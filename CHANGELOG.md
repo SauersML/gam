@@ -1,5 +1,50 @@
 ## Unreleased
 
+- **The survival marginal-slope, survival location-scale and competing-risks bands are central
+  intervals of the posterior law of the response, not `mean ± z·sd` clamped to the range**
+  (gam#3560). This follows `a3b841be88`, which fixed the latent-window band the same way.
+  Near either rail a symmetric band puts all of its miss mass in one tail, and the clamp covers
+  an endpoint the law never reaches. Each surface now inverts the law its mean already
+  integrates, using the landed `central_response_interval` machinery:
+  - Marginal slope, exact anchored rule: `S = Φ(−η(q, b))` over the bivariate Gaussian
+    primaries, taken on `η` and mapped through `Φ(−·)`.
+  - Marginal slope, sigma-point rule: the image of the index's interval, with `η` for marginal
+    slope and `log H` for the transformation and Weibull families.
+  - Location-scale: the `(h, threshold, log σ)` law. Under a link wiggle it adds one standard
+    normal for the conditional wiggle contribution, so the band's law is exactly the nested one
+    the moments integrate. A cone-truncated fit's posterior is the joint rule's mixture
+    `Σ w_i N(A_i, B_i²)` of the row's index, one exactly resolved normal coordinate per node
+    (the wiggle's own, or `h`'s given `(threshold, log σ)`). Its band is that mixture's
+    quantiles, solved on the `f64` lattice and certified on the replicate lattices' spread of
+    the band levels.
+  - Competing risks: the survival, cumulative-hazard, hazard and overall-survival bands, over
+    the joint normal law of every cause's `log H_k` and its rate.
+
+  New entry points: `predict_survival_with_band` (fills `SurvivalPredictResult::survival_lower`
+  and `survival_upper`), `predict_survival_location_scale_band` and
+  `predict_competing_risks_with_band` (fills `CompetingRisksPredictResult::bands`). `gam predict
+  --uncertainty` and the Python competing-risks payload publish these bands.
+  `response_interval_from_mean_sd` and the pyffi `competing_risks_matrix_bounds` and
+  `competing_risks_surface_bounds` are deleted.
+
+  **The competing-risks cumulative-incidence band is refused, not published.**
+  `CIF_k(t) = ∫ h_k S du` depends on every cause's whole linear-predictor curve, so no central
+  interval of its law is derived, and the clamped symmetric band it used to publish is not one.
+  Under an interval request the payload carries `cif_band_refusal`, the typed reason
+  `BandRefusal::WholeCurveFunctional`, in place of `cif_lower`/`cif_upper`. The
+  `failure_prob_*_lower`/`_upper` columns are gone. The point CIF and its standard error still
+  publish. This is the one item of gam#3560 still open.
+
+  `predict_survival`'s truncated-law rule gets the same mixture band. A Royston-Parmar cell's
+  `log H` is linear in the coefficients, so given a node's constraint-normal coordinates it is
+  exactly `N(w(c_u), ‖g‖²)`, with `g` read off the residual factor's columns. A location-scale
+  cell uses the row-law resolution above, over the flattened `(row, time)` input.
+
+  Also refused by name rather than approximated:
+  - A location-scale band on a time-wiggle model under the truncated law.
+  - An overall-survival band over more than four causes.
+  - A sigma-point cell whose nodes are split between a rail and the interior.
+
 - **Full-conformal predictions are reproducible: each test row's tie uniform is a fixed function
   of its position in the request** (#3338). The smoothed conformal p-value needs one uniform `U`
   per inversion; the Gaussian substrate's `interval` and the GLM substrate's `prediction_set`

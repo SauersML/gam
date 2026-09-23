@@ -3344,6 +3344,7 @@ fn predict_competing_risks_survival_result(
 ) -> Result<gam::families::survival::predict::CompetingRisksPredictResult, String> {
     use gam::families::survival::predict::{
         SurvivalPredictEstimand, SurvivalPredictRequest, predict_competing_risks_survival,
+        predict_competing_risks_with_band,
     };
 
     let col_map = dataset.column_map();
@@ -3368,7 +3369,12 @@ fn predict_competing_risks_survival_result(
         with_uncertainty: options.interval.is_some(),
         estimand: SurvivalPredictEstimand::PosteriorMean,
     };
-    Ok(predict_competing_risks_survival(request, covariance_mode)?)
+    // An interval request also asks the library for the central posterior
+    // bands of the surfaces whose law it can invert (gam#3560).
+    Ok(match options.interval {
+        Some(level) => predict_competing_risks_with_band(request, covariance_mode, level)?,
+        None => predict_competing_risks_survival(request, covariance_mode)?,
+    })
 }
 
 fn predict_survival_result(
@@ -3567,70 +3573,6 @@ fn serialize_survival_prediction_payload(
         .map_err(|err| format!("failed to serialize survival prediction payload: {err}"))
 }
 
-fn competing_risks_surface_bounds(
-    point: &[Array2<f64>],
-    standard_error: &[Array2<f64>],
-    z: f64,
-    lower_limit: f64,
-    upper_limit: f64,
-    label: &str,
-) -> Result<(Vec<Array2<f64>>, Vec<Array2<f64>>), String> {
-    if point.len() != standard_error.len() {
-        return Err(format!(
-            "competing-risks {label} interval cause count mismatch: point={}, standard_error={}",
-            point.len(),
-            standard_error.len(),
-        ));
-    }
-    let mut lower = Vec::with_capacity(point.len());
-    let mut upper = Vec::with_capacity(point.len());
-    for (cause, (point_surface, se_surface)) in point.iter().zip(standard_error).enumerate() {
-        if point_surface.dim() != se_surface.dim() {
-            return Err(format!(
-                "competing-risks {label} interval shape mismatch for cause {}: point={:?}, standard_error={:?}",
-                cause + 1,
-                point_surface.dim(),
-                se_surface.dim(),
-            ));
-        }
-        let mut lower_surface = Array2::<f64>::zeros(point_surface.raw_dim());
-        let mut upper_surface = Array2::<f64>::zeros(point_surface.raw_dim());
-        for ((row, column), &point_value) in point_surface.indexed_iter() {
-            let se = se_surface[[row, column]];
-            if !(point_value.is_finite() && se.is_finite() && se >= 0.0) {
-                return Err(format!(
-                    "competing-risks {label} interval requires finite point and non-negative finite SE for cause {}, row {row}, time column {column}; got point={point_value}, se={se}",
-                    cause + 1,
-                ));
-            }
-            lower_surface[[row, column]] = (point_value - z * se).max(lower_limit);
-            upper_surface[[row, column]] = (point_value + z * se).min(upper_limit);
-        }
-        lower.push(lower_surface);
-        upper.push(upper_surface);
-    }
-    Ok((lower, upper))
-}
-
-fn competing_risks_matrix_bounds(
-    point: &Array2<f64>,
-    standard_error: &Array2<f64>,
-    z: f64,
-    lower_limit: f64,
-    upper_limit: f64,
-    label: &str,
-) -> Result<(Array2<f64>, Array2<f64>), String> {
-    let (mut lower, mut upper) = competing_risks_surface_bounds(
-        std::slice::from_ref(point),
-        std::slice::from_ref(standard_error),
-        z,
-        lower_limit,
-        upper_limit,
-        label,
-    )?;
-    Ok((lower.remove(0), upper.remove(0)))
-}
-
 fn competing_risks_vector_bounds(
     point: &[Array1<f64>],
     standard_error: &[Array1<f64>],
@@ -3705,8 +3647,7 @@ fn serialize_competing_risks_prediction_payload(
         survival_upper,
         cumulative_hazard_lower,
         cumulative_hazard_upper,
-        cif_lower,
-        cif_upper,
+        cif_band_refusal,
         overall_survival_lower,
         overall_survival_upper,
         eta_lower,
@@ -3723,60 +3664,27 @@ fn serialize_competing_risks_prediction_payload(
                 "competing-risks prediction interval produced invalid normal quantile for level {level}: {z}"
             ));
         }
-        let hazard_se = result.hazard_se.as_ref().ok_or_else(|| {
-            "competing-risks interval requested but posterior hazard SE is missing".to_string()
-        })?;
-        let survival_se = result.survival_se.as_ref().ok_or_else(|| {
-            "competing-risks interval requested but posterior survival SE is missing".to_string()
-        })?;
-        let cumulative_hazard_se = result.cumulative_hazard_se.as_ref().ok_or_else(|| {
-            "competing-risks interval requested but posterior cumulative-hazard SE is missing"
-                .to_string()
-        })?;
-        let cif_se = result.cif_se.as_ref().ok_or_else(|| {
-            "competing-risks interval requested but posterior CIF SE is missing".to_string()
-        })?;
-        let overall_survival_se = result.overall_survival_se.as_ref().ok_or_else(|| {
-            "competing-risks interval requested but posterior overall-survival SE is missing"
-                .to_string()
-        })?;
         let eta_se = result.eta_se.as_ref().ok_or_else(|| {
             "competing-risks interval requested but posterior eta SE is missing".to_string()
         })?;
-        let (hazard_lower, hazard_upper) = competing_risks_surface_bounds(
-            &result.hazard,
-            hazard_se,
-            z,
-            0.0,
-            f64::INFINITY,
-            "hazard",
-        )?;
-        let (survival_lower, survival_upper) =
-            competing_risks_surface_bounds(&result.survival, survival_se, z, 0.0, 1.0, "survival")?;
-        let (cumulative_hazard_lower, cumulative_hazard_upper) = competing_risks_surface_bounds(
-            &result.cumulative_hazard,
-            cumulative_hazard_se,
-            z,
-            0.0,
-            f64::INFINITY,
-            "cumulative hazard",
-        )?;
-        let (cif_lower, cif_upper) = competing_risks_surface_bounds(
-            &result.cif,
-            cif_se,
-            z,
-            0.0,
-            1.0,
-            "cumulative incidence",
-        )?;
-        let (overall_survival_lower, overall_survival_upper) = competing_risks_matrix_bounds(
-            &result.overall_survival,
-            overall_survival_se,
-            z,
-            0.0,
-            1.0,
-            "overall survival",
-        )?;
+        // The hazard, survival, cumulative-hazard and overall-survival bands are
+        // the central intervals of their posterior laws, which the library forms
+        // (gam#3560); they are published as it returns them.
+        let bands = result.bands.as_ref().ok_or_else(|| {
+            "competing-risks interval requested but the posterior bands are missing".to_string()
+        })?;
+        let hazard_lower = bands.hazard_lower.clone();
+        let hazard_upper = bands.hazard_upper.clone();
+        let survival_lower = bands.survival_lower.clone();
+        let survival_upper = bands.survival_upper.clone();
+        let cumulative_hazard_lower = bands.cumulative_hazard_lower.clone();
+        let cumulative_hazard_upper = bands.cumulative_hazard_upper.clone();
+        let overall_survival_lower = bands.overall_survival_lower.clone();
+        let overall_survival_upper = bands.overall_survival_upper.clone();
+        // The cumulative incidence has no derived central interval, so its band
+        // is refused with the library's typed reason rather than published as
+        // the clamped symmetric one (gam#3560). Its point estimate publishes.
+        let cif_band_refusal = bands.cif_refusal.reason();
         let (eta_lower, eta_upper) =
             competing_risks_vector_bounds(&result.linear_predictor, eta_se, z, "eta")?;
         (
@@ -3786,8 +3694,7 @@ fn serialize_competing_risks_prediction_payload(
             Some(survival_upper),
             Some(cumulative_hazard_lower),
             Some(cumulative_hazard_upper),
-            Some(cif_lower),
-            Some(cif_upper),
+            Some(cif_band_refusal),
             Some(overall_survival_lower),
             Some(overall_survival_upper),
             Some(eta_lower),
@@ -3806,7 +3713,7 @@ fn serialize_competing_risks_prediction_payload(
             );
         }
         (
-            None, None, None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None, None,
         )
     };
     let mut columns = BTreeMap::<String, Vec<f64>>::new();
@@ -3823,20 +3730,11 @@ fn serialize_competing_risks_prediction_payload(
                 .map(|i| result.cif[endpoint_idx][[i, t_last]])
                 .collect(),
         );
-        if let (
-            Some(eta_se),
-            Some(eta_lower),
-            Some(eta_upper),
-            Some(cif_se),
-            Some(cif_lower),
-            Some(cif_upper),
-        ) = (
+        if let (Some(eta_se), Some(eta_lower), Some(eta_upper), Some(cif_se)) = (
             result.eta_se.as_ref(),
             eta_lower.as_ref(),
             eta_upper.as_ref(),
             result.cif_se.as_ref(),
-            cif_lower.as_ref(),
-            cif_upper.as_ref(),
         ) {
             columns.insert(
                 format!("eta_{suffix}_std_error"),
@@ -3854,18 +3752,6 @@ fn serialize_competing_risks_prediction_payload(
                 format!("failure_prob_{suffix}_std_error"),
                 (0..cif_se[endpoint_idx].nrows())
                     .map(|i| cif_se[endpoint_idx][[i, t_last]])
-                    .collect(),
-            );
-            columns.insert(
-                format!("failure_prob_{suffix}_lower"),
-                (0..cif_lower[endpoint_idx].nrows())
-                    .map(|i| cif_lower[endpoint_idx][[i, t_last]])
-                    .collect(),
-            );
-            columns.insert(
-                format!("failure_prob_{suffix}_upper"),
-                (0..cif_upper[endpoint_idx].nrows())
-                    .map(|i| cif_upper[endpoint_idx][[i, t_last]])
                     .collect(),
             );
         }
@@ -3950,8 +3836,7 @@ fn serialize_competing_risks_prediction_payload(
             .map(|value| matrices_to_nested(value)),
         "cif": matrices_to_nested(&result.cif),
         "cif_se": result.cif_se.as_ref().map(|value| matrices_to_nested(value)),
-        "cif_lower": cif_lower.as_ref().map(|value| matrices_to_nested(value)),
-        "cif_upper": cif_upper.as_ref().map(|value| matrices_to_nested(value)),
+        "cif_band_refusal": cif_band_refusal,
         "overall_survival": matrix_to_nested(&result.overall_survival),
         "overall_survival_se": result
             .overall_survival_se

@@ -322,6 +322,101 @@ pub fn predict_survival_location_scalewith_uncertainty(
     })
 }
 
+/// The central posterior interval of every row's survival at `level`
+/// (gam#3560): per row, the pair `(lower, upper)` with
+/// `F(lower) = (1 − level)/2` and `F(upper) = (1 + level)/2` for the posterior
+/// law of `S` whose mean and variance
+/// [`predict_survival_location_scalewith_uncertainty`] publishes. It is not
+/// `mean ± z·response_standard_error`: `S` is bounded and skewed near either
+/// rail, where the symmetric band puts all its miss mass in one tail and covers
+/// values the law never reaches.
+///
+/// The law is the Gaussian one the response moments integrate — the projected
+/// `(h, threshold, log σ)` law with, under a link wiggle, the exact conditional
+/// law of the wiggle contribution — inverted row by row on the coordinate the
+/// survival is monotone along. A fit whose posterior is inequality-truncated
+/// integrates its moments over the mixture the truncated law's joint rule forms
+/// (#2679), so its band is that mixture's central interval
+/// ([`truncated_survival_response_bands`]), not the moment-matched normal's.
+pub fn predict_survival_location_scale_band(
+    input: &SurvivalLocationScalePredictInput,
+    fit: &UnifiedFitResult,
+    covariance: &Array2<f64>,
+    level: f64,
+) -> Result<(Array1<f64>, Array1<f64>), String> {
+    if !(level > 0.0 && level < 1.0) {
+        return Err(format!(
+            "predict_survival_location_scale_band: level must lie strictly inside (0, 1); got {level}"
+        ));
+    }
+    validate_predict_inverse_link(&input.inverse_link)?;
+    let n = input.x_time_exit.nrows();
+    let p_total = fit.beta_time().len()
+        + fit.beta_threshold().len()
+        + fit.beta_log_sigma().len()
+        + fit.beta_link_wiggle().map_or(0, |beta| beta.len());
+    if covariance.nrows() != p_total || covariance.ncols() != p_total {
+        return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
+            "predict_survival_location_scale_band: covariance shape mismatch: got {}x{}, expected {}x{}",
+            covariance.nrows(),
+            covariance.ncols(),
+            p_total,
+            p_total
+        ) }.into());
+    }
+    if input.eta_time_offset_exit.len() != n
+        || input.x_threshold.nrows() != n
+        || input.eta_threshold_offset.len() != n
+        || input.x_log_sigma.nrows() != n
+        || input.eta_log_sigma_offset.len() != n
+    {
+        return Err(SurvivalLocationScaleError::DimensionMismatch {
+            reason: "predict_survival_location_scale_band: row mismatch across inputs".to_string(),
+        }
+        .into());
+    }
+    let x_threshold_dense = input.x_threshold.to_dense_arc();
+    let x_log_sigma_dense = input.x_log_sigma.to_dense_arc();
+    if let Some(bands) = truncated_survival_response_bands(
+        input,
+        fit,
+        covariance,
+        &x_threshold_dense,
+        &x_log_sigma_dense,
+        level,
+    )? {
+        return Ok(bands);
+    }
+    let quadctx = crate::quadrature::QuadratureContext::new();
+    // Warm the 15-point rule the band's outer coordinates use on this thread,
+    // as the response moments do, so the row workers only read the cached rule.
+    crate::quadrature::normal_expectation_nd_adaptive_result::<1, _, _, String>(
+        &quadctx,
+        [0.0_f64],
+        [[1.0_f64]],
+        15,
+        |x: [f64; 1]| Ok(x[0]),
+    )?;
+    let bands = (0..n)
+        .into_par_iter()
+        .map(|row| {
+            let law = SurvivalResponseRowLaw::new(
+                input,
+                fit,
+                covariance,
+                &x_threshold_dense,
+                &x_log_sigma_dense,
+                row,
+            )?;
+            survival_response_central_interval_row(&law, &input.inverse_link, level, &quadctx)
+        })
+        .collect::<Result<Vec<(f64, f64)>, String>>()?;
+    Ok((
+        bands.iter().map(|&(lower, _)| lower).collect(),
+        bands.iter().map(|&(_, upper)| upper).collect(),
+    ))
+}
+
 pub(crate) fn validate_predict_inverse_link(
     inverse_link: &InverseLink,
 ) -> Result<(), SurvivalLocationScaleError> {

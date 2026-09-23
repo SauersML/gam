@@ -5237,5 +5237,13 @@
     },
     "reason": "#3338, acb2a08e4c: every production conformal inversion takes its tie uniform from conformal_tie_uniform(row_index). ExactGaussianFullConformal::new and honest_full_conformal drew an unseeded rand::rng() uniform and had no caller; callers use new_with_uniform and honest_full_conformal_with_uniform.",
     "evidence": "git grep at the base finds no caller outside the coverage replicate, which now uses honest_full_conformal_with_uniform; gam-models 13/13 targeted tests and the gam-pyffi --all-targets check are green (acn112)."
+  },
+  {
+    "base": "366bae1141c2a01856bea665be18737ca67c6d66",
+    "removed": {
+      "crates/gam-cli/src/main/model_summary.rs::response_interval_from_mean_sd": 1
+    },
+    "reason": "gam#3560: the CLI's survival bands are the library's central intervals (predict_survival_with_band and siblings); the clamped mean ± z·sd helper has no caller.",
+    "evidence": "git grep at the base finds its callers only in run_predict.rs's survival branches, which now read the library bands."
   }
 ]

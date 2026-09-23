@@ -411,10 +411,13 @@ pred = model.predict(
 
 pred.covariance_source  # "conditional"
 pred.cif_se
-pred.cif_lower
-pred.cif_upper
+pred.cif_band_refusal  # why the CIF carries no band; see below
 pred.overall_survival_se
 ```
+
+The cumulative incidence carries no band: `CIF_k(t) = ∫ h_k S du` depends on every cause's whole
+linear-predictor curve, so no central interval of its posterior law is derived, and
+`cif_band_refusal` gives that reason in place of `cif_lower`/`cif_upper`.
 
 The covariance request is strict. The default and `covariance_mode="smoothing"`
 require a saved smoothing-corrected covariance and raise when it is absent;

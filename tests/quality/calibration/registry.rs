@@ -481,6 +481,8 @@ fn survival_payload_field_audits(payload: &SurvivalPredictResult) -> Vec<FieldAu
         eta_se,
         covariance_source,
         survival_plugin,
+        survival_lower,
+        survival_upper,
     } = payload;
     std::hint::black_box((
         times,
@@ -493,6 +495,8 @@ fn survival_payload_field_audits(payload: &SurvivalPredictResult) -> Vec<FieldAu
         eta_se,
         covariance_source,
         survival_plugin,
+        survival_lower,
+        survival_upper,
     ));
     vec![
         // Point surfaces: the plug-in/posterior-mean curves themselves carry
@@ -512,6 +516,10 @@ fn survival_payload_field_audits(payload: &SurvivalPredictResult) -> Vec<FieldAu
         // The plug-in surface the posterior mean integrated: a point surface
         // like `survival` itself, carrying no coverage claim of its own.
         FieldAudit::point("survival_plugin"),
+        // The central posterior band of `survival` (gam#3560): a credible band
+        // on the same posterior law the audited `survival_se` describes.
+        FieldAudit::audited("survival_lower", "survival_posterior_mean_se"),
+        FieldAudit::audited("survival_upper", "survival_posterior_mean_se"),
     ]
 }
 
@@ -533,7 +541,9 @@ fn survival_probe() -> SurvivalPredictResult {
         covariance_source: Some(
             gam::families::survival::predict::SurvivalPredictionCovarianceMode::Conditional,
         ),
-        survival_plugin: Some(one2b),
+        survival_plugin: Some(one2b.clone()),
+        survival_lower: Some(one2b.clone()),
+        survival_upper: Some(one2b),
     }
 }
 

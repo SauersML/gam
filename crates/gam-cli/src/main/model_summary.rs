@@ -114,26 +114,6 @@ pub(crate) fn point_covariance_provenance_line(
     provenance.map(|provenance| format!("note: {}", provenance.explain()))
 }
 
-pub(crate) fn response_interval_from_mean_sd(
-    mean: ArrayView1<'_, f64>,
-    response_sd: ArrayView1<'_, f64>,
-    z: f64,
-    lo: f64,
-    hi: f64,
-) -> (Array1<f64>, Array1<f64>) {
-    let lower = Array1::from_iter(
-        mean.iter()
-            .zip(response_sd.iter())
-            .map(|(&m, &s)| (m - z * s).clamp(lo, hi)),
-    );
-    let upper = Array1::from_iter(
-        mean.iter()
-            .zip(response_sd.iter())
-            .map(|(&m, &s)| (m + z * s).clamp(lo, hi)),
-    );
-    (lower, upper)
-}
-
 #[cfg(test)]
 mod per_term_edf_tests {
     use super::*;

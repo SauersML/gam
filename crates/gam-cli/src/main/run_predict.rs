@@ -2457,7 +2457,7 @@ fn run_predict_saved_survival_marginal_slope(
 ) -> Result<(), String> {
     use gam::families::survival::predict::{
         SurvivalPredictEstimand, SurvivalPredictRequest, SurvivalPredictionCovarianceMode,
-        predict_survival,
+        predict_survival, predict_survival_with_band,
     };
     if args.uncertainty {
         validate_level(args.level)?;
@@ -2468,20 +2468,25 @@ fn run_predict_saved_survival_marginal_slope(
             SurvivalPredictionCovarianceMode::SmoothingCorrected
         }
     };
-    let result = predict_survival(
-        SurvivalPredictRequest {
-            model,
-            data,
-            col_map,
-            training_headers,
-            primary_offset,
-            noise_offset,
-            time_grid: None,
-            with_uncertainty: args.uncertainty,
-            estimand: SurvivalPredictEstimand::PosteriorMean,
-        },
-        survival_covariance_mode,
-    )
+    let request = SurvivalPredictRequest {
+        model,
+        data,
+        col_map,
+        training_headers,
+        primary_offset,
+        noise_offset,
+        time_grid: None,
+        with_uncertainty: args.uncertainty,
+        estimand: SurvivalPredictEstimand::PosteriorMean,
+    };
+    // Under `--uncertainty` the band is the central interval of the posterior
+    // law of `S` the library forms beside the mean (gam#3560), not
+    // `mean ± z·sd` clamped to `[0, 1]`.
+    let result = if args.uncertainty {
+        predict_survival_with_band(request, survival_covariance_mode, args.level)
+    } else {
+        predict_survival(request, survival_covariance_mode)
+    }
     .map_err(|e| format!("survival marginal-slope predict failed: {e}"))?;
     // Without a time grid every row is evaluated at its own exit time, so each
     // surface has exactly one column.
@@ -2513,8 +2518,20 @@ fn run_predict_saved_survival_marginal_slope(
             })?,
             "survival posterior standard deviation",
         )?;
-        let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
-        let (lo, hi) = response_interval_from_mean_sd(mean.view(), survival_sd.view(), z, 0.0, 1.0);
+        let lo = own_exit(
+            result.survival_lower.as_ref().ok_or_else(|| {
+                "internal error: survival marginal-slope survival_lower missing under --uncertainty"
+                    .to_string()
+            })?,
+            "survival band lower end",
+        )?;
+        let hi = own_exit(
+            result.survival_upper.as_ref().ok_or_else(|| {
+                "internal error: survival marginal-slope survival_upper missing under --uncertainty"
+                    .to_string()
+            })?,
+            "survival band upper end",
+        )?;
         (Some(eta_se), Some(survival_sd), Some(lo), Some(hi))
     } else {
         (None, None, None, None)
@@ -2915,9 +2932,17 @@ pub(crate) fn run_predict_survival(
                 "internal error: survival location-scale response_standard_error missing under --uncertainty"
                     .to_string()
             })?;
-            let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
+            // The band is the central interval of the posterior law of `S`
+            // whose mean and standard deviation are published beside it
+            // (gam#3560), not `mean ± z·sd` clamped to `[0, 1]`.
             let (mean_lo, mean_hi) =
-                response_interval_from_mean_sd(mean.view(), response_sd.view(), z, 0.0, 1.0);
+                gam::families::survival::location_scale::predict_survival_location_scale_band(
+                    &pred_input,
+                    &saved_fit,
+                    &cov_mat,
+                    args.level,
+                )
+                .map_err(|e| format!("survival location-scale band predict failed: {e}"))?;
             write_survival_prediction_csv(
                 &args.out,
                 eta_out.view(),

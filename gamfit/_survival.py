@@ -60,8 +60,10 @@ class CompetingRisksPrediction:
     cumulative_hazard_upper: Any | None
     cif: Any
     cif_se: Any | None
-    cif_lower: Any | None
-    cif_upper: Any | None
+    # Under an interval request the cumulative incidence carries no band: its
+    # law depends on every cause's whole curve and no central interval is
+    # derived for it, so the Rust core publishes the reason instead (gam#3560).
+    cif_band_refusal: str | None
     overall_survival: Any
     overall_survival_se: Any | None
     overall_survival_lower: Any | None
@@ -671,8 +673,7 @@ def competing_risks_prediction_from_ffi_payload(
         cumulative_hazard_upper=parsed["cumulative_hazard_upper"],
         cif=parsed["cif"],
         cif_se=parsed["cif_se"],
-        cif_lower=parsed["cif_lower"],
-        cif_upper=parsed["cif_upper"],
+        cif_band_refusal=parsed["cif_band_refusal"],
         overall_survival=parsed["overall_survival"],
         overall_survival_se=parsed["overall_survival_se"],
         overall_survival_lower=parsed["overall_survival_lower"],

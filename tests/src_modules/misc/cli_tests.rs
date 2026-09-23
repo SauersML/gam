@@ -6515,7 +6515,7 @@ fn saved_survival_marginal_slope_prediction_replays_latent_z_normalization() {
 fn cli_survival_marginal_slope_predict_publishes_library_posterior_mean_3316() {
     use gam::families::survival::predict::{
         SurvivalPredictEstimand, SurvivalPredictRequest, SurvivalPredictionCovarianceMode,
-        predict_survival,
+        predict_survival_with_band,
     };
     let td = tempdir().unwrap_or_else(|e| panic!("{} failed: {:?}", "tempdir", e));
     let train_path = td.path().join("train.csv");
@@ -6599,7 +6599,9 @@ fn cli_survival_marginal_slope_predict_publishes_library_posterior_mean_3316() {
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "load survival dataset", e));
     let col_map = dataset.column_map();
     let zeros = Array1::<f64>::zeros(n);
-    let library = predict_survival(
+    // The library prediction the CLI's `--uncertainty` publishes: the posterior
+    // mean with the central band of its law at the requested level (gam#3560).
+    let library = predict_survival_with_band(
         SurvivalPredictRequest {
             model: &model,
             data: dataset.values.view(),
@@ -6612,6 +6614,7 @@ fn cli_survival_marginal_slope_predict_publishes_library_posterior_mean_3316() {
             estimand: SurvivalPredictEstimand::PosteriorMean,
         },
         SurvivalPredictionCovarianceMode::Conditional,
+        0.9,
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "library survival predict", e));
     let plugin = library
@@ -6623,8 +6626,14 @@ fn cli_survival_marginal_slope_predict_publishes_library_posterior_mean_3316() {
         .as_ref()
         .expect("uncertainty was requested");
     let eta_se = library.eta_se.as_ref().expect("uncertainty was requested");
-    let z = gam::probability::standard_normal_quantile(0.95)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "normal quantile", e));
+    let survival_lower = library
+        .survival_lower
+        .as_ref()
+        .expect("a band was requested");
+    let survival_upper = library
+        .survival_upper
+        .as_ref()
+        .expect("a band was requested");
     // The CSV writes every value with `{:.12}` fixed decimals, so a published
     // cell differs from the library value by at most half a unit in the 12th
     // decimal plus the parse's own rounding (one ulp of the value).
@@ -6645,8 +6654,8 @@ fn cli_survival_marginal_slope_predict_publishes_library_posterior_mean_3316() {
         assert_published("eta", i, library.linear_predictor[i]);
         assert_published("eta_std_error", i, eta_se[i]);
         assert_published("std_error", i, sd);
-        assert_published("mean_lower", i, (mean - z * sd).clamp(0.0, 1.0));
-        assert_published("mean_upper", i, (mean + z * sd).clamp(0.0, 1.0));
+        assert_published("mean_lower", i, survival_lower[[i, 0]]);
+        assert_published("mean_upper", i, survival_upper[[i, 0]]);
         let delta = normal_cdf(-library.linear_predictor[i] / (1.0 + eta_se[i] * eta_se[i]).sqrt());
         max_gap_to_delta = max_gap_to_delta.max((mean - delta).abs());
     }

@@ -131,9 +131,13 @@ fn cli_royston_parmar_survival_band_is_the_transformed_eta_interval_3560() {
             response_sd > 0.0,
             "a fitted row must carry a positive survival-scale SD, got {response_sd}"
         );
+        // The printed bounds are fixed 12-decimal renderings, so a lower survival
+        // bound below 5e-13 prints as 0 though the band is inside (0, 1): the
+        // printed columns can only be ordered within [0, 1]. Strict interiority is
+        // asserted below on the exact transformed bounds they render.
         assert!(
-            0.0 < lo && lo < hi && hi < 1.0,
-            "row {rows}: the band [{lo}, {hi}] must lie strictly inside (0, 1)"
+            0.0 <= lo && lo < hi && hi <= 1.0,
+            "row {rows}: the printed band [{lo}, {hi}] must be ordered within [0, 1]"
         );
         assert!(
             lo - print_tol <= plugin && plugin <= hi + print_tol,
@@ -141,6 +145,10 @@ fn cli_royston_parmar_survival_band_is_the_transformed_eta_interval_3560() {
         );
         if !constrained {
             let (want_lo, want_hi) = (survival(eta + z * eta_se), survival(eta - z * eta_se));
+            assert!(
+                0.0 < want_lo && want_lo < want_hi && want_hi < 1.0,
+                "row {rows}: the band [{want_lo:e}, {want_hi:e}] must lie strictly inside (0, 1)"
+            );
             for (got, want, side) in [(lo, want_lo, "lower"), (hi, want_hi, "upper")] {
                 assert!(
                     (got - want).abs() <= print_tol,

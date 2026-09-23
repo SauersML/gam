@@ -266,57 +266,165 @@ where
 // erasure" the clip's own note warned a global factor would cause, reached by a
 // different route.
 
-// Exact response moments must stay in the original Gaussian coordinates:
-// [h, threshold, log_sigma] for non-wiggle predictions, with a nested
-// conditional Gaussian over the scalar link-wiggle contribution when present.
-//
-// The row's moments are returned as a centred [`PosteriorMoment`] of `S`
-// (gam#4086). Every Gauss–Hermite node is merged by the pairwise update, so
-// the variance is a sum of non-negative terms, and the nested rule's inner
-// moments merge into the outer ones as the law of total variance
-// `Var S = E[Var(S | y)] + Var(E[S | y])` with no subtraction. The raw pair
-// `(E[S], E[S²])` this used to return resolves `Var S = E[S²] − E[S]²` only to
-// the rounding of `E[S²] ≈ E[S]²`, of order `ε·E[S]²` times the node count, so
-// a row whose survival is nearly certain reported that rounding, or the zero
-// its `max(0)` made of it, as its response standard error.
-pub(crate) fn exact_survival_response_moments_row(
-    input: &SurvivalLocationScalePredictInput,
-    fit: &UnifiedFitResult,
-    covariance: &Array2<f64>,
-    x_threshold_dense: &Array2<f64>,
-    x_log_sigma_dense: &Array2<f64>,
-    row: usize,
-    quadctx: &crate::quadrature::QuadratureContext,
-) -> Result<PosteriorMoment, String> {
-    if input.time_wiggle_ncols > 0 {
-        return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "predict_survival_location_scale: exact response moments are not implemented for time-wiggle models"
-                .to_string(), }.into());
+/// One row's posterior law of the response coordinates, as
+/// [`exact_survival_response_moments_row`] integrates it and
+/// [`survival_response_central_interval_row`] inverts it: the Gaussian over
+/// `y = (h, threshold, log σ)` and, with a link wiggle, the exact conditional
+/// law of the scalar wiggle contribution given `y`.
+pub(crate) struct SurvivalResponseRowLaw<'a> {
+    mu: [f64; 3],
+    cov_htl: [[f64; 3]; 3],
+    wiggle: Option<SurvivalResponseRowWiggle<'a>>,
+}
+
+/// The link-wiggle block's conditional law given the standardized `y`
+/// coordinates: its affine conditional mean `E_π[β_w] + regression · z` and the
+/// constant conditional covariance `cov_cond`.
+struct SurvivalResponseRowWiggle<'a> {
+    beta_w: Array1<f64>,
+    regression: Array2<f64>,
+    cov_cond: Array2<f64>,
+    knots: &'a Array1<f64>,
+    degree: usize,
+}
+
+/// The index `h·exp(−log σ) + q0(threshold, log σ)` the survival reads at the
+/// response coordinates `x = (h, threshold, log σ)`. The scale divides the time
+/// transform too (#2695).
+fn survival_response_base_index(x: [f64; 3]) -> f64 {
+    x[0] * exp_sigma_inverse_from_eta_scalar(x[2]) + survival_q0_from_eta(x[1], x[2])
+}
+
+impl SurvivalResponseRowWiggle<'_> {
+    /// The mean and variance of the full index given `x` and its standardized
+    /// coordinates `z`: the base index plus the wiggle contribution's
+    /// conditional mean, and that contribution's conditional variance.
+    fn conditional_index(&self, x: [f64; 3], z: &[f64]) -> Result<(f64, f64), String> {
+        // #2446: `cond_mean` is `E_π[β_w] + Σ_wy Σ_yy⁻¹ (y − μ_y)`, the
+        // AFFINE conditional mean of the link-wiggle block given the
+        // realized `y = (h, threshold, log σ)`. `regression · z` is that
+        // displacement written in the standardized `y` coordinates the
+        // outer rule integrates over, so this loop and the constant
+        // `cov_cond` below are the exact conditional law of a joint
+        // Gaussian — which is what makes the outer×inner factorization
+        // below an identity rather than an approximation.
+        //
+        // Nothing is clipped back into the `β_w ≥ 0` cone here. The cone
+        // is truncated ONCE, upstream (see the #2446 note above the row law):
+        // clipping the displacement was a third application of the same
+        // correction, it deleted the block's cross-covariance with
+        // `(h, threshold, log σ)` at exactly the near-wall fits the cone
+        // matters for, and it bought no feasibility because the inner
+        // integral already runs over the whole line.
+        let mut cond_mean = self.beta_w.clone();
+        for j in 0..cond_mean.len() {
+            let mut displacement = 0.0;
+            for (col, &latent) in z.iter().enumerate() {
+                displacement += self.regression[[j, col]] * latent;
+            }
+            cond_mean[j] += displacement;
+        }
+        let q0 = survival_q0_from_eta(x[1], x[2]);
+        let q0_arr = Array1::from_vec(vec![q0]);
+        let basis = survival_wiggle_basis_with_options(
+            q0_arr.view(),
+            self.knots,
+            self.degree,
+            BasisOptions::value(),
+        )?;
+        if basis.ncols() != cond_mean.len() {
+            return Err(SurvivalLocationScaleError::DimensionMismatch {
+                reason: format!(
+                    "predict_survival_location_scale: link-wiggle basis/beta mismatch: {} vs {}",
+                    basis.ncols(),
+                    cond_mean.len()
+                ),
+            }
+            .into());
+        }
+        let b = basis.row(0).to_owned();
+        let w_mean = b.dot(&cond_mean);
+        let w_var = b.dot(&self.cov_cond.dot(&b)).max(0.0);
+        // #2446: the cone is accounted for ONCE, upstream. Since
+        // `0b8611a65` the covariance reaching here is `Σ_π` and
+        // `beta_link_wiggle` is `E_π[β_w]` — both already carry the
+        // `β_w ≥ 0` truncation — so `(w_mean, w_var)` are the moments
+        // of the constrained law. Truncating the scalar again would
+        // apply the same correction twice; measured, that costs a
+        // factor of 40 to 300 in `E[S]`, and the ordering does not flip
+        // out to thirty times the tolerance the upstream moments are
+        // converged to (`ORTHANT_MOMENT_RELATIVE_TOLERANCE = 1e-3`).
+        // See `artifacts/issue_2446_double_truncation_robustness.py`.
+        //
+        // #2679: this is the moment-matched NORMAL, and it is a known
+        // approximation rather than the law. The pushforward of a
+        // cone-truncated joint through `bᵀ` is not normal for `q > 1`,
+        // so matching its first two moments has an error FLOOR. The
+        // node mixture over the same cubature nodes
+        // has an error RATE and puts no mass outside the cone; measured
+        // at the shipped 4096-node refinement on a `q = 2` face against
+        // a tensor-Simpson reference on the exact truncated density,
+        // node sum `2.688e-6` vs this normal's `6.135e-4`, with `0` vs
+        // `4.54e-2` infeasible mass.
+        //
+        // It is not cut over here because a node shifts the mean of the
+        // whole coefficient vector — `β = β_unc + t + G(u − E[u])` — so
+        // it moves `(h, threshold, log σ)` as well as `w`, the outer
+        // rule below cannot be shared across nodes, and the exact
+        // cutover costs `nodes × outer × inner` per row. #2679 carries
+        // the joint low-discrepancy rule that makes it affordable. The
+        // consumer that reads misplaced mass at FIRST order is a
+        // quantile, and that one already runs on these nodes
+        // (`constrained_projection_equal_tailed_interval`); `E[S]` and
+        // `E[S²]` are smooth and do not.
+        Ok((survival_response_base_index(x) + w_mean, w_var))
     }
+}
 
-    let beta_time = fit.beta_time();
-    let beta_threshold = fit.beta_threshold();
-    let beta_log_sigma = fit.beta_log_sigma();
-    let beta_link_wiggle = fit.beta_link_wiggle();
-    let p_time = beta_time.len();
-    let p_t = beta_threshold.len();
-    let p_ls = beta_log_sigma.len();
-    let pw = beta_link_wiggle.as_ref().map_or(0, |beta| beta.len());
-    let (time, threshold, log_sigma, wiggle) =
-        survival_response_moment_block_ranges(p_time, p_t, p_ls, pw);
+impl<'a> SurvivalResponseRowLaw<'a> {
+    pub(crate) fn new(
+        input: &'a SurvivalLocationScalePredictInput,
+        fit: &'a UnifiedFitResult,
+        covariance: &Array2<f64>,
+        x_threshold_dense: &Array2<f64>,
+        x_log_sigma_dense: &Array2<f64>,
+        row: usize,
+    ) -> Result<Self, String> {
+        if input.time_wiggle_ncols > 0 {
+            return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "predict_survival_location_scale: exact response moments are not implemented for time-wiggle models"
+                    .to_string(), }.into());
+        }
 
-    let a_h = input.x_time_exit.row(row).to_owned();
-    let a_t = x_threshold_dense.row(row).to_owned();
-    let a_ls = x_log_sigma_dense.row(row).to_owned();
+        let beta_time = fit.beta_time();
+        let beta_threshold = fit.beta_threshold();
+        let beta_log_sigma = fit.beta_log_sigma();
+        let beta_link_wiggle = fit.beta_link_wiggle();
+        let p_time = beta_time.len();
+        let p_t = beta_threshold.len();
+        let p_ls = beta_log_sigma.len();
+        let pw = beta_link_wiggle.as_ref().map_or(0, |beta| beta.len());
+        let (time, threshold, log_sigma, wiggle) =
+            survival_response_moment_block_ranges(p_time, p_t, p_ls, pw);
 
-    let mu_h = a_h.dot(&beta_time) + input.eta_time_offset_exit[row];
-    let mu_t = a_t.dot(&beta_threshold) + input.eta_threshold_offset[row];
-    let mu_ls = a_ls.dot(&beta_log_sigma) + input.eta_log_sigma_offset[row];
-    let mu = [mu_h, mu_t, mu_ls];
-    let cov_htl = projected_survival_response_moment_covariance(
-        covariance, &a_h, &a_t, &a_ls, p_time, p_t, p_ls,
-    );
+        let a_h = input.x_time_exit.row(row).to_owned();
+        let a_t = x_threshold_dense.row(row).to_owned();
+        let a_ls = x_log_sigma_dense.row(row).to_owned();
 
-    if let (Some(beta_w), Some(wiggle_range)) = (beta_link_wiggle.as_ref(), wiggle) {
+        let mu_h = a_h.dot(&beta_time) + input.eta_time_offset_exit[row];
+        let mu_t = a_t.dot(&beta_threshold) + input.eta_threshold_offset[row];
+        let mu_ls = a_ls.dot(&beta_log_sigma) + input.eta_log_sigma_offset[row];
+        let mu = [mu_h, mu_t, mu_ls];
+        let cov_htl = projected_survival_response_moment_covariance(
+            covariance, &a_h, &a_t, &a_ls, p_time, p_t, p_ls,
+        );
+
+        let (Some(beta_w), Some(wiggle_range)) = (beta_link_wiggle, wiggle) else {
+            return Ok(Self {
+                mu,
+                cov_htl,
+                wiggle: None,
+            });
+        };
         let knots = input
             .link_wiggle_knots
             .as_ref()
@@ -378,93 +486,63 @@ pub(crate) fn exact_survival_response_moments_row(
         }
         let cov_cond =
             symmetrize_and_clip_covariance(&(cov_ww - regression.dot(&regression.t().to_owned())));
-
-        return low_rank_normal_expectation_3d_result(
-            quadctx,
+        Ok(Self {
             mu,
             cov_htl,
+            wiggle: Some(SurvivalResponseRowWiggle {
+                beta_w,
+                regression,
+                cov_cond,
+                knots,
+                degree,
+            }),
+        })
+    }
+}
+
+// Exact response moments must stay in the original Gaussian coordinates:
+// [h, threshold, log_sigma] for non-wiggle predictions, with a nested
+// conditional Gaussian over the scalar link-wiggle contribution when present.
+//
+// The row's moments are returned as a centred [`PosteriorMoment`] of `S`
+// (gam#4086). Every Gauss–Hermite node is merged by the pairwise update, so
+// the variance is a sum of non-negative terms, and the nested rule's inner
+// moments merge into the outer ones as the law of total variance
+// `Var S = E[Var(S | y)] + Var(E[S | y])` with no subtraction. The raw pair
+// `(E[S], E[S²])` this used to return resolves `Var S = E[S²] − E[S]²` only to
+// the rounding of `E[S²] ≈ E[S]²`, of order `ε·E[S]²` times the node count, so
+// a row whose survival is nearly certain reported that rounding, or the zero
+// its `max(0)` made of it, as its response standard error.
+pub(crate) fn exact_survival_response_moments_row(
+    input: &SurvivalLocationScalePredictInput,
+    fit: &UnifiedFitResult,
+    covariance: &Array2<f64>,
+    x_threshold_dense: &Array2<f64>,
+    x_log_sigma_dense: &Array2<f64>,
+    row: usize,
+    quadctx: &crate::quadrature::QuadratureContext,
+) -> Result<PosteriorMoment, String> {
+    let law = SurvivalResponseRowLaw::new(
+        input,
+        fit,
+        covariance,
+        x_threshold_dense,
+        x_log_sigma_dense,
+        row,
+    )?;
+    if let Some(wiggle) = law.wiggle.as_ref() {
+        return low_rank_normal_expectation_3d_result(
+            quadctx,
+            law.mu,
+            law.cov_htl,
             15,
             "survival response-moment projected covariance",
             |x, z| {
-                // #2446: `cond_mean` is `E_π[β_w] + Σ_wy Σ_yy⁻¹ (y − μ_y)`, the
-                // AFFINE conditional mean of the link-wiggle block given the
-                // realized `y = (h, threshold, log σ)`. `regression · z` is that
-                // displacement written in the standardized `y` coordinates the
-                // outer rule integrates over, so this loop and the constant
-                // `cov_cond` below are the exact conditional law of a joint
-                // Gaussian — which is what makes the outer×inner factorization
-                // below an identity rather than an approximation.
-                //
-                // Nothing is clipped back into the `β_w ≥ 0` cone here. The cone
-                // is truncated ONCE, upstream (see the note above the function):
-                // clipping the displacement was a third application of the same
-                // correction, it deleted the block's cross-covariance with
-                // `(h, threshold, log σ)` at exactly the near-wall fits the cone
-                // matters for, and it bought no feasibility because the inner
-                // integral already runs over the whole line.
-                let mut cond_mean = beta_w.to_owned();
-                for j in 0..pw {
-                    let mut displacement = 0.0;
-                    for (col, &latent) in z.iter().enumerate() {
-                        displacement += regression[[j, col]] * latent;
-                    }
-                    cond_mean[j] += displacement;
-                }
-                let q0 = survival_q0_from_eta(x[1], x[2]);
-                let q0_arr = Array1::from_vec(vec![q0]);
-                let basis = survival_wiggle_basis_with_options(
-                    q0_arr.view(),
-                    knots,
-                    degree,
-                    BasisOptions::value(),
-                )?;
-                if basis.ncols() != cond_mean.len() {
-                    return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
-                        "predict_survival_location_scale: link-wiggle basis/beta mismatch: {} vs {}",
-                        basis.ncols(),
-                        cond_mean.len()
-                    ) }.into());
-                }
-                let b = basis.row(0).to_owned();
-                let w_mean = b.dot(&cond_mean);
-                let w_var = b.dot(&cov_cond.dot(&b)).max(0.0);
-                // #2446: the cone is accounted for ONCE, upstream. Since
-                // `0b8611a65` the covariance reaching here is `Σ_π` and
-                // `beta_link_wiggle` is `E_π[β_w]` — both already carry the
-                // `β_w ≥ 0` truncation — so `(w_mean, w_var)` are the moments
-                // of the constrained law. Truncating the scalar again would
-                // apply the same correction twice; measured, that costs a
-                // factor of 40 to 300 in `E[S]`, and the ordering does not flip
-                // out to thirty times the tolerance the upstream moments are
-                // converged to (`ORTHANT_MOMENT_RELATIVE_TOLERANCE = 1e-3`).
-                // See `artifacts/issue_2446_double_truncation_robustness.py`.
-                //
-                // #2679: this is the moment-matched NORMAL, and it is a known
-                // approximation rather than the law. The pushforward of a
-                // cone-truncated joint through `bᵀ` is not normal for `q > 1`,
-                // so matching its first two moments has an error FLOOR. The
-                // node mixture over the same cubature nodes
-                // has an error RATE and puts no mass outside the cone; measured
-                // at the shipped 4096-node refinement on a `q = 2` face against
-                // a tensor-Simpson reference on the exact truncated density,
-                // node sum `2.688e-6` vs this normal's `6.135e-4`, with `0` vs
-                // `4.54e-2` infeasible mass.
-                //
-                // It is not cut over here because a node shifts the mean of the
-                // whole coefficient vector — `β = β_unc + t + G(u − E[u])` — so
-                // it moves `(h, threshold, log σ)` as well as `w`, the outer
-                // rule below cannot be shared across nodes, and the exact
-                // cutover costs `nodes × outer × inner` per row. #2679 carries
-                // the joint low-discrepancy rule that makes it affordable. The
-                // consumer that reads misplaced mass at FIRST order is a
-                // quantile, and that one already runs on these nodes
-                // (`constrained_projection_equal_tailed_interval`); `E[S]` and
-                // `E[S²]` are smooth and do not.
+                let (index_mean, index_variance) = wiggle.conditional_index(x, z)?;
                 crate::quadrature::normal_expectation_nd_adaptive_result::<1, _, _, String>(
                     quadctx,
-                    // The scale divides the time transform too (#2695).
-                    [x[0] * exp_sigma_inverse_from_eta_scalar(x[2]) + q0 + w_mean],
-                    [[w_var]],
+                    [index_mean],
+                    [[index_variance]],
                     21,
                     |eta| {
                         Ok(PosteriorMoment::point(inverse_link_survival_prob_checked(
@@ -479,16 +557,124 @@ pub(crate) fn exact_survival_response_moments_row(
 
     low_rank_normal_expectation_3d_result(
         quadctx,
-        mu,
-        cov_htl,
+        law.mu,
+        law.cov_htl,
         15,
         "survival response-moment projected covariance",
         |x, _| {
             Ok(PosteriorMoment::point(inverse_link_survival_prob_checked(
                 &input.inverse_link,
-                x[0] * exp_sigma_inverse_from_eta_scalar(x[2]) + survival_q0_from_eta(x[1], x[2]),
+                survival_response_base_index(x),
             )?))
         },
+    )
+}
+
+/// The central posterior interval `(lower, upper)` of one row's survival at
+/// `level` (gam#3560): the `s` with `F(s) = (1 ∓ level)/2` for the law
+/// [`exact_survival_response_moments_row`] integrates, not `mean ± z·sd`.
+///
+/// That law is Gaussian in standardized coordinates. The outer part is the
+/// rank-`r` factor of `y = (h, threshold, log σ)` the mean's rule walks. With a
+/// link wiggle, the wiggle contribution given `y` is `N(m(z), v(z))`, which is
+/// `m(z) + √v(z)·u` for one more standard normal `u` independent of `z`, so the
+/// row's response is a deterministic function of the `r + 1` independent
+/// standard normals `(z, u)` and its law is exactly the nested one the mean
+/// integrates. [`crate::quadrature::central_response_interval_on_a_monotone_axis`]
+/// inverts it on whichever of those coordinates the survival is monotone along
+/// (it is always monotone in `u` and in `h`). A law with no spread is a point
+/// mass and its interval is that point.
+///
+/// The wiggle's conditional law depends on `z` alone, and the rule tabulates
+/// the response along one axis at every node of the others, so the conditional
+/// index moments are memoized per `z`: without that every tabulation point
+/// would rebuild the same wiggle basis row.
+pub(crate) fn survival_response_central_interval_row(
+    law: &SurvivalResponseRowLaw<'_>,
+    inverse_link: &InverseLink,
+    level: f64,
+    quadctx: &crate::quadrature::QuadratureContext,
+) -> Result<(f64, f64), String> {
+    let factorization = factorize_psd_covariance(
+        &covariance3_to_array2(law.cov_htl),
+        "survival response-band projected covariance",
+    )?;
+    let rank = factorization.factor.ncols();
+    let survival_at = |index: f64| -> Result<f64, String> {
+        Ok(inverse_link_survival_prob_checked(inverse_link, index)?)
+    };
+    let point = |latent: &[f64]| -> Result<f64, String> {
+        let x = apply_low_rank_gaussian_factor3(law.mu, &factorization.factor, latent);
+        match law.wiggle.as_ref() {
+            None => survival_at(survival_response_base_index(x)),
+            Some(wiggle) => survival_at(wiggle.conditional_index(x, latent)?.0),
+        }
+    };
+    let conditional_cache: std::cell::RefCell<std::collections::HashMap<[u64; 3], (f64, f64)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    // The response at standardized coordinates `(z, u)`: `z` is the first
+    // `rank` entries and, with a wiggle, `u` is the last.
+    let response = |coordinates: &[f64]| -> Result<f64, String> {
+        let latent = &coordinates[..rank];
+        let x = apply_low_rank_gaussian_factor3(law.mu, &factorization.factor, latent);
+        let Some(wiggle) = law.wiggle.as_ref() else {
+            return survival_at(survival_response_base_index(x));
+        };
+        let mut key = [0u64; 3];
+        for (slot, value) in key.iter_mut().zip(latent) {
+            *slot = value.to_bits();
+        }
+        let cached = conditional_cache.borrow().get(&key).copied();
+        let (index_mean, index_variance) = match cached {
+            Some(moments) => moments,
+            None => {
+                let moments = wiggle.conditional_index(x, latent)?;
+                conditional_cache.borrow_mut().insert(key, moments);
+                moments
+            }
+        };
+        survival_at(index_mean + index_variance.sqrt() * coordinates[rank])
+    };
+    let dimension = rank + usize::from(law.wiggle.is_some());
+    let interval = match dimension {
+        0 => None,
+        1 => central_interval_in_standard_coordinates::<1>(quadctx, level, |c| response(&c))?,
+        2 => central_interval_in_standard_coordinates::<2>(quadctx, level, |c| response(&c))?,
+        3 => central_interval_in_standard_coordinates::<3>(quadctx, level, |c| response(&c))?,
+        4 => central_interval_in_standard_coordinates::<4>(quadctx, level, |c| response(&c))?,
+        other => {
+            return Err(SurvivalLocationScaleError::InternalInvariant {
+                reason: format!(
+                    "survival response band has {other} standardized coordinates, more than the \
+                     three response coordinates and the wiggle contribution"
+                ),
+            }
+            .into());
+        }
+    };
+    match interval {
+        Some(interval) => Ok(interval),
+        None => {
+            let value = point(&[0.0; 3][..rank])?;
+            Ok((value, value))
+        }
+    }
+}
+
+/// [`crate::quadrature::central_response_interval_on_a_monotone_axis`] on `D`
+/// independent standard normals, the coordinates the survival response law is
+/// written in.
+fn central_interval_in_standard_coordinates<const D: usize>(
+    quadctx: &crate::quadrature::QuadratureContext,
+    level: f64,
+    response: impl Fn([f64; D]) -> Result<f64, String>,
+) -> Result<Option<(f64, f64)>, String> {
+    let mut identity = [[0.0_f64; D]; D];
+    for (axis, row) in identity.iter_mut().enumerate() {
+        row[axis] = 1.0;
+    }
+    crate::quadrature::central_response_interval_on_a_monotone_axis::<D, _, String>(
+        quadctx, [0.0; D], identity, 15, level, response,
     )
 }
 
@@ -769,4 +955,90 @@ pub(crate) fn lift_conditional_covariance(
         ) }.into());
     }
     Ok(finalization_gauge.lift_covariance(cov_reduced))
+}
+
+#[cfg(test)]
+mod central_interval_tests {
+    use super::*;
+
+    /// gam#3560: the location-scale survival band is the central interval of
+    /// the law the response moments integrate, not `mean ± z·sd` clamped to
+    /// `[0, 1]`. Only `h` carries spread and `threshold = log σ = 0`, so the
+    /// probit index is `h·exp_sigma_inverse(0)` with unit standard deviation,
+    /// at a high-survival index (`S ≈ Φ(2.5)`) and a low-survival one
+    /// (`S ≈ Φ(−2.5)`), where `Φ` is curved and the old band's clamp binds.
+    #[test]
+    fn location_scale_survival_band_is_the_central_interval_not_the_clamped_one_3560() {
+        let quadctx = crate::quadrature::QuadratureContext::new();
+        let link = InverseLink::Standard(StandardLink::Probit);
+        let level = 0.95;
+        let z = gam_math::probability::standard_normal_quantile(0.5 + 0.5 * level)
+            .expect("normal quantile");
+        let scale = exp_sigma_inverse_from_eta_scalar(0.0);
+        for (index_mean, near_upper_rail) in [(-2.5, true), (2.5, false)] {
+            let law = SurvivalResponseRowLaw {
+                mu: [index_mean / scale, 0.0, 0.0],
+                cov_htl: [
+                    [1.0 / (scale * scale), 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                ],
+                wiggle: None,
+            };
+            let (lower, upper) =
+                survival_response_central_interval_row(&law, &link, level, &quadctx)
+                    .expect("location-scale band");
+            let moment = low_rank_normal_expectation_3d_result(
+                &quadctx,
+                law.mu,
+                law.cov_htl,
+                15,
+                "location-scale band test",
+                |x, _| {
+                    Ok(PosteriorMoment::point(inverse_link_survival_prob_checked(
+                        &link,
+                        survival_response_base_index(x),
+                    )?))
+                },
+            )
+            .expect("location-scale moments");
+            let mean = moment.mean();
+            let spread = z * moment.variance().sqrt();
+            let (clamped_lower, clamped_upper) =
+                ((mean - spread).clamp(0.0, 1.0), (mean + spread).clamp(0.0, 1.0));
+            assert!(
+                lower < mean && mean < upper,
+                "band ({lower}, {upper}) does not contain its mean {mean}"
+            );
+            assert!(
+                0.0 < lower && upper < 1.0,
+                "band ({lower}, {upper}) reaches a rail"
+            );
+            if near_upper_rail {
+                assert_eq!(
+                    clamped_upper, 1.0,
+                    "control: the clamped band's upper end must bind at 1 here"
+                );
+                assert!(
+                    upper - mean < mean - lower,
+                    "near S = 1 the band must reach further below its mean than above it: \
+                     ({lower}, {mean}, {upper})"
+                );
+            } else {
+                assert_eq!(
+                    clamped_lower, 0.0,
+                    "control: the clamped band's lower end must bind at 0 here"
+                );
+                assert!(
+                    upper - mean > mean - lower,
+                    "near S = 0 the band must reach further above its mean than below it: \
+                     ({lower}, {mean}, {upper})"
+                );
+            }
+            assert!(
+                (lower, upper) != (clamped_lower, clamped_upper),
+                "the central band must not be the clamped symmetric one"
+            );
+        }
+    }
 }

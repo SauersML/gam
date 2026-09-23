@@ -146,6 +146,23 @@ impl TruncatedCoefficientDraws {
         &self.law.rule
     }
 
+    /// The raw coefficient vector at one node's constraint-normal coordinates
+    /// with the tangent at its centre: the mean of the node's exactly Gaussian
+    /// conditional law `N(·, Σ_res)` (gam#3560).
+    pub(crate) fn conditional_center(
+        &self,
+        normal_coordinates: &Array1<f64>,
+    ) -> Result<Array1<f64>, String> {
+        let tangent = vec![0.0; self.residual_factor.ncols()];
+        self.coefficients(normal_coordinates, &tangent)
+    }
+
+    /// `L_res`, raw × rank: column `j` is the coefficient displacement of one
+    /// unit of tangent coordinate `j`.
+    pub(crate) fn residual_factor(&self) -> &Array2<f64> {
+        &self.residual_factor
+    }
+
     /// The raw coefficient vector at one node of [`Self::rule`].
     pub(crate) fn coefficients(
         &self,
@@ -621,6 +638,48 @@ struct TruncatedResponseRow {
     /// coordinate moves each channel.
     htl_factor: Array2<f64>,
     wiggle: Option<TruncatedWiggleRow>,
+    /// The channels' residual covariance, from which a central band builds the
+    /// law of `h` given `(threshold, log σ)` on demand ([`Self::height_law`]):
+    /// the moments never read it, so their rule never factors it (gam#3560).
+    residual_htl: [[f64; 3]; 3],
+}
+
+/// The residual law of `h` given `(threshold, log σ)` at one row: the factor of
+/// the `(threshold, log σ)` residual covariance, the affine regression of `h` on
+/// its standardized coordinates, and the conditional standard deviation left
+/// over. Given `u` the residual law is a joint Gaussian, so this conditioning is
+/// exact, and it leaves `h` with one standard normal of its own that no other
+/// channel reads (gam#3560).
+struct TruncatedHeightRow {
+    factor: Array2<f64>,
+    regression: Array1<f64>,
+    conditional_sd: f64,
+}
+
+impl TruncatedHeightRow {
+    fn new(cov_htl: [[f64; 3]; 3]) -> Result<Self, String> {
+        let mut scale_block = Array2::<f64>::zeros((2, 2));
+        for i in 0..2 {
+            for j in 0..2 {
+                scale_block[[i, j]] = cov_htl[i + 1][j + 1];
+            }
+        }
+        let factorization = factorize_psd_covariance(
+            &scale_block,
+            "survival response-band residual (threshold, log sigma) covariance",
+        )?;
+        let cross = Array1::from_vec(vec![cov_htl[0][1], cov_htl[0][2]]);
+        let mut regression = factorization.eigenvectors.t().dot(&cross);
+        for (column, value) in regression.iter_mut().enumerate() {
+            *value *= factorization.inv_sqrt_eigenvalues[column];
+        }
+        let conditional_variance = (cov_htl[0][0] - regression.dot(&regression)).max(0.0);
+        Ok(Self {
+            factor: factorization.factor,
+            regression,
+            conditional_sd: conditional_variance.sqrt(),
+        })
+    }
 }
 
 /// One row's link-wiggle block, conditioned on the realized channels.
@@ -631,6 +690,52 @@ struct TruncatedWiggleRow {
     degree: usize,
     center: Array1<f64>,
     lift: Array2<f64>,
+}
+
+impl TruncatedWiggleRow {
+    /// The wiggle contribution's conditional mean and standard deviation given
+    /// the node's displacement and the channels' standardized tangent
+    /// coordinates, at the realized `q0`.
+    fn conditional_contribution(
+        &self,
+        q0: f64,
+        displacement: &Array1<f64>,
+        channel_tangent: &[f64],
+    ) -> Result<(f64, f64), String> {
+        let q0_arr = Array1::from_vec(vec![q0]);
+        let basis = survival_wiggle_basis_with_options(
+            q0_arr.view(),
+            &self.knots,
+            self.degree,
+            BasisOptions::value(),
+        )?;
+        if basis.ncols() != self.center.len() {
+            return Err(SurvivalLocationScaleError::DimensionMismatch {
+                reason: format!(
+                    "predict_survival_location_scale: link-wiggle basis/beta mismatch: \
+                     {} vs {}",
+                    basis.ncols(),
+                    self.center.len()
+                ),
+            }
+            .into());
+        }
+        let b = basis.row(0).to_owned();
+        let mut conditional_mean = self.center.clone();
+        for j in 0..conditional_mean.len() {
+            let mut shift = 0.0;
+            for k in 0..displacement.len() {
+                shift += self.lift[[j, k]] * displacement[k];
+            }
+            for (column, &value) in channel_tangent.iter().enumerate() {
+                shift += self.regression[[j, column]] * value;
+            }
+            conditional_mean[j] += shift;
+        }
+        let w_mean = b.dot(&conditional_mean);
+        let w_variance = b.dot(&self.cov_cond.dot(&b)).max(0.0);
+        Ok((w_mean, w_variance.sqrt()))
+    }
 }
 
 impl TruncatedResponseRow {
@@ -814,7 +919,75 @@ impl TruncatedResponseRow {
             channel_lift,
             htl_factor: htl_factor.factor,
             wiggle,
+            residual_htl: cov_htl,
         })
+    }
+
+    /// The row's law of `h` given `(threshold, log σ)`, which the central band
+    /// resolves exactly when no link wiggle carries a coordinate of its own;
+    /// `None` under a link wiggle.
+    fn height_law(&self) -> Result<Option<TruncatedHeightRow>, String> {
+        match self.wiggle {
+            Some(_) => Ok(None),
+            None => TruncatedHeightRow::new(self.residual_htl).map(Some),
+        }
+    }
+
+    /// The row's index at one node of the joint rule as `A + B·τ`, with `τ` one
+    /// standard normal coordinate of the node that no other part of the index
+    /// reads (gam#3560). Under a link wiggle it is the wiggle contribution's own
+    /// coordinate, the last tangent coordinate, exactly as
+    /// [`Self::survival_probability`] reads it. Without one it is `h`'s own
+    /// coordinate given `(threshold, log σ)` ([`TruncatedHeightRow`]); the index
+    /// `h·exp(−log σ) + q0` is affine in `h` at fixed `(threshold, log σ)`. So
+    /// given the node's other coordinates the index is exactly `N(A, B²)`, and
+    /// the node's survival law is the image of that normal.
+    fn index_given_node(
+        &self,
+        height: Option<&TruncatedHeightRow>,
+        displacement: &Array1<f64>,
+        tangent: &[f64],
+    ) -> Result<(f64, f64), String> {
+        let lifted = |channel: usize| -> f64 {
+            let mut value = self.mu[channel];
+            for k in 0..displacement.len() {
+                value += self.channel_lift[[channel, k]] * displacement[k];
+            }
+            value
+        };
+        if let Some(wiggle) = self.wiggle.as_ref() {
+            let htl_rank = self.htl_factor.ncols();
+            let mut x = [lifted(0), lifted(1), lifted(2)];
+            for (channel, value) in x.iter_mut().enumerate() {
+                for column in 0..htl_rank {
+                    *value += self.htl_factor[[channel, column]] * tangent[column];
+                }
+            }
+            let q0 = survival_q0_from_eta(x[1], x[2]);
+            let time_share = x[0] * exp_sigma_inverse_from_eta_scalar(x[2]);
+            let (w_mean, w_sd) =
+                wiggle.conditional_contribution(q0, displacement, &tangent[..htl_rank])?;
+            return Ok((time_share + q0 + w_mean, w_sd));
+        }
+        let height = height.ok_or_else(|| {
+            "survival location-scale truncated band: a row without a link wiggle was handed no \
+             conditional law of h"
+                .to_string()
+        })?;
+        let rank = height.factor.ncols();
+        let mut threshold = lifted(1);
+        let mut log_sigma = lifted(2);
+        let mut h_mean = lifted(0);
+        for column in 0..rank {
+            threshold += height.factor[[0, column]] * tangent[column];
+            log_sigma += height.factor[[1, column]] * tangent[column];
+            h_mean += height.regression[column] * tangent[column];
+        }
+        let inverse_scale = exp_sigma_inverse_from_eta_scalar(log_sigma);
+        Ok((
+            h_mean * inverse_scale + survival_q0_from_eta(threshold, log_sigma),
+            height.conditional_sd * inverse_scale,
+        ))
     }
 
     /// The survival probability at one node, from the node's displacement
@@ -843,40 +1016,9 @@ impl TruncatedResponseRow {
         let eta = match self.wiggle.as_ref() {
             None => time_share + q0,
             Some(wiggle) => {
-                let q0_arr = Array1::from_vec(vec![q0]);
-                let basis = survival_wiggle_basis_with_options(
-                    q0_arr.view(),
-                    &wiggle.knots,
-                    wiggle.degree,
-                    BasisOptions::value(),
-                )?;
-                if basis.ncols() != wiggle.center.len() {
-                    return Err(SurvivalLocationScaleError::DimensionMismatch {
-                        reason: format!(
-                            "predict_survival_location_scale: link-wiggle basis/beta mismatch: \
-                             {} vs {}",
-                            basis.ncols(),
-                            wiggle.center.len()
-                        ),
-                    }
-                    .into());
-                }
-                let b = basis.row(0).to_owned();
-                let mut conditional_mean = wiggle.center.clone();
-                for j in 0..conditional_mean.len() {
-                    let mut shift = 0.0;
-                    for k in 0..retained {
-                        shift += wiggle.lift[[j, k]] * displacement[k];
-                    }
-                    for column in 0..htl_rank {
-                        shift += wiggle.regression[[j, column]] * tangent[column];
-                    }
-                    conditional_mean[j] += shift;
-                }
-                let w_mean = b.dot(&conditional_mean);
-                let w_variance = b.dot(&wiggle.cov_cond.dot(&b)).max(0.0);
-                let w = w_mean + w_variance.sqrt() * tangent[law.tangent_dimension - 1];
-                time_share + q0 + w
+                let (w_mean, w_sd) =
+                    wiggle.conditional_contribution(q0, displacement, &tangent[..htl_rank])?;
+                time_share + q0 + w_mean + w_sd * tangent[law.tangent_dimension - 1]
             }
         };
         let probability = inverse_link_survival_prob_checked(&input.inverse_link, eta)?;
@@ -1011,6 +1153,300 @@ pub(crate) fn truncated_survival_response_moments(
         }
     }
     Ok(Some((first, variance)))
+}
+
+/// The central posterior interval of every row's survival under the truncated
+/// law (gam#3560).
+///
+/// At every node of the joint rule the row's index is `A + B·τ` in one standard
+/// normal coordinate `τ` the rest of the index does not read
+/// ([`TruncatedResponseRow::index_given_node`]), so the index law is the normal
+/// mixture `Σ_i w_i N(A_i, B_i²)`, and its central interval is solved and
+/// certified by [`certified_index_mixture_bands`]. The survival is a monotone
+/// function of the index, so the band is the image of that interval.
+///
+/// Returns `None` when the covariance's law retains no constraint row, and the
+/// Gaussian band then applies.
+pub(crate) fn truncated_survival_response_bands(
+    input: &SurvivalLocationScalePredictInput,
+    fit: &UnifiedFitResult,
+    covariance: &Array2<f64>,
+    x_threshold_dense: &Array2<f64>,
+    x_log_sigma_dense: &Array2<f64>,
+    level: f64,
+) -> Result<Option<(Array1<f64>, Array1<f64>)>, String> {
+    if input.time_wiggle_ncols > 0 {
+        return Err(SurvivalLocationScaleError::InvalidConfiguration {
+            reason: "survival location-scale truncated band: the row law reads the time block \
+                     without its time wiggle, so a time-wiggle model has no band on it"
+                .to_string(),
+        }
+        .into());
+    }
+    let n = input.x_time_exit.nrows();
+    let tangent_dimension = 3 + usize::from(fit.beta_link_wiggle().is_some());
+    let Some(law) = build_truncated_coefficient_law(fit, covariance, tangent_dimension)? else {
+        return Ok(None);
+    };
+    let rows = (0..n)
+        .map(|row| {
+            TruncatedResponseRow::new(input, fit, &law, x_threshold_dense, x_log_sigma_dense, row)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut lower = Array1::<f64>::zeros(n);
+    let mut upper = Array1::<f64>::zeros(n);
+    // Rows share each node's visit a chunk at a time; a chunk's nodes are held
+    // until every row in it certifies.
+    for start in (0..n).step_by(SURVIVAL_ROW_PARALLEL_CHUNK) {
+        let chunk = &rows[start..(start + SURVIVAL_ROW_PARALLEL_CHUNK).min(n)];
+        let heights = chunk
+            .iter()
+            .map(TruncatedResponseRow::height_law)
+            .collect::<Result<Vec<_>, String>>()?;
+        let node_index = |normal_coordinates: &Array1<f64>,
+                          tangent: &[f64]|
+         -> Result<Vec<(f64, f64)>, String> {
+            let displacement = normal_coordinates - &law.normal_center;
+            chunk
+                .iter()
+                .zip(&heights)
+                .map(|(row, height)| row.index_given_node(height.as_ref(), &displacement, tangent))
+                .collect()
+        };
+        let bands = certified_index_mixture_bands(&law.rule, chunk.len(), level, &node_index)?;
+        for (offset, &(index_low, index_high)) in bands.iter().enumerate() {
+            let first = inverse_link_survival_prob_checked(&input.inverse_link, index_low)?;
+            let second = inverse_link_survival_prob_checked(&input.inverse_link, index_high)?;
+            lower[start + offset] = first.min(second);
+            upper[start + offset] = first.max(second);
+        }
+    }
+    Ok(Some((lower, upper)))
+}
+
+/// The central interval, at `level`, of each of `cells` scalar indices whose law
+/// under an inequality-truncated posterior is a normal mixture over the joint
+/// rule's nodes (gam#3560).
+///
+/// `node_index` maps one node (its constraint-normal and tangent coordinates)
+/// to every cell's `(A, B)`: given the node's coordinates the cell's index is
+/// exactly `N(A, B²)`, a point mass when `B = 0`. The index law is then
+/// `Σ_i w_i N(A_i, B_i²)`, whose CDF `F(c) = Σ_i w_i Φ((c − A_i)/B_i) / Σ_i w_i`
+/// is exact at every node in the coordinate it resolves — the factorization
+/// `F(s) = E_V[P(h_V(T) ≤ s)]` of [`crate::quadrature::central_response_interval`],
+/// with the joint rule as the outer expectation. Each end is the least `f64`
+/// with `F ≥ p` ([`index_mixture_quantile`]), for `p = (1 ∓ level)/2`.
+///
+/// # Certification
+///
+/// As for the truncated law's moments, every replicate lattice is extended from
+/// `N` to `2N` nodes until every cell certifies. Each end is solved on the pooled
+/// replicates and each replicate's own mixture CDF is read at it: the replicate
+/// standard error of those levels, less the `f64` rounding of a CDF, must be
+/// within the law's certified relative accuracy of `sqrt(p(1 − p))`, the
+/// standard deviation of the level the end stands for. Past the rule's maximum
+/// node count the band is refused, naming the worst cell.
+pub(crate) fn certified_index_mixture_bands(
+    rule: &ConstrainedPosteriorJointRule,
+    cells: usize,
+    level: f64,
+    node_index: &(dyn Fn(&Array1<f64>, &[f64]) -> Result<Vec<(f64, f64)>, String> + Sync),
+) -> Result<Vec<(f64, f64)>, String> {
+    let replicates = rule.replicates();
+    if replicates < 2 {
+        return Err(format!(
+            "truncated-law band needs at least two replicate lattices to certify on; the joint \
+             rule carries {replicates}"
+        ));
+    }
+    if !(level > 0.0 && level < 1.0) {
+        return Err(format!(
+            "truncated-law band level must lie strictly inside (0, 1); got {level}"
+        ));
+    }
+    let tolerance = rule.relative_tolerance();
+    let tail = 0.5 * (1.0 - level);
+    let levels = [tail, 1.0 - tail];
+    // Each replicate's nodes: the node's log weight and every cell's `(A, B)`.
+    let mut nodes: Vec<Vec<(f64, Vec<(f64, f64)>)>> = vec![Vec::new(); replicates];
+    let mut evaluated = 0usize;
+    loop {
+        let target = if evaluated == 0 {
+            rule.initial_points()
+        } else {
+            2 * evaluated
+        };
+        nodes
+            .as_mut_slice()
+            .into_par_iter()
+            .enumerate()
+            .try_for_each(|(replicate, replicate_nodes)| {
+                rule.visit_nodes(
+                    replicate,
+                    evaluated,
+                    target,
+                    |log_weight, normal_coordinates, tangent| {
+                        let laws = node_index(normal_coordinates, tangent)?;
+                        if laws.len() != cells {
+                            return Err(format!(
+                                "truncated-law band: a node reported {} cells, expected {cells}",
+                                laws.len()
+                            ));
+                        }
+                        if let Some((cell, &(mean, sd))) = laws
+                            .iter()
+                            .enumerate()
+                            .find(|(_, law)| !(law.0.is_finite() && law.1.is_finite()))
+                        {
+                            return Err(format!(
+                                "truncated-law band: cell {cell} has index law N({mean}, {sd}^2) \
+                                 at a node of the joint rule"
+                            ));
+                        }
+                        replicate_nodes.push((log_weight, laws));
+                        Ok(())
+                    },
+                )
+            })?;
+        evaluated = target;
+        // Every replicate on the heaviest node's scale, as the moments pool.
+        let top = nodes
+            .iter()
+            .flatten()
+            .map(|node| node.0)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let mut bands = Vec::with_capacity(cells);
+        let mut worst: Option<(usize, f64)> = None;
+        for cell in 0..cells {
+            let replicate_components: Vec<Vec<IndexComponent>> = nodes
+                .iter()
+                .map(|replicate_nodes| {
+                    replicate_nodes
+                        .iter()
+                        .map(|(log_weight, laws)| IndexComponent {
+                            weight: (log_weight - top).exp(),
+                            mean: laws[cell].0,
+                            sd: laws[cell].1,
+                        })
+                        .collect()
+                })
+                .collect();
+            if let Some(empty) = replicate_components.iter().position(|components| {
+                let total: f64 = components.iter().map(|component| component.weight).sum();
+                !(total.is_finite() && total > 0.0)
+            }) {
+                return Err(format!(
+                    "truncated-law band: replicate lattice {empty} accumulated no finite node \
+                     weight"
+                ));
+            }
+            let pooled = replicate_components.concat();
+            let mut ends = [0.0_f64; 2];
+            let mut error = 0.0_f64;
+            for (slot, &p) in levels.iter().enumerate() {
+                let end = index_mixture_quantile(&pooled, p);
+                let replicate_levels: Vec<f64> = replicate_components
+                    .iter()
+                    .map(|components| index_mixture_cdf(components, end))
+                    .collect();
+                // A CDF is a weighted mean of probabilities, resolved to
+                // `f64::EPSILON` absolute: a spread within that is its rounding.
+                let excess = replicate_standard_error(&replicate_levels) - f64::EPSILON;
+                if excess > 0.0 {
+                    error = error.max(excess / (p * (1.0 - p)).sqrt());
+                }
+                ends[slot] = end;
+            }
+            if error > tolerance && worst.is_none_or(|(_, current)| error > current) {
+                worst = Some((cell, error));
+            }
+            bands.push((ends[0], ends[1]));
+        }
+        let Some((cell, error)) = worst else {
+            return Ok(bands);
+        };
+        let visited = evaluated * replicates;
+        if visited >= rule.maximum_points() {
+            return Err(format!(
+                "truncated-law band did not certify: after {visited} joint cubature nodes over \
+                 {replicates} replicate lattices, the replicate standard error of cell {cell}'s \
+                 band levels, less the CDF's rounding, is {error:.3e} of sqrt(p(1 - p)), above \
+                 the law's certified relative accuracy {tolerance:.1e}"
+            ));
+        }
+    }
+}
+
+/// One component `w·N(mean, sd²)` of an index law under the truncated
+/// posterior; `sd = 0` is a point mass.
+#[derive(Clone, Copy, Debug)]
+struct IndexComponent {
+    weight: f64,
+    mean: f64,
+    sd: f64,
+}
+
+/// `F(c) = Σ w Φ((c − mean)/sd) / Σ w` of a normal mixture, with a point-mass
+/// component contributing its indicator.
+fn index_mixture_cdf(components: &[IndexComponent], c: f64) -> f64 {
+    let mut mass = 0.0;
+    let mut total = 0.0;
+    for component in components {
+        total += component.weight;
+        let below = if component.sd > 0.0 {
+            gam_math::probability::normal_cdf((c - component.mean) / component.sd)
+        } else if component.mean <= c {
+            1.0
+        } else {
+            0.0
+        };
+        mass += component.weight * below;
+    }
+    mass / total
+}
+
+/// The `p`-quantile of a normal mixture: the least `f64` `c` with `F(c) ≥ p`,
+/// for `p` strictly inside `(0, 1)`.
+///
+/// The bracket starts at the extreme component means and widens by doubling
+/// steps until `F` straddles `p`, which it must: every component's tails carry
+/// its mass to `0` and `1`. Bisection then halves it until its ends are adjacent
+/// floats, so the answer is solved on the `f64` lattice rather than to a
+/// tolerance.
+fn index_mixture_quantile(components: &[IndexComponent], p: f64) -> f64 {
+    let mut low = f64::INFINITY;
+    let mut high = f64::NEG_INFINITY;
+    let mut widest = 0.0_f64;
+    for component in components {
+        low = low.min(component.mean);
+        high = high.max(component.mean);
+        widest = widest.max(component.sd);
+    }
+    let mut step = widest.max(high - low);
+    if step == 0.0 {
+        // Every component is the same point mass.
+        return low;
+    }
+    while index_mixture_cdf(components, low) >= p {
+        low -= step;
+        step *= 2.0;
+    }
+    let mut step = widest.max(high - low);
+    while index_mixture_cdf(components, high) < p {
+        high += step;
+        step *= 2.0;
+    }
+    loop {
+        let middle = low + 0.5 * (high - low);
+        if !(middle > low && middle < high) {
+            return high;
+        }
+        if index_mixture_cdf(components, middle) >= p {
+            high = middle;
+        } else {
+            low = middle;
+        }
+    }
 }
 
 /// What one node's response evaluation reads, shared by every replicate.
@@ -1194,6 +1630,65 @@ mod tests {
     use super::*;
     use gam_problem::gauge::Gauge;
     use ndarray::array;
+
+    /// gam#3560: the truncated band's index quantile is the quantile of the
+    /// mixture `Σ w_i N(A_i, B_i²)` itself, solved on the `f64` lattice. On a
+    /// two-component mixture the returned end is exactly the least float whose
+    /// mixture CDF, formed directly here from `Φ`, reaches the level. Control:
+    /// neither component's own central interval is the mixture's, so an
+    /// answer read off one node — or a moment-matched normal's band placed on
+    /// one — would be caught.
+    #[test]
+    fn truncated_band_is_the_mixture_quantile_not_a_node_interval_3560() {
+        let components = [
+            IndexComponent {
+                weight: 0.3,
+                mean: -1.0,
+                sd: 0.5,
+            },
+            IndexComponent {
+                weight: 0.7,
+                mean: 2.0,
+                sd: 1.0,
+            },
+        ];
+        let direct = |c: f64| -> f64 {
+            (0.3 * gam_math::probability::normal_cdf((c + 1.0) / 0.5)
+                + 0.7 * gam_math::probability::normal_cdf((c - 2.0) / 1.0))
+                / (0.3 + 0.7)
+        };
+        let level = 0.95;
+        let z = gam_math::probability::standard_normal_quantile(0.5 + 0.5 * level)
+            .expect("normal quantile");
+        let tail = 0.5 * (1.0 - level);
+        let mut ends = [0.0_f64; 2];
+        for (slot, p) in [tail, 1.0 - tail].into_iter().enumerate() {
+            let end = index_mixture_quantile(&components, p);
+            assert!(
+                direct(end) >= p && direct(end.next_down()) < p,
+                "the {p} quantile {end} is not the least float reaching the level: \
+                 F(end) = {}, F(previous float) = {}",
+                direct(end),
+                direct(end.next_down())
+            );
+            ends[slot] = end;
+        }
+        for component in &components {
+            let own = (
+                component.mean - z * component.sd,
+                component.mean + z * component.sd,
+            );
+            assert!(
+                (ends[0], ends[1]) != own,
+                "the mixture band ({}, {}) must not be a component's own interval {own:?}",
+                ends[0],
+                ends[1]
+            );
+        }
+        // The mixture's lower end sits in the light component's reach and its
+        // upper end in the heavy one's: the band spans both.
+        assert!(ends[0] < components[0].mean && ends[1] > components[1].mean);
+    }
 
     /// Knots and degree for a link-wiggle block of the requested width, taken
     /// from the production knot and block builders so the basis is the one
