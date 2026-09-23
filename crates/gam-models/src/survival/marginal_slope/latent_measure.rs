@@ -1107,8 +1107,11 @@ mod tests {
     }
 
     /// With `K = 2` scores the default never reaches the joint law's refusal of a
-    /// local law. A column whose law moves keeps every column on the closed form,
-    /// uncertified and naming that column; a column that departs without moving
+    /// local law. A column whose law moves in location and scale carries its
+    /// fitted arm onto the joint law, which transports it once the map is divided
+    /// out (gam#2949, 7e641c78b9): the arm is recorded, uncertified at `K ≥ 2`
+    /// and naming the issue, and no column is sent back to the closed form, which
+    /// only a LOCAL arm still forces. A column that departs without moving
     /// sends the fit to the joint law, and the column the screen passed is then
     /// labelled by the law the fit anchors on, not by a closed form it never
     /// consumes (gam#2926, gam#2929, gam#2949).
@@ -1135,25 +1138,37 @@ mod tests {
             Some(&context),
             EmpiricalLatentMeasureSupport::Available,
         )
-        .expect("a moving column at K = 2 keeps the closed form rather than refusing");
+        .expect("a moving column at K = 2 carries its arm rather than refusing");
+        let LatentLawConsumed::EstimatedMovingLaw { arm, uncertified, .. } =
+            &routed.per_score_consumed[0]
+        else {
+            panic!(
+                "the moving column must carry its fitted arm; got {:?}",
+                routed.per_score_consumed[0]
+            )
+        };
+        assert!(
+            !matches!(arm, MovingLawArm::Local),
+            "the shifted fixture moves in location, not shape; got the {} arm",
+            arm.label()
+        );
+        let missing = uncertified
+            .as_deref()
+            .expect("a K = 2 arm is carried without the one-score certificate");
+        assert!(
+            missing.contains("gam#2949"),
+            "the record must name the transport issue; got {missing}"
+        );
+        assert!(routed.per_score_certificate_law[0].is_none());
         for col in 0..2 {
             assert!(
-                matches!(routed.per_score_measure[col], LatentMeasureKind::StandardNormal),
-                "column {col} must keep the closed form; got {:?}",
-                routed.per_score_measure[col]
-            );
-            assert!(routed.per_score_certificate_law[col].is_none());
-            let LatentLawConsumed::GaussianUncertified { missing, .. } =
-                &routed.per_score_consumed[col]
-            else {
-                panic!(
-                    "column {col} must be recorded as uncertified; got {:?}",
-                    routed.per_score_consumed[col]
-                )
-            };
-            assert!(
-                missing.contains("score column 0 moves") && missing.contains("gam#2949"),
-                "the record must name the moving score and the transport issue; got {missing}"
+                !matches!(
+                    routed.per_score_consumed[col],
+                    LatentLawConsumed::GaussianUncertified { .. }
+                ),
+                "column {col}: only a LOCAL arm sends the columns back to the closed form; \
+                 got {:?}",
+                routed.per_score_consumed[col]
             );
         }
         assert!(

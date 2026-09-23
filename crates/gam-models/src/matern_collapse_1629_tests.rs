@@ -94,16 +94,18 @@ fn matern_cold_design_does_not_collapse_and_k_has_effect_1629() {
         ..FitConfig::default()
     };
 
-    // Default matern: the auto center count for n=2000, d=2 is 200, so the cold
-    // design (intercept + 199 centered kernel columns) is ~200 wide. Pre-fix
-    // (diameter seed) it collapsed to ~51. Require the basis to stay essentially
-    // full so the κ-optimizer starts from a rich, non-degenerate basis.
+    // Default matern: the cold design is the intercept plus `centers - 1` centered
+    // kernel columns, `centers` wide in all. Pre-fix (diameter seed) the whitener
+    // pruned ~3/4 of them. The center count itself is the rate-derived default
+    // (#3149, `2·⌈n^{1/3}⌉` in 2-D), so the basis must keep every one of them for
+    // the κ-optimizer to start from a non-degenerate basis.
+    let planned = gam_terms::basis::default_num_centers(ds.values.nrows(), 2);
     let matern_default = cold_design_cols("y ~ matern(x1, x2)", &ds, &cfg);
     assert!(
-        matern_default >= 180,
-        "matern(x1, x2) cold design collapsed to {matern_default} columns \
-         (#1629: the diameter seed's realized-design orthogonality whitener pruned \
-         the basis pre-optimization). Expected ~200."
+        matern_default >= planned,
+        "matern(x1, x2) cold design collapsed to {matern_default} of its {planned} planned \
+         columns (#1629: the diameter seed's realized-design orthogonality whitener pruned \
+         the basis pre-optimization)"
     );
 
     // thinplate is the never-collapsing reference (#1629 reported it at ~200).
@@ -130,7 +132,7 @@ fn matern_cold_design_does_not_collapse_and_k_has_effect_1629() {
     // `k=` was a no-op. Sweep a descending progression and require the resolved
     // width to track it: each smaller k resolves a strictly smaller basis, and
     // each stays near its requested size (no collapse to the old ~50 floor).
-    let mut prev = matern_default;
+    let mut prev = usize::MAX;
     for &k in &[150usize, 100, 60] {
         let cols = cold_design_cols(&format!("y ~ matern(x1, x2, k={k})"), &ds, &cfg);
         assert!(
@@ -152,8 +154,8 @@ fn matern_cold_design_does_not_collapse_and_k_has_effect_1629() {
     // that drove #1629 is independent of the smoothness order.
     let matern_nu32 = cold_design_cols("y ~ matern(x1, x2, nu=3/2)", &ds, &cfg);
     assert!(
-        matern_nu32 >= 180,
-        "matern(x1, x2, nu=3/2) cold design collapsed to {matern_nu32} columns; \
-         the #1629 basis-collapse must not depend on the Matérn smoothness order"
+        matern_nu32 >= planned,
+        "matern(x1, x2, nu=3/2) cold design collapsed to {matern_nu32} of its {planned} \
+         planned columns; the #1629 basis-collapse must not depend on the Matérn smoothness order"
     );
 }

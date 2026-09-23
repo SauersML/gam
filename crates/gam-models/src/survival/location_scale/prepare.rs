@@ -1035,6 +1035,13 @@ pub(crate) fn finalize_survival_location_scale_fit(
         edf_by_block: fit.edf_by_block().to_vec(),
         edf_rank_bound: fit.edf_rank_bound().to_vec(),
         coefficient_mode_selection: fit.artifacts.coefficient_mode_selection.clone(),
+        // Stored beside `H` in the same active frame, which finalization keeps
+        // (`geometry.penalized_hessian` above is carried unchanged), so the curvature
+        // passes through as `H` does.
+        weighted_gram: fit
+            .inference
+            .as_ref()
+            .and_then(|inference| inference.weighted_gram.clone()),
     })
 }
 

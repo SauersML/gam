@@ -201,10 +201,9 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
             psi_hi,
         )
     };
-    assert!(
-        attached,
-        "tensor must certify on this fixture for a non-vacuous gate"
-    );
+    if let Err(why) = &attached {
+        panic!("tensor must certify on this fixture for a non-vacuous gate: {why}");
+    }
     eprintln!(
         "[2827-real-duchon] n={n} columns={} tensor_realizations={tensor_realizations} build_seconds={:.6}",
         frozen_design.design.ncols(), tensor_build_started.elapsed().as_secs_f64(),

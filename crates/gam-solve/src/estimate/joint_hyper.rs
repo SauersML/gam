@@ -528,8 +528,9 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// ψ-invariant column transform (means/scales frozen from the baseline
     /// design at construction), so applying it inside the build keeps the
     /// expansion analytic and the per-trial installed cache frame-exact —
-    /// without restricting to identity conditioning. Returns whether a
-    /// certified tensor was attached; `false` keeps the exact per-trial path.
+    /// without restricting to identity conditioning. `Ok` when a certified
+    /// tensor was attached; an `Err` names why none was, and keeps the exact
+    /// per-trial path.
     pub fn build_and_set_psi_gram_tensor(
         &mut self,
         mut eval_raw_design: impl FnMut(f64) -> Result<DesignMatrix, String>,
@@ -537,7 +538,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         z: ArrayView1<'_, f64>,
         psi_lo: f64,
         psi_hi: f64,
-    ) -> bool {
+    ) -> Result<(), String> {
         // Clone the (cheap) conditioning so the build closure borrows it
         // without aliasing `self` while we set the field afterward.
         let conditioning = self.conditioning.clone();
@@ -551,21 +552,15 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             psi_lo,
             psi_hi,
         );
-        match tensor {
-            Ok(tensor) => {
-                self.psi_gram_tensor = Some(std::sync::Arc::new(tensor));
-                self.psi_gram_anchor_correction = None;
-                true
-            }
-            Err(why) => {
-                // The n-free ψ-Gram tensor declined to attach; the caller falls
-                // back to the exact per-trial design path. Record WHY so the
-                // fast-path coverage (#1264/#1216) is diagnosable instead of a
-                // silent non-attachment.
-                log::trace!("ψ-Gram tensor not attached over [{psi_lo}, {psi_hi}]: {why}");
-                false
-            }
-        }
+        // A declined tensor leaves the exact per-trial design path in place; the
+        // reason goes back to the caller, so the fast path's coverage
+        // (#1264/#1216) is diagnosable instead of a silent non-attachment.
+        let tensor = tensor.map_err(|why| {
+            format!("ψ-Gram tensor not attached over [{psi_lo}, {psi_hi}]: {why}")
+        })?;
+        self.psi_gram_tensor = Some(std::sync::Arc::new(tensor));
+        self.psi_gram_anchor_correction = None;
+        Ok(())
     }
 
     /// Retire the certified ψ-Gram tensor and every piece of state keyed to it,

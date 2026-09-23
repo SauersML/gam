@@ -277,7 +277,7 @@ fn build_term_collection_design_inner_with_policy_and_plan(
         }
     }
 
-    let design = assemble_term_collection_design_matrix(blocks)?;
+    let design = assemble_term_collection_design_matrix(n, blocks)?;
 
     let mut penalties = Vec::<BlockwisePenalty>::new();
     let mut nullspace_dims = Vec::<usize>::new();

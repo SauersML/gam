@@ -3938,8 +3938,17 @@ mod tests {
 
     #[test]
     fn spatial_hyperparameter_request_is_a_typed_error_until_explicitly_frozen() {
-        let locked_meanspec = crate::gamlss::tests::simple_matern_term_collection(&[0, 1], 0.6);
-        let mut meanspec = locked_meanspec.clone();
+        // The shared fixture's scale is learned, resolved at 0.6; the caller's
+        // locked scale is the same value pinned, which enrolls no ψ axis (#3020).
+        let learned_meanspec = crate::gamlss::tests::simple_matern_term_collection(&[0, 1], 0.6);
+        let mut locked_meanspec = learned_meanspec.clone();
+        let gam_terms::smooth::SmoothBasisSpec::Matern { spec, .. } =
+            &mut locked_meanspec.smooth_terms[0].basis
+        else {
+            panic!("test fixture must contain a Matérn term");
+        };
+        spec.length_scale = gam_terms::basis::MaternLengthScale::fixed(0.6);
+        let mut meanspec = learned_meanspec.clone();
         let gam_terms::smooth::SmoothBasisSpec::Matern { spec, .. } =
             &mut meanspec.smooth_terms[0].basis
         else {

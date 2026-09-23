@@ -613,10 +613,37 @@ pub(super) fn assert_term_collection_designs_match(
         right_design.iter().copied(),
         left_design.ncols(),
     );
-    assert!(
-        design_diff <= design_band,
-        "{label} design mismatch max_abs={design_diff:e} exceeds the two-assembly band {design_band:e}"
-    );
+    if design_diff > design_band {
+        // Whether the two designs span the same column space, which tells a chart
+        // change (same functions, other columns) from a different design: the
+        // residual of `right` after projecting onto `left`'s span, relative to it.
+        use gam_linalg::faer_ndarray::FaerSvd;
+        let span_residual = match left_design.svd(true, false) {
+            Ok((Some(u), singular, _)) => {
+                let top = singular.iter().fold(0.0_f64, |acc, v| acc.max(*v));
+                let rank = singular
+                    .iter()
+                    .filter(|v| **v > top * f64::EPSILON * left_design.nrows() as f64)
+                    .count();
+                let basis = u.slice(ndarray::s![.., ..rank]).to_owned();
+                let projected = basis.dot(&basis.t().dot(&right_design));
+                let residual = &right_design - &projected;
+                let norm = |m: &ndarray::Array2<f64>| m.iter().map(|v| v * v).sum::<f64>().sqrt();
+                format!(
+                    "{:e} (left rank {rank} of {})",
+                    norm(&residual) / norm(&right_design).max(f64::MIN_POSITIVE),
+                    left_design.ncols()
+                )
+            }
+            _ => "unavailable (SVD failed)".to_string(),
+        };
+        // SAFETY: test helper; two assemblies of one design that disagree past
+        // their band are the defect the calling test exists to report.
+        panic!(
+            "{label} design mismatch max_abs={design_diff:e} exceeds the two-assembly band \
+             {design_band:e}; right's residual off left's column span {span_residual}"
+        );
+    }
     assert_eq!(
         left.penalties.len(),
         right.penalties.len(),
@@ -2253,7 +2280,27 @@ fn tensor_bspline_supports_two_periodic_margins_as_torus() {
         assert!((dense[[0, j]] - dense[[2, j]]).abs() < 1e-12);
         assert!((dense[[0, j]] - dense[[3, j]]).abs() < 1e-12);
     }
-    assert_eq!(sd.penalties.len(), 2);
+    // Each margin's roughness `∫ (∂ᵐ_d f)²` splits into its functional-ANOVA parts
+    // over the other margin (#3951): the part along the other margin's penalty-null
+    // functions (the constant, for a periodic margin) and the part along their
+    // complement. Two margins, two parts each, and no double penalty.
+    let mut sources: Vec<(usize, Vec<usize>)> = sd
+        .penaltyinfo
+        .iter()
+        .map(|info| match &info.penalty.source {
+            gam_terms::basis::PenaltySource::TensorMarginal { dim, range_margins } => {
+                (*dim, range_margins.clone())
+            }
+            other => panic!("a te() without a double penalty emitted a {other:?} penalty"),
+        })
+        .collect();
+    sources.sort();
+    assert_eq!(
+        sources,
+        vec![(0, vec![]), (0, vec![1]), (1, vec![]), (1, vec![0])],
+        "a te() of two periodic margins carries each margin's roughness split over the \
+         other margin's null and range functions"
+    );
     assert!(sd.penalties.iter().all(|p| p.local.nrows() == 56));
 
     let frozen = freeze_term_collection_from_design(&spec_collection, &design)
@@ -2959,11 +3006,12 @@ fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
     // geometric-decay case the certificate is built for, so we require the
     // attach. If a future basis change makes it refuse, this fails loudly
     // (telling us to re-derive the window) rather than silently passing.
-    assert!(
-        attached,
-        "ψ-gram tensor failed to certify over the production window \
-             [{psi_lo:.3}, {psi_hi:.3}]; the invariance test would be vacuous"
-    );
+    if let Err(why) = &attached {
+        panic!(
+            "ψ-gram tensor failed to certify over the production window \
+             [{psi_lo:.3}, {psi_hi:.3}]; the invariance test would be vacuous: {why}"
+        );
+    }
 
     // One shared realizer drives both lanes per θ.
     let mut stream_cache = make_cache();
@@ -3304,10 +3352,9 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
             psi_hi,
         )
     };
-    assert!(
-        attached,
-        "tensor must certify on this fixture for a non-vacuous gate"
-    );
+    if let Err(why) = &attached {
+        panic!("tensor must certify on this fixture for a non-vacuous gate: {why}");
+    }
 
     // Compare cost and gradient at θ₀ on both lanes — a quick smoke-check
     // that the tensor is live and matching before the optimizer loop.

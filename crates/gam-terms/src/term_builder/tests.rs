@@ -1168,8 +1168,10 @@ fn default_te_takes_the_engine_default_basis_dimension_for_its_rows() {
 }
 
 /// A low-cardinality margin is capped at its distinct values and hands the
-/// remaining budget to the other margin: `te(season, hour)` resolves all 24
-/// hours instead of a 12-knot hour margin (the bike audit case).
+/// remaining budget to the other margin (the bike audit case): `te(season,
+/// hour)` gives season its 4 values and hour the rest of the tensor budget,
+/// `⌊budget / 4⌋` functions up to its 24 values, instead of the geometric share
+/// `⌊√budget⌋` a margin of equal support would get.
 #[test]
 fn default_te_gives_a_low_cardinality_margins_share_to_the_other_margin() {
     let ds = continuous_dataset(
@@ -1182,9 +1184,17 @@ fn default_te_gives_a_low_cardinality_margins_share_to_the_other_margin() {
             })
             .collect(),
     );
+    // The budget is the default 2-D basis dimension on these rows, held to the
+    // 96 distinct (season, hour) cells.
+    let budget = default_num_centers(ds.values.nrows(), 2).min(96);
+    let hour = (budget / 4).min(24);
+    assert!(
+        hour > (budget as f64).sqrt().floor() as usize,
+        "the fixture must leave season a share to hand over: budget {budget}"
+    );
     assert_eq!(
         default_te_margin_dims(&ds, "y ~ te(season, hour)"),
-        vec![4, 24]
+        vec![4, hour]
     );
 }
 
@@ -1824,7 +1834,13 @@ fn multidimensional_duchon_default_is_provisioned_and_the_loop_starts_it_at_its_
     let CenterStrategy::FarthestPoint { num_centers } = inner.as_ref() else {
         panic!("expected farthest-point default centers, got {inner:?}");
     };
-    assert_eq!(*num_centers, 30, "the provisioned 2-D Duchon default is the low-rank 30");
+    // The rate-derived default (#3149) held to the provisioned low-rank cap of
+    // `10 · 3^(d − 1)` = 30 centers in 2-D (#1757).
+    assert_eq!(
+        *num_centers,
+        default_num_centers(500, 2).min(30),
+        "the provisioned 2-D Duchon default is the rate default held to the low-rank 30"
+    );
     // The pilot is the polynomial null space plus the penalized resolution
     // rank at n=500 in 2-D — not a fixed per-dimension constant.
     let polynomial_cols = match spec.nullspace_order {
@@ -4167,8 +4183,9 @@ fn inferred_tensor_basis_cap_uses_coordinate_support_not_duplicate_rows() {
         "duplicating existing tensor coordinates must not inflate the basis past its coordinate support: {repeated_basis}"
     );
 
-    // On a coarse crossed grid the replicated default reaches that support
-    // exactly and stops there, however many replicates are added.
+    // On a coarse crossed grid the replicated default grows with the rows only up
+    // to that support: once the rate-derived budget passes the 30 cells it
+    // reaches them exactly and stops there, however many replicates are added.
     let grid_rows = |reps: usize| {
         let mut rows = Vec::new();
         for _ in 0..reps {
@@ -4181,8 +4198,12 @@ fn inferred_tensor_basis_cap_uses_coordinate_support_not_duplicate_rows() {
         }
         continuous_dataset(&["y", "theta", "h"], rows)
     };
-    assert_eq!(inferred_tensor_basis_product(&grid_rows(40)), 30);
-    assert_eq!(inferred_tensor_basis_product(&grid_rows(400)), 30);
+    let covering = (1..)
+        .find(|&reps| default_num_centers(30 * reps, 2) >= 30)
+        .expect("the default budget grows without bound in n");
+    assert!(inferred_tensor_basis_product(&grid_rows(covering / 2)) <= 30);
+    assert_eq!(inferred_tensor_basis_product(&grid_rows(covering)), 30);
+    assert_eq!(inferred_tensor_basis_product(&grid_rows(10 * covering)), 30);
 }
 
 #[test]

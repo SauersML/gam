@@ -1780,15 +1780,19 @@ fn adaptive_spatial_start_is_activated_only_by_its_orchestrator() {
     assert_eq!(explicit_spec.center_strategy.planned_num_centers(2), 12);
     assert!(!center_strategy_is_auto(&explicit_spec.center_strategy));
 
-    // Second arm, at an n where the `n / COND_N_DIVISOR` conditioning cap in
-    // `default_num_centers` no longer binds: the raw request is at the 30-center
-    // provisioned cap, and the rate pilot is STRICTLY below the production
+    // Second arm, at the least n where the rate-derived `default_num_centers`
+    // (`2·⌈n^{1/3}⌉` in 2-D, #3149) reaches the 30-center provisioned cap: the raw
+    // request is at that cap, and the rate pilot is STRICTLY below the production
     // ceiling, so the orchestrator's grow loop has something to escalate.
-    let wide = duchon_workflow_dataset_with_rows(200);
+    let cap_rows = (1..)
+        .find(|&n| default_num_centers(n, 2) >= 30)
+        .expect("the default center count grows without bound in n");
+    let wide = duchon_workflow_dataset_with_rows(cap_rows);
     let wide_rows = wide.values.nrows();
+    assert_eq!(wide_rows, cap_rows);
     let low_rank_representer_rank = starting_num_centers(wide_rows, 2, 3);
     let wide_raw = materialize("y ~ duchon(ct, st)", &wide, &FitConfig::default())
-        .expect("raw Duchon materialization at 200 rows");
+        .expect("raw Duchon materialization at the cap-binding row count");
     let FitRequest::Standard(wide_raw_request) = wide_raw.request else {
         panic!("expected standard request");
     };

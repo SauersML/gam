@@ -94,6 +94,16 @@ fn binomial_location_scale_nll_in_predictors<S: JetScalar<2>>(
 /// is smaller still and falls geometrically, and `e^{−100}` is far below the
 /// double-precision resolution of the sum. The terms are scaled by the maximum
 /// before summation so the sum is formed at unit magnitude.
+///
+/// Each term's `η_d` slope is also taken relative to the largest term's index
+/// `j*`: `ln W = ln Σ e^{z_j − (j*/(p−1))·η_d} + (j*/(p−1))·η_d`. The `k`-th
+/// derivative of `ln W` is the `k`-th cumulant of `j/(p−1)` under `π_j ∝ e^{z_j}`,
+/// which the jet algebra reaches through the raw moments of the slope. Raw moments
+/// of `j/(p−1)` itself are of order `(j*/(p−1))^k` and cancel down to a cumulant of
+/// order `(σ_j/(p−1))^k`: at `p = 1.1` and `j* ≈ 18` the third cumulant is formed
+/// from terms near `6·10⁶` and carries a roundoff of `1e-9`, the size of the
+/// production row program's disagreement with this oracle. Slopes relative to
+/// `j*` leave the raw moments at the cumulants' own scale.
 pub(crate) fn tweedie_log_series_jet<S: JetScalar<K>, const K: usize>(
     eta_d: &S,
     yi: f64,
@@ -103,8 +113,10 @@ pub(crate) fn tweedie_log_series_jet<S: JetScalar<K>, const K: usize>(
     let alpha = (2.0 - p) / (p - 1.0);
     let rate = 1.0 / (p - 1.0);
     let c0 = alpha * (yi.ln() - (p - 1.0).ln()) - (2.0 - p).ln();
-    let c = c0 + rate * eta_d.value();
+    let eta0 = eta_d.value();
+    let c = c0 + rate * eta0;
     let mut z_ref = f64::NEG_INFINITY;
+    let mut j_ref = 1usize;
     let mut last = 1usize;
     loop {
         let jf = last as f64;
@@ -112,28 +124,36 @@ pub(crate) fn tweedie_log_series_jet<S: JetScalar<K>, const K: usize>(
         assert!(z.is_finite(), "Tweedie series oracle term {last} is not finite");
         if z > z_ref {
             z_ref = z;
+            j_ref = last;
         } else if z < z_ref - TAIL {
             break;
         }
         last += 1;
         assert!(last < 10_000_000, "Tweedie series oracle did not reach its tail");
     }
+    let slope_ref = j_ref as f64 * rate;
     let mut series: Option<S> = None;
     for j in 1..=last {
         let jf = j as f64;
+        // `z_j − z_ref` at `η_d`, with the slope `j·rate` split as
+        // `(j − j*)·rate` on the jet plus `j*·rate` on its value.
         let term = eta_d
-            .scale(jf * rate)
-            .add_constant(jf * c0 - ln_gamma(jf + 1.0) - ln_gamma(jf * alpha) - z_ref)
+            .scale((jf - j_ref as f64) * rate)
+            .add_constant(
+                jf * c0 - ln_gamma(jf + 1.0) - ln_gamma(jf * alpha) + slope_ref * eta0 - z_ref,
+            )
             .exp();
         series = Some(match series {
             None => term,
             Some(sum) => sum.add(&term),
         });
     }
+    // The returned jet adds back `j*·rate·(η_d − η₀)`, whose value is exactly zero.
     series
         .expect("the Tweedie series oracle sums at least one term")
         .ln()
         .add_constant(z_ref)
+        .add(&eta_d.scale(slope_ref).add_constant(-(slope_ref * eta0)))
 }
 
 /// Tweedie compound Poisson–Gamma row NLL written ONCE over a generic

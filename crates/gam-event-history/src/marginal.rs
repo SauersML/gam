@@ -563,9 +563,33 @@ pub(crate) fn condition<S: JetField>(
         .collect();
     let log_normaliser = log_sum_exp(&terms);
     if !log_normaliser.value().is_finite() {
+        // Every term is `ln p̂_i + ell_i − shift + ln w_i`, so the refusal names
+        // which of the three carried no mass: how many of each are not finite, and
+        // the largest finite value each reached.
+        let census = |values: &mut dyn Iterator<Item = f64>| {
+            let (mut non_finite, mut largest) = (0usize, f64::NEG_INFINITY);
+            for value in values {
+                if value.is_finite() {
+                    largest = largest.max(value);
+                } else {
+                    non_finite += 1;
+                }
+            }
+            format!("{non_finite} not finite, largest finite {largest:e}")
+        };
         return Err(numerical(format!(
-            "{label}: log normaliser is not finite ({})",
-            log_normaliser.value()
+            "{label}: log normaliser is not finite ({}) over {} grid point(s) on axes \
+             (centre, spread) {:?}: log predicted density {}; node log-likelihood {} (shift \
+             {shift:e}); log weights {}",
+            log_normaliser.value(),
+            terms.len(),
+            grid.axes
+                .iter()
+                .map(|axis| (axis.mu.value(), axis.sigma.value()))
+                .collect::<Vec<_>>(),
+            census(&mut log_predicted.iter().map(|p| p.value())),
+            census(&mut ell.iter().map(|e| e.value())),
+            census(&mut grid.weights.iter().map(|w| ln(w).value())),
         )));
     }
     let log_alpha: Vec<S> = raw.iter().map(|r| r.sub(&log_normaliser)).collect();
@@ -2661,24 +2685,39 @@ mod tests {
             ));
         }
         // Each claim is read against ITS OWN convergence in the Gauss-Hermite
-        // order: the largest move either moment makes between consecutive
-        // orders, floored by the dense reference's own error, since nothing
-        // here resolves below that.
-        let step = |pick: &dyn Fn(&((f64, f64), (f64, f64))) -> (f64, f64)| -> f64 {
-            measured
+        // order. The error of order `o` telescopes onto the finest order's,
+        // `|e_o| ≤ Σ_{k ≥ o} |m_k − m_{k+1}| + |e_finest|`, and the finest is
+        // bounded by the move into it under the halving premise every ladder
+        // here rests on (`|e_finest| ≤ |e_prev|/2` gives `|e_finest| ≤ |m_prev −
+        // m_finest|`; Gauss-Hermite convergence on this smooth integrand is far
+        // faster). A single move is not a bound on an order's error: order 9
+        // missed by 3.73e-6 against a largest move of 3.57e-6. Every bar is
+        // floored by the dense reference's own error, since nothing here
+        // resolves below that.
+        let bars = |pick: &dyn Fn(&((f64, f64), (f64, f64))) -> (f64, f64)| -> Vec<f64> {
+            let moves: Vec<f64> = measured
                 .windows(2)
                 .map(|pair| {
                     let (coarse, fine) = (pick(&pair[0]), pick(&pair[1]));
                     (coarse.0 - fine.0).abs().max((coarse.1 - fine.1).abs())
                 })
-                .fold(0.0_f64, f64::max)
+                .collect();
+            let finest = moves.last().copied().unwrap_or(0.0);
+            (0..measured.len())
+                .map(|o| (moves[o..].iter().sum::<f64>() + finest).max(reference_error))
+                .collect()
         };
-        let smoother_bar = step(&|m| m.0).max(reference_error);
-        let filter_bar = step(&|m| m.1).max(reference_error);
+        let smoother_bars = bars(&|m| m.0);
+        let filter_bars = bars(&|m| m.1);
         eprintln!(
-            "bars: smoother {smoother_bar:.3e}, forward filter {filter_bar:.3e}, dense reference {reference_error:.3e}"
+            "bars by order: smoother {smoother_bars:.3?}, forward filter {filter_bars:.3?}, \
+             dense reference {reference_error:.3e}"
         );
-        for (&order, &(node_0, final_node)) in orders.iter().zip(&measured) {
+        for ((&order, &(node_0, final_node)), (&smoother_bar, &filter_bar)) in orders
+            .iter()
+            .zip(&measured)
+            .zip(smoother_bars.iter().zip(&filter_bars))
+        {
             let (mean_error, sd_error) = (node_0.0 - smoothed.0, node_0.1 - smoothed.1);
             let (last_mean, last_sd) = (final_node.0 - last.0, final_node.1 - last.1);
             eprintln!(
@@ -2688,15 +2727,15 @@ mod tests {
             assert!(
                 mean_error.abs() <= smoother_bar && sd_error.abs() <= smoother_bar,
                 "order {order}: node 0's smoothed marginal N({:.6}, {:.6}²) misses the dense N({:.6}, {:.6}²) by \
-                 ({mean_error:+.3e}, {sd_error:+.3e}), past the {smoother_bar:.3e} the BACKWARD pass moves by \
-                 between these orders",
+                 ({mean_error:+.3e}, {sd_error:+.3e}), past the {smoother_bar:.3e} its moves across the finer \
+                 orders bound",
                 node_0.0, node_0.1, smoothed.0, smoothed.1
             );
             assert!(
                 last_mean.abs() <= filter_bar && last_sd.abs() <= filter_bar,
                 "order {order}: the last node's filtered marginal N({:.6}, {:.6}²) misses the dense \
                  N({:.6}, {:.6}²) by ({last_mean:+.3e}, {last_sd:+.3e}), past the {filter_bar:.3e} the \
-                 FORWARD filter moves by between these orders",
+                 forward filter's moves across the finer orders bound",
                 final_node.0, final_node.1, last.0, last.1
             );
         }

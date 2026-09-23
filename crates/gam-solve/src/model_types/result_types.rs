@@ -6712,12 +6712,19 @@ impl UnifiedFitResult {
                     spec: spec.clone(),
                     scale: self.likelihood_scale.clone(),
                 };
-                let profiled_standard_deviation = matches!(
-                    glm.resolved_scale()
-                        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?,
-                    gam_problem::ResolvedLikelihoodScale::ProfiledGaussian
-                )
-                .then_some(self.standard_deviation);
+                let resolved = glm
+                    .resolved_scale()
+                    .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+                // A family with no GLM dispersion has no dispersion to resolve, and
+                // its covariance scale is the unit the spec states (gam#3568).
+                if matches!(resolved, gam_problem::ResolvedLikelihoodScale::Unspecified) {
+                    return glm
+                        .coefficient_covariance_scale(1.0)
+                        .map_err(|error| EstimationError::InvalidInput(error.to_string()));
+                }
+                let profiled_standard_deviation =
+                    matches!(resolved, gam_problem::ResolvedLikelihoodScale::ProfiledGaussian)
+                        .then_some(self.standard_deviation);
                 let dispersion =
                     dispersion_from_likelihood(&glm, profiled_standard_deviation)?;
                 glm.coefficient_covariance_scale(dispersion.phi())

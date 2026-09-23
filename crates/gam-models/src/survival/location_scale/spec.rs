@@ -305,6 +305,11 @@ pub struct SurvivalLocationScaleFitResultParts {
     /// carried through rather than defaulted so finalization cannot drop the record the
     /// inner fit made.
     pub coefficient_mode_selection: gam_solve::model_types::CoefficientModeSelection,
+    /// The likelihood curvature `X'WX = H − S(λ)` beside `geometry`'s penalized
+    /// Hessian, in the same active frame, carried from the inner custom-family fit
+    /// so the smooth-term score test can read it (gam#3346, gam#3568). `None` when
+    /// the inner fit had no raw-layout `S(λ)` to subtract.
+    pub weighted_gram: Option<Array2<f64>>,
 }
 
 #[derive(Clone, Copy)]
@@ -424,6 +429,7 @@ pub fn survival_fit_from_parts(
         edf_by_block,
         edf_rank_bound,
         coefficient_mode_selection,
+        weighted_gram,
     } = parts;
 
     // Validation (preserved from the old impl).
@@ -791,7 +797,7 @@ pub fn survival_fit_from_parts(
             smoothing_correction_factorized: None,
             beta_covariance_frequentist: None,
             coefficient_influence: None,
-            weighted_gram: None,
+            weighted_gram: weighted_gram.clone(),
             identified_subspace: None,
             working_residual: None,
         });

@@ -276,6 +276,7 @@ fn test_survival_fit(
         edf_by_block: Vec::new(),
         edf_rank_bound: Vec::new(),
         coefficient_mode_selection: Default::default(),
+        weighted_gram: None,
     })
     .expect("valid survival test fit")
 }
@@ -327,6 +328,7 @@ fn survival_fit_parts_with_outer_evidence(
         edf_by_block: Vec::new(),
         edf_rank_bound: Vec::new(),
         coefficient_mode_selection: Default::default(),
+        weighted_gram: None,
     }
 }
 

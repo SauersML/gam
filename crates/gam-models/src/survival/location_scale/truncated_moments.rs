@@ -1882,6 +1882,7 @@ mod tests {
                 edf_by_block: Vec::new(),
                 edf_rank_bound: Vec::new(),
                 coefficient_mode_selection: Default::default(),
+                weighted_gram: None,
             })
             .expect("valid survival test fit");
             fit.covariance_conditional = Some(sigma_pi.clone());
@@ -2198,6 +2199,7 @@ mod tests {
             edf_by_block: Vec::new(),
             edf_rank_bound: Vec::new(),
             coefficient_mode_selection: Default::default(),
+            weighted_gram: None,
         })
         .expect("valid survival test fit");
         fit.covariance_conditional = Some(sigma_pi.clone());

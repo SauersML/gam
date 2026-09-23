@@ -36,6 +36,7 @@ fn survival_fit_from_parts_rejects_mismatched_lambda_lengths() {
         edf_by_block: Vec::new(),
         edf_rank_bound: Vec::new(),
         coefficient_mode_selection: Default::default(),
+        weighted_gram: None,
     };
 
     let result = survival_fit_from_parts(parts);

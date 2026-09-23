@@ -1753,7 +1753,6 @@ fn survival_edf_from_dense_hessian(
     penalty_blocks: &[PenaltyBlock],
 ) -> Result<(f64, Vec<f64>, Vec<f64>, Vec<gam_solve::estimate::EdfRankBound>), String> {
     let p = h_dense.nrows();
-    let h_sym = gam_linalg::matrix::SymmetricMatrix::Dense(h_dense.clone());
     // EDF is an exact trace of the fitted (unperturbed) penalized Hessian.
     // Factoring a different, ridged matrix silently changes the estimand, so a
     // singular/indefinite fitted Hessian is an inference failure rather than a
@@ -1762,18 +1761,42 @@ fn survival_edf_from_dense_hessian(
     // redundant Linear time-basis constant column is dropped in
     // `build_survival_time_basis` — so a singularity HERE is now a genuine defect
     // and refuses with the named flat direction (diag a0a9771ca).
-    // `X'W_HX` comes from the shared `fast_xt_diag_x` kernel, which mirrors,
-    // so the only rounding the two triangles can disagree by is the penalty
-    // Gram's, over at most `p` rows.
-    let factor = h_sym
-        .factorize(gam_linalg::roundoff::SymmetricAssembly::penalized_gram(
-            0, p,
-        ))
-        .map_err(|error| {
-            format!("survival edf: exact penalized-Hessian factorization failed: {error}")
-        })?;
+    // `X'W_HX` is the observed information at the fitted mode, whose weights
+    // `W_H` need not be non-negative (the transformation baseline's
+    // box-constrained mode, #2901), so `H` may be indefinite. Its EDF trace
+    // `tr(H⁻¹ λS)` is still defined wherever `H` is nonsingular, and #2901
+    // publishes an indefinite `H`'s trace raw with its rank bound uncertified.
+    // `SymmetricMatrix::factorize` is the strict SPD gate (#3696) and refuses
+    // exactly that `H`, so the trace solves go through the backward-stable
+    // symmetric factor instead: Cholesky where `H` is positive definite,
+    // Bunch–Kaufman otherwise. The trace band below is measured from each solve's
+    // own residual, so it prices either factor.
+    //
+    // The matrix factored is the Hessian's symmetric part, formed once here: a
+    // PSD-accumulation symmetry band would rest on every piece being PSD, which
+    // the signed `X'W_HX` is not.
+    let symmetric_part = (h_dense + &h_dense.t()) * 0.5;
+    let factor = gam_linalg::faer_ndarray::factorize_symmetricwith_fallback(
+        gam_linalg::faer_ndarray::FaerArrayView::new(&symmetric_part).as_ref(),
+        faer::Side::Lower,
+    )
+    .map_err(|error| {
+        format!("survival edf: exact penalized-Hessian factorization failed: {error:?}")
+    })?;
+    let solve_columns = |rhs: &Array2<f64>| -> Result<Array2<f64>, String> {
+        let solved = factor.solve(gam_linalg::faer_ndarray::FaerArrayView::new(rhs).as_ref());
+        let solved = Array2::from_shape_fn(rhs.dim(), |(row, column)| solved[(row, column)]);
+        if solved.iter().all(|value| value.is_finite()) {
+            Ok(solved)
+        } else {
+            Err("the symmetric factor's solve is not finite: the penalized Hessian is singular"
+                .to_string())
+        }
+    };
     let solve = |values: &mut [f64]| -> Result<(), String> {
-        let solved = factor.solve(&ndarray::Array1::from(values.to_vec()))?;
+        let rhs = Array2::from_shape_vec((values.len(), 1), values.to_vec())
+            .map_err(|error| error.to_string())?;
+        let solved = solve_columns(&rhs)?;
         for (slot, value) in values.iter_mut().zip(solved.iter()) {
             *slot = *value;
         }
@@ -1840,7 +1863,7 @@ fn survival_edf_from_dense_hessian(
         let mut rhs = Array2::<f64>::zeros((p, penalty_rank));
         rhs.slice_mut(ndarray::s![block.range.clone(), ..])
             .assign(&root.t());
-        let sol = factor.solvemulti(&rhs).map_err(|e| {
+        let sol = solve_columns(&rhs).map_err(|e| {
             // A converged fit whose penalized Hessian cannot support a finite
             // trace solve is an identifiability failure; name the flat direction
             // (issue #2301, diag a0a9771ca) instead of the opaque solver string.
@@ -2616,6 +2639,20 @@ fn survival_unified_fit_result(
         survival_transformation_edf(state, penalty_blocks)?;
     assert_eq!(edf_by_block.len(), lambdas.len());
     assert_eq!(penalty_block_trace.len(), lambdas.len());
+    // The data curvature beside `H` (gam#3346): the penalized Hessian is the
+    // observed information plus `S(λ) = Σ_k λ_k S_k` with no ridge (#2901), in
+    // the identity gauge's raw block coordinates, so `X'W_H X = H − S(λ)`. The
+    // smooth-term score test reads it; without it every survival smooth row was
+    // published with no p-value (gam#3568).
+    let mut weighted_gram = penalized_hessian.clone();
+    for block in penalty_blocks {
+        if block.lambda > 0.0 && !block.range.is_empty() {
+            let range = block.range.clone();
+            weighted_gram
+                .slice_mut(ndarray::s![range.clone(), range])
+                .scaled_add(-block.lambda, &block.matrix);
+        }
+    }
 
     // #2373 defect C: a converged single-cause transformation/weibull survival
     // fit carries the full observed-information penalized Hessian
@@ -2817,7 +2854,7 @@ fn survival_unified_fit_result(
         smoothing_correction_factorized: None,
         beta_covariance_frequentist: None,
         coefficient_influence: None,
-        weighted_gram: None,
+        weighted_gram: Some(weighted_gram),
         identified_subspace: None,
         working_residual: None,
     };

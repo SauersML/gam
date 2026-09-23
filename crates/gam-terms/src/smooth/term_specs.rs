@@ -4500,9 +4500,27 @@ pub(crate) fn try_build_sparse_design_from_blocks(
     )))
 }
 
+/// The design `[B₀ | B₁ | …]` of a term collection's blocks on `nrows` rows.
+///
+/// A collection with no blocks is the `nrows × 0` design: an intercept-only
+/// formula whose intercept a gauge removed (the binomial log-σ block, #3879)
+/// has no coefficients, and its linear predictor is its offset. The row count
+/// is passed in because no block is left to carry it.
 pub fn assemble_term_collection_design_matrix(
+    nrows: usize,
     blocks: Vec<DesignBlock>,
 ) -> Result<DesignMatrix, BasisError> {
+    if let Some(block) = blocks.iter().find(|block| block.nrows() != nrows) {
+        return Err(BasisError::InvalidInput(format!(
+            "term-collection design block has {} rows on {nrows} data rows",
+            block.nrows()
+        )));
+    }
+    if blocks.is_empty() {
+        return Ok(DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            Array2::<f64>::zeros((nrows, 0)),
+        )));
+    }
     if let Some(sparse) = try_build_sparse_design_from_blocks(&blocks)? {
         return Ok(sparse);
     }

@@ -351,6 +351,36 @@ pub(crate) fn custom_family_likelihood_curvature(
     Ok(curvature)
 }
 
+/// [`custom_family_likelihood_curvature`] in the frame of a gauged Hessian:
+/// `H_θ − TᵀS(λ)T`, with `S(λ)` assembled in the raw joint layout and pulled
+/// back through the gauge. On the identity gauge this is the raw form.
+pub(crate) fn custom_family_likelihood_curvature_in_gauge(
+    penalized_hessian: &Array2<f64>,
+    specs: &[ParameterBlockSpec],
+    lambdas: &ndarray::ArrayView1<'_, f64>,
+    gauge: &gam_problem::gauge::Gauge,
+) -> Result<Array2<f64>, CustomFamilyError> {
+    if gauge.is_identity() {
+        return custom_family_likelihood_curvature(penalized_hessian, specs, lambdas);
+    }
+    let raw_total = gauge.raw_total();
+    let reduced_total = gauge.reduced_total();
+    if penalized_hessian.dim() != (reduced_total, reduced_total) {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "custom-family likelihood curvature: a {:?} penalized Hessian under a gauge of \
+                 {reduced_total} active coordinates",
+                penalized_hessian.dim()
+            ),
+        });
+    }
+    // `S(λ)` in the raw layout: the raw curvature of a zero Hessian, negated.
+    let raw_penalty =
+        custom_family_likelihood_curvature(&Array2::zeros((raw_total, raw_total)), specs, lambdas)?
+            .mapv(|value| -value);
+    Ok(penalized_hessian - &gauge.restrict_penalty(&raw_penalty))
+}
+
 /// Effective degrees of freedom for a converged blockwise custom-family fit,
 /// computed from the joint penalized Hessian `H = X'W_HX + S(λ)` and the
 /// per-penalty matrices `S_k` exactly as the standard GAM path and mgcv do:
@@ -1190,17 +1220,17 @@ pub fn blockwise_fit_from_parts(
         })?;
     // The likelihood curvature `H − S(λ)` beside `H`, so the smooth score test
     // can read the score's covariance off the fit as it does on the standard
-    // lane. It is in the saved coefficient layout only when the gauge is the
-    // identity; an active-coordinate `H` has no raw-layout `S(λ)` to subtract.
-    let weighted_gram = if geom.coefficient_gauge.is_identity() {
-        Some(custom_family_likelihood_curvature(
-            geom.penalized_hessian.as_array(),
-            specs,
-            &lambdas.view(),
-        )?)
-    } else {
-        None
-    };
+    // lane. It is stored in `H`'s own frame. Under a gauge `β = Tθ + a` that
+    // frame is the active one, where the penalty's curvature is `TᵀS(λ)T`, the
+    // same congruence that carried it into `H`. So the difference is the
+    // likelihood curvature in θ, and `saved_frame_weighted_gram` pushes it
+    // forward exactly as it pushes `H` (gam#3346, gam#3568).
+    let weighted_gram = Some(custom_family_likelihood_curvature_in_gauge(
+        geom.penalized_hessian.as_array(),
+        specs,
+        &lambdas.view(),
+        &geom.coefficient_gauge,
+    )?);
     let inference = Some(gam_solve::model_types::FitInference {
         edf_by_block: edf_by_penalty,
         penalty_block_trace: penalty_trace,

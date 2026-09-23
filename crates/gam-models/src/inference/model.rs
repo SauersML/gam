@@ -4936,11 +4936,15 @@ impl FittedModel {
     /// `Option<f64>` reads back as `None`, silently.
     pub fn to_saved_bytes(&self) -> Result<Vec<u8>, FittedModelError> {
         let normalized = self.clone().with_synchronized_stateful_link_metadata();
+        // The document first: writing it walks every float the model holds and names
+        // the first non-finite one by path (#2601). The checks below then read a
+        // model known to be finite; before them a NaN would surface as whatever check
+        // it breaks first (`beta` no longer matching its blocks, since NaN != NaN).
+        let text = saved_model_text(SAVED_MODEL_KIND, u64::from(MODEL_PAYLOAD_VERSION), &normalized)
+            .map_err(saved_model_error)?;
         normalized.validate_for_persistence()?;
         normalized.validate_numeric_finiteness()?;
-        saved_model_text(SAVED_MODEL_KIND, u64::from(MODEL_PAYLOAD_VERSION), &normalized)
-            .map(String::into_bytes)
-            .map_err(saved_model_error)
+        Ok(text.into_bytes())
     }
 
     /// The model in a saved document, decoded in one streaming pass.
@@ -7595,44 +7599,51 @@ mod tests {
     fn a_saved_model_of_another_version_or_kind_is_refused_by_name_3350() {
         let model = FittedModel::from_payload(standard_gaussian_payload());
         let payload = serde_json::to_value(model.payload()).expect("serialize payload");
-        let refused = |document: serde_json::Value| -> FittedModelError {
-            match FittedModel::from_saved_bytes(document.to_string().as_bytes()) {
+        let refused = |document: &str| -> FittedModelError {
+            match FittedModel::from_saved_bytes(document.as_bytes()) {
                 Ok(_) => panic!("refused document loaded: {document}"),
                 Err(error) => error,
             }
         };
+        // The reader streams the header, so each document is written header first as
+        // a saved one is: `serde_json::json!` sorts its keys and would put `model`
+        // before `version`, and every document would then be refused for a missing
+        // version rather than for the one it names.
+        let document = |kind: &str, version: u32, model: &serde_json::Value| {
+            format!("{{\"kind\":\"{kind}\",\"version\":{version},\"model\":{model}}}")
+        };
         // #3001 kept this exhaustive: every version but this binary's own is
         // refused, not just its immediate neighbours.
-        let mut documents: Vec<(String, serde_json::Value)> = (0..MODEL_PAYLOAD_VERSION)
+        let mut documents: Vec<(String, String, String)> = (0..MODEL_PAYLOAD_VERSION)
             .chain([MODEL_PAYLOAD_VERSION + 1])
             .map(|version| {
                 (
                     format!("version {version}"),
-                    serde_json::json!({"kind": "gam", "version": version, "model": payload}),
+                    document("gam", version, &payload),
+                    format!("version Some({version})"),
                 )
             })
             .collect();
         documents.push((
             "other kind".to_string(),
-            serde_json::json!({"kind": "joint", "version": MODEL_PAYLOAD_VERSION, "model": payload}),
+            document("joint", MODEL_PAYLOAD_VERSION, &payload),
+            "kind Some(\"joint\")".to_string(),
         ));
         documents.push((
             "pre-envelope".to_string(),
-            serde_json::json!({"model_type": "standard", "payload": payload}),
+            serde_json::json!({"model_type": "standard", "payload": payload}).to_string(),
+            "kind None".to_string(),
         ));
-        for (name, document) in documents {
-            let error = refused(document);
+        for (name, document, named) in documents {
+            let error = refused(&document);
             assert!(
                 matches!(error, FittedModelError::SchemaMismatch { .. }),
                 "{name}: {error}"
             );
             assert!(error.to_string().contains("refit"), "{name}: {error}");
+            assert!(error.to_string().contains(&named), "{name} must be refused as {named}: {error}");
         }
-        let error = refused(serde_json::json!({
-            "kind": "gam",
-            "version": MODEL_PAYLOAD_VERSION,
-            "model": {"formula": 42},
-        }));
+        let error = refused(&document("gam", MODEL_PAYLOAD_VERSION, &serde_json::json!({"formula": 42})));
         assert!(matches!(error, FittedModelError::PayloadCorrupt { .. }), "{error}");
     }
 

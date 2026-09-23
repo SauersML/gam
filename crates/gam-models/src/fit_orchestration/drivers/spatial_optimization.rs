@@ -2336,7 +2336,7 @@ fn prepare_exact_joint_spatial_route<'d>(
         let SpatialJointContext {
             cache, evaluator, ..
         } = &mut ctx;
-        let attached = evaluator.build_and_set_psi_gram_tensor(
+        let attached = match evaluator.build_and_set_psi_gram_tensor(
             |psi| {
                 let mut theta_probe = theta_probe_base.clone();
                 theta_probe[rho_dim] = psi;
@@ -2347,7 +2347,13 @@ fn prepare_exact_joint_spatial_route<'d>(
             z.view(),
             psi_lo,
             psi_hi,
-        );
+        ) {
+            Ok(()) => true,
+            Err(why) => {
+                log::debug!("[{label}] {why}");
+                false
+            }
+        };
         if attached {
             log::debug!(
                 "[{label}] certified ψ-gram tensor over [{psi_lo:.3}, {psi_hi:.3}]: \
@@ -4686,7 +4692,8 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         for term_design in &self.design.smooth.term_designs {
             blocks.push(DesignBlock::from(term_design));
         }
-        self.design.design = assemble_term_collection_design_matrix(blocks)
+        let nrows = self.design.design.nrows();
+        self.design.design = assemble_term_collection_design_matrix(nrows, blocks)
             .map_err(|e| format!("failed to refresh term-collection design: {e}"))?;
         Ok(())
     }

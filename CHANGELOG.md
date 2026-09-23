@@ -1,5 +1,12 @@
 ## Unreleased
 
+- **Royston–Parmar smooth rows carry a score-test p-value** (gam#3568). A family with no GLM
+  dispersion stores the full observed information of its own likelihood, so its
+  coefficient-covariance scale is 1, and the survival route now publishes the likelihood
+  curvature `XᵀW_HX = H − S(λ)` beside `H`. Its smooth rows used to report no p-value. The
+  custom-family fit publishes that curvature under any coefficient gauge: under `β = Tθ + a` the
+  penalty's curvature in the active frame is `TᵀS(λ)T`. The location-scale survival lane still
+  reports no p-value for its smooth rows; that remains open.
 - **The anchored intercept's Taylor table keeps its digits deep in either tail** (gam#3639). The
   survival marginal-slope anchor solves `Σ_k w_k Φ(−(α + b u_k)) = Φ(−q)`. Its derivative table
   differentiated that equation directly, where every partial is a Hermite moment that grows like

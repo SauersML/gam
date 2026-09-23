@@ -1402,10 +1402,13 @@ mod tests {
         assert_eq!(carried, &trials);
         let draws = sampleobservation_seeded_replicates(&spec, 0, 4000, 4228).unwrap();
         let grouped = draws.column(0);
+        // A draw is `k / 50` correctly rounded, and `y·50` need not return `k` exactly
+        // (`0.14·50 = 7.000000000000001`): the nearest count must reproduce the draw.
         assert!(
-            grouped
-                .iter()
-                .all(|&y| (0.0..=1.0).contains(&y) && (y * 50.0).fract() == 0.0),
+            grouped.iter().all(|&y| {
+                let count = (y * 50.0).round();
+                (0.0..=50.0).contains(&count) && count / 50.0 == y
+            }),
             "every grouped draw is a count over 50 trials"
         );
         let n = grouped.len() as f64;

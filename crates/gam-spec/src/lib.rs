@@ -3275,10 +3275,12 @@ impl GlmLikelihoodSpec {
             // the data's overdispersion entirely through that `theta`-dependent
             // weight (issue #802) — multiplying again would double-count it.
             // The same holds verbatim for a user-fixed `theta` (issue #983).
-            | ResolvedLikelihoodScale::NegativeBinomial { .. } => Ok(1.0),
-            ResolvedLikelihoodScale::Unspecified => Err(InvalidLikelihoodScale::new(
-                "family has no scalar coefficient-covariance scale".to_string(),
-            )),
+            | ResolvedLikelihoodScale::NegativeBinomial { .. }
+            // A family with no GLM dispersion (Royston-Parmar) stores the full
+            // observed information of its own likelihood: nothing is profiled out,
+            // so there is no post-hoc scale to restore and `H⁻¹` is the covariance
+            // (gam#3568).
+            | ResolvedLikelihoodScale::Unspecified => Ok(1.0),
         }
     }
 

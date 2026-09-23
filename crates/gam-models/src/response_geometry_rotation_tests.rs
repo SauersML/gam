@@ -163,11 +163,23 @@ fn formula_shared_tangent_fit_preserves_output_rotations_2627() {
     let base_hessian = Array2::from_shape_fn((free.len(), free.len()), |(row, col)| {
         full_hessian[[free[row], free[col]]]
     });
-    let resolution = base
-        .outer_certificate
-        .curvature_floor
-        .expect("a measured outer Hessian records the resolution its verdict was decided at")
-        .decided_at_resolution;
+    // The resolution the certificate decided definiteness at. A certificate whose
+    // Hessian reported a negative direction the criterion cannot resolve at any
+    // step withdraws its verdict and the floor with it (#3036,
+    // `CriterionUnresolvable`): that direction is then adjudicated as below the
+    // criterion's resolution by the certificate itself, and only the directions
+    // of positive curvature carry a ball to check.
+    let resolution = match (
+        base.outer_certificate.curvature_floor,
+        base.outer_certificate.curvature,
+    ) {
+        (Some(floor), _) => Some(floor.decided_at_resolution),
+        (None, gam_solve::rho_optimizer::CurvatureEvidence::CriterionUnresolvable) => None,
+        (None, other) => panic!(
+            "a measured outer Hessian records the resolution its verdict was decided at; \
+             the certificate carries no floor beside the verdict {other:?}"
+        ),
+    };
     let (curvatures, directions) = base_hessian
         .eigh(Side::Lower)
         .expect("off-railed outer Hessian spectrum");
@@ -177,6 +189,20 @@ fn formula_shared_tangent_fit_preserves_output_rotations_2627() {
         Array1::from_shape_fn(free.len(), |row| base_rho[free[row]] - rotated_rho[free[row]]);
     let mut resolvable = 0usize;
     for (index, &curvature) in curvatures.iter().enumerate() {
+        let Some(resolution) = resolution else {
+            if curvature > 0.0 {
+                resolvable += 1;
+                let along = directions.column(index).dot(&displacement).abs();
+                let ball = gradient_sum / curvature;
+                assert!(
+                    along <= ball,
+                    "log-lambda rotation displacement {along:e} along eigen-direction {index} \
+                     (curvature {curvature:e}) exceeds the certified ball {ball:e} \
+                     (projected-gradient sum {gradient_sum:e})"
+                );
+            }
+            continue;
+        };
         if curvature > resolution {
             resolvable += 1;
             let along = directions.column(index).dot(&displacement).abs();
@@ -198,7 +224,7 @@ fn formula_shared_tangent_fit_preserves_output_rotations_2627() {
     assert!(
         resolvable > 0,
         "the certified ball must bound at least one resolvable direction: curvatures \
-         {curvatures:?}, resolution {resolution:e}"
+         {curvatures:?}, resolution {resolution:?}"
     );
     assert!((base.sigma2 - rotated.sigma2).abs() <= 1.0e-9 * base.sigma2.max(1.0));
 }
