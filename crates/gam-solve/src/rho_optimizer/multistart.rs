@@ -1254,8 +1254,15 @@ pub fn probe_face_for_a_lower_basin<S>(
     }
     let certified_criterion = criterion_at(state, &first.rho)?;
     let face_value = criterion_at(state, &face);
+    // A non-finite criterion at the face is a divergence there, not a value an
+    // optimum can be compared with (`<` is false for it either way), so it is
+    // recorded as the face's refusal: an `Evaluated` face always carries a
+    // number, which is what the saved model's finiteness contract reads.
     let face_record = match &face_value {
-        Ok(criterion) => FaceValue::Evaluated { criterion: *criterion },
+        Ok(criterion) if criterion.is_finite() => FaceValue::Evaluated { criterion: *criterion },
+        Ok(criterion) => FaceValue::Refused {
+            reason: format!("the criterion is {criterion} at the face"),
+        },
         Err(error) => FaceValue::Refused { reason: error.to_string() },
     };
     let (published, second_search) = match face_value {

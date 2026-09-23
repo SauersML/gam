@@ -384,3 +384,35 @@ fn expectile_tau_is_held_to_the_expectile_family_and_the_open_unit_interval() {
     let expectile = fit(&["--family", "expectile", "--expectile-tau", "0.9"]);
     assert!(expectile.status.success(), "{}", stderr(&expectile));
 }
+
+/// `--family` takes the names `gamfit.fit(..., family=...)` takes, because
+/// both hand the string to the one library resolver (#4574): a bare head, the
+/// hyphen spelling, and the parenthesized-link form all name the same Gamma
+/// fit, and a spelling the resolver refuses is refused with its message.
+#[test]
+fn family_flag_accepts_the_library_family_names() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/bug_hunt_explicit_family_gamma.csv"
+    );
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let model = scratch.path().join("model.gam");
+    let model = model.to_str().expect("UTF-8 path");
+    let fit = |family: &str| gam(&["fit", fixture, "y ~ x", "--family", family, "--out", model]);
+
+    for family in ["gamma", "gamma-log", "Gamma(log)"] {
+        let output = fit(family);
+        assert!(output.status.success(), "--family {family}: {}", stderr(&output));
+    }
+
+    let alias = fit("nb");
+    assert!(!alias.status.success(), "{}", stderr(&alias));
+    assert!(
+        stderr(&alias).contains("unknown family `nb`; use `negative-binomial`"),
+        "{}",
+        stderr(&alias)
+    );
+    let misspelled = fit("gama");
+    assert!(!misspelled.status.success(), "{}", stderr(&misspelled));
+    assert!(stderr(&misspelled).contains("unknown family 'gama'"), "{}", stderr(&misspelled));
+}

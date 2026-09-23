@@ -303,6 +303,21 @@ impl FittedModelError {
         }
     }
 
+    /// The same refusal with its reason prefixed by `context`, so a caller that
+    /// knows where the payload came from (a path) can name it without changing
+    /// the variant, and so the category, the refusal carries.
+    #[must_use]
+    pub fn with_context(self, context: &str) -> Self {
+        let prefix = |reason: String| format!("{context}: {reason}");
+        match self {
+            Self::SchemaMismatch { reason } => Self::SchemaMismatch { reason: prefix(reason) },
+            Self::PayloadCorrupt { reason } => Self::PayloadCorrupt { reason: prefix(reason) },
+            Self::MissingField { reason } => Self::MissingField { reason: prefix(reason) },
+            Self::IncompatibleConfig { reason } => Self::IncompatibleConfig { reason: prefix(reason) },
+            Self::InvalidInput { reason } => Self::InvalidInput { reason: prefix(reason) },
+        }
+    }
+
     /// The `Enum::Variant` name a front end reports beside the category.
     #[must_use]
     pub fn variant_name(&self) -> &'static str {
@@ -4935,6 +4950,7 @@ impl FittedModel {
             reason: format!("failed to read model '{}': {e}", path.display()),
         })?;
         Self::from_saved_bytes(&bytes)
+            .map_err(|error| error.with_context(&format!("failed to parse model '{}'", path.display())))
     }
 
     /// Write the saved document to `path` atomically: a crash mid-write never

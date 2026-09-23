@@ -280,6 +280,10 @@ fn a_cli_forecast_refuses_a_bad_model_file_with_its_category() {
         &model,
     ]);
     assert_eq!(fit.status.code(), Some(0), "{}", stderr(&fit));
+    // Only a subject still at risk has a forecast: `a`'s history ended in a
+    // terminal event, which the forecast refuses by name.
+    let at_risk_subjects = write("at_risk_subjects.csv", "id,entry,exit\nb,0,6\n");
+    let at_risk_events = write("at_risk_events.csv", "id,time,mark\nb,1,visit\n");
     let forecast = |model: &str| {
         gam(&[
             "joint-events",
@@ -287,9 +291,9 @@ fn a_cli_forecast_refuses_a_bad_model_file_with_its_category() {
             "--model",
             model,
             "--subjects",
-            &subjects,
+            &at_risk_subjects,
             "--events",
-            &events,
+            &at_risk_events,
             "--horizons",
             "1",
         ])

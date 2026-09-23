@@ -75,7 +75,9 @@ fn cli_fit_reports_empty_frame_without_panicking() {
 /// layer the Python API reaches, so the CLI reports the same typed messages.
 #[test]
 fn cli_fit_reports_family_support_weight_and_row_errors_at_the_shared_boundary() {
-    let counts = "y,x,w\n1,0.1,1\n0,0.2,1\n2.5,0.3,1\n3,0.4,1\n1,0.5,1\n";
+    // Poisson's support is the non-negative reals (gam#4572: a non-integer y is
+    // its quasi-likelihood), so the out-of-support row is a negative one.
+    let counts = "y,x,w\n1,0.1,1\n0,0.2,1\n-2.5,0.3,1\n3,0.4,1\n1,0.5,1\n";
     let negative_weight = "y,x,w\n1,0.1,1\n0,0.2,1\n2,0.3,-1\n3,0.4,1\n1,0.5,1\n";
     let zero_weights = "y,x,w\n1,0.1,0\n0,0.2,0\n2,0.3,0\n3,0.4,0\n1,0.5,0\n";
     let cases: [(&str, &str, bool, &[&str]); 4] = [
@@ -83,7 +85,7 @@ fn cli_fit_reports_family_support_weight_and_row_errors_at_the_shared_boundary()
             counts,
             "poisson-log",
             false,
-            &["column 'y'", "Poisson family", "first offending row 3 has value 2.5"],
+            &["column 'y'", "Poisson family", "first offending row 3 has value -2.5"],
         ),
         (
             negative_weight,

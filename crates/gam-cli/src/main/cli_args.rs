@@ -383,9 +383,13 @@ pub(crate) struct FitArgs {
     /// non-binomial families.
     #[arg(long = "firth", default_value_t = false)]
     pub(crate) firth: bool,
-    /// Explicit response family. Use `auto` to infer the family.
-    #[arg(long = "family", value_enum, default_value_t = FamilyArg::Auto)]
-    pub(crate) family: FamilyArg,
+    /// Response family, in any spelling the library resolver accepts — the
+    /// same names as `gamfit.fit(..., family=...)`: `gaussian`, `binomial`,
+    /// `binomial(probit)`, `poisson`, `gamma(log)`, `negative-binomial`,
+    /// `tweedie(1.6)`, `student-t`, `royston-parmar`, `expectile`,
+    /// `multinomial`, .... `auto` (the default) infers it from the response.
+    #[arg(long = "family", default_value = "auto")]
+    pub(crate) family: String,
     /// Fixed size/overdispersion parameter for `--family negative-binomial`.
     #[arg(long = "negative-binomial-theta", value_parser = parse_positive_f64_cli)]
     pub(crate) negative_binomial_theta: Option<f64>,
@@ -714,36 +718,6 @@ pub(crate) struct ReportArgs {
         help = "Output HTML path; default: <model_stem>.report.html"
     )]
     pub(crate) out: Option<PathBuf>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub(crate) enum FamilyArg {
-    Auto,
-    Gaussian,
-    BinomialLogit,
-    BinomialProbit,
-    BinomialCloglog,
-    LatentCloglogBinomial,
-    PoissonLog,
-    NegativeBinomial,
-    GammaLog,
-    /// Inverse-Gaussian (`V(μ) = φμ³`) with its canonical `1/μ²` link; the
-    /// log link is selected in the formula with `link(type=log)`.
-    InverseGaussian,
-    Tweedie,
-    Beta,
-    /// Robust scaled Student-t response on the identity link; its scale and
-    /// degrees of freedom are estimated jointly with the smoothing parameters.
-    StudentT,
-    RoystonParmar,
-    Expectile,
-    /// Penalized multinomial-logit GAM: a categorical response with K classes
-    /// modelled by a shared-covariate softmax over K-1 active-class linear
-    /// predictors (the last class is the reference). Routes through the same
-    /// `fit_penalized_multinomial_formula` REML/LAML driver as
-    /// `gamfit.fit(..., family='multinomial')`. `gam predict` emits per-class
-    /// softmax probabilities.
-    Multinomial,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Eq, PartialEq)]

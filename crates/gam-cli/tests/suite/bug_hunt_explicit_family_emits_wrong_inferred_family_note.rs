@@ -16,7 +16,7 @@
 //! `link_choice.is_none()`, ignoring whether the family was actually
 //! auto-inferred. When `--family` is explicit, `resolve_family` uses the
 //! requested family and no inference occurs, so no note should be emitted. The
-//! note must additionally require `matches!(args.family, FamilyArg::Auto)`.
+//! note must additionally require the family to be left at `auto`.
 //!
 //! This test fits a strictly-positive continuous response with an explicit
 //! `--family gamma-log` (default link) and asserts stderr does NOT contain the
@@ -90,7 +90,7 @@ fn explicit_family_does_not_emit_wrong_inferred_family_note() {
         !stderr.contains("Inferred gaussian-identity family"),
         "explicit `--family gamma-log` emitted the bogus gaussian-identity \
          inference note; the note must be gated on the family actually being \
-         auto-inferred (FamilyArg::Auto), not merely on the link being default.\n\
+         auto-inferred (`--family auto`), not merely on the link being default.\n\
          stderr tail: {}",
         stderr.lines().rev().take(8).collect::<Vec<_>>().join("\n")
     );

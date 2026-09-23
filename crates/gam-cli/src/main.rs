@@ -143,8 +143,6 @@ mod cli_errors;
 use gam::config_resolve;
 #[path = "main/dataset_io.rs"]
 mod dataset_io;
-#[path = "main/family_resolve.rs"]
-mod family_resolve;
 #[path = "main/model_build.rs"]
 mod model_build;
 #[path = "main/model_summary.rs"]
@@ -181,7 +179,6 @@ mod smooth_warnings;
 pub(crate) use cli_args::*;
 pub(crate) use cli_errors::*;
 pub(crate) use dataset_io::*;
-pub(crate) use family_resolve::*;
 pub(crate) use model_build::*;
 pub(crate) use model_summary::*;
 pub(crate) use multinomial_cli::*;

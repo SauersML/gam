@@ -47,7 +47,7 @@ fn fit_request_document_from_fit_args(
         baseline_shape: args.baseline_shape,
         baseline_target: Some(args.baseline_target.clone()),
         expectile_tau: args.expectile_tau.clone(),
-        family: family_arg_canonical_name(args.family).map(str::to_string),
+        family: Some(args.family.clone()),
         firth: args.firth.then_some(true),
         frailty_kind,
         frailty_sd: args.frailty_sd,

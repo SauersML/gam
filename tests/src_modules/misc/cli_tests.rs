@@ -1,11 +1,11 @@
 use gam::smooth::BoundedCoefficientPriorSpec;
 use super::{
     BlockRole, CliError, CliFirthValidation,
-    FamilyArg, FittedFamily, LikelihoodSpec, LinkChoice, LinkMode,
+    FittedFamily, LikelihoodSpec, LinkChoice, LinkMode,
     ResponseFamily, SavedModel, SurvivalBaselineTarget,
     SurvivalLikelihoodMode, build_survival_time_basis,
     compact_fit_result_for_batch,
-    covariance_from_model, family_arg_canonical_name,
+    covariance_from_model,
     fit_required_columns, formula_columns, load_prediction_id_values, parse_formula,
     parse_surv_response, parse_survival_time_basis_config, predict_gam,
     prepend_id_column_to_prediction_csv,
@@ -568,18 +568,15 @@ mod tests {
 use saved_fit_fixtures::{SavedFitSummary, compact_saved_multiblock_fit_result, core_saved_fit_result};
 
 fn resolve_family(
-    arg: FamilyArg,
+    family: Option<&str>,
     negative_binomial_theta: Option<f64>,
     link_choice: Option<LinkChoice>,
     y: ArrayView1<'_, f64>,
     y_kind: ResponseColumnKind,
     response_name: &str,
 ) -> Result<LikelihoodSpec, String> {
-    if negative_binomial_theta.is_some() && !matches!(arg, FamilyArg::NegativeBinomial) {
-        return Err("--negative-binomial-theta requires --family negative-binomial".to_string());
-    }
     gam::families::fit_orchestration::resolve_family(
-        family_arg_canonical_name(arg),
+        family,
         negative_binomial_theta,
         link_choice.as_ref(),
         y,
@@ -1117,7 +1114,7 @@ fn location_scale_fit_args(
         hazard_loading: None,
         transformation_normal: false,
         firth: false,
-        family: FamilyArg::Auto,
+        family: "auto".to_string(),
         negative_binomial_theta: None,
         survival_likelihood: None,
         baseline_target: "linear".to_string(),
@@ -1403,15 +1400,13 @@ fn load_dataset_projected_keeps_only_requested_columns() {
     assert_eq!(ds.values[[1, 1]], 1.0);
 }
 
-/// The CLI flag rule `--negative-binomial-theta` requires
-/// `--family negative-binomial` is a surface concern owned by the CLI
-/// adapter (the canonical resolver only rejects a theta with no family at
-/// all). Guard it explicitly so the adapter keeps enforcing it.
+/// `--negative-binomial-theta` names a nuisance of the negative-binomial
+/// family, so the canonical resolver refuses it beside any other family.
 #[test]
 fn cli_resolve_family_rejects_theta_without_negative_binomial() {
     let y = array![0.0, 1.0, 2.0, 3.0];
     let err = resolve_family(
-        FamilyArg::PoissonLog,
+        Some("poisson"),
         Some(2.0),
         None,
         y.view(),
@@ -1419,10 +1414,7 @@ fn cli_resolve_family_rejects_theta_without_negative_binomial() {
         "y",
     )
     .expect_err("theta without negative-binomial family must be rejected");
-    assert_eq!(
-        err,
-        "--negative-binomial-theta requires --family negative-binomial"
-    );
+    assert!(err.contains("negative_binomial_theta applies only to"), "{err}");
 }
 
 #[test]
@@ -1494,8 +1486,8 @@ fn cli_scale_dimensions_fit_keeps_one_duchon_penalty_structure_for_every_family(
     }
     fs::write(&train_path, csv).unwrap_or_else(|e| panic!("{} failed: {:?}", "write csv", e));
 
-    for family in [FamilyArg::Gaussian, FamilyArg::PoissonLog] {
-        let model_path = td.path().join(format!("model_{family:?}.json"));
+    for family in ["gaussian", "poisson"] {
+        let model_path = td.path().join(format!("model_{family}.json"));
         run_fit(FitArgs {
             expectile_tau: None,
             data: train_path.clone(),
@@ -1513,7 +1505,7 @@ fn cli_scale_dimensions_fit_keeps_one_duchon_penalty_structure_for_every_family(
             hazard_loading: None,
             transformation_normal: false,
             firth: false,
-            family,
+            family: family.to_string(),
             negative_binomial_theta: None,
             survival_likelihood: None,
             baseline_target: "linear".to_string(),
@@ -1641,7 +1633,7 @@ fn cli_and_engine_agree_on_the_left_truncated_survival_anchor_2631() {
         hazard_loading: None,
         transformation_normal: false,
         firth: false,
-        family: FamilyArg::Auto,
+        family: "auto".to_string(),
         negative_binomial_theta: None,
         survival_likelihood: Some("location-scale".to_string()),
         baseline_target: "linear".to_string(),
@@ -1727,7 +1719,7 @@ fn cli_weibull_route_anchors_left_truncated_data_at_the_median_exit_2631() {
         hazard_loading: None,
         transformation_normal: false,
         firth: false,
-        family: FamilyArg::Auto,
+        family: "auto".to_string(),
         negative_binomial_theta: None,
         survival_likelihood: Some("weibull".to_string()),
         baseline_target: "linear".to_string(),
@@ -1809,7 +1801,7 @@ fn cli_request_document_survival_time_anchor_reaches_the_fit_2631() {
     args.formula_positional = None;
     args.predict_noise = None;
     args.survival_likelihood = None;
-    args.family = FamilyArg::Auto;
+    args.family = "auto".to_string();
     run_fit(args).unwrap_or_else(|e| {
         panic!(
             "{} failed: {:?}",
@@ -1947,7 +1939,7 @@ fn cli_request_document_frailty_reaches_the_latent_survival_route() {
         args.formula_positional = None;
         args.predict_noise = None;
         args.survival_likelihood = None;
-        args.family = FamilyArg::Auto;
+        args.family = "auto".to_string();
         run_fit(args)
             .expect_err("the latent survival route must refuse a frailty other than HazardMultiplier")
             .to_string()
@@ -2054,7 +2046,7 @@ fn cli_request_document_firth_is_refused_for_multinomial() {
 
     // Control: the flags reach the refusal.
     let mut flag_args = base();
-    flag_args.family = FamilyArg::Multinomial;
+    flag_args.family = "multinomial".to_string();
     flag_args.firth = true;
     let from_flags = run_fit(flag_args)
         .expect_err("multinomial must refuse Firth")
@@ -2173,7 +2165,7 @@ fn cli_request_document_family_on_a_surv_response_is_refused() {
 
     // Control: the flag reaches the refusal.
     let mut flag_args = base();
-    flag_args.family = FamilyArg::Gaussian;
+    flag_args.family = "gaussian".to_string();
     let from_flags = run_fit(flag_args)
         .expect_err("a family on a Surv(...) response must be refused")
         .to_string();
@@ -2236,7 +2228,7 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
         hazard_loading: None,
         transformation_normal: false,
         firth: false,
-        family: FamilyArg::Auto,
+        family: "auto".to_string(),
         negative_binomial_theta: None,
         // The noise formula IS the log-sigma predictor, so under the DEFAULT
         // likelihood it selects the location-scale model, which is the routing
@@ -2468,7 +2460,7 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
         hazard_loading: None,
         transformation_normal: false,
         firth: true,
-        family: FamilyArg::Auto,
+        family: "auto".to_string(),
         negative_binomial_theta: None,
         // #2301: `survival_likelihood` is `Option<String>` defaulting to `None`,
         // and the single canonical default ("transformation") is resolved at the
@@ -2552,9 +2544,13 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
     // `PosteriorMeanOptions::point_only()` absent a confidence level, because
     // "passing a confidence level is the switch that populates SE/bounds"
     // (#2136). So the default predict carries no `std_error`/bands, and the
-    // banded schema is asserted separately below.
+    // banded schema is asserted separately below. The score derivatives follow
+    // the risk score: they are integrated over the same posterior nodes
+    // (00258e517c).
     assert_eq!(
-        header, "eta,mean_plugin,mean,event_prob,failure_prob,survival_prob,risk_score",
+        header,
+        "eta,mean_plugin,mean,event_prob,failure_prob,survival_prob,risk_score,\
+         mean_score_derivative,probit_score_derivative",
         "posterior-mean marginal-slope prediction header drifted"
     );
 }
@@ -2582,7 +2578,7 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_main_formula() {
         hazard_loading: None,
         transformation_normal: false,
         firth: false,
-        family: FamilyArg::Auto,
+        family: "auto".to_string(),
         negative_binomial_theta: None,
         survival_likelihood: None,
         baseline_target: "linear".to_string(),
@@ -2627,7 +2623,7 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_slope_formula() {
         hazard_loading: None,
         transformation_normal: false,
         firth: false,
-        family: FamilyArg::Auto,
+        family: "auto".to_string(),
         negative_binomial_theta: None,
         survival_likelihood: None,
         baseline_target: "linear".to_string(),
@@ -3088,7 +3084,7 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         hazard_loading: None,
         transformation_normal: false,
         firth: false,
-        family: FamilyArg::Auto,
+        family: "auto".to_string(),
         negative_binomial_theta: None,
         // #2301: `survival_likelihood` is `Option<String>` defaulting to `None`,
         // and the single canonical default ("transformation") is resolved at the
@@ -3227,7 +3223,7 @@ fn binomial_link_fit_args(data: PathBuf, out: PathBuf, formula: &str) -> FitArgs
         hazard_loading: None,
         transformation_normal: false,
         firth: false,
-        family: FamilyArg::Auto,
+        family: "auto".to_string(),
         negative_binomial_theta: None,
         // #2301: `survival_likelihood` is `Option<String>` defaulting to `None`,
         // and the single canonical default ("transformation") is resolved at the
@@ -3378,7 +3374,7 @@ fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         hazard_loading: None,
         transformation_normal: false,
         firth: true,
-        family: FamilyArg::Auto,
+        family: "auto".to_string(),
         negative_binomial_theta: None,
         // #2301, same as the three sibling fixtures: this is a NON-survival
         // binomial Firth fit, so an explicit survival_likelihood is a knob the
@@ -8094,7 +8090,7 @@ fn parse_formula_allows_nested_expression_arguments_in_smooth_calls() {
         panic!("expected smooth term");
     };
     assert_eq!(vars, &vec!["log(x + 1)".to_string()]);
-    assert_eq!(options.get("type").map(String::as_str), Some("duchon"));
+    assert_eq!(options.get("bs").map(String::as_str), Some("duchon"));
     assert_eq!(options.get("power").map(String::as_str), Some("0"));
     assert_eq!(options.get("order").map(String::as_str), Some("1"));
 }
