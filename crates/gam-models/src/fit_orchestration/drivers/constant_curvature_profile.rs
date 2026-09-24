@@ -609,9 +609,43 @@ impl<'a> ConstantCurvatureProfile<'a> {
     /// with a `√ε` resolution, a `1e-9` relative stationarity test, a
     /// quarter-width fallback step and two hand budgets that returned its last
     /// iterate (#2469, #2670: SPEC forbids grid search and hand bounds).
+    ///
+    /// A search that stops where `V_ηη < 0` stopped on a concave shoulder — near the
+    /// distance-kernel face `V ≈ V∞ − c·e^{−η}` its slope is exponentially small, so the
+    /// stationarity test can pass while the curvature refuses the point. On a concave stretch
+    /// the minimum over the stretch lies at its end on the descent side, `−V_η`, so the search
+    /// is run again from the wall on that side and the certified answer with the lower value
+    /// is the range. The flat-replicate coverage fixture stopped at `ln ℓ = 8.58` with
+    /// `V_η = 4.98e−3, V_ηη = −4.94e−3`, and the planted-flat fit at `ln ℓ = 15.43`
+    /// (`8.82e−5`, `−8.82e−5`), each refusing the profile's derivative.
     fn minimize_over_eta(
         &self,
         kappa: f64,
+    ) -> Result<(f64, ProfiledRemlPsiJet, RangeSolveOutcome), EstimationError> {
+        let Some((lo, hi)) = self.eta_bounds else {
+            let jet = self.evaluate_psi(kappa, self.eta_seed)?;
+            return Ok((self.eta_seed, jet, RangeSolveOutcome::Pinned));
+        };
+        let first = self.minimize_over_eta_from(kappa, self.eta_seed.clamp(lo, hi))?;
+        let (_, first_jet, first_outcome) = &first;
+        if *first_outcome != RangeSolveOutcome::Uncertified || !(first_jet.hessian[1][1] < 0.0) {
+            return Ok(first);
+        }
+        let wall = if first_jet.gradient[1] > 0.0 { lo } else { hi };
+        let second = self.minimize_over_eta_from(kappa, wall)?;
+        let (_, second_jet, second_outcome) = &second;
+        if *second_outcome != RangeSolveOutcome::Uncertified && second_jet.value <= first_jet.value {
+            Ok(second)
+        } else {
+            Ok(first)
+        }
+    }
+
+    /// One range solve of [`Self::minimize_over_eta`] from the seed `seed`.
+    fn minimize_over_eta_from(
+        &self,
+        kappa: f64,
+        seed: f64,
     ) -> Result<(f64, ProfiledRemlPsiJet, RangeSolveOutcome), EstimationError> {
         let Some((lo, hi)) = self.eta_bounds else {
             let jet = self.evaluate_psi(kappa, self.eta_seed)?;
@@ -631,7 +665,7 @@ impl<'a> ConstantCurvatureProfile<'a> {
             .with_gradient(Derivative::Analytic)
             .with_hessian(gam_problem::DeclaredHessianForm::Dense)
             .with_bounds(Array1::from_vec(vec![lo]), Array1::from_vec(vec![hi]))
-            .with_initial_rho(Array1::from_vec(vec![self.eta_seed.clamp(lo, hi)]));
+            .with_initial_rho(Array1::from_vec(vec![seed.clamp(lo, hi)]));
         let mut objective = problem.build_objective(
             (),
             |_: &mut (), rho: &Array1<f64>| self.evaluate_value(kappa, rho[0]).map_err(refuse),

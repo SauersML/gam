@@ -1,5 +1,12 @@
 ## Unreleased
 
+- **A constant-curvature smooth's range search no longer stops on a concave shoulder** (gam#1464).
+  Near the distance-kernel face the profiled criterion in the log range `η` flattens as
+  `V ≈ V∞ − c·e^{−η}`, so its slope is exponentially small there and the search's stationarity
+  test passed at points where the curvature `V_ηη` was negative. The range solve then refused the
+  profile's derivative, and a flat-truth fit failed (`analytic curvature profile at kappa=…`). On a
+  concave stretch the minimum lies at the stretch's end on the descent side, so the search now runs
+  again from that wall and keeps the certified answer with the lower value.
 - **A multinomial fit's smoothing search is no longer cut off at 50 iterations**. `gam fit` and
   `gamfit` built the multinomial request with an outer iteration count of 50, a number with no
   derivation, while every other custom-family fit stops the outer search on its progress and
