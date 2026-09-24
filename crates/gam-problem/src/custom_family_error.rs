@@ -1589,6 +1589,27 @@ mod tests {
             None
         );
     }
+
+    /// gam#4577: the not-identified verdict is a trial-point refusal to the
+    /// outer search and its own variant to a caller reading the type.
+    #[test]
+    fn mode_not_identified_is_a_typed_trial_point_refusal_4577() {
+        let refusal = || CustomFamilyError::ModeNotIdentified {
+            reason: "the fitted objective 1.0e0 is not below the frozen-time limit 9.0e-1".to_string(),
+        };
+        assert!(refusal().is_trial_point_infeasible());
+        assert_eq!(refusal().variant_name(), "CustomFamilyError::ModeNotIdentified");
+        assert_eq!(refusal().failure_category(), crate::FailureCategory::Convergence);
+        assert!(matches!(
+            refusal().into_trial_point(),
+            CustomFamilyError::ModeNotIdentified { .. }
+        ));
+        assert!(
+            refusal()
+                .to_string()
+                .starts_with("inner solve refused this trial point: the fitted objective")
+        );
+    }
 }
 
 impl CustomFamilyError {
@@ -1756,25 +1777,5 @@ impl CustomFamilyError {
         })
     }
 
-    /// gam#4577: the not-identified verdict is a trial-point refusal to the
-    /// outer search and its own variant to a caller reading the type.
-    #[test]
-    fn mode_not_identified_is_a_typed_trial_point_refusal_4577() {
-        let refusal = || CustomFamilyError::ModeNotIdentified {
-            reason: "the fitted objective 1.0e0 is not below the frozen-time limit 9.0e-1".to_string(),
-        };
-        assert!(refusal().is_trial_point_infeasible());
-        assert_eq!(refusal().variant_name(), "CustomFamilyError::ModeNotIdentified");
-        assert_eq!(refusal().failure_category(), crate::FailureCategory::Convergence);
-        assert!(matches!(
-            refusal().into_trial_point(),
-            CustomFamilyError::ModeNotIdentified { .. }
-        ));
-        assert!(
-            refusal()
-                .to_string()
-                .starts_with("inner solve refused this trial point: the fitted objective")
-        );
-    }
 
 }
