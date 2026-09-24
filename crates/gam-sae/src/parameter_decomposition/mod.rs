@@ -105,6 +105,9 @@ pub mod block_program;
 // KL oscillation bound, whole-set composition containment, conservation conditioning.
 pub mod bounds;
 
+// Weight slices on an atlas of a use site's input manifold: closed-form reduced-rank charts.
+pub mod chart_slice;
+
 // Prefix, subset and graph codes for the global artifact and local packets.
 pub mod codec;
 
@@ -131,6 +134,9 @@ pub mod occurrence;
 
 // Implementation-gauge families detected from native tensors, quotiented out of codes and intervention sets.
 pub mod gauge;
+
+// Parseval-frame decompositions: overcomplete rank-m pieces, exactly faithful on a Stiefel manifold.
+pub mod parseval_frame;
 
 // Gauge-covariant group masks, structured parameter paths, Sum and Compose accounting.
 pub mod operators;
