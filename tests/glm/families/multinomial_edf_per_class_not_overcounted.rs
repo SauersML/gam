@@ -55,7 +55,7 @@ fn multinomial_edf_per_class_is_per_class_not_per_block_overcount() {
     let data = smooth_multinomial_dataset();
     let config = FitConfig::default();
     let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
-        max_iter: 100,
+        max_iter: usize::MAX,
         ..MultinomialFitRequest::new(&data, "y ~ s(x)", &config)
     })
     .expect("multinomial smooth fit must succeed");

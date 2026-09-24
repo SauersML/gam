@@ -86,7 +86,7 @@ fn fit_smooth_three_class(seed: u64) -> MultinomialSavedModel {
     let config = FitConfig::default();
     fit_penalized_multinomial_formula(&MultinomialFitRequest {
         init_lambda: 1.0,
-        max_iter: 120,
+        max_iter: usize::MAX,
         tol: 1e-8,
         ..MultinomialFitRequest::new(&data, "y ~ s(x, bs='tps', k=8)", &config)
     })

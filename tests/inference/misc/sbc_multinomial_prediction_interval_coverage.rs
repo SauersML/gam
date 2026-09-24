@@ -96,7 +96,7 @@ fn multinomial_mean_prediction_interval_covers_true_probability_at_nominal() {
         let config = FitConfig::default();
         let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
             init_lambda: 1.0,
-            max_iter: 60,
+            max_iter: usize::MAX,
             tol: 1e-8,
             ..MultinomialFitRequest::new(&data, "y ~ s(x, bs='tps', k=8)", &config)
         })
@@ -190,7 +190,7 @@ fn multinomial_conditional_band_is_narrower_than_the_corrected_band() {
     let config = FitConfig::default();
     let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
         init_lambda: 1.0,
-        max_iter: 60,
+        max_iter: usize::MAX,
         tol: 1e-8,
         ..MultinomialFitRequest::new(&data, "y ~ s(x, bs='tps', k=8)", &config)
     })

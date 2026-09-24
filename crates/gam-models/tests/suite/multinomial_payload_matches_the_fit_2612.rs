@@ -106,7 +106,7 @@ fn fit(rows: Vec<StringRecord>, formula: &str) -> MultinomialSavedModel {
     let config = FitConfig::default();
     fit_penalized_multinomial_formula(&MultinomialFitRequest {
         init_lambda: 1.0,
-        max_iter: 120,
+        max_iter: usize::MAX,
         tol: 1e-8,
         ..MultinomialFitRequest::new(&data, formula, &config)
     })

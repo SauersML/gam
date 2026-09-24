@@ -193,7 +193,7 @@ fn fit(records: Vec<StringRecord>, formula: &str) -> MultinomialSavedModel {
         formula,
         config: &config,
         init_lambda: 1.0,
-        max_iter: 100,
+        max_iter: usize::MAX,
         tol: 1e-8,
     })
     .unwrap_or_else(|error| panic!("multinomial formula fit `{formula}`: {error}"))
@@ -482,7 +482,7 @@ fn a_quasi_separated_smooth_fit_is_calibrated_2612() {
         formula: "y ~ s(x, k=8)",
         config: &config,
         init_lambda: 1.0,
-        max_iter: 100,
+        max_iter: usize::MAX,
         tol: 1e-8,
     })
     .expect(

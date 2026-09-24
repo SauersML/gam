@@ -166,7 +166,7 @@ fn hetero_multinomial_recovers_true_simplex_at_true_df_basis_1373() {
     // REML must then recover the surface, not be capped by basis capacity.
     let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
         init_lambda: 1.0,
-        max_iter: 40,
+        max_iter: usize::MAX,
         tol: 1e-8,
         ..MultinomialFitRequest::new(&ds, "y ~ s(x1, k=12) + s(x2, k=6) + x3", &cfg)
     })

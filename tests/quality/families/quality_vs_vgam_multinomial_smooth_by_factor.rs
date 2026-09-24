@@ -197,7 +197,7 @@ fn gam_multinomial_smooth_by_factor_recovers_truth() {
         formula: "y ~ s(x, bs='tps', k=5) + s(x, by=group, bs='tps', k=5)",
         config: &cfg,
         init_lambda: 1.0,
-        max_iter: 60,
+        max_iter: usize::MAX,
         tol: 1e-8,
     })
     .expect("gam multinomial fit");

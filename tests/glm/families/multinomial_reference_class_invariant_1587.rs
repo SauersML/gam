@@ -97,7 +97,7 @@ fn fit_predict_aligned(
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode training data");
     let config = FitConfig::default();
     let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
-        max_iter: 200,
+        max_iter: usize::MAX,
         ..MultinomialFitRequest::new(&data, "y ~ s(x)", &config)
     })
     .expect("multinomial smooth fit must succeed");

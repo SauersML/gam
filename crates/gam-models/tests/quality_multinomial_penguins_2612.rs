@@ -340,7 +340,7 @@ fn gam_multinomial_classifies_penguin_species_at_least_as_well_as_nnet_on_real_d
         formula: "species ~ s(bill_length_mm, k=10) + s(bill_depth_mm, k=10) + s(flipper_length_mm, k=10) + s(body_mass_g, k=10)",
         config: &cfg,
         init_lambda: 1.0,
-        max_iter: 100,
+        max_iter: usize::MAX,
         tol: 1e-8,
     })
     .expect("gam penguin multinomial fit (real-data arm)");
@@ -612,7 +612,7 @@ fn gam_multinomial_classifies_penguin_species_at_least_as_well_as_nnet() {
         formula: "species ~ s(bill_length_mm, k=10) + s(bill_depth_mm, k=10) + s(flipper_length_mm, k=10) + s(body_mass_g, k=10)",
         config: &cfg,
         init_lambda: 1.0,
-        max_iter: 100,
+        max_iter: usize::MAX,
         tol: 1e-8,
     })
     .expect("gam penguin multinomial fit");

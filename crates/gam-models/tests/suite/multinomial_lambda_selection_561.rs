@@ -157,7 +157,7 @@ fn multinomial_outer_reml_selects_per_term_lambda_and_recovers_truth() {
     let formula = "y ~ s(x1, k=6) + s(x2, k=6) + x3";
     let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
         init_lambda: 1.0,
-        max_iter: 40,
+        max_iter: usize::MAX,
         tol: 1e-8,
         ..MultinomialFitRequest::new(&ds, formula, &cfg)
     })
@@ -166,7 +166,7 @@ fn multinomial_outer_reml_selects_per_term_lambda_and_recovers_truth() {
     // measurement that separates the two things this test can fail for.
     let model_hi = fit_penalized_multinomial_formula(&MultinomialFitRequest {
         init_lambda: 50.0,
-        max_iter: 40,
+        max_iter: usize::MAX,
         tol: 1e-8,
         ..MultinomialFitRequest::new(&ds, formula, &cfg)
     })

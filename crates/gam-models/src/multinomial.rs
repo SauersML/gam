@@ -3403,7 +3403,10 @@ pub struct MultinomialFitRequest<'a> {
     /// Warm-start seed for every per-(class, term) smoothing parameter; λ is
     /// REML/LAML-selected, so this only seeds the outer search.
     pub init_lambda: f64,
-    /// OUTER REML/LAML smoothing-parameter iteration budget.
+    /// OUTER REML/LAML smoothing-parameter iteration cap. The search ends on its own progress and
+    /// stationarity certificates (#2817); [`Self::new`] sets no cap
+    /// ([`crate::custom_family::DEFAULT_CUSTOM_FAMILY_OUTER_MAX_ITER`]), and a finite value is a
+    /// caller's resource limit that ends the search without a certificate.
     pub max_iter: usize,
     /// Requested accuracy, finite and positive: the convergence target of both
     /// the inner joint-Newton KKT solve and the outer ρ-stationarity test, each
@@ -3420,7 +3423,7 @@ impl<'a> MultinomialFitRequest<'a> {
             formula,
             config,
             init_lambda: 1.0,
-            max_iter: 50,
+            max_iter: crate::custom_family::DEFAULT_CUSTOM_FAMILY_OUTER_MAX_ITER,
             tol: 1.0e-7,
         }
     }
@@ -6592,7 +6595,7 @@ mod reference_class_invariance_tests {
         let config = FitConfig::default();
         let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
             init_lambda: 1.0,
-            max_iter: 60,
+            max_iter: usize::MAX,
             tol: 1e-6,
             ..MultinomialFitRequest::new(&train, "y ~ s(x)", &config)
         })
@@ -6665,7 +6668,7 @@ mod reference_class_invariance_tests {
             let config = FitConfig::default();
             let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
                 init_lambda: 1.0,
-                max_iter: 60,
+                max_iter: usize::MAX,
                 tol: 1e-6,
                 ..MultinomialFitRequest::new(&train, "y ~ s(x)", &config)
             })

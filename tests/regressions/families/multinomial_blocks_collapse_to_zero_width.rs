@@ -76,7 +76,7 @@ fn multinomial_three_class_fit_keeps_all_blocks_full_width() {
     // Same entry point the Python FFI uses for family="multinomial".
     let config = FitConfig::default();
     let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
-        max_iter: 200,
+        max_iter: usize::MAX,
         tol: 1.0e-8,
         ..MultinomialFitRequest::new(&data, "y ~ x", &config)
     })

@@ -105,7 +105,7 @@ fn fit(formula: &str) -> gam_models::multinomial::MultinomialSavedModel {
         formula,
         config: &config,
         init_lambda: 1.0,
-        max_iter: 100,
+        max_iter: usize::MAX,
         tol: 1e-8,
     })
     .unwrap_or_else(|error| panic!("multinomial formula fit `{formula}`: {error}"))

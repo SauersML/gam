@@ -1,5 +1,12 @@
 ## Unreleased
 
+- **A multinomial fit's smoothing search is no longer cut off at 50 iterations**. `gam fit` and
+  `gamfit` built the multinomial request with an outer iteration count of 50, a number with no
+  derivation, while every other custom-family fit stops the outer search on its progress and
+  stationarity certificates (#2817). On the penguins data the search was still descending, with ten
+  per-class smoothing parameters walking toward their unpenalized limit, when the count ended it,
+  and the fit was refused as "iteration budget". The default is now no count, as elsewhere; a
+  caller's `max_iter` remains available as an explicit resource limit.
 - **A spatial fit's terminal certificate reads the evidence of the point it certifies** (gam#3331).
   The n-block, joint spatial and latent-joint length-scale routes answer a revisited θ from their own
   evaluation memo, which republishes none of the evidence the evaluation published. The terminal

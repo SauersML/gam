@@ -194,7 +194,7 @@ fn gam_multinomial_softmax_recovers_true_simplex() {
         formula: "y ~ s(x1, k=6) + s(x2, k=6) + x3",
         config: &cfg,
         init_lambda: 1.0,
-        max_iter: 40,
+        max_iter: usize::MAX,
         tol: 1e-8,
     })
     .expect("gam multinomial fit");
@@ -668,7 +668,7 @@ fn gam_multinomial_softmax_heterogeneous_smoothness_beats_fixed_df() {
         formula: "y ~ s(x1, k=12) + s(x2, k=6) + x3",
         config: &cfg,
         init_lambda: 1.0,
-        max_iter: 40,
+        max_iter: usize::MAX,
         tol: 1e-8,
     })
     .expect("gam hetero multinomial fit");
@@ -1079,7 +1079,7 @@ fn gam_multinomial_softmax_recovers_true_simplex_on_real_data() {
         formula: "species ~ s(bill, k=5) + s(flip, k=5) + mass",
         config: &cfg,
         init_lambda: 1.0,
-        max_iter: 40,
+        max_iter: usize::MAX,
         tol: 1e-8,
     })
     .expect("gam multinomial fit on penguins train");

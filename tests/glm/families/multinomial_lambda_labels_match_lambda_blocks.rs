@@ -56,7 +56,7 @@ fn multinomial_lambda_labels_are_one_per_penalty_component() {
     let data = two_smooth_multinomial_dataset();
     let config = FitConfig::default();
     let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
-        max_iter: 100,
+        max_iter: usize::MAX,
         ..MultinomialFitRequest::new(&data, "y ~ s(x) + s(z)", &config)
     })
     .expect("two-smooth multinomial fit must succeed");

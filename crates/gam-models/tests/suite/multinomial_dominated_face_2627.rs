@@ -78,7 +78,7 @@ fn published_class_edf(seed: u64) -> (Vec<f64>, f64, Vec<f64>) {
     let config = FitConfig::default();
     let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
         init_lambda: 1.0,
-        max_iter: 40,
+        max_iter: usize::MAX,
         tol: 1e-8,
         ..MultinomialFitRequest::new(&dataset, "y ~ s(x1, k=6) + s(x2, k=6) + x3", &config)
     })

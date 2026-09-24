@@ -229,7 +229,7 @@ fn multinomial_recovers_decision_boundary_on_held_out_split() {
         formula,
         config: &cfg,
         init_lambda: 1.0,
-        max_iter: 50,
+        max_iter: usize::MAX,
         tol: 1e-7,
     })
     .expect("multinomial formula fit");

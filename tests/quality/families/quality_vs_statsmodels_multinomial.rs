@@ -931,7 +931,7 @@ fn multinomial_coefficient_covariance_equals_observed_information_inverse() {
         formula: "y ~ linear(x1, double_penalty=false) + linear(x2, double_penalty=false)",
         config: &FitConfig::default(),
         init_lambda: 1.0,
-        max_iter: 100,
+        max_iter: usize::MAX,
         tol: 1e-9,
     })
     .expect("multinomial formula fit");
@@ -1066,7 +1066,7 @@ fn multinomial_per_class_probability_se_intervals_are_calibrated_over_refits() {
             formula: "y ~ x1 + x2",
             config: &FitConfig::default(),
             init_lambda: 1.0,
-            max_iter: 100,
+            max_iter: usize::MAX,
             tol: 1e-9,
         })
         .expect("multinomial refit");
