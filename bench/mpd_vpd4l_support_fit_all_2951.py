@@ -166,6 +166,7 @@ def main():
 
         class Executor:
             def supports(self, theta, keep):
+                calls["theta"] = theta
                 spend(3)
                 m = mask(keep).requires_grad_(True)
                 lg = model.logits(tokens, m, th(theta))
@@ -183,6 +184,9 @@ def main():
                 return klv, (-g + 0.5 * hh ** 2).cpu().numpy(), (-g - 0.5 * hh ** 2).cpu().numpy()
 
             def divergence(self, theta, keep):
+                # support_fit's last divergence before each alternation is reported is at the
+                # accepted pieces (trial points come earlier)
+                calls["theta"] = theta
                 spend(1)
                 with torch.no_grad():
                     kl = kl_of(model.logits(tokens, mask(keep), th(theta))).double().cpu().numpy()
@@ -207,6 +211,12 @@ def main():
                 return d.double().cpu().numpy()
 
             def observe(self, a):
+                # The pieces each level ends with, for a held-out read of the whole fidelity path
+                # (mpd_vpd4l_heldout_levels_2951.py): saved when the next level starts.
+                previous = calls.get("level")
+                if previous is not None and a["level"] != previous and "theta" in calls:
+                    np.save(args.out.replace(".json", f"_level{previous:.6g}.npy"), np.asarray(calls["theta"], dtype=np.float32))
+                calls["level"] = a["level"]
                 print(f"[alt] level {a['level']:.4g}: kept {a['kept']} pieces, KL mean {a['mean_divergence']:.4f}; "
                       f"barrier {a['barrier_before']:.6g} -> {a['barrier_after']:.6g}; step {a['step']:.3e} radius {a['radius']:.3e}; "
                       f"residual {a['residual']:.3e} / {a['tolerance']:.3e} certified {a['certified']} searched {a['searched']}", flush=True)
