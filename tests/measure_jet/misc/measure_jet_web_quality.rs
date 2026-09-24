@@ -785,17 +785,32 @@ fn measure_jet_eiv_input_variance_matches_fitted_surface_2225() {
         panic!("frozen identifiability transform")
     };
 
-    // Lift the term's fitted reduced coefficients to raw representer+head space.
+    // Lift the term's fitted reduced coefficients to raw representer+head space. The realized
+    // columns are `(B·Z)·Q·T`: the frozen spec keeps the local chart `Z` in the basis, the
+    // joint-null rotation `Q` on the term and the collection's chart `T` on its residualization
+    // chart, and the design applies them in that order, so a realized coefficient reaches the
+    // raw representers as `Z·Q·T·β`. Lifting through `Z` alone read one column past the term.
     let full_cols = fit.design.design.ncols();
     assert_eq!(fit.fit.beta.len(), full_cols, "β length vs design columns");
-    let smooth_start = full_cols - fit.design.smooth.total_smooth_cols();
-    let term_cols = transform.ncols();
-    let beta_term = fit
+    let realized_cols = fit.design.smooth.total_smooth_cols();
+    let smooth_start = full_cols - realized_cols;
+    let mut local = fit
         .fit
         .beta
-        .slice(ndarray::s![smooth_start..smooth_start + term_cols])
+        .slice(ndarray::s![smooth_start..smooth_start + realized_cols])
         .to_owned();
-    let z_full = transform.dot(&beta_term);
+    if let Some(chart) = term.frozen_parametric_residualization.as_ref() {
+        local = chart.coefficient_transform.dot(&local);
+    }
+    if let Some(rotation) = term.joint_null_rotation.as_ref() {
+        local = rotation.rotation.dot(&local);
+    }
+    assert_eq!(
+        local.len(),
+        transform.ncols(),
+        "the term's chain must end on the frozen identifiability transform's columns"
+    );
+    let z_full = transform.dot(&local);
     let m = centers.nrows();
     // The head block spans the energy's whole AFFINE null space, constant
     // included (#2751), so the reconstruction has to rebuild the same object
