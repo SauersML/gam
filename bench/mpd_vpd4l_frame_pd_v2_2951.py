@@ -85,12 +85,27 @@ class Target:
         return self.rms(h, w["ln_f.weight"]) @ w["wte.weight"].T
 
 
+ADAPTIVE = {"on": False}
+
+
+def select(energy, L):
+    """Per-row top-L, or (adaptive) the top n*L energies of the whole batch at this matrix: the same mean L0 per
+    token, spent where the tokens need it (VPD's L0 is likewise a mean over tokens)."""
+    e = energy.detach()
+    if not ADAPTIVE["on"]:
+        return torch.zeros_like(e).scatter_(1, e.topk(L, dim=1).indices, 1.0)
+    flat = e.reshape(-1)
+    keep = torch.zeros_like(flat)
+    keep[flat.topk(min(flat.numel(), e.shape[0] * L)).indices] = 1.0
+    return keep.view_as(e)
+
+
 def frame_restrict(y, X, K, m, L, masks=None):
     """y: n x q; X: (K m) x q with orthonormal columns. Keep the L atoms with the most energy; with ``masks``
     (K,), the inactive atoms are re-added with those weights (VPD's adversarial source on inactive components)."""
     c = (y @ X.T).view(-1, K, m)  # atom coordinates
     energy = c.pow(2).sum(-1)
-    keep = torch.zeros_like(energy).scatter_(1, energy.detach().topk(L, dim=1).indices, 1.0)
+    keep = select(energy, L)
     weight = keep if masks is None else keep + (1 - keep) * masks[None]
     return (c * weight[..., None]).reshape(-1, K * m) @ X
 
@@ -102,7 +117,7 @@ def frame_restrict_input(z, X, W, K, m, L, masks=None):
     WO = (W @ X.T).T.reshape(K, m, -1)  # K x m x q
     gram = torch.einsum("kaq,kbq->kab", WO, WO)
     energy = torch.einsum("nka,kab,nkb->nk", c, gram, c)
-    keep = torch.zeros_like(energy).scatter_(1, energy.detach().topk(L, dim=1).indices, 1.0)
+    keep = select(energy, L)
     weight = keep if masks is None else keep + (1 - keep) * masks[None]
     zhat = (c * weight[..., None]).reshape(-1, K * m) @ X
     return zhat @ W.T
@@ -118,6 +133,22 @@ def neuron_frame(K, m, q, overcomplete, dev, gen):
         R = torch.linalg.qr(torch.randn(q, q, generator=gen))[0]
         X = torch.cat([eye, R.T]) / math.sqrt(2.0)
     return X.to(dev)
+
+
+def biorth_restrict(v, V, K, m, L, W=None, masks=None):
+    """Biorthogonal (oblique) frame: V (d x d) invertible, a_k = columns of V grouped m at a time, b_k = columns of
+    V^{-T}; sum_k b_k a_k^T = I EXACTLY for every invertible V. Coordinates c = v V, reconstruction from the kept
+    groups c_A (V^{-1})_A. With W (input side) the energy of piece k is ||W B_k c_k||^2, else ||B_k c_k||^2."""
+    Vinv = torch.linalg.inv(V)  # rows of V^{-1} = columns of V^{-T} = b_k
+    c = (v @ V).view(-1, K, m)
+    B = Vinv.view(K, m, -1)  # K x m x d
+    WB = B if W is None else torch.einsum("kmd,qd->kmq", B, W)
+    gram = torch.einsum("kaq,kbq->kab", WB, WB)
+    energy = torch.einsum("nka,kab,nkb->nk", c, gram, c)
+    keep = select(energy, L)
+    weight = keep if masks is None else keep + (1 - keep) * masks[None]
+    vhat = (c * weight[..., None]).reshape(-1, K * m) @ Vinv
+    return vhat if W is None else vhat @ W.T
 
 
 def stiefel(K, m, q, dev, gen):
@@ -139,7 +170,25 @@ def main():
     parser.add_argument("--lr", type=float, required=True)
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--pgd-steps", type=int, default=20)
-    parser.add_argument("--init", choices=("neuron", "random"), default="neuron")
+    parser.add_argument("--init", choices=("neuron", "random", "svd"), default="neuron")
+    parser.add_argument("--attn-side", choices=("input", "output"), default="output")
+    parser.add_argument("--opt", choices=("adam", "nsgd"), default="adam")
+    parser.add_argument("--frame-kind", choices=("parseval", "biorth"), default="parseval",
+                        help="biorth: an invertible V on GL(d), pieces b_k a_k^T with B = V^{-T}; exact for every V")
+    parser.add_argument("--adaptive", action="store_true",
+                        help="batch-level top-(n L) selection per matrix: same mean pieces per token, adaptive per token")
+    parser.add_argument("--tf32-train", action="store_true",
+                        help="TF32 matmuls in training steps only; every evaluation stays full fp32")
+    parser.add_argument("--odl-iters", type=int, default=0)
+    parser.add_argument("--odl-rows", type=int, default=64)
+    parser.add_argument("--only-site", default="", help="restrict only this matrix, as layer:mat (diagnosis)")
+    parser.add_argument("--only", choices=("all", "mlp", "attn"), default="all",
+                        help="restrict only these matrices (diagnosis); the rest run exactly")
+    parser.add_argument("--budget-scale", type=float, default=1.0,
+                        help="with --vpd-budget: pieces per matrix scaled from VPD's final per-matrix L0")
+    parser.add_argument("--retract-every", type=int, default=1,
+                        help="QR retraction every this many steps; between, tangent steps leave X^T X = I + O(lr^2)")
+    parser.add_argument("--test-every", type=int, default=0, help="test evaluations every this many steps (0: 4 per run)")
     parser.add_argument("--vpd-budget", action="store_true",
                         help="per-matrix pieces L = ceil(VPD's own per-matrix eval L0 / m) instead of a uniform L")
     parser.add_argument("--stochastic", action="store_true",
@@ -149,6 +198,7 @@ def main():
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
     torch.manual_seed(args.seed)
+    ADAPTIVE["on"] = args.adaptive
     dev = args.device
     torch.backends.cuda.matmul.allow_tf32 = False
     model = Target(args.weights, dev)
@@ -156,22 +206,33 @@ def main():
     held = [test[i:i + args.batch] for i in range(0, len(test), args.batch)]
     train = rows(args.train, args.train_rows)
     m, L = args.atom_dim, args.active
-    actives = {(l, mat): (max(1, math.ceil(VPD_L0[l][mat] / m)) if args.vpd_budget else L)
+    actives = {(l, mat): (max(1, math.ceil(args.budget_scale * VPD_L0[l][mat] / m)) if args.vpd_budget else L)
                for l in range(4) for mat in MATS}
     gen = torch.Generator().manual_seed(args.seed)
     frames, shapes, sides = {}, {}, {}
     for l in range(model.n_layer):
         for mat in MATS:
             Wm = model.w[model.W(l, mat)]
-            side = "input" if mat == "down" else "output"  # the neuron side of each MLP matrix
+            if mat in ("fc", "down"):
+                side = "input" if mat == "down" else "output"  # the neuron side of each MLP matrix
+            else:
+                side = args.attn_side  # the residual-stream (feature) side for q/k/v is their input
             dim = Wm.shape[1] if side == "input" else Wm.shape[0]
             K = math.ceil(args.overcomplete * dim / m)
             shapes[(l, mat)] = K
             sides[(l, mat)] = side
-            if args.init == "neuron" and mat in ("fc", "down"):
+            if args.init in ("neuron", "svd") and mat in ("fc", "down"):
                 frames[(l, mat)] = neuron_frame(K, m, dim, args.overcomplete, dev, gen)
+            elif args.init == "svd" and args.overcomplete <= 1:
+                # the weight's own rank-revealing read (seed.rs): right singular vectors on the input side, left on
+                # the output side, as an orthogonal complete frame; atoms pair consecutive singular directions
+                U, _, Vh = torch.linalg.svd(Wm.double(), full_matrices=True)
+                frames[(l, mat)] = (Vh if side == "input" else U.T).float().contiguous()
             else:
                 frames[(l, mat)] = stiefel(K, m, dim, dev, gen)
+    if args.frame_kind == "biorth":
+        # atoms are the COLUMNS of V; every initial frame is orthogonal, so the transpose is exact and B = V^{-T} = V
+        frames = {k: v.T.contiguous() for k, v in frames.items()}
     report = {"args": vars(args), "vpd": VPD, "pieces_per_token": sum(actives.values()),
               "matrix_slices_per_token": m * sum(actives.values()), "atoms_per_matrix": {f"{k[0]}:{k[1]}": v for k, v in shapes.items()}}
     print(f"[frame4l] {sum(actives.values())} pieces of rank {m} per token ({m * sum(actives.values())} matrix slices; "
@@ -179,7 +240,16 @@ def main():
 
     def edit_with(masks=None):
         def edit(l, mat, y, z=None):
+            if args.only == "mlp" and mat not in ("fc", "down") or args.only == "attn" and mat in ("fc", "down"):
+                return y
+            if args.only_site and args.only_site != f"{l}:{mat}":
+                return y
             mk = None if masks is None else masks[(l, mat)]
+            if args.frame_kind == "biorth":
+                if sides[(l, mat)] == "input":
+                    return biorth_restrict(z, frames[(l, mat)], shapes[(l, mat)], m, actives[(l, mat)],
+                                           model.w[model.W(l, mat)], mk)
+                return biorth_restrict(y, frames[(l, mat)], shapes[(l, mat)], m, actives[(l, mat)], None, mk)
             if sides[(l, mat)] == "input":
                 return frame_restrict_input(z, frames[(l, mat)], model.w[model.W(l, mat)], shapes[(l, mat)], m,
                                             actives[(l, mat)], mk)
@@ -216,6 +286,43 @@ def main():
         model.edit = None
         return (ref.exp() * (ref - lp)).sum(-1).mean()
 
+    if args.odl_iters > 0:
+        # Sequential orthogonal dictionary learning: in network order, on the stream as it arrives with every
+        # upstream matrix already restricted, alternate (a) each row coded by its top-L atom groups of the current
+        # orthogonal frame and (b) the frame updated by orthogonal Procrustes, X = polar(S^T D), which minimizes
+        # ||D - S X|| over orthogonal X for the fixed codes (D the rows of the frame's side: the input z on the input
+        # side, the output y on the output side). Monotone in the reconstruction error; closed form per step.
+        odl_ids = train[: args.odl_rows].to(dev)
+        fitted = set()
+        order = [(l, mat) for l in range(model.n_layer) for mat in MATS]
+        for key in order:
+            bank = {}
+
+            def grab_edit(l, mat, y, z=None):
+                if (l, mat) == key:
+                    bank["d"] = (z if sides[key] == "input" else y).detach()
+                if (l, mat) in fitted:
+                    return edit_with()(l, mat, y, z)
+                return y
+            model.edit = grab_edit
+            with torch.no_grad():
+                model(odl_ids[:, :-1])
+            model.edit = None
+            D = bank["d"]
+            X = frames[key]
+            K = shapes[key]
+            Lk = actives[key]
+            for _ in range(args.odl_iters):
+                c = (D @ X.T).view(-1, K, m)
+                energy = c.pow(2).sum(-1)
+                keep = torch.zeros_like(energy).scatter_(1, energy.topk(Lk, dim=1).indices, 1.0)
+                S = (c * keep[..., None]).reshape(-1, K * m)
+                U, _, Vh = torch.linalg.svd(S.T @ D, full_matrices=False)
+                X = U @ Vh
+            frames[key] = X
+            fitted.add(key)
+        print(f"[frame4l] sequential orthogonal dictionary learning done ({args.odl_iters} iterations per matrix)",
+              flush=True)
     report["init"] = evaluate()
     print(f"[frame4l] random Stiefel init: {report['init']}", flush=True)
     keys = list(frames)
@@ -228,35 +335,60 @@ def main():
         ids = train[idx].to(dev)
         for k in keys:
             frames[k].requires_grad_(True)
+        torch.backends.cuda.matmul.allow_tf32 = args.tf32_train
         with torch.enable_grad():
             loss = batch_kl(ids)
             if args.stochastic:
                 smask = {k: torch.rand(shapes[k], device=dev) for k in keys}
                 loss = 0.5 * loss + 0.5 * batch_kl(ids, smask)
             grads = torch.autograd.grad(loss, [frames[k] for k in keys])
+        torch.backends.cuda.matmul.allow_tf32 = False  # every evaluation runs in full fp32
         trace.append(loss.item())
         with torch.no_grad():
             for k, g in zip(keys, grads):
                 X = frames[k].detach()
+                if args.frame_kind == "biorth":
+                    mom[k].mul_(0.9).add_(0.1 * g)
+                    sq[k].mul_(0.999).add_(0.001 * g.pow(2))
+                    upd = (mom[k] / (1 - 0.9 ** (step + 1))) / ((sq[k] / (1 - 0.999 ** (step + 1))).sqrt() + 1e-12)
+                    lr_t = args.lr * 0.5 * (1 + math.cos(math.pi * step / args.steps))
+                    frames[k] = (X - lr_t * upd).detach()
+                    continue
                 sym = 0.5 * (X.T @ g + g.T @ X)
                 tang = g - X @ sym
-                mom[k].mul_(0.9).add_(0.1 * tang)
-                sq[k].mul_(0.999).add_(0.001 * tang.pow(2))
-                upd = (mom[k] / (1 - 0.9 ** (step + 1))) / ((sq[k] / (1 - 0.999 ** (step + 1))).sqrt() + 1e-12)
-                upd = upd - X @ (0.5 * (X.T @ upd + upd.T @ X))
+                if args.opt == "nsgd":
+                    # rotation-equivariant normalized Riemannian momentum: the step moves the frame by a fraction
+                    # lr of its own Frobenius norm sqrt(d), in the direction of the transported momentum
+                    mom[k].mul_(0.9).add_(tang)
+                    mom[k] = mom[k] - X @ (0.5 * (X.T @ mom[k] + mom[k].T @ X))
+                    upd = mom[k] * (math.sqrt(X.shape[1]) / (mom[k].norm() + 1e-30))
+                else:
+                    mom[k].mul_(0.9).add_(0.1 * tang)
+                    sq[k].mul_(0.999).add_(0.001 * tang.pow(2))
+                    upd = (mom[k] / (1 - 0.9 ** (step + 1))) / ((sq[k] / (1 - 0.999 ** (step + 1))).sqrt() + 1e-12)
+                    upd = upd - X @ (0.5 * (X.T @ upd + upd.T @ X))
                 lr_t = args.lr * 0.5 * (1 + math.cos(math.pi * step / args.steps))
-                Q, Rr = torch.linalg.qr(X - lr_t * upd)
-                frames[k] = (Q * torch.sign(torch.diagonal(Rr))[None]).detach()
+                moved = X - lr_t * upd
+                if (step + 1) % args.retract_every == 0 or step == args.steps - 1:
+                    Q, Rr = torch.linalg.qr(moved)
+                    moved = Q * torch.sign(torch.diagonal(Rr))[None]
+                frames[k] = moved.detach()
         if step % 50 == 0 or step == args.steps - 1:
             print(f"[frame4l] step {step}: train KL {loss.item():.4f} ({time.time() - t0:.0f}s)", flush=True)
-        if (step + 1) % max(1, args.steps // 4) == 0:
+        if (step + 1) % (args.test_every or max(1, args.steps // 4)) == 0:
             res = evaluate()
             print(f"[frame4l] step {step + 1}: TEST {res}", flush=True)
     report["trace"] = trace[::10]
     report["train_seconds"] = time.time() - t0
     report["final"] = evaluate()
     # exact faithfulness: sum of all pieces = W
-    worst = max((frames[k].T @ frames[k] - torch.eye(frames[k].shape[1], device=dev)).abs().max().item() for k in keys)
+    if args.frame_kind == "biorth":
+        worst = max((frames[k] @ torch.linalg.inv(frames[k]) - torch.eye(frames[k].shape[0], device=dev)).abs().max().item()
+                    for k in keys)
+        report["frame_condition_max"] = max(torch.linalg.cond(frames[k]).item() for k in keys)
+        print(f"[frame4l] max cond(V) {report['frame_condition_max']:.3e}", flush=True)
+    else:
+        worst = max((frames[k].T @ frames[k] - torch.eye(frames[k].shape[1], device=dev)).abs().max().item() for k in keys)
     report["frame_orthonormality_defect_max"] = worst
     print(f"[frame4l] FINAL {report['final']} (VPD rounded 0.291, stochastic 0.207); max |X^T X - I| {worst:.2e}",
           flush=True)
