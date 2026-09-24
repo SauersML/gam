@@ -1,0 +1,69 @@
+{
+ "stage": "s2_native",
+ "runs": [
+  {
+   "label": "addition",
+   "file": "addition_s0.pt",
+   "checkpoints": [
+    20000,
+    0,
+    2000
+   ]
+  },
+  {
+   "label": "addition",
+   "file": "addition_s0.pt",
+   "checkpoints": [
+    20000
+   ],
+   "shuffle_seed": 0
+  },
+  {
+   "label": "random",
+   "file": "random_s0.pt",
+   "checkpoints": [
+    20000
+   ]
+  }
+ ],
+ "trained": "addition.20000",
+ "sites": [
+  "pos0",
+  "pos1",
+  "global"
+ ],
+ "fit_shift": 8,
+ "held_out_shifts": [
+  2,
+  3,
+  5,
+  13,
+  21,
+  34,
+  55,
+  56,
+  57,
+  89,
+  112
+ ],
+ "tolerances": [
+  0.001,
+  0.01,
+  0.1,
+  1.0
+ ],
+ "disagreements": [
+  0.0001,
+  0.001,
+  0.01,
+  0.1
+ ],
+ "kl_quantiles": [
+  0.5,
+  0.9,
+  0.99,
+  0.999
+ ],
+ "fraction_bits": 16,
+ "null_seed": 0
+}

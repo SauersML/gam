@@ -93,7 +93,7 @@
 use gam_math::gaussian_activation::GaussianActivation;
 use gam_sae::parameter_decomposition::attention::{AttentionGeometry, ProjectedRows, RotaryEmbedding, RotaryPairing};
 use gam_sae::parameter_decomposition::block::{AttentionLayerReads, NativeAttentionLayer, linear_read};
-use gam_sae::parameter_decomposition::bounds::kl_over_logit_boxes;
+use gam_sae::parameter_decomposition::bounds::{kl_over_logit_boxes, kl_supremum_over_logit_boxes};
 use gam_sae::parameter_decomposition::cyclic_action::{
     CyclicPlanes, PlaneProgramCode, RowCycle, cyclic_planes, frequency_edit, plane_program_code,
 };
@@ -1240,7 +1240,21 @@ impl BoxDivergence for PlaneBoxes<'_, '_> {
                     EvidenceStatus::Exact { value, numerical_error, .. } => Some((*value, *numerical_error)),
                     _ => None,
                 };
-                Ok(RowBound { kl, lower: status.lower_bound(), upper: status.upper_bound() })
+                // P15′ bounds the same supremum with the free planes' radius weighted by the native row's
+                // runner-up mass, so a confident row's unimportant planes certify where the box shift cannot.
+                let supremum = kl_supremum_over_logit_boxes(
+                    ArrayView1::from(native_values),
+                    ArrayView1::from(native_radius),
+                    ArrayView1::from(&logits.values),
+                    ArrayView1::from(&logits.radius),
+                )
+                .map_err(|error| error.to_string())?
+                .upper_bound();
+                let upper = match (status.upper_bound(), supremum) {
+                    (Some(left), Some(right)) => Some(left.min(right)),
+                    (left, right) => left.or(right),
+                };
+                Ok(RowBound { kl, lower: status.lower_bound(), upper })
             })
             .collect::<Result<_, String>>()?;
         let domain = self.domain();
