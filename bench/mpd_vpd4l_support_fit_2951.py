@@ -135,7 +135,11 @@ def main():
         captured = []
         logp_clean = model.b(ids, capture=captured).log_softmax(-1)
     context = captured if args.context == "clean" else None
-    calls = {"n": 0, "t": time.time()}
+    calls = {"n": 0, "t": time.time(), "token_passes": 0}
+
+    def spend(passes, positions):
+        # Compute in VPD's currency: model passes (forward, backward or forward-mode) times positions.
+        calls["token_passes"] += passes * positions
 
     def mask(keep):
         return torch.from_numpy(np.asarray(keep)).to(dev).view(B, T, C).float()
@@ -149,6 +153,7 @@ def main():
     class Executor:
         def supports(self, theta, keep):
             calls["n"] += 1
+            spend(3, P)
             m = mask(keep).requires_grad_(True)
             logits = model.logits(ids, m, th(theta), context)
             kl = kl_of(logits)
@@ -164,6 +169,7 @@ def main():
                     (-g - 0.5 * hh.pow(2)).reshape(P, C).double().cpu().numpy())
 
         def divergence(self, theta, keep):
+            spend(1, P)
             with torch.no_grad():
                 kl = kl_of(model.logits(ids, mask(keep), th(theta), context)).double().cpu().numpy()
             calls["divergence"] = calls.get("divergence", 0) + 1
@@ -183,19 +189,26 @@ def main():
 
         def weighted_gradient(self, theta, keep, weights):
             self.tick("gradient")
+            spend(2, P)
             t = th(theta).requires_grad_(True)
             kl = kl_of(model.logits(ids, mask(keep), t, context))
             (g,) = torch.autograd.grad((kl * th(weights).float()).sum(), t)
             return g.double().cpu().numpy()
 
         def directional(self, theta, keep, v):
+            spend(2, P)
             m = mask(keep)
             _, d = jvp(lambda t: kl_of(model.logits(ids, m, t, context)), (th(theta),), (th(v),))
             return d.double().cpu().numpy()
 
+        def gradient_arithmetic(self):
+            # float32 model evaluation; the longest reduction is the KL over positions and vocabulary.
+            return 2.0 ** -24, P * logp_clean.shape[-1]
+
         def weighted_hessian(self, theta, keep, weights, v):
             # Exact Hessian product of sum_t w_t KL_t in theta, forward-over-reverse.
             self.tick("hessian")
+            spend(3, P)
             m = mask(keep)
             w = th(weights).float()
 
@@ -212,10 +225,11 @@ def main():
     rank = (keep * model.rank_units).sum(1)
     with torch.no_grad():
         joint = kl_of(model.logits(ids, mask(keep), th(fit["theta"]))).double().cpu().numpy()
-    report = {"args": vars(args), "alternations": fit["alternations"], "search_kl_max": float(fit["divergence"].max()),
+    report = {"args": vars(args), "token_passes_fit": calls["token_passes"], "alternations": fit["alternations"], "search_kl_max": float(fit["divergence"].max()),
               "search_kl_mean": float(fit["divergence"].mean()), "kl_max": float(joint.max()), "kl_mean": float(joint.mean()),
               "semantics_of_kl": "joint (VPD)", "rank_units_mean": float(rank.mean()),
               "rank_units_quantiles": np.quantile(rank, [0.1, 0.5, 0.9]).tolist(), "vpd": VPD}
+    print(f"[fit] compute: {calls['token_passes']:.3e} token-passes (VPD p-8383f5e5: ~2.6e10 training tokens x 3 passes)", flush=True)
     print(f"[fit] FINAL rank units/position {report['rank_units_mean']:.1f} (VPD {VPD['l0']}); joint-mask KL max "
           f"{report['kl_max']:.4f} mean {report['kl_mean']:.4f}; alternations {fit['alternations']}", flush=True)
     np.save(args.out.replace(".json", "_theta.npy"), fit["theta"])

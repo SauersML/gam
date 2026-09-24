@@ -120,6 +120,10 @@ def main():
                             (torch.from_numpy(np.asarray(v)),))
                 return dd.numpy()
 
+            def gradient_arithmetic(self):
+                # float64 throughout; the longest reduction is the KL over examples and classes.
+                return 2.0 ** -53, N * p
+
             def weighted_hessian(self, theta, keep, weights, v):
                 # Exact Hessian product of sum_t w_t KL_t in theta, forward-over-reverse.
                 m = mask(keep)

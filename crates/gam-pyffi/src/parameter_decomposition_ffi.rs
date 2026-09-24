@@ -141,8 +141,9 @@ fn parameter_decomposition_minimal_support<'py>(
 
 /// A Python executor object for `support_fit`: methods `supports(theta, keep)`,
 /// `divergence(theta, keep)`, `weighted_gradient(theta, keep, weights)`,
-/// `directional(theta, keep, v)` and `weighted_hessian(theta, keep, weights, v)` (the
-/// exact Hessian product `Σ_t w_t ∇²KL_t v`),
+/// `directional(theta, keep, v)`, `weighted_hessian(theta, keep, weights, v)` (the
+/// exact Hessian product `Σ_t w_t ∇²KL_t v`) and `gradient_arithmetic()` (the unit
+/// roundoff of its gradients and the length of their longest reduction),
 /// with float64 vectors and a `P x C` bool `keep`.
 struct PythonPieceExecutor<'py> {
     object: Bound<'py, PyAny>,
@@ -164,6 +165,14 @@ impl<'py> PythonPieceExecutor<'py> {
 }
 
 impl PieceExecutor for PythonPieceExecutor<'_> {
+    fn gradient_arithmetic(&self) -> Result<(f64, usize), String> {
+        // Declared by the executor; there is no default.
+        self.object
+            .call_method0("gradient_arithmetic")
+            .and_then(|r| r.extract::<(f64, usize)>())
+            .map_err(|e| e.to_string())
+    }
+
     fn supports(&mut self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>) -> Result<SupportEvaluation, String> {
         let py = self.object.py();
         let result = self
@@ -246,7 +255,9 @@ fn parameter_decomposition_fit_supports<'py>(
     let alternations = pyo3::types::PyList::empty(py);
     for a in &fit.alternations {
         let entry = PyDict::new(py);
+        entry.set_item("level", a.level)?;
         entry.set_item("kept", a.kept)?;
+        entry.set_item("mean_divergence", a.mean_divergence)?;
         entry.set_item("barrier_before", a.barrier_before)?;
         entry.set_item("barrier_after", a.barrier_after)?;
         entry.set_item("iterations", a.iterations)?;

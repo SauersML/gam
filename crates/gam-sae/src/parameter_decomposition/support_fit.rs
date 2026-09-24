@@ -38,6 +38,9 @@
 //!    exact model may be indefinite, which Steihaug-CG handles. Slack opened here lets
 //!    step 1 remove more.
 //!
+//! The certificate is decided at the resolution the executor's arithmetic allows (see
+//! [`PieceExecutor::gradient_arithmetic`]), not at a declared tolerance.
+//!
 //! Within one fidelity level, supports never regain a piece and `θ` never leaves the
 //! admissible set, so the kept count is non-increasing. Each alternation takes one
 //! trust-region iteration resumed from the previous one (its radius and certificate
@@ -78,6 +81,13 @@ pub trait PieceExecutor {
     fn weighted_gradient(&mut self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>, weights: ArrayView1<'_, f64>) -> Result<Array1<f64>, String>;
     /// `(∇_θ KL_t · v)_t`.
     fn directional(&mut self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>, v: ArrayView1<'_, f64>) -> Result<Array1<f64>, String>;
+    /// The arithmetic the executor's divergences come from: its unit roundoff (`2⁻²⁴` for
+    /// float32) and the number of terms its longest reduction accumulates. Its values are
+    /// then resolved to `u_f = √n · u` (the probabilistic accumulation bound), and the
+    /// trust region, which judges steps by comparing values, locates a minimizer only to
+    /// relative stationarity `√u_f`. The certificate is decided there: a tighter one
+    /// could never be met, and a looser one would pass unconverged fits.
+    fn gradient_arithmetic(&self) -> Result<(f64, usize), String>;
     /// `Σ_t w_t ∇²KL_t v`, with `∇²KL_t` the exact Hessian of `KL_t` in `θ`.
     fn weighted_hessian(&mut self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>, weights: ArrayView1<'_, f64>, v: ArrayView1<'_, f64>) -> Result<Array1<f64>, String>;
 }
@@ -86,6 +96,9 @@ pub trait PieceExecutor {
 #[derive(Debug)]
 pub enum SupportFitError {
     Support(SupportError),
+    /// The final level's trust region stalled (its radius fell to the solver's collapse
+    /// bound) before its certificate held: no converged fit exists to return.
+    NotConverged { level: f64, residual: f64, tolerance: f64 },
     Executor(String),
     Geometry(GeometryError),
 }
@@ -94,6 +107,10 @@ impl fmt::Display for SupportFitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Support(e) => write!(f, "support_fit: {e}"),
+            Self::NotConverged { level, residual, tolerance } => write!(
+                f,
+                "support_fit: the trust region stalled at level {level:.3e} with relative gradient {residual:.3e} > {tolerance:.3e}"
+            ),
             Self::Executor(e) => write!(f, "support_fit: executor failed: {e}"),
             Self::Geometry(e) => write!(f, "support_fit: trust region failed: {e}"),
         }
@@ -109,6 +126,9 @@ pub struct Alternation {
     pub level: f64,
     /// Kept pieces summed over positions after the support step.
     pub kept: usize,
+    /// Mean divergence over positions after the support step: with `kept` and `level`,
+    /// one point of the fit's sparsity-fidelity path.
+    pub mean_divergence: f64,
     /// Barrier value before and after the piece step.
     pub barrier_before: f64,
     pub barrier_after: f64,
@@ -219,6 +239,30 @@ impl<E: PieceExecutor> RiemannianObjective for Barrier<'_, E> {
     }
 }
 
+/// The first trust radius: the Cauchy step length `‖g‖³ / (gᵀ H g)` of the barrier's model
+/// at `theta` (the minimizer of the quadratic model along the gradient), so the solve
+/// starts at the objective's own scale. Where the model has no positive curvature along
+/// the gradient the Steihaug step goes to the boundary whatever the radius, and the
+/// parameter scale `‖θ‖` is used.
+fn model_scale<E: PieceExecutor>(barrier: &mut Barrier<'_, E>, theta: ArrayView1<'_, f64>) -> GeometryResult<f64> {
+    let (_, g) = barrier.value_gradient(theta)?;
+    let gnorm = g.dot(&g).sqrt();
+    let curvature = match barrier.hessian_vector_product(theta, g.view())? {
+        Some(hg) => g.dot(&hg),
+        None => 0.0,
+    };
+    let theta_norm = theta.dot(&theta).sqrt();
+    Ok(if curvature > 0.0 && gnorm > 0.0 {
+        gnorm.powi(3) / curvature
+    } else if theta_norm > 0.0 {
+        theta_norm
+    } else {
+        // θ = 0 with no curvature along a zero gradient: the solve certifies at its first
+        // test and never steps, so the radius is never read.
+        f64::EPSILON.sqrt()
+    })
+}
+
 /// Alternate supports and pieces along the fidelity path to `eps` (module docs).
 pub fn fit_supports_and_pieces<E: PieceExecutor>(
     executor: &mut E,
@@ -231,6 +275,17 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
 ) -> Result<SupportFit, SupportFitError> {
     let form = |level: f64| if mean { Fidelity::Mean(level) } else { Fidelity::PerPosition(level) };
     let mut theta = theta;
+    let (unit_roundoff, terms) = executor.gradient_arithmetic().map_err(SupportFitError::Executor)?;
+    if !(unit_roundoff.is_finite() && unit_roundoff > 0.0) || terms == 0 {
+        return Err(SupportFitError::Executor(format!(
+            "support_fit: gradient arithmetic ({unit_roundoff}, {terms}) resolves no certificate"
+        )));
+    }
+    // The trust region judges a step by comparing objective values, whose rounding band is
+    // `u_f = √n · u` (relative). A decrease below `u_f` cannot be resolved, so a minimizer is
+    // located only to within `√u_f`, where the relative gradient is of that order: the
+    // certificate is decided at `√u_f`. A tighter one would certify rounding.
+    let certificate = ((terms as f64).sqrt() * unit_roundoff).sqrt();
     let empty = Array2::from_elem((positions, pieces), false);
     let widest = executor
         .divergence(theta.view(), empty.view())
@@ -247,6 +302,9 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
     let mut keep = if levels.len() > 1 { empty } else { Array2::from_elem((positions, pieces), true) };
     let mut alternations = Vec::new();
     let manifold = EuclideanManifold::new(theta.len());
+    // The trust radius each level starts from: the previous level's final radius, or for
+    // the first fit the first model's own scale (below). Never a declared constant.
+    let mut carried_radius: Option<f64> = None;
     let mut supports = None;
     // Each support search resumes the proposal sizes the previous one learned.
     let mut radius: Option<Vec<usize>> = None;
@@ -259,8 +317,10 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
         // learned radius and the certificate's scale. The level ends only when the
         // supports stop shrinking and the certificate holds, so every level (and the
         // fit) comes from a converged optimization.
-        let step = RiemannianTrustRegion { max_iter: 1, ..RiemannianTrustRegion::default() };
+        let step = RiemannianTrustRegion { max_iter: 1, grad_tol: certificate, ..RiemannianTrustRegion::default() };
         let mut state: Option<TrustRegionTermination> = None;
+        let mut level_radius = carried_radius;
+        let theta_at_level_start = theta.clone();
         loop {
             let kept_before = current.keep.iter().filter(|&&k| k).count();
             let at = current.keep.clone();
@@ -268,7 +328,14 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
                 let mut barrier = Barrier { executor: &mut *executor, keep: &at, fidelity, error: None };
                 let before = barrier.value_gradient(theta.view()).map_err(SupportFitError::Geometry)?.0;
                 let termination = match &state {
-                    None => step.minimize_reporting_termination(&manifold, &mut barrier, theta.view()),
+                    None => {
+                        let radius = match level_radius {
+                            Some(r) => r,
+                            None => model_scale(&mut barrier, theta.view()).map_err(SupportFitError::Geometry)?,
+                        };
+                        level_radius = Some(radius);
+                        RiemannianTrustRegion { radius, ..step.clone() }.minimize_reporting_termination(&manifold, &mut barrier, theta.view())
+                    }
                     Some(previous) => step.resume(
                         &manifold,
                         &mut barrier,
@@ -288,15 +355,34 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
             current = minimal_support(&mut AtTheta { executor: &mut *executor, theta: theta.view() }, positions, pieces, fidelity, sequence, Some(at), carried)
                 .map_err(SupportFitError::Support)?;
             let kept = current.keep.iter().filter(|&&k| k).count();
+            let mean_divergence = current.divergence.sum() / current.divergence.len() as f64;
             alternations.push(Alternation {
                 level,
                 kept,
+                mean_divergence,
                 barrier_before: before,
                 barrier_after: after,
                 iterations: termination.iterations,
                 certified,
             });
+            // A radius is learned only by an accepted step: carry it when the pieces moved.
+            if termination.point != theta_at_level_start {
+                carried_radius = Some(termination.radius);
+            }
             if kept >= kept_before && certified {
+                break;
+            }
+            // The solver ends a solve whose radius falls to `tol²` (no resolvable step is
+            // left); a resumed solve in that state cannot move either, so the level ends.
+            // Only the final level must be certified: a stall there returns no fit.
+            if kept >= kept_before && termination.radius <= certificate * certificate {
+                if level == eps {
+                    return Err(SupportFitError::NotConverged {
+                        level,
+                        residual: termination.residual,
+                        tolerance: termination.tolerance,
+                    });
+                }
                 break;
             }
             state = Some(termination);
@@ -313,43 +399,53 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
 mod tests {
     use super::*;
 
-    /// `KL_t = ½ Σ_{c removed} (a_tc e^{θ_c})²`: shrinking a piece's scale `e^{θ_c}` lowers
-    /// the cost of removing it everywhere (a stand-in for pieces that can be reshaped).
-    /// The piece step opens slack, the next support step removes more, and every
-    /// position stays admissible throughout.
+    /// `KL_t = ½ Σ_{c removed} a_tc² (1 + (θ_c − 1)²)`: reshaping a piece (moving `θ_c`
+    /// toward 1) lowers the cost of removing it everywhere, down to a positive floor, so
+    /// the barrier has a minimizer (a stand-in for pieces that can be reshaped). The piece
+    /// step opens slack, the next support step removes more, and every position stays
+    /// admissible throughout.
     struct Scaled {
         a: Array2<f64>,
     }
 
     impl Scaled {
-        fn removed_energy(&self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>) -> Array2<f64> {
-            Array2::from_shape_fn(self.a.dim(), |(t, c)| {
-                if keep[[t, c]] { 0.0 } else { (self.a[[t, c]] * theta[c].exp()).powi(2) }
-            })
+        fn cost(&self, theta: ArrayView1<'_, f64>) -> Array2<f64> {
+            Array2::from_shape_fn(self.a.dim(), |(t, c)| 0.5 * self.a[[t, c]].powi(2) * (1.0 + (theta[c] - 1.0).powi(2)))
+        }
+
+        fn removed(&self, keep: ArrayView2<'_, bool>) -> Array2<f64> {
+            keep.mapv(|k| if k { 0.0 } else { 1.0 })
         }
     }
 
     impl PieceExecutor for Scaled {
         fn supports(&mut self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>) -> Result<SupportEvaluation, String> {
             let divergence = self.divergence(theta, keep)?;
-            let removal_cost = Array2::from_shape_fn(self.a.dim(), |(t, c)| 0.5 * (self.a[[t, c]] * theta[c].exp()).powi(2));
+            let removal_cost = self.cost(theta);
             Ok(SupportEvaluation { divergence, restore_gain: removal_cost.clone(), removal_cost })
         }
         fn divergence(&mut self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>) -> Result<Array1<f64>, String> {
-            Ok(self.removed_energy(theta, keep).sum_axis(ndarray::Axis(1)) * 0.5)
+            Ok((self.cost(theta) * self.removed(keep)).sum_axis(ndarray::Axis(1)))
         }
         fn weighted_gradient(&mut self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>, weights: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
-            // d KL_t / d θ_c = removed energy of (t, c).
-            Ok(self.removed_energy(theta, keep).t().dot(&weights))
+            // d KL_t / d θ_c = a_tc² (θ_c − 1) on removed pieces.
+            let r = self.removed(keep) * self.a.mapv(|a| a * a);
+            Ok(r.t().dot(&weights) * &theta.mapv(|x| x - 1.0))
         }
         fn directional(&mut self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>, v: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
-            Ok(self.removed_energy(theta, keep).dot(&v))
+            let r = self.removed(keep) * self.a.mapv(|a| a * a);
+            Ok(r.dot(&(&theta.mapv(|x| x - 1.0) * &v)))
+        }
+        fn gradient_arithmetic(&self) -> Result<(f64, usize), String> {
+            Ok((f64::EPSILON / 2.0, self.a.len()))
         }
         fn weighted_hessian(&mut self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>, weights: ArrayView1<'_, f64>, v: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
-            // KL_t = ½ Σ a_tc² e^{2θ_c} over removed pieces: the exact Hessian is diagonal,
-            // ∂²KL_t/∂θ_c² = 2 a_tc² e^{2θ_c}, twice the removed energy.
-            let e = self.removed_energy(theta, keep);
-            Ok(e.t().dot(&weights) * &v * 2.0)
+            if theta.len() != self.a.ncols() {
+                return Err(format!("theta has {} entries for {} pieces", theta.len(), self.a.ncols()));
+            }
+            // ∂²KL_t/∂θ_c² = a_tc² on removed pieces (exact, diagonal; constant in θ).
+            let r = self.removed(keep) * self.a.mapv(|a| a * a);
+            Ok(r.t().dot(&weights) * &v)
         }
     }
 
