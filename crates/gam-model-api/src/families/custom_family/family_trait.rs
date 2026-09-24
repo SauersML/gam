@@ -404,9 +404,13 @@ pub enum CoefficientModeRefusal {
     /// The objective falls below the mode along a boundary the coefficient
     /// space approaches without reaching, so the posterior's infimum is not a
     /// mode and these data do not identify the fitted point at this trial
-    /// point (gam#3003). `reason` is the family's certificate, for the message.
-    NotIdentified { reason: String },
+    /// point (gam#3003).
+    NotIdentified {
+        /// The family's certificate, rendered for the error message.
+        reason: String,
+    },
 }
+
 /// User-defined family contract for multi-block generalized models.
 pub trait CustomFamily {
     /// Optional sampled-derivative pilot owned by this family.
