@@ -221,17 +221,29 @@ def main():
     fit_passes = calls["token_passes"]
     hexec, HP, HT, hkl_of, hmask, _ = run(hids)
     held = minimal_support(lambda k: hexec.supports(fit["theta"], k), HP, C, args.eps, args.form, HT)
+    # VPD's PGDRecon protocol on the held-out supports: every removed piece is re-added with an adversarial mask in
+    # [0, 1] shared by all positions, from a uniform start, by 20 sign-gradient steps of 0.1 on the mean KL.
+    hkeep_t = hmask(held["keep"])
+    theta_t = th(fit["theta"])
+    adv = torch.rand(C, device=dev, generator=torch.Generator(device=dev).manual_seed(0)).requires_grad_(True)
+    for _ in range(20):
+        (grad,) = torch.autograd.grad(hkl_of(model.logits(hids, hkeep_t + (1 - hkeep_t) * adv, theta_t)).mean(), adv)
+        with torch.no_grad():
+            adv.add_(0.1 * grad.sign()).clamp_(0, 1)
+    with torch.no_grad():
+        pgd = hkl_of(model.logits(hids, hkeep_t + (1 - hkeep_t) * adv, theta_t)).mean().item()
     report = {"args": vars(args), "token_passes_fit": fit_passes, "alternations": fit["alternations"],
               "fit": {"rank_units_mean": float(keep.sum(1).mean()), "kl_mean": float(joint.mean()),
                       "kl_max": float(joint.max())},
               "heldout": {"rank_units_mean": float(held["keep"].sum(1).mean()),
-                          "kl_mean": float(held["divergence"].mean()), "kl_max": float(held["divergence"].max())},
+                          "kl_mean": float(held["divergence"].mean()), "kl_max": float(held["divergence"].max()),
+                          "pgd20_kl": pgd},
               "vpd": VPD}
     report["rank_units_mean"], report["kl_mean"] = report["fit"]["rank_units_mean"], report["fit"]["kl_mean"]
     print(f"[all] FINAL fit: L0 {report['fit']['rank_units_mean']:.1f} at KL {report['fit']['kl_mean']:.4f}; "
           f"compute {fit_passes:.3e} token-passes (VPD ~2.6e10 tokens x 3)", flush=True)
     print(f"[all] HELDOUT L0 {report['heldout']['rank_units_mean']:.1f} at KL {report['heldout']['kl_mean']:.4f} "
-          f"(VPD {VPD['l0']} at {VPD['kl_rounded']})", flush=True)
+          f"(VPD {VPD['l0']} at {VPD['kl_rounded']}); PGD-20 KL {pgd:.4f} (VPD {VPD['pgd20']})", flush=True)
     np.save(args.out.replace(".json", "_theta.npy"), fit["theta"])
     with open(args.out, "w") as handle:
         json.dump(report, handle, indent=1)
