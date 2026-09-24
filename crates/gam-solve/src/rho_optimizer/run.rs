@@ -5125,6 +5125,32 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                 // the criterion cannot represent at any step it may take.
                 certificate.curvature = CurvatureEvidence::CriterionUnresolvable;
                 certificate.curvature_floor = None;
+                // The withdrawal is itself a bound on the decrease left to the minimum
+                // (#3331, #3993). On the directions the criterion resolves, the Newton
+                // decrease at its curvature resolution bounds it, as the decrement rung
+                // does; along the withdrawn direction the adjudication measured that no
+                // step the box admits predicts more than `predicted_at_largest`. An
+                // indefinite matrix takes no decrement verdict, so without this the point
+                // certified stationary but recorded no criterion error, and every consumer
+                // that compares certified criteria treated it as having none: the default
+                // `s(x)` behind an outlier stopped its knot refinement at a flat,
+                // two-degree-of-freedom fit it could not compare.
+                if certificate.criterion_error.is_none()
+                    && let Some(resolved) = newton_predicted_decrease_at_resolution(
+                        &hessian,
+                        &projected_gradient,
+                        criterion_curvature_resolution(point_resolution),
+                    )
+                    && resolved.is_finite()
+                    && resolved >= 0.0
+                    && predicted_at_largest.is_finite()
+                    && point_band.is_finite()
+                {
+                    certificate.criterion_error = Some(CriterionErrorBound {
+                        decrease_left: resolved + predicted_at_largest,
+                        value_band: point_band,
+                    });
+                }
                 result.criterion_certificate = Some(certificate.clone());
                 curvature_requirement_met = certificate_meets_curvature_requirement(
                     &certificate,

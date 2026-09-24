@@ -1,5 +1,13 @@
 ## Unreleased
 
+- **A default `s(x)` grows its knots behind an outlier again** (gam#3993). A fit whose outer Hessian
+  had a negative eigenvalue too small for the criterion to resolve certified stationary but
+  recorded no bound on its criterion's error, because only the Newton-decrement rung recorded one
+  and an indefinite matrix takes no decrement. The adaptive knot loop compares fits only through
+  those bounds, so it stopped at the first basis: behind one outlier at `x = 1e6` the default fit
+  kept its five pilot knots in the data-free span and fitted the bulk with a line (RMSE 0.75
+  against 0.03). That withdrawal now records the bound it measured: the Newton decrease on the
+  resolved directions plus the most the unresolvable direction can give inside the box.
 - **A smoothing-parameter drift is judged by the rule its penalties were admitted by** (gam#2155).
   The smoothing-mixture drift `Σ λ_k S_k` was refused as not positive semidefinite against the
   eigensolver band `p·ε·‖D‖`, a hundred times tighter than the `100·p·ε·‖S‖` every penalty is
