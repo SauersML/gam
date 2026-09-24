@@ -3624,6 +3624,20 @@ impl SaeManifoldTerm {
                         // bit-for-bit the historical RHS.
                         let w_row = row_w.map_or(1.0, |w| w[row]);
                         let base = cache.row_offsets[row] + block_start;
+                        // #4077 — an active-bound pinned slot's assembled gradient
+                        // is projected to exactly zero (`B`'s Riemannian
+                        // conversion), and the IFT operator holds the slot at the
+                        // metric's unit stiffness uncoupled, so this RHS entry must
+                        // be projected to zero the same way or the solve reads it
+                        // as a real force on a coordinate the retraction holds
+                        // fixed: `A⁺·(∂g/∂ρ)` would move the pinned coordinate by
+                        // `∂g/∂ρ` itself.
+                        if self
+                            .last_pinned_bound_slots
+                            .contains(&(row, block_start + axis))
+                        {
+                            continue;
+                        }
                         match sphere {
                             // On an embedded unit sphere at `x` the assembled gradient
                             // is its tangent projection `P g`, so the RHS is
@@ -5796,6 +5810,23 @@ impl SaeManifoldTerm {
         let dim = sae_exact_stationarity_dim(cache.delta_t_len(), cache.k);
         let mut a = Array2::<f64>::zeros((dim, dim));
         let gap_border = self.probe_exact_hessian_arrow(rho, target, cache, &mut a)?;
+        // #3438/#4077 — an active-bound pinned slot enters `A = B + ΔC` with an
+        // exactly-zero row and column (`B`'s Riemannian conversion zeroes it,
+        // and `ΔC` is projected there too), so the probe above writes a
+        // structural zero diagonal. The evidence pencil carries that slot at
+        // the METRIC's unit stiffness — the same constant `+1` the per-row
+        // spectral deflation installs (`eeb8b136b1`: an all-null block is `d`
+        // unit-stiffness directions, priced at `log 1 = 0`) — so the dense
+        // materialization reads the operator its consumers price: coupled to
+        // nothing (the probe already wrote the zeros), held at the unit (write
+        // it here). The write is exact: the raw entry is exactly zero by the
+        // same projections the test pins, so `0 + 1 = 1` carries no rounding.
+        for &(row, local) in &self.last_pinned_bound_slots {
+            let index = cache.row_offsets.get(row).map_or(0, |start| start + local);
+            if index < a.nrows() {
+                a[[index, index]] += 1.0;
+            }
+        }
         Ok((a, gap_border))
     }
 
