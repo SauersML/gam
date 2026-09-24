@@ -13,7 +13,8 @@
 //! `gam-models` (`crate::inference::predict_io`, `crate::bms`), so the tests are
 //! homed back next to it.
 
-use crate::bms::{EmpiricalZGrid, LatentMeasureKind, empirical_intercept};
+use crate::bms::gradient_paths::empirical_intercept;
+use crate::bms::{EmpiricalZGrid, LatentMeasureKind};
 use crate::inference::model::{SavedCompiledFlexBlock, SavedLatentZNormalization};
 use crate::inference::predict_io::{
     BernoulliMarginalSlopePredictor, LatentConditioningSpan, PredictInput,

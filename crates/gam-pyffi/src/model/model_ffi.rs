@@ -1798,7 +1798,7 @@ fn build_model_predict_payload_json(
     build_predict_payload_json(interval, time_grid, covariance_mode, observation_interval)
 }
 
-#[pyfunction(signature = (model, headers, rows, interval, covariance_mode=None, observation_interval=None))]
+#[pyfunction(signature = (model, headers, rows, interval, covariance_mode=None, observation_interval=None, time_grid=None))]
 fn predict_table(
     py: Python<'_>,
     model: PyRef<'_, PyFittedModel>,
@@ -1807,6 +1807,7 @@ fn predict_table(
     interval: Option<f64>,
     covariance_mode: Option<String>,
     observation_interval: Option<bool>,
+    time_grid: Option<Vec<f64>>,
 ) -> PyResult<PyObject> {
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
@@ -1818,6 +1819,7 @@ fn predict_table(
             interval,
             covariance_mode,
             observation_interval,
+            time_grid,
         )
     })?
     .into_py(py)

@@ -6802,11 +6802,29 @@ fn predict_encoded_table_configured_impl(
     interval: Option<f64>,
     covariance_mode: Option<String>,
     observation_interval: Option<bool>,
+    time_grid: Option<Vec<f64>>,
 ) -> Result<TablePrediction, PredictError> {
     let model_class = model.predict_model_class();
     parse_covariance_mode(covariance_mode.as_deref()).map_err(PredictError::Other)?;
-    let time_grid =
-        default_survival_time_grid_from_model(model, &source).map_err(PredictError::Other)?;
+    // A survival prediction evaluates every row at the caller's own times when it
+    // supplies them (a study reads each row's own follow-up window, not the
+    // whole training range) and at the model's default grid otherwise.
+    let time_grid = match time_grid {
+        None => default_survival_time_grid_from_model(model, &source).map_err(PredictError::Other)?,
+        Some(times) => {
+            if !matches!(model_class, PredictModelClass::Survival) {
+                return Err(PredictError::Other(
+                    "time_grid applies to survival models only".to_string(),
+                ));
+            }
+            if times.is_empty() || times.iter().any(|t| !t.is_finite()) {
+                return Err(PredictError::Other(
+                    "time_grid needs at least one finite time".to_string(),
+                ));
+            }
+            Some(times)
+        }
+    };
     let options = PyPredictOptions {
         interval,
         time_grid,

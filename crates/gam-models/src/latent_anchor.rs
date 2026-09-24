@@ -1480,6 +1480,75 @@ impl AnchorDensity {
 
 }
 
+/// The anchor's first partials `(α_q, α_b)` at a solved root, by implicit
+/// differentiation of the calibration residual. At the root
+/// `Σ_k w_k Φ(∓η_k) = Φ(∓q)` with `η_k = α + b·u_k`, so with the density mass
+/// `D = Σ_k w_k φ(η_k)`:
+///
+/// ```text
+///   α_q = φ(q) / D,        α_b = −Σ_k w_k φ(η_k) u_k / D.
+/// ```
+///
+/// Both sides of the marginal give these same two expressions. They are the
+/// order-one entries of the anchor's Taylor table
+/// ([`AnchorTaylor::derivatives`]) without the table: a prediction node
+/// reads `α` and these two partials alone, and the table's order-five lift
+/// per law node was the whole cost of a posterior rule's node. Formed against
+/// the heaviest law node as [`AnchorDensity::at`] forms its weights, so a tail
+/// where every `φ(η_k)` underflows keeps finite ratios; `φ(q)/D` is then
+/// `exp(−½q² − log D)` with `log D` read off the same shifted sum.
+pub(crate) fn anchor_first_derivatives(
+    alpha: f64,
+    q: f64,
+    observed_slope: f64,
+    grid: AnchorGrid<'_>,
+) -> Result<(f64, f64), String> {
+    let m = grid.len();
+    let mut heaviest = None;
+    let mut heaviest_log_density = f64::NEG_INFINITY;
+    for k in 0..m {
+        let eta = alpha + observed_slope * grid.nodes[k];
+        let log_density = grid.log_weights[k] - 0.5 * eta * eta;
+        if log_density > heaviest_log_density {
+            heaviest_log_density = log_density;
+            heaviest = Some(k);
+        }
+    }
+    let Some(heaviest) = heaviest else {
+        return Err(format!(
+            "survival marginal-slope anchor density has no finite node at α={alpha}, b={observed_slope}"
+        ));
+    };
+    let heaviest_node = grid.nodes[heaviest];
+    let heaviest_log_weight = grid.log_weights[heaviest];
+    let heaviest_eta = alpha + observed_slope * heaviest_node;
+    let mut sum = 0.0;
+    let mut node_sum = 0.0;
+    for k in 0..m {
+        let node = grid.nodes[k];
+        let eta = alpha + observed_slope * node;
+        let exponent = (grid.log_weights[k] - heaviest_log_weight)
+            - 0.5 * (observed_slope * (node - heaviest_node)) * (eta + heaviest_eta);
+        let relative = exponent.exp();
+        sum += relative;
+        node_sum += relative * node;
+    }
+    if !(sum.is_finite() && sum > 0.0 && node_sum.is_finite()) {
+        return Err(format!(
+            "survival marginal-slope anchor density weights are not normalizable: Σ={sum:e} at α={alpha}, b={observed_slope}"
+        ));
+    }
+    // `log D = log w_* − ½η_*² + log Σ`, and `φ(q)/D` cancels the `√(2π)`.
+    let a_q = (-0.5 * q * q - heaviest_log_weight + 0.5 * heaviest_eta * heaviest_eta - sum.ln()).exp();
+    let a_b = -node_sum / sum;
+    if !(a_q.is_finite() && a_b.is_finite()) {
+        return Err(format!(
+            "survival marginal-slope anchor partials are not finite at α={alpha}, q={q}, b={observed_slope}: α_q={a_q}, α_b={a_b}"
+        ));
+    }
+    Ok((a_q, a_b))
+}
+
 /// The order of the anchor's Taylor table. The order-≤4 carriers read `α`
 /// through order four and the exit rate `α̇₁ = α_q·q̇₁` through order four,
 /// which is `α` through order five.
@@ -1898,6 +1967,54 @@ mod anchor_tests {
     use gam_math::jet_scalar::{JetScalar, Order2};
     use gam_math::jet_tower::Tower4;
     use gam_math::probability::{normal_cdf, normal_pdf};
+
+    /// The implicit first partials of the anchor agree with the order-one
+    /// entries of its Taylor table on a skewed law, on both sides of the
+    /// marginal and far into the tails, where every node density underflows.
+    #[test]
+    fn implicit_first_partials_match_the_taylor_table() {
+        let grid = skewed_grid();
+        for q in [-9.0_f64, -3.5, -1.0, -0.2, 0.0, 0.3, 1.7, 4.0, 8.5] {
+            for observed_slope in [0.0_f64, 0.05, 0.4, 1.3, 2.8] {
+                let alpha = solve_anchor(q, observed_slope, grid.view()).unwrap();
+                let table = AnchorTaylor::at(alpha, q, observed_slope, grid.view())
+                    .unwrap()
+                    .derivatives();
+                let (a_q, a_b) = anchor_first_derivatives(alpha, q, observed_slope, grid.view()).unwrap();
+                let tol = |reference: f64| 1e-10 * reference.abs().max(1e-3);
+                assert!(
+                    (a_q - table.a_q).abs() <= tol(table.a_q),
+                    "q={q} b={observed_slope}: a_q {a_q} vs table {}",
+                    table.a_q
+                );
+                assert!(
+                    (a_b - table.a_b).abs() <= tol(table.a_b),
+                    "q={q} b={observed_slope}: a_b {a_b} vs table {}",
+                    table.a_b
+                );
+            }
+        }
+    }
+
+    /// Whatever seed a solve starts from, it returns the same root to
+    /// rounding: a warm start from a neighbouring node's root is a work
+    /// choice, not a value choice.
+    #[test]
+    fn warm_started_solve_returns_the_seed_free_root() {
+        let grid = skewed_grid();
+        for q in [-6.0_f64, -1.5, 0.4, 3.0] {
+            for observed_slope in [0.1_f64, 0.9, 2.2] {
+                let cold = solve_anchor(q, observed_slope, grid.view()).unwrap();
+                for seed in [cold + 0.3, cold - 0.25, cold + 1.5, 0.0] {
+                    let warm = solve_anchor_from(q, observed_slope, grid.view(), seed).unwrap();
+                    assert!(
+                        (warm - cold).abs() <= 1e-12 * (1.0 + cold.abs()),
+                        "q={q} b={observed_slope} seed={seed}: {warm} vs {cold}"
+                    );
+                }
+            }
+        }
+    }
 
     // ── The standard-normal cells route in log units (gam#4504) ──
 

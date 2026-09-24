@@ -158,6 +158,7 @@ class Model:
         observation_interval: bool = False,
         return_type: str | None = None,
         id_column: str | None = None,
+        time_grid: Sequence[float] | None = None,
     ) -> Any:
         """Predict from new ``data``.
 
@@ -285,6 +286,12 @@ class Model:
         id_column : str or None, default None
             Name of an identifier column in ``data`` to propagate as a row key
             in the output (so predictions can be joined back to the input).
+        time_grid : sequence of float or None, default None
+            Survival models only: the times every row's hazard, survival and
+            cumulative hazard are evaluated at, in place of the model's own
+            grid over the training follow-up. A caller that reads one
+            follow-up window per row passes that window's times and pays
+            for those cells alone.
 
         Returns
         -------
@@ -423,6 +430,7 @@ class Model:
                 interval,
                 covariance_mode,
                 observation_interval,
+                None if time_grid is None else [float(t) for t in time_grid],
             )
         except Exception as exc:
             raise map_exception(exc) from exc

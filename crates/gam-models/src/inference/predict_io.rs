@@ -1,12 +1,13 @@
 use crate::bms::{
     BernoulliMarginalSlopeSavedAloReplay, BernoulliMarginalSlopeSavedAloReplayInput,
     EmpiricalZGrid, LatentMeasureKind, LatentZConditionalCalibration, LatentZRankIntCalibration,
-    bernoulli_marginal_link_map, empirical_intercept, replay_saved_bernoulli_marginal_slope_alo,
+    bernoulli_marginal_link_map, replay_saved_bernoulli_marginal_slope_alo,
 };
 use crate::inference::model::{SavedCompiledFlexBlock, SavedLatentZNormalization};
 use crate::latent_anchor::{
-    CalibrationTail, CalibrationUnit, linear_cell_tail_is_representable,
-    smaller_tail_log_target, solve_log_tail_root, sum_calibration_tail,
+    AnchorGridOwned, CalibrationTail, CalibrationUnit, anchor_first_derivatives,
+    gaussian_anchor, linear_cell_tail_is_representable, smaller_tail_log_target,
+    solve_anchor_from, solve_log_tail_root, sum_calibration_tail,
     sum_denested_cells_in_log_space,
 };
 use crate::marginal_slope_shared::{
@@ -21,6 +22,7 @@ use gam_runtime::resource::prediction_chunk_rows;
 use gam_solve::estimate::{EstimationError, UnifiedFitResult};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct PredictResult {
     pub eta: Array1<f64>,
@@ -247,8 +249,19 @@ pub struct AnchoredRowKernel {
     probit_scale: f64,
     base_link: InverseLink,
     /// `None` is the rigid standard-normal law; `Some` is the declared
-    /// empirical law (global, or this row's local mixture).
-    grid: Option<EmpiricalZGrid>,
+    /// empirical law (global, or this row's local mixture), prepared once for
+    /// every root this kernel solves.
+    grid: Option<AnchorGridOwned>,
+    /// The last root solved on this kernel, as `f64` bits (`NaN` before the
+    /// first), the seed of the next solve. A posterior rule visits nodes a
+    /// few standard deviations apart, so the previous root is within a Halley
+    /// step or two of the next; the Gaussian closed form is several. The root
+    /// is a function of the equation alone, whatever the seed
+    /// ([`crate::latent_anchor::solve_log_tail_root`]), so the seed changes
+    /// the work and not the value. Atomic so the kernel stays `Sync` for the
+    /// row-parallel callers; a stale seed under contention costs iterations,
+    /// never correctness.
+    warm_root: AtomicU64,
 }
 
 impl AnchoredRowKernel {
@@ -260,6 +273,17 @@ impl AnchoredRowKernel {
     /// The probit frailty scale `s` multiplying the slope in the kernel.
     pub fn probit_scale(&self) -> f64 {
         self.probit_scale
+    }
+
+    /// The empirical anchor `a(q, b)` at the probit marginal `q` and observed
+    /// slope `s·b`, solved from the last root this kernel found.
+    fn empirical_anchor(&self, grid: &AnchorGridOwned, q: f64, observed_slope: f64) -> Result<f64, EstimationError> {
+        let warm = f64::from_bits(self.warm_root.load(Ordering::Relaxed));
+        let seed = if warm.is_finite() { warm } else { gaussian_anchor(q, observed_slope) };
+        let root = solve_anchor_from(q, observed_slope, grid.view(), seed)
+            .map_err(EstimationError::InvalidInput)?;
+        self.warm_root.store(root.to_bits(), Ordering::Relaxed);
+        Ok(root)
     }
 
     /// The base-scale linear predictor at primaries `(q, b)`, with the anchor
@@ -277,14 +301,7 @@ impl AnchoredRowKernel {
             Some(grid) => {
                 let marginal = bernoulli_marginal_link_map(&self.base_link, q)
                     .map_err(EstimationError::InvalidInput)?;
-                let intercept = empirical_intercept(
-                    marginal.q,
-                    b,
-                    self.probit_scale,
-                    &grid.nodes,
-                    &grid.weights,
-                )
-                .map_err(EstimationError::InvalidInput)?;
+                let intercept = self.empirical_anchor(grid, marginal.q, sb)?;
                 Ok(intercept + sb * self.z)
             }
         }
@@ -321,15 +338,10 @@ impl AnchoredRowKernel {
             Some(grid) => {
                 let marginal = bernoulli_marginal_link_map(&self.base_link, q)
                     .map_err(EstimationError::InvalidInput)?;
-                let (intercept, a_q, a_b) = empirical_intercept_and_partials(
-                    marginal.q,
-                    marginal.q1,
-                    b,
-                    scale,
-                    &grid.nodes,
-                    &grid.weights,
-                )?;
-                Ok((intercept + sb * self.z, a_q, a_b + scale * self.z))
+                let intercept = self.empirical_anchor(grid, marginal.q, sb)?;
+                let (a_q, a_b) = anchor_first_derivatives(intercept, marginal.q, sb, grid.view())
+                    .map_err(EstimationError::InvalidInput)?;
+                Ok((intercept + sb * self.z, a_q * marginal.q1, a_b * scale + scale * self.z))
             }
         }
     }
@@ -337,10 +349,10 @@ impl AnchoredRowKernel {
 
 /// The empirical-law intercept `a`, the root of `Σ wᵢ Φ(a + s·b·zᵢ) = Φ(q)`,
 /// with its partials `(∂a/∂η, ∂a/∂b)` in the marginal index `η` (through
-/// `q′(η) = marginal_q1`) and the slope `b`. The root and its derivatives are
-/// the latent anchor's log-space solve and Taylor table at the observed slope
-/// `s·b`, normalized by the grid density, so a tail index keeps its exact
-/// partials (gam#2978).
+/// `q′(η) = marginal_q1`) and the slope `b`. The root is the latent anchor's
+/// log-space solve at the observed slope `s·b`; the partials are its implicit
+/// derivatives there ([`anchor_first_derivatives`]), normalized by the grid
+/// density, so a tail index keeps its exact partials (gam#2978).
 fn empirical_intercept_and_partials(
     q: f64,
     marginal_q1: f64,
@@ -350,18 +362,12 @@ fn empirical_intercept_and_partials(
     weights: &[f64],
 ) -> Result<(f64, f64, f64), EstimationError> {
     let observed_slope = probit_scale * slope;
-    let grid = crate::latent_anchor::AnchorGridOwned::new(nodes.to_vec(), weights.to_vec());
-    let derivatives = crate::latent_anchor::solve_anchor(q, observed_slope, grid.view())
-        .and_then(|alpha| {
-            crate::latent_anchor::AnchorTaylor::at(alpha, q, observed_slope, grid.view())
-        })
-        .map_err(EstimationError::InvalidInput)?
-        .derivatives();
-    Ok((
-        derivatives.alpha,
-        derivatives.a_q * marginal_q1,
-        derivatives.a_b * probit_scale,
-    ))
+    let grid = AnchorGridOwned::new(nodes.to_vec(), weights.to_vec());
+    let alpha = crate::latent_anchor::solve_anchor(q, observed_slope, grid.view())
+        .map_err(EstimationError::InvalidInput)?;
+    let (a_q, a_b) = anchor_first_derivatives(alpha, q, observed_slope, grid.view())
+        .map_err(EstimationError::InvalidInput)?;
+    Ok((alpha, a_q * marginal_q1, a_b * probit_scale))
 }
 
 pub struct BernoulliMarginalSlopePredictor {
@@ -2685,7 +2691,11 @@ impl BernoulliMarginalSlopePredictor {
                     z_per_raw_score: z_per_raw_score.as_ref().map(|d| d[row]),
                     probit_scale,
                     base_link: self.base_link.clone(),
-                    grid: self.empirical_grid_for_prediction_row(input, row)?,
+                    grid: self
+                        .empirical_grid_for_prediction_row(input, row)?
+                        .as_ref()
+                        .map(AnchorGridOwned::from_grid),
+                    warm_root: AtomicU64::new(f64::NAN.to_bits()),
                 })
             })
             .collect()

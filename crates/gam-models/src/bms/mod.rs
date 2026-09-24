@@ -4634,8 +4634,7 @@ pub(crate) use gradient_paths::MarginalSlopeCovarianceRef;
 pub(crate) use gradient_paths::standardize_latent_z_with_policy;
 pub(crate) use gradient_paths::weighted_location_scale;
 pub(crate) use gradient_paths::{
-    empirical_intercept, signed_probit_neglog_derivatives_up_to_fourth,
-    unary_derivatives_inverse_sqrt, unary_derivatives_log, unary_derivatives_log_normal_pdf,
+    signed_probit_neglog_derivatives_up_to_fourth, unary_derivatives_inverse_sqrt, unary_derivatives_log, unary_derivatives_log_normal_pdf,
     unary_derivatives_neglog_phi, unary_derivatives_sqrt,
 };
 pub(crate) use install_flex::{
