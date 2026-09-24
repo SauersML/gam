@@ -87,6 +87,11 @@ pub(crate) struct HessianRootInputs<'a> {
 pub(crate) struct DataRoot {
     weights: Array1<f64>,
     rows: Vec<Array1<f64>>,
+    /// `‖(√W·X)_{:j}‖`, per column: the scale of both the caller's Gram formation error and the
+    /// root's own backward error on column `j`.
+    column_norms: Array1<f64>,
+    /// The rows the root was formed from, `n`, which sets the Gram's accumulation length.
+    source_rows: usize,
 }
 
 /// One design's memoized data root. It is keyed on the weights alone, so the
@@ -121,28 +126,64 @@ impl DataRootCache {
 
 /// `R_G` for `inputs`, served from `inputs.data_root` when it holds the root
 /// for these exact weights. The lock is never held while the root is formed.
+///
+/// `R_G` is the triangular factor of a Householder QR of `√W·X`, taken over the design's rows
+/// in blocks (`R ← qr([R; √W·X_block])`), so the design is streamed and never densified. It is
+/// NOT a root of the formed Gram `XᵀWX`: forming the Gram costs `γ_n·‖x_i‖‖x_j‖` of absolute
+/// error in every entry, and a design whose columns are nearly collinear (a Matérn basis at a
+/// length scale beyond the data's range) has data curvature far below that. On the cycle-68
+/// Matérn fixture (`n = 300`, `p = 14`, `‖XᵀX‖ = 300`) the Gram's six smallest modes lay between
+/// `1e-12` and `1e-10`, under its `≈ 2e-11` formation error. The Gram root truncated them at
+/// `100·p·ε·max` and priced `H` there as the penalty alone, while the outer ψ-gradient
+/// differentiated the full `XᵀX + S_λ`: the analytic `½tr(H⁻¹∂H/∂ψ)` read `105.4` against the
+/// criterion's own central difference `20.7`, and the iso-κ search stalled. QR is backward
+/// stable on the rows, `R = Q̃ᵀ(√W·X + ΔB)` with `‖Δb_j‖ ≤ γ·‖b_j‖`, so each singular value of
+/// the stacked root carries `O(ε·σ_max)` absolute error instead of the Gram's `O(ε·σ_max²)`.
 fn data_root_rows(inputs: &HessianRootInputs<'_>) -> Result<std::sync::Arc<DataRoot>, String> {
+    use gam_linalg::faer_ndarray::FaerQr;
     if let Some(cached) = inputs.data_root.and_then(|cache| cache.lookup(inputs.weights)) {
         return Ok(cached);
     }
+    let n = inputs.design.nrows();
     let p = inputs.design.ncols();
-    let gram = gam_linalg::matrix::xt_diag_x_signed(
-        inputs.design,
-        gam_linalg::matrix::FiniteSignedWeightsView::try_from_array(&inputs.weights.to_owned())
-            .map_err(|e| format!("Hessian weights are not a valid signed-weight view: {e}"))?,
-    )
-    .map_err(|e| format!("forming the unpenalized Gram XtWX failed: {e}"))?
-    .to_dense();
-    if gram.nrows() != p || gram.ncols() != p {
-        return Err(format!(
-            "the unpenalized Gram is {}x{} against p={p}",
-            gram.nrows(),
-            gram.ncols()
-        ));
+    if inputs.weights.len() != n {
+        return Err(format!("{} weights against {n} design rows", inputs.weights.len()));
+    }
+    if inputs.weights.iter().any(|w| !(w.is_finite() && *w >= 0.0)) {
+        return Err("the weights are not all finite and non-negative, so √W·X does not exist".to_string());
+    }
+    // A block of rows at a time: the block's size is a memory choice, not a numerical one; every
+    // block is folded into `R` by the same backward-stable QR.
+    let block_rows = (4 * p).max(1024);
+    let mut r = Array2::<f64>::zeros((0, p));
+    let mut column_sq = Array1::<f64>::zeros(p);
+    let mut start = 0usize;
+    while start < n {
+        let end = (start + block_rows).min(n);
+        let mut block = inputs
+            .design
+            .try_row_chunk(start..end)
+            .map_err(|e| format!("reading design rows {start}..{end} for the data root failed: {e}"))?;
+        for (mut row, &w) in block.rows_mut().into_iter().zip(inputs.weights.slice(ndarray::s![start..end])) {
+            row *= w.sqrt();
+            for (j, v) in row.iter().enumerate() {
+                column_sq[j] += v * v;
+            }
+        }
+        let stacked = ndarray::concatenate(ndarray::Axis(0), &[r.view(), block.view()])
+            .map_err(|e| format!("stacking the data root failed: {e}"))?;
+        let (_, factor) = stacked
+            .qr()
+            .map_err(|e| format!("the data root's QR failed: {e}"))?;
+        let kept = factor.nrows().min(p);
+        r = factor.slice(ndarray::s![..kept, ..]).to_owned();
+        start = end;
     }
     let root = std::sync::Arc::new(DataRoot {
         weights: inputs.weights.to_owned(),
-        rows: psd_root_rows(&gram)?,
+        rows: r.rows().into_iter().map(|row| row.to_owned()).collect(),
+        column_norms: column_sq.mapv(f64::sqrt),
+        source_rows: n,
     });
     if let Some(cache) = inputs.data_root {
         cache.store(std::sync::Arc::clone(&root));
@@ -184,44 +225,6 @@ pub(crate) fn assembled_logdet_error_bound(spectrum: &[f64]) -> f64 {
 pub(crate) fn assembled_logdet_is_resolved(spectrum: &[f64], assembled_logdet: f64) -> bool {
     let envelope = f64::EPSILON.sqrt() * (1.0 + assembled_logdet.abs());
     assembled_logdet_error_bound(spectrum) <= envelope
-}
-
-/// Rows of a root `R` with `RᵀR = S` for a symmetric PSD `S`, taken from `S`'s
-/// OWN eigensystem and truncated at `S`'s own relative noise floor.
-///
-/// Used only on the UNPENALIZED Gram, whose spectrum is the data curvature and
-/// therefore well-scaled — this eigendecomposition is an `O(ε)` operation, not
-/// an `O(ε·κ(H))` one.
-fn psd_root_rows(s: &Array2<f64>) -> Result<Vec<Array1<f64>>, String> {
-    use faer::Side;
-    use gam_linalg::faer_ndarray::FaerEigh;
-    let dim = s.nrows();
-    if dim == 0 {
-        return Ok(Vec::new());
-    }
-    let (evals, evecs) = s
-        .eigh(Side::Lower)
-        .map_err(|e| format!("rooting the unpenalized Gram failed: {e}"))?;
-    let max = evals.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    // The same relative floor the penalty side uses: `100 · p · ε · max|e|`.
-    let threshold = 100.0 * (dim as f64) * f64::EPSILON * max;
-    let mut rows = Vec::new();
-    for i in 0..dim {
-        let ev = evals[i];
-        if !(ev.is_finite()) {
-            return Err(format!("the unpenalized Gram has eigenvalue {ev}"));
-        }
-        if ev <= threshold {
-            continue;
-        }
-        let scale = ev.sqrt();
-        let mut row = Array1::<f64>::zeros(dim);
-        for c in 0..dim {
-            row[c] = scale * evecs[[c, i]];
-        }
-        rows.push(row);
-    }
-    Ok(rows)
 }
 
 /// The full spectral operator from `B = [√W·X ; √λ_k R_k ; √δ I]`.
@@ -321,8 +324,7 @@ fn root_scale_hessian_operator_inner(
         ));
     }
     // A negative weight makes `XᵀWX` indefinite, so its root is complex and
-    // `B` does not exist. `psd_root_rows` would silently drop those directions.
-    // Decline instead.
+    // `B` does not exist. Decline.
     if inputs.weights.iter().any(|w| !(w.is_finite() && *w >= 0.0)) {
         return Err(
             "the Hessian weights are not all finite and non-negative, so H has no real root"
@@ -330,18 +332,10 @@ fn root_scale_hessian_operator_inner(
         );
     }
 
-    // ── The data half.
-    //
-    // `G = XᵀWX` is formed on its OWN, before any penalty is added, and rooted
-    // from its own eigensystem. That is the whole trick: `G`'s scale is the
-    // data curvature (`‖G‖ ≈ 1e2` on the fixture in the module header) while
-    // `‖H‖ ≈ 6e11`, so a Gram of the rows loses nothing that matters, whereas
-    // recovering `G` from the assembled `H` by subtracting the penalty would
-    // hand back `O(ε‖H‖)` of absolute error and reproduce the very defect this
-    // module exists to remove. The design is never densified: `xt_diag_x_signed`
-    // streams it, so a lazy or operator-backed design works too.
-    // `data_root_rows` forms it, or reuses the one formed at these exact
-    // weights on this design.
+    // ── The data half: `R_G` from a QR of `√W·X` on the rows (see `data_root_rows`), never a
+    //    root of the formed Gram, whose formation error exceeds the data curvature of a
+    //    nearly collinear design. `data_root_rows` forms it, or reuses the one formed at these
+    //    exact weights on this design.
     let data_root = data_root_rows(inputs)?;
     let mut rows: Vec<Array1<f64>> = Vec::with_capacity(3 * p);
     rows.extend(data_root.rows.iter().cloned());
@@ -403,18 +397,36 @@ fn root_scale_hessian_operator_inner(
     // active-constraint projection is in play. `BᵀB` is formed once, at the
     // same `O(n·p²)` the data root already cost.
     let reconstructed = stacked.t().dot(&stacked);
-    let mut worst = 0.0_f64;
     let mut scale = 0.0_f64;
+    for value in h_assembled.iter() {
+        scale = scale.max(value.abs());
+    }
+    // `BᵀB` and the caller's `H` are two assemblies of the same sum, so they may differ by their
+    // own roundoff and nothing more. That has two parts. The caller formed `XᵀWX` as a Gram, so
+    // entry `(i, j)` carries up to `γ_n·‖b_i‖‖b_j‖` (`b = √W·X`), and the QR root's `RᵀR`
+    // reproduces `BᵀB` to `2γ_{n·p}·‖b_i‖‖b_j‖` from its columnwise backward error; the rest is
+    // the assembly roundoff of the penalty sum, `64·p·ε·max|H|`.
+    let gram_growth = gam_math::roundoff::accumulation_growth(data_root.source_rows.max(1))
+        + 2.0 * gam_math::roundoff::accumulation_growth(data_root.source_rows.max(1) * p.max(1));
+    let assembly_band = 64.0 * (p as f64) * f64::EPSILON * scale.max(1.0);
+    let mut worst = 0.0_f64;
+    let mut reconstruction_tolerance = 0.0_f64;
+    let mut reproduced = true;
     for i in 0..p {
         for j in 0..p {
-            worst = worst.max((reconstructed[[i, j]] - h_assembled[[i, j]]).abs());
-            scale = scale.max(h_assembled[[i, j]].abs());
+            let gap = (reconstructed[[i, j]] - h_assembled[[i, j]]).abs();
+            let band = gram_growth * data_root.column_norms[i] * data_root.column_norms[j]
+                + assembly_band;
+            if gap > band {
+                reproduced = false;
+            }
+            if gap > worst {
+                worst = gap;
+                reconstruction_tolerance = band;
+            }
         }
     }
-    // `BᵀB` and the caller's `H` are two assemblies of the same sum, so they
-    // may differ by their own accumulation roundoff and nothing more.
-    let reconstruction_tolerance = 64.0 * (p as f64) * f64::EPSILON * scale.max(1.0);
-    if !(worst <= reconstruction_tolerance) {
+    if !reproduced {
         return Err(format!(
             "the root reproduces H only to {worst:.3e} against a roundoff tolerance of \
              {reconstruction_tolerance:.3e} (max|H|={scale:.3e}); the caller's Hessian is not \

@@ -1,5 +1,15 @@
 ## Unreleased
 
+- **The log-determinant's root is taken from the design's rows, not from its Gram** (gam#2644,
+  gam#3201). When the assembled Hessian cannot resolve `log|H|`, REML prices it from a root of
+  `H = XᵀWX + S_λ`. The data half of that root was rooted from the formed Gram `XᵀWX` and truncated
+  at `100·p·ε·max`, but forming the Gram costs `γ_n·‖x_i‖‖x_j‖` in every entry. A Matérn basis at a
+  length scale beyond the data's range has nearly collinear columns and data curvature below that
+  error, so those modes were dropped and `H` was priced there as the penalty alone, while the
+  length-scale gradient differentiated the full `XᵀX + S_λ`. On a 1-D Matérn fit the analytic
+  length-scale gradient read `+64.8` against the criterion's own central difference `−20.0`, and
+  the search stalled at an uncertified point. The root is now a QR of `√W·X` over the design's rows,
+  whose error is `O(ε·σ_max)` per singular value, and ordinary `matern(x)` fits certify again.
 - **A constant-curvature smooth's range search no longer stops on a concave shoulder** (gam#1464).
   Near the distance-kernel face the profiled criterion in the log range `η` flattens as
   `V ≈ V∞ − c·e^{−η}`, so its slope is exponentially small there and the search's stationarity
