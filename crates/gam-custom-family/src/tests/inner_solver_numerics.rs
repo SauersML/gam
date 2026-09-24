@@ -865,7 +865,11 @@ pub(crate) fn a_rounding_level_change_never_shrinks_the_region_2977() {
          pred={PREDICTED:.3e} band={band:.3e}"
     );
 
-    for realized in [REALIZED, -REALIZED, CEILING, -CEILING, 0.0] {
+    // The band is centred on the model's prediction: the realized change of an
+    // exact model is off from `predicted` by at most `2ε_f = CEILING`, so the
+    // band's closed edges are `PREDICTED ± CEILING`. (`−CEILING` alone sits
+    // `PREDICTED` beyond the lower edge and reads `rho` a hair under 3/4.)
+    for realized in [REALIZED, -REALIZED, PREDICTED + CEILING, PREDICTED - CEILING, 0.0] {
         let update = update_joint_trust_region_radius(
             OLD_RADIUS,
             STEP_NORM,
@@ -877,8 +881,8 @@ pub(crate) fn a_rounding_level_change_never_shrinks_the_region_2977() {
             CEILING,
             true,
         );
-        // The band is closed: at the edge `realized = ±CEILING = ±2ε_f` the ratio is
-        // exactly `1 ∓ 1/4`, which the sampled edges reach.
+        // The band is closed: at the edge `realized = PREDICTED ± 2ε_f` the ratio is
+        // `1 ± 2ε_f/(PREDICTED + 8ε_f)`, within `1/4`, which the sampled edges reach.
         assert!(
             (update.rho - 1.0).abs() <= 0.25,
             "a change {realized:.3e} within the comparison's rounding {CEILING:.3e} must read \
