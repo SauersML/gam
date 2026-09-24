@@ -4462,29 +4462,48 @@ mod tests {
             near.dim(),
             "the analytic jet and the rebuilt difference must be the same block"
         );
+        // The section's jet carries the motion of the section `Z(ℓ)` and of the chart's column
+        // scales, and deliberately not the chart freedoms that right-multiply the section — the
+        // rotation of the kept singular directions among themselves, the damping — because the
+        // profiled criterion does not see a chart applied to the design and the penalty together
+        // (`representer_section_log_length_jets`). A rebuilt design realizes those freedoms at
+        // every `ℓ`, so its difference quotient differs from the jet by `X·A` for the chart's own
+        // motion `A`: a right-multiplication, inside the design's column space. What the jet must
+        // match is the rest. So the gap between the difference and the jet is projected off
+        // `col(X)`, and what remains must sit inside the difference's own error: the projection
+        // is a contraction, so the remainder of an error `E` is at most `‖E‖_F`, with `E` bounded
+        // entrywise by the truncation `|D_{2h} − D_h|` plus the rounding the differencing
+        // amplifies by `1/(2h)`.
         let rows = data.nrows();
         let columns = analytic.ncols();
-        let mut worst = 0.0_f64;
-        let mut worst_report = String::new();
-        for ((index, value), difference) in analytic.indexed_iter().zip(near.iter()) {
+        let design = pinned.design.to_dense();
+        let gap = &near - analytic;
+        let (u, singular, _) = design.svd(true, false).expect("design SVD");
+        let u = u.expect("left singular vectors");
+        let rank_band =
+            singular.iter().fold(0.0_f64, |acc, value| acc.max(*value)) * f64::EPSILON * rows.max(columns) as f64;
+        let kept: Vec<usize> = (0..singular.len()).filter(|&k| singular[k] > rank_band).collect();
+        let basis = u.select(Axis(1), &kept);
+        let remainder = &gap - &basis.dot(&basis.t().dot(&gap));
+        let mut error_sq = 0.0_f64;
+        for (index, difference) in near.indexed_iter() {
             let truncation = (far[index] - difference).abs();
             let rounding = gam_linalg::roundoff::accumulation_growth(rows + columns)
                 * (plus[index].abs() + minus[index].abs())
                 / (2.0 * h);
-            let band = truncation + rounding;
-            let miss = (value - difference).abs();
-            if miss > band && miss - band > worst {
-                worst = miss - band;
-                worst_report = format!(
-                    "entry {index:?}: analytic {value:.9e} vs central difference                      {difference:.9e} (at 2h: {:.9e}), band {band:.3e}",
-                    far[index]
-                );
-            }
+            error_sq += (truncation + rounding).powi(2);
         }
+        let remainder_norm = remainder.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let gap_norm = gap.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let error_norm = error_sq.sqrt();
+        eprintln!(
+            "[2902] gap ‖D − J‖_F {gap_norm:.3e}; off col(X) {remainder_norm:.3e}; difference error {error_norm:.3e}"
+        );
         assert!(
-            worst_report.is_empty(),
-            "the CenterSumToZero design jet left the band its own differences measure by \
-             {worst:.3e}. Worst entry — {worst_report}"
+            remainder_norm <= error_norm,
+            "the CenterSumToZero design jet differs from its central differences by {remainder_norm:.3e} \
+             off the design's column space, beyond the differences' own error {error_norm:.3e} \
+             (total gap {gap_norm:.3e})"
         );
     }
 
