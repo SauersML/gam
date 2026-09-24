@@ -132,10 +132,44 @@ fn duchon_frozen_replay_reproduces_the_collection_penalty_topology_2433() {
         "the frozen single-term replay must reproduce the collection's penalty \
          topology exactly; the κ optimizer refuses the fit otherwise (#2433)"
     );
+    // The collection's width is read after its gauge (the deferred
+    // `OrthogonalToParametric` centring deletes a column), and the κ realizer puts
+    // every local rebuild back into that gauge before it compares widths
+    // (`replace_term_realization`). The replay's width is compared there too; its
+    // pre-gauge `dim` is one column wider by construction.
+    let gauge = term
+        .collection_gauge
+        .as_ref()
+        .expect("the collection records the gauge its terms were placed in");
+    let local = frozen_replay(data.view(), &frozen, None);
+    let frozen_term = &frozen.smooth_terms[0];
+    let placed = gam_terms::smooth::place_term_in_collection_gauge(
+        gauge,
+        gam_terms::smooth::LocalTermRealization {
+            design: local.design,
+            metadata: &local.metadata,
+            active_penalties: &local.active_penalties,
+            dropped_penalties: local.dropped_penalties,
+            linear_constraints_local: local.linear_constraints.as_ref(),
+            joint_null_rotation: local.joint_null_rotation.as_ref(),
+            duchon_operator_penalties: gam_terms::smooth::duchon_operator_penalty_request(
+                frozen_term,
+            ),
+            bspline_null_ridge: gam_terms::smooth::bspline_null_ridge_request(frozen_term),
+            termname: &frozen_term.name,
+        },
+    )
+    .expect("the frozen replay must place in the collection's gauge");
     assert_eq!(
-        replay.dim,
+        placed.design.ncols(),
         term.coeff_range.len(),
-        "the frozen replay must reproduce the collection's coefficient width"
+        "the frozen replay, placed in the collection's gauge, must reproduce the \
+         collection's coefficient width"
+    );
+    assert_eq!(
+        sources(&placed.active_penalties),
+        sources(&term.active_penalties),
+        "the gauged replay must carry the collection's penalty topology"
     );
 
     // The topology the two now agree on is the CORRECT one, not merely a shared
