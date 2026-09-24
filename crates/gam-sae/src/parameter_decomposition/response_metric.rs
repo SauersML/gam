@@ -25,7 +25,7 @@
 //! * `G` is never formed. Its spectrum is read off the factor, `λᵢ(G) = σᵢ(A)²`
 //!   ([`metric_eigenvalues`]), so a direction is resolved at the factor's own
 //!   conditioning, not at its square. The factor is `(Σ_α q_α) × d` per state and
-//!   its rank is resolved by [`constant_rank_check`](super::state::constant_rank_check).
+//!   its rank is resolved by [`constant_rank_check`].
 //! * `ker G(h) = ⋂_α ker(L_α DR_α(h))`. A factor with a kernel removes the output
 //!   directions the metric does not charge: with `L = [½, −½]` on two logits, a
 //!   shift of both logits is invisible, as it is to their softmax.
@@ -52,7 +52,7 @@
 //!   computed directions within `band / (σ̂_k − σ̂_{k+1} − band)` (the sine of the
 //!   largest principal angle) of the leading `k`-dimensional right singular
 //!   subspace of the exact `A(h₀)`, through
-//!   [`projector_error_bar`](gam_linalg::decision::projector_error_bar). Where the
+//!   [`projector_error_bar`]. Where the
 //!   rank reaches `Σ_α q_α` the exact `σ_{k+1}` is zero.
 //!
 //! # The singular-point caveat: finite checks, not the kernel alone
@@ -70,7 +70,7 @@
 //! So no chart is accepted from the kernel. [`LocalStateCoordinates::finite_check`]
 //! executes the whitened responses at declared finite states and compares each
 //! state with its section representative `D(E h)`, which differs from it only
-//! along the kernel, through [`fiber_test`](super::state::fiber_test). A
+//! along the kernel, through [`fiber_test`]. A
 //! separation above the declared fidelity refutes the chart at those states.
 //! Agreement is a bound over the stated states only. The states and the fidelity
 //! are experiment declarations with no default.
@@ -86,7 +86,7 @@
 //! logit shift.
 //!
 //! Each divergence comes from
-//! [`categorical_kl_from_logits_with_error`](gam_math::categorical::categorical_kl_from_logits_with_error),
+//! [`categorical_kl_from_logits_with_error`],
 //! whose bound covers the evaluation of the stored logits. The logits' own
 //! roundoff `e` (sup norm, at both ends) adds `e(2 + osc(δ̂) + 4e)` with
 //! `δ̂ = ẑ′ − ẑ`. Along the segment to the exact pair, `∇_{z′} KL = p′ − p` has
@@ -98,7 +98,7 @@
 //! `L(p) = diag(√p)(I − 1pᵀ)`, the factor `A(h) = [√ν_α L(p_α(h)) J_α(h)]` is not
 //! the Jacobian of any map, because `L` moves with `h`. So it is resolved as a
 //! stacked factor through
-//! [`resolve_stacked_factor`](super::state::resolve_stacked_factor)
+//! [`resolve_stacked_factor`]
 //! ([`CategoricalFamily::at`]). Each `L(p)` has the exact kernel `1`, so the rank
 //! ceiling is `min(Σ_α (K_α − 1), d)`.
 

@@ -430,7 +430,7 @@ fn selected_uncertainty_backend<'a>(
 /// factor with the correction's factor `B` beside it. `None` when the fit
 /// carries no factorized correction. A constrained fit's corrected law is the
 /// θ-mixture of its truncated node laws (gam#3229), which this serves through
-/// one factored node precision per node ([`smoothing_mixture_backend`]); `B`
+/// one factored node precision per node (`smoothing_mixture_backend`); `B`
 /// is never read as an ambient inflation to truncate, the second convention
 /// gam#3229 removed.
 pub fn smoothing_corrected_factorized_backend<'a>(

@@ -24,12 +24,13 @@
 //!   Equal counts are equal Fisher information per bin at the null law, so the
 //!   law has one resolution number, and that number is read from the evidence
 //!   on a nested doubling ladder rather than fixed (#3337); see
-//!   [`StructuredResidualModel::fit`].
+//!   `StructuredResidualModel::fit`.
 //!
 //! Each rank `r` is fitted to its certified posterior mode by a Newton
 //! trust-region solve with exact analytic derivatives, under priors centred on
 //! "no factor" and on the null activity law `c ≡ 1`, and scored by its Laplace
-//! log marginal likelihood (see [`evidence`]). The **factor count `r`** is the
+//! log marginal likelihood (see `StructuredResidualModel::log_evidence`). The
+//! **factor count `r`** is the
 //! evidence maximizer over every rank the model identifies,
 //! `0 ≤ r ≤ L(p)` with `L(p)` the Ledermann bound; a higher rank is taken only
 //! on strictly larger evidence. The candidate set is fixed by identifiability

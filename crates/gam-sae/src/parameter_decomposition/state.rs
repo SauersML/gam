@@ -81,7 +81,7 @@
 //!   only where it reaches `min(rows, d)`.
 //! * The fidelity tolerance is a declared experiment input with no default.
 //! * Every verdict converts to the shared
-//!   [`EvidenceStatus`](super::supports::EvidenceStatus). A violation or a
+//!   [`EvidenceStatus`]. A violation or a
 //!   separation is a counterexample, a bound over the stated items is a uniform
 //!   bound, an unresolved separation, rank or norm is unresolved, and a rank at
 //!   its ceiling is exact. A verdict decides each evaluated item through the

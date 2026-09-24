@@ -3,7 +3,7 @@
 //!
 //! [`ReorthogonalizedRowBasis`] takes rows one at a time. Each row is reduced
 //! against the directions already held, in
-//! [`GRAM_SCHMIDT_PASSES`](gam_math::roundoff::GRAM_SCHMIDT_PASSES) passes of
+//! [`GRAM_SCHMIDT_PASSES`] passes of
 //! modified Gram–Schmidt. When admitted, it joins as the unit direction `q̂_j` of
 //! its residual. The basis keeps:
 //! - the triangular factor `R̂`, where `R̂_ij` is the total projection of admitted
