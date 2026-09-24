@@ -1039,7 +1039,11 @@ impl<'d> SpatialJointContext<'d> {
         }
         let allow_second_order = matches!(order, OuterEvalOrder::ValueGradientHessian)
             && analytic_outer_hessian_available;
-        if let Some(eval) = self.cache.memoized_eval(theta) {
+        // An armed certificate capture is answered by evaluating again, never from the memo,
+        // which publishes no evidence (gam#3331).
+        if !gam_solve::estimate::outer_eval_capture::certificate_parts_capture_enabled()
+            && let Some(eval) = self.cache.memoized_eval(theta)
+        {
             let cached_satisfies_order = !allow_second_order || eval.2.is_analytic();
             if cached_satisfies_order {
                 return Ok(eval);
@@ -6011,7 +6015,12 @@ where
                           theta: &Array1<f64>,
                           order: OuterEvalOrder|
          -> Result<OuterEval, EstimationError> {
-            if let Some((cost, grad, hess)) = ctx.cache.memoized_eval(theta)
+            // A memoized answer publishes none of the evidence its evaluation did, so a
+            // certificate listening for it (armed capture) is answered by evaluating again: the
+            // terminal certificate of this route read an empty window, derived no standard and
+            // judged every BMS spatial fit against the solver's 1e-4 band (gam#3331).
+            if !gam_solve::estimate::outer_eval_capture::certificate_parts_capture_enabled()
+                && let Some((cost, grad, hess)) = ctx.cache.memoized_eval(theta)
                 && ctx.terminal_mode_matches(theta, cost)
             {
                 let cached_satisfies_order = match order {
@@ -7049,7 +7058,11 @@ fn try_exact_joint_latent_coord_optimization(
             theta: &Array1<f64>,
             order: OuterEvalOrder,
         ) -> Result<(f64, Array1<f64>, gam_problem::HessianValue), EstimationError> {
-            if let Some(eval) = self.cache.memoized_eval(theta) {
+            // An armed certificate capture is answered by evaluating again, never from the
+            // memo, which publishes no evidence (gam#3331).
+            if !gam_solve::estimate::outer_eval_capture::certificate_parts_capture_enabled()
+                && let Some(eval) = self.cache.memoized_eval(theta)
+            {
                 return Ok(eval);
             }
             self.cache

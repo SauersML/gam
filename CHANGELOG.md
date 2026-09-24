@@ -1,5 +1,11 @@
 ## Unreleased
 
+- **A spatial fit's terminal certificate reads the evidence of the point it certifies** (gam#3331).
+  The n-block, joint spatial and latent-joint length-scale routes answer a revisited θ from their own
+  evaluation memo, which republishes none of the evidence the evaluation published. The terminal
+  certificate evaluates exactly the point the search last evaluated, so it read an empty evidence
+  window, derived no standard, and judged the fit against the solver's `1e-4` band. While a
+  certificate is listening, those routes now evaluate again instead of answering from the memo.
 - **P-IRLS damps a coordinate by its curvature's magnitude** (gam#3962). The Levenberg–Marquardt
   scale `D²` was the penalized Hessian's diagonal floored to its rounding band, so a coordinate whose
   observed curvature is negative (an indefinite early iterate) got a damping scale of about `1e−17`:

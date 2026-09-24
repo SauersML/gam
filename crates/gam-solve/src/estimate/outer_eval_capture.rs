@@ -719,7 +719,12 @@ pub(crate) fn republish_certificate_evidence(evidence: &CertificateEvidence) {
     });
 }
 
-pub(crate) fn certificate_parts_capture_enabled() -> bool {
+/// Whether an outer certificate is listening for the next evaluation's evidence (#2954).
+///
+/// Public so an outer objective outside this crate that memoizes its evaluations knows when a
+/// memoized answer would be wrong: a cached value carries no evidence, and a certificate that
+/// reads an empty window derives no standard (gam#3331).
+pub fn certificate_parts_capture_enabled() -> bool {
     CERTIFICATE_EVIDENCE.with(|slot| slot.borrow().is_some())
 }
 
