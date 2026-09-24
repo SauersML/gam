@@ -289,7 +289,9 @@ fn recover_column_log_amplitudes(
 /// the spot check.
 enum BuildOutcome {
     EvalFailed(String),
-    TailNotCertified,
+    /// The retained series' trailing coefficients, relative to its scale,
+    /// against the bound they had to fall below.
+    TailNotCertified { worst_relative: f64, bound_relative: f64 },
     Candidate(PsiGramTensor),
 }
 
@@ -496,6 +498,8 @@ impl PsiGramTensor {
         // exhausted without an accepted candidate this drives a reason that
         // distinguishes unresolved interpolation accuracy from failed evaluation.
         let mut last_uncertified: Option<usize> = None;
+        // What each rung measured, so a refusal names the numbers it refused on.
+        let mut tail_record: Vec<String> = Vec::new();
         let mut node_statistics = std::collections::BTreeMap::new();
         let mut dimensions = None;
         for &m in PSI_GRAM_NODE_LADDER.iter() {
@@ -520,7 +524,13 @@ impl PsiGramTensor {
                 // Tail not yet below the certificate at this rung: escalate.
                 // (Conflating this with EvalFailed would kill the ladder at
                 // its first — intentionally coarse — rung.)
-                BuildOutcome::TailNotCertified => {
+                BuildOutcome::TailNotCertified {
+                    worst_relative,
+                    bound_relative,
+                } => {
+                    tail_record.push(format!(
+                        "m={m}: tail {worst_relative:.3e} of scale against {bound_relative:.3e}"
+                    ));
                     last_uncertified = Some(m);
                     continue;
                 }
@@ -537,6 +547,7 @@ impl PsiGramTensor {
                     // The assembled Gram disagreed with an exact off-node
                     // rebuild at this rung; a denser rung may still certify, so
                     // escalate rather than abort.
+                    tail_record.push(format!("m={m}: tail certified, off-node check failed"));
                     last_uncertified = Some(m);
                 }
             }
@@ -547,7 +558,8 @@ impl PsiGramTensor {
                 "Chebyshev series did not certify within the node ladder (reached rung \
                  m={m}, top rung {top_rung}): the coefficient tail or exact off-node \
                  statistics remained unresolved over [{psi_lo}, {psi_hi}], so the n-free \
-                 tensor is refused and the exact per-trial path must be used"
+                 tensor is refused and the exact per-trial path must be used; rungs: [{}]",
+                tail_record.join("; ")
             ),
             None => "empty Chebyshev node ladder".to_string(),
         })
@@ -794,12 +806,24 @@ impl PsiGramTensor {
         let tail_rtol = PSI_GRAM_CERT_RTOL.min(accumulation_floor);
         let gram_bound = tail_rtol * gram_scale;
         let rhs_bound = tail_rtol * rhs_scale;
-        for d in tail_start..m {
-            if gram[d].iter().any(|&v| v.abs() > gram_bound)
+        let relative = |slab: &Array2<f64>, scale: f64| {
+            slab.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs())) / scale.max(f64::MIN_POSITIVE)
+        };
+        let relative_rhs = |slab: &Array1<f64>, scale: f64| {
+            slab.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs())) / scale.max(f64::MIN_POSITIVE)
+        };
+        if (tail_start..m).any(|d| {
+            gram[d].iter().any(|&v| v.abs() > gram_bound)
                 || rhs[d].iter().any(|&v| v.abs() > rhs_bound)
-            {
-                return BuildOutcome::TailNotCertified;
-            }
+        }) {
+            let worst_relative = (tail_start..m).fold(0.0_f64, |acc, d| {
+                acc.max(relative(&gram[d], gram_scale))
+                    .max(relative_rhs(&rhs[d], rhs_scale))
+            });
+            return BuildOutcome::TailNotCertified {
+                worst_relative,
+                bound_relative: tail_rtol,
+            };
         }
         BuildOutcome::Candidate(Self {
             psi_lo,

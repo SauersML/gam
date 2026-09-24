@@ -210,8 +210,15 @@ fn the_profiled_gaussian_lr_statistic_is_the_log_deviance_ratio_plus_its_offset(
             scale.observations, observations,
             "{label}: the reference must count the rows the likelihood sums over"
         );
+        // `offset` is read off this test's own refits, and the driver's `B` off its
+        // own: two separately converged optimizations of each model, like the two
+        // log-likelihoods below, so the two agree at the resolution of the
+        // statistic, not at machine precision. On the zero-weight arm the driver's
+        // `ν_f` and the refit's differ by about 6e-7, which moves `B` by
+        // `(n/ν_f − 1)·6e-7 ≈ 3.5e-8`; the unweighted arm agrees to every digit.
+        // The same bar as the identity below, since `B` is a summand of it.
         assert!(
-            (scale.deterministic_offset - offset).abs() <= 1e-9 * (1.0 + offset.abs()),
+            (scale.deterministic_offset - offset).abs() <= 1e-6 * (1.0 + predicted.abs()),
             "{label}: the published deterministic offset {} is not \
              n·ln(ν_f/ν_0) + (ν_0 − ν_f) = {offset}",
             scale.deterministic_offset

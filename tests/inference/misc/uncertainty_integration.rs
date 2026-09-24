@@ -103,7 +103,8 @@ fn noiseless_gaussian_smoothing_correction_is_a_valid_covariance_2490() {
     );
     assert!(
         first_order.diag().iter().any(|&variance| variance > 0.0),
-        "fixture no longer exercises a non-vacuous smoothing correction"
+        "fixture no longer exercises a non-vacuous smoothing correction: log lambdas {:?}",
+        fit.log_lambdas
     );
 
     let corrected = fit

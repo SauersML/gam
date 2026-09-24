@@ -3198,7 +3198,40 @@ fn matern_include_intercept_is_refused_whenever_the_collection_transforms_it() {
     for centers in ["", ", centers=6", ", centers=9", ", centers=16", ", centers=30"] {
         refused(&format!("y ~ matern(x, zbig, include_intercept=true{centers})"));
     }
-    refused("y ~ matern(x, zbig, include_intercept=true, identifiability=none)");
+    // The uncentered default count: whether a transform arrives depends on whether
+    // the joint penalty at that count has a null space, and the count is the
+    // rate-derived default (bc42d5ca46), not a fixed number. So the contract is
+    // checked either way: refused naming the option when a transform arrives,
+    // otherwise realized as `[K·Z | 1]` with every penalty on the term's columns.
+    {
+        let formula = "y ~ matern(x, zbig, include_intercept=true, identifiability=none)";
+        match build(formula) {
+            Err(err) => {
+                assert!(err.to_string().contains("include_intercept"), "`{formula}`: {err}")
+            }
+            Ok(design) => {
+                assert_eq!(design.smooth.terms.len(), 1, "`{formula}`");
+                let local = design.smooth.terms[0].coeff_range.clone();
+                let start = design.intercept_range.end;
+                let columns = start + local.start..start + local.end;
+                assert_eq!(columns.end, design.design.to_dense().ncols(), "`{formula}`");
+                assert!(!design.penalties.is_empty(), "`{formula}`");
+                let mut joint = Array2::<f64>::zeros((columns.len(), columns.len()));
+                for penalty in &design.penalties {
+                    assert_eq!(
+                        penalty.col_range, columns,
+                        "`{formula}`: penalty off the term's columns"
+                    );
+                    joint += &penalty.local;
+                }
+                let constant = columns.len() - 1;
+                assert!(
+                    joint[[constant, constant]] > 0.0,
+                    "`{formula}`: the appended constant is shrunk"
+                );
+            }
+        }
+    }
     for centers in [6usize, 9, 16, 30] {
         let formula =
             format!("y ~ matern(x, zbig, include_intercept=true, centers={centers}, identifiability=none)");
@@ -5107,9 +5140,10 @@ fn col_minmax_refuses_a_constant_column_and_keeps_a_tiny_real_range_2469() {
 /// - The Matérn operator mass penalty: at a short length scale the builder's
 ///   rank is full, and the collocation factor agrees. At a long one the factor
 ///   still resolves every mode, while the builder's dense Gram has lost some.
-/// - A dimension-4 Gram whose smallest eigenvalue straddles the builder cutoff
-///   `dim·1e-10·λmax` (the hybrid-Duchon Primary regime) is resolved by the
-///   owner, and `try_from_dense_psd` truncates it.
+/// - A dimension-4 Gram whose smallest eigenvalue straddles the retired builder
+///   cutoff `dim·1e-10·λmax` (the hybrid-Duchon Primary regime) is resolved by
+///   the owner, and `try_from_dense_psd` keeps it too: its cut is the spectrum's
+///   rounding band `dim·ε·‖H‖₂` since `0f72c1e70e` (#2901), so the two agree.
 #[test]
 fn partition_owner_keeps_todays_ranks_where_they_are_correct_and_resolves_the_rest_2469() {
     use gam_linalg::roundoff::{factor_rank_partition, resolved_eigenvalue_count};
@@ -5185,8 +5219,17 @@ fn partition_owner_keeps_todays_ranks_where_they_are_correct_and_resolves_the_re
                                  by {leak:.3e} (bound {tilt_bound:.3e})"
                             );
                         }
+                        // The declaration decides the rank where it removes more than
+                        // the spectrum resolves (4dc7cd0f23): the builder counts the
+                        // resolved rank less the declared directions the spectrum still
+                        // calls penalized (the cyclic harmonic fundamental's alias energy,
+                        // a Duchon `√ε` ridge), and never adds any back.
+                        let resolved =
+                            resolved_eigenvalue_count(&analysis.eigenvalues.to_vec(), 0.0);
+                        let resolved_nullity = frame.nrows() - resolved;
+                        let removed = frame.ncols().saturating_sub(resolved_nullity);
                         assert_eq!(
-                            resolved_eigenvalue_count(&analysis.eigenvalues.to_vec(), 0.0),
+                            resolved - removed,
                             penalty.info.effective_rank,
                             "{formula} {:?}: the owner must reproduce the builder's rank",
                             penalty.info.source
@@ -5288,13 +5331,13 @@ fn partition_owner_keeps_todays_ranks_where_they_are_correct_and_resolves_the_re
         4,
         "the owner resolves the eigenvalue straddling dim·1e-10·λmax"
     );
-    let truncated =
+    let factored =
         crate::basis::ConstructiveQuadratic::try_from_dense_psd(straddle, "straddle Gram")
             .expect("PSD straddle Gram");
     assert_eq!(
-        truncated.factor().nrows(),
-        3,
-        "try_from_dense_psd's dim·1e-10·λmax cutoff truncates a resolved eigenvalue"
+        factored.factor().nrows(),
+        4,
+        "try_from_dense_psd cuts at the rounding band, so it keeps the eigenvalue the owner resolves"
     );
 }
 
