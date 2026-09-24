@@ -6493,12 +6493,12 @@ pub(crate) fn build_tensor_bspline_basis(
                 .matrix
                 .clone(),
         };
+        // An open margin's penalty presence is checked by the `None` arm above.
+        // A periodic margin reads nothing of the 1-D build's penalties: on three
+        // translates the harmonic roughness it ships is structurally zero and is
+        // dropped, while the derivative roughness assembled here still charges
+        // the fundamental.
         marginal_penalties.push(marginal_penalty);
-        built.active_penalties.first().ok_or_else(|| {
-            BasisError::InvalidInput(format!(
-                "internal TensorBSpline error at dim {dim}: missing marginal nullspace dim"
-            ))
-        })?;
         // A `PeriodicUniform` marginal knotspec implies the margin is
         // wrap-around: the 1D builder already realized it as a periodic
         // basis, so the tensor product inherits that periodicity. Record

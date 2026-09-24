@@ -44,7 +44,8 @@ const MCSE_BAND: f64 = 3.0;
 const KS_LEVEL: f64 = 0.01;
 const SEED: u64 = 0x3569_0000;
 const FORMULA: &str = "y ~ s(x, bs='tps', k=8)";
-const TERM: &str = "s(x)";
+/// The significance table labels a smooth by its formula token, options included.
+const TERM: &str = "s(x, bs='tps', k=8)";
 /// Amplitude of the class-`b` log-odds curve in the signal scenario.
 const SIGNAL_AMPLITUDE: f64 = 1.5;
 
@@ -93,10 +94,14 @@ fn row(model: &MultinomialSavedModel, contrast: &MultinomialSmoothContrast) -> S
     let table = model
         .smooth_significance()
         .unwrap_or_else(|error| panic!("smooth_significance failed: {error:?}"));
+    let available: Vec<String> = table
+        .iter()
+        .map(|row| format!("{:?}/{}", row.contrast, row.term_label))
+        .collect();
     let found = table
         .into_iter()
         .find(|row| &row.contrast == contrast && row.term_label == TERM)
-        .unwrap_or_else(|| panic!("no {contrast:?} row for {TERM}"));
+        .unwrap_or_else(|| panic!("no {contrast:?} row for {TERM}; the table has {available:?}"));
     found.test.unwrap_or_else(|reason| {
         panic!(
             "{contrast:?} row for {TERM} was refused ({})",

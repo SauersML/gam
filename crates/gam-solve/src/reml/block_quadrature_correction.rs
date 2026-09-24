@@ -108,12 +108,17 @@ impl<'a> RemlState<'a> {
     /// second-order pass over the nodes is paid only then: a value or
     /// value+gradient evaluation (a line search, the ρ-posterior sampler's
     /// leapfrog steps) never reads it.
+    ///
+    /// `own_value_band` is the value band the Laplace evaluation this correction
+    /// splices into carries by itself (see [`laplace_value_band`]). It is the
+    /// order target wherever the admission certified none (#3004).
     pub(crate) fn block_local_quadrature_correction(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
         n_ext: usize,
         want_hessian: bool,
+        own_value_band: f64,
     ) -> Result<TkCorrectionTerms, EstimationError> {
         // This is the ONE seam every spliced evaluation passes through, fresh or
         // cached, so it is where the quadrature's certified error is published to
@@ -131,8 +136,13 @@ impl<'a> RemlState<'a> {
         // A deferred search prices the Laplace criterion, which is not this
         // bundle's correction once the admission is decided, so it is not cached.
         if self.block_correction_admission_deferred() {
-            let (terms, quadrature_error) = self
-                .block_local_quadrature_correction_compute(rho, bundle, n_ext, want_hessian)?;
+            let (terms, quadrature_error) = self.block_local_quadrature_correction_compute(
+                rho,
+                bundle,
+                n_ext,
+                want_hessian,
+                own_value_band,
+            )?;
             publish(quadrature_error);
             return Ok(terms);
         }
@@ -147,8 +157,13 @@ impl<'a> RemlState<'a> {
             publish(entry.quadrature_error);
             return Ok((*entry.terms).clone());
         }
-        let (terms, quadrature_error) =
-            self.block_local_quadrature_correction_compute(rho, bundle, n_ext, want_hessian)?;
+        let (terms, quadrature_error) = self.block_local_quadrature_correction_compute(
+            rho,
+            bundle,
+            n_ext,
+            want_hessian,
+            own_value_band,
+        )?;
         publish(quadrature_error);
         bundle
             .block_local_correction
@@ -305,6 +320,7 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         n_ext: usize,
         want_hessian: bool,
+        own_value_band: f64,
     ) -> Result<(TkCorrectionTerms, f64), EstimationError> {
         // #1521 trait-inversion: the #784 importance-sampling correction and its
         // eigen-diagnostic live UP in the gam-inference `hmc_io` tier; gam-solve
@@ -744,10 +760,17 @@ impl<'a> RemlState<'a> {
         // decrement verdict tightens with it. That is the ordering this change
         // depends on — the charge exists before the target moves.
         //
-        // No band, no correction. A correction admitted where the search
-        // certified no value bound has no derived target at all, and picking one
-        // would be choosing a number. Declining returns the exact Laplace
-        // criterion, which is what the fit had before #784 and is always valid.
+        // Where the admission certified no value bound — a route that evaluates
+        // the criterion at a ρ of its own choosing, with no certified optimum
+        // behind it — the target is the band the evaluated Laplace value carries
+        // at THIS ρ, formed from the channels it was summed from and its inner
+        // mode's residual ([`laplace_value_band`]). That is the same quantity the
+        // certificate charges, read at the evaluation instead of at an optimum;
+        // it omits the inner factor's forward error, so it is never looser than
+        // the certificate's band. Declining there made every such route price
+        // the plain Laplace criterion however non-Gaussian the block (#3004's
+        // open question). Only a band that is not finite and positive declines,
+        // returning the exact Laplace criterion.
         // The Laplace term the correction removes, reported beside the target so
         // a reader can see how far apart the statistical and the arithmetic
         // scales are on this fit.
@@ -756,14 +779,17 @@ impl<'a> RemlState<'a> {
         } else {
             f64::INFINITY
         };
-        let Some(resolution_band) = *self
+        let admission_band = *self
             .block_correction_value_band
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-        else {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(resolution_band) = admission_band.or_else(|| {
+            (own_value_band.is_finite() && own_value_band > 0.0).then_some(own_value_band)
+        }) else {
             log::trace!(
-                "[#784] block-local correction declined: the admission carried no certified \
-                 value band, so its Gauss–Hermite order target is underived (#3004)"
+                "[#784] block-local correction declined: neither the admission nor this \
+                 evaluation carries a finite value band, so its Gauss–Hermite order target is \
+                 underived (#3004)"
             );
             return Ok((zero(), 0.0));
         };
@@ -2332,4 +2358,26 @@ mod block_axis_order_tests {
             curvatures(&from_root, &descending)
         );
     }
+}
+
+/// The value band a Laplace evaluation carries by itself (#3004): the rounding of
+/// the channels `V` is summed from, `γ_{n+p²}·(|fixed_β| + |log|H_β|| + |log|S|₊| +
+/// |kkt|)`, plus the error `|½·rᵀH_β⁻¹r|` its inner mode's residual leaves in `V`,
+/// the `channels` and `inner_residual` terms of the certificate's
+/// `ObjectiveBand`. The inner factor's forward error is not in hand here and is
+/// left out, which only tightens the band.
+pub(crate) fn laplace_value_band(
+    components: &super::reml_outer_engine::RemlCriterionComponents,
+    inner_residual_energy: Option<f64>,
+    n_obs: usize,
+    p_coefficients: usize,
+) -> f64 {
+    gam_linalg::roundoff::accumulation_growth(n_obs + p_coefficients * p_coefficients)
+        * (components.fixed_beta.abs()
+            + components.logdet_h.abs()
+            + components.logdet_s.abs()
+            + components.kkt.abs())
+        + inner_residual_energy
+            .filter(|energy| energy.is_finite())
+            .map_or(0.0, f64::abs)
 }

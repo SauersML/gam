@@ -1817,7 +1817,12 @@ pub(crate) fn spectral_noise_tolerance(evals: &Array1<f64>) -> f64 {
         .iter()
         .copied()
         .fold(0.0_f64, |acc, v| acc.max(v.abs()));
-    (evals.len().max(1) as f64) * SPECTRAL_NOISE_RELATIVE_TOLERANCE * max_abs_ev
+    // The `η = 2⁻¹⁰⁷⁴` term is the arithmetic's absolute error under gradual
+    // underflow (see `symmetric_spectrum_rounding_band`): without it a spectrum
+    // at subnormal scale has a noise cutoff of exactly zero and a `−η`
+    // eigenvalue reads as negative curvature.
+    (evals.len().max(1) as f64)
+        * (SPECTRAL_NOISE_RELATIVE_TOLERANCE * max_abs_ev + f64::from_bits(1))
 }
 
 /// Where a single eigenvalue of a symmetric penalty sits relative to the
@@ -2236,12 +2241,28 @@ pub fn filter_penalty_candidates(
         let structural_null_frame = matrix.structural_null_frame().cloned();
         let energy_factor = matrix.factor().clone();
         let analysis = analyze_penalty_block_with_op(&matrix, op)?;
+        // A declared frame as wide as the chart says the seminorm vanishes on
+        // EVERY representable function: the cyclic harmonic roughness on three
+        // translates, whose discrete frequency-zero and frequency-one modes
+        // `{1, sin, cos}` are all of `R³`. Its spectrum then holds nothing but
+        // the fundamental's spline alias energy, the same energy the
+        // declaration exists to keep from being read as curvature (#2445), so
+        // the block is structurally zero on this chart and is dropped like
+        // one. Because an orthonormal frame never has more columns than rows,
+        // this is also exactly the case in which honouring a declaration would
+        // remove every penalized direction the spectrum resolved.
+        let declared_whole_chart = structural_null_frame.as_ref().is_some_and(|frame| {
+            frame.nrows() == analysis.sym_penalty.nrows()
+                && frame.ncols() >= analysis.sym_penalty.nrows()
+        });
         let dropped_reason = if analysis.rank == 0 {
             Some(if analysis.iszero {
                 PenaltyDropReason::ZeroMatrix
             } else {
                 PenaltyDropReason::NumericalRankZero
             })
+        } else if declared_whole_chart {
+            Some(PenaltyDropReason::DeclaredNullOnWholeChart)
         } else {
             None
         };
@@ -2288,19 +2309,10 @@ pub fn filter_penalty_candidates(
                 .as_ref()
                 .filter(|frame| frame.nrows() == analysis.sym_penalty.nrows())
                 .map_or(analysis.nullity, |frame| frame.ncols());
+            // `declared_null_dim < nrows` here (the whole-chart declaration was
+            // dropped above), so `removed < analysis.rank` and a penalized
+            // direction always survives the declaration.
             let removed = declared_null_dim.saturating_sub(analysis.nullity);
-            if removed >= analysis.rank {
-                crate::bail_invalid_basis!(
-                    "penalty block source={source:?} original_index={original_index} declares \
-                     {declared_null_dim} null direction(s) on a {}-column block whose spectrum \
-                     resolves {} penalized and {} null; honouring the declaration would leave \
-                     nothing penalized, so the frame and the operator disagree about which \
-                     object this is",
-                    analysis.sym_penalty.nrows(),
-                    analysis.rank,
-                    analysis.nullity
-                );
-            }
             let rank = analysis.rank - removed;
             let nullity = analysis.nullity + removed;
             // The declared frame IS the null basis when the declaration is what
@@ -2412,6 +2424,48 @@ mod atomic_penalty_record_tests {
         }
         let block = analyze_penalty_block(&penalty).expect("diagonal block");
         assert_eq!((block.rank, block.nullity, block.negative_dim), (4, 2, 0));
+    }
+
+    /// The cyclic harmonic roughness declares `{1, sin, cos}` null. On three
+    /// translates that frame IS the chart, so the block is structurally zero
+    /// and is dropped rather than refused; the spectrum still resolves two
+    /// alias-energy directions there, which is what the declaration outranks.
+    /// On five translates the same declaration leaves two penalized
+    /// directions and the block stays active with nullity three.
+    #[test]
+    fn cyclic_harmonic_roughness_on_three_translates_is_structurally_zero() {
+        let candidate = |num_basis: usize| PenaltyCandidate {
+            matrix: ConstructiveQuadratic::from_energy_factor(
+                cyclic_bspline_harmonic_penalty_factor(2, num_basis, 1.0, 2)
+                    .expect("harmonic factor"),
+                "test cyclic harmonic roughness",
+            )
+            .expect("constructive harmonic roughness")
+            .with_structural_null_frame(
+                cyclic_harmonic_null_frame(num_basis).expect("harmonic frame"),
+                "test cyclic harmonic frame",
+            )
+            .expect("declared frame"),
+            source: PenaltySource::Primary,
+            normalization_scale: 1.0,
+            kronecker_factors: None,
+            op: None,
+        };
+
+        let three = filter_penalty_candidates(vec![candidate(3)]).expect("three translates");
+        assert!(three.active.is_empty());
+        assert_eq!(three.dropped.len(), 1);
+        assert_eq!(three.dropped[0].reason, PenaltyDropReason::DeclaredNullOnWholeChart);
+        // Positive control on the premise: the spectrum alone would have
+        // called this block penalized.
+        let spectrum = analyze_penalty_block(candidate(3).matrix.dense()).expect("spectrum");
+        assert!(spectrum.rank > 0, "the alias energy must be visible to the rank test");
+
+        let five = filter_penalty_candidates(vec![candidate(5)]).expect("five translates");
+        assert!(five.dropped.is_empty());
+        assert_eq!(five.active.len(), 1);
+        assert_eq!(five.active[0].nullity, 3);
+        assert_eq!(five.active[0].info.effective_rank, 2);
     }
 
     #[test]

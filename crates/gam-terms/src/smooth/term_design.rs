@@ -3177,6 +3177,14 @@ fn penalty_candidates_under_collection_gauge(
             if !matches!(candidate.source, PenaltySource::DoublePenaltyNullspace) {
                 continue;
             }
+            // No Primary survived the term's own build: its wiggliness penalty is
+            // zero on this chart (a Wahba sphere on two centers), so the whole
+            // chart is its null space. The metric-consistent rebuild on `N = I`
+            // is `N (Nᵀ R_c N) Nᵀ = R_c`, the restricted ridge itself, which
+            // already charges every direction; there is nothing to rebuild.
+            if primaries.is_empty() {
+                continue;
+            }
             let q = candidate.matrix.nrows();
             let (rlo, rhi) = support_rows(&candidate.matrix);
             // The Primary whose support CONTAINS this ridge's support (the

@@ -9352,5 +9352,28 @@ mod tests_exact_observed_information_names_2267 {
             )
             .map(|(log_det, _)| log_det)
         }
+
+        /// The pencil's own share of the priced `log|A|`: `log|Φ| + Σ ln μ` over the retained
+        /// directions, before a periodic atom's orbit (#2234) and phase-circle (#3439)
+        /// integrations replace their directions' chord curvature. An independent pencil
+        /// oracle computes exactly this; on a fixture with periodic atoms the priced total
+        /// differs from it by those two integrations, by construction.
+        pub(crate) fn exact_observed_information_pencil_log_det(
+            &self,
+            rho: &SaeManifoldRho,
+            target: ArrayView2<'_, f64>,
+            cache: &ArrowFactorCache,
+        ) -> Result<f64, SaeCriterionError> {
+            let geometry = self.materialize_dense_exact_a_geometry(rho, target, cache)?;
+            let pricing = Self::classify_exact_hessian_basin(
+                &geometry.block,
+                &geometry.e_diag,
+                geometry.e_beta.as_ref(),
+                geometry.total_t,
+                "joint",
+                None,
+            )?;
+            Ok(pricing.log_det)
+        }
     }
 }

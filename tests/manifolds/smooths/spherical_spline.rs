@@ -144,10 +144,35 @@ fn sphere_formula_and_mgcv_sos_alias_resolve_to_sphere_basis() {
 
 #[test]
 fn sphere_m4_wahba_formula_enforces_stable_center_floor_only_for_m4() {
-    let parsed = parse_formula(
-        "y ~ sphere(lat, lon, k=25, penalty_order=4, method=sobolev) + sphere(lat, lon, k=25, penalty_order=2, method=sobolev)",
-    )
-    .expect("formula parses");
+    // #3149: the order-4 floor belongs to the PROVISIONED default, which nobody
+    // chose; a count the user writes is the user's and is kept as written, for
+    // either order. Both terms share `default_num_centers`, so the m=4 default is
+    // the m=2 default raised to the floor.
+    const WAHBA_ORDER4_PROVISIONED_CENTERS: usize = 30;
+    let explicit = sphere_center_counts(
+        "y ~ sphere(lat, lon, k=25, penalty_order=4, method=sobolev) \
+         + sphere(lat, lon, k=25, penalty_order=2, method=sobolev)",
+    );
+    assert_eq!(explicit, (25, 25), "an explicit k is kept for both orders");
+    let (m4_default, m2_default) = sphere_center_counts(
+        "y ~ sphere(lat, lon, penalty_order=4, method=sobolev) \
+         + sphere(lat, lon, penalty_order=2, method=sobolev)",
+    );
+    assert_eq!(
+        m4_default,
+        m2_default.max(WAHBA_ORDER4_PROVISIONED_CENTERS),
+        "the m=4 default is the generic default held to the order-4 floor"
+    );
+    assert!(
+        m2_default < WAHBA_ORDER4_PROVISIONED_CENTERS,
+        "on five rows the floor must be what sets the m=4 default, or this checks nothing"
+    );
+}
+
+/// The farthest-point center counts of the two sphere terms of `formula`, read
+/// through an `Auto` wrapper (a default count is `Auto`, an explicit one is not).
+fn sphere_center_counts(formula: &str) -> (usize, usize) {
+    let parsed = parse_formula(formula).expect("formula parses");
     let values = array![
         [1.0, -80.0, -170.0],
         [2.0, -30.0, -60.0],
@@ -188,33 +213,20 @@ fn sphere_m4_wahba_formula_enforces_stable_center_floor_only_for_m4() {
         &mut notes,
     )
     .expect("term spec");
-    let SmoothBasisSpec::Sphere { spec: m4_spec, .. } = &spec.smooth_terms[0].basis else {
-        panic!("expected m=4 sphere basis");
+    let count = |basis: &SmoothBasisSpec| -> usize {
+        let SmoothBasisSpec::Sphere { spec, .. } = basis else {
+            panic!("expected a sphere basis");
+        };
+        let strategy = match &spec.center_strategy {
+            CenterStrategy::Auto(inner) => inner.as_ref(),
+            other => other,
+        };
+        let CenterStrategy::FarthestPoint { num_centers } = strategy else {
+            panic!("expected farthest-point centers, got {strategy:?}");
+        };
+        *num_centers
     };
-    let CenterStrategy::FarthestPoint {
-        num_centers: m4_centers,
-    } = &m4_spec.center_strategy
-    else {
-        panic!("expected m=4 farthest-point centers");
-    };
-    assert_eq!(
-        *m4_centers, 30,
-        "m=4 Wahba needs the stable center floor that fixed the k=25 seed regression"
-    );
-
-    let SmoothBasisSpec::Sphere { spec: m2_spec, .. } = &spec.smooth_terms[1].basis else {
-        panic!("expected m=2 sphere basis");
-    };
-    let CenterStrategy::FarthestPoint {
-        num_centers: m2_centers,
-    } = &m2_spec.center_strategy
-    else {
-        panic!("expected m=2 farthest-point centers");
-    };
-    assert_eq!(
-        *m2_centers, 25,
-        "the m=4 stability floor must not change ordinary Wahba k semantics"
-    );
+    (count(&spec.smooth_terms[0].basis), count(&spec.smooth_terms[1].basis))
 }
 
 #[test]

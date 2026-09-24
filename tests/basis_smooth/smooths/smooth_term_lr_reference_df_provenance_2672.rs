@@ -29,8 +29,8 @@
 
 use gam::smooth::smooth_term_lr_inference_forspec;
 use gam::{
-    FitConfig, FitRequest, FitResult, encode_recordswith_inferred_schema, fit_from_formula,
-    init_parallelism, materialize,
+    FitConfig, FitRequest, FitResult, encode_recordswith_inferred_schema, init_parallelism,
+    materialize,
 };
 
 use csv::StringRecord;
@@ -73,13 +73,18 @@ fn dataset(n: usize, seed: u64, amplitude: f64) -> gam::data::EncodedDataset {
 /// `edf_total = tr(F)` for one formula on one dataset, from the ordinary fit
 /// entry point. The LR driver refits internally from the same spec and options,
 /// and the fit is deterministic, so this is the same fit seen from outside.
+/// `edf_total` of the SAME model the LR driver fits: the materialized request's
+/// fully provisioned basis. `fit_from_formula` runs the adaptive-resolution
+/// loop (pilot basis, grown on measurement) and so fits a different basis;
+/// the accounting identity only holds within one fit.
 fn fit_edf_total(formula: &str, data: &gam::data::EncodedDataset) -> f64 {
     let cfg = FitConfig {
         family: Some("poisson".to_string()),
         ..FitConfig::default()
     };
+    let mat = materialize(formula, data, &cfg).expect("materialize");
     let FitResult::Standard(std_fit) =
-        fit_from_formula(formula, data, &cfg).unwrap_or_else(|e| panic!("fit {formula}: {e}"))
+        gam::fit_model(mat.request).unwrap_or_else(|e| panic!("fit {formula}: {e}"))
     else {
         panic!("expected a standard fit for {formula}");
     };

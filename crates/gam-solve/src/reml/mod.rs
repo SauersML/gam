@@ -1026,6 +1026,60 @@ mod tests {
         );
     }
 
+    /// #3331: a certificate armed around an evaluation the cache answers reads
+    /// the evidence that evaluation published, not an empty window; and an entry
+    /// stored while the capture was disarmed carries none, so an armed request
+    /// misses and re-evaluates. The disarmed hit is unchanged.
+    #[test]
+    pub(crate) fn cached_outer_eval_republishes_its_certificate_evidence_3331() {
+        use crate::estimate::outer_eval_capture as capture;
+        let cache = EvalCacheManager::new(0);
+        let eval = OuterEval {
+            cost: 3.5,
+            gradient: array![1.0, -2.0],
+            hessian: HessianValue::Unavailable,
+            inner_beta_hint: None,
+        };
+        let criterion = capture::CertificateCriterion {
+            cost: 3.5,
+            fixed_beta: 1.0,
+            logdet_h: 2.0,
+            logdet_s: -0.5,
+            kkt: 0.0,
+            inner_residual_energy: Some(1e-14),
+        };
+
+        let armed_key = super::rho_key::sanitized_rhokey(&array![0.25, -1.0]);
+        capture::begin_certificate_parts_capture();
+        capture::record_certificate_criterion(criterion);
+        cache.store_outer_eval(&armed_key, &eval);
+        drop(capture::take_certificate_evidence());
+
+        capture::begin_certificate_parts_capture();
+        let hit = cache.cached_outer_eval(&armed_key);
+        let republished = capture::take_certificate_evidence();
+        assert_eq!(hit.expect("armed entry hits").cost, eval.cost);
+        assert_eq!(
+            republished.criterion,
+            Some(criterion),
+            "the hit must publish the evidence its evaluation stored"
+        );
+
+        let disarmed_key = super::rho_key::sanitized_rhokey(&array![0.5, -1.0]);
+        cache.store_outer_eval(&disarmed_key, &eval);
+        assert!(
+            cache.cached_outer_eval(&disarmed_key).is_some(),
+            "a disarmed request is answered from the cache as before"
+        );
+        capture::begin_certificate_parts_capture();
+        let armed_miss = cache.cached_outer_eval(&disarmed_key);
+        drop(capture::take_certificate_evidence());
+        assert!(
+            armed_miss.is_none(),
+            "an armed request for an entry with no evidence must re-evaluate"
+        );
+    }
+
     /// #1575 multi-slot outer-eval cache correctness oracle.
     ///
     /// A memoization is only safe if a hit returns *exactly* what the miss path
@@ -5699,8 +5753,14 @@ pub(crate) const OUTER_EVAL_LRU_CAPACITY: usize = 8;
 /// states never alias because lookups compare the full key vector.
 pub(crate) struct OuterEvalLru {
     capacity: usize,
-    /// Front = least-recently-used, back = most-recently-used.
-    entries: std::collections::VecDeque<(Vec<u64>, OuterEval)>,
+    /// Front = least-recently-used, back = most-recently-used. Each entry
+    /// carries the certificate evidence its evaluation published, when the
+    /// capture was armed while it ran (#3331).
+    entries: std::collections::VecDeque<(
+        Vec<u64>,
+        OuterEval,
+        Option<crate::estimate::outer_eval_capture::CertificateEvidence>,
+    )>,
 }
 
 impl OuterEvalLru {
@@ -5711,28 +5771,41 @@ impl OuterEvalLru {
         }
     }
 
-    /// Returns a clone of the eval stored under `key`, if present, promoting it
-    /// to most-recently-used. A miss returns `None` so the caller recomputes —
-    /// never a stale value from a different key.
-    pub(crate) fn get(&mut self, key: &[u64]) -> Option<OuterEval> {
-        let pos = self.entries.iter().position(|(k, _)| k.as_slice() == key)?;
+    /// Returns a clone of the eval stored under `key`, with the certificate
+    /// evidence stored beside it (`None` when its evaluation ran with the capture
+    /// disarmed), promoting it to most-recently-used. A miss returns `None` so
+    /// the caller recomputes — never a stale value from a different key.
+    pub(crate) fn get_with_evidence(
+        &mut self,
+        key: &[u64],
+    ) -> Option<(
+        OuterEval,
+        Option<crate::estimate::outer_eval_capture::CertificateEvidence>,
+    )> {
+        let pos = self.entries.iter().position(|(k, _, _)| k.as_slice() == key)?;
         let entry = self.entries.remove(pos)?;
-        let eval = entry.1.clone();
+        let hit = (entry.1.clone(), entry.2.clone());
         self.entries.push_back(entry);
-        Some(eval)
+        Some(hit)
     }
 
-    /// Inserts (or refreshes) the eval for `key` as most-recently-used,
-    /// evicting the least-recently-used entry once capacity is exceeded.
-    pub(crate) fn insert(&mut self, key: Vec<u64>, eval: OuterEval) {
+    /// Inserts (or refreshes) the eval for `key`, with the certificate evidence the
+    /// evaluation published, as most-recently-used, evicting the least-recently-used
+    /// entry once capacity is exceeded.
+    pub(crate) fn insert_with_evidence(
+        &mut self,
+        key: Vec<u64>,
+        eval: OuterEval,
+        evidence: Option<crate::estimate::outer_eval_capture::CertificateEvidence>,
+    ) {
         if let Some(pos) = self
             .entries
             .iter()
-            .position(|(k, _)| k.as_slice() == key.as_slice())
+            .position(|(k, _, _)| k.as_slice() == key.as_slice())
         {
             self.entries.remove(pos);
         }
-        self.entries.push_back((key, eval));
+        self.entries.push_back((key, eval, evidence));
         while self.entries.len() > self.capacity {
             self.entries.pop_front();
         }
@@ -5838,18 +5911,34 @@ impl EvalCacheManager {
         // serving revisited (non-immediate) rho-points. `get` is a tiny linear
         // scan (capacity is `OUTER_EVAL_LRU_CAPACITY`) that promotes the hit to
         // most-recently-used; hence the write lock.
-        self.outer_eval_lru
+        let (eval, evidence) = self
+            .outer_eval_lru
             .write()
             .expect("outer-eval LRU lock is poisoned: a writer panicked while holding it")
-            .get(key)
+            .get_with_evidence(key)?;
+        // #3331: an evaluation answered from this cache publishes nothing on its
+        // own, so a certificate armed around it read an empty window, derived no
+        // standard and fell back to the solver band — at exactly the terminal
+        // point an ARC stop hands it, which it evaluated moments before. The
+        // stored evaluation's evidence is published back instead; an entry
+        // computed while the capture was disarmed has none, and is answered by
+        // evaluating again rather than by an empty window.
+        if crate::estimate::outer_eval_capture::certificate_parts_capture_enabled() {
+            let evidence = evidence?;
+            crate::estimate::outer_eval_capture::republish_certificate_evidence(&evidence);
+        }
+        Some(eval)
     }
 
     pub(crate) fn store_outer_eval(&self, key: &Option<Vec<u64>>, eval: &OuterEval) {
         if let Some(key) = key.clone() {
+            // The evidence this evaluation published, if the capture was armed
+            // while it ran, travels with it (#3331).
+            let evidence = crate::estimate::outer_eval_capture::peek_certificate_evidence();
             self.outer_eval_lru
                 .write()
                 .expect("outer-eval LRU lock is poisoned: a writer panicked while holding it")
-                .insert(key, eval.clone());
+                .insert_with_evidence(key, eval.clone(), evidence);
         }
     }
 

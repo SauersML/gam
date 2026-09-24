@@ -259,9 +259,16 @@ fn fs_default_basis_is_capped_by_least_resolved_group() {
         BSplineKnotSpec::Generate {
             num_internal_knots, ..
         } => {
+            // #3264: the formula default is the provisioned pooled marginal
+            // held to the least group's distinct-value support — a group with
+            // `u` distinct values identifies at most `u` marginal directions.
+            // Every group here has 8 distinct days, so the cubic marginal is
+            // capped at 8 functions (4 internal knots); the retired rule
+            // subtracted two hand-set "residual points" and built 6. The
+            // marginal is penalized, so full support is not an interpolator.
             assert_eq!(
-                *num_internal_knots, 2,
-                "8 observations per group with cubic fs must build a 6-column marginal, not a pooled 8-column interpolator"
+                *num_internal_knots, 4,
+                "8 distinct values per group bound the cubic fs marginal at 8 columns"
             );
         }
         other => panic!("expected generated factor-smooth knots, got {other:?}"),

@@ -1804,6 +1804,10 @@ pub enum PenaltySource {
 pub enum PenaltyDropReason {
     ZeroMatrix,
     NumericalRankZero,
+    /// The builder declared a structural null frame spanning the whole chart,
+    /// so the seminorm vanishes on every representable function whatever the
+    /// spectrum's roundoff or alias energy says.
+    DeclaredNullOnWholeChart,
 }
 
 fn default_normalization_scale() -> f64 {

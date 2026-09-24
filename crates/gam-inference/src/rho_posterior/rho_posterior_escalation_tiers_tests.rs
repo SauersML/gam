@@ -191,11 +191,19 @@ fn a_constant_added_to_the_criterion_shifts_the_normalizer_by_minus_it_4556() {
         shifted.log_normalizer,
         base.log_normalizer - shift
     );
+    // A normalized log weight is the node's exponent less the log normalizer.
+    // The shift moves each of them by at most `band` (the exponent's two
+    // roundings at the shifted magnitude, and the normalizer's sum), so a weight
+    // can move by at most `2·band` in log — never by the constant itself.
     for (a, b) in base.nodes.iter().zip(shifted.nodes.iter()) {
-        assert_eq!(
-            a.weight.to_bits(),
-            b.weight.to_bits(),
-            "a constant in the criterion cannot move a normalized node weight"
+        let log_gap = (a.weight.ln() - b.weight.ln()).abs();
+        assert!(
+            log_gap <= 2.0 * band,
+            "a constant in the criterion cannot move a normalized node weight beyond its \
+             rounding: {} vs {} (log gap {log_gap:.3e}, band {:.3e})",
+            a.weight,
+            b.weight,
+            2.0 * band
         );
     }
 }

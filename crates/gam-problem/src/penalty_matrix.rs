@@ -109,7 +109,7 @@ impl PenaltyMatrix {
                             })
                     })?;
                 let tolerance =
-                    100.0 * diagonal.len() as f64 * f64::EPSILON * max_abs;
+                    100.0 * diagonal.len() as f64 * eigenvalue_rounding_unit(max_abs);
                 if let Some((index, value)) = diagonal
                     .iter()
                     .copied()
@@ -338,11 +338,25 @@ impl From<Array1<f64>> for PenaltyMatrix {
     }
 }
 
+/// One rounding's worth of error on a quantity of magnitude `scale`, under the
+/// standard model WITH gradual underflow, `fl(a∘b) = (a∘b)(1+δ) + η`,
+/// `|δ| ≤ ε`, `|η| ≤ 2⁻¹⁰⁷⁴` (Demmel, "Underflow and the reliability of
+/// numerical software", 1984). The relative term alone vanishes below the
+/// subnormal quantum, so a structurally PSD matrix whose entries are subnormal
+/// (max `|eigenvalue|` ≈ 3e-313 has ~10 significant bits) was refused for an
+/// eigenvalue of exactly `−2⁻¹⁰⁷⁴`, one quantum. At normal scale the added
+/// term is ~1e-308 relative and changes nothing.
+fn eigenvalue_rounding_unit(scale: f64) -> f64 {
+    f64::EPSILON * scale + f64::from_bits(1)
+}
+
 /// Core quadratic-form validity: square, finite, symmetric (up to a
 /// scale-relative round-off band), and positive semidefinite (eigenvalues
 /// above the relative eigensolver noise floor `p·ε·‖S‖`, the same relative
 /// classification the REML pseudo-logdet kernel uses — never an absolute
-/// floor, so validity is invariant under `S → c·S`).
+/// floor, so validity is invariant under `S → c·S` down to the subnormal
+/// quantum, where [`eigenvalue_rounding_unit`] adds the arithmetic's own
+/// absolute error).
 fn validate_symmetric_psd_core(matrix: &Array2<f64>, what: &str) -> Result<(), String> {
     use gam_linalg::faer_ndarray::FaerEigh;
 
@@ -379,13 +393,35 @@ fn validate_symmetric_psd_core(matrix: &Array2<f64>, what: &str) -> Result<(), S
     if nrows == 0 || max_abs == 0.0 {
         return Ok(()); // the zero penalty is trivially PSD
     }
-    let (eigenvalues, _) = matrix
+    // The eigensolver's backward error is `O(p·ε·‖S‖)` only where its own
+    // arithmetic stays normal: on a subnormal-scale block it returned
+    // `−3.96e-320` for the exact diagonal `diag(3e-313, −2⁻¹⁰⁷⁴)`, eight thousand
+    // quanta. So the block is decomposed at normal scale, `2^k·S` with `k` taking
+    // its largest entry to `[½, 1)`. A power-of-two scaling is exact wherever it
+    // lands in the normal range, so the scaled matrix is the same matrix and its
+    // eigenvalues are `2^k` times its own. What the scaling cannot undo is the
+    // entries' own representation: each is known only to half a quantum, which
+    // by Weyl moves an eigenvalue by at most `p·2⁻¹⁰⁷⁴`, `2^k` times that once
+    // scaled ([`eigenvalue_rounding_unit`]'s absolute term).
+    // `2^k` itself overflows for `k > 1023`, which a subnormal block needs, so the
+    // power is applied as two representable halves; each product is exact.
+    let exponent = (-max_abs.log2().floor() - 1.0) as i32;
+    let (half, rest) = (exponent / 2, exponent - exponent / 2);
+    let (lead, tail) = (2.0_f64.powi(half), 2.0_f64.powi(rest));
+    let scaled = matrix.mapv(|value| value * lead * tail);
+    let (eigenvalues, _) = scaled
         .eigh(faer::Side::Lower)
         .map_err(|e| format!("{what} eigendecomposition failed during validation: {e}"))?;
     let max_abs_eval = eigenvalues
         .iter()
         .fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
-    let psd_tol = 100.0 * (nrows as f64) * f64::EPSILON * max_abs_eval;
+    let psd_tol = 100.0
+        * (nrows as f64)
+        * (f64::EPSILON * max_abs_eval + f64::from_bits(1) * lead * tail);
+    let unscale = |value: f64| value / lead / tail;
+    let eigenvalues = eigenvalues.mapv(unscale);
+    let max_abs_eval = unscale(max_abs_eval);
+    let psd_tol = unscale(psd_tol);
     if let Some(&min_eval) = eigenvalues
         .iter()
         .filter(|&&ev| ev < -psd_tol)
@@ -474,6 +510,41 @@ mod tests {
         let mut acc = ndarray::Array2::<f64>::zeros((2, 2));
         p.add_scaled_to(3.0, &mut acc);
         assert_eq!(acc, array![[3.0, 0.0], [0.0, 3.0]]);
+    }
+
+    /// A subnormal-scale PSD block carries an eigenvalue one quantum below
+    /// zero after roundoff; that is inside the arithmetic's absolute error and
+    /// is accepted. The control: a negative mode a thousand quanta deep at the
+    /// same scale is still refused, so the underflow term did not open the
+    /// check.
+    #[test]
+    fn subnormal_scale_block_is_judged_by_the_underflow_quantum() {
+        let quantum = f64::from_bits(1);
+        let within = array![[3.0e-313, 0.0], [0.0, -quantum]];
+        for penalty in [
+            PenaltyMatrix::Dense(within.clone()),
+            PenaltyMatrix::Blockwise {
+                local: within.clone(),
+                col_range: 0..2,
+                total_dim: 2,
+            },
+            PenaltyMatrix::Diagonal(array![3.0e-313, -quantum]),
+        ] {
+            penalty.validate(2).expect("one-quantum eigenvalue is roundoff");
+        }
+        let deep = -1000.0 * quantum;
+        assert!(
+            PenaltyMatrix::Dense(array![[3.0e-313, 0.0], [0.0, deep]])
+                .validate(2)
+                .unwrap_err()
+                .contains("not positive semidefinite")
+        );
+        assert!(
+            PenaltyMatrix::Diagonal(array![3.0e-313, deep])
+                .validate(2)
+                .unwrap_err()
+                .contains("not positive semidefinite")
+        );
     }
 
     #[test]

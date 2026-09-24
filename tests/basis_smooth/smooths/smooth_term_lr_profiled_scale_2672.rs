@@ -29,8 +29,8 @@
 
 use gam::smooth::{SmoothTermLrInference, smooth_term_lr_inference_forspec};
 use gam::{
-    FitConfig, FitRequest, FitResult, encode_recordswith_inferred_schema, fit_from_formula,
-    init_parallelism, materialize,
+    FitConfig, FitRequest, FitResult, encode_recordswith_inferred_schema, init_parallelism,
+    materialize,
 };
 
 use csv::StringRecord;
@@ -41,6 +41,12 @@ use rand_distr::{ChiSquared, Distribution, Normal, Poisson};
 
 const N: usize = 120;
 const K: usize = 8;
+/// The parametric term, unpenalized. The LR driver's null fit is NESTED at the full
+/// model's smoothing parameters; since b7b874a2a1 a bare `x` carries a null-recovery
+/// ridge, and a standalone `y ~ x` fit re-selects its λ, so it is a different null
+/// model (ν₀ = 118.50 against the nested one's). An unpenalized `x` has no λ to
+/// re-select, so the standalone null IS the nested one.
+const LINEAR: &str = "linear(x, double_penalty=false)";
 
 /// `y ~ x + s(z)` with a genuine — not null — smooth, so the statistic is well
 /// away from the degenerate corner and the identities are being checked
@@ -94,7 +100,7 @@ fn lr_report_with(
         weight_column: weight_column.map(str::to_string),
         ..FitConfig::default()
     };
-    let formula = format!("y ~ x + s(z, k={K})");
+    let formula = format!("y ~ {LINEAR} + s(z, k={K})");
     let mat = materialize(&formula, data, &cfg).expect("materialize");
     let FitRequest::Standard(req) = mat.request else {
         panic!("expected a standard fit request");
@@ -132,7 +138,11 @@ fn fit_summary_with(
         weight_column: weight_column.map(str::to_string),
         ..FitConfig::default()
     };
-    let FitResult::Standard(standard) = fit_from_formula(formula, data, &cfg).expect("fit") else {
+    // The LR driver fits the materialized request's fully provisioned basis; so must the model
+    // these identities are read off. `fit_from_formula` runs the adaptive-resolution loop
+    // (#3149) and fits a different basis, whose `ν` belongs to another model.
+    let mat = materialize(formula, data, &cfg).expect("materialize");
+    let FitResult::Standard(standard) = gam::fit_model(mat.request).expect("fit") else {
         panic!("expected a standard fit");
     };
     let variance = standard.fit.standard_deviation * standard.fit.standard_deviation;
@@ -181,8 +191,9 @@ fn the_profiled_gaussian_lr_statistic_is_the_log_deviance_ratio_plus_its_offset(
             .expect("a profiled-Gaussian fit carries the estimated-scale channel");
 
         let (deviance_full, nu_full, _, _) =
-            fit_summary_with(&format!("y ~ x + s(z, k={K})"), &data, weight_column);
-        let (deviance_null, nu_null, _, _) = fit_summary_with("y ~ x", &data, weight_column);
+            fit_summary_with(&format!("y ~ {LINEAR} + s(z, k={K})"), &data, weight_column);
+        let (deviance_null, nu_null, _, _) =
+            fit_summary_with(&format!("y ~ {LINEAR}"), &data, weight_column);
 
         let observations = observations as f64;
         let offset = observations * (nu_full / nu_null).ln() + (nu_null - nu_full);
@@ -237,7 +248,7 @@ fn the_residual_spectrum_is_the_whole_models_penalty_shares() {
         .profiled_scale
         .as_ref()
         .expect("a profiled-Gaussian fit carries the estimated-scale channel");
-    let (_, _, edf_total, columns) = fit_summary(&format!("y ~ x + s(z, k={K})"), &data);
+    let (_, _, edf_total, columns) = fit_summary(&format!("y ~ {LINEAR} + s(z, k={K})"), &data);
 
     // The unit-multiplicity term counts exactly the directions no column reaches.
     assert_eq!(

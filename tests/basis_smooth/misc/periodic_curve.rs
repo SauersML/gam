@@ -124,9 +124,11 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
         })
         .expect("surviving null-function penalty");
     // The constant is annihilated exactly. The fundamental's spline representer
-    // keeps a little alias energy, so the MEASURED nullity is the constant alone
-    // while the ridge spans the declared {1, sin, cos} frame.
-    assert_eq!(roughness.nullity, 1);
+    // keeps a little alias energy, but the builder DECLARES the {1, sin, cos}
+    // frame and the declaration decides the block's nullity (4dc7cd0f23): the
+    // alias energy is not curvature, so `log|S|₊` must not price it (#2445).
+    // The ridge spans the same frame.
+    assert_eq!(roughness.nullity, 3);
     assert_eq!(null_ridge.nullity, null_ridge.matrix.ncols() - 3);
     let ones = ndarray::Array1::ones(roughness.matrix.ncols());
     assert!(
@@ -179,7 +181,11 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
             )
         })
         .expect("centered fundamental-harmonic ridge");
-    assert_eq!(centered_roughness.nullity, 0);
+    // The declared frame survives the centering as `{sin, cos}`: the constant is
+    // gone, and the fundamental is still declared null (4dc7cd0f23), so the
+    // centered roughness counts those two directions null and the ridge charges
+    // exactly them.
+    assert_eq!(centered_roughness.nullity, 2);
     assert_eq!(
         centered_roughness.matrix.ncols(),
         roughness.matrix.ncols() - 1
@@ -236,8 +242,19 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
     // periodic smooths require explicit `period=` (cycle 27): silent
     // inference from data range is sample-dependent and rarely matches
     // user intent (e.g. uniform draws on [0, 1] give period < 1).
+    // One canonical spelling per behaviour (311c4b3d9d): the retired `type=`
+    // alias is refused and points at `bs`, and the canonical spelling builds.
+    let refused = gam::inference::formula_dsl::parse_formula(
+        "y ~ s(u, type=periodic, k=9, period=1)",
+    )
+    .err()
+    .expect("the retired `type=` alias must be refused");
+    assert!(
+        format!("{refused:?}").contains("use `bs`"),
+        "the refusal must name the canonical option: {refused:?}"
+    );
     let parsed =
-        gam::inference::formula_dsl::parse_formula("y ~ s(u, type=periodic, k=9, period=1)")
+        gam::inference::formula_dsl::parse_formula("y ~ s(u, bs=cyclic, k=9, period=1)")
             .unwrap();
     let cmap = ds.column_map();
     let mut notes = Vec::new();

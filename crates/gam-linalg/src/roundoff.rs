@@ -198,6 +198,13 @@ pub fn symmetric_assembly_band(
 /// with `‖E‖₂ = O(p·ε·‖H‖₂)`, so by Weyl an eigenvalue whose magnitude is at or
 /// below this band is not resolved from zero by the decomposition that produced
 /// it, and a sign inside it is not a measurement.
+///
+/// Under gradual underflow each rounding also carries an absolute error of up to
+/// one subnormal quantum `η = 2⁻¹⁰⁷⁴` (`fl(a∘b) = (a∘b)(1+δ) + η`), so the
+/// backward error is `O(p·(ε·‖H‖₂ + η))`. The relative term alone rounds to zero
+/// once `‖H‖₂` is subnormal, and a block at that scale was then refused for an
+/// eigenvalue of exactly `−η`. At normal scale the `η` term is ~1e-308
+/// relative and moves nothing.
 pub fn symmetric_spectrum_rounding_band(eigenvalues: &[f64]) -> f64 {
     symmetric_spectrum_rounding_band_at_dim(eigenvalues.len(), eigenvalues)
 }
@@ -216,7 +223,7 @@ pub fn symmetric_spectrum_rounding_band_at_dim(dim: usize, eigenvalues: &[f64]) 
     let spectral_radius = eigenvalues
         .iter()
         .fold(0.0_f64, |acc, value| acc.max(value.abs()));
-    dim.max(1) as f64 * f64::EPSILON * spectral_radius
+    dim.max(1) as f64 * (f64::EPSILON * spectral_radius + f64::from_bits(1))
 }
 
 /// The rank of a symmetric Gram, read off its eigenvalues: those above
@@ -830,6 +837,34 @@ pub fn psd_pseudo_inverse_backward_band(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rank-one PSD Gram at subnormal scale: its entries are rounded on the
+    /// subnormal grid, so the stored matrix and its decomposition are exact
+    /// only to the quantum `η`, while the relative band `p·ε·ρ` is below one
+    /// quantum. Every trailing eigenvalue the decomposition returns must sit
+    /// inside the band, and the band must be the absolute one, not zero.
+    #[test]
+    fn subnormal_scale_spectrum_band_carries_the_underflow_quantum() {
+        use crate::faer_ndarray::FaerEigh;
+        let v = [1.0, 1.0 / 3.0, 1.0 / 7.0, 0.61, -0.29];
+        let scale = 3.0e-313;
+        let gram = ndarray::Array2::from_shape_fn((v.len(), v.len()), |(i, j)| {
+            (scale * v[i]) * v[j]
+        });
+        let (eigenvalues, _) = gram.eigh(faer::Side::Lower).expect("eigh");
+        let spectrum = eigenvalues.to_vec();
+        let band = symmetric_spectrum_rounding_band(&spectrum);
+        let quantum = f64::from_bits(1);
+        let radius = spectrum.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        assert!(
+            (v.len() as f64) * f64::EPSILON * radius < quantum,
+            "the fixture must sit where the relative band alone underflows"
+        );
+        assert!(band >= (v.len() as f64) * quantum);
+        let resolved = spectrum.iter().filter(|value| value.abs() > band).count();
+        assert_eq!(resolved, 1, "spectrum {spectrum:?} band {band:e}");
+        assert_eq!(resolved_eigenvalue_count(&spectrum, 0.0), 1);
+    }
 
     /// To first order in `u` the Cholesky band is `(3n+1)u + (n+1)u =
     /// (4n+2)u = (2n+1)ε`: the derivation's own count, which is what replaced

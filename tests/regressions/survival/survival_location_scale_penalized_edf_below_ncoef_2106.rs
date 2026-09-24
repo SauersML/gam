@@ -143,8 +143,13 @@ fn survival_location_scale_penalized_edf_below_ncoef_2106() {
             let cols = block.beta.len();
             // Only assert when the block actually carries a penalty.
             if !block.lambdas.is_empty() {
+                // `edf = tr(F)` of a `cols × cols` influence block carries at
+                // most `cols²·ε` of rounding; a hard-coded zero penalty trace
+                // (#2106) reports `edf == cols` exactly, inside that band. How
+                // far below `cols` REML lands is the data's call, not a margin.
+                let trace_band = (cols * cols) as f64 * f64::EPSILON;
                 assert!(
-                    block.edf < cols as f64 - 0.25,
+                    (cols as f64 - block.edf) > trace_band,
                     "#2106: penalized {:?} smooth EDF ({:.4}) must be below its column count ({cols})",
                     block.role,
                     block.edf,

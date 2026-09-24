@@ -2345,11 +2345,18 @@ impl<'a> RemlState<'a> {
         // the same value+gradient splicing contract as the TK correction so the
         // outer REML/LAML stays consistent. A no-op when every direction is
         // Laplace-trustworthy.
+        let own_value_band = super::block_quadrature_correction::laplace_value_band(
+            &result.criterion_components,
+            result.ift_residual_energy,
+            self.y.len(),
+            solution_beta.len(),
+        );
         let block_terms = self.block_local_quadrature_correction(
             rho,
             bundle,
             assembly_ext_len,
             mode == super::reml_outer_engine::EvalMode::ValueGradientHessian,
+            own_value_band,
         )?;
         let block_atom = super::atoms::ThetaOnlyCorrectionAtom::from_tk_terms(
             "sampled_block_marginal",
@@ -2459,8 +2466,19 @@ impl<'a> RemlState<'a> {
         // surface. The correction enters through the gradient channel exactly
         // like TK, which the universal EFS step already folds in. No-op when no
         // direction is non-Gaussian.
-        let block_terms =
-            self.block_local_quadrature_correction(rho, bundle, assembly_ext_len, false)?;
+        let own_value_band = super::block_quadrature_correction::laplace_value_band(
+            &cost_result.criterion_components,
+            cost_result.ift_residual_energy,
+            self.y.len(),
+            beta.len(),
+        );
+        let block_terms = self.block_local_quadrature_correction(
+            rho,
+            bundle,
+            assembly_ext_len,
+            false,
+            own_value_band,
+        )?;
         let block_atom = super::atoms::ThetaOnlyCorrectionAtom::from_tk_terms(
             "sampled_block_marginal",
             block_terms,

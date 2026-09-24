@@ -715,7 +715,7 @@ impl BernoulliMarginalSlopeFamily {
             rigid_third_full: gam_runtime::resource::RayonSafeOnce::new(),
             rigid_fourth_full: gam_runtime::resource::RayonSafeOnce::new(),
             flex_row_program_derivatives: gam_runtime::resource::RayonSafeOnce::new(),
-            full_data_outer_rows: std::sync::OnceLock::new(),
+            full_data_outer_rows: gam_runtime::resource::RayonSafeOnce::new(),
         })
     }
 

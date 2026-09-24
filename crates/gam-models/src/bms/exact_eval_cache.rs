@@ -785,7 +785,8 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// call. Building it once here and lending a borrowed slice removes that
     /// per-eval churn; the subsampled path stays a per-call owned `Vec` (it is
     /// short — only the masked rows — and varies with the mask).
-    pub(super) full_data_outer_rows: std::sync::OnceLock<std::sync::Arc<Vec<WeightedOuterRow>>>,
+    pub(super) full_data_outer_rows:
+        gam_runtime::resource::RayonSafeOnce<std::sync::Arc<Vec<WeightedOuterRow>>>,
 }
 
 impl BernoulliMarginalSlopeExactEvalCache {
@@ -802,7 +803,7 @@ impl BernoulliMarginalSlopeExactEvalCache {
         if options.outer_score_subsample.is_some() {
             return std::borrow::Cow::Owned(outer_weighted_rows(options, n));
         }
-        let rows = self.full_data_outer_rows.get_or_init(|| {
+        let rows = self.full_data_outer_rows.get_or_compute(|| {
             std::sync::Arc::new(
                 (0..n)
                     .map(|index| WeightedOuterRow {

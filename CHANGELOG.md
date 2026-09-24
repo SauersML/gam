@@ -1,5 +1,40 @@
 ## Unreleased
 
+- **A certificate reading a cached evaluation reads that evaluation's evidence** (gam#3331,
+  gam#3993). The outer search answers a revisited ρ from its evaluation cache, and a cached
+  answer published no certificate evidence. The terminal certificate at an ARC stop evaluates
+  exactly the point the search just evaluated, read an empty evidence window, derived no
+  standard, and fell back to the non-derived `1e-10` solver band, refusing fits the search had
+  reached. The cache now stores each evaluation's evidence beside it and republishes it on a hit
+  while a certificate is listening; an entry computed with no certificate listening is evaluated
+  again rather than answered with nothing.
+- **The block-local quadrature correction engages on routes with no certified optimum**
+  (gam#784, gam#2623, gam#3113). Since #3004 the Gauss–Hermite order target was the certified
+  optimum's value band, and a route evaluating at a ρ of its own choosing had none, so it priced
+  the plain Laplace criterion however non-Gaussian the block. The target there is now the band
+  the evaluated Laplace value carries at that ρ — its channels' rounding plus its inner mode's
+  residual, the same terms the certificate charges, never looser than the certificate's band.
+- **A penalty at subnormal scale is judged by the arithmetic's own absolute error** (BMS Matérn
+  family). The eigensolver's rounding band was purely relative, `p·ε·‖S‖`, which rounds to zero
+  once `‖S‖` is subnormal, so a PSD block was refused for an eigenvalue of exactly `−2⁻¹⁰⁷⁴`, one
+  quantum. Under gradual underflow every rounding also carries an absolute `2⁻¹⁰⁷⁴`; the spectrum
+  band, the noise cutoff and the penalty PSD check now include it, and the PSD check eigensolves the
+  block scaled by an exact power of two to normal range, where the solver's own arithmetic does not
+  underflow (it returned `−3.96e−320` for `−2⁻¹⁰⁷⁴`). At normal scale it moves nothing.
+- **A cyclic smooth on three translates builds** (cylinder formula). The harmonic roughness
+  declares `{1, sin, cos}` null, and on three translates that frame is the whole chart, so the
+  declaration left nothing penalized and the block was refused. Such a block is structurally zero
+  and is now dropped as `DeclaredNullOnWholeChart`; a tensor's periodic margin, which assembles its
+  own derivative roughness, no longer needs one.
+- **The constrained LAML closed-form reference carries the half-space mass** (test). Since #2765 the
+  engine prices an active bound's Laplace mass over the feasible half-space,
+  `−[g²/2H + ln Φ(−g/√H)]`; the reference it is checked against now does too, and matches the
+  engine to the last printed digit.
+- **The BMS full-data row list is a `RayonSafeOnce`**, so no worker parks on a `OnceLock` inside a
+  parallel region.
+- **A double-penalty ridge whose smooth kept no primary penalty is kept as restricted** (Wahba
+  sphere on two centers). The metric-consistent rebuild on a chart that is entirely null space is
+  the restricted ridge itself; it used to refuse the fit.
 - **Royston–Parmar smooth rows carry a score-test p-value** (gam#3568). A family with no GLM
   dispersion stores the full observed information of its own likelihood, so its
   coefficient-covariance scale is 1, and the survival route now publishes the likelihood

@@ -674,8 +674,17 @@ mod tests {
     fn default_duchon_atom_budget_is_row_derived_3826() {
         for d in [1usize, 2] {
             let floor = duchon_nullspace_dimension(d, sae_duchon_atom_m(d) - 1) + d + 1;
+            // A tiny atom follows the same rule as every other size, capped at its
+            // rows: the row-derived default held to the identifiability floor. The
+            // rate-derived default (bc42d5ca46) already clears the floor at d=1,
+            // n=12, so the floor is not assumed to bind there.
             let small = planned_duchon_centers(12, d);
-            assert_eq!(small, floor.min(12), "d={d}: tiny atoms sit on the identifiability floor");
+            assert_eq!(
+                small,
+                default_num_centers(12, d).max(floor).min(12),
+                "d={d}: a tiny atom's budget is the floored default, capped at its rows"
+            );
+            assert!(small >= floor.min(12), "d={d}: never below the identifiability floor");
             let mut previous = small;
             for n_obs in [400usize, 1_600, 6_400] {
                 let centers = planned_duchon_centers(n_obs, d);

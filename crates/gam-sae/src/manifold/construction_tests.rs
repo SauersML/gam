@@ -263,11 +263,20 @@ mod amortized_encoder_tests {
         let retained = oracle.retained();
         let oracle_log_a = oracle.metric_log_det
             + retained.iter().map(|&index| mu[index].ln()).sum::<f64>();
+        // The fixture's atoms are periodic, so the priced total also integrates their orbits
+        // (#2234) and phase circles (#3439); the oracle reads the pencil, and so does this.
         let log_a = term
-            .exact_observed_information_log_dets(&rho, target.view(), &cache)
+            .exact_observed_information_pencil_log_det(&rho, target.view(), &cache)
             .expect("the pencil has no resolved negative direction, so the log-det must be Ok");
         let gap = (log_a - oracle_log_a).abs();
-        eprintln!("PD root log|A|: production={log_a:.12e} oracle={oracle_log_a:.12e} gap={gap:.3e}");
+        let priced_total = term
+            .exact_observed_information_log_dets(&rho, target.view(), &cache)
+            .expect("the priced total exists wherever its pencil share does");
+        eprintln!(
+            "PD root log|A|: pencil={log_a:.12e} oracle={oracle_log_a:.12e} gap={gap:.3e} \
+             priced total={priced_total:.12e} (orbit + phase integrations {:.6e})",
+            priced_total - log_a
+        );
         assert!(
             gap <= 1.0e-9 * (1.0 + oracle_log_a.abs()),
             "log|A| {log_a:.12e} != pencil oracle {oracle_log_a:.12e} (gap {gap:.3e})"

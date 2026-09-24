@@ -700,6 +700,25 @@ pub(crate) fn take_certificate_evidence() -> CertificateEvidence {
     CERTIFICATE_EVIDENCE.with(|slot| slot.borrow_mut().take().unwrap_or_default())
 }
 
+/// What the armed capture holds right now, without disarming it: the evidence
+/// the evaluation that just finished published, for a cache that must hand it
+/// back when it answers the same evaluation later. `None` when disarmed.
+pub(crate) fn peek_certificate_evidence() -> Option<CertificateEvidence> {
+    CERTIFICATE_EVIDENCE.with(|slot| slot.borrow().clone())
+}
+
+/// Publish a stored evaluation's evidence to an armed capture, replacing what
+/// the window holds (no-op when disarmed). A cache that answers an evaluation
+/// without re-running it calls this, so the certificate reading the answer
+/// stands on the evidence that evaluation published and not on an empty window.
+pub(crate) fn republish_certificate_evidence(evidence: &CertificateEvidence) {
+    CERTIFICATE_EVIDENCE.with(|slot| {
+        if let Some(state) = slot.borrow_mut().as_mut() {
+            *state = evidence.clone();
+        }
+    });
+}
+
 pub(crate) fn certificate_parts_capture_enabled() -> bool {
     CERTIFICATE_EVIDENCE.with(|slot| slot.borrow().is_some())
 }

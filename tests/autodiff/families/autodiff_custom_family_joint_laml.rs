@@ -349,27 +349,85 @@ fn constrained_exactobjective_numdual<D: DualNum<f64> + Copy>(
     let lambda = rho.exp();
     let beta_hat = D::from(lower);
     let resid = beta_hat - D::from(target);
+    let slope = resid + lambda * beta_hat;
+    let curvature = D::one() + lambda;
+    let x = slope / curvature.sqrt() / D::from(std::f64::consts::SQRT_2);
+    let mut sum = D::from(0.0);
+    let mut power = x;
+    let mut factorial = 1.0;
+    for n in 0..ERF_SERIES_TERMS {
+        let sign = if n % 2 == 0 { 1.0 } else { -1.0 };
+        sum = sum + power * D::from(sign / (factorial * (2 * n + 1) as f64));
+        power = power * x * x;
+        factorial *= (n + 1) as f64;
+    }
+    let erf = D::from(2.0 / std::f64::consts::PI.sqrt()) * sum;
+    let mass = -(slope * slope / (D::from(2.0) * curvature)
+        + (D::from(0.5) * (D::one() - erf)).ln());
     D::from(0.5) * resid * resid
         + D::from(0.5) * lambda * beta_hat * beta_hat
         + D::from(0.5) * (D::one() + lambda).ln()
         - D::from(0.5) * rho
+        + mass
+}
+
+/// Terms of the erf Maclaurin series `erf(x) = 2/√π Σ (−1)ⁿ x^{2n+1}/(n!(2n+1))`.
+/// The active-bound argument here is `x = z/√2 ≤ 1.2` over the test's ρ grid,
+/// where forty terms leave a tail below `1.2^81/40! ≈ 1e-41`.
+const ERF_SERIES_TERMS: usize = 40;
+
+/// The half-space mass the constrained Laplace term charges an ACTIVE lower bound
+/// (gam#2765). At `β̂ = lower` the penalized loss has outward slope `g` and
+/// curvature `H`, so the feasible Laplace mass is the Gaussian's times
+/// `e^{g²/2H} Φ(−g/√H)`, and the criterion carries
+/// `−[g²/(2H) + ln Φ(−g/√H)]` on top of the full-space `½ ln H`.
+fn half_space_mass_term_f64(g: f64, h: f64) -> f64 {
+    let x = g / h.sqrt() / std::f64::consts::SQRT_2;
+    let mut sum = 0.0;
+    let mut power = x;
+    let mut factorial = 1.0;
+    for n in 0..ERF_SERIES_TERMS {
+        let sign = if n % 2 == 0 { 1.0 } else { -1.0 };
+        sum += sign * power / (factorial * (2 * n + 1) as f64);
+        power *= x * x;
+        factorial *= (n + 1) as f64;
+    }
+    let erf = 2.0 / std::f64::consts::PI.sqrt() * sum;
+    -(g * g / (2.0 * h) + (0.5 * (1.0 - erf)).ln())
 }
 
 fn constrained_exactobjective_f64(rho: f64, target: f64, lower: f64) -> f64 {
     let lambda = rho.exp();
     let beta_hat = lower;
     let resid = beta_hat - target;
+    let slope = resid + lambda * beta_hat;
     0.5 * resid * resid + 0.5 * lambda * beta_hat * beta_hat + 0.5 * (1.0 + lambda).ln() - 0.5 * rho
+        + half_space_mass_term_f64(slope, 1.0 + lambda)
 }
 
 fn constrained_exactobjective_f1(rho: F1, target: f64, lower: f64) -> F1 {
     let lambda = rho.exp();
     let beta_hat = F1::cst(lower);
     let resid = beta_hat - F1::cst(target);
+    let slope = resid + lambda * beta_hat;
+    let curvature = F1::cst(1.0) + lambda;
+    let x = slope / curvature.sqrt() / F1::cst(std::f64::consts::SQRT_2);
+    let mut sum = F1::cst(0.0);
+    let mut power = x;
+    let mut factorial = 1.0;
+    for n in 0..ERF_SERIES_TERMS {
+        let sign = if n % 2 == 0 { 1.0 } else { -1.0 };
+        sum = sum + power * F1::cst(sign / (factorial * (2 * n + 1) as f64));
+        power = power * x * x;
+        factorial *= (n + 1) as f64;
+    }
+    let erf = F1::cst(2.0 / std::f64::consts::PI.sqrt()) * sum;
+    let mass = -(slope * slope / (F1::cst(2.0) * curvature) + (F1::cst(0.5) * (F1::cst(1.0) - erf)).ln());
     F1::cst(0.5) * resid * resid
         + F1::cst(0.5) * lambda * beta_hat * beta_hat
         + F1::cst(0.5) * (F1::cst(1.0) + lambda).ln()
         - F1::cst(0.5) * rho
+        + mass
 }
 
 #[derive(Clone)]
@@ -401,12 +459,29 @@ impl<T: AD> DifferentiableFunctionTrait<T> for ConstrainedExactObjectiveFn<T> {
         let lambda = rho.exp();
         let beta_hat = T::constant(self.lower);
         let resid = beta_hat - T::constant(self.target);
+        let slope = resid + lambda * beta_hat;
+        let curvature = T::one() + lambda;
+        let x = slope / curvature.sqrt() / T::constant(std::f64::consts::SQRT_2);
+        let mut sum = T::constant(0.0);
+        let mut power = x;
+        let mut factorial = 1.0;
+        for n in 0..ERF_SERIES_TERMS {
+            let sign = if n % 2 == 0 { 1.0 } else { -1.0 };
+            sum = sum + power * T::constant(sign / (factorial * (2 * n + 1) as f64));
+            power = power * x * x;
+            factorial *= (n + 1) as f64;
+        }
+        let erf = T::constant(2.0 / std::f64::consts::PI.sqrt()) * sum;
+        let mass = T::constant(0.0)
+            - (slope * slope / (T::constant(2.0) * curvature)
+                + (T::constant(0.5) * (T::one() - erf)).ln());
         stateless_ad_output(
             freeze,
             T::constant(0.5) * resid * resid
                 + T::constant(0.5) * lambda * beta_hat * beta_hat
                 + T::constant(0.5) * (T::one() + lambda).ln()
-                - T::constant(0.5) * rho,
+                - T::constant(0.5) * rho
+                + mass,
         )
     }
 

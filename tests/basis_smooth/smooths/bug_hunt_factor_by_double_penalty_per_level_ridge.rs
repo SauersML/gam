@@ -26,6 +26,8 @@ use gam::basis::PenaltySource;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
+use gam::faer_ndarray::FaerEigh;
+use faer::Side;
 use ndarray::Array2;
 
 const K: usize = 10;
@@ -125,11 +127,11 @@ fn factor_by_double_penalty_ridge_is_per_level_in_constrained_chart() {
     // ridge where its support does not overlap the co-located primary, so the
     // product is large.
     for (t_idx, term) in level_terms.iter().enumerate() {
-        let mut primaries: Vec<&Array2<f64>> = Vec::new();
+        let mut primaries: Vec<(&Array2<f64>, usize)> = Vec::new();
         let mut ridges: Vec<&Array2<f64>> = Vec::new();
         for penalty in &term.active_penalties {
             match &penalty.info.source {
-                PenaltySource::Primary => primaries.push(&penalty.matrix),
+                PenaltySource::Primary => primaries.push((&penalty.matrix, penalty.nullity)),
                 PenaltySource::DoublePenaltyNullspace => ridges.push(&penalty.matrix),
                 // Irrelevant to the ridge-vs-primary pairing under test;
                 // enumerated (not `_`) so a new source must be classified here.
@@ -153,9 +155,9 @@ fn factor_by_double_penalty_ridge_is_per_level_in_constrained_chart() {
         );
         for (r, ridge) in ridges.iter().enumerate() {
             let (rlo, rhi) = support(ridge);
-            let owner = primaries
+            let &(owner, nullity) = primaries
                 .iter()
-                .find(|p| {
+                .find(|(p, _)| {
                     let (plo, phi) = support(p);
                     plo <= rlo && rhi <= phi
                 })
@@ -166,18 +168,43 @@ fn factor_by_double_penalty_ridge_is_per_level_in_constrained_chart() {
                          (#1476 by-factor regression)."
                     )
                 });
-            let rn = frob(ridge);
-            let pn = frob(owner);
             assert!(
-                rn > 0.0 && pn > 0.0,
-                "per-level term {t_idx} ridge {r}: degenerate ridge/primary"
+                frob(ridge) > 0.0 && frob(owner) > 0.0 && nullity > 0,
+                "per-level term {t_idx} ridge {r}: degenerate ridge/primary (nullity {nullity})"
             );
-            let rel = frob(&(**ridge).dot(&**owner)) / (rn * pn);
+            // The ridge is NOT required to annihilate the bending block: a
+            // gauge-placed B-spline ridge is charged along the mean slope
+            // (`charge_placed_bspline_null_ridge_along_mean_slope`), `c·ℓℓᵀ`,
+            // so that the fit and every frozen replay carry one penalty, and
+            // `ℓ` is not orthogonal to the bending range. What #1476 breaks is
+            // WHICH null space the ridge charges: a ridge rebuilt in another
+            // level's block has disjoint support, so it is exactly zero on
+            // this block's bending null space. The contract is therefore that
+            // the ridge has the bending nullity as its rank and is
+            // nondegenerate on that null space, `λ_min(NᵀRN)` above the
+            // decomposition's roundoff band `p·ε·‖R‖₂`.
+            let p = owner.nrows();
+            let (bend_values, bend_vectors) = owner.eigh(Side::Lower).expect("bending eigh");
+            let mut order: Vec<usize> = (0..p).collect();
+            order.sort_by(|&a, &b| bend_values[a].total_cmp(&bend_values[b]));
+            let null = bend_vectors.select(ndarray::Axis(1), &order[..nullity]);
+            let (ridge_values, _) = ridge.eigh(Side::Lower).expect("ridge eigh");
+            let ridge_norm = ridge_values.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+            let band = p as f64 * f64::EPSILON * ridge_norm;
+            let ridge_rank = ridge_values.iter().filter(|&&v| v > band).count();
+            assert_eq!(
+                ridge_rank, nullity,
+                "per-level term {t_idx} ridge {r}: ridge rank {ridge_rank} is not the bending \
+                 nullity {nullity}"
+            );
+            let restricted = null.t().dot(&ridge.dot(&null));
+            let (restricted_values, _) = restricted.eigh(Side::Lower).expect("restricted eigh");
+            let floor = restricted_values.iter().copied().fold(f64::INFINITY, f64::min);
             assert!(
-                rel < 1e-8,
-                "per-level term {t_idx} ridge {r}: per-level double-penalty ridge does not annihilate \
-                 its co-located bending block (‖ridge·bending‖/(‖ridge‖‖bending‖) = {rel:.3e} ≥ 1e-8); \
-                 the ridge is in the wrong constrained chart / coefficient block (#1476 by-factor regression)."
+                floor > band,
+                "per-level term {t_idx} ridge {r}: the ridge does not charge its co-located \
+                 bending null space (λ_min(NᵀRN) = {floor:.3e} ≤ band {band:.3e}); it was rebuilt \
+                 in the wrong constrained chart / coefficient block (#1476 by-factor regression)."
             );
         }
     }

@@ -93,11 +93,15 @@ const EXPECTED_SAVED_MODEL_ROOT_FIELD_COUNT: usize = 3;
 // `Option` fields with no `skip_serializing_if`, so each one always wrote a key
 // (as `null` when absent) and each removal drops exactly one. This number is THIS
 // model's JSON key count, not the struct's declared field count: `FittedModelPayload`
-// declares 93 `pub` fields here, four of which carry `skip_serializing_if` and three
-// of which are empty in this model. Do not re-derive it by subtracting from the
-// declaration count. The stateful sync keeps mirroring each link's point state; the
-// link covariance stays on the fit.
-const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 90;
+// declares 93 `pub` fields here, four of which carry `skip_serializing_if`, and all
+// four are empty in this model: `group_metadata` comes only from a JSON config's
+// groups, `deployment_extensions` only from an attached extension, and
+// `declared_latent_law{,_compression}` only from a BMS fit. The count read 90 on the
+// premise that one of them was populated here; measured on this model, the payload
+// writes every other declared field and none of those four, so 93 - 4 = 89. The
+// stateful sync keeps mirroring each link's point state; the link covariance stays
+// on the fit.
+const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 89;
 const EXPECTED_STANDARD_FAMILY_FIELD_COUNT: usize = 6;
 
 fn read_saved_model_json(path: &Path) -> Value {

@@ -22,11 +22,11 @@
 //!      not a parallel-but-equal hand-built block. This is the field that #1191
 //!      diverged on (`tol` / `skip_rho_posterior_inference`).
 //!
-//!   2. Fitting the materialized request directly through `fit_model` (the exact
-//!      call both the CLI and the FFI make) and fitting the same formula through
-//!      the shared `fit_from_formula` entry yield bit-comparable β̂. Both binaries
-//!      wrap this same orchestration, so agreement here is agreement across the
-//!      two entry points.
+//!   2. The FFI's standard entry `fit_formula_to_payload` and the CLI's
+//!      `fit_from_formula` yield bit-comparable β̂. Both run the
+//!      adaptive-resolution loop (#3149), so they fit one basis; a raw
+//!      `materialize` + `fit_model` keeps the fully provisioned basis and is
+//!      neither route.
 //!
 //! If a future change re-introduces a CLI-only or FFI-only knob in the standard
 //! fit path (a different tolerance, a skipped/added validation pass, a dropped
@@ -34,7 +34,7 @@
 
 use gam::solver::fit_orchestration::{
     self, FitRequest, FitResult, StandardFitOptionsInputs, canonical_standard_fit_options,
-    fit_from_formula, fit_model, materialize,
+    fit_from_formula, materialize,
 };
 use gam::{FitConfig, init_parallelism, load_csvwith_inferred_schema};
 use std::io::Write;
@@ -151,15 +151,25 @@ fn assert_parity_for(formula: &str, ds: &gam::inference::data::EncodedDataset, c
         return;
     }
 
-    // (2a) Fit the materialized request directly through `fit_model` — the exact
-    // call both `run_fit` (CLI) and `fit_dataset_impl` (FFI) make.
-    let direct = fit_model(mat.request).unwrap_or_else(|e| {
-        panic!("fit_model('{formula}') failed: {e}");
+    // (2a) The FFI's standard entry is `fit_formula_to_payload`, which materializes
+    // with the adaptive-resolution loop armed, exactly as the CLI's
+    // `fit_from_formula` does (#3149). A raw `materialize` + `fit_model` is
+    // neither route: it keeps the fully provisioned basis, so comparing it with
+    // the CLI compares two different bases, not two routes to one fit.
+    let direct = gam::inference::model_payload_builders::fit_formula_to_payload(
+        formula.to_string(),
+        ds,
+        &cfg,
+    )
+    .unwrap_or_else(|e| {
+        panic!("fit_formula_to_payload('{formula}') failed: {e}");
     });
-    let FitResult::Standard(direct) = direct else {
-        panic!("'{formula}' fit_model must return a Standard result");
-    };
-    let beta_direct = direct.fit.beta.clone();
+    let beta_direct = direct
+        .fit_result
+        .as_ref()
+        .unwrap_or_else(|| panic!("'{formula}' FFI payload must carry its fit result"))
+        .beta
+        .clone();
 
     // (2b) Fit the same formula through the shared `fit_from_formula` entry that
     // wraps materialize + fast-path dispatch + fit_model. The two binaries are

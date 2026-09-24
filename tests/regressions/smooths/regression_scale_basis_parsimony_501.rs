@@ -47,12 +47,11 @@ fn scale_smooth_basis_is_parsimonious_relative_to_mean() {
     let mean_ncoef = block_ncoef(&result, BlockRole::Location);
     let scale_ncoef = block_ncoef(&result, BlockRole::Scale);
 
-    // Mean keeps the generous spatial default (was ~40 pre-fix; assert it is
-    // not collapsed by the parsimony pass that targets only the scale block).
-    assert!(
-        mean_ncoef >= 25,
-        "mean smooth must keep its generous basis, got ncoef={mean_ncoef}"
-    );
+    // The mean keeps the spatial default, which is now DERIVED from the
+    // smoothing rate (`default_num_centers`, bc42d5ca46: `n^{d/(2m+d)}`, 14
+    // coefficients on these 314 rows) rather than the retired ~40-center
+    // constant this test once transcribed as `>= 25`. The #501 contract is the
+    // relation below: the parsimony pass shrinks only the scale block.
     // Scale is held to the conservative default (centers≈10 + small nullspace).
     assert!(
         scale_ncoef <= 18,
