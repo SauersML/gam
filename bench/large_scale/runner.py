@@ -1434,15 +1434,6 @@ _BFGS_SUMMARY_PATTERN = re.compile(
 # additionally captures the feedback snapshot that drove the margin, so
 # the summary can report which policy branch fired (poor LM fidelity,
 # poor IFT prediction, or geometric backoff after a cap hit).
-_SCHEDULE_TRANSITION_PATTERN = re.compile(
-    r"\[OUTER schedule\]\s+inner-PIRLS cap transition.*?prev=(\d+)\s+new=(\d+)"
-)
-_SCHEDULE_QUALITY_PATTERN = re.compile(
-    r"\[OUTER schedule\]\s+inner-PIRLS cap transition.*?"
-    r"last_iters=(\d+)\s+converged=(true|false)\s+"
-    r"ift_residual=(\S+)\s+accept_rho=(\S+)\s+"
-    r"prev=(\d+)\s+new=(\d+)"
-)
 
 # Per-iter inner-Newton wall-clock, and its split across the four
 # sub-phases that drive the cost: curvature assembly, the (H+λI)δ=-g
@@ -1515,11 +1506,6 @@ _OUTER_EVAL_END_PATTERN = re.compile(
 # Seed-screening cascade summary: one per outer fit. `stages_used=1`
 # means the heuristic seeds passed at the tightest cap tier; higher
 # means the cascade had to escalate, which is startup cost at scale.
-_SEED_CASCADE_PATTERN = re.compile(
-    r"\[OUTER\][^\n]*seed screening cascade complete\s+"
-    r"elapsed=([\d.]+)s\s+stages_used=(\d+)\s+"
-    r"final_cap=(\w+)\s+ranked=(\d+)/(\d+)"
-)
 
 # κ-optimization driver instrumentation: one `[KAPPA-PHASE]` per closure
 # invocation plus a `[KAPPA-PHASE-SUMMARY]` at exit. Two summary
@@ -1604,10 +1590,8 @@ _INSTRUMENTATION_MARKERS: tuple[str, ...] = (
     "[PHASE]",
     "[OUTER summary]",
     "[OUTER non-finite]",
-    "[OUTER schedule] inner-PIRLS cap transition",
     "[OUTER hessian-route]",
     "[OUTER hessian-elapsed]",
-    "seed screening cascade complete",
     "[STAGE] outer eval end",
     "[STAGE] PIRLS update_with_curvature",
     "[PIRLS iter-end]",
@@ -1848,27 +1832,6 @@ def _emit_phase_summary(
         parts.append(f"bfgs_runs={len(bfgs)} bfgs_total={total:.1f}s {status}{iter_part}")
 
     # --- outer optimizer ------------------------------------------------
-    schedule_transitions = _SCHEDULE_TRANSITION_PATTERN.findall(captured_stderr)
-    if schedule_transitions:
-        parts.append(f"sched_transitions={len(schedule_transitions)}")
-    sched_quality = _SCHEDULE_QUALITY_PATTERN.findall(captured_stderr)
-    if sched_quality:
-        n_unconverged = sum(1 for row in sched_quality if row[1] == "false")
-        n_poor_ift = len(
-            [value for value in _finite(row[2] for row in sched_quality) if value >= 0.10]
-        )
-        n_poor_rho = 0
-        for _last_iters, converged, _ift, rho_text, _prev, _new in sched_quality:
-            rho = _finite([rho_text])
-            if rho and rho[0] < 0.5:
-                n_poor_rho += 1
-        parts.append(
-            f"sched_quality_n={len(sched_quality)} "
-            f"sched_unconv={n_unconverged} "
-            f"sched_poor_ift={n_poor_ift} "
-            f"sched_poor_accept_rho={n_poor_rho}"
-        )
-
     outer_h_route = _OUTER_HESSIAN_ROUTE_PATTERN.findall(captured_stderr)
     outer_h_elapsed = _OUTER_HESSIAN_ELAPSED_PATTERN.findall(captured_stderr)
     if outer_h_elapsed:
@@ -1899,18 +1862,6 @@ def _emit_phase_summary(
         parts.append(
             f"outer_h_INCOMPLETE outer_h_routes={len(outer_h_route)} "
             f"outer_h_dom_reason={dominant}"
-        )
-
-    seed_cascades = _SEED_CASCADE_PATTERN.findall(captured_stderr)
-    if seed_cascades:
-        seeds_total = sum(int(row[4]) for row in seed_cascades)
-        parts.append(
-            f"seed_cascade_n={len(seed_cascades)} "
-            f"seed_cascade_elapsed={sum(float(row[0]) for row in seed_cascades):.1f}s "
-            f"seed_cascade_escalated={sum(1 for row in seed_cascades if int(row[1]) >= 2)} "
-            f"seed_cascade_stages_total={sum(int(row[1]) for row in seed_cascades)} "
-            f"seed_cascade_rank_rate="
-            f"{sum(int(row[3]) for row in seed_cascades) / max(seeds_total, 1):.2f}"
         )
 
     outer_eval_ends = _OUTER_EVAL_END_PATTERN.findall(captured_stderr)

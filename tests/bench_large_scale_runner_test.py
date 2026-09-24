@@ -591,18 +591,6 @@ _MARKER_SAMPLES: dict[str, tuple[str, str]] = {
         "[OUTER summary] BFGS converged in 12 iters elapsed=145.234s final_value=1.234567e3",
         "[OUTER summary] BFGS converged in {} iters elapsed=",
     ),
-    "_SCHEDULE_TRANSITION_PATTERN": (
-        "[OUTER schedule] inner-PIRLS cap transition accepted_iter=3 eval_count=9 "
-        "g_ratio=1.000e-01 last_iters=7 converged=true ift_residual=1.000e-03 "
-        "accept_rho=0.985 prev=8 new=12 (margin)",
-        "[OUTER schedule] inner-PIRLS cap transition accepted_iter=",
-    ),
-    "_SCHEDULE_QUALITY_PATTERN": (
-        "[OUTER schedule] inner-PIRLS cap transition accepted_iter=3 eval_count=9 "
-        "g_ratio=1.000e-01 last_iters=7 converged=false ift_residual=n/a "
-        "accept_rho=0.310 prev=8 new=12 (margin)",
-        "last_iters={} converged={} ift_residual={} accept_rho={}",
-    ),
     "_PIRLS_ITER_END_PATTERN": (
         "[PIRLS iter-end] iter=  3 elapsed=0.0345s lm_lambda=1.00e-06 g_norm=1.234e-03 "
         "last_dev_change=5.000e-05 last_halving=0",
@@ -643,11 +631,6 @@ _MARKER_SAMPLES: dict[str, tuple[str, str]] = {
         "[STAGE] outer eval end order=ValueAndGradient elapsed=2.345s cost=1.234567e3 "
         "|g|=4.500e-02 (first-order bridge, iter=3) theta=[] g=[]",
         "[STAGE] outer eval end order=ValueAndGradient elapsed=",
-    ),
-    "_SEED_CASCADE_PATTERN": (
-        "[OUTER] large_scale_fit_001: seed screening cascade complete elapsed=12.345s "
-        "stages_used=2 final_cap=uncapped ranked=8/10",
-        "seed screening cascade complete elapsed=",
     ),
     "_KAPPA_PHASE_PATTERN": (
         "[KAPPA-PHASE] phase=eval_outer call=5 order=ValueGradientHessian "
@@ -1000,24 +983,6 @@ class MarkerPatternTests(unittest.TestCase):
             matches = _RUNNER._OUTER_EVAL_END_PATTERN.findall(line)
             self.assertEqual(len(matches), 1, f"order {expected_order!r} did not parse")
             self.assertEqual(matches[0], (expected_order, expected_elapsed))
-
-    def test_seed_cascade_pattern_captures_cascade_summary(self) -> None:
-        cases = [
-            (
-                "[OUTER] large_scale_fit_001: seed screening cascade complete "
-                "elapsed=12.345s stages_used=2 final_cap=uncapped ranked=8/10",
-                ("12.345", "2", "uncapped", "8", "10"),
-            ),
-            (
-                "[OUTER] survival-marginal-slope/large-scale-1: seed screening cascade "
-                "complete elapsed=0.500s stages_used=1 final_cap=10 ranked=4/4",
-                ("0.500", "1", "10", "4", "4"),
-            ),
-        ]
-        for line, expected in cases:
-            matches = _RUNNER._SEED_CASCADE_PATTERN.findall(line)
-            self.assertEqual(len(matches), 1, f"cascade did not parse: {line}")
-            self.assertEqual(matches[0], expected)
 
     def test_pirls_curvature_kind_pattern_captures_observed_and_fisher(self) -> None:
         for kind in ("Observed", "Fisher"):
