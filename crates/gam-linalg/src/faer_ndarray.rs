@@ -1092,6 +1092,21 @@ impl ColumnPivotedQr {
         let exponent = scale_for_householder(qr.as_mut());
         let block_size = faer::linalg::qr::no_pivoting::factor::recommended_block_size::<f64>(m, n);
         let mut coeff = Mat::<f64>::zeros(block_size, size);
+        // The zero matrix is exactly `I·0·I`: unit reflector columns with zero block
+        // coefficients (`Q = I`), `R = 0`, no pivoting. Handed to the reflector
+        // construction it has no column norm to divide by, and the factor came
+        // back non-finite, so a kernel block that underflowed to exactly zero was
+        // reported as a failed decomposition instead of as rank 0 (#1090).
+        if (0..m).all(|i| (0..n).all(|j| a[(i, j)] == 0.0)) {
+            let basis = Mat::<f64>::from_fn(m, size, |i, j| if i == j { 1.0 } else { 0.0 });
+            return Self {
+                basis,
+                coeff,
+                r: Mat::<f64>::zeros(size, n),
+                forward: (0..n).collect(),
+                inverse: (0..n).collect(),
+            };
+        }
         let mut forward = vec![0usize; n];
         let mut inverse = vec![0usize; n];
         let mut mem = MemBuffer::new(
@@ -4631,6 +4646,23 @@ mod tests {
                 "scale {scale:e}: spectrum {spectrum:?} against band {band:e}"
             );
         }
+    }
+
+    /// The zero matrix has rank 0 and a finite factor; a matrix with one exactly
+    /// zero column among independent ones keeps the rank of the others (#1090).
+    #[test]
+    fn pivoted_qr_rank_reads_exact_zeros_as_rank_deficiency() {
+        let zero = Array2::<f64>::zeros((5, 3));
+        let rrqr = rrqr_with_permutation(&zero).expect("the zero matrix factors");
+        assert_eq!(rrqr.rank, 0, "the zero matrix has rank 0");
+        let with_zero_column = array![
+            [1.0, 0.0, 2.0],
+            [0.0, 0.0, 1.0],
+            [3.0, 0.0, 0.5],
+            [1.0, 0.0, -1.0]
+        ];
+        let rrqr = rrqr_with_permutation(&with_zero_column).expect("a zero column factors");
+        assert_eq!(rrqr.rank, 2, "an exactly zero column adds no rank");
     }
 
     /// A zero leading entry forces a row exchange, and the solve meets LU's backward-error
