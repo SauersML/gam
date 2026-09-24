@@ -21,7 +21,11 @@
 //!    ```
 //!
 //!    `B` is finite exactly on the admissible set, so no step can leave it, and its
-//!    minimizer maximizes every position's slack together, with nothing to weigh.
+//!    minimizer maximizes every position's slack together, with nothing to weigh. Under
+//!    the mean form there is one constraint, which a trust region that accepts only
+//!    decreases keeps by itself; the step then minimizes the mean divergence directly,
+//!    which has the same minimizers without the barrier's curvature at the boundary
+//!    (the float64 modular-addition fit stalled there at slack ~3e-16).
 //!    The step is `gam_geometry`'s trust region with Steihaug-CG on the exact second-order
 //!    model of `B`:
 //!
@@ -179,7 +183,7 @@ impl<E: PieceExecutor> Barrier<'_, E> {
     /// `None` outside the admissible set.
     ///
     /// Per position, `B = −Σ_t log(ε − KL_t)` and `w_t = 1/(ε − KL_t)`. Under the mean
-    /// form, `B = −log(ε − m)` with `m` the mean divergence, and `w_t = 1/(P (ε − m))`.
+    /// form the objective is the mean divergence `m` itself, `w_t = 1/P` (see below).
     fn weights(&mut self, theta: ArrayView1<'_, f64>) -> Result<Option<(f64, Array1<f64>)>, String> {
         let kl = self.executor.divergence(theta, self.keep.view())?;
         match self.fidelity {
@@ -191,28 +195,28 @@ impl<E: PieceExecutor> Barrier<'_, E> {
                 Ok(Some((value, kl.mapv(|v| 1.0 / (eps - v)))))
             }
             Fidelity::Mean(eps) => {
+                // One constraint, kept by monotonicity: the trust region accepts only decreases
+                // of the mean `m`, so from an admissible start it never reaches `ε`. Minimizing
+                // `m` itself shares the minimizers of `−log(ε − m)` (a monotone transform)
+                // without its `1/(ε − m)²` curvature at the boundary the search leaves it at.
                 let p = kl.len() as f64;
                 let mean = kl.sum() / p;
                 if !(mean < eps) {
                     return Ok(None);
                 }
-                Ok(Some((-(eps - mean).ln(), Array1::from_elem(kl.len(), 1.0 / (p * (eps - mean))))))
+                Ok(Some((mean, Array1::from_elem(kl.len(), 1.0 / p))))
             }
         }
     }
 
     /// Per-position weights of the barrier's rank-one Hessian term along `d_t = ∇KL_t · v`:
-    /// per position `w_t² d_t`; under the mean form the one constraint's
-    /// `(Σ d / P) / (ε − m)² / P` at every position.
+    /// per position `w_t² d_t`; none under the mean form, whose objective is the mean
+    /// itself.
     fn rank_one_weights(&self, w: &Array1<f64>, d: &Array1<f64>) -> Array1<f64> {
         match self.fidelity {
             Fidelity::PerPosition(_) => w * w * d,
-            Fidelity::Mean(_) => {
-                let p = d.len() as f64;
-                // w_t = 1/(P (ε − m)), so 1/(ε − m)² = (P w)².
-                let scale = (p * w[0]).powi(2) * d.sum() / p / p;
-                Array1::from_elem(d.len(), scale)
-            }
+            // The mean itself is minimized: it has no rank-one term.
+            Fidelity::Mean(_) => Array1::zeros(d.len()),
         }
     }
 
