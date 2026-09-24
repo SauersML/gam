@@ -4802,7 +4802,18 @@ pub fn plan_joint_spatial_centers_for_term_blocks(
             joint_centers,
             group_key.feature_cols.len(),
         )?;
-        let shared_centers = select_centers_by_strategy(standardized.view(), &joint_strategy)?;
+        let mut shared_centers = select_centers_by_strategy(standardized.view(), &joint_strategy)?;
+        // The centers were selected in the standardized frame. A term with no stored
+        // input scale reads `UserProvided` centers in original units and standardizes
+        // them with the data when it is built (`normalize_euclidean_frame`, #2623), so
+        // writing them in the standardized frame divided them by the scale twice: the
+        // Gaussian location-scale mean and log-σ `s(x, bs='tps')` shared centers at
+        // x/σ̂², and the mean realized 5 of its 12 centers' columns (#2356). A term
+        // with a stored scale is a frozen replay and keeps the standardized frame.
+        if spatial_term_stored_input_scale(prototype).is_none() {
+            let frame_scale = spatial_term_realized_input_scale(data, prototype)?;
+            shared_centers.mapv_inplace(|value| value * frame_scale.get());
+        }
         log::debug!(
             "sharing {} spatial centers across {} smooth terms over columns {:?} (requested {} centers)",
             shared_centers.nrows(),

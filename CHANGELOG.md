@@ -1,5 +1,12 @@
 ## Unreleased
 
+- **A Gaussian location-scale mean smooth keeps its whole basis again** (gam#2356). When the mean
+  and log-σ formulas smooth the same column, the two terms share their centres. The shared centres
+  were chosen in the standardized frame and handed back with no scale, so the term's build
+  standardized them a second time and placed them at x/σ̂². On the gam#1561 sine (n=200) the mean's
+  12-centre thin plate then realized 5 columns and one penalty and fitted edf 5.3 at mean RMSE
+  0.091. The shared centres are now handed back in original units: edf 9.9 at RMSE 0.018.
+
 - **A default `s(x)` grows its knots behind an outlier again** (gam#3993). A fit whose outer Hessian
   had a negative eigenvalue too small for the criterion to resolve certified stationary but
   recorded no bound on its criterion's error, because only the Newton-decrement rung recorded one
