@@ -165,7 +165,16 @@ def main():
 
         def divergence(self, theta, keep):
             with torch.no_grad():
-                return kl_of(model.logits(ids, mask(keep), th(theta), context)).double().cpu().numpy()
+                kl = kl_of(model.logits(ids, mask(keep), th(theta), context)).double().cpu().numpy()
+            calls["divergence"] = calls.get("divergence", 0) + 1
+            t_now = np.asarray(theta)
+            calls.setdefault("theta0", t_now.copy())
+            if calls["divergence"] % 10 == 0:
+                kept = np.asarray(keep).reshape(P, C)
+                print(f"[fit] barrier view {calls['divergence']}: rank units/position {(kept * model.rank_units).sum(1).mean():.1f} "
+                      f"(fixed supports), KL mean {kl.mean():.4f} max {kl.max():.4f}; |theta - theta0| "
+                      f"{np.linalg.norm(t_now - calls['theta0']):.4e} ({time.time() - calls['t']:.0f}s)", flush=True)
+            return kl
 
         def tick(self, kind):
             calls[kind] = calls.get(kind, 0) + 1
@@ -184,17 +193,17 @@ def main():
             _, d = jvp(lambda t: kl_of(model.logits(ids, m, t, context)), (th(theta),), (th(v),))
             return d.double().cpu().numpy()
 
-        def weighted_gauss_newton(self, theta, keep, weights, v):
-            self.tick("gauss_newton")
+        def weighted_hessian(self, theta, keep, weights, v):
+            # Exact Hessian product of sum_t w_t KL_t in theta, forward-over-reverse.
+            self.tick("hessian")
             m = mask(keep)
-            t = th(theta).requires_grad_(True)
-            logits = model.logits(ids, m, t, context)
-            _, u = jvp(lambda s: model.logits(ids, m, s, context), (th(theta),), (th(v),))
-            q = logits.softmax(-1).detach()
-            fu = q * u - q * (q * u).sum(-1, keepdim=True)
-            fu = fu * th(weights).float().view(B, T, 1)
-            (out,) = torch.autograd.grad(logits, t, grad_outputs=fu)
-            return out.double().cpu().numpy()
+            w = th(weights).float()
+
+            def objective_grad(t):
+                return torch.func.grad(lambda s: (kl_of(model.logits(ids, m, s, context)) * w).sum())(t)
+
+            _, hv = jvp(objective_grad, (th(theta),), (th(v),))
+            return hv.double().cpu().numpy()
 
     theta0 = model.initial_theta().numpy()
     print(f"[fit] pieces {C}/position, theta {theta0.size}, P={P}, eps {args.eps}", flush=True)

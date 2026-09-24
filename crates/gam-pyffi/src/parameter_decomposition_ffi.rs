@@ -141,7 +141,8 @@ fn parameter_decomposition_minimal_support<'py>(
 
 /// A Python executor object for `support_fit`: methods `supports(theta, keep)`,
 /// `divergence(theta, keep)`, `weighted_gradient(theta, keep, weights)`,
-/// `directional(theta, keep, v)` and `weighted_gauss_newton(theta, keep, weights, v)`,
+/// `directional(theta, keep, v)` and `weighted_hessian(theta, keep, weights, v)` (the
+/// exact Hessian product `Σ_t w_t ∇²KL_t v`),
 /// with float64 vectors and a `P x C` bool `keep`.
 struct PythonPieceExecutor<'py> {
     object: Bound<'py, PyAny>,
@@ -200,10 +201,10 @@ impl PieceExecutor for PythonPieceExecutor<'_> {
             (theta.to_owned().into_pyarray(py), keep.to_owned().into_pyarray(py), v.to_owned().into_pyarray(py)),
         )
     }
-    fn weighted_gauss_newton(&mut self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>, weights: ArrayView1<'_, f64>, v: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
+    fn weighted_hessian(&mut self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>, weights: ArrayView1<'_, f64>, v: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
         let py = self.object.py();
         self.vector(
-            "weighted_gauss_newton",
+            "weighted_hessian",
             (
                 theta.to_owned().into_pyarray(py),
                 keep.to_owned().into_pyarray(py),

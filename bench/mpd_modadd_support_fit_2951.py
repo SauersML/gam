@@ -120,16 +120,16 @@ def main():
                             (torch.from_numpy(np.asarray(v)),))
                 return dd.numpy()
 
-            def weighted_gauss_newton(self, theta, keep, weights, v):
+            def weighted_hessian(self, theta, keep, weights, v):
+                # Exact Hessian product of sum_t w_t KL_t in theta, forward-over-reverse.
                 m = mask(keep)
-                t = torch.from_numpy(np.asarray(theta)).clone().requires_grad_(True)
-                lg = logits(tokens, m, t)
-                _, u = jvp(lambda s: logits(tokens, m, s), (torch.from_numpy(np.asarray(theta)),),
-                           (torch.from_numpy(np.asarray(v)),))
-                q = lg.softmax(-1).detach()
-                fu = (q * u - q * (q * u).sum(-1, keepdim=True)) * torch.from_numpy(np.asarray(weights))[:, None]
-                (out,) = torch.autograd.grad(lg, t, grad_outputs=fu)
-                return out.numpy()
+                w = torch.from_numpy(np.asarray(weights))
+
+                def objective_grad(t):
+                    return torch.func.grad(lambda s: (kl_of(logits(tokens, m, s)) * w).sum())(t)
+
+                _, hv = jvp(objective_grad, (torch.from_numpy(np.asarray(theta)),), (torch.from_numpy(np.asarray(v)),))
+                return hv.numpy()
 
         return Executor(), N
 
