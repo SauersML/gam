@@ -380,6 +380,18 @@ pub fn qr_retract(frame: ArrayView2<'_, f64>, step: ArrayView2<'_, f64>) -> Resu
 }
 
 /// Orthogonal dictionary learning of a complete frame on a bank of rows `D` (`n × d`):
+///
+/// # What sparsity identifies
+///
+/// The fit identifies a subspace only up to the rotations that preserve every row's
+/// selection. If every row's energy lies in the same union `U` of `r` atom groups, any
+/// orthogonal `Q` acting inside `U` (and as the identity off it) maps an optimal frame to
+/// another optimal frame with identical codes' energies, identical selections and the same
+/// residual, so the individual planes inside `U` are a gauge (P1), not an output: the
+/// grokked modular-addition embedding, whose tokens all use all five key frequency planes,
+/// is the measured case (#2951). What splits `U` into planes is a symmetry the rows carry
+/// (the invariant planes of a shift operator, `spectral`/`schur`), not sparsity.
+///
 /// alternate (a) each row coded by its `active` highest-energy atom groups of the current
 /// frame, `S = mask ⊙ (D Xᵀ)`, and (b) the orthogonal Procrustes update
 /// `X = polar(Sᵀ D)`, the orthogonal matrix nearest `Sᵀ D`, which minimizes
@@ -575,6 +587,43 @@ mod tests {
             assert!(w[1] <= w[0] + 1e-9 * energy, "{trace:?}");
         }
         assert!(trace.last().unwrap() < trace.first().unwrap(), "{trace:?}");
+    }
+
+    /// Every row uses the same two planes: the fit's residual vanishes, but a rotation of
+    /// the frame inside the union of those planes is exactly as optimal, so the planes are
+    /// a gauge of the fit, not an output of it.
+    #[test]
+    fn a_union_every_row_uses_is_identified_but_its_planes_are_not() {
+        let mut rng = StdRng::seed_from_u64(8);
+        let (n, d, m, active) = (300, 6, 2, 2);
+        let planted = stiefel(&mut rng, d, d);
+        let mut bank = Array2::<f64>::zeros((n, d));
+        for i in 0..n {
+            let c = gaussian(&mut rng, 1, 2 * m);
+            let mut code = Array2::<f64>::zeros((1, d));
+            code.slice_mut(s![0, ..2 * m]).assign(&c.row(0));
+            bank.row_mut(i).assign(&code.dot(&planted).row(0));
+        }
+        let energy: f64 = bank.iter().map(|v| v * v).sum();
+        let floor = (n * d) as f64 * f64::EPSILON * energy;
+        let (_, from_planted) = orthogonal_dictionary_fit(bank.view(), planted.view(), m, active).unwrap();
+        assert!(*from_planted.last().unwrap() <= floor);
+        // rotate inside the union of the first two planes (rows 0..4 of the frame)
+        let theta: f64 = 0.7;
+        let mut mix = Array2::<f64>::eye(d);
+        mix[[0, 0]] = theta.cos();
+        mix[[0, 2]] = -theta.sin();
+        mix[[2, 0]] = theta.sin();
+        mix[[2, 2]] = theta.cos();
+        let rotated = mix.dot(&planted);
+        let (_, from_rotated) = orthogonal_dictionary_fit(bank.view(), rotated.view(), m, active).unwrap();
+        assert!(*from_rotated.last().unwrap() <= floor, "{from_rotated:?}");
+        // and the rotated frame's first plane is not the planted first plane
+        let a = planted.slice(s![0..2, ..]).to_owned();
+        let b = rotated.slice(s![0..2, ..]).to_owned();
+        let overlap = a.dot(&b.t());
+        let det = overlap[[0, 0]] * overlap[[1, 1]] - overlap[[0, 1]] * overlap[[1, 0]];
+        assert!(det.abs() < 0.9, "planes coincide: {det}");
     }
 
     /// The neuron frame is Parseval with and without its rotated copy.
