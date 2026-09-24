@@ -101,11 +101,27 @@ fn noiseless_gaussian_smoothing_correction_is_a_valid_covariance_2490() {
         first_order.diag().iter().all(|&variance| variance >= 0.0),
         "a Gram covariance must have non-negative diagonal: {first_order:?}"
     );
-    assert!(
-        first_order.diag().iter().any(|&variance| variance > 0.0),
-        "fixture no longer exercises a non-vacuous smoothing correction: log lambdas {:?}",
-        fit.log_lambdas
-    );
+    // The response is exact (`y = Xβ`), so the REML optimum is the interpolating face `λ → 0`:
+    // the fit's certificate rails the one smoothing coordinate at its lower bound (measured at
+    // `ρ = −13.643`, face `LimitModel`). A railed coordinate is not free, so it carries no
+    // smoothing-parameter uncertainty and the first-order correction is exactly zero — that is
+    // the contract, not vacuity. Off the rail the correction must be non-vacuous.
+    let railed = fit
+        .convergence_evidence()
+        .outer_certificate()
+        .is_some_and(|certificate| certificate.lambdas_railed.contains(&0));
+    if railed {
+        assert!(
+            first_order.iter().all(|&value| value == 0.0),
+            "a smoothing coordinate railed at its bound propagates no uncertainty: {first_order:?}"
+        );
+    } else {
+        assert!(
+            first_order.diag().iter().any(|&variance| variance > 0.0),
+            "an interior smoothing coordinate must carry a non-vacuous correction: log lambdas {:?}",
+            fit.log_lambdas
+        );
+    }
 
     let corrected = fit
         .beta_covariance_corrected()
