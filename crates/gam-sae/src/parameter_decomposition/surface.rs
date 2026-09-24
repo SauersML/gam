@@ -28,6 +28,7 @@ use super::receipts::{
     ExternalExecution, MeasuredDiscrepancy, MlpBlockReceipt, MlpBlockReceiptInputs, ReceiptRefusal,
     StageAgreement, mlp_block_receipt,
 };
+use super::invariant_spectrum::{InvariantSpectrumError, invariant_components};
 use super::spectral::{
     PlaneRotationError, PlaneRotationRecovery, RotationAmbiguity, RotationClusterKind,
     recover_plane_rotations,
@@ -99,6 +100,13 @@ pub enum MpdOperation {
         /// The executor's block output `W₂ a + b₂`, without the residual (`rows x out`).
         external_output: String,
     },
+    /// Components of a row cloud identified by its own isometry-invariant operators
+    /// (`invariant_spectrum`): joint eigenspaces of the Hadamard powers of its centred
+    /// Gram, grouped by a band derived from the non-invariant remainder.
+    InvariantComponents {
+        /// Id of the rows (`rows x width`).
+        rows: String,
+    },
 }
 
 /// [`ExternalExecution`] on the wire.
@@ -148,6 +156,22 @@ pub struct MpdReport {
 pub enum MpdResult {
     RecoverPlaneRotations(PlaneRotationReport),
     MlpBlockReceipt(MlpBlockReceiptReport),
+    InvariantComponents(InvariantComponentsReport),
+}
+
+/// [`invariant_components`] on the wire.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct InvariantComponentsReport {
+    /// Id of the output array of row coordinates of each joint eigen-direction (`rows x r`).
+    pub coordinates: String,
+    /// Id of the output array of readout directions in the row space (`width x r`).
+    pub readout: String,
+    /// Id of the output array of joint eigenvalues (`r x powers`).
+    pub joint_eigenvalues: String,
+    /// Per power, the bound on its non-invariant part after joint diagonalization.
+    pub band: Vec<f64>,
+    /// Components as sets of direction indices.
+    pub components: Vec<Vec<usize>>,
 }
 
 /// [`PlaneRotationRecovery`] on the wire.
@@ -306,6 +330,8 @@ pub enum MpdSurfaceError {
     /// An input array does not have the shape the operation reads.
     TensorShape { tensor: String, reason: String },
     PlaneRotation(PlaneRotationError),
+    /// The invariant-spectrum owner refused the rows.
+    InvariantSpectrum(InvariantSpectrumError),
     /// The receipts owner refused the block, its execution or its activation tag.
     Receipt(ReceiptRefusal),
     /// An owner returned a non-finite value where the wire report has no meaning
@@ -326,6 +352,7 @@ impl fmt::Display for MpdSurfaceError {
                 write!(formatter, "MPD input array {tensor:?}: {reason}")
             }
             Self::PlaneRotation(error) => write!(formatter, "{error}"),
+            Self::InvariantSpectrum(error) => write!(formatter, "{error}"),
             Self::Receipt(error) => write!(formatter, "{error}"),
             Self::NonFiniteReport { field, value } => write!(
                 formatter,
@@ -391,6 +418,32 @@ pub fn run_parameter_decomposition(
             })
             .map_err(MpdSurfaceError::Receipt)?;
             project_mlp_block_receipt(external_execution.device, receipt)
+        }
+        MpdOperation::InvariantComponents { rows } => {
+            let result = invariant_components(matrix(tensors, &rows)?).map_err(MpdSurfaceError::InvariantSpectrum)?;
+            let band = result
+                .band
+                .iter()
+                .map(|&value| finite("band", value))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut arrays = BTreeMap::new();
+            arrays.insert("coordinates".to_string(), result.coordinates.into_dyn());
+            arrays.insert("readout".to_string(), result.readout.into_dyn());
+            arrays.insert("joint_eigenvalues".to_string(), result.joint_eigenvalues.into_dyn());
+            Ok(MpdOutput {
+                report: MpdReport {
+                    schema: MPD_REPORT_SCHEMA,
+                    schema_version: MPD_SCHEMA_VERSION,
+                    result: MpdResult::InvariantComponents(InvariantComponentsReport {
+                        coordinates: "coordinates".to_string(),
+                        readout: "readout".to_string(),
+                        joint_eigenvalues: "joint_eigenvalues".to_string(),
+                        band,
+                        components: result.components,
+                    }),
+                },
+                arrays,
+            })
         }
     }
 }

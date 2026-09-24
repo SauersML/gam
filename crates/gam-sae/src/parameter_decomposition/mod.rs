@@ -120,8 +120,17 @@ pub mod fit;
 // Exact masked rewrites of gated units, norms, biases and residual edges.
 pub mod gated_rewrite;
 
+// Components of a data cloud identified by its own isometry-invariant operators (joint eigenspaces).
+pub mod invariant_spectrum;
+
 // Tensor registry and the exact residual anchor.
 pub mod lift;
+
+// Per-position minimal supports at a declared fidelity, searched against the model itself.
+pub mod minimal_support;
+
+// Alternating fit of pieces (log-barrier analytic centre, trust region) and minimal supports.
+pub mod support_fit;
 
 // Mask moments, the admissible zonotope, support function and affine-logit adversary.
 pub mod moments;
