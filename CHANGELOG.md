@@ -1164,7 +1164,9 @@
   construction — both children re-derive their tube from their own bounds and their union is
   the parent — so only `HonestConformalCost::z_cells` moves.
 
-## gamfit 0.1.274 (2026-09-24)
+## gamfit 0.1.275 (2026-09-24)
+
+- **`outer_start_levels`** on a Bernoulli marginal-slope fit request chooses the multistart's levels beside the derived start (default unchanged: 0, +inf, 2, 4, -2); each level is one certified outer search, so a study that certifies its optimum from fewer pays for fewer (gnomon#2359).
 
 - 0.1.273 was tagged on a tree that did not compile (a misplaced test and an undocumented field, fixed on main by cccb01fdf1 and dfb2a77b85); this is the same release on the fixed tree.
 
