@@ -1534,7 +1534,7 @@ mod tests {
         // "precondition: statrs clamps P(a,x) to 0" — i.e. it asserted a
         // THIRD-PARTY DEFECT as a premise, so statrs fixing its clamp broke a
         // test of our own unchanged, already-correct function. statrs 0.19
-        // fixed it: `gamma_lr(0.05, 1e-20)` now returns 0.1027216865271675,
+        // fixed it: `gamma_lr(0.05, 1e-20)` now returns 0.1.27316865271675,
         // which is `x^a/Γ(a+1)` to four figures.
         //
         // What the fixture actually needs is that `x` sits far below the

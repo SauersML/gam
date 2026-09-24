@@ -1164,6 +1164,21 @@
   construction — both children re-derive their tube from their own bounds and their union is
   the parent — so only `HonestConformalCost::z_cells` moves.
 
+## gamfit 0.1.273 (2026-09-24)
+
+- **A survival marginal-slope posterior mean costs one root solve per quadrature node, not an
+  order-five Taylor table** (gnomon biobank study). The anchored row kernel's partials `(α_q, α_b)`
+  are the implicit derivatives `φ(q)/D` and `−Σ_k ω_k u_k` at the solved root, formed in log space
+  like the anchor density; each kernel keeps one prepared law and warm-starts every root from the
+  last, which the safeguarded solve returns to rounding whatever the seed.
+- **`Model.predict(..., time_grid=)`** evaluates a survival model at the caller's own times instead
+  of the model's grid over the training follow-up, so a caller reading one follow-up window per row
+  pays for those cells alone; `predict_table` carries the same option.
+- **A fit the frozen-time certificate refuses is typed** (gam#4577, gam#3003):
+  `CustomFamilyError::ModeNotIdentified`, from a fit that ends on the certificate and from the
+  startup-seed screen when every seed's mode was refused by it (`rejected_not_identified` in the
+  startup breakdown). It is a trial-point refusal to the outer search, as before.
+
 ## gamfit 0.1.272 (2026-09-22)
 
 - On musl (Alpine), a host with no CUDA driver fits on the CPU again: the

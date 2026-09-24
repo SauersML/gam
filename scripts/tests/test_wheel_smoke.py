@@ -15,7 +15,7 @@ sys.modules["wheel_smoke"] = wheel_smoke
 SPEC.loader.exec_module(wheel_smoke)
 
 EXT = [".cpython-312-x86_64-linux-gnu.so", ".abi3.so", ".so"]
-DIST_INFO = "gamfit-0.1.272.dist-info"
+DIST_INFO = "gamfit-0.1.273.dist-info"
 
 
 class PyprojectMatrixTests(unittest.TestCase):
@@ -113,9 +113,9 @@ class RequirementTests(unittest.TestCase):
 
 class WheelSelectionTests(unittest.TestCase):
     WHEELS = [
-        pathlib.Path("gamfit-0.1.272-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"),
-        pathlib.Path("gamfit-0.1.272-cp313-cp313t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"),
-        pathlib.Path("gamfit-0.1.272-cp314-cp314t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"),
+        pathlib.Path("gamfit-0.1.273-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"),
+        pathlib.Path("gamfit-0.1.273-cp313-cp313t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"),
+        pathlib.Path("gamfit-0.1.273-cp314-cp314t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"),
     ]
 
     def test_gil_interpreters_install_the_abi3_wheel(self):
