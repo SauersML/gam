@@ -177,6 +177,7 @@ def main():
                         help="biorth: an invertible V on GL(d), pieces b_k a_k^T with B = V^{-T}; exact for every V")
     parser.add_argument("--adaptive", action="store_true",
                         help="batch-level top-(n L) selection per matrix: same mean pieces per token, adaptive per token")
+    parser.add_argument("--resume-frames", default="", help="load frames saved by an earlier run (skips ODL)")
     parser.add_argument("--tf32-train", action="store_true",
                         help="TF32 matmuls in training steps only; every evaluation stays full fp32")
     parser.add_argument("--odl-iters", type=int, default=0)
@@ -286,7 +287,12 @@ def main():
         model.edit = None
         return (ref.exp() * (ref - lp)).sum(-1).mean()
 
-    if args.odl_iters > 0:
+    if args.resume_frames:
+        saved = torch.load(args.resume_frames, map_location=dev)
+        for key in frames:
+            frames[key] = saved[f"{key[0]}:{key[1]}"].to(dev)
+        print(f"[frame4l] resumed frames from {args.resume_frames}", flush=True)
+    if args.odl_iters > 0 and not args.resume_frames:
         # Sequential orthogonal dictionary learning: in network order, on the stream as it arrives with every
         # upstream matrix already restricted, alternate (a) each row coded by its top-L atom groups of the current
         # orthogonal frame and (b) the frame updated by orthogonal Procrustes, X = polar(S^T D), which minimizes
