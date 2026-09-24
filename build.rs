@@ -4802,12 +4802,38 @@ fn is_append_only_release_log(rel: &Path) -> bool {
     rel == Path::new("CHANGELOG.md")
 }
 
+/// Whether a tracked file is binary, classified as git classifies a diff: a NUL
+/// byte among its first 8000 bytes.
+///
+/// A binary file has no lines. Its newline bytes are pixel or payload data, and
+/// there is nothing in it to split by cohesive concern, so the line-count gate
+/// cannot apply to it: a 2.9 MB PNG figure (`experiments/issue-2951/figures/`)
+/// read as 11011 "lines" and failed every build of the workspace. Text files,
+/// data shards included, are still counted.
+fn is_binary_file(path: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let mut head = Vec::with_capacity(8000);
+    fs::File::open(path)?.take(8000).read_to_end(&mut head)?;
+    Ok(head.contains(&0))
+}
+
 fn scan_for_oversized_tracked_files(root: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
     for rel in collect_repo_files(root) {
         if is_generated_lockfile(&rel) || is_append_only_release_log(&rel) {
             continue;
         }
         let path = root.join(rel);
+        match is_binary_file(&path) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                panic!(
+                    "failed to read repo file for line-count audit: {}: {err}",
+                    rel.display()
+                )
+            }
+        }
         let line_count = match count_file_lines(&path) {
             Ok(line_count) => line_count,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
