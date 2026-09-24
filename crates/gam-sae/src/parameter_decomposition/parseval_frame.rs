@@ -39,7 +39,7 @@
 //! every piece by that coordinate's sign, `P_k ↦ D P_k D`, so an unnormalized QR is not
 //! a retraction of this decomposition. The step size and the cotangent belong to the
 //! caller (the objective is the model's own divergence, executed outside this crate).
-use gam_linalg::faer_ndarray::{FaerLinalgError, FaerQr};
+use gam_linalg::faer_ndarray::{FaerLinalgError, FaerQr, FaerSvd};
 use ndarray::{Array2, ArrayView2, Axis, s};
 use std::fmt;
 
@@ -58,6 +58,10 @@ pub enum FrameSide {
 /// Why a frame could not be built or applied.
 #[derive(Debug)]
 pub enum FrameError {
+    /// The dictionary alternation increased its residual, which exact alternation cannot do.
+    NotMonotone { residual_trace: Vec<f64> },
+    /// The SVD owner failed.
+    Svd(String),
     /// `X` is not `Km × d` for the declared atom dimension and side.
     Shape { rows: usize, cols: usize, atom_dim: usize, side_dim: usize },
     /// `X` is not Parseval within its roundoff band.
@@ -90,6 +94,11 @@ impl fmt::Display for FrameError {
                 write!(f, "parseval_frame: {active} active pieces requested of {atoms}")
             }
             Self::Qr(error) => write!(f, "parseval_frame: QR failed: {error}"),
+            Self::NotMonotone { residual_trace } => write!(
+                f,
+                "parseval_frame: dictionary alternation increased its residual: {residual_trace:?}"
+            ),
+            Self::Svd(error) => write!(f, "parseval_frame: SVD failed: {error}"),
             Self::Apply(error) => write!(f, "parseval_frame: {error}"),
             Self::Lift(error) => write!(f, "parseval_frame: {error}"),
         }
@@ -370,6 +379,70 @@ pub fn qr_retract(frame: ArrayView2<'_, f64>, step: ArrayView2<'_, f64>) -> Resu
     Ok(q)
 }
 
+/// Orthogonal dictionary learning of a complete frame on a bank of rows `D` (`n × d`):
+/// alternate (a) each row coded by its `active` highest-energy atom groups of the current
+/// frame, `S = mask ⊙ (D Xᵀ)`, and (b) the orthogonal Procrustes update
+/// `X = polar(Sᵀ D)`, the orthogonal matrix nearest `Sᵀ D`, which minimizes
+/// `‖D − S X‖_F` over `O(d)` for the fixed codes. Step (a) is the exact minimizer over
+/// `active`-sparse codes for a fixed orthogonal frame (Parseval: the error is the dropped
+/// energy), so the residual never increases; an increase beyond roundoff is refused.
+/// Stops at a fixed point of the selection. Returns the frame and the residual trace.
+pub fn orthogonal_dictionary_fit(
+    bank: ArrayView2<'_, f64>,
+    start: ArrayView2<'_, f64>,
+    atom_dim: usize,
+    active: usize,
+) -> Result<(Array2<f64>, Vec<f64>), FrameError> {
+    let (n, d) = bank.dim();
+    if start.dim() != (d, d) || atom_dim == 0 || d % atom_dim != 0 {
+        return Err(FrameError::Shape { rows: start.nrows(), cols: start.ncols(), atom_dim, side_dim: d });
+    }
+    let k = d / atom_dim;
+    if active > k {
+        return Err(FrameError::TooManyActive { active, atoms: k });
+    }
+    let mut frame = start.to_owned();
+    let mut trace = Vec::new();
+    let mut previous: Option<Vec<Vec<usize>>> = None;
+    let energy_total: f64 = bank.iter().map(|v| v * v).sum();
+    loop {
+        let coords = bank.dot(&frame.t()); // n × d
+        let mut codes = Array2::<f64>::zeros((n, d));
+        let mut selection = Vec::with_capacity(n);
+        let mut kept = 0.0;
+        for (i, row) in coords.outer_iter().enumerate() {
+            let mut energy: Vec<(usize, f64)> = (0..k)
+                .map(|a| (a, row.slice(s![a * atom_dim..(a + 1) * atom_dim]).iter().map(|v| v * v).sum()))
+                .collect();
+            energy.sort_by(|x, y| y.1.total_cmp(&x.1).then(x.0.cmp(&y.0)));
+            let mut chosen: Vec<usize> = energy.iter().take(active).map(|e| e.0).collect();
+            chosen.sort_unstable();
+            for &a in &chosen {
+                let (lo, hi) = (a * atom_dim, (a + 1) * atom_dim);
+                codes.slice_mut(s![i, lo..hi]).assign(&row.slice(s![lo..hi]));
+            }
+            kept += energy.iter().take(active).map(|e| e.1).sum::<f64>();
+            selection.push(chosen);
+        }
+        let residual = (energy_total - kept).max(0.0);
+        if let Some(&last) = trace.last() {
+            let band = 64.0 * f64::EPSILON * energy_total * (n.max(d) as f64);
+            if residual > last + band {
+                trace.push(residual);
+                return Err(FrameError::NotMonotone { residual_trace: trace });
+            }
+        }
+        trace.push(residual);
+        if previous.as_ref() == Some(&selection) {
+            return Ok((frame, trace));
+        }
+        previous = Some(selection);
+        let target = codes.t().dot(&bank); // d × d
+        let (u, _, vt) = target.svd(true, true).map_err(|e| FrameError::Svd(e.to_string()))?;
+        frame = u.expect("requested").dot(&vt.expect("requested"));
+    }
+}
+
 /// A Parseval frame with the standard basis of `d` as its first `d` rows (atoms group
 /// consecutive coordinates `m` at a time) and, when `overcomplete`, a rotated copy
 /// `R` below it, the whole scaled by `1/√2`: `Xᵀ X = (I + Rᵀ R)/2 = I` exactly for
@@ -474,6 +547,34 @@ mod tests {
         assert!(gram_defect(y.view()) <= parseval_band(12, 5));
         let moved = (&y - &x).iter().map(|v| v.abs()).fold(0.0, f64::max);
         assert!(moved <= 1e-5, "a 1e-6 step moved the frame by {moved:e}");
+    }
+
+    /// Rows exactly `active`-sparse in a planted rotation: the alternation's residual never
+    /// increases, stops at a fixed point, and ends no worse than the planted frame's own
+    /// residual when started from it; from the identity it strictly improves.
+    #[test]
+    fn orthogonal_dictionary_fit_is_monotone_and_finds_sparse_rotation() {
+        let mut rng = StdRng::seed_from_u64(6);
+        let (n, d, m, active) = (400, 8, 2, 1);
+        let planted = stiefel(&mut rng, d, d);
+        let mut bank = Array2::<f64>::zeros((n, d));
+        for i in 0..n {
+            let a = i % (d / m);
+            let c = gaussian(&mut rng, 1, m);
+            let mut code = Array2::<f64>::zeros((1, d));
+            code.slice_mut(s![0, a * m..(a + 1) * m]).assign(&c.row(0));
+            bank.row_mut(i).assign(&code.dot(&planted).row(0));
+        }
+        let energy: f64 = bank.iter().map(|v| v * v).sum();
+        let (_, from_planted) = orthogonal_dictionary_fit(bank.view(), planted.view(), m, active).unwrap();
+        // the residual is total minus kept energy, so its roundoff floor is that subtraction's
+        let floor = (n * d) as f64 * f64::EPSILON * energy;
+        assert!(*from_planted.last().unwrap() <= floor, "{from_planted:?} vs floor {floor:e}");
+        let (_, trace) = orthogonal_dictionary_fit(bank.view(), Array2::<f64>::eye(d).view(), m, active).unwrap();
+        for w in trace.windows(2) {
+            assert!(w[1] <= w[0] + 1e-9 * energy, "{trace:?}");
+        }
+        assert!(trace.last().unwrap() < trace.first().unwrap(), "{trace:?}");
     }
 
     /// The neuron frame is Parseval with and without its rotated copy.
