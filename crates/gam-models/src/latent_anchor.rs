@@ -1639,7 +1639,213 @@ pub(crate) struct AnchorTaylor {
 /// The order-six solve (gam#2945) runs the order-five one's arithmetic
 /// unchanged and adds degree six after it, so its orders through five are the
 /// order-five table's bits.
+/// The bits of the anchor's own scale, `1 + |α|`, that every coefficient of
+/// the linear-space table must be accurate to for the table to be published
+/// from it. The degree-by-degree solve forms each coefficient as a sum whose
+/// terms are Hermite moments, `F^{(n)}(η) = (−1)^n He_{n−1}(η) φ(η)`, growing
+/// like `η^{n−1}` while the coefficient is `O(1)` or smaller: the sum cancels,
+/// and the rounding it carries is `ε` times the sum of the terms' magnitudes,
+/// propagated here through every product and quotient of the solve. The bound
+/// is absolute on the anchor's scale because that is how the table is read:
+/// a row derivative is a Faà di Bruno sum of the coefficients with `O(1)`
+/// weights, and the certificates that read it judge that sum against its own
+/// rounding, so an absolute error at this level below `1 + |α|` is below
+/// every band the table feeds. Where the linear solve does not reach it the
+/// table is solved in logarithms instead ([`anchor_taylor_coefficients_log`],
+/// gam#3639), whose coefficients are `O(1)` at every order: at a tail index
+/// the linear sum cancels `He_4(39)/5! ≈ 2e4` down to `5e-10` — thirteen
+/// orders, no bits — and the log table is the only one with digits; inside
+/// the law's bulk the linear solve reaches this at a twentieth of the log
+/// table's arithmetic, which is most of a marginal-slope fit's time (gnomon
+/// biobank, 16k rows: 5451 against 1328 CPU-seconds).
+const LINEAR_TABLE_MIN_BITS: i32 = 32;
+
+/// The anchor's Taylor table in `(q, b)`: the linear-space solve where it keeps
+/// [`LINEAR_TABLE_MIN_BITS`] bits of every coefficient, the log-space solve
+/// where it does not.
 fn anchor_taylor_coefficients<const SLOTS: usize, const SLICES: usize>(
+    alpha: f64,
+    q: f64,
+    observed_slope: f64,
+    grid: AnchorGrid<'_>,
+) -> Result<[[f64; SLOTS]; SLOTS], String> {
+    const { assert!(SLICES == (SLOTS - 1) * (SLOTS - 2) / 2) };
+    // The path is decided on the order-six solve, whatever order is asked
+    // for, so the published order-five table and the order-six table that
+    // extends it (gam#2945) come from the same arithmetic.
+    if let Some(sixth) = anchor_taylor_coefficients_linear::<ANCHOR_SIXTH_SLOTS, SIXTH_POWER_SLICES>(
+        alpha,
+        q,
+        observed_slope,
+        grid,
+    )? {
+        // The order-`SLOTS − 1` table holds the total degrees below `SLOTS`.
+        let mut table = [[0.0_f64; SLOTS]; SLOTS];
+        for (i, row) in table.iter_mut().enumerate() {
+            for (j, slot) in row.iter_mut().enumerate().take(SLOTS - i) {
+                *slot = sixth[i][j];
+            }
+        }
+        return Ok(table);
+    }
+    anchor_taylor_coefficients_log::<SLOTS, SLICES>(alpha, q, observed_slope, grid)
+}
+
+/// The Hermite-moment (linear-space) table: `moments[n][s] = Σ_k ω_k u_k^s
+/// F^{(n)}(η_k)` under the law's density weights `ω_k` and the target
+/// `F^{(n)}(q)·φ(q)/D`, both homogeneous of degree zero in the density so they
+/// stay finite where every node's density underflows (gam#2941). `None` where
+/// the marginal tail is below the linear residual floor, where the target ratio
+/// is not a finite positive number, or where the solve keeps fewer than
+/// [`LINEAR_TABLE_MIN_BITS`] bits of some coefficient.
+fn anchor_taylor_coefficients_linear<const SLOTS: usize, const SLICES: usize>(
+    alpha: f64,
+    q: f64,
+    observed_slope: f64,
+    grid: AnchorGrid<'_>,
+) -> Result<Option<[[f64; SLOTS]; SLOTS]>, String> {
+    const { assert!(SLICES == (SLOTS - 1) * (SLOTS - 2) / 2) };
+    if smaller_tail_log_target(q) < LINEAR_RESIDUAL_FLOOR.ln() {
+        return Ok(None);
+    }
+    let density = AnchorDensity::at(alpha, observed_slope, grid)?;
+    // Every sum carries its magnitude beside it: the rounding of a floating
+    // sum is `ε` times the sum of its terms' magnitudes, and the bound below
+    // propagates that through every product and quotient of the solve, so the
+    // bits each coefficient keeps are the bits of the arithmetic that formed
+    // it, not of its last sum alone.
+    let mut moments = [[0.0_f64; SLOTS]; SLOTS];
+    let mut moments_magnitude = [[0.0_f64; SLOTS]; SLOTS];
+    for (&u, &omega) in grid.nodes.iter().zip(density.weights().iter()) {
+        let stack = survival_cdf_derivative_stack::<SLOTS>(alpha + observed_slope * u, omega);
+        let mut power = 1.0;
+        for s in 0..SLOTS {
+            for n in s.max(1)..SLOTS {
+                let term = stack[n] * power;
+                moments[n][s] += term;
+                moments_magnitude[n][s] += term.abs();
+            }
+            power *= u;
+        }
+    }
+    let h_alpha = moments[1][0];
+    if !(h_alpha.is_finite() && h_alpha < 0.0) {
+        return Ok(None);
+    }
+    let h_alpha_relative_error = f64::EPSILON * moments_magnitude[1][0] / h_alpha.abs();
+    // `φ(q)/D`, the density ratio the target is normalized by, from the same
+    // shifted log-space sum the anchor's first partials read.
+    let (ratio, _) = anchor_first_derivatives(alpha, q, observed_slope, grid)?;
+    if !(ratio.is_finite() && ratio > 0.0) {
+        return Ok(None);
+    }
+    let target = survival_cdf_derivative_stack::<SLOTS>(q, ratio);
+    let mut parts = [[0.0_f64; SLOTS]; SLOTS];
+    let mut parts_error = [[0.0_f64; SLOTS]; SLOTS];
+    let mut powers = [[0.0_f64; SLOTS]; SLICES];
+    let mut powers_error = [[0.0_f64; SLOTS]; SLICES];
+    let error_floor = 2.0_f64.powi(-LINEAR_TABLE_MIN_BITS) * (1.0 + alpha.abs());
+    for degree in 1..SLOTS {
+        for r in 2..=degree {
+            let mut power = [0.0_f64; SLOTS];
+            let mut power_error = [0.0_f64; SLOTS];
+            for j in 1..=degree + 1 - r {
+                let lower = degree - j;
+                let (right, right_error) = if r == 2 {
+                    (&parts[lower], &parts_error[lower])
+                } else {
+                    let slice = power_slice(r - 1, lower);
+                    (&powers[slice], &powers_error[slice])
+                };
+                for i1 in 0..=j {
+                    for i2 in 0..=lower {
+                        let product = parts[j][i1] * right[i2];
+                        power[i1 + i2] += product;
+                        power_error[i1 + i2] += parts_error[j][i1] * right[i2].abs()
+                            + parts[j][i1].abs() * right_error[i2]
+                            + f64::EPSILON * product.abs();
+                    }
+                }
+            }
+            powers[power_slice(r, degree)] = power;
+            powers_error[power_slice(r, degree)] = power_error;
+        }
+        let mut rest = [0.0_f64; SLOTS];
+        let mut rest_error = [0.0_f64; SLOTS];
+        rest[0] = moments[degree][degree] / FACTORIAL[degree];
+        rest_error[0] = f64::EPSILON * moments_magnitude[degree][degree] / FACTORIAL[degree];
+        let target_term = target[degree] / FACTORIAL[degree];
+        rest[degree] -= target_term;
+        rest_error[degree] += f64::EPSILON * target_term.abs();
+        for s in 0..degree {
+            let lower = degree - s;
+            for r in 1..=lower {
+                if (r, s) == (1, 0) {
+                    continue;
+                }
+                let scale = moments[r + s][s] / (FACTORIAL[r] * FACTORIAL[s]);
+                let scale_error =
+                    f64::EPSILON * moments_magnitude[r + s][s] / (FACTORIAL[r] * FACTORIAL[s]);
+                let (source, source_error) = if r == 1 {
+                    (&parts[lower], &parts_error[lower])
+                } else {
+                    let slice = power_slice(r, lower);
+                    (&powers[slice], &powers_error[slice])
+                };
+                for i in 0..=lower {
+                    let term = scale * source[i];
+                    rest[i] += term;
+                    rest_error[i] += scale_error * source[i].abs()
+                        + scale.abs() * source_error[i]
+                        + f64::EPSILON * term.abs();
+                }
+            }
+        }
+        for i in 0..=degree {
+            let part = -rest[i] / h_alpha;
+            let error = rest_error[i] / h_alpha.abs() + part.abs() * h_alpha_relative_error;
+            if !(error <= error_floor) {
+                return Ok(None);
+            }
+            parts[degree][i] = part;
+            parts_error[degree][i] = error;
+        }
+    }
+    let mut coefficients = [[0.0_f64; SLOTS]; SLOTS];
+    for (degree, part) in parts.iter().enumerate().skip(1) {
+        for i in 0..=degree {
+            coefficients[i][degree - i] = part[i];
+        }
+    }
+    coefficients[0][0] = alpha;
+    if !coefficients.iter().flatten().all(|c| c.is_finite()) {
+        return Ok(None);
+    }
+    Ok(Some(coefficients))
+}
+
+/// `F^{(n)}(x)·density` for `F(x) = Φ(−x)`, `n < SLOTS`: the Hermite moments
+/// `F^{(n)} = (−1)^n He_{n−1}(x) φ(x)` with `φ(x)` replaced by the caller's
+/// normalized density.
+#[inline]
+fn survival_cdf_derivative_stack<const SLOTS: usize>(x: f64, density: f64) -> [f64; SLOTS] {
+    const { assert!(SLOTS <= ANCHOR_SIXTH_SLOTS) };
+    let x2 = x * x;
+    let hermite = [
+        0.0,
+        -1.0,
+        x,
+        1.0 - x2,
+        x2 * x - 3.0 * x,
+        -(x2 * x2 - 6.0 * x2 + 3.0),
+        (x2 * x2 - 10.0 * x2 + 15.0) * x,
+    ];
+    std::array::from_fn(|n| hermite[n] * density)
+}
+
+/// The log-space table (gam#3639), for a tail index the linear table has no
+/// bits at.
+fn anchor_taylor_coefficients_log<const SLOTS: usize, const SLICES: usize>(
     alpha: f64,
     q: f64,
     observed_slope: f64,
@@ -1967,6 +2173,87 @@ mod anchor_tests {
     use gam_math::jet_scalar::{JetScalar, Order2};
     use gam_math::jet_tower::Tower4;
     use gam_math::probability::{normal_cdf, normal_pdf};
+
+    /// The linear-space table is published where it keeps its bits and agrees
+    /// with the log-space table there to those bits; at a tail index it has
+    /// none and steps aside for the log table (gam#3639).
+    #[test]
+    fn linear_table_keeps_its_bits_in_the_bulk_and_steps_aside_in_the_tail() {
+        let grid = skewed_grid();
+        let mut published_linear = 0;
+        for q in [-3.0_f64, -1.2, -0.3, 0.0, 0.4, 1.5, 3.0] {
+            for observed_slope in [0.05_f64, 0.4, 1.3] {
+                let alpha = solve_anchor(q, observed_slope, grid.view()).unwrap();
+                let log_table = anchor_taylor_coefficients_log::<TAYLOR_SLOTS, POWER_SLICES>(
+                    alpha,
+                    q,
+                    observed_slope,
+                    grid.view(),
+                )
+                .unwrap();
+                // The path is decided on the order-six solve, as the dispatcher decides it.
+                let Some(sixth) =
+                    anchor_taylor_coefficients_linear::<ANCHOR_SIXTH_SLOTS, SIXTH_POWER_SLICES>(
+                        alpha,
+                        q,
+                        observed_slope,
+                        grid.view(),
+                    )
+                    .unwrap()
+                else {
+                    continue;
+                };
+                let mut linear = [[0.0_f64; TAYLOR_SLOTS]; TAYLOR_SLOTS];
+                for i in 0..TAYLOR_SLOTS {
+                    for j in 0..TAYLOR_SLOTS - i {
+                        linear[i][j] = sixth[i][j];
+                    }
+                }
+                published_linear += 1;
+                let bar = 2.0_f64.powi(-LINEAR_TABLE_MIN_BITS) * (1.0 + alpha.abs());
+                for i in 0..TAYLOR_SLOTS {
+                    for j in 0..TAYLOR_SLOTS - i {
+                        let (a, b) = (linear[i][j], log_table[i][j]);
+                        assert!(
+                            (a - b).abs() <= bar,
+                            "q={q} b={observed_slope} coefficient ({i}, {j}): linear {a:e} vs log {b:e}"
+                        );
+                    }
+                }
+                let published = anchor_taylor_coefficients::<TAYLOR_SLOTS, POWER_SLICES>(
+                    alpha,
+                    q,
+                    observed_slope,
+                    grid.view(),
+                )
+                .unwrap();
+                for i in 0..TAYLOR_SLOTS {
+                    for j in 0..TAYLOR_SLOTS - i {
+                        assert_eq!(
+                            published[i][j].to_bits(),
+                            linear[i][j].to_bits(),
+                            "the published table is the linear one where it has its bits ({i}, {j})"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(published_linear >= 15, "the bulk publishes the linear table ({published_linear} of 21)");
+        let q = 39.0;
+        let observed_slope = 0.3;
+        let alpha = solve_anchor(q, observed_slope, grid.view()).unwrap();
+        assert!(
+            anchor_taylor_coefficients_linear::<ANCHOR_SIXTH_SLOTS, SIXTH_POWER_SLICES>(
+                alpha,
+                q,
+                observed_slope,
+                grid.view()
+            )
+            .unwrap()
+            .is_none(),
+            "a tail index has no linear-space bits"
+        );
+    }
 
     /// The implicit first partials of the anchor agree with the order-one
     /// entries of its Taylor table on a skewed law, on both sides of the
