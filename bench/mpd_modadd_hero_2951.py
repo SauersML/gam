@@ -89,6 +89,7 @@ def main():
     parser.add_argument("--run", required=True)
     parser.add_argument("--samples", type=int, default=1200)
     parser.add_argument("--early-step", type=int, default=2000)
+    parser.add_argument("--bare", action="store_true", help="the two discs alone, no text but the step under each")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
     run = torch.load(args.run, map_location="cpu", weights_only=True)
@@ -111,6 +112,26 @@ def main():
     logs = np.log10(np.clip(np.concatenate([turning, memorized]), 1e-300, 1.0))
     norm = matplotlib.colors.Normalize(vmin=float(np.quantile(logs, 0.01)), vmax=0.0)
     cmap = plt.get_cmap("magma")
+    if args.bare:
+        fig = plt.figure(figsize=(16, 8.4), facecolor=INK)
+        for left, probs, label in ((0.02, turning, "Grokked"), (0.51, memorized, "Memorized")):
+            ax = fig.add_axes([left, 0.02, 0.47, 0.84], projection="polar")
+            theta = 2 * np.pi * (np.arange(p + 1) - 0.5) / p
+            radius = 0.22 + 0.78 * np.append(ts, ts[-1] + (ts[1] - ts[0])) / ts.max()
+            T, R = np.meshgrid(theta, radius)
+            ax.pcolormesh(T, R, np.log10(np.clip(probs, 1e-300, 1.0)), cmap=cmap, norm=norm, shading="flat", rasterized=True)
+            ax.set_ylim(0, 1.02)
+            ax.set_facecolor(INK)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.spines["polar"].set_visible(False)
+            ax.set_theta_zero_location("N")
+            ax.set_theta_direction(-1)
+            ax.text(0.5, 1.035, label, transform=ax.transAxes, ha="center", va="bottom", color="white",
+                    fontsize=40, fontweight="light")
+        fig.savefig(args.out, dpi=220, facecolor=INK)
+        print(f"[hero] wrote {args.out}", flush=True)
+        return
     fig = plt.figure(figsize=(16, 11), facecolor=INK)
     ax1 = fig.add_axes([0.035, 0.32, 0.44, 0.555], projection="polar")
     ax2 = fig.add_axes([0.525, 0.32, 0.44, 0.555], projection="polar")
