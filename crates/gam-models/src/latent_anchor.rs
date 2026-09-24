@@ -1428,6 +1428,11 @@ pub(crate) struct AnchorDerivatives {
 /// so a weight keeps its digits where `½η²` alone would round them away.
 pub(crate) struct AnchorDensity {
     weights: SmallVec<[f64; 128]>,
+    /// `log w_*`, `η_*` and `log Σ_k exp(·)` of the shifted sum, so the density
+    /// ratio `φ(q)/D` at any `q` is one exponential of the same pass.
+    heaviest_log_weight: f64,
+    heaviest_eta: f64,
+    log_relative_sum: f64,
 }
 
 impl AnchorDensity {
@@ -1469,13 +1474,28 @@ impl AnchorDensity {
         for weight in weights.iter_mut() {
             *weight /= sum;
         }
-        Ok(Self { weights })
+        Ok(Self {
+            weights,
+            heaviest_log_weight,
+            heaviest_eta,
+            log_relative_sum: sum.ln(),
+        })
     }
 
     /// `ω_k`, in the law's node order.
     #[inline]
     pub(crate) fn weights(&self) -> &[f64] {
         &self.weights
+    }
+
+    /// `log(φ(q)/D)` with `D = Σ_k w_k φ(η_k)`: the `√(2π)` cancels, and the
+    /// difference of squares is formed against the heaviest node as the
+    /// weights were.
+    #[inline]
+    pub(crate) fn log_density_ratio(&self, q: f64) -> f64 {
+        -self.heaviest_log_weight
+            - self.log_relative_sum
+            - 0.5 * (q - self.heaviest_eta) * (q + self.heaviest_eta)
     }
 
 }
@@ -1739,9 +1759,9 @@ fn anchor_taylor_coefficients_linear<const SLOTS: usize, const SLICES: usize>(
         return Ok((refused, Some(1)));
     }
     let h_alpha_relative_error = f64::EPSILON * moments_magnitude[1][0] / h_alpha.abs();
-    // `φ(q)/D`, the density ratio the target is normalized by, from the same
-    // shifted log-space sum the anchor's first partials read.
-    let (ratio, _) = anchor_first_derivatives(alpha, q, observed_slope, grid)?;
+    // `φ(q)/D`, the density ratio the target is normalized by, from the pass
+    // that formed the weights.
+    let ratio = density.log_density_ratio(q).exp();
     if !(ratio.is_finite() && ratio > 0.0) {
         return Ok((refused, Some(1)));
     }
