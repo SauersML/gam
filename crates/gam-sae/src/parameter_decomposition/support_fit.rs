@@ -34,8 +34,11 @@
 //!    is). Slack opened here lets step 1 remove more.
 //!
 //! Within one fidelity level, supports never regain a piece and `θ` never leaves the
-//! admissible set, so the kept count is non-increasing; the level ends at the first
-//! alternation whose support step removes nothing.
+//! admissible set, so the kept count is non-increasing. Each alternation takes one
+//! trust-region iteration resumed from the previous one (its radius and certificate
+//! scale carried), so the pieces never converge to the centre for supports the next
+//! search replaces. The level ends when the supports stop shrinking and the
+//! certificate holds: the fit comes only from a converged optimization.
 //!
 //! # Continuation in the fidelity
 //!
@@ -52,7 +55,7 @@
 //! The executor runs the model: per-position divergences, and the three products
 //! above. The barrier, its weights, the trust region and the stopping rule live here.
 use gam_geometry::manifolds::euclidean::EuclideanManifold;
-use gam_geometry::{GeometryError, GeometryResult, RiemannianObjective, RiemannianTrustRegion};
+use gam_geometry::{GeometryError, GeometryResult, RiemannianObjective, RiemannianTrustRegion, TrustRegionTermination};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use std::fmt;
 
@@ -244,29 +247,51 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
         let fidelity = form(level);
         let mut current = minimal_support(&mut AtTheta { executor: &mut *executor, theta: theta.view() }, positions, pieces, fidelity, sequence, Some(keep.clone()))
             .map_err(SupportFitError::Support)?;
+        // One resumed trust-region iteration per alternation: the supports the barrier
+        // holds fixed are re-decided between iterations, and the resume keeps the
+        // learned radius and the certificate's scale. The level ends only when the
+        // supports stop shrinking and the certificate holds, so every level (and the
+        // fit) comes from a converged optimization.
+        let step = RiemannianTrustRegion { max_iter: 1, ..RiemannianTrustRegion::default() };
+        let mut state: Option<TrustRegionTermination> = None;
         loop {
             let kept_before = current.keep.iter().filter(|&&k| k).count();
             let at = current.keep.clone();
-            let (point, before, after, iterations, certified) = {
+            let (termination, before, after) = {
                 let mut barrier = Barrier { executor: &mut *executor, keep: &at, fidelity, error: None };
                 let before = barrier.value_gradient(theta.view()).map_err(SupportFitError::Geometry)?.0;
-                let termination = RiemannianTrustRegion::default().minimize_reporting_termination(&manifold, &mut barrier, theta.view());
+                let termination = match &state {
+                    None => step.minimize_reporting_termination(&manifold, &mut barrier, theta.view()),
+                    Some(previous) => step.resume(
+                        &manifold,
+                        &mut barrier,
+                        &TrustRegionTermination { point: theta.clone(), ..previous.clone() },
+                    ),
+                };
                 if let Some(e) = barrier.error.take() {
                     return Err(SupportFitError::Executor(e));
                 }
                 let termination = termination.map_err(SupportFitError::Geometry)?;
                 let after = barrier.value_gradient(termination.point.view()).map_err(SupportFitError::Geometry)?.0;
-                let certified = termination.residual <= termination.tolerance;
-                (termination.point, before, after, termination.iterations, certified)
+                (termination, before, after)
             };
-            theta = point;
+            theta = termination.point.clone();
+            let certified = termination.residual <= termination.tolerance;
             current = minimal_support(&mut AtTheta { executor: &mut *executor, theta: theta.view() }, positions, pieces, fidelity, sequence, Some(at))
                 .map_err(SupportFitError::Support)?;
             let kept = current.keep.iter().filter(|&&k| k).count();
-            alternations.push(Alternation { level, kept, barrier_before: before, barrier_after: after, iterations, certified });
-            if kept >= kept_before {
+            alternations.push(Alternation {
+                level,
+                kept,
+                barrier_before: before,
+                barrier_after: after,
+                iterations: termination.iterations,
+                certified,
+            });
+            if kept >= kept_before && certified {
                 break;
             }
+            state = Some(termination);
         }
         keep = current.keep.clone();
         supports = Some(current);

@@ -57,6 +57,11 @@ pub struct TrustRegionTermination {
     pub residual: f64,
     /// The bound `residual` was compared against.
     pub tolerance: f64,
+    /// The trust radius the next iteration would use.
+    pub radius: f64,
+    /// The gradient norm the certificate is scaled by (the first run's across
+    /// resumes).
+    pub stationarity_reference: f64,
 }
 
 impl TrustRegionTermination {
@@ -136,12 +141,38 @@ impl RiemannianTrustRegion {
         objective: &mut dyn RiemannianObjective,
         initial: ArrayView1<'_, f64>,
     ) -> GeometryResult<TrustRegionTermination> {
+        self.run(manifold, objective, initial, self.radius, None)
+    }
+
+    /// Continue the solve a [`TrustRegionTermination`] reports, for this solver's
+    /// iteration budget: from its point, at its radius, with its certificate scale.
+    /// A solve split into resumed pieces takes the same steps as one uninterrupted
+    /// solve, so a caller can interleave other work (re-deciding what the objective
+    /// holds fixed) between iterations without relearning the step scale or moving
+    /// the certificate's reference.
+    pub fn resume(
+        &self,
+        manifold: &dyn RiemannianManifold,
+        objective: &mut dyn RiemannianObjective,
+        from: &TrustRegionTermination,
+    ) -> GeometryResult<TrustRegionTermination> {
+        self.run(manifold, objective, from.point.view(), from.radius, Some(from.stationarity_reference))
+    }
+
+    fn run(
+        &self,
+        manifold: &dyn RiemannianManifold,
+        objective: &mut dyn RiemannianObjective,
+        initial: ArrayView1<'_, f64>,
+        radius: f64,
+        stationarity_reference: Option<f64>,
+    ) -> GeometryResult<TrustRegionTermination> {
         let solver = opt::RiemannianTrustRegion {
-            radius: self.radius,
+            radius,
             max_radius: self.max_radius,
             max_iter: self.max_iter,
             grad_tol: self.grad_tol,
-            stationarity_reference: None,
+            stationarity_reference,
         };
         let termination = solver
             .minimize(
@@ -155,6 +186,8 @@ impl RiemannianTrustRegion {
             iterations: termination.iterations,
             residual: termination.residual,
             tolerance: termination.tolerance,
+            radius: termination.radius,
+            stationarity_reference: termination.stationarity_reference,
         })
     }
 }
