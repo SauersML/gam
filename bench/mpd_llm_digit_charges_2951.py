@@ -144,7 +144,7 @@ def main():
                 F = harmonics(lp)
                 gains.append((F * F0.conj()).sum(0) / F0.abs().pow(2).sum(0))
             g = torch.stack(gains).cpu()  # M x 5
-            basis = torch.tensor([[complex(math.cos(n * t), math.sin(n * t)) for t in thetas] for n in charges])
+            basis = torch.tensor([[complex(math.cos(n * t), math.sin(n * t)) for t in thetas] for n in charges], dtype=torch.complex128)
             spec = basis @ g / M  # charges x 5
             entry = {}
             for jj in range(5):

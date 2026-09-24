@@ -105,7 +105,7 @@ def main():
     M = args.angles
     thetas = [2 * math.pi * m / M for m in range(M)]
     charges = list(range(-(M // 2) + 1, M // 2))
-    basis = torch.tensor([[complex(math.cos(q * t), math.sin(q * t)) for t in thetas] for q in charges])
+    basis = torch.tensor([[complex(math.cos(q * t), math.sin(q * t)) for t in thetas] for q in charges], dtype=torch.complex128)
     for layer in layers:
         handle = blocks[layer].register_forward_hook(hook)
         try:
