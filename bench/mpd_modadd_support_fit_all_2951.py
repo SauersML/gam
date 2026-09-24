@@ -4,9 +4,16 @@ Thin torch executor for ``gamfit.sae.fit_supports`` (SPEC 8: the fit's owner is 
 model and its derivatives, and scores the result against the known mechanism).
 
 Every weight map the model applies is split on its input side into rank-one pieces that sum to it exactly for every
-parameter value (analysis ``V``, synthesis ``S = V^+ + Y (I - V V^+)``): the stacked query, key and value maps and the
-output map (K = 128, starting at each map's own singular decomposition), the MLP input (K = 512, starting at the
-neurons' read directions) and the MLP output (K = 512, the neuron basis its input lives in). One example is one position.
+parameter value: the stacked query, key and value maps and the output map (K = 128, starting at each map's own
+singular decomposition), the MLP input (K = 512, starting at the tight frame nearest the neurons' read directions) and
+the MLP output (K = 512, the neuron basis its input lives in). One example is one position.
+
+``--pieces frame`` (the default) keeps every map's pieces a tight frame: analysis ``V = A L^{-T}`` with ``A^T A = L L^T``
+(so ``V^T V = I`` for every unconstrained ``A``) and synthesis ``S = V^T``. Then any partial removal ``0 <= D <= I`` of
+pieces takes out ``W V^T D V``, never more than ``W`` itself: pieces cannot cancel one another. ``--pieces dual``
+is the general exact split (``S = V^+ + Y (I - V V^+)``), where they can: on this model the fit drove the MLP-input
+analysis toward singularity (condition number 2.5e3 at the start, 2.3e5 within three minutes), and from the full
+support no single piece could be removed at a mean budget of 1.28 nats.
 
 Scored against the known mechanism, which the fit never sees: the key Fourier planes of the embedding (the frequencies
 carrying most of its power). For the residual-stream reads (query, key, value and MLP-input pieces), the fraction of
@@ -33,6 +40,7 @@ def main():
     parser.add_argument("--fit-examples", type=int, required=True)
     parser.add_argument("--heldout-examples", type=int, required=True)
     parser.add_argument("--eps", type=float, required=True)
+    parser.add_argument("--pieces", choices=("frame", "dual"), default="frame")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
     from gamfit.sae import fit_supports, minimal_support
@@ -53,7 +61,10 @@ def main():
         offsets[n] = (o, o + K[n])
         o += K[n]
     C = o
-    shapes = [(n, "V", (K[n], maps[n].shape[1])) for n in names] + [(n, "Y", (maps[n].shape[1], K[n])) for n in names]
+    frame = args.pieces == "frame"
+    shapes = [(n, "V", (K[n], maps[n].shape[1])) for n in names]
+    if not frame:
+        shapes += [(n, "Y", (maps[n].shape[1], K[n])) for n in names]
     sizes = [a * b for *_, (a, b) in shapes]
 
     def initial_theta():
@@ -62,7 +73,12 @@ def main():
             if kind == "Y":
                 parts.append(torch.zeros(a, b))
             elif n == "in":
-                parts.append(model.W_in / model.W_in.norm(dim=1, keepdim=True))
+                reads = model.W_in / model.W_in.norm(dim=1, keepdim=True)
+                if frame:
+                    # the tight frame nearest the reads: their polar factor
+                    u, _, vt = torch.linalg.svd(reads, full_matrices=False)
+                    reads = u @ vt
+                parts.append(reads)
             elif n == "out":
                 parts.append(torch.eye(a, b))
             else:
@@ -80,9 +96,15 @@ def main():
         P = unpack(theta)
 
         def apply(n, x):
-            V, Y = P[(n, "V")], P[(n, "Y")]
-            Vp = torch.linalg.solve(V.T @ V, V.T)
-            S = Vp + Y - (Y @ V) @ Vp
+            if frame:
+                A = P[(n, "V")]
+                L = torch.linalg.cholesky(A.T @ A)
+                V = torch.linalg.solve_triangular(L, A.T, upper=False).T
+                S = V.T
+            else:
+                V, Y = P[(n, "V")], P[(n, "Y")]
+                Vp = torch.linalg.solve(V.T @ V, V.T)
+                S = Vp + Y - (Y @ V) @ Vp
             s0, s1 = offsets[n]
             mask = m[:, s0:s1] if x.dim() == 2 else m[:, None, s0:s1]
             return ((x @ V.T) * mask) @ (maps[n] @ S).T
@@ -187,6 +209,8 @@ def main():
         for n in ("q", "k", "v", "in"):
             s0, s1 = offsets[n]
             Vn = V[(n, "V")]
+            if frame:
+                Vn = torch.linalg.solve_triangular(torch.linalg.cholesky(Vn.T @ Vn), Vn.T, upper=False).T
             for c in np.argsort(-used[s0:s1])[:20]:
                 r = Vn[c] / Vn[c].norm()
                 rows.append(float((basis.T @ r).norm() ** 2))

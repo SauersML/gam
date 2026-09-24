@@ -4,14 +4,19 @@ Thin torch executor for ``gamfit.sae.fit_supports`` (SPEC 8: the barrier, trust 
 rule are the Rust owner's; this file only runs the model and its derivatives).
 
 Every matrix ``W`` (out x in) of q, k, v, o, c_fc and down_proj in every layer is split on its input side by an analysis
-``V`` (K x in, rows are reads) and the synthesis ``S = V^+ + Y (I - V V^+)`` (in x K), so ``S V = I`` and ``W = W S V``
-exactly for every ``(V, Y)``. Piece c of ``W`` reads ``v_c . x`` and writes ``W s_c``: a rank-one piece, the unit VPD
+``V`` (K x in, rows are reads) and a synthesis ``S`` (in x K) with ``S V = I``, so ``W = W S V`` exactly for every
+parameter value. ``--pieces frame`` keeps every matrix's pieces a tight frame: ``V = A L^{-T}`` with
+``A^T A = L L^T`` for an unconstrained ``A`` (so ``V^T V = I``) and ``S = V^T``; any partial removal ``0 <= D <= I``
+of pieces then takes out ``W V^T D V``, never more than ``W``, so pieces cannot cancel one another.
+``--pieces dual`` is the general split ``S = V^+ + Y (I - V V^+)``, where they can (on the modular-addition model the
+fit drove an overcomplete analysis toward singularity, condition number 2.5e3 to 2.3e5, and from the full support no
+single piece was removable). Piece c of ``W`` reads ``v_c . x`` and writes ``W s_c``: a rank-one piece, the unit VPD
 counts, so rank units here are VPD's L0. Nothing is pinned: the elementwise GELU fixes only that c_fc's output feeds
 it, and RoPE acts after the query and key projections, so any split of any matrix is exact. Starting pieces and counts
 come from the architecture and reproduce VPD's own component counts: q, k, v, o start at their own singular
 decomposition (reads = right singular vectors, K = 768: the matrix's exact rank-one split, where the residual stream's
 coordinate axes would mean nothing to it); c_fc at the neurons' normalized read directions (K = 3072; VPD's
-neuron-aligned start); down_proj at the neuron basis its input lives in (K = 3072). 36,864 pieces per position in all, VPD's C. Masks act at the position the matrix is applied at, and
+neuron-aligned start), or under ``frame`` the tight frame nearest them (their polar factor); down_proj at the neuron basis its input lives in (K = 3072). 36,864 pieces per position in all, VPD's C. Masks act at the position the matrix is applied at, and
 KL is under joint masking (VPD's semantics).
 """
 from __future__ import annotations
@@ -32,8 +37,9 @@ MATS = ("q", "k", "v", "o", "fc", "down")
 
 
 class AllPieces:
-    def __init__(self, base: Pieces):
+    def __init__(self, base: Pieces, frame: bool):
         self.b = base
+        self.frame = frame
         w, L = base.w, base.L
         self.names = {"q": "attn.q_proj.weight", "k": "attn.k_proj.weight", "v": "attn.v_proj.weight",
                       "o": "attn.o_proj.weight", "fc": "mlp.c_fc.weight", "down": "mlp.down_proj.weight"}
@@ -44,7 +50,8 @@ class AllPieces:
                 K = W.shape[1] if m in ("q", "k", "v", "o", "down") else W.shape[0]
                 self.K[(l, m)] = K
                 self.shapes.append((l, m, "V", (K, W.shape[1])))
-                self.shapes.append((l, m, "Y", (W.shape[1], K)))
+                if not frame:
+                    self.shapes.append((l, m, "Y", (W.shape[1], K)))
         self.sizes = [a * c for *_, (a, c) in self.shapes]
         self.offsets = {}
         o = 0
@@ -62,7 +69,11 @@ class AllPieces:
                 parts.append(torch.zeros(a, c))
             elif m == "fc":
                 W = self.b.w[f"h.{l}.{self.names[m]}"].double().cpu()
-                parts.append(W / W.norm(dim=1, keepdim=True))
+                reads = W / W.norm(dim=1, keepdim=True)
+                if self.frame:
+                    u, _, vt = torch.linalg.svd(reads, full_matrices=False)
+                    reads = u @ vt
+                parts.append(reads)
             elif m == "down":
                 parts.append(torch.eye(a, c))
             else:
@@ -87,9 +98,14 @@ class AllPieces:
         causal = torch.ones(T, T, dtype=torch.bool, device=h.device).tril()
 
         def apply(l, m, x):
-            V, Y = P[(l, m, "V")], P[(l, m, "Y")]
-            Vp = torch.linalg.solve(V.T @ V, V.T)
-            S = Vp + Y - (Y @ V) @ Vp
+            if self.frame:
+                A = P[(l, m, "V")]
+                V = torch.linalg.solve_triangular(torch.linalg.cholesky(A.T @ A), A.T, upper=False).T
+                S = V.T
+            else:
+                V, Y = P[(l, m, "V")], P[(l, m, "Y")]
+                Vp = torch.linalg.solve(V.T @ V, V.T)
+                S = Vp + Y - (Y @ V) @ Vp
             s0, s1 = self.offsets[(l, m)]
             coef = (x @ V.T) * mask[..., s0:s1]
             return coef @ (w[f"h.{l}.{self.names[m]}"] @ S).T
@@ -116,12 +132,13 @@ def main():
     parser.add_argument("--form", choices=("per_position", "mean"), required=True)
     parser.add_argument("--heldout-seqs", type=int, required=True)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--pieces", choices=("frame", "dual"), default="frame")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
     from gamfit.sae import fit_supports, minimal_support
     dev = args.device
     torch.manual_seed(0)
-    model = AllPieces(Pieces(args.weights, dev))
+    model = AllPieces(Pieces(args.weights, dev), args.pieces == "frame")
     table = pq.read_table(args.test)
     ids = torch.tensor(table.slice(0, args.seqs).column("input_ids").to_pylist(), dtype=torch.long)[:, :args.ctx].to(dev)
     hids = torch.tensor(table.slice(args.seqs, args.heldout_seqs).column("input_ids").to_pylist(),
