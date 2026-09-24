@@ -89,9 +89,10 @@ class LargeScaleRunnerTests(unittest.TestCase):
         mean_formula, slope_formula = _RUNNER.rust_marginal_slope_formula_classification(spec, centers=20)
         self.assertIn("duchon(pc1_std, pc2_std", mean_formula)
         self.assertIn("centers=20", mean_formula)
-        self.assertIn("order=0", mean_formula)
-        self.assertIn("power=9", mean_formula)
-        self.assertIn("length_scale=1", mean_formula)
+        # The runner uses gam's scale-free default Duchon kernel: no hard-coded order, power or
+        # length scale on the joint PC smooth (8d19bd5ec7).
+        for option in ("order=", "power=", "length_scale="):
+            self.assertNotIn(option, mean_formula)
         self.assertNotIn("pgs_ctn_z", mean_formula)
         self.assertIn("linkwiggle(internal_knots=8)", mean_formula)
         self.assertIn("linkwiggle(internal_knots=7)", slope_formula)
@@ -117,7 +118,7 @@ class LargeScaleRunnerTests(unittest.TestCase):
         )
         self.assertEqual(report.status, "PASS")
         text = "\n".join(report.lines)
-        self.assertIn("Duchon tuple: order=0, power=9, length_scale=1", text)
+        self.assertIn("Duchon kernel: gam's scale-free default (no order, power or length_scale)", text)
         self.assertIn("Duchon smooth: lazy chunked", text)
         self.assertIn("anisotropy derivatives: implicit streaming", text)
 
