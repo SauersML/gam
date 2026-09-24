@@ -3186,6 +3186,7 @@ mod flex_primary_hessian_oracle_tests {
             cell_moment_cache_stats: Arc::new(exact_kernel::CellMomentCacheStats::default()),
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            outer_start_levels: None,
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
 

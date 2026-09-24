@@ -267,6 +267,20 @@ impl FitConfig {
                 ));
             }
         }
+        if let Some(levels) = self.outer_start_levels.as_deref() {
+            if !super::materialize::requests_bernoulli_marginal_slope(&self) {
+                return Err(
+                    "outer_start_levels applies to Bernoulli marginal-slope fits only".to_string(),
+                );
+            }
+            if levels.is_empty() || levels.iter().any(|level| level.is_nan()) {
+                return Err(
+                    "outer_start_levels needs at least one level and no NaN; +inf names the \
+                     upper face of the search box"
+                        .to_string(),
+                );
+            }
+        }
         if self
             .persistent_warm_start_store
             .as_ref()

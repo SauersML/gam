@@ -153,6 +153,7 @@ fn check_fit(law: Law) {
         latent_z_policy: LatentZPolicy::default(),
         score_influence_jacobian: None,
         residual: None,
+        outer_start_levels: None,
         declared_latent_law: None,
     };
     let fit = fit_bernoulli_marginal_slope_terms(

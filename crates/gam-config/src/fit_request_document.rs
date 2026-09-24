@@ -201,6 +201,14 @@ pub struct FitRequestConfigDocument {
     /// (gam#2923, gam#2926): `{"nodes": [...], "weights": [...]}`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub declared_latent_law: Option<DeclaredLatentLawDocument>,
+    /// The common log-smoothing levels a Bernoulli marginal-slope fit searches
+    /// from beside its own derived start, one certified outer search each, the
+    /// lowest certified value published (gnomon#2359). `+inf` names the upper
+    /// face of the search box. Default: `[0, +inf, 2, 4, -2]`. Fewer levels
+    /// cost proportionally fewer searches; a level set that omits the basin a
+    /// study's data prefers publishes the best of the basins it does search.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outer_start_levels: Option<Vec<f64>>,
 }
 
 /// Ascending nodes and positive weights summing to one.

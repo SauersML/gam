@@ -202,6 +202,7 @@ fn mfixture(is_score_warp: bool) -> MFixture {
         cell_moment_cache_stats: new_cell_moment_cache_stats(),
         intercept_warm_starts: None,
         auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        outer_start_levels: None,
         auto_subsample_last_rho: Arc::new(Mutex::new(None)),
     };
     let primary = PrimarySlices {

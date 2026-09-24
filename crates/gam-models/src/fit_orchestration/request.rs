@@ -519,6 +519,10 @@ pub struct FitConfig {
     /// weights, the score is taken as supplied, and the law travels with the
     /// saved model. `None` leaves the measure to `latent_measure`.
     pub declared_latent_law: Option<DeclaredLatentLaw>,
+    /// The common log-smoothing levels a Bernoulli marginal-slope fit's
+    /// multistart searches from beside its derived start (gnomon#2359); `None`
+    /// is the family's own set `[0, +inf, 2, 4, -2]`.
+    pub outer_start_levels: Option<Vec<f64>>,
     /// Standalone CTN response-basis options, also used by predictive cross-fitting.
     pub transformation_normal_config: Option<TransformationNormalConfig>,
     /// Optional non-negative per-row training weights column.
@@ -695,6 +699,7 @@ impl Default for FitConfig {
             frozen_score: false,
             latent_measure: None,
             declared_latent_law: None,
+            outer_start_levels: None,
             transformation_normal_config: None,
             weight_column: None,
             expectile_tau: None,

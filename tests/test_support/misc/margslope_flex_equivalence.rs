@@ -173,6 +173,7 @@ pub fn build_large_scale_shape_problem(n: usize) -> LargeScaleShapeProblem {
             latent_z_policy: gam_test_support::synthetic::exploratory_fit_weighted_latent_z_policy(),
             score_influence_jacobian: None,
             residual: None,
+            outer_start_levels: None,
             declared_latent_law: None,
         },
     }

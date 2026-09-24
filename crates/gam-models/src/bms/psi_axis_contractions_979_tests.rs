@@ -82,6 +82,7 @@ fn rigid_psi_axis_contractions_match_the_materialized_tensors_979() {
         cell_moment_cache_stats: new_cell_moment_cache_stats(),
         intercept_warm_starts: None,
         auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        outer_start_levels: None,
         auto_subsample_last_rho: Arc::new(Mutex::new(None)),
     };
     let marginal_beta = Array1::from_vec(vec![-0.2, 0.3, -0.15, 0.1]);
@@ -228,6 +229,7 @@ fn flex_full_row_correction_traces_match_the_per_row_route_979() {
         cell_moment_cache_stats: new_cell_moment_cache_stats(),
         intercept_warm_starts: None,
         auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        outer_start_levels: None,
         auto_subsample_last_rho: Arc::new(Mutex::new(None)),
     };
     let marginal_beta = Array1::from_vec(vec![-0.2, 0.3, -0.15]);

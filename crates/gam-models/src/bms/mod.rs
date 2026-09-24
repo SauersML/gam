@@ -158,6 +158,9 @@ pub struct BernoulliMarginalSlopeTermSpec {
     /// and the law is persisted as the fit's latent measure. `None` leaves the
     /// law to `latent_z_policy`.
     pub declared_latent_law: Option<EmpiricalZGrid>,
+    /// The multistart's levels beside the derived start (gnomon#2359); `None`
+    /// is the family's own set.
+    pub outer_start_levels: Option<Vec<f64>>,
 }
 
 pub struct BernoulliMarginalSlopeFitResult {

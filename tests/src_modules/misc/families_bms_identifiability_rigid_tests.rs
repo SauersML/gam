@@ -123,6 +123,7 @@ fn default_test_family() -> BernoulliMarginalSlopeFamily {
         cell_moment_cache_stats: Arc::new(exact_kernel::CellMomentCacheStats::default()),
         intercept_warm_starts: None,
         auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        outer_start_levels: None,
         auto_subsample_last_rho: Arc::new(std::sync::Mutex::new(None)),
     }
 }
@@ -1153,6 +1154,7 @@ fn base_spec(
         latent_z_policy: LatentZPolicy::default(),
         score_influence_jacobian: None,
         residual: None,
+        outer_start_levels: None,
         declared_latent_law: None,
     }
 }
@@ -2419,6 +2421,7 @@ fn bernoulli_marginal_slope_rejects_nonprobit_base_link() {
         latent_z_policy: LatentZPolicy::default(),
         score_influence_jacobian: None,
         residual: None,
+        outer_start_levels: None,
         declared_latent_law: None,
     };
     let err = validate_spec(design.to_dense().view(), &spec)

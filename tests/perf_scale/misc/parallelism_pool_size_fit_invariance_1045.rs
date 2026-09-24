@@ -120,6 +120,7 @@ fn build(n: usize, centers: usize) -> (Array2<f64>, BernoulliMarginalSlopeTermSp
         latent_z_policy: gam_test_support::synthetic::exploratory_fit_weighted_latent_z_policy(),
         score_influence_jacobian: None,
         residual: None,
+        outer_start_levels: None,
         declared_latent_law: None,
     };
     (data, spec)

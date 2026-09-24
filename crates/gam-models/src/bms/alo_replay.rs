@@ -414,6 +414,7 @@ pub(crate) fn replay_saved_bernoulli_marginal_slope_alo(
         intercept_warm_starts: None,
         auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         auto_subsample_last_rho: Arc::new(std::sync::Mutex::new(None)),
+        outer_start_levels: None,
     };
     let slices = block_slices(&family);
     let primary = primary_slices(&slices);

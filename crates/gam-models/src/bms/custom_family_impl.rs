@@ -590,7 +590,9 @@ impl gam_model_api::families::custom_family::IndependentOuterSearch<BernoulliMar
     /// reach the second from the first; each of these starts gets its own full,
     /// certified search and the lowest certified value wins.
     fn additional_outer_start_levels(&self) -> Vec<f64> {
-        vec![0.0, f64::INFINITY, 2.0, 4.0, -2.0]
+        self.outer_start_levels
+            .clone()
+            .unwrap_or_else(|| super::family::DEFAULT_OUTER_START_LEVELS.to_vec())
     }
 }
 

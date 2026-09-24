@@ -3463,6 +3463,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
             intercept_warm_starts: Some(Arc::clone(&intercept_warm_starts)),
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            outer_start_levels: spec.outer_start_levels.clone(),
         }
     };
 

@@ -6,6 +6,13 @@ use crate::latent_anchor::{
 };
 use crate::wiggle::WarpKnotEnds;
 
+/// The levels a Bernoulli marginal-slope multistart searches from beside the
+/// fit's own derived start when the request names none (gnomon#2359): on that
+/// issue's 200-row calibration the derived start certified a basin 1.49 nats
+/// above the one `ρ = −2` reaches. Each is a common log-smoothing level for
+/// every coordinate; `+∞` is the upper face of the search box.
+pub(super) const DEFAULT_OUTER_START_LEVELS: [f64; 5] = [0.0, f64::INFINITY, 2.0, 4.0, -2.0];
+
 #[derive(Clone)]
 pub(super) struct BernoulliMarginalSlopeFamily {
     pub(super) y: Arc<Array1<f64>>,
@@ -71,6 +78,9 @@ pub(super) struct BernoulliMarginalSlopeFamily {
     /// updated atomically so two threads cannot both decide "new ρ" and
     /// double-bump.
     pub(super) auto_subsample_last_rho: Arc<Mutex<Option<Array1<f64>>>>,
+    /// The multistart's levels beside the derived start, when the request
+    /// chose them (gnomon#2359); `None` is [`DEFAULT_OUTER_START_LEVELS`].
+    pub(super) outer_start_levels: Option<Vec<f64>>,
     /// Whether this member's Jeffreys/Firth prior is armed. A fit arms it only
     /// on the unarmed route's own evidence: `fit_bernoulli_marginal_slope_terms`
     /// runs the whole route through `arm_on_evidence` (#979, #3164).

@@ -3135,6 +3135,7 @@ mod empirical_rigid_jet_oracle_tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            outer_start_levels: None,
         }
     }
 
@@ -4069,6 +4070,7 @@ mod empirical_flex_jet_oracle_tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            outer_start_levels: None,
         };
         // Primary layout: [q, slope, then the single active deviation block].
         let primary = PrimarySlices {

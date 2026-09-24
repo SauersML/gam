@@ -61,6 +61,7 @@ pub(super) fn rigid_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlo
                 .expect("an intercept cache on the standard-normal law"),
         ),
         auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        outer_start_levels: None,
         auto_subsample_last_rho: Arc::new(Mutex::new(None)),
     };
     let marginal_beta = Array1::from_vec(vec![-0.2, 0.3, -0.15]);
@@ -198,6 +199,7 @@ fn flex_fixture() -> (BernoulliMarginalSlopeFamily, Array2<f64>, Array2<f64>, us
                 .expect("an intercept cache on the standard-normal law"),
         ),
         auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        outer_start_levels: None,
         auto_subsample_last_rho: Arc::new(Mutex::new(None)),
     };
     (family, marginal_x, slope_x, link_width)

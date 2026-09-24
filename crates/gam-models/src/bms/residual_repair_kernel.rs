@@ -2038,6 +2038,7 @@ mod row_covariance_cache_tests {
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            outer_start_levels: None,
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let marginal_beta = Array1::from_vec(vec![-0.3, 0.2, -0.1]);
