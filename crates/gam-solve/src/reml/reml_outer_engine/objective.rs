@@ -219,7 +219,7 @@ pub(crate) fn reml_laml_evaluate(
         0.5 * solution.penalty_quadratic,
     );
     let penalty_quad_value = penalty_quad_value_atom.value();
-    let (cost, profiled_scale, dp_cgrad, _dp_cgrad2) = match &solution.dispersion {
+    let (cost, profiled_scale, dp_cgrad, dp_cgrad2) = match &solution.dispersion {
         DispersionHandling::ProfiledGaussian => {
             // Gaussian REML with profiled scale:
             //   V(ρ) = D_p/(2φ̂) + ½ log|H| − ½ log|S|₊
@@ -789,6 +789,9 @@ pub(crate) fn reml_laml_evaluate(
             &solution.beta,
         )?;
     let rho_penalty_a_k_betas: Vec<Array1<f64>> = penalty_quad_atom.block_penalty_scores().to_vec();
+    // The fixed-β cost rate `a_k` of each ρ coordinate, the scalar the profiled scale moves by.
+    let rho_frozen_cost_rates: Vec<f64> =
+        (0..k).map(|idx| penalty_quad_atom.rho_frozen_d1(idx)).collect();
     let rho_curvature_a_k_betas: Vec<Array1<f64>> =
         curvature_penalty_quad_atom.block_penalty_scores().to_vec();
     let need_family_corrections = effective_deriv.has_corrections();
@@ -1940,18 +1943,25 @@ pub(crate) fn reml_laml_evaluate(
     // dispatch at the top of this function (`try_tangent_projected_evaluate`,
     // refs Wood 2011 §4; Wood–Pya–Säfken 2016 §3; Marra–Wood 2012 §2).
     let envelope_suppresses_outputs = envelope_inconsistent.is_some();
-    // gam#3234: the second derivative of a term priced on a PROFILED posterior is not assembled.
-    // `d²L` there carries the scale's own second-order channel — the pair terms
-    // `−½ℓ_l tr(Λ̃⁻¹Ṁ_k(I − Λ̃⁻¹M))` and their transpose, `½ℓ_kℓ_l tr(Λ̃⁻¹M(I − Λ̃⁻¹M))`, and
-    // `½ℓ̇_kl` times the same trace deficit the gradient prices — and `ℓ̇_kl` is a function of
-    // `d²D_p`, which is assembled a function away from here. Publishing the fixed-scale Hessian
-    // in its place would hand the outer search a matrix that is not the second derivative of the
-    // value it certifies against. The criterion declares no Hessian instead, and the outer plan
-    // reads that declaration before the search starts.
-    let profiled_cone_declines_hessian = solution
-        .cone_normalizer
-        .as_deref()
-        .is_some_and(|term| term.profiled.is_some());
+    // gam#3234: the second derivative of a term priced on a PROFILED posterior carries the scale's
+    // own second-order channel — the pair terms `−½ℓ_j tr(Λ̃⁻¹Ṁ_i(I − Λ̃⁻¹M))` and their transpose,
+    // `½ℓ_iℓ_j tr(Λ̃⁻¹M(I − Λ̃⁻¹M))`, and `½ℓ_ij` times the trace deficit the gradient prices, with
+    // `ℓ_ij` read from the same data-fit channel the outer Hessian entry forms (`d²D_p`).
+    // `cone_laplace_outer_hessian` assembles them, so the criterion publishes its Hessian at
+    // profiled dispersion as at fixed.
+    let profiled_cone_hessian_scale = match (cone_profiled_dof, &solution.dispersion) {
+        (Some(residual_dof), DispersionHandling::ProfiledGaussian) => {
+            Some(ProfiledConeHessianScale {
+                phi: profiled_scale,
+                residual_dof,
+                dp_cgrad,
+                dp_cgrad2,
+                rho_a: &rho_frozen_cost_rates,
+                rho_penalty_a_k_betas: &rho_penalty_a_k_betas,
+            })
+        }
+        _ => None,
+    };
     if envelope_inconsistent.is_some()
         && matches!(solution.dispersion, DispersionHandling::Fixed { .. })
         && solution.kkt_residual.is_none()
@@ -1976,8 +1986,7 @@ pub(crate) fn reml_laml_evaluate(
     let cone_hessian: Option<Array2<f64>> = match cone_term {
         Some(term)
             if mode == EvalMode::ValueGradientHessian
-                && !envelope_suppresses_outputs
-                && !profiled_cone_declines_hessian =>
+                && !envelope_suppresses_outputs =>
         {
             let rho_vs = rho_v_ks
                 .as_ref()
@@ -1995,6 +2004,7 @@ pub(crate) fn reml_laml_evaluate(
                 effective_deriv,
                 &mode_kernel,
                 cone_scale,
+                profiled_cone_hessian_scale.as_ref(),
             )?;
             log::debug!(
                 "[OUTER hessian-elapsed] constrained Laplace term k={} ext={} elapsed={:.3}s",
@@ -2008,7 +2018,6 @@ pub(crate) fn reml_laml_evaluate(
     };
     let (hessian, hessian_absence) = if mode == EvalMode::ValueGradientHessian
         && !envelope_suppresses_outputs
-        && !profiled_cone_declines_hessian
     {
         // First, allow the family to short-circuit with its own exact outer
         // Hv operator.  Default `None` keeps the fall-through identical to
@@ -2242,16 +2251,6 @@ pub(crate) fn reml_laml_evaluate(
             assembly_start.elapsed().as_secs_f64(),
         );
         (result, None)
-    } else if profiled_cone_declines_hessian {
-        // The criterion DECLARES it has none. Checked before the envelope
-        // because it is a property of this model rather than of this trial: a
-        // suppression is a thing that happened at one point, a declaration
-        // holds at every point of the fit, and a consumer deciding whether its
-        // own output exists needs the durable one.
-        (
-            gam_problem::HessianValue::Unavailable,
-            Some(OuterHessianAbsence::ProfiledCriterionDeclares),
-        )
     } else if envelope_suppresses_outputs {
         (
             gam_problem::HessianValue::Unavailable,
@@ -2335,6 +2334,19 @@ pub(crate) fn reml_laml_evaluate(
     })
 }
 
+/// What the constrained Laplace term's profiled Hessian reads of the criterion's scale
+/// (gam#3234): `φ̂`, its residual degrees of freedom `ν`, the floor's first two derivatives, and the
+/// fixed-β cost rates and unscaled penalty scores the dense outer Hessian forms its data-fit
+/// channel from.
+pub(crate) struct ProfiledConeHessianScale<'a> {
+    pub(crate) phi: f64,
+    pub(crate) residual_dof: f64,
+    pub(crate) dp_cgrad: f64,
+    pub(crate) dp_cgrad2: f64,
+    pub(crate) rho_a: &'a [f64],
+    pub(crate) rho_penalty_a_k_betas: &'a [Array1<f64>],
+}
+
 /// The constrained Laplace term's exact outer Hessian (gam#2765).
 ///
 /// Each pair `(i, j)` moves the state the term reads at second order: the mode by
@@ -2360,10 +2372,76 @@ fn cone_laplace_outer_hessian(
     effective_deriv: &dyn HessianDerivativeProvider,
     mode_kernel: &ThetaModeResponseKernel<'_>,
     scale: f64,
+    profiled_scale: Option<&ProfiledConeHessianScale<'_>>,
 ) -> Result<Array2<f64>, RemlLamlError> {
     let k = curvature_lambdas.len();
     let total = mode_responses.len();
     let mean_offset = term.laplace.mean_offset().clone();
+    // gam#3234 at second order. At profiled dispersion the term is priced on `M/φ̂` and `g/φ̂`, and
+    // `φ̂` moves with every coordinate, so each coordinate's scale rate `ℓ_c = φ̂̇_c/φ̂`, its
+    // unscaled precision drift on the mean `Ṁ_c δ̄` and its unscaled KKT-gradient rate `ġ_c` are
+    // formed once here; the pair loop below differentiates the scaled objects through them.
+    struct ProfiledCoordinate {
+        ell: f64,
+        precision_rate_on_mean: Array1<f64>,
+        gradient_rate: Array1<f64>,
+        /// `tr(Λ̃⁻¹Ṁ_c(I − B))`, the scale channel's pairing with this coordinate's drift.
+        deficit_trace: f64,
+    }
+    let profiled = match (profiled_scale, term.profiled.as_ref()) {
+        (Some(scale_inputs), Some(state)) => {
+            let phi = scale_inputs.phi;
+            let fixed_beta_cost_rate = move |c: usize| {
+                if c < k {
+                    scale_inputs.rho_a[c]
+                } else {
+                    solution.ext_coords[c - k].a
+                }
+            };
+            let p_dim = state.precision_fraction.nrows();
+            // `W = (I − B)Λ⁻¹`, so `tr(Λ̃⁻¹Ṁ_c(I − B)) = tr(Ṁ_c W)/φ̂` with `Ṁ_c` unscaled.
+            let complement = Array2::<f64>::eye(p_dim) - &state.precision_fraction;
+            let w = complement.dot(&state.laplace_precision_inverse);
+            let coordinates = (0..total)
+                .map(|c| {
+                    let fixed_beta_rate = if c < k {
+                        &curvature_a_k_betas[c]
+                    } else {
+                        &solution.ext_coords[c - k].g
+                    };
+                    let mode_response = mode_responses[c].mapv(|value| -value);
+                    let gradient_rate = match &term.gradient_motion {
+                        ConeGradientMotion::Stationary => Array1::zeros(mode_response.len()),
+                        ConeGradientMotion::OnFace(stationarity) => {
+                            (stationarity.dot(&mode_response) + fixed_beta_rate) / scale
+                        }
+                        ConeGradientMotion::Pinned => fixed_beta_rate / scale,
+                    };
+                    let mut deficit_trace = 0.0;
+                    for column in 0..p_dim {
+                        deficit_trace +=
+                            drifts[c].apply(&w.column(column).to_owned())[column] / scale;
+                    }
+                    ProfiledCoordinate {
+                        ell: 2.0 * scale_inputs.dp_cgrad * fixed_beta_cost_rate(c)
+                            / (scale_inputs.residual_dof * phi),
+                        precision_rate_on_mean: drifts[c].apply(&mean_offset) / scale,
+                        gradient_rate,
+                        deficit_trace: deficit_trace / phi,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let fraction_curvature = state.precision_fraction.diag().sum()
+                - state
+                    .precision_fraction
+                    .iter()
+                    .zip(state.precision_fraction.t().iter())
+                    .map(|(left, right)| left * right)
+                    .sum::<f64>();
+            Some((scale_inputs, state, coordinates, fraction_curvature, fixed_beta_cost_rate))
+        }
+        _ => None,
+    };
     let mode_rhs_correction = effective_deriv.mode_response_rhs_correction();
     // Every direction the pair loop below asks about, handed over once before it
     // runs, so a provider with single-direction sub-blocks of `D²H` builds each
@@ -2546,13 +2624,71 @@ fn cone_laplace_outer_hessian(
             precision_rate_on_mean += &drift.apply(&mean_offset);
         }
         precision_rate_on_mean /= scale;
-        let gradient_rate = match &term.gradient_motion {
+        let mut gradient_rate = match &term.gradient_motion {
             ConeGradientMotion::Stationary => Array1::zeros(state.rhs.len()),
             ConeGradientMotion::OnFace(stationarity) => {
                 (stationarity.dot(&state.second_response) - &state.rhs) / scale
             }
             ConeGradientMotion::Pinned => -&state.rhs / scale,
         };
+        // gam#3234: with `ℓ_ij = ∂ℓ_i/∂θ_j = φ̂̈_ij/φ̂ − ℓ_iℓ_j`,
+        //   d²(M/φ̂) = [M̈ − ℓ_jṀ_i − ℓ_iṀ_j]/φ̂ − (ℓ_ij − ℓ_iℓ_j)(M/φ̂)
+        // and the same for `g`, so the pair motion the term contracts is taken in its own scaled
+        // units. `ℓ_ij = (2/ν)·q_ij` where `q_ij` is exactly the profiled data-fit channel of the
+        // outer Hessian entry (`outer_hessian_entry`), read from the same four scalars.
+        let mut scale_share = 0.0;
+        if let Some((scale_inputs, profiled_state, coordinates, fraction_curvature, cost_rate)) =
+            profiled.as_ref()
+        {
+            let phi = scale_inputs.phi;
+            let nu = scale_inputs.residual_dof;
+            let (ell_i, ell_j) = (coordinates[i].ell, coordinates[j].ell);
+            let (a_i, a_j) = (cost_rate(i), cost_rate(j));
+            let (pair_a, g_i_dot_v_j) = match (i.checked_sub(k), j.checked_sub(k)) {
+                (None, None) => (
+                    if i == j { a_i } else { 0.0 },
+                    scale_inputs.rho_penalty_a_k_betas[j].dot(mode_responses[i]),
+                ),
+                (None, Some(_)) => (
+                    state.pair.as_ref().map_or(0.0, |pair| pair.a),
+                    scale_inputs.rho_penalty_a_k_betas[i].dot(mode_responses[j]),
+                ),
+                // With `i <= j` an ext first index implies an ext second index.
+                (Some(ei), _) => (
+                    state.pair.as_ref().map_or(0.0, |pair| pair.a),
+                    solution.ext_coords[ei].g.dot(mode_responses[j]),
+                ),
+            };
+            let data_fit = profiled_data_fit_second_derivative(
+                a_i,
+                a_j,
+                g_i_dot_v_j,
+                pair_a,
+                phi,
+                nu,
+                scale_inputs.dp_cgrad,
+                scale_inputs.dp_cgrad2,
+            );
+            let ell_ij = 2.0 * data_fit / nu;
+            let curvature_shift = ell_ij - ell_i * ell_j;
+            precision_rate_on_mean = (precision_rate_on_mean
+                - &coordinates[i].precision_rate_on_mean * ell_j
+                - &coordinates[j].precision_rate_on_mean * ell_i)
+                / phi
+                - &profiled_state.precision_on_mean * curvature_shift;
+            gradient_rate = (gradient_rate
+                - &coordinates[i].gradient_rate * ell_j
+                - &coordinates[j].gradient_rate * ell_i)
+                / phi
+                - &profiled_state.gradient * curvature_shift;
+            // The scale channel of `½ln|Λ̃|` beyond the criterion's own
+            // `½tr(Λ̃⁻¹M̈) − ½tr(Λ̃⁻¹Ṁ_jΛ̃⁻¹Ṁ_i)`: the second derivative of
+            // `(p/2)ln φ̂ + ½ln|Λ̃/φ̂|` less that, term by term.
+            scale_share = -0.5 * ell_j * coordinates[i].deficit_trace
+                - 0.5 * ell_i * coordinates[j].deficit_trace
+                + 0.5 * ell_i * ell_j * fraction_curvature
+                + 0.5 * ell_ij * profiled_state.trace_deficit;
+        }
         // gam#3171, second order. `A` is a function of the ψ coordinates alone, so a pair that
         // holds a ρ coordinate has `Ä = 0` and only a ψψ pair moves the system.
         let constraint_rate = match (
@@ -2578,7 +2714,8 @@ fn cone_laplace_outer_hessian(
         let value = term
             .laplace
             .second_order(&first_orders[i], &first_orders[j], &pair_motion)
-            .map_err(RemlLamlError::ConeNormalizer)?;
+            .map_err(RemlLamlError::ConeNormalizer)?
+            + scale_share;
         hessian[[i, j]] = value;
         hessian[[j, i]] = value;
     }

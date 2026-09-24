@@ -1,5 +1,11 @@
 ## Unreleased
 
+- **A shape-constrained Gaussian fit's outer search has its exact Hessian** (gam#3234). At profiled
+  dispersion the constrained Laplace term reads the profiled scale's second-order channel, and the
+  criterion used to declare no outer Hessian there, so monotone, convex and concave fits searched
+  on BFGS curvature and were certified against a coordinate band of about 1e-10 their gradient could
+  not reach. The term now assembles its Hessian with the scale's first and second motion, and the
+  plan uses it.
 - **A Gaussian-mixture evidence's band carries its mode's own resolution**. The mode search stops once
   the Newton decrement is inside the value's rounding band, which leaves the mode off by up to the
   square root of that band. The log-posterior is stationary there, but `−½ln|H|` is not, so the

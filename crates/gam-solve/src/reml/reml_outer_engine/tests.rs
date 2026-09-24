@@ -9421,7 +9421,29 @@ impl ConeFaceSwitchFixture {
 /// pass.
 #[test]
 pub(crate) fn the_cone_normalizer_outer_derivatives_match_central_differences_at_a_face_switch_2765() {
-    let fixture = ConeFaceSwitchFixture::new();
+    assert_cone_outer_derivatives_match_central_differences(ConeFaceSwitchFixture::new());
+}
+
+/// gam#3234: the same central-difference check at PROFILED dispersion, where `φ̂` moves with ρ and
+/// the term's Hessian carries the scale's second-order channel. The criterion used to declare no
+/// Hessian here; it now publishes one, and it must be the derivative of its own gradient.
+///
+/// Only where a stencil stays on one face. `φ̂` is read off the face criterion's deviance, whose
+/// second derivative jumps where the active set changes, and the Laplace term's smoothing of the
+/// face kink does not reach it: across the switch the profiled criterion is `C¹`, so there its
+/// gradient is differenced and its Hessian is not. Measured on this fixture: on the four
+/// one-sided stencils every Hessian entry agrees with its differences to about 1e-11 relative,
+/// while the two straddling stencils read the average of the two faces' Hessians, off each
+/// face's own by an equal and opposite 4.7e-5 on `[0,0]`.
+#[test]
+pub(crate) fn the_profiled_cone_normalizer_outer_hessian_matches_central_differences_3234() {
+    assert_cone_outer_derivatives_match_central_differences(ConeFaceSwitchFixture::profiled());
+}
+
+fn assert_cone_outer_derivatives_match_central_differences(fixture: ConeFaceSwitchFixture) {
+    // The fixed-dispersion criterion is twice differentiable across the switch (the term
+    // smooths the face kink); the profiled one is not (see the #3234 test).
+    let hessian_crosses_the_switch = !fixture.profiled;
     // Central differences at steps h and h/2, their Richardson combination, and a bar of the two
     // estimates' disagreement plus the rounding of the coarse one.
     let richardson = |f: &dyn Fn(f64) -> f64, h: f64| {
@@ -9519,7 +9541,9 @@ pub(crate) fn the_cone_normalizer_outer_derivatives_match_central_differences_at
                     hessian[[row, coordinate]],
                     unpriced_hessian[[row, coordinate]]
                 );
-                if (hessian[[row, coordinate]] - fd).abs() > bar {
+                if (one_sided || hessian_crosses_the_switch)
+                    && (hessian[[row, coordinate]] - fd).abs() > bar
+                {
                     failures.push(format!(
                         "{name} hessian [{row},{coordinate}]: {} against {fd} (bar {bar})",
                         hessian[[row, coordinate]]
@@ -9737,32 +9761,3 @@ pub(crate) fn the_profiled_constrained_criterion_is_differentiable_across_a_face
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// gam#3234: a criterion carrying the constrained Laplace term at PROFILED dispersion declares no
-/// outer Hessian, rather than publishing the fixed-scale matrix as if it were the second
-/// derivative of the value.
-///
-/// The positive control is the same fixture at FIXED dispersion, where the scale is not a
-/// function of ρ and the full second order is assembled: a refusal that fired everywhere would
-/// say nothing about the scale.
-#[test]
-pub(crate) fn a_profiled_constrained_criterion_declares_no_outer_hessian_3234() {
-    let fixed = ConeFaceSwitchFixture::new();
-    let point = [fixed.switch[0] - 0.25e-2, fixed.switch[1]];
-    let assembled = fixed.evaluate(&point, EvalMode::ValueGradientHessian, true);
-    assert!(
-        matches!(assembled.hessian, gam_problem::HessianValue::Dense(_)),
-        "at fixed dispersion the term's outer Hessian is assembled: {:?}",
-        assembled.hessian
-    );
-    let profiled = ConeFaceSwitchFixture::profiled();
-    let declined = profiled.evaluate(&point, EvalMode::ValueGradientHessian, true);
-    assert!(
-        matches!(declined.hessian, gam_problem::HessianValue::Unavailable),
-        "at profiled dispersion the term declares no outer Hessian: {:?}",
-        declined.hessian
-    );
-    assert!(
-        declined.gradient.is_some(),
-        "the value and gradient are published where the Hessian is not"
-    );
-}

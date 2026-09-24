@@ -60,9 +60,8 @@ impl SmoothingCorrectionOutcome {
 /// error cannot describe it differently.
 fn declared_no_outer_hessian() -> EstimationError {
     EstimationError::InvalidInput(
-        "this fit's outer criterion declares no rho-Hessian -- a term priced on a profiled \
-         posterior carries the scale's own second-order channel (gam#3234) -- so there is no \
-         matrix to return here"
+        "this fit's outer criterion declares no rho-Hessian -- its #784 block correction has no \
+         closed-form rho-Hessian on this fit -- so there is no matrix to return here"
             .to_string(),
     )
 }

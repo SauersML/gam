@@ -4874,18 +4874,16 @@ impl<'a> RemlState<'a> {
                 .is_some_and(|lin| lin.a.nrows() > 0)
     }
 
-    /// Whether this fit publishes an analytic outer Hessian to the outer plan.
+    /// Whether this fit publishes an analytic outer Hessian to the outer plan. The plan reads
+    /// this before the search starts, so a fit without one searches gradient-only rather than on
+    /// an ARC route that would be handed a refusal at its first second-order request.
     ///
-    /// A criterion carrying the constrained Laplace term at PROFILED dispersion does not
-    /// (gam#3234): `d²L` there carries the profiled scale's own second-order channel, whose
-    /// `ℓ̇_kl = d²log φ̂` is a function of `d²D_p`, and the evaluator declines to assemble it
-    /// rather than publish the fixed-scale matrix in its place. The plan reads this before the
-    /// search starts, so the search is gradient-only rather than an ARC route that would be
-    /// handed a refusal at its first second-order request.
+    /// A criterion carrying the constrained Laplace term at PROFILED dispersion publishes one too
+    /// (gam#3234): `d²L` there carries the profiled scale's second-order channel,
+    /// `ℓ_{i,j} = φ̂̈_ij/φ̂ − ℓ_iℓ_j` read off `d²D_p`, which the evaluator assembles beside the
+    /// fixed-scale pair motions (`ProfiledConeHessianScale`).
     pub(crate) fn declares_analytic_outer_hessian(&self) -> bool {
         self.analytic_outer_hessian_enabled()
-            && !(self.fit_prices_constrained_laplace()
-                && reml_is_gaussian_identity(&self.config.likelihood))
     }
 
     /// Whether this fit's criterion is assembled in the TRANSFORMED PIRLS frame rather than the

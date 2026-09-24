@@ -146,6 +146,12 @@ pub struct ProfiledConeScale {
     /// difference is exactly `½ℓ_k` times this trace: `½ℓ_k[p − tr(Λ̃⁻¹M)]`, with the `p` coming
     /// from `(p/2)ln φ̂`, the part of `½ln|Λ̃|` that is pure scale.
     pub trace_deficit: f64,
+    /// `B = Λ̃⁻¹M = Λ⁻¹(M/φ̂)`, the share of the Laplace precision the likelihood carries. The
+    /// scale channel of `½ln|Λ̃|` at second order reads it through `tr(Λ̃⁻¹Ṁ_k(I − B))` and
+    /// `tr(B(I − B))` (gam#3234).
+    pub precision_fraction: Array2<f64>,
+    /// `Λ⁻¹ = (M/φ̂ + AᵀT̃A)⁻¹`, the inverse Laplace precision in the scaled units `B` is taken in.
+    pub laplace_precision_inverse: Array2<f64>,
 }
 
 impl ConeNormalizerTerm {
@@ -205,6 +211,8 @@ impl ConeNormalizerTerm {
                 precision_on_normals: scaled_precision.dot(laplace.normal_solves()),
                 trace_deficit: beta.len() as f64 - kept,
                 gradient: scaled_gradient,
+                precision_fraction: inverse.dot(&scaled_precision),
+                laplace_precision_inverse: inverse.clone(),
             }
         });
         Ok((

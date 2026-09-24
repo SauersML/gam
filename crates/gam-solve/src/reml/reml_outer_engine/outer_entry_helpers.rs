@@ -892,6 +892,34 @@ pub(crate) fn outer_gradient_entry(
     penalty_term + trace_term - det_term
 }
 
+/// The profiled Gaussian criterion's data-fit channel at second order,
+/// `∂²[D_p/(2φ̂)]` through the floored penalized deviance `D_p = f(D_raw)`:
+/// with `q_raw = pair_a − g_iᵀv_j = ½D̈_raw` and `Ḋ_raw,c = 2a_c`,
+/// `f′q_raw/φ̂ + 2(f″νφ̂ − f′²)a_ia_j/(νφ̂²)`.
+///
+/// It is also `½ν·ℓ_ij` for the scale rate `ℓ_c = φ̂̇_c/φ̂` and `ℓ_ij = ∂ℓ_i/∂θ_j`, which is how
+/// the constrained Laplace term's profiled Hessian reads `φ̂̈` (gam#3234): one formula, so the
+/// criterion and the term cannot disagree about how the scale moves.
+pub(crate) fn profiled_data_fit_second_derivative(
+    a_i: f64,
+    a_j: f64,
+    g_i_dot_v_j: f64,
+    pair_a: f64,
+    profiled_phi: f64,
+    profiled_nu: f64,
+    profiled_dp_cgrad: f64,
+    profiled_dp_cgrad2: f64,
+) -> f64 {
+    let q_raw = pair_a - g_i_dot_v_j;
+    profiled_dp_cgrad * q_raw / profiled_phi
+        + 2.0
+            * (profiled_dp_cgrad2 * profiled_nu * profiled_phi
+                - profiled_dp_cgrad * profiled_dp_cgrad)
+            * a_i
+            * a_j
+            / (profiled_nu * profiled_phi * profiled_phi)
+}
+
 /// Compute one entry of the outer Hessian.
 ///
 /// The universal three-term formula is:
@@ -928,17 +956,19 @@ pub(crate) fn outer_hessian_entry(
     incl_logdet_h: bool,
     incl_logdet_s: bool,
 ) -> f64 {
-    let q_raw = pair_a - g_i_dot_v_j;
     let q = if is_profiled {
-        profiled_dp_cgrad * q_raw / profiled_phi
-            + 2.0
-                * (profiled_dp_cgrad2 * profiled_nu * profiled_phi
-                    - profiled_dp_cgrad * profiled_dp_cgrad)
-                * a_i
-                * a_j
-                / (profiled_nu * profiled_phi * profiled_phi)
+        profiled_data_fit_second_derivative(
+            a_i,
+            a_j,
+            g_i_dot_v_j,
+            pair_a,
+            profiled_phi,
+            profiled_nu,
+            profiled_dp_cgrad,
+            profiled_dp_cgrad2,
+        )
     } else {
-        q_raw
+        pair_a - g_i_dot_v_j
     };
     let l = if incl_logdet_h {
         0.5 * (cross_trace + h2_trace)
