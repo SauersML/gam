@@ -174,6 +174,7 @@ fn alternation_dict<'py>(py: Python<'py>, a: &Alternation) -> PyResult<Bound<'py
     entry.set_item("barrier_after", a.barrier_after)?;
     entry.set_item("iterations", a.iterations)?;
     entry.set_item("certified", a.certified)?;
+    entry.set_item("searched", a.searched)?;
     entry.set_item("residual", a.residual)?;
     entry.set_item("tolerance", a.tolerance)?;
     entry.set_item("radius", a.radius)?;

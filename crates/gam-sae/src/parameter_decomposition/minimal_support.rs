@@ -166,6 +166,17 @@ pub struct MinimalSupport {
     /// Each position's trust radius at the end: a later search resumed with these
     /// continues at the learned proposal sizes instead of relearning them from one.
     pub radius: Vec<usize>,
+    /// Each position's cheapest predicted removal among its kept pieces at the final
+    /// supports (`+∞` where nothing is kept): a caller can tell whether slack it opens
+    /// could buy any removal before paying for another search.
+    pub cheapest: Array1<f64>,
+}
+
+/// Per position, the smallest predicted removal cost over its kept pieces.
+fn cheapest_removals(keep: &Array2<bool>, cost: &Array2<f64>) -> Array1<f64> {
+    Array1::from_iter(keep.outer_iter().zip(cost.outer_iter()).map(|(k, c)| {
+        k.iter().zip(c.iter()).filter(|(k, _)| **k).map(|(_, v)| v.max(0.0)).fold(f64::INFINITY, f64::min)
+    }))
 }
 
 fn checked(eval: SupportEvaluation, positions: usize, pieces: usize) -> Result<SupportEvaluation, SupportError> {
@@ -312,7 +323,10 @@ pub fn minimal_support<E: SupportExecutor>(
         let offered: Vec<usize> = proposal.iter().map(Vec::len).collect();
         let proposed: usize = proposal.iter().map(Vec::len).sum();
         if proposed == 0 {
-            return Ok(MinimalSupport { keep, divergence: current.divergence, rounds, radius });
+            {
+                let cheapest = cheapest_removals(&keep, &current.removal_cost);
+                return Ok(MinimalSupport { keep, divergence: current.divergence, rounds, radius, cheapest });
+            }
         }
         let mut halvings = 0;
         let accepted = loop {
@@ -408,7 +422,10 @@ pub fn minimal_support<E: SupportExecutor>(
                     kept: keep.iter().filter(|&&k| k).count(),
                     max_divergence: current.divergence.iter().copied().fold(0.0, f64::max),
                 });
-                return Ok(MinimalSupport { keep, divergence: current.divergence, rounds, radius });
+                {
+                let cheapest = cheapest_removals(&keep, &current.removal_cost);
+                return Ok(MinimalSupport { keep, divergence: current.divergence, rounds, radius, cheapest });
+            }
             }
         }
     }

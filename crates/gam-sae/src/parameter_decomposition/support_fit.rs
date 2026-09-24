@@ -137,6 +137,9 @@ pub struct Alternation {
     /// Trust-region iterations and whether its first-order certificate held.
     pub iterations: usize,
     pub certified: bool,
+    /// Whether the support step ran (it is skipped when the slack cannot buy the
+    /// cheapest predicted removal).
+    pub searched: bool,
     /// The trust region's relative stationarity, the bound it was decided against, its
     /// radius after the step, and the length of the step the pieces took.
     pub residual: f64,
@@ -293,7 +296,8 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
     // `u_f = √n · u` (relative). A decrease below `u_f` cannot be resolved, so a minimizer is
     // located only to within `√u_f`, where the relative gradient is of that order: the
     // certificate is decided at `√u_f`. A tighter one would certify rounding.
-    let certificate = ((terms as f64).sqrt() * unit_roundoff).sqrt();
+    let value_band = (terms as f64).sqrt() * unit_roundoff;
+    let certificate = value_band.sqrt();
     let empty = Array2::from_elem((positions, pieces), false);
     let widest = executor
         .divergence(theta.view(), empty.view())
@@ -317,8 +321,13 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
     // Each support search resumes the proposal sizes the previous one learned.
     let mut radius: Option<Vec<usize>> = None;
     for &level in &levels {
+        // The barrier's boundary is the level; the supports are searched below it by the
+        // divergence's own rounding band `u_f`, so every admissible support leaves a slack
+        // the executor can resolve. At the level itself the search fills the budget to
+        // within rounding, where the barrier is evaluated in noise and cannot step.
         let fidelity = form(level);
-        let mut current = minimal_support(&mut AtTheta { executor: &mut *executor, theta: theta.view() }, positions, pieces, fidelity, sequence, Some(keep.clone()), radius.take())
+        let search = form(level * (1.0 - value_band));
+        let mut current = minimal_support(&mut AtTheta { executor: &mut *executor, theta: theta.view() }, positions, pieces, search, sequence, Some(keep.clone()), radius.take())
             .map_err(SupportFitError::Support)?;
         // One resumed trust-region iteration per alternation: the supports the barrier
         // holds fixed are re-decided between iterations, and the resume keeps the
@@ -363,9 +372,26 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
             };
             theta = termination.point.clone();
             let certified = termination.residual <= termination.tolerance;
-            let carried = Some(current.radius.clone());
-            current = minimal_support(&mut AtTheta { executor: &mut *executor, theta: theta.view() }, positions, pieces, fidelity, sequence, Some(at), carried)
-                .map_err(SupportFitError::Support)?;
+            // Search only when the slack the step opened could buy the cheapest predicted
+            // removal: otherwise the search cannot remove anything and costs a round of
+            // exact evaluations to prove it. The prediction only schedules searches;
+            // whenever one runs, acceptance is exact.
+            let divergence = executor.divergence(theta.view(), at.view()).map_err(SupportFitError::Executor)?;
+            let affordable = match search {
+                Fidelity::Mean(level) => {
+                    let p = divergence.len() as f64;
+                    let slack = p * (level - divergence.sum() / p);
+                    current.cheapest.iter().copied().fold(f64::INFINITY, f64::min) <= slack
+                }
+                Fidelity::PerPosition(level) => divergence.iter().zip(current.cheapest.iter()).any(|(&d, &c)| c <= level - d),
+            };
+            if affordable {
+                let carried = Some(current.radius.clone());
+                current = minimal_support(&mut AtTheta { executor: &mut *executor, theta: theta.view() }, positions, pieces, search, sequence, Some(at), carried)
+                    .map_err(SupportFitError::Support)?;
+            } else {
+                current.divergence = divergence;
+            }
             let kept = current.keep.iter().filter(|&&k| k).count();
             let mean_divergence = current.divergence.sum() / current.divergence.len() as f64;
             alternations.push(Alternation {
@@ -376,6 +402,7 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
                 barrier_after: after,
                 iterations: termination.iterations,
                 certified,
+                searched: affordable,
                 residual: termination.residual,
                 tolerance: termination.tolerance,
                 radius: termination.radius,

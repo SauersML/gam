@@ -192,7 +192,7 @@ def main():
             def observe(self, a):
                 print(f"[alt] level {a['level']:.4g}: kept {a['kept']} pieces, KL mean {a['mean_divergence']:.4f}; "
                       f"barrier {a['barrier_before']:.6g} -> {a['barrier_after']:.6g}; step {a['step']:.3e} radius {a['radius']:.3e}; "
-                      f"residual {a['residual']:.3e} / {a['tolerance']:.3e} certified {a['certified']}", flush=True)
+                      f"residual {a['residual']:.3e} / {a['tolerance']:.3e} certified {a['certified']} searched {a['searched']}", flush=True)
 
             def gradient_arithmetic(self):
                 return 2.0 ** -24, P * logp_clean.shape[-1]
