@@ -1,0 +1,37 @@
+{
+ "args": {
+  "weights": "vpd4l/model_step_99999.safetensors",
+  "train": "vpd4l/train-00000-of-02021.parquet",
+  "test": "vpd4l/test-00000-of-00002.parquet",
+  "bank_rows": 64,
+  "eval_rows": 32,
+  "atoms": 512,
+  "dims": "1,2",
+  "actives": "2,4,8",
+  "sweeps": 8,
+  "batch": 16,
+  "seed": 0,
+  "device": "cuda",
+  "out": "results/vpd4l_dict.json"
+ },
+ "vpd": {
+  "p-8383f5e5": {
+   "kl_rounded": 0.29135,
+   "kl_stoch": 0.20661,
+   "l0": 180.41
+  }
+ },
+ "clean_ce": 2.7191436290740967,
+ "arms": {
+  "m1_L2": {
+   "kl": 9.62379264831543,
+   "ce_difference": 9.565240144729614,
+   "atom_dim": 1,
+   "atoms_per_token": 2,
+   "atoms": 512,
+   "fit_seconds": 421.79753851890564,
+   "active_directions_per_token": 32,
+   "active_matrix_slices_per_token": 48
+  }
+ }
+}

@@ -1,0 +1,236 @@
+"""#2951: Parseval-frame parameter decomposition on the Stiefel manifold, on VPD's own 4-layer Pile target.
+
+Analysis under SPEC 8's exception (torch execution of the target and of the Riemannian optimization).
+
+For every one of the 24 weight matrices ``W`` (``q x p``) of the target, the decomposition is a Parseval frame of its
+output space: ``K`` atoms ``O_k`` (``q x m``) whose stack ``X = [O_1; ...; O_K]^T``-transposed has orthonormal
+columns, ``X^T X = I_q``. Then ``sum_k O_k O_k^T = I`` EXACTLY, so the pieces ``B_k = O_k O_k^T W`` (rank ``m``) sum to
+``W`` with zero faithfulness error for every frame: faithfulness is the geometry of the Stiefel manifold ``St(Km, q)``
+the frame lives on, not a penalty. ``Km > q`` makes it overcomplete (room for superposition).
+
+A token uses the ``L`` pieces carrying the most of its own output energy ``||O_k^T W z||^2`` (a parameter-free
+selector: no causal-importance network, no penalty; ``L`` is a hard constraint). The frame is fitted by Riemannian
+Adam on the product of Stiefel manifolds against the model's own end-to-end KL with all 24 matrices restricted at
+once (errors propagating): tangent projection ``G - X sym(X^T G)``, QR retraction.
+
+Evaluation is VPD's: KL to the target (rounded masks = selected pieces on, the rest off), and VPD's PGDReconLoss
+adversary (inactive pieces re-added with masks in [0,1] shared by all tokens, 20 sign-gradient steps of 0.1), on the
+target's own Pile-uncopyrighted test split.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import time
+
+import torch
+import torch.nn.functional as F
+
+from mpd_vpd4l_atlas_2951 import rows
+
+MATS = ("q", "k", "v", "o", "fc", "down")
+VPD = {"p-8383f5e5": {"kl_rounded": 0.29135, "kl_stoch": 0.20661, "kl_ci": 0.31372, "l0": 180.41,
+                      "pgd20": 0.6045}}
+
+
+class Target:
+    def __init__(self, path, dev):
+        from safetensors.torch import load_file
+        self.w = {k: v.to(dev) for k, v in load_file(path).items()}
+        self.n_layer, self.n_head, self.d, self.eps, self.base = 4, 6, 768, 1e-6, 10000.0
+        self.hd = self.d // self.n_head
+        self.edit = None  # (layer, mat, y) -> y_hat on the matrix output
+
+    def W(self, l, m):
+        p = f"h.{l}."
+        return {"q": p + "attn.q_proj.weight", "k": p + "attn.k_proj.weight", "v": p + "attn.v_proj.weight",
+                "o": p + "attn.o_proj.weight", "fc": p + "mlp.c_fc.weight", "down": p + "mlp.down_proj.weight"}[m]
+
+    def lin(self, l, m, z):
+        y = z @ self.w[self.W(l, m)].T
+        if self.edit is None:
+            return y
+        shape = y.shape
+        return self.edit(l, m, y.reshape(-1, shape[-1])).reshape(shape)
+
+    def rms(self, x, w):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * w
+
+    def rope(self, x):
+        T = x.shape[-2]
+        inv = 1.0 / (self.base ** (torch.arange(0, self.hd, 2, device=x.device, dtype=torch.float32) / self.hd))
+        ang = torch.arange(T, device=x.device, dtype=torch.float32)[:, None] * inv[None]
+        cos, sin = torch.cat([ang.cos(), ang.cos()], -1), torch.cat([ang.sin(), ang.sin()], -1)
+        x1, x2 = x[..., : self.hd // 2], x[..., self.hd // 2:]
+        return x * cos + torch.cat([-x2, x1], -1) * sin
+
+    def __call__(self, ids):
+        w = self.w
+        h = w["wte.weight"][ids]
+        B, T, _ = h.shape
+        for l in range(self.n_layer):
+            p = f"h.{l}."
+            x = self.rms(h, w[p + "rms_1.weight"])
+            q, k, v = (self.lin(l, n, x).view(B, T, self.n_head, self.hd).transpose(1, 2) for n in ("q", "k", "v"))
+            o = F.scaled_dot_product_attention(self.rope(q), self.rope(k), v, is_causal=True)
+            h = h + self.lin(l, "o", o.transpose(1, 2).reshape(B, T, self.d))
+            x = self.rms(h, w[p + "rms_2.weight"])
+            h = h + self.lin(l, "down", F.gelu(self.lin(l, "fc", x), approximate="tanh"))
+        return self.rms(h, w["ln_f.weight"]) @ w["wte.weight"].T
+
+
+def frame_restrict(y, X, K, m, L, masks=None):
+    """y: n x q; X: (K m) x q with orthonormal columns. Keep the L atoms with the most energy; with ``masks``
+    (K,), the inactive atoms are re-added with those weights (VPD's adversarial source on inactive components)."""
+    c = (y @ X.T).view(-1, K, m)  # atom coordinates
+    energy = c.pow(2).sum(-1)
+    keep = torch.zeros_like(energy).scatter_(1, energy.detach().topk(L, dim=1).indices, 1.0)
+    weight = keep if masks is None else keep + (1 - keep) * masks[None]
+    return (c * weight[..., None]).reshape(-1, K * m) @ X
+
+
+def stiefel(K, m, q, dev, gen):
+    G = torch.randn(K * m, q, generator=gen).to(dev)
+    return torch.linalg.qr(G)[0]  # (K m) x q, orthonormal columns
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--weights", required=True)
+    parser.add_argument("--train", required=True)
+    parser.add_argument("--test", required=True)
+    parser.add_argument("--train-rows", type=int, required=True)
+    parser.add_argument("--eval-rows", type=int, required=True)
+    parser.add_argument("--overcomplete", type=float, required=True, help="K m / q")
+    parser.add_argument("--atom-dim", type=int, required=True)
+    parser.add_argument("--active", type=int, required=True)
+    parser.add_argument("--steps", type=int, required=True)
+    parser.add_argument("--lr", type=float, required=True)
+    parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--pgd-steps", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--out", required=True)
+    args = parser.parse_args()
+    torch.manual_seed(args.seed)
+    dev = args.device
+    torch.backends.cuda.matmul.allow_tf32 = False
+    model = Target(args.weights, dev)
+    test = rows(args.test, args.eval_rows)
+    held = [test[i:i + args.batch] for i in range(0, len(test), args.batch)]
+    train = rows(args.train, args.train_rows)
+    m, L = args.atom_dim, args.active
+    gen = torch.Generator().manual_seed(args.seed)
+    frames, shapes = {}, {}
+    for l in range(model.n_layer):
+        for mat in MATS:
+            q = model.w[model.W(l, mat)].shape[0]
+            K = math.ceil(args.overcomplete * q / m)
+            shapes[(l, mat)] = K
+            frames[(l, mat)] = stiefel(K, m, q, dev, gen)
+    report = {"args": vars(args), "vpd": VPD, "pieces_per_token": 24 * L,
+              "matrix_slices_per_token": 24 * L * m, "atoms_per_matrix": {f"{k[0]}:{k[1]}": v for k, v in shapes.items()}}
+    print(f"[frame4l] {24 * L} pieces of rank {m} per token ({24 * L * m} matrix slices; VPD L0 180 rank-1)", flush=True)
+
+    def edit_with(masks=None):
+        def edit(l, mat, y):
+            return frame_restrict(y, frames[(l, mat)], shapes[(l, mat)], m, L,
+                                  None if masks is None else masks[(l, mat)])
+        return edit
+
+    def evaluate():
+        kl = ce = 0.0
+        n = 0
+        cce = 0.0
+        with torch.inference_mode():
+            for ids in held:
+                ids = ids.to(dev)
+                model.edit = None
+                ref_logits = model(ids[:, :-1]).float()
+                ref = torch.log_softmax(ref_logits, -1)
+                model.edit = edit_with()
+                logits = model(ids[:, :-1]).float()
+                model.edit = None
+                lp = torch.log_softmax(logits, -1)
+                kl += (ref.exp() * (ref - lp)).sum().item()
+                n += ref.shape[0] * ref.shape[1]
+                tgt = ids[:, 1:].reshape(-1)
+                ce += F.cross_entropy(logits.reshape(-1, logits.shape[-1]), tgt).item()
+                cce += F.cross_entropy(ref_logits.reshape(-1, ref_logits.shape[-1]), tgt).item()
+        return {"kl": kl / n, "ce_difference": (ce - cce) / len(held)}
+
+    def batch_kl(ids, masks=None):
+        with torch.no_grad():
+            model.edit = None
+            ref = torch.log_softmax(model(ids[:, :-1]).float(), -1)
+        model.edit = edit_with(masks)
+        lp = torch.log_softmax(model(ids[:, :-1]).float(), -1)
+        model.edit = None
+        return (ref.exp() * (ref - lp)).sum(-1).mean()
+
+    report["init"] = evaluate()
+    print(f"[frame4l] random Stiefel init: {report['init']}", flush=True)
+    keys = list(frames)
+    mom = {k: torch.zeros_like(frames[k]) for k in keys}
+    sq = {k: torch.zeros_like(frames[k]) for k in keys}
+    trace = []
+    t0 = time.time()
+    for step in range(args.steps):
+        idx = torch.randint(0, len(train), (args.batch,), generator=gen)
+        ids = train[idx].to(dev)
+        for k in keys:
+            frames[k].requires_grad_(True)
+        with torch.enable_grad():
+            loss = batch_kl(ids)
+            grads = torch.autograd.grad(loss, [frames[k] for k in keys])
+        trace.append(loss.item())
+        with torch.no_grad():
+            for k, g in zip(keys, grads):
+                X = frames[k].detach()
+                sym = 0.5 * (X.T @ g + g.T @ X)
+                tang = g - X @ sym
+                mom[k].mul_(0.9).add_(0.1 * tang)
+                sq[k].mul_(0.999).add_(0.001 * tang.pow(2))
+                upd = (mom[k] / (1 - 0.9 ** (step + 1))) / ((sq[k] / (1 - 0.999 ** (step + 1))).sqrt() + 1e-12)
+                upd = upd - X @ (0.5 * (X.T @ upd + upd.T @ X))
+                Q, Rr = torch.linalg.qr(X - args.lr * upd)
+                frames[k] = (Q * torch.sign(torch.diagonal(Rr))[None]).detach()
+        if step % 50 == 0 or step == args.steps - 1:
+            print(f"[frame4l] step {step}: train KL {loss.item():.4f} ({time.time() - t0:.0f}s)", flush=True)
+        if (step + 1) % max(1, args.steps // 4) == 0:
+            res = evaluate()
+            print(f"[frame4l] step {step + 1}: TEST {res}", flush=True)
+    report["trace"] = trace[::10]
+    report["train_seconds"] = time.time() - t0
+    report["final"] = evaluate()
+    # exact faithfulness: sum of all pieces = W
+    worst = max((frames[k].T @ frames[k] - torch.eye(frames[k].shape[1], device=dev)).abs().max().item() for k in keys)
+    report["frame_orthonormality_defect_max"] = worst
+    print(f"[frame4l] FINAL {report['final']} (VPD rounded 0.291, stochastic 0.207); max |X^T X - I| {worst:.2e}",
+          flush=True)
+    if args.pgd_steps > 0:
+        g2 = torch.Generator(device=dev).manual_seed(args.seed)
+        masks = {k: torch.rand(shapes[k], generator=g2, device=dev) for k in keys}
+        ids = held[0].to(dev)
+        for _ in range(args.pgd_steps):
+            for k in keys:
+                masks[k].requires_grad_(True)
+            with torch.enable_grad():
+                loss = batch_kl(ids, masks)
+                grads = torch.autograd.grad(loss, [masks[k] for k in keys])
+            with torch.no_grad():
+                for k, g in zip(keys, grads):
+                    masks[k] = (masks[k] + 0.1 * g.sign()).clamp(0, 1).detach()
+        with torch.no_grad():
+            report["pgd"] = batch_kl(ids, masks).item()
+        print(f"[frame4l] PGD-{args.pgd_steps} (inactive pieces re-added adversarially, shared masks): "
+              f"KL {report['pgd']:.4f} (VPD 0.6045)", flush=True)
+    torch.save({f"{k[0]}:{k[1]}": frames[k].cpu() for k in keys}, args.out.replace(".json", "_frames.pt"))
+    with open(args.out, "w") as handle:
+        json.dump(report, handle, indent=1)
+    print(f"[frame4l] wrote {args.out}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
