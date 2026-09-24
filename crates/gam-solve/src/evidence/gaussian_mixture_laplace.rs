@@ -685,10 +685,14 @@ pub(super) struct MixtureLaplaceFit {
     pub(super) means: Array2<f64>,
     pub(super) covariances: Vec<Array2<f64>>,
     pub(super) log_evidence: f64,
-    /// Rounding band of `log_evidence`: the integrand's own accumulation band
-    /// at the certified mode. The solver stops only when the Newton decrement
-    /// is inside it, so two evidences computed from separate solves agree to
-    /// the sum of their bands and no closer.
+    /// Band of `log_evidence`: the integrand's own accumulation band at the
+    /// certified mode, plus the motion one Newton step from that mode makes to
+    /// the evidence. The solver stops once the Newton decrement is inside the
+    /// value's band, which leaves the mode off by up to the square root of it in
+    /// the Hessian's norm. The log-posterior is stationary there, so its value
+    /// carries that only at second order, but `−½ln|H|` is not stationary and
+    /// carries it at first. Two evidences from separate solves agree to the sum
+    /// of their bands.
     pub(super) log_evidence_band: f64,
 }
 
@@ -804,11 +808,37 @@ pub(super) fn fit_mixture_laplace(
         )
     })?;
     let log_det: f64 = chol.diag().iter().map(|&l| 2.0 * l.ln()).sum();
-    let log_evidence = at.value
-        + ln_gamma(k as f64 + 1.0)
-        + 0.5 * problem.dim() as f64 * (2.0 * std::f64::consts::PI).ln()
-        - 0.5 * log_det
-        - 0.5 * n as f64 * whitening.log_det_covariance;
+    let evidence_at = |value: f64, log_det: f64| {
+        value + ln_gamma(k as f64 + 1.0)
+            + 0.5 * problem.dim() as f64 * (2.0 * std::f64::consts::PI).ln()
+            - 0.5 * log_det
+            - 0.5 * n as f64 * whitening.log_det_covariance
+    };
+    let log_evidence = evidence_at(at.value, log_det);
+    // One Newton step from the certified mode, `θ + (−H)⁻¹g`, and the evidence
+    // there: how far the mode's own resolution moves the evidence.
+    let step = chol
+        .solve_mat(&at.gradient.clone().insert_axis(ndarray::Axis(1)))
+        .column(0)
+        .to_owned();
+    let stepped = problem.evaluate(&(&theta + &step), true)?;
+    let stepped_log_det: f64 = stepped
+        .hessian
+        .as_ref()
+        .ok_or_else(|| "Gaussian-mixture evidence: Hessian missing".to_string())?
+        .mapv(|v| -v)
+        .cholesky(Side::Lower)
+        .map_err(|e| {
+            format!(
+                "Gaussian-mixture evidence: k={k} one Newton step from the mode leaves the \
+                 strict maximum's basin (negated Hessian not positive definite: {e:?})"
+            )
+        })?
+        .diag()
+        .iter()
+        .map(|&l| 2.0 * l.ln())
+        .sum();
+    let mode_resolution = (evidence_at(stepped.value, stepped_log_det) - log_evidence).abs();
 
     let params = problem.unpack(&theta);
     let l = &whitening.factor;
@@ -835,7 +865,7 @@ pub(super) fn fit_mixture_laplace(
     let log_evidence_band = at
         .bands
         .as_ref()
-        .map(|bands| bands.objective)
+        .map(|bands| bands.objective + mode_resolution)
         .ok_or_else(|| "Gaussian-mixture evidence: certified sample carries no band".to_string())?;
     Ok(MixtureLaplaceFit {
         weights: Array1::from_vec(params.pi),

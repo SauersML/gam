@@ -1,5 +1,11 @@
 ## Unreleased
 
+- **A Gaussian-mixture evidence's band carries its mode's own resolution**. The mode search stops once
+  the Newton decrement is inside the value's rounding band, which leaves the mode off by up to the
+  square root of that band. The log-posterior is stationary there, but `−½ln|H|` is not, so the
+  evidence carries the mode error at first order: an affine image of the same rows priced its
+  evidence 6.8e-8 away against a reported band of 4.2e-11. The band now adds the motion one Newton
+  step from the certified mode makes to the evidence.
 - **A certificate reading a cached evaluation reads that evaluation's evidence** (gam#3331,
   gam#3993). The outer search answers a revisited ρ from its evaluation cache, and a cached
   answer published no certificate evidence. The terminal certificate at an ARC stop evaluates

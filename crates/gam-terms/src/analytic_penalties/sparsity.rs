@@ -1901,11 +1901,14 @@ mod row_weighted_prior_991_tests {
     fn every_channel_scales_by_w_row_identically() {
         let (n, k) = (4usize, 3usize);
         let temperature = 0.8_f64;
-        let rho = Array1::from_vec(vec![0.15_f64]);
+        // The strength is never an outer coordinate (#4291): it rides on `weight`
+        // and ρ is empty (484c0311a9).
+        let rho = Array1::<f64>::zeros(0);
         let target = logits(n, k);
         let v = logits(n, k); // arbitrary HVP direction.
         let w = vec![1.6_f64, 0.25, 1.05, 1.1];
-        let base = SoftmaxAssignmentSparsityPenalty::new(k, temperature);
+        let mut base = SoftmaxAssignmentSparsityPenalty::new(k, temperature);
+        base.weight = 0.15_f64.exp();
         let wtd = base.clone().with_row_weights(Some(&w));
 
         let g0 = base.grad_target(target.view(), rho.view());
@@ -1925,17 +1928,16 @@ mod row_weighted_prior_991_tests {
                 assert_abs_diff_eq!(h1[i], w[r] * h0[i], epsilon = 1e-12);
             }
         }
-        // grad_rho (softmax) is the value itself, so it too carries the weighting.
-        let r0 = base.grad_rho(target.view(), rho.view())[0];
-        let r1 = wtd.grad_rho(target.view(), rho.view())[0];
+        // The value carries the weighting too, row by row; with no strength
+        // coordinate there is no ρ-gradient to carry it.
         let expect: f64 = (0..n)
             .map(|r| {
                 let row = target.slice(s![r * k..r * k + k]).to_owned();
                 w[r] * base.value(row.view(), rho.view())
             })
             .sum();
-        assert_abs_diff_eq!(r1, expect, epsilon = 1e-12);
-        assert!(r0.is_finite());
+        assert_abs_diff_eq!(wtd.value(target.view(), rho.view()), expect, epsilon = 1e-12);
+        assert!(wtd.grad_rho(target.view(), rho.view()).is_empty());
     }
 
     /// `None` weights are byte-for-byte the unweighted path (no silent ×1.0 drift).

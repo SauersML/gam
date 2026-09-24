@@ -155,9 +155,12 @@ fn smoothed_l1_grad_smoothes_signum_at_zero() {
 
 #[test]
 fn softmax_assignment_hvp_matches_gradient_directional_derivative() {
-    let pen = SoftmaxAssignmentSparsityPenalty::new(3, 0.7);
+    // The strength is never an outer coordinate here (#4291), so it rides on
+    // `weight` and ρ is empty (484c0311a9).
+    let mut pen = SoftmaxAssignmentSparsityPenalty::new(3, 0.7);
+    pen.weight = 1.4;
     let t = array![0.4_f64, -0.8, 1.3, -0.2, 0.9, 0.1];
-    let rho = array![1.4_f64.ln()];
+    let rho = Array1::<f64>::zeros(0);
     let v = array![0.2_f64, -0.5, 0.7, -0.3, 0.4, 0.6];
 
     // The analytic diagonal must equal hvp(.) probed by unit vectors e_k,
@@ -1627,19 +1630,19 @@ fn log_sparsity_hessian_is_exact_true_second_derivative() {
     // and `hvp` must return this genuine (indefinite) Hessian — never the
     // positive IRLS majorizer 2λ/(δ²+x²). This guards against the operator
     // confusion in issue #444.
+    // A fixed-strength penalty: its strength is `weight` and it takes no ρ
+    // coordinate (484c0311a9).
     let delta = 0.5_f64;
-    let weight = 1.3_f64;
-    let log_lambda = 0.2_f64;
-    let lambda = weight * log_lambda.exp();
+    let lambda = 1.3_f64 * 0.2_f64.exp();
     let d2 = delta * delta;
     let pen = {
         let mut p = SparsityPenalty::log(PenaltyTier::Psi, delta).expect("valid log sparsity");
-        p.weight = weight;
+        p.weight = lambda;
         p
     };
     // Sweep across |x| < δ (positive curvature) and |x| > δ (negative).
     let target = array![0.0_f64, 0.25, 0.5, 1.0, 2.0, -2.0, -0.1];
-    let rho = array![log_lambda];
+    let rho = Array1::<f64>::zeros(0);
 
     let diag = pen
         .hessian_diag(target.view(), rho.view())
@@ -1703,18 +1706,18 @@ fn log_sparsity_psd_majorizer_diag_is_distinct_positive_operator() {
     //   B(x) = 2λ/(δ²+x²) ⪰ 0,  agreeing with the exact Hessian only at
     //   x = 0 and strictly dominating it elsewhere. The Newton / PIRLS
     //   curvature block consumes this, not `hessian_diag`.
+    // A fixed-strength penalty: its strength is `weight` and it takes no ρ
+    // coordinate (484c0311a9).
     let delta = 0.5_f64;
-    let weight = 1.3_f64;
-    let log_lambda = 0.2_f64;
-    let lambda = weight * log_lambda.exp();
+    let lambda = 1.3_f64 * 0.2_f64.exp();
     let d2 = delta * delta;
     let pen = {
         let mut p = SparsityPenalty::log(PenaltyTier::Psi, delta).expect("valid log sparsity");
-        p.weight = weight;
+        p.weight = lambda;
         p
     };
     let target = array![0.0_f64, 0.25, 0.5, 1.0, 2.0, -2.0, -0.1];
-    let rho = array![log_lambda];
+    let rho = Array1::<f64>::zeros(0);
     let maj = pen
         .psd_majorizer_diag(target.view(), rho.view())
         .expect("log sparsity exposes a PSD diagonal majorizer");
@@ -5175,7 +5178,8 @@ fn frozen_isometry_operator_reads_the_gauss_newton_majorizer_everywhere() {
     });
     pen.set_third_decoder_derivative(Some(Arc::new(k)));
     let kind = AnalyticPenaltyKind::Isometry(Arc::new(pen));
-    let rho = array![0.0_f64];
+    // An isometry penalty's strength is not an outer coordinate: ρ is empty.
+    let rho = Array1::<f64>::zeros(0);
     let t = Array1::<f64>::zeros(n);
 
     let mut majorizer = Array2::<f64>::zeros((n, n));
