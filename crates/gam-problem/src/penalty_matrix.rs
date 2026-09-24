@@ -108,8 +108,7 @@ impl PenaltyMatrix {
                                 format!("diagonal penalty has non-finite entry: {value}")
                             })
                     })?;
-                let tolerance =
-                    100.0 * diagonal.len() as f64 * eigenvalue_rounding_unit(max_abs);
+                let tolerance = psd_admission_band(diagonal.len(), max_abs);
                 if let Some((index, value)) = diagonal
                     .iter()
                     .copied()
@@ -350,6 +349,18 @@ fn eigenvalue_rounding_unit(scale: f64) -> f64 {
     f64::EPSILON * scale + f64::from_bits(1)
 }
 
+/// The negative curvature a positive semidefinite quadratic form of dimension `dimension` and
+/// largest eigenvalue magnitude `max_abs_eigenvalue` is admitted with: the band every
+/// [`PenaltyMatrix`] PSD check reads, `100·p·(ε·‖S‖ + 2⁻¹⁰⁷⁴)`.
+///
+/// Public so a sum of admitted penalties (a smoothing-parameter drift `Σ λ_k S_k`) is judged by
+/// the same rule its parts were: an eigensolver band alone, `p·ε·‖S‖`, is a hundred times
+/// tighter and refused, as not positive semidefinite, curvature every one of its parts had been
+/// admitted with.
+pub fn psd_admission_band(dimension: usize, max_abs_eigenvalue: f64) -> f64 {
+    100.0 * dimension as f64 * eigenvalue_rounding_unit(max_abs_eigenvalue)
+}
+
 /// Core quadratic-form validity: square, finite, symmetric (up to a
 /// scale-relative round-off band), and positive semidefinite (eigenvalues
 /// above the relative eigensolver noise floor `p·ε·‖S‖`, the same relative
@@ -404,7 +415,7 @@ fn validate_symmetric_psd_core(matrix: &Array2<f64>, what: &str) -> Result<(), S
     let max_abs_eval = eigenvalues
         .iter()
         .fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
-    let psd_tol = 100.0 * (nrows as f64) * (f64::EPSILON * max_abs_eval + f64::from_bits(1));
+    let psd_tol = psd_admission_band(nrows, max_abs_eval);
     if let Some(&min_eval) = eigenvalues
         .iter()
         .filter(|&&ev| ev < -psd_tol)

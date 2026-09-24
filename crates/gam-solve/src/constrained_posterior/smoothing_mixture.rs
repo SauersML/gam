@@ -205,8 +205,14 @@ impl NodePrecision for DenseNodePrecision {
 
 /// `R` with `RᵀR = D` for a symmetric positive semidefinite drift `D`, read
 /// off `D`'s own eigensystem with the eigenvalues its decomposition resolves
-/// (`gam_linalg::roundoff::resolved_eigenvalue_band`); an eigenvalue below the
-/// band's negative is a drift that is not positive semidefinite, and is refused.
+/// (`gam_linalg::roundoff::resolved_eigenvalue_band`).
+///
+/// A drift is a sum of admitted penalties `Σ λ_k S_k`, so it is refused as not positive
+/// semidefinite by the rule those penalties were admitted by
+/// ([`gam_problem::penalty_matrix::psd_admission_band`]), not by the eigensolver's band alone:
+/// that band is a hundred times tighter, and a binomial `flexible(loglog)` link-wiggle drift was
+/// refused for an eigenvalue of `−9.35e−13` against `8.94e−13`, curvature its penalties carried
+/// when they were admitted (#2155).
 pub fn drift_root(drift: &Array2<f64>) -> Result<Array2<f64>, String> {
     use faer::Side;
     use gam_linalg::faer_ndarray::FaerEigh;
@@ -225,10 +231,12 @@ pub fn drift_root(drift: &Array2<f64>) -> Result<Array2<f64>, String> {
         .map_err(|error| format!("smoothing mixture drift eigendecomposition: {error:?}"))?;
     let eigenvalues = eigenvalues.to_vec();
     let band = gam_linalg::roundoff::resolved_eigenvalue_band(&eigenvalues, 0.0);
-    if let Some(&negative) = eigenvalues.iter().find(|&&value| value < -band) {
+    let max_abs = eigenvalues.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    let admitted = gam_problem::penalty_matrix::psd_admission_band(p, max_abs);
+    if let Some(&negative) = eigenvalues.iter().find(|&&value| value < -admitted) {
         return Err(format!(
-            "smoothing mixture drift has eigenvalue {negative:.6e} below its rounding band \
-             {band:.6e}"
+            "smoothing mixture drift has eigenvalue {negative:.6e} below the negative curvature a \
+             penalty is admitted with, {admitted:.6e}"
         ));
     }
     let kept: Vec<usize> = (0..p).filter(|&index| eigenvalues[index] > band).collect();

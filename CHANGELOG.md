@@ -1,5 +1,11 @@
 ## Unreleased
 
+- **A smoothing-parameter drift is judged by the rule its penalties were admitted by** (gam#2155).
+  The smoothing-mixture drift `Σ λ_k S_k` was refused as not positive semidefinite against the
+  eigensolver band `p·ε·‖D‖`, a hundred times tighter than the `100·p·ε·‖S‖` every penalty is
+  admitted with. A binomial `flexible(loglog)` link-wiggle fit was refused for a drift eigenvalue
+  of `−9.35e−13` against `8.94e−13`, curvature its own penalties carried. The drift now reads the
+  same admission band, published as `psd_admission_band`.
 - **The log-determinant's root is taken from the design's rows, not from its Gram** (gam#2644,
   gam#3201). When the assembled Hessian cannot resolve `log|H|`, REML prices it from a root of
   `H = XᵀWX + S_λ`. The data half of that root was rooted from the formed Gram `XᵀWX` and truncated
