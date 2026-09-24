@@ -95,6 +95,9 @@ pub(crate) struct StartupStats {
     pub rejected_by_domain: usize,
     pub rejected_by_nonconvergence: usize,
     pub rejected_by_budget: usize,
+    /// Seeds whose converged mode the family's certificate refused as not
+    /// identified at that trial point (gam#3003).
+    pub rejected_not_identified: usize,
     pub rejected_other: usize,
 }
 
@@ -157,10 +160,18 @@ impl StartupStats {
                 // `classify_inner_error` records thirty lines above for
                 // `rejected_by_budget`, and it gets the same answer — an honest
                 // "unclassified" beats a confident wrong label.
+                InnerFailure::NotIdentified { .. } => stats.rejected_not_identified += 1,
                 InnerFailure::Other(_) => stats.rejected_other += 1,
             }
         }
         stats
+    }
+
+    /// Every rejection was the family's not-identified certificate, and there
+    /// was at least one: the seeds were not refused by numerics but by the
+    /// data at every trial point they proposed.
+    pub(crate) fn all_not_identified(&self) -> bool {
+        self.rejected_not_identified > 0 && self.rejected_not_identified == self.total_rejected()
     }
 
     pub(crate) fn total_rejected(&self) -> usize {
@@ -168,6 +179,7 @@ impl StartupStats {
             + self.rejected_by_domain
             + self.rejected_by_nonconvergence
             + self.rejected_by_budget
+            + self.rejected_not_identified
             + self.rejected_other
     }
 }
@@ -291,11 +303,12 @@ fn uniform_failure_attribution(stats: &StartupStats, rejections: &[SeedRejection
         return None;
     }
     // Exactly one non-empty rejection category, holding every rejection.
-    let categories: [(&str, usize); 5] = [
+    let categories: [(&str, usize); 6] = [
         ("KKT", stats.rejected_by_kkt),
         ("domain", stats.rejected_by_domain),
         ("non-convergence", stats.rejected_by_nonconvergence),
         ("budget", stats.rejected_by_budget),
+        ("not-identified", stats.rejected_not_identified),
         ("other", stats.rejected_other),
     ];
     let mut only: Option<(&str, usize)> = None;
@@ -362,11 +375,13 @@ pub(crate) fn format_no_seeds_passed(
     writeln!(
         &mut out,
         "  rejection breakdown: rejected_by_kkt={}, rejected_by_domain={}, \
-         rejected_by_nonconvergence={}, rejected_by_budget={}, rejected_other={} (total={})",
+         rejected_by_nonconvergence={}, rejected_by_budget={}, rejected_not_identified={}, \
+         rejected_other={} (total={})",
         stats.rejected_by_kkt,
         stats.rejected_by_domain,
         stats.rejected_by_nonconvergence,
         stats.rejected_by_budget,
+        stats.rejected_not_identified,
         stats.rejected_other,
         stats.total_rejected(),
     )
@@ -890,6 +905,32 @@ mod tests {
             !rendered.contains("NOT a seeding failure"),
             "2 listed reasons cannot establish that all 5 shared one cause:\n{rendered}"
         );
+    }
+
+
+    /// gam#4577: the seed screen reports the not-identified certificate as its
+    /// own outcome only when every rejection was that certificate.
+    #[test]
+    fn all_not_identified_needs_every_rejection_to_be_the_certificate_4577() {
+        let certificate = |idx: usize| {
+            SeedRejection::from_message(
+                idx,
+                "outer",
+                "the fitted objective 1e3 is not below the frozen-time limit 9e2".to_string(),
+            )
+        };
+        let every = StartupStats::from_rejections(2, 2, 2, 0, &[certificate(0), certificate(1)]);
+        assert_eq!(every.rejected_not_identified, 2);
+        assert_eq!(every.total_rejected(), 2);
+        assert!(every.all_not_identified());
+        let other = SeedRejection::from_message(
+            1,
+            "outer",
+            "some completely unrecognised legacy error".to_string(),
+        );
+        let mixed = StartupStats::from_rejections(2, 2, 2, 0, &[certificate(0), other]);
+        assert!(!mixed.all_not_identified());
+        assert!(!StartupStats::from_rejections(1, 1, 1, 1, &[]).all_not_identified());
     }
 
 }

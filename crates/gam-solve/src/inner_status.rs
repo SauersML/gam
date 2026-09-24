@@ -65,6 +65,9 @@ pub(crate) enum InnerFailure {
     /// unfittable in its current shape". No rho-anneal recovers this;
     /// the structural fix is to reparameterise the aliased block.
     IdentifiabilityFailure { message: String },
+    /// The family's certificate refused the converged mode as not identified
+    /// at this trial point (`CustomFamilyError::ModeNotIdentified`, gam#3003).
+    NotIdentified { message: String },
     /// Catch-all for strings that do not match any of the structured sentinels
     /// above. These are still rejected; the outer cascade just cannot classify
     /// them.
@@ -80,7 +83,8 @@ impl InnerFailure {
             | InnerFailure::TrustRegionFloor { message }
             | InnerFailure::LikelihoodFailure(message)
             | InnerFailure::Other(message) => message.as_str(),
-            InnerFailure::IdentifiabilityFailure { message } => message.as_str(),
+            InnerFailure::IdentifiabilityFailure { message }
+            | InnerFailure::NotIdentified { message } => message.as_str(),
         }
     }
 }
@@ -102,6 +106,11 @@ pub(crate) fn classify_estimation_error(
                 message: display_message,
             }
         }
+        EstimationError::CustomFamily(CustomFamilyError::ModeNotIdentified { .. }) => {
+            InnerFailure::NotIdentified {
+                message: display_message,
+            }
+        }
         EstimationError::OuterObjectiveEvaluationFailed { source, .. } => {
             if let Some(source) = source.estimation_error() {
                 classify_estimation_error(source, display_message)
@@ -120,6 +129,11 @@ pub(crate) fn classify_estimation_error(
 pub(crate) fn classify_inner_error(message: String) -> InnerFailure {
     if message.contains("IdentifiabilityFailure") || message.contains("identifiability audit") {
         return InnerFailure::IdentifiabilityFailure { message };
+    }
+    // The frozen-time certificate's own sentence, where the refusal reaches the
+    // seed screen as prose (an objective boundary that renders its error).
+    if message.contains("is not below the frozen-time limit") {
+        return InnerFailure::NotIdentified { message };
     }
     // The diagnostician's structured cert-refusal bubbled error carries
     // `diagnosis: <label>` near the end. Look for that first.
@@ -308,4 +322,26 @@ mod tests {
             }
         }
     }
+
+    /// gam#4577: the frozen-time certificate is classified as not identified,
+    /// typed or rendered to prose.
+    #[test]
+    fn classifies_the_frozen_time_certificate_as_not_identified_4577() {
+        let prose = "outer eval failed: inner solve refused this trial point: the fitted \
+                     objective 1.455773114e3 is not below the frozen-time limit 1.455757246e3 \
+                     reached along the marginal intercept going to +inf (gam#3003)"
+            .to_string();
+        assert!(matches!(
+            classify_inner_error(prose),
+            InnerFailure::NotIdentified { .. }
+        ));
+        let typed = EstimationError::CustomFamily(CustomFamilyError::ModeNotIdentified {
+            reason: "the fitted objective is not below the frozen-time limit".to_string(),
+        });
+        assert!(matches!(
+            classify_estimation_error(&typed, typed.to_string()),
+            InnerFailure::NotIdentified { .. }
+        ));
+    }
+
 }

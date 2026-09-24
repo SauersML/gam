@@ -396,6 +396,17 @@ pub trait IndependentOuterSearch<F> {
     fn additional_outer_start_levels(&self) -> Vec<f64>;
 }
 
+
+/// Why a converged coefficient mode is refused as a mode of its trial point's
+/// posterior ([`CustomFamily::coefficient_mode_refusal`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CoefficientModeRefusal {
+    /// The objective falls below the mode along a boundary the coefficient
+    /// space approaches without reaching, so the posterior's infimum is not a
+    /// mode and these data do not identify the fitted point at this trial
+    /// point (gam#3003). `reason` is the family's certificate, for the message.
+    NotIdentified { reason: String },
+}
 /// User-defined family contract for multi-block generalized models.
 pub trait CustomFamily {
     /// Optional sampled-derivative pilot owned by this family.
@@ -566,7 +577,8 @@ pub trait CustomFamily {
     }
 
     /// Why a converged coefficient mode is not a mode of its trial point's
-    /// posterior, when the family can prove it is not (gam#3003).
+    /// posterior, when the family can prove it is not (gam#3003), typed so a
+    /// caller acting on the verdict reads it and not its text (gam#4577).
     ///
     /// Convergence certifies stationarity. It cannot see a boundary the
     /// coefficient space approaches without reaching, along which the objective
@@ -587,7 +599,7 @@ pub trait CustomFamily {
         log_likelihood: f64,
         penalty_value: f64,
         s_lambdas: &[Array2<f64>],
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<CoefficientModeRefusal>, String> {
         // "Nothing refutes this mode" is a statement about one coefficient point
         // of one objective, so its parts must describe the same blocks.
         assert_states_match_specs(states, specs, "coefficient mode refusal");

@@ -16,6 +16,7 @@
 use gam_runtime::warm_start::Session as CacheSession;
 
 use crate::estimate::EstimationError;
+use gam_problem::CustomFamilyError;
 
 use crate::estimate::reml::reml_outer_engine::BarrierConfig;
 

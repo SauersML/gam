@@ -2863,13 +2863,23 @@ pub(crate) fn run_outer_with_plan(
         );
         let structural = uniform_structural_key(&seed_rejections, 1);
         if started_seeds == 0 {
-            EstimationError::StartupSeedsRefused(format_no_seeds_passed(
+            let message = format_no_seeds_passed(
                 context,
                 &stats,
                 &seed_rejections,
                 structural.as_ref(),
                 "",
-            ))
+            );
+            // Every start's mode was refused by the family's not-identified
+            // certificate: the verdict is the data's, not the seeding's, and
+            // it keeps its type through the screen (gam#4577).
+            if stats.all_not_identified() {
+                EstimationError::CustomFamily(CustomFamilyError::ModeNotIdentified {
+                    reason: message,
+                })
+            } else {
+                EstimationError::StartupSeedsRefused(message)
+            }
         } else {
             // The start reached the outer optimiser but did not converge. Keep
             // the structured payload so the caller sees the per-rejection

@@ -798,6 +798,7 @@ pub(crate) fn frozen_time_identification(
 mod tests {
     use super::*;
     use crate::custom_family::CustomFamily;
+    use gam_model_api::families::custom_family::CoefficientModeRefusal;
     use gam_linalg::matrix::DenseDesignMatrix;
 
     const ROWS: usize = 48;
@@ -1237,10 +1238,11 @@ mod tests {
         let specs = blocks(&family);
         let at = states(&family, shape_over(1e3), ndarray::array![0.3, -0.2], 1e3);
         let log_likelihood = family.log_likelihood_only(&at).expect("evaluate");
-        let reason = family
+        let refusal = family
             .coefficient_mode_refusal(&specs, &at, log_likelihood, penalty(&at), &s_lambdas())
             .expect("the hook evaluates")
             .expect("the joint criterion must refuse this trial point");
+        let CoefficientModeRefusal::NotIdentified { reason } = refusal;
         assert!(reason.contains("frozen-time limit"), "{reason}");
     }
 

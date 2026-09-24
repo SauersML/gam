@@ -803,6 +803,16 @@ pub enum CustomFamilyError {
     /// untrue.
     #[error("inner solve refused this trial point: {reason}")]
     TrialPointRefused { reason: String },
+    /// The inner solve converged to a mode the family proves is not a mode of
+    /// this trial point's posterior: the objective falls below it along a
+    /// boundary the coefficient space approaches without reaching, so these
+    /// data do not identify the fitted point at this trial point (gam#3003).
+    /// A statement about one trial point like [`Self::TrialPointRefused`],
+    /// and refused by the outer search the same way; its own variant because a
+    /// caller acting on the verdict (a study reporting a model as not
+    /// identified) reads the type, not the text (gam#4577).
+    #[error("inner solve refused this trial point: {reason}")]
+    ModeNotIdentified { reason: String },
     /// The outer smoothing search ended without a certified optimum after
     /// every strategy fallback, so no fit was assembled.
     ///
@@ -1601,7 +1611,7 @@ impl CustomFamilyError {
             Self::InnerSolveNotConverged { .. } => true,
             // Likewise rho-local: a numerical refusal evaluated at one trial
             // point, which becomes true or false by moving theta (gam#2590).
-            Self::TrialPointRefused { .. } => true,
+            Self::TrialPointRefused { .. } | Self::ModeNotIdentified { .. } => true,
             // Everything else is a property of the configuration, the
             // data, or the numerics, and does not become true or false by
             // moving theta.
@@ -1637,7 +1647,8 @@ impl CustomFamilyError {
             | Self::FitEndedWithoutCertifiedInnerMode { .. }
             // Reaching the boundary, a trial-point refusal means the search
             // never found a point it could evaluate.
-            | Self::TrialPointRefused { .. } => FailureCategory::Convergence,
+            | Self::TrialPointRefused { .. }
+            | Self::ModeNotIdentified { .. } => FailureCategory::Convergence,
             Self::OuterSmoothingFailed { outer_error, .. } => outer_error.failure_category(),
             Self::InvalidInput { .. }
             | Self::UnsupportedConfiguration { .. }
@@ -1683,6 +1694,7 @@ impl CustomFamilyError {
             Self::IdentifiabilityFailure { .. } => "CustomFamilyError::IdentifiabilityFailure",
             Self::MapUniquenessFailure { .. } => "CustomFamilyError::MapUniquenessFailure",
             Self::TrialPointRefused { .. } => "CustomFamilyError::TrialPointRefused",
+            Self::ModeNotIdentified { .. } => "CustomFamilyError::ModeNotIdentified",
             Self::OuterSmoothingFailed { outer_error, .. } => outer_error.variant_name(),
             Self::FitEndedWithoutCertifiedInnerMode { .. } => {
                 "CustomFamilyError::FitEndedWithoutCertifiedInnerMode"
@@ -1743,4 +1755,26 @@ impl CustomFamilyError {
                 .map(InnerConvergenceTerminalState::reason_label),
         })
     }
+
+    /// gam#4577: the not-identified verdict is a trial-point refusal to the
+    /// outer search and its own variant to a caller reading the type.
+    #[test]
+    fn mode_not_identified_is_a_typed_trial_point_refusal_4577() {
+        let refusal = || CustomFamilyError::ModeNotIdentified {
+            reason: "the fitted objective 1.0e0 is not below the frozen-time limit 9.0e-1".to_string(),
+        };
+        assert!(refusal().is_trial_point_infeasible());
+        assert_eq!(refusal().variant_name(), "CustomFamilyError::ModeNotIdentified");
+        assert_eq!(refusal().failure_category(), crate::FailureCategory::Convergence);
+        assert!(matches!(
+            refusal().into_trial_point(),
+            CustomFamilyError::ModeNotIdentified { .. }
+        ));
+        assert!(
+            refusal()
+                .to_string()
+                .starts_with("inner solve refused this trial point: the fitted objective")
+        );
+    }
+
 }

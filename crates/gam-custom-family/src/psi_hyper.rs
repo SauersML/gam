@@ -2973,7 +2973,7 @@ pub(crate) fn certify_inner_mode<F: CustomFamily + Clone + Send + Sync + 'static
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
     // gam#3003: a converged mode the family proves is not a mode of this trial
     // point's posterior refuses the trial point, as an unconverged one does.
-    if let Some(reason) = family
+    if let Some(refusal) = family
         .coefficient_mode_refusal(
             specs,
             &inner.block_states,
@@ -2983,7 +2983,11 @@ pub(crate) fn certify_inner_mode<F: CustomFamily + Clone + Send + Sync + 'static
         )
         .map_err(CustomFamilyError::from)?
     {
-        return Err(CustomFamilyError::TrialPointRefused { reason });
+        return Err(match refusal {
+            CoefficientModeRefusal::NotIdentified { reason } => {
+                CustomFamilyError::ModeNotIdentified { reason }
+            }
+        });
     }
     Ok(())
 }

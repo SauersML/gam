@@ -108,6 +108,7 @@ pub(crate) use gam_problem::*;
 // E0659 ambiguity in the gam-models facade.
 pub use gam_model_api::families::custom_family::{
     BlockwiseFitOptions,
+    CoefficientModeRefusal,
     CustomFamily,
     FamilyEvaluation,
     OuterDerivativePilotSchedule,

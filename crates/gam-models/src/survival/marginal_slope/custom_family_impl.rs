@@ -4,6 +4,7 @@
 //! constraints, and post-update feasibility).
 
 use super::*;
+use gam_model_api::families::custom_family::CoefficientModeRefusal;
 use gam_problem::ConstraintSet;
 
 /// [`SurvivalMarginalSlopeFamily`]'s contracted trace Hessian prepared at ONE coefficient
@@ -218,7 +219,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         log_likelihood: f64,
         penalty_value: f64,
         s_lambdas: &[Array2<f64>],
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<CoefficientModeRefusal>, String> {
         let geometry = FrozenTimeGeometry::new(self)?;
         let verdict = frozen_time_identification(
             self,
@@ -230,7 +231,9 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             penalty_value,
         )?;
         log::debug!("[survival-marginal-slope] frozen-time certificate {verdict:?}");
-        Ok(verdict.refusal_reason())
+        Ok(verdict
+            .refusal_reason()
+            .map(|reason| CoefficientModeRefusal::NotIdentified { reason }))
     }
 
     /// #808: engage the inner self-vanishing Levenberg–Marquardt μ on a
