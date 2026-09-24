@@ -137,7 +137,7 @@ jobs:
       - name: Compile gamfit with invalid string escapes as errors (#2975)
         # An invalid escape such as `\h` in a docstring's :math:`\hat\varphi` is a
         # DeprecationWarning on Python 3.11, a SyntaxWarning from 3.12, and will be a
-        # SyntaxError that breaks `import gamfit`. gamfit 0.1.275 shipped one because
+        # SyntaxError that breaks `import gamfit`. gamfit 0.1.276 shipped one because
         # nothing compiled the package with those warnings as errors. compileall only
         # compiles, so no runtime deprecation can trip it, and it runs before the wheel
         # build so a new escape fails in seconds.

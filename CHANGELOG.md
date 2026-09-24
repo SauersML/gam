@@ -1208,7 +1208,10 @@
   construction — both children re-derive their tube from their own bounds and their union is
   the parent — so only `HonestConformalCost::z_cells` moves.
 
-## gamfit 0.1.275 (2026-09-24)
+## gamfit 0.1.276 (2026-09-24)
+
+- **A Bernoulli marginal-slope fit is 3.8 times cheaper than 0.1.275** (gnomon biobank study): the anchor's Taylor table is solved in linear space wherever that solve keeps 32 bits of every coefficient on the anchor's scale, with its rounding propagated through the solve, and in logarithms (gam#3639) only where it does not — the tails. A 16,000-row fit: 5690 → 1485 CPU-seconds.
+- **A location-scale survival model's sigma-point posterior mean** replays its coefficient nodes on designs assembled once instead of re-running the whole prediction per node.
 
 - **`outer_start_levels`** on a Bernoulli marginal-slope fit request chooses the multistart's levels beside the derived start (default unchanged: 0, +inf, 2, 4, -2); each level is one certified outer search, so a study that certifies its optimum from fewer pays for fewer (gnomon#2359).
 
