@@ -284,7 +284,25 @@ pub(crate) fn closed_form_row_ridge(
     let kappa_ridge = (lambda_max - kappa_max * lambda_min
         + c * spectral_radius * (1.0 + kappa_max))
         / (kappa_max * (1.0 - c) - 1.0 - c);
-    let ridge = ridge_t.max(pivot_ridge).max(kappa_ridge);
+    let mut ridge = ridge_t.max(pivot_ridge).max(kappa_ridge);
+    // #4077 — an exactly-zero spectrum (`spectral_radius == 0`, an all-zero
+    // symmetric block) is a STRUCTURAL null, not an ill-conditioned one: the
+    // active-bound pin (#3438) writes an exactly-zero `H_tt` row and column by
+    // design, and `B` deliberately carries no curvature there so the evidence
+    // pencil can price the slot at the metric's unit stiffness. The two linear
+    // conditions above both evaluate to 0 for such a block, so the derivation's
+    // answer is the unattained infimum 0: retrying at ridge 0 factors the same
+    // zero matrix and fails identically, converting a designed pin into a
+    // `PerRowFactorFailed` refusal. The derivation is defined as the smallest
+    // ridge that passes the gate; every r > 0 passes it for this block (pivots
+    // r, κ 1, pivot_min √ε·0 = 0), and the pencil's own convention for a
+    // structural null is unit stiffness — its evidence contribution is
+    // log 1 = 0 and, the row's `g_t` being exactly zero there, its step
+    // contribution is exactly zero at ANY positive ridge. Floor the answer at
+    // the unit, keeping any larger caller base.
+    if spectral_radius == 0.0 {
+        ridge = ridge.max(1.0);
+    }
     if ridge.is_finite() {
         Ok(ridge)
     } else {
