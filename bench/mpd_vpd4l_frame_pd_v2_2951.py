@@ -86,6 +86,7 @@ class Target:
 
 
 ADAPTIVE = {"on": False}
+ROUTE = {"subset": None}
 
 
 def select(energy, L):
@@ -177,6 +178,14 @@ def main():
                         help="biorth: an invertible V on GL(d), pieces b_k a_k^T with B = V^{-T}; exact for every V")
     parser.add_argument("--adaptive", action="store_true",
                         help="batch-level top-(n L) selection per matrix: same mean pieces per token, adaptive per token")
+    parser.add_argument("--energy-report", action="store_true",
+                        help="per matrix, the mean fraction of each token's output energy its dropped pieces carry "
+                             "(the exact bound on any partial re-adding of them)")
+    parser.add_argument("--subset-routing", action="store_true",
+                        help="each training step restricts a random half of the matrices, the rest run exactly "
+                             "(VPD's subset routing): no piece can learn to undo another's restriction")
+    parser.add_argument("--eval-stoch", type=int, default=0,
+                        help="VPD's kl_stoch_masked: mean KL with inactive pieces re-added by uniform [0,1] masks, over this many draws")
     parser.add_argument("--resume-frames", default="", help="load frames saved by an earlier run (skips ODL)")
     parser.add_argument("--tf32-train", action="store_true",
                         help="TF32 matmuls in training steps only; every evaluation stays full fp32")
@@ -244,6 +253,8 @@ def main():
             if args.only == "mlp" and mat not in ("fc", "down") or args.only == "attn" and mat in ("fc", "down"):
                 return y
             if args.only_site and args.only_site != f"{l}:{mat}":
+                return y
+            if ROUTE["subset"] is not None and (l, mat) not in ROUTE["subset"]:
                 return y
             mk = None if masks is None else masks[(l, mat)]
             if args.frame_kind == "biorth":
@@ -342,17 +353,23 @@ def main():
         for k in keys:
             frames[k].requires_grad_(True)
         torch.backends.cuda.matmul.allow_tf32 = args.tf32_train
+        if args.subset_routing:
+            ROUTE["subset"] = {k for k in keys if torch.rand(1, generator=gen).item() < 0.5}
         with torch.enable_grad():
             loss = batch_kl(ids)
             if args.stochastic:
                 smask = {k: torch.rand(shapes[k], device=dev) for k in keys}
                 loss = 0.5 * loss + 0.5 * batch_kl(ids, smask)
-            grads = torch.autograd.grad(loss, [frames[k] for k in keys])
+            grads = torch.autograd.grad(loss, [frames[k] for k in keys], allow_unused=True)
         torch.backends.cuda.matmul.allow_tf32 = False  # every evaluation runs in full fp32
+        ROUTE["subset"] = None  # every evaluation restricts every matrix
         trace.append(loss.item())
         with torch.no_grad():
             for k, g in zip(keys, grads):
                 X = frames[k].detach()
+                if g is None:  # not restricted on this step (subset routing): no update, frame stays on O(d)
+                    frames[k] = X
+                    continue
                 if args.frame_kind == "biorth":
                     mom[k].mul_(0.9).add_(0.1 * g)
                     sq[k].mul_(0.999).add_(0.001 * g.pow(2))
@@ -398,6 +415,35 @@ def main():
     report["frame_orthonormality_defect_max"] = worst
     print(f"[frame4l] FINAL {report['final']} (VPD rounded 0.291, stochastic 0.207); max |X^T X - I| {worst:.2e}",
           flush=True)
+    if args.energy_report:
+        dropped = {}
+
+        def probe(l, mat, y, z=None):
+            full = y
+            kept = edit_with()(l, mat, y, z)
+            e_full = full.pow(2).sum(-1)
+            e_drop = (full - kept).pow(2).sum(-1)
+            dropped.setdefault((l, mat), []).append((e_drop / e_full.clamp_min(1e-30)).mean().item())
+            return full
+        model.edit = probe
+        with torch.no_grad():
+            for ids in held:
+                model(ids.to(dev)[:, :-1])
+        model.edit = None
+        report["dropped_energy_fraction"] = {f"{k[0]}:{k[1]}": sum(v) / len(v) for k, v in dropped.items()}
+        print("[frame4l] dropped output-energy fraction per matrix (clean stream): " +
+              " ".join(f"{k}={v:.3f}" for k, v in report["dropped_energy_fraction"].items()), flush=True)
+    if args.eval_stoch > 0:
+        g3 = torch.Generator(device=dev).manual_seed(args.seed + 7)
+        vals = []
+        with torch.no_grad():
+            for _ in range(args.eval_stoch):
+                smask = {k: torch.rand(shapes[k], generator=g3, device=dev) for k in keys}
+                for ids in held:
+                    vals.append(batch_kl(ids.to(dev), smask).item())
+        report["kl_stoch_masked"] = sum(vals) / len(vals)
+        print(f"[frame4l] stochastic-mask KL (inactive pieces re-added with uniform masks, {args.eval_stoch} draws): "
+              f"{report['kl_stoch_masked']:.4f} (VPD kl_stoch_masked 0.2066)", flush=True)
     if args.pgd_steps > 0:
         g2 = torch.Generator(device=dev).manual_seed(args.seed)
         masks = {k: torch.rand(shapes[k], generator=g2, device=dev) for k in keys}
@@ -407,10 +453,11 @@ def main():
                 masks[k].requires_grad_(True)
             with torch.enable_grad():
                 loss = batch_kl(ids, masks)
-                grads = torch.autograd.grad(loss, [masks[k] for k in keys])
+                grads = torch.autograd.grad(loss, [masks[k] for k in keys], allow_unused=True)
             with torch.no_grad():
                 for k, g in zip(keys, grads):
-                    masks[k] = (masks[k] + 0.1 * g.sign()).clamp(0, 1).detach()
+                    if g is not None:  # a mask of an unrestricted matrix (diagnosis) never enters the graph
+                        masks[k] = (masks[k] + 0.1 * g.sign()).clamp(0, 1).detach()
         with torch.no_grad():
             report["pgd"] = batch_kl(ids, masks).item()
         print(f"[frame4l] PGD-{args.pgd_steps} (inactive pieces re-added adversarially, shared masks): "
