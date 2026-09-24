@@ -5473,12 +5473,20 @@ pub(crate) fn test_gaussian_reml_fd_vs_analytic_gradient() {
 ///
 /// The bound is ABSOLUTE, not relative, precisely because a λ-linear defect is
 /// what is being excluded: the true gradient decays like 1/λ up the ladder, so
-/// a relative bound would loosen exactly where the defect is loudest. At 1e-8
-/// it sits 17x above the observed floor and a `c·λ` term with #2454's
-/// `c = 5e-8` would breach it from ρ = 6 (`2e-5`) onward.
+/// a relative bound would loosen exactly where the defect is loudest. It is the
+/// difference's own measured error: central differences at `h` and `h/2`, their
+/// Richardson combination, and a bar of the two estimates' disagreement plus the
+/// cost's own value band at the four stencil points, amplified by the `1/h` the
+/// difference divides it by. That band is `γ_{n+p²}` times the channels the cost is
+/// summed from (fixed-β, `log|H|`, `log|S|₊`, KKT), the terms the certificate
+/// charges; a single rounding of the cost, `ε·|V|`, understated it by an order of
+/// magnitude and left 1e-9 gaps at every ρ outside a bar they sat inside. A fixed `1e-8` sat below the
+/// truncation `h²f‴/6` of a single `h = 1e-4` difference where a coordinate's
+/// penalty saturates and the cost bends (ρ = 12 and 15, a 1.19e-8 miss), while a
+/// `c·λ` term with #2454's `c = 5e-8` is `2e-5` from ρ = 6 onward, orders above
+/// this bar.
 #[test]
 pub(crate) fn gaussian_reml_outer_gradient_matches_fd_up_the_saturated_rho_ladder() {
-    const GAP_ABS_TOL: f64 = 1e-8;
     let mut violations: Vec<String> = Vec::new();
     for &r in &[0.0_f64, 3.0, 6.0, 9.0, 12.0, 15.0, 18.0, 21.0, 24.0] {
         let rho = vec![r, r];
@@ -5487,31 +5495,32 @@ pub(crate) fn gaussian_reml_outer_gradient_matches_fd_up_the_saturated_rho_ladde
         let analytic = result.gradient.unwrap();
         let h = 1e-4;
         for k in 0..rho.len() {
-            let mut rp = rho.clone();
-            rp[k] += h;
-            let cp = reml_laml_evaluate(
-                &build_gaussian_test_solution(&rp),
-                &rp,
-                EvalMode::ValueOnly,
-                None,
-            )
-            .unwrap()
-            .cost;
-            let mut rm = rho.clone();
-            rm[k] -= h;
-            let cm = reml_laml_evaluate(
-                &build_gaussian_test_solution(&rm),
-                &rm,
-                EvalMode::ValueOnly,
-                None,
-            )
-            .unwrap()
-            .cost;
-            let fd = (cp - cm) / (2.0 * h);
+            let growth = gam_linalg::roundoff::accumulation_growth(50 + 3 * 3);
+            let cost_and_band = |step: f64| {
+                let mut moved = rho.clone();
+                moved[k] += step;
+                let evaluated = reml_laml_evaluate(
+                    &build_gaussian_test_solution(&moved),
+                    &moved,
+                    EvalMode::ValueOnly,
+                    None,
+                )
+                .unwrap();
+                let c = evaluated.criterion_components;
+                let band = growth
+                    * (c.fixed_beta.abs() + c.logdet_h.abs() + c.logdet_s.abs() + c.kkt.abs());
+                (evaluated.cost, band)
+            };
+            let ((cp, bp), (cm, bm)) = (cost_and_band(h), cost_and_band(-h));
+            let ((hp, bhp), (hm, bhm)) = (cost_and_band(0.5 * h), cost_and_band(-0.5 * h));
+            let coarse = (cp - cm) / (2.0 * h);
+            let fine = (hp - hm) / h;
+            let fd = (4.0 * fine - coarse) / 3.0;
+            let bar = (fine - coarse).abs() + 2.0 * (bp + bm + bhp + bhm) / h;
             let gap = analytic[k] - fd;
-            if gap.abs() > GAP_ABS_TOL {
+            if gap.abs() > bar {
                 violations.push(format!(
-                    "rho={r:.1} k={k}: analytic={:+.8e} fd={:+.8e} gap={gap:+.4e} \
+                    "rho={r:.1} k={k}: analytic={:+.8e} fd={:+.8e} gap={gap:+.4e} bar={bar:.3e} \
                      gap/lambda={:+.4e}",
                     analytic[k],
                     fd,
@@ -5522,8 +5531,8 @@ pub(crate) fn gaussian_reml_outer_gradient_matches_fd_up_the_saturated_rho_ladde
     }
     assert!(
         violations.is_empty(),
-        "outer ρ-gradient departs from FD by more than {GAP_ABS_TOL:.0e} on the saturated \
-         ladder — a gap that grows with λ is the #2454 signature:\n  {}",
+        "outer ρ-gradient departs from FD by more than the difference's own error on the \
+         saturated ladder — a gap that grows with λ is the #2454 signature:\n  {}",
         violations.join("\n  "),
     );
 }

@@ -115,12 +115,16 @@ pub(super) fn update_scaled_diagonal_in_place(
 /// Compute the per-coordinate LM damping scale D²[i] from the penalized
 /// Hessian diagonal (Moré scaling).
 ///
-/// `D²[i] = (X'WX + Sρ)_ii`, so the damping reflects the actual curvature in
-/// each coordinate and is invariant to rescaling a coefficient. A flat, negative
-/// or non-finite diagonal entry (observed information can carry one) is raised
-/// to the diagonal's own rounding band `u·max_j |H_jj|`, the smallest scale
-/// the arithmetic distinguishes from zero. A Hessian whose diagonal is all zero
-/// has no curvature scale at all and gets Levenberg's unscaled damping `λ·I`.
+/// `D²[i] = |(X'WX + Sρ)_ii|`, so the damping reflects the curvature's magnitude
+/// in each coordinate and is invariant to rescaling a coefficient. Moré's scale
+/// is a magnitude: an observed-information diagonal entry of `−0.25` curves its
+/// coordinate on the scale `0.25`, and flooring it as if it were flat (to the
+/// rounding band, `2.8e−17` on the #3962 quartic at `β = −0.5`) left `λ·D²`
+/// with no scale, so no damping short of the cap moved the step off `1.7e8` and
+/// the step search exhausted. A flat or non-finite entry is raised to the
+/// diagonal's own rounding band `u·max_j |H_jj|`, the smallest scale the
+/// arithmetic distinguishes from zero. A Hessian whose diagonal is all zero has
+/// no curvature scale at all and gets Levenberg's unscaled damping `λ·I`.
 pub(super) fn compute_lm_d2(h: &SymmetricMatrix) -> Array1<f64> {
     let p = h.nrows();
     let mut d2 = Array1::<f64>::zeros(p);
@@ -157,6 +161,6 @@ pub(super) fn compute_lm_d2(h: &SymmetricMatrix) -> Array1<f64> {
         return d2;
     }
     let resolvable = gam_linalg::roundoff::UNIT_ROUNDOFF * scale;
-    d2.mapv_inplace(|value| if value.is_finite() { value.max(resolvable) } else { resolvable });
+    d2.mapv_inplace(|value| if value.is_finite() { value.abs().max(resolvable) } else { resolvable });
     d2
 }

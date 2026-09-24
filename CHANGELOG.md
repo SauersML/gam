@@ -1,5 +1,9 @@
 ## Unreleased
 
+- **P-IRLS damps a coordinate by its curvature's magnitude** (gam#3962). The Levenberg–Marquardt
+  scale `D²` was the penalized Hessian's diagonal floored to its rounding band, so a coordinate whose
+  observed curvature is negative (an indefinite early iterate) got a damping scale of about `1e−17`:
+  no damping short of the cap moved the step, and the step search exhausted. `D²` is now `|H_ii|`.
 - **A shape-constrained Gaussian fit's outer search has its exact Hessian** (gam#3234). At profiled
   dispersion the constrained Laplace term reads the profiled scale's second-order channel, and the
   criterion used to declare no outer Hessian there, so monotone, convex and concave fits searched
