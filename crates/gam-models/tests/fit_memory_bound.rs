@@ -135,13 +135,20 @@ fn dataset(family: &str, n: usize) -> EncodedDataset {
     encode_recordswith_inferred_schema(headers, rows).expect("encode the memory-bound fixture")
 }
 
-/// Fits `y ~ s(x)` and returns the fitted dense design's bytes.
+/// The smooth every fixture fits, at an explicit size. A formula default grows its basis
+/// from each fit's own evidence (#3331), so the two families realized different widths on
+/// the same rows (147 and 291 columns at n = 50 000) and could not be compared as fits of
+/// one design. An explicit size carries no adaptive provenance, so every fit of it has one
+/// shape and one refit.
+const FORMULA: &str = "y ~ s(x, k=40)";
+
+/// Fits [`FORMULA`] and returns the fitted dense design's bytes.
 fn fit(family: &str, data: &EncodedDataset) -> usize {
     let config = FitConfig {
         family: Some(family.to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x)", data, &config)
+    let result = fit_from_formula(FORMULA, data, &config)
         .unwrap_or_else(|error| panic!("{family} fit failed: {error:?}"));
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard {family} fit");
