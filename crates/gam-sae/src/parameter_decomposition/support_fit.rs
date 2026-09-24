@@ -47,9 +47,15 @@
 //!
 //! Within one fidelity level, supports never regain a piece and `θ` never leaves the
 //! admissible set, so the kept count is non-increasing. Each alternation takes one
-//! trust-region iteration resumed from the previous one (its radius and certificate
-//! scale carried), so the pieces never converge to the centre for supports the next
-//! search replaces. The level ends when the supports stop shrinking and the
+//! trust-region iteration resumed from the previous one (its certificate scale
+//! carried), so the pieces never converge to the centre for supports the next search
+//! replaces. A trust radius describes where one objective's model holds: it is carried
+//! while the supports stand, and when a search changes them the iteration starts from
+//! the new objective's own model scale. Carrying it across a search collapses it: an
+//! accepted step at the boundary doubles it, the search then removes pieces up to the
+//! budget (a more curved objective), its first trial at the doubled radius is rejected
+//! and quarters it, halving the radius every alternation (from 1.9e-2 to 1e-6 on the
+//! modular-addition fit, 0.19 to 0.09 on the 4-layer target, both still descending). The level ends when the supports stop shrinking and the
 //! certificate holds: the fit comes only from a converged optimization.
 //!
 //! # Continuation in the fidelity
@@ -335,11 +341,14 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
             .map_err(SupportFitError::Support)?;
         // One resumed trust-region iteration per alternation: the supports the barrier
         // holds fixed are re-decided between iterations, and the resume keeps the
-        // learned radius and the certificate's scale. The level ends only when the
+        // certificate's scale, and the learned radius while the supports stand (see the
+        // module docs for why not across a search). The level ends only when the
         // supports stop shrinking and the certificate holds, so every level (and the
         // fit) comes from a converged optimization.
         let step = RiemannianTrustRegion { max_iter: 1, grad_tol: certificate, ..RiemannianTrustRegion::default() };
         let mut state: Option<TrustRegionTermination> = None;
+        // The supports the last trust-region iteration's radius was learned on.
+        let mut solved_on: Option<Array2<bool>> = None;
         let mut level_radius = carried_radius;
         let theta_at_level_start = theta.clone();
         loop {
@@ -357,11 +366,18 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
                         level_radius = Some(radius);
                         RiemannianTrustRegion { radius, ..step.clone() }.minimize_reporting_termination(&manifold, &mut barrier, theta.view())
                     }
-                    Some(previous) => step.resume(
-                        &manifold,
-                        &mut barrier,
-                        &TrustRegionTermination { point: theta.clone(), ..previous.clone() },
-                    ),
+                    Some(previous) => {
+                        let radius = if solved_on.as_ref() == Some(&at) {
+                            previous.radius
+                        } else {
+                            model_scale(&mut barrier, theta.view()).map_err(SupportFitError::Geometry)?
+                        };
+                        step.resume(
+                            &manifold,
+                            &mut barrier,
+                            &TrustRegionTermination { point: theta.clone(), radius, ..previous.clone() },
+                        )
+                    }
                 };
                 if let Some(e) = barrier.error.take() {
                     return Err(SupportFitError::Executor(e));
@@ -375,6 +391,7 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
                 d.dot(&d).sqrt()
             };
             theta = termination.point.clone();
+            solved_on = Some(at.clone());
             let certified = termination.residual <= termination.tolerance;
             // Search only when the slack the step opened could buy the cheapest predicted
             // removal: otherwise the search cannot remove anything and costs a round of

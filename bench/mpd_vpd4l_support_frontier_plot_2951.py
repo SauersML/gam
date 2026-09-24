@@ -23,8 +23,8 @@ def main():
     parser.add_argument("--vpd-history", required=True)
     parser.add_argument("--ours", nargs="*", default=[], help="label=path.json pairs")
     parser.add_argument("--path", nargs="*", default=[],
-                        help="label=log pairs: a support_fit log's barrier-view lines (rank units and KL at the supports "
-                             "the fit holds), drawn as that fit's sparsity-fidelity path")
+                        help="label=log pairs: a support_fit log's barrier-view or supports lines (rank units and KL at "
+                             "the supports the fit holds), drawn as that fit's sparsity-fidelity path")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
     hist = json.load(open(args.vpd_history))["data"]["project"]["run"]["sampledHistory"][0]
@@ -47,10 +47,13 @@ def main():
             h = r["heldout"]
             ax.scatter([h["rank_units_mean"]], [h["kl_mean"]], marker="X", s=110, edgecolor="black", zorder=6,
                        label=f"{label}, held out: {h['rank_units_mean']:.0f} at KL {h['kl_mean']:.3f}")
-    view = re.compile(r"barrier view \d+: rank units/position ([0-9.]+) \(fixed supports\), KL mean ([0-9.]+)")
+    # the c_fc fit's barrier views, and the all-matrices fit's supports after each search
+    views = [re.compile(r"barrier view \d+: rank units/position ([0-9.]+) \(fixed supports\), KL mean ([0-9.]+)"),
+             re.compile(r"\[all\] supports: rank units/position ([0-9.]+); KL mean ([0-9.]+)")]
     for spec in args.path:
         label, path = spec.split("=", 1)
-        pts = [(float(a), float(b)) for a, b in view.findall(open(path).read()) if float(a) > 0]
+        text = open(path).read()
+        pts = [(float(a), float(b)) for view in views for a, b in view.findall(text) if float(a) > 0]
         if pts:
             xs, ys = zip(*pts)
             ax.plot(xs, ys, "-", lw=1, alpha=0.7, label=f"{label} (fit path, {len(pts)} views)")
