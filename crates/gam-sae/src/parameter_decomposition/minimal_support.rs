@@ -163,6 +163,9 @@ pub struct MinimalSupport {
     /// `KL_t` at `keep`.
     pub divergence: Array1<f64>,
     pub rounds: Vec<SupportRound>,
+    /// Each position's trust radius at the end: a later search resumed with these
+    /// continues at the learned proposal sizes instead of relearning them from one.
+    pub radius: Vec<usize>,
 }
 
 fn checked(eval: SupportEvaluation, positions: usize, pieces: usize) -> Result<SupportEvaluation, SupportError> {
@@ -199,16 +202,29 @@ fn checked(eval: SupportEvaluation, positions: usize, pieces: usize) -> Result<S
     Ok(eval)
 }
 
+/// The first `count` of `candidates` under the total order `before`, in that order: a
+/// selection (`O(n)`) and a sort of the selected prefix only, which returns exactly the
+/// prefix a full sort would.
+fn first_in_order<F: Fn(usize, usize) -> std::cmp::Ordering>(mut candidates: Vec<usize>, count: usize, before: F) -> Vec<usize> {
+    if count == 0 {
+        return Vec::new();
+    }
+    if count < candidates.len() {
+        candidates.select_nth_unstable_by(count - 1, |&a, &b| before(a, b));
+        candidates.truncate(count);
+    }
+    candidates.sort_by(|&a, &b| before(a, b));
+    candidates
+}
+
 /// Each position's proposal: its first `radius[t]` kept pieces in increasing predicted
 /// cost (ties to the lower index).
 fn propose(keep: ArrayView2<'_, bool>, cost: ArrayView2<'_, f64>, radius: &[usize]) -> Vec<Vec<usize>> {
     let (positions, pieces) = keep.dim();
     (0..positions)
         .map(|t| {
-            let mut kept: Vec<usize> = (0..pieces).filter(|&c| keep[[t, c]]).collect();
-            kept.sort_by(|&a, &b| cost[[t, a]].total_cmp(&cost[[t, b]]).then(a.cmp(&b)));
-            kept.truncate(radius[t]);
-            kept
+            let kept: Vec<usize> = (0..pieces).filter(|&c| keep[[t, c]]).collect();
+            first_in_order(kept, radius[t], |a, b| cost[[t, a]].total_cmp(&cost[[t, b]]).then(a.cmp(&b)))
         })
         .collect()
 }
@@ -221,6 +237,7 @@ pub fn minimal_support<E: SupportExecutor>(
     fidelity: Fidelity,
     sequence: usize,
     start: Option<Array2<bool>>,
+    start_radius: Option<Vec<usize>>,
 ) -> Result<MinimalSupport, SupportError> {
     let eps = fidelity.bound();
     if !(eps.is_finite() && eps >= 0.0) {
@@ -256,11 +273,12 @@ pub fn minimal_support<E: SupportExecutor>(
         }
         let mut restored = 0usize;
         for t in (0..positions).filter(|&t| repair[t]) {
-            let mut removed: Vec<usize> = (0..pieces).filter(|&c| !keep[[t, c]]).collect();
-            removed.sort_by(|&a, &b| {
-                current.restore_gain[[t, b]].total_cmp(&current.restore_gain[[t, a]]).then(a.cmp(&b))
+            let removed: Vec<usize> = (0..pieces).filter(|&c| !keep[[t, c]]).collect();
+            let gain = &current.restore_gain;
+            let chosen = first_in_order(removed, restore_radius[t], |a, b| {
+                gain[[t, b]].total_cmp(&gain[[t, a]]).then(a.cmp(&b))
             });
-            for &c in removed.iter().take(restore_radius[t]) {
+            for &c in &chosen {
                 keep[[t, c]] = true;
                 restored += 1;
             }
@@ -282,13 +300,19 @@ pub fn minimal_support<E: SupportExecutor>(
             max_divergence: current.divergence.iter().copied().fold(0.0, f64::max),
         });
     }
-    let mut radius = vec![1usize; positions];
+    let mut radius = match start_radius {
+        Some(r) if r.len() != positions => {
+            return Err(SupportError::Shape { what: "start_radius", expected: (positions, 1), found: (r.len(), 1) });
+        }
+        Some(r) => r.into_iter().map(|v| v.max(1)).collect(),
+        None => vec![1usize; positions],
+    };
     loop {
         let mut proposal = propose(keep.view(), current.removal_cost.view(), &radius);
         let offered: Vec<usize> = proposal.iter().map(Vec::len).collect();
         let proposed: usize = proposal.iter().map(Vec::len).sum();
         if proposed == 0 {
-            return Ok(MinimalSupport { keep, divergence: current.divergence, rounds });
+            return Ok(MinimalSupport { keep, divergence: current.divergence, rounds, radius });
         }
         let mut halvings = 0;
         let accepted = loop {
@@ -384,7 +408,7 @@ pub fn minimal_support<E: SupportExecutor>(
                     kept: keep.iter().filter(|&&k| k).count(),
                     max_divergence: current.divergence.iter().copied().fold(0.0, f64::max),
                 });
-                return Ok(MinimalSupport { keep, divergence: current.divergence, rounds });
+                return Ok(MinimalSupport { keep, divergence: current.divergence, rounds, radius });
             }
         }
     }
@@ -422,7 +446,7 @@ mod tests {
         let weight = ndarray::array![[3.0, 0.1, 0.2, 2.0, 0.05], [0.01, 0.02, 5.0, 0.03, 1.0]];
         let mut executor = Quadratic { weight: weight.clone(), evaluations: 0 };
         let eps = 0.1;
-        let result = minimal_support(&mut executor, 2, 5, Fidelity::PerPosition(eps), 1, None).unwrap();
+        let result = minimal_support(&mut executor, 2, 5, Fidelity::PerPosition(eps), 1, None, None).unwrap();
         // Position 0 drops 0.05, 0.1, 0.2 (½ Σ a² = 0.02625); 2.0 would add 2.0.
         assert_eq!(result.keep.row(0).to_vec(), vec![true, false, false, true, false]);
         // Position 1 drops 0.01, 0.02, 0.03; 1.0 would add 0.5.
@@ -444,7 +468,7 @@ mod tests {
         }
         let weight = ndarray::array![[3.0, 0.1, 0.2, 2.0, 0.05, 0.3, 0.02, 1.5]];
         let mut executor = Blind(Quadratic { weight, evaluations: 0 });
-        let result = minimal_support(&mut executor, 1, 8, Fidelity::PerPosition(0.1), 1, None).unwrap();
+        let result = minimal_support(&mut executor, 1, 8, Fidelity::PerPosition(0.1), 1, None, None).unwrap();
         assert!(result.divergence[0] <= 0.1, "{:?}", result.divergence);
         assert!(result.rounds.iter().any(|r| r.halvings > 0));
         for w in result.rounds.windows(2) {
@@ -467,7 +491,7 @@ mod tests {
         }
         let weight = ndarray::array![[3.0, 2.5, 4.0, 2.0, 3.5], [0.01, 0.02, 5.0, 0.03, 1.0]];
         let mut executor = HalfBlind(Quadratic { weight, evaluations: 0 });
-        let result = minimal_support(&mut executor, 2, 5, Fidelity::PerPosition(0.1), 1, None).unwrap();
+        let result = minimal_support(&mut executor, 2, 5, Fidelity::PerPosition(0.1), 1, None, None).unwrap();
         assert_eq!(result.keep.row(1).to_vec(), vec![false, false, true, false, true]);
         assert!(result.divergence.iter().all(|&v| v <= 0.1));
     }
@@ -489,7 +513,7 @@ mod tests {
                 })
             }
         }
-        let result = minimal_support(&mut Causal, 2, 4, Fidelity::PerPosition(0.1), 2, None).unwrap();
+        let result = minimal_support(&mut Causal, 2, 4, Fidelity::PerPosition(0.1), 2, None, None).unwrap();
         assert!(result.divergence.iter().all(|&v| v <= 0.1 + 1e-12), "{:?}", result.divergence);
         assert!(result.keep.iter().any(|k| !*k), "nothing was removed");
     }
@@ -501,7 +525,7 @@ mod tests {
     fn an_empty_start_is_repaired_to_the_same_optimum() {
         let weight = ndarray::array![[3.0, 0.1, 0.2, 2.0, 0.05], [0.01, 0.02, 5.0, 0.03, 1.0]];
         let empty = Array2::from_elem((2, 5), false);
-        let result = minimal_support(&mut Quadratic { weight, evaluations: 0 }, 2, 5, Fidelity::PerPosition(0.1), 1, Some(empty)).unwrap();
+        let result = minimal_support(&mut Quadratic { weight, evaluations: 0 }, 2, 5, Fidelity::PerPosition(0.1), 1, Some(empty), None).unwrap();
         assert!(result.rounds.iter().any(|r| r.restored > 0));
         assert_eq!(result.keep.row(0).to_vec(), vec![true, false, false, true, false]);
         assert_eq!(result.keep.row(1).to_vec(), vec![false, false, true, false, true]);
@@ -513,11 +537,25 @@ mod tests {
     #[test]
     fn a_mean_budget_is_shared_across_positions() {
         let weight = ndarray::array![[0.3, 0.3, 0.3, 0.3], [2.0, 2.0, 2.0, 2.0]];
-        let per = minimal_support(&mut Quadratic { weight: weight.clone(), evaluations: 0 }, 2, 4, Fidelity::PerPosition(0.1), 1, None).unwrap();
-        let mean = minimal_support(&mut Quadratic { weight, evaluations: 0 }, 2, 4, Fidelity::Mean(0.1), 1, None).unwrap();
+        let per = minimal_support(&mut Quadratic { weight: weight.clone(), evaluations: 0 }, 2, 4, Fidelity::PerPosition(0.1), 1, None, None).unwrap();
+        let mean = minimal_support(&mut Quadratic { weight, evaluations: 0 }, 2, 4, Fidelity::Mean(0.1), 1, None, None).unwrap();
         let removed = |k: &Array2<bool>| k.iter().filter(|x| !**x).count();
         assert!(mean.divergence.iter().sum::<f64>() / 2.0 <= 0.1);
         assert!(removed(&mean.keep) >= removed(&per.keep), "{:?} vs {:?}", mean.keep, per.keep);
+    }
+
+    /// The selection returns exactly the prefix a full sort under the same total
+    /// order returns, ties included.
+    #[test]
+    fn a_selected_prefix_equals_the_sorted_prefix() {
+        let cost: [f64; 8] = [0.5, 0.1, 0.5, 0.3, 0.1, 0.9, 0.0, 0.3];
+        let order = |a: usize, b: usize| cost[a].total_cmp(&cost[b]).then(a.cmp(&b));
+        let mut sorted: Vec<usize> = (0..cost.len()).collect();
+        sorted.sort_by(|&a, &b| order(a, b));
+        for count in 0..=cost.len() + 1 {
+            let expected: Vec<usize> = sorted.iter().copied().take(count).collect();
+            assert_eq!(first_in_order((0..cost.len()).rev().collect(), count, order), expected, "count {count}");
+        }
     }
 
     /// A warm start continues from the given supports and never restores a piece the
@@ -527,7 +565,7 @@ mod tests {
         let weight = ndarray::array![[3.0, 0.1, 0.2, 2.0, 0.05]];
         let mut executor = Quadratic { weight, evaluations: 0 };
         let start = ndarray::array![[true, true, false, true, true]];
-        let result = minimal_support(&mut executor, 1, 5, Fidelity::PerPosition(0.1), 1, Some(start.clone())).unwrap();
+        let result = minimal_support(&mut executor, 1, 5, Fidelity::PerPosition(0.1), 1, Some(start.clone()), None).unwrap();
         for (k, s) in result.keep.iter().zip(start.iter()) {
             assert!(!*k || *s, "a piece the start removed came back");
         }
@@ -548,7 +586,7 @@ mod tests {
             }
         }
         assert!(matches!(
-            minimal_support(&mut Broken, 2, 3, Fidelity::PerPosition(0.5), 1, None),
+            minimal_support(&mut Broken, 2, 3, Fidelity::PerPosition(0.5), 1, None, None),
             Err(SupportError::StartInadmissible { position: 0, .. })
         ));
     }

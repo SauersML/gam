@@ -243,9 +243,11 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
     let mut alternations = Vec::new();
     let manifold = EuclideanManifold::new(theta.len());
     let mut supports = None;
+    // Each support search resumes the proposal sizes the previous one learned.
+    let mut radius: Option<Vec<usize>> = None;
     for &level in &levels {
         let fidelity = form(level);
-        let mut current = minimal_support(&mut AtTheta { executor: &mut *executor, theta: theta.view() }, positions, pieces, fidelity, sequence, Some(keep.clone()))
+        let mut current = minimal_support(&mut AtTheta { executor: &mut *executor, theta: theta.view() }, positions, pieces, fidelity, sequence, Some(keep.clone()), radius.take())
             .map_err(SupportFitError::Support)?;
         // One resumed trust-region iteration per alternation: the supports the barrier
         // holds fixed are re-decided between iterations, and the resume keeps the
@@ -277,7 +279,8 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
             };
             theta = termination.point.clone();
             let certified = termination.residual <= termination.tolerance;
-            current = minimal_support(&mut AtTheta { executor: &mut *executor, theta: theta.view() }, positions, pieces, fidelity, sequence, Some(at))
+            let carried = Some(current.radius.clone());
+            current = minimal_support(&mut AtTheta { executor: &mut *executor, theta: theta.view() }, positions, pieces, fidelity, sequence, Some(at), carried)
                 .map_err(SupportFitError::Support)?;
             let kept = current.keep.iter().filter(|&&k| k).count();
             alternations.push(Alternation {
@@ -294,6 +297,7 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
             state = Some(termination);
         }
         keep = current.keep.clone();
+        radius = Some(current.radius.clone());
         supports = Some(current);
     }
     let supports = supports.ok_or(SupportFitError::Executor("support_fit: no fidelity level".to_string()))?;

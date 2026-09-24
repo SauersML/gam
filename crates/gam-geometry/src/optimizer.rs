@@ -519,6 +519,30 @@ mod tests {
         );
     }
 
+    /// `resume` continues the reported solve: three iterations resumed for five more
+    /// through this wrapper reach bit for bit the iterate and certificate of eight
+    /// uninterrupted iterations.
+    #[test]
+    fn a_resumed_solve_takes_the_same_steps() {
+        let manifold = EuclideanManifold::new(3);
+        let objective = || Quadratic {
+            a: ndarray::array![[4.0, 1.0, 0.0], [1.0, 3.0, 1.0], [0.0, 1.0, 2.0],],
+            b: Array1::from_vec(vec![1.0, 2.0, -1.0]),
+        };
+        let solver = |max_iter| RiemannianTrustRegion { radius: 0.25, max_radius: 1.0e6, max_iter, grad_tol: 1.0e-12 };
+        let start = Array1::from_vec(vec![5.0, -3.0, 2.0]);
+        let straight = solver(8)
+            .minimize_reporting_termination(&manifold, &mut objective(), start.view())
+            .expect("TR runs");
+        let first = solver(3)
+            .minimize_reporting_termination(&manifold, &mut objective(), start.view())
+            .expect("TR runs");
+        let resumed = solver(5).resume(&manifold, &mut objective(), &first).expect("TR runs");
+        assert_eq!(resumed.point, straight.point);
+        assert_eq!(resumed.radius.to_bits(), straight.radius.to_bits());
+        assert_eq!(resumed.residual.to_bits(), straight.residual.to_bits());
+    }
+
     /// Steihaug-CG trust region on a 3-D SPD quadratic must reach the exact
     /// minimizer `A⁻¹ b`.
     #[test]

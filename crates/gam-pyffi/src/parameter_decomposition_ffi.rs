@@ -117,7 +117,7 @@ fn parameter_decomposition_minimal_support<'py>(
     };
     let start = start.map(|s| s.as_array().to_owned());
     let mut executor = PythonSupportExecutor { evaluate, error: None };
-    let result = minimal_support(&mut executor, positions, pieces, fidelity, sequence, start);
+    let result = minimal_support(&mut executor, positions, pieces, fidelity, sequence, start, None);
     let result = match result {
         Ok(result) => result,
         Err(error) => return Err(executor.error.take().unwrap_or_else(|| py_value_error(error.to_string()))),
