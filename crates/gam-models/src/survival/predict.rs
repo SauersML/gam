@@ -1796,6 +1796,35 @@ fn survival_sigma_point_posterior_moments(
 ) -> Result<(SurvivalPredictResult, SurvivalPosteriorMoments), SurvivalPredictError> {
     let (posterior_mean, active_covariance, cone_coords) =
         survival_prediction_posterior_factor(req.model, covariance_mode)?;
+    // A location-scale model's surfaces are affine replays of its designs, so
+    // the rule's nodes are evaluated on the designs assembled once for the
+    // pass instead of re-running the whole prediction per node (2·rank + 1
+    // passes, each rebuilding every time basis, before). The band index is
+    // read off the per-node surfaces below, so a banded request keeps that
+    // path.
+    if band_level.is_none()
+        && require_saved_survival_likelihood_mode(req.model)? == SurvivalLikelihoodMode::LocationScale
+    {
+        let mut nodes: Vec<(Array1<f64>, f64)> = Vec::new();
+        for_each_survival_posterior_node(&posterior_mean, &active_covariance, &cone_coords, |node, weight| {
+            nodes.push((node.clone(), weight));
+            Ok(())
+        })?;
+        let (result, moments) = predict_survival_surfaces(
+            SurvivalPredictRequest {
+                with_uncertainty: false,
+                estimand: SurvivalPredictEstimand::Plugin,
+                ..req
+            },
+            covariance_mode,
+            Some(SurvivalSurfacePosterior::SigmaNodes(&nodes)),
+        )?;
+        let moments = moments.ok_or_else(|| {
+            "internal error: the sigma-node survival pass returned no posterior moments".to_string()
+        })?;
+        refuse_decreasing_survival(&result)?;
+        return Ok((result, moments));
+    }
     let result = predict_survival(
         SurvivalPredictRequest {
             model: req.model,
@@ -3019,6 +3048,10 @@ enum SurvivalSurfacePosterior<'a> {
     /// The level of the central survival band the pass also reports, if any
     /// (gam#3560).
     TruncatedLaw(&'a TruncatedCoefficientDraws, Option<f64>),
+    /// [`SurvivalPosteriorIntegration::SigmaPoint`] on a location-scale model:
+    /// the rule's coefficient nodes with their weights, each replayed through
+    /// the plug-in surfaces on the designs assembled once for the pass.
+    SigmaNodes(&'a [(Array1<f64>, f64)]),
 }
 
 /// The plug-in pass of [`predict_survival`]. With `posterior` it also
@@ -3031,12 +3064,13 @@ fn predict_survival_surfaces(
     covariance_mode: SurvivalPredictionCovarianceMode,
     posterior: Option<SurvivalSurfacePosterior<'_>>,
 ) -> Result<(SurvivalPredictResult, Option<SurvivalPosteriorMoments>), SurvivalPredictError> {
-    let (exact_posterior, truncated_posterior) = match posterior {
-        None => (None, None),
-        Some(SurvivalSurfacePosterior::ExactAnchor(posterior)) => (Some(posterior), None),
+    let (exact_posterior, truncated_posterior, sigma_nodes) = match posterior {
+        None => (None, None, None),
+        Some(SurvivalSurfacePosterior::ExactAnchor(posterior)) => (Some(posterior), None, None),
         Some(SurvivalSurfacePosterior::TruncatedLaw(draws, band_level)) => {
-            (None, Some((draws, band_level)))
+            (None, Some((draws, band_level)), None)
         }
+        Some(SurvivalSurfacePosterior::SigmaNodes(nodes)) => (None, None, Some(nodes)),
     };
     let SurvivalPredictRequest {
         model,
@@ -3147,8 +3181,16 @@ fn predict_survival_surfaces(
             with_uncertainty,
             covariance_mode,
             truncated_posterior,
+            sigma_nodes,
         )
         .map_err(SurvivalPredictError::from);
+    }
+    if sigma_nodes.is_some() {
+        return Err(SurvivalPredictError::UnsupportedConfiguration {
+            reason: "sigma-point coefficient nodes replay on a location-scale model's assembled \
+                     designs only; every other likelihood integrates them through its own pass"
+                .to_string(),
+        });
     }
     if truncated_posterior.is_some() {
         return Err(SurvivalPredictError::UnsupportedConfiguration {
@@ -5297,6 +5339,7 @@ fn predict_survival_location_scale_batch(
     with_uncertainty: bool,
     covariance_mode: SurvivalPredictionCovarianceMode,
     truncated_posterior: Option<(&TruncatedCoefficientDraws, Option<f64>)>,
+    sigma_nodes: Option<&[(Array1<f64>, f64)]>,
 ) -> Result<(SurvivalPredictResult, Option<SurvivalPosteriorMoments>), String> {
     use crate::survival::construction::evaluate_survival_time_basis_row;
     use crate::survival::location_scale::{
@@ -5765,51 +5808,62 @@ fn predict_survival_location_scale_batch(
         &saved_inverse_link,
     )?;
 
-    let posterior_moments = match truncated_posterior {
-        None => None,
-        Some((draws, band_level)) => {
-            // One posterior node's cells: the plug-in surfaces replayed at the
-            // node's coefficients. The hazard keeps the sign of the node's rate,
-            // so the node's density `S·h` is exactly `−dS/dt` there and the
-            // integrated density is `−dE[S]/dt` ([`conditional_event_density`]).
-            let node_cells = |fit: &UnifiedFitResult| -> Result<SurvivalNodeCells, String> {
-                let pred = predict_survival_location_scale(&pred_input, fit)
-                    .map_err(|err| format!("survival location-scale predict failed: {err}"))?;
-                let rate = index_rate(fit)?;
-                let hazard = pred
-                    .eta
-                    .iter()
-                    .zip(rate.iter())
-                    .map(|(&eta, &rate)| {
-                        if rate == 0.0 {
-                            Ok(0.0)
-                        } else {
-                            location_scale_hazard_component(eta, rate.abs(), &saved_inverse_link)
-                                .map(|hazard| rate.signum() * hazard)
-                        }
-                    })
-                    .collect::<Result<Array1<f64>, String>>()?;
-                Ok(SurvivalNodeCells {
-                    eta: pred.eta,
-                    log_survival: pred.log_survival_prob,
-                    hazard,
-                })
-            };
-            let surface_cells: Vec<(usize, usize, usize)> = (0..n)
-                .flat_map(|i| (0..t_cols).map(move |j| (i, j)))
-                .filter(|&(i, j)| {
-                    let query_time = if per_row_eval {
-                        age_exit[i]
+        // One posterior node's cells: the plug-in surfaces replayed at the
+        // node's coefficients. The hazard keeps the sign of the node's rate,
+        // so the node's density `S·h` is exactly `−dS/dt` there and the
+        // integrated density is `−dE[S]/dt` ([`conditional_event_density`]).
+        let node_cells = |fit: &UnifiedFitResult| -> Result<SurvivalNodeCells, String> {
+            let pred = predict_survival_location_scale(&pred_input, fit)
+                .map_err(|err| format!("survival location-scale predict failed: {err}"))?;
+            let rate = index_rate(fit)?;
+            let hazard = pred
+                .eta
+                .iter()
+                .zip(rate.iter())
+                .map(|(&eta, &rate)| {
+                    if rate == 0.0 {
+                        Ok(0.0)
                     } else {
-                        eval_times[j]
-                    };
-                    query_time > 0.0
+                        location_scale_hazard_component(eta, rate.abs(), &saved_inverse_link)
+                            .map(|hazard| rate.signum() * hazard)
+                    }
                 })
-                .map(|(i, j)| (i, j, if per_row_eval { i } else { i * eval_width + j }))
-                .collect();
-            let eta_cells: Vec<usize> = (0..n)
-                .map(|i| if per_row_eval { i } else { i * eval_width + t_cols })
-                .collect();
+                .collect::<Result<Array1<f64>, String>>()?;
+            Ok(SurvivalNodeCells {
+                eta: pred.eta,
+                log_survival: pred.log_survival_prob,
+                hazard,
+            })
+        };
+        let surface_cells: Vec<(usize, usize, usize)> = (0..n)
+            .flat_map(|i| (0..t_cols).map(move |j| (i, j)))
+            .filter(|&(i, j)| {
+                let query_time = if per_row_eval {
+                    age_exit[i]
+                } else {
+                    eval_times[j]
+                };
+                query_time > 0.0
+            })
+            .map(|(i, j)| (i, j, if per_row_eval { i } else { i * eval_width + j }))
+            .collect();
+        let eta_cells: Vec<usize> = (0..n)
+            .map(|i| if per_row_eval { i } else { i * eval_width + t_cols })
+            .collect();
+    let posterior_moments = match (truncated_posterior, sigma_nodes) {
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            return Err("a survival pass integrates one coefficient posterior".to_string());
+        }
+        (None, Some(nodes)) => Some(sigma_node_surface_moments(
+            nodes,
+            &saved_fit,
+            &node_cells,
+            &surface_cells,
+            &eta_cells,
+            t_cols,
+        )?),
+        (Some((draws, band_level)), None) => {
             let mut moments = truncated_survival_surface_moments(
                 draws,
                 &saved_fit,

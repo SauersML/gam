@@ -522,3 +522,45 @@ impl<'a> PooledSurfaceMoments<'a> {
         }
     }
 }
+
+/// The surface moments of a fixed set of coefficient nodes with weights (the
+/// sigma-point rule's), each replayed through `node_cells` on the designs the
+/// caller assembled once: `E[S]`, `E[f]`, `E[h]` on every surface cell and
+/// `E[η]` per row, exactly the sums [`super::survival_sigma_point_posterior_moments`]
+/// forms from whole re-predictions. A cell at or before the time origin is
+/// survival one with no density, as the plug-in surfaces have it.
+pub(super) fn sigma_node_surface_moments(
+    nodes: &[(Array1<f64>, f64)],
+    fit: &UnifiedFitResult,
+    node_cells: &(dyn Fn(&UnifiedFitResult) -> Result<SurvivalNodeCells, String> + Sync),
+    surface_cells: &[(usize, usize, usize)],
+    eta_cells: &[usize],
+    t_cols: usize,
+) -> Result<SurvivalPosteriorMoments, String> {
+    let n_rows = eta_cells.len();
+    let mut moments = SurvivalPosteriorMoments::zeros(n_rows, t_cols);
+    let mut on_surface = ndarray::Array2::<bool>::from_elem((n_rows, t_cols), false);
+    for &(i, j, _) in surface_cells {
+        on_surface[[i, j]] = true;
+    }
+    for (coefficients, weight) in nodes {
+        let mut node_fit = fit.clone();
+        assign_survival_fit_coefficients(&mut node_fit, coefficients).map_err(String::from)?;
+        let cells = node_cells(&node_fit)?;
+        for &(i, j, k) in surface_cells {
+            let (survival, density) = cells.survival_and_density(k)?;
+            moments.survival[[i, j]].merge(*weight, PosteriorMoment::point(survival));
+            moments.density_mean[[i, j]] += weight * density;
+            moments.hazard_mean[[i, j]] += weight * cells.hazard[k];
+        }
+        for ((i, j), on) in on_surface.indexed_iter() {
+            if !on {
+                moments.survival[[i, j]].merge(*weight, PosteriorMoment::point(1.0));
+            }
+        }
+        for (row, &k) in eta_cells.iter().enumerate() {
+            moments.eta[row].merge(*weight, PosteriorMoment::point(cells.eta[k]));
+        }
+    }
+    Ok(moments)
+}

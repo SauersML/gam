@@ -1844,3 +1844,138 @@ fn royston_parmar_posterior_mean_integrates_the_cone_truncated_law_3575() {
         "the posterior-mean survival must integrate the law, not re-publish the plug-in"
     );
 }
+
+/// The sigma-point rule on a location-scale model replays its nodes on the
+/// designs assembled once for the pass; the moments it publishes are the
+/// sums the whole-re-prediction rule forms from 2·rank + 1 passes, which a
+/// banded request still runs.
+#[test]
+fn location_scale_sigma_nodes_replay_the_whole_reprediction_rule() {
+    use crate::fit_orchestration::FitConfig;
+    use crate::inference::model::FittedModel;
+    use crate::inference::model_payload_builders::fit_formula_to_payload;
+    let n = 300;
+    let mut rng = Lcg3038(0x5157);
+    let mut records = Vec::with_capacity(n);
+    for _ in 0..n {
+        let x = rng.normal();
+        let log_t = 0.4 * x + (-0.3 + 0.4 * x).exp() * rng.normal();
+        let censor = (-0.5 + 2.5 * rng.unit()).exp();
+        let event_time = log_t.exp();
+        let (time, event) = if event_time <= censor {
+            (event_time, 1)
+        } else {
+            (censor, 0)
+        };
+        records.push(csv::StringRecord::from(vec![
+            format!("{time:.17e}"),
+            event.to_string(),
+            format!("{x:.17e}"),
+        ]));
+    }
+    let headers = ["time", "event", "x"].iter().map(|s| s.to_string()).collect();
+    let data = gam_data::encode_recordswith_inferred_schema(headers, records)
+        .expect("encode the fixture");
+    let config = FitConfig {
+        survival_likelihood: Some("location-scale".to_string()),
+        survival_distribution: "gaussian".to_string(),
+        noise_formula: Some("x".to_string()),
+        ..FitConfig::default()
+    };
+    let payload = fit_formula_to_payload("Surv(time, event) ~ x".to_string(), &data, &config)
+        .expect("survival location-scale fit");
+    let model = FittedModel::from_payload(payload);
+    let mode = SurvivalPredictionCovarianceMode::Conditional;
+    let frame = ndarray::array![[1.0, 0.0, -1.5], [1.0, 0.0, 0.0], [1.0, 0.0, 1.5]];
+    let col_map = data.column_map();
+    let zeros = Array1::<f64>::zeros(frame.nrows());
+    let times = [0.25, 0.5, 1.0, 2.0, 4.0];
+    let request = || SurvivalPredictRequest {
+        model: &model,
+        data: frame.view(),
+        col_map: &col_map,
+        training_headers: Some(&data.headers),
+        primary_offset: &zeros,
+        noise_offset: &zeros,
+        time_grid: Some(&times),
+        with_uncertainty: false,
+        estimand: SurvivalPredictEstimand::PosteriorMean,
+    };
+    let (fast_result, fast) = survival_sigma_point_posterior_moments(request(), mode, None)
+        .expect("the sigma nodes replay on the assembled designs");
+    // The reference: the rule's nodes each re-predicted whole, summed as the
+    // published moments are.
+    let (posterior_mean, active_covariance, cone_coords) =
+        survival_prediction_posterior_factor(&model, mode).expect("posterior factor");
+    let plugin = predict_survival(
+        SurvivalPredictRequest {
+            with_uncertainty: false,
+            estimand: SurvivalPredictEstimand::Plugin,
+            ..request()
+        },
+        mode,
+    )
+    .expect("plug-in surfaces");
+    let (n_rows, n_times) = plugin.survival.dim();
+    let mut survival_sum = Array2::<f64>::zeros((n_rows, n_times));
+    let mut density_sum = Array2::<f64>::zeros((n_rows, n_times));
+    let mut hazard_sum = Array2::<f64>::zeros((n_rows, n_times));
+    let mut eta_sum = Array1::<f64>::zeros(n_rows);
+    let mut weight_sum = 0.0;
+    for_each_survival_posterior_node(&posterior_mean, &active_covariance, &cone_coords, |node, weight| {
+        let draw_model = saved_model_with_survival_coefficients(&model, node)?;
+        let draw = predict_survival_coefficient_law(
+            SurvivalPredictRequest {
+                model: &draw_model,
+                with_uncertainty: false,
+                estimand: SurvivalPredictEstimand::Plugin,
+                ..request()
+            },
+            mode,
+        )?;
+        weight_sum += weight;
+        for row in 0..n_rows {
+            eta_sum[row] += weight * draw.linear_predictor[row];
+            for time in 0..n_times {
+                let survival = draw.survival[[row, time]];
+                let hazard = draw.hazard[[row, time]];
+                let density =
+                    conditional_event_density(survival, draw.cumulative_hazard[[row, time]], hazard)?;
+                survival_sum[[row, time]] += weight * survival;
+                density_sum[[row, time]] += weight * density;
+                hazard_sum[[row, time]] += weight * hazard;
+            }
+        }
+        Ok(())
+    })
+    .expect("the whole-re-prediction rule");
+    assert!((weight_sum - 1.0).abs() < 1e-12, "weights sum to one, got {weight_sum}");
+    assert_eq!(fast_result.times, plugin.times);
+    assert_eq!(fast.survival.dim(), (n_rows, n_times));
+    for ((row, time), moment) in fast.survival.indexed_iter() {
+        let reference = survival_sum[[row, time]];
+        assert!(
+            (moment.mean() - reference).abs() <= 1e-12 * reference.abs().max(1.0),
+            "survival at ({row}, {time}): {} vs {reference}",
+            moment.mean()
+        );
+        let (density, reference) = (fast.density_mean[[row, time]], density_sum[[row, time]]);
+        assert!(
+            (density - reference).abs() <= 1e-12 * reference.abs().max(1.0),
+            "density at ({row}, {time}): {density} vs {reference}"
+        );
+        let (hazard, reference) = (fast.hazard_mean[[row, time]], hazard_sum[[row, time]]);
+        assert!(
+            (hazard - reference).abs() <= 1e-12 * reference.abs().max(1.0),
+            "hazard at ({row}, {time}): {hazard} vs {reference}"
+        );
+    }
+    for (row, moment) in fast.eta.iter().enumerate() {
+        let reference = eta_sum[row];
+        assert!(
+            (moment.mean() - reference).abs() <= 1e-12 * reference.abs().max(1.0),
+            "eta at row {row}: {} vs {reference}",
+            moment.mean()
+        );
+    }
+}
