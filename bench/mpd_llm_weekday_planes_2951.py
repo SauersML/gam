@@ -28,13 +28,17 @@ import math
 import torch
 
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+FEW_SHOT = ("Q: What day is two days after Friday? A: Sunday\n"
+            "Q: What day is one day after Sunday? A: Monday\n"
+            "Q: What day is three days after Tuesday? A: Friday\n")
 TEMPLATES = [
+    FEW_SHOT + "Q: What day is {n} days after {day}? A:",
     "If today is {day}, then {n} days from now it will be",
     "Today is {day}. In {n} days it will be",
-    "{n} days after {day} comes",
-    "Q: What day is {n} days after {day}? A:",
 ]
 WORDS = {1: "one", 2: "two", 3: "three", 4: "four"}
+# the few-shot answers ("Sunday", "Monday", "Friday") put no weekday row in the query position but the cycle
+# rows appear in the examples; only the queried day occurrence is edited (``where`` below picks the last).
 
 
 def single_token_ids(tokenizer, words, prefix):
@@ -98,7 +102,7 @@ def main():
             ids = tok(text, return_tensors="pt").input_ids.to(args.device)
             embeds = model.get_input_embeddings()(ids).detach().clone()
             if edited_rows is not None:
-                where = (ids[0] == in_ids[d]).nonzero().flatten()
+                where = (ids[0] == in_ids[d]).nonzero().flatten()[-1:]
                 embeds[0, where] = edited_rows[d].to(embeds.dtype)
             with torch.inference_mode():
                 logits = model(inputs_embeds=embeds).logits[0, -1].double()
