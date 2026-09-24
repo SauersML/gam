@@ -28,7 +28,6 @@ use super::receipts::{
     ExternalExecution, MeasuredDiscrepancy, MlpBlockReceipt, MlpBlockReceiptInputs, ReceiptRefusal,
     StageAgreement, mlp_block_receipt,
 };
-use super::parseval_frame::{FrameError, orthogonal_dictionary_fit};
 use super::spectral::{
     PlaneRotationError, PlaneRotationRecovery, RotationAmbiguity, RotationClusterKind,
     recover_plane_rotations,
@@ -100,20 +99,6 @@ pub enum MpdOperation {
         /// The executor's block output `W₂ a + b₂`, without the residual (`rows x out`).
         external_output: String,
     },
-    /// A complete orthogonal frame fitted to a bank of rows by monotone orthogonal
-    /// dictionary learning (`parseval_frame::orthogonal_dictionary_fit`): each row coded
-    /// by its `active` highest-energy groups of `atom_dim` atoms, the frame updated by
-    /// orthogonal Procrustes, to a fixed point of the selection.
-    FitOrthogonalFrame {
-        /// Id of the bank (`rows x d`).
-        bank: String,
-        /// Id of the starting orthogonal frame (`d x d`, rows are atoms).
-        start: String,
-        /// Atoms per group, `m`; it divides `d`.
-        atom_dim: usize,
-        /// Groups kept per row, `L`.
-        active: usize,
-    },
 }
 
 /// [`ExternalExecution`] on the wire.
@@ -163,19 +148,6 @@ pub struct MpdReport {
 pub enum MpdResult {
     RecoverPlaneRotations(PlaneRotationReport),
     MlpBlockReceipt(MlpBlockReceiptReport),
-    FitOrthogonalFrame(OrthogonalFrameReport),
-}
-
-/// [`orthogonal_dictionary_fit`] on the wire.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct OrthogonalFrameReport {
-    /// Id of the output array holding the fitted frame (`d x d`, rows are atoms).
-    pub frame: String,
-    /// The bank's summed energy `‖D‖²_F`.
-    pub bank_energy: f64,
-    /// The summed dropped energy after each selection, nonincreasing; the last entry is
-    /// the fixed point's.
-    pub residual_trace: Vec<f64>,
 }
 
 /// [`PlaneRotationRecovery`] on the wire.
@@ -334,8 +306,6 @@ pub enum MpdSurfaceError {
     /// An input array does not have the shape the operation reads.
     TensorShape { tensor: String, reason: String },
     PlaneRotation(PlaneRotationError),
-    /// The frame owner refused the bank, the start or the alternation.
-    Frame(FrameError),
     /// The receipts owner refused the block, its execution or its activation tag.
     Receipt(ReceiptRefusal),
     /// An owner returned a non-finite value where the wire report has no meaning
@@ -356,7 +326,6 @@ impl fmt::Display for MpdSurfaceError {
                 write!(formatter, "MPD input array {tensor:?}: {reason}")
             }
             Self::PlaneRotation(error) => write!(formatter, "{error}"),
-            Self::Frame(error) => write!(formatter, "{error}"),
             Self::Receipt(error) => write!(formatter, "{error}"),
             Self::NonFiniteReport { field, value } => write!(
                 formatter,
@@ -422,36 +391,6 @@ pub fn run_parameter_decomposition(
             })
             .map_err(MpdSurfaceError::Receipt)?;
             project_mlp_block_receipt(external_execution.device, receipt)
-        }
-        MpdOperation::FitOrthogonalFrame {
-            bank,
-            start,
-            atom_dim,
-            active,
-        } => {
-            let bank_rows = matrix(tensors, &bank)?;
-            let (frame, residual_trace) =
-                orthogonal_dictionary_fit(bank_rows, matrix(tensors, &start)?, atom_dim, active)
-                    .map_err(MpdSurfaceError::Frame)?;
-            let bank_energy = finite("bank_energy", bank_rows.iter().map(|v| v * v).sum())?;
-            let residual_trace = residual_trace
-                .into_iter()
-                .map(|value| finite("residual_trace", value))
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut arrays = BTreeMap::new();
-            arrays.insert("frame".to_string(), frame.into_dyn());
-            Ok(MpdOutput {
-                report: MpdReport {
-                    schema: MPD_REPORT_SCHEMA,
-                    schema_version: MPD_SCHEMA_VERSION,
-                    result: MpdResult::FitOrthogonalFrame(OrthogonalFrameReport {
-                        frame: "frame".to_string(),
-                        bank_energy,
-                        residual_trace,
-                    }),
-                },
-                arrays,
-            })
         }
     }
 }
@@ -694,38 +633,6 @@ mod tests {
 
     fn frobenius(matrix: &Array2<f64>) -> f64 {
         matrix.iter().map(|value| value * value).sum::<f64>().sqrt()
-    }
-
-    /// The frame fit round-trips the wire: a bank exactly one-group sparse in the start
-    /// frame keeps it, with a zero residual and an orthogonal frame array; a group size
-    /// that does not divide the width is the frame owner's refusal.
-    #[test]
-    fn fit_orthogonal_frame_round_trips() {
-        let d = 6;
-        let mut bank = Array2::<f64>::zeros((9, d));
-        for i in 0..9 {
-            let g = i % 3;
-            bank[[i, 2 * g]] = 1.0 + i as f64;
-            bank[[i, 2 * g + 1]] = -0.5 * i as f64;
-        }
-        let mut tensors = inputs("bank", bank);
-        tensors.insert("start".to_string(), Array2::<f64>::eye(d).into_dyn());
-        let request = request_json(
-            r#"{"kind": "fit_orthogonal_frame", "bank": "bank", "start": "start", "atom_dim": 2, "active": 1}"#,
-        );
-        let output = run_parameter_decomposition(&request, &tensors).unwrap();
-        let MpdResult::FitOrthogonalFrame(report) = &output.report.result else {
-            panic!("wrong result kind");
-        };
-        assert_eq!(report.frame, "frame");
-        assert!(*report.residual_trace.last().unwrap() <= 64.0 * f64::EPSILON * report.bank_energy);
-        let frame = output.arrays["frame"].view().into_dimensionality::<ndarray::Ix2>().unwrap().to_owned();
-        let gram = frame.dot(&frame.t()) - Array2::<f64>::eye(d);
-        assert!(frobenius(&gram) <= 64.0 * f64::EPSILON * d as f64);
-        let bad = request_json(
-            r#"{"kind": "fit_orthogonal_frame", "bank": "bank", "start": "start", "atom_dim": 4, "active": 1}"#,
-        );
-        assert!(matches!(run_parameter_decomposition(&bad, &tensors), Err(MpdSurfaceError::Frame(_))));
     }
 
     /// A declared distance to the orthogonal group that covers the true one:
