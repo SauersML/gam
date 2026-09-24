@@ -3393,7 +3393,47 @@ pub trait FaerEigh {
 
 /// Self-adjoint eigendecomposition `A = U diag(S) Uᵀ` of the triangle `side`
 /// names, at [`evd_parallelism`].
+///
+/// The decomposition's backward error is `O(n·ε·‖A‖)` only while its own
+/// arithmetic stays in the normal range: its Householder reflectors are formed
+/// from sums of squared entries, which underflow once the largest entry is
+/// below `2⁻⁵¹¹` and overflow once `n·max|a|²` exceeds the largest double. On
+/// `diag(3e-313, −2⁻¹⁰⁷⁴)` it returned `−3.96e−320` for the exact `−2⁻¹⁰⁷⁴`, and
+/// a learned-κ Matérn penalty was refused for an eigenvalue of `−1.248e−308`
+/// against a noise floor of `2.4e−315`. Such a matrix is
+/// decomposed as `2^k·A`, with `k` taking its largest entry to `[½, 1)`: a
+/// power-of-two scaling is exact wherever it lands in the normal range, so the
+/// scaled matrix has `A`'s eigenvectors and `2^k` times its eigenvalues, which
+/// are divided back. A matrix whose squares stay normal is decomposed as given,
+/// bit for bit as before.
 pub fn self_adjoint_evd(a: MatRef<'_, f64>, side: Side) -> Result<(Diag<f64>, Mat<f64>), solvers::EvdError> {
+    let n = a.nrows();
+    let max_abs = (0..n)
+        .flat_map(|i| (0..a.ncols()).map(move |j| (i, j)))
+        .fold(0.0_f64, |acc, (i, j)| acc.max(a[(i, j)].abs()));
+    let square = max_abs * max_abs;
+    let squares_stay_normal = square >= f64::MIN_POSITIVE && (square * n as f64).is_finite();
+    if max_abs == 0.0 || !max_abs.is_finite() || squares_stay_normal {
+        return self_adjoint_evd_as_given(a, side);
+    }
+    // `2^k` itself overflows for `k > 1023`, which a subnormal matrix needs, so
+    // the power is applied as two representable halves; each product is exact.
+    let exponent = (-max_abs.log2().floor() - 1.0) as i32;
+    let (lead, tail) = (2.0_f64.powi(exponent / 2), 2.0_f64.powi(exponent - exponent / 2));
+    let scaled = Mat::<f64>::from_fn(n, a.ncols(), |i, j| a[(i, j)] * lead * tail);
+    let (mut s, u) = self_adjoint_evd_as_given(scaled.as_ref(), side)?;
+    for k in 0..n {
+        let value = s.as_ref().column_vector()[k];
+        s.as_mut().column_vector_mut()[k] = value / lead / tail;
+    }
+    Ok((s, u))
+}
+
+/// [`self_adjoint_evd`] of `a` at its own scale.
+fn self_adjoint_evd_as_given(
+    a: MatRef<'_, f64>,
+    side: Side,
+) -> Result<(Diag<f64>, Mat<f64>), solvers::EvdError> {
     let n = a.nrows();
     let par = evd_parallelism();
     let lower = match side {
@@ -3422,8 +3462,9 @@ pub fn self_adjoint_evd(a: MatRef<'_, f64>, side: Side) -> Result<(Diag<f64>, Ma
 /// Strict self-adjoint eigendecomposition of the exact supplied matrix.
 ///
 /// This entrypoint performs finite/symmetry validation and one direct faer EVD
-/// attempt. It never symmetrizes, rescales, jitters the diagonal, or subtracts
-/// a repair afterward. Rank and pseudoinverse code must use this function so
+/// attempt. It never symmetrizes, jitters the diagonal, or subtracts a repair
+/// afterward, and rescales only by an exact power of two ([`self_adjoint_evd`]).
+/// Rank and pseudoinverse code must use this function so
 /// its reported spectrum belongs to the matrix the caller supplied.
 ///
 /// `assembly` declares how `matrix` was built, which fixes the symmetry band
@@ -4538,6 +4579,59 @@ mod tests {
     /// threshold, used only by the regression tests below to assert the verdict
     /// margin lands on the correct side of the cliff. Kept in sync by value (1e3).
     const JOINT_GRAM_RRQR_TRUST_MARGIN_FOR_TEST: f64 = 1.0e3;
+
+    fn sorted_spectrum(values: &Diag<f64>) -> Vec<f64> {
+        let column = values.as_ref().column_vector();
+        let mut spectrum: Vec<f64> = (0..column.nrows()).map(|k| column[k]).collect();
+        spectrum.sort_by(f64::total_cmp);
+        spectrum
+    }
+
+    /// A matrix whose squared entries underflow is decomposed at normal scale. On an exact
+    /// diagonal the scaled decomposition returns the diagonal itself, to the quantum. Positive
+    /// control: decomposed as given, the same matrix's `−2⁻¹⁰⁷⁴` came back as `−3.96e−320`.
+    #[test]
+    fn an_underflowing_matrix_is_decomposed_at_normal_scale() {
+        let quantum = f64::from_bits(1);
+        let a = Mat::from_fn(2, 2, |i, j| match (i, j) {
+            (0, 0) => 3.0e-313,
+            (1, 1) => -quantum,
+            _ => 0.0,
+        });
+        let (given, _) = self_adjoint_evd_as_given(a.as_ref(), Side::Lower).expect("decomposes as given");
+        let (scaled, _) = self_adjoint_evd(a.as_ref(), Side::Lower).expect("decomposes at normal scale");
+        let (given, scaled) = (sorted_spectrum(&given), sorted_spectrum(&scaled));
+        eprintln!("as given {given:?}; at normal scale {scaled:?}");
+        assert_eq!(scaled, vec![-quantum, 3.0e-313]);
+        assert_ne!(given, scaled, "the positive control: as given, the spectrum is not the diagonal");
+    }
+
+    /// A second-difference penalty `DᵀD` of rank `n − 2`, at `1e−300`, where its squared entries
+    /// underflow: its null pair lies within the spectrum's rounding band and the rest above it,
+    /// exactly as at unit scale.
+    #[test]
+    fn a_near_underflow_penalty_keeps_its_rank_and_null_space() {
+        let n = 12;
+        let difference = Mat::<f64>::from_fn(n - 2, n, |i, j| match j as isize - i as isize {
+            0 | 2 => 1.0,
+            1 => -2.0,
+            _ => 0.0,
+        });
+        let unit = difference.transpose() * difference.as_ref();
+        for scale in [1.0, 1.0e-300] {
+            let penalty = Mat::from_fn(n, n, |i, j| unit[(i, j)] * scale);
+            let (values, _) = self_adjoint_evd(penalty.as_ref(), Side::Lower).expect("decomposes");
+            let spectrum = sorted_spectrum(&values);
+            let band = crate::roundoff::symmetric_spectrum_rounding_band(&spectrum);
+            let null = spectrum.iter().filter(|value| value.abs() <= band).count();
+            let penalized = spectrum.iter().filter(|&&value| value > band).count();
+            assert_eq!(
+                (null, penalized),
+                (2, n - 2),
+                "scale {scale:e}: spectrum {spectrum:?} against band {band:e}"
+            );
+        }
+    }
 
     /// A zero leading entry forces a row exchange, and the solve meets LU's backward-error
     /// bound: `(A + ΔA)x̂ = b` with `|ΔA| ≤ γ_{3n}|L||U|`, where partial pivoting keeps

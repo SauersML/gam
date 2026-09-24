@@ -393,35 +393,18 @@ fn validate_symmetric_psd_core(matrix: &Array2<f64>, what: &str) -> Result<(), S
     if nrows == 0 || max_abs == 0.0 {
         return Ok(()); // the zero penalty is trivially PSD
     }
-    // The eigensolver's backward error is `O(p·ε·‖S‖)` only where its own
-    // arithmetic stays normal: on a subnormal-scale block it returned
-    // `−3.96e-320` for the exact diagonal `diag(3e-313, −2⁻¹⁰⁷⁴)`, eight thousand
-    // quanta. So the block is decomposed at normal scale, `2^k·S` with `k` taking
-    // its largest entry to `[½, 1)`. A power-of-two scaling is exact wherever it
-    // lands in the normal range, so the scaled matrix is the same matrix and its
-    // eigenvalues are `2^k` times its own. What the scaling cannot undo is the
-    // entries' own representation: each is known only to half a quantum, which
-    // by Weyl moves an eigenvalue by at most `p·2⁻¹⁰⁷⁴`, `2^k` times that once
-    // scaled ([`eigenvalue_rounding_unit`]'s absolute term).
-    // `2^k` itself overflows for `k > 1023`, which a subnormal block needs, so the
-    // power is applied as two representable halves; each product is exact.
-    let exponent = (-max_abs.log2().floor() - 1.0) as i32;
-    let (half, rest) = (exponent / 2, exponent - exponent / 2);
-    let (lead, tail) = (2.0_f64.powi(half), 2.0_f64.powi(rest));
-    let scaled = matrix.mapv(|value| value * lead * tail);
-    let (eigenvalues, _) = scaled
+    // The eigensolver decomposes a block whose squares underflow at normal scale, by an exact
+    // power of two ([`gam_linalg::faer_ndarray::self_adjoint_evd`]), so its backward error is
+    // `O(p·ε·‖S‖)` at every scale. What no scaling can undo is the entries' own representation:
+    // each is known only to half a quantum, which by Weyl moves an eigenvalue by at most
+    // `p·2⁻¹⁰⁷⁴` ([`eigenvalue_rounding_unit`]'s absolute term).
+    let (eigenvalues, _) = matrix
         .eigh(faer::Side::Lower)
         .map_err(|e| format!("{what} eigendecomposition failed during validation: {e}"))?;
     let max_abs_eval = eigenvalues
         .iter()
         .fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
-    let psd_tol = 100.0
-        * (nrows as f64)
-        * (f64::EPSILON * max_abs_eval + f64::from_bits(1) * lead * tail);
-    let unscale = |value: f64| value / lead / tail;
-    let eigenvalues = eigenvalues.mapv(unscale);
-    let max_abs_eval = unscale(max_abs_eval);
-    let psd_tol = unscale(psd_tol);
+    let psd_tol = 100.0 * (nrows as f64) * (f64::EPSILON * max_abs_eval + f64::from_bits(1));
     if let Some(&min_eval) = eigenvalues
         .iter()
         .filter(|&&ev| ev < -psd_tol)
