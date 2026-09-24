@@ -1670,43 +1670,49 @@ fn anchor_taylor_coefficients<const SLOTS: usize, const SLICES: usize>(
     grid: AnchorGrid<'_>,
 ) -> Result<[[f64; SLOTS]; SLOTS], String> {
     const { assert!(SLICES == (SLOTS - 1) * (SLOTS - 2) / 2) };
-    // The path is decided on the order-six solve, whatever order is asked
-    // for, so the published order-five table and the order-six table that
-    // extends it (gam#2945) come from the same arithmetic.
-    if let Some(sixth) = anchor_taylor_coefficients_linear::<ANCHOR_SIXTH_SLOTS, SIXTH_POWER_SLICES>(
-        alpha,
-        q,
-        observed_slope,
-        grid,
-    )? {
-        // The order-`SLOTS − 1` table holds the total degrees below `SLOTS`.
-        let mut table = [[0.0_f64; SLOTS]; SLOTS];
-        for (i, row) in table.iter_mut().enumerate() {
-            for (j, slot) in row.iter_mut().enumerate().take(SLOTS - i) {
-                *slot = sixth[i][j];
+    // The linear solve of a degree is the same arithmetic at every order, so
+    // the published order-five table decides on its five degrees and an
+    // order-six table extends it by construction (gam#2945): where only its
+    // sixth degree lacks bits, that degree alone is read from the log table.
+    let (linear, failed) =
+        anchor_taylor_coefficients_linear::<SLOTS, SLICES>(alpha, q, observed_slope, grid)?;
+    match failed {
+        None => Ok(linear),
+        Some(degree) if degree >= TAYLOR_SLOTS => {
+            let log = anchor_taylor_coefficients_log::<SLOTS, SLICES>(alpha, q, observed_slope, grid)?;
+            let mut table = linear;
+            for (i, row) in table.iter_mut().enumerate() {
+                for (j, slot) in row.iter_mut().enumerate() {
+                    if i + j >= degree {
+                        *slot = log[i][j];
+                    }
+                }
             }
+            Ok(table)
         }
-        return Ok(table);
+        Some(_) => anchor_taylor_coefficients_log::<SLOTS, SLICES>(alpha, q, observed_slope, grid),
     }
-    anchor_taylor_coefficients_log::<SLOTS, SLICES>(alpha, q, observed_slope, grid)
 }
 
 /// The Hermite-moment (linear-space) table: `moments[n][s] = Σ_k ω_k u_k^s
 /// F^{(n)}(η_k)` under the law's density weights `ω_k` and the target
 /// `F^{(n)}(q)·φ(q)/D`, both homogeneous of degree zero in the density so they
-/// stay finite where every node's density underflows (gam#2941). `None` where
-/// the marginal tail is below the linear residual floor, where the target ratio
-/// is not a finite positive number, or where the solve keeps fewer than
-/// [`LINEAR_TABLE_MIN_BITS`] bits of some coefficient.
+/// stay finite where every node's density underflows (gam#2941). Beside the
+/// table, the lowest total degree whose coefficients the solve does not reach
+/// [`LINEAR_TABLE_MIN_BITS`] at, or `None` when every degree does; degree one
+/// where the marginal tail is below the linear residual floor or the target
+/// ratio is not a finite positive number. The table's entries at and above a
+/// failing degree are not to be read.
 fn anchor_taylor_coefficients_linear<const SLOTS: usize, const SLICES: usize>(
     alpha: f64,
     q: f64,
     observed_slope: f64,
     grid: AnchorGrid<'_>,
-) -> Result<Option<[[f64; SLOTS]; SLOTS]>, String> {
+) -> Result<([[f64; SLOTS]; SLOTS], Option<usize>), String> {
     const { assert!(SLICES == (SLOTS - 1) * (SLOTS - 2) / 2) };
+    let refused = [[0.0_f64; SLOTS]; SLOTS];
     if smaller_tail_log_target(q) < LINEAR_RESIDUAL_FLOOR.ln() {
-        return Ok(None);
+        return Ok((refused, Some(1)));
     }
     let density = AnchorDensity::at(alpha, observed_slope, grid)?;
     // Every sum carries its magnitude beside it: the rounding of a floating
@@ -1730,14 +1736,14 @@ fn anchor_taylor_coefficients_linear<const SLOTS: usize, const SLICES: usize>(
     }
     let h_alpha = moments[1][0];
     if !(h_alpha.is_finite() && h_alpha < 0.0) {
-        return Ok(None);
+        return Ok((refused, Some(1)));
     }
     let h_alpha_relative_error = f64::EPSILON * moments_magnitude[1][0] / h_alpha.abs();
     // `φ(q)/D`, the density ratio the target is normalized by, from the same
     // shifted log-space sum the anchor's first partials read.
     let (ratio, _) = anchor_first_derivatives(alpha, q, observed_slope, grid)?;
     if !(ratio.is_finite() && ratio > 0.0) {
-        return Ok(None);
+        return Ok((refused, Some(1)));
     }
     let target = survival_cdf_derivative_stack::<SLOTS>(q, ratio);
     let mut parts = [[0.0_f64; SLOTS]; SLOTS];
@@ -1805,7 +1811,14 @@ fn anchor_taylor_coefficients_linear<const SLOTS: usize, const SLICES: usize>(
             let part = -rest[i] / h_alpha;
             let error = rest_error[i] / h_alpha.abs() + part.abs() * h_alpha_relative_error;
             if !(error <= error_floor) {
-                return Ok(None);
+                let mut coefficients = [[0.0_f64; SLOTS]; SLOTS];
+                for (lower, part) in parts.iter().enumerate().take(degree).skip(1) {
+                    for i in 0..=lower {
+                        coefficients[i][lower - i] = part[i];
+                    }
+                }
+                coefficients[0][0] = alpha;
+                return Ok((coefficients, Some(degree)));
             }
             parts[degree][i] = part;
             parts_error[degree][i] = error;
@@ -1819,9 +1832,9 @@ fn anchor_taylor_coefficients_linear<const SLOTS: usize, const SLICES: usize>(
     }
     coefficients[0][0] = alpha;
     if !coefficients.iter().flatten().all(|c| c.is_finite()) {
-        return Ok(None);
+        return Ok((refused, Some(1)));
     }
-    Ok(Some(coefficients))
+    Ok((coefficients, None))
 }
 
 /// `F^{(n)}(x)·density` for `F(x) = Φ(−x)`, `n < SLOTS`: the Hermite moments
@@ -2191,23 +2204,15 @@ mod anchor_tests {
                     grid.view(),
                 )
                 .unwrap();
-                // The path is decided on the order-six solve, as the dispatcher decides it.
-                let Some(sixth) =
-                    anchor_taylor_coefficients_linear::<ANCHOR_SIXTH_SLOTS, SIXTH_POWER_SLICES>(
-                        alpha,
-                        q,
-                        observed_slope,
-                        grid.view(),
-                    )
-                    .unwrap()
-                else {
+                let (linear, failed) = anchor_taylor_coefficients_linear::<TAYLOR_SLOTS, POWER_SLICES>(
+                    alpha,
+                    q,
+                    observed_slope,
+                    grid.view(),
+                )
+                .unwrap();
+                if failed.is_some() {
                     continue;
-                };
-                let mut linear = [[0.0_f64; TAYLOR_SLOTS]; TAYLOR_SLOTS];
-                for i in 0..TAYLOR_SLOTS {
-                    for j in 0..TAYLOR_SLOTS - i {
-                        linear[i][j] = sixth[i][j];
-                    }
                 }
                 published_linear += 1;
                 let bar = 2.0_f64.powi(-LINEAR_TABLE_MIN_BITS) * (1.0 + alpha.abs());
@@ -2243,16 +2248,23 @@ mod anchor_tests {
         let observed_slope = 0.3;
         let alpha = solve_anchor(q, observed_slope, grid.view()).unwrap();
         assert!(
-            anchor_taylor_coefficients_linear::<ANCHOR_SIXTH_SLOTS, SIXTH_POWER_SLICES>(
-                alpha,
-                q,
-                observed_slope,
-                grid.view()
-            )
-            .unwrap()
-            .is_none(),
+            anchor_taylor_coefficients_linear::<TAYLOR_SLOTS, POWER_SLICES>(alpha, q, observed_slope, grid.view())
+                .unwrap()
+                .1
+                .is_some(),
             "a tail index has no linear-space bits"
         );
+        // An order-six table extends the published order-five table bitwise on
+        // the bulk point whichever path its sixth degree takes.
+        let (q, observed_slope) = (0.4, 0.4);
+        let alpha = solve_anchor(q, observed_slope, grid.view()).unwrap();
+        let fifth = AnchorTaylor::at(alpha, q, observed_slope, grid.view()).unwrap();
+        let sixth = anchor_taylor_through_sixth(alpha, q, observed_slope, grid.view()).unwrap();
+        for i in 0..TAYLOR_SLOTS {
+            for j in 0..TAYLOR_SLOTS - i {
+                assert_eq!(fifth.coefficients()[i][j].to_bits(), sixth[i][j].to_bits(), "({i}, {j})");
+            }
+        }
     }
 
     /// The implicit first partials of the anchor agree with the order-one
