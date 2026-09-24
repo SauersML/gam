@@ -1164,7 +1164,9 @@
   construction — both children re-derive their tube from their own bounds and their union is
   the parent — so only `HonestConformalCost::z_cells` moves.
 
-## gamfit 0.1.273 (2026-09-24)
+## gamfit 0.1.274 (2026-09-24)
+
+- 0.1.273 was tagged on a tree that did not compile (a misplaced test and an undocumented field, fixed on main by cccb01fdf1 and dfb2a77b85); this is the same release on the fixed tree.
 
 - **A survival marginal-slope posterior mean costs one root solve per quadrature node, not an
   order-five Taylor table** (gnomon biobank study). The anchored row kernel's partials `(α_q, α_b)`

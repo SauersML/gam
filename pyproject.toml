@@ -133,7 +133,7 @@ type = [
 # crates/gam-pyffi/Cargo.toml's version, which maturin reads, and uv.lock's
 # gamfit version to this first `version = ` line of the file.
 [tool.gamfit]
-version = "0.1.273"
+version = "0.1.274"
 
 [tool.maturin]
 manifest-path = "crates/gam-pyffi/Cargo.toml"
