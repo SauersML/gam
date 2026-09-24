@@ -8,9 +8,10 @@ Every matrix ``W`` (out x in) of q, k, v, o, c_fc and down_proj in every layer i
 exactly for every ``(V, Y)``. Piece c of ``W`` reads ``v_c . x`` and writes ``W s_c``: a rank-one piece, the unit VPD
 counts, so rank units here are VPD's L0. Nothing is pinned: the elementwise GELU fixes only that c_fc's output feeds
 it, and RoPE acts after the query and key projections, so any split of any matrix is exact. Starting pieces and counts
-come from the architecture and reproduce VPD's own component counts: q, k, v, o start at the identity (K = 768); c_fc at
-the neurons' normalized read directions (K = 3072; VPD's neuron-aligned start); down_proj at the neuron basis of its
-input (K = 3072). 36,864 pieces per position in all, VPD's C. Masks act at the position the matrix is applied at, and
+come from the architecture and reproduce VPD's own component counts: q, k, v, o start at their own singular
+decomposition (reads = right singular vectors, K = 768: the matrix's exact rank-one split, where the residual stream's
+coordinate axes would mean nothing to it); c_fc at the neurons' normalized read directions (K = 3072; VPD's
+neuron-aligned start); down_proj at the neuron basis its input lives in (K = 3072). 36,864 pieces per position in all, VPD's C. Masks act at the position the matrix is applied at, and
 KL is under joint masking (VPD's semantics).
 """
 from __future__ import annotations
@@ -62,8 +63,13 @@ class AllPieces:
             elif m == "fc":
                 W = self.b.w[f"h.{l}.{self.names[m]}"].double().cpu()
                 parts.append(W / W.norm(dim=1, keepdim=True))
-            else:
+            elif m == "down":
                 parts.append(torch.eye(a, c))
+            else:
+                # The matrix's own rank-one decomposition W = sum_i s_i u_i v_i^T: reads are its right
+                # singular vectors (the coordinate axes of the residual stream mean nothing to W).
+                W = self.b.w[f"h.{l}.{self.names[m]}"].double().cpu()
+                parts.append(torch.linalg.svd(W, full_matrices=True)[2])
         return torch.cat([t.double().reshape(-1) for t in parts])
 
     def unpack(self, theta):
@@ -182,6 +188,11 @@ def main():
                 m = mask(keep)
                 _, d = jvp(lambda t: kl_of(model.logits(tokens, m, t)), (th(theta),), (th(v),))
                 return d.double().cpu().numpy()
+
+            def observe(self, a):
+                print(f"[alt] level {a['level']:.4g}: kept {a['kept']} pieces, KL mean {a['mean_divergence']:.4f}; "
+                      f"barrier {a['barrier_before']:.6g} -> {a['barrier_after']:.6g}; step {a['step']:.3e} radius {a['radius']:.3e}; "
+                      f"residual {a['residual']:.3e} / {a['tolerance']:.3e} certified {a['certified']}", flush=True)
 
             def gradient_arithmetic(self):
                 return 2.0 ** -24, P * logp_clean.shape[-1]

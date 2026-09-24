@@ -88,6 +88,8 @@ pub trait PieceExecutor {
     /// relative stationarity `√u_f`. The certificate is decided there: a tighter one
     /// could never be met, and a looser one would pass unconverged fits.
     fn gradient_arithmetic(&self) -> Result<(f64, usize), String>;
+    /// Receives each alternation as it completes, for progress reporting.
+    fn observe(&mut self, alternation: &Alternation);
     /// `Σ_t w_t ∇²KL_t v`, with `∇²KL_t` the exact Hessian of `KL_t` in `θ`.
     fn weighted_hessian(&mut self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>, weights: ArrayView1<'_, f64>, v: ArrayView1<'_, f64>) -> Result<Array1<f64>, String>;
 }
@@ -135,6 +137,12 @@ pub struct Alternation {
     /// Trust-region iterations and whether its first-order certificate held.
     pub iterations: usize,
     pub certified: bool,
+    /// The trust region's relative stationarity, the bound it was decided against, its
+    /// radius after the step, and the length of the step the pieces took.
+    pub residual: f64,
+    pub tolerance: f64,
+    pub radius: f64,
+    pub step: f64,
 }
 
 /// The fitted pieces and supports.
@@ -349,6 +357,10 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
                 let after = barrier.value_gradient(termination.point.view()).map_err(SupportFitError::Geometry)?.0;
                 (termination, before, after)
             };
+            let step = {
+                let d = &termination.point - &theta;
+                d.dot(&d).sqrt()
+            };
             theta = termination.point.clone();
             let certified = termination.residual <= termination.tolerance;
             let carried = Some(current.radius.clone());
@@ -364,7 +376,14 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
                 barrier_after: after,
                 iterations: termination.iterations,
                 certified,
+                residual: termination.residual,
+                tolerance: termination.tolerance,
+                radius: termination.radius,
+                step,
             });
+            if let Some(last) = alternations.last() {
+                executor.observe(last);
+            }
             // A radius is learned only by an accepted step: carry it when the pieces moved.
             if termination.point != theta_at_level_start {
                 carried_radius = Some(termination.radius);
@@ -406,6 +425,7 @@ mod tests {
     /// admissible throughout.
     struct Scaled {
         a: Array2<f64>,
+        observed: usize,
     }
 
     impl Scaled {
@@ -439,6 +459,10 @@ mod tests {
         fn gradient_arithmetic(&self) -> Result<(f64, usize), String> {
             Ok((f64::EPSILON / 2.0, self.a.len()))
         }
+        fn observe(&mut self, alternation: &Alternation) {
+            assert!(alternation.step.is_finite() && alternation.radius > 0.0, "{alternation:?}");
+            self.observed += 1;
+        }
         fn weighted_hessian(&mut self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>, weights: ArrayView1<'_, f64>, v: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
             if theta.len() != self.a.ncols() {
                 return Err(format!("theta has {} entries for {} pieces", theta.len(), self.a.ncols()));
@@ -452,8 +476,9 @@ mod tests {
     #[test]
     fn reshaping_pieces_lets_the_supports_shrink() {
         let a = ndarray::array![[1.0, 0.3, 0.2, 0.9], [0.25, 1.0, 0.3, 0.2], [0.3, 0.2, 1.0, 0.25]];
-        let mut executor = Scaled { a };
+        let mut executor = Scaled { a, observed: 0 };
         let fit = fit_supports_and_pieces(&mut executor, Array1::zeros(4), 3, 4, 0.1, false, 1).unwrap();
+        assert_eq!(executor.observed, fit.alternations.len());
         let first = fit.alternations.first().unwrap();
         assert!(first.barrier_after <= first.barrier_before, "{:?}", fit.alternations);
         // The path starts sparse (above the empty support's divergence) and ends at ε.
@@ -473,8 +498,8 @@ mod tests {
     #[test]
     fn the_mean_form_shares_one_budget() {
         let a = ndarray::array![[1.0, 0.3, 0.2, 0.9], [0.25, 1.0, 0.3, 0.2], [0.3, 0.2, 1.0, 0.25]];
-        let per = fit_supports_and_pieces(&mut Scaled { a: a.clone() }, Array1::zeros(4), 3, 4, 0.1, false, 1).unwrap();
-        let mut executor = Scaled { a };
+        let per = fit_supports_and_pieces(&mut Scaled { a: a.clone(), observed: 0 }, Array1::zeros(4), 3, 4, 0.1, false, 1).unwrap();
+        let mut executor = Scaled { a, observed: 0 };
         let mean = fit_supports_and_pieces(&mut executor, Array1::zeros(4), 3, 4, 0.1, true, 1).unwrap();
         let kl = executor.divergence(mean.theta.view(), mean.supports.keep.view()).unwrap();
         assert!(kl.sum() / 3.0 < 0.1, "{kl:?}");

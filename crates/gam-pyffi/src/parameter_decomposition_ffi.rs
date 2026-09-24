@@ -14,7 +14,7 @@ use std::sync::atomic::AtomicBool;
 use gam::terms::sae::parameter_decomposition::minimal_support::{
     Fidelity, SupportEvaluation, SupportExecutor, minimal_support,
 };
-use gam::terms::sae::parameter_decomposition::support_fit::{PieceExecutor, fit_supports_and_pieces};
+use gam::terms::sae::parameter_decomposition::support_fit::{Alternation, PieceExecutor, fit_supports_and_pieces};
 use gam::terms::sae::parameter_decomposition::surface::run_parameter_decomposition;
 use ndarray::{Array1, ArrayView1, ArrayView2};
 use numpy::{IntoPyArray, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn};
@@ -142,8 +142,9 @@ fn parameter_decomposition_minimal_support<'py>(
 /// A Python executor object for `support_fit`: methods `supports(theta, keep)`,
 /// `divergence(theta, keep)`, `weighted_gradient(theta, keep, weights)`,
 /// `directional(theta, keep, v)`, `weighted_hessian(theta, keep, weights, v)` (the
-/// exact Hessian product `Σ_t w_t ∇²KL_t v`) and `gradient_arithmetic()` (the unit
-/// roundoff of its gradients and the length of their longest reduction),
+/// exact Hessian product `Σ_t w_t ∇²KL_t v`), `gradient_arithmetic()` (the unit
+/// roundoff of its gradients and the length of their longest reduction) and
+/// `observe(alternation)` (a dict per completed alternation, for progress),
 /// with float64 vectors and a `P x C` bool `keep`.
 struct PythonPieceExecutor<'py> {
     object: Bound<'py, PyAny>,
@@ -164,7 +165,34 @@ impl<'py> PythonPieceExecutor<'py> {
     }
 }
 
+fn alternation_dict<'py>(py: Python<'py>, a: &Alternation) -> PyResult<Bound<'py, PyDict>> {
+    let entry = PyDict::new(py);
+    entry.set_item("level", a.level)?;
+    entry.set_item("kept", a.kept)?;
+    entry.set_item("mean_divergence", a.mean_divergence)?;
+    entry.set_item("barrier_before", a.barrier_before)?;
+    entry.set_item("barrier_after", a.barrier_after)?;
+    entry.set_item("iterations", a.iterations)?;
+    entry.set_item("certified", a.certified)?;
+    entry.set_item("residual", a.residual)?;
+    entry.set_item("tolerance", a.tolerance)?;
+    entry.set_item("radius", a.radius)?;
+    entry.set_item("step", a.step)?;
+    Ok(entry)
+}
+
 impl PieceExecutor for PythonPieceExecutor<'_> {
+    fn observe(&mut self, alternation: &Alternation) {
+        let py = self.object.py();
+        let result = alternation_dict(py, alternation).and_then(|d| self.object.call_method1("observe", (d,)).map(|r| r.unbind()));
+        if let Err(e) = result
+            && self.error.is_none()
+        {
+            // Raised when the fit returns, never swallowed.
+            self.error = Some(e);
+        }
+    }
+
     fn gradient_arithmetic(&self) -> Result<(f64, usize), String> {
         // Declared by the executor; there is no default.
         self.object
@@ -248,21 +276,16 @@ fn parameter_decomposition_fit_supports<'py>(
         Ok(fit) => fit,
         Err(error) => return Err(runner.error.take().unwrap_or_else(|| py_value_error(error.to_string()))),
     };
+    if let Some(error) = runner.error.take() {
+        return Err(error);
+    }
     let out = PyDict::new(py);
     out.set_item("theta", fit.theta.into_pyarray(py))?;
     out.set_item("keep", fit.supports.keep.into_pyarray(py))?;
     out.set_item("divergence", fit.supports.divergence.into_pyarray(py))?;
     let alternations = pyo3::types::PyList::empty(py);
     for a in &fit.alternations {
-        let entry = PyDict::new(py);
-        entry.set_item("level", a.level)?;
-        entry.set_item("kept", a.kept)?;
-        entry.set_item("mean_divergence", a.mean_divergence)?;
-        entry.set_item("barrier_before", a.barrier_before)?;
-        entry.set_item("barrier_after", a.barrier_after)?;
-        entry.set_item("iterations", a.iterations)?;
-        entry.set_item("certified", a.certified)?;
-        alternations.append(entry)?;
+        alternations.append(alternation_dict(py, a)?)?;
     }
     out.set_item("alternations", alternations)?;
     Ok(out)
