@@ -118,6 +118,11 @@ fn fresh_arrow_schur_joint_fits_are_bit_reproducible_above_61_rows_2512() {
             );
         }
         for (term, rho) in &mut fits {
+            // The joint fit refuses an identically zero decoder (it has no column
+            // space to install a frame from), so each fresh term is seeded from the
+            // data first, deterministically, as that refusal directs (gam#4582).
+            term.refit_decoder_least_squares_at_current_state(target.view(), Some(rho))
+                .unwrap();
             term.run_joint_fit_arrow_schur(target.view(), rho, None, 1, 1.0, 1.0e-6, 1.0e-6)
                 .unwrap();
         }

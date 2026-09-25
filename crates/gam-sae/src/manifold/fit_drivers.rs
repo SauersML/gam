@@ -8509,6 +8509,16 @@ impl SaeManifoldTerm {
         let frames = self.frames_active();
         let mut moved = false;
         let mut sweep_round = 0usize;
+        // The previous committed round's decrease (gam#4582). A block sweep that is
+        // approaching a fixed point of a bounded objective contracts: each round
+        // gains less than the one before. A round that gains AT LEAST as much as
+        // its predecessor is not approaching one — the iterate is sliding along a
+        // descent ray (measured on the #2512 K=1, M=11 fixture: the per-round gain
+        // bottomed near 5.7e-5 by round 40, then grew to 7.2e-5 by round 500 while
+        // the objective fell 0.24 over 5000 rounds and the loop never ended). The
+        // round is kept, since it is a genuine decrease, and the joint Newton that
+        // follows, which owns convergence and refusal, takes the state from there.
+        let mut previous_gain = f64::INFINITY;
         loop {
             let snapshot = self.snapshot_mutable_state();
             // #2731 — one clock per round: on p = 2048 / 32 charts this loop is
@@ -8572,8 +8582,13 @@ impl SaeManifoldTerm {
             let accept_floor = floor_rel * (1.0 + best_objective.abs());
             match round {
                 Ok(value) if value.is_finite() && value < best_objective - accept_floor => {
+                    let gain = best_objective - value;
                     best_objective = value;
                     moved = true;
+                    if gain >= previous_gain {
+                        break;
+                    }
+                    previous_gain = gain;
                 }
                 _ => {
                     self.restore_mutable_state(&snapshot)?;
