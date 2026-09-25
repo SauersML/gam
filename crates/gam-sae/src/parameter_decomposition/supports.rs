@@ -791,30 +791,41 @@ impl<M> FailureHypergraph<M> {
 }
 
 /// A hitting set built by repeatedly taking the component that hits the most unhit
-/// edges, the largest index on ties. Counts range over the members of unhit edges only,
-/// so a pick costs the total length of those edges, not the number of components.
+/// edges, the largest index on ties. Each component's count of unhit edges falls as
+/// its edges are hit, and a max-heap holds the counts with stale entries skipped on
+/// pop, so the whole set costs the total edge length times a logarithm, not a recount
+/// of every edge per pick.
 fn greedy_hitting_set(edges: &[&[usize]]) -> Vec<usize> {
+    let mut members_of: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for (index, edge) in edges.iter().enumerate() {
+        for &component in edge.iter() {
+            members_of.entry(component).or_default().push(index);
+        }
+    }
+    let mut count: std::collections::HashMap<usize, usize> =
+        members_of.iter().map(|(&component, list)| (component, list.len())).collect();
+    let mut heap: std::collections::BinaryHeap<(usize, usize)> =
+        count.iter().map(|(&component, &unhit)| (unhit, component)).collect();
     let mut hit = vec![false; edges.len()];
     let mut picked = Vec::new();
-    loop {
-        let mut counts: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
-        for (edge, done) in edges.iter().zip(&hit) {
-            if !*done {
-                for &component in edge.iter() {
-                    *counts.entry(component).or_insert(0) += 1;
+    while let Some((unhit, component)) = heap.pop() {
+        if unhit == 0 || count.get(&component) != Some(&unhit) {
+            continue;
+        }
+        picked.push(component);
+        for &index in &members_of[&component] {
+            if !std::mem::replace(&mut hit[index], true) {
+                for &member in edges[index] {
+                    let left = count.get_mut(&member).expect("every member is counted");
+                    *left -= 1;
+                    if member != component && *left > 0 {
+                        heap.push((*left, member));
+                    }
                 }
             }
         }
-        let Some((&component, _)) = counts.iter().max_by_key(|(_, count)| **count) else {
-            return picked;
-        };
-        picked.push(component);
-        for (edge, done) in edges.iter().zip(hit.iter_mut()) {
-            if edge.contains(&component) {
-                *done = true;
-            }
-        }
     }
+    picked
 }
 
 /// The number of pairwise disjoint edges a greedy packing finds. Disjoint edges
