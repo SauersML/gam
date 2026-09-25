@@ -1159,21 +1159,17 @@ pub(crate) fn seed_inner_state_accepts_empty_beta_as_noslot() {
 /// defined frozen quasi-Laplace score and is not a valid ownership witness.
 #[test]
 pub(crate) fn seed_inner_state_installs_and_reuses_matching_beta() {
+    // The seed is the β an exact evaluation PUBLISHES, not the bare
+    // quasi-Laplace solve's iterate: the evaluation prices only a state the
+    // exact information certifies, while the quasi-Laplace solve alone can stop
+    // at a state whose exact `A` is indefinite (gam#4583), which `eval` then
+    // refuses as undefined rather than reusing.
     let mut source = warmstart_test_objective();
-    let source_rho = source.baseline_rho.clone();
-    source
-        .term
-        .penalized_quasi_laplace_criterion_with_cache(
-            source.target.view(),
-            &source_rho,
-            source.registry.as_ref(),
-            source.inner_max_iter,
-            source.learning_rate,
-            source.ridge_ext_coord,
-            source.ridge_beta,
-        )
-        .expect("source continuation state must have finite converged evidence");
-    let seed = source.term.flatten_beta();
+    let source_rho = source.baseline_rho.flat_coordinates();
+    let seed = OuterObjective::eval(&mut source, &source_rho)
+        .expect("the source evaluation must price a certified state")
+        .inner_beta_hint
+        .expect("the source evaluation must publish its converged β");
 
     let mut obj = warmstart_test_objective();
     let dim = obj.term.beta_dim();
