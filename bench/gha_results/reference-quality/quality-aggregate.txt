@@ -6,12 +6,12 @@ factors         1      1      0      1    0.0173      1.0000    1.0000
 families       50     50     33     17   -0.0072      0.0025    0.0152
 manifolds      11     11      8      2   -0.0033      0.0527    0.0945
 misc           29     29     18     11   -0.0006      0.0630    0.0945
-smooths        41     41     25     16   -0.0100      0.0093    0.0278
+smooths        41     41     26     15   -0.0109      0.0061    0.0183
 survival       12     12      7      5   -0.0092      0.2349    0.2818
 ------------------------------------------------------------------------
-OVERALL       144    144     91     52   -0.0052      0.0000 
+OVERALL       144    144     92     51   -0.0058      0.0000 
 
-CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0000, median log(gam/ref)=-0.0052, wins 91 / losses 52)
+CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0000, median log(gam/ref)=-0.0058, wins 92 / losses 51)
 Experimental units: 144 cases from 185 metric pairs.
 INCOMPLETE: absent manifest, mismatched execution, or failed cases; closure blocked.
 
@@ -31,7 +31,7 @@ SILENT ATTRITION: 10 test(s) failed BEFORE emitting a pair (excluded from the si
   GAM_ERROR/gam_fit_failed families::quality_vs_vgam_multinomial_smooth_by_factor::gam_multinomial_smooth_by_factor_recovers_truth
   GAM_ERROR/gam_fit_failed families::quality_vs_mgcv_tensor_te_2d_gamma::gam_tensor_te_2d_gamma_matches_mgcv
   METRIC_OFF/quality_metric misc::fit_quality_stress::hifreq_tensor_k4
-  TIMEOUT/per_test_bound misc::quality_expectile_band_coverage_heteroscedastic::expectile_bands_cover_true_expectile_under_heteroscedastic_noise
+  GAM_ERROR/gam_fit_failed misc::quality_expectile_band_coverage_heteroscedastic::expectile_bands_cover_true_expectile_under_heteroscedastic_noise
   GAM_ERROR/gam_fit_failed misc::quality_vs_simplex_dirichlet_regression::gam_dirichlet_regression_recovers_truth_on_real_data
   TIMEOUT/per_test_bound misc::quality_vs_lifelines_interval_censored_truth_recovery::gam_recovers_interval_censored_latent_truth_match_or_beat_lifelines
   METRIC_OFF/quality_metric smooths::quality_vs_rstpm2_pstpm2_smooth_covariate::gam_smooth_covariate_recovers_flat_noise_effect_and_valid_survival_on_bone
