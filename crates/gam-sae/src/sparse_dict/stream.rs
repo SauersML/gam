@@ -830,6 +830,15 @@ mod stream_tests {
         // epoch's pre-refresh EV (which sees the decoder refreshed by earlier
         // epochs) strictly improves on the first epoch's. Uses full-rank data with
         // an undercomplete K so the seed is far from a perfect fit.
+        //
+        // Not necessarily the SECOND epoch's: the routability gate (#3926) holds a
+        // row until its accumulated tangent pull beats the BIC charge
+        // `(p − 1) ln n_k`, so the first refresh can wait several epochs while the
+        // deferred evidence streams. On this corpus every row is held through
+        // epoch 3 and the EV moves only in its tenth digit, then refreshes carry
+        // it from 0.31277 to 0.32851 by epoch 6. That deferral is itself the
+        // persistence under test: a stream that restarted each epoch would never
+        // accumulate the evidence the refresh needs.
         let (n, k, p) = (300usize, 8usize, 12usize);
         let x = pseudo_random(n, p);
         let config = SparseDictConfig {
@@ -849,10 +858,11 @@ mod stream_tests {
             state.partial_fit(x.view()).expect("partial_fit");
             evs.push(state.end_epoch().expect("end_epoch").explained_variance);
         }
+        let last = evs[evs.len() - 1];
         assert!(
-            evs[1] > evs[0] + 1.0e-4,
-            "second-epoch EV {} must improve on first-epoch EV {} (warm-start persisted)",
-            evs[1],
+            last > evs[0] + 1.0e-4,
+            "epoch-{} EV {last} must improve on first-epoch EV {} (warm-start persisted)",
+            evs.len(),
             evs[0]
         );
     }
