@@ -84,6 +84,21 @@ impl RiemannianManifold for EuclideanManifold {
         self.project_tangent(point, euclidean_grad)
     }
 
+    /// Flat: the Euclidean Hessian product is the Riemannian one.
+    fn riemannian_hessian(
+        &self,
+        point: ArrayView1<'_, f64>,
+        euclidean_grad: ArrayView1<'_, f64>,
+        euclidean_hessian_product: ArrayView1<'_, f64>,
+        tangent: ArrayView1<'_, f64>,
+    ) -> GeometryResult<Array1<f64>> {
+        check_len("Euclidean Hessian point", point.len(), self.dim)?;
+        check_len("Euclidean Hessian gradient", euclidean_grad.len(), self.dim)?;
+        check_len("Euclidean Hessian product", euclidean_hessian_product.len(), self.dim)?;
+        check_len("Euclidean Hessian tangent", tangent.len(), self.dim)?;
+        Ok(euclidean_hessian_product.to_owned())
+    }
+
     fn christoffel_symbols(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Vec<Array2<f64>>> {
         check_len("Euclidean Christoffel point", point.len(), self.dim)?;
         Ok(zero_christoffel(self.dim))

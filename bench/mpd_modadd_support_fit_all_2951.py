@@ -8,8 +8,8 @@ parameter value: the stacked query, key and value maps and the output map (K = 1
 singular decomposition), the MLP input (K = 512, starting at the tight frame nearest the neurons' read directions) and
 the MLP output (K = 512, the neuron basis its input lives in). One example is one position.
 
-``--pieces frame`` (the default) keeps every map's pieces a tight frame: analysis ``V = A L^{-T}`` with ``A^T A = L L^T``
-(so ``V^T V = I`` for every unconstrained ``A``) and synthesis ``S = V^T``. Then any partial removal ``0 <= D <= I`` of
+``--pieces frame`` (the default) keeps every map's pieces a tight frame: an analysis ``V`` with orthonormal columns,
+moved on the Stiefel manifold (``fit_supports``'s ``frames``), and synthesis ``S = V^T``. Then any partial removal ``0 <= D <= I`` of
 pieces takes out ``W V^T D V``, never more than ``W`` itself: pieces cannot cancel one another. ``--pieces dual``
 is the general exact split (``S = V^+ + Y (I - V V^+)``), where they can: on this model the fit drove the MLP-input
 analysis toward singularity (condition number 2.5e3 at the start, 2.3e5 within three minutes), and from the full
@@ -97,9 +97,7 @@ def main():
 
         def apply(n, x):
             if frame:
-                A = P[(n, "V")]
-                L = torch.linalg.cholesky(A.T @ A)
-                V = torch.linalg.solve_triangular(L, A.T, upper=False).T
+                V = P[(n, "V")]
                 S = V.T
             else:
                 V, Y = P[(n, "V")], P[(n, "Y")]
@@ -186,7 +184,8 @@ def main():
     theta0 = initial_theta().numpy()
     executor, N = make(fit_tokens)
     print(f"[mall] {C} rank-one pieces/example over q, k, v, o, in, out; theta {theta0.size}; fit {N} examples", flush=True)
-    fit = fit_supports(executor, theta0, N, C, args.eps, "mean", 1)
+    fit = fit_supports(executor, theta0, N, C, args.eps, "mean", 1,
+                       [shape for (_n, kind, shape) in shapes if kind == "V"] if frame else None)
     held_exec, HN = make(held_tokens)
     held = minimal_support(lambda k: held_exec.supports(fit["theta"], k), HN, C, args.eps, "mean", 1)
     base = minimal_support(lambda k: held_exec.supports(theta0, k), HN, C, args.eps, "mean", 1)
@@ -209,8 +208,6 @@ def main():
         for n in ("q", "k", "v", "in"):
             s0, s1 = offsets[n]
             Vn = V[(n, "V")]
-            if frame:
-                Vn = torch.linalg.solve_triangular(torch.linalg.cholesky(Vn.T @ Vn), Vn.T, upper=False).T
             for c in np.argsort(-used[s0:s1])[:20]:
                 r = Vn[c] / Vn[c].norm()
                 rows.append(float((basis.T @ r).norm() ** 2))

@@ -5,9 +5,12 @@ rule are the Rust owner's; this file only runs the model and its derivatives).
 
 Every matrix ``W`` (out x in) of q, k, v, o, c_fc and down_proj in every layer is split on its input side by an analysis
 ``V`` (K x in, rows are reads) and a synthesis ``S`` (in x K) with ``S V = I``, so ``W = W S V`` exactly for every
-parameter value. ``--pieces frame`` keeps every matrix's pieces a tight frame: ``V = A L^{-T}`` with
-``A^T A = L L^T`` for an unconstrained ``A`` (so ``V^T V = I``) and ``S = V^T``; any partial removal ``0 <= D <= I``
-of pieces then takes out ``W V^T D V``, never more than ``W``, so pieces cannot cancel one another.
+parameter value. ``--pieces frame`` keeps every matrix's pieces a tight frame: ``V`` has orthonormal columns
+(``V^T V = I``) and ``S = V^T``, and ``V`` moves on the Stiefel manifold (``gamfit.sae.fit_supports``'s ``frames``: the
+polar retraction and the Riemannian Hessian are gam_geometry's), so there is no free factor to drift; any partial
+removal ``0 <= D <= I`` of pieces then takes out ``W V^T D V``, never more than ``W``, so pieces cannot cancel one
+another. (An unconstrained ``A`` with ``V = A L^{-T}``, ``A^T A = L L^T``, left its triangular factor free: on the
+4-layer target it drifted until ``A^T A`` lost positive definiteness in float32 at a down_proj after 4.5 hours.)
 ``--pieces dual`` is the general split ``S = V^+ + Y (I - V V^+)``, where they can (on the modular-addition model the
 fit drove an overcomplete analysis toward singularity, condition number 2.5e3 to 2.3e5, and from the full support no
 single piece was removable). Piece c of ``W`` reads ``v_c . x`` and writes ``W s_c``: a rank-one piece, the unit VPD
@@ -62,6 +65,10 @@ class AllPieces:
         self.units = o
         self.rank_units = np.ones(self.units)
 
+    def frames(self):
+        """The Stiefel blocks theta is made of, in order (``--pieces frame``)."""
+        return [shape for (_l, _m, kind, shape) in self.shapes if kind == "V"]
+
     def initial_theta(self):
         parts = []
         for l, m, kind, (a, c) in self.shapes:
@@ -99,8 +106,7 @@ class AllPieces:
 
         def apply(l, m, x):
             if self.frame:
-                A = P[(l, m, "V")]
-                V = torch.linalg.solve_triangular(torch.linalg.cholesky(A.T @ A), A.T, upper=False).T
+                V = P[(l, m, "V")]
                 S = V.T
             else:
                 V, Y = P[(l, m, "V")], P[(l, m, "Y")]
@@ -241,7 +247,7 @@ def main():
     theta0 = model.initial_theta().numpy()
     print(f"[all] {C} rank-one pieces/position over 24 matrices, theta {theta0.size}, P={P}, eps {args.eps} {args.form}",
           flush=True)
-    fit = fit_supports(executor, theta0, P, C, args.eps, args.form, T)
+    fit = fit_supports(executor, theta0, P, C, args.eps, args.form, T, model.frames() if model.frame else None)
     keep = fit["keep"]
     with torch.no_grad():
         joint = kl_of(model.logits(ids, mask(keep), th(fit["theta"]))).double().cpu().numpy()

@@ -16,6 +16,7 @@ use gam::terms::sae::parameter_decomposition::minimal_support::{
 };
 use gam::terms::sae::parameter_decomposition::support_fit::{Alternation, PieceExecutor, fit_supports_and_pieces};
 use gam::terms::sae::parameter_decomposition::surface::run_parameter_decomposition;
+use gam::geometry::{EuclideanManifold, RiemannianManifold, StiefelFrames};
 use ndarray::{Array1, ArrayView1, ArrayView2};
 use numpy::{IntoPyArray, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn};
 use pyo3::prelude::*;
@@ -254,8 +255,12 @@ impl PieceExecutor for PythonPieceExecutor<'_> {
 }
 
 /// `support_fit::fit_supports_and_pieces` executed by the Python `executor` object from
-/// pieces `theta`. Returns `{"theta", "keep", "divergence", "alternations"}`.
+/// pieces `theta`. `frames`, when given, lists `(rows, cols)` blocks that cover `theta`
+/// in order, each a matrix with orthonormal columns stored row-major: the pieces are then
+/// tight frames fitted on `StiefelFrames`; without it `theta` is Euclidean. Returns
+/// `{"theta", "keep", "divergence", "alternations"}`.
 #[pyfunction]
+#[pyo3(signature = (executor, theta, positions, pieces, eps, form, sequence, frames=None))]
 fn parameter_decomposition_fit_supports<'py>(
     py: Python<'py>,
     executor: Bound<'py, PyAny>,
@@ -265,6 +270,7 @@ fn parameter_decomposition_fit_supports<'py>(
     eps: f64,
     form: &str,
     sequence: usize,
+    frames: Option<Vec<(usize, usize)>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let mean = match form {
         "per_position" => false,
@@ -272,8 +278,12 @@ fn parameter_decomposition_fit_supports<'py>(
         other => return Err(py_value_error(format!("fit_supports: form must be \"per_position\" or \"mean\", got {other:?}"))),
     };
     let theta = theta.as_array().to_owned();
+    let manifold: Box<dyn RiemannianManifold> = match frames {
+        None => Box::new(EuclideanManifold::new(theta.len())),
+        Some(blocks) => Box::new(StiefelFrames::new(blocks).map_err(|e| py_value_error(format!("fit_supports: frames: {e}")))?),
+    };
     let mut runner = PythonPieceExecutor { object: executor, error: None };
-    let fit = match fit_supports_and_pieces(&mut runner, theta, positions, pieces, eps, mean, sequence) {
+    let fit = match fit_supports_and_pieces(&mut runner, manifold.as_ref(), theta, positions, pieces, eps, mean, sequence) {
         Ok(fit) => fit,
         Err(error) => return Err(runner.error.take().unwrap_or_else(|| py_value_error(error.to_string()))),
     };

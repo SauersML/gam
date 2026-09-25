@@ -82,17 +82,22 @@ def minimal_support(
 
 
 def fit_supports(executor: Any, theta: np.ndarray, positions: int, pieces: int, eps: float, form: str,
-                 sequence: int) -> dict[str, Any]:
+                 sequence: int, frames: list[tuple[int, int]] | None = None) -> dict[str, Any]:
     """Alternate minimal supports and piece reshaping, by the Rust owner.
 
     ``executor`` runs the model only: methods ``supports(theta, keep)`` (as ``minimal_support``'s
     ``evaluate``), ``divergence(theta, keep)`` (``KL_t`` per position), ``weighted_gradient(theta, keep,
-    weights)`` (``sum_t w_t grad KL_t``), ``directional(theta, keep, v)`` (``grad KL_t . v`` per position) and
-    ``weighted_gauss_newton(theta, keep, weights, v)``. ``form`` is ``minimal_support``'s: ``"per_position"``
-    (the barrier ``-sum_t log(eps - KL_t)``) or ``"mean"`` (``-log(eps - mean KL)``). The barrier, the trust region,
-    the fidelity path from the empty support down to ``eps``, and the stopping rule are
-    ``gam_sae::parameter_decomposition::support_fit``'s. Returns ``{"theta", "keep",
-    "divergence", "alternations"}``.
+    weights)`` (``sum_t w_t grad KL_t``), ``directional(theta, keep, v)`` (``grad KL_t . v`` per position),
+    ``weighted_hessian(theta, keep, weights, v)`` (the exact ``sum_t w_t Hess KL_t v``), ``gradient_arithmetic()``
+    and ``observe(alternation)``; every derivative is Euclidean, in ``theta``'s coordinates. ``form`` is
+    ``minimal_support``'s: ``"per_position"`` (the barrier ``-sum_t log(eps - KL_t)``) or ``"mean"`` (the mean
+    divergence itself). ``frames``, when given, is a list of ``(rows, cols)`` blocks covering ``theta`` in order, each
+    a matrix with orthonormal columns stored row-major: the pieces are tight frames and ``theta`` moves on that
+    product of Stiefel manifolds (``gam_geometry::StiefelFrames``); without it ``theta`` is Euclidean. The trust
+    region, the fidelity path from the empty support down to ``eps``, and the stopping rule are
+    ``gam_sae::parameter_decomposition::support_fit``'s. Returns ``{"theta", "keep", "divergence",
+    "alternations"}``.
     """
     return dict(rust_module().parameter_decomposition_fit_supports(
-        executor, np.ascontiguousarray(theta, dtype=np.float64), positions, pieces, float(eps), str(form), int(sequence)))
+        executor, np.ascontiguousarray(theta, dtype=np.float64), positions, pieces, float(eps), str(form), int(sequence),
+        None if frames is None else [(int(r), int(c)) for r, c in frames]))

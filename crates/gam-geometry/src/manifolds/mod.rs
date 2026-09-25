@@ -34,6 +34,7 @@ pub mod simplex;
 pub mod spd;
 pub mod sphere;
 pub mod stiefel;
+pub mod stiefel_frames;
 pub mod torus;
 
 pub use circle::CircleManifold;
@@ -47,4 +48,5 @@ pub use product::ProductManifold;
 pub use spd::SpdManifold;
 pub use sphere::SphereManifold;
 pub use stiefel::StiefelManifold;
+pub use stiefel_frames::StiefelFrames;
 pub use torus::TorusManifold;

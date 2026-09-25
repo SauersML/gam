@@ -351,6 +351,31 @@ pub trait RiemannianManifold: Send + Sync {
         true
     }
 
+    /// The Riemannian Hessian applied to a tangent `ξ`, from an objective's ambient
+    /// Euclidean derivatives: its gradient `e = ∇f(x)` and its Hessian product
+    /// `∇²f(x)[ξ]`. On an embedded submanifold this is the tangent part of the Euclidean
+    /// product plus the embedding's Weingarten term, which depends on `e`; a trust region
+    /// that scores its quadratic model along a second-order retraction needs exactly this.
+    ///
+    /// The default refuses: a manifold declares the closed form it has rather than
+    /// letting an objective pass a Euclidean product off as the Riemannian one.
+    fn riemannian_hessian(
+        &self,
+        point: ArrayView1<'_, f64>,
+        euclidean_grad: ArrayView1<'_, f64>,
+        euclidean_hessian_product: ArrayView1<'_, f64>,
+        tangent: ArrayView1<'_, f64>,
+    ) -> GeometryResult<Array1<f64>> {
+        let m = self.ambient_dim();
+        check_len("riemannian_hessian point", point.len(), m)?;
+        check_len("riemannian_hessian euclidean_grad", euclidean_grad.len(), m)?;
+        check_len("riemannian_hessian euclidean_hessian_product", euclidean_hessian_product.len(), m)?;
+        check_len("riemannian_hessian tangent", tangent.len(), m)?;
+        Err(GeometryError::Unsupported(
+            "riemannian_hessian: this manifold declares no Riemannian Hessian from Euclidean derivatives",
+        ))
+    }
+
     /// Vector–Jacobian product of the ambient map `exp_p(v)`.
     ///
     /// Given a cotangent `grad_output` w.r.t. the ambient output of

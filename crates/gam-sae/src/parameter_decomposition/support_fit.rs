@@ -66,8 +66,7 @@
 //!
 //! The executor runs the model: per-position divergences, and the three products
 //! above. The barrier, its weights, the trust region and the stopping rule live here.
-use gam_geometry::manifolds::euclidean::EuclideanManifold;
-use gam_geometry::{GeometryError, GeometryResult, RiemannianObjective, RiemannianTrustRegion, TrustRegionTermination};
+use gam_geometry::{GeometryError, GeometryResult, RiemannianManifold, RiemannianObjective, RiemannianTrustRegion, TrustRegionTermination};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use std::fmt;
 
@@ -173,9 +172,13 @@ impl<E: PieceExecutor> SupportExecutor for AtTheta<'_, E> {
 
 struct Barrier<'a, E: PieceExecutor> {
     executor: &'a mut E,
+    manifold: &'a dyn RiemannianManifold,
     keep: &'a Array2<bool>,
     fidelity: Fidelity,
     error: Option<String>,
+    /// The Euclidean gradient at the last point `value_gradient` saw: every Hessian product
+    /// the trust region takes at an iterate needs it for the manifold's Weingarten term.
+    gradient: Option<(Array1<f64>, Array1<f64>)>,
 }
 
 impl<E: PieceExecutor> Barrier<'_, E> {
@@ -235,6 +238,7 @@ impl<E: PieceExecutor> RiemannianObjective for Barrier<'_, E> {
             Ok(None) => Ok((f64::INFINITY, Array1::zeros(point.len()))),
             Ok(Some((value, w))) => {
                 let g = self.executor.weighted_gradient(point, self.keep.view(), w.view()).map_err(|e| self.fail(e))?;
+                self.gradient = Some((point.to_owned(), g.clone()));
                 Ok((value, g))
             }
         }
@@ -250,7 +254,12 @@ impl<E: PieceExecutor> RiemannianObjective for Barrier<'_, E> {
         let d = self.executor.directional(point, self.keep.view(), tangent).map_err(|e| self.fail(e))?;
         let rank_one = self.rank_one_weights(&w, &d);
         out += &self.executor.weighted_gradient(point, self.keep.view(), rank_one.view()).map_err(|e| self.fail(e))?;
-        Ok(Some(out))
+        // `out` is the Euclidean Hessian product; the trust region needs the Riemannian one.
+        let gradient = match &self.gradient {
+            Some((at, g)) if at.view() == point => g.clone(),
+            _ => self.executor.weighted_gradient(point, self.keep.view(), w.view()).map_err(|e| self.fail(e))?,
+        };
+        Ok(Some(self.manifold.riemannian_hessian(point, gradient.view(), out.view(), tangent)?))
     }
 }
 
@@ -260,7 +269,8 @@ impl<E: PieceExecutor> RiemannianObjective for Barrier<'_, E> {
 /// the gradient the Steihaug step goes to the boundary whatever the radius, and the
 /// parameter scale `‖θ‖` is used.
 fn model_scale<E: PieceExecutor>(barrier: &mut Barrier<'_, E>, theta: ArrayView1<'_, f64>) -> GeometryResult<f64> {
-    let (_, g) = barrier.value_gradient(theta)?;
+    let (_, euclidean) = barrier.value_gradient(theta)?;
+    let g = barrier.manifold.riemannian_gradient(theta, euclidean.view())?;
     let gnorm = g.dot(&g).sqrt();
     let curvature = match barrier.hessian_vector_product(theta, g.view())? {
         Some(hg) => g.dot(&hg),
@@ -278,9 +288,13 @@ fn model_scale<E: PieceExecutor>(barrier: &mut Barrier<'_, E>, theta: ArrayView1
     })
 }
 
-/// Alternate supports and pieces along the fidelity path to `eps` (module docs).
+/// Alternate supports and pieces along the fidelity path to `eps` (module docs). `theta`
+/// is a point of `manifold`, the geometry the executor's pieces are parameterized on
+/// (Euclidean for unconstrained pieces, [`gam_geometry::StiefelFrames`] for tight frames);
+/// the executor returns Euclidean derivatives and the manifold turns them Riemannian.
 pub fn fit_supports_and_pieces<E: PieceExecutor>(
     executor: &mut E,
+    manifold: &dyn RiemannianManifold,
     theta: Array1<f64>,
     positions: usize,
     pieces: usize,
@@ -289,6 +303,13 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
     sequence: usize,
 ) -> Result<SupportFit, SupportFitError> {
     let form = |level: f64| if mean { Fidelity::Mean(level) } else { Fidelity::PerPosition(level) };
+    if manifold.ambient_dim() != theta.len() {
+        return Err(SupportFitError::Executor(format!(
+            "support_fit: the pieces' manifold has ambient dimension {} for {} parameters",
+            manifold.ambient_dim(),
+            theta.len()
+        )));
+    }
     let mut theta = theta;
     let (unit_roundoff, terms) = executor.gradient_arithmetic().map_err(SupportFitError::Executor)?;
     if !(unit_roundoff.is_finite() && unit_roundoff > 0.0) || terms == 0 {
@@ -317,7 +338,6 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
     levels.reverse();
     let mut keep = if levels.len() > 1 { empty } else { Array2::from_elem((positions, pieces), true) };
     let mut alternations = Vec::new();
-    let manifold = EuclideanManifold::new(theta.len());
     // The trust radius each level starts from: the previous level's final radius, or for
     // the first fit the first model's own scale (below). Never a declared constant.
     let mut carried_radius: Option<f64> = None;
@@ -346,7 +366,7 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
             let kept_before = current.keep.iter().filter(|&&k| k).count();
             let at = current.keep.clone();
             let (termination, before, after) = {
-                let mut barrier = Barrier { executor: &mut *executor, keep: &at, fidelity, error: None };
+                let mut barrier = Barrier { executor: &mut *executor, manifold, keep: &at, fidelity, error: None, gradient: None };
                 let before = barrier.value_gradient(theta.view()).map_err(SupportFitError::Geometry)?.0;
                 let termination = match &state {
                     None => {
@@ -355,10 +375,10 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
                             None => model_scale(&mut barrier, theta.view()).map_err(SupportFitError::Geometry)?,
                         };
                         level_radius = Some(radius);
-                        RiemannianTrustRegion { radius, ..step.clone() }.minimize_reporting_termination(&manifold, &mut barrier, theta.view())
+                        RiemannianTrustRegion { radius, ..step.clone() }.minimize_reporting_termination(manifold, &mut barrier, theta.view())
                     }
                     Some(previous) => step.resume(
-                        &manifold,
+                        manifold,
                         &mut barrier,
                         &TrustRegionTermination { point: theta.clone(), ..previous.clone() },
                     ),
@@ -448,6 +468,7 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gam_geometry::EuclideanManifold;
 
     /// `KL_t = ½ Σ_{c removed} a_tc² (1 + (θ_c − 1)²)`: reshaping a piece (moving `θ_c`
     /// toward 1) lowers the cost of removing it everywhere, down to a positive floor, so
@@ -508,7 +529,7 @@ mod tests {
     fn reshaping_pieces_lets_the_supports_shrink() {
         let a = ndarray::array![[1.0, 0.3, 0.2, 0.9], [0.25, 1.0, 0.3, 0.2], [0.3, 0.2, 1.0, 0.25]];
         let mut executor = Scaled { a, observed: 0 };
-        let fit = fit_supports_and_pieces(&mut executor, Array1::zeros(4), 3, 4, 0.1, false, 1).unwrap();
+        let fit = fit_supports_and_pieces(&mut executor, &EuclideanManifold::new(4), Array1::zeros(4), 3, 4, 0.1, false, 1).unwrap();
         assert_eq!(executor.observed, fit.alternations.len());
         let first = fit.alternations.first().unwrap();
         assert!(first.barrier_after <= first.barrier_before, "{:?}", fit.alternations);
@@ -529,12 +550,88 @@ mod tests {
     #[test]
     fn the_mean_form_shares_one_budget() {
         let a = ndarray::array![[1.0, 0.3, 0.2, 0.9], [0.25, 1.0, 0.3, 0.2], [0.3, 0.2, 1.0, 0.25]];
-        let per = fit_supports_and_pieces(&mut Scaled { a: a.clone(), observed: 0 }, Array1::zeros(4), 3, 4, 0.1, false, 1).unwrap();
+        let per = fit_supports_and_pieces(&mut Scaled { a: a.clone(), observed: 0 }, &EuclideanManifold::new(4), Array1::zeros(4), 3, 4, 0.1, false, 1).unwrap();
         let mut executor = Scaled { a, observed: 0 };
-        let mean = fit_supports_and_pieces(&mut executor, Array1::zeros(4), 3, 4, 0.1, true, 1).unwrap();
+        let mean = fit_supports_and_pieces(&mut executor, &EuclideanManifold::new(4), Array1::zeros(4), 3, 4, 0.1, true, 1).unwrap();
         let kl = executor.divergence(mean.theta.view(), mean.supports.keep.view()).unwrap();
         assert!(kl.sum() / 3.0 < 0.1, "{kl:?}");
         let removed = |k: &Array2<bool>| k.iter().filter(|x| !**x).count();
         assert!(removed(&mean.supports.keep) >= removed(&per.supports.keep));
+    }
+
+    /// Pieces as the rows of an orthogonal `2 × 2` analysis `V` (a tight frame, fitted on
+    /// the Stiefel manifold): `KL_t = ½ Σ_{c removed} (v_c · x_t)²` for data along one
+    /// direction `u`. At the identity start every position needs both pieces; the fit must
+    /// turn one piece onto `u` (the other then carries nothing and is removed everywhere),
+    /// keeping `V` orthogonal throughout.
+    struct Frames {
+        x: Array2<f64>,
+        observed: usize,
+    }
+
+    impl Frames {
+        fn reads(&self, theta: ArrayView1<'_, f64>) -> Array2<f64> {
+            // (V x_t)_c for every position t (rows) and piece c (columns)
+            let v = theta.to_owned().into_shape_with_order((2, 2)).unwrap();
+            self.x.dot(&v.t())
+        }
+        fn removed(keep: ArrayView2<'_, bool>) -> Array2<f64> {
+            keep.mapv(|k| if k { 0.0 } else { 1.0 })
+        }
+        /// `Σ_t w_t Σ_c removed_tc r_tc x_tᵀ` as a flattened `2 × 2`, for per-piece reads `r`.
+        fn pullback(&self, keep: ArrayView2<'_, bool>, weights: ArrayView1<'_, f64>, reads: &Array2<f64>) -> Array1<f64> {
+            let coeff = &(Self::removed(keep) * reads) * &weights.insert_axis(ndarray::Axis(1));
+            coeff.t().dot(&self.x).into_shape_with_order(4).unwrap()
+        }
+    }
+
+    impl PieceExecutor for Frames {
+        fn supports(&mut self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>) -> Result<SupportEvaluation, String> {
+            let divergence = self.divergence(theta, keep)?;
+            let removal_cost = self.reads(theta).mapv(|r| 0.5 * r * r);
+            Ok(SupportEvaluation { divergence, restore_gain: removal_cost.clone(), removal_cost })
+        }
+        fn divergence(&mut self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>) -> Result<Array1<f64>, String> {
+            Ok((self.reads(theta).mapv(|r| 0.5 * r * r) * Self::removed(keep)).sum_axis(ndarray::Axis(1)))
+        }
+        fn weighted_gradient(&mut self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>, weights: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
+            Ok(self.pullback(keep, weights, &self.reads(theta)))
+        }
+        fn directional(&mut self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>, v: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
+            Ok((self.reads(theta) * self.reads(v) * Self::removed(keep)).sum_axis(ndarray::Axis(1)))
+        }
+        fn gradient_arithmetic(&self) -> Result<(f64, usize), String> {
+            Ok((f64::EPSILON / 2.0, self.x.len()))
+        }
+        fn observe(&mut self, alternation: &Alternation) {
+            assert!(alternation.step.is_finite(), "{alternation:?}");
+            self.observed += 1;
+        }
+        fn weighted_hessian(&mut self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>, weights: ArrayView1<'_, f64>, v: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
+            if theta.len() != v.len() {
+                return Err(format!("theta has {} entries, v {}", theta.len(), v.len()));
+            }
+            // KL is quadratic in V: its Hessian product is the pullback of the reads of v.
+            Ok(self.pullback(keep, weights, &self.reads(v)))
+        }
+    }
+
+    #[test]
+    fn tight_frame_pieces_turn_onto_the_data_on_the_stiefel_manifold() {
+        let (c, s) = (0.3_f64.cos(), 0.3_f64.sin());
+        let x = ndarray::array![[c, s], [0.8 * c, 0.8 * s], [1.2 * c, 1.2 * s]];
+        let manifold = gam_geometry::StiefelFrames::new(vec![(2, 2)]).unwrap();
+        let mut executor = Frames { x, observed: 0 };
+        // At V = I, removing either piece costs at least ½ (0.8 sin 0.3)² = 0.028 > ε.
+        let fit = fit_supports_and_pieces(&mut executor, &manifold, ndarray::array![1.0, 0.0, 0.0, 1.0], 3, 2, 0.01, false, 1).unwrap();
+        for row in fit.supports.keep.outer_iter() {
+            assert_eq!(row.iter().filter(|&&k| k).count(), 1, "{:?}", fit.supports.keep);
+        }
+        let v = fit.theta.clone().into_shape_with_order((2, 2)).unwrap();
+        let gram = v.t().dot(&v);
+        assert!((&gram - &Array2::<f64>::eye(2)).iter().all(|e| e.abs() < 1e-12), "{gram:?}");
+        let kl = executor.divergence(fit.theta.view(), fit.supports.keep.view()).unwrap();
+        assert!(kl.iter().all(|&v| v < 0.01), "{kl:?}");
+        assert_eq!(executor.observed, fit.alternations.len());
     }
 }
