@@ -922,6 +922,49 @@ impl CardinalityCode for EnumerativeSubsetCode {
     }
 }
 
+/// A local packet's support code (#2951 design §11.1): the enumerative subset codeword, the padded
+/// body length `H` once in the prefix integer code, and `H` bits for every kept piece.
+///
+/// A local explanation is read on its own, so it carries the bodies of the pieces it keeps; a code
+/// that charges only for which subset is kept makes the full support nearly free (the subset
+/// index vanishes at `k = n`) and the minimum-code search returns everything. Pieces are padded to
+/// the longest body `H`, so the length depends on the size alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaddedPacketCode {
+    /// `H`: the longest decoded body of one piece, in bits.
+    pub body_bits: u64,
+}
+
+impl CardinalityCode for PaddedPacketCode {
+    type Error = CodecError;
+
+    fn support_bits(&self, components: usize, size: usize) -> Result<u64, CodecError> {
+        let header = if self.body_bits == 0 { 0 } else { prefix_integer_len_bits(self.body_bits)? };
+        Ok(subset_code_len_bits(components, size)? + header + size as u64 * self.body_bits)
+    }
+
+    /// The subset part is [`EnumerativeSubsetCode`]'s, cheapest at `least` on `least <= k <= n/2`;
+    /// adding `k H` keeps that. Above `max(least, n/2)` every length is at least
+    /// `L_int(max(least, n/2 + 1) + 1) + L_int(H) + k H`, increasing in `k`, so the walk up from
+    /// there stops once that bound exceeds the best length.
+    fn cheapest_size(&self, components: usize, least: usize) -> Result<(usize, u64), CodecError> {
+        if self.body_bits == 0 {
+            return EnumerativeSubsetCode.cheapest_size(components, least);
+        }
+        let mut best = (self.support_bits(components, least)?, least);
+        let floor = least.max(components / 2);
+        let bound_prefix = prefix_integer_len_bits(least.max(components / 2 + 1) as u64 + 1)?
+            + prefix_integer_len_bits(self.body_bits)?;
+        for size in floor + 1..=components {
+            if bound_prefix + size as u64 * self.body_bits > best.0 {
+                break;
+            }
+            best = best.min((self.support_bits(components, size)?, size));
+        }
+        Ok((best.1, best.0))
+    }
+}
+
 /// Writes the declarations an address message is read against, once per experiment unit:
 /// the fingerprint of the teacher whose registry the addresses index (64 bits), then the
 /// unit's sequence length, the universe of declared positions, in the prefix integer code.
@@ -1220,6 +1263,28 @@ mod tests {
                     Scan.cheapest_size(components, least),
                     "C = {components}, least = {least}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn the_padded_packet_code_bounded_size_matches_the_full_scan_2951() {
+        struct Scan(u64);
+        impl CardinalityCode for Scan {
+            type Error = CodecError;
+            fn support_bits(&self, components: usize, size: usize) -> Result<u64, CodecError> {
+                PaddedPacketCode { body_bits: self.0 }.support_bits(components, size)
+            }
+        }
+        for body_bits in [0, 1, 3, 12, 200] {
+            for components in 0..120 {
+                for least in 0..=components {
+                    assert_eq!(
+                        PaddedPacketCode { body_bits }.cheapest_size(components, least),
+                        Scan(body_bits).cheapest_size(components, least),
+                        "H = {body_bits}, C = {components}, least = {least}"
+                    );
+                }
             }
         }
     }

@@ -82,6 +82,9 @@ def main():
         ones = torch.ones(C)
         assert torch.allclose(logits(tokens_all, ones), model(tokens_all), atol=1e-9), "the piece lift is not exact"
 
+    # Every piece is a read vector, a scale and a write vector (a neuron: its W_in row, bias and W_out column),
+    # stored losslessly as float64.
+    piece_bits = 64 * (2 * d + 1)
     rows = []
     for eps in args.eps:
         for i in range(len(tokens_all)):
@@ -103,10 +106,10 @@ def main():
                 value_roundoff = depth * UNIT_ROUNDOFF * scale
                 gradient = -g.numpy()  # q = sum_c (1 - m_c) e_c, so dF/dq = -dF/dm
                 gradient_roundoff = depth * UNIT_ROUNDOFF * (float(np.linalg.norm(gradient)) + scale)
-                return float(kl), value_roundoff, gradient, gradient_roundoff
+                return float(kl.detach()), value_roundoff, gradient, gradient_roundoff
 
             start = time.time()
-            found = robust_support(objective, None, np.zeros(C), np.ones(C), eps)
+            found = robust_support(objective, None, np.zeros(C), np.ones(C), piece_bits, eps)
             support = [int(c) for c in found["support"]]
             rows.append({
                 "eps": eps,

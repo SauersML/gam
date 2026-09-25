@@ -59,6 +59,7 @@ def robust_support(
     generators: Any,
     lower: Any,
     upper: Any,
+    piece_bits: int,
     epsilon: float,
     gradient_lipschitz: float | None = None,
 ) -> dict[str, Any]:
@@ -68,7 +69,8 @@ def robust_support(
     ``(divergence, its roundoff bound, d divergence / d moment (length K), its roundoff
     bound)``. ``generators`` is ``C x K`` (the moment rows ``v_c``), or ``None`` for literal pieces whose
     moment is the deletion vector itself (``K = C``); ``lower``/``upper``
-    declare each control's mask interval (containing 1); ``epsilon`` is the declared
+    declare each control's mask interval (containing 1); ``piece_bits`` is the longest decoded body of one piece,
+    charged for every kept piece (a local explanation carries what it keeps); ``epsilon`` is the declared
     tolerance. The search, the separation ascent over the moment zonotope and every
     certificate are Rust's (``supports::minimum_code_support`` over
     ``adversary::ZonotopeSeparationOracle``).
@@ -79,6 +81,7 @@ def robust_support(
             None if generators is None else np.ascontiguousarray(generators, dtype=np.float64),
             np.ascontiguousarray(lower, dtype=np.float64),
             np.ascontiguousarray(upper, dtype=np.float64),
+            int(piece_bits),
             float(epsilon),
             gradient_lipschitz,
         )

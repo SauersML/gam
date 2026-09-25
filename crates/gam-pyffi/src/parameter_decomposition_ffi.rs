@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use gam::terms::sae::parameter_decomposition::adversary::{
     ObjectiveJet, SeparationObjective, SmoothnessCertificate, ZonotopeSeparationOracle,
 };
-use gam::terms::sae::parameter_decomposition::codec::EnumerativeSubsetCode;
+use gam::terms::sae::parameter_decomposition::codec::PaddedPacketCode;
 use gam::terms::sae::parameter_decomposition::moments::{
     GeneratorPart, MaskDomain, MaskMomentSystem, MomentBlock, MomentVector,
 };
@@ -128,7 +128,8 @@ impl SeparationObjective for PythonObjective<'_> {
 /// `objective`. `generators` is `C x K` (row `c` is `v_c`), or `None` for literal pieces, whose
 /// moment is the deletion vector itself (`K = C`, each control its own block, so the moment system
 /// is `O(C)` and never a dense identity). `lower`/`upper` are the declared mask interval of each
-/// control (each contains 1), `epsilon` the declared tolerance, and
+/// control (each contains 1), `piece_bits` the declared longest decoded body of one piece (each kept
+/// piece costs that much in the support code, design §11.1), `epsilon` the declared tolerance, and
 /// `gradient_lipschitz` a stated Lipschitz constant of `dF/dq` when one is derived.
 ///
 /// Returns `{"support", "status", "code_lower", "code_upper", "risk_lower", "risk_upper",
@@ -136,13 +137,14 @@ impl SeparationObjective for PythonObjective<'_> {
 /// epsilon) or `"unresolved"` (the minimum-code candidate was neither refuted nor certified;
 /// `support` is that candidate), and the risk bounds are the oracle's evidence about it.
 #[pyfunction]
-#[pyo3(signature = (objective, generators, lower, upper, epsilon, gradient_lipschitz=None))]
+#[pyo3(signature = (objective, generators, lower, upper, piece_bits, epsilon, gradient_lipschitz=None))]
 fn parameter_decomposition_robust_support<'py>(
     py: Python<'py>,
     objective: Bound<'py, PyAny>,
     generators: Option<PyReadonlyArray2<'py, f64>>,
     lower: PyReadonlyArray1<'py, f64>,
     upper: PyReadonlyArray1<'py, f64>,
+    piece_bits: u64,
     epsilon: f64,
     gradient_lipschitz: Option<f64>,
 ) -> PyResult<Bound<'py, PyDict>> {
@@ -190,7 +192,7 @@ fn parameter_decomposition_robust_support<'py>(
         .and_then(|mut oracle| {
             minimum_code_support(
                 &mut oracle,
-                &EnumerativeSubsetCode,
+                &PaddedPacketCode { body_bits: piece_bits },
                 epsilon,
                 FailureHypergraph::new(controls),
             )

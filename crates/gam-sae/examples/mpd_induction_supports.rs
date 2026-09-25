@@ -95,7 +95,7 @@ use gam_sae::parameter_decomposition::block::{
     AttentionLayerReads, AttentionProjection, ComponentAttentionLayer, ComponentMasks, ProjectionRead,
 };
 use gam_sae::parameter_decomposition::codec::{
-    CodecError, encode_support_packets, prefix_integer_len_bits, subset_code_len_bits, union_support_library,
+    CodecError, PaddedPacketCode, encode_support_packets, prefix_integer_len_bits, subset_code_len_bits, union_support_library,
 };
 use gam_sae::parameter_decomposition::precision::{DecodableArtifact, DeclaredPrecision, LatticeCode};
 use gam_sae::parameter_decomposition::rewrite::ComponentRead;
@@ -181,18 +181,6 @@ struct HeadMaskFamily {
     rows: usize,
 }
 
-/// A support's code: its subset codeword, the padded head length `H` once, and `H` bits per kept head.
-struct HeadCode {
-    head_bits: u64,
-}
-
-impl CardinalityCode for HeadCode {
-    type Error = CodecError;
-
-    fn support_bits(&self, components: usize, size: usize) -> Result<u64, CodecError> {
-        Ok(subset_code_len_bits(components, size)? + prefix_integer_len_bits(self.head_bits)? + size as u64 * self.head_bits)
-    }
-}
 
 /// A layer on `weights` (query, key, value and output in torch `Linear` layout) whose four projections read
 /// through the identity, `W = W·I`: the exact write through `R = I` is `W` itself, so the component coordinates
@@ -834,7 +822,7 @@ struct BoxControl {
 fn box_control(
     divergences: &mut Divergences<'_>,
     enclosed: &mut BTreeMap<MaskBox, BoxEnclosure<HeadMaskFamily>>,
-    code: &HeadCode,
+    code: &PaddedPacketCode,
     tolerance: f64,
     exhaustive: &Result<SupportSearch<HeadMask, HeadMaskFamily>, SupportSearchError<String, CodecError>>,
     exhaustive_queried: &[ComponentSet],
@@ -1194,8 +1182,8 @@ fn main() -> Result<(), String> {
     let teacher = HeadNetwork::teacher(&loaded)?;
     let (artifact, head_bits) = teacher.decoded(precision)?;
     let padded_head_bits = head_bits.iter().copied().max().ok_or("the network has no heads")?;
-    let code = HeadCode {
-        head_bits: padded_head_bits,
+    let code = PaddedPacketCode {
+        body_bits: padded_head_bits,
     };
     let components = teacher.components();
     let heads = teacher.heads();
@@ -1629,7 +1617,7 @@ fn position_row(
     let &EvidenceStatus::Exact { value: do_nothing, .. } = &baseline else {
         return Err(format!("row ({sequence}, {position}): the all-off divergence is unresolved"));
     };
-    let code = HeadCode { head_bits };
+    let code = PaddedPacketCode { body_bits: head_bits };
     let mut tolerances = Vec::with_capacity(fractions.len());
     for &fraction in fractions {
         let tolerance = fraction * do_nothing;

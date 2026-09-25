@@ -88,6 +88,8 @@ def main():
         ones = torch.ones(T, pieces, device=dev)
         assert torch.allclose(forward(sequences[0], ones), model(sequences[0]), atol=1e-8), "the piece lift is not exact"
 
+    # A piece is u, s, v of one rank-one factor, float64; padded to the widest matrix.
+    piece_bits = 64 * max(u.shape[0] + 1 + vt.shape[1] for u, _, vt in factors.values())
     rows = []
     for eps in args.eps:
         for i, ids in enumerate(sequences):
@@ -104,11 +106,11 @@ def main():
                 (g,) = torch.autograd.grad(kl, m)
                 scale = float(z.detach().abs().max() + clean_logits.abs().max())
                 gradient = -g.reshape(-1).cpu().numpy()  # q = sum_c (1 - m_c) e_c
-                return (float(kl), depth * UNIT_ROUNDOFF * scale, gradient,
+                return (float(kl.detach()), depth * UNIT_ROUNDOFF * scale, gradient,
                         depth * UNIT_ROUNDOFF * (float(np.linalg.norm(gradient)) + scale))
 
             start = time.time()
-            found = robust_support(objective, None, np.zeros(C), np.ones(C), eps)
+            found = robust_support(objective, None, np.zeros(C), np.ones(C), piece_bits, eps)
             support = np.asarray(found["support"], dtype=np.int64)
             per_position = np.bincount(support // pieces, minlength=T)
             rows.append({

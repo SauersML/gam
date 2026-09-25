@@ -104,9 +104,9 @@ use gam_sae::parameter_decomposition::precision::{
 use gam_sae::parameter_decomposition::receipts::evaluation_band;
 use gam_sae::parameter_decomposition::rewrite::NativeMlp;
 use gam_sae::parameter_decomposition::seed::RankRevealingRead;
-use gam_sae::parameter_decomposition::codec::{CodecError, prefix_integer_len_bits, subset_code_len_bits};
+use gam_sae::parameter_decomposition::codec::PaddedPacketCode;
 use gam_sae::parameter_decomposition::supports::{
-    BoxDivergence, BoxEnclosure, BoxFamily, BoxOracleError, BoxSeparationOracle, CardinalityCode, ComponentSet,
+    BoxDivergence, BoxEnclosure, BoxFamily, BoxOracleError, BoxSeparationOracle, ComponentSet,
     EvidenceStatus, ExactBasis, Extremum, FailureHypergraph, MaskBox, MaskSide, SeparationOracle, SupportSearchError,
     minimum_code_support,
 };
@@ -1072,19 +1072,6 @@ struct RowBound {
     upper: Option<f64>,
 }
 
-/// A plane support's code: its subset codeword over the planes, the padded plane length `H` once, and `H` bits
-/// per kept plane, a function of the size alone.
-struct PlaneCode {
-    plane_bits: u64,
-}
-
-impl CardinalityCode for PlaneCode {
-    type Error = CodecError;
-
-    fn support_bits(&self, components: usize, size: usize) -> Result<u64, CodecError> {
-        Ok(subset_code_len_bits(components, size)? + prefix_integer_len_bits(self.plane_bits)? + size as u64 * self.plane_bits)
-    }
-}
 
 /// A box oracle that prints each separation it answers, so a long search's progress is in the run's log.
 struct Logged<P: BoxDivergence> {
@@ -1764,7 +1751,7 @@ fn main() -> Result<(), String> {
                             separations: 0,
                             started: Instant::now(),
                         };
-                        minimum_code_support(&mut oracle, &PlaneCode { plane_bits }, tolerance, FailureHypergraph::new(plane_count))
+                        minimum_code_support(&mut oracle, &PaddedPacketCode { body_bits: plane_bits }, tolerance, FailureHypergraph::new(plane_count))
                     };
                     let (code_status, bits, frequencies, separations, edges) = match &found {
                         Ok(search) => {

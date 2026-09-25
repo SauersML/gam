@@ -61,12 +61,12 @@
 
 use gam_sae::parameter_decomposition::attention::AttentionGeometry;
 use gam_sae::parameter_decomposition::block::{AttentionLayerReads, ComponentAttentionLayer, ComponentMasks, ProjectionRead};
-use gam_sae::parameter_decomposition::codec::{CodecError, prefix_integer_len_bits, subset_code_len_bits};
+use gam_sae::parameter_decomposition::codec::PaddedPacketCode;
 use gam_sae::parameter_decomposition::precision::{DecodableArtifact, DeclaredPrecision, LatticeCode};
 use gam_sae::parameter_decomposition::rewrite::ComponentRead;
 use gam_sae::parameter_decomposition::seed::RankRevealingRead;
 use gam_sae::parameter_decomposition::supports::{
-    BoxDivergence, BoxEnclosure, BoxSeparationOracle, CardinalityCode, ComponentSet, EvidenceStatus, ExactBasis,
+    BoxDivergence, BoxEnclosure, BoxSeparationOracle, ComponentSet, EvidenceStatus, ExactBasis,
     Extremum, FailureHypergraph, MaskBox, MaskSide, SeparationOracle, minimum_code_support,
 };
 use ndarray::{Array2, s};
@@ -364,19 +364,6 @@ fn component_layer(
     factored_layer(geometry, score_scale, weights.each_ref().map(|weight| weight.clone()), reads)
 }
 
-/// A support's code: its subset codeword over the groups, the padded group length `H` once, and `H` bits per kept
-/// group.
-struct GroupCode {
-    group_bits: u64,
-}
-
-impl CardinalityCode for GroupCode {
-    type Error = CodecError;
-
-    fn support_bits(&self, components: usize, size: usize) -> Result<u64, CodecError> {
-        Ok(subset_code_len_bits(components, size)? + prefix_integer_len_bits(self.group_bits)? + size as u64 * self.group_bits)
-    }
-}
 
 /// The finite family the oracle's evidence is stated over.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -677,8 +664,8 @@ fn main() -> Result<(), String> {
     let teacher = ComponentNetwork::build(&loaded, &stored, &reads)?;
     let (artifact, group_bits) = teacher.decoded(&decompositions, &groups, precision)?;
     let padded_group_bits = group_bits.iter().copied().max().ok_or("no group")?;
-    let code = GroupCode {
-        group_bits: padded_group_bits,
+    let code = PaddedPacketCode {
+        body_bits: padded_group_bits,
     };
     let names: Vec<String> = groups.iter().map(|group| group_name(&decompositions, group)).collect();
 
