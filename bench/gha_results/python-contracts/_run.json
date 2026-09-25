@@ -3,12 +3,12 @@
   "publish_job_status": "failure",
   "publish_job_status_note": "status of the job that PUBLISHED these results, not the conclusion of run_id -- this job is part of that run, so the run has not concluded here",
   "publish_job_failed_steps": "step 13: Run bench-package Python tests (#1512 orphans) | step 16: Triage full Python suite on the fresh wheel (#1512)",
-  "run_id": "36088415107",
-  "run_number": "326",
+  "run_id": "36159949705",
+  "run_number": "327",
   "run_attempt": "1",
   "event": "schedule",
   "ref": "refs/heads/main",
-  "sha": "ea649b49ce50fed7e4700e19f9a04a5229814774",
-  "completed_utc": "2026-09-25T07:20:28Z",
-  "run_url": "https://github.com/SauersML/gam/actions/runs/36088415107"
+  "sha": "e62801bcd0f3e690977b722d6fa22d540786b7f0",
+  "completed_utc": "2026-09-25T20:36:23Z",
+  "run_url": "https://github.com/SauersML/gam/actions/runs/36159949705"
 }
