@@ -1750,7 +1750,12 @@ fn build_closed_form_operator_penalty(
         duchon_p_from_nullspace_order(duchon_effective_nullspace_order(centers, nullspace_order));
     let kappa = 1.0 / length_scale;
     let s_order = duchon_power_to_usize(power);
-    closed_form_operator_penalty_in_total_basis(
+    // The collocated basis carries the kernel block's chart amplitude `α`
+    // (`duchon_kernel_amplification`), so its Grams are `α²` times the raw
+    // integral; the production closed-form operator penalty carries the same `α²`
+    // (`matern_kernel.rs`). The closed form is compared in that chart.
+    let amp2 = ops.kernel_amplification * ops.kernel_amplification;
+    amp2 * closed_form_operator_penalty_in_total_basis(
         centers,
         q,
         p_order,
