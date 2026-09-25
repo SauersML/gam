@@ -127,10 +127,28 @@ fn cholesky_logdet_is_not_installed_where_the_weyl_bound_is_tighter_or_the_mode_
     assert!(kept.factored_logdet.is_none());
     assert_eq!(kept.logdet_forward_error(), Some(weyl));
 
-    // A smooth spectral floor prices `Σ ln r_ε(σ)`, not the LLT's `Σ ln σ`.
+    // A smooth spectral floor prices `Σ ln r_ε(σ)`, not the LLT's `Σ ln σ`: where the
+    // LLT is installed there, its value carries the floor's exact share
+    // `Σ ln(r_ε(σ)/σ)`, so it is the SAME smooth criterion, and it agrees with the
+    // eigen-priced value inside the two bounds.
     let h = graded_hessian();
-    let smooth = DenseSpectralOperator::from_symmetric_with_mode(&h, PseudoLogdetMode::Smooth)
-        .expect("the graded fixture decomposes")
-        .with_cholesky_logdet(&h);
-    assert!(smooth.factored_logdet.is_none());
+    let spectral_smooth =
+        DenseSpectralOperator::from_symmetric_with_mode(&h, PseudoLogdetMode::Smooth)
+            .expect("the graded fixture decomposes");
+    let spectral_value = spectral_smooth.logdet();
+    let spectral_band = spectral_smooth
+        .logdet_forward_error()
+        .expect("the Weyl bound is finite");
+    let smooth = spectral_smooth.with_cholesky_logdet(&h);
+    if let Some((value, band)) = smooth.factored_logdet {
+        assert!(
+            band < spectral_band,
+            "installed only where its bound is the tighter: {band:.3e} vs {spectral_band:.3e}"
+        );
+        assert!(
+            (value - spectral_value).abs() <= band + spectral_band,
+            "the LLT-priced smooth value {value:.12e} is not the eigen-priced \
+             {spectral_value:.12e} within {band:.3e} + {spectral_band:.3e}"
+        );
+    }
 }

@@ -1407,10 +1407,17 @@ impl BlockCoupledOperator {
                 DenseCholeskyOperator::from_positive_definite(joint_hessian)
                     .map_err(|e| format!("BlockCoupledOperator positive-definite factor: {e}"))?,
             ),
+            // On a positive-definite, fully active spectrum the log-determinant's
+            // forward error is the LLT's componentwise one, which a diagonal
+            // rescaling of the coefficients does not move; the eigensolver's
+            // normwise Weyl bound `p·ε·‖H‖₂·Σ1/σᵢ` does (gam#3879, see
+            // `DenseSpectralOperator::with_cholesky_logdet`). Any other spectrum
+            // is left exactly as it was.
             PseudoLogdetMode::Smooth | PseudoLogdetMode::HardPseudo => {
                 BlockCoupledFactorization::Spectral(
                     DenseSpectralOperator::from_symmetric_with_mode(joint_hessian, mode)
-                        .map_err(|e| format!("BlockCoupledOperator eigendecomposition: {e}"))?,
+                        .map_err(|e| format!("BlockCoupledOperator eigendecomposition: {e}"))?
+                        .with_cholesky_logdet(joint_hessian),
                 )
             }
         };

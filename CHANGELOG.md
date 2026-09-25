@@ -1,5 +1,12 @@
 ## Unreleased
 
+- **A fit no longer depends on the units a covariate is recorded in through its log-determinant's
+  error bound** (gam#3879). A smoothed positive-definite Hessian published only the eigensolver's
+  normwise rounding bound, which grows when one coefficient is rescaled although the criterion does
+  not. Recording a binomial location-scale noise covariate in units 1000× smaller grew it from
+  5.3e-11 to 6.1e-2, and the outer search stopped at a different point. The bound is now the
+  Cholesky factorization's componentwise one, which does not move with units.
+
 - **A spatial smooth whose length scale was optimized predicts new rows correctly again.** When
   the length-scale search accepted a new scale, the fitted model kept a term specification whose
   parametric-residualization chart was still marked stale, so every prediction re-derived that

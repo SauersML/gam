@@ -403,15 +403,22 @@ impl DenseSpectralOperator {
     ///
     /// Only the value changes. Traces, solves and the logdet derivatives stay on
     /// the eigenpairs, whose cancellation-free rail forms need them; both price
-    /// the one exact `log|H|`. Admitted only for an exact, fully active spectrum
-    /// (`PositiveDefinite`, no mask), where `log|H|` is the LLT's scalar; any
-    /// other operator is returned unchanged, as is one whose LLT fails or whose
-    /// bound is not the tighter.
+    /// the one `Σ ln r_ε(σ_i)`. Admitted only for a fully active spectrum on a
+    /// positive-definite `H`; any other operator is returned unchanged, as is one
+    /// whose LLT fails or whose bound is not the tighter.
+    ///
+    /// A smooth spectrum (`ε > 0`) prices `ln r_ε(σ) = ln σ + δ(σ)`, with
+    /// `δ(σ) = ln(r_ε(σ)/σ) ≈ ε²/σ²` for `σ ≫ ε`. Its value is then the LLT's
+    /// `ln|H|` plus `Σ δ(σ_i)` from the eigenvalues, and its bound adds what the
+    /// eigenvalues' own rounding band moves `Σ δ` by, `Σ |δ'(σ_i)|·band`, so the
+    /// smooth criterion stays exactly the one its traces differentiate. Without
+    /// it the smooth mode published only the normwise Weyl bound, which a
+    /// diagonal rescaling of one coefficient moves while the criterion does not:
+    /// a binomial location-scale noise covariate recorded in units 1000× smaller
+    /// grew it from 5.3e-11 to 6.1e-2 and the outer search stopped on a coarser
+    /// rung at a different point (gam#3879).
     pub fn with_cholesky_logdet(mut self, h: &Array2<f64>) -> Self {
-        if self.epsilon != 0.0
-            || !self.active_mask.iter().all(|&active| active)
-            || h.nrows() != self.n_dim
-        {
+        if !self.active_mask.iter().all(|&active| active) || h.nrows() != self.n_dim {
             return self;
         }
         let Ok(factor) = DenseCholeskyOperator::from_positive_definite(h) else {
@@ -422,8 +429,29 @@ impl DenseSpectralOperator {
         else {
             return self;
         };
-        if cholesky_error < spectral_error && factor.cached_logdet.is_finite() {
-            self.factored_logdet = Some((factor.cached_logdet, cholesky_error));
+        let (smoothing, smoothing_error) = if self.epsilon == 0.0 {
+            (0.0, 0.0)
+        } else {
+            if self.raw_eigenvalues.iter().any(|&sigma| !(sigma > 0.0)) {
+                return self;
+            }
+            let band = gam_linalg::roundoff::symmetric_spectrum_rounding_band(&self.raw_eigenvalues);
+            let epsilon = self.epsilon;
+            let mut smoothing = 0.0_f64;
+            let mut smoothing_error = 0.0_f64;
+            for &sigma in &self.raw_eigenvalues {
+                let regularized = spectral_regularize(sigma, epsilon);
+                smoothing += (regularized / sigma).ln();
+                // δ'(σ) = r'(σ)/r(σ) − 1/σ with r'(σ) = ½(1 + σ/√(σ² + 4ε²)).
+                let slope = 0.5 * (1.0 + sigma / sigma.hypot(2.0 * epsilon));
+                smoothing_error += (slope / regularized - sigma.recip()).abs() * band;
+            }
+            (smoothing, smoothing_error)
+        };
+        let bound = cholesky_error + smoothing_error;
+        let value = factor.cached_logdet + smoothing;
+        if bound < spectral_error && value.is_finite() && bound.is_finite() {
+            self.factored_logdet = Some((value, bound));
         }
         self
     }
