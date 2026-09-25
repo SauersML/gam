@@ -597,6 +597,10 @@ impl SaeManifoldTerm {
         accepted_sys: &ArrowSchurSystem,
         accepted_cache: ArrowFactorCache,
     ) -> Result<Option<ArrowFactorCache>, String> {
+        self.evidence_root_telemetry
+            .0
+            .decrement_acceptances
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(refined) = self.refine_accepted_root(
             target,
             assembly_rho,

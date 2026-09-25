@@ -863,6 +863,7 @@ pub(crate) struct EvidenceRootCounters {
     unfactorable_no_steps: std::sync::atomic::AtomicUsize,
     uncertified_refinements: std::sync::atomic::AtomicUsize,
     exact_refused_acceptances: std::sync::atomic::AtomicUsize,
+    decrement_acceptances: std::sync::atomic::AtomicUsize,
     rounding_floor_stops: std::sync::atomic::AtomicUsize,
     band_refused_commits: std::sync::atomic::AtomicUsize,
 }
@@ -887,6 +888,10 @@ pub(crate) struct EvidenceRootCounts {
     /// #2933 F08 — a state admitted on the majorizer Newton decrement whose exact verdict
     /// refused it, so it was not priced and the solve continued.
     pub(crate) exact_refused_acceptances: usize,
+    /// #2933 F08 / gam#4584 — states admitted on the majorizer Newton decrement, each of
+    /// which the exact certificate then graded (refined to a certified root, admitted on
+    /// its own exact verdict, or refused).
+    pub(crate) decrement_acceptances: usize,
     /// #2822 — the gate sat inside its formation band, so no root step was solved for.
     pub(crate) rounding_floor_stops: usize,
     /// #2822 — a trial the strict contraction would have committed, refused because the two
@@ -908,6 +913,7 @@ impl EvidenceRootTelemetry {
             unfactorable_no_steps: self.0.unfactorable_no_steps.load(Ordering::Relaxed),
             uncertified_refinements: self.0.uncertified_refinements.load(Ordering::Relaxed),
             exact_refused_acceptances: self.0.exact_refused_acceptances.load(Ordering::Relaxed),
+            decrement_acceptances: self.0.decrement_acceptances.load(Ordering::Relaxed),
             rounding_floor_stops: self.0.rounding_floor_stops.load(Ordering::Relaxed),
             band_refused_commits: self.0.band_refused_commits.load(Ordering::Relaxed),
         }

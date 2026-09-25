@@ -537,6 +537,9 @@ pub struct OuterProbeTelemetry {
     /// #2933 F08 — majorizer-decrement acceptances the exact information refused, so the
     /// state was not priced and the inner solve continued.
     pub root_exact_refused_acceptances: usize,
+    /// #2933 F08 / gam#4584 — states admitted on the majorizer Newton decrement, every one
+    /// of which the exact certificate graded before it could be priced.
+    pub root_decrement_acceptances: usize,
     /// #2822 — root phases that ended with the gate inside its formation band.
     pub root_rounding_floor_stops: usize,
     /// #2822 — root steps the strict contraction would have committed, refused because the
@@ -1879,6 +1882,7 @@ impl SaeManifoldOuterObjective {
             root_unfactorable_no_steps: root.unfactorable_no_steps,
             root_uncertified_refinements: root.uncertified_refinements,
             root_exact_refused_acceptances: root.exact_refused_acceptances,
+            root_decrement_acceptances: root.decrement_acceptances,
             root_rounding_floor_stops: root.rounding_floor_stops,
             root_band_refused_commits: root.band_refused_commits,
             ..self.probe_telemetry

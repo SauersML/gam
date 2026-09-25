@@ -3494,9 +3494,15 @@ fn k1_checkpoint_evaluations_price_exact_certified_states_3327() {
             panic!("{label} eval at {rho} priced a state the exact information refuses: {state}");
         }
     }
+    // The positive control: the checkpoint's evaluations reach the acceptance the fix
+    // gates. It used to be counted only where the exact verdict REFUSED the admitted
+    // state; the refinement now carries every such state here to a certified root first
+    // (gam#4584: 0 refusals over a 100-point ρ sweep of this fixture), so the control
+    // counts every majorizer-decrement acceptance the exact certificate graded.
     assert!(
-        obj.probe_telemetry().root_exact_refused_acceptances > 0,
-        "the #3327 checkpoint reaches a majorizer-decrement acceptance the exact information refuses"
+        obj.probe_telemetry().root_decrement_acceptances > 0,
+        "the #3327 checkpoint must reach a majorizer-decrement acceptance for the exact \
+         certificate to grade"
     );
 }
 
