@@ -2842,6 +2842,70 @@ fn singular_convergent_derivative_builders_use_analytic_self_pair() {
     );
 }
 
+/// Rounding band of the η = 0 radial-form comparison below (gam#4587).
+///
+/// At η = 0 both sides read the SAME radial derivatives `fr` of the q = 0
+/// kernel: `anisotropic_duchon_penalty_radial` takes the uniform-metric chart,
+/// which calls `radial_derivatives_of_isotropic_duchon` at the same `(d, m, s,
+/// κ, R)` and depth `2q` as the reference. On a common `fr` the anisotropic
+/// Laplacian forms with `s₁ = s₂ = d`, `u₁ = u₂ = R²` are algebraically the
+/// isotropic radial chain, term for term, so the two values differ only by
+/// the rounding of the two combinations: `γ_k · Σ|terms|` over both
+/// (Higham, Lemma 3.1).
+///
+/// `k` is the longest rounding path of one term into either sum. The deepest
+/// term of the q = 2 form is `u₁·u₁·(c·f′/R⁷)`: `R⁷` costs four products
+/// (`R², R⁴, R⁶, R⁷`), the coefficient and the quotient one each, and the
+/// prefactor `u₁·u₁` and its product with the bracket two more, eight in all;
+/// the sixteen terms are then summed in at most seven additions per part chain
+/// plus four between parts. `k = 8 + 7 + 4 = 19` bounds every path of both
+/// forms at q ≤ 2 (the isotropic reference's deepest term, `(d−1)(d−3)f′/R³`,
+/// is shallower).
+fn radial_form_comparison_band(q: usize, d: usize, big_r: f64, fr: &[f64]) -> f64 {
+    const DEPTH: usize = 19;
+    let r = big_r;
+    let (r2, r3) = (r * r, r * r * r);
+    let (r4, r5, r6) = (r2 * r2, r2 * r3, r3 * r3);
+    let r7 = r3 * r4;
+    let dd = d as f64;
+    let (s1, s2, u1, u2) = (dd, dd, r2, r2);
+    let terms: Vec<f64> = match q {
+        0 => Vec::new(),
+        1 => vec![
+            fr[2] * u1 / r2,
+            fr[1] * s1 / r,
+            fr[1] * u1 / r3,
+            fr[2],
+            (dd - 1.0) * fr[1] / r,
+        ],
+        _ => {
+            let (dm1, dm3) = (dd - 1.0, dd - 3.0);
+            vec![
+                u1 * u1 * fr[4] / r4,
+                u1 * u1 * 6.0 * fr[3] / r5,
+                u1 * u1 * 15.0 * fr[2] / r6,
+                u1 * u1 * 15.0 * fr[1] / r7,
+                s1 * u1 * 2.0 * fr[3] / r3,
+                s1 * u1 * 6.0 * fr[2] / r4,
+                s1 * u1 * 6.0 * fr[1] / r5,
+                s1 * s1 * fr[2] / r2,
+                s1 * s1 * fr[1] / r3,
+                u2 * 4.0 * fr[3] / r3,
+                u2 * 12.0 * fr[2] / r4,
+                u2 * 12.0 * fr[1] / r5,
+                s2 * 2.0 * fr[2] / r2,
+                s2 * 2.0 * fr[1] / r3,
+                fr[4],
+                2.0 * dm1 * fr[3] / r,
+                dm1 * dm3 * fr[2] / r2,
+                dm1 * dm3 * fr[1] / r3,
+            ]
+        }
+    };
+    let absolute: f64 = terms.iter().map(|term| term.abs()).sum();
+    gam_linalg::roundoff::accumulation_growth(DEPTH) * absolute
+}
+
 #[test]
 fn test_radial_form_matches_q0_laplacian_chain_at_eta_zero_full_sweep() {
     let qs = [0_usize, 1, 2];
@@ -2889,13 +2953,21 @@ fn test_radial_form_matches_q0_laplacian_chain_at_eta_zero_full_sweep() {
                                 skipped += 1;
                                 continue;
                             }
-                            let denom = expected.abs().max(radial.abs()).max(1e-300);
-                            let rel = (radial - expected).abs() / denom;
+                            let fr = super::closed_form_penalty::radial_derivatives_of_isotropic_duchon(
+                                d,
+                                m,
+                                s as f64,
+                                kappa,
+                                big_r,
+                                2 * q,
+                            );
+                            let band = radial_form_comparison_band(q, d, big_r, &fr);
+                            let gap = (radial - expected).abs();
                             assert!(
-                                rel < 1e-12,
+                                gap <= band,
                                 "η=0 radial vs q0-Laplacian disagreement: q={q} d={d} m={m} \
                                      s={s} κ={kappa} R={big_r} radial={radial:.6e} \
-                                     expected={expected:.6e} rel={rel:.3e}"
+                                     expected={expected:.6e} gap={gap:.3e} band={band:.3e}"
                             );
                             tested += 1;
                         }
