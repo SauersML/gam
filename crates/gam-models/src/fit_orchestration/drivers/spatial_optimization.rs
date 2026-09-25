@@ -394,10 +394,19 @@ fn try_exact_joint_spatial_length_scale_optimization(
     // β/inference harvester at the certified (ρ*, ψ*).
     let mut fit = optimized.fit;
     fit.set_criterion(Some(joint_final_value));
+    // The spec the fit ships is frozen from the design it was fitted on. Moving a
+    // length scale marks each moved term's parametric residualization chart stale
+    // (`set_spatial_length_scale`), and a stale chart re-derives its row-space
+    // correction on whatever rows it is built from. Shipped as-is, every
+    // prediction re-centred the kernel columns on the prediction rows: a
+    // `matern(x)` fit whose in-sample RMSE was 0.012 predicted a held-out grid at
+    // 0.098, and the same fit rebuilt on half its own rows moved by 0.61. The
+    // freeze replaces a stale chart with the correction the fitted design applied.
+    let resolvedspec = freeze_term_collection_from_design(&optimized_spec, &optimized.design)?;
     let optimized_result = FittedTermCollectionWithSpec {
         fit,
         design: optimized.design,
-        resolvedspec: optimized_spec,
+        resolvedspec,
         kappa_timing: Some(kappa_timing),
     };
 

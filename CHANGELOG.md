@@ -1,5 +1,13 @@
 ## Unreleased
 
+- **A spatial smooth whose length scale was optimized predicts new rows correctly again.** When
+  the length-scale search accepted a new scale, the fitted model kept a term specification whose
+  parametric-residualization chart was still marked stale, so every prediction re-derived that
+  chart's row correction on the rows being predicted: each kernel column was re-centred on the
+  prediction rows. A `matern(x)` fit with in-sample RMSE 0.012 predicted a held-out grid at 0.098,
+  and rebuilding it on half of its own rows moved its predictions by 0.61. The model now keeps the
+  correction its fitted design applied.
+
 - **A Gaussian location-scale mean smooth keeps its whole basis again** (gam#2356). When the mean
   and log-σ formulas smooth the same column, the two terms share their centres. The shared centres
   were chosen in the standardized frame and handed back with no scale, so the term's build
