@@ -4019,8 +4019,7 @@ fn outer_gradient_at_large_rho_has_a_lambda_infinity_face_2450() {
 }
 
 /// #2461, executable: the Duchon iso-κ ψ-gradient must be CERTIFIED at the
-/// saturated rung the issue measured — and the fixture must still be a place
-/// where a fixed step is not good enough, or the gate is vacuous.
+/// saturated rung the issue measured, by an oracle that can reject it.
 ///
 /// Two assertions, and the second is the one that keeps the first honest.
 ///
@@ -4030,11 +4029,16 @@ fn outer_gradient_at_large_rho_has_a_lambda_infinity_face_2450() {
 ///     property of the gradient, so no tolerance is being widened to admit it:
 ///     the realized agreement is ~1e-7 relative, four orders inside the band.
 ///
-///  2. A central difference at the ladder's historical fixed `h = 3e-4` must
-///     still be wrong here by more than `rel_tol`. Without this the gate would
-///     silently stop testing anything the day the fixture stopped being sharp
-///     in ψ, and the regression it guards — a fixed-step oracle reporting its
-///     own truncation as a gradient defect — would become invisible again.
+///  2. The same certified oracle must REJECT the analytic value moved just
+///     outside the band, so agreement in (1) is a statement the oracle could
+///     have refused. This replaced a control requiring a central difference at
+///     the ladder's historical fixed `h = 3e-4` to be wrong here by more than
+///     `rel_tol`: the fixture is no longer sharp in ψ. Measured on main on
+///     2026-09-25, the ψ derivative is −42.3848 at every rung from 5 to 25,
+///     and the fixed step agrees to 2e-7 (to 2e-5 even at `h = 3e-3`), also at
+///     c32344c461 and its parent; no rung restores the sharpness the old
+///     control needed. The fixed-step value is still printed beside the
+///     certified one.
 #[test]
 fn iso_kappa_duchon_psi_gradient_is_certified_at_a_saturated_rho_2461() {
     use gam_linalg_test_support::fd_checker::{FdVerdict, RiddersConfig, ridders_derivative};
@@ -4042,8 +4046,8 @@ fn iso_kappa_duchon_psi_gradient_is_certified_at_a_saturated_rho_2461() {
     const RUNG: f64 = 15.0;
     const REL_TOL: f64 = 5e-3;
     const ABS_FLOOR: f64 = 1e-3;
-    // The step the driver used to hard-wire, kept as a literal because
-    // assertion 2 is precisely a statement ABOUT that step.
+    // The step the driver used to hard-wire, measured beside the certified
+    // derivative for the record.
     const RETIRED_FIXED_STEP: f64 = 3e-4;
 
     let fixture = build_iso_kappa_fixture(
@@ -4158,10 +4162,17 @@ fn iso_kappa_duchon_psi_gradient_is_certified_at_a_saturated_rho_2461() {
     )) / (2.0 * RETIRED_FIXED_STEP);
     let fixed_rel = (analytic - fixed).abs() / analytic.abs().max(fixed.abs()).max(ABS_FLOOR);
     eprintln!("[#2461-gate] fixed h={RETIRED_FIXED_STEP:.1e} fd={fixed:+.6e} rel={fixed_rel:.3e}");
-    assert!(
-        fixed_rel > REL_TOL,
-        "this rung must still DEFEAT a fixed step, or the gate above proves nothing: \
-         fixed-step rel={fixed_rel:.3e} is now inside rel_tol={REL_TOL:.1e}"
+    // Twice the band away: a gradient this wrong must not pass.
+    let displaced = analytic * (1.0 + 2.0 * REL_TOL);
+    assert_ne!(
+        measured.judge(displaced, REL_TOL, ABS_FLOOR),
+        FdVerdict::Agree,
+        "the certified oracle accepted a gradient {:.1}% off, so its agreement in (1) \
+         proves nothing: analytic={analytic:+.6e} displaced={displaced:+.6e} fd={:+.6e} \
+         unc={:.3e}",
+        200.0 * REL_TOL,
+        measured.value,
+        measured.uncertainty
     );
 }
 
