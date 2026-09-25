@@ -19,12 +19,17 @@
 //! The blocks' dimensions can be in the thousands, so nothing here forms an ambient-sized
 //! matrix: the exponential and logarithm maps, parallel transport, a dense tangent basis and
 //! curvature are refused as unsupported (no solver here needs them); every other operation
-//! costs `O(n k²)` per block.
-use faer::Side;
-use gam_linalg::faer_ndarray::{FaerEigh, fast_ab, fast_atb};
+//! costs `O(n k²)` per block. Blocks are read as views of the flat vectors, never copied, and
+//! every product is a CPU GEMM: these run inside a trust region whose objective already
+//! occupies the device, and shipping `3072 × 3072` blocks across for each product measured
+//! as most of a support fit's wall time.
+use faer::linalg::matmul::matmul;
+use faer::{Accum, Side};
+use gam_linalg::faer_ndarray::{FaerArrayView, FaerEigh, array2_to_matmut, matmul_parallelism};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 
-use crate::manifold::{GeometryError, GeometryResult, RiemannianManifold, check_len, flatten, from_flat, identity, sym};
+use crate::manifold::{GeometryError, GeometryResult, RiemannianManifold, check_len, identity};
+
 
 /// `St(n₁, k₁) × …` under the embedded metric with the polar retraction (module docs).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,11 +51,11 @@ impl StiefelFrames {
         &self.blocks
     }
 
-    /// Apply `f` to every block of the given same-shaped ambient vectors, writing its
-    /// `n × k` result into the output's block.
+    /// Apply `f` to every block of the given same-shaped ambient vectors (as `n × k` views,
+    /// no copy), writing its `n × k` result into the output's block.
     fn per_block<F>(&self, parts: &[ArrayView1<'_, f64>], mut f: F) -> GeometryResult<Array1<f64>>
     where
-        F: FnMut(&[Array2<f64>]) -> GeometryResult<Array2<f64>>,
+        F: FnMut(&[ArrayView2<'_, f64>]) -> GeometryResult<Array2<f64>>,
     {
         let ambient = self.ambient_dim();
         for part in parts {
@@ -58,22 +63,55 @@ impl StiefelFrames {
         }
         let mut out = Array1::<f64>::zeros(ambient);
         let mut offset = 0;
+        // A part that is not contiguous (a strided view) is compacted once for all blocks.
+        let owned: Vec<Option<Array1<f64>>> =
+            parts.iter().map(|p| if p.as_slice().is_some() { None } else { Some(p.to_owned()) }).collect();
+        let flat: Vec<ArrayView1<'_, f64>> =
+            parts.iter().zip(&owned).map(|(p, o)| o.as_ref().map_or(p.view(), |o| o.view())).collect();
         for &(n, k) in &self.blocks {
             let size = n * k;
-            let mats = parts
+            let mats = flat
                 .iter()
-                .map(|p| from_flat(p.slice(s![offset..offset + size]), n, k))
+                .map(|p| {
+                    p.slice(s![offset..offset + size])
+                        .into_shape_with_order((n, k))
+                        .map_err(|_| GeometryError::InvalidPoint("StiefelFrames: a block is not contiguous"))
+                })
                 .collect::<GeometryResult<Vec<_>>>()?;
-            out.slice_mut(s![offset..offset + size]).assign(&flatten(&f(&mats)?));
+            let result = f(&mats)?;
+            out.slice_mut(s![offset..offset + size])
+                .assign(&result.into_shape_with_order(size).map_err(|_| GeometryError::InvalidPoint("StiefelFrames: result layout"))?);
             offset += size;
         }
         Ok(out)
     }
 }
 
-/// `Z − X·sym(XᵀZ)`.
-fn project(x: &Array2<f64>, z: &Array2<f64>) -> Array2<f64> {
-    z - &fast_ab(x, &sym(&fast_atb(x, z)))
+/// `alpha · op(A) · op(B)` accumulated into `out` (`Accum::Add`) or replacing it, as one CPU GEMM
+/// on views (no copy of either operand).
+fn gemm(out: &mut Array2<f64>, accumulate: bool, alpha: f64, a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) {
+    let (m, k) = a.dim();
+    let n = b.ncols();
+    let (va, vb) = (FaerArrayView::new(&a), FaerArrayView::new(&b));
+    let accum = if accumulate { Accum::Add } else { Accum::Replace };
+    matmul(array2_to_matmut(out), accum, va.as_ref(), vb.as_ref(), alpha, matmul_parallelism(m, n, k));
+}
+
+/// `sym(XᵀZ)`, `k × k`.
+fn sym_xtz(x: ArrayView2<'_, f64>, z: ArrayView2<'_, f64>) -> Array2<f64> {
+    let k = x.ncols();
+    let mut xtz = Array2::<f64>::zeros((k, k));
+    gemm(&mut xtz, false, 1.0, x.t(), z);
+    let transposed = xtz.t().to_owned();
+    (xtz + transposed) * 0.5
+}
+
+/// `Z − X·sym(XᵀZ)`: two GEMMs, the second accumulating into a copy of `Z`.
+fn project(x: ArrayView2<'_, f64>, z: ArrayView2<'_, f64>) -> Array2<f64> {
+    let s = sym_xtz(x, z);
+    let mut out = z.to_owned();
+    gemm(&mut out, true, -1.0, x, s.view());
+    out
 }
 
 impl RiemannianManifold for StiefelFrames {
@@ -132,7 +170,7 @@ impl RiemannianManifold for StiefelFrames {
     }
 
     fn project_tangent(&self, point: ArrayView1<'_, f64>, vec: ArrayView1<'_, f64>) -> GeometryResult<Array1<f64>> {
-        self.per_block(&[point, vec], |m| Ok(project(&m[0], &m[1])))
+        self.per_block(&[point, vec], |m| Ok(project(m[0], m[1])))
     }
 
     /// Under the embedded metric the Riesz representative is the tangent projection.
@@ -143,9 +181,8 @@ impl RiemannianManifold for StiefelFrames {
     /// The polar factor of `X + P_X(ξ)` per block (module docs).
     fn retract(&self, point: ArrayView1<'_, f64>, tangent_vec: ArrayView1<'_, f64>) -> GeometryResult<Array1<f64>> {
         self.per_block(&[point, tangent_vec], |m| {
-            let y = &m[0] + &project(&m[0], &m[1]);
-            let gram = fast_atb(&y, &y);
-            let gram = (&gram + &gram.t()) * 0.5;
+            let y = &m[0] + &project(m[0], m[1]);
+            let gram = sym_xtz(y.view(), y.view());
             let (values, vectors) = gram
                 .eigh(Side::Lower)
                 .map_err(|_| GeometryError::InvalidPoint("StiefelFrames retraction: eigendecomposition failed"))?;
@@ -153,7 +190,12 @@ impl RiemannianManifold for StiefelFrames {
                 return Err(GeometryError::Singular("StiefelFrames retraction: X + ξ lost rank"));
             }
             let scaled = &vectors * &values.mapv(|v| 1.0 / v.sqrt());
-            Ok(fast_ab(&y, &fast_ab(&scaled, &vectors.t().to_owned())))
+            let k = values.len();
+            let mut inverse_root = Array2::<f64>::zeros((k, k));
+            gemm(&mut inverse_root, false, 1.0, scaled.view(), vectors.t());
+            let mut out = Array2::<f64>::zeros(y.dim());
+            gemm(&mut out, false, 1.0, y.view(), inverse_root.view());
+            Ok(out)
         })
     }
 
@@ -178,9 +220,11 @@ impl RiemannianManifold for StiefelFrames {
         tangent: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
         self.per_block(&[point, euclidean_grad, euclidean_hessian_product, tangent], |m| {
-            let (x, g, h, xi) = (&m[0], &m[1], &m[2], &m[3]);
-            let weingarten = fast_ab(xi, &sym(&fast_atb(x, g)));
-            Ok(project(x, &(h - &weingarten)))
+            let (x, g, h, xi) = (m[0], m[1], m[2], m[3]);
+            // h − ξ·sym(Xᵀg), then its tangent part
+            let mut inner = h.to_owned();
+            gemm(&mut inner, true, -1.0, xi, sym_xtz(x, g).view());
+            Ok(project(x, inner.view()))
         })
     }
 }
@@ -188,7 +232,9 @@ impl RiemannianManifold for StiefelFrames {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifold::{flatten, from_flat};
     use crate::optimizer::{RiemannianObjective, RiemannianTrustRegion};
+    use gam_linalg::faer_ndarray::{fast_ab, fast_atb};
 
     /// A deterministic `n × k` matrix with orthonormal columns and a symmetric `A`.
     fn fixture(n: usize, k: usize, seed: u64) -> (Array2<f64>, Array2<f64>) {

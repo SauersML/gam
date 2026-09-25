@@ -18,7 +18,7 @@ use gam::terms::sae::parameter_decomposition::support_fit::{Alternation, PieceEx
 use gam::terms::sae::parameter_decomposition::surface::run_parameter_decomposition;
 use gam::geometry::{EuclideanManifold, RiemannianManifold, StiefelFrames};
 use ndarray::{Array1, ArrayView1, ArrayView2};
-use numpy::{IntoPyArray, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -150,9 +150,37 @@ fn parameter_decomposition_minimal_support<'py>(
 struct PythonPieceExecutor<'py> {
     object: Bound<'py, PyAny>,
     error: Option<PyErr>,
+    /// The last pieces and supports handed to Python. Every Hessian product of one
+    /// trust-region iteration shares them, and each is tens of millions of entries: the
+    /// same array object is passed again while its contents still equal the request (so
+    /// the executor can keep its device copy), instead of a fresh copy per call.
+    theta: Option<Bound<'py, PyArray1<f64>>>,
+    keep: Option<Bound<'py, PyArray2<bool>>>,
 }
 
 impl<'py> PythonPieceExecutor<'py> {
+    fn theta_array(&mut self, theta: ArrayView1<'_, f64>) -> Bound<'py, PyArray1<f64>> {
+        if let Some(cached) = &self.theta
+            && cached.readonly().as_array() == theta
+        {
+            return cached.clone();
+        }
+        let array = theta.to_owned().into_pyarray(self.object.py());
+        self.theta = Some(array.clone());
+        array
+    }
+
+    fn keep_array(&mut self, keep: ArrayView2<'_, bool>) -> Bound<'py, PyArray2<bool>> {
+        if let Some(cached) = &self.keep
+            && cached.readonly().as_array() == keep
+        {
+            return cached.clone();
+        }
+        let array = keep.to_owned().into_pyarray(self.object.py());
+        self.keep = Some(array.clone());
+        array
+    }
+
     fn vector<A: pyo3::call::PyCallArgs<'py>>(&mut self, method: &str, args: A) -> Result<Array1<f64>, String> {
         let result = self.object.call_method1(method, args).and_then(|r| {
             let array: PyReadonlyArray1<'_, f64> = r.extract()?;
@@ -204,10 +232,10 @@ impl PieceExecutor for PythonPieceExecutor<'_> {
     }
 
     fn supports(&mut self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>) -> Result<SupportEvaluation, String> {
-        let py = self.object.py();
+        let args = (self.theta_array(theta), self.keep_array(keep));
         let result = self
             .object
-            .call_method1("supports", (theta.to_owned().into_pyarray(py), keep.to_owned().into_pyarray(py)))
+            .call_method1("supports", args)
             .and_then(|r| {
                 let (d, c, g): (PyReadonlyArray1<'_, f64>, PyReadonlyArray2<'_, f64>, PyReadonlyArray2<'_, f64>) = r.extract()?;
                 Ok(SupportEvaluation {
@@ -223,34 +251,26 @@ impl PieceExecutor for PythonPieceExecutor<'_> {
         })
     }
     fn divergence(&mut self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>) -> Result<Array1<f64>, String> {
-        let py = self.object.py();
-        self.vector("divergence", (theta.to_owned().into_pyarray(py), keep.to_owned().into_pyarray(py)))
+        let args = (self.theta_array(theta), self.keep_array(keep));
+        self.vector("divergence", args)
     }
     fn weighted_gradient(&mut self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>, weights: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
-        let py = self.object.py();
-        self.vector(
-            "weighted_gradient",
-            (theta.to_owned().into_pyarray(py), keep.to_owned().into_pyarray(py), weights.to_owned().into_pyarray(py)),
-        )
+        let args = (self.theta_array(theta), self.keep_array(keep), weights.to_owned().into_pyarray(self.object.py()));
+        self.vector("weighted_gradient", args)
     }
     fn directional(&mut self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>, v: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
-        let py = self.object.py();
-        self.vector(
-            "directional",
-            (theta.to_owned().into_pyarray(py), keep.to_owned().into_pyarray(py), v.to_owned().into_pyarray(py)),
-        )
+        let args = (self.theta_array(theta), self.keep_array(keep), v.to_owned().into_pyarray(self.object.py()));
+        self.vector("directional", args)
     }
     fn weighted_hessian(&mut self, theta: ArrayView1<'_, f64>, keep: ArrayView2<'_, bool>, weights: ArrayView1<'_, f64>, v: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
         let py = self.object.py();
-        self.vector(
-            "weighted_hessian",
-            (
-                theta.to_owned().into_pyarray(py),
-                keep.to_owned().into_pyarray(py),
-                weights.to_owned().into_pyarray(py),
-                v.to_owned().into_pyarray(py),
-            ),
-        )
+        let args = (
+            self.theta_array(theta),
+            self.keep_array(keep),
+            weights.to_owned().into_pyarray(py),
+            v.to_owned().into_pyarray(py),
+        );
+        self.vector("weighted_hessian", args)
     }
 }
 
@@ -282,7 +302,7 @@ fn parameter_decomposition_fit_supports<'py>(
         None => Box::new(EuclideanManifold::new(theta.len())),
         Some(blocks) => Box::new(StiefelFrames::new(blocks).map_err(|e| py_value_error(format!("fit_supports: frames: {e}")))?),
     };
-    let mut runner = PythonPieceExecutor { object: executor, error: None };
+    let mut runner = PythonPieceExecutor { object: executor, error: None, theta: None, keep: None };
     let fit = match fit_supports_and_pieces(&mut runner, manifold.as_ref(), theta, positions, pieces, eps, mean, sequence) {
         Ok(fit) => fit,
         Err(error) => return Err(runner.error.take().unwrap_or_else(|| py_value_error(error.to_string()))),

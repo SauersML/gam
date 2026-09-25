@@ -46,10 +46,12 @@
 //! [`PieceExecutor::gradient_arithmetic`]), not at a declared tolerance.
 //!
 //! Within one fidelity level, supports never regain a piece and `θ` never leaves the
-//! admissible set, so the kept count is non-increasing. Each alternation takes one
-//! trust-region iteration resumed from the previous one (its radius and certificate
-//! scale carried), so the pieces never converge to the centre for supports the next
-//! search replaces. The level ends when the supports stop shrinking and the
+//! admissible set, so the kept count is non-increasing. Each alternation takes
+//! trust-region iterations resumed from the previous one (radius and certificate scale
+//! carried) while the region, not the model, limits the step (an accepted boundary step
+//! grows the radius), and stops at the first step the model itself sized: the pieces never
+//! converge to the centre for supports the next search replaces, and never wait a whole
+//! search per radius doubling. The level ends when the supports stop shrinking and the
 //! certificate holds: the fit comes only from a converged optimization.
 //!
 //! # Continuation in the fidelity
@@ -212,17 +214,6 @@ impl<E: PieceExecutor> Barrier<'_, E> {
         }
     }
 
-    /// Per-position weights of the barrier's rank-one Hessian term along `d_t = ∇KL_t · v`:
-    /// per position `w_t² d_t`; none under the mean form, whose objective is the mean
-    /// itself.
-    fn rank_one_weights(&self, w: &Array1<f64>, d: &Array1<f64>) -> Array1<f64> {
-        match self.fidelity {
-            Fidelity::PerPosition(_) => w * w * d,
-            // The mean itself is minimized: it has no rank-one term.
-            Fidelity::Mean(_) => Array1::zeros(d.len()),
-        }
-    }
-
     fn fail(&mut self, e: String) -> GeometryError {
         self.error = Some(e);
         GeometryError::InvalidPoint("support_fit: the executor failed")
@@ -251,9 +242,13 @@ impl<E: PieceExecutor> RiemannianObjective for Barrier<'_, E> {
             Ok(Some(pair)) => pair,
         };
         let mut out = self.executor.weighted_hessian(point, self.keep.view(), w.view(), tangent).map_err(|e| self.fail(e))?;
-        let d = self.executor.directional(point, self.keep.view(), tangent).map_err(|e| self.fail(e))?;
-        let rank_one = self.rank_one_weights(&w, &d);
-        out += &self.executor.weighted_gradient(point, self.keep.view(), rank_one.view()).map_err(|e| self.fail(e))?;
+        // The barrier's rank-one term `Σ_t w_t² (∇KL_t · v) ∇KL_t` exists per position only;
+        // the mean form minimizes the mean itself and has none, so it costs no model pass.
+        if let Fidelity::PerPosition(_) = self.fidelity {
+            let d = self.executor.directional(point, self.keep.view(), tangent).map_err(|e| self.fail(e))?;
+            let rank_one = &w * &w * &d;
+            out += &self.executor.weighted_gradient(point, self.keep.view(), rank_one.view()).map_err(|e| self.fail(e))?;
+        }
         // `out` is the Euclidean Hessian product; the trust region needs the Riemannian one.
         let gradient = match &self.gradient {
             Some((at, g)) if at.view() == point => g.clone(),
@@ -368,25 +363,37 @@ pub fn fit_supports_and_pieces<E: PieceExecutor>(
             let (termination, before, after) = {
                 let mut barrier = Barrier { executor: &mut *executor, manifold, keep: &at, fidelity, error: None, gradient: None };
                 let before = barrier.value_gradient(theta.view()).map_err(SupportFitError::Geometry)?.0;
-                let termination = match &state {
+                let (termination, mut entered) = match &state {
                     None => {
                         let radius = match level_radius {
                             Some(r) => r,
                             None => model_scale(&mut barrier, theta.view()).map_err(SupportFitError::Geometry)?,
                         };
                         level_radius = Some(radius);
-                        RiemannianTrustRegion { radius, ..step.clone() }.minimize_reporting_termination(manifold, &mut barrier, theta.view())
+                        (RiemannianTrustRegion { radius, ..step.clone() }.minimize_reporting_termination(manifold, &mut barrier, theta.view()), radius)
                     }
-                    Some(previous) => step.resume(
-                        manifold,
-                        &mut barrier,
-                        &TrustRegionTermination { point: theta.clone(), ..previous.clone() },
+                    Some(previous) => (
+                        step.resume(manifold, &mut barrier, &TrustRegionTermination { point: theta.clone(), ..previous.clone() }),
+                        previous.radius,
                     ),
                 };
                 if let Some(e) = barrier.error.take() {
                     return Err(SupportFitError::Executor(e));
                 }
-                let termination = termination.map_err(SupportFitError::Geometry)?;
+                let mut termination = termination.map_err(SupportFitError::Geometry)?;
+                // A step accepted at the boundary with close agreement grows the radius: the
+                // region, not the model, limited it. The pieces keep moving at these supports
+                // until a step is not region-limited (or the certificate holds); only then can
+                // the next search use what they opened. Stopping after one such step let the
+                // radius grow by one doubling per search.
+                while termination.radius > entered && termination.residual > termination.tolerance {
+                    entered = termination.radius;
+                    let next = step.resume(manifold, &mut barrier, &termination);
+                    if let Some(e) = barrier.error.take() {
+                        return Err(SupportFitError::Executor(e));
+                    }
+                    termination = next.map_err(SupportFitError::Geometry)?;
+                }
                 let after = barrier.value_gradient(termination.point.view()).map_err(SupportFitError::Geometry)?.0;
                 (termination, before, after)
             };

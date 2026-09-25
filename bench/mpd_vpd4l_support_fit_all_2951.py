@@ -161,8 +161,23 @@ def main():
         def kl_of(lg):
             return (logp_clean.exp() * (logp_clean - lg.log_softmax(-1))).sum(-1).reshape(-1)
 
+        # gamfit hands over the same array object while the pieces or supports are unchanged (every
+        # Hessian product of a trust-region iteration shares them), so each is uploaded once.
+        uploaded = {}
+
+        def once(kind, a, convert):
+            held = uploaded.get(kind)
+            if held is not None and held[0] is a:
+                return held[1]
+            value = convert(a)
+            uploaded[kind] = (a, value)
+            return value
+
         def mask(keep):
-            return torch.from_numpy(np.asarray(keep)).to(dev).view(Bn, T, C).float()
+            return once("keep", keep, lambda k: torch.from_numpy(np.asarray(k)).to(dev).view(Bn, T, C).float())
+
+        def pieces(theta):
+            return once("theta", theta, lambda t: torch.from_numpy(np.asarray(t)).to(dev))
 
         def th(a):
             return torch.from_numpy(np.asarray(a)).to(dev)
@@ -174,8 +189,8 @@ def main():
             def supports(self, theta, keep):
                 calls["theta"] = theta
                 spend(3)
-                m = mask(keep).requires_grad_(True)
-                lg = model.logits(tokens, m, th(theta))
+                m = mask(keep).detach().requires_grad_(True)
+                lg = model.logits(tokens, m, pieces(theta))
                 kl = kl_of(lg)
                 (g,) = torch.autograd.grad(kl.sum(), m, retain_graph=True)
                 with torch.no_grad():
@@ -195,7 +210,7 @@ def main():
                 calls["theta"] = theta
                 spend(1)
                 with torch.no_grad():
-                    kl = kl_of(model.logits(tokens, mask(keep), th(theta))).double().cpu().numpy()
+                    kl = kl_of(model.logits(tokens, mask(keep), pieces(theta))).double().cpu().numpy()
                 calls["views"] = calls.get("views", 0) + 1
                 if calls["views"] % 10 == 0:
                     kept = np.asarray(keep).reshape(P, C)
@@ -206,14 +221,14 @@ def main():
 
             def weighted_gradient(self, theta, keep, weights):
                 spend(2)
-                t = th(theta).requires_grad_(True)
+                t = pieces(theta).detach().requires_grad_(True)
                 (g,) = torch.autograd.grad((kl_of(model.logits(tokens, mask(keep), t)) * th(weights).float()).sum(), t)
                 return g.double().cpu().numpy()
 
             def directional(self, theta, keep, v):
                 spend(2)
                 m = mask(keep)
-                _, d = jvp(lambda t: kl_of(model.logits(tokens, m, t)), (th(theta),), (th(v),))
+                _, d = jvp(lambda t: kl_of(model.logits(tokens, m, t)), (pieces(theta),), (th(v),))
                 return d.double().cpu().numpy()
 
             def observe(self, a):
@@ -238,7 +253,7 @@ def main():
                 def grad_of(t):
                     return torch.func.grad(lambda s: (kl_of(model.logits(tokens, m, s)) * wt).sum())(t)
 
-                _, hv = jvp(grad_of, (th(theta),), (th(v),))
+                _, hv = jvp(grad_of, (pieces(theta),), (th(v),))
                 return hv.double().cpu().numpy()
 
         return Executor(), P, T, kl_of, mask, th
