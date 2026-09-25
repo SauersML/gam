@@ -2,7 +2,7 @@
 
 ``mpd_vpd4l_support_fit_all_2951.py`` saves the pieces each fidelity level ends with (``<out>_level<eps>.npy``). For
 each saved level this runs ``gamfit.sae.minimal_support`` on held-out sequences at that level's fidelity (mean form,
-joint masking) with the pieces frozen, and VPD's PGD-20 on the supports found (every removed piece re-added with an
+joint masking) with the pieces frozen, starting from the empty support, and VPD's PGD-20 on the supports found (every removed piece re-added with an
 adversarial mask in [0, 1] shared by all positions, 20 sign steps of 0.1 from a uniform start). Held-out sequences
 are the ones after the fit's own in the test split. Levels already in ``--out`` are skipped, so the file grows as the
 fit descends.
@@ -75,7 +75,9 @@ def main():
             g, hh = g.reshape(P, C).double(), hh.reshape(P, C).double()
             return kl.detach().double().cpu().numpy(), (-g + 0.5 * hh ** 2).cpu().numpy(), (-g - 0.5 * hh ** 2).cpu().numpy()
 
-        held = minimal_support(evaluate, P, C, eps, "mean", T)
+        # From the empty support: minimal_support restores pieces by predicted gain until admissible and then
+        # searches, so sparse levels cost a few rounds instead of removing ~37,000 pieces per position from full.
+        held = minimal_support(evaluate, P, C, eps, "mean", T, start=np.zeros((P, C), dtype=bool))
         keep_t = mask(held["keep"])
         adv = torch.rand(C, device=dev, generator=torch.Generator(device=dev).manual_seed(0)).requires_grad_(True)
         for _ in range(20):
