@@ -3259,15 +3259,35 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             if eval_mode == EvalMode::ValueGradientHessian {
                 batched_gradient_override = Some(gradient);
             } else {
-                let no_dh =
-                    |_: &Array1<f64>| -> Result<Option<DriftDerivResult>, CustomFamilyError> {
-                        Ok(None)
-                    };
-                let no_d2h = |_: &Array1<f64>,
-                              _: &Array1<f64>|
-                 -> Result<Option<DriftDerivResult>, CustomFamilyError> {
-                    Ok(None)
+                // gam#3164: the value is priced with the SAME `D_βH` the value-only
+                // screen of this mode used, so the IFT correction's moving-Hessian
+                // log-det response (gam#1395) is in both or in neither. A null
+                // closure here dropped it from this pass alone, and mode selection
+                // then refused the mode because the derivative pass had "changed
+                // profile objective" by exactly that term.
+                let drift_scale = if use_outer_curvature_derivatives {
+                    1.0
+                } else {
+                    rho_curvature_scale
                 };
+                let value_dh = exact_newton_dh_closure(
+                    family,
+                    Arc::clone(&synced_joint_states),
+                    specs,
+                    total,
+                    use_outer_curvature_derivatives,
+                    drift_scale,
+                    hessian_workspace.clone(),
+                );
+                let value_d2h = exact_newton_d2h_closure(
+                    family,
+                    Arc::clone(&synced_joint_states),
+                    specs,
+                    total,
+                    use_outer_curvature_derivatives,
+                    drift_scale,
+                    hessian_workspace.clone(),
+                );
                 let value_only = joint_outer_evaluate(
                     &inner,
                     specs,
@@ -3291,9 +3311,9 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                     options,
                     gam_problem::RhoPrior::Flat,
                     family.pseudo_logdet_mode(),
-                    &no_dh,
+                    &value_dh,
                     None,
-                    &no_d2h,
+                    &value_d2h,
                     None,
                     None,
                     None,
