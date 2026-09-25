@@ -2469,6 +2469,16 @@ fn bernoulli_isotropic_matern_psi_psi_joint_hessian_matches_fd_of_first() {
             ms.length_scale
                 .set_resolved(base_length_scale * (-psi_offset).exp());
         }
+        // Moving the length scale moves the term's design, and a frozen parametric
+        // residualization chart's row-space correction with it; the canonical setter
+        // (`set_spatial_length_scale`) marks it stale so the rebuild re-derives it on
+        // this design. Replaying the base ψ's correction here would difference
+        // `X(ψ)·T − C·R(ψ₀)` instead of the design the analytic derivatives describe.
+        if psi_offset != 0.0
+            && let Some(chart) = spec.smooth_terms[0].frozen_parametric_residualization.as_mut()
+        {
+            chart.correction_is_stale = true;
+        }
         let design = build_term_collection_design(data.view(), &spec).expect("design");
         let slope_psi = build_block_spatial_psi_derivatives(data.view(), &spec, &design)
             .expect("psi deriv")
@@ -2700,6 +2710,16 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
         if let SmoothBasisSpec::Matern { spec: ms, .. } = &mut spec.smooth_terms[0].basis {
             ms.length_scale
                 .set_resolved(base_length_scale * (-psi_offset).exp());
+        }
+        // Moving the length scale moves the term's design, and a frozen parametric
+        // residualization chart's row-space correction with it; the canonical setter
+        // (`set_spatial_length_scale`) marks it stale so the rebuild re-derives it on
+        // this design. Replaying the base ψ's correction here would difference
+        // `X(ψ)·T − C·R(ψ₀)` instead of the design the analytic derivatives describe.
+        if psi_offset != 0.0
+            && let Some(chart) = spec.smooth_terms[0].frozen_parametric_residualization.as_mut()
+        {
+            chart.correction_is_stale = true;
         }
         let design = build_term_collection_design(data.view(), &spec).expect("perturbed design");
         // ψ derivative blocks for the slope spatial block at this length-scale.
