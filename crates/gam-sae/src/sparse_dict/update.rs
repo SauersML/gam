@@ -2949,6 +2949,11 @@ pub(super) struct RoutabilityGateDecision {
     pub(super) degrees_of_freedom: usize,
     /// BIC critical value `(p − 1) ln n_k`.
     pub(super) critical: f64,
+    /// For a deferred atom, how far the refresh its accumulated evidence
+    /// currently solves to would move its row, as the rank-one projector
+    /// distance [`decoder_fixed_point_residual`] reads (`1 − cos² θ`). Zero for
+    /// a refreshed atom, whose evidence is spent, and for one with no evidence.
+    pub(super) pending_move: f64,
 }
 
 /// BIC's charge `½ (p − 1) ln n` for the `p − 1` free direction coordinates,
@@ -2995,6 +3000,7 @@ pub(super) fn routability_gate_decisions(
                     statistic: 0.0,
                     degrees_of_freedom,
                     critical,
+                    pending_move: 0.0,
                 };
             }
             let r = partial.row(atom);
@@ -3027,6 +3033,7 @@ pub(super) fn routability_gate_decisions(
                 statistic,
                 degrees_of_freedom,
                 critical,
+                pending_move: 0.0,
             }
         })
         .collect()
@@ -3040,11 +3047,18 @@ pub(super) fn solve_decoder_with_routability_gate_recycled(
     gpu: gam_gpu::GpuPolicy,
     recycle: &mut DecoderRecycleSpace,
 ) -> Result<(DecoderSolveStats, Vec<RoutabilityGateDecision>), String> {
-    let gate = routability_gate_decisions(eq, decoder.view(), residual_scale);
+    let mut gate = routability_gate_decisions(eq, decoder.view(), residual_scale);
     let mut candidate = decoder.clone();
     let stats = solve_decoder_recycled(&mut candidate, eq, ridge, gpu, recycle)?;
-    for decision in gate.iter() {
+    for decision in gate.iter_mut() {
         if !decision.refresh {
+            if decision.firings > 0 {
+                let atom = decision.atom;
+                decision.pending_move = decoder_fixed_point_residual(
+                    &decoder.slice(ndarray::s![atom..atom + 1, ..]).to_owned(),
+                    &candidate.slice(ndarray::s![atom..atom + 1, ..]).to_owned(),
+                );
+            }
             // A deferred atom keeps its previous decoder row and accumulates
             // firing evidence across epochs. Surface the evidence trail so a
             // persistently-held-back atom is diagnosable without a debugger.

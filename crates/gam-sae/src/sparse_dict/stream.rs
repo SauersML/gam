@@ -127,6 +127,9 @@ pub struct SparseDictStreamState {
     last_fixed_point_tol: f64,
     epochs_run: usize,
     last_revived: usize,
+    /// Deferred atoms whose pending refresh would still move their row past the
+    /// fixed-point tolerance in the last epoch.
+    last_unsettled: usize,
     converged: bool,
     score_route_stats: ScoreRouteStats,
     last_decoder_solve_stats: DecoderSolveStats,
@@ -181,6 +184,7 @@ impl SparseDictStreamState {
             last_fixed_point_tol: f64::INFINITY,
             epochs_run: 0,
             last_revived: 0,
+            last_unsettled: 0,
             converged: false,
             score_route_stats: ScoreRouteStats::default(),
             last_decoder_solve_stats: DecoderSolveStats::default(),
@@ -375,7 +379,16 @@ impl SparseDictStreamState {
             self.p,
         );
         let numerically_sound = Self::decoder_solve_is_sound(&decoder_solve_stats);
-        let evidence_settled = self.eq.firings.iter().all(|&firings| firings == 0);
+        // A deferred atom's evidence keeps streaming by design: the gate refreshes a
+        // row only once its tangent pull beats the BIC charge, so a stationary row's
+        // firings never return to zero. What must be settled is the refresh that
+        // evidence would install: it may move no deferred row by more than the
+        // fixed-point tolerance, in the displacement `decoder_residual` reads.
+        let unsettled = gate
+            .iter()
+            .filter(|decision| !decision.refresh && decision.pending_move > fixed_point_tol)
+            .count();
+        let evidence_settled = unsettled == 0;
         let improve = ev - self.prev_ev;
         let converged = self.epochs_run > 0
             && revived == 0
@@ -390,6 +403,7 @@ impl SparseDictStreamState {
         self.last_decoder_residual = decoder_residual;
         self.last_fixed_point_tol = fixed_point_tol;
         self.last_revived = revived;
+        self.last_unsettled = unsettled;
         self.converged = converged;
         self.epochs_run += 1;
         self.last_decoder_solve_stats = decoder_solve_stats;
@@ -492,12 +506,7 @@ impl SparseDictStreamState {
             // gate used, and keep the configured value beside it so the derivation stays
             // visible.
             let solve_sound = Self::decoder_solve_is_sound(&self.last_decoder_solve_stats);
-            let unsettled = self
-                .eq
-                .firings
-                .iter()
-                .filter(|&&firings| firings != 0)
-                .count();
+            let unsettled = self.last_unsettled;
             return Err(format!(
                 "SparseDictStream.finalize: streaming fit has not converged after {} epoch(s) \
                  (last EV {:.6e}, EV residual {:.3e}, decoder residual {:.3e}, both against the \
