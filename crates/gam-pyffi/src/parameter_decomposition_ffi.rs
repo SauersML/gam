@@ -21,7 +21,7 @@ use gam::terms::sae::parameter_decomposition::moments::{
     GeneratorPart, MaskDomain, MaskMomentSystem, MomentBlock, MomentVector,
 };
 use gam::terms::sae::parameter_decomposition::supports::{
-    FailureHypergraph, minimum_code_support,
+    CardinalityCode, FailureHypergraph, minimum_code_support, ranked_support,
 };
 use gam::terms::sae::parameter_decomposition::surface::run_parameter_decomposition;
 use ndarray::Array1;
@@ -136,8 +136,13 @@ impl SeparationObjective for PythonObjective<'_> {
 /// "separations", "edges"}`: `status` is `"certified"` (the support's risk is bounded by
 /// epsilon) or `"unresolved"` (the minimum-code candidate was neither refuted nor certified;
 /// `support` is that candidate), and the risk bounds are the oracle's evidence about it.
+///
+/// With `ranking` (a permutation of some controls, most important first) the search is instead
+/// the shortest sufficient leading run of that ranking (`supports::ranked_support`), found by
+/// bisection in about `log2 C` checks: `code_lower` is then absent (no minimum over all subsets is
+/// claimed) and `edges` is 1 when the run one shorter was refuted.
 #[pyfunction]
-#[pyo3(signature = (objective, generators, lower, upper, piece_bits, epsilon, gradient_lipschitz=None))]
+#[pyo3(signature = (objective, generators, lower, upper, piece_bits, epsilon, gradient_lipschitz=None, ranking=None))]
 fn parameter_decomposition_robust_support<'py>(
     py: Python<'py>,
     objective: Bound<'py, PyAny>,
@@ -147,6 +152,7 @@ fn parameter_decomposition_robust_support<'py>(
     piece_bits: u64,
     epsilon: f64,
     gradient_lipschitz: Option<f64>,
+    ranking: Option<Vec<usize>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let (lower, upper) = (lower.as_array(), upper.as_array());
     let literal = generators.is_none();
@@ -187,39 +193,66 @@ fn parameter_decomposition_robust_support<'py>(
         gradient_lipschitz,
         error: RefCell::new(None),
     };
-    let search = ZonotopeSeparationOracle::new(&system, &domain, epsilon, &objective)
-        .map_err(|error| py_value_error(format!("robust_support: {error}")))
-        .and_then(|mut oracle| {
-            minimum_code_support(
-                &mut oracle,
-                &PaddedPacketCode { body_bits: piece_bits },
-                epsilon,
-                FailureHypergraph::new(controls),
-            )
-            .map_err(|error| py_value_error(format!("robust_support: {error}")))
-        });
-    let search = match search {
-        Ok(search) => search,
-        Err(error) => return Err(objective.error.into_inner().unwrap_or(error)),
-    };
-    let (status, found) = match (&search.certified, &search.undecided) {
-        (_, Some(undecided)) => ("unresolved", undecided),
-        (Some(certified), None) => ("certified", certified),
-        (None, None) => return Err(py_value_error("robust_support: the search returned no support".to_string())),
-    };
+    let code = PaddedPacketCode { body_bits: piece_bits };
     let bound = |value: Option<f64>| value.unwrap_or(f64::NAN);
+    let summary = ZonotopeSeparationOracle::new(&system, &domain, epsilon, &objective)
+        .map_err(|error| format!("{error}"))
+        .and_then(|mut oracle| match &ranking {
+            Some(ranking) => {
+                let ranked = ranked_support(&mut oracle, ranking, epsilon).map_err(|error| format!("{error}"))?;
+                let found = &ranked.found;
+                let status = if found.evidence.certifies_at_most(epsilon) { "certified" } else { "unresolved" };
+                let bits = code.support_bits(controls, found.support.len()).map_err(|error| format!("{error:?}"))?;
+                Ok((
+                    found.support.members().to_vec(),
+                    status,
+                    f64::NAN,
+                    bits as f64,
+                    bound(found.evidence.lower_bound()),
+                    bound(found.evidence.upper_bound()),
+                    ranked.separations,
+                    usize::from(ranked.refuted_shorter.is_some()),
+                ))
+            }
+            None => {
+                let search = minimum_code_support(&mut oracle, &code, epsilon, FailureHypergraph::new(controls))
+                    .map_err(|error| format!("{error}"))?;
+                let (status, found) = match (&search.certified, &search.undecided) {
+                    (_, Some(undecided)) => ("unresolved", undecided),
+                    (Some(certified), None) => ("certified", certified),
+                    (None, None) => return Err("the search returned no support".to_string()),
+                };
+                Ok((
+                    found.support.members().to_vec(),
+                    status,
+                    bound(search.code.lower_bound()),
+                    bound(search.code.upper_bound()),
+                    bound(found.evidence.lower_bound()),
+                    bound(found.evidence.upper_bound()),
+                    search.separations,
+                    search.hypergraph.edges().len(),
+                ))
+            }
+        });
+    let (support, status, code_lower, code_upper, risk_lower, risk_upper, separations, edges) = match summary {
+        Ok(summary) => summary,
+        Err(message) => {
+            return Err(objective
+                .error
+                .into_inner()
+                .unwrap_or_else(|| py_value_error(format!("robust_support: {message}"))));
+        }
+    };
     let out = PyDict::new(py);
-    out.set_item(
-        "support",
-        found.support.members().iter().map(|&c| c as u64).collect::<Vec<_>>().into_pyarray(py),
-    )?;
+    out.set_item("support", support.iter().map(|&c| c as u64).collect::<Vec<_>>().into_pyarray(py))?;
     out.set_item("status", status)?;
-    out.set_item("code_lower", bound(search.code.lower_bound()))?;
-    out.set_item("code_upper", bound(search.code.upper_bound()))?;
-    out.set_item("risk_lower", bound(found.evidence.lower_bound()))?;
-    out.set_item("risk_upper", bound(found.evidence.upper_bound()))?;
-    out.set_item("separations", search.separations)?;
-    out.set_item("edges", search.hypergraph.edges().len())?;
+    out.set_item("code_lower", code_lower)?;
+    out.set_item("code_upper", code_upper)?;
+    out.set_item("risk_lower", risk_lower)?;
+    out.set_item("risk_upper", risk_upper)?;
+    out.set_item("separations", separations)?;
+    // CEGAR: the recorded failure edges. Ranked: 1 when the run one shorter was refuted.
+    out.set_item("edges", edges)?;
     Ok(out)
 }
 

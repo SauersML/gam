@@ -569,6 +569,8 @@ pub enum HypergraphError {
     ComponentCountMismatch { expected: usize, found: usize },
     /// An edge that perturbs no component: no support can hit it.
     EmptyEdge,
+    /// A ranking that lists a component twice.
+    RepeatedComponent { index: usize },
 }
 
 impl fmt::Display for HypergraphError {
@@ -581,6 +583,7 @@ impl fmt::Display for HypergraphError {
                 write!(f, "expected {expected} components, found {found}")
             }
             Self::EmptyEdge => write!(f, "a failure edge must perturb at least one component"),
+            Self::RepeatedComponent { index } => write!(f, "the ranking lists component {index} twice"),
         }
     }
 }
@@ -1156,6 +1159,90 @@ where
             witness: evidence.into_witness(),
         })?;
     }
+}
+
+/// The shortest sufficient leading run of a declared ranking.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RankedSupport<M, D> {
+    /// The leading run the oracle did not refute, and its evidence.
+    pub found: SupportEvidence<M, D>,
+    /// The run one shorter, when the search refuted it: no shorter run of this ranking is
+    /// sufficient. `None` when the found run is empty.
+    pub refuted_shorter: Option<SupportEvidence<M, D>>,
+    /// The oracle separations performed.
+    pub separations: usize,
+}
+
+/// The shortest leading run of `ranking` that the oracle does not refute, by bisection
+/// on its length.
+///
+/// Clamping more controls shrinks the admissible set, so the risk is monotone under
+/// supersets (P7) and "the run of length `k` is sufficient" is monotone in `k`. The
+/// search keeps a refuted length below a length the oracle did not refute and halves
+/// the gap, so it asks the oracle `ceil(log2(C + 1)) + 1` times instead of once per
+/// component as CEGAR does. The full support is asked first; if it is refuted the
+/// tolerance is below what the all-on setting meets and the search is refused.
+///
+/// A run the oracle neither refutes nor certifies counts as not refuted, and the result
+/// carries that evidence unchanged: the returned run is certified only when its
+/// evidence certifies it. The ranking is a proposal (design section 7.5); the result is
+/// the shortest sufficient run of that ranking, not the minimum-code support over all
+/// subsets.
+pub fn ranked_support<O>(
+    oracle: &mut O,
+    ranking: &[usize],
+    tolerance: f64,
+) -> Result<RankedSupport<O::Mask, O::Domain>, SupportSearchError<O::Error>>
+where
+    O: SeparationOracle,
+{
+    require_tolerance::<O::Error, Infallible>(tolerance)?;
+    let components = oracle.components();
+    let mut seen = vec![false; components];
+    for &index in ranking {
+        if index >= components {
+            return Err(HypergraphError::ComponentOutOfRange { index, components }.into());
+        }
+        if std::mem::replace(&mut seen[index], true) {
+            return Err(HypergraphError::RepeatedComponent { index }.into());
+        }
+    }
+    let run = |length: usize| ComponentSet::new(components, ranking[..length].to_vec());
+    let mut separations = 0;
+    let mut ask = |oracle: &mut O, length: usize| -> Result<SupportEvidence<O::Mask, O::Domain>, SupportSearchError<O::Error>> {
+        let support = run(length)?;
+        let evidence = oracle.separate(&support).map_err(SupportSearchError::Oracle)?;
+        separations += 1;
+        Ok(SupportEvidence { support, evidence })
+    };
+    let mut passing = ask(oracle, ranking.len())?;
+    if passing.evidence.refutes_at_most(tolerance) {
+        return Err(SupportSearchError::AllOnViolation);
+    }
+    let mut high = ranking.len();
+    let mut refuted: Option<SupportEvidence<O::Mask, O::Domain>> = None;
+    let mut low_refuted: Option<usize> = None;
+    loop {
+        let low = low_refuted.map_or(0, |length| length + 1);
+        if low >= high {
+            break;
+        }
+        let middle = low + (high - low) / 2;
+        let found = ask(oracle, middle)?;
+        if found.evidence.refutes_at_most(tolerance) {
+            low_refuted = Some(middle);
+            refuted = Some(found);
+        } else {
+            high = middle;
+            passing = found;
+        }
+    }
+    let refuted_shorter = refuted.filter(|found| high > 0 && found.support.len() + 1 == high);
+    Ok(RankedSupport {
+        found: passing,
+        refuted_shorter,
+        separations,
+    })
 }
 
 /// A support certified sufficient at one input, at that input's own tolerance.
@@ -1766,7 +1853,7 @@ mod tests {
         CardinalityCode, ComponentSet, ConflictReplay, EvidenceStatus, EvidenceStatusError,
         ExactBasis, Extremum, FailureEdge, FailureHypergraph, HypergraphError, InputSupport,
         MaskBox, MaskSide, SeparationOracle, SupportSearchError,
-        minimum_code_support, replay_conflicts, sufficient_union,
+        minimum_code_support, ranked_support, replay_conflicts, sufficient_union,
     };
     use std::cmp::Ordering;
     use std::convert::Infallible;
@@ -2169,6 +2256,33 @@ mod tests {
             assert!(!oracle.evaluate(&mask).expect("an exact evaluation").refutes_at_most(tolerance));
         }
         assert!(oracle.separate(&set(2, &[])).expect("an exhaustive separation").refutes_at_most(tolerance));
+    }
+
+    #[test]
+    fn a_ranked_search_keeps_the_shortest_sufficient_run_in_logarithmically_many_checks() {
+        // Only components 0 and 1 move the output. The ranking lists them second and first
+        // among eight, so the shortest sufficient run is the first two.
+        let response = |mask: &[f64]| mask[0] * mask[1];
+        let tolerance = 0.5;
+        let mut oracle = GridOracle { components: 8, levels: vec![0.0, 1.0], response };
+        let ranking = [1, 0, 7, 6, 5, 4, 3, 2];
+        let found = ranked_support(&mut oracle, &ranking, tolerance).expect("the full run passes");
+        assert_eq!(found.found.support.members(), &[0, 1]);
+        assert!(found.found.evidence.certifies_at_most(tolerance));
+        let shorter = found.refuted_shorter.expect("the run of one is refuted");
+        assert_eq!(shorter.support.members(), &[1]);
+        assert!(shorter.evidence.refutes_at_most(tolerance));
+        // The full run, then a bisection over lengths 0..=8: at most ceil(log2 9) more.
+        assert!(found.separations <= 1 + 4, "{} separations", found.separations);
+        // A ranking that repeats or leaves the range is refused.
+        assert!(matches!(
+            ranked_support(&mut oracle, &[0, 0], tolerance),
+            Err(SupportSearchError::Hypergraph(HypergraphError::RepeatedComponent { index: 0 }))
+        ));
+        assert!(matches!(
+            ranked_support(&mut oracle, &[9], tolerance),
+            Err(SupportSearchError::Hypergraph(HypergraphError::ComponentOutOfRange { index: 9, .. }))
+        ));
     }
 
     #[test]

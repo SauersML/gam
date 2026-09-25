@@ -1,7 +1,10 @@
 """#2951: do minimum-code robust supports recover modular addition's key frequencies, unprompted?
 
-Thin torch executor (SPEC 8); the search is ``gamfit.sae.robust_support`` (``supports::minimum_code_support`` over
-``adversary::ZonotopeSeparationOracle``, each kept piece charged its body, design section 11.1).
+Thin torch executor (SPEC 8); the search is ``gamfit.sae.robust_support`` with a ranking: the shortest sufficient
+leading run of it (``supports::ranked_support``, a bisection over ``adversary::ZonotopeSeparationOracle``). The
+ranking is one proposal per input, the moment gradient of the divergence at the half-on mask, largest first; the
+oracle decides. (The counterexample-guided minimum-code search added about one piece per 10^4 native evaluations
+here, so it is not used.)
 
 Pieces, exact and derived from the task's group rather than fitted: the embedding and unembedding tables are
 functions on the cyclic group Z_p, so each expands exactly in its characters,
@@ -106,7 +109,9 @@ def main():
                         depth * UNIT_ROUNDOFF * (float(np.linalg.norm(gradient)) + scale))
 
             start = time.time()
-            found = robust_support(objective, None, np.zeros(C), np.ones(C), piece_bits, eps)
+            _, _, center_gradient, _ = objective(np.full(C, 0.5))
+            ranking = np.argsort(-center_gradient, kind="stable")
+            found = robust_support(objective, None, np.zeros(C), np.ones(C), piece_bits, eps, ranking=ranking)
             kept = [int(c) for c in found["support"]]
             row = {
                 "eps": eps, "example": i, "tokens": tokens[0].tolist(), "support_size": len(kept),

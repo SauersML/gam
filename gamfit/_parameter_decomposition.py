@@ -62,6 +62,7 @@ def robust_support(
     piece_bits: int,
     epsilon: float,
     gradient_lipschitz: float | None = None,
+    ranking: Any = None,
 ) -> dict[str, Any]:
     """The minimum-code robust support at one input, by counterexample-guided search.
 
@@ -73,7 +74,8 @@ def robust_support(
     charged for every kept piece (a local explanation carries what it keeps); ``epsilon`` is the declared
     tolerance. The search, the separation ascent over the moment zonotope and every
     certificate are Rust's (``supports::minimum_code_support`` over
-    ``adversary::ZonotopeSeparationOracle``).
+    ``adversary::ZonotopeSeparationOracle``). With ``ranking`` (controls, most important first) the
+    search is the shortest sufficient leading run of it, by bisection (``supports::ranked_support``).
     """
     return dict(
         rust_module().parameter_decomposition_robust_support(
@@ -84,5 +86,6 @@ def robust_support(
             int(piece_bits),
             float(epsilon),
             gradient_lipschitz,
+            None if ranking is None else [int(c) for c in ranking],
         )
     )
