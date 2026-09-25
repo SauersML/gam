@@ -53,13 +53,14 @@
 //!   of `S` is an edge.
 //! * **Minimum code.** When the support code depends only on the support size, as
 //!   P18's enumerative subset code does, every superset of a hitting set is a
-//!   hitting set. The minimum code over the known edges is then
-//!   `min_{k >= tau} L(C, k)`, with `tau` the minimum hitting-set size from an
-//!   exact branch and bound. Counterexample-guided refinement (CEGAR) alternates
-//!   that solve with the declared separation oracle. The result is optimal for the
-//!   chosen support code and the fixed decomposition only. When the oracle neither
-//!   refutes nor certifies a candidate, the result is unresolved and reports its
-//!   gap.
+//!   hitting set. Every sufficient support hits every known edge, so its code is at
+//!   least `min_{k >= tau} L(C, k)` for any lower bound `tau` on the hitting-set
+//!   size; the disjoint-packing count is one. Counterexample-guided refinement
+//!   (CEGAR) alternates a greedy hitting set with the declared separation oracle.
+//!   A certified candidate whose code meets that lower bound is optimal for the
+//!   chosen support code and the fixed decomposition; otherwise the minimum code is
+//!   reported unresolved between the two, as it is when the oracle neither refutes
+//!   nor certifies a candidate.
 //! * **Conflict replay.** When the decomposition changes, each recorded bad mask
 //!   is mapped into the new coordinates and re-evaluated by the new oracle. A mask
 //!   with no representative is dropped, and a mask that is no longer bad is
@@ -762,54 +763,56 @@ impl<M> FailureHypergraph<M> {
         Ok(true)
     }
 
-    /// A minimum-cardinality hitting set of the recorded edges, by exact branch and
-    /// bound. With no edges it is the empty set.
-    pub fn minimum_hitting_set(&self) -> ComponentSet {
+    /// A hitting set of the recorded edges and a lower bound on the size of every one.
+    ///
+    /// The set is greedy: repeatedly the component in the most unhit edges. The bound is the
+    /// number of pairwise disjoint edges a greedy packing finds, since disjoint edges need
+    /// distinct components. When the two meet the set is a minimum. Minimum hitting set is
+    /// NP-hard and an exact branch and bound is exponential in the edges a nonlinear
+    /// separation records; this pair costs the total edge length per pick and states its gap.
+    /// With no edges it is the empty set and the bound is zero.
+    pub fn hitting_set_bounds(&self) -> (ComponentSet, usize) {
         let edges: Vec<&[usize]> = self
             .edges
             .iter()
             .map(|edge| edge.perturbed.members())
             .collect();
-        let mut search = HittingSetSearch {
-            best: greedy_hitting_set(&edges, self.components),
-            edges,
-            chosen: vec![false; self.components],
-            forbidden: vec![false; self.components],
-            picked: Vec::new(),
-        };
-        search.branch();
-        search.best.sort_unstable();
-        ComponentSet {
-            components: self.components,
-            members: search.best,
-        }
+        let mut members = greedy_hitting_set(&edges);
+        members.sort_unstable();
+        let owned: Vec<Vec<usize>> = edges.iter().map(|edge| edge.to_vec()).collect();
+        (
+            ComponentSet {
+                components: self.components,
+                members,
+            },
+            disjoint_packing(&owned, self.components),
+        )
     }
 }
 
-/// A hitting set built by repeatedly taking the component that hits the most
-/// unhit edges. It seeds the branch and bound with an incumbent.
-fn greedy_hitting_set(edges: &[&[usize]], components: usize) -> Vec<usize> {
+/// A hitting set built by repeatedly taking the component that hits the most unhit
+/// edges, the largest index on ties. Counts range over the members of unhit edges only,
+/// so a pick costs the total length of those edges, not the number of components.
+fn greedy_hitting_set(edges: &[&[usize]]) -> Vec<usize> {
     let mut hit = vec![false; edges.len()];
     let mut picked = Vec::new();
     loop {
-        let mut counts = vec![0usize; components];
+        let mut counts: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
         for (edge, done) in edges.iter().zip(&hit) {
             if !*done {
                 for &component in edge.iter() {
-                    counts[component] += 1;
+                    *counts.entry(component).or_insert(0) += 1;
                 }
             }
         }
-        match (0..components).max_by_key(|&component| counts[component]) {
-            Some(component) if counts[component] > 0 => {
-                picked.push(component);
-                for (edge, done) in edges.iter().zip(hit.iter_mut()) {
-                    if edge.contains(&component) {
-                        *done = true;
-                    }
-                }
+        let Some((&component, _)) = counts.iter().max_by_key(|(_, count)| **count) else {
+            return picked;
+        };
+        picked.push(component);
+        for (edge, done) in edges.iter().zip(hit.iter_mut()) {
+            if edge.contains(&component) {
+                *done = true;
             }
-            Some(..) | None => return picked,
         }
     }
 }
@@ -830,66 +833,6 @@ fn disjoint_packing(edges: &[Vec<usize>], components: usize) -> usize {
         }
     }
     count
-}
-
-/// Branch and bound for a minimum hitting set. Every hitting set contains a
-/// component of any unhit edge, so branching on the components of one unhit edge,
-/// and forbidding each after its branch, visits every minimal candidate once; a
-/// branch whose picked count plus the packing bound cannot beat the incumbent is
-/// pruned.
-struct HittingSetSearch<'a> {
-    edges: Vec<&'a [usize]>,
-    chosen: Vec<bool>,
-    forbidden: Vec<bool>,
-    picked: Vec<usize>,
-    best: Vec<usize>,
-}
-
-impl HittingSetSearch<'_> {
-    fn branch(&mut self) {
-        let mut unhit: Vec<Vec<usize>> = Vec::new();
-        for edge in &self.edges {
-            if edge.iter().any(|&component| self.chosen[component]) {
-                continue;
-            }
-            let allowed: Vec<usize> = edge
-                .iter()
-                .copied()
-                .filter(|&component| !self.forbidden[component])
-                .collect();
-            if allowed.is_empty() {
-                return;
-            }
-            unhit.push(allowed);
-        }
-        if unhit.is_empty() {
-            if self.picked.len() < self.best.len() {
-                self.best = self.picked.clone();
-            }
-            return;
-        }
-        if self.picked.len() + disjoint_packing(&unhit, self.chosen.len()) >= self.best.len() {
-            return;
-        }
-        let mut pivot = 0;
-        for (index, edge) in unhit.iter().enumerate() {
-            if edge.len() < unhit[pivot].len() {
-                pivot = index;
-            }
-        }
-        let pivot = std::mem::take(&mut unhit[pivot]);
-        for &component in &pivot {
-            self.chosen[component] = true;
-            self.picked.push(component);
-            self.branch();
-            self.picked.pop();
-            self.chosen[component] = false;
-            self.forbidden[component] = true;
-        }
-        for &component in &pivot {
-            self.forbidden[component] = false;
-        }
-    }
 }
 
 /// A support code whose length depends only on how many of the `C` components a
@@ -1065,14 +1008,15 @@ pub struct SupportSearch<M, D> {
 /// CEGAR for a minimum-code sufficient support (P12), starting from `hypergraph`
 /// (empty, or replayed after a decomposition change).
 ///
-/// Each round solves the exact minimum hitting set, takes the cheapest size at or
-/// above it, and asks the oracle about the candidate. A certificate closes the
-/// search exactly. A refutation records the witness's perturbed set, or the
+/// Each round takes a greedy hitting set, the cheapest size at or above it, and asks
+/// the oracle about the candidate. A certificate closes the search, exactly when the
+/// candidate's code meets the lower bound from the packing count and otherwise with the
+/// gap between them. A refutation records the witness's perturbed set, or the
 /// candidate's complement when there is no witness. That edge misses the candidate
 /// while every recorded edge hits it, so each round marks a new support unsafe and
 /// the loop ends after at most `2^C` rounds, with no iteration cap. A candidate
 /// that is neither refuted nor certified ends the search unresolved: the lower
-/// bound is the candidate's code, and the upper bound is the full support's code
+/// bound is the packing bound's code, and the upper bound is the full support's code
 /// when the oracle certifies the full support.
 pub fn minimum_code_support<O, K>(
     oracle: &mut O,
@@ -1093,23 +1037,35 @@ where
     };
     let mut separations = 0;
     loop {
-        let least = hypergraph.minimum_hitting_set();
+        let (hitting, packing) = hypergraph.hitting_set_bounds();
         let (size, bits) =
-            code.cheapest_size(components, least.len()).map_err(SupportSearchError::Code)?;
-        let candidate = least.extended_to(size);
+            code.cheapest_size(components, hitting.len()).map_err(SupportSearchError::Code)?;
+        let (_, lower_bits) =
+            code.cheapest_size(components, packing).map_err(SupportSearchError::Code)?;
+        let candidate = hitting.extended_to(size);
         let evidence = oracle
             .separate(&candidate)
             .map_err(SupportSearchError::Oracle)?;
         separations += 1;
         if evidence.certifies_at_most(tolerance) {
             // Integer code lengths convert to f64 exactly below 2^53 bits.
-            let minimum_code = EvidenceStatus::exact(
-                bits as f64,
-                0.0,
-                ExactBasis::ClosedSearch,
-                Some(candidate.clone()),
-                domain,
-            )?;
+            let minimum_code = if lower_bits == bits {
+                EvidenceStatus::exact(
+                    bits as f64,
+                    0.0,
+                    ExactBasis::ClosedSearch,
+                    Some(candidate.clone()),
+                    domain,
+                )?
+            } else {
+                EvidenceStatus::unresolved(
+                    lower_bits as f64,
+                    bits as f64,
+                    Extremum::Infimum,
+                    Some(candidate.clone()),
+                    domain,
+                )?
+            };
             return Ok(SupportSearch {
                 code: minimum_code,
                 certified: Some(SupportEvidence {
@@ -1140,7 +1096,7 @@ where
                 f64::INFINITY
             };
             let minimum_code = EvidenceStatus::unresolved(
-                bits as f64,
+                lower_bits as f64,
                 upper,
                 Extremum::Infimum,
                 certified.as_ref().map(|found| found.support.clone()),
@@ -1787,7 +1743,7 @@ mod tests {
         BoxDivergence, BoxEnclosure, BoxFamily, BoxOracleError, BoxSeparationOracle,
         CardinalityCode, ComponentSet, ConflictReplay, EvidenceStatus, EvidenceStatusError,
         ExactBasis, Extremum, FailureEdge, FailureHypergraph, HypergraphError, InputSupport,
-        MaskBox, MaskSide, SeparationOracle, SupportSearchError, greedy_hitting_set,
+        MaskBox, MaskSide, SeparationOracle, SupportSearchError,
         minimum_code_support, replay_conflicts, sufficient_union,
     };
     use std::cmp::Ordering;
@@ -2107,37 +2063,19 @@ mod tests {
     }
 
     #[test]
-    fn minimum_hitting_set_is_exact_where_greedy_is_not() {
-        // A hub joined to a, b, c, each with a pendant: {a, b, c} hits every edge,
-        // greedy takes the hub first and needs four.
-        let edges = [[0, 1], [0, 2], [0, 3], [1, 4], [2, 5], [3, 6]];
+    fn the_greedy_set_hits_every_edge_and_the_packing_bound_never_exceeds_the_minimum() {
+        // A hub joined to a, b, c, each with a pendant: {a, b, c} is the minimum, greedy takes the
+        // hub first and needs four, and the packing bound (three disjoint pendant edges) is three:
+        // the pair brackets the minimum and states the gap.
+        let edges: [&[usize]; 6] = [&[0, 1], &[0, 2], &[0, 3], &[1, 4], &[2, 5], &[3, 6]];
         let mut hypergraph = FailureHypergraph::<()>::new(7);
-        for edge in &edges {
-            assert!(
-                hypergraph
-                    .insert(FailureEdge {
-                        perturbed: set(7, edge),
-                        witness: None,
-                    })
-                    .expect("a nonempty edge")
-            );
+        for edge in edges {
+            hypergraph.insert(FailureEdge { perturbed: set(7, edge), witness: None }).expect("a nonempty edge");
         }
-        let exhaustive_minimum = (0u32..1 << 7)
-            .filter(|subset| edges.iter().all(|edge| edge.iter().any(|&c| subset >> c & 1 == 1)))
-            .map(u32::count_ones)
-            .min()
-            .expect("the full set hits every edge");
-        let solved = hypergraph.minimum_hitting_set();
-        assert_eq!(solved.len() as u32, exhaustive_minimum);
-        assert_eq!(solved.members(), &[1, 2, 3]);
-        assert!(hypergraph.edges().iter().all(|edge| edge.perturbed.intersects(&solved)));
-        // Positive control: the greedy incumbent the search starts from is not optimal.
-        let members: Vec<&[usize]> = hypergraph.edges().iter().map(|edge| edge.perturbed.members()).collect();
-        assert_eq!(greedy_hitting_set(&members, 7).len(), 4);
-    }
-
-    #[test]
-    fn minimum_hitting_set_equals_the_exhaustive_minimum_on_deterministic_hypergraphs() {
+        let (greedy, packing) = hypergraph.hitting_set_bounds();
+        assert_eq!(greedy.len(), 4);
+        assert_eq!(packing, 3);
+        assert!(hypergraph.edges().iter().all(|edge| edge.perturbed.intersects(&greedy)));
         for components in 3..=8usize {
             for seed in 0..12u64 {
                 let full = (1u64 << components) - 1;
@@ -2151,20 +2089,17 @@ mod tests {
                     bitmasks.push(bits);
                     let members: Vec<usize> = (0..components).filter(|c| bits >> c & 1 == 1).collect();
                     hypergraph
-                        .insert(FailureEdge {
-                            perturbed: set(components, &members),
-                            witness: None,
-                        })
+                        .insert(FailureEdge { perturbed: set(components, &members), witness: None })
                         .expect("a nonempty edge");
                 }
                 let exhaustive_minimum = (0..=full)
                     .filter(|subset| bitmasks.iter().all(|edge| edge & subset != 0))
                     .map(u64::count_ones)
                     .min()
-                    .expect("the full set hits every edge");
-                let solved = hypergraph.minimum_hitting_set();
-                assert_eq!(solved.len() as u32, exhaustive_minimum, "components {components} seed {seed}");
-                assert!(bitmasks.iter().all(|edge| solved.members().iter().any(|&c| edge >> c & 1 == 1)));
+                    .expect("the full set hits every edge") as usize;
+                let (greedy, packing) = hypergraph.hitting_set_bounds();
+                assert!(bitmasks.iter().all(|edge| greedy.members().iter().any(|&c| edge >> c & 1 == 1)));
+                assert!(packing <= exhaustive_minimum && exhaustive_minimum <= greedy.len(), "components {components} seed {seed}");
             }
         }
     }
@@ -2180,9 +2115,8 @@ mod tests {
             .expect("the endpoint search closes");
         let certified = found.certified.expect("a certified support");
         assert_eq!(certified.support.members(), &[0, 1]);
-        assert!(matches!(found.code, EvidenceStatus::Exact { basis: ExactBasis::ClosedSearch, .. }));
         assert_eq!(found.code.upper_bound(), Some(2.0));
-        assert_eq!(found.code.lower_bound(), Some(2.0));
+        assert!(found.code.lower_bound().is_some_and(|lower| lower <= 2.0));
         assert!(found.undecided.is_none());
         assert!(found.hypergraph.edges().iter().all(|edge| !edge.perturbed.is_subset_of(&set(3, &[2]))));
 
@@ -2191,8 +2125,8 @@ mod tests {
             .expect("the interior search closes");
         let certified = found.certified.expect("a certified support");
         assert_eq!(certified.support.members(), &[0, 1, 2]);
-        assert!(matches!(found.code, EvidenceStatus::Exact { basis: ExactBasis::ClosedSearch, .. }));
         assert_eq!(found.code.upper_bound(), Some(3.0));
+        assert!(found.code.lower_bound().is_some_and(|lower| lower <= 3.0));
         assert!(found.hypergraph.edges().iter().any(|edge| edge.perturbed.members() == [2]));
     }
 
@@ -2676,11 +2610,15 @@ mod tests {
                 .expect("the box search closes");
             let by_grid = minimum_code_support(&mut grid, &SizeCode, tolerance, FailureHypergraph::new(OR_COMPONENTS))
                 .expect("the exhaustive search closes");
+            // Both oracles decide every support alike, so both searches certify the same code; each
+            // brackets the minimum from below by its own recorded failures.
             assert_eq!(
-                (by_boxes.code.lower_bound(), by_boxes.code.upper_bound()),
-                (by_grid.code.lower_bound(), by_grid.code.upper_bound()),
-                "tolerance {tolerance}: both searches must find one minimum code"
+                by_boxes.code.upper_bound(),
+                by_grid.code.upper_bound(),
+                "tolerance {tolerance}: both searches must certify one code"
             );
+            assert!(by_boxes.code.lower_bound() <= by_boxes.code.upper_bound(), "tolerance {tolerance}");
+            assert!(by_grid.code.lower_bound() <= by_grid.code.upper_bound(), "tolerance {tolerance}");
             let queried: Vec<ComponentSet> = boxes.queried.iter().chain(grid.queried.iter()).cloned().collect();
             for support in &queried {
                 let from_boxes = boxes.oracle.separate(support).expect("box separation");
