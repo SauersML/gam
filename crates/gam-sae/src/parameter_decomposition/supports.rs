@@ -901,23 +901,20 @@ pub trait CardinalityCode {
 
     /// The length in bits of a support keeping `size` of `components` components.
     fn support_bits(&self, components: usize, size: usize) -> Result<u64, Self::Error>;
-}
 
-/// The cheapest support size at or above `least`, the smallest on ties, and its
-/// length in bits.
-fn cheapest_size<K: CardinalityCode + ?Sized>(
-    code: &K,
-    components: usize,
-    least: usize,
-) -> Result<(usize, u64), K::Error> {
-    let mut best = (least, code.support_bits(components, least)?);
-    for size in least + 1..=components {
-        let bits = code.support_bits(components, size)?;
-        if bits < best.1 {
-            best = (size, bits);
+    /// The cheapest support size at or above `least`, the smallest on ties, and its
+    /// length in bits. The default scans every size; a code whose shape bounds the
+    /// scan overrides it.
+    fn cheapest_size(&self, components: usize, least: usize) -> Result<(usize, u64), Self::Error> {
+        let mut best = (least, self.support_bits(components, least)?);
+        for size in least + 1..=components {
+            let bits = self.support_bits(components, size)?;
+            if bits < best.1 {
+                best = (size, bits);
+            }
         }
+        Ok(best)
     }
-    Ok(best)
 }
 
 /// The declared separation oracle of a fixed decomposition, at one input or over a
@@ -1098,7 +1095,7 @@ where
     loop {
         let least = hypergraph.minimum_hitting_set();
         let (size, bits) =
-            cheapest_size(code, components, least.len()).map_err(SupportSearchError::Code)?;
+            code.cheapest_size(components, least.len()).map_err(SupportSearchError::Code)?;
         let candidate = least.extended_to(size);
         let evidence = oracle
             .separate(&candidate)

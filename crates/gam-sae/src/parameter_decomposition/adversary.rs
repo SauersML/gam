@@ -742,20 +742,77 @@ impl<'a, O: SeparationObjective + ?Sized> ZonotopeSeparationOracle<'a, O> {
     }
 
     /// The last refuting witness with the kept set reset to all-on, else the center of the free
-    /// box.
+    /// box. A free control the witness left at all-on (it was kept when that witness was found)
+    /// starts at its center too: a distance objective is stationary at all-on in every control
+    /// (P16), so the ascent would never move a control started there, and a support that frees
+    /// it would be reported undecided without its only live direction ever being tried.
     fn start_mask(&self, kept: &[bool]) -> Result<Vec<f64>, AdversaryError> {
         (0..kept.len())
             .map(|control| {
                 if kept[control] {
                     return Ok(1.0);
                 }
-                if let Some(witness) = &self.last_witness {
+                if let Some(witness) = &self.last_witness
+                    && witness[control] != 1.0
+                {
                     return Ok(witness[control]);
                 }
                 let (lower, upper) = self.interval(control)?;
                 Ok(lower + 0.5 * (upper - lower))
             })
             .collect()
+    }
+
+    /// The shortest leading run of a refuting witness's changed controls that refutes epsilon on
+    /// its own, every other control restored to all-on.
+    ///
+    /// P12's hitting set is only as sharp as its edges. A Frank-Wolfe witness is a convex
+    /// combination of endpoint masks and moves nearly every free control, so its edge
+    /// `A(m)` is nearly the candidate's complement: it says the support must grow, not which
+    /// control it must take. Every refuting mask is a valid edge and a shorter one is a
+    /// strictly stronger constraint. The changed controls are ordered by the first-order
+    /// value their deletion carries at the witness, `g . v_c (1 - m_c)` with `g = dF/dq`, and
+    /// the run length is bisected on native evaluations between all-on (which does not
+    /// refute, or the search would have stopped at `AllOnViolation`) and the whole witness
+    /// (which does). Only certified refutations move the upper end, so the returned mask
+    /// refutes epsilon whether or not `F` is monotone along the order.
+    fn shortest_refuting_run(&self, witness: &LowerWitness) -> Result<(Vec<f64>, f64, f64), AdversaryError> {
+        let mut evaluations = 0;
+        let jet = evaluate_checked(self.objective, &witness.mask, &mut evaluations)?;
+        let mut changed: Vec<(usize, f64)> = witness
+            .mask
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| **value != 1.0)
+            .map(|(control, &value)| {
+                let pairing: f64 = self
+                    .system
+                    .generator(control)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|part| part.vector.dot(&jet.moment_gradient.blocks[part.block]))
+                    .sum();
+                (control, pairing * (1.0 - value))
+            })
+            .collect();
+        changed.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let mut best = (witness.mask.clone(), witness.value, witness.value_roundoff);
+        let (mut low, mut high) = (0, changed.len());
+        while high - low > 1 {
+            let middle = low + (high - low) / 2;
+            let mut mask = vec![1.0; witness.mask.len()];
+            for &(control, _) in &changed[..middle] {
+                mask[control] = witness.mask[control];
+            }
+            let trial = evaluate_checked(self.objective, &mask, &mut evaluations)?;
+            if certified_lower(trial.value, trial.value_roundoff) > self.epsilon {
+                high = middle;
+                best = (mask, trial.value, trial.value_roundoff);
+            } else {
+                low = middle;
+            }
+        }
+        Ok(best)
     }
 
     /// A native evaluation at one admissible mask, classified against epsilon.
@@ -877,6 +934,9 @@ impl<O: SeparationObjective + ?Sized> SeparationOracle for ZonotopeSeparationOra
         let report = separate(self.system, self.domain, &kept, self.epsilon, &start, self.objective)?;
         if report.status.refutes_at_most(self.epsilon) {
             self.last_witness = Some(report.witness.mask.clone());
+            let (mask, value, roundoff) = self.shortest_refuting_run(&report.witness)?;
+            return OracleStatus::counterexample(value, roundoff, self.epsilon, mask)
+                .map_err(AdversaryError::Evidence);
         }
         over_oracle_region(report.status, region)
     }
@@ -1595,6 +1655,58 @@ mod tests {
                 .iter()
                 .all(|edge| edge.perturbed.members().contains(&2))
         );
+    }
+
+    /// `F(q) = q_1^2 + q_5^2` over eight unit generators: only controls 1 and 5 move the output.
+    struct TwoLiveControls;
+
+    impl SeparationObjective for TwoLiveControls {
+        fn evaluate(&self, mask: &[f64]) -> Result<ObjectiveJet, String> {
+            let (a, b) = (1.0 - mask[1], 1.0 - mask[5]);
+            let value = a * a + b * b;
+            let mut gradient = Array1::zeros(8);
+            gradient[1] = 2.0 * a;
+            gradient[5] = 2.0 * b;
+            // Each deletion rounds once, each square and the sum once more.
+            Ok(ObjectiveJet {
+                value,
+                value_roundoff: accumulation_band(4, value),
+                moment_gradient: MomentVector { blocks: vec![gradient] },
+                gradient_roundoff: accumulation_band(2, 2.0 * (a.abs() + b.abs())),
+            })
+        }
+
+        fn smoothness(&self) -> Option<SmoothnessCertificate> {
+            None
+        }
+    }
+
+    #[test]
+    fn refutations_are_shortened_to_the_controls_that_carry_them_2951() {
+        let system = system_from_rows(&Array2::<f64>::eye(8));
+        let domain = unit_domain(8);
+        let epsilon = 0.25;
+        let mut oracle =
+            ZonotopeSeparationOracle::new(&system, &domain, epsilon, &TwoLiveControls).expect("oracle");
+        let search = minimum_code_support(&mut oracle, &SizeCode, epsilon, FailureHypergraph::new(8))
+            .expect("support search");
+        // An interior ascent moves all eight controls, so an unshortened edge is the candidate's
+        // whole complement and the hitting set would grow by an arbitrary control each round. The
+        // shortened edges name live controls only, so the search never takes a dead one.
+        for edge in search.hypergraph.edges() {
+            assert!(
+                edge.perturbed.members().iter().all(|control| [1, 5].contains(control)),
+                "edge {:?}",
+                edge.perturbed.members()
+            );
+        }
+        let final_candidate = search
+            .undecided
+            .as_ref()
+            .map(|found| found.support.members().to_vec())
+            .or_else(|| search.certified.as_ref().map(|found| found.support.members().to_vec()))
+            .expect("a candidate");
+        assert_eq!(final_candidate, vec![1, 5]);
     }
 
     #[test]

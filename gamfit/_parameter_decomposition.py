@@ -12,13 +12,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
 from ._binding import rust_module
 
-__all__ = ["ParameterDecompositionReport", "run_parameter_decomposition"]
+__all__ = ["ParameterDecompositionReport", "robust_support", "run_parameter_decomposition"]
 
 
 @dataclass(frozen=True)
@@ -52,3 +52,34 @@ def run_parameter_decomposition(
         {name: np.ascontiguousarray(values, dtype=np.float64) for name, values in tensors.items()},
     )
     return ParameterDecompositionReport(report=json.loads(report_json), arrays=dict(arrays))
+
+
+def robust_support(
+    objective: Callable[[np.ndarray], tuple[float, float, np.ndarray, float]],
+    generators: Any,
+    lower: Any,
+    upper: Any,
+    epsilon: float,
+    gradient_lipschitz: float | None = None,
+) -> dict[str, Any]:
+    """The minimum-code robust support at one input, by counterexample-guided search.
+
+    ``objective(mask)`` executes the teacher at a float64 mask of length ``C`` and returns
+    ``(divergence, its roundoff bound, d divergence / d moment (length K), its roundoff
+    bound)``. ``generators`` is ``C x K`` (the moment rows ``v_c``), or ``None`` for literal pieces whose
+    moment is the deletion vector itself (``K = C``); ``lower``/``upper``
+    declare each control's mask interval (containing 1); ``epsilon`` is the declared
+    tolerance. The search, the separation ascent over the moment zonotope and every
+    certificate are Rust's (``supports::minimum_code_support`` over
+    ``adversary::ZonotopeSeparationOracle``).
+    """
+    return dict(
+        rust_module().parameter_decomposition_robust_support(
+            objective,
+            None if generators is None else np.ascontiguousarray(generators, dtype=np.float64),
+            np.ascontiguousarray(lower, dtype=np.float64),
+            np.ascontiguousarray(upper, dtype=np.float64),
+            float(epsilon),
+            gradient_lipschitz,
+        )
+    )

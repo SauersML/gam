@@ -897,6 +897,29 @@ impl CardinalityCode for EnumerativeSubsetCode {
     fn support_bits(&self, components: usize, size: usize) -> Result<u64, CodecError> {
         subset_code_len_bits(components, size)
     }
+
+    /// `L(k) = L_int(k + 1) + w(C(n, k))` with `L_int` nondecreasing and the index width `w`
+    /// of the binomial unimodal in `k` (nondecreasing up to `n / 2`, nonincreasing after). So:
+    /// * on `least <= k <= n / 2` both terms are at least their values at `least`, and `least`
+    ///   is cheapest there (smallest on ties);
+    /// * above `max(least, n / 2)`, with `j = n - k`, `L(k) >= L_int(max(least, n / 2 + 1) + 1)
+    ///   + w(C(n, j))` and `w(C(n, j))` is nondecreasing in `j`, so walking `j` up from 0 can stop
+    ///   once that lower bound exceeds the best length.
+    /// The scan is then a short run near the full support instead of all `n` sizes, each an exact
+    /// big-integer binomial.
+    fn cheapest_size(&self, components: usize, least: usize) -> Result<(usize, u64), CodecError> {
+        let mut best = (subset_code_len_bits(components, least)?, least);
+        let floor = least.max(components / 2);
+        let tail_prefix = prefix_integer_len_bits(least.max(components / 2 + 1) as u64 + 1)?;
+        for dropped in 0..components - floor {
+            let size = components - dropped;
+            if tail_prefix + binomial(components as u64, dropped as u64).index_width() > best.0 {
+                break;
+            }
+            best = best.min((subset_code_len_bits(components, size)?, size));
+        }
+        Ok((best.1, best.0))
+    }
 }
 
 /// Writes the declarations an address message is read against, once per experiment unit:
@@ -1178,6 +1201,26 @@ mod tests {
             }
             let natural = natural_from_u128(left);
             assert_eq!(natural.bit_len(), u64::from(128 - left.leading_zeros()));
+        }
+    }
+
+    #[test]
+    fn the_bounded_cheapest_size_matches_the_full_scan_2951() {
+        struct Scan;
+        impl CardinalityCode for Scan {
+            type Error = CodecError;
+            fn support_bits(&self, components: usize, size: usize) -> Result<u64, CodecError> {
+                subset_code_len_bits(components, size)
+            }
+        }
+        for components in 0..160 {
+            for least in 0..=components {
+                assert_eq!(
+                    EnumerativeSubsetCode.cheapest_size(components, least),
+                    Scan.cheapest_size(components, least),
+                    "C = {components}, least = {least}"
+                );
+            }
         }
     }
 
