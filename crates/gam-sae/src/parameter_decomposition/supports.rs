@@ -777,7 +777,7 @@ impl<M> FailureHypergraph<M> {
             .iter()
             .map(|edge| edge.perturbed.members())
             .collect();
-        let mut members = greedy_hitting_set(&edges);
+        let mut members = greedy_hitting_set(&edges, self.components);
         members.sort_unstable();
         let owned: Vec<Vec<usize>> = edges.iter().map(|edge| edge.to_vec()).collect();
         (
@@ -792,34 +792,45 @@ impl<M> FailureHypergraph<M> {
 
 /// A hitting set built by repeatedly taking the component that hits the most unhit
 /// edges, the largest index on ties. Each component's count of unhit edges falls as
-/// its edges are hit, and a max-heap holds the counts with stale entries skipped on
-/// pop, so the whole set costs the total edge length times a logarithm, not a recount
-/// of every edge per pick.
-fn greedy_hitting_set(edges: &[&[usize]]) -> Vec<usize> {
-    let mut members_of: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
-    for (index, edge) in edges.iter().enumerate() {
+/// its edges are hit, through a compressed index from components to their edges, and a
+/// max-heap holds the counts with stale entries skipped on pop: the whole set costs the
+/// component count plus the total edge length times a logarithm.
+fn greedy_hitting_set(edges: &[&[usize]], components: usize) -> Vec<usize> {
+    let mut count = vec![0usize; components];
+    for edge in edges {
         for &component in edge.iter() {
-            members_of.entry(component).or_default().push(index);
+            count[component] += 1;
         }
     }
-    let mut count: std::collections::HashMap<usize, usize> =
-        members_of.iter().map(|(&component, list)| (component, list.len())).collect();
-    let mut heap: std::collections::BinaryHeap<(usize, usize)> =
-        count.iter().map(|(&component, &unhit)| (unhit, component)).collect();
+    let mut start = vec![0usize; components + 1];
+    for component in 0..components {
+        start[component + 1] = start[component] + count[component];
+    }
+    let mut fill = start.clone();
+    let mut edges_of = vec![0usize; start[components]];
+    for (index, edge) in edges.iter().enumerate() {
+        for &component in edge.iter() {
+            edges_of[fill[component]] = index;
+            fill[component] += 1;
+        }
+    }
+    let mut heap: std::collections::BinaryHeap<(usize, usize)> = (0..components)
+        .filter(|&component| count[component] > 0)
+        .map(|component| (count[component], component))
+        .collect();
     let mut hit = vec![false; edges.len()];
     let mut picked = Vec::new();
     while let Some((unhit, component)) = heap.pop() {
-        if unhit == 0 || count.get(&component) != Some(&unhit) {
+        if unhit == 0 || count[component] != unhit {
             continue;
         }
         picked.push(component);
-        for &index in &members_of[&component] {
+        for &index in &edges_of[start[component]..start[component + 1]] {
             if !std::mem::replace(&mut hit[index], true) {
                 for &member in edges[index] {
-                    let left = count.get_mut(&member).expect("every member is counted");
-                    *left -= 1;
-                    if member != component && *left > 0 {
-                        heap.push((*left, member));
+                    count[member] -= 1;
+                    if member != component && count[member] > 0 {
+                        heap.push((count[member], member));
                     }
                 }
             }
