@@ -170,6 +170,21 @@ impl GaussHermite {
         Ok(rule)
     }
 
+    /// The Lebesgue constant of the tensor-product Lagrange interpolant over
+    /// `axes` axes of this rule (gam#4585).
+    ///
+    /// The tensor basis is `Π_k L_{i_k}(x_k)`, so its Lebesgue function is the
+    /// product of the per-axis ones and its maximum is `Λ^axes`. The forward
+    /// kernel interpolates `ln r` over every latent axis at once, so a filter
+    /// over `K` atoms amplifies nodal roundoff by `Λ^K`, not `Λ`: at order 33
+    /// the per-axis maximum near the hull edge is about 8e9, and on a two-atom
+    /// grid rounding-level nodal values came back from the interpolant as a
+    /// log density of +2.0e3, which the filter then compounded into grid axes
+    /// of 1e80 within eighteen nodes. No axes means nothing is interpolated.
+    pub(crate) fn tensor_lebesgue_constant(&self, axes: usize) -> f64 {
+        (0..axes).fold(1.0, |constant, _| constant * self.lebesgue_constant)
+    }
+
     /// `max_x Σ_i |L_i(x)|` over the node hull, sampled densely between
     /// consecutive nodes (the Lebesgue function of a Lagrange basis has one
     /// local maximum per interior interval, so a fine sample per interval

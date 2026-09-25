@@ -2512,22 +2512,30 @@ fn reference_tables(
     })
 }
 
-/// Whether a fit at Gauss-Hermite `order` can be certified: its certificate
-/// reads the next rung, `2·order − 1`, and that rule's Lagrange interpolant must
-/// amplify roundoff over the longest subject by no more than the certificate's
+/// Whether a fit at Gauss-Hermite `order` over `axes` interpolated latent axes
+/// can be certified: its certificate reads the next rung, `2·order − 1`, and
+/// that rule's tensor-product Lagrange interpolant, whose Lebesgue constant is
+/// the per-axis one to the power `axes`
+/// ([`GaussHermite::tensor_lebesgue_constant`], gam#4585), must amplify
+/// roundoff over the longest subject by no more than the certificate's
 /// tolerance.
-fn certifiable(order: usize, max_subject_nodes: usize, tolerance: f64) -> bool {
+pub(crate) fn certifiable(order: usize, axes: usize, max_subject_nodes: usize, tolerance: f64) -> bool {
     GaussHermite::new(2 * order - 1).is_ok_and(|rule| {
-        rule.lebesgue_constant * f64::EPSILON * max_subject_nodes as f64 <= tolerance
+        rule.tensor_lebesgue_constant(axes) * f64::EPSILON * max_subject_nodes as f64 <= tolerance
     })
 }
 
 /// The Gauss-Hermite order a decision the grid cannot resolve is raised to,
 /// `2·order − 1`, when that rung is itself [`certifiable`]; `None` at the
 /// ladder's top certifiable rung.
-fn next_certifiable_order(order: usize, max_subject_nodes: usize, tolerance: f64) -> Option<usize> {
+fn next_certifiable_order(
+    order: usize,
+    axes: usize,
+    max_subject_nodes: usize,
+    tolerance: f64,
+) -> Option<usize> {
     let next_order = 2 * order - 1;
-    certifiable(next_order, max_subject_nodes, tolerance).then_some(next_order)
+    certifiable(next_order, axes, max_subject_nodes, tolerance).then_some(next_order)
 }
 
 /// The certified fit at ONE rank: the Gauss-Hermite order and the time mesh
@@ -2763,12 +2771,12 @@ pub(crate) fn fit_at_rank(
         } else {
             let rule = GaussHermite::new(next_order)?;
             if !built.family.held_rates.iter().all(|r| *r == Some(0.0))
-                && !certifiable(order, max_nodes, spec.quadrature_tolerance)
+                && !certifiable(order, atoms, max_nodes, spec.quadrature_tolerance)
             {
                 return Err(EventHistoryError::NumericalFailure {
                     reason: format!(
-                        "the Gauss-Hermite certificate cannot be checked at order {next_order}: the Lagrange interpolant's Lebesgue constant {:.3e} amplifies roundoff above the tolerance {} over {max_nodes} nodes; the latent integral at order {order} is uncertified",
-                        rule.lebesgue_constant, spec.quadrature_tolerance
+                        "the Gauss-Hermite certificate cannot be checked at order {next_order}: the Lagrange interpolant's Lebesgue constant {:.3e} over {atoms} axes amplifies roundoff above the tolerance {} over {max_nodes} nodes; the latent integral at order {order} is uncertified",
+                        rule.tensor_lebesgue_constant(atoms), spec.quadrature_tolerance
                     ),
                 });
             }
@@ -3212,7 +3220,7 @@ fn added_factor_curvature_pair(
     let order = probe.gh.order;
     let next_order = 2 * order - 1;
     let interpolates = !probe.held_rates.iter().all(|r| *r == Some(0.0));
-    if interpolates && !certifiable(order, probe.nodes.max_subject_nodes(), tolerance) {
+    if interpolates && !certifiable(order, probe.atoms, probe.nodes.max_subject_nodes(), tolerance) {
         return Ok(None);
     }
     let coarse = loading_curvature(probe, states)?;
@@ -4027,9 +4035,14 @@ fn raise_incumbent(
     let refinement = fit.quadrature.mesh_refinement;
     let from_refinement = match rung {
         Rung::GaussHermite => {
-            let Some(next_order) =
-                next_certifiable_order(order, fit.nodes.max_subject_nodes(), rank_spec.quadrature_tolerance)
-            else {
+            // The decision this rung resolves reads the incumbent's axes plus the
+            // proposed factor's, so the rung must be certifiable over both.
+            let Some(next_order) = next_certifiable_order(
+                order,
+                rank + 1,
+                fit.nodes.max_subject_nodes(),
+                rank_spec.quadrature_tolerance,
+            ) else {
                 log::debug!(
                     "[event-history] rank {rank} → {}: the decision is unresolved at Gauss-Hermite order {order} ({reason}), the ladder's top certifiable rung: the path stops at the certified rank-{rank} model with growth unresolved",
                     rank + 1

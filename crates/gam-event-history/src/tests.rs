@@ -72,9 +72,8 @@ fn rank_stop_explanation(
             // `2·(2·order − 1) − 1`, keeps the interpolant's roundoff within the
             // tolerance over the longest subject.
             let raised = 2 * certified_order - 1;
-            let checkable = GaussHermite::new(2 * raised - 1).is_ok_and(|rule| {
-                rule.lebesgue_constant * f64::EPSILON * max_nodes as f64 <= tolerance
-            });
+            // Over the incumbent's axes and the proposed factor's (gam#4585).
+            let checkable = crate::family::certifiable(raised, last.rank + 1, max_nodes, tolerance);
             if checkable {
                 return Err(format!(
                     "order {raised} is certifiable over {max_nodes} nodes, so growth did not stop at the top rung"
@@ -126,8 +125,10 @@ fn assert_rank_stop_explained(fit: &EventHistoryFit, spec: &EventHistorySpec) ->
 #[test]
 fn a_rank_stop_with_its_verdict_dropped_is_unexplained() {
     let tolerance = EventHistorySpec::new(Vec::new()).quadrature_tolerance;
+    // Rank 0: the rank-1 proposal's curvature is read over one latent axis, the axis
+    // count at which order 11 is the top certifiable rung at 449 nodes (gam#4585).
     let step = RankStep {
-        rank: 1,
+        rank: 0,
         score_eigenvalue: 2.9636,
         standardised_gain: 0.0,
         proposed_rate: 1.0,

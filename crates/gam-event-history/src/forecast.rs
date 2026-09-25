@@ -751,7 +751,9 @@ impl KilledProcess for WindowIntegrand<'_> {
     /// conditioned in place and a rank-zero window has no grid: nothing is
     /// interpolated, and `Λ` is one.
     fn roundoff(&self) -> f64 {
-        let amplification = if self.interpolates { self.gh.lebesgue_constant } else { 1.0 };
+        // The kernel interpolates over every latent axis at once (gam#4585).
+        let amplification =
+            if self.interpolates { self.gh.tensor_lebesgue_constant(self.model.atoms) } else { 1.0 };
         f64::EPSILON * amplification * (2 * self.gl_nodes.len() + 1) as f64
     }
 }

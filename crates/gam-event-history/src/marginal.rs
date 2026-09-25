@@ -137,8 +137,8 @@ pub(crate) enum Evaluation {
 /// The product is the same one, over a rule no coarser and a count no larger,
 /// so a chain fitted at an admitted rung carries a noise this function reports
 /// under that tolerance.
-fn interpolation_noise_relative(gh: &GaussHermite, operators: usize) -> f64 {
-    gh.lebesgue_constant * f64::EPSILON * operators as f64
+fn interpolation_noise_relative(gh: &GaussHermite, axes: usize, operators: usize) -> f64 {
+    gh.tensor_lebesgue_constant(axes) * f64::EPSILON * operators as f64
 }
 
 fn numerical(reason: impl Into<String>) -> EventHistoryError {
@@ -1704,7 +1704,7 @@ fn smoothed_marginal<S: JetField>(
             log_total.value()
         )));
     }
-    let noise = interpolation_noise_relative(gh, operators);
+    let noise = interpolation_noise_relative(gh, grid.dimension(), operators);
     let resolved_above = log_peak + (noise / tolerance).ln();
     // Every share is at most one, since `log_total` dominates each term, so
     // the sum needs no shift and cannot overflow.
@@ -2375,7 +2375,7 @@ mod tests {
         let size = grid.size();
         let operators = 3;
         let tolerance = default_quadrature_tolerance();
-        let bar = interpolation_noise_relative(&gh, operators) / tolerance;
+        let bar = interpolation_noise_relative(&gh, grid.dimension(), operators) / tolerance;
         assert!(
             bar > 0.0 && bar < 1.0,
             "the resolution bar {bar:e} must sit between the grid's noise and its peak"

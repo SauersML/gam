@@ -685,12 +685,20 @@ mod tests {
         let rates = vec![Some(0.5), Some(0.7)];
         let (base, _) = recurrent_family(0.1, rates.clone(), 9);
         let nodes = base.nodes.max_subject_nodes();
+        let axes = base.atoms;
         let mut top = 9;
-        while let Some(next) = next_certifiable_order(top, nodes, tolerance) {
+        while let Some(next) = next_certifiable_order(top, axes, nodes, tolerance) {
             top = next;
         }
-        assert!(top > 9, "a certifiable rung must remain above order 9 over {nodes} nodes");
-        assert!(certifiable(top, nodes, tolerance) && !certifiable(2 * top - 1, nodes, tolerance));
+        // Over two interpolated axes the tensor Lebesgue constant is the per-axis one
+        // squared (gam#4585): order 9's check at 17 amplifies by 6.5e7 and order 17's
+        // check at 33 by 6.9e19, so at this node count the top rung is 9 itself. The
+        // one-axis constant this replaced put it at 33, where the filter's own grid
+        // diverged.
+        assert!(
+            certifiable(top, axes, nodes, tolerance)
+                && !certifiable(2 * top - 1, axes, nodes, tolerance)
+        );
         let (family, states) = recurrent_family(0.1, rates.clone(), top);
         let pair = added_factor_curvature_pair(&family, &states, tolerance)
             .unwrap()
@@ -712,9 +720,9 @@ mod tests {
     #[test]
     fn at_449_nodes_order_11_is_the_top_certifiable_rung() {
         let tolerance = EventHistorySpec::new(Vec::new()).quadrature_tolerance;
-        assert!(certifiable(11, 449, tolerance));
-        assert!(!certifiable(21, 449, tolerance));
-        assert_eq!(next_certifiable_order(11, 449, tolerance), None);
+        assert!(certifiable(11, 1, 449, tolerance));
+        assert!(!certifiable(21, 1, 449, tolerance));
+        assert_eq!(next_certifiable_order(11, 1, 449, tolerance), None);
     }
 
     /// The start shift is the one-unit bar's numerator: each term against its
