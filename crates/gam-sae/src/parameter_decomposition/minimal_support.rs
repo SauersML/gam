@@ -24,7 +24,13 @@
 //!    predicted increase `ĉ_tc` of removing each kept piece `c` at `t`;
 //! 2. at every position, the kept pieces are ordered by increasing `ĉ_tc` (ties to the
 //!    lower index) and the first `r_t` of them are proposed for removal, where `r_t` is
-//!    the position's trust radius (a count of pieces, starting at one);
+//!    the position's trust radius (a count of pieces, starting at one). Under the mean
+//!    form one budget is shared and its exact slack `P·ε − Σ_t KL_t` is known, so all
+//!    kept pieces are ordered together and the proposal is the longest prefix whose
+//!    predicted increase, calibrated by the ratio of exact to predicted increase on the
+//!    latest evaluated proposal, stays below the slack (at least the cheapest piece).
+//!    The raw prediction underestimates the joint effect of many removals; the ratio is
+//!    measured, not declared;
 //! 3. the executor evaluates the proposal exactly. A position's divergence depends only
 //!    on removals at that position and at earlier positions of its own sequence (causal
 //!    attention; independent examples are sequences of length one), a structure the
@@ -34,7 +40,7 @@
 //!    shared, so a violation instead drops the costliest half of all proposed removals,
 //!    wherever they are. Every halving shrinks the
 //!    proposal and an empty proposal is the current, admissible supports, so this ends.
-//! 4. a position whose proposal was accepted whole doubles its radius; one whose
+//! 4. (per-position form) a position whose proposal was accepted whole doubles its radius; one whose
 //!    proposal was halved keeps the size that was accepted (at least one). The radius is
 //!    the classic trust-region update on the count: it is learned from exact
 //!    acceptances, not from the prediction's scale, which underestimates the joint
@@ -240,6 +246,40 @@ fn propose(keep: ArrayView2<'_, bool>, cost: ArrayView2<'_, f64>, radius: &[usiz
         .collect()
 }
 
+/// The mean form's proposal: the longest prefix of all kept pieces in increasing
+/// predicted cost (ties to the lower position, then piece) whose calibrated predicted
+/// increase `scale · Σ ĉ` stays below the budget's exact `slack`, and at least the
+/// cheapest piece, so the search ends only on an exact refusal.
+fn within_slack(keep: ArrayView2<'_, bool>, cost: ArrayView2<'_, f64>, slack: f64, scale: f64) -> Vec<Vec<usize>> {
+    let (positions, pieces) = keep.dim();
+    let kept = || (0..positions).flat_map(move |t| (0..pieces).map(move |c| (t, c))).filter(move |&(t, c)| keep[[t, c]]);
+    let cheapest = kept().min_by(|a, b| cost[[a.0, a.1]].total_cmp(&cost[[b.0, b.1]]).then(a.cmp(b)));
+    // A piece whose own calibrated cost exceeds the slack can join a prefix only after
+    // pieces of negative cost pay for it: only pieces that fit with every negative cost
+    // spent are candidates.
+    let negative: f64 = kept().map(|(t, c)| cost[[t, c]].min(0.0)).sum();
+    let mut candidates: Vec<(usize, usize)> = kept().filter(|&(t, c)| scale * (cost[[t, c]] + negative) < slack).collect();
+    candidates.sort_by(|a, b| cost[[a.0, a.1]].total_cmp(&cost[[b.0, b.1]]).then(a.cmp(b)));
+    let mut taken = 0;
+    let mut total = 0.0;
+    for (k, &(t, c)) in candidates.iter().enumerate() {
+        total += cost[[t, c]];
+        if scale * total < slack {
+            taken = k + 1;
+        }
+    }
+    let mut proposal = vec![Vec::new(); positions];
+    if taken == 0 {
+        if let Some((t, c)) = cheapest {
+            proposal[t].push(c);
+        }
+    }
+    for &(t, c) in &candidates[..taken] {
+        proposal[t].push(c);
+    }
+    proposal
+}
+
 /// The smallest admissible supports the round rule reaches (module docs).
 pub fn minimal_support<E: SupportExecutor>(
     executor: &mut E,
@@ -318,8 +358,17 @@ pub fn minimal_support<E: SupportExecutor>(
         Some(r) => r.into_iter().map(|v| v.max(1)).collect(),
         None => vec![1usize; positions],
     };
+    // Under the mean form: the ratio of the exact increase to the predicted one, measured
+    // on the latest exact evaluation of a proposal (module docs, step 2).
+    let mut scale = 1.0;
     loop {
-        let mut proposal = propose(keep.view(), current.removal_cost.view(), &radius);
+        let mut proposal = match fidelity {
+            Fidelity::Mean(eps) => {
+                let slack = positions as f64 * eps - current.divergence.sum();
+                within_slack(keep.view(), current.removal_cost.view(), slack, scale)
+            }
+            Fidelity::PerPosition(_) => propose(keep.view(), current.removal_cost.view(), &radius),
+        };
         let offered: Vec<usize> = proposal.iter().map(Vec::len).collect();
         let proposed: usize = proposal.iter().map(Vec::len).sum();
         if proposed == 0 {
@@ -341,6 +390,13 @@ pub fn minimal_support<E: SupportExecutor>(
                 }
             }
             let evaluation = checked(executor.evaluate(trial.view()).map_err(SupportError::Executor)?, positions, pieces)?;
+            if let Fidelity::Mean(_) = fidelity {
+                let predicted: f64 = proposal.iter().enumerate().flat_map(|(t, r)| r.iter().map(move |&c| (t, c))).map(|(t, c)| current.removal_cost[[t, c]]).sum();
+                let actual = evaluation.divergence.sum() - current.divergence.sum();
+                if predicted > 0.0 && actual > 0.0 {
+                    scale = actual / predicted;
+                }
+            }
             let violators = fidelity.violators(&evaluation.divergence);
             if violators.is_empty() {
                 break Some((trial, evaluation, count));
@@ -399,7 +455,9 @@ pub fn minimal_support<E: SupportExecutor>(
                     max_divergence: current.divergence.iter().copied().fold(0.0, f64::max),
                 });
             }
-            None if radius.iter().any(|&r| r > 1) => {
+            // Under the mean form every refused round ended on the single cheapest piece,
+            // exactly: nothing smaller is left to try.
+            None if matches!(fidelity, Fidelity::PerPosition(_)) && radius.iter().any(|&r| r > 1) => {
                 // Nothing was admissible at these sizes: shrink every radius and retry.
                 for r in &mut radius {
                     *r = (*r / 2).max(1);
@@ -559,6 +617,44 @@ mod tests {
         let removed = |k: &Array2<bool>| k.iter().filter(|x| !**x).count();
         assert!(mean.divergence.iter().sum::<f64>() / 2.0 <= 0.1);
         assert!(removed(&mean.keep) >= removed(&per.keep), "{:?} vs {:?}", mean.keep, per.keep);
+    }
+
+    /// With an exact additive prediction the mean form's first proposal is the greedy
+    /// optimum (the cheapest removals whose summed cost fits the slack), accepted at once;
+    /// the next round's single cheapest removal is refused and the search ends: three
+    /// exact evaluations in all.
+    #[test]
+    fn the_mean_proposal_is_sized_by_the_exact_slack() {
+        // Costs ½a²: .005 .02 .045 .5 | .00125 .01125 2.0 .03125; budget 2 × 0.1 = 0.2.
+        let weight = ndarray::array![[0.1, 0.2, 0.3, 1.0], [0.05, 0.15, 2.0, 0.25]];
+        let mut executor = Quadratic { weight, evaluations: 0 };
+        let result = minimal_support(&mut executor, 2, 4, Fidelity::Mean(0.1), 1, None, None).unwrap();
+        assert_eq!(result.keep.row(0).to_vec(), vec![false, false, false, true]);
+        assert_eq!(result.keep.row(1).to_vec(), vec![false, false, true, false]);
+        assert!(result.divergence.sum() / 2.0 < 0.1);
+        assert_eq!(executor.evaluations, 3);
+    }
+
+    /// A prediction that sees nothing (every cost zero) proposes every kept piece; exact
+    /// acceptance halves it back, so the mean form still ends, admissible. (Ties fall to
+    /// the lowest index, whose removal alone breaks this budget, so the fixed point it
+    /// reaches is the full support: a blind prediction may cost pieces, never fidelity.)
+    #[test]
+    fn a_blind_prediction_never_costs_the_mean_budget() {
+        struct Blind(Quadratic);
+        impl SupportExecutor for Blind {
+            fn evaluate(&mut self, keep: ArrayView2<'_, bool>) -> Result<SupportEvaluation, String> {
+                let mut e = self.0.evaluate(keep)?;
+                e.removal_cost.fill(0.0);
+                Ok(e)
+            }
+        }
+        let weight = ndarray::array![[3.0, 0.1, 0.2, 2.0, 0.05, 0.3, 0.02, 1.5], [0.4, 0.01, 1.0, 0.2, 0.03, 2.5, 0.1, 0.6]];
+        let mut executor = Blind(Quadratic { weight, evaluations: 0 });
+        let result = minimal_support(&mut executor, 2, 8, Fidelity::Mean(0.1), 1, None, None).unwrap();
+        assert!(result.divergence.sum() / 2.0 < 0.1, "{:?}", result.divergence);
+        // one round, halving 16 proposed removals down to none: the start and five trials
+        assert_eq!(executor.0.evaluations, 6);
     }
 
     /// The selection returns exactly the prefix a full sort under the same total
