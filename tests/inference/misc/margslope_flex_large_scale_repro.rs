@@ -63,6 +63,15 @@ fn fit_synthetic_beta(
     Ok((fit.fit.beta, timing))
 }
 
+/// The typed refusal a cycle-capped fit returns when its inner solve has not converged
+/// within the cap (gam#4590): SPEC 20 mints a fit only from a converged optimization, so a
+/// cap below what the inner solve needs ends in this refusal, which names the cycles run.
+fn is_inner_cycle_cap_refusal(err: &str, inner_max_cycles: usize) -> bool {
+    err.contains(&format!(
+        "custom-family inner solve did not converge after {inner_max_cycles} cycle(s)"
+    ))
+}
+
 fn compare_beta(
     left: &Array1<f64>,
     right: &Array1<f64>,
@@ -120,14 +129,40 @@ fn compare_beta(
     Ok(report)
 }
 
+/// Two fresh fits of one problem under one cap end in the same outcome: the same
+/// coefficients to `rel_tol` where both converge, or the same typed refusal, byte for byte,
+/// where the cap stops both (gam#4590). The refusal carries the inner solve's terminal
+/// decision variables, so identical text is the same cycle-0 state to the digits it prints.
+/// `None` when both refused.
 fn assert_repeated_fit_beta_equivalent(
     n: usize,
     inner_max_cycles: usize,
     rel_tol: f64,
-) -> BetaEquivalenceReport {
-    let (left, left_timing) = fit_synthetic_beta(n, inner_max_cycles).expect("left synthetic fit");
-    let (right, right_timing) =
-        fit_synthetic_beta(n, inner_max_cycles).expect("right synthetic fit");
+) -> Option<BetaEquivalenceReport> {
+    let (left, right) = match (
+        fit_synthetic_beta(n, inner_max_cycles),
+        fit_synthetic_beta(n, inner_max_cycles),
+    ) {
+        (Ok(left), Ok(right)) => (left, right),
+        (Err(left), Err(right)) => {
+            assert!(
+                is_inner_cycle_cap_refusal(&left, inner_max_cycles),
+                "the capped fit refused for a reason other than its inner cycle cap: {left}"
+            );
+            assert_eq!(left, right, "two fresh fits of one problem refused differently");
+            eprintln!(
+                "[MS-FLEX-EQUIV-REFUSED] n={n} inner_max_cycles={inner_max_cycles}: both fits \
+                 refused identically at the cycle cap"
+            );
+            return None;
+        }
+        (left, right) => panic!(
+            "two fresh fits of one problem disagree on whether they converge: left ok={} right ok={}",
+            left.is_ok(),
+            right.is_ok()
+        ),
+    };
+    let ((left, left_timing), (right, right_timing)) = (left, right);
     let report = compare_beta(&left, &right, rel_tol).expect("synthetic fit beta equivalence");
     eprintln!(
         "[MS-FLEX-EQUIV-PASS] n={} inner_max_cycles={} beta_len={} max_abs={:.3e} max_rel={:.3e} left_elapsed_s={:.3} right_elapsed_s={:.3}",
@@ -139,7 +174,7 @@ fn assert_repeated_fit_beta_equivalent(
         left_timing.elapsed.as_secs_f64(),
         right_timing.elapsed.as_secs_f64()
     );
-    report
+    Some(report)
 }
 
 #[test]
@@ -148,8 +183,26 @@ fn margslope_flex_large_scale_repro_cycle0() {
     let n = DEFAULT_REPRO_N;
     let bound = DEFAULT_WALL_BOUND;
     let problem = build_large_scale_shape_problem(n);
-    let (out, timing) = fit_problem(problem, cycle_capped_options(1))
-        .expect("large-scale FLEX margslope cycle-0 repro fit");
+    let start = std::time::Instant::now();
+    // SPEC 20: a fit is minted only from a converged optimization, so a one-cycle cap ends
+    // either in a fit that converged inside it or in the typed refusal that names the cycle it
+    // ran (gam#4590). Either proves the solver entered joint-Newton cycle 0, which is what this
+    // profiling proxy needs; the elapsed time is reported as a diagnostic.
+    let (out, timing) = match fit_problem(problem, cycle_capped_options(1)) {
+        Ok(fitted) => fitted,
+        Err(err) => {
+            assert!(
+                is_inner_cycle_cap_refusal(&err, 1),
+                "the cycle-0 repro fit refused for a reason other than its cycle cap: {err}"
+            );
+            eprintln!(
+                "[MS-FLEX-LARGE_SCALE-REPRO] n={} inner_max_cycles=1 elapsed_s={:.3} refused at the cycle cap after entering cycle 0",
+                n,
+                start.elapsed().as_secs_f64()
+            );
+            return;
+        }
+    };
     eprintln!(
         "[MS-FLEX-LARGE_SCALE-REPRO] n={} inner_max_cycles=1 elapsed_s={:.3} outer_iters={} inner_cycles={} converged={} beta_len={}",
         n,
@@ -179,11 +232,12 @@ fn margslope_flex_beta_equivalence_smoke() {
     let n = DEFAULT_SMOKE_N;
     let inner_cycles = 1usize;
     let rel_tol = 1e-10_f64;
-    let report = assert_repeated_fit_beta_equivalent(n, inner_cycles, rel_tol);
-    eprintln!(
-        "[MS-FLEX-EQUIV-SMOKE] PASS beta_len={} max_abs={:.3e} max_rel={:.3e} rel_tol={:.3e}",
-        report.len, report.max_abs_diff, report.max_rel_diff, rel_tol
-    );
+    if let Some(report) = assert_repeated_fit_beta_equivalent(n, inner_cycles, rel_tol) {
+        eprintln!(
+            "[MS-FLEX-EQUIV-SMOKE] PASS beta_len={} max_abs={:.3e} max_rel={:.3e} rel_tol={:.3e}",
+            report.len, report.max_abs_diff, report.max_rel_diff, rel_tol
+        );
+    }
 }
 
 /// gam#683 regression: multiple real REML outer iterations under
