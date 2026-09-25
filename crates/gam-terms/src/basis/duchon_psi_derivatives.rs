@@ -2288,6 +2288,26 @@ pub(crate) fn build_duchon_basis_designwithworkspace(
             for local_i in 0..rows {
                 let i = chunk_start + local_i;
                 let mut kernel_row = kernel_block.row_mut(local_i);
+                // gam#4588: the hybrid row's representative, origin-reduced or
+                // with the origin constant, whichever carries the smaller entries
+                // over this row's distances; the constraint annihilates either
+                // row constant on its own.
+                let hybrid_row_keeps_origin = match hybrid_eval.as_ref() {
+                    Some(hybrid) if pure_poly_coeff.is_none() => {
+                        let (mut r_min, mut r_max) = (f64::INFINITY, 0.0_f64);
+                        for j in 0..k {
+                            let r = if let Some(scales) = axis_scales.as_deref() {
+                                aniso_distance_rows_with_scales(data, i, centers, j, scales)
+                            } else {
+                                euclidean_distance_rows(data, i, centers, j)
+                            };
+                            r_min = r_min.min(r);
+                            r_max = r_max.max(r);
+                        }
+                        hybrid.row_keeps_origin(r_min, r_max)?
+                    }
+                    _ => false,
+                };
                 for j in 0..k {
                     let r = if let Some(scales) = axis_scales.as_deref() {
                         aniso_distance_rows_with_scales(data, i, centers, j, scales)
@@ -2298,7 +2318,11 @@ pub(crate) fn build_duchon_basis_designwithworkspace(
                         // Pure Duchon: use precomputed coefficient, skip gamma calls.
                         ppc.eval(r)
                     } else if let Some(hybrid) = hybrid_eval.as_ref() {
-                        hybrid.value(r)?
+                        if hybrid_row_keeps_origin {
+                            hybrid.value_with_origin(r)?
+                        } else {
+                            hybrid.value(r)?
+                        }
                     } else if let (Some(profile), Some(kind)) =
                         (value_profile.as_ref(), hybrid_kind.as_ref())
                     {

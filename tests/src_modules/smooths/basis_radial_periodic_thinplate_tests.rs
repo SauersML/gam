@@ -4952,8 +4952,20 @@ fn test_duchon_hybrid_collision_uses_combined_partial_fraction_limit() {
         Some(&coeffs),
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "finite hybrid diagonal", e));
+    // The hybrid kernel is evaluated origin-reduced, `φ(r) − φ(0)` (gam#2735,
+    // gam#4588): the constant `φ(0)` is a degree-zero polynomial every Duchon
+    // constraint annihilates, so the collision value is exactly zero, and the
+    // constant removed is the finite diagonal the combined partial-fraction
+    // limit gives, `1/(4π)` at p = s = 1, d = 3, κ = 1.
+    assert_eq!(got, 0.0, "the origin-reduced kernel vanishes at collision");
+    let profile = duchon_radial_profile(p_order, s_order, dim)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "radial profile", e));
+    let removed = profile.kappa_scale(1.0 / length_scale)
+        * profile
+            .origin_value()
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "origin value", e));
     let expected = 1.0 / (4.0 * std::f64::consts::PI);
-    assert_abs_diff_eq!(got, expected, epsilon = 1e-12);
+    assert_abs_diff_eq!(removed, expected, epsilon = 1e-12);
 }
 
 #[test]
