@@ -11,7 +11,7 @@ pub mod sinkhorn_barycenter;
 // `manifolds/` regrouping.
 pub use manifolds::{
     circle, constant_curvature, euclidean, grassmann, lie_so, poincare, product, simplex, spd,
-    sphere, stiefel, stiefel_frames, torus,
+    sphere, stiefel, torus,
 };
 
 pub use curvature_estimand::{
@@ -22,7 +22,7 @@ pub use latent_seed::{SPECTRAL_SEED_NEIGHBORS, laplacian_eigenmap_coords};
 pub use manifold::{GeometryError, GeometryResult, ManifoldSpec, RiemannianManifold};
 pub use manifolds::{
     CircleManifold, ConstantCurvature, EuclideanManifold, GrassmannManifold, ProductManifold,
-    SpdManifold, SphereManifold, StiefelFrames, StiefelManifold, TorusManifold,
+    SpdManifold, SphereManifold, StiefelManifold, TorusManifold,
     constant_curvature_dirichlet_penalty, constant_curvature_dirichlet_penalty_kappa_derivative,
     distance_kappa_jet,
 };

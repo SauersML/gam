@@ -1,11 +1,38 @@
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use faer::Accum;
+use faer::linalg::matmul::matmul;
+use gam_linalg::faer_ndarray::{FaerArrayView, array2_to_matmut, matmul_parallelism};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, concatenate};
 
 use crate::manifold::{
     GeometryError, GeometryResult, RiemannianManifold, check_len, flatten, from_flat, identity,
-    matrix_det, matrix_exp, orthonormal_completion, qr_thin, skew_log_orthogonal, sym,
+    inverse, matrix_det, matrix_exp, orthonormal_completion, skew_log_orthogonal, sym,
     tangent_basis_metric_orthonormal,
 };
 use crate::manifolds::sphere::SphereManifold;
+
+/// `alpha · A · B` accumulated into `out` or replacing it: one CPU GEMM on views. Frames can
+/// be thousands wide and these run inside trust regions whose objectives occupy the device;
+/// shipping each product across measured as most of a support fit's wall time.
+fn gemm(out: &mut Array2<f64>, accumulate: bool, alpha: f64, a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) {
+    let (m, k) = a.dim();
+    let n = b.ncols();
+    let (va, vb) = (FaerArrayView::new(&a), FaerArrayView::new(&b));
+    let accum = if accumulate { Accum::Add } else { Accum::Replace };
+    matmul(array2_to_matmut(out), accum, va.as_ref(), vb.as_ref(), alpha, matmul_parallelism(m, n, k));
+}
+
+fn product(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Array2<f64> {
+    let mut out = Array2::<f64>::zeros((a.nrows(), b.ncols()));
+    gemm(&mut out, false, 1.0, a, b);
+    out
+}
+
+/// `Z − scale · Y · M` for a `k × k` matrix `M`, fused into one GEMM on a copy of `Z`.
+fn minus_y_times(z: ArrayView2<'_, f64>, y: ArrayView2<'_, f64>, m: ArrayView2<'_, f64>, scale: f64) -> Array2<f64> {
+    let mut out = z.to_owned();
+    gemm(&mut out, true, -scale, y, m);
+    out
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StiefelManifold {
@@ -17,8 +44,8 @@ impl StiefelManifold {
     /// Construct the Stiefel manifold `St(n, k) = {Y ∈ ℝ^{n×k} : YᵀY = I_k}`
     /// of `k`-frames in `ℝⁿ`. This object exists only for `1 ≤ k ≤ n`: with
     /// `k > n` there cannot be `k` orthonormal columns in `ℝⁿ`, the dimension
-    /// `nk − k(k+1)/2` ceases to describe a frame manifold, and the QR
-    /// retraction cannot produce `k` orthonormal columns. The domain is
+    /// `nk − k(k+1)/2` ceases to describe a frame manifold, and no retraction
+    /// can produce `k` orthonormal columns. The domain is
     /// rejected here, before any dimension, projection, exponential, or
     /// curvature computation can run on a nonexistent manifold.
     pub fn new(k: usize, n: usize) -> GeometryResult<Self> {
@@ -30,21 +57,11 @@ impl StiefelManifold {
         Ok(Self { k, n })
     }
 
-    /// QR-based *retraction* `R_Y(Δ) = qf(Y + Δ)` with the sign convention that
-    /// makes the diagonal of `R` non-negative (so the retraction is a smooth
-    /// map agreeing with the exponential to first order). This is a retraction,
-    /// not the Riemannian exponential, and is exposed only through
-    /// [`retract`](RiemannianManifold::retract).
-    fn qr_retraction(&self, y: &Array2<f64>) -> Array2<f64> {
-        let (mut q, r) = qr_thin(y);
-        for j in 0..self.k {
-            if r[[j, j]] < 0.0 {
-                for i in 0..self.n {
-                    q[[i, j]] = -q[[i, j]];
-                }
-            }
-        }
-        q
+    /// The `n × k` matrix a flat vector stores, as a view (no copy).
+    fn frame<'a>(&self, v: ArrayView1<'a, f64>, what: &'static str) -> GeometryResult<ArrayView2<'a, f64>> {
+        check_len(what, v.len(), self.n * self.k)?;
+        v.into_shape_with_order((self.n, self.k))
+            .map_err(|_| GeometryError::InvalidPoint("Stiefel: a flat frame is not contiguous"))
     }
 
     /// For `k == 1` the Stiefel manifold `St(n, 1)` is exactly the unit sphere
@@ -219,12 +236,9 @@ impl RiemannianManifold for StiefelManifold {
         if let Some(sphere) = self.as_sphere() {
             return sphere.metric_product(point, tangent);
         }
-        use gam_linalg::faer_ndarray::{fast_ab, fast_atb};
-        let y = from_flat(point, self.n, self.k)?;
-        let delta = from_flat(tangent, self.n, self.k)?;
-        // YᵀΔ is k×k; Y·(YᵀΔ) carries the ambient n.
-        let correction = fast_ab(&y, &fast_atb(&y, &delta)) * 0.5;
-        Ok(flatten(&(delta - correction)))
+        let y = self.frame(point, "Stiefel metric point")?;
+        let delta = self.frame(tangent, "Stiefel metric tangent")?;
+        Ok(flatten(&minus_y_times(delta, y, product(y.t(), delta).view(), 0.5)))
     }
 
     fn sectional_curvature(
@@ -261,14 +275,10 @@ impl RiemannianManifold for StiefelManifold {
         point: ArrayView1<'_, f64>,
         vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
-        use gam_linalg::faer_ndarray::{fast_ab, fast_atb};
-        let y = from_flat(point, self.n, self.k)?;
-        let z = from_flat(vec, self.n, self.k)?;
-        // Tangent projection z − Y·sym(Yᵀz): YᵀZ (k×n · n×k) and Y·S (n×k · k×k)
-        // both carry the large ambient dimension n, GPU-dispatched via
-        // fast_atb/fast_ab.
-        let correction = fast_ab(&y, &sym(&fast_atb(&y, &z)));
-        Ok(flatten(&(z - correction)))
+        let y = self.frame(point, "Stiefel projection point")?;
+        let z = self.frame(vec, "Stiefel projection vector")?;
+        // Tangent projection Z − Y·sym(YᵀZ).
+        Ok(flatten(&minus_y_times(z, y, sym(&product(y.t(), z)).view(), 1.0)))
     }
 
     /// Riemannian gradient under the **canonical metric**
@@ -298,38 +308,73 @@ impl RiemannianManifold for StiefelManifold {
         if let Some(sphere) = self.as_sphere() {
             return sphere.riemannian_gradient(point, euclidean_grad);
         }
-        use gam_linalg::faer_ndarray::{fast_ab, fast_atb};
-        let y = from_flat(point, self.n, self.k)?;
-        let e = from_flat(euclidean_grad, self.n, self.k)?;
-        // grad = E − Y (Eᵀ Y): Eᵀ Y is k×k, Y·(EᵀY) carries the ambient n.
-        let correction = fast_ab(&y, &fast_atb(&e, &y));
-        Ok(flatten(&(e - correction)))
+        let y = self.frame(point, "Stiefel gradient point")?;
+        let e = self.frame(euclidean_grad, "Stiefel gradient")?;
+        // grad = E − Y (Eᵀ Y).
+        Ok(flatten(&minus_y_times(e, y, product(e.t(), y).view(), 1.0)))
     }
 
-    /// QR retraction `R_Y(Δ) = qf(Y + Δ)`. This is a first-order retraction,
-    /// distinct from the Riemannian [`exp_map`](Self::exp_map); the two agree
-    /// only to first order in `Δ`.
+    /// Cayley retraction `R_Y(Δ) = (I − ½W)⁻¹(I + ½W) Y` with `W` the skew generator of the
+    /// canonical geodesic [`exp_map`](Self::exp_map) uses (`W Y = Δ`). The Cayley transform
+    /// agrees with `exp(W)` through second order, so this is a SECOND-ORDER retraction for
+    /// the canonical metric (Wen and Yin, 2013): a trust region's Riemannian-Hessian model is
+    /// valid along it. `W = P̂ΔYᵀ − YΔᵀP̂` with `P̂ = I − ½YYᵀ` has rank `2k`: `W = U Vᵀ` with
+    /// `U = [P̂Δ, Y]`, `V = [Y, −P̂Δ]`, so by Sherman–Morrison–Woodbury
+    /// `R_Y(Δ) = Y + U (I − ½VᵀU)⁻¹ VᵀY`: one `2k × 2k` solve, never an `n × n` matrix.
     fn retract(
         &self,
         point: ArrayView1<'_, f64>,
         tangent_vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
-        let y = from_flat(point, self.n, self.k)?;
-        let tangent = from_flat(
-            self.project_tangent(point, tangent_vec)?.view(),
-            self.n,
-            self.k,
-        )?;
-        Ok(flatten(&self.qr_retraction(&(y + tangent))))
+        let y = self.frame(point, "Stiefel point")?;
+        let delta_flat = self.project_tangent(point, tangent_vec)?;
+        let delta = self.frame(delta_flat.view(), "Stiefel tangent")?;
+        let p_hat_delta = minus_y_times(delta, y, product(y.t(), delta).view(), 0.5);
+        let negated = -&p_hat_delta;
+        let u = concatenate(Axis(1), &[p_hat_delta.view(), y]).map_err(|_| GeometryError::InvalidPoint("Stiefel retraction: shapes"))?;
+        let v = concatenate(Axis(1), &[y, negated.view()]).map_err(|_| GeometryError::InvalidPoint("Stiefel retraction: shapes"))?;
+        let mut system = identity(2 * self.k);
+        gemm(&mut system, true, -0.5, v.t(), u.view());
+        let coefficients = inverse(&system)?.dot(&product(v.t(), y));
+        let mut out = y.to_owned();
+        gemm(&mut out, true, 1.0, u.view(), coefficients.view());
+        Ok(flatten(&out))
     }
 
-    /// The QR retraction `qf(Y + Δ)` is only a FIRST-ORDER retraction (its
-    /// acceleration at `Δ = 0` is not normal to the manifold), so
-    /// `D²(f∘R_Y)(0) ≠ Hess f(Y)` in general. The trust region must therefore
-    /// not score the Riemannian-Hessian quadratic term against this retraction;
-    /// it falls back to the first-order-correct Cauchy model (issue #956).
     fn retraction_is_second_order(&self) -> bool {
-        false
+        true
+    }
+
+    /// The Riemannian Hessian under the canonical metric from the Euclidean derivatives
+    /// `G = ∇f(Y)` and `∇²f(Y)[Δ]`. With `Π = I − YYᵀ` its bilinear form is (Edelman, Arias
+    /// and Smith, 1998, §2.5.4)
+    ///
+    /// ```text
+    ///   Hess f(Δ₁, Δ₂) = ∇²f(Δ₁, Δ₂) + ½ tr((GᵀΔ₁Yᵀ + YᵀΔ₁Gᵀ)Δ₂) − ½ tr((YᵀG + GᵀY)Δ₁ᵀΠΔ₂),
+    /// ```
+    ///
+    /// i.e. `⟨B, Δ₂⟩` for the ambient `B = ∇²f[Δ₁] + ½(YΔ₁ᵀG + GΔ₁ᵀY) − ½ΠΔ₁(YᵀG + GᵀY)`, whose
+    /// Riesz representative under the canonical metric is `B − Y Bᵀ Y`, as for the gradient.
+    fn riemannian_hessian(
+        &self,
+        point: ArrayView1<'_, f64>,
+        euclidean_grad: ArrayView1<'_, f64>,
+        euclidean_hessian_product: ArrayView1<'_, f64>,
+        tangent: ArrayView1<'_, f64>,
+    ) -> GeometryResult<Array1<f64>> {
+        let y = self.frame(point, "Stiefel Hessian point")?;
+        let g = self.frame(euclidean_grad, "Stiefel Hessian gradient")?;
+        let h = self.frame(euclidean_hessian_product, "Stiefel Hessian product")?;
+        let delta = self.frame(tangent, "Stiefel Hessian tangent")?;
+        let ytg = product(y.t(), g);
+        let s = &ytg + &ytg.t();
+        let mut b = h.to_owned();
+        gemm(&mut b, true, 0.5, y, product(delta.t(), g).view());
+        gemm(&mut b, true, 0.5, g, product(delta.t(), y).view());
+        // − ½ ΠΔ S = − ½ (Δ − Y (YᵀΔ)) S
+        let pi_delta = minus_y_times(delta, y, product(y.t(), delta).view(), 1.0);
+        gemm(&mut b, true, -0.5, pi_delta.view(), s.view());
+        Ok(flatten(&minus_y_times(b.view(), y, product(b.t(), y).view(), 1.0)))
     }
 
     /// Reverse-mode (vector–Jacobian product) of [`exp_map`](Self::exp_map).
@@ -965,7 +1010,7 @@ mod stiefel_tests {
 
     #[test]
     fn retract_stays_on_stiefel_manifold() {
-        // St(2, 4): QR retraction must return a frame with QᵀQ = I₂.
+        // St(2, 4): the retraction must return a frame with QᵀQ = I₂.
         let st = StiefelManifold::new(2, 4).unwrap();
         // Y = [e0, e1] as 4×2 row-major: [1,0, 0,1, 0,0, 0,0]
         let y = Array1::from(vec![1.0_f64, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
@@ -1003,5 +1048,115 @@ mod stiefel_tests {
         assert!(q[0].abs() < 1e-12, "q[0] = {}", q[0]);
         assert!((q[1] - 1.0).abs() < 1e-12, "q[1] = {}", q[1]);
         assert!(q[2].abs() < 1e-12, "q[2] = {}", q[2]);
+    }
+}
+
+#[cfg(test)]
+mod second_order_tests {
+    use super::{StiefelManifold, product};
+    use crate::manifold::{GeometryResult, RiemannianManifold, flatten, from_flat};
+    use crate::manifolds::product::ProductManifold;
+    use crate::optimizer::{RiemannianObjective, RiemannianTrustRegion};
+    use faer::Side;
+    use gam_linalg::faer_ndarray::FaerEigh;
+    use ndarray::{Array1, Array2, ArrayView1, s};
+
+    /// A deterministic `n × k` frame (orthonormal columns) and a symmetric `n × n` matrix.
+    fn fixture(n: usize, k: usize, seed: u64) -> (Array2<f64>, Array2<f64>) {
+        let mut state = seed;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+        };
+        let raw = Array2::from_shape_fn((n, k), |_| next());
+        let (values, vectors) = product(raw.t(), raw.view()).eigh(Side::Lower).unwrap();
+        let inverse_root = product((&vectors * &values.mapv(|v| 1.0 / v.sqrt())).view(), vectors.t());
+        let a = Array2::from_shape_fn((n, n), |_| next());
+        (product(raw.view(), inverse_root.view()), (&a + &a.t()) * 0.5)
+    }
+
+    fn trace(m: &Array2<f64>) -> f64 {
+        (0..m.nrows()).map(|i| m[[i, i]]).sum()
+    }
+
+    /// The Cayley retraction and the canonical exponential share their generator, so they
+    /// agree through second order: their gap shrinks a thousandfold when `t` shrinks tenfold.
+    #[test]
+    fn the_cayley_retraction_matches_the_geodesic_to_second_order() {
+        let (y, a) = fixture(7, 3, 11);
+        let st = StiefelManifold::new(3, 7).unwrap();
+        let yf = flatten(&y);
+        let xi = st.project_tangent(yf.view(), flatten(&a.slice(s![.., ..3]).to_owned()).view()).unwrap();
+        let gap = |t: f64| {
+            let step = xi.mapv(|v| t * v);
+            let d = &st.exp_map(yf.view(), step.view()).unwrap() - &st.retract(yf.view(), step.view()).unwrap();
+            d.dot(&d).sqrt()
+        };
+        let ratio = gap(1e-1) / gap(1e-2);
+        assert!(ratio > 5e2, "{ratio}");
+    }
+
+    /// For `f(Y) = ½ tr(YᵀAY)`, `d²/dt² f(Y(t))` along the canonical geodesic is
+    /// `tr(ΔᵀAΔ) + tr((AY)ᵀŸ)` with `Ÿ = −(ΔΔᵀY + YΔᵀΠΔ)` from the geodesic equation
+    /// (Edelman, Arias and Smith, 1998, eq. 2.41), and it equals `⟨Hess f[Δ], Δ⟩` under the
+    /// canonical metric: an independent check of the Hessian's formula.
+    #[test]
+    fn the_riemannian_hessian_matches_the_second_derivative_along_the_geodesic() {
+        let (y, a) = fixture(9, 4, 12);
+        let st = StiefelManifold::new(4, 9).unwrap();
+        let yf = flatten(&y);
+        let xi = from_flat(st.project_tangent(yf.view(), flatten(&a.slice(s![.., 1..5]).to_owned()).view()).unwrap().view(), 9, 4).unwrap();
+        let xif = flatten(&xi);
+        let g = product(a.view(), y.view());
+        let h = product(a.view(), xi.view());
+        let hess = st.riemannian_hessian(yf.view(), flatten(&g).view(), flatten(&h).view(), xif.view()).unwrap();
+        let along = st.metric_product(yf.view(), xif.view()).unwrap().dot(&hess);
+        let pi_xi = &xi - &product(y.view(), product(y.t(), xi.view()).view());
+        let acceleration = -(&product(xi.view(), product(xi.t(), y.view()).view()) + &product(y.view(), product(xi.t(), pi_xi.view()).view()));
+        let exact = trace(&product(xi.t(), h.view())) + trace(&product(g.t(), acceleration.view()));
+        assert!((along - exact).abs() < 1e-12 * exact.abs().max(1.0), "{along} vs {exact}");
+    }
+
+    /// A trust region on a product of two frames with the exact Riemannian Hessian finds
+    /// `min ½ tr(YᵀAY)` per block: half the sum of each `A`'s smallest `k` eigenvalues.
+    #[test]
+    fn the_trust_region_reaches_the_brockett_minimum_on_a_product_of_frames() {
+        let (y1, a1) = fixture(6, 2, 13);
+        let (y2, a2) = fixture(5, 3, 14);
+        let m = ProductManifold::new(vec![Box::new(StiefelManifold::new(2, 6).unwrap()), Box::new(StiefelManifold::new(3, 5).unwrap())]);
+        struct Brockett<'a> {
+            m: &'a ProductManifold,
+            a: [Array2<f64>; 2],
+        }
+        impl Brockett<'_> {
+            fn apply(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
+                let (first, second) = (from_flat(v.slice(s![..12]), 6, 2).unwrap(), from_flat(v.slice(s![12..]), 5, 3).unwrap());
+                let (p, q) = (product(self.a[0].view(), first.view()), product(self.a[1].view(), second.view()));
+                Array1::from_iter(flatten(&p).iter().chain(flatten(&q).iter()).copied())
+            }
+        }
+        impl RiemannianObjective for Brockett<'_> {
+            fn value_gradient(&mut self, point: ArrayView1<'_, f64>) -> GeometryResult<(f64, Array1<f64>)> {
+                let g = self.apply(point);
+                Ok((0.5 * point.dot(&g), g))
+            }
+            fn hessian_vector_product(&mut self, point: ArrayView1<'_, f64>, tangent: ArrayView1<'_, f64>) -> GeometryResult<Option<Array1<f64>>> {
+                let (g, h) = (self.apply(point), self.apply(tangent));
+                Ok(Some(self.m.riemannian_hessian(point, g.view(), h.view(), tangent)?))
+            }
+        }
+        let mut objective = Brockett { m: &m, a: [a1.clone(), a2.clone()] };
+        let start = Array1::from_iter(flatten(&y1).iter().chain(flatten(&y2).iter()).copied());
+        let solver = RiemannianTrustRegion { radius: 0.5, max_iter: 200, grad_tol: 1e-6, ..RiemannianTrustRegion::default() };
+        let result = solver.minimize_reporting_termination(&m, &mut objective, start.view()).unwrap();
+        assert!(result.residual <= result.tolerance, "{} > {}", result.residual, result.tolerance);
+        let smallest = |a: &Array2<f64>, k: usize| {
+            let (mut values, _) = a.eigh(Side::Lower).unwrap();
+            values.as_slice_mut().unwrap().sort_by(f64::total_cmp);
+            0.5 * values.iter().take(k).sum::<f64>()
+        };
+        let (value, _) = objective.value_gradient(result.point.view()).unwrap();
+        let expected = smallest(&a1, 2) + smallest(&a2, 3);
+        assert!((value - expected).abs() < 1e-9, "{value} vs {expected}");
     }
 }

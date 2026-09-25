@@ -60,7 +60,7 @@ resolver = "3"
 # solves the ARC subproblem to its rounding on every spectrum (opt#19). This is
 # opt main; opt carries no other branch. Pinning the source commit makes the
 # line-search semantics reproducible.
-opt = { version = "=0.9.0", git = "https://github.com/SauersML/opt.git", rev = "389fb564d892a6f9ed4b71aa17b8fdab8eed3b1e" }
+opt = { version = "=0.9.0", git = "https://github.com/SauersML/opt.git", rev = "8228fb139e5ea8ed50e3019a607a4d1171024cd6" }
 # This general-mcmc revision adds GenericNUTS::run_adaptive, the open-ended
 # warmup gam-inference samples with. The warmup ends at any target acceptance
 # and dimension, and it adapts a metric whose inverse mass is each window's

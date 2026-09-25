@@ -24,7 +24,7 @@ fn trust_region_step_is_radius_bounded() {
     };
     let solver = RiemannianTrustRegion {
         radius: 0.25,
-        max_radius: 0.25,
+        value_band: f64::EPSILON,
         max_iter: 1,
         grad_tol: 0.0,
     };

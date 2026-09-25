@@ -140,8 +140,6 @@ from ._intervention_calibration import (
 )
 from ._parameter_decomposition import (
     ParameterDecompositionReport,
-    fit_supports,
-    minimal_support,
     run_parameter_decomposition,
 )
 
@@ -189,7 +187,6 @@ __all__ = [
     "expected_resolution_budget",
     "FisherEffectEvidence",
     "fit_chart_calibration",
-    "fit_supports",
     "fit_transport",
     "fixed_budget_block_sparse_dictionary_fit",
     "flat_block_assignment",
@@ -208,7 +205,6 @@ __all__ = [
     "log_e_from_p_value",
     "loop_holonomy",
     "ManifoldSAE",
-    "minimal_support",
     "model_from_dict",
     "ParameterDecompositionReport",
     "plan_probe_for_contested_claim",

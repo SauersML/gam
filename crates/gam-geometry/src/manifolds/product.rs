@@ -14,6 +14,29 @@ impl ProductManifold {
     pub fn components(&self) -> &[Box<dyn RiemannianManifold>] {
         &self.components
     }
+
+    /// Apply `f` to each factor with that factor's slices of `parts` (all ambient-length),
+    /// writing its result into the factor's slice of the output.
+    fn blockwise<F>(&self, context: &'static str, parts: &[ArrayView1<'_, f64>], mut f: F) -> GeometryResult<Array1<f64>>
+    where
+        F: FnMut(&dyn RiemannianManifold, &[ArrayView1<'_, f64>]) -> GeometryResult<Array1<f64>>,
+    {
+        let ambient = self.ambient_dim();
+        for part in parts {
+            check_len(context, part.len(), ambient)?;
+        }
+        let mut out = Array1::<f64>::zeros(ambient);
+        let mut off = 0usize;
+        for component in &self.components {
+            let m = component.ambient_dim();
+            let slices: Vec<_> = parts.iter().map(|p| p.slice(s![off..off + m])).collect();
+            let part = f(component.as_ref(), &slices)?;
+            check_len(context, part.len(), m)?;
+            out.slice_mut(s![off..off + m]).assign(&part);
+            off += m;
+        }
+        Ok(out)
+    }
 }
 
 impl RiemannianManifold for ProductManifold {
@@ -50,22 +73,7 @@ impl RiemannianManifold for ProductManifold {
         point: ArrayView1<'_, f64>,
         tangent_vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
-        check_len("Product point", point.len(), self.ambient_dim())?;
-        check_len("Product tangent", tangent_vec.len(), self.ambient_dim())?;
-        let mut out = Array1::<f64>::zeros(self.ambient_dim());
-        let mut off = 0usize;
-        for component in &self.components {
-            let m = component.ambient_dim();
-            let part = component.exp_map(
-                point.slice(s![off..off + m]),
-                tangent_vec.slice(s![off..off + m]),
-            )?;
-            for i in 0..m {
-                out[off + i] = part[i];
-            }
-            off += m;
-        }
-        Ok(out)
+        self.blockwise("Product exp_map", &[point, tangent_vec], |c, p| c.exp_map(p[0], p[1]))
     }
 
     fn exp_map_vjp(
@@ -176,23 +184,7 @@ impl RiemannianManifold for ProductManifold {
         point: ArrayView1<'_, f64>,
         tangent: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
-        check_len("Product metric point", point.len(), self.ambient_dim())?;
-        check_len("Product metric tangent", tangent.len(), self.ambient_dim())?;
-        let mut out = Array1::<f64>::zeros(self.ambient_dim());
-        let mut off = 0usize;
-        for component in &self.components {
-            let m = component.ambient_dim();
-            let part = component.metric_product(
-                point.slice(s![off..off + m]),
-                tangent.slice(s![off..off + m]),
-            )?;
-            check_len("Product factor metric product", part.len(), m)?;
-            for i in 0..m {
-                out[off + i] = part[i];
-            }
-            off += m;
-        }
-        Ok(out)
+        self.blockwise("Product metric product", &[point, tangent], |c, p| c.metric_product(p[0], p[1]))
     }
 
     fn christoffel_symbols(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Vec<Array2<f64>>> {
@@ -319,54 +311,50 @@ impl RiemannianManifold for ProductManifold {
         point: ArrayView1<'_, f64>,
         vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
-        check_len("Product projection point", point.len(), self.ambient_dim())?;
-        check_len("Product projection vector", vec.len(), self.ambient_dim())?;
-        let mut out = Array1::<f64>::zeros(self.ambient_dim());
-        let mut off = 0usize;
-        for component in &self.components {
-            let m = component.ambient_dim();
-            let part = component
-                .project_tangent(point.slice(s![off..off + m]), vec.slice(s![off..off + m]))?;
-            for i in 0..m {
-                out[off + i] = part[i];
-            }
-            off += m;
-        }
-        Ok(out)
+        self.blockwise("Product projection", &[point, vec], |c, p| c.project_tangent(p[0], p[1]))
     }
 
     /// The product metric is block-diagonal across the factors, so the
     /// Riemannian gradient raises **independently within each block**: a factor
-    /// with a genuine (non-identity) metric — an affine-invariant SPD or
-    /// canonical Stiefel component — must use *its own* metric-raising, not a
-    /// global tangent projection. Delegating per block keeps every factor's
-    /// gradient first-order correct (issue #955) rather than silently applying
-    /// the embedded projection across the whole product.
+    /// with a genuine (non-identity) metric — an affine-invariant SPD component —
+    /// must use *its own* metric-raising, not a global tangent projection.
+    /// Delegating per block keeps every factor's gradient first-order correct
+    /// (issue #955) rather than silently applying the embedded projection across
+    /// the whole product.
     fn riemannian_gradient(
         &self,
         point: ArrayView1<'_, f64>,
         euclidean_grad: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
-        check_len("Product gradient point", point.len(), self.ambient_dim())?;
-        check_len(
-            "Product gradient vector",
-            euclidean_grad.len(),
-            self.ambient_dim(),
-        )?;
-        let mut out = Array1::<f64>::zeros(self.ambient_dim());
-        let mut off = 0usize;
-        for component in &self.components {
-            let m = component.ambient_dim();
-            let part = component.riemannian_gradient(
-                point.slice(s![off..off + m]),
-                euclidean_grad.slice(s![off..off + m]),
-            )?;
-            for i in 0..m {
-                out[off + i] = part[i];
-            }
-            off += m;
-        }
-        Ok(out)
+        self.blockwise("Product gradient", &[point, euclidean_grad], |c, p| c.riemannian_gradient(p[0], p[1]))
+    }
+
+    /// Each factor retracts its own block with its own retraction.
+    fn retract(
+        &self,
+        point: ArrayView1<'_, f64>,
+        tangent_vec: ArrayView1<'_, f64>,
+    ) -> GeometryResult<Array1<f64>> {
+        self.blockwise("Product retraction", &[point, tangent_vec], |c, p| c.retract(p[0], p[1]))
+    }
+
+    /// Second order exactly when every factor's retraction is.
+    fn retraction_is_second_order(&self) -> bool {
+        self.components.iter().all(|c| c.retraction_is_second_order())
+    }
+
+    /// Block-diagonal: each factor turns its own block of the Euclidean derivatives
+    /// Riemannian.
+    fn riemannian_hessian(
+        &self,
+        point: ArrayView1<'_, f64>,
+        euclidean_grad: ArrayView1<'_, f64>,
+        euclidean_hessian_product: ArrayView1<'_, f64>,
+        tangent: ArrayView1<'_, f64>,
+    ) -> GeometryResult<Array1<f64>> {
+        self.blockwise("Product Hessian", &[point, euclidean_grad, euclidean_hessian_product, tangent], |c, p| {
+            c.riemannian_hessian(p[0], p[1], p[2], p[3])
+        })
     }
 }
 

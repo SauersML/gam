@@ -3098,7 +3098,7 @@ mod batch_tests {
         let manifold_ref: &dyn gam::geometry::RiemannianManifold = manifold_box.as_ref();
         let trust_region = gam::geometry::RiemannianTrustRegion {
             radius: 1.0,
-            max_radius: 1.0e6,
+            value_band: f64::EPSILON,
             max_iter: 200,
             grad_tol: 1.0e-8,
         };

@@ -340,7 +340,7 @@ pub trait RiemannianManifold: Send + Sync {
     /// Manifolds whose `retract` is the exponential map or another second-order
     /// retraction return `true` (the default — the default `retract` *is*
     /// `exp_map`, which is second-order). A manifold exposing only a FIRST-ORDER
-    /// retraction (e.g. the Stiefel/Grassmann QR retraction `qf(Y + Δ)`, whose
+    /// retraction (e.g. the Grassmann QR retraction `qf(Y + Δ)`, whose
     /// acceleration at `0` is not normal to the manifold) must override this to
     /// `false`: the linear model term `Df_x[η]` is retraction-independent and
     /// stays correct, but the Riemannian-Hessian quadratic term is *not* the

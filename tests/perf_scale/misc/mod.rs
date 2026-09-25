@@ -11,5 +11,4 @@ mod rho_posterior_tier0_real_fit;
 mod row_metric_contract;
 mod row_metric_loud_vs_loadbearing;
 mod sparse_dense_imbalance_diagnose;
-mod trust_region_first_step_respects_max_radius;
 mod trust_region_step_is_radius_bounded;

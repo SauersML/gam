@@ -278,8 +278,6 @@ __all__ = [
     "numeric_matrix_validate",
     "numerics_inverse_softplus",
     "numerics_sigmoid_stable",
-    "parameter_decomposition_fit_supports",
-    "parameter_decomposition_minimal_support",
     "parameter_decomposition_run",
     "partial_supervision_solve",
     "periodic_basis_with_jet",
@@ -1918,8 +1916,6 @@ def numerics_inverse_softplus(x: NDArray[np.float64]) -> NDArray[np.float64]: ..
 
 def numerics_sigmoid_stable(x: NDArray[np.float64]) -> NDArray[np.float64]: ...
 
-def parameter_decomposition_fit_supports(executor: Any, theta: NDArray[np.float64], positions: int, pieces: int, eps: float, form: str, sequence: int, frames: Any = None) -> dict[Any, Any]: ...
-def parameter_decomposition_minimal_support(evaluate: Any, positions: int, pieces: int, eps: float, form: str, sequence: int, start: Any = None) -> dict[Any, Any]: ...
 def parameter_decomposition_run(request_json: str, tensors: dict[Any, Any]) -> tuple[str, dict[Any, Any]]: ...
 
 def partial_supervision_solve(t_sup: NDArray[np.float64], aux: NDArray[np.float64], t_free: NDArray[np.float64], method: str, anchor_idx: Sequence[int], free_constraint: str) -> dict[Any, Any]: ...

@@ -57,11 +57,17 @@ pub struct TrustRegionTermination {
     pub residual: f64,
     /// The bound `residual` was compared against.
     pub tolerance: f64,
-    /// The trust radius the next iteration would use.
+    /// The trust radius the last iteration used.
     pub radius: f64,
     /// The gradient norm the certificate is scaled by (the first run's across
     /// resumes).
     pub stationarity_reference: f64,
+    /// The model's measured error rate at the last trial, which sets the next
+    /// radius (`opt::ModelError`); carried by a resume.
+    pub model_error: Option<opt::ModelError>,
+    /// Whether the run ended because no step its measured error bound allows could
+    /// promise a decrease the objective's values resolve.
+    pub resolution_limited: bool,
 }
 
 impl TrustRegionTermination {
@@ -74,10 +80,13 @@ impl TrustRegionTermination {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RiemannianTrustRegion {
-    /// Initial trust-region radius Δ₀.
+    /// The first trial's radius, used until the model's error has been measured.
     pub radius: f64,
-    /// Hard cap Δmax on the radius across all iterations.
-    pub max_radius: f64,
+    /// Relative rounding of the objective's values (`opt::RiemannianTrustRegion`):
+    /// a decrease below `value_band·|f|` is not resolved. The default is float64's
+    /// own; an objective accumulating many terms, or computed in lower precision,
+    /// declares its larger band.
+    pub value_band: f64,
     pub max_iter: usize,
     pub grad_tol: f64,
 }
@@ -86,7 +95,7 @@ impl Default for RiemannianTrustRegion {
     fn default() -> Self {
         Self {
             radius: 1.0,
-            max_radius: 1.0e6,
+            value_band: f64::EPSILON,
             max_iter: 64,
             grad_tol: 1.0e-8,
         }
@@ -101,8 +110,8 @@ impl RiemannianTrustRegion {
     /// tangent space under the manifold metric, a Steihaug truncated-CG step when
     /// the objective supplies Hessian–vector products and the manifold's
     /// retraction is second-order ([`RiemannianManifold::retraction_is_second_order`]),
-    /// the Cauchy point otherwise (issue #956), and radius control from
-    /// `opt::TrustRegionPolicy::classic`. This type adapts a manifold and an
+    /// the Cauchy point otherwise (issue #956), and radii from the model's measured
+    /// error (`opt::ModelError`, no step constant). This type adapts a manifold and an
     /// objective of this crate to it, and returns a point only when the
     /// relative-gradient certificate holds.
     pub fn minimize(
@@ -141,11 +150,12 @@ impl RiemannianTrustRegion {
         objective: &mut dyn RiemannianObjective,
         initial: ArrayView1<'_, f64>,
     ) -> GeometryResult<TrustRegionTermination> {
-        self.run(manifold, objective, initial, self.radius, None)
+        self.run(manifold, objective, initial, self.radius, None, None)
     }
 
     /// Continue the solve a [`TrustRegionTermination`] reports, for this solver's
-    /// iteration budget: from its point, at its radius, with its certificate scale.
+    /// iteration budget: from its point, radius and measured model error, with its
+    /// certificate scale.
     /// A solve split into resumed pieces takes the same steps as one uninterrupted
     /// solve, so a caller can interleave other work (re-deciding what the objective
     /// holds fixed) between iterations without relearning the step scale or moving
@@ -156,7 +166,7 @@ impl RiemannianTrustRegion {
         objective: &mut dyn RiemannianObjective,
         from: &TrustRegionTermination,
     ) -> GeometryResult<TrustRegionTermination> {
-        self.run(manifold, objective, from.point.view(), from.radius, Some(from.stationarity_reference))
+        self.run(manifold, objective, from.point.view(), from.radius, from.model_error, Some(from.stationarity_reference))
     }
 
     fn run(
@@ -165,11 +175,13 @@ impl RiemannianTrustRegion {
         objective: &mut dyn RiemannianObjective,
         initial: ArrayView1<'_, f64>,
         radius: f64,
+        model_error: Option<opt::ModelError>,
         stationarity_reference: Option<f64>,
     ) -> GeometryResult<TrustRegionTermination> {
         let solver = opt::RiemannianTrustRegion {
             radius,
-            max_radius: self.max_radius,
+            value_band: self.value_band,
+            model_error,
             max_iter: self.max_iter,
             grad_tol: self.grad_tol,
             stationarity_reference,
@@ -188,6 +200,8 @@ impl RiemannianTrustRegion {
             tolerance: termination.tolerance,
             radius: termination.radius,
             stationarity_reference: termination.stationarity_reference,
+            model_error: termination.model_error,
+            resolution_limited: termination.resolution_limited,
         })
     }
 }
@@ -264,8 +278,11 @@ fn geometry_error(error: opt::RiemannianTrustRegionError<GeometryError>) -> Geom
         Refusal::InvalidRadius => {
             GeometryError::InvalidPoint("trust-region radius must be finite and positive")
         }
-        Refusal::InvalidMaxRadius => {
-            GeometryError::InvalidPoint("trust-region maximum radius must be finite and positive")
+        Refusal::InvalidValueBand => {
+            GeometryError::InvalidPoint("trust-region value band must be finite and non-negative")
+        }
+        Refusal::InvalidModelErrorRate => {
+            GeometryError::InvalidPoint("trust-region model error rate must be finite and positive")
         }
         Refusal::InvalidGradientTolerance => GeometryError::InvalidPoint(
             "trust-region gradient tolerance must be finite and non-negative",
@@ -451,7 +468,7 @@ mod tests {
         let manifold = EuclideanManifold::new(1);
         let tr = RiemannianTrustRegion {
             radius: 1.0,
-            max_radius: 1.0e6,
+            value_band: 0.0,
             max_iter: 100,
             grad_tol: 1.0e-12,
         };
@@ -477,7 +494,7 @@ mod tests {
         let manifold = EuclideanManifold::new(1);
         let tr = RiemannianTrustRegion {
             radius: 1.0,
-            max_radius: 1.0e6,
+            value_band: 0.0,
             max_iter: 1,
             grad_tol: 1.0e-12,
         };
@@ -503,7 +520,7 @@ mod tests {
         let manifold = EuclideanManifold::new(1);
         let tr = RiemannianTrustRegion {
             radius: 1.0,
-            max_radius: 1.0e6,
+            value_band: 0.0,
             max_iter: 500,
             grad_tol: 1.0e-12,
         };
@@ -529,7 +546,7 @@ mod tests {
             a: ndarray::array![[4.0, 1.0, 0.0], [1.0, 3.0, 1.0], [0.0, 1.0, 2.0],],
             b: Array1::from_vec(vec![1.0, 2.0, -1.0]),
         };
-        let solver = |max_iter| RiemannianTrustRegion { radius: 0.25, max_radius: 1.0e6, max_iter, grad_tol: 1.0e-12 };
+        let solver = |max_iter| RiemannianTrustRegion { radius: 0.25, value_band: 0.0, max_iter, grad_tol: 1.0e-12 };
         let start = Array1::from_vec(vec![5.0, -3.0, 2.0]);
         let straight = solver(8)
             .minimize_reporting_termination(&manifold, &mut objective(), start.view())
@@ -555,7 +572,7 @@ mod tests {
         let mut obj = Quadratic { a, b };
         let tr = RiemannianTrustRegion {
             radius: 1.0,
-            max_radius: 1.0e6,
+            value_band: 0.0,
             max_iter: 200,
             grad_tol: 1.0e-12,
         };
