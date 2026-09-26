@@ -69,6 +69,17 @@ class Weights:
         return a.astype(np.float64).reshape(meta["shape"])
 
 
+
+def compact_json(obj):
+    """One top-level key per line, compact values: keeps receipts under the
+    repository's tracked-file line limit (build.rs MAX_TRACKED_FILE_LINES)."""
+    if isinstance(obj, dict):
+        body = ",\n".join(
+            json.dumps(k) + ": " + json.dumps(v, separators=(",", ":")) for k, v in obj.items()
+        )
+        return "{\n" + body + "\n}\n"
+    return json.dumps(obj, separators=(",", ":")) + "\n"
+
 def snapshot_dir(model):
     root = os.path.expanduser(f"~/.cache/huggingface/hub/models--{model.replace('/', '--')}/snapshots")
     for snap in sorted(glob.glob(os.path.join(root, "*"))):
@@ -329,7 +340,7 @@ def main():
     }
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
-        json.dump(out, f, indent=1)
+        f.write(compact_json(out))
     print(f"total {out['seconds_total']:.1f}s  selfcheck {check:.2e}")
 
 

@@ -32,6 +32,17 @@ EPS = np.finfo(np.float64).eps
 UNIT_ROUNDOFF = EPS / 2
 
 
+
+def compact_json(obj):
+    """One top-level key per line, compact values: keeps receipts under the
+    repository's tracked-file line limit (build.rs MAX_TRACKED_FILE_LINES)."""
+    if isinstance(obj, dict):
+        body = ",\n".join(
+            json.dumps(k) + ": " + json.dumps(v, separators=(",", ":")) for k, v in obj.items()
+        )
+        return "{\n" + body + "\n}\n"
+    return json.dumps(obj, separators=(",", ":")) + "\n"
+
 def growth(operations):
     scaled = operations * UNIT_ROUNDOFF
     return scaled / (1.0 - scaled)
@@ -189,7 +200,7 @@ def main():
     result["runtime_s"] = {"load": load_s, "total": time.time() - started}
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as fh:
-        json.dump(result, fh, indent=1)
+        fh.write(compact_json(result))
     print(json.dumps({k: result[k] for k in ("readout", "time_invariant_closure", "runtime_s")}, indent=1))
     for variant, rows in per_layer.items():
         print(variant)
