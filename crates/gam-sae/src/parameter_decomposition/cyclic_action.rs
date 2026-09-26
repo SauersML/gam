@@ -4,8 +4,8 @@
 //! # Scope
 //!
 //! The action is DECLARED: a successor map over the table's rows whose moved rows form one
-//! odd cycle. An undeclared or non-cyclic operator is refused here; invariant subspaces of a
-//! general operator belong to `schur`, and plane recovery from a frozen matrix to [`super::spectral`].
+//! odd cycle. An undeclared or non-cyclic operator is refused here; plane recovery from a frozen
+//! matrix belongs to [`super::spectral`].
 //!
 //! # The native reference
 //!
@@ -62,11 +62,7 @@
 //!
 //! The plane coefficients are sums of rows times library trigonometric values, whose accuracy
 //! has no derivation on main, so this module returns NO status for them and claims no band on
-//! them. The one status it returns is on the executed artifact: [`ShiftResidual::residual_status`]
-//! is a `UniformBound` over the stated finite family (every cycled row and column at one shift),
-//! because each entry's evaluation band is derived ([`evaluation_band`]) and every entry is
-//! evaluated. It certifies the binary64 edited table computed here, and nothing an external
-//! executor recomputes at another precision.
+//! them. Distortion is measured on the executed artifact where it runs.
 //!
 //! # Code
 //!
@@ -77,8 +73,6 @@
 
 use super::codec::{BitString, subset_code_len_bits};
 use super::precision::{DeclaredPrecision, LatticeCode};
-use super::receipts::evaluation_band;
-use super::supports::{EvidenceStatus, EvidenceStatusError};
 use ndarray::{Array1, Array2, ArrayView2};
 use std::f64::consts::PI;
 use std::fmt;
@@ -94,8 +88,7 @@ pub enum CyclicActionError {
     RowOutOfRange { row: usize, rows: usize },
     /// Two rows share a successor, so the declaration is not a permutation.
     NotPermutation { image: usize },
-    /// The moved rows form several cycles: not a declared single-cycle action. A general
-    /// operator's invariant subspaces belong to `schur`.
+    /// The moved rows form several cycles: not a declared single-cycle action.
     NotSingleCycle { cycles: usize },
     /// A cycle needs at least three rows to carry a plane.
     CycleTooShort { length: usize },
@@ -107,8 +100,6 @@ pub enum CyclicActionError {
     InvalidFrequencies { frequencies: Vec<usize>, planes: usize },
     /// A code failure from `codec` or `precision`.
     Code(String),
-    /// An evidence status was refused by its constructor.
-    Evidence(EvidenceStatusError),
 }
 
 impl fmt::Display for CyclicActionError {
@@ -124,7 +115,7 @@ impl fmt::Display for CyclicActionError {
             }
             Self::NotSingleCycle { cycles } => write!(
                 f,
-                "the moved rows form {cycles} cycles, not one declared cycle; route a general operator to schur"
+                "the moved rows form {cycles} cycles, not one declared cycle"
             ),
             Self::CycleTooShort { length } => {
                 write!(f, "a cycle of {length} rows carries no plane; at least 3 are needed")
@@ -141,16 +132,11 @@ impl fmt::Display for CyclicActionError {
                 "frequencies {frequencies:?} must be non-empty, strictly ascending and within 1..={planes}"
             ),
             Self::Code(message) => write!(f, "code failed: {message}"),
-            Self::Evidence(error) => write!(f, "evidence status refused: {error:?}"),
         }
     }
 }
 
 impl std::error::Error for CyclicActionError {}
-
-fn up(value: f64) -> f64 {
-    value.next_up()
-}
 
 /// A declared odd cycle of table rows: position `a` holds row `rows[a]`, and position 0 is the
 /// smallest moved row (a phase convention the edit does not depend on).
@@ -387,112 +373,6 @@ pub fn frequency_edit(
     })
 }
 
-/// The finite family a [`ShiftResidual`] covers: every cycled row and every column at one shift.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ShiftRegion {
-    pub shift: usize,
-    pub cycled_rows: usize,
-    pub columns: usize,
-}
-
-/// How the executed edited table `E + L Rᵀ` compares with the row permutation of its shift.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ShiftResidual {
-    pub region: ShiftRegion,
-    /// The largest computed `|(E + L Rᵀ)_{r_a j} − E_{r_{a+s} j}|` over cycled rows.
-    pub max_abs_residual: f64,
-    /// The largest evaluation band among those entries.
-    pub max_residual_band: f64,
-    /// The largest computed `|(L Rᵀ)_{r j}|` over rows outside the cycle, which the native
-    /// reference leaves unchanged; 0 when every row is cycled.
-    pub max_abs_fixed_row_change: f64,
-    /// The largest evaluation band among those entries.
-    pub max_fixed_row_band: f64,
-}
-
-impl ShiftResidual {
-    /// An upper bound on the exact residual of the computed factors over cycled rows.
-    pub fn residual_upper_bound(&self) -> f64 {
-        up(self.max_abs_residual + self.max_residual_band)
-    }
-
-    /// An upper bound on the exact change the computed factors make to rows outside the cycle.
-    pub fn fixed_row_upper_bound(&self) -> f64 {
-        up(self.max_abs_fixed_row_change + self.max_fixed_row_band)
-    }
-
-    /// `|residual entry| ≤ upper` over the enumerated family, including numerical error.
-    pub fn residual_status(&self) -> Result<EvidenceStatus<(), ShiftRegion>, CyclicActionError> {
-        EvidenceStatus::uniform_bound(self.residual_upper_bound(), self.max_residual_band, self.region)
-            .map_err(CyclicActionError::Evidence)
-    }
-}
-
-/// Compare the edited table of `edit` with the row permutation of its shift under `cycle`.
-///
-/// A residual entry `e_{r_a j} + Σ_t l_{r_a t} r_{jt} − e_{r_{a+s} j}` has `2|S|` product terms,
-/// each rounding once and passing at most `2|S| − 1` additions among the products, one where
-/// they meet `e_{r_a j}` and one subtraction: `k = 2|S| + 2`. An entry of a fixed row is the
-/// product sum alone: `k = 2|S|`.
-pub fn shift_residual(
-    table: ArrayView2<'_, f64>,
-    cycle: &RowCycle,
-    edit: &CyclicFrequencyEdit,
-) -> Result<ShiftResidual, CyclicActionError> {
-    check_table(table, cycle)?;
-    let (rows, width) = table.dim();
-    let (left, right, shift) = (edit.left.view(), edit.right.view(), edit.shift);
-    let components = left.ncols();
-    for (what, expected, found) in [
-        ("edit left rows against table rows", rows, left.nrows()),
-        ("edit right rows against table width", width, right.nrows()),
-        ("edit right components against left components", components, right.ncols()),
-    ] {
-        if expected != found {
-            return Err(CyclicActionError::ShapeMismatch { what, expected, found });
-        }
-    }
-    let length = cycle.length();
-    let mut target = vec![None; rows];
-    for (position, &row) in cycle.rows().iter().enumerate() {
-        target[row] = Some(cycle.rows()[(position + shift % length) % length]);
-    }
-    let mut out = ShiftResidual {
-        region: ShiftRegion { shift, cycled_rows: length, columns: width },
-        max_abs_residual: 0.0,
-        max_residual_band: 0.0,
-        max_abs_fixed_row_change: 0.0,
-        max_fixed_row_band: 0.0,
-    };
-    for row in 0..rows {
-        for column in 0..width {
-            let mut change = 0.0;
-            let mut absolute_sum = 0.0;
-            for component in 0..components {
-                let term = left[[row, component]] * right[[column, component]];
-                change += term;
-                absolute_sum = up(absolute_sum + up(term.abs()));
-            }
-            match target[row] {
-                Some(shifted) => {
-                    let residual = table[[row, column]] + change - table[[shifted, column]];
-                    let bound_sum = up(up(absolute_sum + table[[row, column]].abs())
-                        + table[[shifted, column]].abs());
-                    let band = evaluation_band(components + 2, bound_sum, components as f64);
-                    out.max_abs_residual = out.max_abs_residual.max(residual.abs());
-                    out.max_residual_band = out.max_residual_band.max(band);
-                }
-                None => {
-                    let band = evaluation_band(components, absolute_sum, components as f64);
-                    out.max_abs_fixed_row_change = out.max_abs_fixed_row_change.max(change.abs());
-                    out.max_fixed_row_band = out.max_fixed_row_band.max(band);
-                }
-            }
-        }
-    }
-    Ok(out)
-}
-
 /// The integer-bit code of a plane program: the frequency subset and the basis reals.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlaneProgramCode {
@@ -530,11 +410,16 @@ pub fn plane_program_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parameter_decomposition::receipts::evaluation_band;
     use gam_linalg::faer_ndarray::{FaerArrayView, FaerQr, FaerSvd, col_piv_qr_solve_lstsq};
     use gam_linalg::roundoff::factor_singular_band;
     use ndarray::{ArrayView1, s};
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
+
+    fn up(value: f64) -> f64 {
+        value.next_up()
+    }
 
     const WIDTH: usize = 8;
     const LENGTH: usize = 7;
@@ -748,6 +633,54 @@ mod tests {
         }
     }
 
+    /// How the executed edited table `E + L Rᵀ` compares with the row permutation of its shift.
+    struct ShiftResidual {
+        /// The largest computed `|(E + L Rᵀ)_{r_a j} − E_{r_{a+s} j}|` over cycled rows.
+        max_abs_residual: f64,
+        /// The largest evaluation band among those entries.
+        max_residual_band: f64,
+        /// The largest computed `|(L Rᵀ)_{r j}|` over rows outside the cycle.
+        max_abs_fixed_row_change: f64,
+    }
+
+    /// A residual entry `e_{r_a j} + Σ_t l_{r_a t} r_{jt} − e_{r_{a+s} j}` has `2|S|` product terms,
+    /// each rounding once and passing at most `2|S| − 1` additions among the products, one where
+    /// they meet `e_{r_a j}` and one subtraction: `k = 2|S| + 2`.
+    fn shift_residual(table: ArrayView2<'_, f64>, cycle: &RowCycle, edit: &CyclicFrequencyEdit) -> ShiftResidual {
+        let (rows, width) = table.dim();
+        let (left, right, shift) = (edit.left.view(), edit.right.view(), edit.shift);
+        let components = left.ncols();
+        let length = cycle.length();
+        let mut target = vec![None; rows];
+        for (position, &row) in cycle.rows().iter().enumerate() {
+            target[row] = Some(cycle.rows()[(position + shift % length) % length]);
+        }
+        let mut out = ShiftResidual { max_abs_residual: 0.0, max_residual_band: 0.0, max_abs_fixed_row_change: 0.0 };
+        for row in 0..rows {
+            for column in 0..width {
+                let mut change = 0.0;
+                let mut absolute_sum = 0.0;
+                for component in 0..components {
+                    let term = left[[row, component]] * right[[column, component]];
+                    change += term;
+                    absolute_sum = up(absolute_sum + up(term.abs()));
+                }
+                match target[row] {
+                    Some(shifted) => {
+                        let residual = table[[row, column]] + change - table[[shifted, column]];
+                        let bound_sum = up(up(absolute_sum + table[[row, column]].abs())
+                            + table[[shifted, column]].abs());
+                        let band = evaluation_band(components + 2, bound_sum, components as f64);
+                        out.max_abs_residual = out.max_abs_residual.max(residual.abs());
+                        out.max_residual_band = out.max_residual_band.max(band);
+                    }
+                    None => out.max_abs_fixed_row_change = out.max_abs_fixed_row_change.max(change.abs()),
+                }
+            }
+        }
+        out
+    }
+
     /// The largest `evaluation_band(1, |entry|, 0)` over a matrix: one rounding per entry, a
     /// difference of two characters, which carries no underflow allowance.
     fn one_rounding(matrix: ArrayView2<'_, f64>) -> f64 {
@@ -772,7 +705,7 @@ mod tests {
         let spacing = minimum_row_spacing(&table);
         for shift in 1..LENGTH {
             let edit = frequency_edit(&cycle, basis.view(), &ALL, shift).expect("a declared cycle");
-            let residual = shift_residual(table.view(), &cycle, &edit).expect("matching shapes");
+            let residual = shift_residual(table.view(), &cycle, &edit);
             let bound = every_plane_bound(&table, full.view(), &edit);
             assert!(
                 residual.max_abs_residual <= up(bound + residual.max_residual_band),
@@ -785,11 +718,6 @@ mod tests {
                 up(bound + residual.max_residual_band) < spacing,
                 "shift {shift}: derived bound {bound:e} does not resolve the row spacing {spacing:e}"
             );
-            assert_eq!(residual.region, ShiftRegion { shift, cycled_rows: LENGTH, columns: WIDTH });
-            assert!(matches!(
-                residual.residual_status().expect("a finite bound"),
-                EvidenceStatus::UniformBound { upper, .. } if upper >= residual.max_abs_residual
-            ));
             // The row outside the cycle is not touched at all.
             assert!(edit.left.row(FIXED_ROW).iter().all(|&value| value == 0.0));
             assert_eq!(residual.max_abs_fixed_row_change, 0.0);
@@ -806,7 +734,7 @@ mod tests {
         let full = full_basis(planes.mean.view(), basis.view());
         let reconstruction = reconstruction_defect(&table, full.view(), &[1]);
         let correct = frequency_edit(&cycle, basis.view(), &[1], 1).expect("a declared cycle");
-        let at_one = shift_residual(table.view(), &cycle, &correct).expect("matching shapes");
+        let at_one = shift_residual(table.view(), &cycle, &correct);
         let bound = up(up(2.0 * reconstruction) + up(inf_norm_upper(basis.view()) * one_rounding(correct.left.view())));
         assert!(
             at_one.max_abs_residual <= up(bound + at_one.max_residual_band),
@@ -816,7 +744,7 @@ mod tests {
         // Plane 1 moved along frequency 2's characters is not the shift: the same bound refutes it, with its
         // own coordinate rounding added, at a held-out entry.
         let wrong = frequency_edit(&cycle, basis.view(), &[2], 1).expect("a declared cycle");
-        let missed = shift_residual(table.view(), &cycle, &wrong).expect("matching shapes");
+        let missed = shift_residual(table.view(), &cycle, &wrong);
         let wrong_bound =
             up(up(2.0 * reconstruction) + up(inf_norm_upper(basis.view()) * one_rounding(wrong.left.view())));
         assert!(

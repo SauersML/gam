@@ -1,4 +1,4 @@
-//! Minimum-code supports over the singular components of the induction benchmark's heads (#2951 S2b).
+//! Ranked supports over the singular components of the induction benchmark's heads (#2951 S2b).
 //!
 //! `mpd_induction_components --export REGISTRY_EXPORT --settings SETTINGS_JSON --out REPORT_JSON`
 //!
@@ -37,6 +37,14 @@
 //! do-nothing divergence (every declared group off), `ε_f = f · b̂`, and declared absolute tolerances; a tolerance
 //! whose certified support is empty is labelled vacuous.
 //!
+//! # Search
+//! `supports::ranked_support` finds the shortest sufficient leading run of the groups ranked by descending singular
+//! mass, the order the oracle splits them in, in `O(log C)` separations. It is not a minimum over all subsets. Each
+//! tolerance reports `status` (`certified` or `unresolved`, or the search's refusal), the run's `code_bits` and
+//! `refuted_shorter`, the run one shorter when that was refuted. Reports from before the ranked search carried
+//! `code_status`, a `code_bits_lower`/`code_bits_upper` bracket and `edges` from a minimum-code search; they are not
+//! comparable.
+//!
 //! # Nulls at equal code
 //! At the certified support's per-circuit counts:
 //! * **bottom:** each circuit's same number of groups of least singular mass, in the same decomposition, so the
@@ -67,7 +75,7 @@ use gam_sae::parameter_decomposition::rewrite::ComponentRead;
 use gam_sae::parameter_decomposition::seed::RankRevealingRead;
 use gam_sae::parameter_decomposition::supports::{
     BoxDivergence, BoxEnclosure, BoxSeparationOracle, ComponentSet, EvidenceStatus, ExactBasis,
-    Extremum, FailureHypergraph, MaskBox, MaskSide, SeparationOracle, minimum_code_support,
+    CardinalityCode, Extremum, MaskBox, MaskSide, SeparationOracle, ranked_support,
 };
 use ndarray::{Array2, s};
 use rand::rngs::StdRng;
@@ -508,12 +516,14 @@ struct ToleranceReport {
     declared: f64,
     tolerance: f64,
     vacuous: bool,
-    code_status: String,
-    code_bits_lower: f64,
-    code_bits_upper: f64,
+    /// `certified` or `unresolved` for the found run, or the search's refusal.
+    status: String,
+    /// The found run's padded group code; infinite when the search was refused.
+    code_bits: f64,
     support: Vec<String>,
     separations: usize,
-    edges: Vec<Vec<String>>,
+    /// The run one shorter, when the search refuted it.
+    refuted_shorter: Option<Vec<String>>,
     nulls: Option<NullReport>,
 }
 
@@ -747,6 +757,9 @@ fn main() -> Result<(), String> {
         .map(|&fraction| ("relative", fraction, fraction * do_nothing))
         .chain(settings.absolute_tolerances.iter().map(|&tolerance| ("absolute", tolerance, tolerance)))
         .collect();
+    // The ranking: groups by descending singular mass, the order the box oracle splits them in.
+    let mut ranking: Vec<usize> = (0..groups.len()).collect();
+    ranking.sort_by(|left, right| groups[*right].mass.total_cmp(&groups[*left].mass));
     let mut rng = StdRng::seed_from_u64(settings.haar_seed);
     let mut reports = Vec::with_capacity(entries.len());
     for &(scale, declared, tolerance) in &entries {
@@ -761,7 +774,7 @@ fn main() -> Result<(), String> {
             };
             let oracle = BoxSeparationOracle::new(program, tolerance).map_err(|error| format!("{error:?}"))?;
             let mut oracle = Logged::new(oracle, format!("{scale} declared={declared:.3e}"));
-            minimum_code_support(&mut oracle, &code, tolerance, FailureHypergraph::new(groups.len()))
+            ranked_support(&mut oracle, &ranking, tolerance)
         };
         let search = match search {
             Ok(search) => search,
@@ -772,33 +785,30 @@ fn main() -> Result<(), String> {
                     declared,
                     tolerance,
                     vacuous: false,
-                    code_status: format!("{error:?}"),
-                    code_bits_lower: f64::INFINITY,
-                    code_bits_upper: f64::INFINITY,
+                    status: format!("{error:?}"),
+                    code_bits: f64::INFINITY,
                     support: Vec::new(),
                     separations: 0,
-                    edges: Vec::new(),
+                    refuted_shorter: None,
                     nulls: None,
                 });
                 continue;
             }
         };
-        let (code_status, code_bits_lower, code_bits_upper) = match &search.code {
-            EvidenceStatus::Exact { value, .. } => ("exact", *value, *value),
-            EvidenceStatus::Unresolved { lower, upper, .. } => ("unresolved", *lower, *upper),
-            other => return Err(format!("tolerance {tolerance}: an unexpected code status {other:?}")),
-        };
-        let certified = search.certified.as_ref().map(|found| found.support.clone());
-        let support: Vec<String> = certified
-            .as_ref()
-            .map_or_else(Vec::new, |support| support.members().iter().map(|&group| names[group].clone()).collect());
-        let vacuous = code_status == "exact" && certified.as_ref().is_some_and(|support| support.is_empty());
-        let edges = search
-            .hypergraph
-            .edges()
-            .iter()
-            .map(|edge| edge.perturbed.members().iter().map(|&group| names[group].clone()).collect())
-            .collect();
+        let named = |support: &ComponentSet| support.members().iter().map(|&group| names[group].clone()).collect::<Vec<String>>();
+        let certified = search
+            .found
+            .evidence
+            .certifies_at_most(tolerance)
+            .then(|| search.found.support.clone());
+        let status = if certified.is_some() { "certified" } else { "unresolved" };
+        // Integer code lengths convert to f64 exactly below 2^53 bits.
+        let code_bits = code
+            .support_bits(groups.len(), search.found.support.len())
+            .map_err(|error| format!("tolerance {tolerance}: {error:?}"))? as f64;
+        let support: Vec<String> = certified.as_ref().map_or_else(Vec::new, &named);
+        let vacuous = certified.as_ref().is_some_and(|support| support.is_empty());
+        let refuted_shorter = search.refuted_shorter.as_ref().map(|shorter| named(&shorter.support));
 
         // Nulls at the certified support's per-circuit counts.
         let nulls = match &certified {
@@ -872,9 +882,8 @@ fn main() -> Result<(), String> {
             None => None,
         };
         println!(
-            "[components] {scale} declared={declared:.3e} tolerance={tolerance:.3e} code={code_status} bits=[{code_bits_lower}, {code_bits_upper}] support={support:?} vacuous={vacuous} separations={} edges={} bottom={:?} haar={:?}",
+            "[components] {scale} declared={declared:.3e} tolerance={tolerance:.3e} status={status} bits={code_bits} support={support:?} vacuous={vacuous} separations={} refuted_shorter={refuted_shorter:?} bottom={:?} haar={:?}",
             search.separations,
-            search.hypergraph.edges().len(),
             nulls.as_ref().map(|nulls| nulls.bottom_verdict.clone()),
             nulls.as_ref().map(|nulls| nulls.haar_verdicts.clone()),
         );
@@ -883,12 +892,11 @@ fn main() -> Result<(), String> {
             declared,
             tolerance,
             vacuous,
-            code_status: code_status.to_string(),
-            code_bits_lower,
-            code_bits_upper,
+            status: status.to_string(),
+            code_bits,
             support,
             separations: search.separations,
-            edges,
+            refuted_shorter,
             nulls,
         });
     }

@@ -47,8 +47,9 @@
 //! is at most `gamma_{m+2} sum_i |X_ci X_ki| <= gamma_{m+2} ||X_c||_F ||X_k||_F`, and
 //! the Frobenius norm of the Gram's formation error is at most `gamma_{m+2} tr(G)` to
 //! first order. A label dimension `d` is admitted only when
-//! `d <= resolved_eigenvalue_count(lambda, gamma_{m+2} tr(G))`. A direction built from
-//! an eigenvalue inside that band is rounding divided by `sqrt(lambda)`, and it never
+//! `d <= resolved_eigenvalue_count(lambda, gamma_{m+2} tr(G))`, which counts the
+//! eigenvalues above the eigensolver's `symmetric_spectrum_rounding_band` plus that
+//! formation band. A direction built from an eigenvalue inside that band is rounding divided by `sqrt(lambda)`, and it never
 //! enters a proposal. The Gram route costs `O(n^2 m)` time and `O(n^2 + (d + 2) m)`
 //! memory and never stacks the members. It squares their conditioning, so a mode whose
 //! singular value lies below the band's square root is not proposed.
@@ -70,8 +71,8 @@
 //! Every real passes through `precision`'s declared lattice. The decoder refuses a
 //! label dimension of at least the member count (such a family has no canonical
 //! directions), a lattice message whose count or declared precision disagrees with
-//! the family, trailing bits, and a component count whose index state exceeds the
-//! host in-core budget, before it allocates that state. Decoding makes one pass over
+//! the family, trailing bits, and a component count whose index state the process
+//! memory governor does not reserve, before it allocates that state. Decoding makes one pass over
 //! the unassigned components per family, and every family costs at least three bits.
 //!
 //! # Scoring
@@ -111,6 +112,7 @@ use crate::basis::{EuclideanPatchEvaluator, SaeBasisEvaluator};
 use faer::Side;
 use gam_linalg::faer_ndarray::{FaerLinalgError, strict_symmetric_eigh};
 use gam_linalg::roundoff::{SymmetricAssembly, accumulation_growth, resolved_eigenvalue_count};
+use gam_runtime::resource::{MemoryGovernor, MemoryReservation, MemoryReservationError};
 use ndarray::{Array2, ArrayView2};
 
 /// Why a family proposal was not built, encoded or decoded.
@@ -126,12 +128,10 @@ pub enum FamilyError {
         dimension: usize,
         resolved: usize,
     },
-    /// The dense state exceeds the host in-core budget. `required_bytes` is `None`
-    /// when the count overflows `usize`.
-    AdmissionRefused {
-        required_bytes: Option<usize>,
-        budget_bytes: usize,
-    },
+    /// The dense state's byte count overflows `usize`.
+    BytesOverflow,
+    /// The process memory governor refused the dense state.
+    Memory(MemoryReservationError),
     /// The eigensolver refused the Gram.
     Eigen(FaerLinalgError),
     /// A message could not be written or read.
@@ -154,22 +154,8 @@ impl fmt::Display for FamilyError {
                 "the family led by component {first_member} asks for {dimension} label \
                  dimensions, while its centered Gram resolves {resolved} above its rounding band"
             ),
-            Self::AdmissionRefused {
-                required_bytes: Some(required),
-                budget_bytes,
-            } => write!(
-                f,
-                "family refused: its dense state needs at least {required} bytes, above the host \
-                 in-core budget of {budget_bytes} bytes"
-            ),
-            Self::AdmissionRefused {
-                required_bytes: None,
-                budget_bytes,
-            } => write!(
-                f,
-                "family refused: its byte count overflows usize (host in-core budget \
-                 {budget_bytes} bytes)"
-            ),
+            Self::BytesOverflow => write!(f, "family refused: its byte count overflows usize"),
+            Self::Memory(error) => write!(f, "family refused by the memory governor: {error}"),
             Self::Eigen(error) => write!(f, "family spectrum refused: {error}"),
             Self::Code(reason) => write!(f, "family message refused: {reason}"),
             Self::Field(reason) => write!(f, "family field refused: {reason}"),
@@ -183,17 +169,13 @@ fn code_error(error: CodecError) -> FamilyError {
     FamilyError::Code(error.to_string())
 }
 
-/// Refuses a dense state whose byte count overflows or exceeds the host in-core
-/// budget.
-fn admit_bytes(required_bytes: Option<usize>) -> Result<(), FamilyError> {
-    let budget_bytes = crate::manifold::sae_host_in_core_budget_bytes().0;
-    match required_bytes {
-        Some(required) if required <= budget_bytes => Ok(()),
-        required_bytes => Err(FamilyError::AdmissionRefused {
-            required_bytes,
-            budget_bytes,
-        }),
-    }
+/// Reserves a dense state on the process memory governor before it is allocated,
+/// refusing a byte count that overflows.
+fn admit_bytes(required_bytes: Option<usize>, context: &str) -> Result<MemoryReservation, FamilyError> {
+    let required = required_bytes.ok_or(FamilyError::BytesOverflow)?;
+    MemoryGovernor::global()
+        .try_reserve(required, context)
+        .map_err(FamilyError::Memory)
 }
 
 /// One family: its members, ascending, and its label dimension.
@@ -413,7 +395,7 @@ pub struct PrincipalField {
 ///
 /// Refuses components that are not one finite tensor class, malformed members, a
 /// dimension of at least the member count or above the resolved dimension, and a
-/// dense state beyond the host in-core budget.
+/// dense state the process memory governor does not reserve.
 pub fn principal_field(
     components: &[ArrayView2<'_, f64>],
     members: &[usize],
@@ -441,7 +423,7 @@ fn principal_field_of_class(
     }
     let entries = rows * cols;
     // The Gram and its eigenvectors, the center and the directions.
-    admit_bytes(
+    let reservation = admit_bytes(
         n.checked_mul(n)
             .and_then(|square| square.checked_mul(2))
             .and_then(|squares| {
@@ -451,6 +433,7 @@ fn principal_field_of_class(
                     .and_then(|doubles| doubles.checked_add(squares))
             })
             .and_then(|doubles| doubles.checked_mul(std::mem::size_of::<f64>())),
+        "principal family field",
     )?;
     let mut center = Array2::<f64>::zeros((rows, cols));
     for &member in members {
@@ -507,6 +490,7 @@ fn principal_field_of_class(
         })
         .collect();
     let labels = Array2::from_shape_fn((n, dimension), |(i, a)| roots[a] * vectors[[i, order[a]]]);
+    drop(reservation);
     Ok(PrincipalField {
         center,
         directions,
@@ -789,7 +773,10 @@ fn decode_families(artifact: &FamilyArtifact) -> Result<DecodedFamilies, FamilyE
         FamilyError::InvalidPartition(format!("component count {announced}: {error}"))
     })?;
     // The unassigned list, the placements and every member list: 4C indices.
-    admit_bytes(components.checked_mul(4 * std::mem::size_of::<usize>()))?;
+    let reservation = admit_bytes(
+        components.checked_mul(4 * std::mem::size_of::<usize>()),
+        "family message index state",
+    )?;
     let mut remaining: Vec<usize> = (0..components).collect();
     let mut placement = vec![(0_usize, 0_usize); components];
     let mut families: Vec<DecodedFamily> = Vec::new();
@@ -837,6 +824,7 @@ fn decode_families(artifact: &FamilyArtifact) -> Result<DecodedFamilies, FamilyE
         });
     }
     reader.finish().map_err(code_error)?;
+    drop(reservation);
     let precision = precision.ok_or_else(|| {
         FamilyError::Code("the message carries no real, so it declares no precision".to_string())
     })?;
@@ -1713,8 +1701,8 @@ mod tests {
         let refusal = FamilyArtifact::from_message(rows, cols, huge)
             .expect("shape")
             .decode()
-            .expect_err("2^62 components exceed the host");
-        assert!(refusal.contains("budget"), "{refusal}");
+            .expect_err("2^62 components overflow the index state's byte count");
+        assert!(refusal.contains("overflows usize"), "{refusal}");
     }
 
     /// `field`'s instance `sum_j s_j B'_j` of `member`, read through the anchor at the mask

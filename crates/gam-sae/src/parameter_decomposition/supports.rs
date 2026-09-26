@@ -29,7 +29,7 @@
 //! a witness for an underived side, and a counterexample that roundoff could
 //! explain.
 //!
-//! # Supports as hitting sets
+//! # Supports
 //!
 //! Fix a decomposition with `C` components and an input-independent control
 //! program `Theta : M -> P` with `Theta(1) = theta_*` over a declared mask domain
@@ -48,23 +48,11 @@
 //! * **Hitting sets (P12).** A mask `m` is bad when `d > eps`, and it perturbs
 //!   `A(m) = {c : m_c != 1}`. `S` is sufficient iff it hits `A(m)` for every bad
 //!   mask, so redundancy is an OR constraint over components, not two scalar
-//!   importances. A refutation with no witness mask still cuts: every bad mask
-//!   admissible under `S` perturbs only components outside `S`, so the complement
-//!   of `S` is an edge.
-//! * **Minimum code.** When the support code depends only on the support size, as
-//!   P18's enumerative subset code does, every superset of a hitting set is a
-//!   hitting set. Every sufficient support hits every known edge, so its code is at
-//!   least `min_{k >= tau} L(C, k)` for any lower bound `tau` on the hitting-set
-//!   size; the disjoint-packing count is one. Counterexample-guided refinement
-//!   (CEGAR) alternates a greedy hitting set with the declared separation oracle.
-//!   A certified candidate whose code meets that lower bound is optimal for the
-//!   chosen support code and the fixed decomposition; otherwise the minimum code is
-//!   reported unresolved between the two, as it is when the oracle neither refutes
-//!   nor certifies a candidate.
-//! * **Conflict replay.** When the decomposition changes, each recorded bad mask
-//!   is mapped into the new coordinates and re-evaluated by the new oracle. A mask
-//!   with no representative is dropped, and a mask that is no longer bad is
-//!   discarded, never kept on trust.
+//!   importances.
+//! * **Ranked support.** Upward closure makes "the leading run of length `k` of a ranking is
+//!   sufficient" monotone in `k`, so [`ranked_support`] bisects on the run length and asks the
+//!   oracle `O(log C)` times. The result is the shortest sufficient run of that ranking, not a
+//!   minimum over all subsets.
 //!
 //! # Separation over mask boxes
 //!
@@ -105,16 +93,13 @@ pub struct Validated(());
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExactBasis {
     /// An algebraic identity over the whole domain, e.g. P8's support function
-    /// `h(u) = sum_c max(0, u'v_c)`.
+    /// `h(u) = sum_{c free} max(least_c u'v_c, most_c u'v_c)`, where control `c`'s
+    /// deletion `1 - m_c` ranges over `[least_c, most_c]`; on the `[0, 1]` domain this is
+    /// `sum_{c free} max(0, u'v_c)`.
     Algebraic,
     /// Every one of the `cardinality` members of the finite family named by the
     /// domain was evaluated.
     Exhaustive { cardinality: u64 },
-    /// A search over the finite family named by the domain closed: every member
-    /// was evaluated or excluded by a proven bound, e.g. P12's branch and bound
-    /// over the `2^C` supports of `C` components, a family too large to count in a
-    /// `u64`.
-    ClosedSearch,
 }
 
 /// Which extremum a reported number is, and so which side of an interval a
@@ -689,175 +674,6 @@ impl ComponentSet {
         }
     }
 
-    /// The set grown to `size` members by adding the smallest absent indices.
-    fn extended_to(&self, size: usize) -> Self {
-        let mut members = self.members.clone();
-        for index in 0..self.components {
-            if members.len() >= size {
-                break;
-            }
-            if self.members.binary_search(&index).is_err() {
-                members.push(index);
-            }
-        }
-        members.sort_unstable();
-        Self {
-            components: self.components,
-            members,
-        }
-    }
-}
-
-/// A recorded failure: the components a bad mask perturbs, and the mask.
-#[derive(Clone, Debug, PartialEq)]
-pub struct FailureEdge<M> {
-    /// `A(m) = {c : m_c != 1}`, or the complement of a support refuted without a
-    /// witness.
-    pub perturbed: ComponentSet,
-    /// The bad mask, or `None` for a complement cut.
-    pub witness: Option<M>,
-}
-
-/// The inclusion-minimal failure edges recorded for a fixed decomposition. A
-/// support is sufficient only if it hits every edge.
-#[derive(Clone, Debug, PartialEq)]
-pub struct FailureHypergraph<M> {
-    components: usize,
-    edges: Vec<FailureEdge<M>>,
-}
-
-impl<M> FailureHypergraph<M> {
-    /// A hypergraph over `components` components with no edges.
-    pub fn new(components: usize) -> Self {
-        Self {
-            components,
-            edges: Vec::new(),
-        }
-    }
-
-    /// The number of components `C`.
-    pub fn components(&self) -> usize {
-        self.components
-    }
-
-    /// The recorded inclusion-minimal edges.
-    pub fn edges(&self) -> &[FailureEdge<M>] {
-        &self.edges
-    }
-
-    /// Records an edge and returns whether it was kept. A recorded subset makes it
-    /// redundant, since hitting the subset hits it; it makes recorded supersets
-    /// redundant in turn.
-    pub fn insert(&mut self, edge: FailureEdge<M>) -> Result<bool, HypergraphError> {
-        require_same_components(self.components, edge.perturbed.components())?;
-        if edge.perturbed.is_empty() {
-            return Err(HypergraphError::EmptyEdge);
-        }
-        if self
-            .edges
-            .iter()
-            .any(|recorded| recorded.perturbed.is_subset_of(&edge.perturbed))
-        {
-            return Ok(false);
-        }
-        self.edges
-            .retain(|recorded| !edge.perturbed.is_subset_of(&recorded.perturbed));
-        self.edges.push(edge);
-        Ok(true)
-    }
-
-    /// A hitting set of the recorded edges and a lower bound on the size of every one.
-    ///
-    /// The set is greedy: repeatedly the component in the most unhit edges. The bound is the
-    /// number of pairwise disjoint edges a greedy packing finds, since disjoint edges need
-    /// distinct components. When the two meet the set is a minimum. Minimum hitting set is
-    /// NP-hard and an exact branch and bound is exponential in the edges a nonlinear
-    /// separation records; this pair costs the total edge length per pick and states its gap.
-    /// With no edges it is the empty set and the bound is zero.
-    pub fn hitting_set_bounds(&self) -> (ComponentSet, usize) {
-        let edges: Vec<&[usize]> = self
-            .edges
-            .iter()
-            .map(|edge| edge.perturbed.members())
-            .collect();
-        let mut members = greedy_hitting_set(&edges, self.components);
-        members.sort_unstable();
-        let owned: Vec<Vec<usize>> = edges.iter().map(|edge| edge.to_vec()).collect();
-        (
-            ComponentSet {
-                components: self.components,
-                members,
-            },
-            disjoint_packing(&owned, self.components),
-        )
-    }
-}
-
-/// A hitting set built by repeatedly taking the component that hits the most unhit
-/// edges, the largest index on ties. Each component's count of unhit edges falls as
-/// its edges are hit, through a compressed index from components to their edges, and a
-/// max-heap holds the counts with stale entries skipped on pop: the whole set costs the
-/// component count plus the total edge length times a logarithm.
-fn greedy_hitting_set(edges: &[&[usize]], components: usize) -> Vec<usize> {
-    let mut count = vec![0usize; components];
-    for edge in edges {
-        for &component in edge.iter() {
-            count[component] += 1;
-        }
-    }
-    let mut start = vec![0usize; components + 1];
-    for component in 0..components {
-        start[component + 1] = start[component] + count[component];
-    }
-    let mut fill = start.clone();
-    let mut edges_of = vec![0usize; start[components]];
-    for (index, edge) in edges.iter().enumerate() {
-        for &component in edge.iter() {
-            edges_of[fill[component]] = index;
-            fill[component] += 1;
-        }
-    }
-    let mut heap: std::collections::BinaryHeap<(usize, usize)> = (0..components)
-        .filter(|&component| count[component] > 0)
-        .map(|component| (count[component], component))
-        .collect();
-    let mut hit = vec![false; edges.len()];
-    let mut picked = Vec::new();
-    while let Some((unhit, component)) = heap.pop() {
-        if unhit == 0 || count[component] != unhit {
-            continue;
-        }
-        picked.push(component);
-        for &index in &edges_of[start[component]..start[component + 1]] {
-            if !std::mem::replace(&mut hit[index], true) {
-                for &member in edges[index] {
-                    count[member] -= 1;
-                    if member != component && count[member] > 0 {
-                        heap.push((count[member], member));
-                    }
-                }
-            }
-        }
-    }
-    picked
-}
-
-/// The number of pairwise disjoint edges a greedy packing finds. Disjoint edges
-/// need distinct components, so it bounds the components still needed from below.
-fn disjoint_packing(edges: &[Vec<usize>], components: usize) -> usize {
-    let mut order: Vec<usize> = (0..edges.len()).collect();
-    order.sort_by_key(|&index| edges[index].len());
-    let mut used = vec![false; components];
-    let mut count = 0;
-    for index in order {
-        if edges[index].iter().all(|&component| !used[component]) {
-            for &component in &edges[index] {
-                used[component] = true;
-            }
-            count += 1;
-        }
-    }
-    count
 }
 
 /// A support code whose length depends only on how many of the `C` components a
@@ -916,10 +732,9 @@ pub trait SeparationOracle {
     ) -> Result<EvidenceStatus<Self::Mask, Self::Domain>, Self::Error>;
 }
 
-/// Why a support search, a union or a replay was refused. `E` is the oracle's
-/// error and `C` the support code's.
+/// Why a support search or a union was refused. `E` is the oracle's error.
 #[derive(Debug)]
-pub enum SupportSearchError<E, C = Infallible> {
+pub enum SupportSearchError<E> {
     /// A component set or hypergraph was refused.
     Hypergraph(HypergraphError),
     /// A status could not be built.
@@ -929,22 +744,18 @@ pub enum SupportSearchError<E, C = Infallible> {
     /// A refutation perturbs no component, so the all-on setting itself violates
     /// the tolerance.
     AllOnViolation,
-    /// A refuting witness perturbs a component of the support it refutes, so it is
-    /// not admissible under that support.
-    InadmissibleWitness {
-        support: ComponentSet,
-        perturbed: ComponentSet,
-    },
+    /// A declared ranking that leaves some component out, whose whole run the oracle
+    /// refutes: no leading run of it is sufficient. Unlike [`Self::AllOnViolation`] this
+    /// says nothing about the all-on setting, since the omitted components stay free.
+    RankingRefuted { ranking: ComponentSet },
     /// A per-input support whose evidence does not certify it at its own
     /// tolerance.
     InsufficientInputSupport { input: usize },
     /// The oracle failed.
     Oracle(E),
-    /// The support code has no codeword for a support size.
-    Code(C),
 }
 
-impl<E: fmt::Display, C: fmt::Display> fmt::Display for SupportSearchError<E, C> {
+impl<E: fmt::Display> fmt::Display for SupportSearchError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Hypergraph(error) => write!(f, "{error}"),
@@ -955,39 +766,34 @@ impl<E: fmt::Display, C: fmt::Display> fmt::Display for SupportSearchError<E, C>
             Self::AllOnViolation => {
                 write!(f, "a refutation perturbs no component: the all-on setting violates the tolerance")
             }
-            Self::InadmissibleWitness { support, perturbed } => write!(
+            Self::RankingRefuted { ranking } => write!(
                 f,
-                "witness perturbs {:?}, which meets the refuted support {:?}",
-                perturbed.members(),
-                support.members()
+                "the whole ranking {:?} is refuted, so no leading run of it is sufficient",
+                ranking.members()
             ),
             Self::InsufficientInputSupport { input } => {
                 write!(f, "the support of input {input} is not certified at its tolerance")
             }
             Self::Oracle(error) => write!(f, "separation oracle failed: {error}"),
-            Self::Code(error) => write!(f, "support code failed: {error}"),
         }
     }
 }
 
-impl<E: fmt::Debug + fmt::Display, C: fmt::Debug + fmt::Display> std::error::Error
-    for SupportSearchError<E, C>
-{
-}
+impl<E: fmt::Debug + fmt::Display> std::error::Error for SupportSearchError<E> {}
 
-impl<E, C> From<HypergraphError> for SupportSearchError<E, C> {
+impl<E> From<HypergraphError> for SupportSearchError<E> {
     fn from(error: HypergraphError) -> Self {
         Self::Hypergraph(error)
     }
 }
 
-impl<E, C> From<EvidenceStatusError> for SupportSearchError<E, C> {
+impl<E> From<EvidenceStatusError> for SupportSearchError<E> {
     fn from(error: EvidenceStatusError) -> Self {
         Self::Evidence(error)
     }
 }
 
-fn require_tolerance<E, C>(tolerance: f64) -> Result<(), SupportSearchError<E, C>> {
+fn require_tolerance<E>(tolerance: f64) -> Result<(), SupportSearchError<E>> {
     if tolerance.is_finite() && tolerance >= 0.0 {
         Ok(())
     } else {
@@ -995,170 +801,11 @@ fn require_tolerance<E, C>(tolerance: f64) -> Result<(), SupportSearchError<E, C
     }
 }
 
-/// The family a support search reports over: the supports of `components`
-/// components, at the declared `tolerance`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SupportDomain {
-    pub components: usize,
-    pub tolerance: f64,
-}
-
 /// A support with the oracle's evidence about its risk.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SupportEvidence<M, D> {
     pub support: ComponentSet,
     pub evidence: EvidenceStatus<M, D>,
-}
-
-/// The outcome of counterexample-guided support search.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SupportSearch<M, D> {
-    /// The minimum code in bits over sufficient supports, for the chosen support
-    /// code and the fixed decomposition only. Exact when the search closed;
-    /// otherwise unresolved, with the certified support attaining `upper` as its
-    /// witness.
-    pub code: EvidenceStatus<ComponentSet, SupportDomain>,
-    /// The certified support with the smallest code found, and its evidence.
-    pub certified: Option<SupportEvidence<M, D>>,
-    /// The minimum-code candidate the oracle neither refuted nor certified, when
-    /// the search did not close.
-    pub undecided: Option<SupportEvidence<M, D>>,
-    /// The failure hypergraph at termination, to replay after the decomposition
-    /// changes.
-    pub hypergraph: FailureHypergraph<M>,
-    /// The oracle separations performed.
-    pub separations: usize,
-}
-
-/// CEGAR for a minimum-code sufficient support (P12), starting from `hypergraph`
-/// (empty, or replayed after a decomposition change).
-///
-/// Each round takes a greedy hitting set, the cheapest size at or above it, and asks
-/// the oracle about the candidate. A certificate closes the search, exactly when the
-/// candidate's code meets the lower bound from the packing count and otherwise with the
-/// gap between them. A refutation records the witness's perturbed set, or the
-/// candidate's complement when there is no witness. That edge misses the candidate
-/// while every recorded edge hits it, so each round marks a new support unsafe and
-/// the loop ends after at most `2^C` rounds, with no iteration cap. A candidate
-/// that is neither refuted nor certified ends the search unresolved: the lower
-/// bound is the packing bound's code, and the upper bound is the full support's code
-/// when the oracle certifies the full support.
-pub fn minimum_code_support<O, K>(
-    oracle: &mut O,
-    code: &K,
-    tolerance: f64,
-    mut hypergraph: FailureHypergraph<O::Mask>,
-) -> Result<SupportSearch<O::Mask, O::Domain>, SupportSearchError<O::Error, K::Error>>
-where
-    O: SeparationOracle,
-    K: CardinalityCode + ?Sized,
-{
-    require_tolerance::<O::Error, K::Error>(tolerance)?;
-    let components = oracle.components();
-    require_same_components(components, hypergraph.components())?;
-    let domain = SupportDomain {
-        components,
-        tolerance,
-    };
-    let mut separations = 0;
-    loop {
-        let (hitting, packing) = hypergraph.hitting_set_bounds();
-        let (size, bits) =
-            code.cheapest_size(components, hitting.len()).map_err(SupportSearchError::Code)?;
-        let (_, lower_bits) =
-            code.cheapest_size(components, packing).map_err(SupportSearchError::Code)?;
-        let candidate = hitting.extended_to(size);
-        let evidence = oracle
-            .separate(&candidate)
-            .map_err(SupportSearchError::Oracle)?;
-        separations += 1;
-        if evidence.certifies_at_most(tolerance) {
-            // Integer code lengths convert to f64 exactly below 2^53 bits.
-            let minimum_code = if lower_bits == bits {
-                EvidenceStatus::exact(
-                    bits as f64,
-                    0.0,
-                    ExactBasis::ClosedSearch,
-                    Some(candidate.clone()),
-                    domain,
-                )?
-            } else {
-                EvidenceStatus::unresolved(
-                    lower_bits as f64,
-                    bits as f64,
-                    Extremum::Infimum,
-                    Some(candidate.clone()),
-                    domain,
-                )?
-            };
-            return Ok(SupportSearch {
-                code: minimum_code,
-                certified: Some(SupportEvidence {
-                    support: candidate,
-                    evidence,
-                }),
-                undecided: None,
-                hypergraph,
-                separations,
-            });
-        }
-        if !evidence.refutes_at_most(tolerance) {
-            let all = ComponentSet::all(components);
-            let certified = if candidate == all {
-                None
-            } else {
-                let full = oracle.separate(&all).map_err(SupportSearchError::Oracle)?;
-                separations += 1;
-                full.certifies_at_most(tolerance).then_some(SupportEvidence {
-                    support: all,
-                    evidence: full,
-                })
-            };
-            let upper = if certified.is_some() {
-                code.support_bits(components, components)
-                    .map_err(SupportSearchError::Code)? as f64
-            } else {
-                f64::INFINITY
-            };
-            let minimum_code = EvidenceStatus::unresolved(
-                lower_bits as f64,
-                upper,
-                Extremum::Infimum,
-                certified.as_ref().map(|found| found.support.clone()),
-                domain,
-            )?;
-            return Ok(SupportSearch {
-                code: minimum_code,
-                certified,
-                undecided: Some(SupportEvidence {
-                    support: candidate,
-                    evidence,
-                }),
-                hypergraph,
-                separations,
-            });
-        }
-        let perturbed = match evidence.witness() {
-            Some(mask) => {
-                let perturbed = ComponentSet::new(components, oracle.perturbed_components(mask))?;
-                if perturbed.intersects(&candidate) {
-                    return Err(SupportSearchError::InadmissibleWitness {
-                        support: candidate,
-                        perturbed,
-                    });
-                }
-                perturbed
-            }
-            None => candidate.complement(),
-        };
-        if perturbed.is_empty() {
-            return Err(SupportSearchError::AllOnViolation);
-        }
-        hypergraph.insert(FailureEdge {
-            perturbed,
-            witness: evidence.into_witness(),
-        })?;
-    }
 }
 
 /// The shortest sufficient leading run of a declared ranking.
@@ -1179,9 +826,13 @@ pub struct RankedSupport<M, D> {
 /// Clamping more controls shrinks the admissible set, so the risk is monotone under
 /// supersets (P7) and "the run of length `k` is sufficient" is monotone in `k`. The
 /// search keeps a refuted length below a length the oracle did not refute and halves
-/// the gap, so it asks the oracle `ceil(log2(C + 1)) + 1` times instead of once per
-/// component as CEGAR does. The full support is asked first; if it is refuted the
-/// tolerance is below what the all-on setting meets and the search is refused.
+/// the gap, so for a ranking of `K` components it asks the oracle at most
+/// `ceil(log2(K + 1)) + 1` times instead of once per component. The whole
+/// ranking is asked first, and if it is refuted the search is refused: with
+/// [`SupportSearchError::AllOnViolation`] when the ranking lists every component, since its
+/// run is then the full support and the tolerance is below what the all-on setting meets,
+/// and otherwise with [`SupportSearchError::RankingRefuted`], since the components the
+/// ranking omits stay free and the all-on setting is not what was refuted.
 ///
 /// A run the oracle neither refutes nor certifies counts as not refuted, and the result
 /// carries that evidence unchanged: the returned run is certified only when its
@@ -1196,7 +847,7 @@ pub fn ranked_support<O>(
 where
     O: SeparationOracle,
 {
-    require_tolerance::<O::Error, Infallible>(tolerance)?;
+    require_tolerance::<O::Error>(tolerance)?;
     let components = oracle.components();
     let mut seen = vec![false; components];
     for &index in ranking {
@@ -1217,7 +868,13 @@ where
     };
     let mut passing = ask(oracle, ranking.len())?;
     if passing.evidence.refutes_at_most(tolerance) {
-        return Err(SupportSearchError::AllOnViolation);
+        return Err(if ranking.len() == components {
+            SupportSearchError::AllOnViolation
+        } else {
+            SupportSearchError::RankingRefuted {
+                ranking: passing.support,
+            }
+        });
     }
     let mut high = ranking.len();
     let mut refuted: Option<SupportEvidence<O::Mask, O::Domain>> = None;
@@ -1275,7 +932,7 @@ pub fn sufficient_union<M, D: Clone>(
     let mut support = ComponentSet::new(components, Vec::new())?;
     let mut inherited = Vec::with_capacity(per_input.len());
     for (input, sufficient) in per_input.iter().enumerate() {
-        require_tolerance::<Infallible, Infallible>(sufficient.tolerance)?;
+        require_tolerance::<Infallible>(sufficient.tolerance)?;
         support = support.union(&sufficient.support)?;
         let Some(upper) = sufficient
             .evidence
@@ -1308,70 +965,6 @@ pub fn sufficient_union<M, D: Clone>(
         support,
         per_input: inherited,
     })
-}
-
-/// The outcome of replaying recorded conflicts on a changed decomposition.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ConflictReplay<M> {
-    /// The replayed conflicts the new oracle still refutes, over the new
-    /// components.
-    pub hypergraph: FailureHypergraph<M>,
-    /// Recorded conflicts whose mask has no representative in the new
-    /// decomposition.
-    pub unrepresentable: usize,
-    /// Recorded conflicts the new oracle no longer refutes at the tolerance.
-    pub no_longer_bad: usize,
-    /// Complement cuts, which record no mask and so cannot be replayed.
-    pub without_witness: usize,
-}
-
-/// Replays the conflicts of `recorded` after the decomposition changes.
-/// `represent` maps an old mask to a mask of the new decomposition that sets the
-/// same parameters (for a refinement, each piece copies its parent's mask value),
-/// or `None` when no mask does. Every mapped mask is re-evaluated by the new oracle;
-/// none is kept on trust.
-pub fn replay_conflicts<O, OldMask, F>(
-    recorded: &FailureHypergraph<OldMask>,
-    mut represent: F,
-    oracle: &mut O,
-    tolerance: f64,
-) -> Result<ConflictReplay<O::Mask>, SupportSearchError<O::Error>>
-where
-    O: SeparationOracle,
-    F: FnMut(&OldMask) -> Option<O::Mask>,
-{
-    require_tolerance::<O::Error, Infallible>(tolerance)?;
-    let components = oracle.components();
-    let mut replay = ConflictReplay {
-        hypergraph: FailureHypergraph::new(components),
-        unrepresentable: 0,
-        no_longer_bad: 0,
-        without_witness: 0,
-    };
-    for edge in recorded.edges() {
-        let Some(old_mask) = &edge.witness else {
-            replay.without_witness += 1;
-            continue;
-        };
-        let Some(mask) = represent(old_mask) else {
-            replay.unrepresentable += 1;
-            continue;
-        };
-        let evidence = oracle.evaluate(&mask).map_err(SupportSearchError::Oracle)?;
-        if !evidence.refutes_at_most(tolerance) {
-            replay.no_longer_bad += 1;
-            continue;
-        }
-        let perturbed = ComponentSet::new(components, oracle.perturbed_components(&mask))?;
-        if perturbed.is_empty() {
-            return Err(SupportSearchError::AllOnViolation);
-        }
-        replay.hypergraph.insert(FailureEdge {
-            perturbed,
-            witness: Some(mask),
-        })?;
-    }
-    Ok(replay)
 }
 
 /// One component's control inside a [`MaskBox`].
@@ -1849,14 +1442,11 @@ impl<P: BoxDivergence> SeparationOracle for BoxSeparationOracle<P> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BoxDivergence, BoxEnclosure, BoxFamily, BoxOracleError, BoxSeparationOracle,
-        CardinalityCode, ComponentSet, ConflictReplay, EvidenceStatus, EvidenceStatusError,
-        ExactBasis, Extremum, FailureEdge, FailureHypergraph, HypergraphError, InputSupport,
-        MaskBox, MaskSide, SeparationOracle, SupportSearchError,
-        minimum_code_support, ranked_support, replay_conflicts, sufficient_union,
+        BoxDivergence, BoxEnclosure, BoxOracleError, BoxSeparationOracle, ComponentSet,
+        EvidenceStatus, EvidenceStatusError, ExactBasis, Extremum, HypergraphError, InputSupport,
+        MaskBox, MaskSide, SeparationOracle, SupportSearchError, ranked_support, sufficient_union,
     };
     use std::cmp::Ordering;
-    use std::convert::Infallible;
 
     type Status = EvidenceStatus<Vec<usize>, &'static str>;
 
@@ -1945,7 +1535,6 @@ mod tests {
         assert!(
             Status::exact(1.0, 0.0, ExactBasis::Exhaustive { cardinality: 1 }, None, "one").is_ok()
         );
-        assert!(Status::exact(2.0, 0.0, ExactBasis::ClosedSearch, Some(vec![0, 1]), "2^C").is_ok());
         assert!(Status::statistical_estimate(0.5, 0.1, 10, "law").is_ok());
     }
 
@@ -2133,110 +1722,31 @@ mod tests {
         }
     }
 
-    /// Code length = support size, so the minimum code is the minimum cardinality.
-    struct SizeCode;
-
-    impl CardinalityCode for SizeCode {
-        type Error = Infallible;
-
-        fn support_bits(&self, components: usize, size: usize) -> Result<u64, Infallible> {
-            Ok(size.min(components) as u64)
-        }
-    }
-
-    /// A P18-shaped subset code with Elias gamma standing in for `L_int`:
-    /// `gamma(k + 1) + ceil(log2 binom(C, k))`.
-    struct SubsetCode;
-
-    impl CardinalityCode for SubsetCode {
-        type Error = Infallible;
-
-        fn support_bits(&self, components: usize, size: usize) -> Result<u64, Infallible> {
-            let count = (size + 1) as u64;
-            let gamma = 2 * u64::from(63 - count.leading_zeros()) + 1;
-            let mut binomial = 1u64;
-            for step in 0..size {
-                binomial = binomial * (components - step) as u64 / (step + 1) as u64;
-            }
-            let enumerative = if binomial <= 1 {
-                0
-            } else {
-                u64::from(64 - (binomial - 1).leading_zeros())
-            };
-            Ok(gamma + enumerative)
-        }
-    }
-
     fn set(components: usize, members: &[usize]) -> ComponentSet {
         ComponentSet::new(components, members.to_vec()).expect("members in range")
     }
 
     #[test]
-    fn the_greedy_set_hits_every_edge_and_the_packing_bound_never_exceeds_the_minimum() {
-        // A hub joined to a, b, c, each with a pendant: {a, b, c} is the minimum, greedy takes the
-        // hub first and needs four, and the packing bound (three disjoint pendant edges) is three:
-        // the pair brackets the minimum and states the gap.
-        let edges: [&[usize]; 6] = [&[0, 1], &[0, 2], &[0, 3], &[1, 4], &[2, 5], &[3, 6]];
-        let mut hypergraph = FailureHypergraph::<()>::new(7);
-        for edge in edges {
-            hypergraph.insert(FailureEdge { perturbed: set(7, edge), witness: None }).expect("a nonempty edge");
-        }
-        let (greedy, packing) = hypergraph.hitting_set_bounds();
-        assert_eq!(greedy.len(), 4);
-        assert_eq!(packing, 3);
-        assert!(hypergraph.edges().iter().all(|edge| edge.perturbed.intersects(&greedy)));
-        for components in 3..=8usize {
-            for seed in 0..12u64 {
-                let full = (1u64 << components) - 1;
-                let mut hypergraph = FailureHypergraph::<()>::new(components);
-                let mut bitmasks = Vec::new();
-                for index in 0..(components as u64 + seed % 5) {
-                    let hash = (seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ index.wrapping_mul(0xBF58_476D_1CE4_E5B9))
-                        .wrapping_mul(0x94D0_49BB_1331_11EB)
-                        >> 17;
-                    let bits = hash % full + 1;
-                    bitmasks.push(bits);
-                    let members: Vec<usize> = (0..components).filter(|c| bits >> c & 1 == 1).collect();
-                    hypergraph
-                        .insert(FailureEdge { perturbed: set(components, &members), witness: None })
-                        .expect("a nonempty edge");
-                }
-                let exhaustive_minimum = (0..=full)
-                    .filter(|subset| bitmasks.iter().all(|edge| edge & subset != 0))
-                    .map(u64::count_ones)
-                    .min()
-                    .expect("the full set hits every edge") as usize;
-                let (greedy, packing) = hypergraph.hitting_set_bounds();
-                assert!(bitmasks.iter().all(|edge| greedy.members().iter().any(|&c| edge >> c & 1 == 1)));
-                assert!(packing <= exhaustive_minimum && exhaustive_minimum <= greedy.len(), "components {components} seed {seed}");
-            }
-        }
-    }
-
-    #[test]
-    fn cegar_keeps_the_interior_component_that_endpoint_masks_miss() {
+    fn a_ranked_search_keeps_the_interior_component_that_endpoint_masks_miss() {
         // P12: F = m1 m2 + 4 m3 (1 - m3). Endpoint masks never see m3.
         let response = |mask: &[f64]| mask[0] * mask[1] + 4.0 * mask[2] * (1.0 - mask[2]);
         let tolerance = 0.5;
+        let ranking = [0, 1, 2];
 
         let mut endpoints = GridOracle { components: 3, levels: vec![0.0, 1.0], response };
-        let found = minimum_code_support(&mut endpoints, &SizeCode, tolerance, FailureHypergraph::new(3))
-            .expect("the endpoint search closes");
-        let certified = found.certified.expect("a certified support");
-        assert_eq!(certified.support.members(), &[0, 1]);
-        assert_eq!(found.code.upper_bound(), Some(2.0));
-        assert!(found.code.lower_bound().is_some_and(|lower| lower <= 2.0));
-        assert!(found.undecided.is_none());
-        assert!(found.hypergraph.edges().iter().all(|edge| !edge.perturbed.is_subset_of(&set(3, &[2]))));
+        let found = ranked_support(&mut endpoints, &ranking, tolerance).expect("the whole run passes");
+        assert_eq!(found.found.support.members(), &[0, 1]);
+        assert!(found.found.evidence.certifies_at_most(tolerance));
+        assert_eq!(found.refuted_shorter.expect("the run {0} is refuted").support.members(), &[0]);
 
         let mut interior = GridOracle { components: 3, levels: vec![0.0, 0.5, 1.0], response };
-        let found = minimum_code_support(&mut interior, &SizeCode, tolerance, FailureHypergraph::new(3))
-            .expect("the interior search closes");
-        let certified = found.certified.expect("a certified support");
-        assert_eq!(certified.support.members(), &[0, 1, 2]);
-        assert_eq!(found.code.upper_bound(), Some(3.0));
-        assert!(found.code.lower_bound().is_some_and(|lower| lower <= 3.0));
-        assert!(found.hypergraph.edges().iter().any(|edge| edge.perturbed.members() == [2]));
+        let found = ranked_support(&mut interior, &ranking, tolerance).expect("the whole run passes");
+        assert_eq!(found.found.support.members(), &[0, 1, 2]);
+        assert!(found.found.evidence.certifies_at_most(tolerance));
+        let shorter = found.refuted_shorter.expect("the run {0, 1} is refuted");
+        assert_eq!(shorter.support.members(), &[0, 1]);
+        let witness = shorter.evidence.witness().expect("an attaining mask");
+        assert_eq!(interior.perturbed_components(witness), vec![2]);
     }
 
     #[test]
@@ -2244,18 +1754,21 @@ mod tests {
         let response = |mask: &[f64]| mask[0] + mask[1] - mask[0] * mask[1];
         let tolerance = 0.5;
         let mut oracle = GridOracle { components: 2, levels: vec![0.0, 1.0], response };
-        let found = minimum_code_support(&mut oracle, &SizeCode, tolerance, FailureHypergraph::new(2))
-            .expect("the search closes");
-        assert_eq!(found.hypergraph.edges().len(), 1);
-        assert_eq!(found.hypergraph.edges()[0].perturbed.members(), &[0, 1]);
-        assert!(matches!(found.code, EvidenceStatus::Exact { .. }));
-        assert_eq!(found.code.upper_bound(), Some(1.0));
+        // Either member alone suffices, and dropping both is refuted by the mask that perturbs the
+        // pair together: one OR constraint over the two components.
+        for member in [0usize, 1] {
+            assert!(oracle.separate(&set(2, &[member])).expect("an exhaustive separation").certifies_at_most(tolerance));
+        }
+        let neither = oracle.separate(&set(2, &[])).expect("an exhaustive separation");
+        assert!(neither.refutes_at_most(tolerance));
+        assert_eq!(oracle.perturbed_components(neither.witness().expect("an attaining mask")), vec![0, 1]);
+        let found = ranked_support(&mut oracle, &[1, 0], tolerance).expect("the whole run passes");
+        assert_eq!(found.found.support.members(), &[1]);
         // Negative control: each single deletion is harmless, so scalar importances
         // keep neither component, and the empty support they select is refuted.
         for mask in [vec![0.0, 1.0], vec![1.0, 0.0]] {
             assert!(!oracle.evaluate(&mask).expect("an exact evaluation").refutes_at_most(tolerance));
         }
-        assert!(oracle.separate(&set(2, &[])).expect("an exhaustive separation").refutes_at_most(tolerance));
     }
 
     #[test]
@@ -2286,23 +1799,56 @@ mod tests {
     }
 
     #[test]
-    fn a_full_support_is_chosen_when_the_subset_code_makes_it_shortest() {
-        // P18: with C = 4 and tau = 2, gamma(3) + ceil(log2 6) = 6 bits, while the
-        // full support costs gamma(5) + 0 = 5 bits.
+    fn a_refuted_partial_ranking_is_not_reported_as_an_all_on_violation() {
+        // Components 0 and 1 both move the output; the ranking lists only 1, so its whole
+        // run leaves 0 free and is refuted while the all-on setting meets the tolerance.
         let response = |mask: &[f64]| mask[0] * mask[1];
         let tolerance = 0.5;
-        let mut oracle = GridOracle { components: 4, levels: vec![0.0, 1.0], response };
-        assert_eq!(SubsetCode.support_bits(4, 2), Ok(6));
-        assert_eq!(SubsetCode.support_bits(4, 4), Ok(5));
-        let found = minimum_code_support(&mut oracle, &SubsetCode, tolerance, FailureHypergraph::new(4))
-            .expect("the search closes");
-        assert_eq!(found.certified.expect("a certified support").support.members(), &[0, 1, 2, 3]);
-        assert!(matches!(found.code, EvidenceStatus::Exact { .. }));
-        assert_eq!(found.code.upper_bound(), Some(5.0));
-        // Positive control: a size code on the same oracle keeps only the pair.
-        let found = minimum_code_support(&mut oracle, &SizeCode, tolerance, FailureHypergraph::new(4))
-            .expect("the search closes");
-        assert_eq!(found.certified.expect("a certified support").support.members(), &[0, 1]);
+        let mut oracle = GridOracle { components: 3, levels: vec![0.0, 1.0], response };
+        assert!(!oracle.separate(&ComponentSet::all(3)).expect("an exhaustive separation").refutes_at_most(tolerance));
+        match ranked_support(&mut oracle, &[1], tolerance) {
+            Err(SupportSearchError::RankingRefuted { ranking }) => assert_eq!(ranking.members(), &[1]),
+            other => panic!("expected a refuted ranking, got {other:?}"),
+        }
+        // Positive control: the ranking extended by the omitted mover passes.
+        let found = ranked_support(&mut oracle, &[1, 0], tolerance).expect("the run {0, 1} passes");
+        assert_eq!(found.found.support.members(), &[0, 1]);
+        assert!(found.found.evidence.certifies_at_most(tolerance));
+
+        // A ranking of every component whose run is refuted is the full support refuted,
+        // which is an all-on violation. This oracle refutes every support at its all-on mask.
+        struct Refuting;
+        impl SeparationOracle for Refuting {
+            type Mask = Vec<f64>;
+            type Domain = &'static str;
+            type Error = EvidenceStatusError;
+            fn components(&self) -> usize {
+                2
+            }
+            fn perturbed_components(&self, mask: &Vec<f64>) -> Vec<usize> {
+                perturbed(mask)
+            }
+            fn separate(
+                &mut self,
+                support: &ComponentSet,
+            ) -> Result<EvidenceStatus<Vec<f64>, &'static str>, EvidenceStatusError> {
+                self.evaluate(&vec![1.0; support.components()])
+            }
+            fn evaluate(
+                &mut self,
+                mask: &Vec<f64>,
+            ) -> Result<EvidenceStatus<Vec<f64>, &'static str>, EvidenceStatusError> {
+                EvidenceStatus::counterexample(1.0, 0.0, 0.5, mask.clone())
+            }
+        }
+        assert!(matches!(
+            ranked_support(&mut Refuting, &[1, 0], tolerance),
+            Err(SupportSearchError::AllOnViolation)
+        ));
+        assert!(matches!(
+            ranked_support(&mut Refuting, &[1], tolerance),
+            Err(SupportSearchError::RankingRefuted { .. })
+        ));
     }
 
     /// An oracle that neither refutes nor certifies a partial support.
@@ -2344,25 +1890,19 @@ mod tests {
     }
 
     #[test]
-    fn an_undecided_candidate_ends_the_search_unresolved_with_its_gap() {
+    fn an_undecided_run_counts_as_not_refuted_and_keeps_its_evidence() {
         let tolerance = 0.5;
-        let mut oracle = UndecidedOracle { components: 3, full_certified: true };
-        let found = minimum_code_support(&mut oracle, &SizeCode, tolerance, FailureHypergraph::new(3))
-            .expect("the search ends");
-        assert!(matches!(found.code, EvidenceStatus::Unresolved { extremum: Extremum::Infimum, .. }));
-        assert_eq!(found.code.lower_bound(), Some(0.0));
-        assert_eq!(found.code.upper_bound(), Some(3.0));
-        assert_eq!(found.code.gap(), Some(3.0));
-        assert!(!found.code.certifies_at_most(2.0));
-        assert_eq!(found.certified.expect("the full support is certified").support.len(), 3);
-        assert!(found.undecided.expect("an undecided candidate").support.is_empty());
-        assert_eq!(found.separations, 2);
-
-        let mut oracle = UndecidedOracle { components: 3, full_certified: false };
-        let found = minimum_code_support(&mut oracle, &SizeCode, tolerance, FailureHypergraph::new(3))
-            .expect("the search ends");
-        assert_eq!(found.code.gap(), Some(f64::INFINITY));
-        assert!(found.certified.is_none());
+        for full_certified in [true, false] {
+            let mut oracle = UndecidedOracle { components: 3, full_certified };
+            let found = ranked_support(&mut oracle, &[0, 1, 2], tolerance).expect("the search ends");
+            // Every partial run is unresolved, so none is refuted and bisection reaches the empty run,
+            // whose evidence is reported unchanged: neither certified nor refuted.
+            assert!(found.found.support.is_empty());
+            assert!(matches!(found.found.evidence, EvidenceStatus::Unresolved { .. }));
+            assert!(!found.found.evidence.certifies_at_most(tolerance));
+            assert!(found.refuted_shorter.is_none());
+            assert_eq!(found.separations, 3);
+        }
     }
 
     #[test]
@@ -2375,13 +1915,14 @@ mod tests {
         let mut per_input = Vec::new();
         for (index, tolerance) in tolerances.into_iter().enumerate() {
             let found = if index == 0 {
-                minimum_code_support(&mut at_first, &SizeCode, tolerance, FailureHypergraph::new(3))
+                ranked_support(&mut at_first, &[0, 1, 2], tolerance)
             } else {
-                minimum_code_support(&mut at_second, &SizeCode, tolerance, FailureHypergraph::new(3))
+                ranked_support(&mut at_second, &[1, 2, 0], tolerance)
             }
-            .expect("the search closes");
-            let certified = found.certified.expect("a certified support");
-            per_input.push(InputSupport { support: certified.support, tolerance, evidence: certified.evidence });
+            .expect("the whole run passes")
+            .found;
+            assert!(found.evidence.certifies_at_most(tolerance));
+            per_input.push(InputSupport { support: found.support, tolerance, evidence: found.evidence });
         }
         assert_eq!(per_input[0].support.members(), &[0]);
         assert_eq!(per_input[1].support.members(), &[1, 2]);
@@ -2461,57 +2002,6 @@ mod tests {
         assert_eq!(bracket.compare_strength(&estimate), None);
         let found = Status::counterexample(1.0, 0.0, 0.5, vec![0]).expect("a violation");
         assert_eq!(found.compare_strength(&found), None);
-    }
-
-    #[test]
-    fn conflict_replay_carries_a_refinement_and_drops_unrepresentable_repaired_and_witnessless_conflicts() {
-        let tolerance = 0.5;
-        let old_response = |mask: &[f64]| mask[0] + mask[1] - mask[0] * mask[1];
-        let mut old = GridOracle { components: 2, levels: vec![0.0, 1.0], response: old_response };
-        let recorded = minimum_code_support(&mut old, &SizeCode, tolerance, FailureHypergraph::new(2))
-            .expect("the old search closes")
-            .hypergraph;
-        assert_eq!(recorded.edges().len(), 1);
-
-        // Refinement: old component 0 splits into new pieces 0 and 1 carrying half of
-        // its moment each; old component 1 becomes new component 2.
-        let refined_response = |mask: &[f64]| {
-            let merged = 0.5 * (mask[0] + mask[1]);
-            merged + mask[2] - merged * mask[2]
-        };
-        let mut refined = GridOracle { components: 3, levels: vec![0.0, 1.0], response: refined_response };
-        let replay: ConflictReplay<Vec<f64>> =
-            replay_conflicts(&recorded, |old_mask: &Vec<f64>| Some(vec![old_mask[0], old_mask[0], old_mask[1]]), &mut refined, tolerance)
-                .expect("the replay evaluates");
-        assert_eq!(replay.hypergraph.edges().len(), 1);
-        assert_eq!(replay.hypergraph.edges()[0].perturbed.members(), &[0, 1, 2]);
-        assert_eq!((replay.unrepresentable, replay.no_longer_bad, replay.without_witness), (0, 0, 0));
-
-        let cold = minimum_code_support(&mut refined, &SizeCode, tolerance, FailureHypergraph::new(3))
-            .expect("the cold search closes");
-        let warm = minimum_code_support(&mut refined, &SizeCode, tolerance, replay.hypergraph)
-            .expect("the warm search closes");
-        assert_eq!(cold.code, warm.code);
-        assert!(warm.separations < cold.separations);
-
-        // A merge has no representative for a mask that deletes only one old piece.
-        let mut split = FailureHypergraph::new(2);
-        split
-            .insert(FailureEdge { perturbed: set(2, &[0]), witness: Some(vec![0.0, 1.0]) })
-            .expect("a nonempty edge");
-        split.insert(FailureEdge { perturbed: set(2, &[1]), witness: None }).expect("a nonempty edge");
-        let mut merged = GridOracle { components: 1, levels: vec![0.0, 1.0], response: |mask: &[f64]| mask[0] };
-        let replay = replay_conflicts(&split, |old_mask: &Vec<f64>| (old_mask[0] == old_mask[1]).then(|| vec![old_mask[0]]), &mut merged, tolerance)
-            .expect("the replay evaluates");
-        assert_eq!((replay.unrepresentable, replay.no_longer_bad, replay.without_witness), (1, 0, 1));
-        assert!(replay.hypergraph.edges().is_empty());
-
-        // A repaired decomposition no longer fails at the replayed mask.
-        let mut repaired = GridOracle { components: 3, levels: vec![0.0, 1.0], response: |mask: &[f64]| mask[0].max(1.0) };
-        let replay = replay_conflicts(&recorded, |old_mask: &Vec<f64>| Some(vec![old_mask[0], old_mask[0], old_mask[1]]), &mut repaired, tolerance)
-            .expect("the replay evaluates");
-        assert_eq!(replay.no_longer_bad, 1);
-        assert!(replay.hypergraph.edges().is_empty());
     }
 
     /// `f(m) = OR(m0, m1) + 2 m2 + 4 m3 (1 - m3) + m4 / 4` with `OR(a, b) = 1 - (1 - a)(1 - b)`,
@@ -2655,47 +2145,6 @@ mod tests {
         }
     }
 
-    /// The no-shrink mutant: every refutation comes back without its vertex, so the search can
-    /// cut only the complement of the refuted support.
-    struct WithoutWitness(BoxSeparationOracle<OrProgram>);
-
-    impl SeparationOracle for WithoutWitness {
-        type Mask = MaskBox;
-        type Domain = BoxFamily<&'static str>;
-        type Error = BoxOracleError<EvidenceStatusError>;
-
-        fn components(&self) -> usize {
-            self.0.components()
-        }
-
-        fn perturbed_components(&self, mask: &MaskBox) -> Vec<usize> {
-            self.0.perturbed_components(mask)
-        }
-
-        fn separate(&mut self, support: &ComponentSet) -> Result<EvidenceStatus<MaskBox, Self::Domain>, Self::Error> {
-            let found = self.0.separate(support)?;
-            let refuted = matches!(found, EvidenceStatus::Counterexample { .. });
-            match (refuted, found.lower_bound()) {
-                (true, Some(lower)) => Ok(EvidenceStatus::unresolved(
-                    lower,
-                    f64::INFINITY,
-                    Extremum::Supremum,
-                    None,
-                    self.0.family(),
-                )?),
-                _ => Ok(found),
-            }
-        }
-
-        fn evaluate(&mut self, mask: &MaskBox) -> Result<EvidenceStatus<MaskBox, Self::Domain>, Self::Error> {
-            self.0.evaluate(mask)
-        }
-    }
-
-    fn largest_edge<M>(hypergraph: &FailureHypergraph<M>) -> usize {
-        hypergraph.edges().iter().map(|edge| edge.perturbed.len()).max().unwrap_or(0)
-    }
-
     /// Whether each box's enclosure bounds every vertex it holds from above, the soundness a
     /// `BoxDivergence` owes its oracle, over all `3^C` boxes of `C` components.
     fn covers_its_vertices<P: BoxDivergence>(program: &mut P) -> bool
@@ -2728,8 +2177,8 @@ mod tests {
 
     /// Refinement over mask boxes decides every support the way exhaustive evaluation of the
     /// binary masks does, on a fixture with an OR constraint and an interior-mask effect: equal
-    /// minimum codes at every tolerance, and the same certify/refute decision for every
-    /// support either search queried. The box with `{0, 2}` on is not decided at `1/2` as a whole,
+    /// ranked runs at every tolerance, and the same certify/refute decision for every support
+    /// either search queried. The box with `{0, 2}` on is not decided at `1/2` as a whole,
     /// since `m3 = 1/2` moves `f` by 1, but refinement certifies it at its vertices.
     #[test]
     fn the_box_oracle_decides_every_support_as_exhaustive_evaluation_does() {
@@ -2742,19 +2191,16 @@ mod tests {
                 oracle: GridOracle { components: OR_COMPONENTS, levels: vec![0.0, 1.0], response: or_response },
                 queried: Vec::new(),
             };
-            let by_boxes = minimum_code_support(&mut boxes, &SizeCode, tolerance, FailureHypergraph::new(OR_COMPONENTS))
-                .expect("the box search closes");
-            let by_grid = minimum_code_support(&mut grid, &SizeCode, tolerance, FailureHypergraph::new(OR_COMPONENTS))
-                .expect("the exhaustive search closes");
-            // Both oracles decide every support alike, so both searches certify the same code; each
-            // brackets the minimum from below by its own recorded failures.
-            assert_eq!(
-                by_boxes.code.upper_bound(),
-                by_grid.code.upper_bound(),
-                "tolerance {tolerance}: both searches must certify one code"
-            );
-            assert!(by_boxes.code.lower_bound() <= by_boxes.code.upper_bound(), "tolerance {tolerance}");
-            assert!(by_grid.code.lower_bound() <= by_grid.code.upper_bound(), "tolerance {tolerance}");
+            // Both oracles decide every support alike, so both searches under one ranking keep the
+            // same run.
+            for ranking in [[0, 1, 2, 3, 4], [4, 3, 2, 1, 0]] {
+                let by_boxes = ranked_support(&mut boxes, &ranking, tolerance).expect("the box search ends");
+                let by_grid = ranked_support(&mut grid, &ranking, tolerance).expect("the exhaustive search ends");
+                assert_eq!(
+                    by_boxes.found.support, by_grid.found.support,
+                    "tolerance {tolerance}, ranking {ranking:?}: both searches must keep one run"
+                );
+            }
             let queried: Vec<ComponentSet> = boxes.queried.iter().chain(grid.queried.iter()).cloned().collect();
             for support in &queried {
                 let from_boxes = boxes.oracle.separate(support).expect("box separation");
@@ -2803,8 +2249,7 @@ mod tests {
     /// A refuting vertex is shrunk: refinement of the empty support reaches the all-off vertex
     /// first, and switching components back on while it still refutes leaves only component 2
     /// off, which no other component replaces. Each of its off components switched back on no
-    /// longer refutes. The mutant that hands back no vertex cuts only complements, so its largest
-    /// edge is larger.
+    /// longer refutes.
     #[test]
     fn a_refuting_vertex_is_shrunk_to_a_minimal_edge() {
         let tolerance = 0.5;
@@ -2823,18 +2268,6 @@ mod tests {
             );
         }
 
-        let mut shrinking = BoxSeparationOracle::new(OrProgram, tolerance).expect("a declared tolerance");
-        let shrunk = minimum_code_support(&mut shrinking, &SizeCode, tolerance, FailureHypergraph::new(OR_COMPONENTS))
-            .expect("the shrinking search closes");
-        let mut mutant = WithoutWitness(BoxSeparationOracle::new(OrProgram, tolerance).expect("a declared tolerance"));
-        let cut = minimum_code_support(&mut mutant, &SizeCode, tolerance, FailureHypergraph::new(OR_COMPONENTS))
-            .expect("the complement-cut search closes");
-        assert_eq!(shrunk.code.upper_bound(), cut.code.upper_bound(), "both searches find one minimum code");
-        assert_eq!(largest_edge(&shrunk.hypergraph), 2, "the shrunk edges are {{2}} and the OR pair {{0, 1}}");
-        assert!(
-            largest_edge(&cut.hypergraph) > largest_edge(&shrunk.hypergraph),
-            "positive control: without shrunk vertices the edges are larger"
-        );
     }
 
     /// Refusals: a tolerance that is not finite and nonnegative, a single-mask evaluation of a box

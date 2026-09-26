@@ -9,8 +9,8 @@
 //!
 //! # Four objects
 //!
-//! Each object names its owner files in parentheses. They land one at a time; the
-//! slot list below records which are present.
+//! Each object names its owner files in parentheses; the module declarations below
+//! record which are present.
 //!
 //! * **Native lift** (`lift`, `occurrence`, `apply`). A tensor registry: stable
 //!   ids, shapes, aliases, use sites with the orientation of the matrix each use
@@ -33,16 +33,19 @@
 //!   `v_c = w_c phi(z_c)`. The labels `z_c` and scales `w_c` do not depend on the
 //!   input; input dependence only selects or masks instances.
 //! * **Ablation geometry** (`moments`, `adversary`, `supports`, `bounds`). Mask
-//!   moments, the zonotope of admissible moments, witness masks, supports as
-//!   hitting sets, and bounds.
+//!   moments, the zonotope of admissible moments, witness masks, ranked supports,
+//!   and bounds.
 //! * **Mechanism program** (`program`, `fit`, `codec`, `precision`). A typed graph
 //!   of Sum, Compose, native primitives, reads and writes, and calls to shared
 //!   bodies, with its interface, native reference, code and validity domain.
 //!
 //! Exact execution under masks belongs to `rewrite` (MLP component coordinates),
-//! `gated_rewrite` (gated activations, norms, biases, residuals) and `attention`
-//! (the component query-key kernel under the source's joint softmax). Gauge and
-//! operator structure belongs to `operators`, `spectral` and `state`.
+//! `gated_rewrite` (gated activations, norms), `attention` (rotary attention under
+//! the source's joint softmax) and `block` (attention layers under component
+//! reads). Sufficient computational state over finite native responses belongs to
+//! `state`. Plane-rotation
+//! recovery from a frozen matrix belongs to `spectral`, and structured edits from a
+//! declared single-cycle row action to `cyclic_action`.
 //!
 //! # Types that are never coerced into one another
 //!
@@ -53,7 +56,6 @@
 //! * A global edit and a use-specific edit.
 //! * A mask group (tied controls) and a macro (a packaged subgraph with
 //!   independent internal controls).
-//! * A quotient contract `E' T = g E` and a realization contract `T D = D' g`.
 //!
 //! # Evidence and inputs
 //!
@@ -65,8 +67,7 @@
 //! mean, an observed worst case and a certified bound are three different numbers.
 //!
 //! The mask domain and the fidelity tolerance are experiment declarations with no
-//! default. Every other tolerance must be derived (a roundoff bound, an eigengap, a
-//! Lipschitz covering). Derivatives must be analytic; finite differences belong in
+//! default. Every other tolerance must be derived (a roundoff bound, an eigengap). Derivatives must be analytic; finite differences belong in
 //! tests only.
 
 // Shared planted-rotation fixtures with derived float-defect bounds.
@@ -83,7 +84,7 @@ pub mod receipts;
 // Structured-edit coordinates from a declared single-cycle row action: closed-form planes, rotation edits, plane code.
 pub mod cyclic_action;
 
-// Planted-rotation teacher controls (test builds only).
+// Teacher controls at bounded code and the cancelling pair (test builds only).
 #[cfg(test)]
 mod teacher_tests;
 
@@ -129,12 +130,6 @@ pub mod moments;
 // Global versus use-specific edits and occurrence scopes.
 pub mod occurrence;
 
-// Implementation-gauge families detected from native tensors, quotiented out of codes and intervention sets.
-pub mod gauge;
-
-// Gauge-covariant group masks, structured parameter paths, Sum and Compose accounting.
-pub mod operators;
-
 // Cross-module adversarial and null controls against the landed modules.
 #[cfg(test)]
 mod controls_tests;
@@ -154,19 +149,13 @@ pub mod rewrite_program;
 // Exact initial decomposition from native tensors through rank-revealing reads.
 pub mod seed;
 
-// Plane-rotation and response-projector recovery with derived eigengaps.
+// Plane-rotation recovery with derived eigengaps.
 pub mod spectral;
 
-// Invariant planes of non-orthogonal operators with Stewart subspace certificates.
-pub mod schur;
-
-// Sufficient-state quotient and realization contracts.
+// Sufficient-state quotient and realization contracts, and the exact linear quotient.
 pub mod state;
 
-// Finite-intervention response metric and local state coordinates with finite checks.
-pub mod response_metric;
-
-// Evidence status, failure hypergraph and robust supports.
+// Evidence status and ranked robust supports.
 pub mod supports;
 
 // Versioned request and report document shared by pyffi and the CLI.

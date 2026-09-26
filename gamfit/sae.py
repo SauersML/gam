@@ -140,7 +140,6 @@ from ._intervention_calibration import (
 )
 from ._parameter_decomposition import (
     ParameterDecompositionReport,
-    robust_support,
     run_parameter_decomposition,
 )
 
@@ -219,7 +218,6 @@ __all__ = [
     "RoutabilityAudit",
     "RoutabilityFloor",
     "run_label_shuffle_margin_null",
-    "robust_support",
     "run_parameter_decomposition",
     "run_shape_controlled_census",
     "sae_behavior_fit",

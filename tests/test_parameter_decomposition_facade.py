@@ -23,7 +23,7 @@ class _RustStub:
 REQUEST = {
     "schema": "gam.mpd-request",
     "schema_version": 1,
-    "operation": {"kind": "recover_plane_rotations", "tensor": "w", "declared_error": 0.0},
+    "operation": {"kind": "recover_plane_rotations", "tensor": "w"},
 }
 
 

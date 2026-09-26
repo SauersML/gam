@@ -91,28 +91,13 @@ fn write_npy_array(path: &Path, array: &ArrayD<f64>) -> CliResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam::linalg::roundoff::accumulation_growth;
     use ndarray::array;
 
     fn write_matrix(path: &Path, matrix: &Array2<f64>) {
         write_npy_array(path, &matrix.clone().into_dyn()).expect("write test NPY");
     }
 
-    fn plane_request(declared_error: f64) -> String {
-        format!(
-            r#"{{"schema": "gam.mpd-request", "schema_version": 1, "operation": {{"kind": "recover_plane_rotations", "tensor": "w", "declared_error": {declared_error:?}}}}}"#
-        )
-    }
-
-    /// A declared distance to the orthogonal group covering the true one:
-    /// `||W^T W - I||_F` plus `gamma_n` times the Frobenius norm of `|W|^T |W|`.
-    fn orthogonality_declaration(matrix: &Array2<f64>) -> f64 {
-        let frobenius = |m: &Array2<f64>| m.iter().map(|value| value * value).sum::<f64>().sqrt();
-        let columns = matrix.ncols();
-        let gram = matrix.t().dot(matrix) - Array2::<f64>::eye(columns);
-        let absolute = matrix.mapv(f64::abs);
-        frobenius(&gram) + accumulation_growth(columns) * frobenius(&absolute.t().dot(&absolute))
-    }
+    const PLANE_REQUEST: &str = r#"{"schema": "gam.mpd-request", "schema_version": 1, "operation": {"kind": "recover_plane_rotations", "tensor": "w"}}"#;
 
     #[test]
     fn parameter_decomposition_help_exposes_only_transport_arguments() {
@@ -169,9 +154,9 @@ mod tests {
         ];
         let tensor_path = dir.path().join("w.npy");
         write_matrix(&tensor_path, &matrix);
-        let request = plane_request(orthogonality_declaration(&matrix));
+        let request = PLANE_REQUEST;
         let request_path = dir.path().join("request.json");
-        std::fs::write(&request_path, &request).expect("write request");
+        std::fs::write(&request_path, request).expect("write request");
         let out = dir.path().join("out");
 
         run_parameter_decomposition_cli(ParameterDecompositionArgs {
@@ -185,7 +170,7 @@ mod tests {
         .expect("CLI run");
 
         let in_memory = run_parameter_decomposition(
-            &request,
+            request,
             &BTreeMap::from([("w".to_string(), matrix.into_dyn())]),
         )
         .expect("in-memory run");
@@ -209,7 +194,7 @@ mod tests {
         let tensor_path = dir.path().join("w.npy");
         write_matrix(&tensor_path, &Array2::eye(2));
         let request_path = dir.path().join("request.json");
-        std::fs::write(&request_path, plane_request(0.0)).expect("write request");
+        std::fs::write(&request_path, PLANE_REQUEST).expect("write request");
         let input = NamedNpyInput {
             label: "w".to_string(),
             path: tensor_path,

@@ -371,6 +371,13 @@ impl std::error::Error for RewriteError {}
 
 /// A residual MLP block `h' = h + W₂ σ(W₁ h + b₁) + b₂` on its original tensors:
 /// `W₁ ∈ ℝ^{H×d}`, `b₁ ∈ ℝ^H`, `W₂ ∈ ℝ^{d×H}`, `b₂ ∈ ℝ^d`.
+///
+/// Every [`GaussianActivation`] is admitted, but [`Self::activate`] evaluates `σ` through
+/// the Gaussian-smoothing owner at variance zero, which has no SiLU case: a SiLU block's
+/// [`Self::activate`], [`Self::execute`] and [`ComponentMlp::execute`] refuse with
+/// [`GaussianActivationError::NoClosedForm`]. The block is still a valid tensor carrier,
+/// and `rewrite_program` executes it through the program's own SiLU owner, so the
+/// refusal is at execution and not at construction.
 #[derive(Clone, Debug)]
 pub struct NativeMlp {
     read_in: Array2<f64>,

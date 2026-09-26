@@ -176,9 +176,9 @@ pub struct EditFootprint {
 impl EditFootprint {
     /// [`apply_anchored_linear`] over `n_rows` rows, with `active_terms` of the
     /// edit's `terms` carrying a nonzero scale. A tile holds the native product
-    /// and the factor contribution (`tile × d_out` each), one product fallback of
-    /// the same size, and the term projections (`tile × active`). A partial mask
-    /// also copies the active factor columns and scales.
+    /// and the factor contribution (`tile × d_out` each) and the term projections
+    /// (`tile × active`). A partial mask also copies the active factor columns
+    /// and scales.
     pub fn anchored_linear(
         n_rows: usize,
         input_dim: usize,

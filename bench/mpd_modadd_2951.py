@@ -8,13 +8,11 @@ Stage S0 is torch only.
   file; the step-0 checkpoint is control C1, the random init of the same run.
 * ``s0`` runs the executor controls and the benchmark oracle on stored checkpoints and writes
   one JSON receipt.
-* ``execute`` is the torch driver of two Rust receipts, picked by the settings' ``stage``:
-  ``schur_cross_check`` (``crates/gam-sae/examples/mpd_modadd_schur_2951.rs``) writes each
-  declared checkpoint's W_E and its least-squares shift operator T1 as ``<f8`` arrays;
+* ``execute`` is the torch driver of a Rust receipt, picked by the settings' ``stage``:
   ``s2_native`` (``crates/gam-sae/examples/mpd_modadd_s2_2951.rs``) writes each declared
   checkpoint's tensors in their trained float32, torch's float64 logits on the test pairs and
   torch's executor control, and builds control C3 from a run entry's declared ``shuffle_seed``.
-  Both write ``export.json``.
+  It writes ``export.json``.
 
 W_E is one tensor with three use sites (pos0 ``a``, pos1 ``b``, pos2 ``=``). ``forward`` runs
 each occurrence as its own lookup, so a use-specific edit and a global edit are different
@@ -389,38 +387,6 @@ def s0(args):
     print(f"RECEIPT {args.out}", flush=True)
 
 
-def export_shift_operators(settings, args):
-    """Stage ``schur_cross_check``: each declared checkpoint's W_E and least-squares shift operator T1."""
-    os.makedirs(args.out_dir, exist_ok=True)
-    exports = []
-    for entry in settings["runs"]:
-        run = torch.load(os.path.join(args.harvest, entry["file"]), map_location="cpu", weights_only=True)
-        p = run["config"]["p"]
-        for step in entry["checkpoints"] or [max(run["checkpoints"])]:
-            table = run["checkpoints"][step]["W_E"].double()
-            cycled = table[:p]
-            shifted = cycled[(torch.arange(p) + 1) % p]
-            # T1 with E T1^T = E_shift over the cycled rows; the minimum-norm solve maps the d - p
-            # directions off the rows' span to zero.
-            t1 = torch.linalg.lstsq(cycled, shifted).solution.T.contiguous()
-            residual = torch.linalg.norm(cycled @ t1.T - shifted) / torch.linalg.norm(shifted)
-            sigma = torch.linalg.svdvals(cycled)
-            name = f"{entry['label']}.{step}"
-            # W_E in its trained dtype: the receipt widens it to binary64, exact for float32.
-            np.save(os.path.join(args.out_dir, f"W_E.{name}.npy"), run["checkpoints"][step]["W_E"].numpy())
-            np.save(os.path.join(args.out_dir, f"T1.{name}.npy"), t1.numpy())
-            exports.append({
-                "name": name, "file": entry["file"], "step": step, "labels": run["config"]["labels"],
-                "p": p, "d_model": table.shape[1], "sigma_max": sigma[0].item(),
-                "sigma_min": sigma[-1].item(), "relative_residual": residual.item(),
-            })
-            print(f"[execute] {exports[-1]}", flush=True)
-    with open(os.path.join(args.out_dir, "export.json.partial"), "w") as handle:
-        json.dump({"stage": "execute", "exports": exports}, handle)
-    os.replace(os.path.join(args.out_dir, "export.json.partial"), os.path.join(args.out_dir, "export.json"))
-    print(f"[execute] wrote {len(exports)} checkpoints to {args.out_dir}", flush=True)
-
-
 def export_native(settings, args):
     """Stage ``s2_native``: each declared checkpoint's tensors, torch's logits and its executor control.
 
@@ -490,7 +456,7 @@ def execute(args):
     """The receipt driver: ``receipt.sh`` always runs ``execute``, and the settings' stage picks the export."""
     with open(args.settings) as handle:
         settings = json.load(handle)
-    stages = {"schur_cross_check": export_shift_operators, "s2_native": export_native}
+    stages = {"s2_native": export_native}
     if settings["stage"] not in stages:
         raise SystemExit(f"[execute] no stage {settings['stage']!r}; declared stages: {sorted(stages)}")
     stages[settings["stage"]](settings, args)

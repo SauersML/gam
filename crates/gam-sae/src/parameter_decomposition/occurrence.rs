@@ -42,12 +42,11 @@
 //! position: the cached prefix keeps its clean keys and values, and every later
 //! query attends over both.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 
 use super::apply::{ApplyError, FactoredEdit};
 use super::field::{CotangentTerm, ParameterCotangent};
-use crate::inference::intervention_shard::{InterventionChange, ParameterEditScope};
 use super::lift::{
     LiftError, TeacherFingerprint, TensorId, TensorRegistry, TieOrientation, UseMap, UseSiteId,
 };
@@ -173,19 +172,6 @@ impl PositionScope {
     }
 }
 
-/// The executing framework's name for one discovered read of a parameter: the module
-/// whose call made the read and the op that made it, such as `("embed_out", "F.linear")`
-/// for a tied unembedding read outside any module call. Discovery reports it beside the
-/// read's use site. A use-specific edit carries it so that a runner can refuse an ordinal
-/// that addresses another read. The module is the innermost executing module's qualified
-/// name, which is empty for a read in the root module's own forward. So only the op must
-/// be non-empty.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReadLabel {
-    pub module: String,
-    pub op: String,
-}
-
 /// One parameter edit: which uses read it, at which positions, and the change of
 /// the stored tensor, held as its factors in the stored orientation. The fields are
 /// private, so every record has been checked against the registry by
@@ -283,99 +269,6 @@ impl ParameterEditRecord {
             )?)),
         }
     }
-
-    /// The record as the declared changes a framework runner applies. Each
-    /// [`InterventionChange::ParameterEdit`] names the storage tensor and carries
-    /// `left · rightᵀ` in the stored orientation, row-major, whatever the tie of the read
-    /// it reaches: the runner edits the stored value, and the read applies its own tie.
-    ///
-    /// - A global record that reaches every position is one [`ParameterEditScope::Global`]
-    ///   change.
-    /// - A global record with declared positions is one [`ParameterEditScope::UseSite`]
-    ///   change per use it reaches, each seen at those positions. A global change reaches
-    ///   every position of the pass, and every use reading the edit at those positions is
-    ///   the same experiment. A key-value cache filled before a global edit is this case.
-    /// - A use-specific record is one use-site change at its read's ordinal.
-    ///
-    /// A use-site change names its read by `labels`, which discovery reported for the
-    /// read, so a read with no label, or with an empty op, is refused. A change carries at
-    /// most `min(rows, cols)` terms, so a record with more is refused, not refactored.
-    /// The plan carrying the changes must declare, as its forward path, the discovery
-    /// pass this registry holds: an ordinal addresses a read only on that path, which is
-    /// why a registry with another fingerprint is refused.
-    pub fn intervention_changes(
-        &self,
-        registry: &TensorRegistry,
-        labels: &BTreeMap<UseSiteId, ReadLabel>,
-    ) -> Result<Vec<InterventionChange>, OccurrenceError> {
-        let found = registry.teacher_fingerprint();
-        if found != self.registry {
-            return Err(OccurrenceError::RegistryMismatch {
-                record: self.registry,
-                registry: found,
-            });
-        }
-        let (storage, (rows, cols)) = self.scope.storage(registry)?;
-        let rank = self.delta.term_count();
-        if rank > rows.min(cols) {
-            return Err(OccurrenceError::RankExceedsShape {
-                storage,
-                rank,
-                rows,
-                cols,
-            });
-        }
-        let positions = self.positions.positions().map(<[usize]>::to_vec);
-        let scopes = match (&self.scope, positions) {
-            (EditScope::Global(..), None) => vec![ParameterEditScope::Global],
-            (_, positions) => {
-                let affected = self.scope.affected_uses(registry)?;
-                let reads = registry.use_sites_of(&storage).len();
-                let numbered: Vec<UseSiteId> = (0..reads)
-                    .map(|ordinal| UseSiteId::read(&storage, ordinal))
-                    .collect();
-                if let Some(use_site) = affected.iter().find(|use_site| !numbered.contains(use_site)) {
-                    return Err(OccurrenceError::UnnumberedUseSite {
-                        use_site: use_site.clone(),
-                        storage,
-                        reads,
-                    });
-                }
-                // In ordinal order, so one record has one list of changes.
-                let mut scopes = Vec::with_capacity(affected.len());
-                for (ordinal, use_site) in numbered.iter().enumerate() {
-                    if !affected.contains(use_site) {
-                        continue;
-                    }
-                    let label = labels
-                        .get(use_site)
-                        .filter(|label| !label.op.is_empty())
-                        .ok_or_else(|| OccurrenceError::UnlabelledRead(use_site.clone()))?;
-                    scopes.push(ParameterEditScope::UseSite {
-                        ordinal,
-                        read_module: label.module.clone(),
-                        read_op: label.op.clone(),
-                        positions: positions.clone(),
-                    });
-                }
-                scopes
-            }
-        };
-        let left: Vec<f64> = self.delta.left().iter().copied().collect();
-        let right: Vec<f64> = self.delta.right().iter().copied().collect();
-        Ok(scopes
-            .into_iter()
-            .map(|scope| InterventionChange::ParameterEdit {
-                parameter: storage.0.clone(),
-                rows,
-                cols,
-                rank,
-                left: left.clone(),
-                right: right.clone(),
-                scope,
-            })
-            .collect())
-    }
 }
 
 /// The cotangent of an edit of `scope`: `Σ_u τ_u*(G_u)` over exactly the uses the
@@ -384,7 +277,9 @@ impl ParameterEditRecord {
 /// `per_use` holds `G_u`, the gradient with respect to what use `u` reads, in that
 /// use's orientation. A transposed use's outer-product term is pulled back by
 /// swapping its factors, `(Σ_i g_i x_iᵀ)ᵀ = Σ_i x_i g_iᵀ`, so it is never formed. A
-/// partial sum is a wrong gradient that looks like a right one, so a reached use
+/// stored use takes either term as given: an outer-product term is still a sum of rank
+/// ones in the stored orientation, such as a lookup's `Σ_i e_{t_i} g_iᵀ` over one-hot rows.
+/// A partial sum is a wrong gradient that looks like a right one, so a reached use
 /// left out is refused, and so is a use the scope does not reach.
 pub fn edit_cotangent(
     registry: &TensorRegistry,
@@ -441,105 +336,7 @@ pub fn edit_cotangent(
     ParameterCotangent::from_terms(stored.0, stored.1, terms).map_err(OccurrenceError::Cotangent)
 }
 
-/// Refuse an external execution whose use sites disagree with the registry or the records.
-///
-/// `discovered` lists every use site the executed forward read, in execution order.
-/// `substituted` lists every use site that read an edited value. Both use the executor's
-/// numbering.
-///
-/// A forward that read a different set of use sites, or numbered them differently, ran
-/// another path, where the ordinals address other reads. So the discovered reads of each
-/// storage tensor must be exactly its registered sites, in ordinal order.
-///
-/// An edit that reached the wrong use is a different experiment, even when its numbers
-/// agree. So every use a record reaches must be substituted exactly once, and no other use
-/// may be.
-///
-/// Comparing ordinals needs the registry to number the `n` sites of each storage tensor
-/// as its reads `storage#0` to `storage#(n-1)`. `TensorRegistry::register_use_site` accepts
-/// any id, so a registered site outside that numbering, a gap or another name, is refused
-/// first, as a registry defect, before any discovered read is blamed for it.
-pub fn check_substitutions(
-    registry: &TensorRegistry,
-    records: &[ParameterEditRecord],
-    discovered: &[UseSiteId],
-    substituted: &[UseSiteId],
-) -> Result<(), OccurrenceError> {
-    let found = registry.teacher_fingerprint();
-    if let Some(record) = records.iter().find(|record| record.registry != found) {
-        return Err(OccurrenceError::RegistryMismatch {
-            record: record.registry,
-            registry: found,
-        });
-    }
-    for storage in registry.storage_ids() {
-        let sites = registry.use_sites_of(storage);
-        let reads: BTreeSet<UseSiteId> = (0..sites.len())
-            .map(|ordinal| UseSiteId::read(storage, ordinal))
-            .collect();
-        // The sites are distinct and as many as the reads, so they are the reads exactly
-        // when each is one of them.
-        if let Some(use_site) = sites.into_iter().find(|use_site| !reads.contains(*use_site)) {
-            return Err(OccurrenceError::UnnumberedUseSite {
-                use_site: use_site.clone(),
-                storage: storage.clone(),
-                reads: reads.len(),
-            });
-        }
-    }
-    let mut next_ordinal: BTreeMap<TensorId, usize> = BTreeMap::new();
-    let mut seen = BTreeSet::new();
-    for use_site in discovered {
-        let storage = match registry.resolve_use_site(use_site) {
-            Ok(read) => read.storage,
-            Err(LiftError::UnknownUseSite(..)) => {
-                return Err(OccurrenceError::UnregisteredDiscovery(use_site.clone()));
-            }
-            Err(err) => return Err(err.into()),
-        };
-        if !seen.insert(use_site.clone()) {
-            return Err(OccurrenceError::RepeatedDiscovery(use_site.clone()));
-        }
-        let ordinal = next_ordinal.entry(storage.clone()).or_insert(0);
-        let expected = UseSiteId::read(&storage, *ordinal);
-        if use_site != &expected {
-            return Err(OccurrenceError::OrdinalOutOfOrder {
-                use_site: use_site.clone(),
-                expected,
-            });
-        }
-        *ordinal += 1;
-    }
-    for storage in registry.storage_ids() {
-        if let Some(missing) = registry
-            .use_sites_of(storage)
-            .into_iter()
-            .find(|use_site| !seen.contains(*use_site))
-        {
-            return Err(OccurrenceError::UndiscoveredUse(missing.clone()));
-        }
-    }
-    let mut planned = BTreeSet::new();
-    for record in records {
-        planned.extend(record.scope.affected_uses(registry)?);
-    }
-    let mut applied = BTreeSet::new();
-    for use_site in substituted {
-        if !planned.contains(use_site) {
-            return Err(OccurrenceError::UnplannedSubstitution(use_site.clone()));
-        }
-        if !applied.insert(use_site.clone()) {
-            return Err(OccurrenceError::RepeatedSubstitution(use_site.clone()));
-        }
-    }
-    match planned.into_iter().find(|use_site| !applied.contains(use_site)) {
-        Some(use_site) => Err(OccurrenceError::MissingSubstitution(use_site)),
-        None => Ok(()),
-    }
-}
-
-/// Typed refusals of occurrence scopes, edit records, edit cotangents and executed
-/// substitutions.
+/// Typed refusals of occurrence scopes, edit records and edit cotangents.
 #[derive(Clone, Debug, PartialEq)]
 pub enum OccurrenceError {
     /// The registry refused a name or a use site.
@@ -588,43 +385,6 @@ pub enum OccurrenceError {
     },
     /// The cotangent refused the pulled-back terms.
     Cotangent(String),
-    /// The registry holds `reads` use sites of `storage`, and `use_site` is not one of
-    /// its reads `storage#0` to `storage#(reads-1)`, so no ordinal of an executed forward
-    /// addresses it.
-    UnnumberedUseSite {
-        use_site: UseSiteId,
-        storage: TensorId,
-        reads: usize,
-    },
-    /// The executor discovered a use site the registry does not hold.
-    UnregisteredDiscovery(UseSiteId),
-    /// The executor reported one use site as discovered twice.
-    RepeatedDiscovery(UseSiteId),
-    /// A storage tensor's reads were not discovered in ordinal order, so the executor
-    /// numbered another path.
-    OrdinalOutOfOrder {
-        use_site: UseSiteId,
-        expected: UseSiteId,
-    },
-    /// A registered use site was not discovered, so the forward read the tensors on
-    /// another path.
-    UndiscoveredUse(UseSiteId),
-    /// A use site read an edited value that no record reaches.
-    UnplannedSubstitution(UseSiteId),
-    RepeatedSubstitution(UseSiteId),
-    /// A use that a record reaches did not read the edited value.
-    MissingSubstitution(UseSiteId),
-    /// A declared parameter edit carries at most `min(rows, cols)` terms, and the
-    /// record's delta has `rank`.
-    RankExceedsShape {
-        storage: TensorId,
-        rank: usize,
-        rows: usize,
-        cols: usize,
-    },
-    /// Discovery gave no label, or an empty op, for a read a use-site change names, so
-    /// a runner could not check that the change's ordinal addresses that read.
-    UnlabelledRead(UseSiteId),
 }
 
 impl From<LiftError> for OccurrenceError {
@@ -700,66 +460,6 @@ impl fmt::Display for OccurrenceError {
                 use_site.0
             ),
             Self::Cotangent(reason) => write!(f, "occurrence: invalid cotangent: {reason}"),
-            Self::UnnumberedUseSite {
-                use_site,
-                storage,
-                reads,
-            } => write!(
-                f,
-                "occurrence: the registry holds {reads} use sites of storage {}, which must be its reads {}#0 onward with no gap; registered use site {} is not one of them",
-                storage.0, storage.0, use_site.0
-            ),
-            Self::UnregisteredDiscovery(use_site) => write!(
-                f,
-                "occurrence: the executor discovered use site {}, which the registry does not hold",
-                use_site.0
-            ),
-            Self::RepeatedDiscovery(use_site) => write!(
-                f,
-                "occurrence: the executor discovered use site {} twice",
-                use_site.0
-            ),
-            Self::OrdinalOutOfOrder { use_site, expected } => write!(
-                f,
-                "occurrence: the executor discovered {} where the next read of its storage is {}, so it numbered another path",
-                use_site.0, expected.0
-            ),
-            Self::UndiscoveredUse(use_site) => write!(
-                f,
-                "occurrence: registered use site {} was not discovered, so the forward ran another path",
-                use_site.0
-            ),
-            Self::UnplannedSubstitution(use_site) => write!(
-                f,
-                "occurrence: use site {} read an edited value that no record reaches",
-                use_site.0
-            ),
-            Self::RepeatedSubstitution(use_site) => write!(
-                f,
-                "occurrence: use site {} was substituted twice",
-                use_site.0
-            ),
-            Self::MissingSubstitution(use_site) => write!(
-                f,
-                "occurrence: use site {} is reached by a record but did not read the edited value",
-                use_site.0
-            ),
-            Self::RankExceedsShape {
-                storage,
-                rank,
-                rows,
-                cols,
-            } => write!(
-                f,
-                "occurrence: the edit of storage {} has {rank} terms; a declared parameter edit of a ({rows}, {cols}) tensor carries at most {}",
-                storage.0,
-                (*rows).min(*cols)
-            ),
-            Self::UnlabelledRead(use_site) => write!(
-                f,
-                "occurrence: discovery gave no label, or an empty op, for read {}, which a use-site parameter edit must name",
-                use_site.0
-            ),
         }
     }
 }
@@ -769,10 +469,6 @@ impl std::error::Error for OccurrenceError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::intervention_shard::{
-        CleanPass, ExperimentUnit, InterventionExperiment, InterventionExperimentPlan, KlPositions,
-        Readout,
-    };
     use crate::parameter_decomposition::field::FieldCoefficient;
     use gam_linalg::roundoff::accumulation_growth;
     use ndarray::{Array1, Array2, Axis, array};
@@ -1569,337 +1265,6 @@ mod tests {
                 use_site: lookup,
                 stored: (3, 2),
                 pulled_back: (2, 3)
-            })
-        );
-    }
-
-    #[test]
-    fn substitutions_must_match_the_discovered_path_and_the_planned_uses() {
-        let chain = Chain::rectangular();
-        let (registry, storage, uses) = registry_with_uses(&chain.weight, &TIES);
-        let global = ParameterEditRecord::new(
-            &registry,
-            EditScope::Global(storage.clone()),
-            PositionScope::every(),
-            rank_one_delta(&chain),
-        )
-        .expect("the global record is valid");
-        let middle = ParameterEditRecord::new(
-            &registry,
-            EditScope::UseSite(uses[1].clone()),
-            PositionScope::every(),
-            rank_one_delta(&chain),
-        )
-        .expect("the use-specific record is valid");
-        let records = [global, middle.clone()];
-        let pick = |indices: &[usize]| indices.iter().map(|&k| uses[k].clone()).collect::<Vec<_>>();
-        assert_eq!(check_substitutions(&registry, &records, &uses, &uses), Ok(()));
-        assert_eq!(
-            check_substitutions(&registry, &[middle.clone()], &uses, &pick(&[1])),
-            Ok(())
-        );
-
-        // An edit that reached another use is refused even though its numbers could agree.
-        assert_eq!(
-            check_substitutions(&registry, &[middle.clone()], &uses, &pick(&[0])),
-            Err(OccurrenceError::UnplannedSubstitution(uses[0].clone()))
-        );
-        assert_eq!(
-            check_substitutions(&registry, &records, &uses, &pick(&[0, 2])),
-            Err(OccurrenceError::MissingSubstitution(uses[1].clone()))
-        );
-        assert_eq!(
-            check_substitutions(&registry, &records, &uses, &pick(&[0, 1, 1, 2])),
-            Err(OccurrenceError::RepeatedSubstitution(uses[1].clone()))
-        );
-
-        // Another forward path: a read left out, an extra read, a repeated read, or reads
-        // numbered out of order.
-        assert_eq!(
-            check_substitutions(&registry, &records, &pick(&[0, 1]), &uses),
-            Err(OccurrenceError::UndiscoveredUse(uses[2].clone()))
-        );
-        let extra = UseSiteId::read(&storage, 3);
-        let mut longer = uses.clone();
-        longer.push(extra.clone());
-        assert_eq!(
-            check_substitutions(&registry, &records, &longer, &uses),
-            Err(OccurrenceError::UnregisteredDiscovery(extra))
-        );
-        assert_eq!(
-            check_substitutions(&registry, &records, &pick(&[0, 0, 1, 2]), &uses),
-            Err(OccurrenceError::RepeatedDiscovery(uses[0].clone()))
-        );
-        assert_eq!(
-            check_substitutions(&registry, &records, &pick(&[1, 0, 2]), &uses),
-            Err(OccurrenceError::OrdinalOutOfOrder {
-                use_site: uses[1].clone(),
-                expected: uses[0].clone()
-            })
-        );
-
-        // Records checked against another path's registry are refused before any site is
-        // compared.
-        let (decode, decode_storage, decode_uses) = registry_with_uses(
-            &chain.weight,
-            &[
-                TieOrientation::Identity,
-                TieOrientation::Transpose,
-                TieOrientation::Identity,
-                TieOrientation::Identity,
-            ],
-        );
-        assert_eq!(decode_storage, storage);
-        assert_eq!(
-            check_substitutions(&decode, &records, &decode_uses, &uses),
-            Err(OccurrenceError::RegistryMismatch {
-                record: registry.teacher_fingerprint(),
-                registry: decode.teacher_fingerprint(),
-            })
-        );
-    }
-
-    #[test]
-    fn substitutions_refuse_a_registry_whose_sites_are_not_numbered_as_reads() {
-        let chain = Chain::rectangular();
-        let storage = TensorId("weight".to_string());
-        let read = |ordinal: usize| UseSiteId::read(&storage, ordinal);
-        let registry_holding = |sites: &[UseSiteId]| {
-            let mut registry = TensorRegistry::default();
-            registry
-                .register_storage(storage.clone(), chain.weight.view().into_dyn())
-                .expect("the storage registers");
-            for site in sites {
-                registry
-                    .register_use_site(
-                        site.clone(),
-                        storage.clone(),
-                        UseMap::Linear(TieOrientation::Identity),
-                    )
-                    .expect("the use site registers");
-            }
-            registry
-        };
-
-        // Eleven reads, the fewest with a two-digit ordinal, registered last to first. Id
-        // order puts weight#10 before weight#2 and registration order is reversed; only the
-        // ordinals give the forward order, and the forward that reads them in it passes.
-        let eleven: Vec<UseSiteId> = (0..11).map(read).collect();
-        let backwards: Vec<UseSiteId> = eleven.iter().rev().cloned().collect();
-        let numbered = registry_holding(&backwards);
-        assert_eq!(check_substitutions(&numbered, &[], &eleven, &[]), Ok(()));
-
-        // A gap: two sites registered as reads 0 and 2. A forward that reads the tensor twice
-        // reports reads 0 and 1, and the registry is refused, not the forward.
-        let gapped = registry_holding(&[read(0), read(2)]);
-        assert_eq!(
-            check_substitutions(&gapped, &[], &[read(0), read(1)], &[]),
-            Err(OccurrenceError::UnnumberedUseSite {
-                use_site: read(2),
-                storage: storage.clone(),
-                reads: 2,
-            })
-        );
-
-        // A site registered under another name than its read.
-        let named = UseSiteId("decoder".to_string());
-        let renamed = registry_holding(&[read(0), named.clone()]);
-        assert_eq!(
-            check_substitutions(&renamed, &[], &[read(0), read(1)], &[]),
-            Err(OccurrenceError::UnnumberedUseSite {
-                use_site: named,
-                storage: storage.clone(),
-                reads: 2,
-            })
-        );
-    }
-
-    #[test]
-    fn records_become_the_declared_changes_a_runner_applies() {
-        let chain = Chain::rectangular();
-        let (rows, cols) = chain.weight.dim();
-        let (registry, storage, uses) = registry_with_uses(&chain.weight, &TIES);
-        // Rank two, so carrying the factors row-major differs from carrying them
-        // column-major.
-        let delta = FactoredEdit::new(
-            array![[0.3, 1.2], [-0.8, 0.1], [1.5, -0.6]],
-            array![[-0.9, 0.7], [0.45, -0.2]],
-        )
-        .expect("the factors agree on the term count");
-        let record = |scope: EditScope, positions: PositionScope| {
-            ParameterEditRecord::new(&registry, scope, positions, delta.clone())
-                .expect("the record is valid")
-        };
-        let label = |ordinal: usize| ReadLabel {
-            module: format!("layers.{ordinal}"),
-            op: "F.linear".to_string(),
-        };
-        let labels: BTreeMap<UseSiteId, ReadLabel> = uses
-            .iter()
-            .enumerate()
-            .map(|(ordinal, use_site)| (use_site.clone(), label(ordinal)))
-            .collect();
-        let at_read = |ordinal: usize, positions: Option<Vec<usize>>| ParameterEditScope::UseSite {
-            ordinal,
-            read_module: label(ordinal).module,
-            read_op: label(ordinal).op,
-            positions,
-        };
-        // `left` is (rows, rank) and `right` is (cols, rank), both row-major, in the
-        // stored orientation.
-        let carried = |scope: ParameterEditScope| InterventionChange::ParameterEdit {
-            parameter: storage.0.clone(),
-            rows,
-            cols,
-            rank: 2,
-            left: vec![0.3, 1.2, -0.8, 0.1, 1.5, -0.6],
-            right: vec![-0.9, 0.7, 0.45, -0.2],
-            scope,
-        };
-
-        // A global record at every position is one global change and names no read.
-        let global = record(EditScope::Global(storage.clone()), PositionScope::every())
-            .intervention_changes(&registry, &BTreeMap::new())
-            .expect("a global record converts");
-        assert_eq!(global, vec![carried(ParameterEditScope::Global)]);
-
-        // A use-specific record on the transposed read still carries the stored
-        // orientation: the runner edits the stored value, and the read transposes it.
-        let middle = record(
-            EditScope::UseSite(uses[1].clone()),
-            PositionScope::declared(vec![2, 4]).expect("the positions are increasing"),
-        )
-        .intervention_changes(&registry, &labels)
-        .expect("a use-specific record converts");
-        assert_eq!(middle, vec![carried(at_read(1, Some(vec![2, 4])))]);
-
-        // A global edit behind a key-value cache filled up to position 3 reaches every
-        // read at positions 3.. only: one use-site change per read, in ordinal order.
-        let cached = record(
-            EditScope::Global(storage.clone()),
-            PositionScope::declared(vec![3, 4, 5]).expect("the positions are increasing"),
-        )
-        .intervention_changes(&registry, &labels)
-        .expect("a positioned global record converts");
-        assert_eq!(
-            cached,
-            (0..TIES.len())
-                .map(|ordinal| carried(at_read(ordinal, Some(vec![3, 4, 5]))))
-                .collect::<Vec<_>>()
-        );
-
-        // The plan accepts every conversion, and only the global change needs its own
-        // clean forward.
-        let plan = |changes: Vec<InterventionChange>| {
-            InterventionExperimentPlan::new(
-                Vec::new(),
-                Vec::new(),
-                vec![InterventionExperiment {
-                    unit: ExperimentUnit {
-                        group: 0,
-                        sequence: 0,
-                        length: 6,
-                    },
-                    changes,
-                    readouts: vec![Readout::Kl(KlPositions::Declared(vec![5]))],
-                }],
-                0,
-                Some("full-forward:len6".to_string()),
-            )
-            .expect("the plan accepts the converted changes")
-        };
-        assert_eq!(plan(global).experiments()[0].clean_pass(), CleanPass::SeparateForward);
-        assert_eq!(plan(middle).experiments()[0].clean_pass(), CleanPass::SameBatch);
-        let cached_plan = plan(cached);
-        assert_eq!(cached_plan.experiments()[0].clean_pass(), CleanPass::SameBatch);
-        assert_eq!(cached_plan.experiments()[0].edited_positions(), vec![3, 4, 5]);
-
-        // The root module's name is empty, so a read in its own forward, such as a tied
-        // head applied through F.linear, is named by its op alone.
-        let use_specific = record(EditScope::UseSite(uses[1].clone()), PositionScope::every());
-        let mut in_root = labels.clone();
-        in_root.insert(
-            uses[1].clone(),
-            ReadLabel {
-                module: String::new(),
-                op: "F.linear".to_string(),
-            },
-        );
-        assert_eq!(
-            use_specific.intervention_changes(&registry, &in_root),
-            Ok(vec![carried(ParameterEditScope::UseSite {
-                ordinal: 1,
-                read_module: String::new(),
-                read_op: "F.linear".to_string(),
-                positions: None,
-            })])
-        );
-
-        // A read discovery did not label, or labelled with an empty op, is refused.
-        assert_eq!(
-            use_specific.intervention_changes(&registry, &BTreeMap::new()),
-            Err(OccurrenceError::UnlabelledRead(uses[1].clone()))
-        );
-        let mut unnamed_op = labels.clone();
-        unnamed_op.insert(
-            uses[1].clone(),
-            ReadLabel {
-                module: "layers.1".to_string(),
-                op: String::new(),
-            },
-        );
-        assert_eq!(
-            use_specific.intervention_changes(&registry, &unnamed_op),
-            Err(OccurrenceError::UnlabelledRead(uses[1].clone()))
-        );
-        let mut two_labels = labels.clone();
-        two_labels.remove(&uses[2]);
-        assert_eq!(
-            record(
-                EditScope::Global(storage.clone()),
-                PositionScope::declared(vec![3]).expect("one position is increasing"),
-            )
-            .intervention_changes(&registry, &two_labels),
-            Err(OccurrenceError::UnlabelledRead(uses[2].clone()))
-        );
-
-        // Three terms on a 3x2 tensor exceed what a declared change carries.
-        let three_terms = ParameterEditRecord::new(
-            &registry,
-            EditScope::Global(storage.clone()),
-            PositionScope::every(),
-            FactoredEdit::new(
-                array![[0.3, 1.2, 0.5], [-0.8, 0.1, -0.4], [1.5, -0.6, 0.2]],
-                array![[-0.9, 0.7, 0.3], [0.45, -0.2, 0.6]],
-            )
-            .expect("the factors agree on the term count"),
-        )
-        .expect("the record is valid");
-        assert_eq!(
-            three_terms.intervention_changes(&registry, &labels),
-            Err(OccurrenceError::RankExceedsShape {
-                storage: storage.clone(),
-                rank: 3,
-                rows,
-                cols,
-            })
-        );
-
-        // An ordinal addresses a read only on the discovery pass of the record's registry.
-        let (decode, ..) = registry_with_uses(
-            &chain.weight,
-            &[
-                TieOrientation::Identity,
-                TieOrientation::Transpose,
-                TieOrientation::Identity,
-                TieOrientation::Identity,
-            ],
-        );
-        assert_eq!(
-            use_specific.intervention_changes(&decode, &labels),
-            Err(OccurrenceError::RegistryMismatch {
-                record: registry.teacher_fingerprint(),
-                registry: decode.teacher_fingerprint(),
             })
         );
     }

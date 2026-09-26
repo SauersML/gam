@@ -33,9 +33,8 @@
 //! A support's message is the `EnumerativeSubsetCode` codeword of the kept set, then `H` once in the prefix
 //! integer code, then every kept head's lattice codeword padded to `H`. `H` is the longest head's codeword, and
 //! the codewords are self-delimiting, so the padded message decodes. Its length
-//! `L(C, k) + L_int(H) + k·H` depends on the support's size alone, as `minimum_code_support` requires. The subset
-//! code by itself would make every head cheapest: keeping all `C` components costs `L_int(C + 1)` bits, below
-//! most `L(C, k)`.
+//! `L(C, k) + L_int(H) + k·H` depends on the support's size alone. The subset code by itself would make every head
+//! cheapest: keeping all `C` components costs `L_int(C + 1)` bits, below most `L(C, k)`.
 //!
 //! # Execution with rigorous radii
 //! Each network, the teacher on its stored tensors and the decoded artifact under a head mask, runs natively
@@ -58,10 +57,17 @@
 //!   `d(m) = max over every induction row`. It is evaluated lazily and memoized per mask.
 //! * **Evidence:** `Exact` over that finite family, with the largest per-row box error as its numerical error.
 //!   It is `Unresolved` when a row's box bound is unresolved.
-//! * **Search:** `minimum_code_support` finds, per tolerance, the minimum-code support and the failure
-//!   hypergraph, whose edges are the OR constraints.
-//! * **Per input (P18):** each induction row gets its own minimum-code support. `sufficient_union` takes their
-//!   union, and the library (the union's heads) plus one subset packet per row prices the per-row artifact.
+//! * **Search:** `ranked_support` finds, per tolerance, the shortest sufficient leading run of the heads ranked by
+//!   descending single-deletion risk (each head alone off, every other on), in `O(log C)` separations. It is not a
+//!   minimum over all subsets; the report gives the run's code and the run one shorter when that was refuted.
+//! * **Per input (P18):** each induction row gets its own ranked support, under the row's own single-deletion
+//!   ranking. `sufficient_union` takes their union, and the library (the union's heads) plus one subset packet per
+//!   row prices the per-row artifact.
+//!
+//! Report schema: each tolerance, the box control and each S3 tolerance carry `status` (`certified`, `unresolved`
+//! or `all_on_violation`), one `code_bits` and `refuted_shorter`. Reports from before the ranked search carried
+//! `code_status`, a `code_bits_lower`/`code_bits_upper` bracket and `edges` from a minimum-code search; they are
+//! not comparable, and a transplant reads only a report of the new schema.
 //!
 //! Beside every code the report gives:
 //! * the do-nothing baseline, every head off;
@@ -80,10 +86,9 @@
 //! oracle's enclosures too wide to certify at `t = 30`: the first probe's third separation ran 15 minutes.)
 //! * **Divergence:** `KL(teacher ‖ artifact under the mask)` at row `t` alone, over both logit boxes. The
 //!   tolerances are fractions of the row's own all-off divergence.
-//! * **Search:** `BoxSeparationOracle` and `minimum_code_support` with the padded head code over the row's
-//!   components, a function of the size alone, so the minimum-code support keeps the fewest instances. The report
-//!   also gives the code that sends each distinct kept head once, and how many instances the same heads keep
-//!   when each is kept at every position.
+//! * **Search:** `BoxSeparationOracle` and `ranked_support` over the row's components ranked by descending
+//!   single-deletion divergence, with the padded head code over them. The report also gives the code that sends
+//!   each distinct kept head once, and how many instances the same heads keep when each is kept at every position.
 //! * **The mechanism's prediction:** the support's lower-layer heads are needed at the source and not at the
 //!   rest. The report counts the support's source and rest components.
 //! * **Null at equal count:** each kept source component read at a uniformly drawn other position instead
@@ -95,14 +100,14 @@ use gam_sae::parameter_decomposition::block::{
     AttentionLayerReads, AttentionProjection, ComponentAttentionLayer, ComponentMasks, ProjectionRead,
 };
 use gam_sae::parameter_decomposition::codec::{
-    CodecError, PaddedPacketCode, encode_support_packets, prefix_integer_len_bits, subset_code_len_bits, union_support_library,
+    PaddedPacketCode, encode_support_packets, prefix_integer_len_bits, subset_code_len_bits, union_support_library,
 };
 use gam_sae::parameter_decomposition::precision::{DecodableArtifact, DeclaredPrecision, LatticeCode};
 use gam_sae::parameter_decomposition::rewrite::ComponentRead;
 use gam_sae::parameter_decomposition::supports::{
     BoxDivergence, BoxEnclosure, BoxSeparationOracle, CardinalityCode, ComponentSet, EvidenceStatus, ExactBasis,
-    Extremum, FailureHypergraph, InputSupport, MaskBox, MaskSide, SeparationOracle, SupportSearch,
-    SupportSearchError, minimum_code_support, sufficient_union,
+    Extremum, InputSupport, MaskBox, MaskSide, RankedSupport, SeparationOracle, SupportSearchError, ranked_support,
+    sufficient_union,
 };
 use ndarray::{Array2, s};
 use rand::rngs::StdRng;
@@ -165,7 +170,7 @@ struct TrainedReport {
 struct TrainedTolerance {
     scale: String,
     declared: f64,
-    code_status: String,
+    status: String,
     support: Vec<String>,
 }
 
@@ -783,48 +788,69 @@ impl<O: SeparationOracle> SeparationOracle for Recording<O> {
     }
 }
 
-/// A search's minimum code: `exact`, `unresolved` or `all_on_violation`, with its bounds in bits.
-fn code_bits<M, D, E: std::fmt::Debug>(
-    found: &Result<SupportSearch<M, D>, SupportSearchError<E, CodecError>>,
-) -> Result<(String, f64, f64), String> {
+/// A ranked search's status, `certified`, `unresolved` or `all_on_violation`, and the found run's code in bits.
+fn ranked_status<M, D, E: std::fmt::Debug>(
+    found: &Result<RankedSupport<M, D>, SupportSearchError<E>>,
+    code: &PaddedPacketCode,
+    components: usize,
+    tolerance: f64,
+) -> Result<(String, f64), String> {
     match found {
-        Ok(search) => match &search.code {
-            EvidenceStatus::Exact { value, .. } => Ok(("exact".to_string(), *value, *value)),
-            EvidenceStatus::Unresolved { lower, upper, .. } => Ok(("unresolved".to_string(), *lower, *upper)),
-            other => Err(format!("an unexpected code status {other:?}")),
-        },
-        Err(SupportSearchError::AllOnViolation) => Ok(("all_on_violation".to_string(), f64::INFINITY, f64::INFINITY)),
+        Ok(ranked) => {
+            let status = if ranked.found.evidence.certifies_at_most(tolerance) { "certified" } else { "unresolved" };
+            // Integer code lengths convert to f64 exactly below 2^53 bits.
+            let bits = code.support_bits(components, ranked.found.support.len()).map_err(|error| format!("{error:?}"))?;
+            Ok((status.to_string(), bits as f64))
+        }
+        Err(SupportSearchError::AllOnViolation) => Ok(("all_on_violation".to_string(), f64::INFINITY)),
         Err(error) => Err(format!("{error:?}")),
     }
 }
 
-/// The box oracle's positive control at one tolerance: its search's minimum code, and the supports either
-/// search queried that the two oracles decide differently.
+/// The components by descending single-deletion risk: the proven lower end of the divergence with only that
+/// component off, index order on ties. `without(c)` is the mask with every component on but `c`.
+fn deletion_ranking<O: SeparationOracle>(
+    oracle: &mut O,
+    without: impl Fn(usize) -> Result<O::Mask, String>,
+) -> Result<Vec<usize>, String>
+where
+    O::Error: std::fmt::Debug,
+{
+    let mut scored = Vec::with_capacity(oracle.components());
+    for component in 0..oracle.components() {
+        let status = oracle.evaluate(&without(component)?).map_err(|error| format!("{error:?}"))?;
+        scored.push((component, status.lower_bound().unwrap_or(0.0)));
+    }
+    scored.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
+    Ok(scored.into_iter().map(|(component, _)| component).collect())
+}
+
+/// The box oracle's positive control at one tolerance: its ranked search's run, and the supports either search
+/// queried that the two oracles decide differently.
 #[derive(Serialize)]
 struct BoxControl {
-    code_status: String,
-    code_bits_lower: f64,
-    code_bits_upper: f64,
+    status: String,
+    code_bits: f64,
     support: Vec<String>,
     separations: usize,
-    edges: Vec<Vec<String>>,
+    refuted_shorter: Option<Vec<String>>,
     /// Supports either search queried, each separated by both oracles.
     queried: usize,
     disagreements: Vec<Vec<String>>,
-    /// The same minimum code as the exhaustive search, and no disagreement.
+    /// The same status and run as the exhaustive search, and no disagreement.
     agrees: bool,
 }
 
-/// S2a's exhaustive oracle is the reference for `supports::BoxSeparationOracle` on the same program (#2951): the
-/// box search must find the exhaustive search's minimum code, and every support either search queried must get
-/// the same certify/refute decision from both oracles. A certified support may differ between the two searches
-/// when two supports share the minimum code, so ties are reported, not compared.
+/// S2a's exhaustive oracle is the reference for `supports::BoxSeparationOracle` on the same program (#2951): under
+/// the same ranking the box search must keep the exhaustive search's run with the same status, and every support
+/// either search queried must get the same certify/refute decision from both oracles.
 fn box_control(
     divergences: &mut Divergences<'_>,
     enclosed: &mut BTreeMap<MaskBox, BoxEnclosure<HeadMaskFamily>>,
     code: &PaddedPacketCode,
     tolerance: f64,
-    exhaustive: &Result<SupportSearch<HeadMask, HeadMaskFamily>, SupportSearchError<String, CodecError>>,
+    ranking: &[usize],
+    exhaustive: &Result<RankedSupport<HeadMask, HeadMaskFamily>, SupportSearchError<String>>,
     exhaustive_queried: &[ComponentSet],
     heads: usize,
 ) -> Result<BoxControl, String> {
@@ -839,18 +865,20 @@ fn box_control(
             oracle,
             queried: Vec::new(),
         };
-        let found = minimum_code_support(&mut recording, code, tolerance, FailureHypergraph::new(components));
+        let found = ranked_support(&mut recording, ranking, tolerance);
         (found, recording.queried)
     };
-    let (code_status, code_bits_lower, code_bits_upper) = code_bits(&found)?;
-    let reference = code_bits(exhaustive)?;
-    let (support, separations, edges) = match &found {
-        Ok(search) => (
-            search.certified.as_ref().map_or_else(Vec::new, |certified| names(heads, certified.support.members())),
-            search.separations,
-            search.hypergraph.edges().iter().map(|edge| names(heads, edge.perturbed.members())).collect(),
+    let (status, code_bits) = ranked_status(&found, code, components, tolerance)?;
+    let reference = ranked_status(exhaustive, code, components, tolerance)?;
+    let same_run = found.as_ref().ok().map(|ranked| &ranked.found.support)
+        == exhaustive.as_ref().ok().map(|ranked| &ranked.found.support);
+    let (support, separations, refuted_shorter) = match &found {
+        Ok(ranked) => (
+            names(heads, ranked.found.support.members()),
+            ranked.separations,
+            ranked.refuted_shorter.as_ref().map(|shorter| names(heads, shorter.support.members())),
         ),
-        Err(_) => (Vec::new(), 0, Vec::new()),
+        Err(_) => (Vec::new(), 0, None),
     };
     let mut queried: Vec<ComponentSet> = Vec::new();
     for support in exhaustive_queried.iter().chain(box_queried.iter()) {
@@ -882,17 +910,13 @@ fn box_control(
             disagreements.push(names(heads, support.members()));
         }
     }
-    let same_code = code_status == reference.0
-        && code_bits_lower.to_bits() == reference.1.to_bits()
-        && code_bits_upper.to_bits() == reference.2.to_bits();
-    let agrees = same_code && disagreements.is_empty();
+    let agrees = status == reference.0 && same_run && disagreements.is_empty();
     Ok(BoxControl {
-        code_status,
-        code_bits_lower,
-        code_bits_upper,
+        status,
+        code_bits,
         support,
         separations,
-        edges,
+        refuted_shorter,
         queried: queried.len(),
         disagreements,
         agrees,
@@ -1057,15 +1081,16 @@ struct ToleranceReport {
     /// The certified support is empty: the do-nothing baseline meets the tolerance, by construction.
     vacuous: bool,
     transplant: Option<TransplantReport>,
-    /// `exact` when the search closed, `unresolved` when it did not, and `all_on_violation` when the artifact
-    /// misses the tolerance with every head on.
-    code_status: String,
-    code_bits_lower: f64,
-    code_bits_upper: f64,
+    /// `certified` when the found run's evidence certifies it, `unresolved` when it does not, and
+    /// `all_on_violation` when the artifact misses the tolerance with every head on.
+    status: String,
+    /// The found run's padded head code.
+    code_bits: f64,
     support: Vec<String>,
     support_risk: Option<Risk>,
     separations: usize,
-    edges: Vec<Vec<String>>,
+    /// The run one shorter, when the search refuted it.
+    refuted_shorter: Option<Vec<String>>,
     per_row: Option<PerRowReport>,
     box_control: BoxControl,
 }
@@ -1246,6 +1271,12 @@ fn main() -> Result<(), String> {
         .map(|&fraction| ("relative", fraction, fraction * all_off))
         .chain(settings.absolute_tolerances.iter().map(|&tolerance| ("absolute", tolerance, tolerance)))
         .collect();
+    // The rankings: heads by descending single-deletion risk over every induction row, and per row.
+    let without = |component: usize| Ok(HeadMask(((1u32 << components) - 1) & !(1 << component)));
+    let ranking = deletion_ranking(&mut HeadOracle { divergences: &mut divergences, row: None }, without)?;
+    let row_rankings = (0..rows)
+        .map(|row| deletion_ranking(&mut HeadOracle { divergences: &mut divergences, row: Some(row) }, without))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut reports = Vec::with_capacity(entries.len());
     let mut box_enclosures = BTreeMap::new();
     let mut box_failures = Vec::new();
@@ -1254,7 +1285,7 @@ fn main() -> Result<(), String> {
         let transplant = match (&settings.transplant, &trained, scale) {
             (Some(transplant), Some(trained), "relative") => {
                 let found = trained.tolerances.iter().find(|entry| {
-                    entry.scale == "relative" && entry.declared.to_bits() == declared.to_bits() && entry.code_status == "exact"
+                    entry.scale == "relative" && entry.declared.to_bits() == declared.to_bits() && entry.status == "certified"
                 });
                 match found {
                     Some(entry) => {
@@ -1289,7 +1320,7 @@ fn main() -> Result<(), String> {
                 },
                 queried: Vec::new(),
             };
-            let found = minimum_code_support(&mut recording, &code, tolerance, FailureHypergraph::new(components));
+            let found = ranked_support(&mut recording, &ranking, tolerance);
             (found, recording.queried)
         };
         let control = box_control(
@@ -1297,15 +1328,15 @@ fn main() -> Result<(), String> {
             &mut box_enclosures,
             &code,
             tolerance,
+            &ranking,
             &search,
             &exhaustive_queried,
             heads,
         )?;
         println!(
-            "[box-control] tolerance={tolerance:.3e} code={} bits=[{}, {}] support={:?} separations={} queried={} disagreements={} agrees={}",
-            control.code_status,
-            control.code_bits_lower,
-            control.code_bits_upper,
+            "[box-control] tolerance={tolerance:.3e} status={} bits={} support={:?} separations={} queried={} disagreements={} agrees={}",
+            control.status,
+            control.code_bits,
             control.support,
             control.separations,
             control.queried,
@@ -1318,20 +1349,19 @@ fn main() -> Result<(), String> {
         let search = match search {
             Ok(search) => search,
             Err(SupportSearchError::AllOnViolation) => {
-                println!("[supports] tolerance={tolerance:.3e} code=all_on_violation: the artifact misses it with every head on");
+                println!("[supports] tolerance={tolerance:.3e} status=all_on_violation: the artifact misses it with every head on");
                 reports.push(ToleranceReport {
                     scale: scale.to_string(),
                     declared,
                     tolerance,
                     vacuous: false,
                     transplant,
-                    code_status: "all_on_violation".to_string(),
-                    code_bits_lower: f64::INFINITY,
-                    code_bits_upper: f64::INFINITY,
+                    status: "all_on_violation".to_string(),
+                    code_bits: f64::INFINITY,
                     support: Vec::new(),
                     support_risk: None,
                     separations: 0,
-                    edges: Vec::new(),
+                    refuted_shorter: None,
                     per_row: None,
                     box_control: control,
                 });
@@ -1339,23 +1369,20 @@ fn main() -> Result<(), String> {
             }
             Err(error) => return Err(format!("tolerance {tolerance}: {error:?}")),
         };
-        let (code_status, code_bits_lower, code_bits_upper) = match &search.code {
-            EvidenceStatus::Exact { value, .. } => ("exact", *value, *value),
-            EvidenceStatus::Unresolved { lower, upper, .. } => ("unresolved", *lower, *upper),
-            other => return Err(format!("tolerance {tolerance}: an unexpected code status {other:?}")),
+        let certified = search.found.evidence.certifies_at_most(tolerance);
+        let status = if certified { "certified" } else { "unresolved" };
+        // Integer code lengths convert to f64 exactly below 2^53 bits.
+        let code_bits = code
+            .support_bits(components, search.found.support.len())
+            .map_err(|error| format!("{error:?}"))? as f64;
+        let (support, support_risk) = if certified {
+            (names(heads, search.found.support.members()), Some(risk(heads, &search.found.evidence)))
+        } else {
+            (Vec::new(), None)
         };
-        let (support, support_risk) = match &search.certified {
-            Some(found) => (names(heads, found.support.members()), Some(risk(heads, &found.evidence))),
-            None => (Vec::new(), None),
-        };
-        let edges = search
-            .hypergraph
-            .edges()
-            .iter()
-            .map(|edge| names(heads, edge.perturbed.members()))
-            .collect();
+        let refuted_shorter = search.refuted_shorter.as_ref().map(|shorter| names(heads, shorter.support.members()));
 
-        // P18: each induction row's own minimum-code support at the same tolerance.
+        // P18: each induction row's own ranked support at the same tolerance, under its own ranking.
         let mut per_input = Vec::new();
         let mut per_row_supports = Vec::new();
         let mut unresolved_rows = 0;
@@ -1365,20 +1392,19 @@ fn main() -> Result<(), String> {
                 divergences: &mut divergences,
                 row: Some(row),
             };
-            let found = minimum_code_support(&mut oracle, &code, tolerance, FailureHypergraph::new(components));
+            let found = ranked_support(&mut oracle, &row_rankings[row], tolerance);
             match found {
-                Ok(found) => match (found.code, found.certified) {
-                    (EvidenceStatus::Exact { .. }, Some(certified)) => {
-                        size_counts[certified.support.len()] += 1;
-                        per_row_supports.push(certified.support.members().to_vec());
-                        per_input.push(InputSupport {
-                            support: certified.support,
-                            tolerance,
-                            evidence: certified.evidence,
-                        });
-                    }
-                    _ => unresolved_rows += 1,
-                },
+                Ok(ranked) if ranked.found.evidence.certifies_at_most(tolerance) => {
+                    let found = ranked.found;
+                    size_counts[found.support.len()] += 1;
+                    per_row_supports.push(found.support.members().to_vec());
+                    per_input.push(InputSupport {
+                        support: found.support,
+                        tolerance,
+                        evidence: found.evidence,
+                    });
+                }
+                Ok(_) => unresolved_rows += 1,
                 Err(SupportSearchError::AllOnViolation) => unresolved_rows += 1,
                 Err(error) => return Err(format!("tolerance {tolerance} row {row}: {error:?}")),
             }
@@ -1396,16 +1422,15 @@ fn main() -> Result<(), String> {
         let resolved = per_row_supports.len();
         let mean_support = if resolved == 0 { 0.0 } else { library.summed_support as f64 / resolved as f64 };
         println!(
-            "[supports] tolerance={tolerance:.3e} code={code_status} bits=[{code_bits_lower}, {code_bits_upper}] support={support:?} risk={:?} separations={} edges={}",
+            "[supports] tolerance={tolerance:.3e} status={status} bits={code_bits} support={support:?} risk={:?} separations={} refuted_shorter={refuted_shorter:?}",
             support_risk.as_ref().and_then(|risk| risk.value),
             search.separations,
-            search.hypergraph.edges().len()
         );
         println!(
             "[supports] tolerance={tolerance:.3e} per_row rows={rows} unresolved={unresolved_rows} mean_support={mean_support:.3} sizes={size_counts:?} union={:?} library_bits={library_bits} packet_bits={packet_bits}",
             names(heads, union.support.members())
         );
-        let vacuous = code_status == "exact" && search.certified.as_ref().is_some_and(|found| found.support.is_empty());
+        let vacuous = certified && search.found.support.is_empty();
         println!(
             "[scale] {scale} declared={declared:.3e} tolerance={tolerance:.3e} vacuous={vacuous}{}",
             if vacuous { ": the do-nothing baseline meets the tolerance by construction" } else { "" }
@@ -1416,13 +1441,12 @@ fn main() -> Result<(), String> {
             tolerance,
             vacuous,
             transplant,
-            code_status: code_status.to_string(),
-            code_bits_lower,
-            code_bits_upper,
+            status: status.to_string(),
+            code_bits,
             support,
             support_risk,
             separations: search.separations,
-            edges,
+            refuted_shorter,
             per_row: Some(PerRowReport {
                 rows,
                 unresolved_rows,
@@ -1465,7 +1489,7 @@ fn main() -> Result<(), String> {
                         row.instances,
                         tolerance.fraction,
                         tolerance.tolerance,
-                        tolerance.code_status,
+                        tolerance.status,
                         tolerance.support,
                         tolerance.at_source,
                         tolerance.elsewhere,
@@ -1549,13 +1573,14 @@ struct PositionTolerance {
     fraction: f64,
     tolerance: f64,
     vacuous: bool,
-    /// `exact`, `unresolved`, or `all_on_violation` when the artifact misses the tolerance with every instance on.
-    code_status: String,
-    code_bits_lower: f64,
-    code_bits_upper: f64,
+    /// `certified`, `unresolved`, or `all_on_violation` when the artifact misses the tolerance with every instance on.
+    status: String,
+    /// The found run's padded head code over the instances.
+    code_bits: f64,
     support: Vec<String>,
     separations: usize,
-    edges: usize,
+    /// The run one shorter, when the search refuted it.
+    refuted_shorter: Option<Vec<String>>,
     /// The support's lower-layer components at the source `t − n + 1` the mechanism reads, and at the rest.
     at_source: usize,
     elsewhere: usize,
@@ -1587,10 +1612,10 @@ struct PositionRowReport {
 }
 
 /// Stage S3 at one declared induction row `(sequence, position)` of a sequence whose segment has length
-/// `segment`: at each declared fraction `f` of the row's own all-off divergence, the minimum-code support over
-/// the row's instances (`row_instances`) by `BoxSeparationOracle`. The code is the padded head code over the
-/// instances, `L(C, k) + L_int(H) + k·H`, a function of the size alone, so the minimum-code support is a
-/// minimum-count one; the report also gives the code that sends each distinct kept head once.
+/// `segment`: at each declared fraction `f` of the row's own all-off divergence, the shortest sufficient run of
+/// the row's instances (`row_instances`) ranked by descending single-deletion divergence, by `BoxSeparationOracle`.
+/// The code is the padded head code over the instances, `L(C, k) + L_int(H) + k·H`; the report also gives the code
+/// that sends each distinct kept head once.
 fn position_row(
     artifact: &HeadNetwork,
     tokens: &[i64],
@@ -1618,21 +1643,36 @@ fn position_row(
         return Err(format!("row ({sequence}, {position}): the all-off divergence is unresolved"));
     };
     let code = PaddedPacketCode { body_bits: head_bits };
+    // The ranking: instances by descending single-deletion divergence, the proven lower end at the vertex with only
+    // that instance off, index order on ties.
+    let ranking = {
+        let mut program = ScopedBoxes { artifact, tokens, reference, family, instances: &instances, enclosed: &mut enclosed };
+        let mut scored = Vec::with_capacity(count);
+        for component in 0..count {
+            let without = vertex((0..count).filter(|&other| other != component).collect())?;
+            scored.push((component, program.enclose(&without)?.evidence.lower_bound().unwrap_or(0.0)));
+        }
+        scored.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
+        scored.into_iter().map(|(component, _)| component).collect::<Vec<usize>>()
+    };
     let mut tolerances = Vec::with_capacity(fractions.len());
     for &fraction in fractions {
         let tolerance = fraction * do_nothing;
         let program = ScopedBoxes { artifact, tokens, reference, family, instances: &instances, enclosed: &mut enclosed };
         let oracle = BoxSeparationOracle::new(program, tolerance).map_err(|error| format!("{error:?}"))?;
         let mut oracle = Logged::new(oracle, format!("row=({sequence}, {position}) fraction={fraction:.3e}"));
-        let found = minimum_code_support(&mut oracle, &code, tolerance, FailureHypergraph::new(count));
-        let (code_status, code_bits_lower, code_bits_upper) = code_bits(&found)?;
-        let (members, separations, edges) = match &found {
-            Ok(search) => (
-                search.certified.as_ref().map(|found| found.support.members().to_vec()),
-                search.separations,
-                search.hypergraph.edges().len(),
+        let found = ranked_support(&mut oracle, &ranking, tolerance);
+        let (status, code_bits) = ranked_status(&found, &code, count, tolerance)?;
+        let (members, separations, refuted_shorter) = match &found {
+            Ok(ranked) => (
+                ranked.found.evidence.certifies_at_most(tolerance).then(|| ranked.found.support.members().to_vec()),
+                ranked.separations,
+                ranked
+                    .refuted_shorter
+                    .as_ref()
+                    .map(|shorter| shorter.support.members().iter().map(|&member| instances[member].name()).collect()),
             ),
-            Err(_) => (None, 0, 0),
+            Err(_) => (None, 0, None),
         };
         let support = members.clone().unwrap_or_default();
         let at_source = support.iter().filter(|&&member| instances[member].scope == Scope::Source).count();
@@ -1679,13 +1719,12 @@ fn position_row(
         tolerances.push(PositionTolerance {
             fraction,
             tolerance,
-            vacuous: code_status == "exact" && members.as_ref().is_some_and(Vec::is_empty),
-            code_status,
-            code_bits_lower,
-            code_bits_upper,
+            vacuous: members.as_ref().is_some_and(Vec::is_empty),
+            status,
+            code_bits,
             support: support.iter().map(|&member| instances[member].name()).collect(),
             separations,
-            edges,
+            refuted_shorter,
             at_source,
             elsewhere,
             distinct_heads: heads.len(),

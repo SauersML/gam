@@ -72,13 +72,13 @@
 //! loses when its code is longer.
 
 use std::fmt;
-use std::num::NonZeroU64;
 
 use super::codec::code_saving_at_proven_fidelity;
-use super::precision::{DecodedFidelity, DeclaredPrecision};
+use super::precision::DecodedFidelity;
 use super::supports::{EvidenceStatus, Extremum};
 use gam_linalg::matrix::{array2_bits_fingerprint, dense_rowwise_kronecker};
 use gam_linalg::roundoff::accumulation_growth;
+use gam_runtime::resource::{MemoryGovernor, MemoryReservation, MemoryReservationError};
 use gam_solve::estimate::EstimationError;
 use gam_solve::gaussian_reml_multi_penalty::{
     GaussianRemlMultiPenaltyDataGradientOutcome, GaussianRemlMultiPenaltyFit,
@@ -178,12 +178,10 @@ pub enum GaussianBlockError {
     NativeMultipleRow {
         row: usize,
     },
-    /// The block's dense state exceeds the host in-core budget. `required_bytes`
-    /// is `None` when the count overflows `usize`.
-    AdmissionRefused {
-        required_bytes: Option<usize>,
-        budget_bytes: usize,
-    },
+    /// The block's dense byte count overflows `usize`.
+    DenseBytesOverflow,
+    /// The process memory governor refused the block's dense state.
+    Memory(MemoryReservationError),
     /// A design cotangent's width is not the design's.
     DesignCotangentWidth {
         columns: usize,
@@ -280,21 +278,13 @@ impl fmt::Display for GaussianBlockError {
                  component, so it executes m_Delta Theta_* whatever the field, labels and weights \
                  are, and observes nothing the fit moves"
             ),
-            Self::AdmissionRefused {
-                required_bytes: Some(required),
-                budget_bytes,
-            } => write!(
+            Self::DenseBytesOverflow => write!(
                 f,
-                "conditionally Gaussian block refused: its dense state needs at least {required} \
-                 bytes, above the host in-core budget of {budget_bytes} bytes"
+                "conditionally Gaussian block refused: its dense byte count overflows usize"
             ),
-            Self::AdmissionRefused {
-                required_bytes: None,
-                budget_bytes,
-            } => write!(
+            Self::Memory(error) => write!(
                 f,
-                "conditionally Gaussian block refused: its dense byte count overflows usize \
-                 (host in-core budget {budget_bytes} bytes)"
+                "conditionally Gaussian block refused by the memory governor: {error}"
             ),
             Self::DesignCotangentWidth { columns, expected } => write!(
                 f,
@@ -323,7 +313,7 @@ impl std::error::Error for GaussianBlockError {}
 /// Refuses:
 /// * an empty or mis-shaped block, an empty penalty list, or non-finite input;
 /// * a row whose declared mask is a native multiple (see the module docs);
-/// * a block whose dense state exceeds the host in-core budget.
+/// * a block whose dense state the process memory governor cannot reserve.
 ///
 /// The block declares a zero null space. So the REML owner refuses a penalty set
 /// whose summed null space it resolves as non-empty, since a direction of the left
@@ -438,12 +428,12 @@ pub fn fit_gaussian_coefficient_block(
         }
     }
     let ranks: Vec<usize> = right_factors.iter().map(|factor| factor.ncols()).collect();
-    admit_dense_block(
+    let reservation = admit_dense_block(
+        MemoryGovernor::global(),
         n,
         &ranks,
         field_penalties.len(),
         output_dim,
-        crate::manifold::sae_host_in_core_budget_bytes().0,
     )?;
     let design = block_design(rows.moments, rows.inputs, right_factors);
     let penalties = field_penalties
@@ -455,6 +445,7 @@ pub fn fit_gaussian_coefficient_block(
         .map_err(GaussianBlockError::Reml)?;
     let reml = problem.fit(None).map_err(GaussianBlockError::Reml)?;
     let left_factors = left_factors_from_design_order(reml.coefficients.view(), right_factors);
+    drop(reservation);
     Ok(GaussianBlockFit {
         left_factors,
         problem,
@@ -846,20 +837,19 @@ fn dense_block_bytes(rows: usize, ranks: &[usize], penalties: usize, outputs: us
         .checked_mul(std::mem::size_of::<f64>())
 }
 
+/// Reserves the block's dense state on `governor`, held while the block is fitted.
 fn admit_dense_block(
+    governor: &MemoryGovernor,
     rows: usize,
     ranks: &[usize],
     penalties: usize,
     outputs: usize,
-    budget_bytes: usize,
-) -> Result<(), GaussianBlockError> {
-    match dense_block_bytes(rows, ranks, penalties, outputs) {
-        Some(required) if required <= budget_bytes => Ok(()),
-        required_bytes => Err(GaussianBlockError::AdmissionRefused {
-            required_bytes,
-            budget_bytes,
-        }),
-    }
+) -> Result<MemoryReservation, GaussianBlockError> {
+    let required = dense_block_bytes(rows, ranks, penalties, outputs)
+        .ok_or(GaussianBlockError::DenseBytesOverflow)?;
+    governor
+        .try_reserve(required, "conditionally Gaussian coefficient block")
+        .map_err(GaussianBlockError::Memory)
 }
 
 /// A structural proposal on the current artifact.
@@ -1003,159 +993,6 @@ pub fn decide_proposal<W, D, V, E>(
         fidelity_certified: fidelity.certifies_at_most(tolerance),
         fidelity,
     })
-}
-
-/// Whether rows execute the residual `Θ_* − Σ_c P_c`.
-///
-/// This is one declared value, shared by every row, by the mask generators and by
-/// the separation oracle, so all three read the same zonotope:
-/// * under `Kept`, `Θ(t) = Θ_* − B q`;
-/// * under `Removed`, `Θ(t) = B Σ_c v_c − B q`.
-///
-/// There is no default: the two are different experiments.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResidualState {
-    /// Rows execute the residual: `m_Δ = 1`.
-    Kept,
-    /// Rows drop the residual: `m_Δ = 0`.
-    Removed,
-}
-
-impl ResidualState {
-    /// The residual mask `m_Δ` every row of the experiment declares.
-    pub fn residual_mask(self) -> f64 {
-        match self {
-            Self::Kept => 1.0,
-            Self::Removed => 0.0,
-        }
-    }
-}
-
-/// How a readout's distortion is measured.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Divergence {
-    /// Squared error on a layer-local readout. Its coefficient block is conditionally
-    /// Gaussian and fitted exactly.
-    SquaredError,
-    /// `KL(p_native ‖ p_edited)` on a distribution readout.
-    ///
-    /// A deterministic teacher gives a soft-label row no dispersion, so each row stands
-    /// for a declared number of teacher draws. That count sets the likelihood's scale for
-    /// the Laplace evidence, which is an approximation and never exact.
-    Kl { samples: NonZeroU64 },
-}
-
-/// The declared inputs of a manifold parameter decomposition fit. Every field is
-/// required, and none has a default.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MpdExperiment {
-    residual_state: ResidualState,
-    tolerance: f64,
-    precision: DeclaredPrecision,
-    divergence: Divergence,
-}
-
-/// Why an experiment declaration was refused.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ExperimentError {
-    /// The fidelity tolerance must be finite and nonnegative.
-    Tolerance { value: f64 },
-}
-
-impl fmt::Display for ExperimentError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Tolerance { value } => write!(
-                f,
-                "experiment refused: the declared fidelity tolerance {value} must be finite and \
-                 nonnegative"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ExperimentError {}
-
-impl MpdExperiment {
-    /// Declares an experiment.
-    ///
-    /// A tolerance is refused unless it is finite and nonnegative. That is the same
-    /// predicate `precision::decode_then_evaluate` and the codec's saving comparison
-    /// apply, so a declaration they would refuse never reaches them.
-    pub fn new(
-        residual_state: ResidualState,
-        tolerance: f64,
-        precision: DeclaredPrecision,
-        divergence: Divergence,
-    ) -> Result<Self, ExperimentError> {
-        if !(tolerance.is_finite() && tolerance >= 0.0) {
-            return Err(ExperimentError::Tolerance { value: tolerance });
-        }
-        Ok(Self {
-            residual_state,
-            tolerance,
-            precision,
-            divergence,
-        })
-    }
-
-    /// The declared residual state.
-    pub fn residual_state(&self) -> ResidualState {
-        self.residual_state
-    }
-
-    /// The declared fidelity tolerance.
-    pub fn tolerance(&self) -> f64 {
-        self.tolerance
-    }
-
-    /// The declared precision of real codes.
-    pub fn precision(&self) -> DeclaredPrecision {
-        self.precision
-    }
-
-    /// The declared divergence of the readout.
-    pub fn divergence(&self) -> Divergence {
-        self.divergence
-    }
-}
-
-#[cfg(test)]
-mod experiment_tests {
-    use super::*;
-
-    #[test]
-    fn an_experiment_declares_every_input_and_refuses_an_invalid_tolerance() {
-        let precision = DeclaredPrecision::new(12).expect("a normal dyadic step");
-        let samples = NonZeroU64::new(64).expect("a nonzero sample count");
-        for invalid in [f64::NAN, f64::INFINITY, -1e-300] {
-            let refused =
-                MpdExperiment::new(ResidualState::Kept, invalid, precision, Divergence::SquaredError);
-            assert!(
-                matches!(refused, Err(ExperimentError::Tolerance { .. })),
-                "tolerance {invalid} must be refused, got {refused:?}"
-            );
-        }
-        // Positive control: zero is a valid declared tolerance, the same edge the
-        // decode-then-evaluate owner admits.
-        let exact = MpdExperiment::new(ResidualState::Removed, 0.0, precision, Divergence::Kl { samples })
-            .expect("a zero tolerance is admitted");
-        assert_eq!(exact.tolerance(), 0.0, "the declared tolerance is kept");
-        assert_eq!(exact.residual_state(), ResidualState::Removed, "the declared residual state is kept");
-        assert_eq!(exact.divergence(), Divergence::Kl { samples }, "the declared divergence is kept");
-        assert_eq!(exact.precision(), precision, "the declared precision is kept");
-    }
-
-    #[test]
-    fn the_residual_state_fixes_one_residual_mask_for_every_row() {
-        assert_eq!(ResidualState::Kept.residual_mask(), 1.0, "Kept executes the residual");
-        assert_eq!(ResidualState::Removed.residual_mask(), 0.0, "Removed drops the residual");
-        assert_ne!(
-            ResidualState::Kept.residual_mask(),
-            ResidualState::Removed.residual_mask(),
-            "the two declared states are different experiments"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -1654,25 +1491,27 @@ mod tests {
             "the ledger counts the design and widest projection, both penalty copies, the owner's \
              reduction and stacked root, and the coefficients"
         );
+        let exact = MemoryGovernor::with_budget_bytes(expected);
         assert!(
-            admit_dense_block(rows, &ranks, penalties, OUTPUT_DIM, expected).is_ok(),
+            admit_dense_block(&exact, rows, &ranks, penalties, OUTPUT_DIM).is_ok(),
             "a budget equal to the ledger admits the block"
         );
-        let refused = admit_dense_block(rows, &ranks, penalties, OUTPUT_DIM, expected - 1);
+        let short = MemoryGovernor::with_budget_bytes(expected - 1);
+        let refused = admit_dense_block(&short, rows, &ranks, penalties, OUTPUT_DIM);
         assert!(
             matches!(
                 refused,
-                Err(GaussianBlockError::AdmissionRefused { required_bytes: Some(required), budget_bytes })
-                    if required == expected && budget_bytes == expected - 1
+                Err(GaussianBlockError::Memory(MemoryReservationError::BudgetExceeded {
+                    requested_bytes,
+                    budget_bytes,
+                    ..
+                })) if requested_bytes == expected && budget_bytes == expected - 1
             ),
             "one byte below the ledger must refuse, got {refused:?}"
         );
-        let overflow = admit_dense_block(usize::MAX, &[2], 1, 1, usize::MAX);
+        let overflow = admit_dense_block(&exact, usize::MAX, &[2], 1, 1);
         assert!(
-            matches!(
-                overflow,
-                Err(GaussianBlockError::AdmissionRefused { required_bytes: None, .. })
-            ),
+            matches!(overflow, Err(GaussianBlockError::DenseBytesOverflow)),
             "an overflowing ledger must refuse, got {overflow:?}"
         );
     }

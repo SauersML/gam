@@ -421,7 +421,7 @@ pub enum ProgramError {
     EmptyCompose { body: BodyId, node: NodeId },
     /// The call graph has a cycle through `body`.
     RecursiveCall { body: BodyId },
-    /// A declared parameter no Linear or AddBias node reads.
+    /// A declared parameter no native primitive reads ([`NativePrimitive::parameters`]).
     ParameterUnused { parameter: ParameterSlot },
     /// A declared slot no Read or Write node names.
     SlotUnused { slot: SlotId },

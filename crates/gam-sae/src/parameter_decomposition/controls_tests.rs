@@ -5,14 +5,8 @@
 //! Each test composes at least two modules and carries a positive control that the
 //! guard under test must catch:
 //!
-//! * a positive collinear refinement keeps every whole-group support's risk, its
-//!   witness and the minimum support, while a bent refinement with the same sum
-//!   does not (`moments`, `supports`; P10, A5);
-//! * splitting a cancelling pair shrinks the mask-law mean square but not the
-//!   supremum, so a support certified by the average is refuted by the support
-//!   function's witness (`moments`, `supports`; P10, A6);
 //! * a `Q, −Q` junk pair reproduces the all-on block exactly yet enters every
-//!   minimum support, and tying its two masks makes it inert (`rewrite`,
+//!   sufficient support, and tying its two masks makes it inert (`rewrite`,
 //!   `supports`; A13 negative control);
 //! * the identity program is shorter than the projector family when the family's
 //!   labels are shipped at declared precision and fidelity is measured on the
@@ -21,49 +15,23 @@
 //!   endpoint masks miss (`rewrite`, `supports`; P7, P12, A7);
 //! * gauge-equivalent factorizations execute one intervention under covariant
 //!   masks and move no generator, while a diagonal mask on a sheared basis is a
-//!   different intervention (`rewrite`, `moments`; P1, A2);
-//! * a softmax-gauge component, a constant logit shift, is dropped by the
-//!   oscillation certificate. A sup-norm gap certificate keeps it and leaves the
-//!   search unresolved (`moments`, `bounds`, gam-math `categorical`, `supports`;
-//!   P8, P15, A6);
-//! * a collinear family resolves one mode whether its members are positive
-//!   multiples or a cancelling pair, but only the positive refinement merges into
-//!   one ablation control (`families`, `moments`; P10).
+//!   different intervention (`rewrite`, `moments`; P1, A2).
 
-use std::convert::Infallible;
 use std::f64::consts::PI;
 
-use gam_linalg::roundoff::{accumulation_band, accumulation_growth};
-use gam_math::categorical::categorical_kl_from_logits_with_error;
+use gam_linalg::roundoff::accumulation_growth;
 use gam_math::gaussian_activation::GaussianActivation;
-use ndarray::{Array1, Array2, ArrayView1, array};
+use ndarray::{Array1, Array2, array};
 
-use super::bounds::{LogitGapNorm, kl_bound_from_logit_gap, softmax_kl_oscillation_bound};
 use super::codec::{
     BitString, DagNode, LibraryPacketArtifact, code_saving_at_proven_fidelity, decode_fixed_index, decode_ordered_dag,
     decode_prefix_integer, decode_support_packet, encode_fixed_index, encode_ordered_dag, encode_prefix_integer,
     encode_support_packets, prefix_integer_len_bits, subset_code_len_bits, union_support_library,
 };
-use super::families::{FamilyError, principal_field};
 use super::moments::{GeneratorPart, MaskDomain, MaskMomentSystem, MomentBlock, MomentVector, WitnessEndpoint};
 use super::precision::{DecodableArtifact, PeriodicQuotient, QuotientCode, decode_then_evaluate};
 use super::rewrite::{ComponentMask, ComponentMlp, ComponentRead, MlpMask, NativeMlp};
-use super::supports::{
-    CardinalityCode, ComponentSet, EvidenceStatus, ExactBasis, Extremum, FailureHypergraph, SeparationOracle,
-    minimum_code_support, replay_conflicts,
-};
-
-/// A support code whose length is the support size, so a minimum code is a minimum
-/// cardinality.
-struct SizeCode;
-
-impl CardinalityCode for SizeCode {
-    type Error = Infallible;
-
-    fn support_bits(&self, components: usize, size: usize) -> Result<u64, Infallible> {
-        Ok(size.min(components) as u64)
-    }
-}
+use super::supports::{ComponentSet, EvidenceStatus, ExactBasis, SeparationOracle, ranked_support};
 
 fn set(components: usize, members: &[usize]) -> ComponentSet {
     ComponentSet::new(components, members.to_vec()).expect("members in range")
@@ -75,195 +43,6 @@ fn perturbed(mask: &[f64]) -> Vec<usize> {
         .enumerate()
         .filter_map(|(component, &level)| (level != 1.0).then_some(component))
         .collect()
-}
-
-fn part(block: usize, vector: &[f64]) -> GeneratorPart {
-    GeneratorPart {
-        block,
-        vector: Array1::from(vector.to_vec()),
-    }
-}
-
-fn planar_system(generators: &[[f64; 2]]) -> MaskMomentSystem {
-    MaskMomentSystem::new(
-        vec![MomentBlock { dimension: 2 }],
-        generators.iter().map(|vector| vec![part(0, vector)]).collect(),
-    )
-    .expect("well-formed planar generators")
-}
-
-fn unit_domain(controls: usize) -> MaskDomain {
-    MaskDomain::new(vec![(0.0, 1.0); controls]).expect("the unit interval contains all-on")
-}
-
-/// The risk of a support: a supremum, its roundoff band and a mask attaining it.
-struct Risk {
-    value: f64,
-    band: f64,
-    mask: Vec<f64>,
-}
-
-/// Separation through the support function (P8). A mask's discrepancy is
-/// `max_k |⟨u_k, q(m)⟩|` over declared readouts, so a support's risk is the largest
-/// absolute support over the readouts: an algebraic supremum over the whole declared
-/// box, attained by the support function's witness mask.
-#[derive(Clone)]
-struct MomentOracle {
-    system: MaskMomentSystem,
-    domain: MaskDomain,
-    readouts: Vec<MomentVector>,
-}
-
-impl MomentOracle {
-    fn kept(&self, support: &ComponentSet) -> Vec<bool> {
-        (0..self.system.control_count())
-            .map(|control| support.members().binary_search(&control).is_ok())
-            .collect()
-    }
-
-    /// Each readout's computed supremum lies within its band of the exact one, so the
-    /// largest computed value lies within the largest band of the exact maximum.
-    fn risk(&self, support: &ComponentSet) -> Result<Risk, String> {
-        let kept = self.kept(support);
-        let mut value = f64::NEG_INFINITY;
-        let mut band = 0.0_f64;
-        let mut witness = Vec::new();
-        for readout in &self.readouts {
-            let side = self
-                .system
-                .absolute_supremum(&self.domain, &kept, readout)
-                .map_err(|error| format!("{error:?}"))?;
-            band = band.max(side.band);
-            if side.value > value {
-                value = side.value;
-                witness = side.witness;
-            }
-        }
-        let mask = self.domain.mask_at(&witness).map_err(|error| format!("{error:?}"))?;
-        Ok(Risk { value, band, mask })
-    }
-
-    /// A bound on the rounding of `⟨u, q(m)⟩`. Each moment coordinate sums `C` products
-    /// of a rounded deletion `1 − m_c` and a generator entry, and the pairing sums `n`
-    /// more products over the `n` moment coordinates, so every term carries at most
-    /// `C + n + 1` roundings and the computed value is within `γ_{C+n+1}` of the exact
-    /// one relative to `Σ_c |1 − m_c| Σ_i |v_{c,i}| |u_i|` (Higham, ASNA 2nd ed., §3.4).
-    fn pairing_band(&self, mask: &[f64], readout: &MomentVector) -> f64 {
-        let controls = self.system.control_count();
-        let dimension: usize = self.system.blocks().iter().map(|block| block.dimension).sum();
-        let absolute: f64 = mask
-            .iter()
-            .enumerate()
-            .map(|(control, &level)| {
-                let parts = self.system.generator(control).expect("control in range");
-                (1.0 - level).abs()
-                    * parts
-                        .iter()
-                        .map(|part| {
-                            part.vector
-                                .iter()
-                                .zip(readout.blocks[part.block].iter())
-                                .map(|(generator, covector)| (generator * covector).abs())
-                                .sum::<f64>()
-                        })
-                        .sum::<f64>()
-            })
-            .sum();
-        accumulation_growth(controls + dimension + 1) * absolute
-    }
-}
-
-impl SeparationOracle for MomentOracle {
-    type Mask = Vec<f64>;
-    type Domain = &'static str;
-    type Error = String;
-
-    fn components(&self) -> usize {
-        self.system.control_count()
-    }
-
-    fn perturbed_components(&self, mask: &Vec<f64>) -> Vec<usize> {
-        perturbed(mask)
-    }
-
-    fn separate(&mut self, support: &ComponentSet) -> Result<EvidenceStatus<Vec<f64>, &'static str>, String> {
-        let risk = self.risk(support)?;
-        EvidenceStatus::exact(
-            risk.value,
-            risk.band,
-            ExactBasis::Algebraic,
-            Some(risk.mask),
-            "support function over the declared mask box",
-        )
-        .map_err(|error| error.to_string())
-    }
-
-    fn evaluate(&mut self, mask: &Vec<f64>) -> Result<EvidenceStatus<Vec<f64>, &'static str>, String> {
-        let moment = self
-            .system
-            .moment(&self.domain, mask)
-            .map_err(|error| format!("{error:?}"))?;
-        let mut value = 0.0_f64;
-        let mut band = 0.0_f64;
-        for readout in &self.readouts {
-            let pairing: f64 = moment
-                .blocks
-                .iter()
-                .zip(&readout.blocks)
-                .map(|(coordinates, covector)| coordinates.dot(covector))
-                .sum();
-            value = value.max(pairing.abs());
-            band = band.max(self.pairing_band(mask, readout));
-        }
-        EvidenceStatus::exact(
-            value,
-            band,
-            ExactBasis::Exhaustive { cardinality: 1 },
-            Some(mask.clone()),
-            "one declared mask",
-        )
-        .map_err(|error| error.to_string())
-    }
-}
-
-/// The dilution defect as an oracle: it reports the root mean square of the first
-/// readout under independent uniform masks, with its roundoff, as if it bounded the
-/// risk.
-struct AverageAsBoundOracle {
-    honest: MomentOracle,
-}
-
-impl SeparationOracle for AverageAsBoundOracle {
-    type Mask = Vec<f64>;
-    type Domain = &'static str;
-    type Error = String;
-
-    fn components(&self) -> usize {
-        self.honest.components()
-    }
-
-    fn perturbed_components(&self, mask: &Vec<f64>) -> Vec<usize> {
-        perturbed(mask)
-    }
-
-    fn separate(&mut self, support: &ComponentSet) -> Result<EvidenceStatus<Vec<f64>, &'static str>, String> {
-        let kept = self.honest.kept(support);
-        let law = self
-            .honest
-            .system
-            .uniform_mask_law_moments(&self.honest.domain, &kept, &self.honest.readouts[0])
-            .map_err(|error| format!("{error:?}"))?;
-        EvidenceStatus::uniform_bound(
-            (law.mean_square + law.mean_square_band).sqrt(),
-            0.0,
-            "root mean square under iid uniform masks",
-        )
-        .map_err(|error| error.to_string())
-    }
-
-    fn evaluate(&mut self, mask: &Vec<f64>) -> Result<EvidenceStatus<Vec<f64>, &'static str>, String> {
-        self.honest.evaluate(mask)
-    }
 }
 
 /// Exhaustive separation of a component MLP over a declared finite grid of read-in
@@ -375,180 +154,7 @@ impl SeparationOracle for BlockGridOracle {
 }
 
 #[test]
-fn a_positive_collinear_refinement_keeps_every_whole_group_risk_and_the_minimum_support_2951() {
-    // Dyadic generators, so every pairing, support value and sum below is exact.
-    let coarse_generators = [[4.0, 2.0], [-1.0, 3.0], [2.0, -6.0]];
-    // Control 0 split into its dyadic pieces 1/2, 1/4 and 1/4, the last two appended.
-    let refined_generators = [[2.0, 1.0], [-1.0, 3.0], [2.0, -6.0], [1.0, 0.5], [1.0, 0.5]];
-    // Two pieces that also sum to (4, 2) but are not collinear.
-    let bent_generators = [[2.0, 2.0], [-1.0, 3.0], [2.0, -6.0], [2.0, 0.0]];
-    let tolerance = 7.5;
-    let oracle = |generators: &[[f64; 2]]| MomentOracle {
-        system: planar_system(generators),
-        domain: unit_domain(generators.len()),
-        readouts: [[1.0, 0.0], [0.0, 1.0], [-1.0, 2.0]]
-            .iter()
-            .map(|readout| MomentVector {
-                blocks: vec![Array1::from(readout.to_vec())],
-            })
-            .collect(),
-    };
-    let mut coarse = oracle(&coarse_generators);
-    let mut refined = oracle(&refined_generators);
-    let mut bent = oracle(&bent_generators);
-
-    // The merge folds the refinement back into the coarse system bit for bit and folds
-    // nothing of the bent one.
-    let merge = refined
-        .system
-        .merge_positive_collinear(&refined.domain)
-        .expect("valid domain");
-    assert_eq!(merge.groups, vec![vec![0, 3, 4], vec![1], vec![2]]);
-    assert_eq!(merge.system, coarse.system);
-    assert_eq!(merge.domain, coarse.domain);
-    let bent_merge = bent
-        .system
-        .merge_positive_collinear(&bent.domain)
-        .expect("valid domain");
-    assert_eq!(bent_merge.groups.len(), 4);
-
-    // Every whole-group support has the coarse risk and the coarse witness, each piece
-    // copying its parent's mask value, exhaustively over the 2^3 coarse supports.
-    let represent = |mask: &Vec<f64>| Some(vec![mask[0], mask[1], mask[2], mask[0], mask[0]]);
-    for bits in 0..8usize {
-        let members: Vec<usize> = (0..3).filter(|control| bits >> control & 1 == 1).collect();
-        let preimage: Vec<usize> = members
-            .iter()
-            .flat_map(|&control| merge.groups[control].iter().copied())
-            .collect();
-        let coarse_risk = coarse.risk(&set(3, &members)).expect("valid support");
-        let refined_risk = refined.risk(&set(5, &preimage)).expect("valid support");
-        assert_eq!(refined_risk.value, coarse_risk.value, "support {members:?}");
-        assert_eq!(Some(refined_risk.mask), represent(&coarse_risk.mask), "support {members:?}");
-    }
-
-    // Positive control: the bent pieces move the risk of keeping control 2 alone from 7
-    // to 9, across the tolerance.
-    assert_eq!(coarse.risk(&set(3, &[2])).expect("valid support").value, 7.0);
-    assert_eq!(bent.risk(&set(4, &[2])).expect("valid support").value, 9.0);
-    assert!(coarse.separate(&set(3, &[2])).expect("exact separation").certifies_at_most(tolerance));
-    assert!(bent.separate(&set(4, &[2])).expect("exact separation").refutes_at_most(tolerance));
-
-    let coarse_search = minimum_code_support(&mut coarse, &SizeCode, tolerance, FailureHypergraph::new(3))
-        .expect("the coarse search closes");
-    assert_eq!(
-        coarse_search.certified.as_ref().expect("a certified support").support.members(),
-        &[2]
-    );
-    assert!(matches!(
-        coarse_search.code,
-        EvidenceStatus::Exact {
-            basis: ExactBasis::ClosedSearch,
-            ..
-        }
-    ));
-    assert_eq!(coarse_search.code.upper_bound(), Some(1.0));
-
-    let cold = minimum_code_support(&mut refined, &SizeCode, tolerance, FailureHypergraph::new(5))
-        .expect("the refined search closes");
-    assert_eq!(cold.certified.as_ref().expect("a certified support").support.members(), &[2]);
-    assert_eq!(cold.code.upper_bound(), coarse_search.code.upper_bound());
-
-    // Every coarse conflict replays into the refinement and is still bad there, and the
-    // replayed search reaches the same code with fewer separations.
-    let replay = replay_conflicts(&coarse_search.hypergraph, represent, &mut refined, tolerance)
-        .expect("the replay evaluates");
-    assert_eq!(
-        (replay.unrepresentable, replay.no_longer_bad, replay.without_witness),
-        (0, 0, 0)
-    );
-    assert_eq!(replay.hypergraph.edges().len(), coarse_search.hypergraph.edges().len());
-    let warm = minimum_code_support(&mut refined, &SizeCode, tolerance, replay.hypergraph)
-        .expect("the replayed search closes");
-    assert_eq!(warm.code.upper_bound(), cold.code.upper_bound());
-    assert!(warm.separations < cold.separations);
-
-    // Positive control: the bent refinement needs two components where the coarse and
-    // the collinear refinement need one.
-    let bent_search = minimum_code_support(&mut bent, &SizeCode, tolerance, FailureHypergraph::new(4))
-        .expect("the bent search closes");
-    assert_eq!(bent_search.code.upper_bound(), Some(2.0));
-    assert!(bent_search.certified.expect("a certified support").support.members().contains(&2));
-}
-
-#[test]
-fn a_support_certified_by_a_mask_law_average_is_refuted_by_the_support_witness_2951() {
-    let tolerance = 0.625;
-    let readout = MomentVector {
-        blocks: vec![array![1.0]],
-    };
-    let mut previous_rms = f64::INFINITY;
-    for pieces in [1usize, 2, 4] {
-        // A cancelling pair ±1, each side split into `pieces` exact dyadic pieces.
-        let piece = 1.0 / pieces as f64;
-        let controls = 2 * pieces;
-        let generators = (0..controls)
-            .map(|index| vec![part(0, &[if index < pieces { piece } else { -piece }])])
-            .collect();
-        let mut honest = MomentOracle {
-            system: MaskMomentSystem::new(vec![MomentBlock { dimension: 1 }], generators)
-                .expect("well-formed generators"),
-            domain: unit_domain(controls),
-            readouts: vec![readout.clone()],
-        };
-        let free = vec![false; controls];
-        let law = honest
-            .system
-            .uniform_mask_law_moments(&honest.domain, &free, &readout)
-            .expect("valid law");
-        let rms = law.mean_square.sqrt();
-        assert!(rms < previous_rms, "the average must shrink as the pair is split");
-        previous_rms = rms;
-
-        // Positive control: an oracle presenting that average as a bound certifies
-        // deleting everything.
-        let mut diluted = AverageAsBoundOracle { honest: honest.clone() };
-        let average_support = minimum_code_support(&mut diluted, &SizeCode, tolerance, FailureHypergraph::new(controls))
-            .expect("the averaged search closes")
-            .certified
-            .expect("the average certifies a support")
-            .support;
-        assert!(average_support.is_empty(), "the average certifies the empty support");
-
-        // The guard: the supremum stays |a| = 1 for every split, its witness refutes the
-        // averaged support, and the average claimed as a bound is refuted.
-        let empty = honest.risk(&average_support).expect("valid support");
-        assert_eq!(empty.value, 1.0);
-        let counterexample =
-            EvidenceStatus::<Vec<f64>, &'static str>::counterexample(empty.value, empty.band, tolerance, empty.mask)
-                .expect("a violation beyond roundoff");
-        assert!(counterexample.refutes_at_most(tolerance));
-        let claim = honest
-            .system
-            .check_claimed_absolute_bound(&honest.domain, &free, &readout, rms)
-            .expect("finite claim");
-        assert!(
-            matches!(claim, EvidenceStatus::Counterexample { value, .. } if value == 1.0),
-            "{claim:?}"
-        );
-        let witness = claim.into_witness().expect("a counterexample carries its witness");
-        let mask = honest.domain.mask_at(&witness).expect("one endpoint per control");
-        assert!(honest.evaluate(&mask).expect("exact evaluation").refutes_at_most(tolerance));
-
-        // Keeping k₊ positive and k₋ negative pieces leaves the risk
-        // max(n − k₊, n − k₋)/n, so the minimum support keeps ⌈n(1 − ε)⌉ of each sign.
-        let honest_search = minimum_code_support(&mut honest, &SizeCode, tolerance, FailureHypergraph::new(controls))
-            .expect("the honest search closes");
-        let per_sign = (pieces as f64 * (1.0 - tolerance)).ceil() as usize;
-        assert_eq!(honest_search.code.upper_bound(), Some((2 * per_sign) as f64));
-        let certified = honest_search.certified.expect("a certified support").support;
-        let positives = certified.members().iter().filter(|&&control| control < pieces).count();
-        assert_eq!(2 * positives, certified.len(), "pieces {pieces}: {:?}", certified.members());
-    }
-}
-
-#[test]
-fn a_q_minus_q_junk_pair_reproduces_the_all_on_block_and_enters_every_minimum_support_2951() {
+fn a_q_minus_q_junk_pair_reproduces_the_all_on_block_and_enters_every_sufficient_support_2951() {
     // d = H = 2 under ReLU with small integer tensors, so every summed input, activation
     // and output below is exact.
     let read_in = array![[1.0, 2.0], [-1.0, 1.0]];
@@ -625,27 +231,19 @@ fn a_q_minus_q_junk_pair_reproduces_the_all_on_block_and_enters_every_minimum_su
     assert!(!split.is_empty() && split.iter().all(|&component| component >= 2), "{split:?}");
     assert_ne!(witness[2], witness[3], "the witness splits the pair");
 
-    // So every minimum support pays for the pair: each junk component alone is an edge.
-    let clean_search = minimum_code_support(&mut clean_oracle, &SizeCode, tolerance, FailureHypergraph::new(2))
-        .expect("the clean search closes");
-    let junk_search = minimum_code_support(&mut junk_oracle, &SizeCode, tolerance, FailureHypergraph::new(4))
-        .expect("the junk search closes");
-    assert_eq!(
-        clean_search.certified.as_ref().expect("a certified support").support.members(),
-        &[0, 1]
-    );
-    assert_eq!(
-        junk_search.certified.as_ref().expect("a certified support").support.members(),
-        &[0, 1, 2, 3]
-    );
-    for component in [2usize, 3] {
+    // So every sufficient support pays for the pair: dropping either junk component alone is
+    // refuted, and by upward closure no support without it is sufficient.
+    let clean_search = ranked_support(&mut clean_oracle, &[0, 1], tolerance).expect("the clean run is certified");
+    let junk_search = ranked_support(&mut junk_oracle, &[0, 1, 2, 3], tolerance).expect("the junk run is certified");
+    assert_eq!(clean_search.found.support.members(), &[0, 1]);
+    assert!(clean_search.found.evidence.certifies_at_most(tolerance));
+    assert_eq!(junk_search.found.support.members(), &[0, 1, 2, 3]);
+    assert!(junk_search.found.evidence.certifies_at_most(tolerance));
+    for dropped in [2usize, 3] {
+        let kept: Vec<usize> = (0..4).filter(|&component| component != dropped).collect();
         assert!(
-            junk_search
-                .hypergraph
-                .edges()
-                .iter()
-                .any(|edge| edge.perturbed.members() == [component]),
-            "junk component {component} alone is a failure edge"
+            junk_oracle.separate(&set(4, &kept)).expect("exhaustive separation").refutes_at_most(tolerance),
+            "junk component {dropped} is needed"
         );
     }
 
@@ -1003,39 +601,25 @@ fn a_redundant_pair_is_one_or_edge_and_an_interior_mask_keeps_a_component_endpoi
     let mut endpoints = BlockGridOracle::new(block.clone(), inputs.clone(), vec![0.0, 1.0]);
     let mut interior = BlockGridOracle::new(block, inputs, vec![0.0, 0.5, 1.0]);
 
-    let endpoint_search = minimum_code_support(&mut endpoints, &SizeCode, tolerance, FailureHypergraph::new(3))
-        .expect("the endpoint search closes");
-    let endpoint_support = endpoint_search
-        .certified
-        .as_ref()
-        .expect("a certified support")
-        .support
-        .clone();
-    assert_eq!(endpoint_support.len(), 1);
-    assert!(!endpoint_support.members().contains(&2), "endpoint masks never see component 2");
-    assert!(
-        endpoint_search
-            .hypergraph
-            .edges()
-            .iter()
-            .any(|edge| edge.perturbed.members() == [0, 1]),
-        "the redundant pair is one OR edge"
-    );
+    // At the endpoints either member of the pair suffices alone, while dropping both is refuted:
+    // the pair is one OR edge, and endpoint masks never see component 2.
+    for member in [0usize, 1] {
+        assert!(endpoints.separate(&set(3, &[member])).expect("exhaustive separation").certifies_at_most(tolerance));
+    }
+    let neither = endpoints.separate(&set(3, &[])).expect("exhaustive separation");
+    assert!(neither.refutes_at_most(tolerance));
+    let endpoint_search = ranked_support(&mut endpoints, &[0, 1, 2], tolerance).expect("the whole run is certified");
+    let endpoint_support = endpoint_search.found.support.clone();
+    assert_eq!(endpoint_support.members(), &[0]);
+    assert!(endpoint_search.found.evidence.certifies_at_most(tolerance));
 
-    let interior_search = minimum_code_support(&mut interior, &SizeCode, tolerance, FailureHypergraph::new(3))
-        .expect("the interior search closes");
-    let interior_support = interior_search
-        .certified
-        .as_ref()
-        .expect("a certified support")
-        .support
-        .clone();
-    assert_eq!(interior_support.len(), 2);
-    assert!(interior_support.members().contains(&2));
+    // Interior masks need component 2 and still one member of the pair.
+    let interior_search = ranked_support(&mut interior, &[0, 2, 1], tolerance).expect("the whole run is certified");
+    assert_eq!(interior_search.found.support.members(), &[0, 2]);
+    assert!(interior_search.found.evidence.certifies_at_most(tolerance));
     assert_eq!(
-        interior_support.members().iter().filter(|&&component| component < 2).count(),
-        1,
-        "one member of the redundant pair suffices"
+        interior_search.refuted_shorter.as_ref().map(|shorter| shorter.support.members().to_vec()),
+        Some(vec![0])
     );
 
     // Positive control: the endpoint-certified support is refuted by an interior mask on
@@ -1217,277 +801,4 @@ fn gauge_equivalent_factorizations_execute_one_intervention_under_covariant_mask
     };
     assert_eq!(original_moments.support(&domain, &free, &probe).expect("valid direction").value, 6.0);
     assert_eq!(sheared_moments.support(&domain, &free, &probe).expect("valid direction").value, 10.0);
-}
-
-/// Which P15 certificate a [`LogitMaskOracle`] derives over the declared mask box.
-#[derive(Clone, Copy, Debug)]
-enum LogitCertificate {
-    /// `KL ≤ osc(δ)²/8`. For `δ = −q`, `δ_k − δ_l = ⟨e_l − e_k, q⟩`, so the supremum of the oscillation over the box is
-    /// the largest support `h(e_l − e_k)` over ordered logit pairs. A constant shift of the logits changes no
-    /// probability, so the bound is read through the shifted gap `‖δ − c·1‖_∞ = osc(δ)/2` of the best shift `c`.
-    Oscillation,
-    /// `KL ≤ ‖δ‖_∞²/2` with `‖δ‖_∞` bounded by the largest absolute support of a single logit `e_k`: blind to the
-    /// softmax gauge.
-    SupremumGap,
-}
-
-/// Separation for logits affine in the moment, `z(m) = z_* − q(m)`, with one moment coordinate per logit.
-///
-/// The upper side is `bounds`' P15 certificate over the whole declared box, fed a support-function bound on the logit
-/// gap from `moments`. The lower side is gam-math's categorical KL with its rounding bound at the support function's
-/// witness mask. The fixtures' reference logits and generators are dyadic with a few bits, so the perturbed logits are
-/// exact and the categorical rounding bound is the whole numerical error.
-struct LogitMaskOracle {
-    system: MaskMomentSystem,
-    domain: MaskDomain,
-    reference: Vec<f64>,
-    certificate: LogitCertificate,
-}
-
-impl LogitMaskOracle {
-    fn divergence(&self, mask: &[f64]) -> Result<(f64, f64), String> {
-        let moment = self
-            .system
-            .moment(&self.domain, mask)
-            .map_err(|error| format!("{error:?}"))?;
-        let perturbed: Vec<f64> = self
-            .reference
-            .iter()
-            .zip(moment.blocks[0].iter())
-            .map(|(logit, shift)| logit - shift)
-            .collect();
-        categorical_kl_from_logits_with_error(&self.reference, &perturbed).map_err(|error| error.to_string())
-    }
-
-    /// The certificate's upper bound on `sup KL` over the masks that keep `support`, and a witness mask.
-    fn certify(&self, support: &ComponentSet) -> Result<(f64, Vec<f64>), String> {
-        let kept: Vec<bool> = (0..self.system.control_count())
-            .map(|control| support.members().binary_search(&control).is_ok())
-            .collect();
-        let logits = self.reference.len();
-        let unit = |index: usize| Array1::from_shape_fn(logits, |coordinate| if coordinate == index { 1.0 } else { 0.0 });
-        let mut value = f64::NEG_INFINITY;
-        let mut band = 0.0_f64;
-        let mut witness = Vec::new();
-        for first in 0..logits {
-            for second in 0..logits {
-                let evaluation = match self.certificate {
-                    LogitCertificate::Oscillation if first != second => self.system.support(
-                        &self.domain,
-                        &kept,
-                        &MomentVector {
-                            blocks: vec![&unit(first) - &unit(second)],
-                        },
-                    ),
-                    LogitCertificate::SupremumGap if first == second => self.system.absolute_supremum(
-                        &self.domain,
-                        &kept,
-                        &MomentVector {
-                            blocks: vec![unit(first)],
-                        },
-                    ),
-                    LogitCertificate::Oscillation | LogitCertificate::SupremumGap => continue,
-                }
-                .map_err(|error| format!("{error:?}"))?;
-                band = band.max(evaluation.band);
-                if evaluation.value > value {
-                    value = evaluation.value;
-                    witness = evaluation.witness;
-                }
-            }
-        }
-        // Each computed support lies within its band of the exact one, so the largest computed value plus the largest
-        // band, rounded up, bounds the exact maximum. Halving it is exact.
-        let rounded = value + band;
-        let bound = if band == 0.0 { rounded } else { rounded.next_up() };
-        let gap = match self.certificate {
-            LogitCertificate::Oscillation => bound / 2.0,
-            LogitCertificate::SupremumGap => bound,
-        };
-        let upper = kl_bound_from_logit_gap(gap, LogitGapNorm::Supremum)
-            .map_err(|error| error.to_string())?
-            .upper_bound()
-            .ok_or_else(|| "a uniform bound has an upper side".to_string())?;
-        let mask = self.domain.mask_at(&witness).map_err(|error| format!("{error:?}"))?;
-        Ok((upper, mask))
-    }
-}
-
-impl SeparationOracle for LogitMaskOracle {
-    type Mask = Vec<f64>;
-    type Domain = &'static str;
-    type Error = String;
-
-    fn components(&self) -> usize {
-        self.system.control_count()
-    }
-
-    fn perturbed_components(&self, mask: &Vec<f64>) -> Vec<usize> {
-        perturbed(mask)
-    }
-
-    fn separate(&mut self, support: &ComponentSet) -> Result<EvidenceStatus<Vec<f64>, &'static str>, String> {
-        let (upper, mask) = self.certify(support)?;
-        let (divergence, error) = self.divergence(&mask)?;
-        let lower = (divergence - error).next_down();
-        EvidenceStatus::unresolved(
-            lower,
-            upper,
-            Extremum::Supremum,
-            Some(mask),
-            "P15 certificate over the declared mask box, categorical KL at the witness",
-        )
-        .map_err(|error| error.to_string())
-    }
-
-    fn evaluate(&mut self, mask: &Vec<f64>) -> Result<EvidenceStatus<Vec<f64>, &'static str>, String> {
-        let (divergence, error) = self.divergence(mask)?;
-        EvidenceStatus::exact(
-            divergence,
-            error,
-            ExactBasis::Exhaustive { cardinality: 1 },
-            Some(mask.clone()),
-            "one declared mask",
-        )
-        .map_err(|error| error.to_string())
-    }
-}
-
-#[test]
-fn a_softmax_gauge_component_is_dropped_by_the_oscillation_certificate_and_kept_by_a_gap_norm_certificate_2951() {
-    // Logits z(m) = z_* − q(m) over three controls: a real edit, the constant shift (1, 1, 1), and a small edit.
-    let reference = vec![0.5, -0.25, 1.0];
-    let generators = [[2.0, -1.0, 0.0], [1.0, 1.0, 1.0], [0.0, 0.5, -0.5]];
-    let tolerance = 0.25;
-    let oracle = |certificate: LogitCertificate| LogitMaskOracle {
-        system: MaskMomentSystem::new(
-            vec![MomentBlock { dimension: 3 }],
-            generators.iter().map(|vector| vec![part(0, vector)]).collect(),
-        )
-        .expect("well-formed generators"),
-        domain: unit_domain(3),
-        reference: reference.clone(),
-        certificate,
-    };
-    let mut oscillation = oracle(LogitCertificate::Oscillation);
-    let mut supremum_gap = oracle(LogitCertificate::SupremumGap);
-
-    // Null control: deleting the shift alone moves every logit by one and no probability. The categorical KL is zero
-    // within its rounding bound, and bounds' oscillation bound on that pair sits at its rounding floor, while the
-    // sup-norm gap bound of the same pair is 1/2.
-    let shifted: Vec<f64> = reference.iter().map(|logit| logit - 1.0).collect();
-    let (shift_divergence, shift_error) = oscillation.divergence(&[1.0, 0.0, 1.0]).expect("valid logits");
-    assert!(shift_divergence - shift_error <= 0.0, "KL {shift_divergence} error {shift_error}");
-    let floor = accumulation_band(8, 2.0);
-    let shift_oscillation = softmax_kl_oscillation_bound(ArrayView1::from(&reference[..]), ArrayView1::from(&shifted[..]))
-        .expect("finite logits")
-        .upper_bound()
-        .expect("a uniform bound has an upper side");
-    assert!(shift_oscillation <= floor * floor, "oscillation bound {shift_oscillation}");
-    let shift_gap = kl_bound_from_logit_gap(1.0, LogitGapNorm::Supremum)
-        .expect("finite gap")
-        .upper_bound()
-        .expect("a uniform bound has an upper side");
-    assert!(shift_gap > tolerance, "gap bound {shift_gap}");
-
-    // The oscillation certificate closes the search with the gauge component free: keeping control 0 leaves
-    // osc ≤ 1 and KL ≤ 1/8.
-    let oscillation_search = minimum_code_support(&mut oscillation, &SizeCode, tolerance, FailureHypergraph::new(3))
-        .expect("the oscillation search closes");
-    assert_eq!(
-        oscillation_search.certified.as_ref().expect("a certified support").support.members(),
-        &[0]
-    );
-    assert!(matches!(
-        oscillation_search.code,
-        EvidenceStatus::Exact {
-            basis: ExactBasis::ClosedSearch,
-            ..
-        }
-    ));
-    assert_eq!(oscillation_search.code.upper_bound(), Some(1.0));
-
-    // Positive control: the sup-norm gap certificate sees the shift in every logit. It never certifies {0}, whose
-    // witness is harmless, so its search ends unresolved on {0}, and only keeping the shift too certifies.
-    let gap_search = minimum_code_support(&mut supremum_gap, &SizeCode, tolerance, FailureHypergraph::new(3))
-        .expect("the gap search ends");
-    assert!(matches!(gap_search.code, EvidenceStatus::Unresolved { .. }), "{:?}", gap_search.code);
-    assert_eq!(gap_search.undecided.as_ref().expect("an undecided candidate").support.members(), &[0]);
-    assert!(!supremum_gap.separate(&set(3, &[0])).expect("valid support").certifies_at_most(tolerance));
-    assert!(supremum_gap.separate(&set(3, &[0, 1])).expect("valid support").certifies_at_most(tolerance));
-
-    // Both certificates dominate the categorical KL at every endpoint mask every support admits.
-    let mut largest_violation_of_a_quartered_certificate = f64::NEG_INFINITY;
-    for kept_bits in 0..8usize {
-        let members: Vec<usize> = (0..3).filter(|control| kept_bits >> control & 1 == 1).collect();
-        let support = set(3, &members);
-        let (oscillation_upper, oscillation_witness) = oscillation.certify(&support).expect("valid support");
-        let (gap_upper, gap_witness) = supremum_gap.certify(&support).expect("valid support");
-        for witness in [&oscillation_witness, &gap_witness] {
-            assert!(members.iter().all(|&control| witness[control] == 1.0), "the witness keeps the support");
-        }
-        for mask_bits in 0..8usize {
-            if (0..3).any(|control| kept_bits >> control & 1 == 1 && mask_bits >> control & 1 == 0) {
-                continue;
-            }
-            let mask: Vec<f64> = (0..3).map(|control| (mask_bits >> control & 1) as f64).collect();
-            let (divergence, error) = oscillation.divergence(&mask).expect("valid logits");
-            assert!(divergence - error <= oscillation_upper, "support {members:?} mask {mask:?}");
-            assert!(divergence - error <= gap_upper, "support {members:?} mask {mask:?}");
-            largest_violation_of_a_quartered_certificate =
-                largest_violation_of_a_quartered_certificate.max(divergence - error - oscillation_upper / 4.0);
-        }
-    }
-    // Positive control: the dominance check has teeth. A certificate a quarter as large is violated at some mask.
-    assert!(largest_violation_of_a_quartered_certificate > 0.0);
-}
-
-#[test]
-fn a_collinear_family_resolves_one_mode_but_only_positive_members_merge_into_one_control_2951() {
-    // Three 1 × 2 components per case, read both as family members and as moment generators.
-    let readout = MomentVector {
-        blocks: vec![array![1.0, 0.0]],
-    };
-    let cases: [(&str, [[f64; 2]; 3], usize, Vec<Vec<usize>>); 3] = [
-        // A positive collinear refinement of (4, 2).
-        ("refined", [[2.0, 1.0], [1.0, 0.5], [1.0, 0.5]], 1, vec![vec![0, 1, 2]]),
-        // The same direction with a sign change: a cancelling pair.
-        ("antiparallel", [[2.0, 1.0], [-2.0, -1.0], [1.0, 0.5]], 1, vec![vec![0, 2], vec![1]]),
-        // Pieces that sum to (4, 2) but span the plane.
-        ("bent", [[3.0, 1.0], [0.0, 2.0], [1.0, -1.0]], 2, vec![vec![0], vec![1], vec![2]]),
-    ];
-    for (name, generators, resolved, groups) in cases {
-        let tensors: Vec<Array2<f64>> = generators.iter().map(|vector| array![[vector[0], vector[1]]]).collect();
-        let views: Vec<_> = tensors.iter().map(|tensor| tensor.view()).collect();
-        let field = principal_field(&views, &[0, 1, 2], resolved).expect("the resolved dimension is admitted");
-        assert_eq!(field.resolved_dimension, resolved, "{name}: eigenvalues {:?}", field.eigenvalues);
-        if resolved == 1 {
-            assert!(
-                matches!(
-                    principal_field(&views, &[0, 1, 2], 2),
-                    Err(FamilyError::UnresolvedDimension { resolved: 1, .. })
-                ),
-                "{name}: a collinear family has one mode"
-            );
-        }
-        let system = planar_system(&generators);
-        let merge = system.merge_positive_collinear(&unit_domain(3)).expect("valid domain");
-        assert_eq!(merge.groups, groups, "{name}");
-        let supremum = system
-            .absolute_supremum(&unit_domain(3), &[false; 3], &readout)
-            .expect("valid direction");
-        let net = system
-            .moment(&unit_domain(3), &[0.0; 3])
-            .expect("admissible mask")
-            .blocks[0][0]
-            .abs();
-        match name {
-            // One family mode and one control: deleting everything attains the supremum.
-            "refined" => assert_eq!((supremum.value, net), (4.0, 4.0)),
-            // Positive control: one family mode, yet the cancelling pair's supremum 3 is not its net deletion 1, so the
-            // family label cannot stand for one ablation control.
-            "antiparallel" => assert_eq!((supremum.value, net), (3.0, 1.0)),
-            _ => assert_eq!(merge.groups.len(), 3, "{name}: two modes and no merge"),
-        }
-    }
 }

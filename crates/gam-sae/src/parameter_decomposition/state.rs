@@ -2286,38 +2286,6 @@ mod tests {
                 })
         }
 
-        /// A derived bound on the 2-norm distance from a descended map `G` to the
-        /// orthogonal group. It uses `measure`'s certified section bound `s ≥ ‖QQᵀ − I‖`
-        /// and realization bound `r ≥ ‖R‖` with `R = TQᵀ − QᵀG`, and `t = 2ε + ε²`
-        /// bounds `‖TᵀT − I‖` when `T` lies within `ε` of an orthogonal matrix.
-        /// Expanding
-        /// `GᵀG − I = Gᵀ(I − QQᵀ)G + (QQᵀ − I) + Q(TᵀT − I)Qᵀ − QTᵀR − RᵀTQᵀ + RᵀR`
-        /// with `‖Q‖² ≤ 1 + s` and `‖G‖ ≤ ((1 + ε)√(1 + s) + r)/√(1 − s)` bounds `‖GᵀG − I‖`. That
-        /// bounds every `|σᵢ − 1| ≤ |σᵢ² − 1|`.
-        fn descended_orthogonality_error(
-            quotient: &LinearStateQuotient,
-            transition_error: f64,
-        ) -> f64 {
-            let section = quotient.section_bounds.upper;
-            let realization = quotient.realization_bounds[0].upper;
-            assert!(
-                section < 1.0,
-                "the chart's section defect {section} must leave QQᵀ invertible"
-            );
-            let transition_gram = 2.0 * transition_error + transition_error * transition_error;
-            let chart_norm_squared = 1.0 + section;
-            let transition_norm = 1.0 + transition_error;
-            // ‖QᵀG‖ = ‖TQᵀ − R‖ ≤ (1 + ε)√(1 + s) + r, and ‖QᵀGx‖² ≥ (1 − s)‖Gx‖², so
-            // ‖G‖ is bounded by certified quantities only. G is the stored fl(Q T Qᵀ), not
-            // the exact product.
-            let descended_norm = (transition_norm * chart_norm_squared.sqrt() + realization)
-                / (1.0 - section).sqrt();
-            descended_norm * descended_norm * section
-                + section
-                + chart_norm_squared * transition_gram
-                + 2.0 * chart_norm_squared.sqrt() * transition_norm * realization
-                + realization * realization
-        }
 
         let (sine, cosine) = 0.9_f64.sin_cos();
         let frame = dyadic_frame();
@@ -2328,20 +2296,7 @@ mod tests {
             [0.0, 0.0, 0.0, 1.0]
         ];
         let transition = frame.dot(&block).dot(&frame);
-        // T's distance to the orthogonal group, derived. The float block's singular
-        // values are √(c² + s²) and 1, so its distance is at most |c² + s² − 1|,
-        // counted with the rounding of forming it. H is exactly orthogonal (dyadic).
-        // The two 4-term products H·B·H round within 2γ₅·(|H||B||H|) entrywise, whose
-        // Frobenius norm bounds the spectral norm of the formation error.
-        let block_gram = cosine * cosine + sine * sine;
-        let block_defect = (block_gram - 1.0).abs() + accumulation_growth(3) * (block_gram + 1.0);
-        let magnitudes = frame
-            .mapv(f64::abs)
-            .dot(&block.mapv(f64::abs))
-            .dot(&frame.mapv(f64::abs));
-        let transition_error = block_defect
-            + 2.0 * accumulation_growth(5) * magnitudes.iter().map(|m| m * m).sum::<f64>().sqrt();
-        let whole = recover_plane_rotations(transition.view(), transition_error)
+        let whole = recover_plane_rotations(transition.view())
             .expect("recovery of T");
         let (whole_low, whole_high) =
             single_plane_cosines(&whole).expect("T rotates exactly one plane");
@@ -2350,8 +2305,7 @@ mod tests {
         let closed = LinearStateQuotient::close(&[in_plane.view()], &[transition.view()])
             .expect("close");
         assert_eq!(closed.chart.nrows(), 2);
-        let descended_error = descended_orthogonality_error(&closed, transition_error);
-        let descended = recover_plane_rotations(closed.descended[0].view(), descended_error)
+        let descended = recover_plane_rotations(closed.descended[0].view())
             .expect("recovery of G");
         assert_eq!(descended.clusters.len(), 1);
         let (low, high) = single_plane_cosines(&descended).expect("G rotates one plane");
@@ -2361,19 +2315,9 @@ mod tests {
              for T must overlap"
         );
         // Width floor: the overlap alone would pass for an interval widened toward [-1, 1].
-        // Spectral reports [lowest - β, highest + β], with β the declared error plus the
-        // formation band γ₁‖G‖_F plus the 2×2 spectrum rounding band (at most 2ε). One
-        // two-point cluster spans at most 2β, so the width is at most 4β, budgeted here from
-        // this test's own quantities.
-        let descended_frobenius = closed.descended[0]
-            .iter()
-            .map(|value| value * value)
-            .sum::<f64>()
-            .sqrt();
-        let width_budget = 4.0
-            * (descended_error
-                + accumulation_growth(1) * descended_frobenius
-                + 2.0 * f64::EPSILON);
+        // Spectral reports [lowest - β, highest + β] with β its own derived perturbation
+        // bound, and one two-point cluster spans at most 2β, so the width is at most 4β.
+        let width_budget = 4.0 * descended.perturbation_bound;
         assert!(
             high - low <= width_budget,
             "G's cosine interval width {} exceeds its derived budget {width_budget}",
@@ -2385,11 +2329,8 @@ mod tests {
         let fixed = LinearStateQuotient::close(&[fixed_readout.view()], &[transition.view()])
             .expect("close");
         assert_eq!(fixed.chart.nrows(), 1);
-        let identity = recover_plane_rotations(
-            fixed.descended[0].view(),
-            descended_orthogonality_error(&fixed, transition_error),
-        )
-        .expect("recovery of the fixed descent");
+        let identity = recover_plane_rotations(fixed.descended[0].view())
+            .expect("recovery of the fixed descent");
         assert_eq!(identity.ambiguities(), vec![RotationAmbiguity::Identity]);
     }
 }

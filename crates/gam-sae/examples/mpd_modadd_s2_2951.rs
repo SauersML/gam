@@ -84,11 +84,15 @@
 //! The components are every plane of the decoded full program: its one codeword decodes each plane's reals
 //! exactly as a subset's would. The frequency edit is linear in the plane masks, `E + Σ_k m_k C_k`, so a box of
 //! masks is the center table with a derived radius (`PlaneBoxes`), and `supports::BoxSeparationOracle` with
-//! `minimum_code_support` finds the minimum-code support under the padded plane code
-//! `L(m, k) + L_int(H) + k·H`, a function of the size alone. The failure hypergraph's edges are the OR
-//! constraints. When the code is exact, no proper subset is certified, so every member is necessary. The
+//! `ranked_support` finds the shortest sufficient leading run of the planes ranked by descending power (the
+//! order S2's prefixes use), in `O(log m)` separations. It is not a minimum over all subsets: the report gives
+//! the run's padded plane code `L(m, k) + L_int(H) + k·H` and the run one shorter when that was refuted. The
 //! support's own program is then scored on the held-out family as S2's programs are. Every checkpoint runs
 //! it, so each control's support is read beside the trained one's.
+//!
+//! Report schema: each support entry carries `status` (`certified`, `unresolved` or `all_on_violation`),
+//! `code_bits` (one number) and `refuted_shorter`. Reports from before the ranked search carried
+//! `code_status`, a `code_bits` bracket and `edges` from a minimum-code search; they are not comparable.
 
 use gam_math::gaussian_activation::GaussianActivation;
 use gam_sae::parameter_decomposition::attention::{AttentionGeometry, ProjectedRows, RotaryEmbedding, RotaryPairing};
@@ -107,8 +111,8 @@ use gam_sae::parameter_decomposition::seed::RankRevealingRead;
 use gam_sae::parameter_decomposition::codec::PaddedPacketCode;
 use gam_sae::parameter_decomposition::supports::{
     BoxDivergence, BoxEnclosure, BoxFamily, BoxOracleError, BoxSeparationOracle, ComponentSet,
-    EvidenceStatus, ExactBasis, Extremum, FailureHypergraph, MaskBox, MaskSide, SeparationOracle, SupportSearchError,
-    minimum_code_support,
+    CardinalityCode, EvidenceStatus, ExactBasis, Extremum, MaskBox, MaskSide, SeparationOracle, SupportSearchError,
+    ranked_support,
 };
 use gam_linalg::roundoff::UNIT_ROUNDOFF;
 use ndarray::{Array1, Array2, ArrayView1, Axis, Zip, s};
@@ -1710,7 +1714,7 @@ fn main() -> Result<(), String> {
                     }));
                 }
             }
-            // Stage S3: the minimum-code plane support on the fit family, with its OR edges, and the support's
+            // Stage S3: the shortest sufficient run of the power ranking on the fit family, and the support's
             // program held out.
             let mut support_reports = Vec::new();
             if let Some(support) = settings.support.as_ref().filter(|support| support.sites.iter().any(|name| name == site.name())) {
@@ -1730,6 +1734,9 @@ fn main() -> Result<(), String> {
                     pairs: checkpoint.train_pairs.len(),
                     planes: plane_count,
                 };
+                let code = PaddedPacketCode { body_bits: plane_bits };
+                // The ranking: planes by descending power, the order S2's prefixes keep them in.
+                let ranking: Vec<usize> = order.iter().map(|&frequency| frequency - 1).collect();
                 let mut enclosed = BTreeMap::new();
                 for &tolerance in &support.tolerances {
                     let found = {
@@ -1751,28 +1758,25 @@ fn main() -> Result<(), String> {
                             separations: 0,
                             started: Instant::now(),
                         };
-                        minimum_code_support(&mut oracle, &PaddedPacketCode { body_bits: plane_bits }, tolerance, FailureHypergraph::new(plane_count))
+                        ranked_support(&mut oracle, &ranking, tolerance)
                     };
-                    let (code_status, bits, frequencies, separations, edges) = match &found {
-                        Ok(search) => {
-                            let (status, bits) = match &search.code {
-                                EvidenceStatus::Exact { value, .. } => ("exact", json!([value, value])),
-                                EvidenceStatus::Unresolved { lower, upper, .. } => ("unresolved", json!([lower, upper])),
-                                other => return Err(format!("an unexpected code status {other:?}")),
-                            };
-                            let edges: Vec<Vec<usize>> = search
-                                .hypergraph
-                                .edges()
-                                .iter()
-                                .map(|edge| edge.perturbed.members().iter().map(|&plane| plane + 1).collect())
-                                .collect();
-                            let frequencies = search
-                                .certified
-                                .as_ref()
-                                .map(|found| found.support.members().iter().map(|&plane| plane + 1).collect::<Vec<usize>>());
-                            (status, bits, frequencies, search.separations, edges)
+                    let frequencies_of =
+                        |support: &ComponentSet| support.members().iter().map(|&plane| plane + 1).collect::<Vec<usize>>();
+                    let (status, bits, frequencies, separations, refuted_shorter) = match &found {
+                        Ok(ranked) => {
+                            let certified = ranked.found.evidence.certifies_at_most(tolerance);
+                            let bits = code
+                                .support_bits(plane_count, ranked.found.support.len())
+                                .map_err(|error| format!("{error:?}"))?;
+                            (
+                                if certified { "certified" } else { "unresolved" },
+                                json!(bits),
+                                certified.then(|| frequencies_of(&ranked.found.support)),
+                                ranked.separations,
+                                ranked.refuted_shorter.as_ref().map(|shorter| frequencies_of(&shorter.support)),
+                            )
                         }
-                        Err(SupportSearchError::AllOnViolation) => ("all_on_violation", Value::Null, None, 0, Vec::new()),
+                        Err(SupportSearchError::AllOnViolation) => ("all_on_violation", Value::Null, None, 0, None),
                         Err(error) => return Err(format!("{} {} tolerance {tolerance}: {error:?}", checkpoint.name, site.name())),
                     };
                     let held_out = match &frequencies {
@@ -1782,19 +1786,18 @@ fn main() -> Result<(), String> {
                         _ => None,
                     };
                     println!(
-                        "[support] {} {} tolerance={tolerance:.3e} code={code_status} bits={bits} support={frequencies:?} separations={separations} edges={} held_out={}",
+                        "[support] {} {} tolerance={tolerance:.3e} status={status} bits={bits} support={frequencies:?} separations={separations} refuted_shorter={refuted_shorter:?} held_out={}",
                         checkpoint.name,
                         site.name(),
-                        edges.len(),
                         held_out.as_ref().map_or_else(|| "none".to_string(), |scored| score_line(&scored.score))
                     );
                     support_reports.push(json!({
                         "tolerance": tolerance,
-                        "code_status": code_status,
+                        "status": status,
                         "code_bits": bits,
                         "support": frequencies,
                         "separations": separations,
-                        "edges": edges,
+                        "refuted_shorter": refuted_shorter,
                         "enclosures": enclosed.len(),
                         "held_out": held_out.as_ref().map(scored_json),
                     }));

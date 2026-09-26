@@ -59,12 +59,9 @@ pub struct MpdRequest {
 pub enum MpdOperation {
     /// P3: the rotation planes of one square matrix (`spectral`).
     RecoverPlaneRotations {
-        /// Id of the input array holding the matrix.
+        /// Id of the input array holding the matrix. The owner measures its distance to
+        /// the orthogonal group and reports it as `orthogonality_defect`.
         tensor: String,
-        /// The declared 2-norm distance from the matrix to the orthogonal group. It is an
-        /// experiment declaration, required and with no default; the owner refuses a matrix
-        /// provably further away.
-        declared_error: f64,
     },
     /// A12: one residual MLP block's stages as an external executor ran them, compared
     /// with its native execution (`receipts::mlp_block_receipt`). Every array field is
@@ -344,11 +341,8 @@ pub fn run_parameter_decomposition(
 ) -> Result<MpdOutput, MpdSurfaceError> {
     let request = MpdRequest::from_json(request_json)?;
     match request.operation {
-        MpdOperation::RecoverPlaneRotations {
-            tensor,
-            declared_error,
-        } => {
-            let recovery = recover_plane_rotations(matrix(tensors, &tensor)?, declared_error)
+        MpdOperation::RecoverPlaneRotations { tensor } => {
+            let recovery = recover_plane_rotations(matrix(tensors, &tensor)?)
                 .map_err(MpdSurfaceError::PlaneRotation)?;
             project_plane_rotations(tensor, recovery)
         }
@@ -610,7 +604,6 @@ fn absent_when_infinite(field: &'static str, value: f64) -> Result<Option<f64>, 
 mod tests {
     use super::super::receipts::compare_stage;
     use super::*;
-    use gam_linalg::roundoff::accumulation_growth;
     use gam_math::gaussian_activation::GaussianActivationError;
     use ndarray::{Array1, Array2, Axis, array};
 
@@ -620,28 +613,12 @@ mod tests {
         )
     }
 
-    fn plane_request(declared_error: f64) -> String {
-        request_json(&format!(
-            r#"{{"kind": "recover_plane_rotations", "tensor": "w", "declared_error": {declared_error:?}}}"#
-        ))
+    fn plane_request() -> String {
+        request_json(r#"{"kind": "recover_plane_rotations", "tensor": "w"}"#)
     }
 
     fn inputs(id: &str, matrix: Array2<f64>) -> BTreeMap<String, ArrayD<f64>> {
         BTreeMap::from([(id.to_string(), matrix.into_dyn())])
-    }
-
-    fn frobenius(matrix: &Array2<f64>) -> f64 {
-        matrix.iter().map(|value| value * value).sum::<f64>().sqrt()
-    }
-
-    /// A declared distance to the orthogonal group that covers the true one:
-    /// `||W - W_o||_2 = max |sigma_i - 1| <= ||W^T W - I||_F`, plus the rounding of the
-    /// computed Gram, `gamma_n` times the Frobenius norm of `|W|^T |W|`.
-    fn orthogonality_declaration(matrix: &Array2<f64>) -> f64 {
-        let columns = matrix.ncols();
-        let gram = matrix.t().dot(matrix) - Array2::<f64>::eye(columns);
-        let absolute = matrix.mapv(f64::abs);
-        frobenius(&gram) + accumulation_growth(columns) * frobenius(&absolute.t().dot(&absolute))
     }
 
     /// Rotations by `alpha` and `beta` in the planes (e1, e2) and (e3, e4), with e5
@@ -660,13 +637,12 @@ mod tests {
 
     #[test]
     fn request_document_round_trips_and_refuses_what_it_does_not_declare() {
-        let valid = plane_request(0.0);
+        let valid = plane_request();
         let request = MpdRequest::from_json(&valid).expect("a declared request parses");
         assert_eq!(
             request.operation,
             MpdOperation::RecoverPlaneRotations {
                 tensor: "w".to_string(),
-                declared_error: 0.0,
             }
         );
         let reserialized = serde_json::to_string(&request).expect("serialize request");
@@ -680,16 +656,18 @@ mod tests {
         let unknown_top = valid.replacen("\"operation\"", "\"extra\": 1, \"operation\"", 1);
         assert!(MpdRequest::from_json(&unknown_top).is_err());
         let unknown_operation_field = request_json(
-            r#"{"kind": "recover_plane_rotations", "tensor": "w", "declared_error": 0.0, "tolerance": 1e-8}"#,
+            r#"{"kind": "recover_plane_rotations", "tensor": "w", "tolerance": 1e-8}"#,
         );
         assert!(MpdRequest::from_json(&unknown_operation_field).is_err());
-        let missing_tensor = request_json(r#"{"kind": "recover_plane_rotations", "declared_error": 0.0}"#);
+        // The distance to the orthogonal group is measured by the owner, so a
+        // hand-supplied one is an unknown field, not an input.
+        let hand_supplied_error = request_json(
+            r#"{"kind": "recover_plane_rotations", "tensor": "w", "declared_error": 0.0}"#,
+        );
+        assert!(MpdRequest::from_json(&hand_supplied_error).is_err());
+        let missing_tensor = request_json(r#"{"kind": "recover_plane_rotations"}"#);
         assert!(MpdRequest::from_json(&missing_tensor).is_err());
-        // The declared error is an experiment declaration with no default.
-        let missing_declaration = request_json(r#"{"kind": "recover_plane_rotations", "tensor": "w"}"#);
-        assert!(MpdRequest::from_json(&missing_declaration).is_err());
-        let unknown_kind =
-            request_json(r#"{"kind": "guess_the_planes", "tensor": "w", "declared_error": 0.0}"#);
+        let unknown_kind = request_json(r#"{"kind": "guess_the_planes", "tensor": "w"}"#);
         assert!(MpdRequest::from_json(&unknown_kind).is_err());
         let other_schema = valid.replacen(MPD_REQUEST_SCHEMA, "gam.fit-request", 1);
         assert!(MpdRequest::from_json(&other_schema).is_err());
@@ -704,9 +682,8 @@ mod tests {
     #[test]
     fn plane_rotation_report_is_the_owner_result_field_for_field() {
         let matrix = two_plane_rotation(0.7, 1.9);
-        let declared = orthogonality_declaration(&matrix);
-        let direct = recover_plane_rotations(matrix.view(), declared).expect("owner recovery");
-        let output = run_parameter_decomposition(&plane_request(declared), &inputs("w", matrix))
+        let direct = recover_plane_rotations(matrix.view()).expect("owner recovery");
+        let output = run_parameter_decomposition(&plane_request(), &inputs("w", matrix))
             .expect("surface run");
         let MpdResult::RecoverPlaneRotations(report) = &output.report.result else {
             panic!("expected a plane-rotation report, got {:?}", output.report.result);
@@ -811,7 +788,7 @@ mod tests {
 
     #[test]
     fn identity_reports_its_ambiguity_and_an_absent_separation() {
-        let output = run_parameter_decomposition(&plane_request(0.0), &inputs("w", Array2::eye(3)))
+        let output = run_parameter_decomposition(&plane_request(), &inputs("w", Array2::eye(3)))
             .expect("surface run on the identity");
         let MpdResult::RecoverPlaneRotations(report) = &output.report.result else {
             panic!("expected a plane-rotation report, got {:?}", output.report.result);
@@ -829,21 +806,21 @@ mod tests {
     }
 
     #[test]
-    fn the_owners_refusal_of_a_non_orthogonal_matrix_reaches_the_caller() {
-        // 2 I is 1 away from the orthogonal group, far beyond a declared error of 0.
+    fn the_owners_refusal_of_a_singular_matrix_reaches_the_caller() {
+        // A rank-one matrix has no unique nearest orthogonal matrix.
         assert!(matches!(
-            run_parameter_decomposition(&plane_request(0.0), &inputs("w", Array2::eye(2) * 2.0)),
+            run_parameter_decomposition(&plane_request(), &inputs("w", Array2::ones((2, 2)))),
             Err(MpdSurfaceError::PlaneRotation(
-                PlaneRotationError::NotOrthogonal { .. }
+                PlaneRotationError::NotInvertible { .. }
             ))
         ));
         // Positive control: the same request on an orthogonal matrix is accepted.
-        assert!(run_parameter_decomposition(&plane_request(0.0), &inputs("w", Array2::eye(2))).is_ok());
+        assert!(run_parameter_decomposition(&plane_request(), &inputs("w", Array2::eye(2))).is_ok());
     }
 
     #[test]
     fn missing_or_misshapen_inputs_are_refused() {
-        let json = plane_request(0.0);
+        let json = plane_request();
         assert!(run_parameter_decomposition(&json, &inputs("w", Array2::eye(2))).is_ok());
         assert!(matches!(
             run_parameter_decomposition(&json, &inputs("other", Array2::eye(2))),
