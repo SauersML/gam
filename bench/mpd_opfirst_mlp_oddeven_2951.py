@@ -94,6 +94,63 @@ def layer_metrics(X, Wg, Wu, Wd, ref=None):
     return out
 
 
+def relu_split(X, Wg, Wu, Wd, Wd_op, ids, tok, top):
+    """Exact split silu(g) = relu(g) + e(g), e(g) = -|g| sigmoid(-|g|) even, |e| <= 0.2785, exponentially small in |g|.
+
+    F = P + C with P = W_down (relu(g) * u) (sign-gated bilinear) and C = W_down (e(g) * u) (bounded even correction).
+    Certified per token: ||C|| <= ||W_down||_2 ||e(g) * u|| (exact given g, u).
+    """
+    g, u = X @ Wg.T, X @ Wu.T
+    F = (torch.nn.functional.silu(g) * u) @ Wd.T
+    a = torch.relu(g) * u
+    e = -g.abs() * torch.sigmoid(-g.abs())
+    P, C = a @ Wd.T, (e * u) @ Wd.T
+    nF_tok = F.norm(dim=-1)
+    bound = Wd_op * (e * u).norm(dim=-1)
+    ratio_tok = C.norm(dim=-1) / nF_tok
+    e2 = a.pow(2).sort(-1, descending=True).values
+    k90 = ((e2.cumsum(-1) / e2.sum(-1, keepdim=True)) < 0.90).sum(-1) + 1
+    active = (g > 0).sum(-1)
+    q = lambda v: {"median": float(v.median()), "min": float(v.min()), "max": float(v.max())}
+    share = nF_tok.pow(2) / nF_tok.pow(2).sum()
+    order = share.argsort(descending=True)[:top]
+    seq_len = ids.shape[1]
+    flat = ids.reshape(-1)
+    heavy = [{"flat": int(j), "position": int(j) % seq_len, "token": tok.decode([int(flat[j])]),
+              "share_of_sum_F2": float(share[j]), "F_norm": float(nF_tok[j]),
+              "F_norm_over_median": float(nF_tok[j] / nF_tok.median())} for j in order]
+    keep = torch.ones(F.shape[0], dtype=torch.bool)
+    keep[order] = False
+    Q = 0.5 * (g * u) @ Wd.T
+
+    def pooled(mask):
+        Fm, Qm, Pm = F[mask], Q[mask], P[mask]
+        ss = (Fm - Fm.mean(0)).pow(2).sum()
+        return {"cos_QF": float((Qm * Fm).sum() / (Qm.norm() * Fm.norm())),
+                "fve_Q_centered": float(1 - (Fm - Qm).pow(2).sum() / ss),
+                "fve_P_centered": float(1 - (Fm - Pm).pow(2).sum() / ss)}
+
+    pos0 = torch.arange(F.shape[0]) % seq_len != 0
+    return {
+        "exact_identity_rel": float((F - P - C).norm() / F.norm()),
+        "e_abs_max": float(e.abs().max()),
+        "C_over_F_agg": float(C.norm() / F.norm()),
+        "C_over_F_tok": q(ratio_tok),
+        "fve_P_centered": float(1 - C.pow(2).sum() / (F - F.mean(0)).pow(2).sum()),
+        "cos_PF_agg": float((P * F).sum() / (P.norm() * F.norm())),
+        "bound_over_F_tok": q(bound / nF_tok),
+        "bound_holds_all": bool((C.norm(dim=-1) <= bound * (1 + 1e-12)).all()),
+        "bound_tightness_tok_median": float((C.norm(dim=-1) / bound).median()),
+        "active_frac_tok": q(active.double() / g.shape[1]),
+        "units90_tok": q(k90.double()),
+        "units90_over_active_tok": q(k90.double() / active.clamp_min(1)),
+        "heavy_tokens": heavy,
+        "pooled_all": pooled(torch.ones_like(keep)),
+        "pooled_drop_heavy": pooled(keep),
+        "pooled_drop_position0": pooled(pos0),
+    }
+
+
 def tensor_rank(Wg, Wu, Wd, n_probe, gen):
     Gg, Gu, C = Wg @ Wg.T, Wu @ Wu.T, Wg @ Wu.T
     res = {
@@ -124,6 +181,8 @@ def main():
     parser.add_argument("--scales", default="0.1,0.3,1")
     parser.add_argument("--probes", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--mode", choices=["oddeven", "relusplit"], default="oddeven")
+    parser.add_argument("--heavy", type=int, default=4)
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -149,13 +208,25 @@ def main():
     t_fwd = time.time() - t0
     scales = [float(s) for s in args.scales.split(",")]
     gen = torch.Generator().manual_seed(args.seed)
-    report = {"model": args.model, "text_source": source, "tokens": int(ids.numel()), "dtype": "float64",
+    report = {"model": args.model, "mode": args.mode, "text_source": source, "tokens": int(ids.numel()), "dtype": "float64",
               "act": model.config.hidden_act, "layers": {}}
     with torch.inference_mode():
         for i, layer in enumerate(layers):
             mlp = layer.mlp
             Wg, Wu, Wd = mlp.gate_proj.weight, mlp.up_proj.weight, mlp.down_proj.weight
             X, ref = captured[i]
+            if args.mode == "relusplit":
+                Wd_op = float(torch.linalg.matrix_norm(Wd, ord=2))
+                entry = relu_split(X, Wg, Wu, Wd, Wd_op, ids, tok, args.heavy)
+                entry["W_down_op_norm"] = Wd_op
+                report["layers"][i] = entry
+                h = entry["heavy_tokens"][0]
+                print(f"L{i:02d} |C|/|F|={entry['C_over_F_agg']:.3f} tokmed={entry['C_over_F_tok']['median']:.3f} "
+                      f"fveP={entry['fve_P_centered']:.4f} act={entry['active_frac_tok']['median']:.3f} "
+                      f"k90={entry['units90_tok']['median']:.0f} bnd={entry['bound_over_F_tok']['median']:.3f} "
+                      f"id={entry['exact_identity_rel']:.1e} heavy=pos{h['position']}:{h['token']!r}:{h['share_of_sum_F2']:.2f}",
+                      flush=True)
+                continue
             entry = {"input_rms_median": float(X.pow(2).mean(-1).sqrt().median())}
             entry["real"] = layer_metrics(X, Wg, Wu, Wd, ref)
             entry["scaled"] = {str(t): layer_metrics(t * X, Wg, Wu, Wd) for t in scales}
