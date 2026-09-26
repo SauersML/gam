@@ -94,7 +94,7 @@ def layer_metrics(X, Wg, Wu, Wd, ref=None):
     return out
 
 
-def relu_split(X, Wg, Wu, Wd, Wd_op, ids, tok, top):
+def relu_split(X, Wg, Wu, Wd, Wd_op, flat_ids, positions, tok, top):
     """Exact split silu(g) = relu(g) + e(g), e(g) = -|g| sigmoid(-|g|) even, |e| <= 0.2785, exponentially small in |g|.
 
     F = P + C with P = W_down (relu(g) * u) (sign-gated bilinear) and C = W_down (e(g) * u) (bounded even correction).
@@ -114,9 +114,7 @@ def relu_split(X, Wg, Wu, Wd, Wd_op, ids, tok, top):
     q = lambda v: {"median": float(v.median()), "min": float(v.min()), "max": float(v.max())}
     share = nF_tok.pow(2) / nF_tok.pow(2).sum()
     order = share.argsort(descending=True)[:top]
-    seq_len = ids.shape[1]
-    flat = ids.reshape(-1)
-    heavy = [{"flat": int(j), "position": int(j) % seq_len, "token": tok.decode([int(flat[j])]),
+    heavy = [{"row": int(j), "position": int(positions[j]), "token": tok.decode([int(flat_ids[j])]),
               "share_of_sum_F2": float(share[j]), "F_norm": float(nF_tok[j]),
               "F_norm_over_median": float(nF_tok[j] / nF_tok.median())} for j in order]
     keep = torch.ones(F.shape[0], dtype=torch.bool)
@@ -130,7 +128,7 @@ def relu_split(X, Wg, Wu, Wd, Wd_op, ids, tok, top):
                 "fve_Q_centered": float(1 - (Fm - Qm).pow(2).sum() / ss),
                 "fve_P_centered": float(1 - (Fm - Pm).pow(2).sum() / ss)}
 
-    pos0 = torch.arange(F.shape[0]) % seq_len != 0
+    pos0 = positions != 0
     return {
         "exact_identity_rel": float((F - P - C).norm() / F.norm()),
         "e_abs_max": float(e.abs().max()),
@@ -149,6 +147,101 @@ def relu_split(X, Wg, Wu, Wd, Wd_op, ids, tok, top):
         "pooled_drop_heavy": pooled(keep),
         "pooled_drop_position0": pooled(pos0),
     }
+
+
+E_PEAK = 1.2784645427610738  # argmax_t t sigmoid(-t); |e| <= E_PEAK sigmoid(-E_PEAK) = 0.2785 (exact)
+
+
+def e_fn(g):
+    return -g.abs() * torch.sigmoid(-g.abs())
+
+
+def correction_bounds(X, Wg, Wu, Wd, gamma, k, chunk=64):
+    """Certified bounds on ||C|| = ||W_d (e(g) * u)|| (C is what relu replacement drops), tightest-first comparison.
+
+    per-token (exact given g, u): op = ||W_d||_2 ||e u||; tri = sum_n |e_n u_n| ||w_n||;
+      split_k = ||W_d[:, A]||_2 ||(e u)_A|| + sum_{n not in A} |e_n u_n| ||w_n||, A = top-k units by |e_n u_n| ||w_n||.
+    a priori: param = 0.2785 ||W_d||_2 ||W_u||_2 max|gamma| sqrt(d) (parameter-only; ||RMSNorm output|| <= max|gamma| sqrt(d));
+      box = min(||W_d||_2 ||emax * umax||, sum_n emax_n umax_n ||w_n||) over the observed per-unit box
+      g_n in [min, max], |u_n| <= max (empirical sup: valid for any input inside the observed ranges).
+    """
+    g, u = X @ Wg.T, X @ Wu.T
+    eu = e_fn(g) * u
+    C = eu @ Wd.T
+    nC = C.norm(dim=-1)
+    wn = Wd.norm(dim=0)
+    op = torch.linalg.matrix_norm(Wd, ord=2)
+    b_op = op * eu.norm(dim=-1)
+    contrib = eu.abs() * wn
+    b_tri = contrib.sum(-1)
+    top = contrib.topk(k, dim=-1).indices
+    b_split = []
+    for s in range(0, X.shape[0], chunk):
+        idx = top[s:s + chunk]
+        sub_op = torch.linalg.matrix_norm(Wd.T[idx], ord=2)
+        in_a = eu[s:s + chunk].gather(-1, idx)
+        b_split.append(sub_op * in_a.norm(dim=-1) + b_tri[s:s + chunk] - contrib[s:s + chunk].gather(-1, idx).sum(-1))
+    b_split = torch.cat(b_split)
+    gmin, gmax = g.min(0).values, g.max(0).values
+    peak = torch.full_like(gmin, E_PEAK)
+    cand = torch.stack([gmin, gmax, torch.clamp(peak, gmin, gmax), torch.clamp(-peak, gmin, gmax)])
+    emax = e_fn(cand).abs().max(0).values
+    umax = u.abs().max(0).values
+    b_box = min(float(op * (emax * umax).norm()), float((emax * umax * wn).sum()))
+    d = X.shape[1]
+    b_param = float(0.27846454276107 * op * torch.linalg.matrix_norm(Wu, ord=2) * gamma.abs().max() * math.sqrt(d))
+    nF = ((torch.nn.functional.silu(g) * u) @ Wd.T).norm(dim=-1)
+    best = torch.minimum(b_op, b_split)
+    med = lambda v: float(v.median())
+    return {
+        "C_norm_tok": {"median": med(nC), "max": float(nC.max())},
+        "F_norm_tok_median": med(nF),
+        "bound_over_C_tok_median": {"op": med(b_op / nC), "tri": med(b_tri / nC), f"split{k}": med(b_split / nC),
+                                    "best": med(best / nC)},
+        "bound_over_F_tok_median": {"op": med(b_op / nF), "tri": med(b_tri / nF), f"split{k}": med(b_split / nF),
+                                    "best": med(best / nF)},
+        "all_bounds_hold": bool(((nC <= b_op * (1 + 1e-12)) & (nC <= b_tri * (1 + 1e-12))
+                                 & (nC <= b_split * (1 + 1e-12))).all()),
+        "apriori_box": b_box, "apriori_box_over_maxC": b_box / float(nC.max()),
+        "apriori_box_over_medianF": b_box / med(nF),
+        "apriori_param": b_param, "apriori_param_over_maxC": b_param / float(nC.max()),
+        "apriori_param_over_medianF": b_param / med(nF),
+    }
+
+
+def replace_runs(model, ids, clean_logits, suffix_l0, prefix_l0, positions):
+    """Swap silu -> relu (drop C exactly) in a layer set, rerun the full model, compare next-token distributions."""
+    n_layers = len(model.model.layers)
+    clean = torch.log_softmax(clean_logits, -1).reshape(-1, clean_logits.shape[-1])
+    tgt = torch.cat([ids[:, 1:], torch.full((ids.shape[0], 1), -1)], 1).reshape(-1)
+    has_tgt = tgt >= 0
+    nll_clean = -clean[has_tgt].gather(-1, tgt[has_tgt, None]).squeeze(-1)
+    keep = positions != 0
+    configs = [("suffix", l0, list(range(l0, n_layers))) for l0 in suffix_l0]
+    configs += [("prefix", l0, list(range(0, l0))) for l0 in prefix_l0]
+    out = []
+    for kind, l0, layer_set in configs:
+        saved = {i: model.model.layers[i].mlp.act_fn for i in layer_set}
+        for i in layer_set:
+            model.model.layers[i].mlp.act_fn = torch.nn.ReLU()
+        with torch.inference_mode():
+            lp = torch.log_softmax(model(input_ids=ids).logits, -1).reshape(-1, clean.shape[-1])
+        for i, fn in saved.items():
+            model.model.layers[i].mlp.act_fn = fn
+        kl = (clean.exp() * (clean - lp)).sum(-1)
+        agree = clean.argmax(-1) == lp.argmax(-1)
+        nll = -lp[has_tgt].gather(-1, tgt[has_tgt, None]).squeeze(-1)
+        kt = keep[has_tgt]
+        row = {"kind": kind, "L0": l0, "layers": f"{layer_set[0]}-{layer_set[-1]}" if layer_set else "none",
+               "kl_mean": float(kl[keep].mean()), "kl_median": float(kl[keep].median()), "kl_max": float(kl[keep].max()),
+               "top1_agree": float(agree[keep].double().mean()),
+               "loss_clean": float(nll_clean[kt].mean()), "loss_delta": float((nll - nll_clean)[kt].mean()),
+               "pos0_kl_mean": float(kl[~keep].mean()), "pos0_kl_max": float(kl[~keep].max()),
+               "pos0_top1_agree": float(agree[~keep].double().mean())}
+        out.append(row)
+        print(f"{kind:6s} L0={l0:2d} [{row['layers']}] KL mean={row['kl_mean']:.2e} max={row['kl_max']:.2e} "
+              f"top1={row['top1_agree']:.3f} dloss={row['loss_delta']:+.2e} pos0KL={row['pos0_kl_mean']:.2e}", flush=True)
+    return out
 
 
 def tensor_rank(Wg, Wu, Wd, n_probe, gen):
@@ -181,7 +274,11 @@ def main():
     parser.add_argument("--scales", default="0.1,0.3,1")
     parser.add_argument("--probes", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--mode", choices=["oddeven", "relusplit"], default="oddeven")
+    parser.add_argument("--mode", choices=["oddeven", "relusplit", "replace"], default="oddeven")
+    parser.add_argument("--include-pos0", action="store_true", help="position 0 (attention sink) is excluded by default")
+    parser.add_argument("--suffix-l0", default="27,24,21,18,15,0")
+    parser.add_argument("--prefix-l0", default="27,24,21,18,15")
+    parser.add_argument("--bound-k", type=int, default=64)
     parser.add_argument("--heavy", type=int, default=4)
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
@@ -202,22 +299,39 @@ def main():
     layers = model.model.layers
     handles = [layers[i].mlp.register_forward_hook(make_hook(i)) for i in range(len(layers))]
     with torch.inference_mode():
-        model(input_ids=ids)
+        clean_logits = model(input_ids=ids).logits
     for h in handles:
         h.remove()
     t_fwd = time.time() - t0
+    positions = torch.arange(ids.shape[1]).repeat(ids.shape[0])
+    rows = torch.ones_like(positions, dtype=torch.bool) if args.include_pos0 else positions != 0
+    flat_ids = ids.reshape(-1)[rows]
     scales = [float(s) for s in args.scales.split(",")]
     gen = torch.Generator().manual_seed(args.seed)
     report = {"model": args.model, "mode": args.mode, "text_source": source, "tokens": int(ids.numel()), "dtype": "float64",
-              "act": model.config.hidden_act, "layers": {}}
+              "act": model.config.hidden_act, "stats_exclude_position0": not args.include_pos0, "layers": {}}
+    if args.mode == "replace":
+        report["replacement"] = replace_runs(model, ids, clean_logits, [int(v) for v in args.suffix_l0.split(",")],
+                                             [int(v) for v in args.prefix_l0.split(",")], positions)
     with torch.inference_mode():
         for i, layer in enumerate(layers):
             mlp = layer.mlp
             Wg, Wu, Wd = mlp.gate_proj.weight, mlp.up_proj.weight, mlp.down_proj.weight
             X, ref = captured[i]
+            X, ref = X[rows], ref[rows]
+            if args.mode == "replace":
+                entry = correction_bounds(X, Wg, Wu, Wd, layer.post_attention_layernorm.weight, args.bound_k)
+                report["layers"][i] = entry
+                b = entry["bound_over_C_tok_median"]
+                print(f"L{i:02d} |C|med={entry['C_norm_tok']['median']:.3f} |F|med={entry['F_norm_tok_median']:.3f} "
+                      f"bound/|C| op={b['op']:.2f} tri={b['tri']:.2f} split={b[f'split{args.bound_k}']:.2f} "
+                      f"best/|F|={entry['bound_over_F_tok_median']['best']:.3f} holds={entry['all_bounds_hold']} "
+                      f"box/maxC={entry['apriori_box_over_maxC']:.1f} param/maxC={entry['apriori_param_over_maxC']:.1f}",
+                      flush=True)
+                continue
             if args.mode == "relusplit":
                 Wd_op = float(torch.linalg.matrix_norm(Wd, ord=2))
-                entry = relu_split(X, Wg, Wu, Wd, Wd_op, ids, tok, args.heavy)
+                entry = relu_split(X, Wg, Wu, Wd, Wd_op, flat_ids, positions[rows], tok, args.heavy)
                 entry["W_down_op_norm"] = Wd_op
                 report["layers"][i] = entry
                 h = entry["heavy_tokens"][0]
