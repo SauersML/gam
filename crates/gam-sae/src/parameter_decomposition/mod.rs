@@ -43,7 +43,10 @@
 //! `gated_rewrite` (gated activations, norms), `attention` (rotary attention under
 //! the source's joint softmax) and `block` (attention layers under component
 //! reads). Sufficient computational state over finite native responses belongs to
-//! `state`. Plane-rotation
+//! `state`. Implementation gauges detected exactly from native tensors (OV
+//! passthroughs, SwiGLU units, norm gains, rotary QK, residual basis) belong to
+//! `gauge`; mask-gauge covariance, structured paths and commutator facts to
+//! `operators`. Plane-rotation
 //! recovery from a frozen matrix belongs to `spectral`, and structured edits from a
 //! declared single-cycle row action to `cyclic_action`.
 //!
@@ -129,6 +132,12 @@ pub mod moments;
 
 // Global versus use-specific edits and occurrence scopes.
 pub mod occurrence;
+
+// Implementation-gauge families detected exactly from native tensors, quotiented out of codes.
+pub mod gauge;
+
+// Gauge-covariant group masks, structured parameter paths, Sum and Compose accounting.
+pub mod operators;
 
 // Cross-module adversarial and null controls against the landed modules.
 #[cfg(test)]
