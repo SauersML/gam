@@ -243,7 +243,8 @@ def main():
                   f"r99={entry['tensor']['mode1_out_sym']['rank99']}", flush=True)
     report["runtime_s"] = {"forward_and_load": t_fwd, "total": time.time() - t0}
     with open(args.out, "w") as fh:
-        json.dump(report, fh, indent=1)
+        fh.write("{\n" + ",\n".join(f"{json.dumps(k)}:{json.dumps(v, separators=(',', ':'))}"
+                                     for k, v in report.items()) + "\n}\n")
     print("runtime", report["runtime_s"])
 
 
