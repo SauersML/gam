@@ -3,14 +3,14 @@
 collected            3404
 passed               2986
 skipped              79
-failed (diagnosed)   227
+failed (diagnosed)   229
 errored (diagnosed)  27
-CENSORED             85   (worker killed at the per-test bound;
+CENSORED             83   (worker killed at the per-test bound;
                           the JUnit records no reason and time=0.000)
 
-faulthandler dumps in the step log: 91
+faulthandler dumps in the step log: 92
 
-## The 85 censored tests, with the frame each was stuck in
+## The 83 censored tests, with the frame each was stuck in
 
 Recovered from the faulthandler dumps, which fire before the kill and
 write straight to fd 2. A test listed here is NOT a crashed interpreter:
@@ -140,23 +140,11 @@ it is a call that had not returned when the bound expired.
       test_a_flexible_link_keyword_fits_the_formula_linkwiggle[extra1]
           stuck in gamfit/_api.py:1225 in fit
 
-[2] tests.generic_variance_link_cells_test
-      test_generic_cell_gam_recovers_truth_and_bands_cover_it[binomial-log-<lambda>-1.0-6000]
-          stuck in gamfit/_api.py:1225 in fit
-      test_generic_cell_gam_recovers_truth_and_bands_cover_it[poisson-identity-<lambda>-1.0-3000]
-          stuck in gamfit/_api.py:1225 in fit
-
 [2] tests.test_event_history_score_slope
       test_a_ctn_calibrated_score_composes_in_front_of_the_fit
           stuck in gamfit/_event_history.py:571 in fit_event_history
       test_a_score_enters_as_one_penalised_slope_surface
           stuck in gamfit/_event_history.py:571 in fit_event_history
-
-[2] tests.test_sae_manifold_certify_external_2266
-      test_certify_external_requires_matching_per_atom_metadata_lengths
-          stuck in gamfit/_sae_manifold.py:216 in sae_manifold_fit
-      test_certify_external_returns_typed_nonfit_for_perturbed_state
-          stuck in (no dump recovered — dump may have interleaved with a concurrent worker)
 
 [2] tests.test_sae_manifold_oos_reencode_issue_2132
       test_oos_reencode_of_training_rows_matches_native_reconstruction
@@ -214,13 +202,17 @@ it is a call that had not returned when the bound expired.
       test_ctm_generate_conditional_mean_increases_with_covariate
           stuck in (no gamfit frame)
 
+[1] tests.generic_variance_link_cells_test
+      test_generic_cell_gam_recovers_truth_and_bands_cover_it[binomial-log-<lambda>-1.0-6000]
+          stuck in gamfit/_api.py:1225 in fit
+
 [1] tests.pygam_covariance_refusal_test
       test_rare_event_binomial_on_raw_covariates_returns_intervals[y ~ factor(student) + s(balance) + s(income)-10]
           stuck in gamfit/_api.py:1225 in fit
 
 [1] tests.test_bug_hunt_marginal_slope_predict_interval
       test_marginal_slope_posterior_band_covers_truth_at_nominal_rate
-          stuck in gamfit/_api.py:1225 in fit
+          stuck in gamfit/_sampling.py:116 in _call
 
 [1] tests.test_bug_hunt_survival_surface_query_beyond_predict_exit
       test_survival_surface_not_truncated_by_small_predict_exit[transformation]
@@ -238,8 +230,12 @@ it is a call that had not returned when the bound expired.
       test_survival_marginal_slope_weibull_n3000_returns_under_60s
           stuck in gamfit/_api.py:1225 in fit
 
+[1] tests.test_sae_manifold_certify_external_2266
+      test_certify_external_requires_matching_per_atom_metadata_lengths
+          stuck in gamfit/_sae_manifold.py:216 in sae_manifold_fit
+
 [1] tests.test_sae_manifold_heterogeneous_d_atom_2088
-      test_heterogeneous_d_atom_passes_validation_when_row_block_penalties_disabled
+      test_isometry_gauge_is_admitted_on_heterogeneous_atom_dims
           stuck in gamfit/_sae_manifold.py:216 in sae_manifold_fit
 
 [1] tests.test_sae_manifold_k_multi_heterogeneous_atoms
@@ -264,33 +260,33 @@ it is a call that had not returned when the bound expired.
 
 ## Entry-point census over the censored population
 
-    39  gamfit/_api.py:1225 in fit
+    37  gamfit/_api.py:1225 in fit
     27  gamfit/_sae_manifold.py:216 in sae_manifold_fit
     11  gamfit/_model.py:426 in predict
      4  (no gamfit frame)
      3  gamfit/_event_history.py:571 in fit_event_history
-     1  (no dump recovered)
+     1  gamfit/_sampling.py:116 in _call
 
 ## 20 slowest tests that DID report a duration
 
-      280.9s  tests.test_sae_manifold_top_k_issue::test_topk_fit_uses_exact_fixed_support[2]
-      276.8s  tests.test_sae_manifold_synthetic_quality_ground_truth::test_isometry_on_circle_recovers_planted_geometry_normalized_reference
-      272.7s  tests.bug_hunt_smooth_pvalue_null_uniform_on_interaction_terms_test::test_null_interaction_pvalues_are_uniform_over_the_whole_range[ti]
-      132.6s  tests.test_latent_center_collision_gradient::test_a_c1_latent_kernel_fits_through_a_center_collision[y ~ s(t, bs='duchon', centers=32)-2]
+      295.6s  tests.test_sae_manifold_synthetic_quality_ground_truth::test_isometry_on_circle_recovers_planted_geometry_normalized_reference
+      279.3s  tests.test_sae_manifold_heterogeneous_d_atom_2088::test_heterogeneous_d_atom_passes_validation_when_row_block_penalties_disabled
+      275.9s  tests.test_sae_manifold_certify_external_2266::test_certify_external_returns_typed_nonfit_for_perturbed_state
+      217.6s  tests.bug_hunt_smooth_pvalue_null_uniform_on_interaction_terms_test::test_null_interaction_pvalues_are_uniform_over_the_whole_range[ti]
+      212.3s  tests.test_sae_manifold_single_circle_default_795::test_single_circle_positive_isometry_recovers_honest_chart_span
+      179.7s  tests.test_sae_manifold_top_k_issue::test_topk_fit_uses_exact_fixed_support[2]
+      125.2s  tests.test_smoothing_correction_first_order::test_corrected_intervals_cover_the_mean_and_partial_dependence[binomial]
       120.4s  tests.test_documentation_examples::test_cli_documentation_example[docs/cli.md:149]
-      120.4s  tests.test_documentation_examples::test_cli_documentation_example[docs/cli.md:136]
       120.3s  tests.test_documentation_examples::test_cli_documentation_example[docs/marginal-slope.md:339]
-       95.7s  tests.test_smoothing_correction_first_order::test_corrected_intervals_cover_the_mean_and_partial_dependence[binomial]
-       95.0s  tests.test_sae_manifold_single_circle_default_795::test_single_circle_positive_isometry_recovers_honest_chart_span
-       94.4s  tests.test_sae_manifold_top_k_issue::test_topk_payload_is_one_unprojected_model
+      120.3s  tests.test_documentation_examples::test_cli_documentation_example[docs/cli.md:136]
        90.1s  tests.test_survival_marginal_slope_clustered_pc_808::test_survival_marginal_slope_clustered_pc_converges_808
-       89.3s  tests.test_documentation_examples::test_python_documentation_example[docs/survival.md:223]
-       82.8s  tests.generic_variance_link_cells_test::test_generic_cell_gam_recovers_truth_and_bands_cover_it[gamma-inverse-<lambda>-0.1-3000]
-       69.3s  tests.test_basis_check_pvalue_calibration::test_basis_check_is_uniform_under_an_adequate_basis[binomial]
+       81.0s  tests.test_sae_manifold_top_k_issue::test_topk_payload_is_one_unprojected_model
+       78.4s  tests.test_latent_center_collision_gradient::test_a_c1_latent_kernel_fits_through_a_center_collision[y ~ s(t, bs='duchon', centers=32)-2]
+       71.0s  tests.test_documentation_examples::test_python_documentation_example[docs/survival.md:223]
+       60.6s  tests.generic_variance_link_cells_test::test_generic_cell_gam_recovers_truth_and_bands_cover_it[gamma-inverse-<lambda>-0.1-3000]
        60.2s  tests.examples_smoke_test::test_python_example_runs[standard_fit_latent_demo.py]
-       60.2s  tests.examples_smoke_test::test_python_example_runs[topology_auto_selector_ring_demo.py]
-       60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_uncertainty.py]
-       60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_scad_mcp_sparsity.py]
-       60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_ordered_beta_bernoulli_topology_atoms.py]
+       60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_incoherence.py]
        60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_nuclear_rank.py]
+       60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_ordered_beta_bernoulli_topology_atoms.py]
+       60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_uncertainty.py]
 
