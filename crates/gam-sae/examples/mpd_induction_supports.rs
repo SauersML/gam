@@ -95,6 +95,7 @@
 //!   (declared seed), with every other head and position off, must miss the tolerance; the support alone must
 //!   meet it.
 
+use gam_runtime::resource::MemoryGovernor;
 use gam_sae::parameter_decomposition::attention::AttentionGeometry;
 use gam_sae::parameter_decomposition::block::{
     AttentionLayerReads, AttentionProjection, ComponentAttentionLayer, ComponentMasks, ProjectionRead,
@@ -288,7 +289,7 @@ impl HeadNetwork {
     /// mask. A free head's columns read `1/2 ± 1/2`, so the radii cover every mask of the box. With free heads,
     /// also each head's spread `max_t Σ |W_O[:, head]| (|z_t| + r_t)` over its layer's mixed rows `z`, the reach
     /// of its half-width, and zero for every head without them.
-    fn logits(&self, tokens: &[i64], heads: Option<&MaskBox>) -> Result<(Rows, Vec<f64>), String> {
+    fn logits(&self, governor: &MemoryGovernor, tokens: &[i64], heads: Option<&MaskBox>) -> Result<(Rows, Vec<f64>), String> {
         let network = &self.network;
         let (count, head_dim) = (network.heads, network.head_dim);
         let width = count * head_dim;
@@ -324,7 +325,7 @@ impl HeadNetwork {
                 ..AttentionLayerReads::native()
             })
             .collect();
-        let (logits, executions) = network.run(tokens, &reads)?;
+        let (logits, executions) = network.run(governor, tokens, &reads)?;
         let mut spreads = vec![0.0_f64; self.components()];
         for (layer, (execution, (_, _, free_here))) in executions.iter().zip(&controls).enumerate() {
             if !free_here {
@@ -355,7 +356,7 @@ impl HeadNetwork {
     /// head at every other position stays on. A free instance's columns read `1/2 ± 1/2` at its positions. Also
     /// each free instance's spread `Σ_s Σ |W_O[:, head]| (|z_s| + r_s)` over its positions' mixed rows, and zero
     /// for the others.
-    fn scoped_logits(&self, tokens: &[i64], instances: &[Instance], mask: &MaskBox) -> Result<(Rows, Vec<f64>), String> {
+    fn scoped_logits(&self, governor: &MemoryGovernor, tokens: &[i64], instances: &[Instance], mask: &MaskBox) -> Result<(Rows, Vec<f64>), String> {
         let network = &self.network;
         let (count, head_dim) = (network.heads, network.head_dim);
         let layers = network.layers.len();
@@ -387,7 +388,7 @@ impl HeadNetwork {
                 ..AttentionLayerReads::native()
             })
             .collect();
-        let (logits, executions) = network.run(tokens, &reads)?;
+        let (logits, executions) = network.run(governor, tokens, &reads)?;
         let mut spreads = vec![0.0_f64; instances.len()];
         for ((spread, instance), side) in spreads.iter_mut().zip(instances).zip(mask.sides()) {
             if *side != MaskSide::Free {
@@ -474,6 +475,7 @@ struct ScopedFamily {
 /// the teacher at that row, bounded over both logit boxes. A box runs once at its center with every free
 /// instance at `1/2 ± 1/2`; free instances split widest first, by spread.
 struct ScopedBoxes<'a, 'b> {
+    governor: MemoryGovernor,
     artifact: &'a HeadNetwork,
     tokens: &'a [i64],
     reference: &'a Rows,
@@ -495,10 +497,11 @@ impl BoxDivergence for ScopedBoxes<'_, '_> {
     }
 
     fn enclose(&mut self, mask: &MaskBox) -> Result<BoxEnclosure<ScopedFamily>, String> {
+        let governor = &self.governor;
         if let Some(found) = self.enclosed.get(mask) {
             return Ok(found.clone());
         }
-        let (moved, spreads) = self.artifact.scoped_logits(self.tokens, self.instances, mask)?;
+        let (moved, spreads) = self.artifact.scoped_logits(governor, self.tokens, self.instances, mask)?;
         let row = row_divergence(self.reference, &moved, self.family.position)?;
         let domain = self.family;
         let evidence = match (mask.is_vertex(), row.resolved, row.upper) {
@@ -533,8 +536,8 @@ struct Divergences<'a> {
 }
 
 impl<'a> Divergences<'a> {
-    fn new(teacher: &HeadNetwork, artifact: &'a HeadNetwork, tokens: &'a [Vec<i64>]) -> Result<Self, String> {
-        let induction = InductionRows::new(tokens, |sequence_tokens| Ok(teacher.logits(sequence_tokens, None)?.0))?;
+    fn new(governor: &MemoryGovernor, teacher: &HeadNetwork, artifact: &'a HeadNetwork, tokens: &'a [Vec<i64>]) -> Result<Self, String> {
+        let induction = InductionRows::new(tokens, |sequence_tokens| Ok(teacher.logits(governor, sequence_tokens, None)?.0))?;
         Ok(Self {
             artifact,
             tokens,
@@ -547,18 +550,18 @@ impl<'a> Divergences<'a> {
     }
 
     /// Every induction row's divergence at one head mask.
-    fn rows_at(&mut self, mask: HeadMask) -> Result<Vec<RowDivergence>, String> {
+    fn rows_at(&mut self, governor: &MemoryGovernor, mask: HeadMask) -> Result<Vec<RowDivergence>, String> {
         let vertex = head_vertex(mask, self.artifact.components())?;
         let (artifact, tokens) = (self.artifact, self.tokens);
         self.induction
-            .at(&vertex, |sequence| Ok(artifact.logits(&tokens[sequence], Some(&vertex))?.0))
+            .at(&vertex, |sequence| Ok(artifact.logits(governor, &tokens[sequence], Some(&vertex))?.0))
     }
 
     /// Every induction row's divergence bound over a box of head masks, from one execution of each sequence at
     /// the box's center, and each head's largest spread over the sequences.
-    fn box_rows(&mut self, heads: &MaskBox) -> Result<(Vec<RowDivergence>, Vec<f64>), String> {
+    fn box_rows(&mut self, governor: &MemoryGovernor, heads: &MaskBox) -> Result<(Vec<RowDivergence>, Vec<f64>), String> {
         let (artifact, tokens) = (self.artifact, self.tokens);
-        let (rows, by_sequence) = self.induction.evaluate_with(|sequence| artifact.logits(&tokens[sequence], Some(heads)))?;
+        let (rows, by_sequence) = self.induction.evaluate_with(|sequence| artifact.logits(governor, &tokens[sequence], Some(heads)))?;
         let mut spreads = vec![0.0_f64; artifact.components()];
         for spread in by_sequence.values() {
             for (widest, &own) in spreads.iter_mut().zip(spread) {
@@ -589,6 +592,7 @@ fn vertex_mask(vertex: &MaskBox) -> HeadMask {
 
 /// The separation oracle over head masks, for every induction row (`row: None`) or one row.
 struct HeadOracle<'a, 'b> {
+    governor: MemoryGovernor,
     divergences: &'b mut Divergences<'a>,
     row: Option<usize>,
 }
@@ -601,8 +605,8 @@ impl HeadOracle<'_, '_> {
         }
     }
 
-    fn divergence(&mut self, mask: HeadMask) -> Result<Largest, String> {
-        let values = self.divergences.rows_at(mask)?;
+    fn divergence(&mut self, governor: &MemoryGovernor, mask: HeadMask) -> Result<Largest, String> {
+        let values = self.divergences.rows_at(governor, mask)?;
         Ok(InductionRows::largest(match self.row {
             Some(row) => &values[row..=row],
             None => &values[..],
@@ -645,6 +649,7 @@ impl SeparationOracle for HeadOracle<'_, '_> {
     }
 
     fn separate(&mut self, support: &ComponentSet) -> Result<EvidenceStatus<HeadMask, HeadMaskFamily>, String> {
+        let governor = &self.governor.clone();
         let kept = support.members().iter().fold(0u32, |bits, &component| bits | 1 << component);
         let free: Vec<usize> = support.complement().members().to_vec();
         let (mut value, mut error, mut lower, mut resolved) = (f64::NEG_INFINITY, 0.0_f64, 0.0_f64, true);
@@ -654,7 +659,7 @@ impl SeparationOracle for HeadOracle<'_, '_> {
                 .iter()
                 .enumerate()
                 .fold(kept, |bits, (index, &component)| bits | (((choice >> index) & 1) as u32) << component);
-            match self.divergence(HeadMask(mask))? {
+            match self.divergence(governor, HeadMask(mask))? {
                 Largest::Resolved { value: center, error: own } => {
                     error = error.max(own);
                     lower = lower.max((center - own).next_down().max(0.0));
@@ -677,7 +682,8 @@ impl SeparationOracle for HeadOracle<'_, '_> {
     }
 
     fn evaluate(&mut self, mask: &HeadMask) -> Result<EvidenceStatus<HeadMask, HeadMaskFamily>, String> {
-        let divergence = self.divergence(*mask)?;
+        let governor = &self.governor.clone();
+        let divergence = self.divergence(governor, *mask)?;
         self.evidence(divergence, 1, *mask)
     }
 }
@@ -688,6 +694,7 @@ impl SeparationOracle for HeadOracle<'_, '_> {
 /// `kl_over_logit_boxes` bounds each induction row over them: the box's bound is the largest row's. Free heads
 /// split widest first, by spread (`Network::logits`).
 struct HeadBoxes<'a, 'b> {
+    governor: MemoryGovernor,
     divergences: &'b mut Divergences<'a>,
     enclosed: &'b mut BTreeMap<MaskBox, BoxEnclosure<HeadMaskFamily>>,
 }
@@ -708,16 +715,18 @@ impl BoxDivergence for HeadBoxes<'_, '_> {
     }
 
     fn enclose(&mut self, heads: &MaskBox) -> Result<BoxEnclosure<HeadMaskFamily>, String> {
+        let governor = &self.governor;
         if let Some(found) = self.enclosed.get(heads) {
             return Ok(found.clone());
         }
         let domain = self.domain();
         let enclosure = if heads.is_vertex() {
             let mut oracle = HeadOracle {
+                governor: governor.clone(),
                 divergences: &mut *self.divergences,
                 row: None,
             };
-            let evidence = match oracle.divergence(vertex_mask(heads))? {
+            let evidence = match oracle.divergence(governor, vertex_mask(heads))? {
                 Largest::Resolved { value, error } => EvidenceStatus::exact(
                     value,
                     error,
@@ -735,7 +744,7 @@ impl BoxDivergence for HeadBoxes<'_, '_> {
                 split_order: Vec::new(),
             }
         } else {
-            let (rows, spreads) = self.divergences.box_rows(heads)?;
+            let (rows, spreads) = self.divergences.box_rows(governor, heads)?;
             let upper = rows
                 .iter()
                 .map(|row| row.upper)
@@ -845,6 +854,7 @@ struct BoxControl {
 /// the same ranking the box search must keep the exhaustive search's run with the same status, and every support
 /// either search queried must get the same certify/refute decision from both oracles.
 fn box_control(
+    governor: &MemoryGovernor,
     divergences: &mut Divergences<'_>,
     enclosed: &mut BTreeMap<MaskBox, BoxEnclosure<HeadMaskFamily>>,
     code: &PaddedPacketCode,
@@ -857,6 +867,7 @@ fn box_control(
     let components = divergences.artifact.components();
     let (found, box_queried) = {
         let program = HeadBoxes {
+            governor: governor.clone(),
             divergences: &mut *divergences,
             enclosed: &mut *enclosed,
         };
@@ -889,12 +900,14 @@ fn box_control(
     let mut disagreements = Vec::new();
     for support in &queried {
         let by_masks = HeadOracle {
+            governor: governor.clone(),
             divergences: &mut *divergences,
             row: None,
         }
         .separate(support)?;
         let by_boxes = BoxSeparationOracle::new(
             HeadBoxes {
+                governor: governor.clone(),
                 divergences: &mut *divergences,
                 enclosed: &mut *enclosed,
             },
@@ -945,6 +958,7 @@ struct TransplantReport {
 
 /// Ranks `support` by its risk `R(S)` among every support of its size, from the exhaustive oracle.
 fn transplant_rank(
+    governor: &MemoryGovernor,
     divergences: &mut Divergences<'_>,
     heads: usize,
     support: &ComponentSet,
@@ -955,6 +969,7 @@ fn transplant_rank(
     let size = support.len();
     let mut risk = |candidate: &ComponentSet| -> Result<(Option<f64>, Option<f64>), String> {
         let evidence = HeadOracle {
+            governor: governor.clone(),
             divergences: &mut *divergences,
             row: None,
         }
@@ -1163,6 +1178,7 @@ fn risk(heads: usize, evidence: &EvidenceStatus<HeadMask, HeadMaskFamily>) -> Ri
 }
 
 fn main() -> Result<(), String> {
+    let governor = MemoryGovernor::global();
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 7 {
         return Err(USAGE.to_string());
@@ -1219,7 +1235,7 @@ fn main() -> Result<(), String> {
         "native_logits",
         (export.sequences * config.seq_len, config.vocab),
     )?;
-    let mut divergences = Divergences::new(&teacher, &artifact, &export.tokens)?;
+    let mut divergences = Divergences::new(governor, &teacher, &artifact, &export.tokens)?;
     let (largest, sequence, witness) =
         induction_network::teacher_vs_torch(&divergences.induction.reference, &torch_logits, config.seq_len);
     let teacher_vs_torch = Measured {
@@ -1239,6 +1255,7 @@ fn main() -> Result<(), String> {
 
     let (baseline, artifact_all_on) = {
         let mut oracle = HeadOracle {
+            governor: governor.clone(),
             divergences: &mut divergences,
             row: None,
         };
@@ -1273,9 +1290,9 @@ fn main() -> Result<(), String> {
         .collect();
     // The rankings: heads by descending single-deletion risk over every induction row, and per row.
     let without = |component: usize| Ok(HeadMask(((1u32 << components) - 1) & !(1 << component)));
-    let ranking = deletion_ranking(&mut HeadOracle { divergences: &mut divergences, row: None }, without)?;
+    let ranking = deletion_ranking(&mut HeadOracle { governor: governor.clone(), divergences: &mut divergences, row: None }, without)?;
     let row_rankings = (0..rows)
-        .map(|row| deletion_ranking(&mut HeadOracle { divergences: &mut divergences, row: Some(row) }, without))
+        .map(|row| deletion_ranking(&mut HeadOracle { governor: governor.clone(), divergences: &mut divergences, row: Some(row) }, without))
         .collect::<Result<Vec<_>, _>>()?;
     let mut reports = Vec::with_capacity(entries.len());
     let mut box_enclosures = BTreeMap::new();
@@ -1292,7 +1309,7 @@ fn main() -> Result<(), String> {
                         let members =
                             entry.support.iter().map(|name| component_of(heads, name)).collect::<Result<Vec<_>, _>>()?;
                         let support = ComponentSet::new(components, members).map_err(|error| error.to_string())?;
-                        Some(transplant_rank(&mut divergences, heads, &support, transplant.top_share, transplant.asserted)?)
+                        Some(transplant_rank(governor, &mut divergences, heads, &support, transplant.top_share, transplant.asserted)?)
                     }
                     None => None,
                 }
@@ -1315,6 +1332,7 @@ fn main() -> Result<(), String> {
         let (search, exhaustive_queried) = {
             let mut recording = Recording {
                 oracle: HeadOracle {
+                    governor: governor.clone(),
                     divergences: &mut divergences,
                     row: None,
                 },
@@ -1324,6 +1342,7 @@ fn main() -> Result<(), String> {
             (found, recording.queried)
         };
         let control = box_control(
+            governor,
             &mut divergences,
             &mut box_enclosures,
             &code,
@@ -1389,6 +1408,7 @@ fn main() -> Result<(), String> {
         let mut size_counts = vec![0usize; components + 1];
         for row in 0..rows {
             let mut oracle = HeadOracle {
+                governor: governor.clone(),
                 divergences: &mut divergences,
                 row: Some(row),
             };
@@ -1473,6 +1493,7 @@ fn main() -> Result<(), String> {
                 // The rows of a sequence are `T − n … T − 2`, so there are `n − 1` of them.
                 let segment = divergences.induction.rows.iter().filter(|(row_sequence, _)| *row_sequence == sequence).count() + 1;
                 let row = position_row(
+                    governor,
                     &artifact,
                     &export.tokens[sequence],
                     &divergences.induction.reference[sequence],
@@ -1617,6 +1638,7 @@ struct PositionRowReport {
 /// The code is the padded head code over the instances, `L(C, k) + L_int(H) + k·H`; the report also gives the code
 /// that sends each distinct kept head once.
 fn position_row(
+    governor: &MemoryGovernor,
     artifact: &HeadNetwork,
     tokens: &[i64],
     reference: &Rows,
@@ -1636,7 +1658,7 @@ fn position_row(
     };
     let mut enclosed = BTreeMap::new();
     let (baseline, all_on) = {
-        let mut program = ScopedBoxes { artifact, tokens, reference, family, instances: &instances, enclosed: &mut enclosed };
+        let mut program = ScopedBoxes { governor: governor.clone(), artifact, tokens, reference, family, instances: &instances, enclosed: &mut enclosed };
         (program.enclose(&vertex(Vec::new())?)?.evidence, program.enclose(&vertex((0..count).collect())?)?.evidence)
     };
     let &EvidenceStatus::Exact { value: do_nothing, .. } = &baseline else {
@@ -1646,7 +1668,7 @@ fn position_row(
     // The ranking: instances by descending single-deletion divergence, the proven lower end at the vertex with only
     // that instance off, index order on ties.
     let ranking = {
-        let mut program = ScopedBoxes { artifact, tokens, reference, family, instances: &instances, enclosed: &mut enclosed };
+        let mut program = ScopedBoxes { governor: governor.clone(), artifact, tokens, reference, family, instances: &instances, enclosed: &mut enclosed };
         let mut scored = Vec::with_capacity(count);
         for component in 0..count {
             let without = vertex((0..count).filter(|&other| other != component).collect())?;
@@ -1658,7 +1680,7 @@ fn position_row(
     let mut tolerances = Vec::with_capacity(fractions.len());
     for &fraction in fractions {
         let tolerance = fraction * do_nothing;
-        let program = ScopedBoxes { artifact, tokens, reference, family, instances: &instances, enclosed: &mut enclosed };
+        let program = ScopedBoxes { governor: governor.clone(), artifact, tokens, reference, family, instances: &instances, enclosed: &mut enclosed };
         let oracle = BoxSeparationOracle::new(program, tolerance).map_err(|error| format!("{error:?}"))?;
         let mut oracle = Logged::new(oracle, format!("row=({sequence}, {position}) fraction={fraction:.3e}"));
         let found = ranked_support(&mut oracle, &ranking, tolerance);
@@ -1707,7 +1729,7 @@ fn position_row(
                     moved[rest].positions = (0..=position).filter(|&other| other != at).collect();
                 }
                 let mut null_enclosed = BTreeMap::new();
-                let mut program = ScopedBoxes { artifact, tokens, reference, family, instances: &moved, enclosed: &mut null_enclosed };
+                let mut program = ScopedBoxes { governor: governor.clone(), artifact, tokens, reference, family, instances: &moved, enclosed: &mut null_enclosed };
                 let status = program.enclose(&vertex(members.clone())?)?.evidence;
                 let names = members.iter().map(|&member| moved[member].name()).collect();
                 (names, Some(Bounds::of(&status)))

@@ -1,5 +1,6 @@
 use super::*;
 
+use gam_runtime::resource::MemoryGovernor;
 use gam_sae::parameter_decomposition::surface::run_parameter_decomposition;
 use ndarray::ArrayD;
 use npyz::WriterBuilder;
@@ -27,7 +28,8 @@ pub(crate) fn run_parameter_decomposition_cli(args: ParameterDecompositionArgs) 
             )));
         }
     }
-    let output = run_parameter_decomposition(&request, &tensors)
+    // The CLI is a process entry, so the run reserves on the process-wide ledger.
+    let output = run_parameter_decomposition(&request, &tensors, MemoryGovernor::global())
         .map_err(|err| CliError::from(err.to_string()))?;
     let report = output
         .report_json()
@@ -172,6 +174,7 @@ mod tests {
         let in_memory = run_parameter_decomposition(
             request,
             &BTreeMap::from([("w".to_string(), matrix.into_dyn())]),
+            &MemoryGovernor::with_budget_bytes(1 << 30),
         )
         .expect("in-memory run");
         let report = std::fs::read_to_string(out.join("report.json")).expect("read report");

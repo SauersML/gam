@@ -364,6 +364,7 @@ impl ParameterSource for ComponentMlp {
     /// formed.
     fn apply_linear(
         &self,
+        governor: &MemoryGovernor,
         parameter_use: ParameterUse<'_>,
         orientation: TieOrientation,
         rows: ArrayView2<'_, f64>,
@@ -384,7 +385,7 @@ impl ParameterSource for ComponentMlp {
             TieOrientation::Transpose => stored.reversed_axes(),
         };
         check("linear input width", applied.ncols(), rows.ncols())?;
-        let reservation = MemoryGovernor::global()
+        let reservation = governor
             .try_reserve_dense_f64(rows.nrows(), applied.nrows(), "component MLP linear map")
             .map_err(MlpBindingError::Memory)?;
         Ok(reservation.bind(rows.dot(&applied.t())))
@@ -407,6 +408,7 @@ impl ParameterSource for ComponentMlp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parameter_decomposition::test_support::test_governor;
     use crate::parameter_decomposition::test_support::component_mlp::{
         HIDDEN, READ_IN_COMPONENTS, ROWS, WIDTH, WRITE_OUT_COMPONENTS, bitwise_equal, mask_family,
         random_block, uniform,
@@ -439,7 +441,7 @@ mod tests {
     ) -> Governed<Array2<f64>> {
         let assignment = block.mask_assignment(mask).expect("mask assignment");
         program
-            .execute(block, &assignment, vec![inputs.clone()], Vec::new(), &positions())
+            .execute(test_governor(), block, &assignment, vec![inputs.clone()], Vec::new(), &positions())
             .expect("program execution")
             .output
     }
@@ -525,6 +527,7 @@ mod tests {
         let native = block.native().execute(inputs.view()).expect("native block");
         let (all_on, all_on_residuals) = program
             .refinement_residuals(
+                test_governor(),
                 &block,
                 &MaskAssignment::all_on(),
                 vec![inputs.clone()],
@@ -553,7 +556,7 @@ mod tests {
             })
             .expect("partial mask assignment");
         let (masked, masked_residuals) = program
-            .refinement_residuals(&block, &partial, vec![inputs.clone()], Vec::new(), &positions())
+            .refinement_residuals(test_governor(), &block, &partial, vec![inputs.clone()], Vec::new(), &positions())
             .expect("partial program");
         assert!(
             masked_residuals.len() == 2 && masked_residuals.iter().all(|residual| !residual.all_on),
@@ -589,20 +592,21 @@ mod tests {
         }
 
         let identity = block
-            .apply_linear(at(MlpParameter::ReadInWeight), TieOrientation::Identity, inputs.view())
+            .apply_linear(test_governor(), at(MlpParameter::ReadInWeight), TieOrientation::Identity, inputs.view())
             .expect("an identity use of W₁");
         assert!(
             bitwise_equal(&identity, &inputs.dot(&block.native().read_in().t())),
             "an identity use must apply x W₁ᵀ"
         );
         let transposed = block
-            .apply_linear(at(MlpParameter::ReadInWeight), TieOrientation::Transpose, hidden.view())
+            .apply_linear(test_governor(), at(MlpParameter::ReadInWeight), TieOrientation::Transpose, hidden.view())
             .expect("a transposed use of W₁");
         assert!(
             bitwise_equal(&transposed, &hidden.dot(&block.native().read_in())),
             "a transposed use must apply x W₁"
         );
         let crossed = block.apply_linear(
+            test_governor(),
             at(MlpParameter::ReadInWeight),
             TieOrientation::Identity,
             hidden.view(),
@@ -616,6 +620,7 @@ mod tests {
             "hidden rows must be refused by an identity use of W₁, got {crossed:?}"
         );
         let bias_as_matrix = block.apply_linear(
+            test_governor(),
             at(MlpParameter::ReadInBias),
             TieOrientation::Identity,
             inputs.view(),

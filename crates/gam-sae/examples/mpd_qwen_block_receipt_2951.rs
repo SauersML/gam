@@ -31,6 +31,7 @@
 //!     --run RUN_DIR --settings settings.json --out report.json
 //! ```
 
+use gam_runtime::resource::MemoryGovernor;
 use gam_sae::parameter_decomposition::apply::FactorView;
 use gam_sae::parameter_decomposition::occurrence::PositionScope;
 use gam_sae::parameter_decomposition::receipts::{
@@ -53,7 +54,7 @@ const READS: [&str; 3] = ["gate_proj.weight", "up_proj.weight", "down_proj.weigh
 const STAGES: [&str; 5] = ["gate", "activation", "up", "hidden", "output"];
 
 fn main() -> ExitCode {
-    match run() {
+    match run(MemoryGovernor::global()) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(error) => {
@@ -263,8 +264,8 @@ fn external<'a>(run: &'a Run, setting: &str, stage_name: &str) -> Result<&'a Arr
         .ok_or_else(|| format!("no executed {stage_name} for setting {setting:?}"))
 }
 
-fn swiglu_receipt(run: &Run, case: &Case) -> Result<SwigluBlockReceipt, String> {
-    swiglu_block_receipt(SwigluBlockReceiptInputs {
+fn swiglu_receipt(governor: &MemoryGovernor, run: &Run, case: &Case) -> Result<SwigluBlockReceipt, String> {
+    swiglu_block_receipt(governor, SwigluBlockReceiptInputs {
         inputs: run.inputs.view(),
         gate: edited_read(run, &case.edits, "gate_proj.weight")?,
         up: edited_read(run, &case.edits, "up_proj.weight")?,
@@ -525,7 +526,7 @@ fn norm_receipt(manifest: &Value, run: &Run) -> Result<(Value, bool), String> {
     ))
 }
 
-fn run() -> Result<bool, String> {
+fn run(governor: &MemoryGovernor) -> Result<bool, String> {
     let args: Vec<String> = std::env::args().collect();
     let run_dir = flag(&args, "--run")?;
     let declaration = read_json(&flag(&args, "--settings")?)?;
@@ -546,7 +547,7 @@ fn run() -> Result<bool, String> {
             edits: setting_edits(setting, &run)?,
             externals: name.clone(),
         };
-        let receipt = swiglu_receipt(&run, &case)?;
+        let receipt = swiglu_receipt(governor, &run, &case)?;
         let agrees = certified(&receipt).iter().all(|entry| entry.1.agrees);
         passed &= agrees;
         println!("[setting] {name} certified_stages_agree={agrees}");
@@ -578,7 +579,7 @@ fn run() -> Result<bool, String> {
             .find(|setting| setting.get("name").and_then(Value::as_str) == Some(native_name))
             .ok_or_else(|| format!("a control names an unknown native setting {native_name:?}"))?;
         let case = control_case(control, native, &run)?;
-        let receipt = swiglu_receipt(&run, &case)?;
+        let receipt = swiglu_receipt(governor, &run, &case)?;
         let differences = executed_differences(control, &run)?;
         let held = control_held(control, &receipt, &differences)?;
         passed &= held;

@@ -952,6 +952,7 @@ pub trait ParameterSource {
     /// identity use and `A = Theta^T` for a transposed one.
     fn apply_linear(
         &self,
+        governor: &MemoryGovernor,
         parameter: ParameterUse<'_>,
         orientation: TieOrientation,
         rows: ArrayView2<'_, f64>,
@@ -1085,13 +1086,14 @@ impl Program {
     /// Runs the entry body on `inputs` with state slots starting at `slots`.
     pub fn execute<S: ParameterSource>(
         &self,
+        governor: &MemoryGovernor,
         source: &S,
         masks: &MaskAssignment,
         inputs: Vec<Array2<f64>>,
         slots: Vec<Option<Array2<f64>>>,
         positions: &[i64],
     ) -> Result<Execution, ExecutionError<S::Error>> {
-        let mut executor = Executor::new(self, source, masks, slots, positions, false)?;
+        let mut executor = Executor::new(self, governor, source, masks, slots, positions, false)?;
         let output = executor.run(inputs)?;
         Ok(Execution { output, slots: executor.slots })
     }
@@ -1101,13 +1103,14 @@ impl Program {
     /// mechanism and its native reference.
     pub fn refinement_residuals<S: ParameterSource>(
         &self,
+        governor: &MemoryGovernor,
         source: &S,
         masks: &MaskAssignment,
         inputs: Vec<Array2<f64>>,
         slots: Vec<Option<Array2<f64>>>,
         positions: &[i64],
     ) -> Result<(Execution, Vec<RefinementResidual>), ExecutionError<S::Error>> {
-        let mut executor = Executor::new(self, source, masks, slots, positions, true)?;
+        let mut executor = Executor::new(self, governor, source, masks, slots, positions, true)?;
         let output = executor.run(inputs)?;
         let residuals = executor.residuals.take().unwrap_or_default();
         Ok((Execution { output, slots: executor.slots }, residuals))
@@ -1121,19 +1124,21 @@ impl Program {
 type NodeValue = Governed<Array2<f64>>;
 
 /// Reserves the footprint of a `rows x cols` value the executor is about to form.
-fn admit<E>(rows: usize, cols: usize) -> Result<MemoryReservation, ExecutionError<E>> {
-    MemoryGovernor::global()
+fn admit<E>(governor: &MemoryGovernor, rows: usize, cols: usize) -> Result<MemoryReservation, ExecutionError<E>> {
+    governor
         .try_reserve_dense_f64(rows, cols, "mechanism program value")
         .map_err(|error| ExecutionError::Memory { error })
 }
 
 /// A copy of `rows` under a reservation taken before the copy is made.
-fn governed_copy<E>(rows: &Array2<f64>) -> Result<NodeValue, ExecutionError<E>> {
-    Ok(admit(rows.nrows(), rows.ncols())?.bind(rows.clone()))
+fn governed_copy<E>(governor: &MemoryGovernor, rows: &Array2<f64>) -> Result<NodeValue, ExecutionError<E>> {
+    Ok(admit(governor, rows.nrows(), rows.ncols())?.bind(rows.clone()))
 }
 
 struct Executor<'a, S> {
     program: &'a Program,
+    /// The ledger every value the executor forms is reserved on.
+    governor: &'a MemoryGovernor,
     source: &'a S,
     masks: BTreeMap<MaskGroupId, Vec<(&'a [CallSite], f64)>>,
     slots: Vec<Option<Array2<f64>>>,
@@ -1148,6 +1153,7 @@ struct Executor<'a, S> {
 impl<'a, S: ParameterSource> Executor<'a, S> {
     fn new(
         program: &'a Program,
+        governor: &'a MemoryGovernor,
         source: &'a S,
         masks: &'a MaskAssignment,
         slots: Vec<Option<Array2<f64>>>,
@@ -1177,6 +1183,7 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
         let slot_reservations = std::iter::repeat_with(|| None).take(slots.len()).collect();
         Ok(Self {
             program,
+            governor,
             source,
             masks: index,
             slots,
@@ -1190,7 +1197,7 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
         // The caller's inputs are moved under reservations for the run, not copied.
         let inputs = inputs
             .into_iter()
-            .map(|rows| Ok(admit(rows.nrows(), rows.ncols())?.bind(rows)))
+            .map(|rows| Ok(admit(self.governor, rows.nrows(), rows.ncols())?.bind(rows)))
             .collect::<Result<Vec<_>, ExecutionError<S::Error>>>()?;
         let mut path = Vec::new();
         self.body(self.program.parts.entry, inputs, &mut path)
@@ -1308,15 +1315,16 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
             let node_id = NodeId(i as u32);
             let site = CallSite { body: body_id, node: node_id, stage: 0 };
             let value = match node {
-                Node::Input { port } => governed_copy(&inputs[*port as usize])?,
+                Node::Input { port } => governed_copy(self.governor, &inputs[*port as usize])?,
                 Node::Read { slot } => governed_copy(
+                    self.governor,
                     self.slots[slot.index()]
                         .as_ref()
                         .ok_or(ProgramError::SlotUnwritten { slot: *slot })?,
                 )?,
                 Node::Write { slot, value } => {
-                    let written = governed_copy(argument(&values, body_id, *value)?)?;
-                    let reservation = admit(written.nrows(), written.ncols())?;
+                    let written = governed_copy(self.governor, argument(&values, body_id, *value)?)?;
+                    let reservation = admit(self.governor, written.nrows(), written.ncols())?;
                     self.slots[slot.index()] = Some((*written).clone());
                     self.slot_reservations[slot.index()] = Some(reservation);
                     written
@@ -1326,7 +1334,7 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
                 }
                 Node::Sum { terms } => self.sum(site, terms, &values, path)?,
                 Node::Compose { value, stages } => {
-                    let mut current = governed_copy(argument(&values, body_id, *value)?)?;
+                    let mut current = governed_copy(self.governor, argument(&values, body_id, *value)?)?;
                     for (k, stage) in stages.iter().enumerate() {
                         let m = stage
                             .control
@@ -1334,7 +1342,7 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
                         if m == 0.0 {
                             continue;
                         }
-                        let stage_input = governed_copy(&current)?;
+                        let stage_input = governed_copy(self.governor, &current)?;
                         path.push(CallSite { stage: k as u32, ..site });
                         let staged = self.body(stage.body, vec![stage_input], path);
                         path.pop();
@@ -1358,14 +1366,14 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
                     current
                 }
                 Node::Call { body: callee, arguments } => {
-                    let passed = collect_arguments(&values, body_id, arguments)?;
+                    let passed = collect_arguments(self.governor, &values, body_id, arguments)?;
                     path.push(site);
                     let called = self.body(*callee, passed, path);
                     path.pop();
                     called?
                 }
                 Node::Refine { native, mechanism, arguments } => {
-                    let passed = collect_arguments(&values, body_id, arguments)?;
+                    let passed = collect_arguments(self.governor, &values, body_id, arguments)?;
                     path.push(site);
                     let refined = self.refine(site, *native, *mechanism, passed, path);
                     path.pop();
@@ -1412,7 +1420,7 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
                 };
                 let rows = self
                     .source
-                    .apply_linear(parameter_use, *orientation, x.view())
+                    .apply_linear(self.governor, parameter_use, *orientation, x.view())
                     .map_err(|error| ExecutionError::Source { body, node, parameter: *weight, error })?;
                 if rows.nrows() != x.nrows() {
                     return Err(ProgramError::RowCountChanged {
@@ -1436,14 +1444,14 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
                     }
                     .into());
                 }
-                let reservation = admit(x.nrows(), x.ncols())?;
+                let reservation = admit(self.governor, x.nrows(), x.ncols())?;
                 let mut rows = x.clone();
                 rows += &vector;
                 Ok((reservation, rows))
             }
             NativePrimitive::SwiGlu => {
                 let up = argument(values, body, arguments[1])?;
-                let reservation = admit(x.nrows(), x.ncols())?;
+                let reservation = admit(self.governor, x.nrows(), x.ncols())?;
                 swiglu_hidden(x.view(), up.view()).map(|rows| (reservation, rows)).map_err(|error| {
                     ExecutionError::Program(ProgramError::GatedRewrite { body, node, error })
                 })
@@ -1455,9 +1463,10 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
                 let value_rows = argument(values, body, arguments[2])?;
                 let attention = RotaryCausalAttention::new(*geometry, rotary.clone(), *score_scale)
                     .map_err(attention_error)?;
-                let reservation = admit(x.nrows(), x.ncols())?;
+                let reservation = admit(self.governor, x.nrows(), x.ncols())?;
                 let attended = attention
                     .attend_projected(
+                        self.governor,
                         ProjectedRows::exact(x.view()),
                         ProjectedRows::exact(keys.view()),
                         ProjectedRows::exact(value_rows.view()),
@@ -1468,7 +1477,7 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
             }
             NativePrimitive::RmsNorm { epsilon, gain } => {
                 let gain_vector = self.parameter_vector(*gain, site, path)?;
-                let reservation = admit(x.nrows(), x.ncols())?;
+                let reservation = admit(self.governor, x.nrows(), x.ncols())?;
                 MaskedNorm::Rms { epsilon: *epsilon, gain: gain_vector.view() }
                     .apply(x.view())
                     .map(|rows| (reservation, rows))
@@ -1476,7 +1485,7 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
             }
             NativePrimitive::HeadRmsNorm { head_dim, epsilon, gain } => {
                 let gain_vector = self.parameter_vector(*gain, site, path)?;
-                let reservation = admit(x.nrows(), x.ncols())?;
+                let reservation = admit(self.governor, x.nrows(), x.ncols())?;
                 head_rms_norm(x.view(), *head_dim, *epsilon, gain_vector.view())
                     .map(|rows| (reservation, rows))
                     .map_err(|error| ExecutionError::Program(ProgramError::GatedRewrite { body, node, error }))
@@ -1484,7 +1493,7 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
             NativePrimitive::LayerNorm { epsilon, gain, bias } => {
                 let gain_vector = self.parameter_vector(*gain, site, path)?;
                 let bias_vector = self.parameter_vector(*bias, site, path)?;
-                let reservation = admit(x.nrows(), x.ncols())?;
+                let reservation = admit(self.governor, x.nrows(), x.ncols())?;
                 MaskedNorm::Layer {
                     epsilon: *epsilon,
                     gain: gain_vector.view(),
@@ -1495,7 +1504,7 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
                 .map_err(|error| ExecutionError::Program(ProgramError::GatedRewrite { body, node, error }))
             }
             NativePrimitive::Activation { activation } => {
-                let reservation = admit(x.nrows(), x.ncols())?;
+                let reservation = admit(self.governor, x.nrows(), x.ncols())?;
                 let mut rows = x.clone();
                 for entry in rows.iter_mut() {
                     *entry = activation
@@ -1515,7 +1524,7 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
                     }
                     .into());
                 }
-                let reservation = admit(x.nrows(), x.ncols())?;
+                let reservation = admit(self.governor, x.nrows(), x.ncols())?;
                 Ok((reservation, x * y))
             }
             NativePrimitive::CoordinateMask { controls } => {
@@ -1528,7 +1537,7 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
                     }
                     .into());
                 }
-                let reservation = admit(x.nrows(), x.ncols())?;
+                let reservation = admit(self.governor, x.nrows(), x.ncols())?;
                 let mut rows = x.clone();
                 for (c, &control) in controls.iter().enumerate() {
                     let m = self.resolve(control, path);
@@ -1557,7 +1566,7 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
         path: &[CallSite],
     ) -> Result<NodeValue, ExecutionError<S::Error>> {
         let first = argument(values, site.body, terms[0].value)?;
-        let reservation = admit(first.nrows(), first.ncols())?;
+        let reservation = admit(self.governor, first.nrows(), first.ncols())?;
         let mut total: Option<Array2<f64>> = None;
         for term in terms {
             let x = argument(values, site.body, term.value)?;
@@ -1603,7 +1612,7 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
             let chosen = if all_on { native } else { mechanism };
             return self.body(chosen, arguments, path);
         }
-        let native_arguments = arguments.iter().map(|rows| governed_copy(rows)).collect::<Result<Vec<_>, _>>()?;
+        let native_arguments = arguments.iter().map(|rows| governed_copy(self.governor, rows)).collect::<Result<Vec<_>, _>>()?;
         let native_output = self.body(native, native_arguments, path)?;
         let mechanism_output = self.body(mechanism, arguments, path)?;
         if native_output.dim() != mechanism_output.dim() {
@@ -1668,13 +1677,14 @@ fn argument<E>(
 }
 
 fn collect_arguments<E>(
+    governor: &MemoryGovernor,
     values: &[Option<NodeValue>],
     body: BodyId,
     arguments: &[NodeId],
 ) -> Result<Vec<NodeValue>, ExecutionError<E>> {
     arguments
         .iter()
-        .map(|&node| governed_copy(argument(values, body, node)?))
+        .map(|&node| governed_copy(governor, argument(values, body, node)?))
         .collect()
 }
 
@@ -2029,6 +2039,7 @@ impl ParameterSource for DenseParameters {
 
     fn apply_linear(
         &self,
+        governor: &MemoryGovernor,
         parameter_use: ParameterUse<'_>,
         orientation: TieOrientation,
         rows: ArrayView2<'_, f64>,
@@ -2036,8 +2047,8 @@ impl ParameterSource for DenseParameters {
         let parameter = parameter_use.parameter;
         match self.tensor(parameter_use)? {
             DenseTensor::Matrix(matrix) => match orientation {
-                TieOrientation::Identity => native_linear(matrix.view(), rows),
-                TieOrientation::Transpose => native_linear(matrix.t(), rows),
+                TieOrientation::Identity => native_linear(governor, matrix.view(), rows),
+                TieOrientation::Transpose => native_linear(governor, matrix.t(), rows),
             }
             .map_err(|error| DenseParameterError::Apply { parameter, error }),
             DenseTensor::Vector(..) => Err(DenseParameterError::NotAMatrix { parameter }),
@@ -2887,6 +2898,7 @@ impl ParameterSource for LiftSource<'_> {
 
     fn apply_linear(
         &self,
+        governor: &MemoryGovernor,
         parameter: ParameterUse<'_>,
         orientation: TieOrientation,
         rows: ArrayView2<'_, f64>,
@@ -2898,8 +2910,9 @@ impl ParameterSource for LiftSource<'_> {
             .get(storage)
             .ok_or_else(|| LiftSourceError::MissingAnchor { storage: storage.clone() })?;
         match parameter.controls {
-            [] => anchor.native_apply(rows, orientation),
+            [] => anchor.native_apply(governor, rows, orientation),
             [residual, components @ ..] => anchor.apply(
+                governor,
                 &AnchorMask { residual: *residual, components: components.to_vec() },
                 rows,
                 orientation,
@@ -2925,6 +2938,8 @@ mod tests {
     //! operation rounds and the comparisons are exact.
 
     use super::*;
+
+    use crate::parameter_decomposition::test_support::test_governor;
     use crate::parameter_decomposition::apply::FactoredEdit;
     use crate::parameter_decomposition::lift::ComponentCoefficients;
     use ndarray::array;
@@ -2991,7 +3006,7 @@ mod tests {
 
     fn run<S: ParameterSource>(program: &Program, source: &S, masks: &MaskAssignment, x: &Array2<f64>) -> Array2<f64> {
         program
-            .execute(source, masks, vec![x.clone()], Vec::new(), &row_positions(x))
+            .execute(test_governor(), source, masks, vec![x.clone()], Vec::new(), &row_positions(x))
             .expect("execution of a valid program")
             .output
             .to_owned()
@@ -3218,7 +3233,7 @@ mod tests {
         assert_eq!(run(&program, &source, &half, &x), row_map(&row_map(&row_map(&x, &r), &diagonal), &u));
 
         let (execution, residuals) = program
-            .refinement_residuals(&source, &MaskAssignment::all_on(), vec![x.clone()], Vec::new(), &row_positions(&x))
+            .refinement_residuals(test_governor(), &source, &MaskAssignment::all_on(), vec![x.clone()], Vec::new(), &row_positions(&x))
             .expect("residual execution");
         assert_eq!(*execution.output, native_output);
         assert_eq!(residuals.len(), 1);
@@ -3242,7 +3257,7 @@ mod tests {
         ));
 
         let (half_execution, half_residuals) = program
-            .refinement_residuals(&source, &half, vec![x.clone()], Vec::new(), &row_positions(&x))
+            .refinement_residuals(test_governor(), &source, &half, vec![x.clone()], Vec::new(), &row_positions(&x))
             .expect("residual execution");
         assert!(!half_residuals[0].all_on);
         assert_eq!(*half_execution.output, run(&program, &source, &half, &x));
@@ -3316,7 +3331,7 @@ mod tests {
             deleted.set(MaskGroupId(0), deep.clone(), 0.0).expect("a new scope");
             assert_eq!(run(program, &source, &deleted, &x), array![[0.0, 0.0]]);
             let (execution, residuals) = program
-                .refinement_residuals(&source, &deleted, vec![x.clone()], Vec::new(), &row_positions(&x))
+                .refinement_residuals(test_governor(), &source, &deleted, vec![x.clone()], Vec::new(), &row_positions(&x))
                 .expect("residual execution");
             assert_eq!(*execution.output, array![[0.0, 0.0]]);
             assert!(!residuals[0].all_on);
@@ -3434,6 +3449,7 @@ mod tests {
         assert!(silu_derivatives(f64::NAN)[0].is_nan());
         assert!(matches!(
             activation_program(NativeActivation::Silu).execute(
+                test_governor(),
                 &source,
                 &MaskAssignment::all_on(),
                 vec![array![[f64::NAN]]],
@@ -3596,17 +3612,17 @@ mod tests {
         .expect("a valid program");
         let source = DenseParameters::new(vec![DenseTensor::Matrix(w.clone())]);
         let execution = program
-            .execute(&source, &MaskAssignment::all_on(), Vec::new(), vec![Some(x.clone())], &[0])
+            .execute(test_governor(), &source, &MaskAssignment::all_on(), Vec::new(), vec![Some(x.clone())], &[0])
             .expect("a written slot");
         let updated = &x + &row_map(&x, &w);
         assert_eq!(*execution.output, updated);
         assert_eq!(execution.slots, vec![Some(updated)]);
         assert!(matches!(
-            program.execute(&source, &MaskAssignment::all_on(), Vec::new(), vec![None], &[0]),
+            program.execute(test_governor(), &source, &MaskAssignment::all_on(), Vec::new(), vec![None], &[0]),
             Err(ExecutionError::Program(ProgramError::SlotUnwritten { .. }))
         ));
         assert!(matches!(
-            program.execute(&source, &MaskAssignment::all_on(), Vec::new(), Vec::new(), &[0]),
+            program.execute(test_governor(), &source, &MaskAssignment::all_on(), Vec::new(), Vec::new(), &[0]),
             Err(ExecutionError::Program(ProgramError::SlotCount { expected: 1, found: 0 }))
         ));
 
@@ -3621,7 +3637,7 @@ mod tests {
             Err(ProgramError::DuplicateMaskScope { .. })
         ));
         assert!(matches!(
-            program.execute(&source, &masks, Vec::new(), vec![Some(x.clone())], &[0]),
+            program.execute(test_governor(), &source, &masks, Vec::new(), vec![Some(x.clone())], &[0]),
             Err(ExecutionError::Program(ProgramError::UnknownMaskGroup { .. }))
         ));
 
@@ -3636,7 +3652,7 @@ mod tests {
         .expect("a valid program");
         assert_eq!(anchored.output_mask_dependence().degree(), Some(1));
         assert!(matches!(
-            anchored.execute(&source, &MaskAssignment::all_on(), vec![x.clone()], Vec::new(), &[0]),
+            anchored.execute(test_governor(), &source, &MaskAssignment::all_on(), vec![x.clone()], Vec::new(), &[0]),
             Err(ExecutionError::Source { error: DenseParameterError::Controlled { .. }, .. })
         ));
     }
@@ -3702,6 +3718,7 @@ mod tests {
         // The owner's refusal of an invalid epsilon reaches the caller unchanged.
         assert!(matches!(
             build(NativePrimitive::RmsNorm { epsilon: -1.0, gain: ParameterSlot(0) }, 1).execute(
+                test_governor(),
                 &source,
                 &MaskAssignment::all_on(),
                 vec![x.clone()],
@@ -3754,7 +3771,7 @@ mod tests {
         assert_ne!(normed, row_wide, "the per-head norm is not the row-wide norm");
         let odd = array![[1.0, 2.0, 3.0]];
         assert!(matches!(
-            program.execute(&source, &MaskAssignment::all_on(), vec![odd.clone()], Vec::new(), &row_positions(&odd)),
+            program.execute(test_governor(), &source, &MaskAssignment::all_on(), vec![odd.clone()], Vec::new(), &row_positions(&odd)),
             Err(ExecutionError::Program(ProgramError::GatedRewrite {
                 error: GatedRewriteError::ShapeMismatch { .. },
                 ..
@@ -3792,7 +3809,7 @@ mod tests {
         .expect("a valid program");
         let source = DenseParameters::new(Vec::new());
         let output = program
-            .execute(&source, &MaskAssignment::all_on(), vec![gate.clone(), up.clone()], Vec::new(), &row_positions(&gate))
+            .execute(test_governor(), &source, &MaskAssignment::all_on(), vec![gate.clone(), up.clone()], Vec::new(), &row_positions(&gate))
             .expect("SwiGLU execution")
             .output;
         assert_eq!(*output, swiglu_hidden(gate.view(), up.view()).expect("finite rows of one shape"));
@@ -3801,6 +3818,7 @@ mod tests {
         // The owner's shape refusal reaches the caller unchanged.
         assert!(matches!(
             program.execute(
+                test_governor(),
                 &source,
                 &MaskAssignment::all_on(),
                 vec![gate.clone(), array![[0.0], [1.0]]],
@@ -3864,7 +3882,7 @@ mod tests {
         ]);
         let positions = [0_i64, 1, 2];
         let output = program
-            .execute(&source, &MaskAssignment::all_on(), vec![x.clone()], Vec::new(), &positions)
+            .execute(test_governor(), &source, &MaskAssignment::all_on(), vec![x.clone()], Vec::new(), &positions)
             .expect("attention execution")
             .output;
         let owner = RotaryCausalAttention::new(geometry, attention_rotary(), 0.75)
@@ -3872,6 +3890,7 @@ mod tests {
         let (queries, keys, value_rows) = (row_map(&x, &w_q), row_map(&x, &w_k), row_map(&x, &w_v));
         let expected = owner
             .attend_projected(
+                test_governor(),
                 ProjectedRows::exact(queries.view()),
                 ProjectedRows::exact(keys.view()),
                 ProjectedRows::exact(value_rows.view()),
@@ -3883,7 +3902,7 @@ mod tests {
         // Positive control: moving one position changes the rotary scores, so the
         // execution's positions reach the node.
         let shifted = program
-            .execute(&source, &MaskAssignment::all_on(), vec![x.clone()], Vec::new(), &[0, 1, 5])
+            .execute(test_governor(), &source, &MaskAssignment::all_on(), vec![x.clone()], Vec::new(), &[0, 1, 5])
             .expect("attention execution")
             .output;
         assert_ne!(*shifted, *output);
@@ -3894,7 +3913,7 @@ mod tests {
         ));
         // Positions that do not name every row are refused by the owner.
         assert!(matches!(
-            program.execute(&source, &MaskAssignment::all_on(), vec![x.clone()], Vec::new(), &[0, 1]),
+            program.execute(test_governor(), &source, &MaskAssignment::all_on(), vec![x.clone()], Vec::new(), &[0, 1]),
             Err(ExecutionError::Program(ProgramError::Attention { .. }))
         ));
         assert_eq!(program.output_mask_dependence().degree(), Some(0));
@@ -4078,6 +4097,7 @@ mod tests {
         // the owner refuses rows of width 2.
         assert!(matches!(
             build(TieOrientation::Identity).execute(
+                test_governor(),
                 &source,
                 &MaskAssignment::all_on(),
                 vec![x.clone()],
@@ -4461,7 +4481,7 @@ mod tests {
             .expect("the native body's read binds");
         assert_eq!(run(&refined, &source, &MaskAssignment::all_on(), &x), x.dot(&fixture.w.t()));
         assert!(matches!(
-            refined.execute(&source, &global(&[(0, 0.5)]), vec![x.clone()], Vec::new(), &row_positions(&x)),
+            refined.execute(test_governor(), &source, &global(&[(0, 0.5)]), vec![x.clone()], Vec::new(), &row_positions(&x)),
             Err(ExecutionError::Source {
                 error: LiftSourceError::UnboundRead { parameter: ParameterSlot(0), body: BodyId(2), node: NodeId(1) },
                 ..
@@ -4487,7 +4507,7 @@ mod tests {
         let site = UseSiteId::read(&w, 0);
         let identity = UseMap::Linear(TieOrientation::Identity);
         assert_eq!(
-            tied.apply_linear(first, TieOrientation::Transpose, x.slice(ndarray::s![.., ..2])).err(),
+            tied.apply_linear(test_governor(), first, TieOrientation::Transpose, x.slice(ndarray::s![.., ..2])).err(),
             Some(LiftSourceError::MapMismatch {
                 site: site.clone(),
                 registered: identity,
@@ -4500,12 +4520,12 @@ mod tests {
         );
         // Positive control: the registered orientation reads the teacher.
         assert_eq!(
-            tied.apply_linear(first, TieOrientation::Identity, x.view()).expect("the bound read").to_owned(),
+            tied.apply_linear(test_governor(), first, TieOrientation::Identity, x.view()).expect("the bound read").to_owned(),
             x.dot(&fixture.w.t())
         );
     }
 
-    /// A dense source that records the process's admissible budget at every product, so a
+    /// A dense source that records its governor's admissible budget at every product, so a
     /// test reads which values the executor holds under reservations while a source runs.
     struct RecordingSource {
         dense: DenseParameters,
@@ -4517,12 +4537,13 @@ mod tests {
 
         fn apply_linear(
             &self,
+            governor: &MemoryGovernor,
             parameter: ParameterUse<'_>,
             orientation: TieOrientation,
             rows: ArrayView2<'_, f64>,
         ) -> Result<Governed<Array2<f64>>, Self::Error> {
-            self.remaining.borrow_mut().push(MemoryGovernor::global().remaining_bytes());
-            self.dense.apply_linear(parameter, orientation, rows)
+            self.remaining.borrow_mut().push(governor.remaining_bytes());
+            self.dense.apply_linear(governor, parameter, orientation, rows)
         }
 
         fn vector(&self, parameter: ParameterUse<'_>) -> Result<Array1<f64>, Self::Error> {
@@ -4531,9 +4552,9 @@ mod tests {
     }
 
     /// Every value the executor forms is reserved before it is formed and released when
-    /// its last reader has run. The process-wide ledger is read inside the source, so the
-    /// run is alone in its process (nextest runs each test in its own). Before the
-    /// executor reserved its own values, both products read nothing reserved.
+    /// its last reader has run. The run reserves on a private governor, so its ledger holds
+    /// only this run's values. Before the executor reserved its own values, both products
+    /// read nothing reserved.
     #[test]
     fn every_value_the_executor_forms_is_reserved_while_it_is_live() {
         let w1 = array![[1.0, -0.5, 0.25], [0.5, 2.0, -1.0]];
@@ -4562,9 +4583,10 @@ mod tests {
             remaining: std::cell::RefCell::new(Vec::new()),
         };
         let bytes = |rows: usize, cols: usize| rows * cols * std::mem::size_of::<f64>();
-        let before = MemoryGovernor::global().remaining_bytes();
+        let governor = MemoryGovernor::with_budget_bytes(1 << 20);
+        let before = governor.remaining_bytes();
         let execution = program
-            .execute(&source, &MaskAssignment::all_on(), vec![x.clone()], Vec::new(), &row_positions(&x))
+            .execute(&governor, &source, &MaskAssignment::all_on(), vec![x.clone()], Vec::new(), &row_positions(&x))
             .expect("execution of a valid program");
         assert_eq!(*execution.output, row_map(&row_map(&x, &w1).mapv(|t| t.max(0.0)), &w2));
         let recorded = source.remaining.borrow().clone();
@@ -4576,12 +4598,12 @@ mod tests {
         assert_eq!(before - recorded[1], bytes(4, 3) + bytes(4, 2));
         // After the run only the output the caller holds is reserved, and dropping it
         // releases the last of it.
-        assert_eq!(before - MemoryGovernor::global().remaining_bytes(), bytes(4, 5));
+        assert_eq!(before - governor.remaining_bytes(), bytes(4, 5));
         drop(execution);
-        assert_eq!(MemoryGovernor::global().remaining_bytes(), before);
+        assert_eq!(governor.remaining_bytes(), before);
     }
 
-    /// A value that does not fit the process's memory budget is refused as a typed
+    /// A value that does not fit the governor's memory budget is refused as a typed
     /// `ExecutionError::Memory` before it is formed, and the values reserved before it are
     /// released. The test holds the ledger (bookkeeping, no allocation) down to less than two
     /// input footprints: the caller's input is admitted, and the Input node's copy is refused.
@@ -4600,17 +4622,20 @@ mod tests {
         })
         .expect("a valid program");
         let source = DenseParameters::new(vec![DenseTensor::Matrix(w.clone())]);
-        let governor = MemoryGovernor::global();
+        let governor = MemoryGovernor::with_budget_bytes(1 << 20);
         let input_bytes = x.len() * std::mem::size_of::<f64>();
         let left = 2 * input_bytes - 1;
         let hold = governor
             .try_reserve(governor.remaining_bytes() - left, "test: hold the budget below two inputs")
             .expect("a ledger hold within the budget");
         assert_eq!(governor.remaining_bytes(), left);
-        let refused = program.execute(&source, &MaskAssignment::all_on(), vec![x.clone()], Vec::new(), &row_positions(&x));
+        let refused = program.execute(&governor, &source, &MaskAssignment::all_on(), vec![x.clone()], Vec::new(), &row_positions(&x));
         assert!(matches!(refused, Err(ExecutionError::Memory { .. })), "the Input node's copy does not fit");
         assert_eq!(governor.remaining_bytes(), left, "the admitted input was released with the refusal");
         drop(hold);
-        assert_eq!(run(&program, &source, &MaskAssignment::all_on(), &x), row_map(&x, &w));
+        let admitted = program
+            .execute(&governor, &source, &MaskAssignment::all_on(), vec![x.clone()], Vec::new(), &row_positions(&x))
+            .expect("the released budget admits the run");
+        assert_eq!(*admitted.output, row_map(&x, &w));
     }
 }

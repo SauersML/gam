@@ -94,6 +94,7 @@
 //! `code_bits` (one number) and `refuted_shorter`. Reports from before the ranked search carried
 //! `code_status`, a `code_bits` bracket and `edges` from a minimum-code search; they are not comparable.
 
+use gam_runtime::resource::MemoryGovernor;
 use gam_math::gaussian_activation::GaussianActivation;
 use gam_sae::parameter_decomposition::attention::{AttentionGeometry, ProjectedRows, RotaryEmbedding, RotaryPairing};
 use gam_sae::parameter_decomposition::block::{AttentionLayerReads, NativeAttentionLayer, linear_read};
@@ -414,14 +415,15 @@ impl Network {
     }
 
     /// The logits at `=` for the three embedding rows the positions read.
-    fn forward(&self, rows: [ArrayView1<'_, f64>; 3]) -> Result<Logits, String> {
-        self.forward_within(rows, None)
+    fn forward(&self, governor: &MemoryGovernor, rows: [ArrayView1<'_, f64>; 3]) -> Result<Logits, String> {
+        self.forward_within(governor, rows, None)
     }
 
     /// The logits at `=` for embedding rows that lie within `radius` of the rows the exact network reads
     /// (none: the rows are exact).
     fn forward_within(
         &self,
+        governor: &MemoryGovernor,
         rows: [ArrayView1<'_, f64>; 3],
         radius: Option<[ArrayView1<'_, f64>; 3]>,
     ) -> Result<Logits, String> {
@@ -446,7 +448,7 @@ impl Network {
         };
         let layer = self
             .attention
-            .execute(AttentionLayerReads::native(), embedded, &POSITIONS)
+            .execute(governor, AttentionLayerReads::native(), embedded, &POSITIONS)
             .map_err(|error| error.to_string())?;
         let last = POSITIONS.len() - 1;
         let stream = layer.output.slice(s![last..last + 1, ..]);
@@ -460,11 +462,11 @@ impl Network {
             (values, radius)
         };
         let read_in = ProjectedRows { values: stream, radius: stream_radius };
-        let (read, read_radius) = linear_read(self.mlp.read_in(), read_in).map_err(|error| text(&error))?;
+        let (read, read_radius) = linear_read(governor, self.mlp.read_in(), read_in).map_err(|error| text(&error))?;
         let (summed, summed_radius) = biased((*read).to_owned(), read_radius, self.mlp.bias_in());
         let activations = self.mlp.activate(summed.view()).map_err(|error| text(&error))?;
         let write_out = ProjectedRows { values: activations.view(), radius: summed_radius.view() };
-        let (write, write_radius) = linear_read(self.mlp.write_out(), write_out).map_err(|error| text(&error))?;
+        let (write, write_radius) = linear_read(governor, self.mlp.write_out(), write_out).map_err(|error| text(&error))?;
         let (written, written_radius) = biased((*write).to_owned(), write_radius, self.mlp.bias_out());
         let mut hidden = stream.to_owned();
         hidden += &written;
@@ -479,7 +481,7 @@ impl Network {
             values: hidden.view(),
             radius: hidden_radius.view().insert_axis(Axis(0)),
         };
-        let (logits, logit_radius) = linear_read(self.unembed.view(), hidden_rows).map_err(|error| text(&error))?;
+        let (logits, logit_radius) = linear_read(governor, self.unembed.view(), hidden_rows).map_err(|error| text(&error))?;
         Ok(Logits { values: logits.row(0).to_vec(), radius: logit_radius.row(0).to_vec() })
     }
 }
@@ -522,19 +524,20 @@ impl Site {
 }
 
 /// The native network on every pair `(a, b)`, row `a·p + b`.
-fn native_table(network: &Network, p: usize) -> Result<LogitTable, String> {
+fn native_table(governor: &MemoryGovernor, network: &Network, p: usize) -> Result<LogitTable, String> {
     let table = &network.table;
     let indices: Vec<usize> = (0..p * p).collect();
     let mut logits = LogitTable::new(p * p, p);
     logits.fill(0, &indices, |&index| {
         let (a, b) = (index / p, index % p);
-        network.forward([table.row(a), table.row(b), table.row(p)])
+        network.forward(governor, [table.row(a), table.row(b), table.row(p)])
     })?;
     Ok(logits)
 }
 
 /// The network with `edited` read at the site, on every pair, into rows `start..start + pairs.len()`.
 fn edited_rows(
+    governor: &MemoryGovernor,
     network: &Network,
     edited: &Array2<f64>,
     site: Site,
@@ -550,7 +553,7 @@ fn edited_rows(
             Site::Pos1 => [native.row(a), edited.row(b), native.row(p)],
             Site::Global => [edited.row(a), edited.row(b), edited.row(p)],
         };
-        network.forward(rows)
+        network.forward(governor, rows)
     })
 }
 
@@ -847,6 +850,7 @@ fn edited_table(
 /// vectors of a Gaussian matrix drawn by Box-Muller) carrying the planes' angles of `frequencies`, executed at
 /// every shift of the target. It has no codeword: it is a null edit, not a program.
 fn random_plane_rows(
+    governor: &MemoryGovernor,
     network: &Network,
     planes: &CyclicPlanes,
     frequencies: &[usize],
@@ -864,7 +868,7 @@ fn random_plane_rows(
     let mut logits = LogitTable::new(target.shifts.len() * target.pairs.len(), p);
     for (index, &shift) in target.shifts.iter().enumerate() {
         let edited = edited_table(&network.table, planes, &basis, frequencies, shift)?;
-        edited_rows(network, &edited, target.site, target.pairs, p, &mut logits, index * target.pairs.len())?;
+        edited_rows(governor, network, &edited, target.site, target.pairs, p, &mut logits, index * target.pairs.len())?;
     }
     Ok(Rows { table: Arc::new(logits), index: None, witnesses: target.reference.witnesses.clone() })
 }
@@ -899,6 +903,7 @@ struct Target<'a> {
 /// each rung of both ladders. The execution runs once: each rung's `decode_then_evaluate` decodes the
 /// program again and hands back the executed rows only when that decode equals the one executed.
 fn score_program(
+    governor: &MemoryGovernor,
     network: &Network,
     planes: &CyclicPlanes,
     frequencies: &[usize],
@@ -914,7 +919,7 @@ fn score_program(
     let mut logits = LogitTable::new(target.shifts.len() * target.pairs.len(), p);
     for (index, &shift) in target.shifts.iter().enumerate() {
         let edited = edited_table(&network.table, planes, &basis, frequencies, shift)?;
-        edited_rows(network, &edited, target.site, target.pairs, p, &mut logits, index * target.pairs.len())?;
+        edited_rows(governor, network, &edited, target.site, target.pairs, p, &mut logits, index * target.pairs.len())?;
     }
     let executed = Rows { table: Arc::new(logits), index: None, witnesses: target.reference.witnesses.clone() };
     let score = family_score(&executed, target.reference, target.family, ladders.quantiles)?;
@@ -1127,6 +1132,7 @@ impl<P: BoxDivergence> SeparationOracle for Logged<P> {
 /// table, both formations included. Its bound is the largest per-row KL from the shifted reference over both
 /// logit boxes. Free planes split in descending order of their power.
 struct PlaneBoxes<'a, 'b> {
+    governor: MemoryGovernor,
     network: &'a Network,
     contributions: &'a [Array2<f64>],
     formation: &'a Array2<f64>,
@@ -1196,6 +1202,7 @@ impl BoxDivergence for PlaneBoxes<'_, '_> {
     }
 
     fn enclose(&mut self, mask: &MaskBox) -> Result<BoxEnclosure<PlaneFamily>, String> {
+        let governor = &self.governor;
         if let Some(found) = self.enclosed.get(mask) {
             return Ok(found.clone());
         }
@@ -1218,7 +1225,7 @@ impl BoxDivergence for PlaneBoxes<'_, '_> {
                 let within = radius
                     .as_ref()
                     .map(|radius| edited.map(|row| row.map_or(zero.view(), |row| radius.row(row))));
-                let logits = network.forward_within(rows, within)?;
+                let logits = network.forward_within(governor, rows, within)?;
                 let (native_values, native_radius) = reference.row(index);
                 let status = kl_over_logit_boxes(
                     ArrayView1::from(native_values),
@@ -1275,6 +1282,7 @@ impl BoxDivergence for PlaneBoxes<'_, '_> {
 }
 
 fn main() -> Result<(), String> {
+    let governor = MemoryGovernor::global();
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 7 {
         return Err(USAGE.to_string());
@@ -1366,7 +1374,7 @@ fn main() -> Result<(), String> {
         let p = checkpoint.p;
         let started = Instant::now();
         let network = Network::load(&run, checkpoint)?;
-        let native = Arc::new(native_table(&network, p)?);
+        let native = Arc::new(native_table(governor, &network, p)?);
         let native_seconds = started.elapsed().as_secs_f64();
         let largest_radius = native.radius.iter().copied().fold(0.0_f64, f64::max);
         println!(
@@ -1414,7 +1422,7 @@ fn main() -> Result<(), String> {
         let mut site_outputs = Vec::new();
         for site in [Site::Pos0, Site::Global] {
             let mut executed = LogitTable::new(checkpoint.test_pairs.len(), p);
-            edited_rows(&network, &permuted, site, &checkpoint.test_pairs, p, &mut executed, 0)?;
+            edited_rows(governor, &network, &permuted, site, &checkpoint.test_pairs, p, &mut executed, 0)?;
             let mismatched = checkpoint
                 .test_pairs
                 .iter()
@@ -1475,7 +1483,7 @@ fn main() -> Result<(), String> {
                 if chosen.kl.iter().chain(&chosen.disagreement).all(Option::is_some) {
                     break;
                 }
-                let scored = match score_program(&network, &planes, &prefix(kept), precision, &fit_target, &ladders) {
+                let scored = match score_program(governor, &network, &planes, &prefix(kept), precision, &fit_target, &ladders) {
                     Ok(scored) => scored,
                     Err(error) => {
                         println!("[fit] {} {} K={kept} refused: {error}", checkpoint.name, site.name());
@@ -1534,7 +1542,7 @@ fn main() -> Result<(), String> {
             let baseline = family_score(&unedited, &reference, &family, ladders.quantiles)?;
             println!("[held_out] {} {} baseline {} memory={}", checkpoint.name, site.name(), score_line(&baseline), memory());
             let full_frequencies: Vec<usize> = (1..=plane_count).collect();
-            let full = score_program(&network, &planes, &full_frequencies, precision, &target, &ladders)?;
+            let full = score_program(governor, &network, &planes, &full_frequencies, precision, &target, &ladders)?;
             println!(
                 "[held_out] {} {} full set K={plane_count} bits={} {} seconds={:.1} memory={}",
                 checkpoint.name,
@@ -1558,7 +1566,7 @@ fn main() -> Result<(), String> {
             distinct.dedup();
             let mut candidates = Vec::new();
             for &kept in &distinct {
-                let scored = score_program(&network, &planes, &prefix(kept), precision, &target, &ladders)?;
+                let scored = score_program(governor, &network, &planes, &prefix(kept), precision, &target, &ladders)?;
                 println!(
                     "[held_out] {} {} K={kept} bits={} {} seconds={:.1} memory={}",
                     checkpoint.name,
@@ -1664,9 +1672,9 @@ fn main() -> Result<(), String> {
                 for &kept in met.iter().filter(|&&kept| 2 * kept <= plane_count) {
                     let mut bottom = order[plane_count - kept..].to_vec();
                     bottom.sort_unstable();
-                    let shifted = score_program(&network, &planes, &bottom, precision, &target, &ladders)?;
-                    let unmoved = score_program(&network, &planes, &bottom, precision, &unedited_target, &ladders)?;
-                    let random = random_plane_rows(&network, &planes, &prefix(kept), &mut null_rng, &target)?;
+                    let shifted = score_program(governor, &network, &planes, &bottom, precision, &target, &ladders)?;
+                    let unmoved = score_program(governor, &network, &planes, &bottom, precision, &unedited_target, &ladders)?;
+                    let random = random_plane_rows(governor, &network, &planes, &prefix(kept), &mut null_rng, &target)?;
                     let random_score = family_score(&random, &reference, &family, ladders.quantiles)?;
                     let mut rungs = Vec::new();
                     for (ladder, trained_met, tolerances) in [
@@ -1741,6 +1749,7 @@ fn main() -> Result<(), String> {
                 for &tolerance in &support.tolerances {
                     let found = {
                         let program = PlaneBoxes {
+                            governor: governor.clone(),
                             network: &network,
                             contributions: &contributions,
                             formation: &formation,
@@ -1781,7 +1790,7 @@ fn main() -> Result<(), String> {
                     };
                     let held_out = match &frequencies {
                         Some(frequencies) if !frequencies.is_empty() => {
-                            Some(score_program(&network, &planes, frequencies, precision, &target, &ladders)?)
+                            Some(score_program(governor, &network, &planes, frequencies, precision, &target, &ladders)?)
                         }
                         _ => None,
                     };

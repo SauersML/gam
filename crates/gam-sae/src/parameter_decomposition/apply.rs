@@ -245,8 +245,8 @@ impl EditFootprint {
     /// The governor is an argument rather than `MemoryGovernor::global()` read from here
     /// (#4565): the global ledger is shared by every caller in the process, so a kernel
     /// that reaches for it cannot be exercised against a budget of its own, and a test of
-    /// its admission is at the mercy of whatever else the binary is holding. Production
-    /// passes the global governor; a test passes `MemoryGovernor::with_budget_bytes`.
+    /// its admission is at the mercy of whatever else the binary is holding. The CLI and
+    /// Python entries pass the global governor; a test passes `MemoryGovernor::with_budget_bytes`.
     pub fn reserve(
         &self,
         governor: &MemoryGovernor,
@@ -281,15 +281,6 @@ impl EditReservation {
 /// term scale zero executes exactly this, bit for bit, and never reads the edit
 /// factors.
 pub fn native_linear(
-    native: ArrayView2<'_, f64>,
-    input: ArrayView2<'_, f64>,
-) -> Result<Governed<Array2<f64>>, ApplyError> {
-    native_linear_with_governor(MemoryGovernor::global(), native, input)
-}
-
-/// [`native_linear`] charging `governor` instead of the process-wide ledger (#4565), so a
-/// caller can exercise this kernel's admission against a budget of its own.
-pub fn native_linear_with_governor(
     governor: &MemoryGovernor,
     native: ArrayView2<'_, f64>,
     input: ArrayView2<'_, f64>,
@@ -306,6 +297,7 @@ pub fn native_linear_with_governor(
 /// = `m_Δ` and `term_scales` = `s`. Terms with a zero scale are never read, so
 /// the all-on setting executes [`native_linear`].
 pub fn apply_anchored_linear(
+    governor: &MemoryGovernor,
     native: ArrayView2<'_, f64>,
     anchor: f64,
     edit: FactorView<'_>,
@@ -329,7 +321,7 @@ pub fn apply_anchored_linear(
         terms,
         active.len(),
     )?;
-    let reservation = footprint.reserve(MemoryGovernor::global(), "anchored linear apply")?;
+    let reservation = footprint.reserve(governor, "anchored linear apply")?;
     let output = if active.is_empty() {
         execute_anchored(native, anchor, None, input, footprint.tile_rows)
     } else if active.len() == terms {
@@ -358,13 +350,14 @@ pub fn apply_anchored_linear(
 /// `⟨G, B_j⟩_F` is the sum over its terms (P16 labels and coefficients). A tied
 /// tensor sums the per-use contractions.
 pub fn edit_frobenius_contractions(
+    governor: &MemoryGovernor,
     edit: FactorView<'_>,
     cotangent: ArrayView2<'_, f64>,
     input: ArrayView2<'_, f64>,
 ) -> Result<Governed<Array1<f64>>, ApplyError> {
     expect_pullback_rows(edit, cotangent, input)?;
     let footprint = EditFootprint::frobenius_contractions(input.nrows(), edit.term_count())?;
-    let reservation = footprint.reserve(MemoryGovernor::global(), "edit frobenius contractions")?;
+    let reservation = footprint.reserve(governor, "edit frobenius contractions")?;
     let sums = contractions_tiled(edit, cotangent, input, footprint.tile_rows);
     Ok(reservation.result.bind(sums))
 }
@@ -382,6 +375,7 @@ pub struct FactorCotangents {
 /// contraction of term `k` is `u_kᵀ (G V)_k`. A tied tensor sums the per-use
 /// cotangents.
 pub fn edit_factor_cotangents(
+    governor: &MemoryGovernor,
     edit: FactorView<'_>,
     cotangent: ArrayView2<'_, f64>,
     input: ArrayView2<'_, f64>,
@@ -393,7 +387,7 @@ pub fn edit_factor_cotangents(
         edit.output_dim(),
         edit.term_count(),
     )?;
-    let reservation = footprint.reserve(MemoryGovernor::global(), "edit factor cotangents")?;
+    let reservation = footprint.reserve(governor, "edit factor cotangents")?;
     let cotangents = cotangents_tiled(edit, cotangent, input, footprint.tile_rows);
     Ok(reservation.result.bind(cotangents))
 }
@@ -571,6 +565,7 @@ fn checked_sum(parts: &[usize], context: &'static str) -> Result<usize, ApplyErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parameter_decomposition::test_support::test_governor;
     use gam_linalg::roundoff::{accumulation_band, accumulation_growth};
     use ndarray::Zip;
 
@@ -640,7 +635,7 @@ mod tests {
             let direct = input.dot(&edited.t());
             let band = anchored_band(&native, anchor, &left, &right, &scales, &input);
             let factored =
-                apply_anchored_linear(native.view(), anchor, edit.view(), scales.view(), input.view())
+                apply_anchored_linear(test_governor(), native.view(), anchor, edit.view(), scales.view(), input.view())
                     .expect("a small edit is admitted");
             assert!(
                 within_band(&factored, &direct, &band),
@@ -671,7 +666,7 @@ mod tests {
         let direct = input.dot(&edited.t());
         let band = anchored_band(&native, 0.5, &left, &right, &scales, &input);
         let wrong =
-            apply_anchored_linear(native.view(), 0.5, edit.view(), perturbed.view(), input.view())
+            apply_anchored_linear(test_governor(), native.view(), 0.5, edit.view(), perturbed.view(), input.view())
                 .expect("a small edit is admitted");
         assert!(
             !within_band(&wrong, &direct, &band),
@@ -692,8 +687,8 @@ mod tests {
         let edit = FactoredEdit::new(left.clone(), right.clone()).expect("finite factors");
         let zeros = Array1::<f64>::zeros(terms);
         let native_output =
-            native_linear(native.view(), input.view()).expect("a small apply is admitted");
-        let all_on = apply_anchored_linear(native.view(), 1.0, edit.view(), zeros.view(), input.view())
+            native_linear(test_governor(), native.view(), input.view()).expect("a small apply is admitted");
+        let all_on = apply_anchored_linear(test_governor(), native.view(), 1.0, edit.view(), zeros.view(), input.view())
             .expect("a small apply is admitted");
         assert!(
             native_output.iter().all(|value| value.is_finite()),
@@ -762,7 +757,7 @@ mod tests {
         let gradient = cotangent.t().dot(&input);
         let dense = Array1::from_shape_fn(terms, |k| left.column(k).dot(&gradient.dot(&right.column(k))));
         let band = contraction_band(&left, &right, &cotangent, &input);
-        let contractions = edit_frobenius_contractions(edit, cotangent.view(), input.view())
+        let contractions = edit_frobenius_contractions(test_governor(), edit, cotangent.view(), input.view())
             .expect("small contractions are admitted");
         assert!(
             vector_within_band(&contractions, &dense, &band),
@@ -809,7 +804,7 @@ mod tests {
             .t()
             .dot(&cotangent.mapv(f64::abs).dot(&left.mapv(f64::abs)))
             .mapv(|sum| rounded_band(n_rows * output_dim + 1, sum));
-        let cotangents = edit_factor_cotangents(edit, cotangent.view(), input.view())
+        let cotangents = edit_factor_cotangents(test_governor(), edit, cotangent.view(), input.view())
             .expect("small cotangents are admitted");
         assert!(
             within_band(&cotangents.left, &dense_left, &left_band),
@@ -885,12 +880,12 @@ mod tests {
             .expect("factor shapes agree");
         let scales = Array1::from(vec![0.5, -0.5, 1.0]);
         assert!(
-            apply_anchored_linear(native.view(), 1.0, edit.view(), scales.view(), input.view()).is_ok(),
+            apply_anchored_linear(test_governor(), native.view(), 1.0, edit.view(), scales.view(), input.view()).is_ok(),
             "a well-shaped apply must be admitted (positive control)"
         );
         let short = Array1::from(vec![0.5, -0.5]);
         assert_eq!(
-            apply_anchored_linear(native.view(), 1.0, edit.view(), short.view(), input.view()).err(),
+            apply_anchored_linear(test_governor(), native.view(), 1.0, edit.view(), short.view(), input.view()).err(),
             Some(ApplyError::Shape {
                 operand: "term scales",
                 expected: (3, 1),

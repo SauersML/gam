@@ -67,6 +67,7 @@
 //! tried in order up to the first whose vertices separate; if none does, the control is reported missing, not passed.
 //! A failed control fails the run.
 
+use gam_runtime::resource::MemoryGovernor;
 use gam_sae::parameter_decomposition::attention::AttentionGeometry;
 use gam_sae::parameter_decomposition::block::{AttentionLayerReads, ComponentAttentionLayer, ComponentMasks, ProjectionRead};
 use gam_sae::parameter_decomposition::codec::PaddedPacketCode;
@@ -267,7 +268,7 @@ impl ComponentNetwork {
     /// The logits of one sequence, `T × vocab`, with their radius: on the stored reads with no controls, or with
     /// the key and value reads through their components, each declared circuit's components under `sides`
     /// (`Free` reads `1/2 ± 1/2`) and every other circuit's on.
-    fn logits(&self, tokens: &[i64], decompositions: &[Decomposition], sides: Option<&[Sides]>) -> Result<Rows, String> {
+    fn logits(&self, governor: &MemoryGovernor, tokens: &[i64], decompositions: &[Decomposition], sides: Option<&[Sides]>) -> Result<Rows, String> {
         let network = &self.network;
         let width = network.heads * self.model_dim;
         let controls: Vec<[(Array2<f64>, Option<Array2<f64>>); 2]> = (0..network.layers.len())
@@ -316,7 +317,7 @@ impl ComponentNetwork {
                 }
             })
             .collect();
-        Ok(network.run(tokens, &reads)?.0)
+        Ok(network.run(governor, tokens, &reads)?.0)
     }
 }
 
@@ -382,6 +383,7 @@ struct GroupFamily {
 
 /// The component network as a box program for `supports::BoxSeparationOracle`.
 struct ComponentBoxes<'a, 'b> {
+    governor: MemoryGovernor,
     artifact: &'a ComponentNetwork,
     decompositions: &'a [Decomposition],
     groups: &'a [Group],
@@ -417,6 +419,7 @@ impl BoxDivergence for ComponentBoxes<'_, '_> {
     }
 
     fn enclose(&mut self, mask: &MaskBox) -> Result<BoxEnclosure<GroupFamily>, String> {
+        let governor = &self.governor;
         if let Some(found) = self.enclosed.get(mask) {
             return Ok(found.clone());
         }
@@ -425,7 +428,7 @@ impl BoxDivergence for ComponentBoxes<'_, '_> {
         let (artifact, decompositions, tokens) = (self.artifact, self.decompositions, self.tokens);
         let rows = self
             .induction
-            .at(mask, |sequence| artifact.logits(&tokens[sequence], decompositions, Some(&sides)))?;
+            .at(mask, |sequence| artifact.logits(governor, &tokens[sequence], decompositions, Some(&sides)))?;
         let status = if mask.is_vertex() {
             match InductionRows::largest(&rows) {
                 Largest::Resolved { value, error } => {
@@ -607,6 +610,7 @@ fn haar(rng: &mut StdRng, n: usize) -> Result<Array2<f64>, String> {
 }
 
 fn main() -> Result<(), String> {
+    let governor = MemoryGovernor::global();
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 7 {
         return Err(USAGE.to_string());
@@ -679,7 +683,7 @@ fn main() -> Result<(), String> {
     };
     let names: Vec<String> = groups.iter().map(|group| group_name(&decompositions, group)).collect();
 
-    let mut induction = InductionRows::new(&export.tokens, |tokens| teacher.logits(tokens, &decompositions, None))?;
+    let mut induction = InductionRows::new(&export.tokens, |tokens| teacher.logits(governor, tokens, &decompositions, None))?;
     let torch_logits = float64_array(&export.files, &export_dir, "native_logits", (export.sequences * config.seq_len, config.vocab))?;
     let (teacher_vs_torch, _, _) = induction_network::teacher_vs_torch(&induction.reference, &torch_logits, config.seq_len);
 
@@ -695,7 +699,7 @@ fn main() -> Result<(), String> {
         .collect();
     let (mut tail_logit_gap, mut tail_logit_radius) = (0.0_f64, 0.0_f64);
     for (sequence, tokens) in export.tokens.iter().enumerate() {
-        let resolved = teacher.logits(tokens, &decompositions, Some(&resolved_only))?;
+        let resolved = teacher.logits(governor, tokens, &decompositions, Some(&resolved_only))?;
         let reference = &induction.reference[sequence];
         for ((entry, &value), &radius) in resolved.values.indexed_iter().zip(resolved.radius.iter()) {
             let gap = (value - reference.values[entry]).abs();
@@ -713,7 +717,7 @@ fn main() -> Result<(), String> {
     let mut enclosed = BTreeMap::new();
     let evaluate = |induction: &mut InductionRows, mask: &MaskBox| {
         let sides = group_sides(&decompositions, &groups, mask);
-        induction.at(mask, |sequence| artifact.logits(&export.tokens[sequence], &decompositions, Some(&sides)))
+        induction.at(mask, |sequence| artifact.logits(governor, &export.tokens[sequence], &decompositions, Some(&sides)))
     };
     let baseline = Risk::of(&evaluate(&mut induction, &all_off)?);
     let artifact_all_on = Risk::of(&evaluate(&mut induction, &all_on)?);
@@ -730,7 +734,7 @@ fn main() -> Result<(), String> {
 
     let mut or_controls = Vec::new();
     for circuit in 0..decompositions.len() {
-        let Some(control) = or_control(&teacher, &decompositions, &groups, &names, circuit, &export.tokens)? else {
+        let Some(control) = or_control(governor, &teacher, &decompositions, &groups, &names, circuit, &export.tokens)? else {
             println!("[or-control] circuit {circuit}: not applicable, its first group is not component 0 alone or it has no tail row");
             continue;
         };
@@ -765,6 +769,7 @@ fn main() -> Result<(), String> {
     for &(scale, declared, tolerance) in &entries {
         let search = {
             let program = ComponentBoxes {
+                governor: governor.clone(),
                 artifact: &artifact,
                 decompositions: &decompositions,
                 groups: &groups,
@@ -860,7 +865,7 @@ fn main() -> Result<(), String> {
                     let rotated = teacher.refactored(factors)?;
                     let (null_artifact, _) = rotated.decoded(&decompositions, &groups_of_rotated(&decompositions), precision)?;
                     let rows = induction
-                        .evaluate(|sequence| null_artifact.logits(&export.tokens[sequence], &decompositions, Some(&sides)))?;
+                        .evaluate(|sequence| null_artifact.logits(governor, &export.tokens[sequence], &decompositions, Some(&sides)))?;
                     haar_risks.push(Risk::of(&rows));
                 }
                 let values: Vec<f64> = haar_risks.iter().filter_map(|risk| risk.value).collect();
@@ -976,6 +981,7 @@ fn groups_of_rotated(decompositions: &[Decomposition]) -> Vec<Group> {
 /// enclosure, the refinement or the shrink is wrong. `None` when the circuit's first group is not component 0 alone,
 /// or it has no tail row to plant the copy in.
 fn or_control(
+    governor: &MemoryGovernor,
     teacher: &ComponentNetwork,
     decompositions: &[Decomposition],
     groups: &[Group],
@@ -1015,9 +1021,10 @@ fn or_control(
         ComponentSet::new(count, off.to_vec()).map(|off| off.complement()).map_err(|error| error.to_string())
     };
 
-    let mut rows = InductionRows::new(tokens, |sequence_tokens| teacher.logits(sequence_tokens, decompositions, None))?;
+    let mut rows = InductionRows::new(tokens, |sequence_tokens| teacher.logits(governor, sequence_tokens, decompositions, None))?;
     let mut enclosed = BTreeMap::new();
     let mut program = ComponentBoxes {
+        governor: governor.clone(),
         artifact: &planted,
         decompositions,
         groups: &planted_groups,

@@ -469,6 +469,7 @@ impl std::error::Error for OccurrenceError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parameter_decomposition::test_support::test_governor;
     use crate::parameter_decomposition::field::FieldCoefficient;
     use gam_linalg::roundoff::accumulation_growth;
     use ndarray::{Array1, Array2, Axis, array};
@@ -708,7 +709,7 @@ mod tests {
         delta: &FactoredEdit,
     ) -> Result<f64, OccurrenceError> {
         edit_cotangent(registry, scope, per_use)?
-            .frobenius_inner(&FieldCoefficient::Factored {
+            .frobenius_inner(test_governor(), &FieldCoefficient::Factored {
                 left: delta.left().to_owned(),
                 right: delta.right().to_owned(),
             })
@@ -1244,7 +1245,7 @@ mod tests {
         )
         .expect("both uses have one term");
         let paired = cotangent
-            .frobenius_inner(&FieldCoefficient::Factored {
+            .frobenius_inner(test_governor(), &FieldCoefficient::Factored {
                 left: delta.left().to_owned(),
                 right: delta.right().to_owned(),
             })

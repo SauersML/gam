@@ -14,6 +14,7 @@
 //! worst ratio of error to band. No `d_out × d_in` edit is formed anywhere.
 
 use gam_linalg::roundoff::{accumulation_band, accumulation_growth};
+use gam_runtime::resource::MemoryGovernor;
 use gam_sae::parameter_decomposition::apply::{
     EditFootprint, FactoredEdit, apply_anchored_linear, edit_factor_cotangents,
     edit_frobenius_contractions, native_linear,
@@ -39,6 +40,7 @@ fn parse(args: &[String], index: usize, name: &str) -> Result<usize, String> {
 }
 
 fn main() -> Result<(), String> {
+    let governor = MemoryGovernor::global();
     let args: Vec<String> = std::env::args().collect();
     let n_rows = parse(&args, 1, "ROWS")?.max(1);
     let input_dim = parse(&args, 2, "D_IN")?;
@@ -88,16 +90,16 @@ fn main() -> Result<(), String> {
 
     for rep in 0..reps {
         let started = Instant::now();
-        let floor = native_linear(native.view(), input.view());
+        let floor = native_linear(governor, native.view(), input.view());
         let native_s = started.elapsed().as_secs_f64();
         let started = Instant::now();
-        let edited = apply_anchored_linear(native.view(), 1.0, edit.view(), scales.view(), input.view());
+        let edited = apply_anchored_linear(governor, native.view(), 1.0, edit.view(), scales.view(), input.view());
         let apply_s = started.elapsed().as_secs_f64();
         let started = Instant::now();
-        let contractions = edit_frobenius_contractions(edit.view(), cotangent.view(), input.view());
+        let contractions = edit_frobenius_contractions(governor, edit.view(), cotangent.view(), input.view());
         let contractions_s = started.elapsed().as_secs_f64();
         let started = Instant::now();
-        let cotangents = edit_factor_cotangents(edit.view(), cotangent.view(), input.view());
+        let cotangents = edit_factor_cotangents(governor, edit.view(), cotangent.view(), input.view());
         let cotangents_s = started.elapsed().as_secs_f64();
         println!(
             "rep={rep} native_s={native_s:.4} apply_s={apply_s:.4} edit_excess_s={:.4} contractions_s={contractions_s:.4} cotangents_s={cotangents_s:.4} ok={}/{}/{}/{}",

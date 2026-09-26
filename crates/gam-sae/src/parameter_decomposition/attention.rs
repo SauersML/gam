@@ -352,13 +352,17 @@ fn expect_heads(
     }
 }
 
-/// Reserve `copies` `heads × tokens × tokens` `f64` arrays on the process
-/// memory governor before any of them is allocated. The caller holds the
-/// reservation beside the arrays for as long as they live. A shape whose cell
-/// count overflows `usize` is refused by the governor as a size overflow.
-fn reserve_heads(shape: (usize, usize, usize), copies: usize) -> Result<MemoryReservation, AttentionProgramError> {
+/// Reserve `copies` `heads × tokens × tokens` `f64` arrays on `governor`
+/// before any of them is allocated. The caller holds the reservation beside the
+/// arrays for as long as they live. A shape whose cell count overflows `usize`
+/// is refused by the governor as a size overflow.
+fn reserve_heads(
+    governor: &MemoryGovernor,
+    shape: (usize, usize, usize),
+    copies: usize,
+) -> Result<MemoryReservation, AttentionProgramError> {
     let (heads, tokens, keys) = shape;
-    MemoryGovernor::global()
+    governor
         .try_reserve_dense_f64_copies(heads.saturating_mul(tokens), keys, copies, "attention scores and weights")
         .map_err(AttentionProgramError::Memory)
 }
@@ -655,6 +659,7 @@ impl RotaryCausalAttention {
     /// `tokens × n_kv_heads·head_dim`. Each input radius enters as a box bound (see the module docs).
     pub fn attend_projected(
         &self,
+        governor: &MemoryGovernor,
         queries: ProjectedRows<'_>,
         keys: ProjectedRows<'_>,
         values: ProjectedRows<'_>,
@@ -674,7 +679,7 @@ impl RotaryCausalAttention {
             expect_shape(name, radius_dim, (tokens, width))?;
         }
         // Scores, score radius, weights and weight radius, before anything is allocated.
-        let footprint = reserve_heads((heads, tokens, tokens), 4)?;
+        let footprint = reserve_heads(governor, (heads, tokens, tokens), 4)?;
         let queries = self.rotate(queries, positions, heads);
         let keys = self.rotate(keys, positions, g.n_kv_heads);
         // The `head_dim` products and their additions, then σ.
@@ -741,6 +746,7 @@ impl RotaryCausalAttention {
     /// reserved on the process memory governor before they are allocated.
     pub fn weights_at_scores(
         &self,
+        governor: &MemoryGovernor,
         scores: ArrayView3<'_, f64>,
         score_radius: ArrayView3<'_, f64>,
     ) -> Result<AttentionWeights, AttentionProgramError> {
@@ -748,7 +754,7 @@ impl RotaryCausalAttention {
         let shape = (self.geometry.n_heads, tokens, tokens);
         expect_heads("scores", scores.dim(), shape)?;
         expect_heads("score radius", score_radius.dim(), shape)?;
-        let footprint = reserve_heads(shape, 2)?;
+        let footprint = reserve_heads(governor, shape, 2)?;
         let (weights, weight_radius) = self.causal_softmax(scores, score_radius)?;
         Ok(AttentionWeights {
             weights,
@@ -1007,6 +1013,7 @@ impl NativeAttention {
     /// values, attend, and project the output.
     pub fn execute(
         &self,
+        governor: &MemoryGovernor,
         x: ArrayView2<f64>,
         positions: &[i64],
     ) -> Result<AttentionExecution, AttentionProgramError> {
@@ -1015,6 +1022,7 @@ impl NativeAttention {
         let (keys, key_radius) = self.normalize_keys(project_affine(&self.key, x))?;
         let (values, value_radius) = project_affine(&self.value, x);
         let projected = self.attention.attend_projected(
+            governor,
             ProjectedRows {
                 values: queries.view(),
                 radius: query_radius.view(),
@@ -1068,6 +1076,7 @@ impl NativeAttention {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parameter_decomposition::test_support::test_governor;
     use ndarray::array;
     use crate::parameter_decomposition::gated_rewrite::rms_normalizers;
     use qd::Quad;
@@ -1231,7 +1240,7 @@ mod tests {
                 identity(),
             )
             .expect("identity block")
-            .execute(x.view(), &positions)
+            .execute(test_governor(), x.view(), &positions)
             .expect("execution");
             (executed.scores[[0, 1, 0]], executed.score_radius[[0, 1, 0]])
         };
@@ -1287,6 +1296,7 @@ mod tests {
         let explicit = native
             .attention
             .attend_projected(
+                test_governor(),
                 ProjectedRows {
                     values: queries.view(),
                     radius: zero_queries.view(),
@@ -1305,6 +1315,7 @@ mod tests {
         let exact = native
             .attention
             .attend_projected(
+                test_governor(),
                 ProjectedRows::exact(queries.view()),
                 ProjectedRows::exact(keys.view()),
                 ProjectedRows::exact(values.view()),
@@ -1316,6 +1327,7 @@ mod tests {
         let widened = native
             .attention
             .attend_projected(
+                test_governor(),
                 ProjectedRows {
                     values: queries.view(),
                     radius: widened_queries.view(),
@@ -1431,6 +1443,7 @@ mod tests {
         let attention = &native.attention;
         let projected = attention
             .attend_projected(
+                test_governor(),
                 ProjectedRows::exact(queries.view()),
                 ProjectedRows::exact(keys.view()),
                 value_rows,
@@ -1441,7 +1454,7 @@ mod tests {
             arrays.iter().flat_map(|a| a.iter().map(|v| v.to_bits())).collect()
         }
         let stage = attention
-            .weights_at_scores(projected.scores.view(), projected.score_radius.view())
+            .weights_at_scores(test_governor(), projected.scores.view(), projected.score_radius.view())
             .expect("weights at attend_projected's scores");
         assert_eq!(
             bits(&[&stage.weights, &stage.weight_radius]),
@@ -1463,7 +1476,7 @@ mod tests {
         let mut moved = projected.scores.clone();
         moved[[0, 3, 1]] += 0.25;
         let moved_weights = attention
-            .weights_at_scores(moved.view(), projected.score_radius.view())
+            .weights_at_scores(test_governor(), moved.view(), projected.score_radius.view())
             .expect("moved scores")
             .weights;
         assert_ne!(row(&moved_weights, 0, 3), row(&stage.weights, 0, 3), "a moved score must move its row");
@@ -1473,7 +1486,7 @@ mod tests {
         let mut masked = projected.scores.clone();
         masked[[0, 1, 3]] = f64::NAN;
         let masked_weights = attention
-            .weights_at_scores(masked.view(), projected.score_radius.view())
+            .weights_at_scores(test_governor(), masked.view(), projected.score_radius.view())
             .expect("a NaN past the causal mask is never read")
             .weights;
         assert_eq!(
@@ -1496,7 +1509,7 @@ mod tests {
         let one_head = projected.scores.slice(ndarray::s![..1, .., ..]);
         assert_eq!(
             attention
-                .weights_at_scores(one_head, projected.score_radius.slice(ndarray::s![..1, .., ..]))
+                .weights_at_scores(test_governor(), one_head, projected.score_radius.slice(ndarray::s![..1, .., ..]))
                 .expect_err("one head for a two-head geometry"),
             AttentionProgramError::HeadShape {
                 tensor: "scores",
@@ -1543,6 +1556,7 @@ mod tests {
             )
         }
         let projected = native.attention.attend_projected(
+            test_governor(),
             ProjectedRows::exact(zeros(g.query_dim())),
             ProjectedRows::exact(zeros(g.key_value_dim())),
             ProjectedRows::exact(zeros(g.key_value_dim())),
@@ -1552,24 +1566,23 @@ mod tests {
             refused(&projected, requested(4)),
             "attend_projected must refuse its four score arrays, got {projected:?}"
         );
-        let executed = native.execute(zeros(g.model_dim), &positions);
+        let executed = native.execute(test_governor(), zeros(g.model_dim), &positions);
         assert!(
             refused(&executed, requested(4)),
             "the native execution must refuse its four score arrays, got {executed:?}"
         );
         let scores = ArrayView3::from_shape((g.n_heads, tokens, tokens).strides((0, 0, 0)), &EXACT_RADIUS[..])
             .expect("a zero-stride view reads only its one entry");
-        let weights = native.attention.weights_at_scores(scores, scores);
+        let weights = native.attention.weights_at_scores(test_governor(), scores, scores);
         assert!(
             refused(&weights, requested(2)),
             "the softmax stage must refuse its two weight arrays, got {weights:?}"
         );
     }
 
-    /// While a result lives, the process ledger holds exactly its
-    /// `heads × tokens × tokens` footprint, and dropping it releases the charge.
-    /// nextest runs each test in its own process, so the process-wide ledger sees
-    /// only this test's reservations (as in program.rs's executor ledger tests).
+    /// While a result lives, the governor's ledger holds exactly its
+    /// `heads × tokens × tokens` footprint, and dropping it releases the charge. The
+    /// test reserves on a private governor, so its ledger holds only these results.
     #[test]
     fn the_score_footprint_is_held_while_a_result_lives_and_released_on_drop() {
         let fixture = Fixture::new(RotaryPairing::HalfSplit).biased();
@@ -1577,16 +1590,16 @@ mod tests {
         let g = fixture.geometry;
         let tokens = fixture.positions.len();
         let array = gam_runtime::resource::dense_f64_bytes(g.n_heads * tokens, tokens).expect("fits in usize");
-        let governor = MemoryGovernor::global();
+        let governor = MemoryGovernor::with_budget_bytes(1 << 30);
         let idle = governor.remaining_bytes();
         let execution = native
-            .execute(fixture.x.view(), &fixture.positions)
+            .execute(&governor, fixture.x.view(), &fixture.positions)
             .expect("native execution");
         assert_eq!(execution.reserved_bytes(), 4 * array, "an execution reserves its four arrays");
         assert_eq!(idle - governor.remaining_bytes(), 4 * array, "the ledger holds them while it lives");
         let stage = native
             .attention
-            .weights_at_scores(execution.scores.view(), execution.score_radius.view())
+            .weights_at_scores(&governor, execution.scores.view(), execution.score_radius.view())
             .expect("weights at the execution's scores");
         assert_eq!(stage.reserved_bytes(), 2 * array, "the softmax stage reserves its two arrays");
         assert_eq!(idle - governor.remaining_bytes(), 6 * array, "the ledger holds both results");
@@ -1701,7 +1714,7 @@ mod tests {
         let fixture = Fixture::new(RotaryPairing::HalfSplit).biased();
         let executed = fixture
             .native()
-            .execute(fixture.x.view(), &fixture.positions)
+            .execute(test_governor(), fixture.x.view(), &fixture.positions)
             .expect("native execution");
         for head in 0..fixture.geometry.n_heads {
             for t in 0..fixture.positions.len() {
@@ -1821,6 +1834,7 @@ mod tests {
         );
         let projected = attention
             .attend_projected(
+                test_governor(),
                 ProjectedRows {
                     values: queries.view(),
                     radius: query_radius.view(),

@@ -169,11 +169,15 @@ fn code_error(error: CodecError) -> FamilyError {
     FamilyError::Code(error.to_string())
 }
 
-/// Reserves a dense state on the process memory governor before it is allocated,
-/// refusing a byte count that overflows.
-fn admit_bytes(required_bytes: Option<usize>, context: &str) -> Result<MemoryReservation, FamilyError> {
+/// Reserves a dense state on `governor` before it is allocated, refusing a byte
+/// count that overflows.
+fn admit_bytes(
+    governor: &MemoryGovernor,
+    required_bytes: Option<usize>,
+    context: &str,
+) -> Result<MemoryReservation, FamilyError> {
     let required = required_bytes.ok_or(FamilyError::BytesOverflow)?;
-    MemoryGovernor::global()
+    governor
         .try_reserve(required, context)
         .map_err(FamilyError::Memory)
 }
@@ -397,16 +401,18 @@ pub struct PrincipalField {
 /// dimension of at least the member count or above the resolved dimension, and a
 /// dense state the process memory governor does not reserve.
 pub fn principal_field(
+    governor: &MemoryGovernor,
     components: &[ArrayView2<'_, f64>],
     members: &[usize],
     dimension: usize,
 ) -> Result<PrincipalField, FamilyError> {
     let (rows, cols) = component_class(components)?;
-    principal_field_of_class(components, rows, cols, members, dimension)
+    principal_field_of_class(governor, components, rows, cols, members, dimension)
 }
 
 /// [`principal_field`] for components already checked to be one `rows x cols` class.
 fn principal_field_of_class(
+    governor: &MemoryGovernor,
     components: &[ArrayView2<'_, f64>],
     rows: usize,
     cols: usize,
@@ -424,6 +430,7 @@ fn principal_field_of_class(
     let entries = rows * cols;
     // The Gram and its eigenvectors, the center and the directions.
     let reservation = admit_bytes(
+        governor,
         n.checked_mul(n)
             .and_then(|square| square.checked_mul(2))
             .and_then(|squares| {
@@ -534,6 +541,12 @@ impl FamilyArtifact {
     pub fn message(&self) -> &BitString {
         &self.message
     }
+
+    /// Rebuilds the families the message carries, reserving the decoder's index state
+    /// on `governor` before the announced component count sizes it.
+    pub fn decode(&self, governor: &MemoryGovernor) -> Result<DecodedFamilies, FamilyError> {
+        decode_families(governor, self)
+    }
 }
 
 /// Encodes `partition` of `components` at the declared `precision`.
@@ -542,6 +555,7 @@ impl FamilyArtifact {
 /// different component count, a family whose label dimension is above its resolved
 /// dimension, and a lattice index the precision cannot decode exactly.
 pub fn encode_families(
+    governor: &MemoryGovernor,
     components: &[ArrayView2<'_, f64>],
     partition: &FamilyPartition,
     precision: DeclaredPrecision,
@@ -575,7 +589,7 @@ pub fn encode_families(
         }
         encode_subset(&mut message, remaining.len() - 1, &positions).map_err(code_error)?;
         encode_prefix_integer(&mut message, family.dimension as u64 + 1).map_err(code_error)?;
-        let field = principal_field_of_class(components, rows, cols, &family.members, family.dimension)?;
+        let field = principal_field_of_class(governor, components, rows, cols, &family.members, family.dimension)?;
         let mut coefficients: Vec<f64> = Vec::with_capacity((family.dimension + 1) * rows * cols);
         coefficients.extend(field.center.iter());
         for direction in &field.directions {
@@ -727,11 +741,17 @@ impl DecodedFamily {
     }
 }
 
-impl DecodableArtifact for FamilyArtifact {
+/// A [`FamilyArtifact`] decoded against the governor its decoder reserves on.
+struct GovernedFamilies<'a> {
+    artifact: &'a FamilyArtifact,
+    governor: &'a MemoryGovernor,
+}
+
+impl DecodableArtifact for GovernedFamilies<'_> {
     type Decoded = DecodedFamilies;
 
     fn decode(&self) -> Result<DecodedFamilies, String> {
-        decode_families(self).map_err(|error| error.to_string())
+        self.artifact.decode(self.governor).map_err(|error| error.to_string())
     }
 }
 
@@ -759,7 +779,7 @@ fn read_reals(
     code.decode().map_err(FamilyError::Code)
 }
 
-fn decode_families(artifact: &FamilyArtifact) -> Result<DecodedFamilies, FamilyError> {
+fn decode_families(governor: &MemoryGovernor, artifact: &FamilyArtifact) -> Result<DecodedFamilies, FamilyError> {
     let (rows, cols) = (artifact.rows, artifact.cols);
     let entries = rows * cols;
     let mut reader = artifact.message.reader();
@@ -774,6 +794,7 @@ fn decode_families(artifact: &FamilyArtifact) -> Result<DecodedFamilies, FamilyE
     })?;
     // The unassigned list, the placements and every member list: 4C indices.
     let reservation = admit_bytes(
+        governor,
         components.checked_mul(4 * std::mem::size_of::<usize>()),
         "family message index state",
     )?;
@@ -847,6 +868,7 @@ fn decode_families(artifact: &FamilyArtifact) -> Result<DecodedFamilies, FamilyE
 /// audit, comment 5716123817). Refuses what `decode_then_evaluate` refuses, and a
 /// status that is not exact.
 pub fn score_decoded_families<O, E, M, W, D>(
+    governor: &MemoryGovernor,
     artifact: &FamilyArtifact,
     evaluate: E,
     native_reference: &O,
@@ -857,7 +879,8 @@ where
     E: FnOnce(&DecodedFamilies) -> Result<O, String>,
     M: FnOnce(&O, &O) -> Result<EvidenceStatus<W, D>, String>,
 {
-    let fidelity = decode_then_evaluate(artifact, evaluate, native_reference, measure, tolerance)?;
+    let governed = GovernedFamilies { artifact, governor };
+    let fidelity = decode_then_evaluate(&governed, evaluate, native_reference, measure, tolerance)?;
     match fidelity.status() {
         EvidenceStatus::Exact { .. } => {}
         EvidenceStatus::UniformBound { .. } => {
@@ -886,6 +909,7 @@ fn not_the_largest_distortion(kind: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parameter_decomposition::test_support::test_governor;
     use crate::parameter_decomposition::codec::{
         code_saving_at_proven_fidelity, prefix_integer_len_bits, subset_code_len_bits,
     };
@@ -1080,7 +1104,7 @@ mod tests {
         let components = planted_components();
         let view = views(&components);
         let everyone: Vec<usize> = (0..MEMBERS).collect();
-        let field = principal_field(&view, &everyone, 2).expect("the planted field is resolved");
+        let field = principal_field(test_governor(), &view, &everyone, 2).expect("the planted field is resolved");
         assert_eq!(
             field.resolved_dimension, 2,
             "eigenvalues {:?} against the formation band {:e}",
@@ -1088,7 +1112,7 @@ mod tests {
         );
         // Guard: a label dimension above the resolved spectrum is refused; d = 2 above is
         // the positive control.
-        let refused = principal_field(&view, &everyone, 3);
+        let refused = principal_field(test_governor(), &view, &everyone, 3);
         assert!(
             matches!(refused, Err(FamilyError::UnresolvedDimension { first_member: 0, dimension: 3, resolved: 2 })),
             "got {refused:?}"
@@ -1103,7 +1127,7 @@ mod tests {
             "the d = 2 field misses the planted members by {residual:e}, above {bound:e}"
         );
         // Negative control: one label dimension fewer discards a direction the members use.
-        let reduced = principal_field(&view, &everyone, 1).expect("d = 1 is resolved");
+        let reduced = principal_field(test_governor(), &view, &everyone, 1).expect("d = 1 is resolved");
         let (reduced_residual, reduced_bound) = reproduction(&reduced, &bands(&components, &everyone, &reduced));
         assert!(
             reduced_residual > reduced_bound,
@@ -1116,7 +1140,7 @@ mod tests {
         let components = random_components();
         let view = views(&components);
         let everyone: Vec<usize> = (0..MEMBERS).collect();
-        let full = principal_field(&view, &everyone, MEMBERS - 1).expect("every centered direction is resolved");
+        let full = principal_field(test_governor(), &view, &everyone, MEMBERS - 1).expect("every centered direction is resolved");
         assert_eq!(
             full.resolved_dimension,
             MEMBERS - 1,
@@ -1135,7 +1159,7 @@ mod tests {
         );
         // A shared field through a random initialization needs n - 1 directions: one
         // fewer misses the members.
-        let truncated = principal_field(&view, &everyone, MEMBERS - 2).expect("n - 2 directions are resolved");
+        let truncated = principal_field(test_governor(), &view, &everyone, MEMBERS - 2).expect("n - 2 directions are resolved");
         let (truncated_residual, truncated_bound) =
             reproduction(&truncated, &bands(&components, &everyone, &truncated));
         assert!(
@@ -1145,7 +1169,7 @@ mod tests {
         );
         // n members span n - 1 directions: d = n is refused.
         assert!(matches!(
-            principal_field(&view, &everyone, MEMBERS),
+            principal_field(test_governor(), &view, &everyone, MEMBERS),
             Err(FamilyError::InvalidPartition(..))
         ));
     }
@@ -1156,7 +1180,7 @@ mod tests {
         let components = projector_components(instances);
         let view = views(&components);
         let everyone: Vec<usize> = (0..instances).collect();
-        let field = principal_field(&view, &everyone, 2).expect("the projector family is an affine field");
+        let field = principal_field(test_governor(), &view, &everyone, 2).expect("the projector family is an affine field");
         assert_eq!(
             field.resolved_dimension, 2,
             "the centered projectors span the two traceless symmetric directions: eigenvalues \
@@ -1164,7 +1188,7 @@ mod tests {
             field.eigenvalues, field.assembly_band
         );
         assert!(matches!(
-            principal_field(&view, &everyone, 3),
+            principal_field(test_governor(), &view, &everyone, 3),
             Err(FamilyError::UnresolvedDimension { resolved: 2, .. })
         ));
         assert_isometric_labels(&components, &everyone, &field);
@@ -1173,7 +1197,7 @@ mod tests {
             residual <= bound,
             "the d = 2 field misses the projectors by {residual:e}, above {bound:e}"
         );
-        let line = principal_field(&view, &everyone, 1).expect("d = 1 is resolved");
+        let line = principal_field(test_governor(), &view, &everyone, 1).expect("d = 1 is resolved");
         let (line_residual, line_bound) = reproduction(&line, &bands(&components, &everyone, &line));
         assert!(
             line_residual > line_bound,
@@ -1186,10 +1210,10 @@ mod tests {
         let components = planted_components();
         let view = views(&components);
         // Positive control: a valid family of three members.
-        assert!(principal_field(&view, &[0, 2, 4], 1).is_ok());
+        assert!(principal_field(test_governor(), &view, &[0, 2, 4], 1).is_ok());
         for members in [&[][..], &[2, 0][..], &[0, 6][..], &[1, 1][..]] {
             assert!(
-                matches!(principal_field(&view, members, 0), Err(FamilyError::InvalidPartition(..))),
+                matches!(principal_field(test_governor(), &view, members, 0), Err(FamilyError::InvalidPartition(..))),
                 "members {members:?} were admitted"
             );
         }
@@ -1199,7 +1223,7 @@ mod tests {
         non_finite[1][[0, 0]] = f64::NAN;
         for refused in [views(&misshapen), views(&non_finite), Vec::new()] {
             assert!(
-                matches!(principal_field(&refused, &[0, 1], 0), Err(FamilyError::InvalidComponents(..))),
+                matches!(principal_field(test_governor(), &refused, &[0, 1], 0), Err(FamilyError::InvalidComponents(..))),
                 "malformed components were admitted"
             );
         }
@@ -1415,6 +1439,7 @@ mod tests {
         native: &Executed,
     ) -> Score {
         score_decoded_families(
+            test_governor(),
             artifact,
             |decoded: &DecodedFamilies| execute_decoded(decoded, family, inputs),
             native,
@@ -1455,12 +1480,13 @@ mod tests {
             inputs,
         );
         let literal = encode_families(
+            test_governor(),
             &view,
             &FamilyPartition::literal(components.len()).expect("literal partition"),
             precision(),
         )
         .expect("the literals encode");
-        let family = encode_families(&view, &one_family(components.len(), dimension), precision())
+        let family = encode_families(test_governor(), &view, &one_family(components.len(), dimension), precision())
             .expect("the family encodes");
         let literal_score = score(&literal, MaskFamily::AllOnAndSingleDeletions, inputs, &native);
         let family_score = score(&family, MaskFamily::AllOnAndSingleDeletions, inputs, &native);
@@ -1543,6 +1569,7 @@ mod tests {
         // component, compared with the family at the one setting both execute.
         let identity = vec![Array2::<f64>::eye(2)];
         let identity_artifact = encode_families(
+            test_governor(),
             &views(&identity),
             &FamilyPartition::literal(1).expect("one component"),
             precision(),
@@ -1560,6 +1587,7 @@ mod tests {
         // restated as a uniform bound is refused; the exact status above is the positive
         // control.
         let restated = score_decoded_families(
+            test_governor(),
             &identity_artifact,
             |decoded: &DecodedFamilies| execute_decoded(decoded, MaskFamily::AllOn, &inputs),
             &native_all_on,
@@ -1610,8 +1638,8 @@ mod tests {
         };
         let partition = FamilyPartition::new(5, vec![family(&[3], 0), family(&[0, 2, 4], 1), family(&[1], 0)])
             .expect("a partition");
-        let artifact = encode_families(&view, &partition, precision()).expect("the partition encodes");
-        let decoded = artifact.decode().expect("the message decodes");
+        let artifact = encode_families(test_governor(), &view, &partition, precision()).expect("the partition encodes");
+        let decoded = artifact.decode(test_governor()).expect("the message decodes");
         assert_eq!(decoded.partition().expect("a valid decoded partition"), partition);
         assert_eq!(decoded.shape(), (rows, cols));
         assert_eq!(decoded.precision(), precision());
@@ -1621,7 +1649,7 @@ mod tests {
         let mut expected_bits = prefix_integer_len_bits(6).expect("count codeword");
         let mut unassigned = 5_usize;
         for spec in partition.families() {
-            let field = principal_field(&view, &spec.members, spec.dimension).expect("the family's field");
+            let field = principal_field(test_governor(), &view, &spec.members, spec.dimension).expect("the family's field");
             expected_bits += subset_code_len_bits(unassigned - 1, spec.members.len() - 1).expect("subset codeword")
                 + prefix_integer_len_bits(spec.dimension as u64 + 1).expect("dimension codeword");
             let mut coefficients: Vec<f64> = field.center.iter().copied().collect();
@@ -1671,13 +1699,13 @@ mod tests {
         // A trailing bit and a missing bit are refused.
         let mut trailing = artifact.message().clone();
         trailing.push_bit(false);
-        assert!(FamilyArtifact::from_message(rows, cols, trailing).expect("shape").decode().is_err());
+        assert!(FamilyArtifact::from_message(rows, cols, trailing).expect("shape").decode(test_governor()).is_err());
         let mut short = BitString::new();
         let mut reader = artifact.message().reader();
         for _ in 1..artifact.code_bits() {
             short.push_bit(reader.read_bit().expect("inside the message"));
         }
-        assert!(FamilyArtifact::from_message(rows, cols, short).expect("shape").decode().is_err());
+        assert!(FamilyArtifact::from_message(rows, cols, short).expect("shape").decode(test_governor()).is_err());
 
         // One component spans no label direction: dimension 1 is refused, while dimension
         // 0 with its twelve reals reads back.
@@ -1690,7 +1718,7 @@ mod tests {
                 .expect("reals encode")
                 .write(&mut message)
                 .expect("reals write");
-            FamilyArtifact::from_message(rows, cols, message).expect("shape").decode()
+            FamilyArtifact::from_message(rows, cols, message).expect("shape").decode(test_governor())
         };
         assert!(lone(0).is_ok(), "positive control: a literal component reads back");
         assert!(lone(1).is_err(), "a lone component announcing a label dimension must be refused");
@@ -1700,9 +1728,9 @@ mod tests {
         encode_prefix_integer(&mut huge, (1_u64 << 62) + 1).expect("count codeword");
         let refusal = FamilyArtifact::from_message(rows, cols, huge)
             .expect("shape")
-            .decode()
+            .decode(test_governor())
             .expect_err("2^62 components overflow the index state's byte count");
-        assert!(refusal.contains("overflows usize"), "{refusal}");
+        assert!(matches!(refusal, FamilyError::BytesOverflow), "{refusal}");
     }
 
     /// `field`'s instance `sum_j s_j B'_j` of `member`, read through the anchor at the mask
@@ -1732,7 +1760,7 @@ mod tests {
         let components = planted_components();
         let view = views(&components);
         let everyone: Vec<usize> = (0..MEMBERS).collect();
-        let principal = principal_field(&view, &everyone, 2).expect("the planted field is resolved");
+        let principal = principal_field(test_governor(), &view, &everyone, 2).expect("the planted field is resolved");
         let dimension = principal.directions.len();
         let family = principal.parameter_family().expect("the planted field converts");
         assert_eq!(family.field().coefficients().len(), dimension + 1);
@@ -1775,9 +1803,9 @@ mod tests {
         // The decoded family is field instances too, at the reals the message carries.
         let partition = FamilyPartition::new(MEMBERS, vec![FamilySpec { members: everyone.clone(), dimension }])
             .expect("one family");
-        let decoded = encode_families(&view, &partition, precision())
+        let decoded = encode_families(test_governor(), &view, &partition, precision())
             .expect("the family encodes")
-            .decode()
+            .decode(test_governor())
             .expect("the message decodes");
         let decoded_family = decoded.families()[0].parameter_family().expect("the decoded family converts");
         for member in 0..MEMBERS {
@@ -1800,15 +1828,16 @@ mod tests {
         }
 
         // Guard: a literal family is a native tensor, not a field (positive control above).
-        let literal = principal_field(&view, &[3], 0).expect("a literal family");
+        let literal = principal_field(test_governor(), &view, &[3], 0).expect("a literal family");
         assert!(matches!(literal.parameter_family(), Err(FamilyError::Field(..))));
         let literal_decoded = encode_families(
+            test_governor(),
             &view,
             &FamilyPartition::literal(MEMBERS).expect("literal partition"),
             precision(),
         )
         .expect("the literals encode")
-        .decode()
+        .decode(test_governor())
         .expect("the literals decode");
         assert!(matches!(
             literal_decoded.families()[0].parameter_family(),
@@ -1830,12 +1859,13 @@ mod tests {
     }
 
     fn encode_one_family(components: &[Array2<f64>], dimension: usize) -> FamilyArtifact {
-        encode_families(&views(components), &one_family(components.len(), dimension), precision())
+        encode_families(test_governor(), &views(components), &one_family(components.len(), dimension), precision())
             .expect("the family encodes")
     }
 
     fn encode_literals(components: &[Array2<f64>]) -> FamilyArtifact {
         encode_families(
+            test_governor(),
             &views(components),
             &FamilyPartition::literal(components.len()).expect("literal partition"),
             precision(),

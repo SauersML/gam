@@ -68,6 +68,7 @@ use std::sync::Arc;
 use gam_linalg::faer_ndarray::rrqr_nullspace_basis_with_cutoff;
 use gam_linalg::matrix::symmetrize_in_place;
 use gam_linalg::roundoff::accumulation_growth;
+use gam_runtime::resource::MemoryGovernor;
 use gam_terms::basis::{
     MeasureJetBasisSpec, affine_function_nullspace_form, measure_jet_band, measure_jet_energy_form,
 };
@@ -181,7 +182,11 @@ impl ParameterCotangent {
     /// outer-product term against a product-form coefficient streams through
     /// `apply`'s governed contraction, which refuses rather than allocate past
     /// its memory admission.
-    pub fn frobenius_inner(&self, coefficient: &FieldCoefficient) -> Result<f64, String> {
+    pub fn frobenius_inner(
+        &self,
+        governor: &MemoryGovernor,
+        coefficient: &FieldCoefficient,
+    ) -> Result<f64, String> {
         let mut total = 0.0;
         for term in &self.terms {
             total += match (term, coefficient) {
@@ -194,7 +199,7 @@ impl ParameterCotangent {
                 }
                 (CotangentTerm::Outer { output, input }, FieldCoefficient::Factored { left, right }) => {
                     let view = FactorView::new(left.view(), right.view()).map_err(|e| e.to_string())?;
-                    edit_frobenius_contractions(view, output.view(), input.view())
+                    edit_frobenius_contractions(governor, view, output.view(), input.view())
                         .map_err(|e| e.to_string())?
                         .sum()
                 }
@@ -207,6 +212,7 @@ impl ParameterCotangent {
     /// terms streamed through `apply`.
     fn factor_cotangents(
         &self,
+        governor: &MemoryGovernor,
         left: ArrayView2<'_, f64>,
         right: ArrayView2<'_, f64>,
     ) -> Result<(Array2<f64>, Array2<f64>), String> {
@@ -220,7 +226,7 @@ impl ParameterCotangent {
                 }
                 CotangentTerm::Outer { output, input } => {
                     let view = FactorView::new(left, right).map_err(|e| e.to_string())?;
-                    let pieces = edit_factor_cotangents(view, output.view(), input.view())
+                    let pieces = edit_factor_cotangents(governor, view, output.view(), input.view())
                         .map_err(|e| e.to_string())?;
                     g_v += &pieces.left;
                     g_t_u += &pieces.right;
@@ -450,6 +456,7 @@ impl ParameterFamily {
     /// the derivative of that lower witness's value, not of the supremum.
     pub fn pullback(
         &self,
+        governor: &MemoryGovernor,
         component_mask: ArrayView1<'_, f64>,
         residual_mask: f64,
         cotangent: &ParameterCotangent,
@@ -468,7 +475,7 @@ impl ParameterFamily {
             .field
             .coefficients
             .iter()
-            .map(|b| cotangent.frobenius_inner(b))
+            .map(|b| cotangent.frobenius_inner(governor, b))
             .collect::<Result<Array1<f64>, String>>()?;
         let weights = &gaps * &self.basis_values.dot(&inner);
         let (instances, width, dimension) = self.basis_jets.dim();
@@ -487,7 +494,7 @@ impl ParameterFamily {
             coefficients.push(match coefficient {
                 FieldCoefficient::Dense(..) => CoefficientPullback::Dense { weight: s },
                 FieldCoefficient::Factored { left, right } => {
-                    let (g_v, g_t_u) = cotangent.factor_cotangents(left.view(), right.view())?;
+                    let (g_v, g_t_u) = cotangent.factor_cotangents(governor, left.view(), right.view())?;
                     CoefficientPullback::Factored {
                         left: g_v.mapv_into(|v| s * v),
                         right: g_t_u.mapv_into(|v| s * v),
@@ -683,6 +690,7 @@ pub enum PenaltyGradient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parameter_decomposition::test_support::test_governor;
     use crate::basis::EuclideanPatchEvaluator;
     use gam_math::probability::{normal_cdf, normal_pdf};
     use faer::Side;
@@ -941,7 +949,7 @@ mod tests {
         let base = family(fx.coefficients.clone(), fx.labels.clone(), fx.weights.clone());
         let (cotangent, dense_g) = readout_cotangent(&fx, &base, &mask, residual);
         let pullback = base
-            .pullback(ArrayView1::from(&mask[..]), residual, &cotangent)
+            .pullback(test_governor(), ArrayView1::from(&mask[..]), residual, &cotangent)
             .expect("pullback");
         let anchor_weights = base
             .anchor_basis_weights(ArrayView1::from(&mask[..]), residual)
@@ -1117,7 +1125,7 @@ mod tests {
         let (cotangent, dense_g) = readout_cotangent(&fx, &base, &all_on, 1.0);
         assert!(dense_g.iter().any(|&v| v != 0.0), "the all-on cotangent is not itself zero");
         let at_all_on = base
-            .pullback(ArrayView1::from(&all_on[..]), 1.0, &cotangent)
+            .pullback(test_governor(), ArrayView1::from(&all_on[..]), 1.0, &cotangent)
             .expect("all-on pullback");
         let anchor_weights = base
             .anchor_basis_weights(ArrayView1::from(&all_on[..]), 1.0)
@@ -1137,7 +1145,7 @@ mod tests {
         // instances' labels exactly still.
         let deleted = [1.0, 0.0, 1.0];
         let moved = base
-            .pullback(ArrayView1::from(&deleted[..]), 1.0, &cotangent)
+            .pullback(test_governor(), ArrayView1::from(&deleted[..]), 1.0, &cotangent)
             .expect("pullback with instance 1 deleted");
         assert!(moved.labels.row(1).iter().any(|&v| v != 0.0), "deleted label {:?}", moved.labels);
         assert!(moved.weights[1] != 0.0, "deleted weight {:?}", moved.weights);
@@ -1224,7 +1232,7 @@ mod tests {
         )
         .expect("witness cotangent");
         let pullback = base
-            .pullback(ArrayView1::from(&mask[..]), 1.0, &cotangent)
+            .pullback(test_governor(), ArrayView1::from(&mask[..]), 1.0, &cotangent)
             .expect("witness pullback");
         let mut refuted = false;
         for c in 0..fx.labels.nrows() {

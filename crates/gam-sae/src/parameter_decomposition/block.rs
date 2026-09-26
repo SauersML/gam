@@ -64,7 +64,7 @@ use super::rewrite::{
     ComponentRead, ExactFactor, FactorRefusal,
 };
 use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
-use gam_runtime::resource::Governed;
+use gam_runtime::resource::{Governed, MemoryGovernor};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, Zip};
 use std::fmt;
 
@@ -640,11 +640,12 @@ impl NativeAttentionLayer {
     /// component read is refused: this layer holds no component factors.
     pub fn execute(
         &self,
+        governor: &MemoryGovernor,
         reads: AttentionLayerReads<'_>,
         residual: ProjectedRows<'_>,
         positions: &[i64],
     ) -> Result<AttentionLayerExecution, BlockError> {
-        execute_attention_layer(self, None, reads, residual, positions)
+        execute_attention_layer(governor, self, None, reads, residual, positions)
     }
 
     /// The rounding band of one linear read of `rows` at their absolute positions:
@@ -731,11 +732,12 @@ impl ComponentAttentionLayer {
     /// their radius against the exact rows ([`ProjectedRows::exact`] for exact rows).
     pub fn execute(
         &self,
+        governor: &MemoryGovernor,
         reads: AttentionLayerReads<'_>,
         residual: ProjectedRows<'_>,
         positions: &[i64],
     ) -> Result<AttentionLayerExecution, BlockError> {
-        execute_attention_layer(&self.native, Some(&self.factors), reads, residual, positions)
+        execute_attention_layer(governor, &self.native, Some(&self.factors), reads, residual, positions)
     }
 
     /// The rounding band of one linear read of `rows` at their absolute positions
@@ -759,6 +761,7 @@ impl ComponentAttentionLayer {
 }
 
 fn execute_attention_layer(
+    governor: &MemoryGovernor,
     layer: &NativeAttentionLayer,
     factors: Option<&[ProjectionFactor; 4]>,
     reads: AttentionLayerReads<'_>,
@@ -777,7 +780,7 @@ fn execute_attention_layer(
     // with `r` the rows' radius.
     let read_rows = |projection: AttentionProjection, read: ProjectionRead<'_>, rows: ProjectedRows<'_>| {
         let (weight, factor) = (layer.weight(projection), factor(projection));
-        let values = read_projection(weight, factor, projection, read, rows.values, positions)?;
+        let values = read_projection(governor, weight, factor, projection, read, rows.values, positions)?;
         let rounding = read_band(weight, factor, projection, read, rows.values, positions)?;
         let radius = if is_exact(rows.radius) {
             rounding
@@ -808,6 +811,7 @@ fn execute_attention_layer(
     let (keys, key_radius) = read_rows(AttentionProjection::Key, reads.key, residual)?;
     let (values, value_radius) = read_rows(AttentionProjection::Value, reads.value, residual)?;
     let attention = layer.attention.attend_projected(
+        governor,
         ProjectedRows {
             values: queries.view(),
             radius: query_radius.view(),
@@ -894,6 +898,7 @@ fn reached_rows(
 
 /// One linear read of `rows`, whose row `r` sits at absolute position `positions[r]`.
 fn read_projection(
+    governor: &MemoryGovernor,
     weight: ArrayView2<'_, f64>,
     factor: Option<&ProjectionFactor>,
     projection: AttentionProjection,
@@ -903,7 +908,7 @@ fn read_projection(
 ) -> Result<Governed<Array2<f64>>, BlockError> {
     let refused = |error: ApplyError| BlockError::Apply { projection, error };
     match read {
-        ProjectionRead::Native => native_linear(weight, rows).map_err(refused),
+        ProjectionRead::Native => native_linear(governor, weight, rows).map_err(refused),
         ProjectionRead::Components(masks) => {
             let factor = factor.ok_or(BlockError::NoComponentFactors { projection })?;
             let view = factor.view().map_err(refused)?;
@@ -912,10 +917,10 @@ fn read_projection(
             // product; each other mask's rows are read on their own and written over it.
             let first = groups.first().map_or(0, |group| group.0);
             let mut written =
-                apply_anchored_linear(weight, 0.0, view, masks.center.row(first), rows).map_err(refused)?;
+                apply_anchored_linear(governor, weight, 0.0, view, masks.center.row(first), rows).map_err(refused)?;
             for (mask_row, members) in groups.iter().skip(1) {
                 let selected = rows.select(Axis(0), members);
-                let read = apply_anchored_linear(weight, 0.0, view, masks.center.row(*mask_row), selected.view())
+                let read = apply_anchored_linear(governor, weight, 0.0, view, masks.center.row(*mask_row), selected.view())
                     .map_err(refused)?;
                 for (index, &row) in members.iter().enumerate() {
                     written.row_mut(row).assign(&read.row(index));
@@ -925,13 +930,13 @@ fn read_projection(
         }
         ProjectionRead::Edited(scoped) => {
             let reached = reached_rows(projection, &scoped, positions)?;
-            let mut written = native_linear(weight, rows).map_err(refused)?;
+            let mut written = native_linear(governor, weight, rows).map_err(refused)?;
             if reached.is_empty() {
                 return Ok(written);
             }
             let selected = rows.select(Axis(0), &reached);
             let every_term = Array1::<f64>::ones(scoped.edit.term_count());
-            let edited = apply_anchored_linear(weight, 1.0, scoped.edit, every_term.view(), selected.view())
+            let edited = apply_anchored_linear(governor, weight, 1.0, scoped.edit, every_term.view(), selected.view())
                 .map_err(refused)?;
             for (index, &row) in reached.iter().enumerate() {
                 written.row_mut(row).assign(&edited.row(index));
@@ -1112,6 +1117,7 @@ fn native_magnitude(weight: ArrayView2<'_, f64>, rows: ArrayView2<'_, f64>) -> R
 /// read, its unembedding, so the logits carry the whole stack's radius. Returns the read and
 /// its radius against the exact read of the exact rows.
 pub fn linear_read(
+    governor: &MemoryGovernor,
     weight: ArrayView2<'_, f64>,
     rows: ProjectedRows<'_>,
 ) -> Result<(Governed<Array2<f64>>, Array2<f64>), ApplyError> {
@@ -1122,7 +1128,7 @@ pub fn linear_read(
             found: rows.radius.dim(),
         });
     }
-    let values = native_linear(weight, rows.values)?;
+    let values = native_linear(governor, weight, rows.values)?;
     let rounding = native_magnitude(weight, rows.values.mapv(f64::abs).view()).rounding();
     let radius = if is_exact(rows.radius) {
         rounding
@@ -1250,6 +1256,7 @@ fn read_band(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parameter_decomposition::test_support::test_governor;
     use crate::parameter_decomposition::attention::RotaryPairing;
     use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
     use ndarray::ArrayView1;
@@ -1663,11 +1670,11 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(2982);
         for (kind, masks) in LayerMasks::family(&mut rng) {
             let component = layer
-                .execute(masks.reads(), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
+                .execute(test_governor(), masks.reads(), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
                 .expect("masked layer");
             let edited = fixture
                 .edited(&layer, &masks)
-                .execute(AttentionLayerReads::native(), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
+                .execute(test_governor(), AttentionLayerReads::native(), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
                 .expect("edited-tensor layer");
             // Both routes compute the same exact layer, so at every stage they differ by at most
             // the sum of their production radii.
@@ -1688,7 +1695,7 @@ mod tests {
             for (control, moved) in [("value 1e-9", moved_value), ("output 1e-9", moved_output)] {
                 let perturbed = fixture
                     .edited(&layer, &moved)
-                    .execute(AttentionLayerReads::native(), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
+                    .execute(test_governor(), AttentionLayerReads::native(), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
                     .expect("perturbed edited-tensor layer");
                 let band = sum_of_bounds(component.output_radius.clone(), perturbed.output_radius.clone());
                 assert!(
@@ -1714,10 +1721,10 @@ mod tests {
         let layer = fixture.component();
         let native = fixture
             .native()
-            .execute(AttentionLayerReads::native(), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
+            .execute(test_governor(), AttentionLayerReads::native(), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
             .expect("native layer");
         let all_on = layer
-            .execute(AttentionLayerReads::native(), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
+            .execute(test_governor(), AttentionLayerReads::native(), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
             .expect("all-on component layer");
         assert!(
             layer_stage_bits(&all_on) == layer_stage_bits(&native),
@@ -1729,6 +1736,7 @@ mod tests {
         let ones = Array1::<f64>::ones(LAYER_COMPONENTS);
         let factored = layer
             .execute(
+                test_governor(),
                 AttentionLayerReads {
                     value: ProjectionRead::Components(ComponentMasks::uniform(ones.view())),
                     ..AttentionLayerReads::native()
@@ -1764,11 +1772,12 @@ mod tests {
         let edit = FactorView::new(left.view(), right.view()).expect("finite edit factors");
         let stack = |reads: AttentionLayerReads<'_>| {
             let hidden = layer0
-                .execute(reads, ProjectedRows::exact(first.residual.view()), &first.positions)
+                .execute(test_governor(), reads, ProjectedRows::exact(first.residual.view()), &first.positions)
                 .expect("layer 0");
             // Layer 1 reads layer 0's output with its radius, as a stack does.
             let top = layer1
                 .execute(
+                    test_governor(),
                     AttentionLayerReads::native(),
                     ProjectedRows {
                         values: hidden.output.view(),
@@ -1777,7 +1786,7 @@ mod tests {
                     &first.positions,
                 )
                 .expect("layer 1");
-            let logits = native_linear(unembed.view(), top.output.view())
+            let logits = native_linear(test_governor(), unembed.view(), top.output.view())
                 .expect("unembedding")
                 .to_owned();
             (hidden, logits)
@@ -1819,7 +1828,7 @@ mod tests {
             ablated.clone(),
         ]);
         let dense = dense_layer
-            .execute(AttentionLayerReads::native(), ProjectedRows::exact(first.residual.view()), &first.positions)
+            .execute(test_governor(), AttentionLayerReads::native(), ProjectedRows::exact(first.residual.view()), &first.positions)
             .expect("dense edited layer");
         assert!(
             bits(&dense.attention.mixed) == bits(&scoped_hidden.attention.mixed),
@@ -1847,6 +1856,7 @@ mod tests {
         let every = PositionScope::every();
         let global = layer0
             .execute(
+                test_governor(),
                 AttentionLayerReads {
                     output: ProjectionRead::Edited(ScopedEdit {
                         edit,
@@ -1877,7 +1887,7 @@ mod tests {
         let layer = fixture.component();
         assert!(
             native
-                .execute(AttentionLayerReads::native(), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
+                .execute(test_governor(), AttentionLayerReads::native(), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
                 .is_ok(),
             "positive control: the fixture layer executes"
         );
@@ -1886,6 +1896,7 @@ mod tests {
         assert!(
             matches!(
                 native.execute(
+                    test_governor(),
                     AttentionLayerReads {
                         value: ProjectionRead::Components(ComponentMasks::uniform(ones.view())),
                         ..AttentionLayerReads::native()
@@ -1904,6 +1915,7 @@ mod tests {
         assert!(
             matches!(
                 layer.execute(
+                    test_governor(),
                     AttentionLayerReads {
                         key: ProjectionRead::Components(ComponentMasks::uniform(short.view())),
                         ..AttentionLayerReads::native()
@@ -1925,6 +1937,7 @@ mod tests {
         assert!(
             matches!(
                 native.execute(
+                    test_governor(),
                     AttentionLayerReads {
                         output: ProjectionRead::Edited(ScopedEdit {
                             edit,
@@ -1948,6 +1961,7 @@ mod tests {
         assert!(
             matches!(
                 native.execute(
+                    test_governor(),
                     AttentionLayerReads {
                         output: ProjectionRead::Edited(ScopedEdit {
                             edit,
@@ -1992,6 +2006,7 @@ mod tests {
         // refuses.
         let components = layer
             .execute(
+                test_governor(),
                 AttentionLayerReads {
                     query: ProjectionRead::Components(ComponentMasks::uniform(ones.view())),
                     ..AttentionLayerReads::native()
@@ -2106,9 +2121,9 @@ mod tests {
             let reads = if factored { masks.reads() } else { AttentionLayerReads::native() };
             let run = |rows: ProjectedRows<'_>| {
                 let executed = if factored {
-                    component.execute(reads, rows, &fixture.positions)
+                    component.execute(test_governor(), reads, rows, &fixture.positions)
                 } else {
-                    native.execute(reads, rows, &fixture.positions)
+                    native.execute(test_governor(), reads, rows, &fixture.positions)
                 };
                 executed.expect("fixture layer")
             };
@@ -2197,9 +2212,9 @@ mod tests {
             let reads = if factored { masks.reads() } else { AttentionLayerReads::native() };
             let run = |rows: ProjectedRows<'_>| {
                 let executed = if factored {
-                    component.execute(reads, rows, &fixture.positions)
+                    component.execute(test_governor(), reads, rows, &fixture.positions)
                 } else {
-                    native.execute(reads, rows, &fixture.positions)
+                    native.execute(test_governor(), reads, rows, &fixture.positions)
                 };
                 executed.expect("fixture layer")
             };
@@ -2227,6 +2242,7 @@ mod tests {
             let stacked = |first: &AttentionLayerExecution| {
                 let second = top
                     .execute(
+                        test_governor(),
                         AttentionLayerReads::native(),
                         ProjectedRows {
                             values: first.output.view(),
@@ -2236,6 +2252,7 @@ mod tests {
                     )
                     .expect("second layer");
                 let (logits, logit_radius) = linear_read(
+                    test_governor(),
                     unembed.view(),
                     ProjectedRows {
                         values: second.output.view(),
@@ -2275,6 +2292,7 @@ mod tests {
         let radius = Array2::<f64>::from_elem(fixture.residual.dim(), 2.0 * step);
         let carried = silent
             .execute(
+                test_governor(),
                 AttentionLayerReads::native(),
                 ProjectedRows {
                     values: moved.view(),
@@ -2284,7 +2302,7 @@ mod tests {
             )
             .expect("silent layer");
         let reference = silent
-            .execute(AttentionLayerReads::native(), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
+            .execute(test_governor(), AttentionLayerReads::native(), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
             .expect("silent layer");
         assert!(carried.write.iter().all(|&value| value == 0.0), "a zero output weight writes exactly zero");
         assert!(
@@ -2318,10 +2336,10 @@ mod tests {
             },
         ] {
             let layer = native
-                .execute(AttentionLayerReads::native(), rows, &fixture.positions)
+                .execute(test_governor(), AttentionLayerReads::native(), rows, &fixture.positions)
                 .expect("native layer");
             let (read, read_radius) =
-                linear_read(native.weight(AttentionProjection::Query), rows).expect("linear read");
+                linear_read(test_governor(), native.weight(AttentionProjection::Query), rows).expect("linear read");
             assert!(
                 bits(&read) == bits(&layer.queries) && bits(&read_radius) == bits(&layer.query_radius),
                 "linear_read must be the layer's native query read, values and radius"
@@ -2331,6 +2349,7 @@ mod tests {
         assert!(
             matches!(
                 linear_read(
+                    test_governor(),
                     native.weight(AttentionProjection::Query),
                     ProjectedRows {
                         values: fixture.residual.view(),
@@ -2344,6 +2363,7 @@ mod tests {
         assert!(
             matches!(
                 native.execute(
+                    test_governor(),
                     AttentionLayerReads::native(),
                     ProjectedRows {
                         values: fixture.residual.view(),
@@ -2411,7 +2431,7 @@ mod tests {
         };
         let execute = |reads: AttentionLayerReads<'_>| {
             layer
-                .execute(reads, ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
+                .execute(test_governor(), reads, ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
                 .expect("fixture layer")
         };
         let enclosing = execute(reads);
@@ -2466,7 +2486,7 @@ mod tests {
             }
         }
         let execute = |reads: AttentionLayerReads<'_>| {
-            layer.execute(reads, ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
+            layer.execute(test_governor(), reads, ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
         };
         let per_row = execute(output_read(ComponentMasks {
             center: centers.view(),
@@ -2578,7 +2598,7 @@ mod tests {
         let (weight_entry, row_entry) = (3.0e-161, 7.0e-162);
         let weight = Array2::from_elem((1, PRODUCTS), weight_entry);
         let rows = Array2::from_elem((1, PRODUCTS), row_entry);
-        let (read, band) = linear_read(weight.view(), ProjectedRows::exact(rows.view())).expect("subnormal read");
+        let (read, band) = linear_read(test_governor(), weight.view(), ProjectedRows::exact(rows.view())).expect("subnormal read");
         let (weight_scaled, row_scaled) = (weight_entry * scale, row_entry * scale);
         let product = weight_scaled * row_scaled;
         let residual = weight_scaled.mul_add(row_scaled, -product);
@@ -2628,8 +2648,9 @@ mod tests {
             0.0,
             "positive control: the magnitude of the radius read underflows to zero"
         );
-        let (_, exact) = linear_read(weight.view(), ProjectedRows::exact(rows.view())).expect("exact rows");
+        let (_, exact) = linear_read(test_governor(), weight.view(), ProjectedRows::exact(rows.view())).expect("exact rows");
         let (_, carried) = linear_read(
+            test_governor(),
             weight.view(),
             ProjectedRows {
                 values: rows.view(),
@@ -2656,7 +2677,7 @@ mod tests {
         let native = fixture.native();
         let weight = native.weight(AttentionProjection::Query);
         let width = weight.ncols();
-        let (_, band) = linear_read(weight, ProjectedRows::exact(fixture.residual.view())).expect("native read");
+        let (_, band) = linear_read(test_governor(), weight, ProjectedRows::exact(fixture.residual.view())).expect("native read");
         let magnitude = abs_map(weight, fixture.residual.mapv(f64::abs).view());
         let relative = magnitude
             .mapv(|value| accumulation_growth(width) * value / (1.0 - accumulation_growth(width + 3)));

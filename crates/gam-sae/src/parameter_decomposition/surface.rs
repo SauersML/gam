@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use gam_math::gaussian_activation::GaussianActivation;
+use gam_runtime::resource::MemoryGovernor;
 use ndarray::{ArrayD, ArrayView1, ArrayView2, Ix1, Ix2};
 use serde::{Deserialize, Serialize};
 
@@ -335,14 +336,19 @@ impl fmt::Display for MpdSurfaceError {
 impl std::error::Error for MpdSurfaceError {}
 
 /// Runs one MPD request against its named input arrays.
+///
+/// Every dense allocation of the run reserves on `governor` first. The CLI and the
+/// Python entry pass the process-wide governor; a caller with a budget of its own
+/// passes that.
 pub fn run_parameter_decomposition(
     request_json: &str,
     tensors: &BTreeMap<String, ArrayD<f64>>,
+    governor: &MemoryGovernor,
 ) -> Result<MpdOutput, MpdSurfaceError> {
     let request = MpdRequest::from_json(request_json)?;
     match request.operation {
         MpdOperation::RecoverPlaneRotations { tensor } => {
-            let recovery = recover_plane_rotations(matrix(tensors, &tensor)?)
+            let recovery = recover_plane_rotations(governor, matrix(tensors, &tensor)?)
                 .map_err(MpdSurfaceError::PlaneRotation)?;
             project_plane_rotations(tensor, recovery)
         }
@@ -363,7 +369,7 @@ pub fn run_parameter_decomposition(
         } => {
             let activation = GaussianActivation::from_hidden_act(&hidden_act)
                 .map_err(|error| MpdSurfaceError::Receipt(ReceiptRefusal::Activation(error)))?;
-            let receipt = mlp_block_receipt(MlpBlockReceiptInputs {
+            let receipt = mlp_block_receipt(governor, MlpBlockReceiptInputs {
                 external_execution: ExternalExecution {
                     dtype: &external_execution.dtype,
                     device: &external_execution.device,
@@ -604,6 +610,7 @@ fn absent_when_infinite(field: &'static str, value: f64) -> Result<Option<f64>, 
 mod tests {
     use super::super::receipts::compare_stage;
     use super::*;
+    use crate::parameter_decomposition::test_support::test_governor;
     use gam_math::gaussian_activation::GaussianActivationError;
     use ndarray::{Array1, Array2, Axis, array};
 
@@ -682,8 +689,8 @@ mod tests {
     #[test]
     fn plane_rotation_report_is_the_owner_result_field_for_field() {
         let matrix = two_plane_rotation(0.7, 1.9);
-        let direct = recover_plane_rotations(matrix.view()).expect("owner recovery");
-        let output = run_parameter_decomposition(&plane_request(), &inputs("w", matrix))
+        let direct = recover_plane_rotations(test_governor(), matrix.view()).expect("owner recovery");
+        let output = run_parameter_decomposition(&plane_request(), &inputs("w", matrix), test_governor())
             .expect("surface run");
         let MpdResult::RecoverPlaneRotations(report) = &output.report.result else {
             panic!("expected a plane-rotation report, got {:?}", output.report.result);
@@ -788,7 +795,7 @@ mod tests {
 
     #[test]
     fn identity_reports_its_ambiguity_and_an_absent_separation() {
-        let output = run_parameter_decomposition(&plane_request(), &inputs("w", Array2::eye(3)))
+        let output = run_parameter_decomposition(&plane_request(), &inputs("w", Array2::eye(3)), test_governor())
             .expect("surface run on the identity");
         let MpdResult::RecoverPlaneRotations(report) = &output.report.result else {
             panic!("expected a plane-rotation report, got {:?}", output.report.result);
@@ -809,26 +816,26 @@ mod tests {
     fn the_owners_refusal_of_a_singular_matrix_reaches_the_caller() {
         // A rank-one matrix has no unique nearest orthogonal matrix.
         assert!(matches!(
-            run_parameter_decomposition(&plane_request(), &inputs("w", Array2::ones((2, 2)))),
+            run_parameter_decomposition(&plane_request(), &inputs("w", Array2::ones((2, 2))), test_governor()),
             Err(MpdSurfaceError::PlaneRotation(
                 PlaneRotationError::NotInvertible { .. }
             ))
         ));
         // Positive control: the same request on an orthogonal matrix is accepted.
-        assert!(run_parameter_decomposition(&plane_request(), &inputs("w", Array2::eye(2))).is_ok());
+        assert!(run_parameter_decomposition(&plane_request(), &inputs("w", Array2::eye(2)), test_governor()).is_ok());
     }
 
     #[test]
     fn missing_or_misshapen_inputs_are_refused() {
         let json = plane_request();
-        assert!(run_parameter_decomposition(&json, &inputs("w", Array2::eye(2))).is_ok());
+        assert!(run_parameter_decomposition(&json, &inputs("w", Array2::eye(2)), test_governor()).is_ok());
         assert!(matches!(
-            run_parameter_decomposition(&json, &inputs("other", Array2::eye(2))),
+            run_parameter_decomposition(&json, &inputs("other", Array2::eye(2)), test_governor()),
             Err(MpdSurfaceError::MissingTensor { .. })
         ));
         let cube = BTreeMap::from([("w".to_string(), ArrayD::<f64>::zeros(vec![2, 2, 2]))]);
         assert!(matches!(
-            run_parameter_decomposition(&json, &cube),
+            run_parameter_decomposition(&json, &cube, test_governor()),
             Err(MpdSurfaceError::TensorShape { .. })
         ));
     }
@@ -961,7 +968,7 @@ mod tests {
             "the fixture's stages are exact"
         );
         assert_eq!(block.output, array![[-0.1875, 0.875], [0.546875, -2.0625]]);
-        let direct = mlp_block_receipt(MlpBlockReceiptInputs {
+        let direct = mlp_block_receipt(test_governor(), MlpBlockReceiptInputs {
             external_execution: BINARY64_CPU,
             activation: GaussianActivation::Relu,
             weight: block.weight.view(),
@@ -980,6 +987,7 @@ mod tests {
         let output = run_parameter_decomposition(
             &receipt_request("relu", "float64", false),
             &block_tensors(&block),
+        test_governor(),
         )
         .expect("surface run");
         let report = receipt_report(&output);
@@ -1011,11 +1019,11 @@ mod tests {
         let mut block = dyadic_block();
         let json = receipt_request("relu", "float64", false);
         // Positive control: the exact stages agree.
-        let agreeing = run_parameter_decomposition(&json, &block_tensors(&block)).expect("surface run");
+        let agreeing = run_parameter_decomposition(&json, &block_tensors(&block), test_governor()).expect("surface run");
         assert!(receipt_report(&agreeing).output.agrees);
 
         block.output[[0, 0]] += 1.0;
-        let displaced = run_parameter_decomposition(&json, &block_tensors(&block)).expect("surface run");
+        let displaced = run_parameter_decomposition(&json, &block_tensors(&block), test_governor()).expect("surface run");
         let report = receipt_report(&displaced);
         assert!(report.output.refutes && !report.output.agrees, "{report:?}");
         assert_eq!(report.output.witness, [0, 0]);
@@ -1062,13 +1070,13 @@ mod tests {
         );
         let json = receipt_request("relu", "float64", false);
         // Positive control: the undisplaced stages keep a finite ratio of 0.
-        let agreeing = run_parameter_decomposition(&json, &block_tensors(&zero_write)).expect("surface run");
+        let agreeing = run_parameter_decomposition(&json, &block_tensors(&zero_write), test_governor()).expect("surface run");
         assert_eq!(receipt_report(&agreeing).output.ratio, StageRatio::Finite { value: 0.0 });
 
         let mut displaced_block = zero_write;
         displaced_block.output[[0, 0]] = 1.0;
         let displaced =
-            run_parameter_decomposition(&json, &block_tensors(&displaced_block)).expect("surface run");
+            run_parameter_decomposition(&json, &block_tensors(&displaced_block), test_governor()).expect("surface run");
         let report = receipt_report(&displaced);
         assert_eq!(report.output.ratio, StageRatio::QuotientOverflows, "{report:?}");
         assert!(report.output.band > 0.0 && report.output.refutes, "{report:?}");
@@ -1095,6 +1103,7 @@ mod tests {
         let output = run_parameter_decomposition(
             &receipt_request("relu", "float64", false),
             &block_tensors(&no_rows),
+        test_governor(),
         )
         .expect("surface run over no rows");
         let report = receipt_report(&output);
@@ -1104,6 +1113,7 @@ mod tests {
         let rows = run_parameter_decomposition(
             &receipt_request("relu", "float64", false),
             &block_tensors(&dyadic_block()),
+        test_governor(),
         )
         .expect("surface run");
         assert_eq!(receipt_report(&rows).output.ratio, StageRatio::Finite { value: 0.0 });
@@ -1142,23 +1152,23 @@ mod tests {
         let block = dyadic_block();
         let tensors = block_tensors(&block);
         // Positive control: the accepted request.
-        assert!(run_parameter_decomposition(&receipt_request("relu", "float64", false), &tensors).is_ok());
+        assert!(run_parameter_decomposition(&receipt_request("relu", "float64", false), &tensors, test_governor()).is_ok());
         assert!(matches!(
-            run_parameter_decomposition(&receipt_request("relu", "float32", false), &tensors),
+            run_parameter_decomposition(&receipt_request("relu", "float32", false), &tensors, test_governor()),
             Err(MpdSurfaceError::Receipt(ReceiptRefusal::ExternalPrecision {
                 float64: false,
                 tf32_matmul: false,
             }))
         ));
         assert!(matches!(
-            run_parameter_decomposition(&receipt_request("relu", "float64", true), &tensors),
+            run_parameter_decomposition(&receipt_request("relu", "float64", true), &tensors, test_governor()),
             Err(MpdSurfaceError::Receipt(ReceiptRefusal::ExternalPrecision {
                 float64: true,
                 tf32_matmul: true,
             }))
         ));
         assert!(matches!(
-            run_parameter_decomposition(&receipt_request("gelu_new", "float64", false), &tensors),
+            run_parameter_decomposition(&receipt_request("gelu_new", "float64", false), &tensors, test_governor()),
             Err(MpdSurfaceError::Receipt(ReceiptRefusal::Activation(
                 GaussianActivationError::ApproximateGelu { .. }
             )))
@@ -1169,7 +1179,7 @@ mod tests {
             block.bias.clone().insert_axis(Axis(1)).into_dyn(),
         );
         assert!(matches!(
-            run_parameter_decomposition(&receipt_request("relu", "float64", false), &misshapen),
+            run_parameter_decomposition(&receipt_request("relu", "float64", false), &misshapen, test_governor()),
             Err(MpdSurfaceError::TensorShape { .. })
         ));
         let unknown_execution_field = receipt_request("relu", "float64", false).replacen(
@@ -1178,7 +1188,7 @@ mod tests {
             1,
         );
         assert!(matches!(
-            run_parameter_decomposition(&unknown_execution_field, &tensors),
+            run_parameter_decomposition(&unknown_execution_field, &tensors, test_governor()),
             Err(MpdSurfaceError::InvalidRequest(..))
         ));
     }

@@ -54,6 +54,7 @@
 //! The tallies go to `REPORT_JSON`. A certified refutation, a residual that is not bit-identical,
 //! or a failed control exits with an error after the report is written.
 
+use gam_runtime::resource::MemoryGovernor;
 use gam_sae::inference::intervention_shard::ExperimentUnit;
 use gam_sae::parameter_decomposition::apply::{
     FactorView, FactoredEdit, apply_anchored_linear, native_linear,
@@ -198,13 +199,14 @@ fn flag<'a>(args: &'a [String], name: &str) -> Result<&'a str, String> {
 /// Rows the edit reaches run `x (W + L diag(s) Rᵀ)ᵀ` through `apply_anchored_linear`, under the
 /// factored-edit band; every other row runs `x Wᵀ` through `native_linear`, under the affine band.
 fn linear_receipt(
+    governor: &MemoryGovernor,
     execution: ExternalExecution<'_>,
     weight: ArrayView2<'_, f64>,
     input: ArrayView2<'_, f64>,
     external: ArrayView2<'_, f64>,
     edit: Option<(ArrayView2<'_, f64>, ArrayView1<'_, f64>, ArrayView2<'_, f64>, &PositionScope)>,
 ) -> Result<StageAgreement, String> {
-    let native_rows = native_linear(weight, input).map_err(|error| LiftError::from(error).to_string())?;
+    let native_rows = native_linear(governor, weight, input).map_err(|error| LiftError::from(error).to_string())?;
     let mut native = (*native_rows).to_owned();
     let mut band = affine_stage_band(weight, None, input)
         .map_err(|mismatch| ReceiptRefusal::from(mismatch).to_string())?;
@@ -213,7 +215,7 @@ fn linear_receipt(
         if !reached.is_empty() {
             let reached_input = input.select(Axis(0), &reached);
             let factors = FactorView::new(left, right).map_err(|error| LiftError::from(error).to_string())?;
-            let edited = apply_anchored_linear(weight, 1.0, factors, coefficients, reached_input.view())
+            let edited = apply_anchored_linear(governor, weight, 1.0, factors, coefficients, reached_input.view())
                 .map_err(|error| LiftError::from(error).to_string())?;
             let edited_band =
                 factored_edit_stage_band(weight, left, coefficients, right, None, reached_input.view())
@@ -230,10 +232,11 @@ fn linear_receipt(
 
 /// `x Wᵀ` through `native_linear`, with its `affine_stage_band` as the rows' forward-error radius.
 fn projected_rows(
+    governor: &MemoryGovernor,
     weight: ArrayView2<'_, f64>,
     input: ArrayView2<'_, f64>,
 ) -> Result<(Array2<f64>, Array2<f64>), String> {
-    let rows = native_linear(weight, input).map_err(|error| LiftError::from(error).to_string())?;
+    let rows = native_linear(governor, weight, input).map_err(|error| LiftError::from(error).to_string())?;
     let radius = affine_stage_band(weight, None, input)
         .map_err(|mismatch| ReceiptRefusal::from(mismatch).to_string())?;
     Ok(((*rows).to_owned(), radius))
@@ -348,6 +351,7 @@ struct AttentionTally {
 }
 
 fn main() -> Result<(), String> {
+    let governor = MemoryGovernor::global();
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 7 {
         return Err(USAGE.to_string());
@@ -582,6 +586,7 @@ fn main() -> Result<(), String> {
             tallies[0].add(
                 sequence,
                 linear_receipt(
+                    governor,
                     execution,
                     output.view(),
                     blocks[0].view(),
@@ -591,11 +596,11 @@ fn main() -> Result<(), String> {
             );
             tallies[1].add(
                 sequence,
-                linear_receipt(execution, later_output.view(), blocks[2].view(), blocks[3].view(), None)?,
+                linear_receipt(governor, execution, later_output.view(), blocks[2].view(), blocks[3].view(), None)?,
             );
             tallies[2].add(
                 sequence,
-                linear_receipt(execution, unembedding.view(), blocks[4].view(), blocks[5].view(), None)?,
+                linear_receipt(governor, execution, unembedding.view(), blocks[4].view(), blocks[5].view(), None)?,
             );
 
             for (layer, (native_layer, tally)) in layers.iter().zip(attention.iter_mut()).enumerate() {
@@ -605,7 +610,7 @@ fn main() -> Result<(), String> {
                     AttentionProjection::Key,
                     AttentionProjection::Value,
                 ]
-                .map(|projection| projected_rows(native_layer.weight(projection), residual.view()));
+                .map(|projection| projected_rows(governor, native_layer.weight(projection), residual.view()));
                 let ((queries, query_radius), (keys, key_radius), (values, value_radius)) = (queries?, keys?, values?);
                 let value_rows = ProjectedRows {
                     values: values.view(),
@@ -613,6 +618,7 @@ fn main() -> Result<(), String> {
                 };
                 let native = core
                     .attend_projected(
+                        governor,
                         ProjectedRows {
                             values: queries.view(),
                             radius: query_radius.view(),
@@ -655,7 +661,7 @@ fn main() -> Result<(), String> {
                 // The softmax and the value read at torch's own inputs, taken as exact.
                 let exact = Array3::<f64>::zeros(external_scores.dim());
                 let pattern = core
-                    .weights_at_scores(external_scores.view(), exact.view())
+                    .weights_at_scores(governor, external_scores.view(), exact.view())
                     .map_err(|error| error.to_string())?;
                 let external_pattern = heads_of(&format!("pattern.{layer}"), index, sequence);
                 tally.pattern.add(
@@ -713,14 +719,14 @@ fn main() -> Result<(), String> {
                     _ => AttentionLayerReads::native(),
                 };
                 let executed = native_layer
-                    .execute(reads, ProjectedRows::exact(residual.view()), &positions)
+                    .execute(governor, reads, ProjectedRows::exact(residual.view()), &positions)
                     .map_err(|error| error.to_string())?;
                 tally
                     .layer_output
                     .add(sequence, residual_out.view(), executed.output.view(), None)?;
                 if scope.is_some() && layer == 0 {
                     let unedited = native_layer
-                        .execute(AttentionLayerReads::native(), ProjectedRows::exact(residual.view()), &positions)
+                        .execute(governor, AttentionLayerReads::native(), ProjectedRows::exact(residual.view()), &positions)
                         .map_err(|error| error.to_string())?;
                     tally.unedited_output.get_or_insert_with(Measured::default).add(
                         sequence,

@@ -41,7 +41,7 @@ use super::program::{
     NodeId, ParameterDecl, ParameterSlot, ParameterSource, ParameterUse, Program, ProgramError, ProgramParts,
     SlotDecl, SlotId, SumTerm,
 };
-use gam_runtime::resource::Governed;
+use gam_runtime::resource::{Governed, MemoryGovernor};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use std::fmt;
 
@@ -352,6 +352,7 @@ impl ParameterSource for NativeAttentionLayer {
 
     fn apply_linear(
         &self,
+        governor: &MemoryGovernor,
         parameter: ParameterUse<'_>,
         orientation: TieOrientation,
         rows: ArrayView2<'_, f64>,
@@ -360,7 +361,7 @@ impl ParameterSource for NativeAttentionLayer {
         if !parameter.controls.is_empty() {
             return Err(LayerProgramError::DenseControls { projection });
         }
-        native_linear(oriented(self.weight(projection), orientation), rows)
+        native_linear(governor, oriented(self.weight(projection), orientation), rows)
             .map_err(|error| LayerProgramError::Apply { projection, error })
     }
 
@@ -376,6 +377,7 @@ impl ParameterSource for ComponentAttentionLayer {
 
     fn apply_linear(
         &self,
+        governor: &MemoryGovernor,
         parameter: ParameterUse<'_>,
         orientation: TieOrientation,
         rows: ArrayView2<'_, f64>,
@@ -396,7 +398,7 @@ impl ParameterSource for ComponentAttentionLayer {
             TieOrientation::Identity => stored,
             TieOrientation::Transpose => FactorView::new(stored.right(), stored.left()).map_err(refused)?,
         };
-        apply_anchored_linear(weight, 0.0, factor, ArrayView1::from(parameter.controls), rows).map_err(refused)
+        apply_anchored_linear(governor, weight, 0.0, factor, ArrayView1::from(parameter.controls), rows).map_err(refused)
     }
 
     fn vector(&self, parameter: ParameterUse<'_>) -> Result<Array1<f64>, LayerProgramError> {
@@ -409,6 +411,7 @@ impl ParameterSource for ComponentAttentionLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parameter_decomposition::test_support::test_governor;
     use crate::parameter_decomposition::attention::{AttentionGeometry, ProjectedRows, RotaryEmbedding, RotaryPairing};
     use crate::parameter_decomposition::block::{
         AttentionLayerExecution, AttentionLayerReads, ComponentMasks, ProjectionRead,
@@ -492,7 +495,7 @@ mod tests {
             masks: &MaskAssignment,
         ) -> Result<Execution, ExecutionError<S::Error>> {
             program.execute(
-                source,
+                test_governor(), source,
                 masks,
                 vec![self.residual.clone()],
                 vec![None; LayerStage::ALL.len()],
@@ -575,7 +578,7 @@ mod tests {
         let layer = fixture.native();
         let program = attention_layer_program(&layer).expect("the layer program is valid");
         let native = layer
-            .execute(AttentionLayerReads::native(), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
+            .execute(test_governor(), AttentionLayerReads::native(), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
             .expect("native layer");
         let executed = fixture
             .run(&program, &layer, &MaskAssignment::all_on())
@@ -619,7 +622,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(2993);
         for (kind, masks) in mask_family(&mut rng) {
             let expected = layer
-                .execute(component_reads(&masks), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
+                .execute(test_governor(), component_reads(&masks), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
                 .expect("component reads");
             let assignment = program.masks(views(&masks)).expect("masks of the right lengths");
             let executed = fixture
@@ -656,7 +659,7 @@ mod tests {
         let program = ComponentLayerProgram::new(&layer).expect("the component program is valid");
         let ones = all_ones();
         let factored = layer
-            .execute(component_reads(&ones), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
+            .execute(test_governor(), component_reads(&ones), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
             .expect("factored all-ones reads");
         let executed = fixture
             .run(program.program(), &layer, &MaskAssignment::all_on())
@@ -669,7 +672,7 @@ mod tests {
             assert!(agrees, "the all-on {stage:?} slot must equal the factored reads' stage bit for bit");
         }
         let native = layer
-            .execute(AttentionLayerReads::native(), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
+            .execute(test_governor(), AttentionLayerReads::native(), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
             .expect("native reads");
         assert!(
             bits(&factored.output) != bits(&native.output),

@@ -9,6 +9,7 @@
 //! logit boxes.
 
 use crate::induction_export::LoadedExport;
+use gam_runtime::resource::MemoryGovernor;
 use gam_sae::parameter_decomposition::attention::{AttentionGeometry, ProjectedRows, RotaryEmbedding, RotaryPairing};
 use gam_sae::parameter_decomposition::block::{
     AttentionLayerExecution, AttentionLayerReads, AttentionProjection, ComponentAttentionLayer, NativeAttentionLayer,
@@ -146,6 +147,7 @@ impl Network {
     /// reads, and every layer's execution.
     pub fn run(
         &self,
+        governor: &MemoryGovernor,
         tokens: &[i64],
         reads: &[AttentionLayerReads<'_>],
     ) -> Result<(Rows, Vec<AttentionLayerExecution>), String> {
@@ -167,7 +169,7 @@ impl Network {
         let mut executions = Vec::with_capacity(self.layers.len());
         for (index, (layer, &reads)) in self.layers.iter().zip(reads).enumerate() {
             let execution = layer
-                .execute(reads, residual.projected(), &self.positions)
+                .execute(governor, reads, residual.projected(), &self.positions)
                 .map_err(|error| format!("layer {index}: {error}"))?;
             residual = Rows {
                 values: execution.output.clone(),
@@ -176,7 +178,7 @@ impl Network {
             executions.push(execution);
         }
         let (values, radius) =
-            linear_read(self.unembedding.view(), residual.projected()).map_err(|error| format!("unembedding: {error}"))?;
+            linear_read(governor, self.unembedding.view(), residual.projected()).map_err(|error| format!("unembedding: {error}"))?;
         Ok((
             Rows {
                 values: (*values).to_owned(),

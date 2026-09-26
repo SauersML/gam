@@ -93,6 +93,7 @@ use std::fmt;
 
 use gam_linalg::faer_ndarray::{FaerLinalgError, FaerSvd};
 use gam_linalg::roundoff::{accumulation_band, accumulation_growth, factor_singular_band};
+use gam_runtime::resource::{MemoryGovernor, MemoryReservation, MemoryReservationError};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 
 use super::supports::{EvidenceStatus, EvidenceStatusError, ExactBasis, Extremum};
@@ -778,6 +779,7 @@ impl ConstantRankCheck {
 /// states where [`LocalDimension::Certified`] holds. The check forms the stacked
 /// `response rows × d` Jacobian of each state and its thin SVD.
 pub fn constant_rank_check(
+    governor: &MemoryGovernor,
     futures: &[&dyn DifferentiableNativeMap],
     states: ArrayView2<'_, f64>,
 ) -> Result<ConstantRankCheck, StateError> {
@@ -799,6 +801,8 @@ pub fn constant_rank_check(
             context: "constant rank: responses",
         });
     }
+    // One stacked Jacobian lives at a time: each state's replaces the last.
+    let stacked_reservation = reserve(governor, rows, dimension, 1, "constant rank: stacked Jacobian")?;
     let mut locals = Vec::with_capacity(states.nrows());
     for state in states.rows() {
         let mut stacked = Array2::<f64>::zeros((rows, dimension));
@@ -830,8 +834,9 @@ pub fn constant_rank_check(
         }
         // The spectral norm of a stacked error is at most the root sum of the
         // blocks' squared spectral norms.
-        locals.push(resolve_stacked_factor(&stacked, formation_squared.sqrt())?);
+        locals.push(resolve_stacked_factor(governor, &stacked, formation_squared.sqrt())?);
     }
+    drop(stacked_reservation);
     let generic_rank = locals
         .iter()
         .map(|local| local.resolved_rank)
@@ -851,6 +856,7 @@ pub fn constant_rank_check(
 /// a metric's weighted factor, calls it directly, so [`LocalQuotient`] has one
 /// owner.
 pub fn resolve_stacked_factor(
+    governor: &MemoryGovernor,
     stacked: &Array2<f64>,
     formation: f64,
 ) -> Result<LocalQuotient, StateError> {
@@ -871,7 +877,7 @@ pub fn resolve_stacked_factor(
             value: formation,
         });
     }
-    let resolution = resolved_row_space(stacked, formation, "stacked factor")?;
+    let resolution = resolved_row_space(governor, stacked, formation, "stacked factor")?;
     Ok(LocalQuotient {
         singular_values: resolution.singular_values,
         band: resolution.band,
@@ -950,11 +956,13 @@ impl LinearStateQuotient {
     /// band leaves out the angle error of the previous step's singular vectors.
     /// The measured bounds are the certificate.
     pub fn close(
+        governor: &MemoryGovernor,
         readouts: &[ArrayView2<'_, f64>],
         transitions: &[ArrayView2<'_, f64>],
     ) -> Result<Self, StateError> {
         let dimension = linear_family_dimension(readouts, transitions)?;
         let rows: usize = readouts.iter().map(|readout| readout.nrows()).sum();
+        let stacked_reservation = reserve(governor, rows, dimension, 1, "linear quotient: readout rows")?;
         let mut stacked = Array2::<f64>::zeros((rows, dimension));
         let mut offset = 0;
         for readout in readouts {
@@ -963,12 +971,22 @@ impl LinearStateQuotient {
                 .assign(readout);
             offset += readout.nrows();
         }
-        let mut chart = resolved_row_space(&stacked, 0.0, "linear quotient: readout rows")?.rows;
+        let mut chart = resolved_row_space(governor, &stacked, 0.0, "linear quotient: readout rows")?.rows;
+        drop(stacked);
+        drop(stacked_reservation);
         loop {
             let rank = chart.nrows();
             if rank == 0 || rank == dimension || transitions.is_empty() {
                 break;
             }
+            // The candidate stack and the chart's absolute value and one moved copy.
+            let candidate_reservation = reserve(
+                governor,
+                rank,
+                dimension,
+                transitions.len().saturating_add(3),
+                "linear quotient: closure step",
+            )?;
             let mut candidate =
                 Array2::<f64>::zeros(((transitions.len() + 1) * rank, dimension));
             candidate.slice_mut(s![..rank, ..]).assign(&chart);
@@ -986,21 +1004,25 @@ impl LinearStateQuotient {
                     .sum::<f64>();
             }
             let next = resolved_row_space(
+                governor,
                 &candidate,
                 formation_squared.sqrt(),
                 "linear quotient: closure step",
             )?;
+            drop(candidate);
+            drop(candidate_reservation);
             if next.rank <= rank {
                 break;
             }
             chart = next.rows;
         }
-        Self::measure(chart, readouts, transitions)
+        Self::measure(governor, chart, readouts, transitions)
     }
 
     /// Measure a declared chart `Q` (`r × d`) against the readouts and
     /// transitions.
     pub fn measure(
+        governor: &MemoryGovernor,
         chart: Array2<f64>,
         readouts: &[ArrayView2<'_, f64>],
         transitions: &[ArrayView2<'_, f64>],
@@ -1013,6 +1035,8 @@ impl LinearStateQuotient {
             });
         }
         let rank = chart.nrows();
+        // `|Q|` and every `r × r` and `r × d` temporary one measurement holds at once.
+        let working = reserve(governor, rank.max(1), dimension, 8, "linear quotient: measurement")?;
         let section = chart.t();
         let absolute_chart = chart.mapv(f64::abs);
         let absolute_section = absolute_chart.t();
@@ -1024,7 +1048,7 @@ impl LinearStateQuotient {
                 .mapv(|magnitude| accumulation_band(dimension + 1, magnitude + 1.0)),
         );
         let section_bounds =
-            spectral_norm_bounds(&section_residual, section_band, "linear quotient: section")?;
+            spectral_norm_bounds(governor, &section_residual, section_band, "linear quotient: section")?;
 
         let mut readout_maps = Vec::with_capacity(readouts.len());
         let mut readout_bounds = Vec::with_capacity(readouts.len());
@@ -1038,6 +1062,7 @@ impl LinearStateQuotient {
                     + &readout.mapv(|entry| accumulation_growth(1) * entry.abs()),
             );
             readout_bounds.push(spectral_norm_bounds(
+                governor,
                 &residual,
                 band,
                 "linear quotient: readout",
@@ -1049,6 +1074,8 @@ impl LinearStateQuotient {
         let mut quotient_bounds = Vec::with_capacity(transitions.len());
         let mut realization_bounds = Vec::with_capacity(transitions.len());
         for transition in transitions {
+            let transition_reservation =
+                reserve(governor, dimension, dimension, 1, "linear quotient: absolute transition")?;
             let absolute_transition = transition.mapv(f64::abs);
             let moved = chart.dot(transition);
             let map = moved.dot(&section);
@@ -1063,6 +1090,7 @@ impl LinearStateQuotient {
                         .mapv(|magnitude| accumulation_band(rank + 1, magnitude)),
             );
             quotient_bounds.push(spectral_norm_bounds(
+                governor,
                 &quotient_residual,
                 quotient_band,
                 "linear quotient: quotient contract",
@@ -1077,12 +1105,15 @@ impl LinearStateQuotient {
                         .mapv(|magnitude| accumulation_band(rank + 1, magnitude)),
             );
             realization_bounds.push(spectral_norm_bounds(
+                governor,
                 &realization_residual,
                 realization_band,
                 "linear quotient: realization contract",
             )?);
             descended.push(map);
+            drop(transition_reservation);
         }
+        drop(working);
         Ok(Self {
             chart,
             readout_maps,
@@ -1105,11 +1136,15 @@ struct ResolvedRowSpace {
 }
 
 fn resolved_row_space(
+    governor: &MemoryGovernor,
     matrix: &Array2<f64>,
     formation: f64,
     context: &'static str,
 ) -> Result<ResolvedRowSpace, StateError> {
     let (rows, cols) = matrix.dim();
+    // The decomposition's working copy, then `Vᵀ` and the resolved rows beside it.
+    let working = reserve(governor, rows, cols, 1, context)?;
+    let factors = reserve(governor, cols, cols, 2, context)?;
     let (_, sigma, vt) = matrix
         .svd(false, true)
         .map_err(|source| StateError::Svd { context, source })?;
@@ -1127,6 +1162,8 @@ fn resolved_row_space(
     for (row, &index) in order.iter().take(rank).enumerate() {
         resolved.row_mut(row).assign(&vt.row(index));
     }
+    drop(working);
+    drop(factors);
     Ok(ResolvedRowSpace {
         singular_values,
         band,
@@ -1136,6 +1173,7 @@ fn resolved_row_space(
 }
 
 fn spectral_norm_bounds(
+    governor: &MemoryGovernor,
     matrix: &Array2<f64>,
     formation: f64,
     context: &'static str,
@@ -1147,15 +1185,31 @@ fn spectral_norm_bounds(
         });
     }
     let (rows, cols) = matrix.dim();
+    // The decomposition's working copy.
+    let working = reserve(governor, rows, cols, 1, context)?;
     let (_, sigma, _) = matrix
         .svd(false, false)
         .map_err(|source| StateError::Svd { context, source })?;
+    drop(working);
     let sigma_max = sigma.iter().fold(0.0_f64, |largest, &value| largest.max(value));
     let band = factor_singular_band(rows, cols, sigma_max) + formation;
     Ok(SpectralNormBounds {
         lower: (sigma_max - band).max(0.0),
         upper: sigma_max + band,
     })
+}
+
+/// Reserves `copies` dense `rows × cols` matrices on `governor` before they are formed.
+fn reserve(
+    governor: &MemoryGovernor,
+    rows: usize,
+    cols: usize,
+    copies: usize,
+    context: &'static str,
+) -> Result<MemoryReservation, StateError> {
+    governor
+        .try_reserve_dense_f64_copies(rows, cols, copies, context)
+        .map_err(|source| StateError::Memory { context, source })
 }
 
 /// `‖B‖_F` of an entrywise error bound `B`, which bounds the spectral norm of the
@@ -1221,6 +1275,11 @@ pub enum StateError {
     },
     /// An evaluated defect could not be expressed as an evidence status.
     Evidence { source: EvidenceStatusError },
+    /// A dense matrix the check forms does not fit the memory budget.
+    Memory {
+        context: &'static str,
+        source: MemoryReservationError,
+    },
 }
 
 impl fmt::Display for StateError {
@@ -1260,6 +1319,7 @@ impl fmt::Display for StateError {
             Self::Evidence { source } => {
                 write!(formatter, "evidence status refused an evaluated defect: {source}")
             }
+            Self::Memory { context, source } => write!(formatter, "{context}: {source}"),
         }
     }
 }
@@ -1269,6 +1329,7 @@ impl std::error::Error for StateError {
         match self {
             Self::Svd { source, .. } => Some(source),
             Self::Evidence { source } => Some(source),
+            Self::Memory { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -1391,6 +1452,7 @@ fn sup_distance(left: ArrayView1<'_, f64>, right: ArrayView1<'_, f64>) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parameter_decomposition::test_support::test_governor;
     use ndarray::{array, s};
 
     /// A fixture map given by closed forms. `evaluate` returns the value and its
@@ -1728,7 +1790,7 @@ mod tests {
         }
 
         let differentiable: [&dyn DifferentiableNativeMap; 1] = [&observe];
-        let ranks = constant_rank_check(&differentiable, array![[-1.0], [1.0]].view())
+        let ranks = constant_rank_check(test_governor(), &differentiable, array![[-1.0], [1.0]].view())
             .expect("rank check");
         assert_eq!(ranks.local_dimension(0), Some(LocalDimension::Certified(1)));
         assert_eq!(ranks.local_dimension(1), Some(LocalDimension::Certified(1)));
@@ -1970,7 +2032,7 @@ mod tests {
         let states = array![[-1.0], [0.0], [1.0]];
 
         let current: [&dyn DifferentiableNativeMap; 1] = [&observe];
-        let ranks = constant_rank_check(&current, states.view()).expect("rank check");
+        let ranks = constant_rank_check(test_governor(), &current, states.view()).expect("rank check");
         assert_eq!(ranks.generic_rank, 1);
         assert_eq!(ranks.local_dimension(0), Some(LocalDimension::Certified(1)));
         assert_eq!(
@@ -1998,7 +2060,7 @@ mod tests {
         ));
 
         let generating: [&dyn DifferentiableNativeMap; 2] = [&observe, &observe_after_shift];
-        let generated = constant_rank_check(&generating, states.view()).expect("rank check");
+        let generated = constant_rank_check(test_governor(), &generating, states.view()).expect("rank check");
         for state in 0..3 {
             assert_eq!(
                 generated.local_dimension(state),
@@ -2011,11 +2073,11 @@ mod tests {
         let after_transition = coordinate_sum();
         let pair_states = array![[0.5, -1.0], [2.0, 3.0]];
         let observed_only: [&dyn DifferentiableNativeMap; 1] = [&first];
-        let partial = constant_rank_check(&observed_only, pair_states.view()).expect("rank check");
+        let partial = constant_rank_check(test_governor(), &observed_only, pair_states.view()).expect("rank check");
         assert_eq!(partial.generic_rank, 1);
         assert_eq!(partial.states[0].observed_directions.dim(), (1, 2));
         let closed: [&dyn DifferentiableNativeMap; 2] = [&first, &after_transition];
-        let full = constant_rank_check(&closed, pair_states.view()).expect("rank check");
+        let full = constant_rank_check(test_governor(), &closed, pair_states.view()).expect("rank check");
         assert_eq!(full.generic_rank, 2);
         assert_eq!(full.local_dimension(0), Some(LocalDimension::Certified(2)));
 
@@ -2036,7 +2098,7 @@ mod tests {
         };
         let faint_family: [&dyn DifferentiableNativeMap; 1] = [&faint];
         let faint_ranks =
-            constant_rank_check(&faint_family, array![[1.0], [f64::EPSILON]].view())
+            constant_rank_check(test_governor(), &faint_family, array![[1.0], [f64::EPSILON]].view())
                 .expect("rank check");
         match faint_ranks.local_dimension(1) {
             Some(LocalDimension::BelowGeneric {
@@ -2094,7 +2156,7 @@ mod tests {
         let transition = planted_transition(1.0);
         let planted = frame.slice(s![..2, ..]).to_owned();
         let measured =
-            LinearStateQuotient::measure(planted, &[readout.view()], &[transition.view()])
+            LinearStateQuotient::measure(test_governor(), planted, &[readout.view()], &[transition.view()])
                 .expect("measure");
         assert_eq!(measured.readout_bounds[0].lower, 0.0);
         assert_eq!(measured.quotient_bounds[0].lower, 0.0);
@@ -2110,6 +2172,7 @@ mod tests {
         assert!(leaks.certifies_at_most(realization.upper));
 
         let unclosed = LinearStateQuotient::measure(
+            test_governor(),
             frame.slice(s![..1, ..]).to_owned(),
             &[readout.view()],
             &[transition.view()],
@@ -2123,6 +2186,7 @@ mod tests {
 
         let decoupled = planted_transition(0.0);
         let realized = LinearStateQuotient::measure(
+            test_governor(),
             frame.slice(s![..2, ..]).to_owned(),
             &[readout.view()],
             &[decoupled.view()],
@@ -2141,11 +2205,11 @@ mod tests {
         let frame = dyadic_frame();
         let readout = frame.slice(s![..1, ..]).to_owned();
         let transition = planted_transition(1.0);
-        let closed = LinearStateQuotient::close(&[readout.view()], &[transition.view()])
+        let closed = LinearStateQuotient::close(test_governor(), &[readout.view()], &[transition.view()])
             .expect("close");
         assert_eq!(closed.chart.nrows(), 2);
         let unclosed =
-            LinearStateQuotient::measure(readout.clone(), &[readout.view()], &[transition.view()])
+            LinearStateQuotient::measure(test_governor(), readout.clone(), &[readout.view()], &[transition.view()])
                 .expect("measure");
         let leak = unclosed.quotient_bounds[0].lower;
         assert!(leak > 0.0);
@@ -2153,7 +2217,7 @@ mod tests {
         assert!(closed.readout_bounds[0].upper < leak);
         assert!(closed.realization_bounds[0].lower > 0.0);
 
-        let static_chart = LinearStateQuotient::close(&[readout.view()], &[]).expect("close");
+        let static_chart = LinearStateQuotient::close(test_governor(), &[readout.view()], &[]).expect("close");
         assert_eq!(static_chart.chart.nrows(), 1);
     }
 
@@ -2165,6 +2229,7 @@ mod tests {
         let shear = array![[1.0, 0.0], [1.0, 1.0]];
         let observe_first = array![[1.0, 0.0]];
         let quotient = LinearStateQuotient::measure(
+            test_governor(),
             observe_first.clone(),
             &[observe_first.view()],
             &[shear.view()],
@@ -2178,7 +2243,7 @@ mod tests {
         );
 
         let observe_second = array![[0.0, 1.0]];
-        let closed = LinearStateQuotient::close(&[observe_second.view()], &[shear.view()])
+        let closed = LinearStateQuotient::close(test_governor(), &[observe_second.view()], &[shear.view()])
             .expect("close");
         assert_eq!(closed.chart.nrows(), 2);
     }
@@ -2235,23 +2300,23 @@ mod tests {
     /// the resolver's own band.
     #[test]
     fn stacked_factor_resolver_refuses_invalid_input() {
-        let resolved = resolve_stacked_factor(&array![[3.0, 4.0]], 0.0).expect("resolve");
+        let resolved = resolve_stacked_factor(test_governor(), &array![[3.0, 4.0]], 0.0).expect("resolve");
         assert_eq!((resolved.resolved_rank, resolved.rank_ceiling), (1, 1));
         assert!((resolved.singular_values[0] - 5.0).abs() <= resolved.band);
         assert!(matches!(
-            resolve_stacked_factor(&array![[f64::NAN]], 0.0),
+            resolve_stacked_factor(test_governor(), &array![[f64::NAN]], 0.0),
             Err(StateError::NonFinite { .. })
         ));
         assert!(matches!(
-            resolve_stacked_factor(&array![[1.0]], f64::INFINITY),
+            resolve_stacked_factor(test_governor(), &array![[1.0]], f64::INFINITY),
             Err(StateError::NonFinite { .. })
         ));
         assert!(matches!(
-            resolve_stacked_factor(&array![[1.0]], -1.0),
+            resolve_stacked_factor(test_governor(), &array![[1.0]], -1.0),
             Err(StateError::NegativeBound { value, .. }) if value == -1.0
         ));
         assert!(matches!(
-            resolve_stacked_factor(&Array2::<f64>::zeros((0, 2)), 0.0),
+            resolve_stacked_factor(test_governor(), &Array2::<f64>::zeros((0, 2)), 0.0),
             Err(StateError::EmptyFamily { .. })
         ));
     }
@@ -2296,16 +2361,16 @@ mod tests {
             [0.0, 0.0, 0.0, 1.0]
         ];
         let transition = frame.dot(&block).dot(&frame);
-        let whole = recover_plane_rotations(transition.view())
+        let whole = recover_plane_rotations(test_governor(), transition.view())
             .expect("recovery of T");
         let (whole_low, whole_high) =
             single_plane_cosines(&whole).expect("T rotates exactly one plane");
 
         let in_plane = frame.slice(s![..1, ..]).to_owned();
-        let closed = LinearStateQuotient::close(&[in_plane.view()], &[transition.view()])
+        let closed = LinearStateQuotient::close(test_governor(), &[in_plane.view()], &[transition.view()])
             .expect("close");
         assert_eq!(closed.chart.nrows(), 2);
-        let descended = recover_plane_rotations(closed.descended[0].view())
+        let descended = recover_plane_rotations(test_governor(), closed.descended[0].view())
             .expect("recovery of G");
         assert_eq!(descended.clusters.len(), 1);
         let (low, high) = single_plane_cosines(&descended).expect("G rotates one plane");
@@ -2326,10 +2391,10 @@ mod tests {
         assert_eq!(descended.ambiguities(), vec![RotationAmbiguity::Winding]);
 
         let fixed_readout = frame.slice(s![2..3, ..]).to_owned();
-        let fixed = LinearStateQuotient::close(&[fixed_readout.view()], &[transition.view()])
+        let fixed = LinearStateQuotient::close(test_governor(), &[fixed_readout.view()], &[transition.view()])
             .expect("close");
         assert_eq!(fixed.chart.nrows(), 1);
-        let identity = recover_plane_rotations(fixed.descended[0].view())
+        let identity = recover_plane_rotations(test_governor(), fixed.descended[0].view())
             .expect("recovery of the fixed descent");
         assert_eq!(identity.ambiguities(), vec![RotationAmbiguity::Identity]);
     }

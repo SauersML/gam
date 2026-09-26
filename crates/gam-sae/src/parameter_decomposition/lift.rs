@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use gam_linalg::utils::splitmix64_hash;
-use gam_runtime::resource::Governed;
+use gam_runtime::resource::{Governed, MemoryGovernor};
 use ndarray::{Array1, Array2, ArrayView2, ArrayViewD};
 use serde::{Deserialize, Serialize};
 
@@ -440,12 +440,13 @@ impl<'a> ResidualAnchor<'a> {
     /// for an identity use and `x Theta_*` for a transposed one.
     pub fn native_apply(
         &self,
+        governor: &MemoryGovernor,
         inputs: ArrayView2<'_, f64>,
         orientation: TieOrientation,
     ) -> Result<Governed<Array2<f64>>, LiftError> {
         Ok(match orientation {
-            TieOrientation::Identity => native_linear(self.native, inputs)?,
-            TieOrientation::Transpose => native_linear(self.native.t(), inputs)?,
+            TieOrientation::Identity => native_linear(governor, self.native, inputs)?,
+            TieOrientation::Transpose => native_linear(governor, self.native.t(), inputs)?,
         })
     }
 
@@ -453,17 +454,19 @@ impl<'a> ResidualAnchor<'a> {
     /// `Theta(m)`.
     pub fn apply(
         &self,
+        governor: &MemoryGovernor,
         mask: &AnchorMask,
         inputs: ArrayView2<'_, f64>,
         orientation: TieOrientation,
     ) -> Result<Governed<Array2<f64>>, LiftError> {
         self.check_mask(mask)?;
         if mask.is_all_on() {
-            return self.native_apply(inputs, orientation);
+            return self.native_apply(governor, inputs, orientation);
         }
         let term_scales = self.term_scales(&self.moment_of_valid_mask(mask));
         Ok(match orientation {
             TieOrientation::Identity => apply_anchored_linear(
+                governor,
                 self.native,
                 mask.residual,
                 self.basis.view(),
@@ -471,6 +474,7 @@ impl<'a> ResidualAnchor<'a> {
                 inputs,
             )?,
             TieOrientation::Transpose => apply_anchored_linear(
+                governor,
                 self.native.t(),
                 mask.residual,
                 FactorView::new(self.basis.right(), self.basis.left())?,
@@ -1097,6 +1101,7 @@ mod executor_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parameter_decomposition::test_support::test_governor;
     use gam_linalg::roundoff::accumulation_growth;
     use gam_linalg::utils::splitmix64;
     use ndarray::{Axis, concatenate};
@@ -1255,7 +1260,7 @@ mod tests {
             let growth = accumulation_growth(anchor_depth) + accumulation_growth(edited_depth);
             for mask in masks {
                 let lifted = anchor
-                    .apply(mask, inputs.view(), orientation)
+                    .apply(test_governor(), mask, inputs.view(), orientation)
                     .expect("a valid mask applies");
                 let reference = read(&inputs, &edited_tensor(native, blocks, vectors, mask), orientation);
                 let magnitude = absolute_edit_magnitude(native, blocks, vectors, mask);
@@ -1361,9 +1366,9 @@ mod tests {
                 TieOrientation::Transpose => (6, native.t()),
             };
             let inputs = random_matrix(5, width, &mut state);
-            let teacher = native_linear(teacher_view, inputs.view()).expect("a small product is admitted");
+            let teacher = native_linear(test_governor(), teacher_view, inputs.view()).expect("a small product is admitted");
             let lifted = anchor
-                .apply(&AnchorMask::all_on(3), inputs.view(), orientation)
+                .apply(test_governor(), &AnchorMask::all_on(3), inputs.view(), orientation)
                 .expect("the all-on mask applies");
             assert!(
                 lifted.iter().zip(teacher.iter()).all(|(a, b)| a.to_bits() == b.to_bits()),
@@ -1375,7 +1380,7 @@ mod tests {
             let mut one_off = AnchorMask::all_on(3);
             one_off.components[0] = 0.0;
             let moved = anchor
-                .apply(&one_off, inputs.view(), orientation)
+                .apply(test_governor(), &one_off, inputs.view(), orientation)
                 .expect("a valid mask applies");
             assert!(
                 moved.iter().zip(teacher.iter()).any(|(a, b)| a.to_bits() != b.to_bits()),
@@ -1645,13 +1650,14 @@ mod tests {
         ));
 
         let inputs = random_matrix(2, 3, &mut state);
-        assert!(anchor.apply(&AnchorMask::all_on(1), inputs.view(), TieOrientation::Identity).is_ok());
+        assert!(anchor.apply(test_governor(), &AnchorMask::all_on(1), inputs.view(), TieOrientation::Identity).is_ok());
         assert!(matches!(
-            anchor.apply(&AnchorMask::all_on(2), inputs.view(), TieOrientation::Identity),
+            anchor.apply(test_governor(), &AnchorMask::all_on(2), inputs.view(), TieOrientation::Identity),
             Err(LiftError::MaskLength { components: 1, mask: 2 })
         ));
         assert!(matches!(
             anchor.apply(
+                test_governor(),
                 &AnchorMask { residual: f64::NAN, components: vec![1.0] },
                 inputs.view(),
                 TieOrientation::Identity
@@ -1659,7 +1665,7 @@ mod tests {
             Err(LiftError::NonFiniteMask)
         ));
         assert!(matches!(
-            anchor.apply(&AnchorMask::all_on(1), inputs.view(), TieOrientation::Transpose),
+            anchor.apply(test_governor(), &AnchorMask::all_on(1), inputs.view(), TieOrientation::Transpose),
             Err(LiftError::Apply(ApplyError::Shape { .. }))
         ));
     }

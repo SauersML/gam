@@ -320,6 +320,7 @@ impl std::error::Error for GaussianBlockError {}
 /// factors with a flat prior can never shrink to no effect (SPEC 12/14). That refusal
 /// and every other one from the owner are returned unchanged.
 pub fn fit_gaussian_coefficient_block(
+    governor: &MemoryGovernor,
     rows: GaussianBlockRows<'_>,
     right_factors: &[ArrayView2<'_, f64>],
     field_penalties: &[ArrayView2<'_, f64>],
@@ -429,7 +430,7 @@ pub fn fit_gaussian_coefficient_block(
     }
     let ranks: Vec<usize> = right_factors.iter().map(|factor| factor.ncols()).collect();
     let reservation = admit_dense_block(
-        MemoryGovernor::global(),
+        governor,
         n,
         &ranks,
         field_penalties.len(),
@@ -998,6 +999,7 @@ pub fn decide_proposal<W, D, V, E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parameter_decomposition::test_support::test_governor;
     use gam_linalg::faer_ndarray::FaerEigh;
     use ndarray::{Array1, array};
 
@@ -1153,7 +1155,7 @@ mod tests {
     fn block_fit_reads_left_factors_in_design_order() {
         let data = fixture(&SUFFICIENCY_MASKS, generic_right_factors());
         let right = data.right_views();
-        let fit = fit_gaussian_coefficient_block(data.rows(), &right, &data.penalty_views())
+        let fit = fit_gaussian_coefficient_block(test_governor(), data.rows(), &right, &data.penalty_views())
             .expect("the full-rank sufficiency fixture is admitted and fitted");
         assert_eq!(fit.left_factors.len(), BASIS);
         for factor in &fit.left_factors {
@@ -1231,7 +1233,7 @@ mod tests {
     fn block_penalty_is_the_function_space_penalty_of_each_output() {
         let data = fixture(&SUFFICIENCY_MASKS, generic_right_factors());
         let right = data.right_views();
-        let fit = fit_gaussian_coefficient_block(data.rows(), &right, &data.penalty_views())
+        let fit = fit_gaussian_coefficient_block(test_governor(), data.rows(), &right, &data.penalty_views())
             .expect("the full-rank sufficiency fixture is admitted and fitted");
         let columns = BASIS * RANK;
         let penalty = block_penalty(0, data.penalty.view(), &right)
@@ -1360,7 +1362,7 @@ mod tests {
             masks.push(native_multiple);
             let data = fixture(&masks, generic_right_factors());
             let right = data.right_views();
-            let refused = fit_gaussian_coefficient_block(data.rows(), &right, &data.penalty_views());
+            let refused = fit_gaussian_coefficient_block(test_governor(), data.rows(), &right, &data.penalty_views());
             assert!(
                 matches!(
                     refused,
@@ -1376,7 +1378,7 @@ mod tests {
         let admitted = fixture(&ablation, generic_right_factors());
         let admitted_right = admitted.right_views();
         let fit =
-            fit_gaussian_coefficient_block(admitted.rows(), &admitted_right, &admitted.penalty_views());
+            fit_gaussian_coefficient_block(test_governor(), admitted.rows(), &admitted_right, &admitted.penalty_views());
         assert!(
             matches!(&fit, Ok(block) if block.reml.evaluation.reml_score.is_finite()),
             "a residual-on ablation row must be admitted and fitted, got {fit:?}"
@@ -1391,6 +1393,7 @@ mod tests {
         cancelled.moments.row_mut(3 * INPUT_ROWS).fill(0.0);
         let cancelled_right = cancelled.right_views();
         let cancelled_fit = fit_gaussian_coefficient_block(
+            test_governor(),
             cancelled.rows(),
             &cancelled_right,
             &cancelled.penalty_views(),
@@ -1408,6 +1411,7 @@ mod tests {
         let mut lopsided = data.penalty.clone();
         lopsided[[0, 1]] = -2.0 + 1e-3;
         let refused = fit_gaussian_coefficient_block(
+            test_governor(),
             data.rows(),
             &right,
             &[lopsided.view(), data.null_penalty.view()],
@@ -1454,19 +1458,19 @@ mod tests {
     fn an_energy_penalty_alone_is_refused_because_its_null_space_escapes_shrinkage() {
         let data = fixture(&SUFFICIENCY_MASKS, generic_right_factors());
         let right = data.right_views();
-        let energy_only = fit_gaussian_coefficient_block(data.rows(), &right, &[data.penalty.view()]);
+        let energy_only = fit_gaussian_coefficient_block(test_governor(), data.rows(), &right, &[data.penalty.view()]);
         assert!(
             matches!(energy_only, Err(GaussianBlockError::Reml(..))),
             "the energy penalty leaves constant and linear fields free, so the owner must refuse \
              the declared zero null space, got {energy_only:?}"
         );
         // Positive control: the same rows with the null-space form added have a proper prior.
-        let proper = fit_gaussian_coefficient_block(data.rows(), &right, &data.penalty_views());
+        let proper = fit_gaussian_coefficient_block(test_governor(), data.rows(), &right, &data.penalty_views());
         assert!(
             matches!(&proper, Ok(block) if block.reml.evaluation.reml_score.is_finite()),
             "energy plus null-space penalty must be admitted and fitted, got {proper:?}"
         );
-        let empty = fit_gaussian_coefficient_block(data.rows(), &right, &[]);
+        let empty = fit_gaussian_coefficient_block(test_governor(), data.rows(), &right, &[]);
         assert!(
             matches!(empty, Err(GaussianBlockError::NoFieldPenalties)),
             "an empty penalty list declares no prior and must be refused, got {empty:?}"
@@ -1766,7 +1770,7 @@ mod tests {
         let data = prior_fixture();
         let right = data.right_views();
         let penalties = data.penalty_views();
-        let fit = fit_gaussian_coefficient_block(data.rows(), &right, &penalties)
+        let fit = fit_gaussian_coefficient_block(test_governor(), data.rows(), &right, &penalties)
             .expect("the prior fixture is admitted and fitted");
         assert!(
             fit.reml
@@ -1891,7 +1895,7 @@ mod tests {
     fn block_cotangents_refuse_arrays_the_fit_was_not_built_from() {
         let data = prior_fixture();
         let right = data.right_views();
-        let fit = fit_gaussian_coefficient_block(data.rows(), &right, &data.penalty_views())
+        let fit = fit_gaussian_coefficient_block(test_governor(), data.rows(), &right, &data.penalty_views())
             .expect("the prior fixture is admitted and fitted");
         assert!(
             matches!(
@@ -1951,7 +1955,7 @@ mod tests {
     fn block_cotangents_return_a_railed_strength_typed() {
         let data = prior_fixture();
         let right = data.right_views();
-        let mut fit = fit_gaussian_coefficient_block(data.rows(), &right, &data.penalty_views())
+        let mut fit = fit_gaussian_coefficient_block(test_governor(), data.rows(), &right, &data.penalty_views())
             .expect("the prior fixture is admitted and fitted");
         let mut railed = fit.reml.rho_placement.clone();
         railed[1] = GaussianRemlMultiPenaltyRhoPlacement::UpperBound;

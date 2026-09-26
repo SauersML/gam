@@ -83,6 +83,7 @@ use gam_linalg::faer_ndarray::{FaerLinalgError, FaerSvd, strict_symmetric_eigh};
 use gam_linalg::roundoff::{
     SymmetricAssembly, accumulation_growth, factor_singular_band, symmetric_spectrum_rounding_band,
 };
+use gam_runtime::resource::{MemoryGovernor, MemoryReservationError};
 use ndarray::{Array2, ArrayView2};
 use std::f64::consts::SQRT_2;
 
@@ -102,6 +103,8 @@ pub enum PlaneRotationError {
     },
     /// The singular value or symmetric eigendecomposition failed.
     Linalg(FaerLinalgError),
+    /// The dense working set of the recovery does not fit the memory budget.
+    Memory(MemoryReservationError),
     /// A cluster whose cosine interval excludes both `+1` and `-1` has odd
     /// dimension. The eigenvalues of `S(O)` inside `(-1, 1)` come in pairs, and a
     /// valid `beta` keeps every cluster a union of whole true eigenvalue groups, so
@@ -132,6 +135,7 @@ impl std::fmt::Display for PlaneRotationError {
             Self::Linalg(error) => {
                 write!(formatter, "plane-rotation recovery decomposition failed: {error}")
             }
+            Self::Memory(error) => write!(formatter, "plane-rotation recovery: {error}"),
             Self::OddInteriorCluster { cluster, dimension } => write!(
                 formatter,
                 "plane-rotation recovery: interior cluster {cluster} has odd dimension \
@@ -281,6 +285,7 @@ impl PlaneRotationRecovery {
 /// above, `J = G / s` carries the true orientation and is reported; otherwise it is
 /// `None`.
 pub fn recover_plane_rotations(
+    governor: &MemoryGovernor,
     matrix: ArrayView2<'_, f64>,
 ) -> Result<PlaneRotationRecovery, PlaneRotationError> {
     let (rows, cols) = matrix.dim();
@@ -291,6 +296,13 @@ pub fn recover_plane_rotations(
         return Err(PlaneRotationError::NonFinite { row, col });
     }
     let dimension = rows;
+    // `d × d` arrays live at the peak, while the eigendecomposition runs: `S`, `K`, the
+    // decomposition's working copy and its eigenvectors, and the cluster bases (whose
+    // widths sum to `d`). The singular value decomposition's one working copy is freed
+    // before `S` and `K` are formed.
+    let working = governor
+        .try_reserve_dense_f64_copies(dimension, dimension, 5, "plane-rotation recovery")
+        .map_err(PlaneRotationError::Memory)?;
     let (_, singular_values, _) = matrix
         .svd(false, false)
         .map_err(PlaneRotationError::Linalg)?;
@@ -407,6 +419,7 @@ pub fn recover_plane_rotations(
             kind,
         });
     }
+    drop(working);
     Ok(PlaneRotationRecovery {
         orthogonality_defect,
         perturbation_bound,
@@ -457,6 +470,7 @@ fn frobenius_norm(matrix: ArrayView2<'_, f64>) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parameter_decomposition::test_support::test_governor;
     use crate::parameter_decomposition::test_support::{Planted, plant, projector_distance};
     use gam_linalg::decision::projector_error_bar;
     use ndarray::s;
@@ -469,7 +483,7 @@ mod tests {
     const DIMENSION: usize = 8;
 
     fn recover_planted(planted: &Planted) -> PlaneRotationRecovery {
-        recover_plane_rotations(planted.matrix.view()).expect("recovery")
+        recover_plane_rotations(test_governor(), planted.matrix.view()).expect("recovery")
     }
 
     /// Bound on `||O - Q_o B_o Q_o^T||_2` for the polar factor `O` the recovery certifies:
@@ -634,7 +648,7 @@ mod tests {
         let gap = 0.9_f64.cos() - 1.0_f64.cos();
         let scale = 1.0 - gap;
         let scaled = planted.matrix.mapv(|value| scale * value);
-        let coarse = recover_plane_rotations(scaled.view()).expect("recovery");
+        let coarse = recover_plane_rotations(test_governor(), scaled.view()).expect("recovery");
         assert!(
             coarse.orthogonality_defect >= gap - scale * planted.matrix_defect,
             "rho_bar {} does not cover the scaling's distance {gap}",
@@ -670,7 +684,7 @@ mod tests {
         // singular-value band twice, the measurement's and the certificate's.
         let basis = exact_hidden_basis(0x2951_0010);
         let dimension = basis.nrows();
-        let exact = recover_plane_rotations(basis.view()).expect("recovery");
+        let exact = recover_plane_rotations(test_governor(), basis.view()).expect("recovery");
         assert!(
             exact.orthogonality_defect
                 <= 2.0
@@ -705,7 +719,7 @@ mod tests {
         let perturbed = Array2::from_shape_fn((dimension, dimension), |(row, col)| {
             basis[[row, col]] * steps[col]
         });
-        let measured = recover_plane_rotations(perturbed.view()).expect("recovery");
+        let measured = recover_plane_rotations(test_governor(), perturbed.view()).expect("recovery");
         let sigma_max = steps.iter().fold(0.0_f64, |acc, &value| acc.max(value));
         let band = factor_singular_band(
             dimension,
@@ -740,7 +754,7 @@ mod tests {
         let largest = ((frobenius_squared + (frobenius_squared * frobenius_squared - 4.0).sqrt())
             / 2.0)
             .sqrt();
-        let operator = recover_plane_rotations(conjugated.view()).expect("recovery");
+        let operator = recover_plane_rotations(test_governor(), conjugated.view()).expect("recovery");
         assert!(
             operator.orthogonality_defect >= largest - 1.0 - formation,
             "rho_bar {} does not cover the operator's distance {}",
@@ -753,7 +767,7 @@ mod tests {
         // column shrunk to a resolved singular value is recovered.
         let mut singular = basis.clone();
         singular.column_mut(3).fill(0.0);
-        match recover_plane_rotations(singular.view()) {
+        match recover_plane_rotations(test_governor(), singular.view()) {
             Err(PlaneRotationError::NotInvertible {
                 smallest_singular_value,
                 band,
@@ -765,7 +779,7 @@ mod tests {
         }
         let mut shrunk = basis.clone();
         shrunk.column_mut(3).mapv_inplace(|value| value / 1024.0);
-        let resolved = recover_plane_rotations(shrunk.view()).expect("recovery");
+        let resolved = recover_plane_rotations(test_governor(), shrunk.view()).expect("recovery");
         assert!(resolved.orthogonality_defect >= 1.0 - 1.0 / 1024.0);
     }
 
@@ -806,7 +820,7 @@ mod tests {
     #[test]
     fn identity_reports_no_plane_and_the_largest_angle_it_cannot_exclude_2951() {
         let identity = Array2::<f64>::eye(DIMENSION);
-        let recovery = recover_plane_rotations(identity.view()).expect("recovery");
+        let recovery = recover_plane_rotations(test_governor(), identity.view()).expect("recovery");
         assert_eq!(recovery.clusters.len(), 1, "{recovery:?}");
         let cluster = &recovery.clusters[0];
         assert!(cluster.separation.is_infinite());
@@ -879,7 +893,7 @@ mod tests {
         // their sine floor `sqrt(1 - 0.996^2) ~ 0.095` is below the skew error
         // `rho_bar + 2 sqrt(2) bar`, so no orientation is certified.
         let scaled = planted.matrix.mapv(|value| 0.9 * value);
-        let withheld = recover_plane_rotations(scaled.view()).expect("recovery");
+        let withheld = recover_plane_rotations(test_governor(), scaled.view()).expect("recovery");
         assert_eq!(withheld.clusters.len(), 2, "{withheld:?}");
         for cluster in &withheld.clusters {
             assert!(

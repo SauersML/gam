@@ -245,6 +245,7 @@ impl std::error::Error for SeedError {}
 /// The result holds the governor charge of the seeded factors. The shapes are
 /// checked by [`NativeMlp::new`], after both decompositions.
 pub fn seed_mlp(
+    governor: &MemoryGovernor,
     read_in: Array2<f64>,
     bias_in: Array1<f64>,
     write_out: Array2<f64>,
@@ -252,7 +253,7 @@ pub fn seed_mlp(
     activation: GaussianActivation,
 ) -> Result<Governed<MlpSeed>, SeedError> {
     let ledger = seed_ledger(read_in.dim(), write_out.dim()).ok_or(SeedError::SizeOverflow)?;
-    let (factors, scratch) = reserve_seed(ledger)?;
+    let (factors, scratch) = reserve_seed(governor, ledger)?;
     let spectrum = |factor: MlpFactor, weight: &Array2<f64>| {
         RankRevealingRead::new(weight)
             .map(RankRevealingRead::into_parts)
@@ -342,10 +343,11 @@ fn seed_ledger(read_in: (usize, usize), write_out: (usize, usize)) -> Option<See
     })
 }
 
-/// Charges the ledger to the process memory governor: the factors' charge, then the
-/// scratch charge.
-fn reserve_seed(ledger: SeedLedger) -> Result<(MemoryReservation, MemoryReservation), SeedError> {
-    let governor = MemoryGovernor::global();
+/// Charges the ledger to `governor`: the factors' charge, then the scratch charge.
+fn reserve_seed(
+    governor: &MemoryGovernor,
+    ledger: SeedLedger,
+) -> Result<(MemoryReservation, MemoryReservation), SeedError> {
     let factors = governor
         .try_reserve(ledger.persistent_bytes, "MLP seed factors")
         .map_err(SeedError::Memory)?;
@@ -358,6 +360,7 @@ fn reserve_seed(ledger: SeedLedger) -> Result<(MemoryReservation, MemoryReservat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parameter_decomposition::test_support::test_governor;
     use crate::parameter_decomposition::rewrite::{ComponentMask, MlpMask};
     use ndarray::array;
     use rand::rngs::StdRng;
@@ -516,7 +519,7 @@ mod tests {
         .expect("the teacher's shapes compose")
         .execute(inputs.view())
         .expect("the teacher executes");
-        let seed = seed_mlp(read_in, bias_in, write_out, bias_out, GaussianActivation::ExactGelu)
+        let seed = seed_mlp(test_governor(), read_in, bias_in, write_out, bias_out, GaussianActivation::ExactGelu)
             .expect("a random block is seeded");
         assert_eq!(seed.read_in().singular_values().len(), WIDTH);
         assert_eq!(seed.write_out().singular_values().len(), HIDDEN);
@@ -587,7 +590,7 @@ mod tests {
         );
 
         assert!(
-            reserve_seed(ledger).is_ok(),
+            reserve_seed(test_governor(), ledger).is_ok(),
             "a {ledger:?} ledger must be admitted (positive control)"
         );
         // 2^55 bytes of factors: no host holds them.
@@ -597,7 +600,7 @@ mod tests {
         };
         assert!(
             matches!(
-                reserve_seed(huge),
+                reserve_seed(test_governor(), huge),
                 Err(SeedError::Memory(MemoryReservationError::BudgetExceeded { .. }))
             ),
             "a {huge:?} ledger was not refused by the memory governor"
@@ -613,6 +616,7 @@ mod tests {
         let bias_out = uniform_vector(&mut rng, WIDTH);
         write_out[[1, 2]] = f64::NAN;
         let refused = seed_mlp(
+            test_governor(),
             read_in.clone(),
             bias_in.clone(),
             write_out.clone(),
@@ -637,7 +641,7 @@ mod tests {
 
         // Positive control: the same block with a finite entry is seeded.
         write_out[[1, 2]] = 0.25;
-        let seeded = seed_mlp(read_in, bias_in, write_out, bias_out, GaussianActivation::Relu);
+        let seeded = seed_mlp(test_governor(), read_in, bias_in, write_out, bias_out, GaussianActivation::Relu);
         assert!(seeded.is_ok(), "a finite block must be seeded, got {seeded:?}");
     }
 }

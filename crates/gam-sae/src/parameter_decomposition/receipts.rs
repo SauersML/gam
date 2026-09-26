@@ -65,6 +65,7 @@ use super::gated_rewrite::{GatedRewriteError, MaskedNorm, swiglu_hidden};
 use super::occurrence::{OccurrenceError, PositionScope};
 use super::rewrite::{NativeMlp, ShapeMismatch};
 use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
+use gam_runtime::resource::MemoryGovernor;
 use gam_math::gaussian_activation::{GaussianActivation, GaussianActivationError};
 use gam_math::gaussian_gated::silu_derivatives;
 use ndarray::{Array2, ArrayView1, ArrayView2, Zip};
@@ -524,7 +525,10 @@ pub struct MlpBlockReceipt {
 
 /// The whole stage map of one residual MLP block ([`MlpBlockReceipt`]). It refuses before
 /// executing anything unless `external_execution` is binary64 with TF32 off.
-pub fn mlp_block_receipt(block: MlpBlockReceiptInputs<'_>) -> Result<MlpBlockReceipt, ReceiptRefusal> {
+pub fn mlp_block_receipt(
+    governor: &MemoryGovernor,
+    block: MlpBlockReceiptInputs<'_>,
+) -> Result<MlpBlockReceipt, ReceiptRefusal> {
     block.external_execution.require_binary64_bands()?;
     check("read-in bias length", block.weight.nrows(), block.bias.len())?;
     let native = NativeMlp::new(
@@ -538,6 +542,7 @@ pub fn mlp_block_receipt(block: MlpBlockReceiptInputs<'_>) -> Result<MlpBlockRec
     // Anchor one rounds nothing, and the bias is added after the kernel: the path the
     // factored-edit band counts.
     let edited = apply_anchored_linear(
+        governor,
         block.weight,
         1.0,
         FactorView::new(block.left, block.right)?,
@@ -623,13 +628,17 @@ fn reached_rows(scope: &PositionScope, mut unedited: Array2<f64>, edited: &Array
 
 /// The native execution of one read at `inputs`: [`apply_anchored_linear`] at anchor one on
 /// the rows the edit reaches, [`native_linear`] on every other row.
-fn read_native(read: EditedRead<'_>, inputs: ArrayView2<'_, f64>) -> Result<Array2<f64>, ReceiptRefusal> {
-    let unedited = native_linear(read.weight, inputs)?;
+fn read_native(
+    governor: &MemoryGovernor,
+    read: EditedRead<'_>,
+    inputs: ArrayView2<'_, f64>,
+) -> Result<Array2<f64>, ReceiptRefusal> {
+    let unedited = native_linear(governor, read.weight, inputs)?;
     let Some(edit) = read.edit else {
         return Ok((*unedited).clone());
     };
     edit.rows.check_within(inputs.nrows())?;
-    let edited = apply_anchored_linear(read.weight, 1.0, edit.factors, edit.coefficients, inputs)?;
+    let edited = apply_anchored_linear(governor, read.weight, 1.0, edit.factors, edit.coefficients, inputs)?;
     Ok(reached_rows(edit.rows, (*unedited).clone(), &edited))
 }
 
@@ -656,12 +665,13 @@ fn read_band(read: EditedRead<'_>, inputs: ArrayView2<'_, f64>) -> Result<Array2
 /// One read executed natively at `inputs` and compared with the executor's rows against its
 /// band on both sides.
 fn banded_read_stage(
+    governor: &MemoryGovernor,
     external_execution: ExternalExecution<'_>,
     read: EditedRead<'_>,
     inputs: ArrayView2<'_, f64>,
     external: ArrayView2<'_, f64>,
 ) -> Result<StageAgreement, ReceiptRefusal> {
-    let native = read_native(read, inputs)?;
+    let native = read_native(governor, read, inputs)?;
     let band = read_band(read, inputs)?;
     compare_stage(external_execution, external, native.view(), band.view(), band.view())
 }
@@ -879,11 +889,12 @@ pub struct SwigluBlockReceipt {
 /// anything unless `external_execution` is binary64 with TF32 off, and refuses an edit whose
 /// declared rows fall outside the rows it reads.
 pub fn swiglu_block_receipt(
+    governor: &MemoryGovernor,
     block: SwigluBlockReceiptInputs<'_>,
 ) -> Result<SwigluBlockReceipt, ReceiptRefusal> {
     block.external_execution.require_binary64_bands()?;
-    let gate = banded_read_stage(block.external_execution, block.gate, block.inputs, block.external_gate)?;
-    let up_stage = banded_read_stage(block.external_execution, block.up, block.inputs, block.external_up)?;
+    let gate = banded_read_stage(governor, block.external_execution, block.gate, block.inputs, block.external_gate)?;
+    let up_stage = banded_read_stage(governor, block.external_execution, block.up, block.inputs, block.external_up)?;
 
     let native_activation = block.external_gate.mapv(|value| silu_derivatives(value)[0]);
     let activation_measured = measured_discrepancy(
@@ -915,6 +926,7 @@ pub fn swiglu_block_receipt(
     )?;
 
     let output = banded_read_stage(
+        governor,
         block.external_execution,
         block.down,
         block.external_hidden,
@@ -922,10 +934,10 @@ pub fn swiglu_block_receipt(
     )?;
 
     let native_hidden_from_inputs = swiglu_hidden(
-        read_native(block.gate, block.inputs)?.view(),
-        read_native(block.up, block.inputs)?.view(),
+        read_native(governor, block.gate, block.inputs)?.view(),
+        read_native(governor, block.up, block.inputs)?.view(),
     )?;
-    let end_to_end = read_native(block.down, native_hidden_from_inputs.view())?;
+    let end_to_end = read_native(governor, block.down, native_hidden_from_inputs.view())?;
     let end_to_end_measured = measured_discrepancy(
         "external output",
         "native end-to-end output",
@@ -946,6 +958,7 @@ pub fn swiglu_block_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parameter_decomposition::test_support::test_governor;
     use ndarray::{Array1, array};
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
@@ -1397,7 +1410,7 @@ mod tests {
         let external_output = affine_forward(&weight_out, &external_activation) + &bias_out;
 
         let receipt_for = |execution: ExternalExecution<'static>, pre_activation: &Array2<f64>| {
-            mlp_block_receipt(MlpBlockReceiptInputs {
+            mlp_block_receipt(test_governor(), MlpBlockReceiptInputs {
                 external_execution: execution,
                 activation: GaussianActivation::ExactGelu,
                 weight: weight.view(),
@@ -1501,7 +1514,7 @@ mod tests {
                            gate_rows: &PositionScope,
                            executed_gate: &Array2<f64>,
                            executed_hidden: &Array2<f64>| {
-            swiglu_block_receipt(SwigluBlockReceiptInputs {
+            swiglu_block_receipt(test_governor(), SwigluBlockReceiptInputs {
                 external_execution: execution,
                 inputs: inputs.view(),
                 gate: EditedRead {

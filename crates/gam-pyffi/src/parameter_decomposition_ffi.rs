@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use gam::terms::sae::parameter_decomposition::surface::run_parameter_decomposition;
+use gam_runtime::resource::MemoryGovernor;
 use numpy::{IntoPyArray, PyReadonlyArrayDyn};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -45,7 +46,8 @@ fn parameter_decomposition_run<'py>(
     }
     let cancel = Arc::new(AtomicBool::new(false));
     let (report_json, arrays) = crate::run_sae_fit_interruptible(py, "gam-mpd", &cancel, move || {
-        run_parameter_decomposition(&request_json, &inputs)
+        // Python is a process entry, so the run reserves on the process-wide ledger.
+        run_parameter_decomposition(&request_json, &inputs, MemoryGovernor::global())
             .and_then(|output| output.report_json().map(|json| (json, output.arrays)))
     })?
     .map_err(|error| py_value_error(error.to_string()))?;
