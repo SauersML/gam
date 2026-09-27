@@ -127,6 +127,9 @@ pub mod gated_rewrite;
 // Exact canonical gauge forms of a native decoder layer, executed against the native layer.
 pub mod canonical;
 
+// Factored gauge-invariant joint operators: rotary QK planes, OV per head and group, Grams, equality.
+pub mod joint_operators;
+
 // Tensor registry and the exact residual anchor.
 pub mod lift;
 
