@@ -412,12 +412,4 @@ fn a_cancelling_pair_is_refuted_at_its_support_witness_through_the_executed_bloc
             "the mask {control:?} keeps the pair balanced and must not refute: {control_value:e}"
         );
     }
-
-    let law = system
-        .uniform_mask_law_moments(&domain, &kept, &direction)
-        .expect("the uniform-mask moments evaluate");
-    assert!(
-        law.mean.abs() <= law.mean_band && support.value - support.band > law.mean_band,
-        "the uniform-mask mean {law:?} must sit at zero while the support {support:?} does not"
-    );
 }

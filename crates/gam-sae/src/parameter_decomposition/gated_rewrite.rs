@@ -21,10 +21,6 @@
 //!   computed on each whole current residual row. `N_eps(c h) = sign(c)
 //!   N_(eps/c^2)(h)`, so a uniform scale of the stream reaches the next RMSNorm
 //!   only through `eps`, and a LayerNorm annihilates every write along `1`.
-//!
-//! [`MaskedNorm::pullback`] carries cotangents through the same summed inputs, so a
-//! parameter gradient through a masked norm (P16) never differentiates a
-//! per-component copy.
 
 use gam_math::gaussian_gated::silu_derivatives;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, Zip};
@@ -195,17 +191,6 @@ pub enum MaskedNorm<'a> {
     },
 }
 
-/// Cotangents of a normalization's residual rows and its tied parameters.
-#[derive(Clone, Debug, PartialEq)]
-pub struct NormCotangents {
-    /// `dl/dh` for every residual row.
-    pub residual: Array2<f64>,
-    /// `dl/dw`, summed over rows: every row reads the same gain.
-    pub gain: Array1<f64>,
-    /// `dl/dbeta` of a LayerNorm, summed over rows; an RMSNorm has no bias.
-    pub bias: Option<Array1<f64>>,
-}
-
 impl MaskedNorm<'_> {
     /// The normalized residual rows, in the source's order of operations:
     /// normalize, multiply by the gain, then add the bias.
@@ -260,82 +245,6 @@ impl MaskedNorm<'_> {
         Ok(output)
     }
 
-    /// The analytic pullback of [`MaskedNorm::apply`] at `residual` for the output
-    /// cotangent rows `y_bar`.
-    ///
-    /// Per row, with `z = w ⊙ y_bar` and `nu = (mean(x^2) + eps)^(-1/2)`, the
-    /// normalization `n = x nu` pulls back as `x_bar = nu z - (nu^3 / d)(z^T x) x`.
-    /// An RMSNorm reads `x = h`, so `h_bar = x_bar`. A LayerNorm reads `x = P h`,
-    /// and the centring projector is symmetric, so `h_bar = x_bar - mean(x_bar)`.
-    /// The gain cotangent sums `y_bar ⊙ n` over rows, and a LayerNorm's bias
-    /// cotangent sums `y_bar`.
-    pub fn pullback(
-        &self,
-        residual: ArrayView2<'_, f64>,
-        output_cotangent: ArrayView2<'_, f64>,
-    ) -> Result<NormCotangents, GatedRewriteError> {
-        let width = residual.ncols();
-        if width == 0 {
-            return Err(GatedRewriteError::EmptyResidual);
-        }
-        require_shape("normalization output cotangent", residual.dim(), output_cotangent.dim())?;
-        require_finite("normalized residual rows", residual)?;
-        require_finite("normalization output cotangent", output_cotangent)?;
-        let (epsilon, gain, centring) = match *self {
-            Self::Rms { epsilon, gain } => {
-                require_vector("RMSNorm gain", width, gain)?;
-                (epsilon, gain, false)
-            }
-            Self::Layer {
-                epsilon,
-                gain,
-                bias,
-            } => {
-                require_vector("LayerNorm gain", width, gain)?;
-                require_vector("LayerNorm bias", width, bias)?;
-                (epsilon, gain, true)
-            }
-        };
-        let read = if centring {
-            centred_rows(residual)
-        } else {
-            residual.to_owned()
-        };
-        let normalizers = rms_normalizers(read.view(), epsilon)?;
-        let mut residual_cotangent = Array2::zeros(residual.raw_dim());
-        let mut gain_cotangent = Array1::zeros(width);
-        for (((cotangent_row, read_row), output_row), &inverse_root) in residual_cotangent
-            .rows_mut()
-            .into_iter()
-            .zip(read.rows())
-            .zip(output_cotangent.rows())
-            .zip(normalizers.iter())
-        {
-            let scaled = Zip::from(gain)
-                .and(output_row)
-                .map_collect(|&weight, &cotangent| weight * cotangent);
-            let radial = inverse_root * inverse_root * inverse_root * scaled.dot(&read_row) / width as f64;
-            let mut read_cotangent = Zip::from(&scaled)
-                .and(read_row)
-                .map_collect(|&direction, &value| inverse_root * direction - radial * value);
-            if centring {
-                let cotangent_mean = read_cotangent.sum() / width as f64;
-                read_cotangent.mapv_inplace(|value| value - cotangent_mean);
-            }
-            Zip::from(cotangent_row)
-                .and(&read_cotangent)
-                .for_each(|slot, &value| *slot = value);
-            Zip::from(&mut gain_cotangent)
-                .and(output_row)
-                .and(read_row)
-                .for_each(|slot, &cotangent, &value| *slot += cotangent * (value * inverse_root));
-        }
-        Ok(NormCotangents {
-            residual: residual_cotangent,
-            gain: gain_cotangent,
-            bias: centring.then(|| output_cotangent.sum_axis(Axis(0))),
-        })
-    }
 }
 
 /// Every row minus its own mean, the LayerNorm read `P h`.
@@ -380,7 +289,7 @@ fn inverse_root_mean_square(
 mod tests {
     use super::{GatedRewriteError, MaskedNorm, rms_normalizers, swiglu_hidden};
     use gam_math::gaussian_gated::silu_derivatives;
-    use ndarray::{Array, Array1, Array2, ArrayView2, Axis, Dimension, Zip, arr0, array};
+    use ndarray::{Array, Array1, Array2, ArrayView2, Dimension, Zip, array};
     use qd::Quad;
     use rand::rngs::StdRng;
     use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
@@ -409,12 +318,6 @@ mod tests {
     fn inflate<D: Dimension>(tolerance: Array<f64, D>, operations: usize) -> Array<f64, D> {
         let factor = 1.0 - accumulation_growth(operations + 1);
         tolerance.mapv(|value| value / factor)
-    }
-
-    /// `2^-100`: qd's double-double resolves about `2^-104` relative per operation,
-    /// so this per-operation allowance covers the oracle's own error.
-    fn quad_relative() -> f64 {
-        0.5_f64.powi(100)
     }
 
     fn quad(value: f64) -> Quad {
@@ -721,209 +624,6 @@ mod tests {
     }
 
     #[test]
-    fn norm_pullbacks_match_a_double_double_central_difference() {
-        let mut rng = StdRng::seed_from_u64(2958);
-        let dim = 8;
-        // Eighths below 3 in magnitude: every row's LayerNorm centring is exact.
-        let residual = Array2::from_shape_simple_fn((ROWS, dim), || rng.random_range(-24..24) as f64 / 8.0);
-        let gain = Array1::from_shape_simple_fn(dim, || rng.random_range(-2.0..2.0));
-        let bias = Array1::from_shape_simple_fn(dim, || rng.random_range(-2.0..2.0));
-        let output_cotangent = uniform_rows(&mut rng, ROWS, dim, -1.0, 1.0);
-        let residual_direction = uniform_rows(&mut rng, ROWS, dim, -1.0, 1.0);
-        let gain_direction = Array1::from_shape_simple_fn(dim, || rng.random_range(-1.0..1.0));
-        let bias_direction = Array1::from_shape_simple_fn(dim, || rng.random_range(-1.0..1.0));
-        let epsilon = 1.0e-5;
-        for centring in [false, true] {
-            let norm = if centring {
-                MaskedNorm::Layer {
-                    epsilon,
-                    gain: gain.view(),
-                    bias: bias.view(),
-                }
-            } else {
-                MaskedNorm::Rms {
-                    epsilon,
-                    gain: gain.view(),
-                }
-            };
-            let cotangents = norm
-                .pullback(residual.view(), output_cotangent.view())
-                .expect("finite fixture");
-            let read = if centring {
-                let means = residual.sum_axis(Axis(1)) / dim as f64;
-                &residual - &means.insert_axis(Axis(1))
-            } else {
-                residual.clone()
-            };
-            let direction_means: Vec<Quad> = (0..ROWS)
-                .map(|row| {
-                    (0..dim).fold(quad(0.0), |sum, column| sum + quad(residual_direction[[row, column]]))
-                        / quad(dim as f64)
-                })
-                .collect();
-            let read_direction = Array2::from_shape_fn((ROWS, dim), |(row, column)| {
-                let direction = quad(residual_direction[[row, column]]);
-                if centring { direction - direction_means[row] } else { direction }
-            });
-
-            // `f(t) = sum_r <y_bar_r, N(h_r + t v_r; w + t omega, beta + t b)>` in double-double.
-            let evaluate = |step: f64| {
-                (0..ROWS).fold(quad(0.0), |total, row| {
-                    let points: Vec<Quad> = (0..dim)
-                        .map(|column| quad(read[[row, column]]) + quad(step) * read_direction[[row, column]])
-                        .collect();
-                    let square = points.iter().fold(quad(0.0), |sum, point| sum + *point * *point);
-                    let inverse_root = quad(1.0) / (square / quad(dim as f64) + quad(epsilon)).sqrt();
-                    (0..dim).fold(total, |sum, column| {
-                        let cotangent = quad(output_cotangent[[row, column]]);
-                        let weight = quad(gain[column]) + quad(step) * quad(gain_direction[column]);
-                        let offset = if centring {
-                            cotangent * (quad(bias[column]) + quad(step) * quad(bias_direction[column]))
-                        } else {
-                            quad(0.0)
-                        };
-                        sum + cotangent * weight * points[column] * inverse_root + offset
-                    })
-                })
-            };
-            let directional = |residual_cotangent: &Array2<f64>| {
-                let residual_part = Zip::from(residual_cotangent)
-                    .and(&residual_direction)
-                    .fold(quad(0.0), |sum, &value, &direction| sum + quad(value) * quad(direction));
-                let gain_part = Zip::from(&cotangents.gain)
-                    .and(&gain_direction)
-                    .fold(quad(0.0), |sum, &value, &direction| sum + quad(value) * quad(direction));
-                let bias_part = match &cotangents.bias {
-                    Some(bias_cotangent) => Zip::from(bias_cotangent)
-                        .and(&bias_direction)
-                        .fold(quad(0.0), |sum, &value, &direction| sum + quad(value) * quad(direction)),
-                    None => quad(0.0),
-                };
-                residual_part + gain_part + bias_part
-            };
-
-            // Cauchy, per row: along `x_r + t v_r`, `q_r(t) + eps = a_r + b_r t + c_r t^2`. On
-            // `|t| <= R_r` with `|b_r| R_r + c_r R_r^2 = a_r / 2`, `|q_r + eps| >= a_r / 2`. With
-            // `R = min_r R_r` the normalized part of `f` is bounded on `|t| <= R` by
-            // `M = sum_r P_r (2 / a_r)^(1/2)`, the bias part is linear, and for `|s| <= R / 2`,
-            // `|f'''(s)| <= 3! M / (R / 2)^3`: the central difference is within `8 step^2 M / R^3`.
-            let direction_f64 = read_direction.mapv(quad_to_f64);
-            let quadratics: Vec<(f64, f64, f64)> = (0..ROWS)
-                .map(|row| {
-                    let x = read.row(row);
-                    let v = direction_f64.row(row);
-                    (x.dot(&x) / dim as f64 + epsilon, 2.0 * x.dot(&v) / dim as f64, v.dot(&v) / dim as f64)
-                })
-                .collect();
-            let radius = quadratics
-                .iter()
-                .map(|&(a, b, c)| a / (b.abs() + (b * b + 2.0 * a * c).sqrt()))
-                .fold(f64::INFINITY, f64::min);
-            let bound_m = (0..ROWS)
-                .map(|row| {
-                    (0..dim)
-                        .map(|column| {
-                            output_cotangent[[row, column]].abs()
-                                * (gain[column].abs() + radius * gain_direction[column].abs())
-                                * (read[[row, column]].abs() + radius * direction_f64[[row, column]].abs())
-                        })
-                        .sum::<f64>()
-                        * (2.0 / quadratics[row].0).sqrt()
-                })
-                .sum::<f64>();
-            let step = radius * 0.5_f64.powi(20);
-            let central = (evaluate(step) - evaluate(-step)) / quad(2.0 * step);
-
-            // f64 entry radii. `nu` passes `d + 4` rounded operations; every term of
-            // `x_bar = nu z - (nu^3 / d)(z^T x) x` passes at most `4 d + 20`. The LayerNorm
-            // centring of the cotangent adds its mean's radius and `gamma_(d + 1)`. The gain
-            // cotangent's terms pass `d + 6` operations and the row sum `rows`; the bias
-            // cotangent's row sum `rows - 1`.
-            let term_gamma = accumulation_growth(4 * dim + 20);
-            let centring_gamma = accumulation_growth(dim + 1);
-            let gain_gamma = accumulation_growth(dim + 6 + ROWS);
-            let summation = accumulation_growth(ROWS - 1);
-            let mut entry_radius = 0.0;
-            let mut predicted_magnitude = 0.0;
-            let mut gain_magnitude = Array1::<f64>::zeros(dim);
-            let mut flipped_radial = cotangents.residual.clone();
-            let mut uncentred = cotangents.residual.clone();
-            for row in 0..ROWS {
-                let x = read.row(row);
-                let inverse_root = super::inverse_root_mean_square(row, x, epsilon).expect("finite row");
-                let scaled = &gain * &output_cotangent.row(row);
-                let projection = scaled.dot(&x);
-                let absolute_projection = Zip::from(&scaled)
-                    .and(x)
-                    .fold(0.0, |sum, &direction, &value| sum + (direction * value).abs());
-                let radial = inverse_root.powi(3) * projection / dim as f64;
-                let radial_magnitude = inverse_root.powi(3) * (projection.abs() + absolute_projection) / dim as f64;
-                let magnitudes = Zip::from(&scaled)
-                    .and(x)
-                    .map_collect(|&direction, &value| inverse_root * direction.abs() + radial_magnitude * value.abs());
-                let read_radius = magnitudes.mapv(|magnitude| term_gamma * magnitude / (1.0 - term_gamma));
-                let mean_radius = read_radius.sum() / dim as f64;
-                let mean_magnitude = magnitudes.sum() / dim as f64;
-                let scaled_mean = scaled.sum() / dim as f64;
-                for column in 0..dim {
-                    let residual_entry_radius = if centring {
-                        read_radius[column]
-                            + mean_radius
-                            + centring_gamma * (magnitudes[column] + mean_magnitude) / (1.0 - centring_gamma)
-                    } else {
-                        read_radius[column]
-                    };
-                    entry_radius += residual_entry_radius * residual_direction[[row, column]].abs();
-                    gain_magnitude[column] += (output_cotangent[[row, column]] * x[column] * inverse_root).abs();
-                    predicted_magnitude +=
-                        (cotangents.residual[[row, column]] * residual_direction[[row, column]]).abs();
-                    flipped_radial[[row, column]] += 2.0 * radial * x[column];
-                    uncentred[[row, column]] += inverse_root * scaled_mean;
-                }
-            }
-            let mut bias_oracle_magnitude = 0.0;
-            for column in 0..dim {
-                entry_radius +=
-                    gain_gamma * gain_magnitude[column] / (1.0 - gain_gamma) * gain_direction[column].abs();
-                predicted_magnitude += (cotangents.gain[column] * gain_direction[column]).abs();
-                if centring {
-                    let bias_magnitude = (0..ROWS).map(|row| output_cotangent[[row, column]].abs()).sum::<f64>();
-                    entry_radius += summation * bias_magnitude / (1.0 - summation) * bias_direction[column].abs();
-                    predicted_magnitude += bias_magnitude * bias_direction[column].abs();
-                    bias_oracle_magnitude +=
-                        bias_magnitude * (bias[column].abs() + step * bias_direction[column].abs());
-                }
-            }
-            let entries = ROWS * dim;
-            let tolerance = entry_radius
-                + 8.0 * step * step * bound_m / radius.powi(3)
-                + quad_relative() * (4 * entries + 8) as f64 * (bound_m + bias_oracle_magnitude) / step
-                + quad_relative() * (3 * entries) as f64 * predicted_magnitude;
-            let tolerance = inflate(arr0(tolerance), 6 * entries + 30).into_scalar();
-            let difference = quad_to_f64(directional(&cotangents.residual) - central).abs();
-            assert!(
-                difference / (1.0 - UNIT_ROUNDOFF) <= tolerance,
-                "centring {centring}: the norm pullback's directional derivative differs from the \
-                 double-double central difference by {difference:e}, beyond the derived bound {tolerance:e}"
-            );
-            let flipped_difference = quad_to_f64(directional(&flipped_radial) - central).abs();
-            assert!(
-                flipped_difference > tolerance,
-                "positive control (centring {centring}): a sign-flipped radial term must differ beyond \
-                 the bound {tolerance:e}, got {flipped_difference:e}"
-            );
-            if centring {
-                let uncentred_difference = quad_to_f64(directional(&uncentred) - central).abs();
-                assert!(
-                    uncentred_difference > tolerance,
-                    "positive control: a LayerNorm cotangent left uncentred must differ beyond the bound \
-                     {tolerance:e}, got {uncentred_difference:e}"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn rms_norm_sees_a_power_of_two_scale_only_through_epsilon() {
         let mut rng = StdRng::seed_from_u64(2953);
         let residual = uniform_rows(&mut rng, ROWS, 12, -3.0, 3.0);
@@ -1122,17 +822,6 @@ mod tests {
             }
             .apply(zero.view()),
             Err(GatedRewriteError::ShapeMismatch { what: "RMSNorm gain", .. })
-        ));
-        assert!(matches!(
-            MaskedNorm::Rms {
-                epsilon: 1.0e-6,
-                gain: gain.view(),
-            }
-            .pullback(zero.view(), array![[1.0, 2.0, 3.0]].view()),
-            Err(GatedRewriteError::ShapeMismatch {
-                what: "normalization output cotangent",
-                ..
-            })
         ));
         let empty_rows = Array2::<f64>::zeros((1, 0));
         let empty = Array1::<f64>::zeros(0);

@@ -31,10 +31,9 @@
 //!
 //! Splitting a cancelling pair `±a` into `n` pieces with independent uniform masks drives the mean
 //! square of the error to `a²/(6n)`, while `sup|E_n| = |a|`. The expectation under a mask law and a
-//! certified supremum are different numbers, and they live in different types:
-//! [`UniformMaskLawMoments`] is an expectation under a declared law and never a bound, while a
-//! support value is the computed sum with a derived band that contains the exact support of the
-//! stored generators.
+//! certified supremum are different numbers. A support value is the computed sum with a derived
+//! band that contains the exact support of the stored generators; no expectation under a mask law
+//! is ever reported as one.
 
 use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_band, accumulation_growth};
 use ndarray::Array1;
@@ -157,22 +156,6 @@ pub struct SupportEvaluation {
     /// Free controls whose pairing lies inside its roundoff band, so either endpoint attains the
     /// support to within `band`.
     pub unresolved: Vec<usize>,
-}
-
-/// Moments of `⟨u, q⟩` when each free control's mask is drawn independently and uniformly on its
-/// declared interval.
-///
-/// It is an expectation under a declared mask law, not a bound. Splitting a cancelling pair `±a`
-/// into `n` pieces drives the mean square to `a²/(6n)`, while the supremum of `|⟨u, q⟩|` stays `|a|`
-/// (#2951 P10). Nothing converts it into an [`EvidenceStatus`] about the supremum.
-#[derive(Clone, Debug, PartialEq)]
-pub struct UniformMaskLawMoments {
-    pub mean: f64,
-    pub mean_band: f64,
-    pub variance: f64,
-    pub variance_band: f64,
-    pub mean_square: f64,
-    pub mean_square_band: f64,
 }
 
 /// Controls, their generators and the moment blocks those generators live in (#2951 P8).
@@ -311,61 +294,6 @@ impl MaskMomentSystem {
             band,
             witness,
             unresolved,
-        })
-    }
-
-    /// Mean, variance and mean square of `⟨u, q⟩` under independent uniform masks on each free
-    /// control's declared interval.
-    ///
-    /// A deletion uniform on `[least, most]` has mean `(least + most)/2` and variance
-    /// `(most − least)²/12`, so `E⟨u, q⟩ = Σ_c (least_c + most_c)/2·⟨u, v_c⟩` and
-    /// `Var⟨u, q⟩ = Σ_c (most_c − least_c)²/12·⟨u, v_c⟩²`.
-    pub fn uniform_mask_law_moments(
-        &self,
-        domain: &MaskDomain,
-        kept: &[bool],
-        direction: &MomentVector,
-    ) -> Result<UniformMaskLawMoments, MomentGeometryError> {
-        self.check_controls(domain, kept.len())?;
-        self.check_direction(direction)?;
-        let mut mean = 0.0;
-        let mut variance = 0.0;
-        let mut mean_absolute = 0.0;
-        let mut variance_absolute = 0.0;
-        let mut mean_band = 0.0;
-        let mut variance_band = 0.0;
-        let mut free = 0usize;
-        for control in (0..self.generators.len()).filter(|&control| !kept[control]) {
-            let (pairing, pairing_band) = self.pairing(control, direction);
-            let (least, most) = domain.deletion_range(control);
-            let centre = 0.5 * (least + most);
-            let width = most - least;
-            let mean_term = centre * pairing;
-            let variance_term = width * width * pairing * pairing / 12.0;
-            mean += mean_term;
-            variance += variance_term;
-            mean_absolute += mean_term.abs();
-            variance_absolute += variance_term.abs();
-            mean_band += centre.abs() * pairing_band;
-            variance_band += width * width * (2.0 * pairing.abs() + pairing_band) * pairing_band / 12.0;
-            free += 1;
-        }
-        // A mean term costs three roundings (the two endpoints, their sum, the product) and a
-        // variance term six (the endpoints, the width, its square, two products, the division),
-        // before the `free − 1` additions.
-        mean_band += accumulation_growth(free + 2) * mean_absolute;
-        variance_band += accumulation_growth(free + 5) * variance_absolute;
-        let mean_square = mean * mean + variance;
-        let mean_square_band = (2.0 * mean.abs() + mean_band) * mean_band
-            + variance_band
-            + accumulation_growth(2) * (mean * mean + variance.abs());
-        Ok(UniformMaskLawMoments {
-            mean,
-            mean_band,
-            variance,
-            variance_band,
-            mean_square,
-            mean_square_band,
         })
     }
 
