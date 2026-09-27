@@ -273,6 +273,139 @@ def spectral_labels(W, K, seed):
     return torch.tensor(sc.fit_predict(W.numpy()))
 
 
+def write_receipt(report, out, t0, t_fwd):
+    report["runtime_s"] = {"forward_and_load": t_fwd, "total": time.time() - t0}
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    # one top-level key per line: build.rs caps tracked files at 10k lines
+    Path(out).write_text("{\n" + ",\n".join("%s:%s" % (json.dumps(k), json.dumps(v, separators=(",", ":")))
+                                             for k, v in report.items()) + "\n}\n")
+
+
+def pi_split(U, T, mask):
+    """Optimal exactly-separated reads for unit subset S (whitened): E* = sum min(lam, 1-lam), lam = eig(U^T D_S U)."""
+    G = U[mask].T @ U[mask]
+    lam, V = torch.linalg.eigh(0.5 * (G + G.T))
+    lam = lam.clamp(0, 1)
+    Vp = V[:, lam > 0.5]
+    P = Vp @ Vp.T
+    Uhat = torch.where(mask[:, None], U @ P, U - U @ P)
+    return {"E_star": float(torch.minimum(lam, 1 - lam).sum()), "chi": float((lam * (1 - lam)).sum()),
+            "rank_P": int(Vp.shape[1])}, Uhat @ T
+
+
+def pi_fiedler(U, n_vec):
+    """Smallest nontrivial eigenvectors of the Pi^2 Laplacian, matrix-free: (Lq)_i = |u_i|^2 q_i - u_i^T (U^T diag(q) U) u_i."""
+    from scipy.sparse.linalg import LinearOperator, eigsh
+    Un = U.numpy()
+    r2 = (Un * Un).sum(1)
+
+    def mv(q):
+        q = np.asarray(q).reshape(-1)
+        return r2 * q - (((Un * q[:, None]).T @ Un @ Un.T).T * Un).sum(1)
+
+    n = Un.shape[0]
+    op = LinearOperator((n, n), matvec=mv, dtype=np.float64)
+    ev, vec = eigsh(op, k=n_vec + 1, which="SA", tol=1e-10, v0=np.ones(n) + 1e-3 * np.arange(n) / n)
+    order = np.argsort(ev)
+    return ev[order], vec[:, order]
+
+
+def pi_proposals(U, T, n_vec, fracs):
+    ev, vec = pi_fiedler(U, n_vec)
+    n = U.shape[0]
+    d = U.shape[1]
+    out = []
+    for v in range(1, n_vec + 1):
+        order = torch.tensor(np.argsort(vec[:, v]))
+        for f in fracs:
+            k = max(1, round(f * n))
+            for side, idx in (("low", order[:k]), ("high", order[-k:])):
+                mask = torch.zeros(n, dtype=torch.bool)
+                mask[idx] = True
+                r, _ = pi_split(U, T, mask)
+                out.append({"vec": v, "k": k, "side": side, "E_over_U2": r["E_star"] / d, "chi_over_U2": r["chi"] / d,
+                            "rank_P": r["rank_P"], "mask": mask})
+    return ev, out
+
+
+def pi_layer(layer, li, Xin, n_rand, gen):
+    tl = time.time()
+    m = layer.mlp
+    W, b_in, Vout = m.dense_h_to_4h.weight, m.dense_h_to_4h.bias, m.dense_4h_to_h.weight
+    n, d = W.shape
+    U, T = torch.linalg.qr(W)
+    Pi = U @ U.T
+    off = ~torch.eye(n, dtype=torch.bool)
+    band = {}
+    for tau in (0.0, 1e-13, 1e-10, 1e-6, 1e-3, 1e-2, 3e-2):
+        nc, sizes = components((Pi.abs() > tau) & off)
+        band[str(tau)] = {"components": nc, "largest": sizes}
+    fracs = (1 / 64, 1 / 32, 1 / 16, 1 / 8, 1 / 4, 3 / 8, 1 / 2)
+    ev, props = pi_proposals(U, T, 3, fracs)
+    dense_ev = torch.linalg.eigvalsh(torch.diag(Pi.pow(2).sum(1)) - Pi.pow(2))[:4]
+    rand = {}
+    for f in fracs:
+        k = max(1, round(f * n))
+        vals = []
+        for _ in range(n_rand):
+            mask = torch.zeros(n, dtype=torch.bool)
+            mask[torch.randperm(n, generator=gen)[:k]] = True
+            vals.append(pi_split(U, T, mask)[0]["E_star"] / d)
+        rand[k] = (float(np.mean(vals)), float(np.std(vals)))
+    G = torch.randn(W.shape, generator=gen, dtype=torch.float64)
+    Wt = G / G.norm(dim=1, keepdim=True) * W.norm(dim=1, keepdim=True)
+    Ut, Tt = torch.linalg.qr(Wt)
+    _, props_t = pi_proposals(Ut, Tt, 3, fracs)
+    best_t = {}
+    for pr in props_t:
+        if pr["k"] not in best_t or pr["E_over_U2"] < best_t[pr["k"]]:
+            best_t[pr["k"]] = pr["E_over_U2"]
+    by_k = []
+    for k in sorted(rand):
+        cand = [pr for pr in props if pr["k"] == k]
+        bp = min(cand, key=lambda pr: pr["E_over_U2"])
+        mu, sd = rand[k]
+        by_k.append({"k": k, "best_fiedler_E_over_U2": bp["E_over_U2"], "best_fiedler_chi_over_U2": bp["chi_over_U2"],
+                     "vec": bp["vec"], "side": bp["side"], "random_mean": mu, "random_sd": sd,
+                     "z_vs_random": (bp["E_over_U2"] - mu) / sd if sd > 0 else None,
+                     "ratio_vs_random": bp["E_over_U2"] / mu, "twin_best_fiedler": best_t[k],
+                     "ratio_vs_twin": bp["E_over_U2"] / best_t[k]})
+    best = min(props, key=lambda pr: pr["E_over_U2"] / rand[pr["k"]][0])
+    _, What = pi_split(U, T, best["mask"])
+    ln = layer.post_attention_layernorm
+    R_ln = float(ln.bias.norm() + math.sqrt(d) * ln.weight.abs().max())
+    R_emp = float(Xin.norm(dim=1).max())
+    specV = float(torch.linalg.matrix_norm(Vout, ord=2))
+    specdW = float(torch.linalg.matrix_norm(W - What, ord=2))
+    L_sigma = 0.5 + KAPPA
+    F = torch.nn.functional.gelu(Xin @ W.T + b_in) @ Vout.T
+    Fh = torch.nn.functional.gelu(Xin @ What.T + b_in) @ Vout.T
+    err = (F - Fh).norm(dim=1)
+    res = {"layer": li, "n": n, "d": d, "U_F2": float(U.pow(2).sum()),
+           "pi_components_band": band, "pi_offdiag_abs": q(Pi.abs()[off]),
+           "laplacian_eigs_lanczos": ev.tolist(), "laplacian_eigs_dense": dense_ev.tolist(),
+           "by_k": by_k,
+           "best": {"k": best["k"], "vec": best["vec"], "side": best["side"], "E_over_U2": best["E_over_U2"],
+                    "random_mean": rand[best["k"]][0], "ratio_vs_random": best["E_over_U2"] / rand[best["k"]][0],
+                    "W_minus_What_2": specdW, "W_2": float(torch.linalg.matrix_norm(W, ord=2)), "V_2": specV,
+                    "R_layernorm": R_ln, "R_empirical_max": R_emp,
+                    "uniform_bound_R_ln": L_sigma * specV * specdW * R_ln,
+                    "uniform_bound_R_emp": L_sigma * specV * specdW * R_emp,
+                    "measured_err": q(err), "measured_err_over_F": q(err / F.norm(dim=1)),
+                    "bound_holds": bool((err <= L_sigma * specV * specdW * R_ln * (1 + 1e-9)).all())},
+           "seconds": time.time() - tl}
+    b = res["best"]
+    print("L%d comps(1e-13)=%d lam2=%.2e/%.2e best k=%d E/U2=%.4f rand=%.4f ratio=%.3f | bound %.2f meas max %.2f "
+          "(rel med %.2f) (%.0fs)" % (li, band["1e-13"]["components"], ev[1], float(dense_ev[1]), b["k"], b["E_over_U2"],
+                                      b["random_mean"], b["ratio_vs_random"], b["uniform_bound_R_ln"],
+                                      b["measured_err"]["max"], b["measured_err_over_F"]["median"], res["seconds"]),
+          flush=True)
+    for r in by_k:
+        print("   k=%d fiedler %.4f random %.4f+-%.4f twin %.4f" % (r["k"], r["best_fiedler_E_over_U2"], r["random_mean"],
+                                                                  r["random_sd"], r["twin_best_fiedler"]), flush=True)
+    return res
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -285,6 +418,9 @@ def main():
     parser.add_argument("--iters", type=int, default=15)
     parser.add_argument("--indep-points", type=int, default=0, help="0 = 3 x d_hidden")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--mode", choices=("replacement", "pi"), default="replacement")
+    parser.add_argument("--layers", default="", help="comma list for --mode pi; empty = all")
+    parser.add_argument("--random-subsets", type=int, default=20)
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
     t0 = time.time()
@@ -312,6 +448,15 @@ def main():
     for h in hs:
         h.remove()
     t_fwd = time.time() - t0
+    if args.mode == "pi":
+        pick = [int(v) for v in args.layers.split(",")] if args.layers else range(len(layers))
+        report = {"model": args.model, "hidden_act": cfg.hidden_act, "d_model": cfg.hidden_size,
+                  "d_hidden": cfg.intermediate_size, "tokens": int(ids.numel()), "text_source": source,
+                  "L_sigma": 0.5 + KAPPA, "dtype": "float64", "device": "cpu", "args": vars(args), "layers": []}
+        with torch.no_grad():
+            for li in pick:
+                report["layers"].append(pi_layer(layers[li], li, caps[li][0], args.random_subsets, gen))
+        return write_receipt(report, args.out, t0, t_fwd)
 
     report = {"model": args.model, "hidden_act": cfg.hidden_act, "d_model": cfg.hidden_size,
               "d_hidden": cfg.intermediate_size, "tokens": int(ids.numel()), "text_source": source,
@@ -434,11 +579,7 @@ def main():
                 print("   refined k=%s: trained eta/scale=%.3f empdF=%.3f | twin eta/scale=%.3f empdF=%.3f" % (
                     kname, r["trained"]["eta_over_scale"], r["trained"]["emp_over_dF_median"],
                     r["random_twin"]["eta_over_scale"], r["random_twin"]["emp_over_dF_median"]), flush=True)
-    report["runtime_s"] = {"forward_and_load": t_fwd, "total": time.time() - t0}
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    # one top-level key per line: build.rs caps tracked files at 10k lines
-    Path(args.out).write_text("{\n" + ",\n".join("%s:%s" % (json.dumps(k), json.dumps(v, separators=(",", ":")))
-                                                  for k, v in report.items()) + "\n}\n")
+    write_receipt(report, args.out, t0, t_fwd)
     print(json.dumps(report["planted"], indent=1))
     print("runtime %.0fs" % report["runtime_s"]["total"])
 
