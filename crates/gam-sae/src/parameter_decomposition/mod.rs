@@ -155,6 +155,9 @@ pub mod rewrite;
 // The component MLP block as a mechanism program, bound to its own tensors.
 pub mod rewrite_program;
 
+// Exact two-endpoint finite-change operators: softmax, RMSNorm, bilinear products, gated activations.
+pub mod secant;
+
 // Exact initial decomposition from native tensors through rank-revealing reads.
 pub mod seed;
 
