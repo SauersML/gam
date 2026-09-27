@@ -136,9 +136,19 @@ writes.
   pythia-70m layer 3 at 32 units clearly beats it (0.43×). The native uniform
   bound is 50–150× looser than the measured error.
 
-Trained GELU MLP blocks contain no additive modules, in either the replacement or
-the linear-change sense, beyond what spectral partitioning finds in random
-weights. Exact module splitting is a diagnostic, not a target.
+**Correction (trained known-answer toys, `bench/mpd_opfirst_toys_trained_2951.py`):
+this null is a limit of the tools, not evidence of absence.** On a task that is
+modular by construction, trained exact-GELU students build the split: exactly at
+width 16, approximately at width 64 (true-split E*/rank 0.015, or 0.0016 with
+weight decay) and width 256 (0.11, 0.029 with weight decay, against 0.26–0.40 for
+random subsets). At width ≤ 64 the Fiedler proposal recovers the split (86–98% of
+units, 6–10× below the twin). At width 256 it does not: the proposal is no better
+than the twin (0.94×) and thresholded Π components show one block, the same
+signature as Pythia, on a network whose true split is 3.4× below random. So the
+Pythia result says the proposer cannot find approximate splits in overparameterized
+blocks; it does not say the splits are absent. A stronger proposer (search directly
+on E*) and a null controlling for unit-norm concentration are needed before
+concluding either way.
 
 ### 6. An executable program for modular addition, from the weights
 `bench/mpd_opfirst_modadd_program_2951.py`, receipts `opfirst_modadd_program*.json`.
