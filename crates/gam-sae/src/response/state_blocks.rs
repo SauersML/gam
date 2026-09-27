@@ -506,29 +506,12 @@ impl Refinement {
     /// cluster.
     fn connected_components(&self) -> Vec<Vec<usize>> {
         let count = self.clusters.len();
-        let mut representative: Vec<usize> = (0..count).collect();
-        for first in 0..count {
-            for second in (first + 1)..count {
-                if self.joined(first, second) {
-                    let left = find_representative(&mut representative, first);
-                    let right = find_representative(&mut representative, second);
-                    representative[left.max(right)] = left.min(right);
-                }
-            }
-        }
-        let mut components: Vec<Vec<usize>> = Vec::new();
-        let mut position: Vec<Option<usize>> = vec![None; count];
-        for cluster in 0..count {
-            let root = find_representative(&mut representative, cluster);
-            match position[root] {
-                Some(index) => components[index].push(cluster),
-                None => {
-                    position[root] = Some(components.len());
-                    components.push(vec![cluster]);
-                }
-            }
-        }
-        components
+        super::interaction::connected_components(
+            count,
+            (0..count)
+                .flat_map(|first| ((first + 1)..count).map(move |second| (first, second)))
+                .filter(|&(first, second)| self.joined(first, second)),
+        )
     }
 
     /// The strongest certified isometry from `source` into `target` across all
@@ -758,14 +741,6 @@ impl Structure {
     fn factor(&self) -> (f64, f64) {
         (self.scale, self.error)
     }
-}
-
-fn find_representative(representative: &mut [usize], mut node: usize) -> usize {
-    while representative[node] != node {
-        representative[node] = representative[representative[node]];
-        node = representative[node];
-    }
-    node
 }
 
 /// Admit `structure` when the predicate resolves it from zero and from the span

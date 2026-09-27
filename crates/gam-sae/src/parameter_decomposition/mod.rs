@@ -133,6 +133,9 @@ pub mod lift;
 // Mask moments, the admissible zonotope, support function and affine-logit adversary.
 pub mod moments;
 
+// Exact module splits of plain GELU/ReLU MLPs under the worst-case replacement contract, with certified eta.
+pub mod module_split;
+
 // Global versus use-specific edits and occurrence scopes.
 pub mod occurrence;
 

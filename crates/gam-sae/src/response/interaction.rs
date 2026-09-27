@@ -83,6 +83,15 @@
 //! declared product law, which makes the terms orthogonal by independence and every index a sum
 //! of term energies. The carve reads observed codes. This module reads the block's response to a
 //! declared randomized intervention.
+//!
+//! # Contrast with the worst-case module split
+//!
+//! `parameter_decomposition::module_split` asks a different question of a plain GELU or ReLU MLP:
+//! whether `F(Px + (I−P)y) = QF(x) + (I−Q)F(y)` for all inputs, a sup-norm replacement contract
+//! with no law, splitting outputs as well as inputs, with the frame found from the weights' read
+//! and write spans instead of declared ports. Its certified `η` bounds the worst-case defect; the
+//! cross-block energy here is an L2 quantity under the declared law. Both read their blocks off
+//! [`connected_components`].
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -228,6 +237,30 @@ fn union_root(parent: &mut [usize], mut port: usize) -> usize {
         port = parent[port];
     }
     port
+}
+
+/// The connected components of the graph on `0..count` with the given edges. Each component is
+/// sorted, and components are ordered by their smallest vertex. The one component owner for every
+/// banded-edge graph in the crate: the caller decides which edges are resolved, this only joins
+/// them.
+pub(crate) fn connected_components(
+    count: usize,
+    edges: impl IntoIterator<Item = (usize, usize)>,
+) -> Vec<Vec<usize>> {
+    let mut parent: Vec<usize> = (0..count).collect();
+    for (i, j) in edges {
+        let root_i = union_root(&mut parent, i);
+        let root_j = union_root(&mut parent, j);
+        if root_i != root_j {
+            parent[root_i.max(root_j)] = root_i.min(root_j);
+        }
+    }
+    let mut blocks: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for vertex in 0..count {
+        let root = union_root(&mut parent, vertex);
+        blocks.entry(root).or_default().push(vertex);
+    }
+    blocks.into_values().collect()
 }
 
 /// The block label of every port, or why `partition` is not a partition of `0..port_count`.
@@ -391,24 +424,12 @@ impl TotalInteractions {
     /// port.
     pub fn additive_blocks(&self) -> Vec<Vec<usize>> {
         let port_count = self.port_count;
-        let mut parent: Vec<usize> = (0..port_count).collect();
-        for i in 0..port_count {
-            for j in (i + 1)..port_count {
-                if self.pairs[pair_index(port_count, i, j)].resolved_positive() {
-                    let root_i = union_root(&mut parent, i);
-                    let root_j = union_root(&mut parent, j);
-                    if root_i != root_j {
-                        parent[root_i.max(root_j)] = root_i.min(root_j);
-                    }
-                }
-            }
-        }
-        let mut blocks: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        for port in 0..port_count {
-            let root = union_root(&mut parent, port);
-            blocks.entry(root).or_default().push(port);
-        }
-        blocks.into_values().collect()
+        connected_components(
+            port_count,
+            (0..port_count)
+                .flat_map(|i| ((i + 1)..port_count).map(move |j| (i, j)))
+                .filter(|&(i, j)| self.pairs[pair_index(port_count, i, j)].resolved_positive()),
+        )
     }
 
     /// `Σ_{cross pairs} I_ij`, which bounds the cross-block energy of `partition` from above, with
