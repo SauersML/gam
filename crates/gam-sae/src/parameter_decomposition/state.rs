@@ -1126,16 +1126,556 @@ impl LinearStateQuotient {
     }
 }
 
-/// The resolved row space of a matrix: its singular values, the band, the rank
-/// and the leading right singular vectors as rows.
-struct ResolvedRowSpace {
-    singular_values: Vec<f64>,
-    band: f64,
-    rank: usize,
-    rows: Array2<f64>,
+/// One forward step of a weighted observability pull-back ([`WeightedObservability`]).
+///
+/// The step maps the state `h_l ∈ ℝ^{n_l}` to `h_{l+1} ∈ ℝ^{n_{l+1}}` by one of
+/// its declared letters, and its readouts read `h_{l+1}`.
+#[derive(Clone, Debug)]
+pub struct ObservabilityStep<'a> {
+    /// The declared letters `T_{l,1..H}`, each `n_{l+1} × n_l`. The alphabet is
+    /// exactly what is declared: a residual stream is the identity letter, passed
+    /// like any other. The letter for attention is a routing law's transport, the
+    /// sum of the OV maps of every head that shares one attention pattern. One
+    /// letter per head is not invariant under the cross-head `GL` gauge of heads
+    /// with identical patterns, so it over-counts.
+    pub letters: Vec<ObservabilityLetter<'a>>,
+    /// Readouts `R_l` of `h_{l+1}`, each `p × n_{l+1}`. May be empty.
+    pub readouts: Vec<ArrayView2<'a, f64>>,
 }
 
-fn resolved_row_space(
+/// Letters of an [`ObservabilityStep`].
+#[derive(Clone, Debug)]
+pub enum ObservabilityLetter<'a> {
+    /// One linear letter `T`, `n_{l+1} × n_l`.
+    Linear(ArrayView2<'a, f64>),
+    /// The rank-one letters `C_j = u_j a_jᵀ` of the units of an MLP normal form
+    /// `F(x) = Ax + b + Σ_j u_j ψ(a_jᵀx + β_j)`, one letter per unit: `reads`
+    /// holds `a_j` as rows (`n × n_l`), `writes` holds `u_j` as rows
+    /// (`n × n_{l+1}`). Pulled back together, `S C_j` has the Gramian of the one
+    /// row `‖S u_j‖ a_jᵀ`, so an MLP step is `[Linear(A), Units{..}]` and adds
+    /// `Aᵀ G A + Σ_j (u_jᵀ G u_j) a_j a_jᵀ`: each read weighted by how strongly
+    /// its write is read. The units must be the merged normal form
+    /// (`module_split::MlpNormalForm`): a pair of units with opposite affine forms
+    /// is one term of the function, and left unmerged its cancelling writes
+    /// each add energy that the function does not carry.
+    Units {
+        reads: ArrayView2<'a, f64>,
+        writes: ArrayView2<'a, f64>,
+    },
+}
+
+impl ObservabilityLetter<'_> {
+    /// `(n_{l+1}, n_l)`.
+    fn shape(&self) -> (usize, usize) {
+        match self {
+            Self::Linear(letter) => letter.dim(),
+            Self::Units { reads, writes } => (writes.ncols(), reads.ncols()),
+        }
+    }
+
+    /// How many words of length one the letter stands for.
+    fn count(&self) -> usize {
+        match self {
+            Self::Linear(_) => 1,
+            Self::Units { reads, .. } => reads.nrows(),
+        }
+    }
+
+    fn validate(&self, output: usize, input: usize) -> Result<(), StateError> {
+        let context = "weighted observability: letter";
+        require_dimension(self.shape().0, output, context)?;
+        require_dimension(self.shape().1, input, context)?;
+        match self {
+            Self::Linear(letter) => require_finite(letter.view(), context),
+            Self::Units { reads, writes } => {
+                require_dimension(writes.nrows(), reads.nrows(), "weighted observability: units")?;
+                require_finite(reads.view(), context)?;
+                require_finite(writes.view(), context)
+            }
+        }
+    }
+
+    /// The pulled-back rows `S T` (or `‖S u_j‖ a_jᵀ`) and a Frobenius bound on
+    /// their distance from those of the exact source, given the source's own
+    /// bound `formation`.
+    fn pull(&self, source: &Array2<f64>, absolute_source: &Array2<f64>, formation: f64) -> (Array2<f64>, f64) {
+        let width = source.ncols();
+        match self {
+            Self::Linear(letter) => {
+                let moved = source.dot(letter);
+                let product_band = entrywise_band_norm(
+                    absolute_source
+                        .dot(&letter.mapv(f64::abs))
+                        .mapv(|magnitude| accumulation_band(width, magnitude)),
+                );
+                (moved, formation * frobenius(letter) + product_band)
+            }
+            Self::Units { reads, writes } => {
+                let read = source.dot(&writes.t());
+                let read_band = absolute_source
+                    .dot(&writes.t().mapv(f64::abs))
+                    .mapv(|magnitude| accumulation_band(width, magnitude));
+                let rows = source.nrows();
+                let mut moved = reads.to_owned();
+                let mut squared = 0.0_f64;
+                for (unit, mut row) in moved.rows_mut().into_iter().enumerate() {
+                    let weight = read.column(unit).iter().map(|value| value * value).sum::<f64>().sqrt();
+                    let write_norm = writes.row(unit).iter().map(|value| value * value).sum::<f64>().sqrt();
+                    let read_norm = row.iter().map(|value| value * value).sum::<f64>().sqrt();
+                    let weight_error = formation * write_norm
+                        + read_band.column(unit).iter().map(|value| value * value).sum::<f64>().sqrt()
+                        + accumulation_growth(rows + 1) * weight;
+                    row.mapv_inplace(|value| value * weight);
+                    squared += ((weight_error + accumulation_growth(1) * weight) * read_norm).powi(2);
+                }
+                (moved, squared.sqrt())
+            }
+        }
+    }
+}
+
+/// The spectrum of an observability Gramian `G = Fᵀ F`, read off its factor `F`.
+#[derive(Clone, Debug)]
+pub struct ObservabilitySpectrum {
+    /// `σ₁ ≥ σ₂ ≥ …` of `F`, so the eigenvalues of `G` are `σᵢ²`. The Gramian
+    /// itself is never formed.
+    pub singular_values: Vec<f64>,
+    /// Every `σᵢ` is within this of a singular value of a factor of the exact
+    /// Gramian: [`factor_singular_band`] plus the pull-back's formation bound.
+    pub band: f64,
+    /// Singular values above `band`: a certified lower bound on the exact rank.
+    pub resolved_rank: usize,
+    /// `min(stacked rows, n)`: the exact rank cannot exceed it.
+    pub rank_ceiling: usize,
+    /// `tr G = Σ σᵢ²`.
+    pub energy: f64,
+    /// `(Σ σᵢ²)² / Σ σᵢ⁴`, the effective number of directions under the
+    /// Gramian's own weighting. A summary of the spectrum with no cutoff; zero
+    /// for a zero Gramian.
+    pub participation_ratio: f64,
+}
+
+impl ObservabilitySpectrum {
+    /// The exact rank of the Gramian: exact at its ceiling, otherwise the
+    /// resolved lower bound and the ceiling.
+    pub fn rank_evidence(&self) -> Result<EvidenceStatus<(), StateDomain>, EvidenceStatusError> {
+        let domain = StateDomain::UnitStates {
+            dimension: self.rank_ceiling,
+        };
+        if self.resolved_rank == self.rank_ceiling {
+            EvidenceStatus::exact(
+                self.resolved_rank as f64,
+                0.0,
+                ExactBasis::Algebraic,
+                None,
+                domain,
+            )
+        } else {
+            EvidenceStatus::unresolved(
+                self.resolved_rank as f64,
+                self.rank_ceiling as f64,
+                Extremum::Supremum,
+                None,
+                domain,
+            )
+        }
+    }
+
+    fn of(singular_values: Vec<f64>, rows: usize, cols: usize, formation: f64, stacked_rows: usize) -> Self {
+        let sigma_max = singular_values.first().copied().unwrap_or(0.0);
+        let band = factor_singular_band(rows.max(1), cols, sigma_max) + formation;
+        let resolved_rank = singular_values.iter().filter(|&&value| value > band).count();
+        let energy: f64 = singular_values.iter().map(|value| value * value).sum();
+        let quartic: f64 = singular_values.iter().map(|value| value.powi(4)).sum();
+        let participation_ratio = if quartic > 0.0 { energy * energy / quartic } else { 0.0 };
+        Self {
+            singular_values,
+            band,
+            resolved_rank,
+            rank_ceiling: stacked_rows.min(cols),
+            energy,
+            participation_ratio,
+        }
+    }
+}
+
+/// The weighted observability Gramian of a readout family pulled back through
+/// declared forward steps, held as a factor.
+///
+/// # Definition
+///
+/// Steps `l = 0..L−1` run forward, `h_{l+1} = T_{l,a} h_l` for a letter `a` of
+/// step `l`, and step `l`'s readouts `R_l` read `h_{l+1}`. A word
+/// `w = (a_0, …, a_l)` picks one letter per step up to `l`, with
+/// `T_w = T_{l,a_l} ⋯ T_{0,a_0}`. The Gramian at the input `h_0` is
+///
+/// ```text
+/// G = Σ_{l=0}^{L−1} Σ_{w = (a_0..a_l)} (R_l T_w)ᵀ (R_l T_w)        (n_0 × n_0),
+/// ```
+///
+/// every readout pulled back along every declared word with unit weight. It is
+/// the per-step stacked factor of the operation-first probes: from the last step
+/// backward, `S = [F_{l+1}; R_l]` and `F_l = [S T_{l,1}; …; S T_{l,H}]`, so
+/// `F_lᵀ F_l = Σ_a T_{l,a}ᵀ (F_{l+1}ᵀ F_{l+1} + Σ R_lᵀ R_l) T_{l,a}` and
+/// `G = F_0ᵀ F_0`. A time-invariant family pulled back to depth `k` is one step
+/// repeated `k` times. The range of `G` lies in the exact observable subspace
+/// that [`LinearStateQuotient::close`] computes for the same readouts and
+/// letters; what the weighting adds is how strongly each direction is read.
+/// Exact rank questions are generically saturated on trained weights, so the
+/// spectrum, not the rank, carries the information.
+///
+/// After every letter the stack is compressed to `diag(σ) Vᵀ` by a thin SVD,
+/// which keeps `Fᵀ F`, so `G` is never formed and memory is `O(n²)` per letter.
+///
+/// # Error
+///
+/// `formation` bounds the Frobenius distance from `factor` to a factor of the
+/// exact Gramian of the supplied matrices, up to a left orthogonal factor. Each
+/// product `S T` adds the propagated bound times `‖T‖_F` and the
+/// [`accumulation_band`] of `|S||T|`; each compression adds the SVD's backward
+/// error ([`factor_singular_band`], times `√rank` for Frobenius), `σ₁` times the
+/// measured orthogonality defect of `V`, and the rounding of `σᵢ Vᵢⱼ`.
+#[derive(Clone, Debug)]
+pub struct WeightedObservability {
+    /// `F = diag(σ) Vᵀ` at `h_0`, `min(rows, n_0) × n_0`, with `Fᵀ F = G`.
+    pub factor: Array2<f64>,
+    /// `V`'s rows: the Gramian's eigenvectors in decreasing `σ`.
+    pub directions: Array2<f64>,
+    /// Frobenius bound on the distance of `factor` from an exact factor.
+    pub formation: f64,
+    /// `step_spectra[l]` is the spectrum at `h_l`, the input of step `l`, of the
+    /// pull-back of steps `l..L`. `step_spectra[0]` is the spectrum of `G`.
+    pub step_spectra: Vec<ObservabilitySpectrum>,
+}
+
+/// How much of the weighted observability a declared candidate subspace holds.
+#[derive(Clone, Debug)]
+pub struct SubspaceCapture {
+    /// The candidate's dimension `k`.
+    pub dimension: usize,
+    /// `tr(Π G) / tr G = ‖F Wᵀ‖²_F / ‖F‖²_F` for the orthogonal projector
+    /// `Π = Wᵀ W` onto the candidate, with its numerical error. A uniformly
+    /// random `k`-dimensional subspace captures `k/n` in expectation.
+    pub energy_fraction: EvidenceStatus<(), StateDomain>,
+    /// Cosines of the principal angles between the top `min(k, rows)` Gramian
+    /// directions and the candidate, in decreasing order.
+    pub principal_cosines: Vec<f64>,
+    /// `σ_k² − σ_{k+1}²`, the eigengap that separates the top `k` directions
+    /// (`σ_{k+1} = 0` past the factor's rows).
+    pub eigengap: f64,
+    /// A Davis–Kahan bound on the sine of the largest angle between the computed
+    /// and the exact top-`k` space: `‖ΔG‖₂ / (gap − ‖ΔG‖₂)` with
+    /// `‖ΔG‖₂ ≤ 2σ₁e + e²`, `e` the factor's error, capped at `1`, and `1` when
+    /// the gap does not exceed `‖ΔG‖₂`.
+    pub angle_perturbation: f64,
+}
+
+impl WeightedObservability {
+    /// Pull the readouts of `steps`, in forward order, back to `h_0`.
+    pub fn pull_back(governor: &MemoryGovernor, steps: &[ObservabilityStep<'_>]) -> Result<Self, StateError> {
+        let last = steps.last().ok_or(StateError::EmptyFamily {
+            context: "weighted observability: steps",
+        })?;
+        if steps.iter().all(|step| step.readouts.is_empty()) {
+            return Err(StateError::EmptyFamily {
+                context: "weighted observability: readouts",
+            });
+        }
+        let mut width = last
+            .letters
+            .first()
+            .ok_or(StateError::EmptyFamily {
+                context: "weighted observability: letters",
+            })?
+            .shape()
+            .0;
+        let mut factor = Array2::<f64>::zeros((0, width));
+        let mut directions = Array2::<f64>::zeros((0, width));
+        let mut formation = 0.0_f64;
+        let mut stacked_rows = 0_usize;
+        let mut step_spectra = Vec::with_capacity(steps.len());
+        for step in steps.iter().rev() {
+            let input = step
+                .letters
+                .first()
+                .ok_or(StateError::EmptyFamily {
+                    context: "weighted observability: letters",
+                })?
+                .shape()
+                .1;
+            for letter in &step.letters {
+                letter.validate(width, input)?;
+            }
+            for readout in &step.readouts {
+                require_sample(readout.view(), width, "weighted observability: readout")?;
+            }
+            let readout_rows: usize = step.readouts.iter().map(|readout| readout.nrows()).sum();
+            let source_rows = factor.nrows() + readout_rows;
+            // The source stack and its absolute value.
+            let source_reservation =
+                reserve(governor, source_rows.max(1), width, 2, "weighted observability: step source")?;
+            let mut source = Array2::<f64>::zeros((source_rows, width));
+            source.slice_mut(s![..factor.nrows(), ..]).assign(&factor);
+            let mut offset = factor.nrows();
+            for readout in &step.readouts {
+                source
+                    .slice_mut(s![offset..offset + readout.nrows(), ..])
+                    .assign(readout);
+                offset += readout.nrows();
+            }
+            let absolute_source = source.mapv(f64::abs);
+            let mut pulled = Array2::<f64>::zeros((0, input));
+            let mut pulled_directions = Array2::<f64>::zeros((0, input));
+            let mut pulled_sigma = Vec::new();
+            let mut pulled_formation = 0.0_f64;
+            for letter in &step.letters {
+                // The moved source, its absolute bound, and the stack beside the running factor.
+                let moved_rows = match letter {
+                    ObservabilityLetter::Linear(_) => source_rows,
+                    ObservabilityLetter::Units { reads, .. } => reads.nrows() + source_rows,
+                };
+                let letter_reservation = reserve(
+                    governor,
+                    moved_rows.max(1) + input,
+                    input.max(width),
+                    3,
+                    "weighted observability: letter",
+                )?;
+                let (moved, moved_formation) = letter.pull(&source, &absolute_source, formation);
+                let mut stack = Array2::<f64>::zeros((pulled.nrows() + moved.nrows(), input));
+                stack.slice_mut(s![..pulled.nrows(), ..]).assign(&pulled);
+                stack.slice_mut(s![pulled.nrows().., ..]).assign(&moved);
+                let stack_formation = pulled_formation.hypot(moved_formation);
+                let compressed = compress_factor(governor, &stack, "weighted observability: compression")?;
+                pulled = compressed.factor;
+                pulled_directions = compressed.directions;
+                pulled_sigma = compressed.singular_values;
+                pulled_formation = stack_formation + compressed.formation;
+                drop(letter_reservation);
+            }
+            drop(source_reservation);
+            stacked_rows = stacked_rows
+                .saturating_add(readout_rows)
+                .saturating_mul(step.letters.iter().map(ObservabilityLetter::count).sum());
+            step_spectra.push(ObservabilitySpectrum::of(
+                pulled_sigma,
+                pulled.nrows(),
+                input,
+                pulled_formation,
+                stacked_rows,
+            ));
+            factor = pulled;
+            directions = pulled_directions;
+            formation = pulled_formation;
+            width = input;
+        }
+        step_spectra.reverse();
+        Ok(Self {
+            factor,
+            directions,
+            formation,
+            step_spectra,
+        })
+    }
+
+    /// The spectrum of `G` at `h_0`.
+    pub fn spectrum(&self) -> &ObservabilitySpectrum {
+        &self.step_spectra[0]
+    }
+
+    /// How much of `G` a declared candidate subspace holds (the row span of
+    /// `candidate`, `k × n_0`, of full row rank `k`), and its principal angles
+    /// to the top `k` Gramian directions. The candidate is the caller's
+    /// declaration; nothing here chooses one.
+    pub fn capture(
+        &self,
+        governor: &MemoryGovernor,
+        candidate: ArrayView2<'_, f64>,
+    ) -> Result<SubspaceCapture, StateError> {
+        let width = self.factor.ncols();
+        require_sample(candidate, width, "weighted observability: candidate")?;
+        let declared = candidate.nrows();
+        let basis = resolved_row_space(
+            governor,
+            &candidate.to_owned(),
+            0.0,
+            "weighted observability: candidate",
+        )?;
+        if basis.rank != declared {
+            return Err(StateError::CandidateRankDeficient {
+                declared,
+                resolved: basis.rank,
+            });
+        }
+        let orthonormal = basis.rows;
+        // The projection, its absolute bound, and the directions' overlap.
+        let working = reserve(
+            governor,
+            declared.max(self.factor.nrows()).max(1),
+            width.max(declared),
+            3,
+            "weighted observability: capture",
+        )?;
+        let orthonormality = orthonormality_defect(&orthonormal);
+        let projected = self.factor.dot(&orthonormal.t());
+        let projected_band = entrywise_band_norm(
+            self.factor
+                .mapv(f64::abs)
+                .dot(&orthonormal.t().mapv(f64::abs))
+                .mapv(|magnitude| accumulation_band(width, magnitude)),
+        );
+        let total = frobenius(&self.factor);
+        let held = frobenius(&projected);
+        let held_error = self.formation * (1.0 + orthonormality)
+            + projected_band
+            + total * orthonormality
+            + accumulation_growth(projected.len().max(1)) * held;
+        let total_error = self.formation + accumulation_growth(self.factor.len().max(1)) * total;
+        let fraction = if total > 0.0 { (held / total).powi(2) } else { 0.0 };
+        let lower = if total > 0.0 {
+            ((held - held_error).max(0.0) / (total + total_error)).powi(2)
+        } else {
+            0.0
+        };
+        let upper = if total > total_error {
+            ((held + held_error) / (total - total_error)).powi(2).min(1.0)
+        } else {
+            1.0
+        };
+        let numerical_error = (fraction - lower).max(upper - fraction).max(0.0);
+        let energy_fraction = EvidenceStatus::exact(
+            fraction,
+            numerical_error,
+            ExactBasis::Algebraic,
+            None,
+            StateDomain::UnitStates { dimension: width },
+        )
+        .map_err(|source| StateError::Evidence { source })?;
+
+        let top = declared.min(self.directions.nrows());
+        let mut principal_cosines = if top == 0 {
+            Vec::new()
+        } else {
+            let overlap = self.directions.slice(s![..top, ..]).dot(&orthonormal.t());
+            let (_, cosines, _) = overlap.svd(false, false).map_err(|source| StateError::Svd {
+                context: "weighted observability: principal angles",
+                source,
+            })?;
+            cosines.to_vec()
+        };
+        principal_cosines.sort_by(|left, right| right.total_cmp(left));
+        drop(working);
+
+        let sigma = &self.spectrum().singular_values;
+        let at = |index: usize| sigma.get(index).copied().unwrap_or(0.0);
+        let eigengap = at(declared - 1).powi(2) - at(declared).powi(2);
+        let error = self.formation + factor_singular_band(self.factor.nrows().max(1), width, at(0));
+        let perturbation = 2.0 * at(0) * error + error * error;
+        let angle_perturbation = if eigengap > perturbation {
+            (perturbation / (eigengap - perturbation)).min(1.0)
+        } else {
+            1.0
+        };
+        Ok(SubspaceCapture {
+            dimension: declared,
+            energy_fraction,
+            principal_cosines,
+            eigengap,
+            angle_perturbation,
+        })
+    }
+}
+
+/// A stack compressed to `diag(σ) Vᵀ`, with `σ` in decreasing order, `V`'s rows,
+/// and the compression's own Frobenius formation bound.
+struct CompressedFactor {
+    factor: Array2<f64>,
+    directions: Array2<f64>,
+    singular_values: Vec<f64>,
+    formation: f64,
+}
+
+fn compress_factor(
+    governor: &MemoryGovernor,
+    stack: &Array2<f64>,
+    context: &'static str,
+) -> Result<CompressedFactor, StateError> {
+    let (rows, cols) = stack.dim();
+    if rows == 0 {
+        return Ok(CompressedFactor {
+            factor: Array2::zeros((0, cols)),
+            directions: Array2::zeros((0, cols)),
+            singular_values: Vec::new(),
+            formation: 0.0,
+        });
+    }
+    // The decomposition's working copy, then `Vᵀ`, the directions and the factor.
+    let working = reserve(governor, rows, cols, 1, context)?;
+    let factors = reserve(governor, cols, cols, 3, context)?;
+    let (_, sigma, vt) = stack
+        .svd(false, true)
+        .map_err(|source| StateError::Svd { context, source })?;
+    let vt = vt.ok_or(StateError::Svd {
+        context,
+        source: FaerLinalgError::SvdNoConvergence { context },
+    })?;
+    let mut order: Vec<usize> = (0..sigma.len()).collect();
+    order.sort_by(|&left, &right| sigma[right].total_cmp(&sigma[left]));
+    let kept = order.len();
+    let mut directions = Array2::<f64>::zeros((kept, cols));
+    let mut factor = Array2::<f64>::zeros((kept, cols));
+    let mut singular_values = Vec::with_capacity(kept);
+    for (row, &index) in order.iter().enumerate() {
+        directions.row_mut(row).assign(&vt.row(index));
+        factor
+            .row_mut(row)
+            .assign(&vt.row(index).mapv(|value| value * sigma[index]));
+        singular_values.push(sigma[index]);
+    }
+    let sigma_max = singular_values.first().copied().unwrap_or(0.0);
+    let sigma_norm = singular_values.iter().map(|value| value * value).sum::<f64>().sqrt();
+    let formation = (kept as f64).sqrt() * factor_singular_band(rows, cols, sigma_max)
+        + sigma_max * orthonormality_defect(&directions)
+        + accumulation_growth(1) * sigma_norm;
+    drop(working);
+    drop(factors);
+    Ok(CompressedFactor {
+        factor,
+        directions,
+        singular_values,
+        formation,
+    })
+}
+
+/// `‖W Wᵀ − I‖_F` plus the rounding of the product: a bound on the distance of
+/// the rows of `W` from an exactly orthonormal set.
+pub(super) fn orthonormality_defect(rows: &Array2<f64>) -> f64 {
+    let count = rows.nrows();
+    let width = rows.ncols();
+    let gram = rows.dot(&rows.t()) - Array2::<f64>::eye(count);
+    let absolute = rows.mapv(f64::abs);
+    let band = entrywise_band_norm(
+        absolute
+            .dot(&absolute.t())
+            .mapv(|magnitude| accumulation_band(width + 1, magnitude + 1.0)),
+    );
+    frobenius(&gram) + band
+}
+
+pub(super) fn frobenius<S: ndarray::Data<Elem = f64>>(matrix: &ndarray::ArrayBase<S, ndarray::Ix2>) -> f64 {
+    matrix.iter().map(|value| value * value).sum::<f64>().sqrt()
+}
+
+/// The resolved row space of a matrix: its singular values, the band, the rank
+/// and the leading right singular vectors as rows.
+pub(super) struct ResolvedRowSpace {
+    pub(super) singular_values: Vec<f64>,
+    pub(super) band: f64,
+    pub(super) rank: usize,
+    pub(super) rows: Array2<f64>,
+}
+
+pub(super) fn resolved_row_space(
     governor: &MemoryGovernor,
     matrix: &Array2<f64>,
     formation: f64,
@@ -1172,7 +1712,7 @@ fn resolved_row_space(
     })
 }
 
-fn spectral_norm_bounds(
+pub(super) fn spectral_norm_bounds(
     governor: &MemoryGovernor,
     matrix: &Array2<f64>,
     formation: f64,
@@ -1200,7 +1740,7 @@ fn spectral_norm_bounds(
 }
 
 /// Reserves `copies` dense `rows × cols` matrices on `governor` before they are formed.
-fn reserve(
+pub(super) fn reserve(
     governor: &MemoryGovernor,
     rows: usize,
     cols: usize,
@@ -1214,7 +1754,7 @@ fn reserve(
 
 /// `‖B‖_F` of an entrywise error bound `B`, which bounds the spectral norm of the
 /// error.
-fn entrywise_band_norm(band: Array2<f64>) -> f64 {
+pub(super) fn entrywise_band_norm(band: Array2<f64>) -> f64 {
     band.iter().map(|entry| entry * entry).sum::<f64>().sqrt()
 }
 
@@ -1280,6 +1820,8 @@ pub enum StateError {
         context: &'static str,
         source: MemoryReservationError,
     },
+    /// A declared candidate subspace's rows do not resolve to full row rank.
+    CandidateRankDeficient { declared: usize, resolved: usize },
 }
 
 impl fmt::Display for StateError {
@@ -1320,6 +1862,10 @@ impl fmt::Display for StateError {
                 write!(formatter, "evidence status refused an evaluated defect: {source}")
             }
             Self::Memory { context, source } => write!(formatter, "{context}: {source}"),
+            Self::CandidateRankDeficient { declared, resolved } => write!(
+                formatter,
+                "declared candidate subspace has {declared} rows but resolves to rank {resolved}"
+            ),
         }
     }
 }
@@ -1425,6 +1971,14 @@ fn require_dimension(found: usize, expected: usize, context: &'static str) -> Re
             expected,
             found,
         })
+    }
+}
+
+fn require_finite(matrix: ArrayView2<'_, f64>, context: &'static str) -> Result<(), StateError> {
+    if matrix.iter().all(|value| value.is_finite()) {
+        Ok(())
+    } else {
+        Err(StateError::NonFinite { context })
     }
 }
 
@@ -2397,5 +2951,293 @@ mod tests {
         let identity = recover_plane_rotations(test_governor(), fixed.descended[0].view())
             .expect("recovery of the fixed descent");
         assert_eq!(identity.ambiguities(), vec![RotationAmbiguity::Identity]);
+    }
+
+    /// Weighted observability: a modular-addition-like readout of `p` answers
+    /// through two frequency planes of a hidden basis, and attention letters that
+    /// act inside those planes and inside their complement separately.
+    mod weighted_observability {
+        use super::*;
+        use crate::parameter_decomposition::test_support::hidden_basis;
+        use gam_linalg::faer_ndarray::FaerEigh;
+        use gam_linalg::roundoff::symmetric_spectrum_rounding_band;
+        use faer::Side;
+
+        const WIDTH: usize = 12;
+        const ANSWERS: usize = 13;
+        const PLANES: [(usize, f64); 2] = [(2, 1.0), (5, 0.7)];
+
+        /// `U`'s columns as rows: `frame.row(i)` is the `i`-th hidden direction,
+        /// the first `2 · PLANES.len()` spanning the key planes.
+        fn frame() -> Array2<f64> {
+            hidden_basis(WIDTH, 2951).t().to_owned()
+        }
+
+        /// Answer `c` is read by `Σ_k α_k (cos(ω_k c) e_{2k} + sin(ω_k c) e_{2k+1})`
+        /// in the hidden frame, plus `leak` times a fixed complement row.
+        fn readout(leak: f64) -> Array2<f64> {
+            let frame = frame();
+            let mut rows = Array2::<f64>::zeros((ANSWERS, WIDTH));
+            for answer in 0..ANSWERS {
+                let mut row = Array1::<f64>::zeros(WIDTH);
+                for (plane, &(frequency, weight)) in PLANES.iter().enumerate() {
+                    let angle = std::f64::consts::TAU * (frequency * answer) as f64 / ANSWERS as f64;
+                    row.scaled_add(weight * angle.cos(), &frame.row(2 * plane));
+                    row.scaled_add(weight * angle.sin(), &frame.row(2 * plane + 1));
+                }
+                for extra in 2 * PLANES.len()..WIDTH {
+                    row.scaled_add(leak * ((answer + extra) as f64).sin(), &frame.row(extra));
+                }
+                rows.row_mut(answer).assign(&row);
+            }
+            rows
+        }
+
+        /// `Uᵀ B U` with `B` a scaled rotation in each key plane and a fixed
+        /// contraction on the complement: every letter keeps both subspaces.
+        fn letter(head: usize) -> Array2<f64> {
+            let frame = frame();
+            let mut block = Array2::<f64>::zeros((WIDTH, WIDTH));
+            for plane in 0..PLANES.len() {
+                let angle = 0.4 + 0.9 * (head + plane) as f64;
+                let scale = 0.8 + 0.1 * head as f64;
+                let (sine, cosine) = angle.sin_cos();
+                let offset = 2 * plane;
+                block[[offset, offset]] = scale * cosine;
+                block[[offset, offset + 1]] = -scale * sine;
+                block[[offset + 1, offset]] = scale * sine;
+                block[[offset + 1, offset + 1]] = scale * cosine;
+            }
+            for row in 2 * PLANES.len()..WIDTH {
+                for col in 2 * PLANES.len()..WIDTH {
+                    block[[row, col]] = 0.1 * (((row * 7 + col * 3 + head) % 5) as f64 - 2.0) / 2.0;
+                }
+            }
+            frame.t().dot(&block).dot(&frame)
+        }
+
+        fn key_planes() -> Array2<f64> {
+            frame().slice(s![..2 * PLANES.len(), ..]).to_owned()
+        }
+
+        /// Two steps of `{I, A_1, A_2}` with the answer readout after the last
+        /// step and a second readout `D` after the first.
+        fn steps<'a>(
+            identity: &'a Array2<f64>,
+            letters: &'a [Array2<f64>],
+            answers: &'a Array2<f64>,
+            early: &'a Array2<f64>,
+        ) -> Vec<ObservabilityStep<'a>> {
+            let alphabet: Vec<ObservabilityLetter<'a>> = std::iter::once(identity)
+                .chain(letters.iter())
+                .map(|letter| ObservabilityLetter::Linear(letter.view()))
+                .collect();
+            vec![
+                ObservabilityStep {
+                    letters: alphabet.clone(),
+                    readouts: vec![early.view()],
+                },
+                ObservabilityStep {
+                    letters: alphabet,
+                    readouts: vec![answers.view()],
+                },
+            ]
+        }
+
+        /// The Gramian formed by enumerating every word, with an entrywise bound on
+        /// its formation.
+        fn enumerated_gramian(
+            identity: &Array2<f64>,
+            letters: &[Array2<f64>],
+            answers: &Array2<f64>,
+            early: &Array2<f64>,
+        ) -> (Array2<f64>, f64) {
+            let alphabet: Vec<&Array2<f64>> = std::iter::once(identity).chain(letters.iter()).collect();
+            let mut gram = Array2::<f64>::zeros((WIDTH, WIDTH));
+            let mut absolute = Array2::<f64>::zeros((WIDTH, WIDTH));
+            let mut add = |rows: Array2<f64>, depth: usize| {
+                gram += &rows.t().dot(&rows);
+                let magnitude = rows.mapv(f64::abs);
+                absolute += &magnitude
+                    .t()
+                    .dot(&magnitude)
+                    .mapv(|entry| accumulation_growth(depth * WIDTH + rows.nrows() + 64) * entry);
+            };
+            for first in &alphabet {
+                add(early.dot(*first), 2);
+                for second in &alphabet {
+                    add(answers.dot(*second).dot(*first), 3);
+                }
+            }
+            let band = absolute.iter().map(|entry| entry * entry).sum::<f64>().sqrt();
+            (gram, band)
+        }
+
+        /// The factor's spectrum is the enumerated Gramian's, within the factor's
+        /// derived error and the enumeration's own bound (Weyl).
+        #[test]
+        fn factor_spectrum_matches_the_enumerated_gramian() {
+            let identity = Array2::<f64>::eye(WIDTH);
+            let letters = [letter(0), letter(1)];
+            let answers = readout(0.05);
+            let early = frame().slice(s![WIDTH - 3.., ..]).to_owned();
+            let report = WeightedObservability::pull_back(
+                test_governor(),
+                &steps(&identity, &letters, &answers, &early),
+            )
+            .expect("pull back");
+            let (gram, band) = enumerated_gramian(&identity, &letters, &answers, &early);
+            let (eigenvalues, _) = gram.eigh(Side::Lower).expect("eigh");
+            let mut expected: Vec<f64> = eigenvalues.to_vec();
+            expected.sort_by(|left, right| right.total_cmp(left));
+            let sigma = &report.spectrum().singular_values;
+            let error = report.formation + report.spectrum().band;
+            let tolerance = 2.0 * sigma[0] * error
+                + error * error
+                + band
+                + symmetric_spectrum_rounding_band(&expected);
+            for (index, &value) in expected.iter().enumerate() {
+                let computed = sigma.get(index).copied().unwrap_or(0.0).powi(2);
+                assert!(
+                    (computed - value).abs() <= tolerance,
+                    "eigenvalue {index}: factor {computed:e}, enumerated {value:e}, tolerance {tolerance:e}"
+                );
+            }
+            assert_eq!(report.step_spectra.len(), 2);
+            let trace: f64 = expected.iter().sum();
+            assert!((report.spectrum().energy - trace).abs() <= WIDTH as f64 * tolerance);
+        }
+
+        /// With no leak every word keeps the key planes, so the Gramian lives in
+        /// them: the planes capture all of its energy up to the derived error, the
+        /// top-4 directions are the planes, the resolved rank is 4, and the exact
+        /// closure's chart holds the same energy.
+        #[test]
+        fn planted_planes_capture_the_energy() {
+            let identity = Array2::<f64>::eye(WIDTH);
+            let letters = [letter(0), letter(1)];
+            let answers = readout(0.0);
+            let early = answers.slice(s![..2, ..]).to_owned();
+            let report = WeightedObservability::pull_back(
+                test_governor(),
+                &steps(&identity, &letters, &answers, &early),
+            )
+            .expect("pull back");
+            let planes = key_planes();
+            let capture = report.capture(test_governor(), planes.view()).expect("capture");
+            let EvidenceStatus::Exact {
+                value,
+                numerical_error,
+                ..
+            } = capture.energy_fraction
+            else {
+                panic!("an energy fraction is an exact algebraic value");
+            };
+            assert!(1.0 - value <= numerical_error, "planes hold {value} ± {numerical_error:e}");            assert!(capture.angle_perturbation < 1.0);
+            let floor = (1.0 - capture.angle_perturbation.powi(2)).sqrt();
+            // The computed directions themselves carry the compression's formation.
+            let slack = report.formation / capture.eigengap.sqrt();
+            for &cosine in &capture.principal_cosines {
+                assert!(cosine >= floor - slack, "principal cosine {cosine} below {floor}");
+            }
+            assert_eq!(report.spectrum().resolved_rank, 2 * PLANES.len());
+            assert!(matches!(
+                report.spectrum().rank_evidence().expect("rank evidence"),
+                EvidenceStatus::Unresolved { lower, .. } if lower == (2 * PLANES.len()) as f64
+            ));
+            assert!(report.spectrum().participation_ratio <= (2 * PLANES.len()) as f64);
+
+            let closed = LinearStateQuotient::close(
+                test_governor(),
+                &[answers.view()],
+                &[letters[0].view(), letters[1].view()],
+            )
+            .expect("close");
+            let held = report
+                .capture(test_governor(), closed.chart.view())
+                .expect("capture by the closure");
+            let EvidenceStatus::Exact {
+                value,
+                numerical_error,
+                ..
+            } = held.energy_fraction
+            else {
+                panic!("exact");
+            };
+            assert!(1.0 - value <= numerical_error);
+        }
+
+        /// Positive control: a uniformly random 4-dimensional subspace captures
+        /// `4/12` of the energy in expectation, so the mean over draws lands on
+        /// `1/3` within its standard error, far from the planted planes' `1`.
+        #[test]
+        fn random_subspaces_capture_only_their_share() {
+            let identity = Array2::<f64>::eye(WIDTH);
+            let letters = [letter(0), letter(1)];
+            let answers = readout(0.3);
+            let early = answers.slice(s![..2, ..]).to_owned();
+            let report = WeightedObservability::pull_back(
+                test_governor(),
+                &steps(&identity, &letters, &answers, &early),
+            )
+            .expect("pull back");
+            let dimension = 2 * PLANES.len();
+            let draws = 400;
+            let fractions: Vec<f64> = (0..draws)
+                .map(|draw| {
+                    let basis = hidden_basis(WIDTH, 10_000 + draw as u64);
+                    let candidate = basis.slice(s![..dimension, ..]).to_owned();
+                    match report
+                        .capture(test_governor(), candidate.view())
+                        .expect("capture")
+                        .energy_fraction
+                    {
+                        EvidenceStatus::Exact { value, .. } => value,
+                        other => panic!("{other:?}"),
+                    }
+                })
+                .collect();
+            let mean = fractions.iter().sum::<f64>() / draws as f64;
+            let variance =
+                fractions.iter().map(|value| (value - mean).powi(2)).sum::<f64>() / (draws - 1) as f64;
+            let standard_error = (variance / draws as f64).sqrt();
+            let share = dimension as f64 / WIDTH as f64;
+            assert!(
+                (mean - share).abs() <= 4.0 * standard_error,
+                "random mean {mean} vs share {share} (se {standard_error:e})"
+            );
+            let planted = report.capture(test_governor(), key_planes().view()).expect("capture");
+            let EvidenceStatus::Exact { value, .. } = planted.energy_fraction else {
+                panic!("exact");
+            };
+            assert!(value > mean + 4.0 * variance.sqrt());
+        }
+
+        #[test]
+        fn refuses_rank_deficient_candidates_and_empty_families() {
+            let identity = Array2::<f64>::eye(WIDTH);
+            let letters = [letter(0)];
+            let answers = readout(0.0);
+            let early = answers.slice(s![..1, ..]).to_owned();
+            let report = WeightedObservability::pull_back(
+                test_governor(),
+                &steps(&identity, &letters, &answers, &early),
+            )
+            .expect("pull back");
+            let row = key_planes().slice(s![..1, ..]).to_owned();
+            let doubled = ndarray::concatenate![ndarray::Axis(0), row, row];
+            assert!(matches!(
+                report.capture(test_governor(), doubled.view()),
+                Err(StateError::CandidateRankDeficient { declared: 2, resolved: 1 })
+            ));
+            let silent = ObservabilityStep {
+                letters: vec![ObservabilityLetter::Linear(identity.view())],
+                readouts: vec![],
+            };
+            assert!(matches!(
+                WeightedObservability::pull_back(test_governor(), &[silent]),
+                Err(StateError::EmptyFamily { .. })
+            ));
+        }
     }
 }
