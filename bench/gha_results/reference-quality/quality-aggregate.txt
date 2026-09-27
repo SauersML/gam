@@ -3,16 +3,16 @@ complete case manifest: /tmp/quality-report/quality_cases.txt (437 cases)
 === #1561 whole-suite quality meta-gate ===
 category        n scored GAMwin REFwin   medlogR  p(1-sided)      p_BH
 factors         1      1      0      1    0.0173      1.0000    1.0000
-families       50     50     33     17   -0.0046      0.0029    0.0173
+families       50     50     32     18   -0.0046      0.0040    0.0243
 manifolds      11     11      8      2   -0.0033      0.0527    0.0945
 misc           29     29     18     11   -0.0006      0.0630    0.0945
-smooths        41     41     26     15   -0.0109      0.0061    0.0183
+smooths        40     40     25     15   -0.0105      0.0104    0.0311
 survival       12     12      7      5   -0.0092      0.2349    0.2818
 ------------------------------------------------------------------------
-OVERALL       144    144     92     51   -0.0052      0.0000 
+OVERALL       143    143     90     52   -0.0047      0.0000 
 
-CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0000, median log(gam/ref)=-0.0052, wins 92 / losses 51)
-Experimental units: 144 cases from 185 metric pairs.
+CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0000, median log(gam/ref)=-0.0047, wins 90 / losses 52)
+Experimental units: 143 cases from 184 metric pairs.
 INCOMPLETE: absent manifest, mismatched execution, or failed cases; closure blocked.
 
 --- execution vs emission (silent-attrition guard) ---
@@ -23,7 +23,7 @@ families           90       7        50
 manifolds          11       0        11
 misc              247       6        29
 regressions         3       0         0
-smooths            49       5        41
+smooths            49       5        40
 survival           27       3        12
 
 SILENT ATTRITION: 10 test(s) failed BEFORE emitting a pair (excluded from the significance set):
@@ -39,7 +39,7 @@ SILENT ATTRITION: 10 test(s) failed BEFORE emitting a pair (excluded from the si
   TIMEOUT/per_test_bound survival::quality_vs_survival_coxph_frailty_hazard_multiplier::gam_hazard_multiplier_frailty_matches_coxph_frailty
 
 --- #2395 paired-panel power ---
-33 of 185 pairs carry a paired fold panel: 3 resolved BETTER, 2 resolved WORSE, 28 unresolved.
+33 of 184 pairs carry a paired fold panel: 3 resolved BETTER, 2 resolved WORSE, 28 unresolved.
 Pairing gain (unpaired SEM / paired SEM) over these panels: min 1.00x, median 4.88x, max 345.92x. Values above 1 are the common fold-draw swing that comparing two separately-averaged arms would have paid for.
 
 pair                                                         K   effect%    sem%  |e|/sem     d_z   wins  verdict
