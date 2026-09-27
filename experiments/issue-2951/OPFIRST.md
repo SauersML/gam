@@ -48,7 +48,13 @@ after two layers).
 The energy-weighted closure is informative. For modular addition the top eight
 observable directions before attention are the embedding's key-frequency planes
 (principal cosines 0.9999–0.996, 96% of the Gramian energy): the mechanism's
-input subspace is recovered from the weights and the task readout alone. For the
+input subspace is recovered from the weights and the task readout alone. The
+checkpoint was later retrained after a scratch-directory wipe (same seed and
+schedule); on the retrained model the top eight directions again align with the
+embedding's key planes (cosines 0.9999–0.914, 91% of the energy; its fifth
+unembedding key frequency is 40 rather than 10), and the exact closure is
+unchanged. Recomputing on OpenBLAS instead of Accelerate changes nothing beyond
+5e-15. For the
 weekday task only a soft concentration survives (participation ratio about
 20–150 over the last one to three layers).
 
