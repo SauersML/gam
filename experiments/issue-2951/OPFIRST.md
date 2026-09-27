@@ -239,6 +239,31 @@ blocks with exact finite gain and lag edits through the query weights.
 - On Qwen3 the edit is not exact: the per-head q-norm rescales the query by an RMS
   that the edit changes.
 
+### 9. Native-anchored conditional operators: the template is what fails
+`bench/mpd_opfirst_cond_operators_2951.py`, receipt `opfirst_cond_operators_OLMo-2-0425-1B.json`.
+
+For a SwiGLU block `F(h) = D[s(Gh) ⊙ Uh]`, a group `c` of hidden units has native output
+`y_c = Σ_{n∈c} d_n s(g_n) u_n`, and scaling `D_c` is a real parameter edit. The explanation
+tested is `ŷ_c = g_c(z_c) t_c(h)` with native template `t_c = D_c U h` and a gate `g_c` fitted by
+REML splines (gam's own `gaussian_reml_fit_batched`). The error splits exactly into operator
+inadequacy `E‖r‖²` (the part of `y_c` not along `t_c`), missing conditioning, and gate fit; and
+for native gains `ρ`, `E‖F_ρ − F̂_ρ‖² = ρᵀKρ` with `K_cd = E[e_cᵀe_d]`.
+
+On OLMo-2-0425-1B, layers 2, 8 and 14 (2048 train and 2048 held-out tokens):
+- Groups formed by clustering unit gates beat size-matched random groups at every depth and
+  group count (at 1024 groups, held-out variance explained 0.50/0.42/0.57 vs 0.15/−0.4/−0.1).
+- Operator inadequacy dominates everywhere: 0.45–0.49 of group energy at 64 groups and
+  0.12–0.15 at 4096, against 0.01–0.06 for conditioning and ≤ 0.01 for gate fit. Even oracle
+  per-token gates cap variance explained at 0.79–0.86. A group's output is a scalar times its
+  template only if its units' gates are equal, and they are not, even in two-unit clusters.
+- Group errors add constructively (`|Σe|²` exceeds `Σ|e_c|²` by 3–105%).
+- The late-layer sign-gated law (section 3) is better than any grouping up to 4096 groups
+  at layer 14 (0.918 vs 0.78); early layers have no competing law.
+- `ρᵀKρ` equals the executed edited-block error to 5.5e-15 relative.
+
+The exact error split did its job: the failure is the operator family, not missing context or
+gate flexibility, so more spline freedom would not have helped.
+
 ## What this says about method
 
 - Deletion-based sparsity and exact rank are the wrong primary objects: exact
