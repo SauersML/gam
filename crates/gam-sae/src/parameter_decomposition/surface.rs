@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use gam_math::gaussian_activation::GaussianActivation;
-use gam_runtime::resource::MemoryGovernor;
+use gam_runtime::resource::{MemoryGovernor, MemoryReservation, MemoryReservationError};
 use ndarray::{ArrayD, ArrayView1, ArrayView2, Ix1, Ix2};
 use serde::{Deserialize, Serialize};
 
@@ -29,9 +29,33 @@ use super::receipts::{
     ExternalExecution, MeasuredDiscrepancy, MlpBlockReceipt, MlpBlockReceiptInputs, ReceiptRefusal,
     StageAgreement, mlp_block_receipt,
 };
+use super::cyclic_action::CyclicActionError;
+use super::secant::SecantError;
+use super::state::StateError;
+use super::supports::EvidenceStatusError;
 use super::spectral::{
     PlaneRotationError, PlaneRotationRecovery, RotationAmbiguity, RotationClusterKind,
     recover_plane_rotations,
+};
+
+mod code;
+mod cyclic;
+mod secant;
+mod state_quotient;
+
+pub use code::{
+    CodeItem, CodeLengthReport, CodeLengthsReport, CodeLengthsRequest, DecideProposalReport,
+    DecideProposalRequest, EvidenceStatusWire, ExactBasisWire, ExtremumWire, FidelityVerdictWire,
+    LatticeReport, ProposalDecision, ProposalKindWire, StatedArtifact,
+};
+pub use secant::{SecantActivationWire, SecantOperator, SecantReport, SecantRequest};
+
+pub use cyclic::{
+    CyclicBasis, CyclicPlanesReport, CyclicPlanesRequest, FrequencyEditReport, FrequencyEditRequest,
+    PlaneProgramCodeReport, PlaneProgramCodeRequest,
+};
+pub use state_quotient::{
+    LinearChart, LinearStateQuotientReport, LinearStateQuotientRequest, SpectralNormBoundsReport,
 };
 
 /// Identity of the request document.
@@ -97,6 +121,26 @@ pub enum MpdOperation {
         /// The executor's block output `W₂ a + b₂`, without the residual (`rows x out`).
         external_output: String,
     },
+    /// The linear sufficient state of linear readouts under linear transitions
+    /// (`state::LinearStateQuotient`): the closed observable chart, or a declared one
+    /// measured.
+    LinearStateQuotient(LinearStateQuotientRequest),
+    /// The closed-form planes of a table under a declared single odd cycle
+    /// (`cyclic_action::cyclic_planes`).
+    CyclicPlanes(CyclicPlanesRequest),
+    /// The frequency edit of a plane subset at one shift
+    /// (`cyclic_action::frequency_edit`).
+    FrequencyEdit(FrequencyEditRequest),
+    /// The exact code of a plane program at a declared precision
+    /// (`cyclic_action::plane_program_code`).
+    PlaneProgramCode(PlaneProgramCodeRequest),
+    /// Exact bit counts of declared message items (`codec`, `precision::LatticeCode`).
+    CodeLengths(CodeLengthsRequest),
+    /// One structural proposal decided by `fit::decide_proposal` from supplied code
+    /// lengths and evidence statuses.
+    DecideProposal(DecideProposalRequest),
+    /// One exact two-endpoint change operator with its bands (`secant`).
+    Secant(SecantRequest),
 }
 
 /// [`ExternalExecution`] on the wire.
@@ -146,6 +190,13 @@ pub struct MpdReport {
 pub enum MpdResult {
     RecoverPlaneRotations(PlaneRotationReport),
     MlpBlockReceipt(MlpBlockReceiptReport),
+    LinearStateQuotient(LinearStateQuotientReport),
+    CyclicPlanes(CyclicPlanesReport),
+    FrequencyEdit(FrequencyEditReport),
+    PlaneProgramCode(PlaneProgramCodeReport),
+    CodeLengths(CodeLengthsReport),
+    DecideProposal(DecideProposalReport),
+    Secant(SecantReport),
 }
 
 /// [`PlaneRotationRecovery`] on the wire.
@@ -305,6 +356,15 @@ pub enum MpdSurfaceError {
     TensorShape { tensor: String, reason: String },
     PlaneRotation(PlaneRotationError),
     Receipt(ReceiptRefusal),
+    State(StateError),
+    CyclicAction(CyclicActionError),
+    /// A code owner refused an item.
+    Code(String),
+    /// An evidence-status constructor refused a supplied status.
+    Evidence(EvidenceStatusError),
+    Secant(SecantError),
+    /// A dense copy the surface forms does not fit the memory budget.
+    Memory(MemoryReservationError),
     /// An owner returned a non-finite value where the wire report has no meaning
     /// for one.
     NonFiniteReport { field: &'static str, value: f64 },
@@ -324,6 +384,12 @@ impl fmt::Display for MpdSurfaceError {
             }
             Self::PlaneRotation(error) => write!(formatter, "{error}"),
             Self::Receipt(error) => write!(formatter, "{error}"),
+            Self::State(error) => write!(formatter, "{error}"),
+            Self::CyclicAction(error) => write!(formatter, "{error}"),
+            Self::Memory(error) => write!(formatter, "{error}"),
+            Self::Code(reason) => write!(formatter, "{reason}"),
+            Self::Evidence(error) => write!(formatter, "{error}"),
+            Self::Secant(error) => write!(formatter, "{error}"),
             Self::NonFiniteReport { field, value } => write!(
                 formatter,
                 "MPD report field {field} is {value}, which the wire report cannot state"
@@ -391,7 +457,42 @@ pub fn run_parameter_decomposition(
             .map_err(MpdSurfaceError::Receipt)?;
             project_mlp_block_receipt(external_execution.device, receipt)
         }
+        MpdOperation::LinearStateQuotient(request) => {
+            state_quotient::run(request, tensors, governor)
+        }
+        MpdOperation::CyclicPlanes(request) => cyclic::run_planes(request, tensors, governor),
+        MpdOperation::FrequencyEdit(request) => cyclic::run_edit(request, tensors, governor),
+        MpdOperation::PlaneProgramCode(request) => cyclic::run_code(request, tensors, governor),
+        MpdOperation::CodeLengths(request) => code::run_lengths(request, tensors, governor),
+        MpdOperation::DecideProposal(request) => code::run_decide(request),
+        MpdOperation::Secant(request) => secant::run(request, tensors, governor),
     }
+}
+
+/// Wraps one operation's result in the versioned report.
+fn output(result: MpdResult, arrays: BTreeMap<String, ArrayD<f64>>) -> MpdOutput {
+    MpdOutput {
+        report: MpdReport {
+            schema: MPD_REPORT_SCHEMA,
+            schema_version: MPD_SCHEMA_VERSION,
+            result,
+        },
+        arrays,
+    }
+}
+
+/// Reserves `copies` dense `rows × cols` matrices the surface forms or an ungoverned
+/// owner allocates.
+fn reserve(
+    governor: &MemoryGovernor,
+    rows: usize,
+    cols: usize,
+    copies: usize,
+    context: &'static str,
+) -> Result<MemoryReservation, MpdSurfaceError> {
+    governor
+        .try_reserve_dense_f64_copies(rows, cols, copies, context)
+        .map_err(MpdSurfaceError::Memory)
 }
 
 /// The input array a request names.
@@ -614,7 +715,7 @@ mod tests {
     use gam_math::gaussian_activation::GaussianActivationError;
     use ndarray::{Array1, Array2, Axis, array};
 
-    fn request_json(operation: &str) -> String {
+    pub(super) fn request_json(operation: &str) -> String {
         format!(
             r#"{{"schema": "{MPD_REQUEST_SCHEMA}", "schema_version": {MPD_SCHEMA_VERSION}, "operation": {operation}}}"#
         )

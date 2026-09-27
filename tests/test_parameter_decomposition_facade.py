@@ -57,3 +57,36 @@ def test_facade_never_sends_a_non_finite_request(monkeypatch):
     # Positive control: the same stub is reached by a finite request.
     facade.run_parameter_decomposition(REQUEST, {"w": np.eye(2)})
     assert rust.args is not None
+
+
+def test_linear_state_quotient_runs_end_to_end_through_rust():
+    """One surface op through the real extension: the report is Rust's; the facade only transports it."""
+    pytest.importorskip("gamfit._rust")
+    readout = np.array([[1.0, 0.0, 0.0]])
+    shear = np.array([[1.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.5]])
+    request = {
+        "schema": "gam.mpd-request",
+        "schema_version": 1,
+        "operation": {
+            "kind": "linear_state_quotient",
+            "readouts": ["m"],
+            "transitions": ["t"],
+            "chart": {"kind": "close"},
+        },
+    }
+
+    out = facade.run_parameter_decomposition(request, {"m": readout, "t": shear})
+
+    result = out.report["result"]
+    assert result["kind"] == "linear_state_quotient"
+    # The shear moves the second coordinate into the observed first: the closed chart is the plane.
+    assert result["rows"] == 2
+    assert set(out.arrays) == {"chart", "readout_maps/0", "descended/0"}
+    assert out.arrays["chart"].shape == (2, 3)
+    assert result["quotient_bounds"][0]["upper"] < 1e-12
+    # Positive control for the bound: a declared chart without the second coordinate is not closed.
+    request["operation"]["chart"] = {"kind": "declared", "tensor": "q"}
+    unclosed = facade.run_parameter_decomposition(
+        request, {"m": readout, "t": shear, "q": np.array([[1.0, 0.0, 0.0]])}
+    )
+    assert unclosed.report["result"]["quotient_bounds"][0]["lower"] > 0.5
