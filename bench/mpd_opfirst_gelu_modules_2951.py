@@ -436,7 +436,9 @@ def main():
                     r["random_twin"]["eta_over_scale"], r["random_twin"]["emp_over_dF_median"]), flush=True)
     report["runtime_s"] = {"forward_and_load": t_fwd, "total": time.time() - t0}
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.out).write_text(json.dumps(report, indent=1))
+    # one top-level key per line: build.rs caps tracked files at 10k lines
+    Path(args.out).write_text("{\n" + ",\n".join("%s:%s" % (json.dumps(k), json.dumps(v, separators=(",", ":")))
+                                                  for k, v in report.items()) + "\n}\n")
     print(json.dumps(report["planted"], indent=1))
     print("runtime %.0fs" % report["runtime_s"]["total"])
 
