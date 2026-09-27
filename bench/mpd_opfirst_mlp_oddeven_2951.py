@@ -209,21 +209,35 @@ def correction_bounds(X, Wg, Wu, Wd, gamma, k, chunk=64):
     }
 
 
-def replace_runs(model, ids, clean_logits, suffix_l0, prefix_l0, positions):
-    """Swap silu -> relu (drop C exactly) in a layer set, rerun the full model, compare next-token distributions."""
-    n_layers = len(model.model.layers)
+class MaskedRelu(torch.nn.Module):
+    """relu on the (batch, seq) tokens in mask, silu elsewhere."""
+
+    def __init__(self, mask):
+        super().__init__()
+        self.mask = mask
+
+    def forward(self, g):
+        return torch.where(self.mask[..., None], torch.relu(g), torch.nn.functional.silu(g))
+
+
+def replace_runs(model, ids, clean_logits, configs, positions):
+    """Swap silu -> relu (drop C exactly) in a layer set, rerun the full model, compare next-token distributions.
+
+    configs: (kind, L0, layer_set, swap_mask) with swap_mask a (batch, seq) bool of tokens to swap, None for all tokens.
+    """
     clean = torch.log_softmax(clean_logits, -1).reshape(-1, clean_logits.shape[-1])
     tgt = torch.cat([ids[:, 1:], torch.full((ids.shape[0], 1), -1)], 1).reshape(-1)
     has_tgt = tgt >= 0
     nll_clean = -clean[has_tgt].gather(-1, tgt[has_tgt, None]).squeeze(-1)
     keep = positions != 0
-    configs = [("suffix", l0, list(range(l0, n_layers))) for l0 in suffix_l0]
-    configs += [("prefix", l0, list(range(0, l0))) for l0 in prefix_l0]
     out = []
-    for kind, l0, layer_set in configs:
+    for kind, l0, layer_set, swap_mask in configs:
         saved = {i: model.model.layers[i].mlp.act_fn for i in layer_set}
         for i in layer_set:
-            model.model.layers[i].mlp.act_fn = torch.nn.ReLU()
+            if swap_mask is None:
+                model.model.layers[i].mlp.act_fn = torch.nn.ReLU()
+            else:
+                model.model.layers[i].mlp.act_fn = MaskedRelu(swap_mask)
         with torch.inference_mode():
             lp = torch.log_softmax(model(input_ids=ids).logits, -1).reshape(-1, clean.shape[-1])
         for i, fn in saved.items():
@@ -274,7 +288,9 @@ def main():
     parser.add_argument("--scales", default="0.1,0.3,1")
     parser.add_argument("--probes", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--mode", choices=["oddeven", "relusplit", "replace"], default="oddeven")
+    parser.add_argument("--mode", choices=["oddeven", "relusplit", "replace", "single"], default="oddeven")
+    parser.add_argument("--massive-factor", type=float, default=100.0)
+    parser.add_argument("--worst", type=int, default=3)
     parser.add_argument("--include-pos0", action="store_true", help="position 0 (attention sink) is excluded by default")
     parser.add_argument("--suffix-l0", default="27,24,21,18,15,0")
     parser.add_argument("--prefix-l0", default="27,24,21,18,15")
@@ -298,6 +314,15 @@ def main():
 
     layers = model.model.layers
     handles = [layers[i].mlp.register_forward_hook(make_hook(i)) for i in range(len(layers))]
+    resid = {}
+
+    def make_resid_hook(i):
+        def hook(_m, inputs):
+            resid[i] = inputs[0].norm(dim=-1).clone()
+        return hook
+
+    handles += [layers[i].post_attention_layernorm.register_forward_pre_hook(make_resid_hook(i))
+                for i in range(len(layers))]
     with torch.inference_mode():
         clean_logits = model(input_ids=ids).logits
     for h in handles:
@@ -310,9 +335,42 @@ def main():
     gen = torch.Generator().manual_seed(args.seed)
     report = {"model": args.model, "mode": args.mode, "text_source": source, "tokens": int(ids.numel()), "dtype": "float64",
               "act": model.config.hidden_act, "stats_exclude_position0": not args.include_pos0, "layers": {}}
+    n_layers = len(layers)
     if args.mode == "replace":
-        report["replacement"] = replace_runs(model, ids, clean_logits, [int(v) for v in args.suffix_l0.split(",")],
-                                             [int(v) for v in args.prefix_l0.split(",")], positions)
+        configs = [("suffix", l0, list(range(l0, n_layers)), None) for l0 in map(int, args.suffix_l0.split(","))]
+        configs += [("prefix", l0, list(range(0, l0)), None) for l0 in map(int, args.prefix_l0.split(","))]
+        report["replacement"] = replace_runs(model, ids, clean_logits, configs, positions)
+    if args.mode == "single":
+        # massive = pre-norm residual norm (input of post_attention_layernorm) > factor x that layer's median token
+        rows_single = replace_runs(model, ids, clean_logits, [("single", i, [i], None) for i in range(n_layers)], positions)
+        worst = sorted(range(n_layers), key=lambda i: -rows_single[i]["kl_mean"])[: args.worst]
+        audit = []
+        for i in worst:
+            r = resid[i]
+            massive = r > args.massive_factor * r.median()
+            mlp_in = captured[i][0].norm(dim=-1).view_as(r)
+            info = {"layer": i, "n_massive": int(massive.sum()),
+                    "massive_positions": sorted({int(p) for p in massive.nonzero()[:, 1]}),
+                    "massive_resid_over_median_min": float((r[massive] / r.median()).min()) if massive.any() else None,
+                    "resid_max_over_median": float(r.max() / r.median()),
+                    "mlp_input_max_over_median": float(mlp_in.max() / mlp_in.median())}
+            runs = replace_runs(model, ids, clean_logits, [("ordinary_only", i, [i], ~massive),
+                                                           ("massive_only", i, [i], massive)], positions)
+            info["all_tokens"] = rows_single[i]
+            info["ordinary_only"], info["massive_only"] = runs
+            audit.append(info)
+            print(f"L{i:02d} massive n={info['n_massive']} pos={info['massive_positions']} "
+                  f"resid max/med={info['resid_max_over_median']:.0f} mlp_in max/med={info['mlp_input_max_over_median']:.1f}",
+                  flush=True)
+        report["single_layer"] = rows_single
+        report["worst_layer_massive_audit"] = audit
+        report["layers"] = {}
+        report["runtime_s"] = {"forward_and_load": t_fwd, "total": time.time() - t0}
+        with open(args.out, "w") as fh:
+            fh.write("{\n" + ",\n".join(f"{json.dumps(k)}:{json.dumps(v, separators=(',', ':'))}"
+                                         for k, v in report.items()) + "\n}\n")
+        print("runtime", report["runtime_s"])
+        return
     with torch.inference_mode():
         for i, layer in enumerate(layers):
             mlp = layer.mlp
