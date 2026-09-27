@@ -39,6 +39,13 @@ Groupings (clustered on the train tokens only, evaluated on held-out tokens):
   random_<x>_s<seed>   random unit groups with the same size multiset as <x>, the null
 The hierarchy is cut at every group count in --ks; the whole curve is reported, nothing is selected.
 
+Multi-template mode (--mode multi, receipt opfirst_cond_operators_multi_*): templates are the group's own native
+vectors d_n u_n(h), so yhat_c = sum_{n in c} shat_n d_n u_n has no operator term and every error is in the gates.
+Per raw-gate Ward group (and its size-matched random null) it reports the singular spectrum of the centered
+token x unit gate matrix s(g_c) against a per-column token-permutation null, and fits rank-r gate models from the
+group's top-r principal gate coordinates z_c: linear (PCA reconstruction), per-unit additive REML splines, and a
+sign-gated form g_n * bhat_n(z_c) whose r = group-size limit is the relu law.
+
 Two stages, because the model runtime (transformers) and the gamfit build live in different environments:
   uv run --no-project --with torch --with numpy --with scipy --with transformers --with safetensors \
       --with huggingface_hub --with datasets python bench/mpd_opfirst_cond_operators_2951.py --stage capture
@@ -464,6 +471,215 @@ def analyze(args):
         f.write(compact_json(receipt))
     print("wrote", args.out)
 
+def spectrum(sv, rs):
+    """Energy spectrum of a centered token x unit matrix from its singular values."""
+    ev = np.sort(sv ** 2)[::-1]
+    tot = ev.sum()
+    if tot <= 0:
+        return None
+    cum = np.cumsum(ev) / tot
+    return {"energy": float(tot), "m": int(ev.size), "r90": int(np.searchsorted(cum, 0.90) + 1),
+            "r99": int(np.searchsorted(cum, 0.99) + 1), "pr": float(tot ** 2 / (ev ** 2).sum()),
+            "top": {r: float(ev[:r].sum()) for r in rs}}
+
+
+def spectrum_summary(specs, rs):
+    """Pooled over groups: top-r energy share, and energy-weighted means of r90/m, r99/m, participation/m."""
+    specs = [x for x in specs if x is not None]
+    E = np.array([x["energy"] for x in specs])
+    m = np.array([x["m"] for x in specs], dtype=float)
+    wmean = lambda v: float((E * v).sum() / E.sum())  # noqa: E731
+    return {"top_r_share": {str(r): float(sum(x["top"][r] for x in specs) / E.sum()) for r in rs},
+            "r90_over_m": wmean(np.array([x["r90"] for x in specs]) / m),
+            "r99_over_m": wmean(np.array([x["r99"] for x in specs]) / m),
+            "pr_over_m": wmean(np.array([x["pr"] for x in specs]) / m),
+            "r90_median": float(np.median([x["r90"] for x in specs])),
+            "pr_median": float(np.median([x["pr"] for x in specs]))}
+
+
+def unit_splines(n_default, ztr, zho, Ytr, Yho, Wtr, Who, max_entries=4e7):
+    """Every unit gate of a group as an additive smooth of the group's r gate coordinates: one shared design,
+    one gamfit batched-REML fit per unit (own lambda, weights w_n = |d_n|^2 u_n^2). Returns the train-fitted
+    prediction on held-out, the in-sample held-out fit (g* estimate), total edf and basis columns."""
+    sd = ztr.std(0)
+    spl = [Spline(n_default).fit_knots(ztr[:, j] / sd[j]) for j in range(ztr.shape[1])]
+
+    def design(z):
+        return np.hstack([sp.design(z[:, j] / sd[j])[:, (1 if j else 0):] for j, sp in enumerate(spl)])
+
+    p = sum(sp.p for sp in spl) - (len(spl) - 1)
+    S = np.zeros((p, p))
+    o = 0
+    for j, sp in enumerate(spl):
+        blk = sp.S[1:, 1:] if j else sp.S
+        S[o:o + blk.shape[0], o:o + blk.shape[0]] = blk
+        o += blk.shape[0]
+    Xtr, Xho = design(ztr), design(zho)
+    per = max(1, int(max_entries // (Xtr.shape[0] * p)))
+    pred, star, edf = np.empty_like(Yho), np.empty_like(Yho), 0.0
+    for s0 in range(0, Ytr.shape[1], per):
+        cols = range(s0, min(s0 + per, Ytr.shape[1]))
+        c_tr, e = batched_reml([Xtr] * len(cols), [Ytr[:, n] for n in cols], [Wtr[:, n] for n in cols], S)
+        c_ho, _ = batched_reml([Xho] * len(cols), [Yho[:, n] for n in cols], [Who[:, n] for n in cols], S)
+        pred[:, s0:s0 + len(cols)] = Xho @ np.stack(c_tr, 1)
+        star[:, s0:s0 + len(cols)] = Xho @ np.stack(c_ho, 1)
+        edf += float(np.sum(e))
+    return pred, star, edf, p
+
+
+def multi_evaluate(layer, labels, rs, n_default, gen, n_rho):
+    """Multi-template explanation: yhat_c = sum_{n in c} shat_n d_n u_n, so the operator term is zero and all
+    error is in the gates. Gates of a group are modelled from its top-r principal gate coordinates z_c."""
+    k = int(labels.max()) + 1
+    order = np.argsort(labels, kind="stable")
+    groups = np.split(order, np.cumsum(np.bincount(labels, minlength=k))[:-1])
+    T, H = layer.sp["train"], layer.sp["held"]
+    Str, Sho, Gtr, Gho = T["S"].numpy(), H["S"].numpy(), T["G"].numpy(), H["G"].numpy()
+    dn2 = (layer.Wd ** 2).sum(0).numpy()
+    Wtr, Who = T["U"].numpy() ** 2 * dn2, H["U"].numpy() ** 2 * dn2
+    F = H["F"]
+    specs = {"gates": [], "gates_perm": [], "active": [], "active_perm": []}
+    models = {f"{name}_r{r}": {"S": Sho.copy(), "params": 0, "edf": 0.0, "star": Sho.copy() if name == "spline" else None}
+              for r in rs for name in ("linear", "spline", "signgated")}
+    act_frac = []
+    for idx in groups:
+        m = idx.size
+        C = Str[:, idx] - Str[:, idx].mean(0)
+        B = (Gtr[:, idx] > 0).astype(float)
+        CB = B - B.mean(0)
+        act_frac.append(B.mean() * m)
+        _, sv, Vt = np.linalg.svd(C, full_matrices=False)
+        perm = lambda A: np.stack([A[gen.permutation(A.shape[0]), j] for j in range(A.shape[1])], 1)  # noqa: E731
+        specs["gates"].append(spectrum(sv, rs))
+        specs["gates_perm"].append(spectrum(np.linalg.svd(perm(C), compute_uv=False), rs))
+        specs["active"].append(spectrum(np.linalg.svd(CB, compute_uv=False), rs))
+        specs["active_perm"].append(spectrum(np.linalg.svd(perm(CB), compute_uv=False), rs))
+        rank = int((sv > sv[0] * max(C.shape) * np.finfo(float).eps).sum()) if sv.size and sv[0] > 0 else 0
+        for r in rs:
+            if r >= rank:  # r coordinates span every unit gate: the native gates, exactly, with no parameters
+                continue
+            Vr = Vt[:r].T
+            ztr, zho = C @ Vr, (Sho[:, idx] - Str[:, idx].mean(0)) @ Vr
+            lin = models[f"linear_r{r}"]
+            lin["S"][:, idx] = Str[:, idx].mean(0) + zho @ Vr.T
+            lin["params"] += m * (r + 1)
+            sg = models[f"signgated_r{r}"]
+            coef = np.linalg.lstsq(ztr, CB, rcond=None)[0]
+            sg["S"][:, idx] = Gho[:, idx] * (B.mean(0) + zho @ coef)
+            sg["params"] += m * (2 * r + 1)
+            sp = models[f"spline_r{r}"]
+            pred, star, edf, p = unit_splines(n_default, ztr, zho, Str[:, idx], Sho[:, idx], Wtr[:, idx], Who[:, idx])
+            sp["S"][:, idx], sp["star"][:, idx] = pred, star
+            sp["params"] += m * (r + p)
+            sp["edf"] += edf
+    E_unit = float((Who * Sho ** 2).sum())
+    out = {"k": k, "size_max": int(max(g.size for g in groups)),
+           "active_units_per_token_mean": float(np.sum(act_frac)) / labels.size,
+           "spectra": {name: spectrum_summary(v, rs) for name, v in specs.items()}}
+    for name, md in models.items():
+        Shat = torch.from_numpy(md["S"])
+        Fh = (H["U"] * Shat) @ layer.Wd.T
+        err = float((Who * (Sho - md["S"]) ** 2).sum()) / E_unit
+        res = {"params": md["params"], **fidelity(F, Fh), "unit_gate_err": err}
+        if hasattr(layer, "gff"):
+            res["post_norm_write"] = fidelity(post_norm(F, layer.gff, layer.eps), post_norm(Fh, layer.gff, layer.eps))
+        if md["star"] is not None:
+            cond = float((Who * (Sho - md["star"]) ** 2).sum()) / E_unit
+            res.update(conditioning=cond, gate_fit=err - cond, edf=md["edf"])
+        if not name.startswith("signgated"):
+            res["edits"] = edits(layer, labels, k, H["U"] * (H["S"] - Shat), Fh, Shat, gen, n_rho)
+        out[name] = res
+    return out
+
+
+def load_layer(cap, li, split):
+    f64 = lambda key: torch.from_numpy(cap[key].astype(np.float64))  # noqa: E731
+    X = f64(f"x{li}").reshape(-1, cap[f"x{li}"].shape[-1])
+    layer = Layer(X, f64(f"wg{li}"), f64(f"wu{li}"), f64(f"wd{li}"), split)
+    if f"gff{li}" in cap:
+        layer.gff, layer.eps = f64(f"gff{li}"), float(cap[f"eps{li}"])
+    return layer, f64(f"f{li}").reshape(-1, cap[f"f{li}"].shape[-1])
+
+
+def analyze_multi(args):
+    """Multi-template mode: templates are the group's own native vectors d_n u_n(h) (operator term zero by
+    construction); the question is whether a group's unit gates are a low-dimensional function of shared
+    coordinates. Groups: raw-gate Ward cuts and size-matched random groups (same seeds as the single mode)."""
+    from gamfit import basis
+
+    t0 = time.time()
+    torch.set_num_threads(args.threads)
+    cap = np.load(args.cache)
+    n_seq, T = cap["ids"].shape
+    ntr = n_seq // 2
+    pos = np.arange(1, T)
+    split = {"train": torch.from_numpy((np.arange(ntr)[:, None] * T + pos).ravel()),
+             "held": torch.from_numpy((np.arange(ntr, n_seq)[:, None] * T + pos).ravel())}
+    n_default = basis.bspline_basis(np.linspace(0.0, 1.0, 64), None).shape[1]
+    ks = [int(x) for x in args.ks.split(",")]
+    rs = [int(x) for x in args.ranks.split(",")]
+    receipt = {"model": str(cap["model"]), "mode": "multi-template", "n_layers": int(cap["n_layers"]),
+               "tokens": {"train": int(split["train"].numel()), "held_out": int(split["held"].numel()),
+                          "position0_excluded": True, "split": "first half of sequences train, second half held-out"},
+               "templates": "per-unit native vectors d_n u_n(h); operator inadequacy is zero by construction",
+               "z": "top-r principal coordinates of the group's centered train gate matrix s(g_c) (held-out: same "
+                    "projection of held-out gates)",
+               "models": {"linear_r": "rank-r PCA reconstruction of the group's gates; params m(r+1)",
+                          "spline_r": "each unit gate = additive cubic B-spline in the r coordinates (knots at the "
+                                      "group's train quantiles, block 2nd-derivative penalty, one REML lambda per "
+                                      "unit, gamfit.reml.gaussian_reml_fit_batched, weights |d_n|^2 u_n^2); params "
+                                      "m(r + basis cols); conditioning = in-sample held-out refit",
+                          "signgated_r": "s_n ~ g_n * bhat_n with bhat = least-squares map from z to the active "
+                                         "indicator 1[g_n>0]; r = group size is the relu law; params m(2r+1)",
+                          "exact_when_r_ge_rank": "groups whose gate rank <= r keep native gates (0 params)"},
+               "spectra": "gates: centered s(g_c); gates_perm: each unit column permuted over tokens (null for "
+                          "shared structure); active: centered 1[g>0]; top_r_share pooled over groups",
+               "unit_gate_err": "sum_n E[|d_n|^2 u_n^2 (s_n - shat_n)^2] / sum_n E[|y_n|^2] (diagonal part of the "
+                                "output error)",
+               "ks": ks, "ranks": rs, "basis_cols_1d": n_default, "layers": {}}
+    todo = [int(x) for x in args.layers.split(",")] if args.layers else [int(x) for x in cap["layers"]]
+    for li in todo:
+        tl = time.time()
+        layer, _ = load_layer(cap, li, split)
+        H = layer.sp["held"]
+        n_ff = H["U"].shape[1]
+        rec = {"n_ff": n_ff, "relu_law": fidelity(H["F"], H["Frelu"]),
+               "relu_active_units_per_token": float((H["G"] > 0).double().mean().item())}
+        Str = layer.sp["train"]["S"].T.numpy()
+        gen = np.random.default_rng(args.seed + li)
+        # same generator sequence as the single mode, so the random groups are the same groups
+        corr = ward_labels((Str - Str.mean(1, keepdims=True)) / Str.std(1, keepdims=True), ks)
+        _ = {k: size_matched_random(lab, gen) for k, lab in corr.items()}
+        raw = ward_labels(Str, ks)
+        groupings = {"gate_raw": raw, "random_gate_raw_s0": {k: size_matched_random(lab, gen) for k, lab in raw.items()}}
+        curves = {}
+        for gname, bykey in groupings.items():
+            curves[gname] = []
+            for k, labels in bykey.items():
+                tg = time.time()
+                r = multi_evaluate(layer, labels, rs, n_default, gen, args.n_rho)
+                r["seconds"] = round(time.time() - tg, 1)
+                curves[gname].append(r)
+                sp = r["spectra"]["gates"]
+                print(f"  L{li} {gname:20s} k={r['k']:5d} top1/2/4={[round(v, 3) for v in sp['top_r_share'].values()]} "
+                      f"perm={[round(v, 3) for v in r['spectra']['gates_perm']['top_r_share'].values()]} "
+                      + " ".join(f"r{q}: lin={r[f'linear_r{q}']['fve_centered']:.3f} spl={r[f'spline_r{q}']['fve_centered']:.3f} "
+                                 f"sg={r[f'signgated_r{q}']['fve_centered']:.3f}" for q in rs)
+                      + f" ({r['seconds']:.0f}s)", flush=True)
+        rec["curves"] = curves
+        rec["runtime_s"] = time.time() - tl
+        rec["reml_interpolated_fits"] = len(INTERPOLATED)
+        INTERPOLATED.clear()
+        receipt["layers"][str(li)] = rec
+        with open(args.out, "w") as f:
+            f.write(compact_json(receipt))
+        print(f"L{li} relu fve={rec['relu_law']['fve_centered']:.3f} ({rec['runtime_s']:.0f}s)", flush=True)
+        del layer
+    receipt["runtime_s"] = time.time() - t0
+    with open(args.out, "w") as f:
+        f.write(compact_json(receipt))
+    print("wrote", args.out)
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -477,6 +693,9 @@ def main():
     ap.add_argument("--random-seeds", type=int, default=1)
     ap.add_argument("--n-rho", type=int, default=3)
     ap.add_argument("--threads", type=int, default=6)
+    ap.add_argument("--mode", choices=["single", "multi"], default="single",
+                    help="analyze: single-template conditional operators, or multi-template low-rank gates")
+    ap.add_argument("--ranks", default="1,2,4", help="multi mode: gate-coordinate ranks r")
     ap.add_argument("--merge", nargs="*", default=[], help="analyze: merge per-layer receipts into --out")
     ap.add_argument("--out", default="experiments/issue-2951/receipts/opfirst_cond_operators.json")
     args = ap.parse_args()
@@ -490,7 +709,10 @@ def main():
         with open(args.out, "w") as f:
             f.write(compact_json(merged))
         return
-    capture(args) if args.stage == "capture" else analyze(args)
+    if args.stage == "capture":
+        capture(args)
+    else:
+        analyze_multi(args) if args.mode == "multi" else analyze(args)
 
 
 if __name__ == "__main__":
