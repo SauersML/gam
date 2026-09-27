@@ -62,15 +62,7 @@ def linear_quotient(readouts, transitions=(), chart=None):
 
 def resolved_rows(matrix):
     """state.rs's resolved row space of one matrix (sigma > max(m, n) eps sigma_max) as orthonormal rows: the
-    owner's quotient of ``matrix`` under no transitions. ``.shape[0]`` is the rank at the eps band.
-
-    When the matrix has full rank min(m, n) with sigma_min above 10x that band (numpy SVD, whose error is far
-    below the margin), the owner's answer is the whole row space and an orthonormal basis of it is returned
-    without the call: the owner's rank rule costs about 30 min at 2048 x 2048 in the available build."""
-    m, n = matrix.shape
-    _, sigma, vt = np.linalg.svd(np.linalg.qr(matrix, mode="r") if m > 2 * n else matrix, full_matrices=False)
-    if sigma[-1] > 10 * max(m, n) * np.finfo(np.float64).eps * sigma[0]:
-        return vt
+    owner's quotient of ``matrix`` under no transitions. ``.shape[0]`` is the rank at the eps band."""
     return linear_quotient([matrix])[0]
 
 
@@ -196,6 +188,8 @@ def main():
             })
             print(variant, layer, rank, f"PR={per_layer[variant][-1]['effective']['participation_ratio']:.1f}",
                   f"{time.time() - started:.0f}s", flush=True)
+            with open(args.out + ".partial", "w") as fh:  # progress survives an interrupted run
+                fh.write(compact_json(result | {"causal_backward_partial": per_layer}))
         per_layer[variant].reverse()
     result["causal_backward"] = per_layer
     result["ov_head_norm_range"] = [float(min(np.linalg.norm(a[0] @ a[1], 2) for a in all_ov)),

@@ -321,12 +321,47 @@ Results, OLMo against Qwen3:
   - the last layer alone costs mean KL 0.37 (Qwen3 0.007), layer 14 costs 0.023, and
     each early layer costs 0.11–0.30;
   - layers 13–15 together cost 0.28, and anything from layer 11 up costs at least 0.72.
+- The sign-gated law depends on the architecture. OLMo's MLP reads the raw, un-normalised
+  residual, so the size of `|g|`, and with it the relu share, tracks the input scale. At
+  initialisation `P` explains 0.83–0.998 of the output variance in every layer for that
+  reason alone. Qwen3's MLP reads an RMS-normalised input, and there the law holds at
+  0.93–0.997 with a last-layer swap cost of KL 0.007; OLMo's is 0.78–0.92 with a
+  last-layer cost of KL 0.37.
 - OLMo has no massive-activation tokens: the residual max/median is at most 2.2 in
   the audited layers. In Qwen3 such tokens dominated the heavy rows. The per-token
   bounds on the dropped correction stay 2.6–7.8× loose.
 - The Π-graph on SwiGLU up reads is not an exact module statement, because the
   exact-GELU theorem does not cover a two-read, bilinear-gated unit (`--mode pi --read up`,
-  labelled in the receipt). It is reported only as read-row geometry.
+  labelled in the receipt `opfirst_swiglu_pi_up_olmo2-1b.json`, layers 1 and 14). It is
+  reported only as read-row geometry.
+
+Training dynamics (`bench/mpd_opfirst_olmo_dynamics_2951.py`, receipt
+`opfirst_dynamics_olmo2-1b.json`). Seven revisions: stage-1 steps 0, 300, 10k, 100k,
+1M and 1.907M (0 to 4T tokens), then `main`, which is after stage-2 mid-training.
+
+| revision | head PR ratio, median (layer 0) | cross-head capture | relu share, layers 13/14/15 | Π up, trained/twin, layer 1, k = n/16 |
+|---|---|---|---|---|
+| 0 | 1.00 (1.00) | 0.00% | 1.00/1.00/1.00 | 1.00 |
+| 300 | 1.00 (1.00) | 0.00% | 1.00/1.00/1.00 | 1.00 |
+| 10k | 0.98 (0.39) | 0.21% | 1.00/1.00/1.00 | 1.04 |
+| 100k | 0.85 (0.42) | 0.74% | 0.84/0.91/0.82 | 0.93 |
+| 1M | 0.97 (0.68) | 0.27% | 0.48/0.65/0.35 | 0.85 |
+| 1.907M | 0.97 (0.75) | 0.34% | 0.24/0.55/0.26 | 0.85 |
+| main | 0.94 (0.57) | 0.48% | 0.78/0.92/0.85 | 0.89 |
+
+- Head sharing emerges early and then washes out. Layer 0 shares first (0.39 at step 10k),
+  the whole model peaks at step 100k, and then the heads separate again (median 0.97).
+  Stage 2 brings back a little of it.
+- The late-layer relu share is trivially near 1 until step 10k (scale, above), then decays
+  through stage 1 to 0.24–0.55 at the end of pretraining. Stage 2 raises it again to
+  0.78–0.92. Because the MLP reads the raw residual, this curve is confounded with the
+  residual-norm trajectory; it is not a clean measure of structure.
+- The Π-graph split on layer-1 up reads (non-exact for SwiGLU) moves from the twin
+  (1.00 at init) to 0.85× the twin by step 1M and stays there. On layer 14 the proposer
+  does worse than on the twin at k = n/64 (1.12–1.14) and slightly better at n/4 (0.96),
+  so the late layer shows no split structure at any checkpoint.
+- The QK span loses numerical rank in stage 1 (minimum 1278 of 2048 at step 1M) and
+  partly recovers after stage 2 (1942).
 
 ## What this says about method
 

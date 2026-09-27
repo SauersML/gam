@@ -177,6 +177,8 @@ def weekday(args):
                 entry.update({"layer": layer, "sigma_over_max_first8": (sigma[:8] / sigma[0]).tolist(),
                               **{f"chart_rank_{t if t else 'eps'}": int(ch.shape[0]) for t, ch in charts.items()}})
                 per_layer.append(entry)
+                with open(args.out_prefix + "_weekday.partial.json", "w") as fh:  # progress survives a stop
+                    json.dump(res | {"partial": {name: per_layer}}, fh, separators=(",", ":"))
                 print(f"[weekday] {name} L{layer} exact={entry['exact_rank_eps_band']} "
                       f"eff1e-2={entry['0.01']} eff1e-3={entry['0.001']} eff1e-6={entry['1e-06']} "
                       f"PR={entry['participation_ratio']:.1f} charts={[e.shape[0] for e in charts.values()]}",

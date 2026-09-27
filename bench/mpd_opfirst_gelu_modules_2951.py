@@ -91,7 +91,8 @@ def dpsi(t):
 
 def q(x):
     x = torch.as_tensor(x, dtype=torch.float64).flatten()
-    qs = torch.quantile(x, torch.tensor([0.5, 0.9, 0.99], dtype=torch.float64)) if x.numel() else [float("nan")] * 3
+    # numpy's quantile (same linear interpolation): torch.quantile refuses inputs above 2^24 elements
+    qs = np.quantile(x.numpy(), [0.5, 0.9, 0.99]) if x.numel() else [float("nan")] * 3
     return {"median": float(qs[0]), "p90": float(qs[1]), "p99": float(qs[2]), "max": float(x.max()),
             "mean": float(x.mean())}
 
@@ -312,13 +313,17 @@ def pi_split(U, T, mask):
 
 
 def pi_fiedler(U, n_vec):
-    """Smallest eigenpairs of the Pi^2 graph Laplacian L = diag(rowsum Pi^2) - Pi^2, dense (n x n)."""
-    from scipy.linalg import eigh
+    """Smallest eigenpairs of the Pi^2 graph Laplacian L = diag(rowsum Pi^2) - Pi^2: Lanczos on the dense L
+    (n^2 per matvec; matches a dense eigh to 1e-16 on OLMo's n = 8192 in seconds instead of an O(n^3) solve)."""
+    from scipy.sparse.linalg import eigsh
     L = (U @ U.T).pow_(2)
     L.neg_()
     L.diagonal().sub_(L.sum(1))
-    ev, vec = eigh(L.numpy(), subset_by_index=[0, n_vec], overwrite_a=True, check_finite=False)
-    return ev, vec
+    Ln = L.numpy()
+    ev, vec = eigsh(Ln, k=n_vec + 1, which="SA", tol=1e-12, ncv=max(40, 4 * (n_vec + 1)), maxiter=100000,
+                    v0=np.ones(Ln.shape[0]))
+    order = np.argsort(ev)
+    return ev[order], vec[:, order]
 
 
 def pi_proposals(U, n_vec, fracs):
