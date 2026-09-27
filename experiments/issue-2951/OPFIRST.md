@@ -123,6 +123,45 @@ writes.
 Trained GELU MLP blocks contain no parallel modules in the replacement sense.
 Exact module splitting is a diagnostic, not a target.
 
+### 6. An executable program for modular addition, from the weights
+`bench/mpd_opfirst_modadd_program_2951.py`, receipts `opfirst_modadd_program*.json`.
+
+For the one-layer modular-addition model (p = 113), a program was built from
+the weights alone, with nothing fitted to the model's outputs.
+
+- An exact rewrite of every stage in the embedding and unembedding frequency
+  planes over all 56 frequencies matches the model to max KL 2e-16 on all
+  12,769 inputs.
+- The program P keeps the frequencies holding more than 1% of the weight
+  power (embedding {20, 56, 7, 5, 10}, unembedding {20, 56, 5, 7}):
+  - the embedding as plane coordinates;
+  - four heads, each routing by a score driven by one frequency (56, 20, 7, and
+    7 + 20), with attention not uniform over the operands;
+  - 512 executed ReLU neurons, each reading only the planes holding at least 1%
+    of its read energy (the frequency-5 neurons also read the 2×5 harmonic);
+  - the unembedding's plane readout.
+  It uses 12,884 reals and 985 integers, 16× fewer than the model's 226,688
+  parameters. Its Fourier coefficients give a closed form
+  `logit(c) = Σ_k A_k cos(ω_k(a + b − c))` with four reals.
+- Exhaustive over all inputs: P has 100% argmax agreement, mean KL 8.3e-7 and
+  max KL 5.2e-4; the four-real closed form has 100% and max KL 8e-5. The stage
+  interfaces are looser: attention weights within 0.061, neuron pre-activations
+  6.7% relative (97.5% ReLU sign agreement), readout coordinates 9–11%.
+- Held-out counterfactuals, exhaustive (P was not built from any of them):
+  - rotating all five embedding planes (the model then answers a + b + s):
+    mean KL 8.5e-7, 100% argmax;
+  - rotating the four readout frequencies: mean KL 1.9e-4, 100%;
+  - scaling one unembedding plane: 99–100%;
+  - rotating or swapping a single plane: the edited model moves by mean KL
+    7–22 from the unedited one, and P tracks it to mean KL 0.10–0.14 with
+    86–90% argmax agreement.
+
+The single-plane edits move the model out of saturation, where the 7–11%
+interface error that saturation hides on clean inputs becomes visible. This is
+the explanation working as intended and showing its resolution: correct laws,
+exhaustively checked where exhaustive checking is possible, with a stated
+counterfactual error where it is coarse.
+
 ## What this says about method
 
 - Deletion-based sparsity and exact rank are the wrong primary objects: exact
