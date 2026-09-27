@@ -1,4 +1,6 @@
 use crate::cgroup_memory::detect_cgroup_memory;
+use crate::host_memory_pool::{HostLease, HostMemoryPool, warn_host_pool_unusable};
+pub use crate::host_memory_pool::{HostPoolHolder, HostPoolSnapshot};
 pub use crate::cgroup_memory::{
     CgroupMemoryAvailability, CgroupMemoryObservation, CgroupMemoryProbeFailure,
     CgroupMemoryProbeFailureKind,
@@ -201,6 +203,25 @@ impl MemoryAvailability {
 
     pub const fn available_bytes(&self) -> u64 {
         self.available_bytes
+    }
+
+    /// Whether this process's capacity is the host's own total, i.e. no cgroup
+    /// hard limit clamps it. Then nothing outside gam bounds the *sum* of gam
+    /// processes on the host, and the governor's budget is shared host-wide
+    /// (see [`crate::host_memory_pool`]). Decided from capacity, not from
+    /// `limiting_source`: which ceiling binds *available* memory moves with
+    /// load, and the pool a process joins must not.
+    pub fn capacity_is_host_bounded(&self) -> bool {
+        match &self.cgroup {
+            CgroupMemoryObservation::NotPresent | CgroupMemoryObservation::V2Unbounded { .. } => {
+                true
+            }
+            CgroupMemoryObservation::V2Limited(observation)
+            | CgroupMemoryObservation::V1Limited(observation) => {
+                observation.limit_bytes() >= self.host_total_bytes.max(self.host_available_bytes)
+            }
+            CgroupMemoryObservation::ProbeFailed(_) => false,
+        }
     }
 }
 
@@ -420,6 +441,11 @@ struct GovernorLedger {
     /// Source of the holder keys. Monotone, so an id is never reused and a drop cannot
     /// remove a later reservation's entry.
     next_holder: std::sync::atomic::AtomicU64,
+    /// The host-wide pool lease covering this ledger's reservations, present
+    /// exactly when capacity is the host's own total (no cgroup bounds the sum
+    /// of gam processes). It never changes a verdict; it only decides when an
+    /// admitted reservation may proceed ([`crate::host_memory_pool`]).
+    host: Option<HostLease>,
 }
 
 impl GovernorLedger {
@@ -461,7 +487,41 @@ impl GovernorLedger {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&id);
     }
+
+    fn new(
+        budget_bytes: usize,
+        materialization_cap_bytes: usize,
+        availability: MemoryAvailability,
+        host: Option<HostLease>,
+    ) -> Self {
+        Self {
+            budget_bytes,
+            materialization_cap_bytes,
+            availability,
+            reserved_bytes: std::sync::atomic::AtomicUsize::new(0),
+            holders: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            next_holder: std::sync::atomic::AtomicU64::new(0),
+            host,
+        }
+    }
 }
+
+/// The pool a process with `availability` joins: `open(budget)` when its
+/// capacity is the host's own total, nothing under a binding cgroup ceiling
+/// (which already bounds the sum of the job's processes) or a failed probe.
+fn host_pool_for(
+    availability: &MemoryAvailability,
+    open: impl FnOnce(u64) -> std::io::Result<HostMemoryPool>,
+) -> Option<HostMemoryPool> {
+    if !availability.capacity_is_host_bounded() {
+        return None;
+    }
+    let budget = u64::try_from(governor_budget_from_availability(availability)).unwrap_or(u64::MAX);
+    open(budget)
+        .map_err(|error| warn_host_pool_unusable(&error))
+        .ok()
+}
+
 
 /// Process-wide byte-accounting governor for large allocations.
 ///
@@ -492,42 +552,62 @@ impl MemoryGovernor {
     /// This `OnceLock` is where the process's single availability observation
     /// is taken; [`process_memory_availability`] hands the same observation to
     /// every other planner rather than probing again.
+    ///
+    /// This is also the one place that decides whether the ledger is covered by
+    /// the host-wide pool: when capacity is the host's own total
+    /// ([`MemoryAvailability::capacity_is_host_bounded`]), every gam process of
+    /// the user shares one budget ([`crate::host_memory_pool`]); under a binding
+    /// cgroup ceiling the ledger is process-local, exactly as before.
     pub fn global() -> &'static MemoryGovernor {
         static GLOBAL: OnceLock<MemoryGovernor> = OnceLock::new();
         GLOBAL.get_or_init(|| {
             let availability = resample_memory_availability();
-            MemoryGovernor::with_detected_availability(availability)
+            let pool = host_pool_for(&availability, HostMemoryPool::open_default);
+            MemoryGovernor::for_process(availability, pool)
         })
+    }
+
+    /// The governor a process with `availability` runs, covered by `pool` when
+    /// one is given. [`Self::global`] is this with the default pool.
+    pub(crate) fn for_process(
+        availability: MemoryAvailability,
+        pool: Option<HostMemoryPool>,
+    ) -> Self {
+        let budget_bytes = governor_budget_from_availability(&availability);
+        let materialization_cap_bytes = governor_materialization_cap_from_availability(&availability);
+        Self {
+            ledger: Arc::new(GovernorLedger::new(
+                budget_bytes,
+                materialization_cap_bytes,
+                availability,
+                pool.map(HostLease::new),
+            )),
+        }
+    }
+
+    /// Who holds the host-wide pool this governor draws on, for diagnostics;
+    /// `None` when the governor is process-local (a binding cgroup ceiling, or
+    /// a test governor) or the pool cannot be read.
+    pub fn host_pool_snapshot(&self) -> Option<HostPoolSnapshot> {
+        let host = self.ledger.host.as_ref()?;
+        host.snapshot()
+            .map_err(|error| log::warn!("host-wide gam memory pool unreadable: {error}"))
+            .ok()
     }
 
     /// A governor whose ledger admits `budget_bytes`, for exercising admission
     /// against a budget the host's memory does not set (the process-wide
     /// governor is [`Self::global`]).
+    ///
+    /// Always process-local: it never joins the host-wide pool.
     pub fn with_budget_bytes(budget_bytes: usize) -> Self {
         Self {
-            ledger: Arc::new(GovernorLedger {
+            ledger: Arc::new(GovernorLedger::new(
                 budget_bytes,
-                materialization_cap_bytes: budget_bytes,
-                availability: resample_memory_availability(),
-                reserved_bytes: std::sync::atomic::AtomicUsize::new(0),
-                holders: std::sync::Mutex::new(std::collections::BTreeMap::new()),
-                next_holder: std::sync::atomic::AtomicU64::new(0),
-            }),
-        }
-    }
-
-    fn with_detected_availability(availability: MemoryAvailability) -> Self {
-        let budget_bytes = governor_budget_from_availability(&availability);
-        let materialization_cap_bytes = governor_materialization_cap_from_availability(&availability);
-        Self {
-            ledger: Arc::new(GovernorLedger {
                 budget_bytes,
-                materialization_cap_bytes,
-                availability,
-                reserved_bytes: std::sync::atomic::AtomicUsize::new(0),
-                holders: std::sync::Mutex::new(std::collections::BTreeMap::new()),
-                next_holder: std::sync::atomic::AtomicU64::new(0),
-            }),
+                resample_memory_availability(),
+                None,
+            )),
         }
     }
 
@@ -604,10 +684,18 @@ impl MemoryGovernor {
             match self.ledger.reserved_bytes.compare_exchange_weak(
                 current,
                 next,
-                Ordering::AcqRel,
+                // SeqCst, not AcqRel: `HostLease::release_excess` relies on this
+                // increment and the lease load in `cover` being ordered against
+                // its lease store and re-read of the ledger (a Dekker pair).
+                Ordering::SeqCst,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
+                    // The verdict above is this process's alone (#2702). A
+                    // host-wide pool only decides when it may proceed.
+                    if let Some(host) = &self.ledger.host {
+                        host.cover(next, &self.ledger.reserved_bytes, context);
+                    }
                     return Ok(MemoryReservation {
                         holder: self.ledger.register(context, bytes),
                         ledger: Arc::clone(&self.ledger),
@@ -739,6 +827,9 @@ impl Drop for MemoryReservation {
         // Released in the same order a refusal reads them, so a holder named by a
         // concurrent refusal was live when that refusal was measured (#4565).
         self.ledger.deregister(self.holder);
+        if let Some(host) = &self.ledger.host {
+            host.release_excess(&self.ledger.reserved_bytes);
+        }
     }
 }
 
@@ -1465,11 +1556,14 @@ mod byte_lru_tests {
             .div_ceil(GOVERNOR_BUDGET_NUMERATOR);
         let available_bytes =
             u64::try_from(available_bytes).expect("test cache budget must fit in u64");
-        MemoryGovernor::with_detected_availability(MemoryAvailability::from_observation(
-            available_bytes,
-            available_bytes,
-            CgroupMemoryObservation::NotPresent,
-        ))
+        MemoryGovernor::for_process(
+            MemoryAvailability::from_observation(
+                available_bytes,
+                available_bytes,
+                CgroupMemoryObservation::NotPresent,
+            ),
+            None,
+        )
     }
 
     /// Fixed-charge value so byte-budget arithmetic in the tests is exact.
@@ -1686,7 +1780,7 @@ mod resource_policy_tests {
         assert_eq!(availability.capacity_bytes(), 4_000_000_000);
         assert_eq!(availability.limiting_source, MemoryAvailabilitySource::Host);
         assert!(format!("{availability}").contains("unbounded cgroup-v2"));
-        let governor = MemoryGovernor::with_detected_availability(availability);
+        let governor = MemoryGovernor::for_process(availability, None);
         assert_eq!(governor.remaining_bytes(), 3_000_000_000);
         assert_eq!(governor.single_materialization_cap_bytes(), 3_000_000_000);
         // Exercise the actual ledger. A literal unlimited controller delegates
@@ -1769,7 +1863,7 @@ mod governor_budget_is_capacity_determined_2702_tests {
             );
             assert_eq!(availability.available_bytes(), LIMIT - charged);
             assert_eq!(availability.capacity_bytes(), LIMIT);
-            let governor = MemoryGovernor::with_detected_availability(availability);
+            let governor = MemoryGovernor::for_process(availability, None);
             assert_eq!(governor.remaining_bytes(), budget);
             assert_eq!(governor.single_materialization_cap_bytes(), budget);
             assert!(governor.single_materialization_cap_bytes() > DESIGN_BYTES);
@@ -1793,7 +1887,7 @@ mod governor_budget_is_capacity_determined_2702_tests {
             1_024,
             0,
         );
-        let governor = MemoryGovernor::with_detected_availability(tiny);
+        let governor = MemoryGovernor::for_process(tiny, None);
         assert_eq!(governor.single_materialization_cap_bytes(), 768);
         assert!(matches!(
             governor.try_reserve(DESIGN_BYTES, "300 by 12 design"),
@@ -1806,7 +1900,7 @@ mod governor_budget_is_capacity_determined_2702_tests {
         // The ceiling must keep saying no, or the test above is satisfied by a
         // governor that admits everything.
         for charged in [0, JOB_LIMIT_BYTES / 2, JOB_LIMIT_BYTES - 4_096] {
-            let governor = MemoryGovernor::with_detected_availability(one_job_cgroup_at_load(charged));
+            let governor = MemoryGovernor::for_process(one_job_cgroup_at_load(charged), None);
             let refusal = governor
                 .try_reserve(16 * 1024 * 1024 * 1024, "twice the job's ceiling")
                 .expect_err("16 GiB cannot be admitted in an 8 GiB job");
@@ -1825,7 +1919,7 @@ mod governor_budget_is_capacity_determined_2702_tests {
         // request's verdict must be the same whether or not the process has
         // already built and dropped something large. Reservations are the only
         // process state the ledger has, and a released one must leave no trace.
-        let governor = MemoryGovernor::with_detected_availability(one_job_cgroup_at_load(0));
+        let governor = MemoryGovernor::for_process(one_job_cgroup_at_load(0), None);
         let request = || {
             governor
                 .try_reserve_dense_f64_copies(
@@ -2019,5 +2113,298 @@ mod dominant_holder_tests {
             "the refusal must say how much the holder holds: {message}"
         );
         drop(held);
+    }
+}
+
+/// The host-wide pool as the governor uses it: selection by capacity
+/// provenance, leasing, and — across real processes — serialization and
+/// reclamation of crashed holders.
+#[cfg(test)]
+mod host_pool_process_tests {
+    use super::*;
+    use std::path::Path;
+    use std::process::{Child, Command, Stdio};
+
+    /// The pool the child processes share: tiny, so no test touches real memory.
+    const POOL_BUDGET: usize = 3_000_000;
+    /// 60% of the pool: any two leases together exceed it.
+    const SIXTY_PERCENT: usize = POOL_BUDGET / 10 * 6;
+
+    /// An observation whose governor budget is exactly [`POOL_BUDGET`].
+    fn host_availability() -> MemoryAvailability {
+        let capacity = (POOL_BUDGET as u64) / 3 * 4;
+        MemoryAvailability::from_observation(capacity, capacity, CgroupMemoryObservation::NotPresent)
+    }
+
+    fn governor_on(directory: &Path) -> MemoryGovernor {
+        let availability = host_availability();
+        let pool = host_pool_for(&availability, |budget| {
+            assert_eq!(budget, POOL_BUDGET as u64);
+            HostMemoryPool::open_in(directory, "pool", budget)
+        });
+        assert!(pool.is_some(), "a host-bounded observation joins the pool");
+        MemoryGovernor::for_process(availability, pool)
+    }
+
+    fn pool_on(directory: &Path) -> HostMemoryPool {
+        HostMemoryPool::open_in(directory, "pool", POOL_BUDGET as u64).expect("open pool")
+    }
+
+    #[test]
+    fn a_binding_cgroup_ceiling_keeps_the_ledger_process_local() {
+        const HOST_TOTAL: u64 = 64 << 30;
+        let job = crate::test_support::simulated_cgroup_memory_environment(
+            HOST_TOTAL,
+            HOST_TOTAL,
+            8 << 30,
+            1 << 30,
+        );
+        assert!(!job.capacity_is_host_bounded());
+        let opened = std::cell::Cell::new(false);
+        assert!(
+            host_pool_for(&job, |_| {
+                opened.set(true);
+                Err(std::io::Error::other("must not be opened"))
+            })
+            .is_none()
+        );
+        assert!(!opened.get(), "a cgroup-bounded process never touches the pool");
+        // The governor is the one it always was: budget from the job, verdicts
+        // from its own ledger, no pool.
+        let governor = MemoryGovernor::for_process(job.clone(), None);
+        let reference = MemoryGovernor::with_budget_bytes((8usize << 30) / 4 * 3);
+        assert_eq!(governor.remaining_bytes(), reference.remaining_bytes());
+        assert_eq!(governor.remaining_bytes(), (8usize << 30) / 4 * 3);
+        assert!(governor.host_pool_snapshot().is_none());
+        // A limit at or above the host's total does not bind: the host does.
+        let loose = crate::test_support::simulated_cgroup_memory_environment(
+            HOST_TOTAL,
+            HOST_TOTAL,
+            HOST_TOTAL,
+            0,
+        );
+        assert!(loose.capacity_is_host_bounded());
+        assert!(host_availability().capacity_is_host_bounded());
+    }
+
+    #[test]
+    fn reservations_inside_the_lease_touch_nothing_and_the_lease_returns_at_zero() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let governor = governor_on(directory.path());
+        let pool = pool_on(directory.path());
+        let quantum = POOL_BUDGET / 1024;
+        let first = governor.try_reserve(10, "small entry").expect("fits");
+        assert_eq!(pool.snapshot().expect("snapshot").held_bytes, quantum as u64);
+        let second = governor.try_reserve(10, "another small entry").expect("fits");
+        assert_eq!(
+            pool.snapshot().expect("snapshot").held_bytes,
+            quantum as u64,
+            "a reservation inside the lease does not grow it"
+        );
+        let large = governor.try_reserve(SIXTY_PERCENT, "large").expect("fits");
+        let covering = (SIXTY_PERCENT + 20).div_ceil(quantum) * quantum;
+        assert_eq!(pool.snapshot().expect("snapshot").held_bytes, covering as u64);
+        drop(large);
+        assert_eq!(pool.snapshot().expect("snapshot").held_bytes, quantum as u64);
+        drop(first);
+        drop(second);
+        let snapshot = pool.snapshot().expect("snapshot");
+        assert_eq!(snapshot.held_bytes, 0);
+        assert!(snapshot.holders.is_empty(), "a process holding nothing leaves no record");
+        // The verdict is the process's own: the budget refuses what it always did.
+        assert!(matches!(
+            governor.try_reserve(POOL_BUDGET + 1, "beyond the budget"),
+            Err(MemoryReservationError::BudgetExceeded { .. })
+        ));
+    }
+
+    // ── Child processes ──────────────────────────────────────────────────────
+
+    /// A child runs in `pool/child-{id}/`, whose order file says what to do
+    /// once it holds its lease. The environment is not used to configure it.
+    const CHILD_ORDER_FILE: &str = "host-pool-child-order";
+
+    #[derive(Clone, Copy)]
+    enum ChildOrder {
+        /// Hold until the parent creates `pool/gate`.
+        UntilGate,
+        /// Hold until killed.
+        Forever,
+        /// Hold briefly, then release.
+        Briefly,
+    }
+
+    impl ChildOrder {
+        const fn word(self) -> &'static str {
+            match self {
+                Self::UntilGate => "gate",
+                Self::Forever => "forever",
+                Self::Briefly => "brief",
+            }
+        }
+    }
+
+    fn append_event(directory: &Path, line: &str) {
+        use std::io::Write;
+        let mut events = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(directory.join("events"))
+            .expect("events file");
+        events.write_all(format!("{line}\n").as_bytes()).expect("event");
+    }
+
+    /// Not a test of its own: the body the child processes run. Outside a
+    /// child's working directory (no order file) it is a no-op.
+    #[test]
+    fn host_pool_child_process() {
+        let working = std::env::current_dir().expect("working directory");
+        let Ok(order) = std::fs::read_to_string(working.join(CHILD_ORDER_FILE)) else {
+            return;
+        };
+        let directory = working.parent().expect("a child runs inside the pool directory");
+        let id = working
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("child-"))
+            .expect("child directory name")
+            .to_owned();
+        let governor = governor_on(directory);
+        // A request beyond the budget is refused at once, whatever the pool
+        // holds: refusals never wait and never depend on neighbours.
+        assert!(matches!(
+            governor.try_reserve(POOL_BUDGET + 1, "beyond the budget"),
+            Err(MemoryReservationError::BudgetExceeded { .. })
+        ));
+        let held = governor
+            .try_reserve(SIXTY_PERCENT, "sixty percent of the pool")
+            .expect("admissible alone, so granted (after waiting), never refused");
+        append_event(directory, &format!("start {id}"));
+        let snapshot = pool_on(directory).snapshot().expect("snapshot");
+        assert!(
+            snapshot.held_bytes <= POOL_BUDGET as u64,
+            "the pool is never oversubscribed: {snapshot}"
+        );
+        match order.trim() {
+            "forever" => loop {
+                std::thread::park();
+            },
+            "gate" => wait_until("the parent opens the gate", || directory.join("gate").exists()),
+            "brief" => std::thread::sleep(std::time::Duration::from_millis(20)),
+            other => panic!("unknown child order {other:?}"),
+        }
+        append_event(directory, &format!("end {id}"));
+        drop(held);
+    }
+
+    fn spawn_child(directory: &Path, id: usize, order: ChildOrder) -> Child {
+        let working = directory.join(format!("child-{id}"));
+        std::fs::create_dir_all(&working).expect("child directory");
+        std::fs::write(working.join(CHILD_ORDER_FILE), order.word()).expect("child order");
+        let test_name = concat!(module_path!(), "::host_pool_child_process");
+        let test_name = test_name.split_once("::").map_or(test_name, |(_, rest)| rest);
+        Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .current_dir(&working)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn child test process")
+    }
+
+    fn finish(child: Child, what: &str) {
+        let output = child.wait_with_output().expect("wait for child");
+        assert!(
+            output.status.success(),
+            "{what} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Test-only deadline: a broken pool must fail the test, not hang it.
+    fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !condition() {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting until {what}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn processes_each_reserving_sixty_percent_serialize_instead_of_oversubscribing() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let pool = pool_on(directory.path());
+        let gate = directory.path().join("gate");
+        let first = spawn_child(directory.path(), 0, ChildOrder::UntilGate);
+        wait_until("the first child holds its lease", || {
+            pool.snapshot().expect("snapshot").held_bytes >= SIXTY_PERCENT as u64
+        });
+        let waiters: Vec<Child> = (1..=2)
+            .map(|id| spawn_child(directory.path(), id, ChildOrder::Briefly))
+            .collect();
+        // Both later children are admissible alone; with the first holding 60%
+        // neither fits, so both must be WAITING in the pool (not refused, and
+        // not granted into an oversubscribed pool).
+        wait_until("both later children wait in the pool", || {
+            let snapshot = pool.snapshot().expect("snapshot");
+            assert!(snapshot.held_bytes <= POOL_BUDGET as u64, "oversubscribed: {snapshot}");
+            snapshot
+                .holders
+                .iter()
+                .filter(|holder| holder.pending_bytes >= SIXTY_PERCENT as u64)
+                .count()
+                == 2
+        });
+        std::fs::write(&gate, b"").expect("open the gate");
+        finish(first, "the first child");
+        for (index, waiter) in waiters.into_iter().enumerate() {
+            finish(waiter, &format!("waiting child {}", index + 1));
+        }
+        let events = std::fs::read_to_string(directory.path().join("events")).expect("events");
+        let lines: Vec<&str> = events.lines().collect();
+        assert_eq!(lines.len(), 6, "every child held and released once: {lines:?}");
+        assert_eq!(lines[0], "start 0");
+        assert_eq!(lines[1], "end 0");
+        for pair in lines.chunks(2) {
+            let started = pair[0].strip_prefix("start ").expect("a start opens each hold");
+            assert_eq!(
+                pair[1],
+                format!("end {started}"),
+                "holds never overlap: {lines:?}"
+            );
+        }
+        let snapshot = pool.snapshot().expect("snapshot");
+        assert_eq!(snapshot.held_bytes, 0, "every lease came back: {snapshot}");
+    }
+
+    #[test]
+    fn a_killed_holder_is_reclaimed_by_the_next_contender() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let pool = pool_on(directory.path());
+        let mut crashed = spawn_child(directory.path(), 0, ChildOrder::Forever);
+        wait_until("the doomed child holds its lease", || {
+            pool.snapshot().expect("snapshot").held_bytes >= SIXTY_PERCENT as u64
+        });
+        let crashed_pid = crashed.id();
+        crashed.kill().expect("kill the holder");
+        crashed.wait().expect("reap the holder");
+        // Nobody has contended yet: the dead record is still on the ledger.
+        assert!(
+            pool.snapshot()
+                .expect("snapshot")
+                .holders
+                .iter()
+                .any(|holder| holder.pid == crashed_pid)
+        );
+        let mut successor = spawn_child(directory.path(), 1, ChildOrder::Briefly);
+        wait_until("the successor reclaims the dead lease and finishes", || {
+            successor.try_wait().expect("poll successor").is_some()
+        });
+        finish(successor, "the successor");
+        let snapshot = pool.snapshot().expect("snapshot");
+        assert!(
+            snapshot.holders.iter().all(|holder| holder.pid != crashed_pid),
+            "the dead holder was reclaimed: {snapshot}"
+        );
     }
 }

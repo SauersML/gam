@@ -1,4 +1,5 @@
 mod cgroup_memory;
+pub mod host_memory_pool;
 
 pub mod loop_progress;
 pub mod parallel;

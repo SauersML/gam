@@ -3964,6 +3964,7 @@ dependencies = [
 name = "gam-runtime"
 version = "0.3.157"
 dependencies = [
+ "libc",
  "log",
  "ndarray 0.17.2",
  "rayon",
