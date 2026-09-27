@@ -3,12 +3,12 @@
   "publish_job_status": "success",
   "publish_job_status_note": "status of the job that PUBLISHED these results, not the conclusion of run_id -- this job is part of that run, so the run has not concluded here",
   "publish_job_failed_steps": "",
-  "run_id": "36232244420",
-  "run_number": "2497",
+  "run_id": "36310901488",
+  "run_number": "2498",
   "run_attempt": "1",
   "event": "schedule",
   "ref": "refs/heads/main",
-  "sha": "93bace64d97b9d1f5f5c87c2c7b484c24195c469",
-  "completed_utc": "2026-09-26T15:17:43Z",
-  "run_url": "https://github.com/SauersML/gam/actions/runs/36232244420"
+  "sha": "bac6ab1bd7d1bc55f5aa8621b17bf2385a545709",
+  "completed_utc": "2026-09-27T15:58:55Z",
+  "run_url": "https://github.com/SauersML/gam/actions/runs/36310901488"
 }
