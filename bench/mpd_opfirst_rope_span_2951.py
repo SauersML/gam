@@ -1,23 +1,29 @@
 """#2951 operator-first: how many independent QK operators does a RoPE attention layer hold?
 
 Analysis under SPEC 8's exception (benchmark evaluation, not an MPD input). numpy + safetensors only,
-CPU float64 on the exact bf16 weights (bf16 -> f64 is exact).
+CPU float64 on the exact bf16 / f32 weights (-> f64 is exact), one layer at a time.
 
 For query head h reading key/value head g(h) = h // (H / KV), with rotary planes j = coords (j, j + hd/2)
-(Qwen3's half-split pairing) and omega_j = theta^(-2j/hd), the pre-softmax score is
+(HF rotate_half pairing) and omega_j = theta^(-2j/hd), the pre-softmax score is
 
     s = sigma * q_h(x)^T R(Delta) k_g(y),   R(Delta) = sum_j cos(omega_j Delta) P_j + sin(omega_j Delta) J_j,
 
-Delta = key position - query position, J_j the quarter turn (a, b) -> (-b, a) on plane j. With the per-head
-q_norm / k_norm gains and the input_layernorm gain folded in as diagonal factors, q_h = Q_h x_hat / r_q and
-k_g = K_g y_hat / r_k, where x_hat, y_hat are the RMS-normalised residual rows and r_q, r_k the per-head RMS
-normaliser scalars. Those two scalars are EXCLUDED: everything below is the bilinear operator on the
-normalised vectors, M_h(Delta) = sum_j cos(omega_j Delta) A_hj + sin(omega_j Delta) B_hj with
+Delta = key position - query position, J_j the quarter turn (a, b) -> (-b, a) on plane j. The architecture is
+read from config (bench/mpd_opfirst_decoder_2951.py). The q/k-norm gains, and in a pre-norm model the
+input RMSNorm gain, are folded in as diagonal factors: q_h = Q_h x / r_q[h], k_g = K_g y / r_k[g], with x, y
+the attention-block inputs (the RMS-normalised residual rows in a pre-norm model such as Qwen3; the raw
+residual in OLMo 2, which has no pre-attention norm). The normalisers r are EXCLUDED: per head in Qwen3
+(q_norm over each head's hd coordinates), and a single scalar per token shared by every head in OLMo 2
+(q_norm / k_norm over the full H * hd projection), so for OLMo 2 the ratio of two heads' scores for one token
+pair is exact. Everything below is the bilinear operator M_h(Delta) = sum_j cos(omega_j Delta) A_hj +
+sin(omega_j Delta) B_hj with
 
     A_hj = Q_hj^T K_gj,   B_hj = Q_hj^T J K_gj     (Q_hj, K_gj the 2 x d rows of plane j; rank <= 2),
 
 kept factored as U V^T with two columns. Frobenius inner products in factored form,
 <U_a V_a^T, U_b V_b^T> = tr[(U_a^T U_b)(V_b^T V_a)] = sum_{pq} (U^T U)_{ab,pq} (V^T V)_{ab,pq}.
+The self-check scores random rows through the literal HF path (raw projections, q/k RMSNorm at its declared
+scope with eps, gains, rotate_half) and compares with the expansion divided by r_q r_k.
 
 Reports, per layer: the span dimension of {A_hj, B_hj} (numerical rank of the Gram at a stated threshold,
 plus a Weyl certificate when the smallest eigenvalue clears it), the eigenvalue counts reaching 90 / 99 /
@@ -28,64 +34,17 @@ subspace", per-plane sharing across heads, and cross-head overlap split by share
 from __future__ import annotations
 
 import argparse
-import glob
-import json
 import os
-import struct
+import sys
 import time
 
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mpd_opfirst_decoder_2951 import Decoder, compact_json  # noqa: E402
+
 EPS = np.finfo(np.float64).eps
 LEVELS = (0.9, 0.99, 0.999)
-
-
-class Weights:
-    """Minimal safetensors reader (bf16 / f32) returning float64 arrays, all shards of a snapshot."""
-
-    def __init__(self, snapshot):
-        self.index = {}
-        for path in sorted(glob.glob(os.path.join(snapshot, "*.safetensors"))):
-            with open(path, "rb") as f:
-                n = struct.unpack("<Q", f.read(8))[0]
-                header = json.loads(f.read(n))
-            for name, meta in header.items():
-                if name != "__metadata__":
-                    self.index[name] = (path, 8 + n, meta)
-        self.config = json.load(open(os.path.join(snapshot, "config.json")))
-
-    def __call__(self, name):
-        path, base, meta = self.index[name]
-        lo, hi = meta["data_offsets"]
-        with open(path, "rb") as f:
-            f.seek(base + lo)
-            raw = f.read(hi - lo)
-        if meta["dtype"] == "BF16":
-            a = (np.frombuffer(raw, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
-        elif meta["dtype"] == "F32":
-            a = np.frombuffer(raw, dtype=np.float32)
-        else:
-            raise SystemExit(f"{name}: dtype {meta['dtype']} not handled")
-        return a.astype(np.float64).reshape(meta["shape"])
-
-
-
-def compact_json(obj):
-    """One top-level key per line, compact values: keeps receipts under the
-    repository's tracked-file line limit (build.rs MAX_TRACKED_FILE_LINES)."""
-    if isinstance(obj, dict):
-        body = ",\n".join(
-            json.dumps(k) + ": " + json.dumps(v, separators=(",", ":")) for k, v in obj.items()
-        )
-        return "{\n" + body + "\n}\n"
-    return json.dumps(obj, separators=(",", ":")) + "\n"
-
-def snapshot_dir(model):
-    root = os.path.expanduser(f"~/.cache/huggingface/hub/models--{model.replace('/', '--')}/snapshots")
-    for snap in sorted(glob.glob(os.path.join(root, "*"))):
-        if glob.glob(os.path.join(snap, "*.safetensors")):
-            return snap
-    raise SystemExit(f"no safetensors snapshot for {model} under {root}")
 
 
 def spectrum_counts(eigs):
@@ -145,18 +104,6 @@ def top_cosine(gram, a, b):
     return float(np.linalg.svd(ia.T @ gram[np.ix_(a, b)] @ ib, compute_uv=False)[0])
 
 
-def layer_factors(W, cfg, layer, fold_input_norm):
-    H, KV = cfg["num_attention_heads"], cfg["num_key_value_heads"]
-    hd = cfg.get("head_dim", cfg["hidden_size"] // H)
-    p = f"model.layers.{layer}."
-    Q = W(p + "self_attn.q_proj.weight").reshape(H, hd, -1) * W(p + "self_attn.q_norm.weight")[None, :, None]
-    K = W(p + "self_attn.k_proj.weight").reshape(KV, hd, -1) * W(p + "self_attn.k_norm.weight")[None, :, None]
-    if fold_input_norm:
-        gamma = W(p + "input_layernorm.weight")
-        Q, K = Q * gamma, K * gamma
-    return Q, K
-
-
 def atoms(Q, K):
     """U, V stacks (d x 2N): atom i = (h, j, t) with t = 0 -> A_hj, t = 1 -> B_hj; columns 2i, 2i+1."""
     H, hd, d = Q.shape
@@ -184,14 +131,26 @@ def gram_from_factors(U, V):
     return ((U.T @ U) * (V.T @ V)).reshape(N, 2, N, 2).sum(axis=(1, 3))
 
 
-def selfcheck(Q, K, cfg, rng):
-    """Direct HF-style rope score (rotate_half convention) vs sum_j cos A_hj + sin B_hj built from the
-    factored atoms, on random normalised rows at query position m, key position n."""
+def selfcheck(D, layer, Q, K, fold, rng):
+    """Literal HF scoring (raw q/k projections, q/k RMSNorm at the declared scope with eps, gains,
+    rotate_half rope) vs (sum_j cos A_hj + sin B_hj) / (r_q[h] r_k[g]) from the factored atoms, on random
+    attention-block inputs at query position m, key position n."""
     H, hd, d = Q.shape
     P, grp = hd // 2, H // K.shape[0]
-    omega = cfg["rope_theta"] ** (-np.arange(P) * 2.0 / hd)
+    omega = D.theta ** (-np.arange(P) * 2.0 / hd)
+    eps = D.config["rms_norm_eps"]
+    pre = f"model.layers.{layer}.self_attn."
+    gamma = D.attn_input_gain(layer) if fold else None
     U, V = atoms(Q, K)
     x, y = rng.standard_normal(d), rng.standard_normal(d)
+    xin, yin = (x, y) if gamma is None else (gamma * x, gamma * y)
+    qr = (D(pre + "q_proj.weight") @ xin).reshape(H, hd)
+    kr = (D(pre + "k_proj.weight") @ yin).reshape(-1, hd)
+    rq, rk = D.qk_norm_rms(qr, H, eps), D.qk_norm_rms(kr, kr.shape[0], eps)
+    if D.qk_norm is not None:
+        qr = qr * D(pre + "q_norm.weight").reshape(-1, hd)
+        kr = kr * D(pre + "k_norm.weight").reshape(-1, hd)
+    q, k = qr / rq[:, None], kr / rk[:, None]
     xu = (x @ U).reshape(H, P, 2, 2)
     yv = (y @ V).reshape(H, P, 2, 2)
     bil = (xu * yv).sum(-1)  # x^T A_hj y, x^T B_hj y
@@ -203,13 +162,14 @@ def selfcheck(Q, K, cfg, rng):
     m, n = 17, 1234
     err = 0.0
     for h in range(H):
-        direct = rope(Q[h] @ x, m) @ rope(K[h // grp] @ y, n)
+        g = h // grp
+        direct = rope(q[h], m) @ rope(k[g], n)
         expand = (np.cos(omega * (n - m)) * bil[h, :, 0] + np.sin(omega * (n - m)) * bil[h, :, 1]).sum()
-        err = max(err, abs(direct - expand) / np.abs(Q[h] @ x).sum() / np.abs(K[h // grp] @ y).max())
+        err = max(err, abs(direct - expand / (rq[h] * rk[g])) / np.abs(q[h]).sum() / np.abs(k[g]).max())
     return err
 
 
-def analyse_layer(Q, K, layer, with_pairs):
+def analyse_layer(Q, K, layer, with_pairs, theta):
     H, hd, d = Q.shape
     KV, P = K.shape[0], hd // 2
     grp = H // KV
@@ -243,12 +203,12 @@ def analyse_layer(Q, K, layer, with_pairs):
                 (same if h // grp == h2 // grp else diff).append(blk)
         planes.append({
             "j": j,
-            "wavelength": float(2 * np.pi / (CFG_THETA ** (-2.0 * j / hd))),
+            "wavelength": float(2 * np.pi / (theta ** (-2.0 * j / hd))),
             "energy": float(np.trace(G[np.ix_(b, b)])),
             "numerical_rank": r["numerical_rank"],
             "counts": spectrum_counts(e),
             "cos_pr": spectrum_counts(ec)["participation_ratio"],  # of the cosine Gram: max 2H
-            "max_abs_cos_same_k": float(np.mean(same)),
+            "max_abs_cos_same_k": float(np.mean(same)) if same else None,
             "max_abs_cos_diff_k": float(np.mean(diff)),
         })
     rec["planes"] = planes
@@ -263,16 +223,12 @@ def analyse_layer(Q, K, layer, with_pairs):
                 tgt = same if h // grp == h2 // grp else diff
                 tgt["captured"].append(cap)
                 tgt["top_cos"].append(tc)
-        rec["head_pairs"] = {
-            "same_k": {k: float(np.mean(v)) for k, v in same.items()} | {"n": len(same["captured"])},
-            "diff_k": {k: float(np.mean(v)) for k, v in diff.items()} | {"n": len(diff["captured"])},
-            "same_k_captured_max": float(np.max(same["captured"])),
-            "diff_k_captured_max": float(np.max(diff["captured"])),
-        }
+        rec["head_pairs"] = {  # "same_k" (GQA siblings) is absent when every head has its own K head
+            key: {k: float(np.mean(v)) for k, v in grp_.items()} | {"n": len(grp_["captured"]),
+                                                                     "captured_max": float(np.max(grp_["captured"]))}
+            for key, grp_ in (("same_k", same), ("diff_k", diff)) if grp_["captured"]}
     return rec
 
-
-CFG_THETA = 1e6
 
 
 def random_null(H, KV, hd, d, rng):
@@ -283,62 +239,64 @@ def random_null(H, KV, hd, d, rng):
     G = gram_from_factors(U, V)
     idx = np.arange(G.shape[0]).reshape(H, hd // 2, 2)
     grp = H // KV
-    return {
-        "actual": spectrum_counts(np.linalg.eigvalsh(G)),
-        "captured_same_k": captured(G, idx[0].ravel(), idx[1].ravel()),
-        "captured_diff_k": captured(G, idx[0].ravel(), idx[grp].ravel()),
-        "top_cos_same_k": top_cosine(G, idx[0].ravel(), idx[1].ravel()),
-        "top_cos_diff_k": top_cosine(G, idx[0].ravel(), idx[grp].ravel()),
-    }
+    out = {"actual": spectrum_counts(np.linalg.eigvalsh(G)),
+           "null_heads_independent": spectrum_counts(block_null(G, [idx[h].ravel() for h in range(H)])),
+           "captured_diff_k": captured(G, idx[0].ravel(), idx[grp].ravel()),
+           "top_cos_diff_k": top_cosine(G, idx[0].ravel(), idx[grp].ravel())}
+    if grp > 1:
+        out["captured_same_k"] = captured(G, idx[0].ravel(), idx[1].ravel())
+        out["top_cos_same_k"] = top_cosine(G, idx[0].ravel(), idx[1].ravel())
+    return out
 
 
 def main():
-    global CFG_THETA
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="Qwen/Qwen3-0.6B-Base")
+    ap.add_argument("--model", default="allenai/OLMo-2-0425-1B")
+    ap.add_argument("--revision", default="main")
     ap.add_argument("--out", required=True)
     ap.add_argument("--no-fold-input-norm", action="store_true")
     ap.add_argument("--pairs-every", type=int, default=1, help="head-pair analysis every k-th layer")
     args = ap.parse_args()
     t0 = time.time()
-    snap = snapshot_dir(args.model)
-    W = Weights(snap)
-    cfg = W.config
-    CFG_THETA = float(cfg["rope_theta"])
-    H, KV, L, d = cfg["num_attention_heads"], cfg["num_key_value_heads"], cfg["num_hidden_layers"], cfg["hidden_size"]
-    hd = cfg.get("head_dim", d // H)
+    D = Decoder(args.model, args.revision)
     rng = np.random.default_rng(2951)
     fold = not args.no_fold_input_norm
 
     layers, check = [], 0.0
-    for layer in range(L):
+    for layer in range(D.L):
         tl = time.time()
-        Q, K = layer_factors(W, cfg, layer, fold)
-        check = max(check, selfcheck(Q, K, cfg, rng))
-        rec = analyse_layer(Q, K, layer, layer % args.pairs_every == 0)
+        Q, K = D.qk(layer, fold)
+        check = max(check, selfcheck(D, layer, Q, K, fold, rng))
+        rec = analyse_layer(Q, K, layer, layer % args.pairs_every == 0, D.theta)
         rec["seconds"] = time.time() - tl
         layers.append(rec)
         a, nh = rec["actual"], rec["null_heads_independent"]
+        hp = rec.get("head_pairs", {})
         print(f"L{layer:2d} rank {rec['rank']['numerical_rank']}/{rec['rank']['max_dim']} "
               f"cert={rec['rank']['full_rank_certified']} k90/99/99.9 {a['k90']}/{a['k99']}/{a['k99.9']} "
-              f"(heads-indep null {nh['k90']}/{nh['k99']}/{nh['k99.9']}) "
-              f"pairs={rec.get('head_pairs', {}).get('same_k', {}).get('captured', float('nan')):.3f}/"
-              f"{rec.get('head_pairs', {}).get('diff_k', {}).get('captured', float('nan')):.3f} "
-              f"{rec['seconds']:.1f}s", flush=True)
+              f"(heads-indep null {nh['k90']}/{nh['k99']}/{nh['k99.9']}) PR {a['participation_ratio']:.1f}/"
+              f"{nh['participation_ratio']:.1f} pairs same/diff="
+              f"{hp.get('same_k', {}).get('captured', float('nan')):.3f}/"
+              f"{hp.get('diff_k', {}).get('captured', float('nan')):.3f} {rec['seconds']:.1f}s", flush=True)
 
+    excluded = {"head": "per-head RMS normalisers of q_norm/k_norm",
+                "full": "ONE full-projection RMS normaliser per token for q and for k, shared by all heads",
+                None: "none (no q/k norm)"}[D.qk_norm]
+    if D.where == "pre":
+        excluded += "; the residual RMS of the input RMSNorm"
     out = {
         "model": args.model,
-        "snapshot": snap,
-        "config": {"H": H, "KV": KV, "head_dim": hd, "d_model": d, "layers": L, "rope_theta": CFG_THETA},
-        "fold": {"q_norm_k_norm_gain": True, "input_layernorm_gain": fold,
-                 "excluded": "per-head RMS normaliser scalars of q_norm/k_norm (and the residual RMS)"},
+        "architecture": D.describe(),
+        "config": {"H": D.H, "KV": D.KV, "head_dim": D.hd, "d_model": D.d, "layers": D.L, "rope_theta": D.theta},
+        "fold": {"q_norm_k_norm_gain": D.qk_norm, "input_layernorm_gain": fold and D.where == "pre",
+                 "excluded": excluded},
         "rank_threshold": "tau = n * eps_f64 * lambda_max(Gram); full rank certified iff lambda_min > tau",
         "operator_expansion_selfcheck_max_rel_err": check,
-        "random_gaussian_null": random_null(H, KV, hd, d, rng),
+        "random_gaussian_null": random_null(D.H, D.KV, D.hd, D.d, rng),
         "layers": layers,
         "seconds_total": time.time() - t0,
     }
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as f:
         f.write(compact_json(out))
     print(f"total {out['seconds_total']:.1f}s  selfcheck {check:.2e}")

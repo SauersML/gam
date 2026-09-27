@@ -1,6 +1,11 @@
-"""#2951 probe: how much of a Qwen3 SwiGLU MLP is its bilinear (even-in-x) part vs the odd remainder?
+"""#2951 probe: how much of a SwiGLU MLP is its bilinear (even-in-x) part vs the odd remainder?
 
-Analysis under SPEC 8's exception (torch execution of a measurement), float64 on CPU throughout.
+Analysis under SPEC 8's exception (torch execution of a measurement). The model runs on CPU at --dtype (float32
+by default: a 1B model is never materialised in float64); every per-layer analysis casts that layer's weights and
+captured MLP inputs to float64. The architecture is read from config (bench/mpd_opfirst_decoder_2951.py): in a
+pre-norm model (Qwen3) the MLP reads the RMS-normalised residual; in a post-norm model (OLMo 2) it reads the raw
+residual and its output F is rescaled by N_ff(F) = gamma_ff * F / rms(F) before the residual add, so relusplit
+also reports how well N_ff(P) reproduces the actual residual write N_ff(F).
 
 Exact identity (checked numerically below, not assumed): silu(s) = s/2 + psi(s) with psi(s) = s (sigmoid(s) - 1/2) even,
 because sigmoid(-s) = 1 - sigmoid(s). With g = W_gate x, u = W_up x, the MLP F(x) = W_down (silu(g) * u) splits as
@@ -24,9 +29,14 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import sys
 import time
 
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mpd_opfirst_decoder_2951 import mlp_input_norm, mlp_output_norm, placement  # noqa: E402
 
 FALLBACK_TEXT = (
     "The water cycle describes how water evaporates from the surface of the earth, rises into the atmosphere, cools "
@@ -39,10 +49,19 @@ FALLBACK_TEXT = (
 
 
 def texts_tokens(tok, n_seq, seq_len, seed):
+    """The first n_seq x seq_len fineweb-edu tokens of the seeded shuffle, cached under ~/mpd-data/tokens per
+    tokenizer (the stream is deterministic, so every checkpoint sharing a tokenizer reads identical tokens)."""
+    source = "HuggingFaceFW/fineweb-edu sample-10BT (streamed, shuffle seed %d)" % seed
+    cache = os.path.expanduser("~/mpd-data/tokens/%s_%dx%d_s%d.pt" % (
+        tok.name_or_path.replace("/", "--"), n_seq, seq_len, seed))
+    if os.path.exists(cache):
+        return torch.load(cache), source
     try:
         from mpd_llm_chart_restriction_2951 import token_batches
         ids = next(token_batches(tok, seq_len, n_seq, seed, 0))
-        return ids, "HuggingFaceFW/fineweb-edu sample-10BT (streamed, shuffle seed %d)" % seed
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        torch.save(ids, cache)
+        return ids, source
     except Exception as exc:  # offline fallback, recorded in the receipt
         buf = tok(FALLBACK_TEXT * 40).input_ids
         return torch.tensor(buf[: n_seq * seq_len]).view(n_seq, seq_len), "fallback fixed text (%s)" % type(exc).__name__
@@ -94,11 +113,12 @@ def layer_metrics(X, Wg, Wu, Wd, ref=None):
     return out
 
 
-def relu_split(X, Wg, Wu, Wd, Wd_op, flat_ids, positions, tok, top):
+def relu_split(X, Wg, Wu, Wd, Wd_op, flat_ids, positions, tok, top, out_norm=None):
     """Exact split silu(g) = relu(g) + e(g), e(g) = -|g| sigmoid(-|g|) even, |e| <= 0.2785, exponentially small in |g|.
 
     F = P + C with P = W_down (relu(g) * u) (sign-gated bilinear) and C = W_down (e(g) * u) (bounded even correction).
     Certified per token: ||C|| <= ||W_down||_2 ||e(g) * u|| (exact given g, u).
+    out_norm = (gain, eps) of a post-MLP RMSNorm: the residual write is N(F), and relu replacement writes N(P).
     """
     g, u = X @ Wg.T, X @ Wu.T
     F = (torch.nn.functional.silu(g) * u) @ Wd.T
@@ -129,7 +149,17 @@ def relu_split(X, Wg, Wu, Wd, Wd_op, flat_ids, positions, tok, top):
                 "fve_P_centered": float(1 - (Fm - Pm).pow(2).sum() / ss)}
 
     pos0 = positions != 0
-    return {
+    post = {}
+    if out_norm is not None:
+        gain, eps = out_norm
+        norm = lambda v: gain * v / (v.pow(2).mean(-1, keepdim=True) + eps).sqrt()
+        NF, NP = norm(F), norm(P)
+        post = {"post_norm_write": {
+            "fve_NP_centered": float(1 - (NF - NP).pow(2).sum() / (NF - NF.mean(0)).pow(2).sum()),
+            "rel_err_agg": float((NF - NP).norm() / NF.norm()),
+            "rel_err_tok": q((NF - NP).norm(dim=-1) / NF.norm(dim=-1)),
+            "rms_ratio_P_over_F_tok": q(P.pow(2).mean(-1).sqrt() / F.pow(2).mean(-1).sqrt())}}
+    return post | {
         "exact_identity_rel": float((F - P - C).norm() / F.norm()),
         "e_abs_max": float(e.abs().max()),
         "C_over_F_agg": float(C.norm() / F.norm()),
@@ -161,7 +191,8 @@ def correction_bounds(X, Wg, Wu, Wd, gamma, k, chunk=64):
 
     per-token (exact given g, u): op = ||W_d||_2 ||e u||; tri = sum_n |e_n u_n| ||w_n||;
       split_k = ||W_d[:, A]||_2 ||(e u)_A|| + sum_{n not in A} |e_n u_n| ||w_n||, A = top-k units by |e_n u_n| ||w_n||.
-    a priori: param = 0.2785 ||W_d||_2 ||W_u||_2 max|gamma| sqrt(d) (parameter-only; ||RMSNorm output|| <= max|gamma| sqrt(d));
+    a priori: param = 0.2785 ||W_d||_2 ||W_u||_2 max|gamma| sqrt(d) (parameter-only; ||RMSNorm output|| <= max|gamma| sqrt(d);
+      None when the MLP reads the raw residual, gamma None: no parameter-only bound on its input exists);
       box = min(||W_d||_2 ||emax * umax||, sum_n emax_n umax_n ||w_n||) over the observed per-unit box
       g_n in [min, max], |u_n| <= max (empirical sup: valid for any input inside the observed ranges).
     """
@@ -189,7 +220,8 @@ def correction_bounds(X, Wg, Wu, Wd, gamma, k, chunk=64):
     umax = u.abs().max(0).values
     b_box = min(float(op * (emax * umax).norm()), float((emax * umax * wn).sum()))
     d = X.shape[1]
-    b_param = float(0.27846454276107 * op * torch.linalg.matrix_norm(Wu, ord=2) * gamma.abs().max() * math.sqrt(d))
+    b_param = None if gamma is None else float(
+        0.27846454276107 * op * torch.linalg.matrix_norm(Wu, ord=2) * gamma.abs().max() * math.sqrt(d))
     nF = ((torch.nn.functional.silu(g) * u) @ Wd.T).norm(dim=-1)
     best = torch.minimum(b_op, b_split)
     med = lambda v: float(v.median())
@@ -204,8 +236,8 @@ def correction_bounds(X, Wg, Wu, Wd, gamma, k, chunk=64):
                                  & (nC <= b_split * (1 + 1e-12))).all()),
         "apriori_box": b_box, "apriori_box_over_maxC": b_box / float(nC.max()),
         "apriori_box_over_medianF": b_box / med(nF),
-        "apriori_param": b_param, "apriori_param_over_maxC": b_param / float(nC.max()),
-        "apriori_param_over_medianF": b_param / med(nF),
+        "apriori_param": b_param, "apriori_param_over_maxC": None if b_param is None else b_param / float(nC.max()),
+        "apriori_param_over_medianF": None if b_param is None else b_param / med(nF),
     }
 
 
@@ -282,7 +314,10 @@ def tensor_rank(Wg, Wu, Wd, n_probe, gen):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True)
+    parser.add_argument("--model", default="allenai/OLMo-2-0425-1B")
+    parser.add_argument("--revision", default="main")
+    parser.add_argument("--dtype", choices=["float32", "float64"], default="float32",
+                        help="model execution dtype; per-layer analyses are float64 either way")
     parser.add_argument("--n-seq", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--scales", default="0.1,0.3,1")
@@ -292,8 +327,8 @@ def main():
     parser.add_argument("--massive-factor", type=float, default=100.0)
     parser.add_argument("--worst", type=int, default=3)
     parser.add_argument("--include-pos0", action="store_true", help="position 0 (attention sink) is excluded by default")
-    parser.add_argument("--suffix-l0", default="27,24,21,18,15,0")
-    parser.add_argument("--prefix-l0", default="27,24,21,18,15")
+    parser.add_argument("--suffix-l0", default="", help="empty: L-1, L-1-s, ..., L-1-4s, 0 with s = round(3L/28)")
+    parser.add_argument("--prefix-l0", default="", help="empty: the suffix starts without 0")
     parser.add_argument("--bound-k", type=int, default=64)
     parser.add_argument("--heavy", type=int, default=4)
     parser.add_argument("--out", required=True)
@@ -302,8 +337,10 @@ def main():
 
     t0 = time.time()
     torch.manual_seed(args.seed)
-    tok = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float64).eval()
+    tok = AutoTokenizer.from_pretrained(args.model, revision=args.revision)
+    model = AutoModelForCausalLM.from_pretrained(args.model, revision=args.revision,
+                                                 dtype=getattr(torch, args.dtype)).eval()
+    where = placement(model.config)
     ids, source = texts_tokens(tok, args.n_seq, args.seq_len, args.seed)
     captured = {}
 
@@ -321,7 +358,8 @@ def main():
             resid[i] = inputs[0].norm(dim=-1).clone()
         return hook
 
-    handles += [layers[i].post_attention_layernorm.register_forward_pre_hook(make_resid_hook(i))
+    # the residual entering the MLP block: input of the pre-MLP norm, or of the MLP itself in a post-norm model
+    handles += [(mlp_input_norm(layers[i], where) or layers[i].mlp).register_forward_pre_hook(make_resid_hook(i))
                 for i in range(len(layers))]
     with torch.inference_mode():
         clean_logits = model(input_ids=ids).logits
@@ -333,12 +371,17 @@ def main():
     flat_ids = ids.reshape(-1)[rows]
     scales = [float(s) for s in args.scales.split(",")]
     gen = torch.Generator().manual_seed(args.seed)
-    report = {"model": args.model, "mode": args.mode, "text_source": source, "tokens": int(ids.numel()), "dtype": "float64",
-              "act": model.config.hidden_act, "stats_exclude_position0": not args.include_pos0, "layers": {}}
+    report = {"model": args.model, "revision": args.revision, "mode": args.mode, "text_source": source,
+              "tokens": int(ids.numel()), "dtype": {"model": args.dtype, "analysis": "float64"},
+              "norm_placement": where, "act": model.config.hidden_act,
+              "stats_exclude_position0": not args.include_pos0, "layers": {}}
     n_layers = len(layers)
+    step = max(1, round(3 * n_layers / 28))
+    suffix = [int(v) for v in args.suffix_l0.split(",")] if args.suffix_l0 else [n_layers - 1 - k * step for k in range(5)] + [0]
+    prefix = [int(v) for v in args.prefix_l0.split(",")] if args.prefix_l0 else [v for v in suffix if v]
     if args.mode == "replace":
-        configs = [("suffix", l0, list(range(l0, n_layers)), None) for l0 in map(int, args.suffix_l0.split(","))]
-        configs += [("prefix", l0, list(range(0, l0)), None) for l0 in map(int, args.prefix_l0.split(","))]
+        configs = [("suffix", l0, list(range(l0, n_layers)), None) for l0 in suffix]
+        configs += [("prefix", l0, list(range(0, l0)), None) for l0 in prefix]
         report["replacement"] = replace_runs(model, ids, clean_logits, configs, positions)
     if args.mode == "single":
         # massive = pre-norm residual norm (input of post_attention_layernorm) > factor x that layer's median token
@@ -374,29 +417,33 @@ def main():
     with torch.inference_mode():
         for i, layer in enumerate(layers):
             mlp = layer.mlp
-            Wg, Wu, Wd = mlp.gate_proj.weight, mlp.up_proj.weight, mlp.down_proj.weight
+            Wg, Wu, Wd = mlp.gate_proj.weight.double(), mlp.up_proj.weight.double(), mlp.down_proj.weight.double()
             X, ref = captured[i]
-            X, ref = X[rows], ref[rows]
+            X, ref = X[rows].double(), ref[rows].double()
+            in_norm, out_norm = mlp_input_norm(layer, where), mlp_output_norm(layer, where)
             if args.mode == "replace":
-                entry = correction_bounds(X, Wg, Wu, Wd, layer.post_attention_layernorm.weight, args.bound_k)
+                entry = correction_bounds(X, Wg, Wu, Wd, None if in_norm is None else in_norm.weight.double(),
+                                          args.bound_k)
                 report["layers"][i] = entry
                 b = entry["bound_over_C_tok_median"]
                 print(f"L{i:02d} |C|med={entry['C_norm_tok']['median']:.3f} |F|med={entry['F_norm_tok_median']:.3f} "
                       f"bound/|C| op={b['op']:.2f} tri={b['tri']:.2f} split={b[f'split{args.bound_k}']:.2f} "
                       f"best/|F|={entry['bound_over_F_tok_median']['best']:.3f} holds={entry['all_bounds_hold']} "
-                      f"box/maxC={entry['apriori_box_over_maxC']:.1f} param/maxC={entry['apriori_param_over_maxC']:.1f}",
+                      f"box/maxC={entry['apriori_box_over_maxC']:.1f} param/maxC={entry['apriori_param_over_maxC']}",
                       flush=True)
                 continue
             if args.mode == "relusplit":
                 Wd_op = float(torch.linalg.matrix_norm(Wd, ord=2))
-                entry = relu_split(X, Wg, Wu, Wd, Wd_op, flat_ids, positions[rows], tok, args.heavy)
+                entry = relu_split(X, Wg, Wu, Wd, Wd_op, flat_ids, positions[rows], tok, args.heavy,
+                                   None if out_norm is None else (out_norm.weight.double(), out_norm.variance_epsilon))
                 entry["W_down_op_norm"] = Wd_op
                 report["layers"][i] = entry
                 h = entry["heavy_tokens"][0]
                 print(f"L{i:02d} |C|/|F|={entry['C_over_F_agg']:.3f} tokmed={entry['C_over_F_tok']['median']:.3f} "
                       f"fveP={entry['fve_P_centered']:.4f} act={entry['active_frac_tok']['median']:.3f} "
                       f"k90={entry['units90_tok']['median']:.0f} bnd={entry['bound_over_F_tok']['median']:.3f} "
-                      f"id={entry['exact_identity_rel']:.1e} heavy=pos{h['position']}:{h['token']!r}:{h['share_of_sum_F2']:.2f}",
+                      f"id={entry['exact_identity_rel']:.1e} heavy=pos{h['position']}:{h['token']!r}:{h['share_of_sum_F2']:.2f} "
+                      f"postnorm fve={entry.get('post_norm_write', {}).get('fve_NP_centered', float('nan')):.4f}",
                       flush=True)
                 continue
             entry = {"input_rms_median": float(X.pow(2).mean(-1).sqrt().median())}

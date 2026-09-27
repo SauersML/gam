@@ -10,9 +10,12 @@ attention OV maps with the full unembedding as readout; that is trivial for Qwen
   constant direction). Transitions: the 4 head OV maps A_h = W_O[:, h] W_V[h]; MLP read rows W_in
   as extra readouts at the post-attention residual in a separate variant. The observable subspace is
   compared with the key-frequency Fourier planes of W_U and W_E (principal angles).
-* ``weekday``: Qwen3-0.6B-Base, C = the 7 " Monday".." Sunday" rows of the tied unembedding times the
-  final RMSNorm gain (and the 6-dimensional difference space), backward causal closure layer by layer
-  under all 16 heads' OV maps (input RMSNorm gain folded), optionally with the MLP reads.
+* ``weekday``: a decoder read through bench/mpd_opfirst_decoder_2951.py (default OLMo 2 1B; the
+  architecture comes from config), C = the 7 " Monday".." Sunday" rows of the unembedding times the final
+  RMSNorm gain (and the 6-dimensional difference space), backward causal closure layer by layer under all
+  heads' OV maps, kept factored (the input RMSNorm gain folded in a pre-norm model; the attention-output
+  RMSNorm gain in a post-norm model, whose excluded normaliser is one scalar per token and layer shared by
+  all heads), optionally with the MLP reads.
 
 The rank rule and the closure are state.rs's resolved row space and LinearStateQuotient::close, and the
 Fourier planes are cyclic_action::cyclic_planes, all called through the MPD surface (the parent bench's
@@ -22,7 +25,6 @@ Gramian factor F (F^T F = sum of pulled-back readout Gramians) weighs directions
 they are read, so its relative singular-value counts are the meaningful effective dimensions.
 """
 import argparse
-import glob
 import json
 import math
 import os
@@ -33,8 +35,9 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mpd_opfirst_decoder_2951 import Decoder  # noqa: E402
 from mpd_opfirst_observability_2951 import (  # noqa: E402
-    effective, linear_quotient, relative_rows, resolved_rows, singular_values)
+    apply, effective, linear_quotient, relative_rows, resolved_rows, singular_values)
 
 TAUS = (1e-2, 1e-3, 1e-6)
 
@@ -134,36 +137,21 @@ def modadd(args):
 
 
 def weekday(args):
-    from safetensors.torch import load_file
     from tokenizers import Tokenizer
 
-    snap = glob.glob(os.path.expanduser(
-        f"~/.cache/huggingface/hub/models--{args.model.replace('/', '--')}/snapshots/*/"))[0]
-    cfg = json.load(open(os.path.join(snap, "config.json")))
-    tok = Tokenizer.from_file(os.path.join(snap, "tokenizer.json"))
+    D = Decoder(args.model, args.revision)
+    tok = Tokenizer.from_file(os.path.join(D.snap, "tokenizer.json"))
     days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     ids = []
     for day in days:
         t = tok.encode(" " + day, add_special_tokens=False).ids
         assert len(t) == 1, day
         ids.append(t[0])
-    w = {k: v.double().numpy() for k, v in load_file(os.path.join(snap, "model.safetensors")).items()}
-    d, n_layers = cfg["hidden_size"], cfg["num_hidden_layers"]
-    n_heads, n_kv, hd = cfg["num_attention_heads"], cfg["num_key_value_heads"], cfg["head_dim"]
-    group = n_heads // n_kv
-    rows = w["model.embed_tokens.weight"][ids] * w["model.norm.weight"][None, :]
+    d, n_layers = D.d, D.L
+    rows = D.readout(ids)
     readouts = {"answers": rows, "differences": rows - rows.mean(0, keepdims=True)}
-    ov, mlp_reads = [], []
-    for layer in range(n_layers):
-        pre = f"model.layers.{layer}."
-        g_in = w[pre + "input_layernorm.weight"]
-        wv, wo = w[pre + "self_attn.v_proj.weight"], w[pre + "self_attn.o_proj.weight"]
-        ov.append([wo[:, h * hd:(h + 1) * hd] @ wv[(h // group) * hd:(h // group + 1) * hd] * g_in[None, :]
-                   for h in range(n_heads)])
-        mlp_reads.append(np.vstack([w[pre + "mlp.gate_proj.weight"], w[pre + "mlp.up_proj.weight"]])
-                         * w[pre + "post_attention_layernorm.weight"][None, :])
-    del w
-    res = {"model": args.model, "day_token_ids": ids, "d_model": d, "variants": {}}
+    ov = [D.ov(layer) for layer in range(n_layers)]
+    res = {"model": args.model, "architecture": D.describe(), "day_token_ids": ids, "d_model": d, "variants": {}}
     for rname, c in readouts.items():
         for mlp in (False, True):
             name = rname + ("+mlp_reads" if mlp else "")
@@ -173,16 +161,17 @@ def weekday(args):
                           **{f"chart_rank_{t if t else 'eps'}": int(ch.shape[0]) for t, ch in charts.items()}}]
             for layer in reversed(range(n_layers)):
                 if mlp:
-                    factor = np.vstack([factor, mlp_reads[layer]])
+                    reads = D.mlp_reads(layer)
+                    factor = np.vstack([factor, reads])
                     for t in charts:
-                        stack = np.vstack([charts[t], mlp_reads[layer] / np.linalg.norm(mlp_reads[layer], 2)])
+                        stack = np.vstack([charts[t], reads / np.linalg.norm(reads, 2)])
                         charts[t] = resolved_rows(stack) if t is None else relative_rows(stack, t)
-                factor = np.vstack([factor] + [factor @ a for a in ov[layer]])
+                factor = np.vstack([factor] + [apply(factor, a) for a in ov[layer]])
                 if factor.shape[0] > d:
                     factor = np.linalg.qr(factor, mode="r")
                 for t in charts:
                     if charts[t].shape[0] < d:
-                        stack = np.vstack([charts[t]] + [charts[t] @ a for a in ov[layer]])
+                        stack = np.vstack([charts[t]] + [apply(charts[t], a) for a in ov[layer]])
                         charts[t] = resolved_rows(stack) if t is None else relative_rows(stack, t)
                 entry, sigma = dims(factor)
                 entry.update({"layer": layer, "sigma_over_max_first8": (sigma[:8] / sigma[0]).tolist(),
@@ -200,7 +189,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", help="bench/mpd_modadd_2951.py train output (.pt)")
     parser.add_argument("--kmax", type=int, default=5)
-    parser.add_argument("--model", default="Qwen/Qwen3-0.6B-Base")
+    parser.add_argument("--model", default="allenai/OLMo-2-0425-1B")
+    parser.add_argument("--revision", default="main")
     parser.add_argument("--tasks", default="modadd,weekday")
     parser.add_argument("--out-prefix", default="experiments/issue-2951/receipts/opfirst_task_observability")
     args = parser.parse_args()
@@ -214,7 +204,7 @@ def main():
         res["labels"] = ("exact_rank_eps_band / chart_rank_eps / time_invariant eps_band: state.rs eps band "
                          "(numerical-exact); tau, 0.01/0.001/1e-06 relative counts, entropy_rank, "
                          "participation_ratio: numerical (Gramian-weighted)")
-        path = f"{args.out_prefix}_{name}.json"
+        path = f"{args.out_prefix}_{name}" + (f"_{args.model.split('/')[-1]}" if name == "weekday" else "") + ".json"
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as fh:  # one top-level key per line (tracked files must stay < 10k lines)
             fh.write("{\n" + ",\n".join(f"{json.dumps(k)}:{json.dumps(v, separators=(',', ':'))}"

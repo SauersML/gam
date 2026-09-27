@@ -1,7 +1,8 @@
 """#2951 gauge census: export Qwen3 weights for crates/gam-sae/examples/mpd_gauge_census_2951.rs.
 
-numpy only. Reads the HF-cache safetensors snapshot (bf16 -> float64 is exact) with the minimal reader
-of bench/mpd_opfirst_rope_span_2951.py, and writes one float64 .npy per tensor the gauge detectors read:
+numpy (+ huggingface_hub to locate the snapshot). Reads the safetensors snapshot (bf16 -> float64 is exact)
+with the lazy reader of bench/mpd_opfirst_decoder_2951.py, and writes one float64 .npy per tensor the gauge
+detectors read:
 
     <out>/manifest.json                      config fields, tensor shapes, parameter counts
     <out>/final_norm.npy                     model.norm.weight
@@ -15,17 +16,14 @@ Usage: python bench/mpd_gauge_census_2951.py --out /path/to/export [--model Qwen
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
+import sys
 
 import numpy as np
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-_spec = importlib.util.spec_from_file_location("rope_span", os.path.join(HERE, "mpd_opfirst_rope_span_2951.py"))
-_rope = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_rope)
-Weights, snapshot_dir = _rope.Weights, _rope.snapshot_dir
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mpd_opfirst_decoder_2951 import Decoder  # noqa: E402
 
 LAYER_TENSORS = {
     "q": "self_attn.q_proj.weight",
@@ -49,9 +47,8 @@ def main():
     ap.add_argument("--embed-stride", type=int, default=16)
     args = ap.parse_args()
 
-    snap = snapshot_dir(args.model)
-    w = Weights(snap)
-    cfg = w.config
+    w = Decoder(args.model)
+    snap, cfg = w.snap, w.config
     os.makedirs(args.out, exist_ok=True)
 
     # Every stored tensor's parameter count, so the census total is the checkpoint's.

@@ -12,7 +12,11 @@ energy-weighted count, and "empirical" means measured on 512 fineweb-edu tokens
 
 Models: Qwen3-0.6B-Base and Qwen3-1.7B-Base (SwiGLU, RMSNorm, GQA, rotary with
 q/k norm), EleutherAI Pythia (exact GELU), and a one-layer modular-addition
-transformer (p = 113).
+transformer (p = 113). The probes' default target is now allenai/OLMo-2-0425-1B
+(result 10), which is fully open and has its training checkpoints published as HF
+revisions. The Qwen3 receipts stay as historical results. Every weight-level probe reads its model
+through `bench/mpd_opfirst_decoder_2951.py`, which takes the architecture (norm placement,
+q/k-norm scope, tied embeddings, GQA) from config and reads one tensor at a time.
 
 ## Results
 
@@ -269,6 +273,45 @@ On OLMo-2-0425-1B, layers 2, 8 and 14 (2048 train and 2048 held-out tokens):
 
 The exact error split did its job: the failure is the operator family, not missing context or
 gate flexibility, so more spline freedom would not have helped.
+
+### 10. OLMo 2 1B: the same probes on a post-norm model
+Receipts `opfirst_*_olmo2-1b.json` (final checkpoint, `main`).
+
+Architecture, from config and `modeling_olmo2`: 16 layers, d = 2048, 16 heads
+without GQA, SwiGLU (d_ff = 8192), RoPE (θ = 5·10⁵, rotate_half pairing), untied
+lm_head. RMSNorm is applied to the attention and MLP outputs before the residual
+add, and there is no pre-norm, so both blocks read the raw residual. q_norm and
+k_norm normalise the full H·d_h projection with one RMS per token shared by all
+heads. The probes change as follows:
+- RoPE span: the full-projection gains are folded onto each head's rows. The excluded
+  normaliser is one scalar per token pair, common to every head, so ratios
+  between heads' scores are exact. The self-check through the literal HF path
+  agrees to 1.7e-15.
+- Observability: `A_h = diag(g_post_attn) W_O,h W_V,h`. The excluded 1/rms(attention
+  output) is one scalar per token and layer, so ranks and closures are exact and the
+  Gramian weights take that scalar as 1.
+- MLP split: the split is exact on the module output `F`. The residual write is
+  `N_ff(F)`, so relusplit also reports `N_ff(P)` against `N_ff(F)`.
+
+Results, OLMo against Qwen3:
+- QK operators are even less shared than in Qwen3. The span is 1942–2048 of 2048
+  (certified full in 10 of 16 layers). The participation ratio over the heads-independent
+  null has median 0.94 (Qwen3 0.62/0.70, which was GQA siblings), and a head captures a
+  median 0.5% of another head's operator energy (Qwen3 0.9%/0.5%). The slow planes
+  (wavelength above the 4096 context) carry 71% of the energy (Qwen3 73% above 32k).
+- The sign-gated law is weaker and later. `P` explains 0.78/0.92/0.85 of the output
+  variance in layers 13–15 (post-norm write 0.83/0.93/0.95) and at most 0.5 before
+  that; Qwen3 reaches 0.93–0.997 from layer 21. About 20–55% of units are active
+  per token. The executed swap does not survive:
+  - the last layer alone costs mean KL 0.37 (Qwen3 0.007), layer 14 costs 0.023, and
+    each early layer costs 0.11–0.30;
+  - layers 13–15 together cost 0.28, and anything from layer 11 up costs at least 0.72.
+- OLMo has no massive-activation tokens: the residual max/median is at most 2.2 in
+  the audited layers. In Qwen3 such tokens dominated the heavy rows. The per-token
+  bounds on the dropped correction stay 2.6–7.8× loose.
+- The Π-graph on SwiGLU up reads is not an exact module statement, because the
+  exact-GELU theorem does not cover a two-read, bilinear-gated unit (`--mode pi --read up`,
+  labelled in the receipt). It is reported only as read-row geometry.
 
 ## What this says about method
 

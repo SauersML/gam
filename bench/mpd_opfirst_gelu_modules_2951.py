@@ -32,6 +32,14 @@ P, Q construction: positive eigenspace of M_a = sum_{j in G} |u_j|^2 a_j a_j^T -
 (the rank-k minimiser of the squared proxy sum |u|^2 |(I-P)a|^2 over G + |u|^2 |Pa|^2 over the rest), Q likewise
 from M_u with weights |a_j|^2, with k = round(d |G| / n) for every split and null alike (P = Q = 0 or I would be
 trivially exact, so the rank must be pinned).
+
+--mode pi also runs on a SwiGLU decoder (read through bench/mpd_opfirst_decoder_2951.py, weights only, one
+layer at a time) with --read up|gate as the read matrix W. That is NOT covered by the theorem above: a SwiGLU
+unit reads two directions (gate and up) and is bilinear-gated, so there is no single-read normal form and Pi's
+components are not the exact module splits. The receipt labels it; what remains exact is only the geometry of
+the chosen read rows: E* is the whitened distance to the nearest read matrix whose rows split into two
+mutually orthogonal subspaces, compared with random subsets and with the same proposer on a twin whose unit
+directions are redrawn.
 """
 from __future__ import annotations
 
@@ -281,6 +289,16 @@ def write_receipt(report, out, t0, t_fwd):
                                              for k, v in report.items()) + "\n}\n")
 
 
+def pi_estar(U, mask):
+    """E* and chi of pi_split without the projector, from the smaller of the |S| x |S| and d x d Grams
+    (the same nonzero eigenvalues; zero eigenvalues contribute nothing)."""
+    Us = U[mask]
+    G = Us @ Us.T if Us.shape[0] < Us.shape[1] else Us.T @ Us
+    lam = torch.linalg.eigvalsh(0.5 * (G + G.T)).clamp(0, 1)
+    return {"E_star": float(torch.minimum(lam, 1 - lam).sum()), "chi": float((lam * (1 - lam)).sum()),
+            "rank_P": int((lam > 0.5).sum())}
+
+
 def pi_split(U, T, mask):
     """Optimal exactly-separated reads for unit subset S (whitened): E* = sum min(lam, 1-lam), lam = eig(U^T D_S U)."""
     G = U[mask].T @ U[mask]
@@ -294,23 +312,16 @@ def pi_split(U, T, mask):
 
 
 def pi_fiedler(U, n_vec):
-    """Smallest nontrivial eigenvectors of the Pi^2 Laplacian, matrix-free: (Lq)_i = |u_i|^2 q_i - u_i^T (U^T diag(q) U) u_i."""
-    from scipy.sparse.linalg import LinearOperator, eigsh
-    Un = U.numpy()
-    r2 = (Un * Un).sum(1)
-
-    def mv(q):
-        q = np.asarray(q).reshape(-1)
-        return r2 * q - (((Un * q[:, None]).T @ Un @ Un.T).T * Un).sum(1)
-
-    n = Un.shape[0]
-    op = LinearOperator((n, n), matvec=mv, dtype=np.float64)
-    ev, vec = eigsh(op, k=n_vec + 1, which="SA", tol=1e-10, v0=np.ones(n) + 1e-3 * np.arange(n) / n)
-    order = np.argsort(ev)
-    return ev[order], vec[:, order]
+    """Smallest eigenpairs of the Pi^2 graph Laplacian L = diag(rowsum Pi^2) - Pi^2, dense (n x n)."""
+    from scipy.linalg import eigh
+    L = (U @ U.T).pow_(2)
+    L.neg_()
+    L.diagonal().sub_(L.sum(1))
+    ev, vec = eigh(L.numpy(), subset_by_index=[0, n_vec], overwrite_a=True, check_finite=False)
+    return ev, vec
 
 
-def pi_proposals(U, T, n_vec, fracs):
+def pi_proposals(U, n_vec, fracs):
     ev, vec = pi_fiedler(U, n_vec)
     n = U.shape[0]
     d = U.shape[1]
@@ -322,16 +333,15 @@ def pi_proposals(U, T, n_vec, fracs):
             for side, idx in (("low", order[:k]), ("high", order[-k:])):
                 mask = torch.zeros(n, dtype=torch.bool)
                 mask[idx] = True
-                r, _ = pi_split(U, T, mask)
+                r = pi_estar(U, mask)
                 out.append({"vec": v, "k": k, "side": side, "E_over_U2": r["E_star"] / d, "chi_over_U2": r["chi"] / d,
                             "rank_P": r["rank_P"], "mask": mask})
     return ev, out
 
 
-def pi_layer(layer, li, Xin, n_rand, gen):
-    tl = time.time()
-    m = layer.mlp
-    W, b_in, Vout = m.dense_h_to_4h.weight, m.dense_h_to_4h.bias, m.dense_4h_to_h.weight
+def pi_reads(W, n_rand, gen, fracs):
+    """Weight-only Pi statistics of a read matrix W (n units x d): thresholded components, Fiedler proposals
+    vs random subsets vs the same proposer on a twin with redrawn unit directions (norms kept)."""
     n, d = W.shape
     U, T = torch.linalg.qr(W)
     Pi = U @ U.T
@@ -340,9 +350,9 @@ def pi_layer(layer, li, Xin, n_rand, gen):
     for tau in (0.0, 1e-13, 1e-10, 1e-6, 1e-3, 1e-2, 3e-2):
         nc, sizes = components((Pi.abs() > tau) & off)
         band[str(tau)] = {"components": nc, "largest": sizes}
-    fracs = (1 / 64, 1 / 32, 1 / 16, 1 / 8, 1 / 4, 3 / 8, 1 / 2)
-    ev, props = pi_proposals(U, T, 3, fracs)
-    dense_ev = torch.linalg.eigvalsh(torch.diag(Pi.pow(2).sum(1)) - Pi.pow(2))[:4]
+    offdiag = q(Pi.abs()[off])
+    del Pi, off
+    ev, props = pi_proposals(U, 3, fracs)
     rand = {}
     for f in fracs:
         k = max(1, round(f * n))
@@ -350,12 +360,12 @@ def pi_layer(layer, li, Xin, n_rand, gen):
         for _ in range(n_rand):
             mask = torch.zeros(n, dtype=torch.bool)
             mask[torch.randperm(n, generator=gen)[:k]] = True
-            vals.append(pi_split(U, T, mask)[0]["E_star"] / d)
+            vals.append(pi_estar(U, mask)["E_star"] / d)
         rand[k] = (float(np.mean(vals)), float(np.std(vals)))
     G = torch.randn(W.shape, generator=gen, dtype=torch.float64)
     Wt = G / G.norm(dim=1, keepdim=True) * W.norm(dim=1, keepdim=True)
-    Ut, Tt = torch.linalg.qr(Wt)
-    _, props_t = pi_proposals(Ut, Tt, 3, fracs)
+    Ut, _ = torch.linalg.qr(Wt)
+    _, props_t = pi_proposals(Ut, 3, fracs)
     best_t = {}
     for pr in props_t:
         if pr["k"] not in best_t or pr["E_over_U2"] < best_t[pr["k"]]:
@@ -370,6 +380,20 @@ def pi_layer(layer, li, Xin, n_rand, gen):
                      "z_vs_random": (bp["E_over_U2"] - mu) / sd if sd > 0 else None,
                      "ratio_vs_random": bp["E_over_U2"] / mu, "twin_best_fiedler": best_t[k],
                      "ratio_vs_twin": bp["E_over_U2"] / best_t[k]})
+    res = {"n": n, "d": d, "U_F2": float(U.pow(2).sum()), "pi_components_band": band, "pi_offdiag_abs": offdiag,
+           "laplacian_eigs": ev.tolist(), "by_k": by_k}
+    for r in by_k:
+        print("   k=%d fiedler %.4f random %.4f+-%.4f twin %.4f" % (r["k"], r["best_fiedler_E_over_U2"], r["random_mean"],
+                                                                  r["random_sd"], r["twin_best_fiedler"]), flush=True)
+    return res, U, T, props, rand
+
+
+def pi_layer(layer, li, Xin, n_rand, gen, fracs):
+    tl = time.time()
+    m = layer.mlp
+    W, b_in, Vout = m.dense_h_to_4h.weight, m.dense_h_to_4h.bias, m.dense_4h_to_h.weight
+    d = W.shape[1]
+    res, U, T, props, rand = pi_reads(W, n_rand, gen, fracs)
     best = min(props, key=lambda pr: pr["E_over_U2"] / rand[pr["k"]][0])
     _, What = pi_split(U, T, best["mask"])
     ln = layer.post_attention_layernorm
@@ -381,10 +405,7 @@ def pi_layer(layer, li, Xin, n_rand, gen):
     F = torch.nn.functional.gelu(Xin @ W.T + b_in) @ Vout.T
     Fh = torch.nn.functional.gelu(Xin @ What.T + b_in) @ Vout.T
     err = (F - Fh).norm(dim=1)
-    res = {"layer": li, "n": n, "d": d, "U_F2": float(U.pow(2).sum()),
-           "pi_components_band": band, "pi_offdiag_abs": q(Pi.abs()[off]),
-           "laplacian_eigs_lanczos": ev.tolist(), "laplacian_eigs_dense": dense_ev.tolist(),
-           "by_k": by_k,
+    res = {"layer": li, **res,
            "best": {"k": best["k"], "vec": best["vec"], "side": best["side"], "E_over_U2": best["E_over_U2"],
                     "random_mean": rand[best["k"]][0], "ratio_vs_random": best["E_over_U2"] / rand[best["k"]][0],
                     "W_minus_What_2": specdW, "W_2": float(torch.linalg.matrix_norm(W, ord=2)), "V_2": specV,
@@ -395,20 +416,43 @@ def pi_layer(layer, li, Xin, n_rand, gen):
                     "bound_holds": bool((err <= L_sigma * specV * specdW * R_ln * (1 + 1e-9)).all())},
            "seconds": time.time() - tl}
     b = res["best"]
-    print("L%d comps(1e-13)=%d lam2=%.2e/%.2e best k=%d E/U2=%.4f rand=%.4f ratio=%.3f | bound %.2f meas max %.2f "
-          "(rel med %.2f) (%.0fs)" % (li, band["1e-13"]["components"], ev[1], float(dense_ev[1]), b["k"], b["E_over_U2"],
-                                      b["random_mean"], b["ratio_vs_random"], b["uniform_bound_R_ln"],
-                                      b["measured_err"]["max"], b["measured_err_over_F"]["median"], res["seconds"]),
-          flush=True)
-    for r in by_k:
-        print("   k=%d fiedler %.4f random %.4f+-%.4f twin %.4f" % (r["k"], r["best_fiedler_E_over_U2"], r["random_mean"],
-                                                                  r["random_sd"], r["twin_best_fiedler"]), flush=True)
+    print("L%d comps(1e-13)=%d lam2=%.2e best k=%d E/U2=%.4f rand=%.4f ratio=%.3f | bound %.2f meas max %.2f "
+          "(rel med %.2f) (%.0fs)" % (li, res["pi_components_band"]["1e-13"]["components"], res["laplacian_eigs"][1],
+                                      b["k"], b["E_over_U2"], b["random_mean"], b["ratio_vs_random"],
+                                      b["uniform_bound_R_ln"], b["measured_err"]["max"],
+                                      b["measured_err_over_F"]["median"], res["seconds"]), flush=True)
     return res
+
+
+def pi_swiglu(args, gen, fracs, t0):
+    """--mode pi on a SwiGLU decoder: weight-only, labelled non-exact (see the module docstring)."""
+    from mpd_opfirst_decoder_2951 import Decoder
+
+    D = Decoder(args.model, args.revision)
+    pick = [int(v) for v in args.layers.split(",")] if args.layers else range(D.L)
+    report = {"model": args.model, "revision": args.revision, "architecture": D.describe(),
+              "hidden_act": D.config["hidden_act"], "read": args.read, "d_model": D.d, "d_hidden": D.n_ff,
+              "exact_module_theorem_applies": False,
+              "label": "SwiGLU: E* is the read-row geometry of W_%s only; a unit's other read and its bilinear "
+                       "gate are ignored, so this is not an exact module split (the exact-GELU theorem does not "
+                       "cover it)" % args.read,
+              "dtype": "float64", "device": "cpu", "args": vars(args), "layers": []}
+    for li in pick:
+        tl = time.time()
+        W = torch.from_numpy(D(f"model.layers.{li}.mlp.{args.read}_proj.weight"))
+        res = pi_reads(W, args.random_subsets, gen, fracs)[0]
+        report["layers"].append({"layer": li, **res, "seconds": time.time() - tl})
+        print("L%d comps(3e-2)=%d lam2=%.2e (%.0fs)" % (li, res["pi_components_band"]["0.03"]["components"],
+                                                       res["laplacian_eigs"][1], time.time() - tl), flush=True)
+    write_receipt(report, args.out, t0, 0.0)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
+    parser.add_argument("--revision", default="main")
+    parser.add_argument("--read", choices=("up", "gate"), default="up", help="SwiGLU --mode pi: read matrix")
+    parser.add_argument("--fracs", default="1/64,1/32,1/16,1/8,1/4,3/8,1/2", help="--mode pi subset sizes / n")
     parser.add_argument("--n-seq", type=int, default=2)
     parser.add_argument("--seq-len", type=int, default=256)
     parser.add_argument("--pairs", type=int, default=256)
@@ -428,9 +472,12 @@ def main():
     gen = torch.Generator().manual_seed(args.seed)
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-    cfg = AutoConfig.from_pretrained(args.model)
+    fracs = [float(a) / float(b) for a, b in (f.split("/") for f in args.fracs.split(","))]
+    cfg = AutoConfig.from_pretrained(args.model, revision=args.revision)
     if cfg.hidden_act != "gelu":
-        raise SystemExit("hidden_act=%r is not exact erf GELU; refusing" % cfg.hidden_act)
+        if args.mode != "pi":
+            raise SystemExit("hidden_act=%r is not exact erf GELU; only the labelled --mode pi runs" % cfg.hidden_act)
+        return pi_swiglu(args, gen, fracs, t0)
     tok = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float64).eval()
     ids, source = texts_tokens(tok, args.n_seq, args.seq_len, args.seed)
@@ -455,7 +502,7 @@ def main():
                   "L_sigma": 0.5 + KAPPA, "dtype": "float64", "device": "cpu", "args": vars(args), "layers": []}
         with torch.no_grad():
             for li in pick:
-                report["layers"].append(pi_layer(layers[li], li, caps[li][0], args.random_subsets, gen))
+                report["layers"].append(pi_layer(layers[li], li, caps[li][0], args.random_subsets, gen, fracs))
         return write_receipt(report, args.out, t0, t_fwd)
 
     report = {"model": args.model, "hidden_act": cfg.hidden_act, "d_model": cfg.hidden_size,

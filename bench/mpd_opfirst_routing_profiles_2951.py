@@ -38,26 +38,20 @@ import time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mpd_opfirst_rope_span_2951 import EPS, Weights, compact_json, snapshot_dir, spectrum_counts  # noqa: E402
+from mpd_opfirst_decoder_2951 import Decoder, compact_json  # noqa: E402
+from mpd_opfirst_rope_span_2951 import EPS, spectrum_counts  # noqa: E402
 
 N_PAIRS = 4000
 
 
-def plane_factors(W, cfg, layer):
-    """X (H, P, d), Y (KV, P, d) complex, all multiplicative gains folded; plus the raw q_norm gains (or None)."""
-    H, KV, d = cfg["num_attention_heads"], cfg["num_key_value_heads"], cfg["hidden_size"]
-    hd = cfg.get("head_dim", d // H)
-    P = hd // 2
-    p = f"model.layers.{layer}."
-    Q = W(p + "self_attn.q_proj.weight").reshape(H, hd, d)
-    K = W(p + "self_attn.k_proj.weight").reshape(KV, hd, d)
+def plane_factors(D, layer):
+    """X (H, P, d), Y (KV, P, d) complex, all multiplicative gains folded (Decoder.qk: q/k-norm gains at their
+    declared scope, input RMSNorm gain); plus the raw q_norm gains per head, (H or 1, hd), or None."""
+    P = D.hd // 2
+    Q, K = D.qk(layer)
     qn = None
-    if p + "self_attn.q_norm.weight" in W.index:
-        qn = W(p + "self_attn.q_norm.weight")
-        Q = Q * qn[None, :, None]
-        K = K * W(p + "self_attn.k_norm.weight")[None, :, None]
-    gamma = W(p + "input_layernorm.weight")
-    Q, K = Q * gamma, K * gamma
+    if D.qk_norm is not None:
+        qn = D(f"model.layers.{layer}.self_attn.q_norm.weight").reshape(-1, D.hd)
     return Q[:, :P] + 1j * Q[:, P:], K[:, :P] + 1j * K[:, P:], qn
 
 
@@ -285,7 +279,7 @@ def analyse_layer(X, Y, rng, full_class):
 
 # ---------------------------------------------------------------- executed edit on a real layer (Llama / SmolLM2)
 
-def edit_checks(model_id, snap, layers, edits, rng):
+def edit_checks(model_id, D, layers, edits, rng):
     import copy
 
     import torch
@@ -310,6 +304,7 @@ def edit_checks(model_id, snap, layers, edits, rng):
         return torch.matmul(w, value).transpose(1, 2).contiguous(), w
 
     AttentionInterface.register("capture_f64", capture_attention)
+    snap = D.snap
     tok = AutoTokenizer.from_pretrained(snap)
     ids = torch.tensor(tok(FALLBACK_TEXT).input_ids[:48])[None]
     T = ids.shape[1]
@@ -329,12 +324,12 @@ def edit_checks(model_id, snap, layers, edits, rng):
     om = inv_freq.numpy()
     tmat = (np.arange(T)[None, :] - np.arange(T)[:, None]).astype(np.float64)  # t = n - m
     causal = np.tril(np.ones((T, T), bool))
-    Wf = Weights(snap)
+    Wf = D
     results = []
     for L in layers:
         layer = model.model.layers[L]
         attn = layer.self_attn
-        X, Y, _ = plane_factors(Wf, Wf.config, L)
+        X, Y, _ = plane_factors(Wf, L)
         xh = hs[L].double()[0].numpy()
         xh = xh / np.sqrt(np.mean(xh ** 2, -1, keepdims=True) + cfg.rms_norm_eps)  # gain is folded in X, Y
         # input RMSNorm in float64 here: HF's LlamaRMSNorm upcasts to float32, a downcast for a float64 input
@@ -430,14 +425,13 @@ def main():
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     t0 = time.time()
-    snap = snapshot_dir(args.model)
-    W = Weights(snap)
-    cfg = W.config
+    D = Decoder(args.model)
+    snap, cfg = D.snap, D.config
     H, KV, L, d = cfg["num_attention_heads"], cfg["num_key_value_heads"], cfg["num_hidden_layers"], cfg["hidden_size"]
     hd = cfg.get("head_dim", d // H)
     layers = list(range(L)) if args.layers == "all" else [int(x) for x in args.layers.split(",")]
     rng = np.random.default_rng(2951)
-    qk_norm = f"model.layers.0.self_attn.q_norm.weight" in W.index
+    qk_norm = D.qk_norm is not None
     out = {
         "model": args.model, "snapshot": snap,
         "config": {"H": H, "KV": KV, "head_dim": hd, "d_model": d, "layers": L, "rope_theta": float(cfg["rope_theta"]),
@@ -454,12 +448,12 @@ def main():
     recs, check = [], 0.0
     for layer in layers:
         tl = time.time()
-        X, Y, qn = plane_factors(W, cfg, layer)
+        X, Y, qn = plane_factors(D, layer)
         check = max(check, selfcheck(X, Y, cfg, rng))
         rec = {"layer": layer}
         if qn is not None:
             P = hd // 2
-            rec["q_norm_pair_gain_equal_frac"] = float(np.mean(qn[:P] == qn[P:]))
+            rec["q_norm_pair_gain_equal_frac"] = float(np.mean(qn[:, :P] == qn[:, P:]))
         rec |= analyse_layer(X, Y, rng, full_class=layer % args.full_class_every == 0)
         rec["seconds"] = time.time() - tl
         recs.append(rec)
@@ -485,7 +479,7 @@ def main():
                             "group_frequency": nl["group_frequency"]}
     out["layers"] = recs
     if args.edit_layers:
-        out["executed_edit"] = edit_checks(args.model, snap, [int(x) for x in args.edit_layers.split(",")],
+        out["executed_edit"] = edit_checks(args.model, D, [int(x) for x in args.edit_layers.split(",")],
                                            [(2.0, 3.0), (1.0, None)], rng)
     out["seconds_total"] = time.time() - t0
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)

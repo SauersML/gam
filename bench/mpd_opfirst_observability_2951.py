@@ -1,44 +1,44 @@
-"""Residual-stream observability of Qwen3-0.6B-Base as an exact linear system (#2951).
+"""Residual-stream observability of a decoder as an exact linear system (#2951).
 
-Readout C = W_U diag(g_final) (tied unembedding times the final RMSNorm gain; the
-RMSNorm normalizer 1/rms(x) is a scalar gain that is excluded, i.e. treated as a
-fixed positive scale). Transitions with attention patterns held fixed: for every
-layer l and query head h, T = I + A_{l,h} with A_{l,h} = W_O[:, h] W_V[g(h)] diag(g_in,l)
-(GQA: head h reads kv group h // 2; the input RMSNorm gain folded in as a diagonal).
-MLPs are nonlinear; their read directions W_gate diag(g_post), W_up diag(g_post) are
+Architecture read from config (bench/mpd_opfirst_decoder_2951.py); weights one tensor at a time in float64,
+OV maps kept factored (d x hd times hd x d) and densified only for the owner's time-invariant closure.
+Readout C = W_U diag(g_final) (lm_head or the tied embedding, times the final RMSNorm gain; the RMSNorm
+normalizer 1/rms(x) is a scalar gain that is excluded, i.e. treated as a fixed positive scale). Transitions
+with attention patterns held fixed: for every layer l and query head h, T = I + A_{l,h} with
+  pre-norm (Qwen3):   A_{l,h} = W_O[:, h] W_V[g(h)] diag(g_in,l)          (input RMSNorm gain folded)
+  post-norm (OLMo 2): A_{l,h} = diag(g_post_attn,l) W_O[:, h] W_V[h]     (attention-output RMSNorm gain folded)
+In the post-norm case the excluded normaliser 1/rms(attention output) is one positive scalar per token and
+layer shared by all heads, so T = I + c A with c > 0 unknown: closures and ranks are exact (they do not depend
+on c), while the Gramian weights assume c = 1. MLPs are nonlinear; their read directions [W_gate; W_up]
+(times the pre-MLP RMSNorm gain in a pre-norm model; raw in OLMo 2, whose MLP reads the raw residual) are
 added as extra readouts in the "+mlp" variant.
 
 Three measurements:
 1. rowspace(C) at the state.rs rank rule (the owner's resolved row space through the MPD
    surface, ``linear_state_quotient``), plus relative-threshold effective dimensions.
 2. state.rs LinearStateQuotient::close itself (op ``linear_state_quotient``): the orthonormal
-   chart of the time-invariant family of all 448 OV maps, with its measured quotient bounds.
+   chart of the time-invariant family of all OV maps, with its measured quotient bounds (when rowspace(C)
+   is already all of d_model the closure is d_model with no computation, and the owner is not called).
 3. Causal backward closure O_L = O_{L+1} + sum_h O_{L+1} A_{L,h} (+ MLP reads of layer L),
    kept both as an orthonormal chart at a relative band tau and as an unnormalized square-root
    Gramian factor F_L (F_L^T F_L = F_{L+1}^T F_{L+1} + sum_h A^T F_{L+1}^T F_{L+1} A + reads),
    whose singular values give the decay of how strongly each residual direction is read.
 """
 import argparse
-import glob
 import json
 import os
+import sys
 import time
 
 import numpy as np
-import torch
-from safetensors.torch import load_file
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mpd_opfirst_decoder_2951 import Decoder, compact_json  # noqa: E402
 
 
-
-def compact_json(obj):
-    """One top-level key per line, compact values: keeps receipts under the
-    repository's tracked-file line limit (build.rs MAX_TRACKED_FILE_LINES)."""
-    if isinstance(obj, dict):
-        body = ",\n".join(
-            json.dumps(k) + ": " + json.dumps(v, separators=(",", ":")) for k, v in obj.items()
-        )
-        return "{\n" + body + "\n}\n"
-    return json.dumps(obj, separators=(",", ":")) + "\n"
+def apply(rows, t):
+    """rows @ A for a transition kept factored, t = (left, right), A = left @ right."""
+    return (rows @ t[0]) @ t[1]
 
 
 def linear_quotient(readouts, transitions=(), chart=None):
@@ -62,7 +62,15 @@ def linear_quotient(readouts, transitions=(), chart=None):
 
 def resolved_rows(matrix):
     """state.rs's resolved row space of one matrix (sigma > max(m, n) eps sigma_max) as orthonormal rows: the
-    owner's quotient of ``matrix`` under no transitions. ``.shape[0]`` is the rank at the eps band."""
+    owner's quotient of ``matrix`` under no transitions. ``.shape[0]`` is the rank at the eps band.
+
+    When the matrix has full rank min(m, n) with sigma_min above 10x that band (numpy SVD, whose error is far
+    below the margin), the owner's answer is the whole row space and an orthonormal basis of it is returned
+    without the call: the owner's rank rule costs about 30 min at 2048 x 2048 in the available build."""
+    m, n = matrix.shape
+    _, sigma, vt = np.linalg.svd(np.linalg.qr(matrix, mode="r") if m > 2 * n else matrix, full_matrices=False)
+    if sigma[-1] > 10 * max(m, n) * np.finfo(np.float64).eps * sigma[0]:
+        return vt
     return linear_quotient([matrix])[0]
 
 
@@ -90,84 +98,93 @@ def effective(sigma, taus=(1e-2, 1e-3, 1e-6)):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="Qwen/Qwen3-0.6B-Base")
-    parser.add_argument("--out", default="experiments/issue-2951/receipts/opfirst_observability.json")
+    parser.add_argument("--model", default="allenai/OLMo-2-0425-1B")
+    parser.add_argument("--revision", default="main")
+    parser.add_argument("--out", required=True)
     args = parser.parse_args()
     started = time.time()
-    torch.set_num_threads(os.cpu_count())
-    snap = glob.glob(os.path.expanduser(
-        f"~/.cache/huggingface/hub/models--{args.model.replace('/', '--')}/snapshots/*/"))[0]
-    cfg = json.load(open(os.path.join(snap, "config.json")))
-    w = {k: v.double().numpy() for k, v in load_file(os.path.join(snap, "model.safetensors")).items()}
-    d, n_layers = cfg["hidden_size"], cfg["num_hidden_layers"]
-    n_heads, n_kv, hd = cfg["num_attention_heads"], cfg["num_key_value_heads"], cfg["head_dim"]
-    group = n_heads // n_kv
+    D = Decoder(args.model, args.revision)
+    d, n_layers = D.d, D.L
 
-    g_final = w["model.norm.weight"]
-    readout = w["model.embed_tokens.weight"] * g_final[None, :]  # tied
-    ov, mlp_reads = [], []
-    for layer in range(n_layers):
-        p = f"model.layers.{layer}."
-        g_in = w[p + "input_layernorm.weight"]
-        g_post = w[p + "post_attention_layernorm.weight"]
-        wv, wo = w[p + "self_attn.v_proj.weight"], w[p + "self_attn.o_proj.weight"]
-        ov.append([wo[:, h * hd:(h + 1) * hd] @ wv[(h // group) * hd:(h // group + 1) * hd] * g_in[None, :]
-                   for h in range(n_heads)])
-        mlp_reads.append(np.vstack([w[p + "mlp.gate_proj.weight"], w[p + "mlp.up_proj.weight"]]) * g_post[None, :])
+    g_final = D("model.norm.weight")
+    readout = D.readout()
+    ov = [D.ov(layer) for layer in range(n_layers)]
     load_s = time.time() - started
 
-    # 1. rowspace(C)
-    rank_c = int(resolved_rows(readout).shape[0])
-    s_c = singular_values(readout)
+    # 1. rowspace(C) through its R factor (same Gram, row space and singular values; the owner is slow on the
+    # tall C). The owner's eps band then uses R's shape, max(m, n) = d instead of the vocabulary size: the rank
+    # is the same under either band whenever sigma_min / sigma_max clears the larger one (recorded).
+    r_readout = np.linalg.qr(readout, mode="r")
+    readout_shape = list(readout.shape)
+    rank_c = int(resolved_rows(r_readout).shape[0])
+    s_c = singular_values(r_readout)
     weak = np.argsort(np.abs(g_final))[:5]
+    pre_norm = D.where == "pre"
     result = {
         "model": args.model,
+        "architecture": D.describe(),
         "conventions": {
-            "readout": "C = W_U diag(g_final), tied embeddings, RMSNorm normalizer excluded (fixed positive scalar)",
-            "transition": "A_{l,h} = W_O[:, h] W_V[h//2] diag(g_in,l); T = I + A; closing under T equals closing under A",
-            "mlp_reads": "rows of W_gate diag(g_post), W_up diag(g_post) added as readouts at the post-attention residual",
+            "readout": "C = W_U diag(g_final), " + ("tied embeddings" if D.tied else "untied lm_head")
+                       + ", RMSNorm normalizer excluded (fixed positive scalar)",
+            "transition": ("A_{l,h} = W_O[:, h] W_V[g(h)] diag(g_in,l)" if pre_norm else
+                           "A_{l,h} = diag(g_post_attn,l) W_O[:, h] W_V[h]; the excluded 1/rms(attention output) "
+                           "is one positive scalar per token and layer shared by all heads: ranks/closures exact, "
+                           "Gramian weights at scalar 1") + "; T = I + A; closing under T equals closing under A",
+            "mlp_reads": "rows of [W_gate; W_up]" + (" diag(g_post)" if pre_norm else " (raw residual input)")
+                         + " added as readouts at the post-attention residual",
             "rank_rule": "state.rs resolved_row_space and LinearStateQuotient::close, called through the MPD surface "
                          "(linear_state_quotient); 'tau' charts keep the singular directions above tau sigma_max",
             "labels": "rank at the eps band is exact-arithmetic rank to within roundoff (numerical-exact); "
                       "tau and effective dimensions are numerical/conditioning statements",
         },
         "readout": {
-            "shape": list(readout.shape), "rank_at_band": rank_c,
+            "shape": readout_shape, "rank_at_band": rank_c,
+            "band_choice_irrelevant": bool(s_c[-1] / s_c[0] > max(readout_shape) * np.finfo(float).eps),
             "sigma_max": float(s_c[0]), "sigma_min": float(s_c[-1]), "sigma_min_over_max": float(s_c[-1] / s_c[0]),
             "sigma_top5": s_c[:5].tolist(), "sigma_bottom8": s_c[-8:].tolist(),
             "effective": effective(s_c),
             "smallest_final_gain_coords": {int(i): float(g_final[i]) for i in weak},
         },
     }
+    del readout
 
     # 2. state.rs's closure under all OV maps (time-invariant family)
     all_ov = [a for layer in ov for a in layer]
 
     def closure(readouts):
-        chart, report = linear_quotient(readouts, all_ov)
+        chart, report = linear_quotient(readouts, [a[0] @ a[1] for a in all_ov])
         return {"rank_closed": int(chart.shape[0]),
                 "max_quotient_bound": max(b["upper"] for b in report["quotient_bounds"]),
                 "max_readout_bound": max(b["upper"] for b in report["readout_bounds"]),
                 "section_bound": report["section_bounds"]["upper"]}
-    result["time_invariant_closure"] = {
-        "attention_only": {"rank_C": rank_c, **closure([readout])},
-        "with_mlp_reads": {"rank_C_plus_mlp_reads": int(resolved_rows(np.vstack([readout] + mlp_reads)).shape[0]),
-                           **closure([readout] + mlp_reads)}}
+    if rank_c == d:  # rowspace(C) is already everything: every closure is d_model, exactly
+        full = {"rank_closed": d, "owner_called": False, "reason": "rank_C = d_model"}
+        result["time_invariant_closure"] = {"attention_only": {"rank_C": rank_c, **full},
+                                            "with_mlp_reads": {"rank_C_plus_mlp_reads": d, **full}}
+    else:
+        mlp_reads = [D.mlp_reads(layer) for layer in range(n_layers)]
+        result["time_invariant_closure"] = {
+            "attention_only": {"rank_C": rank_c, **closure([r_readout])},
+            "with_mlp_reads": {
+                "rank_C_plus_mlp_reads": int(resolved_rows(np.vstack([r_readout] + mlp_reads)).shape[0]),
+                **closure([r_readout] + mlp_reads)}}
+        del mlp_reads
 
     # 3. causal backward closure per layer
     per_layer = {"attention_only": [], "with_mlp_reads": []}
     for variant in per_layer:
-        factor = np.linalg.qr(readout, mode="r")
-        charts = {tau: relative_rows(readout, tau) for tau in (1e-2, 3e-2)}
+        factor = r_readout
+        charts = {tau: relative_rows(r_readout, tau) for tau in (1e-2, 3e-2)}
         for layer in reversed(range(n_layers)):
             if variant == "with_mlp_reads":
-                factor = np.linalg.qr(np.vstack([factor, mlp_reads[layer]]), mode="r")
+                reads = D.mlp_reads(layer)
+                factor = np.linalg.qr(np.vstack([factor, reads]), mode="r")
                 for tau in charts:
-                    charts[tau] = relative_rows(np.vstack([charts[tau], mlp_reads[layer] /
-                                                           np.linalg.norm(mlp_reads[layer], 2)]), tau)
-            factor = np.linalg.qr(np.vstack([factor] + [factor @ a for a in ov[layer]]), mode="r")
+                    charts[tau] = relative_rows(np.vstack([charts[tau], reads / np.linalg.norm(reads, 2)]), tau)
+            factor = np.linalg.qr(np.vstack([factor] + [apply(factor, a) for a in ov[layer]]), mode="r")
             for tau in charts:
-                charts[tau] = relative_rows(np.vstack([charts[tau]] + [charts[tau] @ a for a in ov[layer]]), tau)
+                charts[tau] = relative_rows(np.vstack([charts[tau]] + [apply(charts[tau], a) for a in ov[layer]]),
+                                            tau)
             rank = int(resolved_rows(factor).shape[0])
             _, s, vt = np.linalg.svd(factor)
             per_layer[variant].append({
@@ -177,12 +194,14 @@ def main():
                 "weakest_dir_top_coords": {int(i): float(vt[-1, i]) for i in np.argsort(-np.abs(vt[-1]))[:3]},
                 "sigma_bottom4_over_max": (s[-4:] / s[0]).tolist(),
             })
+            print(variant, layer, rank, f"PR={per_layer[variant][-1]['effective']['participation_ratio']:.1f}",
+                  f"{time.time() - started:.0f}s", flush=True)
         per_layer[variant].reverse()
     result["causal_backward"] = per_layer
-    result["ov_head_norm_range"] = [float(min(np.linalg.norm(a, 2) for a in all_ov)),
-                                    float(max(np.linalg.norm(a, 2) for a in all_ov))]
+    result["ov_head_norm_range"] = [float(min(np.linalg.norm(a[0] @ a[1], 2) for a in all_ov)),
+                                    float(max(np.linalg.norm(a[0] @ a[1], 2) for a in all_ov))]
     result["runtime_s"] = {"load": load_s, "total": time.time() - started}
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as fh:
         fh.write(compact_json(result))
     print(json.dumps({k: result[k] for k in ("readout", "time_invariant_closure", "runtime_s")}, indent=1))
