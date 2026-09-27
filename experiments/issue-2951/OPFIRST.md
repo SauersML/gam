@@ -126,8 +126,19 @@ writes.
 - Merging units with opposite affine forms adds their write vectors, since `ψ` is
   even; only the linear part `A` carries the sign.
 
-Trained GELU MLP blocks contain no parallel modules in the replacement sense.
-Exact module splitting is a diagnostic, not a target.
+- The more general contract, additivity after any invertible linear input change,
+  has its finest blocks at the connected components of `Π = UUᵀ` (`W = UT`), and
+  for a neuron subset `S` the closest exactly separated reads have whitened error
+  `E* = Σ min(λ, 1 − λ)` over the eigenvalues of `UᵀD_SU`, bounded by twice the cut
+  `Σ_{i∈S, j∉S} Π_ij²` (`--mode pi`). Π has one component in every layer. Fiedler
+  subsets reach 0.27–0.77× the random-subset `E*` at small sizes, but a twin with
+  redrawn unit directions reaches about the same (trained/twin 0.95–1.1); only
+  pythia-70m layer 3 at 32 units clearly beats it (0.43×). The native uniform
+  bound is 50–150× looser than the measured error.
+
+Trained GELU MLP blocks contain no additive modules, in either the replacement or
+the linear-change sense, beyond what spectral partitioning finds in random
+weights. Exact module splitting is a diagnostic, not a target.
 
 ### 6. An executable program for modular addition, from the weights
 `bench/mpd_opfirst_modadd_program_2951.py`, receipts `opfirst_modadd_program*.json`.
