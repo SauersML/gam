@@ -21,9 +21,11 @@
 //! * [`Node::Call`] invokes a shared body. Every call site is an invocation, and a
 //!   control inside the body can be set at every invocation or at one.
 //! * [`Node::Refine`] pairs a mechanism body with the native body it decomposes.
-//!   When every control the mechanism reaches resolves to exactly `1` at this
-//!   invocation, the native body runs on its original path, so the all-on program
-//!   is bit-identical to the source; otherwise the mechanism runs.
+//!   When no mask group the mechanism reaches is assigned at this invocation (the
+//!   explicit all-on, [`MaskAssignment::all_on`]), the native body runs on its
+//!   original path, so the all-on program is bit-identical to the source. Any
+//!   assignment runs the mechanism, an assigned value of exactly `1` included:
+//!   algebraic equality with the native body is not bitwise equality.
 //!
 //! # Controls, mask groups and macros
 //!
@@ -1068,8 +1070,8 @@ pub type ResidualStatus = EvidenceStatus<(usize, usize), Vec<CallSite>>;
 #[derive(Clone, Debug, PartialEq)]
 pub struct RefinementResidual {
     pub invocation: Vec<CallSite>,
-    /// Every control the mechanism reaches resolved to `1`, so the native output
-    /// was carried downstream.
+    /// No mask group the mechanism reaches is assigned at this invocation, so the
+    /// native output was carried downstream.
     pub all_on: bool,
     /// `max |mechanism - native|` over every entry of the two computed outputs at
     /// this invocation: Exact over the one-member family, witnessed by its entry. Its
@@ -1220,9 +1222,18 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
         value
     }
 
-    /// Whether every control `body_id` reaches resolves to exactly `1` where it runs:
-    /// a node's own controls at `path`, and a called, composed or refined body's at the
-    /// path its invocation pushes, so a scope set on a deeper invocation is seen.
+    /// Whether a scoped value of `control`'s group applies at `path`.
+    fn assigned(&self, control: ControlId, path: &[CallSite]) -> bool {
+        let group = self.program.control_group[control.index()];
+        self.masks
+            .get(&group)
+            .is_some_and(|scoped| scoped.iter().any(|&(scope, _)| path.starts_with(scope)))
+    }
+
+    /// Whether no control `body_id` reaches is assigned where it runs: a node's own
+    /// controls at `path`, and a called, composed or refined body's at the path its
+    /// invocation pushes, so a scope set on a deeper invocation is seen. Assignment,
+    /// not value, decides: a group assigned exactly `1` still runs the mechanism.
     fn all_on_below(&self, body_id: BodyId, path: &mut Vec<CallSite>) -> bool {
         let program = self.program;
         let within = |site: CallSite, callee: BodyId, path: &mut Vec<CallSite>| {
@@ -1240,19 +1251,19 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
                         NativePrimitive::CoordinateMask { controls } => controls,
                         _ => &[],
                     };
-                    coordinates.iter().all(|&control| self.resolve(control, path) == 1.0)
+                    coordinates.iter().all(|&control| !self.assigned(control, path))
                         && primitive.parameters().iter().all(|parameter| {
                             program.parts.parameters[parameter.index()]
                                 .controls
                                 .iter()
-                                .all(|&control| self.resolve(control, path) == 1.0)
+                                .all(|&control| !self.assigned(control, path))
                         })
                 }
                 Node::Sum { terms } => terms
                     .iter()
-                    .all(|term| term.control.is_none_or(|control| self.resolve(control, path) == 1.0)),
+                    .all(|term| term.control.is_none_or(|control| !self.assigned(control, path))),
                 Node::Compose { stages, .. } => stages.iter().enumerate().all(|(k, stage)| {
-                    stage.control.is_none_or(|control| self.resolve(control, path) == 1.0)
+                    stage.control.is_none_or(|control| !self.assigned(control, path))
                         && within(CallSite { stage: k as u32, ..site }, stage.body, path)
                 }),
                 Node::Call { body: callee, .. } | Node::Refine { mechanism: callee, .. } => {
@@ -3226,7 +3237,9 @@ mod tests {
         assert_ne!(mechanism_all_on, native_output);
 
         assert_eq!(run(&program, &source, &MaskAssignment::all_on(), &x), native_output);
-        assert_eq!(run(&program, &source, &global(&[(0, 1.0), (1, 1.0)]), &x), native_output);
+        // Assigning every group exactly `1` is an assignment, not the explicit all-on: the
+        // mechanism runs, and here it is not even algebraically the native body.
+        assert_eq!(run(&program, &source, &global(&[(0, 1.0), (1, 1.0)]), &x), mechanism_all_on);
 
         let half = global(&[(0, 0.5)]);
         let diagonal = array![[0.5, 0.0], [0.0, 1.0]];
@@ -3335,11 +3348,11 @@ mod tests {
                 .expect("residual execution");
             assert_eq!(*execution.output, array![[0.0, 0.0]]);
             assert!(!residuals[0].all_on);
-            // A deeper scope of `1` overrides the global value where the control runs,
-            // so every reached control is on and the native body runs.
+            // A deeper scope of `1` overrides the global value where the control runs, so
+            // the control is on there; the group is still assigned, so the mechanism runs.
             let mut restored = global(&[(0, 0.5)]);
             restored.set(MaskGroupId(0), deep, 1.0).expect("a new scope");
-            assert_eq!(run(program, &source, &restored, &x), &x * 2.0);
+            assert_eq!(run(program, &source, &restored, &x), x.clone());
         }
     }
 

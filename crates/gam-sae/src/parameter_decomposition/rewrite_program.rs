@@ -414,19 +414,8 @@ mod tests {
         random_block, uniform,
     };
     use gam_math::gaussian_activation::GaussianActivation;
-    use ndarray::ArrayView1;
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
-
-    /// The refinement's own selection: a factor whose every component is exactly
-    /// `1` runs its native tensor.
-    fn all_on_or_components(mask: ArrayView1<'_, f64>) -> ComponentMask<'_> {
-        if mask.iter().all(|&value| value == 1.0) {
-            ComponentMask::AllOn
-        } else {
-            ComponentMask::Components(mask)
-        }
-    }
 
     fn positions() -> Vec<i64> {
         (0..ROWS as i64).collect()
@@ -446,8 +435,8 @@ mod tests {
             .output
     }
 
-    /// Every pair of read-in and write-out mask kinds, including one factor all on
-    /// and the other masked.
+    /// Every pair of read-in and write-out mask kinds, an all-ones mask included: an
+    /// assigned mask always runs the mechanism, whatever its values.
     #[test]
     fn the_mechanism_program_executes_the_component_block_bit_for_bit() {
         for (activation, seed) in [
@@ -474,8 +463,8 @@ mod tests {
                         .execute(
                             inputs.view(),
                             MlpMask {
-                                read_in: all_on_or_components(read_in_mask.view()),
-                                write_out: all_on_or_components(write_out_mask.view()),
+                                read_in: ComponentMask::Components(read_in_mask.view()),
+                                write_out: ComponentMask::Components(write_out_mask.view()),
                             },
                         )
                         .expect("component block");
@@ -486,8 +475,9 @@ mod tests {
                 }
             }
 
-            // Positive controls: the comparison sees the masks, and it sees the
-            // refinements route all-ones factors to their native tensors.
+            // Positive controls: the comparison sees the masks, it sees an assigned
+            // all-ones mask run the factors, which are algebraically but not bitwise the
+            // native tensors, and it sees the explicit all-on run the native tensors.
             let continuous = &read_in_masks[0].1;
             let read_in_ones = &read_in_masks[3].1;
             let write_out_ones = &write_out_masks[3].1;
@@ -509,13 +499,30 @@ mod tests {
                 read_in: ComponentMask::Components(read_in_ones.view()),
                 write_out: ComponentMask::Components(write_out_ones.view()),
             };
-            let routed = execute_program(&block, &program, &inputs, all_ones);
+            let assigned_ones = execute_program(&block, &program, &inputs, all_ones);
             let factored = block
                 .execute(inputs.view(), all_ones)
                 .expect("all-ones factored block");
             assert!(
-                !bitwise_equal(&routed, &factored),
-                "{activation:?} block: the all-ones program must run the native tensors, not the factored all-ones path"
+                bitwise_equal(&assigned_ones, &factored),
+                "{activation:?} block: an assigned all-ones mask must run the factored path"
+            );
+            assert!(
+                !bitwise_equal(&assigned_ones, &native),
+                "{activation:?} block: the factored all-ones path must differ in bits from the native tensors"
+            );
+            let explicit = execute_program(
+                &block,
+                &program,
+                &inputs,
+                MlpMask {
+                    read_in: ComponentMask::AllOn,
+                    write_out: ComponentMask::AllOn,
+                },
+            );
+            assert!(
+                bitwise_equal(&explicit, &native),
+                "{activation:?} block: the explicit all-on program must run the native tensors"
             );
         }
     }
