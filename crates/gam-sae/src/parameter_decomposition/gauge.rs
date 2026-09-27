@@ -1903,6 +1903,7 @@ fn invert_gauge_change(gauge_change: ArrayView2<'_, f64>) -> Result<Array2<f64>,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parameter_decomposition::test_support::test_governor;
     use crate::parameter_decomposition::attention::{AffineProjection, AttentionExecution, RotaryPairing};
     use crate::parameter_decomposition::operators::{MaskGaugeVerdict, classify_under};
     use crate::parameter_decomposition::rewrite::NativeMlp;
@@ -2825,10 +2826,10 @@ mod tests {
                 forced_query_key_carry(&teacher, &changes)
             };
             let before = native_attention(&teacher, score_scale, &value, &output)
-                .execute(x.view(), &positions)
+                .execute(test_governor(), x.view(), &positions)
                 .expect("execute");
             let after = native_attention(&carried, score_scale, &value, &output)
-                .execute(x.view(), &positions)
+                .execute(test_governor(), x.view(), &positions)
                 .expect("execute");
             let mut moved = 0;
             for head in 0..geometry.n_heads {
@@ -2971,7 +2972,7 @@ mod tests {
             .expect("the fixture's shapes compose")
             .with_query_key_norm(block.epsilon, block.query_gain.clone(), block.key_gain.clone())
             .expect("gains of head width")
-            .execute(self.inputs.view(), &self.positions)
+            .execute(test_governor(), self.inputs.view(), &self.positions)
             .expect("execute")
         }
     }
