@@ -25,8 +25,11 @@ Each head's score operator splits exactly into rank-2 per-plane pieces,
 of both models (numerically certified). The energy spectrum is concentrated, but
 a null in which every head is its own orthogonal subspace concentrates it the
 same way, so the concentration is uneven sizes, not sharing. The only
-substantial sharing is between GQA siblings (a head captures a median 18–20% of
-its sibling's operator energy vs about 1% for other heads). The slow planes
+substantial overlap is between GQA siblings (a head captures a median 18–20% of
+its sibling's operator energy vs about 1% for other heads). Overlap of operator
+subspaces is not sameness of routing law: the planted-toy suite scores a head
+whose operator is twice another's as fully shared. The negative conclusion
+stands, since that error can only overcount sharing. The slow planes
 (wavelength beyond the 32k context) carry about 70% of the operator energy:
 most of the QK operator is position-independent content matching.
 
@@ -80,8 +83,11 @@ smooth-nonlinear work. Primitives have to depend on depth.
 `crates/gam-sae/examples/mpd_gauge_census_2951.rs`, receipt `gauge_census_Qwen3-0.6B-Base.json`.
 
 The gauge detectors in `parameter_decomposition::gauge` certify an exact orbit
-dimension of 3,832,763 out of 596,049,920 parameters: 0.643% of Qwen3-0.6B is
-pure implementation convention. Per layer it is almost all the OV basis freedom
+dimension of 3,832,763 out of 596,049,920 parameters: at least 0.643% of
+Qwen3-0.6B is pure implementation convention. This is a lower bound: the
+census counts only the declared families, and the planted-toy suite (result 7)
+shows families it misses, such as a GL(d) hidden in cancelling paired branches
+and a cross-head GL between heads with identical attention patterns. Per layer it is almost all the OV basis freedom
 (131,072 of 136,256), with SwiGLU up/down scales (3,072), norm gains (2,048) and
 only 64 in rotary QK (q/k norm leaves little freedom). The tied embedding pins
 the residual-stream rotation down to an orbit of 17,579.
@@ -161,6 +167,32 @@ interface error that saturation hides on clean inputs becomes visible. This is
 the explanation working as intended and showing its resolution: correct laws,
 exhaustively checked where exhaustive checking is possible, with a stated
 counterfactual error where it is coarse.
+
+### 7. Known-answer toys: which tools can be trusted
+`bench/mpd_opfirst_toys_planted_2951.py`, receipt `opfirst_toys_planted.json`.
+
+Seven hand-built networks with the correct explanation written down before any
+tool runs (a paired-branch copy, planted mixed modules, the same with a
+cross-module edge of size ε, a rotation block with a repeated angle, two heads
+sharing a routing law, a data-subspace ambiguity, a random null). A fibre
+oracle (the nullity of the Jacobian of parameters → outputs) confirmed every
+hand-derived redundancy.
+
+Correct: planted modules recovered exactly; the cross-edge refuted by the
+certified bound (η/ε = 1.0); the repeated-angle planes reported only as a
+4-dimensional invariant subspace while a naive eigendecomposition invents wrong
+planes; the data ambiguity reported; no structure claimed on the random null.
+
+Confidently wrong, now design rules:
+- The unit graph alone reports eight exact modules on the copy block, whose
+  nonlinear parts cancel. Sign-duplicate units must be merged first, and a split
+  is never reported without the linear-part compatibility check and its
+  certified η.
+- Declared gauge families undercount redundancy (result 4 is a lower bound).
+- Subspace-overlap metrics cannot tell equal routing laws from different ones;
+  an operator-equality test is needed.
+- Per-head observability closures are not gauge-invariant when heads share
+  patterns; the unit is the routing law.
 
 ## What this says about method
 
