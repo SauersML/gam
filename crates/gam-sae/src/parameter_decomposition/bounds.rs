@@ -77,6 +77,37 @@
 //! trained modular-addition transformer, over every deletion of its twelve largest non-key unembedding planes, P15 is
 //! a median 1.4·10⁷ times the exact supremum and P15′ 57 times (`bench/mpd_modadd_p15prime_2951.py`).
 //!
+//! # Sharp softmax total variation
+//!
+//! For `q_i ∝ p_i e^{δ_i}` with logit-error range `w = max δ − min δ`,
+//!
+//! ```text
+//! TV(p, q) ≤ tanh(w/4),
+//! ```
+//!
+//! with equality for two keys. Proof: with `X = e^δ ∈ [a, b]` under `p`, `b/a = e^w` and `μ = E_p X`,
+//! `TV = E_p (X/μ − 1)_+`. Its integrand is convex in `X`, so among laws on `[a, b]` with mean `μ` the two-point law on
+//! `{a, b}` maximizes it (Edmundson–Madansky):
+//! `TV ≤ (μ − a)(b − μ)/((b − a) μ)`. Over `μ ∈ [a, b]` this is largest at `μ = √(ab)`, where it equals
+//! `(√b − √a)²/(b − a) = (√b − √a)/(√b + √a) = tanh(w/4)`. The two-key law `δ = (0, w)`,
+//! `p = (1 − π, π)` with `π = 1/(1 + e^{w/2})` has `μ = √(ab)` and attains it. It reads only the range, like P15, and it
+//! never exceeds `1`, where P15 through Pinsker (`TV ≤ w/4`) grows without bound. [`softmax_total_variation_bound`]
+//! evaluates it; [`total_variation_over_logit_boxes`] applies it over two logit boxes.
+//!
+//! # Attention reads
+//!
+//! Two weight rows `p`, `q` over the same keys read payloads `v_s`. With `d = p − q`, `Σ d = 0`, so the positive and
+//! negative parts both have mass `TV(p, q)`, and
+//!
+//! ```text
+//! ‖Σ_s p_s v_s − Σ_s q_s v_s‖ = TV · ‖E_{d₊/TV} v − E_{d₋/TV} v‖ ≤ TV(p, q) · diam({v_s}),
+//! ```
+//!
+//! in any norm, with no factor of the key count; two keys attain it. For payloads `v_s = C y_s` with `‖y_s‖₂ ≤ R` the
+//! diameter is at most `2R‖C‖₂` ([`payload_diameter`], through `‖C‖₂ ≤ ‖C‖_F`). A layer's output is the sum of its heads'
+//! reads (each through its own output projection, folded into `C`), so the triangle inequality sums the per-head bounds
+//! ([`attention_read_bound`]).
+//!
 
 use std::fmt;
 
@@ -313,6 +344,114 @@ pub fn kl_supremum_over_logit_boxes(
         up(variance * phi)
     };
     Ok(EvidenceStatus::uniform_bound(hoeffding.min(bennett), 0.0, region)?)
+}
+
+/// `tanh(w/4)`, rounded up, for a logit-error range `w ≥ 0` (module documentation, *Sharp softmax total variation*):
+/// `(1 − e)/(1 + e)` with `e = e^{−w/2}` decreases in `e`, so the lower end of a [`certified_exp`] enclosure of
+/// `e^{−w/2}` with the numerator rounded up and the denominator down bounds it from above. It never exceeds `1`.
+pub fn softmax_total_variation_bound(range: f64) -> Result<f64, BoundError> {
+    if !(range >= 0.0) {
+        return Err(BoundError::InvalidInput(format!("a logit-error range must be nonnegative; got {range}")));
+    }
+    if range == f64::INFINITY {
+        return Ok(1.0);
+    }
+    if range == 0.0 {
+        // A constant gap changes no probability.
+        return Ok(0.0);
+    }
+    let Some(decay) = certified_exp(-(range / 2.0).next_up()).map(|interval| interval.lo.max(0.0)) else {
+        return Ok(1.0);
+    };
+    let numerator = (1.0 - decay).next_up();
+    let denominator = (1.0 + decay).next_down();
+    Ok((numerator / denominator).next_up().min(1.0))
+}
+
+/// The region a total-variation bound holds over: every pair of logit vectors within per-entry radii of two computed
+/// centers, with the largest radius of each side kept.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TotalVariationRegion {
+    LogitBoxes { reference_radius: f64, perturbed_radius: f64 },
+}
+
+/// `sup TV(softmax(ℓ_p + a), softmax(ℓ_q + b))` over every `|a| ≤ reference_radius` and `|b| ≤ perturbed_radius`,
+/// entrywise, as an [`EvidenceStatus::UniformBound`]: `tanh(O′/4)` with `O′ = O + α + β` the bound on the exact gap's
+/// oscillation that [`kl_supremum_over_logit_boxes`] uses. TV is symmetric, so it bounds both directions.
+pub fn total_variation_over_logit_boxes(
+    reference: ArrayView1<'_, f64>,
+    reference_radius: ArrayView1<'_, f64>,
+    perturbed: ArrayView1<'_, f64>,
+    perturbed_radius: ArrayView1<'_, f64>,
+) -> Result<EvidenceStatus<(), TotalVariationRegion>, BoundError> {
+    let oscillation = gap_oscillation(reference, perturbed)?;
+    let mut widest = [0.0_f64; 2];
+    for (slot, (side, radius)) in [("reference", reference_radius), ("perturbed", perturbed_radius)].into_iter().enumerate()
+    {
+        if radius.len() != reference.len() {
+            return Err(BoundError::InvalidInput(format!(
+                "the {side} radius has {} entries for {} logits",
+                radius.len(),
+                reference.len()
+            )));
+        }
+        if let Some(index) = radius.iter().position(|entry| !(entry.is_finite() && *entry >= 0.0)) {
+            return Err(BoundError::InvalidInput(format!(
+                "the {side} radius must be finite and non-negative; entry {index} is {}",
+                radius[index]
+            )));
+        }
+        widest[slot] = radius.iter().copied().fold(0.0_f64, f64::max);
+    }
+    let range = ((oscillation + 2.0 * widest[0]).next_up() + 2.0 * widest[1]).next_up();
+    let region = TotalVariationRegion::LogitBoxes { reference_radius: widest[0], perturbed_radius: widest[1] };
+    Ok(EvidenceStatus::uniform_bound(softmax_total_variation_bound(range)?, 0.0, region)?)
+}
+
+/// One attention head's read change: upper bounds on the total variation between its two weight rows and on the
+/// diameter of its payloads `{v_s}` in the norm the read is measured in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HeadRead {
+    pub total_variation: f64,
+    pub diameter: f64,
+}
+
+/// The region an attention read bound holds over: the declared heads, each with its declared payload set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttentionReadRegion {
+    pub heads: usize,
+}
+
+/// An upper bound on the diameter of the payloads `v_s = C y_s` over every `‖y_s‖₂ ≤ radius`: `2 · radius · ‖C‖₂`,
+/// with `‖C‖₂ ≤ ‖C‖_F` evaluated upward.
+pub fn payload_diameter(payload_map: ndarray::ArrayView2<'_, f64>, radius: f64) -> Result<f64, BoundError> {
+    if !(radius.is_finite() && radius >= 0.0) {
+        return Err(BoundError::InvalidInput(format!("a payload radius must be finite and nonnegative; got {radius}")));
+    }
+    let mut squares = 0.0_f64;
+    for &entry in payload_map {
+        if !entry.is_finite() {
+            return Err(BoundError::InvalidInput(format!("a payload map entry is not finite: {entry}")));
+        }
+        squares = (squares + (entry * entry).next_up()).next_up();
+    }
+    Ok((2.0 * (squares.sqrt().next_up() * radius).next_up()).next_up())
+}
+
+/// `‖Σ_h Σ_s (p_hs − q_hs) v_hs‖ ≤ Σ_h diam({v_hs}) · TV(p_h, q_h)` (module documentation, *Attention reads*), as an
+/// [`EvidenceStatus::UniformBound`] over the declared heads. No factor of the key count enters.
+pub fn attention_read_bound(heads: &[HeadRead]) -> Result<EvidenceStatus<(), AttentionReadRegion>, BoundError> {
+    let mut total = 0.0_f64;
+    for (index, head) in heads.iter().enumerate() {
+        let valid = |value: f64| value.is_finite() && value >= 0.0;
+        if !(valid(head.total_variation) && head.total_variation <= 1.0 && valid(head.diameter)) {
+            return Err(BoundError::InvalidInput(format!(
+                "head {index} needs a total variation in [0, 1] and a finite nonnegative diameter; got {head:?}"
+            )));
+        }
+        total = (total + (head.total_variation * head.diameter).next_up()).next_up();
+    }
+    Ok(EvidenceStatus::uniform_bound(total, 0.0, AttentionReadRegion { heads: heads.len() })?)
 }
 
 #[cfg(test)]
@@ -556,5 +695,137 @@ mod tests {
                 "radii {reference_radius:?} and {perturbed_radius:?} must be refused"
             );
         }
+    }
+
+    /// `TV(softmax a, softmax b)` evaluated directly.
+    fn total_variation(a: &[f64], b: &[f64]) -> f64 {
+        let (p, q) = (log_softmax(a).expect("logits"), log_softmax(b).expect("logits"));
+        0.5 * p.iter().zip(&q).map(|(x, y)| (x.exp() - y.exp()).abs()).sum::<f64>()
+    }
+
+    #[test]
+    fn the_softmax_total_variation_bound_is_attained_by_two_keys() {
+        for w in [0.1_f64, 1.0, 5.0, 20.0] {
+            // The extremal law: μ = √(ab) at p = (1 − π, π), π = 1/(1 + e^{w/2}), δ = (0, w).
+            let pi = 1.0 / (1.0 + (w / 2.0).exp());
+            let reference = [(1.0 - pi).ln(), pi.ln()];
+            let perturbed = [reference[0], reference[1] + w];
+            let attained = total_variation(&reference, &perturbed);
+            let bound = softmax_total_variation_bound(w).expect("a bound");
+            assert!(bound >= attained - 1e-15, "w = {w}: {bound} < {attained}");
+            assert!(bound - attained <= 1e-12, "w = {w}: not sharp, {bound} vs {attained}");
+            // The certified exponential's enclosure is a few units wide; the band is one-sided.
+            let closed_form = (w / 4.0).tanh();
+            assert!(bound >= closed_form - 1e-16 && bound - closed_form <= 1e-12, "{bound} vs {closed_form}");
+            let boxed = total_variation_over_logit_boxes(
+                ArrayView1::from(&reference[..]),
+                ArrayView1::from(&[0.0, 0.0][..]),
+                ArrayView1::from(&perturbed[..]),
+                ArrayView1::from(&[0.0, 0.0][..]),
+            )
+            .expect("a bound");
+            assert!(boxed.upper_bound().expect("uniform") >= attained - 1e-15);
+        }
+        // Pinsker through P15 gives w/4, which passes 1; the sharp bound never does.
+        assert!(softmax_total_variation_bound(20.0).expect("a bound") < 1.0);
+        assert_eq!(softmax_total_variation_bound(0.0).expect("a bound"), 0.0);
+        assert!(softmax_total_variation_bound(-1.0).is_err());
+        assert!(softmax_total_variation_bound(f64::NAN).is_err());
+    }
+
+    #[test]
+    fn the_total_variation_bound_holds_on_random_logits_and_widens_with_the_boxes() {
+        let mut rng = StdRng::seed_from_u64(29);
+        for _ in 0..200 {
+            let reference: Vec<f64> = (0..6).map(|_| rng.random_range(-4.0..4.0)).collect();
+            let perturbed: Vec<f64> = reference.iter().map(|x| x + rng.random_range(-1.5..1.5)).collect();
+            let zero = vec![0.0; 6];
+            let status = total_variation_over_logit_boxes(
+                ArrayView1::from(&reference[..]),
+                ArrayView1::from(&zero[..]),
+                ArrayView1::from(&perturbed[..]),
+                ArrayView1::from(&zero[..]),
+            )
+            .expect("a bound");
+            let exact = total_variation(&reference, &perturbed);
+            let upper = status.upper_bound().expect("uniform");
+            assert!(upper >= exact, "{upper} < {exact}");
+            // Every logit pair inside the boxes: the corners where the gap is widest stay below the widened bound.
+            let radius = vec![0.05; 6];
+            let widened = total_variation_over_logit_boxes(
+                ArrayView1::from(&reference[..]),
+                ArrayView1::from(&radius[..]),
+                ArrayView1::from(&perturbed[..]),
+                ArrayView1::from(&radius[..]),
+            )
+            .expect("a bound")
+            .upper_bound()
+            .expect("uniform");
+            assert!(widened >= upper);
+            let top = (0..6).max_by(|&i, &j| (perturbed[i] - reference[i]).total_cmp(&(perturbed[j] - reference[j]))).expect("keys");
+            let mut corner_reference = reference.clone();
+            let mut corner_perturbed = perturbed.clone();
+            for i in 0..6 {
+                let sign = if i == top { 1.0 } else { -1.0 };
+                corner_reference[i] -= sign * 0.05;
+                corner_perturbed[i] += sign * 0.05;
+            }
+            assert!(widened >= total_variation(&corner_reference, &corner_perturbed));
+        }
+    }
+
+    #[test]
+    fn an_attention_read_moves_by_at_most_the_diameter_times_the_total_variation() {
+        let norm = |v: [f64; 2]| (v[0] * v[0] + v[1] * v[1]).sqrt();
+        // Two keys attain the bound.
+        let (p, q) = ([0.8, 0.2], [0.3, 0.7]);
+        let payloads = [[1.0, -2.0], [-0.5, 2.0]];
+        let read = |w: [f64; 2]| [w[0] * payloads[0][0] + w[1] * payloads[1][0], w[0] * payloads[0][1] + w[1] * payloads[1][1]];
+        let (a, b) = (read(p), read(q));
+        let moved = norm([a[0] - b[0], a[1] - b[1]]);
+        let diameter = norm([payloads[0][0] - payloads[1][0], payloads[0][1] - payloads[1][1]]);
+        let status = attention_read_bound(&[HeadRead { total_variation: 0.5, diameter }]).expect("a bound");
+        let upper = status.upper_bound().expect("uniform");
+        assert!(upper >= moved && upper - moved <= 1e-14, "{upper} vs {moved}");
+        // Many keys: no key-count factor, and the payload map's diameter bound covers the true diameter.
+        let mut rng = StdRng::seed_from_u64(31);
+        let map = ndarray::array![[3.0, 0.0], [0.0, 4.0]];
+        let keys = 50;
+        let inputs: Vec<[f64; 2]> = (0..keys)
+            .map(|_| {
+                let angle: f64 = rng.random_range(0.0..std::f64::consts::TAU);
+                [angle.cos(), angle.sin()]
+            })
+            .collect();
+        let payload: Vec<[f64; 2]> = inputs.iter().map(|y| [3.0 * y[0], 4.0 * y[1]]).collect();
+        let reference: Vec<f64> = (0..keys).map(|_| rng.random_range(-3.0..3.0)).collect();
+        let perturbed: Vec<f64> = reference.iter().map(|x| x + rng.random_range(-0.5..0.5)).collect();
+        let (p, q) = (log_softmax(&reference).expect("logits"), log_softmax(&perturbed).expect("logits"));
+        let mut change = [0.0, 0.0];
+        for s in 0..keys {
+            let d = p[s].exp() - q[s].exp();
+            change[0] += d * payload[s][0];
+            change[1] += d * payload[s][1];
+        }
+        let zero = vec![0.0; keys];
+        let tv = total_variation_over_logit_boxes(
+            ArrayView1::from(&reference[..]),
+            ArrayView1::from(&zero[..]),
+            ArrayView1::from(&perturbed[..]),
+            ArrayView1::from(&zero[..]),
+        )
+        .expect("a bound")
+        .upper_bound()
+        .expect("uniform");
+        let diameter = payload_diameter(map.view(), 1.0).expect("a diameter");
+        assert!(diameter >= 8.0 && diameter <= 10.0 + 1e-12, "2‖C‖_F = 10 covers 2‖C‖₂ = 8: {diameter}");
+        let bound = attention_read_bound(&[HeadRead { total_variation: tv, diameter }, HeadRead { total_variation: 0.0, diameter }])
+            .expect("a bound")
+            .upper_bound()
+            .expect("uniform");
+        assert!(bound >= norm(change), "{bound} < {}", norm(change));
+        assert!(bound <= 10.0 * tv + 1e-12, "no factor of the {keys} keys");
+        assert!(attention_read_bound(&[HeadRead { total_variation: 1.5, diameter: 1.0 }]).is_err());
+        assert!(payload_diameter(map.view(), -1.0).is_err());
     }
 }
