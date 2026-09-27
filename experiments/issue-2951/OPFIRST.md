@@ -274,6 +274,21 @@ On OLMo-2-0425-1B, layers 2, 8 and 14 (2048 train and 2048 held-out tokens):
 The exact error split did its job: the failure is the operator family, not missing context or
 gate flexibility, so more spline freedom would not have helped.
 
+Multi-template follow-up (`--mode multi`, receipt `opfirst_cond_operators_multi_OLMo-2-0425-1B.json`):
+with each unit's native `d_n u_n` as its own template the operator term is zero, and the
+question becomes whether a group's gates are a low-dimensional function of shared coordinates.
+- Within-group gates share one layer-wide mode but have no low-rank per-group law. Against a
+  token-permutation null they are strongly structured (layer 14, 64 groups: participation
+  ratio per unit 0.11 vs 0.83), but size-matched random groups are nearly as structured
+  (0.15), and the top four components hold under half the gate energy up to 256 groups.
+- Rank-r gate models from the group's top-r principal gate coordinates: the cheapest route to
+  variance explained ≈ 0.90 is a linear rank-4 model at 4096 groups (0.91/0.89/0.90), about
+  15k parameters plus 8192 group labels. There, per-unit REML splines add ≤ 0.02 at 10× the
+  parameters; missing conditioning dominates the remaining error. Native edits are predicted to 3–10%.
+- Nothing reaches native parity, which costs no parameters beyond the weights.
+- The relu law is not a low-rank special case but the full-rank endpoint: zero parameters and
+  0.918 at layer 14, above every rank-r model (best 0.90).
+
 ### 10. OLMo 2 1B: the same probes on a post-norm model
 Receipts `opfirst_*_olmo2-1b.json` (final checkpoint, `main`).
 
