@@ -214,8 +214,9 @@ def main():
                          "participation_ratio: numerical (Gramian-weighted)")
         path = f"{args.out_prefix}_{name}.json"
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as fh:
-            json.dump(res, fh, indent=1)
+        with open(path, "w") as fh:  # one top-level key per line (tracked files must stay < 10k lines)
+            fh.write("{\n" + ",\n".join(f"{json.dumps(k)}:{json.dumps(v, separators=(',', ':'))}"
+                                        for k, v in res.items()) + "\n}\n")
         print(f"[{name}] wrote {path} in {res['runtime_s']:.1f}s", flush=True)
 
 
