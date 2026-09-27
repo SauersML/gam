@@ -19,10 +19,7 @@ Tools (reused from the probes, imported, not rewritten, unless noted):
   T3  activation splits for exact GELU: gelu(t) = t/2 + psi(t) (odd/even) and gelu = relu + e, e(t) = -|t| Phi(-|t|)
       even (GELU analogues of the SiLU splits in bench/mpd_opfirst_mlp_oddeven_2951.py; psi is the probe's).
   T4  spectral plane-rotation recovery: Rust parameter_decomposition::spectral::recover_plane_rotations called
-      through `gam parameter-decomposition` (--gam-bin, default target/release/gam). A numpy stand-in of the same
-      logic (t4_numpy_standin: polar distance, beta, clusters split only at gaps > 2 beta, RepeatedCosine for 2p
-      dims with p >= 2) runs alongside as a labelled cross-check and is the fallback only when no binary exists;
-      the receipt's T4_implementation says which one produced the scored numbers. A naive strawman
+      through `gam parameter-decomposition` (--gam-bin, default target/release/gam; required). A naive strawman
       (np.linalg.eig, one plane per conjugate pair, no grouping) is scored too, to show what the grouping prevents.
   T5  gauge counts by the declared families of parameter_decomposition::gauge (NUMPY STAND-IN: re-statement of the orbit
       formulas: pass-through GL(r) r^2 - (r - rank A)(r - rank B); GELU hidden units permutation only; rotary QK
@@ -274,39 +271,6 @@ def t3_gelu(W_in, b_in, W_out, b_out, X):
 
 
 # --------------------------------------------------------------------------------------------- T4
-def t4_numpy_standin(W):
-    """NUMPY STAND-IN for spectral.rs recover_plane_rotations (bands simplified to d eps scale); used only as a
-    cross-check of the Rust result, or as the fallback when no `gam` binary is available (recorded in the receipt)."""
-    d = W.shape[0]
-    U, s, Vt = np.linalg.svd(W)
-    band = 4 * d * EPS * s[0]
-    if s[-1] <= band:
-        return {"refused": "singular within band"}
-    rho_bar = float(np.abs(s - 1).max() + band)
-    S = 0.5 * (W + W.T)
-    cosv, V = np.linalg.eigh(S)
-    beta = rho_bar + 4 * d * EPS * np.linalg.norm(W) + 4 * d * EPS * np.abs(cosv).max()
-    cuts = [0] + [i + 1 for i in range(d - 1) if cosv[i + 1] - cosv[i] > 2 * beta] + [d]
-    clusters = []
-    for lo, hi in zip(cuts[:-1], cuts[1:]):
-        c = cosv[lo:hi]
-        dim = hi - lo
-        if c.max() + beta >= 1:
-            kind, planes = "fixed", 0
-        elif c.min() - beta <= -1:
-            kind, planes = "half_turn", 0
-        else:
-            kind, planes = ("rotation", dim // 2) if dim % 2 == 0 else ("unresolved_odd", 0)
-        clusters.append({"dim": dim, "kind": kind, "planes": planes,
-                         "angle": float(np.arccos(np.clip(c.mean(), -1, 1))),
-                         "unresolved_beta_ge_1": bool(beta >= 1),
-                         "planes_identified": kind == "rotation" and planes == 1,
-                         "repeated_cosine_ambiguity": kind == "rotation" and planes >= 2, "_basis": V[:, lo:hi]})
-    return {"rho_bar": rho_bar, "beta": float(beta), "clusters": clusters,
-            "planes_claimed": int(sum(c["planes"] for c in clusters if c["planes_identified"])),
-            "subspaces_claimed": int(sum(1 for c in clusters if c["kind"] == "rotation"))}
-
-
 GAM_BIN = None
 
 
@@ -338,17 +302,7 @@ def t4_rust(W):
             "subspaces_claimed": int(sum(1 for c in clusters if c["kind"] == "rotation"))}
 
 
-def t4_planes(W):
-    """Rust plane recovery when a `gam` binary is available, with the numpy stand-in recorded as a cross-check."""
-    mirror = t4_numpy_standin(W)
-    mirror_summary = [(c["dim"], c["kind"], c["planes"]) for c in mirror["clusters"]]
-    if GAM_BIN is None:
-        return mirror | {"source": "numpy_standin"}
-    out = t4_rust(W)
-    rust_summary = [(c["dim"], c["kind"], c["planes"]) for c in out["clusters"]]
-    out["numpy_standin_clusters"] = mirror_summary
-    out["numpy_standin_agrees"] = mirror_summary == rust_summary
-    return out
+t4_planes = t4_rust
 
 
 def t4_naive(W):
@@ -529,8 +483,7 @@ def toy4(rng):
     Rm = U @ B @ U.T
     planes = [U[:, 2 * i:2 * i + 2].T for i in range(3)]
     t4 = t4_planes(Rm)
-    rep = {"d": d, "angles": angles, "T4": {k: t4.get(k) for k in ("source", "rho_bar", "beta", "ambiguities",
-                                                                    "numpy_standin_clusters", "numpy_standin_agrees")}}
+    rep = {"d": d, "angles": angles, "T4": {k: t4.get(k) for k in ("source", "rho_bar", "beta", "ambiguities")}}
     rep["T4"]["clusters"] = []
     ok_11, ok_03 = False, False
     for cl in t4["clusters"]:
@@ -763,8 +716,7 @@ def toy7(rng, gen, n_null=6):
     orc = mlp_oracle(W_in, b_in, W_out, b_out, 2 * rng.standard_normal((300, d)))
     rep = {"d": d, "hidden": n, "T1": t1, "T4": t4c,
            "T4_residual_I_plus_A": {"rho_bar": t4r["rho_bar"], "planes_claimed": t4r["planes_claimed"],
-                                    "subspaces_claimed": t4r["subspaces_claimed"], "source": t4r["source"],
-                                    "numpy_standin_agrees": t4r.get("numpy_standin_agrees")},
+                                    "subspaces_claimed": t4r["subspaces_claimed"], "source": t4r["source"]},
            "T2_weighted": {"exact_rank": g["exact_rank"], "participation_ratio": g["participation_ratio"],
                            "null_participation_ratios": null_pr},
            "T5": {"declared_continuous": 0, "fibre_oracle": orc, "truth": 0}}
@@ -781,18 +733,18 @@ def main():
     ap.add_argument("--seed", type=int, default=2951)
     ap.add_argument("--out", default="experiments/issue-2951/receipts/opfirst_toys_planted.json")
     ap.add_argument("--gam-bin", default=str(Path(__file__).resolve().parents[1] / "target/release/gam"),
-                    help="`gam` CLI for Rust plane recovery; the numpy stand-in is used (and labelled) if absent")
+                    help="`gam` CLI for Rust plane recovery (required)")
     args = ap.parse_args()
     global GAM_BIN
-    GAM_BIN = args.gam_bin if Path(args.gam_bin).exists() else None
+    if not Path(args.gam_bin).exists():
+        raise SystemExit("no gam binary at %s: build it with `cargo build --release -p gam-cli --bin gam`" % args.gam_bin)
+    GAM_BIN = args.gam_bin
     t0 = time.time()
     rng = np.random.default_rng(args.seed)
     gen = torch.Generator().manual_seed(args.seed)
     torch.manual_seed(args.seed)
     report = {"script": "bench/mpd_opfirst_toys_planted_2951.py", "seed": args.seed, "dtype": "float64",
-              "T4_implementation": ("rust: gam parameter-decomposition recover_plane_rotations (numpy stand-in"
-                                    " recorded per call as numpy_standin_clusters / numpy_standin_agrees)"
-                                    if GAM_BIN else "numpy_standin (no gam binary found; Rust not called)"),
+              "T4_implementation": "rust: gam parameter-decomposition recover_plane_rotations",
               "truth": TRUTH}
     scorecard = {}
     for name, fn in (("toy1_paired_copy", toy1), ("toy2_two_modules", toy2), ("toy3_cross_edge", toy3),
