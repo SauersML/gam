@@ -9,7 +9,9 @@ Exact rewrite R (checked against the direct forward on all p^2 inputs). Only the
 only its residual matters. With characters D(w x) = (cos w x, sin w x), w_k = 2 pi k / p, k = 1..(p-1)/2:
 
 * embedding  e(x) = c0 + sum_k U_k D(w_k x)               (DFT of W_E's rows over the token cycle, exact for odd p;
-                                                           U_k is cyclic_action's plane, frequency_edit turns its D)
+                                                           c0, U_k from cyclic_action::cyclic_planes and the pos0 edit
+                                                           from cyclic_action::frequency_edit, both through the MPD
+                                                           surface; ``chars`` evaluates D at the program's inputs)
 * scores     s_hj = sig_hj + sum_k g_hk . D(w_k x_j)      (the query at ``=`` is input-independent; j = 0, 1)
 * routing    alpha_h = softmax(s_h0, s_h1, sig_h2)
 * moved      zeta_hk = alpha_h0 D(w_k a) + alpha_h1 D(w_k b)   (what head h carries in plane k: its OV image O_h U_k)
@@ -48,6 +50,37 @@ def chars(k, x, p):
     """D(w_k x) for frequencies k (K,) and integers x (N,): shape (N, K, 2)."""
     w = 2 * np.pi * np.outer(np.asarray(x), np.asarray(k)) / p
     return np.stack([np.cos(w), np.sin(w)], -1)
+
+
+def mpd(operation, tensors):
+    """One operation of the Rust MPD surface (gam_sae::parameter_decomposition::surface)."""
+    from gamfit.sae import run_parameter_decomposition
+
+    return run_parameter_decomposition({"schema": "gam.mpd-request", "schema_version": 1, "operation": operation},
+                                       tensors)
+
+
+def token_cycle(p, rows):
+    """The declared successor x -> x + 1 (mod p) over a table's first p rows; any further row is fixed."""
+    return [(x + 1) % p if x < p else x for x in range(rows)]
+
+
+def cyclic_planes(table, p):
+    """cyclic_action::cyclic_planes of ``table`` under the token cycle: c0 (d,), the planes U (K, 2, d) with
+    U[k-1] = [u_kc, u_ks], and each plane's power (K,)."""
+    out = mpd({"kind": "cyclic_planes", "table": "table", "successor": token_cycle(p, table.shape[0])},
+              {"table": table})
+    planes = out.arrays["planes"]
+    return out.arrays["mean"], planes.T.reshape(-1, 2, planes.shape[0]), np.array(out.report["result"]["power"])
+
+
+def frequency_edited(table, p, frequencies, shift):
+    """cyclic_action::frequency_edit of the closed-form planes ``frequencies`` of ``table`` at ``shift``:
+    the edited table E + left right^T (rows outside the cycle stay fixed)."""
+    out = mpd({"kind": "frequency_edit", "successor": token_cycle(p, table.shape[0]),
+               "basis": {"kind": "closed_form", "table": "table"},
+               "frequencies": sorted(int(k) for k in frequencies), "shift": int(shift)}, {"table": table})
+    return table + out.arrays["left"] @ out.arrays["right"].T
 
 
 def softmax(s):
@@ -94,11 +127,8 @@ def exact_coordinates(W, cfg):
     """Every coefficient of R, all frequencies, from the weights alone."""
     p, H, dh = cfg["p"], cfg["n_heads"], cfg["d_head"]
     K = np.arange(1, (p - 1) // 2 + 1)
-    Dc = chars(K, np.arange(p), p)
-    E = W["W_E"][:p]
-    c0 = E.mean(0)
-    U = (2 / p) * np.einsum("ckt,cd->ktd", Dc, E)                                   # K,2,d
-    V = (2 / p) * np.einsum("ckt,cd->ktd", Dc, W["W_U"])                            # K,2,d
+    c0, U, _ = cyclic_planes(W["W_E"][:p], p)                                       # d / K,2,d
+    V = cyclic_planes(W["W_U"], p)[1]                                               # K,2,d
     x2 = W["W_E"][p] + W["W_pos"][2]
     base = np.stack([c0 + W["W_pos"][0], c0 + W["W_pos"][1], x2])                   # 3,d
     qk = np.einsum("hk,hkd->hd", np.einsum("hkd,d->hk", W["W_Q"], x2), W["W_K"]) / math.sqrt(dh)
@@ -267,7 +297,8 @@ def compare(ref, pred, label=None):
 
 def y_of_logits(logits, ks, p):
     """The model's actual readout coordinates: the c-Fourier coefficients of its logits, (N, K, 2)."""
-    return (2 / p) * np.einsum("mc,ckt->mkt", logits, chars(ks, np.arange(p), p))
+    planes = cyclic_planes(np.ascontiguousarray(logits.T), p)[1]                    # K,2,N
+    return np.moveaxis(planes[np.asarray(ks) - 1], -1, 0)
 
 
 def rel(x, ref):
@@ -347,8 +378,7 @@ def main():
 
     # ---- frequencies from weight spectra only
     def shares(T):
-        c = (2 / p) * np.einsum("ckt,cd->ktd", chars(X["K"], np.arange(p), p), T)
-        pw = (c ** 2).sum((1, 2))
+        pw = cyclic_planes(T, p)[2]
         return pw / pw.sum()
     se, su = shares(W["W_E"][:p]), shares(W["W_U"])
     s_embed = [int(k) for k in X["K"][np.argsort(-se)] if se[k - 1] > args.embed_share]
@@ -425,9 +455,7 @@ def main():
         hit_shift, hit_orig = 0, 0
         sel = np.isin(X["K"], T)
         for s in shifts:
-            table0 = E.copy()
-            table0[:p] += np.einsum("akt,ktd->ad", chars(X["K"][sel], np.arange(p) + s, p)
-                                    - chars(X["K"][sel], np.arange(p), p), X["U"][sel])
+            table0 = frequency_edited(E, p, X["K"][sel], s)
             Me = model_forward(W, cfg, a, b, table0=table0)["logits"]
             st["model_vs_P"].add(Me, run_program(prog, a, b, shift=(T, s))["logits"])
             st["model_vs_T"].add(Me, closed_form(A, ks_read, p, {k: a + b + (s if k in T else 0) for k in s_read}))

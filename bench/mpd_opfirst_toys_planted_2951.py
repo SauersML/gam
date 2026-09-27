@@ -10,11 +10,11 @@ Tools (reused from the probes, imported, not rewritten, unless noted):
       Two pipelines: "raw" = the probe as written (duplicate units only counted), "merged" = sign/duplicate units
       merged first (psi is even, so a_k = s a_j, beta_k = s beta_j merges to u_j + u_k), zero writes dropped, and a
       unit-free block answered by the commutant of its linear part (continuous split family iff dim > d).
-  T2  weighted observability (bench/mpd_opfirst_observability_2951.py: close, resolved, effective;
-      bench/mpd_opfirst_task_observability_2951.py: principal_cosines, orth_rows). Through an MLP block the
+  T2  weighted observability (bench/mpd_opfirst_observability_2951.py: linear_quotient, resolved_rows, effective;
+      bench/mpd_opfirst_task_observability_2951.py: principal_cosines). Through an MLP block the
       pull-back Gramian of a readout C is (CA)^T(CA) + sum_j |C u_j|^2 a_j a_j^T (write-weighted); the probe's own
-      with_mlp_reads convention (C plus every read row, unweighted) is reported alongside. The closure is the
-      probe's Python mirror of state.rs LinearStateQuotient::close (not yet on the CLI surface). Attention: one backward
+      with_mlp_reads convention (C plus every read row, unweighted) is reported alongside. The closure is
+      state.rs LinearStateQuotient::close through the MPD surface (op linear_state_quotient). Attention: one backward
       step [c; c C_h] per head (probe convention) vs per routing law. Data: the data Gramian X^T X / N.
   T3  activation splits for exact GELU: gelu(t) = t/2 + psi(t) (odd/even) and gelu = relu + e, e(t) = -|t| Phi(-|t|)
       even (GELU analogues of the SiLU splits in bench/mpd_opfirst_mlp_oddeven_2951.py; psi is the probe's).
@@ -44,9 +44,9 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mpd_opfirst_gelu_modules_2951 import KAPPA, Mlp, cos_matrix, eta_bound, psi, refine, random_twin  # noqa: E402
-from mpd_opfirst_observability_2951 import close, effective, resolved  # noqa: E402
+from mpd_opfirst_observability_2951 import effective, linear_quotient, resolved_rows  # noqa: E402
 from mpd_opfirst_rope_span_2951 import atoms, captured, gram_from_factors, top_cosine  # noqa: E402
-from mpd_opfirst_task_observability_2951 import orth_rows, principal_cosines  # noqa: E402
+from mpd_opfirst_task_observability_2951 import principal_cosines  # noqa: E402
 
 EPS = np.finfo(np.float64).eps
 torch.set_default_dtype(torch.float64)
@@ -195,8 +195,8 @@ def t1_mlp(W_in, b_in, W_out, b_out, L=None, merge=True, rng=None):
     comps = []
     for g in range(ncomp):
         mask = lab == g
-        P = orth_rows(a[mask]).T
-        Q = orth_rows(u[mask]).T
+        P = resolved_rows(a[mask]).T
+        Q = resolved_rows(u[mask]).T
         Pp, Qp = P @ P.T, Q @ Q.T
         eb = eta_bound(m, tt(Pp), tt(Qp))
         # empirical replacement on generic pairs, against the certified bound
@@ -237,7 +237,7 @@ def t1_null_search(W_in, b_in, W_out, b_out, rng, gen, restarts=4, iters=20):
 
 # --------------------------------------------------------------------------------------------- T2
 def gram_report(factor, planted=None):
-    _, sigma, _, rank = resolved(factor, 0.0)
+    rank = int(resolved_rows(factor).shape[0])
     _, s, vt = np.linalg.svd(factor, full_matrices=False)
     out = {"exact_rank": rank, "sigma_over_max": (s / s[0]).tolist(),
            "participation_ratio": effective(s)["participation_ratio"]}
@@ -310,7 +310,7 @@ def t4_naive(W):
     planes = []
     for i in range(len(lam)):
         if lam[i].imag > 1e-12:
-            planes.append((float(abs(np.angle(lam[i]))), orth_rows(np.vstack([vec[:, i].real, vec[:, i].imag]))))
+            planes.append((float(abs(np.angle(lam[i]))), resolved_rows(np.vstack([vec[:, i].real, vec[:, i].imag]))))
     return planes
 
 
@@ -362,9 +362,9 @@ def toy1(rng):
     rep["T1_raw"], rep["T1_merged"] = raw, mer
     c = rng.standard_normal((1, d))
     A = 0.5 * W_out @ W_in
-    rep["T2_weighted_raw_units"] = gram_report(mlp_pullback(c, W_in, W_out, A), orth_rows(c))
-    rep["T2_probe_with_mlp_reads"] = gram_report(np.vstack([c, W_in]), orth_rows(c))
-    rep["T2_after_T1_merge"] = gram_report(c @ A, orth_rows(c))  # no unit survives the merge
+    rep["T2_weighted_raw_units"] = gram_report(mlp_pullback(c, W_in, W_out, A), resolved_rows(c))
+    rep["T2_probe_with_mlp_reads"] = gram_report(np.vstack([c, W_in]), resolved_rows(c))
+    rep["T2_after_T1_merge"] = gram_report(c @ A, resolved_rows(c))  # no unit survives the merge
     rep["T3"] = t3_gelu(W_in, b_in, W_out, b_out, X)
     t4 = t4_planes(A)
     rep["T4"] = {k: v for k, v in t4.items() if k != "clusters"} | {
@@ -504,8 +504,8 @@ def toy4(rng):
     c_dim = commutant_dim(Rm)
     rep["T1"] = {"units": 0, "commutant_dim": c_dim, "d": d, "continuous_split_family": c_dim > d}
     c = rng.standard_normal((1, d))
-    chart, steps = close(orth_rows(c), [Rm - np.eye(d)], None)
-    rep["T2_closure"] = {"rank": int(chart.shape[0]), "steps": steps,
+    chart, closure = linear_quotient([c], [Rm - np.eye(d)])
+    rep["T2_closure"] = {"rank": int(chart.shape[0]), "quotient_bound": closure["quotient_bounds"][0]["upper"],
                          "principal_cos_to_1.1_plane": principal_cosines(chart, planes[2]).tolist(),
                          "principal_cos_to_0.3_space": principal_cosines(chart, np.vstack(planes[:2])).tolist()}
     cos03 = np.array(rep["T2_closure"]["principal_cos_to_0.3_space"])
@@ -574,11 +574,11 @@ def toy5(rng):
         per_head = np.vstack([c] + [c @ Ch for Ch in Cs])
         per_law = np.vstack([c] + [c @ Ct for Ct in transports])
         return {"pairs": pairs, "routing_laws": [[h + 1 for h in law] for law in laws],
-                "law_transport_ranks": [int(resolved(Ct, 0.0)[3]) for Ct in transports],
-                "per_head_ov_ranks": [int(resolved(Ch, 0.0)[3]) for Ch in Cs],
+                "law_transport_ranks": [int(resolved_rows(Ct).shape[0]) for Ct in transports],
+                "per_head_ov_ranks": [int(resolved_rows(Ch).shape[0]) for Ch in Cs],
                 "per_head_ov_fro": [float(np.linalg.norm(Ch)) for Ch in Cs],
-                "T2_per_head_rank": int(resolved(per_head, 0.0)[3]), "T2_per_law_rank": int(resolved(per_law, 0.0)[3]),
-                "_per_head_space": orth_rows(per_head), "_per_law_space": orth_rows(per_law), "_transports": transports}
+                "T2_per_head_rank": int(resolved_rows(per_head).shape[0]), "T2_per_law_rank": int(resolved_rows(per_law).shape[0]),
+                "_per_head_space": resolved_rows(per_head), "_per_law_space": resolved_rows(per_law), "_transports": transports}
 
     base = tools(V, O)
     # per-head OV gauge V -> S V, O -> O S^-1

@@ -14,8 +14,9 @@ attention OV maps with the full unembedding as readout; that is trivial for Qwen
   final RMSNorm gain (and the 6-dimensional difference space), backward causal closure layer by layer
   under all 16 heads' OV maps (input RMSNorm gain folded), optionally with the MLP reads.
 
-The rank rule, closure and Gramian recursion are those of the parent bench (mirroring state.rs
-resolved_row_space and LinearStateQuotient::close). "exact" = rank at the eps band (exact-arithmetic
+The rank rule and the closure are state.rs's resolved row space and LinearStateQuotient::close, and the
+Fourier planes are cyclic_action::cyclic_planes, all called through the MPD surface (the parent bench's
+``linear_quotient`` / ``resolved_rows``; ``cyclic_planes`` here). "exact" = rank at the eps band (exact-arithmetic
 rank to within roundoff); tau / effective dimensions are numerical conditioning statements. The
 Gramian factor F (F^T F = sum of pulled-back readout Gramians) weighs directions by how strongly
 they are read, so its relative singular-value counts are the meaningful effective dimensions.
@@ -32,14 +33,15 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mpd_opfirst_observability_2951 import close, effective, resolved  # noqa: E402
+from mpd_opfirst_observability_2951 import (  # noqa: E402
+    effective, linear_quotient, relative_rows, resolved_rows, singular_values)
 
 TAUS = (1e-2, 1e-3, 1e-6)
 
 
 def dims(factor):
-    _, sigma, _, rank = resolved(factor, 0.0)
-    return {"exact_rank_eps_band": rank, **effective(sigma, TAUS)}, sigma
+    sigma = singular_values(factor)
+    return {"exact_rank_eps_band": int(resolved_rows(factor).shape[0]), **effective(sigma, TAUS)}, sigma
 
 
 def top_space(factor, tau):
@@ -52,27 +54,27 @@ def principal_cosines(a, b):
     return np.linalg.svd(a @ b.T, compute_uv=False)
 
 
-def orth_rows(m):
-    _, s, vt = np.linalg.svd(m, full_matrices=False)
-    return vt[: int((s > max(m.shape) * np.finfo(float).eps * s[0]).sum())]
+def cyclic_planes(table):
+    """cyclic_action::cyclic_planes of ``table``'s rows under the token cycle x -> x + 1 (mod p), through the MPD
+    surface: the planes [u_1c, u_1s, ...] (d x 2m) and each plane's power."""
+    from gamfit.sae import run_parameter_decomposition
+
+    p = table.shape[0]
+    out = run_parameter_decomposition(
+        {"schema": "gam.mpd-request", "schema_version": 1,
+         "operation": {"kind": "cyclic_planes", "table": "table", "successor": [(x + 1) % p for x in range(p)]}},
+        {"table": table})
+    return out.arrays["planes"], np.array(out.report["result"]["power"])
 
 
 def fourier_planes(table, freqs):
-    p = table.shape[0]
-    a = np.arange(p)
-    rows = []
-    for k in freqs:
-        rows += [np.cos(2 * math.pi * k * a / p) @ table, np.sin(2 * math.pi * k * a / p) @ table]
-    return orth_rows(np.array(rows))
+    planes, _ = cyclic_planes(table)
+    return resolved_rows(np.vstack([planes[:, [2 * (k - 1), 2 * (k - 1) + 1]].T for k in freqs]))
 
 
 def fourier_power(table):
-    p = table.shape[0]
-    a = np.arange(p)
-    ks = np.arange(1, (p - 1) // 2 + 1)
-    power = np.array([np.sum((np.cos(2 * math.pi * k * a / p) @ table) ** 2 + (np.sin(2 * math.pi * k * a / p) @ table) ** 2)
-                      for k in ks])
-    return ks, power / power.sum()
+    _, power = cyclic_planes(table)
+    return np.arange(1, len(power) + 1), power / power.sum()
 
 
 def compare(factor, planes, label):
@@ -118,11 +120,10 @@ def modadd(args):
             factor = np.linalg.qr(np.vstack([post] + [post @ a for a in ov]), mode="r")
             v["pre_attention_gramian"], sigma = dims(factor)
             v["pre_attention_sigma_over_max_first24"] = (sigma[:24] / sigma[0]).tolist()
-            for tau_label, tau in (("eps_band", None), ("tau_1e-3", 1e-3), ("tau_1e-6", 1e-6)):
-                chart0, _, _, r0 = resolved(post, 0.0, tau)
-                chart, steps = close(chart0, ov, tau)
-                v[f"time_invariant_closure_{tau_label}"] = {"rank_C": r0, "rank_closed": int(chart.shape[0]),
-                                                            "steps": steps}
+            chart, report = linear_quotient([post], ov)
+            v["time_invariant_closure_eps_band"] = {
+                "rank_C": int(resolved_rows(post).shape[0]), "rank_closed": int(chart.shape[0]),
+                "max_quotient_bound": max(b["upper"] for b in report["quotient_bounds"])}
             v["fourier"] = {pn: compare(factor, pl, f"[modadd] {name} vs {pn}") for pn, pl in planes.items()}
             v["fourier"]["readout_only"] = {pn: compare(np.linalg.qr(post, mode="r"), pl,
                                                         f"[modadd] {name} readout-only vs {pn}")
@@ -167,21 +168,22 @@ def weekday(args):
         for mlp in (False, True):
             name = rname + ("+mlp_reads" if mlp else "")
             factor = c
-            charts = {tau: resolved(c, 0.0, tau)[0] for tau in (None, 1e-3, 1e-6)}
+            charts = {tau: resolved_rows(c) if tau is None else relative_rows(c, tau) for tau in (None, 1e-3, 1e-6)}
             per_layer = [{"layer": n_layers, **dims(factor)[0],
                           **{f"chart_rank_{t if t else 'eps'}": int(ch.shape[0]) for t, ch in charts.items()}}]
             for layer in reversed(range(n_layers)):
                 if mlp:
                     factor = np.vstack([factor, mlp_reads[layer]])
                     for t in charts:
-                        charts[t] = resolved(np.vstack([charts[t], mlp_reads[layer] /
-                                                        np.linalg.norm(mlp_reads[layer], 2)]), 0.0, t)[0]
+                        stack = np.vstack([charts[t], mlp_reads[layer] / np.linalg.norm(mlp_reads[layer], 2)])
+                        charts[t] = resolved_rows(stack) if t is None else relative_rows(stack, t)
                 factor = np.vstack([factor] + [factor @ a for a in ov[layer]])
                 if factor.shape[0] > d:
                     factor = np.linalg.qr(factor, mode="r")
                 for t in charts:
                     if charts[t].shape[0] < d:
-                        charts[t] = resolved(np.vstack([charts[t]] + [charts[t] @ a for a in ov[layer]]), 0.0, t)[0]
+                        stack = np.vstack([charts[t]] + [charts[t] @ a for a in ov[layer]])
+                        charts[t] = resolved_rows(stack) if t is None else relative_rows(stack, t)
                 entry, sigma = dims(factor)
                 entry.update({"layer": layer, "sigma_over_max_first8": (sigma[:8] / sigma[0]).tolist(),
                               **{f"chart_rank_{t if t else 'eps'}": int(ch.shape[0]) for t, ch in charts.items()}})

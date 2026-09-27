@@ -9,10 +9,10 @@ MLPs are nonlinear; their read directions W_gate diag(g_post), W_up diag(g_post)
 added as extra readouts in the "+mlp" variant.
 
 Three measurements:
-1. rowspace(C) with the state.rs rank rule (resolved_row_space: band = max(m, n) eps sigma_max
-   plus the formation band), plus relative-threshold effective dimensions.
-2. The literal LinearStateQuotient::close closure (orthonormal chart, time-invariant family
-   of all 448 OV maps) at the state.rs band and at relative bands tau sigma_max.
+1. rowspace(C) at the state.rs rank rule (the owner's resolved row space through the MPD
+   surface, ``linear_state_quotient``), plus relative-threshold effective dimensions.
+2. state.rs LinearStateQuotient::close itself (op ``linear_state_quotient``): the orthonormal
+   chart of the time-invariant family of all 448 OV maps, with its measured quotient bounds.
 3. Causal backward closure O_L = O_{L+1} + sum_h O_{L+1} A_{L,h} (+ MLP reads of layer L),
    kept both as an orthonormal chart at a relative band tau and as an unnormalized square-root
    Gramian factor F_L (F_L^T F_L = F_{L+1}^T F_{L+1} + sum_h A^T F_{L+1}^T F_{L+1} A + reads),
@@ -28,9 +28,6 @@ import numpy as np
 import torch
 from safetensors.torch import load_file
 
-EPS = np.finfo(np.float64).eps
-UNIT_ROUNDOFF = EPS / 2
-
 
 
 def compact_json(obj):
@@ -43,9 +40,38 @@ def compact_json(obj):
         return "{\n" + body + "\n}\n"
     return json.dumps(obj, separators=(",", ":")) + "\n"
 
-def growth(operations):
-    scaled = operations * UNIT_ROUNDOFF
-    return scaled / (1.0 - scaled)
+
+def linear_quotient(readouts, transitions=(), chart=None):
+    """state.rs ``LinearStateQuotient`` through the MPD surface (op ``linear_state_quotient``): ``close`` (the
+    readouts' resolved row span closed under the transitions) or, given ``chart``, ``measure`` of that chart.
+    Returns the chart Q (orthonormal rows) and the report, whose SpectralNormBounds certify the quotient."""
+    from gamfit.sae import run_parameter_decomposition
+
+    tensors = {f"readout/{i}": r for i, r in enumerate(readouts)}
+    tensors.update({f"transition/{i}": t for i, t in enumerate(transitions)})
+    declared = {"kind": "close"}
+    if chart is not None:
+        tensors["chart"] = chart
+        declared = {"kind": "declared", "tensor": "chart"}
+    operation = {"kind": "linear_state_quotient", "readouts": [f"readout/{i}" for i in range(len(readouts))],
+                 "transitions": [f"transition/{i}" for i in range(len(transitions))], "chart": declared}
+    out = run_parameter_decomposition({"schema": "gam.mpd-request", "schema_version": 1, "operation": operation},
+                                      tensors)
+    return out.arrays["chart"], out.report["result"]
+
+
+def resolved_rows(matrix):
+    """state.rs's resolved row space of one matrix (sigma > max(m, n) eps sigma_max) as orthonormal rows: the
+    owner's quotient of ``matrix`` under no transitions. ``.shape[0]`` is the rank at the eps band."""
+    return linear_quotient([matrix])[0]
+
+
+def relative_rows(matrix, tau):
+    """Right singular vectors above tau * sigma_max: a numerical conditioning statement, never a rank."""
+    if matrix.shape[0] > 2 * matrix.shape[1]:
+        matrix = np.linalg.qr(matrix, mode="r")
+    _, sigma, vt = np.linalg.svd(matrix, full_matrices=False)
+    return vt[: int((sigma > tau * sigma[0]).sum())]
 
 
 def singular_values(matrix):
@@ -54,53 +80,12 @@ def singular_values(matrix):
     return np.linalg.svd(matrix, compute_uv=False)
 
 
-def resolved(matrix, formation, tau=None):
-    """state.rs resolved_row_space; tau replaces the eps band by tau * sigma_max when given."""
-    if matrix.shape[0] > 2 * matrix.shape[1]:
-        matrix_r = np.linalg.qr(matrix, mode="r")
-    else:
-        matrix_r = matrix
-    _, sigma, vt = np.linalg.svd(matrix_r, full_matrices=False)
-    rows, cols = matrix.shape
-    band = max(rows, cols) * EPS * sigma[0] + formation
-    if tau is not None:
-        band = max(band, tau * sigma[0])
-    rank = int((sigma > band).sum())
-    return vt[:rank], sigma, band, rank
-
-
 def effective(sigma, taus=(1e-2, 1e-3, 1e-6)):
     out = {f"{t:g}": int((sigma > t * sigma[0]).sum()) for t in taus}
     p = sigma**2 / (sigma**2).sum()
     out["entropy_rank"] = float(np.exp(-(p * np.log(p + 1e-300)).sum()))
     out["participation_ratio"] = float((sigma**2).sum() ** 2 / (sigma**4).sum())
     return out
-
-
-def close(chart, transitions, tau):
-    """LinearStateQuotient::close with the chart given (orthonormal rows)."""
-    d = chart.shape[1]
-    steps = []
-    while 0 < chart.shape[0] < d:
-        rank = chart.shape[0]
-        # the stacked candidate [Q; Q A_1; ...] is folded into a d x d R factor in chunks
-        # (same row space and singular values); the band uses the full stacked row count
-        factor = chart
-        formation_sq = 0.0
-        absolute_chart = np.abs(chart)
-        for start in range(0, len(transitions), 16):
-            chunk = transitions[start:start + 16]
-            factor = np.linalg.qr(np.vstack([factor] + [chart @ a for a in chunk]), mode="r")
-            for a in chunk:
-                formation_sq += ((growth(d) * (absolute_chart @ np.abs(a))) ** 2).sum()
-        stacked_rows = (len(transitions) + 1) * rank
-        formation = np.sqrt(formation_sq) + (stacked_rows - d) * EPS * np.linalg.norm(factor, 2)
-        rows, _, band, new_rank = resolved(factor, formation, tau)
-        steps.append({"rank_in": rank, "rank_out": new_rank, "band": float(band)})
-        if new_rank <= rank:
-            break
-        chart = rows
-    return chart, steps
 
 
 def main():
@@ -132,7 +117,8 @@ def main():
     load_s = time.time() - started
 
     # 1. rowspace(C)
-    q_exact, s_c, band_c, rank_c = resolved(readout, 0.0)
+    rank_c = int(resolved_rows(readout).shape[0])
+    s_c = singular_values(readout)
     weak = np.argsort(np.abs(g_final))[:5]
     result = {
         "model": args.model,
@@ -140,13 +126,13 @@ def main():
             "readout": "C = W_U diag(g_final), tied embeddings, RMSNorm normalizer excluded (fixed positive scalar)",
             "transition": "A_{l,h} = W_O[:, h] W_V[h//2] diag(g_in,l); T = I + A; closing under T equals closing under A",
             "mlp_reads": "rows of W_gate diag(g_post), W_up diag(g_post) added as readouts at the post-attention residual",
-            "rank_rule": "state.rs resolved_row_space: sigma > max(m,n) eps sigma_max + formation, formation = "
-                         "sqrt(sum (gamma_d |Q||A|)^2) for closure steps; 'tau' variants use band tau sigma_max",
+            "rank_rule": "state.rs resolved_row_space and LinearStateQuotient::close, called through the MPD surface "
+                         "(linear_state_quotient); 'tau' charts keep the singular directions above tau sigma_max",
             "labels": "rank at the eps band is exact-arithmetic rank to within roundoff (numerical-exact); "
                       "tau and effective dimensions are numerical/conditioning statements",
         },
         "readout": {
-            "shape": list(readout.shape), "band": float(band_c), "rank_at_band": rank_c,
+            "shape": list(readout.shape), "rank_at_band": rank_c,
             "sigma_max": float(s_c[0]), "sigma_min": float(s_c[-1]), "sigma_min_over_max": float(s_c[-1] / s_c[0]),
             "sigma_top5": s_c[:5].tolist(), "sigma_bottom8": s_c[-8:].tolist(),
             "effective": effective(s_c),
@@ -154,38 +140,36 @@ def main():
         },
     }
 
-    # 2. literal time-invariant closure under all OV maps
+    # 2. state.rs's closure under all OV maps (time-invariant family)
     all_ov = [a for layer in ov for a in layer]
-    closures = {}
-    for label, tau in [("eps_band", None), ("tau_1e-2", 1e-2), ("tau_3e-2", 3e-2)]:
-        chart0, _, _, r0 = resolved(readout, 0.0, tau)
-        chart, steps = close(chart0, all_ov, tau)
-        closures[label] = {"rank_C": r0, "rank_closed": chart.shape[0], "steps": steps}
-    # attention-only closure followed by adding every layer's MLP reads, then closing again
-    closures_mlp = {}
-    for label, tau in [("eps_band", None), ("tau_1e-2", 1e-2), ("tau_3e-2", 3e-2)]:
-        stack = np.vstack([readout] + mlp_reads)
-        chart0, _, _, r0 = resolved(stack, 0.0, tau)
-        chart, steps = close(chart0, all_ov, tau)
-        closures_mlp[label] = {"rank_C_plus_mlp_reads": r0, "rank_closed": chart.shape[0], "steps": steps}
-    result["time_invariant_closure"] = {"attention_only": closures, "with_mlp_reads": closures_mlp}
+
+    def closure(readouts):
+        chart, report = linear_quotient(readouts, all_ov)
+        return {"rank_closed": int(chart.shape[0]),
+                "max_quotient_bound": max(b["upper"] for b in report["quotient_bounds"]),
+                "max_readout_bound": max(b["upper"] for b in report["readout_bounds"]),
+                "section_bound": report["section_bounds"]["upper"]}
+    result["time_invariant_closure"] = {
+        "attention_only": {"rank_C": rank_c, **closure([readout])},
+        "with_mlp_reads": {"rank_C_plus_mlp_reads": int(resolved_rows(np.vstack([readout] + mlp_reads)).shape[0]),
+                           **closure([readout] + mlp_reads)}}
 
     # 3. causal backward closure per layer
     per_layer = {"attention_only": [], "with_mlp_reads": []}
     for variant in per_layer:
         factor = np.linalg.qr(readout, mode="r")
-        charts = {tau: resolved(readout, 0.0, tau)[0] for tau in (1e-2, 3e-2)}
+        charts = {tau: relative_rows(readout, tau) for tau in (1e-2, 3e-2)}
         for layer in reversed(range(n_layers)):
             if variant == "with_mlp_reads":
                 factor = np.linalg.qr(np.vstack([factor, mlp_reads[layer]]), mode="r")
                 for tau in charts:
-                    charts[tau] = resolved(np.vstack([charts[tau], mlp_reads[layer] /
-                                                      np.linalg.norm(mlp_reads[layer], 2)]), 0.0, tau)[0]
+                    charts[tau] = relative_rows(np.vstack([charts[tau], mlp_reads[layer] /
+                                                           np.linalg.norm(mlp_reads[layer], 2)]), tau)
             factor = np.linalg.qr(np.vstack([factor] + [factor @ a for a in ov[layer]]), mode="r")
             for tau in charts:
-                charts[tau] = resolved(np.vstack([charts[tau]] + [charts[tau] @ a for a in ov[layer]]), 0.0, tau)[0]
-            _, s, band, rank = resolved(factor, 0.0)
-            _, _, vt = np.linalg.svd(factor)
+                charts[tau] = relative_rows(np.vstack([charts[tau]] + [charts[tau] @ a for a in ov[layer]]), tau)
+            rank = int(resolved_rows(factor).shape[0])
+            _, s, vt = np.linalg.svd(factor)
             per_layer[variant].append({
                 "layer": layer, "rank_at_band": rank, "sigma_min_over_max": float(s[-1] / s[0]),
                 "effective": effective(s),
