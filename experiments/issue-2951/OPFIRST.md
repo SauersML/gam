@@ -215,6 +215,30 @@ Confidently wrong, now design rules:
 - Per-head observability closures are not gauge-invariant when heads share
   patterns; the unit is the routing law.
 
+### 8. Shared routing profiles across heads: absent, but native edits are exact
+`bench/mpd_opfirst_routing_profiles_2951.py`, receipts `opfirst_routing_profiles_*.json`.
+
+Per head `h` and RoPE frequency `ω`, the complex factors `X = q₁ + iq₂`, `Y = k₁ + ik₂`
+give `Z_hω = XY*` and the score `Σ_ω Re(e^{−iωt} xᵀZ_hω y)/√d_h` exactly (checked to 3e-15
+against the model's attention). A shared-profile decomposition across heads and
+frequencies (commuting diagonalizable ratio operators) would give reusable routing
+blocks with exact finite gain and lag edits through the query weights.
+
+- The span of `{Z_hω}` is full in every layer of SmolLM2-135M (288/288) and in Qwen3-0.6B
+  layers 0, 9, 18, 27 (1024/1024), so any shared-profile description needs one block
+  per head × frequency. The square-truncated class test is rejected, with commutators
+  at the level of a Gaussian null.
+- The only structural sharing is the GQA key factor. Sibling query factors align more
+  than chance (median max|cos| 0.1–0.7 vs 0.03–0.05), and one near-shared cluster exists:
+  SmolLM2 layer 18, one GQA group, slow planes 24–29 (wavelengths 35k–214k tokens),
+  three siblings within 6–9% of one profile, holding 42% of that layer's QK energy.
+- Executed on SmolLM2 layers 3, 15 and 27: a finite gain and lag edit of one head's
+  frequency through `W_Q` gives scores equal to `g·Re(e^{−iω(t+δ)}Z)` to 1e-15, with other
+  heads unchanged. The sharp softmax bound TV ≤ tanh(w/4) and the payload-diameter
+  output bound held on every row, and the latter is attained on two-key rows.
+- On Qwen3 the edit is not exact: the per-head q-norm rescales the query by an RMS
+  that the edit changes.
+
 ## What this says about method
 
 - Deletion-based sparsity and exact rank are the wrong primary objects: exact
