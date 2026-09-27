@@ -826,7 +826,7 @@ fn score_line(score: &FamilyScore) -> String {
 
 /// The decoded basis `U_S` (`d × 2|S|`) of a program: the encoder sent `U_Sᵀ` row-major.
 fn decoded_basis(values: &[f64], width: usize) -> Result<Array2<f64>, String> {
-    if values.len() % width != 0 {
+    if !values.len().is_multiple_of(width) {
         return Err(format!("{} decoded reals are not a whole number of {width}-rows", values.len()));
     }
     let transposed = Array2::from_shape_vec((values.len() / width, width), values.to_vec())

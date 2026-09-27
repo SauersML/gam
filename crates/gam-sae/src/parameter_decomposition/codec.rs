@@ -92,6 +92,12 @@ pub struct BitString {
     len_bits: u64,
 }
 
+impl Default for BitString {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BitString {
     pub fn new() -> Self {
         Self {
@@ -114,10 +120,10 @@ impl BitString {
         if offset == 0 {
             self.bytes.push(0);
         }
-        if bit {
-            if let Some(last) = self.bytes.last_mut() {
-                *last |= 0x80 >> offset;
-            }
+        if bit
+            && let Some(last) = self.bytes.last_mut()
+        {
+            *last |= 0x80 >> offset;
         }
         self.len_bits += 1;
     }
@@ -608,12 +614,12 @@ pub fn encode_subset(
             pair[0], pair[1]
         )));
     }
-    if let Some(&largest) = elements.last() {
-        if largest >= universe {
-            return Err(CodecError::InvalidInput(format!(
-                "element {largest} is outside a universe of {universe}"
-            )));
-        }
+    if let Some(&largest) = elements.last()
+        && largest >= universe
+    {
+        return Err(CodecError::InvalidInput(format!(
+            "element {largest} is outside a universe of {universe}"
+        )));
     }
     let cardinality = elements.len() as u64;
     encode_prefix_integer(out, cardinality + 1)?;

@@ -701,7 +701,7 @@ mod tests {
     ) -> Array2<f64> {
         let growth =
             accumulation_growth(factor.components() + factor.read().ncols() + 1 + additions);
-        (magnitude(factor, mask, inputs) + &shift) * (growth / (1.0 - growth))
+        (magnitude(factor, mask, inputs) + shift) * (growth / (1.0 - growth))
     }
 
     fn violations(gap: &Array2<f64>, band: &Array2<f64>) -> usize {

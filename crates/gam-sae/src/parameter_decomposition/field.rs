@@ -1208,7 +1208,7 @@ mod tests {
         let witness = best.witness;
         let mask = binary_mask(witness);
         assert!(
-            best.value > 0.0 && mask.iter().any(|&m| m == 0.0),
+            best.value > 0.0 && mask.contains(&0.0),
             "the witness {mask:?} deletes an instance (R = {})",
             best.value
         );

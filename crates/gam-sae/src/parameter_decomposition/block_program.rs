@@ -508,7 +508,7 @@ mod tests {
         values.iter().map(|value| value.to_bits()).collect()
     }
 
-    fn slot<'a>(execution: &'a Execution, stage: LayerStage) -> &'a Array2<f64> {
+    fn slot(execution: &Execution, stage: LayerStage) -> &Array2<f64> {
         execution.slots[stage.slot().index()]
             .as_ref()
             .expect("every stage slot is written")
@@ -520,11 +520,11 @@ mod tests {
             .iter()
             .map(|&stage| {
                 let expected: &Array2<f64> = match stage {
-                    LayerStage::Queries => &*layer.queries,
-                    LayerStage::Keys => &*layer.keys,
-                    LayerStage::Values => &*layer.values,
+                    LayerStage::Queries => &layer.queries,
+                    LayerStage::Keys => &layer.keys,
+                    LayerStage::Values => &layer.values,
                     LayerStage::Mixed => &layer.attention.mixed,
-                    LayerStage::Write => &*layer.write,
+                    LayerStage::Write => &layer.write,
                 };
                 (stage, bits(slot(execution, stage)) == bits(expected))
             })

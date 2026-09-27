@@ -840,7 +840,7 @@ impl PlaneRotation {
     /// An accepted basis keeps its measured defect `δ ≤ floor`. Every identity of the
     /// module holds for this edit up to `δ` (see [`RotationPath::Angle`]).
     pub fn new(basis: Array2<f64>, angles: Array1<f64>) -> Result<Self, OperatorRefusal> {
-        if basis.ncols() % 2 != 0 {
+        if !basis.ncols().is_multiple_of(2) {
             return Err(OperatorRefusal::OddPlaneBasis {
                 columns: basis.ncols(),
             });
@@ -907,7 +907,7 @@ impl PlaneRotation {
 
     /// `x + Δ x` along `path`.
     pub fn apply(&self, path: RotationPath, x: ArrayView1<'_, f64>) -> Result<Array1<f64>, OperatorRefusal> {
-        Ok(self.apply_delta(path, x)? + &x)
+        Ok(self.apply_delta(path, x)? + x)
     }
 
     /// This rotation read along `path` as a [`ResidualEdit`].
@@ -1001,7 +1001,7 @@ pub struct ComposeTerms {
 impl ComposeTerms {
     /// `x + Δ_A x + Δ_B x`: the Sum of the two edits, which omits the cross term.
     pub fn sum(&self, x: ArrayView1<'_, f64>) -> Array1<f64> {
-        &self.first + &self.second + &x
+        &self.first + &self.second + x
     }
 
     /// `x + Δ_A x + Δ_B x + Δ_A Δ_B x`: the Compose.

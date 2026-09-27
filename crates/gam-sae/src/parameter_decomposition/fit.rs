@@ -1800,7 +1800,7 @@ mod tests {
         let d_moments = direction(&data.moments);
         let d_inputs = direction(&data.inputs);
         let d_responses = direction(&data.responses);
-        let d_right: Vec<Array2<f64>> = data.right.iter().map(|factor| direction(factor)).collect();
+        let d_right: Vec<Array2<f64>> = data.right.iter().map(direction).collect();
         let step = f64::EPSILON.cbrt();
         let criterion = |moments: &Array2<f64>, inputs: &Array2<f64>, right: &[Array2<f64>], responses: &Array2<f64>| {
             block_criterion_at(rho.view(), moments, inputs, right, responses, &penalties)

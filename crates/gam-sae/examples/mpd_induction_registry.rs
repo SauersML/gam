@@ -545,11 +545,10 @@ fn main() -> Result<(), String> {
             }
             None => None,
         };
-        if let Some(record) = &record {
-            if record.registry() != fingerprint {
+        if let Some(record) = &record
+            && record.registry() != fingerprint {
                 return Err(format!("setting {}: the record was checked against a different registry", setting.name));
             }
-        }
         let mut tallies: [Tally; 3] = Default::default();
         let mut attention: Vec<AttentionTally> = (0..config.n_layers).map(|_| AttentionTally::default()).collect();
         for sequence in 0..execute.sequences {
@@ -577,7 +576,7 @@ fn main() -> Result<(), String> {
             let executed = ExecutedExperiment {
                 readouts: stage_ids
                     .iter()
-                    .map(|id| rows_of(*id, index, sequence))
+                    .map(|id| rows_of(id, index, sequence))
                     .collect(),
                 roundoff: ForwardRoundoff::Unresolved,
             };

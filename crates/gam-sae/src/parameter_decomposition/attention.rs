@@ -624,7 +624,7 @@ impl RotaryCausalAttention {
         rotary: RotaryEmbedding,
         score_scale: f64,
     ) -> Result<Self, AttentionProgramError> {
-        if geometry.n_kv_heads == 0 || geometry.n_heads % geometry.n_kv_heads != 0 {
+        if geometry.n_kv_heads == 0 || !geometry.n_heads.is_multiple_of(geometry.n_kv_heads) {
             return Err(AttentionProgramError::KeyValueHeadsDoNotDivide {
                 n_heads: geometry.n_heads,
                 n_kv_heads: geometry.n_kv_heads,
@@ -1639,7 +1639,7 @@ mod tests {
                 return (sum, 3.0 * terms as f64 * QUAD_UNIT * largest + next.0.abs());
             }
             term = next;
-            sum = sum + term;
+            sum += term;
             largest = largest.max(term.0.abs());
             terms += 1;
         }
@@ -1667,7 +1667,7 @@ mod tests {
                     (sum, sum.0 * relative)
                 };
             }
-            sum = sum + term;
+            sum += term;
             terms += 1;
         }
     }

@@ -1504,14 +1504,14 @@ impl NormedRotaryQueryKey {
             let coincident = self.coincident(plane);
             let turns = change.quarter_turns.column(plane);
             let odd = turns.iter().next().is_some_and(|&turn| turn % 2 == 1);
-            if !coincident {
-                if let Some(kv) = turns.iter().position(|&turn| (turn % 2 == 1) != odd) {
-                    return Err(GaugeRefusal::NotInGroup {
-                        what: "quarter turns of both parities on a plane whose gains are not coincident",
-                        index: kv * planes + plane,
-                        value: f64::from(turns[kv]),
-                    });
-                }
+            if !coincident
+                && let Some(kv) = turns.iter().position(|&turn| (turn % 2 == 1) != odd)
+            {
+                return Err(GaugeRefusal::NotInGroup {
+                    what: "quarter turns of both parities on a plane whose gains are not coincident",
+                    index: kv * planes + plane,
+                    value: f64::from(turns[kv]),
+                });
             }
             let swap = !coincident && odd;
             let scale = change.plane_scales[plane];
@@ -1788,7 +1788,7 @@ impl ResidualReflections {
         require_nonzero_gain(gain, self.vectors.nrows())?;
         check_len("normed read columns", gain.len(), read.ncols())?;
         let scaled = &read * &gain;
-        Ok(self.carry_read(scaled.view())? / &gain)
+        Ok(self.carry_read(scaled.view())? / gain)
     }
 
     /// `diag(w) Q diag(w)⁻¹ β` for a LayerNorm bias `β` with gain `w`, so the carried
@@ -1798,7 +1798,7 @@ impl ResidualReflections {
         require_nonzero_gain(gain, self.vectors.nrows())?;
         check_len("norm bias length", gain.len(), bias.len())?;
         let unscaled = &bias / &gain;
-        Ok(self.apply(unscaled.view())? * &gain)
+        Ok(self.apply(unscaled.view())? * gain)
     }
 }
 
@@ -2543,7 +2543,7 @@ mod tests {
         };
         let nu = 1.0 / (g.mapv(|entry| entry * entry).mean().expect("nonempty") + epsilon).sqrt();
         let token_norm = token.dot(&token).sqrt();
-        let bias_norm = bias.map_or(0.0, |bias| norm(bias));
+        let bias_norm = bias.map_or(0.0, norm);
         let majorant = largest * nu * token_norm + bias_norm;
         let factor = kappa * (2.0 * kappa * (delta_q + 2.0 * gamma_one) + delta_q + 3.0 * normalizer + inner)
             + 3.0 * normalizer

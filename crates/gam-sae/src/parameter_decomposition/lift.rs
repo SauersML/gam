@@ -540,7 +540,7 @@ impl<'a> ResidualAnchor<'a> {
         self.block_ranks
             .iter()
             .zip(beta)
-            .flat_map(|block| std::iter::repeat(*block.1).take(*block.0))
+            .flat_map(|block| std::iter::repeat_n(*block.1, *block.0))
             .collect()
     }
 
@@ -1433,7 +1433,7 @@ mod tests {
         // `anchor_agreement`) and subtracts the teacher once.
         let components = vectors.nrows();
         let edit_depth = components + 2 + 1 + rank;
-        let reference_depth = (2 + 1).max(3) + components * blocks.len() + 1;
+        let reference_depth = 3 + components * blocks.len() + 1;
         let band = absolute_edit_magnitude(&native, &blocks, &vectors, &mask)
             * (accumulation_growth(edit_depth) + accumulation_growth(reference_depth));
         assert!(
