@@ -110,6 +110,16 @@ writes.
   1.04× that of a random split of the same sizes, and an empirical replacement
   error of about 26% of the output change.
 
+- A direct search at fixed rank improves the certified bound by only about 20%
+  over a twin layer whose unit directions are redrawn at random, and does not
+  improve the measured replacement error (37–73% of the output change).
+- The certified bound is about 1000× looser than the function: its scale
+  `‖A‖ + κΣ‖C_j‖` is 409–1261 while the measured Lipschitz ratio is 0.13–0.94,
+  because thousands of unit terms cancel. A usable certificate has to account
+  for that cancellation (conditioned on data or on which units are active).
+- Merging units with opposite affine forms adds their write vectors, since `ψ` is
+  even; only the linear part `A` carries the sign.
+
 Trained GELU MLP blocks contain no parallel modules in the replacement sense.
 Exact module splitting is a diagnostic, not a target.
 
