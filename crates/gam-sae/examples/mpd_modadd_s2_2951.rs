@@ -109,6 +109,7 @@ use gam_sae::parameter_decomposition::precision::{
 use gam_sae::parameter_decomposition::receipts::evaluation_band;
 use gam_sae::parameter_decomposition::rewrite::NativeMlp;
 use gam_sae::parameter_decomposition::seed::RankRevealingRead;
+use gam_sae::parameter_decomposition::verify::{RowValue, certified_argmax, computed_argmax, exhaustive_supremum};
 use gam_sae::parameter_decomposition::codec::PaddedPacketCode;
 use gam_sae::parameter_decomposition::supports::{
     BoxDivergence, BoxEnclosure, BoxFamily, BoxOracleError, BoxSeparationOracle, ComponentSet,
@@ -296,13 +297,9 @@ struct Logits {
     radius: Vec<f64>,
 }
 
-/// The first index of the largest value.
+/// The first index of the largest value, as the verifier reads it.
 fn argmax(values: &[f64]) -> usize {
-    values
-        .iter()
-        .enumerate()
-        .fold((0, f64::NEG_INFINITY), |best, (index, &value)| if value > best.1 { (index, value) } else { best })
-        .0
+    computed_argmax(ArrayView1::from(values))
 }
 
 /// Every entry has the same bits.
@@ -625,14 +622,8 @@ struct RowComparison {
 }
 
 /// The computed argmax is the exact one when its lower end clears every other logit's upper end.
-fn certified_argmax((values, radii): (&[f64], &[f64])) -> bool {
-    let top = argmax(values);
-    let floor = values[top] - radii[top];
-    values
-        .iter()
-        .zip(radii)
-        .enumerate()
-        .all(|(index, (value, radius))| index == top || floor.next_down() > up(value + radius))
+fn certified((values, radii): (&[f64], &[f64])) -> bool {
+    certified_argmax(ArrayView1::from(values), ArrayView1::from(radii))
 }
 
 /// Compare every executed row with its reference; the KL bound only when `with_kl`.
@@ -663,7 +654,7 @@ fn compare_rows(executed: &Rows, reference: &Rows, family: &Family, with_kl: boo
             Ok(RowComparison {
                 kl,
                 disagrees: argmax(edited.0) != argmax(native.0),
-                certified: certified_argmax(edited) && certified_argmax(native),
+                certified: certified(edited) && certified(native),
             })
         })
         .collect()
@@ -672,44 +663,14 @@ fn compare_rows(executed: &Rows, reference: &Rows, family: &Family, with_kl: boo
 /// The exhaustive maximum of the per-row KL bound: `Exact` with the largest value and the largest
 /// error, or `Unresolved` when some row's boxes are too wide for the bound.
 fn kl_status(rows: &[RowComparison], executed: &Rows, family: &Family) -> Result<EvidenceStatus<Witness, Family>, String> {
-    let cardinality = rows.len() as u64;
-    let mut largest: Option<(usize, f64)> = None;
-    let mut error = 0.0_f64;
-    let mut lower: Option<(usize, f64)> = None;
-    let mut unresolved = 0usize;
-    for (index, row) in rows.iter().enumerate() {
-        match row.kl {
-            Some((value, numerical_error)) => {
-                if largest.is_none_or(|(_, best)| value > best) {
-                    largest = Some((index, value));
-                }
-                error = error.max(numerical_error);
-                let attained = (value - numerical_error).next_down().max(0.0);
-                if lower.is_none_or(|(_, best)| attained > best) {
-                    lower = Some((index, attained));
-                }
-            }
-            None => unresolved += 1,
-        }
-    }
-    let witness = |index: usize| executed.witnesses[index];
-    match (unresolved, largest) {
-        (0, Some((index, value))) => EvidenceStatus::exact(
-            value,
-            error,
-            ExactBasis::Exhaustive { cardinality },
-            Some(witness(index)),
-            family.clone(),
-        ),
-        _ => EvidenceStatus::unresolved(
-            lower.map_or(0.0, |(_, value)| value),
-            f64::INFINITY,
-            Extremum::Supremum,
-            lower.map(|(index, _)| witness(index)),
-            family.clone(),
-        ),
-    }
-    .map_err(|error| error.to_string())
+    let values = rows.iter().zip(&executed.witnesses).map(|(row, witness)| {
+        let value = match row.kl {
+            Some((value, numerical_error)) => RowValue::Resolved { value, numerical_error },
+            None => RowValue::Unresolved { lower: 0.0 },
+        };
+        (*witness, value)
+    });
+    exhaustive_supremum(values, None, family.clone()).map_err(|error| error.to_string())
 }
 
 /// The exact fraction of rows whose computed argmax differs from the reference's: a count on the

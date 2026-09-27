@@ -158,6 +158,12 @@ pub mod rewrite;
 // The component MLP block as a mechanism program, bound to its own tensors.
 pub mod rewrite_program;
 
+// Forward-error bands of a traced program execution under dense parameters.
+pub mod replay;
+
+// Exhaustive verification of an explanation against the native model over a declared finite family.
+pub mod verify;
+
 // Exact two-endpoint finite-change operators: softmax, RMSNorm, bilinear products, gated activations.
 pub mod secant;
 

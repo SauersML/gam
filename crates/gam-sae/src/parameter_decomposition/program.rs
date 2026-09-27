@@ -1119,6 +1119,74 @@ impl Program {
     }
 }
 
+/// Every node value one execution formed, keyed by the invocation path of the body
+/// that ran, the body and the node, each under its own memory reservation. A body
+/// that did not run (a skipped composition stage, the refinement body not carried)
+/// has no entries.
+#[derive(Debug, Default)]
+pub struct ExecutionTrace {
+    values: BTreeMap<(Vec<CallSite>, BodyId, NodeId), Governed<Array2<f64>>>,
+}
+
+impl ExecutionTrace {
+    /// The value node `node` of body `body` formed at the invocation `invocation`.
+    pub fn value(&self, invocation: &[CallSite], body: BodyId, node: NodeId) -> Option<&Array2<f64>> {
+        self.values.get(&(invocation.to_vec(), body, node)).map(|value| &**value)
+    }
+
+    /// Whether body `body` ran at the invocation `invocation`.
+    pub fn ran(&self, invocation: &[CallSite], body: BodyId) -> bool {
+        self.value(invocation, body, NodeId(0)).is_some()
+    }
+}
+
+impl Program {
+    /// Runs like [`Program::execute`] and also returns every node value the execution
+    /// formed, bit for bit the values the executor carried.
+    pub fn execute_traced<S: ParameterSource>(
+        &self,
+        governor: &MemoryGovernor,
+        source: &S,
+        masks: &MaskAssignment,
+        inputs: Vec<Array2<f64>>,
+        slots: Vec<Option<Array2<f64>>>,
+        positions: &[i64],
+    ) -> Result<(Execution, ExecutionTrace), ExecutionError<S::Error>> {
+        let mut executor = Executor::new(self, governor, source, masks, slots, positions, false)?;
+        executor.trace = Some(ExecutionTrace::default());
+        let output = executor.run(inputs)?;
+        let trace = executor.trace.take().unwrap_or_default();
+        Ok((Execution { output, slots: executor.slots }, trace))
+    }
+}
+
+/// The value of the deepest scope among `scoped` that prefixes `path`, or `1`.
+fn deepest_scoped_value<'s>(scoped: impl Iterator<Item = (&'s [CallSite], f64)>, path: &[CallSite]) -> f64 {
+    let mut value = 1.0;
+    let mut deepest: Option<usize> = None;
+    for (scope, assigned) in scoped {
+        if path.starts_with(scope) && deepest.is_none_or(|depth| scope.len() > depth) {
+            value = assigned;
+            deepest = Some(scope.len());
+        }
+    }
+    value
+}
+
+impl Program {
+    /// The value `masks` gives `control` at the invocation `path`: its group's deepest
+    /// applicable scoped value, or `1`, as the executor resolves it.
+    pub fn control_value(&self, masks: &MaskAssignment, control: ControlId, path: &[CallSite]) -> Result<f64, ProgramError> {
+        let group = *self.control_group.get(control.index()).ok_or(ProgramError::UnknownControl { control })?;
+        let scoped = masks
+            .entries
+            .iter()
+            .filter(|entry| entry.group == group)
+            .map(|entry| (entry.scope.as_slice(), entry.value));
+        Ok(deepest_scoped_value(scoped, path))
+    }
+}
+
 /// A node's value in the executor, under the memory reservation that accounts for it:
 /// a Linear product under the reservation of the source that formed it, and every
 /// other value under one the executor takes before the value is formed. Values are
@@ -1150,6 +1218,7 @@ struct Executor<'a, S> {
     slot_reservations: Vec<Option<MemoryReservation>>,
     positions: &'a [i64],
     residuals: Option<Vec<RefinementResidual>>,
+    trace: Option<ExecutionTrace>,
 }
 
 impl<'a, S: ParameterSource> Executor<'a, S> {
@@ -1192,6 +1261,7 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
             slot_reservations,
             positions,
             residuals: record_residuals.then(Vec::new),
+            trace: None,
         })
     }
 
@@ -1209,17 +1279,7 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
     /// applicable scoped value, or `1`.
     fn resolve(&self, control: ControlId, path: &[CallSite]) -> f64 {
         let group = self.program.control_group[control.index()];
-        let mut value = 1.0;
-        let mut deepest: Option<usize> = None;
-        if let Some(scoped) = self.masks.get(&group) {
-            for &(scope, assigned) in scoped {
-                if path.starts_with(scope) && deepest.is_none_or(|depth| scope.len() > depth) {
-                    value = assigned;
-                    deepest = Some(scope.len());
-                }
-            }
-        }
-        value
+        deepest_scoped_value(self.masks.get(&group).into_iter().flatten().copied(), path)
     }
 
     /// Whether a scoped value of `control`'s group applies at `path`.
@@ -1391,6 +1451,10 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
                     refined?
                 }
             };
+            if let Some(trace) = self.trace.as_mut() {
+                let copy = governed_copy(self.governor, &value)?;
+                trace.values.insert((path.clone(), body_id, node_id), copy);
+            }
             for argument in node.arguments() {
                 let count = &mut remaining[argument.index()];
                 *count -= 1;
@@ -2032,6 +2096,11 @@ impl DenseParameters {
     /// Binds formal parameter `k` to `tensors[k]`.
     pub fn new(tensors: Vec<DenseTensor>) -> Self {
         Self { tensors }
+    }
+
+    /// The dense tensor bound to `parameter`, if any.
+    pub fn bound(&self, parameter: ParameterSlot) -> Option<&DenseTensor> {
+        self.tensors.get(parameter.index())
     }
 
     fn tensor(&self, parameter_use: ParameterUse<'_>) -> Result<&DenseTensor, DenseParameterError> {
