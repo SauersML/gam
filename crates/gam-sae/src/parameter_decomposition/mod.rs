@@ -124,6 +124,9 @@ pub mod fit;
 // Exact masked rewrites of gated units, norms, biases and residual edges.
 pub mod gated_rewrite;
 
+// Exact canonical gauge forms of a native decoder layer, executed against the native layer.
+pub mod canonical;
+
 // Tensor registry and the exact residual anchor.
 pub mod lift;
 
