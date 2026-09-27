@@ -161,6 +161,9 @@ pub mod rewrite;
 // The component MLP block as a mechanism program, bound to its own tensors.
 pub mod rewrite_program;
 
+// Exact finite-change accounting through a program: per-source contributions summing to the direct change.
+pub mod accounting;
+
 // Forward-error bands of a traced program execution under dense parameters.
 pub mod replay;
 

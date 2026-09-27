@@ -738,6 +738,24 @@ impl RotaryCausalAttention {
         HeadRows { value, radius }
     }
 
+    /// The source's rotation of every head of `rows` (`tokens × heads·head_dim`) at each
+    /// token's absolute position, with the radius the attention carries for it: the
+    /// rows' own radius, the trigonometric input error and the rotation's rounding. The
+    /// rotation is linear, so a change of rows rotates as rows do.
+    pub fn rotate_heads(
+        &self,
+        rows: ProjectedRows<'_>,
+        positions: &[i64],
+        heads: usize,
+    ) -> Result<(Array2<f64>, Array2<f64>), AttentionProgramError> {
+        self.check_positions(positions)?;
+        let shape = (positions.len(), heads * self.geometry.head_dim);
+        expect_shape("rotated rows", rows.values.dim(), shape)?;
+        expect_shape("rotated rows", rows.radius.dim(), shape)?;
+        let rotated = self.rotate(rows, positions, heads);
+        Ok((rotated.value, rotated.radius))
+    }
+
     /// The source's causal mask and joint softmax at given scores: for each head
     /// and query token `t`, one categorical distribution over the keys `s ≤ t`,
     /// with the radius [`RotaryCausalAttention::attend_projected`] carries. Scores

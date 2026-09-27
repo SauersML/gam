@@ -354,6 +354,16 @@ impl SoftmaxSecant {
         Ok(self.apply_with_radii(direction, &vec![0.0; direction.len()]))
     }
 
+    /// `A δ` for a `δ` known only within `radii` of exact, in `O(n)`: the bands also cover
+    /// every `δ` in that box.
+    pub fn apply_within(&self, direction: &[f64], radii: &[f64]) -> Result<BandedVector, SecantError> {
+        require_length("direction", self.means.len(), direction.len())?;
+        require_length("direction radii", self.means.len(), radii.len())?;
+        require_finite("direction", direction.iter().copied())?;
+        require_finite("direction radii", radii.iter().copied())?;
+        Ok(self.apply_with_radii(direction, radii))
+    }
+
     /// `A δ` for a `δ` known within `radii`. `ℓᵀδ` errs by `accumulation_band(n, Σ|ℓ_iδ_i|)` plus the propagated
     /// `Σ(band_i|δ_i| + ℓ_i r_i)`; `c` adds `|c|·band_s/s` and one quotient rounding; `ℓ_i(δ_i − c)` adds its factors'
     /// bands and two roundings.
@@ -464,6 +474,16 @@ impl RmsNormSecant {
         require_length("direction", self.midpoint.len(), direction.len())?;
         require_finite("direction", direction.iter().copied())?;
         Ok(self.apply_with_radii(direction, &vec![0.0; direction.len()]))
+    }
+
+    /// `B Δ` for a `Δ` known only within `radii` of exact, in `O(d)`: the bands also cover
+    /// every `Δ` in that box.
+    pub fn apply_within(&self, direction: &[f64], radii: &[f64]) -> Result<BandedVector, SecantError> {
+        require_length("direction", self.midpoint.len(), direction.len())?;
+        require_length("direction radii", self.midpoint.len(), radii.len())?;
+        require_finite("direction", direction.iter().copied())?;
+        require_finite("direction radii", radii.iter().copied())?;
+        Ok(self.apply_with_radii(direction, radii))
     }
 
     /// `N(end) − N(start) = B·fl(end − start)`, the subtraction's rounding carried as a radius.
