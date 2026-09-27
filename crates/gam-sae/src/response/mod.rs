@@ -15,4 +15,5 @@ pub mod compose;
 pub mod compile;
 pub mod hermite;
 pub mod interaction;
+pub mod finite_grid;
 pub mod tiles;
