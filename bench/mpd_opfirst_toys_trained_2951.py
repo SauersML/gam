@@ -57,6 +57,50 @@ NUMERIC_OWNERS = (
     "(surface.rs exposes recover_plane_rotations and mlp_block_receipt only)")
 
 
+# LAPACK backend for the Pi / E_p eigen-computations. torch on macOS arm64 links Accelerate for LAPACK even in the
+# OpenBLAS venv, and Accelerate is reported to return wrong results on rank-deficient SVD/QR/eigh; --linalg scipy routes
+# every eigh/SVD/QR of the proposer and nulls through scipy.linalg (OpenBLAS in ~/mpd-data/venv).
+LINALG = "torch"
+
+
+def eigh(M):
+    if LINALG == "scipy":
+        from scipy.linalg import eigh as sp_eigh
+        ev, V = sp_eigh(M.detach().numpy(), check_finite=True)
+        return torch.from_numpy(ev), torch.from_numpy(V)
+    return torch.linalg.eigh(M)
+
+
+def svd(M):
+    if LINALG == "scipy":
+        from scipy.linalg import svd as sp_svd
+        Us, sv, Vt = sp_svd(M.detach().numpy(), full_matrices=False, check_finite=True)
+        return torch.from_numpy(Us), torch.from_numpy(sv), torch.from_numpy(Vt)
+    return torch.linalg.svd(M, full_matrices=False)
+
+
+def qr(M):
+    if LINALG == "scipy":
+        from scipy.linalg import qr as sp_qr
+        Qm, Rm = sp_qr(M.detach().numpy(), mode="economic", check_finite=True)
+        return torch.from_numpy(Qm), torch.from_numpy(Rm)
+    return torch.linalg.qr(M)
+
+
+def env_record():
+    import platform
+    rec = {"python": platform.python_version(), "executable": sys.executable, "torch": torch.__version__,
+           "numpy": np.__version__, "linalg_backend": LINALG}
+    try:
+        cfg = np.show_config(mode="dicts")["Build Dependencies"]
+        rec["numpy_blas"], rec["numpy_lapack"] = cfg["blas"]["name"], cfg["lapack"]["name"]
+    except Exception as exc:  # older numpy
+        rec["numpy_blas"] = "unknown (%s)" % type(exc).__name__
+    show = torch.__config__.show()
+    rec["torch_lapack"] = "accelerate" if "LAPACK_INFO=accelerate" in show else ("mkl" if "USE_MKL=ON" in show else "other")
+    return rec
+
+
 class ReluMlp(Mlp):
     kappa = 0.5
 
@@ -144,9 +188,14 @@ PI_FRACS = (1 / 16, 1 / 8, 1 / 4, 3 / 8, 1 / 2)
 
 def read_basis(W):
     """W = U T with U orthonormal on ran W (rank-revealing: SVD in place of the Pythia probe's QR, same Pi and E*)."""
-    Us, sv, Vt = torch.linalg.svd(W, full_matrices=False)
+    Us, sv, Vt = svd(W)
     r = int((sv > 1e-10 * sv[0]).sum())
-    return Us[:, :r], sv[:r, None] * Vt[:r]
+    U = Us[:, :r]
+    # canonical column signs (largest-magnitude entry positive): LAPACKs differ in SVD signs, and the proposer's
+    # random-subspace starts are drawn in these coordinates, so without this the search depends on the backend
+    sg = torch.sign(U.gather(0, U.abs().argmax(0, keepdim=True))).flatten()
+    sg[sg == 0] = 1.0
+    return U * sg, (sg[:, None] * sv[:r, None]) * Vt[:r]
 
 
 def dense_proposals(U, T, n_vec, fracs):
@@ -178,8 +227,12 @@ def pi_best(U, T, n_vec=3):
 
 
 def pi_replace(mlp, U, T, mask, X):
-    """Execute the exactly separated reads: rel. squared change of F on X (vs the variance of F)."""
-    _, What = pi_split(U, T, mask)
+    """Execute the exactly separated reads: rel. squared change of F on X (vs the variance of F). The reads are
+    pi_split's (P = eigenvectors of U_S^T U_S above 1/2), computed through the dispatched eigh."""
+    lam, V = eigh(U[mask].T @ U[mask])
+    Vp = V[:, lam > 0.5]
+    Pp = Vp @ Vp.T
+    What = torch.where(mask[:, None], U @ Pp, U - U @ Pp) @ T
     Mh = type(mlp)(What, mlp.b_in, mlp.W_out, mlp.b_out)
     F, Fh = mlp.direct(X), Mh.direct(X)
     return float(((Fh - F) ** 2).sum() / ((F - F.mean(0)) ** 2).sum()), Mh
@@ -793,7 +846,7 @@ PROPOSER_POLISH = 0
 
 
 def e_star_eig(M):
-    lam, V = torch.linalg.eigh(0.5 * (M + M.T))
+    lam, V = eigh(0.5 * (M + M.T))
     lc = lam.clamp(0, 1)
     return float(torch.minimum(lc, 1 - lc).sum()), int((lam > 0.5).sum()), lam, V
 
@@ -839,7 +892,7 @@ def local_search(U, mask, p, max_single=PROPOSER_POLISH, max_iter=100000):
     r = U.shape[1]
     sgn = torch.ones(r, dtype=U.dtype)
     sgn[r - p:] = -1.0
-    lam, V = torch.linalg.eigh(U[mask].T @ U[mask])
+    lam, V = eigh(U[mask].T @ U[mask])
     E = e_p(lam, p)
     moves = 0
     for _ in range(max_iter):
@@ -854,7 +907,7 @@ def local_search(U, mask, p, max_single=PROPOSER_POLISH, max_iter=100000):
         for ix in trials:
             m2 = mask.clone()
             m2[ix] = ~m2[ix]
-            lam2, V2 = torch.linalg.eigh(U[m2].T @ U[m2])
+            lam2, V2 = eigh(U[m2].T @ U[m2])
             E2 = e_p(lam2, p)
             if E2 < E - 1e-13 * max(E, 1.0):
                 ok = (m2, E2, lam2, V2, len(ix))
@@ -869,7 +922,7 @@ def local_search(U, mask, p, max_single=PROPOSER_POLISH, max_iter=100000):
 def laplacian_vectors(U, n_vec):
     """Fiedler vectors of the Pi^2 Laplacian by dense eigh (the probe's Lanczos pi_fiedler does not always converge)."""
     Pi2 = (U @ U.T).pow(2)
-    return torch.linalg.eigh(torch.diag(Pi2.sum(1)) - Pi2)[1][:, 1:n_vec + 1]
+    return eigh(torch.diag(Pi2.sum(1)) - Pi2)[1][:, 1:n_vec + 1]
 
 
 def propose(U, p_list, gen, n_vec=3, n_rand=PROPOSER_RANDOM_STARTS, n_subspace=PROPOSER_SUBSPACE_STARTS,
@@ -890,11 +943,11 @@ def propose(U, p_list, gen, n_vec=3, n_rand=PROPOSER_RANDOM_STARTS, n_subspace=P
     for p in p_list:
         starts = [(name, start_at_rank(U, o, p)) for name, o in orders]
         for j in range(n_subspace):  # K-subspaces style: units by their read share in a random rank-p subspace
-            Qr = torch.linalg.qr(torch.randn(r, p, generator=gen, dtype=U.dtype))[0]
+            Qr = qr(torch.randn(r, p, generator=gen, dtype=U.dtype))[0]
             share = (U @ Qr).pow(2).sum(1) / U.pow(2).sum(1).clamp_min(1e-300)
             starts.append(("subspace%d" % j, share > p / r))
         for name, m0 in starts:
-            E0 = e_p(torch.linalg.eigvalsh(U[m0].T @ U[m0]), p)
+            E0 = e_p(eigh(U[m0].T @ U[m0])[0], p)
             m, E, p_half, moves = local_search(U, m0, p)
             if p not in best or E < best[p]["E"]:
                 best[p] = {"E": E, "E_over_r": E / r, "start": name, "start_E_over_r": E0 / r, "moves": moves,
@@ -924,7 +977,7 @@ def leverage_null(U, gen, iters=300, tol=1e-8):
     G = torch.randn(U.shape, generator=gen, dtype=F64)
     for _ in range(iters):
         G = G * (h.sqrt() / G.norm(dim=1).clamp_min(1e-300))[:, None]
-        ev, V = torch.linalg.eigh(G.T @ G)
+        ev, V = eigh(G.T @ G)
         G = G @ (V * ev.clamp_min(1e-300).rsqrt()) @ V.T
         if float((G.pow(2).sum(1) - h).abs().max() / h.max()) < tol:
             break
@@ -933,7 +986,7 @@ def leverage_null(U, gen, iters=300, tol=1e-8):
 
 def isotropic_twin_U(W, gen):
     """Read norms kept, directions isotropic within the read row space (so a rank-deficient W keeps its rank)."""
-    _, sv, Vt = torch.linalg.svd(W, full_matrices=False)
+    _, sv, Vt = svd(W)
     Vr = Vt[: int((sv > 1e-10 * sv[0]).sum())]
     G = torch.randn(W.shape[0], Vr.shape[0], generator=gen, dtype=F64) @ Vr
     return read_basis(G / G.norm(dim=1, keepdim=True) * W.norm(dim=1, keepdim=True))[0]
@@ -1164,7 +1217,7 @@ def proposer_pythia(args):
     for h in hs:
         h.remove()
     report = {"mode": "proposer_pythia", "model": args.model, "tokens": int(ids.numel()), "text_source": source,
-              "args": vars(args), "layers": []}
+              "args": vars(args), "env": env_record(), "layers": []}
     with torch.no_grad():
         for li in pick:
             m = layers[li].mlp
@@ -1208,13 +1261,18 @@ def main():
     parser.add_argument("--model", default="EleutherAI/pythia-70m")
     parser.add_argument("--layers", default="", help="proposer_pythia: comma list; empty = all")
     parser.add_argument("--p-fracs", type=float, nargs="*", default=[0.25], help="extra split ranks as fractions of d")
+    parser.add_argument("--linalg", choices=("torch", "scipy"), default="scipy",
+                        help="LAPACK for the Pi / E_p eigen-computations (scipy = OpenBLAS in ~/mpd-data/venv)")
     args = parser.parse_args()
+    global LINALG
+    LINALG = args.linalg
     torch.set_num_threads(6)
     if args.mode != "analyse":
         t0 = time.time()
         report = proposer_toys(args) if args.mode == "proposer_toys" else proposer_pythia(args)
         report["runtime_s"] = time.time() - t0
         report["numeric_owners"] = NUMERIC_OWNERS + "; E* local-search proposer and leverage-matched null: this file"
+        report["env"] = env_record()
         suffix = "proposer" if args.mode == "proposer_toys" else "proposer_" + args.model.split("/")[-1]
         dump("%s_%s.json" % (args.out_prefix, suffix), report)
         print("%s done in %.0fs" % (args.mode, report["runtime_s"]), flush=True)
