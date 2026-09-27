@@ -63,7 +63,7 @@ information is a declared weighting: which readout, which task.
   (cos ≈ −0.9), because most gates satisfy |g| ≫ 1.
 - The exact split `silu(g) = relu(g) + e(g)`, with `e` even and |e| ≤ 0.2785,
   does: from layer 21 the sign-gated bilinear part `W_d[relu(g)⊙u]` explains
-  93–99.7% of the output variance, about 20% of units are active per token, and
+  93–99.4% of the output variance, about 20% of units are active per token, and
   90% of the gated energy sits in 2–4% of all units.
 - Executed replacement (silu → relu, whole model, next-token KL): the last
   layer alone costs mean KL 0.007 (0.6B) / 0.002 (1.7B); layers 21–27 cost
