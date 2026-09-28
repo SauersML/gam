@@ -458,7 +458,11 @@ impl WarmStartStore {
         //    in-memory `payload` / `meta_json` we still hold. The sequence is
         //    retried up to `SAVE_KEY_DIR_RACE_RETRIES` times; a `NotFound` past
         //    that bound is propagated.
-        let nonce = self.nanos_now();
+        // The temp names must be this write's alone: two concurrent saves of
+        // one run id (a `save_overwrite` race) must not share a temp file, or
+        // one's rename finds it already moved by the other. A clock reading is
+        // not unique (see `fresh_run_id`); the process sequence is.
+        let nonce = next_write_sequence();
         let bin_final = dir.join(format!("{run_id}.bin"));
         let meta_final = dir.join(format!("{run_id}.json"));
         let mut attempt = 0u8;
@@ -1029,6 +1033,15 @@ fn lookup_cache_invalidate(key: &LookupCacheKey) {
 /// paths while still bounding worst-case disk drift.
 const EVICT_EVERY_N_SAVES: u64 = 32;
 
+/// Process-wide sequence behind every run id and temp-file nonce this process
+/// mints (see [`WarmStartStore::fresh_run_id`]). Process-wide rather than
+/// per-store, because two stores open on one root in one process share its
+/// directories.
+fn next_write_sequence() -> u64 {
+    static WRITE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+}
+
 fn parse_tmp_pid(name: &str) -> Option<u32> {
     // Names look like "<runid>.bin.tmp.<pid>.<nonce>.<attempt>" or
     // "<runid>.json.tmp.<pid>.<nonce>.<attempt>" (the trailing retry-attempt
@@ -1574,10 +1587,18 @@ impl WarmStartStore {
         nanos_since_epoch().saturating_add(u128::from(self.test_time_offset_ns()))
     }
 
+    /// A run id no other save can mint: the pid and a sequence number make it
+    /// unique within this process and among live processes, and the wall-clock
+    /// nanos keep it unique against a dead process that had the same pid.
+    ///
+    /// The clock alone is not enough: it is coarser than one save on some hosts
+    /// (microseconds on macOS), so concurrent saves in one process read the
+    /// same instant and overwrote each other's entry under one id.
     fn fresh_run_id(&self) -> String {
         let pid = std::process::id();
         let nanos = self.nanos_now();
-        format!("r{pid:x}-{nanos:x}")
+        let sequence = next_write_sequence();
+        format!("r{pid:x}-{nanos:x}-{sequence:x}")
     }
 }
 
@@ -2270,6 +2291,47 @@ mod tests {
         }
         stop.store(true, Ordering::Relaxed);
         evictor.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_saves_mint_distinct_run_ids() {
+        // `save` promises a FRESH run id. It used to be `pid + wall-clock
+        // nanos`, and the wall clock is coarser than a save on some hosts
+        // (microseconds on macOS), so concurrent writers in one process minted
+        // the same id: their saves overwrote each other, and — the temp names
+        // being derived from the same clock — two writers shared one temp file,
+        // so one's rename found it already moved (ENOENT). That was the
+        // intermittent failure of `save_survives_concurrent_eviction_removing_key_dir`.
+        use std::sync::Arc;
+        let (directory, store) = temp_store();
+        let store = Arc::new(store);
+        let key = key_for("distinct-run-ids");
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let writers: Vec<_> = (0..8)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (0..50)
+                        .map(|_| {
+                            store
+                                .save(&key, b"p", Some(1.0), None, EntryKind::Checkpoint)
+                                .expect("save")
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut ids: Vec<String> = writers
+            .into_iter()
+            .flat_map(|writer| writer.join().expect("writer"))
+            .collect();
+        let minted = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), minted, "every save minted its own run id");
+        drop(directory);
     }
 
     #[test]
