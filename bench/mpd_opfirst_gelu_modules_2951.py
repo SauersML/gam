@@ -1,6 +1,8 @@
 """#2951 probe: does an exact-GELU MLP split into (approximately) independent parallel modules?
 
-Analysis under SPEC 8's exception (torch execution of a measurement), float64 on CPU throughout.
+Analysis under SPEC 8's exception (torch execution of a measurement), float64 on CPU throughout. Every
+decomposition and operator norm goes through bench/mpd_opfirst_linalg_2951.py (scipy); torch only runs the model
+and matmuls.
 
 Exact identity (checked numerically below): gelu(t) = t Phi(t) = t/2 + psi(t), psi(t) = t (Phi(t) - 1/2) even,
 psi' odd, psi'' = (2 - t^2) phi. A biased MLP F(x) = W_out gelu(W_in x + b_in) + b_out therefore has the normal form
@@ -54,6 +56,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import mpd_opfirst_linalg_2951 as la  # noqa: E402
 
 KAPPA = 0.5 * (1 + math.erf(1.0)) - 0.5 + math.sqrt(2) * math.exp(-1.0) / math.sqrt(2 * math.pi)
 
@@ -111,15 +114,15 @@ class Mlp:
 
 
 def projector(M, k=None):
-    ev, V = torch.linalg.eigh(0.5 * (M + M.T))
+    ev, V = la.eigh(0.5 * (M + M.T))
     if k is None:
         k = int((ev > 0).sum())
-    Vk = V[:, ev.numel() - k:]
+    Vk = torch.from_numpy(V[:, ev.size - k:])
     return Vk @ Vk.T, k
 
 
 def haar_projector(d, k, gen):
-    Qm, _ = torch.linalg.qr(torch.randn(d, d, generator=gen, dtype=torch.float64))
+    Qm = torch.from_numpy(la.qr(torch.randn(d, d, generator=gen, dtype=torch.float64))[0])
     return Qm[:, :k] @ Qm[:, :k].T
 
 
@@ -142,7 +145,7 @@ def eta_bound(mlp, P, Qp):
     Qu, Iu = u @ Qp, u @ (I - Qp)
     Pa, Ia = a @ P, a @ (I - P)
     Dj = torch.maximum(Qu.norm(dim=1) * Ia.norm(dim=1), Iu.norm(dim=1) * Pa.norm(dim=1))
-    lin = torch.linalg.matrix_norm(Qp @ mlp.A - mlp.A @ P, ord=2)
+    lin = la.spectral_norm(Qp @ mlp.A - mlp.A @ P)
     return {"eta": float(lin + KAPPA * Dj.sum()), "lin": float(lin), "nonlin": float(KAPPA * Dj.sum())}
 
 
@@ -179,8 +182,8 @@ def evaluate_split(mlp, mask, X, Y, scale):
 
 def planted_check(gen):
     d, dims, units = 12, (5, 7), (10, 14)
-    R, _ = torch.linalg.qr(torch.randn(d, d, generator=gen, dtype=torch.float64))
-    S, _ = torch.linalg.qr(torch.randn(d, d, generator=gen, dtype=torch.float64))
+    R = torch.from_numpy(la.qr(torch.randn(d, d, generator=gen, dtype=torch.float64))[0])
+    S = torch.from_numpy(la.qr(torch.randn(d, d, generator=gen, dtype=torch.float64))[0])
     rows_a, rows_u, truth = [], [], []
     off = 0
     for m, (dm, nm) in enumerate(zip(dims, units)):
@@ -206,10 +209,10 @@ def planted_check(gen):
     lab = torch.tensor(lab)
     mask = lab == lab[0]
     recovered = bool(((mask == (truth == truth[0])).all()) and ncomp == 2)
-    Ua = torch.linalg.svd(W_in[mask].T, full_matrices=False)[0]
-    Uu = torch.linalg.svd(W_out[:, mask], full_matrices=False)[0]
-    ra = int((torch.linalg.svdvals(W_in[mask]) > 1e-10).sum())
-    ru = int((torch.linalg.svdvals(W_out[:, mask]) > 1e-10).sum())
+    Ua = torch.from_numpy(la.svd(W_in[mask].T)[0])
+    Uu = torch.from_numpy(la.svd(W_out[:, mask])[0])
+    ra = int((la.svdvals(W_in[mask]) > 1e-10).sum())
+    ru = int((la.svdvals(W_out[:, mask]) > 1e-10).sum())
     P, Qp = Ua[:, :ra] @ Ua[:, :ra].T, Uu[:, :ru] @ Uu[:, :ru].T
     X = 3 * torch.randn(2000, d, generator=gen, dtype=torch.float64)
     Y = 3 * torch.randn(2000, d, generator=gen, dtype=torch.float64)
@@ -232,7 +235,7 @@ def independence_check(mlp, sigma, mu, n_pts, gen):
     G = dpsi(X @ mlp.W_in.T + mlp.b_in)
     G = torch.cat([torch.ones(n_pts, 1, dtype=torch.float64), G], 1)
     G = G / G.norm(dim=0, keepdim=True)
-    sv = torch.linalg.svdvals(G)
+    sv = la.svdvals(G)
     return {"n_points": n_pts, "n_funcs": G.shape[1], "sv_min": float(sv[-1]), "sv_max": float(sv[0]),
             "cond": float(sv[0] / sv[-1])}
 
@@ -284,6 +287,7 @@ def spectral_labels(W, K, seed):
 
 def write_receipt(report, out, t0, t_fwd):
     report["runtime_s"] = {"forward_and_load": t_fwd, "total": time.time() - t0}
+    report["env"] = la.env_record()
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     # one top-level key per line: build.rs caps tracked files at 10k lines
     Path(out).write_text("{\n" + ",\n".join("%s:%s" % (json.dumps(k), json.dumps(v, separators=(",", ":")))
@@ -295,20 +299,20 @@ def pi_estar(U, mask):
     (the same nonzero eigenvalues; zero eigenvalues contribute nothing)."""
     Us = U[mask]
     G = Us @ Us.T if Us.shape[0] < Us.shape[1] else Us.T @ Us
-    lam = torch.linalg.eigvalsh(0.5 * (G + G.T)).clamp(0, 1)
-    return {"E_star": float(torch.minimum(lam, 1 - lam).sum()), "chi": float((lam * (1 - lam)).sum()),
+    lam = np.clip(la.eigvalsh(0.5 * (G + G.T)), 0, 1)
+    return {"E_star": float(np.minimum(lam, 1 - lam).sum()), "chi": float((lam * (1 - lam)).sum()),
             "rank_P": int((lam > 0.5).sum())}
 
 
 def pi_split(U, T, mask):
     """Optimal exactly-separated reads for unit subset S (whitened): E* = sum min(lam, 1-lam), lam = eig(U^T D_S U)."""
     G = U[mask].T @ U[mask]
-    lam, V = torch.linalg.eigh(0.5 * (G + G.T))
-    lam = lam.clamp(0, 1)
-    Vp = V[:, lam > 0.5]
+    lam, V = la.eigh(0.5 * (G + G.T))
+    lam = np.clip(lam, 0, 1)
+    Vp = torch.from_numpy(V[:, lam > 0.5])
     P = Vp @ Vp.T
     Uhat = torch.where(mask[:, None], U @ P, U - U @ P)
-    return {"E_star": float(torch.minimum(lam, 1 - lam).sum()), "chi": float((lam * (1 - lam)).sum()),
+    return {"E_star": float(np.minimum(lam, 1 - lam).sum()), "chi": float((lam * (1 - lam)).sum()),
             "rank_P": int(Vp.shape[1])}, Uhat @ T
 
 
@@ -348,7 +352,7 @@ def pi_reads(W, n_rand, gen, fracs):
     """Weight-only Pi statistics of a read matrix W (n units x d): thresholded components, Fiedler proposals
     vs random subsets vs the same proposer on a twin with redrawn unit directions (norms kept)."""
     n, d = W.shape
-    U, T = torch.linalg.qr(W)
+    U, T = (torch.from_numpy(m) for m in la.qr(W))
     Pi = U @ U.T
     off = ~torch.eye(n, dtype=torch.bool)
     band = {}
@@ -369,7 +373,7 @@ def pi_reads(W, n_rand, gen, fracs):
         rand[k] = (float(np.mean(vals)), float(np.std(vals)))
     G = torch.randn(W.shape, generator=gen, dtype=torch.float64)
     Wt = G / G.norm(dim=1, keepdim=True) * W.norm(dim=1, keepdim=True)
-    Ut, _ = torch.linalg.qr(Wt)
+    Ut = torch.from_numpy(la.qr(Wt)[0])
     _, props_t = pi_proposals(Ut, 3, fracs)
     best_t = {}
     for pr in props_t:
@@ -404,8 +408,8 @@ def pi_layer(layer, li, Xin, n_rand, gen, fracs):
     ln = layer.post_attention_layernorm
     R_ln = float(ln.bias.norm() + math.sqrt(d) * ln.weight.abs().max())
     R_emp = float(Xin.norm(dim=1).max())
-    specV = float(torch.linalg.matrix_norm(Vout, ord=2))
-    specdW = float(torch.linalg.matrix_norm(W - What, ord=2))
+    specV = la.spectral_norm(Vout)
+    specdW = la.spectral_norm(W - What)
     L_sigma = 0.5 + KAPPA
     F = torch.nn.functional.gelu(Xin @ W.T + b_in) @ Vout.T
     Fh = torch.nn.functional.gelu(Xin @ What.T + b_in) @ Vout.T
@@ -413,7 +417,7 @@ def pi_layer(layer, li, Xin, n_rand, gen, fracs):
     res = {"layer": li, **res,
            "best": {"k": best["k"], "vec": best["vec"], "side": best["side"], "E_over_U2": best["E_over_U2"],
                     "random_mean": rand[best["k"]][0], "ratio_vs_random": best["E_over_U2"] / rand[best["k"]][0],
-                    "W_minus_What_2": specdW, "W_2": float(torch.linalg.matrix_norm(W, ord=2)), "V_2": specV,
+                    "W_minus_What_2": specdW, "W_2": la.spectral_norm(W), "V_2": specV,
                     "R_layernorm": R_ln, "R_empirical_max": R_emp,
                     "uniform_bound_R_ln": L_sigma * specV * specdW * R_ln,
                     "uniform_bound_R_emp": L_sigma * specV * specdW * R_emp,
@@ -545,7 +549,7 @@ def main():
                 nc, sizes = components(adj)
                 thr[str(tau)] = {"components": nc, "largest": sizes,
                                  "edge_density": float(adj.sum() / (n * (n - 1)))}
-            scale = float(torch.linalg.matrix_norm(mlp.A, ord=2) + KAPPA * (na * nu).sum())
+            scale = la.spectral_norm(mlp.A) + float(KAPPA * (na * nu).sum())
             npairs = min(args.pairs, Xin.shape[0] // 2)
             perm = torch.randperm(Xin.shape[0], generator=gen)
             X, Y = Xin[perm[:npairs]], Xin[perm[npairs:2 * npairs]]
@@ -586,7 +590,7 @@ def main():
             balanced = [g for g in allg if min(g["size"], n - g["size"]) >= n // 20] or allg
             best = min(balanced, key=lambda g: g["eta_ratio_vs_random_split"])
             twin = random_twin(mlp, gen)
-            scale_twin = float(torch.linalg.matrix_norm(twin.A, ord=2) + KAPPA * (na * nu).sum())
+            scale_twin = la.spectral_norm(twin.A) + float(KAPPA * (na * nu).sum())
             refined = {}
             for kname, k in (("d/4", d // 4), ("d/2", d // 2), ("best_spectral", best["rank_P"])):
                 size = round(n * k / d)
@@ -610,7 +614,7 @@ def main():
                                      "zero_write_inner": int(((Gu == 0) & off).sum() // 2)},
                 "abs_cos_read": q(Ca.abs()[off]), "abs_cos_write": q(Cu.abs()[off]),
                 "threshold_components": thr, "scale_A_plus_kappa_sumC": scale,
-                "A_norm": float(torch.linalg.matrix_norm(mlp.A, ord=2)), "kappa_sumC": float(KAPPA * (na * nu).sum()),
+                "A_norm": la.spectral_norm(mlp.A), "kappa_sumC": float(KAPPA * (na * nu).sum()),
                 "empirical_lipschitz_dF_over_dx": q(lip), "pairs_used": int(X.shape[0]),
                 "independence": independence_check(mlp, sigma, mu, args.indep_points or 3 * n, gen),
                 "splits": splits,

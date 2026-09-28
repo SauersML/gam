@@ -1,7 +1,8 @@
 """#2951 operator-first: how many independent QK operators does a RoPE attention layer hold?
 
 Analysis under SPEC 8's exception (benchmark evaluation, not an MPD input). numpy + safetensors only,
-CPU float64 on the exact bf16 / f32 weights (-> f64 is exact), one layer at a time.
+CPU float64 on the exact bf16 / f32 weights (-> f64 is exact), one layer at a time. Every eigen/singular
+decomposition goes through bench/mpd_opfirst_linalg_2951.py (scipy).
 
 For query head h reading key/value head g(h) = h // (H / KV), with rotary planes j = coords (j, j + hd/2)
 (HF rotate_half pairing) and omega_j = theta^(-2j/hd), the pre-softmax score is
@@ -41,6 +42,7 @@ import time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mpd_opfirst_linalg_2951 as la  # noqa: E402
 from mpd_opfirst_decoder_2951 import Decoder, compact_json  # noqa: E402
 
 EPS = np.finfo(np.float64).eps
@@ -64,7 +66,7 @@ def rank_report(gram):
     the span is certified full-dimensional (up to that rounding model); below it, "numerical" only.
     Equivalently the atom stack has singular values resolved down to sqrt(tau)."""
     n = gram.shape[0]
-    eigs = np.linalg.eigvalsh(gram)
+    eigs = la.eigvalsh(gram)
     tau = n * EPS * eigs[-1]
     return eigs, {
         "max_dim": n,
@@ -79,13 +81,13 @@ def rank_report(gram):
 
 def block_null(gram, blocks):
     """Eigenvalues of the block-diagonal part of the Gram (the 'no sharing between blocks' null)."""
-    return np.concatenate([np.linalg.eigvalsh(gram[np.ix_(b, b)]) for b in blocks])
+    return np.concatenate([la.eigvalsh(gram[np.ix_(b, b)]) for b in blocks])
 
 
 def captured(gram, a, b):
     """Fraction of the Frobenius energy of atom set b lying in span(atom set a)."""
     gaa = gram[np.ix_(a, a)]
-    w, v = np.linalg.eigh(gaa)
+    w, v = la.eigh(gaa)
     keep = w > len(a) * EPS * w[-1]
     pinv = (v[:, keep] / w[keep]) @ v[:, keep].T
     gab = gram[np.ix_(a, b)]
@@ -96,12 +98,12 @@ def top_cosine(gram, a, b):
     """Largest principal cosine between span(a) and span(b)."""
 
     def isqrt(g):
-        w, v = np.linalg.eigh(g)
+        w, v = la.eigh(g)
         keep = w > len(g) * EPS * w[-1]
         return v[:, keep] / np.sqrt(w[keep])
 
     ia, ib = isqrt(gram[np.ix_(a, a)]), isqrt(gram[np.ix_(b, b)])
-    return float(np.linalg.svd(ia.T @ gram[np.ix_(a, b)] @ ib, compute_uv=False)[0])
+    return float(la.svdvals(ia.T @ gram[np.ix_(a, b)] @ ib)[0])
 
 
 def atoms(Q, K):
@@ -185,7 +187,7 @@ def analyse_layer(Q, K, layer, with_pairs, theta):
     rec["null_groups_independent"] = spectrum_counts(
         block_null(G, [idx[g * grp:(g + 1) * grp].ravel() for g in range(KV)]))
     rec["null_all_atoms_orthogonal"] = spectrum_counts(np.diag(G).copy())
-    rec["per_head_k90"] = [spectrum_counts(np.linalg.eigvalsh(G[np.ix_(idx[h].ravel(), idx[h].ravel())]))["k90"]
+    rec["per_head_k90"] = [spectrum_counts(la.eigvalsh(G[np.ix_(idx[h].ravel(), idx[h].ravel())]))["k90"]
                            for h in range(H)]
 
     # per-plane sharing across heads: span of {A_hj, B_hj : h}, 2H atoms
@@ -195,7 +197,7 @@ def analyse_layer(Q, K, layer, with_pairs, theta):
     for j in range(P):
         b = idx[:, j].ravel()
         e, r = rank_report(G[np.ix_(b, b)])
-        ec = np.linalg.eigvalsh(C[np.ix_(b, b)])
+        ec = la.eigvalsh(C[np.ix_(b, b)])
         same, diff = [], []
         for h in range(H):
             for h2 in range(h + 1, H):
@@ -239,7 +241,7 @@ def random_null(H, KV, hd, d, rng):
     G = gram_from_factors(U, V)
     idx = np.arange(G.shape[0]).reshape(H, hd // 2, 2)
     grp = H // KV
-    out = {"actual": spectrum_counts(np.linalg.eigvalsh(G)),
+    out = {"actual": spectrum_counts(la.eigvalsh(G)),
            "null_heads_independent": spectrum_counts(block_null(G, [idx[h].ravel() for h in range(H)])),
            "captured_diff_k": captured(G, idx[0].ravel(), idx[grp].ravel()),
            "top_cos_diff_k": top_cosine(G, idx[0].ravel(), idx[grp].ravel())}
@@ -294,6 +296,7 @@ def main():
         "operator_expansion_selfcheck_max_rel_err": check,
         "random_gaussian_null": random_null(D.H, D.KV, D.hd, D.d, rng),
         "layers": layers,
+        "env": la.env_record(),
         "seconds_total": time.time() - t0,
     }
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)

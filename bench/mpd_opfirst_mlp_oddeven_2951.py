@@ -2,7 +2,8 @@
 
 Analysis under SPEC 8's exception (torch execution of a measurement). The model runs on CPU at --dtype (float32
 by default: a 1B model is never materialised in float64); every per-layer analysis casts that layer's weights and
-captured MLP inputs to float64. The architecture is read from config (bench/mpd_opfirst_decoder_2951.py): in a
+captured MLP inputs to float64, and every spectrum or operator norm goes through bench/mpd_opfirst_linalg_2951.py
+(scipy float64; torch is only the forward pass and matmuls). The architecture is read from config (bench/mpd_opfirst_decoder_2951.py): in a
 pre-norm model (Qwen3) the MLP reads the RMS-normalised residual; in a post-norm model (OLMo 2) it reads the raw
 residual and its output F is rescaled by N_ff(F) = gamma_ff * F / rms(F) before the residual add, so relusplit
 also reports how well N_ff(P) reproduces the actual residual write N_ff(F).
@@ -33,9 +34,11 @@ import os
 import sys
 import time
 
+import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mpd_opfirst_linalg_2951 as la  # noqa: E402
 from mpd_opfirst_decoder_2951 import mlp_input_norm, mlp_output_norm, placement  # noqa: E402
 
 FALLBACK_TEXT = (
@@ -68,11 +71,11 @@ def texts_tokens(tok, n_seq, seq_len, seed):
 
 
 def spectrum_stats(ev):
-    ev = ev.clamp_min(0).sort(descending=True).values
+    ev = np.sort(np.clip(ev, 0, None))[::-1]
     tot = ev.sum()
-    cum = ev.cumsum(0) / tot
+    cum = np.cumsum(ev) / tot
     return {
-        "dim": int(ev.numel()),
+        "dim": int(ev.size),
         "rank90": int((cum < 0.90).sum()) + 1,
         "rank99": int((cum < 0.99).sum()) + 1,
         "participation": float(tot ** 2 / (ev ** 2).sum()),
@@ -201,7 +204,7 @@ def correction_bounds(X, Wg, Wu, Wd, gamma, k, chunk=64):
     C = eu @ Wd.T
     nC = C.norm(dim=-1)
     wn = Wd.norm(dim=0)
-    op = torch.linalg.matrix_norm(Wd, ord=2)
+    op = la.spectral_norm(Wd)
     b_op = op * eu.norm(dim=-1)
     contrib = eu.abs() * wn
     b_tri = contrib.sum(-1)
@@ -209,7 +212,7 @@ def correction_bounds(X, Wg, Wu, Wd, gamma, k, chunk=64):
     b_split = []
     for s in range(0, X.shape[0], chunk):
         idx = top[s:s + chunk]
-        sub_op = torch.linalg.matrix_norm(Wd.T[idx], ord=2)
+        sub_op = torch.from_numpy(la.spectral_norm(Wd.T[idx]))
         in_a = eu[s:s + chunk].gather(-1, idx)
         b_split.append(sub_op * in_a.norm(dim=-1) + b_tri[s:s + chunk] - contrib[s:s + chunk].gather(-1, idx).sum(-1))
     b_split = torch.cat(b_split)
@@ -221,7 +224,7 @@ def correction_bounds(X, Wg, Wu, Wd, gamma, k, chunk=64):
     b_box = min(float(op * (emax * umax).norm()), float((emax * umax * wn).sum()))
     d = X.shape[1]
     b_param = None if gamma is None else float(
-        0.27846454276107 * op * torch.linalg.matrix_norm(Wu, ord=2) * gamma.abs().max() * math.sqrt(d))
+        0.27846454276107 * op * la.spectral_norm(Wu) * gamma.abs().max() * math.sqrt(d))
     nF = ((torch.nn.functional.silu(g) * u) @ Wd.T).norm(dim=-1)
     best = torch.minimum(b_op, b_split)
     med = lambda v: float(v.median())
@@ -293,20 +296,20 @@ def replace_runs(model, ids, clean_logits, configs, positions):
 def tensor_rank(Wg, Wu, Wd, n_probe, gen):
     Gg, Gu, C = Wg @ Wg.T, Wu @ Wu.T, Wg @ Wu.T
     res = {
-        "mode1_out": spectrum_stats(torch.linalg.eigvalsh(0.25 * Wd @ (Gg * Gu) @ Wd.T)),
-        "mode1_out_sym": spectrum_stats(torch.linalg.eigvalsh(0.125 * Wd @ (Gg * Gu + C * C.T) @ Wd.T)),
-        "mode2_gate_in": spectrum_stats(torch.linalg.eigvalsh(0.25 * Wg.T @ ((Wd.T @ Wd) * Gu) @ Wg)),
-        "mode3_up_in": spectrum_stats(torch.linalg.eigvalsh(0.25 * Wu.T @ ((Wd.T @ Wd) * Gg) @ Wu)),
-        "Wd_alone": spectrum_stats(torch.linalg.svdvals(Wd) ** 2),
+        "mode1_out": spectrum_stats(la.eigvalsh(0.25 * Wd @ (Gg * Gu) @ Wd.T)),
+        "mode1_out_sym": spectrum_stats(la.eigvalsh(0.125 * Wd @ (Gg * Gu + C * C.T) @ Wd.T)),
+        "mode2_gate_in": spectrum_stats(la.eigvalsh(0.25 * Wg.T @ ((Wd.T @ Wd) * Gu) @ Wg)),
+        "mode3_up_in": spectrum_stats(la.eigvalsh(0.25 * Wu.T @ ((Wd.T @ Wd) * Gg) @ Wu)),
+        "Wd_alone": spectrum_stats(la.svdvals(Wd) ** 2),
     }
     probes = []
     for _ in range(n_probe):
         r = torch.randn(Wd.shape[0], generator=gen, dtype=Wd.dtype)
         r /= r.norm()
         M = 0.5 * Wg.T @ ((Wd.T @ r)[:, None] * Wu)
-        ev = torch.linalg.eigvalsh(0.5 * (M + M.T))
+        ev = la.eigvalsh(0.5 * (M + M.T))
         st = spectrum_stats(ev ** 2)
-        st["pos_mass"] = float(ev.clamp_min(0).pow(2).sum() / ev.pow(2).sum())
+        st["pos_mass"] = float((np.clip(ev, 0, None) ** 2).sum() / (ev ** 2).sum())
         probes.append(st)
     res["per_output_qform"] = {k: float(sum(p[k] for p in probes) / n_probe) for k in probes[0]}
     return res
@@ -374,7 +377,8 @@ def main():
     report = {"model": args.model, "revision": args.revision, "mode": args.mode, "text_source": source,
               "tokens": int(ids.numel()), "dtype": {"model": args.dtype, "analysis": "float64"},
               "norm_placement": where, "act": model.config.hidden_act,
-              "stats_exclude_position0": not args.include_pos0, "layers": {}}
+              "stats_exclude_position0": not args.include_pos0, "args": vars(args), "env": la.env_record(),
+              "layers": {}}
     n_layers = len(layers)
     step = max(1, round(3 * n_layers / 28))
     suffix = [int(v) for v in args.suffix_l0.split(",")] if args.suffix_l0 else [n_layers - 1 - k * step for k in range(5)] + [0]
@@ -433,7 +437,7 @@ def main():
                       flush=True)
                 continue
             if args.mode == "relusplit":
-                Wd_op = float(torch.linalg.matrix_norm(Wd, ord=2))
+                Wd_op = la.spectral_norm(Wd)
                 entry = relu_split(X, Wg, Wu, Wd, Wd_op, flat_ids, positions[rows], tok, args.heavy,
                                    None if out_norm is None else (out_norm.weight.double(), out_norm.variance_epsilon))
                 entry["W_down_op_norm"] = Wd_op

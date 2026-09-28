@@ -20,11 +20,12 @@ Tools (reused from the probes, imported, not rewritten, unless noted):
       even (GELU analogues of the SiLU splits in bench/mpd_opfirst_mlp_oddeven_2951.py; psi is the probe's).
   T4  spectral plane-rotation recovery: Rust parameter_decomposition::spectral::recover_plane_rotations called
       through `gam parameter-decomposition` (--gam-bin, default target/release/gam; required). A naive strawman
-      (np.linalg.eig, one plane per conjugate pair, no grouping) is scored too, to show what the grouping prevents.
+      (general eig, one plane per conjugate pair, no grouping) is scored too, to show what the grouping prevents.
   T5  gauge counts by the declared families of parameter_decomposition::gauge (NUMPY STAND-IN: re-statement of the orbit
       formulas: pass-through GL(r) r^2 - (r - rank A)(r - rank B); GELU hidden units permutation only; rotary QK
       2 m^2 per frequency with m planes). Scored against the function-level fibre dimension, measured as the
       nullity of the Jacobian of theta -> F_theta(X) on generic inputs (torch autograd, float64).
+Every decomposition goes through bench/mpd_opfirst_linalg_2951.py (scipy float64); torch is autograd and matmuls.
   T6  QK sharing between heads (bench/mpd_opfirst_rope_span_2951.py: atoms, gram_from_factors, captured,
       top_cosine), plus an operator-equality test (same routing law iff equal score operators, no biases).
 
@@ -43,6 +44,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import mpd_opfirst_linalg_2951 as la  # noqa: E402
 from mpd_opfirst_gelu_modules_2951 import KAPPA, Mlp, cos_matrix, eta_bound, psi, refine, random_twin  # noqa: E402
 from mpd_opfirst_observability_2951 import effective, linear_quotient, resolved_rows  # noqa: E402
 from mpd_opfirst_rope_span_2951 import atoms, captured, gram_from_factors, top_cosine  # noqa: E402
@@ -112,8 +114,7 @@ def tt(a):
 
 
 def haar(d, rng):
-    q, r = np.linalg.qr(rng.standard_normal((d, d)))
-    return q * np.sign(np.diag(r))
+    return la.qr(rng.standard_normal((d, d)))[0]  # diag(R) > 0: Haar
 
 
 def gelu_np(t):
@@ -129,10 +130,10 @@ def Phi_np(t):
 def commutant_dim(A):
     d = A.shape[0]
     K = np.kron(np.eye(d), A) - np.kron(A.T, np.eye(d))
-    s = np.linalg.svd(K, compute_uv=False)
+    s = la.svdvals(K)
     if s[0] == 0:
         return d * d
-    return int((s <= d * d * EPS * max(s[0], np.linalg.norm(A, 2)) * 16).sum())
+    return int((s <= d * d * EPS * max(s[0], la.spectral_norm(A)) * 16).sum())
 
 
 def merge_units(W_in, b_in, W_out):
@@ -190,7 +191,7 @@ def t1_mlp(W_in, b_in, W_out, b_out, L=None, merge=True, rng=None):
     ncomp, lab = connected_components(csr_matrix(adj.astype(np.int8)), directed=False)
     m = Mlp(tt(a), tt(beta), tt(u.T.copy()), tt(b_out))
     m.A, m.b = tt(A_full), tt(b_full)
-    scale = float(np.linalg.norm(A_full, 2) + KAPPA * (np.linalg.norm(a, axis=1) * np.linalg.norm(u, axis=1)).sum())
+    scale = float(la.spectral_norm(A_full) + KAPPA * (np.linalg.norm(a, axis=1) * np.linalg.norm(u, axis=1)).sum())
     band = 1e3 * EPS * scale
     comps = []
     for g in range(ncomp):
@@ -224,7 +225,7 @@ def t1_null_search(W_in, b_in, W_out, b_out, rng, gen, restarts=4, iters=20):
     """Probe's Lloyd refine at k = d/2 from random starts; eta / scale (lower = more module-like)."""
     m = Mlp(tt(W_in), tt(b_in), tt(W_out), tt(b_out))
     n, d = W_in.shape
-    scale = float(np.linalg.norm(np64(m.A), 2) + KAPPA * (np.linalg.norm(W_in, axis=1)
+    scale = float(la.spectral_norm(m.A) + KAPPA * (np.linalg.norm(W_in, axis=1)
                                                          * np.linalg.norm(W_out, axis=0)).sum())
     best = math.inf
     for _ in range(restarts):
@@ -238,7 +239,7 @@ def t1_null_search(W_in, b_in, W_out, b_out, rng, gen, restarts=4, iters=20):
 # --------------------------------------------------------------------------------------------- T2
 def gram_report(factor, planted=None):
     rank = int(resolved_rows(factor).shape[0])
-    _, s, vt = np.linalg.svd(factor, full_matrices=False)
+    _, s, vt = la.svd(factor)
     out = {"exact_rank": rank, "sigma_over_max": (s / s[0]).tolist(),
            "participation_ratio": effective(s)["participation_ratio"]}
     if planted is not None:
@@ -306,7 +307,7 @@ t4_planes = t4_rust
 
 
 def t4_naive(W):
-    lam, vec = np.linalg.eig(W)
+    lam, vec = la.eig(W)
     planes = []
     for i in range(len(lam)):
         if lam[i].imag > 1e-12:
@@ -317,7 +318,7 @@ def t4_naive(W):
 # --------------------------------------------------------------------------------------------- T5 oracle
 def fibre_dim(f, theta):
     J = torch.autograd.functional.jacobian(f, theta)
-    s = torch.linalg.svdvals(J).numpy()
+    s = la.svdvals(J)
     rel = s / s[0]
     null = int((rel < 1e-9).sum()) + max(0, theta.numel() - len(s))
     k = len(s) - int((rel < 1e-9).sum())
@@ -584,12 +585,12 @@ def toy5(rng):
     # per-head OV gauge V -> S V, O -> O S^-1
     S = [np.eye(r) + 0.5 * rng.standard_normal((r, r)) for _ in range(H)]
     Vg = np.stack([S[h] @ V[h] for h in range(H)])
-    Og = np.stack([O[h] @ np.linalg.inv(S[h]) for h in range(H)])
+    Og = np.stack([O[h] @ la.inv(S[h]) for h in range(H)])
     per_head_g = tools(Vg, Og)
     # cross-head GL(4) on heads 1, 2 (identical patterns)
     M = np.eye(2 * r) + 0.5 * rng.standard_normal((2 * r, 2 * r))
     Vs = M @ np.vstack([V[0], V[1]])
-    Os = np.hstack([O[0], O[1]]) @ np.linalg.inv(M)
+    Os = np.hstack([O[0], O[1]]) @ la.inv(M)
     Vx, Ox = V.copy(), O.copy()
     Vx[0], Vx[1], Ox[0], Ox[1] = Vs[:r], Vs[r:], Os[:, :r], Os[:, r:]
     cross_g = tools(Vx, Ox)
@@ -658,7 +659,7 @@ def toy6(rng):
     off = max(float(np.abs(Xoff @ (D1(t) - D1(0)).T).max()) for t in ts)
     sums = max(float(np.abs(D1(t) + D2(t) - np.outer(u, a + b)).max()) for t in ts)
     g = gram_report(X / math.sqrt(len(X)))
-    _, s, vt = np.linalg.svd(X / math.sqrt(len(X)))
+    _, s, vt = la.svd(X / math.sqrt(len(X)))
     null = vt[g["exact_rank"]:]
     rep = {"d": d, "data_dim": ds, "t_values": ts, "sum_invariant_maxdiff": sums,
            "component_on_data_maxdiff": on, "component_off_data_maxdiff": off,
@@ -756,6 +757,7 @@ def main():
         scorecard[name] = sc
         print(name, "%.1fs" % (time.time() - ts), json.dumps(sc), flush=True)
     report["scorecard"] = scorecard
+    report["env"] = la.env_record()
     report["runtime_s"] = time.time() - t0
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
