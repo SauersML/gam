@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Known-answer toys for the additive module split (toys 1–3 of
 //! `bench/mpd_opfirst_toys_planted_2951.py`, and planted blocks under dense
 //! integer mixing) and its controls.
