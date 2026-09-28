@@ -203,41 +203,42 @@ impl From<ProposalKind> for ProposalKindWire {
     }
 }
 
-/// [`EvidenceStatus`] on the wire, with a named witness and a named domain. An
-/// unresolved side that is not derived is absent (the owner's infinite side).
+/// [`EvidenceStatus`] on the wire, with a witness `W` and a domain `D` (named, by
+/// default). An unresolved side that is not derived is absent (the owner's infinite
+/// side).
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum EvidenceStatusWire {
+pub enum EvidenceStatusWire<W = String, D = String> {
     Exact {
         value: f64,
         numerical_error: f64,
         basis: ExactBasisWire,
-        witness: Option<String>,
-        domain: String,
+        witness: Option<W>,
+        domain: D,
     },
     UniformBound {
         upper: f64,
         numerical_error: f64,
-        region: String,
+        region: D,
     },
     StatisticalEstimate {
         estimate: f64,
         standard_error: f64,
         samples: u64,
-        law: String,
+        law: D,
     },
     Counterexample {
         value: f64,
         numerical_error: f64,
         threshold: f64,
-        witness: String,
+        witness: W,
     },
     Unresolved {
         lower: Option<f64>,
         upper: Option<f64>,
         extremum: ExtremumWire,
-        witness: Option<String>,
-        domain: String,
+        witness: Option<W>,
+        domain: D,
     },
 }
 
@@ -259,9 +260,9 @@ pub enum ExtremumWire {
 
 type Status = EvidenceStatus<String, String>;
 
-impl EvidenceStatusWire {
+impl<W, D> EvidenceStatusWire<W, D> {
     /// Builds the status through its owner's validating constructor.
-    pub fn into_status(self) -> Result<Status, EvidenceStatusError> {
+    pub fn into_status(self) -> Result<EvidenceStatus<W, D>, EvidenceStatusError> {
         match self {
             Self::Exact {
                 value,
@@ -316,7 +317,16 @@ impl EvidenceStatusWire {
     }
 
     /// The owner's status, with an underived (infinite) side absent.
-    pub fn from_status(status: Status) -> Result<Self, MpdSurfaceError> {
+    pub fn from_status(status: EvidenceStatus<W, D>) -> Result<Self, MpdSurfaceError> {
+        Self::from_status_with(status, |witness| witness, |domain| domain)
+    }
+
+    /// The owner's status with its witness and domain projected to the wire.
+    pub fn from_status_with<V, E>(
+        status: EvidenceStatus<V, E>,
+        witness_of: impl Fn(V) -> W,
+        domain_of: impl Fn(E) -> D,
+    ) -> Result<Self, MpdSurfaceError> {
         Ok(match status {
             EvidenceStatus::Exact {
                 value,
@@ -332,8 +342,8 @@ impl EvidenceStatusWire {
                     ExactBasis::Algebraic => ExactBasisWire::Algebraic {},
                     ExactBasis::Exhaustive { cardinality } => ExactBasisWire::Exhaustive { cardinality },
                 },
-                witness,
-                domain,
+                witness: witness.map(&witness_of),
+                domain: domain_of(domain),
             },
             EvidenceStatus::UniformBound {
                 upper,
@@ -343,7 +353,7 @@ impl EvidenceStatusWire {
             } => Self::UniformBound {
                 upper,
                 numerical_error,
-                region,
+                region: domain_of(region),
             },
             EvidenceStatus::StatisticalEstimate {
                 estimate,
@@ -355,7 +365,7 @@ impl EvidenceStatusWire {
                 estimate,
                 standard_error,
                 samples,
-                law,
+                law: domain_of(law),
             },
             EvidenceStatus::Counterexample {
                 value,
@@ -367,7 +377,7 @@ impl EvidenceStatusWire {
                 value,
                 numerical_error,
                 threshold,
-                witness,
+                witness: witness_of(witness),
             },
             EvidenceStatus::Unresolved {
                 lower,
@@ -391,8 +401,8 @@ impl EvidenceStatusWire {
                     Extremum::Supremum => ExtremumWire::Supremum,
                     Extremum::Infimum => ExtremumWire::Infimum,
                 },
-                witness,
-                domain,
+                witness: witness.map(&witness_of),
+                domain: domain_of(domain),
             },
         })
     }

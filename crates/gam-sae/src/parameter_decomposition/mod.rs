@@ -145,6 +145,9 @@ pub mod occurrence;
 // Implementation-gauge families detected exactly from native tensors, quotiented out of codes.
 pub mod gauge;
 
+// The gauge census of a decoder layer and of a tied residual stream.
+pub mod gauge_census;
+
 // Gauge-covariant group masks, structured parameter paths, Sum and Compose accounting.
 pub mod operators;
 

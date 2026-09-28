@@ -64,7 +64,7 @@ pub struct SpectralNormBoundsReport {
     pub upper: f64,
 }
 
-fn bounds_report(
+pub(super) fn bounds_report(
     field: &'static str,
     bounds: SpectralNormBounds,
 ) -> Result<SpectralNormBoundsReport, MpdSurfaceError> {

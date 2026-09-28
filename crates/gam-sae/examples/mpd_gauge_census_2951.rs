@@ -7,28 +7,10 @@
 //! orbit dimension and the null coordinates. The difference is the part of the
 //! checkpoint that is pure implementation convention.
 //!
-//! Families, per layer:
-//! - `ov`: one `LinearPassthrough` per key/value group, reading the group's value head
-//!   and writing through the output columns of every query head sharing it (`GL(hd)`).
-//! - `qk`: `QueryKeyGauge` on the native attention with Qwen3's `q_norm`/`k_norm`
-//!   (the normed rotary family: plane scales and coincident-plane rotations).
-//! - `swiglu`: `SwigluUnits` (one nonzero up/down scale per unit).
-//! - `input_norm`, `post_norm`: `NormGain` with their linear reads.
-//!
-//! Globally: the residual-stream basis. `ResidualStreamGauge` gives `O(d)` for RMSNorm
-//! reads. A tied embedding/unembedding restricts it: the embedding write forces
-//! `E ↦ E Qᵀ` and the final-norm read `E diag(w) ↦ E diag(w) Qᵀ`, so `Q diag(w) Qᵀ`
-//! must stay diagonal. The identity component is the block-orthogonal group over the
-//! groups of bitwise-equal final gains, of dimension `Σ m_v (m_v − 1)/2`, and its orbit
-//! has that dimension when `E` has full column rank (resolved on a row subset, which
-//! bounds the rank from below). The final norm's own coordinate scales are not a gauge
-//! under the tie: they would rescale the embedding's writes.
-//!
-//! Additivity: every family moves a tensor no other family moves (each norm gain, the
-//! `q_norm`/`k_norm` gains, the embedding), or acts on coordinates disjoint from the
-//! other families' (value rows and output columns, up rows and down columns, the rows
-//! of coincident query/key planes). So the joint orbit's tangent is the direct sum of
-//! the families' tangents and the resolved orbit dimensions add.
+//! The families, their charges and the tied residual stream belong to
+//! `parameter_decomposition::gauge_census` (`decoder_layer_census`,
+//! `tied_residual_census`), which the MPD surface's `gauge_census` operation also runs.
+//! This example only reads the exported checkpoint and writes the receipt.
 //!
 //! ```text
 //! uv run --no-project --with numpy python bench/mpd_gauge_census_2951.py --out /tmp/census
@@ -36,17 +18,14 @@
 //!     --export /tmp/census --out experiments/issue-2951/receipts/gauge_census_Qwen3-0.6B-Base.json
 //! ```
 
-use gam_linalg::faer_ndarray::FaerSvd;
-use gam_linalg::roundoff::factor_singular_band;
-use gam_sae::parameter_decomposition::attention::{
-    AffineProjection, AttentionGeometry, NativeAttention, RotaryEmbedding, RotaryPairing,
+use gam_sae::parameter_decomposition::attention::{AttentionGeometry, RotaryEmbedding, RotaryPairing};
+use gam_sae::parameter_decomposition::gauge::GaugeFamily;
+use gam_sae::parameter_decomposition::gauge_census::{
+    CensusCharge, DecoderLayerTensors, decoder_layer_census, tied_residual_census,
 };
 use gam_sae::parameter_decomposition::operators::DeclaredGauge;
-use gam_sae::parameter_decomposition::gauge::{
-    GaugeFamily, LinearPassthrough, NormGain, QueryKeyGauge, ResidualRead, ResidualStreamGauge, SwigluUnits,
-};
 use memmap2::Mmap;
-use ndarray::{Array1, Array2, Axis, s};
+use ndarray::{Array1, Array2, Axis};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -140,52 +119,19 @@ fn usize_field(manifest: &Value, key: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("manifest.{key} missing"))
 }
 
-/// Running totals of one row of the census.
-#[derive(Clone, Copy, Default)]
-struct Tally {
-    parameters: usize,
-    orbit_resolved: usize,
-    orbit_at_most: usize,
-    null: usize,
+fn charge_json(charge: &CensusCharge) -> Value {
+    json!({
+        "parameters": charge.parameters,
+        "orbit_resolved": charge.orbit_resolved,
+        "orbit_at_most": charge.orbit_at_most,
+        "null": charge.null,
+        "real_coordinates_at_most": charge.real_coordinates_at_most(),
+        "convention_fraction": charge.convention_fraction(),
+    })
 }
 
-impl Tally {
-    fn add(&mut self, other: Tally) {
-        self.parameters += other.parameters;
-        self.orbit_resolved += other.orbit_resolved;
-        self.orbit_at_most += other.orbit_at_most;
-        self.null += other.null;
-    }
-
-    fn real_at_most(&self) -> usize {
-        self.parameters - self.orbit_resolved - self.null
-    }
-
-    fn json(&self) -> Value {
-        json!({
-            "parameters": self.parameters,
-            "orbit_resolved": self.orbit_resolved,
-            "orbit_at_most": self.orbit_at_most,
-            "null": self.null,
-            "real_coordinates_at_most": self.real_at_most(),
-            "convention_fraction": (self.orbit_resolved + self.null) as f64 / self.parameters as f64,
-        })
-    }
-}
-
-/// A family's orbit and null coordinates, charged against `parameters` stored
-/// coordinates of this row (reads shared with another family are charged there).
-fn charge(family: &GaugeFamily, parameters: usize) -> Tally {
-    Tally {
-        parameters,
-        orbit_resolved: family.orbit_dimension.resolved,
-        orbit_at_most: family.orbit_dimension.at_most,
-        null: family.null_coordinates,
-    }
-}
-
-fn family_json(family: &GaugeFamily, parameters: usize) -> Value {
-    let mut row = charge(family, parameters).json();
+fn family_json(family: &GaugeFamily, charge: &CensusCharge) -> Value {
+    let mut row = charge_json(charge);
     let fields = row.as_object_mut().expect("object");
     fields.insert("continuous".into(), json!(format!("{:?}", family.continuous)));
     fields.insert("discrete".into(), json!(format!("{:?}", family.discrete)));
@@ -199,14 +145,6 @@ fn family_json(family: &GaugeFamily, parameters: usize) -> Value {
         }),
     );
     row
-}
-
-/// Resolved rank above the SVD's backward-error band, as the gauge owner resolves it.
-fn resolved_rank(matrix: &Array2<f64>) -> Result<usize, String> {
-    let sigma = matrix.svd(false, false).map_err(|err| format!("svd: {err:?}"))?.1;
-    let sigma_max = sigma.iter().fold(0.0_f64, |largest, &value| largest.max(value));
-    let band = factor_singular_band(matrix.nrows(), matrix.ncols(), sigma_max);
-    Ok(sigma.iter().filter(|&&value| value > band).count())
 }
 
 fn run() -> Result<(), String> {
@@ -245,10 +183,8 @@ fn run() -> Result<(), String> {
         inverse_frequencies: (0..hd / 2).map(|j| theta.powf(-((2 * j) as f64) / hd as f64)).collect(),
         attention_scaling: 1.0,
     };
-    let group = n_heads / n_kv;
-
-    let mut total = Tally::default();
-    let mut by_family: BTreeMap<&str, Tally> = BTreeMap::new();
+    let mut total = CensusCharge::default();
+    let mut by_family: BTreeMap<&str, CensusCharge> = BTreeMap::new();
     let mut layer_rows = Vec::with_capacity(layers);
     let started = Instant::now();
     for layer in 0..layers {
@@ -265,78 +201,44 @@ fn run() -> Result<(), String> {
             .map(|(_, count)| count)
             .sum();
 
-        let mut families = Map::new();
-        let mut layer_tally = Tally::default();
-        let mut record = |name: &'static str, tally: Tally, row: Value, by_family: &mut BTreeMap<&str, Tally>| {
-            layer_tally.add(tally);
-            by_family.entry(name).or_default().add(tally);
-            families.insert(name.into(), row);
-        };
-
-        // OV: one GL(hd) pass-through per key/value group.
-        let mut ov = Tally::default();
-        let mut ov_exact = true;
-        for g in 0..n_kv {
-            let read = v.slice(s![g * hd..(g + 1) * hd, ..]).to_owned();
-            let mut write = Array2::<f64>::zeros((group * d, hd));
-            for member in 0..group {
-                let h = g * group + member;
-                write
-                    .slice_mut(s![member * d..(member + 1) * d, ..])
-                    .assign(&o.slice(s![.., h * hd..(h + 1) * hd]));
-            }
-            let family = LinearPassthrough::new(read, write)
-                .and_then(|block| block.family())
-                .map_err(|err| format!("layer {layer} ov group {g}: {err:?}"))?;
-            ov_exact &= family.orbit_dimension.is_exact();
-            ov.add(charge(&family, family.parameter_coordinates));
-        }
-        let mut ov_row = ov.json();
-        ov_row["groups"] = json!(n_kv);
-        ov_row["per_group"] = json!(format!("GL({hd})"));
-        ov_row["exact"] = json!(ov_exact);
-        record("ov", ov, ov_row, &mut by_family);
-
-        // QK behind q_norm / k_norm.
-        let zeros = |n: usize| Array1::<f64>::zeros(n);
-        let native = NativeAttention::new(
+        let census = decoder_layer_census(
             geometry,
-            rotary.clone(),
+            &rotary,
             1.0 / (hd as f64).sqrt(),
-            AffineProjection { weight: q.clone(), bias: zeros(n_heads * hd) },
-            AffineProjection { weight: k.clone(), bias: zeros(n_kv * hd) },
-            AffineProjection { weight: v.clone(), bias: zeros(n_kv * hd) },
-            AffineProjection { weight: o, bias: zeros(d) },
+            eps,
+            DecoderLayerTensors {
+                query: q.view(),
+                key: k.view(),
+                value: v.view(),
+                output: o.view(),
+                query_key_norm: Some((q_norm.view(), k_norm.view())),
+                gate: gate.view(),
+                up: up.view(),
+                down: down.view(),
+                input_norm: input_norm.view(),
+                post_norm: post_norm.view(),
+            },
         )
-        .and_then(|native| native.with_query_key_norm(eps, q_norm, k_norm))
-        .map_err(|err| format!("layer {layer} attention: {err:?}"))?;
-        let qk_family = QueryKeyGauge::new(&native)
-            .and_then(|gauge| gauge.family())
-            .map_err(|err| format!("layer {layer} qk: {err:?}"))?;
-        let qk_parameters = q.len() + k.len() + 2 * hd;
-        record("qk", charge(&qk_family, qk_parameters), family_json(&qk_family, qk_parameters), &mut by_family);
-        drop(native);
-
-        // Norm gains; their reads are charged to qk / ov / swiglu.
-        let input_family = NormGain::new(input_norm, None, vec![q, k, v])
-            .map(|norm| norm.family())
-            .map_err(|err| format!("layer {layer} input norm: {err:?}"))?;
-        record("input_norm", charge(&input_family, d), family_json(&input_family, d), &mut by_family);
-        let post_family = NormGain::new(post_norm, None, vec![gate.clone(), up.clone()])
-            .map(|norm| norm.family())
-            .map_err(|err| format!("layer {layer} post norm: {err:?}"))?;
-        record("post_norm", charge(&post_family, d), family_json(&post_family, d), &mut by_family);
-
-        let swiglu_family = SwigluUnits::new(gate, up, down)
-            .map(|units| units.family())
-            .map_err(|err| format!("layer {layer} swiglu: {err:?}"))?;
-        record(
-            "swiglu",
-            charge(&swiglu_family, swiglu_family.parameter_coordinates),
-            family_json(&swiglu_family, swiglu_family.parameter_coordinates),
-            &mut by_family,
-        );
-
+        .map_err(|err| format!("layer {layer}: {err:?}"))?;
+        let mut families = Map::new();
+        for (name, charge) in census.charges() {
+            by_family.entry(name).or_default().add(charge);
+            let row = match name {
+                "ov" => {
+                    let mut row = charge_json(&charge);
+                    row["groups"] = json!(n_kv);
+                    row["per_group"] = json!(format!("GL({hd})"));
+                    row["exact"] = json!(census.ov_exact());
+                    row
+                }
+                "qk" => family_json(&census.qk, &charge),
+                "input_norm" => family_json(&census.input_norm, &charge),
+                "post_norm" => family_json(&census.post_norm, &charge),
+                _ => family_json(&census.swiglu, &charge),
+            };
+            families.insert(name.into(), row);
+        }
+        let layer_tally = census.charge();
         if layer_tally.parameters != layer_parameters {
             return Err(format!(
                 "layer {layer}: families cover {} coordinates, the checkpoint stores {layer_parameters}",
@@ -344,7 +246,7 @@ fn run() -> Result<(), String> {
             ));
         }
         total.add(layer_tally);
-        let mut row = layer_tally.json();
+        let mut row = charge_json(&layer_tally);
         row["layer"] = json!(layer);
         row["families"] = Value::Object(families);
         println!(
@@ -352,7 +254,7 @@ fn run() -> Result<(), String> {
             layer_tally.parameters,
             layer_tally.orbit_resolved,
             layer_tally.null,
-            layer_tally.real_at_most(),
+            layer_tally.real_coordinates_at_most(),
             100.0 * (layer_tally.orbit_resolved + layer_tally.null) as f64 / layer_tally.parameters as f64,
             started.elapsed().as_secs_f64()
         );
@@ -362,36 +264,24 @@ fn run() -> Result<(), String> {
     // Residual stream, restricted by the tie.
     let final_norm = vector(&export.join("final_norm.npy"))?;
     let embed_rows = matrix(&export.join("embed_rows.npy"))?;
-    let embed_rank = resolved_rank(&embed_rows)?;
-    let stream = ResidualStreamGauge::new(d, &[ResidualRead::RmsNorm]).map_err(|err| format!("stream: {err:?}"))?;
-    let untied_dimension = stream.continuous().dimension();
-    let mut equal_gains: BTreeMap<u64, usize> = BTreeMap::new();
-    for &gain in final_norm.iter() {
-        *equal_gains.entry(gain.to_bits()).or_default() += 1;
-    }
-    let tied_dimension: usize = equal_gains.values().map(|&m| m * (m - 1) / 2).sum();
-    let largest_group = equal_gains.values().copied().max().unwrap_or(0);
-    let embed_parameters = vocab * d;
-    let residual = Tally {
-        parameters: embed_parameters + d,
-        orbit_resolved: if embed_rank == d { tied_dimension } else { 0 },
-        orbit_at_most: tied_dimension,
-        null: 0,
-    };
+    let tied = tied_residual_census(final_norm.view(), embed_rows.view(), vocab).map_err(|err| format!("residual: {err:?}"))?;
+    let residual = tied.charge;
+    let (embed_rank, untied_dimension, tied_dimension) = (tied.embedding_rank, tied.untied.dimension(), tied.tied_dimension);
+    let largest_group = tied.equal_gain_groups.first().copied().unwrap_or(0);
     total.add(residual);
     by_family.entry("residual").or_default().add(residual);
     if total.parameters != checkpoint_parameters {
         return Err(format!("census covers {} coordinates, the checkpoint stores {checkpoint_parameters}", total.parameters));
     }
-    let mut residual_row = residual.json();
-    residual_row["stream_group_untied"] = json!(format!("{:?}", stream.continuous()));
+    let mut residual_row = charge_json(&residual);
+    residual_row["stream_group_untied"] = json!(format!("{:?}", tied.untied));
     residual_row["stream_orbit_untied"] = json!(untied_dimension);
-    residual_row["final_gain_distinct_values"] = json!(equal_gains.len());
+    residual_row["final_gain_distinct_values"] = json!(tied.equal_gain_groups.len());
     residual_row["final_gain_largest_equal_group"] = json!(largest_group);
     residual_row["embedding_rank_resolved_on_rows"] = json!([embed_rank, embed_rows.len_of(Axis(0))]);
     residual_row["final_norm_gain_gauge"] = json!("none: tied embedding (its coordinate scales would rescale the embedding writes)");
 
-    let families_total: Map<String, Value> = by_family.iter().map(|(name, tally)| (name.to_string(), tally.json())).collect();
+    let families_total: Map<String, Value> = by_family.iter().map(|(name, tally)| (name.to_string(), charge_json(tally))).collect();
     let mut receipt = Map::new();
     receipt.insert("schema".into(), json!("mpd_gauge_census_2951/v1"));
     receipt.insert("model".into(), manifest["model"].clone());
@@ -408,7 +298,7 @@ fn run() -> Result<(), String> {
         "additivity".into(),
         json!("each family moves a tensor no other family moves (norm gains, q_norm/k_norm gains, embedding) or acts on disjoint coordinates (value rows / output columns, up rows / down columns, coincident query/key plane rows), so orbit dimensions add"),
     );
-    receipt.insert("total".into(), total.json());
+    receipt.insert("total".into(), charge_json(&total));
     receipt.insert("by_family".into(), Value::Object(families_total));
     receipt.insert("residual".into(), residual_row);
     receipt.insert("layers".into(), Value::Array(layer_rows));
@@ -424,7 +314,7 @@ fn run() -> Result<(), String> {
         total.orbit_resolved,
         total.orbit_at_most,
         total.null,
-        total.real_at_most(),
+        total.real_coordinates_at_most(),
         100.0 * (total.orbit_resolved + total.null) as f64 / total.parameters as f64
     );
     for (name, tally) in &by_family {
@@ -432,7 +322,7 @@ fn run() -> Result<(), String> {
     }
     println!(
         "residual: untied O({d}) would be {untied_dimension}; tie leaves {tied_dimension} ({} distinct final gains, largest group {largest_group}); embed rank {embed_rank}",
-        equal_gains.len()
+        tied.equal_gain_groups.len()
     );
     println!("wrote {}", out.display());
     Ok(())

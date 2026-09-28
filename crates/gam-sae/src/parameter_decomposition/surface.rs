@@ -31,28 +31,61 @@ use super::receipts::{
 };
 use super::cyclic_action::CyclicActionError;
 use super::secant::SecantError;
+use super::attention::AttentionProgramError;
+use super::canonical::CanonicalRefusal;
+use super::gauge::GaugeRefusal;
+use super::gauge_census::CensusRefusal;
 use super::state::StateError;
+use crate::response::finite_grid::FiniteGridError;
+use crate::response::interaction::InteractionError;
 use super::supports::EvidenceStatusError;
 use super::spectral::{
     PlaneRotationError, PlaneRotationRecovery, RotationAmbiguity, RotationClusterKind,
     recover_plane_rotations,
 };
 
+mod canonical;
 mod code;
 mod cyclic;
+mod finite_grid;
+mod gauge_census;
+mod layer;
 mod secant;
 mod state_quotient;
+mod verify;
 
+pub use canonical::{
+    CanonicalLayerReport, CanonicalLayerRequest, DefectReport, ElementsReport, ExecuteRequest,
+    ExecutionIds, ExecutionReport, NormReport, ProjectionReport, QueryKeyElementReport,
+    QueryKeyNormReport,
+};
 pub use code::{
     CodeItem, CodeLengthReport, CodeLengthsReport, CodeLengthsRequest, DecideProposalReport,
     DecideProposalRequest, EvidenceStatusWire, ExactBasisWire, ExtremumWire, FidelityVerdictWire,
     LatticeReport, ProposalDecision, ProposalKindWire, StatedArtifact,
+};
+pub use finite_grid::{
+    AdditiveAcrossPairReport, BandedEnergyReport, CrossBlockReport, FiniteGridReport,
+    FiniteGridRequest, GridCells, GridReindex, OutputFactor, RectangleComplementReport,
+    RectangleReport,
+};
+pub use gauge_census::{
+    CensusBlock, CensusBlockReport, CensusChargeReport, GaugeCensusReport, GaugeCensusRequest,
+    GaugeFamilyReport, NamedCharge, NamedFamily, TiedResidualReport,
+};
+pub use layer::{
+    AttentionRequest, GeometryRequest, ProjectionRequest, QueryKeyNormRequest, RmsNormRequest,
+    RotaryPairingRequest, RotaryRequest,
 };
 pub use secant::{SecantActivationWire, SecantOperator, SecantReport, SecantRequest};
 
 pub use cyclic::{
     CyclicBasis, CyclicPlanesReport, CyclicPlanesRequest, FrequencyEditReport, FrequencyEditRequest,
     PlaneProgramCodeReport, PlaneProgramCodeRequest,
+};
+pub use verify::{
+    BandedLogits, FamilyDomainReport, FamilyStatusWire, FamilyVerificationReport,
+    FamilyWitnessReport, ToleranceRequest, VerifyLogitsReport, VerifyLogitsRequest,
 };
 pub use state_quotient::{
     LinearChart, LinearStateQuotientReport, LinearStateQuotientRequest, SpectralNormBoundsReport,
@@ -141,6 +174,18 @@ pub enum MpdOperation {
     DecideProposal(DecideProposalRequest),
     /// One exact two-endpoint change operator with its bands (`secant`).
     Secant(SecantRequest),
+    /// The exhaustive FANOVA of a response on a declared finite product grid
+    /// (`response::finite_grid`, `response::interaction`).
+    FiniteGrid(FiniteGridRequest),
+    /// The implementation-gauge families of declared blocks, with their census charges
+    /// (`gauge`, `gauge_census`).
+    GaugeCensus(GaugeCensusRequest),
+    /// The canonical gauge form of a native decoder layer, with the group elements
+    /// applied (`canonical::DecoderLayer::canonical`).
+    CanonicalLayer(Box<CanonicalLayerRequest>),
+    /// Exhaustive verification and the counterfactual contract over supplied banded
+    /// logits (`verify::verify_counterfactual_contract`).
+    VerifyLogits(VerifyLogitsRequest),
 }
 
 /// [`ExternalExecution`] on the wire.
@@ -197,6 +242,10 @@ pub enum MpdResult {
     CodeLengths(CodeLengthsReport),
     DecideProposal(DecideProposalReport),
     Secant(SecantReport),
+    FiniteGrid(FiniteGridReport),
+    GaugeCensus(GaugeCensusReport),
+    CanonicalLayer(Box<CanonicalLayerReport>),
+    VerifyLogits(VerifyLogitsReport),
 }
 
 /// [`PlaneRotationRecovery`] on the wire.
@@ -363,6 +412,14 @@ pub enum MpdSurfaceError {
     /// An evidence-status constructor refused a supplied status.
     Evidence(EvidenceStatusError),
     Secant(SecantError),
+    FiniteGrid(FiniteGridError),
+    Interaction(InteractionError),
+    Gauge(GaugeRefusal),
+    Census(CensusRefusal),
+    Attention(AttentionProgramError),
+    Canonical(Box<CanonicalRefusal>),
+    /// The verification owner refused the family, the tolerance or a row.
+    Verify(String),
     /// A dense copy the surface forms does not fit the memory budget.
     Memory(MemoryReservationError),
     /// An owner returned a non-finite value where the wire report has no meaning
@@ -390,6 +447,13 @@ impl fmt::Display for MpdSurfaceError {
             Self::Code(reason) => write!(formatter, "{reason}"),
             Self::Evidence(error) => write!(formatter, "{error}"),
             Self::Secant(error) => write!(formatter, "{error}"),
+            Self::FiniteGrid(error) => write!(formatter, "{error}"),
+            Self::Interaction(error) => write!(formatter, "{error}"),
+            Self::Gauge(refusal) => write!(formatter, "gauge refused: {refusal:?}"),
+            Self::Census(refusal) => write!(formatter, "gauge census refused: {refusal:?}"),
+            Self::Attention(error) => write!(formatter, "{error}"),
+            Self::Canonical(refusal) => write!(formatter, "canonical form refused: {refusal:?}"),
+            Self::Verify(reason) => write!(formatter, "verification refused: {reason}"),
             Self::NonFiniteReport { field, value } => write!(
                 formatter,
                 "MPD report field {field} is {value}, which the wire report cannot state"
@@ -466,6 +530,10 @@ pub fn run_parameter_decomposition(
         MpdOperation::CodeLengths(request) => code::run_lengths(request, tensors, governor),
         MpdOperation::DecideProposal(request) => code::run_decide(request),
         MpdOperation::Secant(request) => secant::run(request, tensors, governor),
+        MpdOperation::FiniteGrid(request) => finite_grid::run(request, tensors, governor),
+        MpdOperation::GaugeCensus(request) => gauge_census::run(request, tensors, governor),
+        MpdOperation::CanonicalLayer(request) => canonical::run(*request, tensors, governor),
+        MpdOperation::VerifyLogits(request) => verify::run(request, tensors, governor),
     }
 }
 
