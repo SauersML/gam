@@ -6,12 +6,12 @@ factors         1      1      0      1    0.0173      1.0000    1.0000
 families       50     50     33     17   -0.0071      0.0027    0.0162
 manifolds      11     11      8      2   -0.0033      0.0527    0.0945
 misc           29     29     18     11   -0.0006      0.0630    0.0945
-smooths        41     41     25     16   -0.0100      0.0093    0.0278
+smooths        41     41     26     15   -0.0109      0.0061    0.0183
 survival       12     12      7      5   -0.0092      0.2349    0.2818
 ------------------------------------------------------------------------
-OVERALL       144    144     91     52   -0.0051      0.0000 
+OVERALL       144    144     92     51   -0.0058      0.0000 
 
-CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0000, median log(gam/ref)=-0.0051, wins 91 / losses 52)
+CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0000, median log(gam/ref)=-0.0058, wins 92 / losses 51)
 Experimental units: 144 cases from 185 metric pairs.
 INCOMPLETE: absent manifest, mismatched execution, or failed cases; closure blocked.
 
