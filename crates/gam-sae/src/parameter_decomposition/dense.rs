@@ -1,0 +1,533 @@
+//! Dense float64 decompositions on faer with deterministic signs (#2951).
+//!
+//! The operation-first probes read spectra, frames and solves of dense matrices. They
+//! call these through the MPD surface, so every decomposition is faer's at the
+//! parallelism `gam_linalg` names, never LAPACK's, and two runs of one matrix agree bit
+//! for bit.
+//!
+//! # Sign conventions
+//!
+//! A decomposition fixes each vector only up to sign. Here:
+//! - each eigenvector (column) has its largest-magnitude entry positive (the first
+//!   such entry on a tie);
+//! - each left singular vector (column of `U`) likewise, and the matching right
+//!   singular vector (row of `Vᵀ`) flips with it, so `U diag(σ) Vᵀ` is unchanged; a
+//!   right singular vector with no left partner (a full `Vᵀ` past `min(m, n)`) takes
+//!   the rule itself;
+//! - QR has `diag(R) ≥ 0`: row `i` of `R` and column `i` of `Q` flip together.
+//!
+//! Within a repeated eigenvalue or singular value the basis of the eigenspace is
+//! whatever faer returns; only signs are canonical.
+//!
+//! # Bands
+//!
+//! Singular values carry [`factor_singular_band`] (`max(m, n) ε σ₁`) and eigenvalues
+//! [`symmetric_spectrum_rounding_band`] (`n (ε ρ + η)`): a value within its band of
+//! zero is not resolved from zero by the decomposition that produced it.
+//! [`lstsq`]'s rank counts the singular values above its declared cutoff.
+
+use std::fmt;
+
+use faer::dyn_stack::{MemBuffer, MemStack};
+use faer::linalg::svd::{self as faer_svd, ComputeSvdVectors};
+use faer::{Mat, MatRef, Side};
+use gam_linalg::faer_ndarray::{FaerArrayView, FaerEigh, FaerLu, FaerQr, FaerSvd, decomposition_parallelism};
+use gam_linalg::roundoff::{factor_singular_band, symmetric_spectrum_rounding_band};
+use ndarray::{Array1, Array2, ArrayView2, Axis, concatenate, s};
+
+/// Why a dense decomposition was declined.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DenseError {
+    /// An entry is NaN or infinite.
+    NonFinite { what: &'static str },
+    /// The operation needs a square matrix.
+    NotSquare { rows: usize, cols: usize },
+    /// Two shapes that must agree do not.
+    Shape { what: &'static str, expected: usize, found: usize },
+    /// `LU` met a zero or non-finite pivot at this column.
+    Singular { column: usize },
+    /// A requested eigenvalue index range is empty or outside `0..n`.
+    InvalidRange { start: usize, end: usize, order: usize },
+    /// A least-squares cutoff that is negative or not finite.
+    InvalidCutoff { value: f64 },
+    /// The decomposition did not converge.
+    Decomposition { detail: String },
+}
+
+impl fmt::Display for DenseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonFinite { what } => write!(formatter, "dense {what}: non-finite entry"),
+            Self::NotSquare { rows, cols } => write!(formatter, "dense: a {rows} x {cols} matrix is not square"),
+            Self::Shape { what, expected, found } => {
+                write!(formatter, "dense {what}: expected {expected}, found {found}")
+            }
+            Self::Singular { column } => write!(formatter, "dense solve: singular at column {column}"),
+            Self::InvalidRange { start, end, order } => write!(
+                formatter,
+                "dense eigh: eigenvalue indices {start}..{end} are empty or outside 0..{order}"
+            ),
+            Self::InvalidCutoff { value } => {
+                write!(formatter, "dense lstsq: cutoff {value} is not finite and nonnegative")
+            }
+            Self::Decomposition { detail } => write!(formatter, "dense: decomposition failed: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for DenseError {}
+
+fn require_finite(what: &'static str, matrix: ArrayView2<'_, f64>) -> Result<(), DenseError> {
+    if matrix.iter().all(|value| value.is_finite()) {
+        Ok(())
+    } else {
+        Err(DenseError::NonFinite { what })
+    }
+}
+
+fn require_square(matrix: ArrayView2<'_, f64>) -> Result<usize, DenseError> {
+    let (rows, cols) = matrix.dim();
+    if rows == cols {
+        Ok(rows)
+    } else {
+        Err(DenseError::NotSquare { rows, cols })
+    }
+}
+
+fn decomposition(error: impl fmt::Debug) -> DenseError {
+    DenseError::Decomposition {
+        detail: format!("{error:?}"),
+    }
+}
+
+fn to_array(mat: MatRef<'_, f64>) -> Array2<f64> {
+    Array2::from_shape_fn((mat.nrows(), mat.ncols()), |(row, col)| mat[(row, col)])
+}
+
+/// `-1` when the first largest-magnitude entry of `vector` is negative, else `1`.
+fn canonical_sign<'a>(vector: impl Iterator<Item = &'a f64>) -> f64 {
+    let mut best = 0.0_f64;
+    let mut sign = 1.0;
+    for &value in vector {
+        if value.abs() > best {
+            best = value.abs();
+            sign = if value < 0.0 { -1.0 } else { 1.0 };
+        }
+    }
+    sign
+}
+
+/// Flips every column of `vectors` to the canonical sign, and returns the signs.
+fn canonical_columns(vectors: &mut Array2<f64>) -> Vec<f64> {
+    let mut signs = Vec::with_capacity(vectors.ncols());
+    for mut column in vectors.columns_mut() {
+        let sign = canonical_sign(column.iter());
+        if sign < 0.0 {
+            column.mapv_inplace(|value| -value);
+        }
+        signs.push(sign);
+    }
+    signs
+}
+
+/// A symmetric eigendecomposition `A = V diag(λ) Vᵀ`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Eigh {
+    /// Eigenvalues in increasing order.
+    pub values: Array1<f64>,
+    /// The matching eigenvectors as columns, `n × k`.
+    pub vectors: Array2<f64>,
+    /// Every eigenvalue of the whole spectrum is within this of an exact one.
+    pub band: f64,
+}
+
+/// Which triangle of a symmetric matrix is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Triangle {
+    Lower,
+    Upper,
+}
+
+fn side(triangle: Triangle) -> Side {
+    match triangle {
+        Triangle::Lower => Side::Lower,
+        Triangle::Upper => Side::Upper,
+    }
+}
+
+/// The eigenvalues of the symmetric matrix `a` (read from `triangle`), increasing, and
+/// their band.
+pub fn eigvalsh(a: ArrayView2<'_, f64>, triangle: Triangle) -> Result<(Array1<f64>, f64), DenseError> {
+    let decomposed = eigh(a, triangle, None)?;
+    Ok((decomposed.values, decomposed.band))
+}
+
+/// The eigendecomposition of the symmetric matrix `a` (read from `triangle`); with
+/// `indices`, only the eigenpairs `indices` in increasing eigenvalue order.
+pub fn eigh(
+    a: ArrayView2<'_, f64>,
+    triangle: Triangle,
+    indices: Option<(usize, usize)>,
+) -> Result<Eigh, DenseError> {
+    let order = require_square(a)?;
+    require_finite("eigh", a)?;
+    let (values, vectors) = a.eigh(side(triangle)).map_err(decomposition)?;
+    let band = symmetric_spectrum_rounding_band(values.as_slice().unwrap_or(&values.to_vec()));
+    let mut ranked: Vec<usize> = (0..order).collect();
+    ranked.sort_by(|&left, &right| values[left].total_cmp(&values[right]));
+    let (start, end) = indices.unwrap_or((0, order));
+    if start >= end || end > order {
+        return Err(DenseError::InvalidRange { start, end, order });
+    }
+    let chosen = &ranked[start..end];
+    let values = Array1::from_iter(chosen.iter().map(|&index| values[index]));
+    let mut vectors = vectors.select(Axis(1), chosen);
+    canonical_columns(&mut vectors);
+    Ok(Eigh { values, vectors, band })
+}
+
+/// A singular value decomposition `A = U diag(σ) Vᵀ`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Svd {
+    /// `m × k`, `k = min(m, n)` (thin) or `m` (full).
+    pub u: Array2<f64>,
+    /// `σ₁ ≥ σ₂ ≥ … ≥ 0`, `min(m, n)` of them.
+    pub singular_values: Array1<f64>,
+    /// `k × n`, `k = min(m, n)` (thin) or `n` (full).
+    pub vt: Array2<f64>,
+    /// Every singular value is within this of an exact one.
+    pub band: f64,
+}
+
+fn singular_band(a: ArrayView2<'_, f64>, singular_values: &Array1<f64>) -> f64 {
+    let sigma_max = singular_values.iter().fold(0.0_f64, |largest, &value| largest.max(value));
+    factor_singular_band(a.nrows(), a.ncols(), sigma_max)
+}
+
+/// The singular values of `a`, decreasing, and their band.
+pub fn svdvals(a: ArrayView2<'_, f64>) -> Result<(Array1<f64>, f64), DenseError> {
+    require_finite("svd", a)?;
+    let (_, sigma, _) = a.svd(false, false).map_err(decomposition)?;
+    let mut sigma = sigma.to_vec();
+    sigma.sort_by(|left, right| right.total_cmp(left));
+    let sigma = Array1::from(sigma);
+    let band = singular_band(a, &sigma);
+    Ok((sigma, band))
+}
+
+/// `‖A‖₂ = σ₁` and its band.
+pub fn spectral_norm(a: ArrayView2<'_, f64>) -> Result<(f64, f64), DenseError> {
+    let (sigma, band) = svdvals(a)?;
+    Ok((sigma.first().copied().unwrap_or(0.0), band))
+}
+
+/// The thin (`full = false`) or full singular value decomposition of `a`.
+pub fn svd(a: ArrayView2<'_, f64>, full: bool) -> Result<Svd, DenseError> {
+    require_finite("svd", a)?;
+    let (rows, cols) = a.dim();
+    let (u, sigma, vt) = if full {
+        full_svd(a)?
+    } else {
+        let (u, sigma, vt) = a.svd(true, true).map_err(decomposition)?;
+        let missing = || DenseError::Decomposition {
+            detail: "faer returned no singular vectors".to_string(),
+        };
+        (u.ok_or_else(missing)?, sigma, vt.ok_or_else(missing)?)
+    };
+    // Decreasing order, carrying the vectors.
+    let rank = rows.min(cols);
+    let mut order: Vec<usize> = (0..rank).collect();
+    order.sort_by(|&left, &right| sigma[right].total_cmp(&sigma[left]));
+    let leading_u = u.select(Axis(1), &order);
+    let leading_vt = vt.select(Axis(0), &order);
+    let mut u = concatenate![Axis(1), leading_u, u.slice(s![.., rank..])];
+    let mut vt = concatenate![Axis(0), leading_vt, vt.slice(s![rank.., ..])];
+    let singular_values = Array1::from_iter(order.iter().map(|&index| sigma[index]));
+    let signs = canonical_columns(&mut u);
+    for (index, mut row) in vt.rows_mut().into_iter().enumerate() {
+        let sign = if index < rank { signs[index] } else { canonical_sign(row.iter()) };
+        if sign < 0.0 {
+            row.mapv_inplace(|value| -value);
+        }
+    }
+    let band = singular_band(a, &singular_values);
+    Ok(Svd {
+        u,
+        singular_values,
+        vt,
+        band,
+    })
+}
+
+fn full_svd(a: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array1<f64>, Array2<f64>), DenseError> {
+    let view = FaerArrayView::new(&a);
+    let matrix = view.as_ref();
+    let (rows, cols) = matrix.shape();
+    let mut singular = faer::diag::Diag::<f64>::zeros(rows.min(cols));
+    let mut u = Mat::<f64>::zeros(rows, rows);
+    let mut v = Mat::<f64>::zeros(cols, cols);
+    let par = decomposition_parallelism();
+    let mut memory = MemBuffer::new(faer_svd::svd_scratch::<f64>(
+        rows,
+        cols,
+        ComputeSvdVectors::Full,
+        ComputeSvdVectors::Full,
+        par,
+        Default::default(),
+    ));
+    faer_svd::svd(
+        matrix,
+        singular.as_mut(),
+        Some(u.as_mut()),
+        Some(v.as_mut()),
+        par,
+        MemStack::new(&mut memory),
+        Default::default(),
+    )
+    .map_err(decomposition)?;
+    let sigma = Array1::from_iter((0..rows.min(cols)).map(|index| singular[index]));
+    Ok((to_array(u.as_ref()), sigma, to_array(v.as_ref()).reversed_axes().as_standard_layout().into_owned()))
+}
+
+/// What a QR decomposition returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QrMode {
+    /// `Q` `m × k`, `R` `k × n`, `k = min(m, n)`.
+    Economic,
+    /// `Q` `m × m`, `R` `m × n`.
+    Full,
+    /// `R` alone, `k × n`.
+    R,
+}
+
+/// `A = Q R` with `diag(R) ≥ 0`; `q` is absent in [`QrMode::R`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Qr {
+    pub q: Option<Array2<f64>>,
+    pub r: Array2<f64>,
+}
+
+/// The Householder QR of `a` (faer).
+///
+/// The full `Q` is the QR of `[A | I_m]`: Householder QR reduces columns in order, so
+/// its first `n` columns are reduced exactly as `A`'s are, its `R` begins with `A`'s
+/// `R` (zero below row `min(m, n)`), and its `Q` is `m × m`.
+pub fn qr(a: ArrayView2<'_, f64>, mode: QrMode) -> Result<Qr, DenseError> {
+    require_finite("qr", a)?;
+    let (rows, cols) = a.dim();
+    let (mut q, mut r) = match mode {
+        QrMode::Full if rows > cols => {
+            let augmented = concatenate![Axis(1), a, Array2::<f64>::eye(rows)];
+            let (q, r) = augmented.qr().map_err(decomposition)?;
+            (q, r.slice(s![.., ..cols]).to_owned())
+        }
+        _ => a.qr().map_err(decomposition)?,
+    };
+    for index in 0..r.nrows().min(r.ncols()) {
+        if r[[index, index]] < 0.0 {
+            r.row_mut(index).mapv_inplace(|value| -value);
+            q.column_mut(index).mapv_inplace(|value| -value);
+        }
+    }
+    Ok(Qr {
+        q: (mode != QrMode::R).then_some(q),
+        r,
+    })
+}
+
+/// `A⁻¹ B` for a square `A` by partial-pivot LU; refused at a zero pivot.
+pub fn solve(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Result<Array2<f64>, DenseError> {
+    let order = require_square(a)?;
+    require_finite("solve matrix", a)?;
+    require_finite("solve right-hand side", b)?;
+    if b.nrows() != order {
+        return Err(DenseError::Shape {
+            what: "solve right-hand side rows",
+            expected: order,
+            found: b.nrows(),
+        });
+    }
+    let matrix = FaerArrayView::new(&a);
+    let lu = FaerLu::new(matrix.as_ref()).map_err(|column| DenseError::Singular { column })?;
+    let rhs = FaerArrayView::new(&b);
+    Ok(to_array(lu.solve(rhs.as_ref()).as_ref()))
+}
+
+/// The singular-value cutoff of [`lstsq`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LstsqCutoff {
+    /// `max(m, n) ε σ₁`, the decomposition's own band (numpy's `rcond=None`).
+    Band,
+    /// `rcond σ₁`.
+    Relative(f64),
+}
+
+/// The minimum-norm least-squares solution of `A X ≈ B`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Lstsq {
+    /// `V diag(1/σᵢ for σᵢ > cutoff) Uᵀ B`, `n × p`.
+    pub solution: Array2<f64>,
+    /// The singular values above the cutoff.
+    pub rank: usize,
+    pub singular_values: Array1<f64>,
+    pub cutoff: f64,
+    /// `‖A x_j − b_j‖²` per column, from the returned solution.
+    pub residual_sum_squares: Array1<f64>,
+}
+
+/// `min ‖X‖_F` among the minimizers of `‖A X − B‖_F`, through the thin SVD.
+pub fn lstsq(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>, cutoff: LstsqCutoff) -> Result<Lstsq, DenseError> {
+    require_finite("lstsq right-hand side", b)?;
+    if b.nrows() != a.nrows() {
+        return Err(DenseError::Shape {
+            what: "lstsq right-hand side rows",
+            expected: a.nrows(),
+            found: b.nrows(),
+        });
+    }
+    if let LstsqCutoff::Relative(value) = cutoff
+        && !(value.is_finite() && value >= 0.0)
+    {
+        return Err(DenseError::InvalidCutoff { value });
+    }
+    let decomposed = svd(a, false)?;
+    let sigma_max = decomposed.singular_values.first().copied().unwrap_or(0.0);
+    let cutoff = match cutoff {
+        LstsqCutoff::Band => decomposed.band,
+        LstsqCutoff::Relative(rcond) => rcond * sigma_max,
+    };
+    let rank = decomposed.singular_values.iter().filter(|&&value| value > cutoff).count();
+    let projected = decomposed.u.slice(s![.., ..rank]).t().dot(&b);
+    let scaled = Array2::from_shape_fn(projected.dim(), |(row, col)| {
+        projected[[row, col]] / decomposed.singular_values[row]
+    });
+    let solution = decomposed.vt.slice(s![..rank, ..]).t().dot(&scaled);
+    let residual = a.dot(&solution) - b;
+    let residual_sum_squares = residual.map_axis(Axis(0), |column| column.iter().map(|value| value * value).sum());
+    Ok(Lstsq {
+        solution,
+        rank,
+        singular_values: decomposed.singular_values,
+        cutoff,
+        residual_sum_squares,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    fn close(left: &Array2<f64>, right: &Array2<f64>, tolerance: f64) -> bool {
+        left.dim() == right.dim() && left.iter().zip(right).all(|(a, b)| (a - b).abs() <= tolerance)
+    }
+
+    #[test]
+    fn eigh_of_a_known_matrix_has_canonical_signs() {
+        // Eigenvalues 1 and 3 of [[2, 1], [1, 2]], eigenvectors (1, −1)/√2 and (1, 1)/√2.
+        let a = array![[2.0, 1.0], [1.0, 2.0]];
+        let decomposed = eigh(a.view(), Triangle::Lower, None).expect("eigh");
+        assert!((decomposed.values[0] - 1.0).abs() < 1e-14 && (decomposed.values[1] - 3.0).abs() < 1e-14);
+        let root = std::f64::consts::FRAC_1_SQRT_2;
+        // Largest-magnitude entries tie; the first one is made positive.
+        assert!(close(&decomposed.vectors, &array![[root, root], [-root, root]], 1e-14));
+        let top = eigh(a.view(), Triangle::Lower, Some((1, 2))).expect("subset");
+        assert_eq!(top.values.len(), 1);
+        assert!((top.values[0] - 3.0).abs() < 1e-14);
+        // The upper triangle is not read from the lower.
+        let lower_only = array![[2.0, 99.0], [1.0, 2.0]];
+        assert_eq!(eigvalsh(lower_only.view(), Triangle::Lower).expect("lower").0, eigvalsh(a.view(), Triangle::Lower).expect("a").0);
+    }
+
+    #[test]
+    fn a_repeated_eigenvalue_keeps_an_orthonormal_eigenspace() {
+        let a = Array2::<f64>::eye(3) * 2.0;
+        let decomposed = eigh(a.view(), Triangle::Lower, None).expect("eigh");
+        assert!(decomposed.values.iter().all(|&value| (value - 2.0).abs() < 1e-14));
+        let gram = decomposed.vectors.t().dot(&decomposed.vectors);
+        assert!(close(&gram, &Array2::eye(3), 1e-14));
+        for column in decomposed.vectors.columns() {
+            assert!(canonical_sign(column.iter()) > 0.0);
+        }
+    }
+
+    #[test]
+    fn svd_reconstructs_and_is_sign_canonical_including_rank_deficiency() {
+        // Rank one: σ = (5√2, 0).
+        let a = array![[3.0, 4.0], [3.0, 4.0], [0.0, 0.0]];
+        for full in [false, true] {
+            let decomposed = svd(a.view(), full).expect("svd");
+            assert!((decomposed.singular_values[0] - 50.0_f64.sqrt()).abs() < 1e-13);
+            assert!(decomposed.singular_values[1].abs() <= decomposed.band);
+            let k = decomposed.singular_values.len();
+            let rebuilt = decomposed.u.slice(s![.., ..k]).dot(&Array2::from_diag(&decomposed.singular_values)).dot(&decomposed.vt.slice(s![..k, ..]));
+            assert!(close(&rebuilt, &a, 1e-13));
+            assert_eq!(decomposed.u.dim(), if full { (3, 3) } else { (3, 2) });
+            assert_eq!(decomposed.vt.dim(), (2, 2));
+            for column in decomposed.u.columns() {
+                assert!(canonical_sign(column.iter()) > 0.0);
+            }
+            let orthogonal = decomposed.u.t().dot(&decomposed.u);
+            assert!(close(&orthogonal, &Array2::eye(decomposed.u.ncols()), 1e-13));
+        }
+        let (values, band) = svdvals(a.view()).expect("svdvals");
+        assert!((values[0] - 50.0_f64.sqrt()).abs() < 1e-13 && band > 0.0);
+        assert!((spectral_norm(a.view()).expect("norm").0 - 50.0_f64.sqrt()).abs() < 1e-13);
+    }
+
+    #[test]
+    fn qr_has_a_nonnegative_diagonal_in_every_mode() {
+        let a = array![[1.0, 2.0], [3.0, 4.0], [5.0, 7.0]];
+        for mode in [QrMode::Economic, QrMode::Full, QrMode::R] {
+            let decomposed = qr(a.view(), mode).expect("qr");
+            let r = &decomposed.r;
+            for index in 0..r.nrows().min(r.ncols()) {
+                assert!(r[[index, index]] >= 0.0);
+            }
+            match (&decomposed.q, mode) {
+                (None, QrMode::R) => assert_eq!(r.dim(), (2, 2)),
+                (Some(q), QrMode::Economic) => {
+                    assert_eq!(q.dim(), (3, 2));
+                    assert!(close(&q.dot(r), &a, 1e-13));
+                }
+                (Some(q), QrMode::Full) => {
+                    assert_eq!((q.dim(), r.dim()), ((3, 3), (3, 2)));
+                    assert!(close(&q.dot(r), &a, 1e-13));
+                    assert!(close(&q.t().dot(q), &Array2::eye(3), 1e-13));
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        // R alone is the economic R.
+        assert_eq!(qr(a.view(), QrMode::R).expect("r").r, qr(a.view(), QrMode::Economic).expect("e").r);
+    }
+
+    #[test]
+    fn solve_and_lstsq_match_known_answers_and_refuse_singular_systems() {
+        let a = array![[2.0, 1.0], [1.0, 3.0]];
+        let b = array![[3.0], [5.0]];
+        let x = solve(a.view(), b.view()).expect("solve");
+        assert!(close(&x, &array![[0.8], [1.4]], 1e-14));
+        assert_eq!(
+            solve(array![[1.0, 2.0], [2.0, 4.0]].view(), b.view()),
+            Err(DenseError::Singular { column: 1 })
+        );
+        // Rank-deficient least squares: the minimum-norm solution of [1 1] x = 2 is (1, 1).
+        let wide = array![[1.0, 1.0]];
+        let solved = lstsq(wide.view(), array![[2.0]].view(), LstsqCutoff::Band).expect("lstsq");
+        assert_eq!(solved.rank, 1);
+        assert!(close(&solved.solution, &array![[1.0], [1.0]], 1e-14));
+        // Overdetermined: fit y = x through (0, 0), (1, 1), (2, 3); slope 7/5 at no intercept.
+        let tall = array![[0.0], [1.0], [2.0]];
+        let fitted = lstsq(tall.view(), array![[0.0], [1.0], [3.0]].view(), LstsqCutoff::Relative(1e-12)).expect("lstsq");
+        assert!((fitted.solution[[0, 0]] - 1.4).abs() < 1e-14);
+        assert!((fitted.residual_sum_squares[0] - 0.2).abs() < 1e-13);
+        // A repeated column: rank 1 at the band.
+        let repeated = array![[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]];
+        assert_eq!(lstsq(repeated.view(), array![[1.0], [2.0], [3.0]].view(), LstsqCutoff::Band).expect("lstsq").rank, 1);
+        assert!(matches!(lstsq(tall.view(), array![[0.0], [1.0], [3.0]].view(), LstsqCutoff::Relative(-1.0)), Err(DenseError::InvalidCutoff { .. })));
+        assert!(matches!(eigh(array![[1.0, 2.0]].view(), Triangle::Lower, None), Err(DenseError::NotSquare { .. })));
+        assert!(matches!(svd(array![[f64::NAN]].view(), false), Err(DenseError::NonFinite { .. })));
+        assert!(matches!(eigh(a.view(), Triangle::Lower, Some((1, 1))), Err(DenseError::InvalidRange { .. })));
+    }
+}

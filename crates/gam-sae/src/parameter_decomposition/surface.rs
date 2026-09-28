@@ -32,6 +32,7 @@ use super::receipts::{
 use super::cyclic_action::CyclicActionError;
 use super::secant::SecantError;
 use super::attention::AttentionProgramError;
+use super::dense::DenseError;
 use super::canonical::CanonicalRefusal;
 use super::gauge::GaugeRefusal;
 use super::gauge_census::CensusRefusal;
@@ -47,6 +48,7 @@ use super::spectral::{
 mod canonical;
 mod code;
 mod cyclic;
+mod dense;
 mod finite_grid;
 mod gauge_census;
 mod layer;
@@ -63,6 +65,10 @@ pub use code::{
     CodeItem, CodeLengthReport, CodeLengthsReport, CodeLengthsRequest, DecideProposalReport,
     DecideProposalRequest, EvidenceStatusWire, ExactBasisWire, ExtremumWire, FidelityVerdictWire,
     LatticeReport, ProposalDecision, ProposalKindWire, StatedArtifact,
+};
+pub use dense::{
+    CutoffRequest, DenseOperation, DenseReport, DenseRequest, DenseResult, QrModeRequest,
+    TriangleRequest,
 };
 pub use finite_grid::{
     AdditiveAcrossPairReport, BandedEnergyReport, CrossBlockReport, FiniteGridReport,
@@ -186,6 +192,9 @@ pub enum MpdOperation {
     /// Exhaustive verification and the counterfactual contract over supplied banded
     /// logits (`verify::verify_counterfactual_contract`).
     VerifyLogits(VerifyLogitsRequest),
+    /// One dense float64 decomposition on faer with canonical signs (`dense`):
+    /// `eigh`, `eigvalsh`, `svd`, `svdvals`, `qr`, `solve`, `lstsq`, `spectral_norm`.
+    Dense(DenseOperation),
 }
 
 /// [`ExternalExecution`] on the wire.
@@ -246,6 +255,7 @@ pub enum MpdResult {
     GaugeCensus(GaugeCensusReport),
     CanonicalLayer(Box<CanonicalLayerReport>),
     VerifyLogits(VerifyLogitsReport),
+    Dense(DenseResult),
 }
 
 /// [`PlaneRotationRecovery`] on the wire.
@@ -418,6 +428,7 @@ pub enum MpdSurfaceError {
     Census(CensusRefusal),
     Attention(AttentionProgramError),
     Canonical(Box<CanonicalRefusal>),
+    Dense(DenseError),
     /// The verification owner refused the family, the tolerance or a row.
     Verify(String),
     /// A dense copy the surface forms does not fit the memory budget.
@@ -454,6 +465,7 @@ impl fmt::Display for MpdSurfaceError {
             Self::Attention(error) => write!(formatter, "{error}"),
             Self::Canonical(refusal) => write!(formatter, "canonical form refused: {refusal:?}"),
             Self::Verify(reason) => write!(formatter, "verification refused: {reason}"),
+            Self::Dense(error) => write!(formatter, "{error}"),
             Self::NonFiniteReport { field, value } => write!(
                 formatter,
                 "MPD report field {field} is {value}, which the wire report cannot state"
@@ -534,6 +546,7 @@ pub fn run_parameter_decomposition(
         MpdOperation::GaugeCensus(request) => gauge_census::run(request, tensors, governor),
         MpdOperation::CanonicalLayer(request) => canonical::run(*request, tensors, governor),
         MpdOperation::VerifyLogits(request) => verify::run(request, tensors, governor),
+        MpdOperation::Dense(request) => dense::run(request, tensors, governor),
     }
 }
 

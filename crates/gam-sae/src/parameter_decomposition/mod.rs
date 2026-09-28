@@ -176,6 +176,9 @@ pub mod replay;
 // Exhaustive verification of an explanation against the native model over a declared finite family.
 pub mod verify;
 
+// Dense float64 decompositions on faer with canonical signs, for the probes.
+pub mod dense;
+
 // Exact two-endpoint finite-change operators: softmax, RMSNorm, bilinear products, gated activations.
 pub mod secant;
 
