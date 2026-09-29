@@ -30,11 +30,13 @@
 //! products, the basis's orthonormality defect `ω` entering as `(1 + ω)`) and its own
 //! spectrum band are added.
 
-use gam_linalg::roundoff::{accumulation_growth, null_quadratic_band, orthonormality_defect_bound};
+use gam_linalg::roundoff::{
+    SymmetricAssembly, accumulation_growth, null_quadratic_band, orthonormality_defect_bound,
+};
 use gam_math::roundoff::inflated;
 use ndarray::{Array1, Array2, ArrayView2, Axis};
 
-use super::super::dense::{Triangle, eigh};
+use super::super::dense::eigh;
 use super::super::supports::{EvidenceStatus, ExactBasis};
 use super::linear::frobenius;
 use super::{CompileError, require_finite, require_shape};
@@ -93,7 +95,7 @@ pub fn physically_null_supremum(
             reason: "an edit space needs at least one coordinate".to_string(),
         });
     }
-    let decomposed = eigh(edit_gram, Triangle::Lower, None)?;
+    let decomposed = eigh(edit_gram, SymmetricAssembly::Mirrored, None)?;
     let beta = decomposed.band;
     let resolved: Vec<usize> = (0..n).filter(|&i| decomposed.values[i] > beta).collect();
     let kernel: Vec<usize> = (0..n).filter(|&i| decomposed.values[i] <= beta).collect();
@@ -105,7 +107,7 @@ pub fn physically_null_supremum(
         let null_basis = decomposed.vectors.select(Axis(1), &kernel);
         let reduced = null_basis.t().dot(&response_gram.dot(&null_basis));
         let symmetrized = (&reduced + &reduced.t()) * 0.5;
-        let top = eigh(symmetrized.view(), Triangle::Lower, None)?;
+        let top = eigh(symmetrized.view(), SymmetricAssembly::Mirrored, None)?;
         let last = kernel.len() - 1;
         let direction = null_basis.dot(&top.vectors.column(last));
         let length = direction.dot(&direction).sqrt();
@@ -144,7 +146,7 @@ pub fn physically_null_supremum(
     let reduced = scaled.t().dot(&response_gram.dot(&scaled));
     let reduced = (&reduced + &reduced.t()) * 0.5;
     let rank = resolved.len();
-    let top = eigh(reduced.view(), Triangle::Lower, None)?;
+    let top = eigh(reduced.view(), SymmetricAssembly::Mirrored, None)?;
     let supremum = top.values[rank - 1];
     let witness = scaled.dot(&top.vectors.column(rank - 1));
     let absolute = scaled.mapv(f64::abs);
