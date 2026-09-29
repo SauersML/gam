@@ -42,6 +42,7 @@ fit.rs ``decide_proposal``, both through the MPD surface. eps is the only declar
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -1141,7 +1142,10 @@ def main():
     grid = np.arange(p * p)
     a, b = grid // p, grid % p
     shifts = args.shifts or list(range(1, p))
-    res = {"run": os.path.basename(args.run), "step": step, "config": cfg, "read": args.read, "read_frac": args.read_frac,
+    with open(args.run, "rb") as fh:
+        checkpoint_sha256 = hashlib.sha256(fh.read()).hexdigest()
+    res = {"run": os.path.basename(args.run), "checkpoint_sha256": checkpoint_sha256, "step": step, "config": cfg,
+           "read": args.read, "read_frac": args.read_frac,
            "model_params": int(sum(v.size for k, v in W.items() if k != "causal"))}
     if args.select == "greedy":
         return greedy_main(args, cfg, step, W, res)
