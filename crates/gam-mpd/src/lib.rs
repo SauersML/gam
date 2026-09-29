@@ -159,6 +159,12 @@ pub mod compile;
 // Dense float64 decompositions on faer with canonical signs, for the probes.
 pub mod dense;
 
+// A `.safetensors` checkpoint read into exactly widened binary64 arrays.
+pub mod safetensors;
+
+// The LlamaSimpleMLP decoder (VPD's Pile target) executed from its checkpoint with forward-error radii.
+pub mod llama_simple_mlp;
+
 // Exact two-endpoint finite-change operators: softmax, RMSNorm, bilinear products, gated activations.
 pub mod secant;
 
