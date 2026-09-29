@@ -6,6 +6,9 @@ Stage S0 is torch only.
 * ``train`` fits the one-layer grokking transformer on ``(a + b) mod p``, or on iid random
   labels over the same split (control C2). Config, split, curves and checkpoints go into ONE
   file; the step-0 checkpoint is control C1, the random init of the same run.
+* ``check`` writes one JSON card for a stored run: train and held-out accuracy, the Fourier
+  power spectrum of W_E (top-k share and frequencies), the parameter count and the file's
+  sha256. It is the grokking gate for the tiny development ladder (small p, d_model 32).
 * ``s0`` runs the executor controls and the benchmark oracle on stored checkpoints and writes
   one JSON receipt.
 * ``execute`` is the torch driver of a Rust receipt, picked by the settings' ``stage``:
@@ -26,6 +29,7 @@ Rust, and later stages call it through the gamfit surface.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -371,6 +375,59 @@ def s0_checkpoint(run, step, args):
     return out
 
 
+def check(args):
+    """The run card: accuracies, the W_E spectrum and the identity of the stored file."""
+    with open(args.run, "rb") as handle:
+        sha256 = hashlib.sha256(handle.read()).hexdigest()
+    run = torch.load(args.run, map_location="cpu", weights_only=True)
+    config = run["config"]
+    p = config["p"]
+    step = max(run["checkpoints"])
+    model = build_model(config)
+    model.load_state_dict(run["checkpoints"][step])
+    model = model.eval()
+    with torch.inference_mode():
+        hit = model(all_pairs(p)).argmax(-1) == run["labels"]
+    train_acc = hit[run["train_idx"]].double().mean().item()
+    test_acc = hit[run["test_idx"]].double().mean().item()
+    spectra = {}
+    for name, table in (("W_E", model.W_E.detach()[:p]), ("W_U", model.W_U.detach())):
+        _, _, power, total = fourier_planes(table.double(), p)
+        share = power / total
+        order = torch.argsort(share, descending=True)
+        spectra[name] = {
+            "frequencies": [int(k) + 1 for k in order],
+            "share": [share[k].item() for k in order],
+            "top_k_share": {str(k): share[order[:k]].sum().item() for k in range(1, args.kmax + 1)},
+            "dc_share": 1 - share.sum().item(),
+        }
+    top = spectra["W_E"]["top_k_share"][str(args.concentration_k)]
+    curves = run["curves"]
+    reached = [step for step, acc in zip(curves["step"], curves["test_acc"]) if acc >= args.min_test_acc]
+    card = {
+        "run": os.path.abspath(args.run),
+        "sha256": sha256,
+        "config": config,
+        "step": step,
+        "parameter_count": sum(t.numel() for t in model.parameters()),
+        "train_pairs": run["train_idx"].numel(),
+        "test_pairs": run["test_idx"].numel(),
+        "train_acc": train_acc,
+        "test_acc": test_acc,
+        "first_eval_step_at_min_test_acc": reached[0] if reached else None,
+        "spectrum": spectra,
+        "grokked": test_acc >= args.min_test_acc and top >= args.min_concentration,
+        "grokked_rule": f"test_acc >= {args.min_test_acc} and the top {args.concentration_k} W_E "
+                        f"frequencies carry >= {args.min_concentration} of W_E's squared norm",
+    }
+    with open(args.out + ".partial", "w") as handle:
+        json.dump(card, handle, indent=1)
+    os.replace(args.out + ".partial", args.out)
+    print(f"CHECK {args.run} train_acc={train_acc:.4f} test_acc={test_acc:.4f} "
+          f"W_E top frequencies {spectra['W_E']['frequencies'][:args.kmax]} "
+          f"top-{args.concentration_k} share={top:.4f} grokked={card['grokked']}", flush=True)
+
+
 def s0(args):
     run = torch.load(args.run, map_location="cpu", weights_only=True)
     steps = args.checkpoints or [max(run["checkpoints"])]
@@ -485,6 +542,13 @@ def main():
     fit.add_argument("--seed", type=int, required=True)
     fit.add_argument("--device", required=True)
     fit.add_argument("--out", required=True)
+    card = commands.add_parser("check")
+    card.add_argument("--run", required=True)
+    card.add_argument("--kmax", type=int, default=8)
+    card.add_argument("--min-test-acc", type=float, default=0.999)
+    card.add_argument("--concentration-k", type=int, required=True)
+    card.add_argument("--min-concentration", type=float, required=True)
+    card.add_argument("--out", required=True)
     receipt = commands.add_parser("s0")
     receipt.add_argument("--run", required=True)
     receipt.add_argument("--checkpoints", type=int_list, default=[])
@@ -499,6 +563,8 @@ def main():
     args = parser.parse_args()
     if args.command == "train":
         train(args)
+    elif args.command == "check":
+        check(args)
     elif args.command == "s0":
         s0(args)
     else:
