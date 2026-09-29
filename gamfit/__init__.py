@@ -22,7 +22,7 @@ attribute access:
 - ``gamfit.sae`` -- sparse-dictionary and SAE-manifold tools
 - ``gamfit.identifiability``, ``gamfit.inference``, ``gamfit.response_geometry``,
   ``gamfit.diagnostics``, ``gamfit.kernels``, ``gamfit.cuda``,
-  ``gamfit.examples``, ``gamfit.sklearn``, ``gamfit.torch``
+  ``gamfit.sklearn``, ``gamfit.torch``
 
 Quick start::
 
@@ -92,7 +92,6 @@ _SUBMODULES = frozenset(
         "cuda",
         "diagnostics",
         "errors",
-        "examples",
         "geometry",
         "identifiability",
         "inference",
@@ -121,7 +120,6 @@ if _TYPE_CHECKING:
         cuda,
         diagnostics,
         errors,
-        examples,
         geometry,
         identifiability,
         inference,

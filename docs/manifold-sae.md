@@ -786,12 +786,12 @@ audits with a warning.
 
 ## Supervised SAE
 
-`gamfit.examples.sae_supervised` fits a manifold dictionary jointly with a supervised
+`examples/sae_supervised.py` fits a manifold dictionary jointly with a supervised
 GLM head, so the learned atoms are predictive of a label on the rows where one
 is available (semi-supervised: `supervised_mask` selects them):
 
 ```python no-exec
-fit = gamfit.examples.sae_supervised(
+fit = sae_supervised(
     X, Y, supervised_mask,        # (N, p) data, (N,) labels, (N,) bool mask
     K=16, d_atom=2,
     atom_topology="circle",       # default

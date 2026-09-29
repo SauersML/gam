@@ -1,4 +1,4 @@
-"""Smoke test for gamfit.examples.partial_supervision.
+"""Smoke test for examples/partial_supervision.py.
 
 Constructs a synthetic 200x6 latent that contains the auxiliary signal
 in the first three columns plus noise, plus three free noise columns
@@ -17,7 +17,16 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-import gamfit
+
+import sys
+from pathlib import Path
+
+# The example is a script in examples/, not a gamfit submodule.
+_EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
+if str(_EXAMPLES) not in sys.path:
+    sys.path.insert(0, str(_EXAMPLES))
+
+import partial_supervision as partial_supervision_example  # noqa: E402
 
 
 def _column_correlations(A: np.ndarray, B: np.ndarray) -> np.ndarray:
@@ -46,7 +55,7 @@ def test_partial_supervision_procrustes_smoke() -> None:
     rng = np.random.default_rng(20260525)
     X, aux, T_init = _build_synthetic(rng)
 
-    example = gamfit.examples.partial_supervision(
+    example = partial_supervision_example.partial_supervision(
         T_dim=6,
         aux=aux,
         d_supervised=3,
@@ -86,7 +95,7 @@ def test_partial_supervision_anchor_and_softl2_smoke() -> None:
     rng = np.random.default_rng(7)
     X, aux, T_init = _build_synthetic(rng)
 
-    anchor = gamfit.examples.partial_supervision(
+    anchor = partial_supervision_example.partial_supervision(
         T_dim=6, aux=aux, d_supervised=3, d_free=3,
         sup_method="anchor", free_constraint="orthogonal_to_sup",
         anchor_idx=list(range(20)),
@@ -95,7 +104,7 @@ def test_partial_supervision_anchor_and_softl2_smoke() -> None:
     assert anchor.map_A is not None and anchor.map_A.shape == (3, 3)
     assert anchor.map_b is not None and anchor.map_b.shape == (3,)
 
-    soft = gamfit.examples.partial_supervision(
+    soft = partial_supervision_example.partial_supervision(
         T_dim=6, aux=aux, d_supervised=3, d_free=3,
         sup_method="soft_l2", free_constraint=None,
     ).fit(X, T_init=T_init)
@@ -106,12 +115,12 @@ def test_partial_supervision_anchor_and_softl2_smoke() -> None:
 def test_partial_supervision_shape_guards() -> None:
     rng = np.random.default_rng(1)
     with pytest.raises(ValueError, match="d_supervised \\+ d_free"):
-        gamfit.examples.partial_supervision(
+        partial_supervision_example.partial_supervision(
             T_dim=6, aux=rng.standard_normal((10, 3)),
             d_supervised=3, d_free=2,
         )
     with pytest.raises(ValueError, match="aux must have d_supervised"):
-        gamfit.examples.partial_supervision(
+        partial_supervision_example.partial_supervision(
             T_dim=6, aux=rng.standard_normal((10, 2)),
             d_supervised=3, d_free=3,
         )

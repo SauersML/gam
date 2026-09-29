@@ -33,7 +33,7 @@ Everything else lives in a public submodule, imported on first access
 | `gamfit.inference` | conformal, Bartlett, and shared-precision inference helpers |
 | `gamfit.response_geometry` | compositional / spherical response transforms |
 | `gamfit.cuda` | CUDA runtime diagnostics |
-| `gamfit.diagnostics`, `gamfit.kernels`, `gamfit.examples` | diagnostic tools, kernels, worked examples |
+| `gamfit.diagnostics`, `gamfit.kernels` | diagnostic tools, kernels |
 | `gamfit.sklearn`, `gamfit.torch` | scikit-learn and PyTorch integrations (optional extras) |
 
 ## Entry points
@@ -1104,27 +1104,12 @@ See the [Manifold SAE dictionary guide](manifold-sae.md) for the narrative.
 
 ## Partial supervision
 
-::: gamfit.examples.PartialSupervisionExample
+::: gamfit.identifiability.partial_supervision_solve
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.examples.PartialSupervisionFit
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.examples.SaeSupervisedFit
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.examples.partial_supervision
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.examples.sae_supervised
+::: gamfit.identifiability.thin_svd_scores
     options:
       show_root_heading: true
       heading_level: 3

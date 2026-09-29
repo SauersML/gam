@@ -45,7 +45,6 @@ SUBMODULES = {
     "cuda",
     "diagnostics",
     "errors",
-    "examples",
     "geometry",
     "identifiability",
     "inference",

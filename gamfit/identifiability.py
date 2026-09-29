@@ -85,7 +85,49 @@ __all__ = [
     "derive_ivae_aux_scale",
     "identifiable_factor_fit",
     "mechanism_sparsity_jacobian",
+    "partial_supervision_solve",
+    "thin_svd_scores",
 ]
+
+
+def partial_supervision_solve(
+    t_supervised: Any,
+    aux: Any,
+    t_free: Any,
+    method: str,
+    anchor_idx: Any,
+    free_constraint: str,
+) -> dict[str, Any]:
+    """Gauge-fix a supervised latent block onto ``aux`` and decorrelate the free block.
+
+    The Rust ``gam_sae::identifiability::partial_supervision_solve``: ``method`` is
+    ``"procrustes"``, ``"anchor"`` or ``"soft_l2"``; ``free_constraint`` is
+    ``"orthogonal_to_sup"`` or ``"none"``. Returns the aligned ``t_supervised`` and
+    ``t_free``, ``alignment_score``, the evidence-selected ``selected_weight``
+    (``soft_l2``) and the fitted maps ``map_r`` / ``map_a`` / ``map_b`` (``None`` where
+    the method has none).
+    """
+    return dict(
+        rust_module().partial_supervision_solve(
+            np.ascontiguousarray(t_supervised, dtype=np.float64),
+            np.ascontiguousarray(aux, dtype=np.float64),
+            np.ascontiguousarray(t_free, dtype=np.float64),
+            str(method),
+            [int(index) for index in anchor_idx],
+            str(free_constraint),
+        )
+    )
+
+
+def thin_svd_scores(x: Any, k: int) -> np.ndarray:
+    """The leading ``k`` principal scores ``U_k S_k`` of the column-centred ``x``.
+
+    The Rust ``gam_sae::identifiability::thin_svd_scores``.
+    """
+    return np.asarray(
+        rust_module().thin_svd_scores(np.ascontiguousarray(x, dtype=np.float64), int(k)),
+        dtype=np.float64,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +331,7 @@ def check(
     :class:`IdentifiabilityReport`.
 
     ``fit`` may be an :class:`IdentifiableFactorFitResult` (all three
-    theorems are checked), a :class:`gamfit.examples.PartialSupervisionFit`
+    theorems are checked), the ``PartialSupervisionFit`` of ``examples/partial_supervision.py``
     (iVAE-aux + random projection only — no decoder is fit), or any object
     duck-typing the attributes ``T_supervised`` / ``T_free`` / ``decoder``
     / ``encoder_state`` / ``mech_sparsity_weight``.

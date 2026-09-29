@@ -29,9 +29,9 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from .._sae_manifold import sae_manifold_fit, ManifoldSAE
-from .._api import fit as gamfit_fit
-from .._model import Model
+from gamfit import Model
+from gamfit import fit as gamfit_fit
+from gamfit.sae import ManifoldSAE, sae_manifold_fit
 
 
 __all__ = [

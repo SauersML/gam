@@ -1,5 +1,7 @@
-"""Partial-supervision gauge-fix example — thin Python wrapper around the
-Rust ``gam::identifiability::sae::partial_supervision_solve`` primitive.
+"""Partial-supervision gauge-fix example, over the public
+``gamfit.identifiability.partial_supervision_solve`` (the Rust
+``gam_sae::identifiability::partial_supervision_solve``). Run it as a script or
+import it from this directory; it is not part of the ``gamfit`` package.
 
 All numerical linear algebra (Procrustes / anchor / soft-L2 function-mass
 shrinkage / orthogonal-complement projection) lives in Rust; this module
@@ -19,7 +21,9 @@ from typing import Literal, Sequence, Any
 
 import numpy as np
 
-from .._binding import rust_module
+from gamfit.identifiability import check as _check_identifiability
+from gamfit.identifiability import partial_supervision_solve, thin_svd_scores
+from gamfit.sae import GaugeCompanion
 
 
 SupMethod = Literal["procrustes", "anchor", "soft_l2"]
@@ -175,7 +179,7 @@ class PartialSupervisionExample:
         )
         anchor_arg = [int(i) for i in self.anchor_idx]
 
-        result = rust_module().partial_supervision_solve(
+        result = partial_supervision_solve(
             T_sup,
             self.aux,
             T_free_raw,
@@ -199,7 +203,6 @@ class PartialSupervisionExample:
         aux_score: float | None = None
         if self.aux_name is not None:
             # Reuse the existing GaugeCompanion scorer (also Rust-backed).
-            from .._equivariant import GaugeCompanion
             companion = GaugeCompanion(
                 aux=self.aux_name, d_aux=self.d_supervised, aux_values=self.aux,
             )
@@ -219,8 +222,6 @@ class PartialSupervisionExample:
         )
 
         if bool(check_identifiability):
-            from ..identifiability import check as _check_identifiability
-
             report = _check_identifiability(fit_result, aux=self.aux)
             fit_result.report = report
             fit_result.warnings = report.as_warnings()
@@ -243,7 +244,7 @@ class PartialSupervisionExample:
                 f"pass T_init=... to initialize a wider latent block"
             )
         # Centre and thin-SVD via the Rust faer bridge.
-        scores = rust_module().thin_svd_scores(np.ascontiguousarray(X), int(self.T_dim))
+        scores = thin_svd_scores(X, int(self.T_dim))
         return np.ascontiguousarray(np.asarray(scores, dtype=np.float64))
 
 
@@ -269,7 +270,7 @@ def partial_supervision(
     >>> import numpy as np, gamfit
     >>> rng = np.random.default_rng(0)
     >>> hsv = rng.standard_normal((200, 3))
-    >>> example = gamfit.examples.partial_supervision(
+    >>> example = partial_supervision(
     ...     T_dim=6, aux=hsv, d_supervised=3, d_free=3,
     ...     sup_method='procrustes',
     ...     free_constraint='orthogonal_to_sup',
@@ -306,3 +307,16 @@ __all__ = [
     "PartialSupervisionExample",
     "PartialSupervisionFit",
 ]
+
+
+if __name__ == "__main__":
+    rng = np.random.default_rng(0)
+    hsv = rng.standard_normal((200, 3))
+    rotation, _ = np.linalg.qr(rng.standard_normal((3, 3)))
+    supervised = hsv @ rotation.T + 0.1 * rng.standard_normal((200, 3))
+    free = 0.4 * supervised + rng.standard_normal((200, 3))
+    latent = np.concatenate([supervised, free], axis=1)
+    example = partial_supervision(T_dim=6, aux=hsv, d_supervised=3, d_free=3)
+    fit = example.fit(latent + 0.05 * rng.standard_normal((200, 6)), T_init=latent)
+    print(f"procrustes alignment score: {fit.alignment_score:.4f}")
+    print(f"|T_free^T T_supervised|_F: {np.linalg.norm(fit.T_free.T @ fit.T_supervised):.3e}")

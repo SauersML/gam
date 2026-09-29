@@ -1,4 +1,4 @@
-"""End-to-end test for gamfit.examples.sae_supervised.
+"""End-to-end test for examples/sae_supervised.py.
 
 The example orchestrates two Rust kernels: ``sae_manifold_fit`` (full
 ``X``, unsupervised) and ``gamfit.fit`` (GLM head on the supervised
@@ -21,6 +21,16 @@ import numpy as np
 import pytest
 
 import gamfit
+
+import sys
+from pathlib import Path
+
+# The example is a script in examples/, not a gamfit submodule.
+_EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
+if str(_EXAMPLES) not in sys.path:
+    sys.path.insert(0, str(_EXAMPLES))
+
+import sae_supervised as sae_supervised_example  # noqa: E402
 
 # #1512 triage: the supervised-SAE example fits run well past the standard
 # Python-API CI runner budget (the file timed out at >240s in triage), so they
@@ -61,10 +71,10 @@ def synthetic() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 def test_sae_supervised_end_to_end_returns_uniform_result(synthetic):
     X, y, mask = synthetic
-    result = gamfit.examples.sae_supervised(
+    result = sae_supervised_example.sae_supervised(
         X, y, mask, K=4, d_atom=2, atom_topology="circle",
     )
-    assert isinstance(result, gamfit.examples.SaeSupervisedFit)
+    assert isinstance(result, sae_supervised_example.SaeSupervisedFit)
     assert isinstance(result.sae, gamfit.sae.ManifoldSAE)
     assert result.n_train == X.shape[0]
     assert result.n_supervised == int(mask.sum())
@@ -78,7 +88,7 @@ def test_sae_supervised_end_to_end_returns_uniform_result(synthetic):
 
 def test_sae_supervised_predicts_on_training_X(synthetic):
     X, y, mask = synthetic
-    result = gamfit.examples.sae_supervised(
+    result = sae_supervised_example.sae_supervised(
         X, y, mask, K=4, d_atom=2, atom_topology="circle",
     )
     preds = result.predict(X)
@@ -99,7 +109,7 @@ def test_sae_supervised_oos_predict_runs_the_frozen_decoder_encoder(synthetic):
     Rows perturbed by 1e-6 carry the same signal as the training rows, so the
     head must still explain the supervised response on them."""
     X, y, mask = synthetic
-    result = gamfit.examples.sae_supervised(
+    result = sae_supervised_example.sae_supervised(
         X, y, mask, K=4, d_atom=2, atom_topology="circle",
     )
     X_new = X + 1e-6  # Not bit-equal to training.
@@ -120,7 +130,7 @@ def test_sae_supervised_empty_mask_is_clean_error():
     y = rng.standard_normal(30)
     mask = np.zeros(30, dtype=bool)
     with pytest.raises(ValueError, match="zero rows"):
-        gamfit.examples.sae_supervised(X, y, mask, K=3, d_atom=2)
+        sae_supervised_example.sae_supervised(X, y, mask, K=3, d_atom=2)
 
 
 def test_sae_supervised_wrong_length_mask_is_clean_error():
@@ -129,4 +139,4 @@ def test_sae_supervised_wrong_length_mask_is_clean_error():
     y = rng.standard_normal(30)
     mask = np.ones(20, dtype=bool)
     with pytest.raises(ValueError, match="length 20 but X has 30 rows"):
-        gamfit.examples.sae_supervised(X, y, mask, K=3, d_atom=2)
+        sae_supervised_example.sae_supervised(X, y, mask, K=3, d_atom=2)
