@@ -527,7 +527,7 @@ impl DecoderLayer {
     /// of the box:
     /// - each norm through [`head_rms_norm_with_radius`] (the residual norms as one head per
     ///   row), plus its gain defect;
-    /// - each read through [`LayerProjection::read`];
+    /// - each read through its [`LayerProjection`]'s banded read;
     /// - the attention core through [`RotaryCausalAttention::attend_projected`];
     /// - the SwiGLU gate as in `swiglu_band`;
     /// - each residual addition with `γ_1` of its sum.

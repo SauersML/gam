@@ -91,7 +91,7 @@
 //! with no law, splitting outputs as well as inputs, with the frame found from the weights' read
 //! and write spans instead of declared ports. Its certified `η` bounds the worst-case defect; the
 //! cross-block energy here is an L2 quantity under the declared law. Both read their blocks off
-//! [`connected_components`].
+//! the crate's one connected-components owner over the resolved edges.
 
 use std::collections::BTreeMap;
 use std::fmt;

@@ -651,7 +651,8 @@ fn exact_norm(value: f64, error: f64, width: usize) -> Result<EvidenceStatus<(),
 }
 
 /// Compare two operators of one width: `‖M₁ − M₂‖_F`, both norms, the least-squares scale
-/// `c` and `‖M₁ − c M₂‖_F`, each through [`factored_norm`] on the stacked factors
+/// `c` and `‖M₁ − c M₂‖_F`, each as the norm of the product of the stacked factors'
+/// thin-QR triangles, with its backward-error band, on the stacked factors
 /// `[L₁ | −c L₂]`, `[R₁ | R₂]`. `c` comes from the pair's [`family_gram`], which `governor`
 /// reserves.
 pub fn compare_operators(
