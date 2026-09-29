@@ -27,6 +27,7 @@
 use csv::StringRecord;
 use gam::model_types::SmoothingCorrectionMethod;
 use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula};
+use gam_linalg::faer_ndarray::FaerEigh;
 use std::sync::Once;
 
 const N: usize = 600;
@@ -172,27 +173,33 @@ fn survival_transformation_fit_publishes_smoothing_corrected_covariance_2912() {
         "#2912: corrected covariance must match the conditional dimensions"
     );
 
-    // (3) The correction is PSD, so no corrected variance shrinks, and REML
-    // smoothing parameters on finite data carry genuine uncertainty, so at least
-    // one variance strictly grows.
+    // (3) The ρ-uncertainty term `C = A·V_ρ·Aᵀ` is PSD, and REML smoothing
+    // parameters on finite data carry genuine uncertainty, so `C` is not zero.
+    // The theorem is about `C` on the ambient Gaussian `N(β̂, V_cond)`: both
+    // published covariances are that law and `N(β̂, V_cond + C)` truncated to the
+    // baseline cone (gam#3575), and truncation does not preserve the per-coordinate
+    // order of two Gaussians' variances, so their diagonals are not compared.
+    let correction = fit
+        .smoothing_correction()
+        .expect("#2912: the corrected covariance must carry its ρ-uncertainty term");
+    assert_eq!(correction.dim(), conditional.dim(), "#2912: correction shape");
     let p = corrected.nrows();
-    let mut any_strict_growth = false;
-    for i in 0..p {
-        let vc = corrected[[i, i]];
-        let v0 = conditional[[i, i]];
-        assert!(
-            vc >= v0 - 1e-10 * (1.0 + v0.abs()),
-            "#2912: corrected variance must not shrink below conditional at coordinate {i}: \
-             corrected {vc:.6e} vs conditional {v0:.6e}"
-        );
-        if vc > v0 * (1.0 + 1e-9) + 1e-14 {
-            any_strict_growth = true;
-        }
-    }
+    let frobenius = correction.iter().map(|v| v * v).sum::<f64>().sqrt();
+    // The symmetric eigensolver's backward error on an `p × p` matrix.
+    let resolution = gam_linalg::roundoff::accumulation_growth(p) * frobenius;
+    let (eigenvalues, _) = correction
+        .eigh(faer::Side::Lower)
+        .expect("#2912: the correction's spectrum");
+    let min_eigenvalue = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
     assert!(
-        any_strict_growth,
-        "#2912: the rho-uncertainty inflation must strictly widen at least one coefficient \
-         variance"
+        min_eigenvalue >= -resolution,
+        "#2912: the ρ-uncertainty term must be PSD: λ_min {min_eigenvalue:.6e} below \
+         -{resolution:.3e}"
+    );
+    assert!(
+        (0..p).any(|i| correction[[i, i]] > resolution),
+        "#2912: the ρ-uncertainty inflation must strictly widen at least one ambient \
+         coefficient variance (a zero correction means the channel is dead)"
     );
 
     // (4) Symmetry and finiteness.

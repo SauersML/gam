@@ -38,28 +38,31 @@ fn block_ncoef(result: &GaussianLocationScaleFitResult, role: BlockRole) -> usiz
         .len()
 }
 
-/// With no explicit basis size on the scale smooth, the mean keeps the generous
-/// thin-plate default while the scale is held to the conservative
-/// secondary-predictor default — strictly smaller, and modest in absolute terms.
+/// With no explicit basis size on the scale smooth, the scale is held to the
+/// conservative secondary-predictor default: never larger than the mean's, and
+/// modest in absolute terms.
 #[test]
 fn scale_smooth_basis_is_parsimonious_relative_to_mean() {
     let result = fit_location_scale("1 + s(Age, bs='tps')");
     let mean_ncoef = block_ncoef(&result, BlockRole::Location);
     let scale_ncoef = block_ncoef(&result, BlockRole::Scale);
 
-    // The mean keeps the spatial default, which is now DERIVED from the
-    // smoothing rate (`default_num_centers`, bc42d5ca46: `n^{d/(2m+d)}`, 14
-    // coefficients on these 314 rows) rather than the retired ~40-center
-    // constant this test once transcribed as `>= 25`. The #501 contract is the
-    // relation below: the parsimony pass shrinks only the scale block.
-    // Scale is held to the conservative default (centers≈10 + small nullspace).
+    // The mean keeps the spatial default, which is DERIVED from the smoothing
+    // rate (`default_num_centers`, bc42d5ca46: `n^{d/(2m+d)}`, 14 coefficients
+    // on these 314 rows) rather than the retired ~40-center constant this test
+    // once transcribed as `>= 25`. The scale's cap is
+    // `conservative_secondary_centers = min(default_num_centers, 15·d)`, so the
+    // parsimony pass can only shrink the scale block, and it shrinks it exactly
+    // when the mean's default exceeds the modest cap. At this `n` the
+    // rate-derived default is already below it: the two blocks coincide, and
+    // anything smaller would drop below the resolution the data support.
     assert!(
         scale_ncoef <= 18,
         "scale smooth must be parsimonious, got ncoef={scale_ncoef}"
     );
     assert!(
-        scale_ncoef < mean_ncoef,
-        "scale basis ({scale_ncoef}) must be strictly smaller than mean basis ({mean_ncoef})"
+        scale_ncoef <= mean_ncoef,
+        "scale basis ({scale_ncoef}) must not exceed the mean basis ({mean_ncoef})"
     );
 }
 

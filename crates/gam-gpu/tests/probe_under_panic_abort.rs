@@ -3,8 +3,11 @@
 //! No in-tree test binary can observe the abort: libtest ignores a profile's `panic` setting, and
 //! gam's own profiles unwind. This test compiles the gam-gpu example
 //! `cudarc_probe_under_panic_abort` with `-C panic=abort` through `cargo rustc`, in a private
-//! target directory so the nested cargo never waits on the outer build's lock, and runs it. On a
-//! host where cudarc's loader opens no libcuda candidate, the probe must answer `absent` and exit 0.
+//! target directory so the nested cargo never waits on the outer build's lock, and runs it. The
+//! nested resolve is `--locked` to the workspace lockfile but may fetch: a test shard that runs
+//! from a nextest archive has the registry cache but no checkout of the workspace's git
+//! dependencies, and `--offline` refused the resolve there. On a host where cudarc's loader opens
+//! no libcuda candidate, the probe must answer `absent` and exit 0.
 //! Before the preflight, the probe's first cudarc entry point panicked there and the process
 //! aborted.
 
@@ -22,7 +25,7 @@ fn build_example_with_panic_abort() -> PathBuf {
         )
         .args([
             "rustc",
-            "--offline",
+            "--locked",
             "--package",
             "gam-gpu",
             "--example",

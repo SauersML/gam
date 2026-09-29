@@ -263,8 +263,13 @@ fn sae_euclidean_line_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho
         AssignmentMode::softmax(1.0),
     )
     .expect("assignment");
-    let term = SaeManifoldTerm::new(vec![atom], assignment).expect("term");
+    let mut term = SaeManifoldTerm::new(vec![atom], assignment).expect("term");
     let rho = SaeManifoldRho::new(0.0, (0.01_f64).ln(), vec![Array1::<f64>::zeros(1)]);
+    // The joint fit refuses an identically zero decoder (it has no column space
+    // to install a frame from), so the line is seeded from the data, as that
+    // refusal directs (gam#4582).
+    term.refit_decoder_least_squares_at_current_state(z.view(), Some(&rho))
+        .expect("seed the line's decoder from the data");
     (term, z, rho)
 }
 
