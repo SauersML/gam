@@ -32,12 +32,11 @@
 //!   existing bases, with fixed instances `P_c = w_c Gamma(z_c)` and
 //!   `v_c = w_c phi(z_c)`. The labels `z_c` and scales `w_c` do not depend on the
 //!   input; input dependence only selects or masks instances.
-//! * **Ablation geometry** (`moments`, `adversary`, `supports`, `bounds`). Mask
-//!   moments, the zonotope of admissible moments, witness masks, ranked supports,
-//!   and bounds.
-//! * **Mechanism program** (`program`, `fit`, `codec`, `precision`). A typed graph
-//!   of Sum, Compose, native primitives, reads and writes, and calls to shared
-//!   bodies, with its interface, native reference, code and validity domain.
+//! * **Evidence and bounds** (`supports`, `bounds`). The evidence status of every
+//!   reported number, and the bounds it is stated with.
+//! * **Code and proposals** (`fit`, `codec`, `precision`). Exact code lengths,
+//!   declared-precision real codes, and structural proposals decided on decoded
+//!   code.
 //!
 //! Exact execution under masks belongs to `rewrite` (MLP component coordinates),
 //! `gated_rewrite` (gated activations, norms), `attention` (rotary attention under
@@ -77,22 +76,11 @@
 #[cfg(test)]
 mod test_support;
 
-// Blind re-derivation oracles for P7, P15 and P17 against the landed APIs.
-#[cfg(test)]
-mod oracle_tests;
-
 // Executed-stage receipts against the native lift.
 pub mod receipts;
 
 // Structured-edit coordinates from a declared single-cycle row action: closed-form planes, rotation edits, plane code.
 pub mod cyclic_action;
-
-// Teacher controls at bounded code and the cancelling pair (test builds only).
-#[cfg(test)]
-mod teacher_tests;
-
-// Nonlinear separation over the moment zonotope: lower witnesses, derived upper bounds.
-pub mod adversary;
 
 // Matrix-free structured edits applied to the current intervened input.
 pub mod apply;
@@ -102,9 +90,6 @@ pub mod attention;
 
 // A whole pre-norm transformer block under masks: norm, attention, residual, norm, MLP, residual.
 pub mod block;
-
-// Mechanism programs over attention-only layers, replayed bit for bit under component masks.
-pub mod block_program;
 
 // KL oscillation bound, whole-set composition containment, conservation conditioning.
 pub mod bounds;
@@ -116,9 +101,6 @@ pub mod codec;
 pub mod field;
 
 pub mod finite_grid;
-
-// Parameter-family labels: share and split of fixed components into affine fields, scored on decoded code.
-pub mod families;
 
 // Joint finite-intervention objective and structural proposals.
 pub mod fit;
@@ -134,9 +116,6 @@ pub mod joint_operators;
 
 // Tensor registry and the exact residual anchor.
 pub mod lift;
-
-// Mask moments, the admissible zonotope, support function and affine-logit adversary.
-pub mod moments;
 
 // Exact module splits of plain GELU/ReLU MLPs under the worst-case replacement contract, with certified eta.
 pub mod module_split;
@@ -156,10 +135,6 @@ pub mod gauge_census;
 // Gauge-covariant group masks, structured parameter paths, Sum and Compose accounting.
 pub mod operators;
 
-// Cross-module adversarial and null controls against the landed modules.
-#[cfg(test)]
-mod controls_tests;
-
 // The planted known-answer toys against observability and the linear quotient.
 #[cfg(test)]
 mod state_toys_tests;
@@ -175,20 +150,8 @@ mod spectral_toys_tests;
 // Declared-precision real codes and decode-then-evaluate distortion.
 pub mod precision;
 
-// The typed mechanism program graph and its versioned serialization.
-pub mod program;
-
 // Exact component-coordinate MLP program under masks.
 pub mod rewrite;
-
-// The component MLP block as a mechanism program, bound to its own tensors.
-pub mod rewrite_program;
-
-// Exact finite-change accounting through a program: per-source contributions summing to the direct change.
-pub mod accounting;
-
-// Forward-error bands of a traced program execution under dense parameters.
-pub mod replay;
 
 // Exhaustive verification of an explanation against the native model over a declared finite family.
 pub mod verify;
@@ -201,9 +164,6 @@ pub mod dense;
 
 // Exact two-endpoint finite-change operators: softmax, RMSNorm, bilinear products, gated activations.
 pub mod secant;
-
-// Exact initial decomposition from native tensors through rank-revealing reads.
-pub mod seed;
 
 // Plane-rotation recovery with derived eigengaps.
 pub mod spectral;

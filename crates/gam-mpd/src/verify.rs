@@ -4,9 +4,8 @@
 //! An explanation is checked where checking is possible: on every member of a finite input
 //! family the experiment declares, and under every member of a declared family of internal
 //! interventions (the counterfactual contract). Two executables produce logit rows with a
-//! per-entry forward-error radius against their exact values ([`Executable`]): a mechanism
-//! [`Program`] under dense parameters ([`ProgramLogits`], radii from `replay`), or any closure
-//! that derives its own. Nothing is sampled, so every family statistic is
+//! per-entry forward-error radius against their exact values ([`Executable`]), each deriving
+//! its own radii. Nothing is sampled, so every family statistic is
 //! [`EvidenceStatus::Exact`] with [`ExactBasis::Exhaustive`] over the rows compared, a
 //! [`EvidenceStatus::Counterexample`] naming the input that exceeds the declared tolerance, or
 //! [`EvidenceStatus::Unresolved`] when some row's radii are too wide for a bound.
@@ -39,13 +38,11 @@
 //! both certified are counted too, and on them the count is also the exact models'.
 
 use super::bounds::{BoundError, KlBoundRegion, kl_over_logit_boxes};
-use super::program::{DenseParameters, MaskAssignment, Program};
-use super::replay::{ReplayError, execute_banded};
 use super::secant::BandedMatrix;
 use super::supports::{EvidenceStatus, EvidenceStatusError, ExactBasis, Extremum};
 use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
 use gam_runtime::resource::MemoryGovernor;
-use ndarray::{Array2, ArrayView1};
+use ndarray::ArrayView1;
 use std::fmt;
 
 /// A model executed on one input under one intervention: logit rows (one categorical
@@ -65,101 +62,6 @@ where
 
     fn logits(&self, governor: &MemoryGovernor, intervention: &V, input: &I) -> Result<BandedMatrix, E> {
         self(governor, intervention, input)
-    }
-}
-
-/// One member of an input family for a program: its entry inputs, initial slots and
-/// absolute positions, all exact.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ProgramInput {
-    pub inputs: Vec<Array2<f64>>,
-    pub slots: Vec<Option<Array2<f64>>>,
-    pub positions: Vec<i64>,
-}
-
-/// One intervention on a program: its mask assignment and its dense parameters (a
-/// parameter edit is a different binding).
-#[derive(Clone, Copy, Debug)]
-pub struct ProgramSetting<'a> {
-    pub masks: &'a MaskAssignment,
-    pub parameters: &'a DenseParameters,
-}
-
-/// A program's declared output rows as logits.
-#[derive(Clone, Debug)]
-pub struct ProgramLogits<'p> {
-    program: &'p Program,
-    readout: Vec<usize>,
-}
-
-/// A refused program readout.
-#[derive(Debug)]
-pub enum ProgramLogitsError {
-    Replay(Box<ReplayError>),
-    /// A declared readout row the output does not have.
-    ReadoutRow { row: usize, rows: usize },
-    EmptyReadout,
-}
-
-impl fmt::Display for ProgramLogitsError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Replay(error) => write!(formatter, "program logits: {error}"),
-            Self::ReadoutRow { row, rows } => {
-                write!(formatter, "readout row {row} is outside the program's {rows} output rows")
-            }
-            Self::EmptyReadout => write!(formatter, "a program readout declares no rows"),
-        }
-    }
-}
-
-impl std::error::Error for ProgramLogitsError {}
-
-impl<'p> ProgramLogits<'p> {
-    /// The rows `readout` of `program`'s entry output are its logits, in that order.
-    pub fn new(program: &'p Program, readout: Vec<usize>) -> Result<Self, ProgramLogitsError> {
-        if readout.is_empty() {
-            return Err(ProgramLogitsError::EmptyReadout);
-        }
-        Ok(Self { program, readout })
-    }
-
-    /// The readout rows and their forward radii at one setting and input.
-    pub fn run(
-        &self,
-        governor: &MemoryGovernor,
-        setting: &ProgramSetting<'_>,
-        input: &ProgramInput,
-    ) -> Result<BandedMatrix, ProgramLogitsError> {
-        let banded = execute_banded(
-            governor,
-            self.program,
-            setting.parameters,
-            setting.masks,
-            input.inputs.clone(),
-            input.slots.clone(),
-            &input.positions,
-        )
-        .map_err(|error| ProgramLogitsError::Replay(Box::new(error)))?;
-        let rows = banded.output.values.nrows();
-        if let Some(&row) = self.readout.iter().find(|&&row| row >= rows) {
-            return Err(ProgramLogitsError::ReadoutRow { row, rows });
-        }
-        let select = |matrix: &Array2<f64>| matrix.select(ndarray::Axis(0), &self.readout);
-        Ok(BandedMatrix { values: select(&banded.output.values), bands: select(&banded.output.bands) })
-    }
-}
-
-impl<'s> Executable<ProgramSetting<'s>, ProgramInput> for ProgramLogits<'_> {
-    type Error = ProgramLogitsError;
-
-    fn logits(
-        &self,
-        governor: &MemoryGovernor,
-        intervention: &ProgramSetting<'s>,
-        input: &ProgramInput,
-    ) -> Result<BandedMatrix, ProgramLogitsError> {
-        self.run(governor, intervention, input)
     }
 }
 
@@ -577,55 +479,21 @@ mod tests {
     //! exactly on the input `(a, b)`, and the readout puts `2` on class `a + b mod P`.
 
     use super::*;
-    use crate::lift::TieOrientation;
-    use crate::program::{
-        Body, BodyId, ControlDecl, ControlId, DenseTensor, MaskGroup, MaskGroupId, NativeActivation, NativePrimitive,
-        Node, NodeId, ParameterDecl, ParameterSlot, ProgramParts, SumTerm,
-    };
     use crate::test_support::test_governor;
-    use ndarray::{Array1, array};
+    use ndarray::{Array1, Array2, Axis, array};
 
     const P: usize = 5;
     const H: usize = P * P;
 
-    fn native(primitive: NativePrimitive, arguments: &[u32]) -> Node {
-        Node::Native { primitive, arguments: arguments.iter().map(|&index| NodeId(index)).collect() }
-    }
-
-    fn linear(parameter: u32, argument: u32) -> Node {
-        native(NativePrimitive::Linear { weight: ParameterSlot(parameter), orientation: TieOrientation::Identity }, &[argument])
-    }
-
-    fn hidden_mask(argument: u32) -> Node {
-        native(NativePrimitive::CoordinateMask { controls: (0..H as u32).map(ControlId).collect() }, &[argument])
-    }
-
-    fn body(name: &str, nodes: Vec<Node>) -> Body {
-        let output = NodeId(nodes.len() as u32 - 1);
-        Body { name: name.to_string(), inputs: 1, nodes, output }
-    }
-
-    fn parameters(names: &[&str]) -> Vec<ParameterDecl> {
-        names.iter().map(|name| ParameterDecl { name: (*name).to_string(), controls: Vec::new() }).collect()
-    }
-
-    fn controls(count: usize) -> Vec<ControlDecl> {
-        (0..count).map(|index| ControlDecl { name: format!("c{index}") }).collect()
-    }
-
-    fn hidden_group() -> MaskGroup {
-        MaskGroup { name: "hidden".to_string(), controls: (0..H as u32).map(ControlId).collect() }
-    }
-
     /// The one-hot row `[e_a, e_b]` of the pair `(a, b)`.
-    fn pair_input(a: usize, b: usize) -> ProgramInput {
-        let mut row = Array2::zeros((1, 2 * P));
-        row[[0, a]] = 1.0;
-        row[[0, P + b]] = 1.0;
-        ProgramInput { inputs: vec![row], slots: Vec::new(), positions: vec![0] }
+    fn pair_input(a: usize, b: usize) -> Array1<f64> {
+        let mut row = Array1::zeros(2 * P);
+        row[a] = 1.0;
+        row[P + b] = 1.0;
+        row
     }
 
-    fn family() -> Vec<ProgramInput> {
+    fn family() -> Vec<Array1<f64>> {
         (0..P).flat_map(|a| (0..P).map(move |b| pair_input(a, b))).collect()
     }
 
@@ -646,130 +514,35 @@ mod tests {
         (w1, Array1::from_elem(H, -1.0), w2)
     }
 
-    /// `x → W2 m ⊙ relu(W1 x + b1)`, with the hidden mask when `masked`.
-    fn network_nodes(masked: bool) -> Vec<Node> {
-        let mut nodes = vec![
-            Node::Input { port: 0 },
-            linear(0, 0),
-            native(NativePrimitive::AddBias { bias: ParameterSlot(1) }, &[1]),
-            native(NativePrimitive::Activation { activation: NativeActivation::Relu }, &[2]),
-        ];
-        if masked {
-            nodes.push(hidden_mask(3));
+    /// `x → Σ_k R_k (h · relu(W1 x + b1))` with the hidden units scaled by `hidden`. Every
+    /// operand is a small dyadic number, so the row is exact and its band is zero.
+    fn network_logits(readouts: &[Array2<f64>], hidden: f64, input: &Array1<f64>) -> BandedMatrix {
+        let (w1, b1, _) = planted_tensors();
+        let activation = (w1.dot(input) + &b1).mapv(|value| hidden * value.max(0.0));
+        let mut logits = Array1::zeros(P);
+        for readout in readouts {
+            logits += &readout.dot(&activation);
         }
-        let last = nodes.len() as u32 - 1;
-        nodes.push(linear(2, last));
-        nodes
-    }
-
-    /// The native network, with its hidden units as one mask group.
-    fn native_program() -> Program {
-        Program::new(ProgramParts {
-            parameters: parameters(&["W1", "b1", "W2"]),
-            slots: Vec::new(),
-            controls: controls(H),
-            mask_groups: vec![hidden_group()],
-            bodies: vec![body("native", network_nodes(true))],
-            entry: BodyId(0),
-        })
-        .expect("a valid native program")
-    }
-
-    /// The explanation refines the native network: its mechanism masks the hidden units and
-    /// splits the readout into two halves `W2a + W2b`, joined by a controlled sum.
-    fn explanation_program() -> Program {
-        let mechanism = body(
-            "mechanism",
-            vec![
-                Node::Input { port: 0 },
-                linear(0, 0),
-                native(NativePrimitive::AddBias { bias: ParameterSlot(1) }, &[1]),
-                native(NativePrimitive::Activation { activation: NativeActivation::Relu }, &[2]),
-                hidden_mask(3),
-                linear(3, 4),
-                linear(4, 4),
-                Node::Sum {
-                    terms: vec![
-                        SumTerm { value: NodeId(5), control: None },
-                        SumTerm { value: NodeId(6), control: Some(ControlId(H as u32)) },
-                    ],
-                },
-            ],
-        );
-        Program::new(ProgramParts {
-            parameters: parameters(&["W1", "b1", "W2", "W2a", "W2b"]),
-            slots: Vec::new(),
-            controls: controls(H + 1),
-            mask_groups: vec![
-                hidden_group(),
-                MaskGroup { name: "second half".to_string(), controls: vec![ControlId(H as u32)] },
-            ],
-            bodies: vec![
-                body(
-                    "entry",
-                    vec![
-                        Node::Input { port: 0 },
-                        Node::Refine { native: BodyId(1), mechanism: BodyId(2), arguments: vec![NodeId(0)] },
-                    ],
-                ),
-                body("native", network_nodes(false)),
-                mechanism,
-            ],
-            entry: BodyId(0),
-        })
-        .expect("a valid explanation program")
-    }
-
-    fn native_parameters() -> DenseParameters {
-        let (w1, b1, w2) = planted_tensors();
-        DenseParameters::new(vec![DenseTensor::Matrix(w1), DenseTensor::Vector(b1), DenseTensor::Matrix(w2)])
-    }
-
-    /// The explanation's parameters, with `defect` added to the second readout half.
-    fn explanation_parameters(defect: &Array2<f64>) -> DenseParameters {
-        let (w1, b1, w2) = planted_tensors();
-        let w2a = &w2 * 0.5;
-        let w2b = &w2 - &w2a + defect;
-        DenseParameters::new(vec![
-            DenseTensor::Matrix(w1),
-            DenseTensor::Vector(b1),
-            DenseTensor::Matrix(w2),
-            DenseTensor::Matrix(w2a),
-            DenseTensor::Matrix(w2b),
-        ])
-    }
-
-    /// The hidden group at `hidden`, and the second half assigned so the mechanism runs.
-    fn explanation_masks(hidden: f64) -> MaskAssignment {
-        let mut masks = MaskAssignment::all_on();
-        masks.set(MaskGroupId(0), Vec::new(), hidden).expect("a finite mask");
-        masks.set(MaskGroupId(1), Vec::new(), 1.0).expect("a finite mask");
-        masks
-    }
-
-    fn native_masks(hidden: f64) -> MaskAssignment {
-        let mut masks = MaskAssignment::all_on();
-        masks.set(MaskGroupId(0), Vec::new(), hidden).expect("a finite mask");
-        masks
+        BandedMatrix { values: logits.insert_axis(Axis(0)), bands: Array2::zeros((1, P)) }
     }
 
     fn tolerance(value: f64) -> Tolerance {
         Tolerance { kl: value, centred_logit_gap: value }
     }
 
-    /// The counterfactual contract of the explanation with `defect`, over hidden-group values.
+    /// The counterfactual contract of an explanation that splits the readout into two halves
+    /// `W2a + W2b`, with `defect` added to the second half, over hidden-unit scales.
     fn contract(defect: &Array2<f64>, hidden_values: &[f64], declared: &Tolerance) -> CounterfactualContract {
-        let (reference_program, candidate_program) = (native_program(), explanation_program());
-        let reference = ProgramLogits::new(&reference_program, vec![0]).expect("a readout");
-        let candidate = ProgramLogits::new(&candidate_program, vec![0]).expect("a readout");
-        let (native_params, explanation_params) = (native_parameters(), explanation_parameters(defect));
-        let reference_run = |g: &MemoryGovernor, hidden: &f64, input: &ProgramInput| {
-            let masks = native_masks(*hidden);
-            reference.run(g, &ProgramSetting { masks: &masks, parameters: &native_params }, input)
+        let (_, _, w2) = planted_tensors();
+        let w2a = &w2 * 0.5;
+        let w2b = &w2 - &w2a + defect;
+        let native = [w2];
+        let explanation = [w2a, w2b];
+        let reference_run = |_: &MemoryGovernor, hidden: &f64, input: &Array1<f64>| -> Result<BandedMatrix, fmt::Error> {
+            Ok(network_logits(&native, *hidden, input))
         };
-        let candidate_run = |g: &MemoryGovernor, hidden: &f64, input: &ProgramInput| {
-            let masks = explanation_masks(*hidden);
-            candidate.run(g, &ProgramSetting { masks: &masks, parameters: &explanation_params }, input)
+        let candidate_run = |_: &MemoryGovernor, hidden: &f64, input: &Array1<f64>| -> Result<BandedMatrix, fmt::Error> {
+            Ok(network_logits(&explanation, *hidden, input))
         };
         verify_counterfactual_contract(test_governor(), &reference_run, &candidate_run, hidden_values, &family(), declared)
             .expect("a verification")
@@ -901,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn undeclared_tolerances_and_underived_primitives_are_refused() {
+    fn undeclared_tolerances_and_an_empty_family_are_refused() {
         let governor = test_governor();
         let row = |_: &MemoryGovernor, _: &(), _: &f64| -> Result<BandedMatrix, std::fmt::Error> {
             Ok(BandedMatrix { values: array![[0.0, 1.0]], bands: Array2::zeros((1, 2)) })
@@ -914,41 +687,5 @@ mod tests {
             ));
         }
         assert!(matches!(verify_family(governor, &row, &row, &(), &[], &tolerance(0.0)), Err(VerifyError::EmptyFamily)));
-        // A SiLU network has no derived band, so its logits are refused, not guessed.
-        let silu = Program::new(ProgramParts {
-            parameters: parameters(&["W"]),
-            slots: Vec::new(),
-            controls: Vec::new(),
-            mask_groups: Vec::new(),
-            bodies: vec![body(
-                "silu",
-                vec![
-                    Node::Input { port: 0 },
-                    linear(0, 0),
-                    native(NativePrimitive::Activation { activation: NativeActivation::Silu }, &[1]),
-                ],
-            )],
-            entry: BodyId(0),
-        })
-        .expect("a valid program");
-        let logits = ProgramLogits::new(&silu, vec![0]).expect("a readout");
-        let params = DenseParameters::new(vec![DenseTensor::Matrix(Array2::eye(2 * P))]);
-        let masks = MaskAssignment::all_on();
-        let setting = ProgramSetting { masks: &masks, parameters: &params };
-        match logits.run(governor, &setting, &pair_input(0, 0)) {
-            Err(ProgramLogitsError::Replay(error)) => {
-                assert!(matches!(*error, ReplayError::NoDerivedBand { primitive: "SiLU", .. }), "{error}");
-            }
-            other => panic!("expected a refused SiLU band, got {other:?}"),
-        }
-        let planted = native_program();
-        let beyond = ProgramLogits::new(&planted, vec![1]).expect("a readout");
-        let native_params = native_parameters();
-        let native_setting = ProgramSetting { masks: &masks, parameters: &native_params };
-        assert!(matches!(
-            beyond.run(governor, &native_setting, &pair_input(0, 0)),
-            Err(ProgramLogitsError::ReadoutRow { row: 1, rows: 1 })
-        ));
-        assert!(matches!(ProgramLogits::new(&planted, Vec::new()), Err(ProgramLogitsError::EmptyReadout)));
     }
 }

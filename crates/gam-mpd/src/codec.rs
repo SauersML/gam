@@ -50,7 +50,31 @@ use std::cmp::Ordering;
 use std::fmt;
 
 use super::precision::{DecodedFidelity, FidelityVerdict};
-use super::supports::CardinalityCode;
+
+/// A support code whose length depends only on how many of the `C` components a
+/// support keeps, like P18's enumerative subset code
+/// `L_int(k + 1) + ceil(log2 binom(C, k))`.
+pub trait CardinalityCode {
+    /// Why the code has no codeword for a support size.
+    type Error;
+
+    /// The length in bits of a support keeping `size` of `components` components.
+    fn support_bits(&self, components: usize, size: usize) -> Result<u64, Self::Error>;
+
+    /// The cheapest support size at or above `least`, the smallest on ties, and its
+    /// length in bits. The default scans every size; a code whose shape bounds the
+    /// scan overrides it.
+    fn cheapest_size(&self, components: usize, least: usize) -> Result<(usize, u64), Self::Error> {
+        let mut best = (least, self.support_bits(components, least)?);
+        for size in least + 1..=components {
+            let bits = self.support_bits(components, size)?;
+            if bits < best.1 {
+                best = (size, bits);
+            }
+        }
+        Ok(best)
+    }
+}
 
 /// Why a message could not be written or read.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -963,7 +987,7 @@ mod tests {
         DecodableArtifact, DecodedFidelity, FidelityVerdict, PeriodicQuotient, QuotientCode,
         decode_then_evaluate,
     };
-    use crate::supports::{CardinalityCode, EvidenceStatus, ExactBasis};
+    use crate::supports::{EvidenceStatus, ExactBasis};
     use gam_linalg::roundoff::accumulation_growth;
 
     fn natural_to_u128(value: &Natural) -> u128 {

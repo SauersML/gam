@@ -11,11 +11,6 @@ Stage S0 is torch only.
   sha256. It is the grokking gate for the tiny development ladder (small p, d_model 32).
 * ``s0`` runs the executor controls and the benchmark oracle on stored checkpoints and writes
   one JSON receipt.
-* ``execute`` is the torch driver of a Rust receipt, picked by the settings' ``stage``:
-  ``s2_native`` (``crates/gam-mpd/examples/mpd_modadd_s2_2951.rs``) writes each declared
-  checkpoint's tensors in their trained float32, torch's float64 logits on the test pairs and
-  torch's executor control, and builds control C3 from a run entry's declared ``shuffle_seed``.
-  It writes ``export.json``.
 
 W_E is one tensor with three use sites (pos0 ``a``, pos1 ``b``, pos2 ``=``). ``forward`` runs
 each occurrence as its own lookup, so a use-specific edit and a global edit are different
@@ -34,7 +29,6 @@ import json
 import math
 import os
 
-import numpy as np
 import torch
 
 SITES = {"pos0": (0,), "pos1": (1,), "operands": (0, 1), "global": (0, 1, 2)}
@@ -444,81 +438,6 @@ def s0(args):
     print(f"RECEIPT {args.out}", flush=True)
 
 
-def export_native(settings, args):
-    """Stage ``s2_native``: each declared checkpoint's tensors, torch's logits and its executor control.
-
-    The tensors keep their trained float32 (W_Q, W_K and W_V reshaped to ``n_heads*d_head x d_model``,
-    head-major, the layout of torch's head concatenation); the receipt widens them to binary64, exact
-    for float32. torch's float64 logits on the test pairs are a measured agreement for the receipt. The
-    executor control reads the row permutation of W_E by the fit shift at a site against the shifted
-    tokens, bit for bit.
-    """
-    os.makedirs(args.out_dir, exist_ok=True)
-    exports = []
-    shift = settings["fit_shift"]
-    for entry in settings["runs"]:
-        run = torch.load(os.path.join(args.harvest, entry["file"]), map_location="cpu", weights_only=True)
-        config = run["config"]
-        p = config["p"]
-        pairs = all_pairs(p)
-        train_pairs, test_pairs = pairs[run["train_idx"]], pairs[run["test_idx"]]
-        for step in entry["checkpoints"] or [max(run["checkpoints"])]:
-            state = dict(run["checkpoints"][step])
-            name = f"{entry['label']}.{step}"
-            labels = config["labels"]
-            if "shuffle_seed" in entry:
-                # Control C3: the rows of W_in (with b_in) permuted independently of the columns of W_out,
-                # under the declared seed. The weight spectra are kept and the MLP's wiring is destroyed.
-                generator = torch.Generator().manual_seed(entry["shuffle_seed"])
-                hidden = state["W_in"].shape[0]
-                read = torch.randperm(hidden, generator=generator)
-                write = torch.randperm(hidden, generator=generator)
-                state["W_in"], state["b_in"] = state["W_in"][read], state["b_in"][read]
-                state["W_out"] = state["W_out"][:, write]
-                name = f"{entry['label']}-shuffled{entry['shuffle_seed']}.{step}"
-                labels = f"{labels}-shuffled"
-            for key, tensor in state.items():
-                if not tensor.is_floating_point():
-                    continue
-                values = tensor.reshape(-1, tensor.shape[-1]) if key in ("W_Q", "W_K", "W_V") else tensor
-                np.save(os.path.join(args.out_dir, f"{key}.{name}.npy"), values.contiguous().numpy())
-            model = build_model(config)
-            model.load_state_dict(state)
-            model = model.double().eval()
-            control = {}
-            with torch.inference_mode():
-                logits = model(test_pairs)
-                native = model.W_E.detach()
-                permuted = native.clone()
-                permuted[:p] = native[(torch.arange(p) + shift) % p]
-                for site in ("pos0", "global"):
-                    edited = model(test_pairs, embed_at={u: permuted for u in SITES[site]})
-                    shifted = model(shift_tokens(test_pairs, shift, SITES[site], p))
-                    control[f"{site}_bitwise_mismatched_rows"] = int((edited != shifted).any(-1).sum())
-            np.save(os.path.join(args.out_dir, f"native_logits.{name}.npy"), logits.numpy())
-            exports.append({
-                "name": name, "labels": labels, "step": step, "p": p, "d_model": config["d_model"],
-                "n_heads": config["n_heads"], "d_head": config["d_head"], "d_mlp": config["d_mlp"],
-                "train_pairs": train_pairs[:, :2].tolist(), "test_pairs": test_pairs[:, :2].tolist(),
-                "torch_control": control,
-            })
-            print(f"[execute] {name} train={train_pairs.shape[0]} test={test_pairs.shape[0]} control={control}", flush=True)
-    with open(os.path.join(args.out_dir, "export.json.partial"), "w") as handle:
-        json.dump({"stage": "s2_native", "exports": exports}, handle)
-    os.replace(os.path.join(args.out_dir, "export.json.partial"), os.path.join(args.out_dir, "export.json"))
-    print(f"[execute] wrote {len(exports)} checkpoints to {args.out_dir}", flush=True)
-
-
-def execute(args):
-    """The receipt driver: ``receipt.sh`` always runs ``execute``, and the settings' stage picks the export."""
-    with open(args.settings) as handle:
-        settings = json.load(handle)
-    stages = {"s2_native": export_native}
-    if settings["stage"] not in stages:
-        raise SystemExit(f"[execute] no stage {settings['stage']!r}; declared stages: {sorted(stages)}")
-    stages[settings["stage"]](settings, args)
-
-
 def int_list(text):
     return [int(v) for v in text.split(",") if v]
 
@@ -556,19 +475,13 @@ def main():
     receipt.add_argument("--kmax", type=int, required=True)
     receipt.add_argument("--device", required=True)
     receipt.add_argument("--out", required=True)
-    export = commands.add_parser("execute")
-    export.add_argument("--harvest", required=True)
-    export.add_argument("--settings", required=True)
-    export.add_argument("--out-dir", required=True)
     args = parser.parse_args()
     if args.command == "train":
         train(args)
     elif args.command == "check":
         check(args)
-    elif args.command == "s0":
-        s0(args)
     else:
-        execute(args)
+        s0(args)
 
 
 if __name__ == "__main__":
