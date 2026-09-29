@@ -560,9 +560,24 @@ impl FitFailure {
     /// inner solve (`search_inner_refusal`), else its last evaluation's refusal,
     /// read through nested outer failures. `None` when the fit did not end on
     /// one, including a refusal already minted as the fit-ending variant.
+    ///
+    /// A search whose own verdict is the family's not-identified certificate
+    /// (every start's mode refused by it, gam#3003) did not end on an inner
+    /// solve: the data refused the model at every trial point it proposed. An
+    /// uncertified solve one of those probes also met is not what decided the
+    /// fit, so the verdict keeps its type rather than being renamed after that
+    /// probe (gam#4577).
     fn terminal_inner_refusal(err: &CustomFamilyError) -> Option<&CustomFamilyError> {
         match err {
             CustomFamilyError::InnerSolveNotConverged { .. } => Some(err),
+            CustomFamilyError::OuterSmoothingFailed { outer_error, .. }
+                if matches!(
+                    outer_error.as_ref(),
+                    EstimationError::CustomFamily(CustomFamilyError::ModeNotIdentified { .. })
+                ) =>
+            {
+                None
+            }
             CustomFamilyError::OuterSmoothingFailed {
                 search_inner_refusal,
                 last_refusal,
@@ -1244,6 +1259,31 @@ mod fit_failure_tests {
 
         let seeds = FitFailure::from(seeds_refused()).ending_the_fit();
         assert_eq!(seeds.variant_name(), "EstimationError::StartupSeedsRefused");
+
+        // A search every start of which the not-identified certificate refused
+        // ends on that verdict, even when one probe also met an uncertified
+        // inner solve: the caller reads the verdict's type, not its sentence
+        // (gam#4577).
+        let not_identified = CustomFamilyError::OuterSmoothingFailed {
+            reason: "every start's mode was refused".to_string(),
+            last_refusal: Some(Box::new(CustomFamilyError::ModeNotIdentified {
+                reason: "the fitted objective is not below the frozen-time limit".to_string(),
+            })),
+            search_inner_refusal: Some(Box::new(uncertified_inner_solve())),
+            outer_error: Arc::new(EstimationError::CustomFamily(
+                CustomFamilyError::ModeNotIdentified {
+                    reason: "no start passed: 2 not identified".to_string(),
+                },
+            )),
+        };
+        for failure in [
+            FitFailure::from(not_identified.clone()),
+            FitFailure::from(EstimationError::CustomFamily(not_identified)),
+        ] {
+            let ended = failure.ending_the_fit();
+            assert_eq!(ended.variant_name(), "CustomFamilyError::ModeNotIdentified", "{ended}");
+            assert!(ended.terminal_inner_mode_evidence().is_none(), "{ended}");
+        }
 
         // A variant already minted is not wrapped a second time.
         let minted = FitFailure::from(CustomFamilyError::fit_ended_without_certified_inner_mode(
