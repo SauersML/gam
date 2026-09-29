@@ -218,12 +218,12 @@ def test_loglik_ordering():
 @pytest.mark.parametrize("tau", [0.0, 1.0, -0.1, 1.1])
 def test_expectile_tau_validation(mcycle, tau):
     with pytest.raises(Exception):
-        gamfit.fit(mcycle, "y ~ s(x)", expectile_tau=tau)
+        gamfit.fit(mcycle, "y ~ s(x)", family="expectile", expectile_tau=tau)
 
 
 def test_expectile_ordering_and_median_equals_gaussian(mcycle):
-    m50 = gamfit.fit(mcycle, "y ~ s(x)", expectile_tau=0.5)
-    m90 = gamfit.fit(mcycle, "y ~ s(x)", expectile_tau=0.9)
+    m50 = gamfit.fit(mcycle, "y ~ s(x)", family="expectile", expectile_tau=0.5)
+    m90 = gamfit.fit(mcycle, "y ~ s(x)", family="expectile", expectile_tau=0.9)
     mg = gamfit.fit(mcycle, "y ~ s(x)")
     p50, p90, pg = m50.predict(mcycle), m90.predict(mcycle), mg.predict(mcycle)
     assert np.mean(p90 > p50) > 0.95

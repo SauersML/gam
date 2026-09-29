@@ -37,7 +37,7 @@ def test_gamma_trees(trees):
 
 def test_inverse_gaussian_trees(trees):
     """pyGAM InvGaussGAM."""
-    m = gamfit.fit(trees, "y ~ s(girth) + s(height)", family="inverse_gaussian")
+    m = gamfit.fit(trees, "y ~ s(girth) + s(height)", family="inverse-gaussian")
     assert _converged(m)
 
 
@@ -61,7 +61,8 @@ def test_head_circumference_big_gaussian():
     assert _converged(m)
 
 
-# test_gen_imgs.py: plotting smoke tests (pyGAM draws pdep + CI per term)
+# test_gen_imgs.py: plotting smoke tests (pyGAM draws pdep + CI per term). gamfit's per-term
+# partial-effect plot is `plot_terms()`; `plot(data)` draws a single-feature model's prediction.
 @pytest.mark.parametrize("formula,fam,fixture", [
     ("y ~ s(x)", "gaussian", "mcycle"),
     ("y ~ s(x)", "poisson", "coal"),
@@ -72,7 +73,7 @@ def test_plot_renders(formula, fam, fixture, request, tmp_path):
     matplotlib.use("Agg")
     d = request.getfixturevalue(fixture)
     m = gamfit.fit(d, formula, family=fam)
-    out = m.plot(d)
+    m.plot_terms()
     import matplotlib.pyplot as plt
     fig = plt.gcf()
     fig.savefig(tmp_path / "p.png")
@@ -86,7 +87,7 @@ def test_plot_tensor_renders(chicago, tmp_path):
     import matplotlib.pyplot as plt
     d = {k: v[:1500] for k, v in chicago.items()}
     m = gamfit.fit(d, "y ~ te(tmpd, o3)", family="poisson")
-    m.plot(d)
+    m.plot_terms()
     plt.gcf().savefig(tmp_path / "t.png")
     assert (tmp_path / "t.png").stat().st_size > 1000
     plt.close("all")
