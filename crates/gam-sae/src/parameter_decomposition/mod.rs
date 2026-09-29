@@ -145,6 +145,9 @@ pub mod occurrence;
 // Implementation-gauge families detected exactly from native tensors, quotiented out of codes.
 pub mod gauge;
 
+// The function-level fibre bounded from a parameter Jacobian: the oracle a gauge census is checked against.
+pub mod fibre;
+
 // The gauge census of a decoder layer and of a tied residual stream.
 pub mod gauge_census;
 
@@ -154,6 +157,18 @@ pub mod operators;
 // Cross-module adversarial and null controls against the landed modules.
 #[cfg(test)]
 mod controls_tests;
+
+// The planted known-answer toys against observability and the linear quotient.
+#[cfg(test)]
+mod state_toys_tests;
+
+// The planted known-answer toys against exhaustive verification.
+#[cfg(test)]
+mod verify_toys_tests;
+
+// The planted known-answer toys against plane-rotation recovery.
+#[cfg(test)]
+mod spectral_toys_tests;
 
 // Declared-precision real codes and decode-then-evaluate distortion.
 pub mod precision;

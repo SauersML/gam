@@ -6,6 +6,8 @@ use crate::parameter_decomposition::attention::{AffineProjection, RotaryPairing}
 use crate::parameter_decomposition::canonical::{DecoderLayer, LayerRmsNorm, TensorDefect};
 use crate::parameter_decomposition::gated_rewrite::rms_normalizers;
 use crate::parameter_decomposition::gauge::SwigluUnits;
+use crate::parameter_decomposition::state::resolve_stacked_factor;
+use crate::parameter_decomposition::test_support::planted_toys::{ROUTING_HEADS, RoutingToy};
 use crate::parameter_decomposition::test_support::test_governor;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -342,4 +344,80 @@ fn family_gram_is_governed() {
     let governor = MemoryGovernor::with_budget_bytes(64);
     let operator = FactoredOperator::new(Array2::ones((8, 2)), Array2::ones((8, 2))).expect("operator");
     assert!(matches!(family_gram(&governor, &[&operator, &operator]), Err(JointRefusal::Memory(_))));
+}
+
+/// Toy 5, the routing toy: heads 1 and 2 share query and key, head 3 reads query `2 Q₁`.
+/// Every query/key operator of head 3 is head 1's times 2, so a subspace measure (the
+/// Frobenius cosine `⟨M₁, M₃⟩/‖M₁‖‖M₃‖`, a captured energy, a top principal cosine) reads
+/// all three heads as one pattern. Only operator equality separates them: heads 1 and 2
+/// are not proven distinct on any plane, head 3 is proven distinct from both on every
+/// plane and proportional with scale `1/2`. The routing laws are `{1, 2}` and `{3}`, and
+/// the first law's transport `C₁ + C₂` has rank 4, above either head's 2.
+#[test]
+fn toy5_operator_equality_separates_laws_that_share_every_subspace() {
+    let toy = RoutingToy::new(2951);
+    let native = toy.native(&toy.value, &toy.output);
+    let operators = query_key_operators(&native, None).expect("operators");
+    let planes = operators.planes();
+    let operators = &operators;
+    let family: Vec<&FactoredOperator> = (0..ROUTING_HEADS)
+        .flat_map(|head| (0..planes).flat_map(move |plane| [operators.cosine(head, plane), operators.sine(head, plane)]))
+        .collect();
+    let gram = family_gram(test_governor(), &family).expect("gram");
+    let per_head = 2 * planes;
+    for other in [1, 2] {
+        for index in 0..per_head {
+            let (i, j) = (index, other * per_head + index);
+            let cosine = gram.gram[[i, j]] / (gram.gram[[i, i]] * gram.gram[[j, j]]).sqrt();
+            // Each Gram entry is within its band; the cosine's first-order reach is their
+            // sum over the smaller norm, and the square root and division round twice.
+            let band = (gram.band[[i, j]] + gram.band[[i, i]] + gram.band[[j, j]]) / gram.gram[[i, i]].min(gram.gram[[j, j]])
+                + accumulation_growth(4);
+            assert!((1.0 - cosine).abs() <= band, "head {}: subspace cosine {cosine} of operator {index}", other + 1);
+        }
+    }
+
+    let proven_distinct = |first: &FactoredOperator, second: &FactoredOperator| {
+        compare_operators(test_governor(), first, second).expect("comparison").proven_distinct()
+    };
+    let mut laws: Vec<Vec<usize>> = vec![vec![0]];
+    for head in 1..ROUTING_HEADS {
+        let joined = laws.iter_mut().find(|law| {
+            (0..planes).all(|plane| {
+                !proven_distinct(operators.cosine(law[0], plane), operators.cosine(head, plane))
+                    && !proven_distinct(operators.sine(law[0], plane), operators.sine(head, plane))
+            })
+        });
+        match joined {
+            Some(law) => law.push(head),
+            None => laws.push(vec![head]),
+        }
+    }
+    assert_eq!(laws, vec![vec![0, 1], vec![2]]);
+    for plane in 0..planes {
+        for (first, second) in [
+            (operators.cosine(0, plane), operators.cosine(2, plane)),
+            (operators.sine(0, plane), operators.sine(2, plane)),
+        ] {
+            let comparison = compare_operators(test_governor(), first, second).expect("comparison");
+            assert!(comparison.proven_distinct());
+            assert_eq!(comparison.scale, 0.5, "dyadic factors make the least-squares scale exact");
+            assert!(comparison.proportionality_residual.lower_bound().expect("exact") <= 0.0);
+        }
+    }
+
+    let value_output = value_output_operators(&native, None).expect("value/output operators");
+    let rank = |heads: &[usize]| {
+        for &head in heads {
+            let executed = value_output.head(head);
+            let dense = executed.left().dot(&executed.right().t());
+            assert_eq!(dense, RoutingToy::transport(&toy.value, &toy.output, &[head]), "the owner's C_h is O_h V_h");
+        }
+        let transport = RoutingToy::transport(&toy.value, &toy.output, heads);
+        resolve_stacked_factor(test_governor(), &transport, 0.0).expect("rank").resolved_rank
+    };
+    assert_eq!(rank(&[0]), 2);
+    assert_eq!(rank(&[1]), 2);
+    assert_eq!(rank(&[0, 1]), 4);
+    assert_eq!(rank(&[2]), 2);
 }

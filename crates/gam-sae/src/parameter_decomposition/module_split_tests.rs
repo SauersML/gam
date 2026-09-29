@@ -1,11 +1,14 @@
 #![cfg(test)]
-//! Known-answer toys for the additive module split (toys 1–3 of
-//! `bench/mpd_opfirst_toys_planted_2951.py`, and planted blocks under dense
-//! integer mixing) and its controls.
+//! Known-answer toys for the additive module split (toys 1–4 and 7 of the planted
+//! suite, receipt `experiments/issue-2951/receipts/opfirst_toys_planted.json`, and
+//! planted blocks under dense integer mixing) and its controls.
 
 use super::*;
 use crate::parameter_decomposition::state::{ObservabilityStep, WeightedObservability};
-use crate::parameter_decomposition::test_support::test_governor;
+use crate::parameter_decomposition::fibre::parameter_fibre;
+use crate::parameter_decomposition::test_support::planted_toys::{MlpToy, cross_edge, hadamard, hadamard_modules, paired_copy, random_mlp};
+use crate::parameter_decomposition::test_support::{plant, test_governor};
+use crate::response::interaction::connected_components;
 use ndarray::{Array1, Array2, Axis, array, concatenate, s};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -34,6 +37,15 @@ impl Block {
             skip.map(|skip| skip.view()),
         )
         .expect("normal form")
+    }
+
+    fn of(toy: &MlpToy) -> Self {
+        Self {
+            w_in: toy.w_in.clone(),
+            b_in: toy.b_in.clone(),
+            w_out: toy.w_out.clone(),
+            b_out: toy.b_out.clone(),
+        }
     }
 
     fn with_reads(&self, w_in: Array2<f64>) -> Self {
@@ -211,16 +223,21 @@ fn normal_form_merges_opposite_forms_into_the_linear_part() {
 /// write cancels, no unit is left: a linear block, split by any partition, so
 /// there is nothing to identify. Merged, a one-row readout observes one
 /// direction; the unmerged units would claim all `d`.
+///
+/// Design rule: sign duplicates merge before any unit graph is read. The raw reads
+/// `[I; −I]` have the projector `½ [[I, −I], [−I, I]]`, whose pattern falsely splits the
+/// block into `d` modules `{i, d + i}`, each an exact split at zero cost; the merged
+/// form has no unit, and the module split refuses it.
 #[test]
 fn toy1_paired_copy_is_a_linear_block() {
     let width = 8;
     let identity = Array2::<f64>::eye(width);
-    let block = Block {
-        w_in: concatenate![Axis(0), identity, -&identity],
-        b_in: Array1::zeros(2 * width),
-        w_out: concatenate![Axis(1), identity, -&identity],
-        b_out: Array1::zeros(width),
-    };
+    let block = Block::of(&paired_copy(width));
+    let raw_projector = block.w_in.dot(&block.w_in.t()) * 0.5;
+    let raw_pairs = (0..2 * width)
+        .flat_map(|i| ((i + 1)..2 * width).map(move |j| (i, j)))
+        .filter(|&(i, j)| raw_projector[[i, j]] != 0.0);
+    assert_eq!(connected_components(2 * width, raw_pairs).len(), width, "the unmerged graph claims d modules");
     let form = block.normal_form(GaussianActivation::ExactGelu, None);
     assert_eq!(form.reads.nrows(), 0);
     assert_eq!(form.cancelled.len(), 2 * width);
@@ -413,41 +430,12 @@ fn optimal_split_matches_the_direct_loss_and_bounds_the_native_error() {
 /// (rank 4).
 #[test]
 fn toys_two_and_three_modules_and_a_linear_cross_edge() {
-    let width = 8;
-    let hadamard =
-        Array2::from_shape_fn((width, width), |(i, j)| if (i & j).count_ones() % 2 == 0 { 1.0 } else { -1.0 });
-    let outputs = hadamard.slice(s![.., ..;-1]).to_owned();
-    let mut rng = StdRng::seed_from_u64(2951);
-    let mut units = Vec::new();
-    for (module, (range, count)) in [(0..3, 6), (3..8, 10)].into_iter().enumerate() {
-        for _ in 0..count {
-            let mut read = Array1::<f64>::zeros(width);
-            let mut write = Array1::<f64>::zeros(width);
-            for row in range.clone() {
-                read.scaled_add(rng.random_range(-3_i32..=3) as f64, &hadamard.row(row));
-                write.scaled_add(rng.random_range(-3_i32..=3) as f64, &outputs.row(row));
-            }
-            units.push((read, write, rng.random_range(-8_i32..=8) as f64 / 8.0, module));
-        }
-    }
-    units.shuffle(&mut rng);
-    let hidden = units.len();
-    let mut block = Block {
-        w_in: Array2::zeros((hidden, width)),
-        b_in: Array1::zeros(hidden),
-        w_out: Array2::zeros((width, hidden)),
-        b_out: Array1::zeros(width),
-    };
-    let mut truth = Vec::new();
-    for (unit, (read, write, bias, module)) in units.into_iter().enumerate() {
-        block.w_in.row_mut(unit).assign(&read);
-        block.w_out.column_mut(unit).assign(&write);
-        block.b_in[unit] = bias;
-        truth.push(module);
-    }
+    let (toy, truth) = hadamard_modules(2951);
+    let block = Block::of(&toy);
+    let outputs = hadamard().slice(s![.., ..;-1]).to_owned();
     let module_one_outputs = outputs.slice(s![..3, ..]).to_owned();
     for epsilon in [0.0, 1e-6, 1e-3, 1e-1] {
-        let skip = Array2::from_shape_fn((width, width), |(i, j)| epsilon * outputs[[0, i]] * hadamard[[3, j]]);
+        let skip = cross_edge(epsilon);
         let form = block.normal_form(GaussianActivation::ExactGelu, Some(&skip));
         let live: Vec<usize> = form.sources.iter().map(|sources| truth[sources[0].unit]).collect();
         let blocks = form.additive_blocks(test_governor()).expect("blocks");
@@ -493,4 +481,60 @@ fn laplacian_matches_the_dense_form_and_subsets_are_checked() {
         form.optimal_split(test_governor(), &blocks, &[1, 1]),
         Err(ModuleSplitError::InvalidSubset { unit: 1, .. })
     ));
+}
+
+/// Toy 4 as a block: the paired copy of a rotation `R` (angles `0.3, 0.3, 1.1` in a hidden
+/// basis), `R σ(h) − R σ(−h) = R h`. Every write cancels and the merged linear part is `R`
+/// bitwise, so the split refuses: a linear block is additive under every partition. Under
+/// a projector contract its exact splits are the invariant subspace pairs of `R`, a
+/// continuous family whenever the commutant `{X : X R = R X}` exceeds `d`: the rotation
+/// commutant has dimension `2·2² + 2·1² = 10 > 6`, and the fibre oracle on
+/// `X ↦ X R − R X` bounds the computed one by exactly that.
+#[test]
+fn toy4_paired_rotation_is_a_linear_block_with_a_continuous_commutant() {
+    let width = 6;
+    let planted = plant(width, &[0.3, 0.3, 1.1], 0, 0x2951_0004);
+    let rotation = &planted.matrix;
+    let mut w_in = Array2::<f64>::zeros((2 * width, width));
+    w_in.slice_mut(s![..width, ..]).assign(&Array2::<f64>::eye(width));
+    w_in.slice_mut(s![width.., ..]).assign(&(-Array2::<f64>::eye(width)));
+    let w_out = concatenate![Axis(1), *rotation, -rotation];
+    let block = Block {
+        w_in,
+        b_in: Array1::zeros(2 * width),
+        w_out,
+        b_out: Array1::zeros(width),
+    };
+    let form = block.normal_form(GaussianActivation::ExactGelu, None);
+    assert_eq!(form.reads.nrows(), 0);
+    assert_eq!(&form.linear, rotation);
+    assert!(matches!(form.additive_blocks(test_governor()), Err(ModuleSplitError::NoUnits)));
+
+    // `vec(X R − R X) = (Rᵀ ⊗ I − I ⊗ R) vec(X)`, column-major `vec`.
+    let order = width * width;
+    let commutator = Array2::from_shape_fn((order, order), |(row, col)| {
+        let (i, j) = (row % width, row / width);
+        let (k, l) = (col % width, col / width);
+        let right = if i == k { rotation[[l, j]] } else { 0.0 };
+        let left = if j == l { rotation[[i, k]] } else { 0.0 };
+        right - left
+    });
+    // `R` is within `matrix_defect` of an exact rotation, and `‖E ⊗ I‖₂ = ‖I ⊗ E‖₂ = ‖E‖₂`;
+    // each entry is one rounded difference.
+    let rounding = accumulation_growth(1) * commutator.iter().map(|value| value * value).sum::<f64>().sqrt();
+    let fibre = parameter_fibre(test_governor(), &commutator, 2.0 * planted.matrix_defect + rounding).expect("fibre");
+    assert_eq!(fibre.nullity_at_most(), 10);
+    assert!(fibre.nullity_at_most() > width, "a continuous family of splits");
+}
+
+/// Toy 7, the random null: a dense random GELU block of 64 units on `ℝ¹⁶` is one
+/// component with no unresolved join, so no module is claimed.
+#[test]
+fn toy7_random_block_claims_no_module() {
+    let block = Block::of(&random_mlp(7, 64, 16));
+    let form = block.normal_form(GaussianActivation::ExactGelu, None);
+    let blocks = form.additive_blocks(test_governor()).expect("blocks");
+    assert_eq!(blocks.finest.len(), 1);
+    assert!(blocks.unresolved_joins.is_empty());
+    assert!(matches!(blocks.rank, EvidenceStatus::Exact { value, .. } if value == 16.0));
 }

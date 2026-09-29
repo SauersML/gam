@@ -11,6 +11,9 @@ use ndarray::{Array2, ArrayView2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
+// The planted known-answer toys and their ball-arithmetic Jacobians.
+pub mod planted_toys;
+
 pub fn frobenius_norm(matrix: ArrayView2<'_, f64>) -> f64 {
     matrix.iter().map(|value| value * value).sum::<f64>().sqrt()
 }

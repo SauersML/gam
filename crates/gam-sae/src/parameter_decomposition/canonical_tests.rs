@@ -367,3 +367,96 @@ fn canonical_forms_refuse_what_they_do_not_derive() {
     let refused = canonical_value_output(geometry(), &deficient, &native.output.affine(), &TensorDefect::Exact);
     assert!(matches!(refused, Err(CanonicalRefusal::ValueRank { group: 1, .. })));
 }
+
+/// The canonical value/output form of the routing toy's rank-2 heads, one head per group,
+/// and the per-group transports `O′_h V′_h` it determines, each within the band its defects
+/// derive: `|O′ − O T| |V′| + (|O′| + δ_O) |V′ − T⁻¹V| + γ_r |O′| |V′|`.
+fn routing_canonical_transports(value: &[Array2<f64>], output: &[Array2<f64>]) -> Vec<(Array2<f64>, Array2<f64>)> {
+    use crate::parameter_decomposition::test_support::planted_toys::{ROUTING_HEADS, ROUTING_RANK, ROUTING_WIDTH, RoutingToy};
+    let (d, r) = (ROUTING_WIDTH, ROUTING_RANK);
+    let geometry = AttentionGeometry {
+        model_dim: d,
+        n_heads: ROUTING_HEADS,
+        n_kv_heads: ROUTING_HEADS,
+        head_dim: r,
+    };
+    let stacked_value = concatenate(Axis(0), &value.iter().map(|block| block.view()).collect::<Vec<_>>()).expect("stack");
+    let stacked_output = concatenate(Axis(1), &output.iter().map(|block| block.view()).collect::<Vec<_>>()).expect("stack");
+    let affine = |weight: Array2<f64>| AffineProjection {
+        bias: Array1::zeros(weight.nrows()),
+        weight,
+    };
+    let canonical = canonical_value_output(geometry, &affine(stacked_value), &affine(stacked_output), &TensorDefect::Exact)
+        .expect("full-rank heads have a canonical form");
+    assert!(canonical.separated.iter().all(|&separated| separated));
+    (0..ROUTING_HEADS)
+        .map(|head| {
+            let rows = head * r..(head + 1) * r;
+            let value_prime = canonical.value.weight.slice(s![rows.clone(), ..]);
+            let output_prime = canonical.output.weight.slice(s![.., rows.clone()]);
+            let (value_defect, output_defect) =
+                (canonical.value_defect.slice(s![rows.clone(), ..]), canonical.output_defect.slice(s![.., rows]));
+            let transport = output_prime.dot(&value_prime);
+            let absolute_value = value_prime.mapv(f64::abs);
+            let absolute_output = output_prime.mapv(f64::abs);
+            let band = output_defect.dot(&absolute_value)
+                + (&absolute_output + &output_defect).dot(&value_defect)
+                + absolute_output.dot(&absolute_value).mapv(|entry| accumulation_growth(r + 2) * entry);
+            let exact = RoutingToy::transport(value, output, &[head]);
+            for ((index, &computed), (&exact, &band)) in transport.indexed_iter().zip(exact.iter().zip(band.iter())) {
+                assert!((computed - exact).abs() <= band, "head {head} {index:?}: {computed} vs {exact} beyond {band:e}");
+            }
+            (transport, band)
+        })
+        .collect()
+}
+
+/// Toy 5's value/output gauges against the canonical form, which quotients the declared
+/// per-group `GL(r)` and nothing more (module docs, *Scope*).
+/// - A per-head `S_h` moves every head and no function: the executed block agrees within
+///   its radii, and the canonical form carries the same per-group transports.
+/// - The cross-head `GL(4)` of heads 1 and 2, whose patterns are identical, also moves no
+///   function (their summed transport is unchanged exactly), but it moves each head's own
+///   transport, which the canonical form determines. So one function has two canonical
+///   forms: equal canonical forms imply equal functions, not the converse.
+#[test]
+fn toy5_cross_head_transport_gauge_is_outside_the_canonical_form() {
+    use crate::parameter_decomposition::test_support::planted_toys::{ROUTING_HEADS, RoutingToy};
+    let toy = RoutingToy::new(2951);
+    let positions = RoutingToy::positions();
+    let base = routing_canonical_transports(&toy.value, &toy.output);
+    let native = toy.native(&toy.value, &toy.output);
+    let (per_head_value, per_head_output) = toy.per_head_gauge(5);
+    let (cross_value, cross_output) = toy.cross_head_gauge(6);
+    for (value, output, what) in [(&per_head_value, &per_head_output, "per-head"), (&cross_value, &cross_output, "cross-head")] {
+        let moved = toy.native(value, output);
+        for x in &toy.sequences {
+            let before = native.execute(test_governor(), x.view(), &positions).expect("executes");
+            let after = moved.execute(test_governor(), x.view(), &positions).expect("executes");
+            for (((&a, &b), &ra), &rb) in
+                before.output.iter().zip(after.output.iter()).zip(before.output_radius.iter()).zip(after.output_radius.iter())
+            {
+                assert!((a - b).abs() <= ra + rb, "{what}: {a} vs {b} beyond {}", ra + rb);
+            }
+        }
+        assert_eq!(
+            RoutingToy::transport(value, output, &[0, 1]),
+            RoutingToy::transport(&toy.value, &toy.output, &[0, 1]),
+            "{what}: the law's transport is carried exactly"
+        );
+    }
+    // Two canonical transports agree when every entry is within the sum of their bands, and
+    // are certified distinct when some entry is beyond it.
+    let distinct = |first: &(Array2<f64>, Array2<f64>), second: &(Array2<f64>, Array2<f64>)| {
+        first.0.iter().zip(second.0.iter()).zip(first.1.iter().zip(second.1.iter())).any(|((&a, &b), (&ra, &rb))| (a - b).abs() > ra + rb)
+    };
+    let per_head = routing_canonical_transports(&per_head_value, &per_head_output);
+    let cross = routing_canonical_transports(&cross_value, &cross_output);
+    for head in 0..ROUTING_HEADS {
+        assert!(!distinct(&per_head[head], &base[head]), "head {head}: the per-head gauge is quotiented");
+    }
+    assert!(!distinct(&cross[2], &base[2]), "head 3 is untouched");
+    for head in 0..2 {
+        assert!(distinct(&cross[head], &base[head]), "head {head}: the cross-head gauge moves its canonical transport");
+    }
+}
