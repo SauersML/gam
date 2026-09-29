@@ -360,6 +360,31 @@ struct GaussianPart {
     posterior_mean: Array1<f64>,
     /// `(max L_ii / min L_ii)²` of `Λ`'s Cholesky: a lower bound on `κ₂(Λ)`.
     condition_floor: f64,
+    /// The forward error of `½ln|Λ| − ½hᵀδ̄` as computed through `Λ`'s Cholesky; see
+    /// [`SitePrecision::value_forward_error`].
+    value_forward_error: f64,
+}
+
+/// `Λ = M + AᵀT̃A` at a set of sites, with what is read through its Cholesky.
+struct SitePrecision {
+    precision: Array2<f64>,
+    inverse: Array2<f64>,
+    log_det: f64,
+    h: Array1<f64>,
+    /// `δ̄ = Λ⁻¹h`, solved through the Cholesky.
+    mean_offset: Array1<f64>,
+    condition_floor: f64,
+    /// A first-order bound on the forward error of `½ln|Λ| − ½hᵀδ̄` as computed (gam#4573).
+    ///
+    /// The Cholesky is exact for `Λ + ΔΛ` with `|ΔΛ| ≤ γ_{p+1}|L||Lᵀ|`, and a solve through it for
+    /// `Λ + ΔΛ'` with `|ΔΛ'| ≤ γ_{3p+1}|L||Lᵀ|` (Higham, *Accuracy and Stability of Numerical
+    /// Algorithms*, Thms 10.3 and 10.4). So `δ ln|Λ| = tr(Λ⁻¹ΔΛ)` is at most
+    /// `γ_{p+1}·Σ_ab |Λ⁻¹|_ab (|L||Lᵀ|)_ab`, and `hᵀδ̄` moves by `δ̄ᵀΔΛ'δ̄`, at most
+    /// `γ_{3p+1}·‖|Lᵀ||δ̄|‖²`, plus the product's own `γ_p·|h|ᵀ|δ̄|`. Both are amplified by `Λ`'s
+    /// conditioning, which a band formed from the terms' magnitudes alone does not carry: on the
+    /// gam#3257 capture (κ(Λ) near 1e10) the computed `½ln|Λ|` and `½hᵀδ̄` sat 1.1e-6 and 3e-6 from
+    /// their 40-digit values, against a magnitude band of 7e-12.
+    value_forward_error: f64,
 }
 
 /// `Λ = M + AᵀT̃A`, `Λ⁻¹`, `ln|Λ|` and `δ̄ = Λ⁻¹h` at a set of sites.
@@ -371,7 +396,7 @@ fn site_precision(
     tau: &Array1<f64>,
     nu: &Array1<f64>,
     sweep: usize,
-) -> Result<(Array2<f64>, Array2<f64>, f64, Array1<f64>, Array1<f64>, f64), ConeLaplaceRefusal> {
+) -> Result<SitePrecision, ConeLaplaceRefusal> {
     let p = precision_m.nrows();
     let q = rows.nrows();
     let mut precision = precision_m.clone();
@@ -411,11 +436,26 @@ fn site_precision(
     let inverse = symmetrized(&factor.solve_mat(&Array2::<f64>::eye(p)));
     let shift = Array1::from_shape_fn(q, |i| nu[i] - tau[i] * slack[i]);
     let h = rows.t().dot(&shift) - gradient;
-    let mean_offset = inverse.dot(&h);
+    let mean_offset = factor.solvevec(&h);
     if !(log_det.is_finite() && mean_offset.iter().all(|value| value.is_finite())) {
         return Err(ConeLaplaceRefusal::NonFinite { what: "posterior of the sites" });
     }
-    Ok((precision, inverse, log_det, h, mean_offset, condition_floor))
+    let lower = factor.lower_triangular().mapv(f64::abs);
+    let factor_product = lower.dot(&lower.t());
+    let log_det_error = accumulation_growth(p + 1)
+        * inverse
+            .iter()
+            .zip(factor_product.iter())
+            .map(|(inverse_entry, product)| inverse_entry.abs() * product)
+            .sum::<f64>();
+    let loaded = lower.t().dot(&mean_offset.mapv(f64::abs));
+    let quadratic_error = accumulation_growth(3 * p + 1) * loaded.dot(&loaded)
+        + accumulation_growth(p) * h.iter().zip(mean_offset.iter()).map(|(a, b)| (a * b).abs()).sum::<f64>();
+    let value_forward_error = 0.5 * (log_det_error + quadratic_error);
+    if !value_forward_error.is_finite() {
+        return Err(ConeLaplaceRefusal::NonFinite { what: "posterior of the sites" });
+    }
+    Ok(SitePrecision { precision, inverse, log_det, h, mean_offset, condition_floor, value_forward_error })
 }
 
 fn gaussian_part(
@@ -427,7 +467,7 @@ fn gaussian_part(
     nu: &Array1<f64>,
     sweep: usize,
 ) -> Result<GaussianPart, ConeLaplaceRefusal> {
-    let (precision, inverse, log_det, h, mean_offset, condition_floor) =
+    let SitePrecision { precision, inverse, log_det, h, mean_offset, condition_floor, value_forward_error } =
         site_precision(precision_m, gradient, rows, slack, tau, nu, sweep)?;
     let normal_solves = inverse.dot(&rows.t());
     let sigma = symmetrized(&rows.dot(&normal_solves));
@@ -445,6 +485,7 @@ fn gaussian_part(
         sigma,
         posterior_mean,
         condition_floor,
+        value_forward_error,
     })
 }
 
@@ -723,39 +764,24 @@ fn zero_slack_multipliers(zero_rows: &Array2<f64>, gradient: &Array1<f64>) -> Re
     Ok(vectors.dot(&scaled))
 }
 
-/// How EP damps its site updates from one sweep to the next, and what its floor exit compares
-/// (gam#3257). [`RecoveringDamping`] is the rule EP runs; the seam exists so a test can run a
-/// superseded rule through the same sweep.
+/// How EP damps its site updates from one sweep to the next (gam#3257). [`RecoveringDamping`] is
+/// the rule EP runs; the seam exists so a test can run a superseded rule through the same sweep.
 trait EpDampingRule {
     /// The share of its full update every site takes on the next sweep, after a sweep whose full
     /// update moved the sites `step` rounding units against `previous_step` on the sweep before.
     fn next_fraction(&self, fraction: f64, step: f64, previous_step: f64) -> f64;
-
-    /// Whether a sweep that changed `L` by `change`, against its rounding band `band`, at the share
-    /// `fraction`, has reached the floor the value's own rounding sets.
-    fn value_at_floor(&self, change: f64, band: f64, fraction: f64) -> bool;
 }
 
 /// Halve the share after a sweep whose full update did not shrink and double it back, up to the
-/// whole update, after one that did; hold only the change beyond `L`'s own rounding band against
-/// the damped share of it.
+/// whole update, after one that did.
 ///
 /// Neither rule moves a fixed point: a damped sweep takes `(1 − f)·s + f·u(s)` at each site, which
 /// equals `s` exactly when `u(s) = s`, for every `f` in `(0, 1]`. The damping sets only the rate,
 /// about `f` of a full sweep's contraction per sweep, so a share that is never restored keeps EP
 /// crawling long after the transient that cut it has passed. Near its fixed point `step` is
 /// measured in rounding units and fluctuates, and under a halve-only rule each non-decrease was
-/// another permanent halving (to `2⁻³⁷` on the #3257 fit).
-///
-/// The band is `L`'s own rounding, and it enters a sweep's change whatever the damping is: `value`
-/// and `previous` are each formed to within it, so their difference carries up to `band` of
-/// arithmetic even when no site moved. The damping scales only the systematic part, the move a
-/// sweep's sites make toward the fixed point, which is `fraction` of the full update's. So the full
-/// update would move `L` by no more than its band exactly when the change beyond the arithmetic is
-/// within `fraction · band`. A floor on the whole change against `fraction · band` asks the
-/// arithmetic itself to shrink with the damping, which it does not: once `fraction` is small that
-/// exit can never fire, and EP crawls to `step ≤ 1` at `fraction` of a sweep's contraction per
-/// sweep (26 million sweeps per pricing on the #3257 fit).
+/// another permanent halving (to `2⁻³⁷` on the #3257 fit). Where the sweeps stop contracting, EP
+/// takes its Newton step instead ([`newton_probe`]).
 struct RecoveringDamping;
 
 impl EpDampingRule for RecoveringDamping {
@@ -766,9 +792,145 @@ impl EpDampingRule for RecoveringDamping {
             0.5 * fraction
         }
     }
+}
 
-    fn value_at_floor(&self, change: f64, band: f64, fraction: f64) -> bool {
-        change - band <= fraction * band
+/// The mode-side inputs every EP posterior is formed from: `M`, `∇F(β̂)`, and the retained unit rows
+/// with their slacks; with the growth factor a site's formation is rounded by, and the sweep being
+/// run, which the refusals name.
+struct ModeSites<'a> {
+    precision_m: &'a Array2<f64>,
+    gradient: &'a Array1<f64>,
+    rows: &'a Array2<f64>,
+    slack: &'a Array1<f64>,
+    growth: f64,
+    sweep: usize,
+}
+
+/// What EP's Newton step from a set of sites found (gam#3257, gam#4573).
+enum NewtonProbe {
+    /// The full Newton step moves `L` by no more than the band it is computed to: the sites are at
+    /// the EP fixed point to `L`'s resolution. The stepped sites, closer to it still, and that move.
+    Settled { tau: Array1<f64>, nu: Array1<f64>, part: GaussianPart, value_motion: f64 },
+    /// A step along the Newton direction lowered the EP map's residual; EP continues from it.
+    Stepped { tau: Array1<f64>, nu: Array1<f64>, part: GaussianPart },
+    /// No step along the Newton direction lowered the residual before its move fell under every
+    /// site's rounding, or the linearization is not available here; EP continues its sweeps.
+    Unavailable,
+}
+
+/// Every site's full EP update at once, read off the posterior `part` of `(tau, nu)`, stacked as
+/// `[τ̃; ν̃]`, with each site's formation rounding (the rounding of the difference of its tilted and
+/// cavity natural parameters, as a sweep measures it).
+fn full_update(
+    part: &GaussianPart,
+    tau: &Array1<f64>,
+    nu: &Array1<f64>,
+    growth: f64,
+    sweep: usize,
+) -> Result<(Array1<f64>, Array1<f64>), ConeLaplaceRefusal> {
+    let q = tau.len();
+    let mut update = Array1::<f64>::zeros(2 * q);
+    let mut units = Array1::<f64>::zeros(2 * q);
+    for j in 0..q {
+        let s_jj = part.sigma[[j, j]];
+        let tau_c = 1.0 / s_jj - tau[j];
+        let nu_c = part.posterior_mean[j] / s_jj - nu[j];
+        let site = site_update(j, tau_c, nu_c, tau[j], s_jj, part.condition_floor, sweep)?;
+        update[j] = site.tau;
+        update[q + j] = site.nu;
+        units[j] = growth * (tau_c.abs() + (tau_c + site.tau).abs());
+        units[q + j] = growth * (nu_c.abs() + (nu_c + site.nu).abs());
+    }
+    Ok((update, units))
+}
+
+/// The largest residual of the EP map `F(s) − s` in its sites' rounding units.
+fn scaled_residual(update: &Array1<f64>, sites: &Array1<f64>, units: &Array1<f64>) -> f64 {
+    update
+        .iter()
+        .zip(sites.iter())
+        .zip(units.iter())
+        .map(|((&next, &current), &unit)| if next == current { 0.0 } else { (next - current).abs() / unit })
+        .fold(0.0_f64, f64::max)
+}
+
+/// EP's Newton step from the sites `(tau, nu)`, whose posterior is `part` and whose `L` is `value`,
+/// computed to within `band`.
+///
+/// The step solves the linearized fixed point `(I − ∂F/∂s)d = F(s) − s`, the same system the sites'
+/// motion along an outer coordinate solves ([`ConeLaplace::first_order`]), so near the fixed point
+/// it converges quadratically where the damped sweeps crawl: on the gam#3257 capture the EP map's
+/// Jacobian has spectral radius 1.8 at its fixed point, so undamped sweeps diverge and damped ones
+/// contract at the share's rate. `d` is the first-order displacement to the fixed point, and `L` is
+/// stationary there, so `L(s + d) − L(s)` is `L(s)`'s own error to second order: once it is within
+/// the band `L` is computed to, nothing a further step resolves is left. Otherwise the step is
+/// taken, halved until the map's residual falls, and never below the sites' rounding, where no
+/// representable move is left to make.
+fn newton_probe(
+    mode: &ModeSites<'_>,
+    tau: &Array1<f64>,
+    nu: &Array1<f64>,
+    part: &GaussianPart,
+    value: f64,
+    band: f64,
+) -> Result<NewtonProbe, ConeLaplaceRefusal> {
+    let (q, p) = mode.rows.dim();
+    let (growth, sweep) = (mode.growth, mode.sweep);
+    let Ok((update, units)) = full_update(part, tau, nu, growth, sweep) else {
+        return Ok(NewtonProbe::Unavailable);
+    };
+    let mut sites = Array1::<f64>::zeros(2 * q);
+    sites.slice_mut(s![0..q]).assign(tau);
+    sites.slice_mut(s![q..2 * q]).assign(nu);
+    let current = scaled_residual(&update, &sites, &units);
+    let point = SiteFixedPoint {
+        rows: mode.rows,
+        sigma: &part.sigma,
+        posterior_mean: &part.posterior_mean,
+        normal_solves: &part.normal_solves,
+        tau,
+        nu,
+        condition_floor: part.condition_floor,
+        sweep,
+    };
+    let Ok(system) = point.form(SiteMotionRoute::cheaper(q, p)) else {
+        return Ok(NewtonProbe::Unavailable);
+    };
+    let mut direction = &update - &sites;
+    point.solve(&system.solver, &mut direction);
+    if !direction.iter().all(|value| value.is_finite()) {
+        return Ok(NewtonProbe::Unavailable);
+    }
+    let mut length = 1.0_f64;
+    loop {
+        let trial = &sites + &(&direction * length);
+        let trial_tau = trial.slice(s![0..q]).to_owned();
+        let trial_nu = trial.slice(s![q..2 * q]).to_owned();
+        if let Ok(trial_part) =
+            gaussian_part(mode.precision_m, mode.gradient, mode.rows, mode.slack, &trial_tau, &trial_nu, sweep)
+            && let Ok((trial_update, trial_units)) = full_update(&trial_part, &trial_tau, &trial_nu, growth, sweep)
+        {
+            if length == 1.0
+                && let Ok((trial_share, _)) = share_and_magnitude(&trial_part, mode.slack, &trial_tau, &trial_nu, sweep)
+            {
+                let value_motion = (0.5 * trial_part.log_det + trial_share - value).abs();
+                if value_motion <= band {
+                    return Ok(NewtonProbe::Settled {
+                        tau: trial_tau,
+                        nu: trial_nu,
+                        part: trial_part,
+                        value_motion,
+                    });
+                }
+            }
+            if scaled_residual(&trial_update, &trial, &trial_units) < current {
+                return Ok(NewtonProbe::Stepped { tau: trial_tau, nu: trial_nu, part: trial_part });
+            }
+        }
+        length *= 0.5;
+        if direction.iter().zip(units.iter()).all(|(&move_by, &unit)| (length * move_by).abs() <= unit) {
+            return Ok(NewtonProbe::Unavailable);
+        }
     }
 }
 
@@ -834,7 +996,7 @@ impl ConeLaplace {
         }
         let all_rows = stack_rows(units, &(0..total).collect::<Vec<_>>(), p);
         let all_slack = Array1::from(slacks.clone());
-        let (_, start_inverse, _, _, start_offset, _) = site_precision(
+        let SitePrecision { inverse: start_inverse, mean_offset: start_offset, .. } = site_precision(
             precision,
             gradient,
             &all_rows,
@@ -943,8 +1105,6 @@ impl ConeLaplace {
         let growth = accumulation_growth(p * p + 4 * q * q + 8 * q);
         let band_of = |magnitude: f64| growth * magnitude;
         let mut part = gaussian_part(precision_m, gradient, &rows, &slack, &tau, &nu, 0)?;
-        let (share, _) = share_and_magnitude(&part, &slack, &tau, &nu, 0)?;
-        let mut previous = 0.5 * part.log_det + share;
         let mut previous_step = f64::INFINITY;
         let mut fraction = 1.0_f64;
         let mut sweeps = 0;
@@ -1006,16 +1166,46 @@ impl ConeLaplace {
                 return Err(ConeLaplaceRefusal::NonFinite { what: "EP site update" });
             }
             let (share, share_magnitude) = share_and_magnitude(&part, &slack, &tau, &nu, sweeps)?;
-            let value = 0.5 * part.log_det + share;
-            let band = band_of(share_magnitude + 0.5 * part.log_det.abs());
-            let change = (value - previous).abs();
-            // Settled: no site moves beyond its rounding. Or at the floor the sites' own rounding
-            // sets: a full sweep no longer shrinks the sites' move, and `L` moved by no more than
-            // the damped share of its band beyond that band ([`RecoveringDamping`] states why the
-            // band is taken out of the change first).
-            let at_floor =
-                damping.value_at_floor(change, band, fraction) && !(step < previous_step);
-            if step <= 1.0 || at_floor {
+            let mut value = 0.5 * part.log_det + share;
+            // `L` is formed from fixed sites to within its terms' accumulated rounding, and through
+            // `Λ`'s Cholesky to within that factorization's forward error, which `Λ`'s conditioning
+            // amplifies (gam#4573).
+            let mut band = band_of(share_magnitude + 0.5 * part.log_det.abs()) + part.value_forward_error;
+            let mut settled = step <= 1.0;
+            // The sweeps stopped contracting. A damped sweep's change in `L` says nothing about how
+            // far the sites are from their fixed point, since `L` is stationary there, so the
+            // distance is measured instead: EP's Newton step `d = (I − ∂F/∂s)⁻¹(F(s) − s)` is the
+            // first-order displacement to the fixed point, and `L(s + d) − L(s)` is `L`'s error at
+            // `s` to second order ([`newton_probe`]). Where that is within the band `L` is computed
+            // to, the sites are at the fixed point to `L`'s own resolution; otherwise the Newton step,
+            // shortened until the EP map's residual falls, carries EP toward it (gam#3257).
+            if !settled && !(step < previous_step) {
+                let mode_sites =
+                    ModeSites { precision_m, gradient, rows: &rows, slack: &slack, growth, sweep: sweeps };
+                match newton_probe(&mode_sites, &tau, &nu, &part, value, band)? {
+                    NewtonProbe::Settled { tau: next_tau, nu: next_nu, part: next_part, value_motion } => {
+                        let (next_share, next_magnitude) =
+                            share_and_magnitude(&next_part, &slack, &next_tau, &next_nu, sweeps)?;
+                        tau = next_tau;
+                        nu = next_nu;
+                        part = next_part;
+                        value = 0.5 * part.log_det + next_share;
+                        band = band_of(next_magnitude + 0.5 * part.log_det.abs())
+                            + part.value_forward_error
+                            + value_motion;
+                        settled = true;
+                    }
+                    NewtonProbe::Stepped { tau: next_tau, nu: next_nu, part: next_part } => {
+                        tau = next_tau;
+                        nu = next_nu;
+                        part = next_part;
+                        previous_step = f64::INFINITY;
+                        continue;
+                    }
+                    NewtonProbe::Unavailable => {}
+                }
+            }
+            if settled {
                 return Ok(Self {
                     value,
                     log_det_half: 0.5 * part.log_det,
@@ -1047,7 +1237,6 @@ impl ConeLaplace {
             // full update follows the sweeps ([`RecoveringDamping`]); no share moves a fixed point.
             fraction = damping.next_fraction(fraction, step, previous_step);
             previous_step = step;
-            previous = value;
         }
     }
 
@@ -1066,7 +1255,9 @@ impl ConeLaplace {
         self.value - self.log_det_half
     }
 
-    /// The rounding band `L` settled to.
+    /// The band `L` is known to: its terms' accumulated rounding, the forward error its
+    /// Cholesky-read pieces carry through `Λ`'s conditioning, and, where EP settled by its Newton
+    /// step, how far that step still moved `L` (gam#4573).
     pub fn value_band(&self) -> f64 {
         self.band
     }
@@ -1285,8 +1476,56 @@ impl ConeLaplace {
         Ok((rhs.slice(s![0..q]).to_owned(), rhs.slice(s![q..2 * q]).to_owned()))
     }
 
+    /// The EP map's linearization at these sites, read off their posterior.
+    fn fixed_point(&self) -> SiteFixedPoint<'_> {
+        SiteFixedPoint {
+            rows: &self.rows,
+            sigma: &self.sigma,
+            posterior_mean: &self.posterior_mean,
+            normal_solves: &self.normal_solves,
+            tau: &self.tau,
+            nu: &self.nu,
+            condition_floor: self.condition_floor,
+            sweep: self.sweeps,
+        }
+    }
+
     /// Overwrite `rhs = [τ̃ block; ν̃ block]` with `(I − ∂F/∂s)⁻¹rhs`.
     fn solve_linearized_fixed_point(&self, solver: &SiteMotionSolver, rhs: &mut Array1<f64>) {
+        self.fixed_point().solve(solver, rhs);
+    }
+
+    /// The site partials and the factored linearized fixed point `I − ∂F/∂s`, formed once for these
+    /// sites, by the cheaper of its two exact routes. Per unit site change the posterior of `u` moves
+    /// by `dΣ/dτ̃_k = −Σ_{:k}Σ_{k:}`, `dū/dτ̃_k = −Σ_{:k}ū_k` and `dū/dν̃_k = Σ_{:k}`, and site `j`
+    /// reads the cavity `(1/Σ_jj − τ̃_j, ū_j/Σ_jj − ν̃_j)`.
+    fn linearized_fixed_point(&self) -> Result<&SiteMotionSystem, ConeLaplaceRefusal> {
+        let (q, p) = self.rows.dim();
+        self.site_motion_system
+            .get_or_init(|| self.fixed_point().form(SiteMotionRoute::cheaper(q, p)))
+            .as_ref()
+            .map_err(|refusal| refusal.clone())
+    }
+}
+
+/// The EP map `F` at one set of sites, through the posterior those sites give: what its
+/// linearization `I − ∂F/∂s` reads. The sites' own motion along an outer coordinate solves it
+/// ([`ConeLaplace::first_order`]), and so does EP's Newton step toward the fixed point
+/// ([`ConeLaplace::converge`]).
+struct SiteFixedPoint<'a> {
+    rows: &'a Array2<f64>,
+    sigma: &'a Array2<f64>,
+    posterior_mean: &'a Array1<f64>,
+    normal_solves: &'a Array2<f64>,
+    tau: &'a Array1<f64>,
+    nu: &'a Array1<f64>,
+    condition_floor: f64,
+    sweep: usize,
+}
+
+impl SiteFixedPoint<'_> {
+    /// Overwrite `rhs = [τ̃ block; ν̃ block]` with `(I − ∂F/∂s)⁻¹rhs`.
+    fn solve(&self, solver: &SiteMotionSolver, rhs: &mut Array1<f64>) {
         let (q, p) = self.rows.dim();
         match solver {
             SiteMotionSolver::Direct(factor) => factor.solve_in_place(array1_to_col_matmut(rhs)),
@@ -1311,7 +1550,7 @@ impl ConeLaplace {
                         index += 1;
                     }
                 }
-                let linear = self.rows.t().dot(&(&x_nu - &(&self.posterior_mean * &x_tau)));
+                let linear = self.rows.t().dot(&(&x_nu - &(self.posterior_mean * &x_tau)));
                 moved.slice_mut(s![quad..]).assign(&linear);
                 factor.solve_in_place(array1_to_col_matmut(&mut moved));
                 // ds = x₀ + P R_d z, with R_d reading (−w_jᵀZw_j, w_jᵀz) off each site.
@@ -1325,7 +1564,7 @@ impl ConeLaplace {
                     }
                 }
                 let z_linear = moved.slice(s![quad..]);
-                let quadratic = z_matrix.dot(&self.normal_solves);
+                let quadratic = z_matrix.dot(self.normal_solves);
                 for j in 0..q {
                     let w = self.normal_solves.column(j);
                     let read_variance = -quadratic.column(j).dot(&w);
@@ -1338,28 +1577,16 @@ impl ConeLaplace {
         }
     }
 
-    /// The site partials and the factored linearized fixed point `I − ∂F/∂s`, formed once for these
-    /// sites, by the cheaper of its two exact routes. Per unit site change the posterior of `u` moves
-    /// by `dΣ/dτ̃_k = −Σ_{:k}Σ_{k:}`, `dū/dτ̃_k = −Σ_{:k}ū_k` and `dū/dν̃_k = Σ_{:k}`, and site `j`
-    /// reads the cavity `(1/Σ_jj − τ̃_j, ū_j/Σ_jj − ν̃_j)`.
-    fn linearized_fixed_point(&self) -> Result<&SiteMotionSystem, ConeLaplaceRefusal> {
+    fn form(&self, route: SiteMotionRoute) -> Result<SiteMotionSystem, ConeLaplaceRefusal> {
         let (q, p) = self.rows.dim();
-        self.site_motion_system
-            .get_or_init(|| self.form_site_motion_system(SiteMotionRoute::cheaper(q, p)))
-            .as_ref()
-            .map_err(|refusal| refusal.clone())
-    }
-
-    fn form_site_motion_system(&self, route: SiteMotionRoute) -> Result<SiteMotionSystem, ConeLaplaceRefusal> {
-        let (q, p) = self.rows.dim();
-        let (sigma, mean) = (&self.sigma, &self.posterior_mean);
+        let (sigma, mean) = (self.sigma, self.posterior_mean);
         let mut jacobians = Vec::with_capacity(q);
         for j in 0..q {
             let s_jj = sigma[[j, j]];
             let tau_c = 1.0 / s_jj - self.tau[j];
             let nu_c = mean[j] / s_jj - self.nu[j];
             jacobians.push(
-                site_update(j, tau_c, nu_c, self.tau[j], s_jj, self.condition_floor, self.sweeps)?.jacobian,
+                site_update(j, tau_c, nu_c, self.tau[j], s_jj, self.condition_floor, self.sweep)?.jacobian,
             );
         }
         let solver = match route {
@@ -1474,6 +1701,7 @@ impl ConeLaplace {
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1524,8 +1752,7 @@ mod tests {
         ((4.0 * fine - coarse) / 3.0, (fine - coarse).abs() + 4.0 * noise)
     }
 
-    /// The EP damping rule [`RecoveringDamping`] replaced, exactly: the share only ever halves,
-    /// and the floor exit holds a sweep's whole change against `fraction · band`.
+    /// The EP damping rule [`RecoveringDamping`] replaced, exactly: the share only ever halves.
     struct HalveOnlyDamping;
 
     impl EpDampingRule for HalveOnlyDamping {
@@ -1536,36 +1763,30 @@ mod tests {
                 0.5 * fraction
             }
         }
-
-        fn value_at_floor(&self, change: f64, band: f64, fraction: f64) -> bool {
-            change <= fraction * band
-        }
     }
 
-    /// gam#3257: EP's damping recovers once the sweeps contract again.
+    /// gam#3257, gam#4573: on the incident's own pricing EP reaches its fixed point, and `L` lands
+    /// within the band it reports of that fixed point's `L`, under either damping rule.
     ///
-    /// The instance is the incident itself, not a constructed one: the first cone-Laplace pricing
-    /// whose EP reached 100 000 sweeps in the binomial `flexible(probit)` fit of the issue's
-    /// (3014, 2000) sample, captured at `7e3646325d` under the superseded rule, where it took
-    /// 156 746 sweeps at a share of `2⁻¹⁴`. Eleven rows `β_w ≥ 0` on a 13-coefficient mode, one at
-    /// the wall, and a warp block penalized at `λ ≈ 1.4·10⁷`, so the sites couple through `Λ⁻¹`
-    /// almost perfectly. A grid of 128 AR(1) instances built to imitate it never collapsed the
-    /// share past one halving.
+    /// The instance is the incident itself: the first cone-Laplace pricing whose EP reached 100 000
+    /// sweeps in the binomial `flexible(probit)` fit of the issue's (3014, 2000) sample, captured at
+    /// `7e3646325d`. Eleven rows `β_w ≥ 0` on a 13-coefficient mode, one at the wall, and a warp
+    /// block penalized at `λ ≈ 1.4·10⁷`. Its EP map has spectral radius 1.8 at the fixed point, so
+    /// undamped sweeps diverge and damped ones crawl (156 746 sweeps under the halve-only rule, and
+    /// past an hour inside one fit under the recovering one).
     ///
-    /// Both arms are comparisons on that one instance, so neither carries a constant. The
-    /// recovering rule restores the whole update after the transient that cut it, so it ends at a
-    /// larger share than the halve-only rule's collapsed one and takes strictly fewer sweeps. Were
-    /// production still running the halve-only rule, the two runs would be the same run and both
-    /// strict comparisons would fail: that is the positive control. No rate-based sweep bound is
-    /// asserted: undamped EP does not converge on this instance (over a million sweeps with its
-    /// step near 10⁶ rounding units), so the EP map's own rate is not measurable here.
+    /// `EXACT` is the fixed point's `L` from the same `(M, g, β̂, A, b)`, computed independently of
+    /// this module in 40-digit arithmetic (Newton on the EP fixed point to a residual of 3e-33; `L`
+    /// is second-order flat in the sites there). Before this change the two rules priced `L` at
+    /// 78.0981974 and 78.0981932, 8e-6 and 4e-6 from it, against reported bands near 7e-12: the band
+    /// carried neither `Λ`'s conditioning nor the sites' distance from their fixed point. Each is
+    /// now carried, so each run's `L` must be within its own band of `EXACT`.
     ///
-    /// Nor is agreement of the two runs' `L` to their reported bands asserted: they differ by a few
-    /// 1e-6 against bands near 7e-12. Each site is the difference of a tilted and a cavity precision
-    /// near `λ`, so the sites, and `L` through them, are known only to that difference's rounding,
-    /// which the reported band does not carry. That band accounting is its own defect.
+    /// No sweep count is asserted: that number belongs to the EP map and the damping, not to the
+    /// contract.
     #[test]
-    fn ep_damping_recovers_and_its_floor_exit_fires_at_the_rounding_band_3257() {
+    fn ep_prices_the_3257_capture_within_its_band_of_the_exact_fixed_point_4573() {
+        const EXACT: f64 = 78.098_189_477_853_06;
         let precision = ndarray::array![
             [
                 674.5813074433105, -310.1827473636024, -3.6108125975714453, -7.142175676922976,
@@ -1664,30 +1885,27 @@ mod tests {
             ConeLaplace::evaluate_with_damping(&rows, &bounds, &beta, &gradient, &precision, rule)
                 .unwrap_or_else(|refusal| panic!("{label} EP converges: {refusal}"))
         };
-        let recovering = run(&RecoveringDamping, "recovering");
-        let halve_only = run(&HalveOnlyDamping, "halve-only");
-        eprintln!(
-            "[3257-EP] recovering: sweeps {} fraction {:e} L {:.15e}; halve-only: sweeps {} \
-             fraction {:e} L {:.15e}",
-            recovering.sweeps(),
-            recovering.ep_step_fraction(),
-            recovering.value(),
-            halve_only.sweeps(),
-            halve_only.ep_step_fraction(),
-            halve_only.value(),
-        );
-        assert!(
-            recovering.ep_step_fraction() > halve_only.ep_step_fraction(),
-            "the recovering rule ended at share {:e}, not above the halve-only rule's collapsed {:e}",
-            recovering.ep_step_fraction(),
-            halve_only.ep_step_fraction()
-        );
-        assert!(
-            recovering.sweeps() < halve_only.sweeps(),
-            "the recovering rule took {} sweeps, not fewer than the halve-only rule's {}",
-            recovering.sweeps(),
-            halve_only.sweeps()
-        );
+        for (label, rule) in [
+            ("recovering", &RecoveringDamping as &dyn EpDampingRule),
+            ("halve-only", &HalveOnlyDamping),
+        ] {
+            let term = run(rule, label);
+            let miss = (term.value() - EXACT).abs();
+            eprintln!(
+                "[3257-EP] {label}: sweeps {} fraction {:e} L {:.15e} miss {miss:.3e} band {:.3e}",
+                term.sweeps(),
+                term.ep_step_fraction(),
+                term.value(),
+                term.value_band(),
+            );
+            assert!(
+                miss <= term.value_band(),
+                "{label}: L = {:.15e} misses the fixed point's {EXACT:.15e} by {miss:.3e}, outside \
+                 its reported band {:.3e}",
+                term.value(),
+                term.value_band()
+            );
+        }
     }
 
     /// Where `M` is positive definite the term is the covariance form's `½ln|M| + C`: the same EP
@@ -1860,7 +2078,7 @@ mod tests {
             .unwrap_or_else(|refusal| panic!("θ = {theta:?}: {refusal}"));
             if let Some(route) = self.route {
                 term.site_motion_system
-                    .set(term.form_site_motion_system(route))
+                    .set(term.fixed_point().form(route))
                     .expect("a freshly evaluated term has not formed its site motion yet");
             }
             term
