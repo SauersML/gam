@@ -228,47 +228,6 @@ class SkipAffineSmooth(nn.Module):
         recon = torch.mean((y_hat - y_out) ** 2)
         return recon + self.sparsity_penalty(x_in)
 
-    # --------------------------------------------------------------
-    # Convenience: attribution-graph edge weights at active points
-    # --------------------------------------------------------------
-
-    @torch.no_grad()
-    def attribution_edges(
-        self,
-        x_in: torch.Tensor,
-        target_feature: int,
-        top_k: int = 20,
-    ) -> list[tuple[int, float]]:
-        """For a target *output* feature ``j`` (an output-residual coordinate,
-        ``0 <= j < out_dim``), return the top-k upstream atoms that drive it on
-        ``x_in``.
-
-        The model output is ``y_hat = z @ W_dec + skip(x_in) + b_out`` (see
-        :meth:`forward`), so the direct, linearized contribution of atom ``i``
-        to output coordinate ``j`` at the smooth-threshold active points is
-
-            contrib_i = mean_b z_{b,i} * W_dec[i, j],
-
-        i.e. the per-batch mean activation of atom ``i`` times the ``j``-th
-        column of its decoder row. These are the circuit-edge weights that
-        Anthropic-style attribution graphs consume. The skip bypass is a
-        separate, atom-independent linear path and so contributes no atom edge.
-
-        ``target_feature`` indexes the output residual coordinate, which lives
-        in a different space than the ``n_atoms`` upstream atoms; it is
-        validated against ``out_dim`` rather than ``n_atoms``.
-        """
-        if not (0 <= int(target_feature) < self.out_dim):
-            raise IndexError(
-                f"target_feature must be in [0, {self.out_dim}), got {target_feature}"
-            )
-        z = self.code(x_in)                                # (B, F)
-        z_mean = z.mean(dim=0)                             # (F,)
-        contrib = z_mean * self.W_dec[:, int(target_feature)]   # (F,)
-        k = min(int(top_k), contrib.numel())
-        vals, idx = torch.topk(contrib, k=k)
-        return [(int(i.item()), float(v.item())) for i, v in zip(idx, vals)]
-
 
 # ---------------------------------------------------------------------------
 # Scalar builder and continuous/sequential evidence selector
