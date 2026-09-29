@@ -115,6 +115,33 @@ fn converged_eta_refresh_band(
     }
 }
 
+/// Whether a converged-η refresh of a scale that MULTIPLIES the data term
+/// (the Gamma shape, a Tweedie or dispersion `φ`) certifies the reported pair.
+///
+/// The pair certifies when β̂ is stationary at the refreshed scale to `band`.
+/// Where the refresh moved the scale by no more than its estimator's
+/// `resolution`, the refreshed and the carried scale are one estimate to that
+/// resolution, so the stationarity residual itself is known only to what that
+/// indistinguishable movement induces. The scale enters the penalized gradient
+/// `g = c·XᵀW(η − z) + S_λβ` only as the multiplier `c` of the data term, whose
+/// norm is at most the natural scale `‖XᵀWη‖ + ‖XᵀWz‖ + ‖S_λβ‖` the residual is
+/// denominated in. So a relative movement of `c` by `resolution` moves the
+/// relative residual by at most `resolution`, and a residual within
+/// `band + resolution` is the certified one read at a scale the estimator cannot
+/// tell from it. On the te(2-D) Gamma fit of the reference-quality suite the
+/// shape had converged to a relative change of 8.5e-16 while the re-read
+/// residual, 1.5705809419e-10, sat 1.3e-18 above its band 1.5705809293e-10, and
+/// the fit was refused as not a fixed point (gam#1561).
+fn multiplier_refresh_certifies(
+    relative_residual: f64,
+    band: f64,
+    relative_change: f64,
+    resolution: f64,
+) -> bool {
+    relative_residual <= band
+        || (relative_change <= resolution && relative_residual <= band + resolution)
+}
+
 /// Rebuild the reported working state at the scale a converged-η refresh has
 /// just installed, and certify the reported coefficients against it.
 ///
@@ -1882,7 +1909,8 @@ pub(crate) fn fit_model_for_fixed_rho_configured<'a, X: Into<DesignMatrix> + Clo
             let band = converged_eta_refresh_band(&working_summary, &options);
             let reading =
                 certify_converged_eta_scale(&mut working_model, &working_summary, &options)?;
-            if reading.relative_residual <= band {
+            if multiplier_refresh_certifies(reading.relative_residual, band, relative_change, resolution)
+            {
                 // β̂ is stationary at the reported shape to the band this solve
                 // certified it at, and the state just read — weights, Hessian,
                 // deviance, and through them `Vb = H⁻¹` and the EDF — was built
@@ -1992,7 +2020,12 @@ pub(crate) fn fit_model_for_fixed_rho_configured<'a, X: Into<DesignMatrix> + Clo
                 let band = converged_eta_refresh_band(&working_summary, &options);
                 let reading =
                     certify_converged_eta_scale(&mut working_model, &working_summary, &options)?;
-                if reading.relative_residual <= band {
+                if multiplier_refresh_certifies(
+                    reading.relative_residual,
+                    band,
+                    relative_change,
+                    resolution,
+                ) {
                     install_certified_refresh(
                         &mut working_summary,
                         &options,
@@ -2076,7 +2109,8 @@ pub(crate) fn fit_model_for_fixed_rho_configured<'a, X: Into<DesignMatrix> + Clo
             let band = converged_eta_refresh_band(&working_summary, &options);
             let reading =
                 certify_converged_eta_scale(&mut working_model, &working_summary, &options)?;
-            if reading.relative_residual <= band {
+            if multiplier_refresh_certifies(reading.relative_residual, band, relative_change, resolution)
+            {
                 install_certified_refresh(
                     &mut working_summary,
                     &options,
@@ -2676,4 +2710,27 @@ pub(super) fn sparse_from_denseview(x: ArrayView2<f64>) -> Option<DesignMatrix> 
     SparseColMat::try_new_from_triplets(nrows, ncols, &triplets)
         .ok()
         .map(DesignMatrix::from)
+}
+
+#[cfg(test)]
+mod multiplier_refresh_tests {
+    use super::*;
+
+    /// gam#1561, the reference-quality suite's te(2-D) Gamma fit: the shape had converged to
+    /// a relative change of 8.5e-16, inside its estimator's resolution, and the re-read
+    /// residual sat 1.3e-18 above the band the solve certified. The pair is the certified one
+    /// read at a shape the estimator cannot tell from the carried one, so it certifies.
+    #[test]
+    fn a_converged_multiplier_refresh_certifies_within_its_resolution_1561() {
+        let residual = 1.570_580_941_916_221_2e-10;
+        let band = 1.570_580_929_316_702_3e-10;
+        let change = 8.504_026_224_082_876e-16;
+        let resolution = 3.330_669_073_875_581e-14;
+        assert!(residual > band, "the incident's residual is above the bare band");
+        assert!(multiplier_refresh_certifies(residual, band, change, resolution));
+        // A scale that still moves beyond its resolution does not buy that allowance.
+        assert!(!multiplier_refresh_certifies(residual, band, 10.0 * resolution, resolution));
+        // Nor does a converged scale excuse a residual beyond what its resolution induces.
+        assert!(!multiplier_refresh_certifies(band + 2.0 * resolution, band, change, resolution));
+    }
 }
