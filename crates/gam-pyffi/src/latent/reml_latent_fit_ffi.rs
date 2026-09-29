@@ -177,62 +177,21 @@ fn gaussian_reml_optimize_latent<'py>(
             "grad_tol must be finite and positive; got {grad_tol}"
         )));
     }
-    if let Some(reference) = stationarity_reference {
-        if !(reference.is_finite() && reference >= 0.0) {
-            return Err(py_value_error(format!(
-                "stationarity_reference must be finite and non-negative; got {reference}"
-            )));
-        }
-    }
-    let expected = n_obs
-        .checked_mul(latent_dim)
-        .ok_or_else(|| py_value_error("n_obs * latent_dim overflows usize".to_string()))?;
-    let t_values = t.as_array().to_owned();
-    if t_values.len() != expected {
-        return Err(py_value_error(format!(
-            "t length {} must equal n_obs * latent_dim = {expected}",
-            t_values.len()
-        )));
-    }
-    // Choose the start. A spectral seed escapes the random-init local optimum
-    // that leaves the outer optimizer stuck (#627); `"caller"` keeps the
-    // passed-in `t` unchanged for callers that already have a good warm start or
-    // want a pure local solve.
     let start = match init.as_str() {
-        "caller" => t_values.clone(),
-        "spectral" => latent_spectral_seed_start(
-            y.as_array(),
-            centers.as_array(),
-            &manifold,
-            n_obs,
-            latent_dim,
-            gam::geometry::SPECTRAL_SEED_NEIGHBORS,
-            t_values.view(),
-        )
-        .map_err(py_value_error)?,
+        "caller" => LatentStart::Caller,
+        "spectral" => LatentStart::Spectral,
         other => {
             return Err(py_value_error(format!(
                 "init must be 'spectral' or 'caller'; got {other:?}"
             )));
         }
     };
-    let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
-    let fisher_values = fisher_w.as_ref().map(|w| w.as_array().to_owned());
     let effective_weights = latent_scalar_weights_with_fisher(
         n_obs,
-        weight_values.as_ref().map(|w| w.view()),
-        fisher_values.as_ref().map(|w| w.view()),
+        weights.as_ref().map(|w| w.as_array()),
+        fisher_w.as_ref().map(|w| w.as_array()),
     )
     .map_err(py_value_error)?;
-    let tensor_knots_values = tensor_knots_concat
-        .as_ref()
-        .map(|a| a.as_array().to_owned());
-
-    // Derive the periodic chart descriptor ONCE from the manifold; it drives the
-    // periodic Duchon decoder both during optimization (`try_value_and_grad`) and
-    // for the final reported fit so the OPTIMIZED basis == the FINAL basis. Only
-    // the Duchon decoder consumes it; matern/sphere/tensor branches ignore it.
-    let latent_periodic = latent_manifold_periodic_descriptor(&manifold, latent_dim);
     let problem = LatentOuterProblem {
         y: y.as_array().to_owned(),
         centers: centers.as_array().to_owned(),
@@ -247,277 +206,94 @@ fn gaussian_reml_optimize_latent<'py>(
         latent_dim,
         m,
         basis_kind,
-        tensor_knots: tensor_knots_values,
+        tensor_knots: tensor_knots_concat.as_ref().map(|a| a.as_array().to_owned()),
         tensor_knot_offsets,
         tensor_degrees,
-        periodic: latent_periodic,
+        periodic: latent_manifold_periodic_descriptor(&manifold, latent_dim),
     };
-
-    let manifold_box =
-        build_latent_outer_manifold(&manifold, n_obs, latent_dim).map_err(py_value_error)?;
+    let caller_t = t.as_array().to_owned();
     let trust_region = gam::geometry::RiemannianTrustRegion {
         max_iter,
         grad_tol,
         ..gam::geometry::RiemannianTrustRegion::default()
     };
-
-    let (best_t, best_value, best_start_grad_norm) = py
-        .detach_on_pool(|| -> Result<(Array1<f64>, f64, f64), String> {
-            let manifold_ref: &dyn gam::geometry::RiemannianManifold = manifold_box.as_ref();
-            // Every manifold accepted by `build_latent_outer_manifold` carries the
-            // induced ambient metric. Its Riemannian gradient is therefore the
-            // tangent projection and its norm is the Euclidean norm in ambient
-            // coordinates. Record the scale at the start: the optimized latent is
-            // certified against the same reference its optimizer used.
-            let (_, start_gradient) = problem.value_and_grad(start.view(), true);
-            let start_gradient = start_gradient
-                .ok_or_else(|| "the start did not produce an initial latent gradient".to_string())?;
-            let start_projected = manifold_ref
-                .riemannian_gradient(start.view(), start_gradient.view())
-                .map_err(|err| err.to_string())?;
-            let start_grad_norm = start_projected
-                .iter()
-                .map(|value| value * value)
-                .sum::<f64>()
-                .sqrt();
-            // A zero iteration budget is an intentional checkpoint probe that
-            // evaluates the caller's start. Otherwise the trust region reports its
-            // terminal iterate whether or not its certificate holds, so an
-            // exhausted budget still hands back the point: this wrapper's own
-            // stationarity test below then refuses with typed, resumable evidence
-            // instead of the optimizer's untyped non-convergence error.
-            let optimized = if max_iter == 0 {
-                start
-            } else {
-                let mut objective = LatentOuterObjective { problem: &problem };
-                trust_region
-                    .minimize_reporting_termination(manifold_ref, &mut objective, start.view())
-                    .map_err(|err| err.to_string())?
-                    .point
-            };
-            let (value, _) = problem.value_and_grad(optimized.view(), false);
-            Ok((optimized, value, start_grad_norm))
-        })
-        .map_err(py_value_error)?;
-
-    // Final gradient norm at the chosen latent, as a convergence diagnostic.
-    // Report the PROJECTED (Riemannian) gradient — the quantity the trust region
-    // actually tests against `grad_tol` (`g_norm` in optimizer.rs) — not the raw
-    // ambient gradient. On the circle/torus the ambient gradient carries a
-    // normal component the optimizer never sees; reporting it inflated the norm
-    // and made `converged` disagree with the optimizer's own stopping test
-    // (issue #879). On a Euclidean manifold the tangent projection is the
-    // identity, so this leaves that path byte-identical.
-    let (_, final_grad) = problem.value_and_grad(best_t.view(), true);
-    let grad_t_norm = match final_grad.as_ref() {
-        Some(gradient) => {
-            let riemannian = manifold_box
-                .as_ref()
-                .riemannian_gradient(best_t.view(), gradient.view())
-                .map_err(|err| py_value_error(err.to_string()))?;
-            riemannian
-                .iter()
-                .map(|value| value * value)
-                .sum::<f64>()
-                .sqrt()
+    let outcome = py.detach_on_pool(|| {
+        optimize_gaussian_reml_latent(
+            problem,
+            caller_t,
+            &manifold,
+            start,
+            &trust_region,
+            stationarity_reference,
+        )
+    });
+    let optimum = match outcome {
+        Ok(optimum) => optimum,
+        Err(LatentOptimizeError::Invalid(message)) => return Err(py_value_error(message)),
+        Err(LatentOptimizeError::NotStationary {
+            stationarity,
+            latent_t_std,
+            objective_value,
+            checkpoint_t,
+        }) => {
+            let err = RemlConvergenceError::new_err(format!(
+                "gaussian_reml_optimize_latent did not reach latent stationarity: relative \
+                 gradient {:.6e} did not satisfy grad_tol {:.6e} after {} of a budget of \
+                 {max_iter} iteration(s) (projected gradient {:.6e}, seed gradient {:.6e}, \
+                 objective {objective_value:.9e}, latent spread {latent_t_std:.6e}). No fit is \
+                 minted from a non-converged optimization; resume from the exception's \
+                 `checkpoint_t` and `checkpoint_stationarity_reference` attributes with \
+                 `init=\"caller\"`, or loosen grad_tol if this stationarity precision is not \
+                 required.",
+                stationarity.grad_t_norm_scaled,
+                stationarity.grad_tol,
+                stationarity.iterations,
+                stationarity.grad_t_norm,
+                stationarity.reference,
+            ));
+            // The typed class and message are the contract; the attributes are the
+            // structured evidence and checkpoint (same best-effort pattern as
+            // `ColumnNotFoundError`).
+            let bound = err.value(py);
+            let attach_result: PyResult<()> = (|| {
+                bound.setattr("grad_t_norm", stationarity.grad_t_norm)?;
+                bound.setattr("grad_t_norm_init", stationarity.reference)?;
+                bound.setattr("grad_t_norm_scaled", stationarity.grad_t_norm_scaled)?;
+                bound.setattr("grad_tol", stationarity.grad_tol)?;
+                bound.setattr("latent_t_std", latent_t_std)?;
+                bound.setattr("objective_value", objective_value)?;
+                bound.setattr("max_iter", max_iter)?;
+                bound.setattr("init", init.as_str())?;
+                bound.setattr("checkpoint_t", checkpoint_t.into_pyarray(py))?;
+                bound.setattr("checkpoint_shape", (n_obs, latent_dim))?;
+                bound.setattr("checkpoint_stationarity_reference", stationarity.reference)?;
+                Ok(())
+            })();
+            if let Err(attach_err) = attach_result {
+                attach_err.write_unraisable(py, Some(&bound));
+            }
+            return Err(err);
         }
-        None => f64::INFINITY,
-    };
-    // The start carries its own initial-gradient scale. A resumed
-    // solve may supply the original scale explicitly so the convergence test
-    // remains the same test across process/wall boundaries instead of silently
-    // renormalizing at the checkpoint.
-    let grad0_norm = stationarity_reference.unwrap_or(best_start_grad_norm);
-    // Latent spread: a genuine collapse (all rows retract to one latent
-    // coordinate, the issue #876 failure mode) leaves `latent_t_std ≈ 0`, which
-    // distinguishes it from a healthy fit whose latent gradient merely failed to
-    // reach `grad_tol`.
-    let latent_t_std = {
-        let n = best_t.len();
-        if n == 0 {
-            0.0
-        } else {
-            let mean = best_t.iter().sum::<f64>() / n as f64;
-            (best_t.iter().map(|&v| (v - mean) * (v - mean)).sum::<f64>() / n as f64).sqrt()
-        }
-    };
-
-    // Relative-gradient stationarity measure for the profiled-scale latent
-    // objective (issue #879). The latent objective is the *profiled* Gaussian
-    // REML score `n·log σ̂²(t) + ½·log|Hλ| + …`. Near interpolation the profiled
-    // scale `σ̂²` collapses toward zero, which steepens that `n·log σ̂²` term and
-    // leaves the raw latent gradient `‖∇ₜ f‖` at an O(n) magnitude *even at a
-    // genuine stationary point* (R²≈1). So the bare absolute test
-    // `‖∇ₜ f‖ ≤ grad_tol` is mis-calibrated: it flags an excellent,
-    // near-stationary fit as non-converged.
-    //
-    // We use the SAME shift-invariant relative-gradient test the optimizer's own
-    // stopping rule uses (`relative_stationarity` in optimizer.rs, issue #954):
-    //
-    //   rel = ‖∇ₜ f(t̂)‖_g / max(‖∇ₜ f(t₀)‖_g, 1)
-    //
-    // where `t₀` is the initial iterate. The denominator carries the SAME
-    // multiplicative scale `f` and `∇f` share (`f → c·f ⇒ ∇f → c·∇f`), so a
-    // fixed `grad_tol` still reads as a *relative* tolerance — and, crucially,
-    // because the profiled objective's gradient is O(n) at the seed too, the
-    // O(n) magnitude divides out (#879). The `max(·, 1)` floor reduces this to
-    // the absolute test `‖∇ₜ f‖ ≤ grad_tol` on a unit-scale objective.
-    //
-    // This REPLACES the earlier `‖∇ₜ f‖ · ‖t‖_typ / max(|f|, 1)`, which was
-    // *not* shift-invariant: minimization is invariant under `f → f + C`
-    // (minimizer, gradient, Hessian, model reduction all unchanged), yet the old
-    // `max(|f|, 1)` denominator grows with an additive constant `C` and could
-    // falsely certify a non-stationary latent as converged (issue #954). The
-    // `‖t‖_typ` factor was also non-intrinsic — the ambient latent magnitude is
-    // not chart/translation invariant on a manifold (the circle/torus charts
-    // wrap to `[-π, π)`), so it does not belong in a Riemannian stationarity
-    // test. Anchoring to `‖∇ₜ f(t₀)‖` is both shift-invariant (the gradient does
-    // not depend on `C`) and scale-invariant.
-    let grad_t_norm_scaled = latent_relative_stationarity(grad_t_norm, grad0_norm);
-    if !(grad_t_norm_scaled.is_finite() && grad_t_norm_scaled <= grad_tol) {
-        // SPEC 20 — a fit object must only ever come from a converged
-        // optimization. The chosen latent failed the shift-invariant relative
-        // stationarity test, so no fit is rebuilt or returned: the caller gets
-        // a typed `RemlConvergenceError` carrying the available numerical
-        // evidence plus the best latent as a one-dimensional resume checkpoint,
-        // exactly matching the public API's `t` input.
-        let err = RemlConvergenceError::new_err(format!(
-            "gaussian_reml_optimize_latent did not reach latent stationarity: relative \
-             gradient {grad_t_norm_scaled:.6e} did not satisfy grad_tol {grad_tol:.6e} with a \
-             budget of {max_iter} iteration(s) (projected gradient {grad_t_norm:.6e}, \
-             seed gradient {grad0_norm:.6e}, objective {best_value:.9e}, latent spread \
-             {latent_t_std:.6e}). No fit is minted from a non-converged optimization; \
-             resume from the exception's `checkpoint_t` and \
-             `checkpoint_stationarity_reference` attributes with `init=\"caller\"`, or loosen \
-             grad_tol if this stationarity precision is not required."
-        ));
-        // Attach the structured evidence + checkpoint as instance attributes
-        // (same best-effort pattern as `ColumnNotFoundError` in ffi_errors.rs):
-        // the typed class + message remain the primary contract if a setattr
-        // ever fails.
-        let bound = err.value(py);
-        let attach_result: PyResult<()> = (|| {
-            bound.setattr("grad_t_norm", grad_t_norm)?;
-            bound.setattr("grad_t_norm_init", grad0_norm)?;
-            bound.setattr("grad_t_norm_scaled", grad_t_norm_scaled)?;
-            bound.setattr("grad_tol", grad_tol)?;
-            bound.setattr("latent_t_std", latent_t_std)?;
-            bound.setattr("objective_value", best_value)?;
-            bound.setattr("max_iter", max_iter)?;
-            bound.setattr("init", init.as_str())?;
-            bound.setattr("checkpoint_t", best_t.into_pyarray(py))?;
-            bound.setattr("checkpoint_shape", (n_obs, latent_dim))?;
-            bound.setattr("checkpoint_stationarity_reference", grad0_norm)?;
-            Ok(())
-        })();
-        if let Err(attach_err) = attach_result {
-            attach_err.write_unraisable(py, Some(&bound));
-        }
-        return Err(err);
-    }
-
-    // Rebuild the full fit dictionary at the converged latent so callers get the
-    // identical schema [`gaussian_reml_fit_latent`] returns, then echo `t`. The
-    // detached fit closure must be `'static`, so move owned copies in (the
-    // problem's array buffers are no longer needed on this thread afterwards).
-    let latent_payload = serde_json::json!({"t": {"name": "t", "n": n_obs, "d": latent_dim}});
-    let LatentOuterProblem {
-        y,
-        centers,
-        penalty,
-        weights,
-        aux_u,
-        dim_selection,
-        basis_kind,
-        tensor_knots,
-        tensor_knot_offsets,
-        tensor_degrees,
-        periodic: latent_periodic_final,
-        ..
-    } = problem;
-    let best_t_for_fit = best_t.clone();
-    // Retain the response for the #879 reconstruction-quality diagnostic; `y` is
-    // moved into the `move` fit closure below.
-    let y_for_diag = y.clone();
-    let (fit, _design, aux_strength_state) =
-        detach_py_result(py, "gaussian_reml_optimize_latent", move || {
-            let registry = build_analytic_penalty_registry_from_json(Some(&latent_payload), None)?;
-            gaussian_reml_fit_latent_impl(
-                best_t_for_fit.view(),
-                y.view(),
-                n_obs,
-                latent_dim,
-                centers.view(),
-                m,
-                &basis_kind,
-                tensor_knots.as_ref().map(|a| a.view()),
-                tensor_knot_offsets.as_deref(),
-                tensor_degrees.as_deref(),
-                penalty.view(),
-                weights.as_ref().map(|w| w.view()),
-                init_lambda,
-                aux_u.as_ref().map(|a| a.view()),
-                family,
-                aux_strength,
-                dim_selection.as_ref(),
-                Some(&registry),
-                // Final reported fit MUST use the SAME manifold-derived periodic
-                // Duchon decoder the optimizer used (so OPTIMIZED basis == FINAL
-                // basis); `None` for Euclidean / sphere keeps those byte-identical.
-                latent_periodic_final.as_deref(),
-            )
-        })?;
-
-    // Reconstruction quality of the decoder against the response, reported next
-    // to `converged` so model selection can distinguish a good decoder fit whose
-    // latent gradient simply did not reach `grad_tol` (near-interpolation the
-    // profiled scale stiffens the latent objective, so ‖∇ₜ‖ stays O(n) even at
-    // R²≈1 — issue #879) from a genuinely failed/collapsed fit. Computed over all
-    // (row, output) entries of the response and the fitted decoder image.
-    let (residual_ss, total_ss) = {
-        let fitted = &fit.fitted;
-        let mean = if y_for_diag.is_empty() {
-            0.0
-        } else {
-            y_for_diag.iter().sum::<f64>() / y_for_diag.len() as f64
-        };
-        let mut rss = 0.0;
-        let mut tss = 0.0;
-        for (&yi, &fi) in y_for_diag.iter().zip(fitted.iter()) {
-            rss += (yi - fi) * (yi - fi);
-            tss += (yi - mean) * (yi - mean);
-        }
-        (rss, tss)
-    };
-    let response_residual_norm = residual_ss.sqrt();
-    // R² = 1 − RSS/TSS; a degenerate (constant) response has TSS = 0, in which
-    // case a zero residual is a perfect fit (1.0) and any residual is reported as
-    // 0.0 rather than a spurious −∞.
-    let response_r2 = if total_ss > 0.0 {
-        1.0 - residual_ss / total_ss
-    } else if residual_ss == 0.0 {
-        1.0
-    } else {
-        0.0
     };
 
     let out = PyDict::new(py);
-    set_ok_gaussian_reml_items(py, &out, fit)?;
-    set_aux_strength_items(py, &out, aux_strength_state)?;
-    let t_matrix = best_t
+    set_ok_gaussian_reml_items(py, &out, optimum.fit)?;
+    set_aux_strength_items(py, &out, optimum.aux_strength_state)?;
+    let t_matrix = optimum
+        .t
         .clone()
         .into_shape_with_order((n_obs, latent_dim))
         .map_err(shape_error_to_pyerr)?;
     out.set_item("t", t_matrix.clone().into_pyarray(py))?;
     out.set_item("latent", t_matrix.into_pyarray(py))?;
-    out.set_item("t_flat", best_t.into_pyarray(py))?;
-    out.set_item("grad_t_norm", grad_t_norm)?;
-    out.set_item("grad_t_norm_init", grad0_norm)?;
-    out.set_item("grad_t_norm_scaled", grad_t_norm_scaled)?;
-    out.set_item("latent_t_std", latent_t_std)?;
-    out.set_item("response_r2", response_r2)?;
-    out.set_item("response_residual_norm", response_residual_norm)?;
-    out.set_item("objective_value", best_value)?;
+    out.set_item("t_flat", optimum.t.into_pyarray(py))?;
+    out.set_item("grad_t_norm", optimum.stationarity.grad_t_norm)?;
+    out.set_item("grad_t_norm_init", optimum.stationarity.reference)?;
+    out.set_item("grad_t_norm_scaled", optimum.stationarity.grad_t_norm_scaled)?;
+    out.set_item("latent_t_std", optimum.latent_t_std)?;
+    out.set_item("response_r2", optimum.response_r2)?;
+    out.set_item("response_residual_norm", optimum.response_residual_norm)?;
+    out.set_item("objective_value", optimum.objective_value)?;
     out.set_item("init", init)?;
     Ok(out.unbind())
 }

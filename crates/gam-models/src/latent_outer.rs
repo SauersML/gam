@@ -614,6 +614,211 @@ pub fn gaussian_reml_fit_latent_impl(
     Ok((fit, design, aux_strength_state))
 }
 
+/// Where [`optimize_gaussian_reml_latent`] starts the latent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LatentStart {
+    /// The spectral seed of the responses ([`latent_spectral_seed_start`]).
+    Spectral,
+    /// The caller's `t`, unchanged: a warm start or a resumed solve.
+    Caller,
+}
+
+/// The latent outer solve's first-order certificate, as the trust region decided
+/// it: `grad_t_norm_scaled = ‖grad f(t̂)‖_g / max(reference, 1)` against `grad_tol`
+/// (`opt::relative_stationarity`, #954). `reference` is the start's gradient norm,
+/// or the one a resumed solve carries.
+#[derive(Clone, Copy, Debug)]
+pub struct LatentStationarity {
+    pub grad_t_norm: f64,
+    pub reference: f64,
+    pub grad_t_norm_scaled: f64,
+    pub grad_tol: f64,
+    pub iterations: usize,
+}
+
+/// A certified latent optimum and the Gaussian REML fit at it.
+pub struct LatentOptimum {
+    pub fit: gam_solve::gaussian_reml::GaussianRemlMultiResult,
+    pub aux_strength_state: Option<LatentAuxStrengthState>,
+    /// The optimized latent, flattened row-major `(n_obs, latent_dim)`.
+    pub t: Array1<f64>,
+    pub stationarity: LatentStationarity,
+    /// Standard deviation of the latent entries: near zero only when every row
+    /// retracted to one coordinate (#876).
+    pub latent_t_std: f64,
+    /// `1 − RSS/TSS` of the decoder image against the responses (#879).
+    pub response_r2: f64,
+    pub response_residual_norm: f64,
+    pub objective_value: f64,
+}
+
+pub enum LatentOptimizeError {
+    Invalid(String),
+    /// The terminal latent failed the certificate. No fit is built from it (SPEC
+    /// 20); `checkpoint_t` and `stationarity.reference` resume the same solve.
+    NotStationary {
+        stationarity: LatentStationarity,
+        latent_t_std: f64,
+        objective_value: f64,
+        checkpoint_t: Array1<f64>,
+    },
+}
+
+impl From<String> for LatentOptimizeError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
+fn latent_spread(t: &Array1<f64>) -> f64 {
+    let n = t.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let mean = t.iter().sum::<f64>() / n as f64;
+    (t.iter().map(|&v| (v - mean) * (v - mean)).sum::<f64>() / n as f64).sqrt()
+}
+
+/// Walk the latent `t` on `manifold` to a certified minimum of the latent
+/// Gaussian REML score, then fit the decoder there.
+///
+/// The walk is `opt`'s Riemannian trust region (through `gam_geometry`), and its
+/// termination carries the certificate: the relative projected-gradient norm at
+/// the terminal point against `grad_tol`, scaled by the start's gradient or by the
+/// `stationarity_reference` a resumed solve passes, so a solve split across calls
+/// is judged by one test. A terminal point the certificate refuses is returned as
+/// [`LatentOptimizeError::NotStationary`] with the point as a checkpoint.
+pub fn optimize_gaussian_reml_latent(
+    problem: LatentOuterProblem,
+    caller_t: Array1<f64>,
+    manifold: &str,
+    start: LatentStart,
+    trust_region: &gam_geometry::RiemannianTrustRegion,
+    stationarity_reference: Option<f64>,
+) -> Result<LatentOptimum, LatentOptimizeError> {
+    let (n_obs, latent_dim) = (problem.n_obs, problem.latent_dim);
+    let expected = n_obs
+        .checked_mul(latent_dim)
+        .ok_or_else(|| "n_obs * latent_dim overflows usize".to_string())?;
+    if caller_t.len() != expected {
+        return Err(LatentOptimizeError::Invalid(format!(
+            "t length {} must equal n_obs * latent_dim = {expected}",
+            caller_t.len()
+        )));
+    }
+    let start_t = match start {
+        LatentStart::Caller => caller_t,
+        LatentStart::Spectral => latent_spectral_seed_start(
+            problem.y.view(),
+            problem.centers.view(),
+            manifold,
+            n_obs,
+            latent_dim,
+            gam_geometry::SPECTRAL_SEED_NEIGHBORS,
+            caller_t.view(),
+        )?,
+    };
+    let manifold_box = build_latent_outer_manifold(manifold, n_obs, latent_dim)?;
+    let mut objective = LatentOuterObjective { problem: &problem };
+    let fresh = gam_geometry::TrustRegionTermination {
+        point: start_t,
+        iterations: 0,
+        residual: f64::INFINITY,
+        tolerance: trust_region.grad_tol,
+        radius: trust_region.radius,
+        stationarity_reference: 0.0,
+        model_error: None,
+        resolution_limited: false,
+    };
+    let termination = match stationarity_reference {
+        None => trust_region.minimize_reporting_termination(
+            manifold_box.as_ref(),
+            &mut objective,
+            fresh.point.view(),
+        ),
+        Some(reference) => trust_region.resume(
+            manifold_box.as_ref(),
+            &mut objective,
+            &gam_geometry::TrustRegionTermination {
+                stationarity_reference: reference,
+                ..fresh
+            },
+        ),
+    }
+    .map_err(|err| err.to_string())?;
+    let stationarity = LatentStationarity {
+        grad_t_norm: termination.residual * termination.stationarity_reference.max(1.0),
+        reference: termination.stationarity_reference,
+        grad_t_norm_scaled: termination.residual,
+        grad_tol: termination.tolerance,
+        iterations: termination.iterations,
+    };
+    let t = termination.point;
+    let (objective_value, _) = problem.value_and_grad(t.view(), false);
+    let latent_t_std = latent_spread(&t);
+    if !(stationarity.grad_t_norm_scaled.is_finite()
+        && stationarity.grad_t_norm_scaled <= stationarity.grad_tol)
+    {
+        return Err(LatentOptimizeError::NotStationary {
+            stationarity,
+            latent_t_std,
+            objective_value,
+            checkpoint_t: t,
+        });
+    }
+    let (fit, _design, aux_strength_state) = gaussian_reml_fit_latent_impl(
+        t.view(),
+        problem.y.view(),
+        n_obs,
+        latent_dim,
+        problem.centers.view(),
+        problem.m,
+        &problem.basis_kind,
+        problem.tensor_knots.as_ref().map(|a| a.view()),
+        problem.tensor_knot_offsets.as_deref(),
+        problem.tensor_degrees.as_deref(),
+        problem.penalty.view(),
+        problem.weights.as_ref().map(|w| w.view()),
+        problem.init_lambda,
+        problem.aux_u.as_ref().map(|a| a.view()),
+        problem.family,
+        problem.aux_strength,
+        problem.dim_selection.as_ref(),
+        None,
+        problem.periodic.as_deref(),
+    )?;
+    let y = &problem.y;
+    let mean = if y.is_empty() {
+        0.0
+    } else {
+        y.iter().sum::<f64>() / y.len() as f64
+    };
+    let (mut residual_ss, mut total_ss) = (0.0, 0.0);
+    for (&yi, &fi) in y.iter().zip(fit.fitted.iter()) {
+        residual_ss += (yi - fi) * (yi - fi);
+        total_ss += (yi - mean) * (yi - mean);
+    }
+    // A constant response has TSS = 0: a zero residual is a perfect fit, any other
+    // residual reads 0 rather than −∞.
+    let response_r2 = if total_ss > 0.0 {
+        1.0 - residual_ss / total_ss
+    } else if residual_ss == 0.0 {
+        1.0
+    } else {
+        0.0
+    };
+    Ok(LatentOptimum {
+        fit,
+        aux_strength_state,
+        t,
+        stationarity,
+        latent_t_std,
+        response_r2,
+        response_residual_norm: residual_ss.sqrt(),
+        objective_value,
+    })
+}
+
 #[cfg(test)]
 mod latent_reml_tests {
     use super::*;
@@ -651,6 +856,163 @@ mod latent_reml_tests {
             periodic: None,
         };
         (t, problem)
+    }
+
+    fn circle_problem(n_obs: usize) -> (Vec<f64>, LatentOuterProblem) {
+        use std::f64::consts::{PI, TAU};
+        let true_theta: Vec<f64> = (0..n_obs)
+            .map(|i| -PI + (i as f64 + 0.5) / n_obs as f64 * TAU)
+            .collect();
+        // The leading two columns trace the unit circle; the rest are a small
+        // deterministic pad.
+        let y = Array2::from_shape_fn((n_obs, 5), |(row, col)| {
+            let th = true_theta[row];
+            match col {
+                0 => th.cos(),
+                1 => th.sin(),
+                _ => 0.01 * ((row as f64 + 1.3) * (col as f64 + 0.7)).sin(),
+            }
+        });
+        // Periodic Duchon centers on the half-open circle: including both -π and +π
+        // would name one S¹ point twice.
+        let n_centers = 12usize;
+        let centers = Array2::from_shape_fn((n_centers, 1), |(i, _)| {
+            -PI + i as f64 / n_centers as f64 * TAU
+        });
+        let problem = LatentOuterProblem {
+            y,
+            centers,
+            penalty: Array2::eye(n_centers),
+            weights: None,
+            aux_u: None,
+            dim_selection: None,
+            family: AuxPriorFamily::Ridge,
+            aux_strength: None,
+            init_lambda: None,
+            n_obs,
+            latent_dim: 1,
+            m: 2,
+            basis_kind: "duchon".to_string(),
+            tensor_knots: None,
+            tensor_knot_offsets: None,
+            tensor_degrees: None,
+            periodic: latent_manifold_periodic_descriptor("circle", 1),
+        };
+        (true_theta, problem)
+    }
+
+    fn trust_region(max_iter: usize) -> gam_geometry::RiemannianTrustRegion {
+        gam_geometry::RiemannianTrustRegion {
+            max_iter,
+            grad_tol: 1.0e-8,
+            ..gam_geometry::RiemannianTrustRegion::default()
+        }
+    }
+
+    /// #876 through the driver itself: from the collapsed all-zero start the
+    /// periodic spectral seed spreads the rows and the trust region polishes them
+    /// into a latent that tracks the generating angle up to the circle's
+    /// rotation/reflection gauge, certified, with the decoder fit at that latent.
+    #[test]
+    fn circle_latent_optimize_recovers_the_circle_876() {
+        let n_obs = 40;
+        let (true_theta, problem) = circle_problem(n_obs);
+        let Ok(optimum) = optimize_gaussian_reml_latent(
+            problem,
+            Array1::zeros(n_obs),
+            "circle",
+            LatentStart::Spectral,
+            &trust_region(200),
+            None,
+        ) else {
+            panic!("the circle latent optimize must certify");
+        };
+        assert!(optimum.stationarity.grad_t_norm_scaled <= optimum.stationarity.grad_tol);
+        assert!(
+            optimum.latent_t_std > 0.3,
+            "circle latent collapsed (std={})",
+            optimum.latent_t_std
+        );
+        let resultant = |sign: f64| {
+            let (mut c, mut s) = (0.0f64, 0.0f64);
+            for (row, theta) in true_theta.iter().enumerate() {
+                let diff = sign * optimum.t[row] - theta;
+                c += diff.cos();
+                s += diff.sin();
+            }
+            (c * c + s * s).sqrt() / n_obs as f64
+        };
+        let best = resultant(1.0).max(resultant(-1.0));
+        assert!(best > 0.85, "recovered latent does not track the angle (resultant {best})");
+        assert!(optimum.response_r2 > 0.9, "decoder R² {}", optimum.response_r2);
+        assert_eq!(optimum.fit.fitted.dim(), (n_obs, 5));
+    }
+
+    /// A solve cut short refuses with its terminal point, and resuming from that
+    /// checkpoint with the reported reference certifies against the SAME scale:
+    /// the resumed certificate's reference is the first leg's, bit for bit (#954).
+    #[test]
+    fn a_cut_short_latent_solve_resumes_on_its_own_certificate_scale_2899() {
+        let n_obs = 40;
+        let first = optimize_gaussian_reml_latent(
+            circle_problem(n_obs).1,
+            Array1::zeros(n_obs),
+            "circle",
+            LatentStart::Spectral,
+            &trust_region(1),
+            None,
+        );
+        let Err(LatentOptimizeError::NotStationary {
+            stationarity,
+            checkpoint_t,
+            ..
+        }) = first
+        else {
+            panic!("one iteration from the seed must not certify the circle latent");
+        };
+        assert!(stationarity.grad_t_norm_scaled > stationarity.grad_tol);
+        assert_eq!(stationarity.iterations, 1);
+        let Ok(resumed) = optimize_gaussian_reml_latent(
+            circle_problem(n_obs).1,
+            checkpoint_t,
+            "circle",
+            LatentStart::Caller,
+            &trust_region(200),
+            Some(stationarity.reference),
+        ) else {
+            panic!("the resumed circle latent optimize must certify");
+        };
+        assert_eq!(
+            resumed.stationarity.reference.to_bits(),
+            stationarity.reference.to_bits()
+        );
+        assert!(resumed.stationarity.grad_t_norm_scaled <= resumed.stationarity.grad_tol);
+    }
+
+    /// A zero budget is the checkpoint probe: it evaluates the caller's start and
+    /// reports its certificate without moving it.
+    #[test]
+    fn a_zero_budget_latent_solve_reports_the_caller_start_2899() {
+        let n_obs = 40;
+        let start = Array1::from_shape_fn(n_obs, |i| -3.0 + 6.0 * i as f64 / n_obs as f64);
+        let outcome = optimize_gaussian_reml_latent(
+            circle_problem(n_obs).1,
+            start.clone(),
+            "circle",
+            LatentStart::Caller,
+            &trust_region(0),
+            None,
+        );
+        let Err(LatentOptimizeError::NotStationary {
+            stationarity,
+            checkpoint_t,
+            ..
+        }) = outcome
+        else {
+            panic!("a zero budget at a non-stationary start must refuse with its checkpoint");
+        };
+        assert_eq!(stationarity.iterations, 0);
+        assert_eq!(checkpoint_t, start);
     }
 
     #[test]

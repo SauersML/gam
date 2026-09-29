@@ -2404,57 +2404,6 @@ fn gaussian_reml_fit_latent_backward_impl(
     })
 }
 
-/// Optimize the latent coordinate `t` against the Gaussian-REML objective.
-///
-/// Unlike [`gaussian_reml_fit_latent`], which performs a single `β | t` inner
-/// solve at a fixed `t`, this routine runs the *outer* latent optimization: it
-/// minimizes the REML score over `t` with a Riemannian trust region driven by
-/// the analytic `∂(reml_score)/∂t` (the same gradient
-/// [`gaussian_reml_fit_latent_backward`] returns), retracting each accepted
-/// step onto `manifold`. It returns the full REML fit dictionary *at the
-/// converged latent* plus the optimized `t`/`latent` arrays.
-///
-/// The latent REML objective is non-convex (a GP-LVM-style coordinate problem),
-/// so a single cold random start may settle in a poor local optimum. By default
-/// (`init="spectral"`) restart 0 starts from a Laplacian-eigenmaps embedding of
-/// the responses, which recovers the intrinsic coordinate up to gauge and lets
-/// the optimizer polish it to the global fit instead of sorting rows from
-/// scratch; the passed-in `t` is then only a fallback (too few rows, or a
-/// non-Euclidean `manifold`). Pass `init="caller"` to start from `t` unchanged
-/// (a pure local solve / explicit warm start), and `n_restarts > 1` to also
-/// optimize from perturbed starts and keep the lowest-score result.
-///
-/// Shift-invariant relative-gradient stationarity measure for the latent outer
-/// solve: `‖∇ₜ f(t̂)‖_g / max(‖∇ₜ f(t₀)‖_g, 1)`, comparing the projected
-/// Riemannian gradient norm at the chosen latent to the gradient norm at the
-/// INITIAL iterate `t₀`. This is the FFI analogue of `relative_stationarity` in
-/// `src/geometry/optimizer.rs` (issue #954), kept byte-for-byte identical to it
-/// so the diagnostic `converged` flag agrees with the optimizer's own stopping
-/// rule:
-///
-/// * **Shift-invariant** — the objective value `f` does not enter at all, so an
-///   additive shift `f → f + C` (which leaves the minimizer, gradient, Hessian,
-///   and model reduction unchanged) cannot move the measure. The earlier
-///   `‖∇ₜ f‖·‖t‖_typ / max(|f|, 1)` divided by the objective magnitude, so a
-///   large `C` inflated the denominator and could falsely certify a
-///   non-stationary latent as converged (#954).
-/// * **Scale-invariant** — under `f → c·f` both `‖∇ₜ f(t̂)‖` and `‖∇ₜ f(t₀)‖`
-///   scale by `c`, so the ratio is unchanged and a fixed `grad_tol` reads as a
-///   true *relative* tolerance.
-/// * **#879 O(n) calibration** — the profiled REML objective leaves `‖∇ₜ f‖` at
-///   an O(n) magnitude even at a genuine stationary point near interpolation;
-///   anchoring to `‖∇ₜ f(t₀)‖` (itself O(n)) divides that magnitude out, while
-///   the `max(·, 1)` floor reduces the test to the bare absolute
-///   `‖∇ₜ f‖ ≤ grad_tol` on a unit-scale objective.
-/// * **Non-finite** — a blown-up iterate (`‖∇ₜ f‖` or `‖∇ₜ f(t₀)‖` not finite)
-///   maps to `+∞`, so it is never reported stationary.
-fn latent_relative_stationarity(grad_norm: f64, grad0_norm: f64) -> f64 {
-    if !grad_norm.is_finite() || !grad0_norm.is_finite() {
-        return f64::INFINITY;
-    }
-    grad_norm / grad0_norm.max(1.0)
-}
-
 #[cfg(test)]
 mod public_block_orthogonality_tests {
     use super::append_public_block_orthogonality_penalty;

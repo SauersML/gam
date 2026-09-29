@@ -133,7 +133,7 @@ pub(crate) use gam::terms::decoders::interchange_decoder::{
 pub(crate) use gam::terms::latent::{AuxPriorFamily, aux_prior_targets};
 pub(crate) use gam::terms::basis::latent_design::{latent_basis_kind, latent_input_location_jet, periodic_bspline_basis_dense_via_spec, build_latent_duchon_design, build_latent_forward_design};
 pub(crate) use gam::terms::latent::{LatentAuxStrengthState, latent_aux_prior_stats, ValidatedDimSelectionPrecisions, latent_prior_score_and_aux_state_for_t, latent_analytic_penalty_value};
-pub(crate) use gam::families::latent_outer::{LatentOuterProblem, LatentOuterObjective, latent_manifold_periodic_descriptor, build_latent_outer_manifold, latent_spectral_seed_start, gaussian_reml_weight_vector_local, latent_scalar_weights_with_fisher, latent_row_weights, validate_dense_fisher_w, gaussian_reml_fit_latent_impl};
+pub(crate) use gam::families::latent_outer::{LatentOptimizeError, LatentStart, optimize_gaussian_reml_latent, LatentOuterProblem, latent_manifold_periodic_descriptor, gaussian_reml_weight_vector_local, latent_scalar_weights_with_fisher, latent_row_weights, validate_dense_fisher_w, gaussian_reml_fit_latent_impl};
 
 pub(crate) use gam::terms::dictionary::{
     LinearDictionaryAssignment, LinearDictionaryConfig, LinearDictionaryError,
