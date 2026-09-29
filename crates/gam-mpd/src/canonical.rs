@@ -349,6 +349,17 @@ impl LayerRmsNorm {
     /// ([`head_rms_norm_with_radius`]), plus the gain defect. The represented gain is
     /// `ŵ (1 + θ)` with `|θ| ≤ ρ`, so its output is `(1 + θ)` times the stored gain's, and the
     /// defect adds `ρ (|ŷ| + r)`.
+    /// The norm over whole rows given within their radius: [`Self::apply`] with one head
+    /// the width of a row. Returns the normalized rows and their radius.
+    pub(super) fn apply_rows(&self, rows: ProjectedRows<'_>) -> Result<(Array2<f64>, Array2<f64>), CanonicalRefusal> {
+        let banded = Banded {
+            values: rows.values.to_owned(),
+            radius: rows.radius.to_owned(),
+        };
+        let normed = self.apply(&banded, rows.values.ncols())?;
+        Ok((normed.values, normed.radius))
+    }
+
     fn apply(&self, rows: &Banded, head_dim: usize) -> Result<Banded, CanonicalRefusal> {
         let (values, mut radius) = head_rms_norm_with_radius(
             ProjectedRows {
@@ -698,6 +709,20 @@ impl DecoderLayer {
             },
         })
     }
+}
+
+/// [`swiglu_band`] of gate and up rows given as values and radius: the SwiGLU hidden rows
+/// and their radius.
+pub(super) fn swiglu_rows(
+    gate: ProjectedRows<'_>,
+    up_rows: ProjectedRows<'_>,
+) -> Result<(Array2<f64>, Array2<f64>), CanonicalRefusal> {
+    let banded = |rows: ProjectedRows<'_>| Banded {
+        values: rows.values.to_owned(),
+        radius: rows.radius.to_owned(),
+    };
+    let hidden = swiglu_band(&banded(gate), &banded(up_rows))?;
+    Ok((hidden.values, hidden.radius))
 }
 
 /// The SwiGLU hidden rows `s(g) ⊙ u` of gate and up rows given within their radii, and the

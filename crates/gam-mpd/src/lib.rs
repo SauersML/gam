@@ -208,6 +208,9 @@ pub mod seed;
 // Plane-rotation recovery with derived eigengaps.
 pub mod spectral;
 
+// The sign-gated split of a SwiGLU block, its certified correction bounds and ReLU replacement contract.
+pub mod sign_gated;
+
 // Sufficient-state quotient and realization contracts, and the exact linear quotient.
 pub mod state;
 

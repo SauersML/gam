@@ -58,6 +58,7 @@ mod layer;
 mod module_split;
 mod observability;
 mod secant;
+mod sign_gated;
 mod state_quotient;
 mod verify;
 
@@ -103,6 +104,9 @@ pub use layer::{
     RotaryPairingRequest, RotaryRequest,
 };
 pub use secant::{SecantActivationWire, SecantOperator, SecantReport, SecantRequest};
+pub use sign_gated::{
+    PerRowReport, ReadoutReport, ReadoutRequest, RowsReport, SignGatedSwigluReport, SignGatedSwigluRequest,
+};
 
 pub use cyclic::{
     CyclicBasis, CyclicPlanesReport, CyclicPlanesRequest, FrequencyEditReport, FrequencyEditRequest,
@@ -231,6 +235,9 @@ pub enum MpdOperation {
     /// The native edit compiler: control settings to native parameter edits, or
     /// infeasibility witnesses (`compile`).
     Compile(Box<CompileRequest>),
+    /// The executed sign-gated split `F = P + R` of a residual SwiGLU block, its correction
+    /// bounds and SiLU → ReLU replacement contract (`sign_gated`).
+    SignGatedSwiglu(Box<SignGatedSwigluRequest>),
 }
 
 /// [`ExternalExecution`] on the wire.
@@ -297,6 +304,7 @@ pub enum MpdResult {
     WeightedObservability(WeightedObservabilityReport),
     ModuleSplit(Box<ModuleSplitReport>),
     Compile(Box<CompileReport>),
+    SignGatedSwiglu(Box<SignGatedSwigluReport>),
 }
 
 /// [`PlaneRotationRecovery`] on the wire.
@@ -473,6 +481,8 @@ pub enum MpdSurfaceError {
     Joint(JointRefusal),
     /// The module-split owner refused the block, a subset or a vector.
     ModuleSplit(String),
+    /// The sign-gated split owner refused the block, the rows or the readout.
+    SignGated(String),
     /// The verification owner refused the family, the tolerance or a row.
     Verify(String),
     /// A dense copy the surface forms does not fit the memory budget.
@@ -515,6 +525,7 @@ impl fmt::Display for MpdSurfaceError {
             Self::Joint(refusal) => write!(formatter, "joint operators refused: {refusal:?}"),
             Self::ModuleSplit(reason) => write!(formatter, "{reason}"),
             Self::Compile(error) => write!(formatter, "{error}"),
+            Self::SignGated(reason) => write!(formatter, "{reason}"),
             Self::NonFiniteReport { field, value } => write!(
                 formatter,
                 "MPD report field {field} is {value}, which the wire report cannot state"
@@ -601,6 +612,7 @@ pub fn run_parameter_decomposition(
         MpdOperation::WeightedObservability(request) => observability::run(request, tensors, governor),
         MpdOperation::ModuleSplit(request) => module_split::run(request, tensors, governor),
         MpdOperation::Compile(request) => compile::run(*request, tensors, governor),
+        MpdOperation::SignGatedSwiglu(request) => sign_gated::run(*request, tensors, governor),
     }
 }
 
