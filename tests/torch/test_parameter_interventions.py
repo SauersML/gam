@@ -50,6 +50,7 @@ from gamfit.torch.parameter_interventions import (
     UseSiteInputReadout,
     UseSiteOutputReadout,
     UseSiteParameterEdit,
+    compiled_parameter_edits,
     discover_parameter_use_sites,
     execute_native,
     execute_parameter_cotangents,
@@ -427,6 +428,45 @@ def test_a_factored_delta_is_read_as_w_plus_left_right_transpose() -> None:
             model, _TOKENS, [GlobalParameterEdit("body.0.weight", FactoredDelta(right, left), None)]
         )
 
+
+
+class _CompileReport:
+    """The shape of a ``compile`` report: its document and the arrays it names."""
+
+    def __init__(self, result: dict[str, Any], arrays: dict[str, np.ndarray]) -> None:
+        self.report = {"schema": "gam.mpd-report", "schema_version": 1, "result": result}
+        self.arrays = arrays
+
+
+def test_a_compiled_plan_runs_as_global_edits_of_storage() -> None:
+    model = _model()
+    left = _ramp((7, 1)) + 0.25
+    right = _ramp((4, 1)) - 0.75
+    report = _CompileReport(
+        {
+            "kind": "compile",
+            "control": "head",
+            "realization": {"kind": "exactly_realized"},
+            "plan": [{"storage": "embed.weight", "rows": 7, "cols": 4, "rank": 1, "left": "plan/0/left", "right": "plan/0/right"}],
+        },
+        {"plan/0/left": left, "plan/0/right": right},
+    )
+    edits = compiled_parameter_edits(report)
+    run = execute_parameter_edits(model, _TOKENS, edits)
+    edited = _original(model, "embed.weight") + torch.from_numpy(left) @ torch.from_numpy(right).T
+    with torch.no_grad():
+        reference = torch.func.functional_call(model, {"embed.weight": edited}, (_TOKENS,))
+    assert np.array_equal(run.output.values, reference.numpy())
+    # The tie moves together: both the lookup and the head read the edited storage.
+    assert [site.use_site_id for site in run.substituted] == ["embed.weight#0", "embed.weight#1"]
+    # rho(0) = theta is the empty plan; a descriptive control has none and refuses.
+    native = _CompileReport({"kind": "compile", "control": "head", "realization": {"kind": "exactly_realized"}, "plan": []}, {})
+    assert compiled_parameter_edits(native) == ()
+    descriptive = _CompileReport(
+        {"kind": "compile", "control": "head", "realization": {"kind": "descriptive"}, "plan": None}, {}
+    )
+    with pytest.raises(ValueError, match="has no native plan"):
+        compiled_parameter_edits(descriptive)
 
 def test_use_site_edit_of_the_tied_tensor_moves_only_the_head() -> None:
     model = _model()

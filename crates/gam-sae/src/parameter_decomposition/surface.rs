@@ -48,6 +48,7 @@ use super::spectral::{
 
 mod canonical;
 mod code;
+mod compile;
 mod cyclic;
 mod dense;
 mod finite_grid;
@@ -70,6 +71,7 @@ pub use code::{
     DecideProposalRequest, EvidenceStatusWire, ExactBasisWire, ExtremumWire, FidelityVerdictWire,
     LatticeReport, ProposalDecision, ProposalKindWire, StatedArtifact,
 };
+pub use compile::{CompileFindings, CompileProblem, CompileReport, CompileRequest, RealizationWire, WitnessWire};
 pub use dense::{
     AssemblyRequest, CutoffRequest, DenseOperation, DenseReport, DenseRequest, DenseResult,
     QrModeRequest,
@@ -221,6 +223,9 @@ pub enum MpdOperation {
     /// An MLP block's merged normal form, finest additive blocks, optimal splits and
     /// pair-weight Laplacian products (`module_split`).
     ModuleSplit(ModuleSplitRequest),
+    /// The native edit compiler: control settings to native parameter edits, or
+    /// infeasibility witnesses (`compile`).
+    Compile(Box<CompileRequest>),
 }
 
 /// [`ExternalExecution`] on the wire.
@@ -285,6 +290,7 @@ pub enum MpdResult {
     JointOperators(Box<JointOperatorsReport>),
     WeightedObservability(WeightedObservabilityReport),
     ModuleSplit(Box<ModuleSplitReport>),
+    Compile(Box<CompileReport>),
 }
 
 /// [`PlaneRotationRecovery`] on the wire.
@@ -465,6 +471,8 @@ pub enum MpdSurfaceError {
     Verify(String),
     /// A dense copy the surface forms does not fit the memory budget.
     Memory(MemoryReservationError),
+    /// The native edit compiler refused the problem.
+    Compile(Box<super::compile::CompileError>),
     /// An owner returned a non-finite value where the wire report has no meaning
     /// for one.
     NonFiniteReport { field: &'static str, value: f64 },
@@ -500,6 +508,7 @@ impl fmt::Display for MpdSurfaceError {
             Self::Dense(error) => write!(formatter, "{error}"),
             Self::Joint(refusal) => write!(formatter, "joint operators refused: {refusal:?}"),
             Self::ModuleSplit(reason) => write!(formatter, "{reason}"),
+            Self::Compile(error) => write!(formatter, "{error}"),
             Self::NonFiniteReport { field, value } => write!(
                 formatter,
                 "MPD report field {field} is {value}, which the wire report cannot state"
@@ -584,6 +593,7 @@ pub fn run_parameter_decomposition(
         MpdOperation::JointOperators(request) => joint::run(*request, tensors, governor),
         MpdOperation::WeightedObservability(request) => observability::run(request, tensors, governor),
         MpdOperation::ModuleSplit(request) => module_split::run(request, tensors, governor),
+        MpdOperation::Compile(request) => compile::run(*request, tensors, governor),
     }
 }
 

@@ -191,6 +191,9 @@ pub mod replay;
 // Exhaustive verification of an explanation against the native model over a declared finite family.
 pub mod verify;
 
+// The native edit compiler: control settings to native parameter edits, or infeasibility witnesses.
+pub mod compile;
+
 // Dense float64 decompositions on faer with canonical signs, for the probes.
 pub mod dense;
 

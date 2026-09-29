@@ -57,6 +57,7 @@ __all__ = [
     "UseSiteInputReadout",
     "UseSiteOutputReadout",
     "UseSiteParameterEdit",
+    "compiled_parameter_edits",
     "discover_parameter_use_sites",
     "execute_native",
     "execute_parameter_cotangents",
@@ -1057,4 +1058,35 @@ def execute_parameter_cotangents(
         execution=execution,
         readouts=tuple(_float64_copy(block) for block in blocks),
         uses=tuple(uses),
+    )
+
+
+def compiled_parameter_edits(report: Any) -> tuple[GlobalParameterEdit, ...]:
+    """The global edits of a native edit compiler report, ready for
+    :func:`execute_parameter_edits`.
+
+    ``report`` is the :class:`gamfit.ParameterDecompositionReport` of a
+    ``compile`` operation. Its ``plan`` names each edit's storage tensor and the
+    ids of its ``left`` and ``right`` factor arrays (``ΔW = left · rightᵀ`` in
+    the stored orientation). The compiler emits only global edits of storage, so
+    every tied use moves with the tensor it reads. An empty plan is ``ρ(0) = θ``,
+    which runs through :func:`execute_native`; a descriptive control has no plan
+    and refuses here, since no native edit realizes it.
+    """
+    result = report.report["result"]
+    if result.get("kind") != "compile":
+        raise ValueError(f"expected a compile report; got {result.get('kind')!r}")
+    plan = result.get("plan")
+    if plan is None:
+        raise ValueError(
+            f"control {result['control']!r} has no native plan: its realization is "
+            f"{result['realization']['kind'] if result.get('realization') else 'absent'}"
+        )
+    return tuple(
+        GlobalParameterEdit(
+            tensor_id=edit["storage"],
+            delta=FactoredDelta(left=report.arrays[edit["left"]], right=report.arrays[edit["right"]]),
+            positions=None,
+        )
+        for edit in plan
     )
