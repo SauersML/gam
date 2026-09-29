@@ -245,8 +245,9 @@ fn a_model_with_no_region_structure_stays_one_behaviour() {
 #[test]
 fn two_disjoint_laws_are_one_behaviour() {
     let mut fitter = TableFitter::planted();
-    // Each task reads x by its own law: the one table over (task, x) costs what the two tables
-    // over x cost, so the split has only its partition code to pay and does not.
+    // Each task reads x by its own law. The split's two exact tables over x cost as much as the
+    // one table over (task, x), and the one group may also pay data bits instead (a table over x
+    // coding the tasks' mixture), so splitting pays nothing: two laws are not two behaviours.
     for row in 0..fitter.model.len() {
         let shift = if fitter.task[row] == 0 { 0 } else { 3 };
         let mut p = vec![0.02; CLASSES];
@@ -257,5 +258,7 @@ fn two_disjoint_laws_are_one_behaviour() {
     let seeds = atom_seeds(&features);
     let discovery = discover(&mut fitter, &features, &seeds).expect("discovers");
     assert_eq!(discovery.behaviours.len(), 1, "moves {:?}", discovery.moves);
-    assert_eq!(discovery.behaviours[0].program.reads, Reads::TaskAndX);
+    let split_programs = 2 * (2 + XS as u64 * CLASSES as u64 * ENTRY_BITS);
+    assert!(discovery.code.total() < split_programs as f64, "{:?}", discovery.code);
+    assert_ne!(discovery.behaviours[0].program.reads, Reads::Nothing);
 }
