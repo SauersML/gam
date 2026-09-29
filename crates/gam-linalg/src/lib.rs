@@ -38,6 +38,7 @@ pub mod packed_symmetric_spectrum;
 pub mod pairwise_reduce;
 pub mod parallel;
 pub mod pcg;
+pub mod randomized_eigen;
 pub mod roundoff;
 pub mod sparse_exact;
 #[cfg(test)]

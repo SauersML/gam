@@ -324,18 +324,6 @@ def _pullback_matvec(
     return vjp_fn(fjv)  # (p, m)
 
 
-def _orthonormalize(M: torch.Tensor) -> torch.Tensor:
-    """An orthonormal ``(p, m)`` basis for ``range(M)``, from the engine.
-
-    The decomposition is ``gam::linalg``'s, the same one every Rust caller reads
-    a range basis from, so the harvest and the engine cannot disagree about a
-    subspace. It runs in the engine's working precision, float64, and the basis
-    returns in ``M``'s own dtype and device.
-    """
-    basis = _rust().dense_orthonormal_range_basis(_to_engine(M))
-    return torch.from_numpy(basis).to(device=M.device, dtype=M.dtype)
-
-
 def _top_r_eigenpairs(
     matvec: Callable[[torch.Tensor], torch.Tensor],
     p: int,
@@ -343,42 +331,27 @@ def _top_r_eigenpairs(
     *,
     oversample: int,
     n_iter: int,
-    generator: torch.Generator,
+    seed: int,
     dtype: torch.dtype,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Top-r eigenpairs of a PSD operator given only its matvec ``V ↦ G V``.
+    """Top-r eigenpairs of the PSD operator ``V ↦ G V``, from the engine.
 
-    Randomized subspace iteration with ``m = min(p, r + oversample)`` columns,
-    ``n_iter`` power steps, then a Rayleigh–Ritz step: the only dense linear
-    algebra is an ``m × m`` symmetric eig (``m`` small, never ``p × p``).
-
-    Returns ``(eigvals, eigvecs)`` with ``eigvals`` ``(r,)`` descending and
-    ``eigvecs`` ``(p, r)`` orthonormal (the leading-r Ritz vectors).
+    The randomized subspace iteration and its Rayleigh–Ritz step are the
+    engine's (``gam::linalg::randomized_eigen``); this only carries ``matvec``,
+    the model's own autograd, across the boundary in float64. Returns
+    ``(eigvals (r,), eigvecs (p, r))`` in ``dtype`` on ``device``, eigenvalues
+    descending.
     """
-    m = min(p, r + oversample)
-    # Sample on the generator's device (CPU) then move to the operator device,
-    # so the fixed seed gives identical bases on CPU and GPU.
-    Q = torch.randn(p, m, generator=generator, dtype=dtype).to(device)
-    Q = _orthonormalize(Q)
-    for _ in range(n_iter):
-        Q = _orthonormalize(matvec(Q))
-    # Rayleigh–Ritz on the captured subspace: T = Qᵀ G Q is (m, m).
-    GQ = matvec(Q)
-    T = Q.transpose(0, 1) @ GQ
-    # The symmetrization and the decomposition are both the engine's: it averages
-    # `T` with its transpose and enters its strict self-adjoint routine with that
-    # assembly DECLARED, so the two triangles are known to hold one rounded value
-    # each rather than assumed to agree.
-    values, vectors = _rust().dense_symmetric_eigen(_to_engine(T))
-    evals = torch.from_numpy(values).to(device=T.device, dtype=T.dtype)
-    evecs = torch.from_numpy(vectors).to(device=T.device, dtype=T.dtype)
-    # Descending, take leading r.
-    order = torch.argsort(evals, descending=True)
-    top = order[:r]
-    ritz_vals = evals[top].clamp_min(0.0)  # PSD: clamp tiny negative round-off
-    ritz_vecs = Q @ evecs[:, top]  # (p, r)
-    return ritz_vals, ritz_vecs
+
+    def engine_matvec(block: np.ndarray) -> np.ndarray:
+        return _to_engine(matvec(torch.from_numpy(block).to(device=device, dtype=dtype)))
+
+    values, vectors = _rust().psd_top_eigenpairs(engine_matvec, p, r, oversample, n_iter, seed)
+    return (
+        torch.from_numpy(values).to(device=device, dtype=dtype),
+        torch.from_numpy(vectors).to(device=device, dtype=dtype),
+    )
 
 
 def _fisher_energy(probs: torch.Tensor, jv: torch.Tensor) -> torch.Tensor:
@@ -402,44 +375,25 @@ def _deflated_tail_trace(
     jvp_fn: Callable[[torch.Tensor], torch.Tensor],
     probs: torch.Tensor,
     basis: torch.Tensor,
-    p: int,
     *,
     n_probes: int,
-    generator: torch.Generator,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
+    seed: int,
+) -> float:
     """Matrix-free ``trace(P G P)`` with ``P = I − Q Qᵀ``, ``Q = basis`` ``(p, r)``.
 
-    ``Q`` holds the orthonormal top-r Ritz vectors, so
-    ``trace(P G P) = trace(G) − trace(Qᵀ G Q) = trace(G) − Σ_{k≤r} λ_k``: the
-    truncation tail. Each probe ``z`` is projected first and priced as the
-    Fisher energy of ``J (P z)`` (:func:`_fisher_energy`), so every term is
-    ``≥ 0`` and the estimate is non-negative by construction — no clamp.
-
-    Exact when ``n_probes >= p``: identity probes give
-    ``Σ_i (P e_i)ᵀ G (P e_i) = trace(P G P)``. Otherwise a Rademacher
-    Hutchinson estimate with ``E[zᵀ P G P z] = trace(P G P)``. Deflating before
-    probing is what makes the estimate usable: Hutchinson's variance is
-    ``2(‖A‖_F² − Σ_i A_ii²)``, so probing ``G`` itself and subtracting the
-    Ritz sum carries noise on the scale of the leading eigenvalue ``λ_1``,
-    while probing ``P G P`` carries noise on the scale of the tail only.
-    Only JVPs are needed (no VJP): the quadratic form is ``‖J P z‖²_F``.
+    The truncation tail ``trace(G) − Σ_{k≤r} λ_k``. The probes, the projection and
+    the estimate are the engine's (``gam::linalg::randomized_eigen::deflated_trace``:
+    exact on identity probes when ``n_probes >= p``, Hutchinson otherwise); this
+    supplies each projected probe's quadratic form as the Fisher energy of
+    ``J (P z)`` (:func:`_fisher_energy`), which needs only JVPs and is ``≥ 0`` term
+    by term.
     """
-    if n_probes >= p:
-        Z = torch.eye(p, dtype=dtype, device=device)
-        scale = 1.0
-    else:
-        # Sample Rademacher ±1 on the generator's device (CPU), then move.
-        Z = (
-            torch.randint(0, 2, (p, n_probes), generator=generator, dtype=torch.int64)
-            .to(dtype)
-            * 2
-            - 1
-        ).to(device)
-        scale = 1.0 / n_probes
-    PZ = Z - basis @ (basis.transpose(0, 1) @ Z)  # (p, probes)
-    return _fisher_energy(probs, jvp_fn(PZ)).sum() * scale
+
+    def forms(block: np.ndarray) -> np.ndarray:
+        z = torch.from_numpy(block).to(device=basis.device, dtype=basis.dtype)
+        return _to_engine(_fisher_energy(probs, jvp_fn(z)))
+
+    return float(_rust().psd_deflated_trace(forms, _to_engine(basis), n_probes, seed))
 
 
 # ---------------------------------------------------------------------------
@@ -676,37 +630,26 @@ def harvest_output_fisher_factors(
         ) -> torch.Tensor:
             return _pullback_matvec(_j, _vj, _p, V)
 
-        gen = torch.Generator(device="cpu")
-        gen.manual_seed(seed + row)
-        # Generators sample on CPU (randn/randint are CPU-portable), then the
-        # basis is moved onto the activation device so the seed is honored
-        # identically regardless of where the model lives.
         evals, evecs = _top_r_eigenpairs(
             matvec,
             p,
             rank,
             oversample=oversample,
             n_iter=n_iter,
-            generator=gen,
+            seed=seed + row,
             dtype=work_dtype,
             device=device,
         )
         # Factors: column k = sqrt(λ_k) · v_k, so U_n U_nᵀ = Σ_k λ_k v_k v_kᵀ.
         scaled = evecs * evals.clamp_min(0.0).sqrt().unsqueeze(0)  # (p, r)
 
-        gen_tr = torch.Generator(device="cpu")
-        gen_tr.manual_seed(seed + 10_000 + row)
-        tail = _deflated_tail_trace(
+        mass_residual[row] = _deflated_tail_trace(
             jvp_fn,
             probs,
             evecs,
-            p,
             n_probes=trace_probes,
-            generator=gen_tr,
-            dtype=work_dtype,
-            device=device,
+            seed=seed + 10_000 + row,
         )
-        mass_residual[row] = float(tail.item())
         U[row] = scaled.detach().to(torch.float32).cpu().numpy()
 
     factor_kind = "exact_full" if rank == p else "uncertified_approximation"
@@ -947,33 +890,25 @@ def harvest_downstream_output_fisher_factors(
         ) -> torch.Tensor:
             return _downstream_pullback_matvec(_j, _vj, _pf, V)
 
-        gen = torch.Generator(device="cpu")
-        gen.manual_seed(seed + row)
         evals, evecs = _top_r_eigenpairs(
             matvec,
             p,
             rank,
             oversample=oversample,
             n_iter=n_iter,
-            generator=gen,
+            seed=seed + row,
             dtype=work_dtype,
             device=device,
         )
         scaled = evecs * evals.clamp_min(0.0).sqrt().unsqueeze(0)  # (p, r)
 
-        gen_tr = torch.Generator(device="cpu")
-        gen_tr.manual_seed(seed + 10_000 + row)
-        tail = _deflated_tail_trace(
+        mass_residual[row] = _deflated_tail_trace(
             jvp_fn,
             probs_future,
             evecs,
-            p,
             n_probes=trace_probes,
-            generator=gen_tr,
-            dtype=work_dtype,
-            device=device,
+            seed=seed + 10_000 + row,
         )
-        mass_residual[row] = float(tail.item())
         U[row] = scaled.detach().to(torch.float32).cpu().numpy()
 
     factor_kind = "exact_full" if rank == p else "uncertified_approximation"

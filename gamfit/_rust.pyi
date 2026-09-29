@@ -154,8 +154,6 @@ __all__ = [
     "curvature_inference_json",
     "cyclic_bspline_roughness_penalty",
     "debiased_functional",
-    "dense_orthonormal_range_basis",
-    "dense_symmetric_eigen",
     "derive_ivae_aux_scale",
     "diagnostics_anchor_consistency_report",
     "diagnostics_aux_richness",
@@ -321,6 +319,8 @@ __all__ = [
     "predict_table",
     "predict_table_conformal",
     "predict_table_full_conformal",
+    "psd_deflated_trace",
+    "psd_top_eigenpairs",
     "randomization_p_value",
     "rank_charge_dof",
     "recover_spikes",
@@ -1668,10 +1668,6 @@ def cyclic_bspline_roughness_penalty(num_basis: int, degree: int = ..., period: 
 
 def debiased_functional(beta: NDArray[np.float64], penalized_hessian: NDArray[np.float64], row_scores: NDArray[np.float64], penalty_beta: NDArray[np.float64], target: str, design_row: NDArray[np.float64] | None = ..., design_row_b: NDArray[np.float64] | None = ..., design_matrix: NDArray[np.float64] | None = ..., weights: NDArray[np.float64] | None = ..., leverage: NDArray[np.float64] | None = ...) -> dict[Any, Any]: ...
 
-def dense_orthonormal_range_basis(matrix: NDArray[np.float64]) -> NDArray[np.float64]: ...
-
-def dense_symmetric_eigen(matrix: NDArray[np.float64]) -> tuple[NDArray[np.float64], NDArray[np.float64]]: ...
-
 def derive_ivae_aux_scale(aux: NDArray[np.float64]) -> NDArray[np.float64]: ...
 
 def diagnostics_anchor_consistency_report(assignments: NDArray[np.float64], anchor_dominance: float | None = ...) -> dict[Any, Any]: ...
@@ -2001,6 +1997,10 @@ def predict_table(model: _FittedModel, headers: Sequence[str], rows: _EncodedTab
 def predict_table_conformal(model: _FittedModel, headers: Sequence[str], rows: _EncodedTable, calibration_headers: Sequence[str], calibration_rows: _EncodedTable, conformal_level: float, options_json: str | None = ...) -> Any: ...
 
 def predict_table_full_conformal(model: _FittedModel, headers: Sequence[str], rows: _EncodedTable, training_headers: Sequence[str], training_rows: _EncodedTable, conformal_level: float = ...) -> Any: ...
+
+def psd_deflated_trace(quadratic_forms: object, basis: NDArray[np.float64], probes: int, seed: int) -> float: ...
+
+def psd_top_eigenpairs(matvec: object, dim: int, rank: int, oversample: int, power_steps: int, seed: int) -> tuple[NDArray[np.float64], NDArray[np.float64]]: ...
 
 def randomization_p_value(observed: float, null_statistics: NDArray[np.float64]) -> tuple[int, float]: ...
 

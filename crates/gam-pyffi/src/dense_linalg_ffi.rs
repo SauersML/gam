@@ -1,99 +1,96 @@
-//! Dense decompositions the torch-interop harvest needs, evaluated by the engine.
+//! The torch-interop harvest's eigen and trace algorithms, driven by the caller's
+//! operator products.
 //!
 //! SPEC: Python is a thin wrapper. `gamfit/torch/harvest.py` drives a
 //! user-supplied model's autograd — the JVPs and VJPs that build the pullback
-//! matvec — which is torch's job and stays in torch. The two DECOMPOSITIONS its
-//! subspace iteration runs are linear algebra, and linear algebra lives in the
-//! Rust core. These are the entries it calls: an orthonormal basis for a dense
-//! matrix's column space, and the symmetric eigendecomposition of the small
-//! Rayleigh–Ritz matrix. Both route to `gam::linalg`, the same code every Rust
-//! caller reads, so the harvest and the engine cannot disagree about a range or
-//! a spectrum (#2899).
+//! product `V ↦ G V` and the quadratic forms `zᵀ G z` — which is torch's job and
+//! stays in torch. The subspace iteration, the Rayleigh–Ritz step and the deflated
+//! trace estimate are linear algebra, and they run in
+//! `gam::linalg::randomized_eigen`; these entries only carry the caller's products
+//! across the boundary (#2899 P33).
 
-use crate::ffi::ffi_errors::detach_py_result;
-use faer::Side;
-use gam::linalg::faer_ndarray::{FaerSvd, strict_symmetric_eigh};
-use gam::linalg::roundoff::SymmetricAssembly;
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2};
+use gam::linalg::randomized_eigen::{deflated_trace, psd_top_eigenpairs_by_subspace_iteration};
+use ndarray::{Array1, Array2, ArrayView2};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
-/// An orthonormal basis for the column space of a `rows × cols` matrix
-/// (`cols ≤ rows`), returned as a `rows × cols` array.
-///
-/// The basis is the left singular factor of the engine's SVD. A thin QR spans
-/// the same space; the SVD is what every other range basis in the engine is
-/// read from (`solve_design_least_squares`, `sae_residual_seed_logits`), and it
-/// orders the directions by how much of the matrix each one carries, which is
-/// what a subspace iteration wants from its orthonormalization.
-///
-/// Columns beyond the matrix's numerical rank complete the basis and carry no
-/// range. A caller that needs the rank reads the singular values, not this.
-#[pyfunction]
-fn dense_orthonormal_range_basis<'py>(
-    py: Python<'py>,
-    matrix: PyReadonlyArray2<'py, f64>,
-) -> PyResult<Py<PyArray2<f64>>> {
-    let owned = matrix.as_array().to_owned();
-    let basis = detach_py_result(py, "dense_orthonormal_range_basis", move || {
-        let (rows, cols) = owned.dim();
-        if rows == 0 || cols == 0 {
-            return Err(format!(
-                "dense_orthonormal_range_basis needs a non-empty matrix, got {rows}x{cols}"
-            ));
-        }
-        if cols > rows {
-            return Err(format!(
-                "dense_orthonormal_range_basis needs at least as many rows as columns, got \
-                 {rows}x{cols}"
-            ));
-        }
-        let (left, _, _) = owned
-            .svd(true, false)
-            .map_err(|error| format!("dense_orthonormal_range_basis: {error}"))?;
-        left.ok_or_else(|| {
-            "dense_orthonormal_range_basis: the SVD omitted its left factor".to_string()
-        })
-    })?;
-    Ok(basis.into_pyarray(py).unbind())
+use crate::py_value_error;
+
+/// Call `callback` on a float64 block and read back a float64 result.
+fn call_on_block<T>(
+    py: Python<'_>,
+    callback: &Bound<'_, PyAny>,
+    block: ArrayView2<'_, f64>,
+    read: impl FnOnce(&Bound<'_, PyAny>) -> PyResult<T>,
+) -> Result<T, String> {
+    let argument = block.to_owned().into_pyarray(py);
+    let result = callback
+        .call1((argument,))
+        .map_err(|error| format!("operator callback raised: {error}"))?;
+    read(&result).map_err(|error| format!("operator callback returned an unreadable result: {error}"))
 }
 
-/// The eigenvalues and eigenvectors of a symmetric `n × n` matrix, in the order
-/// the engine's self-adjoint eigensolver returns them.
-///
-/// The matrix is averaged with its transpose here, before the decomposition, so
-/// each off-diagonal pair holds ONE rounded value and the engine's strict
-/// routine is entered with `SymmetricAssembly::Mirrored` declared: IEEE addition
-/// is commutative and correctly rounded, so `(M + Mᵀ)/2` is bitwise symmetric
-/// and the two triangles may not disagree at all. A caller whose matrix is meant
-/// to be symmetric already gets that average unchanged; one whose two triangles
-/// hold different information gets their mean rather than a refusal, and should
-/// check the symmetry it means itself.
+/// The top `rank` eigenpairs of the PSD operator `matvec` on `ℝ^dim`, eigenvalues
+/// descending, by randomized subspace iteration with `oversample` extra columns and
+/// `power_steps` power steps, seeded by `seed`
+/// ([`psd_top_eigenpairs_by_subspace_iteration`]). `matvec` maps a float64
+/// `(dim, m)` array to `G` applied to it.
 #[pyfunction]
-fn dense_symmetric_eigen<'py>(
+fn psd_top_eigenpairs<'py>(
     py: Python<'py>,
-    matrix: PyReadonlyArray2<'py, f64>,
+    matvec: Bound<'py, PyAny>,
+    dim: usize,
+    rank: usize,
+    oversample: usize,
+    power_steps: usize,
+    seed: u64,
 ) -> PyResult<(Py<PyArray1<f64>>, Py<PyArray2<f64>>)> {
-    let owned = matrix.as_array().to_owned();
-    let (values, vectors) = detach_py_result(py, "dense_symmetric_eigen", move || {
-        let (rows, cols) = owned.dim();
-        if rows == 0 || rows != cols {
-            return Err(format!(
-                "dense_symmetric_eigen needs a non-empty square matrix, got {rows}x{cols}"
-            ));
-        }
-        let symmetric = (&owned + &owned.t()) * 0.5;
-        strict_symmetric_eigh(&symmetric, SymmetricAssembly::Mirrored, Side::Lower)
-            .map_err(|error| format!("dense_symmetric_eigen: {error}"))
-    })?;
+    let pairs = psd_top_eigenpairs_by_subspace_iteration(
+        dim,
+        rank,
+        oversample,
+        power_steps,
+        seed,
+        |block| {
+            call_on_block(py, &matvec, block, |result| {
+                Ok::<Array2<f64>, PyErr>(
+                    result.extract::<PyReadonlyArray2<f64>>()?.as_array().to_owned(),
+                )
+            })
+        },
+    )
+    .map_err(py_value_error)?;
     Ok((
-        values.into_pyarray(py).unbind(),
-        vectors.into_pyarray(py).unbind(),
+        pairs.values.into_pyarray(py).unbind(),
+        pairs.vectors.into_pyarray(py).unbind(),
     ))
 }
 
+/// `trace(P G P)` for `P = I − Q Qᵀ` with `Q = basis` orthonormal: exact from the
+/// identity columns when `probes ≥ dim`, otherwise Hutchinson over `probes`
+/// Rademacher vectors seeded by `seed` ([`deflated_trace`]). `quadratic_forms` maps
+/// a float64 `(dim, s)` array to the `s` values `zᵢᵀ G zᵢ`.
+#[pyfunction]
+fn psd_deflated_trace<'py>(
+    py: Python<'py>,
+    quadratic_forms: Bound<'py, PyAny>,
+    basis: PyReadonlyArray2<'py, f64>,
+    probes: usize,
+    seed: u64,
+) -> PyResult<f64> {
+    deflated_trace(basis.as_array(), probes, seed, |block| {
+        call_on_block(py, &quadratic_forms, block, |result| {
+            Ok::<Array1<f64>, PyErr>(
+                result.extract::<PyReadonlyArray1<f64>>()?.as_array().to_owned(),
+            )
+        })
+    })
+    .map_err(py_value_error)
+}
+
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(dense_orthonormal_range_basis, module)?)?;
-    module.add_function(wrap_pyfunction!(dense_symmetric_eigen, module)?)?;
+    module.add_function(wrap_pyfunction!(psd_top_eigenpairs, module)?)?;
+    module.add_function(wrap_pyfunction!(psd_deflated_trace, module)?)?;
     Ok(())
 }
