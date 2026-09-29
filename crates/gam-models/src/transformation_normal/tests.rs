@@ -903,6 +903,48 @@ pub(crate) fn direct_alpha_ctn_exposes_exact_factored_monotonicity_cone() {
     );
 }
 
+/// gam#4567: the CTN coefficient objective has one mode per ρ, so the fit selects it without the
+/// #2366/#2661 branch-selection continuation, whose two refinements took most of the fixture's
+/// wall before the outer search began. The declaration is checked against the objective itself:
+/// along every chord between two feasible coefficient vectors the negative log-likelihood lies
+/// on or below the chord (Jensen), to the rounding of the three evaluations.
+#[test]
+pub(crate) fn ctn_coefficient_objective_is_globally_convex_4567() {
+    let (family, _, state, _) = toy_family_and_derivatives(&array![0.15, -0.10]);
+    assert!(
+        family.inner_coefficient_objective_is_globally_convex(),
+        "the direct-alpha CTN objective is convex: h and h' are affine in beta"
+    );
+    let negative_ll = |beta: &Array1<f64>| -> f64 {
+        -family
+            .row_quantities(beta)
+            .expect("feasible chord point")
+            .log_likelihood
+    };
+    let p = state.beta.len();
+    for seed in 0..8_u64 {
+        // A second feasible point: scale the strictly feasible shape field and move the location.
+        let direction = toy_probe_vector(p, seed + 1);
+        let other = &state.beta * (1.0 + 0.5 * (seed as f64) / 8.0) + &(direction * 0.05);
+        let feasible = family.x_deriv_kron.forward_mul(&other).iter().all(|hp| *hp > 0.0);
+        if !feasible {
+            continue;
+        }
+        for t in [0.25_f64, 0.5, 0.75] {
+            let mid = &state.beta * (1.0 - t) + &(&other * t);
+            let (left, right, middle) = (negative_ll(&state.beta), negative_ll(&other), negative_ll(&mid));
+            let chord = (1.0 - t) * left + t * right;
+            let rounding = gam_math::roundoff::accumulation_growth(4 * p + 16)
+                * (left.abs() + right.abs() + middle.abs());
+            assert!(
+                middle <= chord + rounding,
+                "seed {seed}, t = {t}: -ll at the chord point {middle:.17e} exceeds the chord \
+                 {chord:.17e} by more than the evaluations' rounding {rounding:.3e}"
+            );
+        }
+    }
+}
+
 #[test]
 pub(crate) fn ctn_row_quantity_cache_matches_direct_formulas() {
     let psi = array![0.15, -0.10];

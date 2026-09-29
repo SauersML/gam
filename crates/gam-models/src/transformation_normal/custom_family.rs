@@ -251,6 +251,22 @@ impl CustomFamily for TransformationNormalFamily {
         true
     }
 
+    /// The CTN coefficient objective is `Σ_i w_i(½h_i² − ln h'_i) + ½βᵀS_λβ`. In the direct-α
+    /// chart `h` and `h'` are affine in β ([`ctn_row_geometry`]), so each row adds a square and a
+    /// negative logarithm of an affine map, both convex wherever the weight is not negative. The
+    /// penalty is a positive semidefinite quadratic, and the feasible set, cut by the linear
+    /// monotonicity cone and the open half-spaces `h'_i > 0`, is convex. No likelihood correction
+    /// is enabled: `joint_jeffreys_term_required` is false. So every ρ has one coefficient mode,
+    /// and a branch-selection continuation (#2366, #2661) has no branch to select. On the gam#4567
+    /// fixture that continuation ran two refinements, for 1.5 minutes of a release fit and most of
+    /// the 15 minutes a debug fit spent before its outer search began, to certify a mode the
+    /// objective's convexity already made unique.
+    ///
+    /// [`ctn_row_geometry`]: super::chart::ctn_row_geometry
+    fn inner_coefficient_objective_is_globally_convex(&self) -> bool {
+        self.effective_weights().iter().all(|&weight| weight >= 0.0)
+    }
+
     fn joint_jeffreys_term_required(&self) -> bool {
         // CTN models a continuous response through a monotone transformation
         // `h(Y|x) ~ N(0,1)`; there is no separation/under-identification
