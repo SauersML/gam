@@ -17,7 +17,9 @@ attention OV maps with the full unembedding as readout; that is trivial for Qwen
   RMSNorm gain in a post-norm model, whose excluded normaliser is one scalar per token and layer shared by
   all heads), optionally with the MLP reads.
 
-The rank rule and the closure are state.rs's resolved row space and LinearStateQuotient::close, and the
+The weighted Gramian is state.rs WeightedObservability (op ``weighted_observability``); its exact_rank_eps_band
+counts the owner's singular values above d eps sigma_1 (formation not included) and certified_rank is the owner's
+resolved rank at its band (factor band + pull-back formation). The rank rule and the closure are state.rs's resolved row space and LinearStateQuotient::close, and the
 Fourier planes are cyclic_action::cyclic_planes, all called through the MPD surface (the parent bench's
 ``linear_quotient`` / ``resolved_rows``; ``cyclic_planes`` here). "exact" = rank at the eps band (exact-arithmetic
 rank to within roundoff); tau / effective dimensions are numerical conditioning statements. The
@@ -38,7 +40,8 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mpd_opfirst_decoder_2951 import Decoder  # noqa: E402
 from mpd_opfirst_observability_2951 import (  # noqa: E402
-    apply, effective, linear_quotient, relative_rows, resolved_rows, singular_values)
+    apply, effective, linear_quotient, relative_rows, resolved_rows, singular_values, svd_band_rank,
+    weighted_observability)
 
 TAUS = (1e-2, 1e-3, 1e-6)
 
@@ -46,11 +49,6 @@ TAUS = (1e-2, 1e-3, 1e-6)
 def dims(factor):
     sigma = singular_values(factor)
     return {"exact_rank_eps_band": int(resolved_rows(factor).shape[0]), **effective(sigma, TAUS)}, sigma
-
-
-def top_space(factor, tau):
-    _, sigma, vt = np.linalg.svd(factor, full_matrices=False)
-    return vt[: int((sigma > tau * sigma[0]).sum())]
 
 
 def principal_cosines(a, b):
@@ -81,18 +79,30 @@ def fourier_power(table):
     return np.arange(1, len(power) + 1), power / power.sum()
 
 
-def compare(factor, planes, label):
-    """How the Gramian-weighted observable space sits against a Fourier-plane subspace."""
-    gram = factor.T @ factor
-    out = {"plane_dim": int(planes.shape[0]),
-           "gramian_energy_in_planes": float(np.trace(planes @ gram @ planes.T) / np.trace(gram))}
+def gramian(steps, planes):
+    """The owner's weighted Gramian of ``steps`` and its capture of every candidate plane subspace."""
+    report, _, directions, spectra = weighted_observability(steps, list(planes.values()))
+    spectrum = spectra[0]
+    sigma = spectrum["singular_values"]
+    dims = {"exact_rank_eps_band": svd_band_rank(sigma, directions.shape[1]),
+            "certified_rank": spectrum["resolved_rank"], "certified_band": spectrum["band"], **effective(sigma, TAUS),
+            "participation_ratio": spectrum["participation_ratio"]}
+    return dims, sigma, directions, dict(zip(planes, report["captures"]))
+
+
+def compare(sigma, directions, capture, planes, label):
+    """How the Gramian-weighted observable space sits against a Fourier-plane subspace: the owner's capture
+    (energy fraction, principal cosines to the top equal-dimension directions), and the principal cosines of the
+    directions above tau sigma_max (a conditioning statement)."""
+    out = {"plane_dim": int(planes.shape[0]), "gramian_energy_in_planes": capture["energy_fraction"]["value"],
+           "gramian_energy_in_planes_error": capture["energy_fraction"]["numerical_error"],
+           "eigengap": capture["eigengap"], "angle_perturbation": capture["angle_perturbation"]}
     for tau in (1e-2, 1e-3):
-        top = top_space(factor, tau)
+        top = directions[: int((sigma > tau * sigma[0]).sum())]
         cos = principal_cosines(top, planes)
         out[f"tau_{tau:g}"] = {"observable_dim": int(top.shape[0]), "principal_cosines": cos.round(6).tolist(),
                                "planes_contained_frac": float((cos ** 2).sum() / planes.shape[0])}
-    top = top_space(factor, 0.0)[: planes.shape[0]]
-    out["top_equal_dim_cosines"] = principal_cosines(top, planes).round(6).tolist()
+    out["top_equal_dim_cosines"] = np.round(capture["principal_cosines"], 6).tolist()
     print(label, json.dumps({k: v for k, v in out.items() if k != "top_equal_dim_cosines"}), flush=True)
     return out
 
@@ -124,15 +134,17 @@ def modadd(args):
             post = np.vstack([c, w_in]) if mlp else c  # read at the post-attention residual
             v = {"readout": dims(c)[0], "readout_at_post_attn": dims(post)[0]}
             # one layer: the pre-attention residual is read through I + A_h (attention pattern fixed)
-            factor = np.linalg.qr(np.vstack([post] + [post @ a for a in ov]), mode="r")
-            v["pre_attention_gramian"], sigma = dims(factor)
+            identity = np.eye(post.shape[1])
+            v["pre_attention_gramian"], sigma, directions, captures = gramian([([identity] + ov, [post])], planes)
             v["pre_attention_sigma_over_max_first24"] = (sigma[:24] / sigma[0]).tolist()
             chart, report = linear_quotient([post], ov)
             v["time_invariant_closure_eps_band"] = {
                 "rank_C": int(resolved_rows(post).shape[0]), "rank_closed": int(chart.shape[0]),
                 "max_quotient_bound": max(b["upper"] for b in report["quotient_bounds"])}
-            v["fourier"] = {pn: compare(factor, pl, f"[modadd] {name} vs {pn}") for pn, pl in planes.items()}
-            v["fourier"]["readout_only"] = {pn: compare(np.linalg.qr(post, mode="r"), pl,
+            v["fourier"] = {pn: compare(sigma, directions, captures[pn], pl, f"[modadd] {name} vs {pn}")
+                            for pn, pl in planes.items()}
+            _, read_sigma, read_directions, read_captures = gramian([([identity], [post])], planes)
+            v["fourier"]["readout_only"] = {pn: compare(read_sigma, read_directions, read_captures[pn], pl,
                                                         f"[modadd] {name} readout-only vs {pn}")
                                             for pn, pl in planes.items()}
             print(f"[modadd] {name} readout {v['readout']} pre-attn {v['pre_attention_gramian']}", flush=True)
@@ -159,34 +171,36 @@ def weekday(args):
     for rname, c in readouts.items():
         for mlp in (False, True):
             name = rname + ("+mlp_reads" if mlp else "")
-            factor = c
             charts = {tau: resolved_rows(c) if tau is None else relative_rows(c, tau) for tau in (None, 1e-3, 1e-6)}
-            per_layer = [{"layer": n_layers, **dims(factor)[0],
+            per_layer = [{"layer": n_layers, **dims(c)[0],
                           **{f"chart_rank_{t if t else 'eps'}": int(ch.shape[0]) for t, ch in charts.items()}}]
+            chart_ranks, steps = {}, []
             for layer in reversed(range(n_layers)):
+                readouts = [c] if layer == n_layers - 1 else []
                 if mlp:
                     reads = D.mlp_reads(layer)
-                    factor = np.vstack([factor, reads])
+                    readouts.append(reads)
                     for t in charts:
                         stack = np.vstack([charts[t], reads / np.linalg.norm(reads, 2)])
                         charts[t] = resolved_rows(stack) if t is None else relative_rows(stack, t)
-                factor = np.vstack([factor] + [apply(factor, a) for a in ov[layer]])
-                if factor.shape[0] > d:
-                    factor = np.linalg.qr(factor, mode="r")
                 for t in charts:
                     if charts[t].shape[0] < d:
                         stack = np.vstack([charts[t]] + [apply(charts[t], a) for a in ov[layer]])
                         charts[t] = resolved_rows(stack) if t is None else relative_rows(stack, t)
-                entry, sigma = dims(factor)
-                entry.update({"layer": layer, "sigma_over_max_first8": (sigma[:8] / sigma[0]).tolist(),
-                              **{f"chart_rank_{t if t else 'eps'}": int(ch.shape[0]) for t, ch in charts.items()}})
+                chart_ranks[layer] = {f"chart_rank_{t if t else 'eps'}": int(ch.shape[0]) for t, ch in charts.items()}
+                steps.insert(0, ([np.eye(d)] + [a[0] @ a[1] for a in ov[layer]], readouts))
+            _, _, _, spectra = weighted_observability(steps)
+            for layer in reversed(range(n_layers)):
+                spectrum = spectra[layer]
+                sigma = spectrum["singular_values"]
+                entry = {"exact_rank_eps_band": svd_band_rank(sigma, d), "certified_rank": spectrum["resolved_rank"],
+                         "certified_band": spectrum["band"],
+                         **effective(sigma, TAUS), "participation_ratio": spectrum["participation_ratio"],
+                         "layer": layer, "sigma_over_max_first8": (sigma[:8] / sigma[0]).tolist(), **chart_ranks[layer]}
                 per_layer.append(entry)
-                with open(args.out_prefix + "_weekday.partial.json", "w") as fh:  # progress survives a stop
-                    json.dump(res | {"partial": {name: per_layer}}, fh, separators=(",", ":"))
                 print(f"[weekday] {name} L{layer} exact={entry['exact_rank_eps_band']} "
                       f"eff1e-2={entry['0.01']} eff1e-3={entry['0.001']} eff1e-6={entry['1e-06']} "
-                      f"PR={entry['participation_ratio']:.1f} charts={[e.shape[0] for e in charts.values()]}",
-                      flush=True)
+                      f"PR={entry['participation_ratio']:.1f} charts={list(chart_ranks[layer].values())}", flush=True)
             res["variants"][name] = per_layer
     return res
 

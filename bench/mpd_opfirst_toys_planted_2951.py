@@ -21,12 +21,11 @@ Tools (reused from the probes, imported, not rewritten, unless noted):
   T4  spectral plane-rotation recovery: Rust parameter_decomposition::spectral::recover_plane_rotations called
       through `gam parameter-decomposition` (--gam-bin, default target/release/gam; required). A naive strawman
       (np.linalg.eig, one plane per conjugate pair, no grouping) is scored too, to show what the grouping prevents.
-  T5  gauge counts by the declared families of parameter_decomposition::gauge (NUMPY STAND-IN: re-statement of the orbit
-      formulas: pass-through GL(r) r^2 - (r - rank A)(r - rank B); GELU hidden units permutation only; rotary QK
-      2 m^2 per frequency with m planes). Scored against the function-level fibre dimension, measured as the
+  T5  gauge counts by the declared families of parameter_decomposition::gauge, through the MPD surface (op
+      gauge_census: hidden_units, linear_passthrough, query_key); each family's resolved orbit dimension. Scored against the function-level fibre dimension, measured as the
       nullity of the Jacobian of theta -> F_theta(X) on generic inputs (torch autograd, float64).
 Every other decomposition goes through bench/mpd_opfirst_linalg_2951.py (faer float64); torch is autograd and matmuls.
-  T6  QK sharing between heads (bench/mpd_opfirst_rope_span_2951.py: atoms, gram_from_factors, captured,
+  T6  QK sharing between heads (bench/mpd_opfirst_rope_span_2951.py: qk_gram (joint_operators), captured,
       top_cosine), plus an operator-equality test (same routing law iff equal score operators, no biases).
 
 Run: uv run --no-project --with numpy --with scipy --with torch --with safetensors python bench/mpd_opfirst_toys_planted_2951.py
@@ -47,7 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mpd_opfirst_linalg_2951 as la  # noqa: E402
 from mpd_opfirst_gelu_modules_2951 import KAPPA, Mlp, cos_matrix, eta_bound, psi, refine, random_twin  # noqa: E402
 from mpd_opfirst_observability_2951 import effective, linear_quotient, resolved_rows  # noqa: E402
-from mpd_opfirst_rope_span_2951 import atoms, captured, gram_from_factors, top_cosine  # noqa: E402
+from mpd_opfirst_rope_span_2951 import captured, qk_gram, top_cosine  # noqa: E402
 from mpd_opfirst_task_observability_2951 import principal_cosines  # noqa: E402
 
 EPS = np.finfo(np.float64).eps
@@ -315,6 +314,23 @@ def t4_naive(W):
     return planes
 
 
+# --------------------------------------------------------------------------------------------- T5 declared
+def gauge_census(blocks, tensors):
+    """parameter_decomposition::gauge families through the MPD surface (op gauge_census)."""
+    from gamfit.sae import run_parameter_decomposition
+
+    out = run_parameter_decomposition({"schema": "gam.mpd-request", "schema_version": 1,
+                                       "operation": {"kind": "gauge_census", "blocks": blocks}}, tensors)
+    return out.report["result"]
+
+
+def declared_gelu_units(W_in, b_in, W_out):
+    """The resolved continuous orbit of the exact-GELU hidden units (gauge::HiddenUnits)."""
+    census = gauge_census([{"kind": "hidden_units", "read_in": "w_in", "bias_in": "b_in", "write_out": "w_out",
+                            "hidden_act": "gelu"}], {"w_in": W_in, "b_in": b_in, "w_out": W_out})
+    return census["total"]["orbit_resolved"]
+
+
 # --------------------------------------------------------------------------------------------- T5 oracle
 def fibre_dim(f, theta):
     J = torch.autograd.functional.jacobian(f, theta)
@@ -371,7 +387,7 @@ def toy1(rng):
     rep["T4"] = {k: v for k, v in t4.items() if k != "clusters"} | {
         "clusters": [{k: v for k, v in cl.items() if k != "_basis"} for cl in t4["clusters"]]}
     orc = mlp_oracle(W_in, b_in, W_out, b_out, 3 * rng.standard_normal((120, d)))
-    rep["T5"] = {"declared_continuous": 0, "declared_note": "GELU hidden units: permutation only",
+    rep["T5"] = {"declared_continuous": declared_gelu_units(W_in, b_in, W_out),
                  "fibre_oracle": orc, "truth": d * d + d}
     sc = {
         "T1": {"raw": score(raw["graph_components"] == 0),  # raw claims d axis-aligned modules with eta = 0
@@ -431,7 +447,7 @@ def toy2(rng):
     rep["T4"] = {k: v for k, v in t4.items() if k != "clusters"} | {
         "clusters": [{k: v for k, v in cl.items() if k != "_basis"} for cl in t4["clusters"]]}
     orc = mlp_oracle(W_in, b_in, W_out, b_out, 3 * rng.standard_normal((150, d)))
-    rep["T5"] = {"declared_continuous": 0, "fibre_oracle": orc, "truth": 0}
+    rep["T5"] = {"declared_continuous": declared_gelu_units(W_in, b_in, W_out), "fibre_oracle": orc, "truth": 0}
     g = rep["T2_weighted"]
     sc = {"T1": score(part and "exact" == t1["eta_verdict"].split()[0] and min(cos) > 1 - 1e-10),
           "T2": {"weighted": score(g["exact_rank"] == 3 and min(g["exact_space_principal_cos_to_planted"]) > 1 - 1e-10),
@@ -460,7 +476,8 @@ def toy3(rng):
         g["sigma4_over_max_sq"] = float(sig[3] ** 2) if len(sig) > 3 else 0.0
         g["sigma4_sq_over_eps_sq"] = g["sigma4_over_max_sq"] / eps ** 2
         orc = mlp_oracle(W_in, b_in, W_out, b_out, 3 * rng.standard_normal((150, d)), L=L)
-        reps[f"eps={eps:g}"] = {"T1": t1, "T2_weighted": g, "T5": {"declared_continuous": 0, "fibre_oracle": orc}}
+        reps[f"eps={eps:g}"] = {"T1": t1, "T2_weighted": g, "T5": {"declared_continuous": declared_gelu_units(W_in, b_in, W_out),
+                                                                "fibre_oracle": orc}}
         exact_claimed = t1["eta_verdict"] == "exact split"
         scs[f"eps={eps:g}"] = {
             "T1_graph_only": score(t1["graph_components"] < 2),  # the unit graph alone says "exact split"
@@ -552,8 +569,7 @@ def toy5(rng):
 
     def tools(Vg, Og):
         Cs = [Og[h] @ Vg[h] for h in range(H)]
-        U_, V_ = atoms(Q, K)
-        G = gram_from_factors(U_, V_)
+        G = qk_gram(Q, K, omega.numpy())[2]
         idx = np.arange(G.shape[0]).reshape(H, hd // 2, 2)
         pairs = {}
         for h, h2 in ((0, 1), (0, 2), (1, 2)):
@@ -612,7 +628,22 @@ def toy5(rng):
     inv_head["function_rel_change"] = fn_diff(Vg, Og)
     inv_cross["function_rel_change"] = fn_diff(Vx, Ox)
     # declared gauge counts (gauge.rs families) and the fibre oracle
-    declared = {"rotary_qk": H * (hd // 2) * 2, "ov_per_head": H * r * r}
+    # The rotary query/key family reads the attention block; its value/output rows are zero-padded to the head
+    # width the owner's geometry declares, which moves no score (the query/key gauge does not read them).
+    Vp, Op = np.zeros((H * hd, d)), np.zeros((d, H * hd))
+    for h in range(H):
+        Vp[h * hd:h * hd + r], Op[:, h * hd:h * hd + r] = V[h], O[h]
+    attention = {"geometry": {"model_dim": d, "n_heads": H, "n_kv_heads": H, "head_dim": hd},
+                 "rotary": {"pairing": "half_split", "inverse_frequencies": omega.tolist(), "attention_scaling": 1.0},
+                 "score_scale": 1 / math.sqrt(hd), "query": {"weight": "q", "bias": None},
+                 "key": {"weight": "k", "bias": None}, "value": {"weight": "vp", "bias": None},
+                 "output": {"weight": "op", "bias": None}, "query_key_norm": None}
+    tensors = {"q": Q.reshape(H * hd, d), "k": K.reshape(H * hd, d), "vp": Vp, "op": Op}
+    tensors.update({f"v{h}": V[h] for h in range(H)} | {f"o{h}": O[h] for h in range(H)})
+    census = gauge_census([{"kind": "query_key", "attention": attention}]
+                          + [{"kind": "linear_passthrough", "read": f"v{h}", "write": f"o{h}"} for h in range(H)], tensors)
+    declared = {"rotary_qk": census["blocks"][0]["charge"]["orbit_resolved"],
+                "ov_per_head": sum(block["charge"]["orbit_resolved"] for block in census["blocks"][1:])}
     shapes = [(H, hd, d), (H, hd, d), (H, r, d), (H, d, r)]
     flat = torch.cat([tt(p).flatten() for p in (Q, K, V, O)])
 
@@ -720,7 +751,7 @@ def toy7(rng, gen, n_null=6):
                                     "subspaces_claimed": t4r["subspaces_claimed"], "source": t4r["source"]},
            "T2_weighted": {"exact_rank": g["exact_rank"], "participation_ratio": g["participation_ratio"],
                            "null_participation_ratios": null_pr},
-           "T5": {"declared_continuous": 0, "fibre_oracle": orc, "truth": 0}}
+           "T5": {"declared_continuous": declared_gelu_units(W_in, b_in, W_out), "fibre_oracle": orc, "truth": 0}}
     sc = {"T1": score(not t1["module_claimed"]),
           "T4": score(t4["planes_claimed"] == 0 and t4["subspaces_claimed"] == 0),
           "T4_on_I_plus_A": score(t4r["planes_claimed"] == 0 and t4r["subspaces_claimed"] == 0),

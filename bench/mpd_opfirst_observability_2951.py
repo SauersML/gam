@@ -20,9 +20,10 @@ Three measurements:
    chart of the time-invariant family of all OV maps, with its measured quotient bounds (when rowspace(C)
    is already all of d_model the closure is d_model with no computation, and the owner is not called).
 3. Causal backward closure O_L = O_{L+1} + sum_h O_{L+1} A_{L,h} (+ MLP reads of layer L),
-   kept both as an orthonormal chart at a relative band tau and as an unnormalized square-root
-   Gramian factor F_L (F_L^T F_L = F_{L+1}^T F_{L+1} + sum_h A^T F_{L+1}^T F_{L+1} A + reads),
-   whose singular values give the decay of how strongly each residual direction is read.
+   kept as an orthonormal chart at a relative band tau, and the weighted observability Gramian
+   G_L = sum over words of (R T_w)^T (R T_w) with letters {I, A_{L,h}} per layer: state.rs
+   WeightedObservability through the MPD surface (op ``weighted_observability``), whose per-step spectra
+   give the decay of how strongly each residual direction is read, at the owner's rank band.
 """
 import argparse
 import json
@@ -72,6 +73,42 @@ def relative_rows(matrix, tau):
         matrix = np.linalg.qr(matrix, mode="r")
     _, sigma, vt = np.linalg.svd(matrix, full_matrices=False)
     return vt[: int((sigma > tau * sigma[0]).sum())]
+
+
+def weighted_observability(steps, candidates=()):
+    """state.rs ``WeightedObservability::pull_back`` through the MPD surface (op ``weighted_observability``).
+
+    ``steps`` run forward, each ``(letters, readouts)``: dense letters ``n_{l+1} x n_l`` (a residual stream passes
+    the identity as a letter like any other) and readouts of the step's output. Returns the report, the factor
+    ``F`` (``F^T F = G``), the directions (``G``'s eigenvectors by decreasing weight), every step's spectrum with
+    its singular values, and each candidate row space's capture (energy fraction, principal cosines)."""
+    from gamfit.sae import run_parameter_decomposition
+
+    tensors, request_steps = {}, []
+    for step, (letters, readouts) in enumerate(steps):
+        for index, letter in enumerate(letters):
+            tensors[f"steps/{step}/letters/{index}"] = letter
+        for index, readout in enumerate(readouts):
+            tensors[f"steps/{step}/readouts/{index}"] = readout
+        request_steps.append({
+            "letters": [{"kind": "linear", "tensor": f"steps/{step}/letters/{i}"} for i in range(len(letters))],
+            "readouts": [f"steps/{step}/readouts/{i}" for i in range(len(readouts))]})
+    tensors.update({f"candidates/{i}": candidate for i, candidate in enumerate(candidates)})
+    out = run_parameter_decomposition(
+        {"schema": "gam.mpd-request", "schema_version": 1,
+         "operation": {"kind": "weighted_observability", "steps": request_steps,
+                       "candidates": [f"candidates/{i}" for i in range(len(candidates))]}}, tensors)
+    report = out.report["result"]
+    spectra = [spectrum | {"singular_values": out.arrays[spectrum["singular_values"]]}
+               for spectrum in report["step_spectra"]]
+    return report, out.arrays["factor"], out.arrays["directions"], spectra
+
+
+def svd_band_rank(sigma, width):
+    """Singular values above width * eps * sigma_1, the resolved row space's SVD band (state.rs
+    factor_singular_band for a factor of at most ``width`` rows): the pull-back's formation bound is NOT included,
+    so this is a numerical rank of the computed factor. The owner's ``resolved_rank`` includes it (certified)."""
+    return int((sigma > width * np.finfo(np.float64).eps * sigma[0]).sum()) if sigma.size else 0
 
 
 def singular_values(matrix):
@@ -125,7 +162,10 @@ def main():
             "mlp_reads": "rows of [W_gate; W_up]" + (" diag(g_post)" if pre_norm else " (raw residual input)")
                          + " added as readouts at the post-attention residual",
             "rank_rule": "state.rs resolved_row_space and LinearStateQuotient::close, called through the MPD surface "
-                         "(linear_state_quotient); 'tau' charts keep the singular directions above tau sigma_max",
+                         "(linear_state_quotient); 'tau' charts keep the singular directions above tau sigma_max; "
+                         "section 3: rank_at_band counts the owner's singular values above d eps sigma_1 (formation "
+                         "not included), certified_rank is WeightedObservability's resolved rank at its band "
+                         "(factor band + the pull-back's formation bound)",
             "labels": "rank at the eps band is exact-arithmetic rank to within roundoff (numerical-exact); "
                       "tau and effective dimensions are numerical/conditioning statements",
         },
@@ -162,35 +202,41 @@ def main():
                 **closure([r_readout] + mlp_reads)}}
         del mlp_reads
 
-    # 3. causal backward closure per layer
+    # 3. causal backward closure per layer: tau charts (numerical), and the owner's weighted Gramian
     per_layer = {"attention_only": [], "with_mlp_reads": []}
-    for variant in per_layer:
-        factor = r_readout
+    for variant in ("attention_only", "with_mlp_reads"):
         charts = {tau: relative_rows(r_readout, tau) for tau in (1e-2, 3e-2)}
+        chart_ranks = {}
+        steps = []
         for layer in reversed(range(n_layers)):
+            readouts = [r_readout] if layer == n_layers - 1 else []
             if variant == "with_mlp_reads":
                 reads = D.mlp_reads(layer)
-                factor = np.linalg.qr(np.vstack([factor, reads]), mode="r")
+                readouts.append(reads)
                 for tau in charts:
                     charts[tau] = relative_rows(np.vstack([charts[tau], reads / np.linalg.norm(reads, 2)]), tau)
-            factor = np.linalg.qr(np.vstack([factor] + [apply(factor, a) for a in ov[layer]]), mode="r")
             for tau in charts:
                 charts[tau] = relative_rows(np.vstack([charts[tau]] + [apply(charts[tau], a) for a in ov[layer]]),
                                             tau)
-            rank = int(resolved_rows(factor).shape[0])
-            _, s, vt = np.linalg.svd(factor)
+            chart_ranks[layer] = {"chart_rank_tau_1e-2": int(charts[1e-2].shape[0]),
+                                  "chart_rank_tau_3e-2": int(charts[3e-2].shape[0])}
+            steps.insert(0, ([np.eye(d)] + [a[0] @ a[1] for a in ov[layer]], readouts))
+        report, _, directions, spectra = weighted_observability(steps)
+        for layer, spectrum in enumerate(spectra):
+            s = spectrum["singular_values"]
             per_layer[variant].append({
-                "layer": layer, "rank_at_band": rank, "sigma_min_over_max": float(s[-1] / s[0]),
-                "effective": effective(s),
-                "chart_rank_tau_1e-2": int(charts[1e-2].shape[0]), "chart_rank_tau_3e-2": int(charts[3e-2].shape[0]),
-                "weakest_dir_top_coords": {int(i): float(vt[-1, i]) for i in np.argsort(-np.abs(vt[-1]))[:3]},
+                "layer": layer, "rank_at_band": svd_band_rank(s, d), "certified_rank": spectrum["resolved_rank"],
+                "certified_band": spectrum["band"],
+                "sigma_min_over_max": float(s[-1] / s[0]), "effective": effective(s),
+                "participation_ratio": spectrum["participation_ratio"], **chart_ranks[layer],
                 "sigma_bottom4_over_max": (s[-4:] / s[0]).tolist(),
             })
-            print(variant, layer, rank, f"PR={per_layer[variant][-1]['effective']['participation_ratio']:.1f}",
+            print(variant, layer, spectrum["resolved_rank"], f"PR={spectrum['participation_ratio']:.1f}",
                   f"{time.time() - started:.0f}s", flush=True)
-            with open(args.out + ".partial", "w") as fh:  # progress survives an interrupted run
-                fh.write(compact_json(result | {"causal_backward_partial": per_layer}))
-        per_layer[variant].reverse()
+        weakest = directions[-1]
+        per_layer[variant + "_layer0_weakest_dir_top_coords"] = {
+            int(i): float(weakest[i]) for i in np.argsort(-np.abs(weakest))[:3]}
+        per_layer[variant + "_formation"] = report["formation"]
     result["causal_backward"] = per_layer
     result["ov_head_norm_range"] = [float(min(np.linalg.norm(a[0] @ a[1], 2) for a in all_ov)),
                                     float(max(np.linalg.norm(a[0] @ a[1], 2) for a in all_ov))]
@@ -199,12 +245,12 @@ def main():
     with open(args.out, "w") as fh:
         fh.write(compact_json(result))
     print(json.dumps({k: result[k] for k in ("readout", "time_invariant_closure", "runtime_s")}, indent=1))
-    for variant, rows in per_layer.items():
-        print(variant)
-        for r in rows:
+    for variant in ("attention_only", "with_mlp_reads"):
+        print(variant, per_layer[variant + "_layer0_weakest_dir_top_coords"])
+        for r in per_layer[variant]:
             print(r["layer"], r["rank_at_band"], f"{r['sigma_min_over_max']:.2e}", r["effective"]["0.01"],
-                  r["effective"]["0.001"], f"{r['effective']['entropy_rank']:.0f}", f"{r['effective']['participation_ratio']:.1f}",
-                  r["chart_rank_tau_1e-2"], r["chart_rank_tau_3e-2"], r["weakest_dir_top_coords"])
+                  r["effective"]["0.001"], f"{r['effective']['entropy_rank']:.0f}", f"{r['participation_ratio']:.1f}",
+                  r["chart_rank_tau_1e-2"], r["chart_rank_tau_3e-2"])
 
 
 if __name__ == "__main__":

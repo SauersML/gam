@@ -21,8 +21,9 @@ sin(omega_j Delta) B_hj with
 
     A_hj = Q_hj^T K_gj,   B_hj = Q_hj^T J K_gj     (Q_hj, K_gj the 2 x d rows of plane j; rank <= 2),
 
-kept factored as U V^T with two columns. Frobenius inner products in factored form,
-<U_a V_a^T, U_b V_b^T> = tr[(U_a^T U_b)(V_b^T V_a)] = sum_{pq} (U^T U)_{ab,pq} (V^T V)_{ab,pq}.
+kept factored as U V^T with two columns. The factors and their Frobenius Gram
+<U_a V_a^T, U_b V_b^T> = tr[(U_a^T U_b)(V_b^T V_a)] come from parameter_decomposition::joint_operators
+(query_key_operators, family_gram) through the MPD surface (op ``joint_operators``), on the folded Q/K rows.
 The self-check scores random rows through the literal HF path (raw projections, q/k RMSNorm at its declared
 scope with eps, gains, rotate_half) and compares with the expansion divided by r_q r_k.
 
@@ -106,34 +107,45 @@ def top_cosine(gram, a, b):
     return float(la.svdvals(ia.T @ gram[np.ix_(a, b)] @ ib)[0])
 
 
-def atoms(Q, K):
-    """U, V stacks (d x 2N): atom i = (h, j, t) with t = 0 -> A_hj, t = 1 -> B_hj; columns 2i, 2i+1."""
+def qk_gram(Q, K, inverse_frequencies):
+    """joint_operators::query_key_operators of the folded rows Q (H, hd, d) and K (KV, hd, d) under half-split
+    rotary planes, and family_gram over every atom (h, j, t), t = 0 -> A_hj, t = 1 -> B_hj, through the MPD
+    surface. Returns the factor stacks U, V (d x 2N; atom i in columns 2i, 2i+1), the Gram (N x N) and its
+    entrywise rounding band."""
+    from gamfit.sae import run_parameter_decomposition
+
     H, hd, d = Q.shape
-    KV, P = K.shape[0], hd // 2
-    grp = H // KV
-    U = np.empty((H, P, 2, d, 2))
-    V = np.empty((H, P, 2, d, 2))
-    for h in range(H):
-        g = h // grp
-        for j in range(P):
-            q = Q[h, [j, j + P]]  # 2 x d
-            k = K[g, [j, j + P]]
-            jk = np.stack([-k[1], k[0]])  # J k: (a, b) -> (-b, a)
-            U[h, j, 0] = U[h, j, 1] = q.T
-            V[h, j, 0] = k.T
-            V[h, j, 1] = jk.T
-    N = H * P * 2
-    U = U.transpose(3, 0, 1, 2, 4).reshape(d, 2 * N)
-    V = V.transpose(3, 0, 1, 2, 4).reshape(d, 2 * N)
-    return U, V
+    KV, P = K.shape[0], len(inverse_frequencies)
+    atoms_list = [{"kind": kind, "head": h, "plane": j} for h in range(H) for j in range(P) for kind in ("cosine", "sine")]
+    attention = {"geometry": {"model_dim": d, "n_heads": H, "n_kv_heads": KV, "head_dim": hd},
+                 "rotary": {"pairing": "half_split", "inverse_frequencies": [float(w) for w in inverse_frequencies],
+                            "attention_scaling": 1.0},
+                 "score_scale": 1.0, "query": {"weight": "q", "bias": None}, "key": {"weight": "k", "bias": None},
+                 "value": {"weight": "v", "bias": None}, "output": {"weight": "o", "bias": None},
+                 "query_key_norm": None}
+    # The gains are already folded into Q and K; the value/output rows are not read by the QK operators.
+    out = run_parameter_decomposition(
+        {"schema": "gam.mpd-request", "schema_version": 1,
+         "operation": {"kind": "joint_operators", "attention": attention, "input_gain": None, "context_length": 1.0,
+                       "grams": [atoms_list], "comparisons": []}},
+        {"q": Q.reshape(H * hd, d), "k": K.reshape(KV * hd, d), "v": np.zeros((KV * hd, d)),
+         "o": np.zeros((d, H * hd))})
+    report = out.report["result"]
+    U = np.empty((d, 2 * len(atoms_list)))
+    V = np.empty_like(U)
+    for i, atom in enumerate(atoms_list):
+        factors = report["query_key"][atom["head"]][atom["kind"]][atom["plane"]]
+        U[:, 2 * i:2 * i + 2] = out.arrays[factors["left"]]
+        V[:, 2 * i:2 * i + 2] = out.arrays[factors["right"]]
+    gram = report["grams"][0]
+    return U, V, out.arrays[gram["gram"]], out.arrays[gram["band"]]
 
 
-def gram_from_factors(U, V):
-    N = U.shape[1] // 2
-    return ((U.T @ U) * (V.T @ V)).reshape(N, 2, N, 2).sum(axis=(1, 3))
+def inverse_frequencies(theta, hd):
+    return theta ** (-np.arange(hd // 2) * 2.0 / hd)
 
 
-def selfcheck(D, layer, Q, K, fold, rng):
+def selfcheck(D, layer, Q, K, U, V, fold, rng):
     """Literal HF scoring (raw q/k projections, q/k RMSNorm at the declared scope with eps, gains,
     rotate_half rope) vs (sum_j cos A_hj + sin B_hj) / (r_q[h] r_k[g]) from the factored atoms, on random
     attention-block inputs at query position m, key position n."""
@@ -143,7 +155,6 @@ def selfcheck(D, layer, Q, K, fold, rng):
     eps = D.config["rms_norm_eps"]
     pre = f"model.layers.{layer}.self_attn."
     gamma = D.attn_input_gain(layer) if fold else None
-    U, V = atoms(Q, K)
     x, y = rng.standard_normal(d), rng.standard_normal(d)
     xin, yin = (x, y) if gamma is None else (gamma * x, gamma * y)
     qr = (D(pre + "q_proj.weight") @ xin).reshape(H, hd)
@@ -171,17 +182,15 @@ def selfcheck(D, layer, Q, K, fold, rng):
     return err
 
 
-def analyse_layer(Q, K, layer, with_pairs, theta):
+def analyse_layer(Q, K, G, band, layer, with_pairs, theta):
     H, hd, d = Q.shape
     KV, P = K.shape[0], hd // 2
     grp = H // KV
-    U, V = atoms(Q, K)
-    G = gram_from_factors(U, V)
     N = G.shape[0]
     idx = np.arange(N).reshape(H, P, 2)
 
     eigs, rk = rank_report(G)
-    rec = {"layer": layer, "rank": rk, "actual": spectrum_counts(eigs)}
+    rec = {"layer": layer, "rank": rk, "actual": spectrum_counts(eigs), "gram_band_max": float(band.max())}
     rec["null_heads_independent"] = spectrum_counts(block_null(G, [idx[h].ravel() for h in range(H)]))
     rec["null_planes_independent"] = spectrum_counts(block_null(G, [idx[:, j].ravel() for j in range(P)]))
     rec["null_groups_independent"] = spectrum_counts(
@@ -237,8 +246,7 @@ def random_null(H, KV, hd, d, rng):
     """Same shapes, iid Gaussian weights: what 'no structure' looks like for the head-pair metrics."""
     Q = rng.standard_normal((H, hd, d))
     K = rng.standard_normal((KV, hd, d))
-    U, V = atoms(Q, K)
-    G = gram_from_factors(U, V)
+    G = qk_gram(Q, K, inverse_frequencies(10000.0, hd))[2]
     idx = np.arange(G.shape[0]).reshape(H, hd // 2, 2)
     grp = H // KV
     out = {"actual": spectrum_counts(la.eigvalsh(G)),
@@ -268,8 +276,9 @@ def main():
     for layer in range(D.L):
         tl = time.time()
         Q, K = D.qk(layer, fold)
-        check = max(check, selfcheck(D, layer, Q, K, fold, rng))
-        rec = analyse_layer(Q, K, layer, layer % args.pairs_every == 0, D.theta)
+        U, V, G, band = qk_gram(Q, K, inverse_frequencies(D.theta, D.hd))
+        check = max(check, selfcheck(D, layer, Q, K, U, V, fold, rng))
+        rec = analyse_layer(Q, K, G, band, layer, layer % args.pairs_every == 0, D.theta)
         rec["seconds"] = time.time() - tl
         layers.append(rec)
         a, nh = rec["actual"], rec["null_heads_independent"]
