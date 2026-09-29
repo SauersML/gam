@@ -7,8 +7,10 @@ use crate::parameter_decomposition::module_split::MlpNormalForm;
 use crate::parameter_decomposition::spectral::{
     PlaneRotationError, PlaneRotationRecovery, RotationAmbiguity, RotationClusterKind, recover_plane_rotations,
 };
-use crate::parameter_decomposition::test_support::planted_toys::{MlpToy, hadamard_modules, paired_copy, random_mlp};
-use crate::parameter_decomposition::test_support::{plant, projector_distance, test_governor};
+use crate::parameter_decomposition::test_support::planted_toys::{
+    MlpToy, RANDOM_NULL_SEED, hadamard_modules, paired_copy, random_mlp, rotation_toy,
+};
+use crate::parameter_decomposition::test_support::{projector_distance, test_governor};
 use gam_linalg::decision::projector_error_bar;
 use gam_math::gaussian_activation::GaussianActivation;
 use ndarray::{Array2, s};
@@ -20,15 +22,19 @@ use ndarray::{Array2, s};
 /// planted matrix's own defect.
 #[test]
 fn toy4_rotation_reports_one_plane_and_one_repeated_pair() {
-    let planted = plant(6, &[0.3, 0.3, 1.1], 0, 0x2951_0004);
+    let toy = rotation_toy();
+    let planted = &toy.planted;
     let recovery = recover_plane_rotations(test_governor(), planted.matrix.view()).expect("recovery");
     assert_eq!(recovery.clusters.len(), 2, "{recovery:?}");
     assert_eq!(
         recovery.ambiguities(),
-        vec![RotationAmbiguity::RepeatedCosine { cluster: 1, planes: 2 }, RotationAmbiguity::Winding]
+        vec![RotationAmbiguity::RepeatedCosine { cluster: 1, planes: toy.repeated.2 }, RotationAmbiguity::Winding]
     );
     // Increasing cosine: the 1.1 plane, then the repeated 0.3 pair.
-    for (cluster, (angle, planes, columns)) in recovery.clusters.iter().zip([(1.1_f64, 1, 4..6), (0.3, 2, 0..4)]) {
+    for (cluster, (angle, planes, columns)) in recovery.clusters.iter().zip([
+        (toy.identified_plane.0, 1, toy.identified_plane.1.clone()),
+        (toy.repeated.0, toy.repeated.2, toy.repeated.1.clone()),
+    ]) {
         match &cluster.kind {
             RotationClusterKind::Rotation { planes: found, .. } => assert_eq!(*found, planes),
             other => panic!("expected a rotation cluster, got {other:?}"),
@@ -93,7 +99,7 @@ fn toys_one_two_and_seven_claim_no_plane() {
 
     let (modules, _) = hadamard_modules(2951);
     claims_no_plane(recover_plane_rotations(test_governor(), gelu_linear_part(&modules).view()), "planted modules");
-    let random = random_mlp(7, 64, 16);
+    let random = random_mlp(RANDOM_NULL_SEED, 64, 16);
     let linear = gelu_linear_part(&random);
     claims_no_plane(recover_plane_rotations(test_governor(), linear.view()), "random block");
     let residual = &linear + &Array2::<f64>::eye(16);

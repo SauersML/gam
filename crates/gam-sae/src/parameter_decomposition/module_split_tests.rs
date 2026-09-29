@@ -6,8 +6,11 @@
 use super::*;
 use crate::parameter_decomposition::state::{ObservabilityStep, WeightedObservability};
 use crate::parameter_decomposition::fibre::parameter_fibre;
-use crate::parameter_decomposition::test_support::planted_toys::{MlpToy, cross_edge, hadamard, hadamard_modules, paired_copy, random_mlp};
-use crate::parameter_decomposition::test_support::{plant, test_governor};
+use crate::parameter_decomposition::test_support::planted_toys::{
+    MlpToy, RANDOM_NULL_SEED, cross_edge, hadamard, hadamard_modules, hadamard_modules_truth, paired_copy, paired_copy_truth,
+    random_mlp, rotation_toy,
+};
+use crate::parameter_decomposition::test_support::test_governor;
 use crate::response::interaction::connected_components;
 use ndarray::{Array1, Array2, Axis, array, concatenate, s};
 use rand::rngs::StdRng;
@@ -231,7 +234,7 @@ fn normal_form_merges_opposite_forms_into_the_linear_part() {
 #[test]
 fn toy1_paired_copy_is_a_linear_block() {
     let width = 8;
-    let identity = Array2::<f64>::eye(width);
+    let truth = paired_copy_truth(width);
     let block = Block::of(&paired_copy(width));
     let raw_projector = block.w_in.dot(&block.w_in.t()) * 0.5;
     let raw_pairs = (0..2 * width)
@@ -239,9 +242,9 @@ fn toy1_paired_copy_is_a_linear_block() {
         .filter(|&(i, j)| raw_projector[[i, j]] != 0.0);
     assert_eq!(connected_components(2 * width, raw_pairs).len(), width, "the unmerged graph claims d modules");
     let form = block.normal_form(GaussianActivation::ExactGelu, None);
-    assert_eq!(form.reads.nrows(), 0);
+    assert_eq!(form.reads.nrows(), truth.merged_units);
     assert_eq!(form.cancelled.len(), 2 * width);
-    assert_eq!(form.linear, identity);
+    assert_eq!(form.linear, truth.linear);
     assert!(matches!(form.additive_blocks(test_governor()), Err(ModuleSplitError::NoUnits)));
 
     let readout = array![[0.3, -1.1, 0.4, 0.9, -0.2, 0.7, 0.05, -0.6]];
@@ -431,6 +434,7 @@ fn optimal_split_matches_the_direct_loss_and_bounds_the_native_error() {
 #[test]
 fn toys_two_and_three_modules_and_a_linear_cross_edge() {
     let (toy, truth) = hadamard_modules(2951);
+    let planted = hadamard_modules_truth(&truth);
     let block = Block::of(&toy);
     let outputs = hadamard().slice(s![.., ..;-1]).to_owned();
     let module_one_outputs = outputs.slice(s![..3, ..]).to_owned();
@@ -448,7 +452,7 @@ fn toys_two_and_three_modules_and_a_linear_cross_edge() {
             }],
         )
         .expect("pull back");
-        let expected = if epsilon == 0.0 { 3 } else { 4 };
+        let expected = if epsilon == 0.0 { planted.observable_rank } else { planted.observable_rank_with_cross_edge };
         assert_eq!(observed.spectrum().resolved_rank, expected, "ε = {epsilon}");
     }
 }
@@ -493,7 +497,8 @@ fn laplacian_matches_the_dense_form_and_subsets_are_checked() {
 #[test]
 fn toy4_paired_rotation_is_a_linear_block_with_a_continuous_commutant() {
     let width = 6;
-    let planted = plant(width, &[0.3, 0.3, 1.1], 0, 0x2951_0004);
+    let toy = rotation_toy();
+    let planted = &toy.planted;
     let rotation = &planted.matrix;
     let mut w_in = Array2::<f64>::zeros((2 * width, width));
     w_in.slice_mut(s![..width, ..]).assign(&Array2::<f64>::eye(width));
@@ -523,7 +528,7 @@ fn toy4_paired_rotation_is_a_linear_block_with_a_continuous_commutant() {
     // each entry is one rounded difference.
     let rounding = accumulation_growth(1) * commutator.iter().map(|value| value * value).sum::<f64>().sqrt();
     let fibre = parameter_fibre(test_governor(), &commutator, 2.0 * planted.matrix_defect + rounding).expect("fibre");
-    assert_eq!(fibre.nullity_at_most(), 10);
+    assert_eq!(fibre.nullity_at_most(), toy.commutant_dimension);
     assert!(fibre.nullity_at_most() > width, "a continuous family of splits");
 }
 
@@ -531,7 +536,7 @@ fn toy4_paired_rotation_is_a_linear_block_with_a_continuous_commutant() {
 /// component with no unresolved join, so no module is claimed.
 #[test]
 fn toy7_random_block_claims_no_module() {
-    let block = Block::of(&random_mlp(7, 64, 16));
+    let block = Block::of(&random_mlp(RANDOM_NULL_SEED, 64, 16));
     let form = block.normal_form(GaussianActivation::ExactGelu, None);
     let blocks = form.additive_blocks(test_governor()).expect("blocks");
     assert_eq!(blocks.finest.len(), 1);

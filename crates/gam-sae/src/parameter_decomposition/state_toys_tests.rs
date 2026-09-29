@@ -7,11 +7,9 @@ use crate::parameter_decomposition::state::{
     LinearStateQuotient, ObservabilityLetter, ObservabilityStep, WeightedObservability, resolve_stacked_factor,
 };
 use crate::parameter_decomposition::supports::EvidenceStatus;
-use crate::parameter_decomposition::test_support::planted_toys::{ROUTING_WIDTH, RoutingToy, hadamard};
-use crate::parameter_decomposition::test_support::{plant, test_governor};
+use crate::parameter_decomposition::test_support::planted_toys::{ROUTING_WIDTH, RoutingToy, data_subspace_toy, rotation_toy};
+use crate::parameter_decomposition::test_support::test_governor;
 use ndarray::{Array2, Axis, array, concatenate, s};
-use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
 
 /// Toy 4: a rotation `R` with angles `0.3, 0.3, 1.1` in a hidden orthonormal basis, a
 /// generic readout `c` and the transition `R − I`. The closure of `c` is its Krylov space,
@@ -26,11 +24,12 @@ use rand::{RngExt, SeedableRng};
 /// two dimensions (the stack resolves rank 6).
 #[test]
 fn toy4_rotation_closure_is_the_krylov_space() {
-    let planted = plant(6, &[0.3, 0.3, 1.1], 0, 0x2951_0004);
+    let toy = rotation_toy();
+    let planted = &toy.planted;
     let transition = &planted.matrix - &Array2::<f64>::eye(6);
     let readout = array![[0.7, -0.3, 1.1, 0.4, -0.9, 0.2]];
     let quotient = LinearStateQuotient::close(test_governor(), &[readout.view()], &[transition.view()]).expect("closure");
-    assert_eq!(quotient.chart.nrows(), 4);
+    assert_eq!(quotient.chart.nrows(), toy.krylov_dimension);
     let defect = quotient.section_bounds.upper
         + quotient.readout_bounds[0].upper
         + quotient.quotient_bounds[0].upper
@@ -40,10 +39,10 @@ fn toy4_rotation_closure_is_the_krylov_space() {
         let stacked = concatenate(Axis(0), &[quotient.chart.view(), rows.view()]).expect("stack");
         resolve_stacked_factor(test_governor(), &stacked, defect).expect("rank")
     };
-    let plane = planted.basis.slice(s![.., 4..6]).t().to_owned();
+    let plane = planted.basis.slice(s![.., toy.identified_plane.1.clone()]).t().to_owned();
     let with_plane = stack(plane);
-    assert_eq!(with_plane.resolved_rank, 4, "the 1.1 plane is inside the chart: {:?}", with_plane.singular_values);
-    let repeated = planted.basis.slice(s![.., 0..4]).t().to_owned();
+    assert_eq!(with_plane.resolved_rank, toy.krylov_dimension, "the 1.1 plane is inside the chart: {:?}", with_plane.singular_values);
+    let repeated = planted.basis.slice(s![.., toy.repeated.1.clone()]).t().to_owned();
     let with_repeated = stack(repeated);
     assert_eq!(with_repeated.resolved_rank, 6, "only a slice of the 0.3 space: {:?}", with_repeated.singular_values);
 }
@@ -75,8 +74,11 @@ fn observe(toy: &RoutingToy, letters: &[Array2<f64>]) -> WeightedObservability {
 #[test]
 fn toy5_routing_law_letters_are_gauge_invariant_and_head_letters_are_not() {
     let toy = RoutingToy::new(2951);
+    let truth = RoutingToy::truth();
     let law_letters = |value: &[Array2<f64>], output: &[Array2<f64>]| {
-        vec![identity(), RoutingToy::transport(value, output, &[0, 1]), RoutingToy::transport(value, output, &[2])]
+        let mut letters = vec![identity()];
+        letters.extend(truth.laws.iter().map(|law| RoutingToy::transport(value, output, law)));
+        letters
     };
     let head_letters = |value: &[Array2<f64>], output: &[Array2<f64>]| {
         let mut letters = vec![identity()];
@@ -85,9 +87,10 @@ fn toy5_routing_law_letters_are_gauge_invariant_and_head_letters_are_not() {
     };
     let by_law = observe(&toy, &law_letters(&toy.value, &toy.output));
     let by_head = observe(&toy, &head_letters(&toy.value, &toy.output));
-    assert_eq!(by_law.spectrum().resolved_rank, 3);
-    assert!(matches!(by_law.spectrum().rank_evidence().expect("rank"), EvidenceStatus::Exact { value, .. } if value == 3.0));
-    assert_eq!(by_head.spectrum().resolved_rank, 4);
+    let (per_law, per_head) = (truth.observable_rank_per_law, truth.observable_rank_per_head);
+    assert_eq!(by_law.spectrum().resolved_rank, per_law);
+    assert!(matches!(by_law.spectrum().rank_evidence().expect("rank"), EvidenceStatus::Exact { value, .. } if value == per_law as f64));
+    assert_eq!(by_head.spectrum().resolved_rank, per_head);
 
     let (value, output) = toy.per_head_gauge(5);
     assert_eq!(law_letters(&value, &output), law_letters(&toy.value, &toy.output));
@@ -97,8 +100,8 @@ fn toy5_routing_law_letters_are_gauge_invariant_and_head_letters_are_not() {
     let moved_law = observe(&toy, &law_letters(&value, &output));
     assert_eq!(moved_law.factor, by_law.factor, "the law Gramian is carried exactly");
     let moved_head = observe(&toy, &head_letters(&value, &output));
-    assert_eq!(moved_head.spectrum().resolved_rank, 4);
-    let base_space = by_head.directions.slice(s![..4, ..]).to_owned();
+    assert_eq!(moved_head.spectrum().resolved_rank, per_head);
+    let base_space = by_head.directions.slice(s![..per_head, ..]).to_owned();
     let capture = moved_head.capture(test_governor(), base_space.view()).expect("capture");
     let own = by_head.capture(test_governor(), base_space.view()).expect("capture");
     let smallest = capture.principal_cosines.iter().copied().fold(1.0_f64, f64::min);
@@ -118,11 +121,8 @@ fn toy5_routing_law_letters_are_gauge_invariant_and_head_letters_are_not() {
 /// only modulo `S^⊥`. A direction inside `S` is seen.
 #[test]
 fn toy6_data_gramian_cannot_see_the_orthogonal_complement() {
-    let basis = hadamard();
-    let span = basis.slice(s![..4, ..]).to_owned();
-    let mut rng = StdRng::seed_from_u64(6);
-    let coefficients = Array2::from_shape_simple_fn((256, 4), || f64::from(rng.random_range(-4_i32..=4)));
-    let data = coefficients.dot(&span);
+    let toy = data_subspace_toy(6, 256);
+    let data = &toy.data;
     let observed = WeightedObservability::pull_back(
         test_governor(),
         &[ObservabilityStep {
@@ -131,12 +131,12 @@ fn toy6_data_gramian_cannot_see_the_orthogonal_complement() {
         }],
     )
     .expect("pull back");
-    assert_eq!(observed.spectrum().resolved_rank, 4);
+    assert_eq!(observed.spectrum().resolved_rank, toy.data_rank);
     assert!(matches!(
         observed.spectrum().rank_evidence().expect("rank"),
-        EvidenceStatus::Unresolved { lower, .. } if lower == 4.0
+        EvidenceStatus::Unresolved { lower, .. } if lower == toy.data_rank as f64
     ));
-    let hidden = basis.slice(s![4..5, ..]).to_owned();
+    let hidden = toy.hidden.clone().insert_axis(Axis(0));
     assert_eq!(data.dot(&hidden.t()).iter().fold(0.0_f64, |largest, value| largest.max(value.abs())), 0.0);
     let invisible = observed.capture(test_governor(), hidden.view()).expect("capture");
     match &invisible.energy_fraction {
@@ -145,6 +145,6 @@ fn toy6_data_gramian_cannot_see_the_orthogonal_complement() {
         }
         other => panic!("expected an exact energy fraction, got {other:?}"),
     }
-    let seen = observed.capture(test_governor(), basis.slice(s![0..1, ..])).expect("capture");
+    let seen = observed.capture(test_governor(), toy.span.slice(s![0..1, ..])).expect("capture");
     assert!(seen.energy_fraction.lower_bound().expect("exact") > 0.0);
 }

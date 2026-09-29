@@ -393,7 +393,8 @@ fn toy5_operator_equality_separates_laws_that_share_every_subspace() {
             None => laws.push(vec![head]),
         }
     }
-    assert_eq!(laws, vec![vec![0, 1], vec![2]]);
+    let truth = RoutingToy::truth();
+    assert_eq!(laws, truth.laws);
     for plane in 0..planes {
         for (first, second) in [
             (operators.cosine(0, plane), operators.cosine(2, plane)),
@@ -401,7 +402,7 @@ fn toy5_operator_equality_separates_laws_that_share_every_subspace() {
         ] {
             let comparison = compare_operators(test_governor(), first, second).expect("comparison");
             assert!(comparison.proven_distinct());
-            assert_eq!(comparison.scale, 0.5, "dyadic factors make the least-squares scale exact");
+            assert_eq!(comparison.scale, 1.0 / truth.third_head_scale, "dyadic factors make the least-squares scale exact");
             assert!(comparison.proportionality_residual.lower_bound().expect("exact") <= 0.0);
         }
     }
@@ -418,6 +419,5 @@ fn toy5_operator_equality_separates_laws_that_share_every_subspace() {
     };
     assert_eq!(rank(&[0]), 2);
     assert_eq!(rank(&[1]), 2);
-    assert_eq!(rank(&[0, 1]), 4);
-    assert_eq!(rank(&[2]), 2);
+    assert_eq!(vec![rank(&truth.laws[0]), rank(&truth.laws[1])], truth.law_transport_ranks);
 }

@@ -16,7 +16,12 @@
 //!   one routing law and their value/output transports carry a cross-head `GL(4)`; head 3
 //!   has query `2 Q₁`, the same subspaces but a different law. Its fibre is
 //!   `12 + 16 + 4 = 32` against a declared `12 + 3·4 = 24`.
-//! - **Data-subspace ambiguity** and a **random null** live with their single owners.
+//! - **Data-subspace ambiguity**: data on a 4-dimensional span, a hidden direction off it.
+//! - **Random null**: a dense random GELU block, one module, no fibre, no plane.
+//!
+//! Each constructor has its written-down structure beside it (`*_truth`, `rotation_toy`,
+//! [`RoutingToy::truth`], `data_subspace_toy`), for any engine that must recover exactly the
+//! planted structure.
 //!
 //! Every fixture is dyadic where a test compares tensors exactly, so a gauge move by a
 //! unimodular integer matrix is carried without rounding.
@@ -658,3 +663,159 @@ pub fn product_band(jacobian: &Array2<f64>, tangents: &Array2<f64>) -> f64 {
     let magnitude = jacobian.mapv(f64::abs).dot(&tangents.mapv(f64::abs));
     accumulation_growth(jacobian.ncols()) * magnitude.iter().map(|value| value * value).sum::<f64>().sqrt()
 }
+
+// ------------------------------------------------------------------------------------------
+// The written-down structure of every toy: what a recovery must return exactly.
+// ------------------------------------------------------------------------------------------
+
+/// The paired copy's planted structure on `ℝ^width`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PairedCopyTruth {
+    /// Units left after sign duplicates merge: none.
+    pub merged_units: usize,
+    /// The merged linear part: `I` exactly.
+    pub linear: Array2<f64>,
+    /// The function-level fibre, `d² + d` (`GL(d)` and a bias shift).
+    pub fibre_dimension: usize,
+    /// The declared GELU unit family's continuous orbit: none.
+    pub declared_continuous: usize,
+}
+
+pub fn paired_copy_truth(width: usize) -> PairedCopyTruth {
+    PairedCopyTruth {
+        merged_units: 0,
+        linear: Array2::eye(width),
+        fibre_dimension: width * width + width,
+        declared_continuous: 0,
+    }
+}
+
+/// The planted modules' structure, for the units' module labels `hadamard_modules` returns.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModulesTruth {
+    /// The unit partition, each part sorted, parts sorted.
+    pub partition: Vec<Vec<usize>>,
+    /// Each module's read subspace (rows of `H`) and write subspace (rows of `H` reversed).
+    pub read_spaces: Vec<Array2<f64>>,
+    pub write_spaces: Vec<Array2<f64>>,
+    /// Generic GELU units: no continuous fibre, with or without the cross edge.
+    pub fibre_dimension: usize,
+    /// Rank of module 1's outputs pulled back through the block: its read dimension 3,
+    /// and 4 once a cross edge of any size reads module 2's first direction.
+    pub observable_rank: usize,
+    pub observable_rank_with_cross_edge: usize,
+}
+
+pub fn hadamard_modules_truth(unit_modules: &[usize]) -> ModulesTruth {
+    let reads = hadamard();
+    let writes = reads.slice(s![.., ..;-1]).to_owned();
+    let mut partition = vec![Vec::new(), Vec::new()];
+    for (unit, &module) in unit_modules.iter().enumerate() {
+        partition[module].push(unit);
+    }
+    partition.sort();
+    let spaces = |matrix: &Array2<f64>| vec![matrix.slice(s![..3, ..]).to_owned(), matrix.slice(s![3.., ..]).to_owned()];
+    ModulesTruth {
+        partition,
+        read_spaces: spaces(&reads),
+        write_spaces: spaces(&writes),
+        fibre_dimension: 0,
+        observable_rank: 3,
+        observable_rank_with_cross_edge: 4,
+    }
+}
+
+/// The rotation toy: angles `0.3, 0.3, 1.1` in a hidden basis of `ℝ⁶`.
+pub const ROTATION_ANGLES: [f64; 3] = [0.3, 0.3, 1.1];
+pub const ROTATION_SEED: u64 = 0x2951_0004;
+
+/// The rotation toy's planted matrix and its structure.
+pub struct RotationToy {
+    /// `R = Q B Qᵀ` and the float defects of its factors; plane `k` is basis columns
+    /// `2k..2k + 2`.
+    pub planted: super::Planted,
+    /// The one identified plane: its angle and basis columns.
+    pub identified_plane: (f64, std::ops::Range<usize>),
+    /// The repeated pair: its angle, basis columns and plane count. Its individual planes
+    /// are not determined by `R`.
+    pub repeated: (f64, std::ops::Range<usize>, usize),
+    /// `dim {X : X R = R X} = 2·2² + 2·1²`.
+    pub commutant_dimension: usize,
+    /// The Krylov closure of a generic readout under `R − I`: one pair per distinct
+    /// eigenvalue pair, holding the identified plane and a 2-dimensional slice of the pair.
+    pub krylov_dimension: usize,
+}
+
+pub fn rotation_toy() -> RotationToy {
+    RotationToy {
+        planted: super::plant(6, &ROTATION_ANGLES, 0, ROTATION_SEED),
+        identified_plane: (1.1, 4..6),
+        repeated: (0.3, 0..4, 2),
+        commutant_dimension: 10,
+        krylov_dimension: 4,
+    }
+}
+
+/// The routing toy's structure.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoutingTruth {
+    /// Heads grouped by equal query/key operators.
+    pub laws: Vec<Vec<usize>>,
+    /// Head 3's query/key operators are head 1's times this.
+    pub third_head_scale: f64,
+    /// Rank of each law's summed value/output transport.
+    pub law_transport_ranks: Vec<usize>,
+    /// The function-level fibre: rotary commutant `12`, `GL(4)` of the merged law `16`,
+    /// `GL(2)` of head 3 `4`.
+    pub fibre_dimension: usize,
+    /// What the per-head declared families charge: `12 + 3·4`.
+    pub declared_per_head: usize,
+    /// Observable rank of one step with the readout: per law `3`, per head (over-counted) `4`.
+    pub observable_rank_per_law: usize,
+    pub observable_rank_per_head: usize,
+}
+
+impl RoutingToy {
+    pub fn truth() -> RoutingTruth {
+        RoutingTruth {
+            laws: vec![vec![0, 1], vec![2]],
+            third_head_scale: 2.0,
+            law_transport_ranks: vec![4, 2],
+            fibre_dimension: 32,
+            declared_per_head: 24,
+            observable_rank_per_law: 3,
+            observable_rank_per_head: 4,
+        }
+    }
+}
+
+/// The data-subspace toy: data on the span of rows `0..4` of `H` (integer coefficients, so
+/// every datum is exact) and a hidden direction `v` = row 4, orthogonal to the data. The
+/// data Gramian has rank 4 and null space `S^⊥ ∋ v`; component reads `a + t v` and `a` agree
+/// on every datum for every `t` and disagree off the data.
+#[derive(Clone, Debug)]
+pub struct DataSubspaceToy {
+    /// `samples × 8`.
+    pub data: Array2<f64>,
+    /// `4 × 8`, the data span.
+    pub span: Array2<f64>,
+    /// The hidden direction.
+    pub hidden: Array1<f64>,
+    pub data_rank: usize,
+}
+
+pub fn data_subspace_toy(seed: u64, samples: usize) -> DataSubspaceToy {
+    let basis = hadamard();
+    let span = basis.slice(s![..4, ..]).to_owned();
+    let mut rng = StdRng::seed_from_u64(seed);
+    let coefficients = Array2::from_shape_simple_fn((samples, 4), || f64::from(rng.random_range(-4_i32..=4)));
+    DataSubspaceToy {
+        data: coefficients.dot(&span),
+        span,
+        hidden: basis.row(4).to_owned(),
+        data_rank: 4,
+    }
+}
+
+/// The random null (`random_mlp(7, 64, 16)`): one module, no continuous fibre, no plane.
+pub const RANDOM_NULL_SEED: u64 = 7;

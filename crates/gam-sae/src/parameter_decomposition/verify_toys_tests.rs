@@ -6,15 +6,15 @@
 
 use crate::parameter_decomposition::secant::BandedMatrix;
 use crate::parameter_decomposition::supports::{EvidenceStatus, ExactBasis};
-use crate::parameter_decomposition::test_support::planted_toys::{Ball, dyadic, hadamard};
+use crate::parameter_decomposition::test_support::planted_toys::{Ball, data_subspace_toy, dyadic};
 use crate::parameter_decomposition::test_support::test_governor;
 use crate::parameter_decomposition::verify::{
     CounterfactualContract, FamilyStatus, Tolerance, verify_counterfactual_contract,
 };
 use gam_runtime::resource::MemoryGovernor;
-use ndarray::{Array1, Array2, s};
+use ndarray::{Array1, Array2};
+use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
 
 /// `D(t) x = u (r + t v)ᵀ x` as one logit row, with ball radii: the read, its inner product
 /// with `x` and the write each carried by ball arithmetic.
@@ -42,17 +42,16 @@ struct Toy {
 }
 
 fn toy() -> Toy {
-    let basis = hadamard();
-    let mut rng = StdRng::seed_from_u64(61);
-    let coefficients = Array2::from_shape_simple_fn((32, 4), || f64::from(rng.random_range(-4_i32..=4)));
-    let on_data = coefficients.dot(&basis.slice(s![..4, ..])).rows().into_iter().map(|row| row.to_owned()).collect();
+    let planted = data_subspace_toy(61, 32);
+    let mut rng = StdRng::seed_from_u64(62);
+    let on_data = planted.data.rows().into_iter().map(|row| row.to_owned()).collect();
     let off_data = dyadic(&mut rng, 32, 8, 16, 8.0).rows().into_iter().map(|row| row.to_owned()).collect();
     let vectors = dyadic(&mut rng, 3, 8, 8, 8.0);
     Toy {
         write: vectors.row(0).to_owned(),
         first: vectors.row(1).to_owned(),
         second: vectors.row(2).to_owned(),
-        direction: basis.row(4).to_owned(),
+        direction: planted.hidden,
         on_data,
         off_data,
     }

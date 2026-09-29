@@ -5,8 +5,8 @@
 use super::*;
 use crate::parameter_decomposition::gauge::{HiddenUnits, LinearPassthrough, RotaryQueryKey};
 use crate::parameter_decomposition::test_support::planted_toys::{
-    MlpToy, ROUTING_HEADS, RoutingToy, cross_edge, dyadic, hadamard_modules, paired_copy, product_band, random_mlp,
-    uniform_inputs,
+    MlpToy, RANDOM_NULL_SEED, ROUTING_HEADS, RoutingToy, cross_edge, dyadic, hadamard_modules, hadamard_modules_truth, paired_copy,
+    paired_copy_truth, product_band, random_mlp, uniform_inputs,
 };
 use crate::parameter_decomposition::test_support::test_governor;
 use gam_math::gaussian_activation::GaussianActivation;
@@ -72,10 +72,11 @@ fn a_planted_rank_bounds_the_nullity_from_above() {
 fn toy1_paired_copy_fibre_exceeds_the_declared_census() {
     let width = 8;
     let block = paired_copy(width);
+    let truth = paired_copy_truth(width);
     let inputs = uniform_inputs(2, 120, width, 3.0);
     let (jacobian, formation) = block.jacobian(&inputs);
     let fibre = parameter_fibre(test_governor(), &jacobian, formation).expect("fibre");
-    assert_eq!(fibre.nullity_at_most(), width * width + width);
+    assert_eq!(fibre.nullity_at_most(), truth.fibre_dimension);
 
     // The hand family's tangent at `M = N = I`, `β = 0`: `δW_in = [X; −X]`,
     // `δW_out = [−X, X]`, `δb_in = [y; −y]`, `δb_out = −y`.
@@ -101,8 +102,8 @@ fn toy1_paired_copy_fibre_exceeds_the_declared_census() {
         .expect("units")
         .family();
     let declared = census.orbit_dimension.resolved + census.null_coordinates;
-    assert_eq!(declared, 0);
-    assert_eq!(fibre.undeclared_at_most(declared), width * width + width);
+    assert_eq!(declared, truth.declared_continuous);
+    assert_eq!(fibre.undeclared_at_most(declared), truth.fibre_dimension);
     // The census charges nothing against the unit tensors (`b_out` is outside the family).
     assert_eq!(census.real_coordinates_at_most(), census.parameter_coordinates);
 }
@@ -122,14 +123,15 @@ fn assert_no_continuous_fibre(block: &MlpToy, inputs: &Array2<f64>, context: &st
 /// oracle certifies an exact nullity of zero: the census is the whole fibre here.
 #[test]
 fn toys_two_three_and_seven_have_no_continuous_fibre() {
-    let (mut block, _) = hadamard_modules(2951);
+    let (mut block, modules) = hadamard_modules(2951);
+    assert_eq!(hadamard_modules_truth(&modules).fibre_dimension, 0);
     let inputs = uniform_inputs(3, 150, 8, 3.0);
     assert_no_continuous_fibre(&block, &inputs, "planted modules");
     for epsilon in [1e-6, 1e-3, 1e-1] {
         block.skip = Some(cross_edge(epsilon));
         assert_no_continuous_fibre(&block, &inputs, &format!("cross edge ε = {epsilon}"));
     }
-    let random = random_mlp(7, 64, 16);
+    let random = random_mlp(RANDOM_NULL_SEED, 64, 16);
     assert_no_continuous_fibre(&random, &uniform_inputs(4, 160, 16, 2.0), "random block");
 }
 
@@ -141,9 +143,10 @@ fn toys_two_three_and_seven_have_no_continuous_fibre() {
 #[test]
 fn toy5_routing_law_fibre_exceeds_the_declared_census() {
     let toy = RoutingToy::new(2951);
+    let truth = RoutingToy::truth();
     let (jacobian, formation) = toy.jacobian(test_governor());
     let fibre = parameter_fibre(test_governor(), &jacobian, formation).expect("fibre");
-    assert_eq!(fibre.nullity_at_most(), 32);
+    assert_eq!(fibre.nullity_at_most(), truth.fibre_dimension);
     assert_tangents_span_the_kernel(&jacobian, formation, &toy.fibre_tangents(), &fibre);
 
     let native = toy.native(&toy.value, &toy.output);
@@ -157,8 +160,8 @@ fn toy5_routing_law_fibre_exceeds_the_declared_census() {
             .expect("family");
         declared += family.orbit_dimension.resolved + family.null_coordinates;
     }
-    assert_eq!(declared, 24);
-    assert_eq!(fibre.undeclared_at_most(declared), 8);
+    assert_eq!(declared, truth.declared_per_head);
+    assert_eq!(fibre.undeclared_at_most(declared), truth.fibre_dimension - truth.declared_per_head);
     // Merging heads 1 and 2 into one pass-through of order 4 declares the missing `GL(4)`.
     let merged = LinearPassthrough::new(
         ndarray::concatenate(Axis(0), &[toy.value[0].view(), toy.value[1].view()]).expect("stack"),
