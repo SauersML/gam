@@ -548,7 +548,7 @@ fn unzigzag(index: u64) -> i64 {
 
 /// `zigzag(value) + 1`, the argument of the unsigned prefix code. `i64::MIN` has zigzag index
 /// `u64::MAX`, which leaves no room for the `+ 1`, so it has no codeword.
-fn signed_codeword_argument(value: i64) -> Result<u64, CodecError> {
+pub(crate) fn signed_codeword_argument(value: i64) -> Result<u64, CodecError> {
     zigzag(value).checked_add(1).ok_or_else(|| {
         CodecError::InvalidInput("i64::MIN has no signed prefix codeword".to_string())
     })

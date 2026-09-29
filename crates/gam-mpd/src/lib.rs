@@ -174,5 +174,12 @@ pub mod state;
 // Evidence status and ranked robust supports.
 pub mod supports;
 
+// The theory: certificate soundness, invariance, identification, causal abstraction, code sensitivity.
+pub mod theory;
+
+// Machine checks of the theory's theorems.
+#[cfg(test)]
+mod theory_tests;
+
 // Versioned request and report document shared by pyffi and the CLI.
 pub mod surface;
