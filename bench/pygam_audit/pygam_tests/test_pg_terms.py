@@ -21,8 +21,10 @@ def test_block_width_spline(mcycle):
 def test_block_width_factor(wage):
     m = gamfit.fit(wage, "y ~ factor(edu)")
     nlev = len(np.unique(wage["edu"]))
+    # gamfit's factor() is one coefficient per level under a REML ridge, not pyGAM's
+    # treatment coding (docs/formulas.md, "How categorical terms are estimated").
     w = sum(b.end - b.start for b in m.term_blocks if b.kind != "intercept")
-    assert w == nlev - 1, m.term_blocks
+    assert w == nlev, m.term_blocks
 
 
 def test_block_width_tensor(chicago):
@@ -39,7 +41,8 @@ def test_intercept_only_is_mean(mcycle):
 
 # test_GAM_params::test_linear_term: an unpenalized linear term reproduces OLS
 def test_linear_term_is_ols(mcycle):
-    m = gamfit.fit(mcycle, "y ~ linear(x)")
+    # linear(x) carries a REML shrinkage ridge; the unpenalized slope is double_penalty=false.
+    m = gamfit.fit(mcycle, "y ~ linear(x, double_penalty=false)")
     b = np.polyfit(mcycle["x"], mcycle["y"], 1)
     np.testing.assert_allclose(m.predict(mcycle), np.polyval(b, mcycle["x"]), rtol=1e-6, atol=1e-6)
 
