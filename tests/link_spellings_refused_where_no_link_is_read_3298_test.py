@@ -41,7 +41,7 @@ def _survival_data() -> dict[str, list]:
 )
 def test_the_multinomial_family_refuses_every_link_spelling(formula, options, spelling) -> None:
     data = _multinomial_data()
-    with pytest.raises(gamfit.GamfitError, match="multinomial") as refused:
+    with pytest.raises(gamfit.errors.GamfitError, match="multinomial") as refused:
         gamfit.fit(data, formula, family="multinomial", **options)
     assert spelling in str(refused.value)
     # The same fit without the spelling succeeds.
@@ -57,7 +57,7 @@ def test_the_multinomial_family_refuses_every_link_spelling(formula, options, sp
 )
 def test_the_weibull_survival_likelihood_refuses_every_link_spelling(options, spelling) -> None:
     data = _survival_data()
-    with pytest.raises(gamfit.GamfitError, match="weibull") as refused:
+    with pytest.raises(gamfit.errors.GamfitError, match="weibull") as refused:
         gamfit.fit(data, "Surv(time, event) ~ s(x)", survival_likelihood="weibull", **options)
     assert spelling in str(refused.value)
     gamfit.fit(data, "Surv(time, event) ~ s(x)", survival_likelihood="weibull")
@@ -79,5 +79,5 @@ def test_survival_location_scale_reads_a_flexible_request_from_every_spelling(
     # choice from the formula's name alone, dropped a `flexible(...)` in `link=`
     # beside it, and fitted the plain link.
     data = _survival_data()
-    with pytest.raises(gamfit.GamfitError, match="single-component mixture"):
+    with pytest.raises(gamfit.errors.GamfitError, match="single-component mixture"):
         gamfit.fit(data, formula, survival_likelihood="location-scale", **options)

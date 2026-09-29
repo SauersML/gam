@@ -127,7 +127,11 @@ df = {"time": time, "log_exposure": np.log(exposure),
 
 gamfit.fit(df, "count ~ s(time)",
            family="poisson", link="log", offset="log_exposure")
-gamfit.fit(df, "case ~ s(age)", family="binomial", link="log")  # relative risk
+
+# Relative risk: a probability `exp(eta)` that stays below one.
+age = rng.uniform(20, 70, 400)
+cases = {"age": age, "case": rng.binomial(1, 0.05 * np.exp(0.02 * (age - 20)))}
+gamfit.fit(cases, "case ~ s(age)", family="binomial", link="log")
 ```
 
 Pass the offset column via `offset=`; do not include it on the formula RHS.

@@ -33,9 +33,7 @@ LEVEL = 0.95
 def _beta_and_cov(model):
     summary = model.summary()
     beta = np.asarray([c["estimate"] for c in summary.coefficients], dtype=float)
-    cov = np.asarray(summary.covariance_flat, dtype=float).reshape(
-        summary.covariance_n, summary.covariance_n
-    )
+    cov = np.asarray(summary.covariance, dtype=float)
     return beta, cov
 
 

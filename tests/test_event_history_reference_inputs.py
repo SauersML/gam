@@ -14,7 +14,7 @@ def frontend(monkeypatch):
 
     def fit(*args):
         calls.append(args)
-        return SimpleNamespace(subject_ids=lambda: args[3])
+        return SimpleNamespace(subject_ids=lambda: args[3], inference_notes=lambda: [])
 
     package = ModuleType("event_history_input_contract")
     package.__path__ = []
@@ -22,9 +22,17 @@ def frontend(monkeypatch):
     binding.rust_module = lambda: SimpleNamespace(fit_event_history=fit)
     monkeypatch.setitem(sys.modules, package.__name__, package)
     monkeypatch.setitem(sys.modules, binding.__name__, binding)
+    source = Path(__file__).parents[1] / "gamfit"
+    # The frontend's advisory channel is pure Python: load the real one.
+    warnings_spec = importlib.util.spec_from_file_location(
+        "event_history_input_contract._warnings", source / "_warnings.py"
+    )
+    warnings_module = importlib.util.module_from_spec(warnings_spec)
+    monkeypatch.setitem(sys.modules, warnings_spec.name, warnings_module)
+    warnings_spec.loader.exec_module(warnings_module)
     spec = importlib.util.spec_from_file_location(
         "event_history_input_contract._event_history",
-        Path(__file__).parents[1] / "gamfit" / "_event_history.py",
+        source / "_event_history.py",
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

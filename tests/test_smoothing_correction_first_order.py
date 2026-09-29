@@ -164,8 +164,8 @@ def test_corrected_intervals_cover_the_mean_and_partial_dependence(family) -> No
         }
         for v, truth in truth_pd.items():
             pd = model.partial_dependence(f"s({v})", grid=GRID)
-            est = np.asarray(pd["predicted"], dtype=float)
-            se = np.asarray(pd["standard_error"], dtype=float)
+            est = np.asarray(pd.fit, dtype=float)
+            se = np.asarray(pd.se, dtype=float)
             pd_hits[v].append(np.mean(np.abs(truth - est) <= Z95 * se))
     _assert_nominal_coverage(f"{family} mean", mean_hits)
     # The two terms that carry signal are gated separately, so a shortfall in

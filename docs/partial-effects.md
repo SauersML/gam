@@ -18,8 +18,21 @@ tools that answer them.
 ## Partial effects
 
 ```python
+import numpy as np
 import gamfit
 
+rng = np.random.default_rng(0)
+n = 600
+levels = ["1. < HS Grad", "2. HS Grad", "3. Some College", "4. College Grad"]
+education = rng.choice(levels, n)
+age = rng.uniform(18.0, 80.0, n)
+year = rng.uniform(2003.0, 2009.0, n)
+wage = (
+    80.0 + 20.0 * np.sin(age / 12.0) + 1.5 * (year - 2003.0)
+    + 8.0 * np.array([levels.index(e) for e in education])
+    + rng.normal(0.0, 6.0, n)
+)
+train = {"wage": wage, "year": year, "age": age, "education": list(education)}
 model = gamfit.fit(train, "wage ~ s(year) + s(age) + education")
 effect = model.partial_dependence("s(age)")
 
@@ -30,7 +43,8 @@ effect.simultaneous_lower     # 95% simultaneous band over the whole grid
 effect.simultaneous_upper
 ```
 
-The result is a [`gamfit.results.PartialEffect`](api-reference.md#gamfit.results.PartialEffect).
+Each example on this page simulates its own data, so it runs as pasted. The
+result is a [`gamfit.results.PartialEffect`](api-reference.md#gamfit.results.PartialEffect).
 The term names are those of `model.term_blocks`.
 
 The curve is the term's own contribution to the linear predictor,
@@ -88,6 +102,22 @@ The pointwise intervals are for reading the curve one point at a time.
 A factor term has one effect per level:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 600
+levels = ["1. < HS Grad", "2. HS Grad", "3. Some College", "4. College Grad"]
+education = rng.choice(levels, n)
+age = rng.uniform(18.0, 80.0, n)
+year = rng.uniform(2003.0, 2009.0, n)
+wage = (
+    80.0 + 20.0 * np.sin(age / 12.0) + 1.5 * (year - 2003.0)
+    + 8.0 * np.array([levels.index(e) for e in education])
+    + rng.normal(0.0, 6.0, n)
+)
+train = {"wage": wage, "year": year, "age": age, "education": list(education)}
+model = gamfit.fit(train, "wage ~ s(year) + s(age) + education")
 edu = model.partial_dependence("education")
 edu.labels()                  # ["1. < HS Grad", "2. HS Grad", ...]
 edu.fit, edu.lower, edu.upper
@@ -103,6 +133,14 @@ grid of `n_points` values per axis over the training box. `surface()`
 reshapes any series onto that grid:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(1)
+lon = rng.uniform(-10.0, 10.0, 800)
+lat = rng.uniform(40.0, 60.0, 800)
+y = np.sin(lon / 3.0) * np.cos((lat - 50.0) / 4.0) + rng.normal(0.0, 0.2, 800)
+model = gamfit.fit({"y": y, "lon": lon, "lat": lat}, "y ~ te(lon, lat)")
 surf = model.partial_dependence("te(lon, lat)", n_points=40)
 lon, lat = surf.axis_values          # the swept values of each axis
 fit = surf.surface("fit")            # fit[i, j] is at (lon[i], lat[j])
@@ -121,6 +159,22 @@ the predictor as `z · f(x)`, so `effect.quantity == "coefficient_function"`,
 ### Your own grid
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 600
+levels = ["1. < HS Grad", "2. HS Grad", "3. Some College", "4. College Grad"]
+education = rng.choice(levels, n)
+age = rng.uniform(18.0, 80.0, n)
+year = rng.uniform(2003.0, 2009.0, n)
+wage = (
+    80.0 + 20.0 * np.sin(age / 12.0) + 1.5 * (year - 2003.0)
+    + 8.0 * np.array([levels.index(e) for e in education])
+    + rng.normal(0.0, 6.0, n)
+)
+train = {"wage": wage, "year": year, "age": age, "education": list(education)}
+model = gamfit.fit(train, "wage ~ s(year) + s(age) + education")
 effect = model.partial_dependence("s(age)", grid=np.linspace(20, 60, 41))
 ```
 
@@ -131,6 +185,22 @@ grid, so it refuses a caller grid.
 ## Plotting
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 600
+levels = ["1. < HS Grad", "2. HS Grad", "3. Some College", "4. College Grad"]
+education = rng.choice(levels, n)
+age = rng.uniform(18.0, 80.0, n)
+year = rng.uniform(2003.0, 2009.0, n)
+wage = (
+    80.0 + 20.0 * np.sin(age / 12.0) + 1.5 * (year - 2003.0)
+    + 8.0 * np.array([levels.index(e) for e in education])
+    + rng.normal(0.0, 6.0, n)
+)
+train = {"wage": wage, "year": year, "age": age, "education": list(education)}
+model = gamfit.fit(train, "wage ~ s(year) + s(age) + education")
 axes = model.plot_terms()                    # every non-intercept term
 model.plot_terms(["s(age)", "education"], level=0.99)
 ```
@@ -153,11 +223,17 @@ points to `plot_terms`.
 
 ## CLI
 
+For a model saved from `y ~ x`:
+
 ```bash
-gam partial-effect model.gam --term 's(age)'                    # JSON to stdout
-gam partial-effect model.gam --term 's(age)' --level 0.99 --out age.csv
-gam partial-effect model.gam --term education --grid levels.csv --out edu.json
+gam partial-effect model.gam --term x                           # JSON to stdout
+gam partial-effect model.gam --term x --level 0.99 --out x.csv
+printf 'x\n0.5\n2.0\n' > grid.csv
+gam partial-effect model.gam --term x --grid grid.csv --out x.json
 ```
+
+A smooth or factor term is named the same way, e.g. `--term 's(age)'` or
+`--term education`.
 
 | Option | Meaning |
 | --- | --- |

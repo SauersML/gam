@@ -107,7 +107,7 @@ def test_posterior_mean_obeys_shape(shaped: tuple[str, Any]) -> None:
 
 def test_partial_dependence_obeys_shape(shaped: tuple[str, Any]) -> None:
     shape, m = shaped
-    curve = np.asarray(m.partial_dependence(_term(m), grid=_grid())["predicted"], float)
+    curve = np.asarray(m.partial_dependence(_term(m), grid=_grid()).fit, float)
     assert _worst(curve, shape) >= -_tol(curve), shape
     # The pdep is the plug-in curve minus the intercept, so it is the same
     # shaped function, not a re-centred or re-fitted one.
@@ -160,12 +160,12 @@ def test_monotone_term_beside_a_free_smooth_in_a_poisson_model(seed: int) -> Non
     d = {"t": t, "z": z, "y": rng.poisson(np.exp(eta)).astype(float)}
     m = gamfit.fit(d, "y ~ s(t) + s(z, shape=monotone_decreasing)", family="poisson")
     (term,) = [b.name for b in m.term_blocks if "z" in b.name]
-    curve = np.asarray(m.partial_dependence(term, grid=_grid())["predicted"], float)
+    curve = np.asarray(m.partial_dependence(term, grid=_grid()).fit, float)
     assert _worst(curve, "monotone_decreasing") >= -_tol(curve)
     # Ignoring the shape would show: the free fit overshoots the step.
     free = gamfit.fit(d, "y ~ s(t) + s(z)", family="poisson")
     (free_term,) = [b.name for b in free.term_blocks if "z" in b.name]
     free_curve = np.asarray(
-        free.partial_dependence(free_term, grid=_grid())["predicted"], float
+        free.partial_dependence(free_term, grid=_grid()).fit, float
     )
     assert _worst(free_curve, "monotone_decreasing") < -1e3 * _tol(free_curve)

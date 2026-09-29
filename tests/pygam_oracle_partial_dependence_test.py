@@ -43,7 +43,7 @@ def _intercept(model: Any, data: dict[str, np.ndarray]) -> float:
 
 def _pdep_at_rows(model: Any, term: str, *columns: np.ndarray) -> np.ndarray:
     grid = columns[0] if len(columns) == 1 else np.column_stack(columns)
-    return np.asarray(model.partial_dependence(term, grid=grid)["predicted"], float)
+    return np.asarray(model.partial_dependence(term, grid=grid).fit, float)
 
 
 def _scale_tol(eta: np.ndarray) -> float:
@@ -165,13 +165,13 @@ def test_default_grid_is_linspace_over_training_range(
     data, m = smooth_1d
     default = m.partial_dependence("s(x)")
     expected_grid = np.linspace(data["x"].min(), data["x"].max(), 100)
-    np.testing.assert_allclose(default["grid"], expected_grid, rtol=1e-12)
+    np.testing.assert_allclose(default.x, expected_grid, rtol=1e-12)
     explicit = m.partial_dependence("s(x)", grid=expected_grid)
-    np.testing.assert_array_equal(default["predicted"], explicit["predicted"])
-    np.testing.assert_array_equal(default["standard_error"], explicit["standard_error"])
-    assert default["predicted"].shape == (100,)
-    assert np.all(default["standard_error"] > 0.0)
-    assert m.partial_dependence("s(x)", n_points=37)["predicted"].shape == (37,)
+    np.testing.assert_array_equal(default.fit, explicit.fit)
+    np.testing.assert_array_equal(default.se, explicit.se)
+    assert default.fit.shape == (100,)
+    assert np.all(default.se > 0.0)
+    assert m.partial_dependence("s(x)", n_points=37).fit.shape == (37,)
 
 
 # test_partial_dependence_gives_correct_shape_with_meshgrid
@@ -186,9 +186,9 @@ def test_tensor_pdep_on_meshgrid_matches_rowwise_evaluation() -> None:
     ga, gb = np.meshgrid(np.linspace(0.0, 1.0, 7), np.linspace(0.0, 1.0, 5))
     grid = np.column_stack([ga.ravel(), gb.ravel()])
     out = m.partial_dependence("te(a, b)", grid=grid)
-    assert out["predicted"].shape == (35,)
-    assert np.all(np.isfinite(out["standard_error"]))
-    assert list(out["axes"]) == ["a", "b"]
+    assert out.fit.shape == (35,)
+    assert np.all(np.isfinite(out.se))
+    assert list(out.axes) == ["a", "b"]
     # The meshgrid curve is the same function the rows see: at the training
     # rows it closes the additive identity.
     eta = _eta(m, d)
@@ -211,11 +211,11 @@ def test_pdep_se_is_priced_off_the_published_covariance(
     grid = np.linspace(data["x"].min(), data["x"].max(), 25)
     pdep = m.partial_dependence("s(x)", grid=grid)
     pred = m.predict({"x": grid}, interval=0.95)
-    assert pdep["covariance_source"] == pred["covariance_source"]
+    assert pdep.covariance_source == pred["covariance_source"]
 
     # Delta-method SE sqrt(diag(X_t V_tt X_t')) from the same published matrix.
     design = m.design_matrix({"x": grid, "y": np.zeros_like(grid)})
-    source = pdep["covariance_source"]
+    source = pdep.covariance_source
     cov = (
         design.covariance_smoothing_corrected
         if source == "smoothing-corrected"
@@ -226,4 +226,4 @@ def test_pdep_se_is_priced_off_the_published_covariance(
     xt = np.asarray(design.matrix)[:, block.start : block.end]
     vt = np.asarray(cov)[block.start : block.end, block.start : block.end]
     se = np.sqrt(np.einsum("ij,jk,ik->i", xt, vt, xt))
-    np.testing.assert_allclose(pdep["standard_error"], se, rtol=1e-8)
+    np.testing.assert_allclose(pdep.se, se, rtol=1e-8)
