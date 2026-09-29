@@ -723,7 +723,6 @@ fn sae_manifold_fit_model<'py>(
                 atom_dim,
                 support_k,
                 initial_smoothness: smoothness,
-                max_iter,
                 trust_radius: resolved_learning_rate,
                 random_state,
             },

@@ -24,7 +24,6 @@ pub(crate) struct SupportSparseFitRequest<'a> {
     pub atom_dim: Vec<usize>,
     pub support_k: usize,
     pub initial_smoothness: f64,
-    pub max_iter: usize,
     pub trust_radius: f64,
     pub random_state: u64,
 }
@@ -736,9 +735,6 @@ pub(crate) fn fit_support_sparse_manifold_sae(
         atom_dim: request.atom_dim,
         support_k: request.support_k,
         initial_smoothness: request.initial_smoothness,
-        // `max_iter` is the caller's OUTER smoothing-search budget. The inner fixed
-        // point has no budget: it stops on its certificate or on a proven stall (#2576).
-        max_outer_iter: request.max_iter,
         trust_radius: request.trust_radius,
         random_state: request.random_state,
     })

@@ -7,7 +7,7 @@
 //! ```text
 //! python: open("chart.bin","wb").write(np.ascontiguousarray(X, dtype="<f8").tobytes())
 //! cargo run -p gam-sae --release --example support_real_chart -- \
-//!     chart.bin <rows> <cols> <k_atoms> <top_k> <max_outer_iter>
+//!     chart.bin <rows> <cols> <k_atoms> <top_k>
 //! ```
 //!
 //! `RUST_LOG=info` streams the per-cycle fixed-point telemetry.
@@ -24,21 +24,15 @@ use std::time::Instant;
 fn main() -> Result<(), String> {
     env_logger::init();
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 7 {
+    if args.len() != 6 {
         return Err(
-            "usage: support_real_chart <f64-le.bin> <rows> <cols> <k_atoms> <top_k> <max_outer_iter>"
-                .to_string(),
+            "usage: support_real_chart <f64-le.bin> <rows> <cols> <k_atoms> <top_k>".to_string(),
         );
     }
     let rows: usize = args[2].parse().map_err(|error| format!("rows: {error}"))?;
     let cols: usize = args[3].parse().map_err(|error| format!("cols: {error}"))?;
     let k_atoms: usize = args[4].parse().map_err(|error| format!("k_atoms: {error}"))?;
     let top_k: usize = args[5].parse().map_err(|error| format!("top_k: {error}"))?;
-    // The outer search's budget. The inner fixed point has none: it stops on its
-    // certificate or on a proven stall (#2576).
-    let max_outer_iter: usize = args[6]
-        .parse()
-        .map_err(|error| format!("max_outer_iter: {error}"))?;
     let bytes = std::fs::read(&args[1]).map_err(|error| format!("{}: {error}", args[1]))?;
     if bytes.len() != rows * cols * 8 {
         return Err(format!(
@@ -100,7 +94,6 @@ fn main() -> Result<(), String> {
         target: centered.clone(),
         initial_smoothness: 1.0,
         ard_precisions,
-        max_outer_iter,
         trust_radius: 1.0,
         random_state: 0,
     })

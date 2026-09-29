@@ -313,7 +313,6 @@ pub struct SaeSupportOuterRequest {
     /// log-precision coordinate starts at the geometric mean of those it prices,
     /// and a periodic axis keeps its value ([`SaeSupportArdLayout`]).
     pub ard_precisions: Vec<Vec<f64>>,
-    pub max_outer_iter: usize,
     pub trust_radius: f64,
     pub random_state: u64,
 }
@@ -1603,7 +1602,6 @@ pub fn run_sae_support_outer(
         &rho_upper,
         initial_rho,
         (n_cells, beta_dim),
-        request.max_outer_iter,
     )?;
     let terminal = search.terminal;
     if !terminal.fixed_point.recurred {
@@ -1662,17 +1660,17 @@ struct SupportOuterSearch {
 /// further from the criterion's than its measured resolution allows. The search then
 /// resumes from the certified point on the doubled plan, whose probe noise is `1/√2`
 /// of its predecessor's. Doubling ends where the host cannot store a larger plan
-/// ([`admit_logdet_probe_plan`]) or the caller's outer budget is spent, and either
-/// ending is a typed refusal, never an unchecked fit.
+/// ([`admit_logdet_probe_plan`]), a typed refusal, never an unchecked fit. No count
+/// ends it: each plan's search stops on its own certificate (the outer search has no
+/// iteration default), and the plans double toward a memory bound, so there are
+/// finitely many (#2899 O20).
 fn run_support_outer_search(
     objective: &mut SaeSupportOuterObjective,
     rho_lower: &Array1<f64>,
     rho_upper: &Array1<f64>,
     initial_rho: Array1<f64>,
     (n_cells, beta_dim): (usize, usize),
-    max_outer_iter: usize,
 ) -> Result<SupportOuterSearch, EstimationError> {
-    let budget = max_outer_iter.max(1);
     let mut start = initial_rho;
     let mut iterations = 0usize;
     let mut plans = 1usize;
@@ -1692,8 +1690,7 @@ fn run_support_outer_search(
             .with_disable_fixed_point(true)
             .with_problem_size(n_cells, beta_dim)
             .with_bounds(rho_lower.clone(), rho_upper.clone())
-            .with_initial_rho(start)
-            .with_max_iter(budget - iterations);
+            .with_initial_rho(start);
         let outer = problem.run(&mut *objective, SUPPORT_LAML_CONTEXT)?;
         iterations = iterations.saturating_add(outer.iterations);
         let certificate = outer
@@ -1788,14 +1785,6 @@ fn run_support_outer_search(
                 terminal: validation,
                 iterations,
             });
-        }
-        if iterations >= budget {
-            return Err(outer_error(format!(
-                "support LAML certified a point whose gradient, re-estimated on {seen} probes \
-                 the search never saw, is |Pg| = {gradient_norm:.6e} against band {band:.6e} \
-                 plus search-probe resolution {seen_std_err_norm:.6e} plus standard error \
-                 {std_err_norm:.6e}, and the outer budget of {budget} iterations is spent"
-            )));
         }
         start = outer.rho;
         plans += 1;
@@ -1898,8 +1887,6 @@ pub struct SaeSupportSparseFitRequest<'a> {
     pub support_k: usize,
     /// Initial isotropic smoothing strength seeding the outer LAML search.
     pub initial_smoothness: f64,
-    /// Outer (smoothing-selection) iteration budget.
-    pub max_outer_iter: usize,
     /// Inner coordinate trust radius.
     pub trust_radius: f64,
     /// Deterministic seed for the support routing and the evidence probes.
@@ -2004,7 +1991,6 @@ pub fn fit_sae_support_sparse(
         target: centered,
         initial_smoothness: request.initial_smoothness,
         ard_precisions,
-        max_outer_iter: request.max_outer_iter,
         trust_radius: request.trust_radius,
         random_state: request.random_state,
     })
@@ -2922,7 +2908,6 @@ mod tests {
                 &upper,
                 initial.clone(),
                 size,
-                256,
             ) {
                 Ok(search) => search,
                 Err(error) if format!("{error:?}").contains(inner_saddle_refusal) => {

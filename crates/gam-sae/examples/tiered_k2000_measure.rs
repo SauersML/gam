@@ -173,7 +173,6 @@ fn ring_curved_fit(target: ArrayView2<'_, f64>) -> Result<SaeSupportSparseFit, S
         atom_dim: vec![1; 8],
         support_k: 2,
         initial_smoothness: 1.0,
-        max_outer_iter: 32,
         trust_radius: 1.0,
         random_state: 0xC0FF_EE00_D15E_A5E5,
     })

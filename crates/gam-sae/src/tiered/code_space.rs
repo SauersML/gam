@@ -832,7 +832,6 @@ fn fit_pair_chart_at_seed(
         atom_dim: vec![1usize; n_atoms],
         support_k: 2,
         initial_smoothness: 1.0,
-        max_outer_iter: 32,
         trust_radius: 1.0,
         random_state,
     })?;

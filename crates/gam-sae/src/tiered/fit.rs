@@ -92,8 +92,6 @@ pub struct Tier2SupportConfig {
     pub support_k: usize,
     /// Initial isotropic smoothing strength seeding the outer LAML search.
     pub initial_smoothness: f64,
-    /// Outer (smoothing-selection) iteration budget.
-    pub max_outer_iter: usize,
     /// Inner coordinate trust radius.
     pub trust_radius: f64,
     /// Deterministic seed for the support routing and Hutchinson trace probes.
@@ -108,7 +106,6 @@ impl Default for Tier2SupportConfig {
             n_atoms: 256,
             support_k: 4,
             initial_smoothness: 1.0,
-            max_outer_iter: 64,
             trust_radius: 1.0,
             random_state: 0xC0FF_EE00_D15E_A5E5,
         }
@@ -565,7 +562,6 @@ fn fit_tier2_support(
         atom_dim: vec![config.atom_dim; requested_atoms],
         support_k: config.support_k,
         initial_smoothness: config.initial_smoothness,
-        max_outer_iter: config.max_outer_iter,
         trust_radius: config.trust_radius,
         random_state: config.random_state,
     })?;
@@ -875,7 +871,6 @@ mod fit_tests {
         tiered.tier1.max_epochs = 200;
         tiered.tier2.n_atoms = p + 1;
         tiered.tier2.support_k = 1;
-        tiered.tier2.max_outer_iter = 32;
         let report = fit_tiered(z.view(), &tiered).expect("tiered fit runs");
 
         let tier2 = report.tier2.as_ref().expect("Tier-2 curved refinement ran");
@@ -1042,7 +1037,6 @@ mod fit_tests {
         config.tier2.atom_dim = 1;
         config.tier2.n_atoms = p + 1;
         config.tier2.support_k = 1;
-        config.tier2.max_outer_iter = 32;
 
         let report = fit_tiered(z.view(), &config).expect("tiny two-circle tiered fit runs");
         let tier2 = report
@@ -1152,7 +1146,6 @@ mod fit_tests {
             atom_dim: vec![1; p + 1],
             support_k: 1,
             initial_smoothness: 1.0,
-            max_outer_iter: 32,
             trust_radius: 1.0,
             random_state: 0xC0FF_EE00_D15E_A5E5,
         })
