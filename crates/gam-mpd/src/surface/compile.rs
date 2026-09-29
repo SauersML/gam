@@ -1191,4 +1191,55 @@ mod tests {
         };
         assert!(refused);
     }
+
+    #[test]
+    fn a_path_request_solves_behind_a_norm_and_reports_its_residual() {
+        // y = x + W relu(n(x)) with W (2 × 2) editable; targets reachable by W alone.
+        let tensors: BTreeMap<String, ArrayD<f64>> = BTreeMap::from([
+            ("w".to_string(), array![[0.5, -0.25], [0.1, 0.8]].into_dyn()),
+            ("x".to_string(), array![[1.0, 0.5], [0.3, 2.0]].into_dyn()),
+            ("y".to_string(), array![[1.2, 0.9], [0.1, 2.5]].into_dyn()),
+        ]);
+        let problem = r#"{"kind": "path", "sites": [{"storage": "w", "weight": "w", "bias": null, "editable": true}],
+            "layers": [{"kind": "residual", "layers": [{"kind": "rms_norm", "gain": null, "epsilon": 1e-6},
+                                                       {"kind": "relu"}, {"kind": "linear", "site": 0}]}],
+            "inputs": "x", "targets": "y", "target_radius": 0.0, "off_target": null, "max_iterations": 10}"#;
+        let output = run_parameter_decomposition(&request(problem), &tensors, test_governor()).expect("runs");
+        let MpdResult::Compile(report) = &output.report.result else {
+            panic!("compile result");
+        };
+        assert!(matches!(report.realization, Some(RealizationWire::ExactlyRealized { .. })));
+        let CompileFindings::Path { residual, residual_band, .. } = &report.findings else {
+            panic!("path findings");
+        };
+        let (r, b) = (&output.arrays[residual], &output.arrays[residual_band]);
+        assert!(r.iter().zip(b.iter()).all(|(value, band)| value.abs() <= *band));
+        assert_eq!(report.plan.as_ref().expect("plan").len(), 1);
+    }
+
+    #[test]
+    fn a_query_key_solve_request_sets_the_declared_scores() {
+        let tensors: BTreeMap<String, ArrayD<f64>> = BTreeMap::from([
+            ("w".to_string(), array![[0.8, -0.3], [0.2, 0.9]].into_dyn()),
+            ("q".to_string(), array![[0.8, -0.3]].into_dyn()),
+            ("k".to_string(), array![[0.2, 0.9]].into_dyn()),
+            ("xq".to_string(), array![[1.0, 0.0], [0.3, 1.0]].into_dyn()),
+            ("xk".to_string(), array![[0.5, 1.0], [1.0, -0.4]].into_dyn()),
+        ]);
+        let problem = r#"{"kind": "query_key_solve", "query": "q", "key": "k",
+            "query_rows": {"storage": "w", "row_offset": 0}, "key_rows": {"storage": "w", "row_offset": 1},
+            "rotary": null, "score_scale": 1.0, "queries": "xq", "query_positions": [0, 0],
+            "keys": "xk", "key_positions": [0, 0], "causal": false,
+            "requirements": [[0, 0, 1.05], [0, 1, 3.0], [1, 0, -0.35], [1, 1, -1.0]],
+            "target_radius": 0.0, "max_rounds": 500}"#;
+        let output = run_parameter_decomposition(&request(problem), &tensors, test_governor()).expect("runs");
+        let MpdResult::Compile(report) = &output.report.result else {
+            panic!("compile result");
+        };
+        assert!(matches!(report.realization, Some(RealizationWire::ExactlyRealized { .. })));
+        let CompileFindings::QueryKeySolve { residuals, .. } = &report.findings else {
+            panic!("query/key findings");
+        };
+        assert!(residuals.iter().all(|[value, band]| value.abs() <= *band));
+    }
 }
