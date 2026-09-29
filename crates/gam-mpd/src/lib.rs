@@ -114,6 +114,9 @@ pub mod joint_operators;
 // Tensor registry and the exact residual anchor.
 pub mod lift;
 
+// Residual ReLU MLP stacks over their sources: the exact path rewrite and its two-part code fit.
+pub mod mlp_paths;
+
 // Exact module splits of plain GELU/ReLU MLPs under the worst-case replacement contract, with certified eta.
 pub mod module_split;
 
