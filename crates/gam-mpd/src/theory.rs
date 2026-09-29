@@ -5,7 +5,8 @@
 //! Each theorem below is exercised numerically by `theory_tests`, and each names the owner files
 //! whose behaviour it states. The objects are those of `contract`, `engine` and
 //! `operator_program`; nothing here re-implements them. The only code in this file is the
-//! admissible family of integer codes ([`IntegerCode`]), the robustness criterion for a claim
+//! bound on any adversary's distinguishing advantage ([`adversary_advantage_upper`], Theorem 5d),
+//! the admissible family of integer codes ([`IntegerCode`]), the robustness criterion for a claim
 //! across that family ([`claim_robustness`], Theorem 6), and the quotient-consistency check of an
 //! internal interface ([`quotient_consistency`], Theorem 7).
 //!
@@ -54,8 +55,8 @@
 //! * **(CP) Beta quantile.** The Clopper–Pearson bound rests on statrs' regularized incomplete
 //!   Beta function, whose accuracy is not proven. `contract::clopper_pearson_upper`
 //!   raises the quantile until the computed CDF clears the confidence and steps one float up, so
-//!   the only unproven step is the CDF evaluation. `theory_tests` checks the returned bound
-//!   against an independent log-space binomial tail on a grid.
+//!   the only unproven step is the CDF evaluation. `theory_tests` checks the coverage of an
+//!   independent Clopper–Pearson computed from log-space binomial tails.
 //!
 //! **Theorem 1a (exhaustive certificates).** For a `contract::FamilyKind::Complete`
 //! family under (B), `total_kl`, `max_kl` and the argmax agreement of
@@ -187,9 +188,9 @@
 //! 2 bits (`ℓ(−32768) = 28 > ℓ(−32767) + ℓ(−1) = 26`). Under ω, an operator of `k` entries equal to 8
 //! beside one entry equal to 1 (which pins the lattice) costs `11k + 3` index bits and its split
 //! `[7,…,7,1] + [1,…,1,0]` costs `10k + 4`, so for large `k` the structure-free split was strictly
-//! shorter. The lattice code wrote its indices in ω; on this theorem it now writes them in signed
-//! δ (`codec`'s δ code), and `theory_tests` keeps both the ω counterexample and the δ
-//! subadditivity. Counts and subset cardinalities are still written in ω, whose excess is at most
+//! shorter. On this theorem the program code (`operator_program`) writes lattice indices in signed
+//! δ; the standalone [`super::precision::LatticeCode`] still writes ω, and `theory_tests` keeps both
+//! the ω counterexample and the δ subadditivity. Counts and subset cardinalities are still written in ω, whose excess is at most
 //! 2 bits per row group; a split with a different present pattern per part is therefore covered
 //! only when that excess is outweighed by the saved operator overhead. A split across lattices
 //! (a coarse part plus a fine correction) is not a duplicate: it is multiresolution structure
@@ -352,41 +353,147 @@
 //!
 //! # 5. Why no adversary is needed
 //!
-//! VPD's requirement "every combination of ablations of the unimportant components keeps the output"
-//! is the universally quantified constraint `∀x ∈ X, ∀m ∈ M(x): d(x, m) ≤ ε`. An adversary (PGD over `m`)
-//! only ever produces lower bounds on `sup_m d`: a found violation is a counterexample, and a failed search
-//! proves nothing. The certificates replace the search by a bound on the supremum in three regimes.
+//! VPD's requirement that "any combination of ablations of the unimportant components keeps the
+//! output" is a universally quantified constraint over per-input partial masks,
+//! `∀x ∈ X, ∀m with m_c ∈ [g_c(x), 1]: d(x, m) ≤ ε`, where `g` is the trained importance network. A search
+//! over `m` (PGD) only produces lower bounds on `sup_m d`: a violation it finds refutes the claim, and a
+//! search that fails proves nothing. The guarantee our method gives for each kind of claim is:
 //!
-//! **Theorem 5.**
+//! | claim | guarantee | conditions |
+//! |---|---|---|
+//! | joint program fidelity on a finite domain `X × A` | **exact**: the maximum row KL, the summed KL and the argmax agreement, exhaustively | (B); `X`, `A` declared and finite |
+//! | joint program fidelity on a sampled domain | **statistical**: Clopper–Pearson for a program fixed before the sample, Occam for the selected program, on the unit argmax-disagreement rate and on the mean unit total variation (5d) | (B), (D), (U); only i.i.d. units count; no worst-case KL over the population |
+//! | linear edit family `u ∈ ℝ^m` | **exact**: `‖e(u)‖² ≤ λ* ‖ΔD(u)‖²_G` for every `u`, `λ*` attained, or a refusal with a witness | error linear in `u`; `G`, `K` with assembly bands; stated on the resolved quotient (2f) |
+//! | nonlinear edit family with an enclosure | **sound bound** over every mask box, interiors included | the `secant` and `bounds` enclosures; an unresolved box reports its gap |
+//! | nonlinear edit family without an enclosure | **search-survived**: no certificate, reported with the search that failed to refute it | never promoted to a bound |
 //!
-//! 1. (finite families) For a finite `X × A`, the exhaustive maximum (Theorem 1a) is the supremum: the
-//!    outcome is certified, or refuted with the maximizing `(x, α)` as its witness.
-//! 2. (linear edit families) If the prediction error is linear in the control change `u` and the realized
-//!    edit is `ΔD(u) = Σ_j u_j D_j`, then `‖e(u)‖² ≤ λ* ‖ΔD(u)‖²_G` for every `u ∈ ℝ^m` at once, where
-//!    `λ* = sup{uᵀKu : uᵀGu ≤ 1}` is the top generalized eigenvalue on `range(G)` (`compile::null`, the
-//!    single owner), attained at its witness, and the certificate is refused when `ker G ⊄ ker K`. Every
-//!    mask vector `m ∈ [0, 1]^C` is one `u = 1 − m`, so every combination is covered by one number.
-//! 3. (bounded nonlinear propagation) Where the downstream map is nonlinear, the secant operators of
-//!    `secant` enclose the exact finite change of softmax, RMSNorm, bilinear and gated maps between two
-//!    endpoints, and [`super::bounds::kl_supremum_over_logit_boxes`] bounds `sup KL` over every logit pair in
-//!    two boxes. A box enclosure over a mask box bounds every mask inside it, interiors included.
+//! **Theorem 5 (the guarantees are suprema, not search results).**
 //!
-//! *Proof.* 1 by enumeration. 2: for
-//! `u ∈ range(G)`, scale to `uᵀGu = 1`; for `u ∈ ker G`, `Ku = 0` unless refused, and `K` is positive
-//! semidefinite, so the cross terms vanish. 3: the enclosures are proven over their whole boxes
-//! (`secant`, `bounds` module notes). ∎
+//! 1. (finite) For finite `X × A` the exhaustive maximum (Theorem 1a) is the supremum: the outcome is
+//!    certified, or refuted with the maximizing `(x, α)` as its witness.
+//! 2. (sampled) Theorems 1c and 1d.
+//! 3. (linear) If the prediction error is linear in the control change `u` and the realized edit is
+//!    `ΔD(u) = Σ_j u_j D_j`, then `‖e(u)‖² ≤ λ* ‖ΔD(u)‖²_G` for every `u ∈ ℝ^m` at once, where
+//!    `λ* = sup{uᵀKu : uᵀGu ≤ 1}` is the top generalized eigenvalue on `range(G)`
+//!    ([`super::compile::null::physically_null_supremum`]), attained at its witness, and the certificate is
+//!    refused when `ker G ⊄ ker K`. Every mask vector `m ∈ [0, 1]^C` is one `u = 1 − m`, so every combination
+//!    of partial ablations is covered by one number.
+//! 4. (nonlinear with an enclosure) The secant operators of `secant` enclose the exact finite change of
+//!    softmax, RMSNorm, bilinear and gated maps between two endpoints, and
+//!    [`super::bounds::kl_supremum_over_logit_boxes`] bounds `sup KL` over every logit pair in two boxes, so a
+//!    box enclosure over a mask box bounds every mask inside it.
 //!
-//! **Corollary (adversaries are dominated).** For any adversary that returns some `m` in the declared
-//! family, `d(x, m) ≤` the certified supremum. When the status is `Exact` with a witness, the witness
-//! attains the supremum, so no adversary does better. `theory_tests` runs a random-restart ascent against
-//! the linear and the box certificates and checks both facts.
+//! *Proof.* 1 by enumeration. 2 is Section 1.
+//! 3: for `u ∈ range(G)` scale to `uᵀGu = 1`; for `u ∈ ker G`, `Ku = 0` unless refused, and `K` is positive
+//! semidefinite, so the cross terms vanish. 4: the enclosures are proven over their whole boxes (`secant`,
+//! `bounds` module notes). ∎
+//!
+//! **Corollary (adversaries are dominated).** Any adversary returns some point of the declared domain, so its
+//! value is at most the certified supremum; when the status is `Exact` with a witness, the witness attains it.
+//! `theory_tests` runs random and ascending searches against the linear certificate and sampled points
+//! against the box bound, and checks both facts.
+//!
+//! **Theorem 5b (a global joint claim has no per-input quantifier).** A program `P` asserts
+//! `∀x ∈ X, ∀α ∈ A: KL(F_{ρ(α)}(x) ‖ P_α(x)) ≤ ε`, with `A` a declared set of global edits that does not depend on
+//! `x` or on any trained function. Its truth depends only on `(F, P, ρ, X, A)`.
+//!
+//! *Proof.* The quantifier domain is `X × A`, fixed before the search. `P` states no per-input importance: a
+//! dropped block, a coarsened lattice or a removed plane is removed for every input, so the clean-run
+//! fidelity on `X` already evaluates every input's use of every retained and every removed piece, jointly,
+//! in one program. Whatever `P` computes per input (a softmax route, a gate) is computed by `P` itself and is
+//! part of `P_α(x)`, not a separate assertion. So there is no per-input object (an importance, a permitted
+//! mask box) whose choice an adversary could exploit: an adversary can only choose `(x, α) ∈ X × A`, and
+//! Theorem 5 covers every such choice. VPD's claim instead ranges over `x` and over masks inside `[g(x), 1]`,
+//! a box set by a trained network, so the claim's domain is itself a learned object, and its supremum is not
+//! computed. ∎
+//!
+//! **Theorem 5c (counterexample search as a verifier, CEGAR).** Let a search (any heuristic, PGD included)
+//! propose `(x, α)` outside the current contract's family, and let every proposal be evaluated exactly. The
+//! loop is: the engine minimizes `J` on the contract `(X_k, A_k)`; the verifier checks the returned `P_k`
+//! on the declared `(X, A)`; a refuting `(x, α)` is added as a row, `X_{k+1} = X_k ∪ {x}`, `A_{k+1} = A_k ∪ {α}`.
+//!
+//! 1. A counterexample enters `J` as one more row with the weight of every row. It never enters as a loss
+//!    weighted by an attack budget, and nothing is differentiated through the search.
+//! 2. For finite `(X, A)` the loop ends after at most `|X| + |A|` refinements, and its final statement is the
+//!    exhaustive certificate over all of `(X, A)` (Theorem 5.1), which does not depend on the search.
+//! 3. Where the verifier is a search without an enclosure, the final statement is "search-survived", with
+//!    the search named, and never a bound.
+//! 4. Rows added by the search are not i.i.d. units, so they are excluded from the unit count of Theorems 1c
+//!    and 1d; the population bounds use only the i.i.d. units, or a fresh held-out split.
+//!
+//! *Proof.* 1 and 3 are the loop's definition. 2: each refinement adds a new element of `X` or `A`, so it
+//! cannot repeat; acceptance is by the certificate over the declared domain. 4: Hoeffding's bound needs the
+//! units to be drawn independently of the selection, and an added row is chosen by the search. ∎
+//!
+//! This is why the method does not overfit to the attack. Adversarial training makes the attack's
+//! objective part of the fitted objective, so the fitted decomposition is selected to defeat that attack
+//! at that budget, and a stronger attack finds more (the reported robustness grows worse with the number
+//! of attack steps). Here the attack only chooses which rows are added, and acceptance never consults it:
+//! beating the search does not pass the certificate, and a stronger search can only add rows.
+//!
+//! **Theorem 5d (the adversary's game, won without an adversary).** Fix a declared finite edit family `A`
+//! and a population `μ` of units. In the game `G_k(A)` an adversary plays `k` rounds; in round `j` a unit
+//! `U_j ∼ μ` is drawn fresh, and the adversary, seeing `U_j` and the whole transcript so far, knowing `F`, `P`,
+//! `ρ` and every certificate, with unbounded computation and its own randomness, picks a row `x` of `U_j` and an
+//! edit `α ∈ A`. It then receives one output `y_j`, drawn from `F_{ρ(α)}(x)` in world 0 and from `P_α(x)` in
+//! world 1 (greedy decoding is the case of point masses at the argmax). After `k` rounds it outputs a bit; its
+//! advantage is `|Pr_0[1] − Pr_1[1]|`. Choosing a mask at an input to break the explanation, which is what
+//! VPD's adversary does, is one move of round 1.
+//!
+//! Let `Z*(u) = max_{x ∈ u, α ∈ A} TV(F_{ρ(α)}(x), P_α(x))` and let `Ẑ(u) ≥ Z*(u)` be its certified upper end: the
+//! exhaustive maximum (Theorem 1a) over the unit's rows and `A` of
+//! [`super::bounds::total_variation_over_logit_boxes`], or, for greedy decoding, the unit's disagreement
+//! indicator `ℓ(u)` of 1c (the total variation of two point masses is `1[argmax differs]`). For a continuous
+//! family the per-row maximum comes from 5.3 or 5.4 instead of enumeration. Then:
+//!
+//! 1. (composition) every adversary's advantage in `G_k(A)` is at most `k E_μ[Z*] ≤ k E_μ[Ẑ]`;
+//! 2. (fixed program) with probability at least `1 − δ` over `n` i.i.d. units,
+//!    `E_μ[Ẑ] ≤ Ẑ̄ + √(ln(1/δ)/(2n))`, `Ẑ̄` the sample mean; for greedy decoding the Clopper–Pearson end of 1c
+//!    replaces it;
+//! 3. (selected program) with probability at least `1 − δ`, for the selected `P̂ = dec(m̂)`,
+//!    `E_μ[Ẑ_{P̂}] ≤ Ẑ̄ + √((|m̂| ln 2 + ln(1/δ))/(2n))`;
+//! 4. (the guarantee) so, with probability at least `1 − δ`, no adversary of `G_k(A)`, adaptive and unbounded,
+//!    has advantage above `min(1, k(Ẑ̄ + √((|m̂| ln 2 + ln(1/δ))/(2n))))`, the value
+//!    [`adversary_advantage_upper`] returns (`|m̂| = 0` for 2). Certificates compose in the same currency: failure
+//!    probabilities of separate statistical statements add (a union bound), and total variations along a chain
+//!    of approximations add (the triangle inequality: the native model, its compiled edit, the program).
+//!
+//! *Proof.* 1: let `H_j` answer the first `j` rounds from `P` and the rest from `F`, so `H_0` is world 0 and
+//! `H_k` world 1. `H_{j−1}` and `H_j` differ only in the kernel that answers round `j`; everything after it
+//! (later units, the adversary's later choices, later answers, the output bit) is one Markov kernel applied to
+//! both, and total variation does not increase under a kernel. So `TV(H_{j−1}, H_j)` is at most the expected
+//! total variation of round `j`'s answer given the past, `E[TV(F_{ρ(α_j)}(x_j), P_{α_j}(x_j))]`. `U_j` is drawn
+//! independently of the past and `(x_j, α_j)` lies in `U_j × A`, so that is at most `E_μ[Z*]`. The triangle
+//! inequality over the `k` hybrids gives `k E_μ[Z*]`, and a bit's advantage is at most the total variation of
+//! the transcripts. 2: Hoeffding's inequality for the i.i.d. `[0, 1]`-valued `Ẑ(U_i)`. 3: the union argument of
+//! 1d with Lemma 1b; it needs only values in `[0, 1]`, not indicators. 4: 1 on the event of 2 or 3. ∎
+//!
+//! The computed per-unit maximum over `A` is what makes an adversary unnecessary: its best move in each round
+//! is already enumerated (or bounded, for a continuous family), and the population average is certified by a
+//! bound that holds for every selection rule. `theory_tests` plays random adaptive strategies against the
+//! exact transcript laws and checks 1, checks that the greedy one-round strategy attains `E_μ[Z*]`, and checks
+//! the coverage of 2 and 3 over repeated samples.
+//!
+//! **Theorem 5e (where an adversary still adds power).** Exactly where the game changes:
+//!
+//! 1. (inputs chosen, not drawn) 5d averages over `μ`. For any `t > 0`, `μ{u : Z*(u) > t} ≤ E_μ[Ẑ]/t` (Markov),
+//!    so a search that draws candidates from `μ` finds a unit beyond `t` with probability at most `E_μ[Ẑ]/t`
+//!    per draw and needs at least `t/E_μ[Ẑ]` draws in expectation. A search that optimizes the input itself
+//!    (off `μ`, or onto a set of small `μ`-measure) asks for `sup_x`, which no finite sample certifies.
+//! 2. (edits outside `A`, or a continuous family with neither linear structure nor an enclosure) the
+//!    per-unit maximum is not computed.
+//!
+//! In both cases the search is a verifier in the loop of 5c: its finds become rows, the statement for the
+//! uncovered part stays "search-survived", and nothing else changes. *Proof.* 1 is Markov's inequality applied
+//! to `Z* ≤ Ẑ`, and a geometric count of draws. 2 is the absence of the statements 5.1, 5.3, 5.4 use. ∎
 //!
 //! **What is not guaranteed.** Interventions outside the declared family (other inputs, other edit kinds,
-//! use-specific rather than global edits) are not covered. For a sampled family only the unit
-//! disagreement rate is bounded, at confidence `1 − δ`, and not the population's worst-case KL. The linear
-//! certificate is relative to the chosen edit metric `G` and to the resolved quotient of 2f, and it covers a
-//! nonlinear network's error only to first order unless 3 bounds the remainder. An unresolved box reports its
-//! gap and claims nothing inside it. Every statement assumes (B).
+//! use-specific rather than global edits) are not covered. For a sampled family only unit averages are
+//! bounded (the disagreement rate and the mean unit total variation), at confidence `1 − δ`, and not the
+//! population's worst-case KL (5e.1). The linear certificate is relative to the chosen edit metric `G` and to
+//! the resolved quotient of 2f, and it covers a nonlinear network's error only to first order unless an
+//! enclosure bounds the remainder. An unresolved box reports its gap and claims nothing inside it. Every
+//! statement assumes (B), with `ln` within one ulp and `sqrt` correctly rounded for 5d's bound.
 //!
 //! # 6. Code sensitivity and robust claims
 //!
@@ -430,6 +537,35 @@
 //! A run therefore reports a claim as robust, robustly refuted, or code-dependent with the codes on each side;
 //! a code-dependent claim is a statement about the prior, not about the network.
 //!
+//! **Theorem 6b (what the code decides).** Over the admissible codes:
+//!
+//! *Code-free* (the statement does not read `L`, or holds under every prefix code fixed before the data):
+//!
+//! * every certificate of Sections 1a, 5, 5d.1 and 7: they read `F`, `P`, the bands and the declared family, never `L`;
+//! * the validity of 1c, 1d and 5d.2–4 under any prefix code fixed before the sample. Only the value moves: codes
+//!   `c`, `c′` change the Occam term by at most `√(|L_c(P̂) − L_{c′}(P̂)| ln 2 / (2n))`, since `√(a + b) ≤ √a + √b`;
+//! * the invariances 2a, 2b, 2f and the function side of 2c;
+//! * the duplication penalty 2d, under each code of the family: the proof needs only
+//!   `Δ = max(0, ℓ(q) − ℓ(q + k)) < 25(2^k − 1)`, and `theory_tests` checks it for γ, δ and ω over every
+//!   `|q| ≤ 2^16`, `k < 64`, with the doubling step `ℓ(2w) ≤ ℓ(w) + 2` (γ), `+ 3` (δ), `+ 5` (ω) closing the tail;
+//! * identification in the limit (6.4) and every claim with margin above twice the largest per-candidate length
+//!   gap between the codes (6.3).
+//!
+//! *Code-dependent* (the verdict can flip between admissible codes):
+//!
+//! * the split penalty 2e: it holds under γ and δ and fails under ω, whose worst subadditivity excess is 2 bits;
+//! * any finite-sample selection with margin below the codes' gap, which includes Theorem 3's regime `r ≤ max_c r₀(c)`;
+//! * every number that is a length: `L`, `J`, the value of the Occam term, `r₀`, Lemma 0's step count;
+//! * precision and magnitude trade-offs. With `f = ⌊log₂ n⌋`, `ℓ_γ(n) − ℓ_δ(n) = f − 2⌊log₂(f + 1)⌋`, which is
+//!   unbounded, so a candidate that writes a few large indices (a fine lattice) against one that writes many small
+//!   ones (a coarse lattice with a residual) can be proven under one code and refuted under another.
+//!
+//! Unlike Kolmogorov complexity, no invariance theorem bounds the gap between two admissible codes by a constant:
+//! they are not universal machines, and their difference grows with the magnitudes written. So the code-free list
+//! is exactly what a run may state without naming a code. *Proof.* The first list is Sections 1, 2, 5, 7 read for
+//! their use of `L`, 2d's proof with each code's doubling step, and 6.3–6.4. The second: 2e's counterexample, 6.3's
+//! converse, the definitions, and `ℓ_γ = 2f + 1`, `ℓ_δ = f + 2⌊log₂(f + 1)⌋ + 1`. ∎
+//!
 //! # 7. Quotient consistency of an internal interface
 //!
 //! An internal interface `v` of `P` summarizes the native state `s` at a cut of `F` by
@@ -470,6 +606,32 @@ use super::secant::BandedMatrix;
 use super::supports::{EvidenceStatus, EvidenceStatusError, ExactBasis};
 use std::collections::BTreeMap;
 use std::fmt;
+
+/// Theorem 5d.4: with probability at least `confidence` over the i.i.d. units, no adversary of the
+/// `rounds`-round game has advantage above `min(1, rounds (Ẑ̄ + √((code_bits ln 2 + ln(1/δ))/(2n))))`, where
+/// `unit_upper[i]` is unit `i`'s certified `Ẑ ∈ [0, 1]`, `δ = 1 − confidence`, and `code_bits` is the selected
+/// program's message length (`0` for a program fixed before the units were drawn). Every operation is rounded
+/// up; `ln` is taken within one ulp and then stepped up twice.
+pub fn adversary_advantage_upper(unit_upper: &[f64], code_bits: u64, confidence: f64, rounds: u64) -> Result<f64, TheoryError> {
+    if unit_upper.is_empty() || rounds == 0 {
+        return Err(TheoryError::InvalidInput("the bound needs at least one unit and one round".to_string()));
+    }
+    if !(confidence > 0.0 && confidence < 1.0) {
+        return Err(TheoryError::InvalidInput(format!("a confidence lies in (0, 1); got {confidence}")));
+    }
+    if let Some(index) = unit_upper.iter().position(|value| !(0.0..=1.0).contains(value)) {
+        return Err(TheoryError::InvalidInput(format!("unit {index} has total variation {}", unit_upper[index])));
+    }
+    let n = unit_upper.len() as f64;
+    let total = unit_upper.iter().fold(0.0_f64, |sum, value| (sum + value).next_up());
+    let mean = (total / n).next_up();
+    // `δ` is stepped down, which only raises `ln(1/δ)`; `ln δ < 0`, so its negation is stepped up.
+    let delta = (1.0 - confidence).next_down();
+    let log_inverse_delta = (-delta.ln()).next_up().next_up();
+    let program = (code_bits as f64 * std::f64::consts::LN_2.next_up()).next_up();
+    let radius = (((program + log_inverse_delta).next_up() / (2.0 * n)).next_up().sqrt()).next_up();
+    Ok(((mean + radius).next_up() * rounds as f64).next_up().min(1.0))
+}
 
 /// An integer code of the admissible family of Theorem 6, known by its codeword lengths.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -533,6 +695,8 @@ pub enum ClaimVerdict {
 pub enum TheoryError {
     /// The candidates, the claim and the codes do not pair up.
     Shape(String),
+    /// An argument outside the domain of a bound.
+    InvalidInput(String),
     /// A data-bit interval that is not an ordered pair of nonnegative numbers.
     Interval { candidate: usize, lower: f64, upper: f64 },
     /// Classes read off a banded state whose band is not zero at `row`.
@@ -550,6 +714,7 @@ impl fmt::Display for TheoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Shape(message) => write!(f, "claim robustness: {message}"),
+            Self::InvalidInput(message) => write!(f, "adversary bound: {message}"),
             Self::Interval { candidate, lower, upper } => {
                 write!(f, "claim robustness: candidate {candidate} has data bits [{lower}, {upper}]")
             }
