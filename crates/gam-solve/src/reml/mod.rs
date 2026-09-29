@@ -1010,7 +1010,7 @@ mod tests {
             inner_beta_hint: None,
         };
 
-        cache.store_outer_eval(&rho_key, &eval);
+        cache.store_outer_eval_with_provenance(&rho_key, &eval, None);
 
         let cached = cache
             .cached_outer_eval(&rho_key)
@@ -1052,7 +1052,7 @@ mod tests {
         let armed_key = super::rho_key::sanitized_rhokey(&array![0.25, -1.0]);
         capture::begin_certificate_parts_capture();
         capture::record_certificate_criterion(criterion);
-        cache.store_outer_eval(&armed_key, &eval);
+        cache.store_outer_eval_with_provenance(&armed_key, &eval, None);
         drop(capture::take_certificate_evidence());
 
         capture::begin_certificate_parts_capture();
@@ -1066,7 +1066,7 @@ mod tests {
         );
 
         let disarmed_key = super::rho_key::sanitized_rhokey(&array![0.5, -1.0]);
-        cache.store_outer_eval(&disarmed_key, &eval);
+        cache.store_outer_eval_with_provenance(&disarmed_key, &eval, None);
         assert!(
             cache.cached_outer_eval(&disarmed_key).is_some(),
             "a disarmed request is answered from the cache as before"
@@ -1117,7 +1117,7 @@ mod tests {
         let rho_a = array![0.25, -1.5];
         let key_a = super::rho_key::sanitized_rhokey(&rho_a);
         let eval_a = make_eval(0.25);
-        cache.store_outer_eval(&key_a, &eval_a);
+        cache.store_outer_eval_with_provenance(&key_a, &eval_a, None);
         let hit_a = cache
             .cached_outer_eval(&key_a)
             .expect("stored rho_a must hit");
@@ -1137,7 +1137,7 @@ mod tests {
         let key_b = super::rho_key::sanitized_rhokey(&rho_b);
         assert_ne!(key_a, key_b, "the two rho-keys must differ");
         let eval_b = make_eval(7.0);
-        cache.store_outer_eval(&key_b, &eval_b);
+        cache.store_outer_eval_with_provenance(&key_b, &eval_b, None);
         assert!(
             bits_eq(
                 &cache.cached_outer_eval(&key_b).expect("rho_b must hit"),
@@ -1165,7 +1165,7 @@ mod tests {
             let rho = array![i as f64, -(i as f64)];
             let key = super::rho_key::sanitized_rhokey(&rho);
             let eval = make_eval(i as f64 + 0.123);
-            cache.store_outer_eval(&key, &eval);
+            cache.store_outer_eval_with_provenance(&key, &eval, None);
             keys.push(key);
             evals.push(eval);
         }
@@ -1183,7 +1183,7 @@ mod tests {
         let rho_overflow = array![999.0, -999.0];
         let key_overflow = super::rho_key::sanitized_rhokey(&rho_overflow);
         let eval_overflow = make_eval(42.0);
-        cache.store_outer_eval(&key_overflow, &eval_overflow);
+        cache.store_outer_eval_with_provenance(&key_overflow, &eval_overflow, None);
         assert_eq!(
             cache
                 .outer_eval_lru
@@ -1218,14 +1218,8 @@ mod tests {
         );
     }
 
-    #[test]
-    pub(crate) fn reset_outer_seed_state_clears_pirls_cache() {
-        // Build a minimal logit RemlState, populate the cross-call PIRLS LRU
-        // by evaluating the outer objective at one rho, then verify that
-        // reset_outer_seed_state wipes that LRU (alongside the eval bundle
-        // and warm-start signals). This pins down the cross-attempt
-        // cleanup contract that a budget-bump retry relies on.
-        let y = array![0.0, 1.0, 1.0, 0.0, 0.0, 1.0];
+    fn logit_reset_fixture() -> (Array1<f64>, Array1<f64>, Array2<f64>, Array2<f64>) {
+        let y = array![0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
             [1.0, -1.0, 0.2],
@@ -1234,45 +1228,168 @@ mod tests {
             [1.0, 0.4, -0.3],
             [1.0, 0.9, 0.1],
             [1.0, 1.3, -0.6],
+            [1.0, -0.8, 0.5],
+            [1.0, 0.6, 0.9],
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.1, 0.15], [0.0, 0.15, 0.8],];
-        let rho = array![0.0];
+        (y, w, x, s0)
+    }
+
+    #[test]
+    pub(crate) fn reset_outer_seed_state_drops_the_warm_started_pirls_entries() {
+        // The cross-attempt cleanup contract a restart relies on: a solve
+        // warm-started along the previous trajectory is dropped by the reset,
+        // so the restart solves from its own seed. The cold solve that began
+        // that trajectory is seed-independent and stays (#4595).
+        let (y, w, x, s0) = logit_reset_fixture();
         let cfg = RemlConfig::external(binomial_logit_glm_spec(), 1e-10, false);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-
-        // Trigger a full outer eval so execute_pirls_if_needed inserts at
-        // least one entry into the cross-call PIRLS LRU.
-        state
-            .compute_outer_eval_with_order(
-                &rho,
-                crate::rho_optimizer::OuterEvalOrder::ValueAndGradient,
-            )
-            .expect("outer eval should succeed");
-
-        let populated_len = state
+        // The fit's budget is the design's own size, 192 bytes here, which holds
+        // one solve; this contract needs two resident at once.
+        *state
             .cache_manager
             .pirls_cache
-            .read()
-            .expect("PIRLS cache lock is poisoned: a writer panicked while holding it")
-            .map
-            .len();
-        assert!(
-            populated_len > 0,
-            "evaluating the outer objective should populate the PIRLS LRU, got {populated_len}"
-        );
+            .write()
+            .expect("PIRLS cache lock is poisoned: a writer panicked while holding it") =
+            super::PirlsLruCache::new(usize::MAX);
+        let order = crate::rho_optimizer::OuterEvalOrder::ValueAndGradient;
+        let (cold_rho, warm_rho) = (array![0.0], array![1.3]);
+        state
+            .compute_outer_eval_with_order(&cold_rho, order)
+            .expect("cold eval");
+        state
+            .compute_outer_eval_with_order(&warm_rho, order)
+            .expect("warm-started eval");
+        let keys = |state: &RemlState<'_>| {
+            let cache = state
+                .cache_manager
+                .pirls_cache
+                .read()
+                .expect("PIRLS cache lock is poisoned: a writer panicked while holding it");
+            let mut keys: Vec<Vec<u64>> = cache.map.keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        let cold_key = super::rho_key::sanitized_rhokey(&cold_rho).expect("finite key");
+        let warm_key = super::rho_key::sanitized_rhokey(&warm_rho).expect("finite key");
+        let mut both = vec![cold_key.clone(), warm_key];
+        both.sort();
+        assert_eq!(keys(&state), both, "both solves are cached before the reset");
 
         state.reset_outer_seed_state();
 
-        let cleared_len = state
+        assert_eq!(
+            keys(&state),
+            vec![cold_key],
+            "the reset must drop the warm-started entry and keep only the cold solve"
+        );
+    }
+
+    #[test]
+    pub(crate) fn certificate_reevaluations_after_a_reset_replay_the_cold_solve_4595() {
+        // #4595: the outer certificate re-evaluates the terminal ρ after
+        // `reset_outer_seed_state`, several times. On a non-Gaussian family each
+        // of those used to be a fresh cold P-IRLS solve returning the same bits
+        // (measured: four identical cold solves at the terminal ρ of a 200k-row
+        // probit fit). The cold solve is seed-independent, so the reset keeps
+        // it: the re-evaluations run no solve, and return exactly what a state
+        // that never saw another ρ returns.
+        let (y, w, x, s0) = logit_reset_fixture();
+        let cfg = RemlConfig::external(binomial_logit_glm_spec(), 1e-10, false);
+        let full = crate::rho_optimizer::OuterEvalOrder::ValueGradientHessian;
+        let rho = array![0.4];
+        let solves = |state: &RemlState<'_>| {
+            state
+                .arena
+                .inner_pirls_solve_count
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+
+        let fresh_state = build_logit_state(&y, &w, &x, &s0, &cfg);
+        let fresh = fresh_state
+            .compute_outer_eval_with_order(&rho, full)
+            .expect("fresh eval");
+        let fresh_value = fresh_state.compute_cost(&rho).expect("fresh value");
+
+        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
+        let first = state
+            .compute_outer_eval_with_order(&rho, full)
+            .expect("the terminal evaluation");
+        let after_first = solves(&state);
+        for pass in 0..3 {
+            state.reset_outer_seed_state();
+            let value = state.compute_cost(&rho).expect("value-only re-evaluation");
+            let again = state
+                .compute_outer_eval_with_order(&rho, full)
+                .expect("re-evaluation");
+            assert_eq!(
+                solves(&state),
+                after_first,
+                "re-evaluation {pass} after a reset ran an inner solve instead of replaying the \
+                 cold one"
+            );
+            assert_eq!(value.to_bits(), fresh_value.to_bits(), "value, pass {pass}");
+            assert_eq!(again.cost.to_bits(), first.cost.to_bits(), "cost, pass {pass}");
+            assert_eq!(
+                again.gradient.mapv(f64::to_bits),
+                fresh.gradient.mapv(f64::to_bits),
+                "gradient, pass {pass}"
+            );
+            assert_eq!(
+                again.inner_beta_hint.map(|beta| beta.mapv(f64::to_bits)),
+                fresh.inner_beta_hint.clone().map(|beta| beta.mapv(f64::to_bits)),
+                "the replayed solve must leave the warm start a cold solve leaves, pass {pass}"
+            );
+        }
+        assert_eq!(first.cost.to_bits(), fresh.cost.to_bits());
+        assert_eq!(
+            first.gradient.mapv(f64::to_bits),
+            fresh.gradient.mapv(f64::to_bits)
+        );
+    }
+
+    #[test]
+    pub(crate) fn a_changed_inner_problem_is_not_replayed_across_a_reset_4595() {
+        // The kept solve is the cold solve of ONE problem. A reset after the
+        // problem changed (here the frozen λ-search scale the negative-binomial
+        // alternation re-freezes) must drop it and solve again.
+        let (y, w, x, s0) = logit_reset_fixture();
+        let cfg = RemlConfig::external(binomial_logit_glm_spec(), 1e-10, false);
+        let order = crate::rho_optimizer::OuterEvalOrder::ValueAndGradient;
+        let rho = array![0.4];
+        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
+        state
+            .compute_outer_eval_with_order(&rho, order)
+            .expect("cold eval");
+        let before = state
+            .arena
+            .inner_pirls_solve_count
+            .load(std::sync::atomic::Ordering::Relaxed);
+        state
+            .frozen_dispersion_phi
+            .store(1.5_f64.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        state.reset_outer_seed_state();
+        let len = state
             .cache_manager
             .pirls_cache
             .read()
             .expect("PIRLS cache lock is poisoned: a writer panicked while holding it")
             .map
             .len();
+        assert_eq!(len, 0, "a solve of the previous problem must not survive the reset");
+        state
+            .frozen_dispersion_phi
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        state
+            .compute_outer_eval_with_order(&rho, order)
+            .expect("re-evaluation");
         assert_eq!(
-            cleared_len, 0,
-            "reset_outer_seed_state must clear the cross-call PIRLS LRU; got {cleared_len} entries"
+            state
+                .arena
+                .inner_pirls_solve_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            before + 1,
+            "the re-evaluation must solve again"
         );
     }
 
@@ -5535,15 +5652,77 @@ impl SparseRemlDecision {
 pub(crate) struct PirlsLruCache {
     // Stored tuple: (compacted result, last-touched clock, estimated bytes).
     pub(crate) map: HashMap<Vec<u64>, (Arc<PirlsResult>, u64, usize)>,
+    /// The entries of `map` that are seed-independent solves, each with the
+    /// inner problem it solved (#4595): a cold solve, from no warm start, no
+    /// damping hint and no first-step Gram, that reached a certified minimum.
+    /// Such a solve is a function of its key and that problem alone, so an outer
+    /// restart that forgets the search path may keep it (see
+    /// [`Self::retain_seed_independent`]).
+    pub(crate) seed_independent: HashMap<Vec<u64>, InnerProblemIdentity>,
     pub(crate) byte_budget: usize,
     pub(crate) current_bytes: usize,
     pub(crate) clock: u64,
 }
 
+/// Everything besides ρ that an inner solve at ρ, and the outer evaluation built
+/// on it, read and that can change while one `RemlState` lives (#4595).
+///
+/// The design, response, prior weights, offset, bounds and constraints are fixed
+/// for a state's life, and a penalty surface is replaced only through
+/// `refresh_canonical_penalty_surface`/`reset_surface`, which clear every cache
+/// themselves; the penalty list is still held by identity so an entry can never
+/// outlive the surface it was solved on. What remains mutable is listed here and
+/// compared exactly (`PartialEq`, bits for the scalars), never hashed, so two
+/// equal identities are the same problem.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct InnerProblemIdentity {
+    /// The frozen λ-search nuisance scalars (negative-binomial θ, Tweedie φ,
+    /// Gamma shape, Beta precision, dispersion), as bits; zero is "not frozen".
+    pub(crate) frozen_scales: [u64; 5],
+    pub(crate) mixture_link: Option<gam_problem::MixtureLinkState>,
+    pub(crate) sas_link: Option<SasLinkState>,
+    /// Student-t `(σ, ν)` as bits, for a Student-t likelihood.
+    pub(crate) student_t: Option<(u64, u64)>,
+    pub(crate) rho_prior: gam_problem::RhoPrior,
+    /// The #784 block correction's admission, decision, latch and value band:
+    /// they change the criterion an outer evaluation prices.
+    pub(crate) block_correction: (
+        usize,
+        BlockCorrectionDecision,
+        Option<BlockQuadratureLatch>,
+        Option<u64>,
+    ),
+    pub(crate) penalties: PenaltySurfaceIdentity,
+    /// A staged first-step Gram changes the iterate path, so a cold solve's
+    /// bits, even though not its mode.
+    pub(crate) first_step_gram: Option<ArcIdentity<ndarray::Array2<f64>>>,
+}
+
+/// An `Arc` compared by allocation, and held so the allocation cannot be reused
+/// while the comparison is still possible.
+#[derive(Clone)]
+pub(crate) struct ArcIdentity<T>(pub(crate) Arc<T>);
+
+impl<T> std::fmt::Debug for ArcIdentity<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ArcIdentity({:p})", Arc::as_ptr(&self.0))
+    }
+}
+
+impl<T> PartialEq for ArcIdentity<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+pub(crate) type PenaltySurfaceIdentity =
+    ArcIdentity<Vec<gam_terms::construction::CanonicalPenalty>>;
+
 impl PirlsLruCache {
     pub(crate) fn new(byte_budget: usize) -> Self {
         Self {
             map: HashMap::new(),
+            seed_independent: HashMap::new(),
             byte_budget: byte_budget.max(1),
             current_bytes: 0,
             clock: 0,
@@ -5560,12 +5739,20 @@ impl PirlsLruCache {
         }
     }
 
-    pub(crate) fn insert(&mut self, key: Vec<u64>, value: Arc<PirlsResult>) {
+    /// Insert a solve at `key`, recording it as a seed-independent solve of
+    /// `seed_independent_problem` when it is one.
+    pub(crate) fn insert_with_provenance(
+        &mut self,
+        key: Vec<u64>,
+        value: Arc<PirlsResult>,
+        seed_independent_problem: Option<InnerProblemIdentity>,
+    ) {
         self.clock += 1;
         let bytes = pirls_result_cache_bytes(&value);
         if let Some((_, _, prev_bytes)) = self.map.remove(&key) {
             self.current_bytes = self.current_bytes.saturating_sub(prev_bytes);
         }
+        self.seed_independent.remove(&key);
         while !self.map.is_empty() && self.current_bytes + bytes > self.byte_budget {
             let evict_key = self
                 .map
@@ -5577,16 +5764,59 @@ impl PirlsLruCache {
                     if let Some((_, _, evict_bytes)) = self.map.remove(&k) {
                         self.current_bytes = self.current_bytes.saturating_sub(evict_bytes);
                     }
+                    self.seed_independent.remove(&k);
                 }
                 None => break,
             }
         }
         self.current_bytes += bytes;
+        if let Some(problem) = seed_independent_problem {
+            self.seed_independent.insert(key.clone(), problem);
+        }
         self.map.insert(key, (value, self.clock, bytes));
+    }
+
+    /// Whether the entry at `key` is a seed-independent solve of `problem`.
+    pub(crate) fn is_seed_independent_solve_of(
+        &self,
+        key: &[u64],
+        problem: &InnerProblemIdentity,
+    ) -> bool {
+        self.map.contains_key(key)
+            && self
+                .seed_independent
+                .get(key)
+                .is_some_and(|solved| solved == problem)
+    }
+
+    /// Drop every entry but the seed-independent solves of `problem` (#4595).
+    ///
+    /// An outer restart forgets the search path so that nothing it evaluates
+    /// depends on where an earlier search walked. A warm-started entry does:
+    /// its β came from that walk. A seed-independent solve of the current
+    /// problem does not: it is exactly what the restart's own cold solve at
+    /// that key computes, so keeping it replays the same computation instead
+    /// of repeating it.
+    pub(crate) fn retain_seed_independent(&mut self, problem: &InnerProblemIdentity) {
+        let seed_independent = &self.seed_independent;
+        let mut freed = 0usize;
+        self.map.retain(|key, (_, _, bytes)| {
+            let keep = seed_independent
+                .get(key)
+                .is_some_and(|solved| solved == problem);
+            if !keep {
+                freed += *bytes;
+            }
+            keep
+        });
+        self.current_bytes = self.current_bytes.saturating_sub(freed);
+        let map = &self.map;
+        self.seed_independent.retain(|key, _| map.contains_key(key));
     }
 
     pub(crate) fn clear(&mut self) {
         self.map.clear();
+        self.seed_independent.clear();
         self.current_bytes = 0;
     }
 }
@@ -5653,7 +5883,7 @@ impl PenaltySubspaceCacheKey {
 /// design, so the memo may hold as many bytes as the dense design it
 /// memoizes and no more: at any `n` and any number of outer evaluations it is
 /// one further design-sized store, or the newest solve alone where one solve
-/// outgrows the design (see [`PirlsLruCache::insert`]). The
+/// outgrows the design (see [`PirlsLruCache::insert_with_provenance`]). The
 /// host bound is the governor's stationary per-operation ceiling rather than
 /// live availability, so which evaluations hit the cache never depends on
 /// what else the machine is doing (SPEC-20).
@@ -5761,6 +5991,10 @@ pub(crate) struct OuterEvalLru {
         OuterEval,
         Option<crate::estimate::outer_eval_capture::CertificateEvidence>,
     )>,
+    /// The entries whose evaluation was built on a seed-independent inner solve,
+    /// with the problem it priced (#4595); see
+    /// [`PirlsLruCache::retain_seed_independent`].
+    seed_independent: Vec<(Vec<u64>, InnerProblemIdentity)>,
 }
 
 impl OuterEvalLru {
@@ -5768,6 +6002,7 @@ impl OuterEvalLru {
         Self {
             capacity: capacity.max(1),
             entries: std::collections::VecDeque::new(),
+            seed_independent: Vec::new(),
         }
     }
 
@@ -5789,14 +6024,16 @@ impl OuterEvalLru {
         Some(hit)
     }
 
-    /// Inserts (or refreshes) the eval for `key`, with the certificate evidence the
-    /// evaluation published, as most-recently-used, evicting the least-recently-used
-    /// entry once capacity is exceeded.
-    pub(crate) fn insert_with_evidence(
+    /// Inserts (or refreshes) the eval for `key`, with the certificate evidence
+    /// the evaluation published, as most-recently-used, recording it as built
+    /// on a seed-independent solve of `seed_independent_problem` when it is,
+    /// and evicting the least-recently-used entry once capacity is exceeded.
+    pub(crate) fn insert_with_provenance(
         &mut self,
         key: Vec<u64>,
         eval: OuterEval,
         evidence: Option<crate::estimate::outer_eval_capture::CertificateEvidence>,
+        seed_independent_problem: Option<InnerProblemIdentity>,
     ) {
         if let Some(pos) = self
             .entries
@@ -5805,14 +6042,37 @@ impl OuterEvalLru {
         {
             self.entries.remove(pos);
         }
+        self.seed_independent
+            .retain(|(solved, _)| solved.as_slice() != key.as_slice());
+        if let Some(problem) = seed_independent_problem {
+            self.seed_independent.push((key.clone(), problem));
+        }
         self.entries.push_back((key, eval, evidence));
         while self.entries.len() > self.capacity {
             self.entries.pop_front();
         }
+        let entries = &self.entries;
+        self.seed_independent
+            .retain(|(solved, _)| entries.iter().any(|(k, _, _)| k == solved));
+    }
+
+    /// Drop every entry but those built on a seed-independent solve of
+    /// `problem` (#4595); see [`PirlsLruCache::retain_seed_independent`].
+    pub(crate) fn retain_seed_independent(&mut self, problem: &InnerProblemIdentity) {
+        let seed_independent = &self.seed_independent;
+        self.entries.retain(|(key, _, _)| {
+            seed_independent
+                .iter()
+                .any(|(solved, identity)| solved == key && identity == problem)
+        });
+        let entries = &self.entries;
+        self.seed_independent
+            .retain(|(solved, _)| entries.iter().any(|(k, _, _)| k == solved));
     }
 
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
+        self.seed_independent.clear();
     }
 }
 
@@ -5906,7 +6166,7 @@ impl EvalCacheManager {
     pub(crate) fn cached_outer_eval(&self, key: &Option<Vec<u64>>) -> Option<OuterEval> {
         let key = key.as_ref()?;
         // The LRU is the authoritative multi-slot store; it always contains the
-        // most-recently-stored eval too (kept in sync by `store_outer_eval`), so
+        // most-recently-stored eval too (kept in sync by `store_outer_eval_with_provenance`), so
         // a single LRU probe subsumes the old single-slot fast path while also
         // serving revisited (non-immediate) rho-points. `get` is a tiny linear
         // scan (capacity is `OUTER_EVAL_LRU_CAPACITY`) that promotes the hit to
@@ -5930,16 +6190,64 @@ impl EvalCacheManager {
         Some(eval)
     }
 
-    pub(crate) fn store_outer_eval(&self, key: &Option<Vec<u64>>, eval: &OuterEval) {
+    /// Store an outer evaluation at `key`, priced on `problem` when the caller
+    /// knows it: the entry is marked seed-independent when the inner solve it was
+    /// built on, the PIRLS entry at the same key, is a seed-independent solve of
+    /// that same problem (#4595).
+    pub(crate) fn store_outer_eval_with_provenance(
+        &self,
+        key: &Option<Vec<u64>>,
+        eval: &OuterEval,
+        problem: Option<&InnerProblemIdentity>,
+    ) {
         if let Some(key) = key.clone() {
+            let seed_independent = problem
+                .filter(|problem| {
+                    self.pirls_cache
+                        .read()
+                        .expect("PIRLS result cache lock poisoned")
+                        .is_seed_independent_solve_of(&key, problem)
+                })
+                .cloned();
             // The evidence this evaluation published, if the capture was armed
             // while it ran, travels with it (#3331).
             let evidence = crate::estimate::outer_eval_capture::peek_certificate_evidence();
             self.outer_eval_lru
                 .write()
                 .expect("outer-eval LRU lock is poisoned: a writer panicked while holding it")
-                .insert_with_evidence(key, eval.clone(), evidence);
+                .insert_with_provenance(key, eval.clone(), evidence, seed_independent);
         }
+    }
+
+    /// Forget the search path while keeping every evaluation that does not
+    /// depend on it (#4595): the PIRLS entries and outer evaluations that are
+    /// seed-independent solves of `problem`, and the current bundle when it was
+    /// built on one. Everything else is dropped, as a full restart drops it.
+    pub(crate) fn retain_seed_independent(&self, problem: &InnerProblemIdentity) {
+        let mut pirls = self
+            .pirls_cache
+            .write()
+            .expect("PIRLS result cache lock poisoned");
+        pirls.retain_seed_independent(problem);
+        let mut bundle = self
+            .current_eval_bundle
+            .write()
+            .expect("current eval bundle lock is poisoned: a writer panicked while holding it");
+        let bundle_is_seed_independent = bundle.as_ref().is_some_and(|bundle| {
+            bundle
+                .key
+                .as_ref()
+                .is_some_and(|key| pirls.is_seed_independent_solve_of(key, problem))
+        });
+        if !bundle_is_seed_independent {
+            bundle.take();
+        }
+        drop(bundle);
+        drop(pirls);
+        self.outer_eval_lru
+            .write()
+            .expect("outer-eval LRU lock is poisoned: a writer panicked while holding it")
+            .retain_seed_independent(problem);
     }
 
     pub(crate) fn invalidate_eval_bundle(&self) {

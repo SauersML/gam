@@ -6341,6 +6341,51 @@ impl<'a> RemlState<'a> {
         }
     }
 
+    /// The inner problem an evaluation at ρ solves and prices, besides ρ itself
+    /// (#4595); see [`InnerProblemIdentity`].
+    pub(crate) fn inner_problem_identity(&self) -> InnerProblemIdentity {
+        let bits = |cell: &AtomicU64| cell.load(Ordering::Relaxed);
+        // Each lock is taken and released on its own, never two at once.
+        let decision = *self
+            .block_correction_decision
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let latch = self
+            .block_correction_axis_orders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let value_band = self
+            .block_correction_value_band
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map(f64::to_bits);
+        InnerProblemIdentity {
+            frozen_scales: [
+                bits(&self.frozen_negbin_theta),
+                bits(&self.frozen_tweedie_phi),
+                bits(&self.frozen_gamma_shape),
+                bits(&self.frozen_beta_phi),
+                bits(&self.frozen_dispersion_phi),
+            ],
+            mixture_link: self.runtime_mixture_link_state.clone(),
+            sas_link: self.runtime_sas_link_state,
+            student_t: match self.config.likelihood.student_t_parameters() {
+                Some(Ok((sigma, nu))) => Some((sigma.to_bits(), nu.to_bits())),
+                _ => None,
+            },
+            rho_prior: self.rho_prior.clone(),
+            block_correction: (
+                self.block_correction_admission.load(Ordering::Relaxed),
+                decision,
+                latch,
+                value_band,
+            ),
+            penalties: ArcIdentity(Arc::clone(&self.canonical_penalties)),
+            first_step_gram: self.glm_first_step_gram().map(ArcIdentity),
+        }
+    }
+
     pub(crate) fn reset_outer_seed_state(&self) {
         // When the inner mode is seed-independent, every inner solve, and every
         // outer evaluation built on one, is a function of its key alone, so what
@@ -6348,15 +6393,13 @@ impl<'a> RemlState<'a> {
         // bit: the bundle, the PIRLS LRU, the outer-eval LRU and the warm start
         // that publishes each evaluation's `inner_beta_hint` all survive.
         if !self.inner_mode_is_seed_independent() {
-            self.cache_manager.invalidate_eval_bundle();
-            // Drop cross-call PIRLS LRU entries: a cached β was warm-started
-            // along the previous trajectory, so reusing it on retry would
-            // bit-replay the prior attempt instead of solving from the new seed.
+            // Drop what depends on the previous trajectory: a warm-started β
+            // came from it, so reusing one on a restart would bit-replay the
+            // prior attempt instead of solving from the new seed. A cold solve
+            // of the current problem did not, and is exactly what the restart
+            // would compute again at its key, so it stays (#4595).
             self.cache_manager
-                .pirls_cache
-                .write()
-                .expect("PIRLS result cache lock poisoned")
-                .clear();
+                .retain_seed_independent(&self.inner_problem_identity());
             // The outer is restarting from a fresh seed — the previous
             // trajectory's warm-start signals are calibrated to a different
             // ρ-path and would mislead the predictors. Wipe them so the first
@@ -6366,6 +6409,74 @@ impl<'a> RemlState<'a> {
         // The previous trajectory's adaptive signals would mislead the adaptive
         // warm-start policies of the next one.
         self.clear_warm_start_adaptive_signals();
+    }
+
+    /// Take a cached seed-independent solve at `rho` as the cold solve this
+    /// state would otherwise run there (#4595), with the same effect on the
+    /// state: the warm start, the ρ it was solved at, the inner-progress
+    /// feedback and the damping hint are what a converged solve leaves behind,
+    /// so the evaluations after it proceed exactly as after the solve itself.
+    fn adopt_seed_independent_solve(&self, rho: &Array1<f64>, solved: &PirlsResult) {
+        self.updatewarm_start_from(solved);
+        self.record_warm_start_rho(rho);
+        self.last_inner_iters
+            .store(solved.iteration, Ordering::Relaxed);
+        self.last_inner_converged.store(true, Ordering::Relaxed);
+        if solved.final_lm_lambda.is_finite() && solved.final_lm_lambda > 0.0 {
+            self.last_pirls_lm_lambda
+                .store(solved.final_lm_lambda.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    /// The cached outer evaluation at `rho`, if any. With no warm start held,
+    /// a hit replays the cold solve this state would run at `rho` (#4595), so
+    /// the solve it was built on is adopted as that solve's effect on the state
+    /// ([`Self::adopt_seed_independent_solve`]).
+    pub(crate) fn cached_outer_eval_at(
+        &self,
+        rho: &Array1<f64>,
+        rho_key: &Option<Vec<u64>>,
+    ) -> Result<Option<OuterEval>, EstimationError> {
+        let Some(eval) = self.cache_manager.cached_outer_eval(rho_key) else {
+            return Ok(None);
+        };
+        let no_warm_start = self
+            .warm_start_beta
+            .read()
+            .expect("warm-start beta lock poisoned")
+            .is_none();
+        if no_warm_start && let Some(key) = rho_key {
+            let problem = self.inner_problem_identity();
+            let solved = {
+                let mut cache = self
+                    .cache_manager
+                    .pirls_cache
+                    .write()
+                    .expect("PIRLS result cache lock poisoned");
+                if cache.is_seed_independent_solve_of(key, &problem) {
+                    cache.get(key)
+                } else {
+                    None
+                }
+            };
+            if let Some(solved) = solved {
+                let solved = if solved.cache_compacted {
+                    let mut pirls_config = self.config.as_pirls_config();
+                    pirls_config.link_kind = self.runtime_inverse_link();
+                    Arc::new(solved.rehydrate_after_reml_cache(
+                        self.x(),
+                        self.y,
+                        self.weights,
+                        self.offset.view(),
+                        &pirls_config.link_kind,
+                    )?)
+                } else {
+                    solved
+                };
+                self.adopt_seed_independent_solve(rho, solved.as_ref());
+            }
+        }
+        Ok(Some(eval))
     }
 
     /// Whether the inner mode at a key is a function of that key and the frozen
@@ -7044,34 +7155,48 @@ impl<'a> RemlState<'a> {
             .load(Ordering::Relaxed);
         // Use sanitized key to handle NaN and -0.0 vs 0.0 issues
         let key_opt = self.rhokey_sanitized(rho);
+        // With no warm start held, the solve this call would run is a cold one
+        // (#4595), so a cached seed-independent solve of the current problem IS
+        // that solve; see `adopt_seed_independent_solve`.
+        let cold_problem = self
+            .warm_start_beta
+            .read()
+            .expect("warm-start beta lock poisoned")
+            .is_none()
+            .then(|| self.inner_problem_identity());
         if use_cache
             && let Some(key) = &key_opt
-            && let Some(cached) = {
+            && let Some((cached, replays_cold_solve)) = {
                 let mut cache = self
                     .cache_manager
                     .pirls_cache
                     .write()
                     .expect("PIRLS result cache lock poisoned");
-                cache.get(key)
+                let replays_cold_solve = cold_problem
+                    .as_ref()
+                    .is_some_and(|problem| cache.is_seed_independent_solve_of(key, problem));
+                cache.get(key).map(|cached| (cached, replays_cold_solve))
             }
         {
             // Do not overwrite the current warm start from cache hits.
             // Line search / multi-eval outer loops revisit older rho keys and
             // replacing a recent nearby beta with an older cached mode can
             // materially slow subsequent PIRLS convergence.
-            if cached.cache_compacted {
+            let cached = if cached.cache_compacted {
                 let mut pirls_config = self.config.as_pirls_config();
                 pirls_config.link_kind = self.runtime_inverse_link();
-                return Ok((
-                    Arc::new(cached.rehydrate_after_reml_cache(
-                        self.x(),
-                        self.y,
-                        self.weights,
-                        self.offset.view(),
-                        &pirls_config.link_kind,
-                    )?),
-                    BundleRows::Observed,
-                ));
+                Arc::new(cached.rehydrate_after_reml_cache(
+                    self.x(),
+                    self.y,
+                    self.weights,
+                    self.offset.view(),
+                    &pirls_config.link_kind,
+                )?)
+            } else {
+                cached
+            };
+            if replays_cold_solve {
+                self.adopt_seed_independent_solve(rho, cached.as_ref());
             }
             return Ok((cached, BundleRows::Observed));
         }
@@ -7119,6 +7244,7 @@ impl<'a> RemlState<'a> {
         } else {
             BundleRows::Observed
         };
+        let mut seed_independent_problem: Option<InnerProblemIdentity> = None;
         let pirls_result = {
             let warm_start_holder = self
                 .warm_start_beta
@@ -7179,6 +7305,14 @@ impl<'a> RemlState<'a> {
                 None
             };
             let glm_first_step_handle = staged_glm_first_step_handle.or(flat_glm_first_step_handle);
+            // A solve that starts from no warm start, no damping hint and no
+            // first-step Gram reads nothing the search path left behind: it is
+            // a function of ρ and the problem alone (#4595). The problem is
+            // read here, before the solve can freeze a λ-search scale.
+            if warm_start_ref.is_none() && cached_lambda_bits == 0 && glm_first_step_handle.is_none()
+            {
+                seed_independent_problem = Some(self.inner_problem_identity());
+            }
             let problem = pirls::PirlsProblem {
                 x: &self.x,
                 offset: self.offset.view(),
@@ -7709,7 +7843,11 @@ impl<'a> RemlState<'a> {
                         .pirls_cache
                         .write()
                         .expect("PIRLS result cache lock poisoned")
-                        .insert(key, Arc::new(pirls_result.compact_for_reml_cache()));
+                        .insert_with_provenance(
+                            key,
+                            Arc::new(pirls_result.compact_for_reml_cache()),
+                            seed_independent_problem,
+                        );
                 }
                 Ok((pirls_result, realised_rows))
             }

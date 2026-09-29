@@ -97,7 +97,7 @@ fn sparse_hessian_refusal_is_not_replaced_by_dense_bundle() {
             .pirls_cache
             .write()
             .expect("cache")
-            .insert(key, Arc::new(corrupt));
+            .insert_with_provenance(key, Arc::new(corrupt), None);
         match state.prepare_eval_bundlewithkey(&rho, None) {
             Err(EstimationError::PirlsRowGeometryUnrepresentable {
                 row,
@@ -180,7 +180,7 @@ fn transformed_pirls_frame_reroutes_without_a_second_inner_solve() {
             .pirls_cache
             .write()
             .expect("cache")
-            .insert(key, Arc::new(transformed));
+            .insert_with_provenance(key, Arc::new(transformed), None);
         state.last_inner_iters.store(usize::MAX, Ordering::Relaxed);
         let rerouted = state
             .prepare_eval_bundlewithkey(&rho, None)

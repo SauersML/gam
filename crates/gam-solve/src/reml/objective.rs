@@ -194,7 +194,7 @@ impl<'a> RemlState<'a> {
             );
         }
         let rho_key = self.rhokey_sanitized(p);
-        if let Some(eval) = self.cache_manager.cached_outer_eval(&rho_key) {
+        if let Some(eval) = self.cached_outer_eval_at(p, &rho_key)? {
             log::trace!(
                 "[REML] eval#{} cache hit | cost {:.6e} | elapsed {:.1}ms",
                 cost_call_idx,
@@ -2836,7 +2836,7 @@ impl<'a> RemlState<'a> {
             );
         }
         let rho_key = self.rhokey_sanitized(p);
-        if let Some(eval) = self.cache_manager.cached_outer_eval(&rho_key) {
+        if let Some(eval) = self.cached_outer_eval_at(p, &rho_key)? {
             let gnorm = eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
             log::trace!(
                 "[REML] grad-only cache hit | |g| {:.3e} | elapsed {:.1}ms",
@@ -2945,7 +2945,7 @@ impl<'a> RemlState<'a> {
             );
         }
         let rho_key = self.rhokey_sanitized(p);
-        if let Some(eval) = self.cache_manager.cached_outer_eval(&rho_key) {
+        if let Some(eval) = self.cached_outer_eval_at(p, &rho_key)? {
             let cache_satisfies_request = !allow_second_order || eval.hessian.is_analytic();
             if cache_satisfies_request {
                 let gnorm = eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
@@ -3014,7 +3014,7 @@ impl<'a> RemlState<'a> {
                 t_assemble.elapsed().as_secs_f64() * 1000.0,
                 t_eval_start.elapsed().as_secs_f64() * 1000.0
             );
-            // Deliberately NOT cached into `store_outer_eval`: that cache serves
+            // Deliberately NOT cached into `store_outer_eval_with_provenance`: that cache serves
             // gradient/Hessian-bearing requests, and a gradient-free entry would
             // force a re-evaluation the moment the optimiser asks for a real
             // gradient at the same ρ. A value-only probe is cheap to repeat.
@@ -3087,7 +3087,11 @@ impl<'a> RemlState<'a> {
                 t_eval_start.elapsed().as_secs_f64() * 1000.0
             );
         }
-        self.cache_manager.store_outer_eval(&rho_key, &eval);
+        self.cache_manager.store_outer_eval_with_provenance(
+            &rho_key,
+            &eval,
+            Some(&self.inner_problem_identity()),
+        );
         Ok(eval)
     }
 
