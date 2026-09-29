@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
-use ndarray::{Array2, ArrayView1};
+use ndarray::{Array2, ArrayView1, ArrayView2};
 
 use crate::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
@@ -4608,6 +4608,12 @@ pub(crate) fn build_smooth_basis(
                     } else {
                         TensorBSplinePenaltyDecomposition::MarginalKroneckerSum
                     },
+                    // Sizes nobody chose, on knots the data place without a
+                    // requested domain or placement, are the resolution loop's
+                    // to refine.
+                    adaptive: k_inferred
+                        && domains.iter().all(Option::is_none)
+                        && requested_knot_placement.is_none(),
                 },
             })
         }
@@ -5148,12 +5154,23 @@ pub(crate) fn pilot_univariate_spline_basis_dim(
 /// locations the data occupy, so repeated rows sharpen those values without
 /// adding columns the data can pin down.
 fn heuristic_tensor_margin_knots(cols: &[usize], ds: &Dataset, sizing_rows: usize) -> Vec<usize> {
+    default_tensor_margin_sizes(ds.values.view(), cols, sizing_rows)
+}
+
+/// [`heuristic_tensor_margin_knots`] over the columns `cols` of `data`, sized
+/// for `sizing_rows` observations: the formula default the resolution loop
+/// starts a tensor at (`crate::smooth::starting_resolution`).
+pub(crate) fn default_tensor_margin_sizes(
+    data: ArrayView2<'_, f64>,
+    cols: &[usize],
+    sizing_rows: usize,
+) -> Vec<usize> {
     let caps: Vec<usize> = cols
         .iter()
-        .map(|&c| tensor_margin_support(ds.values.column(c)))
+        .map(|&c| tensor_margin_support(data.column(c)))
         .collect();
     let budget = default_num_centers(sizing_rows, cols.len().max(1))
-        .min(count_unique_coordinate_rows(ds.values.view(), cols));
+        .min(count_unique_coordinate_rows(data, cols));
     tensor_margin_sizes(&caps, budget)
 }
 

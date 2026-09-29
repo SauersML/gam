@@ -88,14 +88,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Floored at the residual β̂ already carries: the refreshed gradient differs
 /// from the reported one only by the scale-induced term, so no band below the
 /// residual already present is reachable however little the scale moved, and a
-/// band below it would refuse every fit. This is the `max(τ, ε)` floor — the
-/// certificate cannot demand more precision than the state it is reading was
-/// produced with. On every accepted path `ε` is already inside the band by
-/// construction, so the floor binds only where a state was minted without a
-/// certificate being evaluated at all.
+/// band below it would refuse every fit. This is the `max(τ, ε + γ_n)` floor —
+/// the certificate cannot demand more precision than the state it is reading
+/// was produced with. The check re-reads `ε` from a freshly evaluated gradient,
+/// an `n`-term accumulation, so a re-read at an unmoved scale differs from the
+/// carried value by up to `γ_n` of the gradient's natural scale (`resolution`,
+/// the same Wilkinson band as [`scale_estimator_resolution`]); without it a
+/// scale that has converged to its own resolution is refused on the last ulps
+/// of the gradient sum.
 fn converged_eta_refresh_band(
     summary: &WorkingModelPirlsResult,
     options: &WorkingModelPirlsOptions,
+    resolution: f64,
 ) -> f64 {
     let tolerance = summary
         .final_kkt_tolerance
@@ -109,7 +113,7 @@ fn converged_eta_refresh_band(
         .state
         .relative_gradient_norm(summary.lastgradient_norm);
     if carried.is_finite() {
-        accepted.max(carried)
+        accepted.max(carried + resolution)
     } else {
         accepted
     }
@@ -1906,7 +1910,7 @@ pub(crate) fn fit_model_for_fixed_rho_configured<'a, X: Into<DesignMatrix> + Clo
             // `k·D(β) + βᵀS_λβ`, so a shape that moved leaves β̂ off-stationary
             // by `|k_new/k_old − 1|·‖S_λβ̂‖`; that residual is not predicted
             // here, it is read off the rebuilt gradient.
-            let band = converged_eta_refresh_band(&working_summary, &options);
+            let band = converged_eta_refresh_band(&working_summary, &options, resolution);
             let reading =
                 certify_converged_eta_scale(&mut working_model, &working_summary, &options)?;
             if multiplier_refresh_certifies(reading.relative_residual, band, relative_change, resolution)
@@ -2017,7 +2021,7 @@ pub(crate) fn fit_model_for_fixed_rho_configured<'a, X: Into<DesignMatrix> + Clo
                 working_model.tweedie_phi_locked = true;
                 // φ rescales the effective penalty, so a φ that moved leaves β̂
                 // off-stationary; read how far at the installed φ.
-                let band = converged_eta_refresh_band(&working_summary, &options);
+                let band = converged_eta_refresh_band(&working_summary, &options, resolution);
                 let reading =
                     certify_converged_eta_scale(&mut working_model, &working_summary, &options)?;
                 if multiplier_refresh_certifies(
@@ -2106,7 +2110,7 @@ pub(crate) fn fit_model_for_fixed_rho_configured<'a, X: Into<DesignMatrix> + Clo
                 .clone()
                 .with_dispersion_phi(refreshed_phi);
             working_model.dispersion_phi_locked = true;
-            let band = converged_eta_refresh_band(&working_summary, &options);
+            let band = converged_eta_refresh_band(&working_summary, &options, resolution);
             let reading =
                 certify_converged_eta_scale(&mut working_model, &working_summary, &options)?;
             if multiplier_refresh_certifies(reading.relative_residual, band, relative_change, resolution)
@@ -2223,7 +2227,7 @@ pub(crate) fn fit_model_for_fixed_rho_configured<'a, X: Into<DesignMatrix> + Clo
             // READ: one working-state evaluation at the unchanged β̂ under the
             // installed φ gives the exact β-score there, and the same KKT
             // certificate decides.
-            let band = converged_eta_refresh_band(&working_summary, &options);
+            let band = converged_eta_refresh_band(&working_summary, &options, resolution);
             let reading =
                 certify_converged_eta_scale(&mut working_model, &working_summary, &options)?;
             if reading.relative_residual <= band {
@@ -2382,7 +2386,7 @@ pub(crate) fn fit_model_for_fixed_rho_configured<'a, X: Into<DesignMatrix> + Clo
             // θ enters the NB2 working response, so its induced residual is read
             // off a working-state evaluation at the unchanged β̂, not predicted
             // from the penalty gradient.
-            let band = converged_eta_refresh_band(&working_summary, &options);
+            let band = converged_eta_refresh_band(&working_summary, &options, resolution);
             let reading =
                 certify_converged_eta_scale(&mut working_model, &working_summary, &options)?;
             if reading.relative_residual <= band {

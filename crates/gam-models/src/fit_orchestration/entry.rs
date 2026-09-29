@@ -2644,9 +2644,9 @@ fn chain_proposal(
     let mut point = current.clone();
     let mut proposal = None;
     loop {
-        let next = gam_terms::smooth::refined_adaptive_resolution(&point);
+        let next = gam_terms::smooth::refined_adaptive_resolution(&point, support);
         let added = width(&next).saturating_sub(base);
-        if !next.exceeds(&point) || next.exceeds(support) || added > spare_rank {
+        if !next.exceeds(&point) || added > spare_rank {
             break;
         }
         point = next;
@@ -2756,6 +2756,7 @@ mod adaptive_spatial_resolution_tests {
             AdaptiveResolution::InternalKnots(k) => k + 4,
             AdaptiveResolution::Centers(c) | AdaptiveResolution::PeriodicBasis(c) => *c,
             AdaptiveResolution::HarmonicDegree(l) => l * (l + 2),
+            AdaptiveResolution::TensorIntervals(m) => m.iter().map(|m| m + 1).product(),
         }
     }
 
@@ -2799,6 +2800,33 @@ mod adaptive_spatial_resolution_tests {
         assert_eq!(
             chain_proposal(&Centers(4096), &Centers(9000), 0, 100_000, width),
             Some((Centers(8192), 4096))
+        );
+    }
+
+    /// A tensor splits the margins its covariates still resolve and holds the
+    /// saturated one, so the proposal stays nested.
+    #[test]
+    fn tensor_chain_splits_only_the_margins_that_resolve() {
+        use AdaptiveResolution::TensorIntervals;
+        assert_eq!(
+            chain_proposal(
+                &TensorIntervals(vec![4, 6]),
+                &TensorIntervals(vec![7, 40]),
+                0,
+                1000,
+                width
+            ),
+            Some((TensorIntervals(vec![4, 12]), 30))
+        );
+        assert_eq!(
+            chain_proposal(
+                &TensorIntervals(vec![4, 6]),
+                &TensorIntervals(vec![7, 11]),
+                0,
+                1000,
+                width
+            ),
+            None
         );
     }
 

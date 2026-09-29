@@ -1,5 +1,14 @@
 use super::*;
 
+/// The standard workflow's per-term adaptive resolution plan and the
+/// observations each row carries, which size the pilot a missing entry starts
+/// at ([`gam_terms::smooth::smooth_identification_rows`]).
+#[derive(Clone, Copy)]
+pub(crate) struct AdaptivePlan<'a> {
+    pub(crate) resolutions: &'a [Option<gam_terms::smooth::AdaptiveResolution>],
+    pub(crate) observations: ArrayView1<'a, f64>,
+}
+
 /// Canonical termspec lowering path: formula DSL builds the initial
 /// `SmoothBasisSpec`, then any `gamfit.fit(..., smooths={...})` Python
 /// override registry entry whose `feature_cols` match the term's column set
@@ -16,7 +25,7 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
     inference_notes: &mut FitNotes,
     scale_dimensions: bool,
     smooth_overrides: Option<&JsonValue>,
-    adaptive_resolution: Option<&[Option<gam_terms::smooth::AdaptiveResolution>]>,
+    adaptive_resolution: Option<AdaptivePlan<'_>>,
 ) -> Result<TermCollectionSpec, WorkflowError> {
     let mut spec = build_termspec(terms, data, col_map, inference_notes)?;
     if scale_dimensions {
@@ -61,7 +70,7 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
 fn apply_adaptive_resolution_plan(
     spec: &mut TermCollectionSpec,
     data: &Dataset,
-    plan: &[Option<gam_terms::smooth::AdaptiveResolution>],
+    plan: AdaptivePlan<'_>,
 ) -> Result<(), WorkflowError> {
     use gam_terms::smooth::{
         adaptive_refinement_can_nest, adaptive_resolution_of, apply_adaptive_resolution,
@@ -74,14 +83,19 @@ fn apply_adaptive_resolution_plan(
         if adaptive_resolution_of(&term.basis).is_none() {
             continue;
         }
-        let requested = plan.get(term_index).cloned().flatten();
+        let requested = plan.resolutions.get(term_index).cloned().flatten();
         // A basis whose refinement does not nest is never grown by the loop
         // (#3331), so it keeps its provisioned default: started at the pilot it
         // could never leave, it would only lose resolution (#3149).
         if requested.is_none() && !adaptive_refinement_can_nest(&term.basis) {
             continue;
         }
-        let start = starting_resolution(&term.basis, data.values.view()).ok_or_else(|| {
+        let start = starting_resolution(
+            &term.basis,
+            data.values.view(),
+            Some(plan.observations),
+        )
+        .ok_or_else(|| {
             WorkflowError::InvalidConfig {
                 reason: format!(
                     "adaptive smooth term '{}' has no starting resolution on these data",
@@ -92,7 +106,7 @@ fn apply_adaptive_resolution_plan(
         let target = requested.unwrap_or_else(|| start.clone());
         // Applied even when the count already equals the target: the start is
         // the root the refinement chain grows from, and the spec records it.
-        apply_adaptive_resolution(&mut term.basis, &start, &target).map_err(
+        apply_adaptive_resolution(&mut term.basis, data.values.view(), &start, &target).map_err(
             |error| WorkflowError::InvalidConfig {
                 reason: format!(
                     "failed to set the adaptive resolution of smooth term '{}': {error}",

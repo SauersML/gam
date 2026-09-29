@@ -1849,7 +1849,7 @@ fn multidimensional_duchon_default_is_provisioned_and_the_loop_starts_it_at_its_
         DuchonNullspaceOrder::Degree(degree) => crate::basis::duchon_nullspace_dimension(2, degree),
     };
     assert_eq!(
-        crate::smooth::starting_resolution(basis, ds.values.view()),
+        crate::smooth::starting_resolution(basis, ds.values.view(), None),
         Some(crate::smooth::AdaptiveResolution::Centers(starting_num_centers(
             500,
             2,
@@ -1894,13 +1894,67 @@ fn default_bspline_is_provisioned_and_the_loop_starts_it_at_its_pilot_3149() {
     };
     assert_eq!(internal + spec.degree + 1, 12, "the provisioned default s(x) at n = 10 000");
     assert_eq!(
-        crate::smooth::starting_resolution(basis, ds.values.view()),
+        crate::smooth::starting_resolution(basis, ds.values.view(), None),
         Some(crate::smooth::AdaptiveResolution::InternalKnots(
             pilot_internal_knots(n, DEFAULT_BSPLINE_DEGREE, DEFAULT_PENALTY_ORDER)
         ))
     );
     assert_eq!(pilot_internal_knots(n, DEFAULT_BSPLINE_DEGREE, DEFAULT_PENALTY_ORDER) + DEFAULT_BSPLINE_DEGREE + 1, 24);
     assert_eq!(pilot_internal_knots(1_000, DEFAULT_BSPLINE_DEGREE, DEFAULT_PENALTY_ORDER) + DEFAULT_BSPLINE_DEGREE + 1, 12);
+}
+
+/// A row carrying `w` observations starts the loop where `w` replicated rows
+/// do, for a univariate spline and a tensor alike, so frequency weights and
+/// duplication reach the same basis; a zero-observation row counts for nothing.
+#[test]
+fn weighted_rows_start_the_loop_where_their_replication_does() {
+    let n = 300;
+    let rows: Vec<Vec<f64>> = (0..n)
+        .map(|i| {
+            let x = i as f64 / (n - 1) as f64;
+            let z = ((i * 7919) % n) as f64 / n as f64;
+            vec![(6.0 * x).sin() + z, x, z]
+        })
+        .collect();
+    let counts: Vec<f64> = (0..n).map(|i| (i % 3) as f64 + 1.0).collect();
+    let replicated: Vec<Vec<f64>> = rows
+        .iter()
+        .zip(&counts)
+        .flat_map(|(row, &c)| std::iter::repeat_n(row.clone(), c as usize))
+        .collect();
+    let weighted = continuous_dataset(&["y", "x", "z"], rows);
+    let repeated = continuous_dataset(&["y", "x", "z"], replicated);
+    let observations = Array1::from(counts);
+    for formula in ["y ~ s(x)", "y ~ te(x, z)"] {
+        let parsed = parse_formula(formula).expect("parse");
+        let basis_of = |ds: &Dataset| {
+            build_termspec(&parsed.terms, ds, &ds.column_map(), &mut Vec::new())
+                .expect("default smooth")
+                .smooth_terms[0]
+                .basis
+                .clone()
+        };
+        let from_weights = crate::smooth::starting_resolution(
+            &basis_of(&weighted),
+            weighted.values.view(),
+            Some(observations.view()),
+        );
+        let from_rows =
+            crate::smooth::starting_resolution(&basis_of(&repeated), repeated.values.view(), None);
+        assert!(from_weights.is_some(), "{formula}: an adaptive default");
+        assert_eq!(from_weights, from_rows, "{formula}");
+    }
+    let parsed = parse_formula("y ~ s(x)").expect("parse");
+    let basis = build_termspec(&parsed.terms, &weighted, &weighted.column_map(), &mut Vec::new())
+        .expect("default s(x)")
+        .smooth_terms[0]
+        .basis
+        .clone();
+    let excluded = Array1::from_iter((0..n).map(|i| if i % 2 == 0 { 0.0 } else { 1.0 }));
+    assert_eq!(
+        crate::smooth::smooth_identification_rows(&basis, weighted.values.view(), Some(excluded.view())),
+        n / 2
+    );
 }
 
 /// The provisioned open B-spline default: `unique / 4` internal knots, held
@@ -4746,7 +4800,7 @@ fn by_level_radial_univariate_floor_sizes_from_the_smallest_level_3179() {
             &mut notes,
         )
         .unwrap_or_else(|e| panic!("s(x, bs=duchon) builds: {e}"));
-        crate::smooth::starting_resolution(&basis, data.values.view())
+        crate::smooth::starting_resolution(&basis, data.values.view(), None)
     };
     let col = ds.values.column(1);
     let level_floor = pilot_univariate_spline_basis_dim(col, n_a);
@@ -6763,7 +6817,7 @@ fn factor_smooth_default_marginal_is_the_rank_bounded_group_pilot_3264() {
             panic!("expected FactorSmooth basis for `{formula}`");
         };
         let Some(AdaptiveResolution::InternalKnots(knots)) =
-            starting_resolution(basis, ds.values.view())
+            starting_resolution(basis, ds.values.view(), None)
         else {
             panic!("a default `{formula}` marginal is a resolution the loop grows");
         };

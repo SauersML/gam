@@ -76,6 +76,13 @@ pub(crate) fn materialize_standard<'a>(
     let term_col_map = term_data.column_map();
 
     let policy = resolved_resource_policy(config, gam_runtime::resource::ProblemHints::default());
+    // A row's weight counts that many observations only where the family reads
+    // weights as frequencies; otherwise each positive-weight row counts once.
+    let observations = if family.prior_weights_are_frequencies() {
+        weights.clone()
+    } else {
+        weights.mapv(|w| if w > 0.0 { 1.0 } else { 0.0 })
+    };
     let spec = build_termspec_with_geometry_and_overrides(
         &term_parsed.terms,
         term_data,
@@ -83,7 +90,13 @@ pub(crate) fn materialize_standard<'a>(
         &mut inference_notes,
         config.scale_dimensions,
         config.smooth_overrides.as_ref(),
-        config.adaptive_resolution.as_deref(),
+        config
+            .adaptive_resolution
+            .as_deref()
+            .map(|resolutions| AdaptivePlan {
+                resolutions,
+                observations: observations.view(),
+            }),
     )?;
 
     if let Some(coord) = latent_coord.as_mut() {

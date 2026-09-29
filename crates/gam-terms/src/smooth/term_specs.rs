@@ -636,6 +636,11 @@ pub struct TensorBSplineSpec {
     pub identifiability: TensorBSplineIdentifiability,
     #[serde(default)]
     pub penalty_decomposition: TensorBSplinePenaltyDecomposition,
+    /// Whether nobody chose the margin sizes, so the standard workflow's
+    /// resolution loop may refine them
+    /// ([`crate::smooth::AdaptiveResolution::TensorIntervals`]).
+    #[serde(default)]
+    pub adaptive: bool,
 }
 
 pub(crate) const fn default_tensor_double_penalty() -> bool {
@@ -650,6 +655,7 @@ impl Default for TensorBSplineSpec {
             double_penalty: default_tensor_double_penalty(),
             identifiability: TensorBSplineIdentifiability::default(),
             penalty_decomposition: TensorBSplinePenaltyDecomposition::default(),
+            adaptive: false,
         }
     }
 }

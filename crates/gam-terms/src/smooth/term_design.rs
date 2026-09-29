@@ -3893,6 +3893,7 @@ mod sparse_transform_tests {
             double_penalty: false,
             identifiability: crate::smooth::TensorBSplineIdentifiability::None,
             penalty_decomposition: Default::default(),
+            adaptive: false,
         };
         let built = crate::smooth::build_tensor_bspline_basis(data.view(), &[0, 1], &spec, true)
             .expect("te(x, h) basis");

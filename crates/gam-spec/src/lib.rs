@@ -2318,6 +2318,26 @@ impl LikelihoodSpec {
             ResponseFamily::Beta { phi } => Some(phi),
         }
     }
+
+    /// Whether a prior weight `w` counts `w` observations: the weighted
+    /// likelihood `w·ℓ(y; μ)` is then exactly `w` replicated rows, so the data
+    /// carry `Σ w` observations' worth of information.
+    ///
+    /// That holds where no dispersion parameter reads the weight as a
+    /// precision: Binomial and Poisson have unit scale, and the
+    /// negative-binomial `θ` enters every row's density unweighted. A family
+    /// with a dispersion (`Var = φ·V(μ)/w`) reads `w` as a relative precision
+    /// instead, so `w` and its replication estimate different scales, and a
+    /// row counts once however it is weighted.
+    #[inline]
+    pub const fn prior_weights_are_frequencies(&self) -> bool {
+        matches!(
+            self.response,
+            ResponseFamily::Binomial
+                | ResponseFamily::Poisson
+                | ResponseFamily::NegativeBinomial { .. }
+        )
+    }
 }
 
 #[inline]

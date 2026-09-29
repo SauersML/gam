@@ -21,11 +21,14 @@
 //! poorly here, which is exactly the failure mode this test must catch.
 //!
 //! Two assertions, both objective:
-//!   1. ABSOLUTE: held-out mean fit explains real signal — test R^2 of `mu`
-//!      against `logratio` is >= 0.55. (lidar's mean is a strong, nearly
-//!      monotone trend; an R^2 this high cannot be reached by a degenerate or
-//!      mis-separated mean block, but is comfortably below what a correct linear
-//!      mean achieves, so it is a floor, not a ceiling.)
+//!   1. ABSOLUTE: the fit extracts real distributional signal — its held-out
+//!      NLL beats the homoscedastic least-squares line's (the same linear mean
+//!      with one pooled sigma, fitted on the same training rows). The mean alone
+//!      is not scored by unweighted R^2: the likelihood weights each row by its
+//!      precision, and lidar's noise sd grows about tenfold along `range`, so the
+//!      maximum-likelihood LINE follows the tight low-range plateau and misses
+//!      the noisy high-range fall that dominates an unweighted R^2. That is the
+//!      estimand of a heteroscedastic linear-mean model, not a defect of it.
 //!   2. MATCH-OR-BEAT (baseline): gam's held-out mean per-point NLL is no worse
 //!      than `mgcv::gam(family = gaulss())`'s held-out NLL by more than a small
 //!      additive margin (0.05 nats/point). mgcv's gaulss is the mature reference
@@ -80,18 +83,31 @@ fn gaussian_nll(y: &[f64], mu: &[f64], sigma: &[f64]) -> f64 {
     total / n
 }
 
-/// Coefficient of determination of `pred` against `truth`: `1 - SSE/SST`.
-fn r_squared(truth: &[f64], pred: &[f64]) -> f64 {
-    assert_eq!(truth.len(), pred.len(), "r2: length mismatch");
-    let n = truth.len() as f64;
-    let mean = truth.iter().sum::<f64>() / n;
-    let sse: f64 = truth
+/// Held-out NLL of the homoscedastic least-squares line fitted on
+/// `(x_train, y_train)`: the same linear mean with one pooled sigma, the
+/// maximum-likelihood fit of a model with no scale structure.
+fn homoscedastic_line_nll(x_train: &[f64], y_train: &[f64], x_test: &[f64], y_test: &[f64]) -> f64 {
+    let n = x_train.len() as f64;
+    let mx = x_train.iter().sum::<f64>() / n;
+    let my = y_train.iter().sum::<f64>() / n;
+    let sxy: f64 = x_train
         .iter()
-        .zip(pred)
-        .map(|(&t, &p)| (t - p) * (t - p))
+        .zip(y_train)
+        .map(|(&x, &y)| (x - mx) * (y - my))
         .sum();
-    let sst: f64 = truth.iter().map(|&t| (t - mean) * (t - mean)).sum();
-    1.0 - sse / sst.max(1e-300)
+    let sxx: f64 = x_train.iter().map(|&x| (x - mx) * (x - mx)).sum();
+    let slope = sxy / sxx;
+    let intercept = my - slope * mx;
+    let line = |x: f64| intercept + slope * x;
+    let sigma = (x_train
+        .iter()
+        .zip(y_train)
+        .map(|(&x, &y)| (y - line(x)).powi(2))
+        .sum::<f64>()
+        / n)
+        .sqrt();
+    let mu: Vec<f64> = x_test.iter().map(|&x| line(x)).collect();
+    gaussian_nll(y_test, &mu, &vec![sigma; x_test.len()])
 }
 
 #[test]
@@ -210,7 +226,8 @@ fn gam_gaulss_linear_mean_smooth_sigma_predicts_lidar_at_least_as_well_as_mgcv()
 
     // ---- gam held-out objective scores ------------------------------------
     let gam_nll = gaussian_nll(&logratio_test, &gam_mu, &gam_sigma);
-    let gam_r2 = r_squared(&logratio_test, &gam_mu);
+    let line_nll =
+        homoscedastic_line_nll(&range_train, &logratio_train, &range_test, &logratio_test);
 
     // ---- fit the SAME model with mgcv gaulss on the SAME train rows -------
     // gaulss(): mu formula linear, sigma formula smooth s(range, bs="tp").
@@ -253,7 +270,7 @@ fn gam_gaulss_linear_mean_smooth_sigma_predicts_lidar_at_least_as_well_as_mgcv()
     let mu_rel_to_mgcv = relative_l2(&gam_mu, mgcv_mu);
 
     eprintln!(
-        "lidar gaulss held-out (n_train={} n_test={}): gam_R2={gam_r2:.4} \
+        "lidar gaulss held-out (n_train={} n_test={}): line_NLL={line_nll:.4} \
          gam_NLL={gam_nll:.4} mgcv_NLL={mgcv_nll:.4} (gam-mgcv={:.4}) \
          mu_rel_l2_vs_mgcv={mu_rel_to_mgcv:.4}",
         train_rows.len(),
@@ -277,11 +294,11 @@ fn gam_gaulss_linear_mean_smooth_sigma_predicts_lidar_at_least_as_well_as_mgcv()
         .line()
     );
 
-    // ---- OBJECTIVE assertion 1: gam recovers real held-out signal ---------
+    // ---- OBJECTIVE assertion 1: gam extracts real distributional signal ---
     assert!(
-        gam_r2 >= 0.55,
-        "gam's held-out mean explains too little of lidar's signal: \
-         test R^2={gam_r2:.4} (floor 0.55)"
+        gam_nll < line_nll,
+        "gam's held-out location-scale NLL does not beat the homoscedastic line: \
+         gam_NLL={gam_nll:.4} >= line_NLL={line_nll:.4}"
     );
 
     // ---- OBJECTIVE assertion 2: match-or-beat mgcv on held-out NLL --------

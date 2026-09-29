@@ -2180,9 +2180,19 @@ fn reciprocal_link_posterior_jet(
 ///
 /// Both match the moment expansion of `g⁻¹(η)²` about `mu` to every order, so
 /// the variance agrees with the exact moments of any posterior that keeps its
-/// mass away from the pole. A negative difference means the posterior reaches
-/// the pole so closely that no response-scale variance exists; that is
-/// reported as an error rather than clamped.
+/// mass away from the pole.
+///
+/// When the posterior reaches the pole the continuation stops being a
+/// variance. For the inverse link, with `x = mu/(√2·sigma)` and Dawson's `F`,
+/// the difference is `(2xF(x) − 1 − 2F(x)²)/sigma²`, which is negative for
+/// every `x` below about 1.8 (`mu/sigma` below about 2.6). Lebesgue integration
+/// gives the value there instead. `g⁻¹(η)² ≥ 1/η` near `η = 0` for both links,
+/// and the Gaussian density is positive at the pole, so `E[g⁻¹(η)²]` diverges
+/// and the response-scale variance is `+∞`. That is the value returned. It is
+/// not clamped to zero, which would claim certainty, and it is not an error:
+/// the posterior mean and the interval (the image of the `η` interval under
+/// the monotone link) both still exist, and the prediction path already
+/// reports an infinite variance as an infinite standard error.
 pub fn reciprocal_link_posterior_meanvariance(
     link: LinkFunction,
     mu: f64,
@@ -2210,12 +2220,16 @@ pub fn reciprocal_link_posterior_meanvariance(
     let rounding = 4.0 * f64::EPSILON * second_moment.abs().max(mean * mean);
     let variance = second_moment - mean * mean;
     let variance = if variance < 0.0 && -variance <= rounding { 0.0 } else { variance };
-    if !(variance.is_finite() && variance >= 0.0) {
+    if variance.is_nan() {
         return Err(EstimationError::InvalidInput(format!(
-            "{} link posterior variance does not exist at eta = {mu}, se = {sigma}: the \
-             linear-predictor posterior reaches the link's pole at eta = 0",
+            "{} link posterior variance is not a number at eta = {mu}, se = {sigma}",
             link.name()
         )));
+    }
+    if variance < 0.0 {
+        // The finite-part continuation left the variance's domain: the posterior
+        // reaches the pole, where the Lebesgue second moment diverges.
+        return Ok((mean, f64::INFINITY));
     }
     Ok((mean, variance))
 }
@@ -3960,6 +3974,33 @@ mod tests {
             odd_double_factorial *= (2 * k + 1) as f64;
         }
         odd_double_factorial * std::f64::consts::PI.sqrt() / 2.0_f64.powi(m as i32)
+    }
+
+    /// A posterior that reaches the reciprocal link's pole has an infinite
+    /// response-scale variance (the Lebesgue second moment diverges), reported
+    /// as `+∞` beside a finite mean, not as an error. Away from the pole the
+    /// variance is the finite, positive continuation. The inverse-link value
+    /// is `(2xF(x) − 1 − 2F(x)²)/s²`, `x = m/(√2 s)`.
+    #[test]
+    fn reciprocal_link_variance_is_infinite_once_the_posterior_reaches_the_pole() {
+        for link in [LinkFunction::Inverse, LinkFunction::InverseSquared] {
+            // m/s = 1: the finite-part difference is negative (x ≈ 0.71).
+            let (mean, variance) = reciprocal_link_posterior_meanvariance(link, 1.0, 1.0)
+                .expect("a posterior reaching the pole still has a mean");
+            assert!(mean.is_finite(), "{link:?}: mean {mean}");
+            assert_eq!(variance, f64::INFINITY, "{link:?}");
+            // m/s = 10: far from the pole, a finite positive variance.
+            let (mean, variance) = reciprocal_link_posterior_meanvariance(link, 5.0, 0.5)
+                .expect("a posterior away from the pole has both moments");
+            assert!(mean.is_finite() && variance.is_finite() && variance > 0.0);
+        }
+        let (m, s) = (5.0_f64, 0.5_f64);
+        let x = m / (std::f64::consts::SQRT_2 * s);
+        let f = gam_math::gaussian_reciprocal::dawson_jet(x)[0];
+        let exact = (2.0 * x * f - 1.0 - 2.0 * f * f) / (s * s);
+        let (_, variance) =
+            reciprocal_link_posterior_meanvariance(LinkFunction::Inverse, m, s).unwrap();
+        assert_relative_eq!(variance, exact, max_relative = 1e-8);
     }
 
     #[test]
