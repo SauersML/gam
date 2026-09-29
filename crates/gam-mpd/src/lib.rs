@@ -32,8 +32,7 @@
 //! `state`. Implementation gauges detected exactly from native tensors (OV
 //! passthroughs, SwiGLU units, norm gains, rotary QK, residual basis) belong to
 //! `gauge`; mask-gauge covariance, structured paths and commutator facts to
-//! `operators`. Plane-rotation
-//! recovery from a frozen matrix belongs to `spectral`.
+//! `operators`.
 //!
 //! # Types that are never coerced into one another
 //!
@@ -155,10 +154,6 @@ mod state_toys_tests;
 #[cfg(test)]
 mod verify_toys_tests;
 
-// The planted known-answer toys against plane-rotation recovery.
-#[cfg(test)]
-mod spectral_toys_tests;
-
 // The known-answer toys (induction, modular addition, residual MLPs) against the owners.
 #[cfg(test)]
 mod known_answer_toys_tests;
@@ -181,11 +176,8 @@ pub mod safetensors;
 // The LlamaSimpleMLP decoder (VPD's Pile target) executed from its checkpoint with forward-error radii.
 pub mod llama_simple_mlp;
 
-// Exact two-endpoint finite-change operators: softmax, RMSNorm, bilinear products, gated activations.
+// Exact two-endpoint finite-change operators: softmax and bilinear products.
 pub mod secant;
-
-// Plane-rotation recovery with derived eigengaps.
-pub mod spectral;
 
 // The sign-gated split of a SwiGLU block, its certified correction bounds and ReLU replacement contract.
 pub mod sign_gated;

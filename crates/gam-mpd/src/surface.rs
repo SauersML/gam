@@ -10,9 +10,8 @@
 //!
 //! Nothing here computes. Each operation calls its owner and projects the owner's
 //! result into the wire report without strengthening any claim. A value the owner
-//! reports as `+inf` to mean "no such quantity" (a cluster that is the whole
-//! spectrum has no separation; a refused Davis–Kahan bound has no bar) becomes an
-//! absent value with that stated meaning. Any other non-finite value is refused
+//! reports as `+inf` to mean "no such quantity" (an edit norm with no finite lower
+//! bound) becomes an absent value with that stated meaning. Any other non-finite value is refused
 //! instead of being written as JSON `null`.
 
 use std::collections::BTreeMap;
@@ -22,7 +21,6 @@ use gam_runtime::resource::{MemoryGovernor, MemoryReservation, MemoryReservation
 use ndarray::{ArrayD, ArrayView1, ArrayView2, Ix1, Ix2};
 use serde::{Deserialize, Serialize};
 
-use super::secant::SecantError;
 use super::attention::AttentionProgramError;
 use super::bounds::BoundError;
 use super::dense::DenseError;
@@ -34,10 +32,6 @@ use super::state::StateError;
 use crate::finite_grid::FiniteGridError;
 use gam_sae::response::interaction::InteractionError;
 use super::supports::EvidenceStatusError;
-use super::spectral::{
-    PlaneRotationError, PlaneRotationRecovery, RotationAmbiguity, RotationClusterKind,
-    recover_plane_rotations,
-};
 
 mod bounds;
 mod canonical;
@@ -50,7 +44,6 @@ mod joint;
 mod layer;
 mod module_split;
 mod observability;
-mod secant;
 mod sign_gated;
 mod state_quotient;
 mod verify;
@@ -100,7 +93,6 @@ pub use layer::{
     AttentionRequest, GeometryRequest, ProjectionRequest, QueryKeyNormRequest, RmsNormRequest,
     RotaryPairingRequest, RotaryRequest,
 };
-pub use secant::{SecantActivationWire, SecantOperator, SecantReport, SecantRequest};
 pub use sign_gated::{
     PerRowReport, ReadoutReport, ReadoutRequest, RowsReport, SignGatedSwigluReport, SignGatedSwigluRequest,
 };
@@ -138,12 +130,6 @@ pub struct MpdRequest {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MpdOperation {
-    /// P3: the rotation planes of one square matrix (`spectral`).
-    RecoverPlaneRotations {
-        /// Id of the input array holding the matrix. The owner measures its distance to
-        /// the orthogonal group and reports it as `orthogonality_defect`.
-        tensor: String,
-    },
     /// The linear sufficient state of linear readouts under linear transitions
     /// (`state::LinearStateQuotient`): the closed observable chart, or a declared one
     /// measured.
@@ -157,8 +143,6 @@ pub enum MpdOperation {
     /// One structural proposal decided by `fit::decide_proposal` from supplied code
     /// lengths and evidence statuses.
     DecideProposal(DecideProposalRequest),
-    /// One exact two-endpoint change operator with its bands (`secant`).
-    Secant(SecantRequest),
     /// The exhaustive FANOVA of a response on a declared finite product grid
     /// (`response::finite_grid`, `response::interaction`).
     FiniteGrid(FiniteGridRequest),
@@ -227,12 +211,10 @@ pub struct MpdReport {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MpdResult {
-    RecoverPlaneRotations(PlaneRotationReport),
     LinearStateQuotient(LinearStateQuotientReport),
     LinearClosedChart(LinearClosedChartReport),
     CodeLengths(CodeLengthsReport),
     DecideProposal(DecideProposalReport),
-    Secant(SecantReport),
     FiniteGrid(FiniteGridReport),
     GaugeCensus(GaugeCensusReport),
     CanonicalLayer(Box<CanonicalLayerReport>),
@@ -244,81 +226,6 @@ pub enum MpdResult {
     Compile(Box<CompileReport>),
     SignGatedSwiglu(Box<SignGatedSwigluReport>),
     LogitBounds(LogitBoundsReport),
-}
-
-/// [`PlaneRotationRecovery`] on the wire.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct PlaneRotationReport {
-    /// The input array the matrix came from.
-    pub tensor: String,
-    pub orthogonality_defect: f64,
-    pub perturbation_bound: f64,
-    /// Clusters in increasing cosine order.
-    pub clusters: Vec<RotationClusterReport>,
-    pub ambiguities: Vec<RotationAmbiguityReport>,
-}
-
-/// One spectral cluster on the wire.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct RotationClusterReport {
-    /// Id of the output array holding the cluster's orthonormal basis (`d x m`).
-    pub basis: String,
-    /// `m`, the dimension of the cluster's eigenspace.
-    pub dimension: usize,
-    pub cosine_interval: [f64; 2],
-    /// Distance to the nearest other computed eigenvalue; absent when the cluster
-    /// is the whole spectrum.
-    pub separation: Option<f64>,
-    /// Davis–Kahan bar on the projector; absent when the bound refuses because the
-    /// separation does not exceed the perturbation bound, so no subspace claim
-    /// stands.
-    pub projector_bar: Option<f64>,
-    pub structure: RotationClusterStructure,
-}
-
-/// [`RotationClusterKind`] on the wire.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RotationClusterStructure {
-    Fixed {
-        max_hidden_angle: f64,
-    },
-    Rotation {
-        planes: usize,
-        angle: f64,
-        /// Id of the output array holding `J` in the cluster basis; absent when the
-        /// orientation is not certified.
-        complex_structure: Option<String>,
-    },
-    HalfTurn {
-        min_hidden_angle: f64,
-    },
-    Unresolved,
-}
-
-/// [`RotationAmbiguity`] on the wire.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RotationAmbiguityReport {
-    Identity,
-    RepeatedCosine { cluster: usize, planes: usize },
-    HalfTurn { cluster: usize },
-    Unresolved { cluster: usize },
-    Winding,
-}
-
-impl From<RotationAmbiguity> for RotationAmbiguityReport {
-    fn from(ambiguity: RotationAmbiguity) -> Self {
-        match ambiguity {
-            RotationAmbiguity::Identity => Self::Identity,
-            RotationAmbiguity::RepeatedCosine { cluster, planes } => {
-                Self::RepeatedCosine { cluster, planes }
-            }
-            RotationAmbiguity::HalfTurn { cluster } => Self::HalfTurn { cluster },
-            RotationAmbiguity::Unresolved { cluster } => Self::Unresolved { cluster },
-            RotationAmbiguity::Winding => Self::Winding,
-        }
-    }
 }
 
 /// A report and the arrays it names.
@@ -345,13 +252,11 @@ pub enum MpdSurfaceError {
     MissingTensor { tensor: String },
     /// An input array does not have the shape the operation reads.
     TensorShape { tensor: String, reason: String },
-    PlaneRotation(PlaneRotationError),
     State(StateError),
     /// A code owner refused an item.
     Code(String),
     /// An evidence-status constructor refused a supplied status.
     Evidence(EvidenceStatusError),
-    Secant(SecantError),
     FiniteGrid(FiniteGridError),
     Interaction(InteractionError),
     Gauge(GaugeRefusal),
@@ -388,12 +293,10 @@ impl fmt::Display for MpdSurfaceError {
             Self::TensorShape { tensor, reason } => {
                 write!(formatter, "MPD input array {tensor:?}: {reason}")
             }
-            Self::PlaneRotation(error) => write!(formatter, "{error}"),
             Self::State(error) => write!(formatter, "{error}"),
             Self::Memory(error) => write!(formatter, "{error}"),
             Self::Code(reason) => write!(formatter, "{reason}"),
             Self::Evidence(error) => write!(formatter, "{error}"),
-            Self::Secant(error) => write!(formatter, "{error}"),
             Self::FiniteGrid(error) => write!(formatter, "{error}"),
             Self::Interaction(error) => write!(formatter, "{error}"),
             Self::Gauge(refusal) => write!(formatter, "gauge refused: {refusal:?}"),
@@ -430,18 +333,12 @@ pub fn run_parameter_decomposition(
 ) -> Result<MpdOutput, MpdSurfaceError> {
     let request = MpdRequest::from_json(request_json)?;
     match request.operation {
-        MpdOperation::RecoverPlaneRotations { tensor } => {
-            let recovery = recover_plane_rotations(governor, matrix(tensors, &tensor)?)
-                .map_err(MpdSurfaceError::PlaneRotation)?;
-            project_plane_rotations(tensor, recovery)
-        }
         MpdOperation::LinearStateQuotient(request) => {
             state_quotient::run(request, tensors, governor)
         }
         MpdOperation::LinearClosedChart(request) => state_quotient::run_chart(request, tensors, governor),
         MpdOperation::CodeLengths(request) => code::run_lengths(request, tensors, governor),
         MpdOperation::DecideProposal(request) => code::run_decide(request),
-        MpdOperation::Secant(request) => secant::run(request, tensors, governor),
         MpdOperation::FiniteGrid(request) => finite_grid::run(request, tensors, governor),
         MpdOperation::GaugeCensus(request) => gauge_census::run(request, tensors, governor),
         MpdOperation::CanonicalLayer(request) => canonical::run(*request, tensors, governor),
@@ -522,75 +419,6 @@ fn vector<'a>(
         })
 }
 
-fn project_plane_rotations(
-    tensor: String,
-    recovery: PlaneRotationRecovery,
-) -> Result<MpdOutput, MpdSurfaceError> {
-    let ambiguities = recovery
-        .ambiguities()
-        .into_iter()
-        .map(RotationAmbiguityReport::from)
-        .collect();
-    let orthogonality_defect = finite("orthogonality_defect", recovery.orthogonality_defect)?;
-    let perturbation_bound = finite("perturbation_bound", recovery.perturbation_bound)?;
-    let mut arrays = BTreeMap::new();
-    let mut clusters = Vec::with_capacity(recovery.clusters.len());
-    for (index, cluster) in recovery.clusters.into_iter().enumerate() {
-        let structure = match cluster.kind {
-            RotationClusterKind::Fixed { max_hidden_angle } => RotationClusterStructure::Fixed {
-                max_hidden_angle: finite("max_hidden_angle", max_hidden_angle)?,
-            },
-            RotationClusterKind::Rotation {
-                planes,
-                angle,
-                complex_structure,
-            } => RotationClusterStructure::Rotation {
-                planes,
-                angle: finite("angle", angle)?,
-                complex_structure: complex_structure.map(|structure| {
-                    let id = format!("clusters/{index}/complex_structure");
-                    arrays.insert(id.clone(), structure.into_dyn());
-                    id
-                }),
-            },
-            RotationClusterKind::HalfTurn { min_hidden_angle } => {
-                RotationClusterStructure::HalfTurn {
-                    min_hidden_angle: finite("min_hidden_angle", min_hidden_angle)?,
-                }
-            }
-            RotationClusterKind::Unresolved => RotationClusterStructure::Unresolved,
-        };
-        let basis = format!("clusters/{index}/basis");
-        let dimension = cluster.basis.ncols();
-        arrays.insert(basis.clone(), cluster.basis.into_dyn());
-        clusters.push(RotationClusterReport {
-            basis,
-            dimension,
-            cosine_interval: [
-                finite("cosine_interval", cluster.cosine_interval.0)?,
-                finite("cosine_interval", cluster.cosine_interval.1)?,
-            ],
-            separation: absent_when_infinite("separation", cluster.separation)?,
-            projector_bar: absent_when_infinite("projector_bar", cluster.projector_bar)?,
-            structure,
-        });
-    }
-    Ok(MpdOutput {
-        report: MpdReport {
-            schema: MPD_REPORT_SCHEMA,
-            schema_version: MPD_SCHEMA_VERSION,
-            result: MpdResult::RecoverPlaneRotations(PlaneRotationReport {
-                tensor,
-                orthogonality_defect,
-                perturbation_bound,
-                clusters,
-                ambiguities,
-            }),
-        },
-        arrays,
-    })
-}
-
 fn finite(field: &'static str, value: f64) -> Result<f64, MpdSurfaceError> {
     if value.is_finite() {
         Ok(value)
@@ -612,7 +440,7 @@ fn absent_when_infinite(field: &'static str, value: f64) -> Result<Option<f64>, 
 mod tests {
     use super::*;
     use crate::test_support::test_governor;
-    use ndarray::{Array2, array};
+    use ndarray::Array2;
 
     pub(super) fn request_json(operation: &str) -> String {
         format!(
@@ -620,37 +448,24 @@ mod tests {
         )
     }
 
-    fn plane_request() -> String {
-        request_json(r#"{"kind": "recover_plane_rotations", "tensor": "w"}"#)
+    fn chart_request() -> String {
+        request_json(r#"{"kind": "linear_closed_chart", "readouts": ["w"], "transitions": ["w"]}"#)
     }
 
     fn inputs(id: &str, matrix: Array2<f64>) -> BTreeMap<String, ArrayD<f64>> {
         BTreeMap::from([(id.to_string(), matrix.into_dyn())])
     }
 
-    /// Rotations by `alpha` and `beta` in the planes (e1, e2) and (e3, e4), with e5
-    /// fixed.
-    fn two_plane_rotation(alpha: f64, beta: f64) -> Array2<f64> {
-        let (sa, ca) = alpha.sin_cos();
-        let (sb, cb) = beta.sin_cos();
-        array![
-            [ca, -sa, 0.0, 0.0, 0.0],
-            [sa, ca, 0.0, 0.0, 0.0],
-            [0.0, 0.0, cb, -sb, 0.0],
-            [0.0, 0.0, sb, cb, 0.0],
-            [0.0, 0.0, 0.0, 0.0, 1.0]
-        ]
-    }
-
     #[test]
     fn request_document_round_trips_and_refuses_what_it_does_not_declare() {
-        let valid = plane_request();
+        let valid = chart_request();
         let request = MpdRequest::from_json(&valid).expect("a declared request parses");
         assert_eq!(
             request.operation,
-            MpdOperation::RecoverPlaneRotations {
-                tensor: "w".to_string(),
-            }
+            MpdOperation::LinearClosedChart(LinearClosedChartRequest {
+                readouts: vec!["w".to_string()],
+                transitions: vec!["w".to_string()],
+            })
         );
         let reserialized = serde_json::to_string(&request).expect("serialize request");
         assert_eq!(
@@ -663,17 +478,11 @@ mod tests {
         let unknown_top = valid.replacen("\"operation\"", "\"extra\": 1, \"operation\"", 1);
         assert!(MpdRequest::from_json(&unknown_top).is_err());
         let unknown_operation_field = request_json(
-            r#"{"kind": "recover_plane_rotations", "tensor": "w", "tolerance": 1e-8}"#,
+            r#"{"kind": "linear_closed_chart", "readouts": ["w"], "transitions": ["w"], "tolerance": 1e-8}"#,
         );
         assert!(MpdRequest::from_json(&unknown_operation_field).is_err());
-        // The distance to the orthogonal group is measured by the owner, so a
-        // hand-supplied one is an unknown field, not an input.
-        let hand_supplied_error = request_json(
-            r#"{"kind": "recover_plane_rotations", "tensor": "w", "declared_error": 0.0}"#,
-        );
-        assert!(MpdRequest::from_json(&hand_supplied_error).is_err());
-        let missing_tensor = request_json(r#"{"kind": "recover_plane_rotations"}"#);
-        assert!(MpdRequest::from_json(&missing_tensor).is_err());
+        let missing_transitions = request_json(r#"{"kind": "linear_closed_chart", "readouts": ["w"]}"#);
+        assert!(MpdRequest::from_json(&missing_transitions).is_err());
         let unknown_kind = request_json(r#"{"kind": "guess_the_planes", "tensor": "w"}"#);
         assert!(MpdRequest::from_json(&unknown_kind).is_err());
         let other_schema = valid.replacen(MPD_REQUEST_SCHEMA, "gam.fit-request", 1);
@@ -687,147 +496,8 @@ mod tests {
     }
 
     #[test]
-    fn plane_rotation_report_is_the_owner_result_field_for_field() {
-        let matrix = two_plane_rotation(0.7, 1.9);
-        let direct = recover_plane_rotations(test_governor(), matrix.view()).expect("owner recovery");
-        let output = run_parameter_decomposition(&plane_request(), &inputs("w", matrix), test_governor())
-            .expect("surface run");
-        let MpdResult::RecoverPlaneRotations(report) = &output.report.result else {
-            panic!("expected a plane-rotation report, got {:?}", output.report.result);
-        };
-
-        assert_eq!(report.tensor, "w");
-        assert_eq!(report.orthogonality_defect, direct.orthogonality_defect);
-        assert_eq!(report.perturbation_bound, direct.perturbation_bound);
-        assert_eq!(report.clusters.len(), direct.clusters.len());
-        let rotations = report
-            .clusters
-            .iter()
-            .filter(|cluster| matches!(cluster.structure, RotationClusterStructure::Rotation { .. }))
-            .count();
-        assert_eq!(rotations, 2, "two planted planes with distinct cosines");
-        for (wire, owner) in report.clusters.iter().zip(&direct.clusters) {
-            assert_eq!(output.arrays[&wire.basis], owner.basis.clone().into_dyn());
-            assert_eq!(wire.dimension, owner.basis.ncols());
-            assert_eq!(
-                wire.cosine_interval,
-                [owner.cosine_interval.0, owner.cosine_interval.1]
-            );
-            assert_eq!(
-                wire.separation,
-                (owner.separation != f64::INFINITY).then_some(owner.separation)
-            );
-            assert_eq!(
-                wire.projector_bar,
-                (owner.projector_bar != f64::INFINITY).then_some(owner.projector_bar)
-            );
-            match (&wire.structure, &owner.kind) {
-                (
-                    RotationClusterStructure::Fixed { max_hidden_angle },
-                    RotationClusterKind::Fixed {
-                        max_hidden_angle: owner_angle,
-                    },
-                ) => assert_eq!(max_hidden_angle, owner_angle),
-                (
-                    RotationClusterStructure::HalfTurn { min_hidden_angle },
-                    RotationClusterKind::HalfTurn {
-                        min_hidden_angle: owner_angle,
-                    },
-                ) => assert_eq!(min_hidden_angle, owner_angle),
-                (RotationClusterStructure::Unresolved, RotationClusterKind::Unresolved) => assert!(
-                    wire.cosine_interval[0] <= -1.0 && wire.cosine_interval[1] >= 1.0,
-                    "an unresolved cluster admits both +1 and -1"
-                ),
-                (
-                    RotationClusterStructure::Rotation {
-                        planes,
-                        angle,
-                        complex_structure,
-                    },
-                    RotationClusterKind::Rotation {
-                        planes: owner_planes,
-                        angle: owner_angle,
-                        complex_structure: owner_structure,
-                    },
-                ) => {
-                    assert_eq!(planes, owner_planes);
-                    assert_eq!(angle, owner_angle);
-                    assert_eq!(
-                        complex_structure.is_some(),
-                        owner_structure.is_some(),
-                        "orientation certificate changed on the wire"
-                    );
-                    if let (Some(id), Some(j)) = (complex_structure, owner_structure) {
-                        assert_eq!(output.arrays[id], j.clone().into_dyn());
-                    }
-                }
-                (wire_structure, owner_kind) => panic!(
-                    "cluster structure changed on the wire: {wire_structure:?} vs {owner_kind:?}"
-                ),
-            }
-        }
-        let expected: Vec<RotationAmbiguityReport> = direct
-            .ambiguities()
-            .into_iter()
-            .map(RotationAmbiguityReport::from)
-            .collect();
-        assert_eq!(report.ambiguities, expected);
-
-        // Every array the report names is supplied, and nothing else is.
-        let mut named: Vec<&String> = report.clusters.iter().map(|cluster| &cluster.basis).collect();
-        for cluster in &report.clusters {
-            if let RotationClusterStructure::Rotation {
-                complex_structure: Some(id),
-                ..
-            } = &cluster.structure
-            {
-                named.push(id);
-            }
-        }
-        named.sort();
-        assert_eq!(named, output.arrays.keys().collect::<Vec<_>>());
-
-        let json: serde_json::Value =
-            serde_json::from_str(&output.report_json().expect("report json")).expect("parse report");
-        assert_eq!(json["schema"], MPD_REPORT_SCHEMA);
-        assert_eq!(json["result"]["kind"], "recover_plane_rotations");
-    }
-
-    #[test]
-    fn identity_reports_its_ambiguity_and_an_absent_separation() {
-        let output = run_parameter_decomposition(&plane_request(), &inputs("w", Array2::eye(3)), test_governor())
-            .expect("surface run on the identity");
-        let MpdResult::RecoverPlaneRotations(report) = &output.report.result else {
-            panic!("expected a plane-rotation report, got {:?}", output.report.result);
-        };
-        assert_eq!(report.ambiguities, vec![RotationAmbiguityReport::Identity]);
-        assert_eq!(report.clusters.len(), 1);
-        assert_eq!(report.clusters[0].separation, None);
-        // The whole spectrum's projector is the identity, a bar of exactly 0, not an
-        // absent one.
-        assert_eq!(report.clusters[0].projector_bar, Some(0.0));
-        let json: serde_json::Value =
-            serde_json::from_str(&output.report_json().expect("report json")).expect("parse report");
-        assert!(json["result"]["clusters"][0]["separation"].is_null());
-        assert_eq!(json["result"]["clusters"][0]["projector_bar"], 0.0);
-    }
-
-    #[test]
-    fn the_owners_refusal_of_a_singular_matrix_reaches_the_caller() {
-        // A rank-one matrix has no unique nearest orthogonal matrix.
-        assert!(matches!(
-            run_parameter_decomposition(&plane_request(), &inputs("w", Array2::ones((2, 2))), test_governor()),
-            Err(MpdSurfaceError::PlaneRotation(
-                PlaneRotationError::NotInvertible { .. }
-            ))
-        ));
-        // Positive control: the same request on an orthogonal matrix is accepted.
-        assert!(run_parameter_decomposition(&plane_request(), &inputs("w", Array2::eye(2)), test_governor()).is_ok());
-    }
-
-    #[test]
     fn missing_or_misshapen_inputs_are_refused() {
-        let json = plane_request();
+        let json = chart_request();
         assert!(run_parameter_decomposition(&json, &inputs("w", Array2::eye(2)), test_governor()).is_ok());
         assert!(matches!(
             run_parameter_decomposition(&json, &inputs("other", Array2::eye(2)), test_governor()),

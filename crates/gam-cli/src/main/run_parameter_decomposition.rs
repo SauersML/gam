@@ -99,7 +99,7 @@ mod tests {
         write_npy_array(path, &matrix.clone().into_dyn()).expect("write test NPY");
     }
 
-    const PLANE_REQUEST: &str = r#"{"schema": "gam.mpd-request", "schema_version": 1, "operation": {"kind": "recover_plane_rotations", "tensor": "w"}}"#;
+    const QUOTIENT_REQUEST: &str = r#"{"schema": "gam.mpd-request", "schema_version": 1, "operation": {"kind": "linear_state_quotient", "readouts": ["w"], "transitions": ["w"], "chart": {"kind": "close"}}}"#;
 
     #[test]
     fn parameter_decomposition_help_exposes_only_transport_arguments() {
@@ -156,7 +156,7 @@ mod tests {
         ];
         let tensor_path = dir.path().join("w.npy");
         write_matrix(&tensor_path, &matrix);
-        let request = PLANE_REQUEST;
+        let request = QUOTIENT_REQUEST;
         let request_path = dir.path().join("request.json");
         std::fs::write(&request_path, request).expect("write request");
         let out = dir.path().join("out");
@@ -182,7 +182,7 @@ mod tests {
             report,
             format!("{}\n", in_memory.report_json().expect("report json"))
         );
-        // A basis per cluster and at least the two planted planes, so the comparison
+        // The chart, the readout map and the descended transition, so the comparison
         // below is over real arrays.
         assert!(in_memory.arrays.len() >= 3, "{:?}", in_memory.arrays.keys());
         for (id, array) in &in_memory.arrays {
@@ -197,7 +197,7 @@ mod tests {
         let tensor_path = dir.path().join("w.npy");
         write_matrix(&tensor_path, &Array2::eye(2));
         let request_path = dir.path().join("request.json");
-        std::fs::write(&request_path, PLANE_REQUEST).expect("write request");
+        std::fs::write(&request_path, QUOTIENT_REQUEST).expect("write request");
         let input = NamedNpyInput {
             label: "w".to_string(),
             path: tensor_path,

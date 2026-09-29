@@ -4,9 +4,8 @@
 //! defects, so a test can assert against a planted truth without a constant.
 #![cfg(test)]
 
-use gam_linalg::faer_ndarray::{FaerEigh, FaerQr};
-use gam_linalg::roundoff::{accumulation_growth, symmetric_spectrum_rounding_band};
-use faer::Side;
+use gam_linalg::faer_ndarray::FaerQr;
+use gam_linalg::roundoff::accumulation_growth;
 use ndarray::{Array2, ArrayView2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -67,8 +66,6 @@ pub struct Planted {
     pub matrix: Array2<f64>,
     /// Bound on `||Q - Q_o||_2`.
     pub basis_defect: f64,
-    /// Bound on `||B - B_o||_2`.
-    pub form_defect: f64,
     /// Bound on `||W - Q_o B_o Q_o^T||_2`: the error the planted matrix declares.
     pub matrix_defect: f64,
 }
@@ -97,38 +94,8 @@ pub fn plant(dimension: usize, angles: &[f64], negative_axes: usize, seed: u64) 
         basis,
         matrix,
         basis_defect,
-        form_defect,
         matrix_defect,
     }
-}
-
-/// `||V_a V_a^T - V_b V_b^T||_2` and the rounding band of that measurement.
-pub fn projector_distance(left: ArrayView2<'_, f64>, right: ArrayView2<'_, f64>) -> (f64, f64) {
-    let dimension = left.nrows();
-    let left_projector = left.dot(&left.t());
-    let right_projector = right.dot(&right.t());
-    let mut difference = Array2::<f64>::zeros((dimension, dimension));
-    for row in 0..dimension {
-        for col in 0..dimension {
-            difference[[row, col]] = 0.5
-                * ((left_projector[[row, col]] - right_projector[[row, col]])
-                    + (left_projector[[col, row]] - right_projector[[col, row]]));
-        }
-    }
-    let (values, _) = difference
-        .eigh(Side::Lower)
-        .expect("projector difference eigendecomposition");
-    let distance = values.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
-    let absolute_left = left.mapv(f64::abs);
-    let absolute_right = right.mapv(f64::abs);
-    let band = accumulation_growth(left.ncols())
-        * frobenius_norm(absolute_left.dot(&absolute_left.t()).view())
-        + accumulation_growth(right.ncols())
-            * frobenius_norm(absolute_right.dot(&absolute_right.t()).view())
-        + accumulation_growth(3)
-            * (frobenius_norm(left_projector.view()) + frobenius_norm(right_projector.view()))
-        + symmetric_spectrum_rounding_band(&values.to_vec());
-    (distance, band)
 }
 
 /// The ledger a test's kernels reserve on when the test does not assert on

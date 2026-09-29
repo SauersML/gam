@@ -254,7 +254,7 @@
 //!
 //! The discovery primitives supply reachability pattern by pattern. A declared or recovered cycle
 //! reaches the character basis when the planted table is a sum of character planes (the
-//! `PlaneBasis` / declared-characters primitives, with `spectral`'s eigengap condition);
+//! `PlaneBasis` / declared-characters primitives);
 //! `DropBlocks` and `Coarsen` reach any sub-support and coarser lattice of the current program. A
 //! factor group reused up to change of basis is reachable by rule discovery only when its instances
 //! are exactly related (the ARD evidence and anti-unification propose, they do not certify).
@@ -379,7 +379,7 @@
 //!    refused when `ker G ⊄ ker K`. Every mask vector `m ∈ [0, 1]^C` is one `u = 1 − m`, so every combination
 //!    of partial ablations is covered by one number.
 //! 4. (nonlinear with an enclosure) The secant operators of `secant` enclose the exact finite change of
-//!    softmax, RMSNorm, bilinear and gated maps between two endpoints, and
+//!    softmax and bilinear maps between two endpoints, and
 //!    [`super::bounds::kl_supremum_over_logit_boxes`] bounds `sup KL` over every logit pair in two boxes, so a
 //!    box enclosure over a mask box bounds every mask inside it.
 //!

@@ -1,8 +1,7 @@
 //! Exhaustive FANOVA of a modular-addition model's logits on `Z_p²` (#2946 R7, finite grid).
 //!
 //! Input: the model's logits at `=` on every `(a, b)`, row-major (`row = a·p + b`), as little-endian
-//! f64 `p² × p` — e.g. `bench/mpd_opfirst_modadd_program_2951.py`'s `load`/`model_forward` output written
-//! with `logits.astype("<f8").tofile(path)`. Reports, under the uniform law on `Z_p²` with centred
+//! f64 `p² × p`, e.g. a model forward's logits written with `logits.astype("<f8").tofile(path)`. Reports, under the uniform law on `Z_p²` with centred
 //! logits: the interaction share and rectangle bound in `(a, b)`, the same in `(s, d) = (a+b, a−b)`,
 //! and the argmax accuracy of the `s`-only law `E[logits | s]` on all `p²` inputs.
 //!

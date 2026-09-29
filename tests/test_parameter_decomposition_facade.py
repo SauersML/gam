@@ -16,14 +16,14 @@ class _RustStub:
         self.args = args
         return (
             '{"schema": "gam.mpd-report", "schema_version": 1}',
-            {"clusters/0/basis": np.eye(2)},
+            {"chart": np.eye(2)},
         )
 
 
 REQUEST = {
     "schema": "gam.mpd-request",
     "schema_version": 1,
-    "operation": {"kind": "recover_plane_rotations", "tensor": "w"},
+    "operation": {"kind": "linear_closed_chart", "readouts": ["w"], "transitions": ["w"]},
 }
 
 
@@ -43,14 +43,14 @@ def test_facade_marshals_request_and_arrays_without_math(monkeypatch):
     assert np.array_equal(sent, w)
     assert set(rust.args[1]) == {"w"}
     assert out.report == {"schema": "gam.mpd-report", "schema_version": 1}
-    assert set(out.arrays) == {"clusters/0/basis"}
-    assert np.array_equal(out.arrays["clusters/0/basis"], np.eye(2))
+    assert set(out.arrays) == {"chart"}
+    assert np.array_equal(out.arrays["chart"], np.eye(2))
 
 
 def test_facade_never_sends_a_non_finite_request(monkeypatch):
     rust = _RustStub()
     monkeypatch.setattr(facade, "rust_module", lambda: rust)
-    request = dict(REQUEST, operation={"kind": "recover_plane_rotations", "tensor": float("nan")})
+    request = dict(REQUEST, operation={"kind": "linear_closed_chart", "readouts": [float("nan")], "transitions": ["w"]})
     with pytest.raises(ValueError):
         facade.run_parameter_decomposition(request, {"w": np.eye(2)})
     assert rust.args is None
