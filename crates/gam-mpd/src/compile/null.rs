@@ -13,6 +13,11 @@
 //! and it is attained at `u = U Λ^{-1/2} w` for the top eigenvector `w`. An edit is
 //! physically null at a declared tolerance when this is below it.
 //!
+//! The statement is on the resolved quotient: directions whose `G`-eigenvalue lies within
+//! the spectrum band are not edits at this resolution, so an exact supremum is the supremum
+//! over `range(G)` resolved above that band, not over every direction of `ℝ^m`. Those
+//! unresolved directions are exactly the ones the refusal below inspects.
+//!
 //! # Refusal
 //!
 //! A direction in `ker G` has no size, so if `K` is nonzero on it, the edit metric cannot

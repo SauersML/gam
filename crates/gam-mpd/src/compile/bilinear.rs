@@ -55,6 +55,8 @@ use ndarray::{Array1, Array2, ArrayView2};
 use super::super::apply::FactoredEdit;
 use super::super::attention::RotaryEmbedding;
 use super::super::bounds::total_variation_over_logit_boxes;
+use super::super::dense::eigh;
+use gam_linalg::roundoff::SymmetricAssembly;
 use super::super::lift::{TensorId, TensorRegistry};
 use super::super::secant::{BandedMatrix, BandedVector, bilinear_change, softmax_change};
 use super::super::supports::{EvidenceStatus, ExactBasis};
@@ -349,6 +351,300 @@ pub fn compile_query_key_edit(problem: &QueryKeyEditProblem<'_>, control: &str) 
         first_order,
         cross,
         rows,
+        compiled: CompiledControl::new(control.to_string(), Some(plan), realization)?,
+    })
+}
+
+/// One set-type score requirement: the score of query row `query` on key row `key` is set to
+/// `target` (`σ` included).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScoreRequirement {
+    pub query: usize,
+    pub key: usize,
+    pub target: f64,
+}
+
+/// A bilinear requirement on one head, solved for `(Q′, K′)` together.
+#[derive(Clone, Debug)]
+pub struct QueryKeySolveProblem<'a> {
+    pub registry: &'a TensorRegistry,
+    /// The native `Q`, `K` (`head_dim × width`).
+    pub query: ArrayView2<'a, f64>,
+    pub key: ArrayView2<'a, f64>,
+    pub query_rows: HeadRows,
+    pub key_rows: HeadRows,
+    pub rotary: Option<&'a RotaryEmbedding>,
+    pub score_scale: f64,
+    pub queries: ArrayView2<'a, f64>,
+    pub query_positions: &'a [i64],
+    pub keys: ArrayView2<'a, f64>,
+    pub key_positions: &'a [i64],
+    pub causal: bool,
+    pub requirements: &'a [ScoreRequirement],
+    /// Entrywise radius within which the targets are known.
+    pub target_radius: f64,
+    /// Declared budget of alternating rounds (each a query solve and a key solve).
+    pub max_rounds: usize,
+}
+
+/// The family a solved score requirement is certified over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScoreFamily {
+    pub requirements: usize,
+}
+
+/// What [`solve_query_key_setting`] found.
+#[derive(Clone, Debug)]
+pub struct QueryKeySolveReport {
+    /// The solved setting `(Q′, K′)`.
+    pub query_setting: Array2<f64>,
+    pub key_setting: Array2<f64>,
+    /// Per requirement: the executed score's residual `S′ − S*` and its band.
+    pub residuals: Vec<(f64, f64)>,
+    pub rounds: usize,
+    /// The exact finite change of the solved setting, through the softmax.
+    pub certification: QueryKeyEditReport,
+    pub compiled: CompiledControl<usize, ScoreFamily>,
+}
+
+/// `R_p` on head coordinates: each rotary plane turned by `p ω_j` and scaled by the attention
+/// scaling, pass-through coordinates untouched.
+fn rotation(rotary: Option<&RotaryEmbedding>, position: i64, head_dim: usize) -> Array2<f64> {
+    let mut matrix = Array2::<f64>::eye(head_dim);
+    if let Some(rotary) = rotary {
+        let scaling = rotary.attention_scaling;
+        for (plane, &frequency) in rotary.inverse_frequencies.iter().enumerate() {
+            let (a, b) = rotary.plane(plane);
+            let (sin, cos) = (position as f64 * frequency).sin_cos();
+            matrix[[a, a]] = scaling * cos;
+            matrix[[a, b]] = -scaling * sin;
+            matrix[[b, a]] = scaling * sin;
+            matrix[[b, b]] = scaling * cos;
+        }
+    }
+    matrix
+}
+
+/// Every requirement's executed score `σ q̃ᵀk̃`, its residual against the target and its band:
+/// the rotated rows' formation bands through the product, `γ_{dh}` for the inner product, and
+/// the declared target radius.
+fn score_residuals(problem: &QueryKeySolveProblem<'_>, query: ArrayView2<'_, f64>, key: ArrayView2<'_, f64>) -> Vec<(f64, f64)> {
+    let (q, q_band) = rotated_rows(query, problem.queries, problem.query_positions, problem.rotary);
+    let (k, k_band) = rotated_rows(key, problem.keys, problem.key_positions, problem.rotary);
+    let sigma = problem.score_scale;
+    let head_dim = query.nrows();
+    problem
+        .requirements
+        .iter()
+        .map(|requirement| {
+            let (qt, qb) = (q.row(requirement.query), q_band.row(requirement.query));
+            let (ks, kb) = (k.row(requirement.key), k_band.row(requirement.key));
+            let score = sigma * qt.dot(&ks);
+            let magnitude: f64 = qt.iter().zip(ks.iter()).map(|(a, b)| (a * b).abs()).sum();
+            let propagated: f64 = (0..head_dim)
+                .map(|i| qb[i] * ks[i].abs() + qt[i].abs() * kb[i] + qb[i] * kb[i])
+                .sum();
+            let band = inflated(
+                sigma.abs() * (propagated + accumulation_growth(head_dim + 1) * magnitude)
+                    + f64::EPSILON * score.abs()
+                    + problem.target_radius,
+                2,
+            );
+            (score - requirement.target, band)
+        })
+        .collect()
+}
+
+/// The largest excess of a residual over its band; `≤ 0` certifies every requirement.
+fn excess(residuals: &[(f64, f64)]) -> f64 {
+    residuals.iter().fold(f64::NEG_INFINITY, |worst, (value, band)| worst.max(value.abs() - band))
+}
+
+/// `‖r‖₂` over the requirements: alternating least squares decreases it every solve.
+fn residual_norm(residuals: &[(f64, f64)]) -> f64 {
+    residuals.iter().map(|(value, _)| value * value).sum::<f64>().sqrt()
+}
+
+/// The minimum-norm step `Δ` of one factor with `⟨Δ, u_j x_jᵀ⟩ = b_j` for every requirement:
+/// `Δ = Σ λ_j u_j x_jᵀ` with `M λ = b`, `M_ij = (x_i·x_j)(u_i·u_j)`, solved on the Gram's
+/// eigenvalues resolved above its spectrum band.
+fn minimum_norm_step(
+    directions: &Array2<f64>,
+    inputs: &Array2<f64>,
+    right_side: &Array1<f64>,
+) -> Result<Array2<f64>, CompileError> {
+    let product = directions.dot(&directions.t()) * &inputs.dot(&inputs.t());
+    let gram = (&product + &product.t()) * 0.5;
+    let decomposed = eigh(gram.view(), SymmetricAssembly::Mirrored, None)?;
+    let mut lambda = Array1::<f64>::zeros(right_side.len());
+    for (index, &value) in decomposed.values.iter().enumerate() {
+        if value > decomposed.band {
+            let vector = decomposed.vectors.column(index);
+            lambda = lambda + &vector.mapv(|entry| entry * vector.dot(right_side) / value);
+        }
+    }
+    let weighted = Array2::from_shape_fn(directions.dim(), |(j, i)| lambda[j] * directions[[j, i]]);
+    Ok(weighted.t().dot(inputs))
+}
+
+/// The exact finite change of the setting `(query, key)` of `problem`'s head, under `claim`.
+fn certify_setting<'b>(
+    problem: &'b QueryKeySolveProblem<'_>,
+    query: ArrayView2<'b, f64>,
+    key: ArrayView2<'b, f64>,
+    claim: ScoreClaim<'b>,
+    control: &str,
+) -> Result<QueryKeyEditReport, CompileError> {
+    compile_query_key_edit(
+        &QueryKeyEditProblem {
+            registry: problem.registry,
+            query: problem.query,
+            key: problem.key,
+            query_setting: query,
+            key_setting: key,
+            query_rows: problem.query_rows.clone(),
+            key_rows: problem.key_rows.clone(),
+            rotary: problem.rotary,
+            score_scale: problem.score_scale,
+            queries: problem.queries,
+            query_positions: problem.query_positions,
+            keys: problem.keys,
+            key_positions: problem.key_positions,
+            causal: problem.causal,
+            claim,
+        },
+        control,
+    )
+}
+
+/// Solves the set-type score requirements for `(Q′, K′)` by alternating exact minimum-norm
+/// linear solves (a query solve with `K′` fixed, then a key solve with `Q′` fixed; each is
+/// linear in its factor), certifies the executed scores against the targets, and checks the
+/// solved setting's exact finite change through the softmax. The control is exactly
+/// realized on the declared requirements when every residual lies within its band, and only
+/// empirically validated otherwise.
+pub fn solve_query_key_setting(problem: &QueryKeySolveProblem<'_>, control: &str) -> Result<QueryKeySolveReport, CompileError> {
+    let (head_dim, width) = problem.query.dim();
+    require_shape("key weight", (head_dim, width), problem.key.dim())?;
+    require_finite("query weight", problem.query.iter().copied())?;
+    require_finite("key weight", problem.key.iter().copied())?;
+    if !(problem.target_radius.is_finite() && problem.target_radius >= 0.0) {
+        return Err(CompileError::InvalidDeclaration {
+            what: "target radius",
+            reason: format!("must be finite and nonnegative; got {}", problem.target_radius),
+        });
+    }
+    if problem.requirements.is_empty() {
+        return Err(CompileError::InvalidDeclaration {
+            what: "score requirements",
+            reason: "a score setting needs at least one requirement".to_string(),
+        });
+    }
+    for requirement in problem.requirements {
+        if requirement.query >= problem.queries.nrows()
+            || requirement.key >= problem.keys.nrows()
+            || !requirement.target.is_finite()
+            || (problem.causal
+                && problem.key_positions.get(requirement.key) > problem.query_positions.get(requirement.query))
+        {
+            return Err(CompileError::InvalidDeclaration {
+                what: "score requirement",
+                reason: format!("{requirement:?} names no attended pair or a non-finite target"),
+            });
+        }
+    }
+    let sigma = problem.score_scale;
+    let rotations_q: Vec<Array2<f64>> =
+        problem.query_positions.iter().map(|&p| rotation(problem.rotary, p, head_dim)).collect();
+    let rotations_k: Vec<Array2<f64>> =
+        problem.key_positions.iter().map(|&p| rotation(problem.rotary, p, head_dim)).collect();
+    let count = problem.requirements.len();
+    let query_inputs = Array2::from_shape_fn((count, width), |(j, i)| problem.queries[[problem.requirements[j].query, i]]);
+    let key_inputs = Array2::from_shape_fn((count, width), |(j, i)| problem.keys[[problem.requirements[j].key, i]]);
+    let mut query = problem.query.to_owned();
+    let mut key = problem.key.to_owned();
+    let mut residuals = score_residuals(problem, query.view(), key.view());
+    let mut rounds = 0;
+    while excess(&residuals) > 0.0 && rounds < problem.max_rounds {
+        let start = residual_norm(&residuals);
+        rounds += 1;
+        for side in [0, 1] {
+            let mut directions = Array2::<f64>::zeros((count, head_dim));
+            for (j, requirement) in problem.requirements.iter().enumerate() {
+                let (rq, rk) = (&rotations_q[requirement.query], &rotations_k[requirement.key]);
+                let direction = if side == 0 {
+                    rq.t().dot(&rk.dot(&key.dot(&problem.keys.row(requirement.key)))) * sigma
+                } else {
+                    rk.t().dot(&rq.dot(&query.dot(&problem.queries.row(requirement.query)))) * sigma
+                };
+                directions.row_mut(j).assign(&direction);
+            }
+            let right_side: Array1<f64> = residuals.iter().map(|(value, _)| -value).collect();
+            if side == 0 {
+                query = &query + &minimum_norm_step(&directions, &query_inputs, &right_side)?;
+            } else {
+                key = &key + &minimum_norm_step(&directions, &key_inputs, &right_side)?;
+            }
+            residuals = score_residuals(problem, query.view(), key.view());
+            if excess(&residuals) <= 0.0 {
+                break;
+            }
+        }
+        if !(residual_norm(&residuals) < start) {
+            break;
+        }
+    }
+    require_finite("solved setting", query.iter().chain(key.iter()).copied())?;
+    // The exact finite change of the solved setting: declared pairs claim their targets, the
+    // rest claim their certified change, so the TV bound speaks about the declared pairs.
+    let first = certify_setting(problem, query.view(), key.view(), ScoreClaim::FirstOrder, control)?;
+    let (base_q, _) = rotated_rows(problem.query, problem.queries, problem.query_positions, problem.rotary);
+    let (base_k, _) = rotated_rows(problem.key, problem.keys, problem.key_positions, problem.rotary);
+    let mut claimed = first.exact_change.values.clone();
+    for requirement in problem.requirements {
+        let base = sigma * base_q.row(requirement.query).dot(&base_k.row(requirement.key));
+        claimed[[requirement.query, requirement.key]] = requirement.target - base;
+    }
+    let certification = certify_setting(problem, query.view(), key.view(), ScoreClaim::Declared(claimed.view()), control)?;
+    let (worst, _) = residuals
+        .iter()
+        .enumerate()
+        .fold((0, f64::NEG_INFINITY), |(best, value), (j, (r, b))| {
+            if r.abs() - b > value { (j, r.abs() - b) } else { (best, value) }
+        });
+    let value = residuals.iter().fold(0.0_f64, |m, (r, _)| m.max(r.abs()));
+    let band = residuals.iter().fold(0.0_f64, |m, (_, b)| m.max(*b));
+    let status = EvidenceStatus::exact(
+        value,
+        band,
+        ExactBasis::Exhaustive {
+            cardinality: count as u64,
+        },
+        Some(worst),
+        ScoreFamily { requirements: count },
+    )?;
+    let realization = if excess(&residuals) <= 0.0 {
+        ControlRealization::exactly_realized_on_family(status)?
+    } else {
+        ControlRealization::empirically_validated(status)?
+    };
+    let plan = if query == problem.query && key == problem.key {
+        NativeEditPlan::native()
+    } else {
+        certification
+            .compiled
+            .plan
+            .clone()
+            .ok_or(CompileError::PlanStatusMismatch {
+                control: control.to_string(),
+            })?
+    };
+    Ok(QueryKeySolveReport {
+        query_setting: query,
+        key_setting: key,
+        residuals,
+        rounds,
+        certification,
         compiled: CompiledControl::new(control.to_string(), Some(plan), realization)?,
     })
 }

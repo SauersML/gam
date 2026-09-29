@@ -16,7 +16,11 @@ use super::code::{EvidenceStatusWire, ExactBasisWire, ExtremumWire};
 use super::{MpdOutput, MpdResult, MpdSurfaceError, absent_when_infinite, finite, input, matrix, output, vector};
 use crate::attention::RotaryEmbedding;
 use crate::compile::bilinear::{
-    HeadRows, QueryKeyDomain, QueryKeyEditProblem, ScoreClaim, compile_query_key_edit,
+    HeadRows, QueryKeyDomain, QueryKeyEditProblem, QueryKeySolveProblem, ScoreClaim, ScoreFamily, ScoreRequirement,
+    compile_query_key_edit, solve_query_key_setting,
+};
+use crate::compile::path::{
+    PathActivation, PathFamily, PathLayer, PathProblem, PathSite, PathWitness, compile_path,
 };
 use crate::compile::chart::{
     ChartSetting, FactorBinding, FixedRankChart, compile_chart_edit,
@@ -113,6 +117,68 @@ pub enum CompileProblem {
     QueryKeyEdit(Box<QueryKeyRequest>),
     /// `compile::null::physically_null_supremum`.
     NullEdit { edit_gram: String, response_gram: String },
+    /// `compile::path::compile_path`: a set-type requirement downstream of norms and MLPs,
+    /// solved at the path's editable linear sites through the exact forward.
+    Path(Box<PathRequest>),
+    /// `compile::bilinear::solve_query_key_setting`: set-type scores solved for `(Q′, K′)`.
+    QueryKeySolve(Box<QueryKeySolveRequest>),
+}
+
+/// A linear read of a path: storage, the id of its weight (`out × in`) and optional bias.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathSiteWire {
+    pub storage: String,
+    pub weight: String,
+    pub bias: Option<String>,
+    pub editable: bool,
+}
+
+/// [`PathLayer`] on the wire.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PathLayerWire {
+    Linear { site: usize },
+    RmsNorm { gain: Option<String>, epsilon: f64 },
+    Silu {},
+    ExactGelu {},
+    Relu {},
+    Swiglu { gate: usize, up: usize },
+    Residual { layers: Vec<PathLayerWire> },
+}
+
+/// A path requirement.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathRequest {
+    pub sites: Vec<PathSiteWire>,
+    pub layers: Vec<PathLayerWire>,
+    pub inputs: String,
+    pub targets: String,
+    pub target_radius: f64,
+    pub off_target: Option<String>,
+    pub max_iterations: usize,
+}
+
+/// A set-type score requirement solved on both sides of one head.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueryKeySolveRequest {
+    pub query: String,
+    pub key: String,
+    pub query_rows: HeadRowsWire,
+    pub key_rows: HeadRowsWire,
+    pub rotary: Option<RotaryEmbedding>,
+    pub score_scale: f64,
+    pub queries: String,
+    pub query_positions: Vec<i64>,
+    pub keys: String,
+    pub key_positions: Vec<i64>,
+    pub causal: bool,
+    /// `[query row, key row, target score]` triples; the rows are integral.
+    pub requirements: Vec<(usize, usize, f64)>,
+    pub target_radius: f64,
+    pub max_rounds: usize,
 }
 
 /// One requirement on the edited storage.
@@ -278,6 +344,9 @@ pub enum WitnessWire {
     },
     Compatibility { left: usize, right: usize },
     OffTarget { set: usize, observation: usize },
+    /// An observation and output coordinate of a path, or a requirement index of a score
+    /// setting (`coordinate` 0).
+    Entry { observation: usize, coordinate: usize },
     Residual { side: SideWire, column: usize, entry: usize },
     Tie { tie: usize, row: usize, col: usize },
     Coupling { path: Vec<SupportNodeWire> },
@@ -347,6 +416,20 @@ pub enum CompileFindings {
         exact_change_bands: String,
         first_order: String,
         cross: String,
+        claim_total_variation: Vec<f64>,
+    },
+    Path {
+        iterations: usize,
+        residual: String,
+        residual_band: String,
+        off_target_damage: Option<EvidenceStatusWire<WitnessWire, String>>,
+    },
+    QueryKeySolve {
+        query_setting: String,
+        key_setting: String,
+        rounds: usize,
+        /// `[residual, band]` per requirement.
+        residuals: Vec<[f64; 2]>,
         claim_total_variation: Vec<f64>,
     },
     /// `sup uᵀKu` over the unit `G`-ball of `range(G)`, or the counterexample refusing it.
@@ -608,6 +691,28 @@ fn gain_site<'a>(
             GainAxisWire::Columns => GainAxis::Columns,
         },
     })
+}
+
+fn path_layers(
+    wires: &[PathLayerWire],
+    tensors: &BTreeMap<String, ArrayD<f64>>,
+) -> Result<Vec<PathLayer>, MpdSurfaceError> {
+    let mut layers = Vec::with_capacity(wires.len());
+    for wire in wires {
+        layers.push(match wire {
+            PathLayerWire::Linear { site } => PathLayer::Linear { site: *site },
+            PathLayerWire::RmsNorm { gain, epsilon } => PathLayer::RmsNorm {
+                gain: gain.as_deref().map(|id| slice_of(tensors, id)).transpose()?,
+                epsilon: *epsilon,
+            },
+            PathLayerWire::Silu {} => PathLayer::Activation(PathActivation::Silu),
+            PathLayerWire::ExactGelu {} => PathLayer::Activation(PathActivation::ExactGelu),
+            PathLayerWire::Relu {} => PathLayer::Activation(PathActivation::Relu),
+            PathLayerWire::Swiglu { gate, up } => PathLayer::Swiglu { gate: *gate, up: *up },
+            PathLayerWire::Residual { layers } => PathLayer::Residual(path_layers(layers, tensors)?),
+        });
+    }
+    Ok(layers)
 }
 
 fn slice_of(tensors: &BTreeMap<String, ArrayD<f64>>, id: &str) -> Result<Vec<f64>, MpdSurfaceError> {
@@ -893,6 +998,97 @@ pub(super) fn run(
                 &mut arrays,
                 |row: usize, _| Ok(WitnessWire::Residual { side: SideWire::Right, column: row, entry: 0 }),
                 |domain: &QueryKeyDomain| format!("{} query rows over {} key rows", domain.query_rows, domain.key_rows),
+            )?;
+            (Some(wire), plan, findings)
+        }
+        CompileProblem::Path(request) => {
+            let mut sites = Vec::with_capacity(request.sites.len());
+            for site in &request.sites {
+                sites.push(PathSite {
+                    storage: TensorId(site.storage.clone()),
+                    weight: matrix(tensors, &site.weight)?,
+                    bias: site.bias.as_deref().map(|id| vector(tensors, id)).transpose()?,
+                    editable: site.editable,
+                });
+            }
+            let layers = path_layers(&request.layers, tensors)?;
+            let off_target = request.off_target.as_deref().map(|id| matrix(tensors, id)).transpose()?;
+            let problem = PathProblem {
+                registry: &registry,
+                sites,
+                layers,
+                inputs: matrix(tensors, &request.inputs)?,
+                targets: matrix(tensors, &request.targets)?,
+                target_radius: request.target_radius,
+                off_target,
+                max_iterations: request.max_iterations,
+            };
+            let report = compile_path(&problem, control).map_err(compile_error)?;
+            let plan = plan_report(&report.compiled, &mut arrays);
+            let entry = |witness: PathWitness, _: &mut Arrays| {
+                Ok(WitnessWire::Entry {
+                    observation: witness.observation,
+                    coordinate: witness.coordinate,
+                })
+            };
+            let domain = |family: &PathFamily| format!("{} declared inputs", family.inputs);
+            let findings = CompileFindings::Path {
+                iterations: report.iterations,
+                residual: arrays.put("residual".to_string(), report.residual.into_dyn()),
+                residual_band: arrays.put("residual_band".to_string(), report.residual_band.into_dyn()),
+                off_target_damage: report
+                    .off_target_damage
+                    .map(|status| status_wire(status, &mut arrays, &entry, &domain))
+                    .transpose()?,
+            };
+            let wire = realization(report.compiled.realization, &mut arrays, entry, domain)?;
+            (Some(wire), plan, findings)
+        }
+        CompileProblem::QueryKeySolve(request) => {
+            let requirements: Vec<ScoreRequirement> = request
+                .requirements
+                .iter()
+                .map(|&(query, key, target)| ScoreRequirement { query, key, target })
+                .collect();
+            let head_rows = |wire: &HeadRowsWire| HeadRows {
+                storage: TensorId(wire.storage.clone()),
+                row_offset: wire.row_offset,
+            };
+            let problem = QueryKeySolveProblem {
+                registry: &registry,
+                query: matrix(tensors, &request.query)?,
+                key: matrix(tensors, &request.key)?,
+                query_rows: head_rows(&request.query_rows),
+                key_rows: head_rows(&request.key_rows),
+                rotary: request.rotary.as_ref(),
+                score_scale: request.score_scale,
+                queries: matrix(tensors, &request.queries)?,
+                query_positions: &request.query_positions,
+                keys: matrix(tensors, &request.keys)?,
+                key_positions: &request.key_positions,
+                causal: request.causal,
+                requirements: &requirements,
+                target_radius: request.target_radius,
+                max_rounds: request.max_rounds,
+            };
+            let report = solve_query_key_setting(&problem, control).map_err(compile_error)?;
+            let plan = plan_report(&report.compiled, &mut arrays);
+            let mut residuals = Vec::with_capacity(report.residuals.len());
+            for (value, band) in &report.residuals {
+                residuals.push([finite("score residual", *value)?, finite("score band", *band)?]);
+            }
+            let findings = CompileFindings::QueryKeySolve {
+                query_setting: arrays.put("query_setting".to_string(), report.query_setting.into_dyn()),
+                key_setting: arrays.put("key_setting".to_string(), report.key_setting.into_dyn()),
+                rounds: report.rounds,
+                residuals,
+                claim_total_variation: report.certification.rows.iter().map(|row| row.claim_total_variation).collect(),
+            };
+            let wire = realization(
+                report.compiled.realization,
+                &mut arrays,
+                |index: usize, _| Ok(WitnessWire::Entry { observation: index, coordinate: 0 }),
+                |family: &ScoreFamily| format!("{} declared score requirements", family.requirements),
             )?;
             (Some(wire), plan, findings)
         }

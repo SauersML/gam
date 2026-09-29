@@ -1,7 +1,7 @@
 #![cfg(test)]
 //! Known-answer tests of the native edit compiler.
 
-use ndarray::{Array2, ArrayView2, array, s};
+use ndarray::{Array2, ArrayView1, ArrayView2, array, s};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
@@ -706,6 +706,57 @@ mod fixed_rank_chart {
         .expect("lifts");
         assert!(unchanged.compiled.plan.as_ref().expect("plan").is_native(), "ρ(0) = θ");
     }
+
+    /// Factor pairs of inner dimension 4 whose product has rank 2: the deficiency sits in the
+    /// read factor (reduced through `R₁`) or in the write factor (through `R₂`).
+    fn wide_pairs() -> Vec<(Array2<f64>, Array2<f64>)> {
+        let mut rng = StdRng::seed_from_u64(31);
+        let full_write = uniform(&mut rng, 6, 4);
+        let low_read = uniform(&mut rng, 4, 2).dot(&uniform(&mut rng, 2, 5));
+        let low_write = uniform(&mut rng, 6, 2).dot(&uniform(&mut rng, 2, 4));
+        let full_read = uniform(&mut rng, 4, 5);
+        vec![(full_write, low_read), (low_write, full_read)]
+    }
+
+    #[test]
+    fn a_wide_factor_pair_is_reduced_to_its_chart_rank_and_lifts_back() {
+        for (write, read) in wide_pairs() {
+            let mut registry = TensorRegistry::default();
+            registry.register_storage(TensorId("o".into()), write.view().into_dyn()).expect("o");
+            registry.register_storage(TensorId("v".into()), read.view().into_dyn()).expect("v");
+            let chart = FixedRankChart::from_factors(write.view(), read.view()).expect("chart");
+            assert_eq!((chart.rank(), chart.inner_dimension()), (2, 4));
+            assert!(chart.reduction_band() < 1e-12, "{}", chart.reduction_band());
+            let dependent = chart.dependent().expect("dependent");
+            let (native, native_band) = chart.native_dependent();
+            let distance = frobenius((&dependent.values - &native).view());
+            assert!(distance <= dependent.frobenius_band + native_band, "{distance}");
+            let (a, b, c) = chart.coordinates();
+            let a_new = &a + &array![[0.2, 0.0], [-0.1, 0.15]];
+            let b_new = &b * 0.5;
+            let c_new = &c + 0.1;
+            let setting = ChartSetting { a: Some(a_new.view()), b: Some(b_new.view()), c: Some(c_new.view()) };
+            let binding = |name: &str| FactorBinding { storage: TensorId(name.into()), stored_transposed: false };
+            let report = compile_chart_edit(&registry, &chart, &setting, &binding("o"), &binding("v"), "ov").expect("lifts");
+            assert!(matches!(report.compiled.realization, ControlRealization::ExactlyRealized { .. }));
+            assert_eq!(report.lifted_write.dim(), (6, 4));
+            let product = report.lifted_write.dot(&report.lifted_read);
+            let pick = |rows: &[usize], cols: &[usize]| product.select(Axis(0), rows).select(Axis(1), cols);
+            let (pr, fr, pc, fc) = (chart.pivot_rows(), chart.free_rows(), chart.pivot_cols(), chart.free_cols());
+            assert!(max_abs((&pick(pr, pc) - &a_new).view()) < 1e-12);
+            assert!(max_abs((&pick(pr, fc) - &b_new).view()) < 1e-12);
+            assert!(max_abs((&pick(fr, pc) - &c_new).view()) < 1e-12);
+            let expected = c_new.dot(&solve(a_new.view(), b_new.view()).expect("solve"));
+            assert!(max_abs((&pick(fr, fc) - &expected).view()) < 1e-11, "the dependent block follows");
+            let plan = report.compiled.plan.as_ref().expect("plan");
+            assert!(max_abs((&(&write + &dense(plan, "o", (6, 4))) - &report.lifted_write).view()) < 1e-15);
+            assert!(max_abs((&(&read + &dense(plan, "v", (4, 5))) - &report.lifted_read).view()) < 1e-15);
+            let unchanged =
+                compile_chart_edit(&registry, &chart, &ChartSetting::default(), &binding("o"), &binding("v"), "ov")
+                    .expect("lifts");
+            assert!(unchanged.compiled.plan.as_ref().expect("plan").is_native());
+        }
+    }
 }
 
 mod query_key {
@@ -882,6 +933,101 @@ mod query_key {
         assert!(report.cross.iter().all(|v| *v == 0.0));
         assert!(matches!(report.compiled.realization, ControlRealization::ExactlyRealized { .. }));
     }
+
+    #[test]
+    fn a_score_setting_is_solved_on_both_sides_and_certified() {
+        use super::super::bilinear::{QueryKeySolveProblem, ScoreRequirement, solve_query_key_setting};
+        // A one-dimensional head: scores are q_t k_s, so a rank-one target needs both sides to
+        // move (neither side alone can fit a·bᵀ from the native q, k).
+        let mut registry = TensorRegistry::default();
+        let fused = array![[0.8, -0.3], [0.2, 0.9]];
+        registry.register_storage(TensorId("qk".into()), fused.view().into_dyn()).expect("qk");
+        let q = fused.slice(s![..1, ..]).to_owned();
+        let k = fused.slice(s![1.., ..]).to_owned();
+        let xq = array![[1.0, 0.0], [0.3, 1.0]];
+        let xk = array![[0.5, 1.0], [1.0, -0.4]];
+        let (a, b) = ([1.5, -0.5], [0.7, 2.0]);
+        let requirements: Vec<ScoreRequirement> = (0..2)
+            .flat_map(|t| (0..2).map(move |s| ScoreRequirement { query: t, key: s, target: a[t] * b[s] }))
+            .collect();
+        let positions = [0_i64, 0];
+        let problem = QueryKeySolveProblem {
+            registry: &registry,
+            query: q.view(),
+            key: k.view(),
+            query_rows: rows(0),
+            key_rows: rows(1),
+            rotary: None,
+            score_scale: 1.0,
+            queries: xq.view(),
+            query_positions: &positions,
+            keys: xk.view(),
+            key_positions: &positions,
+            causal: false,
+            requirements: &requirements,
+            target_radius: 0.0,
+            max_rounds: 500,
+        };
+        let report = solve_query_key_setting(&problem, "route").expect("solves");
+        assert!(report.rounds > 1, "one side alone cannot fit the rank-one target");
+        let ControlRealization::ExactlyRealized { residual: EvidenceStatus::Exact { basis, .. }, .. } =
+            &report.compiled.realization
+        else {
+            panic!("certified: {:?} after {} rounds", report.residuals, report.rounds);
+        };
+        assert_eq!(*basis, ExactBasis::Exhaustive { cardinality: 4 });
+        for requirement in &requirements {
+            let score = report.query_setting.dot(&xq.row(requirement.query))[0]
+                * report.key_setting.dot(&xk.row(requirement.key))[0];
+            assert!((score - requirement.target).abs() < 1e-12);
+            // The exact finite change agrees with the target's change from the native score.
+            let native = q.dot(&xq.row(requirement.query))[0] * k.dot(&xk.row(requirement.key))[0];
+            let change = report.certification.exact_change.values[[requirement.query, requirement.key]];
+            let band = report.certification.exact_change.bands[[requirement.query, requirement.key]];
+            assert!((change - (requirement.target - native)).abs() <= band + 1e-12);
+        }
+        let plan = report.compiled.plan.as_ref().expect("plan");
+        let edit = dense(plan, "qk", (2, 2));
+        assert!(max_abs((&edit.slice(s![..1, ..]) - &(&report.query_setting - &q)).view()) < 1e-15);
+        assert!(max_abs((&edit.slice(s![1.., ..]) - &(&report.key_setting - &k)).view()) < 1e-15);
+    }
+
+    #[test]
+    fn a_score_setting_one_side_can_reach_is_certified_in_one_round() {
+        use super::super::bilinear::{QueryKeySolveProblem, ScoreRequirement, solve_query_key_setting};
+        let f = fixture();
+        let rotary = rotary();
+        let query_positions = [1_i64, 2, 3];
+        let key_positions = [0_i64, 1, 2, 3];
+        let requirements = [
+            ScoreRequirement { query: 0, key: 1, target: 2.0 },
+            ScoreRequirement { query: 2, key: 0, target: -1.5 },
+            ScoreRequirement { query: 2, key: 3, target: 0.25 },
+        ];
+        let problem = QueryKeySolveProblem {
+            registry: &f.registry,
+            query: f.q.view(),
+            key: f.k.view(),
+            query_rows: rows(0),
+            key_rows: rows(HEAD),
+            rotary: Some(&rotary),
+            score_scale: 0.5,
+            queries: f.xq.view(),
+            query_positions: &query_positions,
+            keys: f.xk.view(),
+            key_positions: &key_positions,
+            causal: true,
+            requirements: &requirements,
+            target_radius: 0.0,
+            max_rounds: 3,
+        };
+        let report = solve_query_key_setting(&problem, "route").expect("solves");
+        assert_eq!(report.rounds, 1);
+        assert!(matches!(report.compiled.realization, ControlRealization::ExactlyRealized { .. }));
+        for (requirement, (residual, band)) in requirements.iter().zip(&report.residuals) {
+            assert!(residual.abs() <= *band, "{requirement:?}");
+        }
+    }
 }
 
 mod null_edits {
@@ -1004,5 +1150,159 @@ mod set_type_settings {
         assert!(guarded_damage <= guarded_band + report.allowance[0], "{guarded_damage} {guarded_band}");
         let edit = dense(report.compiled.plan.as_ref().expect("plan"), "w", (3, 4));
         assert!(max_abs((edit.dot(&on_target.t()) - changes.t()).view()) < 1e-12);
+    }
+}
+
+mod through_nonlinearities {
+    use super::super::path::{PathLayer, PathProblem, PathSite, compile_path};
+    use super::*;
+    use ndarray::Array1;
+
+    const WIDTH: usize = 4;
+    const HIDDEN: usize = 6;
+
+    struct Block {
+        registry: TensorRegistry,
+        gain: Vec<f64>,
+        gate: Array2<f64>,
+        up: Array2<f64>,
+        down: Array2<f64>,
+    }
+
+    fn block() -> Block {
+        let mut rng = StdRng::seed_from_u64(60);
+        let gate = uniform(&mut rng, HIDDEN, WIDTH);
+        let up = uniform(&mut rng, HIDDEN, WIDTH);
+        let down = uniform(&mut rng, WIDTH, HIDDEN);
+        let mut registry = TensorRegistry::default();
+        for (name, weight) in [("gate", &gate), ("up", &up), ("down", &down)] {
+            registry.register_storage(TensorId(name.into()), weight.view().into_dyn()).expect("storage");
+        }
+        Block { registry, gain: vec![1.2, 0.8, 1.0, 0.9], gate, up, down }
+    }
+
+    /// `x + W_d [silu(W_g n(x)) ⊙ W_u n(x)]`, `n` the gained RMSNorm, written out directly.
+    fn reference(b: &Block, gate: &Array2<f64>, up: &Array2<f64>, down: &Array2<f64>, x: ArrayView1<'_, f64>) -> Array1<f64> {
+        let r = (1e-6 + x.dot(&x) / WIDTH as f64).sqrt();
+        let normed = Array1::from_shape_fn(WIDTH, |i| b.gain[i] * x[i] / r);
+        let a = gate.dot(&normed);
+        let u = up.dot(&normed);
+        let hidden = Array1::from_shape_fn(HIDDEN, |i| a[i] / (1.0 + (-a[i]).exp()) * u[i]);
+        &x + &down.dot(&hidden)
+    }
+
+    fn layers(b: &Block) -> Vec<PathLayer> {
+        vec![PathLayer::Residual(vec![
+            PathLayer::RmsNorm { gain: Some(b.gain.clone()), epsilon: 1e-6 },
+            PathLayer::Swiglu { gate: 0, up: 1 },
+            PathLayer::Linear { site: 2 },
+        ])]
+    }
+
+    fn sites<'a>(b: &'a Block, editable: [bool; 3]) -> Vec<PathSite<'a>> {
+        [("gate", &b.gate), ("up", &b.up), ("down", &b.down)]
+            .into_iter()
+            .zip(editable)
+            .map(|((name, weight), editable)| PathSite { storage: TensorId(name.into()), weight: weight.view(), bias: None, editable })
+            .collect()
+    }
+
+    fn applied(plan: &NativeEditPlan, name: &str, weight: &Array2<f64>) -> Array2<f64> {
+        weight + &dense(plan, name, weight.dim())
+    }
+
+    #[test]
+    fn a_requirement_behind_a_norm_and_a_gate_is_solved_at_the_gate_and_certified() {
+        let b = block();
+        let mut rng = StdRng::seed_from_u64(61);
+        let inputs = uniform(&mut rng, 3, WIDTH);
+        // Targets reachable by moving the gate (nonlinear in it, through silu).
+        let moved_gate = &b.gate + &(uniform(&mut rng, HIDDEN, WIDTH) * 0.1);
+        let targets = Array2::from_shape_fn((3, WIDTH), |(r, c)| reference(&b, &moved_gate, &b.up, &b.down, inputs.row(r))[c]);
+        let off = uniform(&mut rng, 2, WIDTH);
+        let problem = PathProblem {
+            registry: &b.registry,
+            sites: sites(&b, [true, false, false]),
+            layers: layers(&b),
+            inputs: inputs.view(),
+            targets: targets.view(),
+            target_radius: 0.0,
+            off_target: Some(off.view()),
+            max_iterations: 60,
+        };
+        let report = compile_path(&problem, "gate").expect("solves");
+        assert!(report.iterations > 1, "a nonlinear site needs more than one Gauss–Newton step");
+        assert!(
+            matches!(report.compiled.realization, ControlRealization::ExactlyRealized { .. }),
+            "{:?} after {}",
+            report.compiled.realization,
+            report.iterations
+        );
+        // Execute the stored plan through an independent forward.
+        let plan = report.compiled.plan.as_ref().expect("plan");
+        assert_eq!(plan.edits().len(), 1);
+        let gate = applied(plan, "gate", &b.gate);
+        for row in 0..3 {
+            let out = reference(&b, &gate, &b.up, &b.down, inputs.row(row));
+            for c in 0..WIDTH {
+                assert!((out[c] - targets[[row, c]]).abs() <= report.residual_band[[row, c]] + 1e-13);
+            }
+        }
+        assert!(report.off_target_damage.is_some());
+    }
+
+    #[test]
+    fn a_requirement_linear_in_its_site_is_certified_at_once() {
+        let b = block();
+        let mut rng = StdRng::seed_from_u64(62);
+        let inputs = uniform(&mut rng, 3, WIDTH);
+        let native = Array2::from_shape_fn((3, WIDTH), |(r, c)| reference(&b, &b.gate, &b.up, &b.down, inputs.row(r))[c]);
+        let targets = &native + &(uniform(&mut rng, 3, WIDTH) * 0.5);
+        let problem = PathProblem {
+            registry: &b.registry,
+            sites: sites(&b, [false, false, true]),
+            layers: layers(&b),
+            inputs: inputs.view(),
+            targets: targets.view(),
+            target_radius: 0.0,
+            off_target: None,
+            max_iterations: 5,
+        };
+        let report = compile_path(&problem, "down").expect("solves");
+        // Linear in its site: the first step is exact up to where LSQR stopped, and at most
+        // one more step finishes it.
+        assert!(report.iterations <= 2, "{}", report.iterations);
+        assert!(matches!(report.compiled.realization, ControlRealization::ExactlyRealized { .. }));
+        let down = applied(report.compiled.plan.as_ref().expect("plan"), "down", &b.down);
+        for row in 0..3 {
+            let out = reference(&b, &b.gate, &b.up, &down, inputs.row(row));
+            assert!(out.iter().zip(targets.row(row)).all(|(a, t)| (a - t).abs() < 1e-12));
+        }
+    }
+
+    #[test]
+    fn an_overdetermined_requirement_is_only_empirically_validated() {
+        let b = block();
+        let mut rng = StdRng::seed_from_u64(63);
+        // 8 inputs × 4 outputs = 32 conditions on the 24 entries of the down projection.
+        let inputs = uniform(&mut rng, 8, WIDTH);
+        let targets = uniform(&mut rng, 8, WIDTH);
+        let problem = PathProblem {
+            registry: &b.registry,
+            sites: sites(&b, [false, false, true]),
+            layers: layers(&b),
+            inputs: inputs.view(),
+            targets: targets.view(),
+            target_radius: 0.0,
+            off_target: None,
+            max_iterations: 5,
+        };
+        let report = compile_path(&problem, "down").expect("solves");
+        let ControlRealization::EmpiricallyValidated { residual: EvidenceStatus::Exact { value, numerical_error, .. }, .. } =
+            &report.compiled.realization
+        else {
+            panic!("an infeasible requirement is not exactly realized");
+        };
+        assert!(value > numerical_error);
     }
 }

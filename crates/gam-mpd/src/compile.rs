@@ -72,9 +72,14 @@
 //! * [`controls`]: coupled controls of a factorization `γ̂ = A φ(B h)`, their coupling
 //!   classes, and coordinated writer/reader edits.
 //! * [`chart`]: fixed-rank charts of a low-rank joint operator, the dependent block
-//!   computed, and the lift to the native factors through the `GL(r)` gauge.
+//!   computed, and the lift to the native factors through the `GL(r)` gauge; factors wider
+//!   than the chart rank are reduced through `GL(h)` first, with a band.
 //! * [`bilinear`]: query/key edits with every cross term, certified through the exact
-//!   finite softmax.
+//!   finite softmax, and set-type score requirements solved for `(Q′, K′)` together by
+//!   alternating exact linear solves.
+//! * [`path`]: requirements downstream of norms and MLPs, solved at one or more linear
+//!   sites through the exact forward (Gauss–Newton, exact Jacobian products, LSQR) and
+//!   certified by executing the edited path.
 //! * [`null`]: physically null edits, `sup_{uᵀGu ≤ 1} uᵀKu` on `range(G)`, refused when
 //!   `ker G ⊄ ker K`.
 //! * [`ties`]: declared ties between separately stored blocks, checked on a plan.
@@ -98,6 +103,7 @@ pub mod chart;
 pub mod controls;
 pub mod linear;
 pub mod null;
+pub mod path;
 pub mod ties;
 
 #[cfg(test)]
@@ -161,6 +167,28 @@ impl<W, D> ControlRealization<W, D> {
             }),
             _ => Err(CompileError::StatusTooStrong {
                 claimed: "exactly realized",
+                evidence: status_name(&residual),
+            }),
+        }
+    }
+
+    /// Exactly realized on a declared finite family: refused unless `residual` is exhaustive
+    /// over that family and lies within its own numerical error, so the requirement holds at
+    /// every member up to the evaluation band. It states nothing beyond the family, which
+    /// the residual's domain names.
+    pub fn exactly_realized_on_family(residual: EvidenceStatus<W, D>) -> Result<Self, CompileError> {
+        match residual {
+            EvidenceStatus::Exact {
+                basis: ExactBasis::Exhaustive { .. },
+                value,
+                numerical_error,
+                ..
+            } if value.abs() <= numerical_error => Ok(Self::ExactlyRealized {
+                residual,
+                checked: Checked(()),
+            }),
+            _ => Err(CompileError::StatusTooStrong {
+                claimed: "exactly realized on the declared family",
                 evidence: status_name(&residual),
             }),
         }
