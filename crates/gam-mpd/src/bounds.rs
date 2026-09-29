@@ -75,7 +75,7 @@
 //! widens the perturbed box, and here it enters only through `φ(O′)` weighted by the reference's runner-up mass, which
 //! is what lets a confident network's unimportant components be certified ablatable in any combination. On the #2951
 //! trained modular-addition transformer, over every deletion of its twelve largest non-key unembedding planes, P15 is
-//! a median 1.4·10⁷ times the exact supremum and P15′ 57 times (`bench/mpd_modadd_p15prime_2951.py`).
+//! a median 1.4·10⁷ times the exact supremum and P15′ 57 times (`bench/mpd_modadd_p15prime_2951.py` at cb215b9689).
 //!
 //! # Sharp softmax total variation
 //!
