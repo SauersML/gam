@@ -37,7 +37,7 @@ use crate::probability::{TailProbability, WeightedChiSquareTerm, signed_weighted
 /// `residual_df` that is not finite and positive, or a `NaN` or negative
 /// `statistic`.
 pub fn fractional_rank_sf(statistic: f64, rank: f64, residual_df: Option<f64>) -> TailProbability {
-    let invalid = TailProbability { probability: f64::NAN, relative_error: f64::NAN };
+    let invalid = TailProbability::invalid();
     if !(rank.is_finite() && rank > 0.0) || statistic.is_nan() || statistic < 0.0 {
         return invalid;
     }
@@ -54,7 +54,7 @@ pub fn fractional_rank_sf(statistic: f64, rank: f64, residual_df: Option<f64>) -
         None => signed_weighted_chi_square_sf(&terms, statistic),
         Some(rho) if rho.is_finite() && rho > 0.0 => {
             if statistic == f64::INFINITY {
-                return TailProbability { probability: 0.0, relative_error: 0.0 };
+                return TailProbability::exact(0.0);
             }
             terms.push(WeightedChiSquareTerm { weight: -statistic / rho, degrees_of_freedom: rho });
             signed_weighted_chi_square_sf(&terms, 0.0)

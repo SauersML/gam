@@ -41,22 +41,44 @@ pub struct WeightedChiSquareTerm {
 pub struct TailProbability {
     pub probability: f64,
     pub relative_error: f64,
+    /// An upper bound on the exact `P` that holds whatever `relative_error` says: `1` where
+    /// nothing sharper is known, and the smallest subnormal where `P` is certified below the
+    /// double range (a Chernoff bound or the tail's own exponent put it under half the smallest
+    /// subnormal, so `0` is its correctly rounded value).
+    pub ceiling: f64,
 }
 
 impl TailProbability {
-    const fn exact(probability: f64) -> Self {
-        Self { probability, relative_error: 0.0 }
+    pub const fn exact(probability: f64) -> Self {
+        Self { probability, relative_error: 0.0, ceiling: probability }
+    }
+
+    /// Input the tail is not defined for: `NaN` in every field.
+    pub const fn invalid() -> Self {
+        Self { probability: f64::NAN, relative_error: f64::NAN, ceiling: f64::NAN }
+    }
+
+    /// A tail certified below half the smallest subnormal: `0` is its correctly rounded value,
+    /// and no relative statement about it is available, only the ceiling.
+    const fn below_double_range() -> Self {
+        Self { probability: 0.0, relative_error: 1.0, ceiling: SMALLEST_SUBNORMAL }
+    }
+
+    /// A value with its relative error bound, and no ceiling sharper than `1`.
+    pub const fn with_relative_error(probability: f64, relative_error: f64) -> Self {
+        Self { probability, relative_error, ceiling: 1.0 }
     }
 
     /// The same bound stated absolutely: `|probability − P| ≤ absolute_error()`. From
     /// `P ≥ probability/(1 + relative_error)` and `P ≤ probability/(1 − relative_error)`, the
-    /// second being the binding one; a relative error of `1` or more leaves only `P ∈ [0, 1]`.
+    /// second being the binding one. A relative error of `1` or more leaves only
+    /// `P ∈ [0, ceiling]`, and `probability` lies in that interval, so the ceiling bounds it.
     pub fn absolute_error(&self) -> f64 {
         if self.probability.is_nan() || self.relative_error.is_nan() {
             return f64::NAN;
         }
         if self.relative_error >= 1.0 {
-            return 1.0;
+            return self.ceiling.min(1.0);
         }
         (self.relative_error * self.probability / (1.0 - self.relative_error)).min(1.0)
     }
@@ -109,7 +131,7 @@ impl TailProbability {
 /// Returns `NaN` in both fields if any weight is non-finite, if any degrees-of-freedom is not
 /// finite and positive, or if `statistic` is `NaN`.
 pub fn signed_weighted_chi_square_sf(terms: &[WeightedChiSquareTerm], statistic: f64) -> TailProbability {
-    let invalid = TailProbability { probability: f64::NAN, relative_error: f64::NAN };
+    let invalid = TailProbability::invalid();
     if statistic.is_nan() {
         return invalid;
     }
@@ -147,6 +169,13 @@ pub fn signed_weighted_chi_square_sf(terms: &[WeightedChiSquareTerm], statistic:
         Err(tail) => tail,
     }
 }
+
+/// `ln(η/2)`, `η = 2⁻¹⁰⁷⁴` the smallest subnormal: a tail below `η/2` rounds to `0`, so `0` is
+/// then `P` correctly rounded. `η/2 = 2⁻¹⁰⁷⁵` is not a double: `0.5·η` rounds (to even) to `0`,
+/// whose logarithm `−∞` no exponent is below, which left every underflow uncertified (gam#4563).
+/// So the threshold is `−1075·ln 2`, taken one relative `ε` low so that its own two roundings
+/// cannot lift it above the true value.
+const LN_HALF_SMALLEST_SUBNORMAL: f64 = -1075.0 * std::f64::consts::LN_2 * (1.0 + f64::EPSILON);
 
 /// Roundings between the saddle parameter `y` and one factor's coefficient `w_k`, apart from the
 /// size of the logarithms on the way, which enter separately: `θ` or `η` (a softplus: exp,
@@ -302,9 +331,9 @@ impl Problem {
             // The statistic is beyond every weight's scale by more than `f64` spans: above them it
             // is an upper tail that underflows, below them nothing is resolved.
             return Err(if statistic > 0.0 {
-                TailProbability { probability: 0.0, relative_error: 1.0 }
+                TailProbability::below_double_range()
             } else {
-                TailProbability { probability: 1.0, relative_error: f64::INFINITY }
+                TailProbability::with_relative_error(1.0, f64::INFINITY)
             });
         }
         let ln_reference = reference.ln();
@@ -334,8 +363,8 @@ impl Problem {
         // Chernoff: `P ≤ E[e^{cQ}]·e^{−cx} = exp(K(c) − c·x)` for every `c` in the strip.
         let ln_mgf = -pairwise(0..scaled.len(), &|k| scaled[k].exponent * point.ln_m[k]);
         let ln_chernoff = ln_mgf - point.theta_xi;
-        if ln_chernoff < (0.5 * SMALLEST_SUBNORMAL).ln() {
-            return Err(TailProbability { probability: 0.0, relative_error: 1.0 });
+        if ln_chernoff < LN_HALF_SMALLEST_SUBNORMAL {
+            return Err(TailProbability::below_double_range());
         }
 
         let ln_tau = point.ln_tau;
@@ -566,7 +595,7 @@ impl Problem {
 
     fn assemble(&self, integral: f64, integral_error: f64) -> TailProbability {
         if !(integral > 0.0) {
-            return TailProbability { probability: 0.0, relative_error: 1.0 };
+            return TailProbability::with_relative_error(0.0, 1.0);
         }
         let relative = integral_error / integral;
         let ln_integral = integral.ln();
@@ -579,15 +608,23 @@ impl Problem {
         };
         let probability = (self.ln_prefix + ln_integral).exp().min(1.0);
         if probability == 0.0 {
-            return TailProbability { probability: 0.0, relative_error: 1.0 };
+            // The tail's own exponent, widened by its error, is what certifies it: under half the
+            // smallest subnormal, `0` is `P` correctly rounded.
+            return if self.ln_prefix + ln_integral + log_error < LN_HALF_SMALLEST_SUBNORMAL {
+                TailProbability::below_double_range()
+            } else {
+                TailProbability::with_relative_error(0.0, 1.0)
+            };
         }
         let mut relative_error = log_error.exp_m1();
         if probability < f64::MIN_POSITIVE {
-            // A subnormal result is rounded to an absolute half-spacing, not a relative one.
-            let half = 0.5 * SMALLEST_SUBNORMAL;
-            relative_error += half * log_error.exp() / (probability - half);
+            // A subnormal result is rounded to an absolute half-spacing `η/2`, not a relative
+            // one. `η/2` itself is not a double (it rounds to zero), so the ratio
+            // `(η/2)/(p − η/2)` is taken in units of `η`: `p = k·η` with `k` an integer, and
+            // `1/(2k − 1)` is exact in its operands.
+            relative_error += log_error.exp() / (2.0 * (probability / SMALLEST_SUBNORMAL) - 1.0);
         }
-        TailProbability { probability, relative_error }
+        TailProbability::with_relative_error(probability, relative_error)
     }
 }
 
@@ -768,10 +805,27 @@ mod tests {
     /// bound leaves only `P ∈ [0, 1]`.
     #[test]
     fn the_absolute_error_is_the_binding_side_of_the_relative_bound() {
-        let tail = TailProbability { probability: 0.25, relative_error: 0.2 };
+        let tail = TailProbability::with_relative_error(0.25, 0.2);
         assert_eq!(tail.absolute_error(), 0.2 * 0.25 / 0.8);
-        assert_eq!(TailProbability { probability: 0.0, relative_error: 1.0 }.absolute_error(), 1.0);
+        assert_eq!(TailProbability::with_relative_error(0.0, 1.0).absolute_error(), 1.0);
         assert_eq!(TailProbability::exact(0.5).absolute_error(), 0.0);
-        assert!(TailProbability { probability: f64::NAN, relative_error: f64::NAN }.absolute_error().is_nan());
+        assert!(TailProbability::invalid().absolute_error().is_nan());
+    }
+
+    /// A tail certified below the double range keeps that certificate in its absolute error
+    /// (gam#4563): a te(x, z) smooth beside a factor at n = 2000 scored W = 3814 on about nine
+    /// degrees of freedom, whose Chernoff bound is under half the smallest subnormal, and the
+    /// significance report published `p ≤ 1` because the underflow's bound was stated as "no
+    /// relative accuracy", which `absolute_error` read as the whole unit interval.
+    #[test]
+    fn a_tail_below_the_double_range_is_bounded_by_the_smallest_subnormal_4563() {
+        let tail = signed_weighted_chi_square_sf(&[term(1.0, 9.0)], 3814.0);
+        assert_eq!(tail.probability, 0.0, "{tail:?}");
+        assert_eq!(tail.absolute_error(), SMALLEST_SUBNORMAL, "{tail:?}");
+        // The profiled form of the same statistic, `P(Q − W·V/ν > 0)` with a residual block `V`
+        // on `ν = 1987` degrees of freedom, whose mean puts the second term at `W`.
+        let profiled = signed_weighted_chi_square_sf(&[term(1.0, 9.0), term(-3814.0 / 1987.0, 1987.0)], 0.0);
+        assert_eq!(profiled.probability, 0.0, "{profiled:?}");
+        assert_eq!(profiled.absolute_error(), SMALLEST_SUBNORMAL, "{profiled:?}");
     }
 }

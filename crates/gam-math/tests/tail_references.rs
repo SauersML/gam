@@ -98,7 +98,7 @@ fn signed_weighted_chi_square_sf_matches_its_references_within_its_bound() {
         let terms = terms_of(&cases, row[0]);
         let statistic = number(row[1]);
         let want = number(row[2]);
-        let TailProbability { probability, relative_error: bound } = signed_weighted_chi_square_sf(terms, statistic);
+        let TailProbability { probability, relative_error: bound, .. } = signed_weighted_chi_square_sf(terms, statistic);
         let error = relative_error(probability, want);
         worst = worst.max(error);
         count += 1;

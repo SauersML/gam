@@ -380,24 +380,15 @@ fn the_null_tail_decides_the_certificate_only_where_its_bound_does_2926() {
         Some(false),
         "Cantelli places the unresolved deep tail below the rate"
     );
-    let straddle = TailProbability {
-        probability: alpha,
-        relative_error: 0.1,
-    };
+    let straddle = TailProbability::with_relative_error(alpha, 0.1);
     assert_eq!(closed_form_kept_by_null_tail(straddle, 3.8, 1.0, 2.0), None);
-    let unresolved = TailProbability {
-        probability: 0.0,
-        relative_error: 1.0,
-    };
+    let unresolved = TailProbability::with_relative_error(0.0, 1.0);
     assert_eq!(
         closed_form_kept_by_null_tail(unresolved, 1.0 + 2.0_f64.sqrt(), 1.0, 2.0),
         None,
         "Cantelli's bound one sd above the mean is 1/2, which places nothing"
     );
-    let invalid = TailProbability {
-        probability: f64::NAN,
-        relative_error: f64::NAN,
-    };
+    let invalid = TailProbability::invalid();
     assert_eq!(closed_form_kept_by_null_tail(invalid, 2000.0, 1.0, 2.0), None);
 }
 
