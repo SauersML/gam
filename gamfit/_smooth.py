@@ -61,12 +61,12 @@ class Smooth(BasisDescriptor):
         self,
         *,
         latent: ManifoldDescriptor | type,
-        basis: BasisDescriptor | type | None = None,
+        basis: BasisDescriptor | type,
         penalty: PenaltyDescriptor | None = None,
         name: str | None = None,
     ) -> None:
-        # Magic-by-default: accept the class form ``latent=Circle`` (auto-
-        # instantiate), and auto-pick a sensible basis + penalty when omitted.
+        # The class form ``latent=Circle`` / ``basis=PeriodicHarmonic`` instantiates
+        # the descriptor's defaults.
         if isinstance(latent, type) and issubclass(latent, ManifoldDescriptor):
             latent = latent()
         if not isinstance(latent, ManifoldDescriptor):
@@ -75,9 +75,7 @@ class Smooth(BasisDescriptor):
                 f"got {type(latent).__name__}"
             )
 
-        if basis is None:
-            basis = _default_basis_for(latent)
-        elif isinstance(basis, type) and issubclass(basis, BasisDescriptor):
+        if isinstance(basis, type) and issubclass(basis, BasisDescriptor):
             basis = basis()
         if not isinstance(basis, BasisDescriptor):
             raise TypeError(
@@ -177,45 +175,6 @@ class Smooth(BasisDescriptor):
             "penalty": penalty_payload,
         }
 
-    @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "Smooth":
-        from ._manifold import Circle, Sphere, Torus, Euclidean, CylinderManifold
-        from ._basis_descriptors import PeriodicHarmonic
-
-        latent_p = payload["latent"]
-        basis_p = payload["basis"]
-        lkind = str(latent_p.get("kind", "")).lower()
-        if lkind == "circle":
-            latent: ManifoldDescriptor = Circle()
-        elif lkind == "sphere":
-            latent = Sphere(intrinsic_dim=int(latent_p.get("intrinsic_dim", 2)))
-        elif lkind == "torus":
-            latent = Torus(dim=int(latent_p.get("dim", 2)))
-        elif lkind == "euclidean":
-            latent = Euclidean(dim=int(latent_p.get("dim", 1)))
-        elif lkind == "cylinder":
-            latent = CylinderManifold(open_dim=int(latent_p.get("open_dim", 1)))
-        else:
-            raise ValueError(f"Smooth.from_dict: unknown latent kind {lkind!r}")
-
-        bkind = str(basis_p.get("kind", "")).lower()
-        if bkind == "periodic_harmonic":
-            basis: BasisDescriptor = PeriodicHarmonic(harmonics=int(basis_p.get("harmonics", 3)))
-        else:
-            raise ValueError(f"Smooth.from_dict: unknown basis kind {bkind!r}")
-
-        # Penalty deserialization is not yet implemented for the full
-        # descriptor zoo; rather than silently discard a penalty that the
-        # caller serialized, refuse to round-trip and tell them explicitly.
-        if payload.get("penalty") is not None:
-            raise NotImplementedError(
-                "Smooth.from_dict cannot reconstruct penalty descriptors yet; "
-                "round-tripping a penalised Smooth would silently drop it. "
-                "Reconstruct the penalty manually and pass it to Smooth(...)."
-            )
-
-        return cls(latent=latent, basis=basis, penalty=None, name=payload.get("name"))
-
     def __repr__(self) -> str:
         parts = [f"latent={self.latent!r}", f"basis={self.basis!r}"]
         if self.penalty is not None:
@@ -223,25 +182,6 @@ class Smooth(BasisDescriptor):
         if self.name is not None:
             parts.append(f"name={self.name!r}")
         return f"Smooth({', '.join(parts)})"
-
-
-def _default_basis_for(latent: ManifoldDescriptor) -> BasisDescriptor:
-    """Magic-by-default basis selection from a manifold.
-
-    The rule is: pick the canonical basis for the latent's topology. Today
-    that's a periodic harmonic basis for circle/1-D-torus. For other latent
-    topologies the user must pass ``basis=...`` explicitly.
-    """
-    from ._manifold import Circle, Torus
-    from ._basis_descriptors import PeriodicHarmonic
-    if isinstance(latent, Circle):
-        return PeriodicHarmonic()
-    if isinstance(latent, Torus) and latent.dimension == 1:
-        return PeriodicHarmonic()
-    raise ValueError(
-        f"Smooth: no default basis is registered for latent="
-        f"{type(latent).__name__}(dim={latent.dimension}); pass `basis=...` explicitly."
-    )
 
 
 def _check_manifold_basis_compatibility(

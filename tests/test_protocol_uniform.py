@@ -162,7 +162,7 @@ def test_smooth_dim_mismatch_raises_eagerly() -> None:
         )
 
 
-def test_smooth_to_dict_roundtrip() -> None:
+def test_smooth_to_dict() -> None:
     sm = gamfit.basis.Smooth(
         latent=ManifoldCircle(),
         basis=gamfit.basis.PeriodicHarmonic(harmonics=3),
@@ -173,7 +173,3 @@ def test_smooth_to_dict_roundtrip() -> None:
     assert d["name"] == "phase"
     assert d["latent"]["kind"] == "circle"
     assert d["basis"]["kind"] == "periodic_harmonic"
-
-    sm2 = gamfit.basis.Smooth.from_dict(d)
-    theta = torch.linspace(0.0, 2.0 * math.pi, 8, dtype=torch.float64)
-    assert torch.allclose(sm.evaluate(theta), sm2.evaluate(theta), atol=1e-14)
