@@ -25,6 +25,7 @@ Gramian factor F (F^T F = sum of pulled-back readout Gramians) weighs directions
 they are read, so its relative singular-value counts are the meaningful effective dimensions.
 """
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -109,7 +110,10 @@ def modadd(args):
     key = [int(k) for k in ks[np.argsort(-pu)[: args.kmax]]]
     readouts = {"answers": w_u, "differences": w_u - w_u.mean(0, keepdims=True)}
     planes = {"W_U_key": fourier_planes(w_u, key), "W_E_key": fourier_planes(w_e, key)}
-    res = {"step": step, "config": cfg, "final_test_acc": run["curves"]["test_acc"][-1],
+    with open(args.run, "rb") as fh:
+        sha256 = hashlib.sha256(fh.read()).hexdigest()
+    res = {"checkpoint": {"path": os.path.basename(args.run), "sha256": sha256},
+           "step": step, "config": cfg, "final_test_acc": run["curves"]["test_acc"][-1],
            "key_frequencies_W_U": key, "W_U_power_top": [[int(k), float(x)] for k, x in
                                                           zip(ks[np.argsort(-pu)[:8]], np.sort(pu)[::-1][:8])],
            "W_E_power_top": [[int(k), float(x)] for k, x in zip(ks[np.argsort(-pe)[:8]], np.sort(pe)[::-1][:8])],
