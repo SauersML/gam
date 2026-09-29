@@ -544,6 +544,11 @@ fn insert_coefficient_into_saved_fit(
             precision_diag,
         )?
         .into();
+        // `X'W X` lives in `H`'s active frame too, and the new level has no
+        // likelihood rows: its row and column of the Gram are exactly zero.
+        if let Some(gram) = inference.weighted_gram.as_mut() {
+            *gram = insert_symmetric_array2(gram, reduced_index, 0.0)?;
+        }
         if let Some(se) = inference.factorized_standard_errors.as_mut() {
             *se = insert_array1(se, index, variance_diag.sqrt());
         }

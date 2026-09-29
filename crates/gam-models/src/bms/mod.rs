@@ -1683,11 +1683,16 @@ pub(crate) fn combine_empirical_grids(
         let grid = grids.get(grid_idx).ok_or_else(|| {
             format!("local empirical latent mixture references missing grid {grid_idx}")
         })?;
-        // A centre whose kernel weight underflowed to zero carries no mass.
+        // A centre whose kernel weight underflowed to zero carries no mass, and
+        // neither does a node whose share of it underflows: a product of two
+        // positive weights below the smallest subnormal rounds to zero.
         if grid_weight > 0.0 {
             for (node, weight) in grid.pairs() {
-                nodes.push(node);
-                weights.push(grid_weight * weight);
+                let mass = grid_weight * weight;
+                if mass > 0.0 {
+                    nodes.push(node);
+                    weights.push(mass);
+                }
             }
         }
     }
@@ -1716,6 +1721,17 @@ pub(crate) fn combine_empirical_grids(
     for weight in &mut weights {
         *weight /= total;
     }
+    // Normalizing can underflow a node's mass the same way; it carries none.
+    let mut kept = 0usize;
+    for idx in 0..nodes.len() {
+        if weights[idx] > 0.0 {
+            nodes[kept] = nodes[idx];
+            weights[kept] = weights[idx];
+            kept += 1;
+        }
+    }
+    nodes.truncate(kept);
+    weights.truncate(kept);
     validate_empirical_z_grid(&nodes, &weights, "local empirical latent combined grid")?;
     Ok(EmpiricalZGrid { nodes, weights })
 }

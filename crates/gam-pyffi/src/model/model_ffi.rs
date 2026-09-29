@@ -1332,8 +1332,15 @@ fn competing_risks_prediction_payload_from_json(py: Python<'_>, raw: &str) -> Py
     )?;
     set_optional_competing_risks_matrix(py, &out, "cif", object.get("cif"))?;
     set_optional_competing_risks_matrix(py, &out, "cif_se", object.get("cif_se"))?;
-    set_optional_competing_risks_matrix(py, &out, "cif_lower", object.get("cif_lower"))?;
-    set_optional_competing_risks_matrix(py, &out, "cif_upper", object.get("cif_upper"))?;
+    // The cumulative incidence carries no band; under an interval request the
+    // payload names why (gam#3560).
+    match object
+        .get("cif_band_refusal")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(reason) => out.set_item("cif_band_refusal", reason)?,
+        None => out.set_item("cif_band_refusal", py.None())?,
+    }
     set_optional_competing_risks_matrix(
         py,
         &out,
