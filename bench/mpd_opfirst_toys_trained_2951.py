@@ -1,6 +1,6 @@
 """#2951 probe: do the operation-first tools find structure in TRAINED networks whose ground-truth computation is known?
 
-Pythia GELU MLPs showed no parallel modules (OPFIRST.md result 5). This asks whether that is a property of trained
+Pythia GELU MLPs showed no parallel modules (#2951). This asks whether that is a property of trained
 networks or of our tools, using toys where the task's structure is known and a structured solution exists in the
 student's own function class. Training runs in float32 on CPU (the toys are tiny); all analysis is float64 on CPU and
 reuses the unit-graph machinery of bench/mpd_opfirst_gelu_modules_2951.py (normal form, certified eta, empirical
