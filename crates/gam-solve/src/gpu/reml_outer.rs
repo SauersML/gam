@@ -14,7 +14,7 @@
 use ndarray::Array1;
 use opt::{
     Bfgs, BfgsError, CostStallConfig, FirstOrderSample, FusedObjective, GradientTolerance,
-    InitialMetric, MaxIterations, ObjectiveEvalError, Profile, TerminationReason,
+    InitialMetric, MaxIterations, ObjectiveEvalError, Profile, TerminationReason, ValueBand,
 };
 
 use crate::estimate::EstimationError;
@@ -173,13 +173,6 @@ where
         EstimationError::InvalidInput(format!("outer max_iter is invalid: {err}"))
     })?;
     let bounds = crate::rho_optimizer::outer_bounds(&input.bounds.0, &input.bounds.1)?;
-    // opt's cost stall takes its improvement floor relative to the incumbent,
-    // `rel_tol·(1 + |best|)`, and has no absolute form. Expressed at the seed,
-    // the floor equals the criterion resolution where the walk starts; it
-    // moves with `(1 + |best|)/(1 + |seed|)` as the walk descends, which on a
-    // walk that ends inside the stall window is the ratio of two nearly equal
-    // costs.
-    let cost_stall_rel_tol = input.cost_stall_resolution / (1.0 + input.seed_objective.abs());
     let seed_sample = FirstOrderSample {
         value: input.seed_objective,
         gradient: input.seed_gradient,
@@ -194,6 +187,9 @@ where
         1.0
     };
 
+    // The criterion's resolution where the walk starts is the band its values
+    // carry: the line search and the cost stall judge every comparison against it.
+    let value_band = ValueBand::measured(input.cost_stall_resolution);
     let objective = FusedObjective::new(move |rho: &Array1<f64>| {
         evaluator(rho)
             .map(|eval| FirstOrderSample {
@@ -201,7 +197,8 @@ where
                 gradient: eval.gradient,
             })
             .map_err(|err| ObjectiveEvalError::fatal(err.to_string()))
-    });
+    })
+    .with_value_band(value_band);
     let mut optimizer = Bfgs::new(input.seed_rho.clone(), objective)
         .with_initial_sample(input.seed_rho, seed_sample)
         .with_bounds(bounds)
@@ -209,15 +206,11 @@ where
         .with_max_iterations(max_iterations)
         .with_initial_metric(InitialMetric::Scalar(initial_scale))
         .with_profile(Profile::Robust)
-        // opt's native cost stall with escapes disabled: a window that bought no
-        // resolved descent ends the walk at its best iterate, instead of the
-        // iteration count (#2817). Whether that point is stationary rides on its
-        // termination, below.
-        .with_cost_stall(CostStallConfig::new(
-            cost_stall_rel_tol,
-            crate::rho_optimizer::COST_STALL_WINDOW,
-            input.cost_stall_projected_grad_tol,
-        ));
+        // opt's native cost stall: a step that bought no resolved descent while its
+        // model promised none ends the walk at its best iterate, instead of the
+        // iteration count (#2817, #3018). Whether that point is stationary rides on
+        // its termination, below.
+        .with_cost_stall(CostStallConfig::new(input.cost_stall_projected_grad_tol));
 
     let (solution, converged) = match optimizer.run() {
         Ok(solution) => {

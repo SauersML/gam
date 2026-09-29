@@ -401,7 +401,7 @@ pub(crate) struct OuterConfig {
 /// - The dense ARC and matrix-free trust-region bridges, and the host BFGS
 ///   stuck-stall escapes, license another filled cost-stall window only after
 ///   resolved descent or a smaller incumbent residual
-///   (`CostStallGuard::license_continuation`).
+///   (`opt::StallMonitor::license_continuation`).
 /// - The fixed-point and per-atom walks carry `FixedPointProgress`, which
 ///   stops at an evaluation that buys neither a resolved improvement nor a
 ///   contraction of its step (#3176).

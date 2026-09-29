@@ -6464,7 +6464,7 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 [[package]]
 name = "opt"
 version = "0.9.0"
-source = "git+https://github.com/SauersML/opt.git?rev=3e009103db15f3ebfe0b936c03a1ce4c6f395ad4#3e009103db15f3ebfe0b936c03a1ce4c6f395ad4"
+source = "git+https://github.com/SauersML/opt.git?rev=99e680aaa503976712d34130909a9823b9d5a9d3#99e680aaa503976712d34130909a9823b9d5a9d3"
 dependencies = [
  "faer",
  "log",
