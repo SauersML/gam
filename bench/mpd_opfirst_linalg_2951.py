@@ -1,15 +1,16 @@
 """#2951 operation-first probes: the one owner of float64 dense decompositions.
 
-torch 2.11 macOS wheels link Apple Accelerate for LAPACK (torch.__config__: LAPACK_INFO=accelerate), and
-Accelerate's LAPACK returns wrong results / corrupts memory on rank-deficient, wide-spectrum matrices
-(quicophy/mdopt#574). Every probe decomposition therefore goes through scipy.linalg on numpy float64 arrays,
-which in ~/mpd-data/venv links scipy-openblas. Torch is for model forward passes and matmuls only.
+Every probe decomposition is faer's, through the MPD surface's `dense` operation
+(gamfit.sae.run_parameter_decomposition -> crates/gam-sae/src/parameter_decomposition/dense.rs), never
+LAPACK's: torch's macOS wheels link Apple Accelerate, whose LAPACK returns wrong results on rank-deficient,
+wide-spectrum matrices (quicophy/mdopt#574). Torch is for model forward passes and matmuls only.
 
-Inputs may be numpy arrays or CPU torch tensors; every input is copied to float64 numpy and every output is
-numpy float64. Vector signs are canonical and deterministic: each eigenvector, each left singular vector
-(with its right partner), and each Q column (diag R >= 0) is flipped so the stated entry is positive. No
-Rust surface op (gamfit.sae.run_parameter_decomposition) owns a generic dense decomposition, so none is
-re-implemented or bypassed here.
+Inputs may be numpy arrays or CPU torch tensors; each is sent as a float64 numpy array and every output is
+numpy float64. Signs are the owner's canonical ones: each eigenvector and each left singular vector has its
+largest-|entry| positive (the right singular vector flips with it), and QR has diag(R) >= 0. With band=True,
+eigh/eigvalsh/svd/svdvals/spectral_norm also return the owner's rounding band (singular values:
+max(m, n) eps sigma_1; eigenvalues: n (eps rho + eta)): a value within its band of zero is not resolved
+from zero, so callers can threshold on it instead of an ad-hoc tolerance.
 """
 from __future__ import annotations
 
@@ -18,83 +19,74 @@ import re
 import sys
 
 import numpy as np
-import scipy.linalg as sla
 
 
 def f64(a):
-    """float64 numpy copy of a numpy array or (CPU) torch tensor."""
+    """C-contiguous float64 numpy copy of a numpy array or (CPU) torch tensor."""
     if hasattr(a, "detach"):
         a = a.detach().cpu().numpy()
-    return np.array(a, dtype=np.float64)
+    return np.ascontiguousarray(np.array(a, dtype=np.float64))
 
 
-def _canon_cols(V):
-    """Flip each column so its largest-|entry| (first on ties) is positive; returns the signs."""
-    if V.shape[0] == 0 or V.shape[1] == 0:
-        return np.ones(V.shape[1])
-    pick = V[np.abs(V).argmax(0), np.arange(V.shape[1])]
-    s = np.where(pick < 0, -1.0, 1.0)
-    V *= s
-    return s
+def _dense(decomposition, **arrays):
+    import gamfit
+    out = gamfit.sae.run_parameter_decomposition(
+        {"schema": "gam.mpd-request", "schema_version": 1,
+         "operation": {"kind": "dense", "decomposition": decomposition}}, arrays)
+    return out.report["result"]["decomposition"], out.arrays
 
 
-def eigh(A, subset_by_index=None):
+def eigh(A, subset_by_index=None, band=False):
     """Symmetric eigendecomposition (lower triangle read, ascending eigenvalues, canonical vector signs).
     subset_by_index=[lo, hi] keeps eigenpairs lo..hi inclusive (ascending order)."""
-    w, V = sla.eigh(f64(A), subset_by_index=subset_by_index, overwrite_a=True, check_finite=True)
-    _canon_cols(V)
-    return w, V
+    idx = None if subset_by_index is None else [int(subset_by_index[0]), int(subset_by_index[1]) + 1]
+    rep, arr = _dense({"kind": "eigh", "matrix": "a", "triangle": "lower", "indices": idx}, a=f64(A))
+    out = (arr[rep["values"]], arr[rep["vectors"]])
+    return out + (rep["band"],) if band else out
 
 
-def eigvalsh(A):
+def eigvalsh(A, band=False):
     """Ascending eigenvalues of a symmetric matrix (lower triangle read)."""
-    return sla.eigh(f64(A), eigvals_only=True, overwrite_a=True, check_finite=True)
+    rep, arr = _dense({"kind": "eigvalsh", "matrix": "a", "triangle": "lower"}, a=f64(A))
+    return (arr[rep["values"]], rep["band"]) if band else arr[rep["values"]]
 
 
-def svd(A, full_matrices=False):
-    """A = U diag(s) Vt, s descending; each left singular vector's largest-|entry| is positive and its right
-    partner flipped with it."""
-    U, s, Vt = sla.svd(f64(A), full_matrices=full_matrices, overwrite_a=True, check_finite=True,
-                       lapack_driver="gesdd")
-    k = len(s)
-    sign = _canon_cols(U[:, :k])
-    Vt[:k] *= sign[:, None]
-    return U, s, Vt
+def svd(A, full_matrices=False, band=False):
+    """A = U diag(s) Vt, s descending, canonical signs."""
+    rep, arr = _dense({"kind": "svd", "matrix": "a", "full": bool(full_matrices)}, a=f64(A))
+    out = (arr[rep["u"]], arr[rep["s"]], arr[rep["vt"]])
+    return out + (rep["band"],) if band else out
 
 
-def svdvals(A):
+def svdvals(A, band=False):
     """Singular values, descending."""
-    return sla.svd(f64(A), compute_uv=False, overwrite_a=True, check_finite=True, lapack_driver="gesdd")
+    rep, arr = _dense({"kind": "svdvals", "matrix": "a"}, a=f64(A))
+    return (arr[rep["s"]], rep["band"]) if band else arr[rep["s"]]
 
 
-def spectral_norm(A):
+def spectral_norm(A, band=False):
     """||A||_2; leading axes of an ndim > 2 input are a batch (one norm per trailing matrix)."""
     A = f64(A)
     if A.ndim == 2:
-        return float(svdvals(A)[0]) if A.size else 0.0
-    flat = A.reshape(-1, *A.shape[-2:])
-    return np.array([svdvals(m)[0] if m.size else 0.0 for m in flat]).reshape(A.shape[:-2])
+        if not A.size:
+            return (0.0, 0.0) if band else 0.0
+        rep, _ = _dense({"kind": "spectral_norm", "matrix": "a"}, a=A)
+        return (rep["norm"], rep["band"]) if band else rep["norm"]
+    pairs = [spectral_norm(m, band=True) for m in A.reshape(-1, *A.shape[-2:])]
+    norms = np.array([p[0] for p in pairs]).reshape(A.shape[:-2])
+    return (norms, np.array([p[1] for p in pairs]).reshape(A.shape[:-2])) if band else norms
 
 
 def qr(A, mode="economic"):
-    """A = Q R with diag(R) >= 0 (unique for full column rank). mode 'economic' or 'full' returns (Q, R);
-    mode 'r' returns R only (economic)."""
-    if mode == "r":
-        R = sla.qr(f64(A), mode="r", overwrite_a=True, check_finite=True)[0]
-        k = min(R.shape)
-        R[:k] *= np.where(np.diag(R)[:k] < 0, -1.0, 1.0)[:, None]
-        return R
-    Q, R = sla.qr(f64(A), mode=mode, overwrite_a=True, check_finite=True)
-    k = min(R.shape)
-    s = np.where(np.diag(R)[:k] < 0, -1.0, 1.0)
-    Q[:, :k] *= s
-    R[:k] *= s[:, None]
-    return Q, R
+    """A = Q R with diag(R) >= 0. mode 'economic' or 'full' returns (Q, R); mode 'r' returns R only."""
+    rep, arr = _dense({"kind": "qr", "matrix": "a", "mode": mode}, a=f64(A))
+    return arr[rep["r"]] if mode == "r" else (arr[rep["q"]], arr[rep["r"]])
 
 
 def solve(A, B):
-    """A X = B for square nonsingular A (LU with partial pivoting); raises on exact singularity."""
-    return sla.solve(f64(A), f64(B), overwrite_a=True, overwrite_b=True, check_finite=True)
+    """A X = B for square A (partial-pivot LU); refused at a zero pivot. B a vector or a matrix."""
+    rep, arr = _dense({"kind": "solve", "matrix": "a", "rhs": "b"}, a=f64(A), b=f64(B))
+    return arr[rep["x"]]
 
 
 def inv(A):
@@ -104,40 +96,25 @@ def inv(A):
 
 
 def lstsq(A, B, cond=None):
-    """Minimum-norm least squares (gelsd). Returns (X, residues, rank, singular values)."""
-    return sla.lstsq(f64(A), f64(B), cond=cond, overwrite_a=True, overwrite_b=True, check_finite=True,
-                     lapack_driver="gelsd")
-
-
-def eig(A):
-    """General (non-symmetric) eigendecomposition: complex eigenvalues w and right eigenvectors V (columns,
-    unit 2-norm, each scaled so its largest-modulus entry is real positive)."""
-    w, V = sla.eig(f64(A), overwrite_a=True, check_finite=True)
-    if V.size:
-        pick = V[np.abs(V).argmax(0), np.arange(V.shape[1])]
-        V = V * (np.abs(pick) / np.where(pick == 0, 1, pick))
-    return w, V
-
-
-def _np_like_lapack(mod):
-    try:
-        deps = mod.show_config(mode="dicts")["Build Dependencies"]
-        return {k: "%s %s" % (deps[k].get("name"), deps[k].get("version")) for k in ("blas", "lapack")}
-    except Exception as exc:  # recorded, never fatal
-        return {"error": type(exc).__name__}
+    """Minimum-norm least squares through the thin SVD; singular values at or below the cutoff are dropped
+    (cond None: the band max(m, n) eps sigma_1; else cond * sigma_1). Returns (X, per-column ||A x - b||^2,
+    rank, kept singular values)."""
+    cutoff = {"kind": "band"} if cond is None else {"kind": "relative", "rcond": float(cond)}
+    rep, arr = _dense({"kind": "lstsq", "matrix": "a", "rhs": "b", "cutoff": cutoff}, a=f64(A), b=f64(B))
+    return arr[rep["x"]], arr[rep["residuals"]], rep["rank"], arr[rep["s"]]
 
 
 def env_record():
-    """Python and linear-algebra backends, for receipts. Decompositions here use scipy's LAPACK."""
-    import scipy
+    """Python and linear-algebra backends, for receipts."""
+    import gamfit
     rec = {"python": sys.version.split()[0], "platform": platform.platform(), "machine": platform.machine(),
-           "decompositions": "scipy.linalg float64 (bench/mpd_opfirst_linalg_2951.py)",
-           "numpy": {"version": np.__version__, **_np_like_lapack(np)},
-           "scipy": {"version": scipy.__version__, **_np_like_lapack(scipy)}}
+           "decompositions": "faer float64 via gamfit.sae.run_parameter_decomposition dense "
+                             "(bench/mpd_opfirst_linalg_2951.py)",
+           "gamfit": {"version": getattr(gamfit, "__version__", None), "path": gamfit.__file__},
+           "numpy": np.__version__}
     try:
         import torch
-        cfg = torch.__config__.show()
-        info = dict(re.findall(r"\b(BLAS_INFO|LAPACK_INFO)=([^,\s]+)", cfg))
+        info = dict(re.findall(r"\b(BLAS_INFO|LAPACK_INFO)=([^,\s]+)", torch.__config__.show()))
         rec["torch"] = {"version": torch.__version__, "blas": info.get("BLAS_INFO"), "lapack": info.get("LAPACK_INFO"),
                         "used_for_decompositions": False}
     except ImportError:

@@ -20,12 +20,12 @@ Tools (reused from the probes, imported, not rewritten, unless noted):
       even (GELU analogues of the SiLU splits in bench/mpd_opfirst_mlp_oddeven_2951.py; psi is the probe's).
   T4  spectral plane-rotation recovery: Rust parameter_decomposition::spectral::recover_plane_rotations called
       through `gam parameter-decomposition` (--gam-bin, default target/release/gam; required). A naive strawman
-      (general eig, one plane per conjugate pair, no grouping) is scored too, to show what the grouping prevents.
+      (np.linalg.eig, one plane per conjugate pair, no grouping) is scored too, to show what the grouping prevents.
   T5  gauge counts by the declared families of parameter_decomposition::gauge (NUMPY STAND-IN: re-statement of the orbit
       formulas: pass-through GL(r) r^2 - (r - rank A)(r - rank B); GELU hidden units permutation only; rotary QK
       2 m^2 per frequency with m planes). Scored against the function-level fibre dimension, measured as the
       nullity of the Jacobian of theta -> F_theta(X) on generic inputs (torch autograd, float64).
-Every decomposition goes through bench/mpd_opfirst_linalg_2951.py (scipy float64); torch is autograd and matmuls.
+Every other decomposition goes through bench/mpd_opfirst_linalg_2951.py (faer float64); torch is autograd and matmuls.
   T6  QK sharing between heads (bench/mpd_opfirst_rope_span_2951.py: atoms, gram_from_factors, captured,
       top_cosine), plus an operator-equality test (same routing law iff equal score operators, no biases).
 
@@ -307,7 +307,7 @@ t4_planes = t4_rust
 
 
 def t4_naive(W):
-    lam, vec = la.eig(W)
+    lam, vec = np.linalg.eig(W)  # the strawman's own general eig: no surface op owns one
     planes = []
     for i in range(len(lam)):
         if lam[i].imag > 1e-12:

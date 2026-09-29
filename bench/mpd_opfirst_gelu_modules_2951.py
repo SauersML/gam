@@ -1,7 +1,7 @@
 """#2951 probe: does an exact-GELU MLP split into (approximately) independent parallel modules?
 
 Analysis under SPEC 8's exception (torch execution of a measurement), float64 on CPU throughout. Every
-decomposition and operator norm goes through bench/mpd_opfirst_linalg_2951.py (scipy); torch only runs the model
+decomposition and operator norm goes through bench/mpd_opfirst_linalg_2951.py (faer); torch only runs the model
 and matmuls.
 
 Exact identity (checked numerically below): gelu(t) = t Phi(t) = t/2 + psi(t), psi(t) = t (Phi(t) - 1/2) even,

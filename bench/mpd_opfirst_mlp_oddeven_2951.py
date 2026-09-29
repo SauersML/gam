@@ -3,7 +3,7 @@
 Analysis under SPEC 8's exception (torch execution of a measurement). The model runs on CPU at --dtype (float32
 by default: a 1B model is never materialised in float64); every per-layer analysis casts that layer's weights and
 captured MLP inputs to float64, and every spectrum or operator norm goes through bench/mpd_opfirst_linalg_2951.py
-(scipy float64; torch is only the forward pass and matmuls). The architecture is read from config (bench/mpd_opfirst_decoder_2951.py): in a
+(faer float64; torch is only the forward pass and matmuls). The architecture is read from config (bench/mpd_opfirst_decoder_2951.py): in a
 pre-norm model (Qwen3) the MLP reads the RMS-normalised residual; in a post-norm model (OLMo 2) it reads the raw
 residual and its output F is rescaled by N_ff(F) = gamma_ff * F / rms(F) before the residual add, so relusplit
 also reports how well N_ff(P) reproduces the actual residual write N_ff(F).

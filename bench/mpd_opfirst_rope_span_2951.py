@@ -2,7 +2,7 @@
 
 Analysis under SPEC 8's exception (benchmark evaluation, not an MPD input). numpy + safetensors only,
 CPU float64 on the exact bf16 / f32 weights (-> f64 is exact), one layer at a time. Every eigen/singular
-decomposition goes through bench/mpd_opfirst_linalg_2951.py (scipy).
+decomposition goes through bench/mpd_opfirst_linalg_2951.py (faer).
 
 For query head h reading key/value head g(h) = h // (H / KV), with rotary planes j = coords (j, j + hd/2)
 (HF rotate_half pairing) and omega_j = theta^(-2j/hd), the pre-softmax score is
