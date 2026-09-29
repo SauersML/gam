@@ -230,3 +230,9 @@ mod theory_tests;
 
 // Versioned request and report document shared by pyffi and the CLI.
 pub mod surface;
+
+// Behaviour discovery: the family partitioned into groups, each its own subprogram, by one two-part code.
+pub mod behaviors;
+
+#[cfg(test)]
+mod behaviors_tests;
