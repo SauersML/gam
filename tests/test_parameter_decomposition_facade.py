@@ -90,3 +90,23 @@ def test_linear_state_quotient_runs_end_to_end_through_rust():
         request, {"m": readout, "t": shear, "q": np.array([[1.0, 0.0, 0.0]])}
     )
     assert unclosed.report["result"]["quotient_bounds"][0]["lower"] > 0.5
+
+
+def test_linear_closed_chart_is_the_quotient_chart_without_its_bounds():
+    """The chart-only op returns the chart ``linear_state_quotient`` measures, and nothing else."""
+    pytest.importorskip("gamfit._rust")
+    readout = np.array([[1.0, 0.0, 0.0]])
+    shear = np.array([[1.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.5]])
+    tensors = {"m": readout, "t": shear}
+    chart_only = {"kind": "linear_closed_chart", "readouts": ["m"], "transitions": ["t"]}
+    out = facade.run_parameter_decomposition(
+        {"schema": "gam.mpd-request", "schema_version": 1, "operation": chart_only}, tensors
+    )
+
+    assert out.report["result"] == {"kind": "linear_closed_chart", "chart": "chart", "rows": 2}
+    assert set(out.arrays) == {"chart"}
+    measuring = {"kind": "linear_state_quotient", "readouts": ["m"], "transitions": ["t"], "chart": {"kind": "close"}}
+    measured = facade.run_parameter_decomposition(
+        {"schema": "gam.mpd-request", "schema_version": 1, "operation": measuring}, tensors
+    )
+    assert np.array_equal(out.arrays["chart"], measured.arrays["chart"])

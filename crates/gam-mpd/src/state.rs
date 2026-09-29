@@ -91,10 +91,16 @@
 
 use std::fmt;
 
-use gam_linalg::faer_ndarray::{FaerLinalgError, FaerSvd};
-use gam_linalg::roundoff::{accumulation_band, accumulation_growth, factor_singular_band};
+use faer::Side;
+use gam_linalg::faer_ndarray::{
+    FaerArrayView, FaerLinalgError, FaerSvd, fast_ab_into, fast_ata, self_adjoint_eigenvalues,
+};
+use gam_linalg::roundoff::{
+    UNIT_ROUNDOFF, accumulation_band, accumulation_growth, factor_singular_band,
+    symmetric_spectrum_rounding_band_at_dim,
+};
 use gam_runtime::resource::{MemoryGovernor, MemoryReservation, MemoryReservationError};
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
+use ndarray::{Array1, Array2, ArrayBase, ArrayView1, ArrayView2, Data, Ix2, s};
 
 use super::joint_operators::RoutingLawLetters;
 use super::supports::{EvidenceStatus, EvidenceStatusError, ExactBasis, Extremum};
@@ -961,6 +967,24 @@ impl LinearStateQuotient {
         readouts: &[ArrayView2<'_, f64>],
         transitions: &[ArrayView2<'_, f64>],
     ) -> Result<Self, StateError> {
+        let chart = Self::closed_chart(governor, readouts, transitions)?;
+        Self::measure(governor, chart, readouts, transitions)
+    }
+
+    /// The chart `Q` that [`Self::close`] measures, without the measurement, for
+    /// callers that read only the resolved row space: its rows and their count.
+    ///
+    /// Bit for bit the chart of [`Self::close`]. With no transitions it is the
+    /// resolved row space of the stacked readouts, and its row count is their
+    /// resolved rank: a certified lower bound on the exact rank. With transitions
+    /// the row count is not a certified dimension (see [`Self::close`]), and
+    /// nothing here certifies the chart's contracts; a caller that states them
+    /// needs [`Self::close`] or [`Self::measure`].
+    pub fn closed_chart(
+        governor: &MemoryGovernor,
+        readouts: &[ArrayView2<'_, f64>],
+        transitions: &[ArrayView2<'_, f64>],
+    ) -> Result<Array2<f64>, StateError> {
         let dimension = linear_family_dimension(readouts, transitions)?;
         let rows: usize = readouts.iter().map(|readout| readout.nrows()).sum();
         let stacked_reservation = reserve(governor, rows, dimension, 1, "linear quotient: readout rows")?;
@@ -997,9 +1021,8 @@ impl LinearStateQuotient {
                 let start = (index + 1) * rank;
                 candidate
                     .slice_mut(s![start..start + rank, ..])
-                    .assign(&chart.dot(transition));
-                formation_squared += absolute_chart
-                    .dot(&transition.mapv(f64::abs))
+                    .assign(&product(&chart, transition));
+                formation_squared += product(&absolute_chart, &transition.mapv(f64::abs))
                     .iter()
                     .map(|&magnitude| accumulation_band(dimension, magnitude).powi(2))
                     .sum::<f64>();
@@ -1017,7 +1040,7 @@ impl LinearStateQuotient {
             }
             chart = next.rows;
         }
-        Self::measure(governor, chart, readouts, transitions)
+        Ok(chart)
     }
 
     /// Measure a declared chart `Q` (`r × d`) against the readouts and
@@ -1042,10 +1065,9 @@ impl LinearStateQuotient {
         let absolute_chart = chart.mapv(f64::abs);
         let absolute_section = absolute_chart.t();
 
-        let section_residual = &chart.dot(&section) - &Array2::<f64>::eye(rank);
+        let section_residual = &product(&chart, &section) - &Array2::<f64>::eye(rank);
         let section_band = entrywise_band_norm(
-            absolute_chart
-                .dot(&absolute_section)
+            product(&absolute_chart, &absolute_section)
                 .mapv(|magnitude| accumulation_band(dimension + 1, magnitude + 1.0)),
         );
         let section_bounds =
@@ -1054,11 +1076,10 @@ impl LinearStateQuotient {
         let mut readout_maps = Vec::with_capacity(readouts.len());
         let mut readout_bounds = Vec::with_capacity(readouts.len());
         for readout in readouts {
-            let map = readout.dot(&section);
-            let residual = readout - &map.dot(&chart);
+            let map = product(readout, &section);
+            let residual = readout - &product(&map, &chart);
             let band = entrywise_band_norm(
-                map.mapv(f64::abs)
-                    .dot(&absolute_chart)
+                product(&map.mapv(f64::abs), &absolute_chart)
                     .mapv(|magnitude| accumulation_band(rank + 1, magnitude))
                     + &readout.mapv(|entry| accumulation_growth(1) * entry.abs()),
             );
@@ -1078,16 +1099,14 @@ impl LinearStateQuotient {
             let transition_reservation =
                 reserve(governor, dimension, dimension, 1, "linear quotient: absolute transition")?;
             let absolute_transition = transition.mapv(f64::abs);
-            let moved = chart.dot(transition);
-            let map = moved.dot(&section);
+            let moved = product(&chart, transition);
+            let map = product(&moved, &section);
             let absolute_map = map.mapv(f64::abs);
-            let quotient_residual = &moved - &map.dot(&chart);
+            let quotient_residual = &moved - &product(&map, &chart);
             let quotient_band = entrywise_band_norm(
-                absolute_chart
-                    .dot(&absolute_transition)
+                product(&absolute_chart, &absolute_transition)
                     .mapv(|magnitude| accumulation_band(dimension + 1, magnitude))
-                    + &absolute_map
-                        .dot(&absolute_chart)
+                    + &product(&absolute_map, &absolute_chart)
                         .mapv(|magnitude| accumulation_band(rank + 1, magnitude)),
             );
             quotient_bounds.push(spectral_norm_bounds(
@@ -1096,13 +1115,11 @@ impl LinearStateQuotient {
                 quotient_band,
                 "linear quotient: quotient contract",
             )?);
-            let realization_residual = &transition.dot(&section) - &section.dot(&map);
+            let realization_residual = &product(transition, &section) - &product(&section, &map);
             let realization_band = entrywise_band_norm(
-                absolute_transition
-                    .dot(&absolute_section)
+                product(&absolute_transition, &absolute_section)
                     .mapv(|magnitude| accumulation_band(dimension + 1, magnitude))
-                    + &absolute_section
-                        .dot(&absolute_map)
+                    + &product(&absolute_section, &absolute_map)
                         .mapv(|magnitude| accumulation_band(rank + 1, magnitude)),
             );
             realization_bounds.push(spectral_norm_bounds(
@@ -1216,9 +1233,38 @@ impl ObservabilityLetter<'_> {
 
     /// The pulled-back rows `S T` (or `‖S u_j‖ a_jᵀ`) and a Frobenius bound on
     /// their distance from those of the exact source, given the source's own
-    /// bound `formation`.
-    fn pull(&self, source: &Array2<f64>, absolute_source: &Array2<f64>, formation: f64) -> (Array2<f64>, f64) {
+    /// Frobenius bound `formation`.
+    ///
+    /// A source error `E` moves `S T` by `E T`, and `‖E T‖_F ≤ ‖E‖_F·‖T‖₂`, so the
+    /// propagated part is `formation` times a certified upper bound on the
+    /// letter's spectral norm ([`spectral_norm_bounds`]). The Frobenius norm is
+    /// no bound to propagate by: it exceeds `‖T‖₂` by up to `√n` (the identity
+    /// letter's `√n` exactly), so over `L` steps the band grew as `(Σ‖T‖_F)^L`
+    /// while `σ₁` grows as `‖T‖₂`, and a deep stack's band passed `σ₁`. For units
+    /// the weight `‖S u_j‖` moves by at most `‖E u_j‖`, and
+    /// `(Σ_j ‖E u_j‖²‖a_j‖²)^{1/2} ≤ ‖E‖_F·min(‖U‖₂·max_j ‖a_j‖, (Σ_j ‖u_j‖²‖a_j‖²)^{1/2})`,
+    /// `U` the writes as rows: `‖E Uᵀ‖_F ≤ ‖E‖_F‖U‖₂` gives the first,
+    /// `‖E u_j‖ ≤ ‖E‖_F‖u_j‖` the second. The rest of each unit's error, the
+    /// rounding of `S Uᵀ`, of the weight and of the row scaling, is its own and is
+    /// added by Minkowski. A routing law's transport `T` carries its own error
+    /// `Δ` (its band), and `(S + E)(T + Δ) − S T` is bounded by
+    /// `‖E‖_F(‖T‖₂ + ‖Δ‖₂) + ‖S‖_F‖Δ‖₂`, `‖T‖₂` again certified from above.
+    fn pull(
+        &self,
+        governor: &MemoryGovernor,
+        source: &Array2<f64>,
+        absolute_source: &Array2<f64>,
+        formation: f64,
+    ) -> Result<(Array2<f64>, f64), StateError> {
         let width = source.ncols();
+        // An exact letter's spectral norm, needed only when there is an error to carry.
+        let norm = |matrix: ArrayView2<'_, f64>, context| -> Result<f64, StateError> {
+            if formation > 0.0 {
+                Ok(spectral_norm_bounds(governor, &matrix, 0.0, context)?.upper)
+            } else {
+                Ok(0.0)
+            }
+        };
         match self {
             Self::Linear(letter) => {
                 let moved = source.dot(letter);
@@ -1227,7 +1273,8 @@ impl ObservabilityLetter<'_> {
                         .dot(&letter.mapv(f64::abs))
                         .mapv(|magnitude| accumulation_band(width, magnitude)),
                 );
-                (moved, formation * frobenius(letter) + product_band)
+                let letter_norm = norm(letter.view(), "weighted observability: letter norm")?;
+                Ok((moved, formation * letter_norm + product_band))
             }
             Self::Units { reads, writes } => {
                 let read = source.dot(&writes.t());
@@ -1236,18 +1283,24 @@ impl ObservabilityLetter<'_> {
                     .mapv(|magnitude| accumulation_band(width, magnitude));
                 let rows = source.nrows();
                 let mut moved = reads.to_owned();
-                let mut squared = 0.0_f64;
+                let mut local_squared = 0.0_f64;
+                let mut spread_squared = 0.0_f64;
+                let mut widest_read = 0.0_f64;
                 for (unit, mut row) in moved.rows_mut().into_iter().enumerate() {
                     let weight = read.column(unit).iter().map(|value| value * value).sum::<f64>().sqrt();
                     let write_norm = writes.row(unit).iter().map(|value| value * value).sum::<f64>().sqrt();
                     let read_norm = row.iter().map(|value| value * value).sum::<f64>().sqrt();
-                    let weight_error = formation * write_norm
-                        + read_band.column(unit).iter().map(|value| value * value).sum::<f64>().sqrt()
-                        + accumulation_growth(rows + 1) * weight;
+                    let local_error = read_band.column(unit).iter().map(|value| value * value).sum::<f64>().sqrt()
+                        + accumulation_growth(rows + 1) * weight
+                        + accumulation_growth(1) * weight;
                     row.mapv_inplace(|value| value * weight);
-                    squared += ((weight_error + accumulation_growth(1) * weight) * read_norm).powi(2);
+                    local_squared += (local_error * read_norm).powi(2);
+                    spread_squared += (write_norm * read_norm).powi(2);
+                    widest_read = widest_read.max(read_norm);
                 }
-                (moved, squared.sqrt())
+                let writes_norm = norm(writes.view(), "weighted observability: write norm")?;
+                let propagated = formation * (writes_norm * widest_read).min(spread_squared.sqrt());
+                Ok((moved, local_squared.sqrt() + propagated))
             }
             Self::RoutingLaws(letters) => {
                 let rows = source.nrows();
@@ -1261,10 +1314,11 @@ impl ObservabilityLetter<'_> {
                             .dot(&transport.mapv(f64::abs))
                             .mapv(|magnitude| accumulation_band(width, magnitude)),
                     );
-                    let error = formation * (frobenius(transport) + band) + product_band + source_norm * band;
+                    let transport_norm = norm(transport.view(), "weighted observability: law transport norm")?;
+                    let error = formation * (transport_norm + band) + product_band + source_norm * band;
                     squared += error * error;
                 }
-                (moved, squared.sqrt() * (1.0 + accumulation_growth(2 * letters.transports().len() + 1)))
+                Ok((moved, squared.sqrt() * (1.0 + accumulation_growth(2 * letters.transports().len() + 1))))
             }
         }
     }
@@ -1367,7 +1421,8 @@ impl ObservabilitySpectrum {
 ///
 /// `formation` bounds the Frobenius distance from `factor` to a factor of the
 /// exact Gramian of the supplied matrices, up to a left orthogonal factor. Each
-/// product `S T` adds the propagated bound times `‖T‖_F` and the
+/// product `S T` adds the propagated bound times a certified upper bound on
+/// `‖T‖₂` (never `‖T‖_F`, which compounds by up to `√n` a step) and the
 /// [`accumulation_band`] of `|S||T|`; each compression adds the SVD's backward
 /// error ([`factor_singular_band`], times `√rank` for Frobenius), `σ₁` times the
 /// measured orthogonality defect of `V`, and the rounding of `σᵢ Vᵢⱼ`.
@@ -1478,7 +1533,7 @@ impl WeightedObservability {
                     3,
                     "weighted observability: letter",
                 )?;
-                let (moved, moved_formation) = letter.pull(&source, &absolute_source, formation);
+                let (moved, moved_formation) = letter.pull(governor, &source, &absolute_source, formation)?;
                 let mut stack = Array2::<f64>::zeros((pulled.nrows() + moved.nrows(), input));
                 stack.slice_mut(s![..pulled.nrows(), ..]).assign(&pulled);
                 stack.slice_mut(s![pulled.nrows().., ..]).assign(&moved);
@@ -1749,9 +1804,52 @@ pub(super) fn resolved_row_space(
     })
 }
 
-pub(super) fn spectral_norm_bounds(
+/// Bounds on `‖R‖₂` for an exact matrix `R` whose computed value `R̂` (`m × n`)
+/// is within `formation` of it in spectral norm, read off the largest
+/// eigenvalue of the Gram of `R̂`'s smaller side. No singular value
+/// decomposition is formed.
+///
+/// With `k = min(m, n)`, `t = max(m, n)`, `u` the unit roundoff,
+/// `γ_j = j·u/(1 − j·u)` and `η = 2⁻¹⁰⁷⁴`:
+///
+/// 1. **Scale.** `B = 2^{−e}·R̂`, with `e` taking `max|r̂ᵢⱼ|` to about `[½, 1)`,
+///    so the Gram below neither underflows nor overflows. A power of two is
+///    exact except where an entry lands subnormal, which moves it by at most
+///    `η`, so by Weyl `|σ_max(B) − 2^{−e}‖R̂‖₂| ≤ β = √(mn)·η`.
+/// 2. **Gram.** `Ĝ = fl(BᵀB)` (or `fl(BBᵀ)`), `k × k`, with one triangle
+///    mirrored, so `Ĝ` is exactly symmetric. Each entry is an inner product of
+///    length `t`, so `|Ĝ − G| ≤ γ_t·|B|ᵀ|B|` entrywise, in any summation order and
+///    with or without fused multiply-adds (Higham, *ASNA* 2nd ed., §3.5). The
+///    majorant is entrywise non-negative and positive semidefinite, so
+///    `‖Ĝ − G‖₂ ≤ γ_t·‖|B|ᵀ|B|‖₂ ≤ γ_t·tr(|B|ᵀ|B|) = γ_t·‖B‖²_F`. A diagonal entry
+///    sums squares, so `Ĝᵢᵢ ≥ (1 − γ_t)·Gᵢᵢ`, and the trace sums `k`
+///    non-negative terms, so `‖B‖²_F ≤ fl(tr Ĝ)/((1 − γ_t)(1 − γ_k))` and
+///    `δ = γ_t·fl(tr Ĝ)/((1 − γ_t)(1 − γ_k))` bounds `‖Ĝ − G‖₂`.
+/// 3. **Spectrum.** The self-adjoint eigensolver is backward stable: its
+///    computed `λ̂` are the exact eigenvalues of `Ĝ + E` with
+///    `‖E‖₂ ≤ ρ = k·(ε·max|λ̂| + η)`
+///    ([`symmetric_spectrum_rounding_band_at_dim`]; the same convention as the
+///    [`factor_singular_band`] a full SVD reads). By Weyl,
+///    `σ_max(B)² = λ_max(G) ∈ [λ̂_max − ρ − δ, λ̂_max + ρ + δ]`.
+/// 4. **Root.** `√·` is monotone. The endpoints are widened for the handful of
+///    rounded operations that form them, each root is taken one ulp outward,
+///    `β` is added on each side, and the result is multiplied back by `2^e`
+///    (exact, one more ulp outward for a subnormal landing).
+/// 5. **Exact matrix.** `|‖R‖₂ − ‖R̂‖₂| ≤ formation`, so
+///    `lower = max(0, σ_lo − formation)` and `upper = σ_hi + formation` bracket
+///    `‖R‖₂`.
+///
+/// Since `‖B‖²_F ≤ k·σ_max(B)²`, `δ ≤ γ_t·k·λ_max`, so the bracket on `‖R̂‖₂` is
+/// within about `(t + 1)·k·u/2` of it relatively (`2.3e-10` at `t = k = 2048`),
+/// where a full SVD's band is `t·ε`. Every consumer reads only `lower` and
+/// `upper` as a certified interval (the evidence status, the wire report, the
+/// verdicts built on them), and both remain bounds on the exact norm. The Gram
+/// is one `k × k × t` product at pool parallelism and the spectrum an
+/// eigenvalue-only decomposition at the fixed EVD degree, so the result is
+/// identical at every pool width.
+pub(super) fn spectral_norm_bounds<S: Data<Elem = f64>>(
     governor: &MemoryGovernor,
-    matrix: &Array2<f64>,
+    matrix: &ArrayBase<S, Ix2>,
     formation: f64,
     context: &'static str,
 ) -> Result<SpectralNormBounds, StateError> {
@@ -1762,18 +1860,90 @@ pub(super) fn spectral_norm_bounds(
         });
     }
     let (rows, cols) = matrix.dim();
-    // The decomposition's working copy.
+    if matrix.iter().any(|value| !value.is_finite()) {
+        return Err(StateError::NonFinite { context });
+    }
+    let largest = matrix.iter().fold(0.0_f64, |largest, value| largest.max(value.abs()));
+    if largest == 0.0 {
+        return Ok(SpectralNormBounds {
+            lower: 0.0,
+            upper: formation,
+        });
+    }
+    let short = rows.min(cols);
+    let long = rows.max(cols);
+    // The scaled copy, then the Gram and the eigensolver's working copy of it.
     let working = reserve(governor, rows, cols, 1, context)?;
-    let (_, sigma, _) = matrix
-        .svd(false, false)
-        .map_err(|source| StateError::Svd { context, source })?;
+    let gram_reservation = reserve(governor, short, short, 2, context)?;
+    // `2^e` overflows for `e > 1023` and `2^{−e}` for a subnormal `e`, so each
+    // power is applied as two representable halves.
+    let exponent = largest.log2().floor() as i32 + 1;
+    let (shrink, shrink_tail) = (
+        2.0_f64.powi(-(exponent / 2)),
+        2.0_f64.powi(-(exponent - exponent / 2)),
+    );
+    let scaled = matrix.mapv(|value| value * shrink * shrink_tail);
+    let gram = if cols <= rows {
+        fast_ata(&scaled)
+    } else {
+        fast_ata(&scaled.t())
+    };
+    drop(scaled);
     drop(working);
-    let sigma_max = sigma.iter().fold(0.0_f64, |largest, &value| largest.max(value));
-    let band = factor_singular_band(rows, cols, sigma_max) + formation;
+    let gram_view = FaerArrayView::new(&gram);
+    let spectrum = self_adjoint_eigenvalues(gram_view.as_ref(), Side::Lower).map_err(|source| {
+        StateError::Eigen {
+            context,
+            source: FaerLinalgError::SelfAdjointEigen(source),
+        }
+    })?;
+    drop(gram_view);
+    let spectrum = spectrum.as_ref().column_vector();
+    let eigenvalues: Vec<f64> = (0..short).map(|index| spectrum[index]).collect();
+    let trace: f64 = (0..short).map(|index| gram[[index, index]]).sum();
+    drop(gram);
+    drop(gram_reservation);
+    if eigenvalues.iter().any(|value| !value.is_finite()) {
+        return Err(StateError::NonFinite { context });
+    }
+    let largest_eigenvalue = eigenvalues
+        .iter()
+        .fold(f64::NEG_INFINITY, |largest, &value| largest.max(value));
+    let gram_formation = accumulation_growth(long) * trace
+        / ((1.0 - accumulation_growth(long)) * (1.0 - accumulation_growth(short)));
+    let spectrum_band = symmetric_spectrum_rounding_band_at_dim(short, &eigenvalues);
+    // The slack and each endpoint take a handful of rounded operations.
+    let slack = (spectrum_band + gram_formation) * (1.0 + accumulation_growth(8));
+    let widen = 4.0 * UNIT_ROUNDOFF;
+    let squared_upper = (largest_eigenvalue + slack) * (1.0 + widen);
+    let squared_lower = ((largest_eigenvalue - slack) * (1.0 - widen)).max(0.0);
+    let subnormal_shift = ((rows as f64).sqrt() * (cols as f64).sqrt() * f64::from_bits(1)).next_up();
+    let scaled_upper = (squared_upper.sqrt().next_up() + subnormal_shift).next_up();
+    let scaled_lower = (squared_lower.sqrt().next_down() - subnormal_shift).next_down().max(0.0);
+    let (grow, grow_tail) = (
+        2.0_f64.powi(exponent / 2),
+        2.0_f64.powi(exponent - exponent / 2),
+    );
+    let sigma_upper = (scaled_upper * grow * grow_tail).next_up();
+    let sigma_lower = (scaled_lower * grow * grow_tail).next_down().max(0.0);
     Ok(SpectralNormBounds {
-        lower: (sigma_max - band).max(0.0),
-        upper: sigma_max + band,
+        lower: (sigma_lower - formation).max(0.0),
+        upper: sigma_upper + formation,
     })
+}
+
+/// `left · right` through gam_linalg's faer product ([`fast_ab_into`]) at
+/// [`gam_linalg::faer_ndarray::matmul_parallelism`]: identical bits at every
+/// degree and pool width (#2627). Each inner product it forms carries the
+/// [`accumulation_band`] of its length in any summation order, so the bands read
+/// off these products are those of the ndarray products they replace.
+fn product<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    left: &ArrayBase<S1, Ix2>,
+    right: &ArrayBase<S2, Ix2>,
+) -> Array2<f64> {
+    let mut out = Array2::<f64>::zeros((left.nrows(), right.ncols()));
+    fast_ab_into(left, right, &mut out);
+    out
 }
 
 /// Reserves `copies` dense `rows × cols` matrices on `governor` before they are formed.
@@ -1850,6 +2020,11 @@ pub enum StateError {
         context: &'static str,
         source: FaerLinalgError,
     },
+    /// A self-adjoint eigendecomposition failed.
+    Eigen {
+        context: &'static str,
+        source: FaerLinalgError,
+    },
     /// An evaluated defect could not be expressed as an evidence status.
     Evidence { source: EvidenceStatusError },
     /// A dense matrix the check forms does not fit the memory budget.
@@ -1895,6 +2070,9 @@ impl fmt::Display for StateError {
             Self::Svd { context, source } => {
                 write!(formatter, "{context}: singular value decomposition failed: {source}")
             }
+            Self::Eigen { context, source } => {
+                write!(formatter, "{context}: self-adjoint eigendecomposition failed: {source}")
+            }
             Self::Evidence { source } => {
                 write!(formatter, "evidence status refused an evaluated defect: {source}")
             }
@@ -1911,6 +2089,7 @@ impl std::error::Error for StateError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Svd { source, .. } => Some(source),
+            Self::Eigen { source, .. } => Some(source),
             Self::Evidence { source } => Some(source),
             Self::Memory { source, .. } => Some(source),
             _ => None,
@@ -2990,6 +3169,151 @@ mod tests {
         assert_eq!(identity.ambiguities(), vec![RotationAmbiguity::Identity]);
     }
 
+    /// The Sylvester Hadamard matrix of order `2^power`: entries `±1`, orthogonal
+    /// columns of squared norm `2^power`.
+    fn hadamard(power: u32) -> Array2<f64> {
+        let order = 1_usize << power;
+        Array2::from_shape_fn((order, order), |(row, col)| {
+            if (row & col).count_ones() % 2 == 0 { 1.0 } else { -1.0 }
+        })
+    }
+
+    /// `H_m[:, :k] diag(s) H_n[:, :k]ᵀ`, every entry an exact dyadic sum, so its
+    /// exact singular values are `|sᵢ|·√(mn)` and the matrix as stored is exact.
+    fn exact_spectrum(rows_power: u32, cols_power: u32, weights: &[f64]) -> Array2<f64> {
+        let left = hadamard(rows_power);
+        let right = hadamard(cols_power);
+        let mut matrix = Array2::<f64>::zeros((left.nrows(), right.nrows()));
+        for (index, &weight) in weights.iter().enumerate() {
+            for row in 0..left.nrows() {
+                for col in 0..right.nrows() {
+                    matrix[[row, col]] += weight * left[[row, index]] * right[[col, index]];
+                }
+            }
+        }
+        matrix
+    }
+
+    /// The Gram-spectrum bounds bracket the exact `σ_max` of exactly representable
+    /// matrices with a known spectrum: full rank, rank deficient, wide and tall,
+    /// with a clustered top, and at both ends of the exponent range; the bracket is
+    /// as tight as its derivation says, and `formation` widens it by exactly itself.
+    #[test]
+    fn gram_spectrum_bounds_bracket_the_exact_largest_singular_value() {
+        let cluster = 1.0 - (-40.0_f64).exp2();
+        let cases: Vec<(&str, u32, u32, Vec<f64>)> = vec![
+            ("full rank", 6, 6, (0..64).map(|index| 1.0 - index as f64 / 128.0).collect()),
+            ("clustered top", 6, 6, vec![1.0, cluster, cluster, cluster, 0.5, 0.25]),
+            ("rank deficient tall", 7, 5, vec![0.75, 0.5, 0.0, 0.125]),
+            ("rank deficient wide", 5, 7, vec![0.75, 0.5, 0.0, 0.125]),
+            ("rank one", 6, 4, vec![0.5]),
+            ("negative weights", 5, 5, vec![-1.0, 0.875, -0.875]),
+        ];
+        for (name, rows_power, cols_power, weights) in cases {
+            let matrix = exact_spectrum(rows_power, cols_power, &weights);
+            let scale = ((matrix.nrows() * matrix.ncols()) as f64).sqrt();
+            let exact = weights.iter().fold(0.0_f64, |largest, weight| largest.max(weight.abs())) * scale;
+            for exponent in [-1000_i32, 0, 1000] {
+                let power = f64::from(exponent).exp2();
+                let scaled = matrix.mapv(|value| value * power);
+                let truth = exact * power;
+                let bounds = spectral_norm_bounds(test_governor(), &scaled, 0.0, "test").expect("bounds");
+                assert!(
+                    bounds.lower <= truth && truth <= bounds.upper,
+                    "{name} at 2^{exponent}: {bounds:?} misses {truth:e}"
+                );
+                let long = scaled.nrows().max(scaled.ncols()) as f64;
+                let short = scaled.nrows().min(scaled.ncols()) as f64;
+                let width = (bounds.upper - bounds.lower) / truth;
+                assert!(
+                    width <= 4.0 * (long + 1.0) * short * UNIT_ROUNDOFF,
+                    "{name} at 2^{exponent}: relative width {width:e}"
+                );
+            }
+            let formation = 0.5 * exact;
+            let widened = spectral_norm_bounds(test_governor(), &matrix, formation, "test").expect("bounds");
+            let tight = spectral_norm_bounds(test_governor(), &matrix, 0.0, "test").expect("bounds");
+            assert_eq!(widened.upper, tight.upper + formation, "{name}");
+            assert_eq!(widened.lower, (tight.lower - formation).max(0.0), "{name}");
+        }
+        let zero = Array2::<f64>::zeros((3, 5));
+        let bounds = spectral_norm_bounds(test_governor(), &zero, 0.25, "test").expect("bounds");
+        assert_eq!((bounds.lower, bounds.upper), (0.0, 0.25));
+        let mut infinite = Array2::<f64>::eye(3);
+        infinite[[1, 2]] = f64::INFINITY;
+        assert!(matches!(
+            spectral_norm_bounds(test_governor(), &infinite, 0.0, "test"),
+            Err(StateError::NonFinite { .. })
+        ));
+    }
+
+    /// On a seeded dense matrix the bracket agrees with the full SVD it replaces:
+    /// each interval contains the other's centre, both being certified.
+    #[test]
+    fn gram_spectrum_bounds_agree_with_the_singular_value_decomposition() {
+        use rand::rngs::StdRng;
+        use rand::{RngExt, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(2951);
+        for (rows, cols) in [(40, 40), (17, 90), (90, 17), (1, 30)] {
+            let matrix = Array2::from_shape_fn((rows, cols), |_| rng.random_range(-1.0..1.0));
+            let (_, sigma, _) = matrix.svd(false, false).expect("svd");
+            let sigma_max = sigma.iter().fold(0.0_f64, |largest, &value| largest.max(value));
+            let band = factor_singular_band(rows, cols, sigma_max);
+            let bounds = spectral_norm_bounds(test_governor(), &matrix, 0.0, "test").expect("bounds");
+            assert!(
+                bounds.lower <= sigma_max + band && sigma_max - band <= bounds.upper,
+                "{rows}x{cols}: {bounds:?} against σ̂ {sigma_max:e} ± {band:e}"
+            );
+        }
+    }
+
+    /// The chart is the resolved row space whatever the speed-up did to the
+    /// measurement: with no transitions, `close` and `closed_chart` return bit for
+    /// bit the rows of the unchanged stacked-readout SVD, as before. And every
+    /// word of a closed quotient (chart, maps, bounds) is the same at every pool
+    /// width, at a size where the products and the eigensolver run in parallel.
+    #[test]
+    fn closed_quotient_words_are_the_resolved_row_space_and_do_not_depend_on_the_pool_width() {
+        use rand::rngs::StdRng;
+        use rand::{RngExt, SeedableRng};
+        let dimension = 320;
+        let mut rng = StdRng::seed_from_u64(0x2951_c105);
+        let readout = Array2::from_shape_fn((dimension, dimension), |_| rng.random_range(-1.0..1.0));
+        let transition = Array2::from_shape_fn((dimension, dimension), |_| rng.random_range(-1.0..1.0))
+            / (dimension as f64).sqrt();
+        let words = |matrix: &Array2<f64>| matrix.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+        let resolved = resolved_row_space(test_governor(), &readout, 0.0, "linear quotient: readout rows")
+            .expect("row space")
+            .rows;
+        let chart = LinearStateQuotient::closed_chart(test_governor(), &[readout.view()], &[]).expect("chart");
+        assert_eq!(words(&chart), words(&resolved));
+        let at_width = |width: usize| {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(width).build().expect("pool");
+            pool.install(|| {
+                let quotient =
+                    LinearStateQuotient::close(test_governor(), &[readout.view()], &[transition.view()])
+                        .expect("close");
+                let mut all = words(&quotient.chart);
+                for map in quotient.readout_maps.iter().chain(&quotient.descended) {
+                    all.extend(words(map));
+                }
+                for bounds in quotient
+                    .readout_bounds
+                    .iter()
+                    .chain(&quotient.quotient_bounds)
+                    .chain(&quotient.realization_bounds)
+                    .chain(std::iter::once(&quotient.section_bounds))
+                {
+                    all.extend([bounds.lower.to_bits(), bounds.upper.to_bits()]);
+                }
+                (all, quotient.chart)
+            })
+        };
+        let (single, single_chart) = at_width(1);
+        assert_eq!(words(&single_chart), words(&resolved), "a full-rank readout is already closed");
+        assert_eq!(single, at_width(4).0);
+    }
+
     /// Weighted observability: a modular-addition-like readout of `p` answers
     /// through two frequency planes of a hidden basis, and attention letters that
     /// act inside those planes and inside their complement separately.
@@ -3275,6 +3599,58 @@ mod tests {
                 WeightedObservability::pull_back(test_governor(), &[silent]),
                 Err(StateError::EmptyFamily { .. })
             ));
+        }
+
+        /// A deep stack of near-identity steps, each a residual letter
+        /// `I + small` beside a few MLP units, read at the top. The exact error of
+        /// the pull-back grows by a constant multiple of `ε·σ₁` per step, so the
+        /// certified band has to stay `O(L·ε·σ₁)`. Propagating the formation bound by
+        /// `‖T‖_F` multiplied it by about `√n` a step (`24^{15} ≈ 5e20` here) and
+        /// buried every singular value under the band.
+        #[test]
+        fn deep_near_identity_stack_keeps_the_band_linear_in_depth() {
+            use rand::rngs::StdRng;
+            use rand::{RngExt, SeedableRng};
+            let (width, depth, units) = (24_usize, 30_usize, 4_usize);
+            let mut rng = StdRng::seed_from_u64(0x2951_dee9);
+            let mut draw = |rows: usize, scale: f64| {
+                Array2::from_shape_fn((rows, width), |_| scale * rng.random_range(-1.0..1.0))
+            };
+            let residuals: Vec<Array2<f64>> = (0..depth)
+                .map(|_| Array2::<f64>::eye(width) + draw(width, 0.02 / (width as f64).sqrt()))
+                .collect();
+            let reads: Vec<Array2<f64>> = (0..depth).map(|_| draw(units, 0.1)).collect();
+            let writes: Vec<Array2<f64>> = (0..depth).map(|_| draw(units, 0.1)).collect();
+            let readout = draw(3, 1.0);
+            let steps: Vec<ObservabilityStep<'_>> = (0..depth)
+                .map(|layer| ObservabilityStep {
+                    letters: vec![
+                        ObservabilityLetter::Linear(residuals[layer].view()),
+                        ObservabilityLetter::Units {
+                            reads: reads[layer].view(),
+                            writes: writes[layer].view(),
+                        },
+                    ],
+                    readouts: if layer + 1 == depth { vec![readout.view()] } else { vec![] },
+                })
+                .collect();
+            let report = WeightedObservability::pull_back(test_governor(), &steps).expect("pull back");
+            for (layer, spectrum) in report.step_spectra.iter().enumerate() {
+                let sigma_max = spectrum.singular_values[0];
+                let steps_below = (depth - layer) as f64;
+                // Per letter, two a step: a length-`n` product band of about
+                // `n·u·‖S‖_F ≤ n^{3/2}·u·σ₁` and a compression band of the SVD's
+                // `max(m, n)·ε·σ₁·√rank` (rows `m ≤ 2n`) plus `σ₁` times the
+                // measured orthogonality defect of `V`, about `n²·u`: each within
+                // `2n²·ε·σ₁`, so `8n²·ε·σ₁` a step with room.
+                let per_step = 8.0 * (width * width) as f64 * f64::EPSILON * sigma_max;
+                assert!(
+                    spectrum.band <= steps_below * per_step,
+                    "layer {layer}: band {:e} against σ₁ {sigma_max:e} after {steps_below} steps",
+                    spectrum.band
+                );
+                assert!(spectrum.resolved_rank >= 3, "layer {layer}: {spectrum:?}");
+            }
         }
     }
 }

@@ -113,7 +113,8 @@ pub use verify::{
     FamilyWitnessReport, ToleranceRequest, VerifyLogitsReport, VerifyLogitsRequest,
 };
 pub use state_quotient::{
-    LinearChart, LinearStateQuotientReport, LinearStateQuotientRequest, SpectralNormBoundsReport,
+    LinearChart, LinearClosedChartReport, LinearClosedChartRequest, LinearStateQuotientReport,
+    LinearStateQuotientRequest, SpectralNormBoundsReport,
 };
 
 /// Identity of the request document.
@@ -183,6 +184,10 @@ pub enum MpdOperation {
     /// (`state::LinearStateQuotient`): the closed observable chart, or a declared one
     /// measured.
     LinearStateQuotient(LinearStateQuotientRequest),
+    /// The closed observable chart alone, unmeasured
+    /// (`state::LinearStateQuotient::closed_chart`), for callers that read only the
+    /// resolved row space and its rank.
+    LinearClosedChart(LinearClosedChartRequest),
     /// The closed-form planes of a table under a declared single odd cycle
     /// (`cyclic_action::cyclic_planes`).
     CyclicPlanes(CyclicPlanesRequest),
@@ -276,6 +281,7 @@ pub enum MpdResult {
     RecoverPlaneRotations(PlaneRotationReport),
     MlpBlockReceipt(MlpBlockReceiptReport),
     LinearStateQuotient(LinearStateQuotientReport),
+    LinearClosedChart(LinearClosedChartReport),
     CyclicPlanes(CyclicPlanesReport),
     FrequencyEdit(FrequencyEditReport),
     PlaneProgramCode(PlaneProgramCodeReport),
@@ -579,6 +585,7 @@ pub fn run_parameter_decomposition(
         MpdOperation::LinearStateQuotient(request) => {
             state_quotient::run(request, tensors, governor)
         }
+        MpdOperation::LinearClosedChart(request) => state_quotient::run_chart(request, tensors, governor),
         MpdOperation::CyclicPlanes(request) => cyclic::run_planes(request, tensors, governor),
         MpdOperation::FrequencyEdit(request) => cyclic::run_edit(request, tensors, governor),
         MpdOperation::PlaneProgramCode(request) => cyclic::run_code(request, tensors, governor),

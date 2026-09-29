@@ -3422,6 +3422,47 @@ pub trait FaerEigh {
 /// are divided back. A matrix whose squares stay normal is decomposed as given,
 /// bit for bit as before.
 pub fn self_adjoint_evd(a: MatRef<'_, f64>, side: Side) -> Result<(Diag<f64>, Mat<f64>), solvers::EvdError> {
+    at_normal_scale(a, |matrix| self_adjoint_evd_as_given(matrix, side))
+}
+
+/// The eigenvalues of [`self_adjoint_evd`] without its eigenvectors, at
+/// [`evd_parallelism`] and under the same power-of-two rescaling. The
+/// tridiagonal reduction is partitioned at the same fixed degree, so the values
+/// are identical at every pool width.
+pub fn self_adjoint_eigenvalues(a: MatRef<'_, f64>, side: Side) -> Result<Diag<f64>, solvers::EvdError> {
+    at_normal_scale(a, |matrix| {
+        let n = matrix.nrows();
+        let par = evd_parallelism();
+        let lower = match side {
+            Side::Lower => matrix,
+            Side::Upper => matrix.transpose(),
+        };
+        let mut s = Diag::<f64>::zeros(n);
+        let mut mem = MemBuffer::new(faer::linalg::evd::self_adjoint_evd_scratch::<f64>(
+            n,
+            faer::linalg::evd::ComputeEigenvectors::No,
+            par,
+            Default::default(),
+        ));
+        faer::linalg::evd::self_adjoint_evd(
+            lower,
+            s.as_mut(),
+            None,
+            par,
+            MemStack::new(&mut mem),
+            Default::default(),
+        )?;
+        Ok((s, ()))
+    })
+    .map(|(s, ())| s)
+}
+
+/// Runs a self-adjoint `decompose` on `a`, or on `2^k·a` when `a`'s squares
+/// leave the normal range ([`self_adjoint_evd`]), dividing the eigenvalues back.
+fn at_normal_scale<T>(
+    a: MatRef<'_, f64>,
+    decompose: impl Fn(MatRef<'_, f64>) -> Result<(Diag<f64>, T), solvers::EvdError>,
+) -> Result<(Diag<f64>, T), solvers::EvdError> {
     let n = a.nrows();
     let max_abs = (0..n)
         .flat_map(|i| (0..a.ncols()).map(move |j| (i, j)))
@@ -3429,19 +3470,19 @@ pub fn self_adjoint_evd(a: MatRef<'_, f64>, side: Side) -> Result<(Diag<f64>, Ma
     let square = max_abs * max_abs;
     let squares_stay_normal = square >= f64::MIN_POSITIVE && (square * n as f64).is_finite();
     if max_abs == 0.0 || !max_abs.is_finite() || squares_stay_normal {
-        return self_adjoint_evd_as_given(a, side);
+        return decompose(a);
     }
     // `2^k` itself overflows for `k > 1023`, which a subnormal matrix needs, so
     // the power is applied as two representable halves; each product is exact.
     let exponent = (-max_abs.log2().floor() - 1.0) as i32;
     let (lead, tail) = (2.0_f64.powi(exponent / 2), 2.0_f64.powi(exponent - exponent / 2));
     let scaled = Mat::<f64>::from_fn(n, a.ncols(), |i, j| a[(i, j)] * lead * tail);
-    let (mut s, u) = self_adjoint_evd_as_given(scaled.as_ref(), side)?;
+    let (mut s, payload) = decompose(scaled.as_ref())?;
     for k in 0..n {
         let value = s.as_ref().column_vector()[k];
         s.as_mut().column_vector_mut()[k] = value / lead / tail;
     }
-    Ok((s, u))
+    Ok((s, payload))
 }
 
 /// [`self_adjoint_evd`] of `a` at its own scale.

@@ -1,4 +1,5 @@
-//! `linear_state_quotient`: [`LinearStateQuotient`] on the wire.
+//! `linear_state_quotient`: [`LinearStateQuotient`] on the wire, and
+//! `linear_closed_chart`: its closed chart alone ([`LinearStateQuotient::closed_chart`]).
 
 use std::collections::BTreeMap;
 
@@ -64,6 +65,27 @@ pub struct SpectralNormBoundsReport {
     pub upper: f64,
 }
 
+/// The readouts `M_k` (`p_k × d`) and transitions `T_a` (`d × d`) whose closed chart
+/// alone is wanted, each the id of an input array.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinearClosedChartRequest {
+    pub readouts: Vec<String>,
+    pub transitions: Vec<String>,
+}
+
+/// [`LinearStateQuotient::closed_chart`] on the wire: the chart `close` would
+/// measure, with no measurement. With no transitions `rows` is the readouts'
+/// resolved rank, a certified lower bound on their exact rank; with transitions it
+/// is not a certified dimension, and nothing here certifies the chart's contracts.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LinearClosedChartReport {
+    /// Id of the output array `Q` (`r × d`).
+    pub chart: String,
+    /// `r`, the chart's rows.
+    pub rows: usize,
+}
+
 pub(super) fn bounds_report(
     field: &'static str,
     bounds: SpectralNormBounds,
@@ -108,6 +130,26 @@ pub(super) fn run(
     }
     .map_err(MpdSurfaceError::State)?;
     project(quotient)
+}
+
+pub(super) fn run_chart(
+    request: LinearClosedChartRequest,
+    tensors: &BTreeMap<String, ArrayD<f64>>,
+    governor: &MemoryGovernor,
+) -> Result<MpdOutput, MpdSurfaceError> {
+    let readouts = matrices(tensors, &request.readouts)?;
+    let transitions = matrices(tensors, &request.transitions)?;
+    let chart = LinearStateQuotient::closed_chart(governor, &readouts, &transitions)
+        .map_err(MpdSurfaceError::State)?;
+    let rows = chart.nrows();
+    let arrays = BTreeMap::from([("chart".to_string(), chart.into_dyn())]);
+    Ok(output(
+        MpdResult::LinearClosedChart(LinearClosedChartReport {
+            chart: "chart".to_string(),
+            rows,
+        }),
+        arrays,
+    ))
 }
 
 pub(super) fn project(quotient: LinearStateQuotient) -> Result<MpdOutput, MpdSurfaceError> {
@@ -244,6 +286,33 @@ mod tests {
             serde_json::from_str(&output.report_json().expect("report json")).expect("parse report");
         assert_eq!(json["result"]["kind"], "linear_state_quotient");
         assert_eq!(json["result"]["descended"][0], "descended/0");
+    }
+
+    /// The chart-only op returns [`LinearStateQuotient::closed_chart`], which is bit for
+    /// bit the chart the measuring op reports, and refuses what the owner refuses.
+    #[test]
+    fn closed_chart_op_is_the_owner_chart_without_the_measurement() {
+        let tensors = fixture();
+        let chart_request = request_json(r#"{"kind": "linear_closed_chart", "readouts": ["m"], "transitions": ["t"]}"#);
+        let output = run_parameter_decomposition(&chart_request, &tensors, test_governor()).expect("surface run");
+        let MpdResult::LinearClosedChart(report) = &output.report.result else {
+            panic!("expected a closed chart, got {:?}", output.report.result);
+        };
+        let measured = run_parameter_decomposition(&request(r#"{"kind": "close"}"#), &tensors, test_governor())
+            .expect("surface run");
+        assert_eq!(report.rows, 2);
+        assert_eq!(output.arrays.keys().collect::<Vec<_>>(), vec!["chart"]);
+        let bits = |array: &ArrayD<f64>| array.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&output.arrays["chart"]), bits(&measured.arrays["chart"]));
+        let json: serde_json::Value =
+            serde_json::from_str(&output.report_json().expect("report json")).expect("parse report");
+        assert_eq!(json["result"]["kind"], "linear_closed_chart");
+        assert_eq!(json["result"]["rows"], 2);
+        let empty = request_json(r#"{"kind": "linear_closed_chart", "readouts": [], "transitions": []}"#);
+        assert!(matches!(
+            run_parameter_decomposition(&empty, &tensors, test_governor()),
+            Err(MpdSurfaceError::State(_))
+        ));
     }
 
     #[test]

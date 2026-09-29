@@ -63,8 +63,15 @@ def linear_quotient(readouts, transitions=(), chart=None):
 
 def resolved_rows(matrix):
     """state.rs's resolved row space of one matrix (sigma > max(m, n) eps sigma_max) as orthonormal rows: the
-    owner's quotient of ``matrix`` under no transitions. ``.shape[0]`` is the rank at the eps band."""
-    return linear_quotient([matrix])[0]
+    owner's closed chart of ``matrix`` under no transitions (op ``linear_closed_chart``,
+    ``LinearStateQuotient::closed_chart``), without the quotient bounds nothing here reads.
+    ``.shape[0]`` is the rank at the eps band."""
+    from gamfit.sae import run_parameter_decomposition
+
+    operation = {"kind": "linear_closed_chart", "readouts": ["readout/0"], "transitions": []}
+    out = run_parameter_decomposition({"schema": "gam.mpd-request", "schema_version": 1, "operation": operation},
+                                      {"readout/0": matrix})
+    return out.arrays["chart"]
 
 
 def relative_rows(matrix, tau):
