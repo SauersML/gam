@@ -102,6 +102,32 @@ pub mod finite_grid;
 // Joint finite-intervention objective and structural proposals.
 pub mod fit;
 
+// Operator programs: typed operators with exact interfaces, banded batch execution, message code.
+pub mod operator_program;
+
+// Tests of operator programs: code round trips, bands against double-double, exact basis rewrites.
+#[cfg(test)]
+mod operator_program_tests;
+
+// The declared contract of a program decomposition: load, complete and sampled families.
+pub mod contract;
+
+// Contract-driven program decomposition: primitives, batched certified MDL search, certificates.
+pub mod engine;
+
+// The engine on planted programs: recovery, labelling up to automorphism, restatement invariance.
+#[cfg(test)]
+mod engine_tests;
+
+// The component-level view of an operator program: reads, laws, writes, uses, bits, unresolved share.
+pub mod view;
+
+// Refitting a program's reals to its contract: exact Newton–CG on the readout's convex KL.
+pub mod refit;
+
+// Exact rewrites of operator programs: constant folding, composition, mixes, character and plane bases.
+pub mod operator_rewrites;
+
 // Exact masked rewrites of gated units, norms, biases and residual edges.
 pub mod gated_rewrite;
 

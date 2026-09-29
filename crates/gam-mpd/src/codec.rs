@@ -572,6 +572,70 @@ pub fn decode_signed_prefix_integer(reader: &mut BitReader<'_>) -> Result<i64, C
     Ok(unzigzag(decode_prefix_integer(reader)? - 1))
 }
 
+/// Length in bits of the Elias δ codeword of `value ≥ 1`: with `L = ⌊log₂ value⌋`, the Elias γ
+/// codeword of `L + 1` (`2⌊log₂(L + 1)⌋ + 1` bits) followed by the `L` low bits of `value`.
+///
+/// Its Kraft sum is 1. Unlike the ω code, the δ length of the signed index `zigzag(i) + 1` is
+/// subadditive over nonzero pairs: with `m = max(|a|, |b|)`, `zigzag(a + b) + 1 ≤ 4m + 1` and
+/// `ℓ_δ(4m + 1) ≤ ℓ_δ(2m) + 3 ≤ ℓ_δ(zigzag(±m) + 1) + 3`, while every nonzero signed index costs at
+/// least 4 bits. So splitting a real into two on one lattice never shortens a lattice message.
+pub fn elias_delta_len_bits(value: u64) -> Result<u64, CodecError> {
+    if value == 0 {
+        return Err(CodecError::InvalidInput("the Elias delta code covers integers from 1".to_string()));
+    }
+    let low = u64::from(u64::BITS - 1 - value.leading_zeros());
+    let length_prefix = u64::from(u64::BITS - 1 - (low + 1).leading_zeros());
+    Ok(low + 2 * length_prefix + 1)
+}
+
+/// Write `value ≥ 1` as its Elias δ codeword ([`elias_delta_len_bits`]).
+pub fn encode_elias_delta(out: &mut BitString, value: u64) -> Result<(), CodecError> {
+    if value == 0 {
+        return Err(CodecError::InvalidInput("the Elias delta code covers integers from 1".to_string()));
+    }
+    let low = u64::BITS - 1 - value.leading_zeros();
+    let length = u64::from(low) + 1;
+    let length_bits = u64::BITS - length.leading_zeros();
+    for _ in 1..length_bits {
+        out.push_bit(false);
+    }
+    out.push_bits(length, length_bits)?;
+    out.push_bits(value & ((1u64 << low) - 1), low)
+}
+
+/// Read one Elias δ codeword ([`encode_elias_delta`]).
+pub fn decode_elias_delta(reader: &mut BitReader<'_>) -> Result<u64, CodecError> {
+    let mut zeros = 0u32;
+    while !reader.read_bit()? {
+        zeros += 1;
+        if zeros >= u64::BITS {
+            return Err(CodecError::InvalidCodeword("an Elias delta length prefix beyond u64".to_string()));
+        }
+    }
+    let length = (1u64 << zeros) | reader.read_bits(zeros)?;
+    let low = length - 1;
+    if low >= u64::from(u64::BITS) {
+        return Err(CodecError::InvalidCodeword(format!("an Elias delta value of {length} bits")));
+    }
+    Ok((1u64 << low) | reader.read_bits(low as u32)?)
+}
+
+/// Length in bits of the signed δ codeword of `value`: [`elias_delta_len_bits`] of
+/// `zigzag(value) + 1`. `i64::MIN` is refused.
+pub fn signed_delta_len_bits(value: i64) -> Result<u64, CodecError> {
+    elias_delta_len_bits(signed_codeword_argument(value)?)
+}
+
+/// Write `value` as the Elias δ codeword of `zigzag(value) + 1`.
+pub fn encode_signed_delta(out: &mut BitString, value: i64) -> Result<(), CodecError> {
+    encode_elias_delta(out, signed_codeword_argument(value)?)
+}
+
+/// Read one signed δ codeword ([`encode_signed_delta`]).
+pub fn decode_signed_delta(reader: &mut BitReader<'_>) -> Result<i64, CodecError> {
+    Ok(unzigzag(decode_elias_delta(reader)? - 1))
+}
+
 /// `⌈log₂ M⌉`: the width of a fixed index into an alphabet of `M ≥ 1` symbols the
 /// decoder already knows. A one-symbol alphabet costs zero bits.
 pub fn fixed_index_len_bits(alphabet_size: usize) -> Result<u32, CodecError> {

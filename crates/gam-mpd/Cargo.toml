@@ -20,12 +20,14 @@ gam-runtime = { path = "../gam-runtime", version = "=0.3.157" }
 gam-sae = { path = "../gam-sae", version = "=0.3.157" }
 gam-solve = { path = "../gam-solve", version = "=0.3.157" }
 gam-terms = { path = "../gam-terms", version = "=0.3.157" }
+log = "0.4.29"
 memmap2 = "0.9.10"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 rand = "0.10.1"
 rayon = "1.12.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
+statrs = "0.19.0"
 
 [dev-dependencies]
 qd = "0.8.0"
