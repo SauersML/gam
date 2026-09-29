@@ -274,6 +274,11 @@ pub(super) fn truncated_survival_surface_moments(
                     target,
                     |log_weight, normal_coordinates, tangent| {
                         let coefficients = draws.coefficients(normal_coordinates, tangent)?;
+                        // A node across a row the rule does not carry has zero
+                        // density under the law (gam#3575).
+                        if !draws.inside_cone(&coefficients) {
+                            return Ok(());
+                        }
                         assign_survival_fit_coefficients(&mut node_fit, &coefficients)
                             .map_err(String::from)?;
                         accumulator.push(&cells, log_weight, &node_cells(&node_fit)?)

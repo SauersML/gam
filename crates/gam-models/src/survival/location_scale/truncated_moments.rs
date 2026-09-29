@@ -138,6 +138,10 @@ pub(crate) struct TruncatedCoefficientDraws {
     law: TruncatedCoefficientLaw,
     /// `L_res` with `L_res L_resᵀ = Σ_res`, raw × rank.
     residual_factor: Array2<f64>,
+    /// The fit's WHOLE cone in raw coordinates, `rows·β ≥ bounds`: every
+    /// constraint row, retained or not (gam#3575).
+    cone_rows: Array2<f64>,
+    cone_bounds: Array1<f64>,
 }
 
 impl TruncatedCoefficientDraws {
@@ -161,6 +165,39 @@ impl TruncatedCoefficientDraws {
     /// unit of tangent coordinate `j`.
     pub(crate) fn residual_factor(&self) -> &Array2<f64> {
         &self.residual_factor
+    }
+
+    /// Whether a raw coefficient vector lies in the fit's cone, on every
+    /// constraint row (gam#3575).
+    ///
+    /// The rule's nodes are feasible on the RETAINED rows by construction, and
+    /// its tangent block is Gaussian with `AΣ_resAᵀ = 0` on those rows only. A
+    /// row the retention walk left out — beyond the mass horizon, or dropped as
+    /// nearly dependent on the retained ones — constrains nothing in the rule,
+    /// so a node can cross it. The law is `N(β_unc, Σ)` restricted to the whole
+    /// cone: its density at such a node is zero. The rule's nodes are a rule
+    /// for the law restricted to the retained rows, a superset of the cone, so
+    /// weighting each node by this indicator and normalizing by the kept weight
+    /// is exactly the restriction to the whole cone.
+    ///
+    /// A retained row's slack is the node's own coordinate `u ≥ 0` in exact
+    /// arithmetic; formed as `a·β − b` it carries the rounding of that dot
+    /// product, `γ_(p+1)·(Σ|a_j β_j| + |b|)`, so a slack inside that band is a
+    /// node on the wall, which the cone contains.
+    pub(crate) fn inside_cone(&self, coefficients: &Array1<f64>) -> bool {
+        let growth = gam_linalg::roundoff::accumulation_growth(coefficients.len() + 1);
+        self.cone_rows
+            .outer_iter()
+            .zip(self.cone_bounds.iter())
+            .all(|(row, &bound)| {
+                let magnitude = row
+                    .iter()
+                    .zip(coefficients.iter())
+                    .map(|(a, beta)| (a * beta).abs())
+                    .sum::<f64>()
+                    + bound.abs();
+                row.dot(coefficients) - bound >= -growth * magnitude
+            })
     }
 
     /// The raw coefficient vector at one node of [`Self::rule`].
@@ -205,10 +242,35 @@ pub(crate) fn build_truncated_coefficient_draws(
     )?
     .factor;
     let law = pieces.into_law(residual_factor.ncols())?;
+    let (cone_rows, cone_bounds) = raw_cone(fit)?;
     Ok(Some(TruncatedCoefficientDraws {
         law,
         residual_factor,
+        cone_rows,
+        cone_bounds,
     }))
+}
+
+/// The fit's cone `Aβ_a ≥ b` on the active coefficients, carried into the raw
+/// coordinates the draws live in. With `β = Tβ_a + s` and `T` of full column
+/// rank, `β_a = T⁺(β − s)`, `T⁺ = (TᵀT)⁻¹Tᵀ`, so the raw system is
+/// `(AT⁺)β ≥ b + AT⁺s`. A raw vector off the gauge's range has no active
+/// preimage, but every draw is `Tβ_a + s` by construction, on which `T⁺` is
+/// exact.
+fn raw_cone(fit: &UnifiedFitResult) -> Result<(Array2<f64>, Array1<f64>), String> {
+    let geometry = fit
+        .geometry
+        .as_ref()
+        .ok_or_else(|| "truncated coefficient draws: the fit carries no geometry".to_string())?;
+    let constrained = geometry.constrained_posterior.as_ref().ok_or_else(|| {
+        "truncated coefficient draws: the fit carries no constrained posterior".to_string()
+    })?;
+    let gauge = &geometry.coefficient_gauge;
+    let frame = ConeFrame::new(geometry, constrained, gauge.t_full.nrows())?;
+    let pseudo_inverse = frame.gram_inverse.dot(&gauge.t_full.t());
+    let rows = constrained.constraints.a.dot(&pseudo_inverse);
+    let bounds = &constrained.constraints.b + &rows.dot(&gauge.affine_shift);
+    Ok((rows, bounds))
 }
 
 /// Everything of the truncated law but its rule, whose tangent dimension is the

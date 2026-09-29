@@ -1739,9 +1739,45 @@ fn royston_parmar_posterior_mean_integrates_the_cone_truncated_law_3575() {
         scaled.dot(&scaled.t())
     };
 
+    // The Royston-Parmar log cumulative hazard is affine in the coefficients,
+    // `log H(β) = log H(β̄) + J(β − β̄)` about the published mean `β̄`, so each
+    // draw's survival surface is read off that map instead of a whole
+    // re-prediction. `J`'s columns are differences of re-predictions at `β̄`
+    // and `β̄ + e_j`, both inside the cone because `β̄` is and `e_j ≥ 0`; the
+    // map is checked at every feasible draw of the first chunk against a whole
+    // re-prediction.
+    let (n_rows, n_times) = published.survival.dim();
+    let log_cumulative_hazard_at = |beta: &Array1<f64>| -> Array2<f64> {
+        let draw_model =
+            saved_model_with_survival_coefficients(&model, beta).expect("draw model");
+        let draw = predict_survival_coefficient_law(
+            SurvivalPredictRequest {
+                model: &draw_model,
+                ..request(SurvivalPredictEstimand::Plugin, false)
+            },
+            mode,
+        )
+        .expect("per-coefficient survival law at a feasible coefficient vector");
+        draw.cumulative_hazard.mapv(f64::ln)
+    };
+    let base = fit.beta.clone();
+    let base_log_hazard = log_cumulative_hazard_at(&base);
+    let jacobian: Vec<Array2<f64>> = (0..base.len())
+        .map(|j| {
+            let mut shifted = base.clone();
+            shifted[j] += 1.0;
+            &log_cumulative_hazard_at(&shifted) - &base_log_hazard
+        })
+        .collect();
+    let survival_of = |beta: &Array1<f64>| -> Array2<f64> {
+        let mut log_hazard = base_log_hazard.clone();
+        for (j, column) in jacobian.iter().enumerate() {
+            log_hazard.scaled_add(beta[j] - base[j], column);
+        }
+        log_hazard.mapv(|value| (-value.exp()).exp())
+    };
     let chunks = 16usize;
     let per_chunk = 250usize;
-    let (n_rows, n_times) = published.survival.dim();
     let (samples, proposals) = (0..chunks)
         .into_par_iter()
         .map(|chunk| {
@@ -1758,18 +1794,19 @@ fn royston_parmar_posterior_mean_integrates_the_cone_truncated_law_3575() {
                 if slack.iter().any(|&value| value < 0.0) {
                     continue;
                 }
-                let draw_model =
-                    saved_model_with_survival_coefficients(&model, &(&center + &displacement))
-                        .expect("draw model");
-                let draw = predict_survival_coefficient_law(
-                    SurvivalPredictRequest {
-                        model: &draw_model,
-                        ..request(SurvivalPredictEstimand::Plugin, false)
-                    },
-                    mode,
-                )
-                .expect("per-coefficient survival law at a feasible draw");
-                samples.push(draw.survival);
+                let beta = &center + &displacement;
+                let survival = survival_of(&beta);
+                if chunk == 0 {
+                    let replayed = log_cumulative_hazard_at(&beta).mapv(|value| (-value.exp()).exp());
+                    let gap = (&replayed - &survival)
+                        .iter()
+                        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+                    assert!(
+                        gap <= 1.0e-10,
+                        "the affine log-hazard map misses a whole re-prediction by {gap:e}"
+                    );
+                }
+                samples.push(survival);
             }
             (samples, proposals)
         })
