@@ -2,7 +2,7 @@
 decomposition (#2951).
 
 This is the torch end of MPD's native lift
-(``crates/gam-sae/src/parameter_decomposition/``). All math that decides an
+(``crates/gam-mpd/src/``). All math that decides an
 experiment stays in Rust: the lift declares each edit's delta, scope and
 positions and computes the teacher fingerprint from what this module exports.
 This module only

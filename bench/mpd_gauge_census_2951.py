@@ -1,4 +1,4 @@
-"""#2951 gauge census: export Qwen3 weights for crates/gam-sae/examples/mpd_gauge_census_2951.rs.
+"""#2951 gauge census: export Qwen3 weights for crates/gam-mpd/examples/mpd_gauge_census_2951.rs.
 
 numpy (+ huggingface_hub to locate the snapshot). Reads the safetensors snapshot (bf16 -> float64 is exact)
 with the lazy reader of bench/mpd_opfirst_decoder_2951.py, and writes one float64 .npy per tensor the gauge

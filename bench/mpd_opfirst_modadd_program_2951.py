@@ -34,7 +34,7 @@ family). Held-out counterfactuals, run on the model and predicted by P and T, no
  (c) W_U's plane V_k scaled by lambda (a realizable parameter edit).
 
 Greedy MDL structure selection over R (the certified replacement for the 1% cutoffs) is the Rust baseline driver
-crates/gam-sae/examples/mpd_modadd_cyclic_baseline_2951.rs, reading the float64 export of
+crates/gam-mpd/examples/mpd_modadd_cyclic_baseline_2951.rs, reading the float64 export of
 bench/mpd_engine_export_2951.py.
 """
 from __future__ import annotations
@@ -58,7 +58,7 @@ def chars(k, x, p):
 
 
 def mpd(operation, tensors):
-    """One operation of the Rust MPD surface (gam_sae::parameter_decomposition::surface)."""
+    """One operation of the Rust MPD surface (gam_mpd::surface)."""
     from gamfit.sae import run_parameter_decomposition
 
     return run_parameter_decomposition({"schema": "gam.mpd-request", "schema_version": 1, "operation": operation},

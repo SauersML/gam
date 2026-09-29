@@ -1,6 +1,6 @@
 """Manifold parameter decomposition (#2951) — a thin adapter over the Rust surface.
 
-``gam_sae::parameter_decomposition::surface`` owns the versioned request
+``gam_mpd::surface`` owns the versioned request
 document, its validation, every operation and the report. This module only
 serializes the request mapping to JSON text, passes each named array as
 contiguous float64, and returns the report with the arrays it names. ``gam

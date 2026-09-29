@@ -16,6 +16,7 @@ gam-data = { path = "../gam-data" }
 gam-model-api = { path = "../gam-model-api" }
 gam-predict = { path = "../gam-predict" }
 gam-runtime = { path = "../gam-runtime" }
+gam-mpd = { path = "../gam-mpd" }
 gam-sae = { path = "../gam-sae" }
 clap = { version = "4.6.1", features = ["derive"] }
 comfy-table = "7.2.2"

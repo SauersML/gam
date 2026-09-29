@@ -5,7 +5,7 @@ Analysis under SPEC 8's exception: it reads checkpoints from ``bench/mpd_modadd_
 writes one JSON receipt and figures. It is not an MPD input and computes nothing MPD relies on.
 
 The table's cycled rows expand exactly in the characters of their cycle position (see
-``crates/gam-sae/src/parameter_decomposition/cyclic_action.rs``)::
+``crates/gam-mpd/src/cyclic_action.rs``)::
 
     e_a = c_0 + sum_k U_k D(w_k a),   D(t) = (cos t, sin t),   w_k = 2 pi k / p.
 

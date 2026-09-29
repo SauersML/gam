@@ -1,7 +1,7 @@
 //! Manifold parameter decomposition (#2951): the Python transport of the Rust
 //! surface.
 //!
-//! `gam_sae::parameter_decomposition::surface` owns the request document, every
+//! `gam_mpd::surface` owns the request document, every
 //! operation and the report. This module converts a `dict[str, ndarray]` to owned
 //! `f64` arrays, runs the surface with the interpreter lock released, and hands the
 //! report's JSON text and named arrays back. The CLI calls the same entry, so both
@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use gam::terms::sae::parameter_decomposition::surface::run_parameter_decomposition;
+use gam_mpd::surface::run_parameter_decomposition;
 use gam_runtime::resource::MemoryGovernor;
 use numpy::{IntoPyArray, PyReadonlyArrayDyn};
 use pyo3::prelude::*;

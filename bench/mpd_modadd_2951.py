@@ -12,7 +12,7 @@ Stage S0 is torch only.
 * ``s0`` runs the executor controls and the benchmark oracle on stored checkpoints and writes
   one JSON receipt.
 * ``execute`` is the torch driver of a Rust receipt, picked by the settings' ``stage``:
-  ``s2_native`` (``crates/gam-sae/examples/mpd_modadd_s2_2951.rs``) writes each declared
+  ``s2_native`` (``crates/gam-mpd/examples/mpd_modadd_s2_2951.rs``) writes each declared
   checkpoint's tensors in their trained float32, torch's float64 logits on the test pairs and
   torch's executor control, and builds control C3 from a run entry's declared ``shuffle_seed``.
   It writes ``export.json``.

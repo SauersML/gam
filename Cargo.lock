@@ -3593,6 +3593,7 @@ dependencies = [
  "gam-data",
  "gam-math",
  "gam-model-api",
+ "gam-mpd",
  "gam-predict",
  "gam-runtime",
  "gam-sae",
@@ -3876,6 +3877,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "gam-mpd"
+version = "0.3.157"
+dependencies = [
+ "faer",
+ "gam-geometry",
+ "gam-linalg",
+ "gam-math",
+ "gam-runtime",
+ "gam-sae",
+ "gam-solve",
+ "gam-terms",
+ "memmap2",
+ "ndarray 0.17.2",
+ "qd",
+ "rand 0.10.2",
+ "rayon",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "gam-predict"
 version = "0.3.157"
 dependencies = [
@@ -3930,6 +3952,7 @@ dependencies = [
  "gam-build-identity",
  "gam-math",
  "gam-model-api",
+ "gam-mpd",
  "gam-predict",
  "gam-runtime",
  "log",

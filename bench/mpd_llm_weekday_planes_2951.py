@@ -3,7 +3,7 @@
 Analysis under SPEC 8's exception (benchmark evaluation, not an MPD input). torch/transformers only.
 
 The seven weekday tokens are a declared cycle of rows of the INPUT embedding table, the setting of
-``crates/gam-sae/src/parameter_decomposition/cyclic_action.rs``. Their rows expand exactly in the
+``crates/gam-mpd/src/cyclic_action.rs``. Their rows expand exactly in the
 characters of their cycle position: ``e_d = c_0 + sum_{k=1..3} U_k D(2 pi k d / 7)`` (seven rows, seven
 basis columns, so the expansion is exact). The edits act on the input occurrence only: small Qwen3
 models tie the unembedding to the embedding, and a global edit would also move the answer rows, a

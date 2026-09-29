@@ -1,7 +1,7 @@
 use super::*;
 
 use gam_runtime::resource::MemoryGovernor;
-use gam_sae::parameter_decomposition::surface::run_parameter_decomposition;
+use gam_mpd::surface::run_parameter_decomposition;
 use ndarray::ArrayD;
 use npyz::WriterBuilder;
 use std::collections::BTreeMap;

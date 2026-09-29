@@ -86,7 +86,7 @@
 //!
 //! # Contrast with the worst-case module split
 //!
-//! `parameter_decomposition::module_split` asks a different question of a plain GELU or ReLU MLP:
+//! `gam_mpd::module_split` asks a different question of a plain GELU or ReLU MLP:
 //! whether `F(Px + (I−P)y) = QF(x) + (I−Q)F(y)` for all inputs, a sup-norm replacement contract
 //! with no law, splitting outputs as well as inputs, with the frame found from the weights' read
 //! and write spans instead of declared ports. Its certified `η` bounds the worst-case defect; the
@@ -243,7 +243,7 @@ fn union_root(parent: &mut [usize], mut port: usize) -> usize {
 /// sorted, and components are ordered by their smallest vertex. The one component owner for every
 /// banded-edge graph in the crate: the caller decides which edges are resolved, this only joins
 /// them.
-pub(crate) fn connected_components(
+pub fn connected_components(
     count: usize,
     edges: impl IntoIterator<Item = (usize, usize)>,
 ) -> Vec<Vec<usize>> {

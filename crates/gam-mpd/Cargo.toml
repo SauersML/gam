@@ -1,0 +1,34 @@
+[package]
+name = "gam-mpd"
+version = "0.3.157"
+edition = "2024"
+description = "Mechanistic parameter decomposition on top of the gam SAE engine"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/SauersML/gam"
+rust-version = "1.97"
+publish = false
+
+[lib]
+name = "gam_mpd"
+
+[dependencies]
+faer = "0.24.4"
+gam-geometry = { path = "../gam-geometry", version = "=0.3.157" }
+gam-linalg = { path = "../gam-linalg", version = "=0.3.157" }
+gam-math = { path = "../gam-math", version = "=0.3.157" }
+gam-runtime = { path = "../gam-runtime", version = "=0.3.157" }
+gam-sae = { path = "../gam-sae", version = "=0.3.157" }
+gam-solve = { path = "../gam-solve", version = "=0.3.157" }
+gam-terms = { path = "../gam-terms", version = "=0.3.157" }
+ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
+rand = "0.10.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
+
+[dev-dependencies]
+memmap2 = "0.9.10"
+qd = "0.8.0"
+rayon = "1.12.0"
+
+[lints.rust]
+warnings = "deny"

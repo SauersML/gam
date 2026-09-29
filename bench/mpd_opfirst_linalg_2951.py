@@ -1,7 +1,7 @@
 """#2951 operation-first probes: the one owner of float64 dense decompositions.
 
 Every probe decomposition is faer's, through the MPD surface's `dense` operation
-(gamfit.sae.run_parameter_decomposition -> crates/gam-sae/src/parameter_decomposition/dense.rs), never
+(gamfit.sae.run_parameter_decomposition -> crates/gam-mpd/src/dense.rs), never
 LAPACK's: torch's macOS wheels link Apple Accelerate, whose LAPACK returns wrong results on rank-deficient,
 wide-spectrum matrices (quicophy/mdopt#574). Torch is for model forward passes and matmuls only.
 

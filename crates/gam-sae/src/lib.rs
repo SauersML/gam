@@ -32,7 +32,6 @@ pub mod migration_ledger;
 pub mod native_code_source;
 pub mod null_battery;
 pub mod null_sampler;
-pub mod parameter_decomposition;
 pub mod response;
 pub mod routability;
 pub mod row_jet_program;

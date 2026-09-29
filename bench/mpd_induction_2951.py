@@ -13,7 +13,7 @@ Stage S0 is torch only; ``registry`` and ``execute`` are the torch end of S1.
   stored tensor in its trained dtype (float32, which a reader widens to binary64 exactly), a float64
   ``.npy`` of the native logits (rows over sequence then position), and ``registry.json`` with the
   input tokens and every file's md5. Every array has two axes, so
-  ``crates/gam-sae/examples/mpd_induction_registry.rs`` reads it through
+  ``crates/gam-mpd/examples/mpd_induction_registry.rs`` reads it through
   ``examples/support/npy_header.rs``.
 * ``execute`` is the torch driver of the direct-lane receipt runner:
   ``execute --harvest REGISTRY_EXPORT --settings SETTINGS_JSON --out-dir RUN``.
