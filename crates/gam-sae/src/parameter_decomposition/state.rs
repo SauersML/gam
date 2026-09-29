@@ -96,6 +96,7 @@ use gam_linalg::roundoff::{accumulation_band, accumulation_growth, factor_singul
 use gam_runtime::resource::{MemoryGovernor, MemoryReservation, MemoryReservationError};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 
+use super::joint_operators::RoutingLawLetters;
 use super::supports::{EvidenceStatus, EvidenceStatusError, ExactBasis, Extremum};
 
 /// A computed value with a derived bound on its roundoff.
@@ -1134,10 +1135,9 @@ impl LinearStateQuotient {
 pub struct ObservabilityStep<'a> {
     /// The declared letters `T_{l,1..H}`, each `n_{l+1} × n_l`. The alphabet is
     /// exactly what is declared: a residual stream is the identity letter, passed
-    /// like any other. The letter for attention is a routing law's transport, the
-    /// sum of the OV maps of every head that shares one attention pattern. One
-    /// letter per head is not invariant under the cross-head `GL` gauge of heads
-    /// with identical patterns, so it over-counts.
+    /// like any other. An attention block enters only as
+    /// [`ObservabilityLetter::RoutingLaws`], whose letters the joint-operator owner
+    /// derives.
     pub letters: Vec<ObservabilityLetter<'a>>,
     /// Readouts `R_l` of `h_{l+1}`, each `p × n_{l+1}`. May be empty.
     pub readouts: Vec<ArrayView2<'a, f64>>,
@@ -1162,6 +1162,15 @@ pub enum ObservabilityLetter<'a> {
         reads: ArrayView2<'a, f64>,
         writes: ArrayView2<'a, f64>,
     },
+    /// An attention block's letters, one per routing law: the summed value/output
+    /// transport of the heads that share one attention pattern, derived by
+    /// `joint_operators::attention_letters` from the block's own query/key operators,
+    /// the only constructor of [`RoutingLawLetters`]. One letter per head is not
+    /// invariant under the cross-head `GL` gauge of heads with one pattern (it moves
+    /// each head's transport and not their sum), and it over-counts, so it cannot be
+    /// declared here. Each transport carries its formation band, which the pull-back
+    /// propagates as `‖S‖_F ‖E‖_F`.
+    RoutingLaws(&'a RoutingLawLetters),
 }
 
 impl ObservabilityLetter<'_> {
@@ -1170,6 +1179,7 @@ impl ObservabilityLetter<'_> {
         match self {
             Self::Linear(letter) => letter.dim(),
             Self::Units { reads, writes } => (writes.ncols(), reads.ncols()),
+            Self::RoutingLaws(letters) => letters.transports().first().map_or((0, 0), |transport| transport.dim()),
         }
     }
 
@@ -1178,6 +1188,7 @@ impl ObservabilityLetter<'_> {
         match self {
             Self::Linear(_) => 1,
             Self::Units { reads, .. } => reads.nrows(),
+            Self::RoutingLaws(letters) => letters.transports().len(),
         }
     }
 
@@ -1191,6 +1202,14 @@ impl ObservabilityLetter<'_> {
                 require_dimension(writes.nrows(), reads.nrows(), "weighted observability: units")?;
                 require_finite(reads.view(), context)?;
                 require_finite(writes.view(), context)
+            }
+            Self::RoutingLaws(letters) => {
+                for transport in letters.transports() {
+                    require_dimension(transport.nrows(), output, context)?;
+                    require_dimension(transport.ncols(), input, context)?;
+                    require_finite(transport.view(), context)?;
+                }
+                Ok(())
             }
         }
     }
@@ -1229,6 +1248,23 @@ impl ObservabilityLetter<'_> {
                     squared += ((weight_error + accumulation_growth(1) * weight) * read_norm).powi(2);
                 }
                 (moved, squared.sqrt())
+            }
+            Self::RoutingLaws(letters) => {
+                let rows = source.nrows();
+                let mut moved = Array2::<f64>::zeros((rows * letters.transports().len(), width));
+                let mut squared = 0.0_f64;
+                let source_norm = frobenius(source);
+                for (index, (transport, &band)) in letters.transports().iter().zip(letters.bands()).enumerate() {
+                    moved.slice_mut(s![index * rows..(index + 1) * rows, ..]).assign(&source.dot(transport));
+                    let product_band = entrywise_band_norm(
+                        absolute_source
+                            .dot(&transport.mapv(f64::abs))
+                            .mapv(|magnitude| accumulation_band(width, magnitude)),
+                    );
+                    let error = formation * (frobenius(transport) + band) + product_band + source_norm * band;
+                    squared += error * error;
+                }
+                (moved, squared.sqrt() * (1.0 + accumulation_growth(2 * letters.transports().len() + 1)))
             }
         }
     }
@@ -1433,6 +1469,7 @@ impl WeightedObservability {
                 let moved_rows = match letter {
                     ObservabilityLetter::Linear(_) => source_rows,
                     ObservabilityLetter::Units { reads, .. } => reads.nrows() + source_rows,
+                    ObservabilityLetter::RoutingLaws(letters) => letters.transports().len().max(1) * source_rows,
                 };
                 let letter_reservation = reserve(
                     governor,

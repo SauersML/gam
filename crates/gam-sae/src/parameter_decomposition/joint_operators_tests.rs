@@ -377,24 +377,18 @@ fn toy5_operator_equality_separates_laws_that_share_every_subspace() {
         }
     }
 
-    let proven_distinct = |first: &FactoredOperator, second: &FactoredOperator| {
-        compare_operators(test_governor(), first, second).expect("comparison").proven_distinct()
-    };
-    let mut laws: Vec<Vec<usize>> = vec![vec![0]];
-    for head in 1..ROUTING_HEADS {
-        let joined = laws.iter_mut().find(|law| {
-            (0..planes).all(|plane| {
-                !proven_distinct(operators.cosine(law[0], plane), operators.cosine(head, plane))
-                    && !proven_distinct(operators.sine(law[0], plane), operators.sine(head, plane))
-            })
-        });
-        match joined {
-            Some(law) => law.push(head),
-            None => laws.push(vec![head]),
-        }
-    }
     let truth = RoutingToy::truth();
-    assert_eq!(laws, truth.laws);
+    let laws = routing_laws(test_governor(), &native, operators).expect("routing laws");
+    assert_eq!(laws.laws, truth.laws);
+    assert_eq!(laws.law_of(1), Some(0));
+    assert_eq!(laws.law_of(2), Some(1));
+    assert!(!compare_heads(test_governor(), operators, 0, 1).expect("heads").proven_distinct());
+    // One pattern at two temperatures: head 3's score operator is head 1's times 2.
+    let [relation] = laws.relations.as_slice() else {
+        panic!("expected one relation between two laws, got {:?}", laws.relations);
+    };
+    assert!(relation.comparison.proven_distinct() && relation.proportional());
+    assert_eq!(relation.comparison.scale, truth.third_head_scale, "dyadic factors make the common scale exact");
     for plane in 0..planes {
         for (first, second) in [
             (operators.cosine(0, plane), operators.cosine(2, plane)),
@@ -420,4 +414,46 @@ fn toy5_operator_equality_separates_laws_that_share_every_subspace() {
     assert_eq!(rank(&[0]), 2);
     assert_eq!(rank(&[1]), 2);
     assert_eq!(vec![rank(&truth.laws[0]), rank(&truth.laws[1])], truth.law_transport_ranks);
+}
+
+
+/// The routing-law letters of the toy: one per law, `C₁ + C₂` and `C₃`, formed from the
+/// stored factors within their band; a key change that separates heads 1 and 2 splits the
+/// first law, and a query/key norm adds the normalizers to the law test.
+#[test]
+fn attention_letters_are_one_summed_transport_per_law() {
+    let toy = RoutingToy::new(2951);
+    let native = toy.native(&toy.value, &toy.output);
+    let letters = attention_letters(test_governor(), &native, None).expect("letters");
+    assert_eq!(letters.laws.laws, RoutingToy::truth().laws);
+    assert_eq!(letters.transports().len(), 2);
+    for (law, (transport, &band)) in letters.laws.laws.iter().zip(letters.transports().iter().zip(letters.bands())) {
+        let exact = RoutingToy::transport(&toy.value, &toy.output, law);
+        let distance = (transport - &exact).iter().map(|value| value * value).sum::<f64>().sqrt();
+        assert!(distance <= band, "law {law:?}: {distance:e} beyond {band:e}");
+    }
+
+    let mut split = toy.clone();
+    split.key[1][[0, 0]] += 0.25;
+    let native = split.native(&split.value, &split.output);
+    let letters = attention_letters(test_governor(), &native, None).expect("letters");
+    assert_eq!(letters.laws.laws, vec![vec![0], vec![1], vec![2]]);
+    assert!(letters.laws.relations.iter().filter(|relation| relation.law == 2 && relation.earlier == 0).all(|relation| relation.proportional()));
+
+    // A plane scale `S = 2` on plane 0 of the second head's key with `S⁻ᵀ` on its query is a
+    // rotary gauge: the operators, and so the law, do not move. Behind a query/key norm the raw query
+    // rows now differ, so the normalizers differ and the heads route differently.
+    let mut scaled = toy.clone();
+    for row in [0, 2] {
+        scaled.query[1].row_mut(row).mapv_inplace(|entry| entry * 0.5);
+        scaled.key[1].row_mut(row).mapv_inplace(|entry| entry * 2.0);
+    }
+    let plain = attention_letters(test_governor(), &scaled.native(&scaled.value, &scaled.output), None).expect("letters");
+    assert_eq!(plain.laws.laws, RoutingToy::truth().laws);
+    let normed = scaled
+        .native(&scaled.value, &scaled.output)
+        .with_query_key_norm(1e-6, Array1::ones(4), Array1::ones(4))
+        .expect("normed");
+    let letters = attention_letters(test_governor(), &normed, None).expect("letters");
+    assert_eq!(letters.laws.laws, vec![vec![0], vec![1], vec![2]]);
 }

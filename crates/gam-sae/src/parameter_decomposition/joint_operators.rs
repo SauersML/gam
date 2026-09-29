@@ -58,6 +58,14 @@
 //! route differently. Sharing claims need [`compare_operators`]: its difference certifies two
 //! operators distinct, and its proportionality residual says whether they differ only by
 //! scale.
+//!
+//! # Routing laws
+//!
+//! [`routing_laws`] groups query heads whose whole score operators are equal within band
+//! ([`compare_heads`]), and reports how the laws relate (proportional, with the common
+//! scale, or not). [`attention_letters`] turns the laws into an attention step's
+//! observability letters, one summed transport per law, the only letters
+//! `state::ObservabilityLetter::RoutingLaws` accepts for attention.
 
 use gam_linalg::faer_ndarray::{FaerLinalgError, FaerQr, fast_abt, fast_atb, fast_atv};
 use gam_linalg::roundoff::{accumulation_growth, householder_qr_backward_band};
@@ -662,15 +670,7 @@ pub fn compare_operators(
 ) -> Result<OperatorComparison, JointRefusal> {
     let width = first.width();
     expect_shape("compared operator", (width, second.rank()), second.left.dim())?;
-    let stacked = |scale: f64| -> Result<(f64, f64), JointRefusal> {
-        let negated = second.left.mapv(|entry| -scale * entry);
-        let left = concatenate(Axis(1), &[first.left.view(), negated.view()]).map_err(shape_failed)?;
-        let right = concatenate(Axis(1), &[first.right.view(), second.right.view()]).map_err(shape_failed)?;
-        let (value, error) = factored_norm(left.view(), right.view())?;
-        // `−c L₂` rounds each entry once: a relative defect `γ_1` on those columns.
-        let scaled = up(accumulation_growth(1) * up(scale.abs() * upper_frobenius(second.left.view())));
-        Ok((value, up(error + up(scaled * upper_frobenius(second.right.view())))))
-    };
+    let stacked = |scale: f64| scaled_difference(first, second, scale);
     let gram = family_gram(governor, &[first, second])?;
     let scale = if gram.gram[[1, 1]] > 0.0 { gram.gram[[0, 1]] / gram.gram[[1, 1]] } else { 0.0 };
     let (difference, difference_error) = stacked(1.0)?;
@@ -684,6 +684,305 @@ pub fn compare_operators(
         scale,
         proportionality_residual: exact_norm(residual, residual_error, width)?,
     })
+}
+
+/// `‖M₁ − c M₂‖_F` at the given `c`, through [`factored_norm`] on the stacked factors
+/// `[L₁ | −c L₂]`, `[R₁ | R₂]`. `−c L₂` rounds each entry once, a relative defect `γ_1` on
+/// those columns, which is added to the error.
+fn scaled_difference(first: &FactoredOperator, second: &FactoredOperator, scale: f64) -> Result<(f64, f64), JointRefusal> {
+    let negated = second.left.mapv(|entry| -scale * entry);
+    let left = concatenate(Axis(1), &[first.left.view(), negated.view()]).map_err(shape_failed)?;
+    let right = concatenate(Axis(1), &[first.right.view(), second.right.view()]).map_err(shape_failed)?;
+    let (value, error) = factored_norm(left.view(), right.view())?;
+    let scaled = up(accumulation_growth(1) * up(scale.abs() * upper_frobenius(second.left.view())));
+    Ok((value, up(error + up(scaled * upper_frobenius(second.right.view())))))
+}
+
+// ---------------------------------------------------------------------------------------
+// Routing laws
+// ---------------------------------------------------------------------------------------
+//
+// Two query heads attend alike at every input exactly when their scores agree at every
+// token pair and offset. Without a query/key norm the score of head `h` is
+// `σα² Σ_j (cos(ω_j Δ) xᵀ A_hj y + sin(ω_j Δ) xᵀ B_hj y) + σ xᵀ Π_h y`, and the functions
+// `cos(ω_j Δ)`, `sin(ω_j Δ)` of distinct frequencies are independent over the offsets, so
+// equal scores need equal operators: the head's score operator is the direct sum
+// `S_h = ⊕_j σα² (A_hj ⊕ B_hj) ⊕ σ Π_h`, and two heads share a routing law iff
+// `S_h = S_g`. `‖S_h − S_g‖²_F = Σ_j σ²α⁴ (‖A_hj − A_gj‖² + ‖B_hj − B_gj‖²) + σ² ‖Π_h − Π_g‖²`,
+// read part by part through [`compare_operators`]' factored norms, never forming `S`.
+// Behind a query/key norm the score also carries the normalizers `ν_q(u) ν_k(u_k)`, which
+// the operators exclude. Equal raw query rows (and raw key rows) give equal normalizers, so
+// there two heads also need their homogeneous raw rows `[W | b]` not proven distinct.
+//
+// Heads that share a law have one attention pattern, so their value/output transports act
+// as one: the law's letter is `Σ_{h∈law} C_h`, and a cross-head `GL` of the law's stacked
+// value rows moves each `C_h` but not the sum. A per-head letter is therefore not gauge
+// invariant, and an attention step's observability letters are the laws' transports.
+
+/// One part of a head's score operator and its weight in `S_h`.
+fn head_parts(operators: &QueryKeyOperators, head: usize) -> Vec<(&FactoredOperator, f64)> {
+    let rotary = operators.rotary_multiplier();
+    let mut parts = Vec::with_capacity(2 * operators.planes() + 1);
+    for plane in 0..operators.planes() {
+        parts.push((operators.cosine(head, plane), rotary));
+        parts.push((operators.sine(head, plane), rotary));
+    }
+    if let Some(pass) = operators.pass_through(head) {
+        parts.push((pass, operators.pass_through_multiplier()));
+    }
+    parts
+}
+
+/// `√(Σ_k (w_k v_k)²)` from per-part values `v_k` within `e_k`, and a bound on its error: the
+/// root of the per-part lower ends and of the per-part upper ends, each weighted with its own
+/// rounding, bracket the exact value.
+fn combined_norm(parts: &[(f64, f64, f64)]) -> (f64, f64) {
+    let growth = accumulation_growth(2 * parts.len() + 2);
+    let (mut value, mut low, mut high) = (0.0, 0.0, 0.0);
+    for &(weight, part, error) in parts {
+        let weight = weight.abs();
+        let reach = up(up(weight * error) + up(accumulation_growth(1) * up(weight * part)));
+        let centre = weight * part;
+        value += centre * centre;
+        let lower = (centre - reach).max(0.0);
+        low += lower * lower;
+        let upper = up(centre + reach);
+        high = up(high + up(upper * upper));
+    }
+    let value = value.sqrt();
+    let low = (low * (1.0 - growth)).max(0.0).sqrt();
+    let high = up(up(high * up(1.0 + growth)).sqrt());
+    (value, up((value - low).max(high - value).max(0.0)))
+}
+
+/// Query heads `first` and `second` compared as the score operators `S_h` (module docs,
+/// *Routing laws*): `‖S₁ − S₂‖_F`, both norms, the least-squares common scale
+/// `c = Σ_k w_k² ⟨M₁ₖ, M₂ₖ⟩ / Σ_k w_k² ‖M₂ₖ‖²` from each part's [`family_gram`], and
+/// `‖S₁ − c S₂‖_F`. The width reported is the operators' input width.
+pub fn compare_heads(
+    governor: &MemoryGovernor,
+    operators: &QueryKeyOperators,
+    first: usize,
+    second: usize,
+) -> Result<OperatorComparison, JointRefusal> {
+    let heads = operators.geometry().n_heads;
+    for head in [first, second] {
+        if head >= heads {
+            return Err(JointRefusal::Shape {
+                what: "compared head",
+                expected: (heads, 1),
+                found: (head, 1),
+            });
+        }
+    }
+    let (left, right) = (head_parts(operators, first), head_parts(operators, second));
+    let width = left[0].0.width();
+    let (mut numerator, mut denominator) = (0.0, 0.0);
+    for (&(a, weight), &(b, _)) in left.iter().zip(&right) {
+        let gram = family_gram(governor, &[a, b])?;
+        numerator += weight * weight * gram.gram[[0, 1]];
+        denominator += weight * weight * gram.gram[[1, 1]];
+    }
+    let scale = if denominator > 0.0 { numerator / denominator } else { 0.0 };
+    let (mut difference, mut residual, mut first_norm, mut second_norm) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (&(a, weight), &(b, _)) in left.iter().zip(&right) {
+        let (value, error) = scaled_difference(a, b, 1.0)?;
+        difference.push((weight, value, error));
+        let (value, error) = scaled_difference(a, b, scale)?;
+        residual.push((weight, value, error));
+        let (value, error) = factored_norm(a.left.view(), a.right.view())?;
+        first_norm.push((weight, value, error));
+        let (value, error) = factored_norm(b.left.view(), b.right.view())?;
+        second_norm.push((weight, value, error));
+    }
+    let status = |parts: &[(f64, f64, f64)]| {
+        let (value, error) = combined_norm(parts);
+        exact_norm(value, error, width)
+    };
+    Ok(OperatorComparison {
+        difference: status(&difference)?,
+        first_norm: status(&first_norm)?,
+        second_norm: status(&second_norm)?,
+        scale,
+        proportionality_residual: status(&residual)?,
+    })
+}
+
+/// The homogeneous raw rows `[W | b]` of head block `head` of a projection, transposed
+/// (`width × head_dim`, one row wider when `homogeneous`), against the embedded identity:
+/// an operator whose Frobenius norm is that of the rows.
+fn raw_rows(weight: &Array2<f64>, bias: &Array1<f64>, head: usize, head_dim: usize, homogeneous: bool) -> Result<FactoredOperator, JointRefusal> {
+    let rows = folded_rows(
+        weight.slice(s![head * head_dim..(head + 1) * head_dim, ..]),
+        bias.slice(s![head * head_dim..(head + 1) * head_dim]),
+        None,
+        None,
+        homogeneous,
+    );
+    let width = rows.ncols();
+    if width < head_dim {
+        return Err(JointRefusal::Shape {
+            what: "raw rows no narrower than the head",
+            expected: (head_dim, 1),
+            found: (width, 1),
+        });
+    }
+    FactoredOperator::new(rows.t().to_owned(), Array2::from_shape_fn((width, head_dim), |(i, j)| if i == j { 1.0 } else { 0.0 }))
+}
+
+/// How a law's first head relates to an earlier law's first head.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LawRelation {
+    pub law: usize,
+    pub earlier: usize,
+    /// [`compare_heads`] of the two first heads: the difference is certified nonzero, or the
+    /// normalizers differ behind a query/key norm.
+    pub comparison: OperatorComparison,
+}
+
+impl LawRelation {
+    /// The two laws' score operators differ only by the stored scale `c` (the residual is not
+    /// resolved from zero): one pattern at two temperatures, `S_law = c S_earlier`.
+    pub fn proportional(&self) -> bool {
+        self.comparison.proportionality_residual.lower_bound().is_some_and(|lower| lower <= 0.0)
+    }
+}
+
+/// The query heads of a block grouped into routing laws.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoutingLaws {
+    /// Each law's heads, increasing, laws in order of their first head. A head joins the
+    /// first law none of whose heads it is proven distinct from ([`compare_heads`], and the
+    /// raw rows behind a query/key norm), otherwise it opens a new law. Two heads in
+    /// different laws are certified to route differently; two heads in one law are equal
+    /// within the arithmetic's bands.
+    pub laws: Vec<Vec<usize>>,
+    /// Every later law's first head against every earlier law's first head.
+    pub relations: Vec<LawRelation>,
+}
+
+impl RoutingLaws {
+    /// The law of query head `head`.
+    pub fn law_of(&self, head: usize) -> Option<usize> {
+        self.laws.iter().position(|law| law.contains(&head))
+    }
+}
+
+/// The routing laws of `native`'s query heads, from its query/key operators `operators`
+/// (built with the same `input_gain`).
+pub fn routing_laws(governor: &MemoryGovernor, native: &NativeAttention, operators: &QueryKeyOperators) -> Result<RoutingLaws, JointRefusal> {
+    let g = native.geometry();
+    expect_shape("routing heads", (g.n_heads, g.head_dim), (operators.geometry().n_heads, operators.geometry().head_dim))?;
+    let normed = native.has_query_key_norm();
+    let homogeneous = native.query().bias.iter().chain(native.key().bias.iter()).any(|&entry| entry != 0.0);
+    let raw = |head: usize| -> Result<(FactoredOperator, FactoredOperator), JointRefusal> {
+        Ok((
+            raw_rows(&native.query().weight, &native.query().bias, head, g.head_dim, homogeneous)?,
+            raw_rows(&native.key().weight, &native.key().bias, g.key_value_head(head), g.head_dim, homogeneous)?,
+        ))
+    };
+    let distinct = |first: usize, second: usize| -> Result<bool, JointRefusal> {
+        if compare_heads(governor, operators, first, second)?.proven_distinct() {
+            return Ok(true);
+        }
+        if normed {
+            let ((query_a, key_a), (query_b, key_b)) = (raw(first)?, raw(second)?);
+            if compare_operators(governor, &query_a, &query_b)?.proven_distinct() {
+                return Ok(true);
+            }
+            if g.key_value_head(first) != g.key_value_head(second) && compare_operators(governor, &key_a, &key_b)?.proven_distinct() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    let mut laws: Vec<Vec<usize>> = Vec::new();
+    for head in 0..g.n_heads {
+        let mut joined = None;
+        for (index, law) in laws.iter().enumerate() {
+            let mut shared = true;
+            for &member in law {
+                if distinct(member, head)? {
+                    shared = false;
+                    break;
+                }
+            }
+            if shared {
+                joined = Some(index);
+                break;
+            }
+        }
+        match joined {
+            Some(index) => laws[index].push(head),
+            None => laws.push(vec![head]),
+        }
+    }
+    let mut relations = Vec::new();
+    for law in 1..laws.len() {
+        for earlier in 0..law {
+            relations.push(LawRelation {
+                law,
+                earlier,
+                comparison: compare_heads(governor, operators, laws[law][0], laws[earlier][0])?,
+            });
+        }
+    }
+    Ok(RoutingLaws { laws, relations })
+}
+
+/// An attention step's observability letters: one per routing law, the law's summed
+/// value/output transport `T = Σ_{h∈law} O_h V_g(h) diag(γ)` on the block's input, `width ×
+/// width`. The only constructor is [`attention_letters`], so an attention step's letters are
+/// always the laws' and never one per head. A value bias makes the operators homogeneous; its
+/// column is a constant write that no linear pull-back reads, and it is dropped.
+#[derive(Clone, Debug)]
+pub struct RoutingLawLetters {
+    pub laws: RoutingLaws,
+    transports: Vec<Array2<f64>>,
+    bands: Vec<f64>,
+}
+
+impl RoutingLawLetters {
+    /// The laws' transports, in law order.
+    pub fn transports(&self) -> &[Array2<f64>] {
+        &self.transports
+    }
+
+    /// A Frobenius bound on each transport's distance from the exact product of the stored
+    /// tensors: the `k`-term accumulation `γ_k |L| |R|ᵀ` over the law's stacked factors, plus
+    /// the value factors' formation defect.
+    pub fn bands(&self) -> &[f64] {
+        &self.bands
+    }
+}
+
+/// The routing laws of `native` and their observability letters, with `input_gain` (the
+/// preceding residual norm's gain) folded into both operator families when declared.
+pub fn attention_letters(
+    governor: &MemoryGovernor,
+    native: &NativeAttention,
+    input_gain: Option<ArrayView1<'_, f64>>,
+) -> Result<RoutingLawLetters, JointRefusal> {
+    let width = native.geometry().model_dim;
+    let operators = query_key_operators(native, input_gain)?;
+    let laws = routing_laws(governor, native, &operators)?;
+    drop(operators);
+    let value_output = value_output_operators(native, input_gain)?;
+    let (mut transports, mut bands) = (Vec::with_capacity(laws.laws.len()), Vec::with_capacity(laws.laws.len()));
+    for law in &laws.laws {
+        let lefts: Vec<_> = law.iter().map(|&head| value_output.head(head).left()).collect();
+        let rights: Vec<_> = law.iter().map(|&head| value_output.head(head).right()).collect();
+        let left = concatenate(Axis(1), &lefts).map_err(shape_failed)?;
+        let right = concatenate(Axis(1), &rights).map_err(shape_failed)?;
+        let product = fast_abt(&left, &right);
+        let magnitude = fast_abt(&left.mapv(f64::abs), &right.mapv(f64::abs));
+        let relative = up(accumulation_growth(left.ncols().max(1)) + value_output.formation_defect());
+        let transport = product.slice(s![..width, ..width]).to_owned();
+        let band = up(relative * upper_frobenius(magnitude.slice(s![..width, ..width])));
+        transports.push(transport);
+        bands.push(up(band + up(left.ncols() as f64 * SUBNORMAL_SPACING)));
+    }
+    Ok(RoutingLawLetters { laws, transports, bands })
 }
 
 #[cfg(test)]

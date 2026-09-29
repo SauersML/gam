@@ -9,8 +9,10 @@ use ndarray::{Array1, ArrayD};
 use serde::{Deserialize, Serialize};
 
 use super::code::EvidenceStatusWire;
+use super::layer::{AttentionRequest, native_attention};
 use super::module_split::{MlpBlockRequest, normal_form};
-use super::{MpdOutput, MpdResult, MpdSurfaceError, finite, matrix, output};
+use super::{MpdOutput, MpdResult, MpdSurfaceError, finite, matrix, output, vector};
+use crate::parameter_decomposition::joint_operators::{RoutingLawLetters, attention_letters};
 use crate::parameter_decomposition::module_split::MlpNormalForm;
 use crate::parameter_decomposition::state::{
     ObservabilityLetter, ObservabilitySpectrum, ObservabilityStep, StateDomain, SubspaceCapture,
@@ -48,6 +50,11 @@ pub enum LetterRequest {
     /// An MLP block's letters from its merged normal form
     /// (`module_split::MlpNormalForm::observability_letters`).
     Mlp { block: MlpBlockRequest },
+    /// An attention block's letters, one per routing law
+    /// (`joint_operators::attention_letters`): heads with equal score operators share one
+    /// letter, their summed value/output transport. With `input_gain` the preceding
+    /// residual norm's gain is folded in.
+    Attention { attention: AttentionRequest, input_gain: Option<String> },
 }
 
 /// [`WeightedObservability`] on the wire.
@@ -126,6 +133,21 @@ pub(super) fn run(
             }
         }
     }
+    // The routing-law letters the attention letters borrow, in declaration order.
+    let mut attentions: Vec<RoutingLawLetters> = Vec::new();
+    for step in &request.steps {
+        for letter in &step.letters {
+            if let LetterRequest::Attention { attention, input_gain } = letter {
+                let native = native_attention(tensors, attention)?;
+                let gain = match input_gain {
+                    Some(id) => Some(vector(tensors, id)?),
+                    None => None,
+                };
+                attentions.push(attention_letters(governor, &native, gain).map_err(MpdSurfaceError::Joint)?);
+            }
+        }
+    }
+    let mut next_attention = attentions.iter();
     let mut next_form = forms.iter();
     let mut steps = Vec::with_capacity(request.steps.len());
     for step in &request.steps {
@@ -142,6 +164,12 @@ pub(super) fn run(
                         MpdSurfaceError::InvalidRequest("an MLP letter has no normal form".to_string())
                     })?;
                     letters.extend(form.observability_letters());
+                }
+                LetterRequest::Attention { .. } => {
+                    let derived = next_attention.next().ok_or_else(|| {
+                        MpdSurfaceError::InvalidRequest("an attention letter has no routing laws".to_string())
+                    })?;
+                    letters.push(ObservabilityLetter::RoutingLaws(derived));
                 }
             }
         }
@@ -308,5 +336,71 @@ mod tests {
             run_parameter_decomposition(&request_json(&stray), &tensors, test_governor()),
             Err(MpdSurfaceError::InvalidRequest(_))
         ));
+    }
+
+    /// An attention letter is derived by the joint-operator owner: the surface result is the
+    /// owner's pull-back through `attention_letters`, and heads 0 and 1 (equal query rows on
+    /// one key/value head) share one law.
+    #[test]
+    fn an_attention_letter_is_the_owners_routing_law_letters() {
+        use crate::parameter_decomposition::attention::{
+            AffineProjection, AttentionGeometry, NativeAttention, RotaryEmbedding, RotaryPairing,
+        };
+        use crate::parameter_decomposition::joint_operators::attention_letters;
+        let mut state: u64 = 17;
+        let mut draw = |rows: usize, cols: usize| {
+            Array2::from_shape_simple_fn((rows, cols), || {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((state >> 40) as f64 / (1u64 << 24) as f64) - 0.5
+            })
+        };
+        let mut query = draw(8, 4);
+        let first = query.slice(ndarray::s![..2, ..]).to_owned();
+        query.slice_mut(ndarray::s![2..4, ..]).assign(&first);
+        let tensors = BTreeMap::from([
+            ("q".to_string(), query.into_dyn()),
+            ("k".to_string(), draw(4, 4).into_dyn()),
+            ("v".to_string(), draw(4, 4).into_dyn()),
+            ("o".to_string(), draw(4, 8).into_dyn()),
+            ("identity".to_string(), Array2::<f64>::eye(4).into_dyn()),
+            ("r".to_string(), array![[1.0, -0.5, 0.25, 0.75]].into_dyn()),
+        ]);
+        let request = request_json(
+            r#"{"kind": "weighted_observability", "steps": [{"letters": [{"kind": "linear", "tensor": "identity"},
+                {"kind": "attention", "input_gain": null, "attention": {
+                    "geometry": {"model_dim": 4, "n_heads": 4, "n_kv_heads": 2, "head_dim": 2},
+                    "rotary": {"pairing": "half_split", "inverse_frequencies": [1.0], "attention_scaling": 1.0},
+                    "score_scale": 0.5, "query": {"weight": "q", "bias": null}, "key": {"weight": "k", "bias": null},
+                    "value": {"weight": "v", "bias": null}, "output": {"weight": "o", "bias": null},
+                    "query_key_norm": null}}],
+                "readouts": ["r"]}], "candidates": []}"#,
+        );
+        let m = |id: &str| tensors[id].view().into_dimensionality::<ndarray::Ix2>().expect("matrix").to_owned();
+        let affine = |weight: Array2<f64>| AffineProjection { bias: ndarray::Array1::zeros(weight.nrows()), weight };
+        let native = NativeAttention::new(
+            AttentionGeometry { model_dim: 4, n_heads: 4, n_kv_heads: 2, head_dim: 2 },
+            RotaryEmbedding { pairing: RotaryPairing::HalfSplit, inverse_frequencies: vec![1.0], attention_scaling: 1.0 },
+            0.5,
+            affine(m("q")),
+            affine(m("k")),
+            affine(m("v")),
+            affine(m("o")),
+        )
+        .expect("native attention");
+        let letters = attention_letters(test_governor(), &native, None).expect("owner letters");
+        assert_eq!(letters.laws.laws, vec![vec![0, 1], vec![2], vec![3]]);
+        let identity = m("identity");
+        let readout = m("r");
+        let owner = WeightedObservability::pull_back(
+            test_governor(),
+            &[ObservabilityStep {
+                letters: vec![ObservabilityLetter::Linear(identity.view()), ObservabilityLetter::RoutingLaws(&letters)],
+                readouts: vec![readout.view()],
+            }],
+        )
+        .expect("owner pull-back");
+        let expected = project(owner, Vec::new()).expect("projection");
+        let output = run_parameter_decomposition(&request, &tensors, test_governor()).expect("surface run");
+        assert_eq!(output, expected);
     }
 }
