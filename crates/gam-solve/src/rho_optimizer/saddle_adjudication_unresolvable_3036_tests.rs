@@ -13,6 +13,7 @@
 //! checkpoint `θ = 0`, the failure the issue measured at the probes' inner solve.
 
 use super::*;
+use opt::{NegativeCurvatureClaim, negative_curvature_claim};
 use ndarray::{Array1, Array2, array};
 
 /// The issue's instance (gnomon calibrate's Gaussian location-scale unit test at 40b5044e4f):
