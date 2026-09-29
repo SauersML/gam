@@ -296,10 +296,10 @@ def replace_runs(model, ids, clean_logits, configs, positions):
 def tensor_rank(Wg, Wu, Wd, n_probe, gen):
     Gg, Gu, C = Wg @ Wg.T, Wu @ Wu.T, Wg @ Wu.T
     res = {
-        "mode1_out": spectrum_stats(la.eigvalsh(0.25 * Wd @ (Gg * Gu) @ Wd.T)),
-        "mode1_out_sym": spectrum_stats(la.eigvalsh(0.125 * Wd @ (Gg * Gu + C * C.T) @ Wd.T)),
-        "mode2_gate_in": spectrum_stats(la.eigvalsh(0.25 * Wg.T @ ((Wd.T @ Wd) * Gu) @ Wg)),
-        "mode3_up_in": spectrum_stats(la.eigvalsh(0.25 * Wu.T @ ((Wd.T @ Wd) * Gg) @ Wu)),
+        "mode1_out": spectrum_stats(la.eigvalsh(la.symmetrized(0.25 * Wd @ (Gg * Gu) @ Wd.T))),
+        "mode1_out_sym": spectrum_stats(la.eigvalsh(la.symmetrized(0.125 * Wd @ (Gg * Gu + C * C.T) @ Wd.T))),
+        "mode2_gate_in": spectrum_stats(la.eigvalsh(la.symmetrized(0.25 * Wg.T @ ((Wd.T @ Wd) * Gu) @ Wg))),
+        "mode3_up_in": spectrum_stats(la.eigvalsh(la.symmetrized(0.25 * Wu.T @ ((Wd.T @ Wd) * Gg) @ Wu))),
         "Wd_alone": spectrum_stats(la.svdvals(Wd) ** 2),
     }
     probes = []

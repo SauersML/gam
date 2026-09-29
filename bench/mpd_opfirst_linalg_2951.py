@@ -36,18 +36,33 @@ def _dense(decomposition, **arrays):
     return out.report["result"]["decomposition"], out.arrays
 
 
-def eigh(A, subset_by_index=None, band=False):
-    """Symmetric eigendecomposition (lower triangle read, ascending eigenvalues, canonical vector signs).
-    subset_by_index=[lo, hi] keeps eigenpairs lo..hi inclusive (ascending order)."""
+def _assembly(psd_depth):
+    """The request's symmetric assembly: mirrored (band zero) unless psd_depth names an accumulation depth."""
+    return {"kind": "mirrored"} if psd_depth is None else {"kind": "psd_accumulation", "depth": int(psd_depth)}
+
+
+def symmetrized(A):
+    """(A + A^T)/2: one rounded value in both triangles, the mirrored assembly eigh/eigvalsh assume by default.
+    For a product that is symmetric only in exact arithmetic (W D W^T, a GEMM Gram)."""
+    A = f64(A)
+    return 0.5 * (A + A.T)
+
+
+def eigh(A, subset_by_index=None, band=False, psd_depth=None):
+    """Symmetric eigendecomposition (ascending eigenvalues, canonical vector signs).
+    subset_by_index=[lo, hi] keeps eigenpairs lo..hi inclusive (ascending order).
+    The owner refuses A when its triangles disagree beyond the declared assembly's band: mirrored (exactly
+    symmetric; see symmetrized) by default, or psd_depth=d for a sum of PSD pieces with at most d roundings
+    per entry."""
     idx = None if subset_by_index is None else [int(subset_by_index[0]), int(subset_by_index[1]) + 1]
-    rep, arr = _dense({"kind": "eigh", "matrix": "a", "triangle": "lower", "indices": idx}, a=f64(A))
+    rep, arr = _dense({"kind": "eigh", "matrix": "a", "assembly": _assembly(psd_depth), "indices": idx}, a=f64(A))
     out = (arr[rep["values"]], arr[rep["vectors"]])
     return out + (rep["band"],) if band else out
 
 
-def eigvalsh(A, band=False):
-    """Ascending eigenvalues of a symmetric matrix (lower triangle read)."""
-    rep, arr = _dense({"kind": "eigvalsh", "matrix": "a", "triangle": "lower"}, a=f64(A))
+def eigvalsh(A, band=False, psd_depth=None):
+    """Ascending eigenvalues of a symmetric matrix; assembly as for eigh."""
+    rep, arr = _dense({"kind": "eigvalsh", "matrix": "a", "assembly": _assembly(psd_depth)}, a=f64(A))
     return (arr[rep["values"]], rep["band"]) if band else arr[rep["values"]]
 
 

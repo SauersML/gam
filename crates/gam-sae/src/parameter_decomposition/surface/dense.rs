@@ -4,21 +4,36 @@
 
 use std::collections::BTreeMap;
 
+use gam_linalg::roundoff::SymmetricAssembly;
 use gam_runtime::resource::MemoryGovernor;
 use ndarray::{Array2, ArrayD, ArrayView2, Axis, Ix1, Ix2};
 use serde::{Deserialize, Serialize};
 
 use super::{MpdOutput, MpdResult, MpdSurfaceError, finite, input, matrix, output, reserve};
 use crate::parameter_decomposition::dense::{
-    LstsqCutoff, QrMode, Triangle, eigh, eigvalsh, lstsq, qr, solve, spectral_norm, svd, svdvals,
+    LstsqCutoff, QrMode, eigh, eigvalsh, lstsq, qr, solve, spectral_norm, svd, svdvals,
 };
 
-/// Which triangle of a symmetric matrix is read.
+/// How a symmetric input was built, which fixes how far its two triangles may
+/// disagree before `eigh` refuses it ([`SymmetricAssembly`]).
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TriangleRequest {
-    Lower,
-    Upper,
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AssemblyRequest {
+    /// Both triangles hold the same rounded values (an explicit `(M + Mᵀ)/2`, a
+    /// mirrored Gram, a structurally symmetric construction): band zero.
+    Mirrored {},
+    /// Each triangle is its own accumulation of PSD pieces with at most `depth`
+    /// rounded operations per entry.
+    PsdAccumulation { depth: usize },
+}
+
+impl From<AssemblyRequest> for SymmetricAssembly {
+    fn from(request: AssemblyRequest) -> Self {
+        match request {
+            AssemblyRequest::Mirrored {} => Self::Mirrored,
+            AssemblyRequest::PsdAccumulation { depth } => Self::PsdAccumulation { depth },
+        }
+    }
 }
 
 /// What `qr` returns.
@@ -48,10 +63,10 @@ pub enum DenseRequest {
     /// range of them, or null for all.
     Eigh {
         matrix: String,
-        triangle: TriangleRequest,
+        assembly: AssemblyRequest,
         indices: Option<[usize; 2]>,
     },
-    Eigvalsh { matrix: String, triangle: TriangleRequest },
+    Eigvalsh { matrix: String, assembly: AssemblyRequest },
     Svd { matrix: String, full: bool },
     Svdvals { matrix: String },
     Qr { matrix: String, mode: QrModeRequest },
@@ -142,13 +157,6 @@ fn shaped(solution: Array2<f64>, vector: bool) -> ArrayD<f64> {
     }
 }
 
-fn triangle(triangle: TriangleRequest) -> Triangle {
-    match triangle {
-        TriangleRequest::Lower => Triangle::Lower,
-        TriangleRequest::Upper => Triangle::Upper,
-    }
-}
-
 pub(super) fn run(
     request: DenseOperation,
     tensors: &BTreeMap<String, ArrayD<f64>>,
@@ -178,16 +186,16 @@ pub(super) fn run(
         id.to_string()
     };
     let report = match request {
-        DenseRequest::Eigh { triangle: side, indices, .. } => {
-            let decomposed = eigh(a, triangle(side), indices.map(|[start, end]| (start, end))).map_err(dense)?;
+        DenseRequest::Eigh { assembly, indices, .. } => {
+            let decomposed = eigh(a, assembly.into(), indices.map(|[start, end]| (start, end))).map_err(dense)?;
             DenseReport::Eigh {
                 values: put("values", decomposed.values.into_dyn()),
                 vectors: put("vectors", decomposed.vectors.into_dyn()),
                 band: finite("band", decomposed.band)?,
             }
         }
-        DenseRequest::Eigvalsh { triangle: side, .. } => {
-            let (values, band) = eigvalsh(a, triangle(side)).map_err(dense)?;
+        DenseRequest::Eigvalsh { assembly, .. } => {
+            let (values, band) = eigvalsh(a, assembly.into()).map_err(dense)?;
             DenseReport::Eigvalsh {
                 values: put("values", values.into_dyn()),
                 band: finite("band", band)?,
@@ -294,16 +302,16 @@ mod tests {
         let tensors = tensors();
         let m = |id: &str| matrix(&tensors, id).expect("matrix");
 
-        let output = run(r#"{"kind": "eigh", "matrix": "sym", "triangle": "lower", "indices": null}"#, &tensors).expect("eigh");
-        let Eigh { values, vectors, band } = eigh(m("sym"), Triangle::Lower, None).expect("owner");
+        let output = run(r#"{"kind": "eigh", "matrix": "sym", "assembly": {"kind": "mirrored"}, "indices": null}"#, &tensors).expect("eigh");
+        let Eigh { values, vectors, band } = eigh(m("sym"), SymmetricAssembly::Mirrored, None).expect("owner");
         assert_eq!(report(&output), &DenseReport::Eigh { values: "values".into(), vectors: "vectors".into(), band });
         assert_eq!((&output.arrays["values"], &output.arrays["vectors"]), (&values.into_dyn(), &vectors.into_dyn()));
 
-        let output = run(r#"{"kind": "eigh", "matrix": "sym", "triangle": "upper", "indices": [2, 3]}"#, &tensors).expect("eigh top");
-        assert_eq!(output.arrays["values"], eigh(m("sym"), Triangle::Upper, Some((2, 3))).expect("owner").values.into_dyn());
+        let output = run(r#"{"kind": "eigh", "matrix": "sym", "assembly": {"kind": "psd_accumulation", "depth": 8}, "indices": [2, 3]}"#, &tensors).expect("eigh top");
+        assert_eq!(output.arrays["values"], eigh(m("sym"), SymmetricAssembly::PsdAccumulation { depth: 8 }, Some((2, 3))).expect("owner").values.into_dyn());
 
-        let output = run(r#"{"kind": "eigvalsh", "matrix": "sym", "triangle": "lower"}"#, &tensors).expect("eigvalsh");
-        assert_eq!(output.arrays["values"], eigvalsh(m("sym"), Triangle::Lower).expect("owner").0.into_dyn());
+        let output = run(r#"{"kind": "eigvalsh", "matrix": "sym", "assembly": {"kind": "mirrored"}}"#, &tensors).expect("eigvalsh");
+        assert_eq!(output.arrays["values"], eigvalsh(m("sym"), SymmetricAssembly::Mirrored).expect("owner").0.into_dyn());
 
         for full in [false, true] {
             let output = run(&format!(r#"{{"kind": "svd", "matrix": "tall", "full": {full}}}"#), &tensors).expect("svd");
@@ -350,8 +358,13 @@ mod tests {
         let mut tensors = tensors();
         assert!(run(r#"{"kind": "svdvals", "matrix": "tall"}"#, &tensors).is_ok());
         assert!(matches!(
-            run(r#"{"kind": "eigvalsh", "matrix": "tall", "triangle": "lower"}"#, &tensors),
+            run(r#"{"kind": "eigvalsh", "matrix": "tall", "assembly": {"kind": "mirrored"}}"#, &tensors),
             Err(MpdSurfaceError::Dense(DenseError::NotSquare { .. }))
+        ));
+        tensors.insert("lopsided".to_string(), array![[2.0, 99.0], [1.0, 2.0]].into_dyn());
+        assert!(matches!(
+            run(r#"{"kind": "eigh", "matrix": "lopsided", "assembly": {"kind": "mirrored"}, "indices": null}"#, &tensors),
+            Err(MpdSurfaceError::Dense(DenseError::Asymmetric { .. }))
         ));
         tensors.insert("singular".to_string(), array![[1.0, 2.0], [2.0, 4.0]].into_dyn());
         assert!(matches!(
@@ -363,7 +376,7 @@ mod tests {
             Err(MpdSurfaceError::Dense(DenseError::Shape { .. }))
         ));
         assert!(matches!(
-            run(r#"{"kind": "eigh", "matrix": "sym", "triangle": "lower", "indices": [2, 9]}"#, &tensors),
+            run(r#"{"kind": "eigh", "matrix": "sym", "assembly": {"kind": "mirrored"}, "indices": [2, 9]}"#, &tensors),
             Err(MpdSurfaceError::Dense(DenseError::InvalidRange { .. }))
         ));
         assert!(matches!(

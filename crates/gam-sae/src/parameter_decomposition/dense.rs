@@ -19,6 +19,13 @@
 //! Within a repeated eigenvalue or singular value the basis of the eigenspace is
 //! whatever faer returns; only signs are canonical.
 //!
+//! # Symmetry
+//!
+//! A symmetric eigensolver reads one triangle. [`eigh`] first checks the other one
+//! against the band the caller's [`SymmetricAssembly`] declares
+//! ([`strict_symmetric_eigh`]), so an asymmetric matrix is refused rather than
+//! silently decomposed from its lower triangle.
+//!
 //! # Bands
 //!
 //! Singular values carry [`factor_singular_band`] (`max(m, n) ε σ₁`) and eigenvalues
@@ -31,8 +38,10 @@ use std::fmt;
 use faer::dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::svd::{self as faer_svd, ComputeSvdVectors};
 use faer::{Mat, MatRef, Side};
-use gam_linalg::faer_ndarray::{FaerArrayView, FaerEigh, FaerLu, FaerQr, FaerSvd, decomposition_parallelism};
-use gam_linalg::roundoff::{factor_singular_band, symmetric_spectrum_rounding_band};
+use gam_linalg::faer_ndarray::{
+    FaerArrayView, FaerLinalgError, FaerLu, FaerQr, FaerSvd, decomposition_parallelism, strict_symmetric_eigh,
+};
+use gam_linalg::roundoff::{SymmetricAssembly, factor_singular_band, symmetric_spectrum_rounding_band};
 use ndarray::{Array1, Array2, ArrayView2, Axis, concatenate, s};
 
 /// Why a dense decomposition was declined.
@@ -50,6 +59,8 @@ pub enum DenseError {
     InvalidRange { start: usize, end: usize, order: usize },
     /// A least-squares cutoff that is negative or not finite.
     InvalidCutoff { value: f64 },
+    /// The two triangles of a symmetric input disagree beyond the declared assembly's band.
+    Asymmetric { detail: String },
     /// The decomposition did not converge.
     Decomposition { detail: String },
 }
@@ -70,6 +81,7 @@ impl fmt::Display for DenseError {
             Self::InvalidCutoff { value } => {
                 write!(formatter, "dense lstsq: cutoff {value} is not finite and nonnegative")
             }
+            Self::Asymmetric { detail } => write!(formatter, "dense eigh: {detail}"),
             Self::Decomposition { detail } => write!(formatter, "dense: decomposition failed: {detail}"),
         }
     }
@@ -141,44 +153,37 @@ pub struct Eigh {
     pub band: f64,
 }
 
-/// Which triangle of a symmetric matrix is read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Triangle {
-    Lower,
-    Upper,
-}
-
-fn side(triangle: Triangle) -> Side {
-    match triangle {
-        Triangle::Lower => Side::Lower,
-        Triangle::Upper => Side::Upper,
-    }
-}
-
-/// The eigenvalues of the symmetric matrix `a` (read from `triangle`), increasing, and
-/// their band.
-pub fn eigvalsh(a: ArrayView2<'_, f64>, triangle: Triangle) -> Result<(Array1<f64>, f64), DenseError> {
-    let decomposed = eigh(a, triangle, None)?;
+/// The eigenvalues of the symmetric matrix `a`, built as `assembly` declares,
+/// increasing, and their band.
+pub fn eigvalsh(a: ArrayView2<'_, f64>, assembly: SymmetricAssembly) -> Result<(Array1<f64>, f64), DenseError> {
+    let decomposed = eigh(a, assembly, None)?;
     Ok((decomposed.values, decomposed.band))
 }
 
-/// The eigendecomposition of the symmetric matrix `a` (read from `triangle`); with
-/// `indices`, only the eigenpairs `indices` in increasing eigenvalue order.
+/// The eigendecomposition of the symmetric matrix `a`; with `indices`, only the
+/// eigenpairs `indices` in increasing eigenvalue order.
+///
+/// `assembly` declares how `a` was built, which fixes how far its two triangles may
+/// disagree ([`SymmetricAssembly::Mirrored`]: not at all). A matrix outside that band
+/// is refused ([`DenseError::Asymmetric`]).
 pub fn eigh(
     a: ArrayView2<'_, f64>,
-    triangle: Triangle,
+    assembly: SymmetricAssembly,
     indices: Option<(usize, usize)>,
 ) -> Result<Eigh, DenseError> {
     let order = require_square(a)?;
     require_finite("eigh", a)?;
-    let (values, vectors) = a.eigh(side(triangle)).map_err(decomposition)?;
-    let band = symmetric_spectrum_rounding_band(values.as_slice().unwrap_or(&values.to_vec()));
-    let mut ranked: Vec<usize> = (0..order).collect();
-    ranked.sort_by(|&left, &right| values[left].total_cmp(&values[right]));
     let (start, end) = indices.unwrap_or((0, order));
     if start >= end || end > order {
         return Err(DenseError::InvalidRange { start, end, order });
     }
+    let (values, vectors) = strict_symmetric_eigh(&a, assembly, Side::Lower).map_err(|error| match error {
+        FaerLinalgError::StrictSelfAdjointEigenInvalidInput { reason } => DenseError::Asymmetric { detail: reason },
+        other => decomposition(other),
+    })?;
+    let band = symmetric_spectrum_rounding_band(values.as_slice().unwrap_or(&values.to_vec()));
+    let mut ranked: Vec<usize> = (0..order).collect();
+    ranked.sort_by(|&left, &right| values[left].total_cmp(&values[right]));
     let chosen = &ranked[start..end];
     let values = Array1::from_iter(chosen.iter().map(|&index| values[index]));
     let mut vectors = vectors.select(Axis(1), chosen);
@@ -426,23 +431,35 @@ mod tests {
     fn eigh_of_a_known_matrix_has_canonical_signs() {
         // Eigenvalues 1 and 3 of [[2, 1], [1, 2]], eigenvectors (1, −1)/√2 and (1, 1)/√2.
         let a = array![[2.0, 1.0], [1.0, 2.0]];
-        let decomposed = eigh(a.view(), Triangle::Lower, None).expect("eigh");
+        let decomposed = eigh(a.view(), SymmetricAssembly::Mirrored, None).expect("eigh");
         assert!((decomposed.values[0] - 1.0).abs() < 1e-14 && (decomposed.values[1] - 3.0).abs() < 1e-14);
         let root = std::f64::consts::FRAC_1_SQRT_2;
         // Largest-magnitude entries tie; the first one is made positive.
         assert!(close(&decomposed.vectors, &array![[root, root], [-root, root]], 1e-14));
-        let top = eigh(a.view(), Triangle::Lower, Some((1, 2))).expect("subset");
+        let top = eigh(a.view(), SymmetricAssembly::Mirrored, Some((1, 2))).expect("subset");
         assert_eq!(top.values.len(), 1);
         assert!((top.values[0] - 3.0).abs() < 1e-14);
-        // The upper triangle is not read from the lower.
-        let lower_only = array![[2.0, 99.0], [1.0, 2.0]];
-        assert_eq!(eigvalsh(lower_only.view(), Triangle::Lower).expect("lower").0, eigvalsh(a.view(), Triangle::Lower).expect("a").0);
+    }
+
+    #[test]
+    fn an_asymmetric_matrix_beyond_its_band_is_refused() {
+        // The upper triangle disagrees with the lower: refused, not read from one side.
+        let lopsided = array![[2.0, 99.0], [1.0, 2.0]];
+        assert!(matches!(eigh(lopsided.view(), SymmetricAssembly::Mirrored, None), Err(DenseError::Asymmetric { .. })));
+        assert!(matches!(eigvalsh(lopsided.view(), SymmetricAssembly::PsdAccumulation { depth: 64 }), Err(DenseError::Asymmetric { .. })));
+        // A one-ulp disagreement is refused for a mirrored matrix and accepted inside
+        // an accumulation's band.
+        let off = 1.0_f64;
+        let nudged = array![[2.0, off], [f64::from_bits(off.to_bits() + 1), 2.0]];
+        assert!(matches!(eigh(nudged.view(), SymmetricAssembly::Mirrored, None), Err(DenseError::Asymmetric { .. })));
+        let accepted = eigvalsh(nudged.view(), SymmetricAssembly::PsdAccumulation { depth: 4 }).expect("inside the band").0;
+        assert!((accepted[0] - 1.0).abs() < 1e-14 && (accepted[1] - 3.0).abs() < 1e-14);
     }
 
     #[test]
     fn a_repeated_eigenvalue_keeps_an_orthonormal_eigenspace() {
         let a = Array2::<f64>::eye(3) * 2.0;
-        let decomposed = eigh(a.view(), Triangle::Lower, None).expect("eigh");
+        let decomposed = eigh(a.view(), SymmetricAssembly::Mirrored, None).expect("eigh");
         assert!(decomposed.values.iter().all(|&value| (value - 2.0).abs() < 1e-14));
         let gram = decomposed.vectors.t().dot(&decomposed.vectors);
         assert!(close(&gram, &Array2::eye(3), 1e-14));
@@ -526,8 +543,8 @@ mod tests {
         let repeated = array![[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]];
         assert_eq!(lstsq(repeated.view(), array![[1.0], [2.0], [3.0]].view(), LstsqCutoff::Band).expect("lstsq").rank, 1);
         assert!(matches!(lstsq(tall.view(), array![[0.0], [1.0], [3.0]].view(), LstsqCutoff::Relative(-1.0)), Err(DenseError::InvalidCutoff { .. })));
-        assert!(matches!(eigh(array![[1.0, 2.0]].view(), Triangle::Lower, None), Err(DenseError::NotSquare { .. })));
+        assert!(matches!(eigh(array![[1.0, 2.0]].view(), SymmetricAssembly::Mirrored, None), Err(DenseError::NotSquare { .. })));
         assert!(matches!(svd(array![[f64::NAN]].view(), false), Err(DenseError::NonFinite { .. })));
-        assert!(matches!(eigh(a.view(), Triangle::Lower, Some((1, 1))), Err(DenseError::InvalidRange { .. })));
+        assert!(matches!(eigh(a.view(), SymmetricAssembly::Mirrored, Some((1, 1))), Err(DenseError::InvalidRange { .. })));
     }
 }

@@ -78,8 +78,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use faer::Side;
-use gam_linalg::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
-use gam_linalg::roundoff::{accumulation_band, accumulation_growth, factor_singular_band, symmetric_spectrum_rounding_band};
+use gam_linalg::faer_ndarray::{FaerLinalgError, FaerSvd, strict_symmetric_eigh};
+use gam_linalg::roundoff::{
+    SymmetricAssembly, accumulation_band, accumulation_growth, factor_singular_band, symmetric_spectrum_rounding_band,
+};
 use gam_math::gaussian_activation::{GaussianActivation, GaussianActivationError};
 use gam_math::probability::normal_cdf_and_pdf;
 use gam_runtime::resource::MemoryGovernor;
@@ -635,9 +637,9 @@ impl MlpNormalForm {
             }
         }
         let gram = frame.t().dot(&selected);
+        // `(G + Gᵀ)/2` puts one rounded value in both triangles.
         let symmetric = (&gram + &gram.t()) * 0.5;
-        let (values, vectors) = symmetric
-            .eigh(Side::Lower)
+        let (values, vectors) = strict_symmetric_eigh(&symmetric, SymmetricAssembly::Mirrored, Side::Lower)
             .map_err(|source| linear_error("optimal split: M", source))?;
         let eigenvalues: Vec<f64> = values.to_vec();
         let kept: Vec<usize> = (0..rank).filter(|&index| values[index] > 0.5).collect();

@@ -71,8 +71,8 @@ pub use code::{
     LatticeReport, ProposalDecision, ProposalKindWire, StatedArtifact,
 };
 pub use dense::{
-    CutoffRequest, DenseOperation, DenseReport, DenseRequest, DenseResult, QrModeRequest,
-    TriangleRequest,
+    AssemblyRequest, CutoffRequest, DenseOperation, DenseReport, DenseRequest, DenseResult,
+    QrModeRequest,
 };
 pub use finite_grid::{
     AdditiveAcrossPairReport, BandedEnergyReport, CrossBlockReport, FiniteGridReport,
