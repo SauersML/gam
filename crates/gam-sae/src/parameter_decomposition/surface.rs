@@ -36,6 +36,7 @@ use super::dense::DenseError;
 use super::canonical::CanonicalRefusal;
 use super::gauge::GaugeRefusal;
 use super::gauge_census::CensusRefusal;
+use super::joint_operators::JointRefusal;
 use super::state::StateError;
 use crate::response::finite_grid::FiniteGridError;
 use crate::response::interaction::InteractionError;
@@ -51,7 +52,10 @@ mod cyclic;
 mod dense;
 mod finite_grid;
 mod gauge_census;
+mod joint;
 mod layer;
+mod module_split;
+mod observability;
 mod secant;
 mod state_quotient;
 mod verify;
@@ -78,6 +82,19 @@ pub use finite_grid::{
 pub use gauge_census::{
     CensusBlock, CensusBlockReport, CensusChargeReport, GaugeCensusReport, GaugeCensusRequest,
     GaugeFamilyReport, NamedCharge, NamedFamily, TiedResidualReport,
+};
+pub use joint::{
+    ComparisonReport, FactorsReport, GramReport, HeadEnergyReport, HeadOperatorsReport,
+    JointOperatorsReport, JointOperatorsRequest, OperatorPairReport, OperatorRef, PairStatusWire,
+};
+pub use module_split::{
+    AdditiveBlocksReport, MlpBlockRequest, ModuleSplitReport, ModuleSplitRequest,
+    NormalFormReport, OptimalSplitReport, SplitDomainReport, SplitStatusWire, UnitSourceReport,
+    UnresolvedJoinReport,
+};
+pub use observability::{
+    CaptureReport, LetterRequest, SpectrumReport, StateDomainReport, StateStatusWire, StepRequest,
+    WeightedObservabilityReport, WeightedObservabilityRequest,
 };
 pub use layer::{
     AttentionRequest, GeometryRequest, ProjectionRequest, QueryKeyNormRequest, RmsNormRequest,
@@ -195,6 +212,15 @@ pub enum MpdOperation {
     /// One dense float64 decomposition on faer with canonical signs (`dense`):
     /// `eigh`, `eigvalsh`, `svd`, `svdvals`, `qr`, `solve`, `lstsq`, `spectral_norm`.
     Dense(DenseOperation),
+    /// The factored gauge-invariant query/key and value/output operators of an
+    /// attention block, their energies, Grams and comparisons (`joint_operators`).
+    JointOperators(Box<JointOperatorsRequest>),
+    /// The weighted observability Gramian of readouts pulled back through declared
+    /// steps, and candidate captures (`state::WeightedObservability`).
+    WeightedObservability(WeightedObservabilityRequest),
+    /// An MLP block's merged normal form, finest additive blocks, optimal splits and
+    /// pair-weight Laplacian products (`module_split`).
+    ModuleSplit(ModuleSplitRequest),
 }
 
 /// [`ExternalExecution`] on the wire.
@@ -256,6 +282,9 @@ pub enum MpdResult {
     CanonicalLayer(Box<CanonicalLayerReport>),
     VerifyLogits(VerifyLogitsReport),
     Dense(DenseResult),
+    JointOperators(Box<JointOperatorsReport>),
+    WeightedObservability(WeightedObservabilityReport),
+    ModuleSplit(Box<ModuleSplitReport>),
 }
 
 /// [`PlaneRotationRecovery`] on the wire.
@@ -429,6 +458,9 @@ pub enum MpdSurfaceError {
     Attention(AttentionProgramError),
     Canonical(Box<CanonicalRefusal>),
     Dense(DenseError),
+    Joint(JointRefusal),
+    /// The module-split owner refused the block, a subset or a vector.
+    ModuleSplit(String),
     /// The verification owner refused the family, the tolerance or a row.
     Verify(String),
     /// A dense copy the surface forms does not fit the memory budget.
@@ -466,6 +498,8 @@ impl fmt::Display for MpdSurfaceError {
             Self::Canonical(refusal) => write!(formatter, "canonical form refused: {refusal:?}"),
             Self::Verify(reason) => write!(formatter, "verification refused: {reason}"),
             Self::Dense(error) => write!(formatter, "{error}"),
+            Self::Joint(refusal) => write!(formatter, "joint operators refused: {refusal:?}"),
+            Self::ModuleSplit(reason) => write!(formatter, "{reason}"),
             Self::NonFiniteReport { field, value } => write!(
                 formatter,
                 "MPD report field {field} is {value}, which the wire report cannot state"
@@ -547,6 +581,9 @@ pub fn run_parameter_decomposition(
         MpdOperation::CanonicalLayer(request) => canonical::run(*request, tensors, governor),
         MpdOperation::VerifyLogits(request) => verify::run(request, tensors, governor),
         MpdOperation::Dense(request) => dense::run(request, tensors, governor),
+        MpdOperation::JointOperators(request) => joint::run(*request, tensors, governor),
+        MpdOperation::WeightedObservability(request) => observability::run(request, tensors, governor),
+        MpdOperation::ModuleSplit(request) => module_split::run(request, tensors, governor),
     }
 }
 
