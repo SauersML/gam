@@ -177,6 +177,9 @@ pub mod sign_gated;
 // Sufficient-state quotient and realization contracts, and the exact linear quotient.
 pub mod state;
 
+// Causal-state machines of a behaviour: finite classes, counters and retrieve registers under one two-part code.
+pub mod causal_states;
+
 // Evidence status and ranked robust supports.
 pub mod supports;
 
