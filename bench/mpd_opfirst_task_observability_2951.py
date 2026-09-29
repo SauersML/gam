@@ -20,8 +20,8 @@ attention OV maps with the full unembedding as readout; that is trivial for Qwen
 The weighted Gramian is state.rs WeightedObservability (op ``weighted_observability``); its exact_rank_eps_band
 counts the owner's singular values above d eps sigma_1 (formation not included) and certified_rank is the owner's
 resolved rank at its band (factor band + pull-back formation). The rank rule and the closure are state.rs's resolved row space and LinearStateQuotient::close, and the
-Fourier planes are cyclic_action::cyclic_planes, all called through the MPD surface (the parent bench's
-``linear_quotient`` / ``resolved_rows``; ``cyclic_planes`` here). "exact" = rank at the eps band (exact-arithmetic
+closure called through the MPD surface (the parent bench's ``linear_quotient`` / ``resolved_rows``); the
+token-cycle Fourier planes are this experiment's closed form (``cyclic_planes`` here). "exact" = rank at the eps band (exact-arithmetic
 rank to within roundoff); tau / effective dimensions are numerical conditioning statements. The
 Gramian factor F (F^T F = sum of pulled-back readout Gramians) weighs directions by how strongly
 they are read, so its relative singular-value counts are the meaningful effective dimensions.
@@ -38,6 +38,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mpd_opfirst_linalg_2951 as la  # noqa: E402
 from mpd_opfirst_decoder_2951 import Decoder  # noqa: E402
 from mpd_opfirst_observability_2951 import (  # noqa: E402
     apply, effective, linear_quotient, relative_rows, resolved_rows, singular_values, svd_band_rank,
@@ -53,20 +54,19 @@ def dims(factor):
 
 def principal_cosines(a, b):
     """Cosines of the principal angles between the row spaces of orthonormal-row a and b."""
-    return np.linalg.svd(a @ b.T, compute_uv=False)
+    return la.svdvals(a @ b.T)
 
 
 def cyclic_planes(table):
-    """cyclic_action::cyclic_planes of ``table``'s rows under the token cycle x -> x + 1 (mod p), through the MPD
-    surface: the planes [u_1c, u_1s, ...] (d x 2m) and each plane's power."""
-    from gamfit.sae import run_parameter_decomposition
-
+    """The token-cycle Fourier planes of ``table``'s rows (x -> x + 1 mod p, exact for odd p): the planes
+    [u_1c, u_1s, ...] (d x 2m), u_kc + i u_ks = (2/p) sum_a e^{i w_k a} e_a, and each plane's power."""
     p = table.shape[0]
-    out = run_parameter_decomposition(
-        {"schema": "gam.mpd-request", "schema_version": 1,
-         "operation": {"kind": "cyclic_planes", "table": "table", "successor": [(x + 1) % p for x in range(p)]}},
-        {"table": table})
-    return out.arrays["planes"], np.array(out.report["result"]["power"])
+    k = np.arange(1, (p - 1) // 2 + 1)
+    angle = 2 * math.pi * np.outer(k, np.arange(p)) / p
+    cos, sin = (2 / p) * np.cos(angle) @ table, (2 / p) * np.sin(angle) @ table
+    planes = np.empty((table.shape[1], 2 * len(k)))
+    planes[:, 0::2], planes[:, 1::2] = cos.T, sin.T
+    return planes, (cos ** 2).sum(1) + (sin ** 2).sum(1)
 
 
 def fourier_planes(table, freqs):
@@ -127,7 +127,7 @@ def modadd(args):
            "key_frequencies_W_U": key, "W_U_power_top": [[int(k), float(x)] for k, x in
                                                           zip(ks[np.argsort(-pu)[:8]], np.sort(pu)[::-1][:8])],
            "W_E_power_top": [[int(k), float(x)] for k, x in zip(ks[np.argsort(-pe)[:8]], np.sort(pe)[::-1][:8])],
-           "ov_norms": [float(np.linalg.norm(a, 2)) for a in ov], "variants": {}}
+           "ov_norms": [float(la.spectral_norm(a)) for a in ov], "variants": {}}
     for rname, c in readouts.items():
         for mlp in (False, True):
             name = rname + ("+mlp_reads" if mlp else "")
@@ -181,7 +181,7 @@ def weekday(args):
                     reads = D.mlp_reads(layer)
                     readouts.append(reads)
                     for t in charts:
-                        stack = np.vstack([charts[t], reads / np.linalg.norm(reads, 2)])
+                        stack = np.vstack([charts[t], reads / la.spectral_norm(reads)])
                         charts[t] = resolved_rows(stack) if t is None else relative_rows(stack, t)
                 for t in charts:
                     if charts[t].shape[0] < d:

@@ -1,11 +1,12 @@
 //! Structured-edit coordinates from a declared single-cycle action on the rows of one
-//! use-site table (#2951, trained modular-addition benchmark, S2).
+//! use-site table (#2951, trained modular-addition benchmark, S2). A support module of
+//! `mpd_modadd_s2_2951`: it is this experiment's structure, not a library owner.
 //!
 //! # Scope
 //!
 //! The action is DECLARED: a successor map over the table's rows whose moved rows form one
 //! odd cycle. An undeclared or non-cyclic operator is refused here; plane recovery from a frozen
-//! matrix belongs to [`super::spectral`].
+//! matrix belongs to `gam_mpd::spectral`.
 //!
 //! # The native reference
 //!
@@ -56,23 +57,15 @@
 //! `B` has `p` columns, so for `p ≤ d` it is generically of full column rank, and a linear edit
 //! reproducing the shift exists for any table, a random one included (mpd-verify's theorem on
 //! #2951). Reproducing the shift is no evidence of a mechanism. What separates a table that
-//! carries one is the code of a proper subset at fidelity, which [`plane_program_code`] prices.
+//! carries one is the code of a proper subset at fidelity, which the baseline example prices.
 //!
 //! # Evidence status
 //!
 //! The plane coefficients are sums of rows times library trigonometric values, whose accuracy
 //! has no derivation on main, so this module returns NO status for them and claims no band on
 //! them. Distortion is measured on the executed artifact where it runs.
-//!
-//! # Code
-//!
-//! A plane program sends its frequency subset in the enumerative subset code and the `2d|S|`
-//! basis reals as one [`LatticeCode`] at a declared precision. The decoder rebuilds the basis, and
-//! every angle from `p`, `k` and `s`, so no angle is transmitted. Distortion belongs to the decoded
-//! artifact, measured where it executes.
 
-use super::codec::{BitString, subset_code_len_bits};
-use super::precision::{DeclaredPrecision, LatticeCode};
+
 use ndarray::{Array1, Array2, ArrayView2};
 use std::f64::consts::PI;
 use std::fmt;
@@ -239,6 +232,7 @@ fn check_table(table: ArrayView2<'_, f64>, cycle: &RowCycle) -> Result<(), Cycli
     Ok(())
 }
 
+#[cfg(test)]
 fn check_frequencies(frequencies: &[usize], planes: usize) -> Result<(), CyclicActionError> {
     let ascending = frequencies.windows(2).all(|pair| pair[0] < pair[1]);
     let inside = frequencies.iter().all(|&frequency| (1..=planes).contains(&frequency));
@@ -270,11 +264,13 @@ pub struct CyclicPlanes {
 }
 
 impl CyclicPlanes {
+    #[cfg(test)]
     /// The declared cycle.
     pub fn cycle(&self) -> &RowCycle {
         &self.cycle
     }
 
+    #[cfg(test)]
     /// `U_S` for a frequency subset, `d × 2|S|`.
     pub fn basis(&self, frequencies: &[usize]) -> Result<Array2<f64>, CyclicActionError> {
         check_frequencies(frequencies, self.cycle.plane_count())?;
@@ -320,6 +316,7 @@ pub fn cyclic_planes(
     Ok(CyclicPlanes { cycle: cycle.clone(), mean, planes, power })
 }
 
+#[cfg(test)]
 /// The frequency edit of one plane subset at one shift. Each cycled row's own components in the planes of
 /// `frequencies` turn by `ω_k s`, and nothing else in the table moves. Row `r_a` becomes
 /// `e_a + Σ_{k∈S} U_k (D(ω_k (a + s)) − D(ω_k a))`, so the edited table is `E + left · rightᵀ` with
@@ -333,6 +330,7 @@ pub struct CyclicFrequencyEdit {
     pub right: Array2<f64>,
 }
 
+#[cfg(test)]
 /// The frequency edit of `frequencies` at `shift` under `cycle`, from a plane basis `U_S` (`d × 2|S|`),
 /// the closed form or a decoded artifact. Every coordinate is a character of the row's cycle position,
 /// so no inverse is solved and no basis condition is needed.
@@ -373,44 +371,21 @@ pub fn frequency_edit(
     })
 }
 
-/// The integer-bit code of a plane program: the frequency subset and the basis reals.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PlaneProgramCode {
-    /// `L(S) = L_int(|S| + 1) + ⌈log₂ C(m, |S|)⌉`.
-    pub subset_bits: u64,
-    /// The `2d|S|` basis reals, column-major, at the declared precision.
-    pub basis: LatticeCode,
-    /// The length of `basis` written as one message.
-    pub basis_bits: u64,
-}
-
-impl PlaneProgramCode {
-    /// The exact program length.
-    pub fn total_bits(&self) -> u64 {
-        self.subset_bits + self.basis_bits
-    }
-}
-
-/// Price the plane program of `frequencies` over `planes` at a declared precision.
-pub fn plane_program_code(
-    planes: &CyclicPlanes,
-    frequencies: &[usize],
-    precision: DeclaredPrecision,
-) -> Result<PlaneProgramCode, CyclicActionError> {
-    let basis = planes.basis(frequencies)?;
-    let subset_bits = subset_code_len_bits(planes.cycle().plane_count(), frequencies.len())
-        .map_err(|error| CyclicActionError::Code(format!("{error:?}")))?;
-    let values: Vec<f64> = basis.t().iter().copied().collect();
-    let code = LatticeCode::encode(&values, precision).map_err(CyclicActionError::Code)?;
-    let mut message = BitString::new();
-    code.write(&mut message).map_err(CyclicActionError::Code)?;
-    Ok(PlaneProgramCode { subset_bits, basis: code, basis_bits: message.len_bits() })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::receipts::evaluation_band;
+    use gam_linalg::roundoff::accumulation_growth;
+
+    /// `γ_k` rounded up times an upper bound on the exact `Σ|terms|`, plus the underflow
+    /// allowance times the subnormal spacing: the certified band of one evaluation.
+    fn evaluation_band(path_roundings: usize, absolute_sum_upper: f64, underflow_allowance: f64) -> f64 {
+        let relative = (accumulation_growth(path_roundings).next_up() * absolute_sum_upper).next_up();
+        if underflow_allowance == 0.0 {
+            relative
+        } else {
+            (relative + (underflow_allowance * f64::from_bits(1)).next_up()).next_up()
+        }
+    }
     use gam_linalg::faer_ndarray::{FaerArrayView, FaerQr, FaerSvd, col_piv_qr_solve_lstsq};
     use gam_linalg::roundoff::factor_singular_band;
     use ndarray::{ArrayView1, s};
@@ -894,28 +869,5 @@ mod tests {
                 least_squares.row(FIXED_ROW).dot(&basis.t()).iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
             assert!(fixed_change > 0.0, "shift {shift}: the least-squares edit left the fixed row unchanged");
         }
-    }
-
-    #[test]
-    fn a_plane_program_sends_its_subset_and_decodes_every_basis_real_within_the_declared_step() {
-        let table = plant(&ALL, false, false, 7).0;
-        let cycle = declared_cycle();
-        let planes = cyclic_planes(table.view(), &cycle).expect("closed-form planes");
-        let precision = DeclaredPrecision::new(20).expect("20 fraction bits");
-        let one = plane_program_code(&planes, &[2], precision).expect("one plane");
-        let three = plane_program_code(&planes, &ALL, precision).expect("every plane");
-        let mut message = BitString::new();
-        three.basis.write(&mut message).expect("one message");
-        assert_eq!(message.len_bits(), three.basis_bits);
-        let mut reader = message.reader();
-        let decoded = LatticeCode::read(&mut reader).expect("the message decodes");
-        reader.finish().expect("nothing follows the message");
-        let basis = planes.basis(&ALL).expect("every plane");
-        assert_eq!(decoded.indices().len(), 2 * WIDTH * ALL.len());
-        for (&index, value) in decoded.indices().iter().zip(basis.t().iter()) {
-            assert!((index as f64 * precision.step() - value).abs() <= precision.worst_case_error());
-        }
-        assert!(three.total_bits() > one.total_bits());
-        assert_eq!(three.total_bits(), three.subset_bits + three.basis_bits);
     }
 }

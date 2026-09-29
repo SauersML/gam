@@ -46,8 +46,7 @@
 //! passthroughs, SwiGLU units, norm gains, rotary QK, residual basis) belong to
 //! `gauge`; mask-gauge covariance, structured paths and commutator facts to
 //! `operators`. Plane-rotation
-//! recovery from a frozen matrix belongs to `spectral`, and structured edits from a
-//! declared single-cycle row action to `cyclic_action`.
+//! recovery from a frozen matrix belongs to `spectral`.
 //!
 //! # Types that are never coerced into one another
 //!
@@ -79,8 +78,6 @@ mod test_support;
 // Executed-stage receipts against the native lift.
 pub mod receipts;
 
-// Structured-edit coordinates from a declared single-cycle row action: closed-form planes, rotation edits, plane code.
-pub mod cyclic_action;
 
 // Matrix-free structured edits applied to the current intervened input.
 pub mod apply;

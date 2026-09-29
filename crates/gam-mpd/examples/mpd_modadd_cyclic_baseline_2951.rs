@@ -69,12 +69,15 @@ use gam_runtime::resource::{MemoryGovernor, MemoryReservation, MemoryReservation
 use ndarray::{Array1, Array2, Array3, Array4, ArrayD, ArrayView1, ArrayView2, ArrayView3, Axis, IxDyn};
 use rayon::prelude::*;
 
+#[path = "support/cyclic_action.rs"]
+mod cyclic_action;
+
+use cyclic_action::{CyclicActionError, RowCycle, cyclic_planes};
 use gam_mpd::bounds::{BoundError, kl_over_logit_boxes};
 use gam_mpd::codec::{
     BitString, CodecError, encode_fixed_index, encode_prefix_integer, encode_subset, fixed_index_len_bits,
     prefix_integer_len_bits, signed_prefix_integer_len_bits, subset_code_len_bits,
 };
-use gam_mpd::cyclic_action::{CyclicActionError, RowCycle, cyclic_planes};
 use gam_mpd::fit::{ProposalKind, ProposalRejection, decide_proposal};
 use gam_mpd::precision::{DecodableArtifact, DecodedFidelity, DeclaredPrecision, LatticeCode, decode_then_evaluate};
 use gam_mpd::supports::{EvidenceStatus, EvidenceStatusError, ExactBasis};
@@ -2435,7 +2438,7 @@ fn run() -> std::result::Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam_mpd::cyclic_action::frequency_edit;
+    use crate::cyclic_action::frequency_edit;
     use ndarray::{Array3, ArrayD};
 
     /// Deterministic weights of a small cyclic transformer (`p = 7`, `d = 12`, two heads).

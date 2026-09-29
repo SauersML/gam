@@ -176,10 +176,27 @@ pub(super) fn run(
     };
     let a = matrix(tensors, &id)?;
     let (rows, cols) = a.dim();
-    let side = rows.max(cols);
-    // The decomposition's working copy, its factors (up to `max(m, n)` square) and a
-    // right-hand side's solution.
-    let working = reserve(governor, side.max(1), side.max(1), 4, "dense decomposition")?;
+    let (m, n, k) = (rows, cols, rows.min(cols));
+    let rhs_columns = match &request {
+        DenseRequest::Solve { rhs: id, .. } | DenseRequest::Lstsq { rhs: id, .. } => {
+            let array = input(tensors, id)?;
+            if array.ndim() == 1 { 1 } else { array.shape().get(1).copied().unwrap_or(0) }
+        }
+        _ => 0,
+    };
+    // The entries each decomposition holds at once: the working copy, its factors and
+    // its outputs.
+    let entries = match &request {
+        DenseRequest::Eigh { .. } | DenseRequest::Eigvalsh { .. } => 3 * n * n,
+        DenseRequest::Svd { full: false, .. } => m * n + m * k + k * n + k,
+        DenseRequest::Svd { full: true, .. } => m * n + m * m + n * n + k,
+        DenseRequest::Svdvals { .. } | DenseRequest::SpectralNorm { .. } => m * n + k,
+        DenseRequest::Qr { mode: QrModeRequest::Full, .. } => 2 * m * (n + m) + m * m,
+        DenseRequest::Qr { .. } => 2 * m * n + m * k + k * n,
+        DenseRequest::Solve { .. } => 2 * n * n + 2 * n * rhs_columns,
+        DenseRequest::Lstsq { .. } => 2 * m * n + m * k + k * n + 2 * (m + n) * rhs_columns,
+    };
+    let working = reserve(governor, entries.max(1), 1, 1, "dense decomposition")?;
     let mut arrays = BTreeMap::new();
     let mut put = |id: &str, array: ArrayD<f64>| {
         arrays.insert(id.to_string(), array);

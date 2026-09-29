@@ -34,6 +34,7 @@ import time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mpd_opfirst_linalg_2951 as la  # noqa: E402
 from mpd_opfirst_decoder_2951 import Decoder, compact_json  # noqa: E402
 
 
@@ -77,8 +78,8 @@ def resolved_rows(matrix):
 def relative_rows(matrix, tau):
     """Right singular vectors above tau * sigma_max: a numerical conditioning statement, never a rank."""
     if matrix.shape[0] > 2 * matrix.shape[1]:
-        matrix = np.linalg.qr(matrix, mode="r")
-    _, sigma, vt = np.linalg.svd(matrix, full_matrices=False)
+        matrix = la.qr(matrix, mode="r")
+    _, sigma, vt = la.svd(matrix)
     return vt[: int((sigma > tau * sigma[0]).sum())]
 
 
@@ -120,8 +121,8 @@ def svd_band_rank(sigma, width):
 
 def singular_values(matrix):
     if matrix.shape[0] > 2 * matrix.shape[1]:
-        matrix = np.linalg.qr(matrix, mode="r")
-    return np.linalg.svd(matrix, compute_uv=False)
+        matrix = la.qr(matrix, mode="r")
+    return la.svdvals(matrix)
 
 
 def effective(sigma, taus=(1e-2, 1e-3, 1e-6)):
@@ -150,7 +151,7 @@ def main():
     # 1. rowspace(C) through its R factor (same Gram, row space and singular values; the owner is slow on the
     # tall C). The owner's eps band then uses R's shape, max(m, n) = d instead of the vocabulary size: the rank
     # is the same under either band whenever sigma_min / sigma_max clears the larger one (recorded).
-    r_readout = np.linalg.qr(readout, mode="r")
+    r_readout = la.qr(readout, mode="r")
     readout_shape = list(readout.shape)
     rank_c = int(resolved_rows(r_readout).shape[0])
     s_c = singular_values(r_readout)
@@ -221,7 +222,7 @@ def main():
                 reads = D.mlp_reads(layer)
                 readouts.append(reads)
                 for tau in charts:
-                    charts[tau] = relative_rows(np.vstack([charts[tau], reads / np.linalg.norm(reads, 2)]), tau)
+                    charts[tau] = relative_rows(np.vstack([charts[tau], reads / la.spectral_norm(reads)]), tau)
             for tau in charts:
                 charts[tau] = relative_rows(np.vstack([charts[tau]] + [apply(charts[tau], a) for a in ov[layer]]),
                                             tau)
@@ -245,8 +246,8 @@ def main():
             int(i): float(weakest[i]) for i in np.argsort(-np.abs(weakest))[:3]}
         per_layer[variant + "_formation"] = report["formation"]
     result["causal_backward"] = per_layer
-    result["ov_head_norm_range"] = [float(min(np.linalg.norm(a[0] @ a[1], 2) for a in all_ov)),
-                                    float(max(np.linalg.norm(a[0] @ a[1], 2) for a in all_ov))]
+    head_norms = [la.spectral_norm(a[0] @ a[1]) for a in all_ov]
+    result["ov_head_norm_range"] = [float(min(head_norms)), float(max(head_norms))]
     result["runtime_s"] = {"load": load_s, "total": time.time() - started}
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as fh:

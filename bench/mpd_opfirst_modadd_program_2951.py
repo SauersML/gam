@@ -9,9 +9,8 @@ Exact rewrite R (checked against the direct forward on all p^2 inputs). Only the
 only its residual matters. With characters D(w x) = (cos w x, sin w x), w_k = 2 pi k / p, k = 1..(p-1)/2:
 
 * embedding  e(x) = c0 + sum_k U_k D(w_k x)               (DFT of W_E's rows over the token cycle, exact for odd p;
-                                                           c0, U_k from cyclic_action::cyclic_planes and the pos0 edit
-                                                           from cyclic_action::frequency_edit, both through the MPD
-                                                           surface; ``chars`` evaluates D at the program's inputs)
+                                                           c0, U_k by ``cyclic_planes``; the pos0 edit by
+                                                           ``frequency_edited``; ``chars`` evaluates D)
 * scores     s_hj = sig_hj + sum_k g_hk . D(w_k x_j)      (the query at ``=`` is input-independent; j = 0, 1)
 * routing    alpha_h = softmax(s_h0, s_h1, sig_h2)
 * moved      zeta_hk = alpha_h0 D(w_k a) + alpha_h1 D(w_k b)   (what head h carries in plane k: its OV image O_h U_k)
@@ -65,27 +64,24 @@ def mpd(operation, tensors):
                                        tensors)
 
 
-def token_cycle(p, rows):
-    """The declared successor x -> x + 1 (mod p) over a table's first p rows; any further row is fixed."""
-    return [(x + 1) % p if x < p else x for x in range(rows)]
-
-
 def cyclic_planes(table, p):
-    """cyclic_action::cyclic_planes of ``table`` under the token cycle: c0 (d,), the planes U (K, 2, d) with
-    U[k-1] = [u_kc, u_ks], and each plane's power (K,)."""
-    out = mpd({"kind": "cyclic_planes", "table": "table", "successor": token_cycle(p, table.shape[0])},
-              {"table": table})
-    planes = out.arrays["planes"]
-    return out.arrays["mean"], planes.T.reshape(-1, 2, planes.shape[0]), np.array(out.report["result"]["power"])
+    """The token-cycle Fourier planes of ``table``'s first p rows (exact for odd p): c0 (d,), U (K, 2, d) with
+    e(x) = c0 + sum_k U_k D(w_k x), and each plane's power ||U_k||_F^2 (K,)."""
+    K = np.arange(1, (p - 1) // 2 + 1)
+    rows = table[:p]
+    U = (2 / p) * np.einsum("ckt,cd->ktd", chars(K, np.arange(p), p), rows)
+    return rows.mean(0), U, (U ** 2).sum((1, 2))
 
 
 def frequency_edited(table, p, frequencies, shift):
-    """cyclic_action::frequency_edit of the closed-form planes ``frequencies`` of ``table`` at ``shift``:
-    the edited table E + left right^T (rows outside the cycle stay fixed)."""
-    out = mpd({"kind": "frequency_edit", "successor": token_cycle(p, table.shape[0]),
-               "basis": {"kind": "closed_form", "table": "table"},
-               "frequencies": sorted(int(k) for k in frequencies), "shift": int(shift)}, {"table": table})
-    return table + out.arrays["left"] @ out.arrays["right"].T
+    """The frequency edit at ``shift``: each token row's own components in the planes ``frequencies`` turn by
+    w_k shift, e_a -> e_a + sum_k U_k (D(w_k (a + shift)) - D(w_k a)); rows past p stay fixed."""
+    K = np.array(sorted(int(k) for k in frequencies))
+    U = cyclic_planes(table, p)[1][K - 1]
+    a = np.arange(p)
+    out = table.copy()
+    out[:p] += np.einsum("akt,ktd->ad", chars(K, a + shift, p) - chars(K, a, p), U)
+    return out
 
 
 def softmax(s):

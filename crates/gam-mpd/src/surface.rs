@@ -29,9 +29,9 @@ use super::receipts::{
     ExternalExecution, MeasuredDiscrepancy, MlpBlockReceipt, MlpBlockReceiptInputs, ReceiptRefusal,
     StageAgreement, mlp_block_receipt,
 };
-use super::cyclic_action::CyclicActionError;
 use super::secant::SecantError;
 use super::attention::AttentionProgramError;
+use super::bounds::BoundError;
 use super::dense::DenseError;
 use super::canonical::CanonicalRefusal;
 use super::gauge::GaugeRefusal;
@@ -46,10 +46,10 @@ use super::spectral::{
     recover_plane_rotations,
 };
 
+mod bounds;
 mod canonical;
 mod code;
 mod compile;
-mod cyclic;
 mod dense;
 mod finite_grid;
 mod gauge_census;
@@ -62,6 +62,10 @@ mod sign_gated;
 mod state_quotient;
 mod verify;
 
+pub use bounds::{
+    AttentionReadRegionReport, BoxStatusWire, HeadReadRequest, LogitBoundRequest, LogitBoundsReport,
+    LogitBoundsRequest, LogitBoxRegion, LogitBoxes,
+};
 pub use canonical::{
     CanonicalLayerReport, CanonicalLayerRequest, DefectReport, ElementsReport, ExecuteRequest,
     ExecutionIds, ExecutionReport, NormReport, ProjectionReport, QueryKeyElementReport,
@@ -108,10 +112,6 @@ pub use sign_gated::{
     PerRowReport, ReadoutReport, ReadoutRequest, RowsReport, SignGatedSwigluReport, SignGatedSwigluRequest,
 };
 
-pub use cyclic::{
-    CyclicBasis, CyclicPlanesReport, CyclicPlanesRequest, FrequencyEditReport, FrequencyEditRequest,
-    PlaneProgramCodeReport, PlaneProgramCodeRequest,
-};
 pub use verify::{
     BandedLogits, FamilyDomainReport, FamilyStatusWire, FamilyVerificationReport,
     FamilyWitnessReport, ToleranceRequest, VerifyLogitsReport, VerifyLogitsRequest,
@@ -192,15 +192,6 @@ pub enum MpdOperation {
     /// (`state::LinearStateQuotient::closed_chart`), for callers that read only the
     /// resolved row space and its rank.
     LinearClosedChart(LinearClosedChartRequest),
-    /// The closed-form planes of a table under a declared single odd cycle
-    /// (`cyclic_action::cyclic_planes`).
-    CyclicPlanes(CyclicPlanesRequest),
-    /// The frequency edit of a plane subset at one shift
-    /// (`cyclic_action::frequency_edit`).
-    FrequencyEdit(FrequencyEditRequest),
-    /// The exact code of a plane program at a declared precision
-    /// (`cyclic_action::plane_program_code`).
-    PlaneProgramCode(PlaneProgramCodeRequest),
     /// Exact bit counts of declared message items (`codec`, `precision::LatticeCode`).
     CodeLengths(CodeLengthsRequest),
     /// One structural proposal decided by `fit::decide_proposal` from supplied code
@@ -238,6 +229,9 @@ pub enum MpdOperation {
     /// The executed sign-gated split `F = P + R` of a residual SwiGLU block, its correction
     /// bounds and SiLU → ReLU replacement contract (`sign_gated`).
     SignGatedSwiglu(Box<SignGatedSwigluRequest>),
+    /// The logit-box KL and total-variation bounds, and the attention-read bound
+    /// (`bounds`).
+    LogitBounds(LogitBoundsRequest),
 }
 
 /// [`ExternalExecution`] on the wire.
@@ -289,9 +283,6 @@ pub enum MpdResult {
     MlpBlockReceipt(MlpBlockReceiptReport),
     LinearStateQuotient(LinearStateQuotientReport),
     LinearClosedChart(LinearClosedChartReport),
-    CyclicPlanes(CyclicPlanesReport),
-    FrequencyEdit(FrequencyEditReport),
-    PlaneProgramCode(PlaneProgramCodeReport),
     CodeLengths(CodeLengthsReport),
     DecideProposal(DecideProposalReport),
     Secant(SecantReport),
@@ -305,6 +296,7 @@ pub enum MpdResult {
     ModuleSplit(Box<ModuleSplitReport>),
     Compile(Box<CompileReport>),
     SignGatedSwiglu(Box<SignGatedSwigluReport>),
+    LogitBounds(LogitBoundsReport),
 }
 
 /// [`PlaneRotationRecovery`] on the wire.
@@ -465,7 +457,6 @@ pub enum MpdSurfaceError {
     PlaneRotation(PlaneRotationError),
     Receipt(ReceiptRefusal),
     State(StateError),
-    CyclicAction(CyclicActionError),
     /// A code owner refused an item.
     Code(String),
     /// An evidence-status constructor refused a supplied status.
@@ -479,6 +470,7 @@ pub enum MpdSurfaceError {
     Canonical(Box<CanonicalRefusal>),
     Dense(DenseError),
     Joint(JointRefusal),
+    Bound(BoundError),
     /// The module-split owner refused the block, a subset or a vector.
     ModuleSplit(String),
     /// The sign-gated split owner refused the block, the rows or the readout.
@@ -509,7 +501,6 @@ impl fmt::Display for MpdSurfaceError {
             Self::PlaneRotation(error) => write!(formatter, "{error}"),
             Self::Receipt(error) => write!(formatter, "{error}"),
             Self::State(error) => write!(formatter, "{error}"),
-            Self::CyclicAction(error) => write!(formatter, "{error}"),
             Self::Memory(error) => write!(formatter, "{error}"),
             Self::Code(reason) => write!(formatter, "{reason}"),
             Self::Evidence(error) => write!(formatter, "{error}"),
@@ -523,6 +514,7 @@ impl fmt::Display for MpdSurfaceError {
             Self::Verify(reason) => write!(formatter, "verification refused: {reason}"),
             Self::Dense(error) => write!(formatter, "{error}"),
             Self::Joint(refusal) => write!(formatter, "joint operators refused: {refusal:?}"),
+            Self::Bound(error) => write!(formatter, "{error}"),
             Self::ModuleSplit(reason) => write!(formatter, "{reason}"),
             Self::Compile(error) => write!(formatter, "{error}"),
             Self::SignGated(reason) => write!(formatter, "{reason}"),
@@ -597,9 +589,6 @@ pub fn run_parameter_decomposition(
             state_quotient::run(request, tensors, governor)
         }
         MpdOperation::LinearClosedChart(request) => state_quotient::run_chart(request, tensors, governor),
-        MpdOperation::CyclicPlanes(request) => cyclic::run_planes(request, tensors, governor),
-        MpdOperation::FrequencyEdit(request) => cyclic::run_edit(request, tensors, governor),
-        MpdOperation::PlaneProgramCode(request) => cyclic::run_code(request, tensors, governor),
         MpdOperation::CodeLengths(request) => code::run_lengths(request, tensors, governor),
         MpdOperation::DecideProposal(request) => code::run_decide(request),
         MpdOperation::Secant(request) => secant::run(request, tensors, governor),
@@ -613,6 +602,7 @@ pub fn run_parameter_decomposition(
         MpdOperation::ModuleSplit(request) => module_split::run(request, tensors, governor),
         MpdOperation::Compile(request) => compile::run(*request, tensors, governor),
         MpdOperation::SignGatedSwiglu(request) => sign_gated::run(*request, tensors, governor),
+        MpdOperation::LogitBounds(request) => bounds::run(request, tensors),
     }
 }
 
