@@ -14,6 +14,9 @@ use rand::{RngExt, SeedableRng};
 // The planted known-answer toys and their ball-arithmetic Jacobians.
 pub mod planted_toys;
 
+// Hand-built networks with a known decomposition: induction, modular addition, residual MLPs.
+pub mod known_answer_toys;
+
 pub fn frobenius_norm(matrix: ArrayView2<'_, f64>) -> f64 {
     matrix.iter().map(|value| value * value).sum::<f64>().sqrt()
 }

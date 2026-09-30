@@ -159,6 +159,10 @@ mod verify_toys_tests;
 #[cfg(test)]
 mod spectral_toys_tests;
 
+// The known-answer toys (induction, modular addition, residual MLPs) against the owners.
+#[cfg(test)]
+mod known_answer_toys_tests;
+
 // Declared-precision real codes and decode-then-evaluate distortion.
 pub mod precision;
 
