@@ -370,6 +370,21 @@ pub(crate) struct HessianSpectrumBounds {
     upper: Vec<f64>,
     /// See [`HessianSpectrumMotion`].
     weights_stay_nonnegative: bool,
+    /// What [`certify_identified_rank_locally_constant`]'s co-motion bound reads.
+    co_motion: CoMotion,
+}
+
+/// The step as the co-motion bound on the dropped set reads it (#4578): `H`'s
+/// eigenvectors in descending order, each coordinate's scaled root
+/// `√λ_k·R_k` with its reach `[e^{−down_k}, e^{up_k}]`, the weight motion `m`,
+/// the nonpositive rows' Gram `V`, and the residual `R = S̃ − Σ_k B_k` the
+/// blocks leave of the engine's penalty.
+struct CoMotion {
+    eigenvectors: Array2<f64>,
+    roots: Vec<(std::ops::Range<usize>, Array2<f64>, f64, f64)>,
+    relative_weight_motion: f64,
+    nonpositive_rows: Option<Array2<f64>>,
+    residual: Array2<f64>,
 }
 
 impl HessianSpectrumBounds {
@@ -379,7 +394,8 @@ impl HessianSpectrumBounds {
     /// `[e^{−down_k}, e^{up_k}]·λ_k S̃_k`, for the curvature weights' `motion`
     /// over that step. `penalties` yields one `(range, block)` per coordinate,
     /// in coordinate order: `block` is `λ_k S̃_k` on `hessian`'s rows and
-    /// columns `range`, zero elsewhere.
+    /// columns `range`, zero elsewhere, given by its root `√λ_k·R_k` so that
+    /// `block = rootᵀ·root`.
     pub(crate) fn over_reach(
         hessian: &Array2<f64>,
         penalty: &Array2<f64>,
@@ -416,7 +432,9 @@ impl HessianSpectrumBounds {
         let mut grown = Array2::<f64>::zeros((dimension, dimension));
         let mut upper_unbounded = false;
         let mut coordinates = 0usize;
-        for (range, block) in penalties {
+        let mut roots = Vec::new();
+        for (range, root) in penalties {
+            let block = root.t().dot(&root);
             let (Some(&fall), Some(&rise)) = (down.get(coordinates), up.get(coordinates)) else {
                 return Err(EstimationError::InvalidInput(format!(
                     "Hessian spectrum bounds: more penalties than the {} step coordinates",
@@ -442,11 +460,12 @@ impl HessianSpectrumBounds {
             let growth = rise.exp();
             if growth.is_finite() {
                 grown
-                    .slice_mut(s![range.clone(), range])
+                    .slice_mut(s![range.clone(), range.clone()])
                     .scaled_add(growth, &block);
             } else {
                 upper_unbounded = true;
             }
+            roots.push((range, root, fall, rise));
             coordinates += 1;
         }
         if coordinates != down.len() {
@@ -491,6 +510,22 @@ impl HessianSpectrumBounds {
         }
         let lower_charge = (1.0 - m).abs() * residual;
         let upper_charge = (1.0 + m) * residual;
+        let mut symmetric = hessian.clone();
+        gam_linalg::matrix::symmetrize_in_place(&mut symmetric);
+        let (values, vectors) = symmetric
+            .eigh(Side::Lower)
+            .map_err(EstimationError::EigendecompositionFailed)?;
+        let mut order: Vec<usize> = (0..dimension).collect();
+        order.sort_by(|&left, &right| values[right].total_cmp(&values[left]));
+        let co_motion = CoMotion {
+            eigenvectors: Array2::from_shape_fn((dimension, dimension), |(row, column)| {
+                vectors[[row, order[column]]]
+            }),
+            roots,
+            relative_weight_motion: m,
+            nonpositive_rows: motion.nonpositive_rows.clone(),
+            residual: difference,
+        };
         Ok(Self {
             lower: descending_spectrum(lower)?
                 .into_iter()
@@ -505,7 +540,128 @@ impl HessianSpectrumBounds {
                     .collect()
             },
             weights_stay_nonnegative: motion.weights_stay_nonnegative,
+            co_motion,
         })
+    }
+}
+
+impl CoMotion {
+    /// Whether every dropped eigenvalue stays under the band everywhere the step
+    /// reaches, judged jointly (#4578). `descending` is `H`'s spectrum, `rank`
+    /// the kept count.
+    ///
+    /// With `D` the dropped eigenvectors and `x` the top one, Courant–Fischer
+    /// gives `σ_{r+1}(H') ≤ λ_max(DᵀH'D)` and the band at `H'` is at least
+    /// `p·ε·xᵀH'x`. With `u_k = e^{δρ_k}`, the data part `G = H − S̃ = H − Σ_k B_k − R`
+    /// for the residual `R` the blocks leave of `S̃` ([`HessianSpectrumBounds`]),
+    /// and the weights' Loewner bounds (`HessianSpectrumMotion`),
+    ///
+    /// ```text
+    ///   DᵀH'D ⪯ (1+m)·(Λ_D − DᵀRD) + DᵀVD + Σ_k (u_k − (1+m))·DᵀB_kD,
+    ///   xᵀH'x ≥ (1−m)·(σ_1 − xᵀRx) − xᵀVx + Σ_k (u_k − (1−m))·xᵀB_kx,
+    /// ```
+    ///
+    /// `R` enters only through `DᵀRD` and the scalar `xᵀRx`, both read exactly: a
+    /// uniform `‖R‖·I` would charge the dropped directions the rounding of the
+    /// dominating penalty's own entries, which is of the band's size.
+    ///
+    /// with `B_k = λ_kS̃_k`. `λ_max` is subadditive, and `λ_max(c·M) = c·λ_max(M)`
+    /// for `c ≥ 0`, `c·λ_min(M)` otherwise, so `λ_max(DᵀH'D) − p·ε·xᵀH'x` is at
+    /// most a constant plus one piecewise-linear term per coordinate, with
+    /// breaks at `u_k = 1 ± m`. Each term's maximum over `[e^{−down_k}, e^{up_k}]`
+    /// is at an end or a break, and the dropped set holds when the sum of those
+    /// maxima is not positive.
+    ///
+    /// The co-moving case is exactly where `DᵀB_kD` is a small difference of
+    /// large numbers: formed from the dense block it carries rounding of order
+    /// `ε·|D|ᵀ|B_k||D|`, the size of the band itself. It is taken from the root
+    /// instead, `DᵀB_kD = (√λ_kR_kD)ᵀ(√λ_kR_kD)`, whose computed product is off by
+    /// at most `γ_n·‖|√λ_kR_k|·|D|‖_F` (`n` the block's columns, `γ_n =
+    /// nε/(1 − nε)`). That moves each singular value by at most as much (Weyl),
+    /// and the Gram's own eigenvalues are charged `γ_{rows+2c}` of its largest.
+    fn dropped_set_stays_under_band(
+        &self,
+        descending: &[f64],
+        rank: usize,
+    ) -> Result<bool, EstimationError> {
+        let dimension = descending.len();
+        if rank == 0 || rank >= dimension || self.eigenvectors.dim() != (dimension, dimension) {
+            return Ok(false);
+        }
+        let gamma = |count: usize| {
+            let unit = count as f64 * f64::EPSILON;
+            unit / (1.0 - unit)
+        };
+        let resolution = dimension as f64 * f64::EPSILON;
+        let m = self.relative_weight_motion;
+        let dropped = self.eigenvectors.slice(s![.., rank..]);
+        let top = self.eigenvectors.column(0);
+        let (dropped_rows, top_rows) = match self.nonpositive_rows.as_ref() {
+            Some(rows) => (
+                descending_spectrum(dropped.t().dot(rows).dot(&dropped))?[0],
+                top.dot(&rows.dot(&top)),
+            ),
+            None => (0.0, 0.0),
+        };
+        let dropped_residual = descending_spectrum(-dropped.t().dot(&self.residual).dot(&dropped))?[0];
+        let top_residual = top.dot(&self.residual.dot(&top));
+        let mut excess = (1.0 + m) * (descending[rank] + dropped_residual)
+            + dropped_rows
+            - resolution * ((1.0 - m) * (descending[0] - top_residual) - top_rows);
+        for (range, root, fall, rise) in &self.roots {
+            let columns = range.len();
+            let block_dropped = dropped.slice(s![range.clone(), ..]);
+            let product = root.dot(&block_dropped);
+            let charge = gamma(columns)
+                * root
+                    .mapv(f64::abs)
+                    .dot(&block_dropped.mapv(f64::abs))
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f64>()
+                    .sqrt();
+            let gram = descending_spectrum(product.t().dot(&product))?;
+            let gram_charge = gamma(root.nrows() + 2 * gram.len()) * gram[0].max(0.0);
+            let singular_max = (gram[0] + gram_charge).max(0.0).sqrt() + charge;
+            let singular_min = if root.nrows() < gram.len() {
+                0.0
+            } else {
+                ((gram[gram.len() - 1] - gram_charge).max(0.0).sqrt() - charge).max(0.0)
+            };
+            let (dropped_high, dropped_low) = (singular_max.powi(2), singular_min.powi(2));
+            let top_block = top.slice(s![range.clone()]);
+            let top_product = root.dot(&top_block);
+            let top_norm = top_product.dot(&top_product).sqrt();
+            let top_charge = gamma(columns)
+                * root
+                    .mapv(f64::abs)
+                    .dot(&top_block.mapv(f64::abs))
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f64>()
+                    .sqrt()
+                + gamma(root.nrows()) * top_norm;
+            let top_high = (top_norm + top_charge).powi(2);
+            let top_low = (top_norm - top_charge).max(0.0).powi(2);
+            let term = |u: f64| {
+                let dropped_scale = u - (1.0 + m);
+                let top_scale = u - (1.0 - m);
+                dropped_scale * if dropped_scale >= 0.0 { dropped_high } else { dropped_low }
+                    - resolution * top_scale * if top_scale >= 0.0 { top_low } else { top_high }
+            };
+            let low = (-fall).exp();
+            let high = rise.exp();
+            if !high.is_finite() && dropped_high - resolution * top_low > 0.0 {
+                return Ok(false);
+            }
+            let worst = [low, high, 1.0 + m, 1.0 - m]
+                .into_iter()
+                .filter(|&u| u.is_finite() && low <= u && u <= high)
+                .map(term)
+                .fold(f64::NEG_INFINITY, f64::max);
+            excess += worst;
+        }
+        Ok(excess.is_finite() && excess <= 0.0)
     }
 }
 
@@ -604,6 +760,13 @@ pub(crate) struct IdentifiedRankCertificate {
 /// cannot shrink while the curvature weights stay nonnegative: `H' ⪰ S'_λ` gives
 /// `σ_{rank(S_λ)}(H') ≥ σ_{rank(S_λ)}(S'_λ) > 0`, and `rank(S_λ)` does not depend
 /// on ρ.
+///
+/// Those decoupled bounds take the dropped set's largest reach and the band's
+/// smallest at different points of the step. When the dropped directions' only
+/// curvature is the rounding of the penalty that also sets `‖H‖₂`, both move
+/// with that one `λ_k`, their ratio stays put, and the decoupled bounds refuse
+/// a rank that cannot change (#4578). [`CoMotion::dropped_set_stays_under_band`]
+/// bounds the ratio itself, and the dropped set holds if either bound does.
 pub(crate) fn certify_identified_rank_locally_constant(
     eigenvalues: &[f64],
     rank: usize,
@@ -643,7 +806,12 @@ pub(crate) fn certify_identified_rank_locally_constant(
     let kept_set_holds = (rank == penalty_rank && bounds.weights_stay_nonnegative)
         || reachable_smallest_identified > reachable_band.1;
     let dropped_set_holds = match reachable_largest_unidentified {
-        Some(sigma) => sigma <= reachable_band.0,
+        Some(sigma) => {
+            sigma <= reachable_band.0
+                || bounds
+                    .co_motion
+                    .dropped_set_stays_under_band(&descending, rank)?
+        }
         None => true,
     };
     if kept_set_holds && dropped_set_holds {
@@ -889,10 +1057,7 @@ pub(crate) fn certify_fitted_identified_rank(
         &spectrum.hessian,
         &pirls.reparam_result.s_transformed,
         penalties.iter().zip(lambdas.iter()).map(|(penalty, &lambda)| {
-            (
-                penalty.col_range.clone(),
-                penalty.root.t().dot(&penalty.root) * lambda,
-            )
+            (penalty.col_range.clone(), &penalty.root * lambda.sqrt())
         }),
         down.view(),
         up.view(),
@@ -966,6 +1131,18 @@ mod tests {
         Array2::from_diag(&Array1::from(values.to_vec()))
     }
 
+    /// The root of `diag(values)`.
+    fn diagonal_root(values: &[f64]) -> Array2<f64> {
+        diagonal(&values.iter().map(|value| value.sqrt()).collect::<Vec<_>>())
+    }
+
+    /// A root `diag(√σ)·Qᵀ` of a PSD `block = Q·diag(σ)·Qᵀ`.
+    fn root_of(block: &Array2<f64>) -> Array2<f64> {
+        let (values, vectors) = block.clone().eigh(Side::Lower).unwrap();
+        let scale = values.mapv(|value| value.max(0.0).sqrt());
+        Array2::from_diag(&scale).dot(&vectors.t())
+    }
+
     /// The bounds for `diag(hessian)` carrying the penalties `diag(penalty)`,
     /// each over its own step, with still weights.
     fn diagonal_bounds(hessian: &[f64], penalties: &[(&[f64], f64)]) -> HessianSpectrumBounds {
@@ -979,7 +1156,7 @@ mod tests {
             &engine,
             penalties
                 .iter()
-                .map(|entry| (0..hessian.len(), diagonal(entry.0))),
+                .map(|entry| (0..hessian.len(), diagonal_root(entry.0))),
             steps.view(),
             steps.view(),
             still_weights(),
@@ -1025,6 +1202,80 @@ mod tests {
             ),
             "{refusal}"
         );
+    }
+
+    /// #4578: a dropped direction whose only curvature is the rounding leakage
+    /// of the penalty that sets `‖H‖₂` moves with that penalty, and so does the
+    /// band. The hypertension probit refusal had this shape: `σ_{r+1} = 0.268`
+    /// under a band set by `‖H‖₂ ≥ 1.3e13`, and a certificate step of 3.5 on the
+    /// dominating penalty. Taken apart, the dropped eigenvalue rises by `e^{3.5}`
+    /// while the band falls by `e^{−3.5}` and the rank is refused; taken
+    /// together the ratio never moves and the rank is certified. Every
+    /// re-assembled `H'` across the step keeps that rank. The control: the same
+    /// spectrum with the dropped curvature on a second, non-dominating penalty
+    /// really does cross the band, and still refuses.
+    #[test]
+    fn a_dropped_direction_co_moving_with_the_band_certifies_4578() {
+        let norm = 1.3e13;
+        let band = 3.0 * f64::EPSILON * norm;
+        let leak = 0.8 * band;
+        let spectrum = [norm, 33.4, leak];
+        let dominating: (&[f64], f64) = (&[norm, 0.0, leak], 3.5);
+        let data: (&[f64], f64) = (&[0.0, 33.4, 0.0], 0.0);
+        let co_moving = diagonal_bounds(&spectrum, &[dominating, data]);
+        assert!(
+            co_moving.upper[2] > 3.0 * f64::EPSILON * co_moving.lower[0],
+            "the decoupled bounds alone must refuse this step"
+        );
+        let certificate = certify_at_identified_rank(&spectrum, 1, &co_moving).unwrap();
+        assert_eq!(certificate.rank, 2);
+        for step in [-3.5, -1.0, 0.0, 2.0, 3.5] {
+            let scale = f64::exp(step);
+            let displaced = [norm * scale, 33.4, leak * scale];
+            assert_eq!(DenseSpectralOperator::identified_rank(&displaced, 1), 2);
+        }
+        let reaching: (&[f64], f64) = (&[0.0, 0.0, leak], 3.5);
+        let independent = diagonal_bounds(&spectrum, &[(&[norm, 0.0, 0.0], 0.0), data, reaching]);
+        let displaced = [norm, 33.4, leak * f64::exp(3.5)];
+        assert_eq!(DenseSpectralOperator::identified_rank(&displaced, 1), 3);
+        let refusal = certify_at_identified_rank(&spectrum, 1, &independent).unwrap_err();
+        assert!(
+            matches!(
+                refusal,
+                EstimationError::IdentifiedRankNotLocallyConstant { rank: 2, .. }
+            ),
+            "{refusal}"
+        );
+    }
+
+    /// #4578: off the axes, the co-motion bound reads the dropped curvature
+    /// `DᵀB_kD` through the penalty's root. The dominating penalty's leak and a
+    /// data direction share a rotated plane, so neither the dropped eigenvector
+    /// nor the root is aligned with a coordinate, and the co-moving rank still
+    /// certifies.
+    #[test]
+    fn the_co_motion_bound_reads_a_rotated_root_4578() {
+        let angle = 0.3_f64;
+        let (c, s) = (angle.cos(), angle.sin());
+        let rotation = array![[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]];
+        let norm = 1.3e13;
+        let leak = 0.5 * 3.0 * f64::EPSILON * norm;
+        let root = diagonal_root(&[norm, 0.0, leak]).dot(&rotation.t());
+        let data = rotation.dot(&diagonal(&[0.0, 33.4, 0.0])).dot(&rotation.t());
+        let block = root.t().dot(&root);
+        let hessian = &data + &block;
+        let spectrum = descending_spectrum(hessian.clone()).unwrap();
+        let bounds = HessianSpectrumBounds::over_reach(
+            &hessian,
+            &block,
+            [(0..3, root)],
+            array![3.5].view(),
+            array![3.5].view(),
+            still_weights(),
+        )
+        .unwrap();
+        let certificate = certify_at_identified_rank(&spectrum, 1, &bounds).unwrap();
+        assert_eq!(certificate.rank, 2);
     }
 
     /// The certificate judges the rank it is handed, the one the criterion priced,
@@ -1144,7 +1395,7 @@ mod tests {
             HessianSpectrumBounds::over_reach(
                 &hessian,
                 &engine,
-                [(0..2, engine.clone())],
+                [(0..2, diagonal_root(&[2.0e15, 0.0]))],
                 array![down].view(),
                 array![up].view(),
                 still_weights(),
@@ -1187,7 +1438,7 @@ mod tests {
                 &engine,
                 [(
                     penalty.col_range.clone(),
-                    penalty.root.t().dot(&penalty.root) * 1.0e8,
+                    &penalty.root * 1.0e4,
                 )],
                 array![1.0].view(),
                 array![1.0].view(),
@@ -1222,7 +1473,7 @@ mod tests {
             HessianSpectrumBounds::over_reach(
                 &diagonal(&spectrum),
                 &diagonal(engine),
-                [(0..2, diagonal(&[0.0, 0.2]))],
+                [(0..2, diagonal_root(&[0.0, 0.2]))],
                 array![0.0].view(),
                 array![0.0].view(),
                 still_weights(),
@@ -1381,7 +1632,7 @@ mod tests {
         let bounds = HessianSpectrumBounds::over_reach(
             &hessian,
             &(&first + &second),
-            [(0..3, first.clone()), (0..3, second.clone())],
+            [(0..3, root_of(&first)), (0..3, root_of(&second))],
             steps.view(),
             steps.view(),
             still_weights(),
@@ -1451,7 +1702,7 @@ mod tests {
     #[test]
     fn a_negative_weight_rows_motion_refuses_the_direction_it_can_empty_2901() {
         let spectrum = [1.0, 0.1];
-        let penalty = (0..2, diagonal(&[0.0, 0.5]));
+        let penalty = (0..2, diagonal_root(&[0.0, 0.5]));
         let weights = array![1.0, -0.4];
         let bounds_for = |weight_motion: Array1<f64>| {
             let motion =
