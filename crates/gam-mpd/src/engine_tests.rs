@@ -72,6 +72,7 @@ fn planted_program(declared: bool) -> (OperatorProgram, Contract) {
     let contract = Contract {
         declarations,
         family: FamilyInputs {
+            layout: None,
             rows: pairs.len(),
             slots: vec![
                 SlotValues::Tokens(pairs.iter().map(|q| q.0).collect()),

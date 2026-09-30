@@ -34,10 +34,10 @@
 //! the returned program is the last certified one, and its maximal row KL and argmax agreement are
 //! reported as outputs.
 
-use super::contract::{Contract, ContractError, ProgramScore};
+use super::contract::{Contract, ContractError, FamilyKind, ProgramScore};
 use super::fit::ProposalKind;
 use super::operator_program::{
-    Interface, LabelKind, Law, Node, Operator, OperatorBody, OperatorProgram, ProgramError, Trace,
+    FamilyInputs, Interface, LabelKind, Law, Node, Operator, OperatorBody, OperatorProgram, ProgramError, Trace,
     round_to_lattice,
 };
 use super::dense::svd;
@@ -495,6 +495,63 @@ pub fn decompose_with_reference(
     Ok(Decomposition { program, score: current, stop })
 }
 
+/// A decomposition refined against a pool of inputs the family does not hold.
+#[derive(Clone, Debug)]
+pub struct Refinement {
+    pub decomposition: Decomposition,
+    /// Pool inputs that refuted a round's program and joined the family.
+    pub added: usize,
+    pub pool: usize,
+    /// The last program's KL on every pool row is within its certified maximum on the family:
+    /// the claim survived a search over the whole pool (a search, not a proof beyond the family).
+    pub survived: bool,
+}
+
+/// Counterexample-guided refinement: decompose; run the program and the model on `pool`; every
+/// pool input with a distribution row whose KL exceeds the program's certified maximum KL on the
+/// family refutes that the family's worst case covers the pool, and joins the family (as a new unit
+/// of a sampled family); decompose again from the current program. At most `rounds` rounds.
+pub fn decompose_refined(
+    model: &OperatorProgram,
+    contract: &Contract,
+    library: &[Box<dyn Primitive>],
+    budget: &Budget,
+    pool: &FamilyInputs,
+    rounds: usize,
+) -> Result<Refinement, EngineError> {
+    let mut contract = contract.clone();
+    let mut start = model.clone();
+    let mut added = 0;
+    let model_pool = contract.distributions(&model.execute(pool, false)?.values[model.output])?;
+    let reference = Reference { log_probabilities: log_softmax_rows(&model_pool), banded: BandedMatrix { values: model_pool.clone(), bands: Array2::zeros(model_pool.dim()) } };
+    for round in 0..rounds.max(1) {
+        let result = decompose_from(model, &start, &contract, library, budget)?;
+        let threshold = result.score.evaluation.max_kl.upper_bound().unwrap_or(f64::INFINITY);
+        let program_pool = contract.distributions(&result.program.execute(pool, false)?.values[result.program.output])?;
+        let log_q = log_softmax_rows(&program_pool);
+        let mut refuting: BTreeSet<usize> = BTreeSet::new();
+        for (row, (lp, lq)) in reference.log_probabilities.outer_iter().zip(log_q.outer_iter()).enumerate() {
+            let kl: f64 = lp.iter().zip(lq.iter()).map(|(a, b)| a.exp() * (a - b)).sum();
+            if kl > threshold {
+                refuting.insert(row / contract.readouts);
+            }
+        }
+        if refuting.is_empty() || round + 1 == rounds.max(1) {
+            return Ok(Refinement { decomposition: result, added, pool: pool.rows, survived: refuting.is_empty() });
+        }
+        let rows: Vec<usize> = refuting.into_iter().collect();
+        added += rows.len();
+        let extra = pool.select(&rows);
+        if let FamilyKind::Sample { units, .. } = &mut contract.kind {
+            let next = units.iter().copied().max().map_or(0, |m| m + 1);
+            units.extend((0..extra.rows).map(|i| next + i));
+        }
+        contract.family = contract.family.append(&extra)?;
+        start = result.program;
+    }
+    Err(EngineError::Primitive("refinement ran no round".to_string()))
+}
+
 // ------------------------------------------------------------------------------------ restrictions
 
 /// Remove present blocks: level 0 drops a whole column group of an operator (an input subspace
@@ -761,6 +818,81 @@ impl Primitive for DeadUnits {
                     description: format!("dead unit {group} of node {index}"),
                     edit: Edit::Laws { node: index, laws: new_laws, blocks },
                 });
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Law substitution: any pointwise law may be replaced by any other law of the alphabet
+/// ([`super::operator_program::LAWS`]); the two-part code and the contract decide. Level 0 replaces
+/// a whole node's laws with one law; level 1 one group's. A zero law also removes the blocks that
+/// write and read its group. No substitution is privileged: a sign-gated SiLU-to-ReLU split, a
+/// linearized unit and a dead unit are all instances.
+pub struct LawSubstitution;
+
+/// The blocks a zero law on `group` of pointwise node `node` leaves unread or unwritten.
+fn zero_law_blocks(program: &OperatorProgram, node: usize, input: usize, group: usize) -> Vec<BlockRef> {
+    let mut blocks = Vec::new();
+    for (reader, reading) in program.nodes.iter().enumerate() {
+        let Node::Affine { terms, bias } = reading else { continue };
+        for (argument, op) in terms {
+            if *argument == node {
+                blocks.extend(present_blocks(&program.operators[*op]).into_iter().filter(|(_, c)| *c == group).map(|(row, col)| BlockRef { operator: *op, row, col }));
+            }
+        }
+        if reader == input {
+            for op in terms.iter().map(|(_, op)| *op).chain(bias.iter().copied()) {
+                blocks.extend(present_blocks(&program.operators[op]).into_iter().filter(|(r, _)| *r == group).map(|(row, col)| BlockRef { operator: op, row, col }));
+            }
+        }
+    }
+    blocks
+}
+
+impl Primitive for LawSubstitution {
+    fn name(&self) -> &'static str {
+        "law_substitution"
+    }
+
+    fn levels(&self) -> usize {
+        2
+    }
+
+    fn propose(&self, context: &SearchContext<'_>) -> Result<Vec<Proposal>, EngineError> {
+        let program = context.program;
+        let mut out = Vec::new();
+        for (index, node) in program.nodes.iter().enumerate() {
+            let Node::Pointwise { input, laws } = node else { continue };
+            let proposal = |description: String, new_laws: Vec<Law>, blocks: Vec<BlockRef>| Proposal {
+                primitive: "law_substitution",
+                kind: ProposalKind::Reduce,
+                exactness: Exactness::Approximate,
+                description,
+                edit: Edit::Laws { node: index, laws: new_laws, blocks },
+            };
+            for law in super::operator_program::LAWS {
+                if context.level == 0 {
+                    if laws.iter().all(|l| *l == law) {
+                        continue;
+                    }
+                    let blocks = if law == Law::Zero {
+                        (0..laws.len()).flat_map(|g| zero_law_blocks(program, index, *input, g)).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    out.push(proposal(format!("every law of node {index} to {law:?}"), vec![law; laws.len()], blocks));
+                } else {
+                    for (group, current) in laws.iter().enumerate() {
+                        if *current == law {
+                            continue;
+                        }
+                        let mut new_laws = laws.clone();
+                        new_laws[group] = law;
+                        let blocks = if law == Law::Zero { zero_law_blocks(program, index, *input, group) } else { Vec::new() };
+                        out.push(proposal(format!("law of group {group} of node {index} to {law:?}"), new_laws, blocks));
+                    }
+                }
             }
         }
         Ok(out)

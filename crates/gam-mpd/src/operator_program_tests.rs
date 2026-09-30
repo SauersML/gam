@@ -21,7 +21,7 @@ fn reals(rows: usize, cols: usize, salt: usize) -> Array2<f64> {
 
 /// A one-layer routing program over two token slots: embed, score, route, read, ReLU units,
 /// write logits over a declared class domain.
-fn fixture() -> OperatorProgram { rules: Vec::new(),
+fn fixture() -> OperatorProgram {
     let declarations = Declarations { parameters: 0,
         domains: vec![
             Domain { size: 7, cycle: Some((0..7).map(|t| (t < 5).then_some(t as u32)).collect()) },
@@ -83,6 +83,7 @@ fn fixture() -> OperatorProgram { rules: Vec::new(),
 fn family() -> FamilyInputs {
     let pairs: Vec<(u32, u32)> = (0..7).flat_map(|a| (0..7).map(move |b| (a, b))).collect();
     FamilyInputs {
+        layout: None,
         rows: pairs.len(),
         slots: vec![
             SlotValues::Tokens(pairs.iter().map(|p| p.0).collect()),
@@ -259,7 +260,7 @@ fn quad_evaluation(program: &OperatorProgram, inputs: &FamilyInputs) -> Vec<Vec<
                                 Law::Identity => x,
                                 Law::Zero => q(0.0),
                                 Law::Silu => x / (q(1.0) + (-x).exp()),
-                                Law::Gelu => unreachable_input(),
+                                Law::Gelu | Law::GeluTanh => unreachable_input(),
                             };
                         }
                     }
@@ -288,7 +289,14 @@ fn quad_evaluation(program: &OperatorProgram, inputs: &FamilyInputs) -> Vec<Vec<
                         }
                     }
                 }
-                Node::Raw { .. } | Node::Constant { .. } | Node::Param { .. } | Node::Call { .. } | Node::Gain { .. } => {
+                Node::Raw { .. }
+                | Node::Constant { .. }
+                | Node::Param { .. }
+                | Node::Call { .. }
+                | Node::Gain { .. }
+                | Node::Attend { .. }
+                | Node::RmsNorm { .. }
+                | Node::Transposed { .. } => {
                     unreachable_input()
                 }
             }
@@ -519,7 +527,7 @@ fn a_rule_is_sent_once_and_executes_at_each_call_and_a_gain_reads_the_declared_p
     assert_eq!(decoded.rules[0].nodes, program.rules[0].nodes);
     let x = Array2::from_shape_fn((4, 3), |(i, j)| (i as f64 - 1.5) * (j as f64 + 0.25));
     let y = Array2::from_shape_fn((4, 3), |(i, j)| (j as f64 - 1.0) * (i as f64 + 0.5));
-    let inputs = FamilyInputs { rows: 4, slots: vec![SlotValues::Raw(x.clone()), SlotValues::Raw(y.clone())] };
+    let inputs = FamilyInputs { layout: None, rows: 4, slots: vec![SlotValues::Raw(x.clone()), SlotValues::Raw(y.clone())] };
     let at_two = program.execute_at(&inputs, true, &[2.0]).expect("executes");
     let matrix = w.matrix();
     let relu = |m: Array2<f64>| m.mapv(|v| v.max(0.0));

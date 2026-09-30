@@ -128,6 +128,15 @@ pub mod refit;
 // Exact rewrites of operator programs: constant folding, composition, mixes, character and plane bases.
 pub mod operator_rewrites;
 
+// Shared writer factors: operators writing one space factored through one library of directions.
+pub mod factors;
+
+// Exact directional derivatives of operator programs, and precisions derived from curvature.
+pub mod derivatives;
+
+// Model exports (export.json and raw float64 tensors) as operator programs and contracts.
+pub mod import;
+
 // Exact masked rewrites of gated units, norms, biases and residual edges.
 pub mod gated_rewrite;
 

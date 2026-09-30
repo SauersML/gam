@@ -269,7 +269,7 @@ pub enum Basis {
 }
 
 impl Basis {
-    fn domain(&self) -> usize {
+    pub fn domain(&self) -> usize {
         match self {
             Self::Indicator { domain } | Self::Characters { domain, .. } => *domain,
         }
@@ -373,9 +373,21 @@ pub enum Law {
     Silu,
     /// The exact GELU `t Φ(t)`, with `Φ` from the probability owner's proven table.
     Gelu,
+    /// The tanh GELU `½ t (1 + tanh(√(2/π) (t + 0.044715 t³)))`, with the constants as the
+    /// architecture declares them.
+    GeluTanh,
 }
 
-const LAWS: [Law; 5] = [Law::Relu, Law::Identity, Law::Zero, Law::Silu, Law::Gelu];
+pub const LAWS: [Law; 6] = [Law::Relu, Law::Identity, Law::Zero, Law::Silu, Law::Gelu, Law::GeluTanh];
+
+/// The largest slope of the tanh GELU is below this (it peaks at about 1.1289 near `t ≈ 1.5`).
+const GELU_TANH_LIPSCHITZ: f64 = 1.13;
+
+/// `½ t (1 + tanh(√(2/π)(t + 0.044715 t³)))` with `√(2/π)` as its `f64`.
+fn gelu_tanh(t: f64) -> f64 {
+    let inner = std::f64::consts::FRAC_2_SQRT_PI * std::f64::consts::FRAC_1_SQRT_2 * (t + 0.044715 * t * t * t);
+    0.5 * t * (1.0 + inner.tanh())
+}
 
 /// The largest slope of the exact GELU, `max_t |Φ(t) + t φ(t)| = Φ(√2) + √2 φ(√2) < 1.129`.
 const GELU_LIPSCHITZ: f64 = 1.129;
@@ -398,6 +410,36 @@ impl Law {
             Self::Zero => 0.0,
             Self::Silu => silu(t),
             Self::Gelu => t * normal_cdf_and_pdf(t).0,
+            Self::GeluTanh => gelu_tanh(t),
+        }
+    }
+
+    /// The law's derivative at `t` (ReLU's is `0` at the kink, its left derivative).
+    pub fn derivative(self, t: f64) -> f64 {
+        match self {
+            Self::Relu => {
+                if t > 0.0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            Self::Identity => 1.0,
+            Self::Zero => 0.0,
+            Self::Silu => {
+                let sigma = 1.0 / (1.0 + (-t).exp());
+                sigma * (1.0 + t * (1.0 - sigma))
+            }
+            Self::Gelu => {
+                let (cdf, pdf) = normal_cdf_and_pdf(t);
+                cdf + t * pdf
+            }
+            Self::GeluTanh => {
+                let c = std::f64::consts::FRAC_2_SQRT_PI * std::f64::consts::FRAC_1_SQRT_2;
+                let inner = c * (t + 0.044715 * t * t * t);
+                let th = inner.tanh();
+                0.5 * (1.0 + th) + 0.5 * t * (1.0 - th * th) * c * (1.0 + 3.0 * 0.044715 * t * t)
+            }
         }
     }
 
@@ -410,6 +452,12 @@ impl Law {
             // `Φ̂` is within `NORMAL_CDF_RELATIVE_ERROR Φ + NORMAL_CDF_UNDERFLOW_FLOOR` of `Φ` and the
             // product rounds once, so the computed law is within
             // `|t|(rel Φ + floor) + u|value|` of `t Φ(t)`, with `|t| Φ ≤ 2|value|` for `rel ≤ 1/2`.
+            // Eight rounded operations and libm's tanh (one ulp) on the inner argument move `1 + tanh`
+            // by at most `(10u)(1 + |inner|)`, times `½|t|`; the final products add `3u|value|`.
+            Self::GeluTanh => (GELU_TANH_LIPSCHITZ * r
+                + 5.0 * UNIT_ROUNDOFF * input.abs() * (1.0 + input.abs() + 0.045 * input.abs().powi(3))
+                + 3.0 * UNIT_ROUNDOFF * value.abs())
+            .next_up(),
             Self::Gelu => (GELU_LIPSCHITZ * r
                 + 2.0 * NORMAL_CDF_RELATIVE_ERROR * value.abs()
                 + input.abs() * NORMAL_CDF_UNDERFLOW_FLOOR
@@ -678,9 +726,59 @@ pub enum Node {
     Call { rule: usize, arguments: Vec<usize> },
     /// The input times a scalar polynomial in the declared parameters.
     Gain { input: usize, coefficient: Coefficient },
+    /// Attention over the rows of a sequence: each row's query against the keys of the rows of its
+    /// sequence (those at or before its position when `causal`), rotated by position when `rotary`,
+    /// scored `c q·k`, softmax-weighted, reading the values.
+    Attend { query: usize, key: usize, value: usize, scale: Scale, rotary: Option<Rotary>, causal: bool },
+    /// `x / √(mean(x²) + ε)` per row, `ε` an exact real of the architecture.
+    RmsNorm { input: usize, epsilon: f64 },
+    /// `x A` for an operator `A` whose columns are this node's interface: an operator read in its
+    /// transposed orientation (a tied unembedding), paid once.
+    Transposed { input: usize, operator: usize },
 }
 
-const NODE_KINDS: usize = 15;
+const NODE_KINDS: usize = 18;
+
+/// A rotary position embedding: plane `i` of a query or key at position `m` turned by
+/// `m base^{-2i/dims}`. `half_split` pairs coordinate `i` with `i + dims/2` (rotate-half); otherwise
+/// `2i` with `2i + 1`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rotary {
+    pub base: u32,
+    pub dims: u32,
+    pub half_split: bool,
+}
+
+impl Rotary {
+    pub(crate) fn pairs(&self) -> Vec<(usize, usize)> {
+        let half = self.dims as usize / 2;
+        (0..half).map(|i| if self.half_split { (i, i + half) } else { (2 * i, 2 * i + 1) }).collect()
+    }
+
+    /// `(cos, sin)` of plane `i` at position `m`, with the angle as the architecture computes it.
+    pub(crate) fn turn(&self, plane: usize, position: u32) -> (f64, f64) {
+        let frequency = f64::from(self.base).powf(-2.0 * plane as f64 / f64::from(self.dims));
+        let (sine, cosine) = (f64::from(position) * frequency).sin_cos();
+        (cosine, sine)
+    }
+
+    /// `v` rotated to `position` in place, with the rotation's radius added to `radius`.
+    pub(crate) fn rotate(&self, v: &mut [f64], radius: Option<&mut [f64]>, position: u32) {
+        let mut radius = radius;
+        for (plane, (a, b)) in self.pairs().into_iter().enumerate() {
+            let (c, s) = self.turn(plane, position);
+            let (x, y) = (v[a], v[b]);
+            v[a] = c * x - s * y;
+            v[b] = s * x + c * y;
+            if let Some(r) = radius.as_deref_mut() {
+                let (ra, rb) = (r[a], r[b]);
+                let libm = 2.0 * UNIT_ROUNDOFF * (x.abs() + y.abs());
+                r[a] = (c.abs() * ra + s.abs() * rb + libm + 2.0 * UNIT_ROUNDOFF * (c * x).abs().max((s * y).abs())).next_up();
+                r[b] = (s.abs() * ra + c.abs() * rb + libm + 2.0 * UNIT_ROUNDOFF * (s * x).abs().max((c * y).abs())).next_up();
+            }
+        }
+    }
+}
 
 /// A scalar polynomial in the declared parameters, with exact dyadic numbers.
 #[derive(Clone, Debug, PartialEq)]
@@ -697,7 +795,7 @@ impl Coefficient {
     /// `(value, magnitude, operations)`: the computed value, the value of the same polynomial on
     /// the absolute values, and the rounded operations on its longest path; the computed value is
     /// within `γ_operations · magnitude` of the exact one.
-    fn evaluate(&self, parameters: &[f64]) -> Result<(f64, f64, usize), ProgramError> {
+    pub(crate) fn evaluate(&self, parameters: &[f64]) -> Result<(f64, f64, usize), ProgramError> {
         match self {
             Self::Parameter(index) => {
                 let v = *parameters
@@ -755,6 +853,9 @@ impl Node {
             Self::Param { .. } => 12,
             Self::Call { .. } => 13,
             Self::Gain { .. } => 14,
+            Self::Attend { .. } => 15,
+            Self::RmsNorm { .. } => 16,
+            Self::Transposed { .. } => 17,
         }
     }
 
@@ -763,7 +864,8 @@ impl Node {
         match self {
             Self::Feature { .. } | Self::Raw { .. } | Self::Constant { .. } | Self::Param { .. } => Vec::new(),
             Self::Call { arguments, .. } => arguments.clone(),
-            Self::Gain { input, .. } => vec![*input],
+            Self::Gain { input, .. } | Self::RmsNorm { input, .. } | Self::Transposed { input, .. } => vec![*input],
+            Self::Attend { query, key, value, .. } => vec![*query, *key, *value],
             Self::Affine { terms, .. } => terms.iter().map(|(node, _)| *node).collect(),
             Self::Bilinear { left, right, .. } | Self::Hadamard { left, right } | Self::Outer { left, right } => {
                 vec![*left, *right]
@@ -780,7 +882,7 @@ impl Node {
     /// The operators this node reads.
     pub fn operators(&self) -> Vec<usize> {
         match self {
-            Self::Constant { operator } => vec![*operator],
+            Self::Constant { operator } | Self::Transposed { operator, .. } => vec![*operator],
             Self::Affine { terms, bias } => terms.iter().map(|(_, op)| *op).chain(bias.iter().copied()).collect(),
             _ => Vec::new(),
         }
@@ -844,9 +946,49 @@ pub enum SlotValues {
 pub struct FamilyInputs {
     pub rows: usize,
     pub slots: Vec<SlotValues>,
+    /// For a per-position family: each row's sequence and position. Attention reads the rows of the
+    /// same sequence.
+    pub layout: Option<SequenceLayout>,
+}
+
+/// Each row's sequence and position within it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SequenceLayout {
+    pub sequence: Vec<u32>,
+    pub position: Vec<u32>,
 }
 
 impl FamilyInputs {
+    /// This family followed by `other`'s rows (the same slots, and a layout in both or neither).
+    pub fn append(&self, other: &FamilyInputs) -> Result<FamilyInputs, ProgramError> {
+        if self.slots.len() != other.slots.len() || self.layout.is_some() != other.layout.is_some() {
+            return Err(ProgramError::Input("appended families differ in slots or layout".to_string()));
+        }
+        let slots = self
+            .slots
+            .iter()
+            .zip(&other.slots)
+            .map(|pair| match pair {
+                (SlotValues::Tokens(a), SlotValues::Tokens(b)) => Ok(SlotValues::Tokens(a.iter().chain(b).copied().collect())),
+                (SlotValues::Raw(a), SlotValues::Raw(b)) => ndarray::concatenate(Axis(0), &[a.view(), b.view()])
+                    .map(SlotValues::Raw)
+                    .map_err(|e| ProgramError::Input(e.to_string())),
+                _ => Err(ProgramError::Input("appended slots differ in kind".to_string())),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let layout = match (&self.layout, &other.layout) {
+            (Some(a), Some(b)) => {
+                let offset = a.sequence.iter().copied().max().map_or(0, |m| m + 1);
+                Some(SequenceLayout {
+                    sequence: a.sequence.iter().copied().chain(b.sequence.iter().map(|s| s + offset)).collect(),
+                    position: a.position.iter().chain(&b.position).copied().collect(),
+                })
+            }
+            _ => None,
+        };
+        Ok(FamilyInputs { rows: self.rows + other.rows, slots, layout })
+    }
+
     /// The inputs at `indices`, in that order.
     pub fn select(&self, indices: &[usize]) -> Self {
         Self {
@@ -859,6 +1001,10 @@ impl FamilyInputs {
                     SlotValues::Raw(rows) => SlotValues::Raw(rows.select(Axis(0), indices)),
                 })
                 .collect(),
+            layout: self.layout.as_ref().map(|layout| SequenceLayout {
+                sequence: indices.iter().map(|&i| layout.sequence[i]).collect(),
+                position: indices.iter().map(|&i| layout.position[i]).collect(),
+            }),
         }
     }
 }
@@ -883,6 +1029,49 @@ impl Trace {
 }
 
 /// Node values split at `from`: earlier nodes from `base`, later ones from `top`.
+fn value_of<'a>(values: &Layered<'a>, node: usize) -> &'a Array2<f64> {
+    values.get(node)
+}
+
+/// `x / √(mean(x²) + ε)` per row with its radius: the input radius `r` moves the mean of squares by
+/// at most `δ = (2/n) Σ|x_j| r_j + (1/n) Σ r_j²` and the scale `s = (m + ε)^{-1/2}` by at most
+/// `s³ δ/2 ·(1 − δ s²)^{-3/2}` (refused to `+∞` when `δ s² ≥ 1/2`); the computation rounds the mean
+/// (`γ_{n+1}`), the addition, the root and the division (`4u` on `s`, relative) and the product.
+fn rms_norm(x: &Array2<f64>, bands: Option<&Array2<f64>>, epsilon: f64) -> (Array2<f64>, Option<Array2<f64>>) {
+    let (rows, width) = x.dim();
+    let mut out = Array2::<f64>::zeros((rows, width));
+    let mut radius = bands.map(|_| Array2::<f64>::zeros((rows, width)));
+    for row in 0..rows {
+        let xr = x.row(row);
+        let mean = xr.iter().map(|v| v * v).sum::<f64>() / width as f64;
+        let scale = 1.0 / (mean + epsilon).sqrt();
+        for c in 0..width {
+            out[[row, c]] = xr[c] * scale;
+        }
+        if let (Some(radius), Some(bands)) = (radius.as_mut(), bands) {
+            let rr = bands.row(row);
+            let delta = (2.0 * xr.iter().zip(rr.iter()).map(|(v, r)| v.abs() * r).sum::<f64>()
+                + rr.iter().map(|r| r * r).sum::<f64>())
+                / width as f64;
+            let rounding = accumulation_growth(width + 1) * mean + UNIT_ROUNDOFF * (mean + epsilon);
+            let d = delta + rounding;
+            let shrink = d * scale * scale;
+            let scale_error = if shrink < 0.5 {
+                scale.powi(3) * d / 2.0 * (1.0 - shrink).powf(-1.5) + 4.0 * UNIT_ROUNDOFF * scale
+            } else {
+                f64::INFINITY
+            };
+            for c in 0..width {
+                radius[[row, c]] = inflate(
+                    rr[c] * (scale + scale_error) + xr[c].abs() * scale_error + UNIT_ROUNDOFF * (xr[c] * scale).abs(),
+                    4,
+                );
+            }
+        }
+    }
+    (out, radius)
+}
+
 /// The arguments of the rule body being executed (none at the top level) and the parameter values.
 struct Frame<'a> {
     args: &'a [(Array2<f64>, Option<Array2<f64>>)],
@@ -935,6 +1124,23 @@ impl Change {
             Self::Columns { cols, values } => (cols.clone(), values - &base.select(Axis(1), cols)),
         }
     }
+}
+
+/// The column of the single `1` in each row of `x`, when every row is an exact indicator.
+fn one_hot_columns(x: &Array2<f64>) -> Option<Vec<usize>> {
+    let mut columns = Vec::with_capacity(x.nrows());
+    for row in x.outer_iter() {
+        let mut found = None;
+        for (c, v) in row.iter().enumerate() {
+            if *v == 1.0 && found.is_none() {
+                found = Some(c);
+            } else if *v != 0.0 {
+                return None;
+            }
+        }
+        columns.push(found?);
+    }
+    Some(columns)
 }
 
 /// `x / (1 − γ_{k+2})`, bounded by `x (1 + 2γ_{k+2})`: the outward inflation of a computed
@@ -1176,6 +1382,112 @@ impl OperatorProgram {
         Ok(self.evaluate_node(index, &self.nodes[index], inputs, &values, None, interfaces, &frame)?.0)
     }
 
+    /// Causal (or full) attention over each row's sequence, with its radius: the score, softmax and
+    /// read are the [`Node::Bilinear`], [`Node::Softmax`] and [`Node::Mix`] rules applied per row
+    /// over its sequence's rows, after the rotation (orthogonal per plane, with libm's one ulp).
+    fn attend(
+        &self,
+        inputs: &FamilyInputs,
+        (query, key, value): (&Array2<f64>, &Array2<f64>, &Array2<f64>),
+        bands: Option<(&Array2<f64>, &Array2<f64>, &Array2<f64>)>,
+        scale: Scale,
+        rotary: Option<Rotary>,
+        causal: bool,
+    ) -> Result<(Array2<f64>, Option<Array2<f64>>), ProgramError> {
+        let layout = inputs
+            .layout
+            .as_ref()
+            .ok_or_else(|| ProgramError::Input("an attend node needs a sequence layout".to_string()))?;
+        let rows = inputs.rows;
+        let mut by_sequence: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+        for row in 0..rows {
+            by_sequence.entry(layout.sequence[row]).or_default().push(row);
+        }
+        let (mut q, mut k) = (query.clone(), key.clone());
+        let (mut rq, mut rk) = match bands {
+            Some((bq, bk, _)) => (Some(bq.clone()), Some(bk.clone())),
+            None => (None, None),
+        };
+        if let Some(rotary) = rotary {
+            for row in 0..rows {
+                let position = layout.position[row];
+                let mut qrow = q.row(row).to_vec();
+                let mut krow = k.row(row).to_vec();
+                let mut rqrow = rq.as_ref().map(|b| b.row(row).to_vec());
+                let mut rkrow = rk.as_ref().map(|b| b.row(row).to_vec());
+                rotary.rotate(&mut qrow, rqrow.as_deref_mut(), position);
+                rotary.rotate(&mut krow, rkrow.as_deref_mut(), position);
+                q.row_mut(row).assign(&ndarray::ArrayView1::from(&qrow));
+                k.row_mut(row).assign(&ndarray::ArrayView1::from(&krow));
+                if let (Some(b), Some(r)) = (rq.as_mut(), rqrow) {
+                    b.row_mut(row).assign(&ndarray::ArrayView1::from(&r));
+                }
+                if let (Some(b), Some(r)) = (rk.as_mut(), rkrow) {
+                    b.row_mut(row).assign(&ndarray::ArrayView1::from(&r));
+                }
+            }
+        }
+        let c = scale.value();
+        let width = value.ncols();
+        let dims = q.ncols();
+        let mut out = Array2::<f64>::zeros((rows, width));
+        let mut radius = bands.map(|_| Array2::<f64>::zeros((rows, width)));
+        let u = UNIT_ROUNDOFF;
+        for members in by_sequence.values() {
+            for &row in members {
+                let keys: Vec<usize> = members
+                    .iter()
+                    .copied()
+                    .filter(|&other| !causal || layout.position[other] <= layout.position[row])
+                    .collect();
+                let scores: Vec<f64> = keys.iter().map(|&other| c * q.row(row).dot(&k.row(other))).collect();
+                let m = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let e: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
+                let total: f64 = e.iter().sum();
+                let alpha: Vec<f64> = e.iter().map(|v| v / total).collect();
+                for (j, &other) in keys.iter().enumerate() {
+                    out.row_mut(row).scaled_add(alpha[j], &value.row(other));
+                }
+                if let (Some(radius), Some((_, _, bv)), Some(rq), Some(rk)) = (radius.as_mut(), bands, rq.as_ref(), rk.as_ref()) {
+                    let growth = accumulation_growth(dims + 1);
+                    let score_radius: Vec<f64> = keys
+                        .iter()
+                        .map(|&other| {
+                            let mut total = 0.0;
+                            for i in 0..dims {
+                                let (a, b) = (q[[row, i]].abs(), k[[other, i]].abs());
+                                let (ra, rb) = (rq[[row, i]], rk[[other, i]]);
+                                total += growth * a * b + a * rb + ra * b + ra * rb;
+                            }
+                            inflate(c.abs() * total, 4 * dims)
+                        })
+                        .collect();
+                    let spread = scores.iter().map(|v| (v - m).abs()).fold(0.0, f64::max);
+                    let eta = ((2.0 * u * spread).exp()
+                        * (1.0 + 2.0 * u).powi(2)
+                        * (1.0 + accumulation_growth(keys.len().saturating_sub(1)))
+                        * (1.0 + u)
+                        - 1.0)
+                        .next_up();
+                    let big_r = score_radius.iter().copied().fold(0.0, f64::max);
+                    let factor = ((eta + (2.0 * big_r).exp_m1()) / (1.0 - eta)).next_up();
+                    let mix_growth = accumulation_growth(keys.len());
+                    for (j, &other) in keys.iter().enumerate() {
+                        let (av, ar) = (alpha[j].abs(), inflate(alpha[j] * factor, 4));
+                        for col in 0..width {
+                            let (pv, pr) = (value[[other, col]].abs(), bv[[other, col]]);
+                            radius[[row, col]] += mix_growth * av * pv + av * pr + ar * pv + ar * pr;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(radius) = radius.as_mut() {
+            inflate_all(radius, 4 * rows.max(1));
+        }
+        Ok((out, radius))
+    }
+
     /// Rule `rule`'s output on `args`.
     fn execute_rule(
         &self,
@@ -1302,6 +1614,24 @@ impl OperatorProgram {
                     arguments.iter().map(|a| (value(*a).clone(), band(*a).cloned())).collect();
                 self.execute_rule(*rule, &args, inputs, banded, frame.parameters)
             }
+            Node::Attend { query, key, value, scale, rotary, causal } => {
+                self.attend(inputs, (value_of(values, *query), value_of(values, *key), value_of(values, *value)), bands.map(|b| (b.get(*query), b.get(*key), b.get(*value))), *scale, *rotary, *causal)
+            }
+            Node::RmsNorm { input, epsilon } => Ok(rms_norm(value(*input), band(*input), *epsilon)),
+            Node::Transposed { input, operator } => {
+                let a = self.operators[*operator].matrix();
+                let x = value(*input);
+                let out = x.dot(&a);
+                let radius = band(*input).map(|r| {
+                    let growth = accumulation_growth(a.nrows());
+                    let mut lifted = x.mapv(|v| growth * v.abs());
+                    lifted += r;
+                    let mut radius = lifted.dot(&a.mapv(f64::abs));
+                    inflate_all(&mut radius, a.nrows());
+                    radius
+                });
+                Ok((out, radius))
+            }
             Node::Gain { input, coefficient } => {
                 let (c, magnitude, operations) = coefficient.evaluate(frame.parameters)?;
                 let x = value(*input);
@@ -1360,6 +1690,21 @@ impl OperatorProgram {
                             if let (Some(radius), Some(r)) = (radius.as_mut(), band(*argument)) {
                                 radius.zip_mut_with(x, |acc, xv| *acc += growth * xv.abs());
                                 *radius += r;
+                            }
+                        }
+                        OperatorBody::Dense { values: a, .. } if one_hot_columns(x).is_some() => {
+                            // Each row reads one column of `A` times an exact one: a gather, exact.
+                            let columns = one_hot_columns(x).unwrap_or_default();
+                            for (row, &column) in columns.iter().enumerate() {
+                                out.row_mut(row).scaled_add(1.0, &a.column(column));
+                            }
+                            if let (Some(radius), Some(r)) = (radius.as_mut(), band(*argument)) {
+                                if r.iter().any(|v| *v != 0.0) {
+                                    *radius += &r.dot(&a.mapv(f64::abs).t());
+                                }
+                                for (row, &column) in columns.iter().enumerate() {
+                                    radius.row_mut(row).zip_mut_with(&a.column(column), |acc, v| *acc += growth * v.abs());
+                                }
                             }
                         }
                         OperatorBody::Dense { values: a, .. } => {
@@ -1823,6 +2168,26 @@ fn interface_of(index: usize, node: &Node, out: &[Interface], scope: &Scope<'_>)
             check_coefficient(coefficient, declarations.parameters)?;
             out[*input].clone()
         }
+        Node::Attend { query, key, value, rotary, .. } => {
+            let width = out[*query].width();
+            if out[*key].width() != width || rotary.is_some_and(|r| r.dims as usize > width || r.dims % 2 == 1) {
+                return Err(ProgramError::Interface(format!("attend node {index}: query, key and rotary widths disagree")));
+            }
+            out[*value].clone()
+        }
+        Node::RmsNorm { input, epsilon } => {
+            if !(epsilon.is_finite() && *epsilon >= 0.0) {
+                return Err(ProgramError::Interface(format!("rms norm node {index}: epsilon {epsilon}")));
+            }
+            out[*input].clone()
+        }
+        Node::Transposed { input, operator } => {
+            let op = &operators[*operator];
+            if op.rows != out[*input] {
+                return Err(ProgramError::Interface(format!("transposed node {index}: operator {} rows are not its input", op.name)));
+            }
+            op.cols.clone()
+        }
         Node::Outer { left, right } => {
             let (l, r) = (&out[*left], &out[*right]);
             let groups = l
@@ -1888,7 +2253,16 @@ pub fn remap_node(node: &mut Node, nodes: &[usize], operators: &[usize], bases: 
                 *argument = nodes[*argument];
             }
         }
-        Node::Gain { input, .. } => *input = nodes[*input],
+        Node::Gain { input, .. } | Node::RmsNorm { input, .. } => *input = nodes[*input],
+        Node::Transposed { input, operator } => {
+            *input = nodes[*input];
+            *operator = operators[*operator];
+        }
+        Node::Attend { query, key, value, .. } => {
+            *query = nodes[*query];
+            *key = nodes[*key];
+            *value = nodes[*value];
+        }
         Node::Feature { basis, .. } => *basis = bases[*basis],
         Node::Raw { .. } => {}
         Node::Constant { operator } => *operator = operators[*operator],
@@ -2203,6 +2577,33 @@ fn encode_node(out: &mut BitString, node: &Node, index: usize, code: &NodeCode<'
             encode_fixed_index(out, *input, refs)?;
             encode_coefficient(out, coefficient, code.parameters)?;
         }
+        Node::Attend { query, key, value, scale, rotary, causal } => {
+            encode_fixed_index(out, *query, refs)?;
+            encode_fixed_index(out, *key, refs)?;
+            encode_fixed_index(out, *value, refs)?;
+            match scale {
+                Scale::One => out.push_bit(false),
+                Scale::InverseSqrt(n) => {
+                    out.push_bit(true);
+                    encode_prefix_integer(out, u64::from(*n))?;
+                }
+            }
+            out.push_bit(rotary.is_some());
+            if let Some(rotary) = rotary {
+                encode_prefix_integer(out, u64::from(rotary.base))?;
+                encode_prefix_integer(out, u64::from(rotary.dims))?;
+                out.push_bit(rotary.half_split);
+            }
+            out.push_bit(*causal);
+        }
+        Node::RmsNorm { input, epsilon } => {
+            encode_fixed_index(out, *input, refs)?;
+            write_lattice(out, &[*epsilon], exact_precision([*epsilon])?)?;
+        }
+        Node::Transposed { input, operator } => {
+            encode_fixed_index(out, *input, refs)?;
+            encode_fixed_index(out, *operator, ops)?;
+        }
     }
     Ok(())
 }
@@ -2276,10 +2677,37 @@ fn decode_node(reader: &mut BitReader<'_>, index: usize, code: &NodeCode<'_>, in
             let arguments = (0..count).map(|_| decode_fixed_index(reader, refs)).collect::<Result<_, _>>()?;
             Node::Call { rule, arguments }
         }
-        _ => {
+        14 => {
             let input = decode_fixed_index(reader, refs)?;
             Node::Gain { input, coefficient: decode_coefficient(reader, code.parameters, 0)? }
         }
+        15 => {
+            let query = decode_fixed_index(reader, refs)?;
+            let key = decode_fixed_index(reader, refs)?;
+            let value = decode_fixed_index(reader, refs)?;
+            let scale = if reader.read_bit()? {
+                Scale::InverseSqrt(
+                    u32::try_from(decode_prefix_integer(reader)?)
+                        .map_err(|error| ProgramError::Code(format!("scale argument: {error}")))?,
+                )
+            } else {
+                Scale::One
+            };
+            let rotary = if reader.read_bit()? {
+                let base = u32::try_from(decode_prefix_integer(reader)?).map_err(|e| ProgramError::Code(e.to_string()))?;
+                let dims = u32::try_from(decode_prefix_integer(reader)?).map_err(|e| ProgramError::Code(e.to_string()))?;
+                Some(Rotary { base, dims, half_split: reader.read_bit()? })
+            } else {
+                None
+            };
+            Node::Attend { query, key, value, scale, rotary, causal: reader.read_bit()? }
+        }
+        16 => {
+            let input = decode_fixed_index(reader, refs)?;
+            let (_, reals) = read_lattice(reader)?;
+            Node::RmsNorm { input, epsilon: *reals.first().ok_or_else(|| ProgramError::Code("an rms norm without epsilon".to_string()))? }
+        }
+        _ => Node::Transposed { input: decode_fixed_index(reader, refs)?, operator: decode_fixed_index(reader, ops)? },
     })
 }
 

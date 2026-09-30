@@ -2,7 +2,7 @@
 //!
 //! `mpd_engine_blind_2951 MODEL_DIR OUT_DIR [SCREENINGS CERTIFICATIONS]`
 //!
-//! `MODEL_DIR` holds an `export.json` and raw float64 tensors (`examples/support/export_import.rs`
+//! `MODEL_DIR` holds an `export.json` and raw float64 tensors (`gam_mpd::import`
 //! reads transformers, residual MLPs and RNNs). The contract is the export's samples at its declared
 //! readouts. No tolerance is declared: each program is chosen by its two-part code, over a ladder of
 //! observations per sample `n = 1, 10, …, 10⁶`, each search starting from the previous rung's
@@ -13,14 +13,13 @@
 //! the program's decoded message `program_n{n}.bits` (raw bytes; its length in bits is in the
 //! report).
 
-#[path = "support/export_import.rs"]
-mod export_import;
-
-use export_import::import;
-use gam_mpd::engine::{Budget, Coarsen, DeadUnits, DropBlocks, LowRank, Primitive, decompose_from};
+use gam_mpd::import::{import, import_language_model, is_language_model};
+use gam_mpd::engine::{Budget, Coarsen, DeadUnits, DropBlocks, LawSubstitution, LowRank, Primitive, decompose_from};
 use gam_mpd::operator_rewrites::{
     BilinearConstantSide, CenterLogits, ComposeAffine, DropKeyBias, FoldConstants, PlaneBasis, PushThroughMix, StackTerms,
 };
+use gam_mpd::derivatives::CurvaturePrecision;
+use gam_mpd::factors::SharedFactors;
 use gam_mpd::refit::RefitSearch;
 use gam_mpd::view::view;
 use serde_json::json;
@@ -34,7 +33,8 @@ fn main() -> Result<(), String> {
     let screenings: u64 = args.get(3).map_or(Ok(1 << 20), |v| v.parse()).map_err(|e| format!("SCREENINGS: {e}"))?;
     let certifications: u64 = args.get(4).map_or(Ok(1 << 12), |v| v.parse()).map_err(|e| format!("CERTIFICATIONS: {e}"))?;
     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
-    let imported = import(&dir)?;
+    // A language model's family is its first 4 token rows at 64 positions.
+    let imported = if is_language_model(&dir)? { import_language_model(&dir, 4, 64)? } else { import(&dir)? };
     let library: Vec<Box<dyn Primitive>> = vec![
         Box::new(FoldConstants),
         Box::new(BilinearConstantSide),
@@ -48,6 +48,9 @@ fn main() -> Result<(), String> {
         Box::new(StackTerms),
         Box::new(CenterLogits),
         Box::new(DropKeyBias),
+        Box::new(SharedFactors),
+        Box::new(LawSubstitution),
+        Box::new(CurvaturePrecision { probes: 4 }),
     ];
     let budget = Budget { screenings, certifications, refit: Some(RefitSearch { newton_steps: 8, conjugate_gradient_steps: 16 }) };
     let model = &imported.program;

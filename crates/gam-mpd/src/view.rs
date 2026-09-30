@@ -8,7 +8,7 @@
 //! used, its message length and its native sources. An operator whose provenance records no rewrite
 //! is native and unresolved: its bits are the program's unresolved share.
 
-use super::operator_program::{LabelKind, Node, Operator, OperatorBody, OperatorProgram, ProgramError};
+use super::operator_program::{FamilyInputs, Interface, LabelKind, Node, Operator, OperatorBody, OperatorProgram, ProgramError};
 use std::collections::BTreeMap;
 
 /// One operator, as a component.
@@ -28,6 +28,10 @@ pub struct ComponentView {
     pub sources: Vec<String>,
     /// No rewrite produced it: it is the native operator, possibly restricted.
     pub unresolved: bool,
+    /// A lookup table: its columns or its rows are indexed by the tokens of a domain (an embedding,
+    /// an unembedding, a token-indexed constant). Its bits are data; every other operator's are
+    /// algorithm.
+    pub data: bool,
 }
 
 /// The whole program's view.
@@ -36,6 +40,9 @@ pub struct ProgramView {
     pub bits: u64,
     pub components: Vec<ComponentView>,
     pub unresolved_bits: u64,
+    /// The bits of lookup-table components; the rest of the operators' bits are algorithm.
+    pub data_bits: u64,
+    pub algorithm_bits: u64,
 }
 
 impl ProgramView {
@@ -109,6 +116,9 @@ fn node_kind(node: &Node) -> &'static str {
         Node::Param { .. } => "param",
         Node::Call { .. } => "call",
         Node::Gain { .. } => "gain",
+        Node::Attend { .. } => "attend",
+        Node::RmsNorm { .. } => "rms_norm",
+        Node::Transposed { .. } => "transposed",
     }
 }
 
@@ -142,11 +152,19 @@ pub fn view(program: &OperatorProgram) -> Result<ProgramView, ProgramError> {
     }
     let mut components = Vec::new();
     let mut unresolved_bits = 0;
+    let (mut data_bits, mut algorithm_bits) = (0u64, 0u64);
     for (index, op) in program.operators.iter().enumerate() {
         let bits = account.operator_bits[index].0 + account.operator_bits[index].1;
         let unresolved = op.provenance.derivation.is_empty() && !op.provenance.sources.is_empty();
         if unresolved {
             unresolved_bits += bits;
+        }
+        let tokens = |side: &Interface| side.groups().iter().all(|g| g.label.kind == LabelKind::Token);
+        let data = tokens(&op.rows) || tokens(&op.cols);
+        if data {
+            data_bits += bits;
+        } else {
+            algorithm_bits += bits;
         }
         components.push(ComponentView {
             name: op.name.clone(),
@@ -158,7 +176,98 @@ pub fn view(program: &OperatorProgram) -> Result<ProgramView, ProgramError> {
             bits,
             sources: op.provenance.sources.clone(),
             unresolved,
+            data,
         });
     }
-    Ok(ProgramView { bits: account.total_bits, components, unresolved_bits })
+    Ok(ProgramView { bits: account.total_bits, components, unresolved_bits, data_bits, algorithm_bits })
+}
+
+/// A compact text rendering: one line per component with bits, sorted by bits, and the totals.
+pub fn render(view: &ProgramView) -> String {
+    let mut components: Vec<&ComponentView> = view.components.iter().filter(|c| c.bits > 0).collect();
+    components.sort_by(|a, b| b.bits.cmp(&a.bits).then_with(|| a.name.cmp(&b.name)));
+    let mut out = format!(
+        "{} bits: {} algorithm, {} data; {:.1}% unresolved\n",
+        view.bits,
+        view.algorithm_bits,
+        view.data_bits,
+        100.0 * view.unresolved_fraction()
+    );
+    for c in components {
+        out.push_str(&format!(
+            "{:>10} bits {:>8} reals  {:<24} reads [{}] writes [{}] x{} {}{}\n",
+            c.bits,
+            c.reals,
+            c.name,
+            c.reads,
+            c.writes,
+            c.uses,
+            c.laws.join("; "),
+            if c.unresolved { "  (native)" } else { "" }
+        ));
+    }
+    out
+}
+
+/// One term's exact contribution to the readout.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PathContribution {
+    pub node: usize,
+    pub term: usize,
+    pub operator: String,
+    /// The root mean square over the family's rows of the class-centred change in the output when
+    /// the term is removed.
+    pub rms: f64,
+    /// Every node from the term's node to the output is linear, so the change is exactly the
+    /// term's own contribution along its paths (the residual stream is a sum); otherwise it is the
+    /// term's removal effect through the nonlinearities downstream.
+    pub linear: bool,
+}
+
+/// Each affine term's contribution to the output: removed one at a time and propagated from its
+/// node with the executor, reading everything upstream from one trace.
+pub fn path_contributions(program: &OperatorProgram, inputs: &FamilyInputs) -> Result<Vec<PathContribution>, ProgramError> {
+    let trace = program.execute(inputs, false)?;
+    let base = &trace.values[program.output];
+    let mut linear_downstream = vec![true; program.nodes.len()];
+    for index in (0..program.nodes.len()).rev() {
+        linear_downstream[index] = program
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.arguments().contains(&index))
+            .all(|(r, n)| {
+                linear_downstream[r]
+                    && matches!(n, Node::Affine { .. } | Node::Readout { .. } | Node::Concat { .. } | Node::Transposed { .. })
+            });
+    }
+    let mut out = Vec::new();
+    for (index, node) in program.nodes.iter().enumerate() {
+        let Node::Affine { terms, .. } = node else { continue };
+        if terms.len() < 2 {
+            continue;
+        }
+        for (term, (_, operator)) in terms.iter().enumerate() {
+            let mut edited = program.clone();
+            if let Node::Affine { terms: edited_terms, .. } = &mut edited.nodes[index] {
+                edited_terms.remove(term);
+            }
+            let changed = edited.execute_suffix(inputs, &trace, index)?;
+            let Some(last) = changed.last() else { continue };
+            let difference = base - last;
+            let mut total = 0.0;
+            for row in difference.outer_iter() {
+                let mean = row.mean().unwrap_or(0.0);
+                total += row.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / row.len() as f64;
+            }
+            out.push(PathContribution {
+                node: index,
+                term,
+                operator: program.operators[*operator].name.clone(),
+                rms: (total / difference.nrows().max(1) as f64).sqrt(),
+                linear: linear_downstream[index],
+            });
+        }
+    }
+    Ok(out)
 }

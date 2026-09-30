@@ -24,7 +24,9 @@
 
 use super::engine::EngineError;
 use super::operator_program::{FamilyInputs, Node, Operator, OperatorBody, OperatorProgram, Provenance};
-use ndarray::{Array2, Axis, s};
+use gam_linalg::roundoff::accumulation_growth;
+use gam_linalg::utils::solve_spd_pcg_bounded_into;
+use ndarray::{Array1, Array2, Axis, s};
 
 /// How hard [`refit_readout`] searches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,12 +53,6 @@ fn objective(logits: &Array2<f64>, target: &Array2<f64>) -> (f64, Array2<f64>) {
 struct Parameters {
     masks: Vec<Array2<f64>>,
     values: Vec<Array2<f64>>,
-}
-
-impl Parameters {
-    fn dot(&self, a: &[Array2<f64>], b: &[Array2<f64>]) -> f64 {
-        a.iter().zip(b).zip(&self.masks).map(|((x, y), m)| (x * y * m).sum()).sum()
-    }
 }
 
 /// Refit the present reals of `operators` (terms or the bias of the affine node the readout reads)
@@ -148,32 +144,28 @@ pub fn refit_readout(
             let wy = w.dot(&phi);
             xs.iter().zip(&parameters.masks).map(|(x, m)| wy.t().dot(x) * m).collect()
         };
-        // Conjugate gradients on H d = −g.
-        let mut d: Vec<Array2<f64>> = gradient.iter().map(|g| Array2::zeros(g.dim())).collect();
-        let mut r: Vec<Array2<f64>> = gradient.iter().map(|g| -g).collect();
-        let mut p = r.clone();
-        let mut rr = parameters.dot(&r, &r);
-        if rr == 0.0 {
+        // The Newton direction solves H d = −g by the linear-algebra owner's preconditioned
+        // conjugate gradients on the packed present reals (H is positive semidefinite: the exact
+        // Hessian of a log-sum-exp of a linear map). Its tolerance is the packing's accumulation
+        // band; the iteration count is a search setting, and a truncated iterate is still a descent
+        // direction.
+        let rhs = pack(&parameters.masks, &gradient.iter().map(|g| -g).collect::<Vec<_>>());
+        if rhs.iter().all(|v| *v == 0.0) {
             break;
         }
-        for _ in 0..search.conjugate_gradient_steps {
-            let hp = hessian_times(&p);
-            let curvature = parameters.dot(&p, &hp);
-            if curvature <= 0.0 {
-                break;
-            }
-            let alpha = rr / curvature;
-            for k in 0..d.len() {
-                d[k].scaled_add(alpha, &p[k]);
-                r[k].scaled_add(-alpha, &hp[k]);
-            }
-            let next = parameters.dot(&r, &r);
-            let beta = next / rr;
-            rr = next;
-            for k in 0..p.len() {
-                p[k] = &r[k] + &(&p[k] * beta);
-            }
-        }
+        let shapes: Vec<(usize, usize)> = parameters.masks.iter().map(|m| m.dim()).collect();
+        let apply = |x: &Array1<f64>, out: &mut Array1<f64>| {
+            let direction = unpack(&parameters.masks, &shapes, x);
+            out.assign(&pack(&parameters.masks, &hessian_times(&direction)));
+        };
+        let unit = Array1::<f64>::ones(rhs.len());
+        let tolerance = accumulation_growth(rhs.len());
+        let Some((solution, _, _)) =
+            solve_spd_pcg_bounded_into(apply, &rhs, &unit, tolerance, search.conjugate_gradient_steps)
+        else {
+            break;
+        };
+        let d = unpack(&parameters.masks, &shapes, &solution);
         let mut step = 1.0;
         let mut improved = false;
         while step > f64::EPSILON {
@@ -205,6 +197,37 @@ pub fn refit_readout(
         )?;
     }
     Ok(refit)
+}
+
+/// The present entries of `values` (masked by `masks`), in order.
+fn pack(masks: &[Array2<f64>], values: &[Array2<f64>]) -> Array1<f64> {
+    let mut out = Vec::new();
+    for (mask, value) in masks.iter().zip(values) {
+        for (m, v) in mask.iter().zip(value.iter()) {
+            if *m != 0.0 {
+                out.push(*v);
+            }
+        }
+    }
+    Array1::from(out)
+}
+
+/// The inverse of [`pack`]: absent entries are zero.
+fn unpack(masks: &[Array2<f64>], shapes: &[(usize, usize)], packed: &Array1<f64>) -> Vec<Array2<f64>> {
+    let mut next = packed.iter();
+    masks
+        .iter()
+        .zip(shapes)
+        .map(|(mask, shape)| {
+            let mut out = Array2::<f64>::zeros(*shape);
+            for (o, m) in out.iter_mut().zip(mask.iter()) {
+                if *m != 0.0 {
+                    *o = next.next().copied().unwrap_or(0.0);
+                }
+            }
+            out
+        })
+        .collect()
 }
 
 fn slot_output(slots: &[(usize, Option<usize>)], values: &[Array2<f64>], trace: &[Array2<f64>]) -> Array2<f64> {

@@ -28,7 +28,8 @@
 
 use gam_mpd::contract::{Contract, FamilyKind};
 use gam_mpd::engine::{
-    Budget, Coarsen, DeadUnits, DropBlocks, Edit, EngineError, Exactness, LowRank, Primitive, Proposal, SearchContext,
+    Budget, Coarsen, DeadUnits, DropBlocks, Edit, EngineError, Exactness, LawSubstitution, LowRank, Primitive, Proposal,
+    SearchContext,
     decompose_from,
 };
 use gam_mpd::fit::ProposalKind;
@@ -36,6 +37,8 @@ use gam_mpd::operator_program::{
     Basis, Declarations, Domain, FamilyInputs, Interface, LabelKind, Law, Node, Operator,
     OperatorProgram, Provenance, Scale, Slot, SlotValues, exact_precision,
 };
+use gam_mpd::derivatives::CurvaturePrecision;
+use gam_mpd::factors::SharedFactors;
 use gam_mpd::refit::RefitSearch;
 use gam_mpd::view::view;
 use gam_mpd::operator_rewrites::{
@@ -189,6 +192,7 @@ fn native(
     };
     let pairs: Vec<(u32, u32)> = (0..p as u32).flat_map(|a| (0..p as u32).map(move |b| (a, b))).collect();
     let family = FamilyInputs {
+        layout: None,
         rows: pairs.len(),
         slots: vec![
             SlotValues::Tokens(pairs.iter().map(|q| q.0).collect()),
@@ -281,6 +285,55 @@ impl Primitive for DeclaredCharacters {
     }
 }
 
+/// The analyst's check, never an input to the search: for every operator reading or writing the
+/// token or class domain (a table indexed by tokens), the frequencies `k` of the token order
+/// `x → x + 1` carrying the most power over the first `p` tokens, with their shares of the table's
+/// non-constant power. Computed on the program the search returned.
+fn frequencies(program: &OperatorProgram, p: usize) -> serde_json::Value {
+    let mut tables = Vec::new();
+    for op in &program.operators {
+        let tokens = |side: &Interface| side.groups().iter().all(|g| g.label.kind == LabelKind::Token);
+        let table = if tokens(&op.cols) && op.cols.width() >= p {
+            op.matrix().t().to_owned()
+        } else if tokens(&op.rows) && op.rows.width() >= p {
+            op.matrix()
+        } else {
+            continue;
+        };
+        let planes = (p - 1) / 2;
+        let mut power = vec![0.0_f64; planes];
+        for column in table.columns() {
+            for (k, slot) in power.iter_mut().enumerate() {
+                let (mut c, mut s) = (0.0, 0.0);
+                for x in 0..p {
+                    let angle = std::f64::consts::TAU * (((k + 1) * x) % p) as f64 / p as f64;
+                    c += column[x] * angle.cos();
+                    s += column[x] * angle.sin();
+                }
+                *slot += c * c + s * s;
+            }
+        }
+        let total: f64 = power.iter().sum();
+        if total == 0.0 {
+            continue;
+        }
+        let mut ranked: Vec<(usize, f64)> = power.iter().enumerate().map(|(k, v)| (k + 1, v / total)).collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let mut cumulative = 0.0;
+        let top: Vec<serde_json::Value> = ranked
+            .iter()
+            .take_while(|(_, share)| {
+                let keep = cumulative < 0.95;
+                cumulative += share;
+                keep
+            })
+            .map(|(k, share)| json!({"k": k, "share": share}))
+            .collect();
+        tables.push(json!({"operator": op.name, "reals": op.real_count(), "top_frequencies_to_95pct": top}));
+    }
+    json!(tables)
+}
+
 /// The empty program: the model's mean logits over the family, the same on every input.
 fn empty_program(model: &OperatorProgram, contract: &Contract) -> Result<OperatorProgram, String> {
     let logits = contract.logits(model).map_err(|e| e.to_string())?.values;
@@ -342,6 +395,9 @@ fn main() -> Result<(), String> {
         Box::new(StackTerms),
         Box::new(CenterLogits),
         Box::new(DropKeyBias),
+        Box::new(SharedFactors),
+        Box::new(LawSubstitution),
+        Box::new(CurvaturePrecision { probes: 4 }),
     ];
     if declared {
         library.push(Box::new(DeclaredCharacters));
@@ -374,6 +430,7 @@ fn main() -> Result<(), String> {
             "argmax_disagreements": evaluation.argmax_disagreements,
             "argmax_uncertified": evaluation.argmax_uncertified,
             "structure": describe(&result.program, config.p),
+            "frequencies": frequencies(&result.program, config.p),
             "stop": format!("{:?}", result.stop),
             "seconds": started.elapsed().as_secs_f64(),
         }));
@@ -393,6 +450,7 @@ fn main() -> Result<(), String> {
         "export": record,
         "mode": if declared { "declared" } else { "recovered" },
         "native_reals": model.real_count(),
+        "native_frequencies": frequencies(&model, config.p),
         "endpoints": endpoints,
         "frontier": frontier,
     });

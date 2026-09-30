@@ -22,10 +22,10 @@
 //! domain, each once; otherwise it is a sample, with its population bounds stated at the conventional
 //! 0.95 confidence (a reporting level: nothing is selected by it).
 
-use gam_mpd::contract::{Contract, FamilyKind};
-use gam_mpd::operator_program::{
+use crate::contract::{Contract, FamilyKind};
+use crate::operator_program::{
     Basis, Declarations, Domain, FamilyInputs, Interface, LabelKind, Law, Node, Operator, OperatorProgram, Provenance,
-    Scale, Slot, SlotValues, exact_precision,
+    Rotary, Scale, SequenceLayout, Slot, SlotValues, exact_precision,
 };
 use ndarray::{Array2, Axis, s};
 use serde_json::Value;
@@ -117,10 +117,20 @@ fn interface(count: usize, width: usize, kind: LabelKind) -> Result<Interface, S
     Interface::uniform(count, width, kind, 0).map_err(|e| e.to_string())
 }
 
+/// Whether the export in `dir` is a rotary language model (its config names `rope_theta`).
+pub fn is_language_model(dir: &Path) -> Result<bool, String> {
+    let text = std::fs::read_to_string(dir.join("export.json")).map_err(|e| e.to_string())?;
+    let record: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    Ok(record["config"].get("rope_theta").is_some())
+}
+
 /// The export in `dir` as a program and contract.
 pub fn import(dir: &Path) -> Result<Imported, String> {
     let text = std::fs::read_to_string(dir.join("export.json")).map_err(|e| e.to_string())?;
     let record: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    if record["config"].get("rope_theta").is_some() {
+        return Err("a rotary language model export: use import_language_model".to_string());
+    }
     let kind = record["kind"].as_str().ok_or("export.json: kind")?.to_string();
     let name = record["model"].as_str().unwrap_or("model").to_string();
     let (sample_rows, sample_cols) = shape_of(&record["samples"]["shape"])?;
@@ -132,7 +142,7 @@ pub fn import(dir: &Path) -> Result<Imported, String> {
         "rnn" => rnn(&tensors, &record, &samples)?,
         other => return Err(format!("unsupported kind {other}")),
     };
-    let family = FamilyInputs { rows: sample_rows, slots };
+    let family = FamilyInputs { rows: sample_rows, slots, layout: None };
     let kind_of = if complete {
         FamilyKind::Complete { description: format!("every input of {name}'s domain") }
     } else {
@@ -410,4 +420,168 @@ fn rnn(tensors: &Tensors<'_>, record: &Value, samples: &Array2<f64>) -> Result<B
     };
     let slots = (0..steps).map(|t| SlotValues::Raw(samples.slice(s![.., t..t + 1]).to_owned())).collect();
     Ok(((program, 1), slots, false, Some(vec![(0..steps).collect()])))
+}
+
+/// A pre-norm rotary language model export (`config`: d_model, n_layers, n_heads, n_kv_heads,
+/// head_dim, d_mlp, vocab, rope_theta, rope_pairing, norm_eps, mlp_act, tied_embeddings; tensors
+/// `wte`, `blocks.{l}.attn.{q,k,v,o}_proj`, `blocks.{l}.mlp.{c_fc,down_proj}`, `blocks.{l}.rms{1,2}.gain`,
+/// `final_norm.gain`, and the token rows `tokens`) as a per-position program over the first
+/// `sequences` token rows at positions `0..context`: every row runs one shared local program, and
+/// attention reads the rows of its own sequence up to its position. The readout at each row is the
+/// next-token distribution. Each sequence is one unit of a sampled family.
+pub fn import_language_model(dir: &Path, sequences: usize, context: usize) -> Result<Imported, String> {
+    let text = std::fs::read_to_string(dir.join("export.json")).map_err(|e| e.to_string())?;
+    let record: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let tensors = Tensors { dir, record: &record };
+    let (layers, heads, kv_heads, hd, d, vocab) = (
+        config(&record, "n_layers")?,
+        config(&record, "n_heads")?,
+        config(&record, "n_kv_heads")?,
+        config(&record, "head_dim")?,
+        config(&record, "d_model")?,
+        config(&record, "vocab")?,
+    );
+    let theta = record["config"]["rope_theta"].as_f64().ok_or("config.rope_theta")?;
+    let epsilon = record["config"]["norm_eps"].as_f64().ok_or("config.norm_eps")?;
+    let half_split = record["config"]["rope_pairing"].as_str() == Some("rotate_half");
+    let act = match record["config"]["mlp_act"].as_str() {
+        Some("gelu_tanh") => Law::GeluTanh,
+        Some("gelu") => Law::Gelu,
+        Some("silu") => Law::Silu,
+        Some("relu") => Law::Relu,
+        other => return Err(format!("unsupported mlp activation {other:?}")),
+    };
+    if theta.fract() != 0.0 || theta <= 0.0 || theta > f64::from(u32::MAX) {
+        return Err(format!("rope_theta {theta} is not a positive integer"));
+    }
+    let rotary = Rotary { base: theta as u32, dims: hd as u32, half_split };
+    // The residual stream is in coordinate groups, so a norm gain is a diagonal of present blocks.
+    let model = interface(d, 1, LabelKind::Unit)?;
+    let head = Interface::native(hd).map_err(|e| e.to_string())?;
+    let tokens_interface = interface(vocab, 1, LabelKind::Token)?;
+    let coordinates = model.clone();
+    let mut b = Builder { operators: Vec::new(), nodes: Vec::new() };
+    b.operators.push(Operator::identity("I", model.clone()));
+    let identity = 0;
+    let embedding = b.operator("wte", &model, &tokens_interface, tensors.get("wte")?.t().to_owned())?;
+    // A norm gain is a diagonal operator: one present block per coordinate, d reals.
+    let gain = |b: &mut Builder, name: &str| -> Result<usize, String> {
+        let g = tensors.get(name)?;
+        let mut values = Array2::<f64>::zeros((d, d));
+        let mut present = Array2::from_elem((d, d), false);
+        for i in 0..d {
+            values[[i, i]] = g[[0, i]];
+            present[[i, i]] = true;
+        }
+        let precision = exact_precision(g.iter().copied()).map_err(|e| e.to_string())?;
+        let op = Operator::blocks(name, coordinates.clone(), coordinates.clone(), values, present, precision, Provenance::native(name))
+            .map_err(|e| e.to_string())?;
+        b.operators.push(op);
+        Ok(b.operators.len() - 1)
+    };
+    let feature = b.node(Node::Feature { slot: 0, basis: 0 });
+    let embedded = b.node(Node::Affine { terms: vec![(feature, embedding)], bias: None });
+    let mut x = embedded;
+    for l in 0..layers {
+        let prefix = format!("blocks.{l}.");
+        let g1 = gain(&mut b, &format!("{prefix}rms1.gain"))?;
+        let normed = b.node(Node::RmsNorm { input: x, epsilon });
+        let h = b.node(Node::Affine { terms: vec![(normed, g1)], bias: None });
+        let (wq, wk, wv, wo) = (
+            tensors.get(&format!("{prefix}attn.q_proj"))?,
+            tensors.get(&format!("{prefix}attn.k_proj"))?,
+            tensors.get(&format!("{prefix}attn.v_proj"))?,
+            tensors.get(&format!("{prefix}attn.o_proj"))?,
+        );
+        let group = heads / kv_heads.max(1);
+        let mut keys = Vec::new();
+        for g in 0..kv_heads {
+            let rows = s![g * hd..(g + 1) * hd, ..];
+            let k_op = b.operator(&format!("{prefix}k{g}"), &head, &model, wk.slice(rows).to_owned())?;
+            let v_op = b.operator(&format!("{prefix}v{g}"), &head, &model, wv.slice(rows).to_owned())?;
+            let k = b.node(Node::Affine { terms: vec![(h, k_op)], bias: None });
+            let v = b.node(Node::Affine { terms: vec![(h, v_op)], bias: None });
+            keys.push((k, v));
+        }
+        let mut terms = vec![(x, identity)];
+        for hh in 0..heads {
+            let rows = s![hh * hd..(hh + 1) * hd, ..];
+            let q_op = b.operator(&format!("{prefix}q{hh}"), &head, &model, wq.slice(rows).to_owned())?;
+            let o_op = b.operator(&format!("{prefix}o{hh}"), &model, &head, wo.slice(s![.., hh * hd..(hh + 1) * hd]).to_owned())?;
+            let q = b.node(Node::Affine { terms: vec![(h, q_op)], bias: None });
+            let (k, v) = keys[hh / group.max(1)];
+            let read = b.node(Node::Attend {
+                query: q,
+                key: k,
+                value: v,
+                scale: Scale::InverseSqrt(hd as u32),
+                rotary: Some(rotary),
+                causal: true,
+            });
+            terms.push((read, o_op));
+        }
+        x = b.node(Node::Affine { terms, bias: None });
+        let g2 = gain(&mut b, &format!("{prefix}rms2.gain"))?;
+        let normed = b.node(Node::RmsNorm { input: x, epsilon });
+        let h2 = b.node(Node::Affine { terms: vec![(normed, g2)], bias: None });
+        let c_fc = tensors.get(&format!("{prefix}mlp.c_fc"))?;
+        let hidden = c_fc.nrows();
+        let neurons = interface(hidden, 1, LabelKind::Unit)?;
+        let up = b.operator(&format!("{prefix}c_fc"), &neurons, &model, c_fc)?;
+        let down = b.operator(&format!("{prefix}down_proj"), &model, &neurons, tensors.get(&format!("{prefix}mlp.down_proj"))?)?;
+        let pre = b.node(Node::Affine { terms: vec![(h2, up)], bias: None });
+        let active = b.node(Node::Pointwise { input: pre, laws: vec![act; hidden] });
+        x = b.node(Node::Affine { terms: vec![(x, identity), (active, down)], bias: None });
+    }
+    let gf = gain(&mut b, "final_norm.gain")?;
+    let normed = b.node(Node::RmsNorm { input: x, epsilon });
+    let h = b.node(Node::Affine { terms: vec![(normed, gf)], bias: None });
+    let logits = b.node(Node::Transposed { input: h, operator: embedding });
+    let output = b.node(Node::Readout { input: logits, basis: 0 });
+    let declarations = Declarations {
+        parameters: 0,
+        domains: vec![Domain { size: vocab, cycle: None }],
+        slots: vec![Slot::Token { domain: 0 }],
+    };
+    let program = OperatorProgram {
+        rules: Vec::new(),
+        declarations: declarations.clone(),
+        bases: vec![Basis::Indicator { domain: 0 }],
+        operators: b.operators,
+        nodes: b.nodes,
+        output,
+    };
+    let (token_rows, token_cols) = shape_of(&record["files"]["tokens"]["shape"])?;
+    if sequences > token_rows || context > token_cols {
+        return Err(format!("{sequences} sequences of {context} tokens from a {token_rows}×{token_cols} table"));
+    }
+    let tokens = read_f64(&dir.join("tokens.f64"), token_rows, token_cols)?;
+    let mut ids = Vec::new();
+    let (mut sequence, mut position) = (Vec::new(), Vec::new());
+    for row in 0..sequences {
+        for pos in 0..context {
+            ids.push(tokens[[row, pos]] as u32);
+            sequence.push(row as u32);
+            position.push(pos as u32);
+        }
+    }
+    let rows = ids.len();
+    let family = FamilyInputs {
+        rows,
+        slots: vec![SlotValues::Tokens(ids)],
+        layout: Some(SequenceLayout { sequence: sequence.clone(), position }),
+    };
+    let contract = Contract {
+        declarations,
+        family,
+        kind: FamilyKind::Sample {
+            population: "held-out token rows of the export".to_string(),
+            confidence: 0.95,
+            units: sequence.iter().map(|s| *s as usize).collect(),
+        },
+        observations: 1,
+        readouts: 1,
+        readout_slots: None,
+    };
+    Ok(Imported { name: "language_model".to_string(), kind: "language_model".to_string(), program, contract, record })
 }
