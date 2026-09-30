@@ -113,9 +113,13 @@ def test_fit_has_one_native_return_and_no_sparse_variant() -> None:
     # point the facade actually returns is `sae_manifold_fit_model`
     # (gamfit/_sae_manifold.py). The contract under test -- ONE native return
     # and no sparse variant -- is unchanged.
-    assert "return rust_module().sae_manifold_fit_model(" in source
-    assert "return sparse_dictionary_fit(" not in source
-    assert "return block_sparse_dictionary_fit(" not in source
+    # The facade binds the native model and returns it: one return, of the
+    # value `sae_manifold_fit_model` produced.
+    assert "model: ManifoldSAE | Tier0SAE = rust_module().sae_manifold_fit_model(" in source
+    returns = [line.strip() for line in source.splitlines() if line.strip().startswith("return ")]
+    assert returns == ["return model"], returns
+    assert "sparse_dictionary_fit(" not in source
+    assert "block_sparse_dictionary_fit(" not in source
 
 
 def test_steer_reuses_the_resident_metric() -> None:

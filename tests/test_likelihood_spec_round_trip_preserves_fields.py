@@ -8,6 +8,8 @@ import typing
 pytest = typing.cast(typing.Any, importlib.import_module("pytest"))
 pytest.importorskip("gamfit._rust")
 
+import numpy as np
+
 import gamfit
 
 
@@ -31,6 +33,10 @@ def test_likelihood_spec_round_trip_preserves_fields() -> None:
     assert loaded_summary.formula == original_formula, (
         "Formula should be identical after a save/load round-trip"
     )
-    assert loaded_summary.to_dict() == original_dict, (
-        "Summary fields should be identical after a save/load round-trip"
+    # The summary carries arrays (the coefficient covariance), so the dicts are
+    # compared field by field, exactly.
+    np.testing.assert_equal(
+        loaded_summary.to_dict(),
+        original_dict,
+        err_msg="Summary fields should be identical after a save/load round-trip",
     )

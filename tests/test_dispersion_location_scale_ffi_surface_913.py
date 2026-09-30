@@ -75,7 +75,8 @@ def _heteroscedastic_count_rows(n: int, seed: int) -> list[dict[str, float]]:
     [
         ("negative-binomial", "negbin-location-scale"),
         ("gamma", "gamma-location-scale"),
-        ("tweedie", "tweedie-location-scale"),
+        # Tweedie needs its variance power; it is never profiled (SPEC).
+        ("tweedie(p=1.5)", "tweedie-location-scale"),
     ],
 )
 def test_dispersion_location_scale_fits_and_serializes(family, expected_tag) -> None:

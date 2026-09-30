@@ -222,9 +222,13 @@ pub(crate) fn resolve_fit_request_config(
         fit_config.ctn_stage1 = Some(stage1.into_recipe()?);
     }
     if let Some(value) = json_config.frozen_ctn {
-        let model: gam_models::inference::model::FittedModel = serde_json::from_value(value)
+        // The frozen CTN is a saved model document (`kind`, `version`, then the
+        // model; #3350), so it is decoded through the one saved-model reader,
+        // which refuses a foreign envelope by name and runs the save checks.
+        let bytes = serde_json::to_vec(&value)
             .map_err(|error| format!("invalid frozen CTN: {error}"))?;
-        model.validate_for_persistence().map_err(|error| error.to_string())?;
+        let model = gam_models::inference::model::FittedModel::from_saved_bytes(&bytes)
+            .map_err(|error| format!("invalid frozen CTN: {error}"))?;
         fit_config.frozen_ctn = Some(gam_models::inference::ctn::FrozenCtn(Box::new(model.payload().clone())));
     }
     fit_config.link = json_config.link;

@@ -140,7 +140,7 @@ def test_inverse_gaussian_refuses_a_nonpositive_response() -> None:
     x = rng.uniform(0.0, 1.0, 200)
     y = rng.wald(np.ones(200), 2.0)
     y[17] = 0.0
-    with pytest.raises(Exception, match=r"Inverse-Gaussian family requires strictly positive response values \(y > 0\)"):
+    with pytest.raises(Exception, match=r"Inverse-Gaussian family.s support, which requires strictly positive response values \(y > 0\)"):
         gamfit.fit({"x": x, "y": y}, "y ~ s(x)", family="inverse-gaussian")
 
 

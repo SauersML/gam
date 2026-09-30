@@ -143,7 +143,7 @@ def test_sample_weight_routes_through_cross_val_score_params():
 
 def test_all_zero_sample_weight_is_a_value_error_naming_the_weights():
     X, y = _regression_data()
-    with pytest.raises(ValueError, match="non-zero weight"):
+    with pytest.raises(ValueError, match="no positive weight"):
         GAMRegressor(formula=CONTRACT_FORMULA).fit(X, y, sample_weight=np.zeros(y.size))
 
 

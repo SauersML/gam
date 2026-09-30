@@ -109,7 +109,13 @@ def test_convex_fit_is_convex_on_a_grid_finer_than_any_construction_grid() -> No
             id="duchon",
         ),
         pytest.param(
-            lambda: BSpline(periodic=True, shape_constraint="monotone_increasing"),
+            # An explicit periodic grid over the data range: with inferred knots
+            # the periodic override is refused for its unresolved domain first.
+            lambda: BSpline(
+                periodic=True,
+                knots=np.linspace(0.0, 1.0, 9),
+                shape_constraint="monotone_increasing",
+            ),
             id="periodic_bspline",
         ),
     ],

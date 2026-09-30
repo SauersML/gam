@@ -27,7 +27,7 @@ def _lat_lon(n: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
 
 @pytest.mark.parametrize(
     ("kernel", "n_centers"),
-    [("sobolev", 20), ("pseudo", 20), ("pseudo", 150), ("harmonic", 6)],
+    [("sobolev", 20), ("sobolev", 150), ("harmonic", 6)],
 )
 def test_basis_size_is_the_evaluated_width(kernel: str, n_centers: int) -> None:
     spec = gamfit.smooth.Sphere(n_centers=n_centers, kernel=kernel)
