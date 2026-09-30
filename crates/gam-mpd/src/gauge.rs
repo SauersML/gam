@@ -1906,7 +1906,7 @@ mod tests {
     use crate::test_support::test_governor;
     use crate::attention::{AffineProjection, AttentionExecution, RotaryPairing};
     use crate::operators::{MaskGaugeVerdict, classify_under};
-    use crate::rewrite::NativeMlp;
+    use gam_math::gaussian_activation::gaussian_smoothing_derivatives;
     use rand::rngs::StdRng;
     use rand::seq::SliceRandom;
     use rand::{RngExt, SeedableRng};
@@ -2097,15 +2097,22 @@ mod tests {
         assert_eq!(family.real_coordinates_at_most(), r * (d_in + d_out) - (r * r - 1));
     }
 
-    fn native_mlp(units: &HiddenUnits, bias_out: &Array1<f64>) -> NativeMlp {
-        NativeMlp::new(
-            units.read_in.clone(),
-            units.bias_in.clone(),
-            units.write_out.clone(),
-            bias_out.clone(),
-            units.activation,
-        )
-        .expect("the fixture's shapes compose")
+    /// `σ(W₁ x + b₁)` for each row `x` of `inputs`, on the units' original tensors.
+    fn native_hidden(units: &HiddenUnits, inputs: &Array2<f64>) -> Array2<f64> {
+        let summed = inputs.dot(&units.read_in.t()) + &units.bias_in;
+        let mut value = [0.0];
+        summed.mapv(|point| {
+            gaussian_smoothing_derivatives(units.activation, point, 0.0, &mut value).expect("activation");
+            value[0]
+        })
+    }
+
+    /// The residual block `x + (W₂ σ(W₁ x + b₁) + b₂)` on its original tensors, the residual
+    /// added last as the source adds it.
+    fn native_mlp_block(units: &HiddenUnits, bias_out: &Array1<f64>, inputs: &Array2<f64>) -> Array2<f64> {
+        let mut written = native_hidden(units, inputs).dot(&units.write_out.t()) + bias_out;
+        written += inputs;
+        written
     }
 
     /// Entrywise first-order band of comparing the residual block
@@ -2153,8 +2160,8 @@ mod tests {
         };
         let regauged = teacher.apply(&change).expect("positive scales are in ReLU's group");
         let band = relu_gauge_band(&teacher, &bias_out, &inputs);
-        let before = native_mlp(&teacher, &bias_out).execute(inputs.view()).expect("execute");
-        let after = native_mlp(&regauged, &bias_out).execute(inputs.view()).expect("execute");
+        let before = native_mlp_block(&teacher, &bias_out, &inputs);
+        let after = native_mlp_block(&regauged, &bias_out, &inputs);
         for ((&b, &a), &limit) in before.iter().zip(after.iter()).zip(band.iter()) {
             assert!((a - b).abs() <= limit, "ReLU gauge moved an output by {:.3e}, band {limit:.3e}", (a - b).abs());
         }
@@ -2168,8 +2175,8 @@ mod tests {
             activation: GaussianActivation::ExactGelu,
             ..regauged.clone()
         };
-        let gelu_before = native_mlp(&gelu, &bias_out).execute(inputs.view()).expect("execute");
-        let gelu_after = native_mlp(&forced, &bias_out).execute(inputs.view()).expect("execute");
+        let gelu_before = native_mlp_block(&gelu, &bias_out, &inputs);
+        let gelu_after = native_mlp_block(&forced, &bias_out, &inputs);
         let moved = gelu_before
             .iter()
             .zip(gelu_after.iter())
@@ -3306,10 +3313,7 @@ mod tests {
 
     /// `W₂ M σ(W₁ x + b₁)` for each row: a fixed internal mask `M` on the hidden units.
     fn masked_hidden_write(units: &HiddenUnits, mask: &Array2<f64>, inputs: &Array2<f64>) -> Array2<f64> {
-        let native = native_mlp(units, &Array1::zeros(units.write_out.nrows()));
-        let summed = native.summed_input(inputs.view()).expect("shape");
-        let hidden = native.activate(summed.view()).expect("activation");
-        hidden.dot(&mask.t()).dot(&units.write_out.t())
+        native_hidden(units, inputs).dot(&mask.t()).dot(&units.write_out.t())
     }
 
     /// Entrywise band of comparing `W₂ M σ(W₁ x + b₁)` before and after a ReLU unit change

@@ -12,23 +12,16 @@
 //! result into the wire report without strengthening any claim. A value the owner
 //! reports as `+inf` to mean "no such quantity" (a cluster that is the whole
 //! spectrum has no separation; a refused Davis–Kahan bound has no bar) becomes an
-//! absent value with that stated meaning. A report-only quotient the owner leaves
-//! non-finite (a stage ratio) is absent too, paired with a typed reason naming the
-//! owner's case, and nothing is substituted for it. Any other non-finite value is
-//! refused instead of being written as JSON `null`.
+//! absent value with that stated meaning. Any other non-finite value is refused
+//! instead of being written as JSON `null`.
 
 use std::collections::BTreeMap;
 use std::fmt;
 
-use gam_math::gaussian_activation::GaussianActivation;
 use gam_runtime::resource::{MemoryGovernor, MemoryReservation, MemoryReservationError};
 use ndarray::{ArrayD, ArrayView1, ArrayView2, Ix1, Ix2};
 use serde::{Deserialize, Serialize};
 
-use super::receipts::{
-    ExternalExecution, MeasuredDiscrepancy, MlpBlockReceipt, MlpBlockReceiptInputs, ReceiptRefusal,
-    StageAgreement, mlp_block_receipt,
-};
 use super::secant::SecantError;
 use super::attention::AttentionProgramError;
 use super::bounds::BoundError;
@@ -151,39 +144,6 @@ pub enum MpdOperation {
         /// the orthogonal group and reports it as `orthogonality_defect`.
         tensor: String,
     },
-    /// A12: one residual MLP block's stages as an external executor ran them, compared
-    /// with its native execution (`receipts::mlp_block_receipt`). Every array field is
-    /// the id of an input array, and stage rows match `inputs`.
-    MlpBlockReceipt {
-        /// The executed model's Hugging Face `hidden_act` tag. The owner refuses an
-        /// approximate GELU and every tag it does not name.
-        hidden_act: String,
-        /// What the executor reports it ran. The owner refuses anything but binary64
-        /// with TF32 matrix multiplication off.
-        external_execution: ExternalExecutionRequest,
-        /// The read-in weight `W₁` (`hidden x width`).
-        weight: String,
-        /// The read-in bias `b₁` (`hidden`).
-        bias: String,
-        /// The edit's left factor `L` (`hidden x components`).
-        left: String,
-        /// The edit's coefficients `s` (`components`).
-        coefficients: String,
-        /// The edit's right factor `R` (`width x components`).
-        right: String,
-        /// The write-out weight `W₂` (`out x hidden`).
-        weight_out: String,
-        /// The write-out bias `b₂` (`out`).
-        bias_out: String,
-        /// The input rows `x` (`rows x width`).
-        inputs: String,
-        /// The executor's `(W₁ + L diag(s) Rᵀ) x + b₁` (`rows x hidden`).
-        external_pre_activation: String,
-        /// The executor's activations (`rows x hidden`).
-        external_activation: String,
-        /// The executor's block output `W₂ a + b₂`, without the residual (`rows x out`).
-        external_output: String,
-    },
     /// The linear sufficient state of linear readouts under linear transitions
     /// (`state::LinearStateQuotient`): the closed observable chart, or a declared one
     /// measured.
@@ -234,18 +194,6 @@ pub enum MpdOperation {
     LogitBounds(LogitBoundsRequest),
 }
 
-/// [`ExternalExecution`] on the wire.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExternalExecutionRequest {
-    /// The executed dtype's name, e.g. torch's `"float64"`.
-    pub dtype: String,
-    /// The executing device. It is recorded, not gated.
-    pub device: String,
-    /// Whether TF32 matrix multiplication was enabled.
-    pub tf32_matmul: bool,
-}
-
 impl MpdRequest {
     /// Parses and validates a request document.
     pub fn from_json(raw: &str) -> Result<Self, MpdSurfaceError> {
@@ -280,7 +228,6 @@ pub struct MpdReport {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MpdResult {
     RecoverPlaneRotations(PlaneRotationReport),
-    MlpBlockReceipt(MlpBlockReceiptReport),
     LinearStateQuotient(LinearStateQuotientReport),
     LinearClosedChart(LinearClosedChartReport),
     CodeLengths(CodeLengthsReport),
@@ -374,62 +321,6 @@ impl From<RotationAmbiguity> for RotationAmbiguityReport {
     }
 }
 
-/// [`MlpBlockReceipt`] on the wire.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct MlpBlockReceiptReport {
-    /// The executing device as the executor reported it; recorded, not gated.
-    pub device: String,
-    pub pre_activation: StageAgreementReport,
-    pub activation_measured: MeasuredDiscrepancyReport,
-    pub output: StageAgreementReport,
-    pub end_to_end_measured: MeasuredDiscrepancyReport,
-}
-
-/// [`StageAgreement`] on the wire.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct StageAgreementReport {
-    pub agrees: bool,
-    pub refutes: bool,
-    /// `[row, column]` of the entry with the largest discrepancy-to-band ratio.
-    pub witness: [usize; 2],
-    pub discrepancy: f64,
-    pub band: f64,
-    /// `discrepancy / band` at the witness, for reports only: `agrees` and `refutes`
-    /// are decided entry by entry without it.
-    pub ratio: StageRatio,
-}
-
-/// The owner's report-only stage ratio: its value, or the owner's case that leaves it
-/// without a finite value.
-///
-/// The owner keeps the largest entry ratio, starting from `-inf`, where an entry's
-/// ratio is `0` at zero discrepancy and `discrepancy / band` otherwise, with the
-/// discrepancy rounded up (positive) and the band rounded down (at least `0`, at most
-/// the largest `f64`). A stored ratio is therefore finite, `-inf` exactly when no
-/// entry was compared, or `+inf` from a division by a zero band or an overflowing
-/// quotient. These are the variants; the owner never stores a NaN, and one would be
-/// refused rather than named.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum StageRatio {
-    Finite { value: f64 },
-    /// The stage has no entries, so no ratio was taken.
-    EmptyStage,
-    /// The band rounds down to zero at a nonzero discrepancy; the stage refutes.
-    BandRoundsToZero,
-    /// A nonzero discrepancy over a positive band exceeds the largest `f64`.
-    QuotientOverflows,
-}
-
-/// [`MeasuredDiscrepancy`] on the wire.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct MeasuredDiscrepancyReport {
-    pub largest: f64,
-    /// `[row, column]` of the largest entry.
-    pub witness: [usize; 2],
-    pub native_at_witness: f64,
-}
-
 /// A report and the arrays it names.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MpdOutput {
@@ -455,7 +346,6 @@ pub enum MpdSurfaceError {
     /// An input array does not have the shape the operation reads.
     TensorShape { tensor: String, reason: String },
     PlaneRotation(PlaneRotationError),
-    Receipt(ReceiptRefusal),
     State(StateError),
     /// A code owner refused an item.
     Code(String),
@@ -499,7 +389,6 @@ impl fmt::Display for MpdSurfaceError {
                 write!(formatter, "MPD input array {tensor:?}: {reason}")
             }
             Self::PlaneRotation(error) => write!(formatter, "{error}"),
-            Self::Receipt(error) => write!(formatter, "{error}"),
             Self::State(error) => write!(formatter, "{error}"),
             Self::Memory(error) => write!(formatter, "{error}"),
             Self::Code(reason) => write!(formatter, "{reason}"),
@@ -545,45 +434,6 @@ pub fn run_parameter_decomposition(
             let recovery = recover_plane_rotations(governor, matrix(tensors, &tensor)?)
                 .map_err(MpdSurfaceError::PlaneRotation)?;
             project_plane_rotations(tensor, recovery)
-        }
-        MpdOperation::MlpBlockReceipt {
-            hidden_act,
-            external_execution,
-            weight,
-            bias,
-            left,
-            coefficients,
-            right,
-            weight_out,
-            bias_out,
-            inputs,
-            external_pre_activation,
-            external_activation,
-            external_output,
-        } => {
-            let activation = GaussianActivation::from_hidden_act(&hidden_act)
-                .map_err(|error| MpdSurfaceError::Receipt(ReceiptRefusal::Activation(error)))?;
-            let receipt = mlp_block_receipt(governor, MlpBlockReceiptInputs {
-                external_execution: ExternalExecution {
-                    dtype: &external_execution.dtype,
-                    device: &external_execution.device,
-                    tf32_matmul: external_execution.tf32_matmul,
-                },
-                activation,
-                weight: matrix(tensors, &weight)?,
-                bias: vector(tensors, &bias)?,
-                left: matrix(tensors, &left)?,
-                coefficients: vector(tensors, &coefficients)?,
-                right: matrix(tensors, &right)?,
-                weight_out: matrix(tensors, &weight_out)?,
-                bias_out: vector(tensors, &bias_out)?,
-                inputs: matrix(tensors, &inputs)?,
-                external_pre_activation: matrix(tensors, &external_pre_activation)?,
-                external_activation: matrix(tensors, &external_activation)?,
-                external_output: matrix(tensors, &external_output)?,
-            })
-            .map_err(MpdSurfaceError::Receipt)?;
-            project_mlp_block_receipt(external_execution.device, receipt)
         }
         MpdOperation::LinearStateQuotient(request) => {
             state_quotient::run(request, tensors, governor)
@@ -741,92 +591,6 @@ fn project_plane_rotations(
     })
 }
 
-fn project_mlp_block_receipt(
-    device: String,
-    receipt: MlpBlockReceipt,
-) -> Result<MpdOutput, MpdSurfaceError> {
-    let report = MlpBlockReceiptReport {
-        device,
-        pre_activation: stage_agreement_report(
-            [
-                "pre_activation.discrepancy",
-                "pre_activation.band",
-                "pre_activation.ratio",
-            ],
-            receipt.pre_activation,
-        )?,
-        activation_measured: measured_discrepancy_report(
-            [
-                "activation_measured.largest",
-                "activation_measured.native_at_witness",
-            ],
-            receipt.activation_measured,
-        )?,
-        output: stage_agreement_report(
-            ["output.discrepancy", "output.band", "output.ratio"],
-            receipt.output,
-        )?,
-        end_to_end_measured: measured_discrepancy_report(
-            [
-                "end_to_end_measured.largest",
-                "end_to_end_measured.native_at_witness",
-            ],
-            receipt.end_to_end_measured,
-        )?,
-    };
-    Ok(MpdOutput {
-        report: MpdReport {
-            schema: MPD_REPORT_SCHEMA,
-            schema_version: MPD_SCHEMA_VERSION,
-            result: MpdResult::MlpBlockReceipt(report),
-        },
-        arrays: BTreeMap::new(),
-    })
-}
-
-/// `fields` names the discrepancy, the band and the ratio for a refusal.
-fn stage_agreement_report(
-    fields: [&'static str; 3],
-    agreement: StageAgreement,
-) -> Result<StageAgreementReport, MpdSurfaceError> {
-    let ratio = if agreement.ratio.is_finite() {
-        StageRatio::Finite {
-            value: agreement.ratio,
-        }
-    } else if agreement.ratio == f64::NEG_INFINITY {
-        StageRatio::EmptyStage
-    } else if agreement.ratio == f64::INFINITY && agreement.band == 0.0 {
-        StageRatio::BandRoundsToZero
-    } else if agreement.ratio == f64::INFINITY {
-        StageRatio::QuotientOverflows
-    } else {
-        return Err(MpdSurfaceError::NonFiniteReport {
-            field: fields[2],
-            value: agreement.ratio,
-        });
-    };
-    Ok(StageAgreementReport {
-        agrees: agreement.agrees,
-        refutes: agreement.refutes,
-        witness: [agreement.witness.0, agreement.witness.1],
-        discrepancy: finite(fields[0], agreement.discrepancy)?,
-        band: finite(fields[1], agreement.band)?,
-        ratio,
-    })
-}
-
-/// `fields` names the largest entry and the native value at its witness for a refusal.
-fn measured_discrepancy_report(
-    fields: [&'static str; 2],
-    measured: MeasuredDiscrepancy,
-) -> Result<MeasuredDiscrepancyReport, MpdSurfaceError> {
-    Ok(MeasuredDiscrepancyReport {
-        largest: finite(fields[0], measured.largest)?,
-        witness: [measured.witness.0, measured.witness.1],
-        native_at_witness: finite(fields[1], measured.native_at_witness)?,
-    })
-}
-
 fn finite(field: &'static str, value: f64) -> Result<f64, MpdSurfaceError> {
     if value.is_finite() {
         Ok(value)
@@ -846,11 +610,9 @@ fn absent_when_infinite(field: &'static str, value: f64) -> Result<Option<f64>, 
 
 #[cfg(test)]
 mod tests {
-    use super::super::receipts::compare_stage;
     use super::*;
     use crate::test_support::test_governor;
-    use gam_math::gaussian_activation::GaussianActivationError;
-    use ndarray::{Array1, Array2, Axis, array};
+    use ndarray::{Array2, array};
 
     pub(super) fn request_json(operation: &str) -> String {
         format!(
@@ -1086,348 +848,5 @@ mod tests {
         assert!(absent_when_infinite("x", f64::NAN).is_err());
         assert!(finite("x", f64::INFINITY).is_err());
         assert_eq!(finite("x", -2.0).expect("finite"), -2.0);
-    }
-
-    /// A ReLU block whose entries are dyadic rationals of few bits, so every product,
-    /// sum and activation is exact in binary64 whatever the evaluation order: the
-    /// executor stages computed here equal the native execution bitwise.
-    struct DyadicBlock {
-        weight: Array2<f64>,
-        bias: Array1<f64>,
-        left: Array2<f64>,
-        coefficients: Array1<f64>,
-        right: Array2<f64>,
-        weight_out: Array2<f64>,
-        bias_out: Array1<f64>,
-        inputs: Array2<f64>,
-        pre_activation: Array2<f64>,
-        activation: Array2<f64>,
-        output: Array2<f64>,
-    }
-
-    fn dyadic_block_from(
-        weight_out: Array2<f64>,
-        bias_out: Array1<f64>,
-        inputs: Array2<f64>,
-    ) -> DyadicBlock {
-        let weight = array![[0.5, -1.0], [1.5, 0.25], [-0.75, 2.0]];
-        let bias = array![0.125, -0.25, 0.375];
-        let left = array![[1.0], [0.0], [-1.0]];
-        let coefficients = array![0.5];
-        let right = array![[0.25], [1.0]];
-        let edited = &weight + &left.dot(&Array2::from_diag(&coefficients)).dot(&right.t());
-        let pre_activation = inputs.dot(&edited.t()) + &bias;
-        let activation = pre_activation.mapv(|value| value.max(0.0));
-        let output = activation.dot(&weight_out.t()) + &bias_out;
-        DyadicBlock {
-            weight,
-            bias,
-            left,
-            coefficients,
-            right,
-            weight_out,
-            bias_out,
-            inputs,
-            pre_activation,
-            activation,
-            output,
-        }
-    }
-
-    fn dyadic_block() -> DyadicBlock {
-        dyadic_block_from(
-            array![[1.0, -0.5, 0.25], [0.0, 2.0, -1.0]],
-            array![0.0625, -0.125],
-            array![[1.0, 2.0], [-0.5, 0.75]],
-        )
-    }
-
-    fn receipt_request(hidden_act: &str, dtype: &str, tf32_matmul: bool) -> String {
-        request_json(&format!(
-            r#"{{"kind": "mlp_block_receipt", "hidden_act": "{hidden_act}", "external_execution": {{"dtype": "{dtype}", "device": "cpu", "tf32_matmul": {tf32_matmul}}}, "weight": "w1", "bias": "b1", "left": "l", "coefficients": "s", "right": "r", "weight_out": "w2", "bias_out": "b2", "inputs": "x", "external_pre_activation": "pre", "external_activation": "act", "external_output": "out"}}"#
-        ))
-    }
-
-    fn block_tensors(block: &DyadicBlock) -> BTreeMap<String, ArrayD<f64>> {
-        BTreeMap::from([
-            ("w1".to_string(), block.weight.clone().into_dyn()),
-            ("b1".to_string(), block.bias.clone().into_dyn()),
-            ("l".to_string(), block.left.clone().into_dyn()),
-            ("s".to_string(), block.coefficients.clone().into_dyn()),
-            ("r".to_string(), block.right.clone().into_dyn()),
-            ("w2".to_string(), block.weight_out.clone().into_dyn()),
-            ("b2".to_string(), block.bias_out.clone().into_dyn()),
-            ("x".to_string(), block.inputs.clone().into_dyn()),
-            ("pre".to_string(), block.pre_activation.clone().into_dyn()),
-            ("act".to_string(), block.activation.clone().into_dyn()),
-            ("out".to_string(), block.output.clone().into_dyn()),
-        ])
-    }
-
-    fn receipt_report(output: &MpdOutput) -> &MlpBlockReceiptReport {
-        let MpdResult::MlpBlockReceipt(report) = &output.report.result else {
-            panic!("expected an MLP block receipt, got {:?}", output.report.result);
-        };
-        report
-    }
-
-    fn assert_stage_projects(wire: &StageAgreementReport, owner: &StageAgreement) {
-        assert_eq!(wire.agrees, owner.agrees);
-        assert_eq!(wire.refutes, owner.refutes);
-        assert_eq!(wire.witness, [owner.witness.0, owner.witness.1]);
-        assert_eq!(wire.discrepancy, owner.discrepancy);
-        assert_eq!(wire.band, owner.band);
-        match wire.ratio {
-            StageRatio::Finite { value } => assert_eq!(value, owner.ratio),
-            reason => panic!("the owner's finite ratio {} projected as {reason:?}", owner.ratio),
-        }
-    }
-
-    fn assert_measured_projects(wire: &MeasuredDiscrepancyReport, owner: &MeasuredDiscrepancy) {
-        assert_eq!(wire.largest, owner.largest);
-        assert_eq!(wire.witness, [owner.witness.0, owner.witness.1]);
-        assert_eq!(wire.native_at_witness, owner.native_at_witness);
-    }
-
-    const STAGE_FIELDS: [&str; 3] = ["stage.discrepancy", "stage.band", "stage.ratio"];
-
-    const BINARY64_CPU: ExternalExecution<'static> = ExternalExecution {
-        dtype: "float64",
-        device: "cpu",
-        tf32_matmul: false,
-    };
-
-    #[test]
-    fn mlp_block_receipt_report_is_the_owner_result_field_for_field() {
-        let block = dyadic_block();
-        assert_eq!(
-            block.pre_activation,
-            array![[-0.25, 1.75, 2.5], [-0.5625, -0.8125, 1.9375]],
-            "the fixture's stages are exact"
-        );
-        assert_eq!(block.output, array![[-0.1875, 0.875], [0.546875, -2.0625]]);
-        let direct = mlp_block_receipt(test_governor(), MlpBlockReceiptInputs {
-            external_execution: BINARY64_CPU,
-            activation: GaussianActivation::Relu,
-            weight: block.weight.view(),
-            bias: block.bias.view(),
-            left: block.left.view(),
-            coefficients: block.coefficients.view(),
-            right: block.right.view(),
-            weight_out: block.weight_out.view(),
-            bias_out: block.bias_out.view(),
-            inputs: block.inputs.view(),
-            external_pre_activation: block.pre_activation.view(),
-            external_activation: block.activation.view(),
-            external_output: block.output.view(),
-        })
-        .expect("owner receipt");
-        let output = run_parameter_decomposition(
-            &receipt_request("relu", "float64", false),
-            &block_tensors(&block),
-        test_governor(),
-        )
-        .expect("surface run");
-        let report = receipt_report(&output);
-
-        assert_eq!(report.device, "cpu");
-        assert_stage_projects(&report.pre_activation, &direct.pre_activation);
-        assert_stage_projects(&report.output, &direct.output);
-        assert_measured_projects(&report.activation_measured, &direct.activation_measured);
-        assert_measured_projects(&report.end_to_end_measured, &direct.end_to_end_measured);
-        // Exact stages: both compared stages agree with no discrepancy, and ReLU's
-        // measured stages are exact.
-        assert!(report.pre_activation.agrees && !report.pre_activation.refutes, "{report:?}");
-        assert!(report.output.agrees && !report.output.refutes, "{report:?}");
-        assert_eq!(report.pre_activation.ratio, StageRatio::Finite { value: 0.0 });
-        assert_eq!(report.activation_measured.largest, 0.0);
-        assert_eq!(report.end_to_end_measured.largest, 0.0);
-        assert!(output.arrays.is_empty());
-
-        let json: serde_json::Value =
-            serde_json::from_str(&output.report_json().expect("report json")).expect("parse report");
-        assert_eq!(json["result"]["kind"], "mlp_block_receipt");
-        assert_eq!(json["result"]["output"]["agrees"], true);
-        assert_eq!(json["result"]["output"]["ratio"]["kind"], "finite");
-        assert_eq!(json["result"]["device"], "cpu");
-    }
-
-    #[test]
-    fn an_executed_output_outside_its_band_refutes_through_the_surface() {
-        let mut block = dyadic_block();
-        let json = receipt_request("relu", "float64", false);
-        // Positive control: the exact stages agree.
-        let agreeing = run_parameter_decomposition(&json, &block_tensors(&block), test_governor()).expect("surface run");
-        assert!(receipt_report(&agreeing).output.agrees);
-
-        block.output[[0, 0]] += 1.0;
-        let displaced = run_parameter_decomposition(&json, &block_tensors(&block), test_governor()).expect("surface run");
-        let report = receipt_report(&displaced);
-        assert!(report.output.refutes && !report.output.agrees, "{report:?}");
-        assert_eq!(report.output.witness, [0, 0]);
-        assert!(matches!(report.output.ratio, StageRatio::Finite { value } if value > 1.0));
-        assert!(report.pre_activation.agrees, "{report:?}");
-        assert_eq!(report.end_to_end_measured.largest, 1.0);
-        assert_eq!(report.end_to_end_measured.witness, [0, 0]);
-    }
-
-    #[test]
-    fn a_zero_band_ratio_is_absent_as_band_rounds_to_zero() {
-        // Every band the block receipt derives is at least the smallest subnormal
-        // (`evaluation_band` rounds up), so a zero band is driven through the owner's
-        // `compare_stage` with zero bands supplied.
-        let native = array![[0.0, 0.0]];
-        let zero_band = Array2::<f64>::zeros((1, 2));
-        // Positive control: equal stages keep a finite ratio of 0.
-        let equal = compare_stage(BINARY64_CPU, native.view(), native.view(), zero_band.view(), zero_band.view())
-            .expect("owner comparison");
-        let wire = stage_agreement_report(STAGE_FIELDS, equal).expect("projection");
-        assert_eq!(wire.ratio, StageRatio::Finite { value: 0.0 });
-
-        let external = array![[1.0, 0.0]];
-        let agreement = compare_stage(BINARY64_CPU, external.view(), native.view(), zero_band.view(), zero_band.view())
-            .expect("owner comparison");
-        assert_eq!((agreement.ratio, agreement.band), (f64::INFINITY, 0.0));
-        let wire = stage_agreement_report(STAGE_FIELDS, agreement).expect("projection");
-        assert_eq!(wire.ratio, StageRatio::BandRoundsToZero);
-        assert!(wire.refutes && !wire.agrees);
-        assert_eq!((wire.witness, wire.band), ([0, 0], 0.0));
-        let json = serde_json::to_value(&wire).expect("serialize stage");
-        assert_eq!(json["ratio"]["kind"], "band_rounds_to_zero");
-        assert!(json["ratio"]["value"].is_null());
-    }
-
-    #[test]
-    fn an_overflowing_ratio_is_absent_as_quotient_overflows_through_the_surface() {
-        // A zero write-out gives the output stage the smallest positive band, so one
-        // executed output entry 1 away from the native 0 divides past the largest f64.
-        let zero_write = dyadic_block_from(
-            Array2::zeros((2, 3)),
-            Array1::zeros(2),
-            array![[1.0, 2.0], [-0.5, 0.75]],
-        );
-        let json = receipt_request("relu", "float64", false);
-        // Positive control: the undisplaced stages keep a finite ratio of 0.
-        let agreeing = run_parameter_decomposition(&json, &block_tensors(&zero_write), test_governor()).expect("surface run");
-        assert_eq!(receipt_report(&agreeing).output.ratio, StageRatio::Finite { value: 0.0 });
-
-        let mut displaced_block = zero_write;
-        displaced_block.output[[0, 0]] = 1.0;
-        let displaced =
-            run_parameter_decomposition(&json, &block_tensors(&displaced_block), test_governor()).expect("surface run");
-        let report = receipt_report(&displaced);
-        assert_eq!(report.output.ratio, StageRatio::QuotientOverflows, "{report:?}");
-        assert!(report.output.band > 0.0 && report.output.refutes, "{report:?}");
-        assert_eq!(report.output.witness, [0, 0]);
-        assert_eq!(report.pre_activation.ratio, StageRatio::Finite { value: 0.0 });
-    }
-
-    #[test]
-    fn an_empty_stage_ratio_is_absent_as_empty_stage() {
-        // Through the owner's comparison: a stage with no entries takes no ratio.
-        let empty = Array2::<f64>::zeros((0, 2));
-        let agreement = compare_stage(BINARY64_CPU, empty.view(), empty.view(), empty.view(), empty.view())
-            .expect("owner comparison");
-        assert_eq!(agreement.ratio, f64::NEG_INFINITY);
-        let wire = stage_agreement_report(STAGE_FIELDS, agreement).expect("projection");
-        assert_eq!(wire.ratio, StageRatio::EmptyStage);
-
-        // Through the surface: a block receipt over no input rows.
-        let no_rows = dyadic_block_from(
-            array![[1.0, -0.5, 0.25], [0.0, 2.0, -1.0]],
-            array![0.0625, -0.125],
-            Array2::zeros((0, 2)),
-        );
-        let output = run_parameter_decomposition(
-            &receipt_request("relu", "float64", false),
-            &block_tensors(&no_rows),
-        test_governor(),
-        )
-        .expect("surface run over no rows");
-        let report = receipt_report(&output);
-        assert_eq!(report.pre_activation.ratio, StageRatio::EmptyStage, "{report:?}");
-        assert_eq!(report.output.ratio, StageRatio::EmptyStage, "{report:?}");
-        // Positive control: the same block over its rows takes finite ratios.
-        let rows = run_parameter_decomposition(
-            &receipt_request("relu", "float64", false),
-            &block_tensors(&dyadic_block()),
-        test_governor(),
-        )
-        .expect("surface run");
-        assert_eq!(receipt_report(&rows).output.ratio, StageRatio::Finite { value: 0.0 });
-    }
-
-    #[test]
-    fn a_non_finite_ratio_no_owner_case_names_is_refused() {
-        let unnamed = StageAgreement {
-            agrees: false,
-            refutes: false,
-            witness: (0, 0),
-            discrepancy: 0.0,
-            band: 0.0,
-            ratio: f64::NAN,
-        };
-        assert!(matches!(
-            stage_agreement_report(STAGE_FIELDS, unnamed),
-            Err(MpdSurfaceError::NonFiniteReport {
-                field: "stage.ratio",
-                ..
-            })
-        ));
-        // Positive control: the same stage with a finite ratio projects.
-        let finite_stage = StageAgreement {
-            ratio: 0.5,
-            ..unnamed
-        };
-        assert_eq!(
-            stage_agreement_report(STAGE_FIELDS, finite_stage).expect("projection").ratio,
-            StageRatio::Finite { value: 0.5 }
-        );
-    }
-
-    #[test]
-    fn a_receipt_request_the_owner_cannot_certify_is_refused() {
-        let block = dyadic_block();
-        let tensors = block_tensors(&block);
-        // Positive control: the accepted request.
-        assert!(run_parameter_decomposition(&receipt_request("relu", "float64", false), &tensors, test_governor()).is_ok());
-        assert!(matches!(
-            run_parameter_decomposition(&receipt_request("relu", "float32", false), &tensors, test_governor()),
-            Err(MpdSurfaceError::Receipt(ReceiptRefusal::ExternalPrecision {
-                float64: false,
-                tf32_matmul: false,
-            }))
-        ));
-        assert!(matches!(
-            run_parameter_decomposition(&receipt_request("relu", "float64", true), &tensors, test_governor()),
-            Err(MpdSurfaceError::Receipt(ReceiptRefusal::ExternalPrecision {
-                float64: true,
-                tf32_matmul: true,
-            }))
-        ));
-        assert!(matches!(
-            run_parameter_decomposition(&receipt_request("gelu_new", "float64", false), &tensors, test_governor()),
-            Err(MpdSurfaceError::Receipt(ReceiptRefusal::Activation(
-                GaussianActivationError::ApproximateGelu { .. }
-            )))
-        ));
-        let mut misshapen = tensors.clone();
-        misshapen.insert(
-            "b1".to_string(),
-            block.bias.clone().insert_axis(Axis(1)).into_dyn(),
-        );
-        assert!(matches!(
-            run_parameter_decomposition(&receipt_request("relu", "float64", false), &misshapen, test_governor()),
-            Err(MpdSurfaceError::TensorShape { .. })
-        ));
-        let unknown_execution_field = receipt_request("relu", "float64", false).replacen(
-            "\"tf32_matmul\"",
-            "\"precision\": \"high\", \"tf32_matmul\"",
-            1,
-        );
-        assert!(matches!(
-            run_parameter_decomposition(&unknown_execution_field, &tensors, test_governor()),
-            Err(MpdSurfaceError::InvalidRequest(..))
-        ));
     }
 }

@@ -280,9 +280,9 @@ class UseSiteOutputReadout:
 
 @dataclass(frozen=True)
 class ExecutedOutput:
-    """The model's output, promoted exactly to float64, with the execution
-    facts ``receipts::ExternalExecution`` records: the source dtype, the device,
-    and whether TF32 matrix multiplication was enabled when the forward ran."""
+    """The model's output, promoted exactly to float64, with its execution
+    facts: the source dtype, the device, and whether TF32 matrix
+    multiplication was enabled when the forward ran."""
 
     values: np.ndarray
     dtype: str
