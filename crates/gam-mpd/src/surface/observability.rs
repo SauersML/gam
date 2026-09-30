@@ -12,7 +12,7 @@ use super::code::EvidenceStatusWire;
 use super::layer::{AttentionRequest, native_attention};
 use super::module_split::{MlpBlockRequest, normal_form};
 use super::{MpdOutput, MpdResult, MpdSurfaceError, finite, matrix, output, vector};
-use crate::joint_operators::{RoutingLawLetters, attention_letters};
+use crate::joint_operators::{RoutingLawLetters, attention_letters, head_transport_of};
 use crate::module_split::MlpNormalForm;
 use crate::state::{
     ObservabilityLetter, ObservabilitySpectrum, ObservabilityStep, StateDomain, SubspaceCapture,
@@ -42,7 +42,9 @@ pub struct StepRequest {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LetterRequest {
-    /// A linear letter `T` (`n_{l+1} × n_l`).
+    /// A linear letter `T` (`n_{l+1} × n_l`). A head's value/output transport of an attention
+    /// block declared in the same step is refused (`joint_operators::head_transport_of`): the
+    /// block enters only as its `attention` letter.
     Linear { tensor: String },
     /// Rank-one unit letters: reads `a_j` as rows (`n × n_l`), writes `u_j` as rows
     /// (`n × n_{l+1}`). They must be a merged normal form.
@@ -53,8 +55,12 @@ pub enum LetterRequest {
     /// An attention block's letters, one per routing law
     /// (`joint_operators::attention_letters`): heads with equal score operators share one
     /// letter, their summed value/output transport. With `input_gain` the preceding
-    /// residual norm's gain is folded in.
-    Attention { attention: AttentionRequest, input_gain: Option<String> },
+    /// residual norm's gain is folded in (pre-norm); with `output_gain` the gain of the norm
+    /// on the attention output (post-norm) scales the transports' rows. This is the only way
+    /// an attention block enters: per-head value/output maps are not letters, because one
+    /// letter per head over-counts and is not invariant under the cross-head `GL` of heads
+    /// that share a law.
+    Attention { attention: AttentionRequest, input_gain: Option<String>, output_gain: Option<String> },
 }
 
 /// [`WeightedObservability`] on the wire.
@@ -67,6 +73,9 @@ pub struct WeightedObservabilityReport {
     /// The spectrum at the input of every step; `step_spectra[0]` is `G`'s.
     pub step_spectra: Vec<SpectrumReport>,
     pub captures: Vec<CaptureReport>,
+    /// The routing laws of every attention letter, in declaration order: each law's query
+    /// heads (`joint_operators::RoutingLaws::laws`).
+    pub attention_laws: Vec<Vec<Vec<usize>>>,
 }
 
 /// [`StateDomain`] on the wire.
@@ -137,13 +146,28 @@ pub(super) fn run(
     let mut attentions: Vec<RoutingLawLetters> = Vec::new();
     for step in &request.steps {
         for letter in &step.letters {
-            if let LetterRequest::Attention { attention, input_gain } = letter {
+            if let LetterRequest::Attention { attention, input_gain, output_gain } = letter {
                 let native = native_attention(tensors, attention)?;
-                let gain = match input_gain {
-                    Some(id) => Some(vector(tensors, id)?),
-                    None => None,
+                let gain = |id: &Option<String>| match id {
+                    Some(id) => vector(tensors, id).map(Some),
+                    None => Ok(None),
                 };
-                attentions.push(attention_letters(governor, &native, gain).map_err(MpdSurfaceError::Joint)?);
+                let (input, output) = (gain(input_gain)?, gain(output_gain)?);
+                for other in &step.letters {
+                    if let LetterRequest::Linear { tensor } = other {
+                        let linear = matrix(tensors, tensor)?;
+                        if linear.dim() == (native.geometry().model_dim, native.geometry().model_dim)
+                            && let Some(head) = head_transport_of(&native, input, output, linear).map_err(MpdSurfaceError::Joint)?
+                        {
+                            return Err(MpdSurfaceError::InvalidRequest(format!(
+                                "linear letter {tensor:?} is head {head}'s value/output transport: an attention block \
+                                 enters only as its routing-law letters"
+                            )));
+                        }
+                    }
+                }
+                let derived = attention_letters(governor, &native, input, output).map_err(MpdSurfaceError::Joint)?;
+                attentions.push(derived);
             }
         }
     }
@@ -190,12 +214,14 @@ pub(super) fn run(
                 .map_err(MpdSurfaceError::State)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    project(observability, captures)
+    let laws = attentions.iter().map(|letters| letters.laws.laws.clone()).collect();
+    project(observability, captures, laws)
 }
 
 pub(super) fn project(
     observability: WeightedObservability,
     captures: Vec<SubspaceCapture>,
+    attention_laws: Vec<Vec<Vec<usize>>>,
 ) -> Result<MpdOutput, MpdSurfaceError> {
     let mut arrays = BTreeMap::new();
     let mut step_spectra = Vec::with_capacity(observability.step_spectra.len());
@@ -246,6 +272,7 @@ pub(super) fn project(
             formation: finite("formation", observability.formation)?,
             step_spectra,
             captures,
+            attention_laws,
         }),
         arrays,
     ))
@@ -300,7 +327,7 @@ mod tests {
         ];
         let owner = WeightedObservability::pull_back(test_governor(), &steps).expect("owner pull-back");
         let capture = owner.capture(test_governor(), m("candidate")).expect("owner capture");
-        let expected = project(owner, vec![capture]).expect("projection");
+        let expected = project(owner, vec![capture], Vec::new()).expect("projection");
         let output = run_parameter_decomposition(&request_json(REQUEST), &tensors, test_governor()).expect("surface run");
         assert_eq!(output, expected);
         let MpdResult::WeightedObservability(report) = &output.report.result else {
@@ -351,7 +378,8 @@ mod tests {
         let mut draw = |rows: usize, cols: usize| {
             Array2::from_shape_simple_fn((rows, cols), || {
                 state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                ((state >> 40) as f64 / (1u64 << 24) as f64) - 0.5
+                // Dyadic `k/16`: every product and short sum the test forms is exact.
+                (((state >> 40) as f64 / (1u64 << 24) as f64 - 0.5) * 16.0).round() / 16.0
             })
         };
         let mut query = draw(8, 4);
@@ -367,7 +395,7 @@ mod tests {
         ]);
         let request = request_json(
             r#"{"kind": "weighted_observability", "steps": [{"letters": [{"kind": "linear", "tensor": "identity"},
-                {"kind": "attention", "input_gain": null, "attention": {
+                {"kind": "attention", "input_gain": null, "output_gain": null, "attention": {
                     "geometry": {"model_dim": 4, "n_heads": 4, "n_kv_heads": 2, "head_dim": 2},
                     "rotary": {"pairing": "half_split", "inverse_frequencies": [1.0], "attention_scaling": 1.0},
                     "score_scale": 0.5, "query": {"weight": "q", "bias": null}, "key": {"weight": "k", "bias": null},
@@ -387,7 +415,7 @@ mod tests {
             affine(m("o")),
         )
         .expect("native attention");
-        let letters = attention_letters(test_governor(), &native, None).expect("owner letters");
+        let letters = attention_letters(test_governor(), &native, None, None).expect("owner letters");
         assert_eq!(letters.laws.laws, vec![vec![0, 1], vec![2], vec![3]]);
         let identity = m("identity");
         let readout = m("r");
@@ -399,8 +427,22 @@ mod tests {
             }],
         )
         .expect("owner pull-back");
-        let expected = project(owner, Vec::new()).expect("projection");
+        let expected = project(owner, Vec::new(), vec![letters.laws.laws.clone()]).expect("projection");
         let output = run_parameter_decomposition(&request, &tensors, test_governor()).expect("surface run");
         assert_eq!(output, expected);
+
+        // A head's transport declared beside the block is a per-head letter: refused.
+        let mut with_head = tensors.clone();
+        let head = m("o").slice(ndarray::s![.., 4..6]).dot(&m("v").slice(ndarray::s![2..4, ..]));
+        with_head.insert("head".to_string(), head.into_dyn());
+        let per_head = request.replace(
+            r#"{"kind": "linear", "tensor": "identity"},"#,
+            r#"{"kind": "linear", "tensor": "identity"}, {"kind": "linear", "tensor": "head"},"#,
+        );
+        assert_ne!(per_head, request);
+        assert!(matches!(
+            run_parameter_decomposition(&per_head, &with_head, test_governor()),
+            Err(MpdSurfaceError::InvalidRequest(message)) if message.contains("head 2")
+        ));
     }
 }

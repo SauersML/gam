@@ -64,8 +64,10 @@
 //! [`routing_laws`] groups query heads whose whole score operators are equal within band
 //! ([`compare_heads`]), and reports how the laws relate (proportional, with the common
 //! scale, or not). [`attention_letters`] turns the laws into an attention step's
-//! observability letters, one summed transport per law, the only letters
-//! `state::ObservabilityLetter::RoutingLaws` accepts for attention.
+//! observability letters, one summed transport per law (with a pre-norm input gain and a
+//! post-norm output gain folded in), the only letters `state::ObservabilityLetter::RoutingLaws`
+//! accepts for attention; [`head_transport_of`] recognizes a dense letter that is one head's
+//! transport, which a caller declaring the block is refused.
 
 use gam_linalg::faer_ndarray::{FaerLinalgError, FaerQr, fast_abt, fast_atb, fast_atv};
 use gam_linalg::roundoff::{accumulation_growth, householder_qr_backward_band};
@@ -931,15 +933,18 @@ pub fn routing_laws(governor: &MemoryGovernor, native: &NativeAttention, operato
 }
 
 /// An attention step's observability letters: one per routing law, the law's summed
-/// value/output transport `T = Σ_{h∈law} O_h V_g(h) diag(γ)` on the block's input, `width ×
-/// width`. The only constructor is [`attention_letters`], so an attention step's letters are
-/// always the laws' and never one per head. A value bias makes the operators homogeneous; its
-/// column is a constant write that no linear pull-back reads, and it is dropped.
-#[derive(Clone, Debug)]
+/// value/output transport `T = diag(ω) Σ_{h∈law} O_h V_g(h) diag(γ)` on the block's input,
+/// `width × width`, with `γ` the input norm's gain (pre-norm) and `ω` the attention-output
+/// norm's gain (post-norm) when declared. The only constructor is [`attention_letters`], so an
+/// attention step's letters are always the laws' and never one per head. A value bias makes
+/// the operators homogeneous; its column is a constant write that no linear pull-back reads,
+/// and it is dropped. The transports hold their memory reservation.
+#[derive(Debug)]
 pub struct RoutingLawLetters {
     pub laws: RoutingLaws,
     transports: Vec<Array2<f64>>,
     bands: Vec<f64>,
+    footprint: MemoryReservation,
 }
 
 impl RoutingLawLetters {
@@ -954,35 +959,121 @@ impl RoutingLawLetters {
     pub fn bands(&self) -> &[f64] {
         &self.bands
     }
+
+    /// Bytes the transports hold on the process memory governor.
+    pub fn reserved_bytes(&self) -> usize {
+        self.footprint.bytes()
+    }
 }
 
-/// The routing laws of `native` and their observability letters, with `input_gain` (the
-/// preceding residual norm's gain) folded into both operator families when declared.
+/// The routing laws of `native` and their observability letters. `input_gain` (the preceding
+/// residual norm's gain, pre-norm) is folded into both operator families; `output_gain` (the
+/// gain of a norm applied to the attention output before the residual add, post-norm) scales
+/// the transports' rows. The post-norm normalizer itself is one positive scalar per token
+/// shared by every head, so it neither enters the laws nor the letters.
+///
+/// Each transport is `k`-term inner products of the stacked factors (`k` the law's total
+/// rank), within `γ_k |L| |R|ᵀ`; the value factors carry their formation defect, and folding
+/// `ω` into the left factor rounds each entry once more.
 pub fn attention_letters(
     governor: &MemoryGovernor,
     native: &NativeAttention,
     input_gain: Option<ArrayView1<'_, f64>>,
+    output_gain: Option<ArrayView1<'_, f64>>,
 ) -> Result<RoutingLawLetters, JointRefusal> {
     let width = native.geometry().model_dim;
+    if let Some(gain) = output_gain {
+        expect_shape("output gain", (width, 1), (gain.len(), 1))?;
+        if gain.iter().any(|entry| !entry.is_finite()) {
+            return Err(JointRefusal::NonFinite { what: "output gain" });
+        }
+    }
     let operators = query_key_operators(native, input_gain)?;
     let laws = routing_laws(governor, native, &operators)?;
     drop(operators);
     let value_output = value_output_operators(native, input_gain)?;
+    // The transports, and one product and its magnitude while a law is formed.
+    let cells = width.saturating_mul(width).saturating_mul(laws.laws.len().saturating_add(2));
+    let footprint = governor
+        .try_reserve(cells.saturating_mul(std::mem::size_of::<f64>()), "routing-law letters")
+        .map_err(JointRefusal::Memory)?;
+    let folding = if output_gain.is_some() { accumulation_growth(1) } else { 0.0 };
     let (mut transports, mut bands) = (Vec::with_capacity(laws.laws.len()), Vec::with_capacity(laws.laws.len()));
     for law in &laws.laws {
         let lefts: Vec<_> = law.iter().map(|&head| value_output.head(head).left()).collect();
         let rights: Vec<_> = law.iter().map(|&head| value_output.head(head).right()).collect();
-        let left = concatenate(Axis(1), &lefts).map_err(shape_failed)?;
+        let mut left = concatenate(Axis(1), &lefts).map_err(shape_failed)?;
         let right = concatenate(Axis(1), &rights).map_err(shape_failed)?;
+        if let Some(gain) = output_gain {
+            for (row, &scale) in left.rows_mut().into_iter().zip(gain.iter()) {
+                row.into_iter().for_each(|entry| *entry *= scale);
+            }
+        }
         let product = fast_abt(&left, &right);
         let magnitude = fast_abt(&left.mapv(f64::abs), &right.mapv(f64::abs));
-        let relative = up(accumulation_growth(left.ncols().max(1)) + value_output.formation_defect());
+        let relative = up(up(accumulation_growth(left.ncols().max(1)) + value_output.formation_defect()) + folding);
         let transport = product.slice(s![..width, ..width]).to_owned();
-        let band = up(relative * upper_frobenius(magnitude.slice(s![..width, ..width])));
+        let band = up(up(relative * upper_frobenius(magnitude.slice(s![..width, ..width]))) * up(1.0 + folding));
         transports.push(transport);
         bands.push(up(band + up(left.ncols() as f64 * SUBNORMAL_SPACING)));
     }
-    Ok(RoutingLawLetters { laws, transports, bands })
+    Ok(RoutingLawLetters { laws, transports, bands, footprint })
+}
+
+/// The query head, if any, whose value/output transport `diag(ω) C_h` (folded as in
+/// [`attention_letters`]) the dense `letter` (`width × width`, exact as stored) is not proven
+/// distinct from. Such a letter is a per-head attention letter, which over-counts and is not
+/// gauge invariant, and a caller declaring it beside the block's routing-law letters is refused.
+///
+/// Distinctness is certified two ways, cheapest first. Norms: `‖C_h‖²_F` from the factor Grams
+/// is within its [`frobenius_squared`] band (widened by the output gain's rounding) and
+/// `‖letter‖²_F` within `γ_n` of its sum, so squared norms further apart than both bands differ.
+/// Entries: each entry of the computed `C_h` is a `k`-term inner product within `γ_k |L| |R|ᵀ`,
+/// plus the value factors' formation defect and the gain's rounding, so an entry of
+/// `letter − C_h` beyond that band certifies the two distinct.
+pub fn head_transport_of(
+    native: &NativeAttention,
+    input_gain: Option<ArrayView1<'_, f64>>,
+    output_gain: Option<ArrayView1<'_, f64>>,
+    letter: ArrayView2<'_, f64>,
+) -> Result<Option<usize>, JointRefusal> {
+    let width = native.geometry().model_dim;
+    expect_shape("letter", (width, width), letter.dim())?;
+    if let Some(gain) = output_gain {
+        expect_shape("output gain", (width, 1), (gain.len(), 1))?;
+    }
+    let value_output = value_output_operators(native, input_gain)?;
+    let folding = if output_gain.is_some() { accumulation_growth(1) } else { 0.0 };
+    let letter_squares = letter.iter().map(|entry| entry * entry).sum::<f64>();
+    let letter_band = up(accumulation_growth(letter.len().max(1)) * letter_squares);
+    for head in 0..native.geometry().n_heads {
+        let operator = value_output.head(head);
+        let mut left = operator.left().to_owned();
+        if let Some(gain) = output_gain {
+            for (row, &scale) in left.rows_mut().into_iter().zip(gain.iter()) {
+                row.into_iter().for_each(|entry| *entry *= scale);
+            }
+        }
+        let scaled = FactoredOperator::new(left, operator.right().to_owned())?;
+        if scaled.width() == width {
+            let (squares, band) = frobenius_squared(&scaled);
+            let widened = up(band + up(up(5.0 * up(folding + value_output.formation_defect())) * squares));
+            if (squares - letter_squares).abs() > up(widened + letter_band) {
+                continue;
+            }
+        }
+        let product = fast_abt(&scaled.left, &scaled.right);
+        let magnitude = fast_abt(&scaled.left.mapv(f64::abs), &scaled.right.mapv(f64::abs));
+        let relative = up(up(accumulation_growth(scaled.rank().max(1)) + value_output.formation_defect()) + folding);
+        let underflow = up(scaled.rank() as f64 * SUBNORMAL_SPACING);
+        let distinct = (0..width).any(|i| {
+            (0..width).any(|j| (letter[[i, j]] - product[[i, j]]).abs() > up(up(relative * magnitude[[i, j]] * up(1.0 + folding)) + underflow))
+        });
+        if !distinct {
+            return Ok(Some(head));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

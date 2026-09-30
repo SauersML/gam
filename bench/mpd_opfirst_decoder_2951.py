@@ -160,6 +160,56 @@ class Decoder:
                         right if g_in is None else right * g_in[None, :]))
         return out
 
+    def rope_inverse_frequencies(self):
+        """The HF default rotary inverse frequencies theta^(-2j/hd), j < hd/2; a declared rope scaling is refused."""
+        scaling = self.config.get("rope_scaling")
+        if scaling and scaling.get("rope_type", scaling.get("type", "default")) != "default":
+            raise SystemExit(f"rope_scaling {scaling!r} not handled")
+        return (self.theta ** (-np.arange(0, self.hd, 2, dtype=np.float64) / self.hd)).tolist()
+
+    def attention_letter(self, layer, prefix):
+        """Layer ``layer``'s attention block as the MPD surface's ``attention`` observability letter
+        (joint_operators::attention_letters: heads grouped into routing laws by their score operators, one letter
+        per law, its summed OV transport) and the tensors it names, ids under ``prefix``.
+
+        A per-head q/k norm (Qwen3) is declared as the block's query_key_norm. A full-projection q/k norm (OLMo 2)
+        is ONE normaliser shared by every head, so it cannot separate heads: only its gain is folded into the
+        projection rows. The input RMSNorm gain (pre-norm) is the letter's input_gain, folded into the query/key and
+        value reads; the attention-output RMSNorm gain (post-norm) its output_gain, on the transports' rows. The
+        RMS normalisers themselves are excluded (one positive scalar per token, shared by every head)."""
+        p = self._p(layer) + "self_attn."
+        tensors = {}
+
+        def put(name, array):
+            tensors[prefix + name] = np.ascontiguousarray(array)
+            return prefix + name
+
+        def projection(name, gain=None):
+            w = self(p + f"{name}_proj.weight")
+            bias = p + f"{name}_proj.bias"
+            return {"weight": put(name, w if gain is None else w * gain[:, None]),
+                    "bias": put(name + "_bias", self(bias)) if bias in self.index else None}
+
+        norm = None
+        if self.qk_norm == "full":
+            query = projection("q", gain=self(p + "q_norm.weight"))
+            key = projection("k", gain=self(p + "k_norm.weight"))
+        else:
+            query, key = projection("q"), projection("k")
+            if self.qk_norm == "head":
+                norm = {"epsilon": float(self.config["rms_norm_eps"]), "query_gain": put("q_norm", self(p + "q_norm.weight")),
+                        "key_gain": put("k_norm", self(p + "k_norm.weight"))}
+        g_in, g_out = self.attn_input_gain(layer), self.attn_output_gain(layer)
+        attention = {"geometry": {"model_dim": self.d, "n_heads": self.H, "n_kv_heads": self.KV, "head_dim": self.hd},
+                     "rotary": {"pairing": "half_split", "inverse_frequencies": self.rope_inverse_frequencies(),
+                                "attention_scaling": 1.0},
+                     "score_scale": self.hd ** -0.5, "query": query, "key": key,
+                     "value": projection("v"), "output": projection("o"), "query_key_norm": norm}
+        letter = {"kind": "attention", "attention": attention,
+                  "input_gain": None if g_in is None else put("input_gain", g_in),
+                  "output_gain": None if g_out is None else put("output_gain", g_out)}
+        return letter, tensors
+
     def mlp(self, layer):
         p = self._p(layer) + "mlp."
         return self(p + "gate_proj.weight"), self(p + "up_proj.weight"), self(p + "down_proj.weight")

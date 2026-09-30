@@ -7,13 +7,15 @@ attention OV maps with the full unembedding as readout; that is trivial for Qwen
 * ``modadd``: the one-layer p=113 transformer of bench/mpd_modadd_2951.py (a ``train`` run file).
   C = the 113 answer rows of W_U, and separately the 112 logit differences against the correct token
   (span{W_U[j] - W_U[c]} is the row space of the centered W_U, the same for every c: it kills the
-  constant direction). Transitions: the 4 head OV maps A_h = W_O[:, h] W_V[h]; MLP read rows W_in
+  constant direction). Transitions: the routing laws' OV transports (joint_operators::attention_letters groups
+  heads with equal score operators; A_r = sum over law r of W_O[:, h] W_V[h]); MLP read rows W_in
   as extra readouts at the post-attention residual in a separate variant. The observable subspace is
   compared with the key-frequency Fourier planes of W_U and W_E (principal angles).
 * ``weekday``: a decoder read through bench/mpd_opfirst_decoder_2951.py (default OLMo 2 1B; the
   architecture comes from config), C = the 7 " Monday".." Sunday" rows of the unembedding times the final
-  RMSNorm gain (and the 6-dimensional difference space), backward causal closure layer by layer under all
-  heads' OV maps, kept factored (the input RMSNorm gain folded in a pre-norm model; the attention-output
+  RMSNorm gain (and the 6-dimensional difference space), backward causal closure layer by layer under every
+  routing law's OV transport (the attention block enters the Gramian as the surface's ``attention`` letter), kept
+  factored (the input RMSNorm gain folded in a pre-norm model; the attention-output
   RMSNorm gain in a post-norm model, whose excluded normaliser is one scalar per token and layer shared by
   all heads), optionally with the MLP reads.
 
@@ -41,7 +43,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mpd_opfirst_linalg_2951 as la  # noqa: E402
 from mpd_opfirst_decoder_2951 import Decoder  # noqa: E402
 from mpd_opfirst_observability_2951 import (  # noqa: E402
-    apply, effective, linear_quotient, relative_rows, resolved_rows, singular_values, svd_band_rank,
+    apply, effective, law_transports, linear_quotient, relative_rows, resolved_rows, singular_values, svd_band_rank,
     weighted_observability)
 
 TAUS = (1e-2, 1e-3, 1e-6)
@@ -79,15 +81,30 @@ def fourier_power(table):
     return np.arange(1, len(power) + 1), power / power.sum()
 
 
+def modadd_attention(s, cfg):
+    """The modadd transformer's attention block as the surface's ``attention`` letter: causal, no rotary planes
+    (positions enter through W_pos in the residual), score scale 1/sqrt(d_head), no biases or norms."""
+    heads, d_head, d_model = cfg["n_heads"], cfg["d_head"], cfg["d_model"]
+    tensors = {"modadd/q": s["W_Q"].reshape(heads * d_head, d_model), "modadd/k": s["W_K"].reshape(heads * d_head, d_model),
+               "modadd/v": s["W_V"].reshape(heads * d_head, d_model), "modadd/o": s["W_O"]}
+    attention = {"geometry": {"model_dim": d_model, "n_heads": heads, "n_kv_heads": heads, "head_dim": d_head},
+                 "rotary": {"pairing": "half_split", "inverse_frequencies": [], "attention_scaling": 1.0},
+                 "score_scale": d_head ** -0.5, "query_key_norm": None,
+                 **{name: {"weight": f"modadd/{key}", "bias": None}
+                    for name, key in (("query", "q"), ("key", "k"), ("value", "v"), ("output", "o"))}}
+    return {"kind": "attention", "attention": attention, "input_gain": None, "output_gain": None}, tensors
+
+
 def gramian(steps, planes):
-    """The owner's weighted Gramian of ``steps`` and its capture of every candidate plane subspace."""
+    """The owner's weighted Gramian of ``steps`` and its capture of every candidate plane subspace, and the
+    routing laws of every attention letter."""
     report, _, directions, spectra = weighted_observability(steps, list(planes.values()))
     spectrum = spectra[0]
     sigma = spectrum["singular_values"]
     dims = {"exact_rank_eps_band": svd_band_rank(sigma, directions.shape[1]),
             "certified_rank": spectrum["resolved_rank"], "certified_band": spectrum["band"], **effective(sigma, TAUS),
             "participation_ratio": spectrum["participation_ratio"]}
-    return dims, sigma, directions, dict(zip(planes, report["captures"]))
+    return dims, sigma, directions, dict(zip(planes, report["captures"])), report["attention_laws"]
 
 
 def compare(sigma, directions, capture, planes, label):
@@ -135,15 +152,17 @@ def modadd(args):
             v = {"readout": dims(c)[0], "readout_at_post_attn": dims(post)[0]}
             # one layer: the pre-attention residual is read through I + A_h (attention pattern fixed)
             identity = np.eye(post.shape[1])
-            v["pre_attention_gramian"], sigma, directions, captures = gramian([([identity] + ov, [post])], planes)
+            v["pre_attention_gramian"], sigma, directions, captures, laws = gramian(
+                [([identity, modadd_attention(s, cfg)], [post])], planes)
+            v["routing_laws"] = laws[0]
             v["pre_attention_sigma_over_max_first24"] = (sigma[:24] / sigma[0]).tolist()
-            chart, report = linear_quotient([post], ov)
+            chart, report = linear_quotient([post], [sum(ov[h] for h in law) for law in laws[0]])
             v["time_invariant_closure_eps_band"] = {
                 "rank_C": int(resolved_rows(post).shape[0]), "rank_closed": int(chart.shape[0]),
                 "max_quotient_bound": max(b["upper"] for b in report["quotient_bounds"])}
             v["fourier"] = {pn: compare(sigma, directions, captures[pn], pl, f"[modadd] {name} vs {pn}")
                             for pn, pl in planes.items()}
-            _, read_sigma, read_directions, read_captures = gramian([([identity], [post])], planes)
+            _, read_sigma, read_directions, read_captures, _ = gramian([([identity], [post])], planes)
             v["fourier"]["readout_only"] = {pn: compare(read_sigma, read_directions, read_captures[pn], pl,
                                                         f"[modadd] {name} readout-only vs {pn}")
                                             for pn, pl in planes.items()}
@@ -174,22 +193,32 @@ def weekday(args):
             charts = {tau: resolved_rows(c) if tau is None else relative_rows(c, tau) for tau in (None, 1e-3, 1e-6)}
             per_layer = [{"layer": n_layers, **dims(c)[0],
                           **{f"chart_rank_{t if t else 'eps'}": int(ch.shape[0]) for t, ch in charts.items()}}]
-            chart_ranks, steps = {}, []
+            # Each layer's attention block enters as its routing-law letters; the charts then close under the
+            # same laws' transports.
+            steps = []
             for layer in reversed(range(n_layers)):
                 readouts = [c] if layer == n_layers - 1 else []
                 if mlp:
+                    readouts.append(D.mlp_reads(layer))
+                steps.insert(0, ([np.eye(d), D.attention_letter(layer, f"layers/{layer}/")], readouts))
+            report, _, _, spectra = weighted_observability(steps)
+            del steps
+            layer_laws = report["attention_laws"]
+            res.setdefault("routing_laws", {"per_layer": layer_laws,
+                                            "shared_heads": sum(len(law) - 1 for laws in layer_laws for law in laws)})
+            chart_ranks = {}
+            for layer in reversed(range(n_layers)):
+                if mlp:
                     reads = D.mlp_reads(layer)
-                    readouts.append(reads)
                     for t in charts:
                         stack = np.vstack([charts[t], reads / la.spectral_norm(reads)])
                         charts[t] = resolved_rows(stack) if t is None else relative_rows(stack, t)
+                laws = law_transports(ov[layer], layer_laws[layer])
                 for t in charts:
                     if charts[t].shape[0] < d:
-                        stack = np.vstack([charts[t]] + [apply(charts[t], a) for a in ov[layer]])
+                        stack = np.vstack([charts[t]] + [apply(charts[t], a) for a in laws])
                         charts[t] = resolved_rows(stack) if t is None else relative_rows(stack, t)
                 chart_ranks[layer] = {f"chart_rank_{t if t else 'eps'}": int(ch.shape[0]) for t, ch in charts.items()}
-                steps.insert(0, ([np.eye(d)] + [a[0] @ a[1] for a in ov[layer]], readouts))
-            _, _, _, spectra = weighted_observability(steps)
             for layer in reversed(range(n_layers)):
                 spectrum = spectra[layer]
                 sigma = spectrum["singular_values"]

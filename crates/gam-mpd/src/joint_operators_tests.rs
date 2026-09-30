@@ -424,7 +424,7 @@ fn toy5_operator_equality_separates_laws_that_share_every_subspace() {
 fn attention_letters_are_one_summed_transport_per_law() {
     let toy = RoutingToy::new(2951);
     let native = toy.native(&toy.value, &toy.output);
-    let letters = attention_letters(test_governor(), &native, None).expect("letters");
+    let letters = attention_letters(test_governor(), &native, None, None).expect("letters");
     assert_eq!(letters.laws.laws, RoutingToy::truth().laws);
     assert_eq!(letters.transports().len(), 2);
     for (law, (transport, &band)) in letters.laws.laws.iter().zip(letters.transports().iter().zip(letters.bands())) {
@@ -433,10 +433,25 @@ fn attention_letters_are_one_summed_transport_per_law() {
         assert!(distance <= band, "law {law:?}: {distance:e} beyond {band:e}");
     }
 
+    // A post-norm output gain `ω` scales each law's transport rows: `diag(ω) T`, within the
+    // bands, and leaves the laws alone. Dyadic `ω` keeps the scaled rows exact.
+    let omega = Array1::from_shape_fn(toy.value[0].ncols(), |i| 0.5 + (i % 4) as f64 / 4.0);
+    let scaled = attention_letters(test_governor(), &native, None, Some(omega.view())).expect("letters");
+    assert_eq!(scaled.laws, letters.laws);
+    for (law, (transport, &band)) in letters.laws.laws.iter().zip(scaled.transports().iter().zip(scaled.bands())) {
+        let exact = &RoutingToy::transport(&toy.value, &toy.output, law) * &omega.view().insert_axis(Axis(1));
+        let distance = (transport - &exact).iter().map(|value| value * value).sum::<f64>().sqrt();
+        assert!(distance <= band, "law {law:?}: {distance:e} beyond {band:e}");
+    }
+    assert!(matches!(
+        attention_letters(test_governor(), &native, None, Some(Array1::ones(3).view())),
+        Err(JointRefusal::Shape { what: "output gain", .. })
+    ));
+
     let mut split = toy.clone();
     split.key[1][[0, 0]] += 0.25;
     let native = split.native(&split.value, &split.output);
-    let letters = attention_letters(test_governor(), &native, None).expect("letters");
+    let letters = attention_letters(test_governor(), &native, None, None).expect("letters");
     assert_eq!(letters.laws.laws, vec![vec![0], vec![1], vec![2]]);
     assert!(letters.laws.relations.iter().filter(|relation| relation.law == 2 && relation.earlier == 0).all(|relation| relation.proportional()));
 
@@ -448,12 +463,12 @@ fn attention_letters_are_one_summed_transport_per_law() {
         scaled.query[1].row_mut(row).mapv_inplace(|entry| entry * 0.5);
         scaled.key[1].row_mut(row).mapv_inplace(|entry| entry * 2.0);
     }
-    let plain = attention_letters(test_governor(), &scaled.native(&scaled.value, &scaled.output), None).expect("letters");
+    let plain = attention_letters(test_governor(), &scaled.native(&scaled.value, &scaled.output), None, None).expect("letters");
     assert_eq!(plain.laws.laws, RoutingToy::truth().laws);
     let normed = scaled
         .native(&scaled.value, &scaled.output)
         .with_query_key_norm(1e-6, Array1::ones(4), Array1::ones(4))
         .expect("normed");
-    let letters = attention_letters(test_governor(), &normed, None).expect("letters");
+    let letters = attention_letters(test_governor(), &normed, None, None).expect("letters");
     assert_eq!(letters.laws.laws, vec![vec![0], vec![1], vec![2]]);
 }

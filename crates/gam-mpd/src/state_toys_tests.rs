@@ -84,7 +84,7 @@ fn toy5_routing_law_letters_are_gauge_invariant_and_head_letters_are_not() {
     let truth = RoutingToy::truth();
     let identity = identity();
     let derived = |value: &[Array2<f64>], output: &[Array2<f64>]| {
-        let letters = attention_letters(test_governor(), &toy.native(value, output), None).expect("letters");
+        let letters = attention_letters(test_governor(), &toy.native(value, output), None, None).expect("letters");
         assert_eq!(letters.laws.laws, truth.laws);
         letters
     };

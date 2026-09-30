@@ -197,7 +197,7 @@ fn observability_chart(dir: &Path, layout: &Layout, layer: usize) -> Result<Arra
         )
         .map_err(|error| error.to_string())?;
         let gain = vector(dir, &format!("rms_1.{block}"))?;
-        routing.push(attention_letters(governor, &native, Some(gain.view())).map_err(|error| format!("{error:?}"))?);
+        routing.push(attention_letters(governor, &native, Some(gain.view()), None).map_err(|error| format!("{error:?}"))?);
         let mut reads = matrix(dir, &format!("fc.{block}"))?;
         let gain = vector(dir, &format!("rms_2.{block}"))?;
         for mut row in reads.rows_mut() {
