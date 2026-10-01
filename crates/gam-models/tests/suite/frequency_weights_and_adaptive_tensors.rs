@@ -14,7 +14,9 @@
 use csv::StringRecord;
 use gam_data::{EncodedDataset, encode_recordswith_inferred_schema};
 use gam_linalg::matrix::LinearOperator;
-use gam_models::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
+use gam_models::fit_orchestration::{
+    FitConfig, FitResult, fit_from_formula, fit_from_formula_with_notes,
+};
 use gam_terms::smooth::build_term_collection_design;
 use ndarray::Array2;
 use rand::SeedableRng;
@@ -117,7 +119,7 @@ fn default_tensor_grows_until_it_resolves_the_interaction() {
         rows.push(vec![x0, x1, f + noise.sample(&mut rng)]);
     }
     let data = dataset(&["x0", "x1", "y"], &rows);
-    let fit = fit_from_formula(
+    let outcome = fit_from_formula_with_notes(
         "y ~ te(x0, x1)",
         &data,
         &FitConfig {
@@ -126,6 +128,11 @@ fn default_tensor_grows_until_it_resolves_the_interaction() {
         },
     )
     .expect("default tensor fit");
+    let fit = outcome.result;
+    let width = match &fit {
+        FitResult::Standard(standard) => standard.design.smooth.terms[0].coeff_range.len(),
+        _ => panic!("expected a standard fit"),
+    };
     let fitted = eta_at(&fit, &data.values.to_owned());
     let rmse = (fitted
         .iter()
@@ -138,6 +145,8 @@ fn default_tensor_grows_until_it_resolves_the_interaction() {
     // observation's noise; a saturated basis leaves bias of the signal's order.
     assert!(
         rmse < 0.5 * noise_sd,
-        "te(x0, x1) recovery RMSE {rmse:.4} must sit below half the noise sd {noise_sd}"
+        "te(x0, x1) recovery RMSE {rmse:.4} (width {width}) must sit below half the noise \
+         sd {noise_sd}; advisories: {:?}",
+        outcome.inference_notes.advisories
     );
 }

@@ -25,6 +25,7 @@ fn clean_criterion() -> OuterCriterionCertificate {
         newton_polish: None,
         curvature_floor: None,
         criterion_error: None,
+        value_band: None,
     }
 }
 

@@ -45,6 +45,7 @@ fn railed_on_canonical_slot_three() -> OuterCriterionCertificate {
         newton_polish: None,
         curvature_floor: None,
         criterion_error: None,
+        value_band: None,
     }
 }
 

@@ -6184,6 +6184,7 @@ fn strict_curvature_requirement_does_not_reinterpret_floor_clearance_as_psd() {
             cleared: true,
         }),
         criterion_error: None,
+        value_band: None,
     };
     assert!(
         floor_cleared.certifies(),
@@ -6234,6 +6235,7 @@ fn strict_curvature_requirement_does_not_reinterpret_floor_clearance_as_psd() {
         newton_polish: None,
         curvature_floor: None,
         criterion_error: None,
+        value_band: None,
     };
     assert!(
         !certificate_meets_curvature_requirement(

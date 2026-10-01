@@ -3225,6 +3225,7 @@ fn certify_fixed_point_optimality(
         newton_polish: None,
         curvature_floor: None,
         criterion_error: None,
+        value_band: None,
     };
     result.criterion_certificate = Some(certificate.clone());
     if !certificate.certifies() {
@@ -3400,6 +3401,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
             newton_polish: None,
             curvature_floor: None,
             criterion_error: None,
+            value_band: None,
         };
         result.final_value = value;
         result.final_grad_norm = Some(0.0);
@@ -4245,6 +4247,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                     newton_polish: None,
                     curvature_floor: None,
                     criterion_error: None,
+                    value_band: None,
                 };
                 // Move the certified curvature onto the result; the mint path returns
                 // immediately, so the fall-through below never observes the move.
@@ -4495,6 +4498,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                 }),
                 _ => None,
             }),
+        value_band: Some(point_band),
     };
     // Install the measured evidence before deciding its verdict.  A rejected
     // candidate is retained only as a resumable checkpoint, and that

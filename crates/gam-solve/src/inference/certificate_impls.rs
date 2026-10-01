@@ -248,6 +248,7 @@ mod tests {
             newton_polish: None,
             curvature_floor: None,
             criterion_error: None,
+            value_band: None,
         };
         assert_eq!(clean.verdict(), Verdict::Certified);
         assert!(clean.verdict().is_certified());

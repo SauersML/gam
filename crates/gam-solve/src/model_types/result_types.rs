@@ -1383,6 +1383,14 @@ pub struct OuterCriterionCertificate {
     /// carries `None`, as does a certificate stored before this field existed.
     #[serde(default)]
     pub criterion_error: Option<CriterionErrorBound>,
+    /// The rounding band of the reported criterion value at the certified
+    /// point, whatever verdict the point earned. It bounds the point's true
+    /// criterion value from both sides, so the returned value plus this band is
+    /// an upper bound on the criterion's minimum even where no decrement
+    /// verdict bounds the decrease left. `None` where the producer measured no
+    /// band, and for a certificate stored before this field existed.
+    #[serde(default)]
+    pub value_band: Option<f64>,
 }
 
 /// The error the certified criterion value carries (#3331), in the
@@ -2096,6 +2104,7 @@ mod tests_certification_refusal_2550 {
             newton_polish: None,
             curvature_floor: None,
             criterion_error: None,
+            value_band: None,
         }
     }
 
@@ -2207,6 +2216,7 @@ mod tests_certification_refusal_2550 {
             newton_polish: None,
             curvature_floor: None,
             criterion_error: None,
+            value_band: None,
         };
         assert!(matches!(
             certificate.refusal(),
@@ -2309,6 +2319,7 @@ mod rail_tail_evidence_tests {
             newton_polish: None,
             curvature_floor: None,
             criterion_error: None,
+            value_band: None,
         }
     }
 
@@ -4270,6 +4281,7 @@ mod assembly_inner_status_gate_tests {
             newton_polish: None,
             curvature_floor: None,
             criterion_error: None,
+            value_band: None,
         });
         parts.outer_gradient_norm = Some(2e-7);
         parts.outer_iterations = 7;
@@ -4320,6 +4332,7 @@ mod assembly_inner_status_gate_tests {
             newton_polish: None,
             curvature_floor: None,
             criterion_error: None,
+            value_band: None,
         });
         parts.outer_gradient_norm = Some(2e-7);
         parts.outer_iterations = 7;
@@ -4508,6 +4521,7 @@ mod assembly_inner_status_gate_tests {
             }),
             curvature_floor: None,
             criterion_error: None,
+            value_band: None,
         };
         let encoded = serde_json::to_value(&certificate).expect("serialize the certificate");
         let decoded: OuterCriterionCertificate =
@@ -4563,6 +4577,7 @@ mod assembly_inner_status_gate_tests {
             newton_polish: None,
             curvature_floor: None,
             criterion_error: None,
+            value_band: None,
         };
         assert_eq!(
             search_seed_from(log_lambdas.clone(), Some(&certificate)),
@@ -4798,6 +4813,7 @@ mod assembly_inner_status_gate_tests {
             newton_polish: None,
             curvature_floor: None,
             criterion_error: None,
+            value_band: None,
         });
         parts.outer_gradient_norm = Some(0.0);
         parts.outer_iterations = 1;
@@ -7448,6 +7464,7 @@ mod curvature_evidence_serialized_contract_2561_tests {
                 newton_polish: None,
                 curvature_floor: None,
                 criterion_error: None,
+                value_band: None,
             }
         };
         for (evidence, expected) in [
@@ -7546,6 +7563,7 @@ mod curvature_evidence_serialized_contract_2561_tests {
                 newton_polish: None,
                 curvature_floor: None,
                 criterion_error: None,
+                value_band: None,
             }
         };
         let measured = certificate_with(CurvatureEvidence::Measured { psd: true });

@@ -642,6 +642,7 @@ fn surrogate_certificate_is_rescored_on_unseen_probes_before_stamping_2933() {
         curvature_floor: None,
         newton_polish: None,
         criterion_error: None,
+        value_band: None,
     };
     match objective.validate_surrogate_certificate(&certificate(0.0)) {
         Err(SaeOuterCertificationError::SurrogateDisagrees { rho, detail }) => {

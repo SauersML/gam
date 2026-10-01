@@ -550,6 +550,7 @@ fn certificate_with(
         newton_polish: None,
         curvature_floor,
         criterion_error: None,
+        value_band: None,
     }
 }
 

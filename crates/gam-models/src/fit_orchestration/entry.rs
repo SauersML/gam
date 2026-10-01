@@ -2283,9 +2283,13 @@ pub(crate) fn fit_materialized_standard_with_notes(
 ///   not on the request), so the evidence difference is a Bayes factor between
 ///   two smoothing priors on nested spaces rather than a difference of two
 ///   unrelated improper-prior normalizers;
-/// * the difference exceeds the error both fits certify for their own
-///   criterion value ([`certified_evidence_gain`]); a difference inside that
-///   error is not evidence and the smaller basis stands;
+/// * the candidate's ceiling, its returned value plus that value's band,
+///   lies below the floor the incumbent's Newton decrement certifies for its
+///   minimum ([`certified_evidence_gain`]); a difference inside those errors is
+///   not evidence and the smaller basis stands. The candidate needs no
+///   decrement verdict of its own to win (its unfinished decrease only helps
+///   it), but it needs one to be compared against in turn, so growth stops at
+///   an accepted candidate that has none;
 /// * a refit that does not CONVERGE certifies nothing either, so it closes the
 ///   attempt on that same rule and the certified incumbent stands (#4529). It
 ///   is the absence of evidence, not a verdict on the model the caller asked
@@ -2391,10 +2395,8 @@ fn finish_adaptive_spatial_fit(
                 }
                 continue;
             }
-            let improves = match certified_evidence(candidate_standard)? {
-                Some(candidate_evidence) => {
-                    certified_evidence_gain(current_evidence, candidate_evidence)
-                }
+            let improves = match criterion_ceiling(candidate_standard)? {
+                Some(ceiling) => certified_evidence_gain(current_evidence, ceiling),
                 None => false,
             };
             if improves {
@@ -2463,23 +2465,55 @@ fn certified_evidence(
         .map(|score| CertifiedEvidence { score, error }))
 }
 
-/// Whether `candidate`'s criterion minimum is certified lower than
-/// `current`'s.
+/// An upper bound on a converged fit's criterion minimum: the comparable
+/// criterion value `S` it returned plus the rounding band of that value.
 ///
-/// Each fit returned the criterion value `S` at its converged `ρ̂`, evaluated
-/// to within `value_band`, and certifies by its Newton decrement that the true
-/// minimum `M` lies at most `decrease_left` below it:
-/// `M ∈ [S − value_band − decrease_left, S + value_band]`. The candidate is
-/// better only when its whole interval lies below the current one's, so a
-/// difference inside the certified evaluation error is never read as evidence.
+/// The true minimum `M` lies at or below the true value at the returned `ρ̂`,
+/// which lies within the band of `S`, so `M ≤ S + value_band` wherever the
+/// outer search stopped. Unlike [`certified_evidence`] this needs no decrement
+/// verdict: how much decrease is left only lowers `M` further. The band is the
+/// decrement-certified one when the certificate has it, otherwise the band the
+/// certificate measured at the point. `None` when the fit reports neither.
+fn criterion_ceiling(result: &StandardFitResult) -> Result<Option<f64>, WorkflowError> {
+    let Some(band) = result
+        .fit
+        .artifacts
+        .criterion_certificate
+        .as_ref()
+        .and_then(|certificate| {
+            certificate
+                .criterion_error
+                .map(|error| error.value_band)
+                .or(certificate.value_band)
+        })
+        .filter(|band| band.is_finite())
+    else {
+        return Ok(None);
+    };
+    let score = standard_fit_comparable_reml_score(result)
+        .map_err(|reason| raised_fit_failure(FailureCategory::Invariant, reason))?;
+    Ok(score
+        .filter(|score| score.is_finite())
+        .map(|score| score + band))
+}
+
+/// Whether a candidate whose criterion minimum is at most `candidate_ceiling`
+/// ([`criterion_ceiling`]) is certified better than `current`.
+///
+/// The current fit returned the criterion value `S` at its converged `ρ̂`,
+/// evaluated to within `value_band`, and certifies by its Newton decrement that
+/// its true minimum `M` lies at most `decrease_left` below it:
+/// `M ≥ S − value_band − decrease_left`. The candidate is better only when its
+/// ceiling lies below that floor, so a difference inside the certified
+/// evaluation error is never read as evidence. The candidate's unfinished
+/// decrease only lowers its minimum, so it is not charged against the gain.
 ///
 /// The comparison is meaningful only between nested bases with the same null
 /// space and penalty order; callers establish that with
 /// [`non_nested_refinements`] before asking.
-fn certified_evidence_gain(current: CertifiedEvidence, candidate: CertifiedEvidence) -> bool {
-    let candidate_upper = candidate.score + candidate.error.value_band;
+fn certified_evidence_gain(current: CertifiedEvidence, candidate_ceiling: f64) -> bool {
     let current_lower = current.score - current.error.above_minimum();
-    candidate_upper < current_lower
+    candidate_ceiling < current_lower
 }
 
 /// The terms of `attempt` whose realized refinement in `candidate` does not
@@ -2871,16 +2905,16 @@ mod adaptive_spatial_resolution_tests {
     fn growth_requires_a_gain_beyond_both_certified_errors() {
         let current = evidence(1000.0, 1.0e-6, 1.0e-8);
         // A clear gain is accepted.
-        assert!(certified_evidence_gain(current, evidence(999.0, 1.0e-6, 1.0e-8)));
+        assert!(certified_evidence_gain(current, 999.0 + 1.0e-8));
         // A gain smaller than what the current fit may still decrease is not.
-        assert!(!certified_evidence_gain(current, evidence(1000.0 - 5.0e-7, 0.0, 0.0)));
+        assert!(!certified_evidence_gain(current, 1000.0 - 5.0e-7));
         // A gain smaller than the candidate's own evaluation band is not.
-        assert!(!certified_evidence_gain(current, evidence(1000.0 - 1.0e-5, 0.0, 2.0e-5)));
-        // The candidate's unfinished decrease only helps it, so it is not
-        // charged against the gain.
-        assert!(certified_evidence_gain(current, evidence(1000.0 - 1.0e-5, 1.0, 1.0e-8)));
+        assert!(!certified_evidence_gain(current, 1000.0 - 1.0e-5 + 2.0e-5));
+        // The candidate's ceiling needs no decrement verdict: its unfinished
+        // decrease only lowers its minimum.
+        assert!(certified_evidence_gain(current, 1000.0 - 1.0e-5 + 1.0e-8));
         // A loss is never a gain.
-        assert!(!certified_evidence_gain(current, evidence(1000.5, 0.0, 0.0)));
+        assert!(!certified_evidence_gain(current, 1000.5));
     }
 }
 

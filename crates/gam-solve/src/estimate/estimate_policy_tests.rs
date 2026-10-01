@@ -1255,6 +1255,7 @@ fn decode_invariant_test_parts() -> UnifiedFitResultParts {
                 newton_polish: None,
                 curvature_floor: None,
                 criterion_error: None,
+                value_band: None,
             }),
             ..Default::default()
         },

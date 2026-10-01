@@ -239,6 +239,7 @@ fn an_unresolvable_certificate_is_admissible_and_publishes_null_3036() {
         newton_polish: None,
         curvature_floor: None,
         criterion_error: None,
+        value_band: None,
     };
     assert_eq!(certificate.hessian_psd(), None);
     assert_eq!(
