@@ -476,6 +476,8 @@ struct Replicate {
     identity: [(usize, usize); 2],
     honest_extra_refits: [usize; 2],
     honest_factorizations: [usize; 2],
+    /// Per `α`: the z-cells the honest row's branch-and-bound examined.
+    honest_z_cells: [usize; 2],
 }
 
 /// The exchangeability identity of a fixed penalty's map at `(α, u)`.
@@ -547,6 +549,7 @@ fn replicate(scenario: Scenario, n: usize, seed: u64) -> Result<Replicate, Strin
     let mut identity = [(0, 0); 2];
     let mut honest_extra_refits = [0; 2];
     let mut honest_factorizations = [0; 2];
+    let mut honest_z_cells = [0; 2];
     for (a, &alpha) in ALPHAS.iter().enumerate() {
         // K = 1: the honest map. K = 0: a fixed penalty, nothing re-selected.
         // K = 2, and a payload without the count: refused, frozen set.
@@ -572,6 +575,7 @@ fn replicate(scenario: Scenario, n: usize, seed: u64) -> Result<Replicate, Strin
             if count == Some(1) {
                 honest_extra_refits[a] = row.cost.extra_refits;
                 honest_factorizations[a] = row.cost.factorizations;
+                honest_z_cells[a] = row.cost.z_cells;
             }
             let grade = grading(row.certificate);
             if grade == Grading::Identity {
@@ -592,6 +596,7 @@ fn replicate(scenario: Scenario, n: usize, seed: u64) -> Result<Replicate, Strin
         identity,
         honest_extra_refits,
         honest_factorizations,
+        honest_z_cells,
     })
 }
 
@@ -621,6 +626,7 @@ fn coverage_cell(scenario: Scenario, seed_index: usize, n: usize, size_index: us
         .expect("every replicate of the coverage cell fits");
     let mut failures = Vec::new();
     let mut refits = Vec::new();
+    let mut z_cells = Vec::new();
     let mut tallies: std::collections::BTreeMap<(&str, usize), (usize, usize)> = Default::default();
     let mut gradings = std::collections::BTreeMap::new();
     let mut identity_checks = 0;
@@ -651,6 +657,7 @@ fn coverage_cell(scenario: Scenario, seed_index: usize, n: usize, size_index: us
                 "an honest row refactorized the normal matrix"
             );
             refits.push(rep.honest_extra_refits[a]);
+            z_cells.push(rep.honest_z_cells[a]);
         }
     }
     // The identity must have run on every replicate at both α, or the cell
@@ -703,6 +710,12 @@ fn coverage_cell(scenario: Scenario, seed_index: usize, n: usize, size_index: us
     }
     refits.sort_unstable();
     let median = refits[refits.len() / 2];
+    z_cells.sort_unstable();
+    eprintln!(
+        "{scenario:?} n={n} honest rows: z-cells median {}, max {}",
+        z_cells[z_cells.len() / 2],
+        z_cells.last().copied().unwrap_or(0)
+    );
     eprintln!(
         "{scenario:?} n={n} honest rows: median extra refits {median}, max {}, one \
          factorization each",
@@ -734,10 +747,11 @@ fn coverage_cell(scenario: Scenario, seed_index: usize, n: usize, size_index: us
 // STRICTER than the single median over all nine that it replaces -- that one
 // could be held under two by the cheap cells while an expensive cell drifted.
 //
-// This does not change the cost of an honest row. The z branch-and-bound is
-// 94-97 % of the honest call at 1,000-2,100 cells and 35-121 ms per row, and
-// every production row with `conformal_certificate = honest_refit` pays it;
-// #3338's cell-count item is open, and the cap is not raised for it here.
+// The cost of an honest row is the z branch-and-bound, and each cell reports its
+// z-cell count per honest row. Splitting an undecided cell at its comparison's
+// certified sign change (0aa4e211a4) took the median from the 1,000-2,100 cells
+// #3338 measured to 222-368 across the nine cells. The nine together run in
+// 308 s on a 4-core runner, each far inside the 600 s cap, which is not raised.
 
 /// [`exchangeability_identity`] on one replicate: the covered folds equal the
 /// identity's count at both `α`, and the count moves with `α` (at `n = 20` the
