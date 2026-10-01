@@ -1,11 +1,11 @@
 # MASTER_FAILURES
 
 - Compile failures: **0**
-- Workspace tests run: **NOT MEASURED** (13169 runnable in the archive listing)
+- Workspace tests run: **NOT MEASURED** (13166 runnable in the archive listing)
 - Runtime test failures (FAIL/TIMEOUT/TERMINATING/LEAK): **NOT MEASURED** (144 seen in the shards that did run)
 - Python test failures: **NOT MEASURED — at least 6** (LOWER BOUND, not a count: Python API tests (job `cancelled`); Python populations, slow + torch (job `cancelled`) did not run to completion, so the tests they never reached are unmeasured, not passing)
 - Forbidden runtime signatures seen: **NOT MEASURED** (1 seen in the shards that did run)
-- Slow/timeout notices (#1393): **NOT MEASURED** (121 seen in the shards that did run)
+- Slow/timeout notices (#1393): **NOT MEASURED** (118 seen in the shards that did run)
 
 Coverage:
 - workspace shards: **NOT MEASURED** (build `success`, matrix `failure`, workspace shard set differs from 1..10: missing=[2, 3, 8], extra=[])
@@ -39,8 +39,11 @@ _None._
 - **FAIL** `gam::survival` :: `survival::survival_marginal_slope_stall::survival_marginal_slope_pc_duchon_production_shape_fit_converges`
 - **FAIL** `gam-cli::bin/gam` :: `cli_tests::survival_integration_small_dataset_converges`
 - **FAIL** `gam-cli::bin/gam` :: `cli_tests::survival_location_scale_saved_fit_preserves_linkwiggle_metadata`
+- **TERMINATING** `(─────────)` :: `gam-models survival::latent::survival::tests_interval_warm_surrogate_3711::a_zero_weight_exact_row_is_not_a_failure_for_the_surrogate_choice_3711`
+- **TIMEOUT** `gam-models` :: `survival::latent::survival::tests_interval_warm_surrogate_3711::a_zero_weight_exact_row_is_not_a_failure_for_the_surrogate_choice_3711`
 - **FAIL** `gam-models::inverse_gaussian_canonical_block_quadrature` :: `inverse_gaussian_canonical_single_smooth_resolves_its_block_correction`
 - **FAIL** `gam-models::quality_multinomial_penguins_2612` :: `gam_multinomial_classifies_penguin_species_at_least_as_well_as_nnet`
+- **FAIL** `gam-models::suite` :: `frequency_weights_and_adaptive_tensors::default_tensor_grows_until_it_resolves_the_interaction`
 - **FAIL** `gam-models::survival_acceptance` :: `covariate_constant_slope_2930::covariate_constant_slope_derivatives_differentiate_the_value_criterion_2930`
 - **FAIL** `gam-sae` :: `manifold::tests_chart_collapse_2691::zz_2691_recovered_versus_planted_ring`
 - **FAIL** `gam-sae` :: `manifold::tests_interval_active_bound_3438::interval_active_bound_slot_leaves_the_exact_information_3438`
@@ -55,7 +58,8 @@ _None._
 - **FAIL** `gam::sae` :: `sae::sae_manifold_circle_d2_ridge0_fits::sae_manifold_circle_d2_ridge0_fits`
 - **TERMINATING** `(─────────)` :: `gam::sae sae::sae_manifold_small_n_circle_seed_accept::sae_manifold_small_n_circle_accepts_a_seed_and_fits`
 - **TIMEOUT** `gam::sae` :: `sae::sae_manifold_small_n_circle_seed_accept::sae_manifold_small_n_circle_accepts_a_seed_and_fits`
-- **FAIL** `gam-models::suite` :: `survival_summary_block_offsets_3568::location_scale_survival_tables_name_the_covariate_terms_3568`
+- **TERMINATING** `(─────────)` :: `gam-models survival::latent::survival::tests_interval_warm_surrogate_3711::a_positive_weight_exact_failure_seeds_from_the_censored_surrogate_3711`
+- **TIMEOUT** `gam-models` :: `survival::latent::survival::tests_interval_warm_surrogate_3711::a_positive_weight_exact_failure_seeds_from_the_censored_surrogate_3711`
 - **TERMINATING** `(─────────)` :: `gam-models::survival_acceptance margslope_face_criterion_fd_2894::survival_marginal_slope_face_criterion_derivatives_match_central_differences_2894`
 - **TIMEOUT** `gam-models::survival_acceptance` :: `margslope_face_criterion_fd_2894::survival_marginal_slope_face_criterion_derivatives_match_central_differences_2894`
 - **TERMINATING** `(─────────)` :: `gam-sae manifold::tests_basin_bundle_envelope::two_basin_outer_fit_engages_exact_envelope`
@@ -68,13 +72,10 @@ _None._
 - **FAIL** `gam::inference` :: `misc::sbc_multinomial_prediction_interval_coverage::multinomial_mean_prediction_interval_covers_true_probability_at_nominal`
 - **FAIL** `gam::perf_scale` :: `misc::large_scale_perf_benchmark::large_scale_perf_mixed_three_smooths_n100k`
 - **FAIL** `gam::pyffi` :: `optimization::warm_start_invariance_contract::fits_are_invariant_to_warm_start_cache_state_across_families`
-- **TERMINATING** `(─────────)` :: `gam::regressions misc::bms_residual_repair_2924::residual_block_recovers_beta_and_approaches_the_oracle_repair_value`
-- **TIMEOUT** `gam::regressions` :: `misc::bms_residual_repair_2924::residual_block_recovers_beta_and_approaches_the_oracle_repair_value`
 - **FAIL** `gam::regressions` :: `misc::regression_poisson_te_block_axis_split::poisson_tensor_fit_integrates_a_multi_axis_block_axis_by_axis`
 - **FAIL** `gam::sae` :: `sae::sae_unit_speed_chart_canonicalization::certificate_reports_chart_pinned_by_canonicalization_with_finite_group`
 - **FAIL** `gam::survival` :: `survival::survival_marginal_slope_conditional_latent_2768::survival_marginal_slope_removes_the_conditional_latent_shift`
-- **FAIL** `gam-models` :: `fit_orchestration::gaussian_location_scale_link_wiggle_startup_2921_tests::gaussian_location_scale_link_wiggle_fits_the_gnomon_request_2921`
-- **FAIL** `gam-models` :: `gamlss::tests::wiggle_ls::binomial_location_scalewiggle_termswith_matern_spatial_blocks_fit_finitely`
+- **FAIL** `gam-models` :: `gamlss::tests::wiggle_ls::binomial_location_scalewiggle_optimum_is_budget_independent_2647`
 - **FAIL** `gam-models::suite` :: `explicit_length_scale_pinned_every_family_3020::explicit_length_scale_is_pinned_in_the_survival_location_scale_family_3020`
 - **FAIL** `gam-models::survival_acceptance` :: `covariate_constant_slope_2930::separated_survival_seed_takes_the_closing_rho_step_3467`
 - **TERMINATING** `(─────────)` :: `gam-sae manifold::coordinate_fidelity::recovered_collapse_tests::order_free_bound_dominates_every_anchor_order_4323`
@@ -95,9 +96,9 @@ _None._
 - **FAIL** `gam-cli::bin/gam` :: `cli_tests::survival_location_scale_live_warp_fits_linkwiggle_degree2_2695`
 - **FAIL** `gam-event-history` :: `tests::a_censored_tail_is_a_spell_and_the_distance_is_read_off_the_kaplan_meier_curve`
 - **FAIL** `gam-models` :: `fit_orchestration::drivers::iso_kappa_reml_gradient_fd_tests::production_kappa_route_psi_gradient_matches_its_value_2895`
-- **FAIL** `gam-models` :: `fit_orchestration::gaussian_location_scale_link_wiggle_startup_2921_tests::gaussian_location_scale_link_wiggle_fits_the_issue_request_2921`
-- **TERMINATING** `(─────────)` :: `gam-models transformation_normal::kappa_exact_joint_fd_tests::ctn_exact_joint_gradient_matches_fd_duchon_order0_power9`
-- **TIMEOUT** `gam-models` :: `transformation_normal::kappa_exact_joint_fd_tests::ctn_exact_joint_gradient_matches_fd_duchon_order0_power9`
+- **FAIL** `gam-models` :: `fit_orchestration::gaussian_location_scale_link_wiggle_startup_2921_tests::gaussian_location_scale_link_wiggle_fits_the_gnomon_request_2921`
+- **FAIL** `gam-models` :: `gamlss::tests::wiggle_ls::binomial_location_scalewiggle_termswith_matern_spatial_blocks_fit_finitely`
+- **FAIL** `gam-models` :: `latent_outer::latent_reml_tests::circle_latent_optimize_recovers_the_circle_876`
 - **TERMINATING** `(─────────)` :: `gam-models::survival_acceptance latent_frailty_inner_solve_2714::latent_hazard_multiplier_frailty_converges_on_veteran_2714`
 - **TIMEOUT** `gam-models::survival_acceptance` :: `latent_frailty_inner_solve_2714::latent_hazard_multiplier_frailty_converges_on_veteran_2714`
 - **TERMINATING** `(─────────)` :: `gam-sae manifold::coordinate_fidelity::recovered_collapse_tests::the_anchor_walk_must_not_stop_at_the_first_non_improving_order_4323`
@@ -118,8 +119,9 @@ _None._
 - **TERMINATING** `(─────────)` :: `gam-event-history tests::a_multi_mark_rank_two_cohort_does_not_run_away`
 - **TIMEOUT** `gam-event-history` :: `tests::a_multi_mark_rank_two_cohort_does_not_run_away`
 - **FAIL** `gam-models` :: `fit_orchestration::drivers::design_assembly_constraint_tests::psi_gram_tensor_e2e_kappa_optimum_matches_streamed`
-- **TERMINATING** `(─────────)` :: `gam-models survival::latent::survival::tests_interval_warm_surrogate_3711::a_positive_weight_exact_failure_seeds_from_the_censored_surrogate_3711`
-- **TIMEOUT** `gam-models` :: `survival::latent::survival::tests_interval_warm_surrogate_3711::a_positive_weight_exact_failure_seeds_from_the_censored_surrogate_3711`
+- **FAIL** `gam-models` :: `fit_orchestration::gaussian_location_scale_link_wiggle_startup_2921_tests::gaussian_location_scale_link_wiggle_fits_the_issue_request_2921`
+- **TERMINATING** `(─────────)` :: `gam-models survival::latent::survival::tests_rho_domain_2902::latent_rho_domain_is_its_realized_blocks_domain_and_rails_at_switch_off_2902`
+- **TIMEOUT** `gam-models` :: `survival::latent::survival::tests_rho_domain_2902::latent_rho_domain_is_its_realized_blocks_domain_and_rails_at_switch_off_2902`
 - **TERMINATING** `(─────────)` :: `gam-models::survival_acceptance latent_loaded_vs_unloaded_chart_2714::latent_loaded_vs_unloaded_fit_selects_its_background_with_rho_2714`
 - **TIMEOUT** `gam-models::survival_acceptance` :: `latent_loaded_vs_unloaded_chart_2714::latent_loaded_vs_unloaded_fit_selects_its_background_with_rho_2714`
 - **TERMINATING** `(─────────)` :: `gam-predict large_scale_reml_stress_tests::large_scale_reml_stress_main`
@@ -134,8 +136,6 @@ _None._
 - **FAIL** `gam::identifiability` :: `misc::binary_outcome_bms_identifiability::binary_outcome_shape_bms_matern_fit_is_not_refused_by_identifiability_audit`
 - **TERMINATING** `(─────────)` :: `gam::misc misc::bug_hunt_2301_diagnose_alo_multiclass_test::diagnose_alo_transformation_normal_matches_brute_force_loo_2301`
 - **TIMEOUT** `gam::misc` :: `misc::bug_hunt_2301_diagnose_alo_multiclass_test::diagnose_alo_transformation_normal_matches_brute_force_loo_2301`
-- **TERMINATING** `(─────────)` :: `gam::perf_scale optimization::grouped_binomial_sweep_2569::grouped_binomial_sweep_every_fit_is_minted_2569`
-- **TIMEOUT** `gam::perf_scale` :: `optimization::grouped_binomial_sweep_2569::grouped_binomial_sweep_every_fit_is_minted_2569`
 - **FAIL** `gam::regressions` :: `families::multinomial_blocks_collapse_to_zero_width::multinomial_three_class_fit_keeps_all_blocks_full_width`
 - **FAIL** `gam::regressions` :: `smooths::margslope_matern_slope_slowdown::margslope_matern_slope_centers20_issue_scale`
 - **TERMINATING** `(─────────)` :: `gam::sae sae::sae_ev_vs_k_frontier::ev_vs_k_frontier_does_not_fire_on_unstructured_linear_corpus`
@@ -146,9 +146,8 @@ _None._
 - **FAIL** `gam-event-history` :: `tests::the_smoothed_latent_state_tracks_the_simulated_path`
 - **FAIL** `gam-models` :: `fit_orchestration::drivers::design_assembly_constraint_tests::psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient`
 - **FAIL** `gam-models` :: `fit_orchestration::drivers::psi_gram_tensor_fast_path_tests::psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed`
-- **FAIL** `gam-models` :: `fit_orchestration::materialize::tests::gaussian_location_scale_wiggle_face_criterion_gradient_matches_central_differences_2894`
-- **TERMINATING** `(─────────)` :: `gam-models survival::latent::survival::tests_interval_warm_surrogate_3711::a_zero_weight_exact_row_is_not_a_failure_for_the_surrogate_choice_3711`
-- **TIMEOUT** `gam-models` :: `survival::latent::survival::tests_interval_warm_surrogate_3711::a_zero_weight_exact_row_is_not_a_failure_for_the_surrogate_choice_3711`
+- **TERMINATING** `(─────────)` :: `gam-models transformation_normal::kappa_exact_joint_fd_tests::ctn_exact_joint_gradient_matches_fd_duchon_linear_power2`
+- **TIMEOUT** `gam-models` :: `transformation_normal::kappa_exact_joint_fd_tests::ctn_exact_joint_gradient_matches_fd_duchon_linear_power2`
 - **FAIL** `gam-models::survival_acceptance` :: `location_scale_heteroscedastic_globalization_1569::a_saved_model_predicts_the_log_likelihood_it_was_fit_at_2695`
 - **FAIL** `gam-sae` :: `manifold::tests_tier0_primary_path_2023::tests::e1_arc_outer_search_mints_or_reports_blocker_2266`
 - **FAIL** `gam::basis_smooth` :: `smooths::duchon_sin8_quality::duchon_sin8_max_error_within_budget`
@@ -161,6 +160,8 @@ _None._
 - **TERMINATING** `(─────────)` :: `gam::survival survival::survival_marginal_slope_large_scale_repro::survival_marginal_slope_large_scale_repro_vm_exact_engages_and_converges`
 - **TIMEOUT** `gam::survival` :: `survival::survival_marginal_slope_large_scale_repro::survival_marginal_slope_large_scale_repro_vm_exact_engages_and_converges`
 - **FAIL** `gam-event-history` :: `tests::forecast_tiers_population_score_and_history_are_one_model_conditioned_on_more`
+- **TERMINATING** `(─────────)` :: `gam-models transformation_normal::kappa_exact_joint_fd_tests::ctn_exact_joint_gradient_matches_fd_duchon_order0_power9`
+- **TIMEOUT** `gam-models` :: `transformation_normal::kappa_exact_joint_fd_tests::ctn_exact_joint_gradient_matches_fd_duchon_order0_power9`
 - **FAIL** `gam-sae` :: `encode::joint_encode_retraction_2934_tests::joint_encode_keeps_a_mobius_width_inside_the_band_2934`
 - **FAIL** `gam-sae` :: `inference::atlas_nerve::tests::existence_test_is_calibrated_when_no_transfer_exists`
 - **FAIL** `gam-sae` :: `manifold::support_outer::tests::rational_route_search_checks_its_certified_point_on_unseen_probes_2933`
@@ -169,7 +170,6 @@ _None._
 - **TERMINATING** `(─────────)` :: `gam-sae manifold::tests_outer_quasi_laplace_probe_budget_2080::wide_p_outer_reml_terminates_within_probe_budget_2080`
 - **TIMEOUT** `gam-sae` :: `manifold::tests_outer_quasi_laplace_probe_budget_2080::wide_p_outer_reml_terminates_within_probe_budget_2080`
 - **FAIL** `gam-sae` :: `manifold::tests_recovery_split_780::seed_inner_state_installs_and_reuses_matching_beta`
-- **FAIL** `gam-pyffi` :: `batch_tests::circle_latent_recovers_circle_not_collapse`
 - **FAIL** `gam-pyffi` :: `inference::inference_instruments::tests::matched_controls_do_not_promote_circle_on_seeded_isotropic_noise_2262`
 
 ## Python test failures
@@ -198,8 +198,9 @@ _Lower bound: 6 recorded before the run stopped. Unmeasured: Python API tests (j
 - SLOW `(─────────)` :: `gam::measure_jet_ctn_range_screen_2754 transformation_normal_entry_reaches_the_measure_jet_range_screen_2754`
 - TERMINATING `(─────────)` :: `gam::measure_jet_ctn_range_screen_2754 transformation_normal_entry_reaches_the_measure_jet_range_screen_2754`
 - TIMEOUT `gam::measure_jet_ctn_range_screen_2754` :: `transformation_normal_entry_reaches_the_measure_jet_range_screen_2754`
-- SLOW `(─────────)` :: `gam::sae sae::sae_manifold_d1_ordered_beta_bernoulli_gate_cocollapse::sae_manifold_d1_ordered_beta_bernoulli_gate_cocollapse`
-- SLOW `(─────────)` :: `gam::basis_smooth smooths::smooth_term_lr_size_calibration::gaussian_null_size_is_calibrated_where_the_expansion_is_exact_2672`
+- SLOW `(─────────)` :: `gam-models survival::latent::survival::tests_interval_warm_surrogate_3711::a_zero_weight_exact_row_is_not_a_failure_for_the_surrogate_choice_3711`
+- TERMINATING `(─────────)` :: `gam-models survival::latent::survival::tests_interval_warm_surrogate_3711::a_zero_weight_exact_row_is_not_a_failure_for_the_surrogate_choice_3711`
+- TIMEOUT `gam-models` :: `survival::latent::survival::tests_interval_warm_surrogate_3711::a_zero_weight_exact_row_is_not_a_failure_for_the_surrogate_choice_3711`
 - SLOW `(─────────)` :: `gam::inference misc::margslope_flex_large_scale_repro::flex_full_outer_completes_under_budget_683`
 - TERMINATING `(─────────)` :: `gam::inference misc::margslope_flex_large_scale_repro::flex_full_outer_completes_under_budget_683`
 - TIMEOUT `gam::inference` :: `misc::margslope_flex_large_scale_repro::flex_full_outer_completes_under_budget_683`
@@ -209,6 +210,9 @@ _Lower bound: 6 recorded before the run stopped. Unmeasured: Python API tests (j
 - SLOW `(─────────)` :: `gam::sae sae::sae_manifold_small_n_circle_seed_accept::sae_manifold_small_n_circle_accepts_a_seed_and_fits`
 - TERMINATING `(─────────)` :: `gam::sae sae::sae_manifold_small_n_circle_seed_accept::sae_manifold_small_n_circle_accepts_a_seed_and_fits`
 - TIMEOUT `gam::sae` :: `sae::sae_manifold_small_n_circle_seed_accept::sae_manifold_small_n_circle_accepts_a_seed_and_fits`
+- SLOW `(─────────)` :: `gam-models survival::latent::survival::tests_interval_warm_surrogate_3711::a_positive_weight_exact_failure_seeds_from_the_censored_surrogate_3711`
+- TERMINATING `(─────────)` :: `gam-models survival::latent::survival::tests_interval_warm_surrogate_3711::a_positive_weight_exact_failure_seeds_from_the_censored_surrogate_3711`
+- TIMEOUT `gam-models` :: `survival::latent::survival::tests_interval_warm_surrogate_3711::a_positive_weight_exact_failure_seeds_from_the_censored_surrogate_3711`
 - SLOW `(─────────)` :: `gam-models::survival_acceptance margslope_face_criterion_fd_2894::survival_marginal_slope_face_criterion_derivatives_match_central_differences_2894`
 - TERMINATING `(─────────)` :: `gam-models::survival_acceptance margslope_face_criterion_fd_2894::survival_marginal_slope_face_criterion_derivatives_match_central_differences_2894`
 - TIMEOUT `gam-models::survival_acceptance` :: `margslope_face_criterion_fd_2894::survival_marginal_slope_face_criterion_derivatives_match_central_differences_2894`
@@ -221,27 +225,20 @@ _Lower bound: 6 recorded before the run stopped. Unmeasured: Python API tests (j
 - SLOW `(─────────)` :: `gam-sae manifold::tests_startup_validation_1782::topologies_fit_on_circle_data_1782`
 - TERMINATING `(─────────)` :: `gam-sae manifold::tests_startup_validation_1782::topologies_fit_on_circle_data_1782`
 - TIMEOUT `gam-sae` :: `manifold::tests_startup_validation_1782::topologies_fit_on_circle_data_1782`
-- SLOW `gam::basis_smooth` :: `smooths::smooth_term_lr_size_calibration::gaussian_null_size_is_calibrated_where_the_expansion_is_exact_2672`
 - SLOW `(─────────)` :: `gam::regressions misc::bms_residual_repair_2924::residual_block_recovers_beta_and_approaches_the_oracle_repair_value`
-- TERMINATING `(─────────)` :: `gam::regressions misc::bms_residual_repair_2924::residual_block_recovers_beta_and_approaches_the_oracle_repair_value`
-- TIMEOUT `gam::regressions` :: `misc::bms_residual_repair_2924::residual_block_recovers_beta_and_approaches_the_oracle_repair_value`
-- SLOW `(─────────)` :: `gam-cli::bin/gam cli_tests::survival_location_scale_linear_pc_log_scale_large_frame_predicts_bands_3038`
 - SLOW `(─────────)` :: `gam-sae manifold::coordinate_fidelity::recovered_collapse_tests::order_free_bound_dominates_every_anchor_order_4323`
 - TERMINATING `(─────────)` :: `gam-sae manifold::coordinate_fidelity::recovered_collapse_tests::order_free_bound_dominates_every_anchor_order_4323`
 - TIMEOUT `gam-sae` :: `manifold::coordinate_fidelity::recovered_collapse_tests::order_free_bound_dominates_every_anchor_order_4323`
 - SLOW `(─────────)` :: `gam-sae manifold::tests_behavior_qwen_real::zz2015_tiny_inner_crawl_terminates`
 - TERMINATING `(─────────)` :: `gam-sae manifold::tests_behavior_qwen_real::zz2015_tiny_inner_crawl_terminates`
 - TIMEOUT `gam-sae` :: `manifold::tests_behavior_qwen_real::zz2015_tiny_inner_crawl_terminates`
-- SLOW `gam-cli::bin/gam` :: `cli_tests::survival_location_scale_linear_pc_log_scale_large_frame_predicts_bands_3038`
+- SLOW `gam::regressions` :: `misc::bms_residual_repair_2924::residual_block_recovers_beta_and_approaches_the_oracle_repair_value`
 - SLOW `(─────────)` :: `gam::basis_smooth misc::aniso_population_calibration::aniso_demo_population_z_scores_are_equalized_for_iso_and_aniso`
 - TERMINATING `(─────────)` :: `gam::basis_smooth misc::aniso_population_calibration::aniso_demo_population_z_scores_are_equalized_for_iso_and_aniso`
 - TIMEOUT `gam::basis_smooth` :: `misc::aniso_population_calibration::aniso_demo_population_z_scores_are_equalized_for_iso_and_aniso`
 - SLOW `(─────────)` :: `gam::sae sae::sae_manifold_k_ladder_recovery::sae_manifold_k_ladder_recovery_k1024`
 - TERMINATING `(─────────)` :: `gam::sae sae::sae_manifold_k_ladder_recovery::sae_manifold_k_ladder_recovery_k1024`
 - TIMEOUT `gam::sae` :: `sae::sae_manifold_k_ladder_recovery::sae_manifold_k_ladder_recovery_k1024`
-- SLOW `(─────────)` :: `gam-models transformation_normal::kappa_exact_joint_fd_tests::ctn_exact_joint_gradient_matches_fd_duchon_order0_power9`
-- TERMINATING `(─────────)` :: `gam-models transformation_normal::kappa_exact_joint_fd_tests::ctn_exact_joint_gradient_matches_fd_duchon_order0_power9`
-- TIMEOUT `gam-models` :: `transformation_normal::kappa_exact_joint_fd_tests::ctn_exact_joint_gradient_matches_fd_duchon_order0_power9`
 - SLOW `(─────────)` :: `gam-models::survival_acceptance latent_frailty_inner_solve_2714::latent_hazard_multiplier_frailty_converges_on_veteran_2714`
 - TERMINATING `(─────────)` :: `gam-models::survival_acceptance latent_frailty_inner_solve_2714::latent_hazard_multiplier_frailty_converges_on_veteran_2714`
 - TIMEOUT `gam-models::survival_acceptance` :: `latent_frailty_inner_solve_2714::latent_hazard_multiplier_frailty_converges_on_veteran_2714`
@@ -262,9 +259,9 @@ _Lower bound: 6 recorded before the run stopped. Unmeasured: Python API tests (j
 - SLOW `(─────────)` :: `gam-event-history tests::a_multi_mark_rank_two_cohort_does_not_run_away`
 - TERMINATING `(─────────)` :: `gam-event-history tests::a_multi_mark_rank_two_cohort_does_not_run_away`
 - TIMEOUT `gam-event-history` :: `tests::a_multi_mark_rank_two_cohort_does_not_run_away`
-- SLOW `(─────────)` :: `gam-models survival::latent::survival::tests_interval_warm_surrogate_3711::a_positive_weight_exact_failure_seeds_from_the_censored_surrogate_3711`
-- TERMINATING `(─────────)` :: `gam-models survival::latent::survival::tests_interval_warm_surrogate_3711::a_positive_weight_exact_failure_seeds_from_the_censored_surrogate_3711`
-- TIMEOUT `gam-models` :: `survival::latent::survival::tests_interval_warm_surrogate_3711::a_positive_weight_exact_failure_seeds_from_the_censored_surrogate_3711`
+- SLOW `(─────────)` :: `gam-models survival::latent::survival::tests_rho_domain_2902::latent_rho_domain_is_its_realized_blocks_domain_and_rails_at_switch_off_2902`
+- TERMINATING `(─────────)` :: `gam-models survival::latent::survival::tests_rho_domain_2902::latent_rho_domain_is_its_realized_blocks_domain_and_rails_at_switch_off_2902`
+- TIMEOUT `gam-models` :: `survival::latent::survival::tests_rho_domain_2902::latent_rho_domain_is_its_realized_blocks_domain_and_rails_at_switch_off_2902`
 - SLOW `(─────────)` :: `gam-models::survival_acceptance latent_loaded_vs_unloaded_chart_2714::latent_loaded_vs_unloaded_fit_selects_its_background_with_rho_2714`
 - TERMINATING `(─────────)` :: `gam-models::survival_acceptance latent_loaded_vs_unloaded_chart_2714::latent_loaded_vs_unloaded_fit_selects_its_background_with_rho_2714`
 - TIMEOUT `gam-models::survival_acceptance` :: `latent_loaded_vs_unloaded_chart_2714::latent_loaded_vs_unloaded_fit_selects_its_background_with_rho_2714`
@@ -283,15 +280,14 @@ _Lower bound: 6 recorded before the run stopped. Unmeasured: Python API tests (j
 - TERMINATING `(─────────)` :: `gam::misc misc::bug_hunt_2301_diagnose_alo_multiclass_test::diagnose_alo_transformation_normal_matches_brute_force_loo_2301`
 - TIMEOUT `gam::misc` :: `misc::bug_hunt_2301_diagnose_alo_multiclass_test::diagnose_alo_transformation_normal_matches_brute_force_loo_2301`
 - SLOW `(─────────)` :: `gam::perf_scale optimization::grouped_binomial_sweep_2569::grouped_binomial_sweep_every_fit_is_minted_2569`
-- TERMINATING `(─────────)` :: `gam::perf_scale optimization::grouped_binomial_sweep_2569::grouped_binomial_sweep_every_fit_is_minted_2569`
-- TIMEOUT `gam::perf_scale` :: `optimization::grouped_binomial_sweep_2569::grouped_binomial_sweep_every_fit_is_minted_2569`
 - SLOW `(─────────)` :: `gam::sae sae::sae_ev_vs_k_frontier::ev_vs_k_frontier_does_not_fire_on_unstructured_linear_corpus`
 - TERMINATING `(─────────)` :: `gam::sae sae::sae_ev_vs_k_frontier::ev_vs_k_frontier_does_not_fire_on_unstructured_linear_corpus`
 - TIMEOUT `gam::sae` :: `sae::sae_ev_vs_k_frontier::ev_vs_k_frontier_does_not_fire_on_unstructured_linear_corpus`
-- SLOW `(─────────)` :: `gam-models survival::latent::survival::tests_interval_warm_surrogate_3711::a_zero_weight_exact_row_is_not_a_failure_for_the_surrogate_choice_3711`
-- TERMINATING `(─────────)` :: `gam-models survival::latent::survival::tests_interval_warm_surrogate_3711::a_zero_weight_exact_row_is_not_a_failure_for_the_surrogate_choice_3711`
-- TIMEOUT `gam-models` :: `survival::latent::survival::tests_interval_warm_surrogate_3711::a_zero_weight_exact_row_is_not_a_failure_for_the_surrogate_choice_3711`
+- SLOW `(─────────)` :: `gam-models transformation_normal::kappa_exact_joint_fd_tests::ctn_exact_joint_gradient_matches_fd_duchon_linear_power2`
+- TERMINATING `(─────────)` :: `gam-models transformation_normal::kappa_exact_joint_fd_tests::ctn_exact_joint_gradient_matches_fd_duchon_linear_power2`
+- TIMEOUT `gam-models` :: `transformation_normal::kappa_exact_joint_fd_tests::ctn_exact_joint_gradient_matches_fd_duchon_linear_power2`
 - SLOW `(─────────)` :: `gam-sae manifold::tests_startup_validation_1782::ordered_beta_finiteness_sweep_2609`
+- SLOW `gam::perf_scale` :: `optimization::grouped_binomial_sweep_2569::grouped_binomial_sweep_every_fit_is_minted_2569`
 - SLOW `gam-sae` :: `manifold::tests_startup_validation_1782::ordered_beta_finiteness_sweep_2609`
 - SLOW `(─────────)` :: `gam::basis_smooth smooths::smooth_term_lr_size_calibration::exhaustive_null_simulation_size_grid`
 - SLOW `(─────────)` :: `gam::sae sae::sae_factored_frame_solve::factored_matches_full_b_recovery`
@@ -301,7 +297,9 @@ _Lower bound: 6 recorded before the run stopped. Unmeasured: Python API tests (j
 - SLOW `(─────────)` :: `gam::survival survival::survival_marginal_slope_large_scale_repro::survival_marginal_slope_large_scale_repro_vm_exact_engages_and_converges`
 - TERMINATING `(─────────)` :: `gam::survival survival::survival_marginal_slope_large_scale_repro::survival_marginal_slope_large_scale_repro_vm_exact_engages_and_converges`
 - TIMEOUT `gam::survival` :: `survival::survival_marginal_slope_large_scale_repro::survival_marginal_slope_large_scale_repro_vm_exact_engages_and_converges`
-- SLOW `(─────────)` :: `gam-models inference::model_payload_builders::latent_saved_baseline_tests::saved_latent_survival_model_predicts_at_its_fitted_baseline_2714`
+- SLOW `(─────────)` :: `gam-models transformation_normal::kappa_exact_joint_fd_tests::ctn_exact_joint_gradient_matches_fd_duchon_order0_power9`
+- TERMINATING `(─────────)` :: `gam-models transformation_normal::kappa_exact_joint_fd_tests::ctn_exact_joint_gradient_matches_fd_duchon_order0_power9`
+- TIMEOUT `gam-models` :: `transformation_normal::kappa_exact_joint_fd_tests::ctn_exact_joint_gradient_matches_fd_duchon_order0_power9`
 - SLOW `(─────────)` :: `gam-sae manifold::tests_collapse_2132::zz_collapse_2132_heldout_ev_nondecreasing_and_beats_pca`
 - TERMINATING `(─────────)` :: `gam-sae manifold::tests_collapse_2132::zz_collapse_2132_heldout_ev_nondecreasing_and_beats_pca`
 - TIMEOUT `gam-sae` :: `manifold::tests_collapse_2132::zz_collapse_2132_heldout_ev_nondecreasing_and_beats_pca`
@@ -309,5 +307,4 @@ _Lower bound: 6 recorded before the run stopped. Unmeasured: Python API tests (j
 - TERMINATING `(─────────)` :: `gam-sae manifold::tests_outer_quasi_laplace_probe_budget_2080::wide_p_outer_reml_terminates_within_probe_budget_2080`
 - TIMEOUT `gam-sae` :: `manifold::tests_outer_quasi_laplace_probe_budget_2080::wide_p_outer_reml_terminates_within_probe_budget_2080`
 - SLOW `gam::basis_smooth` :: `smooths::smooth_term_lr_size_calibration::exhaustive_null_simulation_size_grid`
-- SLOW `gam-models` :: `inference::model_payload_builders::latent_saved_baseline_tests::saved_latent_survival_model_predicts_at_its_fitted_baseline_2714`
 
