@@ -2521,7 +2521,8 @@ fn cone_laplace_outer_hessian(
         }
     }
     // `D²_βM[β̂̇_i, β̂̇_j] + D_βM[β̈_ij]`, the family's β-side share of `M̈_ij`. The term reads it
-    // applied to `δ̄` alone, so it is fetched as a drift for every pair and never as a trace.
+    // applied to `δ̄` alone, so it is fetched as that product for every pair, never as a drift or a
+    // trace, and a provider that can form the products without the pair drifts does (#4564).
     let triples: Vec<(Array1<f64>, Array1<f64>, Array1<f64>)> = if effective_deriv.has_corrections()
     {
         states
@@ -2537,20 +2538,8 @@ fn cone_laplace_outer_hessian(
     } else {
         Vec::new()
     };
-    let corrections: Vec<Option<DriftDerivResult>> = if effective_deriv.has_corrections() {
-        if effective_deriv.has_batched_hessian_second_derivative_corrections() {
-            effective_deriv.hessian_second_derivative_corrections_result(&triples)?
-        } else {
-            use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-            triples
-                .par_iter()
-                .map(|(v_k, v_l, u_kl)| {
-                    gam_problem::with_nested_parallel(|| {
-                        effective_deriv.hessian_second_derivative_correction_result(v_k, v_l, u_kl)
-                    })
-                })
-                .collect::<Result<_, String>>()?
-        }
+    let corrections: Vec<Option<Array1<f64>>> = if effective_deriv.has_corrections() {
+        effective_deriv.hessian_second_derivative_corrections_applied(&triples, &mean_offset)?
     } else {
         states.iter().map(|_| None).collect()
     };
@@ -2620,8 +2609,8 @@ fn cone_laplace_outer_hessian(
         for drift in &moving_drifts {
             precision_rate_on_mean += &drift.apply(&mean_offset);
         }
-        if let Some(drift) = correction.as_ref() {
-            precision_rate_on_mean += &drift.apply(&mean_offset);
+        if let Some(applied) = correction.as_ref() {
+            precision_rate_on_mean += applied;
         }
         precision_rate_on_mean /= scale;
         let mut gradient_rate = match &term.gradient_motion {

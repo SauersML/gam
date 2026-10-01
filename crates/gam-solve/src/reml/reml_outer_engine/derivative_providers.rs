@@ -10,6 +10,34 @@ pub type ModeResponseRhsCorrectionFn = Arc<
         -> Result<Array1<f64>, String> + Send + Sync,
 >;
 
+/// [`HessianDerivativeProvider::hessian_second_derivative_corrections_applied`]
+/// by forming each correction: batched when the provider batches them, else
+/// per triple across the pool, each then applied to `x`.
+pub fn formed_second_derivative_corrections_applied<P: HessianDerivativeProvider + ?Sized>(
+    provider: &P,
+    triples: &[(Array1<f64>, Array1<f64>, Array1<f64>)],
+    x: &Array1<f64>,
+) -> Result<Vec<Option<Array1<f64>>>, String> {
+    let corrections: Vec<Option<DriftDerivResult>> =
+        if provider.has_batched_hessian_second_derivative_corrections() {
+            provider.hessian_second_derivative_corrections_result(triples)?
+        } else {
+            use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+            triples
+                .par_iter()
+                .map(|(v_k, v_l, u_kl)| {
+                    gam_problem::with_nested_parallel(|| {
+                        provider.hessian_second_derivative_correction_result(v_k, v_l, u_kl)
+                    })
+                })
+                .collect::<Result<_, String>>()?
+        };
+    Ok(corrections
+        .into_iter()
+        .map(|correction| correction.map(|drift| drift.apply(x)))
+        .collect())
+}
+
 /// Provider of family-specific Hessian derivative information.
 ///
 /// The REML/LAML gradient requires ∂H/∂ρₖ. For Gaussian, this is just Aₖ = λₖSₖ.
@@ -142,6 +170,22 @@ pub trait HessianDerivativeProvider: Send + Sync {
 
     fn has_batched_hessian_second_derivative_corrections(&self) -> bool {
         false
+    }
+
+    /// The second-order corrections of
+    /// [`Self::hessian_second_derivative_corrections_result`], each applied to
+    /// the one vector `x`; `None` where that hook returns `None`.
+    ///
+    /// The constrained Laplace term's outer Hessian reads every pair's
+    /// correction only as `C_kl·x` against its mean offset, so a provider that
+    /// can form the products without the `K(K+1)/2` drifts overrides this. The
+    /// default is [`formed_second_derivative_corrections_applied`].
+    fn hessian_second_derivative_corrections_applied(
+        &self,
+        triples: &[(Array1<f64>, Array1<f64>, Array1<f64>)],
+        x: &Array1<f64>,
+    ) -> Result<Vec<Option<Array1<f64>>>, String> {
+        formed_second_derivative_corrections_applied(self, triples, x)
     }
 
     /// Hand the provider every first-order mode response the ρ-ρ pair loop will

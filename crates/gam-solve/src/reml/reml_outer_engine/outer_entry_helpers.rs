@@ -1720,6 +1720,13 @@ impl<'a> HessianDerivativeProvider for BorrowedDerivProvider<'a> {
     fn has_batched_hessian_second_derivative_corrections(&self) -> bool {
         self.0.has_batched_hessian_second_derivative_corrections()
     }
+    fn hessian_second_derivative_corrections_applied(
+        &self,
+        triples: &[(Array1<f64>, Array1<f64>, Array1<f64>)],
+        x: &Array1<f64>,
+    ) -> Result<Vec<Option<Array1<f64>>>, String> {
+        self.0.hessian_second_derivative_corrections_applied(triples, x)
+    }
     fn has_corrections(&self) -> bool {
         self.0.has_corrections()
     }

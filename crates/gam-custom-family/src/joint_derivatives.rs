@@ -4,6 +4,7 @@
 //! by concern (#1145). Re-exported via `custom_family`.
 
 use super::*;
+use gam_solve::estimate::reml::reml_outer_engine::formed_second_derivative_corrections_applied;
 
 /// Shared `(term1, term2)` second-derivative correction assembly used by both
 /// the borrowed and owned joint derivative providers. `compute_dh` supplies the
@@ -34,6 +35,74 @@ pub(crate) fn joint_second_derivative_correction_result(
         dim_hint: u_kl.len(),
     };
     Ok(Some(DriftDerivResult::Operator(Arc::new(op))))
+}
+
+/// The corrections `D_βH[u_kl] + D²_βH[v_l, v_k]` of
+/// [`joint_second_derivative_correction_result`], each applied to one vector
+/// `x`, from `1 + K` drifts instead of two per triple (`K` distinct `v_k`).
+///
+/// `H` is the exact coefficient Hessian of one scalar objective
+/// (`ExactNewtonJointHessianWorkspace`), so `D_βH` and `D²_βH` are its third
+/// and fourth derivative tensors, symmetric in every slot:
+/// `D_βH[u]x = D_βH[x]u` and `D²_βH[v_l, v_k]x = D²_βH[x, v_k]v_l`. One drift
+/// `D_βH[x]` and one `D²_βH[x, v_k]` per distinct `v_k` then give every
+/// triple, where the operator form costs a full row pass per triple for each
+/// term. `None` when a drift is unavailable, so the caller forms the
+/// operators exactly as before.
+fn symmetric_second_derivative_corrections_applied(
+    compute_dh: &crate::joint_newton::DriftDerivFn<'_>,
+    compute_d2h: &crate::joint_newton::DriftSecondDerivFn<'_>,
+    compute_d2h_many: Option<&crate::joint_newton::DriftSecondDerivManyFn<'_>>,
+    triples: &[(Array1<f64>, Array1<f64>, Array1<f64>)],
+    x: &Array1<f64>,
+) -> Result<Option<Vec<Option<Array1<f64>>>>, CustomFamilyError> {
+    let Some(drift_at_x) = compute_dh(x)? else {
+        return Ok(None);
+    };
+    // Each triple's first response, by its index among the distinct ones.
+    let mut firsts: Vec<&Array1<f64>> = Vec::new();
+    let first_of: Vec<usize> = triples
+        .iter()
+        .map(|(v_k, _, _)| {
+            firsts.iter().position(|first| *first == v_k).unwrap_or_else(|| {
+                firsts.push(v_k);
+                firsts.len() - 1
+            })
+        })
+        .collect();
+    let second_drifts: Vec<Option<DriftDerivResult>> = match compute_d2h_many {
+        Some(many) => {
+            let pairs: Vec<(Array1<f64>, Array1<f64>)> =
+                firsts.iter().map(|v_k| (x.clone(), (*v_k).clone())).collect();
+            many(&pairs)?
+        }
+        None => {
+            use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+            firsts
+                .par_iter()
+                .map(|v_k| gam_problem::with_nested_parallel(|| compute_d2h(x, v_k)))
+                .collect::<Result<_, CustomFamilyError>>()?
+        }
+    };
+    if second_drifts.len() != firsts.len() {
+        return Err(CustomFamilyError::trial_point(format!(
+            "second-derivative drifts: {} returned for {} directions",
+            second_drifts.len(),
+            firsts.len()
+        )));
+    }
+    let Some(second_drifts) = second_drifts.into_iter().collect::<Option<Vec<_>>>() else {
+        return Ok(None);
+    };
+    Ok(Some(
+        triples
+            .iter()
+            .zip(&first_of)
+            .map(|((_, v_l, u_kl), &first)| {
+                Some(drift_at_x.apply(u_kl) + second_drifts[first].apply(v_l))
+            })
+            .collect(),
+    ))
 }
 
 /// Fold an optional dense Jeffreys drift into an optional inner drift result,
@@ -167,6 +236,25 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
 
     fn has_batched_hessian_second_derivative_corrections(&self) -> bool {
         self.compute_d2h_many.is_some()
+    }
+
+    fn hessian_second_derivative_corrections_applied(
+        &self,
+        triples: &[(Array1<f64>, Array1<f64>, Array1<f64>)],
+        x: &Array1<f64>,
+    ) -> Result<Vec<Option<Array1<f64>>>, String> {
+        match symmetric_second_derivative_corrections_applied(
+            self.compute_dh,
+            self.compute_d2h,
+            self.compute_d2h_many,
+            triples,
+            x,
+        )
+        .map_err(|error| error.to_string())?
+        {
+            Some(applied) => Ok(applied),
+            None => formed_second_derivative_corrections_applied(self, triples, x),
+        }
     }
 
     fn has_corrections(&self) -> bool {
@@ -317,6 +405,25 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
 
     fn has_batched_hessian_second_derivative_corrections(&self) -> bool {
         self.compute_d2h_many.is_some()
+    }
+
+    fn hessian_second_derivative_corrections_applied(
+        &self,
+        triples: &[(Array1<f64>, Array1<f64>, Array1<f64>)],
+        x: &Array1<f64>,
+    ) -> Result<Vec<Option<Array1<f64>>>, String> {
+        match symmetric_second_derivative_corrections_applied(
+            &*self.compute_dh,
+            &*self.compute_d2h,
+            self.compute_d2h_many.as_deref(),
+            triples,
+            x,
+        )
+        .map_err(|error| error.to_string())?
+        {
+            Some(applied) => Ok(applied),
+            None => formed_second_derivative_corrections_applied(self, triples, x),
+        }
     }
 
     fn hessian_second_derivative_correction_traces(
@@ -758,6 +865,52 @@ impl HessianDerivativeProvider for JeffreysHphiAwareJointDerivatives<'_> {
             .into_iter()
             .zip(drifts)
             .map(|(inner_result, drift)| compose_drift(inner_result, drift, self.p))
+            .collect())
+    }
+
+    /// The inner provider's products (its own fast route where it has one) plus
+    /// the `H_Φ` drifts of [`Self::hessian_second_derivative_corrections_result`]
+    /// applied to `x`. Those drifts are not derivatives of the likelihood
+    /// Hessian, so they are formed as before; only the inner share changes route.
+    fn hessian_second_derivative_corrections_applied(
+        &self,
+        triples: &[(Array1<f64>, Array1<f64>, Array1<f64>)],
+        x: &Array1<f64>,
+    ) -> Result<Vec<Option<Array1<f64>>>, String> {
+        let inner = self
+            .inner
+            .hessian_second_derivative_corrections_applied(triples, x)?;
+        let deltas: Vec<Array1<f64>> = triples.iter().map(|(_, _, u_kl)| u_kl.clone()).collect();
+        let drifts = self.drift.criterion_first(&deltas).map_err(|error| error.to_string())?;
+        let pairs: Vec<_> = triples
+            .iter()
+            .map(|(u, v, _)| (u.clone(), v.clone()))
+            .collect();
+        let mixed = self.drift.criterion_second(&pairs).map_err(|error| error.to_string())?;
+        if drifts.len() != triples.len() || mixed.len() != triples.len() || inner.len() != triples.len() {
+            return Err(format!(
+                "JeffreysHphiAwareJointDerivatives: applied second-order corrections returned \
+                 {}/{}/{} results for {} triples",
+                inner.len(),
+                drifts.len(),
+                mixed.len(),
+                triples.len()
+            ));
+        }
+        Ok(inner
+            .into_iter()
+            .zip(drifts)
+            .zip(mixed)
+            .map(|((inner, drift), mixed)| {
+                let jeffreys = match drift {
+                    Some(matrix) => (matrix + &mixed).dot(x),
+                    None => mixed.dot(x),
+                };
+                Some(match inner {
+                    Some(applied) => applied + &jeffreys,
+                    None => jeffreys,
+                })
+            })
             .collect())
     }
 
@@ -1283,5 +1436,146 @@ mod jeffreys_drift_composition_tests {
             (third - complete).abs() <= 1e-12 * complete,
             "t3={third} carries the completion's motion: expected {complete}"
         );
+    }
+}
+
+#[cfg(test)]
+mod applied_second_corrections_tests {
+    //! #4564: the cone term's outer Hessian reads each pair's second-order
+    //! correction only against one vector, and the joint providers form those
+    //! products from `D_βH[x]` and one `D²_βH[x, v_k]` per direction by the
+    //! symmetry of an exact Hessian's derivatives. Here `H` is the Hessian of
+    //! `f(β) = Σ_i w_i·g(a_iᵀβ)` with `g''' = sinh`, `g'''' = cosh`, so
+    //! `D_βH[u] = Σ w_i sinh(t_i)(a_iᵀu)a_ia_iᵀ` and
+    //! `D²_βH[u, v] = Σ w_i cosh(t_i)(a_iᵀu)(a_iᵀv)a_ia_iᵀ` exactly.
+
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const P: usize = 5;
+    const ROWS: usize = 9;
+
+    fn design() -> (Array2<f64>, Array1<f64>, Array1<f64>) {
+        let a = Array2::from_shape_fn((ROWS, P), |(i, j)| {
+            ((1 + i * 7 + j * 3) as f64 * 0.37).sin() + 0.2 * (j as f64 - 2.0)
+        });
+        let w = Array1::from_shape_fn(ROWS, |i| 0.5 + 0.1 * i as f64);
+        let beta = Array1::from_shape_fn(P, |j| 0.3 * (j as f64 - 2.0));
+        (a, w, beta)
+    }
+
+    fn vector(seed: usize) -> Array1<f64> {
+        Array1::from_shape_fn(P, |j| ((seed * 11 + j * 5 + 1) as f64 * 0.73).cos())
+    }
+
+    fn weighted_outer(a: &Array2<f64>, weight: impl Fn(usize) -> f64) -> Array2<f64> {
+        let mut out = Array2::zeros((P, P));
+        for i in 0..ROWS {
+            let row = a.row(i);
+            let scale = weight(i);
+            for r in 0..P {
+                for c in 0..P {
+                    out[[r, c]] += scale * row[r] * row[c];
+                }
+            }
+        }
+        out
+    }
+
+    fn provider(
+        first_calls: Arc<AtomicUsize>,
+        second_calls: Arc<AtomicUsize>,
+    ) -> OwnedJointDerivProvider {
+        let (a, w, beta) = design();
+        let t = a.dot(&beta);
+        let (a1, w1, t1) = (a.clone(), w.clone(), t.clone());
+        let (a2, w2, t2) = (a, w, t);
+        OwnedJointDerivProvider {
+            compute_dh: Arc::new(move |u: &Array1<f64>| {
+                first_calls.fetch_add(1, Ordering::Relaxed);
+                let au = a1.dot(u);
+                Ok(Some(DriftDerivResult::Dense(weighted_outer(&a1, |i| {
+                    w1[i] * t1[i].sinh() * au[i]
+                }))))
+            }),
+            compute_dh_many: None,
+            compute_d2h: Arc::new(move |u: &Array1<f64>, v: &Array1<f64>| {
+                second_calls.fetch_add(1, Ordering::Relaxed);
+                let (au, av) = (a2.dot(u), a2.dot(v));
+                Ok(Some(DriftDerivResult::Dense(weighted_outer(&a2, |i| {
+                    w2[i] * t2[i].cosh() * au[i] * av[i]
+                }))))
+            }),
+            compute_d2h_many: None,
+            second_correction_traces: None,
+            family_outer_hessian_operator: None,
+        }
+    }
+
+    #[test]
+    fn applied_corrections_match_the_formed_operators_from_k_plus_one_drifts_4564() {
+        let directions = 4;
+        let responses: Vec<Array1<f64>> = (0..directions).map(vector).collect();
+        let mut triples = Vec::new();
+        for i in 0..directions {
+            for j in i..directions {
+                triples.push((
+                    responses[i].clone(),
+                    responses[j].clone(),
+                    vector(100 + 10 * i + j),
+                ));
+            }
+        }
+        let x = vector(999);
+
+        let (formed_first, formed_second) =
+            (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let formed = formed_second_derivative_corrections_applied(
+            &provider(Arc::clone(&formed_first), Arc::clone(&formed_second)),
+            &triples,
+            &x,
+        )
+        .expect("formed corrections");
+        // Premise: the formed route prices two drifts per triple.
+        assert_eq!(formed_first.load(Ordering::Relaxed), triples.len());
+        assert_eq!(formed_second.load(Ordering::Relaxed), triples.len());
+
+        let (first, second) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let applied = provider(Arc::clone(&first), Arc::clone(&second))
+            .hessian_second_derivative_corrections_applied(&triples, &x)
+            .expect("applied corrections");
+        assert_eq!(first.load(Ordering::Relaxed), 1, "one D_βH[x]");
+        assert_eq!(second.load(Ordering::Relaxed), directions, "one D²_βH[x, v_k] per direction");
+
+        // Both routes sum the same products of exact inputs in different orders: each entry is
+        // a dot product over P of row sums over ROWS of products of `a_iᵀ·` (2P operations each),
+        // `w_i`, `g(t_i)` and two row entries, so each side carries at most
+        // k = ROWS + 3P + 8 rounded operations per term and the two differ by at most
+        // 2γ_k times the entry's absolute-value majorant (Higham, Lemma 3.1).
+        let (a, w, beta) = design();
+        let t = a.dot(&beta);
+        let abs_a = a.mapv(f64::abs);
+        let growth = 2.0 * gam_linalg::roundoff::accumulation_growth(ROWS + 3 * P + 8);
+        assert_eq!(applied.len(), formed.len());
+        for (index, ((fast, slow), (v_k, v_l, u_kl))) in
+            applied.iter().zip(&formed).zip(&triples).enumerate()
+        {
+            let (fast, slow) = (fast.as_ref().expect("fast"), slow.as_ref().expect("formed"));
+            let reach = |v: &Array1<f64>| abs_a.dot(&v.mapv(f64::abs));
+            let (ru, rk, rl, rx) = (reach(u_kl), reach(v_k), reach(v_l), reach(&x));
+            let weights = Array1::from_shape_fn(ROWS, |i| {
+                w[i].abs() * rx[i] * (t[i].sinh().abs() * ru[i] + t[i].cosh() * rk[i] * rl[i])
+            });
+            let majorant = abs_a.t().dot(&weights);
+            for (entry, ((f, s), m)) in fast.iter().zip(slow.iter()).zip(majorant.iter()).enumerate() {
+                let band = growth * m;
+                assert!(
+                    (f - s).abs() <= band,
+                    "triple {index} entry {entry}: {f:e} vs {s:e} (band {band:e})"
+                );
+            }
+            // Premise: the correction is not vanishing, so the comparison is not vacuous.
+            assert!(slow.iter().any(|value| value.abs() > 1e3 * growth * majorant.sum()));
+        }
     }
 }
