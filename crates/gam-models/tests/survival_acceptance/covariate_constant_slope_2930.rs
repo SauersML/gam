@@ -150,10 +150,7 @@ fn covariate_constant_slope_survival_fit_passes_seed_validation_2930() {
 
 /// gam#3467: every event time sits on the Weibull chart's own crossing,
 /// `T = λ·(−log Φ(z))^{1/k}`, so `q(T) = −z` and the probit survival index fits
-/// every row ever better as the slope grows. At the derived seed the inner solve
-/// stops on a descending ray that the time block's penalty closes at a named
-/// log-strength step. That certificate reached the outer startup as prose, so
-/// the #2695 restoration could not read it and the only seed was refused.
+/// every row ever better as the slope grows.
 fn separated_dataset(n: usize, seed: u64) -> gam_data::EncodedDataset {
     let headers = ["time", "event", "z", "x"]
         .iter()
@@ -178,20 +175,47 @@ fn separated_dataset(n: usize, seed: u64) -> gam_data::EncodedDataset {
     encode_recordswith_inferred_schema(headers, rows).expect("encode the #3467 fixture")
 }
 
+/// gam#4592: with the frozen standard-normal score, the #3467 fixture's unpenalized constant slope
+/// carries the descent. At the derived seed's chart, the time block and the chart reproduce
+/// `q(T) = −z` closely enough that `−ℓ` falls like `−n·log b` as the slope `b` grows (the stall's
+/// accepted steps descend at `n/b` per unit of `b`), and neither penalty rises along the accepted
+/// step: the time block moves toward its penalty's null space. No smoothing strength closes that
+/// ray, so the fit refuses and names it. Before, the stall read each block's own share of the
+/// likelihood slope, found no closable block, and refused the only seed as an anonymous residual
+/// stall.
 #[test]
-fn separated_survival_seed_takes_the_closing_rho_step_3467() {
+fn separated_frozen_score_fit_refuses_by_naming_its_unpenalized_ray_3467() {
     super::initialize_cpu_fitting();
     gam_runtime::test_support::install_diagnostic_logger();
     #[cfg(target_os = "macos")]
     gam_gpu::configure_global_policy(gam_gpu::GpuPolicy::Off);
 
     let data = separated_dataset(400, 0x3467_0000_0001);
-    fit_and_report(
-        "separated frozen score",
-        "Surv(time, event) ~ x",
-        &data,
-        &constant_slope_config(),
+    let refusal = match fit_from_formula("Surv(time, event) ~ x", &data, &constant_slope_config()) {
+        Ok(_) => panic!("a fit whose slope descends an unbounded ray must refuse"),
+        Err(error) => error.to_string(),
+    };
+    eprintln!("[3467 separated frozen score] refusal: {refusal}");
+    assert!(
+        refusal.contains("no penalty strength closes this ray"),
+        "the refusal must name the unpenalized ray, got: {refusal}"
     );
+}
+
+/// gam#4592: under the global-empirical latent law the same rows do not reproduce the planted law
+/// exactly, and the inner solve reaches a finite mode (slope ≈ 12.4, objective fixed to 6e-14,
+/// steps of 6e-15). Before, the reduced-face step refused the trial point on its own KKT check on
+/// the way there. That mode must certify. It currently does not: the certificate refuses a
+/// residual of 8.3e-2 as `active_set_incomplete` at a penalized Hessian of condition 1e14 with
+/// λ_max = 3.2e14, where one ulp of β moves the gradient by about 0.85.
+#[test]
+fn separated_global_empirical_fit_certifies_its_finite_mode_3467() {
+    super::initialize_cpu_fitting();
+    gam_runtime::test_support::install_diagnostic_logger();
+    #[cfg(target_os = "macos")]
+    gam_gpu::configure_global_policy(gam_gpu::GpuPolicy::Off);
+
+    let data = separated_dataset(400, 0x3467_0000_0001);
     fit_and_report(
         "separated global-empirical",
         "Surv(time, event) ~ x",
@@ -270,11 +294,29 @@ fn derived_band(delta_1: f64, magnitude: f64, step: f64, summands: usize) -> f64
     delta_1.abs() + 2.5 * roundoff / step
 }
 
+/// The rung of a halving ladder of central differences `D(h)` that [`derived_band`] grades.
+///
+/// [`derived_band`] bounds `|E(h)|` by `|Δ₁|` only under its premise `|E(2h)| ≥ 2·|E(h)|`, which the
+/// ladder shows at rung `i` as `Δ(2h)/Δ(h) ≥ 2` with `Δ(i) = D(i−1) − D(i)` (4 in the asymptotic
+/// range). `E(h)` is the truncation `a·h² + …` plus the evaluation's own error, which enters `D(h)`
+/// as `δ/h`: it grows down the ladder while truncation shrinks. The evaluation error is not only
+/// roundoff. Each evaluation's inner mode stops at its residual tolerance, and both the analytic
+/// gradient and the value's `½log|H(β)|` are first order in that residual. At the #2930 seed the
+/// derivative evaluations stop near 8e-6 against a tolerance of 1.6e-4, and the gradient ladder
+/// flattens there to about 1e-7 in gradient units (gam#4592). Where that error dominates, it can
+/// shrink one `Δ` while the ratio still reads `≥ 2`. On the seed's ρ₀ column, a fine rung read a
+/// ratio of 16 and missed by 4.4 times its own `|Δ|`. So the premise is read where it is
+/// truncation's: at the coarsest rung that shows it. There every graded entry of the #4592 ladder
+/// missed by `|Δ|/3`, the pure `h²` value.
+fn premise_rung(differences: &[f64]) -> Option<usize> {
+    let disagreement = |i: usize| differences[i - 1] - differences[i];
+    (2..differences.len()).find(|&i| disagreement(i - 1) / disagreement(i) >= 2.0)
+}
+
 /// Central differences of the value-only criterion along `theta[j]` on a halving ladder whose
 /// first rung is one hundredth of the coordinate's scale and at most half its room inside the
-/// seed box. Returns, among the rungs that exhibit [`derived_band`]'s halving premise, the one that
-/// agrees best with its predecessor: its difference, its step, that disagreement, and its
-/// [`derived_band`].
+/// seed box. Returns the [`premise_rung`]'s difference, its step, its disagreement with its
+/// predecessor, and its [`derived_band`].
 fn value_central_difference(
     probe: &mut dyn OuterSeedProbe,
     theta: &Array1<f64>,
@@ -305,23 +347,15 @@ fn value_central_difference(
         step *= 0.5;
     }
     eprintln!("[2930-LADDER] j={j} rungs={:?}", estimates.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>());
-    // [`derived_band`] bounds `|E(h)|` by `|Δ₁|` only under its premise `|E(2h)| ≥ 2·|E(h)|`. The
-    // ladder shows that premise at rung `i` as the preceding disagreement being at least twice this
-    // one with the same sign, `Δ(2h)/Δ(h) ≥ 2` (4 in the asymptotic range). A rung where evaluation
-    // noise cancels the truncation term breaks that ratio while its `|Δ₁|` is the smallest on the
-    // ladder, so the smallest disagreement is chosen only among rungs that exhibit the premise.
-    let disagreement = |i: usize| estimates[i - 1].1 - estimates[i].1;
-    let (index, settle) = (2..estimates.len())
-        .filter(|&i| disagreement(i - 1) / disagreement(i) >= 2.0)
-        .map(|i| (i, disagreement(i).abs()))
-        .min_by(|left, right| left.1.total_cmp(&right.1))
-        .ok_or_else(|| {
-            format!(
-                "coordinate {j}: no rung of the ladder shows the halving premise Δ(2h)/Δ(h) ≥ 2: {:?}",
-                estimates.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>()
-            )
-        })?;
+    let differences: Vec<f64> = estimates.iter().map(|e| e.1).collect();
+    let index = premise_rung(&differences).ok_or_else(|| {
+        format!(
+            "coordinate {j}: no rung of the ladder shows the halving premise Δ(2h)/Δ(h) ≥ 2: {:?}",
+            estimates.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>()
+        )
+    })?;
     let delta_1 = estimates[index - 1].1 - estimates[index].1;
+    let settle = delta_1.abs();
     let magnitude = estimates[index - 1..=index]
         .iter()
         .fold(0.0_f64, |acc, rung| acc.max(rung.2));
@@ -342,23 +376,23 @@ struct HessianColumnGrade {
     column: usize,
     analytic: Array1<f64>,
     difference: Array1<f64>,
-    step: f64,
-    /// `max_i |D(2h)_i − D(h)_i|` at the accepted rung.
-    settle: f64,
+    /// Each entry's step, at its own [`premise_rung`].
+    step: Array1<f64>,
+    /// Each entry's `|D(2h) − D(h)|` at its rung.
+    settle: Array1<f64>,
     /// Each entry's [`derived_band`].
     band: Array1<f64>,
 }
 
 /// Central differences of the analytic gradient along `theta[j]` on the same halving ladder as
-/// [`value_central_difference`]. Returns the rung whose largest entrywise disagreement with its
-/// predecessor is smallest: its difference, its step, that disagreement, and each entry's
-/// [`derived_band`].
+/// [`value_central_difference`]. Each entry is graded at its own [`premise_rung`]. Returns each
+/// entry's difference, step, disagreement with its predecessor, and [`derived_band`].
 fn gradient_central_difference(
     probe: &mut dyn OuterSeedProbe,
     theta: &Array1<f64>,
     j: usize,
     summands: usize,
-) -> Result<(Array1<f64>, f64, f64, Array1<f64>), String> {
+) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>), String> {
     let layout = probe.layout();
     let room = (theta[j] - layout.lower[j])
         .min(layout.upper[j] - theta[j])
@@ -384,24 +418,30 @@ fn gradient_central_difference(
         estimates.push((step, (&plus - &minus) / (2.0 * step), magnitude));
         step *= 0.5;
     }
-    let (index, settle) = (1..estimates.len())
-        .map(|i| {
-            let disagreement = (&estimates[i - 1].1 - &estimates[i].1)
-                .iter()
-                .fold(0.0_f64, |acc, value| acc.max(value.abs()));
-            (i, disagreement)
-        })
-        .min_by(|left, right| left.1.total_cmp(&right.1))
-        .expect("the ladder has six rungs");
-    let accepted_step = estimates[index].0;
-    let band = Array1::from_shape_fn(estimates[index].1.len(), |i| {
-        let delta_1 = estimates[index - 1].1[i] - estimates[index].1[i];
+    let entries = estimates[0].1.len();
+    let mut difference = Array1::zeros(entries);
+    let mut steps = Array1::zeros(entries);
+    let mut settle = Array1::zeros(entries);
+    let mut band = Array1::zeros(entries);
+    for entry in 0..entries {
+        let differences: Vec<f64> = estimates.iter().map(|e| e.1[entry]).collect();
+        let index = premise_rung(&differences).ok_or_else(|| {
+            format!(
+                "gradient entry {entry} along coordinate {j}: no rung of the ladder shows the \
+                 halving premise Δ(2h)/Δ(h) ≥ 2: {:?}",
+                estimates.iter().map(|e| (e.0, e.1[entry])).collect::<Vec<_>>()
+            )
+        })?;
+        let delta_1 = differences[index - 1] - differences[index];
         let magnitude = estimates[index - 1..=index]
             .iter()
-            .fold(0.0_f64, |acc, rung| acc.max(rung.2[i]));
-        derived_band(delta_1, magnitude, accepted_step, summands)
-    });
-    Ok((estimates[index].1.clone(), accepted_step, settle, band))
+            .fold(0.0_f64, |acc, rung| acc.max(rung.2[entry]));
+        difference[entry] = differences[index];
+        steps[entry] = estimates[index].0;
+        settle[entry] = delta_1.abs();
+        band[entry] = derived_band(delta_1, magnitude, estimates[index].0, summands);
+    }
+    Ok((difference, steps, settle, band))
 }
 
 /// Grade the analytic gradient against central differences of the value-only criterion, and every
@@ -519,8 +559,8 @@ fn report_grades(grades: &[CoordinateGrade], columns: &[HessianColumnGrade], rho
                 grade.analytic[row],
                 grade.difference[row],
                 (grade.analytic[row] - grade.difference[row]).abs() / grade.analytic[row].abs().max(1.0),
-                grade.step,
-                grade.settle,
+                grade.step[row],
+                grade.settle[row],
                 grade.band[row],
                 column_resolved(grade),
             );
@@ -676,24 +716,37 @@ fn covariate_constant_slope_derivatives_differentiate_the_value_criterion_2930()
     }
 
     // gam#2945 positive controls at the outer level: with one second-order completion term omitted,
-    // the same bands must reject the outer Hessian.
+    // the same bands must reject the outer Hessian wherever the omitted term is resolvable, that is
+    // wherever it exceeds its entry's band. A band is what the ladder resolves at the
+    // [`premise_rung`], and a term below it is below the gate's resolution. On this fixture neither
+    // term reaches its band: the largest omitted-to-band ratio is 6.6e-3 at the seed, and both
+    // terms vanish at the interior point (gam#4592). So the report carries the ratio, and the gate
+    // is held to every entry the term does resolve.
     for control in &ablated {
         let mut rejected = 0usize;
+        let mut largest_share = 0.0_f64;
+        let mut unseen = Vec::new();
         for grade in columns.iter().filter(|grade| grade.point == control.point) {
             for row in 0..grade.analytic.len() {
                 let error = (control.hessian[[row, grade.column]] - grade.difference[row]).abs();
+                let omitted = (control.hessian[[row, grade.column]] - grade.analytic[row]).abs();
+                largest_share = largest_share.max(omitted / grade.band[row]);
                 if error > grade.band[row] {
                     rejected += 1;
+                } else if omitted > grade.band[row] {
+                    unseen.push((row, grade.column, omitted, grade.band[row]));
                 }
             }
         }
         eprintln!(
-            "[2930-CONTROL-OUTER] point={} without={:?} rejected_entries={rejected}",
+            "[2930-CONTROL-OUTER] point={} without={:?} rejected_entries={rejected} \
+             largest_omitted_over_band={largest_share:.3e}",
             control.point, control.term
         );
         assert!(
-            rejected >= 1,
-            "{}: the outer Hessian without {:?} passed every band, so the gate cannot see that term",
+            unseen.is_empty(),
+            "{}: the outer Hessian without {:?} passed the band at entries where the omitted term \
+             exceeds it, so the gate cannot see that term: {unseen:?}",
             control.point,
             control.term
         );

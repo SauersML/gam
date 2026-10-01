@@ -63,6 +63,27 @@ pub enum JointNewtonTerminalReason {
         cycles: usize,
         ray: RayRestoration,
     },
+    /// The solve left on a residual-stall or divergence guard while its last
+    /// accepted step `δ` was still descending the penalized objective,
+    /// `∇(−ℓ)·δ + (S_λβ)·δ < 0`, and no block's penalty rose along it: every
+    /// penalized block's `(λ_b S_b β)·δ ≤ 0`. Raising any strength then adds
+    /// nothing that resists the step, so no ρ closes this ray; the objective
+    /// has no finite minimizer in reach at this ρ (gam#4592).
+    ///
+    /// Distinct from [`Self::StalledOnDescendingRay`], whose ray a named block's
+    /// penalty closes, and from [`Self::ResidualStall`], whose accepted step
+    /// carries no such reading.
+    StalledOnUnpenalizedRay {
+        residual: f64,
+        residual_tol: f64,
+        cycles: usize,
+        /// `∇(−ℓ)·δ` over the whole accepted step (negative).
+        likelihood_slope: f64,
+        /// `(S_λβ)·δ` over the whole accepted step (non-positive).
+        penalty_slope: f64,
+        /// `‖δ‖∞`.
+        step_inf: f64,
+    },
     /// The constrained fixed-point certificate declined the iterate the loop
     /// left on, and `condition` is the acceptance condition that failed, with its
     /// value and bound. Before this, the exit read `cycle budget` at any cycle
@@ -144,13 +165,16 @@ pub enum ConstrainedFixedPointCondition {
 
 /// The block-level reading of a ray the joint Newton was descending when it
 /// stopped: along the last accepted step `δ`, the likelihood term slopes
-/// down by `likelihood_slope = ∇(−ℓ)·δ < 0` while block `block`'s penalty
-/// slopes up by only `penalty_slope = (λ_b S_b β)·δ > 0`. The penalized
-/// objective is stationary along `δ` at the strength ratio
-/// `r = −likelihood_slope / penalty_slope > 1`, so raising every log
-/// strength of that block by `log_strength_ratio = ln r` closes the ray at
-/// the iterate the solve stopped on. The ratio is read off the two slopes the
-/// solve already had; nothing here is a step size.
+/// down by `likelihood_slope = ∇(−ℓ)·δ` over the whole step while block
+/// `block`'s penalty slopes up by only `penalty_slope = (λ_b S_b β)·δ > 0`.
+/// Scaling that block's strength by `r` changes only its own term, so the
+/// penalized objective is stationary along `δ` at
+/// `r = −(likelihood_slope + Σ_{c≠b} P_c) / penalty_slope > 1`, with `P_c` the
+/// other blocks' penalty slopes, and raising every log strength of that block
+/// by `log_strength_ratio = ln r` closes the ray at the iterate the solve
+/// stopped on (gam#4592: a coupled step's descent can sit in an unpenalized
+/// block while another block's penalty is the one that rises). The ratio is
+/// read off slopes the solve already had; nothing here is a step size.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RayRestoration {
     /// Index of the parameter block carrying the ray.
@@ -285,6 +309,21 @@ impl std::fmt::Display for JointNewtonTerminalReason {
                  {cycles} cycles while the accepted steps kept descending a direction with no \
                  finite minimizer in reach, so the seed is under-penalized rather than \
                  failed; {ray}"
+            ),
+            Self::StalledOnUnpenalizedRay {
+                residual,
+                residual_tol,
+                cycles,
+                likelihood_slope,
+                penalty_slope,
+                step_inf,
+            } => write!(
+                f,
+                "residual {residual:.6e} stalled or grew against {residual_tol:.6e} over \
+                 {cycles} cycles while the accepted step kept descending a direction no \
+                 block's penalty rises along (likelihood slope {likelihood_slope:.3e}, penalty \
+                 slope {penalty_slope:.3e}, step {step_inf:.3e}): no penalty strength closes \
+                 this ray"
             ),
             Self::ConstrainedFixedPointDeclined { condition } => write!(
                 f,
@@ -595,6 +634,7 @@ impl JointNewtonTerminalReason {
             Self::SlowGeometricRate { .. } => "slow_geometric_rate",
             Self::ResidualNotContracting { .. } => "residual_not_contracting",
             Self::StalledOnDescendingRay { .. } => "stalled_on_descending_ray",
+            Self::StalledOnUnpenalizedRay { .. } => "stalled_on_unpenalized_ray",
             Self::ConstrainedFixedPointDeclined { .. } => "constrained_fixed_point_declined",
             Self::NonFiniteCurvature { .. } => "non_finite_curvature",
             Self::NonFiniteInnerState { .. } => "non_finite_inner_state",
@@ -919,7 +959,8 @@ impl CustomFamilyError {
             | JointNewtonTerminalReason::StalledOnDescendingRay { ray, .. } => {
                 Some(DescendingRayExit::Closable(ray))
             }
-            JointNewtonTerminalReason::SlowGeometricRate { ray: None, .. } => {
+            JointNewtonTerminalReason::SlowGeometricRate { ray: None, .. }
+            | JointNewtonTerminalReason::StalledOnUnpenalizedRay { .. } => {
                 Some(DescendingRayExit::Unpenalized)
             }
             JointNewtonTerminalReason::CycleBudget

@@ -1407,43 +1407,34 @@ fn certified_reduced_face_candidate(
             .fold(1.0_f64, f64::max);
         let kkt_tolerance = f64::EPSILON.sqrt() * (p.max(1) as f64) * stationarity_scale;
         if !closure_inf.is_finite() || closure_inf > kkt_tolerance {
-            if chord_repair > 0.0 {
-                // The candidate that failed here is not the Moré--Sorensen
-                // solution: it is that solution pulled back along the certified
-                // feasible chord because the equality solve landed outside a row
-                // it was holding. A repair that large is not a rounding repair,
-                // and a heuristic repair failing its own certificate is not a
-                // violated contract — it is the same situation a cycled
-                // active-set exchange is in, and it gets the same answer:
-                // decline, and let the caller's general constrained QP own the
-                // subproblem, instead of ending the fit on this trial point.
-                //
-                // Grading the repair by the KKT residual and then treating the
-                // verdict as a contract violation is what made an ordinary
-                // conditional-transformation-normal fit with one smooth covariate
-                // unfittable: `projected_residual_inf = 9.736333e-1` against
-                // `tolerance = 1.162291e-6` at `active_rows = 1` (gam#2600).
-                log::debug!(
-                    "[gam#2600 reduced-face] declining a chord-repaired candidate that fails \
-                     its own first-order KKT (face_rows={}, chord_repair={:.6e}, \
-                     projected_residual_inf={:.6e}, tolerance={:.6e}, trust_shift={:.6e}); \
-                     the general constrained QP owns this subproblem",
-                    working_active.len(),
-                    chord_repair,
-                    closure_inf,
-                    kkt_tolerance,
-                    face_step.trust_shift,
-                );
-                return Ok(None);
-            }
-            return Err(CustomFamilyError::trial_point(format!(
-                "physical reduced-face first-order KKT failed \
-                 (projected_residual_inf={closure_inf:.6e}, \
-                 tolerance={kkt_tolerance:.6e}, trust_shift={:.6e}, \
-                 active_rows={}, chord_repair=0)",
-                face_step.trust_shift,
+            // A reduced-face candidate that fails its own first-order KKT
+            // certificate declines, and the caller's general constrained QP
+            // owns the subproblem. The candidate is either the Moré--Sorensen
+            // solution or that solution pulled back along the certified
+            // feasible chord because the equality solve landed outside a row it
+            // was holding. Neither is a violated contract. A heuristic repair
+            // failing its certificate is the situation a cycled active-set
+            // exchange is in (gam#2600: an ordinary conditional-transformation-
+            // normal fit read `projected_residual_inf = 9.736333e-1` against
+            // `tolerance = 1.162291e-6` at `active_rows = 1`). An unrepaired
+            // solution failing it says the face system resolves its residual
+            // only to about `κ·ε` of its scale, above the `√ε·p` the certificate
+            // asks: on the #3467 fixture's descending slope ray the penalized
+            // Hessian's condition reaches 1e13 and the face solution closes to
+            // 8.9e-4 against 1.2e-4 (gam#4592). Ending the trial point there
+            // took the solve off the stall exits that read the ray it was on.
+            log::debug!(
+                "[gam#2600 reduced-face] declining a candidate that fails its own first-order \
+                 KKT (face_rows={}, chord_repair={:.6e}, projected_residual_inf={:.6e}, \
+                 tolerance={:.6e}, trust_shift={:.6e}); the general constrained QP owns this \
+                 subproblem",
                 working_active.len(),
-            )));
+                chord_repair,
+                closure_inf,
+                kkt_tolerance,
+                face_step.trust_shift,
+            );
+            return Ok(None);
         }
 
         let trust_norm_sq = delta

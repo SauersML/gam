@@ -626,27 +626,50 @@ mod jeffreys_endgame_arming_tests {
     }
 }
 
-/// The block whose penalty is too weak to close the direction the last
-/// accepted step was descending, and the strength at which it would close it
-/// (gam#2695).
+/// What the last accepted step says about the direction the solve was still
+/// descending when a stall or divergence guard stopped it (gam#2695, gam#4592).
+enum DescendingRayReading {
+    /// A block's penalty rises along the step, and raising that block's
+    /// strengths by the named ratio makes the step stationary.
+    Closable(gam_problem::RayRestoration),
+    /// The step descends the penalized objective and no block's penalty rises
+    /// along it, so no strength closes the ray.
+    Unpenalized {
+        likelihood_slope: f64,
+        penalty_slope: f64,
+        step_inf: f64,
+    },
+    /// The step does not descend the penalized objective to first order, or the
+    /// shapes do not line up: no ray is read.
+    NoRay,
+}
+
+/// Read the direction the last accepted step was descending.
 ///
-/// Along `δ = β_new − β_old` the likelihood slopes down by `∇(−ℓ)·δ < 0` while
-/// block `b`'s penalty slopes up by only `(λ_b S_b β)·δ > 0`; the penalized
-/// objective is stationary along `δ` when that block's strength is multiplied
-/// by `r_b = −(∇(−ℓ)·δ) / ((λ_b S_b β)·δ)`, so the outer can read `ln r_b` as
-/// the restoration of an under-penalized seed rather than as a failed seed.
-/// The block needing the largest raise is the binding one and is the one
-/// reported.
+/// Along `δ = β_new − β_old` the penalized objective changes to first order by
+/// `D = L + Σ_b P_b`, where `L = ∇(−ℓ)·δ` over the whole step and
+/// `P_b = (λ_b S_b β)·δ` is block `b`'s penalty slope. Multiplying block `b`'s
+/// strength by `r` changes only its own term, so the step is stationary at
+/// `r_b = −(L + Σ_{c≠b} P_c) / P_b`, which exceeds 1 exactly when `D < 0` and
+/// `P_b > 0`. A ray a coupled step carries is therefore read on the whole
+/// step's likelihood slope, not on one block's share of it: the unpenalized
+/// slope coefficient of the #3467 fixture descends while the time block's
+/// penalty is the one that rises. Of the blocks that close the ray, the one
+/// needing the smallest raise is reported: any one of them closes it at first
+/// order, and the smallest raise moves the seed least.
 ///
-/// `None` when the shapes do not line up, or when no block both resists the
-/// step and needs a strictly larger strength — an unpenalized ray, which no ρ
-/// closes.
+/// When `D < 0` and no block's penalty rises along `δ`, raising any strength
+/// adds nothing that resists the step. That is a ray only while the objective
+/// is still falling: the step's realized decrease must exceed the objective's
+/// own tolerance, or the solve is parked at its resolution (gam#2977) and the
+/// slope is a rounding-scale reading. Then the reading is
+/// [`DescendingRayReading::Unpenalized`].
 ///
 /// This is ONE owner deliberately: the quantity is a property of the accepted
 /// step, not of the exit that noticed it, and computing it at only one of the
 /// three non-converged exits is what left the #2695 seeds refusing "as
 /// evaluated" when they were merely under-penalized.
-fn descending_ray_restoration(
+fn descending_ray_reading(
     old_beta: &[Array1<f64>],
     states: &[ParameterBlockState],
     grad_joint: &Array1<f64>,
@@ -655,36 +678,42 @@ fn descending_ray_restoration(
     specs: &[ParameterBlockSpec],
     joint_bundle: Option<&gam_problem::JointPenaltyBundle>,
     total_p: usize,
-) -> Option<gam_problem::RayRestoration> {
+    realized_decrease: f64,
+    objective_tol: f64,
+) -> DescendingRayReading {
     let beta_old_joint = Array1::from_iter(old_beta.iter().flat_map(|b| b.iter().copied()));
     let beta_new_joint = Array1::from_iter(states.iter().flat_map(|s| s.beta.iter().copied()));
     if beta_old_joint.len() != total_p
         || beta_new_joint.len() != total_p
         || grad_joint.len() != total_p
     {
-        return None;
+        return DescendingRayReading::NoRay;
     }
     let delta = &beta_new_joint - &beta_old_joint;
-    let direction: std::sync::Arc<[f64]> = delta.iter().copied().collect();
     let s_beta =
         apply_joint_block_penalty(ranges, s_lambdas, &beta_old_joint, 0.0, joint_bundle);
-    let mut best: Option<gam_problem::RayRestoration> = None;
+    let likelihood_slope: f64 = -grad_joint.dot(&delta);
+    let block_penalty_slopes: Vec<f64> = ranges
+        .iter()
+        .map(|&(start, end)| (start..end).map(|i| s_beta[i] * delta[i]).sum())
+        .collect();
+    let penalty_slope: f64 = block_penalty_slopes.iter().sum();
+    let objective_slope = likelihood_slope + penalty_slope;
+    if !(objective_slope < 0.0) {
+        return DescendingRayReading::NoRay;
+    }
+    let direction: std::sync::Arc<[f64]> = delta.iter().copied().collect();
+    let mut closing: Option<gam_problem::RayRestoration> = None;
     let mut rho_offset = 0usize;
     for (block, &(start, end)) in ranges.iter().enumerate() {
         let n_pen = specs.get(block).map_or(0, |spec| spec.penalties.len());
         let rho_first = rho_offset;
         rho_offset += n_pen;
-        let likelihood_slope: f64 = (start..end).map(|i| -grad_joint[i] * delta[i]).sum();
-        let penalty_slope: f64 = (start..end).map(|i| s_beta[i] * delta[i]).sum();
-        let block_step_inf = delta
-            .slice(ndarray::s![start..end])
-            .iter()
-            .map(|v| v.abs())
-            .fold(0.0_f64, f64::max);
-        if n_pen == 0 || !(penalty_slope > 0.0) || !(likelihood_slope < 0.0) {
+        let block_penalty_slope = block_penalty_slopes[block];
+        if n_pen == 0 || !(block_penalty_slope > 0.0) {
             continue;
         }
-        let ratio = -likelihood_slope / penalty_slope;
+        let ratio = -(objective_slope - block_penalty_slope) / block_penalty_slope;
         if !(ratio.is_finite() && ratio > 1.0) {
             continue;
         }
@@ -694,18 +723,128 @@ fn descending_ray_restoration(
             rho_count: n_pen,
             log_strength_ratio: ratio.ln(),
             likelihood_slope,
-            penalty_slope,
-            block_step_inf,
+            penalty_slope: block_penalty_slope,
+            block_step_inf: delta
+                .slice(ndarray::s![start..end])
+                .iter()
+                .fold(0.0_f64, |acc, v| acc.max(v.abs())),
             direction: std::sync::Arc::clone(&direction),
         };
-        if best
+        if closing
             .as_ref()
-            .is_none_or(|c| candidate.log_strength_ratio > c.log_strength_ratio)
+            .is_none_or(|c| candidate.log_strength_ratio < c.log_strength_ratio)
         {
-            best = Some(candidate);
+            closing = Some(candidate);
         }
     }
-    best
+    match closing {
+        Some(ray) => DescendingRayReading::Closable(ray),
+        None if block_penalty_slopes.iter().all(|slope| *slope <= 0.0)
+            && realized_decrease > objective_tol =>
+        {
+            DescendingRayReading::Unpenalized {
+                likelihood_slope,
+                penalty_slope,
+                step_inf: delta.iter().fold(0.0_f64, |acc, v| acc.max(v.abs())),
+            }
+        }
+        None => DescendingRayReading::NoRay,
+    }
+}
+
+#[cfg(test)]
+mod descending_ray_reading_4592_tests {
+    use super::*;
+    use ndarray::array;
+
+    /// The #3467 fixture's three blocks: a penalized time block, a penalized
+    /// marginal block, and the unpenalized constant slope.
+    fn fixture_specs() -> (Vec<ParameterBlockSpec>, Vec<(usize, usize)>, Vec<Array2<f64>>) {
+        let block = |name: &str, width: usize, penalized: bool| ParameterBlockSpec {
+            name: name.to_string(),
+            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, width)),
+            )),
+            offset: Array1::zeros(1),
+            penalties: if penalized {
+                vec![PenaltyMatrix::Dense(Array2::eye(width))]
+            } else {
+                Vec::new()
+            },
+            nullspace_dims: if penalized { vec![0] } else { Vec::new() },
+            initial_log_lambdas: if penalized { array![0.0] } else { Array1::zeros(0) },
+            initial_beta: None,
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        };
+        let specs = vec![block("time", 2, true), block("marginal", 1, true), block("slope", 1, false)];
+        let ranges = vec![(0, 2), (2, 3), (3, 4)];
+        let s_lambdas = vec![Array2::eye(2), Array2::eye(1), Array2::zeros((1, 1))];
+        (specs, ranges, s_lambdas)
+    }
+
+    fn read(time_step: f64, slope_step: f64, realized_decrease: f64) -> DescendingRayReading {
+        let (specs, ranges, s_lambdas) = fixture_specs();
+        let old_beta = vec![array![1.0, 0.0], array![0.0], array![0.0]];
+        let states = vec![
+            ParameterBlockState { beta: array![1.0 + time_step, 0.0], eta: Array1::zeros(1) },
+            ParameterBlockState { beta: array![0.0], eta: Array1::zeros(1) },
+            ParameterBlockState { beta: array![slope_step], eta: Array1::zeros(1) },
+        ];
+        // ∇ℓ at β_old: the time coordinate's likelihood rises toward smaller
+        // coefficients, the slope's toward larger ones.
+        let grad_joint = array![-0.5, 0.0, 0.0, 0.2];
+        descending_ray_reading(
+            &old_beta, &states, &grad_joint, &ranges, &s_lambdas, &specs, None, 4, realized_decrease, 1e-9,
+        )
+    }
+
+    /// A coupled step: the unpenalized slope carries the descent
+    /// (`∇(−ℓ)·δ = −0.02` there) while the time block climbs its likelihood
+    /// (`+5e-4`) and its penalty (`P_0 = 1e-3`). The block-local reading saw no
+    /// descending block; the whole step is closed by the time block at
+    /// `r_0 = −(L + P_1)/P_0 = 0.0195/0.001`.
+    #[test]
+    fn a_coupled_ray_is_closed_by_the_block_whose_penalty_rises_4592() {
+        let DescendingRayReading::Closable(ray) = read(1.0e-3, 0.1, 1.0e-2) else {
+            panic!("the time block's penalty closes the coupled ray");
+        };
+        assert_eq!((ray.block, ray.rho_first, ray.rho_count), (0, 0, 1));
+        assert!((ray.likelihood_slope - (-0.0195)).abs() <= 1e-15);
+        assert!((ray.penalty_slope - 1.0e-3).abs() <= 1e-15);
+        assert!((ray.log_strength_ratio - 19.5_f64.ln()).abs() <= 1e-12);
+    }
+
+    /// The #4592 outer-evaluation stall: the step descends through the slope
+    /// while the time block moves toward its penalty's null space
+    /// (`P_0 = −1e-3`). No penalty rises along the step, so no strength
+    /// closes it.
+    #[test]
+    fn a_ray_no_penalty_rises_along_is_unpenalized_4592() {
+        let DescendingRayReading::Unpenalized { likelihood_slope, penalty_slope, step_inf } =
+            read(-1.0e-3, 0.1, 1.0e-2)
+        else {
+            panic!("no block's penalty rises along this step");
+        };
+        assert!((likelihood_slope - (-0.0205)).abs() <= 1e-15);
+        assert!((penalty_slope - (-1.0e-3)).abs() <= 1e-15);
+        assert_eq!(step_inf, 0.1);
+    }
+
+    /// A solve parked at its resolution reads no ray from a rounding-scale
+    /// descent, however unpenalized its direction (gam#2977).
+    #[test]
+    fn an_unresolved_decrease_reads_no_ray_4592() {
+        assert!(matches!(read(-1.0e-3, 0.1, 1.0e-10), DescendingRayReading::NoRay));
+    }
+
+    /// A step that climbs the penalized objective descends no ray.
+    #[test]
+    fn an_ascending_step_reads_no_ray_4592() {
+        assert!(matches!(read(0.0, -0.1, 1.0e-2), DescendingRayReading::NoRay));
+    }
 }
 
 /// What the joint Newton path certified about the iterate an exit of
@@ -7210,7 +7349,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             // computed only at the slow-rate exit below, so those seeds were
             // refused "as evaluated" and the next seed started cold. Without a
             // ray the exit is a stall with clipped steps, and says so.
-            let ray = descending_ray_restoration(
+            let ray = descending_ray_reading(
                 &old_beta,
                 &states,
                 &grad_joint,
@@ -7219,6 +7358,8 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 specs,
                 joint_bundle,
                 total_p,
+                -signed_obj_change,
+                objective_tol,
             );
             if let Some(gam_problem::InnerConvergenceTerminalState::JointNewton {
                 termination_reason,
@@ -7226,13 +7367,27 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             }) = terminal_convergence_state.as_mut()
             {
                 *termination_reason = match ray {
-                    Some(ray) => gam_problem::JointNewtonTerminalReason::StalledOnDescendingRay {
+                    DescendingRayReading::Closable(ray) => {
+                        gam_problem::JointNewtonTerminalReason::StalledOnDescendingRay {
+                            residual,
+                            residual_tol,
+                            cycles: cycles_done,
+                            ray,
+                        }
+                    }
+                    DescendingRayReading::Unpenalized {
+                        likelihood_slope,
+                        penalty_slope,
+                        step_inf,
+                    } => gam_problem::JointNewtonTerminalReason::StalledOnUnpenalizedRay {
                         residual,
                         residual_tol,
                         cycles: cycles_done,
-                        ray,
+                        likelihood_slope,
+                        penalty_slope,
+                        step_inf,
                     },
-                    None => gam_problem::JointNewtonTerminalReason::ResidualStall {
+                    DescendingRayReading::NoRay => gam_problem::JointNewtonTerminalReason::ResidualStall {
                         residual,
                         residual_tol,
                         best_residual: best_residual_seen,
@@ -7342,7 +7497,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             // residual whose accepted steps still descend an unclosed ray is
             // an under-penalized seed, not a failed one. Without a ray it is a
             // flat-residual stall, and says so.
-            let ray = descending_ray_restoration(
+            let ray = descending_ray_reading(
                 &old_beta,
                 &states,
                 &grad_joint,
@@ -7351,6 +7506,8 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 specs,
                 joint_bundle,
                 total_p,
+                -signed_obj_change,
+                objective_tol,
             );
             if let Some(gam_problem::InnerConvergenceTerminalState::JointNewton {
                 termination_reason,
@@ -7358,13 +7515,27 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             }) = terminal_convergence_state.as_mut()
             {
                 *termination_reason = match ray {
-                    Some(ray) => gam_problem::JointNewtonTerminalReason::StalledOnDescendingRay {
+                    DescendingRayReading::Closable(ray) => {
+                        gam_problem::JointNewtonTerminalReason::StalledOnDescendingRay {
+                            residual,
+                            residual_tol,
+                            cycles: cycles_done,
+                            ray,
+                        }
+                    }
+                    DescendingRayReading::Unpenalized {
+                        likelihood_slope,
+                        penalty_slope,
+                        step_inf,
+                    } => gam_problem::JointNewtonTerminalReason::StalledOnUnpenalizedRay {
                         residual,
                         residual_tol,
                         cycles: cycles_done,
-                        ray,
+                        likelihood_slope,
+                        penalty_slope,
+                        step_inf,
                     },
-                    None => gam_problem::JointNewtonTerminalReason::FlatResidualStall {
+                    DescendingRayReading::NoRay => gam_problem::JointNewtonTerminalReason::FlatResidualStall {
                         residual,
                         residual_tol,
                         best_residual: best_residual_seen,
@@ -7479,14 +7650,11 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 }
                 // A typed outcome, so the outer's seed statistics can tell a
                 // descending ray from a stuck solve (gam#2695).
-                // Which block's penalty is too weak to close the ray, read off
-                // the step this cycle accepted (#2695): along `δ = β_new − β_old`
-                // the likelihood slopes down by `∇(−ℓ)·δ` and block b's penalty
-                // slopes up by `(λ_b S_b β)·δ`; the objective is stationary along
-                // `δ` at `r_b = −(∇(−ℓ)·δ) / ((λ_b S_b β)·δ)` times the block's
-                // strength. The outer reads `ln r_b` as the restoration of an
+                // Which block's penalty closes the ray, read off the step this
+                // cycle accepted (#2695, #4592; see `descending_ray_reading`).
+                // The outer reads `ln r_b` as the restoration of an
                 // under-penalized seed rather than as a failed seed.
-                let ray = descending_ray_restoration(
+                let ray = descending_ray_reading(
                     &old_beta,
                     &states,
                     &grad_joint,
@@ -7495,6 +7663,8 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     specs,
                     joint_bundle,
                     total_p,
+                    -signed_obj_change,
+                    objective_tol,
                 );
                 if let Some(gam_problem::InnerConvergenceTerminalState::JointNewton {
                     termination_reason,
@@ -7508,9 +7678,13 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                             projected_cycles_to_tolerance: effective_projection_cap,
                             residual,
                             residual_tol,
-                            ray,
+                            ray: match ray {
+                                DescendingRayReading::Closable(ray) => Some(ray),
+                                DescendingRayReading::Unpenalized { .. }
+                                | DescendingRayReading::NoRay => None,
+                            },
                         },
-                        (false, Some(ray)) => {
+                        (false, DescendingRayReading::Closable(ray)) => {
                             gam_problem::JointNewtonTerminalReason::StalledOnDescendingRay {
                                 residual,
                                 residual_tol,
@@ -7518,7 +7692,22 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 ray,
                             }
                         }
-                        (false, None) => {
+                        (
+                            false,
+                            DescendingRayReading::Unpenalized {
+                                likelihood_slope,
+                                penalty_slope,
+                                step_inf,
+                            },
+                        ) => gam_problem::JointNewtonTerminalReason::StalledOnUnpenalizedRay {
+                            residual,
+                            residual_tol,
+                            cycles: cycle + 1,
+                            likelihood_slope,
+                            penalty_slope,
+                            step_inf,
+                        },
+                        (false, DescendingRayReading::NoRay) => {
                             gam_problem::JointNewtonTerminalReason::ResidualNotContracting {
                                 rate_per_cycle,
                                 window_cycles: LINEAR_RATE_WINDOW,

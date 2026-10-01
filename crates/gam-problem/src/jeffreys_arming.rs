@@ -39,6 +39,15 @@ pub enum JeffreysArmingEvidence {
     /// The inner joint Newton was descending a direction no block's penalty
     /// opposes, so no `rho` bounds it.
     UnpenalizedDescendingRay { rate_per_cycle: f64 },
+    /// The inner joint Newton stopped on a residual-stall or divergence guard
+    /// while its accepted step still descended the penalized objective and no
+    /// block's penalty rose along it (gam#4592), so no `rho` bounds it.
+    UnpenalizedStalledRay {
+        /// `∇(−ℓ)·δ` over the whole accepted step.
+        likelihood_slope: f64,
+        /// `(S_λβ)·δ` over the whole accepted step, at most zero.
+        penalty_slope: f64,
+    },
     /// The penalized Hessian has a numerical null space at the terminal iterate.
     /// `nullity` is the constrained fixed-point certificate's count, or `None`
     /// when the KKT refusal report diagnosed the rank deficiency without a count.
@@ -139,7 +148,7 @@ impl JeffreysArmingEvidence {
                 "the likelihood kept improving along a direction block {block}'s penalty \
                  does not close"
             ),
-            Self::UnpenalizedDescendingRay { .. } => {
+            Self::UnpenalizedDescendingRay { .. } | Self::UnpenalizedStalledRay { .. } => {
                 "the likelihood kept improving along a direction no penalty opposes".to_string()
             }
             Self::NullPenalizedHessian { nullity: Some(nullity) } => format!(
@@ -293,6 +302,14 @@ impl CustomFamilyError {
                 ..
             } => Some(JeffreysArmingEvidence::UnpenalizedDescendingRay {
                 rate_per_cycle: *rate_per_cycle,
+            }),
+            JointNewtonTerminalReason::StalledOnUnpenalizedRay {
+                likelihood_slope,
+                penalty_slope,
+                ..
+            } => Some(JeffreysArmingEvidence::UnpenalizedStalledRay {
+                likelihood_slope: *likelihood_slope,
+                penalty_slope: *penalty_slope,
             }),
             JointNewtonTerminalReason::ConstrainedFixedPointDeclined {
                 condition: ConstrainedFixedPointCondition::HpenNullity { nullity },
@@ -550,6 +567,39 @@ mod tests {
             Some(JeffreysArmingEvidence::UnpenalizedDescendingRay { rate_per_cycle: 0.9 })
         );
 
+        // gam#4592: a stall whose accepted step still descends with no block's
+        // penalty rising along it names the unpenalized ray, and arms on it; the
+        // outer seed loop reads it as a ray no strength closes.
+        let stalled_unpenalized = joint_newton_refusal(
+            JointNewtonTerminalReason::StalledOnUnpenalizedRay {
+                residual: 4.83e3,
+                residual_tol: 4.83e-3,
+                cycles: 47,
+                likelihood_slope: -7.26e-3,
+                penalty_slope: -5.82e-5,
+                step_inf: 6.27e-2,
+            },
+            false,
+        );
+        let unpenalized_stall_evidence = JeffreysArmingEvidence::UnpenalizedStalledRay {
+            likelihood_slope: -7.26e-3,
+            penalty_slope: -5.82e-5,
+        };
+        assert_eq!(
+            stalled_unpenalized.jeffreys_arming_evidence(),
+            Some(unpenalized_stall_evidence.clone())
+        );
+        assert_eq!(
+            stalled_unpenalized.descending_ray_exit(),
+            Some(crate::custom_family_error::DescendingRayExit::Unpenalized)
+        );
+        assert!(
+            stalled_unpenalized
+                .to_string()
+                .contains("no penalty strength closes this ray"),
+            "the refusal names the unpenalized ray: {stalled_unpenalized}"
+        );
+
         let nullity = joint_newton_refusal(
             JointNewtonTerminalReason::ConstrainedFixedPointDeclined {
                 condition: ConstrainedFixedPointCondition::HpenNullity { nullity: 2 },
@@ -684,7 +734,7 @@ mod tests {
             column_indices: vec![0, 2],
             min_signed_margin: 0.125,
         };
-        for evidence in [ray_evidence, divergent_evidence, separation] {
+        for evidence in [ray_evidence, divergent_evidence, separation, unpenalized_stall_evidence] {
             let wire = serde_json::to_string(&evidence).unwrap();
             let restored: JeffreysArmingEvidence = serde_json::from_str(&wire).unwrap();
             assert_eq!(restored, evidence);
