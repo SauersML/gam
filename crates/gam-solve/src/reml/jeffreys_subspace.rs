@@ -1621,6 +1621,11 @@ pub struct JointJeffreysPlan {
     idx_min: usize,
     idx_max: usize,
     information_rounding_band: f64,
+    /// The spectral-norm bound on the rounding the information's own assembly left in
+    /// `H_id`, from the family's entrywise band on `H`
+    /// ([`Self::prepare_with_assembly_band`]); `0` when the family declares none. It is
+    /// part of [`Self::information_rounding_band`] and of [`Self::value_roundoff_bound`].
+    assembly_band: f64,
 }
 
 /// The Jeffreys term at one coefficient point: the value `Φ`, the score `∇Φ`, the
@@ -1750,7 +1755,32 @@ impl JointJeffreysPlan {
     ///
     /// The resolution band is [`Self::information_rounding_band`].
     pub fn prepare(h_joint: ArrayView2<'_, f64>, z_j: ArrayView2<'_, f64>) -> Result<Self, String> {
-        let plan = Self::diagnose(h_joint, z_j)?;
+        Self::prepare_with_assembly_band(h_joint, z_j, None)
+    }
+
+    /// [`Self::prepare`] for an information whose assembly the family bounds entrywise:
+    /// `|fl(H) − H|_ab ≤ assembly_band_ab`, the rounding `H` carried before this plan
+    /// read it (its row sums, and the weights those rows were formed from).
+    ///
+    /// The plan's own bands start from the `H` it is handed: the eigensolve's backward
+    /// error and the formation of `Z_Jᵀ·H·Z_J`. Neither sees the error already in `H`.
+    /// On a separated multinomial each saturated row's weight `p_a(1 − p_a)` is formed
+    /// by cancellation, so its absolute error is `O(u·p_a)` while its value is
+    /// `O(e^{−|η|})`. Six hundred such rows put `O(1e-12)` into a reduced information
+    /// of `O(1e-3)`, which moves `Φ` by `O(1e-10)`: eight times the ceiling the inner
+    /// solve could admit, so it rejected every step at the noise floor and refused the
+    /// mode (#2668). The error maps onto the reduced information as
+    /// `|Z_Jᵀ E Z_J| ≤ |Z_J|ᵀ·B·|Z_J|` entrywise, whose Frobenius norm bounds its spectral
+    /// norm, and by Weyl that bounds every eigenvalue's motion.
+    pub fn prepare_with_assembly_band(
+        h_joint: ArrayView2<'_, f64>,
+        z_j: ArrayView2<'_, f64>,
+        assembly_band: Option<ArrayView2<'_, f64>>,
+    ) -> Result<Self, String> {
+        let mut plan = Self::diagnose(h_joint, z_j)?;
+        if let Some(band) = assembly_band {
+            plan.add_assembly_band(band)?;
+        }
         if plan.reduced_dim == 0 {
             return Ok(plan);
         }
@@ -1804,6 +1834,7 @@ impl JointJeffreysPlan {
                 idx_min: 0,
                 idx_max: 0,
                 information_rounding_band: 0.0,
+                assembly_band: 0.0,
             });
         }
 
@@ -1860,13 +1891,42 @@ impl JointJeffreysPlan {
             idx_min,
             idx_max,
             information_rounding_band,
+            assembly_band: 0.0,
         })
+    }
+
+    fn add_assembly_band(&mut self, band: ArrayView2<'_, f64>) -> Result<(), String> {
+        let p = self.z_j.nrows();
+        if band.dim() != (p, p) {
+            return Err(format!(
+                "joint_jeffreys_term: the information assembly band has shape {:?}, expected \
+                 ({p}, {p})",
+                band.dim()
+            ));
+        }
+        if !band.iter().all(|value| value.is_finite() && *value >= 0.0) {
+            return Err(
+                "joint_jeffreys_term: the information assembly band is not finite and \
+                 non-negative"
+                    .to_string(),
+            );
+        }
+        if self.reduced_dim == 0 {
+            return Ok(());
+        }
+        let z_abs = self.z_j.mapv(f64::abs);
+        let reduced = z_abs.t().dot(&band.dot(&z_abs));
+        let frobenius = reduced.iter().map(|value| value * value).sum::<f64>().sqrt();
+        self.assembly_band = frobenius;
+        self.information_rounding_band += frobenius;
+        Ok(())
     }
 
     /// The rounding band `b` of the computed reduced spectrum: every computed eigenvalue
     /// `fl(λ_i)` lies within `b` of an eigenvalue of the exact `H_id = Z_Jᵀ·H·Z_J`.
     ///
-    /// It is the eigensolve's own band,
+    /// It is the family's assembly band when it declares one
+    /// ([`Self::prepare_with_assembly_band`]), plus the eigensolve's own band,
     /// [`gam_linalg::roundoff::symmetric_spectrum_rounding_band`], plus the rounding the
     /// formation of `H_id = Z_Jᵀ·(H·Z_J)` left in the matrix it decomposes. Each of the
     /// two products is an inner product of length `p` and the symmetrization averages
@@ -1957,14 +2017,15 @@ impl JointJeffreysPlan {
     /// The rounding ONE evaluation of [`Self::value`] carries (gam#2718).
     ///
     /// A symmetric eigensolve returns each `λ_i` exactly for some perturbed
-    /// `H_id + E` with `‖E‖ ≤ m·ε·‖H_id‖`, so every eigenvalue is known only to
-    /// `m·ε·λ_max`. The value maps that through `g'(λ) = floored_inverse(λ)`,
+    /// `H_id + E` with `‖E‖ ≤ m·ε·‖H_id‖`, and the family's assembly left a further
+    /// `a` ([`Self::prepare_with_assembly_band`]) in the `H_id` it decomposed, so every
+    /// eigenvalue is known only to `m·ε·λ_max + a`. The value maps that through `g'(λ) = floored_inverse(λ)`,
     /// which is `1/λ` on an identified direction and saturates at `1/floor`
     /// below it, and the gate moves with `λ_min`, `λ_max` carrying `U = ½Σg`
     /// with it. To first order in the perturbation
     ///
     /// ```text
-    /// δΦ ≤ m·ε·λ_max · ( G·½ Σ_i |g'(λ_i)| + (|∂G/∂λ_min| + |∂G/∂λ_max|)·|U| ).
+    /// δΦ ≤ (m·ε·λ_max + a) · ( G·½ Σ_i |g'(λ_i)| + (|∂G/∂λ_min| + |∂G/∂λ_max|)·|U| ).
     /// ```
     ///
     /// At the relative floor `1/floor = 1/(1e-10·λ_max)`, so ONE floored
@@ -1978,7 +2039,8 @@ impl JointJeffreysPlan {
             return 0.0;
         }
         let m = self.reduced_dim as f64;
-        let eigenvalue_perturbation = m * f64::EPSILON * self.lambda_max.abs().max(self.floor);
+        let eigenvalue_perturbation =
+            m * f64::EPSILON * self.lambda_max.abs().max(self.floor) + self.assembly_band;
         let value_sensitivity = 0.5
             * self.gate_weight.abs()
             * self
@@ -2770,7 +2832,7 @@ where
     DirFn: Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
 {
     let p = h_joint.nrows();
-    joint_jeffreys_term_batched(h_joint, z_j, || {
+    joint_jeffreys_term_batched(h_joint, z_j, None, || {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let results: Vec<Result<Option<Array2<f64>>, String>> = (0..p)
             .into_par_iter()
@@ -2797,16 +2859,19 @@ where
 /// `hessian_axes` is invoked exactly once when the prepared conditioning gate is
 /// active and never when it is inactive.  The same [`JointJeffreysPlan`] supplies
 /// the value, gradient, curvature and score rounding band, so the optimization cannot
-/// accidentally gate one information matrix and differentiate another.
+/// accidentally gate one information matrix and differentiate another. `assembly_band`
+/// is the family's entrywise bound on the rounding `h_joint` carries
+/// ([`JointJeffreysPlan::prepare_with_assembly_band`]).
 pub fn joint_jeffreys_term_batched<AxesFn>(
     h_joint: ArrayView2<'_, f64>,
     z_j: ArrayView2<'_, f64>,
+    assembly_band: Option<ArrayView2<'_, f64>>,
     hessian_axes: AxesFn,
 ) -> Result<JointJeffreysTerm, String>
 where
     AxesFn: FnOnce() -> Result<Option<Vec<Array2<f64>>>, String>,
 {
-    let plan = JointJeffreysPlan::prepare(h_joint, z_j)?;
+    let plan = JointJeffreysPlan::prepare_with_assembly_band(h_joint, z_j, assembly_band)?;
     joint_jeffreys_term_from_plan(plan, hessian_axes)
 }
 
@@ -2829,6 +2894,7 @@ where
 pub fn joint_jeffreys_term_batched_rotated<RotatedFn, AxesFn>(
     h_joint: ArrayView2<'_, f64>,
     z_j: ArrayView2<'_, f64>,
+    assembly_band: Option<ArrayView2<'_, f64>>,
     rotated_axes: RotatedFn,
     hessian_axes: AxesFn,
 ) -> Result<JointJeffreysTerm, String>
@@ -2836,7 +2902,7 @@ where
     RotatedFn: FnOnce(ArrayView2<'_, f64>) -> Result<Option<Array2<f64>>, String>,
     AxesFn: FnOnce() -> Result<Option<Vec<Array2<f64>>>, String>,
 {
-    let plan = JointJeffreysPlan::prepare(h_joint, z_j)?;
+    let plan = JointJeffreysPlan::prepare_with_assembly_band(h_joint, z_j, assembly_band)?;
     joint_jeffreys_term_from_reduced_axes(plan, |z_j, evecs| {
         let p = z_j.nrows();
         let m = evecs.ncols();
@@ -3540,6 +3606,9 @@ pub struct JeffreysHphiDriftBase {
     /// The source plan's [`JointJeffreysPlan::information_rounding_band`], kept so
     /// a plan rebuilt from this spectrum states the same information resolution.
     information_rounding_band: f64,
+    /// The source plan's assembly share of that band
+    /// ([`JointJeffreysPlan::prepare_with_assembly_band`]), kept for the same reason.
+    assembly_band: f64,
     /// Per-axis rotated base derivative rows `vec(Ṽ_a)` (`p × m·m`).
     a_rows: Array2<f64>,
     /// `vec(Ψ ∘ Ṽ_a)` (`p × m·m`).
@@ -4200,6 +4269,7 @@ impl JeffreysHphiDriftBase {
             idx_min: plan.idx_min,
             idx_max: plan.idx_max,
             information_rounding_band: plan.information_rounding_band,
+            assembly_band: plan.assembly_band,
             a_rows: rows,
             aw_rows,
             divided_differences: std::sync::OnceLock::new(),
@@ -4236,6 +4306,7 @@ impl JeffreysHphiDriftBase {
         let idx_min = plan.idx_min;
         let idx_max = plan.idx_max;
         let information_rounding_band = plan.information_rounding_band;
+        let assembly_band = plan.assembly_band;
         let psi = floored_inverse_divided_differences(&evals, floor);
         let ambient_eigenbasis = z_owned.dot(&evecs);
         // The β-FIXED per-axis base: `Ṽ_a = Vᵀ D_a V` and `Ψ ∘ Ṽ_a`, formed from
@@ -4287,6 +4358,7 @@ impl JeffreysHphiDriftBase {
             idx_min,
             idx_max,
             information_rounding_band,
+            assembly_band,
             a_rows,
             aw_rows,
             divided_differences: std::sync::OnceLock::new(),
@@ -5394,7 +5466,7 @@ mod tests {
         let z = array![[1.0, 0.0], [0.0, 0.0], [0.0, 1.0]];
         let all_axis_builds = Cell::new(0usize);
 
-        let term = joint_jeffreys_term_batched(h.view(), z.view(), || {
+        let term = joint_jeffreys_term_batched(h.view(), z.view(), None, || {
             all_axis_builds.set(all_axis_builds.get() + 1);
             Ok(Some(vec![Array2::zeros((3, 3)); 3]))
         })
@@ -5440,7 +5512,7 @@ mod tests {
             band > 0.0 && band < 1e3 * f64::EPSILON * lambda,
             "the information band is a positive rounding-scale quantity (band {band:e})"
         );
-        let term = joint_jeffreys_term_batched(h.view(), z.view(), || Ok(Some(hdots.clone())))
+        let term = joint_jeffreys_term_batched(h.view(), z.view(), None, || Ok(Some(hdots.clone())))
             .expect("active Jeffreys term");
         for (k, hdot) in hdots.iter().enumerate() {
             let expected_gradient = 0.5 * hdot[[0, 0]] / lambda;
@@ -5463,6 +5535,44 @@ mod tests {
             term.score_rounding_band.mapv(|b| 2.0 * b),
             "a strength scales the band by its magnitude"
         );
+    }
+
+    /// #2668: a family's entrywise band `B` on the information it hands over enters the
+    /// plan as `‖|Z_J|ᵀ·B·|Z_J|‖_F`, once in the information band the score reads and
+    /// once in the eigenvalue motion the value's rounding reads. On a one-direction span
+    /// the reduced band is the scalar `|z|ᵀB|z|`, and the value bound grows by it in
+    /// proportion to its eigensolve share `m·ε·max(λ_max, floor)`.
+    #[test]
+    fn assembly_band_enters_the_information_and_value_bands_2668() {
+        let h = array![[0.5, 0.2], [0.2, 0.9]];
+        let z = array![[0.6], [-0.8]];
+        let band = array![[1.0e-12, 2.0e-12], [2.0e-12, 3.0e-12]];
+        let bare = JointJeffreysPlan::prepare(h.view(), z.view()).expect("bare plan");
+        let banded =
+            JointJeffreysPlan::prepare_with_assembly_band(h.view(), z.view(), Some(band.view()))
+                .expect("banded plan");
+        assert!(bare.is_active(), "a sub-one-observation direction arms the term");
+        assert_eq!(bare.evals, banded.evals, "the band never moves the spectrum");
+        let reduced_band = 0.36 * 1.0e-12 + 2.0 * 0.48 * 2.0e-12 + 0.64 * 3.0e-12;
+        let information_growth =
+            banded.information_rounding_band() - bare.information_rounding_band();
+        assert!(
+            (information_growth - reduced_band).abs() <= 8.0 * f64::EPSILON * reduced_band,
+            "information band grew by {information_growth:e}, expected {reduced_band:e}"
+        );
+        let eigensolve_share = f64::EPSILON * bare.lambda_max.abs().max(bare.floor);
+        let expected_value_ratio = 1.0 + reduced_band / eigensolve_share;
+        let value_ratio = banded.value_roundoff_bound() / bare.value_roundoff_bound();
+        assert!(
+            (value_ratio - expected_value_ratio).abs() <= 8.0 * f64::EPSILON * expected_value_ratio,
+            "value bound grew by {value_ratio}, expected {expected_value_ratio}"
+        );
+        let refused = JointJeffreysPlan::prepare_with_assembly_band(
+            h.view(),
+            z.view(),
+            Some(array![[1.0, f64::NAN], [0.0, 1.0]].view()),
+        );
+        assert!(refused.is_err(), "a non-finite band is refused");
     }
 
     /// Test-only analytic oracle: the per-direction mode-response drift
@@ -5876,12 +5986,13 @@ mod tests {
         };
         for z in [Array2::<f64>::eye(p), narrow] {
             let width = z.ncols();
-            let dense = joint_jeffreys_term_batched(h0.view(), z.view(), || Ok(Some(hdots.clone())))
+            let dense = joint_jeffreys_term_batched(h0.view(), z.view(), None, || Ok(Some(hdots.clone())))
                 .map(JointJeffreysTerm::into_triple)
                 .expect("dense Jeffreys term");
             let declined = joint_jeffreys_term_batched_rotated(
                 h0.view(),
                 z.view(),
+                None,
                 |_| Ok(None),
                 || Ok(Some(hdots.clone())),
             )
@@ -5900,6 +6011,7 @@ mod tests {
             let rotated = joint_jeffreys_term_batched_rotated(
                 h0.view(),
                 z.view(),
+                None,
                 |basis| gam_model_api::jeffreys_rotated_axis_rows(&hdots, basis).map(Some),
                 || Err("the dense provider must not run when rows are supplied".to_string()),
             )
@@ -5925,6 +6037,7 @@ mod tests {
             let wrong = joint_jeffreys_term_batched_rotated(
                 h0.view(),
                 z.view(),
+                None,
                 |basis| gam_model_api::jeffreys_rotated_axis_rows(&other, basis).map(Some),
                 || Ok(None),
             )

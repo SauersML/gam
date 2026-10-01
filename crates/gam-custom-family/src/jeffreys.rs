@@ -271,13 +271,18 @@ pub(crate) fn custom_family_joint_jeffreys_value<
             )));
         }
     };
-    let plan = gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::prepare(
-        h_joint.view(),
-        z_joint.view(),
-    )
-    .map_err(|error| {
-        CustomFamilyError::trial_point(format!("Jeffreys value unavailable at this point: {error}"))
-    })?;
+    let assembly_band = family.joint_jeffreys_information_assembly_band_with_specs(states, specs)?;
+    let plan =
+        gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::prepare_with_assembly_band(
+            h_joint.view(),
+            z_joint.view(),
+            assembly_band.as_ref().map(|band| band.view()),
+        )
+        .map_err(|error| {
+            CustomFamilyError::trial_point(format!(
+                "Jeffreys value unavailable at this point: {error}"
+            ))
+        })?;
     let strength = family.joint_jeffreys_term_strength();
     Ok(JointJeffreysValue {
         phi: plan.value() * strength,
@@ -342,9 +347,11 @@ fn custom_family_joint_jeffreys_term_from_information<
     // performs ZERO all-axes builds.  When active, a family that forms the rotated
     // rows supplies them and no `p × p` axis matrix is built (#1082); otherwise the
     // dense provider is called once and returns the canonical `{Hdot[e_a]}` batch.
+    let assembly_band = family.joint_jeffreys_information_assembly_band_with_specs(states, specs)?;
     let term = gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_term_batched_rotated(
         h_joint.view(),
         z_joint.view(),
+        assembly_band.as_ref().map(|band| band.view()),
         |basis| {
             family
                 .jeffreys_rotated_first_derivative()
@@ -370,11 +377,14 @@ fn custom_family_joint_jeffreys_term_from_information<
 /// and lets row-kernel workspaces dispatch their build-once all-axes hook.
 /// `None` is a typed capability result: the caller may use the family route
 /// only when the concrete workspace does not expose a batched derivative.
+/// `assembly_band` is the family's bound on the rounding of the information at this
+/// beta ([`CustomFamily::joint_jeffreys_information_assembly_band_with_specs`]).
 pub(crate) fn custom_family_joint_jeffreys_term_from_workspace(
     workspace: &dyn ExactNewtonJointHessianWorkspace,
     total_p: usize,
     z_joint: &Array2<f64>,
     strength: f64,
+    assembly_band: Option<&Array2<f64>>,
 ) -> Result<Option<JointJeffreysTerm>, CustomFamilyError> {
     if total_p == 0 || z_joint.ncols() == 0 {
         return Ok(None);
@@ -400,6 +410,7 @@ pub(crate) fn custom_family_joint_jeffreys_term_from_workspace(
     gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_term_batched(
         h_joint.view(),
         z_joint.view(),
+        assembly_band.map(|band| band.view()),
         || Ok(Some(directional_derivatives)),
     )
     .map_err(CustomFamilyError::trial_point)

@@ -1857,6 +1857,29 @@ pub trait CustomFamily {
         self.exact_newton_joint_hessian_with_specs(block_states, specs)
     }
 
+    /// Entrywise bound on the rounding [`Self::joint_jeffreys_information_with_specs`]
+    /// carries at the same point: `|fl(H) − H|_ab ≤ B_ab`, counting every operation
+    /// from the coefficients to the returned matrix (the predictors, the per-row
+    /// weights, and the row sums).
+    ///
+    /// The Jeffreys value and score are priced against this band on top of the
+    /// rounding of their own spectral work. `None` means the family does not measure
+    /// it, and those bands then start from the matrix as handed over.
+    fn joint_jeffreys_information_assembly_band_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Array2<f64>>, String> {
+        if block_states.len() != specs.len() {
+            return Err(format!(
+                "Jeffreys information assembly band: {} block states for {} block specs",
+                block_states.len(),
+                specs.len()
+            ));
+        }
+        Ok(None)
+    }
+
     /// First beta-directional derivative of
     /// [`Self::joint_jeffreys_information_with_specs`].
     fn joint_jeffreys_information_directional_derivative_with_specs(

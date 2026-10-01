@@ -3213,6 +3213,89 @@ impl CustomFamily for MultinomialFamily {
         Ok(Some(hessian))
     }
 
+    /// The rounding the Jeffreys information `H = Σ_n x_n x_nᵀ ⊗ W_n` carries, with
+    /// `W_n = w_n(diag(p) − p pᵀ)` on the active classes, entrywise and to first order.
+    ///
+    /// With `t_b = η_b − s` the centred logits (reference `−s`) and `δt` their error,
+    /// `d log p_a = dt_a − Σ_b p_b dt_b`, so the logits move `p_a` by at most
+    /// `2(1 − p_a)·(δt + u)` relatively (each mass's own `exp` rounding enters the same
+    /// way), and the normalizer, its reciprocal and the product add `γ_{M+3}`
+    /// unscaled. `δt ≤ 2·max_a e_a + u·max_b|t_b|`, where `e_a ≤ γ_{P+1}·Σ_j|X_nj β_aj|
+    /// + u|η_a|` is the predictor's own formation. Then `1 − p_a` is off by
+    /// `p_a ρ_a + u(1 − p_a)`, and
+    ///
+    /// ```text
+    /// |δW_aa| ≤ w·( 2γ_{M+3}·p_a + p_a(1 − p_a)·(4(δt + u) + 3u) )
+    /// |δW_ab| ≤ w·p_a p_b·( 4(δt + u) + 2γ_{M+3} + 3u ),   a ≠ b.
+    /// ```
+    ///
+    /// The `2γ_{M+3}·p_a` floor is what survives on a saturated row: `W_aa` is
+    /// `O(e^{−|η|})` there but formed as `p_a(1 − p_a)` with `p_a` rounded at `u`.
+    /// [`dense_block_xtwx`] sums the `n` rows after two products and the off-diagonal
+    /// average, `γ_{n+4}·Σ_n |x_nj x_nk|·|W_n,ab|`. The band is both, summed with
+    /// `|X|` by the same kernel.
+    fn joint_jeffreys_information_assembly_band_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.check_spec_coefficient_width(specs, "Jeffreys information assembly band")?;
+        let eta = self.collect_eta_matrix(block_states)?;
+        let n = self.weights.len();
+        let p = self.design.ncols();
+        let m = self.active_classes();
+        let u = gam_linalg::roundoff::UNIT_ROUNDOFF;
+        let predictor_growth = gam_linalg::roundoff::accumulation_growth(p + 1);
+        let normalizer_growth = gam_linalg::roundoff::accumulation_growth(m + 3);
+        let sum_growth = gam_linalg::roundoff::accumulation_growth(n + 4);
+        let design = self.design.as_standard_layout();
+        let mut row_bands = Array3::<f64>::zeros((n, m, m));
+        let mut eta_row = vec![0.0_f64; m];
+        let mut probabilities = vec![0.0_f64; m + 1];
+        for row in 0..n {
+            let weight = self.weights[row];
+            if weight == 0.0 {
+                continue;
+            }
+            let mut predictor_error = 0.0_f64;
+            for (a, state) in block_states.iter().enumerate() {
+                eta_row[a] = eta[[row, a]];
+                let magnitude: f64 = (0..p)
+                    .map(|j| (design[[row, j]] * state.beta[j]).abs())
+                    .sum();
+                predictor_error =
+                    predictor_error.max(predictor_growth * magnitude + u * eta_row[a].abs());
+            }
+            let (shift, _) = multinomial_logit_probabilities_into(&eta_row, &mut probabilities);
+            let centred_magnitude = eta_row
+                .iter()
+                .map(|logit| (logit - shift).abs())
+                .fold(shift.abs(), f64::max);
+            let centred_error = 2.0 * predictor_error + u * centred_magnitude;
+            let logit_share = 4.0 * (centred_error + u);
+            for a in 0..m {
+                let p_a = probabilities[a];
+                for b in 0..m {
+                    let p_b = probabilities[b];
+                    row_bands[[row, a, b]] = weight
+                        * if a == b {
+                            let curvature = p_a * (1.0 - p_a);
+                            sum_growth * curvature
+                                + 2.0 * normalizer_growth * p_a
+                                + curvature * (logit_share + 3.0 * u)
+                        } else {
+                            p_a * p_b
+                                * (sum_growth + logit_share + 2.0 * normalizer_growth + 3.0 * u)
+                        };
+                }
+            }
+        }
+        let abs_design = design.mapv(f64::abs);
+        dense_block_xtwx(abs_design.view(), row_bands.view(), None)
+            .map(Some)
+            .map_err(|e| format!("MultinomialFamily Jeffreys information assembly band: {e}"))
+    }
+
     fn exact_newton_joint_gradient_evaluation(
         &self,
         block_states: &[ParameterBlockState],
@@ -5702,6 +5785,91 @@ mod tests {
     fn beta_flat_dim_equals_active_classes_times_p() {
         let family = toy_family(3, 5, 4);
         assert_eq!(family.beta_flat_dim(), 3 * 5);
+    }
+
+    /// #2668: on saturated rows `W_aa = p_a(1 − p_a)` is formed by cancellation, so
+    /// the Jeffreys information carries rounding its own spectral bands never saw.
+    /// The family's assembly band must cover it. The reference forms the same
+    /// weights without the cancellation, `p_a·Σ_{b≠a} p_b` over every other class
+    /// including the reference, from the same `p`; each of the two assemblies is
+    /// within the band of the exact matrix, so they differ by at most twice it.
+    #[test]
+    fn jeffreys_information_assembly_band_covers_saturated_weight_cancellation_2668() {
+        let family = toy_family(240, 2, 3);
+        let p = family.design.ncols();
+        let m = family.active_classes();
+        let n = family.weights.len();
+        let design = family.design.view();
+        // Logits of order 100 saturate most rows, as a separated fit's do.
+        let block_states: Vec<ParameterBlockState> = (0..m)
+            .map(|a| {
+                let beta = Array1::<f64>::from_shape_fn(p, |i| {
+                    if a == 0 { 90.0 - 40.0 * i as f64 } else { -60.0 + 70.0 * i as f64 }
+                });
+                let eta = Array1::<f64>::from_shape_fn(n, |row| {
+                    (0..p).map(|i| design[[row, i]] * beta[i]).sum()
+                });
+                ParameterBlockState { beta, eta }
+            })
+            .collect();
+        let specs = family.build_block_specs();
+        let information = family
+            .joint_jeffreys_information_with_specs(&block_states, &specs)
+            .expect("information builds")
+            .expect("information is present");
+        let band = family
+            .joint_jeffreys_information_assembly_band_with_specs(&block_states, &specs)
+            .expect("assembly band builds")
+            .expect("the multinomial measures its assembly");
+        let mut reference_weights = Array3::<f64>::zeros((n, m, m));
+        let mut eta_row = vec![0.0_f64; m];
+        let mut probabilities = vec![0.0_f64; m + 1];
+        let mut saturated_rows = 0usize;
+        for row in 0..n {
+            for a in 0..m {
+                eta_row[a] = block_states[a].eta[row];
+            }
+            multinomial_logit_probabilities_into(&eta_row, &mut probabilities);
+            if probabilities.iter().any(|&mass| mass > 1.0 - 1.0e-12) {
+                saturated_rows += 1;
+            }
+            for a in 0..m {
+                for b in 0..m {
+                    reference_weights[[row, a, b]] = if a == b {
+                        let others: f64 = probabilities
+                            .iter()
+                            .enumerate()
+                            .filter(|&(class, _)| class != a)
+                            .map(|(_, &mass)| mass)
+                            .sum();
+                        probabilities[a] * others
+                    } else {
+                        -probabilities[a] * probabilities[b]
+                    };
+                }
+            }
+        }
+        assert!(
+            saturated_rows > n / 2,
+            "the fixture must saturate most rows, got {saturated_rows} of {n}"
+        );
+        let reference = dense_block_xtwx(design, reference_weights.view(), None)
+            .expect("reference information builds");
+        let mut largest_gap = 0.0_f64;
+        for ((index, &value), &reference_value) in information.indexed_iter().zip(reference.iter()) {
+            let gap = (value - reference_value).abs();
+            largest_gap = largest_gap.max(gap);
+            assert!(
+                gap <= 2.0 * band[index],
+                "entry {index:?}: the cancelled and uncancelled assemblies differ by {gap:e}, \
+                 beyond twice the assembly band {:e}",
+                band[index]
+            );
+        }
+        assert!(
+            largest_gap > 0.0,
+            "the saturated fixture must exercise the cancellation it bounds"
+        );
     }
 
     #[test]

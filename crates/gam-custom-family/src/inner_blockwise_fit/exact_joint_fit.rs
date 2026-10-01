@@ -1929,6 +1929,9 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                             total_p,
                             z_joint,
                             family.joint_jeffreys_term_strength(),
+                            family
+                                .joint_jeffreys_information_assembly_band_with_specs(&states, specs)?
+                                .as_ref(),
                         )?
                     }
                     _ => None,
@@ -5646,6 +5649,9 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                         total_p,
                         z_joint,
                         family.joint_jeffreys_term_strength(),
+                        family
+                            .joint_jeffreys_information_assembly_band_with_specs(&states, specs)?
+                            .as_ref(),
                     )?
                 }
                 _ => None,
