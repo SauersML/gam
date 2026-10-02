@@ -670,6 +670,7 @@ fn search(
         let mut tables: BTreeMap<usize, Option<BlockBits>> = BTreeMap::new();
         let mut current_data: Option<f64> = None;
         let mut base_operator_bits: BTreeMap<usize, u64> = BTreeMap::new();
+        let mut best_structural: Option<Screened> = None;
         for proposal in proposals {
             if refused.contains(&proposal.description) {
                 continue;
@@ -745,9 +746,16 @@ fn search(
                 }
             }
             if saving > 0.0 {
-                screened.push(Screened { proposal, saving });
+                if proposal.edit.is_local() {
+                    screened.push(Screened { proposal, saving });
+                } else if best_structural.as_ref().is_none_or(|best: &Screened| saving > best.saving) {
+                    // A structural proposal is tried alone and only the best one of a round is
+                    // tried, so only it is kept: each carries its own new operators.
+                    best_structural = Some(Screened { proposal, saving });
+                }
             }
         }
+        screened.extend(best_structural);
         if screened.is_empty() {
             if level + 1 < levels {
                 level += 1;
