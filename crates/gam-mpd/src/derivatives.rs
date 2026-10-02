@@ -20,6 +20,7 @@ use super::engine::{EngineError, Edit, Exactness, Primitive, Proposal, SearchCon
 use super::fit::ProposalKind;
 use super::operator_program::{FamilyInputs, Node, OperatorBody, OperatorProgram, ProgramError, Scale, Trace};
 use super::precision::DeclaredPrecision;
+use gam_linalg::faer_ndarray::{fast_ab, fast_abt};
 use ndarray::{Array2, Axis, s};
 use std::collections::BTreeMap;
 
@@ -355,7 +356,7 @@ pub fn vjp(
             Node::Feature { .. } | Node::Raw { .. } | Node::Constant { .. } => {}
             Node::Affine { terms, .. } => {
                 for (argument, operator) in terms {
-                    add(&mut g, *argument, cot.dot(program.operators[*operator].matrix_cow().as_ref()));
+                    add(&mut g, *argument, fast_ab(&cot, program.operators[*operator].matrix_cow().as_ref()));
                 }
             }
             Node::Bilinear { left, right, scale } => {
@@ -439,7 +440,7 @@ pub fn vjp(
                 add(&mut g, *input, out);
             }
             Node::Transposed { input, operator } => {
-                add(&mut g, *input, cot.dot(&program.operators[*operator].matrix_cow().t()));
+                add(&mut g, *input, fast_abt(&cot, program.operators[*operator].matrix_cow().as_ref()));
             }
             Node::Attend { query, key, value: v, scale, rotary, causal } => {
                 let (gq, gk, gv) =

@@ -83,6 +83,9 @@ pub mod factors;
 // lists few pieces (listing code plus second-order KL).
 pub mod pieces;
 
+// Per-input pieces trained through the model's own masked forward, with exact selection.
+pub mod masked;
+
 #[cfg(test)]
 mod pieces_tests;
 

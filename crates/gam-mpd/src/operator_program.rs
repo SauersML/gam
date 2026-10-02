@@ -84,6 +84,7 @@ use super::codec::{
 };
 use super::precision::{DecodableArtifact, DeclaredPrecision, LatticeCode};
 use super::secant::BandedMatrix;
+use gam_linalg::faer_ndarray::{fast_ab, fast_abt};
 use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
 use gam_math::probability::{NORMAL_CDF_RELATIVE_ERROR, NORMAL_CDF_UNDERFLOW_FLOOR, normal_cdf_and_pdf};
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
@@ -2069,12 +2070,12 @@ impl OperatorProgram {
             Node::Transposed { input, operator } => {
                 let a = self.operators[*operator].matrix_cow();
                 let x = value(*input);
-                let out = x.dot(a.as_ref());
+                let out = fast_ab(x, a.as_ref());
                 let radius = band(*input).map(|r| {
                     let growth = accumulation_growth(a.nrows());
                     let mut lifted = x.mapv(|v| growth * v.abs());
                     lifted += r;
-                    let mut radius = lifted.dot(&a.mapv(f64::abs));
+                    let mut radius = fast_ab(&lifted, &a.mapv(f64::abs));
                     inflate_all(&mut radius, a.nrows());
                     radius
                 });
@@ -2156,11 +2157,11 @@ impl OperatorProgram {
                             }
                         }
                         OperatorBody::Dense { values: a, .. } => {
-                            out += &x.dot(&a.t());
+                            out += &fast_abt(x, a);
                             if let (Some(radius), Some(r)) = (radius.as_mut(), band(*argument)) {
                                 let mut lifted = x.mapv(|xv| growth * xv.abs());
                                 lifted += r;
-                                *radius += &lifted.dot(&a.mapv(f64::abs).t());
+                                *radius += &fast_abt(&lifted, &a.mapv(f64::abs));
                             }
                         }
                         OperatorBody::LowRank { left, right, .. } => {

@@ -121,7 +121,7 @@ fn planted() -> (OperatorProgram, Contract) {
 #[test]
 fn units_reading_one_plane_each_come_out_as_one_rule_per_plane() {
     let (program, contract) = planted();
-    let library: Vec<Box<dyn Primitive>> = vec![Box::new(Factors), Box::new(Coarsen)];
+    let library: Vec<Box<dyn Primitive>> = vec![Box::new(Factors::default()), Box::new(Coarsen)];
     let budget = Budget { screenings: 10_000, certifications: 200, refit: None };
     let result = decompose(&program, &contract, &library, &budget).expect("decomposes");
     let native = contract.score(&program, &contract.logits(&program).expect("reference")).expect("native");

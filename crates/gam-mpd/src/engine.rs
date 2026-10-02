@@ -174,7 +174,7 @@ pub fn library() -> Vec<Box<dyn Primitive>> {
         Box::new(StackTerms),
         Box::new(CenterLogits),
         Box::new(DropKeyBias),
-        Box::new(Factors),
+        Box::new(Factors::default()),
         Box::new(LawSubstitution),
         Box::new(CurvaturePrecision { probes: 4 }),
     ]

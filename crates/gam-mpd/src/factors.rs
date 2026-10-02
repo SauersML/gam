@@ -88,7 +88,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// Shared factors fitted in the code's metric (module note).
-pub struct Factors;
+///
+/// The readers' curvature is the costly part of a fit (one reverse pass per sketched class), so it
+/// is kept per component, keyed by the component's own operators: it is measured again only when
+/// one of them changes. A change elsewhere leaves it a proposal metric; the contract certifies.
+#[derive(Default)]
+pub struct Factors {
+    curvature: std::cell::RefCell<BTreeMap<Vec<usize>, BTreeMap<usize, Array2<f64>>>>,
+}
 
 fn refuse(message: impl Into<String>) -> EngineError {
     EngineError::Primitive(message.into())
@@ -415,7 +422,12 @@ struct Fit {
     scale: f64,
 }
 
-fn measure(program: &OperatorProgram, context: &SearchContext<'_>, component: &Component) -> Result<Option<Fit>, EngineError> {
+fn measure(
+    program: &OperatorProgram,
+    context: &SearchContext<'_>,
+    component: &Component,
+    cache: &std::cell::RefCell<BTreeMap<Vec<usize>, BTreeMap<usize, Array2<f64>>>>,
+) -> Result<Option<Fit>, EngineError> {
     let trace = context.trace;
     let d = trace.values[component.arguments[0]].ncols();
     let rows = trace.values[component.arguments[0]].nrows();
@@ -426,14 +438,27 @@ fn measure(program: &OperatorProgram, context: &SearchContext<'_>, component: &C
     }
     let pooled = (rows * component.arguments.len()) as f64;
     mean /= pooled;
-    let mut covariance = Array2::<f64>::zeros((d, d));
-    for &a in &component.arguments {
-        let centred = &trace.values[a] - &mean;
-        covariance += &centred.t().dot(&centred);
-    }
-    covariance /= pooled;
-    symmetrize(&mut covariance);
-    let (lambda, v) = support(&covariance)?;
+    // The read covariance's support and its roots. With fewer pooled rows than read dimensions the
+    // covariance has the rank of the rows: it is taken from the centred data's thin singular value
+    // decomposition (`X = P S Qᵀ`, `Σ = Q S² Qᵀ / N`), never as a d × d matrix.
+    let (lambda, v) = if component.arguments.len() * rows < d {
+        let views: Vec<Array2<f64>> = component.arguments.iter().map(|&a| &trace.values[a] - &mean).collect();
+        let stacked = ndarray::concatenate(Axis(0), &views.iter().map(|m| m.view()).collect::<Vec<_>>()).map_err(|e| refuse(e.to_string()))?;
+        let decomposed = svd(stacked.view(), false).map_err(|e| refuse(format!("{e:?}")))?;
+        let keep: Vec<usize> = (0..decomposed.singular_values.len()).filter(|&i| decomposed.singular_values[i] > decomposed.band).collect();
+        let lambda = Array1::from_iter(keep.iter().map(|&i| decomposed.singular_values[i] * decomposed.singular_values[i] / pooled));
+        let vectors = decomposed.vt.select(Axis(0), &keep).t().to_owned();
+        (lambda, vectors)
+    } else {
+        let mut covariance = Array2::<f64>::zeros((d, d));
+        for &a in &component.arguments {
+            let centred = &trace.values[a] - &mean;
+            covariance += &centred.t().dot(&centred);
+        }
+        covariance /= pooled;
+        symmetrize(&mut covariance);
+        support(&covariance)?
+    };
     if lambda.is_empty() {
         return Ok(None);
     }
@@ -446,7 +471,22 @@ fn measure(program: &OperatorProgram, context: &SearchContext<'_>, component: &C
         unwhiten.row_mut(k).mapv_inplace(|x| x / l.sqrt());
     }
     // Per reader node, its curvature; per operator, the sum over its uses.
-    let node_curvature = curvatures(program, context, &component.readers)?;
+    // The component's identity: its operators' allocations and its readers' positions.
+    let key: Vec<usize> = component
+        .operators
+        .iter()
+        .map(|op| std::sync::Arc::as_ptr(&program.operators[*op]) as usize)
+        .chain(component.readers.iter().copied())
+        .collect();
+    let cached = cache.borrow().get(&key).cloned();
+    let node_curvature = match cached {
+        Some(curvature) => curvature,
+        None => {
+            let curvature = curvatures(program, context, &component.readers)?;
+            cache.borrow_mut().insert(key, curvature.clone());
+            curvature
+        }
+    };
     let scale = (context.contract.observations as f64 * rows as f64).sqrt();
     let mut blocks = Vec::new();
     let (mut inverse_roots, mut curvature_traces, mut ranges) = (Vec::new(), Vec::new(), Vec::new());
@@ -676,7 +716,17 @@ impl Primitive for Factors {
         let program = context.program;
         let mut out = Vec::new();
         for component in components(program) {
-            let Some(fit) = measure(program, context, &component)? else { continue };
+            // A reader at least as wide as the output's classes and wider than the family has a
+            // curvature of more entries than the family can resolve, at one reverse pass per class:
+            // such an operator (an unembedding) is left to the precision and restriction moves.
+            let classes = context.trace.values[program.output].ncols() / context.contract.readouts.max(1);
+            if component.readers.iter().any(|r| {
+                let width = context.trace.values[*r].ncols();
+                width >= classes && width > context.trace.values[*r].nrows()
+            }) {
+                continue;
+            }
+            let Some(fit) = measure(program, context, &component, &self.curvature)? else { continue };
             let stacked_rows = fit.ranges.last().map_or(0, |range| range.end);
             let d = fit.vt.ncols();
             let full = fit.singular_values.len();
