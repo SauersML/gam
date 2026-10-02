@@ -13,10 +13,13 @@
 //!   tried tells apart from the returned program: the model's own implementation is redundant
 //!   there, as far as the interventions see.
 //! * **(d) distinct** — a different hypothesis: an intervention, executed natively on the model,
-//!   on which the two programs' predictions are proven to differ (their intervened data-code
-//!   intervals are disjoint). The witness is reported.
+//!   that resolves the tie: under it one program's total code for the intervened model's
+//!   behaviour is proven shorter than the other's. The witness is reported with the side the
+//!   model takes.
 //!
-//! The program is *identified* when no tie is distinct. The interventions are unit ablations:
+//! The program is *identified* when no tie is distinct in the tie's favour: every alternative
+//! the code allowed on the family is either the same program or refuted by the model under an
+//! intervention. The interventions are unit ablations:
 //! every group of every pointwise layer set to the zero law, in the model and in both programs at
 //! once (layers matched by order, as the search keeps them); the ablation with the largest
 //! screened disagreement is certified. The claim is relative to the ties the search certified and
@@ -39,13 +42,15 @@ pub enum Relation {
     Distinct(Witness),
 }
 
-/// An intervention on which two programs are proven to disagree, executed natively.
+/// An intervention that resolves a tie, executed natively.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Witness {
     pub intervention: String,
-    /// The intervened data-code intervals `[lower, upper]` of the returned program and the tie.
+    /// The intervened total intervals `[lower, upper]` of the returned program and the tie.
     pub returned_bits: (f64, f64),
     pub tie_bits: (f64, f64),
+    /// Whether the intervened model favours the tie (the returned program is refuted).
+    pub favours_tie: bool,
 }
 
 impl fmt::Display for Relation {
@@ -56,8 +61,13 @@ impl fmt::Display for Relation {
             Self::Redundant => write!(f, "redundant"),
             Self::Distinct(w) => write!(
                 f,
-                "distinct under {}: returned [{:.1}, {:.1}] bits, tie [{:.1}, {:.1}] bits",
-                w.intervention, w.returned_bits.0, w.returned_bits.1, w.tie_bits.0, w.tie_bits.1
+                "distinct under {}: returned [{:.1}, {:.1}] bits, tie [{:.1}, {:.1}] bits; the model favours the {}",
+                w.intervention,
+                w.returned_bits.0,
+                w.returned_bits.1,
+                w.tie_bits.0,
+                w.tie_bits.1,
+                if w.favours_tie { "tie" } else { "returned program" }
             ),
         }
     }
@@ -78,7 +88,7 @@ pub struct Identification {
     /// The exact gauge generators of the returned program: its equivalence class under (a).
     pub gauge: Vec<String>,
     pub alternatives: Vec<Alternative>,
-    /// No tie is distinct.
+    /// No tie is distinct in its own favour.
     pub identified: bool,
 }
 
@@ -154,7 +164,7 @@ fn ablate(program: &OperatorProgram, layer: usize, group: usize) -> Result<Optio
 }
 
 fn interval(score: &ProgramScore) -> (f64, f64) {
-    ((score.data_bits - score.data_bits_error).max(0.0), score.data_bits + score.data_bits_error)
+    (score.total_lower(), score.total_upper())
 }
 
 /// The unit ablation on which `returned` and `tie` disagree most about the natively ablated model,
@@ -197,6 +207,7 @@ fn witness(model: &OperatorProgram, contract: &Contract, returned: &OperatorProg
         intervention: format!("unit {group} of pointwise layer {layer} ablated (zero law) in the model and both programs"),
         returned_bits: ri,
         tie_bits: ti,
+        favours_tie: ti.1 < ri.0,
     }))
 }
 
@@ -220,6 +231,6 @@ pub fn identify(model: &OperatorProgram, contract: &Contract, decomposition: &De
             relation,
         });
     }
-    let identified = !alternatives.iter().any(|a| matches!(a.relation, Relation::Distinct(_)));
+    let identified = !alternatives.iter().any(|a| matches!(&a.relation, Relation::Distinct(w) if w.favours_tie));
     Ok(Identification { gauge: gauge(returned), alternatives, identified })
 }

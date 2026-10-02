@@ -7,17 +7,18 @@
 //! reads the four features of one frequency (the one explaining most of its pre-activation), and
 //! each unit writes only the class plane `cos/sin(ω_k c)` of its frequency; the embedding is
 //! restricted to the constant and those planes. Every coefficient is a least-squares fit to the
-//! model, and every operator sits on the lattice its curvature asks for.
+//! model, and the operators' lattices are chosen by the engine's precision moves alone.
 //!
 //! Needs the export at `MPD_P31_EXPORT` (default `~/mpd-data/engine/p31_s0_generic`); run with
-//! `cargo test --release -p gam-mpd --test modadd_oracle_2951 -- --ignored --nocapture`.
+//! `cargo test --release -p gam-mpd --test modadd_oracle_2951 -- --ignored --nocapture` (it runs the
+//! engine at two `n` and takes tens of minutes; a per-test timeout below that kills it).
 
 use gam_mpd::contract::{Contract, ProgramScore};
 use gam_mpd::dense::svd;
-use gam_mpd::derivatives::output_curvature;
-use gam_mpd::engine::{Budget, Edit, apply_edit, decompose, library};
+use gam_mpd::derivatives::CurvaturePrecision;
+use gam_mpd::engine::{Budget, Coarsen, Primitive, decompose, decompose_with_reference, library};
 use gam_mpd::import::import;
-use gam_mpd::operator_program::{Interface, LabelKind, Node, Operator, OperatorBody, OperatorProgram, Provenance, SlotValues};
+use gam_mpd::operator_program::{Interface, LabelKind, Node, Operator, OperatorProgram, Provenance, SlotValues};
 use gam_mpd::operator_rewrites::insert_node;
 use gam_mpd::precision::DeclaredPrecision;
 use ndarray::{Array1, Array2, Axis, s};
@@ -204,23 +205,11 @@ fn oracle(model: &OperatorProgram, contract: &Contract) -> OperatorProgram {
     }
     program.prune();
     program.interfaces().expect("the oracle is well formed");
-    // Every operator on the lattice its curvature asks for.
-    let trace = program.execute(&contract.family, false).expect("executes");
-    let n = contract.observations as f64;
-    for op in 0..program.operators.len() {
-        if !matches!(program.operators[op].body, OperatorBody::Dense { .. }) {
-            continue;
-        }
-        let m = program.operators[op].real_count() as f64;
-        let Some(trace_f) = output_curvature(&program, &contract.family, &trace, contract.readouts, op, 8).expect("curvature") else { continue };
-        if !(trace_f > 0.0) {
-            continue;
-        }
-        let step = (12.0 * m / (n * trace_f)).sqrt();
-        let precision = DeclaredPrecision::new((-step.log2()).round() as i32).expect("a precision");
-        apply_edit(&mut program, &Edit::Precision { operator: op, precision }).expect("rounds");
-    }
-    program
+    // Every operator on its lattice, chosen by the engine's own precision moves from the oracle
+    // alone: the start set is the oracle, the library only re-precises and coarsens.
+    let reference = contract.logits(model).expect("reference");
+    let precisions: Vec<Box<dyn Primitive>> = vec![Box::new(CurvaturePrecision { probes: 4 }), Box::new(Coarsen)];
+    decompose_with_reference(&reference, &[&program], contract, &precisions, &Budget::default()).expect("precisions").program
 }
 
 fn line(label: &str, score: &ProgramScore) {

@@ -530,10 +530,41 @@ fn factor_figure(program: &OperatorProgram, contract: &Contract, p: usize, curve
             write.push(json!({"factor": i, "over_sum": over_c, "coefficient_energy": energy}));
         }
     }
+    // The layer's writes on the logits, whatever the program composed them into: each unit's
+    // derivative of every class logit (one reverse pass per class, at the first input; the path
+    // to the logits is linear), the class mean removed (the softmax shift), and its singular
+    // directions over the classes `c = (a + b) mod p`.
+    let mut writes_over_classes = Vec::new();
+    let logits = &trace.values[program.output];
+    let classes = logits.ncols();
+    let units = trace.values[act].ncols();
+    let mut w = ndarray::Array2::<f64>::zeros((classes, units));
+    for c in 0..classes {
+        let mut cotangent = ndarray::Array2::<f64>::zeros(logits.dim());
+        cotangent[[0, c]] = 1.0;
+        if let Ok(back) = gam_mpd::derivatives::vjp(program, &contract.family, &trace, cotangent)
+            && let Some(g) = &back[act]
+        {
+            w.row_mut(c).assign(&g.row(0));
+        }
+    }
+    let mean = w.mean_axis(ndarray::Axis(0)).expect("classes");
+    let w = &w - &mean;
+    if let Ok(decomposed) = gam_mpd::dense::svd(w.view(), false) {
+        let total: f64 = decomposed.singular_values.iter().map(|s| s * s).sum();
+        for (i, sigma) in decomposed.singular_values.iter().enumerate().take(12) {
+            writes_over_classes.push(json!({
+                "direction": i,
+                "over_class": decomposed.u.column(i).to_vec(),
+                "energy_share": sigma * sigma / total.max(f64::MIN_POSITIVE),
+            }));
+        }
+    }
     json!({
         "p": p,
         "read_factors": read,
         "write_factors": write,
+        "writes_over_classes": writes_over_classes,
         "curve": curve.iter().map(|c| json!({"structure_bits": c.structure_bits, "rest_bits": c.rest_bits, "description": c.description})).collect::<Vec<_>>(),
     })
 }

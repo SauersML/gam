@@ -41,10 +41,11 @@
 //! L(structure) + L(precision) + Σ_x L(explanation of x | program) + n Σ_rows KL/ln 2.
 //! ```
 //!
-//! An activity the forward-error bands leave open (an interval of pre-activations that straddles
-//! the law's zero set) may flip; each flip moves the code by at most
-//! `log₂ T' + log₂ R + log₂(N + 1) + 4` bits (`T'` the largest possible `T`: its own term, the
-//! change of `c_r`, of `T` and of `k_x`), and the explanation term carries that interval.
+//! The explanations are a message the sender writes from the program's computed execution (the
+//! decoder's own arithmetic reproduces it), so their length is exact: an activity the
+//! forward-error bands leave open (an interval of pre-activations that straddles the law's zero
+//! set) changes what the exact-arithmetic program would do, never what was sent. Open activities
+//! are counted and reported (`Explanation::open`); the only band on the term is its own rounding.
 //!
 //! # Evidence
 //!
@@ -272,16 +273,13 @@ pub fn explanation(program: &OperatorProgram, trace: &Trace) -> Result<Explanati
     for &k in &fired {
         bits -= log2_factorial(k);
     }
-    let flips: f64 = open.iter().map(|o| f64::from(*o)).sum();
-    let largest_total = t + flips;
-    let per_flip = largest_total.max(1.0).log2() + (r + 1.0).log2() + (n + 1.0).log2() + 4.0;
     // Rounding: each of the `R + N + 2` terms is within a few ulps relative of itself.
-    let rounding = 64.0 * f64::EPSILON * (bits.abs() + n * (r + 1.0).log2() + t * largest_total.max(2.0).log2());
+    let rounding = 64.0 * f64::EPSILON * (bits.abs() + n * (r + 1.0).log2() + t * t.max(2.0).log2());
     Ok(Explanation {
         instances,
         bits,
-        bits_lower: (bits - flips * per_flip - rounding).max(0.0).next_down(),
-        bits_upper: (bits + flips * per_flip + rounding).next_up(),
+        bits_lower: (bits - rounding).max(0.0).next_down(),
+        bits_upper: (bits + rounding).next_up(),
         active,
         open,
     })

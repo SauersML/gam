@@ -79,6 +79,13 @@ pub mod operator_rewrites;
 // Shared writer factors: operators writing one space factored through one library of directions.
 pub mod factors;
 
+// Per-input pieces of one linear map: an overcomplete rank-1 library fitted so that each input
+// lists few pieces (listing code plus second-order KL).
+pub mod pieces;
+
+#[cfg(test)]
+mod pieces_tests;
+
 // Identifiability: the search's ties classified as gauge, abstraction, redundancy or a distinct
 // hypothesis with a natively executed witness.
 pub mod identify;
