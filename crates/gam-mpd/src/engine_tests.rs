@@ -295,7 +295,7 @@ fn rounding_a_program_leaves_its_structure_bits_unchanged() {
 }
 
 #[test]
-fn the_explanations_are_the_kt_code_of_each_units_activity() {
+fn the_explanations_list_each_inputs_active_units_in_the_librarys_code() {
     let (mut program, contract) = planted_program(true);
     let units = Interface::uniform(WIDTH, 1, LabelKind::Unit, 0).expect("interface");
     let (e, u) = (program.operators[0].clone(), program.operators[1].clone());
@@ -315,15 +315,21 @@ fn the_explanations_are_the_kt_code_of_each_units_activity() {
     let score = contract.score(&program, &reference).expect("score");
     let pre = &program.execute(&contract.family, false).expect("executes").values[2];
     let n = pre.nrows() as f64;
-    let kt = |k: f64| {
-        use statrs::function::gamma::ln_gamma;
-        (std::f64::consts::PI.ln() + ln_gamma(n + 1.0) - ln_gamma(k + 0.5) - ln_gamma(n - k + 0.5)) / std::f64::consts::LN_2
-    };
-    let (mut expected, mut active) = (0.0, 0usize);
-    for unit in 0..WIDTH {
-        let k = pre.column(unit).iter().filter(|v| **v > 0.0).count();
-        active += k;
-        expected += kt(k as f64);
+    // The listing code, term by term: the counts once, then per input its size and its set.
+    let counts: Vec<usize> = (0..WIDTH).map(|unit| pre.column(unit).iter().filter(|v| **v > 0.0).count()).collect();
+    let active: usize = counts.iter().sum();
+    let t = active as f64;
+    let r = WIDTH as f64;
+    let mut expected = r * (n + 1.0).log2() + n * (r + 1.0).log2();
+    for row in pre.outer_iter() {
+        let mut factorial = 1.0_f64;
+        for (unit, v) in row.iter().enumerate() {
+            if *v > 0.0 {
+                expected += (t / counts[unit] as f64).log2();
+                factorial *= (row.iter().take(unit + 1).filter(|x| **x > 0.0).count()) as f64;
+            }
+        }
+        expected -= factorial.log2();
     }
     let explanation = &score.explanation;
     assert_eq!(explanation.instances, WIDTH);

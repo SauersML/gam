@@ -19,20 +19,32 @@
 //! The program's message splits into its structure (bases, interfaces, present blocks, rules,
 //! wiring, laws) and its precision (each lattice's fraction bits and indices,
 //! `operator_program::CodeAccount`); rounding a program changes only the second. The behaviour of
-//! each input is then explained by which of the program's gated rule instances fire on it: every
+//! each input is then explained by the list of the program's rule instances that fire on it: every
 //! group of a pointwise node whose law is not the zero law is an instance, active on an input when
-//! its value there is not identically zero. The explanations of the family are sent once per input
-//! (not per observation) in the Krichevsky–Trofimov code of each instance's activity sequence,
-//! `−log₂ [Γ(k + ½) Γ(N − k + ½) / (π Γ(N + 1))]` bits for an instance active on `k` of the `N`
-//! inputs: the library of rules is paid once and amortised, and each input pays for how
-//! unpredictable its active set is. The score is the total
+//! its value there is not identically zero. The explanations are sent once per input (not per
+//! observation). The library's firing counts `c_r` (how many of the `N` inputs instance `r`
+//! fires on, `log₂(N + 1)` bits each) are sent once; then each input sends how many instances
+//! fire, `k_x` (`log₂(R + 1)` bits for `R` instances), and the set itself in the code that gives
+//! instance `r` probability `c_r / T`, `T = Σ c_r`, a set of `k_x` being any of its `k_x!`
+//! orders:
+//!
+//! ```text
+//! Σ_x L(explanation of x) = R log₂(N + 1) + N log₂(R + 1) + Σ_r c_r log₂(T / c_r) − Σ_x log₂ k_x!
+//! ```
+//!
+//! An input is explained by a few frequent rules cheaply and by many rules dearly: an instance
+//! that fires on every input still costs about `log₂ e` bits on every input, so the code prefers
+//! computations that use few rules per input (the axis of per-input active components), and the
+//! library of rules is paid once and amortised. The score is the total
 //!
 //! ```text
 //! L(structure) + L(precision) + Σ_x L(explanation of x | program) + n Σ_rows KL/ln 2.
 //! ```
 //!
 //! An activity the forward-error bands leave open (an interval of pre-activations that straddles
-//! the law's zero set) is counted both ways: the explanation term carries the resulting interval.
+//! the law's zero set) may flip; each flip moves the code by at most
+//! `log₂ T' + log₂ R + log₂(N + 1) + 4` bits (`T'` the largest possible `T`: its own term, the
+//! change of `c_r`, of `T` and of `k_x`), and the explanation term carries that interval.
 //!
 //! # Evidence
 //!
@@ -188,9 +200,9 @@ impl Explanation {
     }
 }
 
-/// The Krichevsky–Trofimov code length, in bits, of a binary sequence of length `n` with `k` ones.
-fn kt_bits(k: f64, n: f64) -> f64 {
-    (std::f64::consts::PI.ln() + ln_gamma(n + 1.0) - ln_gamma(k + 0.5) - ln_gamma(n - k + 0.5)) / LN_2
+/// `log₂ k!`.
+fn log2_factorial(k: usize) -> f64 {
+    ln_gamma(k as f64 + 1.0) / LN_2
 }
 
 /// The explanations of the family given `program`, from its execution `trace` on the family
@@ -199,10 +211,8 @@ pub fn explanation(program: &OperatorProgram, trace: &Trace) -> Result<Explanati
     let interfaces = program.interfaces()?;
     let rows = trace.values.first().map_or(0, |v| v.nrows());
     let (mut active, mut open) = (vec![0u32; rows], vec![0u32; rows]);
-    let (mut instances, mut bits, mut lower, mut upper) = (0usize, 0.0_f64, 0.0_f64, 0.0_f64);
-    let n = rows as f64;
-    // `ln_gamma` is within a few ulps relative of each term; the slack covers an instance's three.
-    let slack = 64.0 * f64::EPSILON * (std::f64::consts::PI.ln() + 3.0 * ln_gamma(n + 1.0)) / LN_2;
+    let mut fired = vec![0usize; rows];
+    let mut counts: Vec<usize> = Vec::new();
     for node in &program.nodes {
         let Node::Pointwise { input, laws } = node else { continue };
         let values = &trace.values[*input];
@@ -211,9 +221,8 @@ pub fn explanation(program: &OperatorProgram, trace: &Trace) -> Result<Explanati
             if *law == Law::Zero {
                 continue;
             }
-            instances += 1;
             let range = interfaces[*input].range(group);
-            let (mut computed, mut certain, mut unsure) = (0usize, 0usize, 0usize);
+            let mut count = 0usize;
             for row in 0..rows {
                 let (mut fires, mut proven, mut zero) = (false, false, true);
                 for column in range.clone() {
@@ -226,30 +235,42 @@ pub fn explanation(program: &OperatorProgram, trace: &Trace) -> Result<Explanati
                         None => zero = false,
                     }
                 }
-                computed += usize::from(fires);
+                if fires {
+                    count += 1;
+                    fired[row] += 1;
+                }
                 if proven {
-                    certain += 1;
                     active[row] += 1;
                 } else if !zero {
-                    unsure += 1;
                     open[row] += 1;
                 }
             }
-            // The code length is symmetric about `N/2` and grows towards it.
-            let (lo_k, hi_k) = (certain as f64, (certain + unsure) as f64);
-            let half = (n / 2.0).clamp(lo_k, hi_k);
-            let longest = kt_bits(half.floor().max(lo_k), n).max(kt_bits(half.ceil().min(hi_k), n));
-            let shortest = kt_bits(lo_k, n).min(kt_bits(hi_k, n));
-            bits += kt_bits(computed as f64, n);
-            lower += (shortest - slack).max(0.0);
-            upper += longest + slack;
+            counts.push(count);
         }
     }
+    let instances = counts.len();
+    let (n, r) = (rows as f64, instances as f64);
+    let total: usize = counts.iter().sum();
+    let t = total as f64;
+    let mut bits = r * (n + 1.0).log2() + n * (r + 1.0).log2();
+    for &c in &counts {
+        if c > 0 {
+            bits += c as f64 * (t / c as f64).log2();
+        }
+    }
+    for &k in &fired {
+        bits -= log2_factorial(k);
+    }
+    let flips: f64 = open.iter().map(|o| f64::from(*o)).sum();
+    let largest_total = t + flips;
+    let per_flip = largest_total.max(1.0).log2() + (r + 1.0).log2() + (n + 1.0).log2() + 4.0;
+    // Rounding: each of the `R + N + 2` terms is within a few ulps relative of itself.
+    let rounding = 64.0 * f64::EPSILON * (bits.abs() + n * (r + 1.0).log2() + t * largest_total.max(2.0).log2());
     Ok(Explanation {
         instances,
         bits,
-        bits_lower: lower.min(bits).next_down().max(0.0),
-        bits_upper: upper.max(bits).next_up(),
+        bits_lower: (bits - flips * per_flip - rounding).max(0.0).next_down(),
+        bits_upper: (bits + flips * per_flip + rounding).next_up(),
         active,
         open,
     })

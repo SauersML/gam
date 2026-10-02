@@ -577,6 +577,8 @@ fn search(
     let mut ties: Vec<Tie> = Vec::new();
     let mut current = start_score;
     let mut refused: BTreeSet<String> = BTreeSet::new();
+    // Proposals whose compound move with a refit has been screened once and did not pay.
+    let mut refit_tried: BTreeSet<String> = BTreeSet::new();
     let (mut screenings, mut certifications) = (0u64, 0u64);
     let levels = library.iter().map(|primitive| primitive.levels()).max().unwrap_or(1);
     let mut level = 0;
@@ -612,11 +614,12 @@ fn search(
             })?;
             let mut saving = base_total - (bits + explanation_bits + screened_data_bits(&reference, &logits, contract.observations));
             let mut proposal = proposal;
-            // The compound move is tried for structural proposals only: restrictions and
-            // precisions come in the thousands, and a refit each would be the whole search.
+            // The compound move is tried for structural proposals only, once each: restrictions
+            // and precisions come in the thousands, and a refit each round would be the search.
             if saving <= 0.0
                 && bits < base_total
                 && !proposal.edit.is_local()
+                && refit_tried.insert(proposal.description.clone())
                 && let Some(search) = budget.refit
                 && let Some(refit) = refit_after(&candidate, contract, &reference, search)?
             {

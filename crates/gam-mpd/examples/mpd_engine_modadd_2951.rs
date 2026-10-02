@@ -432,11 +432,40 @@ fn rules(program: &OperatorProgram, contract: &Contract, p: usize) -> serde_json
         let write_spectra: Vec<serde_json::Value> = write
             .map(|z| (0..trace.values[z].ncols()).map(|i| spectrum(trace.values[z].column(i))).collect())
             .unwrap_or_default();
+        // Each unit's dominant read: the factor carrying most of its pre-activation's variance, and
+        // that factor's leading frequency; units counted per frequency.
+        let mut dominant: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
+        if let Some((z, op)) = read {
+            let coefficients = program.operators[op].matrix();
+            let spread: Vec<f64> = (0..trace.values[z].ncols())
+                .map(|i| {
+                    let column = trace.values[z].column(i);
+                    let mean = column.mean().unwrap_or(0.0);
+                    (column.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / column.len() as f64).sqrt()
+                })
+                .collect();
+            let leading = |i: usize| -> usize {
+                read_spectra.get(i).and_then(|sp| sp.get(0)).map_or(0, |top| {
+                    top["k_a"].as_u64().unwrap_or(0).max(top["k_b"].as_u64().unwrap_or(0)) as usize
+                })
+            };
+            for unit in 0..coefficients.nrows() {
+                let best = (0..coefficients.ncols())
+                    .map(|i| (i, (coefficients[[unit, i]] * spread[i]).abs()))
+                    .max_by(|a, b| a.1.total_cmp(&b.1));
+                if let Some((i, size)) = best
+                    && size > 0.0
+                {
+                    dominant.entry(leading(i)).or_default().push(unit);
+                }
+            }
+        }
         let mut listed: Vec<_> = groups.into_iter().collect();
         listed.sort_by(|x, y| y.1.len().cmp(&x.1.len()));
         layers.push(json!({
             "node": index,
             "units": units,
+            "units_by_dominant_frequency": dominant.iter().map(|(k, units)| json!({"k": k, "units": units.len()})).collect::<Vec<_>>(),
             "read_factors": read_spectra,
             "write_factors": write_spectra,
             "rules": listed.iter().map(|((r, w), members)| json!({
@@ -445,6 +474,68 @@ fn rules(program: &OperatorProgram, contract: &Contract, p: usize) -> serde_json
         }));
     }
     json!(layers)
+}
+
+/// The figure data of a factored program (analyst output): for the first ReLU layer, each read
+/// factor's values over the family as a table over `(a, b)` with its marginals over `a` and `b`,
+/// each write factor's values averaged over the inputs with one `c = (a + b) mod p`, each factor's
+/// coefficient energy (`Σ_units coefficient² · var(factor)`), and the structure-function curve.
+fn factor_figure(program: &OperatorProgram, contract: &Contract, p: usize, curve: &[gam_mpd::engine::CurvePoint]) -> serde_json::Value {
+    let Ok(trace) = program.execute(&contract.family, false) else { return json!({"error": "execution"}) };
+    let (SlotValues::Tokens(a), SlotValues::Tokens(b)) = (&contract.family.slots[0], &contract.family.slots[1]) else {
+        return json!({"error": "token slots"});
+    };
+    let rows = contract.family.rows;
+    let is_factor = |node: usize| -> Option<usize> {
+        let Node::Affine { terms, .. } = &program.nodes[node] else { return None };
+        (terms.len() == 1 && program.operators[terms[0].1].rows.groups().iter().all(|g| g.label.kind == LabelKind::Factor))
+            .then_some(terms[0].1)
+    };
+    let variance = |column: ndarray::ArrayView1<'_, f64>| {
+        let mean = column.mean().unwrap_or(0.0);
+        column.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / column.len() as f64
+    };
+    let Some(act) = program.nodes.iter().position(|n| matches!(n, Node::Pointwise { .. })) else { return json!({"error": "no layer"}) };
+    let Node::Pointwise { input, .. } = program.nodes[act] else { unreachable!() };
+    let Node::Affine { terms, .. } = &program.nodes[input] else { return json!({"error": "pre-activation"}) };
+    let mut read = Vec::new();
+    if let Some(&(z, op)) = terms.iter().find(|(z, _)| is_factor(*z).is_some()) {
+        let coefficients = program.operators[op].matrix();
+        for i in 0..trace.values[z].ncols() {
+            let column = trace.values[z].column(i);
+            let mut table = vec![vec![0.0_f64; p]; p];
+            for row in 0..rows {
+                table[a[row] as usize][b[row] as usize] = column[row];
+            }
+            let over_a: Vec<f64> = (0..p).map(|x| table[x].iter().sum::<f64>() / p as f64).collect();
+            let over_b: Vec<f64> = (0..p).map(|y| (0..p).map(|x| table[x][y]).sum::<f64>() / p as f64).collect();
+            let energy = coefficients.column(i).iter().map(|c| c * c).sum::<f64>() * variance(column);
+            read.push(json!({"factor": i, "over_a": over_a, "over_b": over_b, "table": table, "coefficient_energy": energy}));
+        }
+    }
+    let mut write = Vec::new();
+    if let Some(z) = program.nodes.iter().enumerate().position(|(z, n)| matches!(n, Node::Affine { terms, .. } if terms.len() == 1 && terms[0].0 == act) && is_factor(z).is_some()) {
+        let op = is_factor(z).expect("a factor node");
+        let coefficients = program.operators[op].matrix();
+        for i in 0..trace.values[z].ncols() {
+            let column = trace.values[z].column(i);
+            let (mut sums, mut counts) = (vec![0.0_f64; p], vec![0usize; p]);
+            for row in 0..rows {
+                let c = (a[row] as usize + b[row] as usize) % p;
+                sums[c] += column[row];
+                counts[c] += 1;
+            }
+            let over_c: Vec<f64> = sums.iter().zip(&counts).map(|(s, n)| s / (*n).max(1) as f64).collect();
+            let energy = coefficients.row(i).iter().map(|c| c * c).sum::<f64>() * variance(column);
+            write.push(json!({"factor": i, "over_sum": over_c, "coefficient_energy": energy}));
+        }
+    }
+    json!({
+        "p": p,
+        "read_factors": read,
+        "write_factors": write,
+        "curve": curve.iter().map(|c| json!({"structure_bits": c.structure_bits, "rest_bits": c.rest_bits, "description": c.description})).collect::<Vec<_>>(),
+    })
 }
 
 /// The empty program: the model's mean logits over the family, the same on every input.
@@ -509,6 +600,7 @@ fn main() -> Result<(), String> {
     ];
     let mut frontier = Vec::new();
     let mut start = model.clone();
+    let mut figure = json!(null);
     for &repeats in &ladder {
         let (_, contract) = native(&dir, &record, &config, repeats, declared)?;
         let started = std::time::Instant::now();
@@ -560,8 +652,11 @@ fn main() -> Result<(), String> {
             evaluation.argmax_disagreements,
             stop
         );
+        figure = factor_figure(&result.program, &contract, config.p, &result.curve);
         start = result.program;
     }
+    let figure_path = dir.join("factors.json");
+    std::fs::write(&figure_path, serde_json::to_string(&figure).map_err(|e| e.to_string())?).map_err(|e| format!("{}: {e}", figure_path.display()))?;
     let report = json!({
         "export": record,
         "mode": if declared { "declared" } else { "recovered" },

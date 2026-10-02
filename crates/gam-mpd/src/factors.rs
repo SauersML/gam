@@ -46,6 +46,9 @@
 //!   is sent once, and a rotation moves its length only through the rounding of its entries. A coefficient that rounds to
 //!   zero on its lattice leaves its block absent. Units that read one plane of a shared basis come
 //!   out reading one pair of coordinates: the sparsity is found, not declared.
+//! * **Support.** Each rank is also proposed sparse: a coefficient is kept only when dropping it
+//!   costs more data bits, `u²/(2 ln 2)` at its normalised size `u`, than coding it costs,
+//!   `log₂(1 + |u|/√12) + 1`. The rules this leaves are the support's components.
 
 //!
 //! # When the rules are identified
@@ -86,8 +89,8 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Shared factors fitted in the code's metric (module note).
 pub struct Factors;
 
-/// The largest curvature computation, in reals, a proposal is allowed: one forward tangent per
-/// output coordinate over every distribution row and class.
+/// The largest curvature computation, in reals, a proposal holds: one forward tangent per output
+/// coordinate over every distribution row and (sketched) class.
 const CURVATURE_REALS: usize = 1 << 25;
 
 fn refuse(message: impl Into<String>) -> EngineError {
@@ -191,8 +194,8 @@ fn components(program: &OperatorProgram) -> Vec<Component> {
 }
 
 /// `(1/N) Σ_x J_xᵀ (diag q − q qᵀ) J_x` at `node` (width × width), from one forward tangent per
-/// coordinate of the node, with `q` the program's own distributions; `None` beyond
-/// [`CURVATURE_REALS`].
+/// coordinate of the node, with `q` the program's own distributions; `None` when even one sketched
+/// class per row exceeds [`CURVATURE_REALS`].
 fn curvature(
     program: &OperatorProgram,
     context: &SearchContext<'_>,
@@ -204,9 +207,24 @@ fn curvature(
     let logits = &trace.values[program.output];
     let readouts = context.contract.readouts.max(1);
     let classes = logits.ncols() / readouts;
-    if width.saturating_mul(rows).saturating_mul(readouts * classes) > CURVATURE_REALS {
+    // The class axis is kept whole when it fits, and otherwise sketched: `G = Sᵀ S` is replaced
+    // by `(P S)ᵀ (P S)` with `P` a Rademacher sketch scaled so `E[Pᵀ P] = I`, an unbiased
+    // estimate (the fit only proposes; the contract certifies).
+    let per_class = width.saturating_mul(rows).saturating_mul(readouts);
+    if per_class == 0 || per_class > CURVATURE_REALS {
         return Ok(None);
     }
+    let sketched = classes.min(CURVATURE_REALS / per_class).max(1);
+    let sketch: Option<Array2<f64>> = (sketched < classes).then(|| {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64 ^ node as u64;
+        let scale = 1.0 / (sketched as f64).sqrt();
+        Array2::from_shape_fn((sketched, classes), |_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            if state & 1 == 1 { scale } else { -scale }
+        })
+    });
     let mut probabilities = Array2::<f64>::zeros((rows * readouts, classes));
     for row in 0..rows {
         for part in 0..readouts {
@@ -219,8 +237,9 @@ fn curvature(
             }
         }
     }
-    // Column j: the whitened logit tangent along coordinate j, `√q ⊙ (t − q·t)`, all rows stacked.
-    let mut whitened = Array2::<f64>::zeros((rows * readouts * classes, width));
+    // Column j: the whitened logit tangent along coordinate j, `√q ⊙ (t − q·t)` (sketched), all
+    // rows stacked.
+    let mut whitened = Array2::<f64>::zeros((rows * readouts * sketched, width));
     let no_tangents = BTreeMap::new();
     for j in 0..width {
         let mut seed = Array2::<f64>::zeros((rows, width));
@@ -233,8 +252,13 @@ fn curvature(
                 let q = probabilities.row(r);
                 let tr = t.slice(s![row, part * classes..(part + 1) * classes]);
                 let mean: f64 = q.iter().zip(tr.iter()).map(|(a, b)| a * b).sum();
-                for c in 0..classes {
-                    whitened[[r * classes + c, j]] = q[c].sqrt() * (tr[c] - mean);
+                let full: Array1<f64> = (0..classes).map(|c| q[c].sqrt() * (tr[c] - mean)).collect();
+                let entries = match &sketch {
+                    Some(p) => p.dot(&full),
+                    None => full,
+                };
+                for (c, v) in entries.iter().enumerate() {
+                    whitened[[r * sketched + c, j]] = *v;
                 }
             }
         }
@@ -384,6 +408,8 @@ struct Fit {
     /// Per operator: its curvature `G`'s `G^{-1/2}` and `tr G`, and its row range in the stack.
     inverse_roots: Vec<Array2<f64>>,
     curvature_traces: Vec<f64>,
+    /// Per operator, the diagonal of its curvature `G`: each coefficient row's own weight.
+    curvature_diagonals: Vec<Array1<f64>>,
     /// Per reader node, `tr G` of its own curvature.
     reader_traces: BTreeMap<usize, f64>,
     ranges: Vec<std::ops::Range<usize>>,
@@ -434,6 +460,7 @@ fn measure(program: &OperatorProgram, context: &SearchContext<'_>, component: &C
     let scale = (context.contract.observations as f64 * rows as f64).sqrt();
     let mut blocks = Vec::new();
     let (mut inverse_roots, mut curvature_traces, mut ranges) = (Vec::new(), Vec::new(), Vec::new());
+    let mut curvature_diagonals = Vec::new();
     let mut offset = 0;
     for &op in &component.operators {
         let m = program.operators[op].rows.width();
@@ -451,6 +478,7 @@ fn measure(program: &OperatorProgram, context: &SearchContext<'_>, component: &C
         let root = spectral(&mu, &w, f64::sqrt);
         inverse_roots.push(spectral(&mu, &w, |x| 1.0 / x.sqrt()));
         curvature_traces.push(mu.sum());
+        curvature_diagonals.push(g.diag().to_owned());
         blocks.push(root.dot(&program.operators[op].matrix()).dot(&whiten) * scale);
         ranges.push(offset..offset + m);
         offset += m;
@@ -464,6 +492,7 @@ fn measure(program: &OperatorProgram, context: &SearchContext<'_>, component: &C
         unwhiten,
         inverse_roots,
         curvature_traces,
+        curvature_diagonals,
         reader_traces: node_curvature.iter().map(|(node, g)| (*node, g.diag().sum())).collect(),
         ranges,
         u: decomposed.u,
@@ -475,7 +504,7 @@ fn measure(program: &OperatorProgram, context: &SearchContext<'_>, component: &C
 }
 
 /// The program with `component` factored at rank `r` (module note).
-fn factor(program: &OperatorProgram, component: &Component, fit: &Fit, r: usize) -> Result<Option<OperatorProgram>, EngineError> {
+fn factor(program: &OperatorProgram, component: &Component, fit: &Fit, r: usize, sparse: bool) -> Result<Option<OperatorProgram>, EngineError> {
     let observations_rows = fit.scale * fit.scale;
     // The basis is orthonormal in the whitened read space, where reads that use different
     // directions are orthogonal, so a rotation of the factor space can separate them; each
@@ -509,6 +538,21 @@ fn factor(program: &OperatorProgram, component: &Component, fit: &Fit, r: usize)
     let right_step = (12.0 * (right.len() as f64) / (fit.covariance_trace * energy)).sqrt();
     let row_steps: Vec<f64> = fit.ranges.iter().enumerate().flat_map(|(s_index, range)| std::iter::repeat_n(left_steps[s_index], range.len())).collect();
     fix_gauge(&mut left, &row_steps, &mut right);
+    if sparse {
+        // A coefficient is kept when dropping it costs more data bits, `u²/(2 ln 2)` at its
+        // normalised size `u` (the factor coordinate has unit variance, and `G`'s diagonal weighs
+        // the row), than coding it costs, `log₂(1 + |u|/√12) + 1` on its lattice.
+        let weights: Vec<f64> = fit.curvature_diagonals.iter().flat_map(|d| d.iter().copied()).collect();
+        for (row, weight) in weights.iter().enumerate() {
+            let scale = (observations_rows * weight.max(0.0)).sqrt();
+            for value in left.row_mut(row).iter_mut() {
+                let u = *value * scale;
+                if u * u / (2.0 * std::f64::consts::LN_2) <= (1.0 + u.abs() / 12.0_f64.sqrt()).log2() + 1.0 {
+                    *value = 0.0;
+                }
+            }
+        }
+    }
     let factor_interface = Interface::uniform(r, 1, LabelKind::Factor, 0)?;
     let argument_interface = program.interfaces()?[component.arguments[0]].clone();
     let names: Vec<&str> = component.operators.iter().map(|op| program.operators[*op].name.as_str()).collect();
@@ -654,16 +698,20 @@ impl Primitive for Factors {
             ranks.retain(|r| r * (stacked_rows + program.operators[component.operators[0]].cols.width()) < reals);
             let names: Vec<&str> = component.operators.iter().map(|op| program.operators[*op].name.as_str()).collect();
             for r in ranks {
-                let Some(candidate) = factor(program, &component, &fit, r)? else { continue };
-                // Every factor is rounded to its rate-distortion lattice: never exact.
-                let exactness = Exactness::Approximate;
-                out.push(Proposal {
-                    primitive: "factors",
-                    kind: ProposalKind::Share,
-                    exactness,
-                    description: format!("rank {r} factors of {names:?} (rate-distortion rank {rd})"),
-                    edit: Edit::Program(Box::new(candidate)),
-                });
+                for sparse in [false, true] {
+                    let Some(candidate) = factor(program, &component, &fit, r, sparse)? else { continue };
+                    // Every factor is rounded to its rate-distortion lattice: never exact.
+                    out.push(Proposal {
+                        primitive: "factors",
+                        kind: ProposalKind::Share,
+                        exactness: Exactness::Approximate,
+                        description: format!(
+                            "{}rank {r} factors of {names:?} (rate-distortion rank {rd})",
+                            if sparse { "sparse " } else { "" }
+                        ),
+                        edit: Edit::Program(Box::new(candidate)),
+                    });
+                }
             }
         }
         Ok(out)
