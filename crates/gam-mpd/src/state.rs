@@ -12,6 +12,7 @@
 //! are reported as [`SpectralNormBounds`]. Every reported quantity converts to the shared
 //! [`EvidenceStatus`].
 
+use gam_linalg::utils::frobenius_norm;
 use std::fmt;
 
 use faer::Side;
@@ -19,8 +20,8 @@ use gam_linalg::faer_ndarray::{
     FaerArrayView, FaerLinalgError, FaerSvd, fast_ata, self_adjoint_eigenvalues,
 };
 use gam_linalg::roundoff::{
-    UNIT_ROUNDOFF, accumulation_band, accumulation_growth, factor_singular_band,
-    symmetric_spectrum_rounding_band_at_dim,
+    UNIT_ROUNDOFF, accumulation_band, accumulation_growth, basis_orthonormality_defect, factor_singular_band,
+    resolved_singular_band, resolved_singular_count, symmetric_spectrum_rounding_band_at_dim,
 };
 use gam_runtime::resource::{MemoryGovernor, MemoryReservation, MemoryReservationError};
 use ndarray::{Array1, Array2, ArrayBase, ArrayView2, Data, Ix2, s};
@@ -224,7 +225,7 @@ impl ObservabilityLetter<'_> {
                 let rows = source.nrows();
                 let mut moved = Array2::<f64>::zeros((rows * letters.transports().len(), width));
                 let mut squared = 0.0_f64;
-                let source_norm = frobenius(source);
+                let source_norm = frobenius_norm(source);
                 for (index, (transport, &band)) in letters.transports().iter().zip(letters.bands()).enumerate() {
                     moved.slice_mut(s![index * rows..(index + 1) * rows, ..]).assign(&source.dot(transport));
                     let product_band = entrywise_band_norm(
@@ -290,9 +291,8 @@ impl ObservabilitySpectrum {
     }
 
     fn of(singular_values: Vec<f64>, rows: usize, cols: usize, formation: f64, stacked_rows: usize) -> Self {
-        let sigma_max = singular_values.first().copied().unwrap_or(0.0);
-        let band = factor_singular_band(rows.max(1), cols, sigma_max) + formation;
-        let resolved_rank = singular_values.iter().filter(|&&value| value > band).count();
+        let band = resolved_singular_band(&singular_values, rows.max(1), cols, formation);
+        let resolved_rank = resolved_singular_count(&singular_values, rows.max(1), cols, formation);
         let energy: f64 = singular_values.iter().map(|value| value * value).sum();
         let quartic: f64 = singular_values.iter().map(|value| value.powi(4)).sum();
         let participation_ratio = if quartic > 0.0 { energy * energy / quartic } else { 0.0 };
@@ -525,7 +525,7 @@ impl WeightedObservability {
             3,
             "weighted observability: capture",
         )?;
-        let orthonormality = orthonormality_defect(&orthonormal);
+        let orthonormality = basis_orthonormality_defect(orthonormal.t());
         let projected = self.factor.dot(&orthonormal.t());
         let projected_band = entrywise_band_norm(
             self.factor
@@ -533,8 +533,8 @@ impl WeightedObservability {
                 .dot(&orthonormal.t().mapv(f64::abs))
                 .mapv(|magnitude| accumulation_band(width, magnitude)),
         );
-        let total = frobenius(&self.factor);
-        let held = frobenius(&projected);
+        let total = frobenius_norm(&self.factor);
+        let held = frobenius_norm(&projected);
         let held_error = self.formation * (1.0 + orthonormality)
             + projected_band
             + total * orthonormality
@@ -644,7 +644,7 @@ fn compress_factor(
     let sigma_max = singular_values.first().copied().unwrap_or(0.0);
     let sigma_norm = singular_values.iter().map(|value| value * value).sum::<f64>().sqrt();
     let formation = (kept as f64).sqrt() * factor_singular_band(rows, cols, sigma_max)
-        + sigma_max * orthonormality_defect(&directions)
+        + sigma_max * basis_orthonormality_defect(directions.t())
         + accumulation_growth(1) * sigma_norm;
     drop(working);
     drop(factors);
@@ -654,25 +654,6 @@ fn compress_factor(
         singular_values,
         formation,
     })
-}
-
-/// `‖W Wᵀ − I‖_F` plus the rounding of the product: a bound on the distance of
-/// the rows of `W` from an exactly orthonormal set.
-pub(super) fn orthonormality_defect(rows: &Array2<f64>) -> f64 {
-    let count = rows.nrows();
-    let width = rows.ncols();
-    let gram = rows.dot(&rows.t()) - Array2::<f64>::eye(count);
-    let absolute = rows.mapv(f64::abs);
-    let band = entrywise_band_norm(
-        absolute
-            .dot(&absolute.t())
-            .mapv(|magnitude| accumulation_band(width + 1, magnitude + 1.0)),
-    );
-    frobenius(&gram) + band
-}
-
-pub(super) fn frobenius<S: ndarray::Data<Elem = f64>>(matrix: &ndarray::ArrayBase<S, ndarray::Ix2>) -> f64 {
-    matrix.iter().map(|value| value * value).sum::<f64>().sqrt()
 }
 
 /// The resolved row space of a matrix: its singular values, the band, the rank
@@ -702,9 +683,7 @@ pub(super) fn resolved_row_space(
     let mut order: Vec<usize> = (0..sigma.len()).collect();
     order.sort_by(|&left, &right| sigma[right].total_cmp(&sigma[left]));
     let singular_values: Vec<f64> = order.iter().map(|&index| sigma[index]).collect();
-    let sigma_max = singular_values.first().copied().unwrap_or(0.0);
-    let band = factor_singular_band(rows, cols, sigma_max) + formation;
-    let rank = singular_values.iter().filter(|&&value| value > band).count();
+    let rank = resolved_singular_count(&singular_values, rows, cols, formation);
     let mut resolved = Array2::<f64>::zeros((rank, cols));
     for (row, &index) in order.iter().take(rank).enumerate() {
         resolved.row_mut(row).assign(&vt.row(index));

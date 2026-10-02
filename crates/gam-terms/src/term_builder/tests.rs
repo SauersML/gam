@@ -5330,7 +5330,7 @@ fn partition_owner_keeps_todays_ranks_where_they_are_correct_and_resolves_the_re
             None,
         )
         .expect("collocation operators");
-        let partition = factor_rank_partition(&ops.d0).expect("mass factor partition");
+        let partition = factor_rank_partition(&ops.d0, 0.0).expect("mass factor partition");
         assert_eq!(
             partition.rank, dim,
             "ℓ={length_scale}: the collocation factor resolves every mass mode"

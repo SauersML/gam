@@ -2485,7 +2485,7 @@ mod axis_relevance_factor_rank_2735_tests {
                 d1.row_mut(2 * row + 1).assign(&factor.row(row));
             }
 
-            let factor_rank = gam_linalg::roundoff::factor_rank_partition(&factor)
+            let factor_rank = gam_linalg::roundoff::factor_rank_partition(&factor, 0.0)
                 .expect("factor SVD")
                 .rank;
             assert_eq!(

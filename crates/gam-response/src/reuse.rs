@@ -39,6 +39,7 @@
 use faer::Side;
 use gam_linalg::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh, HouseholderQr, fast_ab};
 use gam_linalg::roundoff::{accumulation_growth, symmetric_spectrum_rounding_band};
+use gam_linalg::utils::frobenius_norm;
 use gam_math::sparse_grid::CompensatedSum;
 use gam_math::special::{logaddexp, logistic};
 use gam_solve::gaussian_marginal::{
@@ -428,14 +429,6 @@ struct PenaltySplit {
     null_basis: Array2<f64>,
     complement: Array2<f64>,
     restricted: Vec<Array2<f64>>,
-}
-
-fn frobenius_norm(matrix: &Array2<f64>) -> f64 {
-    let mut sum = CompensatedSum::default();
-    for value in matrix {
-        sum.add(value * value);
-    }
-    sum.value().sqrt()
 }
 
 /// How far a declared null space escapes one penalty: `‖S N̂‖_F` for the orthonormal basis `N̂` of the declaration,
@@ -831,10 +824,6 @@ mod tests {
         vector.dot(vector).sqrt()
     }
 
-    fn frobenius(matrix: &Array2<f64>) -> f64 {
-        matrix.iter().map(|value| value * value).sum::<f64>().sqrt()
-    }
-
     fn spectrum_extremes(matrix: &Array2<f64>) -> (f64, f64) {
         let values = matrix
             .eigh(Side::Lower)
@@ -872,8 +861,8 @@ mod tests {
         let precision = prior + &design.t().dot(&design);
         let precision_spectrum = spectrum_extremes(&precision);
         let prior_spectrum = spectrum_extremes(prior);
-        let assembly = gamma(n + 1) * frobenius(&(&abs_prior + &gram_terms))
-            + 2.0 * whitening * frobenius(&gram_terms);
+        let assembly = gamma(n + 1) * frobenius_norm(&(&abs_prior + &gram_terms))
+            + 2.0 * whitening * frobenius_norm(&gram_terms);
         let perturbation = assembly + chol(p, precision_spectrum.1);
         let rhs = design.t().dot(&whitened);
         let rhs_assembly =
@@ -899,7 +888,7 @@ mod tests {
             + 2.0
                 * whitening
                 * residual_norm
-                * (euclidean(&whitened) + frobenius(&abs_design) * euclidean(&mean));
+                * (euclidean(&whitened) + frobenius_norm(&abs_design) * euclidean(&mean));
         let noise_log_sum: f64 = noise.iter().map(|variance| variance.ln().abs()).sum();
         let log_det_band = p as f64 * perturbation / precision_spectrum.0
             + gamma(2 * p) * p as f64 * log_magnitude(precision_spectrum)

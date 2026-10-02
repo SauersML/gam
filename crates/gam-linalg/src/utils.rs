@@ -200,6 +200,20 @@ pub fn inf_norm<I: IntoIterator<Item = f64>>(values: I) -> f64 {
     values.into_iter().fold(0.0_f64, |acc, x| acc.max(x.abs()))
 }
 
+/// Frobenius (entrywise Euclidean) norm `√Σ xᵢ²` of an array or view of any
+/// dimension, with the squares accumulated by compensated summation.
+pub fn frobenius_norm<'a, V, D>(values: V) -> f64
+where
+    V: ndarray::AsArray<'a, f64, D>,
+    D: Dimension,
+{
+    let mut sum = gam_math::sparse_grid::CompensatedSum::default();
+    for &value in values.into().iter() {
+        sum.add(value * value);
+    }
+    sum.value().sqrt()
+}
+
 /// A posteriori certificate for an unperturbed symmetric linear solve.
 ///
 /// The reported backward error is the max-entry norm bound

@@ -164,7 +164,7 @@ fn random_block(seed: u64, hidden: usize, width: usize) -> Block {
 /// depth times its absolute terms.
 fn evaluation_level(form: &MlpNormalForm, reads: &Array2<f64>, radius: f64) -> f64 {
     let (units, input) = reads.dim();
-    let pre: f64 = reads.rows().into_iter().map(|row| norm(row) * radius).sum::<f64>()
+    let pre: f64 = reads.rows().into_iter().map(|row| frobenius_norm(row) * radius).sum::<f64>()
         + form.biases.iter().map(|value| value.abs()).sum::<f64>();
     let writes: f64 = form.writes.iter().map(|value| value.abs()).sum();
     accumulation_growth(4 * (units + input + 4)) * (1.0 + pre) * (1.0 + writes)
@@ -405,13 +405,13 @@ fn optimal_split_matches_the_direct_loss_and_bounds_the_native_error() {
     let level = evaluation_level(&form, &form.reads, radius) + evaluation_level(&form, &split.approximate_reads, radius);
     for _ in 0..200 {
         let direction = Array1::from_shape_simple_fn(4, || rng.random_range(-1.0..1.0));
-        let length = rng.random_range(0.0..radius) / norm(direction.view());
+        let length = rng.random_range(0.0..radius) / frobenius_norm(direction.view());
         let point = direction * length;
         let exact = form.evaluate(point.view()).expect("F");
         let approximate = form
             .evaluate_with_reads(split.approximate_reads.view(), point.view())
             .expect("F̂");
-        let gap = norm((&exact - &approximate).view());
+        let gap = frobenius_norm((&exact - &approximate).view());
         assert!(gap <= native + level, "‖F − F̂‖ = {gap} above {native}");
         assert!(gap <= split.cut_bound * radius + level);
     }

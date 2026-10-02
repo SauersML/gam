@@ -564,13 +564,7 @@ fn structural_pseudo_inverse_band(
         squared_residual += pair_bounds[column] * pair_bounds[column];
         max_eigenvalue = max_eigenvalue.max(eigenvalues[column]);
     }
-    let mut gram_defect = active.t().dot(&active);
-    for index in 0..rank {
-        gram_defect[[index, index]] -= 1.0;
-    }
-    let gram_defect_frobenius = gram_defect.iter().map(|value| value * value).sum::<f64>().sqrt();
-    let orthonormality_defect =
-        gam_linalg::roundoff::orthonormality_defect_bound(gram_defect_frobenius, dimension, rank);
+    let orthonormality_defect = gam_linalg::roundoff::basis_orthonormality_defect(active.view());
     let reciprocal_shift = (1.0 + orthonormality_defect).sqrt()
         * gam_linalg::roundoff::accumulation_growth(1)
         * max_eigenvalue;

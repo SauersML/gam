@@ -78,6 +78,7 @@
 //! bound for the cluster subspaces the blocks are read through. No threshold is
 //! chosen by hand.
 
+use gam_linalg::utils::frobenius_norm;
 use std::collections::VecDeque;
 use std::fmt;
 use std::ops::Range;
@@ -358,7 +359,7 @@ impl Refinement {
                 return Err(StateBlockError::NonFinite { map });
             }
         }
-        let norms: Vec<f64> = maps.iter().map(|matrix| frobenius(&matrix.view())).collect();
+        let norms: Vec<f64> = maps.iter().map(|matrix| frobenius_norm(&matrix.view())).collect();
         // Each entry of `AAᵀ` is a length-`d` inner product in error by at most
         // `γ_d (|A||A|ᵀ)_ij`, whose spectral norm is at most `‖A‖_F²`. The `2m`
         // pre-formed terms add `2m − 1` more roundings.
@@ -423,7 +424,7 @@ impl Refinement {
             for map in 0..self.maps.len() {
                 let own = self.block(map, target, target);
                 let assembly =
-                    self.block_error(map, target, target) + accumulation_growth(2) * frobenius(&own);
+                    self.block_error(map, target, target) + accumulation_growth(2) * frobenius_norm(&own);
                 if let Some(split) = non_scalar_split(
                     &symmetric_part(&own),
                     assembly,
@@ -489,7 +490,7 @@ impl Refinement {
     /// predicate resolves `s²` from zero.
     fn block_scale(&self, map: usize, target: usize, source: usize) -> Option<f64> {
         let block = self.block(map, target, source);
-        let squared = frobenius(&block).powi(2) / block.nrows() as f64;
+        let squared = frobenius_norm(&block).powi(2) / block.nrows() as f64;
         let assembly = gram_band(&block, self.block_error(map, target, source), block.ncols());
         (resolved_eigenvalue_count(&[squared], assembly) == 1).then(|| squared.sqrt())
     }
@@ -618,7 +619,7 @@ impl Refinement {
                         + source_error
                         + product_band(&[(1.0, 0.0), (1.0, 0.0), (1.0, 0.0)], size);
                     let assembly =
-                        error + accumulation_growth(2) * frobenius(&generator.view());
+                        error + accumulation_growth(2) * frobenius_norm(&generator.view());
                     if let Some(split) = non_scalar_split(
                         &symmetric_part(&generator.view()),
                         assembly,
@@ -753,7 +754,7 @@ fn admit_structure(
 ) -> Result<(), StateBlockError> {
     // `JᵀJ = s²I` for a scaled complex structure, so `s²` is its spectrum, in
     // error by at most the product band of `J` with itself.
-    let scale = frobenius(&structure.view()) / (size as f64).sqrt();
+    let scale = frobenius_norm(&structure.view()) / (size as f64).sqrt();
     let assembly = product_band(&[(scale, error), (scale, error)], size);
     if resolved_eigenvalue_count(&[scale * scale], assembly) == 0 {
         return Ok(());
@@ -909,7 +910,7 @@ fn resolved_flags(values: &[f64], assembly: f64) -> Vec<bool> {
 /// Spectral-norm error of `XXᵀ` or `XᵀX` computed from a block `X` within
 /// `error` of the exact block, with `inner` terms per product entry.
 fn gram_band(block: &ArrayView2<'_, f64>, error: f64, inner: usize) -> f64 {
-    let norm = frobenius(block);
+    let norm = frobenius_norm(block);
     2.0 * norm * error + error * error + accumulation_growth(inner) * norm * norm
 }
 
@@ -924,10 +925,6 @@ fn product_band(factors: &[(f64, f64)], size: usize) -> f64 {
         * (size as f64).powf(factors.len() as f64 / 2.0)
         * perturbed;
     perturbed - exact + arithmetic
-}
-
-fn frobenius(matrix: &ArrayView2<'_, f64>) -> f64 {
-    matrix.iter().map(|value| value * value).sum::<f64>().sqrt()
 }
 
 /// The symmetric matrix carrying `matrix`'s lower triangle. A full GEMM product

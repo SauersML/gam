@@ -625,7 +625,7 @@ mod coupled_controls {
 mod fixed_rank_chart {
     use super::super::super::dense::solve;
     use super::super::chart::{ChartSetting, FactorBinding, FixedRankChart, compile_chart_edit};
-    use super::super::linear::frobenius;
+    use gam_linalg::utils::frobenius_norm;
     use super::*;
     use ndarray::Axis;
 
@@ -640,7 +640,7 @@ mod fixed_rank_chart {
         let chart = FixedRankChart::from_factors(write.view(), read.view()).expect("chart");
         let dependent = chart.dependent().expect("dependent");
         let (native, native_band) = chart.native_dependent();
-        let distance = frobenius((&dependent.values - &native).view());
+        let distance = frobenius_norm((&dependent.values - &native).view());
         assert!(distance <= dependent.frobenius_band + native_band, "{distance} {}", dependent.frobenius_band);
         assert!(dependent.frobenius_band < 1e-12);
         let full = write.dot(&read);
@@ -729,7 +729,7 @@ mod fixed_rank_chart {
             assert!(chart.reduction_band() < 1e-12, "{}", chart.reduction_band());
             let dependent = chart.dependent().expect("dependent");
             let (native, native_band) = chart.native_dependent();
-            let distance = frobenius((&dependent.values - &native).view());
+            let distance = frobenius_norm((&dependent.values - &native).view());
             assert!(distance <= dependent.frobenius_band + native_band, "{distance}");
             let (a, b, c) = chart.coordinates();
             let a_new = &a + &array![[0.2, 0.0], [-0.1, 0.15]];

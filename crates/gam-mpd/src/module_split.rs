@@ -76,8 +76,10 @@ use std::fmt;
 
 use faer::Side;
 use gam_linalg::faer_ndarray::{FaerLinalgError, FaerSvd, strict_symmetric_eigh};
+use gam_linalg::utils::frobenius_norm;
 use gam_linalg::roundoff::{
-    SymmetricAssembly, accumulation_band, accumulation_growth, factor_singular_band, symmetric_spectrum_rounding_band,
+    SymmetricAssembly, accumulation_band, accumulation_growth, basis_orthonormality_defect, factor_singular_band,
+    resolved_singular_band, resolved_singular_count, symmetric_spectrum_rounding_band,
 };
 use gam_math::gaussian_activation::{GaussianActivation, GaussianActivationError};
 use gam_math::probability::normal_cdf_and_pdf;
@@ -85,7 +87,7 @@ use gam_runtime::resource::MemoryGovernor;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use super::state::{
-    ObservabilityLetter, SpectralNormBounds, StateError, entrywise_band_norm, orthonormality_defect, reserve, spectral_norm_bounds,
+    ObservabilityLetter, SpectralNormBounds, StateError, entrywise_band_norm, reserve, spectral_norm_bounds,
 };
 use super::supports::{EvidenceStatus, EvidenceStatusError, ExactBasis, Extremum};
 use gam_response::interaction::connected_components;
@@ -316,10 +318,6 @@ fn require_finite<'a>(
     }
 }
 
-fn norm(values: ArrayView1<'_, f64>) -> f64 {
-    values.iter().map(|value| value * value).sum::<f64>().sqrt()
-}
-
 /// The bit pattern of `(s w, s b)` with `s` making the first nonzero entry
 /// positive and `-0.0` read as `0.0`, and whether `s = −1`. `None` for `w = 0`.
 fn canonical_form(read: ArrayView1<'_, f64>, bias: f64) -> Option<(Vec<u64>, bool)> {
@@ -415,9 +413,9 @@ impl MlpNormalForm {
             // One rounded addition errs relative to its own result (`fl(a + b) = (a + b)(1 + δ)`),
             // so a merged pair that computes to zero cancels exactly; longer sums carry `γ_{n−1} Σ|v|`.
             let band = if group.len() <= 2 {
-                accumulation_growth(1) * norm(write.view())
+                accumulation_growth(1) * frobenius_norm(write.view())
             } else {
-                accumulation_growth(group.len() - 1) * norm(absolute_write.view())
+                accumulation_growth(group.len() - 1) * frobenius_norm(absolute_write.view())
             };
             if band == 0.0 && write.iter().all(|value| *value == 0.0) {
                 cancelled.extend(group.iter().map(|source| source.unit));
@@ -523,9 +521,8 @@ impl MlpNormalForm {
         let mut order: Vec<usize> = (0..sigma.len()).collect();
         order.sort_by(|&a, &b| sigma[b].total_cmp(&sigma[a]));
         let singular_values: Vec<f64> = order.iter().map(|&index| sigma[index]).collect();
-        let sigma_max = singular_values.first().copied().unwrap_or(0.0);
-        let backward = factor_singular_band(units, input, sigma_max);
-        let rank = singular_values.iter().filter(|&&value| value > backward).count();
+        let backward = resolved_singular_band(&singular_values, units, input, 0.0);
+        let rank = resolved_singular_count(&singular_values, units, input, 0.0);
         let ceiling = units.min(input);
         let domain = SplitDomain::Reads { units };
         let rank_status = if rank == ceiling {
@@ -546,7 +543,7 @@ impl MlpNormalForm {
         // Wedin: the exact rank-`r` projector moves by at most `e / (σ_r − e)`.
         let sigma_r = singular_values.get(rank.wrapping_sub(1)).copied().unwrap_or(0.0);
         let wedin = if rank == 0 { 0.0 } else { (backward / (sigma_r - backward)).min(1.0) };
-        let projector_band = wedin + orthonormality_defect(&frame.t().to_owned());
+        let projector_band = wedin + basis_orthonormality_defect(frame.view());
         let projector = frame.dot(&frame.t());
         let absolute_frame = frame.mapv(f64::abs);
         let magnitude = absolute_frame.dot(&absolute_frame.t());

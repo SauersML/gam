@@ -637,11 +637,11 @@ pub fn channel_aware_audit_at_operating_scalars(
 /// below `rank_audit(J)`.
 ///
 /// `nk_scale` is the channel-major design row count `n·K` (= `j.nrows()`), the
-/// `n_total` term `rank_of_gram`/`count_rank` use to size their tolerance.
+/// `n_total` term `rank_of_gram`/`resolved_singular_count` use to size their tolerance.
 ///
 /// This verification ranks the PENALTY-AUGMENTED reduced Gram
 /// `J_canᵀJ_can + Σ_block SᵀS` with the AUDIT'S OWN rank function
-/// (`rank_of_gram` → `count_rank`), so the post-T check and the audit's keep
+/// (`rank_of_gram` → `resolved_singular_count`), so the post-T check and the audit's keep
 /// decision use the identical augmentation AND the identical tolerance by
 /// construction — they can no longer disagree on a faithful column-selection `T`.
 /// Two ingredients that the earlier bare-eigenvalue verification dropped, each of
@@ -653,7 +653,7 @@ pub fn channel_aware_audit_at_operating_scalars(
 ///     undercounts exactly those kept directions — e.g. the wiggliness-penalised
 ///     null modes a softmax channel shares once the cross-class σ²-coupling thins
 ///     their data signal (multinomial `s(x) + s(x, by=g)`: 28 vs p_red 30).
-///   • TOLERANCE MATCH. `count_rank` keeps a singular value `σ=√λ` down to
+///   • TOLERANCE MATCH. `resolved_singular_count` keeps a singular value `σ=√λ` down to
 ///     its SVD rounding band `max(n,p)·ε·σ_max`; the old eigenvalue cutoff `λ > scale·64·n·ε` was
 ///     ~ε larger and demoted penalty-covered modes whose `λ` sits between
 ///     `ε²λ_max` and `ε·λ_max` (Gaussian survival location-scale: 16 vs p_red 18).
@@ -739,11 +739,11 @@ fn audit_convention_rank(
         }
     }
     // Rank the augmented Gram with the AUDIT'S OWN singular-value convention
-    // (`rank_of_gram` → `count_rank`), so the post-T verification and the audit's
+    // (`rank_of_gram` → `resolved_singular_count`), so the post-T verification and the audit's
     // keep decision share the identical tolerance. The penalty rows enlarge the
     // tall-design row count exactly as the audit's
     // `rank_of_gram(.., n_design_rows + n_penalty_rows)` does. The earlier
-    // eigenvalue cutoff `λ > scale·64·n·ε` was ~ε larger than `count_rank`'s
+    // eigenvalue cutoff `λ > scale·64·n·ε` was ~ε larger than `resolved_singular_count`'s
     // σ-space `max(n,p)·ε·σ_max` rounding band and demoted penalty-covered modes whose
     // `λ` sits between `ε²λ_max` and `ε·λ_max` (Gaussian survival location-scale:
     // 16 vs p_red 18). A failed eigendecomposition is refused, not read as full

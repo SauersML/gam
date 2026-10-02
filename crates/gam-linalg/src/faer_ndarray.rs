@@ -6273,6 +6273,7 @@ mod eigh_ordering_contract_tests {
 mod general_eigenvalues_2627_tests {
     use super::*;
     use crate::roundoff::accumulation_growth;
+    use crate::utils::frobenius_norm;
 
     fn hashed_matrix(n: usize, seed: u64) -> Array2<f64> {
         let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0x2627_6E1A);
@@ -6282,10 +6283,6 @@ mod general_eigenvalues_2627_tests {
                 .wrapping_add(1_442_695_040_888_963_407);
             (state >> 11) as f64 / (1_u64 << 53) as f64 - 0.5
         })
-    }
-
-    fn frobenius(a: &Array2<f64>) -> f64 {
-        a.iter().map(|value| value * value).sum::<f64>().sqrt()
     }
 
     /// A normal matrix with a planted spectrum (two rotation–scaling blocks and
@@ -6316,7 +6313,7 @@ mod general_eigenvalues_2627_tests {
         }
         let a = q.dot(&b).dot(&q.t());
         let (re, im) = real_general_eigenvalues(&a).expect("certified spectrum");
-        let band = (general_eigen_reduction_band(n) + accumulation_growth(2 * n + 2)) * frobenius(&a);
+        let band = (general_eigen_reduction_band(n) + accumulation_growth(2 * n + 2)) * frobenius_norm(&a);
         let mut planted = vec![(r1 * t1.cos(), r1 * t1.sin()), (real, 0.0), (r2 * t2.cos(), r2 * t2.sin())];
         let mut i = 0;
         while i < n {
@@ -6403,7 +6400,7 @@ mod general_eigenvalues_2627_tests {
         assert!(within_band(&re, &im));
         assert!(general_spectrum_trace_consistent(view.as_ref(), &re, reduction));
         assert!(general_spectrum_within_schur_bound(view.as_ref(), &re, &im, reduction));
-        let scale = frobenius(&a);
+        let scale = frobenius_norm(&a);
 
         let shift = 1.0e6 * eta * (scale + re[0].hypot(im[0]));
         let mut moved = re.clone();
@@ -6575,7 +6572,7 @@ mod general_eigenvalues_2627_tests {
 
         let (_, g_singular, _) = g.svd(false, false).expect("G's singular values");
         let condition = g_singular.iter().fold(0.0_f64, |m, s| m.max(*s)) / g_singular.iter().fold(f64::INFINITY, |m, s| m.min(*s));
-        let scale = frobenius(&t);
+        let scale = frobenius_norm(&t);
         let mut planted = vec![(0.5, 0.75), (0.5, 0.75), (2.0, 0.0), (-1.0, 0.0), (-0.625, 0.25)];
         let mut i = 0;
         while i < n {

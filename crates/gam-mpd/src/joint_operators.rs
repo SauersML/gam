@@ -66,7 +66,7 @@
 use gam_linalg::faer_ndarray::{FaerLinalgError, FaerQr, fast_abt, fast_atb, fast_atv};
 use gam_linalg::roundoff::{accumulation_growth, householder_qr_backward_band};
 use gam_runtime::resource::{MemoryGovernor, MemoryReservation, MemoryReservationError};
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, concatenate, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, AsArray, Axis, Dimension, concatenate, s};
 
 use super::attention::{AttentionGeometry, AttentionProgramError, NativeAttention, RotaryEmbedding};
 use super::block::{SUBNORMAL_SPACING, up};
@@ -120,15 +120,12 @@ fn decomposition(what: &'static str, failure: &FaerLinalgError) -> JointRefusal 
     }
 }
 
-/// An upper bound on `‖v‖₂` of a computed vector: its sum of squares within `γ_n`, rounded up.
-fn upper_norm(values: ArrayView1<'_, f64>) -> f64 {
+/// An upper bound on `‖v‖₂` of a computed vector (`‖M‖_F` of a matrix): its sum of squares
+/// within `γ_n`, rounded up.
+fn upper_norm<'a, V: AsArray<'a, f64, D>, D: Dimension>(values: V) -> f64 {
+    let values = values.into();
     let squares = values.iter().fold(0.0, |sum, &entry| up(sum + up(entry * entry)));
     up(up(squares * up(1.0 + up(2.0 * accumulation_growth(values.len().max(1))))).sqrt())
-}
-
-fn upper_frobenius(matrix: ArrayView2<'_, f64>) -> f64 {
-    let squares = matrix.iter().fold(0.0, |sum, &entry| up(sum + up(entry * entry)));
-    up(up(squares * up(1.0 + up(2.0 * accumulation_growth(matrix.len().max(1))))).sqrt())
 }
 
 /// An operator `M = L Rᵀ` held by its factors, `L` and `R` both `width × rank`. The operator is
@@ -194,7 +191,7 @@ impl FactoredOperator {
     /// An upper bound on `‖δM‖_F` when the stored factors lie within `ρ_L |L|` and `ρ_R |R|`
     /// entrywise of represented ones: `‖δL‖_F ‖R‖_F + ‖L‖_F ‖δR‖_F + ‖δL‖_F ‖δR‖_F`.
     pub fn relative_defect_reach(&self, left_relative: f64, right_relative: f64) -> f64 {
-        let (left, right) = (upper_frobenius(self.left.view()), upper_frobenius(self.right.view()));
+        let (left, right) = (upper_norm(self.left.view()), upper_norm(self.right.view()));
         entrywise_defect_reach(left, right, up(left_relative * left), up(right_relative * right))
     }
 }
@@ -576,16 +573,16 @@ fn factored_norm(left: ArrayView2<'_, f64>, right: ArrayView2<'_, f64>) -> Resul
         }
         let triangle = factor.qr().map_err(|failure| decomposition(what, &failure))?.1;
         let t = triangle.slice(s![..k, ..k]).to_owned();
-        let band = householder_qr_backward_band(rows, k, upper_frobenius(t.view()));
+        let band = householder_qr_backward_band(rows, k, upper_norm(t.view()));
         Ok((t, band))
     };
     let (left_core, left_band) = reduce(left, "left factor")?;
     let (right_core, right_band) = reduce(right, "right factor")?;
     let core = fast_abt(&left_core, &right_core);
     let value = core.iter().map(|entry| entry * entry).sum::<f64>().sqrt();
-    let (left_norm, right_norm) = (upper_frobenius(left), upper_frobenius(right));
+    let (left_norm, right_norm) = (upper_norm(left), upper_norm(right));
     let k = left.ncols().max(1);
-    let product = up(accumulation_growth(k) * upper_frobenius(fast_abt(&left_core.mapv(f64::abs), &right_core.mapv(f64::abs)).view()));
+    let product = up(accumulation_growth(k) * upper_norm(fast_abt(&left_core.mapv(f64::abs), &right_core.mapv(f64::abs)).view()));
     let error = up(up(entrywise_defect_reach(left_norm, right_norm, left_band, right_band) + product)
         + up(accumulation_growth(core.len().max(1) + 2) * value));
     Ok((value, error))
@@ -631,8 +628,8 @@ fn scaled_difference(first: &FactoredOperator, second: &FactoredOperator, scale:
     let left = concatenate(Axis(1), &[first.left.view(), negated.view()]).map_err(shape_failed)?;
     let right = concatenate(Axis(1), &[first.right.view(), second.right.view()]).map_err(shape_failed)?;
     let (value, error) = factored_norm(left.view(), right.view())?;
-    let scaled = up(accumulation_growth(1) * up(scale.abs() * upper_frobenius(second.left.view())));
-    Ok((value, up(error + up(scaled * upper_frobenius(second.right.view())))))
+    let scaled = up(accumulation_growth(1) * up(scale.abs() * upper_norm(second.left.view())));
+    Ok((value, up(error + up(scaled * upper_norm(second.right.view())))))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -948,7 +945,7 @@ pub fn attention_letters(
         let magnitude = fast_abt(&left.mapv(f64::abs), &right.mapv(f64::abs));
         let relative = up(up(accumulation_growth(left.ncols().max(1)) + value_output.formation_defect()) + folding);
         let transport = product.slice(s![..width, ..width]).to_owned();
-        let band = up(up(relative * upper_frobenius(magnitude.slice(s![..width, ..width]))) * up(1.0 + folding));
+        let band = up(up(relative * upper_norm(magnitude.slice(s![..width, ..width]))) * up(1.0 + folding));
         transports.push(transport);
         bands.push(up(band + up(left.ncols() as f64 * SUBNORMAL_SPACING)));
     }

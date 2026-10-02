@@ -221,9 +221,12 @@ fn resolvable_matrix_rank(m: ArrayView2<f64>) -> Result<usize, String> {
     let (_, singular_values, _) = m
         .svd(false, false)
         .map_err(|error| format!("identifiability singular values: {error}"))?;
-    let max_singular = singular_values.iter().copied().fold(0.0_f64, f64::max);
-    let band = f64::EPSILON * m.nrows().max(m.ncols()) as f64 * max_singular;
-    Ok(singular_values.iter().filter(|&&value| value > band).count())
+    Ok(gam_linalg::roundoff::resolved_singular_count(
+        &singular_values,
+        m.nrows(),
+        m.ncols(),
+        0.0,
+    ))
 }
 
 /// Scalar facts about decoder Jacobian sparsity.

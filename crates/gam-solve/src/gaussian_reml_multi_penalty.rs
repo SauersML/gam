@@ -74,6 +74,7 @@ use gam_linalg::roundoff::{
     symmetric_spectrum_rounding_band,
 };
 use gam_linalg::utils::validate_finite_symmetric_matrix;
+use gam_linalg::utils::frobenius_norm;
 use gam_math::sparse_grid::CompensatedSum;
 use gam_problem::{DeclaredHessianForm, Derivative, HessianValue, OuterEval};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
@@ -283,14 +284,6 @@ struct StackedProjection {
     tail_energy: f64,
 }
 
-fn frobenius(matrix: ArrayView2<'_, f64>) -> f64 {
-    let mut sum = CompensatedSum::default();
-    for &value in matrix {
-        sum.add(value * value);
-    }
-    sum.value().sqrt()
-}
-
 fn faer_to_array(matrix: faer::MatRef<'_, f64>) -> Array2<f64> {
     Array2::from_shape_fn((matrix.nrows(), matrix.ncols()), |(row, col)| {
         matrix[(row, col)]
@@ -415,7 +408,7 @@ impl GaussianRemlMultiPenaltyProblem {
             offset += block.nrows();
         }
         let partition =
-            factor_rank_partition(&stacked).map_err(EstimationError::LinearSystemSolveFailed)?;
+            factor_rank_partition(&stacked, 0.0).map_err(EstimationError::LinearSystemSolveFailed)?;
         Ok(PenaltyStructure {
             roots,
             penalty_rounding,
@@ -586,7 +579,7 @@ impl GaussianRemlMultiPenaltyProblem {
             responses: m,
             coefficients: p,
             nullity,
-            response_frobenius: frobenius(y),
+            response_frobenius: frobenius_norm(y),
             design_upper,
             rotated_head,
             compressed_head,
@@ -753,7 +746,7 @@ impl GaussianRemlMultiPenaltyProblem {
                 &factor,
                 residual,
                 projection.tail_energy,
-                frobenius(fitted.view()),
+                frobenius_norm(fitted.view()),
             ),
         ))
     }
@@ -792,7 +785,7 @@ impl GaussianRemlMultiPenaltyProblem {
         let projection = self.project(&factor, self.compressed_head.view());
         let penalized_residual = projection.tail_energy;
         let fitted = Self::solve_upper(&factor, projection.head);
-        let coefficient_frobenius = frobenius(fitted.view());
+        let coefficient_frobenius = frobenius_norm(fitted.view());
         let residual = self.unpenalized_residual + penalized_residual;
         let residual_roundoff =
             self.residual_roundoff(&factor, residual, penalized_residual, coefficient_frobenius);
@@ -806,7 +799,7 @@ impl GaussianRemlMultiPenaltyProblem {
         }
 
         let inverse = Self::solve_upper(&factor, faer::Mat::<f64>::identity(p, p));
-        let inverse_trace = frobenius(inverse.view()).powi(2);
+        let inverse_trace = frobenius_norm(inverse.view()).powi(2);
         let rotation = self.design_rotation_growth + factor.rotation_growth;
 
         let mut log_det = CompensatedSum::default();
@@ -837,9 +830,9 @@ impl GaussianRemlMultiPenaltyProblem {
             .map(|(left, right)| fast_ab(&left.t(), right))
             .collect();
         let penalty_trace =
-            Array1::from_iter(shrink.iter().map(|block| frobenius(block.view()).powi(2)));
+            Array1::from_iter(shrink.iter().map(|block| frobenius_norm(block.view()).powi(2)));
         let residual_gradient =
-            Array1::from_iter(moved.iter().map(|block| frobenius(block.view()).powi(2)));
+            Array1::from_iter(moved.iter().map(|block| frobenius_norm(block.view()).powi(2)));
 
         let lambdas = factor.lambdas.to_vec();
         let pseudo = PenaltyPseudologdet::from_components(&self.penalties, &lambdas, 0.0)
@@ -909,7 +902,7 @@ impl GaussianRemlMultiPenaltyProblem {
                 for (left, right) in adjoint[k].iter().zip(adjoint[j].iter()) {
                     coupling += left * right;
                 }
-                let trace_pair = frobenius(fast_ab(&shrink[k], &shrink[j].t()).view()).powi(2);
+                let trace_pair = frobenius_norm(fast_ab(&shrink[k], &shrink[j].t()).view()).powi(2);
                 let residual_hessian = diagonal * residual_gradient[k] - 2.0 * coupling;
                 let value = 0.5
                     * (nu / residual * residual_hessian
@@ -971,8 +964,8 @@ impl GaussianRemlMultiPenaltyProblem {
         let coefficients = Self::solve_upper(&factor, projection.head);
         let p = self.coefficients;
         let inverse = Self::solve_upper(&factor, faer::Mat::<f64>::identity(p, p));
-        let inverse_frobenius = frobenius(inverse.view());
-        let coefficient_frobenius = frobenius(coefficients.view());
+        let inverse_frobenius = frobenius_norm(inverse.view());
+        let coefficient_frobenius = frobenius_norm(coefficients.view());
         let rotation = self.design_rotation_growth + factor.rotation_growth;
         let roundoff = inverse_frobenius
             * rotation
@@ -1341,7 +1334,7 @@ mod tests {
             curvatures[0]
         );
         resolution_radius(
-            frobenius(fit.evaluation.reml_gradient.view().insert_axis(Axis(1))),
+            frobenius_norm(fit.evaluation.reml_gradient.view().insert_axis(Axis(1))),
             curvatures[0],
             fit.evaluation.reml_score_roundoff,
         )
@@ -1406,7 +1399,7 @@ mod tests {
         )
         .expect("the fixture's penalized normal matrix is SPD");
         let inverse_trace = inverse.inverse().diag().sum();
-        let design_energy = frobenius(x.view()).powi(2);
+        let design_energy = frobenius_norm(x.view()).powi(2);
         let gram_norm = gram.iter().fold(0.0_f64, |acc, value| acc.max(value.abs())) * p as f64;
         let delta_max = old
             .cache
@@ -1433,17 +1426,17 @@ mod tests {
         let (at_old_coefficients, at_old_coefficients_roundoff) = problem
             .coefficients(array![old.rho].view())
             .expect("coefficients evaluate at the closed-form optimum");
-        let old_beta = frobenius(old.coefficients.view());
+        let old_beta = frobenius_norm(old.coefficients.view());
         let old_penalty_rounding = p as f64 * f64::EPSILON * penalty_norm
             + 2.0 * p as f64 * f64::EPSILON * delta_max * gram_norm;
         let whitening = accumulation_growth(n * p);
         let old_coefficient_band = inverse_trace.sqrt()
             * whitening
-            * (frobenius(y.view()) + design_energy.sqrt() * old_beta)
+            * (frobenius_norm(y.view()) + design_energy.sqrt() * old_beta)
             + inverse_trace
                 * (whitening * design_energy.sqrt() * at_old.residual_quadratic.sqrt()
                     + lambda * old_penalty_rounding * old_beta);
-        let coefficient_gap = frobenius((&at_old_coefficients - &old.coefficients).view());
+        let coefficient_gap = frobenius_norm((&at_old_coefficients - &old.coefficients).view());
         let coefficient_band = at_old_coefficients_roundoff + old_coefficient_band;
         assert!(
             coefficient_gap <= coefficient_band,
@@ -1561,7 +1554,7 @@ mod tests {
                 evaluation.log_pseudo_det_penalty,
                 shared.log_pseudo_det_penalty
             );
-            let column_gap = frobenius(
+            let column_gap = frobenius_norm(
                 (&shared_coefficients.column(col).insert_axis(Axis(1)) - coefficients).view(),
             );
             assert!(
@@ -1626,7 +1619,7 @@ mod tests {
         let mut orthogonal = faer::Mat::<f64>::identity(m, m);
         reflector.apply_transpose_on_the_left(orthogonal.as_mut());
         let rotation = faer_to_array(orthogonal.as_ref());
-        let defect = frobenius((&fast_ata(&rotation) - &Array2::<f64>::eye(m)).view());
+        let defect = frobenius_norm((&fast_ata(&rotation) - &Array2::<f64>::eye(m)).view());
         let rotated = fast_ab(&y, &rotation);
         let penalties = [curvature_penalty(p, 2), Array2::<f64>::eye(p)];
         let original = GaussianRemlMultiPenaltyProblem::new(x.view(), y.view(), &penalties, 0)
@@ -1689,8 +1682,8 @@ mod tests {
         let turned_back = fast_ab(&a_coefficients, &rotation);
         let coefficient_band = b_roundoff
             + a_roundoff * (1.0 + defect)
-            + accumulation_growth(m) * frobenius(a_coefficients.view()) * (m as f64).sqrt();
-        let coefficient_gap = frobenius((&b_coefficients - &turned_back).view());
+            + accumulation_growth(m) * frobenius_norm(a_coefficients.view()) * (m as f64).sqrt();
+        let coefficient_gap = frobenius_norm((&b_coefficients - &turned_back).view());
         assert!(
             coefficient_gap <= coefficient_band,
             "B̂(YO) − B̂(Y)O = {coefficient_gap:.3e}, band {coefficient_band:.3e}"
@@ -1831,7 +1824,7 @@ mod tests {
             (evaluation.reml_score, evaluation.reml_score_roundoff)
         };
         let unit = |matrix: Array2<f64>| {
-            let norm = frobenius(matrix.view());
+            let norm = frobenius_norm(matrix.view());
             matrix.mapv(|value| value / norm)
         };
         let design_direction = unit(normal_matrix(n, p, &mut rng));
@@ -2383,7 +2376,7 @@ mod tests {
         )
         .expect("the fixture's weighted penalized normal matrix is SPD");
         let inverse_trace = inverse.inverse().diag().sum();
-        let design_energy = frobenius(white_x.view()).powi(2);
+        let design_energy = frobenius_norm(white_x.view()).powi(2);
         let gram_norm = gram.iter().fold(0.0_f64, |acc, value| acc.max(value.abs())) * p as f64;
         let delta_max = old
             .cache
@@ -2407,14 +2400,14 @@ mod tests {
         let (at_old_coefficients, at_old_coefficients_roundoff) = problem
             .coefficients(array![old.rho].view())
             .expect("coefficients evaluate at the closed-form optimum");
-        let old_beta = frobenius(old.coefficients.view());
+        let old_beta = frobenius_norm(old.coefficients.view());
         let old_coefficient_band = inverse_trace.sqrt()
             * whitening
-            * (frobenius(white_y.view()) + design_energy.sqrt() * old_beta)
+            * (frobenius_norm(white_y.view()) + design_energy.sqrt() * old_beta)
             + inverse_trace
                 * (whitening * design_energy.sqrt() * at_old.residual_quadratic.sqrt()
                     + lambda * old_penalty_rounding * old_beta);
-        let coefficient_gap = frobenius((&at_old_coefficients - &old.coefficients).view());
+        let coefficient_gap = frobenius_norm((&at_old_coefficients - &old.coefficients).view());
         let coefficient_band = at_old_coefficients_roundoff + old_coefficient_band;
         assert!(
             coefficient_gap <= coefficient_band,

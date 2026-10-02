@@ -1053,9 +1053,9 @@ fn tangent_from_row_factorization(
 ) -> Result<(usize, ActiveConstraintTangentGeometry), String> {
     let p = normalized.ncols();
     // The row rank is read at the SVD's own rounding band `max(rows, p)·ε·σ_max`
-    // (`svd_rank_band`), with no extra factor: a singular value above it is
+    // (`resolved_singular_band`), with no extra factor: a singular value above it is
     // resolved by the factorization that produced it (#2469).
-    let rank = crate::active_set::svd_rank(singular, normalized.nrows(), p);
+    let rank = gam_linalg::roundoff::resolved_singular_count(singular, normalized.nrows(), p, 0.0);
     if rank == 0 {
         return Err("non-empty active constraint block has zero numerical row rank".to_string());
     }

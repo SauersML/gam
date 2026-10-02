@@ -48,6 +48,7 @@
 //! ([`gam_spec::RhoPrior::lower_tail_linear_rate`]); any other prior's
 //! ρ-gradient survives into the tail and there is no face to certify.
 
+use gam_linalg::utils::frobenius_norm;
 use super::rail_face::{basis_columns, range_null_split, symmetric_eigh, split_face_penalties};
 use super::rail_face::RailFaceLimitOutcome;
 use gam_linalg::roundoff::accumulation_growth;
@@ -178,10 +179,6 @@ pub(crate) fn certify_zero_smoothing_face(
     })
 }
 
-fn frobenius(matrix: &Array2<f64>) -> f64 {
-    matrix.iter().map(|v| v * v).sum::<f64>().sqrt()
-}
-
 /// `½tr(M⁻¹A)` on `M`'s own eigenpairs, `M ≻ 0`.
 fn half_trace_on_spectrum(values: &Array1<f64>, vectors: &Array2<f64>, a: &Array2<f64>) -> f64 {
     let mut total = 0.0_f64;
@@ -250,7 +247,7 @@ pub(crate) fn gaussian_zero_smoothing_face(
                 .map_or(f64::NAN, |slot| prior_rates[slot])
         })
         .collect();
-    let face_norm = frobenius(&split.s_face_unit);
+    let face_norm = frobenius_norm(&split.s_face_unit);
     if !(face_norm > 0.0) {
         return ZeroSmoothingFaceOutcome::FaceUnavailable {
             reason: "the face's penalties are zero: lambda = 0 there says nothing about the model"
@@ -290,7 +287,7 @@ pub(crate) fn gaussian_zero_smoothing_face(
         .filter(|&i| survivor_values[i] <= survivor_cut)
         .collect();
     let null_basis = basis_columns(&survivor_vectors, &null_cols);
-    let leak = frobenius(&null_basis.t().dot(&split.s_face_unit).dot(&null_basis));
+    let leak = frobenius_norm(&null_basis.t().dot(&split.s_face_unit).dot(&null_basis));
     if leak > f64::EPSILON.sqrt() * face_norm {
         return ZeroSmoothingFaceOutcome::FaceUnavailable {
             reason: format!(
@@ -373,7 +370,7 @@ pub(crate) fn gaussian_zero_smoothing_face(
     // the coefficient error is the backward-stable solve's forward error,
     // amplified by `H₀`'s conditioning (Frobenius bounds the spectral norm).
     let gamma = accumulation_growth(n.max(p));
-    let h_frobenius = frobenius(&h0);
+    let h_frobenius = frobenius_norm(&h0);
     let h_conditioning = h_frobenius / h_smallest;
     let beta_norm = limit_beta.dot(&limit_beta).sqrt();
     let beta_error = gamma * (1.0 + h_conditioning) * beta_norm;
@@ -427,7 +424,7 @@ pub(crate) fn gaussian_zero_smoothing_face(
             ),
         };
     }
-    let block_conditioning = frobenius(&survivor_block) / block_smallest;
+    let block_conditioning = frobenius_norm(&survivor_block) / block_smallest;
 
     // ── the slopes and their bands ──────────────────────────────────────
     let mut slopes = Vec::with_capacity(split.face_sorted.len());
@@ -441,7 +438,7 @@ pub(crate) fn gaussian_zero_smoothing_face(
         let prior = face_prior[slot];
         let slope = fit_term + hessian_trace - survivor_trace + prior;
 
-        let s_norm = frobenius(s_j);
+        let s_norm = frobenius_norm(s_j);
         let energy_error = 2.0 * (energy.max(0.0) * s_norm).sqrt() * beta_error
             + s_norm * beta_error * beta_error
             + gamma * beta_abs.dot(&s_j.mapv(f64::abs).dot(&beta_abs));

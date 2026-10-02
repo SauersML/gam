@@ -419,10 +419,54 @@ pub fn householder_qr_backward_band(rows: usize, cols: usize, r_frobenius: f64) 
     gamma / (1.0 - gamma) * r_frobenius
 }
 
+/// The band below which a computed singular value of a `rows × cols` factor is not
+/// resolved from zero: the SVD's own backward error [`factor_singular_band`] plus
+/// `formation`, the caller's bound on `‖A − Â‖₂` for the factor `Â` it actually
+/// decomposed (zero for an exact input).
+///
+/// By Weyl each computed `σ̂ᵢ` is within this band of the exact `σᵢ(A)`, so a value
+/// above it certifies a nonzero singular value of `A`, and the count of such values
+/// ([`resolved_singular_count`]) is a LOWER bound on `rank A`. This is one-sided: a
+/// value inside the band is not certified zero. The two-sided question — is the
+/// rank decided at a threshold, with a guard gap — is
+/// [`crate::decision::certified_rank`]'s.
+///
+/// `singular_values` are the computed ones, in any order; the band reads their
+/// largest.
+pub fn resolved_singular_band<'a>(
+    singular_values: impl IntoIterator<Item = &'a f64>,
+    rows: usize,
+    cols: usize,
+    formation: f64,
+) -> f64 {
+    let sigma_max = singular_values
+        .into_iter()
+        .fold(0.0_f64, |largest, &value| largest.max(value));
+    factor_singular_band(rows, cols, sigma_max) + formation
+}
+
+/// The number of `singular_values` (any order) of a `rows × cols` factor above
+/// [`resolved_singular_band`]: a certified lower bound on its rank.
+pub fn resolved_singular_count<'a, I>(
+    singular_values: I,
+    rows: usize,
+    cols: usize,
+    formation: f64,
+) -> usize
+where
+    I: IntoIterator<Item = &'a f64> + Copy,
+{
+    let band = resolved_singular_band(singular_values, rows, cols, formation);
+    singular_values
+        .into_iter()
+        .filter(|&&value| value > band)
+        .count()
+}
+
 /// Rank partition of a quadratic `S = AᵀA`, read off its energy factor `A`.
 ///
 /// `λᵢ(S) = σᵢ(A)²`, so `A` carries `S`'s spectrum at `A`'s own conditioning, and
-/// the rank counts the singular values above [`factor_singular_band`]. Forming
+/// the rank counts the singular values above [`resolved_singular_band`]. Forming
 /// `AᵀA` first squares the conditioning: a mode with `σᵢ/σ₁ = 1e-10` is resolved
 /// here, but its eigenvalue lies below the Gram's rounding band, where it comes
 /// back as roundoff of either sign.
@@ -431,7 +475,9 @@ pub struct FactorRankPartition {
     pub singular_values: Vec<f64>,
     /// The right singular vectors as rows, in the same order (`n × n`).
     pub right_vectors: ndarray::Array2<f64>,
-    /// Number of singular values above the backward-error band.
+    /// [`resolved_singular_band`]: the SVD's backward error plus the formation.
+    pub band: f64,
+    /// Number of singular values above `band`.
     pub rank: usize,
 }
 
@@ -448,8 +494,12 @@ impl FactorRankPartition {
 }
 
 /// Partition `S = AᵀA` by the singular values of `A` (see [`FactorRankPartition`]).
+///
+/// `formation` bounds `‖A − Â‖₂` for the factor passed (zero when it is exact);
+/// see [`resolved_singular_band`].
 pub fn factor_rank_partition(
     factor: &ndarray::Array2<f64>,
+    formation: f64,
 ) -> Result<FactorRankPartition, crate::faer_ndarray::FaerLinalgError> {
     use crate::faer_ndarray::FaerSvd;
     let (rows, cols) = factor.dim();
@@ -475,12 +525,12 @@ pub fn factor_rank_partition(
     for (row, &i) in order.iter().enumerate() {
         right_vectors.row_mut(row).assign(&vt.row(i));
     }
-    let sigma_max = singular_values.first().copied().unwrap_or(0.0);
-    let band = factor_singular_band(rows, cols, sigma_max);
-    let rank = singular_values.iter().filter(|&&value| value > band).count();
+    let band = resolved_singular_band(&singular_values, rows, cols, formation);
+    let rank = resolved_singular_count(&singular_values, rows, cols, formation);
     Ok(FactorRankPartition {
         singular_values,
         right_vectors,
+        band,
         rank,
     })
 }
@@ -704,6 +754,21 @@ pub fn orthonormality_defect_bound(
     (computed + formation) / (1.0 - formation)
 }
 
+/// [`orthonormality_defect_bound`] for a computed `n × rank` basis `U`: forms
+/// `fl(UᵀU − I)` and bounds `‖UᵀU − I‖₂` from its Frobenius norm. An empty basis
+/// has no defect.
+pub fn basis_orthonormality_defect(basis: ndarray::ArrayView2<'_, f64>) -> f64 {
+    let (dimension, rank) = basis.dim();
+    if rank == 0 {
+        return 0.0;
+    }
+    let mut gram = basis.t().dot(&basis);
+    for index in 0..rank {
+        gram[[index, index]] -= 1.0;
+    }
+    orthonormality_defect_bound(crate::utils::frobenius_norm(&gram), dimension, rank)
+}
+
 /// A certified upper bound on `‖H·U − U·Σ̃‖₂` from its computed value
 /// `computed_residual_frobenius = ‖fl(H·U − fl(U·Σ̃))‖_F`, for `U` with `rank`
 /// columns and orthonormality defect `ω ≥ ‖UᵀU − I‖₂`
@@ -910,6 +975,15 @@ mod tests {
         assert!(orthonormality_defect_bound(f64::NAN, 50, 10).is_infinite());
         let measured = orthonormality_defect_bound(1.0e-12, 50, 10);
         assert!(measured >= 1.0e-12 + formation);
+
+        let identity = ndarray::Array2::<f64>::eye(4);
+        assert_eq!(
+            basis_orthonormality_defect(identity.view()),
+            orthonormality_defect_bound(0.0, 4, 4)
+        );
+        let skewed = ndarray::array![[1.0, 0.0], [0.0, 1.0], [1.0e-3, 0.0]];
+        assert!(basis_orthonormality_defect(skewed.view()) >= 1.0e-6);
+        assert_eq!(basis_orthonormality_defect(ndarray::Array2::<f64>::zeros((3, 0)).view()), 0.0);
     }
 
     /// The spectral and pseudo-inverse bands reduce to their rounding terms at a
@@ -1038,7 +1112,7 @@ mod tests {
     #[test]
     fn factor_rank_partition_resolves_below_the_gram_band_and_completes_wide_factors() {
         let graded = ndarray::array![[1.0, 0.0, 0.0], [0.0, 1.0e-10, 0.0], [0.0, 0.0, 0.0]];
-        let partition = factor_rank_partition(&graded).expect("graded factor");
+        let partition = factor_rank_partition(&graded, 0.0).expect("graded factor");
         assert_eq!(partition.rank, 2);
         let gram_band = symmetric_spectrum_rounding_band(&[1.0, 1.0e-20, 0.0]);
         assert!(
@@ -1051,7 +1125,7 @@ mod tests {
         assert!((rebuilt[[1, 1]] - 1.0e-20).abs() <= 1.0e-30);
 
         let wide = ndarray::array![[1.0, 2.0, 0.0, 0.0]];
-        let wide_partition = factor_rank_partition(&wide).expect("wide factor");
+        let wide_partition = factor_rank_partition(&wide, 0.0).expect("wide factor");
         assert_eq!(wide_partition.rank, 1);
         assert_eq!(wide_partition.right_vectors.dim(), (4, 4));
         let gram = wide_partition
@@ -1063,6 +1137,24 @@ mod tests {
                 assert!((gram[[i, j]] - expected).abs() <= 8.0 * f64::EPSILON);
             }
         }
+    }
+
+    /// The formation term moves the band, and with it the one-sided rank: a mode
+    /// resolved from an exact factor is not resolved once the factor carries an
+    /// error that large.
+    #[test]
+    fn the_formation_term_widens_the_resolved_singular_band() {
+        let values = [3.0, 1.0e-3, 0.0];
+        assert_eq!(resolved_singular_count(&values, 3, 3, 0.0), 2);
+        assert_eq!(resolved_singular_count(&values, 3, 3, 1.0e-3), 1);
+        assert_eq!(
+            resolved_singular_band(&values, 3, 3, 0.5),
+            factor_singular_band(3, 3, 3.0) + 0.5
+        );
+        let factor = ndarray::array![[3.0, 0.0], [0.0, 1.0e-3]];
+        let partition = factor_rank_partition(&factor, 1.0e-3).expect("partition");
+        assert_eq!(partition.rank, 1);
+        assert_eq!(partition.band, resolved_singular_band(&[3.0], 2, 2, 1.0e-3));
     }
 
     #[test]

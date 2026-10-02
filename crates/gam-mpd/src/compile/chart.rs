@@ -75,6 +75,7 @@
 //! added.
 
 use gam_linalg::roundoff::{accumulation_growth, householder_qr_backward_band};
+use gam_linalg::utils::frobenius_norm;
 use gam_math::roundoff::inflated;
 use ndarray::{Array2, ArrayView2, Axis, concatenate};
 
@@ -83,7 +84,6 @@ use super::super::dense::{QrMode, qr, solve, svd};
 use super::super::gauge::{AllInputs, LinearPassthrough};
 use super::super::lift::{TensorId, TensorRegistry};
 use super::super::supports::{EvidenceStatus, ExactBasis};
-use super::linear::frobenius;
 use super::{
     CompileError, CompiledControl, CompiledParameterEdit, ControlRealization, NativeEditPlan, require_finite,
     require_shape,
@@ -223,12 +223,12 @@ fn reduce(
     let (r1, r2) = (first.r, second.r);
     let core = r1.dot(&r2.t());
     let decomposed = svd(core.view(), false)?;
-    let (norm1, norm2) = (frobenius(r1.view()), frobenius(r2.view()));
+    let (norm1, norm2) = (frobenius_norm(r1.view()), frobenius_norm(r2.view()));
     let band = inflated(
         decomposed.band
             + householder_qr_backward_band(write.nrows(), inner, norm1) * norm2
             + norm1 * householder_qr_backward_band(read.ncols(), inner, norm2)
-            + frobenius(product_band(r1.view(), r2.t()).view()),
+            + frobenius_norm(product_band(r1.view(), r2.t()).view()),
         3,
     );
     let rank = decomposed.singular_values.iter().filter(|&&value| value > band).count();
@@ -289,10 +289,10 @@ fn reduce(
         identity_defect[[index, index]] -= 1.0;
     }
     let reduction_band = inflated(
-        frobenius(write_tail.view()) * frobenius(read_tail.view())
-            + (frobenius(identity_defect.view()) + accumulation_growth(inner) * frobenius(gauge.view()) * frobenius(inverse.view()))
-                * frobenius(write)
-                * frobenius(read),
+        frobenius_norm(write_tail.view()) * frobenius_norm(read_tail.view())
+            + (frobenius_norm(identity_defect.view()) + accumulation_growth(inner) * frobenius_norm(gauge.view()) * frobenius_norm(inverse.view()))
+                * frobenius_norm(write)
+                * frobenius_norm(read),
         4,
     );
     Ok((
@@ -416,7 +416,7 @@ impl FixedRankChart {
         let write_free = self.native_write.select(Axis(0), &self.free_rows);
         let read_free = self.native_read.select(Axis(1), &self.free_cols);
         let values = write_free.dot(&read_free);
-        let band = frobenius(product_band(write_free.view(), read_free.view()).view());
+        let band = frobenius_norm(product_band(write_free.view(), read_free.view()).view());
         (values, band)
     }
 }
@@ -433,15 +433,15 @@ fn dependent_block(
     let sigma = smallest_resolved("chart pivot block", a)?;
     let solved = solve(a, b)?;
     let residual = a.dot(&solved) - b;
-    let residual_band = frobenius(product_band(a, solved.view()).view());
-    let residual_upper = inflated(frobenius(residual.view()) + residual_band, 2);
+    let residual_band = frobenius_norm(product_band(a, solved.view()).view());
+    let residual_upper = inflated(frobenius_norm(residual.view()) + residual_band, 2);
     let solve_error = inflated(residual_upper / sigma, 1);
     let values = c.dot(&solved);
-    let c_norm = frobenius(c);
-    let solved_norm = frobenius(solved.view());
-    let product = frobenius(product_band(c, solved.view()).view());
+    let c_norm = frobenius_norm(c);
+    let solved_norm = frobenius_norm(solved.view());
+    let product = frobenius_norm(product_band(c, solved.view()).view());
     // First order in the coordinates' own formation: δC X + C A⁻¹ (δB − δA X).
-    let (delta_a, delta_b, delta_c) = (frobenius(formation[0].view()), frobenius(formation[1].view()), frobenius(formation[2].view()));
+    let (delta_a, delta_b, delta_c) = (frobenius_norm(formation[0].view()), frobenius_norm(formation[1].view()), frobenius_norm(formation[2].view()));
     let coordinates = delta_c * solved_norm + c_norm / sigma * (delta_b + delta_a * solved_norm);
     let frobenius_band = inflated(c_norm * solve_error + product + coordinates, rank + 4);
     Ok(DependentBlock { values, frobenius_band })
@@ -562,8 +562,8 @@ pub fn compile_chart_edit(
     let difference = lifted.operator_difference(&target)?;
     // The target's C block is C′A′⁻¹A′; its distance from C′ bounds what the target misses.
     let recovered_c = c_over_a.dot(&a);
-    let c_defect = frobenius((&recovered_c - &c).view())
-        + frobenius(product_band(c_over_a.view(), a.view()).view());
+    let c_defect = frobenius_norm((&recovered_c - &c).view())
+        + frobenius_norm(product_band(c_over_a.view(), a.view()).view());
     let (value, numerical_error, witness) = match difference {
         EvidenceStatus::Exact {
             value,

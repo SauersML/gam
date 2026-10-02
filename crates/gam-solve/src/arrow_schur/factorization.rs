@@ -515,7 +515,8 @@ pub(crate) fn factor_gauge_deflated_evidence_row(
     let (_, singular, vt_opt) =
         gam_linalg::faer_ndarray::FaerSvd::svd(&unit_rows, false, true).ok()?;
     let vt = vt_opt?;
-    let rank = crate::active_set::svd_rank(&singular, unit_rows.nrows(), unit_rows.ncols());
+    let rank =
+        gam_linalg::roundoff::resolved_singular_count(&singular, unit_rows.nrows(), unit_rows.ncols(), 0.0);
     let basis: Vec<Array1<f64>> = (0..rank).map(|axis| vt.row(axis).to_owned()).collect();
 
     // Faddeev-Popov stiffening of the orbit, at UNIT stiffness kappa = 1.0

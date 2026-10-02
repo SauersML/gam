@@ -5,6 +5,7 @@ use gam_linalg::faer_ndarray::{
     col_piv_qr_solve_lstsq, rrqr_nullspace_basis,
 };
 use gam_linalg::gram_schmidt::ReorthogonalizedRowBasis;
+use gam_linalg::roundoff::{resolved_singular_band, resolved_singular_count};
 use gam_linalg::utils::{StableSolver, array_is_finite};
 use gam_math::sparse_grid::CompensatedSum;
 use gam_problem::{
@@ -243,7 +244,7 @@ fn solve_dense_system_via_pseudoinverse(
     // `max(σ_max, 1)` floor zeroes a uniformly small but well-conditioned system
     // purely because of its units, and no extra factor on the band buys safety
     // (#2469).
-    let tol = svd_rank_band(&singular, matrix.nrows(), matrix.ncols());
+    let tol = resolved_singular_band(&singular, matrix.nrows(), matrix.ncols(), 0.0);
     let mut coeff = u.t().dot(rhs);
     for (idx, value) in coeff.iter_mut().enumerate() {
         let sigma = singular[idx];
@@ -427,22 +428,6 @@ pub fn binding_constraint_rows(
     Some(rows)
 }
 
-/// The SVD's own rounding band `max(rows, cols)·ε·σ_max` for a `rows × cols`
-/// matrix, read from its one owner `gam_linalg::roundoff::factor_singular_band`:
-/// a singular value at or below it is indistinguishable from zero. There is no
-/// absolute floor and no extra factor, so `cR` has the rank of `R` for every
-/// `c > 0` (#2469).
-pub(crate) fn svd_rank_band(singular: &Array1<f64>, rows: usize, cols: usize) -> f64 {
-    let smax = singular.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    gam_linalg::roundoff::factor_singular_band(rows, cols, smax)
-}
-
-/// Numerical rank of a `rows × cols` matrix from its singular values, at
-/// [`svd_rank_band`].
-pub(crate) fn svd_rank(singular: &Array1<f64>, rows: usize, cols: usize) -> usize {
-    let band = svd_rank_band(singular, rows, cols);
-    singular.iter().filter(|&&s| s > band).count()
-}
 
 /// Orthonormal basis `Z` (`p × (p − rank)`) of the complement of the row space
 /// spanned by the first `rank` rows of `vt` (orthonormal rows, `p` columns), by
@@ -496,7 +481,7 @@ pub(crate) fn null_space_complement(vt: &Array2<f64>, rank: usize) -> Option<Arr
 pub(crate) fn null_space_of_rows(rows: &Array2<f64>) -> Option<(usize, Array2<f64>)> {
     let (_, singular, vt_opt) = rows.svd(false, true).ok()?;
     let vt = vt_opt?;
-    let rank = svd_rank(&singular, rows.nrows(), rows.ncols());
+    let rank = resolved_singular_count(&singular, rows.nrows(), rows.ncols(), 0.0);
     Some((rank, null_space_complement(&vt, rank)?))
 }
 
@@ -1052,9 +1037,9 @@ pub(crate) fn feasible_point_for_linear_constraints(
         return None;
     };
     // Rank tolerance: the `m × m` Gram's own SVD rounding band `m·ε·σ_max`
-    // (`svd_rank_band`). The candidate is certified feasible below whichever
+    // (`resolved_singular_band`). The candidate is certified feasible below whichever
     // directions this keeps, so no extra factor on the band buys safety (#2469).
-    let tol = svd_rank_band(&singular, gram.nrows(), gram.ncols());
+    let tol = resolved_singular_band(&singular, gram.nrows(), gram.ncols(), 0.0);
     let mut coeff = u.t().dot(&constraints.b);
     for (idx, value) in coeff.iter_mut().enumerate() {
         let sigma = singular[idx];
@@ -1298,8 +1283,8 @@ pub fn project_point_strictly_into_feasible_cone(
         let (u_opt, sing, vt_opt) = e_mat.svd(true, true).ok()?;
         let (u_mat, vt) = (u_opt?, vt_opt?);
         // The seed is certified against the original rows below, so the rank is
-        // the SVD's own rounding band (`svd_rank`).
-        let rank = svd_rank(&sing, k, p);
+        // the SVD's own rounding band (`resolved_singular_count`).
+        let rank = resolved_singular_count(&sing, k, p, 0.0);
         if rank == 0 || rank >= p {
             return None;
         }

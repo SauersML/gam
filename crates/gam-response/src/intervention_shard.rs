@@ -866,7 +866,7 @@ impl GaussianLoadingLaw {
                 orthonormal_frames.push(Array2::zeros((rank, 0)));
                 continue;
             }
-            let partition = factor_rank_partition(basis).map_err(|error| {
+            let partition = factor_rank_partition(basis, 0.0).map_err(|error| {
                 InterventionPlanError::InvalidFrame {
                     frame,
                     reason: error.to_string(),

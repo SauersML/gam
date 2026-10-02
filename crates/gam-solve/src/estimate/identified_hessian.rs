@@ -16,6 +16,7 @@
 //! certificate's own Newton step, so the derivative certificate at ρ̂ describes
 //! a criterion that is smooth where the certificate applies.
 
+use gam_linalg::utils::frobenius_norm;
 use super::EstimationError;
 use super::reml::RemlState;
 use super::reml::reml_outer_engine::DenseSpectralOperator;
@@ -125,15 +126,8 @@ impl IdentifiedHessianInverse {
     fn solve_band(&self, hessian: &Array2<f64>, matrix_max_abs: f64) -> f64 {
         let dimension = hessian.nrows();
         let rank = self.rank();
-        let mut gram_defect = self.basis.t().dot(&self.basis);
-        for index in 0..rank {
-            gram_defect[[index, index]] -= 1.0;
-        }
-        let orthonormality_defect = gam_linalg::roundoff::orthonormality_defect_bound(
-            frobenius_norm(&gram_defect),
-            dimension,
-            rank,
-        );
+        let orthonormality_defect =
+            gam_linalg::roundoff::basis_orthonormality_defect(self.basis.view());
         let mut eigen_residual = hessian.dot(&self.basis);
         let mut max_abs_eigenvalue = 0.0_f64;
         for (index, &reciprocal) in self.reduced_inverse.diag().iter().enumerate() {
@@ -209,10 +203,6 @@ impl IdentifiedHessianInverse {
         gam_linalg::matrix::symmetrize_in_place(&mut inverse);
         Ok(inverse)
     }
-}
-
-fn frobenius_norm(matrix: &Array2<f64>) -> f64 {
-    matrix.iter().map(|value| value * value).sum::<f64>().sqrt()
 }
 
 fn max_abs_entry(matrix: &Array2<f64>) -> f64 {

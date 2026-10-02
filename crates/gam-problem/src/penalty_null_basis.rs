@@ -89,7 +89,8 @@
 use crate::PenaltyMatrix;
 use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
 use gam_linalg::roundoff::{
-    accumulation_growth, factor_singular_band, symmetric_spectrum_rounding_band,
+    accumulation_growth, resolved_singular_band, resolved_singular_count,
+    symmetric_spectrum_rounding_band,
 };
 use ndarray::Array2;
 
@@ -261,15 +262,12 @@ impl PenaltyNullBasis {
             .map_err(|e| PenaltyNullBasisError::SingularValuesFailed {
                 reason: e.to_string(),
             })?;
-        let s_max = singular.iter().fold(0.0_f64, |acc, &v| acc.max(v));
-        let band = self.subspace_error
-            + formation
-            + defect * (1.0 + defect)
-            + factor_singular_band(p, m, s_max);
+        let formation = self.subspace_error + formation + defect * (1.0 + defect);
+        let band = resolved_singular_band(&singular, p, m, formation);
         if !over_cut_is_unresolved(band, self.penalty_norm, self.resolution) {
             return Ok(0);
         }
-        let rank = singular.iter().filter(|&&s| s > band).count();
+        let rank = resolved_singular_count(&singular, p, m, formation);
         Ok(m - rank)
     }
 

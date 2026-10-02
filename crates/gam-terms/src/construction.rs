@@ -1813,7 +1813,7 @@ fn penalty_spec_factor_partition(
     idx: usize,
     context: &str,
 ) -> Result<gam_linalg::roundoff::FactorRankPartition, EstimationError> {
-    gam_linalg::roundoff::factor_rank_partition(factor).map_err(|err| {
+    gam_linalg::roundoff::factor_rank_partition(factor, 0.0).map_err(|err| {
         EstimationError::InvalidInput(format!(
             "{context}: energy-factor rank partition failed at penalty {idx}: {err}"
         ))
@@ -3633,7 +3633,7 @@ mod tests {
         // neither is a literal.
         let factor = &ops.d0;
         let gram = gam_linalg::faer_ndarray::fast_ata(factor);
-        let partition = gam_linalg::roundoff::factor_rank_partition(factor)
+        let partition = gam_linalg::roundoff::factor_rank_partition(factor, 0.0)
             .expect("the factor decomposes");
         let analysis =
             crate::basis::analyze_penalty_block(&gram).expect("the Gram decomposes");

@@ -473,7 +473,7 @@ pub fn condition_on_exact_constraint(
         )));
     }
     let constraint = constraint.to_owned();
-    let resolved_rank = factor_rank_partition(&constraint)
+    let resolved_rank = factor_rank_partition(&constraint, 0.0)
         .map_err(|error| GaussianMarginalError::InvalidInput(error.to_string()))?
         .rank;
     if resolved_rank < rows {
@@ -530,6 +530,7 @@ pub fn condition_on_exact_constraint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gam_linalg::utils::frobenius_norm;
     use faer::Side;
     use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
     use gam_linalg::roundoff::{accumulation_growth, symmetric_spectrum_rounding_band};
@@ -537,10 +538,6 @@ mod tests {
 
     fn euclidean(vector: &Array1<f64>) -> f64 {
         vector.dot(vector).sqrt()
-    }
-
-    fn frobenius(matrix: &Array2<f64>) -> f64 {
-        matrix.iter().map(|value| value * value).sum::<f64>().sqrt()
     }
 
     fn spectrum_extremes(matrix: &Array2<f64>) -> (f64, f64) {
@@ -606,8 +603,8 @@ mod tests {
         // Dual: H = Q + WᵀW, b = Wᵀỹ, β̂ = H⁻¹b, q = ‖ỹ − Wβ̂‖² + β̂ᵀQβ̂.
         let precision = prior + &design.t().dot(design);
         let precision_spectrum = spectrum_extremes(&precision);
-        let precision_assembly = gamma(n + 1) * frobenius(&(&abs_prior + &gram_terms))
-            + 2.0 * whitening * frobenius(&gram_terms);
+        let precision_assembly = gamma(n + 1) * frobenius_norm(&(&abs_prior + &gram_terms))
+            + 2.0 * whitening * frobenius_norm(&gram_terms);
         let precision_perturbation =
             precision_assembly + cholesky_backward_band(p, precision_spectrum.1);
         let rhs = design.t().dot(response);
@@ -629,7 +626,7 @@ mod tests {
         let whitening_quadratic = 2.0
             * whitening
             * residual_norm
-            * (euclidean(response) + frobenius(&abs_design) * euclidean(&mean));
+            * (euclidean(response) + frobenius_norm(&abs_design) * euclidean(&mean));
         let dual_quadratic = precision_spectrum.1 * mean_error * mean_error
             + 2.0 * residual_norm * residual_error
             + residual_error * residual_error
@@ -651,12 +648,12 @@ mod tests {
             .expect("fixture prior is SPD")
             .solve_mat(&design.t().to_owned());
         let readout_error =
-            cholesky_backward_band(p, prior_spectrum.1) * frobenius(&readout) / prior_spectrum.0;
-        let product_terms = frobenius(&abs_design.dot(&readout.mapv(f64::abs)));
+            cholesky_backward_band(p, prior_spectrum.1) * frobenius_norm(&readout) / prior_spectrum.0;
+        let product_terms = frobenius_norm(&abs_design.dot(&readout.mapv(f64::abs)));
         let covariance = design.dot(&readout) + Array2::<f64>::eye(n);
         let covariance_spectrum = spectrum_extremes(&covariance);
         let covariance_assembly =
-            (gamma(p + 1) + 2.0 * whitening) * product_terms + frobenius(design) * readout_error;
+            (gamma(p + 1) + 2.0 * whitening) * product_terms + frobenius_norm(design) * readout_error;
         let covariance_perturbation =
             covariance_assembly + cholesky_backward_band(n, covariance_spectrum.1);
         let weights = covariance
@@ -672,7 +669,7 @@ mod tests {
             + gamma(2) * (noise_log_sum + n as f64 * largest_log_magnitude(covariance_spectrum));
         let weights_error = covariance_perturbation * weights_norm / covariance_spectrum.0
             + 2.0 * whitening * euclidean(response) / covariance_spectrum.0;
-        let woodbury_mean = frobenius(&readout) * weights_error
+        let woodbury_mean = frobenius_norm(&readout) * weights_error
             + readout_error * weights_norm
             + gamma(n) * euclidean(&readout.mapv(f64::abs).dot(&weights.mapv(f64::abs)));
 
@@ -838,8 +835,8 @@ mod tests {
             .expect("transformed posterior")
             .mean()
             .to_owned();
-        let fit_band = frobenius(&basis) * bands(&original, &noise).mean
-            + frobenius(&transformed_basis) * bands(&transformed, &noise).mean
+        let fit_band = frobenius_norm(&basis) * bands(&original, &noise).mean
+            + frobenius_norm(&transformed_basis) * bands(&transformed, &noise).mean
             + accumulation_growth(4)
                 * (euclidean(&basis.mapv(f64::abs).dot(&original_mean.mapv(f64::abs)))
                     + euclidean(
@@ -1072,14 +1069,14 @@ mod tests {
             .expect("fixture prior is SPD")
             .solve_mat(&constraint.t().to_owned());
         let readout_error =
-            cholesky_backward_band(p, prior_spectrum.1) * frobenius(&readout) / prior_spectrum.0;
+            cholesky_backward_band(p, prior_spectrum.1) * frobenius_norm(&readout) / prior_spectrum.0;
         let mut covariance = constraint.dot(&readout);
         symmetrize_in_place(&mut covariance);
         let covariance_spectrum = spectrum_extremes(&covariance);
         let covariance_assembly = 2.0
             * gamma(p + 1)
-            * frobenius(&constraint.mapv(f64::abs).dot(&readout.mapv(f64::abs)))
-            + frobenius(constraint) * readout_error;
+            * frobenius_norm(&constraint.mapv(f64::abs).dot(&readout.mapv(f64::abs)))
+            + frobenius_norm(constraint) * readout_error;
         let weights = covariance
             .cholesky(Side::Lower)
             .expect("fixture constraint covariance is SPD")
@@ -1183,39 +1180,39 @@ mod tests {
             .cholesky(Side::Lower)
             .expect("fixture prior is SPD")
             .solve_mat(&constraint.t().to_owned());
-        let readout_error = prior_perturbation * frobenius(&readout) / prior_spectrum.0;
+        let readout_error = prior_perturbation * frobenius_norm(&readout) / prior_spectrum.0;
         let mut constraint_covariance = constraint.dot(&readout);
         symmetrize_in_place(&mut constraint_covariance);
         let correction = constraint_covariance
             .cholesky(Side::Lower)
             .expect("fixture constraint covariance is SPD")
             .solve_mat(&readout.t().dot(&unit));
-        let correction_norm = frobenius(&correction);
+        let correction_norm = frobenius_norm(&correction);
         let abs_constraint = constraint.mapv(f64::abs);
         let abs_readout = readout.mapv(f64::abs);
         let abs_correction = correction.mapv(f64::abs);
-        let product_terms = frobenius(&abs_readout.dot(&abs_correction));
-        let band = frobenius(&constraint) * prior_perturbation * frobenius(&prior_part)
+        let product_terms = frobenius_norm(&abs_readout.dot(&abs_correction));
+        let band = frobenius_norm(&constraint) * prior_perturbation * frobenius_norm(&prior_part)
             / prior_spectrum.0
-            + readout_error * frobenius(&unit)
-            + gamma(p + 1) * frobenius(&abs_readout.t().dot(&unit.mapv(f64::abs)))
+            + readout_error * frobenius_norm(&unit)
+            + gamma(p + 1) * frobenius_norm(&abs_readout.t().dot(&unit.mapv(f64::abs)))
             + cholesky_backward_band(n, exact_bands.covariance_spectrum.1) * correction_norm
             + exact_bands.covariance_assembly * correction_norm
-            + frobenius(&constraint)
-                * (gamma(n + 1) * product_terms + gamma(1) * (frobenius(&prior_part) + product_terms))
+            + frobenius_norm(&constraint)
+                * (gamma(n + 1) * product_terms + gamma(1) * (frobenius_norm(&prior_part) + product_terms))
             + gamma(p + 1)
-                * frobenius(
+                * frobenius_norm(
                     &abs_constraint
                         .dot(&(&prior_part.mapv(f64::abs) + &abs_readout.dot(&abs_correction))),
                 );
         assert!(
-            frobenius(&annihilated) <= band,
+            frobenius_norm(&annihilated) <= band,
             "‖A·Cov‖_F = {:e}, band {band:e}",
-            frobenius(&annihilated)
+            frobenius_norm(&annihilated)
         );
 
         // Positive control: the unconditioned prior covariance does not annihilate the constraint.
-        assert!(frobenius(&constraint.dot(&prior_part)) > band);
+        assert!(frobenius_norm(&constraint.dot(&prior_part)) > band);
     }
 
     #[test]

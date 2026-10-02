@@ -84,6 +84,7 @@
 //!
 //! How to settle a flat slicing direction is left to the caller. The refusal carries the eigenvalue and its band.
 
+use gam_linalg::utils::frobenius_norm;
 use faer::Side;
 use gam_linalg::faer_ndarray::strict_symmetric_eigh;
 use gam_math::roundoff::{UNIT_ROUNDOFF, accumulation_growth, inflated};
@@ -745,10 +746,6 @@ impl std::fmt::Display for SlicingError {
 
 impl std::error::Error for SlicingError {}
 
-fn frobenius(matrix: &Array2<f64>) -> f64 {
-    matrix.iter().map(|value| value * value).sum::<f64>().sqrt()
-}
-
 /// Reduces `marginal` to its first `outer_dimension` coordinates `θ`, with the trailing coordinates `v` a stationary
 /// slicing: gradient `T_θ` (envelope) and Hessian `T_θθ − T_θv T_vv⁻¹ T_vθ` (Schur complement).
 ///
@@ -804,10 +801,10 @@ pub fn reduce_to_stationary_slicing(
     }
     let unit = UNIT_ROUNDOFF;
     let curvature = block(&marginal.hessian, m..d, m..d);
-    let curvature_band = frobenius(&block(&marginal.hessian_band, m..d, m..d));
+    let curvature_band = frobenius_norm(&block(&marginal.hessian_band, m..d, m..d));
     let coupling = block(&marginal.hessian, 0..m, m..d);
-    let coupling_band = frobenius(&block(&marginal.hessian_band, 0..m, m..d));
-    let coupling_norm = frobenius(&coupling);
+    let coupling_band = frobenius_norm(&block(&marginal.hessian_band, 0..m, m..d));
+    let coupling_norm = frobenius_norm(&coupling);
     // The marginal writes `hessian[[i, j]]` and `hessian[[j, i]]` from one
     // rounded entry, so a sub-block of it is bitwise symmetric too.
     let (eigenvalues, vectors) = strict_symmetric_eigh(

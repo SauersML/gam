@@ -74,7 +74,7 @@ fn dense_commutant_dimension(maps: &[Array2<f64>]) -> usize {
                 .assign(&Array1::from_iter(transposed.iter().copied()));
         }
     }
-    let partition = factor_rank_partition(&factor).expect("dense commutator factor SVD");
+    let partition = factor_rank_partition(&factor, 0.0).expect("dense commutator factor SVD");
     unknowns - partition.rank
 }
 
@@ -147,7 +147,7 @@ fn identity_is_one_isotypic_component_with_an_undetermined_block_basis() {
             ambiguity_dimension: 6,
         }
     );
-    let span = factor_rank_partition(&component.basis).expect("component basis SVD");
+    let span = factor_rank_partition(&component.basis, 0.0).expect("component basis SVD");
     assert_eq!(span.rank, dimension, "the component is the whole state");
     assert_eq!(blocks.commutant_dimension(), 16);
     assert_eq!(dense_commutant_dimension(&[identity]), 16);

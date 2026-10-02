@@ -79,7 +79,8 @@
 //! empirical beyond the sampled inputs.
 
 use gam_linalg::faer_ndarray::{fast_ab, fast_atb};
-use gam_linalg::roundoff::{accumulation_growth, orthonormality_defect_bound};
+use gam_linalg::roundoff::{accumulation_growth, basis_orthonormality_defect};
+use gam_linalg::utils::frobenius_norm;
 use gam_math::roundoff::{UNIT_ROUNDOFF, inflated};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, concatenate, s};
 
@@ -366,7 +367,7 @@ impl Resolved {
         let rank = decomposed.singular_values.iter().filter(|&&value| value > decomposed.band).count();
         let u = decomposed.u.slice(s![.., ..rank]).to_owned();
         let v = decomposed.vt.slice(s![..rank, ..]).t().to_owned();
-        let omega = defect(u.view()).max(defect(v.view()));
+        let omega = basis_orthonormality_defect(u.view()).max(basis_orthonormality_defect(v.view()));
         Ok(Self {
             u,
             s: decomposed.singular_values.iter().take(rank).copied().collect(),
@@ -390,27 +391,6 @@ impl Resolved {
     }
 }
 
-/// `ω ≥ ‖UᵀU − I‖₂` for a computed basis.
-fn defect(basis: ArrayView2<'_, f64>) -> f64 {
-    let (rows, rank) = basis.dim();
-    if rank == 0 {
-        return 0.0;
-    }
-    let mut gram = fast_atb(&basis, &basis);
-    for index in 0..rank {
-        gram[[index, index]] -= 1.0;
-    }
-    orthonormality_defect_bound(frobenius(gram.view()), rows, rank)
-}
-
-pub(crate) fn frobenius(matrix: ArrayView2<'_, f64>) -> f64 {
-    matrix.iter().map(|value| value * value).sum::<f64>().sqrt()
-}
-
-fn norm(vector: ArrayView1<'_, f64>) -> f64 {
-    vector.iter().map(|value| value * value).sum::<f64>().sqrt()
-}
-
 /// `‖fl(M v)‖₂` and a bound on its distance from `‖(M + δM) v‖₂` for every `|δM_ij| ≤
 /// radius_j`: `‖γ_n |M||v| + |δM||v|‖₂` from the products and the declared radius, and
 /// `γ_{m+1}` of the value for the norm's own sum and square root.
@@ -428,7 +408,7 @@ fn product_norm(matrix: ArrayView2<'_, f64>, vector: ArrayView1<'_, f64>, radius
         })
         .sum::<f64>()
         .sqrt();
-    let value = norm(product.view());
+    let value = frobenius_norm(product.view());
     (value, inflated(error + accumulation_growth(rows + 1) * value, 2))
 }
 
@@ -565,7 +545,7 @@ fn coverage(
             // Every input: the complement of the resolved range has dimension
             // `width − rank`. One direction: the coordinate axis the range reaches least,
             // made orthogonal to the range.
-            let reach: Vec<f64> = resolved.u.rows().into_iter().map(|row| norm(row)).collect();
+            let reach: Vec<f64> = resolved.u.rows().into_iter().map(|row| frobenius_norm(row)).collect();
             let axis = (0..width).fold(0, |best, index| if reach[index] < reach[best] { index } else { best });
             let mut direction = Array1::<f64>::zeros(width);
             direction[axis] = 1.0;
@@ -587,8 +567,8 @@ fn coverage(
     let decomposed = svd(outside.view(), false)?;
     let threshold = inflated(
         decomposed.band
-            + (2.0 + resolved.omega) * resolved.omega * frobenius(class.view())
-            + accumulation_growth(2 * resolved.rank() + 1) * frobenius(class.view()),
+            + (2.0 + resolved.omega) * resolved.omega * frobenius_norm(class.view())
+            + accumulation_growth(2 * resolved.rank() + 1) * frobenius_norm(class.view()),
         2,
     );
     let dimension = decomposed.singular_values.iter().filter(|&&value| value > threshold).count();
@@ -609,7 +589,7 @@ fn unscale_direction(direction: ArrayView1<'_, f64>, scale: Option<&[f64]>, was_
             *value = if was_inverted { *value * factor } else { *value / factor };
         }
     }
-    let length = norm(out.view());
+    let length = frobenius_norm(out.view());
     if length > 0.0 {
         out.mapv_inplace(|value| value / length);
     }
@@ -715,7 +695,7 @@ pub fn off_target_damage(
             let inner = reader.t().dot(&x);
             let inner_error = reader_abs.t().dot(&x.mapv(f64::abs)) * accumulation_growth(reader.nrows());
             let (value, band) = product_norm(writer, inner.view(), &zeros);
-            let band = inflated(band + norm(writer_abs.dot(&inner_error).view()), 1);
+            let band = inflated(band + frobenius_norm(writer_abs.dot(&inner_error).view()), 1);
             if best.is_none_or(|(v, b, _)| value + band > v + b) {
                 best = Some((value, band, OffTargetWitness { set: set_index, observation }));
             }
@@ -979,7 +959,7 @@ pub fn compile_linear_site(
     let inv_max = |scale: Option<&[f64]>| scale.map_or(1.0, |values| values.iter().fold(0.0_f64, |m, v| m.max(1.0 / v)));
     let target_mass = |side: &Side, y: &Array2<f64>, scale: Option<&[f64]>| {
         let declared = side.radius.iter().fold(0.0_f64, |m, r| m.max(*r)) * scale.map_or(1.0, |v| v.iter().fold(0.0, |m: f64, s| m.max(*s)));
-        accumulation_growth(side.columns() + 2 * terms + 2) * frobenius(y.view()) + declared * (side.columns() as f64).sqrt()
+        accumulation_growth(side.columns() + 2 * terms + 2) * frobenius_norm(y.view()) + declared * (side.columns() as f64).sqrt()
     };
     let right_allowance = inflated(
         inv_max(row_scale)

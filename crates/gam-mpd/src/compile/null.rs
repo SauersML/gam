@@ -36,14 +36,14 @@
 //! spectrum band are added.
 
 use gam_linalg::roundoff::{
-    SymmetricAssembly, accumulation_growth, null_quadratic_band, orthonormality_defect_bound,
+    SymmetricAssembly, accumulation_growth, basis_orthonormality_defect, null_quadratic_band,
 };
+use gam_linalg::utils::frobenius_norm;
 use gam_math::roundoff::inflated;
 use ndarray::{Array1, Array2, ArrayView2, Axis};
 
 use super::super::dense::eigh;
 use super::super::supports::{EvidenceStatus, ExactBasis};
-use super::linear::frobenius;
 use super::{CompileError, require_finite, require_shape};
 
 /// The ball a null-edit supremum is stated over: every `u` of the resolved range of `G`
@@ -155,14 +155,10 @@ pub fn physically_null_supremum(
     let supremum = top.values[rank - 1];
     let witness = scaled.dot(&top.vectors.column(rank - 1));
     let absolute = scaled.mapv(f64::abs);
-    let formation = frobenius(
+    let formation = frobenius_norm(
         (absolute.t().dot(&response_gram.mapv(f64::abs).dot(&absolute)) * accumulation_growth(2 * n + 3)).view(),
     );
-    let mut gram = basis.t().dot(&basis);
-    for index in 0..rank {
-        gram[[index, index]] -= 1.0;
-    }
-    let omega = orthonormality_defect_bound(frobenius(gram.view()), n, rank);
+    let omega = basis_orthonormality_defect(basis.view());
     let smallest = values.iter().copied().fold(f64::INFINITY, f64::min);
     let rho = beta / (smallest - beta).max(f64::MIN_POSITIVE);
     let ball_error = if rho < 1.0 {

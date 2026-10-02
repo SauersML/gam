@@ -2763,8 +2763,8 @@ fn channel_aware_penalty_aware_joint_rank(
     // (Sylvester), so `rank(Ĝ) = rank(G)` and the null space — the genuinely
     // unidentified directions `ker(J_eff) ∩ ker(S)` we DO refuse on — is untouched.
     //
-    // WHY the COUNTING is scale-robust after it: `count_rank`'s tolerance is
-    // the SVD rounding band `τ = max(n,p)·ε·σ_max` (`count_rank_band`),
+    // WHY the COUNTING is scale-robust after it: `resolved_singular_count`'s tolerance is
+    // the SVD rounding band `τ = max(n,p)·ε·σ_max` (`gam_linalg::roundoff::resolved_singular_band`),
     // relative to the LARGEST singular value. On the raw
     // `G` a stiff direction (the marginal-slope chain weight `c_i`, whose spectrum
     // reached ~8.66e7 here) sets `σ_max` huge, so a small-but-nonzero penalty-
@@ -2797,11 +2797,11 @@ fn channel_aware_penalty_aware_joint_rank(
     // is still what is returned and still what gates the fit. `Ambiguous`
     // reports honestly that there is no margin to carry.
     let spectrum = descending_singular_values_of_gram(&equilibrated)?;
-    let sigma_max = spectrum.first().copied().unwrap_or(0.0);
-    let tol = count_rank_band(
-        sigma_max,
+    let tol = gam_linalg::roundoff::resolved_singular_band(
+        &spectrum,
         n_design_rows + n_penalty_rows,
         equilibrated.ncols(),
+        0.0,
     );
     Ok((
         rank,
@@ -3376,22 +3376,6 @@ fn block_penalty_aware_rank(
     })
 }
 
-/// The singular-value band [`count_rank`] decides against: a backward-stable
-/// SVD of the `n × p` design resolves its singular values only to
-/// `max(n, p)·ε·σ_max` ([`gam_linalg::roundoff::factor_singular_band`]), so a
-/// singular value at or below it is not separated from zero (#4045).
-fn count_rank_band(sigma_max: f64, n: usize, p: usize) -> f64 {
-    gam_linalg::roundoff::factor_singular_band(n, p, sigma_max)
-}
-
-/// Number of the descending `singular_values` of an `n × p` design above
-/// [`count_rank_band`].
-pub(crate) fn count_rank(singular_values: &[f64], n: usize, p: usize) -> usize {
-    let leading = singular_values.first().copied().unwrap_or(0.0);
-    let tol = count_rank_band(leading, n, p);
-    singular_values.iter().filter(|&&v| v > tol).count()
-}
-
 /// Numerical rank of a design `D` (with `n_total` rows and `p` columns) given
 /// only its accumulated `(p × p)` Gram matrix `G = Dᵀ D`.
 ///
@@ -3399,13 +3383,13 @@ pub(crate) fn count_rank(singular_values: &[f64], n: usize, p: usize) -> usize {
 /// design `D_k = diag(a_·k)·Φ_k`; it accumulates `G_k = D_kᵀ D_k` online across
 /// row chunks. The singular values of `D` are the square roots of the
 /// eigenvalues of `G` (`G = V diag(σ²) Vᵀ`), so the same RRQR rank tolerance
-/// that `count_rank` applies to QR pivots applies to `√λ`. This lets the
+/// that `resolved_singular_count` applies to QR pivots applies to `√λ`. This lets the
 /// pre-fit decoder identifiability audit run chunk-by-chunk with `O(M_k²)`
 /// state instead of an `O(N · M_k)` design retain.
 ///
 /// Negative eigenvalues from finite-precision accumulation are clamped to zero
 /// before the square root. Returns the count of singular values above the
-/// tolerance, identical in convention to `count_rank`.
+/// tolerance, identical in convention to `resolved_singular_count`.
 pub fn rank_of_gram(gram: &Array2<f64>, n_total: usize) -> Result<usize, EstimationError> {
     let p = gram.ncols();
     if p == 0 {
@@ -3416,7 +3400,7 @@ pub fn rank_of_gram(gram: &Array2<f64>, n_total: usize) -> Result<usize, Estimat
         .map_err(EstimationError::EigendecompositionFailed)?;
     let mut singular: Vec<f64> = evals.iter().map(|&lambda| lambda.max(0.0).sqrt()).collect();
     singular.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    Ok(count_rank(&singular, n_total, p))
+    Ok(gam_linalg::roundoff::resolved_singular_count(&singular, n_total, p, 0.0))
 }
 
 // `MapUniquenessError` (and its pure `Display` impl) now lives in `gam-problem`

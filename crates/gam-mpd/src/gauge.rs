@@ -12,6 +12,7 @@
 
 use gam_linalg::faer_ndarray::{FaerLinalgError, FaerQr, FaerSvd, fast_ab, fast_abt, fast_av};
 use gam_linalg::roundoff::{accumulation_growth, factor_singular_band};
+use gam_linalg::utils::frobenius_norm;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, concatenate, s};
 
 use super::supports::{EvidenceStatus, EvidenceStatusError, ExactBasis};
@@ -144,12 +145,12 @@ impl LinearPassthrough {
             Some(basis) => fast_av(basis, &direction),
             None => direction,
         };
-        let left_norm = frobenius(left.view());
-        let right_norm = frobenius(right.view());
+        let left_norm = frobenius_norm(left.view());
+        let right_norm = frobenius_norm(right.view());
         let numerical_error = left_range.backward_error * right_norm
             + left_norm * right_range.backward_error
-            + accumulation_growth(left.ncols()) * frobenius(left_range.core.view()) * frobenius(right_range.core.view())
-            + factor_singular_band(core.nrows(), core.ncols(), frobenius(core.view()));
+            + accumulation_growth(left.ncols()) * frobenius_norm(left_range.core.view()) * frobenius_norm(right_range.core.view())
+            + factor_singular_band(core.nrows(), core.ncols(), frobenius_norm(core.view()));
         Ok(EvidenceStatus::exact(
             sigma[top],
             numerical_error,
@@ -185,7 +186,7 @@ impl RangeFactor {
         Ok(Self {
             core: t.slice(s![..k, ..k]).to_owned(),
             basis: Some(q.slice(s![.., ..k]).to_owned()),
-            backward_error: factor_singular_band(rows, k, frobenius(factor)),
+            backward_error: factor_singular_band(rows, k, frobenius_norm(factor)),
         })
     }
 }
@@ -226,10 +227,6 @@ fn shape_failed(failure: ndarray::ShapeError) -> GaugeRefusal {
         what: "factor concatenation",
         detail: failure.to_string(),
     }
-}
-
-fn frobenius(matrix: ArrayView2<'_, f64>) -> f64 {
-    matrix.iter().map(|entry| entry * entry).sum::<f64>().sqrt()
 }
 
 /// `S⁻¹ = V Σ⁻¹ Uᵀ` from the SVD `S = U Σ Vᵀ`. It refuses a singular value inside
@@ -273,10 +270,6 @@ mod tests {
         out
     }
 
-    fn norm(v: &Array1<f64>) -> f64 {
-        v.dot(v).sqrt()
-    }
-
     fn exact_parts(status: &EvidenceStatus<Array1<f64>, AllInputs>) -> (f64, f64, Array1<f64>) {
         match status {
             EvidenceStatus::Exact {
@@ -301,9 +294,9 @@ mod tests {
     fn regauge_band(teacher: &LinearPassthrough, gauge_change: &Array2<f64>) -> f64 {
         let r = teacher.order();
         let inverse = invert_gauge_change(gauge_change.view()).expect("the fixture's gauge change is invertible");
-        let kappa = frobenius(gauge_change.view()) * frobenius(inverse.view());
+        let kappa = frobenius_norm(gauge_change.view()) * frobenius_norm(inverse.view());
         let eta = kappa * r as f64 * (f64::EPSILON + accumulation_growth(2 * r));
-        frobenius(teacher.read()) * frobenius(teacher.write()) * (eta + 2.0 * accumulation_growth(r) * kappa)
+        frobenius_norm(teacher.read()) * frobenius_norm(teacher.write()) * (eta + 2.0 * accumulation_growth(r) * kappa)
     }
 
     /// A2's `GL(r)` half through the executed map: the regauged setting executes the
@@ -332,9 +325,9 @@ mod tests {
         let one_sided = LinearPassthrough::new(fast_ab(&gauge_change, &teacher.read), teacher.write.clone())
             .expect("finite factors");
         let one_sided_band = accumulation_growth(r)
-            * frobenius(gauge_change.view())
-            * frobenius(teacher.read())
-            * frobenius(teacher.write());
+            * frobenius_norm(gauge_change.view())
+            * frobenius_norm(teacher.read())
+            * frobenius_norm(teacher.write());
         let difference = teacher.operator_difference(&one_sided).expect("comparable settings");
         let lower = difference.lower_bound().expect("an exact extremum bounds itself");
         assert!(
@@ -342,15 +335,15 @@ mod tests {
             "a one-sided change must be proven distinct: lower bound {lower:.3e}, rounding {one_sided_band:.3e}"
         );
         let (value, numerical_error, witness) = exact_parts(&difference);
-        let executed = norm(
+        let executed = frobenius_norm(
             &(one_sided.apply_to(witness.view()).expect("apply") - &teacher.apply_to(witness.view()).expect("apply")),
         );
         let widest = d_in.max(d_out).max(r);
         let execution_band = accumulation_growth(2 * widest)
-            * frobenius(teacher.write())
-            * (frobenius(teacher.read()) + frobenius(one_sided.read()))
-            * norm(&witness)
-            + one_sided_band * norm(&witness);
+            * frobenius_norm(teacher.write())
+            * (frobenius_norm(teacher.read()) + frobenius_norm(one_sided.read()))
+            * frobenius_norm(&witness)
+            + one_sided_band * frobenius_norm(&witness);
         assert!(
             executed > execution_band,
             "the witness moved the executed output by {executed:.3e}, band {execution_band:.3e} (sup {value:.3e} ± {numerical_error:.3e})"
