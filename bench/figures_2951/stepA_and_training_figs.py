@@ -1,4 +1,4 @@
-"""Step A (VPD's components, VPD's sets vs our selection), our training run, toy ladders, selection speed (#2951)."""
+"""Step A (VPD's subcomponents, VPD's sets vs our selection), our training run, toy ladders, selection speed (#2951)."""
 import json
 import re
 import sys
@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 OUT = Path.home() / "mpd-data/figures"
-PIECES = Path.home() / "mpd-data/components/vpd4l"
+PIECES = Path.home() / "mpd-data/subcomponents/vpd4l"
 SURF, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3de"
 OURS, VPD, THIRD = "#2a78d6", "#eb6834", "#1baf7a"
 plt.rcParams.update({"font.family": "Helvetica Neue", "font.size": 14})
@@ -41,19 +41,19 @@ def step_a_rows():
     return [rows[k] for k in sorted(rows)]
 
 
-# 1. Every passage moves toward fewer components and closer predictions.
+# 1. Every passage moves toward fewer subcomponents and closer predictions.
 rows = step_a_rows()
 n = len(rows)
 fig, ax = new_fig(11, 7.5)
 for l0s, kls, _, l0o, klo, _ in rows:
     ax.annotate("", xy=(l0o, klo), xytext=(l0s, kls),
                 arrowprops=dict(arrowstyle="-|>", color=INK2, lw=1.4, mutation_scale=14), zorder=2)
-ax.scatter([r[0] for r in rows], [r[1] for r in rows], s=110, color=VPD, edgecolor=SURF, lw=2, zorder=3, label="VPD's own choice of components")
-ax.scatter([r[3] for r in rows], [r[4] for r in rows], s=110, color=OURS, edgecolor=SURF, lw=2, zorder=4, label="our choice, same components")
-ax.set_xlabel("VPD components switched on per word (average over a 512-word passage)", color=INK, labelpad=10)
+ax.scatter([r[0] for r in rows], [r[1] for r in rows], s=110, color=VPD, edgecolor=SURF, lw=2, zorder=3, label="VPD's own choice of subcomponents")
+ax.scatter([r[3] for r in rows], [r[4] for r in rows], s=110, color=OURS, edgecolor=SURF, lw=2, zorder=4, label="our choice, same subcomponents")
+ax.set_xlabel("VPD subcomponents switched on per word (average over a 512-word passage)", color=INK, labelpad=10)
 ax.set_ylabel("difference from the real model's predictions (KL, nats)", color=INK, labelpad=10)
 ax.legend(frameon=False, loc="upper left", fontsize=13)
-ax.set_title(f"Same VPD components, better choices: fewer components and closer predictions ({n} passages)",
+ax.set_title(f"Same VPD subcomponents, better choices: fewer subcomponents and closer predictions ({n} passages)",
              color=INK, fontsize=16, fontweight="bold", loc="left", pad=14)
 fig.tight_layout()
 fig.savefig(OUT / "stepA_arrows.png", facecolor=SURF)
@@ -63,13 +63,13 @@ order = np.argsort([r[2] for r in rows])
 fig, ax = new_fig(12, 6.5)
 x = np.arange(n)
 ax.bar(x - 0.2, [rows[i][2] for i in order], 0.38, color=VPD, label="VPD's choices", zorder=3)
-ax.bar(x + 0.2, [rows[i][5] for i in order], 0.38, color=OURS, label="our choices (same components)", zorder=3)
+ax.bar(x + 0.2, [rows[i][5] for i in order], 0.38, color=OURS, label="our choices (same subcomponents)", zorder=3)
 for j, i in enumerate(order):
     d = (rows[i][5] - rows[i][2]) / rows[i][2] * 100
     ax.annotate(f"{d:+.1f}%", (j + 0.2, rows[i][5]), xytext=(0, 4), textcoords="offset points", ha="center", fontsize=11, color=INK2)
 ax.set_xticks(x, [f"passage {i}" for i in order], rotation=0, fontsize=10)
 ax.set_ylim(1300, max(r[2] for r in rows) * 1.06)
-ax.set_ylabel("bits per word to write down which components are on\nplus how far the output is from the model", color=INK, labelpad=10)
+ax.set_ylabel("bits per word to write down which subcomponents are on\nplus how far the output is from the model", color=INK, labelpad=10)
 ax.legend(frameon=False, loc="upper left", fontsize=13)
 tot_v, tot_o = np.mean([r[2] for r in rows]), np.mean([r[5] for r in rows])
 better = sum(r[5] < r[2] - 0.05 for r in rows)
@@ -78,7 +78,7 @@ ax.set_title(f"Shorter on {better} of {n} passages, never longer: {tot_v:,.0f} t
 fig.tight_layout()
 fig.savefig(OUT / "stepA_bits.png", facecolor=SURF)
 
-# 3. Our own components' training run (before switching to VPD's components as the start).
+# 3. Our own subcomponents' training run (before switching to VPD's subcomponents as the start).
 it = json.loads((PIECES / "masked_wsvd_1024_fullbatch.json").read_text())["iterations"]
 l0 = [i["eval"]["l0"] for i in it]
 kl = [i["eval"]["kl"] for i in it]
@@ -92,11 +92,11 @@ ol0, okl = np.mean([r[3] for r in rows]), np.mean([r[4] for r in rows])
 ax.scatter([vl0], [vkl], s=160, color=VPD, edgecolor=SURF, lw=2, zorder=5)
 ax.annotate("VPD", (vl0, vkl), xytext=(10, -4), textcoords="offset points", fontsize=13, color=INK, fontweight="medium")
 ax.scatter([ol0], [okl], s=160, color=THIRD, edgecolor=SURF, lw=2, zorder=5, marker="D")
-ax.annotate("VPD's components, our choices", (ol0, okl), xytext=(10, -16), textcoords="offset points", fontsize=13, color=INK)
+ax.annotate("VPD's subcomponents, our choices", (ol0, okl), xytext=(10, -16), textcoords="offset points", fontsize=13, color=INK)
 ax.set_xscale("log")
-ax.set_xlabel("components switched on per word (log scale)", color=INK, labelpad=10)
+ax.set_xlabel("subcomponents switched on per word (log scale)", color=INK, labelpad=10)
 ax.set_ylabel("difference from the real model (KL, nats)", color=INK, labelpad=10)
-ax.set_title("Training our own components (blue) is still far right of VPD; VPD's components with our choices beat it",
+ax.set_title("Training our own subcomponents (blue) is still far right of VPD; VPD's subcomponents with our choices beat it",
              color=INK, fontsize=15, fontweight="bold", loc="left", pad=14)
 fig.text(0.01, 0.01, "training points: 512 held-out words of a different passage; VPD points: average over the test passages",
          color=INK2, fontsize=11)
