@@ -1344,6 +1344,7 @@ impl Change {
     fn delta(&self, base: &Array2<f64>) -> (Vec<usize>, Array2<f64>) {
         match self {
             Self::Full(values) => ((0..values.ncols()).collect(), values - base),
+            Self::Columns { cols, values } if cols.len() == base.ncols() => (cols.clone(), values - base),
             Self::Columns { cols, values } => (cols.clone(), values - &base.select(Axis(1), cols)),
         }
     }
@@ -1535,8 +1536,11 @@ impl OperatorProgram {
                         let x = &base.values[*argument];
                         if let Some((difference, rows, cols)) = changed_ops.get(operator) {
                             // Only the changed rows and columns of the difference take part.
-                            let changed = difference.select(Axis(1), cols).select(Axis(0), rows);
-                            let product = x.select(Axis(1), cols).dot(&changed.t());
+                            let product = if cols.len() == difference.ncols() {
+                                x.dot(&difference.select(Axis(0), rows).t())
+                            } else {
+                                x.select(Axis(1), cols).dot(&difference.select(Axis(1), cols).select(Axis(0), rows).t())
+                            };
                             for (k, &t) in rows.iter().enumerate() {
                                 let mut target = delta.column_mut(t);
                                 target += &product.column(k);
@@ -1546,7 +1550,12 @@ impl OperatorProgram {
                         if let Some(change) = changes.get(argument) {
                             let (cols, dx) = change.delta(x);
                             let a = self.operators[*operator].matrix_cow();
-                            delta += &dx.dot(&a.select(Axis(1), &cols).t());
+                            // Every column changed (the usual case past the first changed node): no copy.
+                            if cols.len() == a.ncols() {
+                                delta += &dx.dot(&a.t());
+                            } else {
+                                delta += &dx.dot(&a.select(Axis(1), &cols).t());
+                            }
                             touched.iter_mut().for_each(|t| *t = true);
                         }
                     }
@@ -1559,7 +1568,11 @@ impl OperatorProgram {
                         }
                     }
                     let cols: Vec<usize> = touched.iter().enumerate().filter(|(_, t)| **t).map(|(c, _)| c).collect();
-                    let values = &base_value.select(Axis(1), &cols) + &delta.select(Axis(1), &cols);
+                    let values = if cols.len() == base_value.ncols() {
+                        base_value + &delta
+                    } else {
+                        &base_value.select(Axis(1), &cols) + &delta.select(Axis(1), &cols)
+                    };
                     Change::Columns { cols, values }
                 }
                 Node::Pointwise { input, laws } if !law_changed => match changes.get(input) {
