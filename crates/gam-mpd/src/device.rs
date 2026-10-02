@@ -38,8 +38,10 @@ impl Drop for ModeGuard {
 
 /// Run `body` as a proposal (module note).
 pub fn proposing<T>(body: impl FnOnce() -> T) -> T {
-    let _guard = ModeGuard(PROPOSING.replace(true));
-    body()
+    let restore = ModeGuard(PROPOSING.replace(true));
+    let out = body();
+    drop(restore);
+    out
 }
 
 fn device_error(error: impl std::fmt::Display) -> ProgramError {
