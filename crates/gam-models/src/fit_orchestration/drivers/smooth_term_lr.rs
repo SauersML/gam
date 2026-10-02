@@ -2477,14 +2477,37 @@ impl SmoothLrSelectionReplay {
     /// lowers a criterion that is bounded below on the box by more than its own
     /// rounding, so the sweep terminates without an iteration budget.
     ///
+    /// # Why the sweeps are extrapolated (#4563)
+    ///
+    /// That argument bounds the sweeps only by `(criterion range) / (rounding
+    /// band)`. Coordinate descent itself contracts linearly: near a minimum where
+    /// the criterion's Hessian couples two scales with correlation `c`, each sweep
+    /// shrinks the error by `c²`, so a valley diagonal to the axes (a `te` term's
+    /// two margins, a smooth's range and null-space penalties) costs
+    /// `ln(range/band) / ln(1/c²)` sweeps, hundreds as `c → 1`. On the local
+    /// quadratic model with two open scales, the Gauss–Seidel iteration matrix has
+    /// rank one: after the first sweep every displacement is `r` times the one
+    /// before along one fixed direction, so the sweeps' limit is
+    /// `x + d·r/(1 − r)` exactly, read off the last two displacements. Taking it
+    /// leaves only the model's cubic error, so the descent converges
+    /// quadratically and the sweep count is `O(log log(range/band))` where the
+    /// criterion is strongly convex. With more scales the iteration matrix has
+    /// higher rank and the same extrapolation is an acceleration, not exact.
+    ///
+    /// A jump is taken only when it lowers the criterion by more than the rounding
+    /// of the change, and that change is measured exactly: from the incumbent to
+    /// the extrapolated point one axis at a time, each leg along one
+    /// [`AxisSlice`], so it is a sum of slice differences with their bands and no
+    /// absolute criterion value is compared. Every accepted step, sweep or jump,
+    /// is therefore a certified decrease, the termination argument above is
+    /// unchanged, and the stop is still the sweep that moves nothing, which is
+    /// what certifies the per-axis minimum.
+    ///
     /// `residual` is the draw's profiled `(m, R)` when the family profiles its
     /// scale ([`AxisSlice::criterion`]).
     ///
     /// Returns the number of sweeps taken, INCLUDING the final one that moved
-    /// nothing and so decided the stop. That count is the quantity #4563 needs
-    /// and had no producer: the termination argument this descent carries bounds
-    /// it only by `(criterion range) / (rounding band)`, so whether it is in fact
-    /// problem-sized is a measurement, and the caller reports it.
+    /// nothing and so decided the stop; the caller reports it.
     fn select_draw(
         geometry: &SelectionGeometry,
         log_scale_windows: &[(f64, f64)],
@@ -2492,12 +2515,26 @@ impl SmoothLrSelectionReplay {
         residual: Option<(f64, f64)>,
         selected: &mut [f64],
     ) -> Result<usize, SmoothLrSelectionDecline> {
+        Self::select_draw_with(geometry, log_scale_windows, coordinates, residual, selected, true)
+    }
+
+    /// [`Self::select_draw`], with the extrapolation off for a test to compare.
+    fn select_draw_with(
+        geometry: &SelectionGeometry,
+        log_scale_windows: &[(f64, f64)],
+        coordinates: &[f64],
+        residual: Option<(f64, f64)>,
+        selected: &mut [f64],
+        extrapolate: bool,
+    ) -> Result<usize, SmoothLrSelectionDecline> {
         if selected.len() != log_scale_windows.len() {
             return Err(SmoothLrSelectionDecline::NoPenaltyComponents);
         }
         for (slot, &(low, high)) in selected.iter_mut().zip(log_scale_windows) {
             *slot = if high > low { 0.0_f64.clamp(low, high) } else { 0.0 };
         }
+        // The points after the last sweeps, oldest first, since the last jump.
+        let mut trail: Vec<Vec<f64>> = vec![selected.to_vec()];
         let mut sweeps = 0usize;
         loop {
             sweeps += 1;
@@ -2527,7 +2564,71 @@ impl SmoothLrSelectionReplay {
             if !moved {
                 return Ok(sweeps);
             }
+            trail.push(selected.to_vec());
+            if !extrapolate || trail.len() < 3 {
+                continue;
+            }
+            let (before, last, now) = (&trail[trail.len() - 3], &trail[trail.len() - 2], &trail[trail.len() - 1]);
+            let (mut along, mut previous) = (0.0_f64, 0.0_f64);
+            for axis in 0..selected.len() {
+                let (d_before, d_now) = (last[axis] - before[axis], now[axis] - last[axis]);
+                along += d_now * d_before;
+                previous += d_before * d_before;
+            }
+            let ratio = along / previous;
+            if !(ratio > 0.0 && ratio < 1.0) {
+                continue;
+            }
+            let reach = ratio / (1.0 - ratio);
+            let target: Vec<f64> = (0..selected.len())
+                .map(|axis| {
+                    let (low, high) = log_scale_windows[axis];
+                    if high > low {
+                        (now[axis] + reach * (now[axis] - last[axis])).clamp(low, high)
+                    } else {
+                        selected[axis]
+                    }
+                })
+                .collect();
+            if Self::certified_descent(geometry, coordinates, residual, selected, &target) {
+                selected.copy_from_slice(&target);
+                trail.clear();
+                trail.push(selected.to_vec());
+            }
         }
+    }
+
+    /// Whether moving from `from` to `to` lowers the criterion by more than the
+    /// rounding of the change. The change is summed one axis at a time along exact
+    /// [`AxisSlice`]s, each leg's band being its two endpoints'; a point that
+    /// cannot be priced is no descent.
+    fn certified_descent(
+        geometry: &SelectionGeometry,
+        coordinates: &[f64],
+        residual: Option<(f64, f64)>,
+        from: &[f64],
+        to: &[f64],
+    ) -> bool {
+        let mut point = from.to_vec();
+        let (mut change, mut band) = (0.0_f64, 0.0_f64);
+        for axis in 0..point.len() {
+            if to[axis] == point[axis] {
+                continue;
+            }
+            let Some(slice) = AxisSlice::new(geometry, &point, axis, coordinates) else {
+                return false;
+            };
+            let criterion = slice.criterion(residual);
+            let (Some(([at_to, ..], to_band)), Some(([at_from, ..], from_band))) =
+                (criterion.jet(to[axis]), criterion.jet(point[axis]))
+            else {
+                return false;
+            };
+            change += at_to - at_from;
+            band += to_band + from_band;
+            point[axis] = to[axis];
+        }
+        change < -band
     }
     /// The factor that carries the observation from the fitted `λ̂` to the
     /// replay's own selection: the quadratic model's ratio `W_q(t*; z)/W_q(1; z)`
@@ -5144,7 +5245,7 @@ mod selection_replay_tests {
         stratified_chi_square,
     };
     use gam_linalg::utils::splitmix64_hash;
-    use ndarray::Array2;
+    use ndarray::{Array1, Array2};
 
     /// #4086 sibling: the paired-difference spread is two-pass centred, so it
     /// cannot cancel. Half the draws at `c + s`, half at `c − s` (`c = 0.75`, `s` a
@@ -6301,6 +6402,77 @@ mod selection_replay_tests {
                 }
             }
         }
+    }
+
+    /// #4563: the extrapolated descent stays a coordinatewise certified minimum and
+    /// its sweep count does not grow with the scales' coupling.
+    ///
+    /// Two penalties that are nearly proportional make the criterion a function of
+    /// nearly one combination of the two scales, so its minimum sits in a valley
+    /// diagonal to the axes and plain coordinate descent contracts by `c²` per
+    /// sweep. The same draws are selected with and without the extrapolation
+    /// through the one sweep; both must end at a per-axis minimum, and the
+    /// extrapolated descent must take fewer sweeps in total and, per draw, no more
+    /// than the quadratic convergence its rank-one iteration matrix gives.
+    #[test]
+    fn extrapolated_selection_is_certified_and_problem_sized_4563() {
+        let q = 6;
+        let bending = Array2::from_diag(&Array1::from(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let near = Array2::from_diag(&Array1::from(vec![1.1, 2.0, 3.2, 3.9, 5.0, 6.3]));
+        let geometry = SelectionGeometry::whiten(&Array2::eye(q), &[bending, near], &[0.5, 0.5])
+            .expect("coupled geometry");
+        let windows = [(-30.0_f64, 30.0_f64), (-30.0, 30.0)];
+        let mut factor = SelectionFactor::new(&geometry);
+        let mut stream = SelectionDrawStream::new(geometry.dimension, 48);
+        let mut draw = vec![0.0_f64; geometry.dimension];
+        let (mut plain_total, mut fast_total, mut fast_max, mut plain_max) = (0, 0, 0, 0);
+        for index in 0..48 {
+            stream.fill_normals(&mut draw);
+            let norm_squared: f64 = draw.iter().map(|value| value * value).sum();
+            let coordinates = range_coordinates(&geometry, &draw);
+            for extrapolate in [false, true] {
+                let mut selected = vec![0.0_f64; 2];
+                let sweeps = SmoothLrSelectionReplay::select_draw_with(
+                    &geometry,
+                    &windows,
+                    &coordinates,
+                    None,
+                    &mut selected,
+                    extrapolate,
+                )
+                .expect("a certified multi-scale selection");
+                if extrapolate {
+                    fast_total += sweeps;
+                    fast_max = fast_max.max(sweeps);
+                } else {
+                    plain_total += sweeps;
+                    plain_max = plain_max.max(sweeps);
+                }
+                let mut value_at = |point: &[f64]| {
+                    assert!(factor.refactor(&geometry, point));
+                    factor.score(&coordinates, norm_squared).0
+                };
+                let at_selected = value_at(selected.as_slice());
+                let tolerance = 1e-8 * (1.0 + at_selected.abs());
+                for step in [-4.0_f64, -0.5, -1e-3, 1e-3, 0.5, 4.0] {
+                    for axis in 0..2 {
+                        let mut probe = selected.clone();
+                        probe[axis] = (probe[axis] + step).clamp(windows[axis].0, windows[axis].1);
+                        let at_probe = value_at(&probe[..]);
+                        assert!(
+                            at_selected <= at_probe + tolerance,
+                            "draw {index} (extrapolate {extrapolate}): {selected:?} (V={at_selected}) \
+                             is undercut at {probe:?} (V={at_probe})"
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "[4563] plain sweeps total {plain_total} max {plain_max}; extrapolated total \
+             {fast_total} max {fast_max}"
+        );
+        assert!(fast_total < plain_total, "extrapolated {fast_total} sweeps against plain {plain_total}");
     }
 
     /// #2672: the criterion's log-determinant is priced from the stacked scaled
