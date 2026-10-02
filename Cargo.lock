@@ -3947,6 +3947,7 @@ dependencies = [
  "log",
  "memmap2",
  "ndarray 0.17.2",
+ "npyz 0.9.1",
  "qd",
  "rand 0.10.2",
  "rayon",

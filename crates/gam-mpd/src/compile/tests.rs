@@ -5,6 +5,9 @@ use ndarray::{Array2, ArrayView1, ArrayView2, array, s};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
+use gam_linalg::roundoff::SymmetricAssembly;
+
+use super::super::dense::solve;
 use super::super::lift::{TensorId, TensorRegistry, TieOrientation, UseMap, UseSiteId};
 use super::super::supports::{EvidenceStatus, ExactBasis};
 use super::super::test_support::test_governor;
@@ -214,6 +217,53 @@ fn the_weighted_metric_gives_its_closed_form_minimum() {
         .sum::<f64>()
         .sqrt();
     assert!((norm - direct).abs() <= band + 1e-15);
+}
+
+#[test]
+fn the_input_moment_metric_moves_off_target_outputs_least() {
+    let (registry, weight) = single_use(3, 5, 11);
+    let mut rng = StdRng::seed_from_u64(12);
+    // Off-target inputs and their second moment G, symmetrized so both triangles agree.
+    let off = uniform(&mut rng, 40, 5);
+    let raw = off.t().dot(&off) / 40.0;
+    let moment = (&raw + &raw.t()) * 0.5;
+    let inputs = uniform(&mut rng, 2, 5);
+    let changes = uniform(&mut rng, 2, 3);
+    let targets = set_targets(&inputs, &weight, &changes);
+    let mut declared = problem(
+        &registry,
+        weight.view(),
+        vec![linear(inputs.view(), targets.view(), ResponseClass::Span(inputs.view()))],
+    );
+    declared.metric = EditMetric::input_moment(moment.view(), SymmetricAssembly::Mirrored).expect("metric");
+    let report = compile_linear_site(&declared, "set", test_governor()).expect("compiles");
+    assert!(
+        matches!(report.compiled.realization, ControlRealization::ExactlyRealized { .. }),
+        "{:?}",
+        report.compiled.realization
+    );
+    let edit = dense(report.compiled.plan.as_ref().expect("plan"), "w", (3, 5));
+    // ΔW = Y (XᵀG⁻¹X)⁻¹ XᵀG⁻¹, with X the inputs as columns and Y the changes as columns.
+    let x = inputs.t().to_owned();
+    let g_inv_x = solve(moment.view(), x.view()).expect("solve");
+    let reduced = x.t().dot(&g_inv_x);
+    let coefficients = solve(reduced.view(), g_inv_x.t()).expect("solve");
+    let expected = changes.t().dot(&coefficients);
+    assert!(max_abs((&edit - &expected).view()) < 1e-11, "{edit:?} vs {expected:?}");
+    // Any other solution adds Z with Z X = 0 and has larger tr(ΔW G ΔWᵀ).
+    let mut z = uniform(&mut rng, 3, 5);
+    let projector = x.dot(&solve(x.t().dot(&x).view(), x.t()).expect("solve"));
+    z = &z - &z.dot(&projector);
+    let cost = |m: &Array2<f64>| (m.dot(&moment) * m).sum();
+    assert!(cost(&(&edit + &(z * 0.1))) > cost(&edit));
+    let (norm, band) = report.metric_norm.expect("norm");
+    assert!((norm - cost(&edit).sqrt()).abs() <= band + 1e-12);
+}
+
+#[test]
+fn a_singular_input_moment_is_refused() {
+    let moment = array![[1.0, 1.0], [1.0, 1.0]];
+    assert!(EditMetric::input_moment(moment.view(), SymmetricAssembly::Mirrored).is_err());
 }
 
 #[test]

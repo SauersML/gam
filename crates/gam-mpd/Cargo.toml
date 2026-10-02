@@ -33,6 +33,7 @@ statrs = "0.19.0"
 
 [dev-dependencies]
 gam-workspace-hack = { path = "../gam-workspace-hack" }
+npyz = "0.9.1"
 qd = "0.8.0"
 
 [lints.rust]

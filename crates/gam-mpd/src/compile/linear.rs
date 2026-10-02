@@ -39,13 +39,25 @@
 //!
 //! # The minimum-norm edit
 //!
-//! The metric is `‖D_r ΔW D_c‖_F` with declared positive diagonal scales ([`EditMetric`]);
-//! `D = I` is the Frobenius norm of the tensor as given. Frobenius "in canonical gauge" is
+//! The metric is `‖D_r ΔW Q D_c‖_F` with declared positive diagonal scales and an
+//! orthonormal column basis `Q` ([`EditMetric`]); `D = I`, `Q = I` is the Frobenius norm of
+//! the tensor as given. Frobenius "in canonical gauge" is
 //! this metric with the canonical gauge's diagonal elements as scales (a folded norm gain
 //! `γ` moves `W ↦ W diag(γ)`, so its Frobenius norm there is `col_scale = γ`), or the
-//! Frobenius norm of tensors passed already in canonical gauge. With `E = D_r ΔW D_c`, `X̃_r = D_c⁻¹ X_r`,
-//! `Ỹ_r = D_r Y_r`, `X̃_l = D_r⁻¹ X_l`, `Ỹ_l = D_c Y_l`, the constraints keep their form and
-//! the minimum-Frobenius `E` is
+//! Frobenius norm of tensors passed already in canonical gauge
+//! (`canonical::DecoderLayer::canonical`).
+//!
+//! A declared input moment `G = Q D_c² Qᵀ` ([`EditMetric::input_moment`]) makes the metric
+//! `tr(ΔW G ΔWᵀ)`: the mean squared change of the use's output over the inputs `G` is the
+//! second moment of. With `G` the moment of the off-target inputs, the minimum-norm edit
+//! is the one that moves the off-target outputs least in mean square; for right
+//! constraints alone it is `ΔW = Y (XᵀG⁻¹X)⁻¹ XᵀG⁻¹`, and at one column the rank-one model
+//! edit of Meng et al. (*Locating and Editing Factual Associations in GPT*, NeurIPS 2022,
+//! eq. 2). A Kronecker-factored output weight `G ⊗ H` has the same minimizer when every
+//! constraint fixes a whole output column, so no output metric is declared for it.
+//!
+//! With `E = D_r ΔW Q D_c`, `X̃_r = D_c⁻¹ Qᵀ X_r`, `Ỹ_r = D_r Y_r`, `X̃_l = D_r⁻¹ X_l`,
+//! `Ỹ_l = D_c Qᵀ Y_l`, the constraints keep their form and the minimum-Frobenius `E` is
 //!
 //! ```text
 //! E = A⁺C + (I − A⁺A) D B⁺ = U_l S_l⁻¹ V_lᵀ Ỹ_lᵀ + (I − U_l U_lᵀ) Ỹ_r V_r S_r⁻¹ U_rᵀ,
@@ -55,7 +67,10 @@
 //! values (above `factor_singular_band`). The general solution adds
 //! `(I − A⁺A) Z (I − B B⁺)`, which is Frobenius-orthogonal to both terms, so `E` is the
 //! minimum. It is stored as factors `[U_l | (I − U_lU_lᵀ)Ỹ_r V_r S_r⁻¹]` and
-//! `[Ỹ_l V_l S_l⁻¹ | U_r]`, unscaled by `D_r⁻¹` and `D_c⁻¹`, and never formed.
+//! `[Ỹ_l V_l S_l⁻¹ | U_r]`, unscaled by `D_r⁻¹` and `Q D_c⁻¹`, and never formed. The stored
+//! edit reads `x` through `D_c⁻¹ Q̂ᵀ` exactly as the constraints were posed, so a computed
+//! basis `Q̂` off orthonormal by `ω` moves only the metric the minimum is taken in, to the
+//! one of `Q̂⁻ᵀ`, within `ω` of the declared one.
 //!
 //! # Residual and allowance
 //!
@@ -79,13 +94,13 @@
 //! empirical beyond the sampled inputs.
 
 use gam_linalg::faer_ndarray::{fast_ab, fast_atb};
-use gam_linalg::roundoff::{accumulation_growth, basis_orthonormality_defect};
+use gam_linalg::roundoff::{SymmetricAssembly, accumulation_growth, basis_orthonormality_defect};
 use gam_linalg::utils::frobenius_norm;
 use gam_math::roundoff::{UNIT_ROUNDOFF, inflated};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, concatenate, s};
 
 use super::super::apply::FactoredEdit;
-use super::super::dense::svd;
+use super::super::dense::{eigh, svd};
 use super::super::lift::{TensorId, TensorRegistry, TieOrientation, UseMap, UseSiteId};
 use super::super::supports::{EvidenceStatus, ExactBasis};
 use super::ties::{TieConstraint, TieViolation, check_ties};
@@ -128,11 +143,15 @@ pub enum Requirement<'a> {
     },
 }
 
-/// The declared edit metric `‖diag(row_scale) ΔW diag(col_scale)‖_F`; absent scales are 1.
+/// The declared edit metric `‖diag(row_scale) ΔW Q diag(col_scale)‖_F`; absent scales are
+/// 1 and an absent basis `Q` is the identity.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EditMetric {
     row_scale: Option<Vec<f64>>,
     col_scale: Option<Vec<f64>>,
+    /// Orthonormal columns `Q` (`cols × cols`) the column scales act in, and the bound `ω`
+    /// on `‖QᵀQ − I‖₂` of the computed basis.
+    col_basis: Option<(Array2<f64>, f64)>,
 }
 
 impl EditMetric {
@@ -153,7 +172,35 @@ impl EditMetric {
                 });
             }
         }
-        Ok(Self { row_scale, col_scale })
+        Ok(Self {
+            row_scale,
+            col_scale,
+            col_basis: None,
+        })
+    }
+
+    /// `tr(ΔW G ΔWᵀ)` for the declared input second moment `G` (`cols × cols`, built as
+    /// `assembly` declares): the mean squared output change over the inputs `G` is the
+    /// moment of. Refused unless `G` is positive definite beyond its eigenvalue band, since
+    /// otherwise the minimum is not unique.
+    pub fn input_moment(moment: ArrayView2<'_, f64>, assembly: SymmetricAssembly) -> Result<Self, CompileError> {
+        let decomposed = eigh(moment, assembly, None)?;
+        let smallest = decomposed.values.iter().fold(f64::INFINITY, |m, v| m.min(*v));
+        if !(smallest > decomposed.band) {
+            return Err(CompileError::InvalidDeclaration {
+                what: "input moment",
+                reason: format!(
+                    "the smallest eigenvalue {smallest:e} is within its band {:e} of zero: the moment is singular and the minimum-norm edit is not unique",
+                    decomposed.band
+                ),
+            });
+        }
+        let omega = basis_orthonormality_defect(decomposed.vectors.view());
+        Ok(Self {
+            row_scale: None,
+            col_scale: Some(decomposed.values.iter().map(|value| value.sqrt()).collect()),
+            col_basis: Some((decomposed.vectors, omega)),
+        })
     }
 
     pub fn row_scale(&self) -> Option<&[f64]> {
@@ -162,6 +209,95 @@ impl EditMetric {
 
     pub fn col_scale(&self) -> Option<&[f64]> {
         self.col_scale.as_deref()
+    }
+
+    /// The orthonormal basis the column scales act in, when one is declared.
+    pub fn col_basis(&self) -> Option<ArrayView2<'_, f64>> {
+        self.col_basis.as_ref().map(|(basis, _)| basis.view())
+    }
+
+    fn columns(&self) -> Coordinates<'_> {
+        Coordinates {
+            basis: self.col_basis.as_ref().map(|(basis, omega)| (basis.view(), *omega)),
+            scale: self.col_scale(),
+        }
+    }
+
+    fn rows(&self) -> Coordinates<'_> {
+        Coordinates {
+            basis: None,
+            scale: self.row_scale(),
+        }
+    }
+}
+
+/// One side of the metric: inputs read in `x̃ = D⁻¹ Qᵀ x`, duals in `ỹ = D Qᵀ y`, and the
+/// scaled factor mapped back by `Q D⁻¹`; `Q = I` without a basis.
+#[derive(Clone, Copy)]
+struct Coordinates<'a> {
+    basis: Option<(ArrayView2<'a, f64>, f64)>,
+    scale: Option<&'a [f64]>,
+}
+
+impl Coordinates<'_> {
+    /// `D⁻¹ Qᵀ x` for `x` with one vector per column.
+    fn input(&self, x: ArrayView2<'_, f64>) -> Array2<f64> {
+        match self.basis {
+            Some((basis, _)) => scaled_rows(fast_atb(&basis, &x).view(), self.scale, true),
+            None => scaled_rows(x, self.scale, true),
+        }
+    }
+
+    /// `D Qᵀ y` for `y` with one vector per column.
+    fn dual(&self, y: ArrayView2<'_, f64>) -> Array2<f64> {
+        match self.basis {
+            Some((basis, _)) => scaled_rows(fast_atb(&basis, &y).view(), self.scale, false),
+            None => scaled_rows(y, self.scale, false),
+        }
+    }
+
+    /// `Q D⁻¹ r`: a scaled-coordinate factor back to the stored orientation.
+    fn original(&self, factor: ArrayView2<'_, f64>) -> Array2<f64> {
+        let unscaled = scaled_rows(factor, self.scale, true);
+        match self.basis {
+            Some((basis, _)) => fast_ab(&basis, &unscaled),
+            None => unscaled,
+        }
+    }
+
+    /// A scaled-coordinate direction `d̃ = D⁻¹ Qᵀ d` back to a unit vector `d`.
+    fn direction(&self, direction: ArrayView1<'_, f64>) -> Vec<f64> {
+        let unscaled = unscale_direction(direction, self.scale, true);
+        match self.basis {
+            Some((basis, _)) => {
+                let rotated = basis.dot(&Array1::from(unscaled));
+                let length = frobenius_norm(rotated.view());
+                rotated.mapv(|value| value / length).to_vec()
+            }
+            None => unscaled,
+        }
+    }
+
+    fn max_scale(&self) -> f64 {
+        self.scale.map_or(1.0, |values| values.iter().fold(0.0_f64, |m, v| m.max(*v)))
+    }
+
+    fn max_inverse_scale(&self) -> f64 {
+        self.scale.map_or(1.0, |values| values.iter().fold(0.0_f64, |m, v| m.max(1.0 / v)))
+    }
+
+    /// A bound on the Frobenius distance the basis puts between the computed and the exact
+    /// coordinates of `m` (one vector per column), in units of `m`'s own scale: the
+    /// `γ_n |Q̂ᵀ||m|` of the rotation's products, and `ω ‖m‖_F` of `Q̂Q̂ᵀ` off the identity.
+    /// Zero without a basis.
+    fn rotation_band(&self, m: ArrayView2<'_, f64>) -> f64 {
+        match self.basis {
+            Some((basis, omega)) => {
+                let products = frobenius_norm(fast_atb(&basis.mapv(f64::abs), &m.mapv(f64::abs)).view());
+                inflated(accumulation_growth(basis.nrows()) * products + omega * frobenius_norm(m), 2)
+            }
+            None => 0.0,
+        }
     }
 }
 
@@ -529,11 +665,11 @@ fn compatibility_violation(
 }
 
 /// Coverage of one requirement's class by the resolved range `U` of its side (scaled
-/// coordinates `D⁻¹`).
+/// coordinates `D⁻¹ Qᵀ`).
 fn coverage(
     class: &ResponseClass<'_>,
     width: usize,
-    scale: Option<&[f64]>,
+    coordinates: Coordinates<'_>,
     resolved: &Resolved,
 ) -> Result<Coverage, CompileError> {
     let basis = match class {
@@ -551,17 +687,16 @@ fn coverage(
             direction[axis] = 1.0;
             let along = resolved.u.t().dot(&direction);
             direction = direction - resolved.u.dot(&along);
-            let unscaled = unscale_direction(direction.view(), scale, true);
             return Ok(Coverage::Uncovered {
                 dimension: width - resolved.rank(),
-                direction: unscaled,
+                direction: coordinates.direction(direction.view()),
             });
         }
         ResponseClass::Span(basis) => basis,
     };
     require_shape("response class basis", (basis.nrows(), width), basis.dim())?;
     require_finite("response class basis", basis.iter().copied())?;
-    let class = scaled_rows(basis.t(), scale, true);
+    let class = coordinates.input(basis.t());
     let along = fast_ab(&resolved.u, &fast_atb(&resolved.u, &class));
     let outside = &class - &along;
     let decomposed = svd(outside.view(), false)?;
@@ -577,7 +712,7 @@ fn coverage(
     }
     Ok(Coverage::Uncovered {
         dimension,
-        direction: unscale_direction(decomposed.u.column(0), scale, true),
+        direction: coordinates.direction(decomposed.u.column(0)),
     })
 }
 
@@ -615,16 +750,22 @@ fn side_residual(
     let product_error =
         fast_ab(&writer_abs, &inner.mapv(f64::abs)) * accumulation_growth(terms) + fast_ab(&writer_abs, &inner_error);
     let residual = &product - &y;
-    let mut best = (0.0, 0.0, 0, 0);
-    let mut best_excess = f64::NEG_INFINITY;
+    // The entry most resolved above its band decides a refutation; when none is resolved,
+    // the entry of the largest upper bound is the one that states the residual, since an
+    // exactly-zero entry has the largest excess (zero) and would report a residual of 0.
+    let mut resolved = (f64::NEG_INFINITY, (0.0, 0.0, 0, 0));
+    let mut upper = (f64::NEG_INFINITY, (0.0, 0.0, 0, 0));
     for ((entry, column), value) in residual.indexed_iter().map(|(index, value)| (index, *value)) {
         let band = inflated(product_error[[entry, column]] + UNIT_ROUNDOFF * value.abs(), 1);
-        if value.abs() - band > best_excess || (best_excess == f64::NEG_INFINITY) {
-            best_excess = value.abs() - band;
-            best = (value.abs(), band, column, entry);
+        let found = (value.abs(), band, column, entry);
+        if value.abs() - band > resolved.0 {
+            resolved = (value.abs() - band, found);
+        }
+        if value.abs() + band > upper.0 {
+            upper = (value.abs() + band, found);
         }
     }
-    best
+    if resolved.0 > 0.0 { resolved.1 } else { upper.1 }
 }
 
 /// A set-type target turned into the change the edit must make, `targets − inputs · map`
@@ -740,6 +881,9 @@ pub fn compile_linear_site(
     if let Some(scale) = problem.metric.col_scale() {
         require_shape("metric column scale", (cols, 1), (scale.len(), 1))?;
     }
+    if let Some(basis) = problem.metric.col_basis() {
+        require_shape("metric column basis", (cols, cols), basis.dim())?;
+    }
     let mut right = Side::empty(cols, rows);
     let mut left = Side::empty(rows, cols);
     let mut named = Vec::new();
@@ -813,12 +957,12 @@ pub fn compile_linear_site(
         .filter(|site| !named.contains(site))
         .cloned()
         .collect();
-    let row_scale = problem.metric.row_scale();
-    let col_scale = problem.metric.col_scale();
-    let right_x = scaled_rows(right.x.view(), col_scale, true);
-    let right_y = scaled_rows(right.y.view(), row_scale, false);
-    let left_x = scaled_rows(left.x.view(), row_scale, true);
-    let left_y = scaled_rows(left.y.view(), col_scale, false);
+    let row_coordinates = problem.metric.rows();
+    let col_coordinates = problem.metric.columns();
+    let right_x = col_coordinates.input(right.x.view());
+    let right_y = row_coordinates.dual(right.y.view());
+    let left_x = row_coordinates.input(left.x.view());
+    let left_y = col_coordinates.dual(left.y.view());
     let right_resolved = Resolved::of(right_x.view())?;
     let left_resolved = Resolved::of(left_x.view())?;
     let domain_classes = |covered: bool| LinearSiteDomain {
@@ -833,9 +977,9 @@ pub fn compile_linear_site(
             Requirement::Linear { site, class, .. } => {
                 let read = registry.resolve_use_site(site)?;
                 match read.map {
-                    UseMap::Linear(TieOrientation::Transpose) => coverage(class, rows, row_scale, &left_resolved),
+                    UseMap::Linear(TieOrientation::Transpose) => coverage(class, rows, row_coordinates, &left_resolved),
                     UseMap::Linear(TieOrientation::Identity) | UseMap::Stored => {
-                        coverage(class, cols, col_scale, &right_resolved)
+                        coverage(class, cols, col_coordinates, &right_resolved)
                     }
                 }
             }
@@ -954,17 +1098,22 @@ pub fn compile_linear_site(
     };
     let edit_upper = inflated(metric_norm + metric_band, 1);
 
-    let delta_left = scaled_rows(scaled_left.view(), row_scale, true);
-    let delta_right = scaled_rows(scaled_right.view(), col_scale, true);
-    let inv_max = |scale: Option<&[f64]>| scale.map_or(1.0, |values| values.iter().fold(0.0_f64, |m, v| m.max(1.0 / v)));
-    let target_mass = |side: &Side, y: &Array2<f64>, scale: Option<&[f64]>| {
-        let declared = side.radius.iter().fold(0.0_f64, |m, r| m.max(*r)) * scale.map_or(1.0, |v| v.iter().fold(0.0, |m: f64, s| m.max(*s)));
+    let delta_left = row_coordinates.original(scaled_left.view());
+    let delta_right = col_coordinates.original(scaled_right.view());
+    let target_mass = |side: &Side, y: &Array2<f64>, coordinates: Coordinates<'_>| {
+        let declared = side.radius.iter().fold(0.0_f64, |m, r| m.max(*r)) * coordinates.max_scale();
         accumulation_growth(side.columns() + 2 * terms + 2) * frobenius_norm(y.view()) + declared * (side.columns() as f64).sqrt()
     };
+    // A column basis reads the right inputs, and writes the left targets, through a rotation
+    // whose rounding the stored edit carries: `‖E‖₂` times the input coordinates' error on
+    // the right, the dual coordinates' error on the left, and `Q̂Q̂ᵀ` off the identity where
+    // a left target returns through the basis.
+    let right_rotation = col_coordinates.max_inverse_scale() * col_coordinates.rotation_band(right.x.view());
+    let left_rotation = col_coordinates.max_scale() * col_coordinates.rotation_band(left.y.view());
     let right_allowance = inflated(
-        inv_max(row_scale)
-            * (edit_upper * right_resolved.backward()
-                + target_mass(&right, &right_y, row_scale)
+        row_coordinates.max_inverse_scale()
+            * (edit_upper * (right_resolved.backward() + right_rotation)
+                + target_mass(&right, &right_y, row_coordinates)
                 + if left_resolved.rank() > 0 {
                     compatibility_upper / (left_resolved.s[left_resolved.rank() - 1] - left_resolved.band).max(f64::MIN_POSITIVE)
                 } else {
@@ -973,9 +1122,10 @@ pub fn compile_linear_site(
         4,
     );
     let left_allowance = inflated(
-        inv_max(col_scale)
+        col_coordinates.max_inverse_scale()
             * (edit_upper * (left_resolved.backward() + (2.0 + left_resolved.omega) * left_resolved.omega * left_resolved.sigma_max)
-                + target_mass(&left, &left_y, col_scale)),
+                + target_mass(&left, &left_y, col_coordinates)
+                + left_rotation),
         4,
     );
     let allowance = [right_allowance, left_allowance];
