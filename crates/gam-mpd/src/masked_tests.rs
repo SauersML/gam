@@ -134,7 +134,8 @@ fn splitting_a_library_keeps_its_sum_and_lists_both_halves_where_the_piece_was_o
     let rows = 20;
     let x = Array2::from_shape_fn((rows, WIDTH), |(t, j)| noise(1000 + 5 * t + j));
     let mask = Array2::from_shape_fn((rows, pieces), |(t, c)| if c == 2 && t > 0 { 0.0 } else { 1.0 });
-    let (grown, masks) = split(&library, &x, &mask);
+    let (grown, masks, origin) = split(&library, &x, &mask);
+    assert_eq!(origin, vec![0, 0, 1, 1, 2]);
     // Pieces 0 and 1 are listed by every input and split; piece 2 by one input and kept whole.
     assert_eq!(grown.v.nrows(), 5);
     assert_eq!(masks.dim(), (rows, 5));
@@ -183,4 +184,20 @@ fn a_diagonal_gain_is_a_column_scale_forward_and_backward() {
     let moved = trace.values[2].dot(&tangent.t());
     let right: f64 = back[3].as_ref().expect("a cotangent").iter().zip(moved.iter()).map(|(a, b)| a * b).sum();
     assert!((left - right).abs() <= 1e-9 * left.abs().max(1.0), "{left} against {right}");
+}
+
+#[test]
+fn a_set_that_carries_over_from_the_previous_input_is_cheap_to_explain() {
+    use super::masked::Context;
+    // One site of 16 pieces; inputs 0..8 form one sequence whose set {2, 5, 11} never changes.
+    let rows = 8;
+    let mask = Array2::from_shape_fn((rows, 16), |(_, c)| if [2, 5, 11].contains(&c) { 1.0 } else { 0.0 });
+    let previous: Vec<Option<usize>> = (0..rows).map(|r| r.checked_sub(1)).collect();
+    let mut context = Context::new(&[16]);
+    context.absorb(std::slice::from_ref(&mask), &previous);
+    let coder = context.coder(previous);
+    let bits = coder.bits(std::slice::from_ref(&mask));
+    // The first input lists its set; every later one only confirms that three pieces stay on.
+    assert!(bits[1] < bits[0], "{bits:?}");
+    assert!(bits[1] < 1.0, "{bits:?}");
 }

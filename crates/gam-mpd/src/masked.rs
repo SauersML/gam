@@ -491,6 +491,142 @@ pub fn code(kl: &Array1<f64>, listing: &Array1<f64>, observations: f64) -> Array
     listing + &(kl * (observations / std::f64::consts::LN_2))
 }
 
+/// The explanation code of a sequence's sets, conditional on context (module note, "The code and
+/// its fit"): an input whose sequence has a previous input sends, for each piece on there, whether
+/// it stays on (a Bernoulli at the piece's own stay rate), then lists its new pieces at their
+/// frequencies among new activations; the first input of a sequence lists its whole set. Every
+/// rate is the Krichevsky–Trofimov estimate from the counts of the sets selected so far, so the
+/// code is a valid prefix code given those counts, and an always-on piece costs almost nothing.
+pub struct Coder {
+    /// Listing bits of a piece listed new.
+    pub costs: Vec<Array1<f64>>,
+    /// Per piece, the probability it stays on from one input to the next.
+    pub stay: Vec<Array1<f64>>,
+    /// Per input, the previous input of its sequence.
+    pub previous: Vec<Option<usize>>,
+}
+
+/// The counts behind a [`Coder`]: per piece, transitions from on, and new activations.
+#[derive(Clone, Debug)]
+pub struct Context {
+    pub stayed: Vec<Array1<f64>>,
+    pub was_on: Vec<Array1<f64>>,
+    pub new: Vec<Array1<f64>>,
+}
+
+impl Context {
+    pub fn new(pieces: &[usize]) -> Self {
+        let zeros = || pieces.iter().map(|p| Array1::zeros(*p)).collect::<Vec<_>>();
+        Self { stayed: zeros(), was_on: zeros(), new: zeros() }
+    }
+
+    /// Fold one sequence's sets in.
+    pub fn absorb(&mut self, masks: &[Array2<f64>], previous: &[Option<usize>]) {
+        for (k, m) in masks.iter().enumerate() {
+            for r in 0..m.nrows() {
+                for c in 0..m.ncols() {
+                    let now = m[[r, c]] > 0.0;
+                    match previous[r] {
+                        Some(p) if m[[p, c]] > 0.0 => {
+                            self.was_on[k][c] += 1.0;
+                            if now {
+                                self.stayed[k][c] += 1.0;
+                            }
+                        }
+                        _ => {
+                            if now {
+                                self.new[k][c] += 1.0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The counts of a grown library: each new piece starts with its original piece's counts
+    /// (`origins[k][c]` per site).
+    pub fn grown(&self, origins: &[Vec<usize>]) -> Self {
+        let map = |counts: &[Array1<f64>]| -> Vec<Array1<f64>> {
+            counts.iter().zip(origins).map(|(c, o)| o.iter().map(|&i| c[i]).collect()).collect()
+        };
+        Self { stayed: map(&self.stayed), was_on: map(&self.was_on), new: map(&self.new) }
+    }
+
+    /// The coder these counts give, for inputs whose previous inputs are `previous`.
+    pub fn coder(&self, previous: Vec<Option<usize>>) -> Coder {
+        let stay = self.stayed.iter().zip(&self.was_on).map(|(s, w)| (s + 0.5) / &(w + 1.0)).collect();
+        Coder { costs: costs_from_counts(&self.new), stay, previous }
+    }
+}
+
+impl Coder {
+    /// Each input's explanation bits.
+    pub fn bits(&self, masks: &[Array2<f64>]) -> Array1<f64> {
+        let rows = masks.first().map_or(0, |m| m.nrows());
+        let mut out = Array1::<f64>::zeros(rows);
+        for r in 0..rows {
+            let mut fresh = 0usize;
+            for (k, m) in masks.iter().enumerate() {
+                for c in 0..m.ncols() {
+                    let now = m[[r, c]] > 0.0;
+                    match self.previous[r] {
+                        Some(p) if m[[p, c]] > 0.0 => {
+                            let q = self.stay[k][c];
+                            out[r] -= if now { q.log2() } else { (1.0 - q).log2() };
+                        }
+                        _ => {
+                            if now {
+                                out[r] += self.costs[k][c];
+                                fresh += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            out[r] -= (1..=fresh).map(|i| (i as f64).log2()).sum::<f64>();
+        }
+        out
+    }
+
+    /// The new pieces of input `r` (on there, not on at its previous input).
+    fn fresh(&self, masks: &[Array2<f64>], r: usize) -> usize {
+        masks
+            .iter()
+            .map(|m| (0..m.ncols()).filter(|&c| m[[r, c]] > 0.0 && self.previous[r].is_none_or(|p| m[[p, c]] <= 0.0)).count())
+            .sum()
+    }
+
+    /// The change of input `r`'s own bits when entry `(k, c)` flips, with `fresh` new pieces now.
+    fn marginal(&self, masks: &[Array2<f64>], r: usize, k: usize, c: usize, fresh: usize) -> f64 {
+        let on = masks[k][[r, c]] > 0.0;
+        match self.previous[r] {
+            Some(p) if masks[k][[p, c]] > 0.0 => {
+                let q = self.stay[k][c];
+                let (stay, leave) = (-q.log2(), -(1.0 - q).log2());
+                if on { leave - stay } else { stay - leave }
+            }
+            _ => {
+                if on {
+                    -(self.costs[k][c] - (fresh as f64).max(1.0).log2())
+                } else {
+                    self.costs[k][c] - ((fresh + 1) as f64).log2()
+                }
+            }
+        }
+    }
+}
+
+/// Each input's previous input in its sequence (none at a sequence's first position).
+pub fn previous_inputs(inputs: &FamilyInputs) -> Vec<Option<usize>> {
+    match &inputs.layout {
+        Some(layout) => (0..inputs.rows)
+            .map(|r| (r > 0 && layout.sequence[r - 1] == layout.sequence[r] && layout.position[r] > 0).then(|| r - 1))
+            .collect(),
+        None => vec![None; inputs.rows],
+    }
+}
+
 /// Selection (module note): rounds of predicted flips, each input keeping its own only when its
 /// exact code falls, until no input changes. `budget[r]` caps an input's flips per round: halved
 /// when its flips are refused, doubled when kept. Returns the masks and the final exact KL.
@@ -499,7 +635,7 @@ pub fn select(
     base: &FamilyInputs,
     target: &Array2<f64>,
     mut masks: Vec<Array2<f64>>,
-    costs: &[Array1<f64>],
+    coder: &Coder,
     observations: f64,
     samples: usize,
 ) -> Result<(Vec<Array2<f64>>, Array1<f64>), String> {
@@ -520,20 +656,20 @@ pub fn select(
             curvature = Some(fisher(masked, &family, &trace, samples, 0x5EED + round)?);
         }
         let curvature = curvature.as_ref().ok_or("no curvature")?;
-        let listing_now = listing_bits(&masks, costs);
+        let listing_now = coder.bits(&masks);
         let before = code(&kl_now, &listing_now, observations);
         // Each input's predicted flips, best first, within its budget.
         let mut proposed = masks.clone();
         let mut flipped = vec![0usize; rows];
         for r in 0..rows {
-            let active: usize = masks.iter().map(|m| m.row(r).iter().filter(|x| **x > 0.0).count()).sum();
+            let fresh = coder.fresh(&masks, r);
             let mut candidates: Vec<(f64, usize, usize)> = Vec::new();
             for (k, ((g, _, _), (h, _))) in grads.iter().zip(curvature.iter()).enumerate() {
                 for c in 0..g.ncols() {
                     let on = masks[k][[r, c]] > 0.0;
                     let delta = if on { -1.0 } else { 1.0 };
                     let kl_change = g[[r, c]] * delta + 0.5 * h[[r, c]];
-                    let listing_change = if on { -(costs[k][c] - (active as f64).max(1.0).log2()) } else { costs[k][c] - ((active + 1) as f64).log2() };
+                    let listing_change = coder.marginal(&masks, r, k, c, fresh);
                     let net = scale * kl_change + listing_change;
                     if net < 0.0 {
                         candidates.push((net, k, c));
@@ -551,7 +687,7 @@ pub fn select(
         }
         let family = masked.family(base, &proposed);
         let (kl_new, _, _) = forward(masked, &family, target)?;
-        let after = code(&kl_new, &listing_bits(&proposed, costs), observations);
+        let after = code(&kl_new, &coder.bits(&proposed), observations);
         let mut kept = 0usize;
         let mut saved = 0.0;
         for r in 0..rows {
@@ -731,14 +867,15 @@ pub fn step_pieces(
 /// (away from `v_c`'s own), and `δ = β p` along that direction with `β` the least-squares fit of
 /// `δ · (x_t − μ) ≈ s_t a_t / 2`: then one half carries the piece on each side and the other half
 /// is nearly silent there, so the selection can list one where it listed both. Pieces listed by
-/// fewer than two inputs are kept whole. Returns the grown library and the masks with both halves
-/// on wherever the piece was on.
-pub fn split(library: &Library, x: &Array2<f64>, mask: &Array2<f64>) -> (Library, Array2<f64>) {
+/// fewer than two inputs are kept whole. Returns the grown library, the masks with both halves on
+/// wherever the piece was on, and each new piece's original piece.
+pub fn split(library: &Library, x: &Array2<f64>, mask: &Array2<f64>) -> (Library, Array2<f64>, Vec<usize>) {
     let (pieces, d_in) = library.v.dim();
     let centred = x - &library.mean;
     let mut v_rows: Vec<Array1<f64>> = Vec::new();
     let mut u_rows: Vec<Array1<f64>> = Vec::new();
     let mut columns: Vec<Array1<f64>> = Vec::new();
+    let mut origin: Vec<usize> = Vec::new();
     for c in 0..pieces {
         let v = library.v.row(c).to_owned();
         let u = library.u.row(c).to_owned();
@@ -748,6 +885,7 @@ pub fn split(library: &Library, x: &Array2<f64>, mask: &Array2<f64>) -> (Library
             v_rows.push(v);
             u_rows.push(u);
             columns.push(on);
+            origin.push(c);
             continue;
         }
         let y = centred.select(Axis(0), &members);
@@ -779,11 +917,12 @@ pub fn split(library: &Library, x: &Array2<f64>, mask: &Array2<f64>) -> (Library
         u_rows.push(u);
         columns.push(on.clone());
         columns.push(on);
+        origin.extend([c, c]);
     }
     let stack = |rows: &[Array1<f64>]| -> Array2<f64> {
         let width = rows.first().map_or(0, |r| r.len());
         Array2::from_shape_fn((rows.len(), width), |(i, j)| rows[i][j])
     };
     let masks = Array2::from_shape_fn((mask.nrows(), columns.len()), |(t, c)| columns[c][t]);
-    (Library { v: stack(&v_rows), u: stack(&u_rows), mean: library.mean.clone() }, masks)
+    (Library { v: stack(&v_rows), u: stack(&u_rows), mean: library.mean.clone() }, masks, origin)
 }

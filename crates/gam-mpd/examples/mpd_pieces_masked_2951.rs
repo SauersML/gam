@@ -24,7 +24,7 @@
 
 use gam_mpd::codec::prefix_integer_len_bits;
 use gam_mpd::import::import_language_model;
-use gam_mpd::masked::{Library, Masked, Running, costs_from_counts, listing_bits, matrix, read_values, select, sites, split, step_pieces};
+use gam_mpd::masked::{Context, Library, Masked, Running, matrix, previous_inputs, read_values, select, sites, split, step_pieces};
 use gam_mpd::operator_program::FamilyInputs;
 use gam_mpd::pieces::fisher_svd;
 use ndarray::{Array1, Array2, Axis};
@@ -88,7 +88,8 @@ fn main() -> Result<(), String> {
     let imported = import_language_model(&export, train + eval, context)?;
     let model = &imported.program;
     let family = &imported.contract.family;
-    let sequence = |s: usize| -> FamilyInputs { family.select(&(s * context..(s + 1) * context).collect::<Vec<_>>()) };
+    let context_rows = context;
+    let sequence = |s: usize| -> FamilyInputs { family.select(&(s * context_rows..(s + 1) * context_rows).collect::<Vec<_>>()) };
     let target_of = |inputs: &FamilyInputs| -> Result<Array2<f64>, String> {
         Ok(model.execute(inputs, false).map_err(|e| e.to_string())?.values[model.output].clone())
     };
@@ -127,7 +128,7 @@ fn main() -> Result<(), String> {
     let mut masked = Masked::build(model, chosen, libraries)?;
     let samples = 2;
     // The firing counts of every set selected so far, and the costs they give.
-    let mut counts: Vec<Array1<f64>> = masked.libraries.iter().map(|l| Array1::zeros(l.v.nrows())).collect();
+    let mut context = Context::new(&masked.libraries.iter().map(|l| l.v.nrows()).collect::<Vec<_>>());
     // A sequence's start: the pieces whose own second-order KL bits, `n a² uᵀBu / (2 ln 2)` with
     // `a = v · (x − μ)` on the clean forward, exceed their current listing cost.
     let start_masks = |inputs: &FamilyInputs, libraries: &[Library], costs: &[Array1<f64>]| -> Result<Vec<Array2<f64>>, String> {
@@ -148,9 +149,9 @@ fn main() -> Result<(), String> {
     if start == "wsvd2" {
         let inputs = sequence(0);
         let target = target_of(&inputs)?;
-        let costs = costs_from_counts(&counts);
-        let begin = start_masks(&inputs, &masked.libraries, &costs)?;
-        let (masks, _) = select(&masked, &inputs, &target, begin, &costs, observations, samples)?;
+        let coder = context.coder(previous_inputs(&inputs));
+        let begin = start_masks(&inputs, &masked.libraries, &coder.costs)?;
+        let (masks, _) = select(&masked, &inputs, &target, begin, &coder, observations, samples)?;
         let trace = model.execute(&inputs, false).map_err(|e| e.to_string())?;
         let mut grown = Vec::new();
         for (k, library) in masked.libraries.iter().enumerate() {
@@ -159,8 +160,10 @@ fn main() -> Result<(), String> {
         }
         eprintln!("grown to {} pieces", grown.iter().map(|l| l.v.nrows()).sum::<usize>());
         masked = Masked::build(model, original_sites.clone(), grown)?;
-        counts = masked.libraries.iter().map(|l| Array1::zeros(l.v.nrows())).collect();
+        context = Context::new(&masked.libraries.iter().map(|l| l.v.nrows()).collect::<Vec<_>>());
     }
+    // The bits of one real of a library piece: they are sent in single precision.
+    const BITS_PER_REAL: f64 = 32.0;
     let mut running = Running::default();
     let mut points = Vec::new();
     let mut previous = f64::INFINITY;
@@ -171,13 +174,13 @@ fn main() -> Result<(), String> {
             let started = std::time::Instant::now();
             let inputs = sequence(s);
             let target = target_of(&inputs)?;
-            let costs = costs_from_counts(&counts);
-            let begin = start_masks(&inputs, &masked.libraries, &costs)?;
-            let (masks, kl) = select(&masked, &inputs, &target, begin, &costs, observations, samples)?;
-            pass_code += (listing_bits(&masks, &costs).sum() + kl.sum() * observations / std::f64::consts::LN_2) / inputs.rows as f64;
-            for (count, m) in counts.iter_mut().zip(&masks) {
-                *count += &m.sum_axis(Axis(0));
-            }
+            let previous_rows = previous_inputs(&inputs);
+            let coder = context.coder(previous_rows.clone());
+            let begin = start_masks(&inputs, &masked.libraries, &coder.costs)?;
+            let (masks, kl) = select(&masked, &inputs, &target, begin, &coder, observations, samples)?;
+            let sequence_code = (coder.bits(&masks).sum() + kl.sum() * observations / std::f64::consts::LN_2) / inputs.rows as f64;
+            pass_code += sequence_code;
+            context.absorb(&masks, &previous_rows);
             let step = step_pieces(&mut masked, &inputs, &target, &masks, samples, 0xF00D + (pass * train + s) as u64, &mut running)?;
             let (l0, kl_sum, _) = sums(&masks, &kl);
             log::info!(
@@ -191,14 +194,54 @@ fn main() -> Result<(), String> {
             // end the full eval set.
             let last = s + 1 == train;
             if last || (s + 1) % report_every == 0 {
-                let costs = costs_from_counts(&counts);
+                // Growth, tested by the code: every piece this sequence lists two ways is split, the
+                // sequence is selected again, and the split stays when its explanation and KL bits
+                // per token fall by more than the added pieces' library bits spread over every
+                // token trained so far.
+                let trace = model.execute(&inputs, false).map_err(|e| e.to_string())?;
+                let mut grown = Vec::new();
+                let mut origins = Vec::new();
+                let mut grown_masks = Vec::new();
+                let mut added_reals = 0.0;
+                for (k, library) in masked.libraries.iter().enumerate() {
+                    let x = read_values(&trace, &original_sites[k])?;
+                    let (bigger, m, origin) = split(library, &x, &masks[k]);
+                    added_reals += ((bigger.v.nrows() - library.v.nrows()) * (library.v.ncols() + library.u.ncols())) as f64;
+                    grown.push(bigger);
+                    grown_masks.push(m);
+                    origins.push(origin);
+                }
+                let candidate = Masked::build(model, original_sites.clone(), grown)?;
+                let candidate_context = context.grown(&origins);
+                let candidate_coder = candidate_context.coder(previous_rows.clone());
+                let (candidate_masks, candidate_kl) = select(&candidate, &inputs, &target, grown_masks, &candidate_coder, observations, samples)?;
+                let candidate_code = (candidate_coder.bits(&candidate_masks).sum() + candidate_kl.sum() * observations / std::f64::consts::LN_2) / inputs.rows as f64;
+                // The library as it stands after this sequence's step, on the same sets.
+                let now_kl = gam_mpd::masked::forward(&masked, &masked.family(&inputs, &masks), &target)?.0;
+                let sequence_code = (coder.bits(&masks).sum() + now_kl.sum() * observations / std::f64::consts::LN_2) / inputs.rows as f64;
+                let tokens_trained = ((pass * train + s + 1) * context_rows) as f64;
+                let library_bits = added_reals * BITS_PER_REAL / tokens_trained;
+                let kept = candidate_code + library_bits < sequence_code;
+                log::info!(
+                    "split test: {:.1} -> {:.1} bits per token, library {:.1} bits per token; {}",
+                    sequence_code,
+                    candidate_code,
+                    library_bits,
+                    if kept { "kept" } else { "refused" }
+                );
+                if kept {
+                    masked = candidate;
+                    context = candidate_context;
+                }
                 let evaluated = if last { eval } else { eval.min(4) };
-                let (mut l0, mut kl, mut bits, mut tokens) = (0.0, 0.0, 0.0, 0.0);
+                let (mut l0, mut kl, mut bits, mut tokens, mut explanation) = (0.0, 0.0, 0.0, 0.0, 0.0);
                 for e in 0..evaluated {
                     let inputs = sequence(train + e);
                     let target = target_of(&inputs)?;
-                    let begin = start_masks(&inputs, &masked.libraries, &costs)?;
-                    let (masks, values) = select(&masked, &inputs, &target, begin, &costs, observations, samples)?;
+                    let coder = context.coder(previous_inputs(&inputs));
+                    let begin = start_masks(&inputs, &masked.libraries, &coder.costs)?;
+                    let (masks, values) = select(&masked, &inputs, &target, begin, &coder, observations, samples)?;
+                    explanation += coder.bits(&masks).sum();
                     let (a, b, c) = sums(&masks, &values);
                     l0 += a;
                     kl += b;
@@ -207,6 +250,8 @@ fn main() -> Result<(), String> {
                 }
                 let point = json!({
                     "l0": l0 / tokens, "kl": kl / tokens, "bits": bits / tokens,
+                    "context_bits": explanation / tokens,
+                    "pieces": masked.libraries.iter().map(|l| l.v.nrows()).sum::<usize>(),
                     "pass": pass, "sequences_trained": pass * train + s + 1, "observations": observations,
                     "eval_sequences": evaluated,
                 });
