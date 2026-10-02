@@ -359,8 +359,12 @@ pub fn decompose_from(
 /// `contract.logits(model)` (restricted to the family's rows when the family is a selection), so a
 /// caller scoring many families against one model runs the model once. `starts` is the start set
 /// (the model among them): the search runs from each distinct start, shortest first, each within
-/// `budget`, and the result with the least certified upper end of its total is returned. The search
-/// itself only moves to proven-shorter programs, so the result is never longer than any start.
+/// `budget`. The search itself only moves to proven-shorter programs, so no result is longer than
+/// its start.
+///
+/// Of the results, those not proven longer than the shortest (their certified totals overlap) are
+/// equally short as far as the code can tell; the one with the least structure bits is returned:
+/// the knee of the structure function, where more structure no longer buys a proven-shorter total.
 pub fn decompose_with_reference(
     reference: &BandedMatrix,
     starts: &[&OperatorProgram],
@@ -394,14 +398,21 @@ pub fn decompose_with_reference(
         scored.push((start, score));
     }
     scored.sort_by(|a, b| a.1.total_upper().total_cmp(&b.1.total_upper()));
-    let mut best: Option<Decomposition> = None;
+    let mut results = Vec::with_capacity(scored.len());
     for (start, score) in scored {
-        let result = search(&reference, start.clone(), score, contract, library, budget)?;
-        if best.as_ref().is_none_or(|b| result.score.total_upper() < b.score.total_upper()) {
-            best = Some(result);
-        }
+        results.push(search(&reference, start.clone(), score, contract, library, budget)?);
     }
-    best.ok_or_else(|| EngineError::UnresolvedStart("an empty start set".to_string()))
+    let shortest = results.iter().map(|r| r.score.total_upper()).fold(f64::INFINITY, f64::min);
+    results
+        .into_iter()
+        .filter(|r| r.score.total_lower() <= shortest)
+        .min_by(|a, b| {
+            a.score
+                .structure_bits
+                .cmp(&b.score.structure_bits)
+                .then_with(|| a.score.total_upper().total_cmp(&b.score.total_upper()))
+        })
+        .ok_or_else(|| EngineError::UnresolvedStart("an empty start set".to_string()))
 }
 
 /// The search from one start program whose certified score is `start_score`.
@@ -430,6 +441,8 @@ fn search(
             }
         }
         let base_total = current.total();
+        // Screening does not re-derive the explanations; it charges the current program's.
+        let explanation_bits = current.explanation.bits;
         let mut screened: Vec<Screened> = Vec::new();
         for proposal in proposals {
             if refused.contains(&proposal.description) {
@@ -447,7 +460,7 @@ fn search(
             } else {
                 candidate.execute(&contract.family, false)?.values[candidate.output].clone()
             })?;
-            let mut saving = base_total - (bits + screened_data_bits(&reference, &logits, contract.observations));
+            let mut saving = base_total - (bits + explanation_bits + screened_data_bits(&reference, &logits, contract.observations));
             let mut proposal = proposal;
             if saving <= 0.0
                 && bits < base_total
@@ -457,7 +470,8 @@ fn search(
                 // The compound move: the edit and a refit of the readout's reals, judged together.
                 let refit_bits = refit.code_bits()? as f64;
                 let refit_logits = contract.distributions(&refit.execute(&contract.family, false)?.values[refit.output])?;
-                let refit_saving = base_total - (refit_bits + screened_data_bits(&reference, &refit_logits, contract.observations));
+                let refit_saving =
+                    base_total - (refit_bits + explanation_bits + screened_data_bits(&reference, &refit_logits, contract.observations));
                 if refit_saving > 0.0 {
                     saving = refit_saving;
                     proposal = Proposal {

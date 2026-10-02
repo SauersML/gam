@@ -14,6 +14,26 @@
 //! the amount of behaviour explained, the rows and the observations `n` of each, which are a
 //! declaration of the data and not a tolerance.
 //!
+//! # Three parts: structure, explanations, precision
+//!
+//! The program's message splits into its structure (bases, interfaces, present blocks, rules,
+//! wiring, laws) and its precision (each lattice's fraction bits and indices,
+//! `operator_program::CodeAccount`); rounding a program changes only the second. The behaviour of
+//! each input is then explained by which of the program's gated rule instances fire on it: every
+//! group of a pointwise node whose law is not the zero law is an instance, active on an input when
+//! its value there is not identically zero. The explanations of the family are sent once per input
+//! (not per observation) in the Krichevsky–Trofimov code of each instance's activity sequence,
+//! `−log₂ [Γ(k + ½) Γ(N − k + ½) / (π Γ(N + 1))]` bits for an instance active on `k` of the `N`
+//! inputs: the library of rules is paid once and amortised, and each input pays for how
+//! unpredictable its active set is. The score is the total
+//!
+//! ```text
+//! L(structure) + L(precision) + Σ_x L(explanation of x | program) + n Σ_rows KL/ln 2.
+//! ```
+//!
+//! An activity the forward-error bands leave open (an interval of pre-activations that straddles
+//! the law's zero set) is counted both ways: the explanation term carries the resulting interval.
+//!
 //! # Evidence
 //!
 //! Each row's `KL` is [`verify::compare_logit_row`]'s over both logit boxes: an exact value with its
@@ -57,7 +77,7 @@
 
 use super::bounds::BoundError;
 use super::bounds::total_variation_over_logit_boxes;
-use super::operator_program::{Declarations, EncodedProgram, FamilyInputs, Node, OperatorProgram, ProgramError};
+use super::operator_program::{Declarations, EncodedProgram, FamilyInputs, Law, Node, OperatorProgram, ProgramError, Trace};
 use super::precision::DecodableArtifact;
 use super::secant::BandedMatrix;
 use super::supports::{EvidenceStatus, EvidenceStatusError, ExactBasis, Extremum};
@@ -65,6 +85,7 @@ use super::verify::{RowValue, compare_logit_row, exhaustive_supremum};
 use gam_linalg::roundoff::accumulation_growth;
 use ndarray::Array2;
 use statrs::distribution::{Beta, ContinuousCDF};
+use statrs::function::gamma::ln_gamma;
 use std::collections::BTreeMap;
 use std::f64::consts::LN_2;
 use std::fmt;
@@ -138,11 +159,111 @@ pub struct ContractEvaluation {
     pub max_tv_upper: f64,
 }
 
-/// A program's two-part code under the contract.
+/// Which gated rule instances fire on each input of the family (module note, "Three parts").
+#[derive(Clone, Debug, PartialEq)]
+pub struct Explanation {
+    /// The gated instances: groups of pointwise nodes whose law is not the zero law.
+    pub instances: usize,
+    /// The explanations' code length at the computed activities, and a proven interval around it.
+    pub bits: f64,
+    pub bits_lower: f64,
+    pub bits_upper: f64,
+    /// Per input, the instances proven active and those whose activity the bands leave open.
+    pub active: Vec<u32>,
+    pub open: Vec<u32>,
+}
+
+impl Explanation {
+    /// The mean number of instances proven active per input: the size of an input's computation.
+    pub fn mean_active(&self) -> f64 {
+        if self.active.is_empty() {
+            return 0.0;
+        }
+        self.active.iter().map(|a| f64::from(*a)).sum::<f64>() / self.active.len() as f64
+    }
+
+    /// The explanation code length per input.
+    pub fn bits_per_input(&self) -> f64 {
+        if self.active.is_empty() { 0.0 } else { self.bits / self.active.len() as f64 }
+    }
+}
+
+/// The Krichevsky–Trofimov code length, in bits, of a binary sequence of length `n` with `k` ones.
+fn kt_bits(k: f64, n: f64) -> f64 {
+    (std::f64::consts::PI.ln() + ln_gamma(n + 1.0) - ln_gamma(k + 0.5) - ln_gamma(n - k + 0.5)) / LN_2
+}
+
+/// The explanations of the family given `program`, from its execution `trace` on the family
+/// (module note, "Three parts").
+pub fn explanation(program: &OperatorProgram, trace: &Trace) -> Result<Explanation, ContractError> {
+    let interfaces = program.interfaces()?;
+    let rows = trace.values.first().map_or(0, |v| v.nrows());
+    let (mut active, mut open) = (vec![0u32; rows], vec![0u32; rows]);
+    let (mut instances, mut bits, mut lower, mut upper) = (0usize, 0.0_f64, 0.0_f64, 0.0_f64);
+    let n = rows as f64;
+    // `ln_gamma` is within a few ulps relative of each term; the slack covers an instance's three.
+    let slack = 64.0 * f64::EPSILON * (std::f64::consts::PI.ln() + 3.0 * ln_gamma(n + 1.0)) / LN_2;
+    for node in &program.nodes {
+        let Node::Pointwise { input, laws } = node else { continue };
+        let values = &trace.values[*input];
+        let bands = trace.bands.as_ref().map(|b| &b[*input]);
+        for (group, law) in laws.iter().enumerate() {
+            if *law == Law::Zero {
+                continue;
+            }
+            instances += 1;
+            let range = interfaces[*input].range(group);
+            let (mut computed, mut certain, mut unsure) = (0usize, 0usize, 0usize);
+            for row in 0..rows {
+                let (mut fires, mut proven, mut zero) = (false, false, true);
+                for column in range.clone() {
+                    let v = values[[row, column]];
+                    let r = bands.map_or(0.0, |b| b[[row, column]]);
+                    fires |= law.vanishes_on(v, v) == Some(false);
+                    match law.vanishes_on(v - r, v + r) {
+                        Some(false) => proven = true,
+                        Some(true) => {}
+                        None => zero = false,
+                    }
+                }
+                computed += usize::from(fires);
+                if proven {
+                    certain += 1;
+                    active[row] += 1;
+                } else if !zero {
+                    unsure += 1;
+                    open[row] += 1;
+                }
+            }
+            // The code length is symmetric about `N/2` and grows towards it.
+            let (lo_k, hi_k) = (certain as f64, (certain + unsure) as f64);
+            let half = (n / 2.0).clamp(lo_k, hi_k);
+            let longest = kt_bits(half.floor().max(lo_k), n).max(kt_bits(half.ceil().min(hi_k), n));
+            let shortest = kt_bits(lo_k, n).min(kt_bits(hi_k, n));
+            bits += kt_bits(computed as f64, n);
+            lower += (shortest - slack).max(0.0);
+            upper += longest + slack;
+        }
+    }
+    Ok(Explanation {
+        instances,
+        bits,
+        bits_lower: lower.min(bits).next_down().max(0.0),
+        bits_upper: upper.max(bits).next_up(),
+        active,
+        open,
+    })
+}
+
+/// A program's code under the contract: structure, precision, explanations and data (module note).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProgramScore {
-    /// The decoded message length of the program.
+    /// The decoded message length of the program: `structure_bits + precision_bits`.
     pub program_bits: u64,
+    pub structure_bits: u64,
+    pub precision_bits: u64,
+    /// The family's explanations given the program.
+    pub explanation: Explanation,
     /// `L(behaviour | P) = Σ KL / ln 2` and its error; `+∞` error when some row is unresolved.
     pub data_bits: f64,
     pub data_bits_error: f64,
@@ -154,17 +275,17 @@ pub struct ProgramScore {
 impl ProgramScore {
     /// A proven lower end of the total code length.
     pub fn total_lower(&self) -> f64 {
-        (self.program_bits as f64 + (self.data_bits - self.data_bits_error).max(0.0)).next_down()
+        (self.program_bits as f64 + self.explanation.bits_lower + (self.data_bits - self.data_bits_error).max(0.0)).next_down()
     }
 
     /// A proven upper end of the total code length.
     pub fn total_upper(&self) -> f64 {
-        (self.program_bits as f64 + self.data_bits + self.data_bits_error).next_up()
+        (self.program_bits as f64 + self.explanation.bits_upper + self.data_bits + self.data_bits_error).next_up()
     }
 
     /// The computed total.
     pub fn total(&self) -> f64 {
-        self.program_bits as f64 + self.data_bits
+        self.program_bits as f64 + self.explanation.bits + self.data_bits
     }
 
     /// Whether this score is proven shorter than `other`.
@@ -235,12 +356,18 @@ impl Contract {
 
     /// The program's output rows on the family, with forward-error bands.
     pub fn logits(&self, program: &OperatorProgram) -> Result<BandedMatrix, ContractError> {
+        Ok(self.banded_trace(program)?.0)
+    }
+
+    /// The program's output rows on the family with bands, and its banded trace.
+    fn banded_trace(&self, program: &OperatorProgram) -> Result<(BandedMatrix, Trace), ContractError> {
         if program.declarations != self.declarations {
             return Err(ContractError::Declaration("the program's declarations are not the contract's".to_string()));
         }
         let trace = program.execute(&self.family, true)?;
         let banded = trace.banded(program.output);
-        Ok(BandedMatrix { values: self.distributions(&banded.values)?, bands: self.distributions(&banded.bands)? })
+        let logits = BandedMatrix { values: self.distributions(&banded.values)?, bands: self.distributions(&banded.bands)? };
+        Ok((logits, trace))
     }
 
     /// Refuse a program whose readout reads a slot the contract does not allow it.
@@ -362,7 +489,14 @@ impl Contract {
         let decoded = EncodedProgram { message, declarations: self.declarations.clone() }
             .decode()
             .map_err(ContractError::Declaration)?;
-        let candidate = self.logits(&decoded)?;
+        let account = decoded.code_account()?;
+        if account.total_bits != program_bits {
+            return Err(ContractError::Declaration(format!("a message of {program_bits} bits accounted as {}", account.total_bits)));
+        }
+        let (structure_bits, precision_bits) = (account.structure_bits(), account.precision_bits());
+        let (candidate, trace) = self.banded_trace(&decoded)?;
+        let explanation = explanation(&decoded, &trace)?;
+        drop(trace);
         let evaluation = self.evaluate(reference, &candidate)?;
         let n = self.observations as f64;
         let (data_bits, data_bits_error) = match &evaluation.total_kl {
@@ -396,7 +530,16 @@ impl Contract {
                 })
             }
         };
-        Ok(ProgramScore { program_bits, data_bits, data_bits_error, evaluation, population })
+        Ok(ProgramScore {
+            program_bits,
+            structure_bits,
+            precision_bits,
+            explanation,
+            data_bits,
+            data_bits_error,
+            evaluation,
+            population,
+        })
     }
 }
 

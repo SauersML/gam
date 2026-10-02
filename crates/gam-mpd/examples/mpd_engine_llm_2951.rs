@@ -81,6 +81,11 @@ fn main() -> Result<(), String> {
         "native": {"bits": native_view.bits, "algorithm_bits": native_view.algorithm_bits, "data_bits": native_view.data_bits, "reals": program.real_count()},
         "result": {
             "bits": result.score.program_bits,
+            "structure_bits": result.score.structure_bits,
+            "precision_bits": result.score.precision_bits,
+            "explanation_bits": result.score.explanation.bits,
+            "explanation_bits_per_input": result.score.explanation.bits_per_input(),
+            "active_per_input": result.score.explanation.mean_active(),
             "algorithm_bits": result_view.algorithm_bits,
             "data_bits": result_view.data_bits,
             "behaviour_bits": result.score.data_bits,

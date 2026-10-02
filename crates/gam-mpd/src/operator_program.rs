@@ -443,6 +443,21 @@ impl Law {
         }
     }
 
+    /// Whether the exact law is zero on all of `[lo, hi]` (`Some(true)`), nonzero on all of it
+    /// (`Some(false)`), or neither is proven (`None`). ReLU vanishes exactly on `t ≤ 0`; the
+    /// identity, SiLU and both GELUs vanish on the reals only at `t = 0`.
+    pub fn vanishes_on(self, lo: f64, hi: f64) -> Option<bool> {
+        match self {
+            Self::Zero => Some(true),
+            Self::Relu if hi <= 0.0 => Some(true),
+            Self::Relu if lo > 0.0 => Some(false),
+            Self::Relu => None,
+            _ if lo == 0.0 && hi == 0.0 => Some(true),
+            _ if lo > 0.0 || hi < 0.0 => Some(false),
+            _ => None,
+        }
+    }
+
     /// The radius of the computed law `value` at a computed input `input` whose radius is `r`.
     fn radius(self, input: f64, value: f64, r: f64) -> f64 {
         match self {
@@ -2348,6 +2363,20 @@ pub struct CodeAccount {
     pub total_bits: u64,
 }
 
+impl CodeAccount {
+    /// The precision part of the message: every lattice's fraction-bits field and lattice indices.
+    /// Rounding a program onto another lattice changes only this part.
+    pub fn precision_bits(&self) -> u64 {
+        self.operator_bits.iter().map(|(_, reals)| reals).sum()
+    }
+
+    /// The structure part: everything else (bases, interfaces, present blocks, real counts, rules,
+    /// wiring, laws).
+    pub fn structure_bits(&self) -> u64 {
+        self.total_bits - self.precision_bits()
+    }
+}
+
 fn interface_bits(interface: &Interface) -> Result<u64, ProgramError> {
     let runs = interface.runs();
     let mut bits = prefix_integer_len_bits(runs.len() as u64)?;
@@ -2427,21 +2456,34 @@ fn read_lattice(reader: &mut BitReader<'_>) -> Result<(DeclaredPrecision, Vec<f6
     Ok((precision, code.decode().map_err(ProgramError::Code)?))
 }
 
+/// An operator's message length as (structure bits, precision bits): the lattice message's count
+/// field is structure (the present blocks fix it), its fraction bits and indices are precision.
 fn operator_bits(operator: &Operator) -> Result<(u64, u64), ProgramError> {
     let kind = u64::from(fixed_index_len_bits(OPERATOR_KINDS)?);
+    let split = |reals: &[f64], precision: DeclaredPrecision| -> Result<(u64, u64), ProgramError> {
+        let count = prefix_integer_len_bits(reals.len() as u64 + 1)?;
+        Ok((count, lattice_bits(reals, precision)? - count))
+    };
     match &operator.body {
         OperatorBody::Identity => Ok((kind + interface_bits(&operator.rows)?, 0)),
-        OperatorBody::LowRank { left, precision, .. } => Ok((
-            kind + interface_bits(&operator.rows)? + interface_bits(&operator.cols)? + prefix_integer_len_bits(left.ncols() as u64)?,
-            lattice_bits(&operator.present_reals(), *precision)?,
-        )),
+        OperatorBody::LowRank { left, precision, .. } => {
+            let (count, reals) = split(&operator.present_reals(), *precision)?;
+            Ok((
+                kind + interface_bits(&operator.rows)?
+                    + interface_bits(&operator.cols)?
+                    + prefix_integer_len_bits(left.ncols() as u64)?
+                    + count,
+                reals,
+            ))
+        }
         OperatorBody::Dense { present, precision, .. } => {
             let mut structure = kind + interface_bits(&operator.rows)? + interface_bits(&operator.cols)?;
             let columns = operator.cols.group_count();
             for row in present.outer_iter() {
                 structure += subset_code_len_bits(columns, row.iter().filter(|keep| **keep).count())?;
             }
-            Ok((structure, lattice_bits(&operator.present_reals(), *precision)?))
+            let (count, reals) = split(&operator.present_reals(), *precision)?;
+            Ok((structure + count, reals))
         }
     }
 }

@@ -355,7 +355,8 @@ fn point(label: &str, program: &OperatorProgram, contract: &Contract, model: &Op
     let score = contract.score(program, &reference).map_err(|e| e.to_string())?;
     let e = &score.evaluation;
     Ok(json!({
-        "label": label, "bits": score.program_bits, "data_bits": score.data_bits, "reals": program.real_count(),
+        "label": label, "bits": score.program_bits, "structure_bits": score.structure_bits, "precision_bits": score.precision_bits,
+        "explanation_bits": score.explanation.bits, "active_per_input": score.explanation.mean_active(), "data_bits": score.data_bits, "reals": program.real_count(),
         "max_kl": format!("{:?}", e.max_kl), "max_kl_upper": e.max_kl.upper_bound(),
         "argmax_disagreements": e.argmax_disagreements,
     }))
@@ -423,6 +424,11 @@ fn main() -> Result<(), String> {
             "repeats": repeats,
             "rows": contract.family.rows,
             "bits": result.score.program_bits,
+            "structure_bits": result.score.structure_bits,
+            "precision_bits": result.score.precision_bits,
+            "explanation_bits": result.score.explanation.bits,
+            "explanation_bits_per_input": result.score.explanation.bits_per_input(),
+            "active_per_input": result.score.explanation.mean_active(),
             "data_bits": result.score.data_bits,
             "reals": result.program.real_count(),
             "max_kl": format!("{:?}", evaluation.max_kl),

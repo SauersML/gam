@@ -267,11 +267,69 @@ fn a_warm_start_never_leaves_the_result_longer_than_the_native_start() {
     let library: Vec<Box<dyn Primitive>> = vec![Box::new(DropBlocks), Box::new(Coarsen)];
     let from_native = decompose(&program, &contract, &library, &budget()).expect("decomposes");
     let from_warm = decompose_from(&program, &empty, &contract, &library, &budget()).expect("decomposes");
-    assert!(from_warm.score.total_upper() <= native.total_upper(), "{} against native {}", from_warm.score.total(), native.total());
+    // Never proven longer than the native program, nor than the native start's own search.
+    assert!(!native.proven_shorter_than(&from_warm.score), "{} against native {}", from_warm.score.total(), native.total());
     assert!(
-        from_warm.score.total_upper() <= from_native.score.total_upper(),
+        !from_native.score.proven_shorter_than(&from_warm.score),
         "warm-started {} against the native start's {}",
         from_warm.score.total(),
         from_native.score.total()
     );
+}
+
+#[test]
+fn rounding_a_program_leaves_its_structure_bits_unchanged() {
+    let (program, contract) = planted_program(true);
+    let reference = contract.logits(&program).expect("executes");
+    let base = contract.score(&program, &reference).expect("score");
+    for fraction_bits in [12, 4, 1, -2] {
+        let mut rounded = program.clone();
+        for operator in 0..rounded.operators.len() {
+            super::engine::apply_edit(&mut rounded, &Edit::Precision { operator, precision: precision(fraction_bits) }).expect("rounds");
+        }
+        let score = contract.score(&rounded, &reference).expect("score");
+        assert_eq!(score.structure_bits, base.structure_bits, "at 2^-{fraction_bits}");
+        assert_eq!(score.structure_bits + score.precision_bits, score.program_bits);
+        assert!(score.precision_bits < base.precision_bits);
+    }
+}
+
+#[test]
+fn the_explanations_are_the_kt_code_of_each_units_activity() {
+    let (mut program, contract) = planted_program(true);
+    let units = Interface::uniform(WIDTH, 1, LabelKind::Unit, 0).expect("interface");
+    let (e, u) = (program.operators[0].clone(), program.operators[1].clone());
+    let shifted = e.matrix() - 0.5;
+    program.operators[0] = Operator::dense("E", units.clone(), e.cols.clone(), shifted, precision(30), Provenance::default()).expect("dense");
+    program.operators[1] = Operator::dense("U", u.rows.clone(), units, u.matrix(), precision(30), Provenance::default()).expect("dense");
+    program.nodes = vec![
+        Node::Feature { slot: 0, basis: 0 },
+        Node::Feature { slot: 1, basis: 0 },
+        Node::Affine { terms: vec![(0, 0), (1, 0)], bias: None },
+        Node::Pointwise { input: 2, laws: vec![super::operator_program::Law::Relu; WIDTH] },
+        Node::Affine { terms: vec![(3, 1)], bias: None },
+        Node::Readout { input: 4, basis: 1 },
+    ];
+    program.output = 5;
+    let reference = contract.logits(&program).expect("executes");
+    let score = contract.score(&program, &reference).expect("score");
+    let pre = &program.execute(&contract.family, false).expect("executes").values[2];
+    let n = pre.nrows() as f64;
+    let kt = |k: f64| {
+        use statrs::function::gamma::ln_gamma;
+        (std::f64::consts::PI.ln() + ln_gamma(n + 1.0) - ln_gamma(k + 0.5) - ln_gamma(n - k + 0.5)) / std::f64::consts::LN_2
+    };
+    let (mut expected, mut active) = (0.0, 0usize);
+    for unit in 0..WIDTH {
+        let k = pre.column(unit).iter().filter(|v| **v > 0.0).count();
+        active += k;
+        expected += kt(k as f64);
+    }
+    let explanation = &score.explanation;
+    assert_eq!(explanation.instances, WIDTH);
+    assert!((explanation.bits - expected).abs() <= 1e-9 * expected, "{} against {expected}", explanation.bits);
+    assert!(explanation.bits_lower <= explanation.bits && explanation.bits <= explanation.bits_upper);
+    let open: u32 = explanation.open.iter().sum();
+    assert!((explanation.mean_active() * n - active as f64).abs() <= f64::from(open) + 1e-9);
+    assert!((score.total() - (score.program_bits as f64 + explanation.bits + score.data_bits)).abs() < 1e-6);
 }

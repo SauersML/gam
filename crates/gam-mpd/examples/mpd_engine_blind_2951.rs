@@ -83,6 +83,11 @@ fn main() -> Result<(), String> {
         frontier.push(json!({
             "observations": n,
             "program_bits": result.score.program_bits,
+            "structure_bits": result.score.structure_bits,
+            "precision_bits": result.score.precision_bits,
+            "explanation_bits": result.score.explanation.bits,
+            "explanation_bits_per_input": result.score.explanation.bits_per_input(),
+            "active_per_input": result.score.explanation.mean_active(),
             "data_bits": result.score.data_bits,
             "reals": result.program.real_count(),
             "max_kl": evaluation.max_kl.upper_bound(),
