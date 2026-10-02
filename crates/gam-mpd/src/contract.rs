@@ -539,8 +539,9 @@ impl Contract {
         }
         let domain = self.domain();
         let max_kl = exhaustive_supremum(kls.iter().copied(), None, domain.clone())?;
-        let total_kl = if resolved {
-            let error = (sum_error + accumulation_growth(shape.0) * sum_magnitude).next_up();
+        let error = (sum_error + accumulation_growth(shape.0) * sum_magnitude).next_up();
+        // Finite rows can still sum past the largest float: such a total proves its lower end only.
+        let total_kl = if resolved && sum.is_finite() && error.is_finite() {
             EvidenceStatus::exact(sum, error, ExactBasis::Exhaustive { cardinality: shape.0 as u64 }, None, domain)?
         } else {
             EvidenceStatus::unresolved(sum_lower.next_down(), f64::INFINITY, Extremum::Supremum, None, domain)?
