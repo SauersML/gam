@@ -119,10 +119,14 @@ impl Library {
 pub fn fisher_svd(site: &Site) -> Result<Library, String> {
     let whitened = Whitened::new(site)?;
     let (u_white, v_white) = singular_pieces(&whitened.m)?;
-    let mut u = u_white.dot(&whitened.b_inverse);
-    let mut v = whitened.a_inverse.dot(&v_white.t());
-    let (d_out, d_in) = site.w.dim();
-    let left = &site.w - &u.t().dot(&v.t());
+    complete(&site.w, u_white.dot(&whitened.b_inverse), whitened.a_inverse.dot(&v_white.t()))
+}
+
+/// The library `(v: d_in × C, u: C × d_out)` with the singular pieces of what it leaves of `w`
+/// beyond its product's rounding band appended, so all pieces on is the map.
+fn complete(w: &Array2<f64>, mut u: Array2<f64>, mut v: Array2<f64>) -> Result<Library, String> {
+    let (d_out, d_in) = w.dim();
+    let left = w - &u.t().dot(&v.t());
     let band = u.mapv(f64::abs).t().dot(&v.mapv(f64::abs).t()) * accumulation_growth(u.nrows());
     let within = left.iter().zip(band.iter()).all(|(r, b)| r.abs() <= *b);
     let band_norm = band.iter().map(|b| b * b).sum::<f64>().sqrt();
@@ -133,4 +137,62 @@ pub fn fisher_svd(site: &Site) -> Result<Library, String> {
         v = concatenate(Axis(1), &[v.view(), v_left.t()]).map_err(|e| e.to_string())?;
     }
     Ok(Library { v, u, exactness_pieces: extra })
+}
+
+/// What a site's Fisher-SVD needs, measured on its narrow side only, for a site one of whose sides
+/// is too wide for its own `d × d` statistic (a language model's MLP): with `d_in ≤ d_out`, the
+/// reads' covariance `A` and the Fisher pulled back through the map, `WᵀBW = E[(Wᵀg)(Wᵀg)ᵀ]`; with
+/// `d_out < d_in`, the output Fisher `B` and the covariance of the written value, `W A Wᵀ`.
+pub enum Narrow {
+    Reads { covariance: Array2<f64>, pulled_fisher: Array2<f64> },
+    Writes { fisher: Array2<f64>, written_covariance: Array2<f64> },
+}
+
+/// The pieces of [`fisher_svd`] from a site's narrow statistics, and each piece's singular value
+/// `s_c` (its own second-order weight `u_cᵀ B u_c`; zero for an appended exactness piece). `M` is
+/// never formed: with `Reads`, `MᵀM = A^{1/2} WᵀBW A^{1/2} = Q S² Qᵀ`, `v_c = A^{-1/2} q_c √s_c` and
+/// `u_c = B^{-1/2} p_c √s_c = W A^{1/2} q_c / √s_c`; with `Writes`, `MMᵀ = B^{1/2} WAWᵀ B^{1/2} =
+/// P S² Pᵀ`, `u_c = B^{-1/2} p_c √s_c` and `v_c = Wᵀ B^{1/2} p_c / √s_c`. Pieces are in decreasing
+/// `s_c`; eigenvalues within the decomposition's band are left to the exactness pieces.
+pub fn fisher_svd_narrow(w: &Array2<f64>, narrow: &Narrow) -> Result<(Library, Vec<f64>), String> {
+    let (whitening, metric) = match narrow {
+        Narrow::Reads { covariance, pulled_fisher } => (covariance, pulled_fisher),
+        Narrow::Writes { fisher, written_covariance } => (fisher, written_covariance),
+    };
+    let (half, inverse) = roots(whitening)?;
+    let mut gram = half.dot(metric).dot(&half);
+    for i in 0..gram.nrows() {
+        for j in (i + 1)..gram.ncols() {
+            let mean = 0.5 * (gram[[i, j]] + gram[[j, i]]);
+            gram[[i, j]] = mean;
+            gram[[j, i]] = mean;
+        }
+    }
+    let decomposed = eigh(gram.view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
+    let mut kept: Vec<usize> = (0..decomposed.values.len()).filter(|&i| decomposed.values[i] > decomposed.band).collect();
+    kept.sort_by(|a, b| decomposed.values[*b].total_cmp(&decomposed.values[*a]));
+    let singular: Vec<f64> = kept.iter().map(|&i| decomposed.values[i].sqrt()).collect();
+    let (d_out, d_in) = w.dim();
+    let mut u = Array2::<f64>::zeros((kept.len(), d_out));
+    let mut v = Array2::<f64>::zeros((d_in, kept.len()));
+    for (c, (&i, s)) in kept.iter().zip(&singular).enumerate() {
+        let direction = decomposed.vectors.column(i);
+        let root = s.sqrt();
+        match narrow {
+            Narrow::Reads { .. } => {
+                let whitened = half.dot(&direction);
+                v.column_mut(c).assign(&(inverse.dot(&direction) * root));
+                u.row_mut(c).assign(&(w.dot(&whitened) / root));
+            }
+            Narrow::Writes { .. } => {
+                let whitened = half.dot(&direction);
+                u.row_mut(c).assign(&(inverse.dot(&direction) * root));
+                v.column_mut(c).assign(&(w.t().dot(&whitened) / root));
+            }
+        }
+    }
+    let library = complete(w, u, v)?;
+    let mut weights = singular;
+    weights.resize(library.u.nrows(), 0.0);
+    Ok((library, weights))
 }

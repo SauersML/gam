@@ -27,6 +27,8 @@ use crate::operator_program::{
     Basis, Declarations, Domain, FamilyInputs, Interface, LabelKind, Law, Node, Operator, OperatorProgram, Provenance,
     Rotary, Scale, SequenceLayout, Slot, SlotValues, exact_precision,
 };
+use crate::safetensors::SafetensorsFile;
+use gam_runtime::resource::MemoryGovernor;
 use ndarray::{Array2, Axis, s};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -68,19 +70,42 @@ fn shape_of(value: &Value) -> Result<(usize, usize), String> {
     }
 }
 
-struct Tensors<'a> {
-    dir: &'a Path,
-    record: &'a Value,
+/// Where a model's tensors come from, by their export names: an export directory (`<name>.f64`
+/// files listed in `export.json`), or a Hugging Face checkpoint read under those names
+/// ([`hugging_face_name`]).
+enum Tensors<'a> {
+    Export { dir: &'a Path, record: &'a Value },
+    HuggingFace { file: SafetensorsFile },
 }
 
 impl Tensors<'_> {
     fn has(&self, name: &str) -> bool {
-        self.record["files"].get(name).is_some()
+        match self {
+            Self::Export { record, .. } => record["files"].get(name).is_some(),
+            Self::HuggingFace { file } => hugging_face_name(name).is_some_and(|n| file.tensors().contains_key(&n)),
+        }
     }
 
+    /// A stored matrix, or a stored vector as one row.
     fn get(&self, name: &str) -> Result<Array2<f64>, String> {
-        let (rows, cols) = shape_of(&self.record["files"][name]["shape"]).map_err(|e| format!("{name}: {e}"))?;
-        read_f64(&self.dir.join(format!("{name}.f64")), rows, cols)
+        match self {
+            Self::Export { dir, record } => {
+                let (rows, cols) = shape_of(&record["files"][name]["shape"]).map_err(|e| format!("{name}: {e}"))?;
+                read_f64(&dir.join(format!("{name}.f64")), rows, cols)
+            }
+            Self::HuggingFace { file } => {
+                let stored = hugging_face_name(name).ok_or_else(|| format!("{name}: no Hugging Face tensor"))?;
+                let shape = file.tensors().get(&stored).map(|e| e.shape.clone()).ok_or_else(|| format!("{stored}: missing"))?;
+                match shape[..] {
+                    [n] => Ok(file.vector(&stored, n).map_err(|e| e.to_string())?.insert_axis(Axis(0))),
+                    [rows, cols] => {
+                        let mut governed = file.matrix(MemoryGovernor::global(), &stored, rows, cols).map_err(|e| e.to_string())?;
+                        Ok(std::mem::take(&mut *governed))
+                    }
+                    _ => Err(format!("{stored}: shape {shape:?} is not one or two axes")),
+                }
+            }
+        }
     }
 
     /// A stored row vector as a column.
@@ -136,7 +161,7 @@ pub fn import(dir: &Path) -> Result<Imported, String> {
     let name = record["model"].as_str().unwrap_or("model").to_string();
     let (sample_rows, sample_cols) = shape_of(&record["samples"]["shape"])?;
     let samples = read_f64(&dir.join(record["samples"]["file"].as_str().unwrap_or("inputs.f64")), sample_rows, sample_cols)?;
-    let tensors = Tensors { dir, record: &record };
+    let tensors = Tensors::Export { dir, record: &record };
     let (program, slots, complete, readout_slots) = match kind.as_str() {
         "transformer" => transformer(&tensors, &record, &samples)?,
         "residual_mlp" => residual_mlp(&tensors, &record, &samples)?,
@@ -441,14 +466,121 @@ fn rnn(tensors: &Tensors<'_>, record: &Value, samples: &Array2<f64>) -> Result<B
 pub fn import_language_model(dir: &Path, sequences: usize, context: usize) -> Result<Imported, String> {
     let text = std::fs::read_to_string(dir.join("export.json")).map_err(|e| e.to_string())?;
     let record: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let tensors = Tensors { dir, record: &record };
+    let program = language_model(&Tensors::Export { dir, record: &record }, &record, 0)?;
+    let declarations = program.declarations.clone();
+    let (token_rows, token_cols) = shape_of(&record["files"]["tokens"]["shape"])?;
+    if sequences > token_rows || context > token_cols {
+        return Err(format!("{sequences} sequences of {context} tokens from a {token_rows}×{token_cols} table"));
+    }
+    let tokens = read_f64(&dir.join("tokens.f64"), token_rows, token_cols)?;
+    let mut ids = Vec::new();
+    let (mut sequence, mut position) = (Vec::new(), Vec::new());
+    for row in 0..sequences {
+        for pos in 0..context {
+            ids.push(tokens[[row, pos]] as u32);
+            sequence.push(row as u32);
+            position.push(pos as u32);
+        }
+    }
+    let rows = ids.len();
+    let family = FamilyInputs {
+        rows,
+        slots: vec![SlotValues::Tokens(ids)],
+        layout: Some(SequenceLayout { sequence: sequence.clone(), position }),
+    };
+    let contract = Contract {
+        declarations,
+        family,
+        kind: FamilyKind::Sample {
+            population: "held-out token rows of the export".to_string(),
+            confidence: 0.95,
+            units: sequence.iter().map(|s| *s as usize).collect(),
+        },
+        observations: 1,
+        readouts: 1,
+        readout_slots: None,
+    };
+    Ok(Imported { name: "language_model".to_string(), kind: "language_model".to_string(), program, contract, record })
+}
+
+/// The Hugging Face Qwen2, Qwen3 or Llama tensor stored under export name `name` (the names
+/// `bench/mpd_engine_export_hf_2951.py` writes), or `None` for a name such a checkpoint never holds.
+fn hugging_face_name(name: &str) -> Option<String> {
+    let fixed = match name {
+        "wte" => Some("model.embed_tokens.weight"),
+        "lm_head" => Some("lm_head.weight"),
+        "final_norm.gain" => Some("model.norm.weight"),
+        _ => None,
+    };
+    if let Some(fixed) = fixed {
+        return Some(fixed.to_string());
+    }
+    let rest = name.strip_prefix("blocks.")?;
+    let (layer, part) = rest.split_once('.')?;
+    let (part, suffix) = match part.strip_suffix(".bias") {
+        Some(stem) => (stem, "bias"),
+        None => (part, "weight"),
+    };
+    let stored = match part {
+        "attn.q_proj" | "attn.k_proj" | "attn.v_proj" | "attn.o_proj" => format!("self_attn.{}", &part[5..]),
+        "mlp.c_fc" => "mlp.up_proj".to_string(),
+        "mlp.gate_proj" | "mlp.down_proj" => part.to_string(),
+        "attn.q_norm.gain" | "attn.k_norm.gain" if suffix == "weight" => format!("self_attn.{}", &part[5..11]),
+        "rms1.gain" if suffix == "weight" => "input_layernorm".to_string(),
+        "rms2.gain" if suffix == "weight" => "post_attention_layernorm".to_string(),
+        _ => return None,
+    };
+    Some(format!("model.layers.{layer}.{stored}.{suffix}"))
+}
+
+/// A Hugging Face checkpoint directory (`config.json` and `model.safetensors`) of a Qwen2 (q, k, v
+/// biases), Qwen3 (`qk_norm`) or Llama model as the program of [`import_language_model`], read
+/// straight from the stored tensors (each widened exactly), from block `first_layer` on. With
+/// `first_layer > 0` the program's one slot is the residual stream entering that block (raw, `d`
+/// per row, positions from the inputs' layout), so the blocks before it can run elsewhere and enter
+/// as their output. Returns the program and its `{config}` record (the export's conventions).
+pub fn hugging_face_language_model(dir: &Path, first_layer: usize) -> Result<(OperatorProgram, Value), String> {
+    let text = std::fs::read_to_string(dir.join("config.json")).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let hf: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let file = SafetensorsFile::open(&dir.join("model.safetensors")).map_err(|e| e.to_string())?;
+    let integer = |key: &str| hf[key].as_u64().ok_or_else(|| format!("config.json: {key}"));
+    let kind = hf["model_type"].as_str().ok_or("config.json: model_type")?;
+    if !matches!(kind, "qwen2" | "qwen3" | "llama") {
+        return Err(format!("unsupported model_type {kind}"));
+    }
+    let (d, heads) = (integer("hidden_size")?, integer("num_attention_heads")?);
+    let head_dim = hf["head_dim"].as_u64().unwrap_or(d / heads.max(1));
+    let vocab = file.tensors().get("model.embed_tokens.weight").map(|e| e.shape[0]).ok_or("model.embed_tokens.weight: missing")?;
+    let act = match hf["hidden_act"].as_str() {
+        Some("silu") => "silu",
+        other => return Err(format!("unsupported hidden_act {other:?}")),
+    };
+    let record = serde_json::json!({
+        "source": {"model": dir.display().to_string(), "first_layer": first_layer},
+        "config": {
+            "norm": "rms", "parallel_residual": false, "rotary_dims": head_dim,
+            "rope_theta": hf["rope_theta"].as_f64().ok_or("config.json: rope_theta")?,
+            "norm_eps": hf["rms_norm_eps"].as_f64().ok_or("config.json: rms_norm_eps")?, "mlp_act": act,
+            "tied_embeddings": hf["tie_word_embeddings"].as_bool().unwrap_or(false), "mlp_gated": true,
+            "qk_norm": kind == "qwen3", "d_model": d, "n_layers": integer("num_hidden_layers")?, "n_heads": heads,
+            "n_kv_heads": integer("num_key_value_heads")?, "head_dim": head_dim,
+            "d_mlp": integer("intermediate_size")?, "vocab": vocab, "rope_pairing": "rotate_half",
+        },
+    });
+    let program = language_model(&Tensors::HuggingFace { file }, &record, first_layer)?;
+    Ok((program, record))
+}
+
+/// The program of [`import_language_model`] from block `first_layer` on (module note): its input
+/// is the tokens at block 0, else the residual stream entering `first_layer`, raw.
+fn language_model(tensors: &Tensors<'_>, record: &Value, first_layer: usize) -> Result<OperatorProgram, String> {
     let (layers, heads, kv_heads, hd, d, vocab) = (
-        config(&record, "n_layers")?,
-        config(&record, "n_heads")?,
-        config(&record, "n_kv_heads")?,
-        config(&record, "head_dim")?,
-        config(&record, "d_model")?,
-        config(&record, "vocab")?,
+        config(record, "n_layers")?,
+        config(record, "n_heads")?,
+        config(record, "n_kv_heads")?,
+        config(record, "head_dim")?,
+        config(record, "d_model")?,
+        config(record, "vocab")?,
     );
     let flag = |key: &str| record["config"][key].as_bool().unwrap_or(false);
     let (parallel, qk_norm, gated) = (flag("parallel_residual"), flag("qk_norm"), flag("mlp_gated"));
@@ -547,10 +679,19 @@ pub fn import_language_model(dir: &Path, sequences: usize, context: usize) -> Re
         let normed = b.node(Node::RmsNorm { input: x, epsilon });
         Ok(b.node(Node::Affine { terms: vec![(normed, op)], bias: None }))
     };
-    let feature = b.node(Node::Feature { slot: 0, basis: 0 });
-    let embedded = b.node(Node::Affine { terms: vec![(feature, embedding)], bias: None });
-    let mut x = embedded;
-    for l in 0..layers {
+    if first_layer > layers {
+        return Err(format!("first layer {first_layer} of {layers}"));
+    }
+    let (input_slot, mut x) = if first_layer == 0 {
+        let feature = b.node(Node::Feature { slot: 0, basis: 0 });
+        (Slot::Token { domain: 0 }, b.node(Node::Affine { terms: vec![(feature, embedding)], bias: None }))
+    } else {
+        // The raw stream enters the coordinate groups through the identity.
+        let raw = b.node(Node::Raw { slot: 0 });
+        let lift = b.operator("residual input", &model, &Interface::native(d).map_err(|e| e.to_string())?, Array2::eye(d))?;
+        (Slot::Raw { width: d }, b.node(Node::Affine { terms: vec![(raw, lift)], bias: None }))
+    };
+    for l in first_layer..layers {
         let prefix = format!("blocks.{l}.");
         let h = norm(&mut b, x, &format!("{prefix}rms1"))?;
         let (wq, wk, wv, wo) = (
@@ -628,50 +769,13 @@ pub fn import_language_model(dir: &Path, sequences: usize, context: usize) -> Re
         b.node(Node::Affine { terms: vec![(h, head_op)], bias: None })
     };
     let output = b.node(Node::Readout { input: logits, basis: 0 });
-    let declarations = Declarations {
-        parameters: 0,
-        domains: vec![Domain { size: vocab, cycle: None }],
-        slots: vec![Slot::Token { domain: 0 }],
-    };
-    let program = OperatorProgram {
+    let declarations = Declarations { parameters: 0, domains: vec![Domain { size: vocab, cycle: None }], slots: vec![input_slot] };
+    Ok(OperatorProgram {
         rules: Vec::new(),
-        declarations: declarations.clone(),
+        declarations,
         bases: vec![Basis::Indicator { domain: 0 }],
         operators: b.operators,
         nodes: b.nodes,
         output,
-    };
-    let (token_rows, token_cols) = shape_of(&record["files"]["tokens"]["shape"])?;
-    if sequences > token_rows || context > token_cols {
-        return Err(format!("{sequences} sequences of {context} tokens from a {token_rows}×{token_cols} table"));
-    }
-    let tokens = read_f64(&dir.join("tokens.f64"), token_rows, token_cols)?;
-    let mut ids = Vec::new();
-    let (mut sequence, mut position) = (Vec::new(), Vec::new());
-    for row in 0..sequences {
-        for pos in 0..context {
-            ids.push(tokens[[row, pos]] as u32);
-            sequence.push(row as u32);
-            position.push(pos as u32);
-        }
-    }
-    let rows = ids.len();
-    let family = FamilyInputs {
-        rows,
-        slots: vec![SlotValues::Tokens(ids)],
-        layout: Some(SequenceLayout { sequence: sequence.clone(), position }),
-    };
-    let contract = Contract {
-        declarations,
-        family,
-        kind: FamilyKind::Sample {
-            population: "held-out token rows of the export".to_string(),
-            confidence: 0.95,
-            units: sequence.iter().map(|s| *s as usize).collect(),
-        },
-        observations: 1,
-        readouts: 1,
-        readout_slots: None,
-    };
-    Ok(Imported { name: "language_model".to_string(), kind: "language_model".to_string(), program, contract, record })
+    })
 }

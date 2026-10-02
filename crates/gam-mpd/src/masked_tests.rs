@@ -1,7 +1,7 @@
 #![cfg(test)]
 //! The masked program's derivatives against finite differences of its own KL.
 
-use super::masked::{Library, Masked, forward, gradients, sites, split, step_pieces};
+use super::masked::{Library, Masked, Target, forward, gradients, sites, split, step_pieces};
 use super::operator_program::{
     Basis, Declarations, Domain, FamilyInputs, Interface, LabelKind, Law, Node, Operator, OperatorProgram, Provenance, Slot,
     SlotValues,
@@ -68,7 +68,7 @@ fn model() -> (OperatorProgram, FamilyInputs) {
 #[test]
 fn the_masked_programs_gradients_are_its_own_kls_derivatives() {
     let (program, family) = model();
-    let target = program.execute(&family, false).expect("executes").values[program.output].clone();
+    let target = Target::every_row(program.execute(&family, false).expect("executes").values[program.output].clone());
     let all = sites(&program);
     let site = all.iter().find(|s| s.name == "W_in").expect("the W_in site").clone();
     let pieces = 3;
@@ -105,7 +105,7 @@ fn the_masked_programs_gradients_are_its_own_kls_derivatives() {
 #[test]
 fn a_step_of_the_pieces_lowers_the_masked_kl() {
     let (program, family) = model();
-    let target = program.execute(&family, false).expect("executes").values[program.output].clone();
+    let target = Target::every_row(program.execute(&family, false).expect("executes").values[program.output].clone());
     let site = sites(&program).into_iter().find(|s| s.name == "W_in").expect("the W_in site");
     let pieces = 3;
     let library = Library {
@@ -121,6 +121,40 @@ fn a_step_of_the_pieces_lowers_the_masked_kl() {
     assert!(step_pieces(&mut masked, &family, &target, &masks, 4, 7, &mut running).expect("steps").is_some());
     let after = forward(&masked, &fam, &target).expect("forward").0.sum();
     assert!(after < before, "{after} against {before}");
+}
+
+/// A behaviour scored on some rows: an unscored row adds no KL and no cotangent, and the selection
+/// leaves its masks as given while it changes the scored rows'.
+#[test]
+fn an_unscored_row_adds_no_kl_and_keeps_its_masks() {
+    let (program, family) = model();
+    let logits = program.execute(&family, false).expect("executes").values[program.output].clone();
+    let scored: Vec<bool> = (0..family.rows).map(|r| r % 2 == 0).collect();
+    let target = Target { logits, scored: Some(scored.clone()) };
+    let site = sites(&program).into_iter().find(|s| s.name == "W_in").expect("the W_in site");
+    let pieces = 3;
+    let library = Library {
+        v: Array2::from_shape_fn((pieces, WIDTH), |(i, j)| noise(700 + 7 * i + j)),
+        u: Array2::from_shape_fn((pieces, UNITS), |(i, j)| noise(800 + 7 * i + j)),
+        mean: Array1::zeros(WIDTH),
+    };
+    let masked = Masked::build(&program, vec![site], vec![library]).expect("builds");
+    let masks = vec![Array2::<f64>::ones((family.rows, pieces))];
+    let (kl, _, cotangent) = forward(&masked, &masked.family(&family, &masks), &target).expect("forward");
+    for r in (0..family.rows).filter(|r| !scored[*r]) {
+        assert_eq!(kl[r], 0.0);
+        assert!(cotangent.row(r).iter().all(|x| *x == 0.0));
+    }
+    assert!((0..family.rows).any(|r| scored[r] && kl[r] > 0.0));
+    // Nearly free KL and two rarely listed pieces: every scored row drops one.
+    let mut context = super::masked::Context::new(&[pieces]);
+    context.new[0][0] = 100.0;
+    let coder = context.coder(vec![None; family.rows]);
+    let (selected, _) = super::masked::select(&masked, &family, &target, masks, &coder, 1e-3, 2).expect("selects");
+    for r in 0..family.rows {
+        let unchanged = selected[0].row(r).iter().all(|x| *x == 1.0);
+        assert!(unchanged != scored[r], "row {r} (scored {})", scored[r]);
+    }
 }
 
 #[test]
@@ -206,7 +240,7 @@ fn a_set_that_carries_over_from_the_previous_input_is_cheap_to_explain() {
 fn pieces_grown_from_what_selection_leaves_out_recover_its_kl() {
     use super::masked::{Running, dropped_atoms, with_pieces};
     let (program, family) = model();
-    let target = program.execute(&family, false).expect("executes").values[program.output].clone();
+    let target = Target::every_row(program.execute(&family, false).expect("executes").values[program.output].clone());
     let site = sites(&program).into_iter().find(|s| s.name == "W_in").expect("the W_in site");
     let pieces = 3;
     // Three pieces: the site map's leading three singular directions; the rest of the map is in

@@ -36,7 +36,7 @@
 
 use gam_mpd::codec::prefix_integer_len_bits;
 use gam_mpd::import::import_language_model;
-use gam_mpd::masked::{Context, Library, Masked, Running, previous_inputs, read_values, select, site_statistics, sites, split, step_pieces};
+use gam_mpd::masked::{Context, Library, Masked, Running, Target, previous_inputs, read_values, select, site_statistics, sites, split, step_pieces};
 use gam_mpd::operator_program::FamilyInputs;
 use gam_mpd::pieces::fisher_svd;
 use ndarray::{Array1, Array2, Axis};
@@ -107,8 +107,8 @@ fn main() -> Result<(), String> {
     let family = &imported.contract.family;
     let context_rows = context;
     let sequence = |s: usize| -> FamilyInputs { family.select(&(s * context_rows..(s + 1) * context_rows).collect::<Vec<_>>()) };
-    let target_of = |inputs: &FamilyInputs| -> Result<Array2<f64>, String> {
-        Ok(model.execute(inputs, false).map_err(|e| e.to_string())?.values[model.output].clone())
+    let target_of = |inputs: &FamilyInputs| -> Result<Target, String> {
+        Ok(Target::every_row(model.execute(inputs, false).map_err(|e| e.to_string())?.values[model.output].clone()))
     };
     let all_sites = sites(model);
     // The model's statistics on the training sequences (on the eval sequences when nothing trains).
@@ -234,7 +234,7 @@ fn main() -> Result<(), String> {
                 let trace = gam_mpd::masked::forward(masked, &masked.family(&inputs, &masks), &target)?.1;
                 let argmax = |row: ndarray::ArrayView1<f64>| row.iter().enumerate().fold((0, f64::NEG_INFINITY), |b, (i, v)| if *v > b.1 { (i, *v) } else { b }).0;
                 let logits = &trace.values[masked.program.output];
-                agree.extend((0..inputs.rows).map(|r| i64::from(argmax(logits.row(r)) == argmax(target.row(r)))));
+                agree.extend((0..inputs.rows).map(|r| i64::from(argmax(logits.row(r)) == argmax(target.logits.row(r)))));
             }
             let (a, b, c) = sums(&masks, &values);
             l0 += a;
