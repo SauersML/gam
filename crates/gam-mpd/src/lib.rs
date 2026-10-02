@@ -106,6 +106,12 @@ pub mod masked;
 #[cfg(test)]
 mod masked_tests;
 
+// Atomic checkpoints of a streaming masked fit, so an interrupted run resumes exactly.
+pub mod checkpoint;
+
+#[cfg(test)]
+mod checkpoint_tests;
+
 #[cfg(test)]
 mod pieces_tests;
 
@@ -118,6 +124,18 @@ pub mod derivatives;
 
 // Proposal products (ranking, directions, curvature) on the Apple GPU; acceptances stay float64.
 pub mod device;
+
+// An operator program executed on a device (CUDA, or the host reference), values resident.
+pub mod device_program;
+
+#[cfg(test)]
+mod device_program_tests;
+
+// The masked fit's hot path (forward, KL, mask gradients, Fishers, step products) on a device.
+pub mod masked_device;
+
+#[cfg(test)]
+mod masked_device_tests;
 
 // Model exports (export.json and raw float64 tensors) as operator programs and contracts.
 pub mod import;

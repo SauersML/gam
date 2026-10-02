@@ -38,6 +38,7 @@ pub mod pool;
 pub mod precision_bounds;
 pub mod row_kernel_race;
 pub mod solver;
+pub mod tensor;
 
 pub use device::GpuDeviceInfo;
 pub use linalg_dispatch::CholeskyVerdict;
