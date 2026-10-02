@@ -1,5 +1,5 @@
 //! Finest additive decompositions of a plain MLP block over every invertible
-//! change of input coordinates (#2951, operation-first result 5).
+//! change of input coordinates (#2951).
 //!
 //! # Normal form
 //!
@@ -68,7 +68,7 @@
 //! approximation contract is a worst-case sup-norm bound on a ball with no law.
 //! Both read their blocks off one component owner,
 //! `response::interaction::connected_components`. On trained weights the exact
-//! pattern of `Π` is generically connected (operation-first result 5), so this
+//! pattern of `Π` is generically connected, so this
 //! is a diagnostic, not a target.
 
 use std::collections::{BTreeMap, HashMap};

@@ -43,8 +43,7 @@
 //! # The plan is `ρ(α) − θ`
 //!
 //! [`NativeEditPlan`] holds `ρ(α) − θ` as global edits `ΔW = left · rightᵀ` of storage
-//! tensors (`apply::FactoredEdit`), the record `gamfit/torch/parameter_interventions.py`
-//! executes. The empty plan is `ρ(0) = θ`: it executes the original tensors on their original path, never the compiler's arithmetic.
+//! tensors (`apply::FactoredEdit`). The empty plan is `ρ(0) = θ`: it executes the original tensors on their original path, never the compiler's arithmetic.
 //! A compiled edit is always global on storage, so every tied use of a stored tensor moves
 //! with it; the compiler never emits a use-specific edit, which would untie a tie
 //! ([`ties`]).

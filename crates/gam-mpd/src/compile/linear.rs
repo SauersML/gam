@@ -43,8 +43,7 @@
 //! `D = I` is the Frobenius norm of the tensor as given. Frobenius "in canonical gauge" is
 //! this metric with the canonical gauge's diagonal elements as scales (a folded norm gain
 //! `γ` moves `W ↦ W diag(γ)`, so its Frobenius norm there is `col_scale = γ`), or the
-//! Frobenius norm of tensors passed already in canonical gauge
-//! (`canonical::DecoderLayer::canonical`). With `E = D_r ΔW D_c`, `X̃_r = D_c⁻¹ X_r`,
+//! Frobenius norm of tensors passed already in canonical gauge. With `E = D_r ΔW D_c`, `X̃_r = D_c⁻¹ X_r`,
 //! `Ỹ_r = D_r Y_r`, `X̃_l = D_r⁻¹ X_l`, `Ỹ_l = D_c Y_l`, the constraints keep their form and
 //! the minimum-Frobenius `E` is
 //!

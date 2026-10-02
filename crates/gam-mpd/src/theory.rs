@@ -586,7 +586,7 @@
 //!
 //! This is the existence of `H`'s mechanism at the next variable, which a constructive abstraction
 //! requires (Def. 33 needs `F_H` to exist before Eq. 3 can commute), and it is decided without any
-//! proposed `f`. [`super::state::QuotientContract`] checks a given `f` (`E′∘T = g∘E`); this checks
+//! proposed `f`: checking a given `f` (`E′∘T = g∘E`) is weaker than this, which decides
 //! whether any `f` exists. The quantifier over `u` is load-bearing: a summary can be consistent on the
 //! clean run and inconsistent under a declared intervention, which then has no abstract counterpart.
 //!

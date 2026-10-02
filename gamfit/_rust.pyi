@@ -134,7 +134,6 @@ __all__ = [
     "chart_interp_score",
     "chart_transfer_operator",
     "check_json",
-    "check_parameter_use_site_reads",
     "check_payload_from_model",
     "classification_metrics",
     "coefficient_state_json",
@@ -1626,8 +1625,6 @@ def chart_interp_score(observations: Sequence[tuple[float, float, float]], null_
 def chart_transfer_operator(output_chart_jets: NDArray[np.float64], ambient_jvps: NDArray[np.float64], weights: NDArray[np.float64] | None = ...) -> dict[Any, Any]: ...
 
 def check_json(model: _FittedModel, headers: Sequence[str], rows: _EncodedTable) -> str: ...
-
-def check_parameter_use_site_reads(edits: Sequence[tuple[str, int, str, str]], reads: Sequence[tuple[str, int, str, str]]) -> None: ...
 
 def check_payload_from_model(model: _FittedModel, headers: Sequence[str], rows: _EncodedTable) -> Any: ...
 

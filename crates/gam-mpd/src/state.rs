@@ -322,13 +322,12 @@ impl ObservabilitySpectrum {
 /// ```
 ///
 /// every readout pulled back along every declared word with unit weight. It is
-/// the per-step stacked factor of the operation-first probes: from the last step
-/// backward, `S = [F_{l+1}; R_l]` and `F_l = [S T_{l,1}; …; S T_{l,H}]`, so
+/// formed as a per-step stacked factor: from the last step backward, `S = [F_{l+1}; R_l]` and `F_l = [S T_{l,1}; …; S T_{l,H}]`, so
 /// `F_lᵀ F_l = Σ_a T_{l,a}ᵀ (F_{l+1}ᵀ F_{l+1} + Σ R_lᵀ R_l) T_{l,a}` and
 /// `G = F_0ᵀ F_0`. A time-invariant family pulled back to depth `k` is one step
-/// repeated `k` times. The range of `G` lies in the exact observable subspace
-/// that [`LinearStateQuotient::close`] computes for the same readouts and
-/// letters; what the weighting adds is how strongly each direction is read.
+/// repeated `k` times. The range of `G` is the exact observable subspace of the
+/// same readouts and letters; what the weighting adds is how strongly each
+/// direction is read.
 /// Exact rank questions are generically saturated on trained weights, so the
 /// spectrum, not the rank, carries the information.
 ///
