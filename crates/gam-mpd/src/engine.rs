@@ -226,14 +226,29 @@ pub struct Decomposition {
     pub ties: Vec<Tie>,
 }
 
-/// A certified program whose total is not proven longer than the returned program's.
+/// A certified program whose total is not proven longer than the returned program's, kept as the
+/// program the search held and the edits it was refused with (a held program shares its operators,
+/// so a tie costs only what its edits change).
 #[derive(Clone, Debug)]
 pub struct Tie {
-    pub program: OperatorProgram,
+    pub base: OperatorProgram,
+    pub edits: Vec<Edit>,
     pub score: ProgramScore,
     pub description: String,
     /// Whether every edit that produced it from the held program is exact in exact arithmetic.
     pub exact: bool,
+}
+
+impl Tie {
+    /// The tied program.
+    pub fn program(&self) -> Result<OperatorProgram, EngineError> {
+        let mut program = self.base.clone();
+        for edit in &self.edits {
+            apply_edit(&mut program, edit)?;
+        }
+        program.prune();
+        Ok(program)
+    }
 }
 
 /// One certified program on the structure function.
@@ -619,11 +634,11 @@ pub fn decompose_with_reference(
     let mut ties = std::mem::take(&mut chosen.ties);
     for other in results {
         if !chosen.score.proven_shorter_than(&other.score) && other.program != chosen.program {
-            ties.push(Tie { program: other.program, score: other.score, description: "another start's result".to_string(), exact: false });
+            ties.push(Tie { base: other.program, edits: Vec::new(), score: other.score, description: "another start's result".to_string(), exact: false });
         }
         ties.extend(other.ties);
     }
-    ties.retain(|tie| !chosen.score.proven_shorter_than(&tie.score) && tie.program != chosen.program);
+    ties.retain(|tie| !chosen.score.proven_shorter_than(&tie.score) && !(tie.edits.is_empty() && tie.base == chosen.program));
     chosen.ties = ties;
     chosen.curve = curve;
     Ok(chosen)
@@ -798,7 +813,8 @@ fn search(
             }
             if !current.proven_shorter_than(&score) {
                 ties.push(Tie {
-                    program: candidate,
+                    base: program.clone(),
+                    edits: members.iter().map(|&m| screened[m].proposal.edit.clone()).collect(),
                     score: score.clone(),
                     description: members.iter().map(|&m| screened[m].proposal.description.as_str()).collect::<Vec<_>>().join("; "),
                     exact: members.iter().all(|&m| matches!(screened[m].proposal.exactness, Exactness::Exact { .. })),

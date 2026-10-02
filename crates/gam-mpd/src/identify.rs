@@ -230,10 +230,11 @@ pub fn identify(model: &OperatorProgram, contract: &Contract, decomposition: &De
     let returned = &decomposition.program;
     let mut alternatives = Vec::new();
     for tie in &decomposition.ties {
-        let relation = if same_function(contract, returned, &tie.program)? {
+        let tied = tie.program()?;
+        let relation = if same_function(contract, returned, &tied)? {
             if tie.score.structure_bits == decomposition.score.structure_bits { Relation::Gauge } else { Relation::Abstraction }
         } else {
-            match witness(model, contract, returned, &tie.program)? {
+            match witness(model, contract, returned, &tied)? {
                 Some(w) => Relation::Distinct(w),
                 None => Relation::Redundant,
             }
