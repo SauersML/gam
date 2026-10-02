@@ -566,7 +566,15 @@ fn insert_coefficient_into_saved_fit(
         if let Some(influence) = inference.coefficient_influence.as_mut() {
             *influence = insert_symmetric_array2(influence, index, 0.0)?;
         }
-        if let Some(correction) = inference.smoothing_correction.as_mut() {
+        // Both the primary correction and the retained first-order one (which
+        // the corrected-EDF channel reads) gain the new level's zero row.
+        for correction in [
+            inference.smoothing_correction.as_mut(),
+            inference.smoothing_correction_first_order.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
             *correction = insert_symmetric_array2(correction, index, 0.0)?;
         }
         if let Some(qs) = inference.reparam_qs.as_mut() {

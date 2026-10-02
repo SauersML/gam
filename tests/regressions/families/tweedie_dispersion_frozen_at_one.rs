@@ -25,7 +25,9 @@
 //!    (the last term is the `n` vs `n − p_β` divisor bias). A frozen φ = 1
 //!    misses 0.3 and 8.0 by about 100 and 23 standard deviations.
 //! 2. **SE(η̂) is `√φ̂` times the unit-dispersion SE.** For the unpenalized
-//!    `y ~ x` fit the covariance is `φ̂ · I(β̂)⁻¹`. The test rebuilds both
+//!    `y ~ linear(x, double_penalty=false)` fit the covariance is `φ̂ · I(β̂)⁻¹`
+//!    (`y ~ x` carries the default REML-selected shrinkage ridge on the slope,
+//!    whose `S_λ` sits inside `I(β̂) + S_λ`). The test rebuilds both
 //!    legitimate information matrices from the fit's own `μ̂`: expected
 //!    (Fisher) weights `μ̂^{2−p}` and observed (Newton) weights
 //!    `μ̂^{2−p} + (p − 1)(y − μ̂)μ̂^{1−p}`. The engine's SE must lie between the
@@ -70,7 +72,7 @@ use rand_distr::{Distribution, Gamma, Poisson, Uniform};
 const B0: f64 = 1.0;
 const BX: f64 = 0.5;
 const TWEEDIE_P: f64 = 1.5;
-/// Number of mean coefficients in `y ~ x` (intercept and slope).
+/// Number of mean coefficients in the fitted formula (intercept and slope).
 const N_COEF: usize = 2;
 /// Standard deviations allowed between φ̂ and the true φ.
 const PHI_Z: f64 = 4.0;
@@ -149,7 +151,7 @@ struct TweedieFit {
     phi: f64,
 }
 
-/// Fit `y ~ x` as a Tweedie(log) model on `(x, y)` and return the engine's
+/// Fit the unpenalized `y ~ linear(x, double_penalty=false)` as a Tweedie(log) model on `(x, y)` and return the engine's
 /// linear-predictor SEs on `eval`, the two reference SEs rebuilt from the
 /// fit's own `μ̂`, and the fitted dispersion.
 fn fit_tweedie(x: &[f64], y: &[f64], eval: &[f64]) -> Result<TweedieFit, String> {
@@ -168,7 +170,7 @@ fn fit_tweedie(x: &[f64], y: &[f64], eval: &[f64]) -> Result<TweedieFit, String>
         ..FitConfig::default()
     };
     let FitResult::Standard(fit) =
-        fit_from_formula("y ~ x", &ds, &cfg).map_err(|e| format!("fit: {e}"))?
+        fit_from_formula("y ~ linear(x, double_penalty=false)", &ds, &cfg).map_err(|e| format!("fit: {e}"))?
     else {
         return Err("expected a standard fit".to_string());
     };

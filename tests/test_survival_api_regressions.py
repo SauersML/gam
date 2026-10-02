@@ -203,11 +203,16 @@ def test_joint_competing_risks_survival_is_reachable_from_fit(tmp_path) -> None:
             interval_pred.overall_survival, pred.overall_survival
         )
 
+        # The cumulative incidence has no derived central interval, so its band
+        # is refused by name (gam#3560); its point estimate and SE publish.
+        assert interval_pred.cif_band_refusal
+        cif_se = np.asarray(interval_pred.cif_se, dtype=float)
+        assert cif_se.shape == (2 * 3, interval_pred.times.size)
+        assert np.all(np.isfinite(cif_se)) and np.all(cif_se >= 0.0)
         cause_surface_fields = (
             "hazard",
             "survival",
             "cumulative_hazard",
-            "cif",
         )
         for field in cause_surface_fields:
             point = np.asarray(getattr(interval_pred, field), dtype=float)

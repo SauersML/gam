@@ -2675,7 +2675,7 @@ fn survival_unified_fit_result(
     // itself. Its mean — not the mode — is what the fit publishes, and its
     // covariance is the truncated one. With no cone row within reach of the
     // ambient law the truncation is invisible and nothing changes.
-    let constrained_posterior = match (ambient_conditional.as_ref(), coefficient_lower_bounds) {
+    let mut constrained_posterior = match (ambient_conditional.as_ref(), coefficient_lower_bounds) {
         (Some(ambient), Some(lower_bounds)) => survival_bound_truncated_posterior(
             ambient,
             &beta,
@@ -2807,8 +2807,67 @@ fn survival_unified_fit_result(
             _ => (None, None),
         }
     };
+    // A constrained posterior's smoothing-corrected law is the θ-mixture of its
+    // node truncations (gam#3229), the object the custom-family routes publish
+    // through `attach_smoothing_mixture`: its covariance is the corrected
+    // covariance and a predictor reads its law, so the interval and the standard
+    // error describe one posterior. The drift of `H` along `ρ_k` is `λ_k S_k`
+    // over block k's range, in the identity gauge `H` lives in. A mixture the
+    // nodes cannot form leaves the first-order truncation below in place.
+    let mut mixture_covariance = None;
+    if let (false, Some(geometry), Some(_), Some(outer_hessian), Some(certificate)) = (
+        lambda_is_fixed,
+        constrained_posterior.as_mut(),
+        smoothing_corrected.as_ref(),
+        outer_hessian.as_ref(),
+        criterion_certificate.as_ref(),
+    ) && outer_hessian.nrows() == penalty_blocks.len()
+    {
+        let mut excluded: Vec<usize> = certificate.lambdas_railed.clone();
+        for rail in certificate.stationarity.rails() {
+            if !excluded.contains(&rail.index) {
+                excluded.push(rail.index);
+            }
+        }
+        let p = beta.len();
+        let drifts: Vec<Array2<f64>> = penalty_blocks
+            .iter()
+            .enumerate()
+            .map(|(coordinate, block)| {
+                let mut drift = Array2::<f64>::zeros((p, p));
+                drift
+                    .slice_mut(s![block.range.clone(), block.range.clone()])
+                    .scaled_add(lambdas[coordinate], &block.matrix);
+                drift
+            })
+            .collect();
+        let no_gradient = Array1::<f64>::zeros(0);
+        match gam_custom_family::attach_smoothing_mixture(
+            geometry,
+            penalized_hessian.as_array(),
+            &drifts,
+            outer_hessian,
+            outer_gradient.as_ref().unwrap_or(&no_gradient),
+            &excluded,
+            0,
+        )
+        .map_err(|reason| format!("survival transformation smoothing mixture: {reason}"))?
+        {
+            None => {
+                mixture_covariance = geometry
+                    .smoothing_mixture()
+                    .and_then(|mixture| mixture.covariance().cloned());
+            }
+            Some(absence) => log::debug!(
+                "[smoothing-correction] survival transformation publishes the first-order \
+                 truncation: {absence}"
+            ),
+        }
+    }
     let covariance_corrected = if lambda_is_fixed {
         covariance_conditional.clone()
+    } else if mixture_covariance.is_some() {
+        mixture_covariance
     } else {
         let ambient_corrected = smoothing_corrected
             .as_ref()

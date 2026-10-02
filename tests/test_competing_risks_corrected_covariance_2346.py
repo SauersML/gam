@@ -89,14 +89,16 @@ def test_competing_risks_default_mode_uses_smoothing_corrected_covariance() -> N
         np.asarray(explicit.cif, dtype=float), np.asarray(pred.cif, dtype=float)
     )
 
-    # (3) The corrected matrix strictly inflates over the conditional one
-    # somewhere: conditional-mode SEs must never exceed corrected SEs beyond
-    # roundoff, and at least one must strictly grow.
+    # (3) The corrected law is not the conditional one: the rho-uncertainty
+    # correction is live on the CIF surface. The two are compared for
+    # difference, not order: both are the Gaussian truncated to the baseline
+    # cone (gam#3575), and truncation does not preserve the pointwise order of
+    # two Gaussians' variances; the correction's own PSD is pinned on the fit
+    # (tests/survival/survival/competing_risks_corrected_covariance_2346.rs).
     conditional = model.predict(rows, interval=0.9, covariance_mode="conditional")
     assert conditional.covariance_source == "conditional"
     cond_se = np.asarray(conditional.cif_se, dtype=float)
     mask = np.isfinite(cond_se) & np.isfinite(cif_se)
-    assert np.all(cif_se[mask] >= cond_se[mask] - 1e-10 * (1.0 + cond_se[mask]))
-    assert np.any(cif_se[mask] > cond_se[mask] * (1.0 + 1e-9) + 1e-14), (
-        "rho-uncertainty inflation must strictly widen at least one CIF SE"
+    assert np.any(cif_se[mask] != cond_se[mask]), (
+        "the rho-uncertainty correction must change at least one CIF SE"
     )
