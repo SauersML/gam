@@ -1502,7 +1502,7 @@ impl OperatorProgram {
         let interfaces = self.interfaces()?;
         // Each changed operator's difference `A_new − A_old` (one vectorized subtraction), and the
         // rows it changes.
-        let mut changed_ops: BTreeMap<usize, (Array2<f64>, Vec<usize>)> = BTreeMap::new();
+        let mut changed_ops: BTreeMap<usize, (Array2<f64>, Vec<usize>, Vec<usize>)> = BTreeMap::new();
         for (index, (new, old)) in self.operators.iter().zip(&base_program.operators).enumerate() {
             // A shared operator is unchanged without a look at its reals.
             if Arc::ptr_eq(new, old) || new.body == old.body {
@@ -1514,7 +1514,9 @@ impl OperatorProgram {
             let difference = &*new.matrix_cow() - &*old.matrix_cow();
             let rows: Vec<usize> =
                 difference.outer_iter().enumerate().filter(|(_, row)| row.iter().any(|v| *v != 0.0)).map(|(r, _)| r).collect();
-            changed_ops.insert(index, (difference, rows));
+            let cols: Vec<usize> =
+                difference.columns().into_iter().enumerate().filter(|(_, col)| col.iter().any(|v| *v != 0.0)).map(|(c, _)| c).collect();
+            changed_ops.insert(index, (difference, rows, cols));
         }
         let mut changes: BTreeMap<usize, Change> = BTreeMap::new();
         for (index, node) in self.nodes.iter().enumerate() {
@@ -1531,9 +1533,10 @@ impl OperatorProgram {
                     let mut touched = vec![false; base_value.ncols()];
                     for (argument, operator) in terms {
                         let x = &base.values[*argument];
-                        if let Some((difference, rows)) = changed_ops.get(operator) {
-                            let changed = difference.select(Axis(0), rows);
-                            let product = x.dot(&changed.t());
+                        if let Some((difference, rows, cols)) = changed_ops.get(operator) {
+                            // Only the changed rows and columns of the difference take part.
+                            let changed = difference.select(Axis(1), cols).select(Axis(0), rows);
+                            let product = x.select(Axis(1), cols).dot(&changed.t());
                             for (k, &t) in rows.iter().enumerate() {
                                 let mut target = delta.column_mut(t);
                                 target += &product.column(k);
@@ -1548,7 +1551,7 @@ impl OperatorProgram {
                         }
                     }
                     if let Some(op) = bias
-                        && let Some((difference, rows)) = changed_ops.get(op)
+                        && let Some((difference, rows, _)) = changed_ops.get(op)
                     {
                         for &t in rows {
                             delta.column_mut(t).mapv_inplace(|v| v + difference[[t, 0]]);
