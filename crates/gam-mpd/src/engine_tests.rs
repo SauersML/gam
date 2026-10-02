@@ -15,6 +15,7 @@ use super::operator_rewrites::{PlaneBasis, change_basis};
 use super::precision::DeclaredPrecision;
 use ndarray::Array2;
 use std::f64::consts::TAU;
+use std::sync::Arc;
 
 const P: usize = 7;
 const PLANTED: usize = 2;
@@ -64,7 +65,7 @@ fn planted_program(declared: bool) -> (OperatorProgram, Contract) {
     let program = OperatorProgram { rules: Vec::new(),
         declarations: declarations.clone(),
         bases: vec![Basis::Indicator { domain: 0 }, Basis::Indicator { domain: 1 }],
-        operators,
+        operators: operators.into_iter().map(Arc::new).collect(),
         nodes,
         output: 4,
     };
@@ -197,7 +198,7 @@ fn duplicating_a_component_never_shortens_the_program_or_changes_the_verdict() {
             .expect("dense");
         parts.insert(0, first);
         let start = duplicated.operators.len();
-        duplicated.operators.extend(parts);
+        duplicated.operators.extend(parts.into_iter().map(Arc::new));
         duplicated.nodes[3] = Node::Affine { terms: (0..copies).map(|i| (2, start + i)).collect(), bias: None };
         duplicated.prune();
         let fidelity = contract.score(&duplicated, &reference).expect("score");
@@ -213,14 +214,16 @@ fn rescaling_a_component_by_a_power_of_two_changes_only_the_precision_field() {
     let base = contract.score(&program, &reference).expect("score");
     let mut rescaled = program.clone();
     let (e, u) = (rescaled.operators[0].clone(), rescaled.operators[1].clone());
-    let OperatorBody::Dense { precision: pe, .. } = e.body else { panic!("dense") };
-    let OperatorBody::Dense { precision: pu, .. } = u.body else { panic!("dense") };
-    rescaled.operators[0] =
+    let OperatorBody::Dense { precision: pe, .. } = e.body.clone() else { panic!("dense") };
+    let OperatorBody::Dense { precision: pu, .. } = u.body.clone() else { panic!("dense") };
+    rescaled.operators[0] = Arc::new(
         Operator::dense("E", e.rows.clone(), e.cols.clone(), e.matrix() * 4.0, precision(pe.fraction_bits() - 2), Provenance::default())
-            .expect("dense");
-    rescaled.operators[1] =
+            .expect("dense"),
+    );
+    rescaled.operators[1] = Arc::new(
         Operator::dense("U", u.rows.clone(), u.cols.clone(), u.matrix() * 0.25, precision(pu.fraction_bits() + 2), Provenance::default())
-            .expect("dense");
+            .expect("dense"),
+    );
     let fidelity = contract.score(&rescaled, &reference).expect("score");
     assert_eq!(fidelity.evaluation.argmax_disagreements, base.evaluation.argmax_disagreements);
     // The lattice indices are identical; only the two precision codewords can differ in length.
@@ -238,11 +241,11 @@ fn a_finer_partition_of_an_interface_changes_only_the_structure_code() {
     let mut split = program.clone();
     let e = split.operators[0].clone();
     let u = split.operators[1].clone();
-    let OperatorBody::Dense { precision: pe, .. } = e.body else { panic!("dense") };
-    let OperatorBody::Dense { precision: pu, .. } = u.body else { panic!("dense") };
+    let OperatorBody::Dense { precision: pe, .. } = e.body.clone() else { panic!("dense") };
+    let OperatorBody::Dense { precision: pu, .. } = u.body.clone() else { panic!("dense") };
     let units = Interface::uniform(WIDTH, 1, LabelKind::Unit, 0).expect("interface");
-    split.operators[0] = Operator::dense("E", units.clone(), e.cols.clone(), e.matrix(), pe, Provenance::default()).expect("dense");
-    split.operators[1] = Operator::dense("U", u.rows.clone(), units, u.matrix(), pu, Provenance::default()).expect("dense");
+    split.operators[0] = Arc::new(Operator::dense("E", units.clone(), e.cols.clone(), e.matrix(), pe, Provenance::default()).expect("dense"));
+    split.operators[1] = Arc::new(Operator::dense("U", u.rows.clone(), units, u.matrix(), pu, Provenance::default()).expect("dense"));
     let fidelity = contract.score(&split, &reference).expect("score");
     assert_eq!(fidelity.evaluation.argmax_disagreements, base.evaluation.argmax_disagreements);
     assert_eq!(fidelity.evaluation.max_kl, base.evaluation.max_kl);
@@ -259,7 +262,7 @@ fn a_warm_start_never_leaves_the_result_longer_than_the_native_start() {
     // REPEATS observations per input it is far longer than the native program, and a search that
     // only restricts can never put the readout back.
     let mut empty = program.clone();
-    let OperatorBody::Dense { values, present, .. } = &mut empty.operators[1].body else { panic!("dense") };
+    let OperatorBody::Dense { values, present, .. } = &mut Arc::make_mut(&mut empty.operators[1]).body else { panic!("dense") };
     present.fill(false);
     values.fill(0.0);
     let warm = contract.score(&empty, &reference).expect("warm score");
@@ -300,8 +303,8 @@ fn the_explanations_list_each_inputs_active_units_in_the_librarys_code() {
     let units = Interface::uniform(WIDTH, 1, LabelKind::Unit, 0).expect("interface");
     let (e, u) = (program.operators[0].clone(), program.operators[1].clone());
     let shifted = e.matrix() - 0.5;
-    program.operators[0] = Operator::dense("E", units.clone(), e.cols.clone(), shifted, precision(30), Provenance::default()).expect("dense");
-    program.operators[1] = Operator::dense("U", u.rows.clone(), units, u.matrix(), precision(30), Provenance::default()).expect("dense");
+    program.operators[0] = Arc::new(Operator::dense("E", units.clone(), e.cols.clone(), shifted, precision(30), Provenance::default()).expect("dense"));
+    program.operators[1] = Arc::new(Operator::dense("U", u.rows.clone(), units, u.matrix(), precision(30), Provenance::default()).expect("dense"));
     program.nodes = vec![
         Node::Feature { slot: 0, basis: 0 },
         Node::Feature { slot: 1, basis: 0 },

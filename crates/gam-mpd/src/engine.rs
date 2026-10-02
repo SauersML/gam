@@ -45,6 +45,7 @@ use super::precision::DeclaredPrecision;
 use super::secant::BandedMatrix;
 use ndarray::{Array2, s};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::fmt;
 
 /// Whether a proposal is an algebraic identity or changes the computed function.
@@ -323,10 +324,12 @@ pub fn apply_edit(program: &mut OperatorProgram, edit: &Edit) -> Result<(), Engi
     match edit {
         Edit::DropBlocks { blocks } => drop_blocks(program, blocks),
         Edit::Precision { operator, precision } => {
-            let op = program
-                .operators
-                .get_mut(*operator)
-                .ok_or(EngineError::Program(ProgramError::Reference { what: "operator", index: *operator }))?;
+            let op = Arc::make_mut(
+                program
+                    .operators
+                    .get_mut(*operator)
+                    .ok_or(EngineError::Program(ProgramError::Reference { what: "operator", index: *operator }))?,
+            );
             // The target lattice is derived from the operator's range, so a proposed step never
             // overflows the lattice code.
             let precision = &precision.within_range(op.largest_real());
@@ -369,10 +372,12 @@ pub fn apply_edit(program: &mut OperatorProgram, edit: &Edit) -> Result<(), Engi
 
 fn drop_blocks(program: &mut OperatorProgram, blocks: &[BlockRef]) -> Result<(), EngineError> {
     for block in blocks {
-        let op = program
-            .operators
-            .get_mut(block.operator)
-            .ok_or(EngineError::Program(ProgramError::Reference { what: "operator", index: block.operator }))?;
+        let op = Arc::make_mut(
+            program
+                .operators
+                .get_mut(block.operator)
+                .ok_or(EngineError::Program(ProgramError::Reference { what: "operator", index: block.operator }))?,
+        );
         let (rows, cols) = (op.rows.range(block.row), op.cols.range(block.col));
         let OperatorBody::Dense { values, present, .. } = &mut op.body else {
             return Err(EngineError::Primitive(format!("operator {} has no blocks", op.name)));

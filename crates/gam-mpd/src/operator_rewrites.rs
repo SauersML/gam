@@ -38,6 +38,7 @@ use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
 use ndarray::{Array2, Axis, s};
 use std::collections::BTreeSet;
 use std::f64::consts::TAU;
+use std::sync::Arc;
 
 fn exact(derivation: String) -> Exactness {
     Exactness::Exact { derivation }
@@ -159,7 +160,7 @@ impl Primitive for FoldConstants {
                     precision,
                     Provenance::derived(&[], format!("node {index} is constant on the family")),
                 )?;
-                candidate.operators.push(operator);
+                candidate.operators.push(Arc::new(operator));
                 candidate.nodes[index] = Node::Constant { operator: candidate.operators.len() - 1 };
             }
             candidate.prune();
@@ -220,7 +221,7 @@ impl Primitive for BilinearConstantSide {
                 band,
                 Provenance::derived(&[&program.operators[constant].provenance], format!("scale {c} times the constant side")),
             )?;
-            candidate.operators.push(operator);
+            candidate.operators.push(Arc::new(operator));
             candidate.nodes[index] = Node::Affine { terms: vec![(varying, candidate.operators.len() - 1)], bias: None };
             candidate.prune();
             out.push(structural(
@@ -265,7 +266,7 @@ impl Primitive for ComposeAffine {
                         band,
                         Provenance::derived(&[&a.provenance, &b.provenance], format!("{} {}", a.name, b.name)),
                     )?;
-                    candidate.operators.push(operator);
+                    candidate.operators.push(Arc::new(operator));
                     new_terms.push((*z, candidate.operators.len() - 1));
                 }
                 let mut new_bias = *bias;
@@ -285,7 +286,7 @@ impl Primitive for ComposeAffine {
                         band,
                         Provenance::derived(&[&a.provenance, &b.provenance], format!("{} {} (+ bias)", a.name, b.name)),
                     )?;
-                    candidate.operators.push(operator);
+                    candidate.operators.push(Arc::new(operator));
                     new_bias = Some(candidate.operators.len() - 1);
                 }
                 candidate.nodes[index] = Node::Affine { terms: new_terms, bias: new_bias };
@@ -345,14 +346,14 @@ impl Primitive for PushThroughMix {
                 let b = &program.operators[shared];
                 let mut candidate = program.clone();
                 let (values, band) = product(a, b);
-                candidate.operators.push(product_operator(
+                candidate.operators.push(Arc::new(product_operator(
                     format!("{}·{}", a.name, b.name),
                     a.rows.clone(),
                     b.cols.clone(),
                     values,
                     band,
                     Provenance::derived(&[&a.provenance, &b.provenance], format!("{} {} through the mix", a.name, b.name)),
-                )?);
+                )?));
                 let moved_op = candidate.operators.len() - 1;
                 let weight_interface = context.interfaces[*weights].clone();
                 let mut routed = Array2::<f64>::zeros((a.rows.width(), weight_interface.width()));
@@ -376,14 +377,14 @@ impl Primitive for PushThroughMix {
                 new_terms.push((mix_index, moved_op));
                 if routed.iter().any(|v| *v != 0.0) {
                     let weights_shifted = if *weights >= index { *weights + 1 } else { *weights };
-                    candidate.operators.push(product_operator(
+                    candidate.operators.push(Arc::new(product_operator(
                         format!("{}·bias", a.name),
                         a.rows.clone(),
                         weight_interface,
                         routed,
                         routed_band,
                         Provenance::derived(&parts, format!("{} times each payload's bias, read by its routing weight", a.name)),
-                    )?);
+                    )?));
                     new_terms.push((weights_shifted, candidate.operators.len() - 1));
                 }
                 if shifted_bias != *bias {
@@ -467,14 +468,14 @@ impl Primitive for CenterLogits {
             }
             let centred = values - &means.insert_axis(Axis(0));
             let mut candidate = program.clone();
-            candidate.operators[index] = Operator::dense(
+            candidate.operators[index] = Arc::new(Operator::dense(
                 op.name.clone(),
                 op.rows.clone(),
                 op.cols.clone(),
                 centred,
                 *precision,
                 Provenance::derived(&[&op.provenance], "column means over the classes removed (softmax shift)".to_string()),
-            )?;
+            )?);
             out.push(structural(
                 "center_logits",
                 ProposalKind::Reduce,
@@ -615,7 +616,7 @@ impl Primitive for StackTerms {
             }
             let parts_provenance: Vec<&Provenance> = stackable.iter().map(|(_, op)| &program.operators[*op].provenance).collect();
             let mut candidate = program.clone();
-            candidate.operators.push(Operator::blocks(
+            candidate.operators.push(Arc::new(Operator::blocks(
                 format!("stack{index}"),
                 rows,
                 cols,
@@ -623,7 +624,7 @@ impl Primitive for StackTerms {
                 present,
                 precision,
                 Provenance::derived(&parts_provenance, "the terms side by side".to_string()),
-            )?);
+            )?));
             let stacked = candidate.operators.len() - 1;
             let concat = insert_node(&mut candidate, index, Node::Concat { parts });
             let mut new_terms: Vec<(usize, usize)> = terms
@@ -735,14 +736,14 @@ pub fn change_basis(
     for &op in &readers {
         let old = &program.operators[op];
         let (values, band) = transform(&old.matrix(), &m, &r, half_step(old));
-        candidate.operators[op] = product_operator(
+        candidate.operators[op] = Arc::new(product_operator(
             old.name.clone(),
             old.rows.clone(),
             character_interface.clone(),
             values,
             band,
             Provenance::derived(&[&old.provenance], format!("times Φ⁻¹ of the cycle on domain {domain}")),
-        )?;
+        )?);
     }
     for index in &features {
         if let Node::Feature { basis: b, .. } = &mut candidate.nodes[*index] {
@@ -760,14 +761,14 @@ pub fn change_basis(
         let rotated = |op: usize, candidate: &mut OperatorProgram| -> Result<usize, EngineError> {
             let old = &program.operators[op];
             let (values, band) = transform_rows(&mt, &rt, &old.matrix(), half_step(old));
-            candidate.operators.push(product_operator(
+            candidate.operators.push(Arc::new(product_operator(
                 format!("Φ⁻ᵀ·{}", old.name),
                 character_interface.clone(),
                 old.cols.clone(),
                 values,
                 band,
                 Provenance::derived(&[&old.provenance], format!("Φ⁻ᵀ of the cycle on domain {domain} times")),
-            )?);
+            )?));
             Ok(candidate.operators.len() - 1)
         };
         let mut new_terms = Vec::new();

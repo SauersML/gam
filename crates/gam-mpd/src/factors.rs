@@ -85,6 +85,7 @@ use super::precision::DeclaredPrecision;
 use gam_linalg::roundoff::SymmetricAssembly;
 use ndarray::{Array1, Array2, Axis, s};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 /// Shared factors fitted in the code's metric (module note).
 pub struct Factors;
@@ -549,14 +550,14 @@ fn factor(program: &OperatorProgram, component: &Component, fit: &Fit, r: usize,
     let right_largest = right.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
     let Some(right_precision) = lattice(right_step, right_largest) else { return Ok(None) };
     let mut candidate = program.clone();
-    candidate.operators.push(sparse_operator(
+    candidate.operators.push(Arc::new(sparse_operator(
         format!("basis of {}", names.join("+")),
         factor_interface.clone(),
         argument_interface,
         right.clone(),
         right_precision,
         Provenance::derived(&parts, "curvature-whitened shared basis".to_string()),
-    )?);
+    )?));
     let basis = candidate.operators.len() - 1;
     let basis_matrix = candidate.operators[basis].matrix();
     let mut coefficient_of: BTreeMap<usize, usize> = BTreeMap::new();
@@ -576,7 +577,7 @@ fn factor(program: &OperatorProgram, component: &Component, fit: &Fit, r: usize,
         )?;
         // The mean the factored operator misses, folded into its readers' biases.
         let missed = old.matrix().dot(&fit.mean) - coefficients.matrix().dot(&basis_matrix.dot(&fit.mean));
-        candidate.operators.push(coefficients);
+        candidate.operators.push(Arc::new(coefficients));
         coefficient_of.insert(op, candidate.operators.len() - 1);
         residual_of.insert(op, missed);
     }
@@ -627,7 +628,7 @@ fn factor(program: &OperatorProgram, component: &Component, fit: &Fit, r: usize,
         };
         let largest = values.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
         let precision = precision.within_range(largest);
-        candidate.operators.push(Operator::dense(name, rows, Interface::constant(), values, precision, provenance)?);
+        candidate.operators.push(Arc::new(Operator::dense(name, rows, Interface::constant(), values, precision, provenance)?));
         let op = candidate.operators.len() - 1;
         new_bias.insert(reader, op);
         made.push((*bias, key, op));

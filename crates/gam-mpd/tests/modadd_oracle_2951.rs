@@ -164,12 +164,12 @@ fn oracle(model: &OperatorProgram, contract: &Contract) -> OperatorProgram {
     let unit_interface = program.interfaces().expect("interfaces")[pre].clone();
     let class_interface = program.operators[w_u].rows.clone();
     let push = |program: &mut OperatorProgram, op: Operator| {
-        program.operators.push(op);
+        program.operators.push(std::sync::Arc::new(op));
         program.operators.len() - 1
     };
     let e_op = &program.operators[embedding];
     let e_new = Operator::dense("W_E on five planes", e_op.rows.clone(), e_op.cols.clone(), e, fine(), Provenance::default()).expect("dense");
-    program.operators[embedding] = e_new;
+    program.operators[embedding] = std::sync::Arc::new(e_new);
     let read_op = push(&mut program, Operator::dense("Fourier reads", read_factors.clone(), mid_interface, read, fine(), Provenance::default()).expect("dense"));
     let coefficient_op = push(
         &mut program,

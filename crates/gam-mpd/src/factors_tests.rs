@@ -13,6 +13,7 @@ use super::precision::DeclaredPrecision;
 use ndarray::Array2;
 use std::collections::BTreeSet;
 use std::f64::consts::TAU;
+use std::sync::Arc;
 
 const P: usize = 11;
 const WIDTH: usize = 16;
@@ -93,7 +94,7 @@ fn planted() -> (OperatorProgram, Contract) {
     let program = OperatorProgram {
         declarations: declarations.clone(),
         bases: vec![Basis::Indicator { domain: 0 }, Basis::Indicator { domain: 1 }],
-        operators,
+        operators: operators.into_iter().map(Arc::new).collect(),
         rules: Vec::new(),
         nodes,
         output: 6,
@@ -208,7 +209,7 @@ fn the_reverse_pass_through_rotary_causal_attention_is_the_transpose_of_the_forw
     let program = OperatorProgram {
         declarations: Declarations { parameters: 0, domains: Vec::new(), slots: vec![Slot::Raw { width }] },
         bases: Vec::new(),
-        operators,
+        operators: operators.into_iter().map(Arc::new).collect(),
         rules: Vec::new(),
         nodes: vec![
             Node::Raw { slot: 0 },

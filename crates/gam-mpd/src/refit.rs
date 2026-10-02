@@ -27,6 +27,7 @@ use super::operator_program::{FamilyInputs, Node, Operator, OperatorBody, Operat
 use gam_linalg::roundoff::accumulation_growth;
 use gam_linalg::utils::solve_spd_pcg_bounded_into;
 use ndarray::{Array1, Array2, Axis, s};
+use std::sync::Arc;
 
 /// How hard [`refit_readout`] searches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,7 +202,7 @@ pub fn refit_readout(
     for ((op, _), values) in slots.iter().zip(&parameters.values) {
         let old = &program.operators[*op];
         let OperatorBody::Dense { present, precision, .. } = &old.body else { continue };
-        refit.operators[*op] = Operator::blocks(
+        refit.operators[*op] = Arc::new(Operator::blocks(
             old.name.clone(),
             old.rows.clone(),
             old.cols.clone(),
@@ -209,7 +210,7 @@ pub fn refit_readout(
             present.clone(),
             *precision,
             Provenance::derived(&[&old.provenance], "refit to the contract's readout".to_string()),
-        )?;
+        )?);
     }
     Ok(refit)
 }

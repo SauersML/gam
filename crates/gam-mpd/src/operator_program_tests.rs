@@ -9,6 +9,7 @@ use super::operator_program::{
 use super::precision::DeclaredPrecision;
 use ndarray::{Array2, array};
 use qd::Quad;
+use std::sync::Arc;
 
 fn precision(bits: i32) -> DeclaredPrecision {
     DeclaredPrecision::new(bits).expect("a precision in range")
@@ -74,7 +75,7 @@ fn fixture() -> OperatorProgram {
     OperatorProgram { rules: Vec::new(),
         declarations,
         bases: vec![Basis::Indicator { domain: 0 }, Basis::Indicator { domain: 1 }],
-        operators,
+        operators: operators.into_iter().map(Arc::new).collect(),
         nodes,
         output: 14,
     }
@@ -112,7 +113,7 @@ fn message_decodes_to_the_program_at_its_computed_length() {
         let mut present = present.clone();
         present[[1, 0]] = false;
         present[[3, 0]] = false;
-        program.operators[5] = Operator::blocks(
+        program.operators[5] = Arc::new(Operator::blocks(
             "W_in",
             program.operators[5].rows.clone(),
             program.operators[5].cols.clone(),
@@ -121,9 +122,9 @@ fn message_decodes_to_the_program_at_its_computed_length() {
             *q,
             Provenance::default(),
         )
-        .expect("blocks");
+        .expect("blocks"));
     }
-    program.operators[0] = Operator::dense(
+    program.operators[0] = Arc::new(Operator::dense(
         "E",
         program.operators[0].rows.clone(),
         program.operators[0].cols.clone(),
@@ -131,7 +132,7 @@ fn message_decodes_to_the_program_at_its_computed_length() {
         precision(-1),
         Provenance::default(),
     )
-    .expect("coarse");
+    .expect("coarse"));
     program.bases[0] = Basis::Characters {
         domain: 0,
         positions: vec![Some(3), Some(0), Some(4), Some(1), Some(2), None, None],
@@ -139,7 +140,7 @@ fn message_decodes_to_the_program_at_its_computed_length() {
     };
     // A character basis has width 1 + 2·2 + 2 = 7, the indicator's width, with different groups.
     let character_cols = program.bases[0].interface(&program.declarations).expect("interface");
-    program.operators[0] = Operator::dense(
+    program.operators[0] = Arc::new(Operator::dense(
         "E",
         program.operators[0].rows.clone(),
         character_cols,
@@ -147,7 +148,7 @@ fn message_decodes_to_the_program_at_its_computed_length() {
         precision(12),
         Provenance::default(),
     )
-    .expect("character columns");
+    .expect("character columns"));
     let message = program.encode().expect("encodes");
     assert_eq!(message.len_bits(), program.code_bits().expect("length"));
     let decoded = OperatorProgram::decode(&message, &program.declarations).expect("decodes");
@@ -348,7 +349,7 @@ fn a_program_with_an_absent_block_executes_its_zero() {
     };
     let mut present = Array2::from_elem((5, 5), true);
     present[[2, 1]] = false;
-    program.operators[7] = Operator::blocks(
+    program.operators[7] = Arc::new(Operator::blocks(
         "W_out",
         program.operators[7].rows.clone(),
         program.operators[7].cols.clone(),
@@ -357,7 +358,7 @@ fn a_program_with_an_absent_block_executes_its_zero() {
         p,
         Provenance::default(),
     )
-    .expect("blocks");
+    .expect("blocks"));
     assert_eq!(program.operators[7].matrix()[[2, 1]], 0.0);
     assert_eq!(program.operators[7].real_count(), 24);
     let trace = program.execute(&family(), false).expect("executes");
@@ -431,13 +432,15 @@ fn incremental_execution_matches_a_full_execution() {
     let OperatorBody::Dense { values, present, precision: q } = &w_in.body else { panic!("dense") };
     let mut present = present.clone();
     present[[2, 0]] = false;
-    edited.operators[5] =
+    edited.operators[5] = Arc::new(
         Operator::blocks("W_in", w_in.rows.clone(), w_in.cols.clone(), values.clone(), present, *q, Provenance::default())
-            .expect("blocks");
+            .expect("blocks"),
+    );
     let w_out = edited.operators[7].clone();
-    edited.operators[7] =
+    edited.operators[7] = Arc::new(
         Operator::dense("W_out", w_out.rows.clone(), w_out.cols.clone(), w_out.matrix(), precision(3), Provenance::default())
-            .expect("coarse");
+            .expect("coarse"),
+    );
     if let Node::Pointwise { laws, .. } = &mut edited.nodes[12] {
         laws[0] = Law::Zero;
     }
@@ -498,14 +501,14 @@ fn splitting_an_operator_on_its_lattice_never_shortens_the_program() {
     let whole = OperatorProgram { rules: Vec::new(),
         declarations: declarations.clone(),
         bases: vec![],
-        operators: vec![op("whole", whole_values)],
+        operators: vec![Arc::new(op("whole", whole_values))],
         nodes: vec![Node::Raw { slot: 0 }, Node::Affine { terms: vec![(0, 0)], bias: None }],
         output: 1,
     };
     let split = OperatorProgram { rules: Vec::new(),
         declarations,
         bases: vec![],
-        operators: vec![op("first", first), op("second", second)],
+        operators: vec![Arc::new(op("first", first)), Arc::new(op("second", second))],
         nodes: vec![Node::Raw { slot: 0 }, Node::Affine { terms: vec![(0, 0), (0, 1)], bias: None }],
         output: 1,
     };
@@ -536,7 +539,7 @@ fn a_rule_is_sent_once_and_executes_at_each_call_and_a_gain_reads_the_declared_p
         rules: vec![rule],
         declarations: declarations.clone(),
         bases: vec![],
-        operators: vec![w.clone()],
+        operators: vec![Arc::new(w.clone())],
         nodes: vec![
             Node::Raw { slot: 0 },
             Node::Raw { slot: 1 },

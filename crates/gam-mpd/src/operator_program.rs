@@ -89,6 +89,7 @@ use gam_math::probability::{NORMAL_CDF_RELATIVE_ERROR, NORMAL_CDF_UNDERFLOW_FLOO
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
 use std::f64::consts::TAU;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::fmt;
 use std::ops::Range;
 
@@ -1036,7 +1037,9 @@ impl From<CodecError> for ProgramError {
 pub struct OperatorProgram {
     pub declarations: Declarations,
     pub bases: Vec<Basis>,
-    pub operators: Vec<Operator>,
+    /// Shared: a program's clone shares every operator it does not change (`Arc::make_mut` copies
+    /// one on its first change), so a candidate costs only what it edits.
+    pub operators: Vec<Arc<Operator>>,
     pub rules: Vec<Rule>,
     pub nodes: Vec<Node>,
     pub output: usize,
@@ -1383,7 +1386,7 @@ impl OperatorProgram {
 
     /// The total number of reals the program sends.
     pub fn real_count(&self) -> usize {
-        self.operators.iter().map(Operator::real_count).sum()
+        self.operators.iter().map(|op| op.real_count()).sum()
     }
 
     /// Execute on `inputs`, with forward-error bands when `bands`.
@@ -2440,7 +2443,7 @@ impl OperatorProgram {
 /// What a node list may reference: the program's operators, bases and declarations, the rules it
 /// may call, and (inside a rule body) the rule's argument interfaces.
 struct Scope<'a> {
-    operators: &'a [Operator],
+    operators: &'a [Arc<Operator>],
     bases: &'a [Basis],
     declarations: &'a Declarations,
     rules: &'a [Rule],
@@ -2451,7 +2454,7 @@ struct Scope<'a> {
 fn rule_interfaces(
     rules: &[Rule],
     rule: usize,
-    operators: &[Operator],
+    operators: &[Arc<Operator>],
     bases: &[Basis],
     declarations: &Declarations,
 ) -> Result<Vec<Interface>, ProgramError> {
@@ -3183,7 +3186,7 @@ fn encode_rules(out: &mut BitString, program: &OperatorProgram) -> Result<(), Pr
 
 fn decode_rules(
     reader: &mut BitReader<'_>,
-    operators: &[Operator],
+    operators: &[Arc<Operator>],
     bases: &[Basis],
     declarations: &Declarations,
 ) -> Result<Vec<Rule>, ProgramError> {
@@ -3238,7 +3241,7 @@ impl OperatorProgram {
             .iter()
             .map(|basis| basis_bits(basis, self.declarations.domains.len()))
             .collect::<Result<Vec<_>, _>>()?;
-        let operator_bits = self.operators.iter().map(operator_bits).collect::<Result<Vec<_>, _>>()?;
+        let operator_bits = self.operators.iter().map(|op| operator_bits(op)).collect::<Result<Vec<_>, _>>()?;
         let mut rules = BitString::new();
         encode_rules(&mut rules, self)?;
         let rule_bits = rules.len_bits();
@@ -3394,7 +3397,7 @@ impl OperatorProgram {
             let rows = read_interface(reader)?;
             let name = format!("decoded{index}");
             if kind == 0 {
-                operators.push(Operator::identity(name, rows));
+                operators.push(Arc::new(Operator::identity(name, rows)));
                 continue;
             }
             let cols = read_interface(reader)?;
@@ -3409,13 +3412,13 @@ impl OperatorProgram {
                     .map_err(|error| ProgramError::Code(error.to_string()))?;
                 let right = Array2::from_shape_vec((rank, cols.width()), reals[split..].to_vec())
                     .map_err(|error| ProgramError::Code(error.to_string()))?;
-                operators.push(Operator {
+                operators.push(Arc::new(Operator {
                     name,
                     rows,
                     cols,
                     body: OperatorBody::LowRank { left, right, precision },
                     provenance: Provenance::default(),
-                });
+                }));
                 continue;
             }
             let mut present = Array2::from_elem((rows.group_count(), cols.group_count()), false);
@@ -3439,13 +3442,13 @@ impl OperatorProgram {
             if next.next().is_some() {
                 return Err(ProgramError::Code(format!("operator {index} has too many reals")));
             }
-            operators.push(Operator {
+            operators.push(Arc::new(Operator {
                 name,
                 rows,
                 cols,
                 body: OperatorBody::Dense { values, present, precision },
                 provenance: Provenance::default(),
-            });
+            }));
         }
         let rules = decode_rules(reader, &operators, &bases, declarations)?;
         let rule_inputs: Vec<usize> = rules.iter().map(|r| r.inputs.len()).collect();

@@ -176,7 +176,7 @@ fn native(
     let program = OperatorProgram { rules: Vec::new(),
         declarations: declarations.clone(),
         bases: vec![Basis::Indicator { domain: 0 }, Basis::Indicator { domain: 1 }],
-        operators,
+        operators: operators.into_iter().map(std::sync::Arc::new).collect(),
         nodes,
         output,
     };
@@ -547,7 +547,7 @@ fn empty_program(model: &OperatorProgram, contract: &Contract) -> Result<Operato
     Ok(OperatorProgram { rules: Vec::new(),
         declarations: model.declarations.clone(),
         bases: Vec::new(),
-        operators: vec![operator],
+        operators: vec![std::sync::Arc::new(operator)],
         nodes: vec![Node::Constant { operator: 0 }],
         output: 0,
     })

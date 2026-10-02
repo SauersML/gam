@@ -31,6 +31,7 @@ use ndarray::{Array2, Axis, s};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 
 /// An imported model: its native program and the contract of its declared samples.
 pub struct Imported {
@@ -94,7 +95,7 @@ fn config(record: &Value, key: &str) -> Result<usize, String> {
 
 /// Builds a program node by node.
 struct Builder {
-    operators: Vec<Operator>,
+    operators: Vec<Arc<Operator>>,
     nodes: Vec<Node>,
 }
 
@@ -103,7 +104,7 @@ impl Builder {
         let precision = exact_precision(values.iter().copied()).map_err(|e| e.to_string())?;
         let op = Operator::dense(name, rows.clone(), cols.clone(), values, precision, Provenance::native(name))
             .map_err(|e| e.to_string())?;
-        self.operators.push(op);
+        self.operators.push(Arc::new(op));
         Ok(self.operators.len() - 1)
     }
 
@@ -198,7 +199,7 @@ fn transformer(tensors: &Tensors<'_>, record: &Value, samples: &Array2<f64>) -> 
     let w_e = b.operator("W_E", &model, &tokens, tensors.get("W_E")?.t().to_owned())?;
     let w_pos = tensors.get("W_pos")?;
     let identity = {
-        b.operators.push(Operator::identity("I", model.clone()));
+        b.operators.push(Arc::new(Operator::identity("I", model.clone())));
         b.operators.len() - 1
     };
     let mut x: Vec<usize> = Vec::with_capacity(positions);
@@ -307,7 +308,7 @@ fn residual_mlp(tensors: &Tensors<'_>, record: &Value, samples: &Array2<f64>) ->
     let input = Interface::native(bits).map_err(|e| e.to_string())?;
     let constant = Interface::constant();
     let mut b = Builder { operators: Vec::new(), nodes: Vec::new() };
-    b.operators.push(Operator::identity("I", model.clone()));
+    b.operators.push(Arc::new(Operator::identity("I", model.clone())));
     let identity = 0;
     let w_e = b.operator("W_E", &model, &input, tensors.get("W_E")?.t().to_owned())?;
     let b_e = if tensors.has("b_E") { Some(b.operator("b_E", &model, &constant, tensors.column("b_E")?)?) } else { None };
@@ -345,10 +346,10 @@ fn residual_mlp(tensors: &Tensors<'_>, record: &Value, samples: &Array2<f64>) ->
         present[[2 * c + 1, 0]] = true;
     }
     let precision = exact_precision(values.iter().copied()).map_err(|e| e.to_string())?;
-    b.operators.push(
+    b.operators.push(Arc::new(
         Operator::blocks("W_U", pairs.clone(), model.clone(), values, present, precision, Provenance::native("W_U"))
             .map_err(|e| e.to_string())?,
-    );
+    ));
     let w_u_op = b.operators.len() - 1;
     let b_u = if tensors.has("b_U") {
         let bias = tensors.column("b_U")?;
@@ -359,10 +360,10 @@ fn residual_mlp(tensors: &Tensors<'_>, record: &Value, samples: &Array2<f64>) ->
             present[[2 * c + 1, 0]] = true;
         }
         let precision = exact_precision(values.iter().copied()).map_err(|e| e.to_string())?;
-        b.operators.push(
+        b.operators.push(Arc::new(
             Operator::blocks("b_U", pairs.clone(), constant, values, present, precision, Provenance::native("b_U"))
                 .map_err(|e| e.to_string())?,
-        );
+        ));
         Some(b.operators.len() - 1)
     } else {
         None
@@ -479,7 +480,7 @@ pub fn import_language_model(dir: &Path, sequences: usize, context: usize) -> Re
     let tokens_interface = interface(vocab, 1, LabelKind::Token)?;
     let coordinates = model.clone();
     let mut b = Builder { operators: Vec::new(), nodes: Vec::new() };
-    b.operators.push(Operator::identity("I", model.clone()));
+    b.operators.push(Arc::new(Operator::identity("I", model.clone())));
     let identity = 0;
     let embedding = b.operator("wte", &model, &tokens_interface, tensors.get("wte")?.t().to_owned())?;
     // A norm gain is a diagonal operator: one present block per coordinate, d reals.
@@ -494,7 +495,7 @@ pub fn import_language_model(dir: &Path, sequences: usize, context: usize) -> Re
         let precision = exact_precision(g.iter().copied()).map_err(|e| e.to_string())?;
         let op = Operator::blocks(name, coordinates.clone(), coordinates.clone(), values, present, precision, Provenance::native(name))
             .map_err(|e| e.to_string())?;
-        b.operators.push(op);
+        b.operators.push(Arc::new(op));
         Ok(b.operators.len() - 1)
     };
     // A stored bias (a row vector, sliced to `range`) as a column operator on `rows`.
@@ -523,7 +524,7 @@ pub fn import_language_model(dir: &Path, sequences: usize, context: usize) -> Re
             Provenance::native("layer norm mean"),
         )
         .map_err(|e| e.to_string())?;
-        b.operators.push(op);
+        b.operators.push(Arc::new(op));
         Some(b.operators.len() - 1)
     } else {
         None
