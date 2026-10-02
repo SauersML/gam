@@ -1106,100 +1106,14 @@ pub fn survival_baseline_config_from_theta(
     )
 }
 
-/// Derivative contract for the shared baseline-θ outer optimizer.
-///
-/// The two public baseline optimizers (`…_with_gradient_only`,
-/// `…_with_gradient`) differ in exactly one axis: how much derivative
-/// information the objective closure supplies, and therefore which curvature
-/// declaration the `OuterProblem` must advertise. Every baseline-θ path now
-/// supplies an exact analytic gradient (profile-NLL envelope gradient), so both
-/// contracts route to a gradient-based solver. Everything else — θ↔config
-/// conversion, the single-seed config, the `run`/convergence/error-formatting boilerplate
-/// — is identical, so it lives once in [`run_baseline_theta_optimizer`] and
-/// this enum selects the per-contract `OuterProblem` configuration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BaselineDerivativeContract {
-    /// Cost + analytic gradient, no analytic Hessian. Routes to BFGS, which
-    /// builds its own quasi-Newton curvature from successive gradients.
-    ///
-    /// # What the missing theta-Hessian is (#3201)
-    ///
-    /// This is the one row of #3201 whose Hessian is not merely deferred but
-    /// absent, so the derivation is recorded where the absence is declared.
-    /// The criterion is the PROFILE penalized NLL
-    /// `V(theta) = 0.5*deviance(beta_hat(theta); o(theta)) + 0.5*beta_hat' S beta_hat`,
-    /// and theta enters the working model only through the three additive
-    /// time-block offsets `o_E`, `o_X`, `o_D`. Because `beta_hat(theta)` is the
-    /// constrained PIRLS optimum, `dV/dtheta` is the explicit partial alone
-    /// (the envelope theorem; the active-set bounds `beta_j >= 0` carry no
-    /// theta-dependence), which is what `baseline_chain_rule_gradient`
-    /// contracts.
-    ///
-    /// The SECOND derivative of a profiled criterion is NOT the explicit
-    /// partial: `beta_hat` moves with theta, so
-    ///
-    /// ```text
-    ///   d2V/dtheta_j dtheta_k = V_tt[j,k] - V_tb[j,:] (H_bb)^-1 V_bt[:,k],
-    /// ```
-    ///
-    /// with `H_bb` the penalized working Hessian at `beta_hat` restricted to
-    /// the FREE block of the active set (the bounds are theta-free, so a
-    /// coordinate on its bound contributes no `dbeta/dtheta`), `V_tb` the
-    /// cross block `d2V/dtheta dbeta`, and `V_tt` the explicit partial
-    /// Hessian. Each of the three is a contraction of the offset channels the
-    /// gradient already uses: `V_tt` needs the deviance's second derivatives
-    /// in the offsets and each offset's own theta-Hessian, and `V_tb` needs
-    /// the offset-by-coefficient cross derivatives. `OuterEval` already
-    /// carries a `hessian` field and
-    /// [`run_baseline_theta_optimizer_with_eval`] already validates its shape,
-    /// so the plumbing exists; only the producer does not.
-    ///
-    /// Its acceptance is a central finite difference of the analytic theta
-    /// gradient, graded entry by entry against each Hessian row, at an
-    /// interior point and at the seed -- not a norm, which hides a single
-    /// wrong entry. Until that exists, this contract declares
-    /// `DeclaredHessianForm::Unavailable`, which is the honest declaration:
-    /// an absent Hessian, not a reserved one.
-    GradientOnly,
-}
-
-impl BaselineDerivativeContract {
-    /// Apply this contract's derivative declaration, solver class, tolerance,
-    /// and iteration budget to a freshly-constructed `OuterProblem`. The
-    /// bounds, initial ρ, and seed config are contract-independent and applied
-    /// by [`run_baseline_theta_optimizer`].
-    fn configure(
-        self,
-        problem: gam_solve::rho_optimizer::OuterProblem,
-    ) -> gam_solve::rho_optimizer::OuterProblem {
-        use gam_problem::{DeclaredHessianForm, Derivative};
-        match self {
-            // BFGS on a 2–3 dim problem with an exact gradient typically
-            // converges in 5–10 outer evaluations. The stationarity standard is
-            // the engine's own (#2814): a private `1e-4` sat here only because
-            // the inner solve refused to certify at the strengths the engine's
-            // default walked to.
-            BaselineDerivativeContract::GradientOnly => problem
-                .with_gradient(Derivative::Analytic)
-                .with_hessian(DeclaredHessianForm::Unavailable),
-        }
-    }
-}
-
-/// Shared engine behind the three public baseline-config optimizers.
-///
-/// Owns every step that is identical across the cost-only, gradient-only, and
-/// gradient+Hessian contracts: config→θ seeding (with the linear/no-parameter
-/// early return), the single-seed `OuterProblem` skeleton, derivative-contract configuration, `build_objective` wiring,
-/// `run`, the convergence check + error formatting, and θ→config. The only
-/// contract-specific inputs are the already-wired `cost_fn`/`eval_fn` closures
-/// (which embed the derivative shape and dimension validation) and the
-/// `contract` selecting the `OuterProblem` derivative declaration.
+/// The baseline-θ outer search: config→θ seeding (with the linear/no-parameter
+/// early return), the single-seed `OuterProblem` on the exact value, gradient
+/// and Hessian the `eval_fn` closure supplies, `run`, the convergence check and
+/// error formatting, and θ→config.
 fn run_baseline_theta_optimizer<Fc, Fe>(
     initial: &SurvivalBaselineConfig,
     age_exit: ndarray::ArrayView1<'_, f64>,
     context: &str,
-    contract: BaselineDerivativeContract,
     cost_fn: Fc,
     eval_fn: Fe,
 ) -> Result<SurvivalBaselineConfig, crate::fit_orchestration::WorkflowError>
@@ -1227,17 +1141,13 @@ where
     let (lower, upper) = survival_baseline_theta_domain(target, &seed, age_exit).map_err(config)?;
     // The criterion is the baseline likelihood summed over the survival
     // records, in the `dim` baseline parameters themselves.
-    let problem = contract
-        .configure(
-            // No `with_prefer_gradient_only` (#3201). The contract this problem
-            // is configured by declares `DeclaredHessianForm::Unavailable`, and
-            // the flag is read only where the declared Hessian is analytic --
-            // by `plan`, and by `fallback_attempts` when it escalates a
-            // gradient-only primary to exact curvature. It therefore decided
-            // nothing on this path. The baseline row's open item is the
-            // profiled theta-Hessian itself, recorded on the contract.
-            OuterProblem::new(dim).with_problem_size(age_exit.len(), dim),
-        )
+    // The profile criterion's exact θ-Hessian is supplied with every
+    // evaluation (`WorkingModelSurvival::baseline_profile_theta_hessian`,
+    // #3201), so the search runs on exact curvature.
+    let problem = OuterProblem::new(dim)
+        .with_problem_size(age_exit.len(), dim)
+        .with_gradient(gam_problem::Derivative::Analytic)
+        .with_hessian(gam_problem::DeclaredHessianForm::Dense)
         .with_bounds(lower, upper)
         .with_initial_rho(seed.clone());
     let mut obj = problem.build_objective(
@@ -1271,23 +1181,14 @@ where
         .map_err(|reason| WorkflowError::from(FitFailure::invariant(reason)))
 }
 
-/// Shared engine for the two derivative-carrying baseline-config optimizers.
-///
-/// Both `…_with_gradient_only` and `…_with_gradient` route an objective that
-/// returns a fully-populated [`OuterEval`](gam_problem::OuterEval)
-/// (cost + analytic gradient, optionally + analytic Hessian) for a given
-/// config. Everything downstream of that — the `Rc<RefCell>` sharing that lets
-/// the same user closure back both the `cost_fn` and `eval_fn`, the θ→config
-/// conversion, and deriving the scalar `cost_fn` from the eval result — is
-/// identical, so it lives here once. The contract-specific axis is only which
-/// `HessianValue` the objective embeds, which the wrapper has already encoded
-/// in the returned `OuterEval`, so this helper is contract-agnostic beyond the
-/// `contract` it forwards to [`run_baseline_theta_optimizer`].
+/// Serves one objective evaluation, which returns the full
+/// [`OuterEval`](gam_problem::OuterEval) for a config, to both the scalar
+/// `cost_fn` and the derivative `eval_fn` of [`run_baseline_theta_optimizer`],
+/// through a one-point cache (#2714), and validates the derivative shapes.
 fn run_baseline_theta_optimizer_with_eval<F>(
     initial: &SurvivalBaselineConfig,
     age_exit: ndarray::ArrayView1<'_, f64>,
     context: &str,
-    contract: BaselineDerivativeContract,
     objective: F,
 ) -> Result<SurvivalBaselineConfig, crate::fit_orchestration::WorkflowError>
 where
@@ -1356,7 +1257,7 @@ where
         *cost_eval_cache.borrow_mut() = Some((theta.clone(), eval.clone()));
         Ok(eval)
     };
-    run_baseline_theta_optimizer(initial, age_exit, context, contract, cost_fn, eval_fn)
+    run_baseline_theta_optimizer(initial, age_exit, context, cost_fn, eval_fn)
 }
 
 /// The Weibull scaffold as a direct summand of the monotone I-spline time
@@ -1429,42 +1330,33 @@ pub fn weibull_scaffold_direct_sum(
     })
 }
 
-/// Gradient-only outer baseline-config optimizer. Thin adapter over
-/// `run_baseline_theta_optimizer` under the
-/// `BaselineDerivativeContract::GradientOnly` contract, which advertises
-/// `DeclaredHessianForm::Unavailable`, so the planner routes to BFGS and
-/// builds its own quasi-Newton curvature from successive gradient
-/// evaluations. Used by the survival transformation path, which has a
-/// closed-form θ-gradient (`baseline_chain_rule_gradient`) but no native
-/// analytic θ-Hessian; BFGS on a 2–3 dim problem with an exact gradient typically
-/// converges in 5–10 outer evaluations. The search domain is derived at the
-/// seed, and the Gompertz shape's radius reads the oldest exit age in
-/// `age_exit`.
-pub fn optimize_survival_baseline_config_with_gradient_only<F>(
+/// Outer baseline-config optimizer on the profile criterion's exact value,
+/// θ-gradient and θ-Hessian, which `objective` returns for a config. Used by
+/// the survival transformation path: the gradient is the envelope contraction
+/// [`baseline_chain_rule_gradient`] and the Hessian the implicit-response
+/// profile Hessian `WorkingModelSurvival::baseline_profile_theta_hessian`
+/// reads off [`baseline_offset_theta_jets`] (#3201). The search domain is
+/// derived at the seed, and the Gompertz shape's radius reads the oldest exit
+/// age in `age_exit`.
+pub fn optimize_survival_baseline_config<F>(
     initial: &SurvivalBaselineConfig,
     age_exit: ndarray::ArrayView1<'_, f64>,
     context: &str,
     mut objective: F,
 ) -> Result<SurvivalBaselineConfig, crate::fit_orchestration::WorkflowError>
 where
-    F: FnMut(&SurvivalBaselineConfig) -> Result<(f64, Array1<f64>), String>,
+    F: FnMut(&SurvivalBaselineConfig) -> Result<(f64, Array1<f64>, Array2<f64>), String>,
 {
     use gam_problem::{HessianValue, OuterEval};
-    run_baseline_theta_optimizer_with_eval(
-        initial,
-        age_exit,
-        context,
-        BaselineDerivativeContract::GradientOnly,
-        move |cfg| {
-            let (cost, gradient) = objective(cfg)?;
-            Ok(OuterEval {
-                cost,
-                gradient,
-                hessian: HessianValue::Unavailable,
-                inner_beta_hint: None,
-            })
-        },
-    )
+    run_baseline_theta_optimizer_with_eval(initial, age_exit, context, move |cfg| {
+        let (cost, gradient, hessian) = objective(cfg)?;
+        Ok(OuterEval {
+            cost,
+            gradient,
+            hessian: HessianValue::Dense(hessian),
+            inner_beta_hint: None,
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -4668,6 +4560,29 @@ impl LatentSurvivalFrozenOffsetChart {
     }
 }
 
+/// The first and second θ-partials of the log-cumulative-hazard baseline
+/// offsets `(η = log H, o_D = h/H)` at one age, in the coordinates of
+/// [`survival_baseline_theta_from_config`]: [`baseline_offset_theta_partials`]
+/// and [`log_cumulative_hazard_offset_theta_second_partials`], the jets the
+/// transformation path's profile θ-Hessian contracts (#3201).
+pub fn baseline_offset_theta_jets(
+    age: f64,
+    cfg: &SurvivalBaselineConfig,
+) -> Result<(Vec<(f64, f64)>, Vec<Vec<(f64, f64)>>), String> {
+    let first = baseline_offset_theta_partials(age, cfg)?
+        .ok_or_else(|| "a baseline with no θ-parameters has no θ-jets".to_string())?;
+    let second = log_cumulative_hazard_offset_theta_second_partials(age, cfg)?;
+    if second.len() != first.len() || second.iter().any(|row| row.len() != first.len()) {
+        return Err(format!(
+            "baseline θ-jets disagree on the dimension: {} first partials, {}×{} second",
+            first.len(),
+            second.len(),
+            second.first().map_or(0, Vec::len)
+        ));
+    }
+    Ok((first, second))
+}
+
 /// Second partials `(∂²η/∂θ_k∂θ_l, ∂²o_D/∂θ_k∂θ_l)` of the log-cumulative-hazard
 /// offsets `η = log H(t)` and `o_D = h(t)/H(t)` at one age, in the coordinates of
 /// [`survival_baseline_theta_from_config`] (#2677). From the hazard's own first and
@@ -5523,7 +5438,7 @@ mod tests {
     ];
 
     use super::{SURVIVAL_TIME_FLOOR,SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalMarginalSlopeFrozenOffsetChart, SurvivalTimeBasisConfig, baseline_chain_rule_gradient, baseline_offset_theta_partials, build_survival_marginal_slope_baseline_geometry, build_survival_marginal_slope_baseline_offsets, build_survival_time_basis, build_survival_timewiggle_from_baseline, evaluate_survival_baseline, evaluate_survival_marginal_slope_baseline, fitted_weibull_baseline_from_linear_time_beta, gompertz_cumulative_shape_derivative, gompertz_cumulative_shape_second_derivative, gompertz_first_shape_series_switch, gompertz_offset_shape_series_switch, gompertz_second_shape_series_switch, gompertz_shape_derivatives, gompertz_hazard_components, marginal_slope_baseline_offset_theta_partials, resolve_survival_time_anchor_for_mode, survival_baseline_config_from_theta, survival_baseline_theta_from_config, survival_data_is_left_truncated, survival_earliest_entry_time_anchor, survival_robust_interior_time_anchor, validate_survival_time_anchor_override};
-    use super::optimize_survival_baseline_config_with_gradient_only;
+    use super::optimize_survival_baseline_config;
     use super::{
         center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
         resolved_survival_time_basis_config_from_build,
@@ -7030,7 +6945,7 @@ mod tests {
             makeham: None,
         };
         let previous_theta = RefCell::new(None::<Array1<f64>>);
-        let fitted = optimize_survival_baseline_config_with_gradient_only(
+        let fitted = optimize_survival_baseline_config(
             &initial,
             ndarray::array![1.5, 3.0, 5.5].view(),
             "#2714 duplicate-evaluation regression",
@@ -7043,7 +6958,11 @@ mod tests {
                     "the adapter re-executed the expensive objective at the same theta"
                 );
                 *previous_theta.borrow_mut() = Some(theta.clone());
-                Ok((theta.dot(&theta), theta.mapv(|value| 2.0 * value)))
+                Ok((
+                    theta.dot(&theta),
+                    theta.mapv(|value| 2.0 * value),
+                    Array2::<f64>::eye(theta.len()) * 2.0,
+                ))
             },
         )
         .expect("strictly convex baseline objective converges");
@@ -7051,15 +6970,23 @@ mod tests {
         let theta = survival_baseline_theta_from_config(&fitted)
             .expect("valid fitted baseline")
             .expect("Weibull baseline exposes theta");
-        assert!(theta.iter().all(|value| value.abs() <= 1.0e-5));
+        // The search certifies its optimum to the criterion's statistical
+        // resolution `τ_stat = 1/(2n)` over the `n = 3` exit ages: the decrease
+        // it leaves, `θ·θ` on this quadratic whose minimum is 0, is at most that.
+        let resolution = gam_solve::rho_optimizer::criterion_statistical_resolution(3)
+            .expect("three exit ages resolve the criterion");
+        assert!(
+            theta.dot(&theta) <= resolution,
+            "fitted theta {theta:?} leaves more than the resolution {resolution} undescended"
+        );
     }
 
     /// Weibull (dim=2) companion to
     /// `gompertz_makeham_baseline_chain_rule_gradient_matches_finite_difference`.
     ///
     /// This is the FD gate for the analytic outer θ-gradient that the
-    /// transformation/Weibull survival baseline optimizers now feed to BFGS
-    /// (`optimize_survival_baseline_config_with_gradient_only`). At a *fixed* β
+    /// transformation/Weibull survival baseline optimizers now feed to the outer search
+    /// (`optimize_survival_baseline_config`). At a *fixed* β
     /// the profile-NLL surface is
     /// `L(θ) = Σ_i [ r_X[i]·η(t_exit_i;θ) + r_E[i]·η(t_entry_i;θ)
     ///              + r_D[i]·o_D(t_exit_i;θ) ]`,

@@ -2813,9 +2813,28 @@ impl WorkingModelSurvival {
         &self,
         beta: &Array1<f64>,
     ) -> Result<OffsetChannelResiduals, EstimationError> {
+        Ok(self.offset_channel_derivatives(beta)?.0)
+    }
+
+    /// First AND second derivatives of the unpenalized NLL in the additive
+    /// offset channels at `beta`: the residuals of
+    /// [`Self::offset_channel_residuals`] and, per row, the channel Hessian in
+    /// `(entry, exit, derivative)` order.
+    ///
+    /// The row's NLL `w·[e^{η_X} − 1{entry}·e^{η_E} − δ·(η_X + ln s)]` is a sum
+    /// of one function per channel, so its channel Hessian is diagonal:
+    /// `∂²/∂o_E² = −w·e^{η_E}·1{entry}`, `∂²/∂o_X² = w·e^{η_X}` (the event
+    /// term is linear in `η_X`), and `∂²/∂o_D² = w·δ·(slope/s)²` for the
+    /// structural clamp's slope, which is 0 on the floored branch where
+    /// `ln s` is locally constant. These are the weights `update_state`
+    /// forms the β-Hessian from, read in the offset coordinates.
+    pub fn offset_channel_derivatives(
+        &self,
+        beta: &Array1<f64>,
+    ) -> Result<(OffsetChannelResiduals, OffsetChannelCurvatures), EstimationError> {
         if beta.len() != self.coefficient_dim() {
             crate::bail_invalid_estim!(
-                "survival beta dimension mismatch in offset_channel_residuals"
+                "survival beta dimension mismatch in offset_channel_derivatives"
             );
         }
         let n = self.nrows();
@@ -2827,6 +2846,7 @@ impl WorkingModelSurvival {
         let mut r_exit = Array1::<f64>::zeros(n);
         let mut r_entry = Array1::<f64>::zeros(n);
         let mut r_deriv = Array1::<f64>::zeros(n);
+        let mut curvatures = vec![[[0.0_f64; 3]; 3]; n];
 
         for i in 0..n {
             let w = self.sampleweight[i];
@@ -2853,11 +2873,13 @@ impl WorkingModelSurvival {
             };
             if !w_exit_i.is_finite() {
                 crate::bail_invalid_estim!(
-                    "offset_channel_residuals: w*exp(eta_exit)={w_exit_i:.3e} non-finite at row {i}"
+                    "offset_channel_derivatives: w*exp(eta_exit)={w_exit_i:.3e} non-finite at row {i}"
                 );
             }
             r_exit[i] = w_exit_i - d * w;
             r_entry[i] = -w_entry_i;
+            curvatures[i][0][0] = -w_entry_i;
+            curvatures[i][1][1] = w_exit_i;
             // Same per-row monotonicity rule as `update_state`: a strictly
             // negative derivative at any observed exit time (event or
             // censored) falsifies S(t); event rows additionally need
@@ -2869,23 +2891,169 @@ impl WorkingModelSurvival {
             let mono_floor = self.derivative_floor(d > 0.0, derivative_band[i]);
             if !deriv.is_finite() || deriv < mono_floor || (d > 0.0 && !(deriv > 0.0)) {
                 return Err(EstimationError::ParameterConstraintViolation(format!(
-                    "offset_channel_residuals: derivative ≤ numerical guard at row {i}: {deriv:.3e}"
+                    "offset_channel_derivatives: derivative ≤ numerical guard at row {i}: {deriv:.3e}"
                 )));
             }
             if d > 0.0 {
                 // The clamp slope zeroes the residual on the floored branch,
                 // matching update_state's flat `ln(deriv)` value there.
-                r_deriv[i] = -w * d * deriv_slope / deriv;
+                let inv_deriv = deriv_slope / deriv;
+                r_deriv[i] = -w * d * inv_deriv;
+                curvatures[i][2][2] = w * d * inv_deriv * inv_deriv;
             }
         }
 
         let right = Array1::<f64>::zeros(r_exit.len());
-        Ok(OffsetChannelResiduals {
-            exit: r_exit,
-            entry: r_entry,
-            derivative: r_deriv,
-            right,
-        })
+        Ok((
+            OffsetChannelResiduals {
+                exit: r_exit,
+                entry: r_entry,
+                derivative: r_deriv,
+                right,
+            },
+            OffsetChannelCurvatures { rows: curvatures },
+        ))
+    }
+
+    /// The exact θ-Hessian of the PROFILE criterion
+    /// `V(θ) = NLL(β̂(θ); o(θ)) + ½·β̂ᵀSβ̂` at its certified inner optimum
+    /// `beta`, for offsets `o(θ)` whose per-age θ-jets `offset_jets(age)`
+    /// returns as `(first, second)`: `first[k] = (∂o_η/∂θ_k, ∂o_D/∂θ_k)` and
+    /// `second[k][l]` the same pair for `∂²/∂θ_k∂θ_l`. The η pair is read at the
+    /// exit age for the exit channel and at the entry age for the entry channel;
+    /// the derivative channel reads the exit age's `o_D` pair (#3201).
+    ///
+    /// `β̂` moves with θ, so the second derivative is not the explicit partial:
+    ///
+    /// ```text
+    ///   d²V/dθ_k dθ_l = V_θθ[k,l] − G_Fᵀ[k,:] · H_FF⁻¹ · G_F[:,l]
+    ///   V_θθ[k,l]     = Σ_i Σ_c r_c·∂²o_c/∂θ_k∂θ_l + C_c·∂o_c/∂θ_k·∂o_c/∂θ_l
+    ///   G[:,k]        = Σ_i Σ_c x_c·C_c·∂o_c/∂θ_k
+    /// ```
+    ///
+    /// with `r_c`, `C_c` the channel residuals and (diagonal) curvatures of
+    /// [`Self::offset_channel_derivatives`], `x_c` the channel's design row (each
+    /// offset adds to its channel's predictor, so `∂²NLL/∂β∂o_c = x_c·C_c`), and
+    /// `H` the penalized β-Hessian `update_state` returns. A coefficient whose
+    /// lower bound binds (the rule PIRLS certifies its face by,
+    /// [`gam_solve::pirls::lower_bound_binds`]) stays on the bound as θ moves,
+    /// so the response `dβ̂/dθ = −H_FF⁻¹G_F` lives on the free set `F` alone.
+    pub fn baseline_profile_theta_hessian<F>(
+        &self,
+        beta: &Array1<f64>,
+        lower_bounds: Option<&Array1<f64>>,
+        offset_jets: F,
+    ) -> Result<Array2<f64>, EstimationError>
+    where
+        F: Fn(f64) -> Result<(Vec<(f64, f64)>, Vec<Vec<(f64, f64)>>), String>,
+    {
+        use gam_linalg::faer_ndarray::FaerCholesky;
+        let p = self.coefficient_dim();
+        let n = self.nrows();
+        let state = self.update_state(beta)?;
+        let (residuals, curvatures) = self.offset_channel_derivatives(beta)?;
+        let jets = |age: f64| offset_jets(age).map_err(EstimationError::InvalidInput);
+        let mut dim: Option<usize> = None;
+        let mut explicit = Array2::<f64>::zeros((0, 0));
+        let mut cross = Array2::<f64>::zeros((0, 0));
+        let mut row = vec![0.0_f64; p];
+        for i in 0..n {
+            if self.sampleweight[i] <= 0.0 {
+                continue;
+            }
+            let exit = jets(self.age_exit[i])?;
+            let entry = if self.entry_at_origin[i] {
+                None
+            } else {
+                Some(jets(self.age_entry[i])?)
+            };
+            let k_dim = exit.0.len();
+            match dim {
+                None => {
+                    dim = Some(k_dim);
+                    explicit = Array2::zeros((k_dim, k_dim));
+                    cross = Array2::zeros((p, k_dim));
+                }
+                Some(expected) if expected != k_dim => crate::bail_invalid_estim!(
+                    "survival baseline θ-jet dimension drifted ({k_dim} != {expected}) at row {i}"
+                ),
+                Some(_) => {}
+            }
+            // (residual, curvature, first partials, second partials, design row filler)
+            let pick = |pair: &(f64, f64), derivative: bool| if derivative { pair.1 } else { pair.0 };
+            let mut channels: Vec<(f64, f64, &(Vec<(f64, f64)>, Vec<Vec<(f64, f64)>>), bool, usize)> =
+                vec![
+                    (residuals.exit[i], curvatures.rows[i][1][1], &exit, false, 1),
+                    (residuals.derivative[i], curvatures.rows[i][2][2], &exit, true, 2),
+                ];
+            if let Some(entry) = entry.as_ref() {
+                channels.push((residuals.entry[i], curvatures.rows[i][0][0], entry, false, 0));
+            }
+            for (residual, curvature, (first, second), derivative, channel) in channels {
+                if residual == 0.0 && curvature == 0.0 {
+                    continue;
+                }
+                for k in 0..k_dim {
+                    let a_k = pick(&first[k], derivative);
+                    for l in 0..k_dim {
+                        explicit[[k, l]] += residual * pick(&second[k][l], derivative)
+                            + curvature * a_k * pick(&first[l], derivative);
+                    }
+                }
+                if curvature == 0.0 {
+                    continue;
+                }
+                match channel {
+                    0 => self.fill_entry_row(i, &mut row),
+                    1 => self.fill_exit_row(i, &mut row),
+                    _ => self.fill_derivative_row(i, &mut row),
+                }
+                for k in 0..k_dim {
+                    let weight = curvature * pick(&first[k], derivative);
+                    for (j, &x) in row.iter().enumerate() {
+                        cross[[j, k]] += x * weight;
+                    }
+                }
+            }
+        }
+        let Some(k_dim) = dim else {
+            crate::bail_invalid_estim!(
+                "survival baseline θ-Hessian has no positively weighted row to read its dimension from"
+            );
+        };
+        let free: Vec<usize> = (0..p)
+            .filter(|&j| {
+                !lower_bounds.is_some_and(|lb| {
+                    gam_solve::pirls::lower_bound_binds(state.gradient[j], beta[j], lb[j])
+                })
+            })
+            .collect();
+        let hessian = state.hessian.to_dense();
+        let mut hessian_free = Array2::<f64>::zeros((free.len(), free.len()));
+        let mut cross_free = Array2::<f64>::zeros((free.len(), k_dim));
+        for (a, &ja) in free.iter().enumerate() {
+            for (b, &jb) in free.iter().enumerate() {
+                hessian_free[[a, b]] = hessian[[ja, jb]];
+            }
+            cross_free.row_mut(a).assign(&cross.row(ja));
+        }
+        let mut profile = explicit;
+        if !free.is_empty() {
+            // A certified inner minimum has a positive-definite Hessian on its
+            // free face; one that is not has no local response `dβ̂/dθ`.
+            let factor = hessian_free.cholesky(faer::Side::Lower).map_err(|error| {
+                EstimationError::InvalidInput(format!(
+                    "survival baseline θ-Hessian: the penalized Hessian on the free face is not positive definite at the inner optimum ({error:?}), so β̂ has no θ-response"
+                ))
+            })?;
+            let response = factor.solve_mat(&cross_free);
+            profile -= &cross_free.t().dot(&response);
+        }
+        let symmetric = (&profile + &profile.t()) * 0.5;
+        if symmetric.iter().any(|value| !value.is_finite()) {
+            crate::bail_invalid_estim!("survival baseline θ-Hessian is non-finite");
+        }
+        Ok(symmetric)
     }
 
     /// Build an [`InnerSolution`](gam_solve::estimate::reml::reml_outer_engine::InnerSolution) from
@@ -5139,6 +5307,143 @@ mod tests {
                     "∂NLL/∂o_D[{i}]: analytic={:.6e} fd={:.6e}",
                     resid.derivative[i],
                     fd
+                );
+            }
+        }
+    }
+
+    /// #3201: the survival baseline search's exact profile θ-Hessian against
+    /// central differences of its envelope θ-gradient, each re-solved at its
+    /// own inner optimum `β̂(θ)`, on a Gompertz baseline with delayed entry,
+    /// censoring and weights. The bar is read off the differences: the gap
+    /// between the `h` and `2h` differences (their truncation is a third of
+    /// it) plus the gradient's accumulation rounding amplified by `1/(2h)`.
+    #[test]
+    fn baseline_profile_theta_hessian_matches_central_differences_of_its_gradient_3201() {
+        use crate::survival::{
+            SurvivalBaselineTarget, baseline_chain_rule_gradient, baseline_offset_theta_jets,
+            evaluate_survival_baseline, survival_baseline_config_from_theta,
+        };
+        use gam_linalg::faer_ndarray::FaerCholesky;
+        let n = 48usize;
+        let age_entry =
+            Array1::from_shape_fn(n, |i| if i % 3 == 0 { 0.0 } else { 0.1 + 0.013 * i as f64 });
+        let age_exit =
+            Array1::from_shape_fn(n, |i| 0.9 + 0.06 * i as f64 + 0.35 * ((i * 7) % 5) as f64);
+        let event_target = Array1::from_shape_fn(n, |i| u8::from(i % 4 != 1));
+        let event_competing = Array1::<u8>::zeros(n);
+        let sampleweight = Array1::from_shape_fn(n, |i| 0.5 + 0.25 * (i % 5) as f64);
+        let x_exit = Array2::from_shape_fn((n, 2), |(i, j)| {
+            if j == 0 { 1.0 } else { ((i * 13) % 11) as f64 / 11.0 - 0.5 }
+        });
+        let x_entry = x_exit.clone();
+        let x_derivative = Array2::<f64>::zeros((n, 2));
+        let mono = SurvivalMonotonicityPenalty { tolerance: 1e-8 };
+        // The inner optimum at θ, to rounding, with the model it lives on.
+        let solve = |theta: &Array1<f64>| {
+            let cfg = survival_baseline_config_from_theta(SurvivalBaselineTarget::Gompertz, theta)
+                .expect("gompertz chart");
+            let offsets = |age: f64| evaluate_survival_baseline(age, &cfg).expect("baseline");
+            let o_entry = age_entry.mapv(|age| if age > 0.0 { offsets(age).0 } else { 0.0 });
+            let o_exit = age_exit.mapv(|age| offsets(age).0);
+            let o_deriv = age_exit.mapv(|age| offsets(age).1);
+            let model = survival_model_with_offsets(
+                survival_inputs(
+                    &age_entry,
+                    &age_exit,
+                    &event_target,
+                    &event_competing,
+                    &sampleweight,
+                    &x_entry,
+                    &x_exit,
+                    &x_derivative,
+                ),
+                Some(SurvivalBaselineOffsets {
+                    eta_entry: o_entry.view(),
+                    eta_exit: o_exit.view(),
+                    derivative_exit: o_deriv.view(),
+                }),
+                PenaltyBlocks::new(Vec::new()),
+                mono,
+                SurvivalSpec::Net,
+            )
+            .expect("model build");
+            let mut beta = Array1::<f64>::zeros(2);
+            for _ in 0..100 {
+                let state = model.update_state(&beta).expect("state");
+                let step = state
+                    .hessian
+                    .to_dense()
+                    .cholesky(faer::Side::Lower)
+                    .expect("convex inner problem")
+                    .solvevec(&state.gradient);
+                beta -= &step;
+                if step.iter().all(|v| v.abs() <= f64::EPSILON * (1.0 + beta[0].abs())) {
+                    break;
+                }
+            }
+            (model, beta, cfg)
+        };
+        let gradient = |theta: &Array1<f64>| -> (Array1<f64>, Array1<f64>) {
+            let (model, beta, cfg) = solve(theta);
+            let residuals = model.offset_channel_residuals(&beta).expect("residuals");
+            let g = baseline_chain_rule_gradient(
+                age_entry.view(),
+                age_exit.view(),
+                age_exit.view(),
+                &cfg,
+                &residuals,
+            )
+            .expect("gradient")
+            .expect("gompertz has θ");
+            // The gradient's operand magnitudes, per coordinate.
+            let mut magnitude = Array1::<f64>::zeros(theta.len());
+            for i in 0..n {
+                let (exit, _) = baseline_offset_theta_jets(age_exit[i], &cfg).expect("jets");
+                for k in 0..theta.len() {
+                    magnitude[k] += (residuals.exit[i] * exit[k].0).abs()
+                        + (residuals.derivative[i] * exit[k].1).abs();
+                    if residuals.entry[i] != 0.0 {
+                        let (entry, _) =
+                            baseline_offset_theta_jets(age_entry[i], &cfg).expect("jets");
+                        magnitude[k] += (residuals.entry[i] * entry[k].0).abs();
+                    }
+                }
+            }
+            (g, magnitude)
+        };
+        let theta = ndarray::array![0.3_f64.ln(), 0.4];
+        let (model, beta, cfg) = solve(&theta);
+        let hessian = model
+            .baseline_profile_theta_hessian(&beta, None, |age| baseline_offset_theta_jets(age, &cfg))
+            .expect("profile Hessian");
+        let step = 1e-4;
+        let difference = |k: usize, h: f64| {
+            let mut up = theta.clone();
+            up[k] += h;
+            let mut down = theta.clone();
+            down[k] -= h;
+            let ((g_up, m_up), (g_down, m_down)) = (gradient(&up), gradient(&down));
+            ((&g_up - &g_down) / (2.0 * h), (&m_up + &m_down) / (2.0 * h))
+        };
+        let growth = gam_linalg::roundoff::accumulation_growth(n + beta.len());
+        for k in 0..theta.len() {
+            let (near, magnitude) = difference(k, step);
+            let (far, _) = difference(k, 2.0 * step);
+            for l in 0..theta.len() {
+                let band = (far[l] - near[l]).abs() + growth * magnitude[l];
+                eprintln!(
+                    "[3201-SURV-HESS] ({l},{k}) analytic={:.12e} difference={:.12e} band={band:.3e}",
+                    hessian[[l, k]],
+                    near[l]
+                );
+                assert!(
+                    (hessian[[l, k]] - near[l]).abs() <= band,
+                    "profile θ-Hessian entry ({l},{k}): analytic {} vs central difference {} \
+                     (at 2h: {}), band {band:e}",
+                    hessian[[l, k]],
+                    near[l],
+                    far[l]
                 );
             }
         }

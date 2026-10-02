@@ -108,7 +108,7 @@ use crate::survival::construction::{
     build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
     center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
     fitted_weibull_baseline_from_linear_time_beta, initial_survival_baseline_config_for_fit,
-    normalize_survival_time_pair, optimize_survival_baseline_config_with_gradient_only,
+    normalize_survival_time_pair, optimize_survival_baseline_config, baseline_offset_theta_jets,
     parse_survival_likelihood_mode, parse_survival_time_basis_config,
     positive_survival_time_seed, require_structural_survival_time_basis,
     resolve_survival_time_anchor_for_mode, resolved_survival_time_basis_config_from_build,

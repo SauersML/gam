@@ -1278,7 +1278,7 @@ pub(super) fn project_coefficients_to_lower_bounds(
 /// geometric KKT channels already apply to these same rows through
 /// `active_face`. The projected-gradient norm and the bound QP's working set
 /// read it here, so every half of the certificate agrees on the face (#3180).
-fn lower_bound_binds(gradient: f64, beta: f64, lb: f64) -> bool {
+pub fn lower_bound_binds(gradient: f64, beta: f64, lb: f64) -> bool {
     lb.is_finite() && gradient > 0.0 && crate::active_set::row_is_active(beta - lb)
 }
 

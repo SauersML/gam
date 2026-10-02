@@ -3881,7 +3881,7 @@ pub(crate) fn fit_survival_transformation_model(
         // no θ to search (Thm 5.1; see `weibull_scaffold_direct_sum`).
         baseline_cfg = direct_sum;
     } else if baseline_cfg.target != SurvivalBaselineTarget::Linear {
-        // Analytic-gradient BFGS over the baseline shape params (weibull
+        // Exact-curvature search over the baseline shape params (weibull
         // scale/shape; gompertz rate/shape; gompertz-makeham rate/shape/makeham).
         //
         // The cost optimized here is the *profile penalized NLL*
@@ -3913,7 +3913,7 @@ pub(crate) fn fit_survival_transformation_model(
             *candidate_failure.borrow_mut() = Some(failure);
             reason
         };
-        baseline_cfg = optimize_survival_baseline_config_with_gradient_only(
+        baseline_cfg = optimize_survival_baseline_config(
             &baseline_cfg,
             spec.age_exit.view(),
             "workflow survival transformation baseline",
@@ -3925,7 +3925,7 @@ pub(crate) fn fit_survival_transformation_model(
                     convergence_tolerance: SURVIVAL_TRANSFORMATION_PIRLS_CONVERGENCE_TOL,
                     max_step_halving: SURVIVAL_TRANSFORMATION_PIRLS_MAX_STEP_HALVING,
                     firth_bias_reduction: false,
-                    coefficient_lower_bounds: structural_lower_bounds,
+                    coefficient_lower_bounds: structural_lower_bounds.clone(),
                     linear_constraints: None,
                     initial_lm_lambda: None,
                 };
@@ -3995,7 +3995,19 @@ pub(crate) fn fit_survival_transformation_model(
                         "workflow survival transformation baseline unexpectedly has no theta gradient",
                     ))
                 })?;
-                Ok((cost, gradient))
+                // `β̂` moves with θ, so the curvature is the implicit-response
+                // profile Hessian, on the face PIRLS certified (#3201).
+                let hessian = model
+                    .baseline_profile_theta_hessian(&beta, structural_lower_bounds.as_ref(), |age| {
+                        baseline_offset_theta_jets(age, candidate)
+                    })
+                    .map_err(|err| {
+                        stop_on(
+                            FitFailure::from(err)
+                                .context("failed to form the survival baseline θ-Hessian"),
+                        )
+                    })?;
+                Ok((cost, gradient, hessian))
             },
         )
         // A candidate that stopped the search raises its own failure. Otherwise
