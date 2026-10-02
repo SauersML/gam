@@ -550,13 +550,23 @@ fn factor_figure(program: &OperatorProgram, contract: &Contract, p: usize, curve
     }
     let mean = w.mean_axis(ndarray::Axis(0)).expect("classes");
     let w = &w - &mean;
+    // The writes' span (singular directions above the band), rotated by the factor fit's own gauge
+    // to the units' shortest write code (`factors::fix_gauge`), so each direction is what a group
+    // of units writes rather than a mixture the singular value decomposition picked.
     if let Ok(decomposed) = gam_mpd::dense::svd(w.view(), false) {
         let total: f64 = decomposed.singular_values.iter().map(|s| s * s).sum();
-        for (i, sigma) in decomposed.singular_values.iter().enumerate().take(12) {
+        let rank = decomposed.singular_values.iter().filter(|s| **s > decomposed.band).count();
+        let mut directions = decomposed.u.slice(ndarray::s![.., ..rank]).t().to_owned();
+        let mut coefficients = w.t().dot(&directions.t());
+        let largest = coefficients.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        let steps = vec![largest * 2f64.powi(-8); coefficients.nrows()];
+        gam_mpd::factors::fix_gauge(&mut coefficients, &steps, &mut directions);
+        for i in 0..rank {
+            let energy = coefficients.column(i).iter().map(|c| c * c).sum::<f64>();
             writes_over_classes.push(json!({
                 "direction": i,
-                "over_class": decomposed.u.column(i).to_vec(),
-                "energy_share": sigma * sigma / total.max(f64::MIN_POSITIVE),
+                "over_class": directions.row(i).to_vec(),
+                "energy_share": energy / total.max(f64::MIN_POSITIVE),
             }));
         }
     }

@@ -384,3 +384,27 @@ impl Library {
         error.iter().fold(0.0_f64, |m, x| m.max(x.abs())) / largest.max(f64::MIN_POSITIVE)
     }
 }
+
+/// The Fisher-whitened singular pieces of a site, exact: `M = B^{1/2} W A^{1/2} = P S Qᵀ`, piece
+/// `c` is `u_c = B^{-1/2} p_c √s_c`, `v_c = A^{-1/2} q_c √s_c` (so dropping a set costs, to second
+/// order in the global Fisher, the sum of the pieces' own `s_c (q_c · ξ)²/2`), with what the
+/// supports of `A` and `B` leave appended beyond the product's rounding band. Costs are uniform.
+pub fn fisher_svd(site: &Site) -> Result<Library, String> {
+    let whitened = Whitened::new(site)?;
+    let (u_white, v_white) = singular_pieces(&whitened.m)?;
+    let mut u = u_white.dot(&whitened.b_inverse);
+    let mut v = whitened.a_inverse.dot(&v_white.t());
+    let (d_out, d_in) = site.w.dim();
+    let left = &site.w - &u.t().dot(&v.t());
+    let band = u.mapv(f64::abs).t().dot(&v.mapv(f64::abs).t()) * accumulation_growth(u.nrows());
+    let within = left.iter().zip(band.iter()).all(|(r, b)| r.abs() <= *b);
+    let band_norm = band.iter().map(|b| b * b).sum::<f64>().sqrt();
+    let (u_left, v_left) = if within { (Array2::zeros((0, d_out)), Array2::zeros((0, d_in))) } else { singular_pieces_above(&left, band_norm)? };
+    let extra = u_left.nrows();
+    if extra > 0 {
+        u = concatenate(Axis(0), &[u.view(), u_left.view()]).map_err(|e| e.to_string())?;
+        v = concatenate(Axis(1), &[v.view(), v_left.t()]).map_err(|e| e.to_string())?;
+    }
+    let count = u.nrows();
+    Ok(Library { v, u, exactness_pieces: extra, costs: vec![(count as f64).log2(); count], history: Vec::new() })
+}

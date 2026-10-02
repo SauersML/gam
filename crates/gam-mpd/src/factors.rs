@@ -312,7 +312,7 @@ fn lattice(step: f64, largest: f64) -> Option<DeclaredPrecision> {
 /// Rotate the factor space of `left` (`M × r`, row blocks with their own steps) and `right`
 /// (`r × d`, rotated along) to the shortest code of the per-member coefficients `left`
 /// (module note, "Gauge").
-fn fix_gauge(left: &mut Array2<f64>, left_steps: &[f64], right: &mut Array2<f64>) {
+pub fn fix_gauge(left: &mut Array2<f64>, left_steps: &[f64], right: &mut Array2<f64>) {
     let r = right.nrows();
     if r < 2 {
         return;
