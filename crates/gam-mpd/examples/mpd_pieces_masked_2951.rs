@@ -1,7 +1,7 @@
 //! Per-input pieces of a language model trained through its own masked forward, on streamed
 //! sequences (#2951).
 //!
-//! `mpd_pieces_masked_2951 EXPORT_DIR OUT.json OBSERVATIONS {wsvd|wsvd2} TRAIN EVAL [CONTEXT] [GPU]`
+//! `mpd_pieces_masked_2951 EXPORT_DIR OUT.json OBSERVATIONS {wsvd|wsvd2|library:DIR} TRAIN EVAL [CONTEXT] [GPU]`
 //!
 //! `EXPORT_DIR` is a language-model export (`gam_mpd::import::import_language_model`) whose first
 //! `TRAIN` token rows train the pieces and whose next `EVAL` rows evaluate them, `CONTEXT`
@@ -11,7 +11,14 @@
 //! Fishers are measured on the training sequences (`gam_mpd::masked::site_statistics`), so any
 //! imported model runs as it is. `wsvd` starts from each site's exact Fisher-whitened singular
 //! pieces (`gam_mpd::pieces::fisher_svd`), and `wsvd2` grows those to twice as many on the first
-//! training sequence (`gam_mpd::masked::split`).
+//! training sequence (`gam_mpd::masked::split`). `library:DIR` starts from a given library: per
+//! site `DIR/{site}.v.f64` (pieces × d_in) and `DIR/{site}.u.f64` (pieces × d_out), raw float64,
+//! on the uncentred read with nothing beyond the pieces (a site without files stays native).
+//!
+//! With `TRAIN` 0 nothing is trained: the eval sequences are selected pass after pass, each pass
+//! with the counts of the sets the pass before selected, until a pass saves less than a bit per
+//! token; every pass is a full eval. A running point after each eval sequence goes to
+//! `OUT.progress.json`.
 //!
 //! The training sequences stream one at a time: each starts with the pieces whose own second-order
 //! KL bits in the global Fisher, on its clean forward, exceed their listing cost; its sets are
@@ -24,8 +31,8 @@
 //! per-token frontier's code (per site `ω(k + 1) + log₂ C(C, k)`) are appended to `OUT.json` as
 //! `{points: [{l0, bits, kl, …}]}`; a full eval also writes its selected sets as CSR
 //! (`OUT.pass{P}.{indptr,indices,offsets}.npy`, pieces numbered site after site) and each eval
-//! token's KL (`OUT.pass{P}.kl.npy`, float64, rows in order). Passes repeat until one saves less
-//! than a bit per token.
+//! token's KL (`OUT.pass{P}.kl.npy`, float64, rows in order) and whether its argmax is the model's
+//! (`OUT.pass{P}.agree.npy`, int64). Passes repeat until one saves less than a bit per token.
 
 use gam_mpd::codec::prefix_integer_len_bits;
 use gam_mpd::import::import_language_model;
@@ -37,7 +44,15 @@ use serde_json::json;
 use statrs::function::gamma::ln_gamma;
 use std::path::{Path, PathBuf};
 
-/// Sums over a sequence's tokens: active pieces, KL, frontier bits.
+fn read_f64(path: &Path, cols: usize) -> Result<Array2<f64>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if bytes.len() % (cols * 8) != 0 {
+        return Err(format!("{}: {} bytes are not rows of {cols} float64", path.display(), bytes.len()));
+    }
+    let values = bytes.chunks_exact(8).map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])).collect();
+    Array2::from_shape_vec((bytes.len() / (cols * 8), cols), values).map_err(|e| e.to_string())
+}
+
 /// A one-dimensional little-endian `.npy` file of 8-byte values of type `descr`.
 fn write_npy(path: &Path, descr: &str, values: impl ExactSizeIterator<Item = [u8; 8]>) -> Result<(), String> {
     let mut header = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': ({},), }}", values.len());
@@ -54,6 +69,7 @@ fn write_npy(path: &Path, descr: &str, values: impl ExactSizeIterator<Item = [u8
     std::fs::write(path, bytes).map_err(|e| e.to_string())
 }
 
+/// Sums over a sequence's tokens: active pieces, KL, frontier bits.
 fn sums(masks: &[Array2<f64>], kl: &Array1<f64>) -> (f64, f64, f64) {
     let mut l0 = 0.0;
     let mut bits = 0.0;
@@ -72,12 +88,13 @@ fn sums(masks: &[Array2<f64>], kl: &Array1<f64>) -> (f64, f64, f64) {
 fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
-    let usage = "mpd_pieces_masked_2951 EXPORT_DIR OUT.json OBSERVATIONS {wsvd|wsvd2} TRAIN EVAL [CONTEXT] [GPU]";
+    let usage = "mpd_pieces_masked_2951 EXPORT_DIR OUT.json OBSERVATIONS {wsvd|wsvd2|library:DIR} TRAIN EVAL [CONTEXT] [GPU]";
     let export = PathBuf::from(args.get(1).ok_or(usage)?);
     let out = PathBuf::from(args.get(2).ok_or(usage)?);
     let observations: f64 = args.get(3).ok_or(usage)?.parse().map_err(|e| format!("OBSERVATIONS: {e}"))?;
     let start = args.get(4).ok_or(usage)?.clone();
-    if start != "wsvd" && start != "wsvd2" {
+    let given = start.strip_prefix("library:").map(PathBuf::from);
+    if start != "wsvd" && start != "wsvd2" && given.is_none() {
         return Err(format!("unknown start {start}; {usage}"));
     }
     let train: usize = args.get(5).ok_or(usage)?.parse().map_err(|e| format!("TRAIN: {e}"))?;
@@ -93,11 +110,34 @@ fn main() -> Result<(), String> {
     let target_of = |inputs: &FamilyInputs| -> Result<Array2<f64>, String> {
         Ok(model.execute(inputs, false).map_err(|e| e.to_string())?.values[model.output].clone())
     };
-    let chosen = sites(model);
-    let statistics = site_statistics(model, &chosen, (0..train).map(sequence), 2, 0x5EED)?;
+    let all_sites = sites(model);
+    // The model's statistics on the training sequences (on the eval sequences when nothing trains).
+    let measured_on = if train > 0 { 0..train } else { train..train + eval };
+    let statistics = site_statistics(model, &all_sites, measured_on.map(sequence), 2, 0x5EED)?;
+    let mut chosen = Vec::new();
     let mut libraries = Vec::new();
     let mut fishers: Vec<Array2<f64>> = Vec::new();
-    for (site, measured) in chosen.iter().zip(statistics) {
+    for (site, measured) in all_sites.iter().zip(statistics) {
+        if let Some(dir) = &given {
+            let v_path = dir.join(format!("{}.v.f64", site.name));
+            if !v_path.exists() {
+                eprintln!("{}: no given library, native", site.name);
+                continue;
+            }
+            let (d_out, d_in) = measured.w.dim();
+            let v = read_f64(&v_path, d_in)?;
+            let u = read_f64(&dir.join(format!("{}.u.f64", site.name)), d_out)?;
+            if u.nrows() != v.nrows() {
+                return Err(format!("{}: {} v pieces and {} u pieces", site.name, v.nrows(), u.nrows()));
+            }
+            let left = &measured.w - &v.t().dot(&u).t();
+            let norm = |m: &Array2<f64>| m.iter().map(|x| x * x).sum::<f64>().sqrt();
+            eprintln!("{}: {d_out}×{d_in}, {} given pieces, ‖W − Σ u vᵀ‖/‖W‖ = {:.2e}", site.name, v.nrows(), norm(&left) / norm(&measured.w));
+            fishers.push(measured.fisher);
+            chosen.push(site.clone());
+            libraries.push(Library { v, u, mean: Array1::zeros(d_in) });
+            continue;
+        }
         let library = fisher_svd(&measured)?;
         let (v, u) = (library.v.t().to_owned(), library.u);
         let error = (&v.t().dot(&u).t() - &measured.w).iter().fold(0.0_f64, |m, x| m.max(x.abs()));
@@ -107,6 +147,7 @@ fn main() -> Result<(), String> {
         }
         eprintln!("{}: {}×{}, {} pieces", site.name, measured.w.nrows(), measured.w.ncols(), v.nrows());
         fishers.push(measured.fisher);
+        chosen.push(site.clone());
         libraries.push(Library { v, u, mean: measured.mean });
     }
     let original_sites = chosen.clone();
@@ -149,8 +190,94 @@ fn main() -> Result<(), String> {
     }
     // The bits of one real of a library piece: they are sent in single precision.
     const BITS_PER_REAL: f64 = 32.0;
-    let mut running = Running::default();
+    let stem = out.with_extension("");
+    // Select the first `evaluated` eval sequences with `context`'s counts; a full eval also writes
+    // the sets, each token's KL and argmax agreement. Returns the point, the code per token, and
+    // the counts of the sets selected.
+    let evaluate = |masked: &Masked, context: &Context, pass: usize, trained: usize, evaluated: usize, full: bool| -> Result<(serde_json::Value, f64, Context), String> {
+        let mut seen = Context::new(&masked.libraries.iter().map(|l| l.v.nrows()).collect::<Vec<_>>());
+        let (mut l0, mut kl, mut bits, mut tokens, mut explanation) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        // Sets as CSR over all pieces (sites in order), so other context codes can score them.
+        let mut indptr: Vec<i64> = vec![0];
+        let mut indices: Vec<i64> = Vec::new();
+        let mut token_kl: Vec<f64> = Vec::new();
+        let mut agree: Vec<i64> = Vec::new();
+        let point_of = |l0: f64, kl: f64, bits: f64, explanation: f64, tokens: f64, evaluated: usize| {
+            json!({
+                "l0": l0 / tokens, "kl": kl / tokens, "bits": bits / tokens,
+                "context_bits": explanation / tokens,
+                "code": (explanation + kl * observations / std::f64::consts::LN_2) / tokens,
+                "pieces": masked.libraries.iter().map(|l| l.v.nrows()).sum::<usize>(),
+                "pass": pass, "sequences_trained": trained, "observations": observations,
+                "eval_sequences": evaluated,
+            })
+        };
+        for e in 0..evaluated {
+            let inputs = sequence(train + e);
+            let target = target_of(&inputs)?;
+            let previous_rows = previous_inputs(&inputs);
+            let coder = context.coder(previous_rows.clone());
+            let begin = start_masks(&inputs, &masked.libraries, &coder.costs)?;
+            let (masks, values) = select(masked, &inputs, &target, begin, &coder, observations, samples)?;
+            explanation += coder.bits(&masks).sum();
+            seen.absorb(&masks, &previous_rows);
+            if full {
+                token_kl.extend(values.iter().copied());
+                for r in 0..inputs.rows {
+                    let mut offset = 0;
+                    for m in &masks {
+                        indices.extend((0..m.ncols()).filter(|&c| m[[r, c]] > 0.0).map(|c| (offset + c) as i64));
+                        offset += m.ncols();
+                    }
+                    indptr.push(indices.len() as i64);
+                }
+                let trace = gam_mpd::masked::forward(masked, &masked.family(&inputs, &masks), &target)?.1;
+                let argmax = |row: ndarray::ArrayView1<f64>| row.iter().enumerate().fold((0, f64::NEG_INFINITY), |b, (i, v)| if *v > b.1 { (i, *v) } else { b }).0;
+                let logits = &trace.values[masked.program.output];
+                agree.extend((0..inputs.rows).map(|r| i64::from(argmax(logits.row(r)) == argmax(target.row(r)))));
+            }
+            let (a, b, c) = sums(&masks, &values);
+            l0 += a;
+            kl += b;
+            bits += c;
+            tokens += inputs.rows as f64;
+            let progress = point_of(l0, kl, bits, explanation, tokens, e + 1);
+            std::fs::write(format!("{}.progress.json", stem.display()), progress.to_string()).map_err(|e| e.to_string())?;
+        }
+        if full {
+            let mut offsets = vec![0i64];
+            for l in &masked.libraries {
+                offsets.push(offsets[offsets.len() - 1] + l.v.nrows() as i64);
+            }
+            for (name, values) in [("indptr", &indptr), ("indices", &indices), ("offsets", &offsets), ("agree", &agree)] {
+                write_npy(&PathBuf::from(format!("{}.pass{pass}.{name}.npy", stem.display())), "<i8", values.iter().map(|v| v.to_le_bytes()))?;
+            }
+            write_npy(&PathBuf::from(format!("{}.pass{pass}.kl.npy", stem.display())), "<f8", token_kl.iter().map(|v| v.to_le_bytes()))?;
+        }
+        let point = point_of(l0, kl, bits, explanation, tokens, evaluated);
+        let code = point["code"].as_f64().unwrap_or(f64::INFINITY);
+        Ok((point, code, seen))
+    };
     let mut points = Vec::new();
+    let write_points = |points: &[serde_json::Value]| -> Result<(), String> {
+        std::fs::write(&out, serde_json::to_string_pretty(&json!({"points": points})).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    };
+    if train == 0 {
+        let mut previous = f64::INFINITY;
+        for pass in 0.. {
+            let (point, code, seen) = evaluate(&masked, &context, pass, 0, eval, true)?;
+            eprintln!("eval {point}");
+            points.push(point);
+            write_points(&points)?;
+            if previous - code < 1.0 {
+                break;
+            }
+            previous = code;
+            context = seen;
+        }
+        return Ok(());
+    }
+    let mut running = Running::default();
     let mut previous = f64::INFINITY;
     let report_every = (train / 4).max(1);
     for pass in 0.. {
@@ -258,57 +385,10 @@ fn main() -> Result<(), String> {
                     }
                 }
                 let evaluated = if last { eval } else { eval.min(4) };
-                let (mut l0, mut kl, mut bits, mut tokens, mut explanation) = (0.0, 0.0, 0.0, 0.0, 0.0);
-                // At a full eval the selected sets are written as CSR over all pieces (sites in
-                // order), so other context codes can score exactly these sets.
-                let mut indptr: Vec<i64> = vec![0];
-                let mut indices: Vec<i64> = Vec::new();
-                let mut token_kl: Vec<f64> = Vec::new();
-                for e in 0..evaluated {
-                    let inputs = sequence(train + e);
-                    let target = target_of(&inputs)?;
-                    let coder = context.coder(previous_inputs(&inputs));
-                    let begin = start_masks(&inputs, &masked.libraries, &coder.costs)?;
-                    let (masks, values) = select(&masked, &inputs, &target, begin, &coder, observations, samples)?;
-                    explanation += coder.bits(&masks).sum();
-                    if last {
-                        token_kl.extend(values.iter().copied());
-                        for r in 0..inputs.rows {
-                            let mut offset = 0;
-                            for m in &masks {
-                                indices.extend((0..m.ncols()).filter(|&c| m[[r, c]] > 0.0).map(|c| (offset + c) as i64));
-                                offset += m.ncols();
-                            }
-                            indptr.push(indices.len() as i64);
-                        }
-                    }
-                    let (a, b, c) = sums(&masks, &values);
-                    l0 += a;
-                    kl += b;
-                    bits += c;
-                    tokens += inputs.rows as f64;
-                }
-                if last {
-                    let mut offsets = vec![0i64];
-                    for l in &masked.libraries {
-                        offsets.push(offsets[offsets.len() - 1] + l.v.nrows() as i64);
-                    }
-                    let stem = out.with_extension("");
-                    for (name, values) in [("indptr", &indptr), ("indices", &indices), ("offsets", &offsets)] {
-                        write_npy(&PathBuf::from(format!("{}.pass{pass}.{name}.npy", stem.display())), "<i8", values.iter().map(|v| v.to_le_bytes()))?;
-                    }
-                    write_npy(&PathBuf::from(format!("{}.pass{pass}.kl.npy", stem.display())), "<f8", token_kl.iter().map(|v| v.to_le_bytes()))?;
-                }
-                let point = json!({
-                    "l0": l0 / tokens, "kl": kl / tokens, "bits": bits / tokens,
-                    "context_bits": explanation / tokens,
-                    "pieces": masked.libraries.iter().map(|l| l.v.nrows()).sum::<usize>(),
-                    "pass": pass, "sequences_trained": pass * train + s + 1, "observations": observations,
-                    "eval_sequences": evaluated,
-                });
+                let (point, _, _) = evaluate(&masked, &context, pass, pass * train + s + 1, evaluated, last)?;
                 eprintln!("eval {point}");
                 points.push(point);
-                std::fs::write(&out, serde_json::to_string_pretty(&json!({"points": points})).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+                write_points(&points)?;
             }
         }
         let code = pass_code / train as f64;
