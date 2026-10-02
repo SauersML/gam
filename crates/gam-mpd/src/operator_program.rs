@@ -1537,9 +1537,9 @@ impl OperatorProgram {
                         if let Some((difference, rows, cols)) = changed_ops.get(operator) {
                             // Only the changed rows and columns of the difference take part.
                             let product = if cols.len() == difference.ncols() {
-                                x.dot(&difference.select(Axis(0), rows).t())
+                                fast_abt(x, &difference.select(Axis(0), rows))
                             } else {
-                                x.select(Axis(1), cols).dot(&difference.select(Axis(1), cols).select(Axis(0), rows).t())
+                                fast_abt(&x.select(Axis(1), cols), &difference.select(Axis(1), cols).select(Axis(0), rows))
                             };
                             for (k, &t) in rows.iter().enumerate() {
                                 let mut target = delta.column_mut(t);
@@ -1552,9 +1552,9 @@ impl OperatorProgram {
                             let a = self.operators[*operator].matrix_cow();
                             // Every column changed (the usual case past the first changed node): no copy.
                             if cols.len() == a.ncols() {
-                                delta += &dx.dot(&a.t());
+                                delta += &fast_abt(&dx, a.as_ref());
                             } else {
-                                delta += &dx.dot(&a.select(Axis(1), &cols).t());
+                                delta += &fast_abt(&dx, &a.select(Axis(1), &cols));
                             }
                             touched.iter_mut().for_each(|t| *t = true);
                         }
