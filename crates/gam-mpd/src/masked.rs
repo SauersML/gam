@@ -459,11 +459,11 @@ impl XorShift {
 
 /// The cotangent of `−log q_y` at the logits, `q − e_y`, with each row's label `y` drawn from the
 /// row's own distribution `q`: its outer product is an unbiased sample of the output Fisher. Rows
-/// `scores` rejects stay zero.
-fn sampled_cotangent(logits: &Array2<f64>, rng: &mut XorShift, scores: impl Fn(usize) -> bool) -> Array2<f64> {
+/// outside `scored` (every row when absent, as in [`Target::scores`]) stay zero.
+fn sampled_cotangent(logits: &Array2<f64>, rng: &mut XorShift, scored: Option<&[bool]>) -> Array2<f64> {
     let mut cotangent = Array2::<f64>::zeros(logits.dim());
     for r in 0..logits.nrows() {
-        if !scores(r) {
+        if scored.is_some_and(|s| !s[r]) {
             continue;
         }
         let q = softmax(logits.row(r));
@@ -485,7 +485,7 @@ fn sampled_cotangent(logits: &Array2<f64>, rng: &mut XorShift, scores: impl Fn(u
 
 /// One sampled-label cotangent of the target's scored rows (as [`fisher`] draws them), from `seed`.
 pub fn sampled_label_cotangent(logits: &Array2<f64>, target: &Target, seed: u64) -> Array2<f64> {
-    sampled_cotangent(logits, &mut XorShift(seed | 1), |r| target.scores(r))
+    sampled_cotangent(logits, &mut XorShift(seed | 1), target.scored.as_deref())
 }
 
 /// What a site's Fisher-SVD library is built from (`pieces::fisher_svd`), measured on the native
@@ -516,7 +516,7 @@ pub fn site_statistics(
         }
         rows += inputs.rows as f64;
         for _ in 0..samples {
-            let cotangent = sampled_cotangent(&trace.values[program.output], &mut rng, |_| true);
+            let cotangent = sampled_cotangent(&trace.values[program.output], &mut rng, None);
             let back = proposing(|| vjp(program, &inputs, &trace, cotangent)).map_err(|e| e.to_string())?;
             for (site, (_, _, fisher)) in sites.iter().zip(stats.iter_mut()) {
                 let written: Vec<Array2<f64>> =
@@ -565,7 +565,7 @@ pub fn fisher(
         })
         .collect();
     for _ in 0..samples {
-        let cotangent = sampled_cotangent(logits, &mut rng, |r| target.scores(r));
+        let cotangent = sampled_cotangent(logits, &mut rng, target.scored.as_deref());
         let back = proposing(|| vjp(&masked.program, family, trace, cotangent)).map_err(|e| e.to_string())?;
         for (k, (h, f)) in out.iter_mut().enumerate() {
             if let Some(c) = &back[masked.masked[k]] {
