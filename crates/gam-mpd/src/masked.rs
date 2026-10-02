@@ -571,9 +571,10 @@ pub fn select(
     }
 }
 
-/// A preconditioner `M⁺` of a symmetric positive semidefinite matrix over its eigenvalues above
-/// the band.
-fn pseudo_inverse(m: &Array2<f64>) -> Result<Array2<f64>, String> {
+/// `(M + λ I)⁻¹` for a symmetric positive semidefinite `M`, with `λ = tr M / dim`: the matrix
+/// shrunk halfway to the isotropic matrix of its own mean eigenvalue, so a direction the data barely
+/// resolve is not amplified beyond the mean scale.
+fn shrunk_inverse(m: &Array2<f64>) -> Result<Array2<f64>, String> {
     let mut sym = m.clone();
     let n = sym.nrows();
     for i in 0..n {
@@ -583,49 +584,79 @@ fn pseudo_inverse(m: &Array2<f64>) -> Result<Array2<f64>, String> {
             sym[[j, i]] = v;
         }
     }
+    let lambda = (0..n).map(|i| sym[[i, i]]).sum::<f64>() / n.max(1) as f64;
     let d = super::dense::eigh(sym.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
     let mut scaled = d.vectors.clone();
     for (k, l) in d.values.iter().enumerate() {
-        let inv = if *l > d.band { 1.0 / l } else { 0.0 };
+        let shifted = l.max(0.0) + lambda;
+        let inv = if shifted > 0.0 { 1.0 / shifted } else { 0.0 };
         scaled.column_mut(k).mapv_inplace(|x| x * inv);
     }
     Ok(scaled.dot(&d.vectors.t()))
 }
 
-/// One preconditioned, backtracked step of every site's pieces on the exact total KL given the
-/// masks; returns whether the total fell.
-pub fn step_pieces(masked: &mut Masked, base: &FamilyInputs, target: &Array2<f64>, masks: &[Array2<f64>], samples: usize, seed: u64) -> Result<bool, String> {
+/// One preconditioned step of every site's pieces on the exact total KL given the masks: the
+/// direction is the gradient preconditioned by the shrunk read covariance (for `V`) and the shrunk
+/// written Fisher (for `U`); its length is the Gauss–Newton minimiser along it, `⟨g, d⟩ / dᵀ H d`
+/// with `dᵀ H d` from one forward tangent through the masked program, halved until the exact
+/// total falls. Returns the total before and after the step, or `None` when no step lowered it.
+pub fn step_pieces(masked: &mut Masked, base: &FamilyInputs, target: &Array2<f64>, masks: &[Array2<f64>], samples: usize, seed: u64) -> Result<Option<(f64, f64)>, String> {
     let family = masked.family(base, masks);
     let (kl_now, trace, cotangent) = forward(masked, &family, target)?;
     let total = kl_now.sum();
     let grads = gradients(masked, &family, &trace, masks, cotangent)?;
     let curvature = fisher(masked, &family, &trace, samples, seed)?;
     let mut directions = Vec::new();
+    let mut slope = 0.0;
     for (k, site) in masked.sites.iter().enumerate() {
         let centred = &read_values(&trace, site)? - &masked.libraries[k].mean;
         let covariance = fast_atb(&centred, &centred) / centred.nrows() as f64;
-        let rows = centred.nrows() as f64;
         let (_, v_gradient, u_gradient) = &grads[k];
-        // Natural-gradient units: the read covariance for V, the written Fisher for U, per input.
-        let dv = v_gradient.dot(&pseudo_inverse(&covariance)?) / rows;
-        let du = u_gradient.dot(&pseudo_inverse(&curvature[k].1)?) / rows;
+        let dv = v_gradient.dot(&shrunk_inverse(&covariance)?);
+        let du = u_gradient.dot(&shrunk_inverse(&curvature[k].1)?);
+        slope += (v_gradient * &dv).sum() + (u_gradient * &du).sum();
         directions.push((dv, du));
     }
+    if !(slope > 0.0) {
+        return Ok(None);
+    }
+    // `dᵀ H d`: the output tangent of the direction, in each row's softmax Fisher.
+    let mut tangents: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
+    for (k, (dv, du)) in directions.iter().enumerate() {
+        let (ro, wo) = (&masked.read_offsets[k], &masked.write_offsets[k]);
+        for (j, &op) in masked.v_ops[k].iter().enumerate() {
+            tangents.insert(op, dv.slice(s![.., ro[j]..ro[j + 1]]).to_owned());
+        }
+        tangents.insert(masked.centre_ops[k], (-dv.dot(&masked.libraries[k].mean)).insert_axis(Axis(1)));
+        for (i, &op) in masked.u_ops[k].iter().enumerate() {
+            tangents.insert(op, du.slice(s![.., wo[i]..wo[i + 1]]).t().to_owned());
+        }
+    }
+    let output = super::derivatives::jvp(&masked.program, &family, &trace, &tangents).map_err(|e| e.to_string())?;
+    let logits = &trace.values[masked.program.output];
+    let mut quadratic = 0.0;
+    for r in 0..logits.nrows() {
+        let q = softmax(logits.row(r));
+        let t = output.row(r);
+        let mean: f64 = q.iter().zip(t.iter()).map(|(a, b)| a * b).sum();
+        quadratic += q.iter().zip(t.iter()).map(|(a, b)| a * (b - mean) * (b - mean)).sum::<f64>();
+    }
     let originals = masked.libraries.clone();
-    let mut eta = 1.0;
-    while eta > 1.0 / (1u64 << 30) as f64 {
+    let mut eta = if quadratic > 0.0 { slope / quadratic } else { 1.0 };
+    let floor = eta * f64::EPSILON;
+    while eta > floor {
         for (k, (dv, du)) in directions.iter().enumerate() {
             let library = Library { v: &originals[k].v - &(dv * eta), u: &originals[k].u - &(du * eta), mean: originals[k].mean.clone() };
             masked.set_library(k, library)?;
         }
         let (kl_trial, _, _) = forward(masked, &family, target)?;
         if kl_trial.sum() < total {
-            return Ok(true);
+            return Ok(Some((total, kl_trial.sum())));
         }
         eta *= 0.5;
     }
     for (k, library) in originals.into_iter().enumerate() {
         masked.set_library(k, library)?;
     }
-    Ok(false)
+    Ok(None)
 }

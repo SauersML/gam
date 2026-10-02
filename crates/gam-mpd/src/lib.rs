@@ -87,6 +87,9 @@ pub mod pieces;
 pub mod masked;
 
 #[cfg(test)]
+mod masked_tests;
+
+#[cfg(test)]
 mod pieces_tests;
 
 // Identifiability: the search's ties classified as gauge, abstraction, redundancy or a distinct

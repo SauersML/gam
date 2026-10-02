@@ -229,7 +229,9 @@ fn curvatures(program: &OperatorProgram, context: &SearchContext<'_>, nodes: &[u
             }
         }
     }
-    let passes = classes.min(widest);
+    // Exact when the classes are fewer than the widest reader; otherwise a sketch of at most as
+    // many probes as the family has distribution rows (each pass probes every row at once).
+    let passes = classes.min(widest).min(rows * readouts);
     let sketch: Option<Array2<f64>> = (passes < classes).then(|| {
         let mut state = 0x9E37_79B9_7F4A_7C15_u64;
         let scale = 1.0 / (passes as f64).sqrt();

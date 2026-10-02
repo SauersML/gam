@@ -112,10 +112,24 @@ fn main() -> Result<(), String> {
     let mut previous = f64::INFINITY;
     for iteration in 0.. {
         let started = std::time::Instant::now();
-        let (masks, fit_kl) = select(&masked, &fit, &fit_target, fit_masks, &costs, observations, samples)?;
+        let (masks, selected_kl) = select(&masked, &fit, &fit_target, fit_masks, &costs, observations, samples)?;
+        log::info!("selection: KL {:.4} per input", selected_kl.sum() / fit.rows as f64);
         fit_masks = masks;
         costs = listing_costs(&fit_masks);
-        let stepped = step_pieces(&mut masked, &fit, &fit_target, &fit_masks, samples, 0xF00D + iteration as u64)?;
+        // Steps of the pieces until one saves less than a bit per input (or none lowers the KL).
+        let mut steps = 0usize;
+        let bits_per_nat = observations / std::f64::consts::LN_2;
+        while let Some((before, after)) = step_pieces(&mut masked, &fit, &fit_target, &fit_masks, samples, 0xF00D + (iteration * 1000 + steps) as u64)? {
+            steps += 1;
+            log::info!("pieces step {steps}: KL {:.4} -> {:.4} per input", before / fit.rows as f64, after / fit.rows as f64);
+            if (before - after) * bits_per_nat < fit.rows as f64 {
+                break;
+            }
+        }
+        let fit_kl = {
+            let family = masked.family(&fit, &fit_masks);
+            gam_mpd::masked::forward(&masked, &family, &fit_target)?.0
+        };
         let total = (listing_bits(&fit_masks, &costs).sum() + fit_kl.sum() * observations / std::f64::consts::LN_2) / fit.rows as f64;
         // The eval inputs, selected from no piece on with the fit's costs.
         let eval_start: Vec<Array2<f64>> = masked.libraries.iter().map(|l| Array2::zeros((eval.rows, l.v.nrows()))).collect();
@@ -125,7 +139,7 @@ fn main() -> Result<(), String> {
             "fit": report(&fit_masks, &fit_kl),
             "eval": report(&eval_masks, &eval_kl),
             "fit_code_bits_per_input": total,
-            "pieces_stepped": stepped,
+            "pieces_steps": steps,
             "seconds": started.elapsed().as_secs_f64(),
         });
         eprintln!("{point}");
