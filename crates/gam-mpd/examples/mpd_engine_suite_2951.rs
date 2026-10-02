@@ -1,13 +1,14 @@
 //! The decomposition engine on one exported model with the suite's defaults (#2951): one row of the
 //! evaluation table.
 //!
-//! `mpd_engine_suite_2951 MODEL_DIR OUT_DIR [SEQUENCES CONTEXT [SCREENINGS CERTIFICATIONS [RUNGS]]]`
+//! `mpd_engine_suite_2951 MODEL_DIR OUT_DIR [SEQUENCES CONTEXT [SCREENINGS CERTIFICATIONS [RUNGS [LOWEST]]]]`
 //!
 //! `MODEL_DIR` is any export `gam_mpd::import` reads: a transformer, residual MLP or RNN (`import`),
 //! or a rotary language model (`import_language_model`, its first `SEQUENCES` token rows at
 //! positions `0..CONTEXT`, default 1 × 32). Every model gets the same library, the same budget and
 //! the contract its export declares; nothing is tuned per model. The amount of behaviour explained
-//! is a ladder, `n = 10^RUNGS … 10^0` observations of every row (default `RUNGS = 6`), each rung's
+//! is a ladder, `n = 10^RUNGS … 10^LOWEST` observations of every row (default 6 and 0; one rung when
+//! they are equal, for a model whose full ladder is too slow), each rung's
 //! search starting from the previous (larger-n) rung's program, so the row is a frontier of program bits
 //! against behaviour, as in the blind benchmark.
 //!
@@ -229,7 +230,7 @@ fn rollout_fidelity(program: &OperatorProgram, contract: &Contract, rollouts: &R
 fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
-    let usage = "mpd_engine_suite_2951 MODEL_DIR OUT_DIR [SEQUENCES CONTEXT [SCREENINGS CERTIFICATIONS [RUNGS]]]";
+    let usage = "mpd_engine_suite_2951 MODEL_DIR OUT_DIR [SEQUENCES CONTEXT [SCREENINGS CERTIFICATIONS [RUNGS [LOWEST]]]]";
     let dir = PathBuf::from(args.get(1).ok_or(usage)?);
     let out = PathBuf::from(args.get(2).ok_or(usage)?);
     let number = |i: usize, default: u64| -> Result<u64, String> {
@@ -242,6 +243,7 @@ fn main() -> Result<(), String> {
         ..Budget::default()
     };
     let rungs = number(7, 6)? as u32;
+    let lowest = (number(8, 0)? as u32).min(rungs);
     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
     let started = Instant::now();
     let language_model = is_language_model(&dir)?;
@@ -313,7 +315,7 @@ fn main() -> Result<(), String> {
     // Descending: the search only removes and coarsens, so each rung starts from the program of
     // the rung with more behaviour (an ascending ladder would start n = 10 from n = 1's program,
     // which explains almost nothing and cannot regrow).
-    for exponent in (0..=rungs).rev() {
+    for exponent in (lowest..=rungs).rev() {
         let n = 10u64.pow(exponent);
         let mut contract = contract.clone();
         contract.observations = n;
