@@ -342,3 +342,32 @@ fn the_explanations_list_each_inputs_active_units_in_the_librarys_code() {
     assert!((explanation.mean_active() * n - active as f64).abs() <= f64::from(open) + 1e-9);
     assert!((score.total() - (score.program_bits as f64 + explanation.bits + score.data_bits)).abs() < 1e-6);
 }
+
+/// A group drop priced from the per-block table changes the program's message by exactly what
+/// re-encoding the dropped program measures, for every row and column group of every operator.
+#[test]
+fn a_group_drop_is_priced_exactly_from_the_block_table() {
+    use super::engine::{BlockBits, GroupAxis, apply_edit};
+    let (program, _) = planted_program(false);
+    let before = program.code_bits().expect("bits") as i64;
+    for (index, op) in program.operators.iter().enumerate() {
+        let OperatorBody::Dense { present, .. } = &op.body else { continue };
+        let table = BlockBits::of(op).expect("table").expect("dense");
+        for (axis, count) in [(GroupAxis::Columns, present.ncols()), (GroupAxis::Rows, present.nrows())] {
+            for group in 0..count {
+                let blocks: Vec<(usize, usize)> = present
+                    .indexed_iter()
+                    .filter(|((r, c), keep)| **keep && if axis == GroupAxis::Columns { *c == group } else { *r == group })
+                    .map(|(rc, _)| rc)
+                    .collect();
+                if blocks.is_empty() {
+                    continue;
+                }
+                let mut dropped = program.clone();
+                apply_edit(&mut dropped, &Edit::DropGroup { operator: index, axis, group }).expect("drop");
+                let after = dropped.code_bits().expect("bits") as i64;
+                assert_eq!(table.drop_delta(&blocks).expect("delta"), after - before, "{} {axis:?} {group}", op.name);
+            }
+        }
+    }
+}

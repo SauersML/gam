@@ -44,7 +44,8 @@ use super::refit::{RefitSearch, refit_readout};
 use super::precision::DeclaredPrecision;
 use super::secant::BandedMatrix;
 use ndarray::{Array2, s};
-use std::collections::BTreeSet;
+use super::codec::{CodecError, prefix_integer_len_bits, signed_delta_len_bits, subset_code_len_bits};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::fmt;
 
@@ -65,11 +66,20 @@ pub struct BlockRef {
     pub col: usize,
 }
 
+/// Which side of an operator a group indexes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GroupAxis {
+    Rows,
+    Columns,
+}
+
 /// A change of the program.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Edit {
     /// Remove present blocks.
     DropBlocks { blocks: Vec<BlockRef> },
+    /// Remove every present block of one row group or one column group of an operator.
+    DropGroup { operator: usize, axis: GroupAxis, group: usize },
     /// Move an operator's reals to another lattice (coarsened when the reals' range needs it,
     /// `DeclaredPrecision::within_range`).
     Precision { operator: usize, precision: DeclaredPrecision },
@@ -106,6 +116,8 @@ pub struct SearchContext<'a> {
     pub interfaces: &'a [Interface],
     /// The search level: `0` coarse proposals, higher levels finer ones (see [`Primitive`]).
     pub level: usize,
+    /// Screenings the budget has left: a primitive need not propose more than this.
+    pub screenings_left: u64,
 }
 
 /// A source of proposals.
@@ -323,6 +335,20 @@ impl From<ContractError> for EngineError {
 pub fn apply_edit(program: &mut OperatorProgram, edit: &Edit) -> Result<(), EngineError> {
     match edit {
         Edit::DropBlocks { blocks } => drop_blocks(program, blocks),
+        Edit::DropGroup { operator, axis, group } => {
+            let op = program
+                .operators
+                .get(*operator)
+                .ok_or(EngineError::Program(ProgramError::Reference { what: "operator", index: *operator }))?;
+            let OperatorBody::Dense { present, .. } = &op.body else {
+                return Err(EngineError::Primitive(format!("operator {} has no blocks", op.name)));
+            };
+            let blocks: Vec<BlockRef> = match axis {
+                GroupAxis::Columns => present.column(*group).indexed_iter().filter(|(_, k)| **k).map(|(r, _)| BlockRef { operator: *operator, row: r, col: *group }).collect(),
+                GroupAxis::Rows => present.row(*group).indexed_iter().filter(|(_, k)| **k).map(|(c, _)| BlockRef { operator: *operator, row: *group, col: c }).collect(),
+            };
+            drop_blocks(program, &blocks)
+        }
         Edit::Precision { operator, precision } => {
             let op = Arc::make_mut(
                 program
@@ -424,20 +450,55 @@ struct Screened {
     saving: f64,
 }
 
-/// Two local edits that may be applied together.
-fn compatible(a: &Edit, b: &Edit) -> bool {
-    match (a, b) {
-        (Edit::Precision { operator: x, .. }, Edit::Precision { operator: y, .. }) => x != y,
-        (Edit::Laws { node: x, .. }, Edit::Laws { node: y, .. }) => x != y,
-        (Edit::DropBlocks { blocks: x }, Edit::DropBlocks { blocks: y }) => x.iter().all(|b| !y.contains(b)),
-        (Edit::Precision { operator, .. }, Edit::DropBlocks { blocks })
-        | (Edit::DropBlocks { blocks }, Edit::Precision { operator, .. }) => blocks.iter().all(|b| b.operator != *operator),
-        (Edit::Precision { operator, .. }, Edit::Laws { blocks, .. })
-        | (Edit::Laws { blocks, .. }, Edit::Precision { operator, .. }) => blocks.iter().all(|b| b.operator != *operator),
-        (Edit::Laws { blocks: x, .. }, Edit::DropBlocks { blocks: y })
-        | (Edit::DropBlocks { blocks: y }, Edit::Laws { blocks: x, .. }) => x.iter().all(|b| !y.contains(b)),
-        _ => false,
+/// The local edits applied together, greedily in order of screened saving: an edit joins when it
+/// conflicts with none already chosen. A precision move holds its operator alone and a law
+/// replacement its node; restrictions share their operators but not their blocks, and a group drop
+/// is taken once. One pass over the screened list, indexed by what each edit touches.
+fn compatible_batch(screened: &[Screened]) -> Vec<usize> {
+    let mut chosen = Vec::new();
+    let (mut exclusive, mut shared): (BTreeSet<usize>, BTreeSet<usize>) = (BTreeSet::new(), BTreeSet::new());
+    let mut nodes: BTreeSet<usize> = BTreeSet::new();
+    let mut blocks: BTreeSet<BlockRef> = BTreeSet::new();
+    let mut groups: BTreeSet<(usize, GroupAxis, usize)> = BTreeSet::new();
+    for (index, item) in screened.iter().enumerate() {
+        let fits = match &item.proposal.edit {
+            Edit::Precision { operator, .. } => !exclusive.contains(operator) && !shared.contains(operator),
+            Edit::Laws { node, blocks: touched, .. } => {
+                !nodes.contains(node) && touched.iter().all(|b| !exclusive.contains(&b.operator) && !blocks.contains(b))
+            }
+            Edit::DropBlocks { blocks: touched } => touched.iter().all(|b| !exclusive.contains(&b.operator) && !blocks.contains(b)),
+            Edit::DropGroup { operator, axis, group } => !exclusive.contains(operator) && !groups.contains(&(*operator, *axis, *group)),
+            Edit::Program(_) => false,
+        };
+        if !fits {
+            continue;
+        }
+        match &item.proposal.edit {
+            Edit::Precision { operator, .. } => {
+                exclusive.insert(*operator);
+            }
+            Edit::Laws { node, blocks: touched, .. } => {
+                nodes.insert(*node);
+                for b in touched {
+                    shared.insert(b.operator);
+                    blocks.insert(*b);
+                }
+            }
+            Edit::DropBlocks { blocks: touched } => {
+                for b in touched {
+                    shared.insert(b.operator);
+                    blocks.insert(*b);
+                }
+            }
+            Edit::DropGroup { operator, axis, group } => {
+                shared.insert(*operator);
+                groups.insert((*operator, *axis, *group));
+            }
+            Edit::Program(_) => {}
+        }
+        chosen.push(index);
     }
+    chosen
 }
 
 /// `candidate` with the dense operators of the affine node its readout reads refitted, when its
@@ -590,7 +651,8 @@ fn search(
     let stop = 'search: loop {
         let trace = program.execute(&contract.family, false)?;
         let interfaces = program.interfaces()?;
-        let context = SearchContext { program: &program, contract, trace: &trace, interfaces: &interfaces, level };
+        let screenings_left = budget.screenings.saturating_sub(screenings);
+        let context = SearchContext { program: &program, contract, trace: &trace, interfaces: &interfaces, level, screenings_left };
         let mut proposals = Vec::new();
         for primitive in library {
             if level < primitive.levels() {
@@ -601,9 +663,47 @@ fn search(
         // Screening does not re-derive the explanations; it charges the current program's.
         let explanation_bits = current.explanation.bits;
         let mut screened: Vec<Screened> = Vec::new();
+        // Group drops are priced from a per-block table of each operator's message, and one that
+        // no row of the family reads is screened without executing: its outputs are the current
+        // program's, its saving its bits.
+        let uses = operator_uses(&program);
+        let mut tables: BTreeMap<usize, Option<BlockBits>> = BTreeMap::new();
+        let mut current_data: Option<f64> = None;
         for proposal in proposals {
             if refused.contains(&proposal.description) {
                 continue;
+            }
+            if let Edit::DropGroup { operator, axis, group } = proposal.edit {
+                let (blocks, unread) = group_drop(&program, &uses, &trace, operator, axis, group);
+                if blocks.is_empty() {
+                    continue;
+                }
+                if unread {
+                    if screenings >= budget.screenings {
+                        break 'search Stop::ScreeningBudget;
+                    }
+                    screenings += 1;
+                    let table = match tables.entry(operator) {
+                        std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+                        std::collections::btree_map::Entry::Vacant(e) => e.insert(BlockBits::of(&program.operators[operator])?),
+                    };
+                    let Some(table) = table.as_ref() else { continue };
+                    let bits = current.program_bits as f64 + table.drop_delta(&blocks)? as f64;
+                    let data = match current_data {
+                        Some(data) => data,
+                        None => {
+                            let logits = contract.distributions(&trace.values[program.output])?;
+                            let data = screened_data_bits(reference, &logits, contract.observations);
+                            current_data = Some(data);
+                            data
+                        }
+                    };
+                    let saving = base_total - (bits + explanation_bits + data);
+                    if saving > 0.0 {
+                        screened.push(Screened { proposal, saving });
+                    }
+                    continue;
+                }
             }
             let mut candidate = program.clone();
             apply_edit(&mut candidate, &proposal.edit)?;
@@ -657,19 +757,7 @@ fn search(
         screened.sort_by(|a, b| {
             b.saving.total_cmp(&a.saving).then_with(|| a.proposal.description.cmp(&b.proposal.description))
         });
-        let batch: Vec<usize> = if !screened[0].proposal.edit.is_local() {
-            vec![0]
-        } else {
-            let mut chosen: Vec<usize> = Vec::new();
-            for (index, item) in screened.iter().enumerate() {
-                if item.proposal.edit.is_local()
-                    && chosen.iter().all(|&c| compatible(&screened[c].proposal.edit, &item.proposal.edit))
-                {
-                    chosen.push(index);
-                }
-            }
-            chosen
-        };
+        let batch: Vec<usize> = if !screened[0].proposal.edit.is_local() { vec![0] } else { compatible_batch(&screened) };
         let mut size = batch.len();
         let accepted = loop {
             if certifications >= budget.certifications {
@@ -785,9 +873,10 @@ pub fn decompose_refined(
 
 /// Remove present blocks: level 0 drops a whole column group of an operator (an input subspace
 /// removed from every row it feeds), or a whole row group (an output coordinate no longer
-/// written); level 1 drops one row group's reads of one column label tied across the term
-/// operators of an affine node that share it (e.g. one unit's read of plane `k` in every head);
-/// level 2 drops single blocks.
+/// written), each as one [`Edit::DropGroup`]; level 1 drops one row group's reads of one column
+/// label tied across the term operators of an affine node that share it (e.g. one unit's read of
+/// plane `k` in every head); level 2 drops single blocks, at most as many as the screenings left.
+/// Every list is built in one pass over the present blocks.
 pub struct DropBlocks;
 
 fn present_blocks(op: &Operator) -> Vec<(usize, usize)> {
@@ -809,36 +898,32 @@ impl Primitive for DropBlocks {
     fn propose(&self, context: &SearchContext<'_>) -> Result<Vec<Proposal>, EngineError> {
         let program = context.program;
         let mut out = Vec::new();
-        let proposal = |description: String, blocks: Vec<BlockRef>| Proposal {
+        let proposal = |description: String, edit: Edit| Proposal {
             primitive: "drop_blocks",
             kind: ProposalKind::Reduce,
             exactness: Exactness::Approximate,
             description,
-            edit: Edit::DropBlocks { blocks },
+            edit,
         };
         match context.level {
             0 => {
                 for (index, op) in program.operators.iter().enumerate() {
-                    let blocks = present_blocks(op);
-                    for col in 0..op.cols.group_count() {
-                        let dropped: Vec<BlockRef> = blocks
-                            .iter()
-                            .filter(|(_, c)| *c == col)
-                            .map(|&(row, col)| BlockRef { operator: index, row, col })
-                            .collect();
-                        if !dropped.is_empty() {
-                            out.push(proposal(format!("drop input {:?} of {}", op.cols.groups()[col].label, op.name), dropped));
+                    let OperatorBody::Dense { present, .. } = &op.body else { continue };
+                    for (col, column) in present.columns().into_iter().enumerate() {
+                        if column.iter().any(|k| *k) {
+                            out.push(proposal(
+                                format!("drop input {:?} of {}", op.cols.groups()[col].label, op.name),
+                                Edit::DropGroup { operator: index, axis: GroupAxis::Columns, group: col },
+                            ));
                         }
                     }
                     if op.rows.group_count() > 1 {
-                        for row in 0..op.rows.group_count() {
-                            let dropped: Vec<BlockRef> = blocks
-                                .iter()
-                                .filter(|(r, _)| *r == row)
-                                .map(|&(row, col)| BlockRef { operator: index, row, col })
-                                .collect();
-                            if !dropped.is_empty() {
-                                out.push(proposal(format!("drop output {:?} of {}", op.rows.groups()[row].label, op.name), dropped));
+                        for (row, line) in present.rows().into_iter().enumerate() {
+                            if line.iter().any(|k| *k) {
+                                out.push(proposal(
+                                    format!("drop output {:?} of {}", op.rows.groups()[row].label, op.name),
+                                    Edit::DropGroup { operator: index, axis: GroupAxis::Rows, group: row },
+                                ));
                             }
                         }
                     }
@@ -850,40 +935,151 @@ impl Primitive for DropBlocks {
                     if terms.len() < 2 {
                         continue;
                     }
-                    let mut labels: BTreeSet<(usize, (LabelKind, u32))> = BTreeSet::new();
+                    let mut tied: BTreeMap<(usize, LabelKind, u32), Vec<BlockRef>> = BTreeMap::new();
                     for (_, op) in terms {
-                        for (row, col) in present_blocks(&program.operators[*op]) {
-                            let label = program.operators[*op].cols.groups()[col].label;
-                            labels.insert((row, (label.kind, label.index)));
+                        let operator = &program.operators[*op];
+                        for (r, c) in present_blocks(operator) {
+                            let label = operator.cols.groups()[c].label;
+                            tied.entry((r, label.kind, label.index)).or_default().push(BlockRef { operator: *op, row: r, col: c });
                         }
                     }
-                    for (row, (kind, label_index)) in labels {
-                        let mut blocks = Vec::new();
-                        for (_, op) in terms {
-                            let operator = &program.operators[*op];
-                            for (r, c) in present_blocks(operator) {
-                                let label = operator.cols.groups()[c].label;
-                                if r == row && label.kind == kind && label.index == label_index {
-                                    blocks.push(BlockRef { operator: *op, row: r, col: c });
-                                }
-                            }
-                        }
+                    for ((row, kind, label_index), blocks) in tied {
                         if blocks.len() > 1 {
-                            out.push(proposal(format!("drop row {row} reads of {kind:?}{label_index} tied in node {node_index}"), blocks));
+                            out.push(proposal(
+                                format!("drop row {row} reads of {kind:?}{label_index} tied in node {node_index}"),
+                                Edit::DropBlocks { blocks },
+                            ));
                         }
                     }
                 }
             }
             _ => {
-                for (index, op) in program.operators.iter().enumerate() {
+                'operators: for (index, op) in program.operators.iter().enumerate() {
                     for (row, col) in present_blocks(op) {
-                        out.push(proposal(format!("drop block ({row}, {col}) of {}", op.name), vec![BlockRef { operator: index, row, col }]));
+                        if out.len() as u64 >= context.screenings_left {
+                            break 'operators;
+                        }
+                        out.push(proposal(
+                            format!("drop block ({row}, {col}) of {}", op.name),
+                            Edit::DropBlocks { blocks: vec![BlockRef { operator: index, row, col }] },
+                        ));
                     }
                 }
             }
         }
         Ok(out)
     }
+}
+
+/// An operator's message, block by block, for pricing restrictions without re-encoding it: the
+/// index bits of each present block's reals, each row group's present count, and the reals'
+/// total. Dropping blocks changes only these terms of `operator_program`'s code.
+pub(crate) struct BlockBits {
+    block_bits: Array2<u64>,
+    block_reals: Array2<u64>,
+    row_counts: Vec<usize>,
+    columns: usize,
+    reals: u64,
+}
+
+impl BlockBits {
+    pub(crate) fn of(op: &Operator) -> Result<Option<Self>, EngineError> {
+        let OperatorBody::Dense { values, present, precision } = &op.body else { return Ok(None) };
+        let scale = 1.0 / precision.step();
+        let mut block_bits = Array2::<u64>::zeros(present.dim());
+        let mut block_reals = Array2::<u64>::zeros(present.dim());
+        let mut reals = 0u64;
+        for ((r, c), keep) in present.indexed_iter() {
+            if !*keep {
+                continue;
+            }
+            let block = values.slice(s![op.rows.range(r), op.cols.range(c)]);
+            let mut bits = 0u64;
+            for v in block.iter() {
+                bits += signed_delta_len_bits((v * scale).round() as i64).map_err(|e| EngineError::Primitive(format!("{e:?}")))?;
+            }
+            block_bits[[r, c]] = bits;
+            block_reals[[r, c]] = block.len() as u64;
+            reals += block.len() as u64;
+        }
+        let row_counts = present.rows().into_iter().map(|row| row.iter().filter(|k| **k).count()).collect();
+        Ok(Some(Self { block_bits, block_reals, row_counts, columns: op.cols.group_count(), reals }))
+    }
+
+    /// The change of the operator's message when the present blocks `dropped` are removed.
+    pub(crate) fn drop_delta(&self, dropped: &[(usize, usize)]) -> Result<i64, EngineError> {
+        let code = |e: CodecError| EngineError::Primitive(format!("{e:?}"));
+        let (mut bits, mut reals) = (0i64, 0u64);
+        let mut per_row: BTreeMap<usize, usize> = BTreeMap::new();
+        for &(r, c) in dropped {
+            bits -= self.block_bits[[r, c]] as i64;
+            reals += self.block_reals[[r, c]];
+            *per_row.entry(r).or_default() += 1;
+        }
+        for (r, removed) in per_row {
+            let k = self.row_counts[r];
+            bits += subset_code_len_bits(self.columns, k - removed).map_err(code)? as i64
+                - subset_code_len_bits(self.columns, k).map_err(code)? as i64;
+        }
+        bits += prefix_integer_len_bits(self.reals - reals + 1).map_err(code)? as i64
+            - prefix_integer_len_bits(self.reals + 1).map_err(code)? as i64;
+        Ok(bits)
+    }
+}
+
+/// How each operator is read by the program's nodes, for telling which restrictions leave every
+/// output unchanged.
+#[derive(Clone, Default)]
+struct Uses {
+    /// The argument nodes of the affine terms it is.
+    terms: Vec<usize>,
+    /// The input nodes of the transposed nodes that read it.
+    transposed: Vec<usize>,
+    /// It is a bias, a constant, or read inside a rule.
+    other: bool,
+}
+
+fn operator_uses(program: &OperatorProgram) -> Vec<Uses> {
+    let mut uses = vec![Uses::default(); program.operators.len()];
+    for node in &program.nodes {
+        match node {
+            Node::Affine { terms, bias } => {
+                for (argument, op) in terms {
+                    uses[*op].terms.push(*argument);
+                }
+                if let Some(op) = bias {
+                    uses[*op].other = true;
+                }
+            }
+            Node::Transposed { input, operator } => uses[*operator].transposed.push(*input),
+            other => {
+                for op in program.node_operators(other) {
+                    uses[op].other = true;
+                }
+            }
+        }
+    }
+    uses
+}
+
+/// The present blocks a group drop removes, and whether every output is unchanged by it: an
+/// input group that no affine use reads a nonzero value from on any row of the family (and that
+/// no other node reads), or an output group whose transposed uses read only zeros there.
+fn group_drop(program: &OperatorProgram, uses: &[Uses], trace: &Trace, operator: usize, axis: GroupAxis, group: usize) -> (Vec<(usize, usize)>, bool) {
+    let op = &program.operators[operator];
+    let OperatorBody::Dense { present, .. } = &op.body else { return (Vec::new(), false) };
+    let blocks: Vec<(usize, usize)> = match axis {
+        GroupAxis::Columns => present.column(group).indexed_iter().filter(|(_, k)| **k).map(|(r, _)| (r, group)).collect(),
+        GroupAxis::Rows => present.row(group).indexed_iter().filter(|(_, k)| **k).map(|(c, _)| (group, c)).collect(),
+    };
+    let zero = |node: usize, range: std::ops::Range<usize>| trace.values[node].slice(s![.., range]).iter().all(|v| *v == 0.0);
+    let usage = &uses[operator];
+    let unread = !usage.other
+        && match axis {
+            GroupAxis::Columns => usage.transposed.is_empty() && usage.terms.iter().all(|&a| zero(a, op.cols.range(group))),
+            GroupAxis::Rows => usage.terms.is_empty() && usage.transposed.iter().all(|&a| zero(a, op.rows.range(group))),
+        };
+    (blocks, unread)
 }
 
 /// Coarsen an operator's lattice by `2^j` steps, `j = 0, 1, …`, down to the lattice on which every

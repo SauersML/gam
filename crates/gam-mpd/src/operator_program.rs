@@ -1482,19 +1482,32 @@ impl OperatorProgram {
         let interfaces = self.interfaces()?;
         let mut changed_ops: BTreeMap<usize, Vec<(usize, usize, Array2<f64>)>> = BTreeMap::new();
         for (index, (new, old)) in self.operators.iter().zip(&base_program.operators).enumerate() {
-            if new.body == old.body {
+            // A shared operator is unchanged without a look at its reals.
+            if Arc::ptr_eq(new, old) || new.body == old.body {
                 continue;
             }
             if new.rows != old.rows || new.cols != old.cols {
                 return Err(ProgramError::Input(format!("operator {} changed its interfaces", new.name)));
             }
-            let difference = new.matrix() - old.matrix();
             let mut blocks = Vec::new();
-            for r in 0..new.rows.group_count() {
-                for c in 0..new.cols.group_count() {
-                    let block = difference.slice(s![new.rows.range(r), new.cols.range(c)]);
-                    if block.iter().any(|v| *v != 0.0) {
-                        blocks.push((r, c, block.to_owned()));
+            if let (OperatorBody::Dense { values: a, .. }, OperatorBody::Dense { values: b, .. }) = (&new.body, &old.body) {
+                // Block by block, materializing only the blocks that differ.
+                for r in 0..new.rows.group_count() {
+                    for c in 0..new.cols.group_count() {
+                        let (x, y) = (a.slice(s![new.rows.range(r), new.cols.range(c)]), b.slice(s![new.rows.range(r), new.cols.range(c)]));
+                        if x != y {
+                            blocks.push((r, c, &x - &y));
+                        }
+                    }
+                }
+            } else {
+                let difference = new.matrix() - old.matrix();
+                for r in 0..new.rows.group_count() {
+                    for c in 0..new.cols.group_count() {
+                        let block = difference.slice(s![new.rows.range(r), new.cols.range(c)]);
+                        if block.iter().any(|v| *v != 0.0) {
+                            blocks.push((r, c, block.to_owned()));
+                        }
                     }
                 }
             }
