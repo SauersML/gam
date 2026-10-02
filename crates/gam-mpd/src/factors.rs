@@ -42,7 +42,8 @@
 //!   the basis is orthonormal in the whitened read space, so `tr(R Σ Rᵀ) = r`.
 //! * **Gauge.** `L R = (L Qᵀ)(Q R)` for every rotation `Q` of the factor space: the factorisation
 //!   is fixed by the rotation whose per-member coefficients `L` have the shortest code,
-//!   `Σ log₂(1 + |v|/Δ)`, by Jacobi sweeps until a sweep saves less than a bit. The shared basis
+//!   `Σ log₂(1 + |v|/Δ)`, by Jacobi sweeps until a sweep saves less than a bit; each pair is
+//!   offered its closed-form varimax angle and takes it when the code shortens. The shared basis
 //!   is sent once, and a rotation moves its length only through the rounding of its entries. A coefficient that rounds to
 //!   zero on its lattice leaves its block absent. Units that read one plane of a shared basis come
 //!   out reading one pair of coordinates: the sparsity is found, not declared.
@@ -327,41 +328,25 @@ pub fn fix_gauge(left: &mut Array2<f64>, left_steps: &[f64], right: &mut Array2<
         }
         total
     };
-    const GRID: usize = 64;
+    // Each pair's candidate angle is the closed-form varimax angle of the step-scaled coefficients
+    // (the rotation that most concentrates their energy, Kaiser's formula), taken when it shortens
+    // the code: three passes over the rows per pair.
     loop {
         let mut saved = 0.0;
         for i in 0..r {
             for j in (i + 1)..r {
+                let (mut numerator, mut denominator) = (0.0, 0.0);
+                for row in 0..left.nrows() {
+                    let (a, b) = (left[[row, i]] / left_steps[row], left[[row, j]] / left_steps[row]);
+                    let (u, v) = (a * a - b * b, 2.0 * a * b);
+                    numerator += 2.0 * u * v;
+                    denominator += u * u - v * v;
+                }
+                let theta = 0.25 * numerator.atan2(denominator);
                 let base = pair_cost(left, right, i, j, 0.0);
-                let quarter = std::f64::consts::FRAC_PI_4;
-                let mut best = (0.0, base);
-                for k in 0..GRID {
-                    let theta = -quarter + 2.0 * quarter * (k as f64 + 0.5) / GRID as f64;
-                    let cost = pair_cost(left, right, i, j, theta);
-                    if cost < best.1 {
-                        best = (theta, cost);
-                    }
-                }
-                // Golden-section refinement inside the best grid cell.
-                let width = 2.0 * quarter / GRID as f64;
-                let (mut lo, mut hi) = (best.0 - width, best.0 + width);
-                let golden = 0.5 * (5.0_f64.sqrt() - 1.0);
-                for _ in 0..24 {
-                    let a = hi - golden * (hi - lo);
-                    let b = lo + golden * (hi - lo);
-                    if pair_cost(left, right, i, j, a) < pair_cost(left, right, i, j, b) {
-                        hi = b;
-                    } else {
-                        lo = a;
-                    }
-                }
-                let mid = 0.5 * (lo + hi);
-                let refined = pair_cost(left, right, i, j, mid);
-                if refined < best.1 {
-                    best = (mid, refined);
-                }
-                if best.1 < base {
-                    let (c, s) = (best.0.cos(), best.0.sin());
+                let rotated = pair_cost(left, right, i, j, theta);
+                if rotated < base {
+                    let (c, s) = (theta.cos(), theta.sin());
                     for row in 0..left.nrows() {
                         let (a, b) = (left[[row, i]], left[[row, j]]);
                         left[[row, i]] = c * a + s * b;
@@ -372,7 +357,7 @@ pub fn fix_gauge(left: &mut Array2<f64>, left_steps: &[f64], right: &mut Array2<
                         right[[i, col]] = c * a + s * b;
                         right[[j, col]] = -s * a + c * b;
                     }
-                    saved += base - best.1;
+                    saved += base - rotated;
                 }
             }
         }

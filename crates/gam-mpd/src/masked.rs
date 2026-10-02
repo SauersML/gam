@@ -503,11 +503,18 @@ pub fn select(
     let mut budget = vec![usize::MAX; rows];
     let mut round = 0u64;
     let started = std::time::Instant::now();
+    let mut curvature: Option<Vec<(Array2<f64>, Array2<f64>)>> = None;
     loop {
         let family = masked.family(base, &masks);
         let (kl_now, trace, cotangent) = forward(masked, &family, target)?;
         let grads = gradients(masked, &family, &trace, &masks, cotangent)?;
-        let curvature = fisher(masked, &family, &trace, samples, 0x5EED + round)?;
+        // The Fisher diagonal only ranks proposals (the exact forward decides), so it is measured
+        // on the first round and kept: it moves slowly with the masks, and its passes dominate a
+        // round's cost.
+        if curvature.is_none() {
+            curvature = Some(fisher(masked, &family, &trace, samples, 0x5EED + round)?);
+        }
+        let curvature = curvature.as_ref().ok_or("no curvature")?;
         let listing_now = listing_bits(&masks, costs);
         let before = code(&kl_now, &listing_now, observations);
         // Each input's predicted flips, best first, within its budget.
@@ -516,7 +523,7 @@ pub fn select(
         for r in 0..rows {
             let active: usize = masks.iter().map(|m| m.row(r).iter().filter(|x| **x > 0.0).count()).sum();
             let mut candidates: Vec<(f64, usize, usize)> = Vec::new();
-            for (k, ((g, _, _), (h, _))) in grads.iter().zip(&curvature).enumerate() {
+            for (k, ((g, _, _), (h, _))) in grads.iter().zip(curvature.iter()).enumerate() {
                 for c in 0..g.ncols() {
                     let on = masks[k][[r, c]] > 0.0;
                     let delta = if on { -1.0 } else { 1.0 };
