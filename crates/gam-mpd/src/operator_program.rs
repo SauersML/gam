@@ -548,7 +548,8 @@ impl Operator {
     }
 
     /// A dense operator with the declared present blocks; absent blocks are zeroed and present
-    /// reals rounded to `precision`'s lattice.
+    /// reals rounded to `precision`'s lattice, coarsened when the present reals' range needs it
+    /// ([`DeclaredPrecision::within_range`]).
     pub fn blocks(
         name: impl Into<String>,
         rows: Interface,
@@ -570,6 +571,12 @@ impl Operator {
                 cols.group_count()
             )));
         }
+        let largest = present
+            .indexed_iter()
+            .filter(|(_, keep)| **keep)
+            .map(|((r, c), _)| values.slice(s![rows.range(r), cols.range(c)]).iter().fold(0.0_f64, |acc, v| acc.max(v.abs())))
+            .fold(0.0_f64, f64::max);
+        let precision = precision.within_range(largest);
         for ((r, c), &keep) in present.indexed_iter() {
             let mut block = values.slice_mut(s![rows.range(r), cols.range(c)]);
             if keep {
@@ -583,7 +590,8 @@ impl Operator {
         Ok(Self { name, rows, cols, body: OperatorBody::Dense { values, present, precision }, provenance })
     }
 
-    /// A low-rank operator `left · right`, both factors rounded to `precision`'s lattice.
+    /// A low-rank operator `left · right`, both factors rounded to `precision`'s lattice, coarsened
+    /// when the factors' range needs it ([`DeclaredPrecision::within_range`]).
     pub fn low_rank(
         name: impl Into<String>,
         rows: Interface,
@@ -603,6 +611,8 @@ impl Operator {
                 cols.width()
             )));
         }
+        let largest = left.iter().chain(right.iter()).fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        let precision = precision.within_range(largest);
         let round = |m: Array2<f64>| -> Result<Array2<f64>, ProgramError> {
             let mut m = m;
             for value in m.iter_mut() {
@@ -3076,16 +3086,16 @@ pub fn exact_precision(values: impl IntoIterator<Item = f64>) -> Result<Declared
     if finest == i32::MIN {
         return DeclaredPrecision::new(0).map_err(ProgramError::Code);
     }
-    let cap = 52 - largest.log2().ceil() as i32;
-    DeclaredPrecision::new(finest.min(cap)).map_err(ProgramError::Code)
+    // A subnormal's lattice is finer than any declarable one: the finest declarable holds it to
+    // within half a step.
+    Ok(DeclaredPrecision::new(finest.min(-(f64::MIN_EXP - 1))).map_err(ProgramError::Code)?.within_range(largest))
 }
 
 /// The lattice whose half-step does not exceed `band`: `p = ⌈−log₂(2·band)⌉`, capped as in
 /// [`exact_precision`] by the largest value.
 pub fn band_precision(band: f64, largest: f64) -> Result<DeclaredPrecision, ProgramError> {
     let wanted = if band > 0.0 { (-(2.0 * band).log2()).ceil() as i32 } else { 52 };
-    let cap = if largest > 0.0 { 52 - largest.log2().ceil() as i32 } else { 52 };
-    DeclaredPrecision::new(wanted.min(cap)).map_err(ProgramError::Code)
+    Ok(DeclaredPrecision::new(wanted.min(-(f64::MIN_EXP - 1))).map_err(ProgramError::Code)?.within_range(largest))
 }
 
 /// `values` as an owned column operator body input: `n × 1`.

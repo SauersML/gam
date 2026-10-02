@@ -390,6 +390,36 @@ fn lattice_rounding_is_applied_at_construction() {
     assert_eq!(op.matrix(), array![[0.25, -1.25]]);
 }
 
+/// A step finer than the reals' range allows (index beyond `2^53`) is coarsened to the finest the
+/// range allows, at construction and when an edit moves the lattice: the program still encodes
+/// and decodes (the p = 31 run at n = 10^5 refused a real of -1.56e6 at step 2^-33).
+#[test]
+fn a_lattice_step_is_derived_from_the_value_range() {
+    let value = -1561496.4080355994;
+    let op = Operator::dense(
+        "x",
+        Interface::native(1).expect("interface"),
+        Interface::native(2).expect("interface"),
+        array![[value, 0.1]],
+        precision(33),
+        Provenance::default(),
+    )
+    .expect("dense");
+    let OperatorBody::Dense { precision: chosen, .. } = &op.body else { unreachable!() };
+    assert_eq!(chosen.fraction_bits(), 52 - value.abs().log2().ceil() as i32);
+    assert!((op.matrix()[[0, 0]] - value).abs() <= chosen.worst_case_error());
+    let mut program = fixture();
+    let index = program.operators.iter().position(|o| matches!(o.body, OperatorBody::Dense { .. })).expect("a dense operator");
+    let largest = program.operators[index].largest_real();
+    super::engine::apply_edit(&mut program, &super::engine::Edit::Precision { operator: index, precision: precision(1000) })
+        .expect("the edit applies");
+    let OperatorBody::Dense { precision: moved, .. } = &program.operators[index].body else { unreachable!() };
+    assert_eq!(moved.fraction_bits(), 52 - largest.log2().ceil() as i32);
+    let message = program.encode().expect("the program encodes");
+    let decoded = OperatorProgram::decode(&message, &program.declarations).expect("the message decodes");
+    assert_eq!(decoded.operators[index].matrix(), program.operators[index].matrix());
+}
+
 #[test]
 fn incremental_execution_matches_a_full_execution() {
     let base = fixture();

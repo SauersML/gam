@@ -138,6 +138,20 @@ impl DeclaredPrecision {
         power_of_two(-self.fraction_bits)
     }
 
+    /// The finest precision for reals of magnitude at most `largest`: this one, coarsened
+    /// to `2^-(52 − ⌈log₂ largest⌉)` when that is coarser, so every index stays within
+    /// `2^53` and decodes exactly. The step is derived from the value range; a precision
+    /// chosen for other reals (an operator's former values, a curvature step) never
+    /// overflows the lattice code. A zero or non-finite `largest` leaves it unchanged (a
+    /// non-finite real is refused by the encoder).
+    pub fn within_range(self, largest: f64) -> Self {
+        if !(largest > 0.0 && largest.is_finite()) {
+            return self;
+        }
+        let cap = 52 - largest.log2().ceil() as i32;
+        Self { fraction_bits: self.fraction_bits.min(cap.max(-EXPONENT_LIMIT)) }
+    }
+
     /// The exact worst-case decoding error `2^-(fraction_bits+1)`, with no rounding
     /// term (see the module note).
     pub fn worst_case_error(self) -> f64 {

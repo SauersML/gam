@@ -399,12 +399,16 @@ impl Primitive for CurvaturePrecision {
                 continue;
             }
             let step = (12.0 * m as f64 / (n * trace_f)).sqrt();
+            if !(step > 0.0 && step.is_finite()) {
+                continue;
+            }
             let centre = (-step.log2()).round() as i32;
             for bits in [centre - 1, centre, centre + 1] {
                 if bits == precision.fraction_bits() {
                     continue;
                 }
-                let target = DeclaredPrecision::new(bits).map_err(EngineError::Primitive)?;
+                // A step beyond the declarable exponents is no proposal.
+                let Ok(target) = DeclaredPrecision::new(bits) else { continue };
                 out.push(Proposal {
                     primitive: "curvature_precision",
                     kind: ProposalKind::Reduce,

@@ -70,7 +70,8 @@ pub struct BlockRef {
 pub enum Edit {
     /// Remove present blocks.
     DropBlocks { blocks: Vec<BlockRef> },
-    /// Move an operator's reals to another lattice.
+    /// Move an operator's reals to another lattice (coarsened when the reals' range needs it,
+    /// `DeclaredPrecision::within_range`).
     Precision { operator: usize, precision: DeclaredPrecision },
     /// Replace a pointwise node's laws, and remove the blocks the new laws make unread.
     Laws { node: usize, laws: Vec<Law>, blocks: Vec<BlockRef> },
@@ -194,6 +195,9 @@ pub fn apply_edit(program: &mut OperatorProgram, edit: &Edit) -> Result<(), Engi
                 .operators
                 .get_mut(*operator)
                 .ok_or(EngineError::Program(ProgramError::Reference { what: "operator", index: *operator }))?;
+            // The target lattice is derived from the operator's range, so a proposed step never
+            // overflows the lattice code.
+            let precision = &precision.within_range(op.largest_real());
             match &mut op.body {
                 OperatorBody::Dense { values, present, precision: current } => {
                     for ((r, c), &keep) in present.indexed_iter() {

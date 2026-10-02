@@ -3,9 +3,11 @@
 //! The format is an 8-byte little-endian header length `n`, `n` bytes of JSON mapping each
 //! tensor name to its `dtype`, `shape` and `data_offsets` `[begin, end)` into the byte buffer that
 //! follows, and that buffer, little-endian and C-ordered. The optional `__metadata__` entry is a
-//! string map. Every stored float type read here widens to binary64 exactly: `F32` and `BF16`
-//! (the upper half of an `F32`) are subsets of binary64, so a native tensor enters the program as
-//! the very reals the source multiplies by.
+//! string map. Every stored float type read here widens to binary64 exactly: `F32`, `F16` and
+//! `BF16` (the upper half of an `F32`) are subsets of binary64, so a native tensor enters the
+//! program as the very reals the source multiplies by. A tensor of another element type (a `U8`
+//! causal-mask buffer, an `I64` position table) is listed with its type and size and refused only
+//! when it is read as reals: a checkpoint is not rejected for the buffers it carries.
 //!
 //! The file is memory-mapped; a read copies one tensor out, and its binary64 copy is reserved on
 //! gam-runtime's memory governor before it is allocated.
@@ -24,24 +26,48 @@ use ndarray::{Array1, Array2};
 pub enum StoredFloat {
     F64,
     F32,
+    F16,
     Bf16,
 }
 
-impl StoredFloat {
+/// A stored element type: a float this reader widens, or another type of the format (`BOOL`,
+/// `U8`, `I8`, `F8_*`, `I16`, `U16`, `I32`, `U32`, `I64`, `U64`), kept by name and size.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoredType {
+    Float(StoredFloat),
+    Other { name: String, bytes: usize },
+}
+
+impl StoredType {
     fn parse(name: &str) -> Option<Self> {
+        let other = |bytes| Some(Self::Other { name: name.to_string(), bytes });
         match name {
-            "F64" => Some(Self::F64),
-            "F32" => Some(Self::F32),
-            "BF16" => Some(Self::Bf16),
+            "F64" => Some(Self::Float(StoredFloat::F64)),
+            "F32" => Some(Self::Float(StoredFloat::F32)),
+            "F16" => Some(Self::Float(StoredFloat::F16)),
+            "BF16" => Some(Self::Float(StoredFloat::Bf16)),
+            "BOOL" | "U8" | "I8" | "F8_E5M2" | "F8_E4M3" => other(1),
+            "I16" | "U16" => other(2),
+            "I32" | "U32" => other(4),
+            "I64" | "U64" => other(8),
             _ => None,
         }
     }
 
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Float(float) => float.bytes(),
+            Self::Other { bytes, .. } => *bytes,
+        }
+    }
+}
+
+impl StoredFloat {
     fn bytes(self) -> usize {
         match self {
             Self::F64 => 8,
             Self::F32 => 4,
-            Self::Bf16 => 2,
+            Self::F16 | Self::Bf16 => 2,
         }
     }
 
@@ -51,6 +77,19 @@ impl StoredFloat {
             Self::F64 => f64::from_le_bytes(raw[..8].try_into().expect("eight bytes")),
             Self::F32 => f64::from(f32::from_le_bytes(raw[..4].try_into().expect("four bytes"))),
             Self::Bf16 => f64::from(f32::from_bits(u32::from(u16::from_le_bytes([raw[0], raw[1]])) << 16)),
+            Self::F16 => {
+                // sign, 5 exponent bits (bias 15), 10 fraction bits; every value is an exact
+                // binary64 product of an integer and a power of two.
+                let half = u16::from_le_bytes([raw[0], raw[1]]);
+                let sign = if half >> 15 == 1 { -1.0 } else { 1.0 };
+                let (exponent, fraction) = (i32::from((half >> 10) & 0x1f), f64::from(half & 0x3ff));
+                match exponent {
+                    0 => sign * fraction * 2f64.powi(-24),
+                    31 if fraction == 0.0 => sign * f64::INFINITY,
+                    31 => f64::NAN,
+                    _ => sign * (1024.0 + fraction) * 2f64.powi(exponent - 25),
+                }
+            }
         }
     }
 }
@@ -58,7 +97,7 @@ impl StoredFloat {
 /// One tensor's entry in the header.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TensorEntry {
-    pub dtype: StoredFloat,
+    pub dtype: StoredType,
     pub shape: Vec<usize>,
     begin: usize,
     end: usize,
@@ -69,7 +108,8 @@ pub enum SafetensorsError {
     Io { path: PathBuf, error: std::io::Error },
     /// The header length, JSON or an entry does not describe the file.
     Header(String),
-    /// A tensor stored in a type this reader does not widen.
+    /// A tensor stored in a type this reader does not widen, read as reals, or a type the format
+    /// does not define.
     UnsupportedType { tensor: String, dtype: String },
     Missing(String),
     /// A tensor whose shape is not the one the caller needs.
@@ -82,7 +122,7 @@ impl fmt::Display for SafetensorsError {
         match self {
             Self::Io { path, error } => write!(f, "{}: {error}", path.display()),
             Self::Header(message) => write!(f, "safetensors header: {message}"),
-            Self::UnsupportedType { tensor, dtype } => write!(f, "{tensor} is stored as {dtype}, not F64, F32 or BF16"),
+            Self::UnsupportedType { tensor, dtype } => write!(f, "{tensor} is stored as {dtype}, not F64, F32, F16 or BF16"),
             Self::Missing(tensor) => write!(f, "no tensor {tensor}"),
             Self::Shape { tensor, expected, found } => write!(f, "{tensor} has shape {found:?}, expected {expected:?}"),
             Self::Memory(error) => write!(f, "safetensors read: {error}"),
@@ -131,7 +171,7 @@ impl SafetensorsFile {
                 continue;
             }
             let dtype_name = entry["dtype"].as_str().ok_or_else(|| header(format!("{name}: no dtype")))?;
-            let dtype = StoredFloat::parse(dtype_name).ok_or_else(|| SafetensorsError::UnsupportedType {
+            let dtype = StoredType::parse(dtype_name).ok_or_else(|| SafetensorsError::UnsupportedType {
                 tensor: name.clone(),
                 dtype: dtype_name.to_string(),
             })?;
@@ -181,11 +221,17 @@ impl SafetensorsFile {
         self.tensors.get(name).ok_or_else(|| SafetensorsError::Missing(name.to_string()))
     }
 
-    fn widened(&self, entry: &TensorEntry) -> Vec<f64> {
-        self.mmap[self.data_start + entry.begin..self.data_start + entry.end]
-            .chunks_exact(entry.dtype.bytes())
-            .map(|raw| entry.dtype.widen(raw))
-            .collect()
+    fn widened(&self, name: &str, entry: &TensorEntry) -> Result<Vec<f64>, SafetensorsError> {
+        let float = match &entry.dtype {
+            StoredType::Float(float) => *float,
+            StoredType::Other { name: dtype, .. } => {
+                return Err(SafetensorsError::UnsupportedType { tensor: name.to_string(), dtype: dtype.clone() });
+            }
+        };
+        Ok(self.mmap[self.data_start + entry.begin..self.data_start + entry.end]
+            .chunks_exact(float.bytes())
+            .map(|raw| float.widen(raw))
+            .collect())
     }
 
     /// The two-axis tensor `name`, which must be `rows × cols`, widened exactly to binary64.
@@ -203,7 +249,7 @@ impl SafetensorsFile {
         let reservation = governor
             .try_reserve_dense_f64(rows, cols, "safetensors matrix")
             .map_err(SafetensorsError::Memory)?;
-        let values = Array2::from_shape_vec((rows, cols), self.widened(entry)).expect("the header's shape holds the data");
+        let values = Array2::from_shape_vec((rows, cols), self.widened(name, entry)?).expect("the header's shape holds the data");
         Ok(reservation.bind(values))
     }
 
@@ -213,7 +259,7 @@ impl SafetensorsFile {
         if entry.shape != [len] {
             return Err(SafetensorsError::Shape { tensor: name.into(), expected: vec![len], found: entry.shape.clone() });
         }
-        Ok(Array1::from_vec(self.widened(entry)))
+        Ok(Array1::from_vec(self.widened(name, entry)?))
     }
 }
 
@@ -222,17 +268,23 @@ mod tests {
     use super::*;
     use crate::test_support::test_governor;
 
-    /// A file with an `F32` matrix, a `BF16` vector and metadata, written byte for byte.
+    /// A file with an `F32` matrix, a `BF16` vector, an `F16` vector, a `U8` mask buffer and
+    /// metadata, written byte for byte.
     fn fixture(dir: &Path) -> PathBuf {
         let matrix: [f32; 6] = [1.0, -2.5, 0.1, 3.0e-39, f32::MAX, -0.0];
         let vector: [u16; 3] = [0x3f80, 0xc040, 0x0001]; // 1, -3, the least bf16 subnormal
         let mut data = Vec::new();
         matrix.iter().for_each(|v| data.extend_from_slice(&v.to_le_bytes()));
         vector.iter().for_each(|v| data.extend_from_slice(&v.to_le_bytes()));
+        data.extend_from_slice(&[1, 0, 1, 1]);
+        let half: [u16; 3] = [0x3c00, 0xc200, 0x0001]; // 1, -3, the least f16 subnormal 2^-24
+        half.iter().for_each(|v| data.extend_from_slice(&v.to_le_bytes()));
         let header = serde_json::json!({
             "__metadata__": {"format": "pt"},
             "m": {"dtype": "F32", "shape": [2, 3], "data_offsets": [0, 24]},
             "v": {"dtype": "BF16", "shape": [3], "data_offsets": [24, 30]},
+            "mask": {"dtype": "U8", "shape": [2, 2], "data_offsets": [30, 34]},
+            "h": {"dtype": "F16", "shape": [3], "data_offsets": [34, 40]},
         })
         .to_string();
         let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
@@ -256,6 +308,10 @@ mod tests {
         assert_eq!(v.to_vec(), vec![1.0, -3.0, f64::from(f32::from_bits(0x0001_0000))]);
         assert!(matches!(file.matrix(test_governor(), "m", 3, 2), Err(SafetensorsError::Shape { .. })));
         assert!(matches!(file.vector("absent", 1), Err(SafetensorsError::Missing(_))));
+        assert_eq!(file.vector("h", 3).unwrap().to_vec(), vec![1.0, -3.0, 2f64.powi(-24)]);
+        // The mask buffer is listed, and refused only when read as reals.
+        assert_eq!(file.tensors()["mask"].dtype, StoredType::Other { name: "U8".to_string(), bytes: 1 });
+        assert!(matches!(file.matrix(test_governor(), "mask", 2, 2), Err(SafetensorsError::UnsupportedType { .. })));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
