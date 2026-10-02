@@ -26,7 +26,10 @@ print(bands[["posterior_mean", "posterior_mean_lower", "posterior_mean_upper",
              "observation_lower", "observation_upper"]].head())
 ```
 
-![mcycle location-scale fit: posterior mean, credible band and observation interval](docs/images/mcycle_location_scale.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/mcycle_location_scale_dark.png">
+  <img alt="mcycle location-scale fit: posterior mean, credible band and observation interval" src="docs/images/mcycle_location_scale.png">
+</picture>
 
 Coming from pyGAM:
 
