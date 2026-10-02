@@ -1,4 +1,4 @@
-"""E3: how many VPD pieces each kind of word switches on (#2951)."""
+"""E3: how many VPD components each kind of word switches on (#2951)."""
 import json
 from pathlib import Path
 
@@ -44,8 +44,8 @@ ax.grid(True, axis="x", color=GRID, lw=0.8, zorder=0)
 for side in ("top", "right", "left"):
     ax.spines[side].set_visible(False)
 ax.spines["bottom"].set_color(AXIS)
-ax.set_xlabel("VPD pieces switched on, per word", color=INK, labelpad=10)
-fig.suptitle("Which words need the most VPD pieces", color=INK, fontsize=21, fontweight="bold",
+ax.set_xlabel("VPD components switched on, per word", color=INK, labelpad=10)
+fig.suptitle("Which words need the most VPD components", color=INK, fontsize=21, fontweight="bold",
              x=0.025, ha="left", y=0.975)
 fig.text(0.025, 0.895, f"VPD's 4-layer model reading {n_all:,} words of web text, grouped by kind of word",
          color=INK2, fontsize=14, ha="left")
