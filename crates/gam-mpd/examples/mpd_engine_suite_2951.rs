@@ -127,6 +127,9 @@ struct Rollouts {
     model: Vec<Vec<f64>>,
     count: usize,
     horizon: usize,
+    /// Each rollout's tokens, prefix then the sampled continuation.
+    tokens: Vec<Vec<u32>>,
+    prefix: usize,
 }
 
 fn log_softmax(row: ndarray::ArrayView1<'_, f64>) -> Vec<f64> {
@@ -195,7 +198,7 @@ fn rollouts(
     let logits = contract.distributions(&model.execute(&family, false).map_err(|e| e.to_string())?.values[model.output]).map_err(|e| e.to_string())?;
     let steps: Vec<usize> = (0..count).flat_map(|s| (prefix - 1..length - 1).map(move |p| s * (length - 1) + p)).collect();
     model_rows.extend(steps.iter().map(|&r| log_softmax(logits.row(r))));
-    Ok(Some(Rollouts { family, steps, model: model_rows, count, horizon }))
+    Ok(Some(Rollouts { family, steps, model: model_rows, count, horizon, tokens, prefix }))
 }
 
 /// The program's fidelity along the rollouts: per rollout the summed per-step
@@ -283,6 +286,11 @@ fn main() -> Result<(), String> {
     // Rollouts from the token rows after the family's, prefixes of the family's context, 32 tokens
     // sampled from the model.
     let rollout = if language_model { rollouts(&dir, &imported.record, model, contract, sequences, context, 32)? } else { None };
+    if let Some(rollout) = &rollout {
+        // The sampled sequences, so another decomposition (VPD's masks) is read on the same ones.
+        let record = json!({"prefix": rollout.prefix, "horizon": rollout.horizon, "first_row": sequences, "tokens": rollout.tokens});
+        std::fs::write(out.join("rollouts.json"), record.to_string()).map_err(|e| e.to_string())?;
+    }
     let mut once = contract.clone();
     once.observations = 1;
     let mut baselines = Vec::new();

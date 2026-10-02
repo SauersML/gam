@@ -511,7 +511,13 @@ impl Contract {
                 candidate.bands.row(row),
             )
             .map_err(ContractError::Bound)?;
-            let kl = RowValue::of(&comparison.forward_kl);
+            // A resolved value whose error is not finite proves only its lower end.
+            let kl = match RowValue::of(&comparison.forward_kl) {
+                RowValue::Resolved { value, numerical_error } if !(value.is_finite() && numerical_error.is_finite()) => {
+                    RowValue::Unresolved { lower: comparison.forward_kl.lower_bound().unwrap_or(0.0).max(0.0) }
+                }
+                other => other,
+            };
             match kl {
                 RowValue::Resolved { value, numerical_error } => {
                     sum += value;
