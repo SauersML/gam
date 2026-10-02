@@ -34,10 +34,11 @@
 //! the returned program is the last certified one, and its maximal row KL and argmax agreement are
 //! reported as outputs.
 
+use super::cegar::{Ascent, CegarError, Input, InputDomain, Round, family_of, verify};
 use super::contract::{Contract, ContractError, FamilyKind, ProgramScore};
 use super::fit::ProposalKind;
 use super::operator_program::{
-    FamilyInputs, Interface, LabelKind, Law, Node, Operator, OperatorBody, OperatorProgram, ProgramError, Trace,
+    Interface, LabelKind, Law, Node, Operator, OperatorBody, OperatorProgram, ProgramError, Trace,
     round_to_lattice,
 };
 use super::refit::{RefitSearch, refit_readout};
@@ -319,6 +320,8 @@ pub enum EngineError {
     /// A start program whose score is unresolved: its data bits have no upper end.
     UnresolvedStart(String),
     Primitive(String),
+    /// The counterexample search refused.
+    Verifier(CegarError),
 }
 
 impl fmt::Display for EngineError {
@@ -328,6 +331,7 @@ impl fmt::Display for EngineError {
             Self::Contract(error) => write!(f, "decompose: {error}"),
             Self::UnresolvedStart(message) => write!(f, "decompose: the start program's score is unresolved: {message}"),
             Self::Primitive(message) => write!(f, "decompose: primitive: {message}"),
+            Self::Verifier(error) => write!(f, "decompose: {error}"),
         }
     }
 }
@@ -337,6 +341,12 @@ impl std::error::Error for EngineError {}
 impl From<ProgramError> for EngineError {
     fn from(error: ProgramError) -> Self {
         Self::Program(error)
+    }
+}
+
+impl From<CegarError> for EngineError {
+    fn from(error: CegarError) -> Self {
+        Self::Verifier(error)
     }
 }
 
@@ -842,61 +852,59 @@ fn search(
     Ok(Decomposition { program, score: current, stop, curve: pareto(curve), ties })
 }
 
-/// A decomposition refined against a pool of inputs the family does not hold.
+/// A decomposition refined by counterexamples (`cegar` module note).
 #[derive(Clone, Debug)]
 pub struct Refinement {
     pub decomposition: Decomposition,
-    /// Pool inputs that refuted a round's program and joined the family.
+    /// Every round's verifier summary; the last round found no counterexample.
+    pub rounds: Vec<Round>,
+    /// The last round's ascents: every endpoint is certified at or below the family's worst row.
+    pub ascents: Vec<Ascent>,
+    /// Counterexamples that joined the family.
     pub added: usize,
-    pub pool: usize,
-    /// The last program's KL on every pool row is within its certified maximum on the family:
-    /// the claim survived a search over the whole pool (a search, not a proof beyond the family).
-    pub survived: bool,
 }
 
-/// Counterexample-guided refinement: decompose; run the program and the model on `pool`; every
-/// pool input with a distribution row whose KL exceeds the program's certified maximum KL on the
-/// family refutes that the family's worst case covers the pool, and joins the family (as a new unit
-/// of a sampled family); decompose again from the current program. At most `rounds` rounds.
+/// Counterexample-guided refinement: decompose the model on the family; ascend `KL(model ‖
+/// program)` over `domain` from every row of the family and every input of `pool`
+/// (`cegar::verify`); every endpoint certified worse than the family's worst row joins the family
+/// (as a new unit of a sampled family), and the model is decomposed again on the larger family.
+/// Each round starts from the model, since the restrictions can remove structure but never restore
+/// it. The search ends when a round finds no counterexample, which on a finite domain it must:
+/// every counterexample is a new input.
 pub fn decompose_refined(
     model: &OperatorProgram,
     contract: &Contract,
     library: &[Box<dyn Primitive>],
     budget: &Budget,
-    pool: &FamilyInputs,
-    rounds: usize,
+    domain: &InputDomain,
+    pool: &[Input],
 ) -> Result<Refinement, EngineError> {
     let mut contract = contract.clone();
-    let mut start = model.clone();
+    let mut rounds = Vec::new();
     let mut added = 0;
-    let model_pool = contract.distributions(&model.execute(pool, false)?.values[model.output])?;
-    let reference = Reference { log_probabilities: log_softmax_rows(&model_pool), banded: BandedMatrix { values: model_pool.clone(), bands: Array2::zeros(model_pool.dim()) } };
-    for round in 0..rounds.max(1) {
-        let result = decompose_from(model, &start, &contract, library, budget)?;
-        let threshold = result.score.evaluation.max_kl.upper_bound().unwrap_or(f64::INFINITY);
-        let program_pool = contract.distributions(&result.program.execute(pool, false)?.values[result.program.output])?;
-        let log_q = log_softmax_rows(&program_pool);
-        let mut refuting: BTreeSet<usize> = BTreeSet::new();
-        for (row, (lp, lq)) in reference.log_probabilities.outer_iter().zip(log_q.outer_iter()).enumerate() {
-            let kl: f64 = lp.iter().zip(lq.iter()).map(|(a, b)| a.exp() * (a - b)).sum();
-            if kl > threshold {
-                refuting.insert(row / contract.readouts);
-            }
+    loop {
+        let decomposition = decompose(model, &contract, library, budget)?;
+        let verdict = verify(model, &decomposition.program, domain, &contract.family, pool, contract.readouts)?;
+        log::info!(
+            "refinement round {}: {} rows, family worst <= {:.3e}, ascent worst {:.3e}, {} counterexamples",
+            rounds.len() + 1,
+            verdict.round.rows,
+            verdict.round.data_worst_upper,
+            verdict.round.ascent_worst,
+            verdict.counterexamples.len()
+        );
+        rounds.push(verdict.round);
+        if verdict.counterexamples.is_empty() {
+            return Ok(Refinement { decomposition, rounds, ascents: verdict.ascents, added });
         }
-        if refuting.is_empty() || round + 1 == rounds.max(1) {
-            return Ok(Refinement { decomposition: result, added, pool: pool.rows, survived: refuting.is_empty() });
-        }
-        let rows: Vec<usize> = refuting.into_iter().collect();
-        added += rows.len();
-        let extra = pool.select(&rows);
+        let extra = family_of(&verdict.counterexamples)?;
+        added += extra.rows;
         if let FamilyKind::Sample { units, .. } = &mut contract.kind {
             let next = units.iter().copied().max().map_or(0, |m| m + 1);
             units.extend((0..extra.rows).map(|i| next + i));
         }
         contract.family = contract.family.append(&extra)?;
-        start = result.program;
     }
-    Err(EngineError::Primitive("refinement ran no round".to_string()))
 }
 
 // ------------------------------------------------------------------------------------ restrictions

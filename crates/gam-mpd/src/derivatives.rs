@@ -455,7 +455,30 @@ pub fn vjp(
                 add(&mut g, *key, gk);
                 add(&mut g, *v, gv);
             }
-            Node::Outer { .. } | Node::Call { .. } | Node::Param { .. } => {
+            Node::Outer { left, right } => {
+                // Columns run over group pairs row-major, coordinates row-major within a pair.
+                let (l, r) = (value(*left), value(*right));
+                let (li, ri) = (&interfaces[*left], &interfaces[*right]);
+                let mut gl = Array2::<f64>::zeros(l.dim());
+                let mut gr = Array2::<f64>::zeros(r.dim());
+                let mut offset = 0;
+                for g1 in 0..li.group_count() {
+                    for g2 in 0..ri.group_count() {
+                        for i in li.range(g1) {
+                            for j in ri.range(g2) {
+                                for row in 0..rows {
+                                    gl[[row, i]] += cot[[row, offset]] * r[[row, j]];
+                                    gr[[row, j]] += cot[[row, offset]] * l[[row, i]];
+                                }
+                                offset += 1;
+                            }
+                        }
+                    }
+                }
+                add(&mut g, *left, gl);
+                add(&mut g, *right, gr);
+            }
+            Node::Call { .. } | Node::Param { .. } => {
                 return Err(refuse(format!("node {index}: no cotangent rule for this node kind")));
             }
         }

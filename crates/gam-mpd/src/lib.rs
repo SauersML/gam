@@ -67,6 +67,13 @@ mod engine_tests;
 #[cfg(test)]
 mod factors_tests;
 
+// Counterexample-guided refinement: input-space ascent of KL(model ‖ program) feeding the data.
+pub mod cegar;
+
+// The refinement verifier on programs with every node kind: gradients, ascent, termination.
+#[cfg(test)]
+mod cegar_tests;
+
 // The component-level view of an operator program: reads, laws, writes, uses, bits, unresolved share.
 pub mod view;
 
