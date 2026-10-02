@@ -21,12 +21,17 @@
 //!   argmax agreement, and per rung the best of them, `min_b bits_b + n Σ KL_b / ln 2`;
 //! * per rung, the engine's program: program bits, data bits, maximal row KL, argmax agreement, the stop
 //!   reason, the time, its explanation size (mean acting pieces per input and their bits given
-//!   the program, the score's `Explanation`) and its largest components (what the top rules say).
+//!   the program, the score's `Explanation`) and its largest components (what the top rules say);
+//! * for a language model, besides the teacher-forced KL (mean and worst context), the fidelity
+//!   along 32-token continuations sampled from the model after held-out prefixes: the summed
+//!   per-step KL of each rollout (a sequence KL, which by Pinsker bounds the change of any
+//!   sequence-level event) and the greedy agreement over the rollout steps, for every rung and
+//!   every rounded baseline.
 
 use gam_mpd::contract::{Contract, ProgramScore};
 use gam_mpd::engine::{Budget, Edit, apply_edit, decompose_with_reference, library};
 use gam_mpd::import::{import, import_language_model, is_language_model};
-use gam_mpd::operator_program::{OperatorBody, OperatorProgram};
+use gam_mpd::operator_program::{FamilyInputs, OperatorBody, OperatorProgram, SequenceLayout, SlotValues};
 use gam_mpd::precision::DeclaredPrecision;
 use gam_mpd::secant::BandedMatrix;
 use gam_mpd::view::{ProgramView, view};
@@ -110,6 +115,114 @@ fn export_check(dir: &Path, record: &Value, logits: &BandedMatrix, context: usiz
     Ok(Some(worst))
 }
 
+/// Held-out rollouts of a language model: from `count` token rows the family does not hold
+/// (starting at row `first`), each prefix of `prefix` tokens is continued `horizon` tokens by
+/// sampling the MODEL's next-token distribution; the program is then read along those
+/// model-generated sequences.
+struct Rollouts {
+    family: FamilyInputs,
+    /// Rows (of `family`) whose next token was sampled: the rollout steps.
+    steps: Vec<usize>,
+    /// The model's log-probabilities at those rows.
+    model: Vec<Vec<f64>>,
+    count: usize,
+    horizon: usize,
+}
+
+fn log_softmax(row: ndarray::ArrayView1<'_, f64>) -> Vec<f64> {
+    let m = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let lse = m + row.iter().map(|v| (v - m).exp()).sum::<f64>().ln();
+    row.iter().map(|v| v - lse).collect()
+}
+
+fn sequences_family(tokens: &[Vec<u32>]) -> FamilyInputs {
+    let (mut ids, mut sequence, mut position) = (Vec::new(), Vec::new(), Vec::new());
+    for (s, row) in tokens.iter().enumerate() {
+        for (p, &t) in row.iter().enumerate() {
+            ids.push(t);
+            sequence.push(s as u32);
+            position.push(p as u32);
+        }
+    }
+    FamilyInputs { rows: ids.len(), slots: vec![SlotValues::Tokens(ids)], layout: Some(SequenceLayout { sequence, position }) }
+}
+
+fn rollouts(
+    dir: &Path,
+    record: &Value,
+    model: &OperatorProgram,
+    contract: &Contract,
+    first: usize,
+    prefix: usize,
+    horizon: usize,
+) -> Result<Option<Rollouts>, String> {
+    use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
+    let shape = &record["files"]["tokens"]["shape"];
+    let (Some(rows), Some(cols)) = (shape[0].as_u64(), shape[1].as_u64()) else { return Ok(None) };
+    let (rows, cols) = (rows as usize, cols as usize);
+    let count = rows.saturating_sub(first).min(8);
+    if count == 0 || prefix > cols {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(dir.join("tokens.f64")).map_err(|e| e.to_string())?;
+    let table: Vec<f64> = bytes.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().expect("eight bytes"))).collect();
+    let mut tokens: Vec<Vec<u32>> = (first..first + count).map(|r| (0..prefix).map(|p| table[r * cols + p] as u32).collect()).collect();
+    let mut rng = StdRng::seed_from_u64(0x0011_0a75);
+    let mut model_rows: Vec<Vec<f64>> = Vec::new();
+    for _ in 0..horizon {
+        let family = sequences_family(&tokens);
+        let logits = contract.distributions(&model.execute(&family, false).map_err(|e| e.to_string())?.values[model.output]).map_err(|e| e.to_string())?;
+        let length = tokens[0].len();
+        for (s, sequence) in tokens.iter_mut().enumerate() {
+            let lp = log_softmax(logits.row(s * length + length - 1));
+            let mut u: f64 = rng.random::<f64>();
+            let mut next = lp.len() - 1;
+            for (c, l) in lp.iter().enumerate() {
+                u -= l.exp();
+                if u <= 0.0 {
+                    next = c;
+                    break;
+                }
+            }
+            sequence.push(next as u32);
+        }
+    }
+    // The steps: in the final sequences, the rows at positions prefix−1 … prefix+horizon−2 predict
+    // the sampled tokens.
+    let length = prefix + horizon;
+    let family = sequences_family(&tokens.iter().map(|t| t[..length - 1].to_vec()).collect::<Vec<_>>());
+    let logits = contract.distributions(&model.execute(&family, false).map_err(|e| e.to_string())?.values[model.output]).map_err(|e| e.to_string())?;
+    let steps: Vec<usize> = (0..count).flat_map(|s| (prefix - 1..length - 1).map(move |p| s * (length - 1) + p)).collect();
+    model_rows.extend(steps.iter().map(|&r| log_softmax(logits.row(r))));
+    Ok(Some(Rollouts { family, steps, model: model_rows, count, horizon }))
+}
+
+/// The program's fidelity along the rollouts: per rollout the summed per-step
+/// `KL(model ‖ program)` (the sequence KL over the model's own continuations, which by Pinsker
+/// bounds the change of any sequence-level event), its mean and largest over rollouts, and the
+/// greedy (top-1) agreement over all rollout steps.
+fn rollout_fidelity(program: &OperatorProgram, contract: &Contract, rollouts: &Rollouts) -> Result<Value, String> {
+    let logits = contract
+        .distributions(&program.execute(&rollouts.family, false).map_err(|e| e.to_string())?.values[program.output])
+        .map_err(|e| e.to_string())?;
+    let mut sequence_kl = vec![0.0_f64; rollouts.count];
+    let mut agree = 0usize;
+    for (k, (&row, lp)) in rollouts.steps.iter().zip(&rollouts.model).enumerate() {
+        let lq = log_softmax(logits.row(row));
+        sequence_kl[k / rollouts.horizon] += lp.iter().zip(&lq).map(|(a, b)| a.exp() * (a - b)).sum::<f64>();
+        let argmax = |v: &[f64]| v.iter().enumerate().fold((0, f64::NEG_INFINITY), |m, (i, x)| if *x > m.1 { (i, *x) } else { m }).0;
+        agree += usize::from(argmax(lp) == argmax(&lq));
+    }
+    Ok(json!({
+        "rollouts": rollouts.count,
+        "horizon": rollouts.horizon,
+        "sequence_kl_mean": sequence_kl.iter().sum::<f64>() / rollouts.count as f64,
+        "sequence_kl_max": sequence_kl.iter().copied().fold(0.0_f64, f64::max),
+        "greedy_agreement": agree as f64 / rollouts.steps.len() as f64,
+    }))
+}
+
 fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
@@ -167,6 +280,9 @@ fn main() -> Result<(), String> {
     );
     let native_view = view(model).map_err(|e| e.to_string())?;
     let native_score = contract.score(model, &reference).map_err(|e| e.to_string())?;
+    // Rollouts from the token rows after the family's, prefixes of the family's context, 32 tokens
+    // sampled from the model.
+    let rollout = if language_model { rollouts(&dir, &imported.record, model, contract, sequences, context, 32)? } else { None };
     let mut once = contract.clone();
     once.observations = 1;
     let mut baselines = Vec::new();
@@ -176,6 +292,9 @@ fn main() -> Result<(), String> {
         let mut row = scored(&score, rows, 1);
         row["b"] = json!(bits);
         row["algorithm_bits"] = json!(view(&program).map_err(|e| e.to_string())?.algorithm_bits);
+        if let Some(rollout) = &rollout {
+            row["rollout"] = rollout_fidelity(&program, contract, rollout)?;
+        }
         eprintln!("  rounded b={bits}: {}", row);
         baselines.push(row);
     }
@@ -217,6 +336,9 @@ fn main() -> Result<(), String> {
         rung["stop"] = json!(format!("{:?}", result.stop));
         rung["seconds"] = json!(seconds);
         rung["top_components"] = json!(components(&result_view, 8));
+        if let Some(rollout) = &rollout {
+            rung["rollout"] = rollout_fidelity(&result.program, &contract, rollout)?;
+        }
         println!(
             "ROW {} n=1e{exponent} | native {} | ours {} + {:.1} expl + {:.1} data (rounded best {:.0} at b={}) | max KL {:.3e} | argmax {:.4} | {:?} | {:.0}s | active {:.1}/{} ({:.1} bits/input)",
             dir.file_name().map_or(String::new(), |n| n.to_string_lossy().to_string()),
