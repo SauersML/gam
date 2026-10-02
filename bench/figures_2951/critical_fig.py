@@ -1,4 +1,4 @@
-"""VPD components switched on per word against what the model predicts at that word and how far VPD's
+"""VPD subcomponents switched on per word against what the model predicts at that word and how far VPD's
 prediction is from the model's (#2951). Data from critical_data.py."""
 import math
 from pathlib import Path
@@ -13,7 +13,7 @@ INK, INK2, MUTED, SURF, GRID, AXIS = "#0b0b0b", "#52514e", "#898781", "#fcfcfb",
 BLUE = "#2a78d6"
 plt.rcParams.update({"font.family": ["Helvetica Neue", "Arial Unicode MS"], "font.size": 15})
 keep = np.ones(d["pieces"].shape, bool)
-keep[:, 0] = False  # the first word of a chunk is an outlier of its own (535 components)
+keep[:, 0] = False  # the first word of a chunk is an outlier of its own (535 subcomponents)
 pieces = d["pieces"][keep].astype(float)
 ids = d["ids"][keep]
 mean = pieces.mean()
@@ -86,12 +86,12 @@ for ax, (title, x, edges, _, gloss) in zip(axes, panels):
     for side in ("top", "right", "left"):
         ax.spines[side].set_visible(False)
     ax.spines["bottom"].set_color(AXIS)
-axes[0].set_ylabel("VPD components switched on for this word", color=INK, labelpad=10)
+axes[0].set_ylabel("VPD subcomponents switched on for this word", color=INK, labelpad=10)
 axes[0].set_ylim(0, 390)
-fig.suptitle("Only the most predictable words get fewer VPD components; the words VPD gets most wrong get the most",
+fig.suptitle("Only the most predictable words get fewer VPD subcomponents; the words VPD gets most wrong get the most",
              color=INK, fontsize=19, fontweight="bold", x=0.02, ha="left", y=0.975)
 fig.text(0.02, 0.9, f"{len(pieces):,} words of web text through VPD's 4-layer model; the line is the average word "
-         f"({mean:.0f} components); under each bar, words that turn up most in it", color=INK2, fontsize=14, ha="left")
+         f"({mean:.0f} subcomponents); under each bar, words that turn up most in it", color=INK2, fontsize=14, ha="left")
 fig.subplots_adjust(left=0.055, right=0.99, top=0.74, bottom=0.24, wspace=0.1)
 out = Path.home() / "mpd-data/figures/critical_words.png"
 fig.savefig(out, facecolor=SURF)

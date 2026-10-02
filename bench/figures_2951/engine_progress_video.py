@@ -60,7 +60,7 @@ ax.yaxis.set_minor_locator(NullLocator())
 ax.set_yticklabels(["0.3", "0.5", "1.0", "1.5"])
 ax.tick_params(colors=INK2, labelsize=13)
 ax.grid(True, which="major", color=GRID, lw=0.8, zorder=0)
-ax.set_xlabel("bits per token to say which components are on", color=INK, labelpad=10)
+ax.set_xlabel("bits per token to say which subcomponents are on", color=INK, labelpad=10)
 ax.set_ylabel("difference from the model's outputs (KL)", color=INK, labelpad=10)
 
 ax.plot(vx, vy, color=ORANGE, lw=2.4, zorder=3, solid_capstyle="round")

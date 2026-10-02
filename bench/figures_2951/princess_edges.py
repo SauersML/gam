@@ -1,5 +1,5 @@
-"""For the components that most support " her", how much removing each alone shrinks the
-activation of 3.attn.o:2:281 (x @ V[:, 281] at " lost"): the edges into the her->his component."""
+"""For the subcomponents that most support " her", how much removing each alone shrinks the
+activation of 3.attn.o:2:281 (x @ V[:, 281] at " lost"): the edges into the her->his subcomponent."""
 import json
 import os
 import sys

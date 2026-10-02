@@ -1,4 +1,4 @@
-"""One sentence, explained: every VPD component active on "The princess lost", by layer and token (#2951)."""
+"""One sentence, explained: every VPD subcomponent active on "The princess lost", by layer and token (#2951)."""
 import json
 import math
 from pathlib import Path
@@ -59,7 +59,7 @@ for n in names:
             ax.scatter(px, py, s=size, color=cmap(0.5 + 0.5 * np.clip(s, -CLIP, CLIP) / CLIP),
                        edgecolor=SURF, linewidth=1.0, zorder=3 + min(abs(s), CLIP))
 
-# edges into the her->his component, measured: removing the source alone shrinks 281's activation
+# edges into the her->his subcomponent, measured: removing the source alone shrinks 281's activation
 tx, ty = pos[("h.3.attn.o_proj", 2, 281)]
 for e in d["edges281"]:
     drop = 1 - e["frac_left"]
@@ -70,13 +70,13 @@ for e in d["edges281"]:
                                  color=INK, lw=0.6 + 2.2 * drop, alpha=0.55, zorder=8, shrinkA=5, shrinkB=7))
 ax.scatter(tx, ty, s=330, facecolor="none", edgecolor=INK, linewidth=2.0, zorder=12)
 
-# the component's story, outside the grid on the right
+# the subcomponent's story, outside the grid on the right
 p, q = d["p_her_his"], d["p_her_his_without_281"]
 lx = x0[2] + COLW + 0.2
 row_end = max(px for (n, t, c), (px, py) in pos.items() if n == "h.3.attn.o_proj" and t == 2 and py == ty)
 ax.annotate("", xy=(row_end + 0.25, ty), xytext=(lx - 0.15, ty), arrowprops=dict(arrowstyle="-", color=INK2, lw=1.0), zorder=2)
 ax.text(lx, ty + 0.62, "3.attn.o : 281", fontsize=15, color=INK, fontweight="bold", va="center")
-ax.text(lx, ty + 0.12, "the component that makes it “her”", fontsize=14, color=INK, va="center")
+ax.text(lx, ty + 0.12, "the subcomponent that makes it “her”", fontsize=14, color=INK, va="center")
 ax.text(lx, ty - 0.5, f"switch it off:\n“her”  {p[0]:.0%} → {q[0]:.0%}\n“his”  {p[1]:.0%} → {q[1]:.0%}",
         fontsize=13, color=INK2, va="top", linespacing=1.45)
 
@@ -91,20 +91,20 @@ ax.text(cx, top + 1.15, f"next word: “her”  {p[0]:.0%}", ha="center", va="ce
 kx, ky, kw = x0[0] + 0.3, top + 1.05, 4.6
 grad = np.linspace(-1, 1, 200)[None, :]
 ax.imshow(grad, extent=(kx, kx + kw, ky - 0.11, ky + 0.11), cmap=cmap, vmin=-1, vmax=1, aspect="auto", zorder=2)
-ax.text(kx, ky + 0.42, "dot colour: what switching that component off does", fontsize=12.5, color=INK, va="center")
+ax.text(kx, ky + 0.42, "dot colour: what switching that subcomponent off does", fontsize=12.5, color=INK, va="center")
 ax.text(kx, ky - 0.42, "helps “his”", fontsize=11.5, color=INK2, va="center", ha="left")
 ax.text(kx + kw / 2, ky - 0.42, "no effect", fontsize=11.5, color=INK2, va="center", ha="center")
 ax.text(kx + kw, ky - 0.42, "helps “her”", fontsize=11.5, color=INK2, va="center", ha="right")
 ey = ty - 3.3
 ax.plot([lx, lx + 0.9], [ey, ey], color=INK, lw=2.0, alpha=0.55, solid_capstyle="round")
-ax.text(lx + 1.1, ey, "components it needs", fontsize=13, color=INK, va="center")
+ax.text(lx + 1.1, ey, "subcomponents it needs", fontsize=13, color=INK, va="center")
 ax.text(lx, ey - 0.45, "switching one off\nshrinks it by half or more", fontsize=12, color=INK2, va="top", linespacing=1.4)
 
-ax.set_xlim(-4.8, lx + 6.2)
+ax.set_xlim(-4.8, lx + 7.4)
 ax.set_ylim(-1.4, top + 1.9)
 ax.axis("off")
 fig.suptitle("One sentence, explained", color=INK, fontsize=24, fontweight="bold", x=0.035, ha="left", y=0.985)
-fig.text(0.035, 0.945, f"each dot is a VPD component switched on at that word and layer ({len(d['active'])} in all), as VPD's 4-layer model reads three words",
+fig.text(0.035, 0.945, f"each dot is a VPD subcomponent switched on at that word and layer ({len(d['active'])} in all), as VPD's 4-layer model reads three words",
          color=INK2, fontsize=15, ha="left")
 fig.subplots_adjust(left=0.01, right=0.99, bottom=0.01, top=0.93)
 out = Path.home() / "mpd-data/figures/princess_explained.png"

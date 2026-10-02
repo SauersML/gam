@@ -1,4 +1,4 @@
-"""E1: bits per token to say which VPD components are on, coded with more and more context (#2951)."""
+"""E1: bits per token to say which VPD subcomponents are on, coded with more and more context (#2951)."""
 import json
 from pathlib import Path
 
@@ -12,8 +12,8 @@ BLUE, LIGHT = "#2a78d6", "#9ec5f4"
 plt.rcParams.update({"font.family": ["Helvetica Neue", "Arial Unicode MS"], "font.size": 15})
 SPREAD = 1e6
 rows = [("independent", "no context"),
-        ("marginal", "knowing how often\neach component is on"),
-        ("previous", "+ the previous\nword's components"),
+        ("marginal", "knowing how often\neach subcomponent is on"),
+        ("previous", "+ the previous\nword's subcomponents"),
         ("token", "+ which word it is"),
         ("token_and_previous", "both")]
 
@@ -21,9 +21,9 @@ fig, ax = plt.subplots(figsize=(14, 7), dpi=200)
 fig.patch.set_facecolor(SURF)
 ax.set_facecolor(SURF)
 H = 0.38
-STORED = {"marginal": f"storing each component's on-rate ({d['pieces_total']:,} numbers)",
-          "previous": "+ each component's chance of staying on",
-          "token": "+ each component's on-rate for every word in the vocabulary",
+STORED = {"marginal": f"storing each subcomponent's on-rate ({d['pieces_total']:,} numbers)",
+          "previous": "+ each subcomponent's chance of staying on",
+          "token": "+ each subcomponent's on-rate for every word in the vocabulary",
           "token_and_previous": "both of the above"}
 for i, (k, label) in enumerate(rows):
     y = len(rows) - 1 - i
@@ -41,19 +41,19 @@ ax.set_yticks(range(len(rows)))
 ax.set_yticklabels([l for _, l in rows][::-1], fontsize=14, color=INK)
 ax.tick_params(axis="y", length=0, pad=12)
 ax.tick_params(axis="x", colors=INK2, labelsize=12.5)
-ax.set_xlim(0, 2150)
+ax.set_xlim(0, 2300)
 ax.set_xticks([0, 250, 500, 750, 1000, 1250, 1500, 1750, 2000])
 ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:,.0f}"))
 ax.grid(True, axis="x", color=GRID, lw=0.8, zorder=0)
 for side in ("top", "right", "left"):
     ax.spines[side].set_visible(False)
 ax.spines["bottom"].set_color(AXIS)
-ax.set_xlabel("bits needed per word to say which components are on", color=INK, labelpad=10)
-fig.legend(handles=[Patch(color=BLUE, label="listing which components are on, word by word"),
+ax.set_xlabel("bits needed per word to say which subcomponents are on", color=INK, labelpad=10)
+fig.legend(handles=[Patch(color=BLUE, label="listing which subcomponents are on, word by word"),
                     Patch(color=LIGHT, label="one-time cost of storing those numbers, spread over a million words")],
            loc="upper left", bbox_to_anchor=(0.2, 0.87), ncol=2, frameon=False, fontsize=13, labelcolor=INK,
            handlelength=1.2, columnspacing=2.2)
-fig.suptitle("Using context, writing down which VPD components are on takes 38% fewer bits per word (1,771 → 1,100)", color=INK, fontsize=17.5,
+fig.suptitle("Using context, writing down which VPD subcomponents are on takes 38% fewer bits per word (1,771 → 1,100)", color=INK, fontsize=17.5,
              fontweight="bold", x=0.025, ha="left", y=0.975)
 tok32 = {k: E[k]["total"] for k in ("token", "token_and_previous")}
 fig.text(0.025, 0.9, "the stored numbers are paid for once and spread over a million words; "

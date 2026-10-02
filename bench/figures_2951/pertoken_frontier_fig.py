@@ -32,7 +32,7 @@ if eng:
 
 
 def xy(ps, x):
-    """Points in the order the sweep made them (components increase along it; bits need not)."""
+    """Points in the order the sweep made them (subcomponents increase along it; bits need not)."""
     ps = sorted((p for p in ps if p["kl"] > 1e-6 and p[x] > 0), key=lambda p: p["l0"])
     return [(p[x], p["kl"]) for p in ps]
 
@@ -48,7 +48,7 @@ def x_at(curve, target):
 
 fig, axes = plt.subplots(1, 2, figsize=(16, 7.5), dpi=200, sharey=True)
 fig.patch.set_facecolor(SURF)
-for ax, x, xlabel in ((axes[0], "l0", "components switched on per token"),
+for ax, x, xlabel in ((axes[0], "l0", "subcomponents switched on per token"),
                       (axes[1], "bits", "bits per token to name them")):
     ax.set_facecolor(SURF)
     for ps, color, label, ls in series:
@@ -77,9 +77,9 @@ if vpd:
     axes[0].annotate("", xy=(v[0] * 1.08, v[1]), xytext=(w / 1.08, v[1]),
                      arrowprops=dict(arrowstyle="<-", color=INK2, lw=1.2))
     axes[0].annotate(f"{w / v[0]:.0f}× fewer", xy=(np.sqrt(v[0] * w), v[1] * 1.9), color=INK2, fontsize=13, ha="center")
-    title = "Per token, VPD switches on far fewer components than any fixed basis"
+    title = "Per token, VPD switches on far fewer subcomponents than any fixed basis"
 else:
-    title = "Per token, how many components a fixed basis needs"
+    title = "Per token, how many subcomponents a fixed basis needs"
 if vpd:
     for ax, x in ((axes[0], "l0"), (axes[1], "bits")):
         c = xy(vpd["rounded"], x)

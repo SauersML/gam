@@ -1,4 +1,4 @@
-"""VPD 4L on "The princess lost": every active component (g > 0) at every position, and what
+"""VPD 4L on "The princess lost": every active subcomponent (g > 0) at every position, and what
 removing it alone does to the her-vs-his logit gap at " lost" (full model otherwise, delta on)."""
 import json
 import os
