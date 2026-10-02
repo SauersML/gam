@@ -57,11 +57,8 @@ impl Uniforms {
 
 impl Accelerated {
     /// `masked` on `device`, its proposals' products in `proposal`; refused for a program the
-    /// device cannot run (a frozen head after it, a node without a device rule).
+    /// device cannot run (a node without a device rule).
     pub fn new(device: &Device, masked: &Masked, proposal: Arithmetic) -> Result<Self, String> {
-        if masked.head.is_some() {
-            return Err("device: a masked window with a frozen head after it".to_string());
-        }
         Ok(Self { program: DeviceProgram::compile(device, &masked.program)?, proposal })
     }
 
@@ -204,7 +201,7 @@ impl Accelerated {
         let back = self.cotangents(&state.trace, seed, &keep)?;
         let mut out = Vec::new();
         for (k, site) in masked.sites.iter().enumerate() {
-            let (pieces, rows) = (masked.pieces(k), state.trace.rows);
+            let (pieces, rows) = (masked.libraries[k].v.nrows(), state.trace.rows);
             let z = state.trace.value(masked.z[k])?;
             let Node::Hadamard { right: mask_node, .. } = &masked.program.nodes[masked.masked[k]] else {
                 return Err("device: a site's masked node is not its mask's product".to_string());
@@ -214,7 +211,7 @@ impl Accelerated {
                 return Err("device: the state's masks are not the given ones".to_string());
             }
             let Some(cot_masked) = back.get(&masked.masked[k]) else {
-                let (d_in, d_out) = (masked.mean(k).len(), site.writes.iter().map(|w| state.trace.value(*w).map(|t| t.cols())).sum::<Result<usize, _>>()?);
+                let (d_in, d_out) = (masked.libraries[k].mean.len(), site.writes.iter().map(|w| state.trace.value(*w).map(|t| t.cols())).sum::<Result<usize, _>>()?);
                 out.push((Array2::zeros((rows, pieces)), Array2::zeros((pieces, d_in)), Array2::zeros((pieces, d_out))));
                 continue;
             };
@@ -227,7 +224,7 @@ impl Accelerated {
             let mut offset = 0;
             for read in &site.reads {
                 let x = state.trace.value(*read)?;
-                let mean = masked.mean(k).slice(s![offset..offset + x.cols()]).to_owned();
+                let mean = masked.libraries[k].mean.slice(s![offset..offset + x.cols()]).to_owned();
                 offset += x.cols();
                 let mut centred = d.copy(x).map_err(error)?;
                 d.add_row(&mut centred, -1.0, &d.upload_vec(1, mean.len(), mean.to_vec()).map_err(error)?).map_err(error)?;
@@ -266,7 +263,7 @@ impl Accelerated {
         let rows = state.trace.rows as f64;
         let mut out = Vec::new();
         for (k, site) in masked.sites.iter().enumerate() {
-            let library_mean = masked.mean(k);
+            let library_mean = &masked.libraries[k].mean;
             let mut centred: Vec<Tensor> = Vec::new();
             let mut offset = 0;
             for read in &site.reads {

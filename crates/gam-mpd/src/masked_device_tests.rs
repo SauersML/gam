@@ -61,7 +61,7 @@ fn the_masked_device_path_matches_the_cpu_within_bands() {
             .iter()
             .enumerate()
             .map(|(k, site)| {
-                let centred = &read_values(&trace, site).expect("reads") - masked.mean(k);
+                let centred = &read_values(&trace, site).expect("reads") - &masked.libraries[k].mean;
                 fast_atb(&centred, &centred) / family.rows as f64
             })
             .collect();
