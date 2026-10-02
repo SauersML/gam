@@ -237,6 +237,10 @@ pub fn kl_over_logit_boxes(
     let spread = up(perturbed_widest + oscillation);
     let squares = up(up(up(alpha * alpha) + up(beta * beta)) / 8.0);
     let shift = up(up(pinsker + up(growth * spread)) + squares);
+    // A perturbed box wide enough to overflow the shift proves no upper end.
+    if !shift.is_finite() {
+        return Ok(EvidenceStatus::unresolved(0.0, f64::INFINITY, Extremum::Supremum, None, region)?);
+    }
     Ok(EvidenceStatus::exact(
         divergence,
         up(evaluation_error + shift),
