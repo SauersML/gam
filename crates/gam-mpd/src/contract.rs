@@ -36,11 +36,11 @@
 //!
 //! # Evidence
 //!
-//! Each row's `KL` is [`verify::compare_logit_row`]'s over both logit boxes: an exact value with its
+//! Each row's `KL` is [`crate::verify::compare_logit_row`]'s over both logit boxes: an exact value with its
 //! evaluation error, or unresolved. The data term is their sum, exact up to the summed errors and
 //! the summation's own `γ_n` band, or unresolved with an infinite upper end. The reported maxima
 //! (the largest row KL, the argmax disagreement count) are outputs about the selected program,
-//! stated by [`verify::exhaustive_supremum`] over the rows; they select nothing.
+//! stated by [`crate::verify::exhaustive_supremum`] over the rows; they select nothing.
 //!
 //! # Total variation
 //!
