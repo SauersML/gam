@@ -86,7 +86,7 @@ use super::precision::{DecodableArtifact, DeclaredPrecision, LatticeCode};
 use super::secant::BandedMatrix;
 use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
 use gam_math::probability::{NORMAL_CDF_RELATIVE_ERROR, NORMAL_CDF_UNDERFLOW_FLOOR, normal_cdf_and_pdf};
-use ndarray::{Array1, Array2, Axis, s};
+use ndarray::{Array1, Array2, ArrayView2, Axis, s};
 use std::f64::consts::TAU;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -522,21 +522,40 @@ impl Law {
         }
     }
 
+    /// A bound on the law's slope: its Lipschitz constant on the reals.
+    pub fn lipschitz(self) -> f64 {
+        match self {
+            Self::Relu | Self::Identity => 1.0,
+            Self::Zero => 0.0,
+            Self::Silu => SILU_LIPSCHITZ,
+            Self::Gelu => GELU_LIPSCHITZ,
+            Self::GeluTanh => GELU_TANH_LIPSCHITZ,
+        }
+    }
+
     /// The radius of the computed law `value` at a computed input `input` whose radius is `r`.
     fn radius(self, input: f64, value: f64, r: f64) -> f64 {
         match self {
             Self::Relu | Self::Identity => r,
             Self::Zero => 0.0,
             Self::Silu => (SILU_LIPSCHITZ * r + 5.0 * UNIT_ROUNDOFF * value.abs()).next_up(),
-            // `Φ̂` is within `NORMAL_CDF_RELATIVE_ERROR Φ + NORMAL_CDF_UNDERFLOW_FLOOR` of `Φ` and the
-            // product rounds once, so the computed law is within
-            // `|t|(rel Φ + floor) + u|value|` of `t Φ(t)`, with `|t| Φ ≤ 2|value|` for `rel ≤ 1/2`.
-            // Eight rounded operations and libm's tanh (one ulp) on the inner argument move `1 + tanh`
-            // by at most `(10u)(1 + |inner|)`, times `½|t|`; the final products add `3u|value|`.
-            Self::GeluTanh => (GELU_TANH_LIPSCHITZ * r
-                + 5.0 * UNIT_ROUNDOFF * input.abs() * (1.0 + input.abs() + 0.045 * input.abs().powi(3))
-                + 3.0 * UNIT_ROUNDOFF * value.abs())
-            .next_up(),
+            // The inner argument `c(t + 0.044715 t³)` is computed within `δ = 8u·c(|t| + 0.044715|t|³)`
+            // (five roundings and the constant's); tanh moves by at most `δ sech²(ξ)` for `ξ` between
+            // the exact and computed arguments, and `sech²` decreases in `|ξ|`, so by
+            // `δ sech²(max(0, |inner| − δ)) ≤ δ min(1, 4e^{−2(|inner|−δ)})`: a saturated unit's
+            // rounding does not grow with `|t|³`. libm's tanh (one ulp, `2u`) and `1 + tanh` (`2u`)
+            // add `4u` to `1 + tanh`, times `½|t|`; the final products add `3u|value|`.
+            Self::GeluTanh => {
+                let c = std::f64::consts::FRAC_2_SQRT_PI * std::f64::consts::FRAC_1_SQRT_2;
+                let t = input.abs();
+                let reach = (c * (t + 0.044715 * t * t * t)).next_up();
+                let delta = (8.0 * UNIT_ROUNDOFF * reach).next_up();
+                let x = (reach * (1.0 - 8.0 * UNIT_ROUNDOFF) - delta).max(0.0);
+                let slope = (4.0 * (-2.0 * x).exp() * (1.0 + 4.0 * UNIT_ROUNDOFF)).min(1.0);
+                (GELU_TANH_LIPSCHITZ * r + 0.5 * t * (delta * slope + 4.0 * UNIT_ROUNDOFF) + 3.0 * UNIT_ROUNDOFF * value.abs())
+                    .next_up()
+                    .next_up()
+            }
             Self::Gelu => (GELU_LIPSCHITZ * r
                 + 2.0 * NORMAL_CDF_RELATIVE_ERROR * value.abs()
                 + input.abs() * NORMAL_CDF_UNDERFLOW_FLOOR
@@ -1098,23 +1117,115 @@ impl FamilyInputs {
     }
 }
 
-/// Every node's value, and its radius when bands were requested.
+/// Every node's value, and its error enclosure when bands were requested.
+///
+/// A node's computed value `x̂` encloses the exact value as `x̂ + e_box + e_ball` per row, with
+/// `|e_box| ≤ bands` entrywise and `‖e_ball‖₂ ≤ balls` (one radius per row). The local rounding of
+/// each node stays entrywise (a box); an error that an operator carries forward from its input is
+/// propagated in `ℓ₂` through a proven spectral-norm bound of the operator (a ball), so it grows by
+/// the operator's norm, not by its row `ℓ₁` norms layer after layer. [`Trace::band`] is the
+/// enclosure as one box.
 #[derive(Clone, Debug)]
 pub struct Trace {
     pub values: Vec<Array2<f64>>,
     pub bands: Option<Vec<Array2<f64>>>,
+    pub balls: Option<Vec<Array1<f64>>>,
 }
 
 impl Trace {
+    /// Node `node`'s enclosure as one box: its entrywise band plus its row's ball radius in every
+    /// coordinate (`‖e‖₂ ≤ ρ` gives `|e_i| ≤ ρ`).
+    pub fn band(&self, node: usize) -> Option<Array2<f64>> {
+        let mut band = self.bands.as_ref()?[node].clone();
+        if let Some(balls) = &self.balls {
+            for (mut row, rho) in band.outer_iter_mut().zip(balls[node].iter()) {
+                if *rho > 0.0 {
+                    row.mapv_inplace(|r| (r + rho).next_up());
+                }
+            }
+        }
+        Some(band)
+    }
+
     /// The output node's banded value (bands zero when none were requested).
     pub fn banded(&self, node: usize) -> BandedMatrix {
         let values = self.values[node].clone();
-        let bands = match &self.bands {
-            Some(bands) => bands[node].clone(),
-            None => Array2::zeros(values.dim()),
-        };
+        let bands = self.band(node).unwrap_or_else(|| Array2::zeros(values.dim()));
         BandedMatrix { values, bands }
     }
+}
+
+/// Per-row ball radii split at `from`, as [`Layered`] splits values.
+struct Balls<'a> {
+    base: &'a [Array1<f64>],
+    top: &'a [Array1<f64>],
+    from: usize,
+}
+
+impl<'a> Balls<'a> {
+    fn get(&self, node: usize) -> &'a Array1<f64> {
+        if node < self.from { &self.base[node] } else { &self.top[node - self.from] }
+    }
+}
+
+/// Per row, an upward bound on the `ℓ₂` norm of `r` (nonnegative entries).
+fn row_norms(r: &Array2<f64>) -> Array1<f64> {
+    r.outer_iter()
+        .map(|row| inflate(row.iter().map(|v| v * v).sum::<f64>(), row.len()).sqrt().next_up())
+        .collect()
+}
+
+/// A proven upper bound on `‖A‖₂` for an operator: `1` for the identity, the product of its
+/// factors' bounds for a low-rank operator, and for a dense one [`matrix_spectral_bound`].
+fn spectral_bound(op: &Operator) -> Result<f64, ProgramError> {
+    match &op.body {
+        OperatorBody::Identity => Ok(1.0),
+        OperatorBody::Dense { values, .. } => matrix_spectral_bound(values.view()),
+        OperatorBody::LowRank { left, right, .. } => {
+            Ok((matrix_spectral_bound(left.view())? * matrix_spectral_bound(right.view())?).next_up())
+        }
+    }
+}
+
+/// A content fingerprint of a matrix: its shape and two independent 64-bit hashes of its bits.
+fn fingerprint(a: ArrayView2<'_, f64>) -> (usize, usize, u64, u64) {
+    let (mut h1, mut h2) = (0xcbf2_9ce4_8422_2325_u64, 0x9e37_79b9_7f4a_7c15_u64);
+    for v in a.iter() {
+        let bits = v.to_bits();
+        h1 = (h1 ^ bits).wrapping_mul(0x0000_0100_0000_01b3);
+        h2 = (h2.rotate_left(23) ^ bits).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    }
+    (a.nrows(), a.ncols(), h1, h2)
+}
+
+/// A proven upper bound on `‖A‖₂`, the least of: the largest computed singular value plus the
+/// decomposition's band (every singular value is within the band of an exact one,
+/// `dense::svd`), the Frobenius norm, and for a matrix with at most one nonzero per row and per
+/// column (a diagonal gain, a permutation) its largest entry, which is then exact. Bounds are kept
+/// per matrix content, so an operator met again is not decomposed again.
+fn matrix_spectral_bound(a: ArrayView2<'_, f64>) -> Result<f64, ProgramError> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(usize, usize, u64, u64), f64>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let key = fingerprint(a);
+    if let Some(bound) = cache.lock().map_err(|_| ProgramError::Shape("a poisoned norm cache".to_string()))?.get(&key) {
+        return Ok(*bound);
+    }
+    let largest = a.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    let sparse = a.rows().into_iter().all(|row| row.iter().filter(|v| **v != 0.0).count() <= 1)
+        && a.columns().into_iter().all(|column| column.iter().filter(|v| **v != 0.0).count() <= 1);
+    let frobenius = inflate(a.iter().map(|v| v * v).sum::<f64>(), a.len()).sqrt().next_up();
+    let bound = if largest == 0.0 {
+        0.0
+    } else if sparse {
+        largest
+    } else {
+        let decomposition = super::dense::svd(a, false).map_err(|error| ProgramError::Shape(format!("spectral bound: {error:?}")))?;
+        let top = decomposition.singular_values.iter().fold(0.0_f64, |m, v| m.max(*v));
+        (top + decomposition.band).next_up().min(frobenius)
+    };
+    cache.lock().map_err(|_| ProgramError::Shape("a poisoned norm cache".to_string()))?.insert(key, bound);
+    Ok(bound)
 }
 
 /// Node values split at `from`: earlier nodes from `base`, later ones from `top`.
@@ -1292,23 +1403,40 @@ impl OperatorProgram {
         if let Some(bands) = trace.bands.as_mut() {
             bands.truncate(from);
         }
+        if trace.bands.is_some() {
+            let balls = trace.balls.get_or_insert_with(Vec::new);
+            balls.truncate(from);
+            balls.resize_with(from, || Array1::zeros(inputs.rows));
+        }
         let interfaces = self.interfaces()?;
         let mut top: Vec<Array2<f64>> = Vec::new();
         let mut top_bands: Vec<Array2<f64>> = Vec::new();
+        let mut top_balls: Vec<Array1<f64>> = Vec::new();
         for index in from..self.nodes.len() {
             let values = Layered { base: &trace.values, top: &top, from, patch: None };
-            let bands = trace.bands.as_ref().map(|bands| Layered { base: bands, top: &top_bands, from, patch: None });
             let frame = Frame { args: &[], parameters };
-            let (value, band) =
-                self.evaluate_node(index, &self.nodes[index], inputs, &values, bands.as_ref(), &interfaces, &frame)?;
-            top.push(value);
-            if trace.bands.is_some() {
-                top_bands.push(band.unwrap_or_else(|| Array2::zeros((0, 0))));
+            match (&trace.bands, &trace.balls) {
+                (Some(bands), Some(balls)) => {
+                    let bands = Layered { base: bands, top: &top_bands, from, patch: None };
+                    let balls = Balls { base: balls, top: &top_balls, from };
+                    let (value, band, ball) =
+                        self.evaluate_enclosed(index, inputs, &values, &bands, &balls, &interfaces, &frame)?;
+                    top.push(value);
+                    top_bands.push(band);
+                    top_balls.push(ball);
+                }
+                _ => {
+                    let (value, _) = self.evaluate_node(index, &self.nodes[index], inputs, &values, None, &interfaces, &frame)?;
+                    top.push(value);
+                }
             }
         }
         trace.values.extend(top);
         if let Some(bands) = trace.bands.as_mut() {
             bands.extend(top_bands);
+        }
+        if let Some(balls) = trace.balls.as_mut() {
+            balls.extend(top_balls);
         }
         Ok(())
     }
@@ -1471,15 +1599,22 @@ impl OperatorProgram {
     /// Causal (or full) attention over each row's sequence, with its radius: the score, softmax and
     /// read are the [`Node::Bilinear`], [`Node::Softmax`] and [`Node::Mix`] rules applied per row
     /// over its sequence's rows, after the rotation (orthogonal per plane, with libm's one ulp).
+    ///
+    /// With `balls` (per-row `ℓ₂` radii of the query, key and value errors besides their boxes), a
+    /// score's error gains `c(‖q‖‖e_k‖ + ‖e_q‖‖k‖ + ‖e_q‖‖e_k‖)` over every mix of box and ball parts
+    /// (a rotation keeps a ball's radius), and the read's ball is `Σ_j (α_j + Δα_j) ρ_{v,j}`: the
+    /// value errors pass through the convex weights (and their perturbation) in `ℓ₂`.
+    #[allow(clippy::too_many_arguments)]
     fn attend(
         &self,
         inputs: &FamilyInputs,
         (query, key, value): (&Array2<f64>, &Array2<f64>, &Array2<f64>),
         bands: Option<(&Array2<f64>, &Array2<f64>, &Array2<f64>)>,
+        balls: Option<(&Array1<f64>, &Array1<f64>, &Array1<f64>)>,
         scale: Scale,
         rotary: Option<Rotary>,
         causal: bool,
-    ) -> Result<(Array2<f64>, Option<Array2<f64>>), ProgramError> {
+    ) -> Result<(Array2<f64>, Option<Array2<f64>>, Option<Array1<f64>>), ProgramError> {
         let layout = inputs
             .layout
             .as_ref()
@@ -1518,6 +1653,11 @@ impl OperatorProgram {
         let dims = q.ncols();
         let mut out = Array2::<f64>::zeros((rows, width));
         let mut radius = bands.map(|_| Array2::<f64>::zeros((rows, width)));
+        let mut ball = balls.map(|_| Array1::<f64>::zeros(rows));
+        // Per row, upward `ℓ₂` norms of the rotated queries and keys and of their boxes.
+        let norms = |m: &Array2<f64>| -> Array1<f64> { row_norms(&m.mapv(f64::abs)) };
+        let (q_norm, k_norm) = (norms(&q), norms(&k));
+        let (rq_norm, rk_norm) = (rq.as_ref().map(norms), rk.as_ref().map(norms));
         let u = UNIT_ROUNDOFF;
         for members in by_sequence.values() {
             for &row in members {
@@ -1545,6 +1685,10 @@ impl OperatorProgram {
                                 let (ra, rb) = (rq[[row, i]], rk[[other, i]]);
                                 total += growth * a * b + a * rb + ra * b + ra * rb;
                             }
+                            if let (Some((bq, bk, _)), Some(rqn), Some(rkn)) = (balls, rq_norm.as_ref(), rk_norm.as_ref()) {
+                                let (pq, pk) = (bq[row], bk[other]);
+                                total += q_norm[row] * pk + pq * k_norm[other] + pq * pk + rqn[row] * pk + pq * rkn[other];
+                            }
                             inflate(c.abs() * total, 4 * dims)
                         })
                         .collect();
@@ -1564,6 +1708,9 @@ impl OperatorProgram {
                             let (pv, pr) = (value[[other, col]].abs(), bv[[other, col]]);
                             radius[[row, col]] += mix_growth * av * pv + av * pr + ar * pv + ar * pr;
                         }
+                        if let (Some(ball), Some((_, _, bv_ball))) = (ball.as_mut(), balls) {
+                            ball[row] += (av + ar) * bv_ball[other];
+                        }
                     }
                 }
             }
@@ -1571,7 +1718,10 @@ impl OperatorProgram {
         if let Some(radius) = radius.as_mut() {
             inflate_all(radius, 4 * rows.max(1));
         }
-        Ok((out, radius))
+        if let Some(ball) = ball.as_mut() {
+            ball.mapv_inplace(|v| inflate(v, 4 * rows.max(1)));
+        }
+        Ok((out, radius, ball))
     }
 
     /// Rule `rule`'s output on `args`.
@@ -1664,7 +1814,7 @@ impl OperatorProgram {
             )));
         }
         self.interfaces()?;
-        let mut trace = Trace { values: Vec::with_capacity(self.nodes.len()), bands: bands.then(Vec::new) };
+        let mut trace = Trace { values: Vec::with_capacity(self.nodes.len()), bands: bands.then(Vec::new), balls: bands.then(Vec::new) };
         self.execute_range(inputs, &mut trace, 0, parameters)?;
         Ok(trace)
     }
@@ -1674,6 +1824,194 @@ impl OperatorProgram {
             return Err(ProgramError::Input("one value set per declared slot".to_string()));
         }
         Ok(())
+    }
+
+    /// Each node's local rounding on the rows of `trace` (an unbanded trace of this program): the
+    /// band of the node's computed value when every argument is taken as exact.
+    pub fn local_rounding(&self, inputs: &FamilyInputs, trace: &Trace) -> Result<Vec<Array2<f64>>, ProgramError> {
+        self.check_inputs(inputs)?;
+        let interfaces = self.interfaces()?;
+        let ones = vec![1.0; self.declarations.parameters];
+        let frame = Frame { args: &[], parameters: &ones };
+        let count = trace.values.len();
+        let zero_balls: Vec<Array1<f64>> = (0..count).map(|_| Array1::zeros(inputs.rows)).collect();
+        let values = Layered { base: &trace.values, top: &[], from: count, patch: None };
+        let balls = Balls { base: &zero_balls, top: &[], from: count };
+        let mut out = Vec::with_capacity(count);
+        for index in 0..self.nodes.len().min(count) {
+            let zeros: BTreeMap<usize, Array2<f64>> =
+                self.nodes[index].arguments().into_iter().map(|a| (a, Array2::zeros(trace.values[a].dim()))).collect();
+            let bands = Layered { base: &trace.values, top: &[], from: count, patch: Some(&zeros) };
+            let (_, band, _) = self.evaluate_enclosed(index, inputs, &values, &bands, &balls, &interfaces, &frame)?;
+            out.push(band);
+        }
+        Ok(out)
+    }
+
+    /// One node's value and its enclosure (entrywise band, per-row ball): the affine, transposed,
+    /// pointwise, norm, attention, indicator-readout and concatenation nodes carry their inputs'
+    /// balls forward in `ℓ₂`; every other node first folds its arguments' balls into their boxes
+    /// and is evaluated as a box ([`Trace`]).
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_enclosed(
+        &self,
+        index: usize,
+        inputs: &FamilyInputs,
+        values: &Layered<'_>,
+        bands: &Layered<'_>,
+        balls: &Balls<'_>,
+        interfaces: &[Interface],
+        frame: &Frame<'_>,
+    ) -> Result<(Array2<f64>, Array2<f64>, Array1<f64>), ProgramError> {
+        let rows = inputs.rows;
+        let node = &self.nodes[index];
+        let value = |n: usize| values.get(n);
+        let band = |n: usize| bands.get(n);
+        let ball = |n: usize| balls.get(n);
+        let carries = |n: usize| ball(n).iter().any(|v| *v != 0.0) || band(n).iter().any(|v| *v != 0.0);
+        match node {
+            Node::Affine { terms, bias } => {
+                let (out, _) = self.evaluate_node(index, node, inputs, values, None, interfaces, frame)?;
+                let gathers: Vec<Option<Vec<usize>>> = terms
+                    .iter()
+                    .map(|(argument, operator)| match self.operators[*operator].body {
+                        OperatorBody::Dense { .. } => one_hot_columns(value(*argument)),
+                        _ => None,
+                    })
+                    .collect();
+                // A gather of an exact one-hot argument is one exact term, not `cols` of them.
+                let summands: usize = terms
+                    .iter()
+                    .zip(&gathers)
+                    .map(|((_, op), gather)| if gather.is_some() { 1 } else { self.operators[*op].cols.width() })
+                    .sum::<usize>()
+                    + 1;
+                let growth = accumulation_growth(summands);
+                let mut radius = Array2::<f64>::zeros(out.dim());
+                let mut rho = Array1::<f64>::zeros(rows);
+                for ((argument, operator), gather) in terms.iter().zip(&gathers) {
+                    let op = &self.operators[*operator];
+                    let x = value(*argument);
+                    match &op.body {
+                        OperatorBody::Identity => {
+                            radius += band(*argument);
+                            radius.zip_mut_with(x, |acc, xv| *acc += growth * xv.abs());
+                            rho += ball(*argument);
+                            continue;
+                        }
+                        OperatorBody::Dense { values: a, .. } => match gather {
+                            Some(columns) => {
+                                for (row, &column) in columns.iter().enumerate() {
+                                    radius.row_mut(row).zip_mut_with(&a.column(column), |acc, v| *acc += growth * v.abs());
+                                }
+                            }
+                            None => radius += &x.mapv(|xv| growth * xv.abs()).dot(&a.mapv(f64::abs).t()),
+                        },
+                        OperatorBody::LowRank { left, right, .. } => {
+                            let a = left.dot(right);
+                            radius += &x.mapv(|xv| growth * xv.abs()).dot(&a.mapv(f64::abs).t());
+                            let product = left.mapv(f64::abs).dot(&right.mapv(f64::abs)) * accumulation_growth(left.ncols());
+                            radius += &x.mapv(f64::abs).dot(&product.t());
+                        }
+                    }
+                    // The argument's error, box and ball, enters the output's ball through ‖A‖₂.
+                    if carries(*argument) {
+                        let sigma = spectral_bound(op)?;
+                        let entering = row_norms(band(*argument)) + ball(*argument);
+                        rho.zip_mut_with(&entering, |acc, e| *acc += (sigma * e).next_up());
+                    }
+                }
+                if let Some(op) = bias {
+                    let b = self.operators[*op].matrix().column(0).to_owned();
+                    radius += &b.mapv(|bv| growth * bv.abs());
+                }
+                inflate_all(&mut radius, summands);
+                rho.mapv_inplace(|v| inflate(v, terms.len()));
+                Ok((out, radius, rho))
+            }
+            Node::Transposed { input, operator } => {
+                let (out, _) = self.evaluate_node(index, node, inputs, values, None, interfaces, frame)?;
+                let op = &self.operators[*operator];
+                let a = op.matrix();
+                let x = value(*input);
+                let mut radius = x.mapv(|v| accumulation_growth(a.nrows()) * v.abs()).dot(&a.mapv(f64::abs));
+                inflate_all(&mut radius, a.nrows());
+                let mut rho = Array1::<f64>::zeros(rows);
+                if carries(*input) {
+                    let sigma = spectral_bound(op)?;
+                    rho = (row_norms(band(*input)) + ball(*input)).mapv(|e| inflate(sigma * e, 2));
+                }
+                Ok((out, radius, rho))
+            }
+            Node::Pointwise { laws, input } => {
+                let (out, radius) = self.evaluate_node(index, node, inputs, values, Some(bands), interfaces, frame)?;
+                let lipschitz = laws.iter().map(|law| law.lipschitz()).fold(0.0_f64, f64::max);
+                let rho = ball(*input).mapv(|v| (lipschitz * v).next_up());
+                Ok((out, radius.unwrap_or_else(|| Array2::zeros((rows, 0))), rho))
+            }
+            Node::RmsNorm { input, epsilon } => {
+                let (out, radius) = self.evaluate_node(index, node, inputs, values, Some(bands), interfaces, frame)?;
+                // `N(x) = x/s(x)` has `‖∂N‖₂ ≤ 1/s` at every point, so on the enclosure, whose norm is
+                // at least `‖x̂‖ − ‖r‖₂ − ρ`, the ball's part moves the output by at most `ρ/s_min`.
+                let x = value(*input);
+                let n = x.ncols() as f64;
+                let box_norms = row_norms(band(*input));
+                let mut rho = Array1::<f64>::zeros(rows);
+                for row in 0..rows {
+                    let p = ball(*input)[row];
+                    if p == 0.0 {
+                        continue;
+                    }
+                    let squares = x.row(row).iter().map(|v| v * v).sum::<f64>() * (1.0 - accumulation_growth(x.ncols() + 2));
+                    let low = (squares.max(0.0).sqrt() * (1.0 - 2.0 * UNIT_ROUNDOFF) - box_norms[row] - p).max(0.0);
+                    let s_min = ((low * low / n) * (1.0 - 4.0 * UNIT_ROUNDOFF) + epsilon).sqrt() * (1.0 - 4.0 * UNIT_ROUNDOFF);
+                    rho[row] = if s_min > 0.0 { (p / s_min).next_up().next_up() } else { f64::INFINITY };
+                }
+                Ok((out, radius.unwrap_or_else(|| Array2::zeros((rows, 0))), rho))
+            }
+            Node::Attend { query, key, value: payload, scale, rotary, causal } => {
+                let (out, radius, rho) = self.attend(
+                    inputs,
+                    (value(*query), value(*key), value(*payload)),
+                    Some((band(*query), band(*key), band(*payload))),
+                    Some((ball(*query), ball(*key), ball(*payload))),
+                    *scale,
+                    *rotary,
+                    *causal,
+                )?;
+                Ok((out, radius.unwrap_or_else(|| Array2::zeros((rows, 0))), rho.unwrap_or_else(|| Array1::zeros(rows))))
+            }
+            Node::Readout { input, basis } if matches!(self.bases[*basis], Basis::Indicator { .. }) => {
+                Ok((value(*input).clone(), band(*input).clone(), ball(*input).clone()))
+            }
+            Node::Concat { parts } => {
+                let (out, radius) = self.evaluate_node(index, node, inputs, values, Some(bands), interfaces, frame)?;
+                let mut rho = Array1::<f64>::zeros(rows);
+                for part in parts {
+                    rho.zip_mut_with(ball(*part), |acc, p| *acc += p * p);
+                }
+                rho.mapv_inplace(|v| inflate(v, parts.len()).sqrt().next_up());
+                Ok((out, radius.unwrap_or_else(|| Array2::zeros((rows, 0))), rho))
+            }
+            _ => {
+                // Fold every argument's ball into its box (`‖e‖₂ ≤ ρ` gives `|e_i| ≤ ρ`).
+                let mut patch: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
+                for argument in node.arguments() {
+                    let rho = ball(argument);
+                    if rho.iter().any(|v| *v != 0.0) {
+                        let mut folded = band(argument).clone();
+                        for (mut r, p) in folded.outer_iter_mut().zip(rho.iter()) {
+                            r.mapv_inplace(|v| (v + p).next_up());
+                        }
+                        patch.insert(argument, folded);
+                    }
+                }
+                let patched = Layered { base: bands.base, top: bands.top, from: bands.from, patch: Some(&patch) };
+                let (out, radius) = self.evaluate_node(index, node, inputs, values, Some(&patched), interfaces, frame)?;
+                let radius = radius.unwrap_or_else(|| Array2::zeros(out.dim()));
+                Ok((out, radius, Array1::zeros(rows)))
+            }
+        }
     }
 
     fn evaluate_node(
@@ -1701,7 +2039,16 @@ impl OperatorProgram {
                 self.execute_rule(*rule, &args, inputs, banded, frame.parameters)
             }
             Node::Attend { query, key, value, scale, rotary, causal } => {
-                self.attend(inputs, (value_of(values, *query), value_of(values, *key), value_of(values, *value)), bands.map(|b| (b.get(*query), b.get(*key), b.get(*value))), *scale, *rotary, *causal)
+                let (out, radius, _) = self.attend(
+                    inputs,
+                    (value_of(values, *query), value_of(values, *key), value_of(values, *value)),
+                    bands.map(|b| (b.get(*query), b.get(*key), b.get(*value))),
+                    None,
+                    *scale,
+                    *rotary,
+                    *causal,
+                )?;
+                Ok((out, radius))
             }
             Node::RmsNorm { input, epsilon } => Ok(rms_norm(value(*input), band(*input), *epsilon)),
             Node::Transposed { input, operator } => {

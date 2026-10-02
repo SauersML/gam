@@ -317,7 +317,7 @@ fn every_radius_covers_the_quad_double_value() {
     let program = fixture();
     let inputs = family();
     let trace = program.execute(&inputs, true).expect("executes");
-    let bands = trace.bands.as_ref().expect("bands were requested");
+    let bands: Vec<Array2<f64>> = (0..program.nodes.len()).map(|n| trace.band(n).expect("bands were requested")).collect();
     let exact = quad_evaluation(&program, &inputs);
     let mut widest_ratio = 0.0_f64;
     for (node, rows) in exact.iter().enumerate() {
@@ -565,7 +565,7 @@ fn a_rule_is_sent_once_and_executes_at_each_call_and_a_gain_reads_the_declared_p
         ndarray::concatenate(ndarray::Axis(1), &[relu(x.dot(&matrix.t())).view(), relu(y.dot(&matrix.t())).view()])
             .expect("concat");
     let value = &at_two.values[5];
-    let bands = &at_two.bands.as_ref().expect("bands")[5];
+    let bands = &at_two.band(5).expect("bands");
     for ((v, b), e) in value.iter().zip(bands.iter()).zip(expected.iter()) {
         assert!((v - e).abs() <= b + 1e-15 * e.abs(), "{v} vs {e} within {b}");
     }

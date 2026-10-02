@@ -59,6 +59,8 @@ fn scored(score: &ProgramScore, rows: usize, observations: u64) -> Value {
     let evaluation = &score.evaluation;
     json!({
         "program_bits": score.program_bits,
+        "measured_rows": score.measured_rows,
+        "certified": score.measured_rows == 0,
         "structure_bits": score.structure_bits,
         "precision_bits": score.precision_bits,
         "explanation_bits": score.explanation.bits,
@@ -138,6 +140,24 @@ fn main() -> Result<(), String> {
     // forward of the model itself resolves.
     let widest_band = reference.bands.iter().fold(0.0_f64, |w, b| if b.is_finite() { w.max(*b) } else { f64::INFINITY });
     let check = if language_model { export_check(&dir, &imported.record, &reference, context)? } else { None };
+    // Where the banded forward stops resolving: per node, the widest band, up to the first node
+    // whose band is not finite.
+    let mut band_trail = Vec::new();
+    if !widest_band.is_finite() || widest_band > 1.0 {
+        let trace = model.execute(&contract.family, true).map_err(|e| e.to_string())?;
+        if let (Some(bands), Some(balls)) = (&trace.bands, &trace.balls) {
+            let widest = |m: &mut dyn Iterator<Item = f64>| m.fold(0.0_f64, |w, b| if b.is_finite() { w.max(b) } else { f64::INFINITY });
+            for (index, (band, ball)) in bands.iter().zip(balls).enumerate() {
+                let (entrywise, radius) = (widest(&mut band.iter().copied()), widest(&mut ball.iter().copied()));
+                let kind = format!("{:?}", model.nodes[index]).split([' ', '{', '(']).next().unwrap_or("").to_string();
+                band_trail.push(json!({"node": index, "kind": kind, "widest_band": entrywise, "widest_ball": radius}));
+                eprintln!("  node {index} {kind}: widest band {entrywise:e}, ball {radius:e}");
+                if !(entrywise + radius).is_finite() {
+                    break;
+                }
+            }
+        }
+    }
     eprintln!(
         "{}: {} rows ({} inputs × {} readouts) imported in {import_seconds:.1}s, executed with bands in {reference_seconds:.1}s (widest band {widest_band:e}), export check {check:?}",
         dir.display(),
@@ -226,6 +246,7 @@ fn main() -> Result<(), String> {
             "sequences_context": language_model.then_some((sequences, context)),
             "export_logits_max_centred_difference": check,
             "reference_widest_band": widest_band,
+            "band_trail": band_trail,
             "native": {
                 "program_bits": native_view.bits,
                 "algorithm_bits": native_view.algorithm_bits,

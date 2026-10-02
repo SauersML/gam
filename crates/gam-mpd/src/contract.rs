@@ -54,6 +54,16 @@
 //! (the largest row KL, the argmax disagreement count) are outputs about the selected program,
 //! stated by [`crate::verify::exhaustive_supremum`] over the rows; they select nothing.
 //!
+//! # Certified and measured bands
+//!
+//! The logit bands come from the banded execution (`operator_program::Trace`): a proven enclosure
+//! of the exact-arithmetic output. In a deep network the enclosure compounds layer by layer (each
+//! layer multiplies the carried error by its operator norms and its attention and norm slopes)
+//! until it proves nothing about a row's KL. A distribution row whose proven band is not below one
+//! logit unit takes instead a measured band ([`measured_output_band`]): the nodes' local roundings
+//! with random signs, carried to the output to first order. Such a row's verdicts are
+//! measurements; [`ProgramScore::measured_rows`] counts them, and every report states it.
+//!
 //! # Total variation
 //!
 //! KL is the data term because it is a code length, but it is not a metric. The evaluation also
@@ -216,7 +226,8 @@ pub fn explanation(program: &OperatorProgram, trace: &Trace) -> Result<Explanati
     for node in &program.nodes {
         let Node::Pointwise { input, laws } = node else { continue };
         let values = &trace.values[*input];
-        let bands = trace.bands.as_ref().map(|b| &b[*input]);
+        let enclosure = trace.band(*input);
+        let bands = enclosure.as_ref();
         for (group, law) in laws.iter().enumerate() {
             if *law == Law::Zero {
                 continue;
@@ -283,6 +294,9 @@ pub struct ProgramScore {
     pub program_bits: u64,
     pub structure_bits: u64,
     pub precision_bits: u64,
+    /// Distribution rows of the program whose band is measured rather than proven ("Certified and
+    /// measured bands"); the score's verdicts on those rows are measurements, not certificates.
+    pub measured_rows: usize,
     /// The family's explanations given the program.
     pub explanation: Explanation,
     /// `L(behaviour | P) = Σ KL / ln 2` and its error; `+∞` error when some row is unresolved.
@@ -380,15 +394,38 @@ impl Contract {
         Ok(self.banded_trace(program)?.0)
     }
 
-    /// The program's output rows on the family with bands, and its banded trace.
-    fn banded_trace(&self, program: &OperatorProgram) -> Result<(BandedMatrix, Trace), ContractError> {
+    /// [`Contract::logits`] with the number of distribution rows whose band is measured, not
+    /// proven (module note, "Certified and measured bands").
+    pub fn logits_labelled(&self, program: &OperatorProgram) -> Result<(BandedMatrix, usize), ContractError> {
+        let (logits, _, measured) = self.banded_trace(program)?;
+        Ok((logits, measured))
+    }
+
+    /// The program's output rows on the family with bands, its banded trace, and how many
+    /// distribution rows carry a measured band.
+    fn banded_trace(&self, program: &OperatorProgram) -> Result<(BandedMatrix, Trace, usize), ContractError> {
         if program.declarations != self.declarations {
             return Err(ContractError::Declaration("the program's declarations are not the contract's".to_string()));
         }
         let trace = program.execute(&self.family, true)?;
-        let banded = trace.banded(program.output);
+        let mut banded = trace.banded(program.output);
+        // A row whose proven band is not below one logit unit (a factor e on a probability) proves
+        // little about its KL: it takes the measured band instead.
+        let unresolved: Vec<usize> = banded
+            .bands
+            .outer_iter()
+            .enumerate()
+            .filter(|(_, row)| row.iter().any(|r| !(r.is_finite() && *r < 1.0)))
+            .map(|(row, _)| row)
+            .collect();
+        if !unresolved.is_empty() {
+            let measured = measured_output_band(program, &self.family, &trace)?;
+            for &row in &unresolved {
+                banded.bands.row_mut(row).assign(&measured.row(row));
+            }
+        }
         let logits = BandedMatrix { values: self.distributions(&banded.values)?, bands: self.distributions(&banded.bands)? };
-        Ok((logits, trace))
+        Ok((logits, trace, unresolved.len() * self.readouts))
     }
 
     /// Refuse a program whose readout reads a slot the contract does not allow it.
@@ -529,7 +566,7 @@ impl Contract {
             return Err(ContractError::Declaration(format!("a message of {program_bits} bits accounted as {}", account.total_bits)));
         }
         let (structure_bits, precision_bits) = (account.structure_bits(), account.precision_bits());
-        let (candidate, trace) = self.banded_trace(&decoded)?;
+        let (candidate, trace, measured_rows) = self.banded_trace(&decoded)?;
         let explanation = explanation(&decoded, &trace)?;
         drop(trace);
         let evaluation = self.evaluate(reference, &candidate)?;
@@ -569,6 +606,7 @@ impl Contract {
             program_bits,
             structure_bits,
             precision_bits,
+            measured_rows,
             explanation,
             data_bits,
             data_bits_error,
@@ -576,6 +614,34 @@ impl Contract {
             population,
         })
     }
+}
+
+/// Probes of the measured band: random-sign draws of the local roundings.
+const ROUNDING_PROBES: u64 = 4;
+
+/// The measured band of the program's output on `family`: every node's local rounding (its band
+/// with exact arguments), given independent random signs, carried to the output to first order by
+/// one forward-mode pass (`derivatives::jvp_seeded`); the band is four times the largest output
+/// change over the probes, entrywise. It estimates the rounding error the computed output carries
+/// where the proven enclosure has compounded past use (deep networks), and proves nothing.
+pub fn measured_output_band(program: &OperatorProgram, family: &FamilyInputs, trace: &Trace) -> Result<Array2<f64>, ContractError> {
+    use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
+    let local = program.local_rounding(family, trace)?;
+    let output = &trace.values[program.output];
+    let mut band = Array2::<f64>::zeros(output.dim());
+    for probe in 0..ROUNDING_PROBES {
+        let mut rng = StdRng::seed_from_u64(0x5eed_0000 + probe);
+        let seeds: BTreeMap<usize, Array2<f64>> = local
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.iter().any(|v| *v != 0.0))
+            .map(|(node, r)| (node, r.mapv(|v| if rng.random::<bool>() { v } else { -v })))
+            .collect();
+        let change = super::derivatives::jvp_seeded(program, family, trace, &BTreeMap::new(), &seeds)?;
+        band.zip_mut_with(&change, |b, c| *b = b.max(4.0 * c.abs()));
+    }
+    Ok(band)
 }
 
 /// The Occam bound `k/n + √((L ln 2 + ln(1/δ))/(2n))` (module note), capped at 1, every step
