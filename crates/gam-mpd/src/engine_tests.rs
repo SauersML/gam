@@ -4,7 +4,7 @@
 //! component, re-partitioning an interface) never makes it look shorter.
 
 use super::contract::{Contract, FamilyKind};
-use super::engine::{Budget, Coarsen, DropBlocks, Primitive, decompose};
+use super::engine::{Budget, Coarsen, DropBlocks, Primitive, decompose, decompose_from};
 use super::operator_program::{
     Basis, Declarations, Domain, FamilyInputs, Interface, LabelKind, Node, Operator, OperatorBody, OperatorProgram,
     Provenance, Slot, SlotValues,
@@ -248,4 +248,30 @@ fn a_finer_partition_of_an_interface_changes_only_the_structure_code() {
     assert_eq!(fidelity.evaluation.max_kl, base.evaluation.max_kl);
     let reals = |p: &OperatorProgram| p.code_account().expect("account").operator_bits.iter().map(|(_, r)| *r).sum::<u64>();
     assert_eq!(reals(&split), reals(&program));
+}
+
+#[test]
+fn a_warm_start_never_leaves_the_result_longer_than_the_native_start() {
+    let (program, contract) = planted_program(true);
+    let reference = contract.logits(&program).expect("executes");
+    let native = contract.score(&program, &reference).expect("native score");
+    // A start chosen for little behaviour: the readout removed, every input read as uniform. At
+    // REPEATS observations per input it is far longer than the native program, and a search that
+    // only restricts can never put the readout back.
+    let mut empty = program.clone();
+    let OperatorBody::Dense { values, present, .. } = &mut empty.operators[1].body else { panic!("dense") };
+    present.fill(false);
+    values.fill(0.0);
+    let warm = contract.score(&empty, &reference).expect("warm score");
+    assert!(native.proven_shorter_than(&warm), "the warm start {} must be longer than native {}", warm.total(), native.total());
+    let library: Vec<Box<dyn Primitive>> = vec![Box::new(DropBlocks), Box::new(Coarsen)];
+    let from_native = decompose(&program, &contract, &library, &budget()).expect("decomposes");
+    let from_warm = decompose_from(&program, &empty, &contract, &library, &budget()).expect("decomposes");
+    assert!(from_warm.score.total_upper() <= native.total_upper(), "{} against native {}", from_warm.score.total(), native.total());
+    assert!(
+        from_warm.score.total_upper() <= from_native.score.total_upper(),
+        "warm-started {} against the native start's {}",
+        from_warm.score.total(),
+        from_native.score.total()
+    );
 }

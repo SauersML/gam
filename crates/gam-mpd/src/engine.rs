@@ -339,8 +339,10 @@ pub fn decompose(
     decompose_from(model, model, contract, library, budget)
 }
 
-/// [`decompose`] starting from `start`, a program over the model's declarations (for instance the
-/// result of a search on less behaviour).
+/// [`decompose`] with `start` (a program over the model's declarations, for instance the result of
+/// a search on less behaviour) joining the start set. The start set is always `{model, start}`: the
+/// search runs from each, and the shortest certified result is returned, so a warm start can never
+/// leave the result longer than the model's own search would.
 pub fn decompose_from(
     model: &OperatorProgram,
     start: &OperatorProgram,
@@ -350,34 +352,69 @@ pub fn decompose_from(
 ) -> Result<Decomposition, EngineError> {
     contract.validate()?;
     let banded = contract.logits(model)?;
-    decompose_with_reference(&banded, start, contract, library, budget)
+    decompose_with_reference(&banded, &[model, start], contract, library, budget)
 }
 
 /// [`decompose_from`] with the model's banded logits on the family given: `reference` must be
 /// `contract.logits(model)` (restricted to the family's rows when the family is a selection), so a
-/// caller scoring many families against one model runs the model once.
+/// caller scoring many families against one model runs the model once. `starts` is the start set
+/// (the model among them): the search runs from each distinct start, shortest first, each within
+/// `budget`, and the result with the least certified upper end of its total is returned. The search
+/// itself only moves to proven-shorter programs, so the result is never longer than any start.
 pub fn decompose_with_reference(
     reference: &BandedMatrix,
-    start: &OperatorProgram,
+    starts: &[&OperatorProgram],
     contract: &Contract,
     library: &[Box<dyn Primitive>],
     budget: &Budget,
 ) -> Result<Decomposition, EngineError> {
     contract.validate()?;
-    if reference.values.nrows() != contract.family.rows {
+    let expected = contract.family.rows * contract.readouts;
+    if reference.values.nrows() != expected {
         return Err(EngineError::Contract(ContractError::Declaration(format!(
-            "{} reference rows for {} inputs",
+            "{} reference rows for {} inputs at {} readouts",
             reference.values.nrows(),
-            contract.family.rows
+            contract.family.rows,
+            contract.readouts
         ))));
     }
-    let banded = reference.clone();
-    let reference = Reference { log_probabilities: log_softmax_rows(&banded.values), banded };
-    let mut program = start.clone();
-    let mut current = contract.score(&program, &reference.banded)?;
-    if !current.total_upper().is_finite() {
-        return Err(EngineError::UnresolvedStart(format!("{:?}", current.evaluation.total_kl)));
+    let reference = Reference { log_probabilities: log_softmax_rows(&reference.values), banded: reference.clone() };
+    let mut distinct: Vec<&OperatorProgram> = Vec::new();
+    for start in starts {
+        if !distinct.iter().any(|seen| *seen == *start) {
+            distinct.push(start);
+        }
     }
+    let mut scored = Vec::with_capacity(distinct.len());
+    for start in distinct {
+        let score = contract.score(start, &reference.banded)?;
+        if !score.total_upper().is_finite() {
+            return Err(EngineError::UnresolvedStart(format!("{:?}", score.evaluation.total_kl)));
+        }
+        scored.push((start, score));
+    }
+    scored.sort_by(|a, b| a.1.total_upper().total_cmp(&b.1.total_upper()));
+    let mut best: Option<Decomposition> = None;
+    for (start, score) in scored {
+        let result = search(&reference, start.clone(), score, contract, library, budget)?;
+        if best.as_ref().is_none_or(|b| result.score.total_upper() < b.score.total_upper()) {
+            best = Some(result);
+        }
+    }
+    best.ok_or_else(|| EngineError::UnresolvedStart("an empty start set".to_string()))
+}
+
+/// The search from one start program whose certified score is `start_score`.
+fn search(
+    reference: &Reference,
+    start: OperatorProgram,
+    start_score: ProgramScore,
+    contract: &Contract,
+    library: &[Box<dyn Primitive>],
+    budget: &Budget,
+) -> Result<Decomposition, EngineError> {
+    let mut program = start;
+    let mut current = start_score;
     let mut refused: BTreeSet<String> = BTreeSet::new();
     let (mut screenings, mut certifications) = (0u64, 0u64);
     let levels = library.iter().map(|primitive| primitive.levels()).max().unwrap_or(1);
