@@ -70,6 +70,13 @@ mod factors_tests;
 // The component-level view of an operator program: reads, laws, writes, uses, bits, unresolved share.
 pub mod view;
 
+// The human-facing reading of an operator program: rules with bindings, bit split, unresolved map.
+pub mod printer;
+
+// The printer on a planted two-frequency circuit.
+#[cfg(test)]
+mod printer_tests;
+
 // Exact path decomposition of a traced value: conditioned on the trace, best first, with a certified remainder.
 pub mod paths;
 
