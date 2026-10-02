@@ -1394,6 +1394,16 @@ fn inflate(value: f64, terms: usize) -> f64 {
     (value * (1.0 + 2.0 * accumulation_growth(terms + 2))).next_up()
 }
 
+/// The radius of a computed softmax weight `p` whose relative radius is `factor`: `p·factor`, but
+/// never more than `max(p, 1 − p)`, since the exact weight lies in `[0, 1]`. The cap keeps the
+/// radius finite when `factor` overflows (a score radius past ~355 makes `exp(2R) − 1` infinite,
+/// and `0·∞` would be NaN).
+fn softmax_radius(p: f64, factor: f64) -> f64 {
+    let cap = p.max((1.0 - p).next_up());
+    let bound = inflate(p * factor, 4);
+    if bound >= 0.0 { bound.min(cap) } else { cap }
+}
+
 fn inflate_all(array: &mut Array2<f64>, terms: usize) {
     let factor = 1.0 + 2.0 * accumulation_growth(terms + 2);
     array.mapv_inplace(|value| (value * factor).next_up());
@@ -1767,7 +1777,7 @@ impl OperatorProgram {
                     let factor = ((eta + (2.0 * big_r).exp_m1()) / (1.0 - eta)).next_up();
                     let mix_growth = accumulation_growth(keys.len());
                     for (j, &other) in keys.iter().enumerate() {
-                        let (av, ar) = (alpha[j].abs(), inflate(alpha[j] * factor, 4));
+                        let (av, ar) = (alpha[j].abs(), softmax_radius(alpha[j], factor));
                         for col in 0..width {
                             let (pv, pr) = (value[[other, col]].abs(), bv[[other, col]]);
                             radius[[row, col]] += mix_growth * av * pv + av * pr + ar * pv + ar * pr;
@@ -2292,7 +2302,7 @@ impl OperatorProgram {
                             .fold(0.0, f64::max);
                         let factor = ((eta + (2.0 * big_r).exp_m1()) / (1.0 - eta)).next_up();
                         for j in 0..width {
-                            radius[[row, j]] = inflate(out[[row, j]] * factor, 4);
+                            radius[[row, j]] = softmax_radius(out[[row, j]], factor);
                         }
                     }
                 }
