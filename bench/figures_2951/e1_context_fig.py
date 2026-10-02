@@ -52,7 +52,7 @@ fig.legend(handles=[Patch(color=BLUE, label="listing which pieces are on, word b
                     Patch(color=LIGHT, label="one-time cost of storing those numbers, spread over a million words")],
            loc="upper left", bbox_to_anchor=(0.2, 0.87), ncol=2, frameon=False, fontsize=13, labelcolor=INK,
            handlelength=1.2, columnspacing=2.2)
-fig.suptitle("Which VPD pieces are on for each word is about a third predictable from context", color=INK, fontsize=20,
+fig.suptitle("Using context, writing down which VPD pieces are on takes 38% fewer bits per word (1,771 → 1,100)", color=INK, fontsize=20,
              fontweight="bold", x=0.025, ha="left", y=0.975)
 tok32 = {k: E[k]["total"] for k in ("token", "token_and_previous")}
 fig.text(0.025, 0.9, "the stored numbers are paid for once and spread over a million words; "
