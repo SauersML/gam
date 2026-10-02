@@ -128,7 +128,7 @@
 //! **Theorem 2a (reference side).** `J(P; F)` and every certificate depend on `F` only through its
 //! banded logits on the family. So if `g` is any function-preserving reparametrization of `F`
 //! (a duplicated, rescaled or renamed component of the network, or an element of the declared
-//! gauge group of `canonical`: norm-gain folds, SwiGLU unit scales, per-group `GL(r)` on OV, the
+//! gauge group of `gauge`: norm-gain folds, SwiGLU unit scales, per-group `GL(r)` on OV, the
 //! normed rotary QK scales), then in exact arithmetic `J*(P; F) = J*(P; F∘g)` for every `P`, and
 //! the minimizers and verdicts coincide. In floating point, `|D(P; F) − D(P; F∘g)|` is at most the
 //! sum over rows of [`super::bounds::kl_over_logit_boxes`]' band with the radii of both

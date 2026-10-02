@@ -1,7 +1,7 @@
 """Export a modular-addition run file to float64 .npy tensors for the Rust decomposition engine (#2951).
 
 The run file is what ``bench/mpd_modadd_2951.py train`` writes (``torch.save`` of config, curves and
-checkpoints). The engine demo, ``crates/gam-sae/examples/mpd_engine_modadd_2951.rs``, reads each tensor as
+checkpoints). The engine demo, ``crates/gam-mpd/examples/mpd_engine_modadd_2951.rs``, reads each tensor as
 raw little-endian float64 in C order (``<name>.f64``) with its shape from ``export.json``. Each per-head
 tensor (``W_Q``, ``W_K``, ``W_V``: heads x d_head x d_model) is written head-major as (heads * d_head) x
 d_model, the layout of torch's head concatenation; a vector is one row. Every tensor is widened from its

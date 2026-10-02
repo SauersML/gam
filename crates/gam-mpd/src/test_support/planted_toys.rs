@@ -1,8 +1,5 @@
 #![cfg(test)]
-//! The planted known-answer toys of #2951 (receipt
-//! `experiments/issue-2951/receipts/opfirst_toys_planted.json`), shared by the tests of
-//! every owner they exercise, with analytic parameter Jacobians whose rounding is carried
-//! by ball arithmetic.
+//! The planted known-answer toys of #2951, shared by the tests of every owner they exercise.
 //!
 //! Each toy's answer is written down by hand before any tool runs:
 //! - **Paired copy** `σ(h) − σ(−h) = h`: no unit survives merging; its function-level fibre
@@ -26,10 +23,8 @@
 //! Every fixture is dyadic where a test compares tensors exactly, so a gauge move by a
 //! unimodular integer matrix is carried without rounding.
 
-use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
-use gam_math::probability::{NORMAL_CDF_RELATIVE_ERROR, NORMAL_CDF_UNDERFLOW_FLOOR, normal_cdf_and_pdf, normal_pdf_bounded};
-use gam_runtime::resource::MemoryGovernor;
-use ndarray::{Array1, Array2, ArrayView1, s};
+use gam_linalg::roundoff::UNIT_ROUNDOFF;
+use ndarray::{Array1, Array2, s};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{RngExt, SeedableRng};
@@ -73,10 +68,6 @@ impl Ball {
         }
     }
 
-    pub fn sub(self, other: Self) -> Self {
-        self.add(Self::new(-other.value, other.radius))
-    }
-
     pub fn mul(self, other: Self) -> Self {
         let value = self.value * other.value;
         let propagated = ((self.value.abs() * other.radius).next_up() + (self.radius * other.value.abs()).next_up()).next_up()
@@ -92,94 +83,15 @@ impl Ball {
         terms.into_iter().fold(Self::exact(0.0), Self::add)
     }
 
-    /// `Σ_k a_k b_k` over exact coefficients `a` and balls `b`.
-    pub fn dot(coefficients: ArrayView1<'_, f64>, balls: &[Self]) -> Self {
-        Self::sum(coefficients.iter().zip(balls).map(|(&a, &b)| Self::exact(a).mul(b)))
-    }
 }
 
-/// `(Φ(t), φ(t))` as balls about `t̂` for every exact `t` within `t`'s radius. `Φ` errs by
-/// the table's relative error and underflow floor and moves by at most `sup φ = 1/√(2π) <
-/// 0.4` per unit of `t`; `φ` errs by `normal_pdf_bounded`'s bound and moves by at most
-/// `sup |φ′| = φ(1) < 0.25`.
-fn normal_balls(t: Ball) -> (Ball, Ball) {
-    let (cdf, _) = normal_cdf_and_pdf(t.value);
-    let (pdf, pdf_bound) = normal_pdf_bounded(t.value);
-    let cdf_radius = ((NORMAL_CDF_RELATIVE_ERROR * cdf).next_up() + NORMAL_CDF_UNDERFLOW_FLOOR).next_up();
-    (
-        Ball::new(cdf, (cdf_radius + (0.4 * t.radius).next_up()).next_up()),
-        Ball::new(pdf, (pdf_bound + (0.25 * t.radius).next_up()).next_up()),
-    )
-}
-
-/// The exact GELU `σ(t) = t Φ(t)` and its slope `σ′(t) = Φ(t) + t φ(t)` as balls.
-pub fn gelu_balls(t: Ball) -> (Ball, Ball) {
-    let (cdf, pdf) = normal_balls(t);
-    (t.mul(cdf), cdf.add(t.mul(pdf)))
-}
-
-/// A plain GELU block `F(h) = W_out σ(W_in h + b_in) + b_out + L h`.
+/// A plain GELU block `F(h) = W_out σ(W_in h + b_in) + b_out`.
 #[derive(Clone, Debug)]
 pub struct MlpToy {
     pub w_in: Array2<f64>,
     pub b_in: Array1<f64>,
     pub w_out: Array2<f64>,
     pub b_out: Array1<f64>,
-    pub skip: Option<Array2<f64>>,
-}
-
-impl MlpToy {
-    pub fn parameters(&self) -> usize {
-        let (hidden, width) = self.w_in.dim();
-        let output = self.w_out.nrows();
-        hidden * width + hidden + output * hidden + output + self.skip.as_ref().map_or(0, |skip| skip.len())
-    }
-
-    /// The analytic Jacobian of `θ ↦ (F_θ(x_n))_n` over the rows of `inputs`, columns in
-    /// the order `W_in` (row-major), `b_in`, `W_out` (row-major), `b_out`, then `L`
-    /// (row-major) when present; rows `(n, i) ↦ n·d_out + i`. With it, a Frobenius bound on
-    /// its distance from the exact Jacobian, from the ball radii of every entry.
-    pub fn jacobian(&self, inputs: &Array2<f64>) -> (Array2<f64>, f64) {
-        let (hidden, width) = self.w_in.dim();
-        let output = self.w_out.nrows();
-        let samples = inputs.nrows();
-        let mut jacobian = Array2::<f64>::zeros((samples * output, self.parameters()));
-        let mut squared = 0.0_f64;
-        let (bias_in, weight_out) = (hidden * width, hidden * width + hidden);
-        let bias_out = weight_out + output * hidden;
-        let skip = bias_out + output;
-        for n in 0..samples {
-            let x = inputs.row(n);
-            let inputs_exact: Vec<Ball> = x.iter().map(|&value| Ball::exact(value)).collect();
-            for j in 0..hidden {
-                let pre = Ball::dot(self.w_in.row(j), &inputs_exact).add(Ball::exact(self.b_in[j]));
-                let (value, slope) = gelu_balls(pre);
-                for i in 0..output {
-                    let row = n * output + i;
-                    let weighted = Ball::exact(self.w_out[[i, j]]).mul(slope);
-                    for k in 0..width {
-                        let entry = weighted.mul(Ball::exact(x[k]));
-                        jacobian[[row, j * width + k]] = entry.value;
-                        squared += entry.radius * entry.radius;
-                    }
-                    jacobian[[row, bias_in + j]] = weighted.value;
-                    squared += weighted.radius * weighted.radius;
-                    jacobian[[row, weight_out + i * hidden + j]] = value.value;
-                    squared += value.radius * value.radius;
-                }
-            }
-            for i in 0..output {
-                jacobian[[n * output + i, bias_out + i]] = 1.0;
-                if self.skip.is_some() {
-                    for k in 0..width {
-                        jacobian[[n * output + i, skip + i * width + k]] = x[k];
-                    }
-                }
-            }
-        }
-        let formation = (squared * (1.0 + accumulation_growth(jacobian.len()))).sqrt().next_up();
-        (jacobian, formation)
-    }
 }
 
 /// Uniform dyadic rationals `k/denominator`, `|k| ≤ reach`.
@@ -198,7 +110,6 @@ pub fn paired_copy(width: usize) -> MlpToy {
         b_in: Array1::zeros(2 * width),
         w_out: w_in.t().to_owned(),
         b_out: Array1::zeros(width),
-        skip: None,
     }
 }
 
@@ -235,7 +146,6 @@ pub fn hadamard_modules(seed: u64) -> (MlpToy, Vec<usize>) {
         b_in: Array1::zeros(hidden),
         w_out: Array2::zeros((width, hidden)),
         b_out: Array1::zeros(width),
-        skip: None,
     };
     let mut truth = Vec::with_capacity(hidden);
     for (unit, (read, write, bias, module)) in units.into_iter().enumerate() {
@@ -265,22 +175,13 @@ pub fn random_mlp(seed: u64, hidden: usize, width: usize) -> MlpToy {
         b_in: Array1::from_shape_simple_fn(hidden, || rng.random_range(-0.5..0.5)),
         w_out: Array2::from_shape_simple_fn((width, hidden), || rng.random_range(-write_reach..write_reach)),
         b_out: Array1::from_shape_simple_fn(width, || rng.random_range(-0.1..0.1)),
-        skip: None,
     }
-}
-
-/// Inputs uniform on `[−reach, reach]`.
-pub fn uniform_inputs(seed: u64, samples: usize, width: usize, reach: f64) -> Array2<f64> {
-    let mut rng = StdRng::seed_from_u64(seed);
-    Array2::from_shape_simple_fn((samples, width), || rng.random_range(-reach..reach))
 }
 
 pub const ROUTING_WIDTH: usize = 16;
 pub const ROUTING_HEAD_DIM: usize = 4;
 pub const ROUTING_RANK: usize = 2;
 pub const ROUTING_HEADS: usize = 3;
-pub const ROUTING_TOKENS: usize = 6;
-pub const ROUTING_SEQUENCES: usize = 24;
 
 /// Three causal rotary heads on `ℝ¹⁶` (head dimension 4, planes at frequencies `1` and
 /// `0.1`, rotate-half pairing, score scale `1/2`) with rank-2 value/output transports.
@@ -295,8 +196,6 @@ pub struct RoutingToy {
     pub value: Vec<Array2<f64>>,
     /// Per head, `width × rank`.
     pub output: Vec<Array2<f64>>,
-    /// `tokens × width` each, at positions `0..tokens`.
-    pub sequences: Vec<Array2<f64>>,
     /// A readout of the block's output, `1 × width`.
     pub readout: Array2<f64>,
 }
@@ -343,14 +242,12 @@ impl RoutingToy {
         let key_one = dyadic(&mut rng, hd, d, 32, 64.0);
         let value = (0..ROUTING_HEADS).map(|_| dyadic(&mut rng, r, d, 32, 64.0)).collect();
         let output = (0..ROUTING_HEADS).map(|_| dyadic(&mut rng, d, r, 64, 64.0)).collect();
-        let sequences = (0..ROUTING_SEQUENCES).map(|_| dyadic(&mut rng, ROUTING_TOKENS, d, 32, 16.0)).collect();
         let readout = dyadic(&mut rng, 1, d, 16, 16.0);
         Self {
             query: vec![query_one.clone(), query_one.clone(), &query_one * 2.0],
             key: vec![key_one.clone(), key_one.clone(), key_one],
             value,
             output,
-            sequences,
             readout,
         }
     }
@@ -361,10 +258,6 @@ impl RoutingToy {
             inverse_frequencies: vec![1.0, 0.1],
             attention_scaling: 1.0,
         }
-    }
-
-    pub fn positions() -> Vec<i64> {
-        (0..ROUTING_TOKENS as i64).collect()
     }
 
     /// The block as the attention owner's native block: one key/value head per query head,
@@ -448,220 +341,6 @@ impl RoutingToy {
         output[1] = moved_output.slice(s![.., r..]).to_owned();
         (value, output)
     }
-
-    pub fn parameters() -> usize {
-        let (d, hd, r, heads) = (ROUTING_WIDTH, ROUTING_HEAD_DIM, ROUTING_RANK, ROUTING_HEADS);
-        heads * (2 * hd * d + 2 * r * d)
-    }
-
-    /// Column offsets of `Q_h[i, j]`, `K_h[i, j]`, `V_h[k, j]` and `O_h[i, k]`.
-    pub fn query_column(head: usize, i: usize, j: usize) -> usize {
-        (head * ROUTING_HEAD_DIM + i) * ROUTING_WIDTH + j
-    }
-
-    pub fn key_column(head: usize, i: usize, j: usize) -> usize {
-        ROUTING_HEADS * ROUTING_HEAD_DIM * ROUTING_WIDTH + Self::query_column(head, i, j)
-    }
-
-    pub fn value_column(head: usize, k: usize, j: usize) -> usize {
-        2 * ROUTING_HEADS * ROUTING_HEAD_DIM * ROUTING_WIDTH + (head * ROUTING_RANK + k) * ROUTING_WIDTH + j
-    }
-
-    pub fn output_column(head: usize, i: usize, k: usize) -> usize {
-        2 * ROUTING_HEADS * ROUTING_HEAD_DIM * ROUTING_WIDTH
-            + ROUTING_HEADS * ROUTING_RANK * ROUTING_WIDTH
-            + (head * ROUTING_WIDTH + i) * ROUTING_RANK
-            + k
-    }
-
-    /// The analytic Jacobian of `θ = (Q, K, V, O) ↦` every output of every sequence, rows
-    /// `(sequence, token, coordinate)`, columns by [`RoutingToy::query_column`] and its
-    /// siblings, with a Frobenius bound on its distance from the exact Jacobian.
-    ///
-    /// The attention weights and their radii are the attention owner's executed ones
-    /// ([`NativeAttention::execute`]), which enclose the exact softmax. Everything else is
-    /// ball arithmetic on the stored tensors: `q_t = R_t Q x_t`, `k_s = R_s K x_s` with the
-    /// rotation's `cos` and `sin` as balls of radius `γ₁|φ| + ε` (the angle's rounding and
-    /// libm's ulp), `S_ts = ½ q_t·k_s`, and
-    ///
-    /// ```text
-    /// ∂S_ts/∂Q_h[i,j] = ½ x_t[j] (R_t e_i)·k_s,   ∂S_ts/∂K_h[i,j] = ½ x_s[j] q_t·(R_s e_i),
-    /// ∂A_ts = A_ts (∂S_ts − Σ_{s'≤t} A_ts' ∂S_ts'),   ∂y_t = Σ_{s≤t} ∂A_ts O_h V_h x_s,
-    /// ∂y_t/∂V_h[k,j] = O_h[:,k] Σ_s A_ts x_s[j],   ∂y_t/∂O_h[i,k] = e_i Σ_s A_ts (V_h x_s)_k.
-    /// ```
-    pub fn jacobian(&self, governor: &MemoryGovernor) -> (Array2<f64>, f64) {
-        let (d, hd, r, heads, tokens) = (ROUTING_WIDTH, ROUTING_HEAD_DIM, ROUTING_RANK, ROUTING_HEADS, ROUTING_TOKENS);
-        let planes = hd / 2;
-        let rotary = Self::rotary();
-        let native = self.native(&self.value, &self.output);
-        let positions = Self::positions();
-        let rows = self.sequences.len() * tokens * d;
-        let mut jacobian = Array2::<f64>::zeros((rows, Self::parameters()));
-        let mut squared = 0.0_f64;
-        // `(cos, sin)` of plane `p` at position `t`, as balls.
-        let trig: Vec<Vec<(Ball, Ball)>> = (0..tokens)
-            .map(|t| {
-                (0..planes)
-                    .map(|p| {
-                        let angle = t as f64 * rotary.inverse_frequencies[p];
-                        let (sin, cos) = angle.sin_cos();
-                        let eta = ((accumulation_growth(1) * angle.abs()).next_up() + f64::EPSILON).next_up();
-                        (Ball::new(cos, eta), Ball::new(sin, eta))
-                    })
-                    .collect()
-            })
-            .collect();
-        let half = Ball::exact(0.5);
-        let rotate = |raw: &[Ball], t: usize| -> Vec<Ball> {
-            let mut rotated = raw.to_vec();
-            for (p, &(cos, sin)) in trig[t].iter().enumerate() {
-                let (a, b) = rotary.plane(p);
-                rotated[a] = raw[a].mul(cos).sub(raw[b].mul(sin));
-                rotated[b] = raw[b].mul(cos).add(raw[a].mul(sin));
-            }
-            rotated
-        };
-        // `(R_t e_i)·v` for a head vector `v`.
-        let turned = |v: &[Ball], t: usize, i: usize| -> Ball {
-            let p = i % planes;
-            let (a, b) = rotary.plane(p);
-            let (cos, sin) = trig[t][p];
-            if i == a { cos.mul(v[a]).add(sin.mul(v[b])) } else { cos.mul(v[b]).sub(sin.mul(v[a])) }
-        };
-        let mut record = |jacobian: &mut Array2<f64>, row: usize, column: usize, entry: Ball| {
-            jacobian[[row, column]] = entry.value;
-            squared += entry.radius * entry.radius;
-        };
-        for (sequence, x) in self.sequences.iter().enumerate() {
-            let executed = native.execute(governor, x.view(), &positions).expect("the routing toy executes");
-            let exact: Vec<Vec<Ball>> = x.rows().into_iter().map(|row| row.iter().map(|&v| Ball::exact(v)).collect()).collect();
-            let row_of = |t: usize, i: usize| (sequence * tokens + t) * d + i;
-            for head in 0..heads {
-                let weight = |t: usize, s: usize| Ball::new(executed.weights[[head, t, s]], executed.weight_radius[[head, t, s]]);
-                let project = |matrix: &Array2<f64>, t: usize| -> Vec<Ball> {
-                    (0..matrix.nrows()).map(|i| Ball::dot(matrix.row(i), &exact[t])).collect()
-                };
-                let queries: Vec<Vec<Ball>> = (0..tokens).map(|t| rotate(&project(&self.query[head], t), t)).collect();
-                let keys: Vec<Vec<Ball>> = (0..tokens).map(|t| rotate(&project(&self.key[head], t), t)).collect();
-                let reads: Vec<Vec<Ball>> = (0..tokens).map(|t| project(&self.value[head], t)).collect();
-                let writes: Vec<Vec<Ball>> = reads
-                    .iter()
-                    .map(|read| (0..d).map(|i| Ball::dot(self.output[head].row(i), read)).collect())
-                    .collect();
-                // Value and output columns.
-                for t in 0..tokens {
-                    let mixed_read: Vec<Ball> = (0..r).map(|k| Ball::sum((0..=t).map(|s| weight(t, s).mul(reads[s][k])))).collect();
-                    for j in 0..d {
-                        let mixed_input = Ball::sum((0..=t).map(|s| weight(t, s).mul(exact[s][j])));
-                        for k in 0..r {
-                            for i in 0..d {
-                                let entry = Ball::exact(self.output[head][[i, k]]).mul(mixed_input);
-                                record(&mut jacobian, row_of(t, i), Self::value_column(head, k, j), entry);
-                            }
-                        }
-                    }
-                    for i in 0..d {
-                        for k in 0..r {
-                            record(&mut jacobian, row_of(t, i), Self::output_column(head, i, k), mixed_read[k]);
-                        }
-                    }
-                }
-                // Query and key columns through the softmax.
-                for i in 0..hd {
-                    for j in 0..d {
-                        for (key_side, column) in [(false, Self::query_column(head, i, j)), (true, Self::key_column(head, i, j))] {
-                            for t in 0..tokens {
-                                let score_change: Vec<Ball> = (0..=t)
-                                    .map(|s| {
-                                        let raw = if key_side {
-                                            exact[s][j].mul(turned(&queries[t], s, i))
-                                        } else {
-                                            exact[t][j].mul(turned(&keys[s], t, i))
-                                        };
-                                        half.mul(raw)
-                                    })
-                                    .collect();
-                                let mean = Ball::sum((0..=t).map(|s| weight(t, s).mul(score_change[s])));
-                                let weight_change: Vec<Ball> =
-                                    (0..=t).map(|s| weight(t, s).mul(score_change[s].sub(mean))).collect();
-                                for coordinate in 0..d {
-                                    let entry = Ball::sum((0..=t).map(|s| weight_change[s].mul(writes[s][coordinate])));
-                                    record(&mut jacobian, row_of(t, coordinate), column, entry);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        (jacobian, (squared * (1.0 + accumulation_growth(rows * Self::parameters()))).sqrt().next_up())
-    }
-
-    /// The hand-derived tangents of the fibre, one per column (`parameters × 32`):
-    /// - per head, `δK_h = X K_h`, `δQ_h = −Xᵀ Q_h` for `X` in the rotary commutant, spanned
-    ///   on each plane by its identity and its quarter turn `J` (4 per head);
-    /// - heads 1 and 2 together, `δ[V₁; V₂] = X [V₁; V₂]`, `δ[O₁, O₂] = −[O₁, O₂] X` for
-    ///   `X ∈ gl(4)` (16);
-    /// - head 3, `δV₃ = X V₃`, `δO₃ = −O₃ X` for `X ∈ gl(2)` (4).
-    pub fn fibre_tangents(&self) -> Array2<f64> {
-        let (d, hd, r, heads) = (ROUTING_WIDTH, ROUTING_HEAD_DIM, ROUTING_RANK, ROUTING_HEADS);
-        let rotary = Self::rotary();
-        let mut tangents: Vec<Array1<f64>> = Vec::new();
-        for head in 0..heads {
-            for p in 0..hd / 2 {
-                let (a, b) = rotary.plane(p);
-                for turn in [false, true] {
-                    let mut generator = Array2::<f64>::zeros((hd, hd));
-                    if turn {
-                        generator[[a, b]] = -1.0;
-                        generator[[b, a]] = 1.0;
-                    } else {
-                        generator[[a, a]] = 1.0;
-                        generator[[b, b]] = 1.0;
-                    }
-                    let mut tangent = Array1::<f64>::zeros(Self::parameters());
-                    let key = generator.dot(&self.key[head]);
-                    let query = -generator.t().dot(&self.query[head]);
-                    for i in 0..hd {
-                        for j in 0..d {
-                            tangent[Self::key_column(head, i, j)] = key[[i, j]];
-                            tangent[Self::query_column(head, i, j)] = query[[i, j]];
-                        }
-                    }
-                    tangents.push(tangent);
-                }
-            }
-        }
-        for group in [vec![0, 1], vec![2]] {
-            let order = group.len() * r;
-            for (row, col) in (0..order).flat_map(|row| (0..order).map(move |col| (row, col))) {
-                let mut tangent = Array1::<f64>::zeros(Self::parameters());
-                // `X = e_row e_colᵀ`: row `row` of the stacked values gains row `col`, and
-                // column `col` of the stacked outputs loses column `row`.
-                let (to_head, to_k) = (group[row / r], row % r);
-                let (from_head, from_k) = (group[col / r], col % r);
-                for j in 0..d {
-                    tangent[Self::value_column(to_head, to_k, j)] += self.value[from_head][[from_k, j]];
-                }
-                for i in 0..d {
-                    tangent[Self::output_column(from_head, i, from_k)] -= self.output[to_head][[i, to_k]];
-                }
-                tangents.push(tangent);
-            }
-        }
-        let mut matrix = Array2::<f64>::zeros((Self::parameters(), tangents.len()));
-        for (column, tangent) in tangents.iter().enumerate() {
-            matrix.column_mut(column).assign(tangent);
-        }
-        matrix
-    }
-}
-
-/// `γ_n ‖|J| |T|‖_F`: the rounding of the product of a computed Jacobian with tangents,
-/// which adds to the Jacobian's formation bound.
-pub fn product_band(jacobian: &Array2<f64>, tangents: &Array2<f64>) -> f64 {
-    let magnitude = jacobian.mapv(f64::abs).dot(&tangents.mapv(f64::abs));
-    accumulation_growth(jacobian.ncols()) * magnitude.iter().map(|value| value * value).sum::<f64>().sqrt()
 }
 
 // ------------------------------------------------------------------------------------------
@@ -739,8 +418,6 @@ pub struct RotationToy {
     /// The repeated pair: its angle, basis columns and plane count. Its individual planes
     /// are not determined by `R`.
     pub repeated: (f64, std::ops::Range<usize>, usize),
-    /// `dim {X : X R = R X} = 2·2² + 2·1²`.
-    pub commutant_dimension: usize,
     /// The Krylov closure of a generic readout under `R − I`: one pair per distinct
     /// eigenvalue pair, holding the identified plane and a 2-dimensional slice of the pair.
     pub krylov_dimension: usize,
@@ -751,7 +428,6 @@ pub fn rotation_toy() -> RotationToy {
         planted: super::plant(6, &ROTATION_ANGLES, 0, ROTATION_SEED),
         identified_plane: (1.1, 4..6),
         repeated: (0.3, 0..4, 2),
-        commutant_dimension: 10,
         krylov_dimension: 4,
     }
 }

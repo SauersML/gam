@@ -4724,7 +4724,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     inference_instruments::register(module)?;
     crate::joint_event_ffi::register(module)?;
     crate::event_history_ffi::register(module)?;
-    crate::parameter_decomposition_ffi::register(module)?;
     crate::dense_linalg_ffi::register(module)?;
     crate::term_realization_ffi::register(module)?;
     module.add_function(wrap_pyfunction!(gated_sae_decode, module)?)?;

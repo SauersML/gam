@@ -3,7 +3,7 @@
 This is the research surface of gamfit: :func:`sae_manifold_fit` and
 :class:`ManifoldSAE`, sparse / linear dictionary fits, spectral and trust
 diagnostics, shape censuses, structure discovery, layer transport,
-crosscoder / behavior / checkpoint-dynamics fits, and parameter decomposition.
+crosscoder / behavior / checkpoint-dynamics fits.
 Importing :mod:`gamfit` does not load it; ``gamfit.sae`` is imported on first use.
 """
 
@@ -138,10 +138,6 @@ from ._intervention_calibration import (
     ChartCalibration,
     fit_chart_calibration,
 )
-from ._parameter_decomposition import (
-    ParameterDecompositionReport,
-    run_parameter_decomposition,
-)
 
 __all__ = [
     "adjudicate_atom_shape",
@@ -206,7 +202,6 @@ __all__ = [
     "loop_holonomy",
     "ManifoldSAE",
     "model_from_dict",
-    "ParameterDecompositionReport",
     "plan_probe_for_contested_claim",
     "recover_spikes",
     "rho_so2",
@@ -218,7 +213,6 @@ __all__ = [
     "RoutabilityAudit",
     "RoutabilityFloor",
     "run_label_shuffle_margin_null",
-    "run_parameter_decomposition",
     "run_shape_controlled_census",
     "sae_behavior_fit",
     "sae_checkpoint_dynamics",

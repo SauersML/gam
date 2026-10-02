@@ -4,7 +4,7 @@
   4L Pile target: RMSNorm with gain, rotate-half RoPE multi-head attention, GELU(tanh) MLP, no
   biases, final RMSNorm, untied unembedding) on next-token prediction over sequences drawn from
   one planted process. The processes are the known-answer behaviours of
-  ``crates/gam-sae/src/parameter_decomposition/causal_states_tests.rs``:
+  ``crates/gam-mpd/src/causal_states_tests.rs``:
 
   - ``dyck1``: ``(`` = 1, ``)`` = 2; at depth 0 a close has probability 0.03, otherwise 0.5.
     The true machine is one unbounded counter.

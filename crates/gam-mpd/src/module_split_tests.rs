@@ -1,11 +1,9 @@
 #![cfg(test)]
 //! Known-answer toys for the additive module split (toys 1–4 and 7 of the planted
-//! suite, receipt `experiments/issue-2951/receipts/opfirst_toys_planted.json`, and
-//! planted blocks under dense integer mixing) and its controls.
+//! suite, and planted blocks under dense integer mixing) and its controls.
 
 use super::*;
 use crate::state::{ObservabilityStep, WeightedObservability};
-use crate::fibre::parameter_fibre;
 use crate::test_support::planted_toys::{
     MlpToy, RANDOM_NULL_SEED, cross_edge, hadamard, hadamard_modules, hadamard_modules_truth, paired_copy, paired_copy_truth,
     random_mlp, rotation_toy,
@@ -489,13 +487,9 @@ fn laplacian_matches_the_dense_form_and_subsets_are_checked() {
 
 /// Toy 4 as a block: the paired copy of a rotation `R` (angles `0.3, 0.3, 1.1` in a hidden
 /// basis), `R σ(h) − R σ(−h) = R h`. Every write cancels and the merged linear part is `R`
-/// bitwise, so the split refuses: a linear block is additive under every partition. Under
-/// a projector contract its exact splits are the invariant subspace pairs of `R`, a
-/// continuous family whenever the commutant `{X : X R = R X}` exceeds `d`: the rotation
-/// commutant has dimension `2·2² + 2·1² = 10 > 6`, and the fibre oracle on
-/// `X ↦ X R − R X` bounds the computed one by exactly that.
+/// bitwise, so the split refuses: a linear block is additive under every partition.
 #[test]
-fn toy4_paired_rotation_is_a_linear_block_with_a_continuous_commutant() {
+fn toy4_paired_rotation_is_a_linear_block() {
     let width = 6;
     let toy = rotation_toy();
     let planted = &toy.planted;
@@ -514,22 +508,6 @@ fn toy4_paired_rotation_is_a_linear_block_with_a_continuous_commutant() {
     assert_eq!(form.reads.nrows(), 0);
     assert_eq!(&form.linear, rotation);
     assert!(matches!(form.additive_blocks(test_governor()), Err(ModuleSplitError::NoUnits)));
-
-    // `vec(X R − R X) = (Rᵀ ⊗ I − I ⊗ R) vec(X)`, column-major `vec`.
-    let order = width * width;
-    let commutator = Array2::from_shape_fn((order, order), |(row, col)| {
-        let (i, j) = (row % width, row / width);
-        let (k, l) = (col % width, col / width);
-        let right = if i == k { rotation[[l, j]] } else { 0.0 };
-        let left = if j == l { rotation[[i, k]] } else { 0.0 };
-        right - left
-    });
-    // `R` is within `matrix_defect` of an exact rotation, and `‖E ⊗ I‖₂ = ‖I ⊗ E‖₂ = ‖E‖₂`;
-    // each entry is one rounded difference.
-    let rounding = accumulation_growth(1) * commutator.iter().map(|value| value * value).sum::<f64>().sqrt();
-    let fibre = parameter_fibre(test_governor(), &commutator, 2.0 * planted.matrix_defect + rounding).expect("fibre");
-    assert_eq!(fibre.nullity_at_most(), toy.commutant_dimension);
-    assert!(fibre.nullity_at_most() > width, "a continuous family of splits");
 }
 
 /// Toy 7, the random null: a dense random GELU block of 64 units on `ℝ¹⁶` is one

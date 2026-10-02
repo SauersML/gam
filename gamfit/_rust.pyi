@@ -276,7 +276,6 @@ __all__ = [
     "numeric_matrix_validate",
     "numerics_inverse_softplus",
     "numerics_sigmoid_stable",
-    "parameter_decomposition_run",
     "partial_supervision_solve",
     "periodic_basis_with_jet",
     "periodic_bspline_input_location_first_derivative",
@@ -1911,8 +1910,6 @@ def numeric_matrix_validate(values: object, label: str) -> NDArray[np.float64]: 
 def numerics_inverse_softplus(x: NDArray[np.float64]) -> NDArray[np.float64]: ...
 
 def numerics_sigmoid_stable(x: NDArray[np.float64]) -> NDArray[np.float64]: ...
-
-def parameter_decomposition_run(request_json: str, tensors: dict[Any, Any]) -> tuple[str, dict[Any, Any]]: ...
 
 def partial_supervision_solve(t_sup: NDArray[np.float64], aux: NDArray[np.float64], t_free: NDArray[np.float64], method: str, anchor_idx: Sequence[int], free_constraint: str) -> dict[Any, Any]: ...
 

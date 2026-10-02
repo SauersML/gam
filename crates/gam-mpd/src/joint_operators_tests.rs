@@ -1,11 +1,9 @@
-//! Joint operators against executed rotate-half scoring, against dense Frobenius Grams, under
-//! canonical gauge elements, and against the planted "same subspace, different law" pair.
+//! Joint operators against executed rotate-half scoring, against dense Frobenius Grams, and
+//! against the planted "same subspace, different law" pair.
 
 use super::*;
 use crate::attention::{AffineProjection, RotaryPairing};
-use crate::canonical::{DecoderLayer, LayerRmsNorm, TensorDefect};
 use crate::gated_rewrite::rms_normalizers;
-use crate::gauge::SwigluUnits;
 use crate::state::resolve_stacked_factor;
 use crate::test_support::planted_toys::{ROUTING_HEADS, RoutingToy};
 use crate::test_support::test_governor;
@@ -197,119 +195,6 @@ fn energies_split_by_the_declared_context() {
     for length in [0.0, -1.0, f64::INFINITY, f64::NAN] {
         assert!(matches!(operators.energies(length), Err(JointRefusal::ContextLength { .. })));
     }
-}
-
-fn normed_layer(seed: u64) -> DecoderLayer {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let g = AttentionGeometry {
-        model_dim: 8,
-        n_heads: 4,
-        n_kv_heads: 2,
-        head_dim: 4,
-    };
-    let mut gains = |len: usize| Array1::from_shape_simple_fn(len, || rng.random_range(0.5..1.5));
-    let (query_gain, key_gain, input_gain, post_gain) = (gains(4), gains(4), gains(8), gains(8));
-    let mut rng = StdRng::seed_from_u64(seed + 1);
-    let attention = NativeAttention::new(
-        g,
-        RotaryEmbedding {
-            pairing: RotaryPairing::HalfSplit,
-            inverse_frequencies: vec![1.0, 0.1],
-            attention_scaling: 1.0,
-        },
-        0.5,
-        affine(uniform(&mut rng, 16, 8, -1.0, 1.0), Array1::zeros(16)),
-        affine(uniform(&mut rng, 8, 8, -1.0, 1.0), Array1::zeros(8)),
-        affine(uniform(&mut rng, 8, 8, -1.0, 1.0), Array1::zeros(8)),
-        affine(uniform(&mut rng, 8, 16, -1.0, 1.0), Array1::zeros(8)),
-    )
-    .expect("block")
-    .with_query_key_norm(1e-6, query_gain, key_gain)
-    .expect("norm");
-    let mlp = SwigluUnits::new(
-        uniform(&mut rng, 6, 8, -1.0, 1.0),
-        uniform(&mut rng, 6, 8, -1.0, 1.0),
-        uniform(&mut rng, 8, 6, -1.0, 1.0),
-    )
-    .expect("mlp");
-    DecoderLayer::native(LayerRmsNorm::native(1e-6, input_gain), &attention, LayerRmsNorm::native(1e-6, post_gain), &mlp).expect("layer")
-}
-
-fn relative_defect(defect: &TensorDefect) -> f64 {
-    match defect {
-        TensorDefect::Relative(relative) => *relative,
-        TensorDefect::Exact => 0.0,
-        TensorDefect::Entrywise(_) => f64::INFINITY,
-    }
-}
-
-/// The canonical layer's joint operators equal the native layer's within the representation
-/// defects of both; a non-gauge change moves one beyond them.
-#[test]
-fn joint_operators_are_gauge_invariant() {
-    let native = normed_layer(51);
-    let canonical = native.canonical().expect("canonical").layer;
-    let native_block = native.attention().expect("block");
-    let canonical_block = canonical.attention().expect("block");
-    let before = query_key_operators(&native_block, Some(native.input_norm.gain.view())).expect("native operators");
-    let after = query_key_operators(&canonical_block, None).expect("canonical operators");
-    // Canonical factors: the folded rows (γ_1), the balanced gains (γ_1) and the factor's own
-    // product (γ_1), `(1 + γ_1)³ ≤ 1 + γ_3`. Native factors: the gain and input-gain products (γ_2).
-    let norm = canonical.query_key_norm.as_ref().expect("normed");
-    assert_eq!(relative_defect(&canonical.query.weight_defect), accumulation_growth(1));
-    assert_eq!(norm.query.gain_defect, accumulation_growth(1));
-    assert_eq!(after.formation_defect(), accumulation_growth(1));
-    let canonical_rows = accumulation_growth(3);
-    for head in 0..4 {
-        for plane in 0..2 {
-            for (first, second) in [(before.cosine(head, plane), after.cosine(head, plane)), (before.sine(head, plane), after.sine(head, plane))] {
-                let allowance = first.relative_defect_reach(before.formation_defect(), before.formation_defect())
-                    + second.relative_defect_reach(canonical_rows, canonical_rows);
-                let comparison = compare_operators(test_governor(), first, second).expect("comparison");
-                let lower = comparison.difference.lower_bound().expect("exact");
-                assert!(lower <= allowance, "head {head} plane {plane}: {lower:e} beyond {allowance:e}");
-                let norm = comparison.first_norm.lower_bound().expect("exact");
-                assert!(allowance < 1e-12 * norm, "allowance {allowance:e} is vacuous");
-            }
-        }
-    }
-    let (before_ov, after_ov) = (
-        value_output_operators(&native_block, Some(native.input_norm.gain.view())).expect("native OV"),
-        value_output_operators(&canonical_block, None).expect("canonical OV"),
-    );
-    let bound = |defect: &TensorDefect| match defect {
-        TensorDefect::Entrywise(bound) => upper_frobenius(bound.view()),
-        other => panic!("canonical OV defects are entrywise, not {other:?}"),
-    };
-    for head in 0..4 {
-        let (first, second) = (before_ov.head(head), after_ov.head(head));
-        let group = head / 2;
-        let value_defect = match &canonical.value.weight_defect {
-            TensorDefect::Entrywise(bound) => upper_frobenius(bound.slice(s![group * 4..(group + 1) * 4, ..])),
-            other => panic!("canonical value defect is entrywise, not {other:?}"),
-        };
-        let output_defect = match &canonical.output.weight_defect {
-            TensorDefect::Entrywise(bound) => upper_frobenius(bound.slice(s![.., head * 4..(head + 1) * 4])),
-            other => panic!("canonical output defect is entrywise, not {other:?}"),
-        };
-        assert!(bound(&canonical.output.weight_defect) >= output_defect);
-        let allowance = first.relative_defect_reach(0.0, before_ov.formation_defect())
-            + entrywise_defect_reach(upper_frobenius(second.left()), upper_frobenius(second.right()), output_defect, value_defect);
-        let comparison = compare_operators(test_governor(), first, second).expect("comparison");
-        let lower = comparison.difference.lower_bound().expect("exact");
-        assert!(lower <= allowance, "OV head {head}: {lower:e} beyond {allowance:e}");
-        assert!(allowance < 1e-10 * comparison.first_norm.lower_bound().expect("exact"));
-    }
-    // Control: the query gain scaled on plane 0 without the key gain is not a gauge.
-    let mut moved = canonical.clone();
-    let (a, b) = native.rotary().plane(0);
-    let gains = moved.query_key_norm.as_mut().expect("normed");
-    gains.query.gain[a] *= 1.5;
-    gains.query.gain[b] *= 1.5;
-    let moved_operators = query_key_operators(&moved.attention().expect("block"), None).expect("operators");
-    let comparison = compare_operators(test_governor(), after.cosine(0, 0), moved_operators.cosine(0, 0)).expect("comparison");
-    assert!(comparison.proven_distinct());
-    assert!((comparison.scale - 1.0 / 1.5).abs() < 1e-12, "a plane-uniform scale is proportional: {}", comparison.scale);
 }
 
 /// The planted toys' finding: two operators with one range and a factor 2 between them share

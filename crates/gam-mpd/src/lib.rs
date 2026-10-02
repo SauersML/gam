@@ -76,8 +76,6 @@ pub mod bounds;
 // Prefix, subset and graph codes for the global artifact and local packets.
 pub mod codec;
 
-pub mod finite_grid;
-
 // Joint finite-intervention objective and structural proposals.
 pub mod fit;
 
@@ -119,9 +117,6 @@ pub mod import;
 // Exact masked rewrites of gated units, norms, biases and residual edges.
 pub mod gated_rewrite;
 
-// Exact canonical gauge forms of a native decoder layer, executed against the native layer.
-pub mod canonical;
-
 // Factored gauge-invariant joint operators: rotary QK planes, OV per head and group, Grams, equality.
 pub mod joint_operators;
 
@@ -136,12 +131,6 @@ pub mod module_split;
 
 // Implementation-gauge families detected exactly from native tensors, quotiented out of codes.
 pub mod gauge;
-
-// The function-level fibre bounded from a parameter Jacobian: the oracle a gauge census is checked against.
-pub mod fibre;
-
-// The gauge census of a decoder layer and of a tied residual stream.
-pub mod gauge_census;
 
 // Gauge-covariant group masks, structured parameter paths, Sum and Compose accounting.
 pub mod operators;
@@ -179,9 +168,6 @@ pub mod llama_simple_mlp;
 // Exact two-endpoint finite-change operators: softmax and bilinear products.
 pub mod secant;
 
-// The sign-gated split of a SwiGLU block, its certified correction bounds and ReLU replacement contract.
-pub mod sign_gated;
-
 // Sufficient-state quotient and realization contracts, and the exact linear quotient.
 pub mod state;
 
@@ -197,9 +183,6 @@ pub mod theory;
 // Machine checks of the theory's theorems.
 #[cfg(test)]
 mod theory_tests;
-
-// Versioned request and report document shared by pyffi and the CLI.
-pub mod surface;
 
 // Behaviour discovery: the family partitioned into groups, each its own subprogram, by one two-part code.
 pub mod behaviors;

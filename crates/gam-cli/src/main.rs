@@ -153,8 +153,6 @@ mod multinomial_cli;
 mod prediction_csv;
 #[path = "main/run_crosscoder.rs"]
 mod run_crosscoder;
-#[path = "main/run_parameter_decomposition.rs"]
-mod run_parameter_decomposition;
 #[path = "main/run_compare.rs"]
 mod run_compare;
 #[path = "main/run_diagnose.rs"]
@@ -184,7 +182,6 @@ pub(crate) use model_summary::*;
 pub(crate) use multinomial_cli::*;
 pub(crate) use prediction_csv::*;
 pub(crate) use run_crosscoder::*;
-pub(crate) use run_parameter_decomposition::*;
 pub(crate) use run_compare::*;
 pub(crate) use run_diagnose::*;
 pub(crate) use run_partial_effect::*;
@@ -274,7 +271,6 @@ fn run() -> CliResult<()> {
     match cli.command {
         Command::Fit(args) => run_fit(args),
         Command::Crosscoder(args) => run_crosscoder(args),
-        Command::ParameterDecomposition(args) => run_parameter_decomposition_cli(args),
         Command::Report(args) => run_report(args),
         Command::Summary(args) => run_summary(args),
         Command::Predict(args) => run_predict(args),

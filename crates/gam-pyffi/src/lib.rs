@@ -42,7 +42,6 @@ mod test_support {
 mod event_history_ffi;
 mod term_realization_ffi;
 mod ffi;
-mod parameter_decomposition_ffi;
 
 mod inference;
 
