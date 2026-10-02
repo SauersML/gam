@@ -91,12 +91,18 @@ use std::sync::Arc;
 /// Shared factors fitted in the code's metric (module note).
 ///
 /// The readers' curvature is the costly part of a fit (one reverse pass per sketched class), so it
-/// is kept per component, keyed by the component's own operators: it is measured again only when
-/// one of them changes. A change elsewhere leaves it a proposal metric; the contract certifies.
+/// is kept per component, keyed by the component's own operators (held, so an operator's identity
+/// is never mistaken for a later one's at a reused address) and its readers: it is measured again
+/// only when one of them changes, or when a reader's width no longer matches. A change elsewhere
+/// leaves it a proposal metric; the contract certifies. Entries whose operators left the program
+/// are dropped each round.
 #[derive(Default)]
 pub struct Factors {
-    curvature: std::cell::RefCell<BTreeMap<Vec<usize>, BTreeMap<usize, Array2<f64>>>>,
+    curvature: std::cell::RefCell<CurvatureCache>,
 }
+
+/// Cached reader curvatures: per component, its operators, its readers and their curvatures.
+type CurvatureCache = Vec<(Vec<Arc<Operator>>, Vec<usize>, BTreeMap<usize, Array2<f64>>)>;
 
 fn refuse(message: impl Into<String>) -> EngineError {
     EngineError::Primitive(message.into())
@@ -413,7 +419,7 @@ fn measure(
     program: &OperatorProgram,
     context: &SearchContext<'_>,
     component: &Component,
-    cache: &std::cell::RefCell<BTreeMap<Vec<usize>, BTreeMap<usize, Array2<f64>>>>,
+    cache: &std::cell::RefCell<CurvatureCache>,
 ) -> Result<Option<Fit>, EngineError> {
     let trace = context.trace;
     let d = trace.values[component.arguments[0]].ncols();
@@ -459,18 +465,28 @@ fn measure(
     }
     // Per reader node, its curvature; per operator, the sum over its uses.
     // The component's identity: its operators' allocations and its readers' positions.
-    let key: Vec<usize> = component
-        .operators
+    let operators: Vec<Arc<Operator>> = component.operators.iter().map(|op| Arc::clone(&program.operators[*op])).collect();
+    let fits = |curvature: &BTreeMap<usize, Array2<f64>>| {
+        component.readers.iter().all(|r| {
+            let width = trace.values[*r].ncols();
+            curvature.get(r).is_some_and(|c| c.dim() == (width, width))
+        })
+    };
+    let cached = cache
+        .borrow()
         .iter()
-        .map(|op| std::sync::Arc::as_ptr(&program.operators[*op]) as usize)
-        .chain(component.readers.iter().copied())
-        .collect();
-    let cached = cache.borrow().get(&key).cloned();
+        .find(|(ops, readers, curvature)| {
+            ops.len() == operators.len()
+                && ops.iter().zip(&operators).all(|(a, b)| Arc::ptr_eq(a, b))
+                && *readers == component.readers
+                && fits(curvature)
+        })
+        .map(|(_, _, curvature)| curvature.clone());
     let node_curvature = match cached {
         Some(curvature) => curvature,
         None => {
             let curvature = curvatures(program, context, &component.readers)?;
-            cache.borrow_mut().insert(key, curvature.clone());
+            cache.borrow_mut().push((operators, component.readers.clone(), curvature.clone()));
             curvature
         }
     };
@@ -702,6 +718,9 @@ impl Primitive for Factors {
     fn propose(&self, context: &SearchContext<'_>) -> Result<Vec<Proposal>, EngineError> {
         let program = context.program;
         let mut out = Vec::new();
+        self.curvature
+            .borrow_mut()
+            .retain(|(ops, _, _)| ops.iter().all(|op| program.operators.iter().any(|current| Arc::ptr_eq(op, current))));
         for component in components(program) {
             // A reader at least as wide as the output's classes and wider than the family has a
             // curvature of more entries than the family can resolve, at one reverse pass per class:
