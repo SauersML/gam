@@ -59,6 +59,22 @@ fn vpd_name(site: &str) -> Option<String> {
 }
 
 /// Sums over a sequence's tokens: active pieces, KL, frontier bits.
+/// A one-dimensional little-endian int64 `.npy` file.
+fn write_npy(path: &Path, values: &[i64]) -> Result<(), String> {
+    let mut header = format!("{{'descr': '<i8', 'fortran_order': False, 'shape': ({},), }}", values.len());
+    while (10 + header.len() + 1) % 64 != 0 {
+        header.push(' ');
+    }
+    header.push('\n');
+    let mut bytes = b"\x93NUMPY\x01\x00".to_vec();
+    bytes.extend_from_slice(&(header.len() as u16).to_le_bytes());
+    bytes.extend_from_slice(header.as_bytes());
+    for v in values {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(path, bytes).map_err(|e| e.to_string())
+}
+
 fn sums(masks: &[Array2<f64>], kl: &Array1<f64>) -> (f64, f64, f64) {
     let mut l0 = 0.0;
     let mut bits = 0.0;
@@ -277,6 +293,10 @@ fn main() -> Result<(), String> {
                 }
                 let evaluated = if last { eval } else { eval.min(4) };
                 let (mut l0, mut kl, mut bits, mut tokens, mut explanation) = (0.0, 0.0, 0.0, 0.0, 0.0);
+                // At a full eval the selected sets are written as CSR over all pieces (sites in
+                // order), so other context codes can score exactly these sets.
+                let mut indptr: Vec<i64> = vec![0];
+                let mut indices: Vec<i64> = Vec::new();
                 for e in 0..evaluated {
                     let inputs = sequence(train + e);
                     let target = target_of(&inputs)?;
@@ -284,11 +304,31 @@ fn main() -> Result<(), String> {
                     let begin = start_masks(&inputs, &masked.libraries, &coder.costs)?;
                     let (masks, values) = select(&masked, &inputs, &target, begin, &coder, observations, samples)?;
                     explanation += coder.bits(&masks).sum();
+                    if last {
+                        for r in 0..inputs.rows {
+                            let mut offset = 0;
+                            for m in &masks {
+                                indices.extend((0..m.ncols()).filter(|&c| m[[r, c]] > 0.0).map(|c| (offset + c) as i64));
+                                offset += m.ncols();
+                            }
+                            indptr.push(indices.len() as i64);
+                        }
+                    }
                     let (a, b, c) = sums(&masks, &values);
                     l0 += a;
                     kl += b;
                     bits += c;
                     tokens += inputs.rows as f64;
+                }
+                if last {
+                    let mut offsets = vec![0i64];
+                    for l in &masked.libraries {
+                        offsets.push(offsets[offsets.len() - 1] + l.v.nrows() as i64);
+                    }
+                    let stem = out.with_extension("");
+                    for (name, values) in [("indptr", &indptr), ("indices", &indices), ("offsets", &offsets)] {
+                        write_npy(&PathBuf::from(format!("{}.pass{pass}.{name}.npy", stem.display())), values)?;
+                    }
                 }
                 let point = json!({
                     "l0": l0 / tokens, "kl": kl / tokens, "bits": bits / tokens,
