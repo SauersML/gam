@@ -1423,7 +1423,7 @@ impl OperatorProgram {
                     let bands = Layered { base: bands, top: &top_bands, from, patch: None };
                     let balls = Balls { base: balls, top: &top_balls, from };
                     let (value, band, ball) =
-                        self.evaluate_enclosed(index, inputs, &values, &bands, &balls, &interfaces, &frame)?;
+                        self.evaluate_enclosed(index, inputs, (&values, &bands, &balls), &interfaces, &frame)?;
                     top.push(value);
                     top_bands.push(band);
                     top_balls.push(ball);
@@ -1620,16 +1620,13 @@ impl OperatorProgram {
     /// score's error gains `c(‖q‖‖e_k‖ + ‖e_q‖‖k‖ + ‖e_q‖‖e_k‖)` over every mix of box and ball parts
     /// (a rotation keeps a ball's radius), and the read's ball is `Σ_j (α_j + Δα_j) ρ_{v,j}`: the
     /// value errors pass through the convex weights (and their perturbation) in `ℓ₂`.
-    #[allow(clippy::too_many_arguments)]
     fn attend(
         &self,
         inputs: &FamilyInputs,
         (query, key, value): (&Array2<f64>, &Array2<f64>, &Array2<f64>),
         bands: Option<(&Array2<f64>, &Array2<f64>, &Array2<f64>)>,
         balls: Option<(&Array1<f64>, &Array1<f64>, &Array1<f64>)>,
-        scale: Scale,
-        rotary: Option<Rotary>,
-        causal: bool,
+        (scale, rotary, causal): (Scale, Option<Rotary>, bool),
     ) -> Result<(Array2<f64>, Option<Array2<f64>>, Option<Array1<f64>>), ProgramError> {
         let layout = inputs
             .layout
@@ -1858,7 +1855,7 @@ impl OperatorProgram {
             let zeros: BTreeMap<usize, Array2<f64>> =
                 self.nodes[index].arguments().into_iter().map(|a| (a, Array2::zeros(trace.values[a].dim()))).collect();
             let bands = Layered { base: &trace.values, top: &[], from: count, patch: Some(&zeros) };
-            let (_, band, _) = self.evaluate_enclosed(index, inputs, &values, &bands, &balls, &interfaces, &frame)?;
+            let (_, band, _) = self.evaluate_enclosed(index, inputs, (&values, &bands, &balls), &interfaces, &frame)?;
             out.push(band);
         }
         Ok(out)
@@ -1868,14 +1865,11 @@ impl OperatorProgram {
     /// pointwise, norm, attention, indicator-readout and concatenation nodes carry their inputs'
     /// balls forward in `ℓ₂`; every other node first folds its arguments' balls into their boxes
     /// and is evaluated as a box ([`Trace`]).
-    #[allow(clippy::too_many_arguments)]
     fn evaluate_enclosed(
         &self,
         index: usize,
         inputs: &FamilyInputs,
-        values: &Layered<'_>,
-        bands: &Layered<'_>,
-        balls: &Balls<'_>,
+        (values, bands, balls): (&Layered<'_>, &Layered<'_>, &Balls<'_>),
         interfaces: &[Interface],
         frame: &Frame<'_>,
     ) -> Result<(Array2<f64>, Array2<f64>, Array1<f64>), ProgramError> {
@@ -1991,9 +1985,7 @@ impl OperatorProgram {
                     (value(*query), value(*key), value(*payload)),
                     Some((band(*query), band(*key), band(*payload))),
                     Some((ball(*query), ball(*key), ball(*payload))),
-                    *scale,
-                    *rotary,
-                    *causal,
+                    (*scale, *rotary, *causal),
                 )?;
                 Ok((out, radius.unwrap_or_else(|| Array2::zeros((rows, 0))), rho.unwrap_or_else(|| Array1::zeros(rows))))
             }
@@ -2060,9 +2052,7 @@ impl OperatorProgram {
                     (value_of(values, *query), value_of(values, *key), value_of(values, *value)),
                     bands.map(|b| (b.get(*query), b.get(*key), b.get(*value))),
                     None,
-                    *scale,
-                    *rotary,
-                    *causal,
+                    (*scale, *rotary, *causal),
                 )?;
                 Ok((out, radius))
             }

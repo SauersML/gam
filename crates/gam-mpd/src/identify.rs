@@ -100,24 +100,38 @@ pub fn gauge(program: &OperatorProgram) -> Vec<String> {
         Err(error) => return vec![format!("no interfaces: {error}")],
     };
     for (index, node) in program.nodes.iter().enumerate() {
-        match node {
+        let generator = match node {
             Node::Pointwise { laws, .. } => {
                 let relu = laws.iter().filter(|l| **l == Law::Relu).count();
-                out.push(format!(
+                Some(format!(
                     "node {index}: permutations of its {} units within each law; a positive scale on each of its {relu} ReLU units (read row × s, write column / s)",
                     laws.len()
-                ));
+                ))
             }
-            Node::Affine { .. } if interfaces[index].groups().iter().all(|g| g.label.kind == LabelKind::Factor) => {
-                out.push(format!(
-                    "node {index}: GL({}) of its factor coordinates, fixed by the shortest coefficient code up to permutation, sign and scale",
-                    interfaces[index].width()
-                ));
-            }
-            Node::Readout { .. } => out.push(format!("node {index}: a constant added to every logit (softmax shift)")),
-            Node::RmsNorm { .. } => out.push(format!("node {index}: a positive scale of its input")),
-            _ => {}
-        }
+            Node::Affine { .. } if interfaces[index].groups().iter().all(|g| g.label.kind == LabelKind::Factor) => Some(format!(
+                "node {index}: GL({}) of its factor coordinates, fixed by the shortest coefficient code up to permutation, sign and scale",
+                interfaces[index].width()
+            )),
+            Node::Readout { .. } => Some(format!("node {index}: a constant added to every logit (softmax shift)")),
+            Node::RmsNorm { .. } => Some(format!("node {index}: a positive scale of its input")),
+            // Every other node's value is fixed by its arguments and operators: no symmetry of its own.
+            Node::Affine { .. }
+            | Node::Feature { .. }
+            | Node::Raw { .. }
+            | Node::Constant { .. }
+            | Node::Bilinear { .. }
+            | Node::Softmax { .. }
+            | Node::Mix { .. }
+            | Node::Hadamard { .. }
+            | Node::Outer { .. }
+            | Node::Concat { .. }
+            | Node::Param { .. }
+            | Node::Call { .. }
+            | Node::Gain { .. }
+            | Node::Attend { .. }
+            | Node::Transposed { .. } => None,
+        };
+        out.extend(generator);
     }
     out
 }

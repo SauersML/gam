@@ -1,6 +1,6 @@
 //! The known mechanism of the p = 31 modular-addition transformer, written by hand as an operator
 //! program and scored by the engine's own code: the target the engine must reach without being
-//! told the answer (#2951). Test-only: nothing here is an input to the engine.
+//! told the answer (#2951). An analyst's check: nothing here is an input to the engine.
 //!
 //! The oracle reads the residual at `=` through the Fourier features `cos/sin(ω_k a)`,
 //! `cos/sin(ω_k b)` of the five frequencies the embedding uses (`k ∈ {5, 7, 8, 10, 14}`), each unit
@@ -9,9 +9,10 @@
 //! restricted to the constant and those planes. Every coefficient is a least-squares fit to the
 //! model, and the operators' lattices are chosen by the engine's precision moves alone.
 //!
-//! Needs the export at `MPD_P31_EXPORT` (default `~/mpd-data/engine/p31_s0_generic`); run with
-//! `cargo test --release -p gam-mpd --test modadd_oracle_2951 -- --ignored --nocapture` (it runs the
-//! engine at two `n` and takes tens of minutes; a per-test timeout below that kills it).
+//! `mpd_modadd_oracle_2951 EXPORT_DIR` (the p31 export `gam_mpd::import` reads, e.g.
+//! `~/mpd-data/engine/p31_s0_generic`). At `n = 10³` and `10⁶` it scores the native program, the
+//! oracle and the engine's blind result, and fails unless the engine's total is within the stated
+//! gap of the oracle's and, at `10⁶`, shorter than the native program with no argmax error.
 
 use gam_mpd::contract::{Contract, ProgramScore};
 use gam_mpd::dense::svd;
@@ -27,13 +28,6 @@ use std::path::PathBuf;
 
 const P: usize = 31;
 const FREQUENCIES: [usize; 5] = [5, 7, 8, 10, 14];
-
-fn export_dir() -> Option<PathBuf> {
-    let dir = std::env::var_os("MPD_P31_EXPORT")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("mpd-data/engine/p31_s0_generic")))?;
-    dir.join("export.json").exists().then_some(dir)
-}
 
 fn fine() -> DeclaredPrecision {
     DeclaredPrecision::new(40).expect("a precision")
@@ -227,33 +221,30 @@ fn line(label: &str, score: &ProgramScore) {
 
 /// The engine, run blind on the model, reaches the hand-written mechanism's code length within
 /// the stated gap, and at large `n` is shorter than the native program with no argmax error.
-#[test]
-#[ignore = "needs the p31 export"]
-fn the_engine_reaches_the_hand_written_mechanism() {
-    let Some(dir) = export_dir() else {
-        eprintln!("no p31 export; skipped");
-        return;
-    };
-    let imported = import(&dir).expect("imports");
+fn main() -> Result<(), String> {
+    let dir = PathBuf::from(std::env::args().nth(1).ok_or("mpd_modadd_oracle_2951 EXPORT_DIR")?);
+    let imported = import(&dir)?;
     // The stated gap: the engine's total may exceed the oracle's by at most this fraction.
     const GAP: f64 = 0.1;
     for n in [1_000u64, 1_000_000] {
         let mut contract = imported.contract.clone();
         contract.observations = n;
         let model = &imported.program;
-        let reference = contract.logits(model).expect("reference");
-        let native = contract.score(model, &reference).expect("native");
+        let reference = contract.logits(model).map_err(|e| e.to_string())?;
+        let native = contract.score(model, &reference).map_err(|e| e.to_string())?;
         let mechanism = oracle(model, &contract);
-        let target = contract.score(&mechanism, &reference).expect("oracle");
-        let result = decompose(model, &contract, &library(), &Budget::default()).expect("decomposes");
+        let target = contract.score(&mechanism, &reference).map_err(|e| e.to_string())?;
+        let result = decompose(model, &contract, &library(), &Budget::default()).map_err(|e| e.to_string())?;
         eprintln!("n = {n}");
         line("  native", &native);
         line("  oracle", &target);
         line("  engine", &result.score);
-        assert!(result.score.total() <= (1.0 + GAP) * target.total(), "n = {n}: engine {} against oracle {}", result.score.total(), target.total());
-        if n >= 1_000_000 {
-            assert!(!native.proven_shorter_than(&result.score) && result.score.total() < native.total());
-            assert_eq!(result.score.evaluation.argmax_disagreements, 0);
+        if result.score.total() > (1.0 + GAP) * target.total() {
+            return Err(format!("n = {n}: engine {} against oracle {}", result.score.total(), target.total()));
+        }
+        if n >= 1_000_000 && (native.proven_shorter_than(&result.score) || result.score.evaluation.argmax_disagreements > 0) {
+            return Err(format!("n = {n}: engine {} against native {} with {} argmax errors", result.score.total(), native.total(), result.score.evaluation.argmax_disagreements));
         }
     }
+    Ok(())
 }
