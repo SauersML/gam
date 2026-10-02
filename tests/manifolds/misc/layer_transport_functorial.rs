@@ -5,7 +5,7 @@
 //! composition law on consistent triples, and a failing one on a planted
 //! inconsistent triple — with rotation-gauge invariance of the verdict.
 
-use gam::inference::layer_transport::{
+use gam::terms::sae::inference::layer_transport::{
     ChartTopology, PairLaw, composition_defect, fit_transport_map, transport_ladder,
 };
 use ndarray::Array1;

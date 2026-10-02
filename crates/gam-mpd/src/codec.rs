@@ -7,7 +7,7 @@
 //! audit (fr-census, issue comment 5716123817) separates exact code lengths (its
 //! row S17) from Gaussian-surrogate and small-cell figures (row S16). The lengths
 //! returned here are of the first kind. They are `u64` bit counts, never
-//! [`gam_sae::description_length::ScoredBits`], so they cannot be subtracted from a
+//! the SAE engine's `description_length::ScoredBits`, so they cannot be subtracted from a
 //! surrogate figure.
 //!
 //! # Per-input versus global cost (P18)
@@ -1046,7 +1046,7 @@ impl CardinalityCode for PaddedPacketCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam_sae::description_length::selection_bits;
+    use gam_math::special::log2_binomial_coefficient;
     use crate::precision::{
         DecodableArtifact, DecodedFidelity, FidelityVerdict, PeriodicQuotient, QuotientCode,
         decode_then_evaluate,
@@ -1350,13 +1350,13 @@ mod tests {
         let length = subset_code_len_bits(universe, cardinality).expect("length");
         assert_eq!(out.len_bits(), length);
         assert_eq!(decode_support_packet(universe, &out), Ok(elements));
-        // The rank field is ⌈log₂ C(n, k)⌉, checked against description_length's
+        // The rank field is ⌈log₂ C(n, k)⌉, checked against gam-math's
         // real-valued log₂ C(G, k), a sum of k terms log₂((G − k + i)/i). A rounded
         // quotient moves its log by at most ε/ln 2, and the log's own rounding adds at
         // most ε·|term|. The running sum adds at most k·ε·(total bits). Together that is
         // at most 2·k·ε·(bits + 1), and the band is twice that.
         let rank_width = length - prefix_integer_len_bits(cardinality as u64 + 1).expect("length");
-        let real_bits = selection_bits(universe as i64, cardinality as i64);
+        let real_bits = log2_binomial_coefficient(universe as i64, cardinality as i64);
         let band = 4.0 * cardinality as f64 * f64::EPSILON * (real_bits + 1.0);
         assert!(
             rank_width as f64 >= real_bits - band && (rank_width as f64) - 1.0 < real_bits + band,

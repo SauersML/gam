@@ -17,6 +17,7 @@ gam-runtime = { path = "../gam-runtime", version = "=0.3.157" }
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 
 [dev-dependencies]
+gam-workspace-hack = { path = "../gam-workspace-hack" }
 # `fd_checker`'s self-tests compare stencils against closed forms.
 approx = "0.5.1"
 

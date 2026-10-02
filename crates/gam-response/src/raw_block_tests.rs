@@ -5,7 +5,7 @@
 //! is refused with its typed error.
 
 use super::{TorchLayoutError, UnabsorbedBlock, UnabsorbedGatedBlock};
-use crate::response::context::{ContextBlocks, ContextDeclaredLaw};
+use crate::context::{ContextBlocks, ContextDeclaredLaw};
 use gam_math::gaussian_activation::{GaussianActivation, GaussianActivationError};
 use gam_math::gaussian_gated::silu_derivatives;
 use ndarray::{Array1, Array2, ArrayD, array};

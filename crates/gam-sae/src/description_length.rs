@@ -122,21 +122,6 @@ pub(crate) fn scalar_rate_bits(signal_var: f64, delta2: f64) -> f64 {
     (0.5 * (signal_var / delta2).log2()).max(0.0)
 }
 
-/// `log₂ C(G, k)`: bits to name which `k` of `G` dictionary atoms fired. Computed
-/// as `Σ_{i=1..k} log₂((G−k+i)/i)` so it never overflows a binomial (exact, and
-/// `k` is small in practice). Zero when `G ≤ 0` or `k ≤ 0`; `k` is capped at `G`.
-pub fn selection_bits(g_dict: i64, k_active: i64) -> f64 {
-    if g_dict <= 0 || k_active <= 0 {
-        return 0.0;
-    }
-    let k = k_active.min(g_dict);
-    let mut bits = 0.0;
-    for i in 1..=k {
-        bits += ((g_dict - k + i) as f64 / i as f64).log2();
-    }
-    bits
-}
-
 fn exact_weighted_water_level(breakpoints: &mut Vec<(f64, f64)>, total_distortion: f64) -> f64 {
     breakpoints.sort_by(|(left, _), (right, _)| left.total_cmp(right));
     let mut saturated_distortion = 0.0_f64;

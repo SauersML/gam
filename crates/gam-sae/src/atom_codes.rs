@@ -48,6 +48,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::f64::consts::{LN_2, PI};
 
+use gam_math::special::log2_binomial_coefficient;
 use statrs::function::gamma::ln_gamma;
 
 /// Minimal bit-vector. Backing storage is `Vec<u64>` words.
@@ -791,7 +792,9 @@ pub(crate) fn combinatorial_support_bits(g: usize, cardinality_counts: &[usize])
         .iter()
         .enumerate()
         .filter(|entry| *entry.1 > 0)
-        .map(|(cardinality, &count)| count as f64 * log2_binom(g as i64, cardinality as i64))
+        .map(|(cardinality, &count)| {
+            count as f64 * log2_binomial_coefficient(g as i64, cardinality as i64)
+        })
         .sum();
     (g as f64 + 1.0).log2() + subset_bits / rows as f64
 }
@@ -833,23 +836,6 @@ fn mutual_information_bits(n: u64, n_u: u64, n_v: u64, n_uv: u64) -> f64 {
         + cell(c00, determinant, n - n_u, n - n_v);
     let bits = nats / (n as f64 * LN_2);
     if bits > 0.0 { bits } else { 0.0 }
-}
-
-/// `log₂ C(g, k)`: bits to name which `k` of `g` atoms fired under the uniform
-/// support prior. Computed as `Σ_{i=1..k} log₂((g−k+i)/i)` so it never overflows
-/// a binomial. Zero when `g ≤ 0` or `k ≤ 0`; `k` is capped at `g`. (The same
-/// combinatorial bound [`crate::description_length::selection_bits`] reports; kept
-/// local so the support-entropy estimator stays self-contained.)
-fn log2_binom(g: i64, k: i64) -> f64 {
-    if g <= 0 || k <= 0 {
-        return 0.0;
-    }
-    let k = k.min(g);
-    let mut bits = 0.0;
-    for i in 1..=k {
-        bits += ((g - k + i) as f64 / i as f64).log2();
-    }
-    bits
 }
 
 /// Pairwise co-activation summary for two atoms (see

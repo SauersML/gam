@@ -16,5 +16,8 @@ libm = "0.2.16"
 statrs = "0.19.0"
 wide = "1.5"
 
+[dev-dependencies]
+gam-workspace-hack = { path = "../gam-workspace-hack" }
+
 [lints.rust]
 warnings = "deny"

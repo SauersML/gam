@@ -6,6 +6,9 @@ rust-version = "1.97"
 description = "Canonical multi-front-end parsing and normalization for gam FitConfig"
 license = "AGPL-3.0-or-later"
 
+[dev-dependencies]
+gam-workspace-hack = { path = "../gam-workspace-hack" }
+
 [lints.rust]
 warnings = "deny"
 

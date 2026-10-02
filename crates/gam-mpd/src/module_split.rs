@@ -88,7 +88,7 @@ use super::state::{
     ObservabilityLetter, SpectralNormBounds, StateError, entrywise_band_norm, orthonormality_defect, reserve, spectral_norm_bounds,
 };
 use super::supports::{EvidenceStatus, EvidenceStatusError, ExactBasis, Extremum};
-use gam_sae::response::interaction::connected_components;
+use gam_response::interaction::connected_components;
 
 /// What a module-split status ranges over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

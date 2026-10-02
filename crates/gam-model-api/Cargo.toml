@@ -6,6 +6,9 @@ description = "Model and custom-family trait API and contracts for the gam penal
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/SauersML/gam"
 
+[dev-dependencies]
+gam-workspace-hack = { path = "../gam-workspace-hack" }
+
 [lints.rust]
 warnings = "deny"
 

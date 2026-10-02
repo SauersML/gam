@@ -344,7 +344,7 @@ def test_steer_dosimetry_against_analytic_kl(
     """Endpoint output-Fisher dose ≈ analytic KL for a small steer move.
 
     The steering FFI (``ManifoldSAE.steer`` → ``gam-pyffi::sae_steer_delta`` →
-    ``gam::inference::steering::steer_delta``) drives the planted atom a small
+    ``gam::terms::sae::inference::steering::steer_delta``) drives the planted atom a small
     latent step along the recovered circle and returns the SteerPlan dosimetry:
 
     1. Pick the planted atom (k=0) and two nearby on-manifold coordinates

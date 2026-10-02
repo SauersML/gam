@@ -1421,7 +1421,7 @@ fn sae_manifold_certify_external<'py>(
 }
 
 /// Compute a steering plan with output dosimetry for a fitted SAE-manifold atom
-/// ([`gam::inference::steering::steer_delta`]).
+/// ([`gam::terms::sae::inference::steering::steer_delta`]).
 ///
 /// This is the FFI surface for the steering primitive: it rebuilds the fitted
 /// [`gam::terms::sae::manifold::SaeManifoldTerm`] from the trained decoder blocks
@@ -1430,7 +1430,7 @@ fn sae_manifold_certify_external<'py>(
 /// per-row output-Fisher metric ([`gam::inference::row_metric::RowMetric::output_fisher`])
 /// from `fisher_factors` (the same shard the fit used), and calls `steer_delta`
 /// to drive atom `atom_k` from `t_from` to `t_to`. It returns the
-/// [`gam::inference::steering::SteerPlan`] fields as a dict: the activation-space
+/// [`gam::terms::sae::inference::steering::SteerPlan`] fields as a dict: the activation-space
 /// `delta`, the endpoint `predicted_nats` dose, the `off_manifold_norm`
 /// self-check, and the `metric_provenance`.
 ///
@@ -1478,7 +1478,7 @@ fn steer_delta_from_arrays(
     fisher_mass_residual: Option<ndarray::ArrayView1<'_, f64>>,
     fisher_provenance: Option<&str>,
     fisher_factor_kind: Option<&str>,
-) -> PyResult<gam::inference::steering::SteerPlan> {
+) -> PyResult<gam::terms::sae::inference::steering::SteerPlan> {
     let fisher_metric = match fisher_factors {
         Some(u3) => {
             let request = SaeFisherRowMetricRequest::from_tag(
@@ -1534,7 +1534,7 @@ fn steer_delta_with_metric_from_arrays(
     alpha: f64,
     threshold_gate_threshold: f64,
     fisher_metric: Option<gam::inference::row_metric::RowMetric>,
-) -> PyResult<gam::inference::steering::SteerPlan> {
+) -> PyResult<gam::terms::sae::inference::steering::SteerPlan> {
     // Assignment tokens are strict: compatibility aliases are rejected.
     let assignment_kind = canonicalize_assignment_kind(assignment_kind).map_err(py_value_error)?;
     let k_atoms = geometry_plans.len();
@@ -1680,8 +1680,8 @@ impl ManifoldSteerToTargetRequest {
 
 fn steer_to_target_from_arrays(
     request: SteerToTargetArraysRequest<'_>,
-    probe: Option<&mut gam::inference::steering::AppliedDoseProbe<'_>>,
-) -> PyResult<gam::inference::steering::TargetDosePlan> {
+    probe: Option<&mut gam::terms::sae::inference::steering::AppliedDoseProbe<'_>>,
+) -> PyResult<gam::terms::sae::inference::steering::TargetDosePlan> {
     let SteerToTargetArraysRequest {
         atom_k,
         metric_row,
@@ -1747,12 +1747,12 @@ fn steer_to_target_from_arrays(
         .map_err(py_value_error)
 }
 
-/// Render a [`gam::inference::steering::TargetDosePlan`] as a Python dict.
+/// Render a [`gam::terms::sae::inference::steering::TargetDosePlan`] as a Python dict.
 fn target_dose_plan_to_pydict(
     py: Python<'_>,
-    plan: gam::inference::steering::TargetDosePlan,
+    plan: gam::terms::sae::inference::steering::TargetDosePlan,
 ) -> PyResult<Py<PyDict>> {
-    let gam::inference::steering::TargetDosePlan {
+    let gam::terms::sae::inference::steering::TargetDosePlan {
         target_nats,
         seed_displacement,
         displacement,
@@ -1797,11 +1797,11 @@ fn target_dose_plan_to_pydict(
     Ok(out)
 }
 
-/// Render a [`gam::inference::steering::SteerPlan`] as the Python dict both steer
+/// Render a [`gam::terms::sae::inference::steering::SteerPlan`] as the Python dict both steer
 /// callers return (the `sae_steer_delta` pyfunction and `ManifoldSaeCore::steer`).
 fn steer_plan_to_pydict(
     py: Python<'_>,
-    plan: gam::inference::steering::SteerPlan,
+    plan: gam::terms::sae::inference::steering::SteerPlan,
 ) -> PyResult<Py<PyDict>> {
     let provenance_str = gam::terms::sae::manifold::metric_provenance_label(plan.metric_provenance);
     let out = PyDict::new(py);
@@ -1832,7 +1832,7 @@ fn steer_plan_to_pydict(
 /// trained decoder blocks + basis metadata, seeds it with the trained latents /
 /// logits (no re-solve), optionally installs the WP-D output-Fisher metric from
 /// `fisher_factors`, and drives atom `atom_k` from `t_from` to `t_to`, returning
-/// the [`gam::inference::steering::SteerPlan`] as a dict. Thin marshalling over
+/// the [`gam::terms::sae::inference::steering::SteerPlan`] as a dict. Thin marshalling over
 /// the shared [`steer_delta_from_arrays`] rebuild (#2091).
 #[pyfunction(signature = (
     atom_k,

@@ -6,6 +6,9 @@ description = "Design identifiability auditing and rank reduction for the gam pe
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/SauersML/gam"
 
+[dev-dependencies]
+gam-workspace-hack = { path = "../gam-workspace-hack" }
+
 [lints.rust]
 warnings = "deny"
 

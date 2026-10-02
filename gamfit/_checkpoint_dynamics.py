@@ -1,6 +1,6 @@
 """Cross-checkpoint descriptive SAE atom-trajectory dynamics (issue #1102).
 
-Thin wrapper over the Rust core ``gam::inference::checkpoint_dynamics``: all math
+Thin wrapper over the Rust core ``gam::terms::sae::inference::checkpoint_dynamics``: all math
 (per-step descriptive decoder change) lives in Rust; this module only marshals
 numpy arrays across the FFI boundary.
 

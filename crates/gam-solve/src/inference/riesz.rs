@@ -1,7 +1,7 @@
 use faer::Side;
 use gam_linalg::faer_ndarray::FaerCholesky;
-use gam_solve::model_types::EstimationError;
-use gam_solve::sensitivity::FitSensitivity;
+use crate::model_types::EstimationError;
+use crate::sensitivity::FitSensitivity;
 use ndarray::{Array1, ArrayView1, ArrayView2};
 
 /// Closed-form Riesz representer for a linear functional of a fitted smooth.

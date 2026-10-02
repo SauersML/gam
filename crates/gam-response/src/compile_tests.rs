@@ -11,7 +11,7 @@ use super::{
     CompileAction, CompileDesign, CompiledResponse, FunctionRepresentation, compile_retained_response,
     enrichment_step, frame_parameter_count,
 };
-use crate::response::subspace::KnownBlock;
+use crate::subspace::KnownBlock;
 use faer::Side;
 use gam_linalg::faer_ndarray::FaerCholesky;
 use gam_linalg::roundoff::accumulation_growth;

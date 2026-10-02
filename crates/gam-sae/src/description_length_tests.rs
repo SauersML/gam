@@ -8,10 +8,11 @@ use super::{
     ScoreComparison, ScoredBits, atom_occupancy, birth_proposal_priority, circle_phase_code,
     circle_phase_code_at, description_length_delta, manifold_fit_description_length, matched_dl,
     matched_dl_delta, native_manifold_description_length, persisted_decoder_dictionary_code,
-    reverse_water_filling, scalar_rate_bits, se_resolution_bits, selection_bits,
+    reverse_water_filling, scalar_rate_bits, se_resolution_bits,
     weighted_reverse_water_filling,
 };
 use crate::atom_codes::SparseAtomCodes;
+use gam_math::special::log2_binomial_coefficient;
 use crate::native_code_source::NativeGateModel;
 use crate::manifold::{
     SaeAtomBasisKind, SaeAtomGeometryPlan, SaeBasisResolution, SaeReferenceMetricPlan,
@@ -492,12 +493,12 @@ fn primitives_match_mdl_reference() {
     assert!(scalar_rate_bits(1.0, 0.0).is_infinite());
     assert!(close(scalar_rate_bits(0.0, 0.5), 0.0, 1e-12));
     // selection bits = log2 C(G, k)
-    assert!(close(selection_bits(4096, 1), 12.0, 1e-9));
-    assert!(close(selection_bits(32, 4), 15.13410540, 1e-6));
-    assert!(close(selection_bits(10, 0), 0.0, 1e-12));
-    assert!(close(selection_bits(0, 3), 0.0, 1e-12));
+    assert!(close(log2_binomial_coefficient(4096, 1), 12.0, 1e-9));
+    assert!(close(log2_binomial_coefficient(32, 4), 15.13410540, 1e-6));
+    assert!(close(log2_binomial_coefficient(10, 0), 0.0, 1e-12));
+    assert!(close(log2_binomial_coefficient(0, 3), 0.0, 1e-12));
     // k capped at G
-    assert!(close(selection_bits(4, 9), selection_bits(4, 4), 1e-12));
+    assert!(close(log2_binomial_coefficient(4, 9), log2_binomial_coefficient(4, 4), 1e-12));
 }
 
 #[test]

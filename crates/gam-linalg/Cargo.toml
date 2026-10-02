@@ -24,4 +24,5 @@ serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
 
 [dev-dependencies]
+gam-workspace-hack = { path = "../gam-workspace-hack" }
 proptest = "1.11.0"

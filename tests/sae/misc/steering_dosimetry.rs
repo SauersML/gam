@@ -1,5 +1,5 @@
 //! End-to-end check of the SAE-manifold **steering primitive with output
-//! dosimetry** (`gam::inference::steering::steer_delta`).
+//! dosimetry** (`gam::terms::sae::inference::steering::steer_delta`).
 //!
 //! # The planted oracle
 //!
@@ -38,7 +38,7 @@ use std::sync::Arc;
 use ndarray::{Array1, Array2};
 
 use gam::inference::row_metric::{MetricProvenance, RowMetric};
-use gam::inference::steering::{
+use gam::terms::sae::inference::steering::{
     AppliedDoseObservation, AppliedDoseProbe, SteerPlan, TargetDoseError, TargetDoseRequest,
     steer_delta, steer_to_target_nats,
 };

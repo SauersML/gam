@@ -1,6 +1,6 @@
 """Functorial inter-layer concept transport maps (issue #1013).
 
-Thin wrapper over the Rust core ``gam::inference::layer_transport``: all math
+Thin wrapper over the Rust core ``gam::terms::sae::inference::layer_transport``: all math
 (REML smoothing, winding-degree estimation, isometry defect, gauge-quotiented
 composition-law testing) lives in Rust; this module only marshals numpy arrays
 across the FFI boundary.

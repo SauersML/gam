@@ -45,6 +45,7 @@ thiserror = "2.0.18"
 cudarc.workspace = true
 
 [dev-dependencies]
+gam-workspace-hack = { path = "../gam-workspace-hack" }
 approx = "0.5.1"
 csv = "1.4.0"
 gam-inference = { path = "../gam-inference" }

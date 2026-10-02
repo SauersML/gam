@@ -37,6 +37,7 @@ wide = "1.5"
 cudarc.workspace = true
 
 [dev-dependencies]
+gam-workspace-hack = { path = "../gam-workspace-hack" }
 approx = "0.5.1"
 gam-linalg-test-support = { path = "../gam-linalg-test-support" }
 num-dual = "0.14.1"

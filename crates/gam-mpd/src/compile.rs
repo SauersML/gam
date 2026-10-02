@@ -94,7 +94,7 @@ use super::joint_operators::JointRefusal;
 use super::lift::{LiftError, TensorId, TensorRegistry};
 use super::secant::SecantError;
 use super::supports::{EvidenceStatus, EvidenceStatusError, ExactBasis};
-use gam_sae::inference::intervention_shard::{InterventionChange, ParameterEditScope};
+use gam_response::intervention_shard::{InterventionChange, ParameterEditScope};
 
 pub mod bilinear;
 pub mod chart;

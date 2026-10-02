@@ -22,7 +22,7 @@ use gam_models::inference::model::{FittedModel, PredictModelClass};
 use gam_models::inference::saved_summary::prediction_model_class_label;
 use gam_models::survival::predict::fit_result_from_saved_model_for_prediction;
 use gam_problem::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
-use gam_sae::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
+use gam_solve::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
 use gam_terms::smooth::{
     TermCollectionDesign, TermCollectionSpec, build_term_collection_derivative_design,
     build_term_collection_design, smooth_term_feature_cols,

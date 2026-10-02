@@ -41,7 +41,7 @@ use gam_linalg::utils::splitmix64_hash;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::inference::steering::SteerPlan;
+use crate::steer_plan::SteerPlan;
 use gam_math::probability::standard_normal_from_uniform_bits;
 use gam_linalg::faer_ndarray::FaerQr;
 use gam_linalg::roundoff::factor_rank_partition;
@@ -2667,7 +2667,7 @@ mod tests {
             metric_row: 9,
             delta: ndarray::Array1::from(delta.to_vec()),
             predicted_nats: None,
-            predicted_nats_kind: crate::inference::steering::FisherDoseKind::Unavailable,
+            predicted_nats_kind: crate::steer_plan::FisherDoseKind::Unavailable,
             fisher_mass_captured: None,
             fisher_mass_residual: None,
             fisher_mass_residual_fraction: None,

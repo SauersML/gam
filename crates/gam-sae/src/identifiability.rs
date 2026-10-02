@@ -86,7 +86,7 @@ pub use frame_curvature::{
     StreamedLambdaMax, TriangularRootAccumulator, streamed_lambda_max,
 };
 
-use crate::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
+use gam_solve::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
 use faer::Side;
 use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
 use gam_problem::{MetricProvenance, RowMetric};
@@ -935,7 +935,7 @@ pub struct FittedAtom {
 /// Gauss–Newton observation weight `w_i = a_ik²` (the assignment mass enters the
 /// channel linearly, so the normal-equation weight is its square), and
 /// dispersion the fitted reconstruction dispersion. That is an ordinary
-/// penalized WLS smooth — exactly what [`crate::inference::riesz`],
+/// penalized WLS smooth — exactly what [`gam_solve::inference::riesz`],
 /// [`gam_terms::inference::lawley`], and the κ-profile machinery consume. The
 /// channel `j` is the atom's dominant decoder output direction (largest column
 /// norm of `B_k`), i.e. the channel that carries the atom's signal.

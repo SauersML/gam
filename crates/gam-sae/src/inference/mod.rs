@@ -4,8 +4,9 @@
 //! These modules consume the SAE manifold term (`crate::manifold`,
 //! `crate::chart_canonicalization`) plus solver/terms/problem items reached as
 //! `gam_solve::*`, `gam_terms::*`, and `gam_problem::*`. They were hoisted out
-//! of the monolith's `gam::inference::*` namespace; the root crate keeps the
-//! old `gam::inference::{atom_lens, steering, ...}` paths valid via re-exports.
+//! of the monolith's `gam::inference::*` namespace and are reached as
+//! `gam::terms::sae::inference::*`: gam-inference does not depend on gam-sae,
+//! so an SAE edit never rebuilds gam-inference, gam-predict, or gam-models' tests.
 
 pub mod atlas_holonomy;
 pub mod atlas_nerve;
@@ -14,9 +15,8 @@ pub mod atom_shape_race;
 pub mod checkpoint_dynamics;
 pub mod contracts;
 pub mod cross_model_transport;
-pub mod intervention_shard;
+pub use gam_response::intervention_shard;
 pub mod layer_transport;
-pub mod riesz;
 pub mod sparse_audit;
 pub mod steering;
 pub mod transport_class;

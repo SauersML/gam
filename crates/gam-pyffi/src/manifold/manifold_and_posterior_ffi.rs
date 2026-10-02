@@ -4701,10 +4701,10 @@ impl ManifoldSaeCore {
         // The external model adapter receives the exact public plan and returns
         // the three inseparable quantities the Rust dose contract validates.
         let mut probe_boxed: Option<
-            Box<gam::inference::steering::AppliedDoseProbe<'_>>,
+            Box<gam::terms::sae::inference::steering::AppliedDoseProbe<'_>>,
         > = probe.map(|obj| {
-            let boxed: Box<gam::inference::steering::AppliedDoseProbe<'_>> =
-                Box::new(move |plan: &gam::inference::steering::SteerPlan| {
+            let boxed: Box<gam::terms::sae::inference::steering::AppliedDoseProbe<'_>> =
+                Box::new(move |plan: &gam::terms::sae::inference::steering::SteerPlan| {
                     Python::attach(|py| {
                         let plan_dict = steer_plan_to_pydict(py, plan.clone()).map_err(|error| {
                             format!("steer_to_target could not serialize probe plan: {error}")
@@ -4758,7 +4758,7 @@ impl ManifoldSaeCore {
                                          None: {error}"
                                     )
                                 })?;
-                        Ok(gam::inference::steering::AppliedDoseObservation {
+                        Ok(gam::terms::sae::inference::steering::AppliedDoseObservation {
                             effective_delta: Array1::from(effective_delta),
                             exact_directional_nats,
                             measured_nats,

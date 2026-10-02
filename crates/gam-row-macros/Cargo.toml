@@ -16,6 +16,7 @@ quote = "1.0.45"
 syn = { version = "3.0.3", features = ["full"] }
 
 [dev-dependencies]
+gam-workspace-hack = { path = "../gam-workspace-hack" }
 gam-math = { path = "../gam-math" }
 
 [lints.rust]

@@ -14,7 +14,7 @@
 //! Each test also shows a mutant failing the same bound, so the bound can fail.
 
 use super::*;
-use crate::response::subspace::{KnownBlock, pair_moments};
+use crate::subspace::{KnownBlock, pair_moments};
 use gam_linalg::roundoff::accumulation_growth as gamma;
 use gam_math::gaussian_activation::{
     GaussianActivation, GaussianActivationError, PreactivationPair, gaussian_hermite_coefficients,

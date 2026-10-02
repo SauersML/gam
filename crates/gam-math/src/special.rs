@@ -7,6 +7,22 @@
 use crate::double_double::{DoubleDouble, accurate_sum, push_product_parts};
 use crate::roundoff::{UNIT_ROUNDOFF, accumulation_growth, inflated};
 
+/// `log₂ C(n, k)`: the bits that name which `k` of `n` items were chosen under a
+/// uniform prior over supports. Summed as `Σ_{i=1..k} log₂((n−k+i)/i)`, so it never
+/// forms the binomial and never overflows. Zero when `n ≤ 0` or `k ≤ 0`; `k` is
+/// capped at `n`.
+pub fn log2_binomial_coefficient(n: i64, k: i64) -> f64 {
+    if n <= 0 || k <= 0 {
+        return 0.0;
+    }
+    let k = k.min(n);
+    let mut bits = 0.0;
+    for i in 1..=k {
+        bits += ((n - k + i) as f64 / i as f64).log2();
+    }
+    bits
+}
+
 /// Numerically stable `C(n,k) = n! / (k!·(n−k)!)` as `f64`.  Uses the
 /// symmetry `C(n,k) = C(n, n−k)` to keep the loop count `min(k, n−k)`
 /// and the multiplicative recurrence `C(n,j+1) = C(n,j)·(n−j)/(j+1)`,

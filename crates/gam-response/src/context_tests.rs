@@ -8,8 +8,8 @@
 //! shows it rejects.
 
 use super::{ContextAccess, ContextBlocks, ContextDeclaredLaw, ContextLaw, ContextResponseError};
-use crate::response::raw_block::UnabsorbedBlock;
-use crate::response::subspace::KnownBlock;
+use crate::raw_block::UnabsorbedBlock;
+use crate::subspace::KnownBlock;
 use gam_linalg::roundoff::accumulation_growth;
 use gam_math::gaussian_activation::GaussianActivation;
 use gam_math::probability::standard_normal_quantile;

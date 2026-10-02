@@ -129,6 +129,7 @@ cudarc.workspace = true
 workspace = true
 
 [dev-dependencies]
+gam-workspace-hack = { path = "crates/gam-workspace-hack" }
 num-dual = "0.14.1"
 autodiff = "0.7.0"
 ad_trait = "0.3.0"

@@ -47,3 +47,10 @@ pub mod pg_gate_evidence;
 /// monolith crate root re-exports it so `gam::inference::pg_moments` resolves
 /// unchanged.
 pub mod pg_moments;
+
+/// Closed-form Riesz representers and one-step debiasing for linear functionals
+/// of a fitted smooth. Descended from `gam_sae::inference::riesz`: it depends
+/// only on `gam-linalg` plus gam-solve's `model_types`/`sensitivity`, and
+/// holding it in gam-sae made `gam-inference` (and so gam-predict, gam-config,
+/// and gam-models' test targets) rebuild on every gam-sae edit.
+pub mod riesz;

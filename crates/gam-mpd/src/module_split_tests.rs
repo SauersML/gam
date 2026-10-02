@@ -9,7 +9,7 @@ use crate::test_support::planted_toys::{
     random_mlp, rotation_toy,
 };
 use crate::test_support::test_governor;
-use gam_sae::response::interaction::connected_components;
+use gam_response::interaction::connected_components;
 use ndarray::{Array1, Array2, Axis, array, concatenate, s};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;

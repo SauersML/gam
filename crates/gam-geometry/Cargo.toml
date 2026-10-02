@@ -7,6 +7,9 @@ description = "Riemannian-manifold geometry (charts, exp/log maps, Fréchet mean
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/SauersML/gam"
 
+[dev-dependencies]
+gam-workspace-hack = { path = "../gam-workspace-hack" }
+
 [lints.rust]
 warnings = "deny"
 

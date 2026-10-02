@@ -28,7 +28,7 @@
 //! This is a correspondence between two decoder images, not the network's
 //! transport, which runs the block between the layers. Two layers that decode the
 //! same circle correspond by the identity whatever that block does, even when it
-//! rotates the circle. [`crate::response::executed_transport`] measures the
+//! rotates the circle. [`crate::executed_transport`] measures the
 //! executed transport `τ(t; c) = E_{ℓ+1}(T_ℓ(c + D_ℓ(t)) − T_ℓ(c))` next to this
 //! correspondence, and pins that planted rotation as its positive control.
 //!

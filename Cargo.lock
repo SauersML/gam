@@ -3560,6 +3560,7 @@ dependencies = [
  "gam-spec",
  "gam-terms",
  "gam-test-support",
+ "gam-workspace-hack",
  "general-mcmc",
  "libc",
  "libm",
@@ -3580,6 +3581,9 @@ dependencies = [
 [[package]]
 name = "gam-build-identity"
 version = "0.3.157"
+dependencies = [
+ "gam-workspace-hack",
+]
 
 [[package]]
 name = "gam-cli"
@@ -3597,6 +3601,7 @@ dependencies = [
  "gam-runtime",
  "gam-sae",
  "gam-test-support",
+ "gam-workspace-hack",
  "log",
  "ndarray 0.17.2",
  "npyz 0.9.1",
@@ -3619,6 +3624,7 @@ dependencies = [
  "gam-models",
  "gam-problem",
  "gam-solve",
+ "gam-workspace-hack",
  "ndarray 0.17.2",
  "serde",
  "serde_json",
@@ -3638,6 +3644,7 @@ dependencies = [
  "gam-solve",
  "gam-spec",
  "gam-terms",
+ "gam-workspace-hack",
  "log",
  "ndarray 0.17.2",
  "opt",
@@ -3652,6 +3659,7 @@ dependencies = [
  "csv",
  "gam-runtime",
  "gam-spec",
+ "gam-workspace-hack",
  "log",
  "ndarray 0.17.2",
  "parquet",
@@ -3674,6 +3682,7 @@ dependencies = [
  "gam-runtime",
  "gam-solve",
  "gam-terms",
+ "gam-workspace-hack",
  "log",
  "ndarray 0.17.2",
  "opt",
@@ -3692,6 +3701,7 @@ dependencies = [
  "faer",
  "gam-linalg",
  "gam-math",
+ "gam-workspace-hack",
  "libm",
  "ndarray 0.17.2",
  "opt",
@@ -3707,6 +3717,7 @@ dependencies = [
  "gam-linalg",
  "gam-problem",
  "gam-runtime",
+ "gam-workspace-hack",
  "libloading 0.9.0",
  "libm",
  "log",
@@ -3732,6 +3743,7 @@ dependencies = [
  "gam-math",
  "gam-problem",
  "gam-runtime",
+ "gam-workspace-hack",
  "log",
  "ndarray 0.17.2",
  "rayon",
@@ -3753,9 +3765,9 @@ dependencies = [
  "gam-models",
  "gam-problem",
  "gam-runtime",
- "gam-sae",
  "gam-solve",
  "gam-terms",
+ "gam-workspace-hack",
  "general-mcmc",
  "libm",
  "log",
@@ -3776,6 +3788,7 @@ dependencies = [
  "faer",
  "gam-math",
  "gam-runtime",
+ "gam-workspace-hack",
  "log",
  "ndarray 0.17.2",
  "proptest",
@@ -3794,6 +3807,7 @@ dependencies = [
  "faer",
  "gam-linalg",
  "gam-runtime",
+ "gam-workspace-hack",
  "ndarray 0.17.2",
 ]
 
@@ -3802,6 +3816,7 @@ name = "gam-math"
 version = "0.3.157"
 dependencies = [
  "bumpalo",
+ "gam-workspace-hack",
  "libm",
  "statrs 0.19.0",
  "wide 1.5.0",
@@ -3814,6 +3829,7 @@ dependencies = [
  "gam-linalg",
  "gam-problem",
  "gam-runtime",
+ "gam-workspace-hack",
  "ndarray 0.17.2",
  "rayon",
  "serde",
@@ -3831,6 +3847,7 @@ dependencies = [
  "gam-runtime",
  "gam-solve",
  "gam-spec",
+ "gam-workspace-hack",
  "libm",
  "ndarray 0.17.2",
  "opt",
@@ -3866,6 +3883,7 @@ dependencies = [
  "gam-spec",
  "gam-terms",
  "gam-test-support",
+ "gam-workspace-hack",
  "libm",
  "log",
  "ndarray 0.17.2",
@@ -3888,12 +3906,14 @@ version = "0.3.157"
 dependencies = [
  "faer",
  "gam-geometry",
+ "gam-gpu",
  "gam-linalg",
  "gam-math",
+ "gam-response",
  "gam-runtime",
- "gam-sae",
  "gam-solve",
  "gam-terms",
+ "gam-workspace-hack",
  "log",
  "memmap2",
  "ndarray 0.17.2",
@@ -3925,6 +3945,7 @@ dependencies = [
  "gam-spec",
  "gam-terms",
  "gam-test-support",
+ "gam-workspace-hack",
  "log",
  "ndarray 0.17.2",
  "rand 0.10.2",
@@ -3943,6 +3964,7 @@ dependencies = [
  "gam-linalg",
  "gam-runtime",
  "gam-spec",
+ "gam-workspace-hack",
  "ndarray 0.17.2",
  "opt",
  "rayon",
@@ -3964,6 +3986,7 @@ dependencies = [
  "gam-model-api",
  "gam-predict",
  "gam-runtime",
+ "gam-workspace-hack",
  "log",
  "ndarray 0.17.2",
  "numpy",
@@ -3979,7 +4002,25 @@ dependencies = [
 name = "gam-report"
 version = "0.3.157"
 dependencies = [
+ "gam-workspace-hack",
  "serde_json",
+]
+
+[[package]]
+name = "gam-response"
+version = "0.3.157"
+dependencies = [
+ "faer",
+ "gam-linalg",
+ "gam-math",
+ "gam-problem",
+ "gam-runtime",
+ "gam-solve",
+ "gam-terms",
+ "gam-workspace-hack",
+ "ndarray 0.17.2",
+ "rand 0.10.2",
+ "rayon",
 ]
 
 [[package]]
@@ -3987,6 +4028,7 @@ name = "gam-row-macros"
 version = "0.3.157"
 dependencies = [
  "gam-math",
+ "gam-workspace-hack",
  "proc-macro2",
  "quote",
  "syn 3.0.3",
@@ -3996,6 +4038,7 @@ dependencies = [
 name = "gam-runtime"
 version = "0.3.157"
 dependencies = [
+ "gam-workspace-hack",
  "libc",
  "log",
  "ndarray 0.17.2",
@@ -4023,9 +4066,11 @@ dependencies = [
  "gam-linalg-test-support",
  "gam-math",
  "gam-problem",
+ "gam-response",
  "gam-runtime",
  "gam-solve",
  "gam-terms",
+ "gam-workspace-hack",
  "log",
  "memmap2",
  "ndarray 0.17.2",
@@ -4056,6 +4101,7 @@ dependencies = [
  "gam-runtime",
  "gam-spec",
  "gam-terms",
+ "gam-workspace-hack",
  "log",
  "ndarray 0.17.2",
  "num-dual",
@@ -4073,6 +4119,7 @@ dependencies = [
 name = "gam-spec"
 version = "0.3.157"
 dependencies = [
+ "gam-workspace-hack",
  "ndarray 0.17.2",
  "serde",
  "serde_json",
@@ -4094,6 +4141,7 @@ dependencies = [
  "gam-problem",
  "gam-runtime",
  "gam-spec",
+ "gam-workspace-hack",
  "log",
  "memmap2",
  "ndarray 0.17.2",
@@ -4124,10 +4172,66 @@ dependencies = [
  "gam-problem",
  "gam-runtime",
  "gam-terms",
+ "gam-workspace-hack",
  "ndarray 0.17.2",
  "npyz 0.9.1",
  "rand 0.10.2",
  "statrs 0.19.0",
+]
+
+[[package]]
+name = "gam-workspace-hack"
+version = "0.3.157"
+dependencies = [
+ "anstream",
+ "approx",
+ "bitflags 2.13.1",
+ "bytemuck",
+ "crossbeam-channel",
+ "either",
+ "fastrand",
+ "foldhash 0.2.0",
+ "getrandom 0.3.4",
+ "getrandom 0.4.3",
+ "half",
+ "itertools 0.13.0",
+ "log",
+ "matrixmultiply",
+ "memchr",
+ "nalgebra 0.35.0",
+ "ndarray 0.17.2",
+ "npyz 0.9.1",
+ "num-bigint",
+ "num-complex",
+ "num-integer",
+ "num-traits",
+ "once_cell",
+ "parking_lot",
+ "portable-atomic",
+ "proc-macro2",
+ "pulp",
+ "qd",
+ "quote",
+ "rand 0.10.2",
+ "rand 0.8.7",
+ "rand_core 0.6.4",
+ "rand_distr 0.6.0",
+ "regex-syntax",
+ "rustix",
+ "serde",
+ "serde_core",
+ "serde_json",
+ "simba 0.10.0",
+ "simba 0.9.1",
+ "smallvec",
+ "spin",
+ "syn 2.0.119",
+ "syn 3.0.3",
+ "thiserror 2.0.19",
+ "toml_parser",
+ "typenum",
+ "wide 1.5.0",
+ "zerocopy",
 ]
 
 [[package]]
@@ -6360,18 +6464,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "objc2-core-graphics"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e022c9d066895efa1345f8e33e584b9f958da2fd4cd116792e15e07e4720a807"
-dependencies = [
- "dispatch2",
- "objc2",
- "objc2-core-foundation",
- "objc2-io-surface",
-]
-
-[[package]]
 name = "objc2-encode"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6399,17 +6491,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "objc2-io-surface"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "180788110936d59bab6bd83b6060ffdfffb3b922ba1396b312ae795e1de9d81d"
-dependencies = [
- "bitflags 2.13.1",
- "objc2",
- "objc2-core-foundation",
-]
-
-[[package]]
 name = "objc2-metal"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6430,10 +6511,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46a10f15ff4e2045f947ffca8a17fc351b155c321de16f04278a008a1f446784"
 dependencies = [
  "bitflags 2.13.1",
- "block2",
  "objc2",
- "objc2-core-foundation",
- "objc2-core-graphics",
  "objc2-foundation",
  "objc2-metal",
 ]

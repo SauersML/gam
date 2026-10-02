@@ -24,6 +24,7 @@ thiserror = "2.0.18"
 libc = "0.2"
 
 [dev-dependencies]
+gam-workspace-hack = { path = "../gam-workspace-hack" }
 tempfile = "3.27.0"
 
 [lints.rust]

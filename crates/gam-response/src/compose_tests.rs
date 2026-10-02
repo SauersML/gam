@@ -13,7 +13,7 @@ use super::{
     ResidualStackError, compose_affine_stage, enlarged_frame, gaussian_closure_response, quadratic_readout,
     relu_two_moment_bound, residual_block_energies, residual_stack_response,
 };
-use crate::response::subspace::{KnownBlock, smoothing};
+use crate::subspace::{KnownBlock, smoothing};
 use gam_math::gaussian_activation::GaussianActivation;
 use gam_linalg::roundoff::accumulation_growth;
 use gam_linalg::utils::splitmix64;

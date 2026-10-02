@@ -9,7 +9,7 @@
 //! or fails.
 
 use super::{CoordinateFormation, CovarianceFormation, KnownBlock, covariance_rounding_band};
-use crate::response::reader_gram::upper_tile_rows;
+use crate::reader_gram::upper_tile_rows;
 use gam_linalg::roundoff::accumulation_growth;
 use gam_math::gaussian_activation::{GaussianActivation, PreactivationPair, pair_kernel};
 use ndarray::{Array1, Array2, array};

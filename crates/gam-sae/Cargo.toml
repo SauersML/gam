@@ -16,6 +16,7 @@ gam-linalg = { path = "../gam-linalg", version = "=0.3.157" }
 gam-math = { path = "../gam-math", version = "=0.3.157" }
 opt.workspace = true
 gam-problem = { path = "../gam-problem", version = "=0.3.157" }
+gam-response = { path = "../gam-response", version = "=0.3.157" }
 gam-runtime = { path = "../gam-runtime", version = "=0.3.157" }
 gam-solve = { path = "../gam-solve", version = "=0.3.157" }
 gam-terms = { path = "../gam-terms", version = "=0.3.157" }
@@ -32,6 +33,7 @@ statrs = "0.19.0"
 cudarc.workspace = true
 
 [dev-dependencies]
+gam-workspace-hack = { path = "../gam-workspace-hack" }
 approx = "0.5.1"
 gam-linalg-test-support = { path = "../gam-linalg-test-support" }
 qd = "0.8.0"

@@ -1,0 +1,99 @@
+[package]
+name = "gam-workspace-hack"
+version = "0.3.157"
+edition = "2024"
+description = "Pins every workspace build to the workspace-wide feature set of its shared dependencies"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/SauersML/gam"
+rust-version = "1.97"
+publish = false
+
+# Cargo resolves features per invocation: `cargo check -p gam-mpd --all-targets`
+# activated ~46 shared dependencies (serde, bytemuck, half, matrixmultiply,
+# num-traits, rand, syn, ...) with fewer features than `cargo check --workspace
+# --all-targets`. Their hashes differ, so every hash above them differs too, and
+# each `-p` scope rebuilt faer, gam-linalg ... gam-solve as a separate copy in the
+# same target dir (up to 7 gam_solve copies per warm build slot). Every member
+# lists this crate as a path-only dev-dependency (stripped by `cargo publish`),
+# so test, example and --all-targets builds of any single package resolve these
+# dependencies with the workspace's features and reuse the workspace's artifacts.
+#
+# Each entry is the dependency's feature set under `cargo tree --workspace -e
+# normal,dev,build`, listed only where some single-package scope resolved it
+# differently. Entries that also run on the host (proc-macro and build-script
+# dependencies) repeat under [build-dependencies]; build.rs exists so Cargo
+# resolves that table. A stale entry costs rebuilds, never correctness.
+
+[dependencies]
+anstream = { version = "1.0.0", features = ["auto", "wincon"] }
+approx = { version = "0.5.1", features = ["std"] }
+bitflags = { version = "2.13.1", default-features = false, features = ["serde", "serde_core", "std"] }
+bytemuck = { version = "1.25.2", default-features = false, features = ["aarch64_simd", "avx512_simd", "bytemuck_derive", "derive", "extern_crate_alloc", "min_const_generics", "wasm_simd"] }
+crossbeam-channel = { version = "0.5.16", features = ["std"] }
+either = { version = "1.17.0", default-features = false, features = ["std", "use_std"] }
+fastrand = { version = "2.5.0", features = ["alloc", "std"] }
+foldhash = { version = "0.2.0", default-features = false, features = ["std"] }
+getrandom-0-3 = { package = "getrandom", version = "0.3.4", default-features = false, features = ["std"] }
+getrandom-0-4 = { package = "getrandom", version = "0.4.3", default-features = false, features = ["std", "sys_rng"] }
+half = { version = "2.7.1", features = ["alloc", "bytemuck", "num-traits", "serde", "std"] }
+itertools = { version = "0.13.0", features = ["use_alloc", "use_std"] }
+log = { version = "0.4.33", default-features = false, features = ["std"] }
+matrixmultiply = { version = "0.3.11", features = ["avx512", "cgemm", "num_cpus", "once_cell", "std", "thread-tree", "threading"] }
+memchr = { version = "2.8.3", features = ["alloc", "std"] }
+nalgebra = { version = "0.35.0", features = ["macros", "matrixmultiply", "nalgebra-macros", "rand-no-std", "rand-package", "std"] }
+ndarray = { version = "0.17.2", features = ["rayon", "serde", "std"] }
+npyz = { version = "0.9.1", features = ["half"] }
+num-bigint = { version = "0.4.8", features = ["std"] }
+num-complex = { version = "0.4.6", features = ["bytemuck", "rand", "serde", "std"] }
+num-integer = { version = "0.1.46", features = ["i128", "std"] }
+num-traits = { version = "0.2.19", features = ["i128", "libm", "std"] }
+once_cell = { version = "1.21.4", features = ["alloc", "race", "std"] }
+parking_lot = { version = "0.12.5" }
+proc-macro2 = { version = "1.0.107", features = ["proc-macro"] }
+portable-atomic = { version = "1.14.0", features = ["fallback", "require-cas", "serde"] }
+pulp = { version = "0.22.3", default-features = false, features = ["std", "x86-v3"] }
+qd = { version = "0.8.0", features = ["std"] }
+quote = { version = "1.0.47", features = ["proc-macro"] }
+rand-0-10 = { package = "rand", version = "0.10.2", features = ["alloc", "std", "std_rng", "sys_rng", "thread_rng"] }
+rand-0-8 = { package = "rand", version = "0.8.7", features = ["alloc", "getrandom", "libc", "rand_chacha", "std", "std_rng"] }
+rand_core = { version = "0.6.4", default-features = false, features = ["alloc", "getrandom", "std"] }
+rand_distr = { version = "0.6.0", features = ["alloc", "std"] }
+regex-syntax = { version = "0.8.11", features = ["std", "unicode", "unicode-age", "unicode-bool", "unicode-case", "unicode-gencat", "unicode-perl", "unicode-script", "unicode-segment"] }
+serde = { version = "1.0.229", features = ["alloc", "derive", "rc", "serde_derive", "std"] }
+serde_core = { version = "1.0.229", features = ["alloc", "rc", "result", "std"] }
+serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "std"] }
+simba-0-10 = { package = "simba", version = "0.10.0", features = ["std", "wide"] }
+simba-0-9 = { package = "simba", version = "0.9.1", default-features = false, features = ["libm", "std", "wide"] }
+smallvec = { version = "1.15.2", default-features = false, features = ["const_generics", "const_new", "serde", "union"] }
+spin = { version = "0.10.1", features = ["barrier", "lazy", "lock_api", "mutex", "once", "portable-atomic", "rwlock", "spin_mutex", "std"] }
+syn-3 = { package = "syn", version = "3.0.3", features = ["clone-impls", "derive", "full", "parsing", "printing", "proc-macro"] }
+thiserror = { version = "2.0.19", features = ["std"] }
+toml_parser = { version = "1.1.2", features = ["alloc", "std"] }
+typenum = { version = "1.20.1", default-features = false, features = ["const-generics"] }
+wide = { version = "1.5.0", features = ["std"] }
+zerocopy = { version = "0.8.55", default-features = false, features = ["derive", "simd", "zerocopy-derive"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", features = ["alloc", "fs", "std", "stdio", "termios"] }
+
+[build-dependencies]
+bytemuck = { version = "1.25.2", default-features = false, features = ["aarch64_simd", "avx512_simd", "bytemuck_derive", "derive", "extern_crate_alloc", "min_const_generics", "wasm_simd"] }
+foldhash = { version = "0.2.0", default-features = false, features = ["std"] }
+half = { version = "2.7.1", features = ["alloc", "bytemuck", "num-traits", "serde", "std"] }
+log = { version = "0.4.33", default-features = false, features = ["std"] }
+num-traits = { version = "0.2.19", features = ["i128", "libm", "std"] }
+once_cell = { version = "1.21.4", features = ["alloc", "race", "std"] }
+parking_lot = { version = "0.12.5" }
+proc-macro2 = { version = "1.0.107", features = ["proc-macro"] }
+quote = { version = "1.0.47", features = ["proc-macro"] }
+rand-0-10 = { package = "rand", version = "0.10.2", features = ["alloc", "std", "std_rng", "sys_rng", "thread_rng"] }
+serde = { version = "1.0.229", features = ["alloc", "derive", "rc", "serde_derive", "std"] }
+serde_core = { version = "1.0.229", features = ["alloc", "rc", "result", "std"] }
+spin = { version = "0.10.1", features = ["barrier", "lazy", "lock_api", "mutex", "once", "portable-atomic", "rwlock", "spin_mutex", "std"] }
+syn-2 = { package = "syn", version = "2.0.119", features = ["clone-impls", "derive", "extra-traits", "full", "parsing", "printing", "proc-macro", "visit", "visit-mut"] }
+syn-3 = { package = "syn", version = "3.0.3", features = ["clone-impls", "derive", "full", "parsing", "printing", "proc-macro"] }
+toml_parser = { version = "1.1.2", features = ["alloc", "std"] }
+zerocopy = { version = "0.8.55", default-features = false, features = ["derive", "simd", "zerocopy-derive"] }
+
+[lints.rust]
+warnings = "deny"

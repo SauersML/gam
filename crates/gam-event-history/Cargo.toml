@@ -7,6 +7,9 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/SauersML/gam"
 rust-version = "1.97"
 
+[dev-dependencies]
+gam-workspace-hack = { path = "../gam-workspace-hack" }
+
 [lints.rust]
 warnings = "deny"
 

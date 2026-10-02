@@ -4,8 +4,8 @@
 //! LLM-like reader geometry. The columns come from their owner, `response::hermite`.
 
 use super::{PairChaosTable, PairRowScratch, chaos_operations, chaos_orders, chaos_orders_body};
-use crate::response::hermite::HermiteColumns;
-use crate::response::subspace::KnownBlock;
+use crate::hermite::HermiteColumns;
+use crate::subspace::KnownBlock;
 use gam_linalg::roundoff::accumulation_growth;
 use gam_math::gaussian_activation::{GaussianActivation, PairKernel, PreactivationPair, pair_kernel};
 use gam_math::paired_timing::{SpeedGate, paired_interleaved};

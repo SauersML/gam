@@ -1833,12 +1833,12 @@ fn sae_trust_diagnostics_dict<'py>(
 }
 
 /// Build the result-dict entry for the two-score per-atom lens
-/// ([`gam::inference::atom_lens::AtomTwoLensReport`]). Per-atom presence /
+/// ([`gam::terms::sae::inference::atom_lens::AtomTwoLensReport`]). Per-atom presence /
 /// coupling / discrepancy arrays plus the coupling provenance string. Optional
 /// native values remain Python ``None`` when the behavioral axis is unavailable.
 fn sae_atom_two_lens_dict<'py>(
     py: Python<'py>,
-    report: &gam::inference::atom_lens::AtomTwoLensReport,
+    report: &gam::terms::sae::inference::atom_lens::AtomTwoLensReport,
 ) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     let names = PyList::empty(py);
@@ -2507,8 +2507,8 @@ fn sae_streaming_plan_to_pydict<'py>(
 fn parse_chart_topology(
     name: &str,
     coords: ndarray::ArrayView1<'_, f64>,
-) -> PyResult<gam::inference::layer_transport::ChartTopology> {
-    use gam::inference::layer_transport::ChartTopology;
+) -> PyResult<gam::terms::sae::inference::layer_transport::ChartTopology> {
+    use gam::terms::sae::inference::layer_transport::ChartTopology;
     match name {
         "circle" => Ok(ChartTopology::Circle),
         "interval" => {
@@ -2529,7 +2529,7 @@ fn parse_chart_topology(
 
 fn layer_transport_report_to_pydict<'py>(
     py: Python<'py>,
-    report: &gam::inference::layer_transport::LayerTransportReport,
+    report: &gam::terms::sae::inference::layer_transport::LayerTransportReport,
 ) -> PyResult<Bound<'py, PyDict>> {
     let out = PyDict::new(py);
     out.set_item("layer_from", report.layer_from)?;
@@ -2569,8 +2569,8 @@ fn layer_transport_report_to_pydict<'py>(
 /// about the map (estimated chart coordinates), `"deterministic"` pairs are one
 /// function of the source coordinate (a held executed transport, a noise-free
 /// synthetic map).
-fn parse_pair_law(pairs: &str) -> PyResult<gam::inference::layer_transport::PairLaw> {
-    use gam::inference::layer_transport::PairLaw;
+fn parse_pair_law(pairs: &str) -> PyResult<gam::terms::sae::inference::layer_transport::PairLaw> {
+    use gam::terms::sae::inference::layer_transport::PairLaw;
     match pairs {
         "stochastic" => Ok(PairLaw::Stochastic),
         "deterministic" => Ok(PairLaw::Deterministic),
@@ -2580,8 +2580,8 @@ fn parse_pair_law(pairs: &str) -> PyResult<gam::inference::layer_transport::Pair
     }
 }
 
-fn pair_law_name(pair_law: gam::inference::layer_transport::PairLaw) -> &'static str {
-    use gam::inference::layer_transport::PairLaw;
+fn pair_law_name(pair_law: gam::terms::sae::inference::layer_transport::PairLaw) -> &'static str {
+    use gam::terms::sae::inference::layer_transport::PairLaw;
     match pair_law {
         PairLaw::Stochastic => "stochastic",
         PairLaw::Deterministic => "deterministic",
@@ -2594,7 +2594,7 @@ fn pair_law_name(pair_law: gam::inference::layer_transport::PairLaw) -> &'static
 /// winding degree (circle→circle), topology-preservation verdict, the
 /// data-density-weighted isometry defect with its delta-method SE, EDF, and
 /// the selected smoothing level. See
-/// `gam::inference::layer_transport` for the estimator and gauge discipline.
+/// `gam::terms::sae::inference::layer_transport` for the estimator and gauge discipline.
 #[pyfunction(signature = (coords_from, coords_to, topology_from = "circle", topology_to = "circle", layer_from = 0, layer_to = 1, pairs = "stochastic"))]
 fn layer_transport_fit(
     py: Python<'_>,
@@ -2611,7 +2611,7 @@ fn layer_transport_fit(
     let to = coords_to.as_array();
     let topo_from = parse_chart_topology(topology_from, from)?;
     let topo_to = parse_chart_topology(topology_to, to)?;
-    let report = gam::inference::layer_transport::fit_layer_transport(
+    let report = gam::terms::sae::inference::layer_transport::fit_layer_transport(
         layer_from, layer_to, from, to, topo_from, topo_to, pair_law,
     )
     .map_err(PyValueError::new_err)?;
@@ -2626,7 +2626,7 @@ fn layer_transport_fit(
 /// [`fit_transport`]; the summary properties mirror the dict keys.
 #[pyclass(module = "gamfit._rust", name = "FittedTransport")]
 pub struct PyFittedTransport {
-    inner: gam::inference::layer_transport::FittedTransport,
+    inner: gam::terms::sae::inference::layer_transport::FittedTransport,
 }
 
 #[pymethods]
@@ -2737,7 +2737,7 @@ fn fit_transport(
     let to = coords_to.as_array();
     let topo_from = parse_chart_topology(topology_from, from)?;
     let topo_to = parse_chart_topology(topology_to, to)?;
-    let inner = gam::inference::layer_transport::fit_transport_map(
+    let inner = gam::terms::sae::inference::layer_transport::fit_transport_map(
         from, to, topo_from, topo_to, pair_law,
     )
     .map_err(PyValueError::new_err)?;
@@ -2760,7 +2760,7 @@ fn layer_transport_ladder(
     pairs: &str,
 ) -> PyResult<Py<PyDict>> {
     let pair_law = parse_pair_law(pairs)?;
-    use gam::inference::layer_transport::transport_ladder;
+    use gam::terms::sae::inference::layer_transport::transport_ladder;
     let mut coord_vecs: Vec<ndarray::Array1<f64>> = Vec::with_capacity(coords.len());
     for item in coords.iter() {
         let arr: PyReadonlyArray1<'_, f64> = item.extract()?;
@@ -2925,7 +2925,7 @@ fn certify_chart_transfer(
 /// and NO coverage claim: the anytime-valid change e-process and the Riesz
 /// contrast estimator were removed because a bare decoder grid does not supply
 /// the inputs a coverage-valid change certificate requires. See
-/// `gam::inference::checkpoint_dynamics`.
+/// `gam::terms::sae::inference::checkpoint_dynamics`.
 #[pyfunction(signature = (decoder_grid, checkpoint_ids, atom_names, latent_grid))]
 fn sae_checkpoint_dynamics(
     py: Python<'_>,
@@ -2934,7 +2934,7 @@ fn sae_checkpoint_dynamics(
     atom_names: Vec<String>,
     latent_grid: PyReadonlyArray1<'_, f64>,
 ) -> PyResult<Py<PyDict>> {
-    use gam::inference::checkpoint_dynamics::{CheckpointDynamicsInput, checkpoint_atom_dynamics};
+    use gam::terms::sae::inference::checkpoint_dynamics::{CheckpointDynamicsInput, checkpoint_atom_dynamics};
     let grid = decoder_grid.as_array();
     let lat = latent_grid.as_array();
     let input = CheckpointDynamicsInput {

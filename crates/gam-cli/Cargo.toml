@@ -31,6 +31,7 @@ statrs = "0.19.0"
 thiserror = "2.0.18"
 
 [dev-dependencies]
+gam-workspace-hack = { path = "../gam-workspace-hack" }
 # The binary's `#[cfg(test)] mod cli_tests` pulls in the shared CLI test suite
 # (tests/src_modules/misc/cli_tests.rs) by `#[path]` (see src/main.rs). That
 # suite synthesises data with `rand_distr` and writes scratch files with

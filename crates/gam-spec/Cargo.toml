@@ -15,6 +15,7 @@ ndarray = { version = "0.17.2", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
 
 [dev-dependencies]
+gam-workspace-hack = { path = "../gam-workspace-hack" }
 serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
 
 [lints.rust]
