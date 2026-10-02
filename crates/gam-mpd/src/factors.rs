@@ -76,7 +76,7 @@
 
 use super::dense::{eigh, svd};
 use super::engine::{EngineError, Edit, Exactness, Primitive, Proposal, SearchContext};
-use super::derivatives::jvp_seeded;
+use super::derivatives::vjp;
 use super::fit::ProposalKind;
 use super::operator_program::{
     Interface, LabelKind, Node, Operator, OperatorBody, OperatorProgram, Provenance, Trace, remap_node,
@@ -88,10 +88,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Shared factors fitted in the code's metric (module note).
 pub struct Factors;
-
-/// The largest curvature computation, in reals, a proposal holds: one forward tangent per output
-/// coordinate over every distribution row and (sketched) class.
-const CURVATURE_REALS: usize = 1 << 25;
 
 fn refuse(message: impl Into<String>) -> EngineError {
     EngineError::Primitive(message.into())
@@ -193,38 +189,26 @@ fn components(program: &OperatorProgram) -> Vec<Component> {
     groups.into_values().collect()
 }
 
-/// `(1/N) Σ_x J_xᵀ (diag q − q qᵀ) J_x` at `node` (width × width), from one forward tangent per
-/// coordinate of the node, with `q` the program's own distributions; `None` when even one sketched
-/// class per row exceeds [`CURVATURE_REALS`].
-fn curvature(
-    program: &OperatorProgram,
-    context: &SearchContext<'_>,
-    node: usize,
-) -> Result<Option<Array2<f64>>, EngineError> {
+/// `G_y = (1/N) Σ_x J_xᵀ (diag q − q qᵀ) J_x` at every node `y` of `nodes` (width × width), with
+/// `q` the program's own distributions and `J_x` the logits' Jacobian in the node's value.
+///
+/// `diag q − q qᵀ = Σ_c w_c w_cᵀ` with `w_c = √q_c (e_c − q)`, so `G_y = (1/N) Σ_c C_cᵀ C_c` with
+/// `C_c` the reverse-mode cotangent at
+/// `y` of `w_c`: one reverse pass per class serves every node at once. When the classes outnumber
+/// the widest node, the class axis is sketched: `w_k = Σ_c P_kc w_c` with `P` a Rademacher sketch
+/// scaled so `E[Pᵀ P] = I`, an unbiased estimate (the fit only proposes; the contract certifies).
+fn curvatures(program: &OperatorProgram, context: &SearchContext<'_>, nodes: &[usize]) -> Result<BTreeMap<usize, Array2<f64>>, EngineError> {
     let trace: &Trace = context.trace;
-    let width = trace.values[node].ncols();
-    let rows = trace.values[node].nrows();
     let logits = &trace.values[program.output];
+    let rows = logits.nrows();
     let readouts = context.contract.readouts.max(1);
     let classes = logits.ncols() / readouts;
-    // The class axis is kept whole when it fits, and otherwise sketched: `G = Sᵀ S` is replaced
-    // by `(P S)ᵀ (P S)` with `P` a Rademacher sketch scaled so `E[Pᵀ P] = I`, an unbiased
-    // estimate (the fit only proposes; the contract certifies).
-    let per_class = width.saturating_mul(rows).saturating_mul(readouts);
-    if per_class == 0 || per_class > CURVATURE_REALS {
-        return Ok(None);
+    let widest = nodes.iter().map(|&n| trace.values[n].ncols()).max().unwrap_or(0);
+    let mut out: BTreeMap<usize, Array2<f64>> =
+        nodes.iter().map(|&n| (n, Array2::<f64>::zeros((trace.values[n].ncols(), trace.values[n].ncols())))).collect();
+    if widest == 0 {
+        return Ok(out);
     }
-    let sketched = classes.min(CURVATURE_REALS / per_class).max(1);
-    let sketch: Option<Array2<f64>> = (sketched < classes).then(|| {
-        let mut state = 0x9E37_79B9_7F4A_7C15_u64 ^ node as u64;
-        let scale = 1.0 / (sketched as f64).sqrt();
-        Array2::from_shape_fn((sketched, classes), |_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            if state & 1 == 1 { scale } else { -scale }
-        })
-    });
     let mut probabilities = Array2::<f64>::zeros((rows * readouts, classes));
     for row in 0..rows {
         for part in 0..readouts {
@@ -237,35 +221,44 @@ fn curvature(
             }
         }
     }
-    // Column j: the whitened logit tangent along coordinate j, `√q ⊙ (t − q·t)` (sketched), all
-    // rows stacked.
-    let mut whitened = Array2::<f64>::zeros((rows * readouts * sketched, width));
-    let no_tangents = BTreeMap::new();
-    for j in 0..width {
-        let mut seed = Array2::<f64>::zeros((rows, width));
-        seed.column_mut(j).fill(1.0);
-        let seeds: BTreeMap<usize, Array2<f64>> = [(node, seed)].into_iter().collect();
-        let t = jvp_seeded(program, &context.contract.family, trace, &no_tangents, &seeds)?;
+    let passes = classes.min(widest);
+    let sketch: Option<Array2<f64>> = (passes < classes).then(|| {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let scale = 1.0 / (passes as f64).sqrt();
+        Array2::from_shape_fn((passes, classes), |_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            if state & 1 == 1 { scale } else { -scale }
+        })
+    });
+    for k in 0..passes {
+        let mut cotangent = Array2::<f64>::zeros(logits.dim());
         for row in 0..rows {
             for part in 0..readouts {
-                let r = row * readouts + part;
-                let q = probabilities.row(r);
-                let tr = t.slice(s![row, part * classes..(part + 1) * classes]);
-                let mean: f64 = q.iter().zip(tr.iter()).map(|(a, b)| a * b).sum();
-                let full: Array1<f64> = (0..classes).map(|c| q[c].sqrt() * (tr[c] - mean)).collect();
-                let entries = match &sketch {
-                    Some(p) => p.dot(&full),
-                    None => full,
-                };
-                for (c, v) in entries.iter().enumerate() {
-                    whitened[[r * sketched + c, j]] = *v;
+                let q = probabilities.row(row * readouts + part);
+                // `Σ_c P_kc √q_c (e_c − q)`: the class part, then the shared `−q` part.
+                let weights: Vec<f64> = (0..classes)
+                    .map(|c| q[c].sqrt() * sketch.as_ref().map_or(if c == k { 1.0 } else { 0.0 }, |p| p[[k, c]]))
+                    .collect();
+                let total: f64 = weights.iter().sum();
+                for c in 0..classes {
+                    cotangent[[row, part * classes + c]] = weights[c] - total * q[c];
                 }
             }
         }
+        let back = vjp(program, &context.contract.family, trace, cotangent)?;
+        for (node, g) in out.iter_mut() {
+            if let Some(c) = &back[*node] {
+                *g += &c.t().dot(c);
+            }
+        }
     }
-    let mut g = whitened.t().dot(&whitened) / rows as f64;
-    symmetrize(&mut g);
-    Ok(Some(g))
+    for g in out.values_mut() {
+        *g /= rows as f64;
+        symmetrize(g);
+    }
+    Ok(out)
 }
 
 fn symmetrize(m: &mut Array2<f64>) {
@@ -452,11 +445,7 @@ fn measure(program: &OperatorProgram, context: &SearchContext<'_>, component: &C
         unwhiten.row_mut(k).mapv_inplace(|x| x / l.sqrt());
     }
     // Per reader node, its curvature; per operator, the sum over its uses.
-    let mut node_curvature: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
-    for &reader in &component.readers {
-        let Some(g) = curvature(program, context, reader)? else { return Ok(None) };
-        node_curvature.insert(reader, g);
-    }
+    let node_curvature = curvatures(program, context, &component.readers)?;
     let scale = (context.contract.observations as f64 * rows as f64).sqrt();
     let mut blocks = Vec::new();
     let (mut inverse_roots, mut curvature_traces, mut ranges) = (Vec::new(), Vec::new(), Vec::new());

@@ -173,3 +173,76 @@ fn units_reading_one_plane_each_come_out_as_one_rule_per_plane() {
     assert!(identification.gauge.iter().any(|g| g.contains("softmax shift")), "{:?}", identification.gauge);
     assert_eq!(identification.alternatives.len(), result.ties.len());
 }
+
+#[test]
+fn the_reverse_pass_is_the_transpose_of_the_forward_pass() {
+    let (program, contract) = planted();
+    let trace = program.execute(&contract.family, false).expect("executes");
+    let rows = contract.family.rows;
+    let output = &trace.values[program.output];
+    let cotangent = Array2::from_shape_fn(output.dim(), |(r, c)| noise(1000 + 37 * r + c));
+    let back = super::derivatives::vjp(&program, &contract.family, &trace, cotangent.clone()).expect("reverse");
+    // A tangent of W_in moves the pre-activation node (3) by x dAᵀ, with x node 2.
+    let tangent = Array2::from_shape_fn((UNITS, WIDTH), |(r, c)| noise(5000 + 17 * r + c));
+    let tangents = [(1usize, tangent.clone())].into_iter().collect();
+    let forward = super::derivatives::jvp(&program, &contract.family, &trace, &tangents).expect("forward");
+    let left: f64 = cotangent.iter().zip(forward.iter()).map(|(a, b)| a * b).sum();
+    let moved = trace.values[2].dot(&tangent.t());
+    let right: f64 = back[3].as_ref().expect("a cotangent at the pre-activation").iter().zip(moved.iter()).map(|(a, b)| a * b).sum();
+    assert!((left - right).abs() <= 1e-9 * left.abs().max(1.0), "{left} against {right} over {rows} rows");
+}
+
+#[test]
+fn the_reverse_pass_through_rotary_causal_attention_is_the_transpose_of_the_forward_pass() {
+    use super::operator_program::{Rotary, Scale, SequenceLayout};
+    let width = 4;
+    let rows = 8;
+    let x = Array2::from_shape_fn((rows, width), |(r, c)| noise(300 + 5 * r + c));
+    let native = Interface::native(width).expect("interface");
+    let operators: Vec<Operator> = (0..3)
+        .map(|k| {
+            let m = Array2::from_shape_fn((width, width), |(r, c)| noise(400 + 31 * k + 7 * r + c));
+            Operator::dense(format!("W{k}"), native.clone(), native.clone(), m, precision(), Provenance::default()).expect("dense")
+        })
+        .collect();
+    let program = OperatorProgram {
+        declarations: Declarations { parameters: 0, domains: Vec::new(), slots: vec![Slot::Raw { width }] },
+        bases: Vec::new(),
+        operators,
+        rules: Vec::new(),
+        nodes: vec![
+            Node::Raw { slot: 0 },
+            Node::Affine { terms: vec![(0, 0)], bias: None },
+            Node::Affine { terms: vec![(0, 1)], bias: None },
+            Node::Affine { terms: vec![(0, 2)], bias: None },
+            Node::Attend {
+                query: 1,
+                key: 2,
+                value: 3,
+                scale: Scale::InverseSqrt(width as u32),
+                rotary: Some(Rotary { base: 10_000, dims: width as u32, half_split: false }),
+                causal: true,
+            },
+        ],
+        output: 4,
+    };
+    let family = FamilyInputs {
+        layout: Some(SequenceLayout { sequence: (0..rows as u32).map(|r| r / 4).collect(), position: (0..rows as u32).map(|r| r % 4).collect() }),
+        rows,
+        slots: vec![SlotValues::Raw(x.clone())],
+    };
+    let trace = program.execute(&family, false).expect("executes");
+    let cotangent = Array2::from_shape_fn((rows, width), |(r, c)| noise(700 + 11 * r + c));
+    let back = super::derivatives::vjp(&program, &family, &trace, cotangent.clone()).expect("reverse");
+    let tangents: std::collections::BTreeMap<usize, Array2<f64>> =
+        (0..3).map(|k| (k, Array2::from_shape_fn((width, width), |(r, c)| noise(900 + 13 * k + 3 * r + c)))).collect();
+    let forward = super::derivatives::jvp(&program, &family, &trace, &tangents).expect("forward");
+    let left: f64 = cotangent.iter().zip(forward.iter()).map(|(a, b)| a * b).sum();
+    let right: f64 = (0..3)
+        .map(|k| {
+            let moved = x.dot(&tangents[&k].t());
+            back[k + 1].as_ref().expect("a cotangent").iter().zip(moved.iter()).map(|(a, b)| a * b).sum::<f64>()
+        })
+        .sum();
+    assert!((left - right).abs() <= 1e-9 * left.abs().max(1.0), "{left} against {right}");
+}
