@@ -8,7 +8,7 @@
 //! used, its message length and its native sources. An operator whose provenance records no rewrite
 //! is native and unresolved: its bits are the program's unresolved share.
 
-use super::operator_program::{FamilyInputs, Interface, LabelKind, Node, Operator, OperatorBody, OperatorProgram, ProgramError};
+use super::operator_program::{Interface, LabelKind, Node, Operator, OperatorBody, OperatorProgram, ProgramError};
 use std::collections::BTreeMap;
 
 /// One operator, as a component.
@@ -207,67 +207,4 @@ pub fn render(view: &ProgramView) -> String {
         ));
     }
     out
-}
-
-/// One term's exact contribution to the readout.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PathContribution {
-    pub node: usize,
-    pub term: usize,
-    pub operator: String,
-    /// The root mean square over the family's rows of the class-centred change in the output when
-    /// the term is removed.
-    pub rms: f64,
-    /// Every node from the term's node to the output is linear, so the change is exactly the
-    /// term's own contribution along its paths (the residual stream is a sum); otherwise it is the
-    /// term's removal effect through the nonlinearities downstream.
-    pub linear: bool,
-}
-
-/// Each affine term's contribution to the output: removed one at a time and propagated from its
-/// node with the executor, reading everything upstream from one trace.
-pub fn path_contributions(program: &OperatorProgram, inputs: &FamilyInputs) -> Result<Vec<PathContribution>, ProgramError> {
-    let trace = program.execute(inputs, false)?;
-    let base = &trace.values[program.output];
-    let mut linear_downstream = vec![true; program.nodes.len()];
-    for index in (0..program.nodes.len()).rev() {
-        linear_downstream[index] = program
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, n)| n.arguments().contains(&index))
-            .all(|(r, n)| {
-                linear_downstream[r]
-                    && matches!(n, Node::Affine { .. } | Node::Readout { .. } | Node::Concat { .. } | Node::Transposed { .. })
-            });
-    }
-    let mut out = Vec::new();
-    for (index, node) in program.nodes.iter().enumerate() {
-        let Node::Affine { terms, .. } = node else { continue };
-        if terms.len() < 2 {
-            continue;
-        }
-        for (term, (_, operator)) in terms.iter().enumerate() {
-            let mut edited = program.clone();
-            if let Node::Affine { terms: edited_terms, .. } = &mut edited.nodes[index] {
-                edited_terms.remove(term);
-            }
-            let changed = edited.execute_suffix(inputs, &trace, index)?;
-            let Some(last) = changed.last() else { continue };
-            let difference = base - last;
-            let mut total = 0.0;
-            for row in difference.outer_iter() {
-                let mean = row.mean().unwrap_or(0.0);
-                total += row.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / row.len() as f64;
-            }
-            out.push(PathContribution {
-                node: index,
-                term,
-                operator: program.operators[*operator].name.clone(),
-                rms: (total / difference.nrows().max(1) as f64).sqrt(),
-                linear: linear_downstream[index],
-            });
-        }
-    }
-    Ok(out)
 }

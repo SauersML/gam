@@ -70,6 +70,9 @@ mod factors_tests;
 // The component-level view of an operator program: reads, laws, writes, uses, bits, unresolved share.
 pub mod view;
 
+// Exact path decomposition of a traced value: conditioned on the trace, best first, with a certified remainder.
+pub mod paths;
+
 // Refitting a program's reals to its contract: exact Newton–CG on the readout's convex KL.
 pub mod refit;
 

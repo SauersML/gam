@@ -1271,6 +1271,12 @@ fn value_of<'a>(values: &Layered<'a>, node: usize) -> &'a Array2<f64> {
     values.get(node)
 }
 
+/// The per-row scale `(mean(x²) + ε)^{-1/2}` an [`Node::RmsNorm`] multiplies its row by, as it computes it.
+pub fn rms_scale(row: ndarray::ArrayView1<'_, f64>, epsilon: f64) -> f64 {
+    let mean = row.iter().map(|v| v * v).sum::<f64>() / row.len() as f64;
+    1.0 / (mean + epsilon).sqrt()
+}
+
 /// `x / √(mean(x²) + ε)` per row with its radius: the input radius `r` moves the mean of squares by
 /// at most `δ = (2/n) Σ|x_j| r_j + (1/n) Σ r_j²` and the scale `s = (m + ε)^{-1/2}` by at most
 /// `s³ δ/2 ·(1 − δ s²)^{-3/2}` (refused to `+∞` when `δ s² ≥ 1/2`); the computation rounds the mean
@@ -1282,7 +1288,7 @@ fn rms_norm(x: &Array2<f64>, bands: Option<&Array2<f64>>, epsilon: f64) -> (Arra
     for row in 0..rows {
         let xr = x.row(row);
         let mean = xr.iter().map(|v| v * v).sum::<f64>() / width as f64;
-        let scale = 1.0 / (mean + epsilon).sqrt();
+        let scale = rms_scale(xr, epsilon);
         for c in 0..width {
             out[[row, c]] = xr[c] * scale;
         }
@@ -1617,6 +1623,24 @@ impl OperatorProgram {
             Some(change) => change.materialize(&base.values[self.output]),
             None => base.values[self.output].clone(),
         })
+    }
+
+    /// Node `index`'s own law applied with the nodes in `patch` taking those values and every other
+    /// node read from `base` (unbanded): e.g. an attend node's read of a chosen value field at the
+    /// attention its traced query and key fix.
+    pub fn evaluate_with(
+        &self,
+        index: usize,
+        inputs: &FamilyInputs,
+        base: &Trace,
+        patch: &BTreeMap<usize, Array2<f64>>,
+        interfaces: &[Interface],
+    ) -> Result<Array2<f64>, ProgramError> {
+        let node = self.nodes.get(index).ok_or(ProgramError::Reference { what: "node", index })?;
+        let values = Layered { base: &base.values, top: &[], from: base.values.len(), patch: Some(patch) };
+        let ones = vec![1.0; self.declarations.parameters];
+        let frame = Frame { args: &[], parameters: &ones };
+        Ok(self.evaluate_node(index, node, inputs, &values, None, interfaces, &frame)?.0)
     }
 
     /// Node `index` recomputed from its arguments' new values.
