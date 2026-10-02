@@ -106,6 +106,12 @@ pub mod masked;
 #[cfg(test)]
 mod masked_tests;
 
+// Rank-k gated subcomponents: which of a library's columns share one gate, chosen by the code.
+pub mod blocks;
+
+#[cfg(test)]
+mod blocks_tests;
+
 // Atomic checkpoints of a streaming masked fit, so an interrupted run resumes exactly.
 pub mod checkpoint;
 

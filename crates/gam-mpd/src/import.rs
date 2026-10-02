@@ -466,7 +466,8 @@ fn rnn(tensors: &Tensors<'_>, record: &Value, samples: &Array2<f64>) -> Result<B
 pub fn import_language_model(dir: &Path, sequences: usize, context: usize) -> Result<Imported, String> {
     let text = std::fs::read_to_string(dir.join("export.json")).map_err(|e| e.to_string())?;
     let record: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let program = language_model(&Tensors::Export { dir, record: &record }, &record, 0)?;
+    let layers = config(&record, "n_layers")?;
+    let program = language_model(&Tensors::Export { dir, record: &record }, &record, 0..layers)?;
     let declarations = program.declarations.clone();
     let (token_rows, token_cols) = shape_of(&record["files"]["tokens"]["shape"])?;
     if sequences > token_rows || context > token_cols {
@@ -535,11 +536,14 @@ fn hugging_face_name(name: &str) -> Option<String> {
 
 /// A Hugging Face checkpoint directory (`config.json` and `model.safetensors`) of a Qwen2 (q, k, v
 /// biases), Qwen3 (`qk_norm`) or Llama model as the program of [`import_language_model`], read
-/// straight from the stored tensors (each widened exactly), from block `first_layer` on. With
-/// `first_layer > 0` the program's one slot is the residual stream entering that block (raw, `d`
-/// per row, positions from the inputs' layout), so the blocks before it can run elsewhere and enter
-/// as their output. Returns the program and its `{config}` record (the export's conventions).
-pub fn hugging_face_language_model(dir: &Path, first_layer: usize) -> Result<(OperatorProgram, Value), String> {
+/// straight from the stored tensors (each widened exactly), over `blocks`. Past block 0 the
+/// program's one slot is the residual stream entering `blocks.start` (raw, `d` per row, positions
+/// from the inputs' layout), so the blocks before it can run elsewhere and enter as their output;
+/// short of the last block its output is the residual stream entering `blocks.end` (no final norm,
+/// no readout), for the blocks after it to run elsewhere. Only the blocks' tensors (and the
+/// embedding, when the program reads tokens or the tied readout) are read. Returns the program and
+/// its `{config}` record (the export's conventions).
+pub fn hugging_face_language_model(dir: &Path, blocks: std::ops::Range<usize>) -> Result<(OperatorProgram, Value), String> {
     let text = std::fs::read_to_string(dir.join("config.json")).map_err(|e| format!("{}: {e}", dir.display()))?;
     let hf: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     let file = SafetensorsFile::open(&dir.join("model.safetensors")).map_err(|e| e.to_string())?;
@@ -556,7 +560,7 @@ pub fn hugging_face_language_model(dir: &Path, first_layer: usize) -> Result<(Op
         other => return Err(format!("unsupported hidden_act {other:?}")),
     };
     let record = serde_json::json!({
-        "source": {"model": dir.display().to_string(), "first_layer": first_layer},
+        "source": {"model": dir.display().to_string(), "blocks": [blocks.start, blocks.end]},
         "config": {
             "norm": "rms", "parallel_residual": false, "rotary_dims": head_dim,
             "rope_theta": hf["rope_theta"].as_f64().ok_or("config.json: rope_theta")?,
@@ -567,13 +571,14 @@ pub fn hugging_face_language_model(dir: &Path, first_layer: usize) -> Result<(Op
             "d_mlp": integer("intermediate_size")?, "vocab": vocab, "rope_pairing": "rotate_half",
         },
     });
-    let program = language_model(&Tensors::HuggingFace { file }, &record, first_layer)?;
+    let program = language_model(&Tensors::HuggingFace { file }, &record, blocks)?;
     Ok((program, record))
 }
 
-/// The program of [`import_language_model`] from block `first_layer` on (module note): its input
-/// is the tokens at block 0, else the residual stream entering `first_layer`, raw.
-fn language_model(tensors: &Tensors<'_>, record: &Value, first_layer: usize) -> Result<OperatorProgram, String> {
+/// The program of [`import_language_model`] over `blocks` (module note): its input is the tokens
+/// at block 0, else the residual stream entering `blocks.start`, raw; its output is the readout
+/// after the last block, else the residual stream entering `blocks.end`.
+fn language_model(tensors: &Tensors<'_>, record: &Value, blocks: std::ops::Range<usize>) -> Result<OperatorProgram, String> {
     let (layers, heads, kv_heads, hd, d, vocab) = (
         config(record, "n_layers")?,
         config(record, "n_heads")?,
@@ -614,7 +619,15 @@ fn language_model(tensors: &Tensors<'_>, record: &Value, first_layer: usize) -> 
     let mut b = Builder { operators: Vec::new(), nodes: Vec::new() };
     b.operators.push(Arc::new(Operator::identity("I", model.clone())));
     let identity = 0;
-    let embedding = b.operator("wte", &model, &tokens_interface, tensors.get("wte")?.t().to_owned())?;
+    if blocks.start > blocks.end || blocks.end > layers {
+        return Err(format!("blocks {blocks:?} of {layers}"));
+    }
+    let reads_out = blocks.end == layers;
+    let embedding = if blocks.start == 0 || (reads_out && tied) {
+        Some(b.operator("wte", &model, &tokens_interface, tensors.get("wte")?.t().to_owned())?)
+    } else {
+        None
+    };
     // A norm gain is a diagonal operator: one present block per coordinate, d reals.
     let gain = |b: &mut Builder, name: &str| -> Result<usize, String> {
         let g = tensors.get(name)?;
@@ -679,10 +692,7 @@ fn language_model(tensors: &Tensors<'_>, record: &Value, first_layer: usize) -> 
         let normed = b.node(Node::RmsNorm { input: x, epsilon });
         Ok(b.node(Node::Affine { terms: vec![(normed, op)], bias: None }))
     };
-    if first_layer > layers {
-        return Err(format!("first layer {first_layer} of {layers}"));
-    }
-    let (input_slot, mut x) = if first_layer == 0 {
+    let (input_slot, mut x) = if let (0, Some(embedding)) = (blocks.start, embedding) {
         let feature = b.node(Node::Feature { slot: 0, basis: 0 });
         (Slot::Token { domain: 0 }, b.node(Node::Affine { terms: vec![(feature, embedding)], bias: None }))
     } else {
@@ -691,7 +701,7 @@ fn language_model(tensors: &Tensors<'_>, record: &Value, first_layer: usize) -> 
         let lift = b.operator("residual input", &model, &Interface::native(d).map_err(|e| e.to_string())?, Array2::eye(d))?;
         (Slot::Raw { width: d }, b.node(Node::Affine { terms: vec![(raw, lift)], bias: None }))
     };
-    for l in first_layer..layers {
+    for l in blocks {
         let prefix = format!("blocks.{l}.");
         let h = norm(&mut b, x, &format!("{prefix}rms1"))?;
         let (wq, wk, wv, wo) = (
@@ -761,14 +771,19 @@ fn language_model(tensors: &Tensors<'_>, record: &Value, first_layer: usize) -> 
         };
         x = b.node(Node::Affine { terms: vec![(attended, identity), (active, down)], bias: down_bias });
     }
-    let h = norm(&mut b, x, "final_norm")?;
-    let logits = if tied {
-        b.node(Node::Transposed { input: h, operator: embedding })
+    let output = if !reads_out {
+        x
     } else {
-        let head_op = b.operator("lm_head", &tokens_interface, &model, tensors.get("lm_head")?)?;
-        b.node(Node::Affine { terms: vec![(h, head_op)], bias: None })
+        let h = norm(&mut b, x, "final_norm")?;
+        let logits = match embedding {
+            Some(embedding) if tied => b.node(Node::Transposed { input: h, operator: embedding }),
+            _ => {
+                let head_op = b.operator("lm_head", &tokens_interface, &model, tensors.get("lm_head")?)?;
+                b.node(Node::Affine { terms: vec![(h, head_op)], bias: None })
+            }
+        };
+        b.node(Node::Readout { input: logits, basis: 0 })
     };
-    let output = b.node(Node::Readout { input: logits, basis: 0 });
     let declarations = Declarations { parameters: 0, domains: vec![Domain { size: vocab, cycle: None }], slots: vec![input_slot] };
     Ok(OperatorProgram {
         rules: Vec::new(),

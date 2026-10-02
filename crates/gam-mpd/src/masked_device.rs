@@ -57,8 +57,11 @@ impl Uniforms {
 
 impl Accelerated {
     /// `masked` on `device`, its proposals' products in `proposal`; refused for a program the
-    /// device cannot run (a node without a device rule).
+    /// device cannot run (a frozen head after it, a node without a device rule).
     pub fn new(device: &Device, masked: &Masked, proposal: Arithmetic) -> Result<Self, String> {
+        if masked.head.is_some() {
+            return Err("device: a masked window with a frozen head after it".to_string());
+        }
         Ok(Self { program: DeviceProgram::compile(device, &masked.program)?, proposal })
     }
 
@@ -89,7 +92,7 @@ impl Accelerated {
         self.program.vjp(trace, seed, keep, self.proposal)
     }
 
-    /// Per site `∂KL/∂m` (rows × C): `masked::mask_gradients` of the state's KL.
+    /// Per site `∂KL/∂m` (rows × B): `masked::mask_gradients` of the state's KL.
     pub fn mask_gradients(&self, masked: &Masked, state: &State) -> Result<Vec<Array2<f64>>, String> {
         let d = self.program.device();
         let seed = d.copy(&state.cotangent).map_err(error)?;
@@ -101,9 +104,9 @@ impl Accelerated {
                 Some(c) => {
                     let mut g = d.zeros(z.rows(), z.cols()).map_err(error)?;
                     d.hadamard(&mut g, c, z, false).map_err(error)?;
-                    d.download(&g).map_err(error)?
+                    masked.to_blocks(k, &d.download(&g).map_err(error)?)
                 }
-                None => Array2::zeros(z.dim()),
+                None => Array2::zeros((z.rows(), masked.blocks(k))),
             });
         }
         Ok(out)
@@ -127,9 +130,12 @@ impl Accelerated {
             keep.extend(masked.sites.iter().flat_map(|s| s.writes.iter().copied()));
         }
         let mut h: Vec<Tensor> = Vec::new();
+        // A site gated in blocks squares each sample's block sums, on the host.
+        let mut h_blocks: Vec<Option<Array2<f64>>> = Vec::new();
         for k in 0..masked.sites.len() {
             let z = state.trace.value(masked.z[k])?;
             h.push(d.zeros(z.rows(), z.cols()).map_err(error)?);
+            h_blocks.push((!masked.is_rank_one(k)).then(|| Array2::zeros((z.rows(), masked.blocks(k)))));
         }
         // Per site, the blocks `g_iᵀ g_j` of the written nodes' Fisher.
         let mut blocks: Vec<Vec<Vec<Option<Tensor>>>> =
@@ -145,7 +151,13 @@ impl Accelerated {
                     let z = state.trace.value(masked.z[k])?;
                     let mut g = d.zeros(z.rows(), z.cols()).map_err(error)?;
                     d.hadamard(&mut g, c, z, false).map_err(error)?;
-                    d.hadamard(hk, &g, &g, true).map_err(error)?;
+                    match &mut h_blocks[k] {
+                        Some(hb) => {
+                            let gb = masked.to_blocks(k, &d.download(&g).map_err(error)?);
+                            *hb += &(&gb * &gb);
+                        }
+                        None => d.hadamard(hk, &g, &g, true).map_err(error)?,
+                    }
                 }
                 if !written {
                     continue;
@@ -167,7 +179,10 @@ impl Accelerated {
         let scored_rows = (0..rows).filter(|r| scored(*r)).count().max(1) as f64;
         let mut out = Vec::new();
         for (k, hk) in h.iter().enumerate() {
-            let diagonal = d.download(hk).map_err(error)? / samples as f64;
+            let diagonal = match &h_blocks[k] {
+                Some(hb) => hb / samples as f64,
+                None => d.download(hk).map_err(error)? / samples as f64,
+            };
             let fisher = if written {
                 let widths: Vec<usize> = masked.sites[k].writes.iter().map(|w| state.trace.value(*w).map(|t| t.cols())).collect::<Result<_, _>>()?;
                 let offsets: Vec<usize> = std::iter::once(0).chain(widths.iter().scan(0, |a, w| {
@@ -201,18 +216,18 @@ impl Accelerated {
         let back = self.cotangents(&state.trace, seed, &keep)?;
         let mut out = Vec::new();
         for (k, site) in masked.sites.iter().enumerate() {
-            let (pieces, rows) = (masked.libraries[k].v.nrows(), state.trace.rows);
+            let (pieces, rows) = (masked.pieces(k), state.trace.rows);
             let z = state.trace.value(masked.z[k])?;
             let Node::Hadamard { right: mask_node, .. } = &masked.program.nodes[masked.masked[k]] else {
                 return Err("device: a site's masked node is not its mask's product".to_string());
             };
             let mask = state.trace.value(*mask_node)?;
-            if mask.dim() != masks[k].dim() {
+            if mask.dim() != (rows, pieces) || masks[k].dim() != (rows, masked.blocks(k)) {
                 return Err("device: the state's masks are not the given ones".to_string());
             }
             let Some(cot_masked) = back.get(&masked.masked[k]) else {
-                let (d_in, d_out) = (masked.libraries[k].mean.len(), site.writes.iter().map(|w| state.trace.value(*w).map(|t| t.cols())).sum::<Result<usize, _>>()?);
-                out.push((Array2::zeros((rows, pieces)), Array2::zeros((pieces, d_in)), Array2::zeros((pieces, d_out))));
+                let (d_in, d_out) = (masked.mean(k).len(), site.writes.iter().map(|w| state.trace.value(*w).map(|t| t.cols())).sum::<Result<usize, _>>()?);
+                out.push((Array2::zeros((rows, masked.blocks(k))), Array2::zeros((pieces, d_in)), Array2::zeros((pieces, d_out))));
                 continue;
             };
             let mut mask_gradient = d.zeros(rows, pieces).map_err(error)?;
@@ -224,7 +239,7 @@ impl Accelerated {
             let mut offset = 0;
             for read in &site.reads {
                 let x = state.trace.value(*read)?;
-                let mean = masked.libraries[k].mean.slice(s![offset..offset + x.cols()]).to_owned();
+                let mean = masked.mean(k).slice(s![offset..offset + x.cols()]).to_owned();
                 offset += x.cols();
                 let mut centred = d.copy(x).map_err(error)?;
                 d.add_row(&mut centred, -1.0, &d.upload_vec(1, mean.len(), mean.to_vec()).map_err(error)?).map_err(error)?;
@@ -251,7 +266,7 @@ impl Accelerated {
                 let views: Vec<_> = blocks.iter().map(|b| b.view()).collect();
                 ndarray::concatenate(Axis(1), &views).map_err(|e| e.to_string())
             };
-            out.push((d.download(&mask_gradient).map_err(error)?, join(&v_blocks)?, join(&u_blocks)?));
+            out.push((masked.to_blocks(k, &d.download(&mask_gradient).map_err(error)?), join(&v_blocks)?, join(&u_blocks)?));
         }
         Ok(out)
     }
@@ -263,7 +278,7 @@ impl Accelerated {
         let rows = state.trace.rows as f64;
         let mut out = Vec::new();
         for (k, site) in masked.sites.iter().enumerate() {
-            let library_mean = &masked.libraries[k].mean;
+            let library_mean = masked.mean(k);
             let mut centred: Vec<Tensor> = Vec::new();
             let mut offset = 0;
             for read in &site.reads {

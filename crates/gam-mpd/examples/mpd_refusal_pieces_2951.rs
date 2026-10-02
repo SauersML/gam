@@ -1,26 +1,32 @@
 //! Refusal and over-refusal pieces of a chat model, from a behaviour-scoped decomposition (#2951).
 //!
-//! `mpd_refusal_pieces_2951 validate MODEL_DIR DIR [GPU]`
-//! `mpd_refusal_pieces_2951 fit MODEL_DIR DATA_DIR OUT_DIR LAST OBSERVATIONS STATS [BATCH] [GPU]`
+//! `mpd_refusal_pieces_2951 validate MODEL_DIR DIR`
+//! `mpd_refusal_pieces_2951 fit MODEL_DIR DATA_DIR OUT_DIR LAST OBSERVATIONS STATS BATCH GPU HEAD_SOCKET [PROMPTS]`
 //!
-//! `MODEL_DIR` is a Hugging Face Qwen2/Qwen3/Llama checkpoint, imported from block `FIRST` on
-//! (`gam_mpd::import::hugging_face_language_model`): the blocks before it run elsewhere, and their
-//! output, the residual stream entering `FIRST`, is the program's input.
+//! `MODEL_DIR` is a Hugging Face Qwen2/Qwen3/Llama checkpoint (`gam_mpd::import::
+//! hugging_face_language_model`).
 //!
 //! `validate` checks the import: `DIR/meta.json` (`ids`, `first`, `rows`, `scored`, `vocab`),
 //! `DIR/resid.f64` (the stream entering `first`, `rows × d`) and `DIR/logits.f64` (the reference
 //! logits of the last `scored` rows); it prints the largest logit difference and KL.
 //!
-//! `fit` decomposes blocks `FIRST..LAST` against the behaviour. `DATA_DIR/prompts.json` holds
-//! `first`, `d`, `refusal_tokens` (the first tokens of the model's refusals) and per prompt its
-//! `ids` (chat-formatted prompt and the first reply tokens), `scored_from` (its rows from there on
-//! are the behaviour's: the last user token, the template tokens after it and the reply tokens)
-//! and `decision` (the row whose next token is the reply's first); `DATA_DIR/resid.f32` holds every
-//! prompt's stream entering `FIRST`, prompts in order. The run:
+//! `fit` decomposes blocks `FIRST..LAST` against a behaviour, holding only those blocks in float64:
+//! the blocks before run elsewhere (their output, the stream entering `FIRST`, is the input), and
+//! the blocks from `LAST` on are a head server on the Unix socket `HEAD_SOCKET`
+//! (`bench/mpd_refusal_head_2951.py MODEL_DIR LAST HEAD_SOCKET`; `gam_mpd::masked::Head`), a process
+//! of its own with its own memory reservation. `DATA_DIR/prompts.json`
+//! holds `first`, `d`, `refusal_tokens` (the first tokens of the model's refusals) and per prompt its
+//! `ids` (chat-formatted prompt and the first reply tokens), `scored_from` (its rows from there on are
+//! the behaviour's: the last user token, the template tokens after it and the reply tokens) and
+//! `decision` (the row whose next token is the reply's first); `DATA_DIR/resid.f32` (memory-mapped)
+//! holds every prompt's stream entering `FIRST`, prompts in order. Prompts stream `BATCH` at a time;
+//! `PROMPTS` keeps the first that many.
+//! The run:
 //!
 //! 1. measures each site's narrow-side statistics on the first `STATS` prompts' scored rows (the
-//!    reads' mean and covariance, and the output Fisher of the scored rows' KL, `gam_mpd::pieces::
-//!    Narrow`) and builds its exact Fisher-SVD library (`gam_mpd::pieces::fisher_svd_narrow`);
+//!    reads' mean and covariance, and the output Fisher of the scored rows' KL; `gam_mpd::pieces::
+//!    Narrow`) and builds its exact Fisher-SVD library (`gam_mpd::pieces::fisher_svd_narrow`), then
+//!    keeps only the masked program (`Masked::release_training_state`);
 //! 2. selects every prompt's pieces in the masked program on its scored rows only, every piece on
 //!    elsewhere (`gam_mpd::masked::Target`), with the context code of the sets selected so far;
 //! 3. at the selected sets, takes the exact gradient of the refusal score `log p(R) − log(1 −
@@ -31,22 +37,25 @@
 //!
 //! Writes `OUT_DIR`: `library/<site>.{v,u}.f32` (`C × d_in`, `C × d_out`) and `.mean.f64`;
 //! `pieces.json` (sites, offsets, weights `s_c`); `rows.json` (per scored row its prompt and
-//! position, KL and the selection's code); the scored rows' sets as CSR over all pieces
-//! (`sets.indptr.i64`, `sets.indices.i64`) with each entry's score gradient (`sets.share.f32`);
-//! `effects.f32` (prompts × pieces); and per prompt the native and masked refusal scores.
+//! position, KL and the selection's listing bits; per prompt its native and masked refusal scores);
+//! the scored rows' sets as CSR over all pieces (`sets.indptr.i64`, `sets.indices.i64`) with each
+//! entry's score gradient (`sets.share.f32`); and `effects.f32` (prompts × pieces).
 
 use gam_mpd::derivatives::vjp;
 use gam_mpd::device::proposing;
 use gam_mpd::import::hugging_face_language_model;
 use gam_mpd::masked::{
-    Context, Library, Masked, Site, Target, forward, mask_gradients, matrix, read_values, sampled_label_cotangent, select, sites,
+    Context, Head, Library, Masked, Site, Target, forward, kl, mask_gradients, matrix, read_values, sampled_label_cotangent, select,
+    sites, to_output,
 };
 use gam_mpd::operator_program::{FamilyInputs, SequenceLayout, SlotValues};
 use gam_mpd::pieces::{Narrow, fisher_svd_narrow};
-use ndarray::{Array1, Array2, Axis, concatenate};
+use ndarray::{Array1, Array2, Axis, concatenate, s};
 use serde_json::{Value, json};
-use std::io::Write;
+use std::io::{BufReader, Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 fn read_le<const N: usize, T>(path: &Path, convert: fn([u8; N]) -> T) -> Result<Vec<T>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -64,7 +73,7 @@ fn integer(value: &Value, key: &str) -> Result<usize, String> {
     value[key].as_u64().map(|v| v as usize).ok_or_else(|| format!("{key}: not an integer"))
 }
 
-fn write_raw<T: Copy, const N: usize>(file: &mut std::fs::File, values: impl IntoIterator<Item = T>, bytes: fn(T) -> [u8; N]) -> Result<(), String> {
+fn write_raw<T: Copy, const N: usize>(file: &mut impl Write, values: impl IntoIterator<Item = T>, bytes: fn(T) -> [u8; N]) -> Result<(), String> {
     let mut out = Vec::new();
     for v in values {
         out.extend_from_slice(&bytes(v));
@@ -74,6 +83,77 @@ fn write_raw<T: Copy, const N: usize>(file: &mut std::fs::File, values: impl Int
 
 fn create(path: &Path) -> Result<std::fs::File, String> {
     std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn layers_of(model: &Path) -> Result<usize, String> {
+    integer(&read_json(&model.join("config.json"))?, "num_hidden_layers")
+}
+
+/// The blocks after the window, served on a Unix socket (protocol in
+/// `bench/mpd_refusal_head_2951.py`): logits at the scored rows in fp32, and their pullback.
+struct SocketHead {
+    io: Mutex<(UnixStream, BufReader<UnixStream>)>,
+    d: usize,
+    vocab: usize,
+}
+
+impl SocketHead {
+    fn connect(path: &Path, d: usize, vocab: usize) -> Result<Self, String> {
+        let stream = UnixStream::connect(path).map_err(|e| format!("head {}: {e}", path.display()))?;
+        let reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+        Ok(Self { io: Mutex::new((stream, reader)), d, vocab })
+    }
+
+    fn request(&self, op: u8, inputs: &FamilyInputs, output: &Array2<f64>, rows: &[bool], cotangent: Option<&Array2<f64>>) -> Result<Vec<f32>, String> {
+        let layout = inputs.layout.as_ref().ok_or("the head needs a sequence layout")?;
+        let mut message = vec![op];
+        message.extend_from_slice(&(output.nrows() as u32).to_le_bytes());
+        layout.sequence.iter().for_each(|v| message.extend_from_slice(&v.to_le_bytes()));
+        layout.position.iter().for_each(|v| message.extend_from_slice(&v.to_le_bytes()));
+        message.extend(rows.iter().map(|r| u8::from(*r)));
+        output.iter().for_each(|v| message.extend_from_slice(&(*v as f32).to_le_bytes()));
+        if let Some(cotangent) = cotangent {
+            for (r, row) in cotangent.outer_iter().enumerate() {
+                if rows[r] {
+                    row.iter().for_each(|v| message.extend_from_slice(&(*v as f32).to_le_bytes()));
+                }
+            }
+        }
+        let expected = if op == 1 { rows.iter().filter(|r| **r).count() * self.vocab } else { output.nrows() * self.d };
+        let mut io = self.io.lock().map_err(|_| "head poisoned")?;
+        io.0.write_all(&message).map_err(|e| format!("head write: {e}"))?;
+        io.0.flush().map_err(|e| format!("head flush: {e}"))?;
+        let mut bytes = vec![0u8; expected * 4];
+        io.1.read_exact(&mut bytes).map_err(|e| format!("head read: {e}"))?;
+        Ok(bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    }
+}
+
+impl Head for SocketHead {
+    fn logits(&self, inputs: &FamilyInputs, output: &Array2<f64>, rows: &[bool]) -> Result<Array2<f64>, String> {
+        let values = self.request(1, inputs, output, rows, None)?;
+        let mut logits = Array2::<f64>::zeros((output.nrows(), self.vocab));
+        for (i, r) in (0..output.nrows()).filter(|r| rows[*r]).enumerate() {
+            logits.row_mut(r).iter_mut().zip(&values[i * self.vocab..(i + 1) * self.vocab]).for_each(|(l, v)| *l = f64::from(*v));
+        }
+        Ok(logits)
+    }
+
+    fn pullback(&self, inputs: &FamilyInputs, output: &Array2<f64>, rows: &[bool], cotangent: &Array2<f64>) -> Result<Array2<f64>, String> {
+        let values = self.request(2, inputs, output, rows, Some(cotangent))?;
+        Array2::from_shape_vec((output.nrows(), self.d), values.into_iter().map(f64::from).collect()).map_err(|e| e.to_string())
+    }
+}
+
+impl Drop for SocketHead {
+    fn drop(&mut self) {
+        // The server quits when asked.
+        if let Ok(mut io) = self.io.lock()
+            && let Err(error) = io.0.write_all(&[0])
+        {
+            log::warn!("head quit: {error}");
+        }
+    }
 }
 
 /// One prompt of the behaviour.
@@ -92,7 +172,7 @@ struct Batch {
     decisions: Vec<usize>,
 }
 
-fn batch(prompts: &[Prompt], offsets: &[usize], resid: &[f32], d: usize, range: std::ops::Range<usize>) -> Batch {
+fn batch(prompts: &[Prompt], offsets: &[usize], resid: &[u8], d: usize, range: std::ops::Range<usize>) -> Batch {
     let rows: usize = range.clone().map(|p| prompts[p].ids.len()).sum();
     let mut values = Array2::<f64>::zeros((rows, d));
     let (mut sequence, mut position, mut scored, mut starts, mut decisions) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -102,8 +182,8 @@ fn batch(prompts: &[Prompt], offsets: &[usize], resid: &[f32], d: usize, range: 
         starts.push(row);
         decisions.push(row + prompt.decision);
         for t in 0..prompt.ids.len() {
-            let source = &resid[(offsets[p] + t) * d..(offsets[p] + t + 1) * d];
-            values.row_mut(row).iter_mut().zip(source).for_each(|(v, x)| *v = f64::from(*x));
+            let source = &resid[(offsets[p] + t) * d * 4..(offsets[p] + t + 1) * d * 4];
+            values.row_mut(row).iter_mut().zip(source.chunks_exact(4)).for_each(|(v, x)| *v = f64::from(f32::from_le_bytes([x[0], x[1], x[2], x[3]])));
             sequence.push(s as u32);
             position.push(t as u32);
             scored.push(t >= prompt.scored_from);
@@ -131,7 +211,7 @@ fn refusal_score(logits: ndarray::ArrayView1<'_, f64>, refusal: &[usize]) -> f64
 fn validate(model: &Path, dir: &Path) -> Result<(), String> {
     let meta = read_json(&dir.join("meta.json"))?;
     let (first, rows, scored, vocab) = (integer(&meta, "first")?, integer(&meta, "rows")?, integer(&meta, "scored")?, integer(&meta, "vocab")?);
-    let (program, record) = hugging_face_language_model(model, first)?;
+    let (program, record) = hugging_face_language_model(model, first..layers_of(model)?)?;
     let d = integer(&record["config"], "d_model")?;
     let resid = read_le::<8, f64>(&dir.join("resid.f64"), f64::from_le_bytes)?;
     let reference = Array2::from_shape_vec((scored, vocab), read_le::<8, f64>(&dir.join("logits.f64"), f64::from_le_bytes)?).map_err(|e| e.to_string())?;
@@ -141,19 +221,16 @@ fn validate(model: &Path, dir: &Path) -> Result<(), String> {
         layout: Some(SequenceLayout { sequence: vec![0; rows], position: (0..rows as u32).collect() }),
     };
     let started = std::time::Instant::now();
-    let logits = program.execute(&inputs, false).map_err(|e| e.to_string())?.values[program.output].slice(ndarray::s![rows - scored.., ..]).to_owned();
+    let logits = program.execute(&inputs, false).map_err(|e| e.to_string())?.values[program.output].slice(s![rows - scored.., ..]).to_owned();
     let largest = reference.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
     let difference = (&logits - &reference).iter().fold(0.0_f64, |m, x| m.max(x.abs()));
-    let kl = Target::every_row(reference.clone());
-    let kls = gam_mpd::masked::kl(&kl, &logits).0;
+    let kls = kl(&Target::every_row(reference.clone()), &logits).0;
+    let argmax = |a: ndarray::ArrayView1<'_, f64>| a.iter().enumerate().fold((0, f64::NEG_INFINITY), |b, (i, x)| if *x > b.1 { (i, *x) } else { b }).0;
     let report = json!({
         "first": first, "rows": rows, "blocks": integer(&record["config"], "n_layers")? - first,
         "max_abs_logit_difference": difference, "largest_logit": largest,
         "max_kl_reference_to_engine": kls.iter().fold(0.0_f64, |m, x| m.max(*x)),
-        "argmax_agree": (0..scored).all(|r| {
-            let arg = |a: ndarray::ArrayView1<'_, f64>| a.iter().enumerate().fold((0, f64::NEG_INFINITY), |b, (i, x)| if *x > b.1 { (i, *x) } else { b }).0;
-            arg(logits.row(r)) == arg(reference.row(r))
-        }),
+        "argmax_agree": (0..scored).all(|r| argmax(logits.row(r)) == argmax(reference.row(r))),
         "seconds": started.elapsed().as_secs_f64(),
     });
     println!("{report}");
@@ -170,15 +247,17 @@ fn layer_of(site: &Site) -> Option<usize> {
     site.name.strip_prefix("blocks.")?.split('.').next()?.parse().ok()
 }
 
-fn fit(
-    model: &Path,
-    data: &Path,
-    out: &Path,
+/// The fit's settings (module note).
+struct Settings {
     last: usize,
     observations: f64,
     stats: usize,
-    batch_size: usize,
-) -> Result<(), String> {
+    batch: usize,
+    prompts: usize,
+}
+
+fn fit(model: &Path, data: &Path, out: &Path, settings: &Settings, head_socket: &Path) -> Result<(), String> {
+    let Settings { last, observations, stats, batch: batch_size, prompts: limit } = *settings;
     let meta = read_json(&data.join("prompts.json"))?;
     let (first, d) = (integer(&meta, "first")?, integer(&meta, "d")?);
     let refusal: Vec<usize> = meta["refusal_tokens"].as_array().ok_or("refusal_tokens")?.iter().filter_map(|v| v.as_u64().map(|v| v as usize)).collect();
@@ -188,41 +267,45 @@ fn fit(
         prompts.push(Prompt { ids, scored_from: integer(p, "scored_from")?, decision: integer(p, "decision")? });
     }
     let mut offsets = vec![0];
+    let kept = prompts.len().min(limit);
     for p in &prompts {
         offsets.push(offsets[offsets.len() - 1] + p.ids.len());
     }
-    let resid = read_le::<4, f32>(&data.join("resid.f32"), f32::from_le_bytes)?;
-    if resid.len() != offsets[prompts.len()] * d {
-        return Err(format!("resid.f32 holds {} values for {} rows of {d}", resid.len(), offsets[prompts.len()]));
+    let file = std::fs::File::open(data.join("resid.f32")).map_err(|e| e.to_string())?;
+    // SAFETY: a read-only mapping of an input file nothing rewrites during the run.
+    let resid = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| e.to_string())?;
+    if resid.len() != offsets[prompts.len()] * d * 4 {
+        return Err(format!("resid.f32 holds {} bytes for {} rows of {d}", resid.len(), offsets[prompts.len()]));
     }
     std::fs::create_dir_all(out.join("library")).map_err(|e| e.to_string())?;
     let started = std::time::Instant::now();
-    let (program, _) = hugging_face_language_model(model, first)?;
+    let (program, record) = hugging_face_language_model(model, first..last)?;
+    let vocab = integer(&record["config"], "vocab")?;
+    let head: Arc<SocketHead> = Arc::new(SocketHead::connect(head_socket, d, vocab)?);
     let chosen: Vec<Site> = sites(&program).into_iter().filter(|s| layer_of(s).is_some_and(|l| (first..last).contains(&l))).collect();
-    let maps: Vec<Array2<f64>> = chosen.iter().map(|s| matrix(&program, s)).collect::<Result<_, _>>()?;
-    log::info!("imported blocks {first}.. ({:.0}s); {} sites in {first}..{last}", started.elapsed().as_secs_f64(), chosen.len());
-    let batches: Vec<std::ops::Range<usize>> = (0..prompts.len()).step_by(batch_size).map(|s| s..(s + batch_size).min(prompts.len())).collect();
+    log::info!("imported blocks {first}..{last} ({:.0}s); {} sites", started.elapsed().as_secs_f64(), chosen.len());
+    let batches: Vec<std::ops::Range<usize>> = (0..kept).step_by(batch_size).map(|s| s..(s + batch_size).min(kept)).collect();
 
     // 1. Narrow-side statistics on the scored rows of the first `stats` prompts.
     let samples = 2;
-    let mut sums: Vec<Sums> = maps
-        .iter()
-        .map(|w| {
-            let (d_out, d_in) = w.dim();
-            if d_in <= d_out {
-                Sums::Reads { x: Array1::zeros(d_in), xx: Array2::zeros((d_in, d_in)), pulled: Array2::zeros((d_in, d_in)) }
-            } else {
-                Sums::Writes { x: Array1::zeros(d_in), y: Array1::zeros(d_out), yy: Array2::zeros((d_out, d_out)), gg: Array2::zeros((d_out, d_out)) }
-            }
-        })
-        .collect();
+    let mut sums: Vec<Sums> = Vec::new();
+    for site in &chosen {
+        let w = matrix(&program, site)?;
+        let (d_out, d_in) = w.dim();
+        sums.push(if d_in <= d_out {
+            Sums::Reads { x: Array1::zeros(d_in), xx: Array2::zeros((d_in, d_in)), pulled: Array2::zeros((d_in, d_in)) }
+        } else {
+            Sums::Writes { x: Array1::zeros(d_in), y: Array1::zeros(d_out), yy: Array2::zeros((d_out, d_out)), gg: Array2::zeros((d_out, d_out)) }
+        });
+    }
     let (mut rows, mut draws) = (0.0, 0.0);
     for range in batches.iter().filter(|r| r.start < stats) {
         let b = batch(&prompts, &offsets, &resid, d, range.start..range.end.min(stats));
         let keep: Vec<usize> = (0..b.inputs.rows).filter(|r| b.scored[*r]).collect();
         let trace = program.execute(&b.inputs, false).map_err(|e| e.to_string())?;
-        let target = Target { logits: trace.values[program.output].clone(), scored: Some(b.scored.clone()) };
-        for ((site, w), sum) in chosen.iter().zip(&maps).zip(sums.iter_mut()) {
+        let output = &trace.values[program.output];
+        let target = Target { logits: head.logits(&b.inputs, output, &b.scored)?, scored: Some(b.scored.clone()) };
+        for (site, sum) in chosen.iter().zip(sums.iter_mut()) {
             let x = read_values(&trace, site)?.select(Axis(0), &keep);
             match sum {
                 Sums::Reads { x: sx, xx, .. } => {
@@ -230,7 +313,7 @@ fn fit(
                     *xx += &x.t().dot(&x);
                 }
                 Sums::Writes { x: sx, y: sy, yy, .. } => {
-                    let y = x.dot(&w.t());
+                    let y = x.dot(&matrix(&program, site)?.t());
                     *sx += &x.sum_axis(Axis(0));
                     *sy += &y.sum_axis(Axis(0));
                     *yy += &y.t().dot(&y);
@@ -240,15 +323,16 @@ fn fit(
         rows += keep.len() as f64;
         for draw in 0..samples {
             let cotangent = sampled_label_cotangent(&target.logits, &target, 0x5EED ^ (((range.start * samples + draw) as u64) << 8));
+            let cotangent = head.pullback(&b.inputs, output, &b.scored, &cotangent)?;
             let back = proposing(|| vjp(&program, &b.inputs, &trace, cotangent)).map_err(|e| e.to_string())?;
-            for ((site, w), sum) in chosen.iter().zip(&maps).zip(sums.iter_mut()) {
+            for (site, sum) in chosen.iter().zip(sums.iter_mut()) {
                 let written: Vec<Array2<f64>> =
                     site.writes.iter().map(|n| back[*n].clone().unwrap_or_else(|| Array2::zeros(trace.values[*n].dim()))).collect();
                 let views: Vec<_> = written.iter().map(|w| w.view()).collect();
                 let g = concatenate(Axis(1), &views).map_err(|e| e.to_string())?.select(Axis(0), &keep);
                 match sum {
                     Sums::Reads { pulled, .. } => {
-                        let p = g.dot(w);
+                        let p = g.dot(&matrix(&program, site)?);
                         *pulled += &p.t().dot(&p);
                     }
                     Sums::Writes { gg, .. } => *gg += &g.t().dot(&g),
@@ -266,7 +350,8 @@ fn fit(
     let mut weights = Vec::new();
     let mut piece_sites = Vec::new();
     let mut offset = 0;
-    for ((site, w), sum) in chosen.iter().zip(&maps).zip(sums) {
+    for (site, sum) in chosen.iter().zip(sums) {
+        let w = matrix(&program, site)?;
         let (narrow, mean) = match sum {
             Sums::Reads { x, xx, pulled } => {
                 let mean = x / rows;
@@ -277,13 +362,13 @@ fn fit(
                 (Narrow::Writes { fisher: gg / draws, written_covariance: yy / rows - outer(&y_mean) }, x / rows)
             }
         };
-        let (library, weight) = fisher_svd_narrow(w, &narrow)?;
-        let exactness = library.exactness(w);
+        let (library, weight) = fisher_svd_narrow(&w, &narrow)?;
+        let exactness = library.exactness(&w);
         log::info!("{}: {}×{}, {} pieces ({} for exactness), exactness {exactness:.1e}", site.name, w.nrows(), w.ncols(), library.u.nrows(), library.exactness_pieces);
         let v = library.v.t().to_owned();
         let file = |suffix: &str| out.join("library").join(format!("{}.{suffix}", site.name));
-        write_raw(&mut create(&file("v.f32"))?, v.iter().map(|x| *x as f32), f32::to_le_bytes)?;
-        write_raw(&mut create(&file("u.f32"))?, library.u.iter().map(|x| *x as f32), f32::to_le_bytes)?;
+        write_raw(&mut std::io::BufWriter::new(create(&file("v.f32"))?), v.iter().map(|x| *x as f32), f32::to_le_bytes)?;
+        write_raw(&mut std::io::BufWriter::new(create(&file("u.f32"))?), library.u.iter().map(|x| *x as f32), f32::to_le_bytes)?;
         write_raw(&mut create(&file("mean.f64"))?, mean.iter().copied(), f64::to_le_bytes)?;
         piece_sites.push(json!({
             "name": site.name, "layer": layer_of(site), "d_out": w.nrows(), "d_in": w.ncols(), "pieces": v.nrows(),
@@ -296,11 +381,15 @@ fn fit(
     let total_pieces = offset;
     std::fs::write(out.join("pieces.json"), serde_json::to_string(&json!({"first": first, "last": last, "observations": observations, "sites": piece_sites})).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
-    let masked = Masked::build(&program, chosen.clone(), libraries)?;
+    let mut masked = Masked::build(&program, chosen, libraries)?;
+    // Selection only: the program holds each site once, as its pieces.
+    masked.release_training_state()?;
+    drop(program);
+    masked.head = Some(head.clone() as Arc<dyn Head>);
     log::info!("libraries built: {total_pieces} pieces ({:.0}s)", started.elapsed().as_secs_f64());
 
     // 2-3. Selection and the refusal score's gradient, prompt batch by batch.
-    let mut context = Context::new(&masked.libraries.iter().map(|l| l.v.nrows()).collect::<Vec<_>>());
+    let mut context = Context::new(&weights.iter().map(Vec::len).collect::<Vec<_>>());
     let (mut indptr_file, mut indices_file, mut share_file, mut effects_file) = (
         create(&out.join("sets.indptr.i64"))?,
         create(&out.join("sets.indices.i64"))?,
@@ -314,20 +403,26 @@ fn fit(
     for range in &batches {
         let tick = std::time::Instant::now();
         let b = batch(&prompts, &offsets, &resid, d, range.clone());
-        let native = program.execute(&b.inputs, false).map_err(|e| e.to_string())?;
-        let target = Target { logits: native.values[program.output].clone(), scored: Some(b.scored.clone()) };
+        // Every piece on is the model (the libraries are exact): its logits are the target, and its
+        // `z = V(x − μ)` the pieces' activations.
+        let on: Vec<Array2<f64>> = weights.iter().map(|w| Array2::ones((b.inputs.rows, w.len()))).collect();
+        let native = masked.program.execute(&masked.family(&b.inputs, &on), false).map_err(|e| e.to_string())?;
+        let all_rows = Target { logits: Array2::zeros((0, 0)), scored: Some(b.scored.clone()) };
+        let target = Target { logits: gam_mpd::masked::logits(&masked, &b.inputs, &native, &all_rows)?.into_owned(), scored: Some(b.scored.clone()) };
         let previous: Vec<Option<usize>> = (0..b.inputs.rows).map(|r| (r > 0 && b.scored[r] && b.scored[r - 1] && !b.starts.contains(&r)).then(|| r - 1)).collect();
         let coder = context.coder(previous.clone());
         // The start: every piece on off the behaviour's rows; on its rows the pieces whose own
         // second-order KL bits, `n s_c a² / (2 ln 2)` with `a = v · (x − μ)`, exceed their cost.
         let mut start = Vec::new();
-        for (k, (site, library)) in chosen.iter().zip(&masked.libraries).enumerate() {
-            let a = (read_values(&native, site)? - &library.mean).dot(&library.v.t());
+        for (k, weight) in weights.iter().enumerate() {
+            let a = &native.values[masked.z[k]];
             start.push(Array2::from_shape_fn(a.dim(), |(r, c)| {
-                let on = !b.scored[r] || 0.5 * scale * a[[r, c]] * a[[r, c]] * weights[k][c] > coder.costs[k][c];
-                if on { 1.0 } else { 0.0 }
+                let keep = !b.scored[r] || 0.5 * scale * a[[r, c]] * a[[r, c]] * weight[c] > coder.costs[k][c];
+                if keep { 1.0 } else { 0.0 }
             }));
         }
+        let native_scores: Vec<f64> = b.decisions.iter().map(|r| refusal_score(target.logits.row(*r), &refusal)).collect();
+        drop(native);
         let (masks, _) = select(&masked, &b.inputs, &target, start, &coder, observations, samples)?;
         // The code over the behaviour's rows alone, and its counts.
         let keep: Vec<usize> = (0..b.inputs.rows).filter(|r| b.scored[*r]).collect();
@@ -337,8 +432,8 @@ fn fit(
         context.absorb(&kept_masks, &kept_previous);
         // The refusal score's gradient in every mask entry at the selected sets.
         let family = masked.family(&b.inputs, &masks);
-        let (kl, trace, _) = forward(&masked, &family, &target)?;
-        let logits = &trace.values[masked.program.output];
+        let (kl_rows, trace, _) = forward(&masked, &family, &target)?;
+        let logits = gam_mpd::masked::logits(&masked, &b.inputs, &trace, &target)?.into_owned();
         let mut cotangent = Array2::<f64>::zeros(logits.dim());
         for &r in &b.decisions {
             let q = softmax(logits.row(r));
@@ -350,19 +445,17 @@ fn fit(
                 cotangent[[r, i]] = q[i] / p;
             }
         }
+        let cotangent = to_output(&masked, &b.inputs, &trace, &target, cotangent)?;
         let shares = mask_gradients(&masked, &family, &trace, cotangent)?;
         for (s, p) in range.clone().enumerate() {
             let (from, to) = (b.starts[s], b.starts[s] + prompts[p].ids.len());
             let mut effects = Vec::with_capacity(total_pieces);
             for (m, g) in masks.iter().zip(&shares) {
-                let on = &m.slice(ndarray::s![from..to, ..]) * &g.slice(ndarray::s![from..to, ..]);
+                let on = &m.slice(s![from..to, ..]) * &g.slice(s![from..to, ..]);
                 effects.extend(on.sum_axis(Axis(0)).iter().map(|x| *x as f32));
             }
             write_raw(&mut effects_file, effects, f32::to_le_bytes)?;
-            prompt_records.push(json!({
-                "native_score": refusal_score(native.values[program.output].row(b.decisions[s]), &refusal),
-                "masked_score": refusal_score(logits.row(b.decisions[s]), &refusal),
-            }));
+            prompt_records.push(json!({"native_score": native_scores[s], "masked_score": refusal_score(logits.row(b.decisions[s]), &refusal)}));
         }
         let mut active = 0usize;
         for (i, &r) in keep.iter().enumerate() {
@@ -383,9 +476,9 @@ fn fit(
             write_raw(&mut share_file, values, f32::to_le_bytes)?;
             write_raw(&mut indptr_file, [entries], i64::to_le_bytes)?;
             let s = b.starts.iter().rposition(|start| *start <= r).unwrap_or(0);
-            row_records.push(json!({"prompt": range.start + s, "position": r - b.starts[s], "kl": kl[r], "listing_bits": listing[i]}));
+            row_records.push(json!({"prompt": range.start + s, "position": r - b.starts[s], "kl": kl_rows[r], "listing_bits": listing[i]}));
         }
-        let kl_mean = keep.iter().map(|r| kl[*r]).sum::<f64>() / keep.len().max(1) as f64;
+        let kl_mean = keep.iter().map(|r| kl_rows[*r]).sum::<f64>() / keep.len().max(1) as f64;
         log::info!(
             "prompts {}..{}: L0 {:.1} of {total_pieces}, KL {kl_mean:.4} per scored row, listing {:.1} bits; {:.0}s",
             range.start,
@@ -404,31 +497,17 @@ fn fit(
 fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
-    let usage = "mpd_refusal_pieces_2951 {validate MODEL_DIR DIR [GPU] | fit MODEL_DIR DATA_DIR OUT_DIR LAST OBSERVATIONS STATS [BATCH] [GPU]}";
+    let usage = "mpd_refusal_pieces_2951 {validate MODEL_DIR DIR | fit MODEL_DIR DATA_DIR OUT_DIR LAST OBSERVATIONS STATS BATCH GPU HEAD_SOCKET [PROMPTS]}";
     let arg = |i: usize| args.get(i).ok_or_else(|| usage.to_string());
-    let gpu = |i: usize| -> Result<(), String> {
-        let raw = args.get(i).map_or("off", String::as_str);
-        gam_gpu::configure_global_policy(gam_gpu::GpuPolicy::parse(raw).ok_or_else(|| format!("GPU {raw}: expected off, auto or required"))?);
-        Ok(())
-    };
     match arg(1)?.as_str() {
-        "validate" => {
-            gpu(4)?;
-            validate(&PathBuf::from(arg(2)?), &PathBuf::from(arg(3)?))
-        }
+        "validate" => validate(&PathBuf::from(arg(2)?), &PathBuf::from(arg(3)?)),
         "fit" => {
             let number = |i: usize| -> Result<f64, String> { arg(i)?.parse().map_err(|e| format!("{}: {e}", args[i])) };
-            let batch_size = args.get(8).map_or(Ok(4), |v| v.parse()).map_err(|e| format!("BATCH: {e}"))?;
-            gpu(9)?;
-            fit(
-                &PathBuf::from(arg(2)?),
-                &PathBuf::from(arg(3)?),
-                &PathBuf::from(arg(4)?),
-                number(5)? as usize,
-                number(6)?,
-                number(7)? as usize,
-                batch_size,
-            )
+            let gpu = arg(9)?;
+            gam_gpu::configure_global_policy(gam_gpu::GpuPolicy::parse(gpu).ok_or_else(|| format!("GPU {gpu}: expected off, auto or required"))?);
+            let prompts = args.get(11).map_or(Ok(usize::MAX), |v| v.parse()).map_err(|e| format!("PROMPTS: {e}"))?;
+            let settings = Settings { last: number(5)? as usize, observations: number(6)?, stats: number(7)? as usize, batch: number(8)? as usize, prompts };
+            fit(&PathBuf::from(arg(2)?), &PathBuf::from(arg(3)?), &PathBuf::from(arg(4)?), &settings, &PathBuf::from(arg(10)?))
         }
         _ => Err(usage.to_string()),
     }

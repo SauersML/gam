@@ -264,7 +264,7 @@ fn pieces_grown_from_what_selection_leaves_out_recover_its_kl() {
     let (before, trace, _) = forward(&masked, &fam, &target).expect("forward");
     let (v, u) = dropped_atoms(&masked, 0, &trace, &masks[0], &running, 1000.0, 0.0).expect("atoms");
     assert!(v.nrows() >= 1, "no atom");
-    let grown = with_pieces(&masked.libraries[0], &v, &u).expect("grown");
+    let grown = with_pieces(&masked.library(0).expect("library"), &v, &u).expect("grown");
     let added = v.nrows();
     let bigger = Masked::build(&program, vec![site], vec![grown]).expect("builds");
     let on = vec![Array2::from_shape_fn((family.rows, pieces + added), |(_, c)| if c == 2 { 0.0 } else { 1.0 })];
