@@ -185,6 +185,13 @@ pub mod theory;
 #[cfg(test)]
 mod theory_tests;
 
+// Symmetries discovered from weights and the isotypic bases they force.
+pub mod symmetry;
+
+// The planted groups, discovery toys and nulls against the symmetry owner.
+#[cfg(test)]
+mod symmetry_tests;
+
 // Behaviour discovery: the family partitioned into groups, each its own subprogram, by one two-part code.
 pub mod behaviors;
 
