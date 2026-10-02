@@ -63,6 +63,10 @@ pub mod engine;
 #[cfg(test)]
 mod engine_tests;
 
+// The shared-factor fit on a planted layer: one rule per plane, found without naming the planes.
+#[cfg(test)]
+mod factors_tests;
+
 // The component-level view of an operator program: reads, laws, writes, uses, bits, unresolved share.
 pub mod view;
 
@@ -74,6 +78,10 @@ pub mod operator_rewrites;
 
 // Shared writer factors: operators writing one space factored through one library of directions.
 pub mod factors;
+
+// Identifiability: the search's ties classified as gauge, abstraction, redundancy or a distinct
+// hypothesis with a natively executed witness.
+pub mod identify;
 
 // Exact directional derivatives of operator programs, and precisions derived from curvature.
 pub mod derivatives;

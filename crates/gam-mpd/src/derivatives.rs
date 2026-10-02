@@ -34,6 +34,19 @@ pub fn jvp(
     trace: &Trace,
     tangents: &BTreeMap<usize, Array2<f64>>,
 ) -> Result<Array2<f64>, ProgramError> {
+    jvp_seeded(program, inputs, trace, tangents, &BTreeMap::new())
+}
+
+/// [`jvp`] with node seeds: `seeds[node]` (rows × the node's width) is added to that node's
+/// tangent after its own rule, so a seed alone gives the output's derivative along a direction
+/// of the node's value.
+pub fn jvp_seeded(
+    program: &OperatorProgram,
+    inputs: &FamilyInputs,
+    trace: &Trace,
+    tangents: &BTreeMap<usize, Array2<f64>>,
+    seeds: &BTreeMap<usize, Array2<f64>>,
+) -> Result<Array2<f64>, ProgramError> {
     let interfaces = program.interfaces()?;
     let rows = inputs.rows;
     let mut dv: Vec<Option<Array2<f64>>> = vec![None; program.nodes.len()];
@@ -235,7 +248,11 @@ pub fn jvp(
                 }
             }
         };
-        dv[index] = t;
+        dv[index] = match (t, seeds.get(&index)) {
+            (Some(t), Some(seed)) => Some(t + seed),
+            (None, Some(seed)) => Some(seed.clone()),
+            (t, None) => t,
+        };
     }
     Ok(dv[program.output].clone().unwrap_or_else(|| Array2::zeros(trace.values[program.output].dim())))
 }

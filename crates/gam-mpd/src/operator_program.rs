@@ -112,9 +112,11 @@ pub enum LabelKind {
     /// The product of group `index / G₂` of a left interface and group `index mod G₂` of a right
     /// interface of `G₂` groups.
     Pair,
+    /// One coordinate of a fitted factor basis shared by the operators that read or write it.
+    Factor,
 }
 
-const LABEL_KINDS: [LabelKind; 8] = [
+const LABEL_KINDS: [LabelKind; 9] = [
     LabelKind::Native,
     LabelKind::Const,
     LabelKind::Plane,
@@ -123,6 +125,7 @@ const LABEL_KINDS: [LabelKind; 8] = [
     LabelKind::Position,
     LabelKind::Control,
     LabelKind::Pair,
+    LabelKind::Factor,
 ];
 
 /// A labelled coordinate group.

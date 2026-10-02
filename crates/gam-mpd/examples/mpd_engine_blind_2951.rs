@@ -14,18 +14,13 @@
 //! report).
 
 use gam_mpd::import::{import, import_language_model, is_language_model};
-use gam_mpd::engine::{Budget, Coarsen, DeadUnits, DropBlocks, LawSubstitution, LowRank, Primitive, decompose_from};
-use gam_mpd::operator_rewrites::{
-    BilinearConstantSide, CenterLogits, ComposeAffine, DropKeyBias, FoldConstants, PlaneBasis, PushThroughMix, StackTerms,
-};
-use gam_mpd::derivatives::CurvaturePrecision;
-use gam_mpd::factors::SharedFactors;
-use gam_mpd::refit::RefitSearch;
+use gam_mpd::engine::{Budget, decompose_from, library};
 use gam_mpd::view::view;
 use serde_json::json;
 use std::path::PathBuf;
 
 fn main() -> Result<(), String> {
+    gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
     let usage = "mpd_engine_blind_2951 MODEL_DIR OUT_DIR [SCREENINGS CERTIFICATIONS]";
     let dir = PathBuf::from(args.get(1).ok_or(usage)?);
@@ -35,24 +30,8 @@ fn main() -> Result<(), String> {
     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
     // A language model's family is its first 4 token rows at 64 positions.
     let imported = if is_language_model(&dir)? { import_language_model(&dir, 4, 64)? } else { import(&dir)? };
-    let library: Vec<Box<dyn Primitive>> = vec![
-        Box::new(FoldConstants),
-        Box::new(BilinearConstantSide),
-        Box::new(ComposeAffine),
-        Box::new(PushThroughMix),
-        Box::new(PlaneBasis),
-        Box::new(DropBlocks),
-        Box::new(Coarsen),
-        Box::new(DeadUnits),
-        Box::new(LowRank),
-        Box::new(StackTerms),
-        Box::new(CenterLogits),
-        Box::new(DropKeyBias),
-        Box::new(SharedFactors),
-        Box::new(LawSubstitution),
-        Box::new(CurvaturePrecision { probes: 4 }),
-    ];
-    let budget = Budget { screenings, certifications, refit: Some(RefitSearch { newton_steps: 8, conjugate_gradient_steps: 16 }) };
+    let library = library();
+    let budget = Budget { screenings, certifications, ..Budget::default() };
     let model = &imported.program;
     let native_bits = model.code_bits().map_err(|e| e.to_string())?;
     let mut start = model.clone();
@@ -105,6 +84,21 @@ fn main() -> Result<(), String> {
                 "name": c.name, "reads": c.reads, "writes": c.writes, "laws": c.laws, "uses": c.uses,
                 "reals": c.reals, "bits": c.bits, "sources": c.sources, "unresolved": c.unresolved,
             })).collect::<Vec<_>>(),
+            "curve": result.curve.iter().map(|c| json!({
+                "structure_bits": c.structure_bits, "rest_bits": c.rest_bits, "description": c.description,
+            })).collect::<Vec<_>>(),
+            "knee": result.knee().map(|c| json!({"structure_bits": c.structure_bits, "rest_bits": c.rest_bits, "description": c.description})),
+            "identification": match gam_mpd::identify::identify(model, &contract, &result) {
+                Ok(id) => json!({
+                    "identified": id.identified,
+                    "gauge": id.gauge,
+                    "alternatives": id.alternatives.iter().map(|a| json!({
+                        "description": a.description, "structure_bits": a.structure_bits, "total": a.total,
+                        "relation": a.relation.to_string(),
+                    })).collect::<Vec<_>>(),
+                }),
+                Err(error) => json!({"error": error.to_string()}),
+            },
             "stop": format!("{:?}", result.stop),
             "seconds": started.elapsed().as_secs_f64(),
         }));

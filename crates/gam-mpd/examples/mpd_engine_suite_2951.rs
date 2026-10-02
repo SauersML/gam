@@ -24,43 +24,15 @@
 //!   the program, the score's `Explanation`) and its largest components (what the top rules say).
 
 use gam_mpd::contract::{Contract, ProgramScore};
-use gam_mpd::derivatives::CurvaturePrecision;
-use gam_mpd::engine::{
-    Budget, Coarsen, DeadUnits, DropBlocks, Edit, LawSubstitution, LowRank, Primitive, apply_edit, decompose_with_reference,
-};
-use gam_mpd::factors::SharedFactors;
+use gam_mpd::engine::{Budget, Edit, apply_edit, decompose_with_reference, library};
 use gam_mpd::import::{import, import_language_model, is_language_model};
 use gam_mpd::operator_program::{OperatorBody, OperatorProgram};
-use gam_mpd::operator_rewrites::{
-    BilinearConstantSide, CenterLogits, ComposeAffine, DropKeyBias, FoldConstants, PlaneBasis, PushThroughMix, StackTerms,
-};
 use gam_mpd::precision::DeclaredPrecision;
-use gam_mpd::refit::RefitSearch;
 use gam_mpd::secant::BandedMatrix;
 use gam_mpd::view::{ProgramView, view};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-
-fn library() -> Vec<Box<dyn Primitive>> {
-    vec![
-        Box::new(FoldConstants),
-        Box::new(BilinearConstantSide),
-        Box::new(ComposeAffine),
-        Box::new(PushThroughMix),
-        Box::new(PlaneBasis),
-        Box::new(DropBlocks),
-        Box::new(Coarsen),
-        Box::new(DeadUnits),
-        Box::new(LowRank),
-        Box::new(StackTerms),
-        Box::new(CenterLogits),
-        Box::new(DropKeyBias),
-        Box::new(SharedFactors),
-        Box::new(LawSubstitution),
-        Box::new(CurvaturePrecision { probes: 4 }),
-    ]
-}
 
 /// The model with every operator's reals on the lattice of `bits` bits under their RMS.
 fn rounded(model: &OperatorProgram, bits: i32) -> Result<OperatorProgram, String> {
@@ -137,6 +109,7 @@ fn export_check(dir: &Path, record: &Value, logits: &BandedMatrix, context: usiz
 }
 
 fn main() -> Result<(), String> {
+    gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
     let usage = "mpd_engine_suite_2951 MODEL_DIR OUT_DIR [SEQUENCES CONTEXT [SCREENINGS CERTIFICATIONS [RUNGS]]]";
     let dir = PathBuf::from(args.get(1).ok_or(usage)?);
@@ -148,7 +121,7 @@ fn main() -> Result<(), String> {
     let budget = Budget {
         screenings: number(5, 1 << 20)?,
         certifications: number(6, 1 << 12)?,
-        refit: Some(RefitSearch { newton_steps: 8, conjugate_gradient_steps: 16 }),
+        ..Budget::default()
     };
     let rungs = number(7, 6)? as u32;
     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;

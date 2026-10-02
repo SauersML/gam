@@ -20,7 +20,7 @@
 //! 2. Each proposal's program bits are computed exactly (its decoded message length).
 //! 3. Each proposal is screened: its logits on the family (for a local edit only what the edit
 //!    changes is propagated, `OperatorProgram::execute_incremental`) and the resulting data bits.
-//!    A proposal whose screened total is not below the current total is retried, when the budget
+//!    A structural proposal whose screened total is not below the current total is retried, when the budget
 //!    allows, as one compound move with the readout's reals refitted (`refit::refit_readout`).
 //!    Screening certifies nothing; it ranks.
 //! 4. The screened proposals are ranked by total saving. A structural proposal (one that replaces
@@ -40,11 +40,10 @@ use super::operator_program::{
     FamilyInputs, Interface, LabelKind, Law, Node, Operator, OperatorBody, OperatorProgram, ProgramError, Trace,
     round_to_lattice,
 };
-use super::dense::svd;
 use super::refit::{RefitSearch, refit_readout};
 use super::precision::DeclaredPrecision;
 use super::secant::BandedMatrix;
-use ndarray::{Array2, Axis, s};
+use ndarray::{Array2, s};
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -134,6 +133,61 @@ pub struct Budget {
     pub refit: Option<RefitSearch>,
 }
 
+impl Default for Budget {
+    /// The budget every driver runs: about a million screenings, four thousand certifications,
+    /// and the readout refit.
+    fn default() -> Self {
+        Self { screenings: 1 << 20, certifications: 1 << 12, refit: Some(RefitSearch { newton_steps: 8, conjugate_gradient_steps: 16 }) }
+    }
+}
+
+/// The library every driver runs: the exact rewrites, the restrictions, the curvature
+/// precisions, law substitution and the fitted shared factors. Nothing in it names a task.
+pub fn library() -> Vec<Box<dyn Primitive>> {
+    use super::derivatives::CurvaturePrecision;
+    use super::factors::Factors;
+    use super::operator_rewrites::{
+        BilinearConstantSide, CenterLogits, ComposeAffine, DropKeyBias, FoldConstants, PlaneBasis, PushThroughMix, StackTerms,
+    };
+    vec![
+        Box::new(FoldConstants),
+        Box::new(BilinearConstantSide),
+        Box::new(ComposeAffine),
+        Box::new(PushThroughMix),
+        Box::new(PlaneBasis),
+        Box::new(DropBlocks),
+        Box::new(Coarsen),
+        Box::new(DeadUnits),
+        Box::new(StackTerms),
+        Box::new(CenterLogits),
+        Box::new(DropKeyBias),
+        Box::new(Factors),
+        Box::new(LawSubstitution),
+        Box::new(CurvaturePrecision { probes: 4 }),
+    ]
+}
+
+/// A logger writing the engine's progress (`log::info!`: each accepted move) to standard error,
+/// for drivers; installed once, later calls are no-ops.
+pub fn log_to_stderr() {
+    struct Stderr;
+    impl log::Log for Stderr {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Info
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                eprintln!("{}", record.args());
+            }
+        }
+        fn flush(&self) {}
+    }
+    static LOGGER: Stderr = Stderr;
+    if log::set_logger(&LOGGER).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
+}
+
 /// Why the search stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stop {
@@ -143,12 +197,90 @@ pub enum Stop {
     CertificationBudget,
 }
 
-/// The result of [`decompose`]: the program, its certified two-part score, and why it stopped.
+/// The result of [`decompose`]: the program, its certified score, why it stopped, and the
+/// structure function the search traced.
 #[derive(Clone, Debug)]
 pub struct Decomposition {
     pub program: OperatorProgram,
     pub score: ProgramScore,
     pub stop: Stop,
+    /// The Pareto front of every certified program the search scored: structure bits against
+    /// the rest of the code (precision, explanations and data), ascending in structure.
+    pub curve: Vec<CurvePoint>,
+    /// Certified programs the code cannot tell from the returned one: their totals' certified
+    /// intervals overlap it. Each is an edit of a program the search held, or another start's
+    /// result (`identify` classifies them).
+    pub ties: Vec<Tie>,
+}
+
+/// A certified program whose total is not proven longer than the returned program's.
+#[derive(Clone, Debug)]
+pub struct Tie {
+    pub program: OperatorProgram,
+    pub score: ProgramScore,
+    pub description: String,
+    /// Whether every edit that produced it from the held program is exact in exact arithmetic.
+    pub exact: bool,
+}
+
+/// One certified program on the structure function.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CurvePoint {
+    pub structure_bits: u64,
+    /// Precision, explanation and data bits at the computed values.
+    pub rest_bits: f64,
+    pub description: String,
+}
+
+impl CurvePoint {
+    fn of(score: &ProgramScore, description: String) -> Self {
+        Self { structure_bits: score.structure_bits, rest_bits: score.total() - score.structure_bits as f64, description }
+    }
+}
+
+/// The points no other point beats in both structure and the rest, ascending in structure.
+fn pareto(mut points: Vec<CurvePoint>) -> Vec<CurvePoint> {
+    points.sort_by(|a, b| a.structure_bits.cmp(&b.structure_bits).then_with(|| a.rest_bits.total_cmp(&b.rest_bits)));
+    let mut front: Vec<CurvePoint> = Vec::new();
+    for point in points {
+        if front.last().is_none_or(|last| point.rest_bits < last.rest_bits) {
+            front.push(point);
+        }
+    }
+    front
+}
+
+impl Decomposition {
+    /// The knee of the structure function: on the lower convex hull of [`Self::curve`], the first
+    /// vertex after which one more bit of structure buys less than one bit of the rest (the
+    /// hull's slope reaches `−1`). It is the least-structure program of least total on the
+    /// hull, derived from the code alone.
+    pub fn knee(&self) -> Option<&CurvePoint> {
+        let points = &self.curve;
+        let mut hull: Vec<usize> = Vec::new();
+        for index in 0..points.len() {
+            while hull.len() >= 2 {
+                let (a, b) = (&points[hull[hull.len() - 2]], &points[hull[hull.len() - 1]]);
+                let c = &points[index];
+                let cross = (b.structure_bits as f64 - a.structure_bits as f64) * (c.rest_bits - a.rest_bits)
+                    - (b.rest_bits - a.rest_bits) * (c.structure_bits as f64 - a.structure_bits as f64);
+                if cross <= 0.0 {
+                    hull.pop();
+                } else {
+                    break;
+                }
+            }
+            hull.push(index);
+        }
+        for pair in hull.windows(2) {
+            let (a, b) = (&points[pair[0]], &points[pair[1]]);
+            let slope = (b.rest_bits - a.rest_bits) / (b.structure_bits as f64 - a.structure_bits as f64);
+            if slope >= -1.0 {
+                return Some(a);
+            }
+        }
+        hull.last().map(|&i| &points[i])
+    }
 }
 
 /// A refused decomposition.
@@ -402,17 +534,33 @@ pub fn decompose_with_reference(
     for (start, score) in scored {
         results.push(search(&reference, start.clone(), score, contract, library, budget)?);
     }
+    let curve = pareto(results.iter().flat_map(|r| r.curve.iter().cloned()).collect());
     let shortest = results.iter().map(|r| r.score.total_upper()).fold(f64::INFINITY, f64::min);
-    results
-        .into_iter()
-        .filter(|r| r.score.total_lower() <= shortest)
-        .min_by(|a, b| {
+    let chosen_index = results
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.score.total_lower() <= shortest)
+        .min_by(|(_, a), (_, b)| {
             a.score
                 .structure_bits
                 .cmp(&b.score.structure_bits)
                 .then_with(|| a.score.total_upper().total_cmp(&b.score.total_upper()))
         })
-        .ok_or_else(|| EngineError::UnresolvedStart("an empty start set".to_string()))
+        .map(|(index, _)| index)
+        .ok_or_else(|| EngineError::UnresolvedStart("an empty start set".to_string()))?;
+    let mut chosen = results.swap_remove(chosen_index);
+    // The other starts' results and ties that the code cannot separate from the chosen program.
+    let mut ties = std::mem::take(&mut chosen.ties);
+    for other in results {
+        if !chosen.score.proven_shorter_than(&other.score) && other.program != chosen.program {
+            ties.push(Tie { program: other.program, score: other.score, description: "another start's result".to_string(), exact: false });
+        }
+        ties.extend(other.ties);
+    }
+    ties.retain(|tie| !chosen.score.proven_shorter_than(&tie.score) && tie.program != chosen.program);
+    chosen.ties = ties;
+    chosen.curve = curve;
+    Ok(chosen)
 }
 
 /// The search from one start program whose certified score is `start_score`.
@@ -425,6 +573,8 @@ fn search(
     budget: &Budget,
 ) -> Result<Decomposition, EngineError> {
     let mut program = start;
+    let mut curve = vec![CurvePoint::of(&start_score, "start".to_string())];
+    let mut ties: Vec<Tie> = Vec::new();
     let mut current = start_score;
     let mut refused: BTreeSet<String> = BTreeSet::new();
     let (mut screenings, mut certifications) = (0u64, 0u64);
@@ -462,8 +612,11 @@ fn search(
             })?;
             let mut saving = base_total - (bits + explanation_bits + screened_data_bits(&reference, &logits, contract.observations));
             let mut proposal = proposal;
+            // The compound move is tried for structural proposals only: restrictions and
+            // precisions come in the thousands, and a refit each would be the whole search.
             if saving <= 0.0
                 && bits < base_total
+                && !proposal.edit.is_local()
                 && let Some(search) = budget.refit
                 && let Some(refit) = refit_after(&candidate, contract, &reference, search)?
             {
@@ -522,8 +675,12 @@ fn search(
             }
             candidate.prune();
             let score = contract.score(&candidate, &reference.banded)?;
+            curve.push(CurvePoint::of(
+                &score,
+                members.iter().map(|&m| screened[m].proposal.description.as_str()).collect::<Vec<_>>().join("; "),
+            ));
             if score.proven_shorter_than(&current) {
-                log::debug!(
+                log::info!(
                     "accepted {} proposal(s): {} + {:.1} bits -> {} + {:.1} bits: {:?}",
                     members.len(),
                     current.program_bits,
@@ -533,6 +690,14 @@ fn search(
                     members.iter().map(|&m| screened[m].proposal.description.as_str()).collect::<Vec<_>>()
                 );
                 break Some((candidate, score));
+            }
+            if !current.proven_shorter_than(&score) {
+                ties.push(Tie {
+                    program: candidate,
+                    score: score.clone(),
+                    description: members.iter().map(|&m| screened[m].proposal.description.as_str()).collect::<Vec<_>>().join("; "),
+                    exact: members.iter().all(|&m| matches!(screened[m].proposal.exactness, Exactness::Exact { .. })),
+                });
             }
             if size > 1 {
                 size /= 2;
@@ -544,10 +709,11 @@ fn search(
         if let Some((candidate, score)) = accepted {
             program = candidate;
             current = score;
+            ties.retain(|tie| !current.proven_shorter_than(&tie.score));
             level = 0;
         }
     };
-    Ok(Decomposition { program, score: current, stop })
+    Ok(Decomposition { program, score: current, stop, curve: pareto(curve), ties })
 }
 
 /// A decomposition refined against a pool of inputs the family does not hold.
@@ -752,67 +918,6 @@ impl Primitive for Coarsen {
     }
 }
 
-/// Replace a dense operator by a rank-`r` product from its singular value decomposition,
-/// `left = U_r Σ_r^{1/2}`, `right = Σ_r^{1/2} V_rᵀ`, on the operator's lattice, for `r = 1, 2, 4, …`
-/// while the factors hold fewer reals than the operator: exact when the dropped singular values
-/// are within the decomposition's band, and certified by the contract otherwise.
-pub struct LowRank;
-
-impl Primitive for LowRank {
-    fn name(&self) -> &'static str {
-        "low_rank"
-    }
-
-    fn propose(&self, context: &SearchContext<'_>) -> Result<Vec<Proposal>, EngineError> {
-        let program = context.program;
-        let mut out = Vec::new();
-        for (index, op) in program.operators.iter().enumerate() {
-            let OperatorBody::Dense { precision, .. } = &op.body else { continue };
-            let (m, n) = (op.rows.width(), op.cols.width());
-            let reals = op.real_count();
-            if m < 2 || n < 2 || m + n >= reals {
-                continue;
-            }
-            let decomposed = svd(op.matrix().view(), false).map_err(|error| EngineError::Primitive(format!("{error:?}")))?;
-            let mut rank = 1;
-            while rank < m.min(n) && rank * (m + n) < reals {
-                let scale: Vec<f64> = decomposed.singular_values.iter().take(rank).map(|s| s.sqrt()).collect();
-                let mut left = decomposed.u.slice(s![.., ..rank]).to_owned();
-                let mut right = decomposed.vt.slice(s![..rank, ..]).to_owned();
-                for (k, sk) in scale.iter().enumerate() {
-                    left.column_mut(k).mapv_inplace(|v| v * sk);
-                    right.row_mut(k).mapv_inplace(|v| v * sk);
-                }
-                let dropped = decomposed.singular_values.iter().skip(rank).copied().fold(0.0_f64, f64::max);
-                let exactness = if dropped <= decomposed.band {
-                    Exactness::Exact { derivation: format!("singular values beyond {rank} are within the band {:e}", decomposed.band) }
-                } else {
-                    Exactness::Approximate
-                };
-                let mut candidate = program.clone();
-                candidate.operators[index] = Operator::low_rank(
-                    op.name.clone(),
-                    op.rows.clone(),
-                    op.cols.clone(),
-                    left,
-                    right,
-                    *precision,
-                    op.provenance.clone(),
-                )?;
-                out.push(Proposal {
-                    primitive: "low_rank",
-                    kind: ProposalKind::Reduce,
-                    exactness,
-                    description: format!("rank {rank} of {}", op.name),
-                    edit: Edit::Program(Box::new(candidate)),
-                });
-                rank *= 2;
-            }
-        }
-        Ok(out)
-    }
-}
-
 /// A ReLU unit whose pre-activation is at most zero on every input of the family is the zero law
 /// there: its law becomes zero, and the blocks that write it and read it are removed.
 pub struct DeadUnits;
@@ -952,15 +1057,4 @@ impl Primitive for LawSubstitution {
         }
         Ok(out)
     }
-}
-
-/// The per-row oscillation of `values`, exposed for primitives that bound their own effect.
-pub fn row_oscillation(values: &Array2<f64>) -> Vec<f64> {
-    values
-        .axis_iter(Axis(0))
-        .map(|row| {
-            let (lo, hi) = row.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
-            hi - lo
-        })
-        .collect()
 }

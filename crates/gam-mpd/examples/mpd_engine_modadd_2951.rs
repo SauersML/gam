@@ -27,24 +27,14 @@
 //! `k`) and each component's reads, laws, writes, uses and bits.
 
 use gam_mpd::contract::{Contract, FamilyKind};
-use gam_mpd::engine::{
-    Budget, Coarsen, DeadUnits, DropBlocks, Edit, EngineError, Exactness, LawSubstitution, LowRank, Primitive, Proposal,
-    SearchContext,
-    decompose_from,
-};
+use gam_mpd::engine::{Budget, Edit, EngineError, Exactness, Primitive, Proposal, SearchContext, decompose_from, library};
 use gam_mpd::fit::ProposalKind;
 use gam_mpd::operator_program::{
-    Basis, Declarations, Domain, FamilyInputs, Interface, LabelKind, Law, Node, Operator,
+    Basis, Declarations, Domain, FamilyInputs, Interface, LabelKind, Law, Node, Operator, OperatorBody,
     OperatorProgram, Provenance, Scale, Slot, SlotValues, exact_precision,
 };
-use gam_mpd::derivatives::CurvaturePrecision;
-use gam_mpd::factors::SharedFactors;
-use gam_mpd::refit::RefitSearch;
 use gam_mpd::view::view;
-use gam_mpd::operator_rewrites::{
-    BilinearConstantSide, CenterLogits, ComposeAffine, DropKeyBias, FoldConstants, PlaneBasis, PushThroughMix, StackTerms,
-    change_basis,
-};
+use gam_mpd::operator_rewrites::change_basis;
 use ndarray::{Array2, Axis, s};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -334,6 +324,129 @@ fn frequencies(program: &OperatorProgram, p: usize) -> serde_json::Value {
     json!(tables)
 }
 
+/// The analyst's reading of a factored program, never an input to the search: each factor
+/// coordinate's values over the family as a table over `(a, b)`, its two-dimensional Fourier power
+/// at the frequencies `(k_a, k_b)` carrying the most of it, and the units of each pointwise layer
+/// grouped into rules by their support on the factors they read and write.
+fn rules(program: &OperatorProgram, contract: &Contract, p: usize) -> serde_json::Value {
+    let Ok(trace) = program.execute(&contract.family, false) else { return json!({"error": "execution"}) };
+    let rows = contract.family.rows;
+    let SlotValues::Tokens(a) = &contract.family.slots[0] else { return json!({"error": "slot 0"}) };
+    let SlotValues::Tokens(b) = &contract.family.slots[1] else { return json!({"error": "slot 1"}) };
+    let factor_of = |node: usize| -> Option<usize> {
+        let Node::Affine { terms, .. } = &program.nodes[node] else { return None };
+        (terms.len() == 1 && program.operators[terms[0].1].rows.groups().iter().all(|g| g.label.kind == LabelKind::Factor))
+            .then_some(terms[0].1)
+    };
+    // The dominant frequencies of one column of a node's values over Z_p².
+    let spectrum = |values: ndarray::ArrayView1<'_, f64>| -> serde_json::Value {
+        let mut table = vec![0.0_f64; p * p];
+        for row in 0..rows {
+            table[a[row] as usize * p + b[row] as usize] = values[row];
+        }
+        let mean = table.iter().sum::<f64>() / table.len() as f64;
+        let mut power = Vec::new();
+        for ka in 0..p {
+            for kb in 0..p {
+                let (mut re, mut im) = (0.0, 0.0);
+                for x in 0..p {
+                    for y in 0..p {
+                        let angle = std::f64::consts::TAU * ((ka * x + kb * y) % p) as f64 / p as f64;
+                        let v = table[x * p + y] - mean;
+                        re += v * angle.cos();
+                        im -= v * angle.sin();
+                    }
+                }
+                power.push(((ka, kb), re * re + im * im));
+            }
+        }
+        let total: f64 = power.iter().map(|(_, v)| v).sum();
+        power.sort_by(|x, y| y.1.total_cmp(&x.1));
+        let fold = |k: usize| k.min(p - k);
+        let mut cumulative = 0.0;
+        let top: Vec<serde_json::Value> = power
+            .iter()
+            .take_while(|(_, v)| {
+                let keep = cumulative < 0.9 * total;
+                cumulative += v;
+                keep
+            })
+            .take(6)
+            .map(|((ka, kb), v)| json!({"k_a": fold(*ka), "k_b": fold(*kb), "share": v / total.max(f64::MIN_POSITIVE)}))
+            .collect();
+        json!(top)
+    };
+    let mut layers = Vec::new();
+    for (index, node) in program.nodes.iter().enumerate() {
+        let Node::Pointwise { input, .. } = node else { continue };
+        // Read side: the pre-activation reads factor coordinates z through a coefficient operator.
+        let Node::Affine { terms, .. } = &program.nodes[*input] else { continue };
+        let read = terms.iter().find(|(z, _)| factor_of(*z).is_some()).copied();
+        // Write side: a node reading this layer through a factor basis.
+        let write = program.nodes.iter().enumerate().find_map(|(z, n)| match n {
+            Node::Affine { terms, .. } if terms.len() == 1 && terms[0].0 == index && factor_of(z).is_some() => Some(z),
+            _ => None,
+        });
+        let support = |op: usize, transpose: bool| -> Vec<Vec<usize>> {
+            let OperatorBody::Dense { present, .. } = &program.operators[op].body else { return Vec::new() };
+            let present = if transpose { present.t().to_owned() } else { present.clone() };
+            present.outer_iter().map(|row| row.iter().enumerate().filter(|(_, k)| **k).map(|(i, _)| i).collect()).collect()
+        };
+        let units = trace.values[index].ncols();
+        let reads: Vec<Vec<usize>> = read.map_or(vec![Vec::new(); units], |(_, op)| support(op, false));
+        let writes: Vec<Vec<usize>> = write.and_then(factor_of).map_or(vec![Vec::new(); units], |op| support(op, true));
+        // A rule's factors: the factors its units read (write) together, closed under sharing.
+        let closure = |supports: &[Vec<usize>]| -> Vec<Vec<usize>> {
+            let count = supports.iter().flatten().max().map_or(0, |m| m + 1);
+            let mut parent: Vec<usize> = (0..count).collect();
+            fn root(parent: &[usize], mut x: usize) -> usize {
+                while parent[x] != x {
+                    x = parent[x];
+                }
+                x
+            }
+            for support in supports {
+                for pair in support.windows(2) {
+                    let (a, b) = (root(&parent, pair[0]), root(&parent, pair[1]));
+                    parent[a] = b;
+                }
+            }
+            supports
+                .iter()
+                .map(|support| {
+                    let Some(&first) = support.first() else { return Vec::new() };
+                    let r = root(&parent, first);
+                    (0..count).filter(|&f| root(&parent, f) == r).collect()
+                })
+                .collect()
+        };
+        let (read_rules, write_rules) = (closure(&reads), closure(&writes));
+        let mut groups: std::collections::BTreeMap<(Vec<usize>, Vec<usize>), Vec<usize>> = std::collections::BTreeMap::new();
+        for unit in 0..units {
+            let key = (read_rules.get(unit).cloned().unwrap_or_default(), write_rules.get(unit).cloned().unwrap_or_default());
+            groups.entry(key).or_default().push(unit);
+        }
+        let read_spectra: Vec<serde_json::Value> = read
+            .map(|(z, _)| (0..trace.values[z].ncols()).map(|i| spectrum(trace.values[z].column(i))).collect())
+            .unwrap_or_default();
+        let write_spectra: Vec<serde_json::Value> = write
+            .map(|z| (0..trace.values[z].ncols()).map(|i| spectrum(trace.values[z].column(i))).collect())
+            .unwrap_or_default();
+        let mut listed: Vec<_> = groups.into_iter().collect();
+        listed.sort_by(|x, y| y.1.len().cmp(&x.1.len()));
+        layers.push(json!({
+            "node": index,
+            "units": units,
+            "read_factors": read_spectra,
+            "write_factors": write_spectra,
+            "rules": listed.iter().map(|((r, w), members)| json!({
+                "members": members.len(), "reads": r, "writes": w, "units": members,
+            })).collect::<Vec<_>>(),
+        }));
+    }
+    json!(layers)
+}
+
 /// The empty program: the model's mean logits over the family, the same on every input.
 fn empty_program(model: &OperatorProgram, contract: &Contract) -> Result<OperatorProgram, String> {
     let logits = contract.logits(model).map_err(|e| e.to_string())?.values;
@@ -363,6 +476,7 @@ fn point(label: &str, program: &OperatorProgram, contract: &Contract, model: &Op
 }
 
 fn main() -> Result<(), String> {
+    gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
     let usage = "mpd_engine_modadd_2951 EXPORT_DIR REPEATS(comma-separated, ascending) [declared|recovered] [SCREENINGS CERTIFICATIONS]";
     let dir = PathBuf::from(args.get(1).ok_or(usage)?);
@@ -383,31 +497,11 @@ fn main() -> Result<(), String> {
     let screenings: u64 = args.get(4).map_or(Ok(1 << 20), |v| v.parse()).map_err(|e| format!("SCREENINGS: {e}"))?;
     let certifications: u64 = args.get(5).map_or(Ok(1 << 12), |v| v.parse()).map_err(|e| format!("CERTIFICATIONS: {e}"))?;
     let (config, record) = read_config(&dir)?;
-    let mut library: Vec<Box<dyn Primitive>> = vec![
-        Box::new(FoldConstants),
-        Box::new(BilinearConstantSide),
-        Box::new(ComposeAffine),
-        Box::new(PushThroughMix),
-        Box::new(PlaneBasis),
-        Box::new(DropBlocks),
-        Box::new(Coarsen),
-        Box::new(DeadUnits),
-        Box::new(LowRank),
-        Box::new(StackTerms),
-        Box::new(CenterLogits),
-        Box::new(DropKeyBias),
-        Box::new(SharedFactors),
-        Box::new(LawSubstitution),
-        Box::new(CurvaturePrecision { probes: 4 }),
-    ];
+    let mut library = library();
     if declared {
         library.push(Box::new(DeclaredCharacters));
     }
-    let budget = Budget {
-        screenings,
-        certifications,
-        refit: Some(RefitSearch { newton_steps: 8, conjugate_gradient_steps: 16 }),
-    };
+    let budget = Budget { screenings, certifications, ..Budget::default() };
     let (model, first_contract) = native(&dir, &record, &config, ladder[0], declared)?;
     let endpoints = vec![
         point("native", &model, &first_contract, &model)?,
@@ -437,6 +531,22 @@ fn main() -> Result<(), String> {
             "argmax_uncertified": evaluation.argmax_uncertified,
             "structure": describe(&result.program, config.p),
             "frequencies": frequencies(&result.program, config.p),
+            "rules": rules(&result.program, &contract, config.p),
+            "curve": result.curve.iter().map(|c| json!({
+                "structure_bits": c.structure_bits, "rest_bits": c.rest_bits, "description": c.description,
+            })).collect::<Vec<_>>(),
+            "knee": result.knee().map(|c| json!({"structure_bits": c.structure_bits, "rest_bits": c.rest_bits, "description": c.description})),
+            "identification": match gam_mpd::identify::identify(&model, &contract, &result) {
+                Ok(id) => json!({
+                    "identified": id.identified,
+                    "gauge": id.gauge,
+                    "alternatives": id.alternatives.iter().map(|a| json!({
+                        "description": a.description, "structure_bits": a.structure_bits, "total": a.total,
+                        "relation": a.relation.to_string(),
+                    })).collect::<Vec<_>>(),
+                }),
+                Err(error) => json!({"error": error.to_string()}),
+            },
             "stop": format!("{:?}", result.stop),
             "seconds": started.elapsed().as_secs_f64(),
         }));
