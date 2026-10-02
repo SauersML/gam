@@ -201,3 +201,39 @@ fn a_set_that_carries_over_from_the_previous_input_is_cheap_to_explain() {
     assert!(bits[1] < bits[0], "{bits:?}");
     assert!(bits[1] < 1.0, "{bits:?}");
 }
+
+#[test]
+fn pieces_grown_from_what_selection_leaves_out_recover_its_kl() {
+    use super::masked::{Running, dropped_atoms, with_pieces};
+    let (program, family) = model();
+    let target = program.execute(&family, false).expect("executes").values[program.output].clone();
+    let site = sites(&program).into_iter().find(|s| s.name == "W_in").expect("the W_in site");
+    let pieces = 3;
+    // Three pieces: the site map's leading three singular directions; the rest of the map is in
+    // no piece.
+    let w = super::masked::matrix(&program, &site).expect("matrix");
+    let decomposed = super::dense::svd(w.view(), false).expect("svd");
+    let mut v = Array2::<f64>::zeros((pieces, WIDTH));
+    let mut u = Array2::<f64>::zeros((pieces, UNITS));
+    for c in 0..pieces.min(decomposed.singular_values.len()) {
+        let s = decomposed.singular_values[c].sqrt();
+        v.row_mut(c).assign(&(&decomposed.vt.row(c) * s));
+        u.row_mut(c).assign(&(&decomposed.u.column(c) * s));
+    }
+    let library = Library { v, u, mean: Array1::zeros(WIDTH) };
+    let mut masked = Masked::build(&program, vec![site.clone()], vec![library]).expect("builds");
+    // Piece 2 is dropped everywhere.
+    let masks = vec![Array2::from_shape_fn((family.rows, pieces), |(_, c)| if c == 2 { 0.0 } else { 1.0 })];
+    let mut running = Running::default();
+    step_pieces(&mut masked, &family, &target, &masks, 4, 7, &mut running).expect("steps");
+    let fam = masked.family(&family, &masks);
+    let (before, trace, _) = forward(&masked, &fam, &target).expect("forward");
+    let (v, u) = dropped_atoms(&masked, 0, &trace, &masks[0], &running, 1000.0, 0.0).expect("atoms");
+    assert!(v.nrows() >= 1, "no atom");
+    let grown = with_pieces(&masked.libraries[0], &v, &u).expect("grown");
+    let added = v.nrows();
+    let bigger = Masked::build(&program, vec![site], vec![grown]).expect("builds");
+    let on = vec![Array2::from_shape_fn((family.rows, pieces + added), |(_, c)| if c == 2 { 0.0 } else { 1.0 })];
+    let (after, _, _) = forward(&bigger, &bigger.family(&family, &on), &target).expect("forward");
+    assert!(after.sum() < before.sum(), "{} against {}", after.sum(), before.sum());
+}

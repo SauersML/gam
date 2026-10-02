@@ -553,6 +553,14 @@ impl Context {
         Self { stayed: map(&self.stayed), was_on: map(&self.was_on), new: map(&self.new) }
     }
 
+    /// The counts of a library with `added[k]` new pieces appended to site `k`, never seen yet.
+    pub fn extended(&self, added: &[usize]) -> Self {
+        let grow = |counts: &[Array1<f64>]| -> Vec<Array1<f64>> {
+            counts.iter().zip(added).map(|(c, a)| c.iter().copied().chain(std::iter::repeat_n(0.0, *a)).collect()).collect()
+        };
+        Self { stayed: grow(&self.stayed), was_on: grow(&self.was_on), new: grow(&self.new) }
+    }
+
     /// The coder these counts give, for inputs whose previous inputs are `previous`.
     pub fn coder(&self, previous: Vec<Option<usize>>) -> Coder {
         let stay = self.stayed.iter().zip(&self.was_on).map(|(s, w)| (s + 0.5) / &(w + 1.0)).collect();
@@ -925,4 +933,93 @@ pub fn split(library: &Library, x: &Array2<f64>, mask: &Array2<f64>) -> (Library
     };
     let masks = Array2::from_shape_fn((mask.nrows(), columns.len()), |(t, c)| columns[c][t]);
     (Library { v: stack(&v_rows), u: stack(&u_rows), mean: library.mean.clone() }, masks, origin)
+}
+
+/// `(M^{1/2}, M^{-1/2})` of a symmetric positive semidefinite matrix shrunk halfway to its mean
+/// eigenvalue (as the pieces' preconditioner is), so a direction the data barely resolve is
+/// neither amplified nor dropped.
+fn shrunk_roots(m: &Array2<f64>) -> Result<(Array2<f64>, Array2<f64>), String> {
+    let mut sym = m.clone();
+    let n = sym.nrows();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let v = 0.5 * (sym[[i, j]] + sym[[j, i]]);
+            sym[[i, j]] = v;
+            sym[[j, i]] = v;
+        }
+    }
+    let lambda = (0..n).map(|i| sym[[i, i]]).sum::<f64>() / n.max(1) as f64;
+    let d = super::dense::eigh(sym.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
+    let (mut half, mut inverse) = (d.vectors.clone(), d.vectors.clone());
+    for (k, l) in d.values.iter().enumerate() {
+        let shifted = l.max(0.0) + lambda;
+        let (h, i) = if shifted > 0.0 { (shifted.sqrt(), 1.0 / shifted.sqrt()) } else { (0.0, 0.0) };
+        half.column_mut(k).mapv_inplace(|x| x * h);
+        inverse.column_mut(k).mapv_inplace(|x| x * i);
+    }
+    Ok((half.dot(&d.vectors.t()), inverse.dot(&d.vectors.t())))
+}
+
+/// New pieces for site `k` from what its selection leaves out on a sequence: the site's own map on
+/// the reads less the listed pieces, `r_t = W x̃_t − Σ_{c on} u_c z_tc`, regressed on the centred
+/// reads in the pieces' metric (written Fisher on the output side, the sequence's read covariance
+/// on the input side). Each singular pair `σ p qᵀ` of the whitened regression is a candidate piece
+/// `u = F^{-1/2} p √σ`, `v = Σ^{-1/2} q √σ`, kept when the KL bits it would recover over the
+/// sequence, `n N σ² / (2 ln 2)` with `N` the sequence's rows, exceed its library bits
+/// `bits_per_piece`. Returns the new pieces as `(v: K × d_in, u: K × d_out)`.
+pub fn dropped_atoms(
+    masked: &Masked,
+    k: usize,
+    trace: &Trace,
+    mask: &Array2<f64>,
+    running: &Running,
+    observations: f64,
+    bits_per_piece: f64,
+) -> Result<(Array2<f64>, Array2<f64>), String> {
+    let library = &masked.libraries[k];
+    let z = &trace.values[masked.z[k]];
+    let centred = &read_values(trace, &masked.sites[k])? - &library.mean;
+    // What the site's own map gives on these reads, less what the listed pieces give.
+    let residual = centred.dot(&masked.w[k].t()) - (z * mask).dot(&library.u);
+    let rows = centred.nrows() as f64;
+    let (f_half, f_inverse) = shrunk_roots(&running.fishers[k])?;
+    // The reads whitened by this sequence's own covariance (on its support), so the
+    // cross-covariance below is the regression itself.
+    let covariance = fast_atb(&centred, &centred) / rows;
+    let decomposed_reads = super::dense::eigh(covariance.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
+    let mut s_inverse_factor = decomposed_reads.vectors.clone();
+    for (j, l) in decomposed_reads.values.iter().enumerate() {
+        let inverse = if *l > decomposed_reads.band { 1.0 / l.sqrt() } else { 0.0 };
+        s_inverse_factor.column_mut(j).mapv_inplace(|x| x * inverse);
+    }
+    let s_inverse = s_inverse_factor.dot(&decomposed_reads.vectors.t());
+    // The whitened regression of the left-out map on the whitened reads.
+    let whitened_out = residual.dot(&f_half);
+    let whitened_in = centred.dot(&s_inverse);
+    let cross = fast_atb(&whitened_out, &whitened_in) / rows;
+    let decomposed = super::dense::svd(cross.view(), false).map_err(|e| format!("{e:?}"))?;
+    let mut vs = Vec::new();
+    let mut us = Vec::new();
+    for (i, sigma) in decomposed.singular_values.iter().enumerate() {
+        // The regression coefficient σ on unit-variance whitened reads recovers σ² of energy per
+        // input: KL ≈ ½ energy in the written Fisher.
+        let recovered = observations * sigma * sigma * rows / (2.0 * std::f64::consts::LN_2);
+        if recovered <= bits_per_piece {
+            break;
+        }
+        let root = sigma.sqrt();
+        us.push(f_inverse.dot(&decomposed.u.column(i)) * root);
+        vs.push(s_inverse.dot(&decomposed.vt.row(i)) * root);
+    }
+    let stack = |rows: &[Array1<f64>], width: usize| Array2::from_shape_fn((rows.len(), width), |(i, j)| rows[i][j]);
+    Ok((stack(&vs, centred.ncols()), stack(&us, library.u.ncols())))
+}
+
+/// `library` with the pieces `(v, u)` appended.
+pub fn with_pieces(library: &Library, v: &Array2<f64>, u: &Array2<f64>) -> Result<Library, String> {
+    Ok(Library {
+        v: ndarray::concatenate(Axis(0), &[library.v.view(), v.view()]).map_err(|e| e.to_string())?,
+        u: ndarray::concatenate(Axis(0), &[library.u.view(), u.view()]).map_err(|e| e.to_string())?,
+        mean: library.mean.clone(),
+    })
 }

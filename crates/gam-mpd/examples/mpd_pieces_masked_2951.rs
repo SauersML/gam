@@ -229,9 +229,48 @@ fn main() -> Result<(), String> {
                     library_bits,
                     if kept { "kept" } else { "refused" }
                 );
-                if kept {
+                let masks = if kept {
                     masked = candidate;
                     context = candidate_context;
+                    candidate_masks
+                } else {
+                    masks
+                };
+                // Growth from what selection leaves out, tested the same way: per site, the leading
+                // regression pieces of the left-out map that would recover more KL bits on this
+                // sequence than their library bits (`gam_mpd::masked::dropped_atoms`), appended off.
+                let family = masked.family(&inputs, &masks);
+                let (base_kl, masked_trace, _) = gam_mpd::masked::forward(&masked, &family, &target)?;
+                let base_code = (context.coder(previous_rows.clone()).bits(&masks).sum() + base_kl.sum() * observations / std::f64::consts::LN_2) / inputs.rows as f64;
+                let mut grown = Vec::new();
+                let mut grown_masks = Vec::new();
+                let mut added = Vec::new();
+                let mut added_reals = 0.0;
+                for (k, library) in masked.libraries.iter().enumerate() {
+                    let per_piece = (library.v.ncols() + library.u.ncols()) as f64 * BITS_PER_REAL * inputs.rows as f64 / tokens_trained;
+                    let (v, u) = gam_mpd::masked::dropped_atoms(&masked, k, &masked_trace, &masks[k], &running, observations, per_piece)?;
+                    added_reals += (v.nrows() * (v.ncols() + u.ncols())) as f64;
+                    added.push(v.nrows());
+                    grown_masks.push(ndarray::concatenate(Axis(1), &[masks[k].view(), Array2::<f64>::zeros((inputs.rows, v.nrows())).view()]).map_err(|e| e.to_string())?);
+                    grown.push(gam_mpd::masked::with_pieces(library, &v, &u)?);
+                }
+                if added.iter().any(|a| *a > 0) {
+                    let candidate = Masked::build(model, original_sites.clone(), grown)?;
+                    let candidate_context = context.extended(&added);
+                    let candidate_coder = candidate_context.coder(previous_rows.clone());
+                    let (candidate_masks, candidate_kl) = select(&candidate, &inputs, &target, grown_masks, &candidate_coder, observations, samples)?;
+                    let candidate_code = (candidate_coder.bits(&candidate_masks).sum() + candidate_kl.sum() * observations / std::f64::consts::LN_2) / inputs.rows as f64;
+                    let library_bits = added_reals * BITS_PER_REAL / tokens_trained;
+                    let kept = candidate_code + library_bits < base_code;
+                    log::info!(
+                        "dropped-atoms test: {} pieces, {base_code:.1} -> {candidate_code:.1} bits per token, library {library_bits:.1}; {}",
+                        added.iter().sum::<usize>(),
+                        if kept { "kept" } else { "refused" }
+                    );
+                    if kept {
+                        masked = candidate;
+                        context = candidate_context;
+                    }
                 }
                 let evaluated = if last { eval } else { eval.min(4) };
                 let (mut l0, mut kl, mut bits, mut tokens, mut explanation) = (0.0, 0.0, 0.0, 0.0, 0.0);
