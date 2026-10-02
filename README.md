@@ -31,22 +31,6 @@ print(bands[["posterior_mean", "posterior_mean_lower", "posterior_mean_upper",
   <img alt="mcycle location-scale fit: posterior mean, credible band and observation interval" src="docs/images/mcycle_location_scale.png">
 </picture>
 
-Coming from pyGAM:
-
-- **Smoothness is estimated, not searched.** REML/LAML picks every
-  smoothing parameter, so there is no `gridsearch()` and no GCV. Against
-  pyGAM's defaults gamfit wins 8, ties 28 and loses 13 of 49 held-out
-  comparisons; the [benchmarks](docs/benchmarks.md) list every loss.
-- **Predictions carry their uncertainty.** One `predict` call returns the
-  posterior mean, a credible band for it and an observation interval
-  ([predictions](docs/predictions.md)).
-- **The noise can be modelled too.** `noise_formula=` fits a
-  location-scale model like the one above, which pyGAM cannot express; on
-  `mcycle` its 95% observation interval covers 97% of the data
-  ([tour](docs/tour.md#heteroscedastic-noise-mcycle)).
-
-The [tour](docs/tour.md) works through six real datasets.
-
 Docs: <https://gamfit.readthedocs.io/>. PyPI: <https://pypi.org/project/gamfit/>.
 Contributions of every kind are welcome.
 
@@ -99,7 +83,7 @@ The engine also provides, past fitting and point prediction (see
   SPD-matrix cone, Grassmann, Stiefel, or hyperbolic ball, fit in the
   tangent space at the Fréchet mean; a constant-curvature family estimates
   the curvature.
-- **Sparse manifold dictionaries (SAE)** — decompose a matrix into K sparse
+- **Sparse manifold dictionaries** — decompose a matrix into K sparse
   atoms, each a low-dimensional curve or surface (line, circle, sphere,
   torus) with a per-row coordinate, with a differentiable `gamfit.torch`
   version, steering, crosscoders, and cross-layer transport.
