@@ -422,13 +422,21 @@ fn rnn(tensors: &Tensors<'_>, record: &Value, samples: &Array2<f64>) -> Result<B
     Ok(((program, 1), slots, false, Some(vec![(0..steps).collect()])))
 }
 
-/// A pre-norm rotary language model export (`config`: d_model, n_layers, n_heads, n_kv_heads,
-/// head_dim, d_mlp, vocab, rope_theta, rope_pairing, norm_eps, mlp_act, tied_embeddings; tensors
-/// `wte`, `blocks.{l}.attn.{q,k,v,o}_proj`, `blocks.{l}.mlp.{c_fc,down_proj}`, `blocks.{l}.rms{1,2}.gain`,
-/// `final_norm.gain`, and the token rows `tokens`) as a per-position program over the first
-/// `sequences` token rows at positions `0..context`: every row runs one shared local program, and
-/// attention reads the rows of its own sequence up to its position. The readout at each row is the
+/// A pre-norm rotary language model export as a per-position program over the first `sequences`
+/// token rows at positions `0..context`: every row runs one shared local program, and attention
+/// reads the rows of its own sequence up to its position. The readout at each row is the
 /// next-token distribution. Each sequence is one unit of a sampled family.
+///
+/// `config`: d_model, n_layers, n_heads, n_kv_heads, head_dim, vocab, rope_theta, rope_pairing,
+/// norm_eps, mlp_act, tied_embeddings, and optionally `rotary_dims` (a partial rotary on the first
+/// dims of each head; default head_dim), `norm` (`"rms"`, the default, or `"layer"`: the mean is
+/// removed first, `x − 1 (1ᵀx)/d`, a rank-one operator shared by every norm), `parallel_residual`
+/// (attention and MLP read the same stream, GPT-NeoX), `qk_norm` (an RMS norm with a gain on each
+/// head's query and key before the rotary, Qwen3) and `mlp_gated` (`down(act(gate x) ⊙ up x)`).
+/// Tensors: `wte` (vocab × d), `lm_head` when untied, `blocks.{l}.attn.{q,k,v,o}_proj`,
+/// `blocks.{l}.attn.{q,k}_norm.gain`, `blocks.{l}.mlp.{c_fc,gate_proj,down_proj}`,
+/// `blocks.{l}.rms{1,2}.gain`, `final_norm.gain`; any of these with a `.bias` suffix (a
+/// projection's or a layer norm's bias) enters as a bias operator; and the token rows `tokens`.
 pub fn import_language_model(dir: &Path, sequences: usize, context: usize) -> Result<Imported, String> {
     let text = std::fs::read_to_string(dir.join("export.json")).map_err(|e| e.to_string())?;
     let record: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
@@ -441,6 +449,15 @@ pub fn import_language_model(dir: &Path, sequences: usize, context: usize) -> Re
         config(&record, "d_model")?,
         config(&record, "vocab")?,
     );
+    let flag = |key: &str| record["config"][key].as_bool().unwrap_or(false);
+    let (parallel, qk_norm, gated) = (flag("parallel_residual"), flag("qk_norm"), flag("mlp_gated"));
+    let layer_norm = match record["config"]["norm"].as_str() {
+        None | Some("rms") => false,
+        Some("layer") => true,
+        Some(other) => return Err(format!("unsupported norm {other}")),
+    };
+    let tied = record["config"]["tied_embeddings"].as_bool().unwrap_or(true);
+    let rotary_dims = record["config"]["rotary_dims"].as_u64().map_or(hd, |v| v as usize);
     let theta = record["config"]["rope_theta"].as_f64().ok_or("config.rope_theta")?;
     let epsilon = record["config"]["norm_eps"].as_f64().ok_or("config.norm_eps")?;
     let half_split = record["config"]["rope_pairing"].as_str() == Some("rotate_half");
@@ -454,10 +471,11 @@ pub fn import_language_model(dir: &Path, sequences: usize, context: usize) -> Re
     if theta.fract() != 0.0 || theta <= 0.0 || theta > f64::from(u32::MAX) {
         return Err(format!("rope_theta {theta} is not a positive integer"));
     }
-    let rotary = Rotary { base: theta as u32, dims: hd as u32, half_split };
+    let rotary = Rotary { base: theta as u32, dims: rotary_dims as u32, half_split };
     // The residual stream is in coordinate groups, so a norm gain is a diagonal of present blocks.
     let model = interface(d, 1, LabelKind::Unit)?;
     let head = Interface::native(hd).map_err(|e| e.to_string())?;
+    let constant = Interface::constant();
     let tokens_interface = interface(vocab, 1, LabelKind::Token)?;
     let coordinates = model.clone();
     let mut b = Builder { operators: Vec::new(), nodes: Vec::new() };
@@ -479,14 +497,61 @@ pub fn import_language_model(dir: &Path, sequences: usize, context: usize) -> Re
         b.operators.push(op);
         Ok(b.operators.len() - 1)
     };
+    // A stored bias (a row vector, sliced to `range`) as a column operator on `rows`.
+    let bias = |b: &mut Builder, name: &str, rows: &Interface, range: Option<(usize, usize)>| -> Result<Option<usize>, String> {
+        if !tensors.has(name) {
+            return Ok(None);
+        }
+        let column = tensors.column(name)?;
+        let column = match range {
+            Some((first, last)) => column.slice(s![first..last, ..]).to_owned(),
+            None => column,
+        };
+        let label = range.map_or(name.to_string(), |(first, _)| format!("{name}[{}]", first / hd));
+        Ok(Some(b.operator(&label, rows, &constant, column)?))
+    };
+    // A layer norm removes the mean first: `x − 1 (1ᵀx)/d`, one rank-one operator for every norm.
+    let centring = if layer_norm {
+        let precision = exact_precision([-1.0 / d as f64, 1.0]).map_err(|e| e.to_string())?;
+        let op = Operator::low_rank(
+            "centre",
+            model.clone(),
+            model.clone(),
+            Array2::from_elem((d, 1), -1.0 / d as f64),
+            Array2::from_elem((1, d), 1.0),
+            precision,
+            Provenance::native("layer norm mean"),
+        )
+        .map_err(|e| e.to_string())?;
+        b.operators.push(op);
+        Some(b.operators.len() - 1)
+    } else {
+        None
+    };
+    let norm = |b: &mut Builder, x: usize, name: &str| -> Result<usize, String> {
+        let input = match centring {
+            Some(centre) => b.node(Node::Affine { terms: vec![(x, identity), (x, centre)], bias: None }),
+            None => x,
+        };
+        let g = gain(b, &format!("{name}.gain"))?;
+        let beta = bias(b, &format!("{name}.bias"), &model, None)?;
+        let normed = b.node(Node::RmsNorm { input, epsilon });
+        Ok(b.node(Node::Affine { terms: vec![(normed, g)], bias: beta }))
+    };
+    // A head norm (Qwen3's q_norm, k_norm): an RMS norm over the head, then its gain, a dense
+    // diagonal operator on the head.
+    let head_norm = |b: &mut Builder, x: usize, name: &str| -> Result<usize, String> {
+        let g = tensors.get(name)?;
+        let op = b.operator(name, &head, &head, Array2::from_diag(&g.row(0)))?;
+        let normed = b.node(Node::RmsNorm { input: x, epsilon });
+        Ok(b.node(Node::Affine { terms: vec![(normed, op)], bias: None }))
+    };
     let feature = b.node(Node::Feature { slot: 0, basis: 0 });
     let embedded = b.node(Node::Affine { terms: vec![(feature, embedding)], bias: None });
     let mut x = embedded;
     for l in 0..layers {
         let prefix = format!("blocks.{l}.");
-        let g1 = gain(&mut b, &format!("{prefix}rms1.gain"))?;
-        let normed = b.node(Node::RmsNorm { input: x, epsilon });
-        let h = b.node(Node::Affine { terms: vec![(normed, g1)], bias: None });
+        let h = norm(&mut b, x, &format!("{prefix}rms1"))?;
         let (wq, wk, wv, wo) = (
             tensors.get(&format!("{prefix}attn.q_proj"))?,
             tensors.get(&format!("{prefix}attn.k_proj"))?,
@@ -496,19 +561,29 @@ pub fn import_language_model(dir: &Path, sequences: usize, context: usize) -> Re
         let group = heads / kv_heads.max(1);
         let mut keys = Vec::new();
         for g in 0..kv_heads {
-            let rows = s![g * hd..(g + 1) * hd, ..];
+            let range = (g * hd, (g + 1) * hd);
+            let rows = s![range.0..range.1, ..];
             let k_op = b.operator(&format!("{prefix}k{g}"), &head, &model, wk.slice(rows).to_owned())?;
             let v_op = b.operator(&format!("{prefix}v{g}"), &head, &model, wv.slice(rows).to_owned())?;
-            let k = b.node(Node::Affine { terms: vec![(h, k_op)], bias: None });
-            let v = b.node(Node::Affine { terms: vec![(h, v_op)], bias: None });
+            let k_bias = bias(&mut b, &format!("{prefix}attn.k_proj.bias"), &head, Some(range))?;
+            let v_bias = bias(&mut b, &format!("{prefix}attn.v_proj.bias"), &head, Some(range))?;
+            let mut k = b.node(Node::Affine { terms: vec![(h, k_op)], bias: k_bias });
+            if qk_norm {
+                k = head_norm(&mut b, k, &format!("{prefix}attn.k_norm.gain"))?;
+            }
+            let v = b.node(Node::Affine { terms: vec![(h, v_op)], bias: v_bias });
             keys.push((k, v));
         }
         let mut terms = vec![(x, identity)];
         for hh in 0..heads {
-            let rows = s![hh * hd..(hh + 1) * hd, ..];
-            let q_op = b.operator(&format!("{prefix}q{hh}"), &head, &model, wq.slice(rows).to_owned())?;
-            let o_op = b.operator(&format!("{prefix}o{hh}"), &model, &head, wo.slice(s![.., hh * hd..(hh + 1) * hd]).to_owned())?;
-            let q = b.node(Node::Affine { terms: vec![(h, q_op)], bias: None });
+            let range = (hh * hd, (hh + 1) * hd);
+            let q_op = b.operator(&format!("{prefix}q{hh}"), &head, &model, wq.slice(s![range.0..range.1, ..]).to_owned())?;
+            let o_op = b.operator(&format!("{prefix}o{hh}"), &model, &head, wo.slice(s![.., range.0..range.1]).to_owned())?;
+            let q_bias = bias(&mut b, &format!("{prefix}attn.q_proj.bias"), &head, Some(range))?;
+            let mut q = b.node(Node::Affine { terms: vec![(h, q_op)], bias: q_bias });
+            if qk_norm {
+                q = head_norm(&mut b, q, &format!("{prefix}attn.q_norm.gain"))?;
+            }
             let (k, v) = keys[hh / group.max(1)];
             let read = b.node(Node::Attend {
                 query: q,
@@ -520,23 +595,37 @@ pub fn import_language_model(dir: &Path, sequences: usize, context: usize) -> Re
             });
             terms.push((read, o_op));
         }
-        x = b.node(Node::Affine { terms, bias: None });
-        let g2 = gain(&mut b, &format!("{prefix}rms2.gain"))?;
-        let normed = b.node(Node::RmsNorm { input: x, epsilon });
-        let h2 = b.node(Node::Affine { terms: vec![(normed, g2)], bias: None });
+        let o_bias = bias(&mut b, &format!("{prefix}attn.o_proj.bias"), &model, None)?;
+        let attended = b.node(Node::Affine { terms, bias: o_bias });
+        // A parallel block's MLP reads the stream the attention read; a sequential one reads the
+        // stream after it.
+        let h2 = norm(&mut b, if parallel { x } else { attended }, &format!("{prefix}rms2"))?;
         let c_fc = tensors.get(&format!("{prefix}mlp.c_fc"))?;
         let hidden = c_fc.nrows();
         let neurons = interface(hidden, 1, LabelKind::Unit)?;
         let up = b.operator(&format!("{prefix}c_fc"), &neurons, &model, c_fc)?;
+        let up_bias = bias(&mut b, &format!("{prefix}mlp.c_fc.bias"), &neurons, None)?;
         let down = b.operator(&format!("{prefix}down_proj"), &model, &neurons, tensors.get(&format!("{prefix}mlp.down_proj"))?)?;
-        let pre = b.node(Node::Affine { terms: vec![(h2, up)], bias: None });
-        let active = b.node(Node::Pointwise { input: pre, laws: vec![act; hidden] });
-        x = b.node(Node::Affine { terms: vec![(x, identity), (active, down)], bias: None });
+        let down_bias = bias(&mut b, &format!("{prefix}mlp.down_proj.bias"), &model, None)?;
+        let pre = b.node(Node::Affine { terms: vec![(h2, up)], bias: up_bias });
+        let active = if gated {
+            let gate = b.operator(&format!("{prefix}gate_proj"), &neurons, &model, tensors.get(&format!("{prefix}mlp.gate_proj"))?)?;
+            let gate_bias = bias(&mut b, &format!("{prefix}mlp.gate_proj.bias"), &neurons, None)?;
+            let gate_pre = b.node(Node::Affine { terms: vec![(h2, gate)], bias: gate_bias });
+            let gate_active = b.node(Node::Pointwise { input: gate_pre, laws: vec![act; hidden] });
+            b.node(Node::Hadamard { left: gate_active, right: pre })
+        } else {
+            b.node(Node::Pointwise { input: pre, laws: vec![act; hidden] })
+        };
+        x = b.node(Node::Affine { terms: vec![(attended, identity), (active, down)], bias: down_bias });
     }
-    let gf = gain(&mut b, "final_norm.gain")?;
-    let normed = b.node(Node::RmsNorm { input: x, epsilon });
-    let h = b.node(Node::Affine { terms: vec![(normed, gf)], bias: None });
-    let logits = b.node(Node::Transposed { input: h, operator: embedding });
+    let h = norm(&mut b, x, "final_norm")?;
+    let logits = if tied {
+        b.node(Node::Transposed { input: h, operator: embedding })
+    } else {
+        let head_op = b.operator("lm_head", &tokens_interface, &model, tensors.get("lm_head")?)?;
+        b.node(Node::Affine { terms: vec![(h, head_op)], bias: None })
+    };
     let output = b.node(Node::Readout { input: logits, basis: 0 });
     let declarations = Declarations {
         parameters: 0,

@@ -310,6 +310,67 @@ impl Basis {
         }
     }
 
+    /// `y Φᵀ`: rows of basis coordinates `y` read at every class of the domain (`Φ` is the basis at
+    /// every class, `classes × width`). An indicator basis is the identity, so its read is `y`
+    /// itself, exactly, and no `classes × classes` table is formed (a 50k-token vocabulary's would be
+    /// 20 GB).
+    pub fn read(&self, declarations: &Declarations, y: &Array2<f64>) -> Result<Array2<f64>, ProgramError> {
+        match self {
+            Self::Indicator { .. } => Ok(y.clone()),
+            Self::Characters { .. } => Ok(y.dot(&self.table(declarations)?.values.t())),
+        }
+    }
+
+    /// `g Φ`: the transpose of [`Basis::read`], from classes back to basis coordinates.
+    pub fn read_transpose(&self, declarations: &Declarations, g: &Array2<f64>) -> Result<Array2<f64>, ProgramError> {
+        match self {
+            Self::Indicator { .. } => Ok(g.clone()),
+            Self::Characters { .. } => Ok(g.dot(&self.table(declarations)?.values)),
+        }
+    }
+
+    /// `dy Φ[:, cols]ᵀ`: [`Basis::read`] of a change confined to the coordinates `cols`.
+    pub fn read_columns(&self, declarations: &Declarations, dy: &Array2<f64>, cols: &[usize]) -> Result<Array2<f64>, ProgramError> {
+        match self {
+            Self::Indicator { domain } => {
+                let mut out = Array2::<f64>::zeros((dy.nrows(), declarations.domains[*domain].size));
+                for (k, &c) in cols.iter().enumerate() {
+                    out.column_mut(c).assign(&dy.column(k));
+                }
+                Ok(out)
+            }
+            Self::Characters { .. } => Ok(dy.dot(&self.table(declarations)?.values.select(Axis(1), cols).t())),
+        }
+    }
+
+    /// The banded [`Basis::read`]: `y Φᵀ` with the radius of `y`'s band `ry` carried through the
+    /// product and its rounding (an indicator's read is exact: the band is `ry` itself).
+    pub fn read_banded(&self, declarations: &Declarations, y: &Array2<f64>, ry: Option<&Array2<f64>>) -> Result<(Array2<f64>, Option<Array2<f64>>), ProgramError> {
+        if let Self::Indicator { .. } = self {
+            return Ok((y.clone(), ry.cloned()));
+        }
+        let phi = self.table(declarations)?;
+        let out = y.dot(&phi.values.t());
+        let radius = ry.map(|ry| {
+            let growth = accumulation_growth(y.ncols());
+            let phi_abs = phi.values.mapv(f64::abs);
+            let mut lifted = y.mapv(|v| growth * v.abs());
+            lifted += ry;
+            let mut radius = lifted.dot(&phi_abs.t());
+            radius += &ry.dot(&phi.bands.t());
+            radius += &y.mapv(f64::abs).dot(&phi.bands.t());
+            inflate_all(&mut radius, 3 * y.ncols());
+            radius
+        });
+        Ok((out, radius))
+    }
+
+    /// The basis at every class of its domain (`classes × width`).
+    fn table(&self, declarations: &Declarations) -> Result<BandedMatrix, ProgramError> {
+        let classes: Vec<u32> = (0..declarations.domains[self.domain()].size as u32).collect();
+        self.evaluate(declarations, &classes)
+    }
+
     /// The basis evaluated at `tokens`, one row per token, with the Feature radii of the module note.
     pub fn evaluate(&self, declarations: &Declarations, tokens: &[u32]) -> Result<BandedMatrix, ProgramError> {
         let interface = self.interface(declarations)?;
@@ -1368,14 +1429,11 @@ impl OperatorProgram {
                     _ => Change::Full(self.recompute(index, inputs, base, &changes, &interfaces)?),
                 },
                 Node::Readout { input, basis } if !law_changed => {
-                    let size = self.declarations.domains[self.bases[*basis].domain()].size;
-                    let classes: Vec<u32> = (0..size as u32).collect();
-                    let phi = self.bases[*basis].evaluate(&self.declarations, &classes)?.values;
                     let change = changes
                         .get(input)
                         .ok_or_else(|| ProgramError::Input("a readout changed without its input".to_string()))?;
                     let (cols, dy) = change.delta(&base.values[*input]);
-                    Change::Full(base_value + &dy.dot(&phi.select(Axis(1), &cols).t()))
+                    Change::Full(base_value + &self.bases[*basis].read_columns(&self.declarations, &dy, &cols)?)
                 }
                 _ => Change::Full(self.recompute(index, inputs, base, &changes, &interfaces)?),
             };
@@ -1947,25 +2005,7 @@ impl OperatorProgram {
                 }
                 Ok((out, radius))
             }
-            Node::Readout { input, basis } => {
-                let size = self.declarations.domains[self.bases[*basis].domain()].size;
-                let classes: Vec<u32> = (0..size as u32).collect();
-                let phi = self.bases[*basis].evaluate(&self.declarations, &classes)?;
-                let y = value(*input);
-                let out = y.dot(&phi.values.t());
-                let radius = band(*input).map(|ry| {
-                    let growth = accumulation_growth(y.ncols());
-                    let phi_abs = phi.values.mapv(f64::abs);
-                    let mut lifted = y.mapv(|v| growth * v.abs());
-                    lifted += ry;
-                    let mut radius = lifted.dot(&phi_abs.t());
-                    radius += &ry.dot(&phi.bands.t());
-                    radius += &y.mapv(f64::abs).dot(&phi.bands.t());
-                    inflate_all(&mut radius, 3 * y.ncols());
-                    radius
-                });
-                Ok((out, radius))
-            }
+            Node::Readout { input, basis } => self.bases[*basis].read_banded(&self.declarations, value(*input), band(*input)),
         }
     }
 

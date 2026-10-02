@@ -5,8 +5,8 @@
 //! `MODEL_DIR` holds an `export.json` and raw float64 tensors (`gam_mpd::import`
 //! reads transformers, residual MLPs and RNNs). The contract is the export's samples at its declared
 //! readouts. No tolerance is declared: each program is chosen by its two-part code, over a ladder of
-//! observations per sample `n = 1, 10, …, 10⁶`, each search starting from the previous rung's
-//! program, so the report is the frontier of program bits against the behaviour explained.
+//! observations per sample `n = 10⁶, 10⁵, …, 1`, each search starting from the previous (larger-n)
+//! rung's program, so the report is the frontier of program bits against the behaviour explained.
 //!
 //! Written to `OUT_DIR`: `report.json` (per rung: program bits, data bits, maximal row KL, argmax
 //! disagreements, population bounds for a sampled family, and the component view) and, per rung,
@@ -57,7 +57,10 @@ fn main() -> Result<(), String> {
     let native_bits = model.code_bits().map_err(|e| e.to_string())?;
     let mut start = model.clone();
     let mut frontier = Vec::new();
-    for exponent in 0..=6u32 {
+    // Descending: the search only removes and coarsens, so each rung starts from the program of
+    // the rung with more behaviour (an ascending ladder would start n = 10 from n = 1's program,
+    // which explains almost nothing and cannot regrow).
+    for exponent in (0..=6u32).rev() {
         let n = 10u64.pow(exponent);
         let mut contract = imported.contract.clone();
         contract.observations = n;

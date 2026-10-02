@@ -76,8 +76,23 @@ pub fn refit_readout(
         super::operator_program::Basis::Indicator { domain } | super::operator_program::Basis::Characters { domain, .. } => *domain,
     }]
     .size;
-    let classes: Vec<u32> = (0..size as u32).collect();
-    let phi = program.bases[basis].evaluate(&program.declarations, &classes)?.values;
+    // The readout's table Φ (classes × width); an indicator basis is the identity, never formed.
+    let phi = match &program.bases[basis] {
+        super::operator_program::Basis::Indicator { .. } => None,
+        other => Some(other.evaluate(&program.declarations, &(0..size as u32).collect::<Vec<u32>>())?.values),
+    };
+    let forward = |y: Array2<f64>| -> Array2<f64> {
+        match phi.as_ref() {
+            None => y,
+            Some(phi) => y.dot(&phi.t()),
+        }
+    };
+    let backward = |g: Array2<f64>| -> Array2<f64> {
+        match phi.as_ref() {
+            None => g,
+            Some(phi) => g.dot(phi),
+        }
+    };
     // Each refit slot: (operator, the node it reads, or None for the bias).
     let mut slots: Vec<(usize, Option<usize>)> = Vec::new();
     for &op in operators {
@@ -121,10 +136,10 @@ pub fn refit_readout(
         for (x, a) in xs.iter().zip(values) {
             y += &x.dot(&a.t());
         }
-        y.dot(&phi.t())
+        forward(y)
     };
     let gradient_of = |q: &Array2<f64>| -> Vec<Array2<f64>> {
-        let g_y = (q - target).dot(&phi);
+        let g_y = backward(q - target);
         xs.iter().zip(&parameters.masks).map(|(x, m)| g_y.t().dot(x) * m).collect()
     };
     for _ in 0..search.newton_steps {
@@ -135,13 +150,13 @@ pub fn refit_readout(
             for (x, v) in xs.iter().zip(direction) {
                 dy += &x.dot(&v.t());
             }
-            let dz = dy.dot(&phi.t());
+            let dz = forward(dy);
             let mut w = &q * &dz;
             let inner = (&q * &dz).sum_axis(Axis(1));
             for (mut row, (qr, i)) in w.outer_iter_mut().zip(q.outer_iter().zip(inner.iter())) {
                 row.scaled_add(-*i, &qr);
             }
-            let wy = w.dot(&phi);
+            let wy = backward(w);
             xs.iter().zip(&parameters.masks).map(|(x, m)| wy.t().dot(x) * m).collect()
         };
         // The Newton direction solves H d = −g by the linear-algebra owner's preconditioned

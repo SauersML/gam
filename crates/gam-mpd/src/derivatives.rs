@@ -182,12 +182,7 @@ pub fn jvp(
                 }
             }
             Node::Readout { input, basis } => tangent_of(&dv, *input)
-                .map(|dy| -> Result<Array2<f64>, ProgramError> {
-                    let size = program.declarations.domains[program.bases[*basis].domain()].size;
-                    let classes: Vec<u32> = (0..size as u32).collect();
-                    let phi = program.bases[*basis].evaluate(&program.declarations, &classes)?.values;
-                    Ok(dy.dot(&phi.t()))
-                })
+                .map(|dy| program.bases[*basis].read(&program.declarations, &dy))
                 .transpose()?,
             Node::Gain { input, coefficient } => {
                 let (c, _, _) = coefficient.evaluate(&vec![1.0; program.declarations.parameters])?;

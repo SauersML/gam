@@ -81,7 +81,7 @@ use super::operator_program::{Declarations, EncodedProgram, FamilyInputs, Law, N
 use super::precision::DecodableArtifact;
 use super::secant::BandedMatrix;
 use super::supports::{EvidenceStatus, EvidenceStatusError, ExactBasis, Extremum};
-use super::verify::{RowValue, compare_logit_row, exhaustive_supremum};
+use super::verify::{RowValue, compare_logit_row, computed_argmax, exhaustive_supremum};
 use gam_linalg::roundoff::accumulation_growth;
 use ndarray::Array2;
 use statrs::distribution::{Beta, ContinuousCDF};
@@ -423,6 +423,20 @@ impl Contract {
         let (mut sum, mut sum_error, mut sum_magnitude, mut sum_lower) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
         let mut resolved = true;
         for row in 0..shape.0 {
+            // A band that is not a finite number (the forward-error analysis overflowed, or met
+            // `∞ · 0`) proves nothing about the row: it is unresolved, its argmax uncertified.
+            let unbounded = |bands: &Array2<f64>| bands.row(row).iter().any(|r| !r.is_finite());
+            if unbounded(&reference.bands) || unbounded(&candidate.bands) {
+                resolved = false;
+                kl_upper.push(f64::INFINITY);
+                max_tv_upper = 1.0;
+                let differs = computed_argmax(reference.values.row(row)) != computed_argmax(candidate.values.row(row));
+                disagreements += u64::from(differs);
+                uncertified += 1;
+                argmax_agrees.push(false);
+                kls.push((row, RowValue::Unresolved { lower: 0.0 }));
+                continue;
+            }
             let tv = total_variation_over_logit_boxes(
                 reference.values.row(row),
                 reference.bands.row(row),
