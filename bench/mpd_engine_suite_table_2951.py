@@ -33,7 +33,7 @@ for path in sorted(glob.glob(f"{E}/*/report.json")):
 # Runs with no completed rung yet, with what their logs say.
 for log in sorted(glob.glob(f"{E}/runs/*.log")):
     name = os.path.basename(log)[:-4]
-    if name in models and models[name]["ladder"]:
+    if name == "table_updates" or (name in models and models[name].get("ladder")):
         continue
     text = open(log).read()
     status = "running (no rung completed)"
@@ -43,6 +43,39 @@ for log in sorted(glob.glob(f"{E}/runs/*.log")):
     head = next((l for l in text.splitlines() if "imported in" in l), "")
     models.setdefault(name, {})["status"] = status
     models[name]["log_head"] = head[:300]
+
+
+def masked_rows(directory, export):
+    """The masked-pieces path's rows (mpd_pieces_masked_2951's points.json), each full eval with its
+    rollout fidelity: per eval row the summed per-token KL over the continuation the model sampled
+    (positions PREFIX-1 .. PREFIX+HORIZON-2, export rollout.json) and greedy agreement there."""
+    import numpy as np
+    points = json.load(open(os.path.join(directory, "points.json")))["points"]
+    rollout = json.load(open(os.path.join(export, "rollout.json")))
+    record = json.load(open(os.path.join(export, "export.json")))
+    width = record["files"]["tokens"]["shape"][1] - 1
+    lo, hi = rollout["prefix"] - 1, rollout["prefix"] + rollout["horizon"] - 1
+    for point in points:
+        npass = point.get("pass")
+        kl_path = os.path.join(directory, f"points.pass{npass}.kl.npy")
+        agree_path = os.path.join(directory, f"points.pass{npass}.agree.npy")
+        if npass is None or not os.path.exists(kl_path):
+            continue
+        kl = np.load(kl_path)
+        context = kl.size // rollout["eval"]
+        if context != width and context < hi:
+            continue
+        kl = kl.reshape(rollout["eval"], context)[:, lo:hi]
+        agree = np.load(agree_path).reshape(rollout["eval"], context)[:, lo:hi]
+        point["rollout"] = {"rollouts": rollout["eval"], "horizon": rollout["horizon"],
+                            "sequence_kl_mean": float(kl.sum(1).mean()), "sequence_kl_max": float(kl.sum(1).max()),
+                            "greedy_agreement": float(agree.mean())}
+    return points
+
+
+for name, export in (("pythia70m_masked", f"{E}/pythia70m_rollout"), ("vpd4l_masked", f"{E}/vpd4l_rollout")):
+    if os.path.exists(f"{E}/{name}/points.json"):
+        models[name] = {"path": "masked pieces (mpd_pieces_masked_2951)", "points": masked_rows(f"{E}/{name}", export)}
 vpd = f"{E}/vpd4l_1x16/vpd_rollout.json"
 out = {"models": models, "vpd_matched_rollouts": json.load(open(vpd)) if os.path.exists(vpd) else None}
 json.dump(out, open(f"{E}/suite_table.json", "w"), indent=1)
