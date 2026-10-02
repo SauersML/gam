@@ -31,12 +31,20 @@ for name in os.listdir(src):
 model = AutoModelForCausalLM.from_pretrained(hf, dtype=torch.float32).eval()
 gen = torch.Generator().manual_seed(0x110A75)
 table = tokens[: train + ev].copy()
+# Eight rows at a time with the key-value cache, keeping only the last position's logits: the full
+# logits of every position (rows x width x vocab) are never formed.
 with torch.no_grad():
-    seq = torch.tensor(tokens[train:train + ev, :prefix], dtype=torch.long)
-    while seq.shape[1] < cols:
-        probs = torch.softmax(model(seq).logits[:, -1].double(), -1)
-        seq = torch.cat([seq, torch.multinomial(probs, 1, generator=gen)], 1)
-table[train:train + ev] = seq.numpy().astype(np.float64)
+    for first in range(train, train + ev, 8):
+        seq = torch.tensor(tokens[first:min(first + 8, train + ev), :prefix], dtype=torch.long)
+        step = model(seq, use_cache=True, logits_to_keep=1)
+        while True:
+            probs = torch.softmax(step.logits[:, -1].double(), -1)
+            nxt = torch.multinomial(probs, 1, generator=gen)
+            seq = torch.cat([seq, nxt], 1)
+            if seq.shape[1] >= cols:
+                break
+            step = model(nxt, past_key_values=step.past_key_values, use_cache=True, logits_to_keep=1)
+        table[first:first + seq.shape[0]] = seq.numpy().astype(np.float64)
 np.ascontiguousarray(table, dtype="<f8").tofile(os.path.join(out, "tokens.f64"))
 rec["files"]["tokens"] = {"shape": [train + ev, cols]}
 rec["rollout"] = {"source": src, "train": train, "eval": ev, "prefix": prefix, "horizon": horizon, "seed": 0x110A75}
