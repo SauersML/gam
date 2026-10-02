@@ -30,6 +30,7 @@
 //!   backtracking on the exact total.
 
 use super::derivatives::vjp;
+use super::device::{product_atb, proposing};
 use super::operator_program::{
     FamilyInputs, Interface, LabelKind, Node, Operator, OperatorBody, OperatorProgram, Provenance, Slot, SlotValues,
     Trace, remap_node,
@@ -349,8 +350,19 @@ pub fn forward(masked: &Masked, family: &FamilyInputs, target: &Array2<f64>) -> 
 }
 
 /// Per site: `∂KL/∂m` (rows × C) and the gradients in `V` (C × d_in) and `U` (C × d_out), from one
-/// reverse pass of `cotangent`.
+/// reverse pass of `cotangent`. They only propose (ranking flips, steering steps), so their dense
+/// products may run in f32 on the GPU ([`super::device`]); every acceptance is a float64 forward.
 pub fn gradients(
+    masked: &Masked,
+    family: &FamilyInputs,
+    trace: &Trace,
+    masks: &[Array2<f64>],
+    cotangent: Array2<f64>,
+) -> Result<Vec<(Array2<f64>, Array2<f64>, Array2<f64>)>, String> {
+    proposing(|| gradients_proposed(masked, family, trace, masks, cotangent))
+}
+
+fn gradients_proposed(
     masked: &Masked,
     family: &FamilyInputs,
     trace: &Trace,
@@ -368,7 +380,7 @@ pub fn gradients(
         let mask_gradient = &cot_masked * z;
         let cot_z = &cot_masked * &masks[k];
         let centred = &read_values(trace, site)? - &masked.libraries[k].mean;
-        let v_gradient = fast_atb(&cot_z, &centred);
+        let v_gradient = product_atb(&cot_z, &centred).map_err(|e| e.to_string())?;
         let zm = &trace.values[masked.masked[k]];
         let written: Vec<Array2<f64>> = masked.written[k]
             .iter()
@@ -376,7 +388,7 @@ pub fn gradients(
             .collect();
         let views: Vec<_> = written.iter().map(|w| w.view()).collect();
         let cot_written = ndarray::concatenate(Axis(1), &views).map_err(|e| e.to_string())?;
-        let u_gradient = fast_atb(zm, &cot_written);
+        let u_gradient = product_atb(zm, &cot_written).map_err(|e| e.to_string())?;
         out.push((mask_gradient, v_gradient, u_gradient));
     }
     Ok(out)
@@ -433,7 +445,7 @@ pub fn fisher(
                 cotangent[[r, c]] = q[c] - if c == label { 1.0 } else { 0.0 };
             }
         }
-        let back = vjp(&masked.program, family, trace, cotangent).map_err(|e| e.to_string())?;
+        let back = proposing(|| vjp(&masked.program, family, trace, cotangent)).map_err(|e| e.to_string())?;
         for (k, (h, f)) in out.iter_mut().enumerate() {
             if let Some(c) = &back[masked.masked[k]] {
                 let g = c * &trace.values[masked.z[k]];
@@ -445,7 +457,7 @@ pub fn fisher(
                 .collect();
             let views: Vec<_> = written.iter().map(|w| w.view()).collect();
             let cot = ndarray::concatenate(Axis(1), &views).map_err(|e| e.to_string())?;
-            *f += &fast_atb(&cot, &cot);
+            *f += &proposing(|| product_atb(&cot, &cot)).map_err(|e| e.to_string())?;
         }
     }
     let rows = logits.nrows() as f64;

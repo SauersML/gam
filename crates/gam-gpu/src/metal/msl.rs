@@ -9,17 +9,10 @@
 //! `crate::precision_bounds` rest on are exactly the operations written here.
 
 /// Names of the kernel functions the probe builds pipelines for.
-pub(crate) const KERNELS: &[&str] = &[GEMM_F32_PADDED, GEMM_DF64, SELF_TEST_DF64];
+pub(crate) const KERNELS: &[&str] = &[GEMM_DF64, SELF_TEST_DF64];
 
-pub(crate) const GEMM_F32_PADDED: &str = "gam_gemm_f32_padded";
 pub(crate) const GEMM_DF64: &str = "gam_gemm_df64";
 pub(crate) const SELF_TEST_DF64: &str = "gam_self_test_df64";
-
-/// Output tile of the f32 GEMM: one threadgroup of four simdgroups computes a
-/// `GEMM_F32_TILE × GEMM_F32_TILE` block of `C`; `m` and `n` are padded to
-/// it, and `k` to it as well (the kernel steps `k` by eight).
-pub(crate) const GEMM_F32_TILE: usize = 64;
-pub(crate) const GEMM_F32_THREADS: usize = 128;
 
 /// Output tile of the df64 GEMM: a `16 × 16` threadgroup computes a `32 × 32`
 /// block, two by two outputs per thread.
@@ -86,53 +79,6 @@ struct GemmParams {
     uint accumulate; uint trans_b;
     ulong stride_a; ulong stride_b; ulong stride_c;
 };
-
-// ---------------------------------------------------------------------------
-// Batched f32 GEMM on the simdgroup matrix unit, over zero-padded operands
-// (m, n multiples of 64, k a multiple of 8): every simdgroup reads its 8 x 8
-// fragments straight from device memory and the kernel uses no threadgroup
-// memory. The padding contributes exact zeros. Each output is a chain of k
-// f32 multiply-adds, in order l = 0..k-1 by blocks of eight.
-// ---------------------------------------------------------------------------
-
-kernel void gam_gemm_f32_padded(
-    device const float* A        [[buffer(0)]],
-    device const float* B        [[buffer(1)]],
-    device float*       C        [[buffer(2)]],
-    constant GemmParams& p       [[buffer(3)]],
-    uint3 tg                     [[threadgroup_position_in_grid]],
-    uint  sg                     [[simdgroup_index_in_threadgroup]])
-{
-    A += (ulong)tg.z * p.stride_a;
-    B += (ulong)tg.z * p.stride_b;
-    C += (ulong)tg.z * p.stride_c;
-    const uint row0 = tg.y * 64 + (sg >> 1) * 32;
-    const uint col0 = tg.x * 64 + (sg & 1) * 32;
-    simdgroup_float8x8 acc[4][4];
-    for (uint i = 0; i < 4; ++i)
-        for (uint j = 0; j < 4; ++j)
-            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    device const float* a_base = A + (ulong)row0 * p.lda;
-    for (uint kk = 0; kk < p.k; kk += 8) {
-        simdgroup_float8x8 a[4];
-        simdgroup_float8x8 b[4];
-        for (uint i = 0; i < 4; ++i)
-            simdgroup_load(a[i], a_base + (ulong)(8 * i) * p.lda + kk, p.lda);
-        if (p.trans_b == 0u) {
-            for (uint j = 0; j < 4; ++j)
-                simdgroup_load(b[j], B + (ulong)kk * p.ldb + col0 + 8 * j, p.ldb);
-        } else {
-            for (uint j = 0; j < 4; ++j)
-                simdgroup_load(b[j], B + (ulong)(col0 + 8 * j) * p.ldb + kk, p.ldb, ulong2(0, 0), true);
-        }
-        for (uint i = 0; i < 4; ++i)
-            for (uint j = 0; j < 4; ++j)
-                simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
-    }
-    for (uint i = 0; i < 4; ++i)
-        for (uint j = 0; j < 4; ++j)
-            simdgroup_store(acc[i][j], C + (ulong)(row0 + 8 * i) * p.ldc + col0 + 8 * j, p.ldc);
-}
 
 // ---------------------------------------------------------------------------
 // Batched df64 GEMM: each thread accumulates a 2 x 2 block of dot products in

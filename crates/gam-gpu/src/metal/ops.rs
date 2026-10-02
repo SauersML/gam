@@ -30,11 +30,6 @@ fn to_u32(value: usize, what: &str) -> Result<u32, GpuError> {
     u32::try_from(value).map_err(|_| gpu_err!("Metal GEMM {what} = {value} exceeds u32"))
 }
 
-/// `value` rounded up to a multiple of `step`.
-pub(crate) fn padded(value: usize, step: usize) -> usize {
-    value.div_ceil(step).max(1) * step
-}
-
 /// How the right operand of a product is read from its buffer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RightLayout {
@@ -56,7 +51,7 @@ pub(crate) struct RightOperand<'b> {
 
 impl RightOperand<'_> {
     /// `(k, n)` of the product that reads this operand with `layout`.
-    fn product_dims(&self, layout: RightLayout) -> (usize, usize) {
+    pub(crate) fn product_dims(&self, layout: RightLayout) -> (usize, usize) {
         match layout {
             RightLayout::AsStored => (self.rows, self.cols),
             RightLayout::Transposed => (self.cols, self.rows),
@@ -106,87 +101,6 @@ pub(crate) fn upload_df64(
             }
         });
     Ok(buffer)
-}
-
-/// `A·op(B)` in f32 on the simdgroup matrix unit; `A` (`m × k`) is converted
-/// on upload and `B` is resident, padded to [`msl::GEMM_F32_TILE`] in both
-/// dimensions. The result is widened back to float64 exactly.
-pub(crate) fn matmul_f32_resident(
-    context: &MetalContext,
-    a: ArrayView2<'_, f64>,
-    b: RightOperand<'_>,
-    layout: RightLayout,
-) -> Result<(Array2<f64>, DeviceTiming), GpuError> {
-    let (m, k) = a.dim();
-    let (bk, n) = b.product_dims(layout);
-    if k != bk {
-        return Err(gpu_err!("Metal f32 GEMM: A is {m}x{k}, op(B) is {bk}x{n}"));
-    }
-    let tile = msl::GEMM_F32_TILE;
-    let (mp, kp, np) = match layout {
-        RightLayout::AsStored => (padded(m, tile), padded(b.rows, tile), b.stride),
-        RightLayout::Transposed => (padded(m, tile), b.stride, padded(b.rows, tile)),
-    };
-    let a_dev = upload_f32_padded(context, a, mp, kp)?;
-    let c_dev = context.buffer(mp * np * 4)?;
-    let params = GemmParams {
-        m: to_u32(mp, "m")?,
-        n: to_u32(np, "n")?,
-        k: to_u32(kp, "k")?,
-        lda: to_u32(kp, "lda")?,
-        ldb: to_u32(b.stride, "ldb")?,
-        ldc: to_u32(np, "ldc")?,
-        accumulate: 0,
-        trans_b: u32::from(layout == RightLayout::Transposed),
-        stride_a: 0,
-        stride_b: 0,
-        stride_c: 0,
-    };
-    let timing = context.submit(|recorder| {
-        recorder.dispatch(
-            msl::GEMM_F32_PADDED,
-            &[Arg::whole(&a_dev), Arg::whole(b.buffer), Arg::whole(&c_dev)],
-            &params,
-            [np / tile, mp / tile, 1],
-            [msl::GEMM_F32_THREADS, 1, 1],
-        )
-    })?;
-    Ok((read_f32(c_dev, m, n, np), timing))
-}
-
-/// `A·B` in f32, both operands converted on upload (any layout).
-pub(crate) fn matmul_f32(
-    context: &MetalContext,
-    a: ArrayView2<'_, f64>,
-    b: ArrayView2<'_, f64>,
-) -> Result<(Array2<f64>, DeviceTiming), GpuError> {
-    let (k, n) = b.dim();
-    let tile = msl::GEMM_F32_TILE;
-    let (kp, np) = (padded(k, tile), padded(n, tile));
-    let b_dev = upload_f32_padded(context, b, kp, np)?;
-    let right = RightOperand {
-        buffer: &b_dev,
-        rows: k,
-        cols: n,
-        stride: np,
-    };
-    matmul_f32_resident(context, a, right, RightLayout::AsStored)
-}
-
-/// The `m × n` corner of a padded f32 result, widened to float64.
-fn read_f32(mut c_dev: DeviceBuffer, m: usize, n: usize, stride: usize) -> Array2<f64> {
-    let padded = c_dev.f32s();
-    let mut values = Array2::<f64>::zeros((m, n));
-    values
-        .axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .enumerate()
-        .for_each(|(row, mut out)| {
-            for (slot, &value) in out.iter_mut().zip(&padded[row * stride..row * stride + n]) {
-                *slot = f64::from(value);
-            }
-        });
-    values
 }
 
 /// `A·op(B)` in df64 on the device against a resident df64 `B`; `A` is split
@@ -346,13 +260,13 @@ pub(crate) fn self_test(context: &MetalContext) -> Result<Result<(), String>, Gp
             .map_err(|refusal| gpu_err!("self-test operands refused: {refusal}"))?;
         for layout in [RightLayout::AsStored, RightLayout::Transposed] {
             let values = match (arithmetic, layout) {
-                (DeviceArithmetic::F32, RightLayout::AsStored) => matmul_f32(context, a.view(), b.view())?.0,
+                (DeviceArithmetic::F32, RightLayout::AsStored) => {
+                    super::mps::matmul_f32(context, a.view(), b.view())?.0
+                }
                 (DeviceArithmetic::F32, RightLayout::Transposed) => {
-                    let tile = msl::GEMM_F32_TILE;
-                    let stride = padded(k, tile);
-                    let stored = upload_f32_padded(context, stored_t.view(), padded(n, tile), stride)?;
-                    let right = RightOperand { buffer: &stored, rows: n, cols: k, stride };
-                    matmul_f32_resident(context, a.view(), right, layout)?.0
+                    let stored = upload_f32_padded(context, stored_t.view(), n, k)?;
+                    let right = RightOperand { buffer: &stored, rows: n, cols: k, stride: k };
+                    super::mps::matmul_f32_resident(context, a.view(), right, layout)?.0
                 }
                 (_, RightLayout::AsStored) => matmul_df64(context, a.view(), b.view())?.0,
                 (_, RightLayout::Transposed) => {

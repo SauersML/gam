@@ -31,6 +31,9 @@ cudarc.workspace = true
 objc2 = "0.6.4"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSError", "NSArray", "NSObject"] }
 objc2-metal = "0.3.2"
+# Apple's tuned f32 GEMM (MPSMatrixMultiplication), several times the hand
+# kernel's throughput on the matrix units.
+objc2-metal-performance-shaders = { version = "0.3.2", default-features = false, features = ["std", "MPSCore", "MPSCoreTypes", "MPSKernel", "MPSMatrix", "MPSMatrixMultiplication"] }
 
 [dev-dependencies]
 gam-problem = { path = "../gam-problem" }

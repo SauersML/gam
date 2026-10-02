@@ -257,20 +257,49 @@ pub fn row_norms_upper(
             unit: f64::EPSILON,
         })?;
     let limit = arithmetic.admissible_magnitude();
+    let check = |value: f64| -> Result<f64, BandRefusal> {
+        if !value.is_finite() {
+            return Err(BandRefusal::NonFinite { what });
+        }
+        let magnitude = value.abs();
+        if magnitude > limit {
+            return Err(BandRefusal::MagnitudeOutOfRange { what, magnitude });
+        }
+        Ok(value * value)
+    };
+    if !matrix.is_standard_layout() && matrix.t().is_standard_layout() {
+        // A transposed view of a row-major matrix: accumulate its rows'
+        // squares by walking the stored rows contiguously, in parallel blocks.
+        let stored = matrix.t();
+        let block = 64;
+        let partials: Result<Vec<Vec<f64>>, BandRefusal> = stored
+            .axis_chunks_iter(Axis(0), block)
+            .into_par_iter()
+            .map(|chunk| {
+                let mut sums = vec![0.0_f64; stored.ncols()];
+                for row in chunk.rows() {
+                    for (sum, &value) in sums.iter_mut().zip(row) {
+                        *sum += check(value)?;
+                    }
+                }
+                Ok(sums)
+            })
+            .collect();
+        let mut sums = vec![0.0_f64; stored.ncols()];
+        for partial in partials? {
+            for (sum, value) in sums.iter_mut().zip(partial) {
+                *sum += value;
+            }
+        }
+        return Ok(sums.into_iter().map(|sum| sum.sqrt() * inflation).collect());
+    }
     matrix
         .axis_iter(Axis(0))
         .into_par_iter()
         .map(|row| {
             let mut sum = 0.0_f64;
             for &value in row {
-                if !value.is_finite() {
-                    return Err(BandRefusal::NonFinite { what });
-                }
-                let magnitude = value.abs();
-                if magnitude > limit {
-                    return Err(BandRefusal::MagnitudeOutOfRange { what, magnitude });
-                }
-                sum += value * value;
+                sum += check(value)?;
             }
             Ok(sum.sqrt() * inflation)
         })

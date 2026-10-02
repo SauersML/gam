@@ -20,7 +20,8 @@ use ndarray::{Array2, ArrayView2};
 /// The device arithmetic a banded product asks for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BandedArithmetic {
-    /// f32 values and accumulation: relative band about `(k+2)·2^-23`. For
+    /// f32 values and accumulation (Metal Performance Shaders' GEMM): relative
+    /// band about `(k+2)·2^-23`. For
     /// results whose role is a ranking or a proposal that a float64
     /// computation then decides.
     F32,
@@ -109,7 +110,7 @@ pub fn banded_matmul(
     if let (Some(runtime), Ok(band)) = (decision.device(), &device_band) {
         let context = &runtime.context;
         let (values, timing) = match requested {
-            BandedArithmetic::F32 => crate::metal::ops::matmul_f32(context, a, b)?,
+            BandedArithmetic::F32 => crate::metal::mps::matmul_f32(context, a, b)?,
             BandedArithmetic::Df64 => crate::metal::ops::matmul_df64(context, a, b)?,
         };
         return Ok(BandedProduct {
@@ -160,8 +161,6 @@ pub struct ResidentOperand {
     runtime: &'static crate::apple_gpu::MetalRuntime,
     #[cfg(target_os = "macos")]
     buffer: crate::metal::DeviceBuffer,
-    #[cfg(target_os = "macos")]
-    stride: usize,
 }
 
 /// The `auto` floor of [`resident_operand`], in entries of `B`: below it a
@@ -195,15 +194,11 @@ pub fn resident_operand(
     decision.require_supported()?;
     #[cfg(target_os = "macos")]
     if let (Some(runtime), Ok((row_norms, col_norms))) = (decision.device(), norms) {
-        use crate::metal::{msl, ops};
+        use crate::metal::ops;
         let context = &runtime.context;
-        let (buffer, stride) = match arithmetic {
-            BandedArithmetic::F32 => {
-                let tile = msl::GEMM_F32_TILE;
-                let stride = ops::padded(cols, tile);
-                (ops::upload_f32_padded(context, b, ops::padded(rows, tile), stride)?, stride)
-            }
-            BandedArithmetic::Df64 => (ops::upload_df64(context, b)?, cols),
+        let buffer = match arithmetic {
+            BandedArithmetic::F32 => ops::upload_f32_padded(context, b, rows, cols)?,
+            BandedArithmetic::Df64 => ops::upload_df64(context, b)?,
         };
         return Ok(Some(ResidentOperand {
             rows,
@@ -214,7 +209,6 @@ pub fn resident_operand(
             policy,
             runtime,
             buffer,
-            stride,
         }));
     }
     Ok(None)
@@ -286,7 +280,7 @@ impl ResidentOperand {
             buffer: &self.buffer,
             rows: self.rows,
             cols: self.cols,
-            stride: self.stride,
+            stride: self.cols,
         };
         let layout = match layout {
             Layout::AsStored => RightLayout::AsStored,
@@ -294,7 +288,7 @@ impl ResidentOperand {
         };
         let context = &self.runtime.context;
         let (values, timing) = match self.arithmetic {
-            BandedArithmetic::F32 => ops::matmul_f32_resident(context, x, right, layout)?,
+            BandedArithmetic::F32 => crate::metal::mps::matmul_f32_resident(context, x, right, layout)?,
             BandedArithmetic::Df64 => ops::matmul_df64_resident(context, x, right, layout)?,
         };
         Ok(Some(BandedProduct {

@@ -66,6 +66,10 @@ fn products_lie_inside_their_bands_on_every_route() {
             let required = required.expect("required runs on the device");
             assert!(required.band.arithmetic.is_device());
             assert_inside(&required, &a, &b);
+            // A transposed view on the left is read transposed in place.
+            let stored = a.t().to_owned();
+            let left = banded_matmul(GpuPolicy::Required, arithmetic, stored.t(), b.view()).expect("device");
+            assert_inside(&left, &a, &b);
         } else {
             assert!(required.is_err(), "required must never silently run the CPU");
         }

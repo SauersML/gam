@@ -4,10 +4,14 @@
 //!
 //! The binding is `objc2-metal`, the maintained Metal binding (the `metal`
 //! crate is deprecated upstream in its favour and receives no new API).
-//! Custom MSL kernels are used rather than Metal Performance Shaders: the
-//! bands in [`crate::precision_bounds`] need the exact operation sequence of
-//! every kernel, which MPS does not document.
+//! f32 products run on Metal Performance Shaders' tuned GEMM ([`mps`]): its
+//! summation order is undocumented, and the f32 band
+//! ([`crate::precision_bounds::GemmBand`]) holds for every order at the
+//! faithful unit `2^-23`, which the probe's self-test checks on the device.
+//! df64 products run on gam's own MSL kernel ([`msl`]), whose operation
+//! sequence the df64 band counts exactly.
 
+pub(crate) mod mps;
 pub(crate) mod msl;
 pub(crate) mod ops;
 
@@ -244,11 +248,7 @@ impl MetalContext {
         &self,
         record: impl FnOnce(&Recorder<'_>) -> Result<(), GpuError>,
     ) -> Result<DeviceTiming, GpuError> {
-        autoreleasepool(|_| {
-            let command_buffer = self
-                .queue
-                .commandBuffer()
-                .ok_or_else(|| gpu_err!("Metal queue returned no command buffer"))?;
+        self.run(|command_buffer| {
             let encoder = command_buffer
                 .computeCommandEncoder()
                 .ok_or_else(|| gpu_err!("Metal command buffer returned no compute encoder"))?;
@@ -258,7 +258,23 @@ impl MetalContext {
             };
             let recorded = record(&recorder);
             recorder.encoder.endEncoding();
-            recorded?;
+            recorded
+        })
+    }
+
+    /// Encode into one command buffer with `encode`, commit it and wait for
+    /// the device. A command buffer that ends in any state but `Completed` is
+    /// a fault carrying Metal's own error description.
+    pub(crate) fn run(
+        &self,
+        encode: impl FnOnce(&ProtocolObject<dyn MTLCommandBuffer>) -> Result<(), GpuError>,
+    ) -> Result<DeviceTiming, GpuError> {
+        autoreleasepool(|_| {
+            let command_buffer = self
+                .queue
+                .commandBuffer()
+                .ok_or_else(|| gpu_err!("Metal queue returned no command buffer"))?;
+            encode(&command_buffer)?;
             command_buffer.commit();
             command_buffer.waitUntilCompleted();
             let status = command_buffer.status();

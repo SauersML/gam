@@ -20,7 +20,7 @@ use super::engine::{EngineError, Edit, Exactness, Primitive, Proposal, SearchCon
 use super::fit::ProposalKind;
 use super::operator_program::{FamilyInputs, Node, OperatorBody, OperatorProgram, ProgramError, Scale, Trace};
 use super::precision::DeclaredPrecision;
-use gam_linalg::faer_ndarray::{fast_ab, fast_abt};
+use gam_gpu::banded::Layout;
 use ndarray::{Array2, Axis, s};
 use std::collections::BTreeMap;
 
@@ -360,7 +360,7 @@ pub fn vjp(
                     // The identity and a norm gain are column scales, not matrix products.
                     let term = match op.diagonal() {
                         Some(d) => &cot * &d,
-                        None => fast_ab(&cot, op.matrix_cow().as_ref()),
+                        None => super::device::product(op, &cot, Layout::AsStored)?,
                     };
                     add(&mut g, *argument, term);
                 }
@@ -446,7 +446,7 @@ pub fn vjp(
                 add(&mut g, *input, out);
             }
             Node::Transposed { input, operator } => {
-                add(&mut g, *input, fast_abt(&cot, program.operators[*operator].matrix_cow().as_ref()));
+                add(&mut g, *input, super::device::product(&program.operators[*operator], &cot, Layout::Transposed)?);
             }
             Node::Attend { query, key, value: v, scale, rotary, causal } => {
                 let (gq, gk, gv) =

@@ -99,6 +99,9 @@ pub mod identify;
 // Exact directional derivatives of operator programs, and precisions derived from curvature.
 pub mod derivatives;
 
+// Proposal products (ranking, directions, curvature) on the Apple GPU; acceptances stay float64.
+pub mod device;
+
 // Model exports (export.json and raw float64 tensors) as operator programs and contracts.
 pub mod import;
 

@@ -1,11 +1,12 @@
 //! Per-input pieces of a language model trained through its own masked forward, on streamed
 //! sequences (#2951).
 //!
-//! `mpd_pieces_masked_2951 EXPORT_DIR PIECES_DIR OUT.json OBSERVATIONS {fit|wsvd|wsvd2} TRAIN EVAL [CONTEXT]`
+//! `mpd_pieces_masked_2951 EXPORT_DIR PIECES_DIR OUT.json OBSERVATIONS {fit|wsvd|wsvd2} TRAIN EVAL [CONTEXT] [GPU]`
 //!
 //! `EXPORT_DIR` is a language-model export (`gam_mpd::import::import_language_model`) whose first
 //! `TRAIN` token rows train the pieces and whose next `EVAL` rows evaluate them, `CONTEXT`
-//! positions each (default 512). `PIECES_DIR` holds `bench/mpd_pieces_2951.py dump`'s site
+//! positions each (default 512). `GPU` (`off`, `auto` (default) or `required`) is the policy for the
+//! proposal products (`gam_mpd::device`); every acceptance runs in float64 on the CPU. `PIECES_DIR` holds `bench/mpd_pieces_2951.py dump`'s site
 //! statistics and, for `fit`, the starting libraries of `mpd_pieces_2951` (VPD naming,
 //! `h.{l}.attn.q_proj` and so on); `wsvd` starts from each site's exact Fisher-whitened singular
 //! pieces (`gam_mpd::pieces::fisher_svd`), and `wsvd2` grows those to twice as many on the first
@@ -76,7 +77,7 @@ fn sums(masks: &[Array2<f64>], kl: &Array1<f64>) -> (f64, f64, f64) {
 fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
-    let usage = "mpd_pieces_masked_2951 EXPORT_DIR PIECES_DIR OUT.json OBSERVATIONS {fit|wsvd|wsvd2} TRAIN EVAL [CONTEXT]";
+    let usage = "mpd_pieces_masked_2951 EXPORT_DIR PIECES_DIR OUT.json OBSERVATIONS {fit|wsvd|wsvd2} TRAIN EVAL [CONTEXT] [GPU]";
     let export = PathBuf::from(args.get(1).ok_or(usage)?);
     let pieces_dir = PathBuf::from(args.get(2).ok_or(usage)?);
     let out = PathBuf::from(args.get(3).ok_or(usage)?);
@@ -85,6 +86,8 @@ fn main() -> Result<(), String> {
     let train: usize = args.get(6).ok_or(usage)?.parse().map_err(|e| format!("TRAIN: {e}"))?;
     let eval: usize = args.get(7).ok_or(usage)?.parse().map_err(|e| format!("EVAL: {e}"))?;
     let context: usize = args.get(8).map_or(Ok(512), |v| v.parse()).map_err(|e| format!("CONTEXT: {e}"))?;
+    let gpu = args.get(9).map_or("auto", String::as_str);
+    gam_gpu::configure_global_policy(gam_gpu::GpuPolicy::parse(gpu).ok_or_else(|| format!("GPU {gpu}: expected off, auto or required"))?);
     let imported = import_language_model(&export, train + eval, context)?;
     let model = &imported.program;
     let family = &imported.contract.family;
