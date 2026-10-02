@@ -862,87 +862,16 @@ fn encoded_table_from_arrow(
     Ok(PyEncodedTable { dataset })
 }
 
-/// Project a typed prediction table onto the model's input columns and re-encode
-/// it against the saved training schema.
-///
-/// The column set is the model's input contract ([`prediction_consumable_columns`]),
-/// and a required column the table lacks is refused. The cell rules are gam-data's
-/// [`gam::data::project_encoded_to_schema`], the projection `gam predict` applies
-/// to a Parquet file: labels map onto training levels, a random-effect group's
-/// unseen or missing label takes the unknown-level code, and a missing or
-/// non-finite numeric cell is refused naming its column. A numeric-coded fixed
-/// `factor(g)` has no categorical schema, so its unseen levels are refused by
-/// [`FittedModel::unseen_numeric_factor_levels`], the check `gam predict` runs.
-///
-/// A refused cell is [`PredictError::Input`] and a missing column or a column
-/// of the wrong kind is [`PredictError::SchemaMismatch`], so each reaches Python
-/// as its own class.
+/// `source` projected onto the model's input contract and re-encoded against the
+/// saved training schema ([`gam_predict::model_frame::project_to_model_schema`],
+/// the projection `gam predict` applies to a Parquet file). A refused cell is
+/// [`PredictError::Input`] and a missing column or a column of the wrong kind is
+/// [`PredictError::SchemaMismatch`], so each reaches Python as its own class.
 fn dataset_with_model_schema_from_encoded(
     model: &FittedModel,
     source: &EncodedDataset,
 ) -> Result<EncodedDataset, PredictError> {
-    let required = required_prediction_columns(model)?;
-    let present = source.headers.iter().cloned().collect::<BTreeSet<_>>();
-    let missing = required
-        .difference(&present)
-        .map(|name| format!("missing required column '{name}'"))
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        return Err(PredictError::SchemaMismatch(missing.join(" ")));
-    }
-    let consumable = prediction_consumable_columns(model)?;
-    let keep = source
-        .headers
-        .iter()
-        .enumerate()
-        .filter(|(_, name)| consumable.contains(name.as_str()))
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    let selected = EncodedDataset {
-        headers: keep
-            .iter()
-            .map(|&index| source.headers[index].clone())
-            .collect(),
-        values: source.values.select(ndarray::Axis(1), &keep),
-        schema: DataSchema {
-            columns: keep
-                .iter()
-                .map(|&index| {
-                    source.schema.columns.get(index).cloned().ok_or_else(|| {
-                        format!(
-                            "encoded table column '{}' has no source schema",
-                            source.headers[index]
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        },
-        column_kinds: keep
-            .iter()
-            .map(|&index| source.column_kinds[index])
-            .collect(),
-    };
-    let policy = gam::data::UnseenCategoryPolicy::encode_unknown_for_columns(
-        model.random_effect_group_columns(),
-    );
-    let schema = model
-        .require_data_schema()
-        .map_err(|error| PredictError::Other(error.to_string()))?;
-    let dataset = gam::data::project_encoded_to_schema(selected, schema, &policy).map_err(
-        |error| match error {
-            gam::data::DataError::InvalidCell { .. } => PredictError::Input(error),
-            gam::data::DataError::SchemaMismatch { reason } => PredictError::SchemaMismatch(reason),
-            other => PredictError::Other(other.to_string()),
-        },
-    )?;
-    if let Some(unseen) = model
-        .unseen_numeric_factor_levels(&dataset.headers, dataset.values.view())
-        .into_iter()
-        .next()
-    {
-        return Err(PredictError::Input(unseen));
-    }
-    Ok(dataset)
+    Ok(gam_predict::model_frame::project_to_model_schema(model, source)?)
 }
 
 fn schema_check_encoded(

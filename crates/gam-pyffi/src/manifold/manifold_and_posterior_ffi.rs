@@ -2233,37 +2233,6 @@ fn required_prediction_columns(model: &FittedModel) -> Result<BTreeSet<String>, 
     model.prediction_required_columns()
 }
 
-/// Columns a fitted model can legitimately consume from a prediction frame.
-///
-/// This is the model's *input contract*: every variable the formula names
-/// (features, interaction margins, random-effect grouping columns, a smooth's
-/// `by=` column), plus the offset / noise-offset / latent-`z` / survival
-/// entry-exit columns surfaced by [`required_prediction_columns`], plus the
-/// response column (needed for the conformal-calibration fold and for survival
-/// / transformation-normal label-bearing frames), plus the prior-weights column
-/// when the model was fitted with one (needed by the generative-replicate path
-/// to reconstruct heteroskedastic observation noise `Var(y_i)=sigma^2/w_i`,
-/// #2025/#2033).
-///
-/// Any column *not* in this set is irrelevant to the model — a row ID, a
-/// grouping/label column carried for bookkeeping, an auxiliary measurement —
-/// and must be ignored at predict time rather than strictly re-encoded against
-/// the training schema. See [`project_frame_to_model_columns`] for why.
-fn prediction_consumable_columns(model: &FittedModel) -> Result<BTreeSet<String>, String> {
-    let mut consumable = required_prediction_columns(model)?;
-    if let Some(response) = response_column_name(model.payload().formula.as_str()) {
-        consumable.insert(response);
-    }
-    // Retain the prior-weights column when the model carried one, so it survives
-    // projection and the replicate path can resolve per-row weights rather than
-    // erroring on a frame that *does* include them (#2033 regression of #2025).
-    // Harmless for ordinary predict, which never resolves the weight column.
-    if let Some(weight) = model.weight_column.as_deref() {
-        consumable.insert(weight.to_string());
-    }
-    Ok(consumable)
-}
-
 /// Project a prediction frame onto the columns the model actually references,
 /// preserving the input column order.
 ///

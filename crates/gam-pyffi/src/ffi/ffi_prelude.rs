@@ -69,6 +69,7 @@ pub(crate) use gam::inference::model_extension::ExtendGroupRequest;
 pub(crate) use gam_predict::posterior_bands::{self, PosteriorPredictBandsPayload};
 
 pub(crate) use gam_predict::FittedModelPredictExt;
+pub(crate) use gam_predict::model_frame::prediction_consumable_columns;
 pub(crate) use gam_predict::input::{
     build_predict_input_for_model, build_transformation_normal_observed_scores,
 };

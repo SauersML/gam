@@ -776,6 +776,17 @@ impl From<String> for PredictError {
     }
 }
 
+impl From<gam_predict::model_frame::ModelFrameError> for PredictError {
+    fn from(error: gam_predict::model_frame::ModelFrameError) -> Self {
+        use gam_predict::model_frame::ModelFrameError;
+        match error {
+            ModelFrameError::SchemaMismatch(message) => PredictError::SchemaMismatch(message),
+            ModelFrameError::Input(error) => PredictError::Input(error),
+            ModelFrameError::Other(message) => PredictError::Other(message),
+        }
+    }
+}
+
 impl From<PredictError> for String {
     fn from(err: PredictError) -> Self {
         match err {

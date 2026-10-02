@@ -7732,27 +7732,7 @@ fn affine_design_for_dataset(
     model: &FittedModel,
     dataset: EncodedDataset,
 ) -> Result<DenseAffineDesign, String> {
-    // Which fitted models have no affine coefficient frame — and the wording of
-    // that refusal — is the core's decision, not this boundary's. Ask before
-    // materialising prediction rows so a scan-routed model declines with the
-    // structural reason instead of a row-building error (#1046, SPEC parity).
-    if let Some(reason) = gam_predict::affine_design_unavailable_reason(model)? {
-        return Err(reason);
-    }
-
-    let col_map = dataset.column_map();
-    let offset = resolve_offset_column(&dataset, &col_map, model.offset_column.as_deref())?;
-    let offset_noise = Array1::zeros(dataset.values.nrows());
-    let input = build_predict_input_for_model(
-        model,
-        dataset.values.view(),
-        &col_map,
-        model.training_headers.as_ref(),
-        &offset,
-        &offset_noise,
-        false,
-    )?;
-    let affine = gam_predict::fitted_standard_affine_design(model, &input)?;
+    let affine = gam_predict::model_frame::affine_design_for_model_frame(model, &dataset)?;
     let matrix = affine
         .matrix
         .try_to_dense_by_chunks("public affine prediction design")?;
