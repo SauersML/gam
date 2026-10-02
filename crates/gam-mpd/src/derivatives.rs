@@ -69,7 +69,7 @@ pub fn jvp_seeded(
                     None => out = Some(term),
                 };
                 for (argument, operator) in terms {
-                    let a = program.operators[*operator].matrix();
+                    let a = program.operators[*operator].matrix_cow();
                     if let Some(dx) = tangent_of(&dv, *argument) {
                         add(dx.dot(&a.t()));
                     }
@@ -219,10 +219,10 @@ pub fn jvp_seeded(
                 out
             }),
             Node::Transposed { input, operator } => {
-                let a = program.operators[*operator].matrix();
+                let a = program.operators[*operator].matrix_cow();
                 let mut out: Option<Array2<f64>> = None;
                 if let Some(dx) = tangent_of(&dv, *input) {
-                    out = Some(dx.dot(&a));
+                    out = Some(dx.dot(a.as_ref()));
                 }
                 if let Some(da) = tangents.get(operator) {
                     let term = value(*input).dot(da);
@@ -355,7 +355,7 @@ pub fn vjp(
             Node::Feature { .. } | Node::Raw { .. } | Node::Constant { .. } => {}
             Node::Affine { terms, .. } => {
                 for (argument, operator) in terms {
-                    add(&mut g, *argument, cot.dot(&program.operators[*operator].matrix()));
+                    add(&mut g, *argument, cot.dot(program.operators[*operator].matrix_cow().as_ref()));
                 }
             }
             Node::Bilinear { left, right, scale } => {
@@ -410,12 +410,7 @@ pub fn vjp(
                 add(&mut g, *left, &cot * value(*right));
                 add(&mut g, *right, &cot * value(*left));
             }
-            Node::Readout { input, basis } => {
-                let size = program.declarations.domains[program.bases[*basis].domain()].size;
-                let classes: Vec<u32> = (0..size as u32).collect();
-                let phi = program.bases[*basis].evaluate(&program.declarations, &classes)?.values;
-                add(&mut g, *input, cot.dot(&phi));
-            }
+            Node::Readout { input, basis } => add(&mut g, *input, program.bases[*basis].read_transpose(&program.declarations, &cot)?),
             Node::Concat { parts } => {
                 let mut offset = 0;
                 for part in parts {
@@ -444,7 +439,7 @@ pub fn vjp(
                 add(&mut g, *input, out);
             }
             Node::Transposed { input, operator } => {
-                add(&mut g, *input, cot.dot(&program.operators[*operator].matrix().t()));
+                add(&mut g, *input, cot.dot(&program.operators[*operator].matrix_cow().t()));
             }
             Node::Attend { query, key, value: v, scale, rotary, causal } => {
                 let (gq, gk, gv) =

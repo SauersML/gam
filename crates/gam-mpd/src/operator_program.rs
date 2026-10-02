@@ -749,6 +749,15 @@ impl Operator {
         }
     }
 
+    /// [`Operator::matrix`] without copying a dense operator's reals: borrowed when dense, formed
+    /// otherwise.
+    pub fn matrix_cow(&self) -> std::borrow::Cow<'_, Array2<f64>> {
+        match &self.body {
+            OperatorBody::Dense { values, .. } => std::borrow::Cow::Borrowed(values),
+            _ => std::borrow::Cow::Owned(self.matrix()),
+        }
+    }
+
     /// The matrix (rows × cols) this operator applies.
     pub fn matrix(&self) -> Array2<f64> {
         match &self.body {
@@ -1543,7 +1552,7 @@ impl OperatorProgram {
                         }
                         if let Some(change) = changes.get(argument) {
                             let (cols, dx) = change.delta(x);
-                            let a = self.operators[*operator].matrix();
+                            let a = self.operators[*operator].matrix_cow();
                             delta += &dx.dot(&a.select(Axis(1), &cols).t());
                             touched.iter_mut().for_each(|t| *t = true);
                         }
@@ -1942,7 +1951,7 @@ impl OperatorProgram {
             Node::Transposed { input, operator } => {
                 let (out, _) = self.evaluate_node(index, node, inputs, values, None, interfaces, frame)?;
                 let op = &self.operators[*operator];
-                let a = op.matrix();
+                let a = op.matrix_cow();
                 let x = value(*input);
                 let mut radius = x.mapv(|v| accumulation_growth(a.nrows()) * v.abs()).dot(&a.mapv(f64::abs));
                 inflate_all(&mut radius, a.nrows());
@@ -2058,9 +2067,9 @@ impl OperatorProgram {
             }
             Node::RmsNorm { input, epsilon } => Ok(rms_norm(value(*input), band(*input), *epsilon)),
             Node::Transposed { input, operator } => {
-                let a = self.operators[*operator].matrix();
+                let a = self.operators[*operator].matrix_cow();
                 let x = value(*input);
-                let out = x.dot(&a);
+                let out = x.dot(a.as_ref());
                 let radius = band(*input).map(|r| {
                     let growth = accumulation_growth(a.nrows());
                     let mut lifted = x.mapv(|v| growth * v.abs());
