@@ -3244,6 +3244,18 @@ fn decode_rules(
 impl OperatorProgram {
     /// The itemised length of [`Self::encode`]'s message, computed without writing it.
     pub fn code_account(&self) -> Result<CodeAccount, ProgramError> {
+        let (header_bits, basis_bits, rule_bits, node_total) = self.frame_bits()?;
+        let operator_bits = self.operators.iter().map(|op| operator_bits(op)).collect::<Result<Vec<_>, _>>()?;
+        let total_bits = header_bits
+            + basis_bits.iter().sum::<u64>()
+            + operator_bits.iter().map(|(a, b)| a + b).sum::<u64>()
+            + rule_bits
+            + node_total;
+        Ok(CodeAccount { header_bits, basis_bits, operator_bits, rule_bits, node_bits: node_total, total_bits })
+    }
+
+    /// The message's parts other than the operators: header, bases, rules and nodes.
+    fn frame_bits(&self) -> Result<(u64, Vec<u64>, u64, u64), ProgramError> {
         let interfaces = self.interfaces()?;
         let header_bits = prefix_integer_len_bits(self.bases.len() as u64 + 1)?
             + prefix_integer_len_bits(self.operators.len() as u64 + 1)?
@@ -3254,7 +3266,6 @@ impl OperatorProgram {
             .iter()
             .map(|basis| basis_bits(basis, self.declarations.domains.len()))
             .collect::<Result<Vec<_>, _>>()?;
-        let operator_bits = self.operators.iter().map(|op| operator_bits(op)).collect::<Result<Vec<_>, _>>()?;
         let mut rules = BitString::new();
         encode_rules(&mut rules, self)?;
         let rule_bits = rules.len_bits();
@@ -3264,13 +3275,30 @@ impl OperatorProgram {
         for (index, node) in self.nodes.iter().enumerate() {
             encode_node(&mut nodes, node, index, &code, &interfaces)?;
         }
-        let node_total = nodes.len_bits();
-        let total_bits = header_bits
-            + basis_bits.iter().sum::<u64>()
-            + operator_bits.iter().map(|(a, b)| a + b).sum::<u64>()
-            + rule_bits
-            + node_total;
-        Ok(CodeAccount { header_bits, basis_bits, operator_bits, rule_bits, node_bits: node_total, total_bits })
+        Ok((header_bits, basis_bits, rule_bits, nodes.len_bits()))
+    }
+
+    /// [`Self::code_bits`] given `base`, a program whose message is `base_bits` long and whose
+    /// operators this one shares wherever it has not changed them: only the operators that differ
+    /// (by pointer, then by value) and the frame are re-measured. A different operator count
+    /// measures the whole message.
+    pub fn code_bits_from(&self, base: &OperatorProgram, base_bits: u64) -> Result<u64, ProgramError> {
+        if self.operators.len() != base.operators.len() {
+            return self.code_bits();
+        }
+        let mut bits = base_bits as i128;
+        for (new, old) in self.operators.iter().zip(&base.operators) {
+            if Arc::ptr_eq(new, old) || new == old {
+                continue;
+            }
+            let ((ns, nr), (os, or)) = (operator_bits(new)?, operator_bits(old)?);
+            bits += i128::from(ns + nr) - i128::from(os + or);
+        }
+        if self.nodes != base.nodes || self.bases != base.bases || self.rules != base.rules || self.declarations != base.declarations {
+            let frame = |(h, b, r, n): (u64, Vec<u64>, u64, u64)| i128::from(h + b.iter().sum::<u64>() + r + n);
+            bits += frame(self.frame_bits()?) - frame(base.frame_bits()?);
+        }
+        u64::try_from(bits).map_err(|_| ProgramError::Code(format!("a message of {bits} bits")))
     }
 
     fn top_code<'a>(&self, rule_inputs: &'a [usize]) -> NodeCode<'a> {

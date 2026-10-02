@@ -371,3 +371,45 @@ fn a_group_drop_is_priced_exactly_from_the_block_table() {
         }
     }
 }
+
+/// A candidate's message length measured from its base (changed operators and frame only) is
+/// its full length, for restrictions, precision moves and law replacements.
+#[test]
+fn a_candidates_length_from_its_base_is_its_length() {
+    use super::engine::{GroupAxis, apply_edit};
+    use super::operator_program::Law;
+    let (program, _) = planted_program(false);
+    let base = program.code_bits().expect("bits");
+    let dense = program.operators.iter().position(|o| matches!(o.body, OperatorBody::Dense { .. })).expect("dense");
+    let mut edits = vec![
+        Edit::DropGroup { operator: dense, axis: GroupAxis::Columns, group: 0 },
+        Edit::Precision { operator: dense, precision: precision(3) },
+    ];
+    if let Some((node, count)) = program.nodes.iter().enumerate().find_map(|(i, n)| match n {
+        Node::Pointwise { laws, .. } => Some((i, laws.len())),
+        Node::Feature { .. }
+        | Node::Raw { .. }
+        | Node::Constant { .. }
+        | Node::Affine { .. }
+        | Node::Bilinear { .. }
+        | Node::Softmax { .. }
+        | Node::Mix { .. }
+        | Node::Hadamard { .. }
+        | Node::Readout { .. }
+        | Node::Outer { .. }
+        | Node::Concat { .. }
+        | Node::Param { .. }
+        | Node::Call { .. }
+        | Node::Gain { .. }
+        | Node::Attend { .. }
+        | Node::RmsNorm { .. }
+        | Node::Transposed { .. } => None,
+    }) {
+        edits.push(Edit::Laws { node, laws: vec![Law::Identity; count], blocks: Vec::new() });
+    }
+    for edit in edits {
+        let mut candidate = program.clone();
+        apply_edit(&mut candidate, &edit).expect("edit");
+        assert_eq!(candidate.code_bits_from(&program, base).expect("from base"), candidate.code_bits().expect("bits"), "{edit:?}");
+    }
+}
