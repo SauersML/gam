@@ -59,8 +59,8 @@
 //!
 //! # The unit gauge
 //!
-//! A gauge orbit has no shortest element under rewriting in both directions, so the gauge moves of
-//! [`super::canonical`] enter as one exact canonical form applied before saturation
+//! A gauge orbit has no shortest element under rewriting in both directions, so the unit gauge
+//! moves (merging, rescaling, reordering) enter as one exact canonical form applied before saturation
 //! ([`canonical_units`]): a ReLU layer's units whose read rows (every term and the bias) are equal
 //! merge into one unit with the summed write column; a unit that reads nothing is removed; each
 //! remaining unit is moved by the exact power of two that puts its bias's magnitude in `[1, 2)`, or

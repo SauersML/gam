@@ -1274,7 +1274,7 @@ pub(super) fn project_coefficients_to_lower_bounds(
 /// A lower bound is the unit row `β_i ≥ lb_i` of the fit's inequality system
 /// (`polish_inequality_system` states it that way), whose scaled slack is
 /// `β_i − lb_i`. Whether a row is active has ONE definition,
-/// [`crate::active_set::row_is_active`], which the exact face decrement and the
+/// `active_set::row_is_active`, which the exact face decrement and the
 /// geometric KKT channels already apply to these same rows through
 /// `active_face`. The projected-gradient norm and the bound QP's working set
 /// read it here, so every half of the certificate agrees on the face (#3180).

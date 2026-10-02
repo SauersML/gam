@@ -4563,7 +4563,7 @@ impl LatentSurvivalFrozenOffsetChart {
 /// The first and second θ-partials of the log-cumulative-hazard baseline
 /// offsets `(η = log H, o_D = h/H)` at one age, in the coordinates of
 /// [`survival_baseline_theta_from_config`]: [`baseline_offset_theta_partials`]
-/// and [`log_cumulative_hazard_offset_theta_second_partials`], the jets the
+/// and `log_cumulative_hazard_offset_theta_second_partials`, the jets the
 /// transformation path's profile θ-Hessian contracts (#3201).
 pub fn baseline_offset_theta_jets(
     age: f64,
