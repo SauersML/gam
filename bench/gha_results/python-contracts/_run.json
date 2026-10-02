@@ -3,12 +3,12 @@
   "publish_job_status": "cancelled",
   "publish_job_status_note": "status of the job that PUBLISHED these results, not the conclusion of run_id -- this job is part of that run, so the run has not concluded here",
   "publish_job_failed_steps": "",
-  "run_id": "36910550120",
-  "run_number": "347",
+  "run_id": "37039432086",
+  "run_number": "349",
   "run_attempt": "1",
-  "event": "workflow_dispatch",
-  "ref": "refs/heads/wip/sae-spec-issues",
-  "sha": "328b900ad567a079abb99bea03c2361a2f8d00c5",
-  "completed_utc": "2026-10-02T00:09:24Z",
-  "run_url": "https://github.com/SauersML/gam/actions/runs/36910550120"
+  "event": "schedule",
+  "ref": "refs/heads/main",
+  "sha": "347486fbd8b88b508ed8fbae746d1ca27972f182",
+  "completed_utc": "2026-10-02T22:16:20Z",
+  "run_url": "https://github.com/SauersML/gam/actions/runs/37039432086"
 }
