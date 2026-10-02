@@ -245,7 +245,7 @@ impl From<ProgramError> for EgraphError {
 
 /// `x (1 + 2γ_{k+2})`, rounded up: the outward inflation of a computed nonnegative sum of `k`
 /// terms, as in the program's execution bands.
-fn outward(value: f64, terms: usize) -> f64 {
+pub(crate) fn outward(value: f64, terms: usize) -> f64 {
     (value * (1.0 + 2.0 * accumulation_growth(terms + 2))).next_up()
 }
 

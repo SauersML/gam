@@ -16,8 +16,9 @@
 //!   each path product.
 //!
 //! A leaf's reals are exact on its lattice, but a leaf that stands for a basis change of another
-//! is only defined to that lattice's half-step `h`, so each spectrum is compared within the SVD's
-//! own band plus Weyl's bound `h √(m n)` for each leaf (propagated through a product by
+//! is only defined to the grid each entry was rounded on, at most the coarsest lattice holding the
+//! entry, so each spectrum is compared within the SVD's own band plus Weyl's bound `‖(h_ij)‖_F`
+//! (`h_ij` that lattice's half-step) for each leaf (propagated through a product by
 //! `‖ΔB‖‖A‖ + ‖B‖‖ΔA‖ + ‖ΔB‖‖ΔA‖`, and into `tr(P^k)` by `k n ‖P‖^{k−1} ‖ΔP‖`). The fingerprints
 //! nominate pairs; only the code accepts them.
 //!
@@ -337,9 +338,27 @@ fn lattice_half_step(operator: &super::operator_program::Operator) -> f64 {
     }
 }
 
-/// `h √(m n)`: Weyl's bound on the spectral move of a matrix only resolved to half-step `h`.
+/// Half the step of the coarsest dyadic lattice holding the nonzero `value`: the largest rounding
+/// error a grid `value` lies on can have left in it.
+fn coarsest_half_step(value: f64) -> f64 {
+    let bits = value.abs().to_bits();
+    let exponent = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1_u64 << 52) - 1);
+    let (mantissa, scale) = if exponent == 0 { (fraction, -1074) } else { (fraction | (1_u64 << 52), exponent - 1075) };
+    2.0_f64.powi(scale + mantissa.trailing_zeros() as i32 - 1)
+}
+
+/// `‖(h_ij)‖_F`, each `h_ij` the half-step of the coarsest lattice holding entry `ij` (the
+/// operator's own `half_step` for a zero): Weyl's bound on the spectral move of a matrix whose
+/// entries were each rounded to some grid they lie on. Units moved by different powers of two
+/// (the canonical gauge) were rounded on different grids, so no single step bounds them all.
 fn resolution(matrix: &Array2<f64>, half_step: f64) -> f64 {
-    (half_step * ((matrix.nrows() * matrix.ncols()) as f64).sqrt()).next_up()
+    let squares: f64 = matrix
+        .iter()
+        .map(|&v| if v == 0.0 { half_step } else { coarsest_half_step(v).max(half_step) })
+        .map(|h| h * h)
+        .sum();
+    super::egraph::outward(squares.sqrt().next_up(), matrix.len())
 }
 
 fn singular_values(matrix: &Array2<f64>) -> Option<(Vec<f64>, f64)> {
