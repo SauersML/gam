@@ -1,14 +1,15 @@
 //! Per-input pieces of a language model trained through its own masked forward, on streamed
 //! sequences (#2951).
 //!
-//! `mpd_pieces_masked_2951 EXPORT_DIR PIECES_DIR OUT.json OBSERVATIONS {fit|wsvd} TRAIN EVAL [CONTEXT]`
+//! `mpd_pieces_masked_2951 EXPORT_DIR PIECES_DIR OUT.json OBSERVATIONS {fit|wsvd|wsvd2} TRAIN EVAL [CONTEXT]`
 //!
 //! `EXPORT_DIR` is a language-model export (`gam_mpd::import::import_language_model`) whose first
 //! `TRAIN` token rows train the pieces and whose next `EVAL` rows evaluate them, `CONTEXT`
 //! positions each (default 512). `PIECES_DIR` holds `bench/mpd_pieces_2951.py dump`'s site
 //! statistics and, for `fit`, the starting libraries of `mpd_pieces_2951` (VPD naming,
 //! `h.{l}.attn.q_proj` and so on); `wsvd` starts from each site's exact Fisher-whitened singular
-//! pieces (`gam_mpd::pieces::fisher_svd`).
+//! pieces (`gam_mpd::pieces::fisher_svd`), and `wsvd2` grows those to twice as many on the first
+//! training sequence (`gam_mpd::masked::split`).
 //!
 //! The training sequences stream one at a time: each starts with the pieces whose own second-order
 //! KL bits in the global Fisher, on its clean forward, exceed their listing cost; its sets are
@@ -23,7 +24,7 @@
 
 use gam_mpd::codec::prefix_integer_len_bits;
 use gam_mpd::import::import_language_model;
-use gam_mpd::masked::{Library, Masked, Running, costs_from_counts, listing_bits, matrix, read_values, select, sites, step_pieces};
+use gam_mpd::masked::{Library, Masked, Running, costs_from_counts, listing_bits, matrix, read_values, select, sites, split, step_pieces};
 use gam_mpd::operator_program::FamilyInputs;
 use gam_mpd::pieces::fisher_svd;
 use ndarray::{Array1, Array2, Axis};
@@ -75,7 +76,7 @@ fn sums(masks: &[Array2<f64>], kl: &Array1<f64>) -> (f64, f64, f64) {
 fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
-    let usage = "mpd_pieces_masked_2951 EXPORT_DIR PIECES_DIR OUT.json OBSERVATIONS {fit|wsvd} TRAIN EVAL [CONTEXT]";
+    let usage = "mpd_pieces_masked_2951 EXPORT_DIR PIECES_DIR OUT.json OBSERVATIONS {fit|wsvd|wsvd2} TRAIN EVAL [CONTEXT]";
     let export = PathBuf::from(args.get(1).ok_or(usage)?);
     let pieces_dir = PathBuf::from(args.get(2).ok_or(usage)?);
     let out = PathBuf::from(args.get(3).ok_or(usage)?);
@@ -93,7 +94,7 @@ fn main() -> Result<(), String> {
     };
     let mut chosen = Vec::new();
     let mut libraries = Vec::new();
-    let mut weights: Vec<Array1<f64>> = Vec::new();
+    let mut fishers: Vec<Array2<f64>> = Vec::new();
     for site in sites(model) {
         let Some(name) = vpd_name(&site.name) else { continue };
         let w = matrix(model, &site)?;
@@ -101,7 +102,7 @@ fn main() -> Result<(), String> {
         let mean = Array1::from_vec(read_f64(&pieces_dir.join(format!("{name}.mu.f64")), 1, d_in)?.into_raw_vec_and_offset().0);
         let fisher = read_f64(&pieces_dir.join(format!("{name}.B.f64")), d_out, d_out)?;
         let (v, u) = match start.as_str() {
-            "wsvd" => {
+            "wsvd" | "wsvd2" => {
                 let second_moment = read_f64(&pieces_dir.join(format!("{name}.A.f64")), d_in, d_in)?;
                 let library = fisher_svd(&gam_mpd::pieces::Site { w: w.clone(), second_moment, mean: mean.clone(), fisher: fisher.clone() })?;
                 (library.v.t().to_owned(), library.u)
@@ -117,8 +118,7 @@ fn main() -> Result<(), String> {
         if error > 1e-6 * largest {
             return Err(format!("{name}: the starting library is not the site ({error:e} against {largest:e})"));
         }
-        // Each piece's second-order weight `uᵀ B u` in the global Fisher.
-        weights.push((&u.dot(&fisher) * &u).sum_axis(Axis(1)));
+        fishers.push(fisher);
         eprintln!("{} = {name}: {d_out}×{d_in}, {} pieces", site.name, v.nrows());
         chosen.push(site);
         libraries.push(Library { v, u, mean });
@@ -137,10 +137,30 @@ fn main() -> Result<(), String> {
         for (k, library) in libraries.iter().enumerate() {
             let x = read_values(&trace, &original_sites[k])? - &library.mean;
             let a = x.dot(&library.v.t());
-            masks.push(Array2::from_shape_fn(a.dim(), |(r, c)| if scale * a[[r, c]] * a[[r, c]] * weights[k][c] > costs[k][c] { 1.0 } else { 0.0 }));
+            // Each piece's second-order weight `uᵀ B u` in the global Fisher.
+            let weights = (&library.u.dot(&fishers[k]) * &library.u).sum_axis(Axis(1));
+            masks.push(Array2::from_shape_fn(a.dim(), |(r, c)| if scale * a[[r, c]] * a[[r, c]] * weights[c] > costs[k][c] { 1.0 } else { 0.0 }));
         }
         Ok(masks)
     };
+    // `wsvd2`: the Fisher-SVD library grown to twice its pieces on the first training sequence,
+    // every piece its listing inputs use in two ways split in two (`gam_mpd::masked::split`).
+    if start == "wsvd2" {
+        let inputs = sequence(0);
+        let target = target_of(&inputs)?;
+        let costs = costs_from_counts(&counts);
+        let begin = start_masks(&inputs, &masked.libraries, &costs)?;
+        let (masks, _) = select(&masked, &inputs, &target, begin, &costs, observations, samples)?;
+        let trace = model.execute(&inputs, false).map_err(|e| e.to_string())?;
+        let mut grown = Vec::new();
+        for (k, library) in masked.libraries.iter().enumerate() {
+            let x = read_values(&trace, &original_sites[k])?;
+            grown.push(split(library, &x, &masks[k]).0);
+        }
+        eprintln!("grown to {} pieces", grown.iter().map(|l| l.v.nrows()).sum::<usize>());
+        masked = Masked::build(model, original_sites.clone(), grown)?;
+        counts = masked.libraries.iter().map(|l| Array1::zeros(l.v.nrows())).collect();
+    }
     let mut running = Running::default();
     let mut points = Vec::new();
     let mut previous = f64::INFINITY;

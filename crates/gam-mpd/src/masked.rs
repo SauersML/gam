@@ -718,3 +718,67 @@ pub fn step_pieces(
     }
     Ok(None)
 }
+
+/// Grow a site's library by splitting every piece that its active inputs use in two ways
+/// (module note): piece `c` with activation `a_t = v_c · (x_t − μ)` on the inputs `t` that list it
+/// becomes `(u_c, v_c/2 + δ)` and `(u_c, v_c/2 − δ)`, so the pair sums to the piece (all pieces on
+/// is unchanged). The inputs are split by the sign `s_t` of their leading principal coordinate
+/// (away from `v_c`'s own), and `δ = β p` along that direction with `β` the least-squares fit of
+/// `δ · (x_t − μ) ≈ s_t a_t / 2`: then one half carries the piece on each side and the other half
+/// is nearly silent there, so the selection can list one where it listed both. Pieces listed by
+/// fewer than two inputs are kept whole. Returns the grown library and the masks with both halves
+/// on wherever the piece was on.
+pub fn split(library: &Library, x: &Array2<f64>, mask: &Array2<f64>) -> (Library, Array2<f64>) {
+    let (pieces, d_in) = library.v.dim();
+    let centred = x - &library.mean;
+    let mut v_rows: Vec<Array1<f64>> = Vec::new();
+    let mut u_rows: Vec<Array1<f64>> = Vec::new();
+    let mut columns: Vec<Array1<f64>> = Vec::new();
+    for c in 0..pieces {
+        let v = library.v.row(c).to_owned();
+        let u = library.u.row(c).to_owned();
+        let on = mask.column(c).to_owned();
+        let members: Vec<usize> = (0..mask.nrows()).filter(|&t| on[t] > 0.0).collect();
+        if members.len() < 2 {
+            v_rows.push(v);
+            u_rows.push(u);
+            columns.push(on);
+            continue;
+        }
+        let y = centred.select(Axis(0), &members);
+        let a = y.dot(&v);
+        // The members' inputs away from v's own direction, and their leading principal direction
+        // by power iteration from the residual of largest norm.
+        let vv = v.dot(&v).max(f64::MIN_POSITIVE);
+        let mut away = y.clone();
+        for (mut row, at) in away.outer_iter_mut().zip(a.iter()) {
+            row.scaled_add(-at / vv, &v);
+        }
+        let start = away.outer_iter().map(|r| r.dot(&r)).enumerate().fold((0, 0.0), |best, (i, n)| if n > best.1 { (i, n) } else { best }).0;
+        let mut p = away.row(start).to_owned();
+        for _ in 0..d_in.min(32) {
+            let next = away.t().dot(&away.dot(&p));
+            let norm = next.dot(&next).sqrt();
+            if !(norm > 0.0) {
+                break;
+            }
+            p = next / norm;
+        }
+        let projection = away.dot(&p);
+        let (num, den) = projection.iter().zip(a.iter()).fold((0.0, 0.0), |(n, d), (q, at)| (n + q * q.signum() * at * 0.5, d + q * q));
+        let beta = if den > 0.0 { num / den } else { 0.0 };
+        let delta = &p * beta;
+        v_rows.push(&v * 0.5 + &delta);
+        v_rows.push(&v * 0.5 - &delta);
+        u_rows.push(u.clone());
+        u_rows.push(u);
+        columns.push(on.clone());
+        columns.push(on);
+    }
+    let stack = |rows: &[Array1<f64>]| -> Array2<f64> {
+        let width = rows.first().map_or(0, |r| r.len());
+        Array2::from_shape_fn((rows.len(), width), |(i, j)| rows[i][j])
+    };
+    let masks = Array2::from_shape_fn((mask.nrows(), columns.len()), |(t, c)| columns[c][t]);
+    (Library { v: stack(&v_rows), u: stack(&u_rows), mean: library.mean.clone() }, masks)
+}

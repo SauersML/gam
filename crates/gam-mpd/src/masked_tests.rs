@@ -1,7 +1,7 @@
 #![cfg(test)]
 //! The masked program's derivatives against finite differences of its own KL.
 
-use super::masked::{Library, Masked, forward, gradients, sites, step_pieces};
+use super::masked::{Library, Masked, forward, gradients, sites, split, step_pieces};
 use super::operator_program::{
     Basis, Declarations, Domain, FamilyInputs, Interface, LabelKind, Law, Node, Operator, OperatorProgram, Provenance, Slot,
     SlotValues,
@@ -121,4 +121,25 @@ fn a_step_of_the_pieces_lowers_the_masked_kl() {
     assert!(step_pieces(&mut masked, &family, &target, &masks, 4, 7, &mut running).expect("steps").is_some());
     let after = forward(&masked, &fam, &target).expect("forward").0.sum();
     assert!(after < before, "{after} against {before}");
+}
+
+#[test]
+fn splitting_a_library_keeps_its_sum_and_lists_both_halves_where_the_piece_was_on() {
+    let pieces = 3;
+    let library = Library {
+        v: Array2::from_shape_fn((pieces, WIDTH), |(i, j)| noise(700 + 7 * i + j)),
+        u: Array2::from_shape_fn((pieces, UNITS), |(i, j)| noise(800 + 7 * i + j)),
+        mean: Array1::from_shape_fn(WIDTH, |i| 0.1 * noise(900 + i)),
+    };
+    let rows = 20;
+    let x = Array2::from_shape_fn((rows, WIDTH), |(t, j)| noise(1000 + 5 * t + j));
+    let mask = Array2::from_shape_fn((rows, pieces), |(t, c)| if c == 2 && t > 0 { 0.0 } else { 1.0 });
+    let (grown, masks) = split(&library, &x, &mask);
+    // Pieces 0 and 1 are listed by every input and split; piece 2 by one input and kept whole.
+    assert_eq!(grown.v.nrows(), 5);
+    assert_eq!(masks.dim(), (rows, 5));
+    let sum = |l: &Library| l.v.t().dot(&l.u);
+    let error = (&sum(&grown) - &sum(&library)).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    assert!(error < 1e-12, "{error}");
+    assert_eq!(masks.column(0), masks.column(1));
 }
