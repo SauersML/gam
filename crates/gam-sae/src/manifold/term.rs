@@ -506,8 +506,9 @@ pub struct SaeManifoldTerm {
     /// #3438 — the `(row, local slot)` interval coordinates the MOST RECENT
     /// `assemble_arrow_schur` pinned: at an endpoint whose descent direction leaves
     /// the interval ([`LatentManifold::gradient_pinned_axes`] on the raw row
-    /// gradient), where `B`'s Riemannian conversion zeroes the gradient, the
-    /// Hessian row and column, and the cross-block row. Read off the raw gradient
+    /// gradient), where `B`'s Riemannian conversion zeroes the gradient and the
+    /// cross-block row and writes the unit direction on the Hessian row and column
+    /// (#4077). Read off the raw gradient
     /// before the conversion discards its sign, in the row layout the system was
     /// built in, row-ascending. Every exact-information consumer applies the same
     /// pin to `ΔC` ([`Self::coordinate_tangent_blocks`]).

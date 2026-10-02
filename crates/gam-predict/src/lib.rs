@@ -10,7 +10,9 @@ pub mod linalg;
 pub mod partial_effect;
 pub mod posterior_bands;
 pub mod posterior_predict;
+pub mod response_geometry;
 pub mod term_diagnostics;
+pub mod topology_selection;
 
 pub use affine_design::*;
 pub use alo::*;
@@ -6018,6 +6020,9 @@ mod predict_2_2_tests;
 
 #[cfg(test)]
 mod anchored_posterior_predictive_tests;
+
+#[cfg(test)]
+mod topology_selection_tests;
 
 #[cfg(test)]
 mod survival_marginal_slope_posterior_tests;

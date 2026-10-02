@@ -33,25 +33,6 @@ class PredictionResult(dict[str, Any]):
             ) from exc
 
 
-class PreNormalizedTable:
-    """A table already normalized to ``(headers, native_table, kind)`` form.
-
-    The native table is the Rust-owned, typed encoding produced by
-    :func:`normalize_table`.  Reusing it across topology candidates avoids both
-    reparsing and another dense numeric copy; categorical labels are retained
-    only once in the Rust schema rather than expanded into a Python string per
-    cell. ``kind`` is preserved so output restoration still reflects the input
-    library.
-    """
-
-    __slots__ = ("headers", "rows", "kind")
-
-    def __init__(self, headers: list[str], rows: _EncodedTable, kind: str) -> None:
-        self.headers = headers
-        self.rows = rows
-        self.kind = kind
-
-
 # Mirror of gam-data's `CATEGORICAL_CELL_SENTINEL`: a rendered row of an encoded
 # table prefixes each categorical cell with it, so a level whose label parses as
 # a number ("0", "1") keeps its categorical source intent when the row is
@@ -80,8 +61,6 @@ def normalize_table(
     synthetic ``x0, x1, ...``); prediction passes the names the model binds a
     positional array to.
     """
-    if isinstance(data, PreNormalizedTable):
-        return data.headers, data.rows, data.kind
     columns, kind = _table_column_views(data, positional_headers)
     if required_columns is not None:
         names = list(required_columns)

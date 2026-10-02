@@ -102,7 +102,6 @@ __all__ = [
     "analytic_penalty_value_grad",
     "apply_inverse_link_array",
     "apply_shape_constraints_to_formula",
-    "assemble_candidate_formula",
     "atlas_nerve_diagram",
     "auc_from_predictions",
     "audit_sae",
@@ -181,12 +180,12 @@ __all__ = [
     "evidence_ratio",
     "expected_resolution_budget",
     "extend_model_with_group",
-    "extract_reml_score_raw",
     "extract_row_ids",
     "fit_array",
     "fit_event_history",
     "fit_joint_event_model",
     "fit_penalized_multinomial_pyfunc",
+    "fit_response_geometry_table",
     "fit_table",
     "fit_transport",
     "fixed_budget_block_sparse_dictionary_fit",
@@ -224,7 +223,6 @@ __all__ = [
     "glm_reml_fit_latent",
     "glm_reml_fit_latent_backward",
     "gumbel_schedule_tau",
-    "has_auto_smooth_term",
     "hazard_from_cumulative_knots",
     "identifiability_check_json",
     "identifiable_factor_profile_log_likelihood",
@@ -339,7 +337,9 @@ __all__ = [
     "response_geometry_inverse_alr",
     "response_geometry_inverse_ilr",
     "response_geometry_log_map",
+    "response_geometry_model_fields",
     "response_geometry_normalize_fisher_rao",
+    "response_geometry_predict_table",
     "response_geometry_simplex_exp_map",
     "response_geometry_simplex_exp_map_jet",
     "response_geometry_simplex_frechet_mean",
@@ -349,6 +349,7 @@ __all__ = [
     "response_geometry_sphere_exp_map_jet",
     "response_geometry_sphere_log_map",
     "response_geometry_sphere_normalize_base",
+    "response_geometry_summary",
     "riemannian_gradient_step",
     "routability_audit",
     "routability_floor",
@@ -379,7 +380,7 @@ __all__ = [
     "saved_model_kind",
     "select_probe_by_expected_evidence",
     "select_rank_with_profiled_hyperparameters",
-    "select_topology_candidate_lifecycle",
+    "select_topology_table",
     "separation_limit",
     "shape_matched_control",
     "shape_matched_control_f32",
@@ -1562,8 +1563,6 @@ def apply_inverse_link_array(eta: NDArray[np.float64], family_kind: str, link_sp
 
 def apply_shape_constraints_to_formula(formula: str, constraints: Sequence[tuple[str, str]]) -> str: ...
 
-def assemble_candidate_formula(base_formula: str, candidate_json: str, strict_dimension: bool = ...) -> str | None: ...
-
 def atlas_nerve_diagram(indices: NDArray[np.uint32], values: NDArray[np.float32], n_units: int, block_size: int, blocks: Sequence[int] | None = ..., observations: NDArray[np.float64] | None = ..., familywise_alpha: float | None = ...) -> dict[Any, Any]: ...
 
 def auc_from_predictions(observed: Sequence[float], predicted_mean: Sequence[float]) -> float: ...
@@ -1720,8 +1719,6 @@ def expected_resolution_budget(alpha: float, growth_nats_per_obs: float) -> floa
 
 def extend_model_with_group(model: _FittedModel, request_json: str) -> bytes: ...
 
-def extract_reml_score_raw(fit: object) -> float: ...
-
 def extract_row_ids(headers: Sequence[str], rows: _EncodedTable, id_column: str | None) -> list[str] | None: ...
 
 def fit_array(x: NDArray[np.float64], y: NDArray[np.float64], formula: str, config_json: str | None = ..., fisher_rao_w: NDArray[np.float64] | None = ..., warm_start_model: Sequence[int] | None = ...) -> bytes: ...
@@ -1731,6 +1728,8 @@ def fit_event_history(declared_marks: Sequence[tuple[str, str]] | None, covariat
 def fit_joint_event_model(declared_marks: Sequence[tuple[str, str]] | None, subject_ids: Sequence[str], entry: Sequence[float], exit: Sequence[float], event_subject: Sequence[str], event_time: Sequence[float], event_marks: Sequence[str]) -> _JointEventModel: ...
 
 def fit_penalized_multinomial_pyfunc(design: NDArray[np.float64], y_one_hot: NDArray[np.float64], penalty: NDArray[np.float64], lambdas: NDArray[np.float64], row_weights: NDArray[np.float64] | None = ..., max_iter: int = ..., tol: float = ...) -> dict[Any, Any]: ...
+
+def fit_response_geometry_table(headers: Sequence[str], rows: _EncodedTable, formula: str, config_json: str | None, geometry: str, response_columns: Sequence[str], coordinates: str | None = ..., reference: int = ..., fisher_rao_w: NDArray[np.float64] | None = ...) -> bytes: ...
 
 def fit_table(headers: Sequence[str], rows: _EncodedTable, formula: str, config_json: str | None = ..., fisher_rao_w: NDArray[np.float64] | None = ..., warm_start_model: Sequence[int] | None = ...) -> bytes: ...
 
@@ -1805,8 +1804,6 @@ def glm_reml_fit_latent(t: NDArray[np.float64], y: NDArray[np.float64], n_obs: i
 def glm_reml_fit_latent_backward(t: NDArray[np.float64], y: NDArray[np.float64], n_obs: int, latent_dim: int, centers: NDArray[np.float64], penalty: NDArray[np.float64], family: str, grad_reml_score: float = ..., m: int = ..., weights: NDArray[np.float64] | None = ..., fisher_w: NDArray[np.float64] | None = ..., init_lambda: float | None = ..., aux_u: NDArray[np.float64] | None = ..., aux_family: str = ..., aux_strength: float | None = ..., dim_selection_log_precision: NDArray[np.float64] | None = ..., tweedie_p: float | None = ..., negbin_theta: float | None = ..., beta_phi: float | None = ..., analytic_penalties: str | None = ...) -> dict[Any, Any]: ...
 
 def gumbel_schedule_tau(schedule: dict[Any, Any], iter: int) -> float: ...
-
-def has_auto_smooth_term(formula: str) -> bool: ...
 
 def hazard_from_cumulative_knots(grid: NDArray[np.float64], surface: NDArray[np.float64], times: NDArray[np.float64]) -> NDArray[np.float64]: ...
 
@@ -2036,7 +2033,11 @@ def response_geometry_inverse_ilr(coords: NDArray[np.float64]) -> NDArray[np.flo
 
 def response_geometry_log_map(values: NDArray[np.float64], geometry: str, base: NDArray[np.float64] | None = ..., coordinates: str | None = ..., reference: int = ..., weights: NDArray[np.float64] | None = ...) -> tuple[NDArray[np.float64], NDArray[np.float64], str]: ...
 
+def response_geometry_model_fields(model_bytes: Sequence[int]) -> Any: ...
+
 def response_geometry_normalize_fisher_rao(value: NDArray[np.float64], n_rows: int, dim: int) -> NDArray[np.float64]: ...
+
+def response_geometry_predict_table(model_bytes: Sequence[int], headers: Sequence[str], rows: _EncodedTable) -> tuple[NDArray[np.float64], NDArray[np.float64]]: ...
 
 def response_geometry_simplex_exp_map(tangent: NDArray[np.float64], base: NDArray[np.float64], coordinates: str, reference: int = ...) -> NDArray[np.float64]: ...
 
@@ -2055,6 +2056,8 @@ def response_geometry_sphere_exp_map_jet(tangent: NDArray[np.float64], base: NDA
 def response_geometry_sphere_log_map(values: NDArray[np.float64], base: NDArray[np.float64]) -> NDArray[np.float64]: ...
 
 def response_geometry_sphere_normalize_base(base: NDArray[np.float64]) -> NDArray[np.float64]: ...
+
+def response_geometry_summary(model_bytes: Sequence[int]) -> Any: ...
 
 def riemannian_gradient_step(manifold_json: str, points: NDArray[np.float64], euclidean_grad: NDArray[np.float64], learning_rate: float) -> NDArray[np.float64]: ...
 
@@ -2116,7 +2119,7 @@ def select_probe_by_expected_evidence(delta: NDArray[np.float64], predicted_mean
 
 def select_rank_with_profiled_hyperparameters(initial_rank: int, max_rank: int, initial_log_hyperparameters: Sequence[float], profile: object) -> str: ...
 
-def select_topology_candidate_lifecycle(request_json: str) -> str: ...
+def select_topology_table(headers: Sequence[str], rows: _EncodedTable, candidates_json: str, defaults: bool, score_kind: str, score_scale: str, config_json: str | None = ..., response: str | None = ..., formula: str | None = ..., latent: str | None = ...) -> tuple[str, list[tuple[str, bytes]], list[tuple[str, Any]]]: ...
 
 def separation_limit(n_harmonics: int) -> float: ...
 

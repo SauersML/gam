@@ -3,52 +3,72 @@ import json
 import gamfit._select_topology as st
 
 
-def test_select_topology_uses_ranked_order_from_comparison_layer(monkeypatch):
-    class _Summary:
-        def __init__(self, fields):
-            self._fields = fields
-
-        def to_dict(self):
-            return dict(self._fields)
-
-    class _Fit:
-        def __init__(self, reml, edf):
-            self._summary = _Summary(
-                {"reml_score": reml, "edf_total": edf, "coefficients": [{}, {}]}
-            )
-
-        def summary(self):
-            return self._summary
-
-    monkeypatch.setattr(st, "_formula_from_response", lambda data, response: ("y ~ s(x, type=AUTO)", 1, 5))
-    monkeypatch.setattr(st, "_normalize_candidates", lambda candidates, feature_dim: [
-        st._Candidate("a", object.__new__(st.PeriodicSplineCurve)),
-        st._Candidate("b", object.__new__(st.PeriodicSplineCurve)),
-    ])
-    monkeypatch.setattr(st, "_formula_for_candidate", lambda formula, candidate, *, strict_dimension: formula)
-    monkeypatch.setattr(st, "fit", lambda data, formula, **kwargs: _Fit(-1.0 if "a" in formula else -2.0, 1.0))
-    monkeypatch.setattr(
-        st, "_extract_reml_score_raw", lambda m: float(m.summary().to_dict()["reml_score"])
-    )
+def test_select_topology_reads_the_rust_ranking_and_its_fits(monkeypatch):
+    """The candidate loop and the ranking are the Rust owner's (#2899 P10): Python
+    marshals the candidates and the request, and reads the ranking back verbatim."""
+    requests: list[dict[str, object]] = []
 
     class _Rust:
-        def select_topology_candidate_lifecycle(self, request_json):
-            request = json.loads(request_json)
-            assert [row["name"] for row in request["candidates"]] == ["a", "b"]
-            return json.dumps(
+        def select_topology_table(
+            self,
+            headers,
+            rows,
+            candidates_json,
+            defaults,
+            score_kind,
+            score_scale,
+            config_json=None,
+            response=None,
+            formula=None,
+            latent=None,
+        ):
+            requests.append(
                 {
-                    "winner_index": 0,
-                    "ranked": [
-                        {"name": "b", "score": -2.0, "raw_reml": -2.0, "effective_dim": 1.0, "basis_size": 2, "n_obs": 5},
-                        {"name": "a", "score": -1.0, "raw_reml": -1.0, "effective_dim": 1.0, "basis_size": 2, "n_obs": 5},
-                    ],
-                    "failed": [],
-                    "warnings": [],
+                    "candidates": [row["name"] for row in json.loads(candidates_json)],
+                    "defaults": defaults,
+                    "score_kind": score_kind,
+                    "score_scale": score_scale,
+                    "response": response,
+                    "formula": formula,
+                    "latent": latent,
                 }
             )
+            ranking = {
+                "winner_index": 0,
+                "ranked": [
+                    {"name": "b", "score": -2.0, "raw_reml": -2.0, "effective_dim": 1.0, "basis_size": 2, "n_obs": 3},
+                    {"name": "a", "score": -1.0, "raw_reml": -1.0, "effective_dim": 1.0, "basis_size": 2, "n_obs": 3},
+                ],
+                "failed": [],
+                "warnings": [],
+            }
+            return json.dumps(ranking), [("a", b"model-a"), ("b", b"model-b")], []
 
     monkeypatch.setattr(st, "_topology_rust", lambda: _Rust())
+    candidates = [
+        ("a", st._default_topology_candidate("circle", 1).topology),
+        ("b", st._default_topology_candidate("circle", 1).topology),
+    ]
+    result = st.select_topology(
+        {"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0]},
+        "y",
+        candidates,
+        score="tk",
+        return_fits=True,
+    )
 
-    result = st.select_topology({"y": [1, 2, 3], "x": [0, 1, 2]}, "y")
-
+    assert requests == [
+        {
+            "candidates": ["a", "b"],
+            "defaults": False,
+            "score_kind": "tk",
+            "score_scale": "per_observation",
+            "response": "y",
+            "formula": None,
+            "latent": None,
+        }
+    ]
     assert result.rankings == [("b", -2.0), ("a", -1.0)]
+    assert result.winner_name == "b"
+    assert result.winner_fit._model_bytes == b"model-b"
+    assert set(result.fits or {}) == {"a", "b"}

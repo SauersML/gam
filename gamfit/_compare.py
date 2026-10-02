@@ -11,10 +11,6 @@ from typing import Any
 from ._binding import rust_module
 
 
-def _extract_reml_score_raw(fit: Any) -> float:
-    return float(rust_module().extract_reml_score_raw(fit))
-
-
 def compare_models(
     fits: list[Any] | tuple[Any, ...],
     names: list[str] | tuple[str, ...] | None = None,

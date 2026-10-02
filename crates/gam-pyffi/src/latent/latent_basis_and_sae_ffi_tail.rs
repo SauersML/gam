@@ -2195,15 +2195,7 @@ fn gaussian_reml_fit_latent_backward<'py>(
     tensor_degrees: Option<Vec<usize>>,
     analytic_penalties: Option<String>,
 ) -> PyResult<Py<PyDict>> {
-    let family = match aux_family.to_ascii_lowercase().as_str() {
-        "ridge" => AuxPriorFamily::Ridge,
-        "linear" => AuxPriorFamily::Linear,
-        other => {
-            return Err(py_value_error(format!(
-                "aux_family must be 'ridge' or 'linear'; got {other:?}"
-            )));
-        }
-    };
+    let family = AuxPriorFamily::from_name(&aux_family).map_err(py_value_error)?;
     let dim_selection_precision = dim_selection_log_precision
         .as_ref()
         .map(|values| ValidatedDimSelectionPrecisions::new(values.as_array(), latent_dim))

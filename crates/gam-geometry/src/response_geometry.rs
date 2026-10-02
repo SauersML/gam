@@ -868,6 +868,88 @@ pub fn dispatch_log_map(
     Ok((tangent, base_point, manifold.canonical_label()))
 }
 
+/// A spherical base point projected onto the unit sphere; a zero-norm point has no
+/// direction and is refused.
+pub fn normalize_sphere_base(base: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
+    let norm = base.iter().fold(0.0_f64, |acc, value| acc.hypot(*value));
+    if !norm.is_finite() || norm <= 0.0 {
+        return Err("spherical base point must have non-zero norm".to_string());
+    }
+    Ok(base.mapv(|v| v / norm))
+}
+
+/// The simplex tangent chart a request names: an explicit `coordinates` wins
+/// (lower-cased), otherwise `alr` for an `alr` geometry and `clr` for every other.
+pub fn simplex_coordinate_label(kind: &str, coordinates: Option<&str>) -> String {
+    match coordinates {
+        Some(c) => c.to_ascii_lowercase(),
+        None if kind == "alr" => "alr".to_string(),
+        None => "clr".to_string(),
+    }
+}
+
+/// The response-geometry log map every front door calls: route the geometry label to
+/// the sphere, the simplex or the curved-manifold maps, pick the base point (the
+/// intrinsic Fréchet mean when `base` is `None`, weighted by `weights` so the chart sits
+/// where the weighted mass lives, #2125), and return `(tangent, base, resolved label)`.
+pub fn log_map(
+    values: ArrayView2<'_, f64>,
+    geometry: &str,
+    base: Option<ArrayView1<'_, f64>>,
+    coordinates: Option<&str>,
+    reference: isize,
+    weights: Option<ArrayView1<'_, f64>>,
+) -> Result<(Array2<f64>, Array1<f64>, String), String> {
+    let kind = geometry.to_ascii_lowercase();
+    match kind.as_str() {
+        "spherical" | "sphere" => {
+            let base_point = match base {
+                None => Array1::from(crate::sphere::sphere_frechet_mean(values, weights)?),
+                Some(b) => normalize_sphere_base(b)?,
+            };
+            let tangent = crate::sphere::response_sphere_log_map(values, base_point.view())?;
+            Ok((tangent, base_point, "spherical".to_string()))
+        }
+        "simplex" | "clr" | "alr" => {
+            let label = simplex_coordinate_label(&kind, coordinates);
+            let coord = crate::simplex::parse_simplex_coord(&label)?;
+            let base_point = match base {
+                None => Array1::from(crate::simplex::simplex_frechet_mean(values, weights)?),
+                Some(b) => {
+                    let row = Array2::from_shape_fn((1, b.len()), |(_, j)| b[j]);
+                    crate::simplex::closure(row.view())?.row(0).to_owned()
+                }
+            };
+            let tangent =
+                crate::simplex::simplex_log_map(values, base_point.view(), coord, reference)?;
+            Ok((tangent, base_point, label))
+        }
+        // Curved matrix / hyperbolic response geometries (#1061); `reference` does not
+        // apply.
+        _ => dispatch_log_map(values, &kind, base, weights),
+    }
+}
+
+/// The inverse of [`log_map`] at an explicit base point and resolved chart.
+pub fn exp_map(
+    tangent: ArrayView2<'_, f64>,
+    geometry: &str,
+    base: ArrayView1<'_, f64>,
+    coordinates: Option<&str>,
+    reference: isize,
+) -> Result<Array2<f64>, String> {
+    let kind = geometry.to_ascii_lowercase();
+    match kind.as_str() {
+        "spherical" | "sphere" => crate::sphere::response_sphere_exp_map(tangent, base),
+        "simplex" | "clr" | "alr" => {
+            let label = simplex_coordinate_label(&kind, coordinates);
+            let coord = crate::simplex::parse_simplex_coord(&label)?;
+            crate::simplex::simplex_exp_map(tangent, base, coord, reference)
+        }
+        _ => dispatch_exp_map(tangent, &kind, base),
+    }
+}
+
 /// String-driven response-geometry exponential map: inverse of
 /// [`dispatch_log_map`] given an explicit base point.
 pub fn dispatch_exp_map(

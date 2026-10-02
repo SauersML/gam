@@ -292,36 +292,36 @@ def format_cuda_diagnostics() -> str:
 
 def _build_fit_payload(
     *,
-    family: str,
-    negative_binomial_theta: float | None,
-    expectile_tau: float | Sequence[float] | None,
-    offset: str | None,
-    weights: str | None,
-    transformation_normal: bool | None,
+    family: str = "auto",
+    negative_binomial_theta: float | None = None,
+    expectile_tau: float | Sequence[float] | None = None,
+    offset: str | None = None,
+    weights: str | None = None,
+    transformation_normal: bool | None = None,
     transformation_normal_stage1: Any | None = None,
-    survival_likelihood: str | None,
-    survival_time_anchor: float | None,
-    baseline_target: str | None,
-    baseline_scale: float | None,
-    baseline_shape: float | None,
-    baseline_rate: float | None,
-    baseline_makeham: float | None,
-    z_column: str | None,
-    link: str | None,
-    slope_formula: str | None,
-    frailty_kind: str | None,
-    frailty_sd: float | None,
-    hazard_loading: str | None,
-    scale_dimensions: bool | None,
-    firth: bool | None,
-    noise_formula: str | None,
-    noise_offset: str | None,
-    flexible_link: bool | None,
-    precision_hyperpriors: Any | None,
-    latents: Mapping[str, Any] | None,
-    penalties: Sequence[Any] | None,
-    smooths: Mapping[Any, Any] | None,
-    config: dict[str, Any] | None,
+    survival_likelihood: str | None = None,
+    survival_time_anchor: float | None = None,
+    baseline_target: str | None = None,
+    baseline_scale: float | None = None,
+    baseline_shape: float | None = None,
+    baseline_rate: float | None = None,
+    baseline_makeham: float | None = None,
+    z_column: str | None = None,
+    link: str | None = None,
+    slope_formula: str | None = None,
+    frailty_kind: str | None = None,
+    frailty_sd: float | None = None,
+    hazard_loading: str | None = None,
+    scale_dimensions: bool | None = None,
+    firth: bool | None = None,
+    noise_formula: str | None = None,
+    noise_offset: str | None = None,
+    flexible_link: bool | None = None,
+    precision_hyperpriors: Any | None = None,
+    latents: Mapping[str, Any] | None = None,
+    penalties: Sequence[Any] | None = None,
+    smooths: Mapping[Any, Any] | None = None,
+    config: dict[str, Any] | None = None,
     residual_columns: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     normalized_latents = _normalize_latents(latents)
@@ -409,6 +409,32 @@ def _build_fit_payload(
                 )
             payload[key] = _jsonable_array(value)
     return payload
+
+
+# The :func:`fit` inputs that act outside its request document.
+_NON_DOCUMENT_FIT_KWARGS = (
+    "constraints",
+    "warm_start_from",
+    "fisher_rao_w",
+    "response_geometry",
+    "response_columns",
+    "response_coordinates",
+    "response_reference",
+)
+
+
+def _fit_request_document(fit_kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """The request document :func:`fit` would build from ``fit_kwargs``, for an
+    entry point that fits several models from one request (topology selection).
+
+    The inputs that never reach the document are refused by name.
+    """
+    for name in _NON_DOCUMENT_FIT_KWARGS:
+        if fit_kwargs.get(name) is not None:
+            raise ValueError(f"{name} is not supported by topology selection")
+    return _build_fit_payload(
+        **{key: value for key, value in fit_kwargs.items() if key not in _NON_DOCUMENT_FIT_KWARGS}
+    )
 
 
 def _warm_start_model_bytes(warm_start_from: Any) -> bytes | None:
@@ -1105,6 +1131,8 @@ def fit(
         Rust engine errors are mapped into the typed gamfit exception
         hierarchy.
     """
+    if constraints and response_geometry is not None:
+        raise ValueError("constraints is not supported with response_geometry")
     if constraints:
         # Alias normalization, smooth-term scanning, and the `shape=` rewrite all
         # live in Rust (`gam::terms::smooth::apply_shape_constraints_to_formula`);
@@ -1120,56 +1148,13 @@ def fit(
             raise map_exception(exc) from exc
 
     if response_geometry is not None:
+        # The response-geometry fit is one Rust owner; it refuses every request
+        # field its joint tangent fit cannot honour. Only the two inputs that
+        # never reach the request document are refused here.
         if response_columns is None:
             raise ValueError("response_columns is required when response_geometry is set")
-        if family != "auto":
-            raise ValueError("family is forced to gaussian and cannot be specified with response_geometry")
-
-        for arg_name, arg_val in [
-            ("offset", offset),
-            ("transformation_normal", transformation_normal),
-            ("transformation_normal_stage1", transformation_normal_stage1),
-            ("survival_likelihood", survival_likelihood),
-            ("survival_time_anchor", survival_time_anchor),
-            ("baseline_target", baseline_target),
-            ("baseline_scale", baseline_scale),
-            ("baseline_shape", baseline_shape),
-            ("baseline_rate", baseline_rate),
-            ("baseline_makeham", baseline_makeham),
-            ("z_column", z_column),
-            ("residual_columns", residual_columns),
-            ("link", link),
-            ("slope_formula", slope_formula),
-            ("frailty_kind", frailty_kind),
-            ("frailty_sd", frailty_sd),
-            ("hazard_loading", hazard_loading),
-            ("noise_formula", noise_formula),
-            ("noise_offset", noise_offset),
-            ("flexible_link", flexible_link),
-            ("warm_start_from", warm_start_from),
-        ]:
-            if arg_val is not None:
-                raise ValueError(f"{arg_name} is not supported with response_geometry")
-
-        return fit_response_geometry(
-            fit,
-            data,
-            formula,
-            response_geometry=response_geometry,
-            response_columns=tuple(response_columns),
-            coordinates=response_coordinates,
-            reference=-1 if response_reference is None else int(response_reference),
-            weights=weights,
-            fisher_rao_w=fisher_rao_w,
-            scale_dimensions=scale_dimensions,
-            firth=firth,
-            precision_hyperpriors=precision_hyperpriors,
-            latents=latents,
-            penalties=penalties,
-            smooths=smooths,
-            constraints=constraints,
-            config=config,
-        )
+        if warm_start_from is not None:
+            raise ValueError("warm_start_from is not supported with response_geometry")
 
     warm_start_bytes = _warm_start_model_bytes(warm_start_from)
     rust_config = dict(config or {})
@@ -1206,6 +1191,18 @@ def fit(
         smooths=smooths,
         config=rust_config or None,
     )
+
+    if response_geometry is not None and response_columns is not None:
+        return fit_response_geometry(
+            data,
+            formula,
+            payload,
+            response_geometry=response_geometry,
+            response_columns=tuple(response_columns),
+            coordinates=response_coordinates,
+            reference=-1 if response_reference is None else int(response_reference),
+            fisher_rao_w=fisher_rao_w,
+        )
 
     # Column discovery and fitting consume the same request. In particular,
     # CTN mode and its response-basis settings must survive this boundary.
@@ -1451,7 +1448,7 @@ def loads(model_bytes: bytes) -> LoadedModel:
     if kind == "manifold_sae":
         return model_from_dict(json.loads(model_bytes.decode("utf-8")))
     if kind == "response_geometry":
-        return _reconstruct_response_geometry(json.loads(model_bytes.decode("utf-8")))
+        return ResponseGeometryModel(bytes(model_bytes))
     if kind == "multinomial":
         from ._model import MultinomialModel  # local import avoids cycle
 
@@ -1479,63 +1476,6 @@ def loads(model_bytes: bytes) -> LoadedModel:
             "GAM, multinomial, response-geometry, joint event and manifold SAE models"
         )
     return Model(_model_bytes=model_bytes)
-
-
-def _reconstruct_response_geometry(payload: Mapping[str, Any]) -> ResponseGeometryModel:
-    """Rebuild a :class:`ResponseGeometryModel` from its JSON payload (#2114).
-
-    Symmetric with :meth:`ResponseGeometryModel.to_dict`: each embedded tangent
-    ``Model`` archive is reloaded through :func:`loads`, and the base point,
-    coordinate chart, geometry label, and (optional) curvature summary are
-    restored so the rebuilt model reproduces :meth:`ResponseGeometryModel.predict`.
-    """
-    import base64
-
-    import numpy as np
-
-    from ._response_geometry import SharedGaussianRemlTangentFit
-
-    def _model_from_b64(encoded: str) -> Model:
-        model = loads(base64.b64decode(encoded.encode("ascii")))
-        if not isinstance(model, Model):
-            raise ValueError(
-                "response-geometry coordinate archive does not hold a scalar Model; "
-                f"got {type(model).__name__}"
-            )
-        return model
-
-    models = tuple(
-        _model_from_b64(encoded) for encoded in payload.get("coordinate_models_b64", [])
-    )
-
-    shared_payload = payload.get("shared_tangent_fit")
-    shared_fit: SharedGaussianRemlTangentFit | None = None
-    if shared_payload is not None:
-        template = _model_from_b64(shared_payload["template_model_b64"])
-        coefficients = np.asarray(shared_payload["coefficients"], dtype=float)
-        fit = dict(shared_payload.get("fit", {}))
-        for key in ("coefficients", "fitted", "sigma2", "lambdas", "edf"):
-            if fit.get(key) is not None:
-                fit[key] = np.asarray(fit[key], dtype=float)
-        if fit.get("reml_score") is not None:
-            fit["reml_score"] = float(fit["reml_score"])
-        shared_fit = SharedGaussianRemlTangentFit(
-            template_model=template,
-            coefficients=coefficients,
-            fit=fit,
-        )
-
-    return ResponseGeometryModel(
-        models=models,
-        response_geometry=str(payload["response_geometry"]),
-        response_columns=tuple(payload["response_columns"]),
-        base_point=np.asarray(payload["base_point"], dtype=float),
-        coordinates=str(payload["coordinates"]),
-        reference=int(payload.get("reference", -1)),
-        training_table_kind=str(payload["training_table_kind"]),
-        shared_tangent_fit=shared_fit,
-        curvature=payload.get("curvature"),
-    )
 
 
 def validate_formula(

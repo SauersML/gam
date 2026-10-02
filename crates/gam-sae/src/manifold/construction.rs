@@ -845,6 +845,10 @@ include!("construction_orbit_elimination.rs");
 // bordered operator, and the arrow-held seams the exact-A channels read their operands through.
 include!("construction_orbit_arrow.rs");
 
+// [#4077] The half-line Laplace mass of an interval coordinate pinned at an active bound, which
+// every exact-A value and gradient route adds beside its log-determinant.
+include!("construction_half_line_mass.rs");
+
 // [#780] The outer-gradient error taxonomy (`OuterGradientError`), the
 // `ForcedRowLayout` override alias, the `COTRAIN_*` co-training weight
 // constants, and the `AmortizedEncoderConsistency` report were extracted

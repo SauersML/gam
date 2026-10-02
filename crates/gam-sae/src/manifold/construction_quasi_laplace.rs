@@ -2984,7 +2984,12 @@ impl SaeManifoldTerm {
             }
             None => 0.0,
         };
-        let log_det = log_det + phase_correction;
+        // #4077 — each slot pinned at an active bound keeps its half-line mass, priced off this
+        // cache as the dense lane prices it off its own.
+        let half_line_correction = self
+            .pinned_half_line_log_det_correction(rho, target, &converged_cache)
+            .map_err(SaeCriterionError::Numerical)?;
+        let log_det = log_det + phase_correction + half_line_correction;
         let occam = self.reml_occam_term(rho)?;
         // Extra penalized-objective energy (#671/#737 + full-objective
         // completion: registry penalties + repulsion + separation barrier),

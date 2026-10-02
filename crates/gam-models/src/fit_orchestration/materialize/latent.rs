@@ -573,21 +573,10 @@ fn parse_latent_specs(payload: Option<&JsonValue>) -> Result<Vec<LatentSpec>, St
                         .ok_or_else(|| format!("latents['{key}'].aux_prior.u is required"))?,
                     &format!("latents['{key}'].aux_prior.u"),
                 )?;
-                let family = match aux
-                    .get("family")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or("ridge")
-                    .to_ascii_lowercase()
-                    .as_str()
-                {
-                    "ridge" => AuxPriorFamily::Ridge,
-                    "linear" => AuxPriorFamily::Linear,
-                    other => {
-                        return Err(format!(
-                            "latents['{key}'].aux_prior.family must be 'ridge' or 'linear', got '{other}'"
-                        ));
-                    }
-                };
+                let family = AuxPriorFamily::from_name(
+                    aux.get("family").and_then(JsonValue::as_str).unwrap_or("ridge"),
+                )
+                .map_err(|err| format!("latents['{key}'].aux_prior: {err}"))?;
                 // An unset strength is REML-selected, the same default as the
                 // direct latent-fit entry points (`aux_strength=None` ⇒ auto)
                 // and the `LatentCoord` contract: a fixed μ is a user choice.

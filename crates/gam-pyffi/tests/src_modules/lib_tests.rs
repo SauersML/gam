@@ -307,6 +307,23 @@ fn shared_tangent_formula_dataset() -> (EncodedDataset, Array2<f64>) {
     (dataset, y)
 }
 
+/// The joint tangent REML on `formula`'s design, through its owner
+/// `gam_predict::response_geometry::fit_shared_tangent_formula`.
+fn shared_tangent_fit(
+    dataset: gam::data::EncodedDataset,
+    formula: String,
+    y: ndarray::ArrayView2<'_, f64>,
+) -> Result<gam_predict::response_geometry::SharedTangentFormulaFit, String> {
+    gam_predict::response_geometry::fit_shared_tangent_formula(
+        &dataset,
+        &formula,
+        &y.to_owned(),
+        &FitConfig::default(),
+        None,
+    )
+    .map_err(|error| error.to_string())
+}
+
 /// Regression for issue #381 adversarial review (flaw #2), carried into the
 /// shared-smoothing model (issue #967): the residual-variance denominator must
 /// count the FULL effective df — unpenalized columns (the intercept) included
@@ -318,12 +335,10 @@ fn shared_tangent_formula_dataset() -> (EncodedDataset, Array2<f64>) {
 #[test]
 fn shared_tangent_sigma2_pools_and_counts_unpenalized_columns() {
     let (dataset, y) = shared_tangent_formula_dataset();
-    let fit = gaussian_reml_fit_formula_dataset_impl(
+    let fit = shared_tangent_fit(
         dataset,
         "r ~ x + z + s(w)".to_string(),
         y.view(),
-        None,
-        None,
     )
     .expect("shared-tangent REML must fit ~ x + z + s(w)");
 
@@ -331,12 +346,12 @@ fn shared_tangent_sigma2_pools_and_counts_unpenalized_columns() {
     let n = y.nrows() as f64;
     // Isotropic tangent noise: exactly one pooled scale, NOT a per-coordinate
     // σ² (a per-output scale would itself break frame equivariance).
-    assert_eq!(fit.sigma2.len(), 1);
-    let m = fit.edf.len();
-    assert_eq!(fit.lambdas.len(), m);
+    assert_eq!(fit.report.sigma2.len(), 1);
+    let m = fit.report.edf.len();
+    assert_eq!(fit.report.lambdas.len(), m);
     assert!(m >= 2, "an s() smooth expands to >= 2 penalty blocks");
-    assert!(fit.lambdas.iter().all(|v| v.is_finite()));
-    assert!(fit.edf.iter().all(|v| v.is_finite() && *v >= 0.0));
+    assert!(fit.report.lambdas.iter().all(|v| v.is_finite()));
+    assert!(fit.report.edf.iter().all(|v| v.is_finite() && *v >= 0.0));
 
     // `~ x + z + s(w)` has exactly ONE unpenalized column PER OUTPUT, the
     // intercept. Under the default double penalty each parametric slope owns
@@ -346,7 +361,7 @@ fn shared_tangent_sigma2_pools_and_counts_unpenalized_columns() {
     // pooled effective df is
     //   edf_total = 1·D (unpenalized) + Σ_block edf  (shared across all D).
     const UNPENALIZED_PER_OUTPUT: f64 = 1.0;
-    let penalized_edf: f64 = fit.edf.iter().sum();
+    let penalized_edf: f64 = fit.report.edf.iter().sum();
     let edf_total = UNPENALIZED_PER_OUTPUT * d as f64 + penalized_edf;
     let mut ss = 0.0;
     for output in 0..d {
@@ -357,18 +372,18 @@ fn shared_tangent_sigma2_pools_and_counts_unpenalized_columns() {
     }
     let expected = ss / (d as f64 * n - edf_total);
     assert!(
-        (fit.sigma2[0] - expected).abs() <= 1.0e-9 * expected.max(1.0),
+        (fit.report.sigma2[0] - expected).abs() <= 1.0e-9 * expected.max(1.0),
         "pooled sigma2 = {} but residual scale with full pooled effective df is {expected} \
              (edf_total = {edf_total}, penalized_edf = {penalized_edf})",
-        fit.sigma2[0]
+        fit.report.sigma2[0]
     );
     // The buggy denominator omitted the unpenalized columns; pinning the strict
     // gap guards against a regression back to it.
     let buggy = ss / (d as f64 * n - penalized_edf);
     assert!(
-        fit.sigma2[0] > buggy * (1.0 + 1.0e-9),
+        fit.report.sigma2[0] > buggy * (1.0 + 1.0e-9),
         "pooled sigma2 = {} must exceed the unpenalized-omitting estimate {buggy}",
-        fit.sigma2[0]
+        fit.report.sigma2[0]
     );
 }
 
@@ -381,25 +396,23 @@ fn shared_tangent_sigma2_pools_and_counts_unpenalized_columns() {
 #[test]
 fn shared_tangent_lambda_edf_are_shared_per_smooth() {
     let (dataset, y) = shared_tangent_formula_dataset();
-    let fit = gaussian_reml_fit_formula_dataset_impl(
+    let fit = shared_tangent_fit(
         dataset,
         "r ~ x + z + s(w)".to_string(),
         y.view(),
-        None,
-        None,
     )
     .expect("shared-tangent REML must fit ~ x + z + s(w)");
 
-    let m = fit.lambdas.len();
-    assert_eq!(fit.edf.len(), m, "lambdas and edf are both per-smooth");
+    let m = fit.report.lambdas.len();
+    assert_eq!(fit.report.edf.len(), m, "lambdas and edf are both per-smooth");
     assert!(m >= 2, "an s() smooth expands to >= 2 penalty blocks");
     assert!(
-        fit.lambdas.iter().all(|v| v.is_finite()),
+        fit.report.lambdas.iter().all(|v| v.is_finite()),
         "no cell may be NaN-padded by an off-the-end stride"
     );
-    assert!(fit.edf.iter().all(|v| v.is_finite() && *v >= 0.0));
+    assert!(fit.report.edf.iter().all(|v| v.is_finite() && *v >= 0.0));
     assert!(
-        fit.lambdas.iter().any(|v| *v > 0.0),
+        fit.report.lambdas.iter().any(|v| *v > 0.0),
         "at least one smooth must carry an active (nonzero) smoothing parameter"
     );
 }
@@ -423,20 +436,16 @@ fn shared_tangent_fit_is_output_rotation_equivariant() {
     let rot = array![[c, -s], [s, c]];
     let y_rot = y.dot(&rot.t());
 
-    let base = gaussian_reml_fit_formula_dataset_impl(
+    let base = shared_tangent_fit(
         dataset.clone(),
         "r ~ x + z + s(w)".to_string(),
         y.view(),
-        None,
-        None,
     )
     .expect("base shared-tangent fit");
-    let rotated = gaussian_reml_fit_formula_dataset_impl(
+    let rotated = shared_tangent_fit(
         dataset,
         "r ~ x + z + s(w)".to_string(),
         y_rot.view(),
-        None,
-        None,
     )
     .expect("rotated shared-tangent fit");
 
@@ -458,9 +467,10 @@ fn shared_tangent_fit_is_output_rotation_equivariant() {
     // data only through rotation-invariant quantities (the stacked residual SS
     // tr(YᵀMY) is invariant; the log-determinant terms are data-independent).
     let lam_err = base
+        .report
         .lambdas
         .iter()
-        .zip(rotated.lambdas.iter())
+        .zip(rotated.report.lambdas.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0_f64, f64::max);
     assert!(
@@ -470,10 +480,10 @@ fn shared_tangent_fit_is_output_rotation_equivariant() {
 
     // The pooled isotropic σ² is frame-invariant as well.
     assert!(
-        (base.sigma2[0] - rotated.sigma2[0]).abs() <= 1.0e-9 * base.sigma2[0].max(1.0),
+        (base.report.sigma2[0] - rotated.report.sigma2[0]).abs() <= 1.0e-9 * base.report.sigma2[0].max(1.0),
         "pooled sigma2 is not frame-invariant: {} vs {}",
-        base.sigma2[0],
-        rotated.sigma2[0]
+        base.report.sigma2[0],
+        rotated.report.sigma2[0]
     );
 }
 
@@ -537,21 +547,19 @@ fn response_geometry_parametric_only_rhs_fits_frechet_mean() {
 
     // Before #2103 this returned Err("... requires at least one smoothing
     // penalty ..."); it must now succeed via the direct non-REML LSQ path.
-    let fit = gaussian_reml_fit_formula_dataset_impl(
+    let fit = shared_tangent_fit(
         dataset,
         "r ~ 1".to_string(),
         tangent.view(),
-        None,
-        None,
     )
     .expect("parametric-only (intercept) shared-tangent fit must succeed (#2103)");
 
     // Intercept-only design: one basis column (the constant), D = 4 tangent
     // outputs. No smoothing penalty ⇒ empty λ/edf vectors.
     assert_eq!(fit.coefficients.dim(), (1, 4));
-    assert_eq!(fit.lambdas.len(), 0);
-    assert_eq!(fit.edf.len(), 0);
-    assert!(fit.sigma2.iter().all(|v| v.is_finite()));
+    assert_eq!(fit.report.lambdas.len(), 0);
+    assert_eq!(fit.report.edf.len(), 0);
+    assert!(fit.report.sigma2.iter().all(|v| v.is_finite()));
 
     // The intercept tangent prediction, mapped back through the exponential map,
     // must equal the intrinsic Fréchet mean of the responses.

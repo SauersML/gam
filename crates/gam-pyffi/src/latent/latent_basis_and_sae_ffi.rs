@@ -917,15 +917,7 @@ fn gaussian_reml_fit_latent<'py>(
         analytic_penalties.as_ref(),
     )
     .map_err(py_value_error)?;
-    let family = match aux_family.to_ascii_lowercase().as_str() {
-        "ridge" => AuxPriorFamily::Ridge,
-        "linear" => AuxPriorFamily::Linear,
-        other => {
-            return Err(py_value_error(format!(
-                "aux_family must be 'ridge' or 'linear'; got {other:?}"
-            )));
-        }
-    };
+    let family = AuxPriorFamily::from_name(&aux_family).map_err(py_value_error)?;
     let t_values = t.as_array().to_owned();
     let y_values = y.as_array().to_owned();
     let centers_values = centers.as_array().to_owned();

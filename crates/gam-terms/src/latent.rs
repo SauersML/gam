@@ -95,6 +95,18 @@ pub enum AuxPriorFamily {
     Linear,
 }
 
+impl AuxPriorFamily {
+    /// The family a request names, case-insensitively: `"ridge"` or `"linear"`. The one
+    /// spelling every front door parses.
+    pub fn from_name(name: &str) -> Result<Self, String> {
+        match name.to_ascii_lowercase().as_str() {
+            "ridge" => Ok(Self::Ridge),
+            "linear" => Ok(Self::Linear),
+            other => Err(format!("aux_family must be 'ridge' or 'linear'; got {other:?}")),
+        }
+    }
+}
+
 /// Strength of the auxiliary-prior identifiability penalty.
 ///
 /// `Auto` defers the choice to REML — the strength is added to the outer
@@ -901,6 +913,14 @@ impl LatentManifold {
     /// `d − 1` tangent dimensions (#2933 F26). Any other normal eigenvalue `c`
     /// would add an unpriced `½·log c` per sphere row, so the block is the
     /// projector itself, not a tunable pin.
+    ///
+    /// An interval coordinate at an endpoint whose descent direction `−g` leaves the
+    /// interval ([`Self::gradient_pinned_axes`]) is the same geometry on one axis:
+    /// the gradient-tangent projector zeroes it, the complementary projector is
+    /// `e_u e_uᵀ`, and the block is `P·H·P ⊕ 1` there (#4077). Without it a row whose
+    /// every coordinate is pinned is an exactly zero block no step solve can factor.
+    /// Its mass is not `log 1`: the criterion prices the half-line Laplace mass of the
+    /// truncated posterior beside the log-determinant.
     pub fn riemannian_hessian_matrix(
         &self,
         t: ArrayView1<'_, f64>,
@@ -919,12 +939,17 @@ impl LatentManifold {
                 out[[b, a]] = col[b];
             }
         }
-        self.add_normal_pinning(t, &mut out);
+        self.add_normal_pinning(t, eg, &mut out);
         symmetrize(&mut out);
         out
     }
 
-    fn add_normal_pinning(&self, t: ArrayView1<'_, f64>, matrix: &mut Array2<f64>) {
+    fn add_normal_pinning(
+        &self,
+        t: ArrayView1<'_, f64>,
+        eg: ArrayView1<'_, f64>,
+        matrix: &mut Array2<f64>,
+    ) {
         match self {
             Self::Sphere { dim } => {
                 assert_eq!(t.len(), *dim);
@@ -945,12 +970,22 @@ impl LatentManifold {
                     let mut block =
                         matrix.slice_mut(ndarray::s![offset..offset + dim, offset..offset + dim]);
                     let mut owned = block.to_owned();
-                    part.add_normal_pinning(t.slice(ndarray::s![offset..offset + dim]), &mut owned);
+                    part.add_normal_pinning(
+                        t.slice(ndarray::s![offset..offset + dim]),
+                        eg.slice(ndarray::s![offset..offset + dim]),
+                        &mut owned,
+                    );
                     block.assign(&owned);
                     offset += dim;
                 }
             }
-            Self::Euclidean | Self::Circle { .. } | Self::Interval { .. } => {}
+            Self::Interval { lo, hi } => {
+                // The pinned axis's complementary projector `e_u e_uᵀ`.
+                if interval_descent_exits(*lo, *hi, t[0], eg[0]) {
+                    matrix[[0, 0]] += 1.0;
+                }
+            }
+            Self::Euclidean | Self::Circle { .. } => {}
         }
     }
 }
@@ -2013,6 +2048,32 @@ mod tests {
         assert_eq!(
             rhess, eh,
             "Circle Riemannian Hessian must equal the Euclidean Hessian"
+        );
+    }
+
+    /// #4077: an interval axis pinned at an active bound carries the complementary
+    /// projector, exactly as a sphere's normal does. Its row and column are the unit
+    /// direction, the free axis keeps its Euclidean curvature, and an endpoint whose
+    /// descent stays inside the interval is not pinned.
+    #[test]
+    fn pinned_interval_axis_block_is_the_projector_4077() {
+        let manifold = LatentManifold::Product(vec![
+            LatentManifold::Interval { lo: -1.0, hi: 1.0 },
+            LatentManifold::Interval { lo: -1.0, hi: 1.0 },
+        ]);
+        let eh = array![[2.5_f64, 0.7], [0.7, 1.9]];
+        // Axis 0 sits on `hi` with `g < 0` (descent leaves); axis 1 is interior.
+        let t = array![1.0_f64, 0.3];
+        let eg = array![-0.8_f64, 0.4];
+        assert_eq!(manifold.gradient_pinned_axes(t.view(), eg.view()), vec![0]);
+        let block = manifold.riemannian_hessian_matrix(t.view(), eg.view(), eh.view());
+        assert_eq!(block, array![[1.0, 0.0], [0.0, 1.9]]);
+        // On `hi` with `g > 0` the descent direction points inward: nothing is pinned.
+        let inward = array![0.8_f64, 0.4];
+        assert!(manifold.gradient_pinned_axes(t.view(), inward.view()).is_empty());
+        assert_eq!(
+            manifold.riemannian_hessian_matrix(t.view(), inward.view(), eh.view()),
+            eh
         );
     }
 

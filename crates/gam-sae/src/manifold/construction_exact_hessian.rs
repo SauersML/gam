@@ -1397,18 +1397,18 @@ impl SphereTangentBlock {
 ///
 /// A bound is active when the descent direction leaves the interval: `t ≤ lo`
 /// with `g > 0`, or `t ≥ hi` with `g < 0` ([`LatentManifold::gradient_pinned_axes`]).
-/// There the conversion projects the slot out of `B`: its gradient, its `H_tt` row
-/// and column, and its `H_tβ` row are zero ([`LatentManifold::riemannian_hessian_matrix`]),
-/// so the slot is a flat direction of its row block, which the evidence
-/// factorization's row deflation carries at unit stiffness and excludes from the
-/// log-determinant traces. Under strict complementarity the coordinate stays on the
+/// There the conversion projects the slot out of `B`: its gradient and its `H_tβ` row
+/// are zero, and its `H_tt` row and column are the complementary projector's unit
+/// direction `e_u` ([`LatentManifold::riemannian_hessian_matrix`], #4077), so the slot
+/// carries no curvature of `B`, prices `log 1 = 0` and is constant in every
+/// log-determinant trace. Under strict complementarity the coordinate stays on the
 /// bound for every nearby `(ρ, β)`, so its mode response is zero. The
 /// residual-curvature and prior legs of `ΔC` are written per raw coordinate. Added
 /// unprojected, they would give `A = B + ΔC` the slot's raw curvature on the
 /// diagonal and a `ΔC_uβ` coupling. The IFT solve would then move a coordinate the
 /// retraction holds fixed, and `½log|A|` would price the curvature of a direction
 /// the mode cannot take. So `ΔC` enters with the slot projected out, exactly as `B`
-/// does, and `A` keeps the same flat direction `B` has.
+/// does, and `A` keeps the same unit direction `B` has.
 pub(crate) enum CoordinateTangentBlock {
     Sphere(SphereTangentBlock),
     PinnedBound { row: usize, local: usize },
@@ -1567,10 +1567,10 @@ impl SaeManifoldTerm {
     /// [`Self::coordinate_tangent_blocks`] grouped by row: entry `row` lists each pinned
     /// `local`, empty on a row that holds none.
     ///
-    /// #4077 — at an active bound `B`'s Riemannian conversion zeroes the slot's gradient,
-    /// row and column; `ΔC` is projected there too (#3438); and the evidence factor's row
-    /// deflation carries what is left at the metric's unit stiffness. So `A`'s row and
-    /// column at a pinned slot are the CONSTANT unit direction `e_u` — the state
+    /// #4077 — at an active bound `B`'s Riemannian conversion zeroes the slot's gradient
+    /// and writes its complementary projector `e_u e_uᵀ` on the row and column, and `ΔC`
+    /// is projected there too (#3438). So `A`'s row and column at a pinned slot are the
+    /// CONSTANT unit direction `e_u` — the state
     /// `interval_active_bound_slot_leaves_the_exact_information_3438` pins to `ε·max|A|`
     /// on both the diagonal and the coupling. A constant row has no derivative, so the
     /// AMBIENT slot derivative the row towers form on those positions is not `∂A` and may
@@ -3803,6 +3803,32 @@ impl SaeManifoldTerm {
         // every non-exact-A caller passes `None`.
         residual_target: Option<ArrayView2<'_, f64>>,
     ) -> Result<SaeArrowVector, String> {
+        self.logdet_theta_adjoint_dense_on_slots(
+            rho,
+            cache,
+            inv,
+            skip_deflation_dk,
+            exact_a,
+            residual_target,
+            PinnedSlotDerivative::Projected,
+        )
+    }
+
+    /// [`Self::logdet_theta_adjoint_dense`], with the treatment of the slots the assembly
+    /// pinned at an active bound chosen by the caller: `Projected` is the derivative of `A`
+    /// itself, which carries each such slot as a constant unit direction; `Raw` is the
+    /// derivative of the unprojected `A_raw = B_raw + ΔC` there, which the pinned slot's
+    /// half-line mass reads (#4077).
+    pub(crate) fn logdet_theta_adjoint_dense_on_slots<W: JointWeight + ?Sized>(
+        &self,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+        inv: &W,
+        skip_deflation_dk: bool,
+        exact_a: bool,
+        residual_target: Option<ArrayView2<'_, f64>>,
+        pinned_slots: PinnedSlotDerivative,
+    ) -> Result<SaeArrowVector, String> {
         // #2330 — `skip_deflation_dk` drops the Daleckii–Krein deflation
         // correction, leaving the raw trace contraction (a deflation-blind
         // counterfactual for tests). Production callers pass `false`.
@@ -3878,7 +3904,10 @@ impl SaeManifoldTerm {
         // each as the metric's constant unit direction, so the ambient derivative this
         // tower forms there is not `∂A` and is projected out before it is contracted, the
         // same projector `ΔC` is assembled under.
-        let pinned_blocks = self.pinned_bound_slots_by_row(&cache.row_dims)?;
+        let pinned_blocks = match pinned_slots {
+            PinnedSlotDerivative::Projected => self.pinned_bound_slots_by_row(&cache.row_dims)?,
+            PinnedSlotDerivative::Raw => vec![Vec::new(); cache.row_dims.len()],
+        };
         let sphere_axis_periods = self.all_ard_axis_periods();
         let mut jet_window: std::collections::VecDeque<SaeRowJets> =
             std::collections::VecDeque::new();
@@ -4337,14 +4366,17 @@ impl SaeManifoldTerm {
                 }
             }
         }
-        if exact_a {
+        // A weight held on coordinate diagonals alone reads nothing on the border or on a
+        // logit slot, so the decoder-prior and ordered Beta--Bernoulli legs are exactly zero.
+        let coordinate_diagonal = inv.coordinate_diagonal_only();
+        if exact_a && !coordinate_diagonal {
             let border = inv.border_block(total_t).ok_or_else(|| {
                 format!("logdet_theta_adjoint_dense: the weight holds no border after {total_t} coordinates")
             })?;
             gamma_beta += &self.exact_decoder_prior_theta_trace(cache, border)?;
         }
         // Fold the entire ordered-BB prior derivative into the logit slots.
-        if let Some(data) = patchd_obb_adjoint.as_ref() {
+        if let Some(data) = patchd_obb_adjoint.as_ref().filter(|_| !coordinate_diagonal) {
             let inv = inv.dense().ok_or_else(|| {
                 "logdet_theta_adjoint_dense: the ordered Beta--Bernoulli prior leg reads cross-row \
                  entries, which an arrow-held weight does not carry"
@@ -4841,6 +4873,15 @@ impl SaeManifoldTerm {
                     gamma.t += &phase_gamma.t;
                     gamma.beta += &phase_gamma.beta;
                 }
+                // #4077 — the pinned slots' half-line mass, priced off the same cache.
+                if let Some((half_line_trace, half_line_gamma)) = self
+                    .pinned_half_line_channels(rho, target, cache)
+                    .map_err(OuterGradientError::internal)?
+                {
+                    logdet_trace += &half_line_trace;
+                    gamma.t += &half_line_gamma.t;
+                    gamma.beta += &half_line_gamma.beta;
+                }
                 Some(gamma)
             }
         };
@@ -4974,8 +5015,13 @@ impl SaeManifoldTerm {
         // The block weights sit before the curvature tail, so their range is
         // derived forwards from the flat layout, not as an offset from the end.
         let block_range = rho.block_flat_range();
+        // #4077 — the half-line mass reads the pinned slot's raw gradient, whose explicit
+        // `ρ`-derivative is that slot's entry of the implicit right-hand side below.
+        let half_line_legs = self
+            .pinned_half_line_gradient_legs(rho, target, cache)
+            .map_err(OuterGradientError::internal)?;
         for coord in 0..n_params {
-            let rhs = if block_range.contains(&coord) {
+            let mut rhs = if block_range.contains(&coord) {
                 let &(p_x, ref block_dims) =
                     self.crosscoder_pricing_spans.as_ref().ok_or_else(|| {
                         OuterGradientError::internal(
@@ -4992,6 +5038,10 @@ impl SaeManifoldTerm {
                 self.outer_rho_gradient_ift_rhs(rho, coord, cache)
                     .map_err(OuterGradientError::internal)?
             };
+            for &(index, coefficient) in &half_line_legs {
+                logdet_trace[coord] += coefficient * rhs.t[index];
+            }
+            self.project_pinned_ift_rhs(cache, &mut rhs);
             let mut dot = 0.0_f64;
             for idx in 0..adjoint.t.len() {
                 dot += adjoint.t[idx] * rhs.t[idx];
@@ -5177,7 +5227,15 @@ impl SaeManifoldTerm {
             }
             None => 0.0,
         };
-        Ok((joint_pricing.log_det + orbit_correction + phase_correction, geometry))
+        // #4077 — each slot pinned at an active bound, which `A` prices at `log 1 = 0`, keeps
+        // its half-line mass.
+        let half_line_correction = self
+            .pinned_half_line_log_det_correction(rho, target, cache)
+            .map_err(SaeCriterionError::Numerical)?;
+        Ok((
+            joint_pricing.log_det + orbit_correction + phase_correction + half_line_correction,
+            geometry,
+        ))
     }
 
     /// The generalized eigensystem of one already-materialized exact-Hessian block in the
@@ -6561,6 +6619,14 @@ impl SaeManifoldTerm {
         logdet_trace += &metric_trace;
         gamma.t += &metric_gamma.t;
         gamma.beta += &metric_gamma.beta;
+        // #4077 — the pinned slots' half-line mass the value added beside `log|A|`.
+        if let Some((half_line_trace, half_line_gamma)) =
+            self.pinned_half_line_channels(rho, target, cache)?
+        {
+            logdet_trace += &half_line_trace;
+            gamma.t += &half_line_gamma.t;
+            gamma.beta += &half_line_gamma.beta;
+        }
         // #2234 — the orbit legs that reach neither `A` nor `Φ`.
         if let Some((theta, log_precisions)) = orbit_legs {
             gamma.t += &theta.t;
@@ -7345,37 +7411,7 @@ impl SaeManifoldTerm {
         let second_jets = self.atom_second_jets()?;
         let border = self.border_channels_for_border_dim(border_dim)?;
         let row_loss_w = self.row_loss_weights.as_deref();
-        let ard_axis_periods: Vec<Vec<Option<f64>>> = self.all_ard_axis_periods();
-        let ard_precisions = self.validated_ard_precisions(rho)?;
-
-        // Softmax entropy-minus-majorizer scale (#1419); `None` off softmax.
-        let softmax_scale: Option<f64> = match self.assignment.mode {
-            AssignmentMode::Softmax {
-                temperature,
-                sparsity,
-            } if k_atoms > 1 => {
-                let inv_tau = 1.0 / temperature;
-                Some(rho.lambda_sparse()? * sparsity * inv_tau * inv_tau)
-            }
-            _ => None,
-        };
-        // (3b) #2520 — the ThresholdGate's concave remainder, from the producer the
-        // applier and the clamp diagonal read; `None` off the threshold gate.
-        let threshold_gate_remainder = match self.assignment.mode {
-            AssignmentMode::ThresholdGate { .. } => Some(
-                crate::assignment::threshold_gate_negative_hessian_remainder_weighted(
-                    &self.assignment,
-                    rho,
-                    row_loss_w,
-                )?,
-            ),
-            _ => None,
-        };
-
-        let whitens = self
-            .row_metric
-            .as_ref()
-            .is_some_and(|metric| metric.whitens_likelihood());
+        let operands = self.exact_hessian_delta_operands(rho)?;
         let mut assignments = Array1::<f64>::zeros(k_atoms);
 
         let coordinate_tangents = self.coordinate_tangent_blocks(row_dims)?;
@@ -7385,7 +7421,6 @@ impl SaeManifoldTerm {
             std::collections::VecDeque::new();
         let mut jet_window_next = 0usize;
         for row in 0..n {
-            let q = row_dims[row];
             let a_scratch = assignments.as_slice_mut().ok_or_else(|| {
                 "assemble_exact_hessian_minus_b_rows: assignment scratch is not contiguous"
                     .to_string()
@@ -7404,93 +7439,18 @@ impl SaeManifoldTerm {
                 .pop_front()
                 .expect("jet window must be non-empty");
             let w_row = row_loss_w.map_or(1.0, |w| w[row]);
-
             // The same sqrt(w)-scaled metric-applied residual the applier contracts.
             let error_metric =
-                self.patchd_row_error_metric(row, w_row, target, &assignments, whitens);
-
-            let mut tt = Array2::<f64>::zeros((q, q));
-            let mut tbeta = Array2::<f64>::zeros((q, border.len()));
-
-            // (1a) residual curvature, t-t.
-            for a in 0..q {
-                for b in 0..q {
-                    tt[[a, b]] = sae_dot(&error_metric, jets.second(a, b));
-                }
-            }
-            // (1b) residual curvature, t-beta. The beta-t block is its transpose;
-            // the arrow system stores only this orientation.
-            for a in 0..q {
-                for beta_pos in 0..border.len() {
-                    tbeta[[a, beta_pos]] = sae_dot(&error_metric, jets.beta_deriv(a, beta_pos));
-                }
-            }
-            // (2) softmax exact entropy minus the Gershgorin majorizer written into B.
-            if let Some(scale) = softmax_scale {
-                let assignment_dim = self.assignment.assignment_coord_dim();
-                let a_soft = assignments
-                    .as_slice()
-                    .expect("softmax assignments row must be contiguous");
-                let m = softmax_majorizer_log_mean(a_soft);
-                for (a, va) in jets.vars.iter().enumerate() {
-                    let SaeLocalRowVar::Logit { atom: ka } = *va else {
-                        continue;
-                    };
-                    if ka >= assignment_dim {
-                        continue;
-                    }
-                    for (b, vb) in jets.vars.iter().enumerate() {
-                        let SaeLocalRowVar::Logit { atom: kb } = *vb else {
-                            continue;
-                        };
-                        if kb >= assignment_dim {
-                            continue;
-                        }
-                        let h_entropy =
-                            softmax_dense_entropy_hessian_entry(a_soft, ka, kb, m, scale);
-                        let delta = if ka == kb {
-                            h_entropy
-                                - active_softmax_gershgorin_majorizer_entry(a_soft, ka, m, scale)
-                        } else {
-                            h_entropy
-                        };
-                        tt[[a, b]] += w_row * delta;
-                    }
-                }
-            }
-            // (3) periodic ARD concave clamp, diagonal on coordinate vars.
-            for (a, va) in jets.vars.iter().enumerate() {
-                let SaeLocalRowVar::Coord { atom, axis } = *va else {
-                    continue;
-                };
-                if rho.log_ard[atom].is_empty() {
-                    continue;
-                }
-                let alpha = ard_precisions[atom][axis];
-                let t_val = self.assignment.coords[atom].row(row)[axis];
-                let prior = ArdAxisPrior::eval(alpha, t_val, ard_axis_periods[atom][axis]);
-                let neg = prior.negative_hessian_remainder();
-                if neg != 0.0 {
-                    tt[[a, a]] += w_row * neg;
-                }
-            }
-            // (3b) #2520 threshold gate: the applier's channel (3b), on logit slots.
-            // `B` carries the PSD clamp of the gate's curvature. Without the
-            // non-positive remainder the arrow system prices `B` on every switched-on
-            // logit, while the classification's clamp diagonal restores a concave
-            // half the operator never subtracted (#2915). The producer already
-            // applies `w_row` and the fixed-logit mask.
-            if let Some(remainder) = threshold_gate_remainder.as_ref() {
-                for (a, va) in jets.vars.iter().enumerate() {
-                    let SaeLocalRowVar::Logit { atom } = *va else {
-                        continue;
-                    };
-                    let neg = remainder[row * k_atoms + atom];
-                    if neg != 0.0 {
-                        tt[[a, a]] += neg;
-                    }
-                }
-            }
+                self.patchd_row_error_metric(row, w_row, target, &assignments, operands.whitens);
+            let ExactHessianDeltaRow { mut tt, mut tbeta } = self.exact_hessian_minus_b_row_raw(
+                &operands,
+                row,
+                &jets,
+                &error_metric,
+                &assignments,
+                w_row,
+                border.len(),
+            );
             // #2933 F36, #3438 — on every coordinate tangent block `ΔC_tt` is `P·ΔC_tt·P` and
             // `ΔC_tβ` is `P·ΔC_tβ`, in the tangent projector `B`'s row was assembled in.
             while let Some(block) = coordinate_tangents
@@ -7513,6 +7473,163 @@ impl SaeManifoldTerm {
         }
         Ok(rows_out)
     }
+
+    /// The row-independent operands of `ΔC = A − B`, resolved once per state.
+    pub(crate) fn exact_hessian_delta_operands(
+        &self,
+        rho: &SaeManifoldRho,
+    ) -> Result<ExactHessianDeltaOperands, String> {
+        let k_atoms = self.k_atoms();
+        // Softmax entropy-minus-majorizer scale (#1419); `None` off softmax.
+        let softmax_scale: Option<f64> = match self.assignment.mode {
+            AssignmentMode::Softmax {
+                temperature,
+                sparsity,
+            } if k_atoms > 1 => {
+                let inv_tau = 1.0 / temperature;
+                Some(rho.lambda_sparse()? * sparsity * inv_tau * inv_tau)
+            }
+            _ => None,
+        };
+        // (3b) #2520 — the ThresholdGate's concave remainder, from the producer the
+        // applier and the clamp diagonal read; `None` off the threshold gate.
+        let threshold_gate_remainder = match self.assignment.mode {
+            AssignmentMode::ThresholdGate { .. } => Some(
+                crate::assignment::threshold_gate_negative_hessian_remainder_weighted(
+                    &self.assignment,
+                    rho,
+                    self.row_loss_weights.as_deref(),
+                )?,
+            ),
+            _ => None,
+        };
+        Ok(ExactHessianDeltaOperands {
+            softmax_scale,
+            threshold_gate_remainder,
+            ard_axis_periods: self.all_ard_axis_periods(),
+            ard_precisions: self.validated_ard_precisions(rho)?,
+            ard_live: rho.log_ard.iter().map(|axes| !axes.is_empty()).collect(),
+            whitens: self
+                .row_metric
+                .as_ref()
+                .is_some_and(|metric| metric.whitens_likelihood()),
+        })
+    }
+
+    /// One row's `(ΔC_tt, ΔC_tβ)` on its RAW slots, before any coordinate tangent
+    /// projection: the one owner of the per-row channels, read by
+    /// [`Self::assemble_exact_hessian_minus_b_rows`] (which then projects) and by the
+    /// pinned-slot half-line mass (#4077), which needs the slot's unprojected curvature.
+    ///
+    /// `error_metric` is [`Self::patchd_row_error_metric`] at `operands.whitens`, and
+    /// `jets` are the row's unwhitened `√w`-scaled jets.
+    pub(crate) fn exact_hessian_minus_b_row_raw(
+        &self,
+        operands: &ExactHessianDeltaOperands,
+        row: usize,
+        jets: &SaeRowJets,
+        error_metric: &[f64],
+        assignments: &Array1<f64>,
+        w_row: f64,
+        border_len: usize,
+    ) -> ExactHessianDeltaRow {
+        let q = jets.vars.len();
+        let k_atoms = self.k_atoms();
+        let mut tt = Array2::<f64>::zeros((q, q));
+        let mut tbeta = Array2::<f64>::zeros((q, border_len));
+        // (1a) residual curvature, t-t.
+        for a in 0..q {
+            for b in 0..q {
+                tt[[a, b]] = sae_dot(error_metric, jets.second(a, b));
+            }
+        }
+        // (1b) residual curvature, t-beta. The beta-t block is its transpose;
+        // the arrow system stores only this orientation.
+        for a in 0..q {
+            for beta_pos in 0..border_len {
+                tbeta[[a, beta_pos]] = sae_dot(error_metric, jets.beta_deriv(a, beta_pos));
+            }
+        }
+        // (2) softmax exact entropy minus the Gershgorin majorizer written into B.
+        if let Some(scale) = operands.softmax_scale {
+            let assignment_dim = self.assignment.assignment_coord_dim();
+            let a_soft = assignments
+                .as_slice()
+                .expect("softmax assignments row must be contiguous");
+            let m = softmax_majorizer_log_mean(a_soft);
+            for (a, va) in jets.vars.iter().enumerate() {
+                let SaeLocalRowVar::Logit { atom: ka } = *va else {
+                    continue;
+                };
+                if ka >= assignment_dim {
+                    continue;
+                }
+                for (b, vb) in jets.vars.iter().enumerate() {
+                    let SaeLocalRowVar::Logit { atom: kb } = *vb else {
+                        continue;
+                    };
+                    if kb >= assignment_dim {
+                        continue;
+                    }
+                    let h_entropy = softmax_dense_entropy_hessian_entry(a_soft, ka, kb, m, scale);
+                    let delta = if ka == kb {
+                        h_entropy - active_softmax_gershgorin_majorizer_entry(a_soft, ka, m, scale)
+                    } else {
+                        h_entropy
+                    };
+                    tt[[a, b]] += w_row * delta;
+                }
+            }
+        }
+        // (3) periodic ARD concave clamp, diagonal on coordinate vars.
+        for (a, va) in jets.vars.iter().enumerate() {
+            let SaeLocalRowVar::Coord { atom, axis } = *va else {
+                continue;
+            };
+            if !operands.ard_live[atom] {
+                continue;
+            }
+            let alpha = operands.ard_precisions[atom][axis];
+            let t_val = self.assignment.coords[atom].row(row)[axis];
+            let prior = ArdAxisPrior::eval(alpha, t_val, operands.ard_axis_periods[atom][axis]);
+            let neg = prior.negative_hessian_remainder();
+            if neg != 0.0 {
+                tt[[a, a]] += w_row * neg;
+            }
+        }
+        // (3b) #2520 threshold gate: the applier's channel (3b), on logit slots.
+        // `B` carries the PSD clamp of the gate's curvature. Without the
+        // non-positive remainder the arrow system prices `B` on every switched-on
+        // logit, while the classification's clamp diagonal restores a concave
+        // half the operator never subtracted (#2915). The producer already
+        // applies `w_row` and the fixed-logit mask.
+        if let Some(remainder) = operands.threshold_gate_remainder.as_ref() {
+            for (a, va) in jets.vars.iter().enumerate() {
+                let SaeLocalRowVar::Logit { atom } = *va else {
+                    continue;
+                };
+                let neg = remainder[row * k_atoms + atom];
+                if neg != 0.0 {
+                    tt[[a, a]] += neg;
+                }
+            }
+        }
+        ExactHessianDeltaRow { tt, tbeta }
+    }
+}
+
+/// The row-independent operands of `ΔC = A − B`
+/// ([`SaeManifoldTerm::exact_hessian_delta_operands`]).
+pub(crate) struct ExactHessianDeltaOperands {
+    softmax_scale: Option<f64>,
+    threshold_gate_remainder: Option<Array1<f64>>,
+    pub(crate) ard_axis_periods: Vec<Vec<Option<f64>>>,
+    pub(crate) ard_precisions: Vec<Array1<f64>>,
+    /// Whether each atom carries ARD log-precisions at all.
+    pub(crate) ard_live: Vec<bool>,
+    /// Whether the row metric whitens the likelihood, the flag the error metric is
+    /// built at.
+    pub(crate) whitens: bool,
 }
 
 #[cfg(test)]

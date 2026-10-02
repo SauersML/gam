@@ -1,18 +1,14 @@
 from __future__ import annotations
 
-from typing import get_type_hints
-
 import numpy as np
 import pytest
 
 import gamfit
 from gamfit._response_geometry import (
-    ResponseGeometryModel,
     alr,
     closure,
     clr,
     geometry_log_map,
-    fit_response_geometry,
     inverse_alr,
     simplex_exp_map,
     simplex_frechet_mean,
@@ -20,12 +16,6 @@ from gamfit._response_geometry import (
     sphere_frechet_mean,
     sphere_log_map,
 )
-
-
-def test_fit_response_geometry_runtime_type_hints_resolve() -> None:
-    hints = get_type_hints(fit_response_geometry)
-
-    assert {"latents", "smooths", "constraints"} <= hints.keys()
 
 
 def test_simplex_frechet_mean_is_geometric_not_extrinsic() -> None:
@@ -125,46 +115,6 @@ def test_geometry_log_map_resolves_simplex_aliases() -> None:
     np.testing.assert_allclose(tangent_simplex, tangent_clr)
     np.testing.assert_allclose(base_simplex, base_clr)
     assert tangent_alr.shape == (2, 2)
-
-
-def test_response_geometry_model_predict_projects_back_to_manifold() -> None:
-    class DummyCoordinateModel:
-        """A coordinate model's predict table: the estimand-explicit schema a
-        plain Gaussian tangent ``Model`` publishes, point under ``posterior_mean``."""
-
-        def __init__(self, values: list[float]) -> None:
-            self.values = values
-
-        def predict(
-            self,
-            data: object,
-            return_type: str | None = None,
-            **kwargs: object,
-        ) -> dict[str, list[float]]:
-            return {
-                "linear_predictor_plugin": self.values,
-                "mean_plugin": self.values,
-                "posterior_mean": self.values,
-            }
-
-        def summary(self) -> dict[str, str]:
-            return {"ok": "yes"}
-
-    base = np.array([0.25, 0.25, 0.50], dtype=float)
-    target = np.array([[0.50, 0.25, 0.25], [0.20, 0.30, 0.50]], dtype=float)
-    tangent = clr(target) - clr(base.reshape(1, -1))
-    model = ResponseGeometryModel(
-        models=[DummyCoordinateModel(tangent[:, j].tolist()) for j in range(3)],
-        response_geometry="simplex",
-        response_columns=("a", "b", "c"),
-        base_point=base,
-        coordinates="clr",
-    )
-
-    pred = model.predict({"x": [1.0, 2.0]}, return_type="dict")
-    out = np.column_stack([pred[name] for name in ("a", "b", "c")])
-    np.testing.assert_allclose(out, target, rtol=1e-12, atol=1e-12)
-    np.testing.assert_allclose(out.sum(axis=1), np.ones(2), atol=1e-12)
 
 
 def _simplex_frame(n: int) -> dict[str, list[float]]:

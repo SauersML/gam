@@ -10,7 +10,9 @@ license = "AGPL-3.0-or-later"
 
 [dependencies]
 faer = "0.24.4"
+gam-config = { path = "../gam-config", version = "=0.3.157" }
 gam-data = { path = "../gam-data", version = "=0.3.157" }
+gam-geometry = { path = "../gam-geometry", version = "=0.3.157" }
 gam-inference = { path = "../gam-inference", version = "=0.3.157" }
 gam-linalg = { path = "../gam-linalg", version = "=0.3.157" }
 gam-math = { path = "../gam-math", version = "=0.3.157" }
@@ -25,13 +27,13 @@ log = "0.4.29"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 rayon = "1.12.0"
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
 
 [dev-dependencies]
 # `linalg.rs` unit tests assemble sparse `DesignMatrix` fixtures directly from
 # faer triplets, so faer is a genuine test-only dependency.
 faer = "0.24.4"
 rand = "0.10.1"
-serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
 # The conformal, reference-quality and large-scale tests moved from the root and
 # gam-models test binaries under #2899 read CSV fixtures, draw from rand_distr and
 # drive gam-test-support's reference harness.

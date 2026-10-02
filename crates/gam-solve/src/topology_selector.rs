@@ -576,6 +576,16 @@ impl TopologySelectionScoreKind {
             Self::Tk => "tk",
         }
     }
+
+    /// The kind a request names, spelled as [`Self::as_str`] writes it.
+    pub fn from_name(name: &str) -> Result<Self, String> {
+        match name {
+            "reml" => Ok(Self::Reml),
+            "laml" => Ok(Self::Laml),
+            "tk" => Ok(Self::Tk),
+            other => Err(format!("score must be one of: 'reml', 'laml', 'tk'; got {other:?}")),
+        }
+    }
 }
 
 /// Scale applied after the candidate's raw evidence cost is formed.
@@ -594,6 +604,19 @@ impl TopologySelectionScoreScale {
         match self {
             Self::Raw => "raw",
             Self::PerObservation => "per_observation",
+        }
+    }
+
+    /// The scale a request names, spelled as [`Self::as_str`] writes it. There is no
+    /// per-effective-dimension scale (#4556): dividing each candidate's evidence by its OWN
+    /// effective dimension lets a constant shared by the whole data set reverse the race.
+    pub fn from_name(name: &str) -> Result<Self, String> {
+        match name {
+            "raw" => Ok(Self::Raw),
+            "per_observation" => Ok(Self::PerObservation),
+            other => Err(format!(
+                "score_scale must be one of: 'per_observation', 'raw'; got {other:?}"
+            )),
         }
     }
 }

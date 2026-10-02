@@ -1106,7 +1106,7 @@ fn response_geometry_sphere_normalize_base<'py>(
     base: PyReadonlyArray1<'py, f64>,
 ) -> PyResult<Py<PyArray1<f64>>> {
     let owned = base.as_array().to_owned();
-    let normalized = py.detach_on_pool(move || rg_normalize_sphere_base(owned.view()));
+    let normalized = py.detach_on_pool(move || gam::geometry::response_geometry::normalize_sphere_base(owned.view()));
     let normalized = normalized.map_err(PyValueError::new_err)?;
     Ok(normalized.into_pyarray(py).unbind())
 }
@@ -1266,7 +1266,7 @@ fn response_geometry_log_map<'py>(
     let weights_owned = weights.as_ref().map(|w| w.as_array().to_owned());
     let (tangent, base_point, coord_label) =
         detach_py_result(py, "response_geometry_log_map", move || {
-            rg_log_map_dispatch(
+            gam::geometry::response_geometry::log_map(
                 arr.view(),
                 &geometry,
                 base_owned.as_ref().map(|b| b.view()),
@@ -1297,7 +1297,7 @@ fn response_geometry_exp_map<'py>(
     let t_owned = tangent.as_array().to_owned();
     let base_owned = base.as_array().to_owned();
     let out = detach_py_result(py, "response_geometry_exp_map", move || {
-        rg_exp_map_dispatch(
+        gam::geometry::response_geometry::exp_map(
             t_owned.view(),
             &geometry,
             base_owned.view(),
@@ -4545,12 +4545,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(gaussian_reml_score, module)?)?;
     module.add_function(wrap_pyfunction!(tierney_kadane_normalized_score, module)?)?;
     module.add_function(wrap_pyfunction!(torch_smooth_dispatch_key, module)?)?;
-    module.add_function(wrap_pyfunction!(assemble_candidate_formula, module)?)?;
-    module.add_function(wrap_pyfunction!(has_auto_smooth_term, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        select_topology_candidate_lifecycle,
-        module
-    )?)?;
+    module.add_function(wrap_pyfunction!(select_topology_table, module)?)?;
     module.add_function(wrap_pyfunction!(
         select_rank_with_profiled_hyperparameters,
         module
@@ -4558,11 +4553,14 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(stacking_weights_from_log_density, module)?)?;
     module.add_function(wrap_pyfunction!(stack_topologies_gaussian, module)?)?;
     module.add_function(wrap_pyfunction!(stacked_predictive_mean, module)?)?;
-    module.add_function(wrap_pyfunction!(extract_reml_score_raw, module)?)?;
     module.add_function(wrap_pyfunction!(compare_models, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_backward, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_formula_table, module)?)?;
+    module.add_function(wrap_pyfunction!(fit_response_geometry_table, module)?)?;
+    module.add_function(wrap_pyfunction!(response_geometry_predict_table, module)?)?;
+    module.add_function(wrap_pyfunction!(response_geometry_summary, module)?)?;
+    module.add_function(wrap_pyfunction!(response_geometry_model_fields, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_blocks_forward, module)?)?;
     module.add_function(wrap_pyfunction!(
         gaussian_reml_fit_blocks_orthogonal_forward,

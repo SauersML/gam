@@ -3911,7 +3911,9 @@ version = "0.3.157"
 dependencies = [
  "csv",
  "faer",
+ "gam-config",
  "gam-data",
+ "gam-geometry",
  "gam-inference",
  "gam-linalg",
  "gam-math",

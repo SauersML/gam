@@ -158,15 +158,7 @@ fn gaussian_reml_optimize_latent<'py>(
     stationarity_reference: Option<f64>,
     init: String,
 ) -> PyResult<Py<PyDict>> {
-    let family = match aux_family.to_ascii_lowercase().as_str() {
-        "ridge" => AuxPriorFamily::Ridge,
-        "linear" => AuxPriorFamily::Linear,
-        other => {
-            return Err(py_value_error(format!(
-                "aux_family must be 'ridge' or 'linear'; got {other:?}"
-            )));
-        }
-    };
+    let family = AuxPriorFamily::from_name(&aux_family).map_err(py_value_error)?;
     let dim_selection_values = dim_selection_log_precision
         .as_ref()
         .map(|values| ValidatedDimSelectionPrecisions::new(values.as_array(), latent_dim))
@@ -556,15 +548,7 @@ fn glm_reml_fit_latent<'py>(
     .map_err(py_value_error)?;
     let family_name = family.clone();
     let family_normalized = family_name.to_ascii_lowercase().replace('_', "-");
-    let aux_family = match aux_family.to_ascii_lowercase().as_str() {
-        "ridge" => AuxPriorFamily::Ridge,
-        "linear" => AuxPriorFamily::Linear,
-        other => {
-            return Err(py_value_error(format!(
-                "aux_family must be 'ridge' or 'linear'; got {other:?}"
-            )));
-        }
-    };
+    let aux_family = AuxPriorFamily::from_name(&aux_family).map_err(py_value_error)?;
     let t_values = t.as_array().to_owned();
     let y_values = y.as_array().to_owned();
     let centers_values = centers.as_array().to_owned();
@@ -700,15 +684,7 @@ fn glm_reml_fit_latent_backward<'py>(
     analytic_penalties: Option<String>,
 ) -> PyResult<Py<PyDict>> {
     let family = latent_family_spec(&family, tweedie_p, negbin_theta, beta_phi)?;
-    let aux_family = match aux_family.to_ascii_lowercase().as_str() {
-        "ridge" => AuxPriorFamily::Ridge,
-        "linear" => AuxPriorFamily::Linear,
-        other => {
-            return Err(py_value_error(format!(
-                "aux_family must be 'ridge' or 'linear'; got {other:?}"
-            )));
-        }
-    };
+    let aux_family = AuxPriorFamily::from_name(&aux_family).map_err(py_value_error)?;
     let dim_selection_precision = dim_selection_log_precision
         .as_ref()
         .map(|values| ValidatedDimSelectionPrecisions::new(values.as_array(), latent_dim))
@@ -1346,130 +1322,6 @@ struct BatchedPositionGaussianRemlBackwardResult {
     grad_penalty: Array2<f64>,
     grad_weights: Array1<f64>,
     grad_by: Option<Array1<f64>>,
-}
-
-/// Shared-tangent multi-output Gaussian REML fit.
-///
-/// One full Gaussian GAM is fitted per tangent coordinate (matching the
-/// documented `response_geometry` contract: "one scalar Gaussian GAM is fitted
-/// for each tangent coordinate"), but all coordinates are estimated jointly
-/// under one smoothing parameter per formula smooth shared across every
-/// coordinate, and an optional cross-coordinate Fisher-Rao precision metric
-/// couples their residuals. The numerical engine is
-/// `gam::families::response_geometry::fit_shared_tangent_reml`; this FFI layer
-/// only marshals the formula artifacts into its typed request.
-struct TangentRemlMultiResult {
-    /// Per-output coefficients, shape `(K, D)`.
-    coefficients: Array2<f64>,
-    /// Per-output fitted tangent values `X · β_d`, shape `(N, D)`.
-    fitted: Array2<f64>,
-    /// Pooled isotropic residual variance, length 1. Isotropic tangent noise
-    /// (`Cov = σ²·I_D`) is the rotation-invariant noise model; a per-coordinate
-    /// scale would itself break frame equivariance.
-    sigma2: Array1<f64>,
-    /// Shared per-smooth fitted smoothing parameters, length `M`. One λ per
-    /// formula smooth, common to every tangent output coordinate.
-    lambdas: Array1<f64>,
-    /// Shared per-smooth effective degrees of freedom, length `M` (the full
-    /// effective df of the `Sᵇ ⊗ I_D` block across all `D` outputs).
-    edf: Array1<f64>,
-    /// Joint REML score.
-    reml_score: f64,
-}
-
-/// Marshaling-vs-engine error split for the shared-tangent formula fit. The
-/// engine's typed `EstimationError` must reach `estimation_error_to_pyerr`
-/// unflattened so a non-converged outer search keeps its
-/// `RemlConvergenceError` class identity and structured resume evidence.
-#[derive(Debug)]
-enum SharedTangentFfiError {
-    Spec(String),
-    Engine(EstimationError),
-}
-
-fn gaussian_reml_fit_formula_dataset_impl(
-    dataset: EncodedDataset,
-    formula: String,
-    y: ArrayView2<'_, f64>,
-    config_json: Option<&str>,
-    fisher_rao_w: Option<ArrayView3<'_, f64>>,
-) -> Result<TangentRemlMultiResult, SharedTangentFfiError> {
-    let mut fit_config = parse_fit_config(config_json).map_err(SharedTangentFfiError::Spec)?;
-    fit_config.family = Some("gaussian".to_string());
-    fit_config.link = Some("identity".to_string());
-    let materialized = materialize(&formula, &dataset, &fit_config)
-        .map_err(|err| SharedTangentFfiError::Spec(err.to_string()))?;
-    let standard = match materialized.request {
-        FitRequest::Standard(request) => request,
-        _ => {
-            return Err(SharedTangentFfiError::Spec(
-                "shared-tangent Gaussian REML fitting requires a standard Gaussian formula"
-                    .to_string(),
-            ));
-        }
-    };
-    if !standard.family.is_gaussian_identity() {
-        return Err(SharedTangentFfiError::Spec(
-            "shared-tangent Gaussian REML fitting requires Gaussian identity".to_string(),
-        ));
-    }
-    if standard.wiggle.is_some() {
-        return Err(SharedTangentFfiError::Spec(
-            "shared-tangent Gaussian REML fitting does not support link wiggle".to_string(),
-        ));
-    }
-    if standard.offset.iter().any(|value| value.abs() > 0.0) {
-        return Err(SharedTangentFfiError::Spec(
-            "shared-tangent Gaussian REML fitting does not support offsets".to_string(),
-        ));
-    }
-    // Build the formula design and hand the joint problem to the core
-    // shared-tangent REML engine. The engine consumes the design through
-    // bounded row chunks and streams exact joint sufficient statistics, so the
-    // stacked `(N·D) × (K·D)` system and the `Sᵇ ⊗ I_D` Kronecker penalties are
-    // never materialized on this side of the boundary; all remaining input
-    // validation (shapes, finiteness, weight signs, metric shape/PD) is owned
-    // by the engine's typed request preparation.
-    let design =
-        gam::terms::smooth::build_term_collection_design(standard.data.view(), &standard.spec)
-            .map_err(|err| {
-                SharedTangentFfiError::Spec(format!("failed to build formula design matrix: {err}"))
-            })?;
-    if design.affine_offset.iter().any(|value| *value != 0.0) {
-        return Err(SharedTangentFfiError::Spec(
-            "shared-tangent Gaussian REML fitting does not support non-zero smooth anchors: \
-             the vector-valued tangent response requires an explicit affine offset per tangent \
-             coordinate"
-                .to_string(),
-        ));
-    }
-    let penalties: Vec<gam::families::response_geometry::SharedTangentPenalty> = design
-        .penalties
-        .iter()
-        .map(|penalty| {
-            gam::families::response_geometry::SharedTangentPenalty::new(
-                penalty.col_range.start,
-                penalty.local.clone(),
-            )
-        })
-        .collect();
-    let request = gam::families::response_geometry::SharedTangentRemlRequest::new(
-        design.design,
-        y.to_owned(),
-        (*standard.weights).clone(),
-        fisher_rao_w.map(|metric| metric.to_owned()),
-        penalties,
-    );
-    let fit = gam::families::response_geometry::fit_shared_tangent_reml(request)
-        .map_err(SharedTangentFfiError::Engine)?;
-    Ok(TangentRemlMultiResult {
-        sigma2: Array1::from_elem(1, fit.sigma2),
-        coefficients: fit.coefficients,
-        fitted: fit.fitted,
-        lambdas: fit.lambdas,
-        edf: fit.edf_by_penalty,
-        reml_score: fit.reml_score,
-    })
 }
 
 fn gaussian_reml_fit_batched_impl(
@@ -4556,116 +4408,6 @@ fn bspline_tensor_input_location_first_derivative<'py>(
 // gamfit/_equivariant.py. Each pyfunction is a thin marshalled entrypoint
 // that delegates to a pure-Rust impl on ndarray views.
 // ===========================================================================
-
-/// Project a spherical base point onto the unit sphere, rejecting a zero-norm
-/// input. Shared by the explicit `response_geometry_sphere_normalize_base` FFI
-/// and the consolidated log-map dispatch.
-fn rg_normalize_sphere_base(base: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
-    let norm = base.iter().fold(0.0_f64, |acc, value| acc.hypot(*value));
-    if !norm.is_finite() || norm <= 0.0 {
-        return Err("spherical base point must have non-zero norm".to_string());
-    }
-    Ok(base.mapv(|v| v / norm))
-}
-
-/// Resolve the simplex coordinate label exactly as the response-geometry log/exp
-/// maps require: an explicit `coordinates` request wins (lower-cased), otherwise
-/// `alr` for an `alr` geometry and `clr` for everything else.
-fn rg_resolve_simplex_coord_label(kind: &str, coordinates: Option<&str>) -> String {
-    match coordinates {
-        Some(c) => c.to_ascii_lowercase(),
-        None => {
-            if kind == "alr" {
-                "alr".to_string()
-            } else {
-                "clr".to_string()
-            }
-        }
-    }
-}
-
-/// Consolidated response-geometry log map: pick the base point (intrinsic
-/// Fréchet mean when none is supplied, else the projected/closed input base),
-/// dispatch to the sphere or simplex log map, and report the resolved
-/// coordinate label. This owns the geometry-kind routing, coordinate
-/// resolution, and base-point selection that previously lived in the Python
-/// wrapper.
-///
-/// `weights` are the per-observation prior weights used ONLY to choose the
-/// intrinsic base point when `base` is `None`. A weighted response-geometry fit
-/// linearizes every response in the tangent space at the base point and runs a
-/// weighted tangent regression there; if the base point ignored the weights the
-/// chart would be expanded around where the *unweighted* data balances rather
-/// than where the weighted mass lives — a biased linearization whenever the
-/// weighted and unweighted intrinsic means differ (#2125). Threading the same
-/// weights the tangent regression uses into the Fréchet mean puts the chart
-/// origin at the weighted mean. `None` recovers the uniform intrinsic mean.
-fn rg_log_map_dispatch(
-    values: ArrayView2<'_, f64>,
-    geometry: &str,
-    base: Option<ArrayView1<'_, f64>>,
-    coordinates: Option<&str>,
-    reference: isize,
-    weights: Option<ArrayView1<'_, f64>>,
-) -> Result<(Array2<f64>, Array1<f64>, String), String> {
-    let kind = geometry.to_ascii_lowercase();
-    match kind.as_str() {
-        "spherical" | "sphere" => {
-            let base_point = match base {
-                None => Array1::from(gam::geometry::sphere::sphere_frechet_mean(values, weights)?),
-                Some(b) => rg_normalize_sphere_base(b)?,
-            };
-            let tangent =
-                gam::geometry::sphere::response_sphere_log_map(values, base_point.view())?;
-            Ok((tangent, base_point, "spherical".to_string()))
-        }
-        "simplex" | "clr" | "alr" => {
-            let coord_label = rg_resolve_simplex_coord_label(&kind, coordinates);
-            let coord = gam::geometry::simplex::parse_simplex_coord(&coord_label)?;
-            let base_point = match base {
-                None => Array1::from(simplex_frechet_mean(values, weights)?),
-                Some(b) => {
-                    let b2 = Array2::from_shape_fn((1, b.len()), |(_, j)| b[j]);
-                    simplex_closure(b2.view())?.row(0).to_owned()
-                }
-            };
-            let tangent = gam::geometry::simplex::simplex_log_map(
-                values,
-                base_point.view(),
-                coord,
-                reference,
-            )?;
-            Ok((tangent, base_point, coord_label))
-        }
-        // Curved matrix / hyperbolic response geometries (#1061): the math is in
-        // `gam::geometry` and the label-parsing + intrinsic-mean + batched-map
-        // routing lives in `response_geometry`. `reference` does not apply.
-        _ => gam::geometry::response_geometry::dispatch_log_map(values, &kind, base, weights),
-    }
-}
-
-/// Consolidated response-geometry exponential map: dispatch tangent coordinates
-/// back to the response manifold given the geometry kind and (already resolved)
-/// coordinate label.
-fn rg_exp_map_dispatch(
-    tangent: ArrayView2<'_, f64>,
-    geometry: &str,
-    base: ArrayView1<'_, f64>,
-    coordinates: Option<&str>,
-    reference: isize,
-) -> Result<Array2<f64>, String> {
-    let kind = geometry.to_ascii_lowercase();
-    match kind.as_str() {
-        "spherical" | "sphere" => gam::geometry::sphere::response_sphere_exp_map(tangent, base),
-        "simplex" | "clr" | "alr" => {
-            let coord_label = rg_resolve_simplex_coord_label(&kind, coordinates);
-            let coord = gam::geometry::simplex::parse_simplex_coord(&coord_label)?;
-            gam::geometry::simplex::simplex_exp_map(tangent, base, coord, reference)
-        }
-        // Curved matrix / hyperbolic response geometries (#1061).
-        _ => gam::geometry::response_geometry::dispatch_exp_map(tangent, &kind, base),
-    }
-}
 
 #[pyfunction]
 fn response_geometry_closure<'py>(

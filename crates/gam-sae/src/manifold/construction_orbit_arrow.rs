@@ -74,9 +74,18 @@ pub(crate) trait JointWeight {
     /// The dense matrix, when the weight is held dense. A channel reading cross-row entries (the
     /// ordered Beta--Bernoulli shared mass) needs it.
     fn dense(&self) -> Option<&Array2<f64>>;
+    /// Whether every nonzero entry sits on the diagonal of a coordinate slot, so no channel
+    /// reading the border or a logit slot sees anything.
+    fn coordinate_diagonal_only(&self) -> bool {
+        false
+    }
 }
 
 impl<W: JointWeight + ?Sized> JointWeight for &W {
+    fn coordinate_diagonal_only(&self) -> bool {
+        (**self).coordinate_diagonal_only()
+    }
+
     fn entry(&self, row: usize, column: usize) -> f64 {
         (**self).entry(row, column)
     }
@@ -1707,6 +1716,14 @@ impl SaeManifoldTerm {
             if !rho.log_ard[atom].is_empty() {
                 logdet_trace[rho.ard_flat_index(atom, 0)] += 0.5 * log_precision;
             }
+        }
+        // #4077 — the pinned slots' half-line mass the value added beside `log|A|`.
+        if let Some((half_line_trace, half_line_gamma)) =
+            self.pinned_half_line_channels(rho, target, cache)?
+        {
+            logdet_trace += &half_line_trace;
+            gamma.t += &half_line_gamma.t;
+            gamma.beta += &half_line_gamma.beta;
         }
         gamma.t.scaled_add(2.0, &rank_charge_theta.t);
         gamma.beta.scaled_add(2.0, &rank_charge_theta.beta);

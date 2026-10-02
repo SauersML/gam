@@ -7523,8 +7523,27 @@ impl SaeManifoldTerm {
             // `O(N·M·d)` `basis_jacobian` and `O(N·M)` `basis_values` on every
             // backtrack.
             let snapshot = self.snapshot_mutable_state();
-            let pre_step_total =
-                self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
+            let pre_step =
+                self.penalized_objective_banded(target, rho, analytic_penalties, 1.0)?;
+            let pre_step_total = pre_step.value;
+            // #4077 — the rounding band of every trial objective this iteration
+            // evaluates, by value bits, so an evidence lane's acceptance compares a
+            // decrease with the resolution of the two values it subtracts.
+            let trial_bands: std::cell::RefCell<Vec<(u64, f64)>> =
+                std::cell::RefCell::new(Vec::new());
+            let evaluate_trial = |term: &mut Self| -> Result<f64, String> {
+                let banded = term.penalized_objective_banded(target, rho, analytic_penalties, 1.0)?;
+                trial_bands.borrow_mut().push((banded.value.to_bits(), banded.band));
+                Ok(banded.value)
+            };
+            let trial_band = |value: f64| {
+                trial_bands
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .find(|&&(bits, _)| bits == value.to_bits())
+                    .map_or(f64::INFINITY, |&(_, band)| band)
+            };
             if !pre_step_total.is_finite() {
                 // Pre-step state is unperturbed here; restore is a no-op but
                 // keeps the invariant explicit.
@@ -7589,9 +7608,7 @@ impl SaeManifoldTerm {
                                 delta_beta.view(),
                                 trial_step_size,
                             )
-                            .and_then(|()| {
-                                self.penalized_objective_total(target, rho, analytic_penalties, 1.0)
-                            })
+                            .and_then(|()| evaluate_trial(self))
                             .ok()
                             .map(|post_step_total| (post_step_total, ())))
                     },
@@ -7599,26 +7616,27 @@ impl SaeManifoldTerm {
                         let armijo_bound = pre_step_total
                             - SAE_MANIFOLD_ARMIJO_C1 * trial_step_size * directional_decrease;
                         // #2253 idempotence — EVIDENCE lanes additionally require
-                        // the decrease to clear the stall detector's own
-                        // resolution: a sub-resolution "strict" decrease (the
-                        // ε-harvest of per-assembly gate-freeze drift at a
-                        // KKT-band iterate) is not measurable progress, but each
-                        // such accept was a fresh state move that kept the inner
-                        // map non-idempotent forever (tier-0 K=2 fixtures:
-                        // refused at 512 granted iterations with ‖g‖ 300× inside
-                        // the band). Rejecting it routes to the proximal path
-                        // and then to the NoStrictDecrease termination — exactly
-                        // the recurrence the certificate needs. Discovery lanes
-                        // (floor 0) are byte-identical to the historical gate.
+                        // the decrease to be RESOLVED: larger than the rounding
+                        // bands of the two objective values it subtracts. A
+                        // sub-resolution "strict" decrease (the ε-harvest of
+                        // per-assembly gate-freeze drift at a KKT-band iterate)
+                        // is not measurable progress, and each such accept was a
+                        // fresh state move that kept the inner map non-idempotent
+                        // forever. #4077 — the floor used to be the stall
+                        // detector's `1e-8·(1 + |f|)`, a constant that refused
+                        // genuine, resolvable Newton decreases near the optimum
+                        // (`5.8e-9` on an objective of `1.16`, band `4e-15`), so
+                        // the inner solve stalled at a gradient five times its own
+                        // tolerance. Discovery lanes (floor 0) are byte-identical
+                        // to the historical gate.
                         let material_floor = if allow_heuristic_termination {
                             0.0
                         } else {
-                            SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
-                                * (1.0 + pre_step_total.abs())
+                            pre_step.band + trial_band(post_step_total)
                         };
                         post_step_total.is_finite()
                             && post_step_total <= armijo_bound
-                            && pre_step_total - post_step_total >= material_floor
+                            && pre_step_total - post_step_total > material_floor
                     },
                 )?
             } else {
@@ -7786,9 +7804,7 @@ impl SaeManifoldTerm {
                             return f64::INFINITY;
                         }
                         self.apply_newton_step(trial_delta_t, trial_delta_beta, 1.0)
-                            .and_then(|()| {
-                                self.penalized_objective_total(target, rho, analytic_penalties, 1.0)
-                            })
+                            .and_then(|()| evaluate_trial(self))
                             .unwrap_or(f64::INFINITY)
                     },
                 ) {
@@ -7813,14 +7829,14 @@ impl SaeManifoldTerm {
                         break;
                     }
                 };
-                // Same #2253 evidence-lane material floor as the Armijo gate
-                // above: a sub-stall-resolution proximal decrease is the same
-                // ε-harvest, and accepting it here would just move the
-                // non-idempotence from the line search to the fallback.
+                // Same #2253 evidence-lane resolution floor as the Armijo gate
+                // above: an unresolved proximal decrease is the same ε-harvest,
+                // and accepting it here would just move the non-idempotence from
+                // the line search to the fallback.
                 let proximal_material_floor = if allow_heuristic_termination {
                     0.0
                 } else {
-                    SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL * (1.0 + pre_step_total.abs())
+                    pre_step.band + trial_band(accepted_step.trial_objective_value)
                 };
                 if !(accepted_step.trial_objective_value.is_finite()
                     && pre_step_total - accepted_step.trial_objective_value

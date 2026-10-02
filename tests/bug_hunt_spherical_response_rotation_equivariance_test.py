@@ -13,10 +13,10 @@ under a rotation ``R`` of the ambient frame, so the *only* correct behaviour is
 In other words, relabelling the arbitrary ``(x, y, z)`` axes of the sphere must
 not change the physical predictions.
 
-It does.  ``gamfit/_response_geometry.py`` fits **each ambient tangent
+It did.  The response-geometry fit used to fit **each ambient tangent
 coordinate as its own scalar Gaussian GAM with its own per-coordinate smoothing
-parameter** (see ``SharedGaussianRemlTangentFit`` /
-``ResponseGeometryModel`` docstrings).  Per-axis smoothing in an *arbitrary*
+parameter**; ``gam_predict::response_geometry`` now shares one smoothing
+parameter per smooth across every coordinate.  Per-axis smoothing in an *arbitrary*
 ambient frame is not rotation invariant: a rotation that mixes a high-curvature
 tangent direction with a low-curvature one is smoothed completely differently
 after the mix, so the fitted surface — and the predictions — depend on the axis

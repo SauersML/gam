@@ -1570,7 +1570,7 @@ fn student_t_parameters_from_model(model: PyRef<'_, PyFittedModel>) -> Option<(f
 }
 
 /// Schema tag of the response-geometry saved-model container (#2114).
-pub(crate) const RESPONSE_GEOMETRY_SCHEMA: &str = "gamfit.ResponseGeometryModel/v1";
+pub(crate) const RESPONSE_GEOMETRY_SCHEMA: &str = gam_predict::response_geometry::RESPONSE_GEOMETRY_SCHEMA;
 
 /// Whether `family` names the multinomial-logit family, by the one engine
 /// predicate `fit_table` and the CLI route on. Python front ends that must
@@ -3945,42 +3945,6 @@ fn torch_smooth_dispatch_key(spec_kind: &str) -> PyResult<String> {
         .map_err(PyValueError::new_err)
 }
 
-/// Replace the unique `s(..., type=AUTO)` term in `base_formula` with the
-/// candidate-specific smooth term described by `candidate_json`. The JSON
-/// payload is a typed `CandidateTopology` (tag = "kind").
-///
-/// Returns `Ok(Some(formula))` when the substitution succeeds, `Ok(None)`
-/// when the candidate's required dimension does not match the AUTO term and
-/// `strict_dimension` is false, and `Err(...)` on any other failure (missing
-/// AUTO term, dimension mismatch in strict mode, malformed JSON, etc.).
-#[pyfunction(signature = (base_formula, candidate_json, strict_dimension = true))]
-fn assemble_candidate_formula(
-    base_formula: &str,
-    candidate_json: &str,
-    strict_dimension: bool,
-) -> PyResult<Option<String>> {
-    let candidate: gam::solver::topology_formula::CandidateTopology =
-        serde_json::from_str(candidate_json).map_err(|err| {
-            py_value_error(format!(
-                "assemble_candidate_formula: failed to parse candidate JSON: {err}"
-            ))
-        })?;
-    gam::solver::topology_formula::assemble_candidate_formula(
-        base_formula,
-        &candidate,
-        strict_dimension,
-    )
-    .map_err(PyValueError::new_err)
-}
-
-/// Whether `formula` holds the `s(..., type=AUTO)` term that
-/// [`assemble_candidate_formula`] substitutes into, read by the assembler's own
-/// scan.
-#[pyfunction]
-fn has_auto_smooth_term(formula: &str) -> PyResult<bool> {
-    gam::solver::topology_formula::has_auto_smooth_term(formula).map_err(PyValueError::new_err)
-}
-
 const PREFERRED_PREDICTION_COLUMNS: &[&str] = &[
     // Estimand-explicit schema (#2785): the plug-in pair, the posterior
     // estimand, then its uncertainty columns, in the order the docs list them.
@@ -4013,161 +3977,103 @@ const PREFERRED_PREDICTION_COLUMNS: &[&str] = &[
     "noise_scale",
 ];
 
-/// Finalize topology candidate lifecycles through the typed Rust selector.
+/// Select a topology by fitting every candidate on a table and ranking their evidence
+/// (`gam_predict::topology_selection`).
 ///
-/// Python supplies exactly one terminal outcome per declared candidate:
-/// assembly/fit failures, or metadata from one completed fit. Rust owns score
-/// construction, evidence validation, failure conversion, deterministic
-/// ordering, winner selection, and cross-score disagreement diagnostics.
-#[pyfunction]
-fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "snake_case")]
-    enum ScoreKind {
-        Reml,
-        Laml,
-        Tk,
-    }
-    #[derive(Deserialize)]
-    #[serde(rename_all = "snake_case")]
-    // No `per_effective_dim` (#4556): dividing each candidate's evidence by
-    // its OWN effective dimension lets a constant shared by the whole data set
-    // reverse the race, so a request naming it is refused by the deserializer
-    // rather than answered under a different scale.
-    enum ScoreScale {
-        Raw,
-        PerObservation,
-    }
-    #[derive(Deserialize)]
-    #[serde(rename_all = "snake_case")]
-    enum FailureStage {
-        Assembly,
-        Fit,
-        Evidence,
-    }
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum LifecycleFloat {
-        Finite(f64),
-        NonFinite(String),
-    }
-    impl LifecycleFloat {
-        fn decode(self) -> Result<f64, String> {
-            match self {
-                Self::Finite(value) => Ok(value),
-                Self::NonFinite(token) => match token.as_str() {
-                    "nan" => Ok(f64::NAN),
-                    "infinity" => Ok(f64::INFINITY),
-                    "-infinity" => Ok(f64::NEG_INFINITY),
-                    _ => Err(format!("invalid lifecycle float token {token:?}")),
-                },
-            }
-        }
-    }
-    #[derive(Deserialize)]
-    #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
-    enum CandidateOutcome {
-        Fitted {
-            name: String,
-            raw_reml: LifecycleFloat,
-            laml: Option<LifecycleFloat>,
-            null_dim: Option<LifecycleFloat>,
-            null_space_logdet: Option<LifecycleFloat>,
-            effective_dim: LifecycleFloat,
-            basis_size: usize,
-            n_obs: usize,
-        },
-        Failed {
-            name: String,
-            stage: FailureStage,
-            error_type: String,
-            message: String,
-            evidence_at_failure: Option<LifecycleFloat>,
-        },
-    }
+/// `response` names a response column for response selection (the AUTO formula is built
+/// from the other columns); otherwise `formula` is the caller's, and `latent` names the
+/// latent block each candidate retopologizes. `candidates_json` is a list of
+/// `{"name", "topology"}` with `topology` a `CandidateTopology`; `defaults` says they are
+/// a default portfolio, whose dimension-mismatched members are not candidates.
+///
+/// Returns `(result_json, fits, fit_errors)`: the ranking document, the saved bytes of
+/// every ranked candidate's model by name, and the typed exception of every candidate
+/// whose fit failed, by name.
+#[pyfunction(signature = (
+    headers,
+    rows,
+    candidates_json,
+    defaults,
+    score_kind,
+    score_scale,
+    config_json = None,
+    response = None,
+    formula = None,
+    latent = None
+))]
+fn select_topology_table(
+    py: Python<'_>,
+    headers: Vec<String>,
+    rows: PyRef<'_, PyEncodedTable>,
+    candidates_json: &str,
+    defaults: bool,
+    score_kind: &str,
+    score_scale: &str,
+    config_json: Option<String>,
+    response: Option<String>,
+    formula: Option<String>,
+    latent: Option<String>,
+) -> PyResult<(String, Vec<(String, Py<PyBytes>)>, Vec<(String, PyObject)>)> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct LifecycleRequest {
-        score_kind: ScoreKind,
-        score_scale: ScoreScale,
-        candidates: Vec<CandidateOutcome>,
+    struct CandidateDocument {
+        name: String,
+        topology: gam::solver::topology_formula::CandidateTopology,
     }
-
-    let request: LifecycleRequest = serde_json::from_str(request_json).map_err(|err| {
-        py_value_error(format!(
-            "select_topology_candidate_lifecycle: failed to parse request JSON: {err}"
-        ))
-    })?;
-    let score_kind = match request.score_kind {
-        ScoreKind::Reml => gam::solver::TopologySelectionScoreKind::Reml,
-        ScoreKind::Laml => gam::solver::TopologySelectionScoreKind::Laml,
-        ScoreKind::Tk => gam::solver::TopologySelectionScoreKind::Tk,
-    };
-    let score_scale = match request.score_scale {
-        ScoreScale::Raw => gam::solver::TopologySelectionScoreScale::Raw,
-        ScoreScale::PerObservation => gam::solver::TopologySelectionScoreScale::PerObservation,
-    };
-    let candidates: Result<Vec<_>, String> = request
-        .candidates
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
+    let candidates: Vec<CandidateDocument> = serde_json::from_str(candidates_json)
+        .map_err(|err| py_value_error(format!("select_topology: invalid candidates: {err}")))?;
+    let candidates = candidates
         .into_iter()
-        .map(|candidate| match candidate {
-            CandidateOutcome::Fitted {
-                name,
-                raw_reml,
-                laml,
-                null_dim,
-                null_space_logdet,
-                effective_dim,
-                basis_size,
-                n_obs,
-            } => Ok(gam::solver::TopologyCandidateOutcome::Fitted(
-                gam::solver::TopologyCandidateEvidence {
-                    name,
-                    raw_reml: raw_reml.decode()?,
-                    laml: laml.map(LifecycleFloat::decode).transpose()?,
-                    null_dim: null_dim.map(LifecycleFloat::decode).transpose()?,
-                    null_space_logdet: null_space_logdet.map(LifecycleFloat::decode).transpose()?,
-                    effective_dim: effective_dim.decode()?,
-                    basis_size,
-                    n_obs,
-                },
-            )),
-            CandidateOutcome::Failed {
-                name,
-                stage,
-                error_type,
-                message,
-                evidence_at_failure,
-            } => Ok(gam::solver::TopologyCandidateOutcome::Failed(
-                gam::solver::TopologyCandidateFailure {
-                    name,
-                    stage: match stage {
-                        FailureStage::Assembly => {
-                            gam::solver::TopologyCandidateFailureStage::Assembly
-                        }
-                        FailureStage::Fit => gam::solver::TopologyCandidateFailureStage::Fit,
-                        FailureStage::Evidence => {
-                            gam::solver::TopologyCandidateFailureStage::Evidence
-                        }
-                    },
-                    error_type,
-                    message,
-                    evidence_at_failure: evidence_at_failure
-                        .map(LifecycleFloat::decode)
-                        .transpose()?,
-                },
-            )),
+        .map(|candidate| gam_predict::topology_selection::TopologyCandidate {
+            name: candidate.name,
+            topology: candidate.topology,
         })
         .collect();
-    let candidates = candidates.map_err(|err| {
-        py_value_error(format!(
-            "select_topology_candidate_lifecycle: invalid numeric payload: {err}"
-        ))
+    let score_kind =
+        gam::solver::TopologySelectionScoreKind::from_name(score_kind).map_err(py_value_error)?;
+    let score_scale =
+        gam::solver::TopologySelectionScoreScale::from_name(score_scale).map_err(py_value_error)?;
+    let source = if defaults {
+        gam_predict::topology_selection::TopologyCandidateSource::Defaults
+    } else {
+        gam_predict::topology_selection::TopologyCandidateSource::Explicit
+    };
+    let selection = detach_py_result(py, "select_topology_table", move || {
+        let formula = match (response, formula) {
+            (Some(response), None) => {
+                gam_predict::topology_selection::auto_topology_formula(&dataset, &response)?.0
+            }
+            (None, Some(formula)) => formula,
+            _ => {
+                return Err(
+                    "select_topology_table takes exactly one of response and formula".to_string()
+                );
+            }
+        };
+        let selection = gam_predict::topology_selection::select_topology(
+            &dataset,
+            gam_predict::topology_selection::TopologySelectionRequest {
+                formula: &formula,
+                candidates,
+                source,
+                latent: latent.as_deref(),
+                score_kind,
+                score_scale,
+                config_json: config_json.as_deref(),
+            },
+        )?;
+        let fits = selection
+            .fits
+            .into_iter()
+            .map(|(name, model)| model.to_saved_bytes().map(|bytes| (name, bytes)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| err.to_string())?;
+        Ok((selection.result, fits, selection.fit_errors))
     })?;
-    let selected =
-        gam::solver::select_topology_candidate_lifecycle(candidates, score_kind, score_scale)
-            .map_err(|err| py_value_error(format!("select_topology_candidate_lifecycle: {err}")))?;
-    let ranked: Vec<serde_json::Value> = selected
+    let (result, fits, fit_errors) = selection;
+    let ranked: Vec<serde_json::Value> = result
         .ranked
         .into_iter()
         .map(|row| {
@@ -4181,7 +4087,7 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
             })
         })
         .collect();
-    let failed: Vec<serde_json::Value> = selected
+    let failed: Vec<serde_json::Value> = result
         .failed
         .into_iter()
         .map(|failure| {
@@ -4194,17 +4100,25 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
             })
         })
         .collect();
-    serde_json::to_string(&serde_json::json!({
+    let document = serde_json::to_string(&serde_json::json!({
         "ranked": ranked,
-        "winner_index": selected.winner_index,
+        "winner_index": result.winner_index,
         "failed": failed,
-        "warnings": selected.warnings,
+        "warnings": result.warnings,
     }))
-    .map_err(|err| {
-        py_value_error(format!(
-            "select_topology_candidate_lifecycle: serialise: {err}"
-        ))
-    })
+    .map_err(|err| py_value_error(format!("select_topology_table: serialise: {err}")))?;
+    let fits = fits
+        .into_iter()
+        .map(|(name, bytes)| (name, PyBytes::new(py, &bytes).unbind()))
+        .collect();
+    let fit_errors = fit_errors
+        .into_iter()
+        .map(|(name, error)| {
+            let exception = workflow_error_to_pyerr(py, error);
+            (name, exception.into_value(py).into_any())
+        })
+        .collect();
+    Ok((document, fits, fit_errors))
 }
 
 /// Select a skip-transcoder style integer rank in `[0, max_rank]` with the
@@ -4439,44 +4353,6 @@ fn stacked_predictive_mean(weights: Vec<f64>, means: Vec<Vec<f64>>) -> PyResult<
         .map_err(py_value_error)
 }
 
-// Each lookup below names the one `SummaryPayload` field that publishes the
-// quantity; there are no alternative spellings to probe.
-const REML_SCORE_KEYS: &[&str] = &["reml_score"];
-
-const RAW_REML_SCORE_KEYS: &[&str] = &["raw_reml_score"];
-
-/// Payload key carrying WHY a summary has no comparable criterion (#2595,
-/// #2627). Present exactly when `reml_score` is `null`.
-const REML_UNAVAILABLE_KEYS: &[&str] = &["reml_score_unavailable"];
-
-/// The refusal a ranking surface raises when the summary it was handed has no
-/// criterion to rank.
-///
-/// Reads the payload's own recorded reason when there is one, so the user is
-/// told what actually happened to their fit rather than that a field is
-/// "missing" — the field is present, and it is `null` on purpose.
-fn no_criterion_error(payload: &serde_json::Value, surface: &str) -> pyo3::PyErr {
-    match json_lookup_str(payload, REML_UNAVAILABLE_KEYS) {
-        Some(reason) => py_value_error(format!("{surface}: {reason}")),
-        None => py_value_error(format!(
-            "{surface}: this model summary carries no reml_score field"
-        )),
-    }
-}
-
-enum RemlFitView<'py> {
-    /// The `SummaryPayload` of a gamfit Model or its saved bytes.
-    SavedSummary(serde_json::Value),
-    /// A summary mapping (a dict or `gamfit.results.Summary`) read through `.get`.
-    Mapping(Bound<'py, PyAny>),
-}
-
-#[pyfunction]
-fn extract_reml_score_raw(py: Python<'_>, fit: Py<PyAny>) -> PyResult<f64> {
-    let fit = fit.bind(py);
-    extract_reml_score_raw_impl(fit)
-}
-
 /// Rank fitted models on their smoothing-corrected AIC. The ranking is
 /// `compare_saved_models`, the same one `gam compare` prints.
 #[pyfunction(signature = (fits, names = None))]
@@ -4535,113 +4411,6 @@ fn compare_models(
             .map_err(|err| format!("failed to serialize model comparison: {err}"))
     })?;
     json_value_to_py(py, &comparison)
-}
-
-fn extract_reml_score_raw_impl(fit: &Bound<'_, PyAny>) -> PyResult<f64> {
-    let view = reml_fit_view(fit)?;
-    extract_reml_score_raw_from_view(&view)
-}
-
-fn extract_reml_score_raw_from_view(view: &RemlFitView<'_>) -> PyResult<f64> {
-    if let Some(score) = extract_float_metadata_from_view(view, RAW_REML_SCORE_KEYS)? {
-        return Ok(score);
-    }
-    if let Some(score) = extract_float_metadata_from_view(view, REML_SCORE_KEYS)? {
-        return Ok(score);
-    }
-    match view {
-        RemlFitView::SavedSummary(payload) => Err(no_criterion_error(payload, "compare_models")),
-        RemlFitView::Mapping(fit) => Err(PyTypeError::new_err(format!(
-            "compare_models: cannot extract reml_score from {}; pass a gamfit.Model \
-             or a summary mapping with 'reml_score'",
-            fit.get_type().name()?
-        ))),
-    }
-}
-
-fn extract_float_metadata_from_view(
-    view: &RemlFitView<'_>,
-    keys: &[&str],
-) -> PyResult<Option<f64>> {
-    match view {
-        RemlFitView::SavedSummary(payload) => Ok(json_lookup_f64(payload, keys)),
-        RemlFitView::Mapping(_) => {
-            let Some(value) = extract_py_metadata_value(view, keys)? else {
-                return Ok(None);
-            };
-            value.extract::<f64>().map(Some)
-        }
-    }
-}
-
-fn json_lookup_str(payload: &serde_json::Value, keys: &[&str]) -> Option<String> {
-    let object = payload.as_object()?;
-    for key in keys {
-        if let Some(value) = object.get(*key) {
-            if let Some(s) = value.as_str() {
-                return Some(s.to_string());
-            }
-        }
-    }
-    None
-}
-
-fn reml_fit_view<'py>(fit: &Bound<'py, PyAny>) -> PyResult<RemlFitView<'py>> {
-    if let Ok(model_bytes) = fit.extract::<Vec<u8>>() {
-        let model =
-            load_model_impl(&model_bytes).map_err(|err| saved_model_error_to_pyerr(fit.py(), err))?;
-        let summary = summary_payload_value(&model)?;
-        return Ok(RemlFitView::SavedSummary(summary));
-    }
-    if fit.hasattr("_prediction_model")? {
-        let compiled = fit.getattr("_prediction_model")?;
-        let compiled = compiled.cast::<PyFittedModel>()?;
-        return Ok(RemlFitView::SavedSummary(
-            compiled.get().summary_value()?.clone(),
-        ));
-    }
-    if fit.hasattr("get")? && fit.getattr("get")?.is_callable() {
-        return Ok(RemlFitView::Mapping(fit.clone()));
-    }
-    Err(PyTypeError::new_err(format!(
-        "compare_models: expected a gamfit.Model, its saved bytes, or a summary mapping; got {}",
-        fit.get_type().name()?
-    )))
-}
-
-fn extract_py_metadata_value<'py>(
-    view: &RemlFitView<'py>,
-    keys: &[&str],
-) -> PyResult<Option<Bound<'py, PyAny>>> {
-    let RemlFitView::Mapping(mapping) = view else {
-        return Ok(None);
-    };
-    for key in keys {
-        let value = mapping.call_method1("get", (*key,))?;
-        if !value.is_none() {
-            return Ok(Some(value));
-        }
-    }
-    Ok(None)
-}
-
-fn json_lookup_f64(payload: &serde_json::Value, keys: &[&str]) -> Option<f64> {
-    let object = payload.as_object()?;
-    for key in keys {
-        if let Some(value) = object.get(*key) {
-            if let Some(value) = json_number_to_f64(value) {
-                return Some(value);
-            }
-        }
-    }
-    None
-}
-
-fn json_number_to_f64(value: &serde_json::Value) -> Option<f64> {
-    value
-        .as_f64()
-        .or_else(|| value.as_i64().map(|value| value as f64))
-        .or_else(|| value.as_u64().map(|value| value as f64))
 }
 
 #[pyfunction(signature = (x, y, penalty, weights, ridge_lambda))]
@@ -4930,42 +4699,155 @@ fn gaussian_reml_fit_formula_table<'py>(
     let dataset = rows.dataset.clone();
     let y_values = y.as_array().to_owned();
     let fisher_values = fisher_rao_w.as_ref().map(|w| w.as_array().to_owned());
-    let result = detach_typed_py_result(
+    let fit_config = parse_fit_config(config_json.as_deref()).map_err(py_value_error)?;
+    let fit = detach_typed_py_result(
         py,
         "gaussian_reml_fit_formula_table",
         move || {
-            gaussian_reml_fit_formula_dataset_impl(
-                dataset,
-                formula,
-                y_values.view(),
-                config_json.as_deref(),
+            gam_predict::response_geometry::fit_shared_tangent_formula(
+                &dataset,
+                &formula,
+                &y_values,
+                &fit_config,
                 fisher_values.as_ref().map(|w| w.view()),
             )
         },
-        |_, error| match error {
-            SharedTangentFfiError::Spec(message) => py_value_error(message),
-            SharedTangentFfiError::Engine(engine) => estimation_error_to_pyerr(engine),
-        },
+        response_geometry_error_to_pyerr,
     )?;
-    tangent_reml_result_to_pydict(py, result)
-}
-
-fn tangent_reml_result_to_pydict<'py>(
-    py: Python<'py>,
-    fit: TangentRemlMultiResult,
-) -> PyResult<Py<PyDict>> {
-    let finite = fit.reml_score.is_finite()
-        && fit.coefficients.iter().all(|value| value.is_finite())
-        && fit.lambdas.iter().all(|value| value.is_finite());
     let out = PyDict::new(py);
-    out.set_item("status", if finite { "ok" } else { "diverged" })?;
-    out.set_item("reml_score", fit.reml_score)?;
+    out.set_item("status", fit.report.status)?;
+    out.set_item("reml_score", fit.report.reml_score)?;
     out.set_item("coefficients", fit.coefficients.into_pyarray(py))?;
     out.set_item("fitted", fit.fitted.into_pyarray(py))?;
-    out.set_item("sigma2", fit.sigma2.into_pyarray(py))?;
-    out.set_item("lambdas", fit.lambdas.into_pyarray(py))?;
-    out.set_item("edf", fit.edf.into_pyarray(py))?;
+    out.set_item("sigma2", Array1::from(fit.report.sigma2).into_pyarray(py))?;
+    out.set_item("lambdas", Array1::from(fit.report.lambdas).into_pyarray(py))?;
+    out.set_item("edf", Array1::from(fit.report.edf).into_pyarray(py))?;
     Ok(out.unbind())
+}
+
+/// The typed Python exception for a response-geometry failure: an unusable request is a
+/// `ValueError`, the template fit keeps its workflow class, and the joint REML keeps its
+/// engine class with its resume evidence.
+fn response_geometry_error_to_pyerr(
+    py: Python<'_>,
+    error: gam_predict::response_geometry::ResponseGeometryError,
+) -> PyErr {
+    match error {
+        gam_predict::response_geometry::ResponseGeometryError::Invalid(message) => {
+            py_value_error(message)
+        }
+        gam_predict::response_geometry::ResponseGeometryError::Fit(workflow) => {
+            workflow_error_to_pyerr(py, workflow)
+        }
+        gam_predict::response_geometry::ResponseGeometryError::Engine(engine) => {
+            estimation_error_to_pyerr(engine)
+        }
+    }
+}
+
+/// Fit a response-geometry GAM (`gam_predict::response_geometry`) and return its saved
+/// container.
+#[pyfunction(signature = (
+    headers,
+    rows,
+    formula,
+    config_json,
+    geometry,
+    response_columns,
+    coordinates = None,
+    reference = -1,
+    fisher_rao_w = None
+))]
+fn fit_response_geometry_table<'py>(
+    py: Python<'py>,
+    headers: Vec<String>,
+    rows: PyRef<'py, PyEncodedTable>,
+    formula: String,
+    config_json: Option<String>,
+    geometry: String,
+    response_columns: Vec<String>,
+    coordinates: Option<String>,
+    reference: isize,
+    fisher_rao_w: Option<PyReadonlyArrayDyn<'py, f64>>,
+) -> PyResult<Py<PyBytes>> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
+    let request = gam_predict::response_geometry::ResponseGeometryRequest {
+        geometry,
+        response_columns,
+        coordinates,
+        reference,
+        fisher_rao_w: fisher_rao_w.as_ref().map(|w| w.as_array().to_owned()),
+    };
+    let bytes = detach_typed_py_result(
+        py,
+        "fit_response_geometry_table",
+        move || {
+            let model = gam_predict::response_geometry::fit_response_geometry(
+                &dataset,
+                &formula,
+                &request,
+                config_json.as_deref(),
+            )?;
+            model
+                .to_saved_bytes()
+                .map_err(gam_predict::response_geometry::ResponseGeometryError::Invalid)
+        },
+        response_geometry_error_to_pyerr,
+    )?;
+    Ok(PyBytes::new(py, &bytes).unbind())
+}
+
+fn load_response_geometry_model(
+    model_bytes: &[u8],
+) -> PyResult<gam_predict::response_geometry::ResponseGeometryModel> {
+    gam_predict::response_geometry::ResponseGeometryModel::from_saved_bytes(model_bytes)
+        .map_err(py_value_error)
+}
+
+/// `(response, tangent)` of a saved response-geometry model at the rows of a table,
+/// projected onto its template's schema first.
+#[pyfunction]
+fn response_geometry_predict_table<'py>(
+    py: Python<'py>,
+    model_bytes: Vec<u8>,
+    headers: Vec<String>,
+    rows: PyRef<'py, PyEncodedTable>,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let model = load_response_geometry_model(&model_bytes)?;
+    let source = rows.dataset.clone();
+    let (response, tangent) = detach_predict_result(py, "response_geometry_predict_table", move || {
+        let dataset = dataset_with_model_schema_from_encoded(model.template(), &source)?;
+        Ok(model.predict(dataset)?)
+    })?;
+    Ok((response.into_pyarray(py).unbind(), tangent.into_pyarray(py).unbind()))
+}
+
+/// The summary of a saved response-geometry model.
+#[pyfunction]
+fn response_geometry_summary(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyObject> {
+    let model = load_response_geometry_model(&model_bytes)?;
+    let summary = model.summary().map_err(py_value_error)?;
+    json_value_to_py(py, &summary)
+}
+
+/// The fields a saved response-geometry model exposes: geometry, response columns, chart,
+/// base point, tangent dimension, training table kind and curvature estimand.
+#[pyfunction]
+fn response_geometry_model_fields(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyObject> {
+    let model = load_response_geometry_model(&model_bytes)?;
+    let fields = serde_json::json!({
+        "response_geometry": model.response_geometry,
+        "response_columns": model.response_columns,
+        "base_point": model.base_point.to_vec(),
+        "coordinates": model.coordinates,
+        "reference": model.reference,
+        "training_table_kind": model.training_table_kind,
+        "tangent_dimension": model.tangent_dimension(),
+        "curvature": model.curvature,
+    });
+    json_value_to_py(py, &fields)
 }
 
 /// Multi-block Gaussian REML forward fit with per-smooth λ_k.
