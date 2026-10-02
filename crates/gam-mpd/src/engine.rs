@@ -669,6 +669,7 @@ fn search(
         let uses = operator_uses(&program);
         let mut tables: BTreeMap<usize, Option<BlockBits>> = BTreeMap::new();
         let mut current_data: Option<f64> = None;
+        let mut base_operator_bits: BTreeMap<usize, u64> = BTreeMap::new();
         for proposal in proposals {
             if refused.contains(&proposal.description) {
                 continue;
@@ -707,7 +708,7 @@ fn search(
             }
             let mut candidate = program.clone();
             apply_edit(&mut candidate, &proposal.edit)?;
-            let bits = candidate.code_bits_from(&program, current.program_bits)? as f64;
+            let bits = candidate.code_bits_from(&program, current.program_bits, &mut base_operator_bits)? as f64;
             if screenings >= budget.screenings {
                 break 'search Stop::ScreeningBudget;
             }
@@ -729,7 +730,7 @@ fn search(
                 && let Some(refit) = refit_after(&candidate, contract, &reference, search)?
             {
                 // The compound move: the edit and a refit of the readout's reals, judged together.
-                let refit_bits = refit.code_bits_from(&program, current.program_bits)? as f64;
+                let refit_bits = refit.code_bits_from(&program, current.program_bits, &mut base_operator_bits)? as f64;
                 let refit_logits = contract.distributions(&refit.execute(&contract.family, false)?.values[refit.output])?;
                 let refit_saving =
                     base_total - (refit_bits + explanation_bits + screened_data_bits(&reference, &refit_logits, contract.observations));

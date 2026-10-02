@@ -786,9 +786,19 @@ impl Operator {
         let mut reals = Vec::new();
         match &self.body {
             OperatorBody::Dense { values, present, .. } => {
-                for ((r, c), &keep) in present.indexed_iter() {
-                    if keep {
-                        reals.extend(values.slice(s![self.rows.range(r), self.cols.range(c)]).iter().copied());
+                reals.reserve(self.real_count());
+                if self.rows.groups().iter().all(|g| g.width == 1) && self.cols.groups().iter().all(|g| g.width == 1) {
+                    // One-coordinate blocks: the message order is the row-major order of the present entries.
+                    reals.extend(values.iter().zip(present.iter()).filter(|(_, keep)| **keep).map(|(v, _)| *v));
+                } else {
+                    for ((r, c), &keep) in present.indexed_iter() {
+                        if keep {
+                            for i in self.rows.range(r) {
+                                for j in self.cols.range(c) {
+                                    reals.push(values[[i, j]]);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -3258,17 +3268,27 @@ impl OperatorProgram {
     /// operators this one shares wherever it has not changed them: only the operators that differ
     /// (by pointer, then by value) and the frame are re-measured. A different operator count
     /// measures the whole message.
-    pub fn code_bits_from(&self, base: &OperatorProgram, base_bits: u64) -> Result<u64, ProgramError> {
+    ///
+    /// `base_operator_bits` caches the base's operator lengths across candidates of one base.
+    pub fn code_bits_from(&self, base: &OperatorProgram, base_bits: u64, base_operator_bits: &mut BTreeMap<usize, u64>) -> Result<u64, ProgramError> {
         if self.operators.len() != base.operators.len() {
             return self.code_bits();
         }
         let mut bits = base_bits as i128;
-        for (new, old) in self.operators.iter().zip(&base.operators) {
+        for (index, (new, old)) in self.operators.iter().zip(&base.operators).enumerate() {
             if Arc::ptr_eq(new, old) || new == old {
                 continue;
             }
-            let ((ns, nr), (os, or)) = (operator_bits(new)?, operator_bits(old)?);
-            bits += i128::from(ns + nr) - i128::from(os + or);
+            let old_bits = match base_operator_bits.get(&index) {
+                Some(bits) => *bits,
+                None => {
+                    let (os, or) = operator_bits(old)?;
+                    base_operator_bits.insert(index, os + or);
+                    os + or
+                }
+            };
+            let (ns, nr) = operator_bits(new)?;
+            bits += i128::from(ns + nr) - i128::from(old_bits);
         }
         if self.nodes != base.nodes || self.bases != base.bases || self.rules != base.rules || self.declarations != base.declarations {
             let frame = |(h, b, r, n): (u64, Vec<u64>, u64, u64)| i128::from(h + b.iter().sum::<u64>() + r + n);

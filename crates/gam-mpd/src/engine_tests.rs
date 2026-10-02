@@ -410,6 +410,10 @@ fn a_candidates_length_from_its_base_is_its_length() {
     for edit in edits {
         let mut candidate = program.clone();
         apply_edit(&mut candidate, &edit).expect("edit");
-        assert_eq!(candidate.code_bits_from(&program, base).expect("from base"), candidate.code_bits().expect("bits"), "{edit:?}");
+        assert_eq!(
+            candidate.code_bits_from(&program, base, &mut std::collections::BTreeMap::new()).expect("from base"),
+            candidate.code_bits().expect("bits"),
+            "{edit:?}"
+        );
     }
 }
