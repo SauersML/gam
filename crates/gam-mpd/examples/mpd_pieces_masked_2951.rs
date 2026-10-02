@@ -1,25 +1,32 @@
-//! Per-input pieces of a language model trained through its own masked forward (#2951).
+//! Per-input pieces of a language model trained through its own masked forward, on streamed
+//! sequences (#2951).
 //!
-//! `mpd_pieces_masked_2951 EXPORT_DIR PIECES_DIR OUT.json OBSERVATIONS SEQUENCES {fit|wsvd} [CONTEXT]`
+//! `mpd_pieces_masked_2951 EXPORT_DIR PIECES_DIR OUT.json OBSERVATIONS {fit|wsvd} TRAIN EVAL [CONTEXT]`
 //!
-//! `EXPORT_DIR` is a language-model export (`gam_mpd::import::import_language_model`);
-//! `PIECES_DIR` holds `bench/mpd_pieces_2951.py dump`'s site statistics and, for `fit`, the
-//! starting libraries of `mpd_pieces_2951` (VPD naming, `h.{l}.attn.q_proj` and so on); `wsvd`
-//! starts from each site's exact Fisher-whitened singular pieces (`gam_mpd::pieces::fisher_svd`).
-//! Each input starts with the pieces whose second-order KL bits alone, in the global Fisher, exceed
-//! the uniform listing cost. The first `SEQUENCES` token rows are the fit inputs and the next `SEQUENCES` the eval
-//! inputs, `CONTEXT` positions each (default 512). From no piece on, the fit alternates exact
-//! selection and preconditioned steps of the pieces (`gam_mpd::masked`) at `OBSERVATIONS` per input,
-//! until an iteration saves less than one bit per input; after each iteration the eval inputs are
-//! selected with the fit's listing costs and the masked forward reports their mean active pieces
-//! (L0), KL and bits per token in the per-token frontier's code (per site `ω(k + 1) + log₂ C(C, k)`).
-//! Written to `OUT.json` after every iteration.
+//! `EXPORT_DIR` is a language-model export (`gam_mpd::import::import_language_model`) whose first
+//! `TRAIN` token rows train the pieces and whose next `EVAL` rows evaluate them, `CONTEXT`
+//! positions each (default 512). `PIECES_DIR` holds `bench/mpd_pieces_2951.py dump`'s site
+//! statistics and, for `fit`, the starting libraries of `mpd_pieces_2951` (VPD naming,
+//! `h.{l}.attn.q_proj` and so on); `wsvd` starts from each site's exact Fisher-whitened singular
+//! pieces (`gam_mpd::pieces::fisher_svd`).
+//!
+//! The training sequences stream one at a time: each starts with the pieces whose own second-order
+//! KL bits in the global Fisher, on its clean forward, exceed their listing cost; its sets are
+//! selected exactly in the masked forward (`gam_mpd::masked::select`) with the listing costs of
+//! every set selected so far; then the pieces take one exact-gradient step on it, preconditioned by
+//! the running read covariances and written Fishers of every sequence seen
+//! (`gam_mpd::masked::step_pieces`). Four times per pass the first four eval sequences, and at each
+//! pass's end all of them, are selected one at a time with the current costs, and their mean active
+//! pieces (L0), KL and bits per token in the
+//! per-token frontier's code (per site `ω(k + 1) + log₂ C(C, k)`) are appended to `OUT.json` as
+//! `{points: [{l0, bits, kl, …}]}`. Passes repeat until one saves less than a bit per token.
 
 use gam_mpd::codec::prefix_integer_len_bits;
 use gam_mpd::import::import_language_model;
-use gam_mpd::masked::{Library, Masked, listing_bits, listing_costs, matrix, select, sites, step_pieces};
+use gam_mpd::masked::{Library, Masked, Running, costs_from_counts, listing_bits, matrix, read_values, select, sites, step_pieces};
+use gam_mpd::operator_program::FamilyInputs;
 use gam_mpd::pieces::fisher_svd;
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, Axis};
 use serde_json::json;
 use statrs::function::gamma::ln_gamma;
 use std::path::{Path, PathBuf};
@@ -49,9 +56,8 @@ fn vpd_name(site: &str) -> Option<String> {
     Some(format!("h.{layer}.{full}"))
 }
 
-/// Mean active pieces, KL and frontier bits per input.
-fn report(masks: &[Array2<f64>], kl: &Array1<f64>) -> serde_json::Value {
-    let rows = kl.len() as f64;
+/// Sums over a sequence's tokens: active pieces, KL, frontier bits.
+fn sums(masks: &[Array2<f64>], kl: &Array1<f64>) -> (f64, f64, f64) {
     let mut l0 = 0.0;
     let mut bits = 0.0;
     for m in masks {
@@ -60,39 +66,35 @@ fn report(masks: &[Array2<f64>], kl: &Array1<f64>) -> serde_json::Value {
             let k = row.iter().filter(|x| **x > 0.0).count();
             l0 += k as f64;
             let omega = prefix_integer_len_bits(k as u64 + 1).map_or(0.0, |b| b as f64);
-            let binomial = (ln_gamma(c + 1.0) - ln_gamma(k as f64 + 1.0) - ln_gamma(c - k as f64 + 1.0)) / std::f64::consts::LN_2;
-            bits += omega + binomial;
+            bits += omega + (ln_gamma(c + 1.0) - ln_gamma(k as f64 + 1.0) - ln_gamma(c - k as f64 + 1.0)) / std::f64::consts::LN_2;
         }
     }
-    json!({"l0": l0 / rows, "kl": kl.sum() / rows, "bits": bits / rows})
+    (l0, kl.sum(), bits)
 }
 
 fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
-    let usage = "mpd_pieces_masked_2951 EXPORT_DIR PIECES_DIR OUT.json OBSERVATIONS SEQUENCES {fit|wsvd} [CONTEXT]";
+    let usage = "mpd_pieces_masked_2951 EXPORT_DIR PIECES_DIR OUT.json OBSERVATIONS {fit|wsvd} TRAIN EVAL [CONTEXT]";
     let export = PathBuf::from(args.get(1).ok_or(usage)?);
     let pieces_dir = PathBuf::from(args.get(2).ok_or(usage)?);
     let out = PathBuf::from(args.get(3).ok_or(usage)?);
     let observations: f64 = args.get(4).ok_or(usage)?.parse().map_err(|e| format!("OBSERVATIONS: {e}"))?;
-    let sequences: usize = args.get(5).ok_or(usage)?.parse().map_err(|e| format!("SEQUENCES: {e}"))?;
-    let start = args.get(6).ok_or(usage)?.clone();
-    let context: usize = args.get(7).map_or(Ok(512), |v| v.parse()).map_err(|e| format!("CONTEXT: {e}"))?;
-    let imported = import_language_model(&export, 2 * sequences, context)?;
+    let start = args.get(5).ok_or(usage)?.clone();
+    let train: usize = args.get(6).ok_or(usage)?.parse().map_err(|e| format!("TRAIN: {e}"))?;
+    let eval: usize = args.get(7).ok_or(usage)?.parse().map_err(|e| format!("EVAL: {e}"))?;
+    let context: usize = args.get(8).map_or(Ok(512), |v| v.parse()).map_err(|e| format!("CONTEXT: {e}"))?;
+    let imported = import_language_model(&export, train + eval, context)?;
     let model = &imported.program;
     let family = &imported.contract.family;
-    let fit_rows: Vec<usize> = (0..sequences * context).collect();
-    let eval_rows: Vec<usize> = (sequences * context..2 * sequences * context).collect();
-    let (fit, eval) = (family.select(&fit_rows), family.select(&eval_rows));
-    let target_of = |inputs: &gam_mpd::operator_program::FamilyInputs| -> Result<Array2<f64>, String> {
+    let sequence = |s: usize| -> FamilyInputs { family.select(&(s * context..(s + 1) * context).collect::<Vec<_>>()) };
+    let target_of = |inputs: &FamilyInputs| -> Result<Array2<f64>, String> {
         Ok(model.execute(inputs, false).map_err(|e| e.to_string())?.values[model.output].clone())
     };
-    let (fit_target, eval_target) = (target_of(&fit)?, target_of(&eval)?);
-    let all = sites(model);
     let mut chosen = Vec::new();
     let mut libraries = Vec::new();
     let mut weights: Vec<Array1<f64>> = Vec::new();
-    for site in all {
+    for site in sites(model) {
         let Some(name) = vpd_name(&site.name) else { continue };
         let w = matrix(model, &site)?;
         let (d_out, d_in) = w.dim();
@@ -110,79 +112,95 @@ fn main() -> Result<(), String> {
             }
             other => return Err(format!("unknown start {other}; {usage}")),
         };
-        let pieces = v.nrows();
         let error = (&v.t().dot(&u).t() - &w).iter().fold(0.0_f64, |m, x| m.max(x.abs()));
         let largest = w.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
         if error > 1e-6 * largest {
             return Err(format!("{name}: the starting library is not the site ({error:e} against {largest:e})"));
         }
         // Each piece's second-order weight `uᵀ B u` in the global Fisher.
-        weights.push((&u.dot(&fisher) * &u).sum_axis(ndarray::Axis(1)));
-        eprintln!("{} = {name}: {d_out}×{d_in}, {pieces} pieces", site.name);
+        weights.push((&u.dot(&fisher) * &u).sum_axis(Axis(1)));
+        eprintln!("{} = {name}: {d_out}×{d_in}, {} pieces", site.name, v.nrows());
         chosen.push(site);
         libraries.push(Library { v, u, mean });
     }
-    let total_pieces: usize = libraries.iter().map(|l| l.v.nrows()).sum();
     let original_sites = chosen.clone();
     let mut masked = Masked::build(model, chosen, libraries)?;
     let samples = 2;
-    // Every input starts with the pieces whose own second-order KL bits, `n a² uᵀBu / (2 ln 2)`
-    // with `a = v · (x − μ)` on the model's clean forward, exceed the uniform listing cost.
-    let uniform = (total_pieces as f64).log2();
-    let start_masks = |inputs: &gam_mpd::operator_program::FamilyInputs, libraries: &[Library]| -> Result<Vec<Array2<f64>>, String> {
+    // The firing counts of every set selected so far, and the costs they give.
+    let mut counts: Vec<Array1<f64>> = masked.libraries.iter().map(|l| Array1::zeros(l.v.nrows())).collect();
+    // A sequence's start: the pieces whose own second-order KL bits, `n a² uᵀBu / (2 ln 2)` with
+    // `a = v · (x − μ)` on the clean forward, exceed their current listing cost.
+    let start_masks = |inputs: &FamilyInputs, libraries: &[Library], costs: &[Array1<f64>]| -> Result<Vec<Array2<f64>>, String> {
         let trace = model.execute(inputs, false).map_err(|e| e.to_string())?;
+        let scale = observations / (2.0 * std::f64::consts::LN_2);
         let mut masks = Vec::new();
         for (k, library) in libraries.iter().enumerate() {
-            let original = &original_sites[k];
-            let x = gam_mpd::masked::read_values(&trace, original)? - &library.mean;
+            let x = read_values(&trace, &original_sites[k])? - &library.mean;
             let a = x.dot(&library.v.t());
-            let scale = observations / (2.0 * std::f64::consts::LN_2);
-            masks.push(Array2::from_shape_fn(a.dim(), |(r, c)| if scale * a[[r, c]] * a[[r, c]] * weights[k][c] > uniform { 1.0 } else { 0.0 }));
+            masks.push(Array2::from_shape_fn(a.dim(), |(r, c)| if scale * a[[r, c]] * a[[r, c]] * weights[k][c] > costs[k][c] { 1.0 } else { 0.0 }));
         }
         Ok(masks)
     };
-    let mut fit_masks = start_masks(&fit, &masked.libraries)?;
-    let mut eval_masks = start_masks(&eval, &masked.libraries)?;
-    let mut costs = listing_costs(&fit_masks);
-    let mut history = Vec::new();
+    let mut running = Running::default();
+    let mut points = Vec::new();
     let mut previous = f64::INFINITY;
-    for iteration in 0.. {
-        let started = std::time::Instant::now();
-        let (masks, selected_kl) = select(&masked, &fit, &fit_target, fit_masks, &costs, observations, samples)?;
-        log::info!("selection: KL {:.4} per input, {}", selected_kl.sum() / fit.rows as f64, report(&masks, &selected_kl));
-        fit_masks = masks;
-        costs = listing_costs(&fit_masks);
-        // One step of the pieces, then the selection again from where it stands: alternating
-        // minimisation, stopped when an iteration saves less than a bit per input.
-        let steps = usize::from(
-            step_pieces(&mut masked, &fit, &fit_target, &fit_masks, samples, 0xF00D + iteration as u64)?
-                .inspect(|(before, after)| log::info!("pieces step: KL {:.4} -> {:.4} per input", before / fit.rows as f64, after / fit.rows as f64))
-                .is_some(),
-        );
-        let fit_kl = {
-            let family = masked.family(&fit, &fit_masks);
-            gam_mpd::masked::forward(&masked, &family, &fit_target)?.0
-        };
-        let total = (listing_bits(&fit_masks, &costs).sum() + fit_kl.sum() * observations / std::f64::consts::LN_2) / fit.rows as f64;
-        // The eval inputs, selected with the fit's costs from where their last selection stands.
-        let (masks, eval_kl) = select(&masked, &eval, &eval_target, eval_masks, &costs, observations, samples)?;
-        eval_masks = masks;
-        let point = json!({
-            "iteration": iteration,
-            "fit": report(&fit_masks, &fit_kl),
-            "eval": report(&eval_masks, &eval_kl),
-            "fit_code_bits_per_input": total,
-            "pieces_steps": steps,
-            "seconds": started.elapsed().as_secs_f64(),
-        });
-        eprintln!("{point}");
-        history.push(point);
-        std::fs::write(&out, serde_json::to_string_pretty(&json!({"observations": observations, "iterations": history})).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-        if previous - total < 1.0 {
+    let report_every = (train / 4).max(1);
+    for pass in 0.. {
+        let mut pass_code = 0.0;
+        for s in 0..train {
+            let started = std::time::Instant::now();
+            let inputs = sequence(s);
+            let target = target_of(&inputs)?;
+            let costs = costs_from_counts(&counts);
+            let begin = start_masks(&inputs, &masked.libraries, &costs)?;
+            let (masks, kl) = select(&masked, &inputs, &target, begin, &costs, observations, samples)?;
+            pass_code += (listing_bits(&masks, &costs).sum() + kl.sum() * observations / std::f64::consts::LN_2) / inputs.rows as f64;
+            for (count, m) in counts.iter_mut().zip(&masks) {
+                *count += &m.sum_axis(Axis(0));
+            }
+            let step = step_pieces(&mut masked, &inputs, &target, &masks, samples, 0xF00D + (pass * train + s) as u64, &mut running)?;
+            let (l0, kl_sum, _) = sums(&masks, &kl);
+            log::info!(
+                "pass {pass} sequence {s}: L0 {:.1}, KL {:.4} per token; step {:?}; {:.0}s",
+                l0 / inputs.rows as f64,
+                kl_sum / inputs.rows as f64,
+                step.map(|(b, a)| (b / inputs.rows as f64, a / inputs.rows as f64)),
+                started.elapsed().as_secs_f64()
+            );
+            // Four times a pass a progress point on the first four eval sequences; at the pass's
+            // end the full eval set.
+            let last = s + 1 == train;
+            if last || (s + 1) % report_every == 0 {
+                let costs = costs_from_counts(&counts);
+                let evaluated = if last { eval } else { eval.min(4) };
+                let (mut l0, mut kl, mut bits, mut tokens) = (0.0, 0.0, 0.0, 0.0);
+                for e in 0..evaluated {
+                    let inputs = sequence(train + e);
+                    let target = target_of(&inputs)?;
+                    let begin = start_masks(&inputs, &masked.libraries, &costs)?;
+                    let (masks, values) = select(&masked, &inputs, &target, begin, &costs, observations, samples)?;
+                    let (a, b, c) = sums(&masks, &values);
+                    l0 += a;
+                    kl += b;
+                    bits += c;
+                    tokens += inputs.rows as f64;
+                }
+                let point = json!({
+                    "l0": l0 / tokens, "kl": kl / tokens, "bits": bits / tokens,
+                    "pass": pass, "sequences_trained": pass * train + s + 1, "observations": observations,
+                    "eval_sequences": evaluated,
+                });
+                eprintln!("eval {point}");
+                points.push(point);
+                std::fs::write(&out, serde_json::to_string_pretty(&json!({"points": points})).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+            }
+        }
+        let code = pass_code / train as f64;
+        log::info!("pass {pass}: {code:.1} bits per token");
+        if previous - code < 1.0 {
             break;
         }
-        previous = total;
+        previous = code;
     }
     Ok(())
 }

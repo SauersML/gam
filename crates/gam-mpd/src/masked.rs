@@ -453,9 +453,13 @@ pub fn fisher(
 
 /// Each piece's listing bits at its firing frequency in `masks` (half a count each added).
 pub fn listing_costs(masks: &[Array2<f64>]) -> Vec<Array1<f64>> {
-    let counts: Vec<Array1<f64>> = masks.iter().map(|m| m.sum_axis(Axis(0)) + 0.5).collect();
-    let total: f64 = counts.iter().map(|c| c.sum()).sum();
-    counts.iter().map(|c| c.mapv(|x| (total / x).log2())).collect()
+    costs_from_counts(&masks.iter().map(|m| m.sum_axis(Axis(0))).collect::<Vec<_>>())
+}
+
+/// Each piece's listing bits from its firing counts (half a count each added).
+pub fn costs_from_counts(counts: &[Array1<f64>]) -> Vec<Array1<f64>> {
+    let total: f64 = counts.iter().map(|c| c.sum() + 0.5 * c.len() as f64).sum();
+    counts.iter().map(|c| c.mapv(|x| (total / (x + 0.5)).log2())).collect()
 }
 
 /// The listing bits of each input's sets (over every site at once).
@@ -537,11 +541,13 @@ pub fn select(
         let (kl_new, _, _) = forward(masked, &family, target)?;
         let after = code(&kl_new, &listing_bits(&proposed, costs), observations);
         let mut kept = 0usize;
+        let mut saved = 0.0;
         for r in 0..rows {
             if flipped[r] == 0 {
                 continue;
             }
             if after[r] < before[r] {
+                saved += before[r] - after[r];
                 for k in 0..masks.len() {
                     masks[k].row_mut(r).assign(&proposed[k].row(r));
                 }
@@ -563,11 +569,42 @@ pub fn select(
             before.sum() / rows as f64,
             after.sum() / rows as f64
         );
-        if kept == 0 && budget.iter().all(|b| *b == 0) {
+        // Done when no input can change, or when a round saves less than a bit per input.
+        if (kept == 0 && budget.iter().all(|b| *b == 0)) || (kept > 0 && saved < rows as f64) {
             let family = masked.family(base, &masks);
             let (kl_final, _, _) = forward(masked, &family, target)?;
             return Ok((masks, kl_final));
         }
+    }
+}
+
+/// The pieces' preconditioners as running means over the inputs stepped on: per site, the read
+/// covariance and the written nodes' Fisher.
+#[derive(Clone, Debug, Default)]
+pub struct Running {
+    pub covariances: Vec<Array2<f64>>,
+    pub fishers: Vec<Array2<f64>>,
+    pub rows: f64,
+}
+
+impl Running {
+    /// Fold one batch's per-site matrices (means over its `rows` inputs) into the running means.
+    pub fn absorb(&mut self, covariances: Vec<Array2<f64>>, fishers: Vec<Array2<f64>>, rows: f64) {
+        if self.rows == 0.0 {
+            self.covariances = covariances;
+            self.fishers = fishers;
+            self.rows = rows;
+            return;
+        }
+        let total = self.rows + rows;
+        let (old, new) = (self.rows / total, rows / total);
+        for (running, batch) in self.covariances.iter_mut().zip(covariances) {
+            *running = &*running * old + &(batch * new);
+        }
+        for (running, batch) in self.fishers.iter_mut().zip(fishers) {
+            *running = &*running * old + &(batch * new);
+        }
+        self.rows = total;
     }
 }
 
@@ -600,20 +637,34 @@ fn shrunk_inverse(m: &Array2<f64>) -> Result<Array2<f64>, String> {
 /// written Fisher (for `U`); its length is the Gauss–Newton minimiser along it, `⟨g, d⟩ / dᵀ H d`
 /// with `dᵀ H d` from one forward tangent through the masked program, halved until the exact
 /// total falls. Returns the total before and after the step, or `None` when no step lowered it.
-pub fn step_pieces(masked: &mut Masked, base: &FamilyInputs, target: &Array2<f64>, masks: &[Array2<f64>], samples: usize, seed: u64) -> Result<Option<(f64, f64)>, String> {
+pub fn step_pieces(
+    masked: &mut Masked,
+    base: &FamilyInputs,
+    target: &Array2<f64>,
+    masks: &[Array2<f64>],
+    samples: usize,
+    seed: u64,
+    running: &mut Running,
+) -> Result<Option<(f64, f64)>, String> {
     let family = masked.family(base, masks);
     let (kl_now, trace, cotangent) = forward(masked, &family, target)?;
     let total = kl_now.sum();
     let grads = gradients(masked, &family, &trace, masks, cotangent)?;
     let curvature = fisher(masked, &family, &trace, samples, seed)?;
-    let mut directions = Vec::new();
-    let mut slope = 0.0;
+    // The preconditioners are the running means over every input stepped on so far.
+    let rows = trace.values[masked.program.output].nrows() as f64;
+    let mut batch_covariances = Vec::new();
     for (k, site) in masked.sites.iter().enumerate() {
         let centred = &read_values(&trace, site)? - &masked.libraries[k].mean;
-        let covariance = fast_atb(&centred, &centred) / centred.nrows() as f64;
+        batch_covariances.push(fast_atb(&centred, &centred) / rows);
+    }
+    running.absorb(batch_covariances, curvature.iter().map(|(_, f)| f.clone()).collect(), rows);
+    let mut directions = Vec::new();
+    let mut slope = 0.0;
+    for k in 0..masked.sites.len() {
         let (_, v_gradient, u_gradient) = &grads[k];
-        let dv = v_gradient.dot(&shrunk_inverse(&covariance)?);
-        let du = u_gradient.dot(&shrunk_inverse(&curvature[k].1)?);
+        let dv = v_gradient.dot(&shrunk_inverse(&running.covariances[k])?);
+        let du = u_gradient.dot(&shrunk_inverse(&running.fishers[k])?);
         slope += (v_gradient * &dv).sum() + (u_gradient * &du).sum();
         directions.push((dv, du));
     }

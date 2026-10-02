@@ -117,7 +117,8 @@ fn a_step_of_the_pieces_lowers_the_masked_kl() {
     let masks = vec![Array2::from_shape_fn((family.rows, pieces), |(r, c)| if (r + c) % 3 == 0 { 0.0 } else { 1.0 })];
     let fam = masked.family(&family, &masks);
     let before = forward(&masked, &fam, &target).expect("forward").0.sum();
-    assert!(step_pieces(&mut masked, &family, &target, &masks, 4, 7).expect("steps").is_some());
+    let mut running = super::masked::Running::default();
+    assert!(step_pieces(&mut masked, &family, &target, &masks, 4, 7, &mut running).expect("steps").is_some());
     let after = forward(&masked, &fam, &target).expect("forward").0.sum();
     assert!(after < before, "{after} against {before}");
 }
