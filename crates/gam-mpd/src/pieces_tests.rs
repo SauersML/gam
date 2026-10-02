@@ -1,9 +1,9 @@
 #![cfg(test)]
-//! Per-input pieces on inputs that each lie along one of a few directions: the fitted library is
-//! the map exactly, and each input lists about one piece.
+//! The Fisher-whitened singular pieces of a map are the map exactly, and are orthogonal in the
+//! whitened metric.
 
-use super::pieces::{Site, fit, sets};
-use ndarray::{Array1, Array2};
+use super::pieces::{Site, fisher_svd};
+use ndarray::{Array1, Array2, Axis};
 
 fn noise(seed: usize) -> f64 {
     let mut x = (seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
@@ -13,32 +13,29 @@ fn noise(seed: usize) -> f64 {
     (x >> 11) as f64 / (1u64 << 52) as f64 - 1.0
 }
 
-const D: usize = 8;
-const DIRECTIONS: usize = 4;
-
-/// `count` inputs, input `t` along direction `t mod 4` with a scale of size in `[1, 2]` and either
-/// sign, so every direction is a line through the mean.
-fn inputs(count: usize, salt: usize) -> Array2<f64> {
-    let directions = Array2::from_shape_fn((DIRECTIONS, D), |(k, i)| noise(10 + 7 * k + i));
-    Array2::from_shape_fn((count, D), |(t, i)| {
-        let size = 1.5 + 0.5 * noise(salt + 3 * t);
-        let sign = if (t / DIRECTIONS) % 2 == 0 { 1.0 } else { -1.0 };
-        sign * size * directions[[t % DIRECTIONS, i]]
-    })
-}
+const D_IN: usize = 8;
+const D_OUT: usize = 6;
 
 #[test]
-fn inputs_along_few_directions_each_list_about_one_piece() {
-    let x = inputs(400, 1000);
-    let w = Array2::from_shape_fn((D, D), |(i, j)| noise(500 + D * i + j));
-    let mean = x.mean_axis(ndarray::Axis(0)).expect("rows");
-    let second_moment = x.t().dot(&x) / x.nrows() as f64;
-    let fisher = Array2::eye(D);
-    let site = Site { w: w.clone(), second_moment, mean: Array1::from(mean), fisher };
-    let (library, whitened) = fit(&site, &x, 1.0e4).expect("fits");
+fn the_fisher_svd_library_is_the_map_and_whitened_orthogonal() {
+    let x = Array2::from_shape_fn((200, D_IN), |(t, i)| noise(10 + D_IN * t + i) + 0.3);
+    let w = Array2::from_shape_fn((D_OUT, D_IN), |(i, j)| noise(500 + D_IN * i + j));
+    let g = Array2::from_shape_fn((300, D_OUT), |(t, i)| noise(9000 + D_OUT * t + i));
+    let mean: Array1<f64> = x.mean_axis(Axis(0)).expect("rows");
+    let site = Site { w: w.clone(), second_moment: x.t().dot(&x) / x.nrows() as f64, mean: mean.clone(), fisher: g.t().dot(&g) / g.nrows() as f64 };
+    let library = fisher_svd(&site).expect("library");
     assert!(library.exactness(&w) < 1e-9, "{}", library.exactness(&w));
-    let fresh = inputs(200, 9000);
-    let chosen = sets(&library, &whitened, &fresh, 1.0e4);
-    let mean_active = chosen.iter().map(Vec::len).sum::<usize>() as f64 / chosen.len() as f64;
-    assert!(mean_active <= 1.5, "{mean_active} pieces per input; history {:?}", library.history);
+    // Pieces' contributions are orthogonal in the Fisher metric over the centred inputs: the
+    // cost of dropping a set is the sum of the pieces' own costs.
+    let a = (&x - &mean).dot(&library.v);
+    let fu = library.u.dot(&site.fisher).dot(&library.u.t());
+    let gram = a.t().dot(&a) / x.nrows() as f64 * &fu;
+    let largest = gram.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    for i in 0..gram.nrows() {
+        for j in 0..gram.ncols() {
+            if i != j {
+                assert!(gram[[i, j]].abs() <= 1e-8 * largest, "({i}, {j}): {} against {largest}", gram[[i, j]]);
+            }
+        }
+    }
 }

@@ -1,14 +1,15 @@
 //! Per-input pieces of a language model trained through its own masked forward, on streamed
 //! sequences (#2951).
 //!
-//! `mpd_pieces_masked_2951 EXPORT_DIR PIECES_DIR OUT.json OBSERVATIONS {fit|wsvd|wsvd2} TRAIN EVAL [CONTEXT] [GPU]`
+//! `mpd_pieces_masked_2951 EXPORT_DIR OUT.json OBSERVATIONS {wsvd|wsvd2} TRAIN EVAL [CONTEXT] [GPU]`
 //!
 //! `EXPORT_DIR` is a language-model export (`gam_mpd::import::import_language_model`) whose first
 //! `TRAIN` token rows train the pieces and whose next `EVAL` rows evaluate them, `CONTEXT`
 //! positions each (default 512). `GPU` (`off`, `auto` (default) or `required`) is the policy for the
-//! proposal products (`gam_mpd::device`); every acceptance runs in float64 on the CPU. `PIECES_DIR` holds `bench/mpd_pieces_2951.py dump`'s site
-//! statistics and, for `fit`, the starting libraries of `mpd_pieces_2951` (VPD naming,
-//! `h.{l}.attn.q_proj` and so on); `wsvd` starts from each site's exact Fisher-whitened singular
+//! proposal products (`gam_mpd::device`); every acceptance runs in float64 on the CPU. The sites are
+//! the model's hidden-to-hidden maps (`gam_mpd::masked::sites`); their read moments and output
+//! Fishers are measured on the training sequences (`gam_mpd::masked::site_statistics`), so any
+//! imported model runs as it is. `wsvd` starts from each site's exact Fisher-whitened singular
 //! pieces (`gam_mpd::pieces::fisher_svd`), and `wsvd2` grows those to twice as many on the first
 //! training sequence (`gam_mpd::masked::split`).
 //!
@@ -21,11 +22,14 @@
 //! pass's end all of them, are selected one at a time with the current costs, and their mean active
 //! pieces (L0), KL and bits per token in the
 //! per-token frontier's code (per site `ω(k + 1) + log₂ C(C, k)`) are appended to `OUT.json` as
-//! `{points: [{l0, bits, kl, …}]}`. Passes repeat until one saves less than a bit per token.
+//! `{points: [{l0, bits, kl, …}]}`; a full eval also writes its selected sets as CSR
+//! (`OUT.pass{P}.{indptr,indices,offsets}.npy`, pieces numbered site after site) and each eval
+//! token's KL (`OUT.pass{P}.kl.npy`, float64, rows in order). Passes repeat until one saves less
+//! than a bit per token.
 
 use gam_mpd::codec::prefix_integer_len_bits;
 use gam_mpd::import::import_language_model;
-use gam_mpd::masked::{Context, Library, Masked, Running, matrix, previous_inputs, read_values, select, sites, split, step_pieces};
+use gam_mpd::masked::{Context, Library, Masked, Running, previous_inputs, read_values, select, site_statistics, sites, split, step_pieces};
 use gam_mpd::operator_program::FamilyInputs;
 use gam_mpd::pieces::fisher_svd;
 use ndarray::{Array1, Array2, Axis};
@@ -33,35 +37,10 @@ use serde_json::json;
 use statrs::function::gamma::ln_gamma;
 use std::path::{Path, PathBuf};
 
-fn read_f64(path: &Path, rows: usize, cols: usize) -> Result<Array2<f64>, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if bytes.len() != rows * cols * 8 {
-        return Err(format!("{}: {} bytes for {rows}×{cols}", path.display(), bytes.len()));
-    }
-    let values = bytes.chunks_exact(8).map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])).collect();
-    Array2::from_shape_vec((rows, cols), values).map_err(|e| e.to_string())
-}
-
-/// The VPD name of a site of the imported program (`blocks.{l}.q` → `h.{l}.attn.q_proj`).
-fn vpd_name(site: &str) -> Option<String> {
-    let rest = site.strip_prefix("blocks.")?;
-    let (layer, kind) = rest.split_once('.')?;
-    let full = match kind {
-        "q" => "attn.q_proj",
-        "k" => "attn.k_proj",
-        "v" => "attn.v_proj",
-        "o" => "attn.o_proj",
-        "c_fc" => "mlp.c_fc",
-        "down_proj" => "mlp.down_proj",
-        _ => return None,
-    };
-    Some(format!("h.{layer}.{full}"))
-}
-
 /// Sums over a sequence's tokens: active pieces, KL, frontier bits.
-/// A one-dimensional little-endian int64 `.npy` file.
-fn write_npy(path: &Path, values: &[i64]) -> Result<(), String> {
-    let mut header = format!("{{'descr': '<i8', 'fortran_order': False, 'shape': ({},), }}", values.len());
+/// A one-dimensional little-endian `.npy` file of 8-byte values of type `descr`.
+fn write_npy(path: &Path, descr: &str, values: impl ExactSizeIterator<Item = [u8; 8]>) -> Result<(), String> {
+    let mut header = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': ({},), }}", values.len());
     while (10 + header.len() + 1) % 64 != 0 {
         header.push(' ');
     }
@@ -70,7 +49,7 @@ fn write_npy(path: &Path, values: &[i64]) -> Result<(), String> {
     bytes.extend_from_slice(&(header.len() as u16).to_le_bytes());
     bytes.extend_from_slice(header.as_bytes());
     for v in values {
-        bytes.extend_from_slice(&v.to_le_bytes());
+        bytes.extend_from_slice(&v);
     }
     std::fs::write(path, bytes).map_err(|e| e.to_string())
 }
@@ -93,16 +72,18 @@ fn sums(masks: &[Array2<f64>], kl: &Array1<f64>) -> (f64, f64, f64) {
 fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
-    let usage = "mpd_pieces_masked_2951 EXPORT_DIR PIECES_DIR OUT.json OBSERVATIONS {fit|wsvd|wsvd2} TRAIN EVAL [CONTEXT] [GPU]";
+    let usage = "mpd_pieces_masked_2951 EXPORT_DIR OUT.json OBSERVATIONS {wsvd|wsvd2} TRAIN EVAL [CONTEXT] [GPU]";
     let export = PathBuf::from(args.get(1).ok_or(usage)?);
-    let pieces_dir = PathBuf::from(args.get(2).ok_or(usage)?);
-    let out = PathBuf::from(args.get(3).ok_or(usage)?);
-    let observations: f64 = args.get(4).ok_or(usage)?.parse().map_err(|e| format!("OBSERVATIONS: {e}"))?;
-    let start = args.get(5).ok_or(usage)?.clone();
-    let train: usize = args.get(6).ok_or(usage)?.parse().map_err(|e| format!("TRAIN: {e}"))?;
-    let eval: usize = args.get(7).ok_or(usage)?.parse().map_err(|e| format!("EVAL: {e}"))?;
-    let context: usize = args.get(8).map_or(Ok(512), |v| v.parse()).map_err(|e| format!("CONTEXT: {e}"))?;
-    let gpu = args.get(9).map_or("auto", String::as_str);
+    let out = PathBuf::from(args.get(2).ok_or(usage)?);
+    let observations: f64 = args.get(3).ok_or(usage)?.parse().map_err(|e| format!("OBSERVATIONS: {e}"))?;
+    let start = args.get(4).ok_or(usage)?.clone();
+    if start != "wsvd" && start != "wsvd2" {
+        return Err(format!("unknown start {start}; {usage}"));
+    }
+    let train: usize = args.get(5).ok_or(usage)?.parse().map_err(|e| format!("TRAIN: {e}"))?;
+    let eval: usize = args.get(6).ok_or(usage)?.parse().map_err(|e| format!("EVAL: {e}"))?;
+    let context: usize = args.get(7).map_or(Ok(512), |v| v.parse()).map_err(|e| format!("CONTEXT: {e}"))?;
+    let gpu = args.get(8).map_or("auto", String::as_str);
     gam_gpu::configure_global_policy(gam_gpu::GpuPolicy::parse(gpu).ok_or_else(|| format!("GPU {gpu}: expected off, auto or required"))?);
     let imported = import_language_model(&export, train + eval, context)?;
     let model = &imported.program;
@@ -112,36 +93,21 @@ fn main() -> Result<(), String> {
     let target_of = |inputs: &FamilyInputs| -> Result<Array2<f64>, String> {
         Ok(model.execute(inputs, false).map_err(|e| e.to_string())?.values[model.output].clone())
     };
-    let mut chosen = Vec::new();
+    let chosen = sites(model);
+    let statistics = site_statistics(model, &chosen, (0..train).map(sequence), 2, 0x5EED)?;
     let mut libraries = Vec::new();
     let mut fishers: Vec<Array2<f64>> = Vec::new();
-    for site in sites(model) {
-        let Some(name) = vpd_name(&site.name) else { continue };
-        let w = matrix(model, &site)?;
-        let (d_out, d_in) = w.dim();
-        let mean = Array1::from_vec(read_f64(&pieces_dir.join(format!("{name}.mu.f64")), 1, d_in)?.into_raw_vec_and_offset().0);
-        let fisher = read_f64(&pieces_dir.join(format!("{name}.B.f64")), d_out, d_out)?;
-        let (v, u) = match start.as_str() {
-            "wsvd" | "wsvd2" => {
-                let second_moment = read_f64(&pieces_dir.join(format!("{name}.A.f64")), d_in, d_in)?;
-                let library = fisher_svd(&gam_mpd::pieces::Site { w: w.clone(), second_moment, mean: mean.clone(), fisher: fisher.clone() })?;
-                (library.v.t().to_owned(), library.u)
-            }
-            "fit" => {
-                let count = std::fs::read(pieces_dir.join(format!("{name}.V.f64"))).map_err(|e| format!("{name}: {e}"))?.len() / 8 / d_in;
-                (read_f64(&pieces_dir.join(format!("{name}.V.f64")), d_in, count)?.t().to_owned(), read_f64(&pieces_dir.join(format!("{name}.U.f64")), count, d_out)?)
-            }
-            other => return Err(format!("unknown start {other}; {usage}")),
-        };
-        let error = (&v.t().dot(&u).t() - &w).iter().fold(0.0_f64, |m, x| m.max(x.abs()));
-        let largest = w.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+    for (site, measured) in chosen.iter().zip(statistics) {
+        let library = fisher_svd(&measured)?;
+        let (v, u) = (library.v.t().to_owned(), library.u);
+        let error = (&v.t().dot(&u).t() - &measured.w).iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+        let largest = measured.w.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
         if error > 1e-6 * largest {
-            return Err(format!("{name}: the starting library is not the site ({error:e} against {largest:e})"));
+            return Err(format!("{}: the starting library is not the site ({error:e} against {largest:e})", site.name));
         }
-        fishers.push(fisher);
-        eprintln!("{} = {name}: {d_out}×{d_in}, {} pieces", site.name, v.nrows());
-        chosen.push(site);
-        libraries.push(Library { v, u, mean });
+        eprintln!("{}: {}×{}, {} pieces", site.name, measured.w.nrows(), measured.w.ncols(), v.nrows());
+        fishers.push(measured.fisher);
+        libraries.push(Library { v, u, mean: measured.mean });
     }
     let original_sites = chosen.clone();
     let mut masked = Masked::build(model, chosen, libraries)?;
@@ -297,6 +263,7 @@ fn main() -> Result<(), String> {
                 // order), so other context codes can score exactly these sets.
                 let mut indptr: Vec<i64> = vec![0];
                 let mut indices: Vec<i64> = Vec::new();
+                let mut token_kl: Vec<f64> = Vec::new();
                 for e in 0..evaluated {
                     let inputs = sequence(train + e);
                     let target = target_of(&inputs)?;
@@ -305,6 +272,7 @@ fn main() -> Result<(), String> {
                     let (masks, values) = select(&masked, &inputs, &target, begin, &coder, observations, samples)?;
                     explanation += coder.bits(&masks).sum();
                     if last {
+                        token_kl.extend(values.iter().copied());
                         for r in 0..inputs.rows {
                             let mut offset = 0;
                             for m in &masks {
@@ -327,8 +295,9 @@ fn main() -> Result<(), String> {
                     }
                     let stem = out.with_extension("");
                     for (name, values) in [("indptr", &indptr), ("indices", &indices), ("offsets", &offsets)] {
-                        write_npy(&PathBuf::from(format!("{}.pass{pass}.{name}.npy", stem.display())), values)?;
+                        write_npy(&PathBuf::from(format!("{}.pass{pass}.{name}.npy", stem.display())), "<i8", values.iter().map(|v| v.to_le_bytes()))?;
                     }
+                    write_npy(&PathBuf::from(format!("{}.pass{pass}.kl.npy", stem.display())), "<f8", token_kl.iter().map(|v| v.to_le_bytes()))?;
                 }
                 let point = json!({
                     "l0": l0 / tokens, "kl": kl / tokens, "bits": bits / tokens,

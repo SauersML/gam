@@ -237,3 +237,23 @@ fn pieces_grown_from_what_selection_leaves_out_recover_its_kl() {
     let (after, _, _) = forward(&bigger, &bigger.family(&family, &on), &target).expect("forward");
     assert!(after.sum() < before.sum(), "{} against {}", after.sum(), before.sum());
 }
+
+#[test]
+fn sites_are_the_hidden_maps_and_their_statistics_build_an_exact_library() {
+    use super::masked::site_statistics;
+    use super::pieces::fisher_svd;
+    let (program, family) = model();
+    // The embedding `E` reads tokens and `W_out` writes token logits: only `W_in` is a site.
+    let all = sites(&program);
+    assert_eq!(all.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["W_in"]);
+    let half = family.rows / 2;
+    let batches = [family.select(&(0..half).collect::<Vec<_>>()), family.select(&(half..family.rows).collect::<Vec<_>>())];
+    let measured = site_statistics(&program, &all, batches, 4, 3).expect("statistics");
+    let trace = program.execute(&family, false).expect("executes");
+    let x = super::masked::read_values(&trace, &all[0]).expect("reads");
+    let mean = x.mean_axis(ndarray::Axis(0)).expect("rows");
+    assert!((&measured[0].mean - &mean).iter().all(|d| d.abs() < 1e-12));
+    assert!(measured[0].fisher.diag().iter().all(|f| *f >= 0.0) && measured[0].fisher.diag().sum() > 0.0);
+    let library = fisher_svd(&measured[0]).expect("library");
+    assert!(library.exactness(&measured[0].w) < 1e-9, "{}", library.exactness(&measured[0].w));
+}

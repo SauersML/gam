@@ -55,9 +55,11 @@ fn stem(name: &str) -> String {
     name.trim_end_matches(|c: char| c.is_ascii_digit()).to_string()
 }
 
-/// The sites of `program`: its dense, fully present operators that are only affine terms, grouped
+/// The sites of `program`: its dense, fully present operators that are only affine terms between
+/// hidden interfaces (neither side token-labelled, so not an embedding or an unembedding), grouped
 /// by name up to a trailing index.
 pub fn sites(program: &OperatorProgram) -> Vec<Site> {
+    let tokens = |interface: &Interface| interface.groups().iter().any(|g| g.label.kind == LabelKind::Token);
     let mut only_terms = vec![true; program.operators.len()];
     for node in &program.nodes {
         match node {
@@ -76,7 +78,7 @@ pub fn sites(program: &OperatorProgram) -> Vec<Site> {
         for (argument, op) in terms {
             let operator = &program.operators[*op];
             let dense = matches!(&operator.body, OperatorBody::Dense { present, .. } if present.iter().all(|k| *k));
-            if !dense || !only_terms[*op] {
+            if !dense || !only_terms[*op] || tokens(&operator.rows) || tokens(&operator.cols) {
                 continue;
             }
             let site = groups
@@ -406,6 +408,78 @@ impl XorShift {
     }
 }
 
+/// The cotangent of `−log q_y` at the logits, `q − e_y`, with each row's label `y` drawn from the
+/// row's own distribution `q`: its outer product is an unbiased sample of the output Fisher.
+fn sampled_cotangent(logits: &Array2<f64>, rng: &mut XorShift) -> Array2<f64> {
+    let mut cotangent = Array2::<f64>::zeros(logits.dim());
+    for r in 0..logits.nrows() {
+        let q = softmax(logits.row(r));
+        let mut pick = rng.next();
+        let mut label = q.len() - 1;
+        for (c, p) in q.iter().enumerate() {
+            if pick < *p {
+                label = c;
+                break;
+            }
+            pick -= p;
+        }
+        for c in 0..q.len() {
+            cotangent[[r, c]] = q[c] - if c == label { 1.0 } else { 0.0 };
+        }
+    }
+    cotangent
+}
+
+/// What a site's Fisher-SVD library is built from (`pieces::fisher_svd`), measured on the native
+/// program over `batches` of inputs: the map `W`, the reads' mean and second moment `E[x xᵀ]`, and
+/// the output Fisher `E[g gᵀ]` of the written value, `g` the gradient of `−log q_y` with `y` drawn
+/// from the program's own output, `samples` draws per input. Any model's sites, no external dump.
+pub fn site_statistics(
+    program: &OperatorProgram,
+    sites: &[Site],
+    batches: impl IntoIterator<Item = FamilyInputs>,
+    samples: usize,
+    seed: u64,
+) -> Result<Vec<super::pieces::Site>, String> {
+    let mut rng = XorShift(seed | 1);
+    let mut stats: Vec<(Array1<f64>, Array2<f64>, Array2<f64>)> = Vec::new();
+    let maps: Vec<Array2<f64>> = sites.iter().map(|site| matrix(program, site)).collect::<Result<_, _>>()?;
+    for w in &maps {
+        let (d_out, d_in) = w.dim();
+        stats.push((Array1::zeros(d_in), Array2::zeros((d_in, d_in)), Array2::zeros((d_out, d_out))));
+    }
+    let (mut rows, mut draws) = (0.0, 0.0);
+    for inputs in batches {
+        let trace = program.execute(&inputs, false).map_err(|e| e.to_string())?;
+        for (site, (sum, outer, _)) in sites.iter().zip(stats.iter_mut()) {
+            let x = read_values(&trace, site)?;
+            *sum += &x.sum_axis(Axis(0));
+            *outer += &fast_atb(&x, &x);
+        }
+        rows += inputs.rows as f64;
+        for _ in 0..samples {
+            let cotangent = sampled_cotangent(&trace.values[program.output], &mut rng);
+            let back = proposing(|| vjp(program, &inputs, &trace, cotangent)).map_err(|e| e.to_string())?;
+            for (site, (_, _, fisher)) in sites.iter().zip(stats.iter_mut()) {
+                let written: Vec<Array2<f64>> =
+                    site.writes.iter().map(|n| back[*n].clone().unwrap_or_else(|| Array2::zeros(trace.values[*n].dim()))).collect();
+                let views: Vec<_> = written.iter().map(|w| w.view()).collect();
+                let g = ndarray::concatenate(Axis(1), &views).map_err(|e| e.to_string())?;
+                *fisher += &proposing(|| product_atb(&g, &g)).map_err(|e| e.to_string())?;
+            }
+            draws += inputs.rows as f64;
+        }
+    }
+    if rows == 0.0 || draws == 0.0 {
+        return Err("site statistics need inputs and samples".to_string());
+    }
+    Ok(maps
+        .into_iter()
+        .zip(stats)
+        .map(|(w, (sum, outer, fisher))| super::pieces::Site { w, second_moment: outer / rows, mean: sum / rows, fisher: fisher / draws })
+        .collect())
+}
+
 /// The Fisher diagonal of every mask entry and the Fisher of every written node, from `samples`
 /// sampled-label reverse passes: per site `(h: rows × C, F: d_out × d_out)`.
 pub fn fisher(
@@ -429,22 +503,7 @@ pub fn fisher(
         })
         .collect();
     for _ in 0..samples {
-        let mut cotangent = Array2::<f64>::zeros(logits.dim());
-        for r in 0..logits.nrows() {
-            let q = softmax(logits.row(r));
-            let mut pick = rng.next();
-            let mut label = q.len() - 1;
-            for (c, p) in q.iter().enumerate() {
-                if pick < *p {
-                    label = c;
-                    break;
-                }
-                pick -= p;
-            }
-            for c in 0..q.len() {
-                cotangent[[r, c]] = q[c] - if c == label { 1.0 } else { 0.0 };
-            }
-        }
+        let cotangent = sampled_cotangent(logits, &mut rng);
         let back = proposing(|| vjp(&masked.program, family, trace, cotangent)).map_err(|e| e.to_string())?;
         for (k, (h, f)) in out.iter_mut().enumerate() {
             if let Some(c) = &back[masked.masked[k]] {
