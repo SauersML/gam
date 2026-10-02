@@ -28,14 +28,6 @@
 //! * **pieces** — the exact gradient of the total KL in every site's `V` and `U` given the masks,
 //!   preconditioned by the read covariance and the written nodes' Fisher, stepped by
 //!   backtracking on the exact total.
-//!
-//! # Behaviours
-//!
-//! A behaviour scored at some positions only (a chat model's reply to a request, say) is a
-//! [`Target`] with its scored rows: the code is over those rows alone. An unscored row adds no KL,
-//! no cotangent and no sampled label, and the selection keeps its masks as given, so the rows
-//! before a behaviour's positions can run the native map (every piece on) while they still feed
-//! it through attention.
 
 use super::derivatives::vjp;
 use super::device::{product_atb, proposing};
@@ -320,34 +312,9 @@ impl Masked {
     }
 }
 
-/// What a masked forward is scored against (module note, "Behaviours"): the model's own logits
-/// and, for a behaviour, which rows count (`None`: every row).
-#[derive(Clone, Debug)]
-pub struct Target {
-    pub logits: Array2<f64>,
-    pub scored: Option<Vec<bool>>,
-}
-
-impl Target {
-    /// Every row scored.
-    pub fn every_row(logits: Array2<f64>) -> Self {
-        Self { logits, scored: None }
-    }
-
-    /// Whether row `r` is scored.
-    pub fn scores(&self, r: usize) -> bool {
-        self.scored.as_ref().is_none_or(|s| s[r])
-    }
-
-    /// The number of scored rows.
-    pub fn scored_rows(&self) -> usize {
-        (0..self.logits.nrows()).filter(|r| self.scores(*r)).count()
-    }
-}
-
-/// `KL(p ‖ q)` per row between the target's logits and `logits` (rows × classes), and the
-/// cotangent of the total in the logits, `q − p` per row; an unscored row has zero of both.
-pub fn kl(target: &Target, logits: &Array2<f64>) -> (Array1<f64>, Array2<f64>) {
+/// `KL(p ‖ q)` per row between target logits and logits (rows × classes), and the cotangent of
+/// the total in the logits, `q − p` per row.
+pub fn kl(target: &Array2<f64>, logits: &Array2<f64>) -> (Array1<f64>, Array2<f64>) {
     use rayon::prelude::*;
     let mut cotangent = Array2::<f64>::zeros(logits.dim());
     // Rows are independent: one per worker.
@@ -356,10 +323,7 @@ pub fn kl(target: &Target, logits: &Array2<f64>) -> (Array1<f64>, Array2<f64>) {
         .into_par_iter()
         .enumerate()
         .map(|(r, mut row)| {
-            if !target.scores(r) {
-                return 0.0;
-            }
-            let (p, q) = (softmax(target.logits.row(r)), softmax(logits.row(r)));
+            let (p, q) = (softmax(target.row(r)), softmax(logits.row(r)));
             let mut total = 0.0;
             for c in 0..p.len() {
                 if p[c] > 0.0 {
@@ -381,7 +345,7 @@ fn softmax(z: ndarray::ArrayView1<'_, f64>) -> Array1<f64> {
 }
 
 /// One masked forward: per-input KL against `target`, the trace, and the KL's cotangent.
-pub fn forward(masked: &Masked, family: &FamilyInputs, target: &Target) -> Result<(Array1<f64>, Trace, Array2<f64>), String> {
+pub fn forward(masked: &Masked, family: &FamilyInputs, target: &Array2<f64>) -> Result<(Array1<f64>, Trace, Array2<f64>), String> {
     let trace = masked.program.execute(family, false).map_err(|e| e.to_string())?;
     let (values, cotangent) = kl(target, &trace.values[masked.program.output]);
     Ok((values, trace, cotangent))
@@ -432,17 +396,41 @@ fn gradients_proposed(
     Ok(out)
 }
 
-/// Per site `∂/∂m` (rows × C) of whatever `cotangent` is the gradient of at the output, from one
-/// reverse pass: what the selection ranks flips by (a proposal, as [`gradients`]), without the
-/// pieces' own gradients.
-pub fn mask_gradients(masked: &Masked, family: &FamilyInputs, trace: &Trace, cotangent: Array2<f64>) -> Result<Vec<Array2<f64>>, String> {
+/// Per site, only `∂KL/∂m` (rows × C): what selection reads, without the `V`/`U` gradients (their
+/// two `C × d` products per site are most of a reverse pass's cost and memory).
+fn mask_gradients(masked: &Masked, family: &FamilyInputs, trace: &Trace, cotangent: Array2<f64>) -> Result<Vec<Array2<f64>>, String> {
     let back = proposing(|| vjp(&masked.program, family, trace, cotangent)).map_err(|e| e.to_string())?;
     Ok((0..masked.sites.len())
         .map(|k| {
             let z = &trace.values[masked.z[k]];
-            back[masked.masked[k]].as_ref().map_or_else(|| Array2::zeros(z.dim()), |c| c * z)
+            match &back[masked.masked[k]] {
+                Some(c) => c * z,
+                None => Array2::zeros(z.dim()),
+            }
         })
         .collect())
+}
+
+/// The Fisher diagonal of every mask entry (rows × C per site) from `samples` sampled-label reverse
+/// passes, without the written nodes' Fishers (`fisher`), which selection does not read.
+fn mask_fisher(masked: &Masked, family: &FamilyInputs, trace: &Trace, samples: usize, seed: u64) -> Result<Vec<Array2<f64>>, String> {
+    let logits = &trace.values[masked.program.output];
+    let mut rng = XorShift(seed | 1);
+    let mut out: Vec<Array2<f64>> = (0..masked.sites.len()).map(|k| Array2::zeros(trace.values[masked.z[k]].dim())).collect();
+    for _ in 0..samples {
+        let cotangent = sampled_cotangent(logits, &mut rng);
+        let back = proposing(|| vjp(&masked.program, family, trace, cotangent)).map_err(|e| e.to_string())?;
+        for (k, h) in out.iter_mut().enumerate() {
+            if let Some(c) = &back[masked.masked[k]] {
+                let g = c * &trace.values[masked.z[k]];
+                *h += &(&g * &g);
+            }
+        }
+    }
+    for h in out.iter_mut() {
+        *h /= samples as f64;
+    }
+    Ok(out)
 }
 
 /// A deterministic generator for label sampling.
@@ -458,14 +446,10 @@ impl XorShift {
 }
 
 /// The cotangent of `−log q_y` at the logits, `q − e_y`, with each row's label `y` drawn from the
-/// row's own distribution `q`: its outer product is an unbiased sample of the output Fisher. Rows
-/// `scores` rejects stay zero.
-fn sampled_cotangent(logits: &Array2<f64>, rng: &mut XorShift, scores: impl Fn(usize) -> bool) -> Array2<f64> {
+/// row's own distribution `q`: its outer product is an unbiased sample of the output Fisher.
+fn sampled_cotangent(logits: &Array2<f64>, rng: &mut XorShift) -> Array2<f64> {
     let mut cotangent = Array2::<f64>::zeros(logits.dim());
     for r in 0..logits.nrows() {
-        if !scores(r) {
-            continue;
-        }
         let q = softmax(logits.row(r));
         let mut pick = rng.next();
         let mut label = q.len() - 1;
@@ -481,11 +465,6 @@ fn sampled_cotangent(logits: &Array2<f64>, rng: &mut XorShift, scores: impl Fn(u
         }
     }
     cotangent
-}
-
-/// One sampled-label cotangent of the target's scored rows (as [`fisher`] draws them), from `seed`.
-pub fn sampled_label_cotangent(logits: &Array2<f64>, target: &Target, seed: u64) -> Array2<f64> {
-    sampled_cotangent(logits, &mut XorShift(seed | 1), |r| target.scores(r))
 }
 
 /// What a site's Fisher-SVD library is built from (`pieces::fisher_svd`), measured on the native
@@ -516,7 +495,7 @@ pub fn site_statistics(
         }
         rows += inputs.rows as f64;
         for _ in 0..samples {
-            let cotangent = sampled_cotangent(&trace.values[program.output], &mut rng, |_| true);
+            let cotangent = sampled_cotangent(&trace.values[program.output], &mut rng);
             let back = proposing(|| vjp(program, &inputs, &trace, cotangent)).map_err(|e| e.to_string())?;
             for (site, (_, _, fisher)) in sites.iter().zip(stats.iter_mut()) {
                 let written: Vec<Array2<f64>> =
@@ -538,22 +517,18 @@ pub fn site_statistics(
         .collect())
 }
 
-/// The Fisher diagonal of every mask entry and, when `written`, the Fisher of every written node,
-/// from `samples` sampled-label reverse passes on the target's scored rows: per site
-/// `(h: rows × C, F: d_out × d_out)`. The selection needs only `h`; `F` (the pieces'
-/// preconditioner) can be far larger than the site.
+/// The Fisher diagonal of every mask entry and the Fisher of every written node, from `samples`
+/// sampled-label reverse passes: per site `(h: rows × C, F: d_out × d_out)`.
 pub fn fisher(
     masked: &Masked,
     family: &FamilyInputs,
     trace: &Trace,
-    target: &Target,
     samples: usize,
     seed: u64,
-    written: bool,
-) -> Result<Vec<(Array2<f64>, Option<Array2<f64>>)>, String> {
+) -> Result<Vec<(Array2<f64>, Array2<f64>)>, String> {
     let logits = &trace.values[masked.program.output];
     let mut rng = XorShift(seed | 1);
-    let mut out: Vec<(Array2<f64>, Option<Array2<f64>>)> = masked
+    let mut out: Vec<(Array2<f64>, Array2<f64>)> = masked
         .sites
         .iter()
         .enumerate()
@@ -561,18 +536,17 @@ pub fn fisher(
             let rows = trace.values[masked.z[k]].nrows();
             let pieces = masked.libraries[k].v.nrows();
             let d_out = masked.libraries[k].u.ncols();
-            (Array2::zeros((rows, pieces)), written.then(|| Array2::zeros((d_out, d_out))))
+            (Array2::zeros((rows, pieces)), Array2::zeros((d_out, d_out)))
         })
         .collect();
     for _ in 0..samples {
-        let cotangent = sampled_cotangent(logits, &mut rng, |r| target.scores(r));
+        let cotangent = sampled_cotangent(logits, &mut rng);
         let back = proposing(|| vjp(&masked.program, family, trace, cotangent)).map_err(|e| e.to_string())?;
         for (k, (h, f)) in out.iter_mut().enumerate() {
             if let Some(c) = &back[masked.masked[k]] {
                 let g = c * &trace.values[masked.z[k]];
                 *h += &(&g * &g);
             }
-            let Some(f) = f else { continue };
             let written: Vec<Array2<f64>> = masked.written[k]
                 .iter()
                 .map(|n| back[*n].clone().unwrap_or_else(|| Array2::zeros(trace.values[*n].dim())))
@@ -582,12 +556,10 @@ pub fn fisher(
             *f += &proposing(|| product_atb(&cot, &cot)).map_err(|e| e.to_string())?;
         }
     }
-    let rows = target.scored_rows().max(1) as f64;
+    let rows = logits.nrows() as f64;
     for (h, f) in out.iter_mut() {
         *h /= samples as f64;
-        if let Some(f) = f {
-            *f /= samples as f64 * rows;
-        }
+        *f /= samples as f64 * rows;
     }
     Ok(out)
 }
@@ -777,7 +749,7 @@ pub fn previous_inputs(inputs: &FamilyInputs) -> Vec<Option<usize>> {
 pub fn select(
     masked: &Masked,
     base: &FamilyInputs,
-    target: &Target,
+    target: &Array2<f64>,
     mut masks: Vec<Array2<f64>>,
     coder: &Coder,
     observations: f64,
@@ -785,57 +757,76 @@ pub fn select(
 ) -> Result<(Vec<Array2<f64>>, Array1<f64>), String> {
     let scale = observations / std::f64::consts::LN_2;
     let rows = base.rows;
-    let scored = target.scored_rows();
-    // An unscored row's masks stay as given (module note, "Behaviours").
-    let mut budget: Vec<usize> = (0..rows).map(|r| if target.scores(r) { usize::MAX } else { 0 }).collect();
+    let mut budget = vec![usize::MAX; rows];
     let mut round = 0u64;
     let started = std::time::Instant::now();
-    let mut curvature: Option<Vec<(Array2<f64>, Option<Array2<f64>>)>> = None;
+    let mut curvature: Option<Vec<Array2<f64>>> = None;
+    // What the next round may reuse exactly instead of recomputing: the current masks' forward
+    // (when the last proposal was kept whole, its forward *is* the current state's) and, when
+    // nothing was kept, also their gradients (the state did not move).
+    let mut next_forward: Option<(Array1<f64>, Trace, Array2<f64>)> = None;
+    let mut reuse: Option<(Array1<f64>, Trace, Vec<Array2<f64>>)> = None;
     loop {
         let family = masked.family(base, &masks);
-        let (kl_now, trace, cotangent) = forward(masked, &family, target)?;
-        let grads = mask_gradients(masked, &family, &trace, cotangent)?;
+        let (kl_now, trace, grads) = match reuse.take() {
+            Some(state) => state,
+            None => {
+                let (kl_now, trace, cotangent) = match next_forward.take() {
+                    Some(state) => state,
+                    None => forward(masked, &family, target)?,
+                };
+                let grads = mask_gradients(masked, &family, &trace, cotangent)?;
+                (kl_now, trace, grads)
+            }
+        };
         // The Fisher diagonal only ranks proposals (the exact forward decides), so it is measured
         // on the first round and kept: it moves slowly with the masks, and its passes dominate a
         // round's cost.
         if curvature.is_none() {
-            curvature = Some(fisher(masked, &family, &trace, target, samples, 0x5EED + round, false)?);
+            curvature = Some(mask_fisher(masked, &family, &trace, samples, 0x5EED + round)?);
         }
         let curvature = curvature.as_ref().ok_or("no curvature")?;
         let listing_now = coder.bits(&masks);
         let before = code(&kl_now, &listing_now, observations);
-        // Each input's predicted flips, best first, within its budget.
+        // Each input's predicted flips, best first, within its budget (inputs in parallel: each
+        // reads only its own row of every array).
+        let picks: Vec<Vec<(usize, usize)>> = {
+            use rayon::prelude::*;
+            (0..rows)
+                .into_par_iter()
+                .map(|r| {
+                    let fresh = coder.fresh(&masks, r);
+                    let mut candidates: Vec<(f64, usize, usize)> = Vec::new();
+                    for (k, (g, h)) in grads.iter().zip(curvature.iter()).enumerate() {
+                        let (g, h, m) = (g.row(r), h.row(r), masks[k].row(r));
+                        for c in 0..g.len() {
+                            let delta = if m[c] > 0.0 { -1.0 } else { 1.0 };
+                            let kl_change = g[c] * delta + 0.5 * h[c];
+                            let listing_change = coder.marginal(&masks, r, k, c, fresh);
+                            let net = scale * kl_change + listing_change;
+                            if net < 0.0 {
+                                candidates.push((net, k, c));
+                            }
+                        }
+                    }
+                    candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    candidates.into_iter().take(budget[r]).map(|(_, k, c)| (k, c)).collect()
+                })
+                .collect()
+        };
         let mut proposed = masks.clone();
         let mut flipped = vec![0usize; rows];
-        for r in 0..rows {
-            if budget[r] == 0 {
-                continue;
-            }
-            let fresh = coder.fresh(&masks, r);
-            let mut candidates: Vec<(f64, usize, usize)> = Vec::new();
-            for (k, (g, (h, _))) in grads.iter().zip(curvature.iter()).enumerate() {
-                for c in 0..g.ncols() {
-                    let on = masks[k][[r, c]] > 0.0;
-                    let delta = if on { -1.0 } else { 1.0 };
-                    let kl_change = g[[r, c]] * delta + 0.5 * h[[r, c]];
-                    let listing_change = coder.marginal(&masks, r, k, c, fresh);
-                    let net = scale * kl_change + listing_change;
-                    if net < 0.0 {
-                        candidates.push((net, k, c));
-                    }
-                }
-            }
-            candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
-            for &(_, k, c) in candidates.iter().take(budget[r]) {
+        for (r, pick) in picks.iter().enumerate() {
+            for &(k, c) in pick {
                 proposed[k][[r, c]] = 1.0 - proposed[k][[r, c]];
-                flipped[r] += 1;
             }
+            flipped[r] = pick.len();
         }
         if flipped.iter().all(|f| *f == 0) {
             return Ok((masks, kl_now));
         }
-        let family = masked.family(base, &proposed);
-        let (kl_new, _, _) = forward(masked, &family, target)?;
+        let proposed_family = masked.family(base, &proposed);
+        let (kl_new, trace_new, cotangent_new) = forward(masked, &proposed_family, target)?;
         let after = code(&kl_new, &coder.bits(&proposed), observations);
         let mut kept = 0usize;
         let mut saved = 0.0;
@@ -858,19 +849,28 @@ pub fn select(
             }
         }
         round += 1;
-        let per_scored = |code: &Array1<f64>| (0..rows).filter(|r| target.scores(*r)).map(|r| code[r]).sum::<f64>() / scored.max(1) as f64;
+        let tried = flipped.iter().filter(|f| **f > 0).count();
+        if kept == tried {
+            // Every proposing input kept its flips, so the masks now equal the proposal.
+            next_forward = Some((kl_new.clone(), trace_new, cotangent_new));
+        } else if kept == 0 {
+            // Nothing moved: this round's forward and gradients still describe the masks.
+            reuse = Some((kl_now.clone(), trace, grads));
+        }
         log::info!(
             "selection round {round} ({:.0}s): {} inputs flipped {} entries, {kept} kept; code {:.1} -> {:.1} bits per input",
             started.elapsed().as_secs_f64(),
             flipped.iter().filter(|f| **f > 0).count(),
             flipped.iter().sum::<usize>(),
-            per_scored(&before),
-            per_scored(&after)
+            before.sum() / rows as f64,
+            after.sum() / rows as f64
         );
-        // Done when no input can change, or when a round saves less than a bit per scored input.
-        if (kept == 0 && budget.iter().all(|b| *b == 0)) || (kept > 0 && saved < scored as f64) {
-            let family = masked.family(base, &masks);
-            let (kl_final, _, _) = forward(masked, &family, target)?;
+        // Done when no input can change, or when a round saves less than a bit per input.
+        if (kept == 0 && budget.iter().all(|b| *b == 0)) || (kept > 0 && saved < rows as f64) {
+            let kl_final = match (next_forward.take(), reuse.take()) {
+                (Some((kl, _, _)), _) | (None, Some((kl, _, _))) => kl,
+                (None, None) => forward(masked, &masked.family(base, &masks), target)?.0,
+            };
             return Ok((masks, kl_final));
         }
     }
@@ -938,7 +938,7 @@ fn shrunk_inverse(m: &Array2<f64>) -> Result<Array2<f64>, String> {
 pub fn step_pieces(
     masked: &mut Masked,
     base: &FamilyInputs,
-    target: &Target,
+    target: &Array2<f64>,
     masks: &[Array2<f64>],
     samples: usize,
     seed: u64,
@@ -948,7 +948,7 @@ pub fn step_pieces(
     let (kl_now, trace, cotangent) = forward(masked, &family, target)?;
     let total = kl_now.sum();
     let grads = gradients(masked, &family, &trace, masks, cotangent)?;
-    let curvature = fisher(masked, &family, &trace, target, samples, seed, true)?;
+    let curvature = fisher(masked, &family, &trace, samples, seed)?;
     // The preconditioners are the running means over every input stepped on so far.
     let rows = trace.values[masked.program.output].nrows() as f64;
     let mut batch_covariances = Vec::new();
@@ -956,8 +956,7 @@ pub fn step_pieces(
         let centred = &read_values(&trace, site)? - &masked.libraries[k].mean;
         batch_covariances.push(fast_atb(&centred, &centred) / rows);
     }
-    let fishers = curvature.into_iter().map(|(_, f)| f.ok_or("no written Fisher")).collect::<Result<Vec<_>, _>>()?;
-    running.absorb(batch_covariances, fishers, rows);
+    running.absorb(batch_covariances, curvature.iter().map(|(_, f)| f.clone()).collect(), rows);
     let mut directions = Vec::new();
     let mut slope = 0.0;
     for k in 0..masked.sites.len() {
@@ -985,7 +984,7 @@ pub fn step_pieces(
     let output = super::derivatives::jvp(&masked.program, &family, &trace, &tangents).map_err(|e| e.to_string())?;
     let logits = &trace.values[masked.program.output];
     let mut quadratic = 0.0;
-    for r in (0..logits.nrows()).filter(|r| target.scores(*r)) {
+    for r in 0..logits.nrows() {
         let q = softmax(logits.row(r));
         let t = output.row(r);
         let mean: f64 = q.iter().zip(t.iter()).map(|(a, b)| a * b).sum();
