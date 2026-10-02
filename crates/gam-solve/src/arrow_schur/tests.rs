@@ -1184,6 +1184,109 @@ pub(crate) fn evidence_row_at_zero_spectral_scale_deflates_every_direction_4077(
     );
 }
 
+/// #4077 — the STEP arm of the same all-zero row. `eeb8b136b1` let the EVIDENCE
+/// factorization price a fully pinned row at unit stiffness
+/// (`factor_spectral_deflated_criterion_row_with_geometry`), but the criterion's
+/// Newton-step lane factors rows under `ArrowEvidencePolicy::Strict`
+/// (`newton_step.rs`, "A Newton step is never an evidence factorization"), where
+/// the spectral arm is unreachable: a refused base Cholesky retries at the
+/// closed-form ridge, and `closed_form_row_ridge` of an all-zero block evaluates
+/// both linear conditions to exactly 0 — the derivation's infimum is unattained,
+/// so the retry factors the same zero matrix and refuses identically. On the SAE
+/// interval fixture this surfaced as `penalized_quasi_laplace_criterion`'s
+/// "objective stalled … orbit_best_objective_drop=0" refusal: the walk parks at
+/// its optimum with `g_t` exactly zero on the pinned slots, but every
+/// certificate lane that consults the curvature (`factor_deflated_evidence_with_
+/// grad_norms` → `solve_arrow_newton_step_with_options`) dies at the structural
+/// zero before it can certify, and the loop falls through to the typed refusal.
+///
+/// The floor here is the unit: the derivation answers "the smallest ridge that
+/// passes the safe-inversion gate", and for an all-zero block every `r > 0`
+/// passes it (pivots `r`, κ 1, `pivot_min = √ε·0 = 0`), while the pencil's own
+/// convention for a structural null is unit stiffness — `log 1 = 0` to the
+/// evidence, and, `g_t` being exactly zero on a pinned slot, a step contribution
+/// of exactly zero at ANY positive ridge.
+#[test]
+pub(crate) fn closed_form_row_ridge_floors_an_all_zero_block_at_the_unit_4077() {
+    for d in [1usize, 2usize, 3usize] {
+        let mut row = ArrowRowBlock::new(d, 1);
+        row.htt = Array2::<f64>::zeros((d, d));
+        row.htbeta = Array2::<f64>::zeros((d, 1));
+        row.gt = Array1::<f64>::zeros(d);
+
+        // The state the fixture reaches this routine in: the genuine Cholesky
+        // refuses an exactly-zero block at ridge 0.
+        assert!(
+            cholesky_lower(&row.htt).is_err(),
+            "d={d}: an all-zero block must refuse the genuine Cholesky"
+        );
+
+        // The derivation's raw infimum: both linear conditions evaluate to
+        // exactly 0 at zero spectrum, so the answer is the unattained 0 UNLESS
+        // the zero-scale floor fires — which is the fix under test. Before the
+        // floor this returned 0.0 and the step retry factored the same zero
+        // matrix, refusing identically (the #4077 stall's mechanism).
+        let ridge = closed_form_row_ridge(&row, d, 0.0, row_block_diag_scale(&row, d))
+            .expect("an all-zero block has a finite closed-form ridge");
+        assert_eq!(
+            ridge, 1.0,
+            "d={d}: the zero-spectrum floor answers the unit, not the unattained 0"
+        );
+
+        // The behaviour the step path consumes: ONE factorization at the derived
+        // ridge succeeds and passes the safe-inversion gate.
+        let result = factor_one_row_with_escalation(&row, 0.0, d, 0, false)
+            .expect("d={d}: the closed-form ridge must condition an all-zero block");
+        let factor = result.factor;
+        let kappa = cholesky_factor_kappa_estimate(&factor);
+        assert!(
+            cholesky_factor_passes_safe_inversion(
+                &factor,
+                d,
+                row_block_diag_scale(&row, d),
+                kappa
+            ),
+            "d={d}: the factored all-zero block at the unit ridge passes the gate; κ={kappa:e}"
+        );
+        // The pinned convention: the factored block is the unit diagonal.
+        let recon = factor.dot(&factor.t());
+        let band = 2.0 * (d as f64) * f64::EPSILON;
+        for i in 0..d {
+            for j in 0..d {
+                let expected = if i == j { 1.0_f64 } else { 0.0 };
+                assert!(
+                    (recon[[i, j]] - expected).abs() <= band,
+                    "d={d}: the ridge-conditioned all-zero block is the identity at [{i},{j}]: \
+                     got {}, band {band:e}",
+                    recon[[i, j]]
+                );
+            }
+        }
+
+        // A positive caller base is kept: the floor never lowers a caller's ridge.
+        let raised = closed_form_row_ridge(&row, d, 7.5, row_block_diag_scale(&row, d))
+            .expect("finite");
+        assert_eq!(
+            raised, 7.5,
+            "d={d}: the unit floor never lowers a caller's base ridge"
+        );
+
+        // Control: a block with ANY curvature is untouched — its derivation is
+        // attained and the floor does not fire.
+        let mut live = ArrowRowBlock::new(d, 1);
+        live.htt = Array2::<f64>::from_diag(&Array1::from_elem(d, 2.0_f64));
+        live.htbeta = Array2::<f64>::zeros((d, 1));
+        live.gt = Array1::<f64>::zeros(d);
+        let live_ridge = closed_form_row_ridge(&live, d, 0.0, row_block_diag_scale(&live, d))
+            .expect("finite");
+        assert!(
+            live_ridge < 1.0,
+            "d={d}: a well-conditioned positive block keeps its sub-unit derived ridge \
+             ({live_ridge:e}), the zero-scale floor does not fire"
+        );
+    }
+}
+
 /// #1117 flicker guard: a per-row evidence block carrying ONE genuinely
 /// indefinite direction (so spectral deflation runs) plus a small POSITIVE
 /// eigenvalue parked right at the relative cutoff `floor = REL_FLOOR·max|λ|`
