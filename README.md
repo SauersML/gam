@@ -62,19 +62,25 @@ and `latent-binary` forms). Firth /
 Jeffreys bias reduction handles separation in binomial fits.
 
 Supported term types in formulas: parametric terms, univariate smooths
-(`s`), tensor-product smooths (`te`, `ti`), radial smooths in arbitrary
+(`s`), tensor-product smooths (`te`, `ti`, `t2`), radial smooths in arbitrary
 dimension (`matern`, `duchon`, `thinplate`), intrinsic manifold smooths
 (`sphere`, periodic / cyclic, torus, cylinder via `te(..., periodic=...)`),
-measure-jet (`mjs`) and constant-curvature (`curv`) smooths, random effects
-and factor smooths (`group`, `fs`, `sz`, `by=`), shape-constrained smooths
-(monotone / convex / concave), interval-bounded coefficients (`bounded`),
-and learnable links (`link(type=flexible(...))`,
-`link(type=blended(...))`, `sas`, `beta-logistic`, `linkwiggle`).
+measure-jet (`mjs`) and constant-curvature (`curv`) smooths, PCA-subspace
+smooths (`pca`), random effects and factor smooths (`group`, `fs`, `sz`,
+`by=`), shape-constrained smooths (monotone / convex / concave),
+interval-bounded and sign-constrained coefficients (`bounded`,
+`nonnegative`, `nonpositive`), and learnable links
+(`link(type=flexible(...))`, `link(type=blended(...))`, `sas`,
+`beta-logistic`, `linkwiggle`).
 
-Smoothing parameters are selected by REML or LAML. Posterior sampling
-uses NUTS over the coefficient posterior conditional on the fitted
-smoothing parameters where the family supports it, and a Gaussian
-Laplace approximation otherwise.
+Smoothing parameters are selected by REML or LAML. The outer search is
+adaptive regularization with cubics (ARC) on the criterion's exact analytic
+Hessian; a model without an analytic Hessian uses EFS or BFGS instead, never
+a finite-difference Hessian. Every fit returns a convergence certificate; a
+search that ends without one raises `FitConvergenceError`. Posterior
+sampling uses NUTS over the coefficient posterior conditional on the fitted
+smoothing parameters where the family supports it, and a Gaussian Laplace
+approximation otherwise.
 
 The engine also provides, past fitting and point prediction (see
 [Examples](#examples) and the [docs](https://gamfit.readthedocs.io/)):

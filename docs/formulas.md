@@ -390,33 +390,41 @@ period_end=2*pi)` describe the same `[0, 2π)` smooth. An unparseable
 endpoint or an unknown option is rejected rather than silently dropped.
 
 Default basis of a 1-D `s(x)`: the data size it. The fit starts from a
-pilot of `clamp(unique_values / 4, 4, 8)` interior knots (at most twelve
-cubic basis functions). With 32 or fewer rows and five or more smooth
-coordinates the pilot is reduced to at most 1 interior knot. After the fit
-converges, the basis is checked for two signs that it is too small: an edf
-pressed against the basis dimension, and a rejection by the residual
-lack-of-fit test that
-[`basis_check()`](diagnostics.md#basis_check-is-the-basis-big-enough)
-reports, at a family-wise level of `1e-3` Bonferroni-corrected over the
-tested smooths. If either appears, the knot count doubles and the model is
-refit, until neither does. Only the data bound the growth:
+pilot whose penalized span holds the `⌈n^{1/3}⌉` directions an optimally
+smoothed fit of the roughest admissible (order-1 Sobolev) truth keeps, plus
+the penalty's polynomial null space. After the fit converges, the engine
+refits with the next level of a nested refinement (`K` interior knots become
+`2K + 1`, keeping every old knot) and keeps the larger basis only when its
+REML/LAML criterion improves by more than both fits' certified error. There
+is no trigger threshold: neither an edf pressed against the basis dimension
+nor a lack-of-fit test decides whether to try. Growth repeats until a refit
+is not certified better, does not converge, or is not nested, and the
+certified smaller fit then stands. Only the data bound the growth:
 
 - a smooth never gets more coefficients than its covariate has distinct
   values, which is the interpolating limit;
 - the whole model keeps at least one residual degree of freedom.
 
 A null or linear truth passes at the pilot, and REML shrinks it to about 0
-or 1 edf. The larger basis is built only where the fit shows it is needed.
+or 1 edf. The larger basis is built only where the fit's evidence shows it
+is needed.
 
 The basis dimension is `k = internal_knots + degree + 1`. Setting `k=` or
 `knots=` fixes the size: an explicit `k` is honoured exactly, down to
 `k = degree + 1` (zero interior knots), and never grows. Passing both `k`
-and `knots` is an error. A Python smooth override (`smooths=`) also keeps
-its size. So do a `by=` smooth (only the rows its gate selects support it)
-and the cyclic, factor-smooth and tensor-product bases, which take the
-pilot count as a fixed default. Thin-plate, Duchon and the other radial
-smooths with automatic centers grow their center count by the same
-adequacy loop. Matérn is the exception and keeps its default count.
+and `knots` is an error. A declared `domain=` also fixes the size, and a
+Python smooth override (`smooths=`) keeps its size. The cyclic default
+(`b` functions become `2b` on the same period), the factor-smooth marginal
+(`fs`, `sz`; not `re`), the tensor-product margins (`te`, `ti`, `t2`, each
+knot interval split once, unless a `domain=` or `knot_placement=` is given)
+and the harmonic `sphere` degree grow by the same loop. Thin-plate, Duchon,
+`curv`, `mjs` and Wahba `sphere` smooths with automatic centers in at most
+three dimensions (farthest-point placement) grow their center count, also
+inside `by=`. These do not grow: an explicit `k`/`knots`, a `by=` smooth of
+any non-radial basis (only the rows its gate selects support it), radial
+smooths whose center plan re-places every center (the equal-mass default
+above three dimensions, k-means, grid, spectral), and Matérn, which keeps
+its default count.
 
 ### Choosing `k` {#choosing-k}
 
@@ -436,9 +444,9 @@ close to the basis dimension is the symptom, and
 [`basis_check()`](diagnostics.md#basis_check-is-the-basis-big-enough)
 is the test: it looks for structure left in the residuals along the
 covariate. A small p-value means the basis ran out. For `s(x)`, drop the
-`k=` and let the default grow. A basis that never grows by itself (a `by=`
-smooth, or a tensor-product, cyclic, factor-smooth or Matérn smooth) needs a
-larger `k`.
+`k=` and let the default grow. A basis that never grows by itself (a
+non-radial `by=` smooth, a Matérn smooth, or any smooth with an explicit
+size) needs a larger `k`.
 
 ```python
 import numpy as np
@@ -462,11 +470,11 @@ Six full periods of a sine need more than a dozen basis functions. The
 fixed `k=12` basis runs out: its edf (10.4) presses against the basis
 dimension (11 after centering), the basis check's p-value is about
 `1e-309`, and the error against the truth is 0.63. The default `s(x)`
-starts from the same dozen functions, sees the same rejection, and doubles
-its knots until the check's p-value clears the engine's basis-adequacy
-level (`1e-3`, Bonferroni-corrected over the tested smooths). Here it
-stops at 19 dimensions with an edf of 17.8, a basis check p of about
-0.007, and an error of 0.07. Nobody had to tell it how many.
+starts from the same dozen functions and refines them (8, then 17, then 35
+interior knots) for as long as each larger basis certifiably improves the
+REML criterion. Here it stops at 38 dimensions with an edf of 32.7, a
+basis check p of about 0.94, and an error of 0.06. Nobody had to tell it
+how many.
 
 ### Shape-constrained smooths {#shape-constrained-smooths}
 
@@ -585,7 +593,7 @@ Radial-basis surface smooth with thin-plate kernel.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `centers` (`k`) | auto | Number of radial centres. |
-| `length_scale` | `1.0` | Global length-scale init. |
+| `length_scale` | auto | Global length scale. Omitted: derived from the data once, when the basis is built. It is fixed geometry and never learned: REML already learns the smoothing penalty, and a thin-plate kernel scale is not identifiable beside it. |
 | `double_penalty` | `true` | Ridge + main penalty. |
 | `by`, `identifiability` | — | `identifiability` takes `none` or `orthogonal_to_parametric`; see [univariate smooths](#univariate-smooths). |
 

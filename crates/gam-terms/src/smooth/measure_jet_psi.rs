@@ -32,9 +32,9 @@ pub fn measure_jet_term_spec(
 /// `spatial_term_uses_per_axis_psi` both defer here so the θ-layout sources
 /// cannot disagree.
 pub(crate) fn measure_jet_enrolls_psi(mj: &crate::basis::MeasureJetBasisSpec) -> bool {
-    // Two independent enrollment sources (#1116), both explicit:
+    // Two independent enrollment sources (#1116):
     //   * the design-moving representer length-scale ℓ (`learn_length_scale`),
-    //     available in every mode when the spec opts in;
+    //     on by default in every mode unless an explicit `length_scale=` pins it;
     //   * the multiscale penalty dial α, which rides the explicit `multiscale`
     //     opt-in. The energy uses the exact weighted affine projection, so the
     //     ridge τ moves nothing and is not a dial (#2902).
@@ -42,8 +42,10 @@ pub(crate) fn measure_jet_enrolls_psi(mj: &crate::basis::MeasureJetBasisSpec) ->
     measure_jet_learns_length_scale(mj) || crate::basis::measure_jet_multiscale_mode(mj)
 }
 
-/// Whether the design-moving ℓ dial is enrolled for this term. ℓ is fixed by
-/// default and learnable in every mode only when `learn_length_scale = true`.
+/// Whether the design-moving ℓ dial is enrolled for this term. The term builder
+/// learns ℓ by default (`learn_length_scale` defaults to true when no explicit
+/// `length_scale=` is given, which pins it); `learn_length_scale=` overrides
+/// either way, in every mode.
 pub(crate) fn measure_jet_learns_length_scale(mj: &crate::basis::MeasureJetBasisSpec) -> bool {
     mj.learn_length_scale
 }

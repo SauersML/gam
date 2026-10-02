@@ -47,20 +47,20 @@ The full signature, with defaults (keyword-only arguments follow the `*`):
 | `atom_topology` | `None` | exact global topology token; omitted means native `auto` discovery |
 | `assignment` | `"softmax"` | gate kind: `softmax` / `ordered_beta_bernoulli` / `threshold_gate` / `topk` |
 | `schedule` | `None` | `GumbelTemperatureSchedule` for annealed gates |
-| `isometry_weight` | `1.0` | unit-speed gauge penalty (on by default) |
+| `isometry_weight` | `0.0` | fixed multiplier of the unit-speed gauge penalty (off by default) |
 | `decoder_feature_sparsity_groups` | `None` | output-feature partition for decoder group-lasso |
 | `n_iter` | `50` | joint-solve iterations |
-| `sparsity_weight` | `None` | optional coordinate-shrinkage strength override; omitted delegates to the native neutral log-strength origin (`1.0`). Refused with a fixed-concentration `ordered_beta_bernoulli` prior, which has no strength coordinate |
+| `sparsity_weight` | `None` | starting value of the estimated assignment strength where the gate family has that coordinate, and the fixed SCAD/MCP coordinate-penalty weight; omitted delegates to the native neutral log-strength origin (`1.0`). Refused with a fixed-concentration `ordered_beta_bernoulli` prior, which has no strength coordinate |
 | `coord_sparsity` | `"scad"` | coordinate (latent `t`-block) magnitude penalty: `scad` / `mcp` / `l1` |
 | `scad_mcp_gamma` | `None` | SCAD/MCP concavity (defaults SCAD 3.7, MCP 2.5) |
-| `smoothness_weight` | `1.0` | roughness penalty strength |
+| `smoothness_weight` | `1.0` | starting value of each atom's estimated roughness strength |
 | `alpha` | `None` | `ordered_beta_bernoulli` concentration: `None` learns it by empirical Bayes from the dictionary-spanning default, a `float` fixes it |
 | `learning_rate` | `None` | optional step size override |
 | `random_state` | `0` | RNG seed |
-| `block_orthogonality_weight` | `0.0` | orthogonalize latent axes (needs `d_atom >= 2`) |
-| `nuclear_norm_weight` | `1.0` | embedding-rank selection penalty |
+| `block_orthogonality_weight` | `0.0` | fixed multiplier orthogonalizing latent axes (needs `d_atom >= 2`) |
+| `nuclear_norm_weight` | `0.0` | fixed multiplier of the embedding-rank selection penalty (off by default) |
 | `nuclear_norm_max_rank` | `None` | optional cap on the embedding rank |
-| `decoder_incoherence_weight` | `1.0` | cross-atom incoherence (separability lever) |
+| `decoder_incoherence_weight` | `0.0` | fixed multiplier of cross-atom incoherence (off by default) |
 | `top_k` | `None` | optional cap on per-token active atoms. |
 | `t_init` | `None` | coordinate warm start `(K, N, D_max)` |
 | `a_init` | `None` | assignment-logit warm start `(N, K)` |
@@ -150,8 +150,20 @@ the relaxed gates. `"softmax"`, `"threshold_gate"` and `"ordered_beta_bernoulli"
 add their partition functions, so the strength or concentration derivative of
 the criterion includes the prior's normalizer. An ordered Beta--Bernoulli fit learns
 its concentration by default (`alpha=None`); a numeric `alpha` fixes it, and the
-fixed prior has no strength to tune, so `sparsity_weight` is refused there. Each piece plays a distinct role
-(default state in parentheses):
+fixed prior has no strength to tune, so `sparsity_weight` is refused there.
+
+The criterion estimates three kinds of weight: each atom's own smoothness
+strength `λ_smooth[k]`, started from `smoothness_weight`; the per-atom,
+per-axis ARD precisions; and the assignment strength, started from
+`sparsity_weight`, where the gate family has that coordinate (threshold gate,
+softmax at `K > 1`, and ordered Beta--Bernoulli while its concentration is
+learned). Hard TopK and a fixed-concentration ordered Beta--Bernoulli prior
+have no strength coordinate. Every other weight is a fixed multiplier that the
+criterion never moves: `isometry_weight`, `decoder_incoherence_weight`,
+`nuclear_norm_weight`, `block_orthogonality_weight`, and the SCAD/MCP
+coordinate-penalty weight, which is `sparsity_weight` itself.
+
+Each piece plays a distinct role (default state in parentheses):
 
 - **Reconstruction.** Squared error between `Z` and the sparse sum of
   per-atom decoded points. Reported as `fit.reconstruction_r2`.
@@ -210,16 +222,15 @@ fixed prior has no strength to tune, so `sparsity_weight` is refused there. Each
   fit = gamfit.sae.sae_manifold_fit(X=Z, K=16, assignment="softmax", schedule=sched)
   ```
 
-- **Cross-atom decoder incoherence** (`decoder_incoherence_weight=1.0`, **on
+- **Cross-atom decoder incoherence** (`decoder_incoherence_weight=0.0`, **off
   by default**). The separability lever. For `K >= 2` it
   penalizes the squared output-space cross-Gram `||B_j B_k^T||_F^2` between
   the `(M_k, p)` decoder blocks of *co-activating* atom pairs, weighted by
   their empirical co-activation `mean_n gate_j·gate_k`. This drives co-firing
   atoms toward perpendicular ambient subspaces, conditioning the joint solve
-  and making the decomposition identifiable. Set the weight to `0.0` to
-  disable.
+  and making the decomposition identifiable. A positive weight turns it on.
 
-- **Nuclear-norm embedding-rank selection** (`nuclear_norm_weight=1.0`, **on
+- **Nuclear-norm embedding-rank selection** (`nuclear_norm_weight=0.0`, **off
   by default**; `nuclear_norm_max_rank=` optional cap). Adds a
   smoothed sum-of-singular-values penalty on each atom's `(M_k, p)` decoder matrix,
   shrinking its singular spectrum so the **embedding dimension** — how many
@@ -235,12 +246,12 @@ fixed prior has no strength to tune, so `sparsity_weight` is refused there. Each
   is no option to switch it off (#2822). The surviving count per atom is
   `fit.atoms[k].active_dim` (also `fit.summary()["active_dims"]`).
 
-- **Isometry gauge** (`isometry_weight=1.0`, **on by default**).
+- **Isometry gauge** (`isometry_weight=0.0`, **off by default**).
   `IsometryPenalty` drives the pulled-back metric
   `g = J^T J` toward a unit-average-speed chart, making `t` easier to read as
   near arc length. This gauge matters because each smoothing prior is defined
   relative to a declared reference chart/measure; the smoothing Gram does not
-  move with the fitted decoder. Set the weight to `0.0` to disable the gauge.
+  move with the fitted decoder. A positive weight turns the gauge on.
 
 - **Smoothness** (`smoothness_weight=1.0`). Each atom declares a fixed
   reference-function seminorm. If
