@@ -294,12 +294,6 @@ fn planted_blocks_are_the_finest_components() {
             assert!(loss <= error, "E* = {loss:e} beyond its error {error:e}");
             let (cut, cut_error) = exact_parts(&component.cut);
             assert!(cut <= cut_error);
-            let indicator = Array1::from_shape_fn(truth.len(), |unit| {
-                if component.subset.contains(&unit) { 1.0 } else { 0.0 }
-            });
-            let applied = blocks.laplacian_apply(indicator.view()).expect("laplacian");
-            let tolerance = 4.0 * blocks.projector_band * truth.len() as f64;
-            assert!(applied.iter().all(|value| value.abs() <= tolerance), "{applied:?}");
         }
     }
 }
@@ -467,18 +461,10 @@ fn a_random_dense_block_is_one_component() {
 }
 
 #[test]
-fn laplacian_matches_the_dense_form_and_subsets_are_checked() {
+fn a_repeated_subset_unit_is_refused() {
     let block = random_block(8, 9, 4);
     let form = block.normal_form(GaussianActivation::Relu, None);
     let blocks = form.additive_blocks(test_governor()).expect("blocks");
-    let projector = blocks.frame.dot(&blocks.frame.t());
-    let q = Array1::from_shape_fn(9, |unit| (unit as f64).sin());
-    let dense = Array1::from_shape_fn(9, |i| {
-        projector[[i, i]] * q[i] - (0..9).map(|j| projector[[i, j]].powi(2) * q[j]).sum::<f64>()
-    });
-    let applied = blocks.laplacian_apply(q.view()).expect("laplacian");
-    let tolerance = accumulation_growth(64) * 9.0;
-    assert!((&applied - &dense).iter().all(|value| value.abs() <= tolerance));
     assert!(matches!(
         form.optimal_split(test_governor(), &blocks, &[1, 1]),
         Err(ModuleSplitError::InvalidSubset { unit: 1, .. })
@@ -491,9 +477,7 @@ fn laplacian_matches_the_dense_form_and_subsets_are_checked() {
 #[test]
 fn toy4_paired_rotation_is_a_linear_block() {
     let width = 6;
-    let toy = rotation_toy();
-    let planted = &toy.planted;
-    let rotation = &planted.matrix;
+    let rotation = &rotation_toy();
     let mut w_in = Array2::<f64>::zeros((2 * width, width));
     w_in.slice_mut(s![..width, ..]).assign(&Array2::<f64>::eye(width));
     w_in.slice_mut(s![width.., ..]).assign(&(-Array2::<f64>::eye(width)));

@@ -23,67 +23,12 @@
 //! Every fixture is dyadic where a test compares tensors exactly, so a gauge move by a
 //! unimodular integer matrix is carried without rounding.
 
-use gam_linalg::roundoff::UNIT_ROUNDOFF;
 use ndarray::{Array1, Array2, s};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{RngExt, SeedableRng};
 
 use crate::attention::{AffineProjection, AttentionGeometry, NativeAttention, RotaryEmbedding, RotaryPairing};
-
-/// The smallest positive subnormal: the absolute error of a product that underflows.
-fn underflow() -> f64 {
-    f64::from_bits(1)
-}
-
-/// A computed real and a radius that encloses the exact value: running error analysis as
-/// box arithmetic. An operation adds the propagated radii of its operands and one rounding
-/// of its result, `|fl(x) − x| ≤ u |x| ≤ 2u |fl(x)|` (plus the subnormal spacing for a
-/// product). Radii are formed from nonnegative terms and each step is rounded up, so the
-/// stored radius is never below the exact one.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Ball {
-    pub value: f64,
-    pub radius: f64,
-}
-
-impl Ball {
-    pub fn exact(value: f64) -> Self {
-        Self { value, radius: 0.0 }
-    }
-
-    pub fn new(value: f64, radius: f64) -> Self {
-        Self { value, radius }
-    }
-
-    fn rounding(value: f64) -> f64 {
-        (2.0 * UNIT_ROUNDOFF * value.abs()).next_up()
-    }
-
-    pub fn add(self, other: Self) -> Self {
-        let value = self.value + other.value;
-        Self {
-            value,
-            radius: ((self.radius + other.radius).next_up() + Self::rounding(value)).next_up(),
-        }
-    }
-
-    pub fn mul(self, other: Self) -> Self {
-        let value = self.value * other.value;
-        let propagated = ((self.value.abs() * other.radius).next_up() + (self.radius * other.value.abs()).next_up()).next_up()
-            + (self.radius * other.radius).next_up();
-        Self {
-            value,
-            radius: ((propagated.next_up() + Self::rounding(value)).next_up() + underflow()).next_up(),
-        }
-    }
-
-    /// The sum of the balls `terms`, left to right.
-    pub fn sum(terms: impl IntoIterator<Item = Self>) -> Self {
-        terms.into_iter().fold(Self::exact(0.0), Self::add)
-    }
-
-}
 
 /// A plain GELU block `F(h) = W_out σ(W_in h + b_in) + b_out`.
 #[derive(Clone, Debug)]
@@ -408,28 +353,9 @@ pub fn hadamard_modules_truth(unit_modules: &[usize]) -> ModulesTruth {
 pub const ROTATION_ANGLES: [f64; 3] = [0.3, 0.3, 1.1];
 pub const ROTATION_SEED: u64 = 0x2951_0004;
 
-/// The rotation toy's planted matrix and its structure.
-pub struct RotationToy {
-    /// `R = Q B Qᵀ` and the float defects of its factors; plane `k` is basis columns
-    /// `2k..2k + 2`.
-    pub planted: super::Planted,
-    /// The one identified plane: its angle and basis columns.
-    pub identified_plane: (f64, std::ops::Range<usize>),
-    /// The repeated pair: its angle, basis columns and plane count. Its individual planes
-    /// are not determined by `R`.
-    pub repeated: (f64, std::ops::Range<usize>, usize),
-    /// The Krylov closure of a generic readout under `R − I`: one pair per distinct
-    /// eigenvalue pair, holding the identified plane and a 2-dimensional slice of the pair.
-    pub krylov_dimension: usize,
-}
-
-pub fn rotation_toy() -> RotationToy {
-    RotationToy {
-        planted: super::plant(6, &ROTATION_ANGLES, 0, ROTATION_SEED),
-        identified_plane: (1.1, 4..6),
-        repeated: (0.3, 0..4, 2),
-        krylov_dimension: 4,
-    }
+/// The rotation toy's matrix `R = Q B Qᵀ`.
+pub fn rotation_toy() -> Array2<f64> {
+    super::plant(6, &ROTATION_ANGLES, 0, ROTATION_SEED)
 }
 
 /// The routing toy's structure.

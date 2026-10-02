@@ -4,7 +4,7 @@
 use super::*;
 use crate::attention::{AffineProjection, RotaryPairing};
 use crate::gated_rewrite::rms_normalizers;
-use crate::state::resolve_stacked_factor;
+use crate::state::resolved_row_space;
 use crate::test_support::planted_toys::{ROUTING_HEADS, RoutingToy};
 use crate::test_support::test_governor;
 use rand::rngs::StdRng;
@@ -178,25 +178,6 @@ fn gram_from_factors_matches_dense_operators() {
     }
 }
 
-/// Energies over a declared context: a plane whose wavelength exceeds it is content, the pass-
-/// through coordinates are content, and the split sums to the total.
-#[test]
-fn energies_split_by_the_declared_context() {
-    let native = neox_block(RotaryPairing::HalfSplit, 41);
-    let operators = query_key_operators(&native, None).expect("operators");
-    let energies = operators.energies(100.0).expect("declared context");
-    for (head, energy) in energies.iter().enumerate() {
-        // 2π/1 < 100 < 2π/0.03.
-        assert_eq!(energy.slow_planes, vec![1]);
-        let (a, b) = (frobenius_squared(operators.cosine(head, 1)).0, frobenius_squared(operators.sine(head, 1)).0);
-        assert!((energy.content - (a + b)).abs() <= energy.band);
-        assert!(energy.positional > 0.0 && energy.pass_through > 0.0);
-    }
-    for length in [0.0, -1.0, f64::INFINITY, f64::NAN] {
-        assert!(matches!(operators.energies(length), Err(JointRefusal::ContextLength { .. })));
-    }
-}
-
 /// The planted toys' finding: two operators with one range and a factor 2 between them share
 /// every subspace measure, yet they are distinct laws. The comparison certifies them distinct
 /// and proportional with scale 1/2; an identical copy is not certified distinct.
@@ -294,13 +275,12 @@ fn toy5_operator_equality_separates_laws_that_share_every_subspace() {
             assert_eq!(dense, RoutingToy::transport(&toy.value, &toy.output, &[head]), "the owner's C_h is O_h V_h");
         }
         let transport = RoutingToy::transport(&toy.value, &toy.output, heads);
-        resolve_stacked_factor(test_governor(), &transport, 0.0).expect("rank").resolved_rank
+        resolved_row_space(test_governor(), &transport, 0.0, "law transport").expect("rank").rank
     };
     assert_eq!(rank(&[0]), 2);
     assert_eq!(rank(&[1]), 2);
     assert_eq!(vec![rank(&truth.laws[0]), rank(&truth.laws[1])], truth.law_transport_ranks);
 }
-
 
 /// The routing-law letters of the toy: one per law, `C₁ + C₂` and `C₃`, formed from the
 /// stored factors within their band; a key change that separates heads 1 and 2 splits the

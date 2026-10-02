@@ -1,52 +1,13 @@
 #![cfg(test)]
-//! Observability and the linear quotient on the planted toys of #2951: the Krylov closure
-//! of a rotation block with a repeated angle, routing-law letters against per-head letters
+//! Observability on the planted toys of #2951: routing-law letters against per-head letters
 //! under the value/output gauges, and a data Gramian that cannot see a direction.
 
 use crate::joint_operators::attention_letters;
-use crate::state::{
-    LinearStateQuotient, ObservabilityLetter, ObservabilityStep, WeightedObservability, resolve_stacked_factor,
-};
+use crate::state::{ObservabilityLetter, ObservabilityStep, WeightedObservability};
 use crate::supports::EvidenceStatus;
-use crate::test_support::planted_toys::{ROUTING_WIDTH, RoutingToy, data_subspace_toy, rotation_toy};
+use crate::test_support::planted_toys::{ROUTING_WIDTH, RoutingToy, data_subspace_toy};
 use crate::test_support::test_governor;
-use ndarray::{Array2, Axis, array, concatenate, s};
-
-/// Toy 4: a rotation `R` with angles `0.3, 0.3, 1.1` in a hidden orthonormal basis, a
-/// generic readout `c` and the transition `R − I`. The closure of `c` is its Krylov space,
-/// of dimension 4: one direction pair per distinct eigenvalue pair `e^{±1.1i} − 1`,
-/// `e^{±0.3i} − 1`. It holds the whole 1.1 plane and only a 2-dimensional slice of the
-/// repeated 0.3 space.
-///
-/// The chart is a computed invariant subspace, off an exact one by at most its measured
-/// section, readout and quotient defects, and the planted basis carries its own defect.
-/// With those as the formation of the stacked rows, the 1.1 plane is not separated from
-/// the chart (the stack resolves rank 4), and the 0.3 space is certified to leave it by
-/// two dimensions (the stack resolves rank 6).
-#[test]
-fn toy4_rotation_closure_is_the_krylov_space() {
-    let toy = rotation_toy();
-    let planted = &toy.planted;
-    let transition = &planted.matrix - &Array2::<f64>::eye(6);
-    let readout = array![[0.7, -0.3, 1.1, 0.4, -0.9, 0.2]];
-    let quotient = LinearStateQuotient::close(test_governor(), &[readout.view()], &[transition.view()]).expect("closure");
-    assert_eq!(quotient.chart.nrows(), toy.krylov_dimension);
-    let defect = quotient.section_bounds.upper
-        + quotient.readout_bounds[0].upper
-        + quotient.quotient_bounds[0].upper
-        + planted.matrix_defect
-        + planted.basis_defect;
-    let stack = |rows: Array2<f64>| {
-        let stacked = concatenate(Axis(0), &[quotient.chart.view(), rows.view()]).expect("stack");
-        resolve_stacked_factor(test_governor(), &stacked, defect).expect("rank")
-    };
-    let plane = planted.basis.slice(s![.., toy.identified_plane.1.clone()]).t().to_owned();
-    let with_plane = stack(plane);
-    assert_eq!(with_plane.resolved_rank, toy.krylov_dimension, "the 1.1 plane is inside the chart: {:?}", with_plane.singular_values);
-    let repeated = planted.basis.slice(s![.., toy.repeated.1.clone()]).t().to_owned();
-    let with_repeated = stack(repeated);
-    assert_eq!(with_repeated.resolved_rank, 6, "only a slice of the 0.3 space: {:?}", with_repeated.singular_values);
-}
+use ndarray::{Array2, Axis, s};
 
 fn identity() -> Array2<f64> {
     Array2::<f64>::eye(ROUTING_WIDTH)

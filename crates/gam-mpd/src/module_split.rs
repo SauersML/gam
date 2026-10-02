@@ -59,9 +59,6 @@
 //! `sup_{‖h‖≤R} ‖F(h) − F̂(h)‖ ≤ L_σ ‖V‖₂ ‖W − Ŵ‖₂ R`, and
 //! `‖W − Ŵ‖₂ ≤ ‖T‖₂ √E* ≤ ‖T‖₂ √(2χ)`. `L_σ = Φ(√2) + √2 φ(√2)` for the exact
 //! GELU and `1` for ReLU, from [`GaussianActivation::slope_bound_squared`].
-//! [`AdditiveBlocks::laplacian_apply`] applies `𝓛 = diag(Π) − Π ⊙ Π` matrix-free
-//! for callers that search for proposals; the search is theirs, and `S` is an
-//! input here.
 //!
 //! # Relation to `response::interaction`
 //!
@@ -723,30 +720,6 @@ impl MlpNormalForm {
             native_bound,
             cut_bound,
         })
-    }
-}
-
-impl AdditiveBlocks {
-    /// `𝓛 q` for the Laplacian `𝓛 = diag(Π) − Π ⊙ Π` of the pair weights
-    /// `Π_ij²`, matrix-free: `(𝓛q)_i = ‖u_i‖² q_i − u_iᵀ (Uᵀ diag(q) U) u_i`, in
-    /// `O(m r²)` time and `O(m r + r²)` memory.
-    pub fn laplacian_apply(&self, q: ArrayView1<'_, f64>) -> Result<Array1<f64>, ModuleSplitError> {
-        let units = self.frame.nrows();
-        require_dimension(q.len(), units, "laplacian: vector")?;
-        let rank = self.frame.ncols();
-        let mut weighted = Array2::<f64>::zeros((rank, rank));
-        for (unit, row) in self.frame.rows().into_iter().enumerate() {
-            for a in 0..rank {
-                for b in 0..rank {
-                    weighted[[a, b]] += q[unit] * row[a] * row[b];
-                }
-            }
-        }
-        Ok(Array1::from_shape_fn(units, |unit| {
-            let row = self.frame.row(unit);
-            let degree = row.dot(&row);
-            degree * q[unit] - row.dot(&weighted.dot(&row))
-        }))
     }
 }
 

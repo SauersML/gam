@@ -1,9 +1,8 @@
 //! Dense float64 decompositions on faer with deterministic signs (#2951).
 //!
-//! The operation-first probes read spectra, frames and solves of dense matrices. They
-//! call these through the MPD surface, so every decomposition is faer's at the
-//! parallelism `gam_linalg` names, never LAPACK's, and two runs of one matrix agree bit
-//! for bit.
+//! The engine and the edit compiler read spectra, frames and solves of dense matrices.
+//! Every decomposition is faer's at the parallelism `gam_linalg` names, never LAPACK's, and
+//! two runs of one matrix agree bit for bit.
 //!
 //! # Sign conventions
 //!
@@ -31,7 +30,6 @@
 //! Singular values carry [`factor_singular_band`] (`max(m, n) ε σ₁`) and eigenvalues
 //! [`symmetric_spectrum_rounding_band`] (`n (ε ρ + η)`): a value within its band of
 //! zero is not resolved from zero by the decomposition that produced it.
-//! [`lstsq`]'s rank counts the singular values above its declared cutoff.
 
 use std::fmt;
 
@@ -57,8 +55,6 @@ pub enum DenseError {
     Singular { column: usize },
     /// A requested eigenvalue index range is empty or outside `0..n`.
     InvalidRange { start: usize, end: usize, order: usize },
-    /// A least-squares cutoff that is negative or not finite.
-    InvalidCutoff { value: f64 },
     /// The two triangles of a symmetric input disagree beyond the declared assembly's band.
     Asymmetric { detail: String },
     /// The decomposition did not converge.
@@ -78,9 +74,6 @@ impl fmt::Display for DenseError {
                 formatter,
                 "dense eigh: eigenvalue indices {start}..{end} are empty or outside 0..{order}"
             ),
-            Self::InvalidCutoff { value } => {
-                write!(formatter, "dense lstsq: cutoff {value} is not finite and nonnegative")
-            }
             Self::Asymmetric { detail } => write!(formatter, "dense eigh: {detail}"),
             Self::Decomposition { detail } => write!(formatter, "dense: decomposition failed: {detail}"),
         }
@@ -153,13 +146,6 @@ pub struct Eigh {
     pub band: f64,
 }
 
-/// The eigenvalues of the symmetric matrix `a`, built as `assembly` declares,
-/// increasing, and their band.
-pub fn eigvalsh(a: ArrayView2<'_, f64>, assembly: SymmetricAssembly) -> Result<(Array1<f64>, f64), DenseError> {
-    let decomposed = eigh(a, assembly, None)?;
-    Ok((decomposed.values, decomposed.band))
-}
-
 /// The eigendecomposition of the symmetric matrix `a`; with `indices`, only the
 /// eigenpairs `indices` in increasing eigenvalue order.
 ///
@@ -207,23 +193,6 @@ pub struct Svd {
 fn singular_band(a: ArrayView2<'_, f64>, singular_values: &Array1<f64>) -> f64 {
     let sigma_max = singular_values.iter().fold(0.0_f64, |largest, &value| largest.max(value));
     factor_singular_band(a.nrows(), a.ncols(), sigma_max)
-}
-
-/// The singular values of `a`, decreasing, and their band.
-pub fn svdvals(a: ArrayView2<'_, f64>) -> Result<(Array1<f64>, f64), DenseError> {
-    require_finite("svd", a)?;
-    let (_, sigma, _) = a.svd(false, false).map_err(decomposition)?;
-    let mut sigma = sigma.to_vec();
-    sigma.sort_by(|left, right| right.total_cmp(left));
-    let sigma = Array1::from(sigma);
-    let band = singular_band(a, &sigma);
-    Ok((sigma, band))
-}
-
-/// `‖A‖₂ = σ₁` and its band.
-pub fn spectral_norm(a: ArrayView2<'_, f64>) -> Result<(f64, f64), DenseError> {
-    let (sigma, band) = svdvals(a)?;
-    Ok((sigma.first().copied().unwrap_or(0.0), band))
 }
 
 /// The thin (`full = false`) or full singular value decomposition of `a`.
@@ -358,66 +327,6 @@ pub fn solve(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Result<Array2<f6
     Ok(to_array(lu.solve(rhs.as_ref()).as_ref()))
 }
 
-/// The singular-value cutoff of [`lstsq`].
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum LstsqCutoff {
-    /// `max(m, n) ε σ₁`, the decomposition's own band (numpy's `rcond=None`).
-    Band,
-    /// `rcond σ₁`.
-    Relative(f64),
-}
-
-/// The minimum-norm least-squares solution of `A X ≈ B`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Lstsq {
-    /// `V diag(1/σᵢ for σᵢ > cutoff) Uᵀ B`, `n × p`.
-    pub solution: Array2<f64>,
-    /// The singular values above the cutoff.
-    pub rank: usize,
-    pub singular_values: Array1<f64>,
-    pub cutoff: f64,
-    /// `‖A x_j − b_j‖²` per column, from the returned solution.
-    pub residual_sum_squares: Array1<f64>,
-}
-
-/// `min ‖X‖_F` among the minimizers of `‖A X − B‖_F`, through the thin SVD.
-pub fn lstsq(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>, cutoff: LstsqCutoff) -> Result<Lstsq, DenseError> {
-    require_finite("lstsq right-hand side", b)?;
-    if b.nrows() != a.nrows() {
-        return Err(DenseError::Shape {
-            what: "lstsq right-hand side rows",
-            expected: a.nrows(),
-            found: b.nrows(),
-        });
-    }
-    if let LstsqCutoff::Relative(value) = cutoff
-        && !(value.is_finite() && value >= 0.0)
-    {
-        return Err(DenseError::InvalidCutoff { value });
-    }
-    let decomposed = svd(a, false)?;
-    let sigma_max = decomposed.singular_values.first().copied().unwrap_or(0.0);
-    let cutoff = match cutoff {
-        LstsqCutoff::Band => decomposed.band,
-        LstsqCutoff::Relative(rcond) => rcond * sigma_max,
-    };
-    let rank = decomposed.singular_values.iter().filter(|&&value| value > cutoff).count();
-    let projected = decomposed.u.slice(s![.., ..rank]).t().dot(&b);
-    let scaled = Array2::from_shape_fn(projected.dim(), |(row, col)| {
-        projected[[row, col]] / decomposed.singular_values[row]
-    });
-    let solution = decomposed.vt.slice(s![..rank, ..]).t().dot(&scaled);
-    let residual = a.dot(&solution) - b;
-    let residual_sum_squares = residual.map_axis(Axis(0), |column| column.iter().map(|value| value * value).sum());
-    Ok(Lstsq {
-        solution,
-        rank,
-        singular_values: decomposed.singular_values,
-        cutoff,
-        residual_sum_squares,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,13 +355,13 @@ mod tests {
         // The upper triangle disagrees with the lower: refused, not read from one side.
         let lopsided = array![[2.0, 99.0], [1.0, 2.0]];
         assert!(matches!(eigh(lopsided.view(), SymmetricAssembly::Mirrored, None), Err(DenseError::Asymmetric { .. })));
-        assert!(matches!(eigvalsh(lopsided.view(), SymmetricAssembly::PsdAccumulation { depth: 64 }), Err(DenseError::Asymmetric { .. })));
+        assert!(matches!(eigh(lopsided.view(), SymmetricAssembly::PsdAccumulation { depth: 64 }, None), Err(DenseError::Asymmetric { .. })));
         // A one-ulp disagreement is refused for a mirrored matrix and accepted inside
         // an accumulation's band.
         let off = 1.0_f64;
         let nudged = array![[2.0, off], [f64::from_bits(off.to_bits() + 1), 2.0]];
         assert!(matches!(eigh(nudged.view(), SymmetricAssembly::Mirrored, None), Err(DenseError::Asymmetric { .. })));
-        let accepted = eigvalsh(nudged.view(), SymmetricAssembly::PsdAccumulation { depth: 4 }).expect("inside the band").0;
+        let accepted = eigh(nudged.view(), SymmetricAssembly::PsdAccumulation { depth: 4 }, None).expect("inside the band").values;
         assert!((accepted[0] - 1.0).abs() < 1e-14 && (accepted[1] - 3.0).abs() < 1e-14);
     }
 
@@ -487,9 +396,6 @@ mod tests {
             let orthogonal = decomposed.u.t().dot(&decomposed.u);
             assert!(close(&orthogonal, &Array2::eye(decomposed.u.ncols()), 1e-13));
         }
-        let (values, band) = svdvals(a.view()).expect("svdvals");
-        assert!((values[0] - 50.0_f64.sqrt()).abs() < 1e-13 && band > 0.0);
-        assert!((spectral_norm(a.view()).expect("norm").0 - 50.0_f64.sqrt()).abs() < 1e-13);
     }
 
     #[test]
@@ -520,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn solve_and_lstsq_match_known_answers_and_refuse_singular_systems() {
+    fn solve_matches_a_known_answer_and_refuses_a_singular_system() {
         let a = array![[2.0, 1.0], [1.0, 3.0]];
         let b = array![[3.0], [5.0]];
         let x = solve(a.view(), b.view()).expect("solve");
@@ -529,20 +435,6 @@ mod tests {
             solve(array![[1.0, 2.0], [2.0, 4.0]].view(), b.view()),
             Err(DenseError::Singular { column: 1 })
         );
-        // Rank-deficient least squares: the minimum-norm solution of [1 1] x = 2 is (1, 1).
-        let wide = array![[1.0, 1.0]];
-        let solved = lstsq(wide.view(), array![[2.0]].view(), LstsqCutoff::Band).expect("lstsq");
-        assert_eq!(solved.rank, 1);
-        assert!(close(&solved.solution, &array![[1.0], [1.0]], 1e-14));
-        // Overdetermined: fit y = x through (0, 0), (1, 1), (2, 3); slope 7/5 at no intercept.
-        let tall = array![[0.0], [1.0], [2.0]];
-        let fitted = lstsq(tall.view(), array![[0.0], [1.0], [3.0]].view(), LstsqCutoff::Relative(1e-12)).expect("lstsq");
-        assert!((fitted.solution[[0, 0]] - 1.4).abs() < 1e-14);
-        assert!((fitted.residual_sum_squares[0] - 0.2).abs() < 1e-13);
-        // A repeated column: rank 1 at the band.
-        let repeated = array![[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]];
-        assert_eq!(lstsq(repeated.view(), array![[1.0], [2.0], [3.0]].view(), LstsqCutoff::Band).expect("lstsq").rank, 1);
-        assert!(matches!(lstsq(tall.view(), array![[0.0], [1.0], [3.0]].view(), LstsqCutoff::Relative(-1.0)), Err(DenseError::InvalidCutoff { .. })));
         assert!(matches!(eigh(array![[1.0, 2.0]].view(), SymmetricAssembly::Mirrored, None), Err(DenseError::NotSquare { .. })));
         assert!(matches!(svd(array![[f64::NAN]].view(), false), Err(DenseError::NonFinite { .. })));
         assert!(matches!(eigh(a.view(), SymmetricAssembly::Mirrored, Some((1, 1))), Err(DenseError::InvalidRange { .. })));

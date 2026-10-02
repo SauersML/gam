@@ -34,11 +34,6 @@
 //! `P_j` and `J_j` and are orthogonal, so `A_hj` and `B_hj` are unchanged. A folded residual
 //! gain moves `diag(γ)` from the norm into the columns, which the operators already carry.
 //!
-//! **Content and position.** Over a declared context of length `L` (an experiment input), a
-//! plane whose wavelength `2π/ω_j` exceeds `L` turns by less than one period, so its operator
-//! is a slowly varying content match; the others are positional. Pass-through coordinates are
-//! content exactly. [`QueryKeyOperators::energies`] splits `‖A_hj‖²_F + ‖B_hj‖²_F` that way.
-//!
 //! # Value/output
 //!
 //! Head `h`'s write of its weighted value read is `O_h (V_g x + b_V,g)`, so its operator is
@@ -66,8 +61,7 @@
 //! scale, or not). [`attention_letters`] turns the laws into an attention step's
 //! observability letters, one summed transport per law (with a pre-norm input gain and a
 //! post-norm output gain folded in), the only letters `state::ObservabilityLetter::RoutingLaws`
-//! accepts for attention; [`head_transport_of`] recognizes a dense letter that is one head's
-//! transport, which a caller declaring the block is refused.
+//! accepts for attention.
 
 use gam_linalg::faer_ndarray::{FaerLinalgError, FaerQr, fast_abt, fast_atb, fast_atv};
 use gam_linalg::roundoff::{accumulation_growth, householder_qr_backward_band};
@@ -89,8 +83,6 @@ pub enum JointRefusal {
     },
     /// A non-finite entry.
     NonFinite { what: &'static str },
-    /// A declared context length that is not positive and finite.
-    ContextLength { length: f64 },
     /// The attention owner refused the block.
     Attention(AttentionProgramError),
     /// The process memory governor refused a Gram's footprint.
@@ -224,21 +216,6 @@ pub struct QueryKeyOperators {
     /// `Π_h` per query head, when the head has pass-through coordinates.
     pass_through: Vec<Option<FactoredOperator>>,
     formation_defect: f64,
-}
-
-/// One head's operator energies over a declared context.
-#[derive(Clone, Debug, PartialEq)]
-pub struct HeadEnergy {
-    /// `Σ ‖A_hj‖² + ‖B_hj‖²` over the slow planes.
-    pub content: f64,
-    /// The same sum over the other planes.
-    pub positional: f64,
-    /// `‖Π_h‖²_F`, position-independent exactly.
-    pub pass_through: f64,
-    /// A bound on the rounding of each of the three sums.
-    pub band: f64,
-    /// The planes whose wavelength exceeds the declared context.
-    pub slow_planes: Vec<usize>,
 }
 
 /// The query or key rows `W̃ = D W diag(γ)` of one head, with the bias column `D b` when the
@@ -397,48 +374,6 @@ impl QueryKeyOperators {
         Ok((value, band))
     }
 
-    /// Each head's energies, with the planes whose wavelength `2π/ω_j` exceeds
-    /// `context_length` (a declared experiment input) counted as content.
-    pub fn energies(&self, context_length: f64) -> Result<Vec<HeadEnergy>, JointRefusal> {
-        if !(context_length.is_finite() && context_length > 0.0) {
-            return Err(JointRefusal::ContextLength { length: context_length });
-        }
-        let slow_planes: Vec<usize> = (0..self.planes())
-            .filter(|&plane| std::f64::consts::TAU / self.rotary.inverse_frequencies[plane] > context_length)
-            .collect();
-        let mut heads = Vec::with_capacity(self.geometry.n_heads);
-        for head in 0..self.geometry.n_heads {
-            let (mut content, mut positional, mut band) = (0.0, 0.0, 0.0);
-            for plane in 0..self.planes() {
-                let (a, band_a) = frobenius_squared(self.cosine(head, plane));
-                let (b, band_b) = frobenius_squared(self.sine(head, plane));
-                if slow_planes.contains(&plane) {
-                    content += a + b;
-                } else {
-                    positional += a + b;
-                }
-                band = up(band + up(up(band_a + band_b) + up(accumulation_growth(2 * self.planes()) * up(a + b))));
-            }
-            let (pass_through, pass_band) = self.pass_through(head).map_or((0.0, 0.0), frobenius_squared);
-            heads.push(HeadEnergy {
-                content,
-                positional,
-                pass_through,
-                band: up(band + pass_band),
-                slow_planes: slow_planes.clone(),
-            });
-        }
-        Ok(heads)
-    }
-}
-
-/// `‖L Rᵀ‖²_F = Σ_ab (LᵀL)_ab (RᵀR)_ab` and its band `[(1 + γ_w)²(1 + γ_{r²}) − 1] (Σ_a ‖l_a‖ ‖r_a‖)²`
-/// ([`family_gram`]'s entry band with `i = j`).
-fn frobenius_squared(operator: &FactoredOperator) -> (f64, f64) {
-    let (left, right) = (fast_atb(&operator.left, &operator.left), fast_atb(&operator.right, &operator.right));
-    let value = (&left * &right).sum();
-    let reach = column_reach(operator);
-    (value, entry_band(operator.width(), operator.rank(), operator.rank(), reach, reach))
 }
 
 /// `Σ_a ‖l_a‖ ‖r_a‖` over the factor columns, rounded up.
@@ -1018,62 +953,6 @@ pub fn attention_letters(
         bands.push(up(band + up(left.ncols() as f64 * SUBNORMAL_SPACING)));
     }
     Ok(RoutingLawLetters { laws, transports, bands, footprint })
-}
-
-/// The query head, if any, whose value/output transport `diag(ω) C_h` (folded as in
-/// [`attention_letters`]) the dense `letter` (`width × width`, exact as stored) is not proven
-/// distinct from. Such a letter is a per-head attention letter, which over-counts and is not
-/// gauge invariant, and a caller declaring it beside the block's routing-law letters is refused.
-///
-/// Distinctness is certified two ways, cheapest first. Norms: `‖C_h‖²_F` from the factor Grams
-/// is within its [`frobenius_squared`] band (widened by the output gain's rounding) and
-/// `‖letter‖²_F` within `γ_n` of its sum, so squared norms further apart than both bands differ.
-/// Entries: each entry of the computed `C_h` is a `k`-term inner product within `γ_k |L| |R|ᵀ`,
-/// plus the value factors' formation defect and the gain's rounding, so an entry of
-/// `letter − C_h` beyond that band certifies the two distinct.
-pub fn head_transport_of(
-    native: &NativeAttention,
-    input_gain: Option<ArrayView1<'_, f64>>,
-    output_gain: Option<ArrayView1<'_, f64>>,
-    letter: ArrayView2<'_, f64>,
-) -> Result<Option<usize>, JointRefusal> {
-    let width = native.geometry().model_dim;
-    expect_shape("letter", (width, width), letter.dim())?;
-    if let Some(gain) = output_gain {
-        expect_shape("output gain", (width, 1), (gain.len(), 1))?;
-    }
-    let value_output = value_output_operators(native, input_gain)?;
-    let folding = if output_gain.is_some() { accumulation_growth(1) } else { 0.0 };
-    let letter_squares = letter.iter().map(|entry| entry * entry).sum::<f64>();
-    let letter_band = up(accumulation_growth(letter.len().max(1)) * letter_squares);
-    for head in 0..native.geometry().n_heads {
-        let operator = value_output.head(head);
-        let mut left = operator.left().to_owned();
-        if let Some(gain) = output_gain {
-            for (row, &scale) in left.rows_mut().into_iter().zip(gain.iter()) {
-                row.into_iter().for_each(|entry| *entry *= scale);
-            }
-        }
-        let scaled = FactoredOperator::new(left, operator.right().to_owned())?;
-        if scaled.width() == width {
-            let (squares, band) = frobenius_squared(&scaled);
-            let widened = up(band + up(up(5.0 * up(folding + value_output.formation_defect())) * squares));
-            if (squares - letter_squares).abs() > up(widened + letter_band) {
-                continue;
-            }
-        }
-        let product = fast_abt(&scaled.left, &scaled.right);
-        let magnitude = fast_abt(&scaled.left.mapv(f64::abs), &scaled.right.mapv(f64::abs));
-        let relative = up(up(accumulation_growth(scaled.rank().max(1)) + value_output.formation_defect()) + folding);
-        let underflow = up(scaled.rank() as f64 * SUBNORMAL_SPACING);
-        let distinct = (0..width).any(|i| {
-            (0..width).any(|j| (letter[[i, j]] - product[[i, j]]).abs() > up(up(relative * magnitude[[i, j]] * up(1.0 + folding)) + underflow))
-        });
-        if !distinct {
-            return Ok(Some(head));
-        }
-    }
-    Ok(None)
 }
 
 #[cfg(test)]
