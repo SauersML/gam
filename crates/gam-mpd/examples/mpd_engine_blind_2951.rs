@@ -11,13 +11,85 @@
 //! Written to `OUT_DIR`: `report.json` (per rung: program bits, data bits, maximal row KL, argmax
 //! disagreements, population bounds for a sampled family, and the component view) and, per rung,
 //! the program's decoded message `program_n{n}.bits` (raw bytes; its length in bits is in the
-//! report).
+//! report) and the same program as JSON, `program_n{n}.json`: its bases, every operator (interface
+//! groups by label kind, index and width; body kind, precision, present blocks and reals;
+//! provenance sources and derivation), every node (kind, arguments, laws, scales, rotary) and its
+//! rules, verbatim, for tools that read programs without decoding the message.
 
 use gam_mpd::import::{import, import_language_model, is_language_model};
 use gam_mpd::engine::{Budget, decompose_from, library};
+use gam_mpd::operator_program::{Basis, Interface, Node, OperatorBody, OperatorProgram};
 use gam_mpd::view::view;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::path::PathBuf;
+
+fn interface_json(interface: &Interface) -> Value {
+    json!(interface.groups().iter().map(|g| json!([format!("{:?}", g.label.kind), g.label.index, g.width])).collect::<Vec<_>>())
+}
+
+fn node_json(node: &Node) -> Value {
+    match node {
+        Node::Feature { slot, basis } => json!({"kind": "Feature", "slot": slot, "basis": basis}),
+        Node::Raw { slot } => json!({"kind": "Raw", "slot": slot}),
+        Node::Constant { operator } => json!({"kind": "Constant", "operator": operator}),
+        Node::Affine { terms, bias } => json!({"kind": "Affine", "terms": terms, "bias": bias}),
+        Node::Bilinear { left, right, scale } => json!({"kind": "Bilinear", "left": left, "right": right, "scale": format!("{scale:?}")}),
+        Node::Softmax { scores } => json!({"kind": "Softmax", "scores": scores}),
+        Node::Mix { weights, payloads } => json!({"kind": "Mix", "weights": weights, "payloads": payloads}),
+        Node::Pointwise { input, laws } => {
+            json!({"kind": "Pointwise", "input": input, "laws": laws.iter().map(|l| format!("{l:?}")).collect::<Vec<_>>()})
+        }
+        Node::Hadamard { left, right } => json!({"kind": "Hadamard", "left": left, "right": right}),
+        Node::Readout { input, basis } => json!({"kind": "Readout", "input": input, "basis": basis}),
+        Node::Outer { left, right } => json!({"kind": "Outer", "left": left, "right": right}),
+        Node::Concat { parts } => json!({"kind": "Concat", "parts": parts}),
+        Node::Param { index } => json!({"kind": "Param", "index": index}),
+        Node::Call { rule, arguments } => json!({"kind": "Call", "rule": rule, "arguments": arguments}),
+        Node::Gain { input, coefficient } => json!({"kind": "Gain", "input": input, "coefficient": format!("{coefficient:?}")}),
+        Node::Attend { query, key, value, scale, rotary, causal } => json!({
+            "kind": "Attend", "query": query, "key": key, "value": value, "scale": format!("{scale:?}"),
+            "rotary": rotary.map(|r| json!({"base": r.base, "dims": r.dims, "half_split": r.half_split})), "causal": causal,
+        }),
+        Node::RmsNorm { input, epsilon } => json!({"kind": "RmsNorm", "input": input, "epsilon": epsilon}),
+        Node::Transposed { input, operator } => json!({"kind": "Transposed", "input": input, "operator": operator}),
+    }
+}
+
+/// The program verbatim as JSON (module note).
+fn program_json(program: &OperatorProgram) -> Value {
+    let matrix = |m: &ndarray::Array2<f64>| json!(m.outer_iter().map(|row| row.to_vec()).collect::<Vec<_>>());
+    json!({
+        "bases": program.bases.iter().map(|b| match b {
+            Basis::Indicator { domain } => json!({"kind": "Indicator", "domain": domain}),
+            Basis::Characters { domain, positions, declared } => {
+                json!({"kind": "Characters", "domain": domain, "positions": positions, "declared": declared})
+            }
+        }).collect::<Vec<_>>(),
+        "operators": program.operators.iter().map(|op| {
+            let body = match &op.body {
+                OperatorBody::Identity => json!({"kind": "Identity"}),
+                OperatorBody::Dense { values, present, precision } => json!({
+                    "kind": "Dense", "fraction_bits": precision.fraction_bits(),
+                    "present": present.indexed_iter().filter(|(_, k)| **k).map(|((r, c), _)| [r, c]).collect::<Vec<_>>(),
+                    "values": matrix(values),
+                }),
+                OperatorBody::LowRank { left, right, precision } => json!({
+                    "kind": "LowRank", "fraction_bits": precision.fraction_bits(), "left": matrix(left), "right": matrix(right),
+                }),
+            };
+            json!({
+                "name": op.name, "rows": interface_json(&op.rows), "cols": interface_json(&op.cols), "body": body,
+                "sources": op.provenance.sources, "derivation": op.provenance.derivation,
+            })
+        }).collect::<Vec<_>>(),
+        "nodes": program.nodes.iter().map(node_json).collect::<Vec<_>>(),
+        "rules": program.rules.iter().map(|rule| json!({
+            "name": rule.name, "inputs": rule.inputs.iter().map(interface_json).collect::<Vec<_>>(),
+            "nodes": rule.nodes.iter().map(node_json).collect::<Vec<_>>(), "output": rule.output,
+        })).collect::<Vec<_>>(),
+        "output": program.output,
+    })
+}
 
 fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
@@ -62,6 +134,7 @@ fn main() -> Result<(), String> {
             bytes.push(byte << (8 - message.len_bits() % 8));
         }
         std::fs::write(out.join(format!("program_n{n}.bits")), &bytes).map_err(|e| e.to_string())?;
+        std::fs::write(out.join(format!("program_n{n}.json")), program_json(&result.program).to_string()).map_err(|e| e.to_string())?;
         frontier.push(json!({
             "observations": n,
             "program_bits": result.score.program_bits,

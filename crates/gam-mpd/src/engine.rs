@@ -1148,31 +1148,7 @@ impl Primitive for DeadUnits {
                 }
                 let mut new_laws = laws.clone();
                 new_laws[group] = Law::Zero;
-                let mut blocks = Vec::new();
-                for (reader, reading) in program.nodes.iter().enumerate() {
-                    if let Node::Affine { terms, .. } = reading {
-                        for (argument, op) in terms {
-                            if *argument == index {
-                                for (r, c) in present_blocks(&program.operators[*op]) {
-                                    if c == group {
-                                        blocks.push(BlockRef { operator: *op, row: r, col: c });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if reader == *input
-                        && let Node::Affine { terms, bias } = reading
-                    {
-                        for op in terms.iter().map(|(_, op)| *op).chain(bias.iter().copied()) {
-                            for (r, c) in present_blocks(&program.operators[op]) {
-                                if r == group {
-                                    blocks.push(BlockRef { operator: op, row: r, col: c });
-                                }
-                            }
-                        }
-                    }
-                }
+                let blocks = zero_law_blocks(program, index, *input, group);
                 out.push(Proposal {
                     primitive: "dead_units",
                     kind: ProposalKind::Reduce,
@@ -1197,17 +1173,41 @@ pub struct LawSubstitution;
 
 /// The blocks a zero law on `group` of pointwise node `node` leaves unread or unwritten.
 fn zero_law_blocks(program: &OperatorProgram, node: usize, input: usize, group: usize) -> Vec<BlockRef> {
+    // One column (a reader's) or one row (the writer's) of an operator's present blocks, read off
+    // its block mask directly: O(groups), not a pass over every block.
+    let column = |op: usize| -> Vec<BlockRef> {
+        match &program.operators[op].body {
+            OperatorBody::Dense { present, .. } if group < present.ncols() => present
+                .column(group)
+                .indexed_iter()
+                .filter(|(_, keep)| **keep)
+                .map(|(row, _)| BlockRef { operator: op, row, col: group })
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    let row = |op: usize| -> Vec<BlockRef> {
+        match &program.operators[op].body {
+            OperatorBody::Dense { present, .. } if group < present.nrows() => present
+                .row(group)
+                .indexed_iter()
+                .filter(|(_, keep)| **keep)
+                .map(|(col, _)| BlockRef { operator: op, row: group, col })
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
     let mut blocks = Vec::new();
     for (reader, reading) in program.nodes.iter().enumerate() {
         let Node::Affine { terms, bias } = reading else { continue };
         for (argument, op) in terms {
             if *argument == node {
-                blocks.extend(present_blocks(&program.operators[*op]).into_iter().filter(|(_, c)| *c == group).map(|(row, col)| BlockRef { operator: *op, row, col }));
+                blocks.extend(column(*op));
             }
         }
         if reader == input {
             for op in terms.iter().map(|(_, op)| *op).chain(bias.iter().copied()) {
-                blocks.extend(present_blocks(&program.operators[op]).into_iter().filter(|(r, _)| *r == group).map(|(row, col)| BlockRef { operator: op, row, col }));
+                blocks.extend(row(op));
             }
         }
     }
