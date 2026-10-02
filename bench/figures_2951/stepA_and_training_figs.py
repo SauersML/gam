@@ -96,7 +96,7 @@ ax.annotate("VPD's pieces, our choices", (ol0, okl), xytext=(10, -16), textcoord
 ax.set_xscale("log")
 ax.set_xlabel("pieces switched on per word (log scale)", color=INK, labelpad=10)
 ax.set_ylabel("difference from the real model (KL, nats)", color=INK, labelpad=10)
-ax.set_title("Our own pieces: 1,297 → 774 pieces per word in training; VPD's pieces with our choices already beat VPD".replace("→", "to"),
+ax.set_title("Training our own pieces (blue) is still far right of VPD; VPD's pieces with our choices beat it",
              color=INK, fontsize=15, fontweight="bold", loc="left", pad=14)
 fig.text(0.01, 0.01, "training points: 512 held-out words of a different passage; VPD points: average over the test passages",
          color=INK2, fontsize=11)
