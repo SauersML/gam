@@ -2,7 +2,7 @@
 name = "gam-gpu"
 version = "0.3.157"
 edition = "2024"
-description = "GPU (CUDA/NVRTC) dispatch, device runtime, and BLAS kernels for the gam penalized-likelihood engine"
+description = "GPU (CUDA/NVRTC and Apple Metal) dispatch, device runtime, and BLAS kernels for the gam penalized-likelihood engine"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/SauersML/gam"
 
@@ -17,11 +17,20 @@ libloading = "0.9.0"
 libm = "0.2.16"
 log = "0.4.29"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
+rayon = "1.12.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 cudarc.workspace = true
+
+# The Apple-GPU backend. objc2-metal is the maintained Metal binding (the
+# `metal` crate is deprecated upstream in its favour); it is compiled only on
+# macOS, so Linux and every other target never see these crates.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSError", "NSArray", "NSObject"] }
+objc2-metal = "0.3.2"
 
 [dev-dependencies]
 gam-problem = { path = "../gam-problem" }

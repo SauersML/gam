@@ -16,7 +16,9 @@
 // denied future-incompat lint.
 #[macro_use]
 pub mod gpu_error;
+pub mod apple_gpu;
 pub mod backend_probe;
+pub mod banded;
 pub mod blas;
 #[cfg(target_os = "linux")]
 pub mod calibration;
@@ -27,10 +29,13 @@ mod dictionary_score;
 pub mod driver;
 pub mod engagement;
 pub mod linalg_dispatch;
+#[cfg(target_os = "macos")]
+pub(crate) mod metal;
 pub mod numerics_device;
 pub mod numerics_host;
 pub mod policy;
 pub mod pool;
+pub mod precision_bounds;
 pub mod row_kernel_race;
 pub mod solver;
 
@@ -134,6 +139,9 @@ pub enum GpuKernel {
     RowHessianDiagonal,
     RemlTrace,
     FinalInference,
+    /// A matrix product whose result carries a derived error band
+    /// ([`precision_bounds::GemmBand`]); the Metal f32 / df64 GEMM.
+    BandedGemm,
 }
 
 impl GpuKernel {
@@ -158,6 +166,7 @@ impl GpuKernel {
             Self::RowHessianDiagonal => "row-hessian-diagonal",
             Self::RemlTrace => "reml-trace",
             Self::FinalInference => "final-inference",
+            Self::BandedGemm => "banded-gemm",
         }
     }
 }
@@ -511,11 +520,13 @@ pub fn log_backend_inventory_once() {
     LOGGED.get_or_init(|| {
         let compiled_backends = if cfg!(target_os = "linux") {
             "cuda-dynamic"
+        } else if cfg!(target_os = "macos") {
+            "metal-f32-df64"
         } else {
             "none"
         };
         log::trace!(
-            "[GPU backend] policy={} compiled_backends={} kernels=dense-matvec,dense-transpose-matvec,dense-xtwx,candidate-screen,dense-solve,matrix-free-pcg,sparse-assembly,spatial-kernel-operator,marginal-slope-rows,marginal-slope-rows-host-pin,survival-marginal-slope-rows,polya-gamma-draws,sae-row-jet-channels,sae-row-jet-linear,sae-row-jet-bilinear,row-hessian-matvec,row-hessian-diagonal,reml-trace,final-inference",
+            "[GPU backend] policy={} compiled_backends={} kernels=dense-matvec,dense-transpose-matvec,dense-xtwx,candidate-screen,dense-solve,matrix-free-pcg,sparse-assembly,spatial-kernel-operator,marginal-slope-rows,marginal-slope-rows-host-pin,survival-marginal-slope-rows,polya-gamma-draws,sae-row-jet-channels,sae-row-jet-linear,sae-row-jet-bilinear,row-hessian-matvec,row-hessian-diagonal,reml-trace,final-inference,banded-gemm",
             global_policy().as_str(),
             compiled_backends
         );
