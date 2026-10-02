@@ -173,3 +173,17 @@ pub mod behaviors;
 
 #[cfg(test)]
 mod behaviors_tests;
+
+// Exact normalization of operator programs by equality saturation, gains kept symbolic.
+pub mod egraph;
+
+// Equality saturation on planted exact equivalences and symbolic gains.
+#[cfg(test)]
+mod egraph_tests;
+
+// Rule discovery by anti-unification over the saturated e-graph, bindings priced by the codec.
+pub mod antiunify;
+
+// Rule discovery on planted subroutines under orthogonal and linear changes of basis, ResidMLP toys, nulls.
+#[cfg(test)]
+mod antiunify_tests;
