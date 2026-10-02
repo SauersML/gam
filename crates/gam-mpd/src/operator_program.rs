@@ -67,7 +67,12 @@
 //!    width, label kind as a fixed index, first label index + 1); for a dense operator, per row
 //!    group the present column groups in the enumerative subset code, then the present reals as
 //!    one lattice message: count + 1 and the fraction bits in the prefix codes, and each lattice
-//!    index in the signed Elias δ code, which is subadditive, so splitting a real is never shorter;
+//!    index in the signed Elias δ code, which is subadditive, so splitting a real is never shorter.
+//!    A dense operator whose rows' first present reals do not decrease down the rows may be sent as the ordered kind instead: each of those first reals after
+//!    the first is sent as its increment over the previous one in the Elias δ code of `increment + 1`.
+//!    Its rows are then a sorted list, whose order costs nothing, where the plain kind pays for an
+//!    arbitrary order (about `log₂ n!` bits for `n` distinct rows). The encoder sends whichever kind
+//!    is shorter, and the decoder recovers the positions from the present blocks;
 //! 4. each node: its kind as a fixed index and its references as fixed indices into the objects
 //!    listed before it, a per-group law as a fixed index, a scale kind as a fixed index and its
 //!    argument in the prefix code;
@@ -77,9 +82,10 @@
 //! and it is not sent.
 
 use super::codec::{
-    BitReader, BitString, CodecError, decode_fixed_index, decode_prefix_integer, decode_signed_delta,
-    decode_signed_prefix_integer, decode_subset, encode_fixed_index, encode_prefix_integer, encode_signed_delta,
-    encode_signed_prefix_integer, encode_subset, fixed_index_len_bits, prefix_integer_len_bits, signed_delta_len_bits,
+    BitReader, BitString, CodecError, decode_elias_delta, decode_fixed_index, decode_prefix_integer, decode_signed_delta,
+    decode_signed_prefix_integer, decode_subset, elias_delta_len_bits, encode_elias_delta, encode_fixed_index,
+    encode_prefix_integer, encode_signed_delta, encode_signed_prefix_integer, encode_subset, fixed_index_len_bits,
+    prefix_integer_len_bits, signed_delta_len_bits,
     signed_prefix_integer_len_bits, subset_code_len_bits,
 };
 use super::precision::{DecodableArtifact, DeclaredPrecision, LatticeCode};
@@ -621,7 +627,8 @@ pub enum OperatorBody {
     LowRank { left: Array2<f64>, right: Array2<f64>, precision: DeclaredPrecision },
 }
 
-const OPERATOR_KINDS: usize = 3;
+/// Identity, dense, low-rank, and dense with ordered rows (module note, "The code").
+const OPERATOR_KINDS: usize = 4;
 
 /// A shared operator between two interfaces.
 #[derive(Clone, Debug, PartialEq)]
@@ -2886,30 +2893,87 @@ fn read_interface(reader: &mut BitReader<'_>) -> Result<Interface, ProgramError>
 
 /// The length of [`write_lattice`]'s message.
 fn lattice_bits(reals: &[f64], precision: DeclaredPrecision) -> Result<u64, ProgramError> {
-    let code = LatticeCode::encode(reals, precision).map_err(ProgramError::Code)?;
-    let mut bits = prefix_integer_len_bits(reals.len() as u64 + 1)?
+    ordered_lattice_bits(LatticeCode::encode(reals, precision).map_err(ProgramError::Code)?.indices(), precision, &[])
+}
+
+/// The length of a lattice message whose reals at `leads` after the first are sent as increments.
+fn ordered_lattice_bits(indices: &[i64], precision: DeclaredPrecision, leads: &[usize]) -> Result<u64, ProgramError> {
+    let mut bits = prefix_integer_len_bits(indices.len() as u64 + 1)?
         + signed_prefix_integer_len_bits(i64::from(precision.fraction_bits()))?;
-    for &index in code.indices() {
+    for &index in indices {
         bits += signed_delta_len_bits(index)?;
     }
+    for pair in leads.windows(2) {
+        bits -= signed_delta_len_bits(indices[pair[1]])?;
+        bits += elias_delta_len_bits(increment(indices[pair[0]], indices[pair[1]])? + 1)?;
+    }
     Ok(bits)
+}
+
+fn increment(from: i64, to: i64) -> Result<u64, ProgramError> {
+    u64::try_from(i128::from(to) - i128::from(from))
+        .map_err(|_| ProgramError::Code(format!("ordered rows decrease from {from} to {to}")))
+}
+
+/// The position in [`Operator::present_reals`] of each nonempty row's first real, in row order
+/// (blocks row group by row group, row-major within a block); `None` for fewer than two.
+fn row_leads(rows: &Interface, cols: &Interface, present: &Array2<bool>) -> Option<Vec<usize>> {
+    let mut leads = Vec::new();
+    let mut at = 0;
+    for (g, group) in rows.groups().iter().enumerate() {
+        let mut first = true;
+        for (c, col) in cols.groups().iter().enumerate() {
+            if !present[[g, c]] {
+                continue;
+            }
+            if first {
+                leads.extend((0..group.width).map(|k| at + k * col.width));
+                first = false;
+            }
+            at += group.width * col.width;
+        }
+    }
+    (leads.len() >= 2).then_some(leads)
+}
+
+/// The leads of a dense operator sent as the ordered kind: its rows' first reals do not decrease,
+/// and the ordered message is strictly shorter than the plain one.
+fn ordered_leads(operator: &Operator) -> Result<Option<Vec<usize>>, ProgramError> {
+    let OperatorBody::Dense { present, precision, .. } = &operator.body else { return Ok(None) };
+    let Some(leads) = row_leads(&operator.rows, &operator.cols, present) else { return Ok(None) };
+    let code = LatticeCode::encode(&operator.present_reals(), *precision).map_err(ProgramError::Code)?;
+    let indices = code.indices();
+    if leads.windows(2).any(|pair| indices[pair[1]] < indices[pair[0]]) {
+        return Ok(None);
+    }
+    let ordered = ordered_lattice_bits(indices, *precision, &leads)?;
+    Ok((ordered < ordered_lattice_bits(indices, *precision, &[])?).then_some(leads))
 }
 
 /// Reals on one lattice as a message: `count + 1` in the prefix code, the fraction bits in the
 /// signed prefix code, then each lattice index in the signed Elias δ code, whose subadditivity
 /// (`codec::elias_delta_len_bits`) keeps a split of a real from ever being shorter than the real.
-fn write_lattice(out: &mut BitString, reals: &[f64], precision: DeclaredPrecision) -> Result<(), ProgramError> {
+fn write_lattice(out: &mut BitString, reals: &[f64], precision: DeclaredPrecision, leads: &[usize]) -> Result<(), ProgramError> {
     let code = LatticeCode::encode(reals, precision).map_err(ProgramError::Code)?;
+    let indices = code.indices();
     encode_prefix_integer(out, reals.len() as u64 + 1)?;
     encode_signed_prefix_integer(out, i64::from(precision.fraction_bits()))?;
-    for &index in code.indices() {
+    let mut lead = 0;
+    for (k, &index) in indices.iter().enumerate() {
+        if lead < leads.len() && leads[lead] == k {
+            lead += 1;
+            if lead > 1 {
+                encode_elias_delta(out, increment(indices[leads[lead - 2]], index)? + 1)?;
+                continue;
+            }
+        }
         encode_signed_delta(out, index)?;
     }
     Ok(())
 }
 
-/// Read a [`write_lattice`] message: the precision and the decoded reals.
-fn read_lattice(reader: &mut BitReader<'_>) -> Result<(DeclaredPrecision, Vec<f64>), ProgramError> {
+/// Read a [`write_lattice`] message with the given leads: the precision and the decoded reals.
+fn read_lattice(reader: &mut BitReader<'_>, leads: &[usize]) -> Result<(DeclaredPrecision, Vec<f64>), ProgramError> {
     let count = decode_prefix_integer(reader)? - 1;
     if count > reader.remaining_bits() {
         return Err(ProgramError::Code(format!("a lattice of {count} reals beyond the message")));
@@ -2917,7 +2981,25 @@ fn read_lattice(reader: &mut BitReader<'_>) -> Result<(DeclaredPrecision, Vec<f6
     let fraction_bits = i32::try_from(decode_signed_prefix_integer(reader)?)
         .map_err(|error| ProgramError::Code(format!("fraction bits: {error}")))?;
     let precision = DeclaredPrecision::new(fraction_bits).map_err(ProgramError::Code)?;
-    let indices = (0..count).map(|_| decode_signed_delta(reader)).collect::<Result<Vec<_>, _>>()?;
+    let mut indices: Vec<i64> = Vec::with_capacity(count as usize);
+    let mut lead = 0;
+    for k in 0..count as usize {
+        if lead < leads.len() && leads[lead] == k {
+            lead += 1;
+            if lead > 1 {
+                let step = decode_elias_delta(reader)? - 1;
+                let previous = indices[leads[lead - 2]];
+                let index = i64::try_from(i128::from(previous) + i128::from(step))
+                    .map_err(|_| ProgramError::Code(format!("an ordered increment {step} overflows")))?;
+                indices.push(index);
+                continue;
+            }
+        }
+        indices.push(decode_signed_delta(reader)?);
+    }
+    if lead != leads.len() {
+        return Err(ProgramError::Code(format!("{} ordered rows for {count} reals", leads.len())));
+    }
     let code = LatticeCode::from_indices(precision, indices).map_err(ProgramError::Code)?;
     Ok((precision, code.decode().map_err(ProgramError::Code)?))
 }
@@ -2948,8 +3030,16 @@ fn operator_bits(operator: &Operator) -> Result<(u64, u64), ProgramError> {
             for row in present.outer_iter() {
                 structure += subset_code_len_bits(columns, row.iter().filter(|keep| **keep).count())?;
             }
-            let (count, reals) = split(&operator.present_reals(), *precision)?;
-            Ok((structure + count, reals))
+            let reals = operator.present_reals();
+            let total = match ordered_leads(operator)? {
+                Some(leads) => {
+                    let code = LatticeCode::encode(&reals, *precision).map_err(ProgramError::Code)?;
+                    ordered_lattice_bits(code.indices(), *precision, &leads)?
+                }
+                None => lattice_bits(&reals, *precision)?,
+            };
+            let count = prefix_integer_len_bits(reals.len() as u64 + 1)?;
+            Ok((structure + count, total - count))
         }
     }
 }
@@ -2989,7 +3079,7 @@ fn encode_coefficient(out: &mut BitString, coefficient: &Coefficient, parameters
         }
         Coefficient::Number(value) => {
             encode_fixed_index(out, 1, COEFFICIENT_KINDS)?;
-            write_lattice(out, &[*value], exact_precision([*value])?)?;
+            write_lattice(out, &[*value], exact_precision([*value])?, &[])?;
         }
         Coefficient::Sum(terms) | Coefficient::Product(terms) => {
             encode_fixed_index(out, if matches!(coefficient, Coefficient::Sum(_)) { 2 } else { 3 }, COEFFICIENT_KINDS)?;
@@ -3009,7 +3099,7 @@ fn decode_coefficient(reader: &mut BitReader<'_>, parameters: usize, depth: usiz
     Ok(match decode_fixed_index(reader, COEFFICIENT_KINDS)? {
         0 => Coefficient::Parameter(decode_fixed_index(reader, parameters.max(1))?),
         1 => {
-            let (_, reals) = read_lattice(reader)?;
+            let (_, reals) = read_lattice(reader, &[])?;
             Coefficient::Number(*reals.first().ok_or_else(|| ProgramError::Code("an empty coefficient number".to_string()))?)
         }
         kind => {
@@ -3116,7 +3206,7 @@ fn encode_node(out: &mut BitString, node: &Node, index: usize, code: &NodeCode<'
         }
         Node::RmsNorm { input, epsilon } => {
             encode_fixed_index(out, *input, refs)?;
-            write_lattice(out, &[*epsilon], exact_precision([*epsilon])?)?;
+            write_lattice(out, &[*epsilon], exact_precision([*epsilon])?, &[])?;
         }
         Node::Transposed { input, operator } => {
             encode_fixed_index(out, *input, refs)?;
@@ -3222,7 +3312,7 @@ fn decode_node(reader: &mut BitReader<'_>, index: usize, code: &NodeCode<'_>, in
         }
         16 => {
             let input = decode_fixed_index(reader, refs)?;
-            let (_, reals) = read_lattice(reader)?;
+            let (_, reals) = read_lattice(reader, &[])?;
             Node::RmsNorm { input, epsilon: *reals.first().ok_or_else(|| ProgramError::Code("an rms norm without epsilon".to_string()))? }
         }
         _ => Node::Transposed { input: decode_fixed_index(reader, refs)?, operator: decode_fixed_index(reader, ops)? },
@@ -3437,17 +3527,18 @@ impl OperatorProgram {
                     write_interface(&mut out, &operator.rows)?;
                     write_interface(&mut out, &operator.cols)?;
                     encode_prefix_integer(&mut out, left.ncols() as u64)?;
-                    write_lattice(&mut out, &operator.present_reals(), *precision)?;
+                    write_lattice(&mut out, &operator.present_reals(), *precision, &[])?;
                 }
                 OperatorBody::Dense { present, precision, .. } => {
-                    encode_fixed_index(&mut out, 1, OPERATOR_KINDS)?;
+                    let leads = ordered_leads(operator)?;
+                    encode_fixed_index(&mut out, if leads.is_some() { 3 } else { 1 }, OPERATOR_KINDS)?;
                     write_interface(&mut out, &operator.rows)?;
                     write_interface(&mut out, &operator.cols)?;
                     for row in present.outer_iter() {
                         let kept: Vec<usize> = row.iter().enumerate().filter(|(_, k)| **k).map(|(c, _)| c).collect();
                         encode_subset(&mut out, operator.cols.group_count(), &kept)?;
                     }
-                    write_lattice(&mut out, &operator.present_reals(), *precision)?;
+                    write_lattice(&mut out, &operator.present_reals(), *precision, leads.as_deref().unwrap_or(&[]))?;
                 }
             }
         }
@@ -3505,8 +3596,8 @@ impl OperatorProgram {
         let mut operators = Vec::new();
         for index in 0..operator_count {
             let kind = decode_fixed_index(reader, OPERATOR_KINDS)?;
-            let rows = read_interface(reader)?;
             let name = format!("decoded{index}");
+            let rows = read_interface(reader)?;
             if kind == 0 {
                 operators.push(Arc::new(Operator::identity(name, rows)));
                 continue;
@@ -3514,7 +3605,7 @@ impl OperatorProgram {
             let cols = read_interface(reader)?;
             if kind == 2 {
                 let rank = decode_prefix_integer(reader)? as usize;
-                let (precision, reals) = read_lattice(reader)?;
+                let (precision, reals) = read_lattice(reader, &[])?;
                 let split = rows.width() * rank;
                 if reals.len() != split + rank * cols.width() {
                     return Err(ProgramError::Code(format!("operator {index}: {} reals for rank {rank}", reals.len())));
@@ -3538,7 +3629,12 @@ impl OperatorProgram {
                     present[[r, c]] = true;
                 }
             }
-            let (precision, reals) = read_lattice(reader)?;
+            let leads = match kind {
+                3 => row_leads(&rows, &cols, &present)
+                    .ok_or_else(|| ProgramError::Code(format!("operator {index}: ordered rows without two nonempty rows")))?,
+                _ => Vec::new(),
+            };
+            let (precision, reals) = read_lattice(reader, &leads)?;
             let mut values = Array2::<f64>::zeros((rows.width(), cols.width()));
             let mut next = reals.iter();
             for ((r, c), &keep) in present.indexed_iter() {

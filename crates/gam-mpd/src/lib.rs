@@ -122,6 +122,13 @@ pub mod device;
 // Model exports (export.json and raw float64 tensors) as operator programs and contracts.
 pub mod import;
 
+// Exact invariance quotients: a program's canonical representative under its exact gauges, and the bits saved.
+pub mod quotient;
+
+// Quotients on planted programs: bit-identical scale gauges, banded shifts, exact savings.
+#[cfg(test)]
+mod quotient_tests;
+
 // Exact masked rewrites of gated units, norms, biases and residual edges.
 pub mod gated_rewrite;
 

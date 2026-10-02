@@ -161,7 +161,7 @@ pub fn library() -> Vec<Box<dyn Primitive>> {
     use super::derivatives::CurvaturePrecision;
     use super::factors::Factors;
     use super::operator_rewrites::{
-        BilinearConstantSide, CenterLogits, ComposeAffine, DropKeyBias, FoldConstants, PlaneBasis, PushThroughMix, StackTerms,
+        BilinearConstantSide, ComposeAffine, FoldConstants, PlaneBasis, PushThroughMix, StackTerms,
     };
     vec![
         Box::new(FoldConstants),
@@ -173,8 +173,7 @@ pub fn library() -> Vec<Box<dyn Primitive>> {
         Box::new(Coarsen),
         Box::new(DeadUnits),
         Box::new(StackTerms),
-        Box::new(CenterLogits),
-        Box::new(DropKeyBias),
+        Box::new(super::quotient::Canonical),
         Box::new(Factors::default()),
         Box::new(LawSubstitution),
         Box::new(CurvaturePrecision { probes: 4 }),
