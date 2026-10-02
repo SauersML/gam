@@ -289,6 +289,8 @@ mod tests_zoo_micro_local;
 
 #[cfg(test)]
 mod tests_termination_2235;
+#[cfg(test)]
+mod tests_rank_wall_profile_2939;
 
 #[cfg(test)]
 mod tests_alpha_persistence_2933;
