@@ -143,3 +143,44 @@ fn splitting_a_library_keeps_its_sum_and_lists_both_halves_where_the_piece_was_o
     assert!(error < 1e-12, "{error}");
     assert_eq!(masks.column(0), masks.column(1));
 }
+
+#[test]
+fn a_diagonal_gain_is_a_column_scale_forward_and_backward() {
+    let (mut program, family) = model();
+    let residual = Interface::uniform(WIDTH, 1, LabelKind::Unit, 0).expect("interface");
+    let gains = Array1::from_shape_fn(WIDTH, |i| 0.5 + noise(1200 + i));
+    let mut present = Array2::from_elem((WIDTH, WIDTH), false);
+    for i in 0..WIDTH {
+        present[[i, i]] = true;
+    }
+    let gain = Operator::blocks("gain", residual.clone(), residual.clone(), Array2::from_diag(&gains), present, precision(), Provenance::default())
+        .expect("blocks");
+    assert!(gain.diagonal().is_some());
+    // The embedding writes the unit-labelled residual, then the gain reads it.
+    let e = program.operators[0].matrix();
+    program.operators[0] = Arc::new(Operator::dense("E", residual.clone(), program.operators[0].cols.clone(), e, precision(), Provenance::default()).expect("dense"));
+    let w_in = program.operators[1].matrix();
+    program.operators[1] = Arc::new(Operator::dense("W_in", program.operators[1].rows.clone(), residual, w_in, precision(), Provenance::default()).expect("dense"));
+    program.operators.push(Arc::new(gain));
+    let gain_op = program.operators.len() - 1;
+    program.nodes.insert(3, Node::Affine { terms: vec![(2, gain_op)], bias: None });
+    program.nodes[4] = Node::Affine { terms: vec![(3, 1)], bias: None };
+    program.nodes[5] = Node::Pointwise { input: 4, laws: vec![Law::Relu; UNITS] };
+    program.nodes[6] = Node::Affine { terms: vec![(5, 2)], bias: None };
+    program.nodes[7] = Node::Readout { input: 6, basis: 0 };
+    program.output = 7;
+    let trace = program.execute(&family, true).expect("executes");
+    let rounded = program.operators[gain_op].diagonal().expect("a diagonal");
+    let expected = &trace.values[2] * &rounded;
+    let error = (&trace.values[3] - &expected).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    assert!(error == 0.0, "{error}");
+    let cotangent = Array2::from_shape_fn(trace.values[7].dim(), |(r, c)| noise(1300 + 7 * r + c));
+    let back = super::derivatives::vjp(&program, &family, &trace, cotangent.clone()).expect("reverse");
+    let tangent = Array2::from_shape_fn((WIDTH, WIDTH), |(i, j)| if i == j { noise(1400 + i) } else { 0.0 });
+    let tangents = [(gain_op, tangent.clone())].into_iter().collect();
+    let forward = super::derivatives::jvp(&program, &family, &trace, &tangents).expect("forward");
+    let left: f64 = cotangent.iter().zip(forward.iter()).map(|(a, b)| a * b).sum();
+    let moved = trace.values[2].dot(&tangent.t());
+    let right: f64 = back[3].as_ref().expect("a cotangent").iter().zip(moved.iter()).map(|(a, b)| a * b).sum();
+    assert!((left - right).abs() <= 1e-9 * left.abs().max(1.0), "{left} against {right}");
+}

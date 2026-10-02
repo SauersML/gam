@@ -312,21 +312,26 @@ impl Masked {
 /// `KL(p ‖ q)` per row between target logits and logits (rows × classes), and the cotangent of
 /// the total in the logits, `q − p` per row.
 pub fn kl(target: &Array2<f64>, logits: &Array2<f64>) -> (Array1<f64>, Array2<f64>) {
-    let rows = target.nrows();
-    let mut values = Array1::<f64>::zeros(rows);
+    use rayon::prelude::*;
     let mut cotangent = Array2::<f64>::zeros(logits.dim());
-    for r in 0..rows {
-        let (p, q) = (softmax(target.row(r)), softmax(logits.row(r)));
-        let mut total = 0.0;
-        for c in 0..p.len() {
-            if p[c] > 0.0 {
-                total += p[c] * (p[c].ln() - q[c].max(f64::MIN_POSITIVE).ln());
+    // Rows are independent: one per worker.
+    let values: Vec<f64> = cotangent
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .map(|(r, mut row)| {
+            let (p, q) = (softmax(target.row(r)), softmax(logits.row(r)));
+            let mut total = 0.0;
+            for c in 0..p.len() {
+                if p[c] > 0.0 {
+                    total += p[c] * (p[c].ln() - q[c].max(f64::MIN_POSITIVE).ln());
+                }
+                row[c] = q[c] - p[c];
             }
-            cotangent[[r, c]] = q[c] - p[c];
-        }
-        values[r] = total;
-    }
-    (values, cotangent)
+            total
+        })
+        .collect();
+    (Array1::from(values), cotangent)
 }
 
 fn softmax(z: ndarray::ArrayView1<'_, f64>) -> Array1<f64> {

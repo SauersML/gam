@@ -356,7 +356,13 @@ pub fn vjp(
             Node::Feature { .. } | Node::Raw { .. } | Node::Constant { .. } => {}
             Node::Affine { terms, .. } => {
                 for (argument, operator) in terms {
-                    add(&mut g, *argument, fast_ab(&cot, program.operators[*operator].matrix_cow().as_ref()));
+                    let op = &program.operators[*operator];
+                    // The identity and a norm gain are column scales, not matrix products.
+                    let term = match op.diagonal() {
+                        Some(d) => &cot * &d,
+                        None => fast_ab(&cot, op.matrix_cow().as_ref()),
+                    };
+                    add(&mut g, *argument, term);
                 }
             }
             Node::Bilinear { left, right, scale } => {

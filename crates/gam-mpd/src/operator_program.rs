@@ -759,6 +759,21 @@ impl Operator {
         }
     }
 
+    /// The diagonal of an operator that is one: the identity, or a dense operator between equal
+    /// interfaces of single-coordinate groups whose only present blocks are on the diagonal (a
+    /// norm gain). A product with it is a column scale, not a matrix product.
+    pub fn diagonal(&self) -> Option<Array1<f64>> {
+        match &self.body {
+            OperatorBody::Identity => Some(Array1::ones(self.rows.width())),
+            OperatorBody::Dense { values, present, .. } => {
+                let n = self.rows.width();
+                let single = self.cols.width() == n && self.rows.group_count() == n && self.cols.group_count() == n;
+                (single && present.indexed_iter().all(|((r, c), keep)| !*keep || r == c)).then(|| values.diag().to_owned())
+            }
+            OperatorBody::LowRank { .. } => None,
+        }
+    }
+
     /// The matrix (rows × cols) this operator applies.
     pub fn matrix(&self) -> Array2<f64> {
         match &self.body {
@@ -2159,11 +2174,20 @@ impl OperatorProgram {
                             }
                         }
                         OperatorBody::Dense { values: a, .. } => {
-                            out += &fast_abt(x, a);
+                            // A diagonal operator (a norm gain) is a column scale; one rounded
+                            // product per entry is within the summation bound below.
+                            let diagonal = op.diagonal();
+                            match &diagonal {
+                                Some(d) => out += &(x * d),
+                                None => out += &fast_abt(x, a),
+                            }
                             if let (Some(radius), Some(r)) = (radius.as_mut(), band(*argument)) {
                                 let mut lifted = x.mapv(|xv| growth * xv.abs());
                                 lifted += r;
-                                *radius += &fast_abt(&lifted, &a.mapv(f64::abs));
+                                match &diagonal {
+                                    Some(d) => *radius += &(&lifted * &d.mapv(f64::abs)),
+                                    None => *radius += &fast_abt(&lifted, &a.mapv(f64::abs)),
+                                }
                             }
                         }
                         OperatorBody::LowRank { left, right, .. } => {
