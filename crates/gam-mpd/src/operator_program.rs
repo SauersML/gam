@@ -1490,7 +1490,9 @@ impl OperatorProgram {
             return Err(ProgramError::Input("an incremental execution needs the same nodes and operators".to_string()));
         }
         let interfaces = self.interfaces()?;
-        let mut changed_ops: BTreeMap<usize, Vec<(usize, usize, Array2<f64>)>> = BTreeMap::new();
+        // Each changed operator's difference `A_new − A_old` (one vectorized subtraction), and the
+        // rows it changes.
+        let mut changed_ops: BTreeMap<usize, (Array2<f64>, Vec<usize>)> = BTreeMap::new();
         for (index, (new, old)) in self.operators.iter().zip(&base_program.operators).enumerate() {
             // A shared operator is unchanged without a look at its reals.
             if Arc::ptr_eq(new, old) || new.body == old.body {
@@ -1499,29 +1501,10 @@ impl OperatorProgram {
             if new.rows != old.rows || new.cols != old.cols {
                 return Err(ProgramError::Input(format!("operator {} changed its interfaces", new.name)));
             }
-            let mut blocks = Vec::new();
-            if let (OperatorBody::Dense { values: a, .. }, OperatorBody::Dense { values: b, .. }) = (&new.body, &old.body) {
-                // Block by block, materializing only the blocks that differ.
-                for r in 0..new.rows.group_count() {
-                    for c in 0..new.cols.group_count() {
-                        let (x, y) = (a.slice(s![new.rows.range(r), new.cols.range(c)]), b.slice(s![new.rows.range(r), new.cols.range(c)]));
-                        if x != y {
-                            blocks.push((r, c, &x - &y));
-                        }
-                    }
-                }
-            } else {
-                let difference = new.matrix() - old.matrix();
-                for r in 0..new.rows.group_count() {
-                    for c in 0..new.cols.group_count() {
-                        let block = difference.slice(s![new.rows.range(r), new.cols.range(c)]);
-                        if block.iter().any(|v| *v != 0.0) {
-                            blocks.push((r, c, block.to_owned()));
-                        }
-                    }
-                }
-            }
-            changed_ops.insert(index, blocks);
+            let difference = &*new.matrix_cow() - &*old.matrix_cow();
+            let rows: Vec<usize> =
+                difference.outer_iter().enumerate().filter(|(_, row)| row.iter().any(|v| *v != 0.0)).map(|(r, _)| r).collect();
+            changed_ops.insert(index, (difference, rows));
         }
         let mut changes: BTreeMap<usize, Change> = BTreeMap::new();
         for (index, node) in self.nodes.iter().enumerate() {
@@ -1536,19 +1519,15 @@ impl OperatorProgram {
                 Node::Affine { terms, bias } if !law_changed => {
                     let mut delta = Array2::<f64>::zeros(base_value.dim());
                     let mut touched = vec![false; base_value.ncols()];
-                    let rows_of = &interfaces[index];
                     for (argument, operator) in terms {
                         let x = &base.values[*argument];
-                        if let Some(blocks) = changed_ops.get(operator) {
-                            let cols_of = &self.operators[*operator].cols;
-                            for (r, c, block) in blocks {
-                                let range = rows_of.range(*r);
-                                let product = x.slice(s![.., cols_of.range(*c)]).dot(&block.t());
-                                let mut target = delta.slice_mut(s![.., range.clone()]);
-                                target += &product;
-                                for t in range {
-                                    touched[t] = true;
-                                }
+                        if let Some((difference, rows)) = changed_ops.get(operator) {
+                            let changed = difference.select(Axis(0), rows);
+                            let product = x.dot(&changed.t());
+                            for (k, &t) in rows.iter().enumerate() {
+                                let mut target = delta.column_mut(t);
+                                target += &product.column(k);
+                                touched[t] = true;
                             }
                         }
                         if let Some(change) = changes.get(argument) {
@@ -1559,14 +1538,11 @@ impl OperatorProgram {
                         }
                     }
                     if let Some(op) = bias
-                        && let Some(blocks) = changed_ops.get(op)
+                        && let Some((difference, rows)) = changed_ops.get(op)
                     {
-                        for (r, _, block) in blocks {
-                            let range = rows_of.range(*r);
-                            for (k, t) in range.enumerate() {
-                                delta.column_mut(t).mapv_inplace(|v| v + block[[k, 0]]);
-                                touched[t] = true;
-                            }
+                        for &t in rows {
+                            delta.column_mut(t).mapv_inplace(|v| v + difference[[t, 0]]);
+                            touched[t] = true;
                         }
                     }
                     let cols: Vec<usize> = touched.iter().enumerate().filter(|(_, t)| **t).map(|(c, _)| c).collect();
