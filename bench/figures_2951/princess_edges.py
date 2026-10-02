@@ -6,8 +6,8 @@ import sys
 
 import torch
 
-os.chdir(os.path.expanduser("~/mpd-data/vpd"))
-sys.path.insert(0, ".")
+os.chdir(os.path.expanduser("~/mpd-data/vpd"))  # tokenizer and runs are read relative to here
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vpd_2951"))
 from tokenizers import Tokenizer  # noqa: E402
 
 from vpd_model import load_target, load_vpd  # noqa: E402
