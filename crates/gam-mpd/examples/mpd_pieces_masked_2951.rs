@@ -142,33 +142,31 @@ fn main() -> Result<(), String> {
         Ok(masks)
     };
     let mut fit_masks = start_masks(&fit, &masked.libraries)?;
+    let mut eval_masks = start_masks(&eval, &masked.libraries)?;
     let mut costs = listing_costs(&fit_masks);
     let mut history = Vec::new();
     let mut previous = f64::INFINITY;
     for iteration in 0.. {
         let started = std::time::Instant::now();
         let (masks, selected_kl) = select(&masked, &fit, &fit_target, fit_masks, &costs, observations, samples)?;
-        log::info!("selection: KL {:.4} per input", selected_kl.sum() / fit.rows as f64);
+        log::info!("selection: KL {:.4} per input, {}", selected_kl.sum() / fit.rows as f64, report(&masks, &selected_kl));
         fit_masks = masks;
         costs = listing_costs(&fit_masks);
-        // Steps of the pieces until one saves less than a bit per input (or none lowers the KL).
-        let mut steps = 0usize;
-        let bits_per_nat = observations / std::f64::consts::LN_2;
-        while let Some((before, after)) = step_pieces(&mut masked, &fit, &fit_target, &fit_masks, samples, 0xF00D + (iteration * 1000 + steps) as u64)? {
-            steps += 1;
-            log::info!("pieces step {steps}: KL {:.4} -> {:.4} per input", before / fit.rows as f64, after / fit.rows as f64);
-            if (before - after) * bits_per_nat < fit.rows as f64 {
-                break;
-            }
-        }
+        // One step of the pieces, then the selection again from where it stands: alternating
+        // minimisation, stopped when an iteration saves less than a bit per input.
+        let steps = usize::from(
+            step_pieces(&mut masked, &fit, &fit_target, &fit_masks, samples, 0xF00D + iteration as u64)?
+                .inspect(|(before, after)| log::info!("pieces step: KL {:.4} -> {:.4} per input", before / fit.rows as f64, after / fit.rows as f64))
+                .is_some(),
+        );
         let fit_kl = {
             let family = masked.family(&fit, &fit_masks);
             gam_mpd::masked::forward(&masked, &family, &fit_target)?.0
         };
         let total = (listing_bits(&fit_masks, &costs).sum() + fit_kl.sum() * observations / std::f64::consts::LN_2) / fit.rows as f64;
-        // The eval inputs, selected from the same start with the fit's costs.
-        let eval_start = start_masks(&eval, &masked.libraries)?;
-        let (eval_masks, eval_kl) = select(&masked, &eval, &eval_target, eval_start, &costs, observations, samples)?;
+        // The eval inputs, selected with the fit's costs from where their last selection stands.
+        let (masks, eval_kl) = select(&masked, &eval, &eval_target, eval_masks, &costs, observations, samples)?;
+        eval_masks = masks;
         let point = json!({
             "iteration": iteration,
             "fit": report(&fit_masks, &fit_kl),
