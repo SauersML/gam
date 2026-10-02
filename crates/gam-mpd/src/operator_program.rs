@@ -3241,7 +3241,7 @@ impl OperatorProgram {
     }
 
     /// The message's parts other than the operators: header, bases, rules and nodes.
-    fn frame_bits(&self) -> Result<(u64, Vec<u64>, u64, u64), ProgramError> {
+    pub(crate) fn frame_bits(&self) -> Result<(u64, Vec<u64>, u64, u64), ProgramError> {
         let interfaces = self.interfaces()?;
         let header_bits = prefix_integer_len_bits(self.bases.len() as u64 + 1)?
             + prefix_integer_len_bits(self.operators.len() as u64 + 1)?

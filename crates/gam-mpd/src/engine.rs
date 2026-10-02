@@ -724,7 +724,12 @@ fn search(
             }
             let mut candidate = program.clone();
             apply_edit(&mut candidate, &proposal.edit)?;
-            let bits = candidate.code_bits_from(&program, current.program_bits, &mut base_operator_bits)? as f64;
+            // A restriction (and a law replacement's restriction) is priced from the block tables;
+            // anything else measures the operators it changed.
+            let bits = match restriction_bits(&proposal.edit, &program, &candidate, &mut tables)? {
+                Some(delta) => (current.program_bits as i64 + delta) as f64,
+                None => candidate.code_bits_from(&program, current.program_bits, &mut base_operator_bits)? as f64,
+            };
             if screenings >= budget.screenings {
                 break 'search Stop::ScreeningBudget;
             }
@@ -1050,6 +1055,52 @@ impl BlockBits {
             - prefix_integer_len_bits(self.reals + 1).map_err(code)? as i64;
         Ok(bits)
     }
+}
+
+/// The exact change of the message a restriction makes, from the block tables: the dropped
+/// present blocks of each operator ([`BlockBits::drop_delta`]) and, for a law replacement, the
+/// change of the frame (its laws are in the node code). `None` for an edit that is not a restriction.
+fn restriction_bits(
+    edit: &Edit,
+    program: &OperatorProgram,
+    candidate: &OperatorProgram,
+    tables: &mut BTreeMap<usize, Option<BlockBits>>,
+) -> Result<Option<i64>, EngineError> {
+    let blocks: Vec<BlockRef> = match edit {
+        Edit::DropBlocks { blocks } | Edit::Laws { blocks, .. } => blocks.clone(),
+        Edit::DropGroup { operator, axis, group } => {
+            let OperatorBody::Dense { present, .. } = &program.operators[*operator].body else { return Ok(None) };
+            match axis {
+                GroupAxis::Columns => present.column(*group).indexed_iter().filter(|(_, k)| **k).map(|(r, _)| BlockRef { operator: *operator, row: r, col: *group }).collect(),
+                GroupAxis::Rows => present.row(*group).indexed_iter().filter(|(_, k)| **k).map(|(c, _)| BlockRef { operator: *operator, row: *group, col: c }).collect(),
+            }
+        }
+        Edit::Precision { .. } | Edit::Program(_) => return Ok(None),
+    };
+    let mut by_operator: BTreeMap<usize, BTreeSet<(usize, usize)>> = BTreeMap::new();
+    for b in blocks {
+        let OperatorBody::Dense { present, .. } = &program.operators[b.operator].body else { return Ok(None) };
+        if present.get((b.row, b.col)).copied().unwrap_or(false) {
+            by_operator.entry(b.operator).or_default().insert((b.row, b.col));
+        }
+    }
+    let mut delta = 0i64;
+    for (operator, dropped) in by_operator {
+        let table = match tables.entry(operator) {
+            std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::btree_map::Entry::Vacant(e) => e.insert(BlockBits::of(&program.operators[operator])?),
+        };
+        let Some(table) = table.as_ref() else { return Ok(None) };
+        delta += table.drop_delta(&dropped.into_iter().collect::<Vec<_>>())?;
+    }
+    if let Edit::Laws { .. } = edit {
+        let frame = |p: &OperatorProgram| -> Result<i64, EngineError> {
+            let (h, b, r, n) = p.frame_bits()?;
+            Ok((h + b.iter().sum::<u64>() + r + n) as i64)
+        };
+        delta += frame(candidate)? - frame(program)?;
+    }
+    Ok(Some(delta))
 }
 
 /// How each operator is read by the program's nodes, for telling which restrictions leave every
