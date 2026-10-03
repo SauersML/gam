@@ -330,7 +330,8 @@ def stage_eval():
     import torch
     import torch.nn.functional as F
     target, W0, models, meta = edit_variants()
-    models = {k: v for k, v in models.items() if not k.startswith("vpd_a")}  # LoRAs and their matched VPD edits
+    # the 282-example LoRAs and their strength-matched VPD edits (the benchmarks cover all eight LoRA settings)
+    models = {k: v for k, v in models.items() if "lora282" in k}
     names = list(models)
     json.dump({"models": names, "meta": meta}, open(OUTD / "models.json", "w"), indent=1)
 
@@ -353,20 +354,21 @@ def stage_eval():
                                                              ("ptop", np.float16), ("lpc", np.float32))} for nm in names}
     done_path = OUTD / "eval_done.txt"
     done = int(done_path.read_text()) if done_path.exists() else 0
-    B, PC = 2, 128  # rows per forward; positions per vocab-sized block (keeps the job inside 2 GiB)
+    B, PC = 4, 128  # rows per forward; positions per vocab-sized block (keeps the job inside 2 GiB)
     resid, final, head = split_forward(target)
 
     with torch.no_grad():
         ids = torch.from_numpy(tokens[:1].astype(np.int64)).to("mps")  # the split forward is the model's forward
         err = (head(final(*resid(ids), W0)) - F.log_softmax(target(ids), -1)).abs().max().item()
         assert err < 1e-3, err
+        order = np.argsort(-lens, kind="stable")  # longest first; a batch stops at its longest document
         for r0 in range(done, R, B):
-            ids = torch.from_numpy(tokens[r0:r0 + B].astype(np.int64)).to("mps")
+            rs = np.sort(order[r0:r0 + B])
+            ids = torch.from_numpy(tokens[rs].astype(np.int64)).to("mps")
             xmid, g2 = resid(ids)
             xb = final(xmid, g2, W0)
             xe = {nm: final(xmid, g2, W0 + models[nm]) for nm in names}
-            rs = slice(r0, r0 + ids.shape[0])
-            for p0 in range(0, P, PC):
+            for p0 in range(0, int(lens[rs].max()) - 1, PC):
                 ps = slice(p0, min(p0 + PC, P))
                 nxt = ids[:, ps.start + 1:ps.stop + 1]
                 lb = head(xb[:, ps])
