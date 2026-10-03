@@ -462,7 +462,9 @@ impl<'a> Block<'a> {
         };
         let (p, hl, gp, rp) = side(writer, wg, &self.fu, &self.metric.fisher)?;
         let (q, hr, gq, rq) = side(reader, rg, &self.cv, &self.metric.moment)?;
-        let h = hl.dot(&hr.t());
+        // The dense `H` only for the linear cores, which pair two charts' groups; a pair with an
+        // identity side codes generic cores only, on `H`'s factors.
+        let h = if writer.identity || reader.identity { Array2::zeros((0, 0)) } else { hl.dot(&hr.t()) };
         Ok(Sides { p, q, hl, hr, h, gp, gq, rp, rq })
     }
 
