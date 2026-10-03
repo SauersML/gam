@@ -1,6 +1,6 @@
 //! Libraries fitted on each site's own inputs (#2951, `gam_mpd::site_fit`).
 //!
-//! `mpd_site_fit_2951 EXPORT_DIR OUT_DIR OBSERVATIONS TRAIN [DRAWS] [ROUNDS] [SITES] [CONTEXT]`
+//! `mpd_site_fit_2951 EXPORT_DIR OUT_DIR OBSERVATIONS TRAIN [DRAWS] [ROUNDS] [SITES] [CONTEXT] [library:DIR]`
 //!
 //! `EXPORT_DIR` is a language-model export (`gam_mpd::import::import_language_model`) whose first
 //! `TRAIN` sequences of `CONTEXT` positions (default 512) are the inputs. Every site of the model
@@ -12,10 +12,15 @@
 //! statistics. After every round the library goes to `OUT_DIR/{site}.v.f64` (pieces × d_in) and
 //! `OUT_DIR/{site}.u.f64` (pieces × d_out), raw float64, the `library:DIR` start of
 //! `mpd_pieces_masked_2951`, and its rounds to `OUT_DIR/{site}.rounds.json`.
+//!
+//! With `library:DIR` nothing is fitted: each site's given library (`DIR/{site}.{v,u}.f64`, as
+//! above) is measured under the same code (`gam_mpd::site_fit::measure`, its sets selected from all
+//! on), and the measurement goes to `OUT_DIR/{site}.measure.json`.
 
 use gam_mpd::import::import_language_model;
 use gam_mpd::masked::{matrix, sites};
-use gam_mpd::site_fit::{Settings, fit, samples};
+use gam_mpd::masked::Library;
+use gam_mpd::site_fit::{Settings, fit, measure, samples};
 use ndarray::{Array1, Array2};
 use serde_json::json;
 use std::path::PathBuf;
@@ -30,7 +35,7 @@ fn write_f64(path: &PathBuf, m: &Array2<f64>) -> Result<(), String> {
 fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
-    let usage = "mpd_site_fit_2951 EXPORT_DIR OUT_DIR OBSERVATIONS TRAIN [DRAWS] [ROUNDS] [SITES] [CONTEXT]";
+    let usage = "mpd_site_fit_2951 EXPORT_DIR OUT_DIR OBSERVATIONS TRAIN [DRAWS] [ROUNDS] [SITES] [CONTEXT] [library:DIR]";
     let export = PathBuf::from(args.get(1).ok_or(usage)?);
     let out = PathBuf::from(args.get(2).ok_or(usage)?);
     let observations: f64 = args.get(3).ok_or(usage)?.parse().map_err(|e| format!("OBSERVATIONS: {e}"))?;
@@ -39,6 +44,10 @@ fn main() -> Result<(), String> {
     let rounds: usize = args.get(6).map_or(Ok(50), |v| v.parse()).map_err(|e| format!("ROUNDS: {e}"))?;
     let wanted: Option<Vec<String>> = args.get(7).filter(|s| *s != "all").map(|s| s.split(',').map(str::to_string).collect());
     let context: usize = args.get(8).map_or(Ok(512), |v| v.parse()).map_err(|e| format!("CONTEXT: {e}"))?;
+    let given = match args.get(9) {
+        Some(a) => Some(PathBuf::from(a.strip_prefix("library:").ok_or(usage)?)),
+        None => None,
+    };
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
     let imported = import_language_model(&export, train, context)?;
     let model = &imported.program;
@@ -63,6 +72,22 @@ fn main() -> Result<(), String> {
     drop(statistics);
     for (k, ((site, w), sample)) in chosen.iter().zip(&maps).zip(&gathered).enumerate() {
         let (d_out, d_in) = w.dim();
+        if let Some(dir) = &given {
+            let read = |side: &str, cols: usize| -> Result<Array2<f64>, String> {
+                let path = dir.join(format!("{}.{side}.f64", site.name));
+                let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                let values: Vec<f64> = bytes.chunks_exact(8).map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])).collect();
+                Array2::from_shape_vec((values.len() / cols, cols), values).map_err(|e| e.to_string())
+            };
+            let library = Library { v: read("v", d_in)?, u: read("u", d_out)?, mean: Array1::zeros(d_in) };
+            let round = measure(k, w, sample, &description, observations, &library)?;
+            eprintln!("{} given library of {}: code {:.1} bits per input (description {:.1}, error {:.1}), L0 {:.2}, corner {:.2}",
+                site.name, library.v.nrows(), round.code, round.description, round.error, round.l0, round.corner_share);
+            let record = json!({"site": site.name, "observations": observations, "pieces": library.v.nrows(), "code": round.code,
+                "description": round.description, "error": round.error, "l0": round.l0, "corner_share": round.corner_share});
+            std::fs::write(out.join(format!("{}.measure.json", site.name)), record.to_string()).map_err(|e| e.to_string())?;
+            continue;
+        }
         let settings = Settings { observations, pieces: d_in + d_out, rounds, seed: 0xF17 + k as u64 };
         let started = std::time::Instant::now();
         let mut log = Vec::new();

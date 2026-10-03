@@ -246,9 +246,11 @@ impl Fitting<'_> {
         }
     }
 
-    /// The sets: every input's single flips swept until none lowers its code. Returns the total
-    /// description and error bits and each input's error bits.
-    fn select(&mut self, v: &Array2<f64>, u: &Array2<f64>, bits: &Array1<f64>) -> (f64, f64, Vec<f64>) {
+    /// The code of `(v, u)`: with `flip`, every input's single flips swept first until none lowers
+    /// its code; with `keep`, each input's worst point is recorded (both leave the state as it was
+    /// otherwise, so a trial library is measured by neither). Returns the total description and
+    /// error bits and each input's error bits.
+    fn code(&mut self, v: &Array2<f64>, u: &Array2<f64>, bits: &Array1<f64>, flip: bool, keep: bool) -> (f64, f64, Vec<f64>) {
         let c_total = self.pieces;
         let uf = u.dot(self.fisher);
         let k = uf.dot(&u.t());
@@ -306,7 +308,7 @@ impl Fitting<'_> {
                     let mut ss = zq_off;
                     let weight = scale * s[t];
                     let mut current = worst(rr, rs, ss, off).0;
-                    for _ in 0..c_total {
+                    for _ in 0..if flip { c_total } else { 0 } {
                         let mut flipped = false;
                         for c in 0..c_total {
                             let sigma = if m[c] == 1 { -1.0 } else { 1.0 };
@@ -336,7 +338,9 @@ impl Fitting<'_> {
                             break;
                         }
                     }
-                    *corner = worst(rr, rs, ss, off).1;
+                    if keep {
+                        *corner = worst(rr, rs, ss, off).1;
+                    }
                     let listed: f64 = (0..c_total).filter(|c| m[*c] == 1).map(|c| bits[c]).sum();
                     (listed, weight * current)
                 })
@@ -426,10 +430,9 @@ impl Fitting<'_> {
         gradient.mapv(f64::from)
     }
 
-    /// `H d` of the reads' quadratic along `d` (C × d_in), and `dᵀ H d`.
-    fn read_curvature(&self, d: &Array2<f64>, k32: &Array2<f32>, kappa: &[f64]) -> (Array2<f64>, f64) {
+    /// `dᵀ H d` of the reads' quadratic along `d` (C × d_in).
+    fn read_curvature(&self, d: &Array2<f64>, k32: &Array2<f32>, kappa: &[f64]) -> f64 {
         let d32 = single(d);
-        let mut out = Array2::<f32>::zeros(d.dim());
         let mut quadratic = 0.0;
         for start in (0..self.rows()).step_by(CHUNK) {
             let end = (start + CHUNK).min(self.rows());
@@ -437,26 +440,21 @@ impl Fitting<'_> {
             let (mu, nk) = self.chunk_gates(start, end, kappa);
             let dz = &da * &mu;
             let kdz = product(dz.view(), false, k32.view(), false);
-            let mut hd = Array2::<f32>::zeros(da.dim());
             for r in 0..end - start {
-                let w = 2.0 * self.scale * self.s[start + r];
                 let mut q = 0.0f64;
                 for c in 0..self.pieces {
-                    let (dzc, dac) = (f64::from(dz[[r, c]]), f64::from(da[[r, c]]));
-                    let row = f64::from(mu[[r, c]]) * f64::from(kdz[[r, c]]) + f64::from(nk[[r, c]]) * dac / 12.0;
-                    q += dzc * f64::from(kdz[[r, c]]) + f64::from(nk[[r, c]]) * dac * dac / 12.0;
-                    hd[[r, c]] = (w * row) as f32;
+                    let dac = f64::from(da[[r, c]]);
+                    q += f64::from(dz[[r, c]]) * f64::from(kdz[[r, c]]) + f64::from(nk[[r, c]]) * dac * dac / 12.0;
                 }
-                quadratic += w * q;
+                quadratic += 2.0 * self.scale * self.s[start + r] * q;
             }
-            gemm(&mut out, true, hd.view(), true, self.x.slice(s![start..end, ..]), false, 1.0);
         }
-        (out.mapv(f64::from), quadratic)
+        quadratic
     }
 
-    /// The reads by preconditioned conjugate gradients until a step saves less than a bit per
-    /// input (at most `d_in` steps). Returns the new reads and the steps taken.
-    fn reads(&self, v: &Array2<f64>, u: &Array2<f64>, right: &Array2<f64>) -> (Array2<f64>, usize) {
+    /// The reads' step (module note): the preconditioned negative gradient of the charged points'
+    /// quadratic in `V`, and the length minimising that quadratic along it (`None` when it is flat).
+    fn read_step(&self, v: &Array2<f64>, u: &Array2<f64>, right: &Array2<f64>) -> Option<(Array2<f64>, f64)> {
         let k = u.dot(self.fisher).dot(&u.t());
         let k32 = single(&k);
         let kappa: Vec<f64> = (0..self.pieces).map(|c| k[[c, c]]).collect();
@@ -468,40 +466,15 @@ impl Fitting<'_> {
                 *l += 2.0 * self.scale * self.s[t] * (f64::from(mu * mu) * kappa[c] + f64::from(nu) * kappa[c] / 12.0);
             }
         }
-        let precondition = |g: &Array2<f64>| -> Array2<f64> {
-            let mut out = g.dot(right);
-            for (c, mut row) in out.outer_iter_mut().enumerate() {
-                let l = left[c];
-                row.mapv_inplace(|x| if l > 0.0 { x / l } else { 0.0 });
-            }
-            out
-        };
-        let mut v = v.clone();
-        let gradient = self.read_gradient(&v, u, &k32, &kappa);
-        let mut residual = -gradient;
-        let mut z = precondition(&residual);
-        let mut direction = z.clone();
-        let mut rz = (&residual * &z).sum();
-        let mut steps = 0;
-        for _ in 0..v.ncols() {
-            let (hd, quadratic) = self.read_curvature(&direction, &k32, &kappa);
-            if !(quadratic > 0.0) || !(rz > 0.0) {
-                break;
-            }
-            let alpha = rz / quadratic;
-            v.scaled_add(alpha, &direction);
-            steps += 1;
-            if 0.5 * alpha * rz < self.rows() as f64 {
-                break;
-            }
-            residual.scaled_add(-alpha, &hd);
-            z = precondition(&residual);
-            let next = (&residual * &z).sum();
-            let beta = next / rz;
-            rz = next;
-            direction = &z + &(direction * beta);
+        let gradient = self.read_gradient(v, u, &k32, &kappa);
+        let mut direction = -gradient.dot(right);
+        for (c, mut row) in direction.outer_iter_mut().enumerate() {
+            let l = left[c];
+            row.mapv_inplace(|x| if l > 0.0 { x / l } else { 0.0 });
         }
-        (v, steps)
+        let slope = -(&gradient * &direction).sum();
+        let quadratic = self.read_curvature(&direction, &k32, &kappa);
+        (slope > 0.0 && quadratic > 0.0).then(|| (direction, slope / quadratic))
     }
 }
 
@@ -513,6 +486,60 @@ pub struct Settings {
     pub pieces: usize,
     pub rounds: usize,
     pub seed: u64,
+}
+
+impl<'a> Fitting<'a> {
+    /// The state of a fit of `pieces` subcomponents on `samples`, every subcomponent on.
+    fn new(site: usize, w: &Array2<f64>, samples: &'a Samples, observations: f64, pieces: usize) -> Result<Self, String> {
+        let (d_out, d_in) = w.dim();
+        let x = &samples.reads;
+        let rows = x.nrows();
+        if x.ncols() != d_in || samples.sensitivity.len() != rows || samples.fisher.dim() != (d_out, d_out) || rows == 0 || pieces == 0 {
+            return Err(format!("site {site}: samples of {rows} inputs do not fit its {d_out}×{d_in} map"));
+        }
+        let y = product(x.view(), false, single(w).view(), true);
+        let yf = product(y.view(), false, single(&samples.fisher).view(), false);
+        let yfy: Vec<f64> = (0..rows).map(|t| y.row(t).iter().zip(yf.row(t).iter()).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum()).collect();
+        Ok(Self {
+            x,
+            y,
+            yfy,
+            s: &samples.sensitivity,
+            fisher: &samples.fisher,
+            scale: observations / (2.0 * LN_2),
+            pieces,
+            masks: vec![1; rows * pieces],
+            corner: vec![true; rows],
+        })
+    }
+
+    /// The round's report of the state as last coded.
+    fn report(&self, round: usize, description: f64, error: f64) -> Round {
+        let rows = self.rows() as f64;
+        let on = self.masks.iter().filter(|m| **m == 1).count() as f64;
+        let corner_share = self.corner.iter().filter(|c| **c).count() as f64 / rows;
+        Round { round, code: (description + error) / rows, description: description / rows, error: error / rows, l0: on / rows, corner_share, reseeded: 0, read_steps: 0 }
+    }
+}
+
+/// Every subcomponent's description bits.
+fn description_bits(describe: &dyn Describe, site: usize, v: &Array2<f64>, u: &Array2<f64>) -> Result<Array1<f64>, String> {
+    Ok((0..v.nrows())
+        .into_par_iter()
+        .map(|c| describe.bits(site, u.slice(s![c..c + 1, ..]), v.slice(s![c..c + 1, ..])))
+        .collect::<Result<Vec<f64>, String>>()?
+        .into())
+}
+
+/// A given library's code on `samples` (module note): every input's sets selected from all on.
+pub fn measure(site: usize, w: &Array2<f64>, samples: &Samples, describe: &dyn Describe, observations: f64, library: &Library) -> Result<Round, String> {
+    if library.mean.iter().any(|m| *m != 0.0) {
+        return Err("a measured library reads the uncentred input".to_string());
+    }
+    let mut fitting = Fitting::new(site, w, samples, observations, library.v.nrows())?;
+    let bits = description_bits(describe, site, &library.v, &library.u)?;
+    let (description, error, _) = fitting.code(&library.v, &library.u, &bits, true, true);
+    Ok(fitting.report(0, description, error))
 }
 
 /// A library of `settings.pieces` subcomponents for site `site` (`w` its `d_out × d_in` map, `site`
@@ -527,27 +554,10 @@ pub fn fit(
     mut progress: impl FnMut(&Round, &Library),
 ) -> Result<Library, String> {
     let Settings { observations, pieces, rounds, seed } = settings;
-    let (d_out, d_in) = w.dim();
+    let d_in = w.ncols();
     let x = &samples.reads;
     let rows = x.nrows();
-    if x.ncols() != d_in || samples.sensitivity.len() != rows || samples.fisher.dim() != (d_out, d_out) || rows == 0 || pieces == 0 {
-        return Err(format!("site {site}: samples of {rows} inputs do not fit its {d_out}×{d_in} map"));
-    }
-    let y = product(x.view(), false, single(w).view(), true);
-    let yf = product(y.view(), false, single(&samples.fisher).view(), false);
-    let yfy: Vec<f64> = (0..rows).map(|t| y.row(t).iter().zip(yf.row(t).iter()).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum()).collect();
-    drop(yf);
-    let mut fitting = Fitting {
-        x,
-        y,
-        yfy,
-        s: &samples.sensitivity,
-        fisher: &samples.fisher,
-        scale: observations / (2.0 * LN_2),
-        pieces,
-        masks: vec![1; rows * pieces],
-        corner: vec![true; rows],
-    };
+    let mut fitting = Fitting::new(site, w, samples, observations, pieces)?;
     // The reads' inverse second moment (seeding) and the sensitivity-weighted one (the reads'
     // right preconditioner).
     let seeding = pseudo_inverse(&samples.second_moment, rows)?;
@@ -576,34 +586,57 @@ pub fn fit(
     }
     // Every subcomponent on: the writes that make the library the map on these inputs.
     let mut u = fitting.writes(&v)?;
-    let mut previous = f64::INFINITY;
+    let mut bits = description_bits(describe, site, &v, &u)?;
+    let (description, error, mut errors) = fitting.code(&v, &u, &bits, true, true);
+    let mut current = description + error;
+    let mut report = fitting.report(0, description, error);
     for round in 0..rounds {
-        let library = Library { v: v.clone(), u: u.clone(), mean: Array1::zeros(d_in) };
-        let bits: Array1<f64> = (0..pieces)
-            .into_par_iter()
-            .map(|c| describe.bits(site, u.slice(s![c..c + 1, ..]), v.slice(s![c..c + 1, ..])))
-            .collect::<Result<Vec<f64>, String>>()?
-            .into();
-        let (description, error, errors) = fitting.select(&v, &u, &bits);
-        let code = (description + error) / rows as f64;
-        let on: Vec<usize> = (0..pieces).map(|c| (0..rows).filter(|t| fitting.masks[t * pieces + c] == 1).count()).collect();
-        let l0 = on.iter().sum::<usize>() as f64 / rows as f64;
-        let corner_share = fitting.corner.iter().filter(|c| **c).count() as f64 / rows as f64;
-        let mut report = Round { round, code, description: description / rows as f64, error: error / rows as f64, l0, corner_share, reseeded: 0, read_steps: 0 };
-        if previous - code < 1.0 {
-            progress(&report, &library);
-            return Ok(library);
+        // The writes: their closed form under the charged points, halved until the code falls.
+        let target = fitting.writes(&v)?;
+        let step = &target - &u;
+        let before = fitting.corner.clone();
+        let mut eta = 1.0;
+        let mut moved = false;
+        while eta > f64::EPSILON {
+            let trial = &u + &(&step * eta);
+            let (d, e, _) = fitting.code(&v, &trial, &bits, false, true);
+            if d + e < current {
+                (u, current, moved) = (trial, d + e, true);
+                break;
+            }
+            eta *= 0.5;
         }
-        previous = code;
-        u = fitting.writes(&v)?;
-        let (next, steps) = fitting.reads(&v, &u, &right);
-        v = next;
-        report.read_steps = steps;
-        // Reseeding: every subcomponent on nowhere, from the inputs of largest error in turn.
-        let dead: Vec<usize> = (0..pieces).filter(|c| on[*c] == 0).collect();
+        if !moved {
+            fitting.corner = before;
+        }
+        // The reads: one preconditioned step at the quadratic's minimiser, halved until it falls.
+        if let Some((direction, alpha)) = fitting.read_step(&v, &u, &right) {
+            let before = fitting.corner.clone();
+            let mut eta = alpha;
+            let mut moved = false;
+            while eta > alpha * f64::EPSILON {
+                let trial = &v + &(&direction * eta);
+                let (d, e, _) = fitting.code(&trial, &u, &bits, false, true);
+                report.read_steps += 1;
+                if d + e < current {
+                    (v, current, moved) = (trial, d + e, true);
+                    break;
+                }
+                eta *= 0.5;
+            }
+            if !moved {
+                fitting.corner = before;
+            }
+        }
+        // Reseeding: every subcomponent on nowhere, from the inputs of largest error in turn, kept
+        // when the sets selected with it code the inputs in fewer bits.
+        let on: Vec<bool> = (0..pieces).map(|c| (0..rows).any(|t| fitting.masks[t * pieces + c] == 1)).collect();
+        let dead: Vec<usize> = (0..pieces).filter(|c| !on[*c]).collect();
         if !dead.is_empty() {
+            let saved = (v.clone(), u.clone(), fitting.masks.clone(), fitting.corner.clone());
             let mut order: Vec<usize> = (0..rows).collect();
             order.sort_by(|a, b| errors[*b].total_cmp(&errors[*a]));
+            let mut reseeded = 0;
             for (&c, &t) in dead.iter().zip(&order) {
                 let read = seed_read(t);
                 let xt = x.row(t).mapv(f64::from);
@@ -620,10 +653,28 @@ pub fn fit(
                 }
                 v.row_mut(c).assign(&read);
                 u.row_mut(c).assign(&(residual / a));
-                report.reseeded += 1;
+                reseeded += 1;
+            }
+            bits = description_bits(describe, site, &v, &u)?;
+            let (d, e, _) = fitting.code(&v, &u, &bits, true, true);
+            if d + e < current {
+                report.reseeded = reseeded;
+            } else {
+                (v, u, fitting.masks, fitting.corner) = saved;
             }
         }
-        progress(&report, &library);
+        progress(&report, &Library { v: v.clone(), u: u.clone(), mean: Array1::zeros(d_in) });
+        // The next round's sets, under the descriptions as the steps left them.
+        bits = description_bits(describe, site, &v, &u)?;
+        let (description, error, next_errors) = fitting.code(&v, &u, &bits, true, true);
+        let previous = report.code;
+        report = fitting.report(round + 1, description, error);
+        current = description + error;
+        errors = next_errors;
+        if previous - report.code < 1.0 {
+            break;
+        }
     }
+    progress(&report, &Library { v: v.clone(), u: u.clone(), mean: Array1::zeros(d_in) });
     Ok(Library { v, u, mean: Array1::zeros(d_in) })
 }
