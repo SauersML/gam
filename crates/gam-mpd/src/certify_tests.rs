@@ -266,7 +266,7 @@ fn a_pinned_box_certifies_its_own_divergence() {
             .enumerate()
             .map(|(k, m)| Array2::from_shape_fn(m.dim(), |(r, c)| 0.5 + 0.5 * noise(400 + 31 * k + 7 * r + c)))
             .collect();
-        let gates = Gates { lower: point.clone(), upper: point.clone() };
+        let gates = Gates { lower: point.clone(), upper: point.clone(), restored: None };
         let bound = certify(&masked, &family, &target, Some(&radius), &gates, Relaxation::sound(64)).expect("certificate");
         let (kl, _, _) = forward(&masked, &masked.family(&family, &point), &target).expect("forward");
         for r in 0..family.rows {
@@ -359,4 +359,40 @@ fn a_screened_adversary_returns_the_float64_one() {
         }
     }
     assert!(screened_any, "no fixture has a lone head to screen");
+}
+
+/// Under a restoration claim the certificate is at or above every word's KL with any one or two of its
+/// off subcomponents restored (all of them, one at a time, and random pairs at random strengths) and
+/// above every point the projected adversary visits.
+#[test]
+fn restoration_certificates_contain_every_restoration_found() {
+    for (name, program, family) in fixtures() {
+        let (masked, masks, target, radius) = masked(&program, &family, 23);
+        for k in [1usize, 2] {
+            let gates = Gates::restoring(&masks, k);
+            let bound = certify(&masked, &family, &target, Some(&radius), &gates, Relaxation::sound(4096)).expect("certificate");
+            let mut worst = adversary(&masked, &family, &target, &gates, None, 8, 4, 23).expect("adversary");
+            let off: Vec<(usize, usize, usize)> = masks
+                .iter()
+                .enumerate()
+                .flat_map(|(s, m)| m.indexed_iter().filter(|(_, v)| **v <= 0.0).map(move |((r, c), _)| (s, r, c)))
+                .collect();
+            for (n, &(site, row, column)) in off.iter().enumerate() {
+                let mut point: Vec<Array2<f64>> = masks.clone();
+                point[site][[row, column]] = 1.0;
+                if k == 2 {
+                    // A second off gate of the same word, at a random strength.
+                    if let Some(&(s2, _, c2)) = off.iter().skip((n * 7 + 3) % off.len()).find(|(s2, r2, c2)| *r2 == row && (*s2, *c2) != (site, column)) {
+                        point[s2][[row, c2]] = 0.5 + 0.5 * noise(n);
+                    }
+                }
+                let (kl, _, _) = forward(&masked, &masked.family(&family, &point), &target).expect("forward");
+                ndarray::Zip::from(&mut worst).and(&kl).for_each(|w, &v| *w = w.max(v));
+            }
+            for r in 0..family.rows {
+                assert!(bound[r].is_finite(), "{name}, k {k}: row {r} unbounded");
+                assert!(bound[r] >= worst[r], "{name}, k {k}: row {r} certified {} below a found {}", bound[r], worst[r]);
+            }
+        }
+    }
 }

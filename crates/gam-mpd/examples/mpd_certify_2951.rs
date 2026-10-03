@@ -13,7 +13,7 @@
 //! * the certificate with at most `BUDGET` symbols per word (default 4096);
 //! * the certificate after `LEAVES` leaves of branching on that word alone (default 33).
 //!
-//! `mpd_certify_2951 lm EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json SEQUENCES CONTEXT [BUDGET] [LEAVES] [FREE] [STEPS] [OBSERVATIONS] [ROUNDING]`
+//! `mpd_certify_2951 lm EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json SEQUENCES CONTEXT [BUDGET] [LEAVES] [FREE] [STEPS] [OBSERVATIONS] [ROUNDING] [CLAIMS]`
 //!
 //! A language-model export (`import_language_model`), the first `CONTEXT` positions of its first
 //! `SEQUENCES` sequences (or of sequences `a..b` for `SEQUENCES` `a:b`, sequence `a` alone for `a:`). Positions only read earlier ones, so a prefix is exact. The sites with a
@@ -30,6 +30,8 @@
 //! symbols (default 512), and the sequence's box is split into `LEAVES` leaves (default 1: no
 //! branching). With `OBSERVATIONS` positive, a second set per word is chosen by the masked selection under
 //! the box claim (`select_boxed`, coded in `OBSERVATIONS`) from the given sets, and certified the same way.
+//! `CLAIMS` lists what each set is certified under: `box` (the default) and `restore:K`, at most `K`
+//! off subcomponents restored per word (`gam_mpd::certify::Gates::restoring`), comma-separated.
 //! `ROUNDING` `real` reports the relaxation's bound without any rounding enclosure (not a proof; the
 //! default `sound` is one).
 
@@ -145,6 +147,7 @@ fn toy(args: &[String]) -> Result<(), String> {
             let row_gates = Gates {
                 lower: gates.lower.iter().map(|m| m.select(ndarray::Axis(0), &[r])).collect(),
                 upper: gates.upper.iter().map(|m| m.select(ndarray::Axis(0), &[r])).collect(),
+                restored: gates.restored,
             };
             branched[r] = certify_branching(&masked, &one, &row_target, Some(&row_radius), row_gates, Relaxation::sound(budget), leaves)?.kl[0];
         }
@@ -189,7 +192,7 @@ fn toy(args: &[String]) -> Result<(), String> {
 }
 
 fn lm(args: &[String]) -> Result<(), String> {
-    let usage = "mpd_certify_2951 lm EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json SEQUENCES CONTEXT [BUDGET] [LEAVES] [FREE] [STEPS] [OBSERVATIONS] [ROUNDING]";
+    let usage = "mpd_certify_2951 lm EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json SEQUENCES CONTEXT [BUDGET] [LEAVES] [FREE] [STEPS] [OBSERVATIONS] [ROUNDING] [CLAIMS]";
     let export = PathBuf::from(args.get(2).ok_or(usage)?);
     let library_dir = PathBuf::from(args.get(3).ok_or(usage)?);
     let sets_dir = PathBuf::from(args.get(4).ok_or(usage)?);
@@ -217,6 +220,19 @@ fn lm(args: &[String]) -> Result<(), String> {
         Some("real") => false,
         Some(other) => return Err(format!("ROUNDING {other}: expected sound or real; {usage}")),
     };
+    // `CLAIMS`: comma-separated `box` (the default) and `restore:K` (at most `K` off subcomponents
+    // restored per word, `gam_mpd::certify::Gates::restoring`).
+    let claims: Vec<Option<usize>> = arg(args, 14, "box".to_string())?
+        .split(',')
+        .map(|c| match c {
+            "box" => Ok(None),
+            other => other
+                .strip_prefix("restore:")
+                .and_then(|k| k.parse().ok())
+                .map(Some)
+                .ok_or_else(|| format!("CLAIMS {other}: expected box or restore:K; {usage}")),
+        })
+        .collect::<Result<_, _>>()?;
     let started = Instant::now();
     let imported = import_language_model(&export, first + sequences, context)?;
     let model = &imported.program;
@@ -362,8 +378,9 @@ fn lm(args: &[String]) -> Result<(), String> {
         sets.push(("box".to_string(), boxed));
     }
     let mut report = Vec::new();
-    for (name, masks) in sets {
-        let mut gates = Gates::claim(&masks);
+    for (name, masks, restored) in sets.into_iter().flat_map(|(n, m)| claims.iter().map(move |c| (n.clone(), m.clone(), *c))) {
+        let claim = restored.map_or_else(|| "box".to_string(), |k| format!("restore:{k}"));
+        let mut gates = Gates { restored, ..Gates::claim(&masks) };
         // The off pieces outside `FREE` stay off.
         for (k, site) in masked.sites.iter().enumerate() {
             let pinned = free != "all" && !free.split(',').any(|p| site.name.starts_with(p));
@@ -378,11 +395,11 @@ fn lm(args: &[String]) -> Result<(), String> {
         let seconds = at.elapsed().as_secs_f64();
         for r in 0..family.rows {
             if branched.kl[r] < found[r] {
-                return Err(format!("{name}: row {r} certified {} below the adversary's {}", branched.kl[r], found[r]));
+                return Err(format!("{name} under {claim}: row {r} certified {} below the adversary's {}", branched.kl[r], found[r]));
             }
         }
         eprintln!(
-            "{name}: L0 {:.1}, corner KL {:.4}, adversary {:.4}, certified {:.4}, branched {:.4} ({seconds:.1}s)",
+            "{name} under {claim}: L0 {:.1}, corner KL {:.4}, adversary {:.4}, certified {:.4}, branched {:.4} ({seconds:.1}s)",
             listed_l0(&masks),
             kl.mean().unwrap_or(0.0),
             found.mean().unwrap_or(0.0),
@@ -390,7 +407,7 @@ fn lm(args: &[String]) -> Result<(), String> {
             branched.kl.mean().unwrap_or(0.0)
         );
         report.push(json!({
-            "sets": name, "l0": listed_l0(&masks), "leaves": branched.leaves, "seconds": seconds,
+            "sets": name, "claim": claim, "l0": listed_l0(&masks), "leaves": branched.leaves, "seconds": seconds,
             "kl": summary(&kl), "adversary": summary(&found), "certified": summary(&branched.root), "branched": summary(&branched.kl),
             "rows": { "kl": kl.to_vec(), "adversary": found.to_vec(), "certified": branched.root.to_vec(), "branched": branched.kl.to_vec() },
         }));

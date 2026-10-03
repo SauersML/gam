@@ -82,6 +82,21 @@
 //! width, at the box's center. It bounds each half, and the worst case is the largest bound over
 //! the leaves.
 //!
+//! # Restoration claims
+//!
+//! A box claim lets every off subcomponent of a word move at once, and on a deep model the sum of
+//! their reaches swamps any relaxation. A restoration claim ([`Gates::restoring`]) states less: at
+//! each word at most `k` of its off subcomponents are restored, in any combination and strength,
+//! which is the polytope `g ∈ [0, 1]^n, Σ g ≤ k` (the convex hull of restoring any `k`). Its gates
+//! are budgeted symbols `η ∈ [−1, 1]` with `Σ |η| ≤ k` per word, a superset. Over them a
+//! coordinate `Σ_s a_s η_s` reaches only the `k` largest `|a_s|` of each word's gates rather than
+//! their sum ([`spread_of`]), and every place a form's reach, a dropped generator's enclosure or a
+//! logit gap is bounded counts them so. A gated read `z_c g_c` becomes the budgeted symbol
+//! `η′_c = z_c g_c / M_c` with `M_c` the read's reach, so the budget survives the product
+//! ([`gated`]); a product of two forms carrying budgeted gates bounds their quadratic part by the
+//! product of the spreads alone. The adversary projects every point onto the claim
+//! ([`Gates::fit`]), and a restoration claim is not branched (its gates all start at zero).
+//!
 //! # What an infinite bound means, and what bounds the problem allows
 //!
 //! An infinite bound is the relaxation's failure, not the model's. In real arithmetic every masked
@@ -182,6 +197,46 @@ fn union(lists: &[&[u64]]) -> (Vec<u64>, Vec<Vec<usize>>) {
     (all, places)
 }
 
+/// Whether symbol `id` is a gate counted against its row's restoration budget (module note,
+/// "Restoration claims"), and that row.
+fn budgeted(id: u64) -> Option<usize> {
+    (id >> 62 == 2).then_some(((id >> 21) as usize) & (FIELD - 1))
+}
+
+/// Per column of `coef` (one row per symbol of `ids`), an upper bound on `|Σ_s coef_s ε_s|` over the
+/// symbols' range: `Σ_s |coef_s|` over free symbols, and over each budgeted row's gates the sum of
+/// the `restored` largest `|coef_s|` (`|ε_s| ≤ 1` and `Σ |ε_s| ≤ restored` within the row). With
+/// `restored` zero every symbol is free.
+fn spread_of(ids: &[u64], coef: ArrayView2<'_, f64>, restored: usize) -> Array1<f64> {
+    let width = coef.ncols();
+    let mut out = Array1::<f64>::zeros(width);
+    let mut groups: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
+    for (s, g) in coef.outer_iter().enumerate() {
+        match budgeted(ids[s]).filter(|_| restored > 0) {
+            Some(row) => groups.entry(row).or_default().push(s),
+            None => Zip::from(&mut out).and(&g).for_each(|o, &v| *o += v.abs()),
+        }
+    }
+    let mut column: Vec<f64> = Vec::new();
+    for members in groups.values() {
+        if members.len() <= restored {
+            for &s in members {
+                Zip::from(&mut out).and(coef.row(s)).for_each(|o, &v| *o += v.abs());
+            }
+            continue;
+        }
+        for d in 0..width {
+            column.clear();
+            column.extend(members.iter().map(|&s| coef[[s, d]].abs()));
+            column.select_nth_unstable_by(restored - 1, |a, b| b.total_cmp(a));
+            out[d] += column[..restored].iter().sum::<f64>();
+        }
+    }
+    let grow = 1.0 + gamma(ids.len() + 1);
+    out.mapv_inplace(|v| up(v * grow));
+    out
+}
+
 /// Fresh symbols, each defined once by the [`enclose`] that draws it.
 static FRESH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(3 << 62);
 
@@ -196,19 +251,13 @@ fn principal_share(budget: usize) -> usize {
 /// so it is `Q_{:,j} s_j` times one fresh symbol. `Q` is an orthonormalised power iterate of the
 /// generators' span (a randomized range finder); only the identity matters for soundness. Returns the
 /// fresh symbols, their generators and the radius `Σ_i |r_i|`, with the products' and sums' rounding.
-fn enclose(dropped: &Array2<f64>, k: usize) -> (Vec<u64>, Array2<f64>, Array1<f64>) {
+fn enclose(dropped: &Array2<f64>, ids: &[u64], restored: usize, k: usize) -> (Vec<u64>, Array2<f64>, Array1<f64>) {
     let (m, width) = dropped.dim();
-    let total = |a: &Array2<f64>| {
-        let mut out = Array1::<f64>::zeros(a.ncols());
-        for row in a.outer_iter() {
-            Zip::from(&mut out).and(&row).for_each(|o, &v| *o += v.abs());
-        }
-        out
-    };
+    // `Σ_i |a_i|` over the dropped symbols, a budgeted row's gates counted by its largest.
+    let total = |a: &Array2<f64>| spread_of(ids, a.view(), restored);
     let k = k.min(m).min(width);
     if k == 0 {
-        let grow = 1.0 + gamma(m + 1);
-        return (Vec::new(), Array2::zeros((0, width)), total(dropped).mapv(|v| up(v * grow)));
+        return (Vec::new(), Array2::zeros((0, width)), total(dropped));
     }
     let mut rng = SplitMix(0x2951_e1c1 ^ ((m as u64) << 32) ^ width as u64);
     let omega = Array2::from_shape_fn((m, k), |_| rng.next() - 0.5);
@@ -229,16 +278,15 @@ fn enclose(dropped: &Array2<f64>, k: usize) -> (Vec<u64>, Array2<f64>, Array1<f6
         }
     }
     let p = dropped.dot(&q);
-    let reach = total(&p).mapv(|v| up(v * (1.0 + gamma(m + 1))));
+    let reach = total(&p);
     let residual = dropped - &p.dot(&q.t());
     let q_abs = q.mapv(f64::abs);
     let spread = q_abs.dot(&reach);
     let g = gamma(k + width + 4);
-    let grow = 1.0 + gamma(m + 1);
     let radius = Zip::from(&total(&residual))
         .and(&total(dropped))
         .and(&spread)
-        .map_collect(|&r, &d, &s| up(up(r * grow) + up(g * up(d + up(3.0 * s)))));
+        .map_collect(|&r, &d, &s| up(r + up(g * up(d + up(3.0 * s)))));
     let mut generators = Array2::<f64>::zeros((k, width));
     for j in 0..k {
         generators.row_mut(j).assign(&q.column(j).mapv(|v| v * reach[j]));
@@ -257,12 +305,15 @@ struct Row {
     radius: Array1<f64>,
     /// A bound on the `ℓ₂` norm of a further error vector (module note, "Rounding").
     ball: f64,
+    /// The restoration budget of its budgeted gate symbols (module note, "Restoration claims"); zero
+    /// when it has none.
+    restored: usize,
 }
 
 impl Row {
     fn exact(center: Array1<f64>, radius: Array1<f64>) -> Self {
         let width = center.len();
-        Self { center, ids: Vec::new(), coef: Array2::zeros((0, width)), radius, ball: 0.0 }
+        Self { center, ids: Vec::new(), coef: Array2::zeros((0, width)), radius, ball: 0.0, restored: 0 }
     }
 
     fn width(&self) -> usize {
@@ -280,15 +331,14 @@ impl Row {
         reach
     }
 
-    /// Per coordinate, an upper bound on `Σ_s |G_s|`.
+    /// Per coordinate, an upper bound on `|Σ_s G_s ε_s|` ([`spread_of`]).
     fn spread(&self) -> Array1<f64> {
-        let mut out = Array1::<f64>::zeros(self.width());
-        for g in self.coef.outer_iter() {
-            Zip::from(&mut out).and(&g).for_each(|o, &v| *o += v.abs());
-        }
-        let grow = 1.0 + gamma(self.ids.len() + 1);
-        out.mapv_inplace(|v| up(v * grow));
-        out
+        spread_of(&self.ids, self.coef.view(), self.restored)
+    }
+
+    /// Whether it carries a gate counted against a restoration budget.
+    fn budgeted(&self) -> bool {
+        self.restored > 0 && self.ids.iter().any(|id| budgeted(*id).is_some())
     }
 
     /// Per coordinate, an upper bound on `|c| + Σ_s |G_s| + r`: what every computed term is below.
@@ -314,6 +364,7 @@ impl Row {
             coef: self.coef.slice(s![.., c..c + 1]).to_owned(),
             radius: Array1::from_elem(1, self.radius[c]),
             ball: self.ball,
+            restored: self.restored,
         }
     }
 
@@ -332,7 +383,8 @@ impl Row {
         keep.sort_unstable();
         let mut dropped: Vec<usize> = order[held..].to_vec();
         dropped.sort_unstable();
-        let (fresh, generators, radius) = enclose(&self.coef.select(Axis(0), &dropped), principal);
+        let dropped_ids: Vec<u64> = dropped.iter().map(|&d| self.ids[d]).collect();
+        let (fresh, generators, radius) = enclose(&self.coef.select(Axis(0), &dropped), &dropped_ids, self.restored, principal);
         Zip::from(&mut self.radius).and(&radius).for_each(|r, &d| *r = up(*r + d));
         let mut rows: Vec<(u64, Array1<f64>)> = keep.iter().map(|&k| (self.ids[k], self.coef.row(k).to_owned())).collect();
         rows.extend(fresh.into_iter().zip(generators.outer_iter().map(|g| g.to_owned())));
@@ -356,6 +408,7 @@ impl Row {
                 .and(&magnitude)
                 .map_collect(|&r, &m| up(up(k.abs() * r) + up(up(2.0 * unit() * k.abs() + extra) * m))),
             ball: up(up(k.abs() + extra) * self.ball),
+            restored: self.restored,
         }
     }
 
@@ -391,7 +444,8 @@ fn combine(terms: &[(&Row, f64)]) -> Row {
     let g = gamma(terms.len() + 2);
     Zip::from(&mut radius).and(&magnitude).for_each(|r, &m| *r = up(*r + up(g * m)));
     let ball = terms.iter().fold(0.0, |b, (x, sign)| up(b + up(sign.abs() * x.ball)));
-    Row { center, ids, coef, radius, ball }
+    let restored = terms.iter().map(|(x, _)| x.restored).max().unwrap_or(0);
+    Row { center, ids, coef, radius, ball, restored }
 }
 
 /// The sum of a form's coordinates, as a one-coordinate form.
@@ -406,6 +460,7 @@ fn total(x: &Row) -> Row {
         radius: Array1::from_elem(1, radius),
         // `|Σ_d e_d| ≤ √n ‖e‖`.
         ball: up((width as f64).sqrt().next_up() * x.ball),
+        restored: x.restored,
     }
 }
 
@@ -428,7 +483,8 @@ fn concat(parts: &[&Row]) -> Row {
         offset += w;
     }
     let ball = up(parts.iter().map(|p| p.ball * p.ball).sum::<f64>() * (1.0 + gamma(parts.len() + 1))).sqrt().next_up();
-    Row { center, ids, coef, radius, ball }
+    let restored = parts.iter().map(|p| p.restored).max().unwrap_or(0);
+    Row { center, ids, coef, radius, ball, restored }
 }
 
 /// The product of two forms coordinate by coordinate, a one-coordinate form broadcast against the
@@ -455,8 +511,11 @@ fn product(l: &Row, r: &Row) -> Row {
     }
     let mut shift = Array1::<f64>::zeros(width);
     let mut paired = Array1::<f64>::zeros(width);
+    // A shared symbol's square lies in `[0, 1]`; with budgeted gates present the quadratic part is
+    // bounded by the product of the two spreads alone (`|XY| ≤ |X||Y|`), which they still bound.
+    let tighten = !(l.budgeted() || r.budgeted());
     let (mut i, mut j) = (0, 0);
-    while i < l.ids.len() && j < r.ids.len() {
+    while tighten && i < l.ids.len() && j < r.ids.len() {
         match l.ids[i].cmp(&r.ids[j]) {
             std::cmp::Ordering::Less => i += 1,
             std::cmp::Ordering::Greater => j += 1,
@@ -501,7 +560,42 @@ fn product(l: &Row, r: &Row) -> Row {
     };
     let (lr, rr) = (rest(l), rest(r));
     let ball = up(up(up(l.ball * size(&rr, wl == width)) + up(r.ball * size(&lr, wr == width))) + up(l.ball * r.ball));
-    Row { center, ids, coef, radius, ball }
+    Row { center, ids, coef, radius, ball, restored: l.restored.max(r.restored) }
+}
+
+/// `z ⊙ m` for a mask `m` under a restoration claim ([`free_row`]): each fixed entry scales its
+/// coordinate exactly, and a gated coordinate `z_c g_c` is `M_c η′_c` with `M_c = |c| + Σ|G| + r` its
+/// reach without the ball and `η′_c = z_c g_c / M_c`, a budgeted symbol of the gate's own id
+/// (`|η′_c| ≤ g_c`, so the row's budget still holds). The ball meets `m` through `|m| ≤ 1`. One
+/// gate per coordinate: a block wider than one column is refused upstream.
+fn gated(z: &Row, m: &Row) -> Row {
+    let width = z.width();
+    let mut out = product(z, &Row::exact(m.center.clone(), Array1::zeros(width)));
+    let reach = {
+        let mut r = z.spread();
+        Zip::from(&mut r).and(&z.center).and(&z.radius).for_each(|a, &c, &rad| *a = up(up(*a + c.abs()) + rad));
+        r
+    };
+    let mut rows: Vec<(u64, Array1<f64>)> = out.ids.iter().copied().zip(out.coef.outer_iter().map(|g| g.to_owned())).collect();
+    for (k, id) in m.ids.iter().enumerate() {
+        let mut generator = Array1::<f64>::zeros(width);
+        for c in 0..width {
+            if m.coef[[k, c]] != 0.0 {
+                generator[c] = reach[c];
+            }
+        }
+        rows.push((*id, generator));
+    }
+    rows.sort_unstable_by_key(|r| r.0);
+    let mut coef = Array2::<f64>::zeros((rows.len(), width));
+    for (k, (_, g)) in rows.iter().enumerate() {
+        coef.row_mut(k).assign(g);
+    }
+    out.ids = rows.into_iter().map(|r| r.0).collect();
+    out.coef = coef;
+    out.ball = up(out.ball + z.ball);
+    out.restored = z.restored.max(m.restored);
+    out
 }
 
 /// An operator read as the linear map `x ↦ M x` (written × read), with what its relaxation reads of it.
@@ -629,19 +723,18 @@ fn affine(terms: &[(&Row, &Map, usize)], bias: Option<&Array1<f64>>, row: usize,
     for &i in &enclosed {
         in_enclosure[i] = true;
     }
-    let mut radius = Array1::<f64>::zeros(written);
-    let mut dropped_rows: Vec<Array1<f64>> = Vec::new();
-    let mut boxed = 0usize;
+    let restored = terms.iter().map(|(x, _, _)| x.restored).max().unwrap_or(0);
+    let mut dropped_rows: Vec<(u64, Array1<f64>)> = Vec::new();
+    let mut boxed: Vec<usize> = Vec::new();
     for (u, g) in coef.outer_iter().enumerate().filter(|(u, _)| !keep[*u]) {
         if in_enclosure[u] {
-            dropped_rows.push(g.to_owned());
+            dropped_rows.push((ids[u], g.to_owned()));
         } else {
-            Zip::from(&mut radius).and(&g).for_each(|o, &v| *o += v.abs());
-            boxed += 1;
+            boxed.push(u);
         }
     }
-    let grow = 1.0 + gamma(boxed + 1);
-    radius.mapv_inplace(|v| up(v * grow));
+    let boxed_ids: Vec<u64> = boxed.iter().map(|&u| ids[u]).collect();
+    let mut radius = spread_of(&boxed_ids, coef.select(Axis(0), &boxed).view(), restored);
     // What passes through `|M_t|`: each term's rounding magnitude and its unpromoted radii.
     let g = gamma(terms.iter().map(|(x, _, _)| x.width()).max().unwrap_or(0) + terms.len() + 4);
     for (i, f) in fresh.iter().enumerate().filter(|(i, _)| !keep[ids.len() + i]) {
@@ -650,7 +743,7 @@ fn affine(terms: &[(&Row, &Map, usize)], bias: Option<&Array1<f64>>, row: usize,
             for &(t, j) in &f.2 {
                 generator.scaled_add(terms[t].0.radius[j], &terms[t].1.m().column(j));
             }
-            dropped_rows.push(generator);
+            dropped_rows.push((f.0, generator));
         } else {
             for &(t, j) in &f.2 {
                 passed[t][j] = up(passed[t][j] + terms[t].0.radius[j]);
@@ -682,10 +775,11 @@ fn affine(terms: &[(&Row, &Map, usize)], bias: Option<&Array1<f64>>, row: usize,
     let mut principal_rows: Vec<(u64, Array1<f64>)> = Vec::new();
     if !dropped_rows.is_empty() {
         let mut dropped = Array2::<f64>::zeros((dropped_rows.len(), written));
-        for (i, r) in dropped_rows.iter().enumerate() {
+        for (i, (_, r)) in dropped_rows.iter().enumerate() {
             dropped.row_mut(i).assign(r);
         }
-        let (ids_new, generators, extra) = enclose(&dropped, principal);
+        let dropped_ids: Vec<u64> = dropped_rows.iter().map(|(id, _)| *id).collect();
+        let (ids_new, generators, extra) = enclose(&dropped, &dropped_ids, restored, principal);
         Zip::from(&mut radius).and(&extra).for_each(|r, &x| *r = up(*r + x));
         principal_rows = ids_new.into_iter().zip(generators.outer_iter().map(|g| g.to_owned())).collect();
     }
@@ -709,7 +803,7 @@ fn affine(terms: &[(&Row, &Map, usize)], bias: Option<&Array1<f64>>, row: usize,
     for (s, (_, generator)) in rows.iter().enumerate() {
         out.row_mut(s).assign(generator);
     }
-    Row { center, ids: rows.into_iter().map(|r| r.0).collect(), coef: out, radius, ball }
+    Row { center, ids: rows.into_iter().map(|r| r.0).collect(), coef: out, radius, ball, restored }
 }
 
 /// A scalar curve a relaxation replaces by lines (module note, "Operations").
@@ -908,7 +1002,17 @@ fn mean_square(x: &Row, mean: &Row, epsilon: f64) -> (f64, f64) {
     let (mut l, mut h) = (lo[0].max(epsilon), hi[0]);
     let operator = if x.ids.is_empty() { Some(0.0) } else { super::operator_program::matrix_spectral_bound(x.coef.view()).ok() };
     if let Some(operator) = operator {
-        let rows = (x.ids.len() as f64).sqrt().next_up();
+        // `‖ε‖² ≤ S` over free symbols, and within a budgeted row at most its budget.
+        let mut members: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+        let mut free = 0usize;
+        for id in &x.ids {
+            match budgeted(*id).filter(|_| x.restored > 0) {
+                Some(row) => *members.entry(row).or_default() += 1,
+                None => free += 1,
+            }
+        }
+        let effective = free + members.values().map(|m| (*m).min(x.restored)).sum::<usize>();
+        let rows = (effective as f64).sqrt().next_up();
         let r = up(x.radius.iter().map(|v| v * v).sum::<f64>() * (1.0 + gamma(n + 1))).sqrt().next_up();
         let rho = up(up(up(operator * rows) + r) + x.ball);
         let squares = x.center.iter().map(|v| v * v).sum::<f64>();
@@ -1128,6 +1232,9 @@ pub struct FreeSlot {
     pub upper: Array2<f64>,
     /// Each column's block; the columns of one block share one value.
     pub blocks: Vec<usize>,
+    /// A restoration claim's budget (module note, "Restoration claims"): every free entry ranges over
+    /// `[0, 1]`, and each row's free entries over every budgeted slot sum to at most this.
+    pub restored: Option<usize>,
 }
 
 /// The logits as a dense read of a hidden node: `(hidden, class-major map, bias, skipped nodes)`.
@@ -1167,6 +1274,8 @@ fn head_gaps(x: &Row, classes: ArrayView2<'_, f64>, bias: Option<&Array1<f64>>, 
         generators[[x.ids.len() + k, j]] = x.radius[j];
     }
     let symbols = generators.nrows();
+    // A promoted radius is a free symbol (id 0 is never a gate).
+    let generator_ids: Vec<u64> = x.ids.iter().copied().chain(std::iter::repeat_n(0, promoted.len())).collect();
     let magnitude = x.magnitude();
     let rounding = gamma(width + symbols + 4);
     let read = |i: usize| classes.row(i).dot(&x.center) + bias.map_or(0.0, |b| b[i]);
@@ -1180,14 +1289,17 @@ fn head_gaps(x: &Row, classes: ArrayView2<'_, f64>, bias: Option<&Array1<f64>>, 
     for start in (0..count).step_by(TILE) {
         let end = (start + TILE).min(count);
         let tile = classes.slice(s![start..end, ..]);
-        let generated = fast_abt(&generators, &tile);
+        let mut generated = fast_abt(&generators, &tile);
+        for mut column in generated.columns_mut() {
+            column -= &top_generator;
+        }
+        let spreads = spread_of(&generator_ids, generated.view(), x.restored);
         let centers = tile.dot(&x.center);
         for (k, i) in (start..end).enumerate() {
             if i == top {
                 continue;
             }
-            let spread: f64 = generated.column(k).iter().zip(top_generator.iter()).map(|(a, b)| (a - b).abs()).sum();
-            let spread = up(spread * (1.0 + gamma(symbols + 2)));
+            let spread = up(spreads[k] * (1.0 + gamma(symbols + 2)));
             let class_magnitude = up(tile.row(k).iter().zip(magnitude.iter()).map(|(a, m)| a.abs() * m).sum::<f64>() * (1.0 + gamma(width + 1)));
             let error = up(rounding * up(up(class_magnitude + top_magnitude) + bias.map_or(0.0, |b| b[i].abs() + b[top].abs())));
             let gap = (centers[k] + bias.map_or(0.0, |b| b[i])) - top_center;
@@ -1212,9 +1324,13 @@ fn form_gaps(x: &Row, top: usize) -> (Array1<f64>, Array1<f64>) {
     let mut lower = Array1::<f64>::zeros(count);
     let mut upper = Array1::<f64>::zeros(count);
     let symbols = x.ids.len();
+    let mut apart = x.coef.clone();
+    for mut column in apart.columns_mut() {
+        column -= &x.coef.column(top);
+    }
+    let spreads = spread_of(&x.ids, apart.view(), x.restored);
     for i in (0..count).filter(|&i| i != top) {
-        let spread: f64 = (0..symbols).map(|s| (x.coef[[s, i]] - x.coef[[s, top]]).abs()).sum();
-        let spread = up(spread * (1.0 + gamma(symbols + 2)));
+        let spread = up(spreads[i] * (1.0 + gamma(symbols + 2)));
         let gap = x.center[i] - x.center[top];
         let reach = up(up(up(up(spread + x.radius[i]) + x.radius[top]) + up(std::f64::consts::SQRT_2 * x.ball * (1.0 + 2.0 * unit()))) + 2.0 * unit() * gap.abs());
         lower[i] = down(gap - reach);
@@ -1301,7 +1417,7 @@ fn certify_held(
                 (0..rows).map(|r| Row::exact(banded.values.row(r).to_owned(), banded.bands.row(r).to_owned())).collect()
             }
             Node::Raw { slot } => match free.iter().find(|f| f.slot == *slot) {
-                Some(f) => (0..rows).map(|r| free_row(f, r)).collect(),
+                Some(f) => (0..rows).map(|r| free_row(f, r)).collect::<Result<_, _>>()?,
                 None => {
                     let SlotValues::Raw(values) = &inputs.slots[*slot] else {
                         return Err(format!("slot {slot} holds no raw rows"));
@@ -1350,7 +1466,15 @@ fn certify_held(
             }
             Node::Hadamard { left, right } => {
                 let (l, r) = (get(*left)?, get(*right)?);
-                l.par_iter().zip(r.par_iter()).map(|(a, b)| product(a, b)).collect()
+                // A mask under a restoration claim gates its read through `gated`.
+                let restoring = |n: usize| matches!(program.nodes[n], Node::Raw { slot } if free.iter().any(|f| f.slot == slot && f.restored.is_some()));
+                if restoring(*right) {
+                    l.par_iter().zip(r.par_iter()).map(|(z, m)| gated(z, m)).collect()
+                } else if restoring(*left) {
+                    l.par_iter().zip(r.par_iter()).map(|(m, z)| gated(z, m)).collect()
+                } else {
+                    l.par_iter().zip(r.par_iter()).map(|(a, b)| product(a, b)).collect()
+                }
             }
             Node::Bilinear { left, right, scale } => {
                 let (l, r) = (get(*left)?, get(*right)?);
@@ -1454,8 +1578,32 @@ fn certify_held(
 }
 
 /// Row `r` of a free slot: a lone column's interval as its radius, a wider block's as its symbol.
-fn free_row(slot: &FreeSlot, r: usize) -> Row {
+fn free_row(slot: &FreeSlot, r: usize) -> Result<Row, String> {
     let width = slot.lower.ncols();
+    if let Some(restored) = slot.restored {
+        // Under a restoration claim a free gate is `η ∈ [−1, 1]` on its block's budgeted symbol, a
+        // superset of `[0, 1]` with the row's total at most the budget.
+        let mut symbols: std::collections::BTreeMap<u64, Vec<usize>> = std::collections::BTreeMap::new();
+        let mut center = Array1::<f64>::zeros(width);
+        for c in 0..width {
+            let (l, u) = (slot.lower[[r, c]], slot.upper[[r, c]]);
+            if u > l {
+                if l != 0.0 || u != 1.0 {
+                    return Err(format!("slot {}: a restored gate must range over [0, 1], not [{l}, {u}]", slot.slot));
+                }
+                symbols.entry(gate(slot.slot, r, slot.blocks[c])).or_default().push(c);
+            } else {
+                center[c] = l;
+            }
+        }
+        let mut coef = Array2::<f64>::zeros((symbols.len(), width));
+        for (k, columns) in symbols.values().enumerate() {
+            for &c in columns {
+                coef[[k, c]] = 1.0;
+            }
+        }
+        return Ok(Row { center, ids: symbols.into_keys().collect(), coef, radius: Array1::zeros(width), ball: 0.0, restored });
+    }
     let mut sizes: HashMap<usize, usize> = HashMap::new();
     for &b in &slot.blocks {
         *sizes.entry(b).or_default() += 1;
@@ -1485,7 +1633,7 @@ fn free_row(slot: &FreeSlot, r: usize) -> Row {
             coef[[k, c]] = half;
         }
     }
-    Row { center, ids: symbols.into_iter().map(|s| s.0).collect(), coef, radius, ball: 0.0 }
+    Ok(Row { center, ids: symbols.into_iter().map(|s| s.0).collect(), coef, radius, ball: 0.0, restored: 0 })
 }
 
 /// Per site, each block's gate interval (rows × blocks).
@@ -1493,6 +1641,9 @@ fn free_row(slot: &FreeSlot, r: usize) -> Row {
 pub struct Gates {
     pub lower: Vec<Array2<f64>>,
     pub upper: Vec<Array2<f64>>,
+    /// A restoration claim's per-word budget (module note, "Restoration claims"): the free gates of
+    /// each word, over every site, sum to at most this. `None` is the box claim.
+    pub restored: Option<usize>,
 }
 
 impl Gates {
@@ -1501,6 +1652,53 @@ impl Gates {
         Self {
             lower: masks.iter().map(|m| m.mapv(|x| if x > 0.0 { x } else { 0.0 })).collect(),
             upper: masks.iter().map(|m| m.mapv(|x| if x > 0.0 { x } else { 1.0 })).collect(),
+            restored: None,
+        }
+    }
+
+    /// The restoration claim at `masks` (module note, "Restoration claims"): as [`Gates::claim`], with
+    /// each word's off gates summing to at most `k`, the convex hull of restoring any `k` of them.
+    pub fn restoring(masks: &[Array2<f64>], k: usize) -> Self {
+        Self { restored: Some(k), ..Self::claim(masks) }
+    }
+
+    /// `point` moved onto the claim: each word's free gates, over every site, cut back by one common
+    /// amount until they sum to at most the budget above their lower ends (a Euclidean projection
+    /// onto the capped simplex, by bisection on the amount).
+    fn fit(&self, point: &mut [Array2<f64>]) {
+        let Some(k) = self.restored else { return };
+        let budget = k as f64;
+        let rows = point.first().map_or(0, |p| p.nrows());
+        for r in 0..rows {
+            let excess = |cut: f64, point: &[Array2<f64>]| -> f64 {
+                let mut total = 0.0;
+                for ((p, l), u) in point.iter().zip(&self.lower).zip(&self.upper) {
+                    for c in 0..p.ncols() {
+                        if u[[r, c]] > l[[r, c]] {
+                            total += (p[[r, c]] - l[[r, c]] - cut).clamp(0.0, u[[r, c]] - l[[r, c]]);
+                        }
+                    }
+                }
+                total
+            };
+            if excess(0.0, point) <= budget {
+                continue;
+            }
+            let (mut low, mut high) = (0.0_f64, 1.0_f64);
+            while excess(high, point) > budget {
+                high *= 2.0;
+            }
+            for _ in 0..60 {
+                let mid = 0.5 * (low + high);
+                if excess(mid, point) > budget { low = mid } else { high = mid }
+            }
+            for ((p, l), u) in point.iter_mut().zip(&self.lower).zip(&self.upper) {
+                for c in 0..p.ncols() {
+                    if u[[r, c]] > l[[r, c]] {
+                        p[[r, c]] = l[[r, c]] + (p[[r, c]] - l[[r, c]] - high).clamp(0.0, u[[r, c]] - l[[r, c]]);
+                    }
+                }
+            }
         }
     }
 
@@ -1530,8 +1728,12 @@ pub fn certify(
             lower: masked.expand(k, &gates.lower[k]),
             upper: masked.expand(k, &gates.upper[k]),
             blocks: masked.ranks(k).iter().enumerate().flat_map(|(b, r)| std::iter::repeat_n(b, *r)).collect(),
+            restored: gates.restored,
         })
         .collect();
+    if gates.restored.is_some() && (0..masked.sites.len()).any(|k| !masked.is_rank_one(k)) {
+        return Err("a restoration claim is certified over rank-one subcomponents only".to_string());
+    }
     let inputs = masked.family(base, &gates.lower);
     certify_program(&masked.program, &inputs, &free, target, reference_radius, relaxation)
 }
@@ -1557,9 +1759,11 @@ pub fn certify_branching(
     leaves: usize,
 ) -> Result<Branched, String> {
     let root = certify(masked, base, target, reference_radius, &gates, relaxation)?;
+    // A restoration claim's gates all start at zero, so it is not split.
+    let splits = gates.restored.is_none();
     let mut open = vec![(gates, root.clone())];
     let mut spent = 1;
-    while spent + 2 <= leaves {
+    while splits && spent + 2 <= leaves {
         let (leaf, row, _) = open
             .iter()
             .enumerate()
@@ -1707,7 +1911,7 @@ pub fn adversary_batch(
 /// Start `restart` of [`adversary`]: every gate at its lower end, its upper end, its middle, then
 /// uniform draws.
 fn start_point(gates: &Gates, restart: usize, rng: &mut SplitMix) -> Vec<Array2<f64>> {
-    gates
+    let mut point: Vec<Array2<f64>> = gates
         .lower
         .iter()
         .zip(&gates.upper)
@@ -1719,7 +1923,9 @@ fn start_point(gates: &Gates, restart: usize, rng: &mut SplitMix) -> Vec<Array2<
                 _ => l + (u - l) * rng.next(),
             })
         })
-        .collect()
+        .collect();
+    gates.fit(&mut point);
+    point
 }
 
 /// One sign-ascent step of [`adversary`] on the free gates, its rate shrinking linearly with `step`.
@@ -1732,6 +1938,7 @@ fn climb(point: &mut [Array2<f64>], gates: &Gates, ascent: &[Array2<f64>], step:
             }
         });
     }
+    gates.fit(point);
 }
 
 /// [`adversary`], each point's head run as `screen` says ([`masked::ScreenedPoint`](super::masked::ScreenedPoint)): a point's KL is then
