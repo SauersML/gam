@@ -242,13 +242,6 @@ struct Fitting<'a> {
     x: &'a Array2<f32>,
     /// The site's map, `d_out × d_in`: every subcomponent on is exactly it.
     w: Array2<f64>,
-    /// Every read direction scaled by its root second moment (floored at [`LEFT_OUT`] of the
-    /// mean): the constraint's metric, `d_in × d_in`, and its inverse map from whitened reads.
-    span: Array2<f64>,
-    unwhiten: Array2<f64>,
-    /// `E Λ⁻¹ Eᵀ` on the inputs' span (all but [`LEFT_OUT`] of the second moment): a read seeded
-    /// from an input is its direction in it.
-    seeding: Array2<f64>,
     /// `y = x Wᵀ`, inputs × d_out.
     y: Array2<f32>,
     /// `yᵀ F y` per input.
@@ -273,6 +266,39 @@ struct Chunk {
     left: Vec<f64>,
 }
 
+/// Geometry used only to fit the library, never to score it or choose its on-sets. In particular,
+/// evaluating a learned switching rule must not eigendecompose the read covariance again.
+struct ReadGeometry {
+    span: Array2<f64>,
+    unwhiten: Array2<f64>,
+    seeding: Array2<f64>,
+}
+
+impl ReadGeometry {
+    fn new(moment: &Array2<f64>) -> Result<Self, String> {
+        let moment = eigh(moment.view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
+        let total: f64 = moment.values.iter().map(|l| l.max(0.0)).sum();
+        let mut order: Vec<usize> = (0..moment.values.len()).collect();
+        order.sort_by(|a, b| moment.values[*b].total_cmp(&moment.values[*a]));
+        let mut kept = Vec::new();
+        let mut held = 0.0;
+        for &i in &order {
+            if held >= (1.0 - LEFT_OUT) * total || moment.values[i] <= moment.band { break; }
+            held += moment.values[i];
+            kept.push(i);
+        }
+        let basis = moment.vectors.select(Axis(1), &kept);
+        let roots = Array1::from_iter(kept.iter().map(|&i| moment.values[i].sqrt()));
+        let seeding = (&basis / &roots.mapv(|r| r * r)).dot(&basis.t());
+        // Keep every direction in the all-on constraint, including those no input reached.
+        let floor = LEFT_OUT * total / moment.values.len().max(1) as f64;
+        let all_roots = moment.values.mapv(|l| l.max(floor).sqrt());
+        let span = &moment.vectors * &all_roots;
+        let unwhiten = &moment.vectors / &all_roots;
+        Ok(Self { span, unwhiten, seeding })
+    }
+}
+
 impl Chunk {
     /// Input `r`'s real contribution sizes `|a_tc| q_tc`.
     fn sizes(&self, r: usize) -> Vec<f64> {
@@ -292,30 +318,6 @@ impl<'a> Fitting<'a> {
         let y = product(x.view(), false, single(w).view(), true);
         let yf = product(y.view(), false, single(&samples.fisher).view(), false);
         let yfy: Vec<f64> = (0..rows).map(|t| y.row(t).iter().zip(yf.row(t).iter()).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum()).collect();
-        // The reads' second moment, all but `LEFT_OUT` of it the span inputs are seeded from (as
-        // the masked program restricts its reads, `Masked::project_reads`); every direction is
-        // kept in the map's constraint, those the inputs never reach weighted at that floor, so
-        // all on is the map on every input, seen or not.
-        let moment = eigh(samples.second_moment.view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
-        let total: f64 = moment.values.iter().map(|l| l.max(0.0)).sum();
-        let mut order: Vec<usize> = (0..moment.values.len()).collect();
-        order.sort_by(|a, b| moment.values[*b].total_cmp(&moment.values[*a]));
-        let mut kept = Vec::new();
-        let mut held = 0.0;
-        for &i in &order {
-            if held >= (1.0 - LEFT_OUT) * total || moment.values[i] <= moment.band {
-                break;
-            }
-            held += moment.values[i];
-            kept.push(i);
-        }
-        let basis = moment.vectors.select(Axis(1), &kept);
-        let roots = Array1::from_iter(kept.iter().map(|&i| moment.values[i].sqrt()));
-        let seeding = (&basis / &roots.mapv(|r| r * r)).dot(&basis.t());
-        let floor = LEFT_OUT * total / moment.values.len().max(1) as f64;
-        let all_roots = moment.values.mapv(|l| l.max(floor).sqrt());
-        let span = &moment.vectors * &all_roots;
-        let unwhiten = &moment.vectors / &all_roots;
         let gy = samples
             .gradients
             .iter()
@@ -329,9 +331,6 @@ impl<'a> Fitting<'a> {
             gy,
             x,
             w: w.clone(),
-            span,
-            unwhiten,
-            seeding,
             y,
             yfy,
             s: &samples.sensitivity,
@@ -474,13 +473,13 @@ impl<'a> Fitting<'a> {
 
     /// The writes minimising `Σ_c ω_c ‖u_c‖²_F` under every subcomponent on being the map (module
     /// note, "Writes").
-    fn writes_weighted(&self, v: &Array2<f64>, omega: &Array1<f64>) -> Result<Array2<f64>, String> {
+    fn writes_weighted(&self, v: &Array2<f64>, omega: &Array1<f64>, span: &Array2<f64>) -> Result<Array2<f64>, String> {
         // On every read direction (`x = E√Λ ξ`) the constraint is `Uᵀ (V E√Λ) = W E√Λ`.
-        let decomposed = svd(v.dot(&self.span).view(), true).map_err(|e| format!("{e:?}"))?;
+        let decomposed = svd(v.dot(span).view(), true).map_err(|e| format!("{e:?}"))?;
         let rank = decomposed.singular_values.iter().filter(|s| **s > decomposed.band).count();
         let p1 = decomposed.u.slice(s![.., ..rank]);
         let inverse = Array1::from_iter(decomposed.singular_values.iter().take(rank).map(|s| 1.0 / s));
-        let particular = (&p1 * &inverse).dot(&decomposed.vt.slice(s![..rank, ..])).dot(&self.w.dot(&self.span).t());
+        let particular = (&p1 * &inverse).dot(&decomposed.vt.slice(s![..rank, ..])).dot(&self.w.dot(span).t());
         let null = decomposed.u.slice(s![.., rank..]).to_owned();
         let weighted = &null * &omega.view().insert_axis(Axis(1));
         let z = pseudo_inverse(&null.t().dot(&weighted), 0)?.dot(&weighted.t().dot(&particular));
@@ -488,7 +487,7 @@ impl<'a> Fitting<'a> {
     }
 
     /// The writes' majorise-minimise step at `(v, u)` (module note, "Writes").
-    fn writes(&self, v: &Array2<f64>, u: &Array2<f64>) -> Result<Array2<f64>, String> {
+    fn writes(&self, v: &Array2<f64>, u: &Array2<f64>, span: &Array2<f64>) -> Result<Array2<f64>, String> {
         let c_total = self.pieces;
         let (v32, u32, k32, uf32, sizes) = self.operands(v, u);
         let mut omega = Array1::<f64>::zeros(c_total);
@@ -509,7 +508,7 @@ impl<'a> Fitting<'a> {
                 }
             }
         }
-        self.writes_weighted(v, &omega)
+        self.writes_weighted(v, &omega, span)
     }
 
     /// The reads' step (module note, "Reads"): its direction and the quadratic estimate of its
@@ -689,9 +688,10 @@ pub fn fit(
     let x = &samples.reads;
     let rows = x.nrows();
     let mut fitting = Fitting::new(site, w, samples, observations, pieces)?;
+    let geometry = ReadGeometry::new(&samples.second_moment)?;
     // The reads' inverse second moment on their span (seeding) and the sensitivity-weighted one
     // (the reads' right preconditioner).
-    let seeding = fitting.seeding.clone();
+    let seeding = &geometry.seeding;
     let weighted = {
         let scaled = Array2::from_shape_fn(x.dim(), |(t, i)| (f64::from(x[[t, i]]) * samples.sensitivity[t].sqrt()) as f32);
         product(scaled.view(), true, scaled.view(), false).mapv(f64::from) / samples.sensitivity.sum().max(f64::MIN_POSITIVE)
@@ -723,11 +723,11 @@ pub fn fit(
         v.row_mut(c).assign(&seed_read(draw(rows)));
     }
     // The reads span every read direction, so every subcomponent on can be the map.
-    let span = fitting.span.clone();
-    let unwhiten = fitting.unwhiten.clone();
+    let span = &geometry.span;
+    let unwhiten = &geometry.unwhiten;
     let cover = |v: &mut Array2<f64>, rows: &[usize]| -> Result<(), String> {
         // The directions (in the whitened reads) the reads leave out replace the reads of `rows`.
-        let covered = svd(v.dot(&span).view(), false).map_err(|e| format!("{e:?}"))?;
+        let covered = svd(v.dot(span).view(), false).map_err(|e| format!("{e:?}"))?;
         let rank = covered.singular_values.iter().filter(|s| **s > covered.band).count();
         for (&c, i) in rows.iter().zip(rank..covered.vt.nrows()) {
             v.row_mut(c).assign(&unwhiten.dot(&covered.vt.row(i)));
@@ -743,7 +743,7 @@ pub fn fit(
             u.slice_mut(s![..given, ..]).assign(&s.u);
             u
         }
-        _ => fitting.writes_weighted(&v, &Array1::ones(pieces))?,
+        _ => fitting.writes_weighted(&v, &Array1::ones(pieces), span)?,
     };
     let mut bits = description_bits(describe, site, &v, &u)?;
     let (description, error) = fitting.code(&v, &u, &bits, true);
@@ -751,7 +751,7 @@ pub fn fit(
     let mut report = fitting.report(0, description, error);
     for round in 0..rounds {
         // The writes: the majoriser's minimiser, kept when the code falls.
-        let trial = fitting.writes(&v, &u)?;
+        let trial = fitting.writes(&v, &u, span)?;
         let (d, e) = fitting.code(&v, &trial, &bits, false);
         if d + e < current {
             (u, current) = (trial, d + e);
