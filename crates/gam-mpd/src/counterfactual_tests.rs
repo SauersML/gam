@@ -1,4 +1,4 @@
-use super::counterfactual::{Action, Decoder, Donor, Library, Maps, Program, Rows, Selection, Selector, score, site_index, site_name};
+use super::counterfactual::{Action, Decoder, Donor, InputChange, Library, Maps, OutputChange, Program, Rows, Selection, Selector, score, site_index, site_name};
 use ndarray::{Array2, Axis};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,17 +45,18 @@ fn tiny_export(tag: &str) -> PathBuf {
 }
 
 /// Each site's exact library of input-coordinate units: `v_c = e_c`, `u_c = W e_c`.
-fn coordinate_libraries(decoder: &Decoder) -> Vec<Library> {
+fn coordinate_libraries(decoder: &Decoder) -> Vec<Option<Library>> {
     (0..decoder.sites())
         .map(|site| {
             let w = decoder.native(site);
-            Library { v: Array2::eye(w.ncols()), u: w.t().to_owned() }
+            Some(Library { v: Array2::eye(w.ncols()), u: w.t().to_owned() })
         })
         .collect()
 }
 
-fn all_on(libraries: &[Library], rows: usize) -> Selection {
-    let row: Vec<(u32, u32)> = libraries.iter().enumerate().flat_map(|(k, l)| (0..l.v.nrows()).map(move |c| (k as u32, c as u32))).collect();
+fn all_on(libraries: &[Option<Library>], rows: usize) -> Selection {
+    let row: Vec<(u32, u32)> =
+        libraries.iter().enumerate().flat_map(|(k, l)| (0..l.as_ref().map_or(0, |l| l.v.nrows())).map(move |c| (k as u32, c as u32))).collect();
     Selection { rows: vec![row; rows] }
 }
 
@@ -66,7 +67,8 @@ fn max_gap(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
 /// The donor states `actions` read, from one program on `tokens`.
 fn donor(decoder: &Decoder, maps: Maps<'_>, tokens: &[u32], actions: &[Action]) -> Donor {
     let record = actions.iter().filter_map(Action::donor_state).map(|k| (k, None)).collect();
-    let mut program = Program { maps, actions: &[], donor: None, record };
+    let mut program = Program::new(maps, &[], None);
+    program.record = record;
     decoder.forward(tokens, &mut program, &[]);
     Donor { states: program.record.into_iter().map(|(k, v)| (k, v.expect("donor state reached"))).collect() }
 }
@@ -83,28 +85,28 @@ fn an_exact_library_all_on_reproduces_every_native_action() {
     let cases: Vec<Vec<Action>> = vec![
         vec![],
         // A neuron at one row, and a head at every row.
-        vec![Action::ScaleInput { site: site_index(0, 5), rows: Rows::One(4), cols: (3, 4), scale: 0.0 }],
-        vec![Action::ScaleInput { site: site_index(1, 3), rows: Rows::All, cols: (4, 8), scale: 2.0 }],
+        vec![Action::Input { site: site_index(0, 5), change: InputChange::Scale { rows: Rows::One(4), cols: (3, 4), scale: 0.0 } }],
+        vec![Action::Input { site: site_index(1, 3), change: InputChange::Scale { rows: Rows::All, cols: (4, 8), scale: 2.0 } }],
         // Resampling a site's input and another site's output, together.
         vec![
-            Action::MixInput { site: site_index(0, 1), row: 5, alpha: 0.5 },
-            Action::MixOutput { site: site_index(1, 4), row: 6, alpha: 1.0 },
+            Action::Input { site: site_index(0, 1), change: InputChange::Mix { row: 5, alpha: 0.5 } },
+            Action::Output { site: site_index(1, 4), change: OutputChange::Mix { row: 6, alpha: 1.0 } },
         ],
-        vec![Action::AddMap { site: site_index(1, 5), left: edit_left, right: edit_right }],
+        vec![Action::Output { site: site_index(1, 5), change: OutputChange::Add { left: edit_left, right: edit_right } }],
     ];
     let rows: Vec<usize> = (0..tokens.len()).collect();
-    let mut clean_native = Program { maps: Maps::Native(&decoder), actions: &[], donor: None, record: Vec::new() };
+    let mut clean_native = Program::new(Maps::Native(&decoder), &[], None);
     let clean = decoder.forward(&tokens, &mut clean_native, &rows);
     for actions in &cases {
         let native_donor = donor(&decoder, Maps::Native(&decoder), &donor_tokens, actions);
         let mut donor_selection = all_on(&libraries, donor_tokens.len());
-        let own_donor = donor(&decoder, Maps::Units { libraries: &libraries, selector: &mut donor_selection }, &donor_tokens, actions);
+        let own_donor = donor(&decoder, Maps::Units { decoder: &decoder, libraries: &libraries, selector: &mut donor_selection }, &donor_tokens, actions);
         let interface = [5usize, 7];
-        let mut native = Program { maps: Maps::Native(&decoder), actions, donor: Some(&native_donor), record: Vec::new() };
+        let mut native = Program::new(Maps::Native(&decoder), actions, Some(&native_donor));
         let a = decoder.forward(&tokens, &mut native, &interface);
         let mut selection = all_on(&libraries, tokens.len());
         let selector: &mut dyn Selector = &mut selection;
-        let mut explained = Program { maps: Maps::Units { libraries: &libraries, selector }, actions, donor: Some(&own_donor), record: Vec::new() };
+        let mut explained = Program::new(Maps::Units { decoder: &decoder, libraries: &libraries, selector }, actions, Some(&own_donor));
         let b = decoder.forward(&tokens, &mut explained, &interface);
         assert!(max_gap(&a.residual, &b.residual) < 1e-10, "{actions:?}: {}", max_gap(&a.residual, &b.residual));
         let from = actions.iter().map(Action::first_row).min().unwrap_or(0);
@@ -115,7 +117,7 @@ fn an_exact_library_all_on_reproduces_every_native_action() {
         }
     }
     assert_eq!(site_name(11), "blocks.1.down_proj");
-    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&dir).expect("remove the temporary export");
 }
 
 #[test]
@@ -125,7 +127,7 @@ fn a_partial_explanation_is_scored_by_its_disagreement() {
     let libraries = coordinate_libraries(&decoder);
     let tokens: Vec<u32> = (0..6).map(|t| (t * 5 % 11) as u32).collect();
     let rows: Vec<usize> = (0..tokens.len()).collect();
-    let mut clean_native = Program { maps: Maps::Native(&decoder), actions: &[], donor: None, record: Vec::new() };
+    let mut clean_native = Program::new(Maps::Native(&decoder), &[], None);
     let clean = decoder.forward(&tokens, &mut clean_native, &rows);
     // Half of every site's units at every row.
     let mut selection = all_on(&libraries, tokens.len());
@@ -133,12 +135,34 @@ fn a_partial_explanation_is_scored_by_its_disagreement() {
         row.retain(|(_, c)| c % 2 == 0);
     }
     let selector: &mut dyn Selector = &mut selection;
-    let mut explained = Program { maps: Maps::Units { libraries: &libraries, selector }, actions: &[], donor: None, record: Vec::new() };
+    let mut explained = Program::new(Maps::Units { decoder: &decoder, libraries: &libraries, selector }, &[], None);
     let b = decoder.forward(&tokens, &mut explained, &[2]);
-    let mut native = Program { maps: Maps::Native(&decoder), actions: &[], donor: None, record: Vec::new() };
+    let mut native = Program::new(Maps::Native(&decoder), &[], None);
     let a = decoder.forward(&tokens, &mut native, &[2]);
     let scores = score(&decoder, &a, &b, &clean, &[2], 0, 4);
     assert!(scores.kl > 1e-6 && scores.native_effect.abs() < 1e-12, "{scores:?}");
     assert_eq!(clean.layers[0].len_of(Axis(0)), tokens.len());
-    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&dir).expect("remove the temporary export");
+}
+
+#[test]
+fn a_site_without_a_library_runs_its_native_map() {
+    let dir = tiny_export("scope");
+    let decoder = Decoder::from_export(&dir).expect("decoder");
+    let mut libraries = coordinate_libraries(&decoder);
+    // Only block 0's sites are explained; block 1 runs native.
+    for site in 6..decoder.sites() {
+        libraries[site] = None;
+    }
+    let tokens: Vec<u32> = (0..7).map(|t| (t * 4 % 11) as u32).collect();
+    let mut selection = all_on(&libraries, tokens.len());
+    let selector: &mut dyn Selector = &mut selection;
+    let mut explained = Program::new(Maps::Units { decoder: &decoder, libraries: &libraries, selector }, &[], None);
+    let b = decoder.forward(&tokens, &mut explained, &[]);
+    let mut native = Program::new(Maps::Native(&decoder), &[], None);
+    let a = decoder.forward(&tokens, &mut native, &[]);
+    assert!(max_gap(&a.residual, &b.residual) < 1e-10);
+    // Block 0's units: five maps reading 8 coordinates and the down-projection reading 16.
+    assert_eq!(explained.selected, (5 * 8 + 16) * tokens.len());
+    std::fs::remove_dir_all(&dir).expect("remove the temporary export");
 }

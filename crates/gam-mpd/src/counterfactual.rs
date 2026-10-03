@@ -238,42 +238,63 @@ impl Rows {
             Rows::All => true,
         }
     }
+
+    fn first(self) -> usize {
+        match self {
+            Rows::One(r) => r,
+            Rows::All => 0,
+        }
+    }
 }
 
-/// A native intervention's step, applied alike to every program that runs the decoder.
+/// A change of a site's input rows.
+#[derive(Clone, Debug)]
+pub enum InputChange {
+    /// Columns `cols` multiplied by `scale` on `rows` (a neuron, a head).
+    Scale { rows: Rows, cols: (usize, usize), scale: f64 },
+    /// The row mixed toward the donor's: `x ← (1 − α) x + α x_donor`.
+    Mix { row: usize, alpha: f64 },
+}
+
+/// A change of a site's output rows.
+#[derive(Clone, Debug)]
+pub enum OutputChange {
+    /// The row mixed toward the donor's.
+    Mix { row: usize, alpha: f64 },
+    /// `y ← y + L (Rᵀ x)` at every row (`left`: d_out × r, `right`: d_in × r): a weight edit.
+    Add { left: Arc<Array2<f64>>, right: Arc<Array2<f64>> },
+}
+
+/// A native intervention's step at one site, applied alike to every program that runs the
+/// decoder.
 #[derive(Clone, Debug)]
 pub enum Action {
-    /// Columns `cols` of the site's input multiplied by `scale` on `rows` (a neuron, a head).
-    ScaleInput { site: usize, rows: Rows, cols: (usize, usize), scale: f64 },
-    /// The site's input at `row` mixed toward the donor's: `x ← (1 − α) x + α x_donor`.
-    MixInput { site: usize, row: usize, alpha: f64 },
-    /// The site's output at `row` mixed toward the donor's.
-    MixOutput { site: usize, row: usize, alpha: f64 },
-    /// `y ← y + L (Rᵀ x)` at every row (`left`: d_out × r, `right`: d_in × r): a weight edit.
-    AddMap { site: usize, left: Arc<Array2<f64>>, right: Arc<Array2<f64>> },
+    Input { site: usize, change: InputChange },
+    Output { site: usize, change: OutputChange },
 }
 
 impl Action {
     pub fn site(&self) -> usize {
         match self {
-            Action::ScaleInput { site, .. } | Action::MixInput { site, .. } | Action::MixOutput { site, .. } | Action::AddMap { site, .. } => *site,
+            Action::Input { site, .. } | Action::Output { site, .. } => *site,
         }
     }
 
     /// The first row the action changes.
     pub fn first_row(&self) -> usize {
         match self {
-            Action::ScaleInput { rows: Rows::One(r), .. } | Action::MixInput { row: r, .. } | Action::MixOutput { row: r, .. } => *r,
-            Action::ScaleInput { rows: Rows::All, .. } | Action::AddMap { .. } => 0,
+            Action::Input { change: InputChange::Scale { rows, .. }, .. } => rows.first(),
+            Action::Input { change: InputChange::Mix { row, .. }, .. } | Action::Output { change: OutputChange::Mix { row, .. }, .. } => *row,
+            Action::Output { change: OutputChange::Add { .. }, .. } => 0,
         }
     }
 
-    /// The donor states the action reads: `(site, row, output?)`.
+    /// The donor state the action reads: `(site, row, output?)`.
     pub fn donor_state(&self) -> Option<(usize, usize, bool)> {
         match self {
-            Action::MixInput { site, row, .. } => Some((*site, *row, false)),
-            Action::MixOutput { site, row, .. } => Some((*site, *row, true)),
-            _ => None,
+            Action::Input { site, change: InputChange::Mix { row, .. } } => Some((*site, *row, false)),
+            Action::Output { site, change: OutputChange::Mix { row, .. } } => Some((*site, *row, true)),
+            Action::Input { change: InputChange::Scale { .. }, .. } | Action::Output { change: OutputChange::Add { .. }, .. } => None,
         }
     }
 }
@@ -314,10 +335,6 @@ impl Selection {
             .collect();
         Self { rows }
     }
-
-    pub fn mean_selected(&self) -> f64 {
-        self.rows.iter().map(Vec::len).sum::<usize>() as f64 / self.rows.len().max(1) as f64
-    }
 }
 
 impl Selector for Selection {
@@ -332,22 +349,23 @@ pub struct Library {
     pub u: Array2<f64>,
 }
 
-/// Every site's library from `DIR/{site name}.v.f64` and `.u.f64` (an absent site has no units).
-pub fn load_libraries(dir: &Path, decoder: &Decoder) -> Result<Vec<Library>, String> {
+/// Every site's library from `DIR/{site name}.v.f64` and `.u.f64`; a site without files has none
+/// and runs its native map.
+pub fn load_libraries(dir: &Path, decoder: &Decoder) -> Result<Vec<Option<Library>>, String> {
     (0..decoder.sites())
         .map(|site| {
             let (d_out, d_in) = decoder.native(site).dim();
             let name = site_name(site);
             let v_path = dir.join(format!("{name}.v.f64"));
             if !v_path.exists() {
-                return Ok(Library { v: Array2::zeros((0, d_in)), u: Array2::zeros((0, d_out)) });
+                return Ok(None);
             }
             let v = read_f64_matrix(&v_path, d_in)?;
             let u = read_f64_matrix(&dir.join(format!("{name}.u.f64")), d_out)?;
             if u.nrows() != v.nrows() {
                 return Err(format!("{name}: {} read and {} write vectors", v.nrows(), u.nrows()));
             }
-            Ok(Library { v, u })
+            Ok(Some(Library { v, u }))
         })
         .collect()
 }
@@ -356,20 +374,26 @@ pub fn load_libraries(dir: &Path, decoder: &Decoder) -> Result<Vec<Library>, Str
 pub enum Maps<'a> {
     /// The native maps.
     Native(&'a Decoder),
-    /// An explanation's units, chosen by its own rule.
-    Units { libraries: &'a [Library], selector: &'a mut dyn Selector },
+    /// An explanation's units, chosen by its own rule, at the sites it has a library for; its
+    /// other sites run their native maps.
+    Units { decoder: &'a Decoder, libraries: &'a [Option<Library>], selector: &'a mut dyn Selector },
 }
 
 /// A program under an intervention: its maps, the actions, its own donor states, and the site
-/// states to record (`(site, row, output?)`).
+/// states to record (`(site, row, output?)`). `selected` counts the units its rule ran.
 pub struct Program<'a> {
     pub maps: Maps<'a>,
     pub actions: &'a [Action],
     pub donor: Option<&'a Donor>,
     pub record: Vec<((usize, usize, bool), Option<Array1<f64>>)>,
+    pub selected: usize,
 }
 
-impl Program<'_> {
+impl<'a> Program<'a> {
+    pub fn new(maps: Maps<'a>, actions: &'a [Action], donor: Option<&'a Donor>) -> Self {
+        Self { maps, actions, donor, record: Vec::new(), selected: 0 }
+    }
+
     fn donor_row(&self, key: (usize, usize, bool)) -> Option<&Array1<f64>> {
         self.donor.and_then(|d| d.states.get(&key))
     }
@@ -381,55 +405,62 @@ impl Program<'_> {
             }
         }
     }
+
+    fn mix(&self, rows: &mut Array2<f64>, key: (usize, usize, bool), alpha: f64) {
+        if let Some(d) = self.donor_row(key) {
+            let mixed = &rows.row(key.1) * (1.0 - alpha) + d * alpha;
+            rows.row_mut(key.1).assign(&mixed);
+        }
+    }
 }
 
 impl SiteMaps for Program<'_> {
     fn apply(&mut self, site: usize, input: &Array2<f64>) -> Array2<f64> {
+        let actions = self.actions;
         let mut x = input.clone();
-        for action in self.actions.iter().filter(|a| a.site() == site) {
-            match action {
-                Action::ScaleInput { rows, cols: (a, b), scale, .. } => {
+        let inputs = actions.iter().filter_map(|a| match a {
+            Action::Input { site: k, change } if *k == site => Some(change),
+            Action::Input { .. } | Action::Output { .. } => None,
+        });
+        for change in inputs.collect::<Vec<_>>() {
+            match change {
+                InputChange::Scale { rows, cols: (a, b), scale } => {
                     for (r, mut row) in x.outer_iter_mut().enumerate() {
                         if rows.has(r) {
                             row.slice_mut(s![*a..*b]).mapv_inplace(|v| v * scale);
                         }
                     }
                 }
-                Action::MixInput { row, alpha, .. } => {
-                    if let Some(d) = self.donor_row((site, *row, false)) {
-                        let mixed = &x.row(*row) * (1.0 - alpha) + d * *alpha;
-                        x.row_mut(*row).assign(&mixed);
-                    }
-                }
-                _ => {}
+                InputChange::Mix { row, alpha } => self.mix(&mut x, (site, *row, false), *alpha),
             }
         }
         self.keep(site, &x, false);
-        let mut y = match &mut self.maps {
-            Maps::Native(decoder) => fast_abt(&x, decoder.native(site)),
-            Maps::Units { libraries, selector } => {
-                let library = &libraries[site];
-                let chosen = selector.select(site, &x);
-                let mut y = Array2::<f64>::zeros((x.nrows(), library.u.ncols()));
-                for ((mut out, xr), units) in y.outer_iter_mut().zip(x.outer_iter()).zip(&chosen) {
-                    for &(c, mask) in units {
-                        let c = c as usize;
-                        out.scaled_add(mask * library.v.row(c).dot(&xr), &library.u.row(c));
+        let (mut y, ran) = match &mut self.maps {
+            Maps::Native(decoder) => (fast_abt(&x, decoder.native(site)), 0),
+            Maps::Units { decoder, libraries, selector } => match &libraries[site] {
+                None => (fast_abt(&x, decoder.native(site)), 0),
+                Some(library) => {
+                    let chosen = selector.select(site, &x);
+                    let mut y = Array2::<f64>::zeros((x.nrows(), library.u.ncols()));
+                    for ((mut out, xr), units) in y.outer_iter_mut().zip(x.outer_iter()).zip(&chosen) {
+                        for &(c, mask) in units {
+                            let c = c as usize;
+                            out.scaled_add(mask * library.v.row(c).dot(&xr), &library.u.row(c));
+                        }
                     }
+                    (y, chosen.iter().map(Vec::len).sum::<usize>())
                 }
-                y
-            }
+            },
         };
-        for action in self.actions.iter().filter(|a| a.site() == site) {
-            match action {
-                Action::MixOutput { row, alpha, .. } => {
-                    if let Some(d) = self.donor_row((site, *row, true)) {
-                        let mixed = &y.row(*row) * (1.0 - alpha) + d * *alpha;
-                        y.row_mut(*row).assign(&mixed);
-                    }
-                }
-                Action::AddMap { left, right, .. } => y += &fast_abt(&fast_ab(&x, right.as_ref()), left.as_ref()),
-                _ => {}
+        self.selected += ran;
+        let outputs = actions.iter().filter_map(|a| match a {
+            Action::Output { site: k, change } if *k == site => Some(change),
+            Action::Input { .. } | Action::Output { .. } => None,
+        });
+        for change in outputs.collect::<Vec<_>>() {
+            match change {
+                OutputChange::Mix { row, alpha } => self.mix(&mut y, (site, *row, true), *alpha),
+                OutputChange::Add { left, right } => y += &fast_abt(&fast_ab(&x, right.as_ref()), left.as_ref()),
             }
         }
         self.keep(site, &y, true);
@@ -491,4 +522,204 @@ pub fn score(decoder: &Decoder, native: &Forward, explained: &Forward, clean: &F
         interface_effect.push(mean(kl_rows(&p, &c)));
     }
     Scores { kl: kl / n, native_effect: effect / n, top1_agree: agree / n, interface_kl, interface_effect }
+}
+
+/// One declared episode: its actions on a passage, the rows its internal interfaces are read at,
+/// and the donor passage its mixes read.
+#[derive(Clone, Debug)]
+pub struct Episode {
+    pub id: String,
+    pub group: String,
+    pub passage: usize,
+    pub donor: Option<usize>,
+    pub interface_rows: Vec<usize>,
+    pub actions: Vec<Action>,
+}
+
+/// A frozen episode list (`bench/vpd_2951/counterfactual_spec.py`).
+#[derive(Clone, Debug)]
+pub struct Spec {
+    pub rows: usize,
+    pub episodes: Vec<Episode>,
+}
+
+fn field(value: &serde_json::Value, key: &str) -> Result<usize, String> {
+    value[key].as_u64().map(|v| v as usize).ok_or_else(|| format!("{value} has no {key}"))
+}
+
+impl Spec {
+    /// The spec at `path`, its edits' factors read relative to it.
+    pub fn load(path: &Path, decoder: &Decoder) -> Result<Self, String> {
+        let spec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?).map_err(|e| e.to_string())?;
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let mut edits = BTreeMap::new();
+        for (name, e) in spec["edits"].as_object().into_iter().flatten() {
+            let (site, rank) = (field(e, "site")?, field(e, "rank")?);
+            let left = read_f64_matrix(&dir.join(e["left"].as_str().unwrap_or_default()), rank)?;
+            let right = read_f64_matrix(&dir.join(e["right"].as_str().unwrap_or_default()), rank)?;
+            let (d_out, d_in) = decoder.native(site).dim();
+            if left.nrows() != d_out || right.nrows() != d_in {
+                return Err(format!("edit {name}: left {:?}, right {:?} for a {d_out}×{d_in} site", left.dim(), right.dim()));
+            }
+            edits.insert(name.clone(), (site, Arc::new(left), Arc::new(right)));
+        }
+        let mut episodes = Vec::new();
+        for e in spec["episodes"].as_array().ok_or("spec has no episodes")? {
+            let mut actions = Vec::new();
+            for a in e["actions"].as_array().ok_or_else(|| format!("{} has no actions", e["id"]))? {
+                let site = field(a, "site")?;
+                let alpha = || a["alpha"].as_f64().ok_or_else(|| format!("{a} has no alpha"));
+                actions.push(match a["type"].as_str().unwrap_or_default() {
+                    "scale_input" => {
+                        let cols = a["cols"].as_array().ok_or("scale_input without cols")?;
+                        let rows = a["row"].as_u64().map_or(Rows::All, |r| Rows::One(r as usize));
+                        let cols = (cols[0].as_u64().unwrap_or(0) as usize, cols[1].as_u64().unwrap_or(0) as usize);
+                        Action::Input { site, change: InputChange::Scale { rows, cols, scale: a["scale"].as_f64().ok_or("scale_input without scale")? } }
+                    }
+                    "mix_input" => Action::Input { site, change: InputChange::Mix { row: field(a, "row")?, alpha: alpha()? } },
+                    "mix_output" => Action::Output { site, change: OutputChange::Mix { row: field(a, "row")?, alpha: alpha()? } },
+                    "add_map" => {
+                        let (edit_site, left, right) = edits.get(a["edit"].as_str().unwrap_or_default()).ok_or_else(|| format!("unknown edit {}", a["edit"]))?;
+                        if *edit_site != site {
+                            return Err(format!("edit {} is of site {edit_site}, not {site}", a["edit"]));
+                        }
+                        Action::Output { site, change: OutputChange::Add { left: left.clone(), right: right.clone() } }
+                    }
+                    other => return Err(format!("unknown action {other}")),
+                });
+            }
+            episodes.push(Episode {
+                id: e["id"].as_str().ok_or("episode without id")?.to_string(),
+                group: e["group"].as_str().unwrap_or("ungrouped").to_string(),
+                passage: field(e, "passage")?,
+                donor: e["donor"].as_u64().map(|d| d as usize),
+                interface_rows: e["interface_rows"].as_array().ok_or("episode without interface_rows")?.iter().map(|v| v.as_u64().unwrap_or(0) as usize).collect(),
+                actions,
+            });
+        }
+        Ok(Self { rows: field(&spec, "rows")?, episodes })
+    }
+}
+
+/// An explanation under evaluation: its libraries (a site without one runs native) and, per
+/// episode id, a fresh instance of its selection rule. A donor passage runs the rule of the
+/// passage's clean episode, `clean/{passage}`.
+pub struct Explanation<'a> {
+    pub libraries: &'a [Option<Library>],
+    pub selector: &'a (dyn Fn(&str) -> Result<Box<dyn Selector>, String> + Sync),
+}
+
+/// One episode's scores, with the units per row the explanation's rule ran.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Scored {
+    pub id: String,
+    pub group: String,
+    pub passage: usize,
+    pub from_row: usize,
+    pub selected_per_row: f64,
+    #[serde(flatten)]
+    pub scores: Scores,
+}
+
+/// Every episode of `spec` on `passages` (token rows), the explanation's program against the
+/// native model's (`None` scores the native model as its own explanation, a check of the
+/// evaluator), `tile` output rows at a time; episodes run in parallel.
+pub fn evaluate(decoder: &Decoder, spec: &Spec, passages: &[Vec<u32>], explanation: Option<&Explanation<'_>>, tile: usize) -> Result<Vec<Scored>, String> {
+    use rayon::prelude::*;
+    let all_rows: Vec<usize> = (0..spec.rows).collect();
+    let named: std::collections::BTreeSet<usize> = spec.episodes.iter().map(|e| e.passage).collect();
+    let clean: BTreeMap<usize, Forward> = named
+        .par_iter()
+        .map(|&p| {
+            let mut native = Program::new(Maps::Native(decoder), &[], None);
+            (p, decoder.forward(&passages[p], &mut native, &all_rows))
+        })
+        .collect();
+    spec.episodes
+        .par_iter()
+        .map(|e| -> Result<Scored, String> {
+            let keys: Vec<(usize, usize, bool)> = e.actions.iter().filter_map(Action::donor_state).collect();
+            let donor_of = |maps: Maps<'_>| -> Result<Donor, String> {
+                if keys.is_empty() {
+                    return Ok(Donor::default());
+                }
+                let d = e.donor.ok_or_else(|| format!("{}: a mix without a donor", e.id))?;
+                let mut program = Program::new(maps, &[], None);
+                program.record = keys.iter().map(|k| (*k, None)).collect();
+                decoder.forward(&passages[d], &mut program, &[]);
+                Ok(Donor { states: program.record.into_iter().map(|(k, v)| v.map(|v| (k, v)).ok_or("donor state not reached")).collect::<Result<_, _>>()? })
+            };
+            let native_donor = donor_of(Maps::Native(decoder))?;
+            let mut native = Program::new(Maps::Native(decoder), &e.actions, Some(&native_donor));
+            let native_forward = decoder.forward(&passages[e.passage], &mut native, &e.interface_rows);
+            let (explained, selected) = match explanation {
+                Some(x) => {
+                    let own_donor = match e.donor {
+                        Some(d) if !keys.is_empty() => {
+                            let mut rule = (x.selector)(&format!("clean/{d}"))?;
+                            donor_of(Maps::Units { decoder, libraries: x.libraries, selector: rule.as_mut() })?
+                        }
+                        Some(_) | None => Donor::default(),
+                    };
+                    let mut rule = (x.selector)(&e.id)?;
+                    let mut program = Program::new(Maps::Units { decoder, libraries: x.libraries, selector: rule.as_mut() }, &e.actions, Some(&own_donor));
+                    let forward = decoder.forward(&passages[e.passage], &mut program, &e.interface_rows);
+                    (forward, program.selected as f64 / spec.rows as f64)
+                }
+                None => {
+                    let mut program = Program::new(Maps::Native(decoder), &e.actions, Some(&native_donor));
+                    (decoder.forward(&passages[e.passage], &mut program, &e.interface_rows), f64::NAN)
+                }
+            };
+            let from = e.actions.iter().map(Action::first_row).min().unwrap_or(0);
+            let scores = score(decoder, &native_forward, &explained, &clean[&e.passage], &e.interface_rows, from, tile);
+            Ok(Scored { id: e.id.clone(), group: e.group.clone(), passage: e.passage, from_row: from, selected_per_row: selected, scores })
+        })
+        .collect()
+}
+
+/// Means per group.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct GroupSummary {
+    pub episodes: usize,
+    pub kl: f64,
+    pub native_effect: f64,
+    pub top1_agree: f64,
+    pub selected_per_row: f64,
+    pub interface_kl: Vec<f64>,
+    pub interface_effect: Vec<f64>,
+}
+
+pub fn summarize(scored: &[Scored]) -> BTreeMap<String, GroupSummary> {
+    let mut groups: BTreeMap<String, Vec<&Scored>> = BTreeMap::new();
+    for s in scored {
+        groups.entry(s.group.clone()).or_default().push(s);
+    }
+    groups
+        .into_iter()
+        .map(|(g, ss)| {
+            let n = ss.len() as f64;
+            let mean = |f: &dyn Fn(&Scored) -> f64| ss.iter().map(|s| f(s)).sum::<f64>() / n;
+            let layers = ss.first().map_or(0, |s| s.scores.interface_kl.len());
+            let per_layer = |f: &dyn Fn(&Scored) -> &Vec<f64>| (0..layers).map(|l| ss.iter().map(|s| f(s)[l]).sum::<f64>() / n).collect();
+            let summary = GroupSummary {
+                episodes: ss.len(),
+                kl: mean(&|s| s.scores.kl),
+                native_effect: mean(&|s| s.scores.native_effect),
+                top1_agree: mean(&|s| s.scores.top1_agree),
+                selected_per_row: mean(&|s| s.selected_per_row),
+                interface_kl: per_layer(&|s| &s.scores.interface_kl),
+                interface_effect: per_layer(&|s| &s.scores.interface_effect),
+            };
+            (g, summary)
+        })
+        .collect()
+}
+
+/// The token rows of an export's passages, the first `rows` columns of each.
+pub fn passages(export: &Path, rows: usize) -> Result<Vec<Vec<u32>>, String> {
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(export.join("export.json")).map_err(|e| format!("{}: {e}", export.display()))?).map_err(|e| e.to_string())?;
+    let width = record["files"]["tokens"]["shape"][1].as_u64().ok_or("export has no tokens")? as usize;
+    Ok(read_f64_matrix(&export.join("tokens.f64"), width)?.outer_iter().map(|r| r.iter().take(rows).map(|t| *t as u32).collect()).collect())
 }
