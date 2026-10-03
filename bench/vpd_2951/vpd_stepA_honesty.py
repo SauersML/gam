@@ -10,7 +10,7 @@ rounded (g > 0), or a given set's indicator. Every mask lies in VPD's box [g, 1]
           threshold curve (rounded, g > 0.1, g > 0.5, g itself); 64 uniform draws of every off
           entry per word (m = g + (1 - g) U, the same U for every family); VPD's eval adversary
           (one source per subcomponent shared over every word, sign steps of 0.1) at 20/40/80
-          steps. Each with the residual (delta) off, as the sets are scored, and with `--delta` also
+          steps. Each with the residual (delta) off, as the sets are scored, or with `--delta` also
           VPD's own delta semantics (uniform per word for draws, one adversarial coordinate for PGD).
   layers  cross-layer compensation: the KL with only layer l masked (the rest native), and the
           hybrids H_0 (native) .. H_4 (every layer masked), H_l masking layers < l, in total
@@ -54,7 +54,8 @@ parser.add_argument("--key", default=None)
 parser.add_argument("--families", default="vpd_ci,vpd_rounded,given")
 parser.add_argument("--all-on", action="store_true", help="also every subcomponent on (box)")
 parser.add_argument("--parts", default="fixed,draws,pgd", help="which parts of box to run")
-parser.add_argument("--delta", action="store_true", help="also VPD's residual semantics (box; it moves the KL by <1%%)")
+parser.add_argument("--delta", choices=["off", "both", "only"], default="off",
+                    help="VPD's residual (delta) semantics in the box: off (as the sets are scored), both, or only")
 parser.add_argument("--name", default="ours", help="the given sets' family name")
 parser.add_argument("--library", type=Path, default=Path.home() / "mpd-data/pieces/vpd4l_library")
 parser.add_argument("--gates", type=Path, default=None,
@@ -285,7 +286,8 @@ def box():
                      "l0": {k: f.l0() for k, f in families.items()}})
     # Uniform draws over the box, the same U per (draw, microbatch) for every family.
     draws = {}
-    for delta_mode in () if "draws" not in parts else (("off", "uniform") if args.delta else ("off",)):
+    delta_modes = {"off": ("off",), "both": ("off", "uniform"), "only": ("uniform",)}[args.delta]
+    for delta_mode in () if "draws" not in parts else delta_modes:
         for name, fam in families.items():
             kl = np.zeros((args.draws, args.rows * S))
             with torch.no_grad():
@@ -310,7 +312,7 @@ def box():
             update_out(key, {"draws": draws, "draws_per_word": args.draws})
     # VPD's eval adversary: one shared source per subcomponent (plus one delta coordinate).
     pgd = {}
-    for with_delta in () if "pgd" not in parts else ((False, True) if args.delta else (False,)):
+    for with_delta in () if "pgd" not in parts else tuple(m != "off" for m in delta_modes):
         for name, fam in families.items():
             ladder = pgd_recon(vpd, ids, fam, steps, step_size=0.1, with_delta=with_delta, seed=0)
             pgd[f"{name}/delta_{'adversarial' if with_delta else 'off'}"] = {str(k): v for k, v in ladder.items()}
