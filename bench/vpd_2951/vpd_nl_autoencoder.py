@@ -729,7 +729,7 @@ def stage_figure():
                          "xtick.color": MUTED, "ytick.color": MUTED, "axes.edgecolor": RULE, "xtick.labelsize": 12, "ytick.labelsize": 12})
     fig = plt.figure(figsize=(22, 12.5), facecolor=SURF)
     gs = fig.add_gridspec(2, 2, width_ratios=[1.45, 1], height_ratios=[1.15, 1], wspace=0.10, hspace=0.42,
-                          left=0.015, right=0.975, top=0.87, bottom=0.07)
+                          left=0.015, right=0.975, top=0.83, bottom=0.07)
     fig.text(0.015, 0.955, "A natural-language autoencoder of the weights that ran", fontsize=24, weight="bold")
     fig.text(0.015, 0.915, "VPD 4-layer model, held-out words. Encoder: the concepts (co-firing groups of VPD subcomponents, fitted by one code) "
              "that ran, each named from its members' weights and top contexts.\nDecoder: reads only the text, looks the names up, runs the "
@@ -743,8 +743,8 @@ def stage_figure():
     words_idx = example_words(tb[head]["bits"], kl)
     vocab = vocab_words(z["ids"][EVAL[0]])
     ax.set_ylim(len(words_idx) + 0.25, -0.35)
-    cols = [0.0, 0.14, 0.70, 0.88]
-    for x, h in zip(cols, ["word", "text the encoder wrote", "subcomponents on", "KL, nats"]):
+    cols = [0.0, 0.14, 0.68, 0.90]
+    for x, h in zip(cols, ["word", "text the encoder wrote", "subcomponents on", "KL"]):
         ax.text(x, -0.12, h, fontsize=14, color=MUTED, weight="bold", va="bottom")
     bw = 0.12 / max(max(kl["vpd"]["l0"][i], kl[head]["l0"][i]) for i in words_idx)
     for r, w in enumerate(words_idx):
@@ -754,7 +754,7 @@ def stage_figure():
         ax.text(cols[0], y - 0.22, "…" + ctx, fontsize=10, color=MUTED, va="center")
         ax.text(cols[0], y + 0.12, repr(vocab[w])[1:-1][:12], fontsize=16, weight="bold", va="center", family="Menlo")
         parts = tb[head]["lines"][w].split("; ") if tb[head]["lines"][w] else []
-        shown = [p.replace("L0-3 attn+mlp: ", "") for p in parts[:4]]
+        shown = [p.replace("L0-3 attn+mlp: ", "").replace("\ufffd", "▯") for p in parts[:4]]
         more = len(parts) - len(shown)
         txt = "\n".join(shown) + (f"\n… {more} more names" if more else "")
         ax.text(cols[1], y - 0.4, txt or "(nothing)", fontsize=10.5, va="top", family="Menlo", color=INK, linespacing=1.3)
@@ -795,14 +795,16 @@ def stage_figure():
     ax.set_ylabel("KL(model ‖ decoded program), nats")
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
-    ax.legend(frameon=False, fontsize=10.5, loc="lower left", ncol=1)
+    ax.set_ylim(0.2, t["empty"]["kl"] * 2)
+    ax.legend(frameon=False, fontsize=10.5, loc="lower left", bbox_to_anchor=(0.0, 0.16), ncol=1)
     ax.set_title("Description bits vs KL", fontsize=16, loc="left", weight="bold")
 
     # ---- right bottom: the objective per word
     ax = fig.add_subplot(gs[1, 1], facecolor=SURF)
     bars = [("VPD's set, binary listing", t["vpd"], ORANGE), ("concept names + binary residual", t["lossless"], VIOLET),
             ("concept names only", t["n=concepts"], VIOLET), ("every subcomponent named in text", t["n=inf"], BLUE),
-            ("decoder reads the word only", t["token-only decoder"], YELLOW)]
+            ("decoder reads the word only", t["token-only decoder"], YELLOW),
+            ("leak: quote the word, decoder reruns VPD (explains nothing)", t["leak"], AQUA)]
     for i, (name, v, col) in enumerate(bars):
         kb = N_REPORT * v["kl"] / math.log(2)
         ax.barh(i, v["bits"], color=col, height=0.5)
