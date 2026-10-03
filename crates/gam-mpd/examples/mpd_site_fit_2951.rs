@@ -9,8 +9,11 @@
 //! sequence (default 4, `gam_mpd::site_fit::samples`), and a library of `d_in + d_out`
 //! subcomponents fitted to its code at `n = OBSERVATIONS` for at most `ROUNDS` rounds (default 50,
 //! `gam_mpd::site_fit::fit`), each subcomponent described by `gam_mpd::blocks::Generic` in those
-//! statistics. A site that reads a layer of units (a pointwise map's output, an MLP's hidden
-//! layer) starts its first `d_in` reads from those units. After every round the library goes to `OUT_DIR/{site}.v.f64` (pieces × d_in) and
+//! statistics. Every site starts from a library that is its map, read off the model alone: a site
+//! that reads a layer of units (a pointwise map's output, an MLP's hidden layer) from those units
+//! (`gam_mpd::pieces::unit_pieces`), any other from its Fisher-whitened singular pieces
+//! (`gam_mpd::pieces::fisher_svd`); the rest of its subcomponents start writing nothing and grow by
+//! splits. After every round the library goes to `OUT_DIR/{site}.v.f64` (pieces × d_in) and
 //! `OUT_DIR/{site}.u.f64` (pieces × d_out), raw float64, the `library:DIR` start of
 //! `mpd_pieces_masked_2951`, and its rounds to `OUT_DIR/{site}.rounds.json`.
 //!
@@ -109,9 +112,15 @@ fn main() -> Result<(), String> {
         let mut log = Vec::new();
         let (v_path, u_path) = (out.join(format!("{}.v.f64", site.name)), out.join(format!("{}.u.f64", site.name)));
         let rounds_path = out.join(format!("{}.rounds.json", site.name));
-        // A site reading a layer of units starts from the units.
-        let units = (site.reads.len() == 1 && matches!(model.nodes[site.reads[0]], Node::Pointwise { .. })).then(|| Array2::<f64>::eye(d_in));
-        let library = fit(k, w, sample, &description, settings, units.as_ref(), |round, library| {
+        // The start: the units a site reads, else its Fisher-whitened singular pieces.
+        let reads_units = site.reads.len() == 1 && matches!(model.nodes[site.reads[0]], Node::Pointwise { .. });
+        let exact = if reads_units {
+            gam_mpd::pieces::unit_pieces(w, gam_mpd::pieces::Units::Read)
+        } else {
+            gam_mpd::pieces::fisher_svd(&gam_mpd::pieces::Site { w: w.clone(), second_moment: sample.second_moment.clone(), mean: Array1::zeros(d_in), fisher: sample.fisher.clone() })?
+        };
+        let start = Library { v: exact.v.t().to_owned(), u: exact.u, mean: Array1::zeros(d_in) };
+        let library = fit(k, w, sample, &description, settings, Some(&start), |round, library| {
             eprintln!(
                 "{} round {}: code {:.1} bits per input (description {:.1}, error {:.1}), L0 {:.2}, reseeded {}, read rung {}, {:.0}s",
                 site.name,

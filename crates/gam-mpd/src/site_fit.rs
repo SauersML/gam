@@ -39,8 +39,8 @@
 //! Alternating steps that each lower that one total:
 //!
 //! * **Sets.** Each input's on-set from its subcomponents ranked by real size per description bit,
-//!   `|a_tc| ‖u_c‖_F / bits(c)`: the best prefix of that ranking, then single flips swept until none
-//!   lowers the input's code.
+//!   `|a_tc| ‖u_c‖_F / bits(c)`: the best prefix of that ranking when it codes the input in fewer
+//!   bits than its current sets, then single flips swept until none lowers the input's code.
 //! * **Writes.** With the sets and reads fixed the error is convex in `U`. With `L_t` the current
 //!   `B_t`, `(Σ_c α_c)² ≤ Σ_c α_c² L/α_c` majorises it by `Σ_c ω_c ‖u_c‖²_F`, `ω_c = Σ_{t: c off} n s_t
 //!   |a_tc| L_t / (2 ln 2 ‖u_c‖_F)`, tight at the current writes, so its minimiser lowers the code.
@@ -53,9 +53,9 @@
 //!   ‖u_c‖²_F`, right by the inputs' sensitivity-weighted second moment) restricted to the moves
 //!   that keep the map, `Uᵀ D = 0`, its length the one of least code on a geometric ladder around
 //!   the step's quadratic estimate; every input's `B_t` along the line is measured in one pass.
-//! * **Reseeding.** A subcomponent that runs on no input is replaced by one reading the input of
-//!   largest error (its direction in the reads' inverse second moment), the writes solved again;
-//!   kept when the sets selected with it code the inputs in fewer bits.
+//! * **Growth.** A subcomponent that runs nowhere or writes nothing takes half of the one that
+//!   carries the most error where it is off, split along that one's inputs (the halves sum to it);
+//!   kept when the sets selected with them code the inputs in fewer bits.
 //!
 //! The fit stops when a round saves less than one bit per input, or at `rounds`. Every product over
 //! inputs runs in single precision (the fit only proposes a library; the masked program's exact
@@ -339,13 +339,12 @@ impl<'a> Fitting<'a> {
     }
 
     /// The code of `(v, u)` (module note); with `flip`, every input's sets selected first (module
-    /// note, "Sets"). Returns the total description and error bits and each input's error bits.
-    fn code(&mut self, v: &Array2<f64>, u: &Array2<f64>, bits: &Array1<f64>, flip: bool) -> (f64, f64, Vec<f64>) {
+    /// note, "Sets"). Returns the total description and error bits.
+    fn code(&mut self, v: &Array2<f64>, u: &Array2<f64>, bits: &Array1<f64>, flip: bool) -> (f64, f64) {
         let c_total = self.pieces;
         let (v32, uf32, k32, sizes) = self.operands(v, u);
         let mut description = 0.0;
         let mut error = 0.0;
-        let mut errors = vec![0.0; self.rows()];
         for start in (0..self.rows()).step_by(CHUNK) {
             let end = (start + CHUNK).min(self.rows());
             let chunk = self.chunk(start, end, &v32, &uf32, &k32);
@@ -360,7 +359,11 @@ impl<'a> Fitting<'a> {
                     if flip {
                         // The best prefix of the ranking by size per bit, then single flips.
                         let mut order: Vec<usize> = (0..c_total).collect();
-                        let ratio = |c: usize| if bits[c] > 0.0 { size[c] / bits[c] } else { f64::INFINITY };
+                        let ratio = |c: usize| match (bits[c] > 0.0, size[c] > 0.0) {
+                            (true, _) => size[c] / bits[c],
+                            (false, true) => f64::INFINITY,
+                            (false, false) => 0.0,
+                        };
                         order.sort_by(|a, b| ratio(*b).total_cmp(&ratio(*a)));
                         let all: f64 = size.iter().sum();
                         let (mut listed, mut bound) = (0.0, chunk.left[r] + all);
@@ -373,9 +376,14 @@ impl<'a> Fitting<'a> {
                                 (best, best_code) = (k + 1, code);
                             }
                         }
-                        m.fill(0);
-                        for &c in &order[..best] {
-                            m[c] = 1;
+                        // The prefix replaces the input's current sets only when it codes it in fewer bits.
+                        let held = chunk.left[r] + (0..c_total).filter(|c| m[*c] == 0).map(|c| size[c]).sum::<f64>();
+                        let held_code = (0..c_total).filter(|c| m[*c] == 1).map(|c| bits[c]).sum::<f64>() + weight * held * held;
+                        if best_code < held_code {
+                            m.fill(0);
+                            for &c in &order[..best] {
+                                m[c] = 1;
+                            }
                         }
                         let mut bound = chunk.left[r] + (0..c_total).filter(|c| m[*c] == 0).map(|c| size[c]).sum::<f64>();
                         for _ in 0..c_total {
@@ -399,13 +407,12 @@ impl<'a> Fitting<'a> {
                     (listed, weight * bound * bound)
                 })
                 .collect();
-            for (r, (listed, err)) in results.into_iter().enumerate() {
+            for (listed, err) in results {
                 description += listed;
                 error += err;
-                errors[start + r] = err;
             }
         }
-        (description, error, errors)
+        (description, error)
     }
 
     /// The writes minimising `Σ_c ω_c ‖u_c‖²_F` under every subcomponent on being the map (module
@@ -428,6 +435,9 @@ impl<'a> Fitting<'a> {
         let c_total = self.pieces;
         let (v32, uf32, k32, sizes) = self.operands(v, u);
         let mut omega = Array1::<f64>::zeros(c_total);
+        // A subcomponent writing nothing is held near nothing (its majoriser's weight is bounded at
+        // the double-precision resolution of the largest write).
+        let floor = sizes.iter().fold(0.0_f64, |m, s| m.max(*s)) * f64::EPSILON.sqrt();
         for start in (0..self.rows()).step_by(CHUNK) {
             let end = (start + CHUNK).min(self.rows());
             let chunk = self.chunk(start, end, &v32, &uf32, &k32);
@@ -437,7 +447,7 @@ impl<'a> Fitting<'a> {
                 let bound = chunk.left[r] + (0..c_total).filter(|c| m[*c] == 0).map(|c| f64::from(chunk.a[[r, c]]).abs() * sizes[c]).sum::<f64>();
                 let weight = self.scale * self.s[t] * bound;
                 for c in (0..c_total).filter(|c| m[*c] == 0) {
-                    omega[c] += weight * f64::from(chunk.a[[r, c]]).abs() / sizes[c].max(f64::MIN_POSITIVE);
+                    omega[c] += weight * f64::from(chunk.a[[r, c]]).abs() / sizes[c].max(floor);
                 }
             }
         }
@@ -531,6 +541,27 @@ impl<'a> Fitting<'a> {
         totals
     }
 
+    /// Per subcomponent, the error bits it carries where it is off, `Σ_{t: c off} n s_t B_t |a_tc|
+    /// ‖u_c‖_F / (2 ln 2)` (its share of each input's bound times the bound).
+    fn carried(&self, v: &Array2<f64>, u: &Array2<f64>) -> Vec<f64> {
+        let c_total = self.pieces;
+        let (v32, uf32, k32, sizes) = self.operands(v, u);
+        let mut carried = vec![0.0; c_total];
+        for start in (0..self.rows()).step_by(CHUNK) {
+            let end = (start + CHUNK).min(self.rows());
+            let chunk = self.chunk(start, end, &v32, &uf32, &k32);
+            for r in 0..end - start {
+                let t = start + r;
+                let m = &self.masks[t * c_total..(t + 1) * c_total];
+                let bound = chunk.left[r] + (0..c_total).filter(|c| m[*c] == 0).map(|c| f64::from(chunk.a[[r, c]]).abs() * sizes[c]).sum::<f64>();
+                for c in (0..c_total).filter(|c| m[*c] == 0) {
+                    carried[c] += self.scale * self.s[t] * bound * f64::from(chunk.a[[r, c]]).abs() * sizes[c];
+                }
+            }
+        }
+        carried
+    }
+
     /// The round's report of the state as last coded.
     fn report(&self, round: usize, description: f64, error: f64) -> Round {
         let rows = self.rows() as f64;
@@ -566,7 +597,7 @@ pub fn measure(site: usize, w: &Array2<f64>, samples: &Samples, describe: &dyn D
     }
     let mut fitting = Fitting::new(site, w, samples, observations, library.v.nrows())?;
     let bits = description_bits(describe, site, &library.v, &library.u)?;
-    let (description, error, _) = fitting.code(&library.v, &library.u, &bits, true);
+    let (description, error) = fitting.code(&library.v, &library.u, &bits, true);
     let pieces = library.v.nrows();
     let sets = fitting.masks.chunks(pieces).map(|m| (0..pieces as u32).filter(|c| m[*c as usize] == 1).collect()).collect();
     Ok((fitting.report(0, description, error), sets))
@@ -574,17 +605,18 @@ pub fn measure(site: usize, w: &Array2<f64>, samples: &Samples, describe: &dyn D
 
 /// A library of `settings.pieces` subcomponents for site `site` (`w` its `d_out × d_in` map, `site`
 /// its index in `describe`), fitted on `samples` to the site's code (module note); `progress` sees
-/// every round with the library it measured. Its first reads are `start` (rows of `d_in`, at most
-/// `pieces`; a site reading a layer of units starts from the units themselves), the rest seeded
-/// from inputs, and its first writes the smallest that make every subcomponent on the map. The
-/// library reads the uncentred input (`mean` zero).
+/// every round with the library it measured. Its first subcomponents are `start` (at most
+/// `pieces`; a site reading a layer of units starts from the units themselves), the rest read
+/// inputs; when `start` carries its writes and is the map, the rest start writing nothing, else
+/// the first writes are the smallest that make every subcomponent on the map. The library reads
+/// the uncentred input (`mean` zero).
 pub fn fit(
     site: usize,
     w: &Array2<f64>,
     samples: &Samples,
     describe: &dyn Describe,
     settings: Settings,
-    start: Option<&Array2<f64>>,
+    start: Option<&Library>,
     mut progress: impl FnMut(&Round, &Library),
 ) -> Result<Library, String> {
     let Settings { observations, pieces, rounds, seed } = settings;
@@ -615,12 +647,12 @@ pub fn fit(
         (state % n as u64) as usize
     };
     let mut v = Array2::<f64>::zeros((pieces, d_in));
-    let given = start.map_or(0, |s| s.nrows());
-    if given > pieces || start.is_some_and(|s| s.ncols() != d_in) {
+    let given = start.map_or(0, |s| s.v.nrows());
+    if given > pieces || start.is_some_and(|s| s.v.ncols() != d_in) {
         return Err(format!("site {site}: {given} starting reads for {pieces} subcomponents of {d_in} reads"));
     }
     if let Some(s) = start {
-        v.slice_mut(s![..given, ..]).assign(s);
+        v.slice_mut(s![..given, ..]).assign(&s.v);
     }
     for c in given..pieces {
         v.row_mut(c).assign(&seed_read(draw(rows)));
@@ -638,16 +670,24 @@ pub fn fit(
         Ok(())
     };
     cover(&mut v, &(given..pieces).rev().collect::<Vec<_>>())?;
-    // The smallest writes that make every subcomponent on the map.
-    let mut u = fitting.writes_weighted(&v, &Array1::ones(pieces))?;
+    // The starting writes when they are the map, else the smallest that make every subcomponent on
+    // the map.
+    let mut u = match start.filter(|s| s.u.nrows() == given && s.u.ncols() == w.nrows()) {
+        Some(s) if (&s.u.t().dot(&s.v) - w).iter().all(|e| e.abs() <= 1e-9 * w.iter().fold(0.0_f64, |m, x| m.max(x.abs()))) => {
+            let mut u = Array2::<f64>::zeros((pieces, w.nrows()));
+            u.slice_mut(s![..given, ..]).assign(&s.u);
+            u
+        }
+        _ => fitting.writes_weighted(&v, &Array1::ones(pieces))?,
+    };
     let mut bits = description_bits(describe, site, &v, &u)?;
-    let (description, error, mut errors) = fitting.code(&v, &u, &bits, true);
+    let (description, error) = fitting.code(&v, &u, &bits, true);
     let mut current = description + error;
     let mut report = fitting.report(0, description, error);
     for round in 0..rounds {
         // The writes: the majoriser's minimiser, kept when the code falls.
         let trial = fitting.writes(&v, &u)?;
-        let (d, e, _) = fitting.code(&v, &trial, &bits, false);
+        let (d, e) = fitting.code(&v, &trial, &bits, false);
         if d + e < current {
             (u, current) = (trial, d + e);
         }
@@ -665,26 +705,39 @@ pub fn fit(
                 v.scaled_add(lengths[best], &direction);
             }
         }
-        // Reseeding: every subcomponent on nowhere, from the inputs of largest error in turn, kept
-        // when the sets selected with it code the inputs in fewer bits.
-        let on: Vec<bool> = (0..pieces).map(|c| (0..rows).any(|t| fitting.masks[t * pieces + c] == 1)).collect();
-        let dead: Vec<usize> = (0..pieces).filter(|c| !on[*c]).collect();
-        if !dead.is_empty() {
+        // Growth: every subcomponent that runs nowhere or writes nothing takes half of one that
+        // carries the most error where it is off, split along its inputs (`super::masked::split`:
+        // the halves sum to it, so every subcomponent on stays the map); kept when the sets
+        // selected with them code the inputs in fewer bits.
+        let sizes: Vec<f64> = u.outer_iter().map(|r| r.dot(&r).sqrt()).collect();
+        let largest = sizes.iter().fold(0.0_f64, |m, s| m.max(*s));
+        let idle: Vec<usize> = (0..pieces).filter(|&c| sizes[c] <= f64::EPSILON * largest || (0..rows).all(|t| fitting.masks[t * pieces + c] == 0)).collect();
+        if !idle.is_empty() {
             let saved = (v.clone(), u.clone(), fitting.masks.clone());
-            let mut order: Vec<usize> = (0..rows).collect();
-            order.sort_by(|a, b| errors[*b].total_cmp(&errors[*a]));
-            let mut reseeded = 0;
-            for (&c, &t) in dead.iter().zip(&order) {
-                v.row_mut(c).assign(&seed_read(t));
-                reseeded += 1;
+            let carried = fitting.carried(&v, &u);
+            let mut parents: Vec<usize> = (0..pieces).filter(|c| !idle.contains(c)).collect();
+            parents.sort_by(|a, b| carried[*b].total_cmp(&carried[*a]));
+            let mut grown = 0;
+            for (&slot, &parent) in idle.iter().zip(&parents) {
+                let members: Vec<usize> = (0..rows).filter(|t| fitting.masks[t * pieces + parent] == 1).collect();
+                if members.len() < 2 {
+                    continue;
+                }
+                let reads = Array2::from_shape_fn((members.len(), d_in), |(i, j)| f64::from(x[[members[i], j]]));
+                let one = Library { v: v.slice(s![parent..parent + 1, ..]).to_owned(), u: u.slice(s![parent..parent + 1, ..]).to_owned(), mean: Array1::zeros(d_in) };
+                let (halves, _, _) = super::masked::split(&one, &reads, &Array2::ones((members.len(), 1)));
+                if halves.v.nrows() == 2 {
+                    v.row_mut(parent).assign(&halves.v.row(0));
+                    v.row_mut(slot).assign(&halves.v.row(1));
+                    let write = u.row(parent).to_owned();
+                    u.row_mut(slot).assign(&write);
+                    grown += 1;
+                }
             }
-            cover(&mut v, &dead)?;
-            // The writes again, so every subcomponent on stays the map.
-            u = fitting.writes(&v, &u)?;
             bits = description_bits(describe, site, &v, &u)?;
-            let (d, e, _) = fitting.code(&v, &u, &bits, true);
-            if d + e < current {
-                report.reseeded = reseeded;
+            let (d, e) = fitting.code(&v, &u, &bits, true);
+            if grown > 0 && d + e < current {
+                report.reseeded = grown;
             } else {
                 (v, u, fitting.masks) = saved;
             }
@@ -692,11 +745,10 @@ pub fn fit(
         progress(&report, &Library { v: v.clone(), u: u.clone(), mean: Array1::zeros(d_in) });
         // The next round's sets, under the descriptions as the steps left them.
         bits = description_bits(describe, site, &v, &u)?;
-        let (description, error, next_errors) = fitting.code(&v, &u, &bits, true);
+        let (description, error) = fitting.code(&v, &u, &bits, true);
         let previous = report.code;
         report = fitting.report(round + 1, description, error);
         current = description + error;
-        errors = next_errors;
         if previous - report.code < 1.0 {
             break;
         }
