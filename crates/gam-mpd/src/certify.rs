@@ -767,6 +767,30 @@ fn visible(inputs: &FamilyInputs, causal: bool) -> Result<Vec<Vec<usize>>, Strin
         .collect())
 }
 
+/// A node's kind, for the relaxation's log.
+fn kind(node: &Node) -> &'static str {
+    match node {
+        Node::Feature { .. } => "feature",
+        Node::Raw { .. } => "raw",
+        Node::Constant { .. } => "constant",
+        Node::Affine { .. } => "affine",
+        Node::Bilinear { .. } => "bilinear",
+        Node::Softmax { .. } => "softmax",
+        Node::Mix { .. } => "mix",
+        Node::Pointwise { .. } => "pointwise",
+        Node::Hadamard { .. } => "hadamard",
+        Node::Readout { .. } => "readout",
+        Node::Outer { .. } => "outer",
+        Node::Concat { .. } => "concat",
+        Node::Param { .. } => "param",
+        Node::Call { .. } => "call",
+        Node::Gain { .. } => "gain",
+        Node::Attend { .. } => "attend",
+        Node::RmsNorm { .. } => "rms norm",
+        Node::Transposed { .. } => "transposed",
+    }
+}
+
 /// One free raw slot: each entry anywhere in `[lower, upper]`, the columns of one block moving together.
 #[derive(Clone, Debug)]
 pub struct FreeSlot {
@@ -1040,6 +1064,17 @@ pub fn certify_program(
         };
         let mut value = value;
         value.par_iter_mut().for_each(|x| x.reduce(budget));
+        if log::log_enabled!(log::Level::Debug) {
+            // Where the relaxation widens: each node's mean half-width against its mean center.
+            let (mut reach, mut size, mut symbols) = (0.0, 0.0, 0);
+            for x in &value {
+                let spread = x.spread();
+                reach += (&spread + &x.radius).mean().unwrap_or(0.0) / rows as f64;
+                size += x.center.mapv(f64::abs).mean().unwrap_or(0.0) / rows as f64;
+                symbols = symbols.max(x.ids.len());
+            }
+            log::debug!("certify: node {index} {}: half-width {reach:.3e}, |center| {size:.3e}, {symbols} symbols", kind(&program.nodes[index]));
+        }
         if value.iter().any(|x| !x.finite()) {
             return Ok(unbounded());
         }
