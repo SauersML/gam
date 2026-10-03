@@ -35,15 +35,16 @@
 //! site-switch claim (`gam_mpd::certify::certify_sites`): per sequence, each site within `FREE` runs
 //! its explanation (the given set's subcomponents, the residual and every other one removed) or its
 //! native map, at every word alike, in any combination or anything between; sites outside `FREE`
-//! run native. Under `sites` the lower side is exact: every word's largest KL over all free sites
-//! replaced and each free site replaced alone (no adversary, no branching).
+//! run native. Under `sites` the lower side is exact: every word's largest KL over every subset of
+//! the free sites replaced when there are at most 8 of them, else over all of them and each alone
+//! (no adversary, no branching).
 //! `ROUNDING` `real` reports the relaxation's bound without any rounding enclosure (not a proof; the
 //! default `sound` is one).
 
 use gam_mpd::blocks::Describe;
 use gam_mpd::certify::{Gates, Relaxation, adversary, certify, certify_branching, certify_sites, certify_widening};
 use gam_mpd::import::{import, import_language_model};
-use gam_mpd::masked::{Coder, Library, Masked, Target, box_excess_at, forward, select, select_boxed, site_statistics, sites};
+use gam_mpd::masked::{Coder, Library, Masked, Target, box_excess_at, forward, score_only, select, select_boxed, site_statistics, sites};
 use gam_mpd::operator_program::{FamilyInputs, OperatorProgram};
 use gam_mpd::pieces::fisher_svd;
 use ndarray::{Array1, Array2, Zip};
@@ -232,17 +233,21 @@ fn lm(args: &[String]) -> Result<(), String> {
     enum Claim {
         Gates(Option<usize>),
         Sites,
+        Singles(usize),
     }
     let claims: Vec<Claim> = arg(args, 14, "box".to_string())?
         .split(',')
         .map(|c| match c {
             "box" => Ok(Claim::Gates(None)),
             "sites" => Ok(Claim::Sites),
+            other if other.starts_with("singles:") => {
+                other["singles:".len()..].parse().map(Claim::Singles).map_err(|e| format!("CLAIMS {other}: {e}"))
+            }
             other => other
                 .strip_prefix("restore:")
                 .and_then(|k| k.parse().ok())
                 .map(|k| Claim::Gates(Some(k)))
-                .ok_or_else(|| format!("CLAIMS {other}: expected box, sites or restore:K; {usage}")),
+                .ok_or_else(|| format!("CLAIMS {other}: expected box, sites, singles:B or restore:K; {usage}")),
         })
         .collect::<Result<_, _>>()?;
     let started = Instant::now();
@@ -394,6 +399,82 @@ fn lm(args: &[String]) -> Result<(), String> {
     for (name, masks, claim) in sets.into_iter().flat_map(|(n, m)| claims.iter().map(move |c| (n.clone(), m.clone(), *c))) {
         let restored = match claim {
             Claim::Gates(restored) => restored,
+            Claim::Singles(batch) => {
+                // Every word with each one of its free off subcomponents restored alone, at full
+                // strength: the exact worst single restoration at the word, by exhaustion. A word's KL
+                // reads only the words up to it, so each candidate runs that prefix, `batch` at a time.
+                let layout = family.layout.as_ref().ok_or("singles: a sequence layout")?;
+                let at = Instant::now();
+                let mut worst = Array1::<f64>::zeros(family.rows);
+                let mut argmax: Vec<Option<(usize, usize)>> = vec![None; family.rows];
+                let mut candidates = vec![0usize; family.rows];
+                for r in 0..family.rows {
+                    let prefix: Vec<usize> = (0..family.rows)
+                        .filter(|&j| layout.sequence[j] == layout.sequence[r] && layout.position[j] <= layout.position[r])
+                        .collect();
+                    let at_row = prefix.iter().position(|&j| j == r).ok_or("singles: a row outside its prefix")?;
+                    let base = family.select(&prefix);
+                    let base_masks: Vec<Array2<f64>> = masks.iter().map(|m| m.select(ndarray::Axis(0), &prefix)).collect();
+                    let off: Vec<(usize, usize)> = masks
+                        .iter()
+                        .enumerate()
+                        .filter(|(k, _)| free == "all" || free.split(',').any(|p| masked.sites[*k].name.starts_with(p)))
+                        .flat_map(|(k, m)| (0..m.ncols()).filter(move |&b| m[[r, b]] <= 0.0).map(move |b| (k, b)))
+                        .collect();
+                    candidates[r] = off.len();
+                    for chunk in off.chunks(batch.max(1)) {
+                        let mut batch_family = base.clone();
+                        for _ in 1..chunk.len() {
+                            batch_family = batch_family.append(&base).map_err(|e| e.to_string())?;
+                        }
+                        let n = prefix.len();
+                        let batch_masks: Vec<Array2<f64>> = base_masks
+                            .iter()
+                            .enumerate()
+                            .map(|(k, m)| {
+                                let mut stacked = Array2::<f64>::zeros((n * chunk.len(), m.ncols()));
+                                for (c, &(site, block)) in chunk.iter().enumerate() {
+                                    stacked.slice_mut(ndarray::s![c * n..(c + 1) * n, ..]).assign(m);
+                                    if site == k {
+                                        stacked[[c * n + at_row, block]] = 1.0;
+                                    }
+                                }
+                                stacked
+                            })
+                            .collect();
+                        let logits = target.logits.select(ndarray::Axis(0), &prefix);
+                        let views: Vec<_> = (0..chunk.len()).map(|_| logits.view()).collect();
+                        let batch_target = Target::every_row(ndarray::concatenate(ndarray::Axis(0), &views).map_err(|e| e.to_string())?);
+                        let kl = score_only(&masked, &masked.family(&batch_family, &batch_masks), &batch_target)?;
+                        for (c, &candidate) in chunk.iter().enumerate() {
+                            let value = kl[c * n + at_row];
+                            if value > worst[r] || argmax[r].is_none() {
+                                worst[r] = value;
+                                argmax[r] = Some(candidate);
+                            }
+                        }
+                    }
+                }
+                let seconds = at.elapsed().as_secs_f64();
+                let (kl, _, _) = forward(&masked, &masked.family(family, &masks), &target)?;
+                eprintln!(
+                    "{name} under singles: L0 {:.1}, corner KL {:.4}, worst single restoration {:.4} (largest {:.4}) over {} candidates ({seconds:.1}s)",
+                    listed_l0(&masks),
+                    kl.mean().unwrap_or(0.0),
+                    worst.mean().unwrap_or(0.0),
+                    worst.iter().copied().fold(0.0, f64::max),
+                    candidates.iter().sum::<usize>()
+                );
+                report.push(json!({
+                    "sets": name, "claim": "singles", "l0": listed_l0(&masks), "seconds": seconds,
+                    "kl": summary(&kl), "worst_single": summary(&worst),
+                    "rows": {
+                        "kl": kl.to_vec(), "worst_single": worst.to_vec(), "candidates": candidates,
+                        "argmax": argmax.iter().map(|a| a.map(|(k, b)| json!([masked.sites[k].name, b]))).collect::<Vec<_>>(),
+                    },
+                }));
+                continue;
+            }
             Claim::Sites => {
                 // A replaced site keeps only the set's subcomponents: its residual pieces are off too.
                 let on: Vec<Array2<f64>> = masks
@@ -408,10 +489,21 @@ fn lm(args: &[String]) -> Result<(), String> {
                 let (kl, _, _) = forward(&masked, &masked.family(family, &all), &target)?;
                 let mut found = kl.clone();
                 let mut alone = Vec::new();
-                for k in (0..masked.sites.len()).filter(|&k| free_site[k]) {
-                    let (one, _, _) = forward(&masked, &masked.family(family, &hybrid(&|j| j == k)), &target)?;
+                let switched: Vec<usize> = (0..masked.sites.len()).filter(|&k| free_site[k]).collect();
+                // Every subset of the free sites when there are at most `EXHAUSTIVE` of them (the exact
+                // worst corner), else all replaced and each alone.
+                const EXHAUSTIVE: usize = 8;
+                let subsets: Vec<u64> = if switched.len() <= EXHAUSTIVE {
+                    (1..(1u64 << switched.len()) - 1).collect()
+                } else {
+                    (0..switched.len()).map(|b| 1u64 << b).collect()
+                };
+                for subset in subsets {
+                    let (one, _, _) = forward(&masked, &masked.family(family, &hybrid(&|k| switched.iter().position(|&j| j == k).is_some_and(|b| subset >> b & 1 == 1))), &target)?;
                     Zip::from(&mut found).and(&one).for_each(|f, &o| *f = f.max(o));
-                    alone.push(json!({"site": masked.sites[k].name, "kl": summary(&one)}));
+                    if subset.is_power_of_two() {
+                        alone.push(json!({"site": masked.sites[switched[subset.trailing_zeros() as usize]].name, "kl": summary(&one)}));
+                    }
                 }
                 let at = Instant::now();
                 let certified = certify_sites(&masked, family, &target, rounding.then_some(&radius), &on, &free_site, Relaxation { budget, rounding })?;
