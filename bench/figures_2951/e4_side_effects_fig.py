@@ -42,7 +42,8 @@ def style(ax, grid_axis="x"):
 
 def logfmt(ax, axis="x"):
     a = ax.xaxis if axis == "x" else ax.yaxis
-    a.set_major_locator(LogLocator(base=10, subs=(1, 2, 5), numticks=40))
+    lo, hi = ax.get_xlim() if axis == "x" else ax.get_ylim()
+    a.set_major_locator(LogLocator(base=10, subs=(1, 2, 5) if hi / lo < 300 else (1,), numticks=40))
     a.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
     a.set_minor_formatter(NullFormatter())
 
@@ -112,7 +113,8 @@ a3.set_title("Effect on getting the right answer", loc="left", fontsize=14, font
 a3.text(1.01, len(rows) - 0.3, "positions", transform=a3.get_yaxis_transform(), ha="left", va="bottom", fontsize=14, color=INK2)
 n_l = sum(hi < 1 for _, _, _, hi in ratios)
 n_v = sum(lo > 1 for _, _, lo, _ in ratios)
-fig.suptitle(f"At equal edit success, LoRA disturbs {n_l} of {len(ratios)} abilities less than the VPD edit, VPD {n_v}",
+other = f"VPD less on {n_v}" if n_v else "none the other way"
+fig.suptitle(f"At equal edit success, LoRA disturbs {n_l} of {len(ratios)} abilities less than the VPD edit; {other}",
              x=0.01, ha="left", y=1 - 0.35 / H, fontsize=26, fontweight="bold", color=INK)
 fig.legend(handles=[Line2D([], [], color=ORANGE, marker="o", lw=1.6, ms=6, mec=SURF, label=HV),
                     Line2D([], [], color=BLUE, marker="o", lw=1.6, ms=6, mec=SURF, label=HL),
@@ -142,7 +144,8 @@ for ax, (axis, title) in zip(axes.ravel(), panels):
     ax.set_yscale("log")
     logfmt(ax, "y")
     ax.set_xticks(x)
-    labs = [b["label"] for b in bins]
+    short = {"no emoticon earlier in the document": "no emoticon earlier", "an emoticon earlier in the document": "emoticon earlier"}
+    labs = [short.get(b["label"], b["label"]) for b in bins]
     rot = 30 if sum(len(s) for s in labs) > 60 else 0
     ax.set_xticklabels(labs, rotation=rot, ha="right" if rot else "center", fontsize=14)
     for xi, b in zip(x, bins):
@@ -242,7 +245,7 @@ cb.set_ticklabels([f"LoRA {2 ** lim:.0f}× less", "equal", f"LoRA {2 ** lim:.0f}
 cb.outline.set_visible(False)
 fig.suptitle("LoRA's disturbance ÷ VPD's, for every LoRA setting at equal edit success",
              x=0.01, ha="left", fontsize=22, fontweight="bold", color=INK, y=1 - 0.3 / H4)
-fig.subplots_adjust(left=0.33, right=0.86, top=1 - 2.4 / H4, bottom=0.2 / H4)
+fig.subplots_adjust(left=0.37, right=0.86, top=1 - 2.4 / H4, bottom=0.2 / H4)
 fig.savefig(OUT / "e4_side_effects_all_settings.png", facecolor=SURF)
 plt.close(fig)
 # ---------------------------------------------------------------- 5. each Pile subset
