@@ -166,6 +166,12 @@ pub mod masked_device;
 #[cfg(test)]
 mod masked_device_tests;
 
+// A masked program's library trained on a device: every step's sets, KL and box charge on it.
+pub mod device_train;
+
+#[cfg(test)]
+mod device_train_tests;
+
 // Model exports (export.json and raw float64 tensors) as operator programs and contracts.
 pub mod import;
 
