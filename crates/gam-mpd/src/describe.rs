@@ -296,8 +296,8 @@ pub struct Description {
     pub choice: Option<Choice>,
 }
 
-/// A description's family and precision: the charts and their groups, the core, the lattice
-/// exponents and the coded core in chart coordinates (`K̃ = A Bᵀ`).
+/// A description's family and precision: the charts and their groups and the lattice exponents
+/// (the core's kind is the description's).
 #[derive(Clone, Debug)]
 pub struct Choice {
     writer: usize,
@@ -305,22 +305,8 @@ pub struct Choice {
     reader: usize,
     reader_groups: Vec<usize>,
     exponents: Vec<i32>,
-    a: Array2<f64>,
-    b: Array2<f64>,
 }
 
-impl Choice {
-    /// Whether `other` codes the same family and every one of its reals is within one lattice step
-    /// of this one's (the core's first factor at the first exponent, its second at the last).
-    fn within_step(&self, other: &Choice) -> bool {
-        let close = |x: &Array2<f64>, y: &Array2<f64>, p: i32| {
-            let step = 2f64.powi(-p);
-            x.dim() == y.dim() && x.iter().zip(y.iter()).all(|(a, b)| (a - b).abs() <= step)
-        };
-        let (first, last) = (self.exponents.first().copied().unwrap_or(0), self.exponents.last().copied().unwrap_or(0));
-        self.exponents == other.exponents && close(&self.a, &other.a, first) && close(&self.b, &other.b, last)
-    }
-}
 
 impl Description {
     /// The description's own bits.
@@ -867,7 +853,7 @@ impl Context<'_> {
                 kl_bits: coded.kl,
                 u,
                 v,
-                choice: Some(Choice { writer: i, writer_groups: wg.to_vec(), reader: j, reader_groups: rg.to_vec(), exponents: coded.exponents, a: coded.a, b: coded.b }),
+                choice: Some(Choice { writer: i, writer_groups: wg.to_vec(), reader: j, reader_groups: rg.to_vec(), exponents: coded.exponents }),
             }
         };
         let mut best: Option<Description> = None;
@@ -913,26 +899,24 @@ impl Context<'_> {
     }
 }
 
-/// The prefixes of a side's ranked groups worth a description: while what the groups left out could
-/// still save more KL bits than one more group's least cost (a bit a column; the energies are each
-/// group's own, so their sum estimates what the rest carries), and while the prefix has fewer
-/// columns than the side is wide (beyond that its columns are dependent and the identity says the
-/// same map in fewer reals).
-fn prefixes(chart: &Chart, ranked: &[(usize, f64)], scale: f64) -> Vec<Vec<usize>> {
+/// A chart's candidate group sets: the prefixes of its ranked groups with fewer columns than the
+/// side is wide (beyond that its columns are dependent and the identity says the same map in fewer
+/// reals), each with its column count and the energy its groups carry (each group's own, so their
+/// sum estimates the set's); a chart that takes every group has the one set, carrying `whole`.
+fn prefixes(chart: &Chart, ranked: &[(usize, f64)], whole: f64) -> Vec<(Vec<usize>, usize, f64)> {
     if !chart.subsets {
-        return vec![(0..chart.groups.len()).collect()];
+        return vec![((0..chart.groups.len()).collect(), chart.basis.ncols(), whole)];
     }
     let d = chart.basis.nrows();
     let mut out = Vec::new();
-    let mut columns = 0;
+    let (mut columns, mut energy) = (0, 0.0);
     for n in 1..=ranked.len() {
-        let rest: f64 = ranked[n - 1..].iter().map(|(_, e)| e).sum();
-        let width = chart.groups[ranked[n - 1].0].width;
-        columns += width;
-        if columns >= d || (n > 1 && rest * scale < width as f64) {
+        columns += chart.groups[ranked[n - 1].0].width;
+        energy += ranked[n - 1].1;
+        if columns >= d {
             break;
         }
-        out.push(ranked[..n].iter().map(|(g, _)| *g).collect());
+        out.push((ranked[..n].iter().map(|(g, _)| *g).collect(), columns, energy.min(whole)));
     }
     out
 }
@@ -1114,7 +1098,7 @@ impl Geometry {
             kl_bits: coded.kl,
             u: du,
             v: dv,
-            choice: Some(Choice { exponents: coded.exponents, a: coded.a, b: coded.b, ..choice.clone() }),
+            choice: Some(Choice { exponents: coded.exponents, ..choice.clone() }),
         }))
     }
 
@@ -1125,53 +1109,35 @@ impl Geometry {
         let block = Block::new(u, v, metric, calibration);
         let rank = u.nrows();
         let (charts_bits, core_bits) = self.header_bits()?;
-        let writer_sets: Vec<Vec<Vec<usize>>> =
-            self.writers.iter().map(|c| prefixes(&c.chart, &ranked(c, &block.fu, &block.gv), block.scale)).collect();
-        let reader_sets: Vec<Vec<Vec<usize>>> =
-            self.readers.iter().map(|c| prefixes(&c.chart, &ranked(c, &block.cv, &block.gu), block.scale)).collect();
+        let writer_sets: Vec<_> = self.writers.iter().map(|c| prefixes(&c.chart, &ranked(c, &block.fu, &block.gv), block.w2)).collect();
+        let reader_sets: Vec<_> = self.readers.iter().map(|c| prefixes(&c.chart, &ranked(c, &block.cv, &block.gu), block.w2)).collect();
         let context = Context { block: &block, rank, charts_bits, core_bits };
         let mut best: Option<Description> = None;
         let used = |n: usize| if charts { n } else { 1 };
+        // The identity pair first, coded exactly; every other pair at the sets its proxy prefers (the
+        // groups' bits, the identity's bits per real for every real, and the energy the sets leave out
+        // at the metric's price), then coded exactly there.
         for (i, writer) in self.writers.iter().enumerate().take(used(self.writers.len())) {
             for (j, reader) in self.readers.iter().enumerate().take(used(self.readers.len())) {
-                let (ws, rs) = (&writer_sets[i], &reader_sets[j]);
-                let (Some(mut wg), Some(mut rg)) = (ws.last().cloned(), rs.last().cloned()) else { continue };
-                // A side with one set is scanned once, by whichever pass comes first.
-                let mut scanned = false;
-                for _ in 0..2 {
-                    for (side, sets) in [(0, rs), (1, ws)] {
-                        if sets.len() == 1 && scanned {
-                            continue;
-                        }
-                        scanned = true;
-                        let mut evaluate = |n: usize| -> Result<f64, String> {
-                            let set = &sets[n];
-                            let (w_, r_) = if side == 0 { (&wg, set) } else { (set, &rg) };
-                            let floor = charts_bits
-                                + core_bits
-                                + writer.chart.subset_bits(w_.len())?
-                                + reader.chart.subset_bits(r_.len())?
-                                + w_.len().min(r_.len()) as f64;
-                            if best.as_ref().is_some_and(|b| floor >= b.total()) {
-                                return Ok(f64::INFINITY);
-                            }
-                            let Some(found) = context.evaluate((i, writer, w_.as_slice()), (j, reader, r_.as_slice()))? else {
-                                return Ok(f64::INFINITY);
-                            };
-                            let total = found.total();
-                            if best.as_ref().is_none_or(|b| total < b.total()) {
-                                best = Some(found);
-                            }
-                            Ok(total)
-                        };
-                        if let Some(n) = minimize(sets.len(), &mut evaluate)? {
-                            if side == 0 {
-                                rg = sets[n].clone();
-                            } else {
-                                wg = sets[n].clone();
-                            }
+                let per_real = best.as_ref().map_or(1.0, |b| b.real_bits / b.reals.max(1) as f64);
+                let mut choice: Option<(f64, &Vec<usize>, &Vec<usize>)> = None;
+                for (wg, ws, we) in &writer_sets[i] {
+                    for (rg, rs, re) in &reader_sets[j] {
+                        let r = rank.min(*ws).min(*rs);
+                        let proxy = writer.chart.subset_bits(wg.len())?
+                            + reader.chart.subset_bits(rg.len())?
+                            + per_real * (r * (ws + rs - r)) as f64
+                            + block.scale * ((block.w2 - we).max(0.0) + (block.w2 - re).max(0.0));
+                        if choice.is_none_or(|c| proxy < c.0) {
+                            choice = Some((proxy, wg, rg));
                         }
                     }
+                }
+                let Some((_, wg, rg)) = choice else { continue };
+                if let Some(found) = context.evaluate((i, writer, wg.as_slice()), (j, reader, rg.as_slice()))?
+                    && best.as_ref().is_none_or(|b| found.total() < b.total())
+                {
+                    best = Some(found);
                 }
             }
         }
@@ -1293,16 +1259,16 @@ impl Structured {
     }
 
     /// The description of block `index` of site `site`, from its last one when it can: re-sent in
-    /// that family at that precision ([`Geometry::recode`]), and searched afresh only when a real
-    /// has moved by more than its lattice step (or the family no longer holds the block). A
+    /// that family at that precision ([`Geometry::recode`]), and searched afresh only when the
+    /// family no longer holds the block or the re-sent total has grown by more than the family's own
+    /// structure bits (all a fresh search could re-allocate without changing the reals' count). A
     /// library that trains by small steps is so re-priced at the cost of one coding, not a search.
     pub fn describe_cached(&self, site: usize, index: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<Description, String> {
         let geometry = self.sites.get(site).ok_or_else(|| format!("no site {site}"))?;
         let previous = self.cache.lock().map_err(|e| e.to_string())?.get(&(site, index)).cloned();
         if let Some(previous) = previous
             && let Some(d) = geometry.recode(u, v, &previous, self.calibration)?
-            && let (Some(old), Some(new)) = (&previous.choice, &d.choice)
-            && old.within_step(new)
+            && d.total() <= previous.total() + previous.structure_bits
         {
             self.cache.lock().map_err(|e| e.to_string())?.insert((site, index), d.clone());
             return Ok(d);
