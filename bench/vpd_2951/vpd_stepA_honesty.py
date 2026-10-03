@@ -53,6 +53,7 @@ parser.add_argument("--steps", default="20,40,80")
 parser.add_argument("--key", default=None)
 parser.add_argument("--families", default="vpd_ci,vpd_rounded,given")
 parser.add_argument("--all-on", action="store_true", help="also every subcomponent on (box)")
+parser.add_argument("--parts", default="fixed,draws,pgd", help="which parts of box to run")
 parser.add_argument("--delta", action="store_true", help="also VPD's residual semantics (box; it moves the KL by <1%%)")
 parser.add_argument("--name", default="ours", help="the given sets' family name")
 parser.add_argument("--library", type=Path, default=Path.home() / "mpd-data/pieces/vpd4l_library")
@@ -266,6 +267,7 @@ def box():
     key = args.key or "box"
     steps = [int(s) for s in args.steps.split(",")]
     # The fixed points: each family at its lower bound, VPD's thresholds, and every subcomponent on.
+    parts = args.parts.split(",")
     fixed = {}
     with torch.no_grad():
         for name, fam in families.items():
@@ -283,7 +285,7 @@ def box():
                      "l0": {k: f.l0() for k, f in families.items()}})
     # Uniform draws over the box, the same U per (draw, microbatch) for every family.
     draws = {}
-    for delta_mode in (("off", "uniform") if args.delta else ("off",)):
+    for delta_mode in () if "draws" not in parts else (("off", "uniform") if args.delta else ("off",)):
         for name, fam in families.items():
             kl = np.zeros((args.draws, args.rows * S))
             with torch.no_grad():
@@ -308,7 +310,7 @@ def box():
             update_out(key, {"draws": draws, "draws_per_word": args.draws})
     # VPD's eval adversary: one shared source per subcomponent (plus one delta coordinate).
     pgd = {}
-    for with_delta in ((False, True) if args.delta else (False,)):
+    for with_delta in () if "pgd" not in parts else ((False, True) if args.delta else (False,)):
         for name, fam in families.items():
             ladder = pgd_recon(vpd, ids, fam, steps, step_size=0.1, with_delta=with_delta, seed=0)
             pgd[f"{name}/delta_{'adversarial' if with_delta else 'off'}"] = {str(k): v for k, v in ladder.items()}
