@@ -322,10 +322,14 @@ fn every_radius_covers_the_quad_double_value() {
     let exact = quad_evaluation(&program, &inputs);
     let mut widest_ratio = 0.0_f64;
     for (node, rows) in exact.iter().enumerate() {
+        // A gathered feature holds no columns in the trace: its one-hot rows, formed here, are
+        // exact, so their radius is zero.
+        let gathered = program.gathered_tokens(node, &inputs).is_some();
+        let values = program.node_value(&trace, &inputs, node).expect("the node's value");
         for (row, entries) in rows.iter().enumerate() {
             for (col, value) in entries.iter().enumerate() {
-                let error = (q(trace.values[node][[row, col]]) - *value).abs();
-                let radius = bands[node][[row, col]];
+                let error = (q(values[[row, col]]) - *value).abs();
+                let radius = if gathered { 0.0 } else { bands[node][[row, col]] };
                 assert!(
                     to_f64(error) <= radius,
                     "node {node} row {row} col {col}: error {} beyond radius {radius}",

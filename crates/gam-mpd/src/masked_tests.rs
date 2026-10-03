@@ -368,7 +368,7 @@ fn sites_are_the_hidden_maps_and_their_statistics_build_an_exact_library() {
 /// The box claim's error is the KL expected over every off gate drawn uniform: against the mean
 /// KL of sampled gates on small pieces (where second order is accurate).
 #[test]
-fn the_box_claims_error_is_the_kl_expected_over_uniform_off_gates() {
+fn the_box_expectation_is_the_kl_expected_over_uniform_off_gates() {
     use super::masked::{box_excess, fisher};
     let (mut program, family) = model();
     // The second-order comparison needs a smooth neighborhood. ReLU gate crossings are not
@@ -660,4 +660,76 @@ fn a_box_step_is_judged_on_the_claims_worst_case_error() {
         judged += 1;
     }
     assert!(judged > 0, "no step was taken");
+}
+
+/// The box claim's error is the worst over the box points it evaluates
+/// ([`super::masked::box_excess_at`]), so it is never below the uniform expectation
+/// ([`super::masked::box_excess`], the previous test's term) nor below zero (the masks themselves
+/// are a point), and never below any layer's vertex (that layer's sites at the masks, the other
+/// layers' gates all on), whose exact KL is evaluated here independently. With every gate on the
+/// box is one point, the masks, and the error is zero.
+#[test]
+fn the_box_claims_error_is_its_worst_point_at_least_the_expectation() {
+    use super::masked::{box_excess_at, expected_box_excess_at, fisher, matrix, score_only};
+    let (mut program, family) = model();
+    // A second hidden map, `W_mid` on the residual stream before `W_in`: two sites, two layers.
+    let residual = Interface::native(WIDTH).expect("interface");
+    let mid = Array2::from_shape_fn((WIDTH, WIDTH), |(i, j)| (if i == j { 1.0 } else { 0.0 }) + 0.3 * noise(300 + 31 * i + j));
+    program.operators.push(Arc::new(Operator::dense("W_mid", residual.clone(), residual, mid, precision(), Provenance::default()).expect("dense")));
+    let w_mid = program.operators.len() - 1;
+    program.nodes = vec![
+        Node::Feature { slot: 0, basis: 0 },
+        Node::Feature { slot: 1, basis: 0 },
+        Node::Affine { terms: vec![(0, 0), (1, 0)], bias: None },
+        Node::Affine { terms: vec![(2, w_mid)], bias: None },
+        Node::Affine { terms: vec![(3, 1)], bias: None },
+        Node::Pointwise { input: 4, laws: vec![Law::Relu; UNITS] },
+        Node::Affine { terms: vec![(5, 2)], bias: None },
+        Node::Readout { input: 6, basis: 0 },
+    ];
+    program.output = 7;
+    let chosen: Vec<_> = sites(&program).into_iter().filter(|s| s.name == "W_in" || s.name == "W_mid").collect();
+    assert_eq!(chosen.len(), 2, "two sites in two layers");
+    let pieces = 3;
+    let libraries: Vec<Library> = chosen
+        .iter()
+        .enumerate()
+        .map(|(k, site)| {
+            let (d_out, d_in) = matrix(&program, site).expect("map").dim();
+            Library {
+                v: Array2::from_shape_fn((pieces, d_in), |(i, j)| 0.5 * noise(900 + 100 * k + 7 * i + j)),
+                u: Array2::from_shape_fn((pieces, d_out), |(i, j)| 0.5 * noise(1900 + 100 * k + 7 * i + j)),
+                mean: Array1::zeros(d_in),
+            }
+        })
+        .collect();
+    let masked = Masked::build(&program, chosen, libraries).expect("builds");
+    let target = Target::every_row(program.execute(&family, false).expect("executes").values[program.output].clone());
+    let masks: Vec<Array2<f64>> = (0..2).map(|k| Array2::from_shape_fn((family.rows, pieces), |(r, c)| if (r + c + k) % 2 == 0 { 0.0 } else { 1.0 })).collect();
+    let fam = masked.family(&family, &masks);
+    let (_, trace, _) = forward(&masked, &fam, &target).expect("forward");
+    let fishers: Vec<Array2<f64>> =
+        fisher(&masked, &fam, &trace, &target, 64, 11, true).expect("fisher").into_iter().map(|(_, f)| f.expect("written")).collect();
+    let corner = score_only(&masked, &fam, &target).expect("kl");
+    let expected = expected_box_excess_at(&masked, &family, &target, &masks, &fishers).expect("expected");
+    let error = box_excess_at(&masked, &family, &target, &masks, &fishers).expect("error");
+    // Without a layout every input is its own sequence, so each row is charged its own worst point.
+    let close = |a: f64, b: f64| a >= b - 1e-12 * (1.0 + b.abs());
+    let mut above = 0;
+    for r in 0..family.rows {
+        assert!(error[r] >= expected[r].max(0.0), "row {r}: error {} below the expectation {} or zero", error[r], expected[r]);
+        above += usize::from(error[r] > expected[r].max(0.0));
+    }
+    for layer in 0..2 {
+        let vertex: Vec<Array2<f64>> = (0..2).map(|k| if k == layer { masks[k].clone() } else { Array2::ones(masks[k].dim()) }).collect();
+        let kl_vertex = score_only(&masked, &masked.family(&family, &vertex), &target).expect("vertex");
+        for r in 0..family.rows {
+            assert!(close(error[r], kl_vertex[r] - corner[r]), "row {r}: error {} below layer {layer}'s vertex {}", error[r], kl_vertex[r] - corner[r]);
+        }
+    }
+    assert!(above > 0, "no box point beyond the expectation: the test would not tell the worst case from it");
+    let on: Vec<Array2<f64>> = masks.iter().map(|m| Array2::ones(m.dim())).collect();
+    let none = box_excess_at(&masked, &family, &target, &on, &fishers).expect("all on");
+    // Zero up to the rounding of the points' own forwards (they run by other routes than the masks').
+    assert!(none.iter().zip(corner.iter()).all(|(e, k)| e.abs() <= 1e-12 * (1.0 + k.abs())), "with every gate on the error is the masks' own: {none:?}");
 }
