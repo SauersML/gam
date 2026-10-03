@@ -1,64 +1,69 @@
-//! Concepts: groups of subcomponents that run together, each named once per word (#2951).
+//! Concepts: named groups of subcomponents, the vocabulary of a text that alone says which weights
+//! ran on a word (#2951).
 //!
 //! # The object
 //!
 //! A decomposition says, per word `t`, which subcomponents ran: a set `S_t` of a universe of `N`.
-//! A *concept* is a group `g` of subcomponents with one binary latent `z_tg` per word: the word
-//! invokes the concept or not, and each member's state is coded given that choice. Concepts are
-//! disjoint; a subcomponent in no concept is coded on its own. The concepts are the vocabulary of a
-//! description of a word's computation: the word's text names the concepts it invokes (the
-//! natural-language autoencoder `bench/vpd_2951/vpd_nl_autoencoder.py` renders each one as a label
-//! read off its members' weights), and decoding the text turns on each named concept's core, the
-//! members more often on than off when it is invoked ([`Model::decode`]).
+//! A *concept* is a group `g` of subcomponents with a name. A word's text is the names of the
+//! concepts it invokes, and the text is the only channel: decoding it runs the model with every
+//! member of every named concept on and everything else off. Concepts are disjoint, and a
+//! subcomponent can be a concept alone. The natural-language autoencoder
+//! (`bench/vpd_2951/vpd_nl_autoencoder.py`) writes each concept's name in English from its members'
+//! weights and contexts and prices the text under a fixed language model.
 //!
 //! # The code
 //!
-//! Every stream is a Krichevsky–Trofimov sequential code, so a rate costs no separate parameter
-//! bits (the KT mixture already pays about `½ log₂ n` for it):
+//! A word pays the objective's three terms, with nothing sent beside the text:
 //!
 //! ```text
-//! concept g:    KT(|Z_g|, T) + Σ_{j∈g} [KT(k¹_j, |Z_g|) + KT(k⁰_j, T − |Z_g|)]
-//! on its own:   KT(n_j, T)
-//! library:      L_subset(N, |g|) + label bits, per concept
+//! names:     KT(|Z_g|, T) per concept in the vocabulary (invoked on some word)
+//! program:   B_g = Σ_{j∈g} b_j on every word that invokes g (the description of the weights that ran)
+//! error:     m_tg = Σ_{j∈g∩S_t} d_tj on every word t that needs g's members and does not invoke it
+//! library:   L_subset(N, |g|) + label bits, per concept in the vocabulary
 //! ```
 //!
-//! with `T` the coded words, `Z_g` the words invoking `g`, `k¹_j` the words of `Z_g` on which
-//! member `j` ran, `k⁰_j` the other words on which it ran, `n_j` all of them, and
-//! `KT(k, n) = −log₂ [Γ(k + ½) Γ(n − k + ½) / (π Γ(n + 1))]`. The label bits are what the
-//! concept's name costs in the language the text is scored in, declared by the caller. The total
-//! is a sum over groups, so merging disjoint pairs changes it by the sum of their own changes.
+//! with `T` the coded words, `Z_g` the words invoking `g`, `b_j` member `j`'s description bits
+//! (from the library's own description, so the code is library-agnostic) and `d_tj` the price in
+//! bits of leaving `j` off at word `t`, `n ΔKL_tj / ln 2` for the exact KL its absence adds there
+//! (the caller measures it). `KT(k, n) = −log₂ [Γ(k + ½) Γ(n − k + ½) / (π Γ(n + 1))]`, the
+//! Krichevsky–Trofimov code of the invocation stream, pays for its own rate. The error term is the
+//! fit's price for KL; every number quoted for a fitted vocabulary is the exact KL of the decoded
+//! text. The program term is what keeps the code honest: without it the one name "everything"
+//! (every subcomponent on at every word) would cost almost nothing, since that program is the
+//! model itself. The total is a sum over concepts, so changes to disjoint concepts add.
 //!
 //! # The fit
 //!
-//! Given its members, a concept's invocations are fitted by hard EM on its exact bits: the rates
-//! from `Z`, then each word invokes the concept when its log-odds under those rates is positive
-//! (only a word on which some member ran may invoke it), until `Z` repeats or the bits stop
-//! falling; the least total seen is kept. Groups merge agglomeratively. Each open group ranks its
-//! partners by the information between their invocations, `T Î(z_g; z_h)` bits (what a joint
-//! code of the two indicators saves over separate ones), and proposes, in that order, the first
-//! whose fitted merge lowers the total, while that information can still pay for the merge's
-//! added library bits; a group with no such partner closes (a merged group is new and open). A
-//! greedy matching of the proposals, most saving first, is applied at once, and rounds repeat
-//! until no group is open. There is no threshold: a merge is kept exactly when the code is
-//! shorter.
+//! Given its members, a concept's invocations are fitted by hard EM on its exact bits: the rate
+//! `π` from `Z`, then a word invokes the concept when its name and program cost less than the error
+//! it removes, `−log₂ π + B_g < −log₂(1 − π) + m_tg` (only a word that needs some member may
+//! invoke it), until `Z` repeats or the bits stop falling; the least total seen is kept.
+//!
+//! Every subcomponent that ran starts as its own concept. Groups merge: a merge can only save on
+//! words that need both groups (elsewhere the merged concept costs at least what the cheaper of
+//! the two choices did), at most one name per such word, `log₂ 2(T + 1)` bits, plus the two
+//! libraries it replaces. Each open group proposes partners in order of shared words while that
+//! bound exceeds the merged concept's library; it proposes the first whose fitted merge lowers the
+//! total and closes when none does. A greedy matching of the proposals, most saving first, is
+//! applied at once. Each merged concept then peels: a member whose own concept would cost less
+//! than its share of the group (it disagrees with the others on when it is needed) leaves, the
+//! most saving first, while that lowers the total. Rounds repeat until no group is open. Nothing
+//! is kept unless the code is shorter.
 //!
 //! # Coding new words
 //!
-//! A [`Model`] freezes every rate at its KT estimate from the fitted counts. A new word invokes a
-//! concept when that is cheaper ([`Model::encode`]). Its bits split into the concept choices (what
-//! the text carries), the members given those choices and the subcomponents on their own
-//! ([`Bits`]), against the independent code that sends every subcomponent at its own rate.
+//! A [`Model`] freezes each concept's rate at its KT estimate. A new word invokes a concept when
+//! that is cheaper ([`Model::encode`]); [`Model::decode`] turns the invoked concepts back into the
+//! program. Its bits split into the names, the program and the predicted error ([`Bits`]).
 //!
 //! # What a concept's name does and does not carry
 //!
-//! A concept's invocation alone does not determine its members: two words with member patterns
-//! `(1, 0)` and `(0, 1)` can invoke the same concept, and the conditional member streams carry the
-//! difference. A text that names concepts is exact only together with those corrections. Decoding
-//! a text to the native on-sets is referential faithfulness; it does not make the words' English
-//! meaning an explanation (renaming every concept preserves the code). That needs the text's rules
-//! to predict declared interventions. For candidate groups with costs `c_g`, the best partition
-//! `min Σ c_g z_g` s.t. `Σ_{g ∋ j} z_g = 1` is bounded below by any `α` with
-//! `Σ_{j ∈ g} α_j ≤ c_g` (`Σ_j α_j`), which gives agglomeration a stopping gap.
+//! Decoding a text to a program is referential faithfulness: the names pick weights, and the KL of
+//! the picked program is measured. It does not make the names' English meaning an explanation
+//! (renaming every concept preserves the code); that needs the text's words to predict declared
+//! interventions. For candidate groups with costs `c_g`, the best partition `min Σ c_g z_g` s.t.
+//! `Σ_{g ∋ j} z_g = 1` is bounded below by any `α` with `Σ_{j ∈ g} α_j ≤ c_g` (`Σ_j α_j`), which
+//! gives agglomeration a stopping gap.
 
 use super::codec::subset_code_len_bits;
 use rayon::prelude::*;
@@ -94,16 +99,37 @@ impl Sets {
     pub fn row(&self, t: usize) -> &[u32] {
         &self.indices[self.indptr[t]..self.indptr[t + 1]]
     }
+}
 
-    /// Each element's rows, ascending.
-    pub fn columns(&self) -> Vec<Vec<u32>> {
-        let mut out = vec![Vec::new(); self.universe];
-        for t in 0..self.rows() {
-            for j in self.row(t) {
-                out[*j as usize].push(t as u32);
+/// Per-word sets with the price, in bits, of leaving each member off (aligned with the indices).
+#[derive(Clone, Debug)]
+pub struct Priced {
+    pub sets: Sets,
+    pub missing: Vec<f64>,
+}
+
+impl Priced {
+    pub fn new(sets: Sets, missing: Vec<f64>) -> Result<Self, String> {
+        if missing.len() != sets.indices.len() || missing.iter().any(|x| !x.is_finite()) {
+            return Err("priced sets: one finite price per member of every set".to_string());
+        }
+        Ok(Self { sets, missing })
+    }
+
+    /// Each element's (word, price) pairs, words ascending.
+    fn columns(&self) -> Vec<Vec<(u32, f64)>> {
+        let mut out = vec![Vec::new(); self.sets.universe];
+        for t in 0..self.sets.rows() {
+            for k in self.sets.indptr[t]..self.sets.indptr[t + 1] {
+                out[self.sets.indices[k] as usize].push((t as u32, self.missing[k]));
             }
         }
         out
+    }
+
+    /// The program bits of each word's own set: what the decomposition's sets cost as programs.
+    pub fn program_bits(&self, program: &[f64]) -> Vec<f64> {
+        (0..self.sets.rows()).map(|t| self.sets.row(t).iter().map(|j| program[*j as usize]).sum()).collect()
     }
 }
 
@@ -112,7 +138,9 @@ pub fn kt_bits(k: u64, n: u64) -> f64 {
     assert!(k <= n, "kt_bits: {k} ones in {n} symbols");
     // The empty sequence has probability exactly one. Evaluating the gamma identity here
     // introduces a rounding residual, charging (or crediting) unused branches in the code.
-    if n == 0 { return 0.0; }
+    if n == 0 {
+        return 0.0;
+    }
     (ln_gamma(n as f64 + 1.0) + PI.ln() - ln_gamma(k as f64 + 0.5) - ln_gamma((n - k) as f64 + 0.5)) / LN_2
 }
 
@@ -121,259 +149,194 @@ fn kt_rate(k: u64, n: u64) -> f64 {
     (k as f64 + 0.5) / (n as f64 + 1.0)
 }
 
-/// A group of subcomponents and its fitted invocations.
+/// A named group of subcomponents and its fitted invocations.
 #[derive(Clone, Debug)]
 pub struct Concept {
     /// Members, ascending.
     pub members: Vec<u32>,
-    /// The words that invoke it, ascending (for a lone subcomponent, the words it ran on).
-    pub invoked: Vec<u32>,
-    /// Per member, the words it ran on (`n_j`) and those of them that invoke the group (`k¹_j`).
-    pub ran: Vec<u64>,
-    pub ran_invoked: Vec<u64>,
-    /// Its data bits (module note, "The code").
+    /// The words that need some member, ascending, each with its error if not invoked (`m_tg`).
+    pub needed: Vec<u32>,
+    pub error: Vec<f64>,
+    /// Per needed word, whether it invokes the concept.
+    pub invoked: Vec<bool>,
+    /// `B_g`: the program bits of invoking it.
+    pub program: f64,
+    /// Its names, program and error bits (module note, "The code").
     pub bits: f64,
 }
 
 impl Concept {
-    fn alone(j: u32, column: &[u32], words: u64) -> Self {
-        let n = column.len() as u64;
-        Self { members: vec![j], invoked: column.to_vec(), ran: vec![n], ran_invoked: vec![n], bits: kt_bits(n, words) }
+    pub fn invocations(&self) -> usize {
+        self.invoked.iter().filter(|z| **z).count()
     }
 
-    /// Its library bits: none alone, else its members as a subset of the universe plus its label.
+    /// Its library bits: none outside the vocabulary, else its members as a subset of the universe
+    /// plus its label.
     fn library(&self, universe: usize, label_bits: f64) -> f64 {
-        if self.members.len() < 2 {
+        if self.invocations() == 0 {
             return 0.0;
         }
         subset_code_len_bits(universe, self.members.len()).map_or(f64::INFINITY, |b| b as f64) + label_bits
     }
-}
 
-/// The words on which any of a group's members ran, ascending, with the members (by position)
-/// that ran on each.
-struct Local {
-    words: Vec<u32>,
-    start: Vec<usize>,
-    member: Vec<u32>,
-    ran: Vec<u64>,
-}
-
-impl Local {
-    fn new(members: &[u32], columns: &[Vec<u32>]) -> Self {
-        let mut pairs: Vec<(u32, u32)> = members
-            .iter()
-            .enumerate()
-            .flat_map(|(i, j)| columns[*j as usize].iter().map(move |t| (*t, i as u32)))
-            .collect();
-        pairs.sort_unstable();
-        let mut words = Vec::new();
-        let mut start = Vec::new();
-        let mut member = Vec::with_capacity(pairs.len());
-        for (t, i) in pairs {
-            if words.last() != Some(&t) {
-                words.push(t);
-                start.push(member.len());
-            }
-            member.push(i);
-        }
-        start.push(member.len());
-        let ran = members.iter().map(|j| columns[*j as usize].len() as u64).collect();
-        Self { words, start, member, ran }
-    }
-
-    /// The bits of invocations `z` (one per local word) and their member counts `k¹`.
-    fn bits(&self, z: &[bool], words: u64) -> (f64, u64, Vec<u64>) {
-        let mut invoked = 0u64;
-        let mut k1 = vec![0u64; self.ran.len()];
-        for (w, on) in z.iter().enumerate() {
-            if *on {
-                invoked += 1;
-                for i in &self.member[self.start[w]..self.start[w + 1]] {
-                    k1[*i as usize] += 1;
-                }
-            }
-        }
-        let mut bits = kt_bits(invoked, words);
-        for (n, k) in self.ran.iter().zip(&k1) {
-            bits += kt_bits(*k, invoked) + kt_bits(n - k, words - invoked);
-        }
-        (bits, invoked, k1)
-    }
-
-    /// Hard EM on the exact bits from `z` (module note, "The fit"): the least-bits invocations seen.
-    fn fit(&self, mut z: Vec<bool>, words: u64) -> (Vec<bool>, f64, Vec<u64>) {
-        let (mut bits, mut invoked, mut k1) = self.bits(&z, words);
-        loop {
-            let pi = kt_rate(invoked, words);
-            let mut base = (pi / (1.0 - pi)).ln();
-            let weight: Vec<f64> = self
-                .ran
-                .iter()
-                .zip(&k1)
-                .map(|(n, k)| {
-                    let q = kt_rate(*k, invoked);
-                    let a = kt_rate(n - k, words - invoked);
-                    base += ((1.0 - q) / (1.0 - a)).ln();
-                    (q / a).ln() - ((1.0 - q) / (1.0 - a)).ln()
-                })
-                .collect();
-            let next: Vec<bool> = (0..self.words.len())
-                .map(|w| base + self.member[self.start[w]..self.start[w + 1]].iter().map(|i| weight[*i as usize]).sum::<f64>() > 0.0)
-                .collect();
-            if next == z {
-                return (z, bits, k1);
-            }
-            let (b, n, k) = self.bits(&next, words);
-            if b >= bits {
-                return (z, bits, k1);
-            }
-            (z, bits, invoked, k1) = (next, b, n, k);
-        }
+    fn total(&self, universe: usize, label_bits: f64) -> f64 {
+        self.bits + self.library(universe, label_bits)
     }
 }
 
-/// Fit the group of `members` from initial invocations (the local words in `init`, ascending).
-fn fit_group(members: Vec<u32>, columns: &[Vec<u32>], words: u64, inits: &[&[u32]]) -> Concept {
-    let local = Local::new(&members, columns);
-    let mut best: Option<(Vec<bool>, f64, Vec<u64>)> = None;
+/// The bits of invocations `z` over the needed words (module note, "The code").
+fn concept_bits(error: &[f64], z: &[bool], program: f64, words: u64) -> f64 {
+    let invoked = z.iter().filter(|x| **x).count() as u64;
+    let names = if invoked == 0 { 0.0 } else { kt_bits(invoked, words) };
+    names + invoked as f64 * program + error.iter().zip(z).filter(|(_, on)| !**on).map(|(e, _)| e).sum::<f64>()
+}
+
+/// Fit the concept of `members` (module note, "The fit"), from each of `inits` (invoking words,
+/// ascending); the least-bits result.
+fn fit_concept(members: Vec<u32>, columns: &[Vec<(u32, f64)>], program: &[f64], words: u64, inits: &[&[u32]]) -> Concept {
+    let mut pairs: Vec<(u32, f64)> = members.iter().flat_map(|j| columns[*j as usize].iter().copied()).collect();
+    pairs.sort_unstable_by_key(|p| p.0);
+    let mut needed: Vec<u32> = Vec::new();
+    let mut error: Vec<f64> = Vec::new();
+    for (t, d) in pairs {
+        if needed.last() == Some(&t) {
+            *error.last_mut().expect("a needed word") += d;
+        } else {
+            needed.push(t);
+            error.push(d);
+        }
+    }
+    let cost: f64 = members.iter().map(|j| program[*j as usize]).sum();
+    let mut best: Option<(Vec<bool>, f64)> = None;
     for init in inits {
-        let mut z = vec![false; local.words.len()];
-        let mut i = 0;
-        for (w, t) in local.words.iter().enumerate() {
-            while i < init.len() && init[i] < *t {
-                i += 1;
+        let mut z: Vec<bool> = needed.iter().map(|t| init.binary_search(t).is_ok()).collect();
+        let mut bits = concept_bits(&error, &z, cost, words);
+        loop {
+            let pi = kt_rate(z.iter().filter(|x| **x).count() as u64, words);
+            let (on, off) = (-pi.log2() + cost, -(1.0 - pi).log2());
+            let next: Vec<bool> = error.iter().map(|e| on < off + e).collect();
+            if next == z {
+                break;
             }
-            z[w] = i < init.len() && init[i] == *t;
+            let b = concept_bits(&error, &next, cost, words);
+            if b >= bits {
+                break;
+            }
+            (z, bits) = (next, b);
         }
-        let fitted = local.fit(z, words);
-        if best.as_ref().is_none_or(|b| fitted.1 < b.1) {
-            best = Some(fitted);
+        if best.as_ref().is_none_or(|(_, b)| bits < *b) {
+            best = Some((z, bits));
         }
     }
-    let (z, bits, ran_invoked) = best.expect("at least one start");
-    let invoked = local.words.iter().zip(&z).filter(|(_, on)| **on).map(|(t, _)| *t).collect();
-    Concept { members, invoked, ran: local.ran, ran_invoked, bits }
+    let (invoked, bits) = best.expect("at least one start");
+    Concept { members, needed, error, invoked, program: cost, bits }
+}
+
+fn invoking(c: &Concept) -> Vec<u32> {
+    c.needed.iter().zip(&c.invoked).filter(|(_, z)| **z).map(|(t, _)| *t).collect()
 }
 
 fn union(a: &[u32], b: &[u32]) -> Vec<u32> {
-    let mut out = Vec::with_capacity(a.len() + b.len());
-    let (mut i, mut j) = (0, 0);
-    while i < a.len() || j < b.len() {
-        if j == b.len() || (i < a.len() && a[i] < b[j]) {
-            out.push(a[i]);
-            i += 1;
-        } else if i == a.len() || b[j] < a[i] {
-            out.push(b[j]);
-            j += 1;
-        } else {
-            out.push(a[i]);
-            i += 1;
-            j += 1;
-        }
-    }
+    let mut out: Vec<u32> = a.iter().chain(b).copied().collect();
+    out.sort_unstable();
+    out.dedup();
     out
 }
 
 fn intersection(a: &[u32], b: &[u32]) -> Vec<u32> {
-    let mut out = Vec::new();
-    let (mut i, mut j) = (0, 0);
-    while i < a.len() && j < b.len() {
-        match a[i].cmp(&b[j]) {
-            std::cmp::Ordering::Less => i += 1,
-            std::cmp::Ordering::Greater => j += 1,
-            std::cmp::Ordering::Equal => {
-                out.push(a[i]);
-                i += 1;
-                j += 1;
-            }
-        }
-    }
-    out
-}
-
-/// `T Î(z_a; z_b)` in bits from the two invocation counts and their overlap, when the association
-/// is positive (zero otherwise).
-fn information(a: u64, b: u64, both: u64, words: u64) -> f64 {
-    let n11 = both as f64;
-    let n10 = (a - both) as f64;
-    let n01 = (b - both) as f64;
-    let n00 = (words + both - a - b) as f64;
-    if n11 * n00 <= n10 * n01 {
-        return 0.0;
-    }
-    let t = words as f64;
-    let term = |n: f64, x: f64, y: f64| if n > 0.0 { n * (n * t / (x * y)).log2() } else { 0.0 };
-    let (ra, rb) = (a as f64, b as f64);
-    term(n11, ra, rb) + term(n10, ra, t - rb) + term(n01, t - ra, rb) + term(n00, t - ra, t - rb)
-}
-
-/// The module note's total over `groups`: their bits, their library, and the subcomponents of the
-/// universe in none of them (never ran).
-fn total_bits<'a>(groups: impl Iterator<Item = &'a Concept>, universe: usize, words: u64, label_bits: f64) -> f64 {
-    let mut ran = 0;
-    let mut total = 0.0;
-    for g in groups {
-        ran += g.members.len();
-        total += g.bits + g.library(universe, label_bits);
-    }
-    total + (universe - ran) as f64 * kt_bits(0, words)
+    a.iter().copied().filter(|x| b.binary_search(x).is_ok()).collect()
 }
 
 /// One round's record of the fit.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Round {
-    pub groups: usize,
     pub concepts: usize,
+    pub vocabulary: usize,
     pub open: usize,
     pub merges: usize,
+    pub peels: usize,
     pub total_bits: f64,
 }
 
-/// The fitted concepts of a set of words.
+/// The fitted vocabulary of a set of words.
 #[derive(Clone, Debug)]
 pub struct Fit {
     pub universe: usize,
     pub words: u64,
     pub label_bits: f64,
-    /// Every group: concepts (two or more members) and lone subcomponents that ran.
-    pub groups: Vec<Concept>,
+    /// Every concept, in the vocabulary or not (a subcomponent alone that no word invokes).
+    pub concepts: Vec<Concept>,
     pub rounds: Vec<Round>,
 }
 
 impl Fit {
-    /// The total of the module note's code: every group's bits, the library, and the subcomponents
-    /// that never ran.
+    /// The total of the module note's code over the fitted words.
     pub fn total_bits(&self) -> f64 {
-        total_bits(self.groups.iter(), self.universe, self.words, self.label_bits)
-    }
-
-    /// The independent code of the same words: every subcomponent at its own rate.
-    pub fn independent_bits(sets: &Sets) -> f64 {
-        let words = sets.rows() as u64;
-        sets.columns().iter().map(|c| kt_bits(c.len() as u64, words)).sum()
+        self.concepts.iter().map(|c| c.total(self.universe, self.label_bits)).sum()
     }
 }
 
-/// Fit the concepts of `sets` (module note, "The fit"), each concept's name costing `label_bits`.
-pub fn fit(sets: &Sets, label_bits: f64) -> Fit {
-    let universe = sets.universe;
-    let words = sets.rows() as u64;
-    let columns = sets.columns();
-    let mut groups: Vec<Option<Concept>> =
-        (0..universe).filter(|j| !columns[*j].is_empty()).map(|j| Some(Concept::alone(j as u32, &columns[j], words))).collect();
-    let mut open: Vec<bool> = vec![true; groups.len()];
-    let library = |g: &Concept| g.library(universe, label_bits);
+/// Peel a merged concept (module note, "The fit"): the member whose leaving saves the most, while
+/// one does; the concepts it becomes and the bits saved.
+fn peel(mut c: Concept, columns: &[Vec<(u32, f64)>], program: &[f64], words: u64, universe: usize, label_bits: f64) -> (Vec<Concept>, f64, usize) {
+    let mut out = Vec::new();
+    let mut saved = 0.0;
+    let mut peeled = 0;
+    while c.members.len() > 1 {
+        let z = invoking(&c);
+        let before = c.total(universe, label_bits);
+        let best = c
+            .members
+            .par_iter()
+            .map(|j| {
+                let rest: Vec<u32> = c.members.iter().copied().filter(|m| m != j).collect();
+                let kept = fit_concept(rest, columns, program, words, &[&z]);
+                let own: Vec<u32> = columns[*j as usize].iter().map(|p| p.0).collect();
+                let alone = fit_concept(vec![*j], columns, program, words, &[&own, &intersection(&own, &z)]);
+                let delta = kept.total(universe, label_bits) + alone.total(universe, label_bits) - before;
+                (delta, *j, kept, alone)
+            })
+            .min_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+        match best {
+            Some((delta, _, kept, alone)) if delta < 0.0 => {
+                saved -= delta;
+                peeled += 1;
+                out.push(alone);
+                c = kept;
+            }
+            _ => break,
+        }
+    }
+    out.push(c);
+    (out, saved, peeled)
+}
+
+/// Fit the vocabulary of `priced` (module note, "The fit"): `program[j]` is subcomponent `j`'s
+/// description bits and every concept's name costs `label_bits` in the library.
+pub fn fit(priced: &Priced, program: &[f64], label_bits: f64) -> Fit {
+    let universe = priced.sets.universe;
+    let words = priced.sets.rows() as u64;
+    let columns = priced.columns();
+    let name_bound = (2.0 * (words as f64 + 1.0)).log2();
+    let mut concepts: Vec<Option<Concept>> = (0..universe)
+        .filter(|j| !columns[*j].is_empty())
+        .map(|j| {
+            let own: Vec<u32> = columns[j].iter().map(|p| p.0).collect();
+            Some(fit_concept(vec![j as u32], &columns, program, words, &[&own, &[]]))
+        })
+        .collect();
+    let mut open = vec![true; concepts.len()];
+    let lib = |c: &Concept| c.library(universe, label_bits);
     let mut rounds = Vec::new();
     loop {
-        let alive: Vec<usize> = (0..groups.len()).filter(|g| groups[*g].is_some()).collect();
-        let total = total_bits(groups.iter().flatten(), universe, words, label_bits);
-        let concepts = groups.iter().flatten().filter(|g| g.members.len() > 1).count();
+        let alive: Vec<usize> = (0..concepts.len()).filter(|g| concepts[*g].is_some()).collect();
+        let total: f64 = alive.iter().map(|g| concepts[*g].as_ref().expect("alive").total(universe, label_bits)).sum();
+        let vocabulary = alive.iter().filter(|g| concepts[**g].as_ref().expect("alive").invocations() > 0).count();
         let opened: Vec<usize> = alive.iter().copied().filter(|g| open[*g]).collect();
-        // Which groups each word invokes.
+        // Which concepts each word needs.
         let mut start = vec![0usize; words as usize + 1];
         for g in &alive {
-            for t in &groups[*g].as_ref().expect("alive").invoked {
+            for t in &concepts[*g].as_ref().expect("alive").needed {
                 start[*t as usize + 1] += 1;
             }
         }
@@ -381,21 +344,21 @@ pub fn fit(sets: &Sets, label_bits: f64) -> Fit {
             start[t + 1] += start[t];
         }
         let mut fill = start.clone();
-        let mut invoking = vec![0u32; start[words as usize]];
+        let mut needing = vec![0u32; start[words as usize]];
         for g in &alive {
-            for t in &groups[*g].as_ref().expect("alive").invoked {
-                invoking[fill[*t as usize]] = *g as u32;
+            for t in &concepts[*g].as_ref().expect("alive").needed {
+                needing[fill[*t as usize]] = *g as u32;
                 fill[*t as usize] += 1;
             }
         }
         let proposals: Vec<(usize, Option<(usize, f64, Concept)>)> = opened
             .par_iter()
             .map_init(
-                || (vec![0u64; groups.len()], Vec::<usize>::new()),
+                || (vec![0u32; concepts.len()], Vec::<usize>::new()),
                 |(count, touched), &g| {
-                    let a = groups[g].as_ref().expect("alive");
-                    for t in &a.invoked {
-                        for h in &invoking[start[*t as usize]..start[*t as usize + 1]] {
+                    let a = concepts[g].as_ref().expect("alive");
+                    for t in &a.needed {
+                        for h in &needing[start[*t as usize]..start[*t as usize + 1]] {
                             let h = *h as usize;
                             if h != g {
                                 if count[h] == 0 {
@@ -405,31 +368,22 @@ pub fn fit(sets: &Sets, label_bits: f64) -> Fit {
                             }
                         }
                     }
-                    let mut ranked: Vec<(f64, usize)> = touched
-                        .iter()
-                        .map(|h| {
-                            let b = groups[*h].as_ref().expect("alive");
-                            (information(a.invoked.len() as u64, b.invoked.len() as u64, count[*h], words), *h)
-                        })
-                        .filter(|(i, _)| *i > 0.0)
-                        .collect();
+                    let mut ranked: Vec<(u32, usize)> = touched.iter().map(|h| (count[*h], *h)).collect();
                     for h in touched.drain(..) {
                         count[h] = 0;
                     }
-                    ranked.sort_by(|x, y| y.0.total_cmp(&x.0).then(x.1.cmp(&y.1)));
-                    for (info, h) in ranked {
-                        let b = groups[h].as_ref().expect("alive");
+                    ranked.sort_by(|x, y| y.0.cmp(&x.0).then(x.1.cmp(&y.1)));
+                    let za = invoking(a);
+                    for (shared, h) in ranked {
+                        let b = concepts[h].as_ref().expect("alive");
                         let members = union(&a.members, &b.members);
-                        let added = subset_code_len_bits(universe, members.len()).map_or(f64::INFINITY, |x| x as f64) + label_bits
-                            - library(a)
-                            - library(b);
-                        if info <= added {
+                        let merged_library = subset_code_len_bits(universe, members.len()).map_or(f64::INFINITY, |x| x as f64) + label_bits;
+                        if f64::from(shared) * name_bound + lib(a) + lib(b) <= merged_library {
                             break;
                         }
-                        let both = union(&a.invoked, &b.invoked);
-                        let common = intersection(&a.invoked, &b.invoked);
-                        let merged = fit_group(members, &columns, words, &[&both, &common]);
-                        let delta = merged.bits + library(&merged) - a.bits - library(a) - b.bits - library(b);
+                        let zb = invoking(b);
+                        let merged = fit_concept(members, &columns, program, words, &[&union(&za, &zb), &intersection(&za, &zb)]);
+                        let delta = merged.total(universe, label_bits) - a.total(universe, label_bits) - b.total(universe, label_bits);
                         if delta < 0.0 {
                             return (g, Some((h, delta, merged)));
                         }
@@ -446,165 +400,133 @@ pub fn fit(sets: &Sets, label_bits: f64) -> Fit {
             }
         }
         accepted.sort_by(|x, y| x.2.total_cmp(&y.2).then(x.0.cmp(&y.0)));
-        let mut used = vec![false; groups.len()];
-        let mut merges = 0;
+        let mut used = vec![false; concepts.len()];
+        let mut merged_now = Vec::new();
         for (g, h, _, merged) in accepted {
             if used[g] || used[h] {
                 continue;
             }
             used[g] = true;
             used[h] = true;
-            groups[g] = None;
-            groups[h] = None;
-            groups.push(Some(merged));
-            open.push(true);
-            used.push(true);
-            merges += 1;
+            concepts[g] = None;
+            concepts[h] = None;
+            merged_now.push(merged);
         }
-        rounds.push(Round { groups: alive.len(), concepts, open: opened.len(), merges, total_bits: total });
-        log::info!("concepts: round {} groups {} concepts {} open {} merges {} total {:.0} bits", rounds.len(), alive.len(), concepts, opened.len(), merges, total);
+        let merges = merged_now.len();
+        let mut peels = 0;
+        for merged in merged_now {
+            let (parts, _, peeled) = peel(merged, &columns, program, words, universe, label_bits);
+            peels += peeled;
+            for part in parts {
+                concepts.push(Some(part));
+                open.push(true);
+            }
+        }
+        rounds.push(Round { concepts: alive.len(), vocabulary, open: opened.len(), merges, peels, total_bits: total });
+        log::info!(
+            "concepts: round {} concepts {} vocabulary {} open {} merges {merges} peels {peels} total {total:.0} bits",
+            rounds.len(),
+            alive.len(),
+            vocabulary,
+            opened.len()
+        );
         if opened.is_empty() {
             break;
         }
     }
-    let groups: Vec<Concept> = groups.into_iter().flatten().collect();
-    Fit { universe, words, label_bits, groups, rounds }
+    let concepts: Vec<Concept> = concepts.into_iter().flatten().collect();
+    Fit { universe, words, label_bits, concepts, rounds }
 }
 
-/// A concept's frozen rates.
+/// A concept as the frozen model holds it.
 #[derive(Clone, Debug, serde::Serialize)]
-pub struct Rates {
+pub struct Frozen {
     pub members: Vec<u32>,
     /// `π`: the rate at which a word invokes it.
     pub invoked: f64,
-    /// Per member, the rate it runs given the concept invoked (`q`) and not invoked (`a`).
-    pub on: Vec<f64>,
-    pub off: Vec<f64>,
+    /// `B_g`.
+    pub program: f64,
 }
 
 /// A word's bits under a [`Model`].
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub struct Bits {
-    /// The concept choices: what the text carries.
-    pub choices: f64,
-    /// The members of every concept given its choice.
-    pub members: f64,
-    /// The subcomponents in no concept.
-    pub alone: f64,
-    /// The independent code of the same set.
-    pub independent: f64,
+    /// The names (the ideal code of the invocations; the text's own bits are measured separately).
+    pub names: f64,
+    /// The description of the weights the text decodes to.
+    pub program: f64,
+    /// The predicted error of what the text leaves off (`Σ m_tg` over needed, uninvoked concepts).
+    pub error: f64,
 }
 
-/// Frozen rates of a [`Fit`], for coding words it was not fitted on.
+/// The vocabulary of a [`Fit`] with frozen rates, for coding words it was not fitted on.
 #[derive(Clone, Debug)]
 pub struct Model {
     pub universe: usize,
-    pub concepts: Vec<Rates>,
-    /// Per subcomponent, its concept and its position in it.
-    pub concept_of: Vec<Option<(u32, u32)>>,
-    /// Per subcomponent, its own rate (the independent code, and the code of one in no concept).
-    pub rate: Vec<f64>,
-    /// Bits of a word that ran nothing, independent code; and of every concept's choice and
-    /// members and every lone subcomponent when nothing ran.
-    empty_independent: f64,
-    empty_choices: f64,
-    empty_members: f64,
-    empty_alone: f64,
-}
-
-fn bernoulli_bits(on: bool, p: f64) -> f64 {
-    -(if on { p } else { 1.0 - p }).log2()
+    /// The vocabulary: concepts some fitted word invokes.
+    pub concepts: Vec<Frozen>,
+    /// Per subcomponent, its concept in the vocabulary.
+    pub concept_of: Vec<Option<u32>>,
+    /// The names' bits of a word that invokes nothing.
+    silent: f64,
 }
 
 impl Model {
     pub fn new(fit: &Fit) -> Self {
-        let words = fit.words;
-        let mut rate = vec![kt_rate(0, words); fit.universe];
         let mut concept_of = vec![None; fit.universe];
         let mut concepts = Vec::new();
-        for g in &fit.groups {
-            for (j, n) in g.members.iter().zip(&g.ran) {
-                rate[*j as usize] = kt_rate(*n, words);
-            }
-            if g.members.len() < 2 {
+        for c in &fit.concepts {
+            let z = c.invocations() as u64;
+            if z == 0 {
                 continue;
             }
-            let z = g.invoked.len() as u64;
-            for (i, j) in g.members.iter().enumerate() {
-                concept_of[*j as usize] = Some((concepts.len() as u32, i as u32));
+            for j in &c.members {
+                concept_of[*j as usize] = Some(concepts.len() as u32);
             }
-            concepts.push(Rates {
-                members: g.members.clone(),
-                invoked: kt_rate(z, words),
-                on: g.ran_invoked.iter().map(|k| kt_rate(*k, z)).collect(),
-                off: g.ran.iter().zip(&g.ran_invoked).map(|(n, k)| kt_rate(n - k, words - z)).collect(),
-            });
+            concepts.push(Frozen { members: c.members.clone(), invoked: kt_rate(z, fit.words), program: c.program });
         }
-        let empty_independent = rate.iter().map(|p| bernoulli_bits(false, *p)).sum();
-        let empty_choices = concepts.iter().map(|c| bernoulli_bits(false, c.invoked)).sum();
-        let empty_members = concepts.iter().flat_map(|c| c.off.iter().map(|a| bernoulli_bits(false, *a))).sum();
-        let empty_alone = (0..fit.universe).filter(|j| concept_of[*j].is_none()).map(|j| bernoulli_bits(false, rate[j])).sum();
-        Self { universe: fit.universe, concepts, concept_of, rate, empty_independent, empty_choices, empty_members, empty_alone }
+        let silent = concepts.iter().map(|c| -(1.0 - c.invoked).log2()).sum();
+        Self { universe: fit.universe, concepts, concept_of, silent }
     }
 
-    /// The concepts a word with set `row` invokes (ascending) and its bits (module note,
-    /// "Coding new words"): each touched concept is invoked when that is the cheaper choice.
-    pub fn encode(&self, row: &[u32]) -> (Vec<u32>, Bits) {
-        let mut bits = Bits {
-            choices: self.empty_choices,
-            members: self.empty_members,
-            alone: self.empty_alone,
-            independent: self.empty_independent,
-        };
-        let mut touched: Vec<(u32, u32)> = Vec::new();
-        for j in row {
-            let j = *j as usize;
-            let p = self.rate[j];
-            bits.independent += bernoulli_bits(true, p) - bernoulli_bits(false, p);
-            match self.concept_of[j] {
-                Some(c) => touched.push(c),
-                None => bits.alone += bernoulli_bits(true, p) - bernoulli_bits(false, p),
+    /// The concepts a word invokes (ascending) and its bits (module note, "Coding new words"):
+    /// `row` its set and `missing` each member's price of being left off.
+    pub fn encode(&self, row: &[u32], missing: &[f64]) -> (Vec<u32>, Bits) {
+        let mut error: Vec<(u32, f64)> = Vec::new();
+        let mut lost = 0.0;
+        for (j, d) in row.iter().zip(missing) {
+            match self.concept_of[*j as usize] {
+                Some(c) => error.push((c, *d)),
+                None => lost += d,
             }
         }
-        touched.sort_unstable();
+        error.sort_unstable_by_key(|e| e.0);
+        let mut bits = Bits { names: self.silent, program: 0.0, error: lost };
         let mut invoked = Vec::new();
         let mut i = 0;
-        while i < touched.len() {
-            let c = touched[i].0;
-            let rates = &self.concepts[c as usize];
-            let mut ran = vec![false; rates.members.len()];
-            while i < touched.len() && touched[i].0 == c {
-                ran[touched[i].1 as usize] = true;
+        while i < error.len() {
+            let c = error[i].0;
+            let mut m = 0.0;
+            while i < error.len() && error[i].0 == c {
+                m += error[i].1;
                 i += 1;
             }
-            let side = |q: &[f64]| -> f64 { ran.iter().zip(q).map(|(x, p)| bernoulli_bits(*x, *p)).sum() };
-            let off_members: f64 = rates.off.iter().map(|a| bernoulli_bits(false, *a)).sum();
-            let on = bernoulli_bits(true, rates.invoked) + side(&rates.on);
-            let off = bernoulli_bits(false, rates.invoked) + side(&rates.off);
-            bits.members -= off_members;
-            bits.choices -= bernoulli_bits(false, rates.invoked);
-            if on < off {
+            let f = &self.concepts[c as usize];
+            let (on, off) = (-f.invoked.log2(), -(1.0 - f.invoked).log2());
+            if on + f.program < off + m {
                 invoked.push(c);
-                bits.choices += bernoulli_bits(true, rates.invoked);
-                bits.members += on - bernoulli_bits(true, rates.invoked);
+                bits.names += on - off;
+                bits.program += f.program;
             } else {
-                bits.choices += bernoulli_bits(false, rates.invoked);
-                bits.members += off - bernoulli_bits(false, rates.invoked);
+                bits.error += m;
             }
         }
         (invoked, bits)
     }
 
-    /// The set a list of invoked concepts decodes to: each one's members more often on than off
-    /// when it is invoked, ascending.
+    /// The program a list of invoked concepts decodes to: all their members, ascending.
     pub fn decode(&self, invoked: &[u32]) -> Vec<u32> {
-        let mut out: Vec<u32> = invoked
-            .iter()
-            .flat_map(|c| {
-                let r = &self.concepts[*c as usize];
-                r.members.iter().zip(&r.on).filter(|(_, q)| **q > 0.5).map(|(j, _)| *j)
-            })
-            .collect();
+        let mut out: Vec<u32> = invoked.iter().flat_map(|c| self.concepts[*c as usize].members.iter().copied()).collect();
         out.sort_unstable();
         out
     }

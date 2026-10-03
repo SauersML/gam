@@ -816,6 +816,71 @@ def stage_allon():
           f"VPD's sets: {z['kl_vpd'][EVAL[0]:EVAL[0] + TEXT_ROWS].mean():.4f}")
 
 
+def stage_dropkl():
+    """Per word and per member of VPD's set there, the exact KL its absence adds: the row's program
+    with that subcomponent off wherever it was on, every position's KL against the set's own (one
+    batched forward per group of subcomponents). Writes sets/missing.f32, aligned with the sets'
+    indices (nats; the fit prices it at n KL / ln 2)."""
+    import torch
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from vpd_eval import kl_per_pos
+
+    z, indptr, indices, offsets, names = sets()
+    dev = device()
+    target, C = load_light(dev)
+    site = site_of(offsets)
+    out = np.zeros(len(indices), dtype=np.float32)
+    batch = int(os.environ.get("NLAE_BATCH", "32"))
+    rows = z["ids"].shape[0]
+    for r in range(rows):
+        a, b = indptr[r * CONTEXT], indptr[(r + 1) * CONTEXT]
+        pos = np.repeat(np.arange(CONTEXT), np.diff(indptr[r * CONTEXT:(r + 1) * CONTEXT + 1]))
+        glob = indices[a:b]
+        ids = torch.tensor(z["ids"][r:r + 1], device=dev)
+        base = {}
+        for s_, n in enumerate(names):
+            m = torch.zeros(1, CONTEXT, C[n], device=dev)
+            sel = site[glob] == s_
+            m[0, torch.tensor(pos[sel], device=dev), torch.tensor(glob[sel] - offsets[s_], device=dev)] = 1.0
+            base[n] = m
+        with torch.no_grad():
+            tgt = target(ids)
+            k0 = kl_per_pos(masked(target, ids, base), tgt)[0]
+        order = np.argsort(glob, kind="stable")
+        js, starts = np.unique(glob[order], return_index=True)
+        ends = np.append(starts[1:], len(order))
+        for c0 in range(0, len(js), batch):
+            chunk = js[c0:c0 + batch]
+            B = len(chunk)
+            masks = {n: m.expand(B, -1, -1).clone() for n, m in base.items()}
+            for i, j in enumerate(chunk):
+                masks[names[site[j]]][i, :, j - offsets[site[j]]] = 0.0
+            with torch.no_grad():
+                kl = kl_per_pos(masked(target, ids.expand(B, -1), masks), tgt.expand(B, -1, -1)) - k0
+            kl = kl.cpu().numpy()
+            for i in range(B):
+                k = order[starts[c0 + i]:ends[c0 + i]]
+                out[a - indptr[0] + k] = kl[i, pos[k]]
+            del masks
+        print(f"row {r}: {len(js)} subcomponents, mean drop KL {out[a:b].mean():.4f} nats", flush=True)
+    out.tofile(OUT / "sets/missing.f32")
+
+
+def stage_program():
+    """Each subcomponent's description bits as a rank-one map: (d_in + d_out - 1) reals at
+    NLAE_BITS_PER_REAL bits (the library's declared precision). Writes sets/program.f64."""
+    z, indptr, indices, offsets, names = sets()
+    bits = float(os.environ.get("NLAE_BITS_PER_REAL", "8"))
+    dims = {"q_proj": (768, 768), "k_proj": (768, 768), "v_proj": (768, 768), "o_proj": (768, 768), "c_fc": (768, 3072), "down_proj": (3072, 768)}
+    out = np.zeros(int(offsets[-1]))
+    for s_, n in enumerate(names):
+        d_in, d_out = dims[n.split(".")[-1]]
+        out[offsets[s_]:offsets[s_ + 1]] = (d_in + d_out - 1) * bits
+    out.tofile(OUT / "sets/program.f64")
+    print(f"program bits per subcomponent: {sorted(set(out.tolist()))}")
+
+
 def stage_kl():
     """KL(model || masked model) per eval word for every decoded program, plus VPD's own set and
     the empty program."""
@@ -1048,6 +1113,6 @@ if __name__ == "__main__":
     stages = {"labels": stage_labels, "label_bits": stage_label_bits, "attrib": stage_attrib, "text": stage_text,
               "bits": stage_bits, "kl": stage_kl, "report": stage_report, "figure": stage_figure,
               "controls": stage_controls, "names": stage_names, "fluent": stage_fluent,
-              "allon": stage_allon}
+              "allon": stage_allon, "dropkl": stage_dropkl, "program": stage_program}
     for stage in sys.argv[1:]:
         stages[stage]()
