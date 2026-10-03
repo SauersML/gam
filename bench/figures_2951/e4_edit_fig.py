@@ -19,9 +19,12 @@ ORANGE, BLUE = "#eb6834", "#2a78d6"
 plt.rcParams.update({"font.family": ["Helvetica Neue", "Arial Unicode MS"], "font.size": 15})
 vpd = sorted(d["vpd"].values(), key=lambda e: e["p_fire"])
 lora = [(e, False) for e in d["lora"].values()] + [(e, True) for e in d.get("lora_low", {}).values()]
+# Loss is −ln P(correct next word), so a change of Δ nats scales that probability by e^±Δ: show it as a percent.
+for e in list(vpd) + [e for e, _ in lora]:
+    e["right_word_pct"] = 100 * np.expm1(e["declared_abs_damage_mean"])
 panels = [("surr_kl", "Words within 20 of each emoticon", "KL from the original model (nats per word)"),
           ("global_kl", "Every word of 40 ordinary documents", "KL from the original model (nats per word)"),
-          ("declared_abs_damage_mean", "Predicting . the of , digits, and copying", "mean change in loss (nats)")]
+          ("right_word_pct", "Predicting . the of , digits, and copying", "average % change in the probability\nthe model gives the correct next word")]
 
 
 def vpd_at(key, p):
