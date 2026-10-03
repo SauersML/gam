@@ -45,7 +45,7 @@ from vpd_eval import MB, gates_and_l0, kl_per_pos, pgd_recon  # noqa: E402
 from vpd_model import VPD, VPD_PTH, load_target, load_vpd, site_names, val_tokens  # noqa: E402
 
 parser = argparse.ArgumentParser()
-parser.add_argument("mode", choices=["box", "layers", "sites"])
+parser.add_argument("mode", choices=["box", "layers", "sites", "linear"])
 parser.add_argument("sets", type=Path)
 parser.add_argument("out", type=Path)
 parser.add_argument("--rows", type=int, default=32)
@@ -669,5 +669,101 @@ def site_switches():
         update_out(key, out)
 
 
-box() if args.mode == "box" else layers() if args.mode == "layers" else site_switches()
+def fisher_norm(p: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Per row, sqrt(v^T F v) with F = diag(p) - p p^T, the softmax Fisher at p."""
+    mean = (p * v).sum(-1, keepdim=True)
+    return (p * (v - mean) ** 2).sum(-1).clamp(min=0).sqrt()
+
+
+@torch.no_grad()
+def linear_remainder():
+    """How far the site-switch claim is from its first-order part (the certificate's easy half). Per
+    passage, at the native model (every switch 0), each switched site's first-order logit change
+    g_l = dz/ds_l (central differences, float64), and at every subset S of the `--exhaustive` sites
+    (every other site native) the exact change dz(S), its first-order part sum_{l in S} g_l and the
+    remainder rho(S) = dz(S) - sum g_l, in the Fisher norm at the native distribution. Per word, over
+    the subsets: the exact KL, the first-order quadratic Q = 1/2 |sum g|_F^2, |rho|_F, the bound shape
+    (sqrt(2Q) + |rho|_F)^2 / 2, and the logit oscillation R = max dz - min dz."""
+    key = args.key or "linear"
+    import vpd_model
+
+    def rms_native_precision(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+        return w * (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps))
+
+    # vpd_model.rms computes in float32; the differences here need the whole forward in float64.
+    vpd_model.rms = rms_native_precision
+    target.double()
+    for n in names:
+        st = target.site(n)
+        st.U, st.V = st.U.double(), st.V.double()
+    chosen = [j for j, n in enumerate(names) if any(n.startswith(p) for p in args.exhaustive.split(","))]
+    h = 1e-4
+    out = {}
+    for name, fam in families.items():
+        worst = {k: np.full(args.rows * S, -np.inf) for k in ("kl", "first_order", "remainder", "bound_shape", "oscillation")}
+        remainder_share = np.zeros(args.rows * S)
+        for i in range(n_mb):
+            g = {n: v.double() for n, v in fam.dense(i).items()}
+            sl = slice(i * MB * S, (i + 1) * MB * S)
+
+            def logits_at(sw: torch.Tensor) -> torch.Tensor:
+                moved = [j for j in range(len(names)) if bool((sw[:, j] != 0).any())]
+                masks = {names[j]: 1 - sw[:, j, None, None] * (1 - g[names[j]]) for j in moved}
+                delta = {names[j]: (1 - sw[:, j, None]).expand(MB, S) for j in moved}
+                set_masks(masks, delta)
+                try:
+                    return target(ids[i * MB:(i + 1) * MB])
+                finally:
+                    vpd.clear()
+
+            zero = torch.zeros((MB, len(names)), device=DEV, dtype=torch.float64)
+            z0 = logits_at(zero)
+            p0 = torch.softmax(z0, -1)
+            logp0 = torch.log_softmax(z0, -1)
+            grads = {}
+            for j in chosen:
+                e = zero.clone()
+                e[:, j] = h
+                grads[j] = (logits_at(e) - logits_at(-e)) / (2 * h)
+            for subset in range(1, 1 << len(chosen)):
+                sw = zero.clone()
+                lin = torch.zeros_like(z0)
+                for b, j in enumerate(chosen):
+                    if subset >> b & 1:
+                        sw[:, j] = 1
+                        lin += grads[j]
+                dz = logits_at(sw) - z0
+                kl = (p0 * (logp0 - torch.log_softmax(z0 + dz, -1))).sum(-1)
+                first = 0.5 * fisher_norm(p0, lin) ** 2
+                rho = fisher_norm(p0, dz - lin)
+                shape = 0.5 * ((2 * first).sqrt() + rho) ** 2
+                osc = dz.max(-1).values - dz.min(-1).values
+                values = {"kl": kl, "first_order": first, "remainder": rho, "bound_shape": shape, "oscillation": osc}
+                for k, v in values.items():
+                    flat = v.reshape(-1).cpu().numpy()
+                    if k == "kl":
+                        at_worst = flat > worst["kl"][sl]
+                        share = (rho / (2 * first).sqrt().clamp(min=1e-12)).reshape(-1).cpu().numpy()
+                        remainder_share[sl] = np.where(at_worst, share, remainder_share[sl])
+                    worst[k][sl] = np.maximum(worst[k][sl], flat)
+                del dz, lin, kl
+            del grads, g, z0, p0, logp0
+            empty_cache()
+            log(f"linear {name} passages {i * MB}..{(i + 1) * MB}: worst KL {worst['kl'][sl].mean():.4f}, first order "
+                f"{worst['first_order'][sl].mean():.4f}, remainder {worst['remainder'][sl].mean():.4f}, bound shape {worst['bound_shape'][sl].mean():.4f}")
+        out[name] = {k: stats(v) for k, v in worst.items()}
+        out[name]["remainder_over_first_order_at_worst_kl"] = stats(remainder_share)
+        out[name]["sites"] = [names[j] for j in chosen]
+        log(f"linear {name}: " + ", ".join(f"{k} mean {v['mean']:.4f} median {v['median']:.4f}" for k, v in out[name].items() if isinstance(v, dict)))
+        update_out(key, out)
+
+
+if args.mode == "box":
+    box()
+elif args.mode == "layers":
+    layers()
+elif args.mode == "sites":
+    site_switches()
+else:
+    linear_remainder()
 log("done")
