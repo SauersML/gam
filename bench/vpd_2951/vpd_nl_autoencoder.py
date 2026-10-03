@@ -793,6 +793,29 @@ def stage_fluent():
     print(f"fluent lossless: {lossless.mean():.1f} bits (names {np.mean(levels['all']['bits']):.1f} + residual {(b[:, 1] + b[:, 2]).mean():.1f})")
 
 
+def stage_allon():
+    """The trivial description: one name meaning "every subcomponent on". Its KL decides whether
+    text bits + n KL alone (no charge for the program the text decodes to) has a trivial minimum."""
+    import torch
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from vpd_eval import kl_per_pos
+
+    z, indptr, indices, offsets, names = sets()
+    dev = device() if os.environ.get("NLAE_CPU") is None else "cpu"
+    target, C = load_light(dev)
+    out = []
+    for r in range(TEXT_ROWS):
+        ids = torch.tensor(z["ids"][EVAL[0] + r:EVAL[0] + r + 1], device=dev)
+        with torch.no_grad():
+            tgt = target(ids)
+            masks = {n: torch.ones(1, CONTEXT, C[n], device=dev) for n in names}
+            out.append(kl_per_pos(masked(target, ids, masks), tgt)[0].cpu().numpy())
+    kl = np.concatenate(out)
+    print(f"all {sum(C.values())} subcomponents on at every word: KL {kl.mean():.4f} nats/word (median {np.median(kl):.4f}); "
+          f"VPD's sets: {z['kl_vpd'][EVAL[0]:EVAL[0] + TEXT_ROWS].mean():.4f}")
+
+
 def stage_kl():
     """KL(model || masked model) per eval word for every decoded program, plus VPD's own set and
     the empty program."""
@@ -1024,6 +1047,7 @@ if __name__ == "__main__":
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     stages = {"labels": stage_labels, "label_bits": stage_label_bits, "attrib": stage_attrib, "text": stage_text,
               "bits": stage_bits, "kl": stage_kl, "report": stage_report, "figure": stage_figure,
-              "controls": stage_controls, "names": stage_names, "fluent": stage_fluent}
+              "controls": stage_controls, "names": stage_names, "fluent": stage_fluent,
+              "allon": stage_allon}
     for stage in sys.argv[1:]:
         stages[stage]()
