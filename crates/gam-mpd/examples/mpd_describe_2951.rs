@@ -463,8 +463,7 @@ fn vpd(dir: &Path, library_dir: &Path, sets_dir: &Path, out: &Path, observations
     let rotary_chart = Chart::coordinates("rotary planes", heads * head_dim, &planes)?;
     let sets = counts(sets_dir, CONTEXT, first, sequences)?;
     let words = (sequences * CONTEXT) as f64;
-    let mut generic = Generic::new(&statistics, observations);
-    let measuring = Generic::new(&statistics, observations);
+    let generic = Generic::new(&statistics, observations);
     let mut report = Vec::new();
     for (k, site) in chosen.iter().enumerate() {
         let layer: usize = site.name.split('.').nth(1).and_then(|x| x.parse().ok()).ok_or(format!("{}: no layer", site.name))?;
