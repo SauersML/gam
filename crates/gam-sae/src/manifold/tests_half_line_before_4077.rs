@@ -94,12 +94,14 @@ fn interval_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
 
 /// One production criterion evaluation at a perturbed ρ, returning the value
 /// and the pin set the assembly recorded at that ρ.
-#[expect(clippy::type_complexity, reason = "one probe helper")]
+/// The (row, slot) pairs pinned at an active bound.
+type PinnedSlots = Vec<(usize, usize)>;
+
 fn priced(
     term: &SaeManifoldTerm,
     target: ArrayView2<'_, f64>,
     rho: &SaeManifoldRho,
-) -> (f64, Vec<(usize, usize)>) {
+) -> (f64, PinnedSlots) {
     let mut probe = term.clone();
     let (value, _, _) = probe
         .penalized_quasi_laplace_criterion_with_cache(target, rho, None, 60, 0.4, 1.0e-8, 1.0e-8)
