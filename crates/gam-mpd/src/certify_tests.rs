@@ -2,7 +2,7 @@
 //! The box claim's certificate against every point an adversary or a draw finds in the box, on small
 //! programs with every node kind the certificate reads.
 
-use super::certify::{Curve, GELU_CURVATURE, Gates, SILU_CURVATURE, adversary, certify, certify_branching, linearize};
+use super::certify::{Curve, GELU_CURVATURE, Gates, Relaxation, SILU_CURVATURE, adversary, certify, certify_branching, linearize};
 use super::masked::{Library, Masked, Target, forward, matrix, sites};
 use super::operator_program::{
     Basis, Declarations, Domain, FamilyInputs, Interface, LabelKind, Law, Node, Operator, OperatorProgram, Provenance,
@@ -246,7 +246,7 @@ fn certificates_contain_every_point_found_in_the_box() {
                 ndarray::Zip::from(&mut worst).and(&kl).for_each(|w, &v| *w = w.max(v));
             }
             for budget in [4096, 24, 2] {
-                let bound = certify(&masked, &family, &target, Some(&radius), &gates, budget).expect("certificate");
+                let bound = certify(&masked, &family, &target, Some(&radius), &gates, Relaxation::sound(budget)).expect("certificate");
                 for r in 0..family.rows {
                     assert!(bound[r].is_finite(), "{name}, seed {seed}, budget {budget}: row {r} unbounded");
                     assert!(bound[r] >= worst[r], "{name}, seed {seed}, budget {budget}: row {r} certified {} below a found {}", bound[r], worst[r]);
@@ -267,7 +267,7 @@ fn a_pinned_box_certifies_its_own_divergence() {
             .map(|(k, m)| Array2::from_shape_fn(m.dim(), |(r, c)| 0.5 + 0.5 * noise(400 + 31 * k + 7 * r + c)))
             .collect();
         let gates = Gates { lower: point.clone(), upper: point.clone() };
-        let bound = certify(&masked, &family, &target, Some(&radius), &gates, 64).expect("certificate");
+        let bound = certify(&masked, &family, &target, Some(&radius), &gates, Relaxation::sound(64)).expect("certificate");
         let (kl, _, _) = forward(&masked, &masked.family(&family, &point), &target).expect("forward");
         for r in 0..family.rows {
             assert!(bound[r] >= kl[r], "{name}: row {r} certified {} below its {}", bound[r], kl[r]);
@@ -282,7 +282,7 @@ fn branching_tightens_and_stays_sound() {
     for (name, program, family) in fixtures() {
         let (masked, masks, target, radius) = masked(&program, &family, 11);
         let found = adversary(&masked, &family, &target, &Gates::claim(&masks), None, 8, 4, 11).expect("adversary");
-        let branched = certify_branching(&masked, &family, &target, Some(&radius), Gates::claim(&masks), 4096, 9).expect("branched");
+        let branched = certify_branching(&masked, &family, &target, Some(&radius), Gates::claim(&masks), Relaxation::sound(4096), 9).expect("branched");
         for r in 0..family.rows {
             assert!(branched.kl[r] <= branched.root[r], "{name}: row {r} branched {} above its root {}", branched.kl[r], branched.root[r]);
             assert!(branched.kl[r] >= found[r], "{name}: row {r} branched {} below a found {}", branched.kl[r], found[r]);

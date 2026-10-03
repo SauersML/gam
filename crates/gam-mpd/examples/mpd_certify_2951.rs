@@ -13,7 +13,7 @@
 //! * the certificate with at most `BUDGET` symbols per word (default 4096);
 //! * the certificate after `LEAVES` leaves of branching on that word alone (default 33).
 //!
-//! `mpd_certify_2951 lm EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json SEQUENCES CONTEXT [BUDGET] [LEAVES] [FREE] [STEPS] [OBSERVATIONS]`
+//! `mpd_certify_2951 lm EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json SEQUENCES CONTEXT [BUDGET] [LEAVES] [FREE] [STEPS] [OBSERVATIONS] [ROUNDING]`
 //!
 //! A language-model export (`import_language_model`), the first `CONTEXT` positions of its first
 //! `SEQUENCES` sequences. Positions only read earlier ones, so a prefix is exact. The sites with a
@@ -28,9 +28,11 @@
 //! symbols (default 512), and the sequence's box is split into `LEAVES` leaves (default 1: no
 //! branching). With `OBSERVATIONS` positive, a second set per word is chosen by the masked selection under
 //! the box claim (`select_boxed`, coded in `OBSERVATIONS`) from the given sets, and certified the same way.
+//! `ROUNDING` `real` reports the relaxation's bound without any rounding enclosure (not a proof; the
+//! default `sound` is one).
 
 use gam_mpd::blocks::Describe;
-use gam_mpd::certify::{Gates, adversary, certify, certify_branching};
+use gam_mpd::certify::{Gates, Relaxation, adversary, certify, certify_branching};
 use gam_mpd::import::{import, import_language_model};
 use gam_mpd::masked::{Coder, Library, Masked, Target, box_excess_at, forward, select, select_boxed, site_statistics, sites};
 use gam_mpd::operator_program::{FamilyInputs, OperatorProgram};
@@ -132,7 +134,7 @@ fn toy(args: &[String]) -> Result<(), String> {
         let estimate = &kl + &box_excess_at(&masked, &family, &target, &masks, &fishers)?;
         let gates = Gates::claim(&masks);
         let found = adversary(&masked, &family, &target, &gates, None, 40, 8, 0xAD5)?;
-        let root = certify(&masked, &family, &target, Some(&radius), &gates, budget)?;
+        let root = certify(&masked, &family, &target, Some(&radius), &gates, Relaxation::sound(budget))?;
         let mut branched = Array1::<f64>::zeros(family.rows);
         for r in 0..family.rows {
             let one = family.select(&[r]);
@@ -142,7 +144,7 @@ fn toy(args: &[String]) -> Result<(), String> {
                 lower: gates.lower.iter().map(|m| m.select(ndarray::Axis(0), &[r])).collect(),
                 upper: gates.upper.iter().map(|m| m.select(ndarray::Axis(0), &[r])).collect(),
             };
-            branched[r] = certify_branching(&masked, &one, &row_target, Some(&row_radius), row_gates, budget, leaves)?.kl[0];
+            branched[r] = certify_branching(&masked, &one, &row_target, Some(&row_radius), row_gates, Relaxation::sound(budget), leaves)?.kl[0];
         }
         for r in 0..family.rows {
             if root[r] < found[r] || branched[r] < found[r] {
@@ -185,7 +187,7 @@ fn toy(args: &[String]) -> Result<(), String> {
 }
 
 fn lm(args: &[String]) -> Result<(), String> {
-    let usage = "mpd_certify_2951 lm EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json SEQUENCES CONTEXT [BUDGET] [LEAVES] [FREE] [STEPS] [OBSERVATIONS]";
+    let usage = "mpd_certify_2951 lm EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json SEQUENCES CONTEXT [BUDGET] [LEAVES] [FREE] [STEPS] [OBSERVATIONS] [ROUNDING]";
     let export = PathBuf::from(args.get(2).ok_or(usage)?);
     let library_dir = PathBuf::from(args.get(3).ok_or(usage)?);
     let sets_dir = PathBuf::from(args.get(4).ok_or(usage)?);
@@ -197,6 +199,13 @@ fn lm(args: &[String]) -> Result<(), String> {
     let free: String = arg(args, 10, "all".to_string())?;
     let steps: usize = arg(args, 11, 40)?;
     let observations: f64 = arg(args, 12, 0.0)?;
+    // `ROUNDING` (`sound`, the default, or `real`): `real` drops every rounding enclosure
+    // (`gam_mpd::certify::Relaxation`), the relaxation's own bound in real arithmetic, not a proof.
+    let rounding = match args.get(13).map(String::as_str) {
+        None | Some("sound") => true,
+        Some("real") => false,
+        Some(other) => return Err(format!("ROUNDING {other}: expected sound or real; {usage}")),
+    };
     let started = Instant::now();
     let imported = import_language_model(&export, sequences, context)?;
     let model = &imported.program;
@@ -282,6 +291,7 @@ fn lm(args: &[String]) -> Result<(), String> {
         named.push(("given".to_string(), masks));
     }
     let (target, radius) = reference(model, family)?;
+    eprintln!("reference logits' radius: largest {:.3e}", radius.iter().copied().fold(0.0_f64, f64::max));
     // The given library's pieces on per word (the residual pieces are always on).
     let listed_l0 = |masks: &[Array2<f64>]| -> f64 {
         masks.iter().zip(&given).map(|(m, g)| m.slice(ndarray::s![.., ..*g]).iter().filter(|x| **x > 0.0).count()).sum::<usize>() as f64 / family.rows as f64
@@ -325,7 +335,7 @@ fn lm(args: &[String]) -> Result<(), String> {
         let (kl, _, _) = forward(&masked, &masked.family(family, &masks), &target)?;
         let found = adversary(&masked, family, &target, &gates, None, steps, 6, 0xAD5)?;
         let at = Instant::now();
-        let branched = certify_branching(&masked, family, &target, Some(&radius), gates, budget, leaves)?;
+        let branched = certify_branching(&masked, family, &target, rounding.then_some(&radius), gates, Relaxation { budget, rounding }, leaves)?;
         let seconds = at.elapsed().as_secs_f64();
         for r in 0..family.rows {
             if branched.kl[r] < found[r] {
@@ -348,7 +358,7 @@ fn lm(args: &[String]) -> Result<(), String> {
     }
     let record = json!({
         "mode": "lm", "export": export, "library": library_dir, "given": sets_dir, "sequences": sequences, "context": context,
-        "budget": budget, "free": free, "steps": steps, "observations": observations, "sets": report,
+        "budget": budget, "free": free, "steps": steps, "observations": observations, "rounding": rounding, "sets": report,
     });
     std::fs::write(&out, serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }

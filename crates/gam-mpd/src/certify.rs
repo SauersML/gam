@@ -60,6 +60,12 @@
 //!
 //! # Rounding
 //!
+//! Besides its box radius, a form carries an `ℓ₂` ball: an error vector of bounded length that a
+//! linear map moves by its spectral norm rather than by its rows' `ℓ₁` norms (as the program's own
+//! enclosures carry their errors, [`super::operator_program::Trace`]). A coordinate radius that a
+//! linear map does not promote passes into the ball when that is shorter than the box `|A| r`, so
+//! rounding radii and unpromoted remainders do not grow by the rows' `ℓ₁` norms layer after layer.
+//!
 //! Every form is computed in binary64, and its radius absorbs the rounding:
 //! * a linear map with inner width `n` adds `γ_{n+k} |A| (|c| + Σ_s |G_s| + r)`;
 //! * a product adds `γ` times its operands' magnitudes;
@@ -90,7 +96,15 @@ use super::bounds::kl_supremum_over_gap_box;
 use super::masked::{Masked, Target, forward, mask_gradients};
 use super::operator_program::{Basis, FamilyInputs, Law, Node, Operator, OperatorBody, OperatorProgram, Rotary, SlotValues};
 
-const U: f64 = UNIT_ROUNDOFF;
+/// Whether the forms absorb their own rounding (module note, "Rounding"); off only inside a
+/// [`Relaxation`] with `rounding: false`, which holds [`MODE`] exclusively while it runs.
+static ROUNDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static MODE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// The unit roundoff the forms absorb: binary64's, or zero for a relaxation without rounding.
+fn unit() -> f64 {
+    if ROUNDING.load(std::sync::atomic::Ordering::Relaxed) { UNIT_ROUNDOFF } else { 0.0 }
+}
 
 fn up(x: f64) -> f64 {
     x.next_up()
@@ -101,19 +115,19 @@ fn down(x: f64) -> f64 {
 }
 
 fn gamma(n: usize) -> f64 {
-    accumulation_growth(n)
+    if ROUNDING.load(std::sync::atomic::Ordering::Relaxed) { accumulation_growth(n) } else { 0.0 }
 }
 
 /// An upper bound on the exact `a − b` from its rounded difference.
 fn above(a: f64, b: f64) -> f64 {
     let d = a - b;
-    up(d + 2.0 * U * d.abs())
+    up(d + 2.0 * unit() * d.abs())
 }
 
 /// A lower bound on the exact `a − b` from its rounded difference.
 fn below(a: f64, b: f64) -> f64 {
     let d = a - b;
-    down(d - 2.0 * U * d.abs())
+    down(d - 2.0 * unit() * d.abs())
 }
 
 /// The symbol of radius coordinate `j` of node `node` at row `row`.
@@ -213,12 +227,14 @@ struct Row {
     ids: Vec<u64>,
     coef: Array2<f64>,
     radius: Array1<f64>,
+    /// A bound on the `ℓ₂` norm of a further error vector (module note, "Rounding").
+    ball: f64,
 }
 
 impl Row {
     fn exact(center: Array1<f64>, radius: Array1<f64>) -> Self {
         let width = center.len();
-        Self { center, ids: Vec::new(), coef: Array2::zeros((0, width)), radius }
+        Self { center, ids: Vec::new(), coef: Array2::zeros((0, width)), radius, ball: 0.0 }
     }
 
     fn width(&self) -> usize {
@@ -226,7 +242,14 @@ impl Row {
     }
 
     fn finite(&self) -> bool {
-        self.radius.iter().all(|r| r.is_finite()) && self.center.iter().all(|c| c.is_finite())
+        self.ball.is_finite() && self.radius.iter().all(|r| r.is_finite()) && self.center.iter().all(|c| c.is_finite())
+    }
+
+    /// Per coordinate, an upper bound on its distance from the center.
+    fn reach(&self) -> Array1<f64> {
+        let mut reach = self.spread();
+        Zip::from(&mut reach).and(&self.radius).for_each(|a, &r| *a = up(up(*a + r) + self.ball));
+        reach
     }
 
     /// Per coordinate, an upper bound on `Σ_s |G_s|`.
@@ -249,8 +272,7 @@ impl Row {
 
     /// Per coordinate, an interval holding every point of the form.
     fn bounds(&self) -> (Array1<f64>, Array1<f64>) {
-        let mut reach = self.spread();
-        Zip::from(&mut reach).and(&self.radius).for_each(|a, &r| *a = up(*a + r));
+        let reach = self.reach();
         let lo = Zip::from(&self.center).and(&reach).map_collect(|&c, &r| down(c - r));
         let hi = Zip::from(&self.center).and(&reach).map_collect(|&c, &r| up(c + r));
         (lo, hi)
@@ -263,6 +285,7 @@ impl Row {
             ids: self.ids.clone(),
             coef: self.coef.slice(s![.., c..c + 1]).to_owned(),
             radius: Array1::from_elem(1, self.radius[c]),
+            ball: self.ball,
         }
     }
 
@@ -303,7 +326,8 @@ impl Row {
             coef: self.coef.mapv(|g| k * g),
             radius: Zip::from(&self.radius)
                 .and(&magnitude)
-                .map_collect(|&r, &m| up(up(k.abs() * r) + up(up(2.0 * U * k.abs() + extra) * m))),
+                .map_collect(|&r, &m| up(up(k.abs() * r) + up(up(2.0 * unit() * k.abs() + extra) * m))),
+            ball: up(up(k.abs() + extra) * self.ball),
         }
     }
 
@@ -312,7 +336,7 @@ impl Row {
         let mut out = self.clone();
         Zip::from(&mut out.center).and(&mut out.radius).for_each(|c, r| {
             *c += k;
-            *r = up(*r + up(U * c.abs()));
+            *r = up(*r + up(unit() * c.abs()));
         });
         out
     }
@@ -338,7 +362,8 @@ fn combine(terms: &[(&Row, f64)]) -> Row {
     }
     let g = gamma(terms.len() + 2);
     Zip::from(&mut radius).and(&magnitude).for_each(|r, &m| *r = up(*r + up(g * m)));
-    Row { center, ids, coef, radius }
+    let ball = terms.iter().fold(0.0, |b, (x, sign)| up(b + up(sign.abs() * x.ball)));
+    Row { center, ids, coef, radius, ball }
 }
 
 /// The sum of a form's coordinates, as a one-coordinate form.
@@ -351,6 +376,8 @@ fn total(x: &Row) -> Row {
         ids: x.ids.clone(),
         coef: x.coef.sum_axis(Axis(1)).insert_axis(Axis(1)),
         radius: Array1::from_elem(1, radius),
+        // `|Σ_d e_d| ≤ √n ‖e‖`.
+        ball: up((width as f64).sqrt().next_up() * x.ball),
     }
 }
 
@@ -372,7 +399,8 @@ fn concat(parts: &[&Row]) -> Row {
         }
         offset += w;
     }
-    Row { center, ids, coef, radius }
+    let ball = up(parts.iter().map(|p| p.ball * p.ball).sum::<f64>() * (1.0 + gamma(parts.len() + 1))).sqrt().next_up();
+    Row { center, ids, coef, radius, ball }
 }
 
 /// The product of two forms coordinate by coordinate, a one-coordinate form broadcast against the
@@ -429,7 +457,23 @@ fn product(l: &Row, r: &Row) -> Row {
         let magnitude = up(up(up(cl.abs() + al) + rl) * up(up(cr.abs() + ar) + rr));
         radius[d] = up(up(linear + tightened) + up(3.0 * g * magnitude));
     }
-    Row { center, ids, coef, radius }
+    // The balls: `e_l ⊙ R + L ⊙ e_r + e_l ⊙ e_r`, with `L`, `R` the rest of each operand. A full-width
+    // operand's ball meets the other's largest reach; a broadcast one's meets the other's length.
+    let rest = |x: &Row| {
+        let mut reach = x.spread();
+        Zip::from(&mut reach).and(&x.center).and(&x.radius).for_each(|a, &c, &r| *a = up(up(*a + c.abs()) + r));
+        reach
+    };
+    let size = |reach: &Array1<f64>, full: bool| {
+        if full {
+            reach.iter().copied().fold(0.0, f64::max)
+        } else {
+            up(reach.iter().map(|v| v * v).sum::<f64>() * (1.0 + gamma(reach.len() + 1))).sqrt().next_up()
+        }
+    };
+    let (lr, rr) = (rest(l), rest(r));
+    let ball = up(up(up(l.ball * size(&rr, wl == width)) + up(r.ball * size(&lr, wr == width))) + up(l.ball * r.ball));
+    Row { center, ids, coef, radius, ball }
 }
 
 /// An operator read as the linear map `x ↦ M x` (written × read), with what its relaxation reads of it.
@@ -441,16 +485,27 @@ struct Map {
     transposed: bool,
     /// Per read coordinate, `Σ_i |m_ij|`, rounded up.
     column_l1: Array1<f64>,
+    /// A proven bound on `‖M‖₂`, computed on first use.
+    norm: std::sync::OnceLock<f64>,
 }
 
 impl Map {
+    fn spectral(&self) -> f64 {
+        *self.norm.get_or_init(|| {
+            super::operator_program::matrix_spectral_bound(self.m()).unwrap_or_else(|_| {
+                let m = self.m();
+                up(m.iter().map(|v| v * v).sum::<f64>() * (1.0 + gamma(m.len() + 1))).sqrt().next_up()
+            })
+        })
+    }
+
     fn new(operator: Arc<Operator>, transposed: bool) -> Result<Self, String> {
         let formed = match &operator.body {
             OperatorBody::Dense { .. } => None,
             OperatorBody::LowRank { .. } => return Err(format!("operator {}: a low-rank body is not certified", operator.name)),
             _ => Some(operator.matrix()),
         };
-        let mut map = Self { operator, formed, transposed, column_l1: Array1::zeros(0) };
+        let mut map = Self { operator, formed, transposed, column_l1: Array1::zeros(0), norm: std::sync::OnceLock::new() };
         let m = map.m();
         let mut column_l1 = Array1::<f64>::zeros(m.ncols());
         for row in m.outer_iter() {
@@ -501,6 +556,8 @@ fn affine(terms: &[(&Row, &Map, usize)], bias: Option<&Array1<f64>>, row: usize,
     let mut coef = Array2::<f64>::zeros((ids.len(), written));
     let mut center = bias.cloned().unwrap_or_else(|| Array1::zeros(written));
     // Promotion candidates: symbol → (written ℓ₁ mass, its (term, coordinate) members).
+    let length = |a: &Array1<f64>| up(a.iter().map(|v| v * v).sum::<f64>() * (1.0 + gamma(a.len() + 1))).sqrt().next_up();
+    let mut passed: Vec<Array1<f64>> = terms.iter().map(|(x, _, _)| Array1::zeros(x.width())).collect();
     let mut fresh: HashMap<u64, (f64, Vec<(usize, usize)>)> = HashMap::new();
     for (t, (x, map, node)) in terms.iter().enumerate() {
         let m = map.m();
@@ -563,7 +620,6 @@ fn affine(terms: &[(&Row, &Map, usize)], bias: Option<&Array1<f64>>, row: usize,
     radius.mapv_inplace(|v| up(v * grow));
     // What passes through `|M_t|`: each term's rounding magnitude and its unpromoted radii.
     let g = gamma(terms.iter().map(|(x, _, _)| x.width()).max().unwrap_or(0) + terms.len() + 4);
-    let mut passed: Vec<Array1<f64>> = terms.iter().map(|(x, _, _)| x.magnitude().mapv(|m| up(g * m))).collect();
     for (i, f) in fresh.iter().enumerate().filter(|(i, _)| !keep[ids.len() + i]) {
         if in_enclosure[ids.len() + i] {
             let mut generator = Array1::<f64>::zeros(written);
@@ -577,9 +633,24 @@ fn affine(terms: &[(&Row, &Map, usize)], bias: Option<&Array1<f64>>, row: usize,
             }
         }
     }
-    for ((_, map, _), v) in terms.iter().zip(&passed) {
-        let through = map.absolute(v);
-        Zip::from(&mut radius).and(&through).for_each(|r, &x| *r = up(*r + x));
+    // Each term's ball passes through `‖M‖₂`; its unpromoted radii pass either as a box through `|M|`
+    // or into the ball through `‖M‖₂`, whichever is shorter.
+    let mut ball = 0.0_f64;
+    for ((x, map, _), v) in terms.iter().zip(&passed) {
+        let rounding = map.absolute(&x.magnitude().mapv(|m| up(g * m)));
+        Zip::from(&mut radius).and(&rounding).for_each(|r, &x| *r = up(*r + x));
+        let unpromoted = v;
+        let needs_norm = x.ball > 0.0 || unpromoted.iter().any(|v| *v > 0.0);
+        let norm = if needs_norm { map.spectral() } else { 0.0 };
+        ball = up(ball + up(norm * x.ball));
+        if unpromoted.iter().any(|v| *v > 0.0) {
+            let through = map.absolute(unpromoted);
+            if up(norm * length(unpromoted)) < length(&through) {
+                ball = up(ball + up(norm * length(unpromoted)));
+            } else {
+                Zip::from(&mut radius).and(&through).for_each(|r, &x| *r = up(*r + x));
+            }
+        }
     }
     if let Some(b) = bias {
         Zip::from(&mut radius).and(b).for_each(|r, &x| *r = up(*r + up(g * x.abs())));
@@ -614,7 +685,7 @@ fn affine(terms: &[(&Row, &Map, usize)], bias: Option<&Array1<f64>>, row: usize,
     for (s, (_, generator)) in rows.iter().enumerate() {
         out.row_mut(s).assign(generator);
     }
-    Row { center, ids: rows.into_iter().map(|r| r.0).collect(), coef: out, radius }
+    Row { center, ids: rows.into_iter().map(|r| r.0).collect(), coef: out, radius, ball }
 }
 
 /// A scalar curve a relaxation replaces by lines (module note, "Operations").
@@ -638,17 +709,19 @@ impl Curve {
         match self {
             Self::Law(law) => {
                 let v = law.apply(x);
-                let e = law.radius(x, v, 0.0);
+                let e = if ROUNDING.load(std::sync::atomic::Ordering::Relaxed) { law.radius(x, v, 0.0) } else { 0.0 };
                 (v.is_finite() && e.is_finite()).then(|| (down(v - e), up(v + e)))
             }
+            // Far below the enclosure's range `e^x` is positive and below `e^{-700} < 10^{-300}`.
+            Self::Exp if x < -700.0 => Some((0.0, 1e-300)),
             Self::Exp => certified_exp(x).map(|i| (i.lo, i.hi)),
             Self::InverseSqrt => {
                 let v = 1.0 / x.sqrt();
-                (x > 0.0 && v.is_finite()).then(|| (down(v - 3.0 * U * v), up(v + 3.0 * U * v)))
+                (x > 0.0 && v.is_finite()).then(|| (down(v - 3.0 * unit() * v), up(v + 3.0 * unit() * v)))
             }
             Self::Reciprocal => {
                 let v = 1.0 / x;
-                (x > 0.0 && v.is_finite()).then(|| (down(v - 2.0 * U * v), up(v + 2.0 * U * v)))
+                (x > 0.0 && v.is_finite()).then(|| (down(v - 2.0 * unit() * v), up(v + 2.0 * unit() * v)))
             }
         }
     }
@@ -660,6 +733,22 @@ fn centred(low: f64, high: f64) -> (f64, f64) {
     (mu, above(high, mu).max(above(mu, low)))
 }
 
+/// The line's slope on `[l, h]`: the chord's, or on an interval too narrow for the chord to survive
+/// rounding the derivative at its middle. Any slope is sound (the deviation is certified for the
+/// slope used); this one keeps the deviation small.
+fn slope(curve: Curve, l: f64, h: f64, fl: (f64, f64), fh: (f64, f64)) -> f64 {
+    if h - l > 1e-6 * (1.0 + l.abs().max(h.abs())) {
+        return (0.5 * (fh.0 + fh.1) - 0.5 * (fl.0 + fl.1)) / (h - l);
+    }
+    let t = 0.5 * (l + h);
+    match curve {
+        Curve::Law(law) => law.derivative(t),
+        Curve::Exp => t.exp(),
+        Curve::InverseSqrt => -0.5 / (t * t.sqrt()),
+        Curve::Reciprocal => -1.0 / (t * t),
+    }
+}
+
 /// `(λ, μ, δ)` with `|f(t) − λ t − μ| ≤ δ` on `[l, h]` (module note, "Operations"); `None` when an
 /// enclosure fails.
 pub(crate) fn linearize(curve: Curve, l: f64, h: f64) -> Option<(f64, f64, f64)> {
@@ -669,11 +758,11 @@ pub(crate) fn linearize(curve: Curve, l: f64, h: f64) -> Option<(f64, f64, f64)>
     // `g(t) = f(t) − λ t` from an enclosure of `f(t)`, outward.
     let g_hi = |hi: f64, lambda: f64, t: f64| {
         let p = lambda * t;
-        up(above(hi, p) + U * p.abs())
+        up(above(hi, p) + unit() * p.abs())
     };
     let g_lo = |lo: f64, lambda: f64, t: f64| {
         let p = lambda * t;
-        down(below(lo, p) - U * p.abs())
+        down(below(lo, p) - unit() * p.abs())
     };
     let point = |t: f64| curve.enclose(t).map(|(lo, hi)| centred(lo, hi)).map(|(mu, delta)| (0.0, mu, delta));
     match curve {
@@ -699,7 +788,7 @@ pub(crate) fn linearize(curve: Curve, l: f64, h: f64) -> Option<(f64, f64, f64)>
             }
             let curvature = if law == Law::Silu { SILU_CURVATURE } else { GELU_CURVATURE };
             let (fl, fh) = (curve.enclose(l)?, curve.enclose(h)?);
-            let lambda = (0.5 * (fh.0 + fh.1) - 0.5 * (fl.0 + fl.1)) / (h - l);
+            let lambda = slope(curve, l, h, fl, fh);
             let steps = (((h - l) * 8.0).ceil() as usize).clamp(4, 256);
             let mut previous = l;
             let mut gap = 0.0_f64;
@@ -712,7 +801,7 @@ pub(crate) fn linearize(curve: Curve, l: f64, h: f64) -> Option<(f64, f64, f64)>
                 low = low.min(g_lo(lo, lambda, t));
                 high = high.max(g_hi(hi, lambda, t));
             }
-            let bend = up(up(up(curvature * up(gap * gap)) / 8.0) * (1.0 + 4.0 * U));
+            let bend = up(up(up(curvature * up(gap * gap)) / 8.0) * (1.0 + 4.0 * unit()));
             let (mu, delta) = centred(down(low - bend), up(high + bend));
             Some((lambda, mu, delta))
         }
@@ -721,7 +810,7 @@ pub(crate) fn linearize(curve: Curve, l: f64, h: f64) -> Option<(f64, f64, f64)>
             if h == l {
                 return point(l);
             }
-            let lambda = (0.5 * (fh.0 + fh.1) - 0.5 * (fl.0 + fl.1)) / (h - l);
+            let lambda = slope(curve, l, h, fl, fh);
             let high = g_hi(fl.1, lambda, l).max(g_hi(fh.1, lambda, h));
             // The convex `g` lies above its tangent at `t`, the point of slope `λ`.
             let t = match curve {
@@ -735,15 +824,15 @@ pub(crate) fn linearize(curve: Curve, l: f64, h: f64) -> Option<(f64, f64, f64)>
                 Curve::Exp => (ft_lo, ft_hi),
                 Curve::InverseSqrt => {
                     let v = -0.5 / (t * t.sqrt());
-                    (v - 6.0 * U * v.abs(), v + 6.0 * U * v.abs())
+                    (v - 6.0 * unit() * v.abs(), v + 6.0 * unit() * v.abs())
                 }
                 _ => {
                     let v = -1.0 / (t * t);
-                    (v - 4.0 * U * v.abs(), v + 4.0 * U * v.abs())
+                    (v - 4.0 * unit() * v.abs(), v + 4.0 * unit() * v.abs())
                 }
             };
             let tilt = above(slope_hi, lambda).abs().max(below(slope_lo, lambda).abs());
-            let tilt = up(tilt * (1.0 + 4.0 * U));
+            let tilt = up(tilt * (1.0 + 4.0 * unit()));
             let reach = above(t, l).max(above(h, t));
             let low = down(g_lo(ft_lo, lambda, t) - up(tilt * reach));
             if !(low.is_finite() && high.is_finite()) {
@@ -766,11 +855,15 @@ fn curved_within(x: &Row, curves: &[Curve], lo: &Array1<f64>, hi: &Array1<f64>) 
     let width = x.width();
     let magnitude = x.magnitude();
     let mut out = x.clone();
+    let mut steepest = 0.0_f64;
     for d in 0..width {
         let curve = curves[if curves.len() == 1 { 0 } else { d }];
         let line = if lo[d].is_nan() || hi[d].is_nan() { None } else { linearize(curve, lo[d], hi[d].max(lo[d])) };
         // A failed relaxation poisons the center, so no later maximum can hide it.
         let Some((lambda, mu, delta)) = line else {
+            if std::env::var_os("MPD_CERTIFY_TRACE").is_some() {
+                eprintln!("certify: {curve:?} fails on [{}, {}] (ball {}, radius {}, center {})", lo[d], hi[d], x.ball, x.radius[d], x.center[d]);
+            }
             out.center[d] = f64::NAN;
             out.radius[d] = f64::INFINITY;
             continue;
@@ -779,24 +872,24 @@ fn curved_within(x: &Row, curves: &[Curve], lo: &Array1<f64>, hi: &Array1<f64>) 
         out.coef.column_mut(d).mapv_inplace(|g| lambda * g);
         let rounding = up(gamma(4) * up(up(lambda.abs() * magnitude[d]) + mu.abs()));
         out.radius[d] = up(up(up(lambda.abs() * x.radius[d]) + delta) + rounding);
+        steepest = steepest.max(lambda.abs());
     }
+    out.ball = up(steepest * x.ball);
     out
 }
 
-/// `x (mean x² + ε)^{-1/2}`. The mean of squares is also bounded through the row's length,
-/// `‖x‖ ∈ ‖c‖ ± (‖G‖₂ √S + ‖r‖)` (the symbols' corners have length `√S`), which a sum of
-/// coordinatewise squares cannot see; the scale is the curve's line on the intersection of both
-/// intervals, or that interval itself when it is narrower than the line.
-fn rms_norm(x: &Row, epsilon: f64) -> Row {
+/// The interval of `mean x² + ε` over a form: the coordinatewise square's sum, and the row's length
+/// `‖x‖ ∈ ‖c‖ ± (‖G‖₂ √S + ‖r‖ + ρ)` (the symbols' corners have length `√S`), which a sum of
+/// coordinatewise squares cannot see.
+fn mean_square(x: &Row, mean: &Row, epsilon: f64) -> (f64, f64) {
     let n = x.width();
-    let mean = total(&product(x, x)).scaled(1.0 / n as f64, 0.0).shifted(epsilon);
     let (lo, hi) = mean.bounds();
     let (mut l, mut h) = (lo[0].max(epsilon), hi[0]);
     let operator = if x.ids.is_empty() { Some(0.0) } else { super::operator_program::matrix_spectral_bound(x.coef.view()).ok() };
     if let Some(operator) = operator {
         let rows = (x.ids.len() as f64).sqrt().next_up();
         let r = up(x.radius.iter().map(|v| v * v).sum::<f64>() * (1.0 + gamma(n + 1))).sqrt().next_up();
-        let rho = up(up(operator * rows) + r);
+        let rho = up(up(up(operator * rows) + r) + x.ball);
         let squares = x.center.iter().map(|v| v * v).sum::<f64>();
         let length_hi = up(squares * (1.0 + gamma(n + 1))).sqrt().next_up();
         let length_lo = down(squares * (1.0 - gamma(n + 1))).max(0.0).sqrt().next_down().max(0.0);
@@ -806,7 +899,20 @@ fn rms_norm(x: &Row, epsilon: f64) -> Row {
         l = l.max(down(down(down(shortest * shortest) / k) + epsilon));
         h = h.min(up(up(up(longest * longest) / k) + epsilon));
     }
-    let h = h.max(l);
+    (l, h.max(l))
+}
+
+/// `x (mean x² + ε)^{-1/2}`. The form without its ball, `x₀`, is normalised through the square, the
+/// mean, the curve's line on the interval of [`mean_square`] (or that interval itself when it is
+/// narrower than the line) and the product. The ball `e` moves the result by at most `s̄ ‖e‖`: the
+/// map's Jacobian `s (I − s² x xᵀ/n)` has norm at most its scale `s`, and `s̄` bounds the scale on
+/// every point between `x₀` and `x₀ + e` (the interval of the full form, ball included).
+fn rms_norm(x: &Row, epsilon: f64) -> Row {
+    let n = x.width();
+    let mut bare = x.clone();
+    bare.ball = 0.0;
+    let mean = total(&product(&bare, &bare)).scaled(1.0 / n as f64, 0.0).shifted(epsilon);
+    let (l, h) = mean_square(&bare, &mean, epsilon);
     let line = curved_within(&mean, &[Curve::InverseSqrt], &Array1::from_elem(1, l), &Array1::from_elem(1, h));
     let scale = match (Curve::InverseSqrt.enclose(h), Curve::InverseSqrt.enclose(l)) {
         (Some((low, _)), Some((_, high))) => {
@@ -816,7 +922,14 @@ fn rms_norm(x: &Row, epsilon: f64) -> Row {
         }
         _ => line,
     };
-    product(x, &scale)
+    let mut out = product(&bare, &scale);
+    if x.ball > 0.0 {
+        let whole = total(&product(x, x)).scaled(1.0 / n as f64, 0.0).shifted(epsilon);
+        let (lowest, _) = mean_square(x, &whole, epsilon);
+        let steepest = Curve::InverseSqrt.enclose(lowest).map_or(f64::INFINITY, |(_, high)| high);
+        out.ball = up(out.ball + up(steepest * x.ball));
+    }
+    out
 }
 
 /// `x` rotated to `position`, plane by plane.
@@ -833,10 +946,12 @@ fn rotate(x: &Row, rotary: Rotary, position: u32) -> Row {
             out.coef[[k, b]] = s * ga + c * gb;
         }
         // libm's one ulp on each of the cosine and sine, and the products and sums.
-        let rounding = up(4.0 * U * up(magnitude[a] + magnitude[b]));
+        let rounding = up(4.0 * unit() * up(magnitude[a] + magnitude[b]));
         out.radius[a] = up(up(up(c.abs() * x.radius[a]) + up(s.abs() * x.radius[b])) + rounding);
         out.radius[b] = up(up(up(s.abs() * x.radius[a]) + up(c.abs() * x.radius[b])) + rounding);
     }
+    // The computed rotation is within a few ulps of orthogonal.
+    out.ball = up(x.ball * (1.0 + 8.0 * unit()));
     out
 }
 
@@ -893,9 +1008,22 @@ fn mix(weights: &[Row], payloads: &[&Row], budget: usize, convex: bool) -> Row {
     out
 }
 
-/// `c q·k`.
+/// `c q·k`. The balls enter through lengths: `|e_q · k| ≤ ‖e_q‖ ‖k‖`, with `‖k‖` bounded by its
+/// reach without the ball, and likewise for `e_k` and the product of both balls.
 fn score(q: &Row, k: &Row, c: f64) -> Row {
-    total(&product(q, k)).scaled(c, 0.0)
+    let (mut q0, mut k0) = (q.clone(), k.clone());
+    q0.ball = 0.0;
+    k0.ball = 0.0;
+    let mut out = total(&product(&q0, &k0));
+    if q.ball > 0.0 || k.ball > 0.0 {
+        let length = |x: &Row| {
+            let mut reach = x.spread();
+            Zip::from(&mut reach).and(&x.center).and(&x.radius).for_each(|a, &c, &r| *a = up(up(*a + c.abs()) + r));
+            up(reach.iter().map(|v| v * v).sum::<f64>() * (1.0 + gamma(reach.len() + 1))).sqrt().next_up()
+        };
+        out.ball = up(up(up(q.ball * length(&k0)) + up(k.ball * length(&q0))) + up(q.ball * k.ball));
+    }
+    out.scaled(c, 0.0)
 }
 
 /// Per input row, which inputs it may read: its sequence's rows at or before its position when
@@ -941,6 +1069,52 @@ fn kind(node: &Node) -> &'static str {
         Node::Attend { .. } => "attend",
         Node::RmsNorm { .. } => "rms norm",
         Node::Transposed { .. } => "transposed",
+    }
+}
+
+/// What a certificate keeps: at most `budget` symbols per input row, and whether the forms absorb
+/// their own binary64 rounding (`rounding`, the sound default). Without it the bound is the
+/// relaxation's in real arithmetic with every form evaluated as if exact: no longer a proof, but it
+/// separates the relaxation's own width from the composed rounding enclosures, which on a deep model
+/// can dwarf it (the program's own banded forward of VPD's 4-layer model bounds its logits' rounding
+/// only by about `10²¹`).
+#[derive(Clone, Copy, Debug)]
+pub struct Relaxation {
+    pub budget: usize,
+    pub rounding: bool,
+}
+
+impl Relaxation {
+    /// A sound certificate with at most `budget` symbols per row.
+    pub fn sound(budget: usize) -> Self {
+        Self { budget, rounding: true }
+    }
+}
+
+/// The rounding switch held for one certificate: shared while rounding is absorbed, exclusive (and
+/// the switch off) while it is not.
+enum Mode {
+    Shared(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>),
+    Exclusive(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>),
+}
+
+impl Mode {
+    fn enter(rounding: bool) -> Self {
+        if rounding {
+            Self::Shared(MODE.read().unwrap_or_else(|e| e.into_inner()))
+        } else {
+            let guard = MODE.write().unwrap_or_else(|e| e.into_inner());
+            ROUNDING.store(false, std::sync::atomic::Ordering::SeqCst);
+            Self::Exclusive(guard)
+        }
+    }
+}
+
+impl Drop for Mode {
+    fn drop(&mut self) {
+        if matches!(self, Self::Exclusive(_)) {
+            ROUNDING.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
@@ -1015,7 +1189,14 @@ fn head_gaps(x: &Row, classes: ArrayView2<'_, f64>, bias: Option<&Array1<f64>>, 
             let class_magnitude = up(tile.row(k).iter().zip(magnitude.iter()).map(|(a, m)| a.abs() * m).sum::<f64>() * (1.0 + gamma(width + 1)));
             let error = up(rounding * up(up(class_magnitude + top_magnitude) + bias.map_or(0.0, |b| b[i].abs() + b[top].abs())));
             let gap = (centers[k] + bias.map_or(0.0, |b| b[i])) - top_center;
-            let reach = up(up(spread + error) + 2.0 * U * gap.abs());
+            // The ball meets the difference of the two classes' rows.
+            let apart = if x.ball > 0.0 {
+                let d = tile.row(k).iter().zip(classes.row(top).iter()).map(|(a, b)| (a - b) * (a - b)).sum::<f64>();
+                up(up(d * (1.0 + gamma(width + 2))).sqrt().next_up() * x.ball)
+            } else {
+                0.0
+            };
+            let reach = up(up(up(spread + error) + apart) + 2.0 * unit() * gap.abs());
             lower[i] = down(gap - reach);
             upper[i] = up(gap + reach);
         }
@@ -1033,7 +1214,7 @@ fn form_gaps(x: &Row, top: usize) -> (Array1<f64>, Array1<f64>) {
         let spread: f64 = (0..symbols).map(|s| (x.coef[[s, i]] - x.coef[[s, top]]).abs()).sum();
         let spread = up(spread * (1.0 + gamma(symbols + 2)));
         let gap = x.center[i] - x.center[top];
-        let reach = up(up(up(spread + x.radius[i]) + x.radius[top]) + 2.0 * U * gap.abs());
+        let reach = up(up(up(up(spread + x.radius[i]) + x.radius[top]) + up(std::f64::consts::SQRT_2 * x.ball * (1.0 + 2.0 * unit()))) + 2.0 * unit() * gap.abs());
         lower[i] = down(gap - reach);
         upper[i] = up(gap + reach);
     }
@@ -1049,8 +1230,10 @@ pub fn certify_program(
     free: &[FreeSlot],
     target: &Target,
     reference_radius: Option<&Array2<f64>>,
-    budget: usize,
+    relaxation: Relaxation,
 ) -> Result<Array1<f64>, String> {
+    let _mode = Mode::enter(relaxation.rounding);
+    let budget = relaxation.budget;
     let rows = inputs.rows;
     let nodes = program.nodes.len();
     if rows >= FIELD || nodes + 1 >= FIELD {
@@ -1225,13 +1408,14 @@ pub fn certify_program(
         if trace {
             // Where the relaxation widens: each node's mean half-width against its mean center.
             let (mut reach, mut size, mut symbols) = (0.0, 0.0, 0);
+            let ball = value.iter().map(|x| x.ball).fold(0.0_f64, f64::max);
             for x in &value {
                 let spread = x.spread();
                 reach += (&spread + &x.radius).mean().unwrap_or(0.0) / rows as f64;
                 size += x.center.mapv(f64::abs).mean().unwrap_or(0.0) / rows as f64;
                 symbols = symbols.max(x.ids.len());
             }
-            eprintln!("certify: node {index} {}: half-width {reach:.3e}, |center| {size:.3e}, {symbols} symbols", kind(&program.nodes[index]));
+            eprintln!("certify: node {index} {}: half-width {reach:.3e}, ball {ball:.3e}, |center| {size:.3e}, {symbols} symbols", kind(&program.nodes[index]));
         }
         if value.iter().any(|x| !x.finite()) {
             return Ok(unbounded());
@@ -1305,7 +1489,7 @@ fn free_row(slot: &FreeSlot, r: usize) -> Row {
             coef[[k, c]] = half;
         }
     }
-    Row { center, ids: symbols.into_iter().map(|s| s.0).collect(), coef, radius }
+    Row { center, ids: symbols.into_iter().map(|s| s.0).collect(), coef, radius, ball: 0.0 }
 }
 
 /// Per site, each block's gate interval (rows × blocks).
@@ -1332,14 +1516,14 @@ impl Gates {
 
 /// Per input, an upper bound on `KL(target ‖ masked)` over every gate setting in `gates` (module
 /// note), the reference within `reference_radius` of the target's logits, at most `budget` symbols
-/// per input. A program with a head is refused.
+/// per input (`relaxation`). A program with a head is refused.
 pub fn certify(
     masked: &Masked,
     base: &FamilyInputs,
     target: &Target,
     reference_radius: Option<&Array2<f64>>,
     gates: &Gates,
-    budget: usize,
+    relaxation: Relaxation,
 ) -> Result<Array1<f64>, String> {
     if masked.head.is_some() {
         return Err("a program with a head is not certified".to_string());
@@ -1353,7 +1537,7 @@ pub fn certify(
         })
         .collect();
     let inputs = masked.family(base, &gates.lower);
-    certify_program(&masked.program, &inputs, &free, target, reference_radius, budget)
+    certify_program(&masked.program, &inputs, &free, target, reference_radius, relaxation)
 }
 
 /// A branched certificate: per input the largest bound over the leaves, and how many leaves were bounded.
@@ -1373,10 +1557,10 @@ pub fn certify_branching(
     target: &Target,
     reference_radius: Option<&Array2<f64>>,
     gates: Gates,
-    budget: usize,
+    relaxation: Relaxation,
     leaves: usize,
 ) -> Result<Branched, String> {
-    let root = certify(masked, base, target, reference_radius, &gates, budget)?;
+    let root = certify(masked, base, target, reference_radius, &gates, relaxation)?;
     let mut open = vec![(gates, root.clone())];
     let mut spent = 1;
     while spent + 2 <= leaves {
@@ -1412,7 +1596,7 @@ pub fn certify_branching(
         let mut right = gates;
         right.lower[k][[r, b]] = middle;
         for half in [left, right] {
-            let bound = certify(masked, base, target, reference_radius, &half, budget)?;
+            let bound = certify(masked, base, target, reference_radius, &half, relaxation)?;
             open.push((half, bound));
         }
         spent += 2;
