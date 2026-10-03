@@ -20,7 +20,7 @@ fn normal(seed: usize) -> f64 {
 }
 
 fn feature(piece: usize) -> Feature {
-    Feature { site: 0, piece, lag: 0 }
+    Feature { site: 0, piece, lag: 0, magnitude: false }
 }
 
 /// A subcomponent on when its amplitude's magnitude is past 1.5 (a two-sided gate no linear switch
@@ -93,7 +93,7 @@ fn the_screen_ranks_the_feature_that_drives_the_residual_first() {
 fn masks_read_lagged_features_from_the_previous_row_and_zero_at_a_sequence_start() {
     // Site 1's one subcomponent is on when site 0's amplitude at the previous row is past 1.
     let switch = Switch {
-        features: vec![Feature { site: 0, piece: 0, lag: 1 }],
+        features: vec![Feature { site: 0, piece: 0, lag: 1, magnitude: false }],
         beta: -1.0,
         linear: vec![1.0],
         units: vec![Unit { w: vec![0.0], d: 0.0, c: 0.0 }],
@@ -109,4 +109,18 @@ fn masks_read_lagged_features_from_the_previous_row_and_zero_at_a_sequence_start
     let chosen = masks(&[vec![off], vec![switch]], &amplitudes, &previous);
     assert_eq!(chosen[0].column(0).to_vec(), vec![0.0; 4]);
     assert_eq!(chosen[1].column(0).to_vec(), vec![0.0, 1.0, 0.0, 1.0]);
+}
+
+#[test]
+fn a_magnitude_gate_is_the_one_line_threshold_rule() {
+    // On exactly when |a| > 1.5: a magnitude feature says it with no unit, at the planted threshold.
+    let n = 4000;
+    let x = Array2::from_shape_fn((n, 1), |(t, _)| normal(t));
+    let y: Vec<bool> = (0..n).map(|t| x[[t, 0]].abs() > 1.5).collect();
+    let magnitudes = x.mapv(f64::abs);
+    let switch = best(magnitudes.view(), &y, &[Feature { magnitude: true, ..feature(0) }], 0.0);
+    let tau = switch.threshold().unwrap_or_else(|| panic!("not a threshold rule: {switch:?}"));
+    assert!((tau - 1.5).abs() < 0.05, "τ = {tau}: {switch:?}");
+    let with_units = best(x.view(), &y, &[feature(0)], 0.0);
+    assert!(switch.total_bits() < with_units.total_bits(), "rule {} bits, units {}", switch.total_bits(), with_units.total_bits());
 }

@@ -19,14 +19,17 @@
 //!   ĝ_j(f) = β + ℓᵀf + Σ_{u<r} c_u GELU(w_uᵀf + d_u),     P(j on | f) = σ(ĝ_j(f)),
 //! ```
 //!
-//! and `j` is on exactly when `ĝ_j(f) > 0`. With no features and no units it is the base rate.
-//! Nothing about its size is fixed: the features, the number of units `r` and the precision of
-//! every coefficient are chosen by the code below.
+//! and `j` is on exactly when `ĝ_j(f) > 0`. With no features and no units it is the base rate. A
+//! feature is an amplitude or its magnitude `|a|`; the smallest law that is not a rate, one
+//! magnitude feature of its own amplitude and no units, is the one-line rule "`j` is on when
+//! `|v_j·x| > τ_j`" with `τ_j = −β/ℓ` ([`Switch::threshold`]). Nothing about its size is fixed:
+//! the features, their forms, the number of units `r` and the precision of every coefficient are
+//! chosen by the code below.
 //!
 //! # The code
 //!
 //! A switching function is sent as `L_int(d + 1)`, the feature subset (its bits given by the
-//! caller, who knows the pool it was chosen from), `L_int(r + 1)`, a dyadic precision `p` (signed
+//! caller, who knows the pool it was chosen from), one bit per feature for its form, `L_int(r + 1)`, a dyadic precision `p` (signed
 //! prefix integer) and every coefficient as the signed prefix integer `round(θ·2^p)`
 //! ([`Switch::function_bits`]). The per-word listing then sends the on/off labels at the inputs
 //! under the decoded function, `−Σ log₂ P(y | f)` ([`Switch::listing_bits`]), each label escaped as
@@ -77,13 +80,23 @@ use ndarray::{Array1, Array2, ArrayView2};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
-/// One feature of a switching function: the amplitude of subcomponent `piece` of site `site` at this input (`lag`
-/// 0) or at the previous input of the sequence (`lag` 1, zero at a sequence's first input).
+/// One feature of a switching function: the amplitude of subcomponent `piece` of site `site` at this
+/// input (`lag` 0) or at the previous input of the sequence (`lag` 1, zero at a sequence's first
+/// input), or its magnitude `|a|` when `magnitude`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Feature {
     pub site: usize,
     pub piece: usize,
     pub lag: usize,
+    #[serde(default)]
+    pub magnitude: bool,
+}
+
+impl Feature {
+    /// The feature's value from the amplitude it reads.
+    pub fn value(&self, amplitude: f64) -> f64 {
+        if self.magnitude { amplitude.abs() } else { amplitude }
+    }
 }
 
 /// One nonlinear unit: `c · GELU(wᵀf + d)`.
@@ -124,6 +137,15 @@ impl Switch {
             g += u.c * gelu(dot(&u.w, f) + u.d);
         }
         g
+    }
+
+    /// `τ` when the function is the one-line rule "on when `|a| > τ`": a single magnitude feature,
+    /// no units, rising with `|a|`.
+    pub fn threshold(&self) -> Option<f64> {
+        match (self.features.as_slice(), self.linear.as_slice()) {
+            ([f], [l]) if f.magnitude && self.units.is_empty() && *l > 0.0 => Some(-self.beta / l),
+            _ => None,
+        }
     }
 
     /// Whether the switch says the subcomponent is on.
@@ -370,7 +392,7 @@ fn optimise(params: &mut Params, x: &[f64], y: &[bool]) -> f64 {
 fn encode(params: &Params, x: &[f64], y: &[bool], features: &[Feature], structure_bits: f64) -> Switch {
     let (_, fisher) = params.derivatives(x, y);
     let p = params.theta.len();
-    let header = count_bits(params.d) + structure_bits + count_bits(params.units());
+    let header = count_bits(params.d) + structure_bits + params.d as f64 + count_bits(params.units());
     let largest = params.theta.iter().fold(0.0f64, |m, t| m.max(t.abs()));
     // The coarsest useful precision rounds every coefficient to zero; past 52 fraction bits more
     // than the largest coefficient's mantissa, nothing changes.
@@ -454,7 +476,7 @@ pub fn base(y: &[bool]) -> Switch {
 /// The fewest bits any switch with features can take: its header and at least one bit for each of
 /// its precision and its three coefficients.
 pub fn least_featured_bits(structure_bits: f64) -> f64 {
-    count_bits(1) + structure_bits + count_bits(0) + 4.0
+    count_bits(1) + structure_bits + 1.0 + count_bits(0) + 4.0
 }
 
 /// The best switching function for on-labels `y` (a subcomponent's, or a candidate group's) over
@@ -644,7 +666,7 @@ pub fn masks(switches: &[Vec<Switch>], amplitudes: &[Array2<f64>], previous: &[O
                 for (r, prev) in previous.iter().enumerate() {
                     for (k, feature) in switch.features.iter().enumerate() {
                         let row = if feature.lag == 0 { Some(r) } else { *prev };
-                        f[k] = row.map_or(0.0, |row| amplitudes[feature.site][[row, feature.piece]]);
+                        f[k] = row.map_or(0.0, |row| feature.value(amplitudes[feature.site][[row, feature.piece]]));
                     }
                     if switch.on(&f) {
                         m[[r, piece]] = 1.0;
