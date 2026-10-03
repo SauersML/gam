@@ -3,8 +3,8 @@
 //!
 //! The code is one total over every word: the description bits of the blocks that ran on it plus
 //! `n KL / ln 2` (`gam_mpd::blocks`, module note), each block described by
-//! `gam_mpd::blocks::Generic` from the sites' read covariances and written Fishers measured on the
-//! coded inputs.
+//! `gam_mpd::blocks::Generic` from the sites' read second moments and logit-space Gauss–Newton
+//! metrics (`gam_mpd::describe::logit_gauss_newton`) measured on the coded inputs.
 //!
 //! `mpd_blocks_2951 modadd EXPORT_DIR OUT.json OBSERVATIONS [SITES]`
 //!
@@ -38,6 +38,7 @@
 //! points masks each block's columns together, a weaker claim than per column.
 
 use gam_mpd::blocks::{Bits, Blocked, Coded, Describe, Generic, block_cosine, fit_blocks, measure, reselect, rounding_error};
+use gam_mpd::describe::logit_gauss_newton;
 use gam_mpd::import::{import, import_language_model};
 use gam_mpd::masked::{Library, Site, Target, site_statistics, sites};
 use gam_mpd::operator_program::{FamilyInputs, LabelKind, OperatorProgram};
@@ -150,7 +151,14 @@ fn modadd(dir: &Path, out: &Path, observations: f64, names: Option<Vec<String>>)
     if chosen.is_empty() {
         return Err(format!("no sites chosen of {:?}", sites(&program).iter().map(|s| s.name.clone()).collect::<Vec<_>>()));
     }
-    let statistics = site_statistics(&program, &chosen, [family.clone()], 16, 0x5EED)?;
+    let mut statistics = site_statistics(&program, &chosen, [family.clone()], 16, 0x5EED)?;
+    // The written metric is the logit-space Gauss–Newton: the sampled-label Fisher vanishes on a
+    // confident network, which would price every rounding as free.
+    let trace = program.execute(&family, false).map_err(|e| e.to_string())?;
+    for (site, metric) in statistics.iter_mut().zip(logit_gauss_newton(&program, &chosen, &family, &trace, 64)?) {
+        site.fisher = metric;
+    }
+    drop(trace);
     let mut libraries = Vec::new();
     for (site, measured) in chosen.iter().zip(&statistics) {
         let library = fisher_svd(measured)?;
@@ -390,7 +398,17 @@ fn vpd(run: &VpdRun) -> Result<(), String> {
         let logits = program.execute(&inputs, false).map_err(|e| e.to_string())?.values[program.output].clone();
         batches.push((inputs, Target::every_row(logits)));
     }
-    let statistics = site_statistics(&program, &chosen, batches.iter().map(|(inputs, _)| inputs.clone()), 4, 0x5EED)?;
+    let mut statistics = site_statistics(&program, &chosen, batches.iter().map(|(inputs, _)| inputs.clone()), 4, 0x5EED)?;
+    // The written metric is the logit-space Gauss–Newton (as `modadd`), averaged over the batches.
+    for site in statistics.iter_mut() {
+        site.fisher.fill(0.0);
+    }
+    for (inputs, _) in &batches {
+        let trace = program.execute(inputs, false).map_err(|e| e.to_string())?;
+        for (site, metric) in statistics.iter_mut().zip(logit_gauss_newton(&program, &chosen, inputs, &trace, 16)?) {
+            site.fisher += &(metric / batches.len() as f64);
+        }
+    }
     let boxed = run.boxed.then(|| statistics.iter().map(|s| s.fisher.clone()).collect::<Vec<_>>());
     let mut describe = Generic::new(&statistics, run.observations);
     drop(statistics);
