@@ -47,10 +47,11 @@ def hs_pre(text):
     return text.replace("  ", " ")
 
 
-def build_requests():
+def build_requests(colon=True):
     """Every (context, continuation) request of every benchmark, tokenized the harness way, cached to requests.npz.
-    Items: task, gold index, request range, choice character lengths."""
-    path = OUTD / "requests.npz"
+    Items: task, gold index, request range, choice character lengths. colon=False builds the control prompts for
+    HellaSwag, ARC-Easy and PIQA with their prompt colon replaced ("label. ctx", "...\nAnswer -") and nothing else."""
+    path = OUTD / ("requests.npz" if colon else "requests_nocolon.npz")
     if path.exists():
         z = np.load(path, allow_pickle=True)
         return {k: z[k] for k in z.files}
@@ -60,23 +61,23 @@ def build_requests():
     enc = lambda s: tok.encode(s).ids
     items = []  # (task, gold, [(context, continuation)], [choice char lengths])
     for d in load_dataset("Rowan/hellaswag", split="validation"):
-        q = hs_pre(d["activity_label"] + ": " + d["ctx_a"] + " " + d["ctx_b"].capitalize())
+        q = hs_pre(d["activity_label"] + (": " if colon else ". ") + d["ctx_a"] + " " + d["ctx_b"].capitalize())
         ch = [hs_pre(e) for e in d["endings"]]
         items.append(("hellaswag", int(d["label"]), [(q, " " + c) for c in ch], [len(c) for c in ch]))
     for d in load_dataset("allenai/ai2_arc", "ARC-Easy", split="test"):
-        q = "Question: " + d["question"] + "\nAnswer:"
+        q = "Question: " + d["question"] + ("\nAnswer:" if colon else "\nAnswer -")
         ch = d["choices"]["text"]
         items.append(("arc_easy", d["choices"]["label"].index(d["answerKey"]), [(q, " " + c) for c in ch], [len(c) for c in ch]))
     for d in load_dataset("baber/piqa", split="validation"):
-        q = "Question: " + d["goal"] + "\nAnswer:"
+        q = "Question: " + d["goal"] + ("\nAnswer:" if colon else "\nAnswer -")
         ch = [d["sol1"], d["sol2"]]
         items.append(("piqa", int(d["label"]), [(q, " " + c) for c in ch], [len(c) for c in ch]))
-    for d in load_dataset("EleutherAI/lambada_openai", "default", split="test"):
+    for d in load_dataset("EleutherAI/lambada_openai", "default", split="test") if colon else []:
         words = d["text"].split(" ")
         items.append(("lambada", 0, [(" ".join(words[:-1]), " " + words[-1])], [len(words[-1])]))
     blimp = sorted(p.name for p in (Path.home() / ".cache/huggingface/datasets/nyu-mll___blimp").iterdir() if p.is_dir())
     assert len(blimp) == 67, len(blimp)
-    for cfg in blimp:
+    for cfg in blimp if colon else []:
         for d in load_dataset("nyu-mll/blimp", cfg, split="train"):
             ch = [d["sentence_good"], d["sentence_bad"]]
             items.append(("blimp:" + cfg, 0, [("", c) for c in ch], [len(c) for c in ch]))
@@ -106,10 +107,11 @@ def build_requests():
     return dict(np.load(path, allow_pickle=True))
 
 
-def stage_score(base_only=False):
-    """Per request and variant: the continuation's summed log-probability and whether greedy decoding reproduces it."""
+def stage_score(base_only=False, colon=True):
+    """Per request and variant: the continuation's summed log-probability and whether greedy decoding reproduces it.
+    colon=False scores the colon-free control prompts with the original model, the headline LoRA and its VPD match."""
     import torch
-    rq = build_requests()
+    rq = build_requests(colon)
     lens, n_cont = rq["lens"], rq["n_cont"]
     offs = np.concatenate([[0], np.cumsum(lens)])
     if base_only:
@@ -119,10 +121,12 @@ def stage_score(base_only=False):
     else:
         target, W0, models, meta = E.edit_variants()
         models = {k: v for k, v in models.items() if not k.startswith("vpd_a")}  # LoRAs and their matched VPD edits
-    names = (["base"] if base_only else []) + list(models)
+        if not colon:
+            models = {k: v for k, v in models.items() if k.endswith("lora282_lam10")}
+    names = (["base"] if base_only or not colon else []) + list(models)
     resid, final, head = E.split_forward(target)
     nR = len(lens)
-    out = OUTD / ("scores_base.npz" if base_only else "scores.npz")
+    out = OUTD / ("scores_nocolon.npz" if not colon else "scores_base.npz" if base_only else "scores.npz")
     part = out.with_suffix(".part.npz")
     lp = np.zeros((nR, len(names)), np.float64)
     greedy = np.zeros((nR, len(names)), bool)
@@ -176,7 +180,7 @@ def stage_score(base_only=False):
                 log(f"{i}/{nR} requests")
     np.savez(out, lp=lp, greedy=greedy, names=np.array(names))
     part.unlink(missing_ok=True)
-    if not base_only:
+    if not base_only and colon:
         json.dump({"models": names, "meta": meta}, open(OUTD / "models.json", "w"), indent=1)
     log("scored")
 
@@ -257,5 +261,30 @@ def stage_summarize():
               f"{e['base_acc'][2]:.3f}]  acc_norm {e['base_acc_norm'][0]:.3f} [{e['base_acc_norm'][1]:.3f}, {e['base_acc_norm'][2]:.3f}]")
 
 
+def stage_colon():
+    """Is the VPD edit's benchmark damage carried by the prompt colon? Change in the correct answer's share, with and
+    without the colon, for the headline LoRA and its equal-success VPD edit."""
+    with_c, no_c = build_requests(True), build_requests(False)
+    zb, z = np.load(OUTD / "scores_base.npz"), np.load(OUTD / "scores.npz")
+    names = ["base"] + list(z["names"])
+    lp = np.hstack([zb["lp"], z["lp"]])
+    _, _, m_c = item_stats(with_c, lp, np.hstack([zb["greedy"], z["greedy"]]))
+    zn = np.load(OUTD / "scores_nocolon.npz")
+    _, _, m_n = item_stats(no_c, zn["lp"], zn["greedy"])
+    nn = list(zn["names"])
+    res = {}
+    for t in ("hellaswag", "arc_easy", "piqa"):
+        res[t] = {}
+        for nm in ("lora282_lam10", "vpd_match_lora282_lam10"):
+            a = boot(m_c[with_c["task"] == t][:, [names.index(nm)]] - m_c[with_c["task"] == t][:, :1])
+            b = boot(m_n[no_c["task"] == t][:, [nn.index(nm)]] - m_n[no_c["task"] == t][:, :1])
+            res[t][nm] = {"with_colon": [float(a[0][0]), float(a[1][0]), float(a[2][0])],
+                          "without_colon": [float(b[0][0]), float(b[1][0]), float(b[2][0])]}
+            print(f"{t:10s} {nm:24s} with colon {a[0][0]:+.4f} [{a[1][0]:+.4f}, {a[2][0]:+.4f}]   "
+                  f"without {b[0][0]:+.4f} [{b[1][0]:+.4f}, {b[2][0]:+.4f}]")
+    json.dump(res, open(OUTD / "e4_colon_control.json", "w"), indent=1)
+
+
 if __name__ == "__main__":
-    {"score": lambda: stage_score(sys.argv[2:3] == ["base"]), "summarize": stage_summarize}[sys.argv[1]]()
+    {"score": lambda: stage_score(sys.argv[2:3] == ["base"]), "score_nocolon": lambda: stage_score(colon=False),
+     "colon": stage_colon, "summarize": stage_summarize}[sys.argv[1]]()
