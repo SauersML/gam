@@ -1,7 +1,7 @@
 import json, numpy as np, matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-d = json.load(open("/Users/user/mpd-data/certify/p31_n1e6.json"))
+d = json.load(open("/Users/user/mpd-data/certify/p31_v3.json"))
 plt.rcParams.update({"font.size": 16})
 fig, axes = plt.subplots(1, 2, figsize=(14, 6.2), facecolor="white")
 floor = 1e-9
