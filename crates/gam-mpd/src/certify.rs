@@ -1641,6 +1641,18 @@ pub fn adversary(
     adversary_screened(masked, base, target, gates, focus, (steps, restarts, seed), HeadScreen::Device)
 }
 
+/// One sign-ascent step of [`adversary`] on the free gates, its rate shrinking linearly with `step`.
+fn climb(point: &mut [Array2<f64>], gates: &Gates, ascent: &[Array2<f64>], step: usize, steps: usize) {
+    let rate = 0.5 - (0.5 - 0.5 / steps as f64) * step as f64 / steps.max(2).saturating_sub(1) as f64;
+    for (((g, l), u), a) in point.iter_mut().zip(&gates.lower).zip(&gates.upper).zip(ascent) {
+        Zip::from(g).and(l).and(u).and(a).for_each(|g, &l, &u, &a| {
+            if u > l {
+                *g = (*g + rate * (u - l) * a.signum()).clamp(l, u);
+            }
+        });
+    }
+}
+
 /// [`adversary`], each point's head run as `screen` says ([`masked::ScreenedPoint`](super::masked::ScreenedPoint)): a point's KL is then
 /// known within a band per row, and at the end each row's float64 KL is computed only at the
 /// points whose upper end reaches the largest lower end, so the returned maximum is the float64
@@ -1659,6 +1671,12 @@ pub(crate) fn adversary_screened(
     let mut best = Array1::<f64>::from_elem(rows, f64::NEG_INFINITY);
     // The screened points: per point its rows' KL, band and hidden values.
     let mut screened: Vec<(Array1<f64>, Array1<f64>, Array2<f64>)> = Vec::new();
+    // On the program's device twin (masked, module note, "Devices") every point's forward, its
+    // float64 KL and its ascent run there; a focused ascent stays on the CPU.
+    let on_device = match focus {
+        None => masked.on_device(|accelerated| accelerated.target(target))?,
+        Some(_) => None,
+    };
     for restart in 0..restarts.max(1) {
         let mut point: Vec<Array2<f64>> = gates
             .lower
@@ -1675,6 +1693,20 @@ pub(crate) fn adversary_screened(
             .collect();
         for step in 0..=steps {
             let family = masked.family(base, &point);
+            if let Some(on_device) = &on_device {
+                let last = step == steps;
+                let (kl, ascent) = masked
+                    .on_device(|accelerated| {
+                        let state = accelerated.forward(&family, on_device)?;
+                        let ascent = if last { None } else { Some(accelerated.mask_gradients(masked, &state)?) };
+                        Ok((state.kl, ascent))
+                    })?
+                    .ok_or("adversary: the masked program left its device")?;
+                Zip::from(&mut best).and(&kl).for_each(|b, &v| *b = b.max(v));
+                let Some(ascent) = ascent else { break };
+                climb(&mut point, gates, &ascent, step, steps);
+                continue;
+            }
             let ascent = match screened_point(masked, &family, target, screen)? {
                 Some(point) => {
                     let ascent = if step == steps { None } else { Some(point.mask_gradients(masked, &family, target, focus)?) };
@@ -1700,14 +1732,7 @@ pub(crate) fn adversary_screened(
                 }
             };
             let Some(ascent) = ascent else { break };
-            let rate = 0.5 - (0.5 - 0.5 / steps as f64) * step as f64 / steps.max(2).saturating_sub(1) as f64;
-            for (((g, l), u), a) in point.iter_mut().zip(&gates.lower).zip(&gates.upper).zip(&ascent) {
-                Zip::from(g).and(l).and(u).and(a).for_each(|g, &l, &u, &a| {
-                    if u > l {
-                        *g = (*g + rate * (u - l) * a.signum()).clamp(l, u);
-                    }
-                });
-            }
+            climb(&mut point, gates, &ascent, step, steps);
         }
     }
     // Each row settles to float64 at every screened point that could hold its maximum: one whose
