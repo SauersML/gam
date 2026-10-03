@@ -19,9 +19,9 @@ ORANGE, BLUE = "#eb6834", "#2a78d6"
 plt.rcParams.update({"font.family": ["Helvetica Neue", "Arial Unicode MS"], "font.size": 15})
 vpd = sorted(d["vpd"].values(), key=lambda e: e["p_fire"])
 lora = [(e, False) for e in d["lora"].values()] + [(e, True) for e in d.get("lora_low", {}).values()]
-panels = [("surr_kl", "Text around each emoticon", "KL from the original model (nats per word)"),
-          ("global_kl", "Ordinary documents", "KL from the original model (nats per word)"),
-          ("declared_abs_damage_mean", "Six side-effect checks", "mean change in loss (nats)")]
+panels = [("surr_kl", "Words within 20 of each emoticon", "KL from the original model (nats per word)"),
+          ("global_kl", "Every word of 40 ordinary documents", "KL from the original model (nats per word)"),
+          ("declared_abs_damage_mean", "Predicting . the of , digits, and copying", "mean change in loss (nats)")]
 
 
 def vpd_at(key, p):
@@ -83,11 +83,7 @@ head = (f"At equal edit success, LoRA disturbs nearby text {min(near):.0f}–{ma
 fig.suptitle(head, color=INK, fontsize=19, fontweight="bold", x=0.02, ha="left", y=0.975)
 fig.text(0.02, 0.905, "The VPD paper's emoticon edit on its 4-layer model, with the paper's protocol. "
          "Lower is better in every panel.", color=INK2, fontsize=14, ha="left")
-fig.text(0.02, 0.02, "Text around each emoticon: the 20 words on either side of 50 held-out emoticons.   "
-         "Ordinary documents: every word of 40 web-text documents.\n"
-         "Side-effect checks: predicting “.”, “the”, “of”, “,” and digits in 32 documents, and copying a repeated random sequence.",
-         color=INK2, fontsize=11.5, ha="left")
-fig.subplots_adjust(left=0.06, right=0.99, top=0.7, bottom=0.19, wspace=0.28)
+fig.subplots_adjust(left=0.06, right=0.99, top=0.7, bottom=0.12, wspace=0.28)
 out = Path.home() / "mpd-data/figures/e4_edit_vs_lora.png"
 fig.savefig(out, facecolor=SURF)
 print(out, {k: [round(x, 1) for x in v] for k, v in ratios.items()})
