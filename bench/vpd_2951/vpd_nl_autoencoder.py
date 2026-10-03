@@ -227,13 +227,13 @@ def stage_labels():
 
 
 class LM:
-    """Qwen2.5-1.5B-Instruct as a fixed code: bits of each line of a document given the earlier lines."""
+    """An instruct LM: Qwen2.5-1.5B-Instruct is the fixed code (bits of each line of a document given
+    the earlier lines); a larger one may write names."""
 
-    def __init__(self):
+    def __init__(self, name: str = "Qwen/Qwen2.5-1.5B-Instruct"):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        name = "Qwen/Qwen2.5-1.5B-Instruct"
         self.torch = torch
         self.tok = AutoTokenizer.from_pretrained(name)
         # Built on the device, then filled tensor by tensor from the checkpoint (a CPU copy of the
@@ -269,23 +269,26 @@ class LM:
                 out.append(-lp / math.log(2))
             return torch.cat(out, 1)
 
-    def paraphrase(self, texts: list[str], batch: int = 64) -> list[str]:
-        """Each text rewritten in other words by the instruct model (greedy, one line)."""
+    def generate(self, requests: list[str], batch: int = 32, tokens: int = 48) -> list[str]:
+        """The instruct model's greedy one-line reply to each request."""
         torch = self.torch
         self.tok.padding_side = "left"
         out = []
-        for b in range(0, len(texts), batch):
-            prompts = [self.tok.apply_chat_template(
-                [{"role": "user", "content": "Rewrite this short label of a neural-network mechanism in different words, keeping its "
-                  f"meaning and every quoted token. Reply with the rewrite only, one line.\nLabel: {t}"}],
-                tokenize=False, add_generation_prompt=True) for t in texts[b:b + batch]]
+        for b in range(0, len(requests), batch):
+            prompts = [self.tok.apply_chat_template([{"role": "user", "content": r}], tokenize=False, add_generation_prompt=True)
+                       for r in requests[b:b + batch]]
             enc = self.tok(prompts, return_tensors="pt", padding=True).to(device())
             with torch.no_grad():
-                gen = self.model.generate(**enc, max_new_tokens=48, do_sample=False)
+                gen = self.model.generate(**enc, max_new_tokens=tokens, do_sample=False)
             for g in gen[:, enc["input_ids"].shape[1]:]:
-                out.append(self.tok.decode(g, skip_special_tokens=True).strip().split("\n")[0].replace(";", ","))
-            print(f"paraphrased {len(out)}/{len(texts)}", flush=True)
+                out.append(self.tok.decode(g, skip_special_tokens=True).strip().split("\n")[0].strip().strip('"').replace(";", ","))
+            print(f"generated {len(out)}/{len(requests)}", flush=True)
         return out
+
+    def paraphrase(self, texts: list[str]) -> list[str]:
+        """Each text rewritten in other words (greedy, one line)."""
+        return self.generate(["Rewrite this short description of a neural-network mechanism in different words, keeping its "
+                              f"meaning. Reply with the rewrite only, one line.\nDescription: {t}" for t in texts])
 
     def line_bits(self, lines: list[str], window: int = 2048, header: str = HEADER, sep: str = "\n") -> np.ndarray:
         """Bits of each line (its text and its newline) given the header and the lines before it,
@@ -619,6 +622,177 @@ def stage_controls():
     print(f"paraphrase: {correct:.1%} of {len(used)} item labels decode back to themselves; {para_bits.mean():.1f} bits/word")
 
 
+NAMER = "Qwen/Qwen2.5-7B-Instruct"
+
+
+def stage_names():
+    """A short English name for every concept, written by NAMER from the concept's evidence: where
+    its members sit, the words that invoke it (with example contexts), what its members read from
+    the embedding and what they write to the logits. Names are made unique (the decoder is a lookup)."""
+    z, indptr, indices, offsets, names = sets()
+    rep, ptr, idx, bits = fit_outputs()
+    lab = json.load(open(OUT / "labels.json"))["subcomponents"]
+    words = vocab_words(z["ids"][TRAIN[0]:TRAIN[1]].reshape(-1))
+    T = len(words)
+    base = Counter(words)
+    users = [[] for _ in rep["concepts"]]
+    for t in range(T):
+        for c in idx[ptr[t]:ptr[t + 1]]:
+            users[c].append(t)
+    q = lambda w: repr(w)[1:-1]
+    requests, evidence = [], []
+    for c, con in enumerate(rep["concepts"]):
+        members, on = con["members"], con["on"]
+        where = Counter(f"layer {lab[j]['site'].split('.')[1]} {'attention' if '.attn.' in lab[j]['site'] else 'MLP'}" for j in members)
+        cnt = Counter(words[t] for t in users[c])
+        score = {w: k * math.log(max(1.0, k * T / (len(users[c]) * base[w]))) for w, k in cnt.items()}
+        top = sorted(score, key=lambda w: -score[w])[:8]
+        rng = np.random.default_rng(c)
+        cand = [t for t in users[c] if words[t] in top[:4] and t % CONTEXT >= 8]
+        examples = ["".join(words[t - 8:t]).replace("\n", " ") + " [[" + words[t] + "]]" for t in rng.choice(cand, size=min(5, len(cand)), replace=False)] if cand else []
+        reads, writes = Counter(), Counter()
+        for j, p in zip(members, on):
+            for r, w in enumerate(lab[j]["reads"]):
+                reads[w] += p * (4 - r)
+            for r, w in enumerate(lab[j]["writes"]):
+                writes[w] += p * (4 - r)
+        ev = {"where": dict(where.most_common(4)), "invoked_by": top, "examples": examples,
+              "reads": [w for w, _ in reads.most_common(6)], "writes": [w for w, _ in writes.most_common(6)],
+              "rate": con["invoked"], "members": len(members)}
+        evidence.append(ev)
+        requests.append(
+            "You are naming one mechanism inside a small 4-layer language model. It is a group of weight components that switch on "
+            "together on some words. Evidence:\n"
+            f"- where its components sit: {', '.join(f'{k} ({v})' for k, v in ev['where'].items())}\n"
+            f"- words it switches on for (most characteristic first): {', '.join(q(w) for w in top)}\n"
+            + "".join(f"- example (the word in [[ ]]): {q(e)}\n" for e in examples)
+            + f"- input tokens its weights read most: {', '.join(q(w) for w in ev['reads'])}\n"
+            f"- next tokens its weights push up: {', '.join(q(w) for w in ev['writes'])}\n"
+            "Write a short, plain English name for what this mechanism does (3 to 7 words, lowercase, no quotes, no layer numbers). "
+            "Reply with the name only.")
+    lm = LM(NAMER)
+    got = lm.generate(requests, batch=16, tokens=24)
+    seen, final = Counter(), []
+    for c, g in enumerate(got):
+        g = g.lower().rstrip(".") or "unnamed mechanism"
+        if seen[g]:
+            g = f"{g} after {q(evidence[c]['invoked_by'][0]).strip() or 'space'}"
+        while seen[g]:
+            g = g + " again"
+        seen[g] += 1
+        final.append(g)
+    json.dump({"namer": NAMER, "names": final, "evidence": evidence}, open(OUT / "names.json", "w"), indent=1)
+    for c in range(0, len(final), max(1, len(final) // 20)):
+        print(f"{c:4d} {final[c]!r}  <- {evidence[c]['invoked_by'][:4]}")
+
+
+def stage_fluent():
+    """The concepts-only text with the written names, scored like everything else:
+    * per eval word, every invoked concept's exact single-drop KL (the row's program without that
+      concept's core where it is invoked, one forward per concept and row);
+    * the encoder of the objective: a concept is named when n dKL/ln 2 exceeds its name's bits;
+      and the frontier: each word's k most valuable names (dKL per bit), k = 0, 1, 2, 4, 8, all;
+    * text bits under the fixed LM, KL of every decoded program;
+    * the lossless code with these names (+ the binary residual) and the paraphrase control."""
+    import scipy.sparse as sp
+    import torch
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from vpd_eval import kl_per_pos
+
+    z, indptr, indices, offsets, names = sets()
+    rep, ptr, idx, bits = fit_outputs()
+    it = json.load(open(OUT / "items.json"))
+    core = it["core"]
+    cname = json.load(open(OUT / "names.json"))["names"]
+    words = TEXT_ROWS * CONTEXT
+    invoked = [idx[ptr[eval_word(0, 0) + w]:ptr[eval_word(0, 0) + w + 1]].tolist() for w in range(words)]
+    dev = device()
+    target, C = load_light(dev)
+
+    def row_kl(r, prog):
+        ids = torch.tensor(z["ids"][EVAL[0] + r:EVAL[0] + r + 1], device=dev)
+        masks = {n: torch.zeros(1, CONTEXT, C[n], device=dev) for n in names}
+        pos = np.concatenate([[p] * len(prog[p]) for p in range(CONTEXT)]).astype(np.int64)
+        glob = np.concatenate([prog[p] for p in range(CONTEXT)]).astype(np.int64)
+        for s_, n in enumerate(names):
+            sel = (glob >= offsets[s_]) & (glob < offsets[s_ + 1])
+            if sel.any():
+                masks[n][0, torch.tensor(pos[sel], device=dev), torch.tensor(glob[sel] - offsets[s_], device=dev)] = 1.0
+        with torch.no_grad():
+            return kl_per_pos(masked(target, ids, masks), tgt[r])[0].cpu().numpy()
+
+    with torch.no_grad():
+        tgt = [target(torch.tensor(z["ids"][EVAL[0] + r:EVAL[0] + r + 1], device=dev)) for r in range(TEXT_ROWS)]
+    program = lambda chosen: [sorted({j for c in ch for j in core[c]}) for ch in chosen]
+    # exact single-drop KL of every invoked concept
+    gain = [dict() for _ in range(words)]
+    for r in range(TEXT_ROWS):
+        rows = range(r * CONTEXT, (r + 1) * CONTEXT)
+        full = row_kl(r, program([invoked[w] for w in rows]))
+        for c in sorted({c for w in rows for c in invoked[w]}):
+            k = row_kl(r, program([[x for x in invoked[w] if x != c] for w in rows]))
+            for p, w in enumerate(rows):
+                if c in invoked[w]:
+                    gain[w][c] = float(k[p] - full[p])
+        print(f"row {r}: single-drop KL of {len({c for w in rows for c in invoked[w]})} concepts", flush=True)
+    lm = LM()
+    name_bits = lm.standalone_bits(cname)
+    levels = {}
+
+    def score(key, chosen):
+        lines = ["; ".join(cname[c] for c in ch) for ch in chosen]
+        tb = np.concatenate([lm.line_bits(lines[r * CONTEXT:(r + 1) * CONTEXT]) for r in range(TEXT_ROWS)])
+        prog = program(chosen)
+        kl = np.concatenate([row_kl(r, prog[r * CONTEXT:(r + 1) * CONTEXT]) for r in range(TEXT_ROWS)])
+        levels[key] = {"chosen": chosen, "lines": lines, "bits": tb.tolist(), "kl": kl.tolist(), "l0": [len(p) for p in prog]}
+        print(f"fluent {key}: {np.mean([len(c) for c in chosen]):.1f} names, {tb.mean():.1f} bits, KL {kl.mean():.3f}, L0 {np.mean([len(p) for p in prog]):.1f}", flush=True)
+
+    ranked = [sorted(inv, key=lambda c: -gain[w][c] / name_bits[c]) for w, inv in enumerate(invoked)]
+    for k in (1, 2, 4, 8):
+        score(f"top{k}", [r[:k] for r in ranked])
+    score("all", ranked)
+    for n in (256, 1024, 4096):
+        score(f"n={n}", [[c for c in r if n * gain[w][c] / math.log(2) > name_bits[c]] for w, r in enumerate(ranked)])
+    # paraphrase control on the full concept text: each name rewritten, decoded to the nearest name
+    para = lm.paraphrase(cname)
+
+    def grams(texts, table=None):
+        rows_, cols, table = [], [], ({} if table is None else table)
+        grow = not table
+        for r_, t_ in enumerate(texts):
+            t_ = f"  {t_.lower()}  "
+            for a in range(len(t_) - 2):
+                g = t_[a:a + 3]
+                if g not in table:
+                    if not grow:
+                        continue
+                    table[g] = len(table)
+                rows_.append(r_)
+                cols.append(table[g])
+        return sp.csr_matrix((np.ones(len(rows_)), (rows_, cols)), shape=(len(texts), len(table))), table
+
+    V, table = grams(cname)
+    idf = np.log(V.shape[0] / (1 + np.asarray((V > 0).sum(0)).ravel()))
+    norm = lambda M: sp.diags(1 / np.sqrt(np.asarray(M.multiply(M).sum(1)).ravel() + 1e-12)) @ M
+    P, _ = grams(para, table)
+    match = np.asarray((norm(P @ sp.diags(idf)) @ norm(V @ sp.diags(idf)).T).argmax(1)).ravel()
+    accuracy = float(np.mean(match == np.arange(len(cname))))
+    chosen = [[int(match[c]) for c in r] for r in ranked]
+    lines = ["; ".join(para[c] for c in r) for r in ranked]
+    tb = np.concatenate([lm.line_bits(lines[r * CONTEXT:(r + 1) * CONTEXT]) for r in range(TEXT_ROWS)])
+    prog = program(chosen)
+    kl = np.concatenate([row_kl(r, prog[r * CONTEXT:(r + 1) * CONTEXT]) for r in range(TEXT_ROWS)])
+    levels["paraphrase"] = {"lines": lines, "bits": tb.tolist(), "kl": kl.tolist(), "l0": [len(p) for p in prog], "accuracy": accuracy,
+                            "paraphrases": para}
+    print(f"fluent paraphrase: {accuracy:.1%} of names decode back; {tb.mean():.1f} bits, KL {kl.mean():.3f}", flush=True)
+    b = bits[eval_word(0, 0):eval_word(0, 0) + words]
+    lossless = np.array(levels["all"]["bits"]) + b[:, 1] + b[:, 2]
+    json.dump({"names": cname, "name_bits": name_bits.tolist(), "gain": [{str(k): v for k, v in g.items()} for g in gain],
+               "levels": levels, "lossless_bits": lossless.tolist()}, open(OUT / "fluent.json", "w"))
+    print(f"fluent lossless: {lossless.mean():.1f} bits (names {np.mean(levels['all']['bits']):.1f} + residual {(b[:, 1] + b[:, 2]).mean():.1f})")
+
+
 def stage_kl():
     """KL(model || masked model) per eval word for every decoded program, plus VPD's own set and
     the empty program."""
@@ -838,5 +1012,5 @@ if __name__ == "__main__":
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     stages = {"labels": stage_labels, "label_bits": stage_label_bits, "attrib": stage_attrib, "text": stage_text,
               "bits": stage_bits, "kl": stage_kl, "report": stage_report, "figure": stage_figure,
-              "controls": stage_controls}
+              "controls": stage_controls, "names": stage_names, "fluent": stage_fluent}
     stages[sys.argv[1]]()
