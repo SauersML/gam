@@ -25,6 +25,7 @@ order = [
     ("rank one", "rank-one\nsubcomponents,\nselected"),
     ("blocks' columns as rank-one subcomponents", "the blocks' columns\nas rank-one\nsubcomponents"),
     ("blocks", "rank-k blocks,\nchosen by the code"),
+    ("blocks, decoded", "the blocks decoded\n(rounded, run exactly)"),
 ]
 order = [(k, label) for k, label in order if k in points]
 
@@ -40,7 +41,7 @@ for yi, (key, label) in zip(y, order):
     kl = p["kl_bits"] / p["rows"]
     ax.barh(yi, ran, color=RAN_COLOR, height=0.62)
     ax.barh(yi, kl, left=ran, color=KL_COLOR, height=0.62)
-    ax.text(ran + kl, yi, f"  {ran + kl:,.0f}   KL {p['kl']:.2f}, {p['active_rank_one_equivalents_per_word']:.1f} directions on",
+    ax.text(ran + kl, yi, f"  {ran + kl:,.0f}   KL {abs(p['kl']):.3f}, {p['active_rank_one_equivalents_per_word']:.1f} directions on",
             va="center", fontsize=14, color=INK)
 ax.set_yticks(y, [label for _, label in order], fontsize=15)
 ax.set_xlabel("bits per word")
@@ -51,7 +52,7 @@ xmax = max(points[k]["bits_per_word"] for k, _ in order)
 ax.set_xlim(0, xmax * 1.9)
 
 # The multi-direction blocks the code chose, by frequency.
-blocks = [b for b in result["blocks"] if b["rank"] >= 2 and b["firing"] > 0]
+blocks = [b for b in result["blocks"] if b["rank"] >= 2 and b["firing"] > 0 and (b.get("output_spectrum") or b.get("input_spectrum"))]
 ax2 = fig.add_subplot(gs[1])
 if blocks:
     spectra, labels = [], []
@@ -76,6 +77,7 @@ if blocks:
         ax2.axis("off")
 else:
     ax2.axis("off")
+    ax2.text(0, 0.5, "No block of rank 2 or more\nis on for any word:\nevery block that runs is rank one.", fontsize=18, color=INK, transform=ax2.transAxes)
 ax2.set_title("Blocks of rank 2 or more", loc="left", fontsize=20, pad=14)
 fig.suptitle(f"Mod-31 addition: one gate per rank-k block (n = {result['observations']:g})", x=0.02, ha="left", fontsize=24)
 fig.savefig(out, facecolor="white")
