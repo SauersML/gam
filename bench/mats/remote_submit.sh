@@ -88,7 +88,7 @@ if [ -z "$B" ]; then
     done
     if [ -z "$B" ]; then
         bj=$(sbatch --parsable -J mpd-build --dependency=singleton -p compute --qos=debug -c 16 --mem=16G \
-            -t 01:00:00 -o "$CL/_build/build-$C12-%j.log" "$CL/_build/build.sh" "$C")
+            -t 00:30:00 -o "$CL/_build/build-$C12-%j.log" "$CL/_build/build.sh" "$C")
         echo "$bj $C" > "$BIN/$C12.buildjob"
         B=$C12
         echo "mats-run: building $C12 in job $bj (log ~/mpd-data/cluster/_build/build-$C12-$bj.log)" >&2
