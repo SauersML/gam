@@ -7,7 +7,9 @@
 #     at base) take it by raising their array throttles; when the group submits, the throttles drop
 #     back (a running gsweep task finishes; no new one starts in its place);
 #   - our debug-QOS GPU jobs (which the 6-GPU QOS cap does not cover) are held while starting them
-#     would put us above 6 GPUs, and released when there is room.
+#     would put us above 6 GPUs, and released when there is room;
+#   - with ~/gpu_preempt_on present, a reserved group's waiting GPU job (or our total above 6)
+#     requeues the newest-started gsweep tasks, which resume exactly from their checkpoints.
 set -uo pipefail
 SWEEPS=(15314 15316)
 declare -A RESERVE=([e2e]=2 [trainer]=1 [battery]=1)
@@ -54,6 +56,25 @@ while :; do
         fi
         i=$(( i + 1 ))
     done
+    # Preemption (on while ~/gpu_preempt_on exists): a reserved group with a GPU job waiting, or our
+    # total above 6, takes GPUs back from the gsweep tasks, newest started first. `scontrol requeue`
+    # stops the task; it resumes exactly from OUT.select/ when it next starts, and the throttle just
+    # set keeps it from starting again before the reserved job does.
+    if [ -e "$HOME/gpu_preempt_on" ]; then
+        owed=0
+        while read -r name; do
+            k=$(group "$name")
+            [ -n "${RESERVE[$k]:-}" ] && owed=$(( owed + 1 ))
+        done < <(squeue -u "$USER" -h -t PD -o '%j %b %r' | awk '$2 ~ /gpu/ && $3 != "JobHeldUser" && $3 != "Dependency" { print $1 }')
+        excess=$(( running - 6 ))
+        free=$(( owed > 0 && running + owed > 6 ? running + owed - 6 : 0 ))
+        (( excess > free )) && free=$excess
+        if (( free > 0 )); then
+            for t in $(squeue -u "$USER" -h -t R -o '%S %i %j' | awk '$3 ~ /^gsweep/' | sort -r | awk '{ print $2 }' | head -n "$free"); do
+                scontrol requeue "$t" && echo "$(date +%T) requeued $t (owed $owed, running $running GPUs)"
+            done
+        fi
+    fi
     # Debug-QOS GPU jobs: hold those that would take us past 6, release ours when there is room.
     room=$(( 6 - running ))
     while read -r id g; do
