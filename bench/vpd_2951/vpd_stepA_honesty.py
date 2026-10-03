@@ -12,6 +12,8 @@ rounded (g > 0), or a given set's indicator. Every mask lies in VPD's box [g, 1]
           (one source per subcomponent shared over every word, sign steps of 0.1) at 20/40/80
           steps. Each with the residual (delta) off, as the sets are scored, or with `--delta` also
           VPD's own delta semantics (uniform per word for draws, one adversarial coordinate for PGD).
+          `word` runs gam_mpd::certify::adversary's per-word, per-gate ascent (every layer free), reporting
+          per word its worst KL in the box and at the corners its points round to.
   layers  cross-layer compensation: the KL with only layer l masked (the rest native), and the
           hybrids H_0 (native) .. H_4 (every layer masked), H_l masking layers < l, in total
           variation between consecutive hybrids and end to end.
@@ -54,7 +56,9 @@ parser.add_argument("--key", default=None)
 parser.add_argument("--families", default="vpd_ci,vpd_rounded,given")
 parser.add_argument("--all-on", action="store_true", help="also every subcomponent on (box)")
 parser.add_argument("--seeds", type=int, default=1, help="PGD restarts (box); with more than one, each ladder and their max go under pgd_restarts")
-parser.add_argument("--parts", default="fixed,draws,pgd", help="which parts of box to run")
+parser.add_argument("--parts", default="fixed,draws,pgd", help="which parts of box to run: fixed, draws, pgd, word")
+parser.add_argument("--word-steps", type=int, default=40, help="the per-word adversary's steps")
+parser.add_argument("--word-restarts", type=int, default=6, help="the per-word adversary's starts")
 parser.add_argument("--delta", choices=["off", "both", "only"], default="off",
                     help="VPD's residual (delta) semantics in the box: off (as the sets are scored), both, or only")
 parser.add_argument("--name", default="ours", help="the given sets' family name")
@@ -365,6 +369,86 @@ def box():
                                  "max": {str(k): max(l[k] for l in ladders) for k in steps},
                                  "mean": {str(k): float(np.mean([l[k] for l in ladders])) for k in steps}}
                 update_out(key, {"pgd_restarts": restarts, "pgd_step_size": 0.1})
+    # The per-word adversary (gam_mpd::certify::adversary): every word's own gates, all layers.
+    words = {}
+    for with_delta in () if "word" not in parts else tuple(m != "off" for m in delta_modes):
+        for name, fam in families.items():
+            box_kl, corner_kl = word_adversary(fam, with_delta)
+            tag = f"{name}/delta_{'adversarial' if with_delta else 'off'}"
+            words[tag] = {"box": {**stats(box_kl), "per_word": box_kl.tolist()},
+                          "corners": {**stats(corner_kl), "per_word": corner_kl.tolist()}}
+            log(f"word adversary {name} delta {with_delta}: box mean {box_kl.mean():.3f} median {np.median(box_kl):.3f} "
+                f"max {box_kl.max():.3f}; corners mean {corner_kl.mean():.3f} median {np.median(corner_kl):.3f} max {corner_kl.max():.3f}")
+            update_out(key, {"word_adversary": words, "word_steps": args.word_steps, "word_restarts": args.word_restarts})
+
+
+def word_adversary(fam: Family, with_delta: bool) -> tuple[np.ndarray, np.ndarray]:
+    """gam_mpd::certify::adversary on this harness's program: per word, the largest KL over every point
+    visited by `--word-restarts` sign-ascent runs of `--word-steps` steps on each word's own off gates
+    (and, with the residual, each word's residual gate), starting from the lower ends (the masks), the
+    upper ends, the middles, then uniform draws, the step shrinking linearly from half of each gate's
+    width to 1/(2 steps) of it, ascending the total KL; also, per word, the largest KL at the corners
+    those points round to (off gates to the nearer of 0 and 1): the box claim and the corners-only claim,
+    each a lower bound on its worst case."""
+    T, R = args.word_steps, args.word_restarts
+    best = np.full(args.rows * S, -np.inf)
+    best_corner = np.full(args.rows * S, -np.inf)
+    for i in range(n_mb):
+        g = fam.dense(i)
+        gen = torch.Generator(device=DEV).manual_seed(0xAD5 + i)
+        sl = slice(i * MB * S, (i + 1) * MB * S)
+        for restart in range(R):
+            point = {}
+            for n in names:
+                lo, hi = g[n], torch.ones_like(g[n])
+                if restart == 0:
+                    point[n] = lo.clone()
+                elif restart == 1:
+                    point[n] = hi.clone()
+                elif restart == 2:
+                    point[n] = 0.5 * (lo + hi)
+                else:
+                    point[n] = lo + (hi - lo) * torch.rand(lo.shape, generator=gen, device=DEV)
+            delta = None
+            if with_delta:
+                shape = g[names[0]].shape[:-1]
+                delta = {n: (torch.zeros(shape, device=DEV) if restart == 0 else torch.ones(shape, device=DEV) if restart == 1
+                             else torch.full(shape, 0.5, device=DEV) if restart == 2
+                             else torch.rand(shape, generator=gen, device=DEV)) for n in names}
+            for step in range(T + 1):
+                with torch.no_grad():
+                    corner = {n: torch.where(g[n] > 0, g[n], (point[n] > 0.5).float()) for n in names}
+                    corner_delta = None if delta is None else {n: (d > 0.5).float() for n, d in delta.items()}
+                    best_corner[sl] = np.maximum(best_corner[sl], kl_rows(i, corner, corner_delta if with_delta else zero_delta(g)).cpu().numpy().ravel())
+                    del corner, corner_delta
+                leaves = [point[n].requires_grad_(True) for n in names] + ([delta[n].requires_grad_(True) for n in names] if with_delta else [])
+                with torch.enable_grad():
+                    set_masks(point, delta if with_delta else zero_delta(g))
+                    try:
+                        logits = target(ids[i * MB:(i + 1) * MB])
+                    finally:
+                        vpd.clear()
+                    kl = kl_per_pos(logits, targets[i])
+                    del logits
+                    best[sl] = np.maximum(best[sl], kl.detach().cpu().numpy().ravel())
+                    if step == T:
+                        del kl
+                        break
+                    grads = torch.autograd.grad(kl.sum(), leaves)
+                    del kl
+                rate = 0.5 - (0.5 - 0.5 / T) * step / max(max(T, 2) - 1, 1)
+                with torch.no_grad():
+                    for j, n in enumerate(names):
+                        width = 1 - g[n]
+                        point[n] = (point[n].detach() + rate * width * grads[j].sign()).clamp(min=g[n], max=1.0)
+                        if with_delta:
+                            delta[n] = (delta[n].detach() + rate * grads[len(names) + j].sign()).clamp(0.0, 1.0)
+                del grads, leaves
+                empty_cache()
+            del point, delta
+        del g
+        empty_cache()
+    return best, best_corner
 
 
 @torch.no_grad()
