@@ -195,42 +195,33 @@ fn replaced(blocked: &Blocked, k: usize, c: usize, u: &Array2<f64>, v: &Array2<f
 }
 
 /// The decoded point: every block replaced by its description under `geometry`, each description's
-/// error priced by the exact KL of decoding that block alone (`Geometry::describe_exact`, measured
+/// error priced by the exact KL of decoding it after every block before it (`Geometry::describe_exact`, measured
 /// per word it runs on), then every block decoded together and measured by the exact masked forward
 /// (`coded` only measures, so its description is irrelevant here). `(description bits, KL nats,
 /// total bits)` per word, the total the description bits of the blocks on plus `n KL / ln 2`.
 fn decoded(coded: &Coded<'_>, blocked: &Blocked, geometry: &Structured) -> Result<(f64, f64, f64), String> {
-    use rayon::prelude::*;
-    let (base, _) = measure(coded, blocked)?;
     let mut out = blocked.clone();
-    let mut prices = Vec::new();
+    let mut prices: Vec<Vec<f64>> = Vec::new();
+    // Blocks are priced in decoding order, each against every block already decoded, so an error
+    // that only shows once its reads move is paid where it arises.
     for (k, ranks) in blocked.ranks.iter().enumerate() {
-        let described: Vec<gam_mpd::describe::Description> = (0..ranks.len())
-            .into_par_iter()
-            .map(|c| {
-                let (u, v) = blocked.factors(k, c);
-                let on: f64 = blocked.masks.iter().map(|m| m[k].column(c).sum()).sum::<f64>().max(1.0);
-                geometry.sites[k].describe_exact(u, v, &mut |d| {
-                    let (bits, _) = measure(coded, &replaced(blocked, k, c, &d.u, &d.v)?)?;
-                    let measured = (bits.kl - base.kl) / on;
-                    if u.nrows() > 1 {
-                        eprintln!("  site {k} block {c} (rank {}): {:.0} bits, error predicted {:.1}, measured {measured:.1}", u.nrows(), d.bits(), d.kl_bits);
-                    }
-                    Ok(measured)
-                })
-            })
-            .collect::<Result<_, String>>()?;
-        let widths: Vec<usize> = described.iter().map(|d| d.u.nrows()).collect();
-        let site: Vec<f64> = described.iter().map(|d| d.bits()).collect();
-        let (us, vs): (Vec<_>, Vec<_>) = described.into_iter().map(|d| (d.u, d.v)).unzip();
-        let uv: Vec<_> = us.iter().map(|x| x.view()).collect();
-        let vv: Vec<_> = vs.iter().map(|x| x.view()).collect();
-        out.libraries[k] = std::sync::Arc::new(Library {
-            u: ndarray::concatenate(ndarray::Axis(0), &uv).map_err(|e| e.to_string())?,
-            v: ndarray::concatenate(ndarray::Axis(0), &vv).map_err(|e| e.to_string())?,
-            mean: blocked.libraries[k].mean.clone(),
-        });
-        out.ranks[k] = widths;
+        let mut site = Vec::new();
+        for c in 0..ranks.len() {
+            let (base, _) = measure(coded, &out)?;
+            let (u, v) = blocked.factors(k, c);
+            let on: f64 = blocked.masks.iter().map(|m| m[k].column(c).sum()).sum::<f64>().max(1.0);
+            let current = out.clone();
+            let d = geometry.sites[k].describe_exact(u, v, &mut |d| {
+                let (bits, _) = measure(coded, &replaced(&current, k, c, &d.u, &d.v)?)?;
+                let measured = (bits.kl - base.kl) / on;
+                if u.nrows() > 1 {
+                    eprintln!("  site {k} block {c} (rank {}): {:.0} bits, error predicted {:.1}, measured {measured:.1}", u.nrows(), d.bits(), d.kl_bits);
+                }
+                Ok(measured)
+            })?;
+            site.push(d.bits());
+            out = replaced(&out, k, c, &d.u, &d.v)?;
+        }
         prices.push(site);
     }
     let (bits, _) = measure(coded, &out)?;

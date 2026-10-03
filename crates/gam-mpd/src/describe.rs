@@ -927,7 +927,7 @@ impl Geometry {
     /// ranked prefixes, a scan ending where the structure bits and one bit a paired column already
     /// exceed the best total.
     pub fn describe(&self, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<Description, String> {
-        self.describe_at(u, v, 1.0)
+        self.describe_at(u, v, 1.0, true)
     }
 
     /// The description whose error is priced by the exact KL `exact` gives (bits, at the metric's
@@ -943,28 +943,37 @@ impl Geometry {
         v: ArrayView2<'_, f64>,
         exact: &mut dyn FnMut(&Description) -> Result<f64, String>,
     ) -> Result<Description, String> {
-        let mut calibration = 1.0_f64;
+        // Every family, then the identity charts alone: a chart whose error the local metric cannot
+        // see (a reader outside a ReLU's active set, a direction only the decoded upstream excites)
+        // is never repaired by a larger price, while the identity converges as precision grows.
         let mut best: Option<Description> = None;
-        for _ in 0..8 {
-            let mut d = self.describe_at(u, v, calibration)?;
-            let predicted = d.kl_bits / calibration;
-            let measured = exact(&d)?.max(0.0);
-            d.kl_bits = measured;
-            if best.as_ref().is_none_or(|b| d.total() < b.total()) {
-                best = Some(d);
+        for charts in [true, false] {
+            let mut calibration = 1.0_f64;
+            let mut last = f64::NAN;
+            for _ in 0..8 {
+                let mut d = self.describe_at(u, v, calibration, charts)?;
+                let predicted = d.kl_bits / calibration;
+                let measured = exact(&d)?.max(0.0);
+                d.kl_bits = measured;
+                if best.as_ref().is_none_or(|b| d.total() < b.total()) {
+                    best = Some(d);
+                }
+                // Within a factor of two of its prediction, or not moved by a larger price.
+                if measured <= 2.0 * predicted + 1.0 || measured == last {
+                    break;
+                }
+                last = measured;
+                // A prediction of nothing says only that the price must grow: at most by 2^20 a
+                // round, so the scale stays finite.
+                calibration *= (measured / predicted.max(f64::MIN_POSITIVE)).min(1048576.0);
             }
-            if measured <= 2.0 * predicted + 1.0 {
-                break;
-            }
-            // A prediction of nothing says only that the price must grow: at most by 2^20 a round,
-            // so the scale stays finite.
-            calibration *= (measured / predicted.max(f64::MIN_POSITIVE)).min(1048576.0);
         }
         best.ok_or_else(|| "no description".to_string())
     }
 
     /// [`Geometry::describe`] with the metric's price scaled by `calibration`.
-    fn describe_at(&self, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>, calibration: f64) -> Result<Description, String> {
+    /// With `charts` false, only the identity charts (the generic family).
+    fn describe_at(&self, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>, calibration: f64, charts: bool) -> Result<Description, String> {
         let metric = &self.metric;
         let block = Block::new(u, v, metric, calibration);
         let rank = u.nrows();
@@ -978,8 +987,9 @@ impl Geometry {
             self.readers.iter().map(|c| prefixes(&c.chart, &ranked(c, &block.cv, &block.gu), block.scale)).collect();
         let context = Context { block: &block, rank, charts_bits, core_bits };
         let mut best: Option<Description> = None;
-        for (i, writer) in self.writers.iter().enumerate() {
-            for (j, reader) in self.readers.iter().enumerate() {
+        let used = |n: usize| if charts { n } else { 1 };
+        for (i, writer) in self.writers.iter().enumerate().take(used(self.writers.len())) {
+            for (j, reader) in self.readers.iter().enumerate().take(used(self.readers.len())) {
                 let (ws, rs) = (&writer_sets[i], &reader_sets[j]);
                 let (Some(mut wg), Some(mut rg)) = (ws.last().cloned(), rs.last().cloned()) else { continue };
                 // A side with one set is scanned once, by whichever pass comes first.
@@ -1021,7 +1031,7 @@ impl Geometry {
                 }
             }
         }
-        if let Some(whitening) = &self.whitening {
+        if let Some(whitening) = self.whitening.as_ref().filter(|_| charts) {
             let w = u.t().dot(&v);
             for r in 1..=rank.min(w.nrows()) {
                 if let Some(candidate) = same_subspace(&block, &w, whitening, r, charts_bits + core_bits)?
