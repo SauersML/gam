@@ -60,14 +60,26 @@ fn kt_code_lengths() {
 fn planted_groups_become_the_vocabulary() {
     let (priced, _) = planted(3000, 0xC0);
     let program = vec![PROGRAM; 40];
-    let fitted = fit(&priced, &program, 40.0);
+    // The exact KL of a program: every needed member it leaves off, at its price (observations
+    // ln 2, so a price in bits is its KL in nats).
+    let mut oracle = |programs: &[Vec<u32>]| -> Result<Vec<f64>, String> {
+        Ok(programs
+            .iter()
+            .enumerate()
+            .map(|(t, p)| {
+                let k = priced.sets.indptr[t]..priced.sets.indptr[t + 1];
+                priced.sets.row(t).iter().zip(&priced.missing[k]).filter(|(j, _)| p.binary_search(*j).is_err()).map(|(_, d)| d).sum()
+            })
+            .collect())
+    };
+    let fitted = fit(&priced, &program, 40.0, std::f64::consts::LN_2, &mut oracle).expect("fit");
     let mut vocabulary: Vec<Vec<u32>> = fitted.concepts.iter().filter(|c| c.invocations() > 0).map(|c| c.members.clone()).collect();
     vocabulary.sort();
     let want: Vec<Vec<u32>> = PLANTED.iter().map(|r| r.clone().collect()).collect();
     assert_eq!(vocabulary, want, "the passenger and the cheap noise must stay out of the vocabulary");
     // Naming the groups costs less than running every word's own set as its program.
     let own: f64 = priced.program_bits(&program).iter().sum();
-    assert!(fitted.total_bits() < own, "{} bits vs {own} for the words' own sets", fitted.total_bits());
+    assert!(fitted.total_bits < own, "{} bits vs {own} for the words' own sets", fitted.total_bits);
 
     // Fresh words: the names alone decode to the needed groups.
     let model = Model::new(&fitted);

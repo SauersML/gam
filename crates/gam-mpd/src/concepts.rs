@@ -34,21 +34,27 @@
 //!
 //! # The fit
 //!
-//! Given its members, a concept's invocations are fitted by hard EM on its exact bits: the rate
-//! `π` from `Z`, then a word invokes the concept when its name and program cost less than the error
-//! it removes, `−log₂ π + B_g < −log₂(1 − π) + m_tg` (only a word that needs some member may
-//! invoke it), until `Z` repeats or the bits stop falling; the least total seen is kept.
+//! Given its members, a concept's invocations are fitted by hard EM on its bits: the rate `π` from
+//! `Z`, then a word invokes the concept when its name and program cost less than the error it
+//! removes, `−log₂ π + B_g < −log₂(1 − π) + m_tg` (only a word that needs some member may invoke
+//! it), until `Z` repeats or the bits stop falling; the least total seen is kept.
 //!
 //! Every subcomponent that ran starts as its own concept. Groups merge: a merge can only save on
 //! words that need both groups (elsewhere the merged concept costs at least what the cheaper of
 //! the two choices did), at most one name per such word, `log₂ 2(T + 1)` bits, plus the two
 //! libraries it replaces. Each open group proposes partners in order of shared words while that
 //! bound exceeds the merged concept's library; it proposes the first whose fitted merge lowers the
-//! total and closes when none does. A greedy matching of the proposals, most saving first, is
-//! applied at once. Each merged concept then peels: a member whose own concept would cost less
-//! than its share of the group (it disagrees with the others on when it is needed) leaves, the
-//! most saving first, while that lowers the total. Rounds repeat until no group is open. Nothing
-//! is kept unless the code is shorter.
+//! priced total and closes when none does. A greedy matching of the proposals, most saving first,
+//! is formed, and each merged concept peels: a member whose own concept would cost less than its
+//! share of the group (it disagrees with the others on when it is needed) leaves, the most saving
+//! first, while that lowers the priced total.
+//!
+//! The prices `d_tj` are single drops; dropping several members at once interacts. So the priced
+//! total only proposes, and the exact total decides: every word's text is decoded, the model runs
+//! each word's decoded program ([`Oracle`]), and the code is names + program + library +
+//! `n Σ_t KL_t / ln 2` with the exact KL. A round's changes are kept only when the exact total
+//! falls; a refused set is halved by predicted saving until a single refused change is set aside
+//! (its pair is never proposed again). Rounds repeat until no group is open.
 //!
 //! # Coding new words
 //!
@@ -253,9 +259,13 @@ pub struct Round {
     pub concepts: usize,
     pub vocabulary: usize,
     pub open: usize,
-    pub merges: usize,
+    /// Changes proposed, tried in the exact code, and kept.
+    pub proposed: usize,
+    pub kept: usize,
     pub peels: usize,
+    /// The exact total after the round, and its mean KL per word.
     pub total_bits: f64,
+    pub kl: f64,
 }
 
 /// The fitted vocabulary of a set of words.
@@ -267,13 +277,39 @@ pub struct Fit {
     /// Every concept, in the vocabulary or not (a subcomponent alone that no word invokes).
     pub concepts: Vec<Concept>,
     pub rounds: Vec<Round>,
+    /// The exact total (module note, "The fit") and every fitted word's exact KL.
+    pub total_bits: f64,
+    pub kl: Vec<f64>,
 }
 
-impl Fit {
-    /// The total of the module note's code over the fitted words.
-    pub fn total_bits(&self) -> f64 {
-        self.concepts.iter().map(|c| c.total(self.universe, self.label_bits)).sum()
+/// Runs the model on programs: per word, the exact KL in nats of the model restricted to that
+/// word's program (every listed subcomponent on, every other off).
+pub type Oracle<'a> = dyn FnMut(&[Vec<u32>]) -> Result<Vec<f64>, String> + 'a;
+
+/// The exact code of a vocabulary (module note, "The fit"): names, programs and library from the
+/// concepts, the KL from the oracle on every word's decoded program.
+fn exact<'a>(concepts: impl Iterator<Item = &'a Concept>, words: u64, universe: usize, label_bits: f64, observations: f64, oracle: &mut Oracle<'_>) -> Result<(f64, Vec<f64>), String> {
+    let mut programs: Vec<Vec<u32>> = vec![Vec::new(); words as usize];
+    let mut bits = 0.0;
+    for c in concepts {
+        let z = c.invocations() as u64;
+        if z > 0 {
+            bits += kt_bits(z, words) + z as f64 * c.program + c.library(universe, label_bits);
+        }
+        for (t, on) in c.needed.iter().zip(&c.invoked) {
+            if *on {
+                programs[*t as usize].extend(&c.members);
+            }
+        }
     }
+    for p in &mut programs {
+        p.sort_unstable();
+    }
+    let kl = oracle(&programs)?;
+    if kl.len() != programs.len() {
+        return Err(format!("oracle: {} KLs for {} words", kl.len(), programs.len()));
+    }
+    Ok((bits + observations / LN_2 * kl.iter().sum::<f64>(), kl))
 }
 
 /// Peel a merged concept (module note, "The fit"): the member whose leaving saves the most, while
@@ -312,8 +348,9 @@ fn peel(mut c: Concept, columns: &[Vec<(u32, f64)>], program: &[f64], words: u64
 }
 
 /// Fit the vocabulary of `priced` (module note, "The fit"): `program[j]` is subcomponent `j`'s
-/// description bits and every concept's name costs `label_bits` in the library.
-pub fn fit(priced: &Priced, program: &[f64], label_bits: f64) -> Fit {
+/// description bits, every concept's name costs `label_bits` in the library, and `oracle` runs the
+/// model for the exact KL at `observations`.
+pub fn fit(priced: &Priced, program: &[f64], label_bits: f64, observations: f64, oracle: &mut Oracle<'_>) -> Result<Fit, String> {
     let universe = priced.sets.universe;
     let words = priced.sets.rows() as u64;
     let columns = priced.columns();
@@ -326,13 +363,18 @@ pub fn fit(priced: &Priced, program: &[f64], label_bits: f64) -> Fit {
         })
         .collect();
     let mut open = vec![true; concepts.len()];
+    let mut refused: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
     let lib = |c: &Concept| c.library(universe, label_bits);
+    let (mut total, mut kl) = exact(concepts.iter().flatten(), words, universe, label_bits, observations, oracle)?;
+    log::info!("concepts: start {} concepts, exact total {total:.0} bits", concepts.len());
     let mut rounds = Vec::new();
     loop {
         let alive: Vec<usize> = (0..concepts.len()).filter(|g| concepts[*g].is_some()).collect();
-        let total: f64 = alive.iter().map(|g| concepts[*g].as_ref().expect("alive").total(universe, label_bits)).sum();
         let vocabulary = alive.iter().filter(|g| concepts[**g].as_ref().expect("alive").invocations() > 0).count();
         let opened: Vec<usize> = alive.iter().copied().filter(|g| open[*g]).collect();
+        if opened.is_empty() {
+            break;
+        }
         // Which concepts each word needs.
         let mut start = vec![0usize; words as usize + 1];
         for g in &alive {
@@ -360,7 +402,7 @@ pub fn fit(priced: &Priced, program: &[f64], label_bits: f64) -> Fit {
                     for t in &a.needed {
                         for h in &needing[start[*t as usize]..start[*t as usize + 1]] {
                             let h = *h as usize;
-                            if h != g {
+                            if h != g && !refused.contains(&(g.min(h), g.max(h))) {
                                 if count[h] == 0 {
                                     touched.push(h);
                                 }
@@ -401,41 +443,68 @@ pub fn fit(priced: &Priced, program: &[f64], label_bits: f64) -> Fit {
         }
         accepted.sort_by(|x, y| x.2.total_cmp(&y.2).then(x.0.cmp(&y.0)));
         let mut used = vec![false; concepts.len()];
-        let mut merged_now = Vec::new();
-        for (g, h, _, merged) in accepted {
+        // Each change: the pair it replaces, the concepts it becomes, its predicted saving.
+        let mut changes: Vec<(usize, usize, Vec<Concept>, f64)> = Vec::new();
+        for (g, h, delta, merged) in accepted {
             if used[g] || used[h] {
                 continue;
             }
             used[g] = true;
             used[h] = true;
+            changes.push((g, h, vec![merged], -delta));
+        }
+        let peeled: Vec<(Vec<Concept>, f64, usize)> =
+            changes.par_iter().map(|(_, _, parts, _)| peel(parts[0].clone(), &columns, program, words, universe, label_bits)).collect();
+        let mut peels = 0;
+        for (change, (parts, saved, n)) in changes.iter_mut().zip(peeled) {
+            change.2 = parts;
+            change.3 += saved;
+            peels += n;
+        }
+        changes.sort_by(|x, y| y.3.total_cmp(&x.3).then(x.0.cmp(&y.0)));
+        let proposed = changes.len();
+        // The exact total decides: the most saving `k` changes, halved while refused.
+        let mut k = changes.len();
+        let mut kept = 0;
+        while k > 0 {
+            let gone: std::collections::HashSet<usize> = changes[..k].iter().flat_map(|c| [c.0, c.1]).collect();
+            let candidate = concepts
+                .iter()
+                .enumerate()
+                .filter(|(g, c)| c.is_some() && !gone.contains(g))
+                .map(|(_, c)| c.as_ref().expect("alive"))
+                .chain(changes[..k].iter().flat_map(|c| c.2.iter()));
+            let (t, k_l) = exact(candidate, words, universe, label_bits, observations, oracle)?;
+            if t < total {
+                (total, kl) = (t, k_l);
+                kept = k;
+                break;
+            }
+            if k == 1 {
+                refused.insert((changes[0].0.min(changes[0].1), changes[0].0.max(changes[0].1)));
+            }
+            k /= 2;
+        }
+        for (g, h, parts, _) in changes.drain(..kept) {
             concepts[g] = None;
             concepts[h] = None;
-            merged_now.push(merged);
-        }
-        let merges = merged_now.len();
-        let mut peels = 0;
-        for merged in merged_now {
-            let (parts, _, peeled) = peel(merged, &columns, program, words, universe, label_bits);
-            peels += peeled;
             for part in parts {
                 concepts.push(Some(part));
                 open.push(true);
             }
         }
-        rounds.push(Round { concepts: alive.len(), vocabulary, open: opened.len(), merges, peels, total_bits: total });
+        let mean_kl = kl.iter().sum::<f64>() / words.max(1) as f64;
+        rounds.push(Round { concepts: alive.len(), vocabulary, open: opened.len(), proposed, kept, peels, total_bits: total, kl: mean_kl });
         log::info!(
-            "concepts: round {} concepts {} vocabulary {} open {} merges {merges} peels {peels} total {total:.0} bits",
+            "concepts: round {} concepts {} vocabulary {} open {} proposed {proposed} kept {kept} peels {peels} exact total {total:.0} bits, KL {mean_kl:.4}",
             rounds.len(),
             alive.len(),
             vocabulary,
             opened.len()
         );
-        if opened.is_empty() {
-            break;
-        }
     }
     let concepts: Vec<Concept> = concepts.into_iter().flatten().collect();
-    Fit { universe, words, label_bits, concepts, rounds }
+    Ok(Fit { universe, words, label_bits, concepts, rounds, total_bits: total, kl })
 }
 
 /// A concept as the frozen model holds it.

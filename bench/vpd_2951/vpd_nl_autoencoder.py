@@ -943,6 +943,56 @@ def stage_textonly():
                "all_program": float(prog_bits.sum())}, open(OUT / "textonly.json", "w"))
 
 
+def stage_oracle():
+    """The model as the concept fit's oracle (examples/mpd_nl_concepts_2951.rs): reads programs for
+    every word of the sequences argv[2] (lo:hi of the masks' rows) on stdin and answers each word's
+    exact KL(model || model running only its program), f32 nats, on stdout. A batch of rows per
+    forward; the clean logits are kept."""
+    import torch
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from vpd_eval import kl_per_pos
+
+    lo, hi = (int(x) for x in sys.argv[2].split(":"))
+    z, indptr, indices, offsets, names = sets()
+    site = site_of(offsets)
+    target, C = load_light()
+    dev = next(iter(target.buffers())).device
+    batch = int(os.environ.get("NLAE_ORACLE_BATCH", "8"))
+    ids = torch.tensor(z["ids"][lo:hi], device=dev)
+    with torch.no_grad():
+        clean = [target(ids[b:b + batch]) for b in range(0, hi - lo, batch)]
+    stdin, stdout = sys.stdin.buffer, sys.stdout.buffer
+    calls = 0
+    while True:
+        head = stdin.read(16)
+        if len(head) < 16:
+            return
+        words, members = np.frombuffer(head, dtype="<u8")
+        ptr = np.frombuffer(stdin.read(8 * (int(words) + 1)), dtype="<u8").astype(np.int64)
+        glob = np.frombuffer(stdin.read(4 * int(members)), dtype="<u4").astype(np.int64)
+        assert words == (hi - lo) * CONTEXT, f"oracle: {words} words for {hi - lo} sequences"
+        word = np.repeat(np.arange(int(words)), np.diff(ptr))
+        out = []
+        for b0, tgt in zip(range(0, hi - lo, batch), clean):
+            B = tgt.shape[0]
+            sel = (word >= b0 * CONTEXT) & (word < (b0 + B) * CONTEXT)
+            w, g = word[sel] - b0 * CONTEXT, glob[sel]
+            masks = {n: torch.zeros(B, CONTEXT, C[n], device=dev) for n in names}
+            for s_, n in enumerate(names):
+                k = site[g] == s_
+                if k.any():
+                    wt = torch.tensor(w[k], device=dev)
+                    masks[n][wt // CONTEXT, wt % CONTEXT, torch.tensor(g[k] - offsets[s_], device=dev)] = 1.0
+            with torch.no_grad():
+                out.append(kl_per_pos(masked(target, ids[b0:b0 + B], masks), tgt).reshape(-1).float().cpu().numpy())
+            del masks
+        stdout.write(np.concatenate(out).astype("<f4").tobytes())
+        stdout.flush()
+        calls += 1
+        print(f"oracle call {calls}: mean KL {np.concatenate(out).mean():.4f}", file=sys.stderr, flush=True)
+
+
 def stage_kl():
     """KL(model || masked model) per eval word for every decoded program, plus VPD's own set and
     the empty program."""
@@ -1176,6 +1226,9 @@ if __name__ == "__main__":
               "bits": stage_bits, "kl": stage_kl, "report": stage_report, "figure": stage_figure,
               "controls": stage_controls, "names": stage_names, "fluent": stage_fluent,
               "allon": stage_allon, "dropkl": stage_dropkl, "program": stage_program,
-              "textonly": stage_textonly}
+              "textonly": stage_textonly, "oracle": stage_oracle}
+    if sys.argv[1] == "oracle":
+        stage_oracle()
+        sys.exit(0)
     for stage in sys.argv[1:]:
         stages[stage]()
