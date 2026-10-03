@@ -304,6 +304,11 @@ def cmd_sets(run: Path, device: str, check: int) -> None:
     quick = {"rows": check, "l0": float(np.mean(l0)), "kl": float(np.mean(kl)), "agree": float(np.mean(agree))} if check else {}
     json.dump({"delta_relative": {k: v["delta_relative"] for k, v in manifest.items()}, "check": quick}, open(run / "sets.json", "w"), indent=1)
     print(f"{run}: library {offsets[-1]} subcomponents, {total / (SCORED_ROWS * ids.shape[1]):.1f} on per position; check {quick}")
+    # The scorer's sets directory (`mpd_pieces_masked_2951 ... SETS`).
+    import subprocess
+
+    subprocess.run([sys.executable, str(Path(__file__).parent / "vpd_sets_export.py"), str(run / "sets"),
+                    "--masks", str(run / "masks.npz"), "--library", str(library)], check=True)
 
 
 SCORER = Path.home() / "mpd-data/engine/bin/mpd_pieces_masked_race"
@@ -315,8 +320,6 @@ def cmd_score(run: Path, lease: int, observations: str) -> None:
     the 96 held-out rows counted by the context coder."""
     import subprocess
 
-    subprocess.run([sys.executable, str(Path(__file__).parent / "vpd_sets_export.py"), str(run / "sets"),
-                    "--masks", str(run / "masks.npz"), "--library", str(run / "library")], check=True)
     stem = f"score_o{observations}"
     with open(run / f"{stem}.log", "w") as log:
         subprocess.run([str(Path.home() / ".local/bin/mem-lease"), str(lease), str(SCORER), str(FRONTIER32), str(run / f"{stem}.json"),
