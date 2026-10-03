@@ -53,6 +53,7 @@ parser.add_argument("--steps", default="20,40,80")
 parser.add_argument("--key", default=None)
 parser.add_argument("--families", default="vpd_ci,vpd_rounded,given")
 parser.add_argument("--all-on", action="store_true", help="also every subcomponent on (box)")
+parser.add_argument("--seeds", type=int, default=1, help="PGD restarts (box); with more than one, each ladder and their max go under pgd_restarts")
 parser.add_argument("--parts", default="fixed,draws,pgd", help="which parts of box to run")
 parser.add_argument("--delta", choices=["off", "both", "only"], default="off",
                     help="VPD's residual (delta) semantics in the box: off (as the sets are scored), both, or only")
@@ -339,14 +340,25 @@ def box():
             log(f"draws {name} delta {delta_mode}: mean {kl.mean():.4f} worst-of-{args.draws} mean {worst.mean():.4f}")
             update_out(key, {"draws": draws, "draws_per_word": args.draws})
     # VPD's eval adversary: one shared source per subcomponent (plus one delta coordinate).
-    pgd = {}
+    pgd, restarts = {}, {}
     for with_delta in () if "pgd" not in parts else tuple(m != "off" for m in delta_modes):
         for name, fam in families.items():
-            ladder = pgd_recon(vpd, ids, fam, steps, step_size=0.1, with_delta=with_delta, seed=0)
-            pgd[f"{name}/delta_{'adversarial' if with_delta else 'off'}"] = {str(k): v for k, v in ladder.items()}
-            log(f"pgd {name} delta {with_delta}: {ladder}")
-            update_out(key, {"pgd_shared": pgd, "pgd_step_size": 0.1})
-            empty_cache()
+            # Sign-step PGD from a random start is one sample of the adversary: `--seeds` restarts,
+            # the claim's worst case being the largest KL any of them finds.
+            ladders = []
+            for seed in range(args.seeds):
+                ladders.append(pgd_recon(vpd, ids, fam, steps, step_size=0.1, with_delta=with_delta, seed=seed))
+                log(f"pgd {name} delta {with_delta} seed {seed}: {ladders[-1]}")
+                empty_cache()
+            tag = f"{name}/delta_{'adversarial' if with_delta else 'off'}"
+            if args.seeds == 1:
+                pgd[tag] = {str(k): v for k, v in ladders[0].items()}
+                update_out(key, {"pgd_shared": pgd, "pgd_step_size": 0.1})
+            else:
+                restarts[tag] = {"seeds": [{str(k): v for k, v in l.items()} for l in ladders],
+                                 "max": {str(k): max(l[k] for l in ladders) for k in steps},
+                                 "mean": {str(k): float(np.mean([l[k] for l in ladders])) for k in steps}}
+                update_out(key, {"pgd_restarts": restarts, "pgd_step_size": 0.1})
 
 
 @torch.no_grad()
