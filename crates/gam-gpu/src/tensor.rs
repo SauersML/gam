@@ -1029,7 +1029,7 @@ fn host_gemm(
 
 #[cfg(target_os = "linux")]
 mod cuda {
-    use super::{Arithmetic, Data, IndexData, Indices, Op, RmsMode, Tensor, foreign, shape};
+    use super::{Arithmetic, ColumnBlocks, Data, IndexData, Indices, Op, RmsMode, Tensor, foreign, shape};
     use crate::gpu_error::{GpuError, GpuResultExt};
     use cudarc::cublas::sys::{cublasMath_t, cublasOperation_t};
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
