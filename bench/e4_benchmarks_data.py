@@ -118,7 +118,8 @@ def stage_score(base_only=False):
         models, meta = {}, {}
     else:
         target, W0, models, meta = E.edit_variants()
-    names = ["base"] + list(models)
+        models = {k: v for k, v in models.items() if not k.startswith("vpd_a")}  # LoRAs and their matched VPD edits
+    names = (["base"] if base_only else []) + list(models)
     resid, final, head = E.split_forward(target)
     nR = len(lens)
     out = OUTD / ("scores_base.npz" if base_only else "scores.npz")
@@ -126,7 +127,7 @@ def stage_score(base_only=False):
     lp = np.zeros((nR, len(names)), np.float64)
     greedy = np.zeros((nR, len(names)), bool)
     order = np.argsort(lens, kind="stable")
-    TOK = 8000  # tokens per batch
+    TOK = 4096  # tokens per batch
     i = nb = 0
     if part.exists():  # resume a killed run
         z = np.load(part)
@@ -135,34 +136,36 @@ def stage_score(base_only=False):
             log(f"resuming at request {i}")
     with torch.no_grad():
         while i < nR:
-            n = max(1, TOK // int(lens[order[i]]))
-            while n > 1 and n * int(lens[order[min(nR, i + n) - 1]]) > TOK:  # lengths ascend: the last is the longest
-                n = (n + 1) // 2
-            j = min(nR, i + n)
+            # MPS compiles and caches a graph per tensor shape, so shapes come from a few buckets: width a multiple of
+            # 32, rows = TOK // width (padding rows are all-padding and ignored), head blocks of exactly 512 positions
+            Lb = -(-int(lens[order[i]]) // 32) * 32
+            j = min(nR, i + TOK // Lb)
+            j = i + int(np.searchsorted(lens[order[i:j]], Lb, side="right"))
             idx = order[i:j]
-            Lm = int(lens[idx].max())
-            ids = np.zeros((len(idx), Lm), np.int64)
+            Lm = Lb + 1
+            ids = np.zeros((TOK // Lb, Lm), np.int64)
             for r, q in enumerate(idx):
                 ids[r, :lens[q]] = rq["flat"][offs[q]:offs[q + 1]]
             ids_t = torch.from_numpy(ids).to("mps")
             # scored positions: predicting token t+1 for the last n_cont tokens of each request
             rr = np.concatenate([np.full(n_cont[q], r) for r, q in enumerate(idx)])
             pp = np.concatenate([np.arange(lens[q] - n_cont[q] - 1, lens[q] - 1) for q in idx])
-            tgt = ids_t[torch.from_numpy(rr).to("mps"), torch.from_numpy(pp + 1).to("mps")]
-            rr_t, pp_t = torch.from_numpy(rr).to("mps"), torch.from_numpy(pp).to("mps")
-            seg = torch.from_numpy(np.repeat(np.arange(len(idx)), n_cont[idx])).to("mps")
+            sg = np.repeat(np.arange(len(idx)), n_cont[idx])
+            pad = -len(rr) % 512  # padded positions read row 0, position 0, and are summed into a discarded column
+            rr, pp, sg = np.r_[rr, np.zeros(pad, int)], np.r_[pp, np.zeros(pad, int)], np.r_[sg, np.full(pad, ids.shape[0])]
+            rr_t, pp_t, seg = (torch.from_numpy(a).to("mps") for a in (rr, pp, sg))
+            tgt = ids_t[rr_t, pp_t + 1]
             xmid, g2 = resid(ids_t[:, :-1])
-            S = torch.zeros(len(names), len(idx), device="mps")
-            G = torch.zeros(len(names), len(idx), device="mps")
+            S = torch.zeros(len(names), ids.shape[0] + 1, device="mps")
+            G = torch.zeros(len(names), ids.shape[0] + 1, device="mps")
             for k, nm in enumerate(names):
                 x = final(xmid, g2, W0 if nm == "base" else W0 + models[nm])[rr_t, pp_t]
                 for c in range(0, len(x), 512):
                     h = head(x[c:c + 512])
-                    sc = seg[c:c + 512]
-                    S[k].index_add_(0, sc, h.gather(-1, tgt[c:c + 512, None])[:, 0])  # fp32: MPS has no float64
-                    G[k].index_add_(0, sc, (h.argmax(-1) == tgt[c:c + 512]).float())
+                    S[k].index_add_(0, seg[c:c + 512], h.gather(-1, tgt[c:c + 512, None])[:, 0])  # fp32: MPS has no float64
+                    G[k].index_add_(0, seg[c:c + 512], (h.argmax(-1) == tgt[c:c + 512]).float())
                     del h
-            S, G = S.cpu().numpy(), G.cpu().numpy()  # one device sync per batch
+            S, G = S[:, :len(idx)].cpu().numpy(), G[:, :len(idx)].cpu().numpy()  # one device sync per batch
             lp[idx] = S.T
             greedy[idx] = G.T == n_cont[idx][:, None]
             i = j
@@ -173,7 +176,8 @@ def stage_score(base_only=False):
                 log(f"{i}/{nR} requests")
     np.savez(out, lp=lp, greedy=greedy, names=np.array(names))
     part.unlink(missing_ok=True)
-    json.dump({"models": names, "meta": meta}, open(OUTD / "models.json", "w"), indent=1)
+    if not base_only:
+        json.dump({"models": names, "meta": meta}, open(OUTD / "models.json", "w"), indent=1)
     log("scored")
 
 
@@ -199,20 +203,21 @@ def item_stats(rq, lp, greedy):
     return acc, accn, marg
 
 
-def boot(x, B=2000, seed=0):
+def boot(x, B=1000, seed=0):
     """Mean and 95% interval over items (columns are variants)."""
     rng = np.random.default_rng(seed)
-    w = np.stack([np.bincount(rng.integers(0, len(x), len(x)), minlength=len(x)) for _ in range(B)]).astype(float)
-    bs = (w @ x) / len(x)
+    bs = np.stack([x[rng.integers(0, len(x), len(x))].mean(0) for _ in range(B)])
     return x.mean(0), np.percentile(bs, 2.5, 0), np.percentile(bs, 97.5, 0), bs
 
 
 def stage_summarize():
     rq = build_requests()
-    f = OUTD / "scores.npz"
-    z = np.load(f if f.exists() else OUTD / "scores_base.npz")
-    lp, greedy, names = z["lp"], z["greedy"], list(z["names"])
-    meta = json.load(open(OUTD / "models.json"))["meta"]
+    zb = np.load(OUTD / "scores_base.npz")
+    lp, greedy, names = zb["lp"], zb["greedy"], ["base"]
+    if (OUTD / "scores.npz").exists():  # the edited variants, scored in a second pass
+        z = np.load(OUTD / "scores.npz")
+        lp, greedy, names = np.hstack([lp, z["lp"]]), np.hstack([greedy, z["greedy"]]), names + list(z["names"])
+    meta = json.load(open(OUTD / "models.json"))["meta"] if len(names) > 1 else {}
     acc, accn, marg = item_stats(rq, lp, greedy)
     task = rq["task"]
     chance_item = np.array([1.0 / n if n > 1 else 0.0 for n in rq["req_n"]])
