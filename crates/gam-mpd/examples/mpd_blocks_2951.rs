@@ -3,8 +3,10 @@
 //!
 //! The code is one total over every word: the description bits of the blocks that ran on it plus
 //! `n KL / ln 2` (`gam_mpd::blocks`, module note), each block described by
-//! `gam_mpd::blocks::Generic` from the sites' read second moments and logit-space Gauss–Newton
-//! metrics (`gam_mpd::describe::logit_gauss_newton`) measured on the coded inputs.
+//! its generic form on the exact lattice code (`gam_mpd::describe::Structured` over the identity
+//! charts: every real an integer multiple of its factor's dyadic step in the signed Elias δ code)
+//! in the sites' read second moments and logit-space Gauss–Newton metrics
+//! (`gam_mpd::describe::logit_gauss_newton`) measured on the coded inputs.
 //!
 //! `mpd_blocks_2951 modadd EXPORT_DIR OUT.json OBSERVATIONS [SITES|all] [given:DIR]`
 //!
@@ -39,8 +41,8 @@
 //! block along a line, not the box of k independent masks: any robustness evaluation of these
 //! points masks each block's columns together, a weaker claim than per column.
 
-use gam_mpd::blocks::{Bits, Blocked, Coded, Describe, Generic, block_cosine, fit_blocks, measure, reselect, rounding_error};
-use gam_mpd::describe::logit_gauss_newton;
+use gam_mpd::blocks::{Bits, Blocked, Coded, Describe, block_cosine, fit_blocks, measure, reselect, rounding_error};
+use gam_mpd::describe::{Geometry, Metric, Structured, logit_gauss_newton};
 use gam_mpd::import::{import, import_language_model};
 use gam_mpd::masked::{Library, Site, Target, site_statistics, sites};
 use gam_mpd::operator_program::{FamilyInputs, LabelKind, OperatorProgram};
@@ -188,7 +190,7 @@ fn modadd(dir: &Path, out: &Path, observations: f64, names: Option<Vec<String>>,
     // The second-order rounding price only proposes: each fit's decoded blocks are run exactly, and
     // while the measured rounding KL is off its price by more than a factor of two the price is
     // rescaled by their ratio and the fit repeated (`gam_mpd::blocks::rounding_error`).
-    let mut describe = Generic::new(&statistics, observations);
+    let mut describe = lattice(&statistics, observations)?;
     let mut calibrations = Vec::new();
     loop {
         let coded = Coded { model: &program, sites: chosen.clone(), batches: vec![(family.clone(), target.clone())], observations, samples: 16, describe: &describe, boxed: None };
@@ -205,9 +207,14 @@ fn modadd(dir: &Path, out: &Path, observations: f64, names: Option<Vec<String>>,
     }
 }
 
+/// Every site's generic description on the exact lattice code (module note).
+fn lattice(statistics: &[gam_mpd::pieces::Site], observations: f64) -> Result<Structured, String> {
+    Ok(Structured::new(statistics.iter().map(|s| Geometry::new(Metric::of(s, observations), Vec::new(), Vec::new(), false)).collect::<Result<_, _>>()?))
+}
+
 /// One fit of the mod-31 decomposition under `describe` (`modadd`): the checks, the rank-one point
 /// and the blocks, its report and the blocks' measured and priced rounding KL bits.
-fn fit_modadd(program: &OperatorProgram, coded: &Coded<'_>, chosen: &[Site], start: Blocked, describe: &Generic) -> Result<(Value, f64, f64), String> {
+fn fit_modadd(program: &OperatorProgram, coded: &Coded<'_>, chosen: &[Site], start: Blocked, describe: &dyn Describe) -> Result<(Value, f64, f64), String> {
     // The checks: every subcomponent on, every one off, and each site's whole map on; then the start
     // (every subcomponent on, or the given sets).
     let mut rank_one = start;
@@ -436,7 +443,7 @@ fn vpd(run: &VpdRun) -> Result<(), String> {
         }
     }
     let boxed = run.boxed.then(|| statistics.iter().map(|s| s.fisher.clone()).collect::<Vec<_>>());
-    let mut describe = Generic::new(&statistics, run.observations);
+    let mut describe = lattice(&statistics, run.observations)?;
     drop(statistics);
     let mut calibrations = Vec::new();
     // As `modadd`: refit until the decoded blocks' measured rounding KL is within a factor of two
