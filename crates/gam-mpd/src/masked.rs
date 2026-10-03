@@ -880,6 +880,10 @@ fn scored_forward(masked: &Masked, family: &FamilyInputs, target: &Target) -> Re
 /// Evaluate an actual candidate for acceptance without calculating gradients: the float64 KL per
 /// input, on the program's device twin when it has one (module note, "Devices").
 pub fn score_only(masked: &Masked, family: &FamilyInputs, target: &Target) -> Result<Array1<f64>, String> {
+    timed("score only", || score_only_untimed(masked, family, target))
+}
+
+fn score_only_untimed(masked: &Masked, family: &FamilyInputs, target: &Target) -> Result<Array1<f64>, String> {
     if let Some(values) = masked.on_device(|accelerated| accelerated.score_only(family, &accelerated.target(target)?))? {
         return Ok(values);
     }
@@ -1342,7 +1346,7 @@ fn box_worst(
         }
     }
     let seeds: Vec<u64> = (0..boxes.len()).map(|i| 0xAD5E + i as u64).collect();
-    for kl_point in super::certify::adversary_batch(masked, base, target, &boxes, ADVERSARY_STEPS, ADVERSARY_STARTS, &seeds)? {
+    for kl_point in timed("adversary", || super::certify::adversary_batch(masked, base, target, &boxes, ADVERSARY_STEPS, ADVERSARY_STARTS, &seeds))? {
         let excess = &kl_point - corner;
         for r in 0..rows {
             worst[r] = worst[r].max(excess[r]);
@@ -1960,6 +1964,26 @@ pub fn previous_inputs(inputs: &FamilyInputs) -> Vec<Option<usize>> {
     }
 }
 
+/// Wall seconds per phase of the selection since the last [`phases`] (forwards, gradients,
+/// Fishers, the box claim's parts), for the round's log line.
+static PHASES: Mutex<BTreeMap<&'static str, f64>> = Mutex::new(BTreeMap::new());
+
+/// `body`, its wall time added to phase `name` ([`phases`]).
+pub(crate) fn timed<T>(name: &'static str, body: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let out = body();
+    if let Ok(mut phases) = PHASES.lock() {
+        *phases.entry(name).or_insert(0.0) += started.elapsed().as_secs_f64();
+    }
+    out
+}
+
+/// The phases' wall times since the last call, as `name s, …` (nested phases overlap).
+fn phases() -> String {
+    let taken = PHASES.lock().map(|mut p| std::mem::take(&mut *p)).unwrap_or_default();
+    taken.iter().map(|(name, seconds)| format!("{name} {seconds:.1}s")).collect::<Vec<_>>().join(", ")
+}
+
 /// A selection round's masked forward (module note, "Devices"): the CPU's trace with the KL's
 /// cotangent at the output (`None` until a gradient needs it) and, once the box claim's excess
 /// was read off it, the float64 reverse pass that kept every masked and written node; or the
@@ -1972,6 +1996,10 @@ enum Selected {
 impl Selected {
     /// The masked forward and its KL, deferring the head cotangent on score-only trials.
     fn forward(masked: &Masked, family: &FamilyInputs, target: &Target, on_device: Option<&DeviceTarget>, cotangent: bool) -> Result<(Array1<f64>, Self), String> {
+        timed("forward", || Self::forward_untimed(masked, family, target, on_device, cotangent))
+    }
+
+    fn forward_untimed(masked: &Masked, family: &FamilyInputs, target: &Target, on_device: Option<&DeviceTarget>, cotangent: bool) -> Result<(Array1<f64>, Self), String> {
         if let Some(on_device) = on_device {
             let state = masked.on_lowered(|accelerated| {
                 if cotangent { accelerated.forward(family, on_device) }
@@ -1990,6 +2018,20 @@ impl Selected {
     /// The box claim's expected excess at `masks` ([`box_excess`]), read off this forward; on the
     /// CPU its reverse pass is kept for the mask gradients.
     fn expected_excess(
+        &mut self,
+        masked: &Masked,
+        family: &FamilyInputs,
+        target: &Target,
+        masks: &[Array2<f64>],
+        fishers: &[Array2<f64>],
+        terms: Option<&BoxTerms>,
+        on_device: Option<&DeviceTarget>,
+        for_gradients: bool,
+    ) -> Result<Array1<f64>, String> {
+        timed("expected excess", || self.expected_excess_untimed(masked, family, target, masks, fishers, terms, on_device, for_gradients))
+    }
+
+    fn expected_excess_untimed(
         &mut self,
         masked: &Masked,
         family: &FamilyInputs,
@@ -2058,6 +2100,10 @@ impl Selected {
 
     /// [`mask_gradients`] of the KL.
     fn mask_gradients(&mut self, masked: &Masked, family: &FamilyInputs, target: &Target, on_device: Option<&DeviceTarget>) -> Result<Vec<Array2<f64>>, String> {
+        timed("mask gradients", || self.mask_gradients_untimed(masked, family, target, on_device))
+    }
+
+    fn mask_gradients_untimed(&mut self, masked: &Masked, family: &FamilyInputs, target: &Target, on_device: Option<&DeviceTarget>) -> Result<Vec<Array2<f64>>, String> {
         match self {
             Self::Device(state) => masked.on_lowered(|accelerated| {
                 accelerated.prepare_gradient(state, on_device.ok_or("device: missing selection target")?)?;
@@ -2076,6 +2122,18 @@ impl Selected {
 
     /// The Fisher diagonals of [`fisher`].
     fn fisher(
+        &self,
+        masked: &Masked,
+        family: &FamilyInputs,
+        target: &Target,
+        on_device: Option<&DeviceTarget>,
+        samples: usize,
+        seed: u64,
+    ) -> Result<Vec<(Array2<f64>, Option<Array2<f64>>)>, String> {
+        timed("fisher", || self.fisher_untimed(masked, family, target, on_device, samples, seed))
+    }
+
+    fn fisher_untimed(
         &self,
         masked: &Masked,
         family: &FamilyInputs,
@@ -2799,12 +2857,13 @@ pub fn select_resumable(
         }
         let per_scored = |code: &Array1<f64>| (0..rows).filter(|r| target.scores(*r)).map(|r| code[r]).sum::<f64>() / scored.max(1) as f64;
         log::info!(
-            "selection round {round} ({:.0}s): {} inputs flipped {} entries, {kept} of {tried} sequences kept, {saved:.0} bits saved; code {:.1} -> {:.1} bits per input",
+            "selection round {round} ({:.0}s): {} inputs flipped {} entries, {kept} of {tried} sequences kept, {saved:.0} bits saved; code {:.1} -> {:.1} bits per input [{}]",
             started.elapsed().as_secs_f64(),
             flipped.iter().filter(|f| **f > 0).count(),
             flipped.iter().sum::<usize>(),
             per_scored(&before),
-            per_scored(&after)
+            per_scored(&after),
+            phases()
         );
         // Done when every sequence is done (each on its own evidence, so a batch of sequences
         // selects exactly as each would alone).
