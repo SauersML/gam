@@ -135,6 +135,9 @@ pub struct DeviceProgram {
     head: Head,
     operators: BTreeMap<(usize, Role), HeldOperator>,
     batch: Mutex<Option<Arc<PreparedBatch>>>,
+    /// The arithmetic of every product in the forward pass and the head (float64 by default; a
+    /// training step's proposals may run in TF32, its accepted point is scored again in float64).
+    arithmetic: Arithmetic,
 }
 
 struct PreparedBatch {
@@ -271,7 +274,7 @@ impl DeviceProgram {
             let held = hold(device, &source, key.1)?;
             operators.insert(key, HeldOperator { source, held });
         }
-        Ok(Self { device: device.clone(), steps, widths, head, operators, batch: Mutex::new(None) })
+        Ok(Self { device: device.clone(), steps, widths, head, operators, batch: Mutex::new(None), arithmetic: Arithmetic::F64 })
     }
 
     fn head_of(program: &OperatorProgram) -> Result<Head, String> {
@@ -313,6 +316,53 @@ impl DeviceProgram {
     #[must_use]
     pub fn classes(&self) -> usize {
         self.head.classes
+    }
+
+    /// Every node's width.
+    #[must_use]
+    pub fn widths(&self) -> &[usize] {
+        &self.widths
+    }
+
+    /// A dense operator's device copy (an affine term's `A` of `x Aᵀ`).
+    pub fn dense(&self, op: usize) -> Result<&Tensor, String> {
+        match self.held(op, Role::Product)? {
+            Held::Dense(a) => Ok(a),
+            _ => Err(format!("device: operator {op} is not held dense")),
+        }
+    }
+
+    /// A dense operator's device copy to change in place (a trained library); the program's
+    /// host operator no longer describes it until [`Self::refresh`] from a program holding it.
+    pub fn dense_mut(&mut self, op: usize) -> Result<&mut Tensor, String> {
+        match self.operators.get_mut(&(op, Role::Product)).map(|h| &mut h.held) {
+            Some(Held::Dense(a)) => Ok(a),
+            _ => Err(format!("device: operator {op} is not held dense")),
+        }
+    }
+
+    /// The logits of every row, on the device (a target).
+    pub fn logits_on_device(&self, trace: &DeviceTrace) -> Result<Tensor, String> {
+        let hidden = trace.value(self.head.hidden)?;
+        let mut out = self.device.zeros(trace.rows, self.head.classes).map_err(error)?;
+        let tile = self.tile_rows();
+        for start in (0..trace.rows).step_by(tile) {
+            let n = tile.min(trace.rows - start);
+            let logits = self.logits_tile(hidden, start, n, self.arithmetic)?;
+            self.device.set_rows(&mut out, start, &logits).map_err(error)?;
+        }
+        Ok(out)
+    }
+
+    /// The arithmetic of the forward pass's and the head's products.
+    #[must_use]
+    pub fn arithmetic(&self) -> Arithmetic {
+        self.arithmetic
+    }
+
+    /// Run the forward pass's and the head's products in `arithmetic` from now on.
+    pub fn set_arithmetic(&mut self, arithmetic: Arithmetic) {
+        self.arithmetic = arithmetic;
     }
 
     /// Re-upload every operator `program` now holds a different copy of (a stepped library).
@@ -461,6 +511,12 @@ impl DeviceProgram {
 
     /// One forward pass on `family` (module note).
     pub fn forward(&self, family: &FamilyInputs) -> Result<DeviceTrace, String> {
+        self.forward_given(family, BTreeMap::new())
+    }
+
+    /// One forward pass on `family`, the raw slots in `given` taking those device values instead
+    /// of the family's (which may then be empty).
+    pub fn forward_given(&self, family: &FamilyInputs, mut given: BTreeMap<usize, Tensor>) -> Result<DeviceTrace, String> {
         let d = &self.device;
         let rows = family.rows;
         let batch = self.prepared_batch(family)?;
@@ -470,12 +526,16 @@ impl DeviceProgram {
             let value = match step {
                 Step::Head => None,
                 Step::Feature { .. } => None,
-                Step::Raw { slot } => {
-                    let SlotValues::Raw(values) = &family.slots[*slot] else {
-                        return Err(format!("device: slot {slot} holds no raw rows"));
-                    };
-                    Some(d.upload(values.view()).map_err(error)?)
-                }
+                Step::Raw { slot } => match given.remove(slot) {
+                    Some(value) if value.dim() == (rows, width) => Some(value),
+                    Some(value) => return Err(format!("device: a {:?} value for slot {slot} of {rows} × {width}", value.dim())),
+                    None => {
+                        let SlotValues::Raw(values) = &family.slots[*slot] else {
+                            return Err(format!("device: slot {slot} holds no raw rows"));
+                        };
+                        Some(d.upload(values.view()).map_err(error)?)
+                    }
+                },
                 Step::Constant { operator } => Some(d.broadcast_rows(self.column(*operator)?, rows).map_err(error)?),
                 Step::Affine { terms, bias } => {
                     let mut out = d.zeros(rows, width).map_err(error)?;
@@ -488,7 +548,7 @@ impl DeviceProgram {
                             let gathered = d.gather_rows(table, ids).map_err(error)?;
                             d.axpy(&mut out, 1.0, &gathered).map_err(error)?;
                         } else {
-                            self.add_product(&mut out, trace.value(*argument)?, *operator, false, Arithmetic::F64)?;
+                            self.add_product(&mut out, trace.value(*argument)?, *operator, false, self.arithmetic)?;
                         }
                     }
                     if let Some(b) = bias {
@@ -507,17 +567,17 @@ impl DeviceProgram {
                     let (q, k) = self.rotated(&trace, *query, *key, *rotary)?;
                     let v = trace.value(*value)?;
                     if Self::tile_attention(&trace) {
-                        Some(super::device_attention::forward(d, (&q, &k, v), trace.blocks, *scale, *causal).map_err(error)?)
+                        Some(super::device_attention::forward(d, (&q, &k, v), trace.blocks, *scale, *causal, self.arithmetic).map_err(error)?)
                     } else {
                         let alpha = self.attention(&trace, &q, &k, *scale, *causal)?;
                         let mut out = d.zeros(rows, v.cols()).map_err(error)?;
-                        d.gemm_batched(trace.blocks, &mut out, 1.0, &alpha, Op::N, v, Op::N, 0.0, Arithmetic::F64).map_err(error)?;
+                        d.gemm_batched(trace.blocks, &mut out, 1.0, &alpha, Op::N, v, Op::N, 0.0, self.arithmetic).map_err(error)?;
                         Some(out)
                     }
                 }
                 Step::Transposed { input, operator } => {
                     let mut out = d.zeros(rows, width).map_err(error)?;
-                    self.add_product(&mut out, trace.value(*input)?, *operator, true, Arithmetic::F64)?;
+                    self.add_product(&mut out, trace.value(*input)?, *operator, true, self.arithmetic)?;
                     Some(out)
                 }
             };
@@ -552,7 +612,7 @@ impl DeviceProgram {
         let d = &self.device;
         let length = trace.rows / trace.blocks;
         let mut scores = d.zeros(trace.rows, length).map_err(error)?;
-        d.gemm_batched(trace.blocks, &mut scores, scale, q, Op::N, k, Op::T, 0.0, Arithmetic::F64).map_err(error)?;
+        d.gemm_batched(trace.blocks, &mut scores, scale, q, Op::N, k, Op::T, 0.0, self.arithmetic).map_err(error)?;
         d.softmax_rows(&mut scores, causal).map_err(error)?;
         Ok(scores)
     }
@@ -614,12 +674,12 @@ impl DeviceProgram {
         let tile = self.tile_rows();
         for start in (0..trace.rows).step_by(tile) {
             let n = tile.min(trace.rows - start);
-            let mut logits = self.logits_tile(hidden, start, n, Arithmetic::F64)?;
+            let mut logits = self.logits_tile(hidden, start, n, self.arithmetic)?;
             let t = d.rows_of(target, start, n).map_err(error)?;
             let flags = self.flags(scored, start, n)?;
             if let Some(g) = &mut g {
                 kl.extend(d.kl_rows(&t, &mut logits, flags.as_ref()).map_err(error)?);
-                self.pull_tile(g, start, &logits, Arithmetic::F64)?;
+                self.pull_tile(g, start, &logits, self.arithmetic)?;
             } else {
                 kl.extend(d.kl_score_rows(&t, &mut logits, flags.as_ref()).map_err(error)?);
             }
@@ -636,7 +696,7 @@ impl DeviceProgram {
         let tile = self.tile_rows();
         for start in (0..trace.rows).step_by(tile) {
             let n = tile.min(trace.rows - start);
-            let mut logits = self.logits_tile(hidden, start, n, Arithmetic::F64)?;
+            let mut logits = self.logits_tile(hidden, start, n, self.arithmetic)?;
             let u = d.upload_vec(n, 1, uniforms[start..start + n].to_vec()).map_err(error)?;
             d.sampled_cotangent(&mut logits, &u, self.flags(scored, start, n)?.as_ref()).map_err(error)?;
             self.pull_tile(&mut g, start, &logits, arithmetic)?;
@@ -662,10 +722,10 @@ impl DeviceProgram {
         let tile = self.tile_rows();
         for start in (0..trace.rows).step_by(tile) {
             let n = tile.min(trace.rows - start);
-            let mut probabilities = self.logits_tile(hidden, start, n, Arithmetic::F64)?;
+            let mut probabilities = self.logits_tile(hidden, start, n, self.arithmetic)?;
             d.softmax_rows(&mut probabilities, false).map_err(error)?;
             let mut mean = d.zeros(n, hidden.cols()).map_err(error)?;
-            self.pull_tile(&mut mean, 0, &probabilities, Arithmetic::F64)?;
+            self.pull_tile(&mut mean, 0, &probabilities, self.arithmetic)?;
             let flags = self.flags(scored, start, n)?;
             for (uniforms, seed) in uniforms.iter().zip(&mut seeds) {
                 let u = d.upload_vec(n, 1, uniforms[start..start + n].to_vec()).map_err(error)?;
@@ -685,7 +745,7 @@ impl DeviceProgram {
         let mut total = 0.0;
         for start in (0..trace.rows).step_by(tile) {
             let n = tile.min(trace.rows - start);
-            let logits = self.logits_tile(hidden, start, n, Arithmetic::F64)?;
+            let logits = self.logits_tile(hidden, start, n, self.arithmetic)?;
             let t = self.logits_tile(tangent, start, n, arithmetic)?;
             let per_row = self.device.softmax_quadratic(&logits, &t).map_err(error)?;
             total += per_row.iter().enumerate().filter(|(r, _)| scored.is_none_or(|s| s[start + r])).map(|(_, v)| v).sum::<f64>();
@@ -695,7 +755,7 @@ impl DeviceProgram {
 
     /// The logits of rows `start..start + n`, on the host.
     pub fn logits(&self, trace: &DeviceTrace, start: usize, n: usize) -> Result<Array2<f64>, String> {
-        let tile = self.logits_tile(trace.value(self.head.hidden)?, start, n, Arithmetic::F64)?;
+        let tile = self.logits_tile(trace.value(self.head.hidden)?, start, n, self.arithmetic)?;
         self.device.download(&tile).map_err(error)
     }
 
@@ -703,11 +763,26 @@ impl DeviceProgram {
     /// cotangents of the nodes in `keep` (those any cotangent reaches), each node's dropped once
     /// its own rule has run. Products run in `arithmetic`.
     pub fn vjp(&self, trace: &DeviceTrace, seed: Tensor, keep: &[usize], arithmetic: Arithmetic) -> Result<BTreeMap<usize, Tensor>, String> {
+        self.vjp_seeded(trace, seed, BTreeMap::new(), keep, arithmetic)
+    }
+
+    /// [`Self::vjp`] of the hidden node's `seed` plus, at each node of `extra`, its cotangent
+    /// there (a term of the scalar that reads that node directly).
+    pub fn vjp_seeded(&self, trace: &DeviceTrace, seed: Tensor, extra: BTreeMap<usize, Tensor>, keep: &[usize], arithmetic: Arithmetic) -> Result<BTreeMap<usize, Tensor>, String> {
         let Some(first) = keep.iter().copied().min() else { return Ok(BTreeMap::new()); };
-        if keep.iter().any(|node| *node >= self.steps.len()) { return Err("device: retained node out of range".to_string()); }
+        if keep.iter().chain(extra.keys()).any(|node| *node >= self.steps.len()) { return Err("device: retained node out of range".to_string()); }
         let d = &self.device;
         let mut g: Vec<Option<Tensor>> = (0..self.steps.len()).map(|_| None).collect();
         g[self.head.hidden] = Some(seed);
+        for (node, term) in extra {
+            if term.dim() != (trace.rows, self.widths[node]) {
+                return Err(format!("device: a {:?} cotangent at node {node} of width {}", term.dim(), self.widths[node]));
+            }
+            match g[node].as_mut() {
+                Some(existing) => d.axpy(existing, 1.0, &term).map_err(error)?,
+                None => g[node] = Some(term),
+            }
+        }
         let mut kept = BTreeMap::new();
         // Adds `term` into node `n`'s cotangent.
         let add = |g: &mut Vec<Option<Tensor>>, n: usize, term: Tensor| -> Result<(), String> {
@@ -767,12 +842,18 @@ impl DeviceProgram {
                     add(&mut g, *input, term)?;
                 }
                 Step::Hadamard { left, right } => {
-                    let mut gl = d.zeros(trace.rows, self.widths[*left]).map_err(error)?;
-                    d.hadamard(&mut gl, &cot, trace.value(*right)?, false).map_err(error)?;
-                    let mut gr = d.zeros(trace.rows, self.widths[*right]).map_err(error)?;
-                    d.hadamard(&mut gr, &cot, trace.value(*left)?, false).map_err(error)?;
-                    add(&mut g, *left, gl)?;
-                    add(&mut g, *right, gr)?;
+                    // A raw input's cotangent goes nowhere unless it is kept (a mask's).
+                    let wanted = |n: usize| keep.contains(&n) || !matches!(self.steps[n], Step::Raw { .. } | Step::Constant { .. });
+                    if wanted(*left) {
+                        let mut gl = d.zeros(trace.rows, self.widths[*left]).map_err(error)?;
+                        d.hadamard(&mut gl, &cot, trace.value(*right)?, false).map_err(error)?;
+                        add(&mut g, *left, gl)?;
+                    }
+                    if wanted(*right) {
+                        let mut gr = d.zeros(trace.rows, self.widths[*right]).map_err(error)?;
+                        d.hadamard(&mut gr, &cot, trace.value(*left)?, false).map_err(error)?;
+                        add(&mut g, *right, gr)?;
+                    }
                 }
                 Step::RmsNorm { input, epsilon } => {
                     let term = d.rms_norm_backward(trace.value(*input)?, &cot, *epsilon).map_err(error)?;
@@ -806,7 +887,7 @@ impl DeviceProgram {
         let blocks = trace.blocks;
         let (q, k) = self.rotated(trace, query, key, rotary)?;
         if Self::tile_attention(trace) {
-            let (gq, gk, gv) = super::device_attention::backward(d, (&q, &k, trace.value(value)?), cot, blocks, scale, causal, arithmetic).map_err(error)?;
+            let (gq, gk, gv) = super::device_attention::backward(d, (&q, &k, trace.value(value)?), cot, blocks, scale, causal, (self.arithmetic, arithmetic)).map_err(error)?;
             return match rotary {
                 None => Ok((gq, gk, gv)),
                 Some(r) => {
@@ -954,7 +1035,7 @@ impl DeviceProgram {
         if Self::tile_attention(trace) {
             let dq = dv[query].as_ref().map(&turn).transpose()?;
             let dk = dv[key].as_ref().map(&turn).transpose()?;
-            return super::device_attention::tangent(d, (&q, &k, trace.value(value)?), (dq.as_ref(), dk.as_ref(), dv[value].as_ref()), blocks, scale, causal, arithmetic).map_err(error);
+            return super::device_attention::tangent(d, (&q, &k, trace.value(value)?), (dq.as_ref(), dk.as_ref(), dv[value].as_ref()), blocks, scale, causal, (self.arithmetic, arithmetic)).map_err(error);
         }
         let alpha = self.attention(trace, &q, &k, scale, causal)?;
         let length = trace.rows / blocks;
