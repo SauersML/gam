@@ -21,7 +21,8 @@
 //! the behaviour's: the last user token, the template tokens after it and the reply tokens) and
 //! `decision` (the row whose next token is the reply's first); `DATA_DIR/resid.f32` (memory-mapped)
 //! holds every prompt's stream entering `FIRST`, prompts in order. Prompts stream `BATCH` at a time;
-//! `PROMPTS` keeps the first that many.
+//! `PROMPTS` (`n` or `a..b`) selects prompts `0..n` or `a..b` only (shards of one fit: every shard
+//! measures the same statistics on the first `STATS` prompts, so their libraries are the same).
 //! The run:
 //!
 //! 1. measures each site's narrow-side statistics on the first `STATS` prompts' scored rows (the
@@ -194,12 +195,12 @@ struct Settings {
     observations: f64,
     stats: usize,
     batch: usize,
-    prompts: usize,
+    prompts: std::ops::Range<usize>,
     tail_cache: usize,
 }
 
 fn fit(model: &Path, data: &Path, out: &Path, settings: &Settings) -> Result<(), String> {
-    let Settings { last, observations, stats, batch: batch_size, prompts: limit, .. } = *settings;
+    let Settings { last, observations, stats, batch: batch_size, .. } = *settings;
     let meta = read_json(&data.join("prompts.json"))?;
     let (first, d) = (integer(&meta, "first")?, integer(&meta, "d")?);
     let refusal: Vec<usize> = meta["refusal_tokens"].as_array().ok_or("refusal_tokens")?.iter().filter_map(|v| v.as_u64().map(|v| v as usize)).collect();
@@ -209,7 +210,7 @@ fn fit(model: &Path, data: &Path, out: &Path, settings: &Settings) -> Result<(),
         prompts.push(Prompt { ids, scored_from: integer(p, "scored_from")?, decision: integer(p, "decision")? });
     }
     let mut offsets = vec![0];
-    let kept = prompts.len().min(limit);
+    let shard = settings.prompts.start.min(prompts.len())..settings.prompts.end.min(prompts.len());
     for p in &prompts {
         offsets.push(offsets[offsets.len() - 1] + p.ids.len());
     }
@@ -225,7 +226,8 @@ fn fit(model: &Path, data: &Path, out: &Path, settings: &Settings) -> Result<(),
     let head = Arc::new(DecoderTail::new(model, last, settings.tail_cache)?);
     let chosen: Vec<Site> = sites(&program).into_iter().filter(|s| layer_of(s).is_some_and(|l| (first..last).contains(&l))).collect();
     log::info!("imported blocks {first}..{last} ({:.0}s); {} sites", started.elapsed().as_secs_f64(), chosen.len());
-    let batches: Vec<std::ops::Range<usize>> = (0..kept).step_by(batch_size).map(|s| s..(s + batch_size).min(kept)).collect();
+    let chunks = |range: std::ops::Range<usize>| -> Vec<std::ops::Range<usize>> { range.clone().step_by(batch_size).map(|s| s..(s + batch_size).min(range.end)).collect() };
+    let batches = chunks(shard);
 
     // 1. Narrow-side statistics on the scored rows of the first `stats` prompts.
     let samples = 2;
@@ -240,8 +242,8 @@ fn fit(model: &Path, data: &Path, out: &Path, settings: &Settings) -> Result<(),
         });
     }
     let (mut rows, mut draws) = (0.0, 0.0);
-    for range in batches.iter().filter(|r| r.start < stats) {
-        let b = batch(&prompts, &offsets, &resid, d, range.start..range.end.min(stats));
+    for range in chunks(0..stats.min(prompts.len())) {
+        let b = batch(&prompts, &offsets, &resid, d, range.clone());
         let keep: Vec<usize> = (0..b.inputs.rows).filter(|r| b.scored[*r]).collect();
         let trace = program.execute(&b.inputs, false).map_err(|e| e.to_string())?;
         let output = &trace.values[program.output];
@@ -281,7 +283,7 @@ fn fit(model: &Path, data: &Path, out: &Path, settings: &Settings) -> Result<(),
             }
             draws += keep.len() as f64;
         }
-        log::info!("statistics: prompts {}..{} ({:.0}s)", range.start, range.end.min(stats), started.elapsed().as_secs_f64());
+        log::info!("statistics: prompts {}..{} ({:.0}s)", range.start, range.end, started.elapsed().as_secs_f64());
     }
     if rows == 0.0 {
         return Err("no scored rows for the statistics".to_string());
@@ -446,7 +448,13 @@ fn main() -> Result<(), String> {
             let number = |i: usize| -> Result<f64, String> { arg(i)?.parse().map_err(|e| format!("{}: {e}", args[i])) };
             let gpu = arg(9)?;
             gam_gpu::configure_global_policy(gam_gpu::GpuPolicy::parse(gpu).ok_or_else(|| format!("GPU {gpu}: expected off, auto or required"))?);
-            let prompts = args.get(10).map_or(Ok(usize::MAX), |v| v.parse()).map_err(|e| format!("PROMPTS: {e}"))?;
+            let prompts = match args.get(10) {
+                None => 0..usize::MAX,
+                Some(v) => match v.split_once("..") {
+                    Some((a, b)) => a.parse().map_err(|e| format!("PROMPTS: {e}"))?..b.parse().map_err(|e| format!("PROMPTS: {e}"))?,
+                    None => 0..v.parse().map_err(|e| format!("PROMPTS: {e}"))?,
+                },
+            };
             let gib: f64 = args.get(11).map_or(Ok(1.0), |v| v.parse()).map_err(|e| format!("TAIL_CACHE_GIB: {e}"))?;
             let settings = Settings {
                 last: number(5)? as usize,
