@@ -829,7 +829,7 @@ pub struct SpectralNormBounds {
 ///    computed `λ̂` are the exact eigenvalues of `Ĝ + E` with
 ///    `‖E‖₂ ≤ ρ = k·(ε·max|λ̂| + η)`
 ///    ([`symmetric_spectrum_rounding_band_at_dim`]; the same convention as the
-///    [`factor_singular_band`] a full SVD reads). By Weyl,
+///    [`gam_linalg::roundoff::factor_singular_band`] a full SVD reads). By Weyl,
 ///    `σ_max(B)² = λ_max(G) ∈ [λ̂_max − ρ − δ, λ̂_max + ρ + δ]`.
 /// 4. **Root.** `√·` is monotone. The endpoints are widened for the handful of
 ///    rounded operations that form them, each root is taken one ulp outward,

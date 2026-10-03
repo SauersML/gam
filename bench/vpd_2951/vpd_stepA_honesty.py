@@ -18,8 +18,10 @@ rounded (g > 0), or a given set's indicator. Every mask lies in VPD's box [g, 1]
 
 Results go under `OUT[key][family]` (the file is read and rewritten, so the modes share it).
 usage: vpd_stepA_honesty.py {box|layers} SETS_STEM OUT.json [--rows N] [--offset OFF] [--draws D]
-       [--steps 20,40,80] [--key NAME]
-SETS_STEM is the driver's `OUT.pass{P}` path prefix; `--offset` is the export's first val row.
+       [--steps 20,40,80] [--key NAME] [--families vpd_ci,vpd_rounded,given] [--name NAME]
+SETS_STEM is the driver's `OUT.pass{P}` path prefix (unused without `given`); `--offset` is the
+export's first val row; the given family is stored under `--name`. The threshold curve and the
+all-on point come with `vpd_ci`.
 """
 
 import argparse
@@ -48,6 +50,8 @@ parser.add_argument("--offset", type=int, default=1024)
 parser.add_argument("--draws", type=int, default=64)
 parser.add_argument("--steps", default="20,40,80")
 parser.add_argument("--key", default=None)
+parser.add_argument("--families", default="vpd_ci,vpd_rounded,given")
+parser.add_argument("--name", default="ours", help="the given sets' family name")
 parser.add_argument("--library", type=Path, default=Path.home() / "mpd-data/pieces/vpd4l_library")
 args = parser.parse_args()
 DEV = "mps"
@@ -131,11 +135,14 @@ ci, _ = gates_and_l0(vpd, ids)
 # Only the gates are needed: the CI network (0.54B parameters) leaves memory.
 del vpd.ci_fn
 torch.mps.empty_cache()
-families = {
-    "vpd_ci": Family(ci.mb),
-    "vpd_rounded": transformed(Family(ci.mb), lambda v: (v > 0).float()),
-    "ours": given_family(),
-}
+wanted = args.families.split(",")
+families = {}
+if "vpd_ci" in wanted:
+    families["vpd_ci"] = Family(ci.mb)
+if "vpd_rounded" in wanted:
+    families["vpd_rounded"] = transformed(Family(ci.mb), lambda v: (v > 0).float())
+if "given" in wanted:
+    families[args.name] = given_family()
 log("families: " + ", ".join(f"{k} L0 {f.l0():.1f}" for k, f in families.items()))
 targets = []
 with torch.no_grad():
@@ -178,7 +185,12 @@ def stats(kl: np.ndarray) -> dict:
 
 def update_out(key: str, value: dict):
     data = json.load(open(args.out)) if args.out.exists() else {}
-    data.setdefault(key, {}).update(value)
+    # One level deep, so runs over other families add to what is there.
+    for k, v in value.items():
+        if isinstance(v, dict) and isinstance(data.setdefault(key, {}).get(k), dict):
+            data[key][k].update(v)
+        else:
+            data.setdefault(key, {})[k] = v
     data[key]["rows"], data[key]["offset"], data[key]["sets"] = args.rows, args.offset, str(args.sets)
     tmp = args.out.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=1))
@@ -193,13 +205,14 @@ def box():
     with torch.no_grad():
         for name, fam in families.items():
             fixed[name] = np.concatenate([kl_rows(i, fam.dense(i), zero_delta(fam.dense(i))).cpu().numpy() for i in range(n_mb)])
-        for tau in (0.1, 0.5):
+        for tau in ((0.1, 0.5) if "vpd_ci" in families else ()):
             fam = transformed(families["vpd_ci"], lambda v, tau=tau: (v > tau).float())
             fixed[f"vpd_gt_{tau}"] = np.concatenate([kl_rows(i, fam.dense(i), zero_delta(fam.dense(i))).cpu().numpy() for i in range(n_mb)])
             log(f"threshold {tau}: L0 {fam.l0():.1f} KL {fixed[f'vpd_gt_{tau}'].mean():.4f}")
-        ones = {n: torch.ones((MB, S, vpd.C[n]), device=DEV) for n in names}
-        fixed["all_on"] = np.concatenate([kl_rows(i, ones, zero_delta(ones)).cpu().numpy() for i in range(n_mb)])
-        del ones
+        if "vpd_ci" in families:
+            ones = {n: torch.ones((MB, S, vpd.C[n]), device=DEV) for n in names}
+            fixed["all_on"] = np.concatenate([kl_rows(i, ones, zero_delta(ones)).cpu().numpy() for i in range(n_mb)])
+            del ones
     log("fixed: " + ", ".join(f"{k} {v.mean():.4f}" for k, v in fixed.items()))
     update_out(key, {"fixed_kl": {k: stats(v) for k, v in fixed.items()},
                      "l0": {k: f.l0() for k, f in families.items()}})
@@ -245,8 +258,7 @@ def layers():
     out = {}
     n_layer = 4
     layer_sites = [[n for n in names if n.startswith(f"h.{l}.")] for l in range(n_layer)]
-    for name in ("vpd_rounded", "ours", "vpd_ci"):
-        fam = families[name]
+    for name, fam in families.items():
         only = np.zeros((n_layer, args.rows * S))
         joint = np.zeros(args.rows * S)
         tv_step = np.zeros((n_layer, args.rows * S))

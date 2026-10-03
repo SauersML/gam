@@ -236,14 +236,12 @@ def solve_alpha(pf, W0, U, V, u_o, p_target, lo=0.5, hi=12.0):
     return 0.5 * (lo + hi)
 
 
-def stage_eval():
+def edit_variants():
+    """The model and every edit: the VPD strength sweep, each LoRA, and for each LoRA the VPD edit whose strength is
+    solved to give exactly that LoRA's edit success. Returns (target, W0, {name: delta W}, {name: meta})."""
     import torch
-    import torch.nn.functional as F
-    sys.path.insert(0, str(VD))
-    from vpd_model import gelu_tanh, rms
     target, U, V = load()
-    site = target.site(SITE)
-    W0 = site.W.clone()
+    W0 = target.site(SITE).W.clone()
     u_o = target.wte[O_TOK] / target.wte[O_TOK].norm()
     ev, _ = harvest()
     pf = p_fire_fn(target, ev)
@@ -264,6 +262,51 @@ def stage_eval():
         models["vpd_match_" + name] = vpd_dw(a)
         meta["vpd_match_" + name] = {"method": "vpd", "alpha": a, "p_fire": pf(W0 + vpd_dw(a)), "matches": name}
         log(f"{name}: p_fire {p:.4f}; VPD alpha {a:.4f} gives {meta['vpd_match_' + name]['p_fire']:.4f}")
+    return target, W0, models, meta
+
+
+def split_forward(target):
+    """(resid, final, head): resid(ids) runs the shared part once (everything before h.2.mlp.down_proj) and returns
+    the residual entering that MLP output and the MLP hidden activation; final(xmid, g2, W) finishes the network with
+    h.2.mlp.down_proj = W and returns the last residual; head(x) gives log-probabilities."""
+    import torch.nn.functional as F
+    sys.path.insert(0, str(VD))
+    from vpd_model import gelu_tanh, rms
+
+    def block(x, i, T):
+        s = lambda k: target.site(f"h.{i}.{'mlp' if k in ('c_fc', 'down_proj') else 'attn'}.{k}")
+        Bn = x.shape[0]
+        h = rms(x, target.norms[2 * i], target.eps)
+        q = s("q_proj")(h).view(Bn, T, target.n_head, target.hd).transpose(1, 2)
+        k = s("k_proj")(h).view(Bn, T, target.n_head, target.hd).transpose(1, 2)
+        v = s("v_proj")(h).view(Bn, T, target.n_head, target.hd).transpose(1, 2)
+        q, k = target._rope(q, T), target._rope(k, T)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        x = x + s("o_proj")(y.transpose(1, 2).reshape(Bn, T, -1))
+        g = gelu_tanh(s("c_fc")(rms(x, target.norms[2 * i + 1], target.eps)))
+        return x, g
+    down3 = target.site("h.3.mlp.down_proj")
+
+    def resid(ids):
+        x = target.wte[ids]
+        for i in range(2):
+            x, g = block(x, i, ids.shape[1])
+            x = x + target.site(f"h.{i}.mlp.down_proj")(g)
+        return block(x, 2, ids.shape[1])
+
+    def final(xmid, g2, W):
+        x3, g3 = block(xmid + g2 @ W.T, 3, xmid.shape[1])
+        return x3 + down3(g3)
+
+    def head(x):
+        return F.log_softmax(rms(x, target.ln_f, target.eps) @ target.wte.T, -1)
+    return resid, final, head
+
+
+def stage_eval():
+    import torch
+    import torch.nn.functional as F
+    target, W0, models, meta = edit_variants()
     names = list(models)
     json.dump({"models": names, "meta": meta}, open(OUTD / "models.json", "w"), indent=1)
 
@@ -287,36 +330,7 @@ def stage_eval():
     done_path = OUTD / "eval_done.txt"
     done = int(done_path.read_text()) if done_path.exists() else 0
     B, PC = 2, 128  # rows per forward; positions per vocab-sized block (keeps the job inside 2 GiB)
-
-    def block(x, i, T):
-        s = lambda k: target.site(f"h.{i}.{'mlp' if k in ('c_fc', 'down_proj') else 'attn'}.{k}")
-        Bn = x.shape[0]
-        h = rms(x, target.norms[2 * i], target.eps)
-        q = s("q_proj")(h).view(Bn, T, target.n_head, target.hd).transpose(1, 2)
-        k = s("k_proj")(h).view(Bn, T, target.n_head, target.hd).transpose(1, 2)
-        v = s("v_proj")(h).view(Bn, T, target.n_head, target.hd).transpose(1, 2)
-        q, k = target._rope(q, T), target._rope(k, T)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        x = x + s("o_proj")(y.transpose(1, 2).reshape(Bn, T, -1))
-        g = gelu_tanh(s("c_fc")(rms(x, target.norms[2 * i + 1], target.eps)))
-        return x, g
-
-    def head(x):
-        return F.log_softmax(rms(x, target.ln_f, target.eps) @ target.wte.T, -1)
-
-    down3 = target.site("h.3.mlp.down_proj")
-
-    def resid(ids):
-        """The residual entering h.2's MLP, and that MLP's hidden activation: everything before the edited matrix."""
-        x = target.wte[ids]
-        for i in range(2):
-            x, g = block(x, i, ids.shape[1])
-            x = x + target.site(f"h.{i}.mlp.down_proj")(g)
-        return block(x, 2, ids.shape[1])
-
-    def final(xmid, g2, W):
-        x3, g3 = block(xmid + g2 @ W.T, 3, xmid.shape[1])
-        return x3 + down3(g3)
+    resid, final, head = split_forward(target)
 
     with torch.no_grad():
         ids = torch.from_numpy(tokens[:1].astype(np.int64)).to("mps")  # the split forward is the model's forward

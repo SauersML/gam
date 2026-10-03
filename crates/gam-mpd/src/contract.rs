@@ -22,8 +22,8 @@
 //! each input is then explained by the list of the program's rule instances that fire on it: every
 //! group of a pointwise node whose law is not the zero law is an instance, active on an input when
 //! its value there is not identically zero. A call is counted as its body inlined: each pointwise
-//! group of the called rule's body is an instance at each call, so wrapping work in a rule neither
-//! hides nor adds activity. The explanations are sent once per input (not per
+//! group of the called rule's body is an instance at each call, so each input is charged for the
+//! work that runs on it, however it is wrapped. The explanations are sent once per input (not per
 //! observation). The library's firing counts `c_r` (how many of the `N` inputs instance `r`
 //! fires on, `log₂(N + 1)` bits each) are sent once; then each input sends how many instances
 //! fire, `k_x` (`log₂(R + 1)` bits for `R` instances), and the set itself in the code that gives
@@ -57,20 +57,13 @@
 //! (the largest row KL, the argmax disagreement count) are outputs about the selected program,
 //! stated by [`crate::verify::exhaustive_supremum`] over the rows; they select nothing.
 //!
-//! # Enclosed and estimated bands
+//! # Bands
 //!
 //! The logit bands come from the banded execution (`operator_program::Trace`): a proven enclosure
-//! of the exact-arithmetic output. In a deep network the enclosure compounds layer by layer (each
-//! layer multiplies the carried error by its operator norms and its attention and norm slopes)
-//! until it proves nothing about a row's KL. A distribution row whose proven band is not below one
-//! logit unit takes instead an estimated band ([`measured_output_band`]): the nodes' local
-//! roundings with random signs, carried to the output to first order. Every row carries what its
-//! band rests on ([`BandBasis`]), for the model's reference rows and the candidate's alike. Only a
-//! row both of whose bands are enclosures is certified: any other row is unresolved in the
-//! certified statuses (`total_kl`, `max_kl`, the argmax agreement), and a score with such a row is
-//! never [`ProgramScore::proven_shorter_than`] another. Its KL at the estimated bands still enters
-//! the ranking total ([`ContractEvaluation::ranking_kl`]), which orders candidates
-//! ([`ProgramScore::ranks_shorter_than`]) and certifies nothing.
+//! of the exact-arithmetic output. In a deep network the enclosure compounds layer by layer until
+//! it proves nothing about a row's KL; such a row stays unresolved, however wide. A sampled
+//! estimate of the rounding error ([`measured_output_band`]) is a diagnostic only: it never enters
+//! a band, a status or a comparison.
 //!
 //! # Total variation
 //!
@@ -113,6 +106,7 @@ use super::bounds::total_variation_over_logit_boxes;
 use super::cegar::inlined;
 use super::operator_program::{Declarations, EncodedProgram, FamilyInputs, Law, Node, OperatorProgram, ProgramError, Trace};
 use super::precision::DecodableArtifact;
+use super::secant::BandedMatrix;
 use super::supports::{EvidenceStatus, EvidenceStatusError, ExactBasis, Extremum};
 use super::verify::{RowValue, compare_logit_row, computed_argmax, exhaustive_supremum};
 use gam_linalg::roundoff::accumulation_growth;
@@ -175,33 +169,6 @@ pub struct PopulationBound {
     pub estimate: EvidenceStatus<(), String>,
 }
 
-/// What a distribution row's band rests on (module note, "Enclosed and estimated bands"), ordered
-/// from strongest to weakest.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum BandBasis {
-    /// A proven enclosure of the exact-arithmetic output.
-    Enclosure,
-    /// An empirical estimate of the rounding error: it ranks and proves nothing.
-    Estimate,
-    /// Neither the enclosure nor the estimate is a finite band.
-    Unresolved,
-}
-
-/// A program's distribution rows on the family with their bands and, per row, what each band rests on.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ContractLogits {
-    pub values: Array2<f64>,
-    pub bands: Array2<f64>,
-    pub basis: Vec<BandBasis>,
-}
-
-impl ContractLogits {
-    /// The weakest basis over the rows.
-    pub fn basis(&self) -> BandBasis {
-        self.basis.iter().copied().max().unwrap_or(BandBasis::Enclosure)
-    }
-}
-
 /// Everything one evaluation of a program against the model shows.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContractEvaluation {
@@ -218,16 +185,6 @@ pub struct ContractEvaluation {
     pub argmax_agrees: Vec<bool>,
     /// A proven upper bound on `max_rows TV(model, program)`.
     pub max_tv_upper: f64,
-    /// Rows whose reference or candidate band is not an enclosure: unresolved in every status
-    /// above, whatever their estimated KL.
-    pub estimated_rows: usize,
-    /// The weakest basis of any row's two bands.
-    pub basis: BandBasis,
-    /// `Σ_rows KL` with every row read at its own bands, estimated ones included, and that sum's
-    /// error (`+∞` when some row is unresolved even so). It ranks candidates and certifies
-    /// nothing; when every band is an enclosure it is `total_kl`'s value and error.
-    pub ranking_kl: f64,
-    pub ranking_kl_error: f64,
 }
 
 /// Which gated rule instances fire on each input of the family (module note, "Three parts").
@@ -348,9 +305,7 @@ pub struct ProgramScore {
     pub precision_bits: u64,
     /// The family's explanations given the program.
     pub explanation: Explanation,
-    /// `L(behaviour | P) = Σ KL / ln 2` and its error, from the ranking total
-    /// ([`ContractEvaluation::ranking_kl`]): proven only when [`ProgramScore::certified`]; `+∞`
-    /// error when some row is unresolved even at its estimated bands.
+    /// `L(behaviour | P) = Σ KL / ln 2` and its error; `+∞` error when some row is unresolved.
     pub data_bits: f64,
     pub data_bits_error: f64,
     pub evaluation: ContractEvaluation,
@@ -359,18 +314,12 @@ pub struct ProgramScore {
 }
 
 impl ProgramScore {
-    /// Whether every band the score rests on, the reference's and the program's, is an enclosure:
-    /// only then are its totals' ends proven.
-    pub fn certified(&self) -> bool {
-        self.evaluation.basis == BandBasis::Enclosure
-    }
-
-    /// The lower end of the total code length: proven when [`Self::certified`], otherwise estimated.
+    /// A proven lower end of the total code length.
     pub fn total_lower(&self) -> f64 {
         (self.program_bits as f64 + self.explanation.bits_lower + (self.data_bits - self.data_bits_error).max(0.0)).next_down()
     }
 
-    /// The upper end of the total code length: proven when [`Self::certified`], otherwise estimated.
+    /// A proven upper end of the total code length.
     pub fn total_upper(&self) -> f64 {
         (self.program_bits as f64 + self.explanation.bits_upper + self.data_bits + self.data_bits_error).next_up()
     }
@@ -380,16 +329,8 @@ impl ProgramScore {
         self.program_bits as f64 + self.explanation.bits + self.data_bits
     }
 
-    /// Whether this score is proven shorter than `other`: both rest on enclosures only, and this
-    /// one's upper end is below the other's lower end.
+    /// Whether this score is proven shorter than `other`.
     pub fn proven_shorter_than(&self, other: &ProgramScore) -> bool {
-        self.certified() && other.certified() && self.ranks_shorter_than(other)
-    }
-
-    /// Whether this score's upper end is below `other`'s lower end at the bands each rests on: the
-    /// search's order. It is [`Self::proven_shorter_than`] when both are certified; otherwise an
-    /// estimated band entered and it ranks, proving nothing.
-    pub fn ranks_shorter_than(&self, other: &ProgramScore) -> bool {
         self.total_upper() < other.total_lower()
     }
 }
@@ -454,42 +395,19 @@ impl Contract {
         ContractDomain { rows: self.family.rows * self.readouts, complete: matches!(self.kind, FamilyKind::Complete { .. }) }
     }
 
-    /// The program's distribution rows on the family, with their bands and what each rests on
-    /// (module note, "Enclosed and estimated bands").
-    pub fn logits(&self, program: &OperatorProgram) -> Result<ContractLogits, ContractError> {
+    /// The program's output rows on the family, with forward-error bands.
+    pub fn logits(&self, program: &OperatorProgram) -> Result<BandedMatrix, ContractError> {
         Ok(self.banded_trace(program)?.0)
     }
 
-    /// The program's distribution rows on the family with bands, and its banded trace.
-    fn banded_trace(&self, program: &OperatorProgram) -> Result<(ContractLogits, Trace), ContractError> {
+    /// The program's output rows on the family with bands, and its banded trace.
+    fn banded_trace(&self, program: &OperatorProgram) -> Result<(BandedMatrix, Trace), ContractError> {
         if program.declarations != self.declarations {
             return Err(ContractError::Declaration("the program's declarations are not the contract's".to_string()));
         }
         let trace = program.execute(&self.family, true)?;
-        let mut banded = trace.banded(program.output);
-        let mut basis = vec![BandBasis::Enclosure; banded.values.nrows()];
-        // A row whose proven band is not below one logit unit (a factor e on a probability) proves
-        // little about its KL: it takes the estimated band instead, and says so.
-        let unresolved: Vec<usize> = banded
-            .bands
-            .outer_iter()
-            .enumerate()
-            .filter(|(_, row)| row.iter().any(|r| !(r.is_finite() && *r < 1.0)))
-            .map(|(row, _)| row)
-            .collect();
-        if !unresolved.is_empty() {
-            let measured = measured_output_band(program, &self.family, &trace)?;
-            for &row in &unresolved {
-                let estimate = measured.row(row);
-                basis[row] = if estimate.iter().all(|r| r.is_finite()) { BandBasis::Estimate } else { BandBasis::Unresolved };
-                banded.bands.row_mut(row).assign(&estimate);
-            }
-        }
-        let logits = ContractLogits {
-            values: self.distributions(&banded.values)?,
-            bands: self.distributions(&banded.bands)?,
-            basis: basis.iter().flat_map(|b| std::iter::repeat_n(*b, self.readouts)).collect(),
-        };
+        let banded = trace.banded(program.output);
+        let logits = BandedMatrix { values: self.distributions(&banded.values)?, bands: self.distributions(&banded.bands)? };
         Ok((logits, trace))
     }
 
@@ -525,23 +443,17 @@ impl Contract {
         Array2::from_shape_vec((rows * self.readouts, classes), flat).map_err(|e| ContractError::Declaration(e.to_string()))
     }
 
-    /// Compare candidate logit rows against the reference's, row by row. A row either of whose
-    /// bands is not an enclosure is unresolved in every certified status and enters only the
-    /// ranking total (module note, "Enclosed and estimated bands").
-    pub fn evaluate(&self, reference: &ContractLogits, candidate: &ContractLogits) -> Result<ContractEvaluation, ContractError> {
+    /// Compare candidate logit rows against the reference's, row by row.
+    pub fn evaluate(&self, reference: &BandedMatrix, candidate: &BandedMatrix) -> Result<ContractEvaluation, ContractError> {
         self.validate()?;
         let shape = reference.values.dim();
         if candidate.values.dim() != shape || reference.bands.dim() != shape || candidate.bands.dim() != shape {
             return Err(ContractError::Shape { reference: shape, candidate: candidate.values.dim() });
         }
-        if shape.0 != self.family.rows * self.readouts || reference.basis.len() != shape.0 || candidate.basis.len() != shape.0 {
+        if shape.0 != self.family.rows * self.readouts {
             return Err(ContractError::Declaration(format!(
-                "{} distribution rows ({} and {} bases) for {} inputs × {} readouts",
-                shape.0,
-                reference.basis.len(),
-                candidate.basis.len(),
-                self.family.rows,
-                self.readouts
+                "{} distribution rows for {} inputs × {} readouts",
+                shape.0, self.family.rows, self.readouts
             )));
         }
         let mut kls = Vec::with_capacity(shape.0);
@@ -551,21 +463,12 @@ impl Contract {
         let mut max_tv_upper = 0.0_f64;
         let (mut sum, mut sum_error, mut sum_magnitude, mut sum_lower) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
         let mut resolved = true;
-        // The ranking total over every row at its own bands.
-        let (mut ranking, mut ranking_error, mut ranking_magnitude) = (0.0_f64, 0.0_f64, 0.0_f64);
-        let mut ranking_resolved = true;
-        let mut estimated_rows = 0usize;
-        let mut basis = BandBasis::Enclosure;
         for row in 0..shape.0 {
-            let row_basis = reference.basis[row].max(candidate.basis[row]);
-            basis = basis.max(row_basis);
             // A band that is not a finite number (the forward-error analysis overflowed, or met
-            // `∞ · 0`) says nothing about the row: it is unresolved, its argmax uncertified.
+            // `∞ · 0`) proves nothing about the row: it is unresolved, its argmax uncertified.
             let unbounded = |bands: &Array2<f64>| bands.row(row).iter().any(|r| !r.is_finite());
             if unbounded(&reference.bands) || unbounded(&candidate.bands) {
                 resolved = false;
-                ranking_resolved = false;
-                estimated_rows += usize::from(row_basis != BandBasis::Enclosure);
                 kl_upper.push(f64::INFINITY);
                 max_tv_upper = 1.0;
                 let differs = computed_argmax(reference.values.row(row)) != computed_argmax(candidate.values.row(row));
@@ -575,6 +478,15 @@ impl Contract {
                 kls.push((row, RowValue::Unresolved { lower: 0.0 }));
                 continue;
             }
+            let tv = total_variation_over_logit_boxes(
+                reference.values.row(row),
+                reference.bands.row(row),
+                candidate.values.row(row),
+                candidate.bands.row(row),
+            )
+            .map_err(ContractError::Bound)?
+            .upper_bound()
+            .unwrap_or(1.0);
             let comparison = compare_logit_row(
                 reference.values.row(row),
                 reference.bands.row(row),
@@ -591,28 +503,6 @@ impl Contract {
             };
             match kl {
                 RowValue::Resolved { value, numerical_error } => {
-                    ranking += value;
-                    ranking_error += numerical_error;
-                    ranking_magnitude += value.abs();
-                }
-                RowValue::Unresolved { .. } => ranking_resolved = false,
-            }
-            let differs = comparison.reference_argmax != comparison.candidate_argmax;
-            disagreements += u64::from(differs);
-            if row_basis != BandBasis::Enclosure {
-                // An estimated band encloses nothing: the row proves no KL end, no TV bound and
-                // no argmax.
-                estimated_rows += 1;
-                resolved = false;
-                kl_upper.push(f64::INFINITY);
-                max_tv_upper = 1.0;
-                uncertified += 1;
-                argmax_agrees.push(false);
-                kls.push((row, RowValue::Unresolved { lower: 0.0 }));
-                continue;
-            }
-            match kl {
-                RowValue::Resolved { value, numerical_error } => {
                     sum += value;
                     sum_error += numerical_error;
                     sum_magnitude += value.abs();
@@ -623,18 +513,11 @@ impl Contract {
                     sum_lower += lower;
                 }
             }
-            let tv = total_variation_over_logit_boxes(
-                reference.values.row(row),
-                reference.bands.row(row),
-                candidate.values.row(row),
-                candidate.bands.row(row),
-            )
-            .map_err(ContractError::Bound)?
-            .upper_bound()
-            .unwrap_or(1.0);
             let kl_bound = comparison.forward_kl.upper_bound().unwrap_or(f64::INFINITY);
             kl_upper.push(kl_bound);
             max_tv_upper = max_tv_upper.max(tv.min((kl_bound / 2.0).sqrt().next_up()).min(1.0));
+            let differs = comparison.reference_argmax != comparison.candidate_argmax;
+            disagreements += u64::from(differs);
             uncertified += u64::from(!comparison.argmax_certified);
             argmax_agrees.push(!differs && comparison.argmax_certified);
             kls.push((row, kl));
@@ -648,9 +531,6 @@ impl Contract {
         } else {
             EvidenceStatus::unresolved(sum_lower.next_down(), f64::INFINITY, Extremum::Supremum, None, domain)?
         };
-        let ranking_kl_error = (ranking_error + accumulation_growth(shape.0) * ranking_magnitude).next_up();
-        let ranking_kl_error =
-            if ranking_resolved && ranking.is_finite() && ranking_kl_error.is_finite() { ranking_kl_error } else { f64::INFINITY };
         Ok(ContractEvaluation {
             total_kl,
             max_kl,
@@ -659,16 +539,12 @@ impl Contract {
             argmax_uncertified: uncertified,
             argmax_agrees,
             max_tv_upper,
-            estimated_rows,
-            basis,
-            ranking_kl: ranking,
-            ranking_kl_error,
         })
     }
 
     /// Encode `program`, decode the message, execute the decoded program with bands and score its
     /// two-part code against `reference` (the model's banded logits).
-    pub fn score(&self, program: &OperatorProgram, reference: &ContractLogits) -> Result<ProgramScore, ContractError> {
+    pub fn score(&self, program: &OperatorProgram, reference: &BandedMatrix) -> Result<ProgramScore, ContractError> {
         self.check_causal(program)?;
         let message = program.encode()?;
         let program_bits = message.len_bits();
@@ -685,12 +561,11 @@ impl Contract {
         drop(trace);
         let evaluation = self.evaluate(reference, &candidate)?;
         let n = self.observations as f64;
-        // The ranking total is the certified one when every band is an enclosure.
-        let (value, error) = (evaluation.ranking_kl, evaluation.ranking_kl_error);
-        let (data_bits, data_bits_error) = if error.is_finite() {
-            (n * value / LN_2, (n * error / LN_2).next_up() + (n * value / LN_2) * 2.0 * f64::EPSILON)
-        } else {
-            (n * evaluation.total_kl.lower_bound().unwrap_or(0.0) / LN_2, f64::INFINITY)
+        let (data_bits, data_bits_error) = match &evaluation.total_kl {
+            EvidenceStatus::Exact { value, numerical_error, .. } => {
+                (n * value / LN_2, (n * numerical_error / LN_2).next_up() + (n * value / LN_2) * 2.0 * f64::EPSILON)
+            }
+            other => (n * other.lower_bound().unwrap_or(0.0) / LN_2, f64::INFINITY),
         };
         let population = match &self.kind {
             FamilyKind::Complete { .. } => None,
@@ -731,14 +606,15 @@ impl Contract {
     }
 }
 
-/// Probes of the estimated band: random-sign draws of the local roundings.
+/// Probes of the measured band: random-sign draws of the local roundings.
 const ROUNDING_PROBES: u64 = 4;
 
-/// The estimated band of the program's output on `family`: every node's local rounding (its band
+/// The measured band of the program's output on `family`: every node's local rounding (its band
 /// with exact arguments), given independent random signs, carried to the output to first order by
 /// one forward-mode pass (`derivatives::jvp_seeded`); the band is four times the largest output
 /// change over the probes, entrywise. It estimates the rounding error the computed output carries
-/// where the proven enclosure has compounded past use (deep networks), and proves nothing.
+/// where the proven enclosure has compounded past use (deep networks), and proves nothing: a
+/// diagnostic, never a band of any status or comparison (module note, "Bands").
 pub fn measured_output_band(program: &OperatorProgram, family: &FamilyInputs, trace: &Trace) -> Result<Array2<f64>, ContractError> {
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};

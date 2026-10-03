@@ -84,7 +84,6 @@
 //! of term energies. The carve reads observed codes. This module reads the block's response to a
 //! declared randomized intervention.
 
-use std::collections::BTreeMap;
 use std::fmt;
 
 use ndarray::Array2;
@@ -445,6 +444,7 @@ impl TotalInteractions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use gam_linalg::roundoff::accumulation_growth;
     use ndarray::array;
 

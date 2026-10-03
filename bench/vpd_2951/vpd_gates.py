@@ -104,7 +104,7 @@ def cmd_kl(spec: str, rows: str) -> None:
         st.U, st.V = raw[k + ".U"].float().to(DEV), raw[k + ".V"].float().to(DEV)
     del raw
     kls = []
-    MB = 4
+    MB = 1  # one row's logits at a time keeps the scorer in the 1 GiB lane
     for i in range(0, hi - lo, MB):
         b = ids[i:i + MB].to(DEV)
         B = b.shape[0]
