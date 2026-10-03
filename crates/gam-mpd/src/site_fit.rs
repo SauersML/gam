@@ -196,8 +196,9 @@ fn product(a: ArrayView2<'_, f32>, ta: bool, b: ArrayView2<'_, f32>, tb: bool) -
     out
 }
 
+/// `m` in single precision, row-major whatever `m`'s layout.
 fn single(m: &Array2<f64>) -> Array2<f32> {
-    m.mapv(|v| v as f32)
+    m.mapv(|v| v as f32).as_standard_layout().into_owned()
 }
 
 /// The pseudo-inverse of a symmetric positive semidefinite matrix summed in single precision over
