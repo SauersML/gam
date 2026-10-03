@@ -22,18 +22,22 @@
 //!
 //! # The map
 //!
-//! Every subcomponent on is the map the library started at, `Uᵀ V = S` (a parameter
-//! decomposition sums to its model). After every update `V ← V + G (S − Uᵀ V)` with `G = U (Uᵀ
-//! U)⁺`, then `U ← U + (S − Uᵀ V) H` with `H = (V Vᵀ)⁺ V` on what that leaves (nothing when `U`
-//! spans every written direction; when it cannot, the reads do), both maps from the last
-//! [`Trainer::sync`]. At a sync, in float64, the sum is restored exactly; between syncs, in float32,
-//! the residual left is only what the factors moved since times what that step moved.
+//! Every subcomponent on is the map the library started at, `U V = S` in the held layouts (`U`
+//! d_out × pieces, `V` pieces × d_in; a parameter decomposition sums to its model). An update
+//! moves the map by `ΔU V + U ΔV` (exactly, with `V` after the step and `U` before it), and the
+//! least change of both factors that undoes `R` to first order is `δU = Λ Vᵀ`, `δV = Uᵀ Λ` with
+//! `U Uᵀ Λ + Λ Vᵀ V = R`: a Sylvester equation, solved in the Grams' eigenbases by dividing by
+//! `λ_U + λ_V`, which no direction makes small unless both factors lack it (then nothing can
+//! restore it to first order). The bases are the last [`Trainer::sync`]'s; a sync decomposes the
+//! Grams afresh and retracts `S − U V` in float64 while it shrinks, so the map is exact there and
+//! between syncs it drifts only by what the stale bases and the step's second order leave.
 //!
 //! # Precision
 //!
 //! A step's products run in the trainer's arithmetic (TF32 on a device whose tensor cores make
 //! that worth it); [`Trainer::evaluate`] runs the same pass in float64, the number to decide on.
-//! The map's correction always runs in float64: it is a small difference of large products.
+//! A step's retraction runs in f32 on the step's own small products; a sync's runs in float64 on
+//! `S − U V`, a small difference of large products.
 //! On the Apple GPU, which has no float64 (`gam_gpu::tensor`), every product asked in float64
 //! here runs in f32 (the library is held in f32 there), and [`Trainer::evaluate`] is refused: its
 //! decision runs on a float64 device.
@@ -147,9 +151,20 @@ struct Trained {
     /// `W − S = A Bᵀ` past its decomposition's band, `A` per written block (d_i × r) and `B` per
     /// read block (d_j × r), when any.
     gap: Option<(Vec<Tensor>, Vec<Tensor>)>,
-    /// The corrections' maps from the last sync: `G = U (Uᵀ U)⁺` per written block (pieces × d_i),
-    /// and `H = (V Vᵀ)⁺ V` per read block (d_j × pieces), in the held layouts.
-    projectors: (Vec<Tensor>, Vec<Tensor>),
+    /// The Grams' eigenbases from the last sync (module note, "The map").
+    bases: Bases,
+}
+
+/// The eigendecompositions `U Uᵀ = Q_U Λ_U Q_Uᵀ` and `Vᵀ V = Q_V Λ_V Q_Vᵀ` of a site's held factors
+/// (`U` stacked over its written blocks, `V` side by side over its read blocks): `Q_U`'s rows per
+/// written block, `Λ_U` a column, `Q_V`'s rows per read block, `Λ_V` a row, and the sum of their
+/// bands, below which `λ_U + λ_V` is no direction.
+struct Bases {
+    u: Vec<Tensor>,
+    u_values: Tensor,
+    v: Vec<Tensor>,
+    v_values: Tensor,
+    floor: f64,
 }
 
 /// A masked program's library on a device, trained as the module note says.
@@ -352,7 +367,7 @@ impl Trainer {
                 listing: device.zeros(pieces, 2).map_err(error)?,
                 map,
                 gap,
-                projectors: (Vec::new(), Vec::new()),
+                bases: Bases { u: Vec::new(), u_values: device.zeros(0, 1).map_err(error)?, v: Vec::new(), v_values: device.zeros(1, 0).map_err(error)?, floor: 0.0 },
             });
         }
         let mut trainer = Self { device: device.clone(), native, program, masked, sites: trained, settings, arithmetic, steps: 0, uniforms: Uniforms(settings.seed | 1) };
@@ -402,6 +417,17 @@ impl Trainer {
     fn pass(&mut self, inputs: &FamilyInputs, learn: bool) -> Result<Tally, String> {
         let d = self.device.clone();
         let (rows, arithmetic, draws) = (inputs.rows, self.arithmetic, self.settings.draws);
+        // Each phase's wall time, at debug level (the device synchronised at its end).
+        let timed = log::log_enabled!(log::Level::Debug);
+        let mut clock = std::time::Instant::now();
+        let mut lap = |phase: &str| -> Result<(), String> {
+            if timed {
+                d.synchronize().map_err(error)?;
+                log::debug!("device train: {phase} {:.1} ms on {rows} rows", 1e3 * clock.elapsed().as_secs_f64());
+                clock = std::time::Instant::now();
+            }
+            Ok(())
+        };
         let trace = self.native.forward(inputs)?;
         let target = self.native.logits_on_device(&trace)?;
         // Every written block's sampled-label gradients, per site, per draw.
@@ -421,6 +447,7 @@ impl Trainer {
                 gradients[k].push(drawn);
             }
         }
+        lap("model forward and labels")?;
         // Each site's sets under its own code, and its writes' sizes in each input's metric.
         let mut tally = Tally { rows, ..Tally::default() };
         let mut masks = BTreeMap::new();
@@ -469,6 +496,7 @@ impl Trainer {
             owns.push(own);
         }
         drop(trace);
+        lap("sets")?;
         // The masked forward at the sets, its KL, and the box claim's charge on its reads.
         let mut family = inputs.clone();
         let slots = self.sites.iter().map(|s| s.slot + 1).max().unwrap_or(0);
@@ -484,6 +512,7 @@ impl Trainer {
         };
         drop(target);
         tally.kl = kl.sum();
+        lap("masked forward")?;
         let mut seeds = BTreeMap::new();
         let mut coefficients = Vec::new();
         for (site, own) in self.sites.iter().zip(owns) {
@@ -494,6 +523,7 @@ impl Trainer {
             seeds.insert(site.z, cot);
             coefficients.push(coefficient);
         }
+        lap("charge")?;
         let Some(hidden) = hidden else { return Ok(tally) };
         let keep: Vec<usize> = self.sites.iter().flat_map(|s| std::iter::once(s.z).chain(s.writes.iter().map(|b| b.node))).collect();
         let back = self.program.vjp_seeded(&masked_trace, hidden, seeds, &keep, arithmetic)?;
@@ -521,6 +551,7 @@ impl Trainer {
                 }
             }
         }
+        lap("reverse and gradients")?;
         Ok(tally)
     }
 
@@ -546,24 +577,45 @@ impl Trainer {
     }
 
     /// One Adam update from the gradients the training passes since the last summed, then each
-    /// site's map restored (module note, "The map").
+    /// site's map restored to first order (module note, "The map").
     pub fn update(&mut self) -> Result<(), String> {
         self.steps += 1;
         let d = self.device.clone();
         let Settings { betas: (beta1, beta2), epsilon, .. } = self.settings;
         for k in 0..self.sites.len() {
             let site = &mut self.sites[k];
+            let mut steps = Vec::new();
             for b in site.reads.iter_mut().chain(site.writes.iter_mut()) {
+                let before = d.copy(self.program.dense(b.op)?).map_err(error)?;
                 let (m, v) = &mut b.moments;
-                d.adam(self.program.dense_mut(b.op)?, (m, v), &b.gradient, b.rate, (beta1, beta2, epsilon), self.steps).map_err(error)?;
+                let held = self.program.dense_mut(b.op)?;
+                d.adam(held, (m, v), &b.gradient, b.rate, (beta1, beta2, epsilon), self.steps).map_err(error)?;
+                let mut step = d.copy(held).map_err(error)?;
+                d.axpy(&mut step, -1.0, &before).map_err(error)?;
+                steps.push((before, step));
                 b.gradient = d.zeros(b.gradient.rows(), b.gradient.cols()).map_err(error)?;
             }
-            self.keep_map(k, Arithmetic::F32)?;
+            // What the step moved the map by, `ΔU_i V_j + U_i ΔV_j` (V after, U before): small
+            // products, so single precision holds it to its own relative precision.
+            let reads = site.reads.len();
+            let (read_steps, write_steps) = steps.split_at(reads);
+            let mut residuals = Vec::new();
+            for (u_before, u_step) in write_steps {
+                let mut row = Vec::new();
+                for (read, (_, v_step)) in site.reads.iter().zip(read_steps) {
+                    let mut r = product(&d, u_step, Op::N, self.program.dense(read.op)?, Op::N, -1.0, Arithmetic::F32)?;
+                    d.gemm(&mut r, -1.0, u_before, Op::N, v_step, Op::N, 1.0, Arithmetic::F32).map_err(error)?;
+                    row.push(r);
+                }
+                residuals.push(row);
+            }
+            drop(steps);
+            self.retract(k, &residuals, Arithmetic::F32)?;
         }
         Ok(())
     }
 
-    /// The residuals `S_ij − U_iᵀ V_j` of site `k`.
+    /// The residuals `S_ij − U_i V_j` of site `k`.
     fn residuals(&self, k: usize, arithmetic: Arithmetic) -> Result<Vec<Vec<Tensor>>, String> {
         let (d, site) = (&self.device, &self.sites[k]);
         site.writes
@@ -583,64 +635,87 @@ impl Trainer {
             .collect()
     }
 
-    /// Site `k`'s map restored (module note, "The map"): `V_j ← V_j + Σ_i G_i R_ij`, then `U_i ←
-    /// U_i + Σ_j R'_ij H_j` on what that leaves (nothing, when `U` spans every written direction).
-    fn keep_map(&mut self, k: usize, arithmetic: Arithmetic) -> Result<(), String> {
+    /// Site `k`'s least change `(δU, δV)` (in the sum of both factors' squared entries) with `δU V
+    /// + U δV = R`, `R` per written and read block: `δU = Λ Vᵀ`, `δV = Uᵀ Λ` with `U Uᵀ Λ + Λ Vᵀ V =
+    /// R`, solved in the bases ([`Bases`]): `Λ = Q_U ((Q_Uᵀ R Q_V) ⊘ (λ_U + λ_V)) Q_Vᵀ`.
+    fn retract(&mut self, k: usize, residuals: &[Vec<Tensor>], arithmetic: Arithmetic) -> Result<(), String> {
         let d = self.device.clone();
-        let residuals = self.residuals(k, arithmetic)?;
         let site = &self.sites[k];
-        let corrections = (0..site.reads.len())
-            .map(|j| products(&d, site.projectors.0.iter().zip(residuals.iter().map(|row| &row[j])), (Op::N, Op::N), 1.0, arithmetic))
-            .collect::<Result<Vec<_>, _>>()?;
-        for (read, correction) in site.reads.iter().zip(corrections) {
-            d.axpy(self.program.dense_mut(read.op)?, 1.0, &correction).map_err(error)?;
+        let bases = &site.bases;
+        let mut core: Option<Tensor> = None;
+        for (i, row) in residuals.iter().enumerate() {
+            for (j, r) in row.iter().enumerate() {
+                let right = product(&d, r, Op::N, &bases.v[j], Op::N, 1.0, arithmetic)?;
+                match &mut core {
+                    None => core = Some(product(&d, &bases.u[i], Op::T, &right, Op::N, 1.0, arithmetic)?),
+                    Some(total) => d.gemm(total, 1.0, &bases.u[i], Op::T, &right, Op::N, 1.0, arithmetic).map_err(error)?,
+                }
+            }
         }
-        let residuals = self.residuals(k, arithmetic)?;
-        let site = &self.sites[k];
-        let corrections = residuals.iter().map(|row| products(&d, row.iter().zip(&site.projectors.1), (Op::N, Op::N), 1.0, arithmetic)).collect::<Result<Vec<_>, _>>()?;
-        for (write, correction) in site.writes.iter().zip(corrections) {
-            d.axpy(self.program.dense_mut(write.op)?, 1.0, &correction).map_err(error)?;
+        let mut core = core.ok_or_else(|| error("a site without blocks"))?;
+        d.divide_sums(&mut core, &bases.u_values, &bases.v_values, bases.floor).map_err(error)?;
+        let us: Vec<&Tensor> = site.writes.iter().map(|b| self.program.dense(b.op)).collect::<Result<_, _>>()?;
+        let vs: Vec<&Tensor> = site.reads.iter().map(|b| self.program.dense(b.op)).collect::<Result<_, _>>()?;
+        // `Uᵀ Q_U` (pieces × d_out) and `Q_Vᵀ Vᵀ` (d_in × pieces).
+        let u_turned = products(&d, us.iter().copied().zip(&bases.u), (Op::T, Op::N), 1.0, arithmetic)?;
+        let v_turned = products(&d, bases.v.iter().zip(vs.iter().copied()), (Op::T, Op::T), 1.0, arithmetic)?;
+        let core_v = product(&d, &core, Op::N, &v_turned, Op::N, 1.0, arithmetic)?;
+        let u_core = product(&d, &u_turned, Op::N, &core, Op::N, 1.0, arithmetic)?;
+        let write_moves = bases.u.iter().map(|q| product(&d, q, Op::N, &core_v, Op::N, 1.0, arithmetic)).collect::<Result<Vec<_>, _>>()?;
+        let read_moves = bases.v.iter().map(|q| product(&d, &u_core, Op::N, q, Op::T, 1.0, arithmetic)).collect::<Result<Vec<_>, _>>()?;
+        let ops: Vec<usize> = site.writes.iter().chain(&site.reads).map(|b| b.op).collect();
+        for (op, change) in ops.into_iter().zip(write_moves.iter().chain(&read_moves)) {
+            d.axpy(self.program.dense_mut(op)?, 1.0, change).map_err(error)?;
         }
         Ok(())
     }
 
-    /// Every site's projector from its current `U`, its map restored exactly, its library written
-    /// into the masked program, and its description bits priced again under `describe`.
+    /// The largest entry of site `k`'s residuals.
+    fn largest_residual(&self, k: usize, arithmetic: Arithmetic) -> Result<f64, String> {
+        let mut largest = 0.0_f64;
+        for row in self.residuals(k, arithmetic)? {
+            for r in row {
+                largest = self.device.download(&r).map_err(error)?.iter().fold(largest, |m, x| m.max(x.abs()));
+            }
+        }
+        Ok(largest)
+    }
+
+    /// Every site's bases from its current factors, its map restored exactly (retractions while the
+    /// residual shrinks), its library written into the masked program, and its description bits
+    /// priced again under `describe`.
     pub fn sync(&mut self, describe: &dyn Describe) -> Result<&Masked, String> {
         let d = self.device.clone();
+        let exact = exact(&d);
         for k in 0..self.sites.len() {
             let site = &self.sites[k];
             let us: Vec<&Tensor> = site.writes.iter().map(|b| self.program.dense(b.op)).collect::<Result<_, _>>()?;
             let vs: Vec<&Tensor> = site.reads.iter().map(|b| self.program.dense(b.op)).collect::<Result<_, _>>()?;
-            // G_i = Σ_l U_lᵀ (U Uᵀ)⁺_li and H_j = Σ_l (Vᵀ V)⁺_jl V_lᵀ, from the Grams' pseudo-inverses.
-            let pseudo_inverse = |blocks: Vec<Vec<Tensor>>| -> Result<Array2<f64>, String> {
-                let gram = assemble(&d, &blocks)?;
-                let decomposed = eigh(gram.view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
-                let mut scaled = decomposed.vectors.clone();
-                for (j, value) in decomposed.values.iter().enumerate() {
-                    let inverse = if *value > decomposed.band { value.recip() } else { 0.0 };
-                    scaled.column_mut(j).mapv_inplace(|x| x * inverse);
-                }
-                Ok(scaled.dot(&decomposed.vectors.t()))
+            let decompose = |held: &[&Tensor], (ta, tb): (Op, Op)| -> Result<super::dense::Eigh, String> {
+                let blocks: Vec<Vec<Tensor>> = held.iter().map(|a| held.iter().map(|b| product(&d, a, ta, b, tb, 1.0, exact)).collect()).collect::<Result<_, _>>()?;
+                eigh(assemble(&d, &blocks)?.view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))
             };
-            let grams = |held: &[&Tensor], ta: Op, tb: Op| -> Result<Vec<Vec<Tensor>>, String> {
-                held.iter().map(|a| held.iter().map(|b| product(&d, a, ta, b, tb, 1.0, exact(&d))).collect()).collect()
-            };
+            let (u_gram, v_gram) = (decompose(&us, (Op::N, Op::T))?, decompose(&vs, (Op::T, Op::N))?);
             let (u_widths, v_widths): (Vec<usize>, Vec<usize>) = (us.iter().map(|t| t.rows()).collect(), vs.iter().map(|t| t.cols()).collect());
-            let inverse = pseudo_inverse(grams(&us, Op::N, Op::T)?)?;
-            let mut g = Vec::new();
-            for column in split(&inverse, &u_widths, true) {
-                let parts = split(&column, &u_widths, false).iter().map(|p| d.upload(p.view()).map_err(error)).collect::<Result<Vec<_>, _>>()?;
-                g.push(products(&d, us.iter().copied().zip(&parts), (Op::T, Op::N), 1.0, exact(&d))?);
+            let upload = |parts: Vec<Array2<f64>>| parts.iter().map(|p| d.upload(p.view()).map_err(error)).collect::<Result<Vec<_>, _>>();
+            let bases = Bases {
+                u: upload(split(&u_gram.vectors, &u_widths, false))?,
+                u_values: d.upload_vec(u_gram.values.len(), 1, u_gram.values.to_vec()).map_err(error)?,
+                v: upload(split(&v_gram.vectors, &v_widths, false))?,
+                v_values: d.upload_vec(1, v_gram.values.len(), v_gram.values.to_vec()).map_err(error)?,
+                floor: u_gram.band + v_gram.band,
+            };
+            self.sites[k].bases = bases;
+            let mut largest = self.largest_residual(k, exact)?;
+            while largest > 0.0 {
+                let residuals = self.residuals(k, exact)?;
+                self.retract(k, &residuals, exact)?;
+                let next = self.largest_residual(k, exact)?;
+                if next >= largest {
+                    break;
+                }
+                largest = next;
             }
-            let inverse = pseudo_inverse(grams(&vs, Op::T, Op::N)?)?;
-            let mut h = Vec::new();
-            for row in split(&inverse, &v_widths, false) {
-                let parts = split(&row, &v_widths, true).iter().map(|p| d.upload(p.view()).map_err(error)).collect::<Result<Vec<_>, _>>()?;
-                h.push(products(&d, parts.iter().zip(vs.iter().copied()), (Op::N, Op::T), 1.0, exact(&d))?);
-            }
-            self.sites[k].projectors = (g, h);
-            self.keep_map(k, exact(&d))?;
             let site = &self.sites[k];
             let download = |op: usize| -> Result<Array2<f64>, String> { d.download(self.program.dense(op)?).map_err(error) };
             let v_parts: Vec<Array2<f64>> = site.reads.iter().map(|b| download(b.op)).collect::<Result<_, _>>()?;

@@ -1193,6 +1193,38 @@ impl Device {
         }
     }
 
+    /// `x[i, j] ← x[i, j] / (rows[i] + cols[j])`, or 0 where that sum is not above `floor`: in the
+    /// eigenbases of `K_r` and `K_c` (eigenvalues `rows`, rows × 1, and `cols`, 1 × cols), the
+    /// solution of the Sylvester equation `K_r X + X K_c = C` from `C`.
+    pub fn divide_sums(&self, x: &mut Tensor, rows: &Tensor, cols: &Tensor, floor: f64) -> Result<(), GpuError> {
+        if rows.dim() != (x.rows, 1) || cols.dim() != (1, x.cols) {
+            return Err(shape(format!("sums of {:?} and {:?} for {:?}", rows.dim(), cols.dim(), x.dim())));
+        }
+        let divide = |x: &mut [f64], r: &[f64], c: &[f64], width: usize| {
+            for (i, v) in x.iter_mut().enumerate() {
+                let sum = r[i / width] + c[i % width];
+                *v = if sum > floor { *v / sum } else { 0.0 };
+            }
+        };
+        match &*self.backend {
+            Backend::Host => {
+                let (r, c, width) = (host(rows)?.to_vec(), host(cols)?.to_vec(), x.cols);
+                divide(host_mut(x)?, &r, &c, width);
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.divide_sums(x, rows, cols, floor),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => {
+                let (mut values, r, c) = (self.download(x)?, self.download(rows)?, self.download(cols)?);
+                let width = x.cols;
+                divide(values.as_slice_mut().ok_or_else(|| shape("a downloaded tensor is contiguous".to_string()))?, r.as_slice().unwrap_or(&[]), c.as_slice().unwrap_or(&[]), width);
+                *x = self.upload(values.view())?;
+                Ok(())
+            }
+        }
+    }
+
     /// The box claim's charge at one site (`gam_mpd::masked::box_upper`) and its gradients: per row
     /// `N_r = Σ_c (1 − m_rc) |z_rc| q_rc`, `q_rc` the subcomponent's write in the row's metric,
     /// returned as `½ N_r²`; `cot[r, c] += N_r (1 − m_rc) sign(z_rc) q_rc` (its gradient in `z`),
@@ -1679,6 +1711,13 @@ extern "C" __global__ void select_sets(unsigned int rows, unsigned int cols, uns
             }
         }
         __syncthreads();
+    }
+}
+
+extern "C" __global__ void divide_sums(u64 n, unsigned int cols, const double* r, const double* c, double floor, double* x) {
+    GRID_STRIDE(i, n) {
+        double sum = r[i / cols] + c[i % cols];
+        x[i] = sum > floor ? x[i] / sum : 0.0;
     }
 }
 
@@ -2268,6 +2307,18 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
                     .arg(&mut keys).arg(&mut order).arg(&mut sizes).arg(slice_mut(mask)?).launch(cfg)
             }
             .gpu_ctx("tensor select_sets")
+            .map(|_| ())
+        }
+
+        pub(super) fn divide_sums(&self, x: &mut Tensor, rows: &Tensor, cols: &Tensor, floor: f64) -> Result<(), GpuError> {
+            let (n, width) = (x.len() as u64, x.cols as u32);
+            if n == 0 { return Ok(()); }
+            let f = self.function("divide_sums")?;
+            // SAFETY: shapes checked by the caller.
+            unsafe {
+                self.stream.launch_builder(&f).arg(&n).arg(&width).arg(slice(rows)?).arg(slice(cols)?).arg(&floor).arg(slice_mut(x)?).launch(cfg_elements(n))
+            }
+            .gpu_ctx("tensor divide_sums")
             .map(|_| ())
         }
 
