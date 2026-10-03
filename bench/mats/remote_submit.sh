@@ -45,9 +45,6 @@ rm -rf "$dest"
 mv "$dest.tmp" "$dest"
 touch "$dest/READY"
 echo "== $(date '+%F %T') installed $(ls "$dest" | wc -l) entries in $dest"
-# Keep the 12 newest builds. On NFS a binary a running job still executes cannot be removed yet
-# (.nfs* placeholders), so pruning is best effort and never fails the build.
-ls -1dt "$HOME"/mpd-bin/*/ | tail -n +13 | xargs -r rm -rf 2> /dev/null || true
 BUILD
 
 exec 9> "$CL/_build/submit.lock"
@@ -107,6 +104,16 @@ elif [ -z "$B" ]; then
     dep=(--dependency="afterok:$bj" --kill-on-invalid-dep=yes)
 fi
 find "$BIN" -maxdepth 1 \( -name '*.buildjob' -o -name '*.failed' \) -mtime +1 -delete
+# Prune old builds here (the compute node cannot see the queue): beyond the 12 newest, a build goes
+# only when it is 2 days old and no queued, running or pool job's script names it. Best effort: NFS
+# keeps a binary a running process still executes.
+inuse=$( { squeue -u "$USER" -h -o %o 2> /dev/null; sed -n 's/^# script=//p' "$CL"/queue/{todo,running}/*.task 2> /dev/null; } |
+    sort -u | xargs -r grep -ohE "$BIN/[0-9a-f]{12}" 2> /dev/null | sort -u)
+for d in $(ls -1dt "$BIN"/*/ | tail -n +13); do
+    d=${d%/}
+    [ -n "$(find "$d" -maxdepth 0 -mtime +2)" ] && ! grep -qx "$d" <<< "$inuse" && rm -rf "$d" 2> /dev/null
+done
+true
 
 stamp=$(date +%Y%m%d-%H%M%S)-$$
 job=$OUT/job-$stamp.sh
