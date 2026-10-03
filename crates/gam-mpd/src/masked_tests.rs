@@ -545,31 +545,6 @@ fn shared_cpu_fisher_matches_full_vocabulary_reverse_passes_for_grouped_masks() 
 }
 
 #[test]
-#[ignore = "manual timing of the training preconditioner; no timing assertion"]
-fn benchmark_training_preconditioner_solve() {
-    use super::masked::{shrunk_direction, shrunk_inverse};
-    use std::{hint::black_box, time::Instant};
-    for width in [256, 768] {
-        let x = Array2::from_shape_fn((width + 32, width), |(i, j)| noise(1009 * i + j));
-        let m = x.t().dot(&x) / width as f64;
-        let g = Array2::from_shape_fn((64, width), |(i, j)| noise(997 * i + j));
-        let mut old = Vec::new();
-        let mut new = Vec::new();
-        for _ in 0..3 {
-            let started = Instant::now();
-            let reference = black_box(g.dot(&shrunk_inverse(&m).expect("inverse")));
-            old.push(started.elapsed().as_secs_f64());
-            let started = Instant::now();
-            let direction = black_box(shrunk_direction(&m, &g).expect("solve"));
-            new.push(started.elapsed().as_secs_f64());
-            assert!((&reference - &direction).iter().all(|v| v.abs() < 1e-10));
-        }
-        old.sort_by(f64::total_cmp); new.sort_by(f64::total_cmp);
-        eprintln!("preconditioner width={width} pieces=64 spectral_seconds={} solve_seconds={} ratio={}", old[1], new[1], old[1] / new[1]);
-    }
-}
-
-#[test]
 fn piece_space_projection_matches_width_space_and_preserves_the_native_sum() {
     let left = Array2::from_shape_fn((20, 8), |(i, j)| noise(31 * i + j + 1));
     let right = Array2::from_shape_fn((8, 256), |(i, j)| noise(17 * i + j + 9));

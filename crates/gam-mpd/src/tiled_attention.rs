@@ -205,25 +205,4 @@ mod tests {
             }
         }
     }
-    #[test]
-    #[ignore = "manual attention timing; no timing assertion"]
-    fn benchmark_training_attention() {
-        use std::{hint::black_box, time::Instant};
-        for rows in [256, 1024] {
-            let inputs = FamilyInputs { rows, slots: vec![], layout: Some(SequenceLayout { sequence: vec![0; rows], position: (0..rows as u32).collect() }) };
-            let (q, k, v) = (data(rows, 64, 1), data(rows, 64, 2), data(rows, 64, 3));
-            let mut old = Vec::new(); let mut new = Vec::new();
-            for _ in 0..3 {
-                let started = Instant::now();
-                let expected = black_box(reference(&inputs, (&q, &k, &v), 0.125, None, true));
-                old.push(started.elapsed().as_secs_f64());
-                let started = Instant::now();
-                let actual = black_box(forward(&inputs, (&q, &k, &v), 0.125, None, true).expect("forward"));
-                new.push(started.elapsed().as_secs_f64());
-                close(&actual, &expected, 1e-12);
-            }
-            old.sort_by(f64::total_cmp); new.sort_by(f64::total_cmp);
-            eprintln!("attention rows={rows} width=64 scalar_seconds={} tiled_seconds={} ratio={}", old[1], new[1], old[1] / new[1]);
-        }
-    }
 }
