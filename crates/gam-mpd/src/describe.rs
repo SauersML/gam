@@ -72,6 +72,7 @@
 
 use super::codec::{fixed_index_len_bits, prefix_integer_len_bits, signed_delta_len_bits, subset_code_len_bits};
 use super::dense::{eigh, solve, svd};
+use gam_linalg::faer_ndarray::fast_abt;
 use gam_linalg::roundoff::SymmetricAssembly;
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
 use std::borrow::Cow;
@@ -328,17 +329,15 @@ fn symmetric(m: &Array2<f64>) -> Array2<f64> {
 /// over its eigenvalues beyond the decomposition's band.
 fn inverses(m: &Array2<f64>) -> Result<(Array2<f64>, Array2<f64>), String> {
     let d = eigh(symmetric(m).view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
-    let n = m.nrows();
-    let (mut inverse, mut root) = (Array2::<f64>::zeros((n, n)), Array2::<f64>::zeros((n, n)));
+    // `Q Λ⁻¹ Qᵀ` and `Q Λ^{-1/2} Qᵀ` over the eigenvalues beyond the band, as two products of the
+    // scaled eigenvectors (the dropped ones scaled to zero), each mirrored to exact symmetry.
+    let (mut inverse_factor, mut root_factor) = (d.vectors.clone(), d.vectors.clone());
     for (i, l) in d.values.iter().enumerate() {
-        if *l > d.band {
-            let q = d.vectors.column(i);
-            let outer = q.insert_axis(Axis(1)).dot(&q.insert_axis(Axis(0)));
-            inverse.scaled_add(1.0 / l, &outer);
-            root.scaled_add(1.0 / l.sqrt(), &outer);
-        }
+        let (a, b) = if *l > d.band { (1.0 / l, 1.0 / l.sqrt()) } else { (0.0, 0.0) };
+        inverse_factor.column_mut(i).mapv_inplace(|v| v * a);
+        root_factor.column_mut(i).mapv_inplace(|v| v * b);
     }
-    Ok((inverse, root))
+    Ok((symmetric(&fast_abt(&inverse_factor, &d.vectors)), symmetric(&fast_abt(&root_factor, &d.vectors))))
 }
 
 /// Bits of a real sent as the signed integer `i` (the signed Elias δ code).
