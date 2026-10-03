@@ -364,3 +364,29 @@ fn a_resumed_screened_selection_is_the_uninterrupted_one() {
         assert_eq!(resumed_states, states[k..], "resumed at round {k}: other states on the way");
     }
 }
+
+/// On a lowered program the adversary climbs every box's every start as one batch of sequences
+/// and finds what each box's own run finds on the CPU.
+#[test]
+fn a_batched_adversary_on_a_device_finds_each_boxs_points() {
+    use super::certify::{Gates, adversary, adversary_batch};
+    let (unlowered, base, masks, clean) = masked_fixture();
+    let (lowered, _, _, _) = masked_fixture();
+    lowered.lower_on(&gam_gpu::tensor::Device::host(), Arithmetic::F64).expect("lowered");
+    let claim = Gates::claim(&masks);
+    let mut first = claim.clone();
+    for k in 1..masks.len() {
+        first.upper[k] = first.lower[k].clone();
+    }
+    let boxes = [claim, first];
+    let seeds = [5u64, 9];
+    for target in targets(&clean) {
+        let batched = adversary_batch(&lowered, &base, &target, &boxes, 3, 4, &seeds).expect("batched");
+        for (b, gates) in boxes.iter().enumerate() {
+            let alone = adversary(&unlowered, &base, &target, gates, None, 3, 4, seeds[b]).expect("alone");
+            for r in 0..base.rows {
+                assert!((batched[b][r] - alone[r]).abs() <= 1e-9 * (1.0 + alone[r].abs()), "box {b} row {r}: {} against {}", batched[b][r], alone[r]);
+            }
+        }
+    }
+}

@@ -65,11 +65,14 @@
 //!
 //! `g` the KL's gradient at the written value and `F` its Fisher ([`box_excess`]). The claim is
 //! about every point of the box, so its error is the worst case: [`box_excess_at`] charges each
-//! sequence the largest of that expectation, the exact KL at every layer's vertex (one layer
-//! masked, the rest's off gates at 1), which the expectation barely sees and which a set whose
-//! layers cancel each other's errors fails, and the exact KL along a few sign-ascent steps of an
-//! adversary in the off gates. A fit under the box claim learns subcomponents that
-//! explain the input whatever the off ones are set to, not only at exactly one mask.
+//! sequence the largest exact KL among the points it evaluates, the masks themselves, every
+//! layer's vertex (one layer masked, the rest's off gates at 1, which a set whose layers cancel
+//! each other's errors fails), and an adversary's sign ascent in the off gates (charged per word).
+//! That is a lower bound on the worst case. The expectation above is no point of the box, and a
+//! refinement of the library lowers it with the box unchanged (one off piece split into `q` copies
+//! cuts its own term by `1/q`), so it screens proposals and steers steps but is never charged. A
+//! fit under the box claim learns subcomponents that explain the input whatever the off ones are
+//! set to, not only at exactly one mask.
 //!
 //! # Behaviours
 //!
@@ -897,21 +900,22 @@ pub fn kl_and_logits(masked: &Masked, family: &FamilyInputs, target: &Target) ->
 }
 
 /// The box claim's error beyond the masks' own KL, per input (module note, "Claims"): the worst,
-/// per sequence, of the box points evaluated. They are the masks themselves (no excess), the
-/// expectation over uniform off gates ([`expected_box_excess_at`]), every layer's vertex (that
-/// layer's sites at the masks, every other site's off gates at 1), and an adversary's points
+/// per sequence, of the box points evaluated. They are the masks themselves (no excess), every
+/// layer's vertex (that layer's sites at the masks, every other site's off gates at 1), and an
+/// adversary's points
 /// (sign ascent over the off gates, all together and one layer's alone), each of whose KL is exact;
 /// the adversary's are charged per word, each word its own worst point. A sequence is
 /// charged the point of its largest total, so a set whose layers only cancel each other's errors
-/// pays for it. A lower bound on the claim's worst case.
-pub fn box_excess_at(masked: &Masked, base: &FamilyInputs, target: &Target, masks: &[Array2<f64>], fishers: &[Array2<f64>]) -> Result<Array1<f64>, String> {
+/// pays for it. A lower bound on the claim's worst case. The expectation over uniform off gates
+/// ([`expected_box_excess_at`]) is no point of the box and a refinement of the library lowers it
+/// with the box unchanged, so it only screens proposals (its Fishers, `_fishers`, go unused here).
+pub fn box_excess_at(masked: &Masked, base: &FamilyInputs, target: &Target, masks: &[Array2<f64>], _fishers: &[Array2<f64>]) -> Result<Array1<f64>, String> {
     let corner = score_only(masked, &masked.family(base, masks), target)?;
-    let expected = expected_box_excess_at(masked, base, target, masks, fishers)?;
-    box_excess_from(masked, base, target, masks, &corner, expected)
+    box_excess_from(masked, base, target, masks, &corner)
 }
 
 /// [`box_excess_at`] from the masks' own KL `corner` and their expected excess `expected`.
-fn box_excess_from(masked: &Masked, base: &FamilyInputs, target: &Target, masks: &[Array2<f64>], corner: &Array1<f64>, expected: Array1<f64>) -> Result<Array1<f64>, String> {
+fn box_excess_from(masked: &Masked, base: &FamilyInputs, target: &Target, masks: &[Array2<f64>], corner: &Array1<f64>) -> Result<Array1<f64>, String> {
     // The vertices share every gate on up to their own layer (as in a selection).
     let lowered = masked.on_device(|_| Ok(()))?.is_some();
     let all_on = if !lowered && masked.head.is_none() {
@@ -923,7 +927,7 @@ fn box_excess_from(masked: &Masked, base: &FamilyInputs, target: &Target, masks:
     } else {
         None
     };
-    box_worst(masked, base, target, masks, corner, expected, all_on.as_ref())
+    box_worst(masked, base, target, masks, corner, all_on.as_ref())
 }
 
 /// The program's logits when they are one dense product of a hidden node and nothing after it:
@@ -1246,7 +1250,6 @@ fn box_worst(
     target: &Target,
     masks: &[Array2<f64>],
     corner: &Array1<f64>,
-    expected: Array1<f64>,
     all_on: Option<&Trace>,
 ) -> Result<Array1<f64>, String> {
     let rows = base.rows;
@@ -1262,15 +1265,11 @@ fn box_worst(
         }
         totals
     };
-    let mut worst = expected;
-    let mut totals = per_sequence(&worst);
-    // The masks themselves are a point of the box.
-    for r in 0..rows {
-        if totals[sequence_of[r]] < 0.0 {
-            worst[r] = 0.0;
-        }
-    }
-    totals.iter_mut().for_each(|t| *t = t.max(0.0));
+    // The masks themselves are a point of the box. The expected excess over uniform gates is not
+    // one, and a refinement of the library can lower it with the box unchanged, so it only
+    // screens proposals and is never charged.
+    let mut worst = Array1::<f64>::zeros(rows);
+    let mut totals = vec![0.0; sequences];
     // Sites by layer: the name up to its last `.`.
     let mut layers: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (k, site) in masked.sites.iter().enumerate() {
@@ -1339,8 +1338,8 @@ fn box_worst(
             boxes.push(only);
         }
     }
-    for (i, gates) in boxes.iter().enumerate() {
-        let kl_point = super::certify::adversary(masked, base, target, gates, None, ADVERSARY_STEPS, ADVERSARY_STARTS, 0xAD5E + i as u64)?;
+    let seeds: Vec<u64> = (0..boxes.len()).map(|i| 0xAD5E + i as u64).collect();
+    for kl_point in super::certify::adversary_batch(masked, base, target, &boxes, ADVERSARY_STEPS, ADVERSARY_STARTS, &seeds)? {
         let excess = &kl_point - corner;
         for r in 0..rows {
             worst[r] = worst[r].max(excess[r]);
@@ -2264,11 +2263,9 @@ pub fn select_resumable(
         let family = masked.family(base, trial);
         match boxed {
             None => Ok((score_only(masked, &family, target)?, Array1::zeros(rows))),
-            Some(f) => {
-                let (kl_trial, mut state) = Selected::forward(masked, &family, target, on_device, false)?;
-                let expected = state.expected_excess(masked, &family, target, trial, f, box_terms.as_deref(), on_device, false)?;
-                drop(state);
-                let excess = box_worst(masked, base, target, trial, &kl_trial, expected, all_on.as_ref())?;
+            Some(_) => {
+                let kl_trial = Selected::forward(masked, &family, target, on_device, false)?.0;
+                let excess = box_worst(masked, base, target, trial, &kl_trial, all_on.as_ref())?;
                 Ok((kl_trial, excess))
             }
         }
@@ -2297,10 +2294,8 @@ pub fn select_resumable(
                 if let (Some(screen), Selected::Host(trace, _, _)) = (&screen, &state) {
                     head_base = Some(screen.base(masked, trace));
                 }
-                // The excess first, so its reverse pass also serves the mask gradients.
-                if let (Some(f), None) = (boxed, &excess_known) {
-                    let expected = state.expected_excess(masked, &family, target, &masks, f, box_terms.as_deref(), on_device, true)?;
-                    excess_known = Some(box_worst(masked, base, target, &masks, &kl_now, expected, all_on.as_ref())?);
+                if let (Some(_), None) = (boxed, &excess_known) {
+                    excess_known = Some(box_worst(masked, base, target, &masks, &kl_now, all_on.as_ref())?);
                 }
                 let grads = state.mask_gradients(masked, &family, target, on_device)?;
                 // The Fisher diagonal only ranks proposals (the exact forward decides), so it is
@@ -2560,11 +2555,10 @@ pub fn select_resumable(
             }
         };
         let excess_new = match boxed {
-            Some(f) => {
-                let expected = state_new.expected_excess(masked, &proposed_family, target, &proposed, f, box_terms.as_deref(), on_device, true)?;
+            Some(_) => {
                 // Kept, this forward serves only the next round's mask gradients.
                 state_new.shrink(masked);
-                box_worst(masked, base, target, &proposed, &kl_new, expected, all_on.as_ref())?
+                box_worst(masked, base, target, &proposed, &kl_new, all_on.as_ref())?
             }
             None => Array1::zeros(rows),
         };
@@ -2994,7 +2988,7 @@ pub fn step_pieces(
     let (total, grads) = match claim {
         Claim::Corner => (kl_now.sum(), grads),
         Claim::Box => {
-            let (excess, box_grads) = match &evaluated {
+            let (_, box_grads) = match &evaluated {
                 Evaluated::Host(trace, cotangent) => box_excess(masked, &family, trace, masks, cotangent.clone(), &running.fishers, true)?,
                 Evaluated::Device(state) => masked.on_lowered(|accelerated| accelerated.box_excess(masked, state, masks, &running.fishers, true))?,
             };
@@ -3002,7 +2996,7 @@ pub fn step_pieces(
             let grads = grads.into_iter().zip(box_grads).map(|((m, v, u), (bv, bu))| (m, v + bv, u + bu)).collect::<Vec<_>>();
             // The expectation's gradients steer; the claim's error, its worst case over the box
             // points ([`box_excess_at`]), decides.
-            (kl_now.sum() + box_excess_from(masked, base, target, masks, &kl_now, excess)?.sum(), grads)
+            (kl_now.sum() + box_excess_from(masked, base, target, masks, &kl_now)?.sum(), grads)
         }
     };
     // The direction, as the tangent of each operator it moves, on one side of every site and
@@ -3064,18 +3058,12 @@ pub fn step_pieces(
         }
         (Claim::Corner, None) => score_only(masked, &family, target)?.sum(),
         (Claim::Box, Some(on_device)) => {
-            let (kl_trial, expected) = masked.on_lowered(|accelerated| {
-                let state = accelerated.forward(&family, on_device)?;
-                let expected = accelerated.box_excess(masked, &state, masks, &running.fishers, false)?.0;
-                Ok((state.kl.clone(), expected))
-            })?;
-            kl_trial.sum() + box_excess_from(masked, base, target, masks, &kl_trial, expected)?.sum()
+            let kl_trial = masked.on_lowered(|accelerated| Ok(accelerated.forward(&family, on_device)?.kl.clone()))?;
+            kl_trial.sum() + box_excess_from(masked, base, target, masks, &kl_trial)?.sum()
         }
         (Claim::Box, None) => {
-            let (kl_trial, trial_trace, trial_cotangent) = forward(masked, &family, target)?;
-            let expected = box_excess(masked, &family, &trial_trace, masks, trial_cotangent, &running.fishers, false)?.0;
-            drop(trial_trace);
-            kl_trial.sum() + box_excess_from(masked, base, target, masks, &kl_trial, expected)?.sum()
+            let kl_trial = score_only(masked, &family, target)?;
+            kl_trial.sum() + box_excess_from(masked, base, target, masks, &kl_trial)?.sum()
         }
     }))
 }

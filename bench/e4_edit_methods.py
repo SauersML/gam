@@ -411,8 +411,9 @@ def stage_compile_export():
     log(f"wrote {d / 'manifest.json'}: {len(problems)} problems, {len(K)} fire keys")
 
 
-def family_deltas():
-    """Every closed-form family as strength -> delta W (torch, mps), from prep.npz and the compiled plans."""
+def family_deltas(only=None):
+    """Every closed-form family as strength -> delta W (torch, on the device), from prep.npz and the compiled plans;
+    with `only`, just the compiled plans named there (the others are cheap and always built)."""
     import torch
     z = np.load(OUT / "prep.npz")
     target, U, V = E.load()
@@ -429,6 +430,8 @@ def family_deltas():
             fams[f"{rn}+{wn}"] = lambda s, w=w, uu=uu: s * torch.outer(w, uu)
     for plan in sorted((OUT / "compile").glob("plan_*.left.npy")):
         name = plan.name[len("plan_"):-len(".left.npy")]
+        if only is not None and name not in only:
+            continue
         unit = t32(np.load(plan) @ np.load(plan.with_name(plan.name.replace(".left.", ".right."))).T)
         fams[name] = lambda s, unit=unit: s * unit
     fams["vpd"] = lambda a: torch.outer((-a * u_o).to(torch.bfloat16).float() - U, V)
@@ -671,6 +674,9 @@ def stage_prep_fisher(eps=0.1):
                 for q in np.nonzero(hit[r])[0]:
                     out.append(g2[0, q].cpu().double().numpy())
                     ctx.append(rows[r, max(0, q - E.SIDE):q + 1])
+                del g2
+                if r % 64 == 0:
+                    E.empty_cache()
             keys[name] = np.stack(out)
             if name == "N_dev":  # windows ending at the near-miss eye, for the dev KL there
                 L = max(len(c) for c in ctx)
@@ -708,7 +714,7 @@ def stage_dev(names):
     headline success, then KL on 64 general rows (val 3000-3063), KL at held-out near-miss eyes (val rows 2304-2999),
     and the change in the correct ending's share on 1000 HellaSwag train items. Appends to dev.json."""
     import torch
-    target, fams, _ = family_deltas()
+    target, fams, _ = family_deltas(only=names)
     site = target.site(E.SITE)
     W0 = site.W.clone()
     resid, final, head = E.split_forward(target)
@@ -720,6 +726,8 @@ def stage_dev(names):
     rows = np.asarray(REF[SCREEN_ROWS.start:SCREEN_ROWS.stop, :512]).astype(np.int64)
     emo, _, _ = masks(rows, txt)
     win, wl = torch.from_numpy(zf["N_dev_windows"]).to(E.DEVICE), torch.from_numpy(zf["N_dev_lens"] - 1).to(E.DEVICE)
+    eye = zf["N_dev_windows"][np.arange(len(zf["N_dev_lens"])), zf["N_dev_lens"] - 1]
+    spaced_colon = np.array([txt[t] == " :" for t in eye])  # the harness's near-miss panel: a spaced ':' only
     hs = hellaswag_dev()
     path = OUT / "dev.json"
     res = json.load(open(path)) if path.exists() else {}
@@ -750,25 +758,28 @@ def stage_dev(names):
             le = torch.log_softmax(target(b)[ar, l], -1)
             out.append((le.exp() * (le - lb)).sum(-1))
         site.W = W0
-        return float(torch.cat(out).mean())
+        kl = torch.cat(out).cpu().numpy()
+        return float(kl.mean()), float(kl[spaced_colon].mean())
 
     @torch.no_grad()
     def hs_lp(W):
         site.W = W
         lp = np.zeros(len(hs))
         order = np.argsort([len(r[0]) for r in hs])
-        for i in range(0, len(order), 32):
-            idx = order[i:i + 32]
-            L = max(len(hs[j][0]) for j in idx)
-            ids = torch.zeros(len(idx), L, dtype=torch.long)
+        for i in range(0, len(order), 8):
+            idx = order[i:i + 8]
+            L = -(-max(len(hs[j][0]) for j in idx) // 64) * 64  # few distinct shapes: MPS caches a graph per shape
+            ids = torch.zeros(8, L, dtype=torch.long)
             for r, j in enumerate(idx):
                 ids[r, :len(hs[j][0])] = torch.tensor(hs[j][0])
-            lg = torch.log_softmax(target(ids.to(E.DEVICE)), -1)
+            lg = target(ids.to(E.DEVICE))
             for r, j in enumerate(idx):
                 n, t = hs[j][1], len(hs[j][0])
                 tg = ids[r, t - n:t].to(E.DEVICE)
-                lp[j] = float(lg[r, t - n - 1:t - 1].gather(-1, tg[:, None]).sum())
+                lp[j] = float(torch.log_softmax(lg[r, t - n - 1:t - 1], -1).gather(-1, tg[:, None]).sum())
             del lg
+            if i % 512 == 0:
+                E.empty_cache()
         site.W = W0
         E.empty_cache()
         return lp
@@ -794,7 +805,8 @@ def stage_dev(names):
                 mid = (lo * hi) ** 0.5
                 lo, hi = (mid, hi) if pf(W0 + fams[nm](mid)) < p_star else (lo, mid)
             dW = fams[nm]((lo * hi) ** 0.5)
-        res[nm] = {"p_fire": pf(W0 + dW), "kl_general": kl_general(W0 + dW), "kl_near": kl_near(W0 + dW),
+        near, near_colon = kl_near(W0 + dW)
+        res[nm] = {"p_fire": pf(W0 + dW), "kl_general": kl_general(W0 + dW), "kl_near": near, "kl_near_colon": near_colon,
                    "hellaswag_dev": float((margin(hs_lp(W0 + dW)) - base_m).mean())}
         log(f"{nm}: " + " ".join(f"{k} {v:.4g}" for k, v in res[nm].items()))
         json.dump(res, open(path, "w"), indent=1)
@@ -813,6 +825,7 @@ def stage_compile_v2():
     problems = []
     for mname, G in (("F", zf["G_F"]), ("C", z["C"])):
         G = G + 1e-6 * np.trace(G) / len(G) * np.eye(len(G))
+        G = (G + G.T) / 2  # exactly symmetric: the solver's eigendecomposition checks it
         np.save(d / f"moment_{mname}.npy", np.ascontiguousarray(G))
         Gi = lambda X: sl.solve(G, X.T, assume_a="pos")
         kv, kV = sl.eigh(K @ Gi(K))
@@ -838,6 +851,76 @@ def stage_compile_v2():
     log(f"{len(problems)} problems")
 
 
+def stage_compile_v3():
+    """The compiler in the output-Fisher metric with the near-miss eyes inside the metric rather than held exactly:
+    G = G_F + beta * f_mean * N^T N / |N| (the mean squared output change on general text, plus beta times that on
+    near-miss eyes at the average sensitivity), fire requirements exact on the top-k directions of the key Gram
+    whitened by G. k in {16, 32, 64}, beta in {0, 0.03, 0.3, 3}."""
+    import scipy.linalg as sl
+    d = OUT / "compile"
+    z, zf = np.load(OUT / "prep.npz"), np.load(OUT / "prep_fisher.npz")
+    W0, K, N = np.load(d / "native.npy"), np.load(d / "inputs.npy"), zf["N"]
+    w = fisher_write(z)
+    problems = []
+    for beta in (0.0, 0.03, 0.3, 3.0):
+        G = zf["G_F"] + beta * float(zf["f_mean"]) * (N.T @ N) / len(N)
+        G = G + 1e-6 * np.trace(G) / len(G) * np.eye(len(G))
+        G = (G + G.T) / 2
+        mfile = f"moment_F_b{beta:g}.npy"
+        np.save(d / mfile, np.ascontiguousarray(G))
+        kv, kV = sl.eigh(K @ sl.solve(G, K.T, assume_a="pos"))
+        kV = kV[:, ::-1]
+        for k in (16, 32, 64):
+            A = kV[:, :k]
+            B = A.T @ K
+            name = f"v3_k{k}_b{beta:g}"
+            np.save(d / f"inputs_{name}.npy", np.ascontiguousarray(B))
+            np.save(d / f"targets_{name}.npy", np.ascontiguousarray(B @ W0.T + np.outer(A.sum(0), w)))
+            problems.append({"name": name, "storage": E.SITE + ".weight", "native": "native.npy",
+                             "inputs": f"inputs_{name}.npy", "targets": f"targets_{name}.npy", "class": "sample",
+                             "moment": mfile, "off_target": "off_target.npy", "out": f"plan_{name}"})
+    for i in range(3):
+        json.dump({"problems": problems[i::3]}, open(d / f"manifest_v3_{i}.json", "w"), indent=1)
+    log(f"{len(problems)} problems")
+
+
+def stage_mine_colon(n_rows=30000):
+    """Site inputs at non-emoticon spaced ':' positions (the harness's near-miss panel) in rows 0..n_rows of the val
+    shard's row group 3 (never used elsewhere): the first 3/4 of the rows for constraints/metric, the rest for dev,
+    with the windows ending at each ':' for the dev KL."""
+    import pyarrow.parquet as pq
+    import torch
+    sys.path.insert(0, str(E.VD))
+    from vpd_model import VAL_PARQUET
+    _, txt = vocab()
+    target, _, _ = E.load()
+    resid, _, _ = E.split_forward(target)
+    ends_space = np.array([t[-1:].isspace() for t in txt])
+    colon = np.array([t == " :" for t in txt])
+    keys, wins, split, seen = [], [], [], 0
+    with torch.no_grad():
+        for batch in pq.ParquetFile(VAL_PARQUET).iter_batches(batch_size=1000, row_groups=[3], columns=["input_ids"]):
+            col = batch.column(0)
+            rows = col.flatten().to_numpy().reshape(len(col), -1)[:, :512].astype(np.int64)
+            hit = colon[rows[:, :-1]] & ~E.emoticon_positions(rows, txt, ends_space)
+            for r in np.nonzero(hit.any(1))[0]:
+                _, g2 = resid(torch.from_numpy(rows[r:r + 1]).to(E.DEVICE))
+                for q in np.nonzero(hit[r])[0]:
+                    keys.append(g2[0, q].cpu().double().numpy())
+                    w = rows[r, max(0, q - E.SIDE):q + 1]
+                    wins.append(np.pad(w, (0, E.SIDE + 1 - len(w))))
+                    split.append(seen + r < 0.75 * n_rows)
+                del g2
+            E.empty_cache()
+            seen += len(rows)
+            log(f"rows {seen}: {len(keys)} spaced ':' keys")
+            if seen >= n_rows:
+                break
+    keys, wins, split = np.stack(keys), np.stack(wins), np.array(split)
+    lens = np.array([int((w != 0).sum()) for w in wins])
+    np.savez(OUT / "colon_keys.npz", N=keys[split], N_dev=keys[~split], dev_windows=wins[~split], dev_lens=lens[~split])
+
+
 if __name__ == "__main__":
-    {"prep": stage_prep, "screen": stage_screen, "compile_export": stage_compile_export, "assemble": stage_assemble, "compile_span": stage_compile_span, "heldout": stage_heldout, "prep_fisher": stage_prep_fisher, "compile_v2": stage_compile_v2, "dev": lambda: stage_dev(sys.argv[2:]), "compile_neg": stage_compile_neg,
+    {"prep": stage_prep, "screen": stage_screen, "compile_export": stage_compile_export, "assemble": stage_assemble, "compile_span": stage_compile_span, "heldout": stage_heldout, "prep_fisher": stage_prep_fisher, "compile_v2": stage_compile_v2, "compile_v3": stage_compile_v3, "mine_colon": stage_mine_colon, "dev": lambda: stage_dev(sys.argv[2:]), "compile_neg": stage_compile_neg,
      "assemble_extra": lambda: stage_assemble_extra(sys.argv[2], sys.argv[3:]), "lora_neg": lambda: stage_lora_neg(float(sys.argv[2]))}[sys.argv[1]]()

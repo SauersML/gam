@@ -1609,6 +1609,91 @@ pub fn adversary(
     adversary_screened(masked, base, target, gates, focus, (steps, restarts, seed), HeadScreen::Device)
 }
 
+/// [`adversary`] in each box of `boxes` (seeded by `seeds`), every input's KL at the points found
+/// per box. On the program's device twin every box's every start climbs at once, as one batch of
+/// sequences per step (the same points as one at a time); elsewhere the boxes run in turn.
+pub fn adversary_batch(
+    masked: &Masked,
+    base: &FamilyInputs,
+    target: &Target,
+    boxes: &[Gates],
+    steps: usize,
+    restarts: usize,
+    seeds: &[u64],
+) -> Result<Vec<Array1<f64>>, String> {
+    if boxes.len() != seeds.len() {
+        return Err("adversary batch: one seed per box".to_string());
+    }
+    let rows = base.rows;
+    let copies = boxes.len() * restarts.max(1);
+    let lowered = masked.on_device(|_| Ok(()))?.is_some();
+    if !lowered || copies <= 1 {
+        return boxes.iter().zip(seeds).map(|(gates, &seed)| adversary(masked, base, target, gates, None, steps, restarts, seed)).collect();
+    }
+    // Every start of every box, in the order a box's own run draws them.
+    let mut points: Vec<(usize, Vec<Array2<f64>>)> = Vec::with_capacity(copies);
+    for (b, gates) in boxes.iter().enumerate() {
+        let mut rng = SplitMix(seeds[b]);
+        for restart in 0..restarts.max(1) {
+            points.push((b, start_point(gates, restart, &mut rng)));
+        }
+    }
+    let mut family = base.clone();
+    for _ in 1..copies {
+        family = family.append(base).map_err(|e| e.to_string())?;
+    }
+    let views: Vec<_> = (0..copies).map(|_| target.logits.view()).collect();
+    let batch_target = Target {
+        logits: ndarray::concatenate(Axis(0), &views).map_err(|e| e.to_string())?,
+        scored: target.scored.as_ref().map(|s| (0..copies).flat_map(|_| s.iter().copied()).collect()),
+    };
+    let on_device = masked.on_device(|accelerated| accelerated.target(&batch_target))?.ok_or("adversary: the masked program left its device")?;
+    drop(batch_target);
+    let mut best: Vec<Array1<f64>> = boxes.iter().map(|_| Array1::from_elem(rows, f64::NEG_INFINITY)).collect();
+    for step in 0..=steps {
+        let sites = points[0].1.len();
+        let masks: Vec<Array2<f64>> = (0..sites)
+            .map(|k| ndarray::concatenate(Axis(0), &points.iter().map(|(_, p)| p[k].view()).collect::<Vec<_>>()).map_err(|e| e.to_string()))
+            .collect::<Result<_, _>>()?;
+        let batch = masked.family(&family, &masks);
+        let last = step == steps;
+        let (kl, ascent) = masked
+            .on_device(|accelerated| {
+                let state = accelerated.forward(&batch, &on_device)?;
+                let ascent = if last { None } else { Some(accelerated.mask_gradients(masked, &state)?) };
+                Ok((state.kl, ascent))
+            })?
+            .ok_or("adversary: the masked program left its device")?;
+        for (c, (b, _)) in points.iter().enumerate() {
+            Zip::from(&mut best[*b]).and(&kl.slice(s![c * rows..(c + 1) * rows])).for_each(|m, &v| *m = m.max(v));
+        }
+        let Some(ascent) = ascent else { break };
+        for (c, (b, point)) in points.iter_mut().enumerate() {
+            let own: Vec<Array2<f64>> = ascent.iter().map(|a| a.slice(s![c * rows..(c + 1) * rows, ..]).to_owned()).collect();
+            climb(point, &boxes[*b], &own, step, steps);
+        }
+    }
+    Ok(best)
+}
+
+/// Start `restart` of [`adversary`]: every gate at its lower end, its upper end, its middle, then
+/// uniform draws.
+fn start_point(gates: &Gates, restart: usize, rng: &mut SplitMix) -> Vec<Array2<f64>> {
+    gates
+        .lower
+        .iter()
+        .zip(&gates.upper)
+        .map(|(l, u)| {
+            Zip::from(l).and(u).map_collect(|&l, &u| match restart {
+                0 => l,
+                1 => u,
+                2 => 0.5 * (l + u),
+                _ => l + (u - l) * rng.next(),
+            })
+        })
+        .collect()
+}
+
 /// One sign-ascent step of [`adversary`] on the free gates, its rate shrinking linearly with `step`.
 fn climb(point: &mut [Array2<f64>], gates: &Gates, ascent: &[Array2<f64>], step: usize, steps: usize) {
     let rate = 0.5 - (0.5 - 0.5 / steps as f64) * step as f64 / steps.max(2).saturating_sub(1) as f64;
@@ -1646,19 +1731,7 @@ pub(crate) fn adversary_screened(
         Some(_) => None,
     };
     for restart in 0..restarts.max(1) {
-        let mut point: Vec<Array2<f64>> = gates
-            .lower
-            .iter()
-            .zip(&gates.upper)
-            .map(|(l, u)| {
-                Zip::from(l).and(u).map_collect(|&l, &u| match restart {
-                    0 => l,
-                    1 => u,
-                    2 => 0.5 * (l + u),
-                    _ => l + (u - l) * rng.next(),
-                })
-            })
-            .collect();
+        let mut point = start_point(gates, restart, &mut rng);
         for step in 0..=steps {
             let family = masked.family(base, &point);
             if let Some(on_device) = &on_device {
