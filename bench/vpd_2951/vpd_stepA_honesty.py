@@ -440,7 +440,7 @@ def word_adversary(fam: Family, with_delta: bool) -> tuple[np.ndarray, np.ndarra
                 with torch.no_grad():
                     for j, n in enumerate(names):
                         width = 1 - g[n]
-                        point[n] = (point[n].detach() + rate * width * grads[j].sign()).clamp(min=g[n], max=1.0)
+                        point[n] = torch.minimum(torch.maximum(point[n].detach() + rate * width * grads[j].sign(), g[n]), torch.ones_like(g[n]))
                         if with_delta:
                             delta[n] = (delta[n].detach() + rate * grads[len(names) + j].sign()).clamp(0.0, 1.0)
                 del grads, leaves
