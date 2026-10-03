@@ -78,8 +78,8 @@ use gam_mpd::checkpoint::{Saved, load, save};
 use gam_mpd::codec::prefix_integer_len_bits;
 use gam_mpd::import::import_language_model;
 use gam_mpd::masked::{
-    Claim, Coder, Context, Library, Masked, Running, Target, box_excess, forward, matrix, previous_inputs, read_values, select, site_statistics, sites, split,
-    step_pieces,
+    Claim, Coder, Context, Library, Masked, Running, Target, box_excess, box_excess_at, forward, kl_and_logits, matrix, previous_inputs, read_values, score_only,
+    select, site_statistics, sites, split, step_pieces,
 };
 use gam_mpd::operator_program::FamilyInputs;
 use gam_mpd::operator_program::Node;
@@ -649,9 +649,7 @@ fn main() -> Result<(), String> {
         }
         // What the box claim adds on a sequence's sets.
         let excess_of = |inputs: &FamilyInputs, target: &Target, masks: &[Array2<f64>], fishers: &[Array2<f64>]| -> Result<f64, String> {
-            let family = masked.family(inputs, masks);
-            let (_, trace, cotangent) = forward(masked, &family, target)?;
-            Ok(box_excess(masked, &family, &trace, masks, cotangent, fishers, false)?.0.sum())
+            Ok(box_excess_at(masked, inputs, target, masks, fishers)?.sum())
         };
         // Sets as CSR over all pieces (sites in order), so other context codes can score them.
         let mut indptr: Vec<i64> = vec![0];
@@ -682,15 +680,15 @@ fn main() -> Result<(), String> {
             // Everything on: the trivial explanation, which the description code must not favour.
             {
                 let on: Vec<Array2<f64>> = masked.all_pieces().iter().map(|p| Array2::ones((inputs.rows, *p))).collect();
-                let (kl, trace, _) = forward(masked, &masked.family(&inputs, &on), &target)?;
-                let agree = agreement(&trace.values[masked.program.output], &target);
+                let (kl, logits) = kl_and_logits(masked, &masked.family(&inputs, &on), &target)?;
+                let agree = agreement(&logits, &target);
                 all_on.add(&on, &kl, coder.bits(&on).sum(), &agree);
             }
             let begin = begin_of(starts[e].as_ref(), &inputs, masked, &coder.costs)?;
             // The start's own exact KL, explanation bits and argmax agreement.
             let (begin_kl, begin_agree) = {
-                let (kl, trace, _) = forward(masked, &masked.family(&inputs, &begin), &target)?;
-                (kl, agreement(&trace.values[masked.program.output], &target))
+                let (kl, logits) = kl_and_logits(masked, &masked.family(&inputs, &begin), &target)?;
+                (kl, agreement(&logits, &target))
             };
             let begin_bits = coder.bits(&begin).sum();
             started.add(&begin, &begin_kl, begin_bits, &begin_agree);
@@ -704,8 +702,7 @@ fn main() -> Result<(), String> {
             // Selection keeps each input's flips by that input's own code; the sequence keeps its
             // start whenever the selected sets do not code it in fewer bits as a whole.
             let (masks, values, bits, row_agree) = if bits + values.sum() * scale < begin_code {
-                let trace = forward(masked, &masked.family(&inputs, &masks), &target)?.1;
-                let row_agree = agreement(&trace.values[masked.program.output], &target);
+                let row_agree = agreement(&kl_and_logits(masked, &masked.family(&inputs, &masks), &target)?.1, &target);
                 (masks, values, bits, row_agree)
             } else {
                 log::info!("eval sequence {e}: selection did not lower the start's code; the start stays");
@@ -814,7 +811,7 @@ fn main() -> Result<(), String> {
             let sampled: Vec<f64> = (0..draws)
                 .map(|_| {
                     let gates: Vec<Array2<f64>> = masks.iter().map(|m| m.mapv(|x| if x > 0.0 { 1.0 } else { uniform() })).collect();
-                    forward(&masked, &masked.family(&inputs, &gates), &target).map(|r| r.0.sum())
+                    score_only(&masked, &masked.family(&inputs, &gates), &target).map(|r| r.sum())
                 })
                 .collect::<Result<_, _>>()?;
             let mean = sampled.iter().sum::<f64>() / draws as f64;
@@ -843,7 +840,7 @@ fn main() -> Result<(), String> {
                 Some(old) => old.masks(&masked.all_pieces()),
                 None => start_masks(&inputs, &masked, &coder.costs)?,
             };
-            let begin_kl = forward(&masked, &masked.family(&inputs, &begin), &target)?.0;
+            let begin_kl = score_only(&masked, &masked.family(&inputs, &begin), &target)?;
             let begin_code = coder.bits(&begin).sum() + begin_kl.sum() * scale;
             let (masks, kl) = select(&masked, &inputs, &target, begin, &coder, observations, samples)?;
             let (masks, kl) = if coder.bits(&masks).sum() + kl.sum() * scale < begin_code {
@@ -894,7 +891,7 @@ fn main() -> Result<(), String> {
                 let (candidate_masks, candidate_kl) = select(&candidate, &inputs, &target, grown_masks, &candidate_coder, observations, samples)?;
                 let candidate_code = (candidate_coder.bits(&candidate_masks).sum() + candidate_kl.sum() * scale) / inputs.rows as f64;
                 // The library as it stands after this sequence's step, on the same sets.
-                let now_kl = forward(&masked, &masked.family(&inputs, &masks), &target)?.0;
+                let now_kl = score_only(&masked, &masked.family(&inputs, &masks), &target)?;
                 let sequence_code = (coder.bits(&masks).sum() + now_kl.sum() * scale) / inputs.rows as f64;
                 let kept = candidate_code < sequence_code;
                 log::info!("split test: {sequence_code:.1} -> {candidate_code:.1} bits per token; {}", if kept { "kept" } else { "refused" });

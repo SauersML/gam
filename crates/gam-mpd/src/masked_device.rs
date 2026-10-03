@@ -13,7 +13,7 @@
 //! one sequence's 512 rows.
 
 use super::device_program::{DeviceProgram, DeviceTrace};
-use super::masked::{Masked, Target};
+use super::masked::{BoxGradients, Masked, Target};
 use super::operator_program::{FamilyInputs, Node};
 use gam_gpu::tensor::{Arithmetic, Device, Op, Tensor};
 use ndarray::{Array1, Array2, Axis, s};
@@ -330,6 +330,117 @@ impl Accelerated {
             out.push(covariance);
         }
         Ok(out)
+    }
+
+    /// `masked::box_excess` of the state: per input what the box claim adds to the masks' own KL,
+    /// in float64 (it decides a step's backtracking), and with `gradients` its gradients in every
+    /// site's `V` and `U` in the proposal arithmetic. Refused for a site gated in blocks.
+    pub fn box_excess(
+        &self,
+        masked: &Masked,
+        state: &State,
+        masks: &[Array2<f64>],
+        fishers: &[Array2<f64>],
+        gradients: bool,
+    ) -> Result<(Array1<f64>, Option<BoxGradients>), String> {
+        let d = self.program.device();
+        let rows = state.trace.rows;
+        if let Some(k) = (0..masked.sites.len()).find(|k| !masked.is_rank_one(*k)) {
+            return Err(format!("device: the box claim of {}, gated in blocks", masked.sites[k].name));
+        }
+        let keep: Vec<usize> = masked.sites.iter().flat_map(|s| s.writes.iter().copied()).collect();
+        let seed = d.copy(&state.cotangent).map_err(error)?;
+        // The excess decides, so the gradient it reads is float64 too.
+        let back = self.program.vjp(&state.trace, seed, &keep, Arithmetic::F64)?;
+        let ones = |n: usize, m: usize| d.upload_vec(n, m, vec![1.0; n * m]).map_err(error);
+        let ones_rows = ones(rows, 1)?;
+        let mut excess = d.zeros(rows, 1).map_err(error)?;
+        let mut out = Vec::new();
+        for (k, site) in masked.sites.iter().enumerate() {
+            let pieces = masked.pieces(k);
+            let library = masked.library(k)?;
+            let d_out = library.u.ncols();
+            let u = d.upload(library.u.view()).map_err(error)?;
+            let f = d.upload(fishers[k].view()).map_err(error)?;
+            // Each piece's own weight `u_c F u_cᵀ`, as a column and as a row.
+            let mut uf = d.zeros(pieces, d_out).map_err(error)?;
+            d.gemm(&mut uf, 1.0, &u, Op::N, &f, Op::N, 0.0, Arithmetic::F64).map_err(error)?;
+            let mut ufu = d.zeros(pieces, d_out).map_err(error)?;
+            d.hadamard(&mut ufu, &uf, &u, false).map_err(error)?;
+            let mut own_weight = d.zeros(pieces, 1).map_err(error)?;
+            d.gemm(&mut own_weight, 1.0, &ufu, Op::N, &ones(d_out, 1)?, Op::N, 0.0, Arithmetic::F64).map_err(error)?;
+            drop(ufu);
+            // The off pieces' coordinates `a = z ⊙ (1 − m)` and their output `S = a U`.
+            let off = d.upload(masks[k].mapv(|m| 1.0 - m).view()).map_err(error)?;
+            let mut a = d.zeros(rows, pieces).map_err(error)?;
+            d.hadamard(&mut a, state.trace.value(masked.z[k])?, &off, false).map_err(error)?;
+            let mut s_out = d.zeros(rows, d_out).map_err(error)?;
+            d.gemm(&mut s_out, 1.0, &a, Op::N, &u, Op::N, 0.0, Arithmetic::F64).map_err(error)?;
+            // The KL's gradient at the written values, joined in the site's column order.
+            let mut written = Vec::new();
+            for w in &site.writes {
+                let width = state.trace.value(*w)?.cols();
+                written.push(match back.get(w) {
+                    Some(g) => d.download(g).map_err(error)?,
+                    None => Array2::zeros((rows, width)),
+                });
+            }
+            let views: Vec<_> = written.iter().map(|w| w.view()).collect();
+            let g = d.upload(ndarray::concatenate(Axis(1), &views).map_err(|e| e.to_string())?.view()).map_err(error)?;
+            drop(written);
+            let mut sf = d.zeros(rows, d_out).map_err(error)?;
+            d.gemm(&mut sf, 1.0, &s_out, Op::N, &f, Op::N, 0.0, Arithmetic::F64).map_err(error)?;
+            // ½ gᵀS + ⅛ SᵀF S + 1/24 Σ_off a_c² u_c F u_cᵀ, per input.
+            let ones_out = ones(d_out, 1)?;
+            let mut product = d.zeros(rows, d_out).map_err(error)?;
+            d.hadamard(&mut product, &g, &s_out, false).map_err(error)?;
+            d.gemm(&mut excess, 0.5, &product, Op::N, &ones_out, Op::N, 1.0, Arithmetic::F64).map_err(error)?;
+            d.hadamard(&mut product, &sf, &s_out, false).map_err(error)?;
+            d.gemm(&mut excess, 0.125, &product, Op::N, &ones_out, Op::N, 1.0, Arithmetic::F64).map_err(error)?;
+            drop((product, s_out));
+            let mut aa = d.zeros(rows, pieces).map_err(error)?;
+            d.hadamard(&mut aa, &a, &a, false).map_err(error)?;
+            d.gemm(&mut excess, 1.0 / 24.0, &aa, Op::N, &own_weight, Op::N, 1.0, Arithmetic::F64).map_err(error)?;
+            if !gradients {
+                continue;
+            }
+            // ∂/∂S = ½ g + ¼ S F; ∂/∂a = (∂/∂S) Uᵀ + a ⊙ (u_c F u_cᵀ)/12.
+            let mut g_s = d.zeros(rows, d_out).map_err(error)?;
+            d.axpy(&mut g_s, 0.5, &g).map_err(error)?;
+            d.axpy(&mut g_s, 0.25, &sf).map_err(error)?;
+            drop((g, sf));
+            let mut g_a = d.zeros(rows, pieces).map_err(error)?;
+            d.gemm(&mut g_a, 1.0, &g_s, Op::N, &u, Op::T, 0.0, self.proposal).map_err(error)?;
+            let own_row = d.upload(d.download(&own_weight).map_err(error)?.t()).map_err(error)?;
+            let mut own_a = d.zeros(rows, pieces).map_err(error)?;
+            d.scale_columns(&mut own_a, &a, &own_row, false).map_err(error)?;
+            d.axpy(&mut g_a, 1.0 / 12.0, &own_a).map_err(error)?;
+            drop(own_a);
+            // ∂/∂U = aᵀ ∂/∂S + (Σ_inputs a_c²)/12 · u_c F per piece.
+            let mut u_gradient = d.zeros(pieces, d_out).map_err(error)?;
+            d.gemm(&mut u_gradient, 1.0, &a, Op::T, &g_s, Op::N, 0.0, self.proposal).map_err(error)?;
+            let mut weight = d.zeros(pieces, 1).map_err(error)?;
+            d.gemm(&mut weight, 1.0 / 12.0, &aa, Op::T, &ones_rows, Op::N, 0.0, Arithmetic::F64).map_err(error)?;
+            let mut spread = d.zeros(pieces, d_out).map_err(error)?;
+            d.gemm(&mut spread, 1.0, &weight, Op::N, &ones(1, d_out)?, Op::N, 0.0, Arithmetic::F64).map_err(error)?;
+            d.hadamard(&mut u_gradient, &spread, &uf, true).map_err(error)?;
+            drop((spread, uf, aa, a));
+            // ∂/∂V = ((∂/∂a) ⊙ (1 − m))ᵀ x, one block per read node.
+            let mut g_off = d.zeros(rows, pieces).map_err(error)?;
+            d.hadamard(&mut g_off, &g_a, &off, false).map_err(error)?;
+            let mut v_blocks = Vec::new();
+            for read in &site.reads {
+                let x = state.trace.value(*read)?;
+                let mut block = d.zeros(pieces, x.cols()).map_err(error)?;
+                d.gemm(&mut block, 1.0, &g_off, Op::T, x, Op::N, 0.0, self.proposal).map_err(error)?;
+                v_blocks.push(d.download(&block).map_err(error)?);
+            }
+            let views: Vec<_> = v_blocks.iter().map(|b| b.view()).collect();
+            let v_gradient = ndarray::concatenate(Axis(1), &views).map_err(|e| e.to_string())?;
+            out.push((v_gradient, d.download(&u_gradient).map_err(error)?));
+        }
+        let excess = d.download(&excess).map_err(error)?.column(0).to_owned();
+        Ok((excess, gradients.then_some(out)))
     }
 
     /// `step_pieces`' curvature along a direction: `Σ_rows` of the output Fisher's quadratic form

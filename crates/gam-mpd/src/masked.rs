@@ -709,9 +709,45 @@ fn scored_forward(masked: &Masked, family: &FamilyInputs, target: &Target) -> Re
     Ok((values, trace))
 }
 
-/// Evaluate an actual candidate for acceptance without calculating gradients.
+/// Evaluate an actual candidate for acceptance without calculating gradients: the float64 KL per
+/// input, on the program's device twin when it has one (module note, "Devices").
 pub fn score_only(masked: &Masked, family: &FamilyInputs, target: &Target) -> Result<Array1<f64>, String> {
+    if let Some(values) = masked.on_device(|accelerated| accelerated.score_only(family, &accelerated.target(target)?))? {
+        return Ok(values);
+    }
     scored_forward(masked, family, target).map(|(values, _)| values)
+}
+
+/// The float64 KL per input and the logits it scores, on the program's device twin when it has
+/// one (module note, "Devices").
+pub fn kl_and_logits(masked: &Masked, family: &FamilyInputs, target: &Target) -> Result<(Array1<f64>, Array2<f64>), String> {
+    let lowered = masked.on_device(|accelerated| {
+        let state = accelerated.forward(family, &accelerated.target(target)?)?;
+        let logits = accelerated.program().logits(&state.trace, 0, state.trace.rows)?;
+        Ok((state.kl, logits))
+    })?;
+    if let Some(out) = lowered {
+        return Ok(out);
+    }
+    let (values, trace) = scored_forward(masked, family, target)?;
+    let logits = logits(masked, family, &trace, target)?.into_owned();
+    Ok((values, logits))
+}
+
+/// The box claim's excess per input ([`box_excess`]) at `masks`, on the program's device twin
+/// when it has one (module note, "Devices").
+pub fn box_excess_at(masked: &Masked, base: &FamilyInputs, target: &Target, masks: &[Array2<f64>], fishers: &[Array2<f64>]) -> Result<Array1<f64>, String> {
+    let family = masked.family(base, masks);
+    if (0..masked.sites.len()).all(|k| masked.is_rank_one(k))
+        && let Some(excess) = masked.on_device(|accelerated| {
+            let state = accelerated.forward(&family, &accelerated.target(target)?)?;
+            Ok(accelerated.box_excess(masked, &state, masks, fishers, false)?.0)
+        })?
+    {
+        return Ok(excess);
+    }
+    let (_, trace, cotangent) = forward(masked, &family, target)?;
+    Ok(box_excess(masked, &family, &trace, masks, cotangent, fishers, false)?.0)
 }
 
 /// Per site: `∂KL/∂m` (rows × B) and the gradients in `V` (C × d_in) and `U` (C × d_out), from one
@@ -1523,10 +1559,10 @@ impl Running {
         let total = self.rows + rows;
         let (old, new) = (self.rows / total, rows / total);
         for (running, batch) in self.covariances.iter_mut().zip(covariances) {
-            *running = &*running * old + &(batch * new);
+            ndarray::Zip::from(running).and(&batch).for_each(|r, b| *r = *r * old + *b * new);
         }
         for (running, batch) in self.fishers.iter_mut().zip(fishers) {
-            *running = &*running * old + &(batch * new);
+            ndarray::Zip::from(running).and(&batch).for_each(|r, b| *r = *r * old + *b * new);
         }
         self.rows = total;
     }
@@ -1554,6 +1590,36 @@ fn shrunk_inverse(m: &Array2<f64>) -> Result<Array2<f64>, String> {
         scaled.column_mut(k).mapv_inplace(|x| x * inv);
     }
     Ok(scaled.dot(&d.vectors.t()))
+}
+
+/// Apply the shrunk PSD preconditioner by a Cholesky solve, avoiding eigenvectors and an
+/// explicit inverse. Singular/invalid factors retain the spectral fallback. This only proposes
+/// a direction; the actual candidate's F64 loss still decides whether to commit it.
+pub(super) fn shrunk_direction(m: &Array2<f64>, gradient: &Array2<f64>) -> Result<Array2<f64>, String> {
+    use gam_linalg::faer_ndarray::FaerCholesky;
+    let n = m.nrows();
+    if m.ncols() != n || gradient.ncols() != n {
+        return Err("preconditioner and gradient shapes disagree".to_string());
+    }
+    if m.iter().all(|v| *v == 0.0) { return Ok(Array2::zeros(gradient.dim())); }
+    let lambda = (0..n).map(|i| m[[i, i]]).sum::<f64>() / n.max(1) as f64;
+    if lambda > 0.0 && lambda.is_finite() {
+        let mut shifted = m.clone();
+        for i in 0..n {
+            shifted[[i, i]] += lambda;
+            for j in i + 1..n {
+                let value = 0.5 * (m[[i, j]] + m[[j, i]]);
+                shifted[[i, j]] = value;
+                shifted[[j, i]] = value;
+            }
+        }
+        if let Ok(factor) = shifted.cholesky(faer::Side::Lower) {
+            let mut direction = gradient.t().to_owned();
+            factor.solve_mat_in_place(&mut direction);
+            if direction.iter().all(|v| v.is_finite()) { return Ok(direction.reversed_axes()); }
+        }
+    }
+    Ok(gradient.dot(&shrunk_inverse(m)?))
 }
 
 /// `g` (C × d, one row per piece) less its part that would move `Σ_c u_c v_cᵀ`, the other side's
@@ -1611,17 +1677,19 @@ pub fn step_pieces(
         return Err("pieces steps need the whole model in the program and the training state".to_string());
     }
     let family = masked.family(base, masks);
-    // The forward and everything read off it, on the device twin when there is one.
-    let lowered = match claim {
-        Claim::Corner => masked.on_device(|accelerated| {
+    // The forward and everything read off it, on the device twin when there is one (the box
+    // claim's there only on sites of rank-one blocks).
+    let lowered = if claim == Claim::Corner || (0..masked.sites.len()).all(|k| masked.is_rank_one(k)) {
+        masked.on_device(|accelerated| {
             let on_device = accelerated.target(target)?;
             let state = accelerated.forward(&family, &on_device)?;
             let grads = accelerated.gradients(masked, &state, masks)?;
             let curvature = accelerated.fisher(masked, &state, &on_device, samples, seed, true)?;
             let covariances = accelerated.covariances(masked, &state)?;
             Ok((on_device, state, grads, curvature, covariances))
-        })?,
-        Claim::Box => None,
+        })?
+    } else {
+        None
     };
     let (kl_now, grads, curvature, batch_covariances, evaluated, device_target) = match lowered {
         Some((on_device, state, grads, curvature, covariances)) => (state.kl.clone(), grads, curvature, covariances, Evaluated::Device(state), Some(on_device)),
@@ -1646,10 +1714,10 @@ pub fn step_pieces(
     let (total, grads) = match claim {
         Claim::Corner => (kl_now.sum(), grads),
         Claim::Box => {
-            let Evaluated::Host(trace, cotangent) = &evaluated else {
-                return Err("the box claim's step runs on the CPU".to_string());
+            let (excess, box_grads) = match &evaluated {
+                Evaluated::Host(trace, cotangent) => box_excess(masked, &family, trace, masks, cotangent.clone(), &running.fishers, true)?,
+                Evaluated::Device(state) => masked.on_lowered(|accelerated| accelerated.box_excess(masked, state, masks, &running.fishers, true))?,
             };
-            let (excess, box_grads) = box_excess(masked, &family, trace, masks, cotangent.clone(), &running.fishers, true)?;
             let box_grads = box_grads.ok_or("no box gradients")?;
             let grads = grads.into_iter().zip(box_grads).map(|((m, v, u), (bv, bu))| (m, v + bv, u + bu)).collect::<Vec<_>>();
             (kl_now.sum() + excess.sum(), grads)
@@ -1666,7 +1734,7 @@ pub fn step_pieces(
         if moves_u {
             drop(v_gradient);
             let g = keep_sum(&u_gradient, &library.v)?;
-            let du = g.dot(&shrunk_inverse(&running.fishers[k])?);
+            let du = shrunk_direction(&running.fishers[k], &g)?;
             slope += (&g * &du).sum();
             for (i, &op) in masked.u_ops[k].iter().enumerate() {
                 moves.push((op, du.slice(s![.., wo[i]..wo[i + 1]]).t().to_owned()));
@@ -1674,7 +1742,7 @@ pub fn step_pieces(
         } else {
             drop(u_gradient);
             let g = keep_sum(&v_gradient, &library.u)?;
-            let dv = g.dot(&shrunk_inverse(&running.covariances[k])?);
+            let dv = shrunk_direction(&running.covariances[k], &g)?;
             slope += (&g * &dv).sum();
             for (j, &op) in masked.v_ops[k].iter().enumerate() {
                 moves.push((op, dv.slice(s![.., ro[j]..ro[j + 1]]).to_owned()));
@@ -1722,7 +1790,11 @@ pub fn step_pieces(
                 masked.on_device(|accelerated| accelerated.score_only(&family, on_device))?.ok_or("device: the twin went away")?.sum()
             }
             (Claim::Corner, None) => score_only(masked, &family, target)?.sum(),
-            (Claim::Box, _) => {
+            (Claim::Box, Some(on_device)) => masked.on_lowered(|accelerated| {
+                let state = accelerated.forward(&family, on_device)?;
+                Ok(state.kl.sum() + accelerated.box_excess(masked, &state, masks, &running.fishers, false)?.0.sum())
+            })?,
+            (Claim::Box, None) => {
                 let (kl_trial, trial_trace, trial_cotangent) = forward(masked, &family, target)?;
                 kl_trial.sum() + box_excess(masked, &family, &trial_trace, masks, trial_cotangent, &running.fishers, false)?.0.sum()
             }
