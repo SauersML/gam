@@ -96,6 +96,8 @@ export RAYON_NUM_THREADS=\$SLURM_CPUS_PER_TASK OMP_NUM_THREADS=\$SLURM_CPUS_PER_
 export MPD_BIN=$BIN/$B GAM_SRC=$SRC/$C12 MPD_DATA=\$HOME/mpd-data MATS_OUT=$OUT
 export PATH=$BIN/$B:\$HOME/mpd-venv/bin:\$HOME/.cargo/bin:\$PATH
 export LD_LIBRARY_PATH=/usr/local/cuda-12.2/lib64:/usr/local/cuda-12.2/targets/x86_64-linux/lib:\${LD_LIBRARY_PATH:-}
+# The node does not confine devices: a job Slurm gave no GPU would otherwise see (and take) all 8.
+export CUDA_VISIBLE_DEVICES=\${CUDA_VISIBLE_DEVICES-}
 cd $SRC/$C12
 echo "== \$(date '+%F %T') job \$SLURM_JOB_ID on \$(hostname): source $C, binaries $B, cpus \$SLURM_CPUS_PER_TASK, mem ${MEM}G, gpus ${GPUS}"
 echo "== $cmd"
