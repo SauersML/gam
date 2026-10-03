@@ -256,6 +256,13 @@ pub mod gates;
 // Libraries fitted on one site's own inputs to its second-order code.
 pub mod site_fit;
 
+// Counterfactual response: an explanation's predicted response to declared interventions
+// against the native model's.
+pub mod counterfactual;
+
+#[cfg(test)]
+mod counterfactual_tests;
+
 #[cfg(test)]
 mod site_fit_tests;
 
