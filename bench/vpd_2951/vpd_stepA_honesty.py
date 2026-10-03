@@ -213,9 +213,10 @@ def box():
                     g = fam.dense(i)
                     for d in range(args.draws):
                         gen = torch.Generator(device=DEV).manual_seed(1_000_003 * d + i)
-                        m = {n: v + (1 - v) * torch.rand(v.shape, generator=gen, device=DEV) for n, v in g.items()}
+                        # Sites in one fixed order, so every family sees the same draws.
+                        m = {n: g[n] + (1 - g[n]) * torch.rand(g[n].shape, generator=gen, device=DEV) for n in names}
                         delta = (zero_delta(g) if delta_mode == "off"
-                                 else {n: torch.rand(v.shape[:-1], generator=gen, device=DEV) for n, v in g.items()})
+                                 else {n: torch.rand(g[n].shape[:-1], generator=gen, device=DEV) for n in names})
                         kl[d, i * MB * S:(i + 1) * MB * S] = kl_rows(i, m, delta).cpu().numpy().ravel()
                         del m, delta
                     del g
