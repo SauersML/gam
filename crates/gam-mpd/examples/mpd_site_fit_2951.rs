@@ -72,7 +72,8 @@ fn write_blocks(coding: &Coding<'_>, name: &str, k: usize, w: &Array2<f64>, samp
     let columns = library.v.nrows();
     let (fine, fine_round) = blocks(k, w, sample, description, observations, library, &vec![1; columns])?;
     let (coarse, coarse_round) = blocks(k, w, sample, description, observations, library, &[columns])?;
-    let (evidence, evidence_round) = ard(k, w, sample, description, observations, (library, &vec![1; columns]), 50)?;
+    let capacity = columns.max(w.nrows() + w.ncols());
+    let (evidence, evidence_round) = ard(k, w, sample, description, observations, (library, &vec![1; columns], capacity), 50)?;
     let (chosen, round) = [(&fine, &fine_round), (&coarse, &coarse_round), (&evidence, &evidence_round)]
         .into_iter()
         .fold(None, |best: Option<(&gam_mpd::site_fit::Blocked, &gam_mpd::site_fit::Round)>, c| match best {

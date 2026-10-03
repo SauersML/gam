@@ -91,7 +91,7 @@ fn groups_fitted_by_evidence_partition_their_columns_and_code_no_worse_than_rank
     let v = (d.vt.t().to_owned() * &roots).t().to_owned();
     let library = Library { v, u, mean: Array1::zeros(3) };
     let (rank_one, _) = measure(0, &w, &samples, &describe, 1e4, &library).expect("measures");
-    let (fitted, round) = ard(0, &w, &samples, &describe, 1e4, (&library, &[1, 1]), 20).expect("fits");
+    let (fitted, round) = ard(0, &w, &samples, &describe, 1e4, (&library, &[1, 1], 5), 20).expect("fits");
     assert_eq!(fitted.ranks.iter().sum::<usize>(), fitted.library.v.nrows());
     assert!(!fitted.ranks.is_empty() && fitted.ranks.iter().all(|r| *r >= 1));
     assert!(round.code <= rank_one.code + 1.0, "{} against {}", round.code, rank_one.code);

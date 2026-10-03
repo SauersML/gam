@@ -74,7 +74,7 @@
 //! sums, `√T 2⁻²⁴` of the largest.
 
 use super::blocks::Describe;
-use super::dense::{eigh, svd};
+use super::dense::{QrMode, eigh, qr, svd};
 use super::derivatives::vjp;
 use super::device::proposing;
 use super::masked::{Library, Site, Target, read_values, sampled_label_cotangent};
@@ -735,7 +735,7 @@ pub struct Settings {
 fn description_bits(describe: &dyn Describe, site: usize, v: &Array2<f64>, u: &Array2<f64>) -> Result<Array1<f64>, String> {
     Ok((0..v.nrows())
         .into_par_iter()
-        .map(|c| describe.bits_at(site, c, u.slice(s![c..c + 1, ..]), v.slice(s![c..c + 1, ..])))
+        .map(|c| gam_linalg::faer_ndarray::with_nested_parallel(|| describe.bits_at(site, c, u.slice(s![c..c + 1, ..]), v.slice(s![c..c + 1, ..]))))
         .collect::<Result<Vec<f64>, String>>()?
         .into())
 }
@@ -1265,41 +1265,96 @@ fn evb_singular(gamma: f64, l: f64, m: f64, sigma2: f64) -> f64 {
     if b < 0.0 { 0.0 } else { 0.5 * gamma * (a + b.sqrt()) }
 }
 
-/// A library of blocks whose number and ranks follow from the site's code by evidence (module
-/// note, "Blocks"): an overcomplete set of groups, each a block of any rank, alternating
+/// One group's refit by evidence (module note, "Blocks"): on its inputs `members`, with targets
+/// `targets` (members × d_out, what they need of it) and reads `reads` (members × d_in), each
+/// weighted by its sensitivity `weights`, the least-squares map in the written Fisher's root
+/// `f_half` and the reads' own span: with `√s X = Q R` (thin), the target `Y = F^{1/2} (√s T)ᵀ Q`
+/// observed with noise of variance `1/n`; its singular values take their empirical
+/// variational-Bayes estimates ([`evb_singular`]) and its rank is the one whose kept directions save
+/// the most KL bits, `n/(2 ln 2) Σ_j (γ_j² − (γ_j − γ̂_j)²)`, over their description on every member
+/// (up to that net's first peak). Returns the group's rows `(u, v)`, `None` at rank zero.
+fn evidence_group(
+    site: usize,
+    describe: &dyn Describe,
+    observations: f64,
+    (f_half, f_inverse): (&Array2<f64>, &Array2<f64>),
+    targets: &Array2<f32>,
+    reads: &Array2<f32>,
+    weights: &[f32],
+) -> Result<Option<(Array2<f64>, Array2<f64>)>, String> {
+    let members = reads.nrows();
+    let root = |m: &Array2<f32>| {
+        let mut out = m.mapv(f64::from);
+        for (mut row, w) in out.outer_iter_mut().zip(weights) {
+            row.mapv_inplace(|x| x * f64::from(*w).sqrt());
+        }
+        out
+    };
+    let (x, t) = (root(reads), root(targets));
+    let decomposed = qr(x.view(), QrMode::Economic).map_err(|e| format!("{e:?}"))?;
+    let q = decomposed.q.ok_or("a thin QR without Q")?;
+    let r = decomposed.r;
+    let y = f_half.dot(&t.t().dot(&q));
+    let d = svd(y.view(), false).map_err(|e| format!("{e:?}"))?;
+    let (l, m) = (y.nrows().min(y.ncols()) as f64, y.nrows().max(y.ncols()) as f64);
+    let shrunk: Vec<f64> = d.singular_values.iter().map(|g| evb_singular(*g, l, m, 1.0 / observations)).collect();
+    // `V` from `R V = Q₂ √Γ̂` (least norm), `U = (F^{1/2})⁺ P √Γ̂`.
+    let r_inverse = pseudo_inverse(&r.t().dot(&r), members)?.dot(&r.t());
+    let factors = |rank: usize| -> (Array2<f64>, Array2<f64>) {
+        let roots = Array1::from_iter((0..rank).map(|i| shrunk[i].sqrt()));
+        let u = (f_inverse.dot(&d.u.slice(s![.., ..rank])) * &roots).t().to_owned();
+        let v = (r_inverse.dot(&d.vt.slice(s![..rank, ..]).t()) * &roots).t().to_owned();
+        (u, v)
+    };
+    let scale = observations / (2.0 * LN_2);
+    let (mut best, mut gain) = ((0.0, 0usize), 0.0);
+    for j in 0..shrunk.len() {
+        if shrunk[j] <= 0.0 {
+            break;
+        }
+        gain += d.singular_values[j].powi(2) - (d.singular_values[j] - shrunk[j]).powi(2);
+        let (u, v) = factors(j + 1);
+        let net = scale * gain - members as f64 * describe.bits(site, u.view(), v.view())?;
+        if net > best.0 {
+            best = (net, j + 1);
+        } else if best.1 > 0 {
+            break;
+        }
+    }
+    Ok((best.1 > 0).then(|| factors(best.1)))
+}
+
+/// A site's library as blocks whose number and ranks follow from its code by evidence (module
+/// note, "Blocks"): up to `capacity` groups, each a block of any rank, from `start` (each group's
+/// columns, a partition of `library`'s; the rest empty), alternating
 ///
 /// * **Gates.** Every input's groups on, selected by its code ([`select`] over the groups' real
 ///   sizes and descriptions).
-/// * **Groups.** Each group in turn refitted on the inputs it runs on to what they need of it, the
-///   map less every other group on there (backfitting): in the written Fisher `F` and the group's
-///   own sensitivity-weighted read moment `C_g` the target is `Y_g = F^{1/2} R_g (C_g^{1/2})⁺` (`R_g =
-///   Σ_{t on} s_t r_t x_tᵀ`), observed with noise of variance `1/n` (its KL is `n/2 ‖·‖²`); its
-///   singular values take their empirical variational-Bayes estimates ([`evb_singular`], unused
-///   directions exactly zero), and its rank is the one whose kept directions' KL bits saved, `n/(2
-///   ln 2) Σ_j (γ_j² − (γ_j − γ̂_j)²)`, most exceed its description bits on the inputs it runs on
-///   (up to the first peak of that net, each further direction saving less). The group is
-///   `U = (F^{1/2})⁺ P √Γ̂`, `V = (C_g^{1/2})⁺ Q √Γ̂` from `Y_g = P Γ Qᵀ`; a group of rank zero is gone.
+/// * **Groups.** Each group in turn refitted by evidence ([`evidence_group`]) on the inputs it runs
+///   on, to what they need of it: the map less every other group on there (backfitting). Unused
+///   directions are exactly zero, so a group's rank falls out of its refit, and a group of rank
+///   zero is gone.
+/// * **Growth.** Every empty group is fitted by evidence to the inputs of largest error, an equal
+///   share of the inputs each, their targets what the groups on there leave of the map.
 ///
-/// from `start` (each group's columns, a partition of `library`'s), until a round lowers the code
-/// by less than one bit per input or `rounds` pass.
+/// The decomposition of least code over the rounds is kept; the rounds stop when one lowers the
+/// code by less than one bit per input, or at `rounds`.
 pub fn ard(
     site: usize,
     w: &Array2<f64>,
     samples: &Samples,
     describe: &dyn Describe,
     observations: f64,
-    (library, start): (&Library, &[usize]),
+    (library, start, capacity): (&Library, &[usize], usize),
     rounds: usize,
 ) -> Result<(Blocked, Round), String> {
-    if start.contains(&0) || start.iter().sum::<usize>() != library.v.nrows() {
-        return Err(format!("site {site}: groups {start:?} do not partition {} subcomponents", library.v.nrows()));
+    if start.contains(&0) || start.iter().sum::<usize>() != library.v.nrows() || start.len() > capacity {
+        return Err(format!("site {site}: groups {start:?} do not partition {} subcomponents within {capacity}", library.v.nrows()));
     }
     let (d_out, d_in) = w.dim();
     let x = &samples.reads;
     let rows = x.nrows();
-    let scale = observations / (2.0 * LN_2);
     let (f_half, f_inverse) = roots(&samples.fisher, rows)?;
-    // The groups, as rows `(u: r × d_out, v: r × d_in)`.
     let mut groups: Vec<(Array2<f64>, Array2<f64>)> = Vec::new();
     let mut at = 0;
     for r in start {
@@ -1316,117 +1371,101 @@ pub fn ard(
         };
         Ok((library, groups.iter().map(|g| g.0.nrows()).collect()))
     };
-    let bits_of = |groups: &[(Array2<f64>, Array2<f64>)]| -> Result<Vec<f64>, String> {
-        groups.par_iter().map(|(u, v)| describe.bits(site, u.view(), v.view())).collect()
+    let contribution = |g: &(Array2<f64>, Array2<f64>)| -> Array2<f32> {
+        let a = product(x.view(), false, single(&g.1).view(), true);
+        product(a.view(), false, single(&g.0).view(), false)
     };
     let y32 = product(x.view(), false, single(w).view(), true);
+    let fit_on = |members: &[usize], targets: Array2<f32>| -> Result<Option<(Array2<f64>, Array2<f64>)>, String> {
+        let reads = x.select(Axis(0), members);
+        let weights: Vec<f32> = members.iter().map(|t| samples.sensitivity[*t] as f32).collect();
+        evidence_group(site, describe, observations, (&f_half, &f_inverse), &targets, &reads, &weights)
+    };
     let mut masks = vec![1u8; rows * groups.len()];
-    let mut report = Round { round: 0, code: f64::INFINITY, description: 0.0, error: 0.0, l0: 0.0, reseeded: 0, read_steps: 0 };
+    let mut best: Option<(Blocked, Round)> = None;
+    let mut previous = f64::INFINITY;
     for round in 0..rounds.max(1) {
         // Gates.
         let (current, ranks) = assemble(&groups)?;
         let fitting = Fitting::new(site, w, samples, observations, current.v.nrows())?;
-        let bits = bits_of(&groups)?;
+        let bits: Vec<f64> = groups.par_iter().map(|(u, v)| describe.bits(site, u.view(), v.view())).collect::<Result<_, String>>()?;
         let (description, error) = fitting.code_blocks(&current.v, &current.u, &ranks, &bits, &mut masks, true);
-        let previous = report.code;
+        let count = groups.len();
         let on = masks.iter().filter(|m| **m == 1).count() as f64;
-        report = Round { round, code: (description + error) / rows as f64, description: description / rows as f64, error: error / rows as f64, l0: on / rows as f64, reseeded: 0, read_steps: 0 };
-        log::info!("site {site} round {round}: {} groups of ranks {:?}, code {:.1} bits per input (description {:.1}, error {:.1}), {:.2} on", groups.len(),
-            { let mut h = std::collections::BTreeMap::<usize, usize>::new(); for r in &ranks { *h.entry(*r).or_default() += 1; } h },
-            report.code, report.description, report.error, report.l0);
+        let report = Round { round, code: (description + error) / rows as f64, description: description / rows as f64, error: error / rows as f64, l0: on / rows as f64, reseeded: 0, read_steps: 0 };
+        let mut histogram = std::collections::BTreeMap::<usize, usize>::new();
+        for r in &ranks {
+            *histogram.entry(*r).or_default() += 1;
+        }
+        log::info!("site {site} round {round}: {count} groups of ranks {histogram:?}, code {:.1} bits per input (description {:.1}, error {:.1}), {:.2} on", report.code, report.description, report.error, report.l0);
+        if best.as_ref().is_none_or(|(_, b)| report.code < b.code) {
+            let sets = masks.chunks(count).map(|m| (0..count as u32).filter(|c| m[*c as usize] == 1).collect()).collect();
+            best = Some((Blocked { library: current, ranks, sets }, report.clone()));
+        }
         if previous - report.code < 1.0 {
             break;
         }
+        previous = report.code;
         // Groups, in turn, against every other group on (backfitting).
-        let count = groups.len();
-        let contribution = |g: &(Array2<f64>, Array2<f64>)| -> Array2<f32> {
-            let a = product(x.view(), false, single(&g.1).view(), true);
-            product(a.view(), false, single(&g.0).view(), false)
-        };
         let mut on_sum = Array2::<f32>::zeros((rows, d_out));
-        for (k, g) in groups.iter().enumerate() {
-            let z = contribution(g);
+        let contributions: Vec<Array2<f32>> = groups.iter().map(contribution).collect();
+        for (k, z) in contributions.iter().enumerate() {
             for t in (0..rows).filter(|t| masks[t * count + k] == 1) {
                 let mut row = on_sum.row_mut(t);
                 row += &z.row(t);
             }
         }
         let mut next: Vec<Option<(Array2<f64>, Array2<f64>)>> = Vec::with_capacity(count);
-        for k in 0..count {
+        for (k, z) in contributions.iter().enumerate() {
             let members: Vec<usize> = (0..rows).filter(|t| masks[t * count + k] == 1).collect();
-            let z = contribution(&groups[k]);
             if members.is_empty() {
                 next.push(None);
                 continue;
             }
-            // What the group's inputs need of it: the map, less every other group on there.
-            let xm = x.select(Axis(0), &members);
-            let weights: Vec<f32> = members.iter().map(|t| samples.sensitivity[*t] as f32).collect();
-            let target = y32.select(Axis(0), &members) - &on_sum.select(Axis(0), &members) + &z.select(Axis(0), &members);
-            let mut weighted = xm.clone();
-            for (i, w_t) in weights.iter().enumerate() {
-                weighted.row_mut(i).mapv_inplace(|v| v * w_t);
-            }
-            let c = product(weighted.view(), true, xm.view(), false).mapv(f64::from);
-            let r = product(target.view(), true, weighted.view(), false).mapv(f64::from);
-            let (_, c_inverse) = roots(&c, members.len())?;
-            let y = f_half.dot(&r).dot(&c_inverse);
-            let d = svd(y.view(), false).map_err(|e| format!("{e:?}"))?;
-            let (l, m) = (d_out.min(d_in) as f64, d_out.max(d_in) as f64);
-            let shrunk: Vec<f64> = d.singular_values.iter().map(|g| evb_singular(*g, l, m, 1.0 / observations)).collect();
-            // The rank of most bits saved less description on the inputs it runs on.
-            let mut best: (f64, usize) = (0.0, 0);
-            let mut gain = 0.0;
-            for j in 0..shrunk.len() {
-                if shrunk[j] <= 0.0 {
-                    break;
-                }
-                gain += d.singular_values[j].powi(2) - (d.singular_values[j] - shrunk[j]).powi(2);
-                let roots_j = Array1::from_iter((0..=j).map(|i| shrunk[i].sqrt()));
-                let u = (f_inverse.dot(&d.u.slice(s![.., ..=j])) * &roots_j).t().to_owned();
-                let v = (c_inverse.dot(&d.vt.slice(s![..=j, ..]).t()) * &roots_j).t().to_owned();
-                let net = scale * gain - members.len() as f64 * describe.bits(site, u.view(), v.view())?;
-                if net > best.0 {
-                    best = (net, j + 1);
-                } else if best.1 > 0 {
-                    // Past its first peak: each further direction saves less and costs as much.
-                    break;
-                }
-            }
-            if best.1 == 0 {
-                next.push(None);
-                continue;
-            }
-            let rank = best.1;
-            let roots_r = Array1::from_iter((0..rank).map(|i| shrunk[i].sqrt()));
-            let u = (f_inverse.dot(&d.u.slice(s![.., ..rank])) * &roots_r).t().to_owned();
-            let v = (c_inverse.dot(&d.vt.slice(s![..rank, ..]).t()) * &roots_r).t().to_owned();
-            // Its new contribution replaces its old one in the inputs' on-sum.
-            let fresh = contribution(&(u.clone(), v.clone()));
+            let targets = y32.select(Axis(0), &members) - &on_sum.select(Axis(0), &members) + &z.select(Axis(0), &members);
+            let fresh = fit_on(&members, targets)?;
+            let fresh_z = fresh.as_ref().map(contribution);
             for &t in &members {
                 let mut row = on_sum.row_mut(t);
                 row -= &z.row(t);
-                row += &fresh.row(t);
+                if let Some(f) = &fresh_z {
+                    row += &f.row(t);
+                }
             }
-            next.push(Some((u, v)));
+            next.push(fresh);
         }
-        // The groups that kept a direction, and their gates.
         let kept: Vec<usize> = (0..count).filter(|k| next[*k].is_some()).collect();
-        if kept.is_empty() {
+        let mut grown: Vec<(Array2<f64>, Array2<f64>)> = next.into_iter().flatten().collect();
+        // Growth: the empty groups from the inputs of largest error, an equal share each.
+        let empty = capacity.saturating_sub(grown.len());
+        if empty > 0 {
+            let left = &y32 - &on_sum;
+            let lf = product(left.view(), false, single(&samples.fisher).view(), false);
+            let mut errors: Vec<(f64, usize)> = (0..rows)
+                .map(|t| (samples.sensitivity[t] * left.row(t).iter().zip(lf.row(t).iter()).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum::<f64>(), t))
+                .collect();
+            errors.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let share = (rows / capacity).max(1);
+            for chunk in errors.chunks(share).take(empty) {
+                let members: Vec<usize> = chunk.iter().map(|(_, t)| *t).collect();
+                if let Some(g) = fit_on(&members, left.select(Axis(0), &members))? {
+                    grown.push(g);
+                }
+            }
+        }
+        if grown.is_empty() {
             break;
         }
-        let width = kept.len();
-        let mut kept_masks = vec![0u8; rows * width];
+        // The gates of the groups kept carry over; a grown group starts on everywhere.
+        let width = grown.len();
+        let mut carried = vec![1u8; rows * width];
         for t in 0..rows {
             for (j, &k) in kept.iter().enumerate() {
-                kept_masks[t * width + j] = masks[t * count + k];
+                carried[t * width + j] = masks[t * count + k];
             }
         }
-        groups = next.into_iter().flatten().collect();
-        masks = kept_masks;
+        groups = grown;
+        masks = carried;
     }
-    let (current, ranks) = assemble(&groups)?;
-    let blocks = ranks.len();
-    let sets = masks.chunks(blocks).map(|m| (0..blocks as u32).filter(|c| m[*c as usize] == 1).collect()).collect();
-    Ok((Blocked { library: current, ranks, sets }, report))
+    best.ok_or_else(|| "no round".to_string())
 }
