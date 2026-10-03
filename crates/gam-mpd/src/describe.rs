@@ -308,6 +308,14 @@ pub struct Choice {
     exponents: Vec<i32>,
 }
 
+impl Choice {
+    /// The lattice exponent its reader side was sent at (the generic core's second factor, a linear
+    /// core's one).
+    pub fn reader_exponent(&self) -> Option<i32> {
+        self.exponents.last().copied()
+    }
+}
+
 
 impl Description {
     /// The description's own bits.
@@ -323,6 +331,12 @@ impl Description {
 
 fn symmetric(m: &Array2<f64>) -> Array2<f64> {
     (m + &m.t()) * 0.5
+}
+
+/// `a b` through faer, so inside a site's per-subcomponent pricing (run in parallel under
+/// `gam_linalg::faer_ndarray::with_nested_parallel`) it stays on its own thread.
+fn mm<A: ndarray::Data<Elem = f64>, B: ndarray::Data<Elem = f64>>(a: &ndarray::ArrayBase<A, ndarray::Ix2>, b: &ndarray::ArrayBase<B, ndarray::Ix2>) -> Array2<f64> {
+    gam_linalg::faer_ndarray::fast_ab(a, b)
 }
 
 /// The pseudo-inverse and the pseudo-inverse root of a symmetric positive semidefinite matrix,
@@ -455,15 +469,15 @@ impl<'a> Block<'a> {
 
     /// The KL bits of the factored core `K = A Bᵀ`.
     fn error_factored(&self, sides: &Sides, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
-        let cross = (a.t().dot(&sides.hl) * b.t().dot(&sides.hr)).sum();
-        let quad = (a.t().dot(&*sides.gp).dot(a) * b.t().dot(&*sides.gq).dot(b)).sum();
+        let cross = (mm(&a.t(), &sides.hl) * mm(&b.t(), &sides.hr)).sum();
+        let quad = (mm(&mm(&a.t(), &*sides.gp), a) * mm(&mm(&b.t(), &*sides.gq), b)).sum();
         (self.w2 - 2.0 * cross + quad).max(0.0) * self.scale
     }
 
     /// The KL bits of the core `K`.
     fn error(&self, sides: &Sides, k: &Array2<f64>) -> f64 {
         let cross = (k * &sides.h).sum();
-        let quad = (sides.gp.dot(k).dot(&*sides.gq) * k).sum();
+        let quad = (mm(&mm(&*sides.gp, k), &*sides.gq) * k).sum();
         (self.w2 - 2.0 * cross + quad).max(0.0) * self.scale
     }
 }
@@ -626,23 +640,23 @@ fn generic_core(block: &Block<'_>, sides: &Sides, kl: &Array2<f64>, kr: &Array2<
     let scan_a = |pb: i32| -> Option<i32> {
         let (qb, bb) = if free.is_empty() { (b_free.clone(), 0.0) } else { quantize(&b_free, pb)? };
         let full = rebuild(&qb);
-        let (hb, gb) = (sides.hr.t().dot(&full), full.t().dot(&*sides.gq).dot(&full));
+        let (hb, gb) = (mm(&sides.hr.t(), &full), mm(&mm(&full.t(), &*sides.gq), &full));
         scan(exponents(&a), |p| {
             let (qa, ba) = quantize(&a, p)?;
-            let cross = (qa.t().dot(&sides.hl) * &hb.t()).sum();
-            let quad = (qa.t().dot(&*sides.gp).dot(&qa) * &gb).sum();
+            let cross = (mm(&qa.t(), &sides.hl) * &hb.t()).sum();
+            let quad = (mm(&mm(&qa.t(), &*sides.gp), &qa) * &gb).sum();
             Some((ba + bb + exponent_cost(p, pb), (block.w2 - 2.0 * cross + quad).max(0.0) * scale))
         })
         .map(|(p, _)| p)
     };
     let scan_b = |pa: i32| -> Option<i32> {
         let (qa, ba) = quantize(&a, pa)?;
-        let (ha, ga) = (qa.t().dot(&sides.hl), qa.t().dot(&*sides.gp).dot(&qa));
+        let (ha, ga) = (mm(&qa.t(), &sides.hl), mm(&mm(&qa.t(), &*sides.gp), &qa));
         scan(exponents(&b_free), |p| {
             let (qb, bb) = quantize(&b_free, p)?;
             let full = rebuild(&qb);
-            let cross = (&ha * &full.t().dot(&sides.hr)).sum();
-            let quad = (&ga * &full.t().dot(&*sides.gq).dot(&full)).sum();
+            let cross = (&ha * &mm(&full.t(), &sides.hr)).sum();
+            let quad = (&ga * &mm(&mm(&full.t(), &*sides.gq), &full)).sum();
             Some((ba + bb + exponent_cost(pa, p), (block.w2 - 2.0 * cross + quad).max(0.0) * scale))
         })
         .map(|(p, _)| p)
