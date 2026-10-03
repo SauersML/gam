@@ -53,7 +53,7 @@ fn a_subcomponent_split_in_two_halves_is_merged_back() {
     let stack = |rows: &[Array1<f64>]| Array2::from_shape_fn((rows.len(), rows[0].len()), |(i, j)| rows[i][j]);
     let library = Library { v: stack(&v_rows), u: stack(&u_rows), mean: Array1::zeros(3) };
     let (rank_one, _) = measure(0, &w, &samples, &describe, 1e4, &library).expect("measures");
-    let (blocked, round) = blocks(0, &w, &samples, &describe, 1e4, &library).expect("blocks");
+    let (blocked, round) = blocks(0, &w, &samples, &describe, 1e4, &library, &[1, 1, 1]).expect("blocks");
     // The halves always run together: they end in one block (alone, or with the rest of the map).
     assert!(blocked.ranks.len() < 3 && blocked.ranks[0] >= 2, "the halves stayed apart: {:?}", blocked.ranks);
     assert!(round.code < rank_one.code, "{} against {}", round.code, rank_one.code);

@@ -18,10 +18,11 @@
 //! `OUT_DIR/{site}.u.f64` (pieces × d_out), raw float64, the `library:DIR` start of
 //! `mpd_pieces_masked_2951`, and its rounds to `OUT_DIR/{site}.rounds.json`.
 //!
-//! Every library (fitted or given) is then gated in blocks by the same code
-//! (`gam_mpd::site_fit::blocks`: merges of co-firing subcomponents, and splits back, each kept when
-//! the site's code falls), written as `OUT_DIR/{site}.blocked.{v,u}.f64` with its ranks and its code
-//! against the rank-one library's in `OUT_DIR/{site}.blocked.json`.
+//! Every library (fitted or given) is then made blocks of any rank by the same code
+//! (`gam_mpd::site_fit::blocks`: merges and splits, each kept when the site's code falls), from both
+//! the fine start (every subcomponent its own block) and the coarse one (the whole site one block),
+//! the lower kept and written as the site's library in `OUT_DIR` (`{site}.{v,u}.f64` in its blocks'
+//! column order, `{site}.ranks.json`), both starts' codes in `OUT_DIR/{site}.blocks.json`.
 //!
 //! With `library:DIR` nothing is fitted: each site's given library (`DIR/{site}.{v,u}.f64`, as
 //! above) is measured under the same code (`gam_mpd::site_fit::measure`, its sets selected from all
@@ -54,31 +55,49 @@ fn spread(w: &Array2<f64>, library: &Library) -> f64 {
     total / w.iter().map(|x| x * x).sum::<f64>().sqrt()
 }
 
-/// The library gated in blocks by the site's code (`gam_mpd::site_fit::blocks`), written beside it
-/// as `{site}.blocked.{v,u}.f64` and `{site}.blocked.json` (the ranks, in column order, and the
-/// code against the rank-one library's).
-fn write_blocks(
-    out: &std::path::Path,
-    name: &str,
-    blocked: &gam_mpd::site_fit::Blocked,
-    round: &gam_mpd::site_fit::Round,
-    rank_one: &gam_mpd::site_fit::Round,
-) -> Result<(), String> {
-    write_f64(&out.join(format!("{name}.blocked.v.f64")), &blocked.library.v)?;
-    write_f64(&out.join(format!("{name}.blocked.u.f64")), &blocked.library.u)?;
-    let wide = blocked.ranks.iter().filter(|r| **r > 1).count();
+/// Where the sites' libraries go and the code they are measured in.
+#[derive(Clone, Copy)]
+struct Coding<'a> {
+    out: &'a std::path::Path,
+    description: &'a dyn gam_mpd::blocks::Describe,
+    observations: f64,
+}
+
+/// The site's library as blocks of any rank, chosen by its code (`gam_mpd::site_fit::blocks`) from
+/// both starts, every column its own block (merging up) and the whole site one block (splitting
+/// down), the lower total kept; written as the site's library, `{site}.{v,u}.f64` in its blocks'
+/// column order and `{site}.ranks.json`, with both starts' codes in `{site}.blocks.json`.
+fn write_blocks(coding: &Coding<'_>, name: &str, k: usize, w: &Array2<f64>, sample: &gam_mpd::site_fit::Samples, library: &Library) -> Result<(), String> {
+    let Coding { out, description, observations } = *coding;
+    let columns = library.v.nrows();
+    let (fine, fine_round) = blocks(k, w, sample, description, observations, library, &vec![1; columns])?;
+    let (coarse, coarse_round) = blocks(k, w, sample, description, observations, library, &[columns])?;
+    let (chosen, round) = if coarse_round.code < fine_round.code { (&coarse, &coarse_round) } else { (&fine, &fine_round) };
+    write_f64(&out.join(format!("{name}.v.f64")), &chosen.library.v)?;
+    write_f64(&out.join(format!("{name}.u.f64")), &chosen.library.u)?;
+    std::fs::write(out.join(format!("{name}.ranks.json")), json!(chosen.ranks).to_string()).map_err(|e| e.to_string())?;
+    let histogram = |ranks: &[usize]| {
+        let mut h = std::collections::BTreeMap::<usize, usize>::new();
+        for r in ranks {
+            *h.entry(*r).or_default() += 1;
+        }
+        h
+    };
     eprintln!(
-        "{name} blocks: code {:.1} bits per input (description {:.1}, error {:.1}), {} blocks ({wide} of rank ≥ 2), {:.2} on per input; rank one {:.1}",
+        "{name} blocks: code {:.1} bits per input (description {:.1}, error {:.1}), ranks {:?}, {:.2} on per input; from the fine start {:.1}, the coarse {:.1}",
         round.code,
         round.description,
         round.error,
-        blocked.ranks.len(),
+        histogram(&chosen.ranks),
         round.l0,
-        rank_one.code
+        fine_round.code,
+        coarse_round.code
     );
-    let record = json!({"site": name, "ranks": blocked.ranks, "code": round.code, "description": round.description, "error": round.error, "l0": round.l0,
-        "rank_one_code": rank_one.code, "rank_one_description": rank_one.description, "rank_one_error": rank_one.error, "rank_one_l0": rank_one.l0});
-    std::fs::write(out.join(format!("{name}.blocked.json")), record.to_string()).map_err(|e| e.to_string())
+    let record = |b: &gam_mpd::site_fit::Blocked, r: &gam_mpd::site_fit::Round| {
+        json!({"ranks": histogram(&b.ranks), "code": r.code, "description": r.description, "error": r.error, "l0": r.l0})
+    };
+    let report = json!({"site": name, "observations": observations, "fine": record(&fine, &fine_round), "coarse": record(&coarse, &coarse_round)});
+    std::fs::write(out.join(format!("{name}.blocks.json")), report.to_string()).map_err(|e| e.to_string())
 }
 
 fn main() -> Result<(), String> {
@@ -144,8 +163,7 @@ fn main() -> Result<(), String> {
             };
             let library = Library { v: read("v", d_in)?, u: read("u", d_out)?, mean: Array1::zeros(d_in) };
             let (round, chosen_sets) = measure(k, w, sample, &description, observations, &library)?;
-            let (blocked, blocked_round) = blocks(k, w, sample, &description, observations, &library)?;
-            write_blocks(&out, &site.name, &blocked, &blocked_round, &round)?;
+            write_blocks(&Coding { out: &out, description: &description, observations }, &site.name, k, w, sample, &library)?;
             selected.push((site.name.clone(), library.v.nrows(), chosen_sets));
             eprintln!("{} given library of {}: code {:.1} bits per input (description {:.1}, error {:.1}), L0 {:.2}, Σ|u||v|/|W| {:.1}",
                 site.name, library.v.nrows(), round.code, round.description, round.error, round.l0, spread(w, &library));
@@ -191,9 +209,7 @@ fn main() -> Result<(), String> {
         })?;
         write_f64(&v_path, &library.v)?;
         write_f64(&u_path, &library.u)?;
-        let (rank_one, _) = measure(k, w, sample, &description, observations, &library)?;
-        let (blocked, blocked_round) = blocks(k, w, sample, &description, observations, &library)?;
-        write_blocks(&out, &site.name, &blocked, &blocked_round, &rank_one)?;
+        write_blocks(&Coding { out: &out, description: &description, observations }, &site.name, k, w, sample, &library)?;
         // What all on leaves of the map, in the reads' second moment M: ‖(W − Σ u vᵀ) M^½‖ / ‖W M^½‖.
         let weighted = |e: &Array2<f64>| (&e.dot(&sample.second_moment) * e).sum().sqrt();
         let left = weighted(&(w - &library.u.t().dot(&library.v))) / weighted(w);

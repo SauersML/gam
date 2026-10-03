@@ -3,8 +3,8 @@
 //! `mpd_e2e_train_2951 EXPORT_DIR LIBRARY_DIR OUT_DIR OBSERVATIONS TRAIN [PASSES] [CONTEXT]`
 //!
 //! `LIBRARY_DIR` holds a library per site (`{site}.v.f64`, `{site}.u.f64`, as
-//! `mpd_site_fit_2951` writes them; a site without files stays native), gated in the blocks its
-//! site's code chose (`{site}.blocked.*`) where they code it in fewer bits than its rank-one library. Every sequence of the
+//! `mpd_site_fit_2951` writes them, with its blocks `{site}.ranks.json`; a site without files
+//! stays native). Every sequence of the
 //! export's first `TRAIN` (of `CONTEXT` positions, default 512) is coded in turn, `PASSES` times
 //! (default 1): its sets are each site's own code's selection on the sequence's clean reads
 //! (`gam_mpd::site_fit::measure_blocks`, each subcomponent priced by its exact lattice description
@@ -53,23 +53,19 @@ fn main() -> Result<(), String> {
     let sequence = |s: usize| family.select(&(s * context..(s + 1) * context).collect::<Vec<_>>());
     let (mut chosen, mut libraries, mut ranks) = (Vec::new(), Vec::new(), Vec::new());
     for site in sites(model) {
-        // A site's blocked library (`{site}.blocked.{v,u}.f64` and its ranks in `{site}.blocked.json`,
-        // as `mpd_site_fit_2951` writes them) when it codes the site in fewer bits than its rank-one
-        // one, else the rank-one library, every subcomponent its own block.
-        let blocked = given.join(format!("{}.blocked.json", site.name));
-        let record: Option<serde_json::Value> = std::fs::read_to_string(&blocked).ok().and_then(|t| serde_json::from_str(&t).ok());
-        let wins = record.as_ref().is_some_and(|r| r["code"].as_f64() < r["rank_one_code"].as_f64());
-        let stem = if wins { format!("{}.blocked", site.name) } else { site.name.clone() };
-        let v_path = given.join(format!("{stem}.v.f64"));
+        // The site's blocks (`{site}.ranks.json`, as `mpd_site_fit_2951` writes them; without it,
+        // every subcomponent its own block).
+        let v_path = given.join(format!("{}.v.f64", site.name));
         if !v_path.exists() {
             continue;
         }
         let w = matrix(model, &site)?;
         let (d_out, d_in) = w.dim();
-        let library = Library { v: read_f64(&v_path, d_in)?, u: read_f64(&given.join(format!("{stem}.u.f64")), d_out)?, mean: Array1::zeros(d_in) };
-        ranks.push(match (wins, record) {
-            (true, Some(r)) => r["ranks"].as_array().ok_or("blocked.json: ranks")?.iter().map(|x| x.as_u64().map(|x| x as usize).ok_or("blocked.json: a rank")).collect::<Result<Vec<_>, _>>()?,
-            _ => vec![1; library.v.nrows()],
+        let library = Library { v: read_f64(&v_path, d_in)?, u: read_f64(&given.join(format!("{}.u.f64", site.name)), d_out)?, mean: Array1::zeros(d_in) };
+        let partition = given.join(format!("{}.ranks.json", site.name));
+        ranks.push(match std::fs::read_to_string(&partition) {
+            Ok(text) => serde_json::from_str::<Vec<usize>>(&text).map_err(|e| format!("{}: {e}", partition.display()))?,
+            Err(_) => vec![1; library.v.nrows()],
         });
         libraries.push(library);
         chosen.push(site);
