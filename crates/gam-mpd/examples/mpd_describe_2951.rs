@@ -1,6 +1,6 @@
 //! Structured descriptions of rank-k blocks (`gam_mpd::describe`) on a trained toy (#2951).
 //!
-//! `mpd_describe_2951 modadd EXPORT_DIR OUT.json OBSERVATIONS [generic|structured]`
+//! `mpd_describe_2951 modadd EXPORT_DIR OUT.json OBSERVATIONS [generic|structured|exact]`
 //!
 //! `EXPORT_DIR` a `transformer` export on a finite family whose token slots carry the operands
 //! (e.g. `~/mpd-data/engine/p31_s0_generic`, the mod-31 adder on all 961 inputs). The code is the
@@ -247,6 +247,7 @@ fn modadd(dir: &Path, out: &Path, observations: f64, only: Option<&str>) -> Resu
     let logit_metrics = gam_mpd::describe::logit_gauss_newton(&program, &chosen, &family, &trace, 64)?;
     let mut libraries = Vec::new();
     let mut structured_sites = Vec::new();
+    let mut exact_sites = Vec::new();
     let mut lattice_sites = Vec::new();
     for (site, measured) in chosen.iter().zip(&statistics) {
         let library = fisher_svd(measured)?;
@@ -268,6 +269,7 @@ fn modadd(dir: &Path, out: &Path, observations: f64, only: Option<&str>) -> Resu
         eprintln!("{}: {}×{}, {} subcomponents, {} writer charts", site.name, measured.w.nrows(), measured.w.ncols(), libraries.last().map_or(0, |l| l.u.nrows()), writers.len());
         let k = structured_sites.len();
         let metric = || Metric { fisher: logit_metrics[k].clone(), ..Metric::of(measured, observations) };
+        exact_sites.push(Geometry::new(metric(), writers.clone(), readers.clone(), false)?);
         structured_sites.push(Geometry::new(metric(), writers, readers, false)?);
         lattice_sites.push(Geometry::new(metric(), Vec::new(), Vec::new(), false)?);
     }
@@ -277,6 +279,14 @@ fn modadd(dir: &Path, out: &Path, observations: f64, only: Option<&str>) -> Resu
     let mut generic = Generic::new(&statistics, observations);
     let measuring = Generic::new(&statistics, observations);
     let mut structured = Structured::new(structured_sites);
+    // Every block priced at the exact KL of its decoded map (gam_mpd::describe::Exact).
+    let exact = gam_mpd::describe::Exact::new(
+        Structured::new(exact_sites),
+        &program,
+        chosen.clone(),
+        vec![(family.clone(), target.clone())],
+        observations,
+    )?;
     let batches = vec![(family.clone(), target)];
     // Measures only (the KL of a decomposition does not depend on its description).
     let coded_generic = Coded { model: &program, sites: chosen.clone(), batches: batches.clone(), observations, samples: 16, describe: &measuring, boxed: None };
@@ -312,7 +322,7 @@ fn modadd(dir: &Path, out: &Path, observations: f64, only: Option<&str>) -> Resu
     }
     let mut points = Vec::new();
     let mut fitted = Vec::new();
-    for name in ["generic", "structured"] {
+    for name in ["generic", "structured", "exact"] {
         if only.is_some_and(|o| o != name) {
             continue;
         }
@@ -321,7 +331,11 @@ fn modadd(dir: &Path, out: &Path, observations: f64, only: Option<&str>) -> Resu
         // more than a factor of two the price is rescaled by their ratio and the fit repeated.
         let mut calibrations = Vec::new();
         let (rank_one, rank_one_bits, blocked, block_bits) = loop {
-            let describe: &dyn Describe = if name == "generic" { &generic } else { &structured };
+            let describe: &dyn Describe = match name {
+                "generic" => &generic,
+                "structured" => &structured,
+                _ => &exact,
+            };
             let coded = Coded { model: &program, sites: chosen.clone(), batches: batches.clone(), observations, samples: 16, describe, boxed: None };
             let started = std::time::Instant::now();
             let (rank_one, rank_one_bits) = rank_one_point(&coded, libraries.clone(), family.rows)?;
@@ -332,7 +346,7 @@ fn modadd(dir: &Path, out: &Path, observations: f64, only: Option<&str>) -> Resu
             eprintln!("  {name}: {:.1} s; rounding measured {measured:.1} bits against {priced:.1} priced", started.elapsed().as_secs_f64());
             calibrations.push(json!({"measured": measured, "priced": priced}));
             let ratio = if priced > 0.0 { measured / priced } else { f64::INFINITY };
-            if (0.5..=2.0).contains(&ratio) || measured <= 0.0 || calibrations.len() >= 6 {
+            if name == "exact" || (0.5..=2.0).contains(&ratio) || measured <= 0.0 || calibrations.len() >= 6 {
                 break (rank_one, rank_one_bits, blocked, block_bits);
             }
             let ratio = if ratio.is_finite() { ratio } else { 1e3 };

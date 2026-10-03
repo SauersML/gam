@@ -1271,3 +1271,78 @@ impl super::blocks::Describe for Structured {
         Ok(Some((d.u, d.v, d.kl_bits)))
     }
 }
+
+/// [`Structured`] priced at the exact KL of its decoded blocks ([`Geometry::describe_exact`]): a
+/// block's error is measured by the masked forward of the native model with only that block's map
+/// replaced by its decoded description (every site otherwise its native map, every word on), per
+/// word at `n`. Context-free, so the blocks' code can call it for any block it proposes; the price
+/// of running only on some words is the per-word error over all of them.
+pub struct Exact<'a> {
+    pub structured: Structured,
+    model: &'a super::operator_program::OperatorProgram,
+    sites: Vec<super::masked::Site>,
+    batches: Vec<(super::operator_program::FamilyInputs, super::masked::Target)>,
+    observations: f64,
+    maps: Vec<Array2<f64>>,
+    base: f64,
+}
+
+impl<'a> Exact<'a> {
+    pub fn new(
+        structured: Structured,
+        model: &'a super::operator_program::OperatorProgram,
+        sites: Vec<super::masked::Site>,
+        batches: Vec<(super::operator_program::FamilyInputs, super::masked::Target)>,
+        observations: f64,
+    ) -> Result<Self, String> {
+        let maps = sites.iter().map(|s| super::masked::matrix(model, s)).collect::<Result<Vec<_>, _>>()?;
+        let mut exact = Self { structured, model, sites, batches, observations, maps, base: 0.0 };
+        exact.base = exact.kl_bits(None)?;
+        Ok(exact)
+    }
+
+    /// The KL bits per word of the native model with site `k`'s map changed by `− uᵀv + ũᵀṽ`.
+    fn kl_bits(&self, change: Option<(usize, ArrayView2<'_, f64>, ArrayView2<'_, f64>, &Description)>) -> Result<f64, String> {
+        let mut libraries = Vec::new();
+        for (j, w) in self.maps.iter().enumerate() {
+            let (d_out, d_in) = w.dim();
+            let (mut u, mut v) = (Array2::<f64>::eye(d_out), w.clone());
+            if let Some((_, bu, bv, d)) = change.as_ref().filter(|c| c.0 == j) {
+                u = ndarray::concatenate(Axis(0), &[u.view(), (-&bu.to_owned()).view(), d.u.view()]).map_err(|e| e.to_string())?;
+                v = ndarray::concatenate(Axis(0), &[v.view(), bv.view(), d.v.view()]).map_err(|e| e.to_string())?;
+            }
+            libraries.push(super::masked::Library { v, u, mean: Array1::zeros(d_in) });
+        }
+        let ranks: Vec<Vec<usize>> = libraries.iter().map(|l| vec![l.u.nrows()]).collect();
+        let masked = super::masked::Masked::build_blocks(self.model, self.sites.clone(), libraries, ranks)?;
+        let (mut total, mut rows) = (0.0_f64, 0.0_f64);
+        for (inputs, target) in &self.batches {
+            let masks: Vec<Array2<f64>> = self.sites.iter().map(|_| Array2::ones((inputs.rows, 1))).collect();
+            let (kl, _, _) = super::masked::forward(&masked, &masked.family(inputs, &masks), target)?;
+            for r in (0..inputs.rows).filter(|r| target.scores(*r)) {
+                total += kl[r];
+                rows += 1.0;
+            }
+        }
+        Ok(self.observations * total / rows.max(1.0) / std::f64::consts::LN_2)
+    }
+
+    fn describe(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<Description, String> {
+        let geometry = self.structured.sites.get(site).ok_or_else(|| format!("no site {site}"))?;
+        geometry.describe_exact(u, v, &mut |d| Ok(self.kl_bits(Some((site, u, v, d)))? - self.base))
+    }
+}
+
+impl super::blocks::Describe for Exact<'_> {
+    fn bits(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<f64, String> {
+        if u.nrows() == 0 {
+            return Ok(0.0);
+        }
+        Ok(self.describe(site, u, v)?.total())
+    }
+
+    fn decode(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<Option<(Array2<f64>, Array2<f64>, f64)>, String> {
+        let d = self.describe(site, u, v)?;
+        Ok(Some((d.u, d.v, d.kl_bits)))
+    }
+}
