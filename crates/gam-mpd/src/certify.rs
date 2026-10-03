@@ -93,7 +93,7 @@ use ndarray::{Array1, Array2, ArrayView2, Axis, Zip, s};
 use rayon::prelude::*;
 
 use super::bounds::kl_supremum_over_gap_box;
-use super::masked::{Masked, Target, forward, mask_gradients};
+use super::masked::{HeadScreen, Masked, Target, exact_rows, forward, mask_gradients, screened_point};
 use super::operator_program::{Basis, FamilyInputs, Law, Node, Operator, OperatorBody, OperatorProgram, Rotary, SlotValues};
 
 /// Whether the forms absorb their own rounding (module note, "Rounding"); off only inside a
@@ -1638,8 +1638,27 @@ pub fn adversary(
     restarts: usize,
     seed: u64,
 ) -> Result<Array1<f64>, String> {
+    adversary_screened(masked, base, target, gates, focus, (steps, restarts, seed), HeadScreen::Device)
+}
+
+/// [`adversary`], each point's head run as `screen` says ([`masked::ScreenedPoint`](super::masked::ScreenedPoint)): a point's KL is then
+/// known within a band per row, and at the end each row's float64 KL is computed only at the
+/// points whose upper end reaches the largest lower end, so the returned maximum is the float64
+/// maximum over the same points. The ascent steers from the screened logits.
+pub(crate) fn adversary_screened(
+    masked: &Masked,
+    base: &FamilyInputs,
+    target: &Target,
+    gates: &Gates,
+    focus: Option<usize>,
+    (steps, restarts, seed): (usize, usize, u64),
+    screen: HeadScreen,
+) -> Result<Array1<f64>, String> {
+    let rows = base.rows;
     let mut rng = SplitMix(seed);
-    let mut best = Array1::<f64>::from_elem(base.rows, f64::NEG_INFINITY);
+    let mut best = Array1::<f64>::from_elem(rows, f64::NEG_INFINITY);
+    // The screened points: per point its rows' KL, band and hidden values.
+    let mut screened: Vec<(Array1<f64>, Array1<f64>, Array2<f64>)> = Vec::new();
     for restart in 0..restarts.max(1) {
         let mut point: Vec<Array2<f64>> = gates
             .lower
@@ -1656,20 +1675,31 @@ pub fn adversary(
             .collect();
         for step in 0..=steps {
             let family = masked.family(base, &point);
-            let (kl, trace, cotangent) = forward(masked, &family, target)?;
-            Zip::from(&mut best).and(&kl).for_each(|b, &v| *b = b.max(v));
-            if step == steps {
-                break;
-            }
-            let cotangent = match focus {
-                Some(row) => {
-                    let mut focused = Array2::<f64>::zeros(cotangent.dim());
-                    focused.row_mut(row).assign(&cotangent.row(row));
-                    focused
+            let ascent = match screened_point(masked, &family, target, screen)? {
+                Some(point) => {
+                    let ascent = if step == steps { None } else { Some(point.mask_gradients(masked, &family, target, focus)?) };
+                    screened.push((point.kl.clone(), point.band.clone(), point.hidden().clone()));
+                    ascent
                 }
-                None => cotangent,
+                None => {
+                    let (kl, trace, cotangent) = forward(masked, &family, target)?;
+                    Zip::from(&mut best).and(&kl).for_each(|b, &v| *b = b.max(v));
+                    if step == steps {
+                        None
+                    } else {
+                        let cotangent = match focus {
+                            Some(row) => {
+                                let mut focused = Array2::<f64>::zeros(cotangent.dim());
+                                focused.row_mut(row).assign(&cotangent.row(row));
+                                focused
+                            }
+                            None => cotangent,
+                        };
+                        Some(mask_gradients(masked, &family, &trace, cotangent)?)
+                    }
+                }
             };
-            let ascent = mask_gradients(masked, &family, &trace, cotangent)?;
+            let Some(ascent) = ascent else { break };
             let rate = 0.5 - (0.5 - 0.5 / steps as f64) * step as f64 / steps.max(2).saturating_sub(1) as f64;
             for (((g, l), u), a) in point.iter_mut().zip(&gates.lower).zip(&gates.upper).zip(&ascent) {
                 Zip::from(g).and(l).and(u).and(a).for_each(|g, &l, &u, &a| {
@@ -1678,6 +1708,26 @@ pub fn adversary(
                     }
                 });
             }
+        }
+    }
+    // Each row settles to float64 at every screened point that could hold its maximum: one whose
+    // upper end reaches the largest lower end (or the float64 maximum already known).
+    let mut floor = best.clone();
+    for (kl, band, _) in &screened {
+        Zip::from(&mut floor).and(kl).and(band).for_each(|f, &v, &b| *f = f.max(v - b));
+    }
+    for (kl, band, hidden) in &screened {
+        // A row without a band (unscored) is exact as it stands.
+        for r in (0..rows).filter(|r| band[*r] == 0.0) {
+            best[r] = best[r].max(kl[r]);
+        }
+        let open: Vec<usize> = (0..rows).filter(|r| band[*r] > 0.0 && kl[*r] + band[*r] >= floor[*r] && kl[*r] + band[*r] > best[*r]).collect();
+        if open.is_empty() {
+            continue;
+        }
+        let exact = exact_rows(masked, target, &hidden.select(Axis(0), &open), &open)?;
+        for (i, &r) in open.iter().enumerate() {
+            best[r] = best[r].max(exact[i]);
         }
     }
     Ok(best)

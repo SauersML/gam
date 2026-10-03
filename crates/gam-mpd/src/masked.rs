@@ -1003,6 +1003,104 @@ fn exact_head(masked: &Masked, hidden: &Array2<f64>, operator: usize, layout: ga
     }
 }
 
+/// A masked forward whose head runs in f32 on the device with its certified band: each row's KL
+/// within `band` of its float64 value (`2 maxⱼ` of the head's entry bounds, the KL's gradient in
+/// the logits being `q − p`, of `ℓ₁` norm at most 2). The trace stops at the head's hidden node;
+/// [`ScreenedPoint::exact`] settles any rows to their float64 KL, and [`ScreenedPoint::mask_gradients`]
+/// steers from the screened logits.
+pub(crate) struct ScreenedPoint {
+    pub kl: Array1<f64>,
+    pub band: Array1<f64>,
+    trace: Trace,
+    logits: Array2<f64>,
+    head: (usize, usize, gam_gpu::banded::Layout),
+}
+
+/// How a [`ScreenedPoint`] forward runs its head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadScreen {
+    /// No screen: the caller's float64 forward.
+    Off,
+    /// The f32 product on the device; no screen when the device does not take it.
+    Device,
+    /// The float64 product carrying the f32 band (tests: every decision path runs, and the
+    /// values are the unscreened ones).
+    Emulated,
+}
+
+/// [`ScreenedPoint`] at `family`, or `None` when the head is not a lone product or the device does not
+/// take it.
+pub(crate) fn screened_point(masked: &Masked, family: &FamilyInputs, target: &Target, screen: HeadScreen) -> Result<Option<ScreenedPoint>, String> {
+    use gam_gpu::banded::Layout;
+    let Some(head @ (hidden, operator, layout)) = lone_head(masked).filter(|_| screen != HeadScreen::Off) else {
+        return Ok(None);
+    };
+    let mut body = masked.program.clone();
+    body.nodes.truncate(hidden + 1);
+    body.output = hidden;
+    let trace = body.execute(family, false).map_err(|e| e.to_string())?;
+    let h = &trace.values[hidden];
+    let (logits, band) = match screen {
+        HeadScreen::Device => {
+            let op = &masked.program.operators[operator];
+            match super::device::banded_product(op, h, layout).map_err(|e| e.to_string())? {
+                Some(banded) => (banded.values, banded.band),
+                None => return Ok(None),
+            }
+        }
+        HeadScreen::Off => return Ok(None),
+        HeadScreen::Emulated => {
+            let a = masked.program.operators[operator].matrix_cow();
+            let right = match layout {
+                Layout::Transposed => a.t(),
+                Layout::AsStored => a.view(),
+            };
+            let band = gam_gpu::precision_bounds::GemmBand::derive(gam_gpu::precision_bounds::DeviceArithmetic::F32, h.view(), right).map_err(|e| format!("{e:?}"))?;
+            (exact_head(masked, h, operator, layout), band)
+        }
+    };
+    let band = Array1::from_shape_fn(family.rows, |r| if target.scores(r) { 2.0 * band.row_max(r) } else { 0.0 });
+    let kl = kl_score_only(target, &logits);
+    Ok(Some(ScreenedPoint { kl, band, trace, logits, head }))
+}
+
+impl ScreenedPoint {
+    /// The hidden node's value (to settle rows after this trace is gone, [`exact_rows`]).
+    pub(crate) fn hidden(&self) -> &Array2<f64> {
+        &self.trace.values[self.head.0]
+    }
+
+    /// `∂/∂m` of the KL (of row `focus` alone when given) from the screened logits: it only steers.
+    pub(crate) fn mask_gradients(&self, masked: &Masked, family: &FamilyInputs, target: &Target, focus: Option<usize>) -> Result<Vec<Array2<f64>>, String> {
+        let (hidden, operator, layout) = self.head;
+        let mut cotangent = kl(target, &self.logits).1;
+        if let Some(row) = focus {
+            for (r, mut c) in cotangent.outer_iter_mut().enumerate() {
+                if r != row {
+                    c.fill(0.0);
+                }
+            }
+        }
+        let backward = match layout {
+            gam_gpu::banded::Layout::Transposed => gam_gpu::banded::Layout::AsStored,
+            gam_gpu::banded::Layout::AsStored => gam_gpu::banded::Layout::Transposed,
+        };
+        let op = &masked.program.operators[operator];
+        let seed = proposing(|| super::device::product(op, &cotangent, backward)).map_err(|e| e.to_string())?;
+        let back = proposing(|| super::derivatives::vjp_from(&masked.program, family, &self.trace, hidden, seed, Some(&masked.masked))).map_err(|e| e.to_string())?;
+        Ok(mask_gradients_of(masked, &self.trace, &back))
+    }
+}
+
+/// The float64 KL of `rows` from their hidden values `hidden` (one row each, in order), through
+/// the lone head ([`lone_head`]).
+pub(crate) fn exact_rows(masked: &Masked, target: &Target, hidden: &Array2<f64>, rows: &[usize]) -> Result<Array1<f64>, String> {
+    let (_, operator, layout) = lone_head(masked).ok_or("exact rows: no lone head")?;
+    let logits = exact_head(masked, hidden, operator, layout);
+    let sub = Target { logits: target.logits.select(Axis(0), rows), scored: target.scored.as_ref().map(|s| rows.iter().map(|r| s[*r]).collect()) };
+    Ok(kl_score_only(&sub, &logits))
+}
+
 /// The current masks' head as a screened score starts from (module note, "Screened heads"): the
 /// hidden rows before the head, the logits, and per row a bound on the logits' error (zero when
 /// they came from a float64 forward).

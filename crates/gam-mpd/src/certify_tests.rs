@@ -340,3 +340,23 @@ fn second_derivative_bounds_hold() {
         assert!(largest < bound, "{law:?}: |f''| reaches {largest}, bound {bound}");
     }
 }
+
+/// The adversary with every head screened (its f32 band carried, each row settled to float64 only
+/// where a point could hold its maximum) returns exactly the per-word KLs of the float64 one.
+#[test]
+fn a_screened_adversary_returns_the_float64_one() {
+    use super::certify::adversary_screened;
+    use super::masked::{HeadScreen, screened_point};
+    let mut screened_any = false;
+    for (name, program, family) in fixtures() {
+        for seed in [3, 71] {
+            let (masked, masks, target, _) = masked(&program, &family, seed);
+            let gates = Gates::claim(&masks);
+            screened_any |= screened_point(&masked, &masked.family(&family, &masks), &target, HeadScreen::Emulated).expect("screened").is_some();
+            let plain = adversary_screened(&masked, &family, &target, &gates, None, (8, 4, seed as u64), HeadScreen::Off).expect("plain");
+            let screened = adversary_screened(&masked, &family, &target, &gates, None, (8, 4, seed as u64), HeadScreen::Emulated).expect("screened");
+            assert_eq!(screened, plain, "{name}, seed {seed}");
+        }
+    }
+    assert!(screened_any, "no fixture has a lone head to screen");
+}
