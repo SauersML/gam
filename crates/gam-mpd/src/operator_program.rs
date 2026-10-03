@@ -1311,7 +1311,7 @@ fn fingerprint(a: ArrayView2<'_, f64>) -> (usize, usize, u64, u64) {
 /// `dense::svd`), the Frobenius norm, and for a matrix with at most one nonzero per row and per
 /// column (a diagonal gain, a permutation) its largest entry, which is then exact. Bounds are kept
 /// per matrix content, so an operator met again is not decomposed again.
-fn matrix_spectral_bound(a: ArrayView2<'_, f64>) -> Result<f64, ProgramError> {
+pub(crate) fn matrix_spectral_bound(a: ArrayView2<'_, f64>) -> Result<f64, ProgramError> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(usize, usize, u64, u64), f64>>> =
         std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));

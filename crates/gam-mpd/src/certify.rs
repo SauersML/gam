@@ -140,6 +140,71 @@ fn union(lists: &[&[u64]]) -> (Vec<u64>, Vec<Vec<usize>>) {
     (all, places)
 }
 
+/// Fresh symbols, each defined once by the [`enclose`] that draws it.
+static FRESH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(3 << 62);
+
+/// The share of a budget held by principal symbols ([`enclose`]).
+fn principal_share(budget: usize) -> usize {
+    budget / 8
+}
+
+/// Generators `d_i` (rows of `dropped`, each on its own symbol) enclosed by at most `k` fresh symbols
+/// along principal directions and a radius: for any `Q`, `Σ_i ε_i d_i = Q (Σ_i ε_i Qᵀd_i) + Σ_i ε_i r_i`
+/// with `r_i = d_i − Q Qᵀ d_i`, and the first sum's `j`-th coordinate lies within `s_j = Σ_i |(Qᵀ d_i)_j|`,
+/// so it is `Q_{:,j} s_j` times one fresh symbol. `Q` is an orthonormalised power iterate of the
+/// generators' span (a randomized range finder); only the identity matters for soundness. Returns the
+/// fresh symbols, their generators and the radius `Σ_i |r_i|`, with the products' and sums' rounding.
+fn enclose(dropped: &Array2<f64>, k: usize) -> (Vec<u64>, Array2<f64>, Array1<f64>) {
+    let (m, width) = dropped.dim();
+    let total = |a: &Array2<f64>| {
+        let mut out = Array1::<f64>::zeros(a.ncols());
+        for row in a.outer_iter() {
+            Zip::from(&mut out).and(&row).for_each(|o, &v| *o += v.abs());
+        }
+        out
+    };
+    let k = k.min(m).min(width);
+    if k == 0 {
+        let grow = 1.0 + gamma(m + 1);
+        return (Vec::new(), Array2::zeros((0, width)), total(dropped).mapv(|v| up(v * grow)));
+    }
+    let mut rng = SplitMix(0x2951_e1c1 ^ ((m as u64) << 32) ^ width as u64);
+    let omega = Array2::from_shape_fn((m, k), |_| rng.next() - 0.5);
+    let mut q = dropped.t().dot(&omega);
+    q = dropped.t().dot(&dropped.dot(&q));
+    // Modified Gram–Schmidt; a column without a new direction is left zero.
+    for j in 0..k {
+        for i in 0..j {
+            let projection = q.column(i).dot(&q.column(j));
+            let previous = q.column(i).to_owned();
+            q.column_mut(j).scaled_add(-projection, &previous);
+        }
+        let norm = q.column(j).dot(&q.column(j)).sqrt();
+        if norm > 0.0 && norm.is_finite() {
+            q.column_mut(j).mapv_inplace(|v| v / norm);
+        } else {
+            q.column_mut(j).fill(0.0);
+        }
+    }
+    let p = dropped.dot(&q);
+    let reach = total(&p).mapv(|v| up(v * (1.0 + gamma(m + 1))));
+    let residual = dropped - &p.dot(&q.t());
+    let q_abs = q.mapv(f64::abs);
+    let spread = q_abs.dot(&reach);
+    let g = gamma(k + width + 4);
+    let grow = 1.0 + gamma(m + 1);
+    let radius = Zip::from(&total(&residual))
+        .and(&total(dropped))
+        .and(&spread)
+        .map_collect(|&r, &d, &s| up(up(r * grow) + up(g * up(d + up(3.0 * s)))));
+    let mut generators = Array2::<f64>::zeros((k, width));
+    for j in 0..k {
+        generators.row_mut(j).assign(&q.column(j).mapv(|v| v * reach[j]));
+    }
+    let fresh: Vec<u64> = (0..k).map(|_| FRESH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)).collect();
+    (fresh, generators, radius)
+}
+
 /// One input's affine form over a node's coordinates (module note, "Affine forms").
 #[derive(Clone, Debug)]
 struct Row {
@@ -201,28 +266,32 @@ impl Row {
         }
     }
 
-    /// Keep the `budget` symbols of largest `ℓ₁` generator; the rest join the radius.
+    /// Keep at most `budget` symbols: those of largest `ℓ₁` generator, and the rest enclosed by
+    /// [`enclose`] in a share of the budget.
     fn reduce(&mut self, budget: usize) {
         if self.ids.len() <= budget {
             return;
         }
+        let principal = principal_share(budget);
+        let held = budget - principal;
         let mass: Vec<f64> = self.coef.outer_iter().map(|g| g.iter().map(|v| v.abs()).sum()).collect();
         let mut order: Vec<usize> = (0..self.ids.len()).collect();
-        order.select_nth_unstable_by(budget, |a, b| mass[*b].total_cmp(&mass[*a]));
-        let mut keep = order[..budget].to_vec();
+        order.select_nth_unstable_by(held, |a, b| mass[*b].total_cmp(&mass[*a]));
+        let mut keep = order[..held].to_vec();
         keep.sort_unstable();
-        let mut kept = vec![false; self.ids.len()];
-        for &k in &keep {
-            kept[k] = true;
+        let mut dropped: Vec<usize> = order[held..].to_vec();
+        dropped.sort_unstable();
+        let (fresh, generators, radius) = enclose(&self.coef.select(Axis(0), &dropped), principal);
+        Zip::from(&mut self.radius).and(&radius).for_each(|r, &d| *r = up(*r + d));
+        let mut rows: Vec<(u64, Array1<f64>)> = keep.iter().map(|&k| (self.ids[k], self.coef.row(k).to_owned())).collect();
+        rows.extend(fresh.into_iter().zip(generators.outer_iter().map(|g| g.to_owned())));
+        rows.sort_unstable_by_key(|r| r.0);
+        let mut coef = Array2::<f64>::zeros((rows.len(), self.width()));
+        for (k, (_, g)) in rows.iter().enumerate() {
+            coef.row_mut(k).assign(g);
         }
-        let mut dropped = Array1::<f64>::zeros(self.width());
-        for (g, _) in self.coef.outer_iter().zip(&kept).filter(|(_, k)| !**k) {
-            Zip::from(&mut dropped).and(&g).for_each(|o, &v| *o += v.abs());
-        }
-        let grow = 1.0 + gamma(self.ids.len() - budget + 1);
-        Zip::from(&mut self.radius).and(&dropped).for_each(|r, &d| *r = up(*r + up(d * grow)));
-        self.ids = keep.iter().map(|&k| self.ids[k]).collect();
-        self.coef = self.coef.select(Axis(0), &keep);
+        self.ids = rows.into_iter().map(|r| r.0).collect();
+        self.coef = coef;
     }
 
     /// `k x` for an exact constant `k`, with `extra` added to the radius.
@@ -462,29 +531,50 @@ fn affine(terms: &[(&Row, &Map, usize)], bias: Option<&Array1<f64>>, row: usize,
     let mass: Vec<f64> = coef.outer_iter().map(|g| g.iter().map(|v| v.abs()).sum()).collect();
     let candidates = ids.len() + fresh.len();
     let mut keep = vec![true; candidates];
+    let principal = if candidates > budget { principal_share(budget) } else { 0 };
+    let held = budget - principal;
+    // The dropped candidates, by written mass: the heaviest go to the principal enclosure.
+    let mut order: Vec<(f64, usize)> =
+        mass.iter().copied().enumerate().map(|(i, m)| (m, i)).chain(fresh.iter().enumerate().map(|(i, f)| (f.1, ids.len() + i))).collect();
     if candidates > budget {
-        let mut order: Vec<(f64, usize)> =
-            mass.iter().copied().enumerate().map(|(i, m)| (m, i)).chain(fresh.iter().enumerate().map(|(i, f)| (f.1, ids.len() + i))).collect();
-        order.select_nth_unstable_by(budget, |a, b| b.0.total_cmp(&a.0));
+        order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
         keep.iter_mut().for_each(|k| *k = false);
-        for &(_, i) in &order[..budget] {
+        for &(_, i) in &order[..held] {
             keep[i] = true;
         }
     }
-    let mut radius = Array1::<f64>::zeros(written);
-    let mut dropped = 0usize;
-    for (g, _) in coef.outer_iter().zip(&keep[..ids.len()]).filter(|(_, k)| !**k) {
-        Zip::from(&mut radius).and(&g).for_each(|o, &v| *o += v.abs());
-        dropped += 1;
+    let enclosed: Vec<usize> = if candidates > budget { order[held..].iter().take(4 * budget.max(1)).map(|o| o.1).collect() } else { Vec::new() };
+    let mut in_enclosure = vec![false; candidates];
+    for &i in &enclosed {
+        in_enclosure[i] = true;
     }
-    let grow = 1.0 + gamma(dropped + 1);
+    let mut radius = Array1::<f64>::zeros(written);
+    let mut dropped_rows: Vec<Array1<f64>> = Vec::new();
+    let mut boxed = 0usize;
+    for (u, g) in coef.outer_iter().enumerate().filter(|(u, _)| !keep[*u]) {
+        if in_enclosure[u] {
+            dropped_rows.push(g.to_owned());
+        } else {
+            Zip::from(&mut radius).and(&g).for_each(|o, &v| *o += v.abs());
+            boxed += 1;
+        }
+    }
+    let grow = 1.0 + gamma(boxed + 1);
     radius.mapv_inplace(|v| up(v * grow));
     // What passes through `|M_t|`: each term's rounding magnitude and its unpromoted radii.
     let g = gamma(terms.iter().map(|(x, _, _)| x.width()).max().unwrap_or(0) + terms.len() + 4);
     let mut passed: Vec<Array1<f64>> = terms.iter().map(|(x, _, _)| x.magnitude().mapv(|m| up(g * m))).collect();
-    for (f, _) in fresh.iter().zip(&keep[ids.len()..]).filter(|(_, k)| !**k) {
-        for &(t, j) in &f.2 {
-            passed[t][j] = up(passed[t][j] + terms[t].0.radius[j]);
+    for (i, f) in fresh.iter().enumerate().filter(|(i, _)| !keep[ids.len() + i]) {
+        if in_enclosure[ids.len() + i] {
+            let mut generator = Array1::<f64>::zeros(written);
+            for &(t, j) in &f.2 {
+                generator.scaled_add(terms[t].0.radius[j], &terms[t].1.m().column(j));
+            }
+            dropped_rows.push(generator);
+        } else {
+            for &(t, j) in &f.2 {
+                passed[t][j] = up(passed[t][j] + terms[t].0.radius[j]);
+            }
         }
     }
     for ((_, map, _), v) in terms.iter().zip(&passed) {
@@ -493,6 +583,16 @@ fn affine(terms: &[(&Row, &Map, usize)], bias: Option<&Array1<f64>>, row: usize,
     }
     if let Some(b) = bias {
         Zip::from(&mut radius).and(b).for_each(|r, &x| *r = up(*r + up(g * x.abs())));
+    }
+    let mut principal_rows: Vec<(u64, Array1<f64>)> = Vec::new();
+    if !dropped_rows.is_empty() {
+        let mut dropped = Array2::<f64>::zeros((dropped_rows.len(), written));
+        for (i, r) in dropped_rows.iter().enumerate() {
+            dropped.row_mut(i).assign(r);
+        }
+        let (ids_new, generators, extra) = enclose(&dropped, principal);
+        Zip::from(&mut radius).and(&extra).for_each(|r, &x| *r = up(*r + x));
+        principal_rows = ids_new.into_iter().zip(generators.outer_iter().map(|g| g.to_owned())).collect();
     }
     // The kept symbols, ascending.
     let mut rows: Vec<(u64, Array1<f64>)> = Vec::new();
@@ -508,6 +608,7 @@ fn affine(terms: &[(&Row, &Map, usize)], bias: Option<&Array1<f64>>, row: usize,
         }
         rows.push((f.0, generator));
     }
+    rows.extend(principal_rows);
     rows.sort_unstable_by_key(|r| r.0);
     let mut out = Array2::<f64>::zeros((rows.len(), written));
     for (s, (_, generator)) in rows.iter().enumerate() {
@@ -657,17 +758,17 @@ pub(crate) fn linearize(curve: Curve, l: f64, h: f64) -> Option<(f64, f64, f64)>
 /// Each coordinate's curve applied (`floor` the smallest value its argument takes exactly).
 fn curved(x: &Row, curves: &[Curve], floor: f64) -> Row {
     let (lo, hi) = x.bounds();
+    curved_within(x, curves, &lo.mapv(|l| l.max(floor)), &hi)
+}
+
+/// Each coordinate's curve applied on `[lo, hi]`, an interval its exact argument is known to lie in.
+fn curved_within(x: &Row, curves: &[Curve], lo: &Array1<f64>, hi: &Array1<f64>) -> Row {
     let width = x.width();
     let magnitude = x.magnitude();
     let mut out = x.clone();
     for d in 0..width {
         let curve = curves[if curves.len() == 1 { 0 } else { d }];
-        let line = if lo[d].is_nan() || hi[d].is_nan() {
-            None
-        } else {
-            let l = lo[d].max(floor);
-            linearize(curve, l, hi[d].max(l))
-        };
+        let line = if lo[d].is_nan() || hi[d].is_nan() { None } else { linearize(curve, lo[d], hi[d].max(lo[d])) };
         // A failed relaxation poisons the center, so no later maximum can hide it.
         let Some((lambda, mu, delta)) = line else {
             out.center[d] = f64::NAN;
@@ -682,11 +783,39 @@ fn curved(x: &Row, curves: &[Curve], floor: f64) -> Row {
     out
 }
 
-/// `x (mean x² + ε)^{-1/2}`.
+/// `x (mean x² + ε)^{-1/2}`. The mean of squares is also bounded through the row's length,
+/// `‖x‖ ∈ ‖c‖ ± (‖G‖₂ √S + ‖r‖)` (the symbols' corners have length `√S`), which a sum of
+/// coordinatewise squares cannot see; the scale is the curve's line on the intersection of both
+/// intervals, or that interval itself when it is narrower than the line.
 fn rms_norm(x: &Row, epsilon: f64) -> Row {
-    let width = x.width() as f64;
-    let mean = total(&product(x, x)).scaled(1.0 / width, 0.0).shifted(epsilon);
-    let scale = curved(&mean, &[Curve::InverseSqrt], epsilon);
+    let n = x.width();
+    let mean = total(&product(x, x)).scaled(1.0 / n as f64, 0.0).shifted(epsilon);
+    let (lo, hi) = mean.bounds();
+    let (mut l, mut h) = (lo[0].max(epsilon), hi[0]);
+    let operator = if x.ids.is_empty() { Some(0.0) } else { super::operator_program::matrix_spectral_bound(x.coef.view()).ok() };
+    if let Some(operator) = operator {
+        let rows = (x.ids.len() as f64).sqrt().next_up();
+        let r = up(x.radius.iter().map(|v| v * v).sum::<f64>() * (1.0 + gamma(n + 1))).sqrt().next_up();
+        let rho = up(up(operator * rows) + r);
+        let squares = x.center.iter().map(|v| v * v).sum::<f64>();
+        let length_hi = up(squares * (1.0 + gamma(n + 1))).sqrt().next_up();
+        let length_lo = down(squares * (1.0 - gamma(n + 1))).max(0.0).sqrt().next_down().max(0.0);
+        let shortest = down(length_lo - rho).max(0.0);
+        let longest = up(length_hi + rho);
+        let k = n as f64;
+        l = l.max(down(down(down(shortest * shortest) / k) + epsilon));
+        h = h.min(up(up(up(longest * longest) / k) + epsilon));
+    }
+    let h = h.max(l);
+    let line = curved_within(&mean, &[Curve::InverseSqrt], &Array1::from_elem(1, l), &Array1::from_elem(1, h));
+    let scale = match (Curve::InverseSqrt.enclose(h), Curve::InverseSqrt.enclose(l)) {
+        (Some((low, _)), Some((_, high))) => {
+            let (mid, half) = centred(low, high);
+            let reach = |row: &Row| up(row.spread()[0] + row.radius[0]);
+            if half < reach(&line) || !line.finite() { Row::exact(Array1::from_elem(1, mid), Array1::from_elem(1, half)) } else { line }
+        }
+        _ => line,
+    };
     product(x, &scale)
 }
 

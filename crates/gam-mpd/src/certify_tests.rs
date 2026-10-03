@@ -227,7 +227,7 @@ fn fixtures() -> Vec<(&'static str, OperatorProgram, FamilyInputs)> {
 }
 
 /// The certificate is at or above the KL of the masks, of draws inside the box and of every point an adversary
-/// visits, with no symbol dropped and with nearly every one dropped.
+/// visits, with no symbol dropped, with most enclosed along principal directions, and with nearly every one dropped.
 #[test]
 fn certificates_contain_every_point_found_in_the_box() {
     for (name, program, family) in fixtures() {
@@ -245,7 +245,7 @@ fn certificates_contain_every_point_found_in_the_box() {
                 let (kl, _, _) = forward(&masked, &masked.family(&family, &point), &target).expect("forward");
                 ndarray::Zip::from(&mut worst).and(&kl).for_each(|w, &v| *w = w.max(v));
             }
-            for budget in [4096, 2] {
+            for budget in [4096, 24, 2] {
                 let bound = certify(&masked, &family, &target, Some(&radius), &gates, budget).expect("certificate");
                 for r in 0..family.rows {
                     assert!(bound[r].is_finite(), "{name}, seed {seed}, budget {budget}: row {r} unbounded");
