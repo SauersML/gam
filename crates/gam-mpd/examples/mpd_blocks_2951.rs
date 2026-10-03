@@ -6,12 +6,14 @@
 //! `gam_mpd::blocks::Generic` from the sites' read second moments and logit-space Gauss–Newton
 //! metrics (`gam_mpd::describe::logit_gauss_newton`) measured on the coded inputs.
 //!
-//! `mpd_blocks_2951 modadd EXPORT_DIR OUT.json OBSERVATIONS [SITES]`
+//! `mpd_blocks_2951 modadd EXPORT_DIR OUT.json OBSERVATIONS [SITES|all] [given:DIR]`
 //!
 //! `EXPORT_DIR` is a `transformer` export (`gam_mpd::import::import`; e.g.
 //! `~/mpd-data/engine/p31_s0_generic`, the mod-31 network on all 961 inputs), `SITES` a comma list
 //! of site names (default every site). Each site starts as its Fisher-whitened singular
-//! subcomponents (`gam_mpd::pieces::fisher_svd`). The checks: every subcomponent on, every one
+//! subcomponents (`gam_mpd::pieces::fisher_svd`), every one on, or with `given:DIR` as a given
+//! library and its per-input sets (`DIR` as `vpd` reads `LIBRARY_DIR` and `SETS_DIR`, the family's
+//! rows one sequence): VPD's decomposition of the same network, scored by the same total. The checks: every subcomponent on, every one
 //! off, and each site's whole map as one block on everywhere (dense). The rank-one sets are
 //! selected pass after pass from all on until a pass no longer lowers the total (the rank-one
 //! point), then the blocks are fitted: merges, shrinks and splits (`gam_mpd::blocks::fit_blocks`).
@@ -141,7 +143,7 @@ fn leading(y: &Array2<f64>) -> (usize, f64) {
     (f, if total > 0.0 { e / total } else { 0.0 })
 }
 
-fn modadd(dir: &Path, out: &Path, observations: f64, names: Option<Vec<String>>) -> Result<(), String> {
+fn modadd(dir: &Path, out: &Path, observations: f64, names: Option<Vec<String>>, given: Option<&Path>) -> Result<(), String> {
     let imported = import(dir)?;
     let program = imported.program;
     let family = imported.contract.family;
@@ -161,11 +163,28 @@ fn modadd(dir: &Path, out: &Path, observations: f64, names: Option<Vec<String>>)
     drop(trace);
     let mut libraries = Vec::new();
     for (site, measured) in chosen.iter().zip(&statistics) {
-        let library = fisher_svd(measured)?;
+        let library = match given {
+            // A given library (`GIVEN/{site}.{v,u}.f64`, as `vpd` reads it) on the uncentred read.
+            Some(dir) => {
+                let (d_out, d_in) = measured.w.dim();
+                let (v, u) = (read_f64(&dir.join(format!("{}.v.f64", site.name)), d_in)?, read_f64(&dir.join(format!("{}.u.f64", site.name)), d_out)?);
+                Library { v, u, mean: Array1::zeros(d_in) }
+            }
+            None => {
+                let library = fisher_svd(measured)?;
+                Library { v: library.v.t().to_owned(), u: library.u, mean: measured.mean.clone() }
+            }
+        };
         eprintln!("{}: {}×{}, {} rank-one subcomponents", site.name, measured.w.nrows(), measured.w.ncols(), library.u.nrows());
-        libraries.push(Library { v: library.v.t().to_owned(), u: library.u, mean: measured.mean.clone() });
+        libraries.push(library);
     }
-    let masks: Vec<Vec<Array2<f64>>> = vec![libraries.iter().map(|l| Array2::<f64>::ones((family.rows, l.v.nrows()))).collect()];
+    let masks: Vec<Vec<Array2<f64>>> = match given {
+        Some(dir) => {
+            let named: Vec<(String, usize)> = chosen.iter().zip(&libraries).map(|(s, l)| (s.name.clone(), l.v.nrows())).collect();
+            given_sets(dir, &named, family.rows, 0, 1)?
+        }
+        None => vec![libraries.iter().map(|l| Array2::<f64>::ones((family.rows, l.v.nrows()))).collect()],
+    };
     // The second-order rounding price only proposes: each fit's decoded blocks are run exactly, and
     // while the measured rounding KL is off its price by more than a factor of two the price is
     // rescaled by their ratio and the fit repeated (`gam_mpd::blocks::rounding_error`).
@@ -189,12 +208,18 @@ fn modadd(dir: &Path, out: &Path, observations: f64, names: Option<Vec<String>>)
 /// One fit of the mod-31 decomposition under `describe` (`modadd`): the checks, the rank-one point
 /// and the blocks, its report and the blocks' measured and priced rounding KL bits.
 fn fit_modadd(program: &OperatorProgram, coded: &Coded<'_>, chosen: &[Site], start: Blocked, describe: &Generic) -> Result<(Value, f64, f64), String> {
-    // The checks: every subcomponent on, every one off, and each site's whole map on.
+    // The checks: every subcomponent on, every one off, and each site's whole map on; then the start
+    // (every subcomponent on, or the given sets).
     let mut rank_one = start;
     rank_one.price(coded)?;
-    let (mut bits, _) = measure(coded, &rank_one)?;
-    let all_on = bits.clone();
+    let mut on = rank_one.clone();
+    on.masks.iter_mut().flatten().for_each(|m| m.fill(1.0));
+    let (all_on, _) = measure(coded, &on)?;
     say("all on", &all_on);
+    drop(on);
+    let (mut bits, _) = measure(coded, &rank_one)?;
+    let start_bits = bits.clone();
+    say("start", &start_bits);
     let (all_off, _) = measure(coded, &rank_one.off())?;
     say("all off", &all_off);
     let (dense, _) = measure(coded, &rank_one.whole())?;
@@ -257,6 +282,7 @@ fn fit_modadd(program: &OperatorProgram, coded: &Coded<'_>, chosen: &[Site], sta
     let report = json!({
         "points": [
             point("all on", &all_on),
+            point("start", &start_bits),
             point("all off", &all_off),
             point("dense", &dense),
             point("rank one", &rank_one_bits),
@@ -464,8 +490,9 @@ fn main() -> Result<(), String> {
     let number = |i: usize, what: &str| -> Result<f64, String> { args.get(i).ok_or(format!("missing {what}"))?.parse::<f64>().map_err(|e| format!("{what}: {e}")) };
     match args.get(1).map(String::as_str) {
         Some("modadd") if args.len() >= 5 => {
-            let names = args.get(5).map(|s| s.split(',').map(str::to_string).collect());
-            modadd(Path::new(&args[2]), Path::new(&args[3]), number(4, "OBSERVATIONS")?, names)
+            let names = args.get(5).filter(|s| s.as_str() != "all").map(|s| s.split(',').map(str::to_string).collect());
+            let given = args.get(6).and_then(|g| g.strip_prefix("given:")).map(Path::new);
+            modadd(Path::new(&args[2]), Path::new(&args[3]), number(4, "OBSERVATIONS")?, names, given)
         }
         Some("vpd") if args.len() >= 9 => vpd(&VpdRun {
             dir: PathBuf::from(&args[2]),
@@ -478,6 +505,6 @@ fn main() -> Result<(), String> {
             kinds: args.get(9).filter(|k| k.as_str() != "all").map(|k| k.split(',').map(str::to_string).collect()),
             boxed: args.get(10).is_some_and(|c| c == "box"),
         }),
-        _ => Err("mpd_blocks_2951 modadd EXPORT_DIR OUT.json OBSERVATIONS [SITES] | vpd EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json OBSERVATIONS FIRST SEQUENCES [KINDS|all] [box|corner]".to_string()),
+        _ => Err("mpd_blocks_2951 modadd EXPORT_DIR OUT.json OBSERVATIONS [SITES|all] [given:DIR] | vpd EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json OBSERVATIONS FIRST SEQUENCES [KINDS|all] [box|corner]".to_string()),
     }
 }
