@@ -2003,6 +2003,19 @@ pub fn select_observed(
             }
         }
     };
+    // A trial's KL and, under the box claim, only its expected excess: the cheap screen the split
+    // recursion ranks halves by before the full worst case decides.
+    let measure_expected = |trial: &[Array2<f64>]| -> Result<(Array1<f64>, Array1<f64>), String> {
+        let family = masked.family(base, trial);
+        match boxed {
+            None => Ok((score_only(masked, &family, target)?, Array1::zeros(rows))),
+            Some(f) => {
+                let (kl_trial, mut state) = Selected::forward(masked, &family, target, on_device, false)?;
+                let expected = state.expected_excess(masked, &family, target, trial, f, box_terms.as_deref(), on_device)?;
+                Ok((kl_trial, expected))
+            }
+        }
+    };
     loop {
         let family = masked.family(base, &masks);
         // The current forward lives only until its gradients (and, once, the Fisher) are read.
@@ -2319,7 +2332,7 @@ pub fn select_observed(
                     Ok((code(&screened.kl, &listing, observations), listing, Some(screened)))
                 }
                 _ => {
-                    let (kl_trial, excess_trial) = measure(trial)?;
+                    let (kl_trial, excess_trial) = measure_expected(trial)?;
                     Ok((code(&(&kl_trial + &excess_trial), &listing, observations), listing, None))
                 }
             }
@@ -2374,12 +2387,44 @@ pub fn select_observed(
                     savings[sequence_of[r]][side] += before[r] - after_half[r];
                 }
             }
-            for q in 0..sequences {
-                if !open[q] {
-                    continue;
+            // The half each sequence would keep; under the box claim the halves were screened by
+            // the expected excess alone, so the kept halves are measured under the full worst case
+            // first (all at once), and a half that does not lower its sequence's code there is
+            // refused.
+            let mut chosen: Vec<Option<usize>> = (0..sequences)
+                .map(|q| {
+                    let side = if savings[q][0] >= savings[q][1] { 0 } else { 1 };
+                    (open[q] && savings[q][side] > 0.0).then_some(side)
+                })
+                .collect();
+            if boxed.is_some() && chosen.iter().any(Option::is_some) {
+                let mut trial = masks.clone();
+                for (r, (first, rest)) in halves.iter().enumerate() {
+                    if let Some(side) = chosen[sequence_of[r]] {
+                        for &(site, c) in if side == 0 { first } else { rest } {
+                            trial[site][[r, c]] = 1.0 - trial[site][[r, c]];
+                        }
+                    }
                 }
-                let side = if savings[q][0] >= savings[q][1] { 0 } else { 1 };
-                if savings[q][side] > 0.0 {
+                let (kl_full, excess_full) = measure(&trial)?;
+                let after_full = code(&(&kl_full + &excess_full), &coder.bits(&trial), observations);
+                let mut full = vec![0.0; sequences];
+                for r in 0..rows {
+                    full[sequence_of[r]] += before[r] - after_full[r];
+                }
+                for q in 0..sequences {
+                    if let Some(side) = chosen[q] {
+                        if full[q] > 0.0 {
+                            savings[q][side] = full[q];
+                        } else {
+                            chosen[q] = None;
+                        }
+                    }
+                }
+            }
+            for q in 0..sequences {
+                let Some(side) = chosen[q] else { continue };
+                {
                     for (r, (first, rest)) in halves.iter().enumerate() {
                         if sequence_of[r] == q {
                             for &(site, c) in if side == 0 { first } else { rest } {

@@ -426,7 +426,9 @@ fn scan(range: std::ops::RangeInclusive<i32>, mut cost: impl FnMut(i32) -> Optio
         return None;
     }
     let len = (end - start + 1) as usize;
-    let mut total = |n: usize| -> Result<f64, String> { Ok(cost(start + n as i32).map_or(f64::INFINITY, |(b, k)| b + k)) };
+    let mut total = |n: usize| -> Result<f64, String> {
+        Ok(cost(start + n as i32).map_or(f64::INFINITY, |(b, k)| b + k)).map(|t| if t.is_nan() { f64::INFINITY } else { t })
+    };
     let mut values: Vec<Option<f64>> = vec![None; len];
     let mut memo = |n: usize| -> f64 {
         if let Some(v) = values[n] {
@@ -954,7 +956,9 @@ impl Geometry {
             if measured <= 2.0 * predicted + 1.0 {
                 break;
             }
-            calibration *= measured / predicted.max(f64::MIN_POSITIVE.sqrt());
+            // A prediction of nothing says only that the price must grow: at most by 2^20 a round,
+            // so the scale stays finite.
+            calibration *= (measured / predicted.max(f64::MIN_POSITIVE)).min(1048576.0);
         }
         best.ok_or_else(|| "no description".to_string())
     }
