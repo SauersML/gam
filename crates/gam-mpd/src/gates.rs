@@ -578,3 +578,27 @@ pub fn decisions(law: &Law, x: ArrayView2<f64>) -> Array1<f64> {
     let d = x.ncols();
     (0..x.nrows()).map(|t| if law.on(&data[t * d..(t + 1) * d]) { 1.0 } else { 0.0 }).collect()
 }
+
+/// The sets the laws choose (`laws[site][piece]`), as per-site 0/1 masks (`rows × pieces`), from
+/// every site's amplitudes on the clean forward (`amplitudes[site]` is `rows × pieces`) and each
+/// row's previous row in its sequence.
+pub fn masks(laws: &[Vec<Law>], amplitudes: &[Array2<f64>], previous: &[Option<usize>]) -> Vec<Array2<f64>> {
+    laws.iter()
+        .map(|site_laws| {
+            let mut m = Array2::<f64>::zeros((previous.len(), site_laws.len()));
+            for (piece, law) in site_laws.iter().enumerate() {
+                let mut f = vec![0.0; law.features.len()];
+                for (r, prev) in previous.iter().enumerate() {
+                    for (k, feature) in law.features.iter().enumerate() {
+                        let row = if feature.lag == 0 { Some(r) } else { *prev };
+                        f[k] = row.map_or(0.0, |row| amplitudes[feature.site][[row, feature.piece]]);
+                    }
+                    if law.on(&f) {
+                        m[[r, piece]] = 1.0;
+                    }
+                }
+            }
+            m
+        })
+        .collect()
+}

@@ -89,6 +89,7 @@ fn the_masked_device_path_matches_the_cpu_within_bands() {
             let accelerated = Accelerated::new(&device, &masked, Arithmetic::F64).expect("lowered");
             let on_device = accelerated.target(&target).expect("target");
             let state = accelerated.forward(&family, &on_device).expect("device forward");
+            assert_eq!(accelerated.score_only(&family, &on_device).expect("score only"), state.kl);
             for r in 0..family.rows {
                 if !target.scores(r) {
                     assert_eq!(state.kl[r], 0.0, "{name}: an unscored row has no KL");
@@ -119,6 +120,27 @@ fn the_masked_device_path_matches_the_cpu_within_bands() {
             let device_quadratic = accelerated.quadratic(&state, &on_device, &tangents).expect("device quadratic");
             let band = (widest + 2) as f64 * 2f64.powi(-24) * quadratic.abs();
             assert!((device_quadratic - quadratic).abs() <= band, "{name}: curvature {device_quadratic} against {quadratic}");
+        }
+    }
+}
+
+/// Selection on a lowered program keeps or refuses by the same float64 KL: lowered onto the host
+/// reference device it selects the masks the program selects unlowered, and the KL it returns is
+/// the CPU forward's on them.
+#[test]
+fn selection_on_a_lowered_program_selects_the_unlowered_masks() {
+    let (unlowered, base, masks, clean) = masked_fixture();
+    let (lowered, _, _, _) = masked_fixture();
+    lowered.lower_on(&gam_gpu::tensor::Device::host(), Arithmetic::F64).expect("lowered");
+    for target in targets(&clean) {
+        let coder = masked::Coder::ran(masked::listing_costs(&masks), base.rows);
+        let (reference, _) = masked::select(&unlowered, &base, &target, masks.clone(), &coder, 1.0, 2).expect("unlowered selection");
+        let (selected, kl) = masked::select(&lowered, &base, &target, masks.clone(), &coder, 1.0, 2).expect("lowered selection");
+        assert_eq!(selected, reference, "the lowered selection's masks");
+        assert_ne!(selected, masks, "the selection moved");
+        let (cpu, _, _) = masked::forward(&unlowered, &unlowered.family(&base, &selected), &target).expect("cpu forward");
+        for r in 0..base.rows {
+            assert!((kl[r] - cpu[r]).abs() <= 1e-9 * (1.0 + cpu[r].abs()), "row {r}: {} against {}", kl[r], cpu[r]);
         }
     }
 }

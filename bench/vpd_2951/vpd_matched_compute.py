@@ -15,6 +15,8 @@ Subcommands:
   train OUT_DIR --steps S ...       VPD training (FLOPs counted), checkpoint OUT_DIR/model.pth
   sets RUN_DIR                      the run's library (U, V per site) and CI>0 sets on val rows
                                     1024..1151 (frontier first), in vpd_sets_export.py's formats
+  score RUN_DIR                     the engine's scorer on the run's library and sets (after
+                                    `sets`): RUN_DIR/score.json, whose `start` is VPD's own sets
   engine-flops LOG [--train N]      training FLOPs of an engine run, from its log's events
 
 Training data for both methods: one stream of Pile val-00000 rows, val 1056..1151 (the rows the
@@ -281,6 +283,25 @@ def cmd_sets(run: Path, device: str, check: int) -> None:
     print(f"{run}: library {offsets[-1]} subcomponents, {total / (SCORED_ROWS * ids.shape[1]):.1f} on per position; check {quick}")
 
 
+SCORER = Path.home() / "mpd-data/engine/bin/mpd_pieces_masked_race"
+
+
+def cmd_score(run: Path, lease: int) -> None:
+    """The scorer the reference VPD point went through (stepA): the frontier export, OBSERVATIONS
+    1024, the run's library, nothing trained, its sets on the 32 frontier rows given, its sets on
+    the 96 held-out rows counted by the context coder."""
+    import subprocess
+
+    subprocess.run([sys.executable, str(Path(__file__).parent / "vpd_sets_export.py"), str(run / "sets"),
+                    "--masks", str(run / "masks.npz"), "--library", str(run / "library")], check=True)
+    with open(run / "score.log", "w") as log:
+        subprocess.run([str(Path.home() / ".local/bin/mem-lease"), str(lease), str(SCORER), str(FRONTIER32), str(run / "score.json"),
+                        "1024", f"library:{run / 'library'}", "0", "32", "512", "auto", str(run / "sets")],
+                       stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, check=True)
+    point = json.load(open(run / "score.json"))["points"][-1]
+    print(json.dumps({"vpd_sets": point["start"], "reselected": {k: point[k] for k in ("l0", "kl", "context_bits", "code", "agree")}}, indent=1))
+
+
 # ---------------------------------------------------------------- engine FLOPs from its log
 
 T, D, VOCAB, LAYERS, HEADS = 512, 768, 50277, 4, 6
@@ -408,6 +429,9 @@ def main() -> None:
     s.add_argument("run", type=Path)
     s.add_argument("--device", default="mps")
     s.add_argument("--check", type=int, default=4)
+    c = sub.add_parser("score")
+    c.add_argument("run", type=Path)
+    c.add_argument("--lease", type=int, default=8)
     f = sub.add_parser("engine-flops")
     f.add_argument("log", type=Path)
     f.add_argument("--train", type=int, required=True)
@@ -420,6 +444,8 @@ def main() -> None:
             cmd_train(a)
         case "sets":
             cmd_sets(a.run, a.device, a.check)
+        case "score":
+            cmd_score(a.run, a.lease)
         case "engine-flops":
             cmd_engine_flops(a.log, a.train, a.box)
 

@@ -81,9 +81,19 @@
 //! [`Head`]: the program ends at the window's output, and the head maps that to the logits the code
 //! scores and pulls their cotangent back. It may run elsewhere (another process, another
 //! precision), so the window's operators are the only ones held in float64.
+//!
+//! # Devices
+//!
+//! Where the process has an accelerator (`masked_device::device`, under `gam_gpu`'s policy), a
+//! masked program without a head is lowered onto it on first use ([`Masked::on_device`]) and the
+//! selection runs there: the forward and its KL in float64, so every keep or refuse is the same
+//! float64 decision as on the CPU, and the proposals (mask gradients, Fisher diagonals) in the
+//! lowered program's proposal arithmetic. Elsewhere everything runs on the CPU.
 
 use super::derivatives::vjp;
 use super::device::{product_atb, proposing};
+use super::masked_device::{Accelerated, DeviceTarget, State};
+use gam_gpu::tensor::{Arithmetic, Device};
 use super::operator_program::{
     FamilyInputs, Interface, LabelKind, Node, Operator, OperatorBody, OperatorProgram, Provenance, Slot, SlotValues,
     Trace, remap_node,
@@ -92,7 +102,7 @@ use super::precision::DeclaredPrecision;
 use gam_linalg::faer_ndarray::fast_atb;
 use ndarray::{Array1, Array2, Axis, s};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// One site of a program (module note).
 #[derive(Clone, Debug)]
@@ -217,6 +227,15 @@ pub struct Masked {
     written: Vec<Vec<usize>>,
     /// The frozen map after the program, when it ends inside a model (module note, "Heads").
     pub head: Option<Arc<dyn Head>>,
+    /// The program on the process's accelerator (module note, "Devices").
+    lowered: Mutex<Lowered>,
+}
+
+/// A masked program's device twin, lowered on first use.
+enum Lowered {
+    Untried,
+    Host,
+    Device(Box<Accelerated>),
 }
 
 /// The frozen blocks after a decomposed window (module note, "Heads"). `output` is the program's
@@ -344,7 +363,54 @@ impl Masked {
             released: false,
             written,
             head: None,
+            lowered: Mutex::new(Lowered::Untried),
         })
+    }
+
+    /// Lower the program onto `device` now, its proposals' products in `proposal`, in place of
+    /// the process's accelerator.
+    pub fn lower_on(&self, device: &Device, proposal: Arithmetic) -> Result<(), String> {
+        let accelerated = Accelerated::new(device, self, proposal)?;
+        *self.lowered.lock().map_err(|_| "device: a poisoned lowering".to_string())? = Lowered::Device(Box::new(accelerated));
+        Ok(())
+    }
+
+    /// `run` on the program's device twin (module note, "Devices"), its operators first brought up
+    /// to date with the program's; `None` when the program runs on the CPU. Calls hold the twin in
+    /// turn, so `run` must not call this again.
+    pub fn on_device<T>(&self, run: impl FnOnce(&Accelerated) -> Result<T, String>) -> Result<Option<T>, String> {
+        if self.head.is_some() {
+            return Ok(None);
+        }
+        let mut lowered = self.lowered.lock().map_err(|_| "device: a poisoned lowering".to_string())?;
+        if matches!(*lowered, Lowered::Untried) {
+            *lowered = match super::masked_device::device()? {
+                None => Lowered::Host,
+                Some(device) => match Accelerated::new(&device, self, Arithmetic::F32) {
+                    Ok(accelerated) => {
+                        log::info!("masked program lowered onto {}", device.name());
+                        Lowered::Device(Box::new(accelerated))
+                    }
+                    Err(e) if gam_gpu::global_policy() == gam_gpu::GpuPolicy::Required => return Err(e),
+                    Err(e) => {
+                        log::warn!("masked program stays on the CPU: {e}");
+                        Lowered::Host
+                    }
+                },
+            };
+        }
+        match &mut *lowered {
+            Lowered::Device(accelerated) => {
+                accelerated.refresh(self)?;
+                run(accelerated).map(Some)
+            }
+            Lowered::Untried | Lowered::Host => Ok(None),
+        }
+    }
+
+    /// [`Masked::on_device`] where the program was found lowered.
+    fn on_lowered<T>(&self, run: impl FnOnce(&Accelerated) -> Result<T, String>) -> Result<T, String> {
+        self.on_device(run)?.ok_or_else(|| "device: the masked program left its device".to_string())
     }
 
     /// Site `k`'s number of pieces.
@@ -1091,6 +1157,61 @@ pub fn previous_inputs(inputs: &FamilyInputs) -> Vec<Option<usize>> {
     }
 }
 
+/// A selection round's masked forward (module note, "Devices"): the CPU's trace with the KL's
+/// cotangent at the output (`None` until a gradient needs it), or the device's state.
+enum Selected {
+    Host(Trace, Option<Array2<f64>>),
+    Device(State),
+}
+
+impl Selected {
+    /// The masked forward of `family` and its per-input KL; on the CPU with the cotangent when
+    /// `cotangent`, on the device always (its KL's cotangent comes with it).
+    fn forward(masked: &Masked, family: &FamilyInputs, target: &Target, on_device: Option<&DeviceTarget>, cotangent: bool) -> Result<(Array1<f64>, Self), String> {
+        if let Some(on_device) = on_device {
+            let state = masked.on_lowered(|accelerated| accelerated.forward(family, on_device))?;
+            return Ok((state.kl.clone(), Self::Device(state)));
+        }
+        if cotangent {
+            let (values, trace, cotangent) = forward(masked, family, target)?;
+            return Ok((values, Self::Host(trace, Some(cotangent))));
+        }
+        let (values, trace) = scored_forward(masked, family, target)?;
+        Ok((values, Self::Host(trace, None)))
+    }
+
+    /// [`mask_gradients`] of the KL.
+    fn mask_gradients(&mut self, masked: &Masked, family: &FamilyInputs, target: &Target) -> Result<Vec<Array2<f64>>, String> {
+        match self {
+            Self::Device(state) => masked.on_lowered(|accelerated| accelerated.mask_gradients(masked, state)),
+            Self::Host(trace, cotangent) => {
+                let cotangent = match cotangent.take() {
+                    Some(c) => c,
+                    None => to_output(masked, family, trace, target, kl(target, &logits(masked, family, trace, target)?).1)?,
+                };
+                mask_gradients(masked, family, trace, cotangent)
+            }
+        }
+    }
+
+    /// The Fisher diagonals of [`fisher`].
+    fn fisher(
+        &self,
+        masked: &Masked,
+        family: &FamilyInputs,
+        target: &Target,
+        on_device: Option<&DeviceTarget>,
+        samples: usize,
+        seed: u64,
+    ) -> Result<Vec<(Array2<f64>, Option<Array2<f64>>)>, String> {
+        match (self, on_device) {
+            (Self::Device(state), Some(on_device)) => masked.on_lowered(|accelerated| accelerated.fisher(masked, state, on_device, samples, seed, false)),
+            (Self::Host(trace, _), _) => fisher(masked, family, trace, target, samples, seed, false),
+            (Self::Device(_), None) => Err("device: a device state without its target".to_string()),
+        }
+    }
+}
+
 /// Selection (module note): rounds of predicted flips, each sequence keeping its inputs' flips only
 /// when its exact code falls, until no sequence changes. Sequences are independent, but the inputs
 /// of one are not (attention carries an earlier input's masks into every later one), so a proposal
@@ -1156,26 +1277,29 @@ pub fn select_observed(
     // What the next round may reuse exactly instead of recomputing: the current masks' forward
     // (when the last proposal was kept whole, its forward *is* the current state's) and, when
     // nothing was kept, also their gradients (the state did not move).
-    let mut next_forward: Option<(Array1<f64>, Trace, Array2<f64>)> = None;
-    let mut reuse: Option<(Array1<f64>, Trace, Vec<Array2<f64>>)> = None;
+    let mut next_forward: Option<(Array1<f64>, Selected)> = None;
+    let mut reuse: Option<(Array1<f64>, Selected, Vec<Array2<f64>>)> = None;
+    // The target on the program's device, when it runs on one (module note, "Devices").
+    let on_device = masked.on_device(|accelerated| accelerated.target(target))?;
+    let on_device = on_device.as_ref();
     loop {
         let family = masked.family(base, &masks);
-        let (kl_now, trace, grads) = match reuse.take() {
+        let (kl_now, state, grads) = match reuse.take() {
             Some(state) => state,
             None => {
-                let (kl_now, trace, cotangent) = match next_forward.take() {
+                let (kl_now, mut state) = match next_forward.take() {
                     Some(state) => state,
-                    None => forward(masked, &family, target)?,
+                    None => Selected::forward(masked, &family, target, on_device, true)?,
                 };
-                let grads = mask_gradients(masked, &family, &trace, cotangent)?;
-                (kl_now, trace, grads)
+                let grads = state.mask_gradients(masked, &family, target)?;
+                (kl_now, state, grads)
             }
         };
         // The Fisher diagonal only ranks proposals (the exact forward decides), so it is measured
         // on the first round and kept: it moves slowly with the masks, and its passes dominate a
         // round's cost.
         if curvature.is_none() {
-            curvature = Some(fisher(masked, &family, &trace, target, samples, 0x5EED + round, false)?);
+            curvature = Some(state.fisher(masked, &family, target, on_device, samples, 0x5EED + round)?);
         }
         let curvature = curvature.as_ref().ok_or("no curvature")?;
         let listing_now = coder.bits(&masks);
@@ -1233,7 +1357,7 @@ pub fn select_observed(
             return Ok((masks, kl_now));
         }
         let proposed_family = masked.family(base, &proposed);
-        let (kl_new, trace_new, cotangent_new) = forward(masked, &proposed_family, target)?;
+        let (kl_new, state_new) = Selected::forward(masked, &proposed_family, target, on_device, false)?;
         let after = code(&kl_new, &coder.bits(&proposed), observations);
         observe(&Round { current: &family, proposed: &proposed_family, before: &before, after: &after, sequence_of: &sequence_of, flipped: &flipped })?;
         // Per sequence: the exact saving of its whole proposal, and its largest flips per input.
@@ -1276,10 +1400,10 @@ pub fn select_observed(
         round += 1;
         if kept == tried {
             // Every proposing input kept its flips, so the masks now equal the proposal.
-            next_forward = Some((kl_new.clone(), trace_new, cotangent_new));
+            next_forward = Some((kl_new.clone(), state_new));
         } else if kept == 0 {
             // Nothing moved: this round's forward and gradients still describe the masks.
-            reuse = Some((kl_now.clone(), trace, grads));
+            reuse = Some((kl_now.clone(), state, grads));
         }
         let per_scored = |code: &Array1<f64>| (0..rows).filter(|r| target.scores(*r)).map(|r| code[r]).sum::<f64>() / scored.max(1) as f64;
         log::info!(
@@ -1293,8 +1417,14 @@ pub fn select_observed(
         // Done when no input can change, or when a round saves less than a bit per scored input.
         if kept > 0 && saved < scored as f64 {
             let kl_final = match (next_forward.take(), reuse.take()) {
-                (Some((kl, _, _)), _) | (None, Some((kl, _, _))) => kl,
-                (None, None) => forward(masked, &masked.family(base, &masks), target)?.0,
+                (Some((kl, _)), _) | (None, Some((kl, _, _))) => kl,
+                (None, None) => {
+                    let family = masked.family(base, &masks);
+                    match on_device {
+                        Some(on_device) => masked.on_lowered(|accelerated| accelerated.score_only(&family, on_device))?,
+                        None => score_only(masked, &family, target)?,
+                    }
+                }
             };
             return Ok((masks, kl_final));
         }

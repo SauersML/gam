@@ -364,7 +364,7 @@ fn main() -> Result<(), String> {
     // `attribution`: every site's per-input samples on the training sequences, gathered a group of
     // sites at a time so a group's samples stay within `SAMPLE_BYTES` (fewer sequences for a site
     // too wide for that alone).
-    const SAMPLE_BYTES: usize = 2 << 30;
+    const SAMPLE_BYTES: usize = 1 << 30;
     let mut attributions: Vec<Option<gam_mpd::pieces::Attributions>> = all_sites.iter().map(|_| None).collect();
     if start == "attribution" {
         let widths: Vec<usize> = statistics.iter().map(|m| m.as_ref().map_or(0, |m| m.w.nrows() + m.w.ncols())).collect();

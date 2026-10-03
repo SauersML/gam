@@ -1,7 +1,7 @@
 #![cfg(test)]
 //! Gate laws on planted gates: the code finds the law that made the labels, and no more.
 
-use super::gates::{Feature, base, fit, least_featured_bits, screen};
+use super::gates::{Feature, Law, Unit, base, fit, least_featured_bits, masks, screen};
 use ndarray::Array2;
 
 /// A deterministic uniform draw in `[0, 1)`.
@@ -85,4 +85,25 @@ fn the_screen_ranks_the_feature_that_drives_the_residual_first() {
     // A feature added to the law it was screened for lowers its total.
     let law = fit(candidates.slice(ndarray::s![.., 2..3]).view(), &y, &[feature(2)], (5f64).log2(), None);
     assert!(law.total_bits() < rate.total_bits() - gains[[2, 0]] / 4.0);
+}
+
+#[test]
+fn masks_read_lagged_features_from_the_previous_row_and_zero_at_a_sequence_start() {
+    // Site 1's one subcomponent is on when site 0's amplitude at the previous row is past 1.
+    let law = Law {
+        features: vec![Feature { site: 0, piece: 0, lag: 1 }],
+        beta: -1.0,
+        linear: vec![1.0],
+        units: vec![Unit { w: vec![0.0], d: 0.0, c: 0.0 }],
+        precision: 0,
+        law_bits: 0.0,
+        data_bits: 0.0,
+    };
+    let off = Law { features: Vec::new(), beta: -1.0, linear: Vec::new(), units: Vec::new(), precision: 0, law_bits: 0.0, data_bits: 0.0 };
+    let amplitudes = vec![Array2::from_shape_vec((4, 1), vec![3.0, 0.0, 3.0, 3.0]).expect("shape"), Array2::zeros((4, 1))];
+    // Rows 0..2 one sequence, rows 2..4 another.
+    let previous = vec![None, Some(0), None, Some(2)];
+    let chosen = masks(&[vec![off], vec![law]], &amplitudes, &previous);
+    assert_eq!(chosen[0].column(0).to_vec(), vec![0.0; 4]);
+    assert_eq!(chosen[1].column(0).to_vec(), vec![0.0, 1.0, 0.0, 1.0]);
 }

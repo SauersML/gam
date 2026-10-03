@@ -18,9 +18,17 @@ use super::operator_program::{FamilyInputs, Node};
 use gam_gpu::tensor::{Arithmetic, Device, Op, Tensor};
 use ndarray::{Array1, Array2, Axis, s};
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 fn error(e: impl std::fmt::Display) -> String {
     format!("device: {e}")
+}
+
+/// The process's accelerator under `gam_gpu`'s global policy, resolved once: a CUDA device, or
+/// `None`, where the masked fit runs on the CPU (`masked`, module note, "Devices").
+pub fn device() -> Result<Option<Device>, String> {
+    static DEVICE: OnceLock<Result<Option<Device>, String>> = OnceLock::new();
+    DEVICE.get_or_init(|| Device::accelerator(gam_gpu::global_policy()).map_err(error)).clone()
 }
 
 /// A masked program lowered onto a device (module note).

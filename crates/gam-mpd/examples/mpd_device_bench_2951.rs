@@ -177,7 +177,7 @@ fn main() -> Result<(), String> {
         b *= 2;
     }
     let remaining = (seconds - started.elapsed().as_secs_f64()).max(5.0);
-    let share = remaining / (batches.len() as f64 * 6.0);
+    let share = remaining / (batches.len() as f64 * 7.0);
     let mut rows_out = Vec::new();
     for &batch in &batches {
         let base = family_of(all, 0, batch);
@@ -187,6 +187,7 @@ fn main() -> Result<(), String> {
         let masks = masks_for(&masked, rows, 3);
         let family = masked.family(&base, &masks);
         let forward = timed(share, || accelerated.forward(&family, &on_device).map(|_| ()))?;
+        let score = timed(share, || accelerated.score_only(&family, &on_device).map(|_| ()))?;
         let state = accelerated.forward(&family, &on_device)?;
         let mut reverse = BTreeMap::new();
         for (name, arithmetic) in [("f64", Arithmetic::F64), ("f32", Arithmetic::F32), ("tf32", Arithmetic::Tf32)] {
@@ -198,7 +199,7 @@ fn main() -> Result<(), String> {
             let state = proposing.forward(&family, &on_device)?;
             proposing.mask_gradients(&masked, &state)?;
             proposing.fisher(&masked, &state, &on_device, 2, 0x5EED, false)?;
-            proposing.forward(&family, &on_device).map(|_| ())
+            proposing.score_only(&family, &on_device).map(|_| ())
         })?;
         // A direction on every library operator (`V`, centring, `U` of every site).
         let tangents: BTreeMap<usize, Array2<f64>> = masked
@@ -215,13 +216,14 @@ fn main() -> Result<(), String> {
             proposing.fisher(&masked, &state, &on_device, 2, 0xF00D, true)?;
             proposing.covariances(&masked, &state)?;
             proposing.quadratic(&state, &on_device, &tangents)?;
-            proposing.forward(&family, &on_device)?;
-            proposing.forward(&family, &on_device).map(|_| ())
+            proposing.score_only(&family, &on_device)?;
+            proposing.score_only(&family, &on_device).map(|_| ())
         })?;
         let per_second = |s: f64| batch as f64 / s;
         let row = json!({
             "batch": batch,
             "forward_kl_f64_seconds": forward, "forward_kl_f64_sequences_per_second": per_second(forward),
+            "score_only_f64_seconds": score, "score_only_f64_sequences_per_second": per_second(score),
             "mask_gradients_seconds": reverse,
             "mask_gradients_sequences_per_second": reverse.iter().map(|(k, v)| (k.to_string(), json!(per_second(*v)))).collect::<serde_json::Map<_, _>>(),
             "selection_round_sequences_per_second": per_second(round),

@@ -117,10 +117,28 @@ fn a_step_of_the_pieces_lowers_the_masked_kl() {
     let masks = vec![Array2::from_shape_fn((family.rows, pieces), |(r, c)| if (r + c) % 3 == 0 { 0.0 } else { 1.0 })];
     let fam = masked.family(&family, &masks);
     let before = forward(&masked, &fam, &target).expect("forward").0.sum();
+    assert_eq!(super::masked::score_only(&masked, &fam, &target).expect("score only").sum(), before);
     let mut running = super::masked::Running::default();
     assert!(step_pieces(&mut masked, &family, &target, &masks, 4, 7, &mut running, super::masked::Claim::Corner).expect("steps").is_some());
     let after = forward(&masked, &fam, &target).expect("forward").0.sum();
     assert!(after < before, "{after} against {before}");
+}
+
+#[test]
+fn score_only_kl_matches_derivatives_with_underflow_and_large_offsets() {
+    let target = Target { logits: ndarray::array![[0.0, 1.0], [0.0, -1000.0], [0.0, 1.0]], scored: Some(vec![true, true, false]) };
+    let logits = ndarray::array![[0.0, -1000.0], [0.0, -1000.0], [0.0, -1000.0]];
+    let (values, gradient) = super::masked::kl(&target, &logits);
+    assert_eq!(super::masked::kl_score_only(&target, &logits), values);
+    let p = 1.0 / (1.0 + (-1.0_f64).exp());
+    let expected = p * (1000.0 + p.ln()) + (1.0 - p) * (1.0 - p).ln();
+    assert!((values[0] - expected).abs() < 1e-10);
+    assert_eq!(values[1], 0.0);
+    assert_eq!(values[2], 0.0);
+    assert!((gradient[[0, 1]] + p).abs() < 1e-14);
+    assert!(gradient.row(2).iter().all(|g| *g == 0.0));
+    let shifted = Target { logits: target.logits.mapv(|x| x + 1e15), scored: target.scored.clone() };
+    assert_eq!(super::masked::kl(&shifted, &logits.mapv(|x| x - 1e15)), (values, gradient));
 }
 
 /// A behaviour scored on some rows: an unscored row adds no KL and no cotangent, and the selection

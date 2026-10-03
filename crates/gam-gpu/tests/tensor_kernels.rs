@@ -61,6 +61,9 @@ fn kl_remains_consistent_with_its_gradient_when_probabilities_underflow() {
         let teacher = up(&device, &target);
         let mut gradient = up(&device, &logits);
         let kl = device.kl_rows(&teacher, &mut gradient, Some(&flags)).expect("kl");
+        let mut scratch = up(&device, &logits);
+        assert_eq!(device.kl_score_rows(&teacher, &mut scratch, Some(&flags)).expect("score only"), kl);
+        assert_eq!(down(&device, &scratch), logits);
         let p = 1.0 / (1.0 + (-1.0_f64).exp());
         let expected = p * (1000.0 + p.ln()) + (1.0 - p) * (1.0 - p).ln();
         assert!((kl[0] - expected).abs() < 1e-10, "{}: {} against {expected}", device.name(), kl[0]);
@@ -79,6 +82,12 @@ fn kl_remains_consistent_with_its_gradient_when_probabilities_underflow() {
         }
         let numeric = (losses[1] - losses[0]) / (2.0 * step);
         assert!((numeric - gradient[[0, 1]]).abs() < 1e-8, "loss derivative {numeric} disagrees with cotangent");
+        // Normalize before adding logarithms, so even a large common logit offset cancels.
+        let shifted_teacher = up(&device, &target.mapv(|x| x + 1e15));
+        let mut shifted_logits = up(&device, &logits.mapv(|x| x - 1e15));
+        let shifted = device.kl_rows(&shifted_teacher, &mut shifted_logits, Some(&flags)).expect("shifted kl");
+        assert_eq!(shifted, kl);
+        assert_eq!(down(&device, &shifted_logits), gradient);
     }
 }
 
