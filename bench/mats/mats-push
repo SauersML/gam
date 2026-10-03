@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Copy Mac data to the same place under the cluster's ~/mpd-data (#2951), for inputs a command
+# reads without naming them (mats-run uploads the paths it names by itself):
+#   mats-push /Users/user/mpd-data/PATH...
+# Absolute symlinks go up as the files they name.
+set -Eeuo pipefail
+MAC_DATA=/Users/user/mpd-data
+[ $# -ge 1 ] || { sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+rel=()
+for p in "$@"; do
+    p=${p%/}
+    case $p in "$MAC_DATA"/*) ;; *) echo "mats-push: $p is not under $MAC_DATA" >&2; exit 2 ;; esac
+    [ -e "$p" ] || { echo "mats-push: $p does not exist" >&2; exit 2; }
+    rel+=("${p#"$MAC_DATA"/}")
+done
+# macOS's openrsync ignores the `/./` marker, so --relative gets paths relative to mpd-data.
+cd "$MAC_DATA" && rsync -a --relative --copy-unsafe-links --exclude '*.pem' --exclude '*.key' --exclude '.env' "${rel[@]}" mats:mpd-data/
+printf 'pushed ~/mpd-data/%s\n' "${rel[@]}"
