@@ -93,6 +93,17 @@
 //! selection runs there: the forward and its KL in float64, so every keep or refuse is the same
 //! float64 decision as on the CPU, and the proposals (mask gradients, Fisher diagonals) in the
 //! lowered program's proposal arithmetic. Elsewhere everything runs on the CPU.
+//!
+//! # Screened heads
+//!
+//! On the CPU under the corner claim, a selection trial's logits are the current masks' plus the
+//! change of the head's hidden rows times the head, `z = z_cur + (h − h_cur) A`, that product in
+//! f32 on the Apple GPU with its derived band (`gam_gpu::banded`), which shrinks with the change.
+//! Its KL is within twice the logits' error of the float64 one (the KL's gradient in the logits,
+//! `q − p`, has `ℓ₁` norm at most 2), so a sequence's keep/refuse is taken from the screened codes
+//! only when its saving clears the sum of its rows' bands (from zero, from every other option, and
+//! from any further rule on the saving); otherwise its rows get the float64 head first. A screened
+//! decision is the one the exact codes take, and the head runs in float64 only where one is close.
 
 use super::derivatives::vjp;
 use super::device::{product_atb, proposing};
@@ -793,6 +804,142 @@ fn exact_head(masked: &Masked, hidden: &Array2<f64>, operator: usize, layout: ga
         gam_gpu::banded::Layout::Transposed => gam_linalg::faer_ndarray::fast_abt(hidden, a.as_ref()),
         gam_gpu::banded::Layout::AsStored => gam_linalg::faer_ndarray::fast_ab(hidden, a.as_ref()),
     }
+}
+
+/// The current masks' head as a screened score starts from (module note, "Screened heads"): the
+/// hidden rows before the head, the logits, and per row a bound on the logits' error (zero when
+/// they came from a float64 forward).
+struct HeadBase {
+    hidden: Array2<f64>,
+    logits: Array2<f64>,
+    error: Array1<f64>,
+}
+
+/// A screened score: per row the KL and a bound on its logits' error, and the hidden rows it was
+/// scored from.
+struct Screened {
+    kl: Array1<f64>,
+    error: Array1<f64>,
+    hidden: Array2<f64>,
+}
+
+/// Screened heads for the selection's scores (module note, "Screened heads"): the program up to
+/// the head's hidden node runs in float64, and the logits are the current ones plus the change of
+/// the hidden rows times the head, `z = z_cur + (h − h_cur) A`, that product in f32 on the device
+/// with its derived band, which shrinks with the change. A keep/refuse decision is taken from the
+/// screened codes when its margin exceeds their bands; otherwise its sequences' rows get the
+/// float64 head first, so every decision is the float64 one.
+struct Screen {
+    body: OperatorProgram,
+    hidden: usize,
+    operator: usize,
+    layout: gam_gpu::banded::Layout,
+}
+
+impl Screen {
+    /// The screen of `masked`, when its program ends in a lone head right after its hidden node.
+    fn new(masked: &Masked) -> Option<Self> {
+        let (hidden, operator, layout) = lone_head(masked)?;
+        let program = &masked.program;
+        let logits = match &program.nodes[program.output] {
+            Node::Readout { input, .. } => *input,
+            _ => program.output,
+        };
+        if logits != hidden + 1 || program.output + 1 != program.nodes.len() {
+            return None;
+        }
+        let mut body = program.clone();
+        body.nodes.truncate(hidden + 1);
+        body.output = hidden;
+        Some(Self { body, hidden, operator, layout })
+    }
+
+    /// The head of a forward's `trace` as a base, its logits exact.
+    fn base(&self, masked: &Masked, trace: &Trace) -> HeadBase {
+        let output = masked.program.output;
+        HeadBase { hidden: trace.values[self.hidden].clone(), logits: trace.values[output].clone(), error: Array1::zeros(trace.values[output].nrows()) }
+    }
+
+    /// `family` scored from `base`; the trace carries the screened logits in the head's nodes.
+    fn score(&self, masked: &Masked, family: &FamilyInputs, target: &Target, base: &HeadBase) -> Result<(Screened, Trace), String> {
+        let mut trace = self.body.execute(family, false).map_err(|e| e.to_string())?;
+        let hidden = trace.values[self.hidden].clone();
+        let op = &masked.program.operators[self.operator];
+        let delta = &hidden - &base.hidden;
+        let (logits, error) = match super::device::banded_product(op, &delta, self.layout).map_err(|e| e.to_string())? {
+            Some(banded) => {
+                let logits = &base.logits + &banded.values;
+                // The device product's band, the base's own error, and the addition's rounding.
+                let error = Array1::from_shape_fn(hidden.nrows(), |r| {
+                    let largest = logits.row(r).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+                    (base.error[r] + banded.band.row_max(r) + f64::EPSILON * largest).next_up()
+                });
+                (logits, error)
+            }
+            None => (exact_head(masked, &hidden, self.operator, self.layout), Array1::zeros(hidden.nrows())),
+        };
+        let kl = kl_score_only(target, &logits);
+        for _ in self.hidden + 1..masked.program.nodes.len() {
+            trace.values.push(logits.clone());
+        }
+        Ok((Screened { kl, error, hidden }, trace))
+    }
+
+    /// The float64 logits and KL of rows `rows` of `hidden`.
+    fn exact(&self, masked: &Masked, target: &Target, hidden: &Array2<f64>, rows: &[usize]) -> (Array2<f64>, Array1<f64>) {
+        let logits = exact_head(masked, &hidden.select(Axis(0), rows), self.operator, self.layout);
+        let sub = Target { logits: target.logits.select(Axis(0), rows), scored: target.scored.as_ref().map(|s| rows.iter().map(|r| s[*r]).collect()) };
+        let kl = kl_score_only(&sub, &logits);
+        (logits, kl)
+    }
+
+    /// Settle rows `rows` of `screened` to float64; with `trace`, its head's nodes too.
+    fn settle(&self, masked: &Masked, target: &Target, screened: &mut Screened, rows: &[usize], trace: Option<&mut Trace>) {
+        let (logits, kl) = self.exact(masked, target, &screened.hidden, rows);
+        for (i, &r) in rows.iter().enumerate() {
+            screened.kl[r] = kl[i];
+            screened.error[r] = 0.0;
+        }
+        if let Some(trace) = trace {
+            for values in trace.values.iter_mut().skip(self.hidden + 1) {
+                for (i, &r) in rows.iter().enumerate() {
+                    values.row_mut(r).assign(&logits.row(i));
+                }
+            }
+        }
+    }
+
+    /// Settle rows `rows` of the current masks' head to float64, with their KL into `kl_now`.
+    fn settle_base(&self, masked: &Masked, target: &Target, base: &mut HeadBase, kl_now: &mut Array1<f64>, rows: &[usize]) {
+        let rows: Vec<usize> = rows.iter().copied().filter(|r| base.error[*r] > 0.0).collect();
+        if rows.is_empty() {
+            return;
+        }
+        let (logits, kl) = self.exact(masked, target, &base.hidden, &rows);
+        for (i, &r) in rows.iter().enumerate() {
+            base.logits.row_mut(r).assign(&logits.row(i));
+            base.error[r] = 0.0;
+            kl_now[r] = kl[i];
+        }
+    }
+}
+
+/// Per sequence, whether a decision over `options` (per option, its saving and the saving's
+/// band per sequence) is open: its best option's interval overlaps another's, zero, or
+/// `threshold[q]` (a further rule on the best saving).
+fn undecided(savings: &[Vec<f64>], bands: &[Vec<f64>], threshold: Option<&[f64]>) -> Vec<bool> {
+    let sequences = savings.first().map_or(0, Vec::len);
+    (0..sequences)
+        .map(|q| {
+            let best = (0..savings.len()).max_by(|a, b| savings[*a][q].total_cmp(&savings[*b][q])).unwrap_or(0);
+            let (low, high) = (savings[best][q] - bands[best][q], savings[best][q] + bands[best][q]);
+            let overlaps = (0..savings.len()).any(|o| o != best && savings[o][q] + bands[o][q] >= low);
+            let zero = low <= 0.0 && high > 0.0;
+            let rule = threshold.is_some_and(|t| low <= t[q] && high >= t[q]);
+            let banded = (0..savings.len()).any(|o| bands[o][q] > 0.0);
+            banded && (overlaps || zero || rule)
+        })
+        .collect()
 }
 
 /// [`box_excess_at`] from the masks' own KL `corner` and the expected excess `expected`, adding
@@ -1735,16 +1882,70 @@ pub fn select_observed(
         }
         _ => None,
     };
+    // The exact KL and (under the box claim) excess of a trial's masks, from one forward: the
+    // expected excess read off it, the vertices from the all-on trace.
+    // The corner claim's scores on the CPU through screened heads (module note, "Screened heads"):
+    // the current masks' head, and the errors a proposal kept whole hands to the next round.
+    let screen = if boxed.is_none() && on_device.is_none() { Screen::new(masked) } else { None };
+    let mut head_base: Option<HeadBase> = None;
+    let mut next_error: Option<Array1<f64>> = None;
+    // Per sequence, its scored rows (a kept round saving less than a bit per one is the last).
+    let mut sequence_rows = vec![0usize; sequences];
+    for r in 0..rows {
+        sequence_rows[sequence_of[r]] += usize::from(scores[r]);
+    }
+    let threshold: Vec<f64> = sequence_rows.iter().map(|n| *n as f64).collect();
+    // Per sequence, `n/ln 2` times the sum of its scored rows' KL bands (twice the logits' error).
+    let bands_of = |error: &Array1<f64>, other: Option<&Array1<f64>>| -> Vec<f64> {
+        let mut out = vec![0.0; sequences];
+        for r in (0..rows).filter(|r| scores[*r]) {
+            out[sequence_of[r]] += scale * 2.0 * (error[r] + other.map_or(0.0, |o| o[r]));
+        }
+        out
+    };
+    // Per sequence, the saving of each option's codes over `before`.
+    let savings_of = |before: &Array1<f64>, afters: &[&Array1<f64>]| -> Vec<Vec<f64>> {
+        afters
+            .iter()
+            .map(|after| {
+                let mut out = vec![0.0; sequences];
+                for r in 0..rows {
+                    out[sequence_of[r]] += before[r] - after[r];
+                }
+                out
+            })
+            .collect()
+    };
+    let measure = |trial: &[Array2<f64>]| -> Result<(Array1<f64>, Array1<f64>), String> {
+        let family = masked.family(base, trial);
+        match boxed {
+            None => Ok((score_only(masked, &family, target)?, Array1::zeros(rows))),
+            Some(f) => {
+                let (kl_trial, mut state) = Selected::forward(masked, &family, target, on_device, false)?;
+                let expected = state.expected_excess(masked, &family, target, trial, f, box_terms.as_ref(), on_device)?;
+                drop(state);
+                let excess = box_worst(masked, base, target, trial, &kl_trial, expected, all_on.as_ref())?;
+                Ok((kl_trial, excess))
+            }
+        }
+    };
     loop {
         let family = masked.family(base, &masks);
         // The current forward lives only until its gradients (and, once, the Fisher) are read.
-        let (kl_now, grads) = match reuse.take() {
+        let (mut kl_now, grads) = match reuse.take() {
             Some(state) => state,
             None => {
                 let (kl_now, mut state) = match next_forward.take() {
                     Some(state) => state,
                     None => Selected::forward(masked, &family, target, on_device, true)?,
                 };
+                if let (Some(screen), Selected::Host(trace, _, _)) = (&screen, &state) {
+                    let mut current = screen.base(masked, trace);
+                    if let Some(error) = next_error.take() {
+                        current.error = error;
+                    }
+                    head_base = Some(current);
+                }
                 // The excess first, so its reverse pass also serves the mask gradients.
                 if let (Some(f), None) = (boxed, &excess_known) {
                     let expected = state.expected_excess(masked, &family, target, &masks, f, box_terms.as_ref(), on_device)?;
@@ -1768,7 +1969,7 @@ pub fn select_observed(
             (Some(_), Some(known)) => known,
             (Some(f), None) => box_excess_at(masked, base, target, &masks, f)?,
         };
-        let before = code(&(&kl_now + &excess_now), &listing_now, observations);
+        let mut before = code(&(&kl_now + &excess_now), &listing_now, observations);
         // Each input's predicted flips, best first, as many as its interaction model says pay
         // (inputs in parallel: each reads only its own row of every array).
         let picks: Vec<(Vec<(usize, usize)>, f64)> = {
@@ -1860,12 +2061,8 @@ pub fn select_observed(
                     .collect()
             };
             let longest = ranked.iter().map(Vec::len).max().unwrap_or(0);
-            let mut before_sequence = vec![0.0; sequences];
-            for r in 0..rows {
-                before_sequence[sequence_of[r]] += before[r];
-            }
-            // Per sequence, the best saving and its k.
-            let mut best = vec![(0.0f64, 0usize); sequences];
+            // Every k's codes (with its screened score), then per sequence the best saving and its k.
+            let mut options: Vec<(usize, Array1<f64>, Array1<f64>, Option<Screened>)> = Vec::new();
             let mut k = 1;
             while k <= longest {
                 let mut trial = masks.clone();
@@ -1874,12 +2071,49 @@ pub fn select_observed(
                         trial[site][[r, c]] = 1.0 - trial[site][[r, c]];
                     }
                 }
-                let kl_trial = score_only(masked, &masked.family(base, &trial), target)?;
-                let excess_trial = match boxed {
-                    Some(f) => box_excess_at(masked, base, target, &trial, f)?,
-                    None => Array1::zeros(rows),
+                let listing_trial = coder.bits(&trial);
+                let (after_trial, screened) = match (&screen, &head_base) {
+                    (Some(screen), Some(head)) => {
+                        let (screened, _) = screen.score(masked, &masked.family(base, &trial), target, head)?;
+                        (code(&screened.kl, &listing_trial, observations), Some(screened))
+                    }
+                    _ => {
+                        let (kl_trial, excess_trial) = measure(&trial)?;
+                        (code(&(&kl_trial + &excess_trial), &listing_trial, observations), None)
+                    }
                 };
-                let after_trial = code(&(&kl_trial + &excess_trial), &coder.bits(&trial), observations);
+                options.push((k, after_trial, listing_trial, screened));
+                k *= 2;
+            }
+            // Screened codes decide where their bands allow; elsewhere the sequence's rows are
+            // settled to float64 in every option and in the current masks first.
+            if let (Some(screen), Some(head)) = (&screen, head_base.as_mut()) {
+                let afters: Vec<&Array1<f64>> = options.iter().map(|(_, after, _, _)| after).collect();
+                let savings = savings_of(&before, &afters);
+                let bands: Vec<Vec<f64>> = options.iter().map(|(_, _, _, s)| bands_of(&head.error, s.as_ref().map(|s| &s.error))).collect();
+                let open = undecided(&savings, &bands, None);
+                let settle: Vec<usize> = (0..rows).filter(|r| open[sequence_of[*r]]).collect();
+                if !settle.is_empty() {
+                    screen.settle_base(masked, target, head, &mut kl_now, &settle);
+                    for &r in &settle {
+                        before[r] = listing_now[r] + scale * (kl_now[r] + excess_now[r]);
+                    }
+                    for (_, after, listing, screened) in options.iter_mut() {
+                        if let Some(screened) = screened.as_mut() {
+                            screen.settle(masked, target, screened, &settle, None);
+                            for &r in &settle {
+                                after[r] = listing[r] + scale * screened.kl[r];
+                            }
+                        }
+                    }
+                }
+            }
+            let mut before_sequence = vec![0.0; sequences];
+            for r in 0..rows {
+                before_sequence[sequence_of[r]] += before[r];
+            }
+            let mut best = vec![(0.0f64, 0usize); sequences];
+            for (k, after_trial, _, _) in &options {
                 let mut after_sequence = vec![0.0; sequences];
                 for r in 0..rows {
                     after_sequence[sequence_of[r]] += after_trial[r];
@@ -1887,10 +2121,9 @@ pub fn select_observed(
                 for q in 0..sequences {
                     let saving = before_sequence[q] - after_sequence[q];
                     if saving > best[q].0 {
-                        best[q] = (saving, k);
+                        best[q] = (saving, *k);
                     }
                 }
-                k *= 2;
             }
             if best.iter().any(|(saving, _)| *saving > 0.0) {
                 for (r, moves) in ranked.iter().enumerate() {
@@ -1917,7 +2150,16 @@ pub fn select_observed(
             return Ok((masks, kl_now));
         }
         let proposed_family = masked.family(base, &proposed);
-        let (kl_new, mut state_new) = Selected::forward(masked, &proposed_family, target, on_device, false)?;
+        let (mut kl_new, mut state_new, mut screened) = match (&screen, &head_base) {
+            (Some(screen), Some(head)) => {
+                let (screened, trace) = screen.score(masked, &proposed_family, target, head)?;
+                (screened.kl.clone(), Selected::Host(trace, None, None), Some(screened))
+            }
+            _ => {
+                let (kl, state) = Selected::forward(masked, &proposed_family, target, on_device, false)?;
+                (kl, state, None)
+            }
+        };
         let excess_new = match boxed {
             Some(f) => {
                 let expected = state_new.expected_excess(masked, &proposed_family, target, &proposed, f, box_terms.as_ref(), on_device)?;
@@ -1927,7 +2169,27 @@ pub fn select_observed(
             }
             None => Array1::zeros(rows),
         };
-        let after = code(&(&kl_new + &excess_new), &coder.bits(&proposed), observations);
+        let listing_new = coder.bits(&proposed);
+        let mut after = code(&(&kl_new + &excess_new), &listing_new, observations);
+        // Screened codes decide where their bands allow; elsewhere the sequence's rows are settled
+        // to float64 in the proposal and in the current masks first.
+        if let (Some(screen), Some(screened), Some(head)) = (&screen, screened.as_mut(), head_base.as_mut()) {
+            let open = undecided(&savings_of(&before, &[&after]), &[bands_of(&head.error, Some(&screened.error))], Some(&threshold));
+            let settle: Vec<usize> = (0..rows).filter(|r| open[sequence_of[*r]]).collect();
+            if !settle.is_empty() {
+                let trace = match &mut state_new {
+                    Selected::Host(trace, _, _) => Some(trace),
+                    Selected::Device(_) => None,
+                };
+                screen.settle(masked, target, screened, &settle, trace);
+                screen.settle_base(masked, target, head, &mut kl_now, &settle);
+                for &r in &settle {
+                    kl_new[r] = screened.kl[r];
+                    before[r] = listing_now[r] + scale * (kl_now[r] + excess_now[r]);
+                    after[r] = listing_new[r] + scale * (kl_new[r] + excess_new[r]);
+                }
+            }
+        }
         observe(&Round { current: &family, proposed: &proposed_family, before: &before, after: &after, sequence_of: &sequence_of, flipped: &flipped })?;
         // Per sequence: the exact saving of its whole proposal, and its largest flips per input.
         let mut sequence_saving = vec![0.0; sequences];
@@ -1941,11 +2203,9 @@ pub fn select_observed(
             let k = flipped[r] as f64;
             alpha[r] = ((predicted - actual) / (k * k)).max(0.0);
         }
-        let mut sequence_rows = vec![0usize; sequences];
         for r in 0..rows {
             sequence_saving[sequence_of[r]] += before[r] - after[r];
             sequence_flips[sequence_of[r]] = sequence_flips[sequence_of[r]].max(flipped[r]);
-            sequence_rows[sequence_of[r]] += usize::from(scores[r]);
         }
         let (mut kept, mut tried, mut saved) = (0usize, 0usize, 0.0);
         for q in 0..sequences {
@@ -1976,13 +2236,18 @@ pub fn select_observed(
         let mut open: Vec<bool> = (0..sequences).map(|q| sequence_flips[q] > 0 && sequence_saving[q] <= 0.0).collect();
         let mut subset: Vec<Vec<(usize, usize)>> = picks.iter().map(|(pick, _)| pick.clone()).collect();
         let (mut rescued, mut rescued_saving) = (0usize, 0.0);
-        let code_at = |trial: &[Array2<f64>]| -> Result<Array1<f64>, String> {
-            let kl_trial = score_only(masked, &masked.family(base, trial), target)?;
-            let excess_trial = match boxed {
-                Some(f) => box_excess_at(masked, base, target, trial, f)?,
-                None => Array1::zeros(rows),
-            };
-            Ok(code(&(&kl_trial + &excess_trial), &coder.bits(trial), observations))
+        let code_at = |trial: &[Array2<f64>], head: Option<&HeadBase>| -> Result<(Array1<f64>, Array1<f64>, Option<Screened>), String> {
+            let listing = coder.bits(trial);
+            match (&screen, head) {
+                (Some(screen), Some(head)) => {
+                    let (screened, _) = screen.score(masked, &masked.family(base, trial), target, head)?;
+                    Ok((code(&screened.kl, &listing, observations), listing, Some(screened)))
+                }
+                _ => {
+                    let (kl_trial, excess_trial) = measure(trial)?;
+                    Ok((code(&(&kl_trial + &excess_trial), &listing, observations), listing, None))
+                }
+            }
         };
         while (0..rows).any(|r| open[sequence_of[r]] && subset[r].len() >= 2) {
             let halves: Vec<(Vec<(usize, usize)>, Vec<(usize, usize)>)> = subset
@@ -1996,7 +2261,7 @@ pub fn select_observed(
                     (flips[..middle].to_vec(), flips[middle..].to_vec())
                 })
                 .collect();
-            let mut savings: Vec<[f64; 2]> = vec![[0.0, 0.0]; sequences];
+            let mut sides = Vec::new();
             for side in 0..2 {
                 let mut trial = masks.clone();
                 for (r, (first, rest)) in halves.iter().enumerate() {
@@ -2004,7 +2269,32 @@ pub fn select_observed(
                         trial[site][[r, c]] = 1.0 - trial[site][[r, c]];
                     }
                 }
-                let after_half = code_at(&trial)?;
+                sides.push(code_at(&trial, head_base.as_ref())?);
+            }
+            // Screened codes decide where their bands allow; elsewhere the sequence's rows are
+            // settled to float64 in both halves and in the current masks first.
+            if let (Some(screen), Some(head)) = (&screen, head_base.as_mut()) {
+                let afters: Vec<&Array1<f64>> = sides.iter().map(|(after, _, _)| after).collect();
+                let bands: Vec<Vec<f64>> = sides.iter().map(|(_, _, s)| bands_of(&head.error, s.as_ref().map(|s| &s.error))).collect();
+                let undecided_now = undecided(&savings_of(&before, &afters), &bands, Some(&threshold));
+                let settle: Vec<usize> = (0..rows).filter(|r| open[sequence_of[*r]] && undecided_now[sequence_of[*r]]).collect();
+                if !settle.is_empty() {
+                    screen.settle_base(masked, target, head, &mut kl_now, &settle);
+                    for &r in &settle {
+                        before[r] = listing_now[r] + scale * (kl_now[r] + excess_now[r]);
+                    }
+                    for (after, listing, screened) in sides.iter_mut() {
+                        if let Some(screened) = screened.as_mut() {
+                            screen.settle(masked, target, screened, &settle, None);
+                            for &r in &settle {
+                                after[r] = listing[r] + scale * screened.kl[r];
+                            }
+                        }
+                    }
+                }
+            }
+            let mut savings: Vec<[f64; 2]> = vec![[0.0, 0.0]; sequences];
+            for (side, (after_half, _, _)) in sides.iter().enumerate() {
                 for r in 0..rows {
                     savings[sequence_of[r]][side] += before[r] - after_half[r];
                 }
@@ -2049,6 +2339,7 @@ pub fn select_observed(
             // The masks are neither the proposal nor what this round measured.
         } else if kept == tried {
             // Every proposing input kept its flips, so the masks now equal the proposal.
+            next_error = screened.map(|s| s.error);
             next_forward = Some((kl_new.clone(), state_new));
         } else if kept == 0 {
             // Nothing moved: this round's forward and gradients still describe the masks.
@@ -2066,6 +2357,13 @@ pub fn select_observed(
         // Done when every sequence is done (each on its own evidence, so a batch of sequences
         // selects exactly as each would alone).
         if cap.iter().all(|c| *c == 0) {
+            // A screened forward's KL is not returned: the float64 one is.
+            if next_error.as_ref().is_some_and(|e| e.iter().any(|v| *v > 0.0)) {
+                next_forward = None;
+            }
+            if head_base.as_ref().is_some_and(|h| h.error.iter().any(|v| *v > 0.0)) {
+                reuse = None;
+            }
             let kl_final = match (next_forward.take(), reuse.take()) {
                 (Some((kl, _)), _) | (None, Some((kl, _))) => kl,
                 (None, None) => {
