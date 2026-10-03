@@ -1409,8 +1409,8 @@ fn box_worst(
 
 /// Our box claim's cost per input (module note, "Claims"): at every site, from its reads in the
 /// masked forward `trace`, the off blocks' outputs `Z_c = U_c z_c` bounded together in the site's
-/// written Fisher `fishers[k]`, `½ (Σ_off ‖Z_c‖_F)²` nats, the largest second-order KL any setting of
-/// the off gates in `[0, 1]` adds there (the triangle inequality), summed over sites. Local to each
+/// written Fisher `fishers[k]`, `½ (Σ_off ‖Z_c‖_F)²` nats, an upper bound on the quadratic response
+/// of the off gates in `[0, 1]` there (the triangle inequality), summed over sites. Local to each
 /// site and second order, it is our claim's cost, not a bound on the end-to-end KL, which the
 /// attack measures ([`box_excess_at`]). A refinement of the library cannot lower it: splitting an
 /// off block leaves the sum of its parts' norms no smaller.
@@ -1524,7 +1524,8 @@ pub(crate) fn box_contributions(
 /// Gradient of the masks' KL plus [`box_upper`], with the written Fishers held fixed for a step.
 /// Later sites' charge depends on earlier sites' weights through their actual masked reads. All
 /// amplitude derivatives and the output's KL derivative therefore seed one joint reverse pass;
-/// differentiating each site in isolation would omit those terms. Returns `(cost, [(dV, dU)])`.
+/// differentiating each site in isolation would omit those terms. Returns the contribution cost
+/// alone and the combined gradients, `(contribution_cost, [(dV, dU)])`.
 pub fn box_gradients(
     masked: &Masked, family: &FamilyInputs, trace: &Trace, masks: &[Array2<f64>],
     cotangent: Array2<f64>, fishers: &[Array2<f64>],
@@ -3197,7 +3198,11 @@ pub(super) fn keep_sum(g: &Array2<f64>, other: &Array2<f64>) -> Result<Array2<f6
 /// the direction projected onto the moves that leave `Σ_c u_c v_cᵀ` unchanged, `Vᵀ dU = 0` or
 /// `Uᵀ dV = 0`. Both are linear, so the sum holds to rounding at every step length.
 ///
-/// On a device (module note, "Devices") the corner claim uses resident forward/reverse passes,
+/// The box gradient differentiates its charged bound, including later sites' dependence on earlier
+/// masked activations, with the running Fishers fixed. It does not differentiate the old random-mask
+/// expectation or the Fisher estimator. The line search reuses each trial's forward for both terms.
+///
+/// On a device (module note, "Devices") both claims use resident forward/reverse passes,
 /// Fisher accumulation and curvature tangents. Factor gradients and covariance blocks still
 /// return to the host for preconditioning and updates. Each backtracking trial is a score-only
 /// float64 forward of the device twin, refreshed with the trial operators.

@@ -118,7 +118,9 @@ fn a_step_of_the_pieces_lowers_the_masked_kl() {
     let masks = vec![Array2::from_shape_fn((family.rows, pieces), |(r, c)| if (r + c) % 3 == 0 { 0.0 } else { 1.0 })];
     let fam = masked.family(&family, &masks);
     let before = forward(&masked, &fam, &target).expect("forward").0.sum();
-    assert_eq!(super::masked::score_only(&masked, &fam, &target).expect("score only").sum(), before);
+    let scored = super::masked::score_only(&masked, &fam, &target).expect("score only").sum();
+    // The gated scorer can use a different product order from the full derivative forward.
+    assert!((scored - before).abs() <= 32.0 * f64::EPSILON * (1.0 + before.abs()), "{scored} vs {before}");
     let mut running = super::masked::Running::default();
     assert!(step_pieces(&mut masked, &family, &target, &masks, 4, 7, &mut running, super::masked::Claim::Corner).expect("steps").is_some());
     let after = forward(&masked, &fam, &target).expect("forward").0.sum();
@@ -623,12 +625,10 @@ fn piece_space_projection_matches_width_space_and_preserves_the_native_sum() {
     assert!((&direction - &reference).iter().all(|v| v.abs() < 1e-10));
 }
 
-/// A step under the box claim is judged on the claim's error, the worst over the box points
-/// ([`super::masked::box_excess_at`]), not on the uniform expectation that only steers it: the
-/// totals a step compares are the masks' KL plus that worst case, before and after.
+/// Training and acceptance use the same contribution charge with the step's fixed Fishers.
 #[test]
-fn a_box_step_is_judged_on_the_claims_worst_case_error() {
-    use super::masked::{Claim, Running, box_excess_at, expected_box_excess_at, score_only};
+fn a_box_step_is_judged_on_the_contribution_charge() {
+    use super::masked::{Claim, Running, box_upper_at, score_only};
     let (program, family) = model();
     let target = Target::every_row(program.execute(&family, false).expect("executes").values[program.output].clone());
     let site = sites(&program).into_iter().find(|s| s.name == "W_in").expect("the W_in site");
@@ -639,24 +639,27 @@ fn a_box_step_is_judged_on_the_claims_worst_case_error() {
         mean: Array1::zeros(WIDTH),
     };
     let mut masked = Masked::build(&program, vec![site.clone()], vec![library]).expect("builds");
+    // Exercise operator refresh and retained-forward scoring in the device path, without a GPU.
+    masked.lower_on(&gam_gpu::tensor::Device::host(), gam_gpu::tensor::Arithmetic::F64).expect("lower");
     let masks = vec![Array2::from_shape_fn((family.rows, pieces), |(r, c)| if (r + c) % 3 == 0 { 0.0 } else { 1.0 })];
     let claim_error = |m: &Masked, fishers: &[Array2<f64>]| -> f64 {
-        score_only(m, &m.family(&family, &masks), &target).expect("kl").sum() + box_excess_at(m, &family, &target, &masks, fishers).expect("box").sum()
+        score_only(m, &m.family(&family, &masks), &target).expect("kl").sum() + box_upper_at(m, &family, &masks, fishers).expect("box").sum()
     };
     let mut running = Running::default();
     let mut judged = 0;
     for seed in 0..6u64 {
         let before = Masked::build(&program, vec![site.clone()], vec![masked.library(0).expect("library")]).expect("rebuilds");
         let Some((total, trial)) = step_pieces(&mut masked, &family, &target, &masks, 4, seed, &mut running, Claim::Box).expect("steps") else { continue };
-        // The worst case is not the expectation here, so the test tells the two apart.
-        let expected = score_only(&before, &before.family(&family, &masks), &target).expect("kl").sum()
-            + expected_box_excess_at(&before, &family, &target, &masks, &running.fishers).expect("expected").sum();
         let worst = claim_error(&before, &running.fishers);
-        assert!(worst > expected, "the box points add nothing over the expectation here: {worst} against {expected}");
         assert!((total - worst).abs() <= 1e-12 * worst.abs(), "the step's total {total} is not the claim's error {worst}");
         let after = claim_error(&masked, &running.fishers);
         assert!((trial - after).abs() <= 1e-12 * after.abs(), "the step's trial {trial} is not the claim's error {after}");
         assert!(after < worst, "{after} against {worst}");
+        let old = before.library(0).expect("before library");
+        let new = masked.library(0).expect("after library");
+        let old_map = old.u.t().dot(&old.v);
+        let new_map = new.u.t().dot(&new.v);
+        assert!((&old_map - &new_map).iter().all(|x| x.abs() < 1e-10), "the step moved the all-on map");
         judged += 1;
     }
     assert!(judged > 0, "no step was taken");
@@ -803,5 +806,94 @@ fn the_box_claims_cost_is_unmoved_by_splitting_an_off_subcomponent() {
     assert!(cost_whole.iter().any(|c| *c > 0.0));
     for (a, b) in cost_whole.iter().zip(cost_split.iter()) {
         assert!((a - b).abs() <= 1e-9 * a.abs().max(1e-12), "{a} against {b}");
+    }
+}
+
+/// Two decomposed sites separated by a nonlinearity: the second site's charge must differentiate
+/// through the first site's masked output. The Fishers are fixed dense positive definite metrics.
+#[test]
+fn contribution_gradients_include_downstream_charges_and_rank_two_blocks() {
+    use super::masked::{box_gradients, box_upper, matrix};
+    use gam_gpu::tensor::{Arithmetic, Device};
+    let (mut program, family) = model();
+    let units = Interface::uniform(UNITS, 1, LabelKind::Unit, 0).expect("units");
+    let middle = Array2::from_shape_fn((UNITS, UNITS), |(i, j)| noise(300 + 31 * i + j));
+    program.operators.push(Arc::new(Operator::dense("W_mid", units.clone(), units, middle, precision(), Provenance::default()).expect("dense")));
+    program.nodes[5] = Node::Affine { terms: vec![(4, 3)], bias: None };
+    program.nodes[6] = Node::Affine { terms: vec![(5, 2)], bias: None };
+    program.nodes.push(Node::Readout { input: 6, basis: 0 });
+    program.output = 7;
+    let chosen: Vec<_> = sites(&program).into_iter().filter(|s| s.name == "W_in" || s.name == "W_mid").collect();
+    assert_eq!(chosen.len(), 2);
+    let libraries: Vec<_> = chosen.iter().enumerate().map(|(k, site)| {
+        let (out, input) = matrix(&program, site).expect("matrix").dim();
+        Library {
+            v: Array2::from_shape_fn((4, input), |(i, j)| 0.3 * noise(400 + 100 * k + 7 * i + j)),
+            u: Array2::from_shape_fn((4, out), |(i, j)| 0.4 * noise(900 + 100 * k + 7 * i + j)),
+            mean: Array1::zeros(input),
+        }
+    }).collect();
+    let fishers: Vec<_> = libraries.iter().enumerate().map(|(k, lib)| {
+        let a = Array2::from_shape_fn((lib.u.ncols(), lib.u.ncols()), |(i, j)| noise(2000 + 100 * k + 7 * i + j));
+        a.t().dot(&a) + Array2::<f64>::eye(lib.u.ncols())
+    }).collect();
+    let target = Target::every_row(program.execute(&family, false).expect("reference").values[program.output].clone());
+    for ranks in [vec![1, 1, 1, 1], vec![2, 2]] {
+        let masks: Vec<_> = (0..2).map(|k| Array2::from_shape_fn((family.rows, ranks.len()), |(r, c)| if (r + c + k) % 3 == 0 { 1.0 } else { 0.0 })).collect();
+        let mut masked = Masked::build_blocks(&program, chosen.clone(), libraries.clone(), vec![ranks.clone(); 2]).expect("masked");
+        let inputs = masked.family(&family, &masks);
+        let (kl, trace, cotangent) = forward(&masked, &inputs, &target).expect("forward");
+        let (charge, grads) = box_gradients(&masked, &inputs, &trace, &masks, cotangent, &fishers).expect("gradient");
+        assert_eq!(charge, box_upper(&masked, &trace, &masks, &fishers).expect("charge"));
+        assert!(charge.sum() > 0.0 && kl.sum() > 0.0);
+        for k in 0..libraries.len() {
+            for writes in [false, true] {
+                let base = if writes { &libraries[k].u } else { &libraries[k].v };
+                for ((i, j), value) in base.indexed_iter() {
+                    let h = 1e-6;
+                    let mut totals = Vec::new();
+                    for sign in [-1.0, 1.0] {
+                        let mut lib = libraries[k].clone();
+                        if writes { lib.u[[i, j]] = value + sign * h; } else { lib.v[[i, j]] = value + sign * h; }
+                        masked.set_library(k, lib).expect("perturb");
+                        let (kl, t, _) = forward(&masked, &inputs, &target).expect("perturbed forward");
+                        totals.push(kl.sum() + box_upper(&masked, &t, &masks, &fishers).expect("perturbed charge").sum());
+                    }
+                    masked.set_library(k, libraries[k].clone()).expect("restore");
+                    let numerical = (totals[1] - totals[0]) / (2.0 * h);
+                    let analytic = if writes { grads[k].1[[i, j]] } else { grads[k].0[[i, j]] };
+                    assert!((numerical - analytic).abs() < 2e-5 * (1.0 + analytic.abs()), "ranks {ranks:?}, site {k}, writes {writes}, [{i},{j}]: {numerical} vs {analytic}");
+                }
+            }
+        }
+        // Exercise the resident graph's independent reverse rules, even without a CUDA GPU.
+        let device = super::masked_device::Accelerated::new(&Device::host(), &masked, Arithmetic::F64).expect("lower");
+        let state = device.forward(&inputs, &device.target(&target).expect("target")).expect("resident forward");
+        let (device_charge, device_grads) = device.box_gradients(&masked, &state, &masks, &fishers).expect("resident gradient");
+        for (a, b) in charge.iter().zip(&device_charge) { assert!((a - b).abs() < 1e-9 * (1.0 + a.abs())); }
+        for ((v, u), (dv, du)) in grads.iter().zip(&device_grads) {
+            for (a, b) in v.iter().chain(u.iter()).zip(dv.iter().chain(du.iter())) {
+                assert!((a - b).abs() < 1e-9 * (1.0 + a.abs()), "host {a} vs resident {b}");
+            }
+        }
+    }
+}
+
+#[test]
+fn contribution_zero_norms_and_all_on_have_finite_zero_derivatives() {
+    use super::masked::box_gradients;
+    let (program, family) = model();
+    let site = sites(&program).into_iter().find(|s| s.name == "W_in").expect("site");
+    let library = Library { v: Array2::ones((2, WIDTH)), u: Array2::zeros((2, UNITS)), mean: Array1::zeros(WIDTH) };
+    for ranks in [vec![1, 1], vec![2]] {
+        let masked = Masked::build_blocks(&program, vec![site.clone()], vec![library.clone()], vec![ranks.clone()]).expect("masked");
+        for on in [0.0, 1.0] {
+            let masks = vec![Array2::from_elem((family.rows, ranks.len()), on)];
+            let inputs = masked.family(&family, &masks);
+            let trace = masked.program.execute(&inputs, false).expect("trace");
+            let seed = Array2::zeros(trace.values[masked.program.output].dim());
+            let (cost, grads) = box_gradients(&masked, &inputs, &trace, &masks, seed, &[Array2::eye(UNITS)]).expect("gradient");
+            assert!(cost.iter().chain(grads[0].0.iter()).chain(grads[0].1.iter()).all(|x| *x == 0.0));
+        }
     }
 }
