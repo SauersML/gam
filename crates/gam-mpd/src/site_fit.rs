@@ -653,15 +653,18 @@ fn description_bits(describe: &dyn Describe, site: usize, v: &Array2<f64>, u: &A
         .into())
 }
 
-/// A given library's code on `samples` (module note): every input's sets selected from all on.
-pub fn measure(site: usize, w: &Array2<f64>, samples: &Samples, describe: &dyn Describe, observations: f64, library: &Library) -> Result<Round, String> {
+/// A given library's code on `samples` (module note), every input's sets selected from all on,
+/// and those sets (per input, the subcomponents on, ascending).
+pub fn measure(site: usize, w: &Array2<f64>, samples: &Samples, describe: &dyn Describe, observations: f64, library: &Library) -> Result<(Round, Vec<Vec<u32>>), String> {
     if library.mean.iter().any(|m| *m != 0.0) {
         return Err("a measured library reads the uncentred input".to_string());
     }
     let mut fitting = Fitting::new(site, w, samples, observations, library.v.nrows())?;
     let bits = description_bits(describe, site, &library.v, &library.u)?;
     let (description, error, _) = fitting.code(&library.v, &library.u, &bits, true, true);
-    Ok(fitting.report(0, description, error))
+    let pieces = library.v.nrows();
+    let sets = fitting.masks.chunks(pieces).map(|m| (0..pieces as u32).filter(|c| m[*c as usize] == 1).collect()).collect();
+    Ok((fitting.report(0, description, error), sets))
 }
 
 /// A library of `settings.pieces` subcomponents for site `site` (`w` its `d_out × d_in` map, `site`

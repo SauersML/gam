@@ -16,7 +16,10 @@
 //!
 //! With `library:DIR` nothing is fitted: each site's given library (`DIR/{site}.{v,u}.f64`, as
 //! above) is measured under the same code (`gam_mpd::site_fit::measure`, its sets selected from all
-//! on), and the measurement goes to `OUT_DIR/{site}.measure.json`.
+//! on), the measurement goes to `OUT_DIR/{site}.measure.json`, and every input's selected sets to
+//! `OUT_DIR/sets/` as `mpd_pieces_masked_2951` takes its `SETS` (`indptr.i64`, `indices.i64` CSR
+//! over the positions, subcomponents numbered site after site, `sites.txt`): a start for its
+//! selection from this code's own.
 
 use gam_mpd::import::import_language_model;
 use gam_mpd::masked::{matrix, sites};
@@ -72,6 +75,8 @@ fn main() -> Result<(), String> {
         .collect();
     let description = gam_mpd::blocks::Generic::new(&statistics, observations);
     drop(statistics);
+    // `library:DIR`: every site's selected sets, written as one CSR at the end.
+    let mut selected: Vec<(String, usize, Vec<Vec<u32>>)> = Vec::new();
     for (k, ((site, w), sample)) in chosen.iter().zip(&maps).zip(&gathered).enumerate() {
         let (d_out, d_in) = w.dim();
         if let Some(dir) = &given {
@@ -82,7 +87,8 @@ fn main() -> Result<(), String> {
                 Array2::from_shape_vec((values.len() / cols, cols), values).map_err(|e| e.to_string())
             };
             let library = Library { v: read("v", d_in)?, u: read("u", d_out)?, mean: Array1::zeros(d_in) };
-            let round = measure(k, w, sample, &description, observations, &library)?;
+            let (round, chosen_sets) = measure(k, w, sample, &description, observations, &library)?;
+            selected.push((site.name.clone(), library.v.nrows(), chosen_sets));
             eprintln!("{} given library of {}: code {:.1} bits per input (description {:.1}, error {:.1}), L0 {:.2}, corner {:.2}",
                 site.name, library.v.nrows(), round.code, round.description, round.error, round.l0, round.corner_share);
             let record = json!({"site": site.name, "observations": observations, "pieces": library.v.nrows(), "code": round.code,
@@ -126,6 +132,25 @@ fn main() -> Result<(), String> {
         let weighted = |e: &Array2<f64>| (&e.dot(&sample.second_moment) * e).sum().sqrt();
         let left = weighted(&(w - &library.u.t().dot(&library.v))) / weighted(w);
         eprintln!("{}: {} subcomponents written, all on leaves {left:.2e} of the map, {:.0}s", site.name, library.v.nrows(), started.elapsed().as_secs_f64());
+    }
+    if !selected.is_empty() {
+        let dir = out.join("sets");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let rows = selected[0].2.len();
+        let (mut indptr, mut indices) = (vec![0i64], Vec::new());
+        for r in 0..rows {
+            let mut offset = 0i64;
+            for (_, pieces, sets) in &selected {
+                indices.extend(sets[r].iter().map(|c| offset + i64::from(*c)));
+                offset += *pieces as i64;
+            }
+            indptr.push(indices.len() as i64);
+        }
+        let bytes = |values: &[i64]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+        std::fs::write(dir.join("indptr.i64"), bytes(&indptr)).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join("indices.i64"), bytes(&indices)).map_err(|e| e.to_string())?;
+        let listed: String = selected.iter().map(|(name, pieces, _)| format!("{name} {pieces}\n")).collect();
+        std::fs::write(dir.join("sites.txt"), listed).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
