@@ -97,6 +97,17 @@
 //! product of the spreads alone. The adversary projects every point onto the claim
 //! ([`Gates::fit`]), and a restoration claim is not branched (its gates all start at zero).
 //!
+//! # Site switches
+//!
+//! A site-switch claim ([`certify_sites`]) states less than any per-gate claim: per passage, each of
+//! the model's sites runs either its explanation (the subcomponents on at each word, every other
+//! one removed) or its native map, the same choice at every word, in any combination of sites, or
+//! anything between. A site's off subcomponents then move together: at every word they share the
+//! site's one switch `t ∈ [0, 1]` (`1` native, `0` replaced). A [`FreeSlot`] with every column in one
+//! block and `tied` set gives exactly that: one gate symbol per site for the whole passage, so the
+//! forms of every word and every attention read carry the same 24 switches rather than thousands
+//! of independent gates.
+//!
 //! # What an infinite bound means, and what bounds the problem allows
 //!
 //! An infinite bound is the relaxation's failure, not the model's. In real arithmetic every masked
@@ -1235,6 +1246,9 @@ pub struct FreeSlot {
     /// A restoration claim's budget (module note, "Restoration claims"): every free entry ranges over
     /// `[0, 1]`, and each row's free entries over every budgeted slot sum to at most this.
     pub restored: Option<usize>,
+    /// Each block's gate is one value at every row (module note, "Site switches"): one symbol per
+    /// block for the whole input family rather than one per row.
+    pub tied: bool,
 }
 
 /// The logits as a dense read of a hidden node: `(hidden, class-major map, bias, skipped nodes)`.
@@ -1591,7 +1605,7 @@ fn free_row(slot: &FreeSlot, r: usize) -> Result<Row, String> {
                 if l != 0.0 || u != 1.0 {
                     return Err(format!("slot {}: a restored gate must range over [0, 1], not [{l}, {u}]", slot.slot));
                 }
-                symbols.entry(gate(slot.slot, r, slot.blocks[c])).or_default().push(c);
+                symbols.entry(gate(slot.slot, if slot.tied { 0 } else { r }, slot.blocks[c])).or_default().push(c);
             } else {
                 center[c] = l;
             }
@@ -1618,7 +1632,7 @@ fn free_row(slot: &FreeSlot, r: usize) -> Result<Row, String> {
         let block = slot.blocks[c];
         if sizes[&block] > 1 && half > 0.0 {
             let k = *shared.entry(block).or_insert_with(|| {
-                symbols.push((gate(slot.slot, r, block), Vec::new()));
+                symbols.push((gate(slot.slot, if slot.tied { 0 } else { r }, block), Vec::new()));
                 symbols.len() - 1
             });
             symbols[k].1.push((c, half));
@@ -1729,6 +1743,7 @@ pub fn certify(
             upper: masked.expand(k, &gates.upper[k]),
             blocks: masked.ranks(k).iter().enumerate().flat_map(|(b, r)| std::iter::repeat_n(b, *r)).collect(),
             restored: gates.restored,
+            tied: false,
         })
         .collect();
     if gates.restored.is_some() && (0..masked.sites.len()).any(|k| !masked.is_rank_one(k)) {
@@ -1736,6 +1751,40 @@ pub fn certify(
     }
     let inputs = masked.family(base, &gates.lower);
     certify_program(&masked.program, &inputs, &free, target, reference_radius, relaxation)
+}
+
+/// Per input, an upper bound on `KL(target ‖ hybrid)` over the site-switch claim (module note, "Site
+/// switches"): each site `k` with `free[k]` runs its explanation (`on[k]`'s blocks, every other block
+/// removed) or its native map, the same at every input of `base` (one passage), or anything
+/// between; every site without `free[k]` runs native. `on` is per site rows × blocks, positive
+/// where a block is on. A library whose blocks do not sum to the site's matrix leaves the rest out of
+/// the native map, so a caller certifying against the model includes it as always-free blocks.
+pub fn certify_sites(
+    masked: &Masked,
+    base: &FamilyInputs,
+    target: &Target,
+    reference_radius: Option<&Array2<f64>>,
+    on: &[Array2<f64>],
+    free: &[bool],
+    relaxation: Relaxation,
+) -> Result<Array1<f64>, String> {
+    if masked.head.is_some() {
+        return Err("a program with a head is not certified".to_string());
+    }
+    if on.len() != masked.sites.len() || free.len() != masked.sites.len() {
+        return Err(format!("{} sites, {} masks, {} switches", masked.sites.len(), on.len(), free.len()));
+    }
+    let lower: Vec<Array2<f64>> =
+        on.iter().zip(free).map(|(m, &f)| if f { m.mapv(|x| if x > 0.0 { 1.0 } else { 0.0 }) } else { Array2::ones(m.dim()) }).collect();
+    let slots: Vec<FreeSlot> = (0..masked.sites.len())
+        .map(|k| {
+            let lower = masked.expand(k, &lower[k]);
+            let upper = Array2::ones(lower.dim());
+            FreeSlot { slot: masked.slots[k], blocks: vec![0; lower.ncols()], lower, upper, restored: None, tied: true }
+        })
+        .collect();
+    let inputs = masked.family(base, &lower);
+    certify_program(&masked.program, &inputs, &slots, target, reference_radius, relaxation)
 }
 
 /// A branched certificate: per input the largest bound over the leaves, and how many leaves were bounded.

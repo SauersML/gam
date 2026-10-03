@@ -31,17 +31,22 @@
 //! branching). With `OBSERVATIONS` positive, a second set per word is chosen by the masked selection under
 //! the box claim (`select_boxed`, coded in `OBSERVATIONS`) from the given sets, and certified the same way.
 //! `CLAIMS` lists what each set is certified under: `box` (the default) and `restore:K`, at most `K`
-//! off subcomponents restored per word (`gam_mpd::certify::Gates::restoring`), comma-separated.
+//! off subcomponents restored per word (`gam_mpd::certify::Gates::restoring`), and `sites`, the
+//! site-switch claim (`gam_mpd::certify::certify_sites`): per sequence, each site within `FREE` runs
+//! its explanation (the given set's subcomponents, the residual and every other one removed) or its
+//! native map, at every word alike, in any combination or anything between; sites outside `FREE`
+//! run native. Under `sites` the lower side is exact: every word's largest KL over all free sites
+//! replaced and each free site replaced alone (no adversary, no branching).
 //! `ROUNDING` `real` reports the relaxation's bound without any rounding enclosure (not a proof; the
 //! default `sound` is one).
 
 use gam_mpd::blocks::Describe;
-use gam_mpd::certify::{Gates, Relaxation, adversary, certify, certify_branching};
+use gam_mpd::certify::{Gates, Relaxation, adversary, certify, certify_branching, certify_sites};
 use gam_mpd::import::{import, import_language_model};
 use gam_mpd::masked::{Coder, Library, Masked, Target, box_excess_at, forward, select, select_boxed, site_statistics, sites};
 use gam_mpd::operator_program::{FamilyInputs, OperatorProgram};
 use gam_mpd::pieces::fisher_svd;
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, Zip};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -222,15 +227,22 @@ fn lm(args: &[String]) -> Result<(), String> {
     };
     // `CLAIMS`: comma-separated `box` (the default) and `restore:K` (at most `K` off subcomponents
     // restored per word, `gam_mpd::certify::Gates::restoring`).
-    let claims: Vec<Option<usize>> = arg(args, 14, "box".to_string())?
+    // `sites` is the site-switch claim (`gam_mpd::certify::certify_sites`).
+    #[derive(Clone, Copy)]
+    enum Claim {
+        Gates(Option<usize>),
+        Sites,
+    }
+    let claims: Vec<Claim> = arg(args, 14, "box".to_string())?
         .split(',')
         .map(|c| match c {
-            "box" => Ok(None),
+            "box" => Ok(Claim::Gates(None)),
+            "sites" => Ok(Claim::Sites),
             other => other
                 .strip_prefix("restore:")
                 .and_then(|k| k.parse().ok())
-                .map(Some)
-                .ok_or_else(|| format!("CLAIMS {other}: expected box or restore:K; {usage}")),
+                .map(|k| Claim::Gates(Some(k)))
+                .ok_or_else(|| format!("CLAIMS {other}: expected box, sites or restore:K; {usage}")),
         })
         .collect::<Result<_, _>>()?;
     let started = Instant::now();
@@ -378,7 +390,52 @@ fn lm(args: &[String]) -> Result<(), String> {
         sets.push(("box".to_string(), boxed));
     }
     let mut report = Vec::new();
-    for (name, masks, restored) in sets.into_iter().flat_map(|(n, m)| claims.iter().map(move |c| (n.clone(), m.clone(), *c))) {
+    let free_site: Vec<bool> = masked.sites.iter().map(|site| free == "all" || free.split(',').any(|p| site.name.starts_with(p))).collect();
+    for (name, masks, claim) in sets.into_iter().flat_map(|(n, m)| claims.iter().map(move |c| (n.clone(), m.clone(), *c))) {
+        let restored = match claim {
+            Claim::Gates(restored) => restored,
+            Claim::Sites => {
+                // A replaced site keeps only the set's subcomponents: its residual pieces are off too.
+                let on: Vec<Array2<f64>> = masks
+                    .iter()
+                    .zip(&given)
+                    .map(|(m, g)| Array2::from_shape_fn(m.dim(), |(r, c)| if c < *g { m[[r, c]] } else { 0.0 }))
+                    .collect();
+                let hybrid = |replaced: &dyn Fn(usize) -> bool| -> Vec<Array2<f64>> {
+                    on.iter().enumerate().map(|(k, m)| if replaced(k) { m.clone() } else { Array2::ones(m.dim()) }).collect()
+                };
+                let all = hybrid(&|k| free_site[k]);
+                let (kl, _, _) = forward(&masked, &masked.family(family, &all), &target)?;
+                let mut found = kl.clone();
+                let mut alone = Vec::new();
+                for k in (0..masked.sites.len()).filter(|&k| free_site[k]) {
+                    let (one, _, _) = forward(&masked, &masked.family(family, &hybrid(&|j| j == k)), &target)?;
+                    Zip::from(&mut found).and(&one).for_each(|f, &o| *f = f.max(o));
+                    alone.push(json!({"site": masked.sites[k].name, "kl": summary(&one)}));
+                }
+                let at = Instant::now();
+                let certified = certify_sites(&masked, family, &target, rounding.then_some(&radius), &on, &free_site, Relaxation { budget, rounding })?;
+                let seconds = at.elapsed().as_secs_f64();
+                for r in 0..family.rows {
+                    if certified[r] < found[r] {
+                        return Err(format!("{name} under sites: row {r} certified {} below the exact {}", certified[r], found[r]));
+                    }
+                }
+                eprintln!(
+                    "{name} under sites: L0 {:.1}, all replaced KL {:.4}, worst evaluated {:.4}, certified {:.4} ({seconds:.1}s)",
+                    listed_l0(&masks),
+                    kl.mean().unwrap_or(0.0),
+                    found.mean().unwrap_or(0.0),
+                    certified.mean().unwrap_or(0.0)
+                );
+                report.push(json!({
+                    "sets": name, "claim": "sites", "l0": listed_l0(&masks), "seconds": seconds,
+                    "kl": summary(&kl), "evaluated": summary(&found), "certified": summary(&certified), "alone": alone,
+                    "rows": { "kl": kl.to_vec(), "evaluated": found.to_vec(), "certified": certified.to_vec() },
+                }));
+                continue;
+            }
+        };
         let claim = restored.map_or_else(|| "box".to_string(), |k| format!("restore:{k}"));
         let mut gates = Gates { restored, ..Gates::claim(&masks) };
         // The off pieces outside `FREE` stay off.
