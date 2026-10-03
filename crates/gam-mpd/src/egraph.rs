@@ -268,6 +268,13 @@ impl Leaf {
     pub fn is_exact(&self) -> bool {
         self.lattice.is_some()
     }
+
+    /// Whether the leaf is exactly the identity of one interface.
+    fn is_identity(&self) -> bool {
+        self.is_exact()
+            && self.operator.rows == self.operator.cols
+            && self.center.indexed_iter().all(|((r, c), v)| *v == if r == c { 1.0 } else { 0.0 })
+    }
 }
 
 /// How a derived leaf was formed: the memo key that keeps a law from minting a new leaf for a
@@ -444,6 +451,15 @@ impl Leaves {
     /// `A B`.
     fn product(&mut self, a: LeafId, b: LeafId) -> Result<LeafId, EgraphError> {
         let (la, lb) = (self.leaf(a), self.leaf(b));
+        // `I B = B` and `A I = A` exactly: no new leaf. A banded recomputation of the other factor
+        // would be a leaf no exact equality could merge back, and composing with the identity
+        // again would mint one more each round.
+        if la.is_identity() && la.operator.rows == lb.operator.rows {
+            return Ok(b);
+        }
+        if lb.is_identity() && lb.operator.cols == la.operator.cols {
+            return Ok(a);
+        }
         let inner = la.center.ncols();
         let value = la.center.dot(&lb.center);
         let (abs_a, abs_b) = (la.center.mapv(f64::abs), lb.center.mapv(f64::abs));

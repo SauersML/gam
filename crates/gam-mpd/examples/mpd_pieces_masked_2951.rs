@@ -804,6 +804,18 @@ fn main() -> Result<(), String> {
         Some(saved) => (0..train).map(|s| as_assigned(saved[s].take())).collect(),
         None => (0..train).map(|s| sets.as_ref().filter(|x| x.fits(&masked.all_pieces())).map(|x| x.assigned(s))).collect(),
     };
+    // Selection and the error under the run's claim, on any library of these sites (a grown one's
+    // sites and Fishers are the same).
+    let select_claimed = |m: &Masked, inputs: &FamilyInputs, target: &Target, begin: Vec<Array2<f64>>, coder: &Coder| match claim {
+        Claim::Box => select_boxed(m, inputs, target, begin, coder, observations, samples, &fishers),
+        Claim::Corner => select(m, inputs, target, begin, coder, observations, samples),
+    };
+    let excess_on = |m: &Masked, inputs: &FamilyInputs, target: &Target, masks: &[Array2<f64>]| -> Result<f64, String> {
+        match claim {
+            Claim::Box => Ok(box_excess_at(m, inputs, target, masks, &fishers)?.sum()),
+            Claim::Corner => Ok(0.0),
+        }
+    };
     // The box claim's error against the KL of sampled gates (module note, `CLAIM`): on the first
     // five training sequences at their start sets, every off gate drawn uniform.
     if claim == Claim::Box && first_pass == 0 && first_sequence == 0 {
@@ -865,19 +877,10 @@ fn main() -> Result<(), String> {
             };
             let begin_kl = score_only(&masked, &masked.family(&inputs, &begin), &target)?;
             // The error under the claim: under the box, the masks' KL plus the box's excess.
-            let excess_at = |masks: &[Array2<f64>]| -> Result<f64, String> {
-                match claim {
-                    Claim::Box => Ok(box_excess_at(&masked, &inputs, &target, masks, &fishers)?.sum()),
-                    Claim::Corner => Ok(0.0),
-                }
-            };
-            let begin_excess = excess_at(&begin)?;
+            let begin_excess = excess_on(&masked, &inputs, &target, &begin)?;
             let begin_code = coder.bits(&begin).sum() + (begin_kl.sum() + begin_excess) * scale;
-            let (masks, kl) = match claim {
-                Claim::Box => select_boxed(&masked, &inputs, &target, begin, &coder, observations, samples, &fishers)?,
-                Claim::Corner => select(&masked, &inputs, &target, begin, &coder, observations, samples)?,
-            };
-            let excess = excess_at(&masks)?;
+            let (masks, kl) = select_claimed(&masked, &inputs, &target, begin, &coder)?;
+            let excess = excess_on(&masked, &inputs, &target, &masks)?;
             let (masks, kl, excess) = if coder.bits(&masks).sum() + (kl.sum() + excess) * scale < begin_code {
                 (masks, kl, excess)
             } else {
@@ -923,11 +926,13 @@ fn main() -> Result<(), String> {
                 let candidate = Masked::build(model, original_sites.clone(), grown)?;
                 let candidate_costs = costs_of(&candidate)?;
                 let candidate_coder = Coder::ran(candidate_costs.clone(), inputs.rows);
-                let (candidate_masks, candidate_kl) = select(&candidate, &inputs, &target, grown_masks, &candidate_coder, observations, samples)?;
-                let candidate_code = (candidate_coder.bits(&candidate_masks).sum() + candidate_kl.sum() * scale) / inputs.rows as f64;
+                let (candidate_masks, candidate_kl) = select_claimed(&candidate, &inputs, &target, grown_masks, &candidate_coder)?;
+                let candidate_excess = excess_on(&candidate, &inputs, &target, &candidate_masks)?;
+                let candidate_code = (candidate_coder.bits(&candidate_masks).sum() + (candidate_kl.sum() + candidate_excess) * scale) / inputs.rows as f64;
                 // The library as it stands after this sequence's step, on the same sets.
                 let now_kl = score_only(&masked, &masked.family(&inputs, &masks), &target)?;
-                let sequence_code = (coder.bits(&masks).sum() + now_kl.sum() * scale) / inputs.rows as f64;
+                let now_excess = excess_on(&masked, &inputs, &target, &masks)?;
+                let sequence_code = (coder.bits(&masks).sum() + (now_kl.sum() + now_excess) * scale) / inputs.rows as f64;
                 let kept = candidate_code < sequence_code;
                 log::info!("split test: {sequence_code:.1} -> {candidate_code:.1} bits per token; {}", if kept { "kept" } else { "refused" });
                 if kept {
@@ -949,7 +954,8 @@ fn main() -> Result<(), String> {
                 let family = masked.family(&inputs, &masks);
                 let (base_kl, masked_trace, _) = forward(&masked, &family, &target)?;
                 drop(family);
-                let base_code = (Coder::ran(costs.clone(), inputs.rows).bits(&masks).sum() + base_kl.sum() * scale) / inputs.rows as f64;
+                let base_excess = excess_on(&masked, &inputs, &target, &masks)?;
+                let base_code = (Coder::ran(costs.clone(), inputs.rows).bits(&masks).sum() + (base_kl.sum() + base_excess) * scale) / inputs.rows as f64;
                 let mut grown = Vec::new();
                 let mut grown_masks = Vec::new();
                 let mut added = Vec::new();
@@ -968,8 +974,9 @@ fn main() -> Result<(), String> {
                     let candidate = Masked::build(model, original_sites.clone(), grown)?;
                     let candidate_costs = costs_of(&candidate)?;
                     let candidate_coder = Coder::ran(candidate_costs.clone(), inputs.rows);
-                    let (candidate_masks, candidate_kl) = select(&candidate, &inputs, &target, grown_masks, &candidate_coder, observations, samples)?;
-                    let candidate_code = (candidate_coder.bits(&candidate_masks).sum() + candidate_kl.sum() * scale) / inputs.rows as f64;
+                    let (candidate_masks, candidate_kl) = select_claimed(&candidate, &inputs, &target, grown_masks, &candidate_coder)?;
+                    let candidate_excess = excess_on(&candidate, &inputs, &target, &candidate_masks)?;
+                    let candidate_code = (candidate_coder.bits(&candidate_masks).sum() + (candidate_kl.sum() + candidate_excess) * scale) / inputs.rows as f64;
                     let kept = candidate_code < base_code;
                     log::info!(
                         "dropped-atoms test: {} pieces, {base_code:.1} -> {candidate_code:.1} bits per token; {}",

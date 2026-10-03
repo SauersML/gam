@@ -1,7 +1,7 @@
 #![cfg(test)]
 //! Switching functions on planted gates: the code finds the function that made the labels, and no more.
 
-use super::gates::{Feature, Switch, Unit, base, fit, least_featured_bits, masks, screen};
+use super::gates::{Feature, Switch, Unit, base, best, fit, masks, screen};
 use ndarray::Array2;
 
 /// A deterministic uniform draw in `[0, 1)`.
@@ -61,12 +61,14 @@ fn labels_independent_of_the_feature_keep_the_base_rate() {
 }
 
 #[test]
-fn a_rare_subcomponent_is_left_at_its_base_rate_by_the_bound() {
-    // One on-label in 4000: no switch with a feature can pay for itself.
-    let mut y = vec![false; 4000];
+fn a_rare_subcomponent_keeps_its_base_rate() {
+    // One on-label in 4000 inputs: no function of a feature pays for itself.
+    let n = 4000;
+    let x = Array2::from_shape_fn((n, 1), |(t, _)| normal(t));
+    let mut y = vec![false; n];
     y[17] = true;
-    let rate = base(&y);
-    assert!(rate.total_bits() <= least_featured_bits(12.0), "base {}", rate.total_bits());
+    let chosen = best(x.view(), &y, &[feature(0)], (40_000f64).log2());
+    assert!(chosen.features.is_empty(), "{chosen:?}");
 }
 
 #[test]
