@@ -62,6 +62,10 @@ parser.add_argument("--word-restarts", type=int, default=6, help="the per-word a
 parser.add_argument("--word-delta", choices=["off", "held", "adversarial"], default=None,
                     help="the per-word adversary's residual: off (0), held (1, the model's own weights), adversarial per word (default: as --delta)")
 parser.add_argument("--site-random", type=int, default=64, help="sites: random subsets of sites tried per passage")
+parser.add_argument("--exhaustive", default=None,
+                    help="sites: comma-separated site-name prefixes (VPD names, e.g. h.0.) whose every subset is tried, every other site native; no search")
+parser.add_argument("--sets-first", type=int, default=0, help="the given stems' first passage: they are read from passage SETS_FIRST on")
+parser.add_argument("--passage", type=int, default=None, help="score passage P alone: --offset moves by P and --sets-first is P")
 parser.add_argument("--site-steps", type=int, default=30, help="sites: sign-ascent steps on the continuous switches")
 parser.add_argument("--site-restarts", type=int, default=4, help="sites: sign-ascent starts")
 parser.add_argument("--free", default="all", help="comma-separated site-name prefixes whose off gates the per-word adversary may move (VPD names, e.g. h.3.)")
@@ -75,6 +79,9 @@ parser.add_argument("--subcomponents", type=Path, default=None,
 parser.add_argument("--gates", type=Path, default=None,
                     help="VPD's gates on these rows (written by the first run, read by the rest: the CI network then never loads)")
 args = parser.parse_args()
+if args.passage is not None:
+    args.offset += args.passage
+    args.sets_first = args.passage
 DEV = os.environ.get("VPD_DEVICE", "mps")
 
 
@@ -161,8 +168,10 @@ class Family:
 def given_family(stem=None) -> Family:
     """The driver's CSR sets in VPD's site order."""
     stem = args.sets if stem is None else stem
-    indptr = np.load(f"{stem}.indptr.npy")
-    indices = np.load(f"{stem}.indices.npy")
+    # From passage `--sets-first` on.
+    indptr = np.load(f"{stem}.indptr.npy")[args.sets_first * S:]
+    indices = np.load(f"{stem}.indices.npy")[int(indptr[0]):]
+    indptr = indptr - indptr[0]
     offsets = np.load(f"{stem}.offsets.npy")
     manifest = json.load(open(args.library / "manifest.json"))
     driver_sites = sorted(manifest)
@@ -527,7 +536,8 @@ def site_switches():
     passage's mean KL, and `--site-restarts` sign-ascent runs of `--site-steps` steps on the
     continuous switches (each step's rounding counted as a subset too). Reports per passage the
     worst mean KL over subsets and over the continuous box, and per word the largest KL any visited
-    switch setting gave it: lower bounds on the claim's worst case."""
+    switch setting gave it: lower bounds on the claim's worst case. With `--exhaustive`, every subset of
+    the named sites instead (every other site native): the exact worst over the claim's corners."""
     key = args.key or "sites"
     out = {}
     L = len(names)
@@ -544,9 +554,10 @@ def site_switches():
             rows = slice(i * MB, (i + 1) * MB)
 
             def kl_at(sw: torch.Tensor, grad: bool = False) -> torch.Tensor:
-                """Per-position KL [MB, S] with switches sw [MB, L]."""
-                masks = {n: 1 - sw[:, j, None, None] * (1 - g[n]) for j, n in enumerate(names)}
-                delta = {n: (1 - sw[:, j, None]).expand(MB, S) for j, n in enumerate(names)}
+                """Per-position KL [MB, S] with switches sw [MB, L]; a site native in every row runs its own map."""
+                moved = [j for j in range(L) if grad or bool((sw[:, j] != 0).any())]
+                masks = {names[j]: 1 - sw[:, j, None, None] * (1 - g[names[j]]) for j in moved}
+                delta = {names[j]: (1 - sw[:, j, None]).expand(MB, S) for j in moved}
                 with torch.set_grad_enabled(grad):
                     set_masks(masks, delta)
                     try:
@@ -571,6 +582,29 @@ def site_switches():
                 best[better] = mean[better]
                 best_sw[better] = sw[better]
 
+            if args.exhaustive:
+                # Every subset of the named sites, every other site native: the exact worst corner.
+                chosen = [j for j, n in enumerate(names) if any(n.startswith(p) for p in args.exhaustive.split(","))]
+                for subset in range(1 << len(chosen)):
+                    sw = torch.zeros((MB, L), device=DEV)
+                    for b, j in enumerate(chosen):
+                        if subset >> b & 1:
+                            sw[:, j] = 1
+                    kl = kl_at(sw).detach()
+                    flat = kl.cpu().numpy().ravel()
+                    word_corner[sl] = np.maximum(word_corner[sl], flat)
+                    take(sw, kl.mean(1))
+                    if subset == (1 << len(chosen)) - 1:
+                        all_replaced[sl] = flat
+                    if subset and subset & (subset - 1) == 0:
+                        alone[chosen[subset.bit_length() - 1], sl] = flat
+                word_box[sl] = word_corner[sl]
+                corner_worst[rows] = best.cpu().numpy()
+                box_worst[rows] = corner_worst[rows]
+                del g
+                log(f"sites {name} passages {i * MB}..{(i + 1) * MB} exhaustive over {len(chosen)} sites: all replaced "
+                    f"{all_replaced[sl].mean():.3f}, worst subset {corner_worst[rows].round(3).tolist()}")
+                continue
             ones = torch.ones((MB, L), device=DEV)
             m = visit(ones, True)
             take(ones, m)
