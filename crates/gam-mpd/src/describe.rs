@@ -416,20 +416,26 @@ impl<'a> Block<'a> {
 }
 
 /// The best exponent of a scan: `cost(p)` is `(bits, KL bits)`, `None` when `p` is out of range.
-/// Coarse to fine, it stops once the bits alone exceed the best total: a finer lattice sends every
-/// integer at least as long, so no finer exponent can win.
+/// The lattice bits grow as it refines and the error they leave falls, so their sum is searched as
+/// unimodal in `p` (ternary search, each exponent costed once).
 fn scan(range: std::ops::RangeInclusive<i32>, mut cost: impl FnMut(i32) -> Option<(f64, f64)>) -> Option<(i32, f64)> {
-    let mut best: Option<(i32, f64)> = None;
-    for p in range {
-        let Some((bits, kl)) = cost(p) else { continue };
-        if best.is_none_or(|(_, b)| bits + kl < b) {
-            best = Some((p, bits + kl));
-        }
-        if best.is_some_and(|(_, b)| bits > b) {
-            break;
-        }
+    let (start, end) = (*range.start(), *range.end());
+    if end < start {
+        return None;
     }
-    best
+    let len = (end - start + 1) as usize;
+    let mut total = |n: usize| -> Result<f64, String> { Ok(cost(start + n as i32).map_or(f64::INFINITY, |(b, k)| b + k)) };
+    let mut values: Vec<Option<f64>> = vec![None; len];
+    let mut memo = |n: usize| -> f64 {
+        if let Some(v) = values[n] {
+            return v;
+        }
+        let v = total(n).unwrap_or(f64::INFINITY);
+        values[n] = Some(v);
+        v
+    };
+    let n = minimize(len, &mut |n| Ok(memo(n))).ok()??;
+    Some((start + n as i32, memo(n)))
 }
 
 /// Up to `rank` pivot columns of `k` by greedy residual norm (maximum volume, column by column).

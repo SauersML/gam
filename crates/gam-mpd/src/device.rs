@@ -16,7 +16,7 @@
 //! by the operator's `Arc` and drops an entry when the operator is gone).
 
 use super::operator_program::{Operator, OperatorBody, ProgramError};
-use gam_gpu::banded::{BandedArithmetic, Layout, ResidentOperand, banded_matmul, resident_operand};
+use gam_gpu::banded::{BandedArithmetic, BandedProduct, Layout, ResidentOperand, banded_matmul, resident_operand};
 use gam_gpu::global_policy;
 use gam_linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
 use ndarray::Array2;
@@ -87,6 +87,19 @@ pub fn product(op: &Arc<Operator>, x: &Array2<f64>, layout: Layout) -> Result<Ar
         Layout::AsStored => fast_ab(x, a.as_ref()),
         Layout::Transposed => fast_abt(x, a.as_ref()),
     })
+}
+
+/// `x·A` ([`Layout::AsStored`]) or `x·Aᵀ` ([`Layout::Transposed`]) for a dense operator `op` in
+/// f32 on the device with its certified band (`gam_gpu::banded`), proposal or not: a caller that
+/// decides by it carries the band. `None` when the policy keeps the product on the CPU.
+pub fn banded_product(op: &Arc<Operator>, x: &Array2<f64>, layout: Layout) -> Result<Option<BandedProduct>, ProgramError> {
+    let OperatorBody::Dense { values, .. } = &op.body else {
+        return Ok(None);
+    };
+    match resident(op, values)? {
+        Some(device) => device.product(x.view(), layout).map_err(device_error),
+        None => Ok(None),
+    }
 }
 
 /// `aᵀ·b`: inside [`proposing`], in f32 on the device when the policy selects it; otherwise the

@@ -1645,8 +1645,8 @@ pub fn fast_abt<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     b: &ArrayBase<S2, Ix2>,
 ) -> Array2<f64> {
+    use faer::Accum;
     use faer::linalg::matmul::matmul;
-    use faer::{Accum, Mat};
 
     let (m, k_a) = a.dim();
     let (n, k_b) = b.dim();
@@ -1659,19 +1659,22 @@ pub fn fast_abt<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         return a.dot(&b.t());
     }
 
-    let mut result = Mat::<f64>::zeros(m, n);
+    // Written straight into the row-major result: a column-major product and its transposing
+    // copy cost as much as a tenth of a wide product (a language model's logits).
+    let mut result = Array2::<f64>::zeros((m, n));
     let aview = FaerArrayView::new(a);
     let bview = FaerArrayView::new(b);
     let par = matmul_parallelism(m, n, k_a);
+    let mut outview = array2_to_matmut(&mut result);
     matmul(
-        result.as_mut(),
+        outview.as_mut(),
         Accum::Replace,
         aview.as_ref(),
         bview.as_ref().transpose(),
         1.0,
         par,
     );
-    mat_to_array(result.as_ref())
+    result
 }
 
 /// Compute A * B using faer's SIMD-optimized GEMM.

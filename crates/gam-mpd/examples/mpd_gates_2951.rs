@@ -29,7 +29,10 @@
 //! multiply–adds per token they cost (the amplitudes their features read, `d_in` each, plus the
 //! functions themselves) beside every amplitude's. `OUT.switches.json` holds the functions, and
 //! `OUT.sets.{indptr,indices}.npy` the sets they choose on the eval sequences (int64 CSR over their
-//! tokens).
+//! tokens); `OUT.logits.*` and `OUT.train_logits.*` hold their logits above `−6` on the eval
+//! sequences and on the first eight training ones (CSR with float64 values). A run that finds
+//! `OUT.switches.json` resumes from those functions, and one whose `OUT.json` is screened only
+//! rescores them.
 
 use gam_mpd::gates::{self, Feature, Switch};
 use gam_mpd::import::import_language_model;
@@ -114,7 +117,12 @@ fn read_i64(path: &Path) -> Result<Vec<i64>, String> {
 
 /// A one-dimensional little-endian int64 `.npy` file.
 fn write_npy_i64(path: &Path, values: &[i64]) -> Result<(), String> {
-    let mut header = format!("{{'descr': '<i8', 'fortran_order': False, 'shape': ({},), }}", values.len());
+    write_npy(path, "<i8", values.iter().map(|v| v.to_le_bytes()))
+}
+
+/// A one-dimensional little-endian `.npy` file of 8-byte values of type `descr`.
+fn write_npy(path: &Path, descr: &str, values: impl ExactSizeIterator<Item = [u8; 8]>) -> Result<(), String> {
+    let mut header = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': ({},), }}", values.len());
     while (10 + header.len() + 1) % 64 != 0 {
         header.push(' ');
     }
@@ -123,9 +131,44 @@ fn write_npy_i64(path: &Path, values: &[i64]) -> Result<(), String> {
     bytes.extend_from_slice(&(header.len() as u16).to_le_bytes());
     bytes.extend_from_slice(header.as_bytes());
     for v in values {
-        bytes.extend_from_slice(&v.to_le_bytes());
+        bytes.extend_from_slice(&v);
     }
     std::fs::write(path, bytes).map_err(|e| e.to_string())
+}
+
+/// The switching functions' logits above `floor` at tokens `lo..hi`, as CSR (token, subcomponent
+/// numbered site after site, logit), written to `{stem}.{indptr,indices,values}.npy`.
+fn write_logits(run: &Run, switches: &[Vec<Switch>], lo: usize, hi: usize, floor: f64, stem: &Path) -> Result<(), String> {
+    let n = hi - lo;
+    let mut per_token: Vec<Vec<(i64, f64)>> = vec![Vec::new(); n];
+    let mut offset = 0;
+    for (site, site_switches) in switches.iter().enumerate() {
+        let columns: Vec<Vec<(usize, f64)>> = site_switches
+            .par_iter()
+            .map(|switch| {
+                let x = run.rows(&switch.features, lo, hi, 1);
+                (0..n).filter_map(|t| Some((t, switch.logit(&x.row(t).to_vec()))).filter(|(_, g)| *g > floor)).collect()
+            })
+            .collect();
+        for (piece, column) in columns.into_iter().enumerate() {
+            for (t, g) in column {
+                per_token[t].push(((offset + piece) as i64, g));
+            }
+        }
+        offset += run.pieces[site];
+    }
+    let mut indptr = vec![0i64];
+    let (mut indices, mut values) = (Vec::new(), Vec::new());
+    for entries in per_token {
+        for (c, g) in entries {
+            indices.push(c);
+            values.push(g);
+        }
+        indptr.push(indices.len() as i64);
+    }
+    write_npy_i64(&stem.with_extension("indptr.npy"), &indptr)?;
+    write_npy_i64(&stem.with_extension("indices.npy"), &indices)?;
+    write_npy(&stem.with_extension("values.npy"), "<f8", values.iter().map(|v| v.to_le_bytes()))
 }
 
 fn range(spec: &str) -> Result<(usize, usize), String> {
@@ -478,21 +521,51 @@ fn main() -> Result<(), String> {
         std::fs::write(out.with_extension("switches.json"), serde_json::to_string(&sites_json).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         write_npy_i64(&out.with_extension("sets.indptr.npy"), &indptr)?;
         write_npy_i64(&out.with_extension("sets.indices.npy"), &indices)?;
+        // The logits above e^-6 odds, on the eval sequences and the first eight training ones, so a
+        // decision threshold can be chosen on training sequences and scored on eval ones.
+        write_logits(&run, switches, eval.0, eval.1, -6.0, &out.with_extension("logits"))?;
+        write_logits(&run, switches, train.0, train.1.min(train.0 + 8 * context), -6.0, &out.with_extension("train_logits"))?;
         eprintln!("{stage}: {}", report[stage]);
         Ok(())
     };
-    let mut report = json!({"train": args[5], "eval": args[6], "sites": run.names});
+    // A run that finds its own switching functions resumes from them.
+    let saved = out.with_extension("switches.json");
+    let mut report: serde_json::Value = std::fs::read_to_string(out.with_extension("json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| json!({"train": args[5], "eval": args[6], "sites": run.names}));
     let started = std::time::Instant::now();
-    let mut switches: Vec<Vec<Switch>> = Vec::new();
-    for site in 0..run.names.len() {
-        switches.push(first_pass(&run, site, train));
-        eprintln!("first pass {} ({:.0}s)", run.names[site], started.elapsed().as_secs_f64());
+    let mut switches: Vec<Vec<Switch>> = match std::fs::read_to_string(&saved) {
+        Ok(text) => {
+            let listed: Vec<serde_json::Value> = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", saved.display()))?;
+            let loaded = listed
+                .iter()
+                .map(|entry| serde_json::from_value(entry["switches"].clone()).map_err(|e| format!("{}: {e}", saved.display())))
+                .collect::<Result<Vec<Vec<Switch>>, String>>()?;
+            if loaded.iter().map(Vec::len).collect::<Vec<_>>() != run.pieces {
+                return Err(format!("{}: another run's switching functions", saved.display()));
+            }
+            eprintln!("resumed from {}", saved.display());
+            loaded
+        }
+        Err(_) => {
+            let mut fitted = Vec::new();
+            for site in 0..run.names.len() {
+                fitted.push(first_pass(&run, site, train));
+                eprintln!("first pass {} ({:.0}s)", run.names[site], started.elapsed().as_secs_f64());
+            }
+            write("own_amplitude", &fitted, &mut report)?;
+            fitted
+        }
+    };
+    if report.get("screened").is_none() {
+        for site in 0..run.names.len() {
+            let kept = screening(&run, site, &mut switches[site], train)?;
+            eprintln!("screening {}: {kept} features kept ({:.0}s)", run.names[site], started.elapsed().as_secs_f64());
+        }
+        write("screened", &switches, &mut report)?;
+    } else {
+        write("rescored", &switches, &mut report)?;
     }
-    write("own_amplitude", &switches, &mut report)?;
-    for site in 0..run.names.len() {
-        let kept = screening(&run, site, &mut switches[site], train)?;
-        eprintln!("screening {}: {kept} features kept ({:.0}s)", run.names[site], started.elapsed().as_secs_f64());
-    }
-    write("screened", &switches, &mut report)?;
     Ok(())
 }

@@ -744,6 +744,67 @@ pub fn kl_and_logits(masked: &Masked, family: &FamilyInputs, target: &Target) ->
 /// charged the point of its largest total, so a set whose layers only cancel each other's errors
 /// pays for it. A lower bound on the claim's worst case.
 pub fn box_excess_at(masked: &Masked, base: &FamilyInputs, target: &Target, masks: &[Array2<f64>], fishers: &[Array2<f64>]) -> Result<Array1<f64>, String> {
+    let corner = score_only(masked, &masked.family(base, masks), target)?;
+    let expected = expected_box_excess_at(masked, base, target, masks, fishers)?;
+    box_worst(masked, base, target, masks, &corner, expected, None)
+}
+
+/// The program's logits when they are one dense product of a hidden node and nothing after it:
+/// the hidden node, the operator and the product's layout (`x Aᵀ` for an affine node, `x A` for a
+/// transposed one).
+fn lone_head(masked: &Masked) -> Option<(usize, usize, gam_gpu::banded::Layout)> {
+    use gam_gpu::banded::Layout;
+    if masked.head.is_some() {
+        return None;
+    }
+    let program = &masked.program;
+    let logits = match &program.nodes[program.output] {
+        Node::Readout { input, basis } if matches!(program.bases[*basis], super::operator_program::Basis::Indicator { .. }) => *input,
+        Node::Readout { .. } => return None,
+        _ => program.output,
+    };
+    let (hidden, operator, layout) = match &program.nodes[logits] {
+        Node::Affine { terms, bias: None } if terms.len() == 1 => (terms[0].0, terms[0].1, Layout::Transposed),
+        Node::Transposed { input, operator } => (*input, *operator, Layout::AsStored),
+        _ => return None,
+    };
+    matches!(program.operators[operator].body, OperatorBody::Dense { .. }).then_some((hidden, operator, layout))
+}
+
+/// A vertex's KL per input from the hidden values `hidden` before the head ([`lone_head`]): the
+/// head's product in f32 on the device, each row's KL with a bound on its error (`2 maxⱼ band`, the
+/// KL's gradient in the logits being `q − p`, of `ℓ₁` norm at most 2), or exact with no band when
+/// the product stays on the CPU.
+fn screened_kl(masked: &Masked, target: &Target, hidden: &Array2<f64>, operator: usize, layout: gam_gpu::banded::Layout) -> Result<(Array1<f64>, Array1<f64>), String> {
+    let op = &masked.program.operators[operator];
+    if let Some(banded) = super::device::banded_product(op, hidden, layout).map_err(|e| e.to_string())? {
+        let band = Array1::from_shape_fn(hidden.nrows(), |r| if target.scores(r) { 2.0 * banded.band.row_max(r) } else { 0.0 });
+        return Ok((kl_score_only(target, &banded.values), band));
+    }
+    Ok((kl_score_only(target, &exact_head(masked, hidden, operator, layout)), Array1::zeros(hidden.nrows())))
+}
+
+/// The head's float64 product on `hidden`.
+fn exact_head(masked: &Masked, hidden: &Array2<f64>, operator: usize, layout: gam_gpu::banded::Layout) -> Array2<f64> {
+    let a = masked.program.operators[operator].matrix_cow();
+    match layout {
+        gam_gpu::banded::Layout::Transposed => gam_linalg::faer_ndarray::fast_abt(hidden, a.as_ref()),
+        gam_gpu::banded::Layout::AsStored => gam_linalg::faer_ndarray::fast_ab(hidden, a.as_ref()),
+    }
+}
+
+/// [`box_excess_at`] from the masks' own KL `corner` and the expected excess `expected`, adding
+/// each layer's vertex. With `all_on`, the CPU trace of every gate on: a vertex's layers before
+/// its own are all on, so its forward starts at its layer's first mask, reading the rest there.
+fn box_worst(
+    masked: &Masked,
+    base: &FamilyInputs,
+    target: &Target,
+    masks: &[Array2<f64>],
+    corner: &Array1<f64>,
+    expected: Array1<f64>,
+    all_on: Option<&Trace>,
+) -> Result<Array1<f64>, String> {
     let rows = base.rows;
     let sequence_of: Vec<usize> = match &base.layout {
         Some(layout) => layout.sequence.iter().map(|s| *s as usize).collect(),
@@ -757,7 +818,7 @@ pub fn box_excess_at(masked: &Masked, base: &FamilyInputs, target: &Target, mask
         }
         totals
     };
-    let mut worst = expected_box_excess_at(masked, base, target, masks, fishers)?;
+    let mut worst = expected;
     let mut totals = per_sequence(&worst);
     // The masks themselves are a point of the box.
     for r in 0..rows {
@@ -771,12 +832,58 @@ pub fn box_excess_at(masked: &Masked, base: &FamilyInputs, target: &Target, mask
     for (k, site) in masked.sites.iter().enumerate() {
         layers.entry(site.name.rsplit_once('.').map_or_else(|| site.name.clone(), |(layer, _)| layer.to_string())).or_default().push(k);
     }
+    // The program up to the head's hidden node, when the head is a lone product: a vertex's
+    // logits are then screened in f32 and made exact only for the sequences it may decide.
+    let head = lone_head(masked).filter(|_| all_on.is_some());
+    let body = head.map(|(hidden, _, _)| {
+        let mut body = masked.program.clone();
+        body.nodes.truncate(hidden + 1);
+        body.output = hidden;
+        body
+    });
     if layers.len() > 1 {
-        let corner = score_only(masked, &masked.family(base, masks), target)?;
         for sites in layers.values() {
             let vertex: Vec<Array2<f64>> =
                 masks.iter().enumerate().map(|(k, m)| if sites.contains(&k) { m.clone() } else { Array2::ones(m.dim()) }).collect();
-            let excess = &score_only(masked, &masked.family(base, &vertex), target)? - &corner;
+            let family = masked.family(base, &vertex);
+            // The layer's first mask node (each site's mask sits just before its `z`).
+            let from = sites.iter().map(|k| masked.z[*k] - 1).min().unwrap_or(0);
+            let kl_vertex = match (all_on, &body, head) {
+                (Some(trace), Some(body), Some((hidden, operator, layout))) if from <= hidden => {
+                    let top = body.execute_suffix(&family, trace, from).map_err(|e| e.to_string())?;
+                    let hidden_values = &top[hidden - from];
+                    let (mut kl_vertex, band) = screened_kl(masked, target, hidden_values, operator, layout)?;
+                    // A sequence this vertex may decide (its total within the band of beating the
+                    // worst so far) gets its rows' KL exactly; the others cannot be beaten by it.
+                    let mut upper = vec![0.0; sequences];
+                    for r in 0..rows {
+                        upper[sequence_of[r]] += kl_vertex[r] + band[r] - corner[r];
+                    }
+                    let is_open: Vec<bool> = (0..rows).map(|r| band[r] > 0.0 && upper[sequence_of[r]] > totals[sequence_of[r]]).collect();
+                    let open: Vec<usize> = (0..rows).filter(|r| is_open[*r]).collect();
+                    if !open.is_empty() {
+                        let exact = exact_head(masked, &hidden_values.select(Axis(0), &open), operator, layout);
+                        let sub = Target { logits: target.logits.select(Axis(0), &open), scored: target.scored.as_ref().map(|s| open.iter().map(|r| s[*r]).collect()) };
+                        for (i, value) in kl_score_only(&sub, &exact).into_iter().enumerate() {
+                            kl_vertex[open[i]] = value;
+                        }
+                    }
+                    // Rows still banded belong to sequences the vertex cannot win: their excess
+                    // is set to its lower end, so the comparison below leaves them alone.
+                    for r in 0..rows {
+                        if band[r] > 0.0 && !is_open[r] {
+                            kl_vertex[r] -= band[r];
+                        }
+                    }
+                    kl_vertex
+                }
+                (Some(trace), _, _) if masked.head.is_none() && from <= masked.program.output => {
+                    let top = masked.program.execute_suffix(&family, trace, from).map_err(|e| e.to_string())?;
+                    kl_score_only(target, &top[masked.program.output - from])
+                }
+                _ => score_only(masked, &family, target)?,
+            };
+            let excess = &kl_vertex - corner;
             let vertex_totals = per_sequence(&excess);
             for r in 0..rows {
                 let q = sequence_of[r];
@@ -885,12 +992,17 @@ fn gradients_proposed(
 /// pieces' own gradients.
 pub fn mask_gradients(masked: &Masked, family: &FamilyInputs, trace: &Trace, cotangent: Array2<f64>) -> Result<Vec<Array2<f64>>, String> {
     let back = proposing(|| super::derivatives::vjp_from(&masked.program, family, trace, masked.program.output, cotangent, Some(&masked.masked))).map_err(|e| e.to_string())?;
-    Ok((0..masked.sites.len())
+    Ok(mask_gradients_of(masked, trace, &back))
+}
+
+/// [`mask_gradients`] from a reverse pass `back` that kept every site's masked node.
+fn mask_gradients_of(masked: &Masked, trace: &Trace, back: &[Option<Array2<f64>>]) -> Vec<Array2<f64>> {
+    (0..masked.sites.len())
         .map(|k| {
             let z = &trace.values[masked.z[k]];
             back[masked.masked[k]].as_ref().map_or_else(|| Array2::zeros((z.nrows(), masked.blocks(k))), |c| masked.to_blocks(k, &(c * z)))
         })
-        .collect())
+        .collect()
 }
 
 /// A deterministic generator for label sampling.
@@ -1353,9 +1465,11 @@ pub fn previous_inputs(inputs: &FamilyInputs) -> Vec<Option<usize>> {
 }
 
 /// A selection round's masked forward (module note, "Devices"): the CPU's trace with the KL's
-/// cotangent at the output (`None` until a gradient needs it), or the device's state.
+/// cotangent at the output (`None` until a gradient needs it) and, once the box claim's excess
+/// was read off it, the float64 reverse pass that kept every masked and written node; or the
+/// device's state.
 enum Selected {
-    Host(Trace, Option<Array2<f64>>),
+    Host(Trace, Option<Array2<f64>>, Option<Vec<Option<Array2<f64>>>>),
     Device(State),
 }
 
@@ -1371,10 +1485,48 @@ impl Selected {
         }
         if cotangent {
             let (values, trace, cotangent) = forward(masked, family, target)?;
-            return Ok((values, Self::Host(trace, Some(cotangent))));
+            return Ok((values, Self::Host(trace, Some(cotangent), None)));
         }
         let (values, trace) = scored_forward(masked, family, target)?;
-        Ok((values, Self::Host(trace, None)))
+        Ok((values, Self::Host(trace, None, None)))
+    }
+
+    /// The box claim's expected excess at `masks` ([`box_excess`]), read off this forward; on the
+    /// CPU its reverse pass is kept for the mask gradients.
+    fn expected_excess(
+        &mut self,
+        masked: &Masked,
+        family: &FamilyInputs,
+        target: &Target,
+        masks: &[Array2<f64>],
+        fishers: &[Array2<f64>],
+        on_device: Option<&DeviceTarget>,
+    ) -> Result<Array1<f64>, String> {
+        match self {
+            Self::Device(state) => match on_device {
+                Some(on_device) if (0..masked.sites.len()).all(|k| masked.is_rank_one(k)) => masked.on_lowered(|accelerated| {
+                    accelerated.prepare_gradient(state, on_device)?;
+                    Ok(accelerated.box_excess(masked, state, masks, fishers, false)?.0)
+                }),
+                _ => {
+                    let (_, trace, cotangent) = forward(masked, family, target)?;
+                    Ok(box_excess(masked, family, &trace, masks, cotangent, fishers, false)?.0)
+                }
+            },
+            Self::Host(trace, cotangent, back) => {
+                if back.is_none() {
+                    let cotangent = match cotangent.take() {
+                        Some(c) => c,
+                        None => to_output(masked, family, trace, target, kl(target, &*logits(masked, family, trace, target)?).1)?,
+                    };
+                    let mut keep = masked.masked.clone();
+                    keep.extend(masked.written.iter().flatten().copied());
+                    *back = Some(super::derivatives::vjp_from(&masked.program, family, trace, masked.program.output, cotangent, Some(&keep)).map_err(|e| e.to_string())?);
+                }
+                let back = back.as_ref().ok_or("no reverse pass")?;
+                Ok(box_excess_back(masked, trace, back, masks, fishers, false)?.0)
+            }
+        }
     }
 
     /// [`mask_gradients`] of the KL.
@@ -1384,7 +1536,8 @@ impl Selected {
                 accelerated.prepare_gradient(state, on_device.ok_or("device: missing selection target")?)?;
                 accelerated.mask_gradients(masked, state)
             }),
-            Self::Host(trace, cotangent) => {
+            Self::Host(trace, _, Some(back)) => Ok(mask_gradients_of(masked, trace, back)),
+            Self::Host(trace, cotangent, None) => {
                 let cotangent = match cotangent.take() {
                     Some(c) => c,
                     None => to_output(masked, family, trace, target, kl(target, &*logits(masked, family, trace, target)?).1)?,
@@ -1406,7 +1559,7 @@ impl Selected {
     ) -> Result<Vec<(Array2<f64>, Option<Array2<f64>>)>, String> {
         match (self, on_device) {
             (Self::Device(state), Some(on_device)) => masked.on_lowered(|accelerated| accelerated.fisher(masked, state, on_device, samples, seed, false)),
-            (Self::Host(trace, _), _) => fisher(masked, family, trace, target, samples, seed, false),
+            (Self::Host(trace, _, _), _) => fisher(masked, family, trace, target, samples, seed, false),
             (Self::Device(_), None) => Err("device: a device state without its target".to_string()),
         }
     }
@@ -1497,9 +1650,21 @@ pub fn select_observed(
     // nothing was kept, also their gradients (the state did not move).
     let mut next_forward: Option<(Array1<f64>, Selected)> = None;
     let mut reuse: Option<(Array1<f64>, Selected, Vec<Array2<f64>>)> = None;
+    // Under the box claim, the current masks' excess when a round already measured it: sequences
+    // are independent, so a kept sequence's is the proposal's and a refused one's is unchanged.
+    let mut excess_known: Option<Array1<f64>> = None;
     // The target on the program's device, when it runs on one (module note, "Devices").
     let on_device = masked.on_device(|accelerated| accelerated.target(target))?;
     let on_device = on_device.as_ref();
+    // Under the box claim on the CPU, the trace of every gate on, which every layer's vertex
+    // shares up to its own layer.
+    let all_on: Option<Trace> = match boxed {
+        Some(_) if on_device.is_none() && masked.head.is_none() => {
+            let on: Vec<Array2<f64>> = masks.iter().map(|m| Array2::ones(m.dim())).collect();
+            Some(masked.program.execute(&masked.family(base, &on), false).map_err(|e| e.to_string())?)
+        }
+        _ => None,
+    };
     loop {
         let family = masked.family(base, &masks);
         let (kl_now, state, grads) = match reuse.take() {
@@ -1509,6 +1674,11 @@ pub fn select_observed(
                     Some(state) => state,
                     None => Selected::forward(masked, &family, target, on_device, true)?,
                 };
+                // The excess first, so its reverse pass also serves the mask gradients.
+                if let (Some(f), None) = (boxed, &excess_known) {
+                    let expected = state.expected_excess(masked, &family, target, &masks, f, on_device)?;
+                    excess_known = Some(box_worst(masked, base, target, &masks, &kl_now, expected, all_on.as_ref())?);
+                }
                 let grads = state.mask_gradients(masked, &family, target, on_device)?;
                 (kl_now, state, grads)
             }
@@ -1522,9 +1692,10 @@ pub fn select_observed(
         let curvature = curvature.as_ref().ok_or("no curvature")?;
         let listing_now = coder.bits(&masks);
         // Under the box claim each input's error is its masks' KL plus the box's excess.
-        let excess_now = match boxed {
-            Some(f) => box_excess_at(masked, base, target, &masks, f)?,
-            None => Array1::zeros(rows),
+        let excess_now = match (boxed, excess_known.take()) {
+            (None, _) => Array1::zeros(rows),
+            (Some(_), Some(known)) => known,
+            (Some(f), None) => box_excess_at(masked, base, target, &masks, f)?,
         };
         let before = code(&(&kl_now + &excess_now), &listing_now, observations);
         // Each input's predicted flips, best first, as many as its interaction model says pay
@@ -1588,9 +1759,12 @@ pub fn select_observed(
             return Ok((masks, kl_now));
         }
         let proposed_family = masked.family(base, &proposed);
-        let (kl_new, state_new) = Selected::forward(masked, &proposed_family, target, on_device, false)?;
+        let (kl_new, mut state_new) = Selected::forward(masked, &proposed_family, target, on_device, false)?;
         let excess_new = match boxed {
-            Some(f) => box_excess_at(masked, base, target, &proposed, f)?,
+            Some(f) => {
+                let expected = state_new.expected_excess(masked, &proposed_family, target, &proposed, f, on_device)?;
+                box_worst(masked, base, target, &proposed, &kl_new, expected, all_on.as_ref())?
+            }
             None => Array1::zeros(rows),
         };
         let after = code(&(&kl_new + &excess_new), &coder.bits(&proposed), observations);
@@ -1634,6 +1808,10 @@ pub fn select_observed(
                     masks[site].row_mut(r).assign(&proposed[site].row(r));
                 }
             }
+        }
+        if boxed.is_some() {
+            let kept_sequence = |q: usize| sequence_flips[q] > 0 && sequence_saving[q] > 0.0;
+            excess_known = Some(Array1::from_shape_fn(rows, |r| if kept_sequence(sequence_of[r]) { excess_new[r] } else { excess_now[r] }));
         }
         round += 1;
         if kept == tried {
@@ -1997,7 +2175,20 @@ pub fn box_excess(
     fishers: &[Array2<f64>],
     gradients: bool,
 ) -> Result<(Array1<f64>, Option<BoxGradients>), String> {
-    let back = vjp(&masked.program, family, trace, cotangent).map_err(|e| e.to_string())?;
+    let written: Vec<usize> = masked.written.iter().flatten().copied().collect();
+    let back = super::derivatives::vjp_from(&masked.program, family, trace, masked.program.output, cotangent, Some(&written)).map_err(|e| e.to_string())?;
+    box_excess_back(masked, trace, &back, masks, fishers, gradients)
+}
+
+/// [`box_excess`] from a reverse pass `back` that kept every site's written nodes.
+fn box_excess_back(
+    masked: &Masked,
+    trace: &Trace,
+    back: &[Option<Array2<f64>>],
+    masks: &[Array2<f64>],
+    fishers: &[Array2<f64>],
+    gradients: bool,
+) -> Result<(Array1<f64>, Option<BoxGradients>), String> {
     let rows = trace.values[masked.program.output].nrows();
     let mut excess = Array1::<f64>::zeros(rows);
     let mut out = Vec::new();

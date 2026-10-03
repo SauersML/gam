@@ -354,7 +354,7 @@ def stage_eval():
                                                              ("ptop", np.float16), ("lpc", np.float32))} for nm in names}
     done_path = OUTD / "eval_done.txt"
     done = int(done_path.read_text()) if done_path.exists() else 0
-    B, PC = 4, 128  # rows per forward; positions per vocab-sized block (keeps the job inside 2 GiB)
+    B, PC = 2, 128  # rows per forward; positions per vocab-sized block (keeps the job inside 2 GiB)
     resid, final, head = split_forward(target)
 
     with torch.no_grad():

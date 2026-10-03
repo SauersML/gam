@@ -311,7 +311,7 @@ fn vpd(dir: &Path, library_dir: &Path, sets_dir: &Path, out: &Path, observations
         serde_json::from_str(&std::fs::read_to_string(dir.join("export.json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     let config = |key: &str| record["config"][key].as_u64().map(|v| v as usize).ok_or(format!("config.{key}"));
     let (heads, head_dim) = (config("n_heads")?, config("head_dim")?);
-    let imported = gam_mpd::import::import_language_model(dir, first + sequences, CONTEXT)?;
+    let imported = gam_mpd::import::import_language_model(dir, first + statistics_sequences, CONTEXT)?;
     let program = imported.program;
     let family = imported.contract.family;
     let kinds = ["q", "k", "v", "o"];
