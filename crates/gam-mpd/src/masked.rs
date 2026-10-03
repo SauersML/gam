@@ -2588,7 +2588,7 @@ pub(super) fn shrunk_direction(m: &Array2<f64>, gradient: &Array2<f64>) -> Resul
 /// over the eigenvalues of `otherᵀother` beyond its band. A preconditioning on the right keeps it,
 /// since the projection acts on the pieces' index alone.
 pub(super) fn keep_sum(g: &Array2<f64>, other: &Array2<f64>) -> Result<Array2<f64>, String> {
-    if other.ncols() >= 128 && other.nrows() < other.ncols() {
+    if other.nrows() <= other.ncols() {
         // otherᵀ other and other otherᵀ have the same nonzero eigenvalues. Work in piece
         // space when it is smaller, projecting onto the same resolved column space without
         // allocating a layer-width Gram matrix or its pseudoinverse.
@@ -2602,11 +2602,14 @@ pub(super) fn keep_sum(g: &Array2<f64>, other: &Array2<f64>) -> Result<Array2<f6
         }
         let spectrum = super::dense::eigh(gram.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
         let band = gam_linalg::roundoff::symmetric_spectrum_rounding_band_at_dim(other.ncols(), &spectrum.values.to_vec());
+        // Project directly onto the unresolved/null eigenspace. Subtracting the resolved
+        // projection from g leaves roundoff even when that space spans every piece; a line
+        // search can amplify that residual into a move that changes the native map.
         let mut coefficients = fast_atb(&spectrum.vectors, g);
         for (k, value) in spectrum.values.iter().enumerate() {
-            if *value <= band { coefficients.row_mut(k).fill(0.0); }
+            if *value > band { coefficients.row_mut(k).fill(0.0); }
         }
-        return Ok(g - &gam_linalg::faer_ndarray::fast_ab(&spectrum.vectors, &coefficients));
+        return Ok(gam_linalg::faer_ndarray::fast_ab(&spectrum.vectors, &coefficients));
     }
     let gram = fast_atb(other, other);
     let mut sym = gram.clone();
@@ -2759,39 +2762,54 @@ pub fn step_pieces(
         }
     };
     drop(evaluated);
-    // Every trial is the float64 operator less the step; the originals are shared, not copied,
-    // and restored exactly when no step lowers the total.
+    let eta = if quadratic > 0.0 { slope / quadratic } else { 1.0 };
+    backtrack_pieces(masked, &moves, eta, total, |masked| Ok(match (claim, &device_target) {
+        (Claim::Corner, Some(on_device)) => {
+            masked.on_device(|accelerated| accelerated.score_only(&family, on_device))?.ok_or("device: the twin went away")?.sum()
+        }
+        (Claim::Corner, None) => score_only(masked, &family, target)?.sum(),
+        (Claim::Box, Some(on_device)) => masked.on_lowered(|accelerated| {
+            let state = accelerated.forward(&family, on_device)?;
+            Ok(state.kl.sum() + accelerated.box_excess(masked, &state, masks, &running.fishers, false)?.0.sum())
+        })?,
+        (Claim::Box, None) => {
+            let (kl_trial, trial_trace, trial_cotangent) = forward(masked, &family, target)?;
+            kl_trial.sum() + box_excess(masked, &family, &trial_trace, masks, trial_cotangent, &running.fishers, false)?.0.sum()
+        }
+    }))
+}
+
+/// Apply numerical trials transactionally: only a measured improvement keeps edited operators.
+pub(super) fn backtrack_pieces(
+    masked: &mut Masked,
+    moves: &[(usize, Array2<f64>)],
+    mut eta: f64,
+    total: f64,
+    mut evaluate: impl FnMut(&Masked) -> Result<f64, String>,
+) -> Result<Option<(f64, f64)>, String> {
     let originals: Vec<Arc<Operator>> = moves.iter().map(|(op, _)| Arc::clone(&masked.program.operators[*op])).collect();
-    let mut eta = if quadratic > 0.0 { slope / quadratic } else { 1.0 };
-    let floor = eta * f64::EPSILON;
-    while eta > floor {
-        for ((op, t), original) in moves.iter().zip(&originals) {
-            let values = &*original.matrix_cow() - &(t * eta);
-            masked.program.operators[*op] = dense(original.name.clone(), original.rows.clone(), original.cols.clone(), values)?;
-        }
-        let trial = match (claim, &device_target) {
-            (Claim::Corner, Some(on_device)) => {
-                masked.on_device(|accelerated| accelerated.score_only(&family, on_device))?.ok_or("device: the twin went away")?.sum()
+    let result = (|| -> Result<Option<(f64, f64)>, String> {
+        let floor = eta * f64::EPSILON;
+        while eta.is_finite() && eta > floor {
+            for ((op, t), original) in moves.iter().zip(&originals) {
+                let values = &*original.matrix_cow() - &(t * eta);
+                masked.program.operators[*op] = dense(original.name.clone(), original.rows.clone(), original.cols.clone(), values)?;
             }
-            (Claim::Corner, None) => score_only(masked, &family, target)?.sum(),
-            (Claim::Box, Some(on_device)) => masked.on_lowered(|accelerated| {
-                let state = accelerated.forward(&family, on_device)?;
-                Ok(state.kl.sum() + accelerated.box_excess(masked, &state, masks, &running.fishers, false)?.0.sum())
-            })?,
-            (Claim::Box, None) => {
-                let (kl_trial, trial_trace, trial_cotangent) = forward(masked, &family, target)?;
-                kl_trial.sum() + box_excess(masked, &family, &trial_trace, masks, trial_cotangent, &running.fishers, false)?.0.sum()
+            let trial = evaluate(masked)?;
+            if trial.is_finite() && trial < total {
+                return Ok(Some((total, trial)));
             }
-        };
-        if trial < total {
-            return Ok(Some((total, trial)));
+            eta *= 0.5;
         }
-        eta *= 0.5;
+        Ok(None)
+    })();
+    // An error during construction or evaluation is not a committed edit.
+    if !matches!(&result, Ok(Some(_))) {
+        for ((op, _), original) in moves.iter().zip(originals) {
+            masked.program.operators[*op] = original;
+        }
     }
-    for ((op, _), original) in moves.iter().zip(originals) {
-        masked.program.operators[*op] = original;
-    }
-    Ok(None)
+    result
 }
 
 /// A step's forward: on the CPU (its trace and the KL's cotangent) or resident on the device.

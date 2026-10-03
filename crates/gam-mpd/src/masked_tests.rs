@@ -107,7 +107,8 @@ fn a_step_of_the_pieces_lowers_the_masked_kl() {
     let (program, family) = model();
     let target = Target::every_row(program.execute(&family, false).expect("executes").values[program.output].clone());
     let site = sites(&program).into_iter().find(|s| s.name == "W_in").expect("the W_in site");
-    let pieces = 3;
+    // The fixed U side must have a nullspace for a nonzero sum-preserving V step.
+    let pieces = UNITS + 2;
     let library = Library {
         v: Array2::from_shape_fn((pieces, WIDTH), |(i, j)| noise(700 + 7 * i + j)),
         u: Array2::from_shape_fn((pieces, UNITS), |(i, j)| noise(800 + 7 * i + j)),
@@ -122,6 +123,36 @@ fn a_step_of_the_pieces_lowers_the_masked_kl() {
     assert!(step_pieces(&mut masked, &family, &target, &masks, 4, 7, &mut running, super::masked::Claim::Corner).expect("steps").is_some());
     let after = forward(&masked, &fam, &target).expect("forward").0.sum();
     assert!(after < before, "{after} against {before}");
+}
+
+#[test]
+fn a_full_row_rank_factor_has_no_sum_preserving_direction() {
+    for width in [3, 7, 256] {
+        let other = Array2::from_shape_fn((3, width), |(i, j)| if i == j { 1.0 + i as f64 } else { 0.0 });
+        let g = Array2::from_shape_fn((3, 4), |(i, j)| noise(100 * i + j));
+        let direction = super::masked::keep_sum(&g, &other).expect("projection");
+        assert!(direction.iter().all(|x| *x == 0.0), "full rank must not leave a roundoff direction");
+    }
+}
+
+#[test]
+fn failed_or_nonfinite_piece_trials_restore_the_original_operators() {
+    let (program, _) = model();
+    let mut masked = Masked::build(&program, vec![], vec![]).expect("build");
+    let originals = masked.program.operators.clone();
+    let moves: Vec<_> = originals.iter().enumerate().map(|(i, op)| (i, Array2::ones(op.matrix().dim()))).collect();
+    let result = super::masked::backtrack_pieces(&mut masked, &moves, 1.0, 1.0, |trial| {
+        assert!(!Arc::ptr_eq(&trial.program.operators[0], &originals[0]), "the trial was installed");
+        Err("injected evaluation error".to_string())
+    });
+    assert_eq!(result, Err("injected evaluation error".to_string()));
+    assert!(masked.program.operators.iter().zip(&originals).all(|(a, b)| Arc::ptr_eq(a, b)));
+    for loss in [f64::NAN, f64::NEG_INFINITY, 2.0] {
+        assert_eq!(super::masked::backtrack_pieces(&mut masked, &moves, 1.0, 1.0, |_| Ok(loss)).expect("reject"), None);
+        assert!(masked.program.operators.iter().zip(&originals).all(|(a, b)| Arc::ptr_eq(a, b)));
+    }
+    assert_eq!(super::masked::backtrack_pieces(&mut masked, &moves, 1.0, 1.0, |_| Ok(0.5)).expect("keep"), Some((1.0, 0.5)));
+    assert!(!Arc::ptr_eq(&masked.program.operators[0], &originals[0]));
 }
 
 #[test]
