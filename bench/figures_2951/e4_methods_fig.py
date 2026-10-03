@@ -9,6 +9,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.lines import Line2D
 from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
 
 M = Path.home() / "mpd-data/frontier/e4_side/methods"
@@ -79,7 +80,10 @@ if (M / "table.json").exists():
     T = json.load(open(M / "table.json"))
     keys = [k for k in sorted(T, key=lambda k: -T[k]["kl_all"][0])
             if k != "vpd_at_hardneg" and (k == "compiled_span8" or not k.startswith("compiled"))]
-    COL = {"vpd": "#eb6834", "lora": "#2a78d6", "lora_hardneg": "#2a78d6"}
+    FAMILY = [("#eb6834", "parameter decomposition (VPD subcomponents)"), ("#2a78d6", "fine-tuning (LoRA)"),
+              ("#898781", "direct weight edit"), ("#1baf7a", "direct weight edit, least change to ordinary text")]
+    COL = {"vpd": "#eb6834", "specific_subcomponent": "#eb6834", "lora": "#2a78d6", "lora_hardneg": "#2a78d6",
+           "compiled_span8": "#1baf7a"}
     panels = [("kl_all", "Disturbance of all held-out text", "KL from the original model (nats per word)", True),
               ("kl_spaced_colon", "After a colon that is not an emoticon", "KL from the original model (nats per word)", True),
               ("hellaswag", "HellaSwag", "change in the right answer's log-probability share (nats)", False)]
@@ -91,7 +95,7 @@ if (M / "table.json").exists():
             v = T[k]["bench_d_margin"][key] if key == "hellaswag" else T[k][key]
             if v[0] is None or not np.isfinite(v[0]):
                 continue
-            col = COL.get(k, "#1baf7a" if k.startswith("compiled") else "#898781")
+            col = COL.get(k, "#898781")
             ax.plot([v[1], v[2]], [y, y], color=col, lw=3, solid_capstyle="round", zorder=3)
             ax.scatter([v[0]], [y], s=120, color=col, edgecolor=SURF, linewidth=1.8, zorder=4,
                        marker="D" if k == "lora_hardneg" else "o")
@@ -113,7 +117,9 @@ if (M / "table.json").exists():
     H = 0.62 * len(keys) + 3.4
     fig.suptitle("Side effects of each edit, all at 98.5% edit success", x=0.01, ha="left", y=1 - 0.15 / H,
                  fontsize=32, fontweight="bold", color=INK)
-    fig.subplots_adjust(left=0.27, right=0.99, top=1 - 1.6 / H, bottom=1.2 / H)
+    fig.legend(handles=[Line2D([], [], color=c, marker="o", lw=3, ms=11, mec=SURF, label=l) for c, l in FAMILY],
+               loc="upper left", ncol=4, frameon=False, fontsize=20, bbox_to_anchor=(0.005, 1 - 0.75 / H))
+    fig.subplots_adjust(left=0.27, right=0.99, top=1 - 2.2 / H, bottom=1.2 / H)
     fig.savefig(OUT / "e4_methods_matched.png", facecolor=SURF)
     plt.close(fig)
     print(OUT / "e4_methods_matched.png")

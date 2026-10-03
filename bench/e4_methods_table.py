@@ -12,11 +12,11 @@ import numpy as np
 M = Path.home() / "mpd-data/frontier/e4_side/methods"
 SETS = ("final", "compiled", "neg")
 TASKS = ("hellaswag", "arc_easy", "piqa", "lambada", "blimp")
-LABEL = {"vpd": "VPD subcomponent edit", "lora": "LoRA (the paper's fine-tune)",
+LABEL = {"vpd": "VPD: the paper's subcomponent", "lora": "LoRA (the paper's fine-tune)",
          "lora_hardneg": "LoRA, trained to spare other colons",
          "vpd_at_hardneg": "VPD edit at the hard-negative LoRA's success", "rome": "ROME", "memit": "MEMIT",
          "nullspace": "AlphaEdit (avoids directions common in text)", "contrast": "ROME, also avoiding other colons",
-         "specific_subcomponent": "most emoticon-specific VPD subcomponent",
+         "specific_subcomponent": "VPD: most emoticon-specific subcomponent",
          "compiled_every_key": "least change to ordinary text, exact on all 282 examples",
          "compiled_span8": "least change to ordinary text, exact on emoticons",
          "compiled_span16": "our solver, exact on the 16 main emoticon patterns",
