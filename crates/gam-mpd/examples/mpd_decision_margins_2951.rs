@@ -177,7 +177,7 @@ fn main() -> Result<(), String> {
         }
         Ok(())
     };
-    select_observed(&masked, family, &target, masks, &coder, observations, 2, &mut observe)?;
+    select_observed(&masked, family, &target, masks, &coder, observations, 2, None, &mut observe)?;
     let total = started.elapsed().as_secs_f64();
     let summary = |records: &[serde_json::Value]| -> serde_json::Value {
         let mut out = json!({"count": records.len()});

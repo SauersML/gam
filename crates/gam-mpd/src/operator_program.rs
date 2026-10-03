@@ -1878,6 +1878,9 @@ impl OperatorProgram {
         balls: Option<(&Array1<f64>, &Array1<f64>, &Array1<f64>)>,
         (scale, rotary, causal): (Scale, Option<Rotary>, bool),
     ) -> Result<(Array2<f64>, Option<Array2<f64>>, Option<Array1<f64>>), ProgramError> {
+        if bands.is_none() && balls.is_none() && inputs.rows >= 32 {
+            return Ok((super::tiled_attention::forward(inputs, (query, key, value), scale.value(), rotary, causal)?, None, None));
+        }
         let layout = inputs
             .layout
             .as_ref()

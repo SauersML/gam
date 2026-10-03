@@ -479,3 +479,92 @@ fn steps_keep_every_piece_on_the_same_map() {
     }
     assert!(stepped > 0, "no step lowered the KL");
 }
+
+#[test]
+fn shrunk_solve_matches_spectral_preconditioning_and_preserves_the_sum() {
+    use super::masked::{shrunk_direction, shrunk_inverse};
+    for rank in [1, 7, 16] {
+        let x = Array2::from_shape_fn((rank, 16), |(i, j)| noise(31 * i + j + 7));
+        let m = x.t().dot(&x);
+        let g = Array2::from_shape_fn((5, 16), |(i, j)| noise(71 * i + j + 91));
+        let actual = shrunk_direction(&m, &g).expect("solve");
+        let expected = g.dot(&shrunk_inverse(&m).expect("spectral"));
+        assert!((&actual - &expected).iter().all(|v| v.abs() < 1e-11));
+        let lambda = m.diag().sum() / 16.0;
+        let mut shifted = m;
+        shifted.diag_mut().mapv_inplace(|v| v + lambda);
+        assert!((&actual.dot(&shifted) - &g).iter().all(|v| v.abs() < 1e-11));
+    }
+    assert_eq!(shrunk_direction(&Array2::zeros((3, 3)), &Array2::ones((2, 3))).expect("zero"), Array2::<f64>::zeros((2, 3)));
+}
+
+#[test]
+fn shared_cpu_fisher_matches_full_vocabulary_reverse_passes_for_grouped_masks() {
+    use super::masked::{fisher, kl};
+    let (program, base) = model();
+    let site = sites(&program).into_iter().find(|s| s.name == "W_in").expect("site");
+    let library = Library {
+        v: Array2::from_shape_fn((3, WIDTH), |(i, j)| noise(71 * i + j)),
+        u: Array2::from_shape_fn((3, UNITS), |(i, j)| noise(31 * i + j + 17)),
+        mean: Array1::zeros(WIDTH),
+    };
+    let masked = Masked::build_blocks(&program, vec![site], vec![library], vec![vec![2, 1]]).expect("blocks");
+    let family = masked.family(&base, &[Array2::from_shape_fn((base.rows, 2), |(r, c)| if (r + c) % 3 == 0 { 0.0 } else { 1.0 })]);
+    let trace = masked.program.execute(&family, false).expect("trace");
+    let logits = &trace.values[masked.program.output];
+    let target = Target { logits: logits.clone(), scored: Some((0..base.rows).map(|r| r % 3 != 1).collect()) };
+    let actual = fisher(&masked, &family, &trace, &target, 4, 73, true).expect("fisher");
+    let mut h = Array2::zeros((base.rows, 2));
+    let mut f = Array2::zeros((UNITS, UNITS));
+    let mut rng = 73u64;
+    for _ in 0..4 {
+        let mut seed = kl(&Target::every_row(Array2::zeros(logits.dim())), logits).1;
+        // The reference constructs q - e_y at the full vocabulary and differentiates every node.
+        for r in 0..base.rows {
+            if !target.scores(r) { seed.row_mut(r).fill(0.0); continue; }
+            let max = logits.row(r).iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let mut q = logits.row(r).mapv(|v| (v - max).exp());
+            q /= q.sum();
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            let mut pick = (rng >> 11) as f64 / (1u64 << 53) as f64;
+            let mut label = q.len() - 1;
+            for (c, p) in q.iter().enumerate() { if pick < *p { label = c; break; } pick -= p; }
+            seed.row_mut(r).assign(&q);
+            seed[[r, label]] -= 1.0;
+        }
+        let back = super::derivatives::vjp(&masked.program, &family, &trace, seed).expect("reference reverse");
+        let g = masked.to_blocks(0, &(back[masked.masked[0]].as_ref().expect("mask cotangent") * &trace.values[masked.z[0]]));
+        h += &(&g * &g);
+        let written = back[masked.sites[0].writes[0]].as_ref().expect("written");
+        f += &written.t().dot(written);
+    }
+    h /= 4.0;
+    f /= 4.0 * target.scored_rows() as f64;
+    assert!((&actual[0].0 - &h).iter().all(|v| v.abs() < 1e-11));
+    assert!((actual[0].1.as_ref().expect("Fisher") - &f).iter().all(|v| v.abs() < 1e-11));
+}
+
+#[test]
+#[ignore = "manual timing of the training preconditioner; no timing assertion"]
+fn benchmark_training_preconditioner_solve() {
+    use super::masked::{shrunk_direction, shrunk_inverse};
+    use std::{hint::black_box, time::Instant};
+    for width in [256, 768] {
+        let x = Array2::from_shape_fn((width + 32, width), |(i, j)| noise(1009 * i + j));
+        let m = x.t().dot(&x) / width as f64;
+        let g = Array2::from_shape_fn((64, width), |(i, j)| noise(997 * i + j));
+        let mut old = Vec::new();
+        let mut new = Vec::new();
+        for _ in 0..3 {
+            let started = Instant::now();
+            let reference = black_box(g.dot(&shrunk_inverse(&m).expect("inverse")));
+            old.push(started.elapsed().as_secs_f64());
+            let started = Instant::now();
+            let direction = black_box(shrunk_direction(&m, &g).expect("solve"));
+            new.push(started.elapsed().as_secs_f64());
+            assert!((&reference - &direction).iter().all(|v| v.abs() < 1e-10));
+        }
+        old.sort_by(f64::total_cmp); new.sort_by(f64::total_cmp);
+        eprintln!("preconditioner width={width} pieces=64 spectral_seconds={} solve_seconds={} ratio={}", old[1], new[1], old[1] / new[1]);
+    }
+}

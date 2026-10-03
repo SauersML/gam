@@ -1268,11 +1268,13 @@ enum Selected {
 }
 
 impl Selected {
-    /// The masked forward of `family` and its per-input KL; on the CPU with the cotangent when
-    /// `cotangent`, on the device always (its KL's cotangent comes with it).
+    /// The masked forward and its KL, deferring the head cotangent on score-only trials.
     fn forward(masked: &Masked, family: &FamilyInputs, target: &Target, on_device: Option<&DeviceTarget>, cotangent: bool) -> Result<(Array1<f64>, Self), String> {
         if let Some(on_device) = on_device {
-            let state = masked.on_lowered(|accelerated| accelerated.forward(family, on_device))?;
+            let state = masked.on_lowered(|accelerated| {
+                if cotangent { accelerated.forward(family, on_device) }
+                else { accelerated.score_state(family, on_device) }
+            })?;
             return Ok((state.kl.clone(), Self::Device(state)));
         }
         if cotangent {
@@ -1284,9 +1286,12 @@ impl Selected {
     }
 
     /// [`mask_gradients`] of the KL.
-    fn mask_gradients(&mut self, masked: &Masked, family: &FamilyInputs, target: &Target) -> Result<Vec<Array2<f64>>, String> {
+    fn mask_gradients(&mut self, masked: &Masked, family: &FamilyInputs, target: &Target, on_device: Option<&DeviceTarget>) -> Result<Vec<Array2<f64>>, String> {
         match self {
-            Self::Device(state) => masked.on_lowered(|accelerated| accelerated.mask_gradients(masked, state)),
+            Self::Device(state) => masked.on_lowered(|accelerated| {
+                accelerated.prepare_gradient(state, on_device.ok_or("device: missing selection target")?)?;
+                accelerated.mask_gradients(masked, state)
+            }),
             Self::Host(trace, cotangent) => {
                 let cotangent = match cotangent.take() {
                     Some(c) => c,
@@ -1334,7 +1339,24 @@ pub fn select(
     observations: f64,
     samples: usize,
 ) -> Result<(Vec<Array2<f64>>, Array1<f64>), String> {
-    select_observed(masked, base, target, masks, coder, observations, samples, &mut |_: &Round<'_>| Ok(()))
+    select_observed(masked, base, target, masks, coder, observations, samples, None, &mut |_: &Round<'_>| Ok(()))
+}
+
+/// [`select`] under the box claim (module note, "Claims"): every input's error is its masks' KL
+/// plus [`box_excess`] in the written Fishers `fishers`, so the sets it keeps explain the input
+/// whatever the off subcomponents are set to in `[0, 1]`. Returns the masks and their own KL.
+#[allow(clippy::too_many_arguments)]
+pub fn select_boxed(
+    masked: &Masked,
+    base: &FamilyInputs,
+    target: &Target,
+    masks: Vec<Array2<f64>>,
+    coder: &Coder,
+    observations: f64,
+    samples: usize,
+    fishers: &[Array2<f64>],
+) -> Result<(Vec<Array2<f64>>, Array1<f64>), String> {
+    select_observed(masked, base, target, masks, coder, observations, samples, Some(fishers), &mut |_: &Round<'_>| Ok(()))
 }
 
 /// One selection round's keep/refuse decisions as [`select_observed`] shows them: the masks before
@@ -1349,7 +1371,9 @@ pub struct Round<'a> {
     pub flipped: &'a [usize],
 }
 
-/// [`select`], showing `observe` every round's decisions before they are taken.
+/// [`select`], showing `observe` every round's decisions before they are taken; with `boxed`
+/// (the written Fishers), under the box claim ([`select_boxed`]).
+#[allow(clippy::too_many_arguments)]
 pub fn select_observed(
     masked: &Masked,
     base: &FamilyInputs,
@@ -1358,6 +1382,7 @@ pub fn select_observed(
     coder: &Coder,
     observations: f64,
     samples: usize,
+    boxed: Option<&[Array2<f64>]>,
     observe: &mut dyn FnMut(&Round<'_>) -> Result<(), String>,
 ) -> Result<(Vec<Array2<f64>>, Array1<f64>), String> {
     let scale = observations / std::f64::consts::LN_2;
@@ -1394,7 +1419,7 @@ pub fn select_observed(
                     Some(state) => state,
                     None => Selected::forward(masked, &family, target, on_device, true)?,
                 };
-                let grads = state.mask_gradients(masked, &family, target)?;
+                let grads = state.mask_gradients(masked, &family, target, on_device)?;
                 (kl_now, state, grads)
             }
         };
@@ -1406,7 +1431,12 @@ pub fn select_observed(
         }
         let curvature = curvature.as_ref().ok_or("no curvature")?;
         let listing_now = coder.bits(&masks);
-        let before = code(&kl_now, &listing_now, observations);
+        // Under the box claim each input's error is its masks' KL plus the box's excess.
+        let excess_now = match boxed {
+            Some(f) => box_excess_at(masked, base, target, &masks, f)?,
+            None => Array1::zeros(rows),
+        };
+        let before = code(&(&kl_now + &excess_now), &listing_now, observations);
         // Each input's predicted flips, best first, as many as its interaction model says pay
         // (inputs in parallel: each reads only its own row of every array).
         let picks: Vec<(Vec<(usize, usize)>, f64)> = {
@@ -1422,8 +1452,16 @@ pub fn select_observed(
                     for (k, (g, (h, _))) in grads.iter().zip(curvature.iter()).enumerate() {
                         let (g, h, m) = (g.row(r), h.row(r), masks[k].row(r));
                         for c in 0..g.len() {
-                            let delta = if m[c] > 0.0 { -1.0 } else { 1.0 };
-                            let kl_change = g[c] * delta + 0.5 * h[c];
+                            let on = m[c] > 0.0;
+                            // The corner's change, `∓g + h/2`; under the box claim an off gate also
+                            // adds its expected excess, `g/2 + h/6` to second order (`E m = ½`,
+                            // `E m² = ⅓`), which turning it on removes.
+                            let kl_change = match (boxed.is_some(), on) {
+                                (false, true) => -g[c] + 0.5 * h[c],
+                                (false, false) => g[c] + 0.5 * h[c],
+                                (true, true) => -0.5 * g[c] + (2.0 / 3.0) * h[c],
+                                (true, false) => 0.5 * g[c] + h[c] / 3.0,
+                            };
                             let listing_change = coder.marginal(&masks, r, k, c, fresh);
                             let net = scale * kl_change + listing_change;
                             if net < 0.0 {
@@ -1461,7 +1499,11 @@ pub fn select_observed(
         }
         let proposed_family = masked.family(base, &proposed);
         let (kl_new, state_new) = Selected::forward(masked, &proposed_family, target, on_device, false)?;
-        let after = code(&kl_new, &coder.bits(&proposed), observations);
+        let excess_new = match boxed {
+            Some(f) => box_excess_at(masked, base, target, &proposed, f)?,
+            None => Array1::zeros(rows),
+        };
+        let after = code(&(&kl_new + &excess_new), &coder.bits(&proposed), observations);
         observe(&Round { current: &family, proposed: &proposed_family, before: &before, after: &after, sequence_of: &sequence_of, flipped: &flipped })?;
         // Per sequence: the exact saving of its whole proposal, and its largest flips per input.
         let mut sequence_saving = vec![0.0; sequences];
@@ -1571,7 +1613,7 @@ impl Running {
 /// `(M + λ I)⁻¹` for a symmetric positive semidefinite `M`, with `λ = tr M / dim`: the matrix
 /// shrunk halfway to the isotropic matrix of its own mean eigenvalue, so a direction the data barely
 /// resolve is not amplified beyond the mean scale.
-fn shrunk_inverse(m: &Array2<f64>) -> Result<Array2<f64>, String> {
+pub(super) fn shrunk_inverse(m: &Array2<f64>) -> Result<Array2<f64>, String> {
     let mut sym = m.clone();
     let n = sym.nrows();
     for i in 0..n {

@@ -199,6 +199,17 @@ enum IndexData {
     Cuda(cudarc::driver::CudaSlice<u32>),
 }
 
+/// Validated contiguous column groups, with their offsets uploaded once.
+pub struct ColumnBlocks {
+    offsets: Indices,
+    columns: usize,
+}
+
+impl ColumnBlocks {
+    pub fn len(&self) -> usize { self.offsets.len - 1 }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+}
+
 impl Indices {
     #[must_use]
     pub fn len(&self) -> usize {
@@ -679,13 +690,27 @@ impl Device {
     /// reads only columns `j ≤ r mod L` and the rest become zero.
     pub fn softmax_rows(&self, scores: &mut Tensor, causal: bool) -> Result<(), GpuError> {
         let width = scores.cols;
-        if width == 0 || scores.rows % width != 0 {
+        if width == 0 || (causal && scores.rows % width != 0) {
             return Err(shape(format!("attention scores {:?} are not square blocks", scores.dim())));
         }
+        self.softmax_rows_impl(scores, causal, 0)
+    }
+
+    /// Softmax of a rectangular query tile against a sequence's keys, preserving its causal
+    /// offset. Noncausal rows can have any batch/vocabulary shape.
+    pub fn softmax_rows_offset(&self, scores: &mut Tensor, causal: bool, start: usize) -> Result<(), GpuError> {
+        if scores.cols == 0 || (causal && (start > scores.cols || scores.rows > scores.cols - start)) {
+            return Err(shape("causal softmax tile outside its sequence".to_string()));
+        }
+        self.softmax_rows_impl(scores, causal, start)
+    }
+
+    fn softmax_rows_impl(&self, scores: &mut Tensor, causal: bool, start: usize) -> Result<(), GpuError> {
+        let width = scores.cols;
         match &*self.backend {
             Backend::Host => {
                 for (r, row) in host_mut(scores)?.chunks_mut(width).enumerate() {
-                    let valid = if causal { r % width + 1 } else { width };
+                    let valid = if causal { start + r % width + 1 } else { width };
                     let m = row[..valid].iter().copied().fold(f64::NEG_INFINITY, f64::max);
                     for v in row[..valid].iter_mut() {
                         *v = (*v - m).exp();
@@ -701,7 +726,7 @@ impl Device {
                 Ok(())
             }
             #[cfg(target_os = "linux")]
-            Backend::Cuda(engine) => engine.softmax_rows(scores, causal),
+            Backend::Cuda(engine) => engine.softmax_rows(scores, causal, start),
         }
     }
 
@@ -817,6 +842,40 @@ impl Device {
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.sampled_cotangent(logits, uniforms, scored),
+        }
+    }
+
+    /// Prepare contiguous column groups for fused product/reduction kernels.
+    pub fn column_blocks(&self, widths: &[usize]) -> Result<ColumnBlocks, GpuError> {
+        let mut offsets = vec![0u32];
+        let mut columns = 0usize;
+        for &width in widths {
+            if width == 0 { return Err(shape("empty column block".to_string())); }
+            columns = columns.checked_add(width).ok_or_else(|| shape("column block overflow".to_string()))?;
+            offsets.push(u32::try_from(columns).map_err(|_| shape("column blocks exceed u32".to_string()))?);
+        }
+        Ok(ColumnBlocks { offsets: self.upload_indices(&offsets)?, columns })
+    }
+
+    /// `out[r,b] = sum_{c in b} left[r,c] * right[r,c]`. Sum before any subsequent square
+    /// to preserve cross terms in grouped-mask Fisher estimates.
+    pub fn block_products(&self, left: &Tensor, right: &Tensor, blocks: &ColumnBlocks) -> Result<Tensor, GpuError> {
+        same(left, right, "block products")?;
+        if left.cols != blocks.columns { return Err(shape("column blocks do not match input".to_string())); }
+        match &*self.backend {
+            Backend::Host => {
+                let (a, b, offsets) = (host(left)?, host(right)?, host_indices(&blocks.offsets)?);
+                let mut out = vec![0.0; left.rows * blocks.len()];
+                for r in 0..left.rows {
+                    for k in 0..blocks.len() {
+                        out[r * blocks.len() + k] = (offsets[k] as usize..offsets[k + 1] as usize)
+                            .map(|c| a[r * left.cols + c] * b[r * left.cols + c]).sum();
+                    }
+                }
+                Ok(Tensor { rows: left.rows, cols: blocks.len(), data: Data::Host(out) })
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.block_products(left, right, blocks),
         }
     }
 
@@ -1129,12 +1188,12 @@ extern "C" __global__ void rotate_planes(unsigned int rows, unsigned int cols, u
     }
 }
 
-extern "C" __global__ void softmax_rows(unsigned int rows, unsigned int width, int causal, double* s) {
+extern "C" __global__ void softmax_rows(unsigned int rows, unsigned int width, int causal, unsigned int start, double* s) {
     __shared__ double shared[BLOCK];
     unsigned int r = blockIdx.x;
     if (r >= rows) return;
     double* row = s + (u64)r * width;
-    unsigned int valid = causal ? r % width + 1 : width;
+    unsigned int valid = causal ? start + r % width + 1 : width;
     double m = NEG_INF;
     for (unsigned int c = threadIdx.x; c < valid; c += BLOCK) m = fmax(m, row[c]);
     m = block_max(m, shared);
@@ -1229,6 +1288,18 @@ extern "C" __global__ void sampled_cotangent(unsigned int rows, unsigned int col
     }
     __syncthreads();
     for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) z[c] -= (c == label) ? 1.0 : 0.0;
+}
+
+extern "C" __global__ void block_products(u64 n, unsigned int cols, unsigned int blocks,
+    const double* left, const double* right, const unsigned int* offsets, double* out) {
+    GRID_STRIDE(i, n) {
+        u64 row = i / blocks;
+        unsigned int block = (unsigned int)(i % blocks);
+        double sum = 0.0;
+        for (unsigned int c = offsets[block]; c < offsets[block + 1]; c++)
+            sum += left[row * cols + c] * right[row * cols + c];
+        out[i] = sum;
+    }
 }
 
 extern "C" __global__ void sampled_head_cotangent(unsigned int rows, unsigned int classes, unsigned int width,
@@ -1646,13 +1717,14 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
             Ok(out)
         }
 
-        pub(super) fn softmax_rows(&self, scores: &mut Tensor, causal: bool) -> Result<(), GpuError> {
+        pub(super) fn softmax_rows(&self, scores: &mut Tensor, causal: bool, start: usize) -> Result<(), GpuError> {
             let (rows, width) = (scores.rows as u32, scores.cols as u32);
             let launch = cfg_rows(scores.rows);
             let causal = i32::from(causal);
+            let start = start as u32;
             let f = self.function("softmax_rows")?;
             // SAFETY: one block per row of a rows × width buffer.
-            unsafe { self.stream.launch_builder(&f).arg(&rows).arg(&width).arg(&causal).arg(slice_mut(scores)?).launch(launch) }
+            unsafe { self.stream.launch_builder(&f).arg(&rows).arg(&width).arg(&causal).arg(&start).arg(slice_mut(scores)?).launch(launch) }
                 .gpu_ctx("tensor softmax_rows")
                 .map(|_| ())
         }
@@ -1729,6 +1801,20 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
             }
             .gpu_ctx("tensor sampled_cotangent")
             .map(|_| ())
+        }
+
+        pub(super) fn block_products(&self, left: &Tensor, right: &Tensor, blocks: &ColumnBlocks) -> Result<Tensor, GpuError> {
+            let mut out = Tensor { rows: left.rows, cols: blocks.len(), data: Data::Cuda(self.zeros(left.rows * blocks.len())?) };
+            if out.is_empty() { return Ok(out); }
+            let (n, cols, count) = (out.len() as u64, left.cols as u32, blocks.len() as u32);
+            let f = self.function("block_products")?;
+            // SAFETY: shapes agree, and column_blocks validates monotone offsets within cols.
+            unsafe {
+                self.stream.launch_builder(&f).arg(&n).arg(&cols).arg(&count)
+                    .arg(slice(left)?).arg(slice(right)?).arg(index_slice(&blocks.offsets)?)
+                    .arg(slice_mut(&mut out)?).launch(cfg_elements(n))
+            }.gpu_ctx("tensor block_products")?;
+            Ok(out)
         }
 
         pub(super) fn sampled_head_cotangent(

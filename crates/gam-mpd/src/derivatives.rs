@@ -308,6 +308,9 @@ fn attend_tangent(
     rotary: Option<super::operator_program::Rotary>,
     causal: bool,
 ) -> Result<Array2<f64>, ProgramError> {
+    if inputs.rows >= 32 {
+        return super::tiled_attention::tangent(inputs, (query, key, value), (dq.as_ref(), dk.as_ref(), dv.as_ref()), scale.value(), rotary, causal);
+    }
     let layout = inputs.layout.as_ref().ok_or_else(|| refuse("an attend node needs a sequence layout".to_string()))?;
     let rows = inputs.rows;
     let rotate = |m: &Array2<f64>| -> Array2<f64> {
@@ -404,9 +407,11 @@ pub(crate) fn vjp_from(
             None => g[node] = Some(term),
         }
     }
-    for index in (0..program.nodes.len()).rev() {
+    let first = keep.and_then(|nodes| nodes.iter().min().copied()).unwrap_or(0);
+    for index in (first..program.nodes.len()).rev() {
         let Some(cot) = g[index].take() else { continue };
         if retained[index] { g[index] = Some(cot.clone()); }
+        if keep.is_some() && index == first { break; }
         let node = &program.nodes[index];
         match node {
             Node::Feature { .. } | Node::Raw { .. } | Node::Constant { .. } => {}
@@ -539,6 +544,9 @@ pub(crate) fn vjp_from(
             }
         }
     }
+    for (node, gradient) in g.iter_mut().enumerate() {
+        if !retained[node] { *gradient = None; }
+    }
     Ok(g)
 }
 
@@ -569,6 +577,9 @@ fn attend_cotangent(
     rotary: Option<super::operator_program::Rotary>,
     causal: bool,
 ) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>), ProgramError> {
+    if inputs.rows >= 32 {
+        return super::tiled_attention::backward(inputs, (query, key, value), cot, scale.value(), rotary, causal);
+    }
     let layout = inputs.layout.as_ref().ok_or_else(|| refuse("an attend node needs a sequence layout".to_string()))?;
     let rows = inputs.rows;
     let (q, k) = (rotate_rows(query, rotary, &layout.position, false), rotate_rows(key, rotary, &layout.position, false));

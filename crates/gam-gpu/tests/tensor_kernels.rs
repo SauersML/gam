@@ -96,6 +96,24 @@ fn up(device: &Device, m: &Array2<f64>) -> Tensor {
 }
 
 #[test]
+fn grouped_mask_fisher_squares_sums_with_cross_terms() {
+    let mut devices = vec![Device::host()];
+    devices.extend(accelerator());
+    for device in devices {
+        let blocks = device.column_blocks(&[2, 1]).expect("blocks");
+        let left = up(&device, &ndarray::array![[2.0, -2.0, 3.0], [1.0, 2.0, -1.0]]);
+        let right = up(&device, &ndarray::array![[1.0, 1.0, 2.0], [3.0, 4.0, 5.0]]);
+        let sums = device.block_products(&left, &right, &blocks).expect("reduce");
+        assert_eq!(down(&device, &sums), ndarray::array![[0.0, 6.0], [11.0, -5.0]]);
+        let mut fisher = device.zeros(2, 2).expect("fisher");
+        device.hadamard(&mut fisher, &sums, &sums, true).expect("square sums");
+        assert_eq!(down(&device, &fisher), ndarray::array![[0.0, 36.0], [121.0, 25.0]]);
+        assert!(device.column_blocks(&[0]).is_err());
+        assert!(device.block_products(&left, &right, &device.column_blocks(&[2]).expect("blocks")).is_err());
+    }
+}
+
+#[test]
 fn sampled_head_lookup_matches_full_pullback_in_both_orientations() {
     let mut devices = vec![Device::host()];
     devices.extend(accelerator());

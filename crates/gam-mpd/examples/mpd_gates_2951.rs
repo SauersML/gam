@@ -350,7 +350,7 @@ fn score(run: &Run, switches: &[Vec<Switch>], train: (usize, usize), eval: (usiz
         offset += run.pieces[site];
     }
     // The previous-state context coder, counted on the training sequences.
-    let sequences = |lo: usize, hi: usize| (lo / run.context..hi / run.context);
+    let sequences = |lo: usize, hi: usize| lo / run.context..hi / run.context;
     let masks_of = |s: usize| -> Vec<Array2<f64>> {
         (0..run.names.len())
             .map(|site| {

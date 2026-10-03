@@ -89,6 +89,10 @@ fn the_masked_device_path_matches_the_cpu_within_bands() {
             let accelerated = Accelerated::new(&device, &masked, Arithmetic::F64).expect("lowered");
             let on_device = accelerated.target(&target).expect("target");
             let state = accelerated.forward(&family, &on_device).expect("device forward");
+            let mut deferred = accelerated.score_state(&family, &on_device).expect("score state");
+            assert_eq!(deferred.kl, state.kl);
+            accelerated.prepare_gradient(&mut deferred, &on_device).expect("deferred gradient");
+            assert_eq!(accelerated.mask_gradients(&masked, &deferred).expect("deferred masks"), accelerated.mask_gradients(&masked, &state).expect("masks"));
             assert_eq!(accelerated.score_only(&family, &on_device).expect("score only"), state.kl);
             for r in 0..family.rows {
                 if !target.scores(r) {

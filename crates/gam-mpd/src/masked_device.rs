@@ -15,7 +15,7 @@
 use super::device_program::{DeviceProgram, DeviceTrace};
 use super::masked::{BoxGradients, Masked, Target};
 use super::operator_program::{FamilyInputs, Node};
-use gam_gpu::tensor::{Arithmetic, Device, Op, Tensor};
+use gam_gpu::tensor::{Arithmetic, ColumnBlocks, Device, Op, Tensor};
 use ndarray::{Array1, Array2, Axis, s};
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -35,6 +35,8 @@ pub fn device() -> Result<Option<Device>, String> {
 pub struct Accelerated {
     program: DeviceProgram,
     proposal: Arithmetic,
+    blocks: Vec<ColumnBlocks>,
+    ranks: Vec<Vec<usize>>,
 }
 
 /// A target's logits held on the device, and its scored rows.
@@ -48,7 +50,7 @@ pub struct DeviceTarget {
 pub struct State {
     pub kl: Array1<f64>,
     pub trace: DeviceTrace,
-    cotangent: Tensor,
+    cotangent: Option<Tensor>,
 }
 
 /// Mirrors `masked`'s label sampler (`XorShift`), so the device draws the CPU's labels.
@@ -70,7 +72,9 @@ impl Accelerated {
         if masked.head.is_some() {
             return Err("device: a masked window with a frozen head after it".to_string());
         }
-        Ok(Self { program: DeviceProgram::compile(device, &masked.program)?, proposal })
+        let ranks: Vec<_> = (0..masked.sites.len()).map(|k| masked.ranks(k).to_vec()).collect();
+        let blocks = ranks.iter().map(|r| device.column_blocks(r).map_err(error)).collect::<Result<_, _>>()?;
+        Ok(Self { program: DeviceProgram::compile(device, &masked.program)?, proposal, blocks, ranks })
     }
 
     /// The device program.
@@ -81,7 +85,13 @@ impl Accelerated {
 
     /// Re-upload the operators `masked` now holds new copies of (after a step).
     pub fn refresh(&mut self, masked: &Masked) -> Result<(), String> {
-        self.program.refresh(&masked.program)
+        self.program.refresh(&masked.program)?;
+        let ranks: Vec<_> = (0..masked.sites.len()).map(|k| masked.ranks(k).to_vec()).collect();
+        if ranks != self.ranks {
+            self.blocks = ranks.iter().map(|r| self.program.device().column_blocks(r).map_err(error)).collect::<Result<_, _>>()?;
+            self.ranks = ranks;
+        }
+        Ok(())
     }
 
     /// `target` on the device.
@@ -98,7 +108,21 @@ impl Accelerated {
     pub fn score_and_gradient(&self, family: &FamilyInputs, target: &DeviceTarget) -> Result<State, String> {
         let trace = self.program.forward(family)?;
         let (kl, cotangent) = self.program.kl(&trace, &target.logits, target.scored.as_deref())?;
-        Ok(State { kl, trace, cotangent })
+        Ok(State { kl, trace, cotangent: Some(cotangent) })
+    }
+
+    /// Retain the candidate forward for reuse, but defer its head gradient until it is needed.
+    pub fn score_state(&self, family: &FamilyInputs, target: &DeviceTarget) -> Result<State, String> {
+        let trace = self.program.forward(family)?;
+        let kl = self.program.score_only(&trace, &target.logits, target.scored.as_deref())?;
+        Ok(State { kl, trace, cotangent: None })
+    }
+
+    pub fn prepare_gradient(&self, state: &mut State, target: &DeviceTarget) -> Result<(), String> {
+        if state.cotangent.is_none() {
+            state.cotangent = Some(self.program.kl(&state.trace, &target.logits, target.scored.as_deref())?.1);
+        }
+        Ok(())
     }
 
     /// Evaluate a candidate without constructing or pulling back the KL cotangent.
@@ -114,16 +138,15 @@ impl Accelerated {
     /// Per site `∂KL/∂m` (rows × B): `masked::mask_gradients` of the state's KL.
     pub fn mask_gradients(&self, masked: &Masked, state: &State) -> Result<Vec<Array2<f64>>, String> {
         let d = self.program.device();
-        let seed = d.copy(&state.cotangent).map_err(error)?;
+        let seed = d.copy(state.cotangent.as_ref().ok_or("device: prepare the state's gradient first")?).map_err(error)?;
         let back = self.cotangents(&state.trace, seed, &masked.masked)?;
         let mut out = Vec::new();
         for k in 0..masked.sites.len() {
             let z = state.trace.value(masked.z[k])?;
             out.push(match back.get(&masked.masked[k]) {
                 Some(c) => {
-                    let mut g = d.zeros(z.rows(), z.cols()).map_err(error)?;
-                    d.hadamard(&mut g, c, z, false).map_err(error)?;
-                    masked.to_blocks(k, &d.download(&g).map_err(error)?)
+                    let g = d.block_products(c, z, &self.blocks[k]).map_err(error)?;
+                    d.download(&g).map_err(error)?
                 }
                 None => Array2::zeros((z.rows(), masked.blocks(k))),
             });
@@ -152,12 +175,9 @@ impl Accelerated {
             keep.extend(masked.sites.iter().flat_map(|s| s.writes.iter().copied()));
         }
         let mut h: Vec<Tensor> = Vec::new();
-        // A site gated in blocks squares each sample's block sums, on the host.
-        let mut h_blocks: Vec<Option<Array2<f64>>> = Vec::new();
         for k in 0..masked.sites.len() {
             let z = state.trace.value(masked.z[k])?;
-            h.push(d.zeros(z.rows(), z.cols()).map_err(error)?);
-            h_blocks.push((!masked.is_rank_one(k)).then(|| Array2::zeros((z.rows(), masked.blocks(k)))));
+            h.push(d.zeros(z.rows(), masked.blocks(k)).map_err(error)?);
         }
         // Per site, the blocks `g_iᵀ g_j` of the written nodes' Fisher.
         let mut blocks: Vec<Vec<Vec<Option<Tensor>>>> =
@@ -177,15 +197,8 @@ impl Accelerated {
                 for (k, hk) in h.iter_mut().enumerate() {
                     if let Some(c) = back.get(&masked.masked[k]) {
                         let z = state.trace.value(masked.z[k])?;
-                        let mut g = d.zeros(z.rows(), z.cols()).map_err(error)?;
-                        d.hadamard(&mut g, c, z, false).map_err(error)?;
-                        match &mut h_blocks[k] {
-                            Some(hb) => {
-                                let gb = masked.to_blocks(k, &d.download(&g).map_err(error)?);
-                                *hb += &(&gb * &gb);
-                            }
-                            None => d.hadamard(hk, &g, &g, true).map_err(error)?,
-                        }
+                        let g = d.block_products(c, z, &self.blocks[k]).map_err(error)?;
+                        d.hadamard(hk, &g, &g, true).map_err(error)?;
                     }
                     if !written {
                         continue;
@@ -208,10 +221,7 @@ impl Accelerated {
         let scored_rows = (0..rows).filter(|r| scored(*r)).count().max(1) as f64;
         let mut out = Vec::new();
         for (k, hk) in h.iter().enumerate() {
-            let diagonal = match &h_blocks[k] {
-                Some(hb) => hb / samples as f64,
-                None => d.download(hk).map_err(error)? / samples as f64,
-            };
+            let diagonal = d.download(hk).map_err(error)? / samples as f64;
             let fisher = if written {
                 let widths: Vec<usize> = masked.sites[k].writes.iter().map(|w| state.trace.value(*w).map(|t| t.cols())).collect::<Result<_, _>>()?;
                 let offsets: Vec<usize> = std::iter::once(0).chain(widths.iter().scan(0, |a, w| {
@@ -241,7 +251,7 @@ impl Accelerated {
         let d = self.program.device();
         let mut keep = masked.masked.clone();
         keep.extend(masked.sites.iter().flat_map(|s| s.writes.iter().copied()));
-        let seed = d.copy(&state.cotangent).map_err(error)?;
+        let seed = d.copy(state.cotangent.as_ref().ok_or("device: prepare the state's gradient first")?).map_err(error)?;
         let back = self.cotangents(&state.trace, seed, &keep)?;
         let mut out = Vec::new();
         for (k, site) in masked.sites.iter().enumerate() {
@@ -260,8 +270,7 @@ impl Accelerated {
                 out.push((Array2::zeros((rows, masked.blocks(k))), Array2::zeros((pieces, d_in)), Array2::zeros((pieces, d_out))));
                 continue;
             };
-            let mut mask_gradient = d.zeros(rows, pieces).map_err(error)?;
-            d.hadamard(&mut mask_gradient, cot_masked, z, false).map_err(error)?;
+            let mask_gradient = d.block_products(cot_masked, z, &self.blocks[k]).map_err(error)?;
             let mut cot_z = d.zeros(rows, pieces).map_err(error)?;
             d.hadamard(&mut cot_z, cot_masked, mask, false).map_err(error)?;
             // ∂KL/∂V = cot_zᵀ x, one block per read node (the reads are uncentred, `crate::masked`).
@@ -291,7 +300,7 @@ impl Accelerated {
                 let views: Vec<_> = blocks.iter().map(|b| b.view()).collect();
                 ndarray::concatenate(Axis(1), &views).map_err(|e| e.to_string())
             };
-            out.push((masked.to_blocks(k, &d.download(&mask_gradient).map_err(error)?), join(&v_blocks)?, join(&u_blocks)?));
+            out.push((d.download(&mask_gradient).map_err(error)?, join(&v_blocks)?, join(&u_blocks)?));
         }
         Ok(out)
     }
@@ -349,7 +358,7 @@ impl Accelerated {
             return Err(format!("device: the box claim of {}, gated in blocks", masked.sites[k].name));
         }
         let keep: Vec<usize> = masked.sites.iter().flat_map(|s| s.writes.iter().copied()).collect();
-        let seed = d.copy(&state.cotangent).map_err(error)?;
+        let seed = d.copy(state.cotangent.as_ref().ok_or("device: prepare the state's gradient first")?).map_err(error)?;
         // The excess decides, so the gradient it reads is float64 too.
         let back = self.program.vjp(&state.trace, seed, &keep, Arithmetic::F64)?;
         let ones = |n: usize, m: usize| d.upload_vec(n, m, vec![1.0; n * m]).map_err(error);

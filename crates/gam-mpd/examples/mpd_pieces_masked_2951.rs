@@ -78,7 +78,7 @@ use gam_mpd::checkpoint::{Saved, load, save};
 use gam_mpd::codec::prefix_integer_len_bits;
 use gam_mpd::import::import_language_model;
 use gam_mpd::masked::{
-    Claim, Coder, Context, Library, Masked, Running, Target, box_excess, box_excess_at, forward, kl_and_logits, matrix, previous_inputs, read_values, score_only,
+    Claim, Coder, Context, select_boxed, Library, Masked, Running, Target, box_excess, box_excess_at, forward, kl_and_logits, matrix, previous_inputs, read_values, score_only,
     select, site_statistics, sites, split, step_pieces,
 };
 use gam_mpd::operator_program::FamilyInputs;
@@ -350,7 +350,16 @@ fn main() -> Result<(), String> {
     let family = &imported.contract.family;
     let context_rows = context;
     let sequence = |s: usize| -> FamilyInputs { family.select(&(s * context_rows..(s + 1) * context_rows).collect::<Vec<_>>()) };
+    // The model's own logits, on the process's accelerator when it has one (float64 either way).
+    let native = match gam_mpd::masked_device::device()? {
+        Some(device) => Some(gam_mpd::device_program::DeviceProgram::compile(&device, model)?),
+        None => None,
+    };
     let target_of = |inputs: &FamilyInputs| -> Result<Target, String> {
+        if let Some(native) = &native {
+            let trace = native.forward(inputs)?;
+            return Ok(Target::every_row(native.logits(&trace, 0, trace.rows)?));
+        }
         Ok(Target::every_row(model.execute(inputs, false).map_err(|e| e.to_string())?.values[model.output].clone()))
     };
     let all_sites = sites(model);
@@ -646,6 +655,8 @@ fn main() -> Result<(), String> {
         if fishers.is_some() {
             selected.excess = Some(0.0);
             started.excess = Some(0.0);
+            // Everything on leaves no gate free: no excess.
+            all_on.excess = Some(0.0);
         }
         // What the box claim adds on a sequence's sets.
         let excess_of = |inputs: &FamilyInputs, target: &Target, masks: &[Array2<f64>], fishers: &[Array2<f64>]| -> Result<f64, String> {
@@ -692,34 +703,46 @@ fn main() -> Result<(), String> {
             };
             let begin_bits = coder.bits(&begin).sum();
             started.add(&begin, &begin_kl, begin_bits, &begin_agree);
-            if let (Some(f), Some(excess)) = (fishers, started.excess.as_mut()) {
-                *excess += excess_of(&inputs, &target, &begin, f)?;
+            // Under the box claim the error is the KL expected over every off gate (module note).
+            let begin_excess = match fishers {
+                Some(f) => excess_of(&inputs, &target, &begin, f)?,
+                None => 0.0,
+            };
+            if let Some(excess) = started.excess.as_mut() {
+                *excess += begin_excess;
             }
-            let begin_code = begin_bits + begin_kl.sum() * scale;
+            let begin_code = begin_bits + (begin_kl.sum() + begin_excess) * scale;
             let begin_l0 = sums(&begin, &begin_kl).0;
-            let (masks, values) = select(masked, &inputs, &target, begin, &coder, observations, samples)?;
+            let (masks, values) = match fishers {
+                Some(f) => select_boxed(masked, &inputs, &target, begin, &coder, observations, samples, f)?,
+                None => select(masked, &inputs, &target, begin, &coder, observations, samples)?,
+            };
             let bits = coder.bits(&masks).sum();
-            // Selection keeps each input's flips by that input's own code; the sequence keeps its
-            // start whenever the selected sets do not code it in fewer bits as a whole.
-            let (masks, values, bits, row_agree) = if bits + values.sum() * scale < begin_code {
+            let excess = match fishers {
+                Some(f) => excess_of(&inputs, &target, &masks, f)?,
+                None => 0.0,
+            };
+            // Selection keeps each sequence's flips by its own code; the sequence keeps its start
+            // whenever the selected sets do not code it in fewer bits as a whole.
+            let (masks, values, bits, excess, row_agree) = if bits + (values.sum() + excess) * scale < begin_code {
                 let row_agree = agreement(&kl_and_logits(masked, &masked.family(&inputs, &masks), &target)?.1, &target);
-                (masks, values, bits, row_agree)
+                (masks, values, bits, excess, row_agree)
             } else {
                 log::info!("eval sequence {e}: selection did not lower the start's code; the start stays");
-                (begin_of(starts[e].as_ref(), &inputs, masked, &coder.costs)?, begin_kl.clone(), begin_bits, begin_agree.clone())
+                (begin_of(starts[e].as_ref(), &inputs, masked, &coder.costs)?, begin_kl.clone(), begin_bits, begin_excess, begin_agree.clone())
             };
             log::info!(
-                "eval sequence {e}: start L0 {:.1} KL {:.4} code {:.1}; selected L0 {:.1} KL {:.4} code {:.1} bits per token",
+                "eval sequence {e}: start L0 {:.1} KL {:.4} code {:.1}; selected L0 {:.1} KL {:.4} code {:.1} bits per token (the code under the claim)",
                 begin_l0 / inputs.rows as f64,
                 begin_kl.mean().unwrap_or(0.0),
                 begin_code / inputs.rows as f64,
                 sums(&masks, &values).0 / inputs.rows as f64,
                 values.mean().unwrap_or(0.0),
-                (bits + values.sum() * scale) / inputs.rows as f64
+                (bits + (values.sum() + excess) * scale) / inputs.rows as f64
             );
             selected.add(&masks, &values, bits, &row_agree);
-            if let (Some(f), Some(excess)) = (fishers, selected.excess.as_mut()) {
-                *excess += excess_of(&inputs, &target, &masks, f)?;
+            if let Some(total) = selected.excess.as_mut() {
+                *total += excess;
             }
             if full {
                 token_kl.extend(values.iter().copied());
@@ -764,7 +787,7 @@ fn main() -> Result<(), String> {
     if train == 0 {
         // The description code is fixed by the library, so one pass says it all.
         if first_pass == 0 {
-            let (point, code) = evaluate(&masked, &costs, &eval_starts, None, 0, 0, eval, true)?;
+            let (point, code) = evaluate(&masked, &costs, &eval_starts, (claim == Claim::Box).then_some(fishers.as_slice()), 0, 0, eval, true)?;
             eprintln!("eval {point}");
             points.push(point);
             write_points(&points)?;
@@ -841,18 +864,30 @@ fn main() -> Result<(), String> {
                 None => start_masks(&inputs, &masked, &coder.costs)?,
             };
             let begin_kl = score_only(&masked, &masked.family(&inputs, &begin), &target)?;
-            let begin_code = coder.bits(&begin).sum() + begin_kl.sum() * scale;
-            let (masks, kl) = select(&masked, &inputs, &target, begin, &coder, observations, samples)?;
-            let (masks, kl) = if coder.bits(&masks).sum() + kl.sum() * scale < begin_code {
-                (masks, kl)
+            // The error under the claim: under the box, the masks' KL plus the box's excess.
+            let excess_at = |masks: &[Array2<f64>]| -> Result<f64, String> {
+                match claim {
+                    Claim::Box => Ok(box_excess_at(&masked, &inputs, &target, masks, &fishers)?.sum()),
+                    Claim::Corner => Ok(0.0),
+                }
+            };
+            let begin_excess = excess_at(&begin)?;
+            let begin_code = coder.bits(&begin).sum() + (begin_kl.sum() + begin_excess) * scale;
+            let (masks, kl) = match claim {
+                Claim::Box => select_boxed(&masked, &inputs, &target, begin, &coder, observations, samples, &fishers)?,
+                Claim::Corner => select(&masked, &inputs, &target, begin, &coder, observations, samples)?,
+            };
+            let excess = excess_at(&masks)?;
+            let (masks, kl, excess) = if coder.bits(&masks).sum() + (kl.sum() + excess) * scale < begin_code {
+                (masks, kl, excess)
             } else {
                 let begin = match &current[s] {
                     Some(old) => old.masks(&masked.all_pieces()),
                     None => start_masks(&inputs, &masked, &coder.costs)?,
                 };
-                (begin, begin_kl)
+                (begin, begin_kl, begin_excess)
             };
-            let sequence_code = (coder.bits(&masks).sum() + kl.sum() * scale) / inputs.rows as f64;
+            let sequence_code = (coder.bits(&masks).sum() + (kl.sum() + excess) * scale) / inputs.rows as f64;
             pass_code += sequence_code;
             current[s] = Some(Assigned::of(&masks));
             let step = step_pieces(&mut masked, &inputs, &target, &masks, samples, 0xF00D + (pass * train + s) as u64, &mut running, claim)?;
@@ -951,7 +986,7 @@ fn main() -> Result<(), String> {
                 // The steps since the last report moved the pieces, and with them their descriptions.
                 costs = costs_of(&masked)?;
                 let evaluated = if last { eval } else { eval.min(4) };
-                let (point, _) = evaluate(&masked, &costs, &eval_starts, (claim == Claim::Box).then_some(running.fishers.as_slice()), pass, pass * train + s + 1, evaluated, last)?;
+                let (point, _) = evaluate(&masked, &costs, &eval_starts, (claim == Claim::Box).then_some(fishers.as_slice()), pass, pass * train + s + 1, evaluated, last)?;
                 eprintln!("eval {point}");
                 points.push(point);
                 write_points(&points)?;

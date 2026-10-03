@@ -39,6 +39,8 @@ pub mod apply;
 
 // Component query-key kernel under the source's joint softmax and causal mask.
 pub mod attention;
+mod tiled_attention;
+mod device_attention;
 
 // Native linear reads and RMSNorm evaluations with forward-error radii.
 pub mod block;

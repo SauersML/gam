@@ -31,7 +31,7 @@ use super::operator_program::{
 use gam_gpu::tensor::{Arithmetic, Device, Indices, Op, PointwiseLaw, Tensor};
 use ndarray::{Array1, Array2};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// The largest logits tile the head forms at once, in bytes.
 pub const TILE_BYTES: usize = 1 << 30;
@@ -134,6 +134,16 @@ pub struct DeviceProgram {
     widths: Vec<usize>,
     head: Head,
     operators: BTreeMap<(usize, Role), HeldOperator>,
+    batch: Mutex<Option<Arc<PreparedBatch>>>,
+}
+
+struct PreparedBatch {
+    rows: usize,
+    layout: Option<super::operator_program::SequenceLayout>,
+    tokens: BTreeMap<usize, Vec<u32>>,
+    ids: BTreeMap<usize, Arc<Indices>>,
+    blocks: usize,
+    rotations: Arc<Vec<(Rotary, Tensor, Tensor)>>,
 }
 
 /// One forward pass's node values on the device (`None` for features and the head), with the
@@ -141,11 +151,11 @@ pub struct DeviceProgram {
 pub struct DeviceTrace {
     pub values: Vec<Option<Tensor>>,
     pub rows: usize,
-    ids: BTreeMap<usize, Indices>,
+    ids: BTreeMap<usize, Arc<Indices>>,
     /// Sequences (equal row blocks) and their length.
     blocks: usize,
     /// Per rotary configuration, `(cos, sin)` per row and plane.
-    rotations: Vec<(Rotary, Tensor, Tensor)>,
+    rotations: Arc<Vec<(Rotary, Tensor, Tensor)>>,
 }
 
 impl DeviceTrace {
@@ -261,7 +271,7 @@ impl DeviceProgram {
             let held = hold(device, &source, key.1)?;
             operators.insert(key, HeldOperator { source, held });
         }
-        Ok(Self { device: device.clone(), steps, widths, head, operators })
+        Ok(Self { device: device.clone(), steps, widths, head, operators, batch: Mutex::new(None) })
     }
 
     fn head_of(program: &OperatorProgram) -> Result<Head, String> {
@@ -333,6 +343,36 @@ impl DeviceProgram {
 
     /// The family's blocks and rotation tables: every sequence one contiguous block of equal
     /// length, positions strictly increasing within it.
+    fn prepared_batch(&self, family: &FamilyInputs) -> Result<Arc<PreparedBatch>, String> {
+        let mut cached = self.batch.lock().map_err(|_| "device: poisoned batch cache".to_string())?;
+        if let Some(saved) = cached.as_ref() {
+            let same_layout = match (&saved.layout, &family.layout) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.sequence == b.sequence && a.position == b.position,
+                _ => false,
+            };
+            if saved.rows == family.rows && same_layout && saved.tokens.iter().all(|(slot, tokens)| {
+                matches!(family.slots.get(*slot), Some(SlotValues::Tokens(current)) if current == tokens)
+            }) { return Ok(Arc::clone(saved)); }
+        }
+        let (blocks, rotations) = self.layout(family)?;
+        let mut tokens = BTreeMap::new();
+        let mut ids = BTreeMap::new();
+        for step in &self.steps {
+            if let Step::Feature { slot } = step {
+                let Some(SlotValues::Tokens(values)) = family.slots.get(*slot) else { return Err(format!("device: slot {slot} holds no tokens")); };
+                if values.len() != family.rows { return Err("device: token count does not match batch".to_string()); }
+                if !ids.contains_key(slot) {
+                    ids.insert(*slot, Arc::new(self.device.upload_indices(values).map_err(error)?));
+                    tokens.insert(*slot, values.clone());
+                }
+            }
+        }
+        let saved = Arc::new(PreparedBatch { rows: family.rows, layout: family.layout.clone(), tokens, ids, blocks, rotations: Arc::new(rotations) });
+        *cached = Some(Arc::clone(&saved));
+        Ok(saved)
+    }
+
     fn layout(&self, family: &FamilyInputs) -> Result<(usize, Vec<(Rotary, Tensor, Tensor)>), String> {
         let rotaries: Vec<Rotary> = {
             let mut list: Vec<Rotary> = Vec::new();
@@ -353,6 +393,9 @@ impl DeviceProgram {
             return Ok((1, Vec::new()));
         };
         let rows = family.rows;
+        if layout.sequence.len() != rows || layout.position.len() != rows {
+            return Err("device: layout length does not match batch".to_string());
+        }
         let length = (1..=rows).find(|&l| l == rows || layout.sequence[l] != layout.sequence[0]).unwrap_or(rows);
         if attends {
             if length == 0 || rows % length != 0 {
@@ -420,21 +463,13 @@ impl DeviceProgram {
     pub fn forward(&self, family: &FamilyInputs) -> Result<DeviceTrace, String> {
         let d = &self.device;
         let rows = family.rows;
-        let (blocks, rotations) = self.layout(family)?;
-        let mut trace = DeviceTrace { values: Vec::with_capacity(self.steps.len()), rows, ids: BTreeMap::new(), blocks, rotations };
+        let batch = self.prepared_batch(family)?;
+        let mut trace = DeviceTrace { values: Vec::with_capacity(self.steps.len()), rows, ids: batch.ids.clone(), blocks: batch.blocks, rotations: Arc::clone(&batch.rotations) };
         for (index, step) in self.steps.iter().enumerate() {
             let width = self.widths[index];
             let value = match step {
                 Step::Head => None,
-                Step::Feature { slot } => {
-                    let SlotValues::Tokens(tokens) = &family.slots[*slot] else {
-                        return Err(format!("device: slot {slot} holds no tokens"));
-                    };
-                    if !trace.ids.contains_key(slot) {
-                        trace.ids.insert(*slot, d.upload_indices(tokens).map_err(error)?);
-                    }
-                    None
-                }
+                Step::Feature { .. } => None,
                 Step::Raw { slot } => {
                     let SlotValues::Raw(values) = &family.slots[*slot] else {
                         return Err(format!("device: slot {slot} holds no raw rows"));
@@ -470,11 +505,15 @@ impl DeviceProgram {
                 Step::RmsNorm { input, epsilon } => Some(d.rms_norm(trace.value(*input)?, *epsilon).map_err(error)?),
                 Step::Attend { query, key, value, scale, rotary, causal } => {
                     let (q, k) = self.rotated(&trace, *query, *key, *rotary)?;
-                    let alpha = self.attention(&trace, &q, &k, *scale, *causal)?;
                     let v = trace.value(*value)?;
-                    let mut out = d.zeros(rows, v.cols()).map_err(error)?;
-                    d.gemm_batched(trace.blocks, &mut out, 1.0, &alpha, Op::N, v, Op::N, 0.0, Arithmetic::F64).map_err(error)?;
-                    Some(out)
+                    if Self::tile_attention(&trace) {
+                        Some(super::device_attention::forward(d, (&q, &k, v), trace.blocks, *scale, *causal).map_err(error)?)
+                    } else {
+                        let alpha = self.attention(&trace, &q, &k, *scale, *causal)?;
+                        let mut out = d.zeros(rows, v.cols()).map_err(error)?;
+                        d.gemm_batched(trace.blocks, &mut out, 1.0, &alpha, Op::N, v, Op::N, 0.0, Arithmetic::F64).map_err(error)?;
+                        Some(out)
+                    }
                 }
                 Step::Transposed { input, operator } => {
                     let mut out = d.zeros(rows, width).map_err(error)?;
@@ -504,6 +543,11 @@ impl DeviceProgram {
     }
 
     /// The attention weights `softmax(c q kᵀ)` of every block (`blocks · L × L`).
+    fn tile_attention(trace: &DeviceTrace) -> bool {
+        let length = trace.rows / trace.blocks;
+        length > 1024 || trace.rows.saturating_mul(length) > 8 * 1024 * 1024
+    }
+
     fn attention(&self, trace: &DeviceTrace, q: &Tensor, k: &Tensor, scale: f64, causal: bool) -> Result<Tensor, String> {
         let d = &self.device;
         let length = trace.rows / trace.blocks;
@@ -659,6 +703,8 @@ impl DeviceProgram {
     /// cotangents of the nodes in `keep` (those any cotangent reaches), each node's dropped once
     /// its own rule has run. Products run in `arithmetic`.
     pub fn vjp(&self, trace: &DeviceTrace, seed: Tensor, keep: &[usize], arithmetic: Arithmetic) -> Result<BTreeMap<usize, Tensor>, String> {
+        let Some(first) = keep.iter().copied().min() else { return Ok(BTreeMap::new()); };
+        if keep.iter().any(|node| *node >= self.steps.len()) { return Err("device: retained node out of range".to_string()); }
         let d = &self.device;
         let mut g: Vec<Option<Tensor>> = (0..self.steps.len()).map(|_| None).collect();
         g[self.head.hidden] = Some(seed);
@@ -679,8 +725,12 @@ impl DeviceProgram {
             }
             Ok(())
         };
-        for index in (0..=self.head.hidden).rev() {
+        for index in (first..=self.head.hidden).rev() {
             let Some(cot) = g[index].take() else { continue };
+            if index == first {
+                kept.insert(index, cot);
+                break;
+            }
             match &self.steps[index] {
                 Step::Head | Step::Feature { .. } | Step::Raw { .. } | Step::Constant { .. } => {}
                 Step::Affine { terms, .. } => {
@@ -755,6 +805,16 @@ impl DeviceProgram {
         let d = &self.device;
         let blocks = trace.blocks;
         let (q, k) = self.rotated(trace, query, key, rotary)?;
+        if Self::tile_attention(trace) {
+            let (gq, gk, gv) = super::device_attention::backward(d, (&q, &k, trace.value(value)?), cot, blocks, scale, causal, arithmetic).map_err(error)?;
+            return match rotary {
+                None => Ok((gq, gk, gv)),
+                Some(r) => {
+                    let (cos, sin) = rotations_of(trace, r)?;
+                    Ok((d.rotate(&gq, cos, sin, r.half_split, true).map_err(error)?, d.rotate(&gk, cos, sin, r.half_split, true).map_err(error)?, gv))
+                }
+            };
+        }
         let alpha = self.attention(trace, &q, &k, scale, causal)?;
         let v = trace.value(value)?;
         let length = trace.rows / blocks;
@@ -882,7 +942,6 @@ impl DeviceProgram {
         let d = &self.device;
         let blocks = trace.blocks;
         let (q, k) = self.rotated(trace, query, key, rotary)?;
-        let alpha = self.attention(trace, &q, &k, scale, causal)?;
         let turn = |t: &Tensor| -> Result<Tensor, String> {
             match rotary {
                 None => d.copy(t).map_err(error),
@@ -892,6 +951,12 @@ impl DeviceProgram {
                 }
             }
         };
+        if Self::tile_attention(trace) {
+            let dq = dv[query].as_ref().map(&turn).transpose()?;
+            let dk = dv[key].as_ref().map(&turn).transpose()?;
+            return super::device_attention::tangent(d, (&q, &k, trace.value(value)?), (dq.as_ref(), dk.as_ref(), dv[value].as_ref()), blocks, scale, causal, arithmetic).map_err(error);
+        }
+        let alpha = self.attention(trace, &q, &k, scale, causal)?;
         let length = trace.rows / blocks;
         let mut ds = d.zeros(trace.rows, length).map_err(error)?;
         if let Some(dq) = dv[query].as_ref() {
