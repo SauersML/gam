@@ -217,6 +217,8 @@ def cmd_train(args) -> None:
         )
     if args.device == "mps":
         torch.mps.synchronize()
+    elif args.device.startswith("cuda"):
+        torch.cuda.synchronize()
     seconds = time.time() - started
     flops = counter.get_total_flops()
     # The loop runs steps + 1 training passes (the last one only logs) after one probe forward.
