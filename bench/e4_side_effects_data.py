@@ -55,9 +55,14 @@ def tokenizer():
 # ---------------------------------------------------------------- model side (lora, eval)
 def load():
     import torch
+    import yaml
+    from safetensors.torch import load_file
     sys.path.insert(0, str(VD))
-    from vpd_model import VPD_PTH, load_target
-    target = load_target("mps")
+    from vpd_model import TARGET_DIR, VPD_PTH, Target
+    # vpd_model.load_target with the weights loaded straight onto the GPU: 0.5 GiB instead of 1.3 GiB of footprint
+    sd = load_file(str(TARGET_DIR / "model_step_99999.safetensors"), device="mps")
+    target = Target(sd, yaml.safe_load((TARGET_DIR / "model_config.yaml").read_text())).to("mps").eval()
+    del sd
     raw = torch.load(str(VPD_PTH), map_location="cpu", weights_only=True, mmap=True)
     key = "_components." + SITE.replace(".", "-")
     U = raw[key + ".U"].float()[COMP].to("mps")

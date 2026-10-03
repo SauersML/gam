@@ -121,12 +121,18 @@ def stage_score(base_only=False):
     names = ["base"] + list(models)
     resid, final, head = E.split_forward(target)
     nR = len(lens)
+    out = OUTD / ("scores_base.npz" if base_only else "scores.npz")
+    part = out.with_suffix(".part.npz")
     lp = np.zeros((nR, len(names)), np.float64)
     greedy = np.zeros((nR, len(names)), bool)
     order = np.argsort(lens, kind="stable")
-    TOK = 3000  # tokens per batch (keeps the job inside 2 GiB)
-    i = 0
-    nb = 0
+    TOK = 8000  # tokens per batch
+    i = nb = 0
+    if part.exists():  # resume a killed run
+        z = np.load(part)
+        if list(z["names"]) == names:
+            lp, greedy, i = z["lp"], z["greedy"], int(z["i"])
+            log(f"resuming at request {i}")
     with torch.no_grad():
         while i < nR:
             n = max(1, TOK // int(lens[order[i]]))
@@ -145,25 +151,28 @@ def stage_score(base_only=False):
             tgt = ids_t[torch.from_numpy(rr).to("mps"), torch.from_numpy(pp + 1).to("mps")]
             rr_t, pp_t = torch.from_numpy(rr).to("mps"), torch.from_numpy(pp).to("mps")
             seg = torch.from_numpy(np.repeat(np.arange(len(idx)), n_cont[idx])).to("mps")
-            xmid, g2 = resid(ids_t[:, :-1] if Lm > 1 else ids_t)
+            xmid, g2 = resid(ids_t[:, :-1])
+            S = torch.zeros(len(names), len(idx), device="mps")
+            G = torch.zeros(len(names), len(idx), device="mps")
             for k, nm in enumerate(names):
                 x = final(xmid, g2, W0 if nm == "base" else W0 + models[nm])[rr_t, pp_t]
-                tl, gr = [], []
                 for c in range(0, len(x), 512):
                     h = head(x[c:c + 512])
-                    tl.append(h.gather(-1, tgt[c:c + 512, None])[:, 0])
-                    gr.append(h.argmax(-1) == tgt[c:c + 512])
-                tl, gr = torch.cat(tl), torch.cat(gr).float()  # MPS has no float64; sums of <= 512 terms are fine in fp32
-                s = torch.zeros(len(idx), device="mps").index_add_(0, seg, tl)
-                g = torch.zeros(len(idx), device="mps").index_add_(0, seg, gr)
-                lp[idx, k] = s.cpu().numpy()
-                greedy[idx, k] = (g.cpu().numpy() == n_cont[idx])
+                    sc = seg[c:c + 512]
+                    S[k].index_add_(0, sc, h.gather(-1, tgt[c:c + 512, None])[:, 0])  # fp32: MPS has no float64
+                    G[k].index_add_(0, sc, (h.argmax(-1) == tgt[c:c + 512]).float())
+                    del h
+            S, G = S.cpu().numpy(), G.cpu().numpy()  # one device sync per batch
+            lp[idx] = S.T
+            greedy[idx] = G.T == n_cont[idx][:, None]
             i = j
             nb += 1
-            if nb % 20 == 0:
+            torch.mps.empty_cache()  # batch shapes vary, so the MPS allocator's cache would otherwise keep growing
+            if nb % 50 == 0:
+                np.savez(part, lp=lp, greedy=greedy, names=np.array(names), i=i)
                 log(f"{i}/{nR} requests")
-                torch.mps.empty_cache()
-    np.savez(OUTD / ("scores_base.npz" if base_only else "scores.npz"), lp=lp, greedy=greedy, names=np.array(names))
+    np.savez(out, lp=lp, greedy=greedy, names=np.array(names))
+    part.unlink(missing_ok=True)
     json.dump({"models": names, "meta": meta}, open(OUTD / "models.json", "w"), indent=1)
     log("scored")
 
