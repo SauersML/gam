@@ -807,8 +807,9 @@ pub fn fit(
     cover(&mut v, &(given..pieces).rev().collect::<Vec<_>>())?;
     // The starting writes when they are the map, else the smallest that make every subcomponent on
     // the map.
+    let tolerance = 1e-9 * w.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
     let mut u = match start.filter(|s| s.u.nrows() == given && s.u.ncols() == w.nrows()) {
-        Some(s) if (&s.u.t().dot(&s.v) - w).iter().all(|e| e.abs() <= 1e-9 * w.iter().fold(0.0_f64, |m, x| m.max(x.abs()))) => {
+        Some(s) if (&s.u.t().dot(&s.v) - w).iter().all(|e| e.abs() <= tolerance) => {
             let mut u = Array2::<f64>::zeros((pieces, w.nrows()));
             u.slice_mut(s![..given, ..]).assign(&s.u);
             u
