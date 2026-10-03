@@ -12,15 +12,17 @@ import numpy as np
 M = Path.home() / "mpd-data/frontier/e4_side/methods"
 SETS = ("final", "compiled", "neg")
 TASKS = ("hellaswag", "arc_easy", "piqa", "lambada", "blimp")
-LABEL = {"vpd": "VPD subcomponent edit", "lora": "LoRA, 282 examples, λ=10", "lora_hardneg": "LoRA with hard negatives",
-         "vpd_at_hardneg": "VPD edit at the hard-negative LoRA's success", "rome": "covariance edit (ROME)",
-         "memit": "all fire keys, ridge (MEMIT)", "nullspace": "null space of general text",
-         "contrast": "contrast against hard negatives", "specific_subcomponent": "most emoticon-specific subcomponent",
-         "compiled_every_key": "compiler, every fire key exact", "compiled_span8": "compiler, exact on 8 key directions",
-         "compiled_span16": "compiler, exact on 16 key directions",
-         "compiled_span8_neg4": "compiler, 8 key directions + 4 near-miss directions fixed",
-         "compiled_span8_neg16": "compiler, 8 key directions + 16 near-miss directions fixed",
-         "compiled_span8_neg64": "compiler, 8 key directions + 64 near-miss directions fixed"}
+LABEL = {"vpd": "VPD subcomponent edit", "lora": "LoRA (the paper's fine-tune)",
+         "lora_hardneg": "LoRA, trained to spare other colons",
+         "vpd_at_hardneg": "VPD edit at the hard-negative LoRA's success", "rome": "ROME", "memit": "MEMIT",
+         "nullspace": "AlphaEdit (avoids directions common in text)", "contrast": "ROME, also avoiding other colons",
+         "specific_subcomponent": "most emoticon-specific VPD subcomponent",
+         "compiled_every_key": "our solver, exact on all 282 emoticon examples",
+         "compiled_span8": "our solver, exact on the 8 main emoticon patterns",
+         "compiled_span16": "our solver, exact on the 16 main emoticon patterns",
+         "compiled_span8_neg4": "our solver, 8 patterns, 4 other-colon patterns untouched",
+         "compiled_span8_neg16": "our solver, 8 patterns, 16 other-colon patterns untouched",
+         "compiled_span8_neg64": "our solver, 8 patterns, 64 other-colon patterns untouched"}
 
 
 def check(d, key, nm, metric="kl"):
