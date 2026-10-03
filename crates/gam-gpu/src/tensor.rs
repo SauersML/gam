@@ -729,6 +729,15 @@ impl Device {
     /// Per row, `KL(softmax(target) ‖ softmax(logits))` and, in place of `logits`, its cotangent
     /// `q − p`; a row whose `scored` flag is zero has zero of both. Returns the KL per row.
     pub fn kl_rows(&self, target: &Tensor, logits: &mut Tensor, scored: Option<&Indices>) -> Result<Vec<f64>, GpuError> {
+        self.kl_rows_impl(target, logits, scored, true)
+    }
+
+    /// Per-row KL without calculating a cotangent. `logits` is a scratch buffer, left unchanged.
+    pub fn kl_score_rows(&self, target: &Tensor, logits: &mut Tensor, scored: Option<&Indices>) -> Result<Vec<f64>, GpuError> {
+        self.kl_rows_impl(target, logits, scored, false)
+    }
+
+    fn kl_rows_impl(&self, target: &Tensor, logits: &mut Tensor, scored: Option<&Indices>, gradient: bool) -> Result<Vec<f64>, GpuError> {
         same(target, logits, "kl")?;
         if let Some(s) = scored
             && s.len != logits.rows
@@ -742,24 +751,35 @@ impl Device {
                 let mut kl = vec![0.0; logits.rows];
                 for (r, row) in host_mut(logits)?.chunks_mut(cols).enumerate() {
                     if flags.is_some_and(|f| f[r] == 0) {
-                        row.fill(0.0);
+                        if gradient {
+                            row.fill(0.0);
+                        }
                         continue;
                     }
-                    let p = host_softmax(&tv[r * cols..(r + 1) * cols]);
-                    let q = host_softmax(row);
+                    let teacher = &tv[r * cols..(r + 1) * cols];
+                    let (mt, st) = host_softmax_stats(teacher);
+                    let (mz, sz) = host_softmax_stats(row);
+                    let (lt, lz) = (st.ln(), sz.ln());
                     let mut total = 0.0;
                     for c in 0..cols {
-                        if p[c] > 0.0 {
-                            total += p[c] * (p[c].ln() - q[c].max(f64::MIN_POSITIVE).ln());
+                        let p = (teacher[c] - mt).exp() / st;
+                        // Keep the logarithms in shifted logit space: q can underflow even
+                        // though log(q), its KL contribution, and the derivative are finite.
+                        let log_p = (teacher[c] - mt) - lt;
+                        let log_q = (row[c] - mz) - lz;
+                        if p > 0.0 {
+                            total += p * (log_p - log_q);
                         }
-                        row[c] = q[c] - p[c];
+                        if gradient {
+                            row[c] = (row[c] - mz).exp() / sz - p;
+                        }
                     }
                     kl[r] = total;
                 }
                 Ok(kl)
             }
             #[cfg(target_os = "linux")]
-            Backend::Cuda(engine) => engine.kl_rows(target, logits, scored),
+            Backend::Cuda(engine) => engine.kl_rows(target, logits, scored, gradient),
         }
     }
 
@@ -868,6 +888,11 @@ fn host_softmax(z: &[f64]) -> Vec<f64> {
     let e: Vec<f64> = z.iter().map(|v| (v - m).exp()).collect();
     let total: f64 = e.iter().sum();
     e.into_iter().map(|v| v / total).collect()
+}
+
+fn host_softmax_stats(z: &[f64]) -> (f64, f64) {
+    let m = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    (m, z.iter().map(|v| (v - m).exp()).sum())
 }
 
 fn host_gemm(
@@ -1112,26 +1137,28 @@ __device__ void softmax_stats(const double* z, unsigned int cols, double* shared
 }
 
 extern "C" __global__ void kl_rows(unsigned int rows, unsigned int cols, const double* target, double* logits,
-                                   const unsigned int* scored, int use_scored, double* kl) {
+                                   const unsigned int* scored, int use_scored, int gradient, double* kl) {
     __shared__ double shared[BLOCK];
     unsigned int r = blockIdx.x;
     if (r >= rows) return;
     const double* t = target + (u64)r * cols;
     double* z = logits + (u64)r * cols;
     if (use_scored && scored[r] == 0) {
-        for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) z[c] = 0.0;
+        if (gradient) for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) z[c] = 0.0;
         if (threadIdx.x == 0) kl[r] = 0.0;
         return;
     }
     double mt, st, mz, sz;
     softmax_stats(t, cols, shared, &mt, &st);
     softmax_stats(z, cols, shared, &mz, &sz);
+    double lt = log(st), lz = log(sz);
     double acc = 0.0;
     for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) {
         double p = exp(t[c] - mt) / st;
-        double q = exp(z[c] - mz) / sz;
-        if (p > 0.0) acc += p * (log(p) - log(fmax(q, 2.2250738585072014e-308)));
-        z[c] = q - p;
+        double log_p = (t[c] - mt) - lt;
+        double log_q = (z[c] - mz) - lz;
+        if (p > 0.0) acc += p * (log_p - log_q);
+        if (gradient) z[c] = exp(z[c] - mz) / sz - p;
     }
     double total = block_sum(acc, shared);
     if (threadIdx.x == 0) kl[r] = total;
@@ -1591,12 +1618,13 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
             }
         }
 
-        pub(super) fn kl_rows(&self, target: &Tensor, logits: &mut Tensor, scored: Option<&Indices>) -> Result<Vec<f64>, GpuError> {
+        pub(super) fn kl_rows(&self, target: &Tensor, logits: &mut Tensor, scored: Option<&Indices>, gradient: bool) -> Result<Vec<f64>, GpuError> {
             let mut kl = self.zeros(logits.rows)?;
             let (rows, cols) = (logits.rows as u32, logits.cols as u32);
             let (flags, use_flags) = self.flags(scored)?;
             let f = self.function("kl_rows")?;
             let n_rows = logits.rows;
+            let gradient = i32::from(gradient);
             // SAFETY: one block per row of equal-shape buffers; `flags` has a flag per row when used.
             unsafe {
                 self.stream
@@ -1607,6 +1635,7 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
                     .arg(slice_mut(logits)?)
                     .arg(flags)
                     .arg(&use_flags)
+                    .arg(&gradient)
                     .arg(&mut kl)
                     .launch(cfg_rows(n_rows))
             }

@@ -185,14 +185,6 @@ impl FourierModAdd {
 /// The modular-addition answer.
 #[derive(Clone, Debug)]
 pub struct FourierModAddTruth {
-    /// The key frequencies `K`, increasing.
-    pub frequencies: Vec<usize>,
-    /// Phases per frequency, `J`.
-    pub phases: usize,
-    /// Each unit's module: the index of its frequency in `frequencies`.
-    pub unit_frequency: Vec<usize>,
-    /// Each module's read space, `2 × 4|K|` orthonormal rows: the sum `E_k(a) + E_k(b)`.
-    pub read_spaces: Vec<Array2<f64>>,
     /// A lower bound on the logit margin of `(a + b) mod p` over every other class and every
     /// pair, from the analysis in the module docs, before rounding.
     pub margin_floor: f64,
@@ -224,28 +216,10 @@ pub fn fourier_modadd(modulus: usize, frequencies: &[usize], phases: usize, seed
             w_out[[c, unit]] = (2.0 * phase(j) + angle(frequencies[k], c)).cos();
         }
     }
-    let half = std::f64::consts::FRAC_1_SQRT_2;
-    let read_spaces = (0..frequencies.len())
-        .map(|k| {
-            let mut rows = Array2::<f64>::zeros((2, 2 * width));
-            for (row, column) in [(0, 2 * k), (1, 2 * k + 1)] {
-                rows[[row, column]] = half;
-                rows[[row, width + column]] = half;
-            }
-            rows
-        })
-        .collect();
     let margin_floor = fourier_margin_floor(modulus, frequencies, phases);
-    let unit_frequency = units.iter().map(|&(k, _)| k).collect();
     (
         FourierModAdd { modulus, embedding, w_in, w_out },
-        FourierModAddTruth {
-            frequencies: frequencies.to_vec(),
-            phases,
-            unit_frequency,
-            read_spaces,
-            margin_floor,
-        },
+        FourierModAddTruth { margin_floor },
     )
 }
 

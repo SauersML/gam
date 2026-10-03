@@ -178,15 +178,8 @@ pub mod joint_operators;
 // The tensor registry: storage, aliases and use sites.
 pub mod lift;
 
-// Exact module splits of plain GELU/ReLU MLPs under the worst-case replacement contract, with certified eta.
-pub mod module_split;
-
 // The linear pass-through gauge GL(r) and the certified operator difference of two settings.
 pub mod gauge;
-
-// The planted known-answer toys against observability.
-#[cfg(test)]
-mod state_toys_tests;
 
 // The known-answer toys (induction, modular addition, residual MLPs) against the owners.
 #[cfg(test)]
@@ -212,9 +205,6 @@ pub mod llama_simple_mlp;
 
 // Exact two-endpoint finite-change operators: softmax and bilinear products.
 pub mod secant;
-
-// Residual-stream observability: readouts pulled back through declared steps into one Gramian.
-pub mod state;
 
 // Evidence status and ranked robust supports.
 pub mod supports;

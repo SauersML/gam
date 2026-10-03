@@ -1,20 +1,17 @@
 #![cfg(test)]
 //! The known-answer toys of `test_support::known_answer_toys` against the owners that can
 //! read their answers today: each toy computes its task, its written-down decomposition
-//! reproduces it, and the module split and the routing laws recover the planted structure. A decomposition engine is held to the same `*Truth` values.
+//! reproduces it, and the attention owners recover the planted routing structure. A decomposition engine is held to the same `*Truth` values.
 
 use crate::attention::AttentionExecution;
 use crate::joint_operators::{attention_letters, query_key_operators, routing_laws};
-use crate::module_split::MlpNormalForm;
-use crate::supports::EvidenceStatus;
 use crate::test_support::known_answer_toys::{
-    INDUCTION_VOCAB, RESID_FEATURES, RESID_WIDTH, ResidMlp, dyadic_features, fourier_modadd, induction_toy, repeated_sequence,
+    INDUCTION_VOCAB, RESID_FEATURES, ResidMlp, dyadic_features, fourier_modadd, induction_toy, repeated_sequence,
     resid_feature_duplicated, resid_mlp,
 };
 use crate::test_support::test_governor;
 use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
-use gam_math::gaussian_activation::GaussianActivation;
-use ndarray::{Array1, Array2, s};
+use ndarray::{Array2, s};
 use std::f64::consts::PI;
 
 const RESID_SEED: u64 = 0x2951_00a1;
@@ -62,42 +59,6 @@ fn resid_mlp_components_sum_to_the_weights_and_each_carries_one_feature() {
     }
 }
 
-/// The module split of each layer, with the residual as its skip, merges each duplicated
-/// feature's units and finds one module per feature, with every read resolved.
-#[test]
-fn resid_mlp_module_split_finds_one_module_per_feature() {
-    for layers in 1..=3 {
-        let (model, truth) = resid_mlp(layers, RESID_SEED + layers as u64);
-        for (layer, weights) in model.layers.iter().enumerate() {
-            let units = weights.w_in.nrows();
-            let form = MlpNormalForm::new(
-                GaussianActivation::Relu,
-                weights.w_in.view(),
-                Array1::zeros(units).view(),
-                weights.w_out.view(),
-                Array1::zeros(RESID_WIDTH).view(),
-                Some(Array2::<f64>::eye(RESID_WIDTH).view()),
-            )
-            .expect("normal form");
-            let features: Vec<_> = truth.components.iter().filter(|component| component.layer == layer).collect();
-            let mut merged: Vec<Vec<usize>> =
-                form.sources.iter().map(|sources| sources.iter().map(|source| source.unit).collect()).collect();
-            merged.iter_mut().for_each(|units| units.sort());
-            merged.sort();
-            let mut planted: Vec<Vec<usize>> = features.iter().map(|component| component.units.clone()).collect();
-            planted.sort();
-            assert_eq!(merged, planted, "{layers} layers, layer {layer}: one merged unit per feature");
-            assert!(form.sources.iter().flatten().all(|source| !source.negated));
-            let blocks = form.additive_blocks(test_governor()).expect("blocks");
-            assert!(matches!(blocks.rank, EvidenceStatus::Exact { .. }), "{layers} layers, layer {layer}");
-            assert_eq!(blocks.free_input_dimension, RESID_WIDTH - features.len());
-            assert_eq!(blocks.finest.len(), features.len(), "{layers} layers, layer {layer}");
-            assert!(blocks.finest.iter().all(|module| module.len() == 1));
-            assert_eq!(blocks.certified_pairs, 0);
-        }
-    }
-}
-
 const MODULUS: usize = 17;
 const KEY_FREQUENCIES: [usize; 3] = [2, 5, 6];
 const PHASES: usize = 9;
@@ -127,46 +88,6 @@ fn fourier_modadd_adds_every_pair() {
             );
         }
     }
-}
-
-/// The module split of the modular-addition layer is its frequencies: the finest blocks
-/// are the units of each key frequency, and each reads the sum `E_k(a) + E_k(b)`.
-#[test]
-fn fourier_modadd_modules_are_its_frequencies() {
-    let (model, truth) = fourier_modadd(MODULUS, &KEY_FREQUENCIES, PHASES, MODADD_SEED);
-    let units = model.w_in.nrows();
-    let form = MlpNormalForm::new(
-        GaussianActivation::Relu,
-        model.w_in.view(),
-        Array1::zeros(units).view(),
-        model.w_out.view(),
-        Array1::zeros(MODULUS).view(),
-        None,
-    )
-    .expect("normal form");
-    assert_eq!(form.sources.len(), units, "no two phase units merge for odd J");
-    let original = |merged: usize| form.sources[merged][0].unit;
-    let blocks = form.additive_blocks(test_governor()).expect("blocks");
-    let mut found: Vec<Vec<usize>> =
-        blocks.finest.iter().map(|module| module.iter().map(|&merged| original(merged)).collect()).collect();
-    found.iter_mut().for_each(|module| module.sort());
-    found.sort();
-    assert_eq!(truth.unit_frequency.len(), KEY_FREQUENCIES.len() * truth.phases);
-    assert_eq!(truth.frequencies, KEY_FREQUENCIES);
-    let mut planted = vec![Vec::new(); KEY_FREQUENCIES.len()];
-    for (unit, &module) in truth.unit_frequency.iter().enumerate() {
-        planted[module].push(unit);
-    }
-    planted.sort();
-    assert_eq!(found, planted);
-    // Each unit's read lies in its module's read space, exactly up to the cosines' rounding.
-    for (unit, &module) in truth.unit_frequency.iter().enumerate() {
-        let read = model.w_in.row(unit);
-        let inside = truth.read_spaces[module].dot(&read);
-        let residual = (read.dot(&read) - inside.dot(&inside)).abs();
-        assert!(residual <= 16.0 * UNIT_ROUNDOFF * (1.0 + 2.0 * PI), "unit {unit}: {residual:e}");
-    }
-    assert_eq!(blocks.free_input_dimension, 4 * KEY_FREQUENCIES.len() - 2 * KEY_FREQUENCIES.len());
 }
 
 /// Whether head `head` scores `key` above every other admissible key of `query` by `gap`:

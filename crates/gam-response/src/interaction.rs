@@ -83,15 +83,6 @@
 //! declared product law, which makes the terms orthogonal by independence and every index a sum
 //! of term energies. The carve reads observed codes. This module reads the block's response to a
 //! declared randomized intervention.
-//!
-//! # Contrast with the worst-case module split
-//!
-//! `gam_mpd::module_split` asks a different question of a plain GELU or ReLU MLP:
-//! whether `F(Px + (I−P)y) = QF(x) + (I−Q)F(y)` for all inputs, a sup-norm replacement contract
-//! with no law, splitting outputs as well as inputs, with the frame found from the weights' read
-//! and write spans instead of declared ports. Its certified `η` bounds the worst-case defect; the
-//! cross-block energy here is an L2 quantity under the declared law. Both read their blocks off
-//! the crate's one connected-components owner over the resolved edges.
 
 use std::collections::BTreeMap;
 use std::fmt;

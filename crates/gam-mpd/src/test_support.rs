@@ -22,33 +22,6 @@ pub fn hidden_basis(dimension: usize, seed: u64) -> Array2<f64> {
     q
 }
 
-/// Block-diagonal normal form: `[[c, -s], [s, c]]` per angle, then `negative_axes`
-/// entries `-1`, then `+1`.
-pub fn normal_form(dimension: usize, angles: &[f64], negative_axes: usize) -> Array2<f64> {
-    let mut form = Array2::<f64>::eye(dimension);
-    for (plane, &angle) in angles.iter().enumerate() {
-        let (sine, cosine) = angle.sin_cos();
-        let offset = 2 * plane;
-        form[[offset, offset]] = cosine;
-        form[[offset, offset + 1]] = -sine;
-        form[[offset + 1, offset]] = sine;
-        form[[offset + 1, offset + 1]] = cosine;
-    }
-    for axis in 0..negative_axes {
-        let index = 2 * angles.len() + axis;
-        form[[index, index]] = -1.0;
-    }
-    form
-}
-
-/// The planted matrix `W = Q B Q^T`. Plane `k` is basis columns `2k..2k + 2`, then the `-1`
-/// axes, then the fixed space.
-pub fn plant(dimension: usize, angles: &[f64], negative_axes: usize, seed: u64) -> Array2<f64> {
-    let basis = hidden_basis(dimension, seed);
-    let form = normal_form(dimension, angles, negative_axes);
-    basis.dot(&form).dot(&basis.t())
-}
-
 /// The ledger a test's kernels reserve on when the test does not assert on
 /// reservations: a private governor, so no test draws on or reads the process-wide
 /// ledger. Its budget, `2^34` bytes, is far above any fixture's footprint and far

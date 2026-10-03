@@ -49,6 +49,39 @@ fn accelerator() -> Option<Device> {
     Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault")
 }
 
+#[test]
+fn kl_remains_consistent_with_its_gradient_when_probabilities_underflow() {
+    let mut devices = vec![Device::host()];
+    devices.extend(accelerator());
+    for device in devices {
+        // The teacher assigns substantial mass to a class whose candidate probability underflows.
+        let target = ndarray::array![[0.0, 1.0], [0.0, -1000.0], [0.0, 1.0]];
+        let logits = ndarray::array![[0.0, -1000.0], [0.0, -1000.0], [0.0, -1000.0]];
+        let flags = device.upload_indices(&[1, 1, 0]).expect("flags");
+        let teacher = up(&device, &target);
+        let mut gradient = up(&device, &logits);
+        let kl = device.kl_rows(&teacher, &mut gradient, Some(&flags)).expect("kl");
+        let p = 1.0 / (1.0 + (-1.0_f64).exp());
+        let expected = p * (1000.0 + p.ln()) + (1.0 - p) * (1.0 - p).ln();
+        assert!((kl[0] - expected).abs() < 1e-10, "{}: {} against {expected}", device.name(), kl[0]);
+        assert_eq!(kl[1], 0.0, "identical distributions, including zero teacher mass");
+        assert_eq!(kl[2], 0.0, "unscored loss");
+        let gradient = down(&device, &gradient);
+        assert!((gradient[[0, 0]] - p).abs() < 1e-14);
+        assert!((gradient[[0, 1]] + p).abs() < 1e-14);
+        assert!(gradient.row(1).iter().chain(gradient.row(2).iter()).all(|g| *g == 0.0));
+        let step = 1e-3;
+        let mut losses = Vec::new();
+        for delta in [-step, step] {
+            let mut perturbed = logits.clone();
+            perturbed[[0, 1]] += delta;
+            losses.push(device.kl_rows(&teacher, &mut up(&device, &perturbed), Some(&flags)).expect("perturbed kl")[0]);
+        }
+        let numeric = (losses[1] - losses[0]) / (2.0 * step);
+        assert!((numeric - gradient[[0, 1]]).abs() < 1e-8, "loss derivative {numeric} disagrees with cotangent");
+    }
+}
+
 fn up(device: &Device, m: &Array2<f64>) -> Tensor {
     device.upload(m.view()).expect("upload")
 }
