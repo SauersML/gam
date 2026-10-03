@@ -21,13 +21,12 @@ best = lambda prefix: min((k for k in scr if k.startswith(prefix) and isinstance
                           key=lambda k: next((q["kl"] for q in scr[k] if q.get("target") == 0.985 and q.get("kl")), np.inf))
 SERIES = [  # (family key, label, colour, dashed)
     ("vpd", "VPD subcomponent edit", "#eb6834", False),
-    ("compiled_old", "our solver, exact on all 282 emoticon examples", "#e34948", True),
     (f"{best('spec')}", "most emoticon-specific VPD subcomponent", "#eda100", False),
     (best("contrast"), "ROME, also avoiding other colons", "#e87ba4", False),
     (best("null"), "AlphaEdit (avoids directions common in text)", "#4a3aa7", False),
     (best("memit"), "MEMIT", "#008300", False),
     ("rome+fisher", "ROME", "#1baf7a", False),
-    ("compiled_span8", "our solver, exact on the 8 main emoticon patterns", "#e34948", False),
+    ("compiled_span8", "least change to ordinary text, exact on emoticons", "#e34948", False),
 ]
 fig, ax = plt.subplots(figsize=(22, 11.5), dpi=150)
 fig.patch.set_facecolor(SURF)
@@ -78,7 +77,8 @@ print(OUT / "e4_methods_frontier.png")
 # ---------------------------------------------------------------- the full harness at equal edit success
 if (M / "table.json").exists():
     T = json.load(open(M / "table.json"))
-    keys = [k for k in sorted(T, key=lambda k: -T[k]["kl_all"][0]) if k != "vpd_at_hardneg"]
+    keys = [k for k in sorted(T, key=lambda k: -T[k]["kl_all"][0])
+            if k != "vpd_at_hardneg" and (k == "compiled_span8" or not k.startswith("compiled"))]
     COL = {"vpd": "#eb6834", "lora": "#2a78d6", "lora_hardneg": "#2a78d6"}
     panels = [("kl_all", "Disturbance of all held-out text", "KL from the original model (nats per word)", True),
               ("kl_spaced_colon", "After a colon that is not an emoticon", "KL from the original model (nats per word)", True),
@@ -128,7 +128,7 @@ if full.exists():
     pct = lambda p: f"{p:.0%}" if p >= 0.01 else "<1%"
     fig = plt.figure(figsize=(26, 15), dpi=140)
     fig.patch.set_facecolor(SURF)
-    fig.suptitle("Our solver's edit: the 20 most-changed positions in ordinary text", x=0.01, ha="left", y=0.985,
+    fig.suptitle("The least-change edit: its 20 most-changed positions in ordinary text", x=0.01, ha="left", y=0.985,
                  fontsize=30, fontweight="bold", color=INK)
     cols = [0.01, 0.5, 0.63, 0.79, 0.94]
     hy = 0.9
