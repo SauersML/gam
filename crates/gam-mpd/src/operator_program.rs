@@ -1224,6 +1224,32 @@ impl FamilyInputs {
     }
 }
 
+/// Whether `x` is at most one eighth nonzero: then [`sparse_abt`] reads fewer entries of `A` than
+/// a dense product multiplies.
+pub(crate) fn sparse_enough(x: &Array2<f64>) -> bool {
+    let nonzero = x.iter().filter(|v| **v != 0.0).count();
+    nonzero > 0 && 8 * nonzero <= x.len()
+}
+
+/// `x Aᵀ` over the nonzeros of `x` alone (a masked site's gated values, a few percent nonzero per
+/// row): each output column is `A`'s row against every row's nonzeros, so `A` is read once.
+/// Exact zeros add nothing; the sums run over the same products in another order.
+pub(crate) fn sparse_abt(x: &Array2<f64>, a: &Array2<f64>) -> Array2<f64> {
+    use rayon::prelude::*;
+    let rows = x.nrows();
+    let nonzeros: Vec<Vec<(usize, f64)>> = x
+        .outer_iter()
+        .map(|row| row.iter().enumerate().filter(|(_, v)| **v != 0.0).map(|(j, v)| (j, *v)).collect())
+        .collect();
+    let mut transposed = Array2::<f64>::zeros((a.nrows(), rows));
+    transposed.axis_iter_mut(Axis(0)).into_par_iter().zip(a.axis_iter(Axis(0))).for_each(|(mut column, weights)| {
+        for (r, entries) in nonzeros.iter().enumerate() {
+            column[r] = entries.iter().map(|(j, v)| weights[*j] * v).sum();
+        }
+    });
+    transposed.reversed_axes().as_standard_layout().into_owned()
+}
+
 /// Every node's value, and its error enclosure when bands were requested.
 ///
 /// A node's computed value `x̂` encloses the exact value as `x̂ + e_box + e_ball` per row, with
@@ -1707,6 +1733,52 @@ impl OperatorProgram {
             }
         }
         Ok(std::mem::replace(&mut top[node - from], Array2::zeros((0, 0))))
+    }
+
+    /// The unbanded trace of `inputs` when each gated node `(node, mask)` is read only through its
+    /// elementwise product with the 0/1 mask node `mask` (an earlier node): such a node is evaluated
+    /// at its mask's nonzero entries alone, each a dot product of its dense terms' rows with their
+    /// arguments, and is exactly zero elsewhere, which no reader sees. Every other node's value is
+    /// [`OperatorProgram::execute`]'s; a gated node of another form is evaluated whole.
+    pub fn execute_gated(&self, inputs: &FamilyInputs, gated: &[(usize, usize)]) -> Result<Trace, ProgramError> {
+        use rayon::prelude::*;
+        self.check_inputs(inputs)?;
+        let interfaces = self.interfaces()?;
+        let ones = vec![1.0; self.declarations.parameters];
+        let frame = Frame { args: &[], parameters: &ones, nodes: &self.nodes, output: self.output };
+        let mut top: Vec<Array2<f64>> = Vec::with_capacity(self.nodes.len());
+        for (index, node) in self.nodes.iter().enumerate() {
+            let mask = gated.iter().find(|(n, _)| *n == index).map(|(_, m)| *m).filter(|m| *m < index);
+            let dense_terms = match node {
+                Node::Affine { terms, bias: None } => terms
+                    .iter()
+                    .map(|(argument, op)| match &self.operators[*op].body {
+                        OperatorBody::Dense { values, .. } if !matches!(self.nodes[*argument], Node::Feature { .. }) => Some((*argument, values)),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>(),
+                _ => None,
+            };
+            let value = match (mask, dense_terms) {
+                (Some(mask), Some(terms)) => {
+                    let width = interfaces[index].width();
+                    let gate = &top[mask];
+                    let mut out = Array2::<f64>::zeros((inputs.rows, width));
+                    out.axis_iter_mut(Axis(0)).into_par_iter().enumerate().for_each(|(r, mut row)| {
+                        for c in (0..width).filter(|c| gate[[r, *c]] != 0.0) {
+                            row[c] = terms.iter().map(|(argument, a)| a.row(c).dot(&top[*argument].row(r))).sum();
+                        }
+                    });
+                    out
+                }
+                _ => {
+                    let values = Layered { base: &[], top: &top, from: 0, patch: None };
+                    self.evaluate_node(index, node, inputs, &values, None, &interfaces, &frame)?.0
+                }
+            };
+            top.push(value);
+        }
+        Ok(Trace { values: top, bands: None, balls: None })
     }
 
     /// The unbanded output of this program, which differs from `base_program` only in operator
@@ -2515,6 +2587,7 @@ impl OperatorProgram {
                             let diagonal = op.diagonal();
                             match &diagonal {
                                 Some(d) => out += &(x * d),
+                                None if sparse_enough(x) => out += &sparse_abt(x, a),
                                 None => {
                                     // A column of `x` zero on every row adds nothing, so only the
                                     // live columns enter the product (a masked site's gated

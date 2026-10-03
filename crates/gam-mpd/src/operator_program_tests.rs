@@ -581,3 +581,28 @@ fn a_rule_is_sent_once_and_executes_at_each_call_and_a_gain_reads_the_declared_p
     let account = program.code_account().expect("account");
     assert_eq!(account.operator_bits.iter().map(|(_, r)| r).sum::<u64>(), real_bits);
 }
+
+/// A mostly-zero argument's product over its nonzeros is the dense product's, within the float64
+/// summation bound of the same products in another order (`2 γ_{k}` of `|x| |A|ᵀ`).
+#[test]
+fn a_sparse_arguments_product_is_the_dense_one() {
+    use super::operator_program::{sparse_abt, sparse_enough};
+    let noise = |seed: usize| {
+        let mut v = (seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
+        v ^= v >> 33;
+        v = v.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        v ^= v >> 33;
+        (v >> 11) as f64 / (1u64 << 52) as f64 - 1.0
+    };
+    let (rows, inner, outer) = (37, 400, 23);
+    let x = Array2::from_shape_fn((rows, inner), |(r, c)| if noise(r * inner + c) > 0.9 { noise(7 + r * inner + c) } else { 0.0 });
+    let a = Array2::from_shape_fn((outer, inner), |(o, c)| noise(100_000 + o * inner + c));
+    assert!(sparse_enough(&x));
+    let (sparse, dense) = (sparse_abt(&x, &a), x.dot(&a.t()));
+    let magnitude = x.mapv(f64::abs).dot(&a.mapv(f64::abs).t());
+    let k = inner as f64 * f64::EPSILON / 2.0;
+    for ((s, d), m) in sparse.iter().zip(dense.iter()).zip(magnitude.iter()) {
+        assert!((s - d).abs() <= 2.0 * k / (1.0 - k) * m, "{s} against {d}");
+    }
+    assert!(!sparse_enough(&Array2::ones((3, 3))));
+}

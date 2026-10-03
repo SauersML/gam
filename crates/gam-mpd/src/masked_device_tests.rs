@@ -392,3 +392,94 @@ fn a_batched_adversary_on_a_device_finds_each_boxs_points() {
         }
     }
 }
+
+/// A forward whose sites' `z` are evaluated at their masks' nonzeros alone gives the whole
+/// forward's logits within its float64 bands, and every value no `z` feeds unchanged.
+#[test]
+fn a_gated_forward_scores_as_the_whole_forward() {
+    let (masked, base, _, _) = masked_fixture();
+    let masks: Vec<Array2<f64>> = masked
+        .all_pieces()
+        .iter()
+        .enumerate()
+        .map(|(k, p)| Array2::from_shape_fn((base.rows, *p), |(r, c)| if noise(900 * k + 13 * r + c) > 0.5 { 1.0 } else { 0.0 }))
+        .collect();
+    let family = masked.family(&base, &masks);
+    let whole = masked.program.execute(&family, true).expect("whole");
+    let gated = masked.program.execute_gated(&family, &masked.gates()).expect("gated");
+    assert_eq!(masked.gates().len(), masked.sites.len());
+    let output = masked.program.output;
+    let (bands, balls) = (whole.bands.as_ref().expect("bands"), whole.balls.as_ref().expect("balls"));
+    for ((r, c), v) in gated.values[output].indexed_iter() {
+        let band = bands[output][[r, c]] + balls[output][r];
+        assert!((v - whole.values[output][[r, c]]).abs() <= 2.0 * band, "logit ({r},{c})");
+    }
+    for (z, mask) in masked.gates() {
+        for ((r, c), m) in gated.values[mask].indexed_iter() {
+            if *m == 0.0 {
+                assert_eq!(gated.values[z][[r, c]], 0.0);
+            }
+        }
+    }
+}
+
+/// On the Apple GPU (`masked_device`'s module note: f32 throughout, its twin never decides) the
+/// masked forward and its reverse pass agree with the CPU's within the f32 proposal band, `(w + 2)
+/// 2⁻²⁴` of the largest entry (`device_program_tests`), the one the CUDA path's f32 proposals are
+/// held to; the logits per row of their largest entry, and the KL within twice the logits' band
+/// (its gradient in the logits has `ℓ₁` norm at most 2) plus the f32 evaluation's own rounding. The
+/// CPU's float64 bands scaled to f32 (first order in the unit roundoff, `2⁻⁵³` there and `2⁻²⁴`
+/// here, with each product's operand rounding at most as many units again: `2 · 2²⁹` times band
+/// plus ball) are a rigorous but much wider bound on the logits, checked as well.
+#[test]
+fn the_masked_program_on_the_apple_gpu_matches_the_cpu_in_f32_bands() {
+    use gam_gpu::tensor::Device;
+    let Some(metal) = Device::single_precision(gam_gpu::GpuPolicy::Auto).expect("a probe that does not fault").filter(|d| !d.float64()) else { return };
+    const SCALE: f64 = 2.0 * (1u64 << 29) as f64;
+    const UNIT: f64 = 1.0 / 16_777_216.0;
+    let (masked, base, masks, clean) = masked_fixture();
+    let family = masked.family(&base, &masks);
+    let banded = masked.program.execute(&family, true).expect("banded");
+    let output = masked.program.output;
+    let (bands, balls) = (&banded.bands.as_ref().expect("bands")[output], &banded.balls.as_ref().expect("balls")[output]);
+    assert!(Accelerated::new(&metal, &masked, Arithmetic::F64).is_err(), "float64 proposals are refused");
+    let accelerated = Accelerated::new(&metal, &masked, Arithmetic::F32).expect("lowered");
+    assert!(!accelerated.decides());
+    let widest = 16;
+    let proposal = (widest + 2) as f64 * UNIT;
+    for target in targets(&clean) {
+        let (kl, trace, cotangent) = masked::forward(&masked, &family, &target).expect("cpu forward");
+        let mask_gradients = masked::mask_gradients(&masked, &family, &trace, cotangent.clone()).expect("cpu mask gradients");
+        let gradients = masked::gradients(&masked, &family, &trace, &masks, cotangent).expect("cpu gradients");
+        let on_device = accelerated.target(&target).expect("target");
+        let state = accelerated.forward(&family, &on_device).expect("metal forward");
+        let logits = accelerated.program().logits(&state.trace, 0, family.rows).expect("logits");
+        let cpu = &trace.values[output];
+        for r in 0..family.rows {
+            let size = cpu.row(r).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+            for c in 0..cpu.ncols() {
+                let (v, w) = (logits[[r, c]], cpu[[r, c]]);
+                assert!((v - w).abs() <= SCALE * (bands[[r, c]] + balls[r]), "logit ({r},{c}) outside the scaled float64 band");
+                assert!((v - w).abs() <= proposal * size, "logit ({r},{c}): {v} against {w} (band {:e})", proposal * size);
+            }
+            if !target.scores(r) {
+                assert_eq!(state.kl[r], 0.0, "an unscored row has no KL");
+                continue;
+            }
+            let (p, q) = (softmax(target.logits.row(r)), softmax(cpu.row(r)));
+            let zmax = target.logits.row(r).iter().fold(size, |m, v| m.max(v.abs()));
+            let terms: f64 = p.iter().zip(q.iter()).map(|(a, b)| a * (a.ln().abs() + b.ln().abs() + 2.0 * zmax + 1.0)).sum();
+            let n = (clean.ncols() + 16) as f64;
+            let band = 2.0 * proposal * size + (4.0 * UNIT * zmax + n * UNIT / (1.0 - n * UNIT)) * terms;
+            assert!((state.kl[r] - kl[r]).abs() <= band, "KL of row {r}: {} against {} (band {band:e})", state.kl[r], kl[r]);
+        }
+        for (k, g) in accelerated.mask_gradients(&masked, &state).expect("metal mask gradients").iter().enumerate() {
+            assert_proposal(&format!("Metal mask gradient of site {k}"), g, &mask_gradients[k], widest);
+        }
+        for (k, (m, v, u)) in accelerated.gradients(&masked, &state, &masks).expect("metal gradients").iter().enumerate() {
+            assert_proposal(&format!("Metal mask gradient of site {k}"), m, &gradients[k].0, widest);
+            assert_proposal(&format!("Metal V gradient of site {k}"), v, &gradients[k].1, family.rows);
+            assert_proposal(&format!("Metal U gradient of site {k}"), u, &gradients[k].2, family.rows);
+        }
+    }
+}

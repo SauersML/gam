@@ -150,6 +150,25 @@ fn main() -> Result<(), String> {
     let started = std::time::Instant::now();
     let mut banding = 0.0;
     let margins = args.get(9).is_none_or(|v| v != "time");
+    // The forward a selection's trials take, whole and with each site's `z` at its mask's nonzeros.
+    let start_family = masked.family(family, &masks);
+    let timed = |gated: bool| -> Result<f64, String> {
+        let mut seconds = Vec::new();
+        for _ in 0..3 {
+            let clock = std::time::Instant::now();
+            if gated {
+                masked.program.execute_gated(&start_family, &masked.gates()).map_err(|e| e.to_string())?;
+            } else {
+                masked.program.execute(&start_family, false).map_err(|e| e.to_string())?;
+            }
+            seconds.push(clock.elapsed().as_secs_f64());
+        }
+        seconds.sort_by(f64::total_cmp);
+        Ok(seconds[1])
+    };
+    let density = masks.iter().map(|m| m.iter().filter(|v| **v != 0.0).count()).sum::<usize>() as f64 / masks.iter().map(|m| m.len()).sum::<usize>() as f64;
+    eprintln!("forward {:.3}s, gated {:.3}s, mask density {density:.4}", timed(false)?, timed(true)?);
+    drop(start_family);
     let mut observe = |round: &Round<'_>| -> Result<(), String> {
         if !margins {
             return Ok(());
