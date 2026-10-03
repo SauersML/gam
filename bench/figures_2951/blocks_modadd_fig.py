@@ -9,6 +9,7 @@ import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.patches import Patch
 
 result = json.load(open(sys.argv[1]))
 out = sys.argv[2]
@@ -42,14 +43,12 @@ for yi, (key, label) in zip(y, order):
     ax.text(ran + kl, yi, f"  {ran + kl:,.0f}   KL {p['kl']:.2f}, {p['active_rank_one_equivalents_per_word']:.1f} directions on",
             va="center", fontsize=14, color=INK)
 ax.set_yticks(y, [label for _, label in order], fontsize=15)
-ax.set_xscale("log")
-ax.set_xlabel("bits per word (log scale)")
+ax.set_xlabel("bits per word")
 ax.set_title("The code of each explanation", loc="left", fontsize=20, pad=14)
-ax.barh([], [], color=RAN_COLOR, label="the weights that ran")
-ax.barh([], [], color=KL_COLOR, label="n·KL / ln 2")
-ax.legend(frameon=False, loc="lower right", fontsize=14)
+ax.legend(handles=[Patch(color=RAN_COLOR, label="the weights that ran"), Patch(color=KL_COLOR, label="n·KL / ln 2")],
+          frameon=False, loc="lower right", fontsize=14)
 xmax = max(points[k]["bits_per_word"] for k, _ in order)
-ax.set_xlim(right=xmax * 40)
+ax.set_xlim(0, xmax * 1.9)
 
 # The multi-direction blocks the code chose, by frequency.
 blocks = [b for b in result["blocks"] if b["rank"] >= 2 and b["firing"] > 0]
@@ -73,6 +72,10 @@ if blocks:
         ax2.set_xlabel("frequency (share of the block's energy)")
         for spine in ax2.spines.values():
             spine.set_visible(False)
+    else:
+        ax2.axis("off")
+else:
+    ax2.axis("off")
 ax2.set_title("Blocks of rank 2 or more", loc="left", fontsize=20, pad=14)
 fig.suptitle(f"Mod-31 addition: one gate per rank-k block (n = {result['observations']:g})", x=0.02, ha="left", fontsize=24)
 fig.savefig(out, facecolor="white")
