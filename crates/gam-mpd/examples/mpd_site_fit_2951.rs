@@ -122,7 +122,10 @@ fn main() -> Result<(), String> {
         })?;
         write_f64(&v_path, &library.v)?;
         write_f64(&u_path, &library.u)?;
-        eprintln!("{}: {} subcomponents written, {:.0}s", site.name, library.v.nrows(), started.elapsed().as_secs_f64());
+        // What all on leaves of the map, in the reads' second moment M: ‖(W − Σ u vᵀ) M^½‖ / ‖W M^½‖.
+        let weighted = |e: &Array2<f64>| (&e.dot(&sample.second_moment) * e).sum().sqrt();
+        let left = weighted(&(w - &library.u.t().dot(&library.v))) / weighted(w);
+        eprintln!("{}: {} subcomponents written, all on leaves {left:.2e} of the map, {:.0}s", site.name, library.v.nrows(), started.elapsed().as_secs_f64());
     }
     Ok(())
 }

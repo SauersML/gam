@@ -33,19 +33,24 @@
 //! * **Sets.** Each input's on-set by single flips, a flip kept when it lowers the input's code
 //!   (both points tracked exactly through `K = U F Uᵀ`), swept until no flip pays.
 //! * **Writes.** With the sets and each input's worst point fixed the code is a quadratic in `U`
-//!   whose metric `F` factors out, solved in closed form, `U = Q⁺ R`, `Q = Σ_t s_t z̃_t z̃_tᵀ +
-//!   1/12 diag(Σ_t s_t ν_t ⊙ a_t²)`, `R = Σ_t s_t z̃_t y_tᵀ`, with `z̃ = μ ⊙ a`, `μ` one on, one half
-//!   off at an input charged its expectation (zero at one charged its corner), `ν` its off
-//!   indicator there; the step toward it is halved until the code (each input at its worse point)
-//!   falls.
+//!   whose metric `F` factors out, `tr F (UᵀQU − 2UᵀR)`, with `Q = Σ_t s_t z̃_t z̃_tᵀ + 1/12
+//!   diag(Σ_t s_t ν_t ⊙ a_t²)`, `R = Σ_t s_t z̃_t y_tᵀ`, `z̃ = μ ⊙ a`, `μ` one on, one half off at an
+//!   input charged its expectation (zero at one charged its corner), `ν` its off indicator there.
+//!   Every subcomponent on is the map exactly on the reads' span (all but `10⁻⁶` of their second
+//!   moment, as the masked program restricts its reads), `Uᵀ V E√Λ = W E√Λ`, so an input the fit
+//!   never saw is still carried by the off subcomponents it leaves. With `V E√Λ = P S Gᵀ` (full
+//!   `P`) every such `U` is `U₀ + N Z`, `U₀ = P₁ S⁻¹ Gᵀ (W E√Λ)ᵀ` and `N` the columns of `P` past
+//!   its rank, and the code fixes `Z` by `(NᵀQN) Z = Nᵀ(R − Q U₀)`; the step toward that minimiser
+//!   is halved until the code (each input at its worse point) falls.
 //! * **Reads.** With `U` and the sets fixed, each input's two points are quadratics in `V`. The
 //!   step is the charged points' preconditioned negative gradient (left by each subcomponent's own
-//!   curvature, right by the inputs' sensitivity-weighted second moment), its length the one of
-//!   least code among a geometric ladder around the quadratic's minimiser: along a line every
-//!   input's scalars are quadratics in the length, so one pass measures the whole ladder.
-//! * **Reseeding.** A subcomponent that runs on no input is replaced by one that would explain the
-//!   input of largest error: its read the input's own direction in the reads' inverse second
-//!   moment, its write that input's residual.
+//!   curvature, right by the inputs' sensitivity-weighted second moment) restricted to the moves
+//!   that keep the map, `Uᵀ D = 0`, its length the one of least code among a geometric ladder
+//!   around the quadratic's minimiser: along a line every input's scalars are quadratics in the
+//!   length, so one pass measures the whole ladder.
+//! * **Reseeding.** A subcomponent that runs on no input is replaced by one reading the input of
+//!   largest error (its direction in the reads' inverse second moment), the writes solved again;
+//!   kept when the sets selected with it code the inputs in fewer bits.
 //!
 //! The fit stops when a round (sets, writes, reads) saves less than one bit per input, or at
 //! `rounds`. Every product over inputs runs in single precision (the fit only proposes a library;
@@ -53,7 +58,7 @@
 //! single-precision band of their sums, `√T 2⁻²⁴` of the largest.
 
 use super::blocks::Describe;
-use super::dense::eigh;
+use super::dense::{eigh, svd};
 use super::derivatives::vjp;
 use super::device::proposing;
 use super::masked::{Library, Site, Target, read_values, sampled_label_cotangent};
@@ -157,6 +162,9 @@ pub struct Round {
     pub read_steps: usize,
 }
 
+/// The share of the reads' second moment left out of their span (the masked driver's).
+const LEFT_OUT: f64 = 1e-6;
+
 /// Rows per chunk of the products over inputs.
 const CHUNK: usize = 2048;
 
@@ -187,8 +195,14 @@ fn single(m: &Array2<f64>) -> Array2<f32> {
 }
 
 /// The pseudo-inverse of a symmetric positive semidefinite matrix summed in single precision over
-/// `terms` inputs: eigenvalues within `√terms · 2⁻²⁴` of the largest are dropped.
+/// `terms` inputs: eigenvalues within `√terms · 2⁻²⁴` of `scale` (its largest when `None`, else the
+/// matrix it was projected from) are dropped; with `terms` zero, a matrix formed in float64, only
+/// its decomposition's band.
 fn pseudo_inverse(m: &Array2<f64>, terms: usize) -> Result<Array2<f64>, String> {
+    pseudo_inverse_of(m, terms, None)
+}
+
+fn pseudo_inverse_of(m: &Array2<f64>, terms: usize, scale: Option<f64>) -> Result<Array2<f64>, String> {
     let mut sym = m.clone();
     let n = sym.nrows();
     for i in 0..n {
@@ -199,7 +213,7 @@ fn pseudo_inverse(m: &Array2<f64>, terms: usize) -> Result<Array2<f64>, String> 
         }
     }
     let d = eigh(sym.view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
-    let largest = d.values.iter().fold(0.0_f64, |m, l| m.max(*l));
+    let largest = scale.unwrap_or_else(|| d.values.iter().fold(0.0_f64, |m, l| m.max(*l)));
     let floor = (largest * (terms as f64).sqrt() * f64::from(f32::EPSILON) / 2.0).max(d.band);
     let mut scaled = d.vectors.clone();
     for (k, l) in d.values.iter().enumerate() {
@@ -212,6 +226,13 @@ fn pseudo_inverse(m: &Array2<f64>, terms: usize) -> Result<Array2<f64>, String> 
 /// The per-input state of a fit: the sets and which point each input is charged.
 struct Fitting<'a> {
     x: &'a Array2<f32>,
+    /// The site's map, `d_out × d_in`: every subcomponent on is exactly it on the reads' span.
+    w: Array2<f64>,
+    /// The reads' span (all but [`LEFT_OUT`] of their second moment), each direction scaled by
+    /// its root second moment: `d_in × r`.
+    span: Array2<f64>,
+    /// `E Λ⁻¹ Eᵀ` on that span: a read seeded from an input is its direction in it.
+    seeding: Array2<f64>,
     /// `y = x Wᵀ`, inputs × d_out.
     y: Array2<f32>,
     /// `yᵀ F y` per input.
@@ -388,7 +409,20 @@ impl Fitting<'_> {
         for c in 0..c_total {
             q[[c, c]] += own[c] / 12.0;
         }
-        Ok(pseudo_inverse(&q, self.rows())?.dot(&r32.mapv(f64::from)))
+        // The minimiser under `Uᵀ V = W`: with `V = P S Gᵀ` (full `P`), every exact `U` is
+        // `U₀ + N Z`, `U₀ = P₁ S⁻¹ Gᵀ Wᵀ` and `N` the columns of `P` past `V`'s rank; the code then
+        // fixes `Z` by `(NᵀQN) Z = Nᵀ(R − Q U₀)`.
+        // On the reads' span (`x = E√Λ ξ`) the constraint is `Uᵀ (V E√Λ) = W E√Λ`.
+        let decomposed = svd(v.dot(&self.span).view(), true).map_err(|e| format!("{e:?}"))?;
+        let rank = decomposed.singular_values.iter().filter(|s| **s > decomposed.band).count();
+        let p1 = decomposed.u.slice(s![.., ..rank]);
+        let inverse = Array1::from_iter(decomposed.singular_values.iter().take(rank).map(|s| 1.0 / s));
+        let particular = (&p1 * &inverse).dot(&decomposed.vt.slice(s![..rank, ..])).dot(&self.w.dot(&self.span).t());
+        let null = decomposed.u.slice(s![.., rank..]);
+        let rhs = r32.mapv(f64::from) - q.dot(&particular);
+        // `NᵀQN` is resolved only as far as `Q` itself is: its band is `Q`'s (bounded by its trace).
+        let z = pseudo_inverse_of(&null.t().dot(&q).dot(&null), self.rows(), Some(q.diag().sum()))?.dot(&null.t().dot(&rhs));
+        Ok(particular + null.dot(&z))
     }
 
     /// Per input, `μ` and `ν ⊙ κ` over a chunk.
@@ -457,7 +491,7 @@ impl Fitting<'_> {
 
     /// The reads' step (module note): the preconditioned negative gradient of the charged points'
     /// quadratic in `V`, and the length minimising that quadratic along it (`None` when it is flat).
-    fn read_step(&self, v: &Array2<f64>, u: &Array2<f64>, right: &Array2<f64>) -> Option<(Array2<f64>, f64)> {
+    fn read_step(&self, v: &Array2<f64>, u: &Array2<f64>, right: &Array2<f64>) -> Result<Option<(Array2<f64>, f64)>, String> {
         let k = u.dot(self.fisher).dot(&u.t());
         let k32 = single(&k);
         let kappa: Vec<f64> = (0..self.pieces).map(|c| k[[c, c]]).collect();
@@ -475,9 +509,12 @@ impl Fitting<'_> {
             let l = left[c];
             row.mapv_inplace(|x| if l > 0.0 { x / l } else { 0.0 });
         }
+        // Only the moves that keep every subcomponent on the map, `Uᵀ D = 0`.
+        let along = u.t().dot(&direction);
+        let direction = &direction - &u.dot(&pseudo_inverse(&u.t().dot(u), 0)?.dot(&along));
         let slope = -(&gradient * &direction).sum();
         let quadratic = self.read_curvature(&direction, &k32, &kappa);
-        (slope > 0.0 && quadratic > 0.0).then(|| (direction, slope / quadratic))
+        Ok((slope > 0.0 && quadratic > 0.0).then(|| (direction, slope / quadratic)))
     }
 
     /// The error bits of `v + η d` for every `η` of `lengths`, the sets held: each input's four
@@ -564,8 +601,29 @@ impl<'a> Fitting<'a> {
         let y = product(x.view(), false, single(w).view(), true);
         let yf = product(y.view(), false, single(&samples.fisher).view(), false);
         let yfy: Vec<f64> = (0..rows).map(|t| y.row(t).iter().zip(yf.row(t).iter()).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum()).collect();
+        // The reads' span, as the masked program restricts its reads (`Masked::project_reads`).
+        let moment = eigh(samples.second_moment.view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
+        let total: f64 = moment.values.iter().map(|l| l.max(0.0)).sum();
+        let mut order: Vec<usize> = (0..moment.values.len()).collect();
+        order.sort_by(|a, b| moment.values[*b].total_cmp(&moment.values[*a]));
+        let mut kept = Vec::new();
+        let mut held = 0.0;
+        for &i in &order {
+            if held >= (1.0 - LEFT_OUT) * total || moment.values[i] <= moment.band {
+                break;
+            }
+            held += moment.values[i];
+            kept.push(i);
+        }
+        let basis = moment.vectors.select(Axis(1), &kept);
+        let roots = Array1::from_iter(kept.iter().map(|&i| moment.values[i].sqrt()));
+        let span = &basis * &roots;
+        let seeding = (&basis / &roots.mapv(|r| r * r)).dot(&basis.t());
         Ok(Self {
             x,
+            w: w.clone(),
+            span,
+            seeding,
             y,
             yfy,
             s: &samples.sensitivity,
@@ -625,9 +683,10 @@ pub fn fit(
     let x = &samples.reads;
     let rows = x.nrows();
     let mut fitting = Fitting::new(site, w, samples, observations, pieces)?;
-    // The reads' inverse second moment (seeding) and the sensitivity-weighted one (the reads'
-    // right preconditioner).
-    let seeding = pseudo_inverse(&samples.second_moment, rows)?;
+    // The reads' inverse second moment on their span (seeding) and the sensitivity-weighted one
+    // (the reads' right preconditioner).
+    let seeding = fitting.seeding.clone();
+
     let weighted = {
         let scaled = Array2::from_shape_fn(x.dim(), |(t, i)| (f64::from(x[[t, i]]) * samples.sensitivity[t].sqrt()) as f32);
         product(scaled.view(), true, scaled.view(), false).mapv(f64::from) / samples.sensitivity.sum().max(f64::MIN_POSITIVE)
@@ -658,6 +717,16 @@ pub fn fit(
     for c in given..pieces {
         v.row_mut(c).assign(&seed_read(draw(rows)));
     }
+    // The reads span the inputs' span, so every subcomponent on can be the map: the directions
+    // the seeds leave out (in the whitened reads) replace the last seeds.
+    let covered = svd(v.dot(&fitting.span).view(), false).map_err(|e| format!("{e:?}"))?;
+    let rank = covered.singular_values.iter().filter(|s| **s > covered.band).count();
+    let unwhiten = seeding.dot(&fitting.span);
+    for (k, i) in (rank..covered.vt.nrows()).enumerate() {
+        if k + given < pieces {
+            v.row_mut(pieces - 1 - k).assign(&unwhiten.dot(&covered.vt.row(i)));
+        }
+    }
     // Every subcomponent on: the writes that make the library the map on these inputs.
     let mut u = fitting.writes(&v)?;
     let mut bits = description_bits(describe, site, &v, &u)?;
@@ -685,7 +754,7 @@ pub fn fit(
         }
         // The reads: along the preconditioned step, the length of least code among the quadratic's
         // minimiser times every power of √2 from 2⁻³² to 2⁴, all measured in one pass.
-        if let Some((direction, alpha)) = fitting.read_step(&v, &u, &right) {
+        if let Some((direction, alpha)) = fitting.read_step(&v, &u, &right)? {
             let mut lengths = vec![0.0];
             lengths.extend((-64..=8).map(|k| alpha * 2f64.powf(f64::from(k) / 2.0)));
             let profile = fitting.read_profile(&v, &u, &direction, &lengths);
@@ -707,23 +776,11 @@ pub fn fit(
             order.sort_by(|a, b| errors[*b].total_cmp(&errors[*a]));
             let mut reseeded = 0;
             for (&c, &t) in dead.iter().zip(&order) {
-                let read = seed_read(t);
-                let xt = x.row(t).mapv(f64::from);
-                let a = read.dot(&xt);
-                if a.abs() <= 0.0 {
-                    continue;
-                }
-                // The input's residual under its sets.
-                let mut residual = w.dot(&xt);
-                for j in 0..pieces {
-                    if fitting.masks[t * pieces + j] == 1 {
-                        residual.scaled_add(-v.row(j).dot(&xt), &u.row(j));
-                    }
-                }
-                v.row_mut(c).assign(&read);
-                u.row_mut(c).assign(&(residual / a));
+                v.row_mut(c).assign(&seed_read(t));
                 reseeded += 1;
             }
+            // The writes again, so every subcomponent on stays the map.
+            u = fitting.writes(&v)?;
             bits = description_bits(describe, site, &v, &u)?;
             let (d, e, _) = fitting.code(&v, &u, &bits, true, true);
             if d + e < current {
