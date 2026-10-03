@@ -269,6 +269,24 @@ class LM:
                 out.append(-lp / math.log(2))
             return torch.cat(out, 1)
 
+    def paraphrase(self, texts: list[str], batch: int = 64) -> list[str]:
+        """Each text rewritten in other words by the instruct model (greedy, one line)."""
+        torch = self.torch
+        self.tok.padding_side = "left"
+        out = []
+        for b in range(0, len(texts), batch):
+            prompts = [self.tok.apply_chat_template(
+                [{"role": "user", "content": "Rewrite this short label of a neural-network mechanism in different words, keeping its "
+                  f"meaning and every quoted token. Reply with the rewrite only, one line.\nLabel: {t}"}],
+                tokenize=False, add_generation_prompt=True) for t in texts[b:b + batch]]
+            enc = self.tok(prompts, return_tensors="pt", padding=True).to(device())
+            with torch.no_grad():
+                gen = self.model.generate(**enc, max_new_tokens=48, do_sample=False)
+            for g in gen[:, enc["input_ids"].shape[1]:]:
+                out.append(self.tok.decode(g, skip_special_tokens=True).strip().split("\n")[0].replace(";", ","))
+            print(f"paraphrased {len(out)}/{len(texts)}", flush=True)
+        return out
+
     def line_bits(self, lines: list[str], window: int = 2048, header: str = HEADER, sep: str = "\n") -> np.ndarray:
         """Bits of each line (its text and its newline) given the header and the lines before it,
         scored in windows of `window` tokens that overlap by half (each token scored once, with at
@@ -514,6 +532,93 @@ def stage_bits():
     json.dump({"item_bits": item_bits, "levels": levels}, open(OUT / "text_bits.json", "w"))
 
 
+def stage_controls():
+    """Leakage controls at the headline n.
+
+    token       the context-only decoder: it reads the input word itself (no description) and
+                turns on what usually runs on that word in the train rows (each subcomponent on
+                at more than half of the word's train occurrences). Its text is the word.
+    shuffled    the same items in a random order: the lookup decoder is order-blind by
+                construction, so only the text bits can change.
+    paraphrase  every item label rewritten by Qwen2.5-1.5B-Instruct; the decoder maps each
+                rewritten item to the nearest label of the whole vocabulary (character-trigram
+                tf-idf cosine), so the program survives only if the words carry it."""
+    import scipy.sparse as sp
+
+    z, indptr, indices, offsets, names = sets()
+    it = json.load(open(OUT / "items.json"))
+    tb = json.load(open(OUT / "text_bits.json"))
+    head = tb["levels"][str(N_REPORT)]
+    words = TEXT_ROWS * CONTEXT
+    # token-only decoder
+    ids = z["ids"]
+    occ, fire = Counter(), Counter()
+    for t in range(TRAIN[0] * CONTEXT, TRAIN[1] * CONTEXT):
+        w = int(ids.reshape(-1)[t])
+        occ[w] += 1
+        for j in indices[indptr[t]:indptr[t + 1]].tolist():
+            fire[(w, j)] += 1
+    by_word = {}
+    for (w, j), k in fire.items():
+        if k > occ[w] / 2:
+            by_word.setdefault(w, []).append(j)
+    flat = ids[EVAL[0]:EVAL[0] + TEXT_ROWS].reshape(-1)
+    token_programs = [sorted(by_word.get(int(w), [])) for w in flat]
+    seen = np.mean([int(w) in occ for w in flat])
+    # shuffled order, and the paraphrases
+    rng = np.random.default_rng(0)
+    text_of = lambda k, i: it["concept_labels"][i] if k == "c" else it["single_labels"][i]
+    shuffled = []
+    for ch in head["chosen"]:
+        ch = list(ch)
+        rng.shuffle(ch)
+        shuffled.append("; ".join(text_of(k, i) for k, i in ch))
+    lm = LM()
+    shuffled_bits = np.concatenate([lm.line_bits(shuffled[r * CONTEXT:(r + 1) * CONTEXT]) for r in range(TEXT_ROWS)])
+    used = sorted({(k, i) for ch in head["chosen"] for k, i in ch})
+    para = lm.paraphrase([text_of(k, i) for k, i in used])
+    vocab = [("c", i) for i in range(len(it["concept_labels"]))] + [("s", i) for i in range(len(it["single_labels"]))]
+    vtext = it["concept_labels"] + it["single_labels"]
+
+    def grams(texts, table=None):
+        rows, cols = [], []
+        table = {} if table is None else table
+        grow = not table
+        for r, t in enumerate(texts):
+            t = f"  {t.lower()}  "
+            for a in range(len(t) - 2):
+                g = t[a:a + 3]
+                if g not in table:
+                    if not grow:
+                        continue
+                    table[g] = len(table)
+                rows.append(r)
+                cols.append(table[g])
+        M = sp.csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(len(texts), len(table)))
+        return M, table
+
+    V, table = grams(vtext)
+    idf = np.log(V.shape[0] / (1 + np.asarray((V > 0).sum(0)).ravel()))
+    norm = lambda M: sp.diags(1 / np.sqrt(np.asarray(M.multiply(M).sum(1)).ravel() + 1e-12)) @ M
+    Vn = norm(V @ sp.diags(idf))
+    P, _ = grams(para, table)
+    Pn = norm(P @ sp.diags(idf))
+    match = np.asarray((Pn @ Vn.T).argmax(1)).ravel()
+    decoded = {u: vocab[m] for u, m in zip(used, match)}
+    correct = np.mean([decoded[u] == u for u in used])
+    paraphrase_chosen = [[list(decoded[(k, i)]) for k, i in ch] for ch in head["chosen"]]
+    para_of = dict(zip(used, para))
+    para_lines = ["; ".join(para_of[(k, i)] for k, i in ch) for ch in head["chosen"]]
+    para_bits = np.concatenate([lm.line_bits(para_lines[r * CONTEXT:(r + 1) * CONTEXT]) for r in range(TEXT_ROWS)])
+    json.dump({"token_programs": token_programs, "token_seen": float(seen), "shuffled_bits": shuffled_bits.tolist(),
+               "paraphrases": [[k, i, p] for (k, i), p in zip(used, para)], "paraphrase_item_accuracy": float(correct),
+               "paraphrase_chosen": paraphrase_chosen, "paraphrase_lines": para_lines, "paraphrase_bits": para_bits.tolist()},
+              open(OUT / "controls.json", "w"))
+    print(f"token decoder: {np.mean([len(p) for p in token_programs]):.1f} on, {seen:.1%} of eval words seen in train")
+    print(f"shuffled: {shuffled_bits.mean():.1f} bits/word vs {np.mean(head['bits']):.1f} in order")
+    print(f"paraphrase: {correct:.1%} of {len(used)} item labels decode back to themselves; {para_bits.mean():.1f} bits/word")
+
+
 def stage_kl():
     """KL(model || masked model) per eval word for every decoded program, plus VPD's own set and
     the empty program."""
@@ -533,6 +638,10 @@ def stage_kl():
                 for k, v in tb["levels"].items() if "chosen" in v}
     programs["vpd"] = [indices[indptr[t]:indptr[t + 1]].tolist() for t in range(EVAL[0] * CONTEXT, EVAL[0] * CONTEXT + words)]
     programs["empty"] = [[] for _ in range(words)]
+    if (OUT / "controls.json").exists():
+        ctl = json.load(open(OUT / "controls.json"))
+        programs["token"] = ctl["token_programs"]
+        programs["paraphrase"] = [sorted({j for kind, i in ch for j in (core[i] if kind == "c" else [i])}) for ch in ctl["paraphrase_chosen"]]
     out = {}
     for key, prog in programs.items():
         kls = []
@@ -579,6 +688,12 @@ def totals():
     row["concept code (binary)"] = (b[:, :3].sum(1).mean(), kv, l0)
     row["leak"] = (np.mean(tb["leak"]["bits"]), kv, l0)
     row["empty"] = (0.0, np.mean(kl["empty"]["kl"]), 0.0)
+    if (OUT / "controls.json").exists() and "token" in kl:
+        ctl = json.load(open(OUT / "controls.json"))
+        row["token-only decoder"] = (np.mean(tb["leak"]["bits"]), np.mean(kl["token"]["kl"]), np.mean(kl["token"]["l0"]))
+        row["paraphrased text"] = (np.mean(ctl["paraphrase_bits"]), np.mean(kl["paraphrase"]["kl"]), np.mean(kl["paraphrase"]["l0"]))
+        h = f"n={N_REPORT}"
+        row["shuffled text"] = (np.mean(ctl["shuffled_bits"]), row[h][1], row[h][2])
     return {k: {"bits": float(x), "kl": float(y), "l0": float(z), "total": float(x + N_REPORT * y / math.log(2))} for k, (x, y, z) in row.items()}
 
 
@@ -728,5 +843,6 @@ def example_words(text_bits, kl, count=7):
 if __name__ == "__main__":
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     stages = {"labels": stage_labels, "label_bits": stage_label_bits, "attrib": stage_attrib, "text": stage_text,
-              "bits": stage_bits, "kl": stage_kl, "report": stage_report, "figure": stage_figure}
+              "bits": stage_bits, "kl": stage_kl, "report": stage_report, "figure": stage_figure,
+              "controls": stage_controls}
     stages[sys.argv[1]]()
