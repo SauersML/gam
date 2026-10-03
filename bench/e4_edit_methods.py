@@ -614,6 +614,230 @@ def stage_compile_neg():
     json.dump({"problems": problems}, open(d / "manifest_neg.json", "w"), indent=1)
 
 
+NEAR = (" :", " ;", " =", " :-", " ;-", " =-")  # spaced eyes that are not emoticons: the near-miss the edits fail on
+
+
+def fisher_write(z):
+    import scipy.linalg as sl
+    hv, hV = sl.eigh(z["H"])
+    hv = np.maximum(hv, 1e-6 * hv.max())
+    wf = hV @ ((hV.T @ z["Gk"].mean(0)) / hv)
+    return wf / np.linalg.norm(wf)
+
+
+def stage_prep_fisher(eps=0.1):
+    """The output-Fisher-weighted input moment G_F = E[f_t x_t x_t^T] over general text (val rows 2048-2303), with
+    f_t = 2 KL_t / eps^2 the output sensitivity at position t to the Fisher write w added to the site output (all
+    positions shifted together, so it includes what layer 3's attention carries across positions); and the site
+    inputs at non-emoticon spaced ':' ';' '=' positions: rows 0-2303 for constraints, rows 2304-2999 kept for dev."""
+    import torch
+    z = np.load(OUT / "prep.npz")
+    target, _, _ = E.load()
+    W0 = target.site(E.SITE).W.clone()
+    resid, final, head = E.split_forward(target)
+    _, txt = vocab()
+    w = torch.from_numpy(fisher_write(z).astype(np.float32)).to(E.DEVICE)
+    near_tok = np.array([t in NEAR for t in txt])
+    ends_space = np.array([t[-1:].isspace() for t in txt])
+    GF = np.zeros((3072, 3072))
+    fsum = fn = 0.0
+    rows = np.asarray(REF[MOMENT_ROWS.start:MOMENT_ROWS.stop, :512]).astype(np.int64)
+    emo = E.emoticon_positions(rows, txt, ends_space)
+    with torch.no_grad():
+        for i in range(len(rows)):
+            ids = torch.from_numpy(rows[i:i + 1]).to(E.DEVICE)
+            xmid, g2 = resid(ids)
+            x0 = xmid + g2 @ W0.T
+            xb, xe = final.after(x0)[:, :-1], final.after(x0 + eps * w)[:, :-1]
+            kl = torch.cat([(lambda lb, le: (le.exp() * (le - lb)).sum(-1))(head(xb[:, p:p + 128]), head(xe[:, p:p + 128]))
+                            for p in range(0, 511, 128)], 1)[0]
+            f = 2 * kl / eps ** 2
+            keep = torch.from_numpy(~emo[i]).to(E.DEVICE)
+            g = g2[0, :-1][keep]
+            GF += ((g * f[keep, None]).T @ g).cpu().double().numpy()
+            fsum += float(f[keep].sum())
+            fn += int(keep.sum())
+            if i % 64 == 0:
+                log(f"Fisher moment: row {i}")
+                E.empty_cache()
+        keys = {}
+        for name, lo, hi in (("N", 0, 2304), ("N_dev", 2304, 3000)):
+            rows = np.asarray(REF[lo:hi, :512]).astype(np.int64)
+            emo = E.emoticon_positions(rows, txt, ends_space)
+            hit = near_tok[rows[:, :-1]] & ~emo
+            out, ctx = [], []
+            for r in np.nonzero(hit.any(1))[0]:
+                _, g2 = resid(torch.from_numpy(rows[r:r + 1]).to(E.DEVICE))
+                for q in np.nonzero(hit[r])[0]:
+                    out.append(g2[0, q].cpu().double().numpy())
+                    ctx.append(rows[r, max(0, q - E.SIDE):q + 1])
+            keys[name] = np.stack(out)
+            if name == "N_dev":  # windows ending at the near-miss eye, for the dev KL there
+                L = max(len(c) for c in ctx)
+                keys["N_dev_windows"] = np.stack([np.pad(c, (0, L - len(c))) for c in ctx])
+                keys["N_dev_lens"] = np.array([len(c) for c in ctx])
+            log(f"{name}: {len(out)} near-miss keys")
+    np.savez(OUT / "prep_fisher.npz", G_F=GF / fn, f_mean=fsum / fn, **keys)
+    log(f"mean output sensitivity f = {fsum / fn:.4g} over {fn} positions")
+
+
+def hellaswag_dev(n=1000):
+    """n HellaSwag TRAIN items (a dev set disjoint from the validation set the harness reports), tokenized as the
+    harness tokenizes: [(ids, n_cont, gold, item)] per choice."""
+    import random as _random
+
+    from datasets import load_dataset
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from e4_benchmarks_data import hs_pre
+    tok = E.tokenizer()
+    ds = load_dataset("Rowan/hellaswag", split="train")
+    idx = _random.Random(0).sample(range(len(ds)), n)
+    reqs = []
+    for it, i in enumerate(idx):
+        d = ds[i]
+        q = hs_pre(d["activity_label"] + ": " + d["ctx_a"] + " " + d["ctx_b"].capitalize())
+        c_enc = tok.encode(q).ids
+        for j, e in enumerate(d["endings"]):
+            whole = tok.encode(q + " " + hs_pre(e)).ids
+            reqs.append((whole[-513:], len(whole) - len(c_enc), j == int(d["label"]), it))
+    return reqs
+
+
+def stage_dev(names):
+    """Dev proxies for the three harness panels, never touching the harness's data: each family solved to the
+    headline success, then KL on 64 general rows (val 3000-3063), KL at held-out near-miss eyes (val rows 2304-2999),
+    and the change in the correct ending's share on 1000 HellaSwag train items. Appends to dev.json."""
+    import torch
+    target, fams, _ = family_deltas()
+    site = target.site(E.SITE)
+    W0 = site.W.clone()
+    resid, final, head = E.split_forward(target)
+    ev, _ = E.harvest()
+    pf = E.p_fire_fn(target, ev)
+    p_star = json.load(open(E.FR / "e4_side/models.json"))["meta"]["lora282_lam10"]["p_fire"]
+    zf = np.load(OUT / "prep_fisher.npz")
+    _, txt = vocab()
+    rows = np.asarray(REF[SCREEN_ROWS.start:SCREEN_ROWS.stop, :512]).astype(np.int64)
+    emo, _, _ = masks(rows, txt)
+    win, wl = torch.from_numpy(zf["N_dev_windows"]).to(E.DEVICE), torch.from_numpy(zf["N_dev_lens"] - 1).to(E.DEVICE)
+    hs = hellaswag_dev()
+    path = OUT / "dev.json"
+    res = json.load(open(path)) if path.exists() else {}
+
+    @torch.no_grad()
+    def kl_general(W):
+        tot = cnt = 0.0
+        for i in range(0, len(rows), 2):
+            xmid, g2 = resid(torch.from_numpy(rows[i:i + 2]).to(E.DEVICE))
+            xb, xe = final(xmid, g2, W0)[:, :-1], final(xmid, g2, W)[:, :-1]
+            k = torch.from_numpy(~emo[i:i + 2]).to(E.DEVICE)
+            for p0 in range(0, 511, 128):
+                lb, le = head(xb[:, p0:p0 + 128]), head(xe[:, p0:p0 + 128])
+                kl = (le.exp() * (le - lb)).sum(-1)
+                tot += float(kl[k[:, p0:p0 + 128]].sum())
+                cnt += int(k[:, p0:p0 + 128].sum())
+        return tot / cnt
+
+    @torch.no_grad()
+    def kl_near(W):
+        out = []
+        for i in range(0, len(win), 64):
+            b, l = win[i:i + 64], wl[i:i + 64]
+            ar = torch.arange(len(b), device=E.DEVICE)
+            site.W = W0
+            lb = torch.log_softmax(target(b)[ar, l], -1)
+            site.W = W
+            le = torch.log_softmax(target(b)[ar, l], -1)
+            out.append((le.exp() * (le - lb)).sum(-1))
+        site.W = W0
+        return float(torch.cat(out).mean())
+
+    @torch.no_grad()
+    def hs_lp(W):
+        site.W = W
+        lp = np.zeros(len(hs))
+        order = np.argsort([len(r[0]) for r in hs])
+        for i in range(0, len(order), 32):
+            idx = order[i:i + 32]
+            L = max(len(hs[j][0]) for j in idx)
+            ids = torch.zeros(len(idx), L, dtype=torch.long)
+            for r, j in enumerate(idx):
+                ids[r, :len(hs[j][0])] = torch.tensor(hs[j][0])
+            lg = torch.log_softmax(target(ids.to(E.DEVICE)), -1)
+            for r, j in enumerate(idx):
+                n, t = hs[j][1], len(hs[j][0])
+                tg = ids[r, t - n:t].to(E.DEVICE)
+                lp[j] = float(lg[r, t - n - 1:t - 1].gather(-1, tg[:, None]).sum())
+            del lg
+        site.W = W0
+        E.empty_cache()
+        return lp
+
+    def margin(lp):
+        items = np.array([r[3] for r in hs])
+        gold = np.array([r[2] for r in hs])
+        m = []
+        for it in np.unique(items):
+            v = lp[items == it]
+            m.append(v[gold[items == it]][0] - np.logaddexp.reduce(v))
+        return np.array(m)
+    base_m = margin(hs_lp(W0))
+    for nm in names:
+        if nm in res:
+            continue
+        if nm.startswith("loraneg"):  # trained, so evaluated at its own success
+            d = torch.load(OUT / f"lora_{nm}.pt")[nm]
+            dW = (d["B"] @ d["A"]).to(E.DEVICE)
+        else:
+            lo, hi = (0.3, 20.0) if nm == "vpd" else (1e-3, 1e4)
+            for _ in range(40):
+                mid = (lo * hi) ** 0.5
+                lo, hi = (mid, hi) if pf(W0 + fams[nm](mid)) < p_star else (lo, mid)
+            dW = fams[nm]((lo * hi) ** 0.5)
+        res[nm] = {"p_fire": pf(W0 + dW), "kl_general": kl_general(W0 + dW), "kl_near": kl_near(W0 + dW),
+                   "hellaswag_dev": float((margin(hs_lp(W0 + dW)) - base_m).mean())}
+        log(f"{nm}: " + " ".join(f"{k} {v:.4g}" for k, v in res[nm].items()))
+        json.dump(res, open(path, "w"), indent=1)
+
+
+def stage_compile_v2():
+    """The compiler posed in the output-Fisher metric: G = G_F (+ the input moment C when named), fire requirements
+    exact on the top-k directions of the key Gram whitened by G, and the near-miss eyes' outputs held exactly on the
+    top-r directions of their own whitened Gram (target = the native output). Each problem is solved as one
+    requirement, so a near-miss direction the fire span needs makes the solver return its witness."""
+    import scipy.linalg as sl
+    d = OUT / "compile"
+    z, zf = np.load(OUT / "prep.npz"), np.load(OUT / "prep_fisher.npz")
+    W0, K = np.load(d / "native.npy"), np.load(d / "inputs.npy")
+    w = fisher_write(z)
+    problems = []
+    for mname, G in (("F", zf["G_F"]), ("C", z["C"])):
+        G = G + 1e-6 * np.trace(G) / len(G) * np.eye(len(G))
+        np.save(d / f"moment_{mname}.npy", np.ascontiguousarray(G))
+        Gi = lambda X: sl.solve(G, X.T, assume_a="pos")
+        kv, kV = sl.eigh(K @ Gi(K))
+        kV = kV[:, ::-1]
+        N = zf["N"]
+        nv, nV = sl.eigh(N @ Gi(N))
+        nV = nV[:, ::-1]
+        for k in (4, 8, 16):
+            A = kV[:, :k]
+            B = A.T @ K
+            for r in (0, 16, 64, 256) if mname == "F" else (0, 64):
+                Bn = nV[:, :r].T @ N
+                X = np.vstack([B, Bn])
+                Y = np.vstack([B @ W0.T + np.outer(A.sum(0), w), Bn @ W0.T])
+                name = f"v2{mname}_k{k}_r{r}"
+                np.save(d / f"inputs_{name}.npy", np.ascontiguousarray(X))
+                np.save(d / f"targets_{name}.npy", np.ascontiguousarray(Y))
+                problems.append({"name": name, "storage": E.SITE + ".weight", "native": "native.npy",
+                                 "inputs": f"inputs_{name}.npy", "targets": f"targets_{name}.npy", "class": "sample",
+                                 "moment": f"moment_{mname}.npy", "off_target": "off_target.npy", "out": f"plan_{name}"})
+    for i in range(3):  # three manifests, run in parallel
+        json.dump({"problems": problems[i::3]}, open(d / f"manifest_v2_{i}.json", "w"), indent=1)
+    log(f"{len(problems)} problems")
+
+
 if __name__ == "__main__":
-    {"prep": stage_prep, "screen": stage_screen, "compile_export": stage_compile_export, "assemble": stage_assemble, "compile_span": stage_compile_span, "heldout": stage_heldout, "compile_neg": stage_compile_neg,
+    {"prep": stage_prep, "screen": stage_screen, "compile_export": stage_compile_export, "assemble": stage_assemble, "compile_span": stage_compile_span, "heldout": stage_heldout, "prep_fisher": stage_prep_fisher, "compile_v2": stage_compile_v2, "dev": lambda: stage_dev(sys.argv[2:]), "compile_neg": stage_compile_neg,
      "assemble_extra": lambda: stage_assemble_extra(sys.argv[2], sys.argv[3:]), "lora_neg": lambda: stage_lora_neg(float(sys.argv[2]))}[sys.argv[1]]()

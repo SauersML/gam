@@ -717,10 +717,10 @@ fn main() -> Result<(), String> {
             let complete: Vec<bool> = r.driver["complete"].as_array().map(|a| a.iter().map(|v| v == &json!(true)).collect()).unwrap_or_default();
             let state = r.driver["under_way"].clone();
             for (e, sets) in r.sets.into_iter().enumerate().take(evaluated) {
-                match (complete.get(e).copied().unwrap_or(false), sets) {
-                    (true, sets) => finished[e] = sets,
-                    (false, Some(sets)) if state["sequence"] == json!(e) => under_way = Some((e, sets, state.clone())),
-                    _ => {}
+                if complete.get(e).copied().unwrap_or(false) {
+                    finished[e] = sets;
+                } else if let Some(sets) = sets.filter(|_| state["sequence"] == json!(e)) {
+                    under_way = Some((e, sets, state.clone()));
                 }
             }
             eprintln!(

@@ -36,9 +36,10 @@
 //!   whose metric `F` factors out, `tr F (UᵀQU − 2UᵀR)`, with `Q = Σ_t s_t z̃_t z̃_tᵀ + 1/12
 //!   diag(Σ_t s_t ν_t ⊙ a_t²)`, `R = Σ_t s_t z̃_t y_tᵀ`, `z̃ = μ ⊙ a`, `μ` one on, one half off at an
 //!   input charged its expectation (zero at one charged its corner), `ν` its off indicator there.
-//!   Every subcomponent on is the map exactly on the reads' span (all but `10⁻⁶` of their second
-//!   moment, as the masked program restricts its reads), `Uᵀ V E√Λ = W E√Λ`, so an input the fit
-//!   never saw is still carried by the off subcomponents it leaves. With `V E√Λ = P S Gᵀ` (full
+//!   Every subcomponent on is the map exactly, on every read direction (in the metric `E√Λ` of the
+//!   reads' second moment, floored at `10⁻⁶` of its mean so directions no input reached still
+//!   count), `Uᵀ V E√Λ = W E√Λ`: an input the fit never saw is still carried by the off
+//!   subcomponents it leaves. With `V E√Λ = P S Gᵀ` (full
 //!   `P`) every such `U` is `U₀ + N Z`, `U₀ = P₁ S⁻¹ Gᵀ (W E√Λ)ᵀ` and `N` the columns of `P` past
 //!   its rank, and the code fixes `Z` by `(NᵀQN) Z = Nᵀ(R − Q U₀)`; the step toward that minimiser
 //!   is halved until the code (each input at its worse point) falls.
@@ -228,10 +229,12 @@ struct Fitting<'a> {
     x: &'a Array2<f32>,
     /// The site's map, `d_out × d_in`: every subcomponent on is exactly it on the reads' span.
     w: Array2<f64>,
-    /// The reads' span (all but [`LEFT_OUT`] of their second moment), each direction scaled by
-    /// its root second moment: `d_in × r`.
+    /// Every read direction scaled by its root second moment (floored at [`LEFT_OUT`] of the
+    /// mean): the constraint's metric, `d_in × d_in`, and its inverse map from whitened reads.
     span: Array2<f64>,
-    /// `E Λ⁻¹ Eᵀ` on that span: a read seeded from an input is its direction in it.
+    unwhiten: Array2<f64>,
+    /// `E Λ⁻¹ Eᵀ` on the inputs' span (all but [`LEFT_OUT`] of the second moment): a read seeded
+    /// from an input is its direction in it.
     seeding: Array2<f64>,
     /// `y = x Wᵀ`, inputs × d_out.
     y: Array2<f32>,
@@ -601,7 +604,10 @@ impl<'a> Fitting<'a> {
         let y = product(x.view(), false, single(w).view(), true);
         let yf = product(y.view(), false, single(&samples.fisher).view(), false);
         let yfy: Vec<f64> = (0..rows).map(|t| y.row(t).iter().zip(yf.row(t).iter()).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum()).collect();
-        // The reads' span, as the masked program restricts its reads (`Masked::project_reads`).
+        // The reads' second moment, all but `LEFT_OUT` of it the span inputs are seeded from (as
+        // the masked program restricts its reads, `Masked::project_reads`); every direction is
+        // kept in the map's constraint, those the inputs never reach weighted at that floor, so
+        // all on is the map on every input, seen or not.
         let moment = eigh(samples.second_moment.view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
         let total: f64 = moment.values.iter().map(|l| l.max(0.0)).sum();
         let mut order: Vec<usize> = (0..moment.values.len()).collect();
@@ -617,12 +623,16 @@ impl<'a> Fitting<'a> {
         }
         let basis = moment.vectors.select(Axis(1), &kept);
         let roots = Array1::from_iter(kept.iter().map(|&i| moment.values[i].sqrt()));
-        let span = &basis * &roots;
         let seeding = (&basis / &roots.mapv(|r| r * r)).dot(&basis.t());
+        let floor = LEFT_OUT * total / moment.values.len().max(1) as f64;
+        let all_roots = moment.values.mapv(|l| l.max(floor).sqrt());
+        let span = &moment.vectors * &all_roots;
+        let unwhiten = &moment.vectors / &all_roots;
         Ok(Self {
             x,
             w: w.clone(),
             span,
+            unwhiten,
             seeding,
             y,
             yfy,
@@ -722,7 +732,7 @@ pub fn fit(
     }
     // The reads span the inputs' span, so every subcomponent on can be the map.
     let span = fitting.span.clone();
-    let unwhiten = seeding.dot(&span);
+    let unwhiten = fitting.unwhiten.clone();
     let cover = |v: &mut Array2<f64>, rows: &[usize]| -> Result<(), String> {
         // The directions (in the whitened reads) the reads leave out replace the reads of `rows`.
         let covered = svd(v.dot(&span).view(), false).map_err(|e| format!("{e:?}"))?;
