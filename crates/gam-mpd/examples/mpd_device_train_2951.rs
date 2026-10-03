@@ -10,7 +10,9 @@
 //! (default 25) and at the end, the library goes to `OUT_DIR/{site}.{v,u}.f64` and the code of the
 //! `EVAL` sequences after the training ones (default 8) in float64 to `OUT_DIR/evals.json`. With
 //! several CUDA devices each holds a replica: a batch's sequences are split among them, their
-//! gradients summed, and every replica takes the same update.
+//! gradients summed, and every replica takes the same update. Without CUDA it trains on the Apple
+//! GPU where there is one (f32 steps); that device has no float64, so each eval runs on the host,
+//! a float64 trainer built from the synced library.
 
 use gam_gpu::tensor::{Arithmetic, Device};
 use gam_mpd::describe::{Geometry, Metric, Structured, declared_charts};
@@ -40,6 +42,14 @@ where
     T::Err: std::fmt::Display,
 {
     args.get(i).map_or(Ok(default), |v| v.parse().map_err(|e| format!("{name}: {e}")))
+}
+
+/// A replica's result, or its panic's message.
+fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, Result<T, String>>) -> Result<T, String> {
+    handle.join().map_err(|payload| {
+        let message = payload.downcast_ref::<&str>().map(|s| (*s).to_string()).or_else(|| payload.downcast_ref::<String>().cloned());
+        format!("a replica panicked: {}", message.as_deref().unwrap_or("(no message)"))
+    })?
 }
 
 fn main() -> Result<(), String> {
@@ -81,6 +91,9 @@ fn main() -> Result<(), String> {
     }
     let mut devices = Device::accelerators(gam_gpu::global_policy()).map_err(|e| e.to_string())?;
     if devices.is_empty() {
+        devices.extend(Device::single_precision(gam_gpu::global_policy()).map_err(|e| e.to_string())?);
+    }
+    if devices.is_empty() {
         devices.push(Device::host());
     }
     let device = devices[0].clone();
@@ -102,11 +115,11 @@ fn main() -> Result<(), String> {
             .collect::<Result<_, String>>()?,
     );
     drop(measured);
+    let settings = |r: usize| Settings { observations, rate, betas: (0.9, 0.999), epsilon: 1e-12, draws: 2, seed: 0x5E7 + 0x1000 * r as u64 };
     let mut replicas = Vec::new();
     for (r, replica) in devices.iter().enumerate() {
         let masked = Masked::build(model, chosen.clone(), libraries.clone())?;
-        let settings = Settings { observations, rate, betas: (0.9, 0.999), epsilon: 1e-12, draws: 2, seed: 0x5E7 + 0x1000 * r as u64 };
-        replicas.push(Trainer::new(replica, model, &chosen, masked, &describe, settings, arithmetic)?);
+        replicas.push(Trainer::new(replica, model, &chosen, masked, &describe, settings(r), arithmetic)?);
     }
     drop(libraries);
     eprintln!("{} sites on {} × {} ({arithmetic:?}), statistics and start {:.0}s", chosen.len(), devices.len(), device.name(), started.elapsed().as_secs_f64());
@@ -123,8 +136,18 @@ fn main() -> Result<(), String> {
             return Ok(());
         }
         let mut tally = Tally::default();
-        for inputs in &evals {
-            tally.add(&trainer.evaluate(inputs)?);
+        if device.float64() {
+            for inputs in &evals {
+                tally.add(&trainer.evaluate(inputs)?);
+            }
+        } else {
+            // The first replica's library and draws, evaluated in float64 on the host.
+            let libraries = (0..chosen.len()).map(|k| masked.library(k)).collect::<Result<Vec<_>, _>>()?;
+            let masked = Masked::build(model, chosen.clone(), libraries)?;
+            let mut host = Trainer::new(&Device::host(), model, &chosen, masked, &describe, settings(0), Arithmetic::F64)?;
+            for inputs in &evals {
+                tally.add(&host.evaluate(inputs)?);
+            }
         }
         let rows = tally.rows.max(1) as f64;
         eprintln!(
@@ -160,7 +183,7 @@ fn main() -> Result<(), String> {
                     })
                 })
                 .collect();
-            running.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("a replica panicked".to_string()))).collect()
+            running.into_iter().map(|h| joined(h)).collect()
         });
         let mut tally = Tally::default();
         for t in tallies {
@@ -179,7 +202,7 @@ fn main() -> Result<(), String> {
         }
         std::thread::scope(|scope| -> Result<(), String> {
             let running: Vec<_> = replicas.iter_mut().map(|trainer| scope.spawn(move || trainer.update())).collect();
-            running.into_iter().try_for_each(|h| h.join().unwrap_or_else(|_| Err("a replica panicked".to_string())))
+            running.into_iter().try_for_each(|h| joined(h))
         })?;
         for d in &devices {
             d.synchronize().map_err(|e| e.to_string())?;
@@ -202,7 +225,7 @@ fn main() -> Result<(), String> {
             std::thread::scope(|scope| -> Result<(), String> {
                 let describe = &describe;
                 let running: Vec<_> = replicas[1..].iter_mut().map(|trainer| scope.spawn(move || trainer.sync(describe).map(|_| ()))).collect();
-                running.into_iter().try_for_each(|h| h.join().unwrap_or_else(|_| Err("a replica panicked".to_string())))
+                running.into_iter().try_for_each(|h| joined(h))
             })?;
             evaluate(&mut replicas[0], step + 1, &mut log)?;
         }

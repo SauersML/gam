@@ -657,7 +657,7 @@ fn main() -> Result<(), String> {
             all_on.excess = Some(0.0);
         }
         // What the box claim adds on a sequence's sets.
-        let excess_of = |inputs: &FamilyInputs, _target: &Target, masks: &[Array2<f64>], fishers: &[Array2<f64>]| -> Result<f64, String> {
+        let excess_of = |inputs: &FamilyInputs, masks: &[Array2<f64>], fishers: &[Array2<f64>]| -> Result<f64, String> {
             Ok(gam_mpd::masked::box_upper_at(masked, inputs, masks, fishers)?.sum())
         };
         // Sets as CSR over all pieces (sites in order), so other context codes can score them.
@@ -750,14 +750,14 @@ fn main() -> Result<(), String> {
             started.add(&begin, &begin_kl, begin_bits, &begin_agree);
             // Under the box claim the error is the KL expected over every off gate (module note).
             let begin_excess = match fishers {
-                Some(f) => excess_of(&inputs, &target, &begin, f)?,
+                Some(f) => excess_of(&inputs, &begin, f)?,
                 None => 0.0,
             };
             if let Some(excess) = started.excess.as_mut() {
                 *excess += begin_excess;
             }
-            if let (Some(f), Some(attack)) = (fishers, started.attack.as_mut()) {
-                *attack += box_excess_at(masked, &inputs, &target, &begin, f)?.sum();
+            if fishers.is_some() && let Some(attack) = started.attack.as_mut() {
+                *attack += box_excess_at(masked, &inputs, &target, &begin)?.sum();
             }
             let begin_code = begin_bits + (begin_kl.sum() + begin_excess) * scale;
             let begin_l0 = sums(&begin, &begin_kl).0;
@@ -801,7 +801,7 @@ fn main() -> Result<(), String> {
             };
             let bits = coder.bits(&masks).sum();
             let excess = match fishers {
-                Some(f) => excess_of(&inputs, &target, &masks, f)?,
+                Some(f) => excess_of(&inputs, &masks, f)?,
                 None => 0.0,
             };
             // Selection keeps each sequence's flips by its own code; the sequence keeps its start
@@ -826,8 +826,8 @@ fn main() -> Result<(), String> {
             if let Some(total) = selected.excess.as_mut() {
                 *total += excess;
             }
-            if let (Some(f), Some(attack)) = (fishers, selected.attack.as_mut()) {
-                *attack += box_excess_at(masked, &inputs, &target, &masks, f)?.sum();
+            if fishers.is_some() && let Some(attack) = selected.attack.as_mut() {
+                *attack += box_excess_at(masked, &inputs, &target, &masks)?.sum();
             }
             if full {
                 token_kl.extend(values.iter().copied());
@@ -896,7 +896,7 @@ fn main() -> Result<(), String> {
         Claim::Box => select_boxed(m, inputs, target, begin, coder, observations, samples, &fishers),
         Claim::Corner => select(m, inputs, target, begin, coder, observations, samples),
     };
-    let excess_on = |m: &Masked, inputs: &FamilyInputs, _target: &Target, masks: &[Array2<f64>]| -> Result<f64, String> {
+    let excess_on = |m: &Masked, inputs: &FamilyInputs, masks: &[Array2<f64>]| -> Result<f64, String> {
         match claim {
             Claim::Box => Ok(gam_mpd::masked::box_upper_at(m, inputs, masks, &fishers)?.sum()),
             Claim::Corner => Ok(0.0),
@@ -963,10 +963,10 @@ fn main() -> Result<(), String> {
             };
             let begin_kl = score_only(&masked, &masked.family(&inputs, &begin), &target)?;
             // The error under the claim: under the box, the masks' KL plus the box's excess.
-            let begin_excess = excess_on(&masked, &inputs, &target, &begin)?;
+            let begin_excess = excess_on(&masked, &inputs, &begin)?;
             let begin_code = coder.bits(&begin).sum() + (begin_kl.sum() + begin_excess) * scale;
             let (masks, kl) = select_claimed(&masked, &inputs, &target, begin, &coder)?;
-            let excess = excess_on(&masked, &inputs, &target, &masks)?;
+            let excess = excess_on(&masked, &inputs, &masks)?;
             let (masks, kl, excess) = if coder.bits(&masks).sum() + (kl.sum() + excess) * scale < begin_code {
                 (masks, kl, excess)
             } else {
@@ -1017,12 +1017,12 @@ fn main() -> Result<(), String> {
                 let candidate_costs = costs_of(&candidate)?;
                 let candidate_coder = Coder::ran(candidate_costs.clone(), inputs.rows);
                 let (candidate_masks, candidate_kl) = select_claimed(&candidate, &inputs, &target, grown_masks, &candidate_coder)?;
-                let candidate_excess = excess_on(&candidate, &inputs, &target, &candidate_masks)?;
+                let candidate_excess = excess_on(&candidate, &inputs, &candidate_masks)?;
                 let candidate_code = (candidate_coder.bits(&candidate_masks).sum() + (candidate_kl.sum() + candidate_excess) * scale) / inputs.rows as f64;
                 // The library as it stands after this sequence's step, on the same sets, priced by
                 // its own descriptions as the candidate is by its.
                 let now_kl = score_only(&masked, &masked.family(&inputs, &masks), &target)?;
-                let now_excess = excess_on(&masked, &inputs, &target, &masks)?;
+                let now_excess = excess_on(&masked, &inputs, &masks)?;
                 let sequence_code = (Coder::ran(costs.clone(), inputs.rows).bits(&masks).sum() + (now_kl.sum() + now_excess) * scale) / inputs.rows as f64;
                 let kept = candidate_code < sequence_code;
                 log::info!("split test: {sequence_code:.1} -> {candidate_code:.1} bits per token; {}", if kept { "kept" } else { "refused" });
@@ -1045,7 +1045,7 @@ fn main() -> Result<(), String> {
                 let family = masked.family(&inputs, &masks);
                 let (base_kl, masked_trace, _) = forward(&masked, &family, &target)?;
                 drop(family);
-                let base_excess = excess_on(&masked, &inputs, &target, &masks)?;
+                let base_excess = excess_on(&masked, &inputs, &masks)?;
                 let base_code = (Coder::ran(costs.clone(), inputs.rows).bits(&masks).sum() + (base_kl.sum() + base_excess) * scale) / inputs.rows as f64;
                 let mut grown = Vec::new();
                 let mut grown_masks = Vec::new();
@@ -1066,7 +1066,7 @@ fn main() -> Result<(), String> {
                     let candidate_costs = costs_of(&candidate)?;
                     let candidate_coder = Coder::ran(candidate_costs.clone(), inputs.rows);
                     let (candidate_masks, candidate_kl) = select_claimed(&candidate, &inputs, &target, grown_masks, &candidate_coder)?;
-                    let candidate_excess = excess_on(&candidate, &inputs, &target, &candidate_masks)?;
+                    let candidate_excess = excess_on(&candidate, &inputs, &candidate_masks)?;
                     let candidate_code = (candidate_coder.bits(&candidate_masks).sum() + (candidate_kl.sum() + candidate_excess) * scale) / inputs.rows as f64;
                     let kept = candidate_code < base_code;
                     log::info!(

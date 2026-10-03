@@ -715,7 +715,7 @@ fn the_box_claims_error_is_its_worst_point_at_least_the_expectation() {
         fisher(&masked, &fam, &trace, &target, 64, 11, true).expect("fisher").into_iter().map(|(_, f)| f.expect("written")).collect();
     let corner = score_only(&masked, &fam, &target).expect("kl");
     let expected = expected_box_excess_at(&masked, &family, &target, &masks, &fishers).expect("expected");
-    let error = box_excess_at(&masked, &family, &target, &masks, &fishers).expect("error");
+    let error = box_excess_at(&masked, &family, &target, &masks).expect("error");
     // Without a layout every input is its own sequence, so each row is charged its own worst point.
     let close = |a: f64, b: f64| a >= b - 1e-12 * (1.0 + b.abs());
     let mut above = 0;
@@ -732,7 +732,7 @@ fn the_box_claims_error_is_its_worst_point_at_least_the_expectation() {
     }
     assert!(above > 0, "no box point beyond the expectation: the test would not tell the worst case from it");
     let on: Vec<Array2<f64>> = masks.iter().map(|m| Array2::ones(m.dim())).collect();
-    let none = box_excess_at(&masked, &family, &target, &on, &fishers).expect("all on");
+    let none = box_excess_at(&masked, &family, &target, &on).expect("all on");
     // Zero up to the rounding of the points' own forwards (they run by other routes than the masks').
     assert!(none.iter().zip(corner.iter()).all(|(e, k)| e.abs() <= 1e-12 * (1.0 + k.abs())), "with every gate on the error is the masks' own: {none:?}");
 }

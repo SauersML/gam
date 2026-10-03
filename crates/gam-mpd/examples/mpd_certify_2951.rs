@@ -141,7 +141,7 @@ fn toy(args: &[String]) -> Result<(), String> {
     for (name, masks) in [("corner", corner), ("box", boxed)] {
         let started = Instant::now();
         let (kl, _, _) = forward(&masked, &masked.family(&family, &masks), &target)?;
-        let estimate = &kl + &box_excess_at(&masked, &family, &target, &masks, &fishers)?;
+        let estimate = &kl + &box_excess_at(&masked, &family, &target, &masks)?;
         let gates = Gates::claim(&masks);
         let found = adversary(&masked, &family, &target, &gates, None, 40, 8, 0xAD5)?;
         let root = certify(&masked, &family, &target, Some(&radius), &gates, Relaxation::sound(budget))?;

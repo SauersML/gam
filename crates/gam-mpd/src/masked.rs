@@ -958,8 +958,8 @@ pub fn kl_and_logits(masked: &Masked, family: &FamilyInputs, target: &Target) ->
 /// charged the point of its largest total, so a set whose layers only cancel each other's errors
 /// pays for it. A lower bound on the claim's worst case. The expectation over uniform off gates
 /// ([`expected_box_excess_at`]) is no point of the box and a refinement of the library lowers it
-/// with the box unchanged, so it only screens proposals (its Fishers, `_fishers`, go unused here).
-pub fn box_excess_at(masked: &Masked, base: &FamilyInputs, target: &Target, masks: &[Array2<f64>], _fishers: &[Array2<f64>]) -> Result<Array1<f64>, String> {
+/// with the box unchanged, so it only screens proposals.
+pub fn box_excess_at(masked: &Masked, base: &FamilyInputs, target: &Target, masks: &[Array2<f64>]) -> Result<Array1<f64>, String> {
     let corner = score_only(masked, &masked.family(base, masks), target)?;
     box_excess_from(masked, base, target, masks, &corner)
 }
