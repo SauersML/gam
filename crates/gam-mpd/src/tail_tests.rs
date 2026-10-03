@@ -103,5 +103,21 @@ fn the_tail_is_the_imported_program_forward_and_backward() {
             assert!((pulled[[r, c]] - expected[[r, c]]).abs() <= 1e-11 * largest, "pullback ({r}, {c}): {} against {}", pulled[[r, c]], expected[[r, c]]);
         }
     }
+    // Rows before every scored row held fixed: the same logits, and the same cotangent at every row
+    // that is run (twice: the second call reuses the fixed rows' keys and values).
+    tail.hold_fixed(true);
+    for _ in 0..2 {
+        let held = tail.logits(&inputs, &x, &scored).expect("logits");
+        let scale = reference.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        assert!((&held - &logits).iter().all(|e| e.abs() <= 1e-12 * scale), "held logits");
+        let pulled_held = tail.pullback(&inputs, &x, &scored, &cotangent).expect("pullback");
+        for r in 0..rows {
+            let fixed = [0, 3, 4].contains(&r);
+            for c in 0..D {
+                let want = if fixed { 0.0 } else { pulled[[r, c]] };
+                assert!((pulled_held[[r, c]] - want).abs() <= 1e-11 * largest, "held pullback ({r}, {c}): {} against {want}", pulled_held[[r, c]]);
+            }
+        }
+    }
     std::fs::remove_dir_all(&dir).expect("cleanup");
 }
