@@ -1533,6 +1533,7 @@ impl Selected {
         target: &Target,
         masks: &[Array2<f64>],
         fishers: &[Array2<f64>],
+        terms: Option<&BoxTerms>,
         on_device: Option<&DeviceTarget>,
     ) -> Result<Array1<f64>, String> {
         match self {
@@ -1557,7 +1558,15 @@ impl Selected {
                     *back = Some(super::derivatives::vjp_from(&masked.program, family, trace, masked.program.output, cotangent, Some(&keep)).map_err(|e| e.to_string())?);
                 }
                 let back = back.as_ref().ok_or("no reverse pass")?;
-                Ok(box_excess_back(masked, trace, back, masks, fishers, false)?.0)
+                let built;
+                let terms = match terms {
+                    Some(terms) => terms,
+                    None => {
+                        built = BoxTerms::new(masked, fishers)?;
+                        &built
+                    }
+                };
+                Ok(box_excess_back(masked, trace, back, masks, terms, fishers, false)?.0)
             }
         }
     }
@@ -1691,6 +1700,11 @@ pub fn select_observed(
     let on_device = on_device.as_ref();
     // Under the box claim on the CPU, the trace of every gate on, which every layer's vertex
     // shares up to its own layer.
+    // Under the box claim, what its excess reads of the library and the Fishers: fixed here.
+    let box_terms = match boxed {
+        Some(f) if on_device.is_none() => Some(BoxTerms::new(masked, f)?),
+        _ => None,
+    };
     let all_on: Option<Trace> = match boxed {
         Some(_) if on_device.is_none() && masked.head.is_none() => {
             let on: Vec<Array2<f64>> = masks.iter().map(|m| Array2::ones(m.dim())).collect();
@@ -1709,7 +1723,7 @@ pub fn select_observed(
                 };
                 // The excess first, so its reverse pass also serves the mask gradients.
                 if let (Some(f), None) = (boxed, &excess_known) {
-                    let expected = state.expected_excess(masked, &family, target, &masks, f, on_device)?;
+                    let expected = state.expected_excess(masked, &family, target, &masks, f, box_terms.as_ref(), on_device)?;
                     excess_known = Some(box_worst(masked, base, target, &masks, &kl_now, expected, all_on.as_ref())?);
                 }
                 let grads = state.mask_gradients(masked, &family, target, on_device)?;
@@ -1789,13 +1803,100 @@ pub fn select_observed(
             flipped[r] = pick.len();
         }
         if flipped.iter().all(|f| *f == 0) {
+            // Group moves: no single flip pays, but many together may (from an empty start one
+            // subcomponent rarely pays for itself alone). Each input's flips are ranked by their
+            // predicted KL change alone; for k = 1, 2, 4, … every input takes its k best, the
+            // exact code is measured, and each sequence keeps the k that lowers its code most.
+            let ranked: Vec<Vec<(usize, usize)>> = {
+                use rayon::prelude::*;
+                (0..rows)
+                    .into_par_iter()
+                    .map(|r| {
+                        if !scores[r] {
+                            return Vec::new();
+                        }
+                        let mut moves: Vec<(f64, usize, usize)> = Vec::new();
+                        for (k, (g, (h, _))) in grads.iter().zip(curvature.iter()).enumerate() {
+                            let (g, h, m) = (g.row(r), h.row(r), masks[k].row(r));
+                            for c in 0..g.len() {
+                                let kl_change = match (boxed.is_some(), m[c] > 0.0) {
+                                    (false, true) => -g[c] + 0.5 * h[c],
+                                    (false, false) => g[c] + 0.5 * h[c],
+                                    (true, true) => -0.5 * g[c] + (2.0 / 3.0) * h[c],
+                                    (true, false) => 0.5 * g[c] + h[c] / 3.0,
+                                };
+                                if kl_change < 0.0 {
+                                    moves.push((kl_change, k, c));
+                                }
+                            }
+                        }
+                        moves.sort_by(|a, b| a.0.total_cmp(&b.0));
+                        moves.into_iter().map(|(_, k, c)| (k, c)).collect()
+                    })
+                    .collect()
+            };
+            let longest = ranked.iter().map(Vec::len).max().unwrap_or(0);
+            let mut before_sequence = vec![0.0; sequences];
+            for r in 0..rows {
+                before_sequence[sequence_of[r]] += before[r];
+            }
+            // Per sequence, the best saving and its k.
+            let mut best = vec![(0.0f64, 0usize); sequences];
+            let mut k = 1;
+            while k <= longest {
+                let mut trial = masks.clone();
+                for (r, moves) in ranked.iter().enumerate() {
+                    for &(site, c) in moves.iter().take(k) {
+                        trial[site][[r, c]] = 1.0 - trial[site][[r, c]];
+                    }
+                }
+                let kl_trial = score_only(masked, &masked.family(base, &trial), target)?;
+                let excess_trial = match boxed {
+                    Some(f) => box_excess_at(masked, base, target, &trial, f)?,
+                    None => Array1::zeros(rows),
+                };
+                let after_trial = code(&(&kl_trial + &excess_trial), &coder.bits(&trial), observations);
+                let mut after_sequence = vec![0.0; sequences];
+                for r in 0..rows {
+                    after_sequence[sequence_of[r]] += after_trial[r];
+                }
+                for q in 0..sequences {
+                    let saving = before_sequence[q] - after_sequence[q];
+                    if saving > best[q].0 {
+                        best[q] = (saving, k);
+                    }
+                }
+                k *= 2;
+            }
+            if best.iter().any(|(saving, _)| *saving > 0.0) {
+                for (r, moves) in ranked.iter().enumerate() {
+                    let (saving, k) = best[sequence_of[r]];
+                    if saving > 0.0 {
+                        for &(site, c) in moves.iter().take(k) {
+                            masks[site][[r, c]] = 1.0 - masks[site][[r, c]];
+                        }
+                    }
+                }
+                log::info!(
+                    "group moves ({:.0}s): {} sequences moved, {:.0} bits saved, k {:?}",
+                    started.elapsed().as_secs_f64(),
+                    best.iter().filter(|(saving, _)| *saving > 0.0).count(),
+                    best.iter().map(|(saving, _)| saving).sum::<f64>(),
+                    best.iter().map(|(_, k)| *k).collect::<Vec<_>>()
+                );
+                cap = vec![usize::MAX; sequences];
+                next_forward = None;
+                reuse = None;
+                excess_known = None;
+                continue;
+            }
             return Ok((masks, kl_now));
         }
         let proposed_family = masked.family(base, &proposed);
         let (kl_new, mut state_new) = Selected::forward(masked, &proposed_family, target, on_device, false)?;
         let excess_new = match boxed {
             Some(f) => {
-                let expected = state_new.expected_excess(masked, &proposed_family, target, &proposed, f, on_device)?;
+                let expected = state_new.expected_excess(masked, &proposed_family, target, &proposed, f, box_terms.as_ref(), on_device)?;
                 box_worst(masked, base, target, &proposed, &kl_new, expected, all_on.as_ref())?
             }
             None => Array1::zeros(rows),
@@ -2210,7 +2311,7 @@ pub fn box_excess(
 ) -> Result<(Array1<f64>, Option<BoxGradients>), String> {
     let written: Vec<usize> = masked.written.iter().flatten().copied().collect();
     let back = super::derivatives::vjp_from(&masked.program, family, trace, masked.program.output, cotangent, Some(&written)).map_err(|e| e.to_string())?;
-    box_excess_back(masked, trace, &back, masks, fishers, gradients)
+    box_excess_back(masked, trace, &back, masks, &BoxTerms::new(masked, fishers)?, fishers, gradients)
 }
 
 /// [`box_excess`] from a reverse pass `back` that kept every site's written nodes.
@@ -2219,62 +2320,104 @@ fn box_excess_back(
     trace: &Trace,
     back: &[Option<Array2<f64>>],
     masks: &[Array2<f64>],
+    terms: &BoxTerms,
     fishers: &[Array2<f64>],
     gradients: bool,
 ) -> Result<(Array1<f64>, Option<BoxGradients>), String> {
+    use gam_linalg::faer_ndarray::{fast_ab, fast_abt};
     let rows = trace.values[masked.program.output].nrows();
     let mut excess = Array1::<f64>::zeros(rows);
     let mut out = Vec::new();
     for (k, site) in masked.sites.iter().enumerate() {
-        let library = masked.library(k)?;
+        let SiteTerms { u, own: own_blocks, uf } = &terms.sites[k];
         let f = &fishers[k];
         // The off blocks' coordinates, per column.
         let off = masked.expand(k, &masks[k]).mapv(|m| 1.0 - m);
         let a = &trace.values[masked.z[k]] * &off;
-        let s_out = a.dot(&library.u);
-        let written: Vec<Array2<f64>> = masked.written[k]
+        let s_out = fast_ab(&a, u);
+        let zeros: Vec<Array2<f64>> = masked.written[k].iter().filter(|n| back[**n].is_none()).map(|n| Array2::zeros(trace.values[*n].dim())).collect();
+        let mut zero = zeros.iter();
+        let views: Vec<ndarray::ArrayView2<'_, f64>> = masked.written[k]
             .iter()
-            .map(|n| back[*n].clone().unwrap_or_else(|| Array2::zeros(trace.values[*n].dim())))
-            .collect();
-        let views: Vec<_> = written.iter().map(|w| w.view()).collect();
+            .map(|n| match &back[*n] {
+                Some(b) => Ok(b.view()),
+                None => zero.next().map(|z| z.view()).ok_or_else(|| "box excess: a written node without a value".to_string()),
+            })
+            .collect::<Result<_, String>>()?;
         let g = ndarray::concatenate(Axis(1), &views).map_err(|e| e.to_string())?;
-        let sf = s_out.dot(f);
+        let sf = fast_ab(&s_out, f);
         // Each block's own term `Z_cᵀ F Z_c = a_cᵀ (U_c F U_cᵀ) a_c`, per input.
-        let mut own = Array1::<f64>::zeros(rows);
         let mut own_a = Array2::<f64>::zeros(a.dim());
-        let mut start = 0;
-        let mut blocks_ufu = Vec::new();
-        for &r in masked.ranks(k) {
-            let u_block = library.u.slice(s![start..start + r, ..]);
-            let ufu = u_block.dot(f).dot(&u_block.t());
-            let a_block = a.slice(s![.., start..start + r]);
-            let a_ufu = a_block.dot(&ufu);
-            own += &(&a_ufu * &a_block).sum_axis(Axis(1));
-            own_a.slice_mut(s![.., start..start + r]).assign(&a_ufu);
-            blocks_ufu.push(ufu);
-            start += r;
+        if masked.is_rank_one(k) {
+            let weight = own_blocks[0].row(0);
+            ndarray::Zip::from(own_a.rows_mut()).and(a.rows()).for_each(|mut o, ar| {
+                ndarray::Zip::from(&mut o).and(&ar).and(&weight).for_each(|o, a, w| *o = a * w);
+            });
+        } else {
+            let mut start = 0;
+            for (&r, ufu) in masked.ranks(k).iter().zip(own_blocks) {
+                let a_block = a.slice(s![.., start..start + r]);
+                own_a.slice_mut(s![.., start..start + r]).assign(&a_block.dot(ufu));
+                start += r;
+            }
         }
+        let own = (&own_a * &a).sum_axis(Axis(1));
         excess += &((&g * &s_out).sum_axis(Axis(1)) * 0.5 + (&sf * &s_out).sum_axis(Axis(1)) * 0.125 + &own * (1.0 / 24.0));
         if gradients {
             // ∂/∂S = ½ g + ¼ S F; ∂/∂a = (∂/∂S) Uᵀ + a (U_c F U_cᵀ)/12 within each block.
             let g_s = &g * 0.5 + &sf * 0.25;
-            let g_a = &g_s.dot(&library.u.t()) + &(own_a * (1.0 / 12.0));
-            let mut u_gradient = a.t().dot(&g_s);
+            let g_a = &fast_abt(&g_s, u) + &(own_a * (1.0 / 12.0));
+            let mut u_gradient = fast_atb(&a, &g_s);
             let mut start = 0;
             for &r in masked.ranks(k) {
                 let a_block = a.slice(s![.., start..start + r]);
-                let u_block = library.u.slice(s![start..start + r, ..]);
-                let extra = a_block.t().dot(&a_block).dot(&u_block).dot(f) * (1.0 / 12.0);
+                let extra = a_block.t().dot(&a_block).dot(&uf.slice(s![start..start + r, ..])) * (1.0 / 12.0);
                 let mut target_rows = u_gradient.slice_mut(s![start..start + r, ..]);
                 target_rows += &extra;
                 start += r;
             }
             let reads = read_values(trace, site)?;
-            let v_gradient = (&g_a * &off).t().dot(&reads);
+            let v_gradient = fast_atb(&(&g_a * &off), &reads);
             out.push((v_gradient, u_gradient));
         }
     }
     Ok((excess, gradients.then_some(out)))
+}
+
+/// What the box claim's excess reads of the library and the written Fishers, fixed while neither
+/// moves: per site its pieces' `U`, `U F`, and each block's `U_c F U_cᵀ` (a site of rank-one
+/// blocks holds them as one row, `u_c F u_cᵀ` per piece).
+pub(crate) struct BoxTerms {
+    sites: Vec<SiteTerms>,
+}
+
+struct SiteTerms {
+    u: Array2<f64>,
+    own: Vec<Array2<f64>>,
+    uf: Array2<f64>,
+}
+
+impl BoxTerms {
+    pub(crate) fn new(masked: &Masked, fishers: &[Array2<f64>]) -> Result<Self, String> {
+        let mut sites = Vec::new();
+        for k in 0..masked.sites.len() {
+            let u = masked.library(k)?.u;
+            let uf = gam_linalg::faer_ndarray::fast_ab(&u, &fishers[k]);
+            let own = if masked.is_rank_one(k) {
+                vec![(&uf * &u).sum_axis(Axis(1)).insert_axis(Axis(0))]
+            } else {
+                let mut blocks = Vec::new();
+                let mut start = 0;
+                for &r in masked.ranks(k) {
+                    blocks.push(uf.slice(s![start..start + r, ..]).dot(&u.slice(s![start..start + r, ..]).t()));
+                    start += r;
+                }
+                blocks
+            };
+            sites.push(SiteTerms { u, own, uf });
+        }
+        Ok(Self { sites })
+    }
 }
 
 /// Each site's read mean and second moment about it, `E[(x − μ)(x − μ)ᵀ]`, on the native program

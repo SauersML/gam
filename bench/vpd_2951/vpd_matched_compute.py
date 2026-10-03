@@ -186,11 +186,19 @@ def cmd_train(args) -> None:
 
     if args.device == "mps":
         # MPS keeps freed buffers cached; across steps that grows the footprint past any cap.
+        import gc
+
         step = torch.optim.AdamW.step
+        calls = [0]
 
         def step_then_release(self, *a, **k):
             out = step(self, *a, **k)
+            calls[0] += 1
+            gc.collect()
             torch.mps.empty_cache()
+            if calls[0] % 50 == 0:
+                print(f"mps memory after {calls[0]} optimizer steps: allocated {torch.mps.current_allocated_memory() / 2**30:.2f} GiB, "
+                      f"driver {torch.mps.driver_allocated_memory() / 2**30:.2f} GiB", flush=True)
             return out
 
         torch.optim.AdamW.step = step_then_release
@@ -299,7 +307,7 @@ def cmd_sets(run: Path, device: str, check: int) -> None:
 SCORER = Path.home() / "mpd-data/engine/bin/mpd_pieces_masked_race"
 
 
-def cmd_score(run: Path, lease: int) -> None:
+def cmd_score(run: Path, lease: int, observations: str) -> None:
     """The scorer the reference VPD point went through (stepA): the frontier export, OBSERVATIONS
     1024, the run's library, nothing trained, its sets on the 32 frontier rows given, its sets on
     the 96 held-out rows counted by the context coder."""
@@ -307,11 +315,12 @@ def cmd_score(run: Path, lease: int) -> None:
 
     subprocess.run([sys.executable, str(Path(__file__).parent / "vpd_sets_export.py"), str(run / "sets"),
                     "--masks", str(run / "masks.npz"), "--library", str(run / "library")], check=True)
-    with open(run / "score.log", "w") as log:
-        subprocess.run([str(Path.home() / ".local/bin/mem-lease"), str(lease), str(SCORER), str(FRONTIER32), str(run / "score.json"),
-                        "1024", f"library:{run / 'library'}", "0", "32", "512", "auto", str(run / "sets")],
+    stem = f"score_o{observations}"
+    with open(run / f"{stem}.log", "w") as log:
+        subprocess.run([str(Path.home() / ".local/bin/mem-lease"), str(lease), str(SCORER), str(FRONTIER32), str(run / f"{stem}.json"),
+                        observations, f"library:{run / 'library'}", "0", "32", "512", "auto", str(run / "sets")],
                        stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, check=True)
-    point = json.load(open(run / "score.json"))["points"][-1]
+    point = json.load(open(run / f"{stem}.json"))["points"][-1]
     print(json.dumps({"vpd_sets": point["start"], "reselected": {k: point[k] for k in ("l0", "kl", "context_bits", "code", "agree")}}, indent=1))
 
 
@@ -523,7 +532,8 @@ def main() -> None:
     s.add_argument("--check", type=int, default=4)
     c = sub.add_parser("score")
     c.add_argument("run", type=Path)
-    c.add_argument("--lease", type=int, default=8)
+    c.add_argument("--lease", type=int, default=12)
+    c.add_argument("--observations", default="100000", help="the exchange rate n of the engine's code")
     b = sub.add_parser("table")
     b.add_argument("out", type=Path)
     b.add_argument("--vpd", type=Path, nargs="*", default=[])
@@ -542,7 +552,7 @@ def main() -> None:
         case "sets":
             cmd_sets(a.run, a.device, a.check)
         case "score":
-            cmd_score(a.run, a.lease)
+            cmd_score(a.run, a.lease, a.observations)
         case "table":
             cmd_table(a.out, a.vpd, a.engine, a.reference)
         case "engine-flops":
