@@ -3,10 +3,11 @@
 //! `mpd_e2e_train_2951 EXPORT_DIR LIBRARY_DIR OUT_DIR OBSERVATIONS TRAIN [PASSES] [CONTEXT]`
 //!
 //! `LIBRARY_DIR` holds a library per site (`{site}.v.f64`, `{site}.u.f64`, as
-//! `mpd_site_fit_2951` writes them; a site without files stays native). Every sequence of the
+//! `mpd_site_fit_2951` writes them; a site without files stays native), gated in the blocks its
+//! site's code chose (`{site}.blocked.*`) where they code it in fewer bits than its rank-one library. Every sequence of the
 //! export's first `TRAIN` (of `CONTEXT` positions, default 512) is coded in turn, `PASSES` times
 //! (default 1): its sets are each site's own code's selection on the sequence's clean reads
-//! (`gam_mpd::site_fit::measure`, each subcomponent priced by its exact lattice description
+//! (`gam_mpd::site_fit::measure_blocks`, each subcomponent priced by its exact lattice description
 //! `gam_mpd::describe::Structured` in the model's statistics on the training sequences, re-sent
 //! from its last one while a step keeps it within a lattice step), and the library takes one exact-gradient step of the
 //! masked forward's KL under the box claim on those sets (`gam_mpd::masked::step_pieces`, every
@@ -16,7 +17,7 @@
 
 use gam_mpd::import::import_language_model;
 use gam_mpd::masked::{Claim, Library, Masked, Running, Target, matrix, sites, step_pieces};
-use gam_mpd::site_fit::{measure, samples};
+use gam_mpd::site_fit::{measure_blocks, samples};
 use ndarray::{Array1, Array2};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -50,15 +51,27 @@ fn main() -> Result<(), String> {
     let model = &imported.program;
     let family = &imported.contract.family;
     let sequence = |s: usize| family.select(&(s * context..(s + 1) * context).collect::<Vec<_>>());
-    let (mut chosen, mut libraries) = (Vec::new(), Vec::new());
+    let (mut chosen, mut libraries, mut ranks) = (Vec::new(), Vec::new(), Vec::new());
     for site in sites(model) {
-        let v_path = given.join(format!("{}.v.f64", site.name));
+        // A site's blocked library (`{site}.blocked.{v,u}.f64` and its ranks in `{site}.blocked.json`,
+        // as `mpd_site_fit_2951` writes them) when it codes the site in fewer bits than its rank-one
+        // one, else the rank-one library, every subcomponent its own block.
+        let blocked = given.join(format!("{}.blocked.json", site.name));
+        let record: Option<serde_json::Value> = std::fs::read_to_string(&blocked).ok().and_then(|t| serde_json::from_str(&t).ok());
+        let wins = record.as_ref().is_some_and(|r| r["code"].as_f64() < r["rank_one_code"].as_f64());
+        let stem = if wins { format!("{}.blocked", site.name) } else { site.name.clone() };
+        let v_path = given.join(format!("{stem}.v.f64"));
         if !v_path.exists() {
             continue;
         }
         let w = matrix(model, &site)?;
         let (d_out, d_in) = w.dim();
-        libraries.push(Library { v: read_f64(&v_path, d_in)?, u: read_f64(&given.join(format!("{}.u.f64", site.name)), d_out)?, mean: Array1::zeros(d_in) });
+        let library = Library { v: read_f64(&v_path, d_in)?, u: read_f64(&given.join(format!("{stem}.u.f64")), d_out)?, mean: Array1::zeros(d_in) };
+        ranks.push(match (wins, record) {
+            (true, Some(r)) => r["ranks"].as_array().ok_or("blocked.json: ranks")?.iter().map(|x| x.as_u64().map(|x| x as usize).ok_or("blocked.json: a rank")).collect::<Result<Vec<_>, _>>()?,
+            _ => vec![1; library.v.nrows()],
+        });
+        libraries.push(library);
         chosen.push(site);
     }
     if chosen.is_empty() {
@@ -87,7 +100,7 @@ fn main() -> Result<(), String> {
     );
     drop((statistics, measured));
     eprintln!("statistics of {} sites on {train} sequences, {:.0}s", chosen.len(), started.elapsed().as_secs_f64());
-    let mut masked = Masked::build(model, chosen.clone(), libraries)?;
+    let mut masked = Masked::build_blocks(model, chosen.clone(), libraries, ranks.clone())?;
     let mut running = Running::default();
     let mut log = Vec::new();
     for pass in 0..passes {
@@ -103,9 +116,9 @@ fn main() -> Result<(), String> {
             for (k, sample) in local.iter().enumerate() {
                 let library = masked.library(k)?;
                 let clock = std::time::Instant::now();
-                let (_, sets) = measure(k, &maps[k], sample, &description, observations, &library)?;
+                let (_, sets) = measure_blocks(k, &maps[k], sample, &description, observations, &library, &ranks[k])?;
                 measuring += clock.elapsed().as_secs_f64();
-                let mut mask = Array2::<f64>::zeros((inputs.rows, library.v.nrows()));
+                let mut mask = Array2::<f64>::zeros((inputs.rows, ranks[k].len()));
                 for (r, on) in sets.iter().enumerate() {
                     for &c in on {
                         mask[[r, c as usize]] = 1.0;
@@ -126,6 +139,7 @@ fn main() -> Result<(), String> {
                 let library = masked.library(k)?;
                 write_f64(&out.join(format!("{}.v.f64", site.name)), &library.v)?;
                 write_f64(&out.join(format!("{}.u.f64", site.name)), &library.u)?;
+                std::fs::write(out.join(format!("{}.ranks.json", site.name)), json!(ranks[k]).to_string()).map_err(|e| e.to_string())?;
             }
             std::fs::write(out.join("steps.json"), json!({"observations": observations, "steps": log}).to_string()).map_err(|e| e.to_string())?;
         }

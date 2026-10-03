@@ -418,6 +418,7 @@ impl<'a> Fitting<'a> {
             let g0 = product(self.y.slice(s![start..end, ..]), false, uf32.view(), true);
             let ak = product(a.view(), false, k32.view(), false);
             let left = (0..rows)
+                .into_par_iter()
                 .map(|r| {
                     let (mut ag, mut aka) = (0.0f64, 0.0f64);
                     for c in 0..self.pieces {
@@ -435,17 +436,17 @@ impl<'a> Fitting<'a> {
         let mut q2 = Array2::<f64>::zeros((rows, self.pieces));
         let mut left = vec![0.0f64; rows];
         for (g, gy) in self.gradients.iter().zip(&self.gy) {
-            // `g_tk · u_c` for every input and write.
+            // `g_tk · u_c` for every input and write; the inputs accumulate in parallel.
             let p = product(g.slice(s![start..end, ..]), false, u32.view(), true);
-            for r in 0..rows {
+            q2.axis_iter_mut(Axis(0)).into_par_iter().zip(left.par_iter_mut()).enumerate().for_each(|(r, (mut q2_row, left_r))| {
                 let mut gd = gy[start + r];
                 for c in 0..self.pieces {
                     let pc = f64::from(p[[r, c]]);
-                    q2[[r, c]] += pc * pc / draws;
+                    q2_row[c] += pc * pc / draws;
                     gd -= f64::from(a[[r, c]]) * pc;
                 }
-                left[r] += gd * gd / draws;
-            }
+                *left_r += gd * gd / draws;
+            });
         }
         Chunk { a, q: q2.mapv(|x| x.sqrt() as f32), left: left.into_iter().map(f64::sqrt).collect() }
     }
@@ -501,7 +502,7 @@ impl<'a> Fitting<'a> {
             // else `s_t aᵀ K_c a`.
             let mut size2 = Array2::<f64>::zeros((rows, blocks));
             if self.gradients.is_empty() {
-                for r in 0..rows {
+                size2.axis_iter_mut(Axis(0)).into_par_iter().enumerate().for_each(|(r, mut row)| {
                     for c in 0..blocks {
                         let mut total = 0.0;
                         for i in starts[c]..starts[c + 1] {
@@ -509,19 +510,19 @@ impl<'a> Fitting<'a> {
                                 total += f64::from(chunk.a[[r, i]]) * f64::from(k32[[i, j]]) * f64::from(chunk.a[[r, j]]);
                             }
                         }
-                        size2[[r, c]] = self.s[start + r] * total.max(0.0);
+                        row[c] = self.s[start + r] * total.max(0.0);
                     }
-                }
+                });
             } else {
                 let draws = self.gradients.len() as f64;
                 for g in self.gradients {
                     let p = product(g.slice(s![start..end, ..]), false, u32.view(), true);
-                    for r in 0..rows {
+                    size2.axis_iter_mut(Axis(0)).into_par_iter().enumerate().for_each(|(r, mut row)| {
                         for c in 0..blocks {
                             let along: f64 = (starts[c]..starts[c + 1]).map(|j| f64::from(chunk.a[[r, j]]) * f64::from(p[[r, j]])).sum();
-                            size2[[r, c]] += along * along / draws;
+                            row[c] += along * along / draws;
                         }
-                    }
+                    });
                 }
             }
             let weight = self.scale;
@@ -903,6 +904,39 @@ pub fn fit(
     }
     progress(&report, &Library { v: v.clone(), u: u.clone(), mean: Array1::zeros(d_in) });
     Ok(Library { v, u, mean: Array1::zeros(d_in) })
+}
+
+/// [`measure`] of a library gated in blocks of `ranks` (column runs): its code and every input's
+/// blocks on, selected from all on.
+pub fn measure_blocks(
+    site: usize,
+    w: &Array2<f64>,
+    samples: &Samples,
+    describe: &dyn Describe,
+    observations: f64,
+    library: &Library,
+    ranks: &[usize],
+) -> Result<(Round, Vec<Vec<u32>>), String> {
+    if library.mean.iter().any(|m| *m != 0.0) {
+        return Err("a measured library reads the uncentred input".to_string());
+    }
+    if ranks.contains(&0) || ranks.iter().sum::<usize>() != library.v.nrows() {
+        return Err(format!("site {site}: blocks {ranks:?} do not partition {} subcomponents", library.v.nrows()));
+    }
+    let fitting = Fitting::new(site, w, samples, observations, library.v.nrows())?;
+    let rows = fitting.rows();
+    let blocks = ranks.len();
+    let mut start = 0;
+    let mut bits = Vec::with_capacity(blocks);
+    for r in ranks {
+        bits.push(describe.bits(site, library.u.slice(s![start..start + r, ..]), library.v.slice(s![start..start + r, ..]))?);
+        start += r;
+    }
+    let mut masks = vec![1u8; rows * blocks];
+    let (description, error) = fitting.code_blocks(&library.v, &library.u, ranks, &bits, &mut masks, true);
+    let on = masks.iter().filter(|m| **m == 1).count() as f64;
+    let report = Round { round: 0, code: (description + error) / rows as f64, description: description / rows as f64, error: error / rows as f64, l0: on / rows as f64, reseeded: 0, read_steps: 0 };
+    Ok((report, masks.chunks(blocks).map(|m| (0..blocks as u32).filter(|c| m[*c as usize] == 1).collect()).collect()))
 }
 
 /// A library gated in blocks ([`blocks`]): its columns, their partition into blocks (column runs),
