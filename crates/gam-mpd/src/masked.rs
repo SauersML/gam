@@ -483,8 +483,9 @@ impl Masked {
                 let Node::Affine { terms, bias } = &program.nodes[written] else {
                     return Err(format!("{}: a written node that is not affine", site.name));
                 };
+                let (terms, bias) = (terms.clone(), *bias);
                 let mut rewritten = Vec::with_capacity(terms.len() + site.reads.len());
-                for &(argument, operator) in terms {
+                for (argument, operator) in terms {
                     if argument == self.masked[k] {
                         for (j, &read) in site.reads.iter().enumerate() {
                             let op = &sums[k][i][j];
@@ -498,7 +499,7 @@ impl Masked {
                         rewritten.push((argument, operator));
                     }
                 }
-                program.nodes[written] = Node::Affine { terms: rewritten, bias: *bias };
+                program.nodes[written] = Node::Affine { terms: rewritten, bias };
             }
         }
         Ok(program)
@@ -652,7 +653,23 @@ impl Masked {
         let projector = basis.dot(&basis.t());
         let mut library = self.library(k)?;
         library.v = library.v.dot(&projector);
+        // Each read block `V_j = (V B)(Bᵀ)_j` is held factored wherever its two products cost
+        // fewer operations per input than the dense one.
+        let factor = library.v.dot(&basis);
         self.set_library(k, library)?;
+        let pieces = self.pieces[k];
+        let ro = self.read_offsets[k].clone();
+        for (j, &op) in self.v_ops[k].clone().iter().enumerate() {
+            let width = ro[j + 1] - ro[j];
+            if kept * (width + pieces) < width * pieces {
+                let old = &self.program.operators[op];
+                let right = basis.slice(s![ro[j]..ro[j + 1], ..]).t().to_owned();
+                self.program.operators[op] = Arc::new(
+                    Operator::low_rank(old.name.clone(), old.rows.clone(), old.cols.clone(), factor.clone(), right, fine(), Provenance::default())
+                        .map_err(|e| e.to_string())?,
+                );
+            }
+        }
         Ok(kept)
     }
 
@@ -898,7 +915,8 @@ fn box_excess_from(masked: &Masked, base: &FamilyInputs, target: &Target, masks:
     let lowered = masked.on_device(|_| Ok(()))?.is_some();
     let all_on = if !lowered && masked.head.is_none() {
         let on: Vec<Array2<f64>> = masks.iter().map(|m| Array2::ones(m.dim())).collect();
-        let mut trace = masked.program.execute(&masked.family(base, &on), false).map_err(|e| e.to_string())?;
+        let every = masked.dense_program(&vec![true; masked.sites.len()])?;
+        let mut trace = every.execute(&masked.family(base, &on), false).map_err(|e| e.to_string())?;
         trace.values.truncate(masked.z.iter().copied().max().unwrap_or(0));
         Some(trace)
     } else {
@@ -1175,13 +1193,17 @@ fn box_worst(
             let family = masked.family(base, &vertex);
             // The layer's first mask node (each site's mask sits just before its `z`).
             let from = sites.iter().map(|k| masked.z[*k] - 1).min().unwrap_or(0);
+            // Every other layer's gates are on: its sites run through their library sums.
+            let others: Vec<bool> = (0..masked.sites.len()).map(|k| !sites.contains(&k)).collect();
             let kl_vertex = match (all_on, &body, head) {
                 (Some(trace), Some(_), Some((hidden, operator, layout))) if from <= hidden => {
-                    let hidden_values = masked.program.execute_suffix_node(&family, trace, from, hidden).map_err(|e| e.to_string())?;
+                    let program = masked.dense_program(&others)?;
+                    let hidden_values = program.execute_suffix_node(&family, trace, from, hidden).map_err(|e| e.to_string())?;
                     certified_point(masked, target, &hidden_values, (operator, layout), corner, &totals, &sequence_of)?.0
                 }
                 (Some(trace), _, _) if masked.head.is_none() && from <= masked.program.output => {
-                    let output = masked.program.execute_suffix_node(&family, trace, from, masked.program.output).map_err(|e| e.to_string())?;
+                    let program = masked.dense_program(&others)?;
+                    let output = program.execute_suffix_node(&family, trace, from, masked.program.output).map_err(|e| e.to_string())?;
                     kl_score_only(target, &output)
                 }
                 _ => score_only(masked, &family, target)?,
@@ -2058,7 +2080,8 @@ pub fn select_observed(
     let all_on: Option<Trace> = match boxed {
         Some(_) if on_device.is_none() && masked.head.is_none() => {
             let on: Vec<Array2<f64>> = masks.iter().map(|m| Array2::ones(m.dim())).collect();
-            let mut trace = masked.program.execute(&masked.family(base, &on), false).map_err(|e| e.to_string())?;
+            let every = masked.dense_program(&vec![true; masked.sites.len()])?;
+            let mut trace = every.execute(&masked.family(base, &on), false).map_err(|e| e.to_string())?;
             trace.values.truncate(masked.z.iter().copied().max().unwrap_or(0));
             Some(trace)
         }
@@ -2281,8 +2304,11 @@ pub fn select_observed(
                 k *= 2;
             }
             // Screened codes decide where their bands allow; elsewhere the sequence's rows are
-            // settled to float64 in every option and in the current masks first.
-            if let (Some(screen), Some(head)) = (&screen, head_base.as_mut()) {
+            // settled to float64 in every option and in the current masks first. With no option
+            // (no input has a move) there is nothing to decide.
+            if let (Some(screen), Some(head)) = (&screen, head_base.as_mut())
+                && !options.is_empty()
+            {
                 let afters: Vec<&Array1<f64>> = options.iter().map(|(_, after, _, _)| after).collect();
                 let savings = savings_of(&before, &afters);
                 let bands: Vec<Vec<f64>> = options.iter().map(|(_, _, _, s)| bands_of(&head.error, s.as_ref().map(|s| &s.error))).collect();

@@ -2545,9 +2545,10 @@ impl OperatorProgram {
                             }
                         }
                         OperatorBody::LowRank { left, right, .. } => {
-                            let a = left.dot(right);
-                            out += &x.dot(&a.t());
+                            // Through the factors, never their product: `(x Rᵀ) Lᵀ`.
+                            out += &fast_abt(&fast_abt(x, right), left);
                             if let (Some(radius), Some(r)) = (radius.as_mut(), band(*argument)) {
+                                let a = left.dot(right);
                                 let mut lifted = x.mapv(|xv| growth * xv.abs());
                                 lifted += r;
                                 *radius += &lifted.dot(&a.mapv(f64::abs).t());

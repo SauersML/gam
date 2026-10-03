@@ -82,6 +82,13 @@ pub fn product(op: &Arc<Operator>, x: &Array2<f64>, layout: Layout) -> Result<Ar
     {
         return Ok(x * &d);
     }
+    // A factored operator `L R` runs through its factors.
+    if let OperatorBody::LowRank { left, right, .. } = &op.body {
+        return Ok(match layout {
+            Layout::AsStored => fast_ab(&fast_ab(x, left), right),
+            Layout::Transposed => fast_abt(&fast_abt(x, right), left),
+        });
+    }
     let a = op.matrix_cow();
     Ok(match layout {
         Layout::AsStored => fast_ab(x, a.as_ref()),
