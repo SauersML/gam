@@ -224,6 +224,9 @@ fn fit(model: &Path, data: &Path, out: &Path, settings: &Settings) -> Result<(),
     let started = std::time::Instant::now();
     let (program, _) = hugging_face_language_model(model, first..last)?;
     let head = Arc::new(DecoderTail::new(model, last, settings.tail_cache)?);
+    // A mask on a behaviour row cannot reach an earlier row: the tail runs the behaviour's rows
+    // only, the earlier ones held fixed (gam_mpd::tail, "Fixed rows").
+    head.hold_fixed(true);
     let chosen: Vec<Site> = sites(&program).into_iter().filter(|s| layer_of(s).is_some_and(|l| (first..last).contains(&l))).collect();
     log::info!("imported blocks {first}..{last} ({:.0}s); {} sites", started.elapsed().as_secs_f64(), chosen.len());
     let chunks = |range: std::ops::Range<usize>| -> Vec<std::ops::Range<usize>> { range.clone().step_by(batch_size).map(|s| s..(s + batch_size).min(range.end)).collect() };
@@ -388,7 +391,12 @@ fn fit(model: &Path, data: &Path, out: &Path, settings: &Settings) -> Result<(),
                 cotangent[[r, i]] = q[i] / p;
             }
         }
-        let cotangent = to_output(&masked, &b.inputs, &trace, &target, cotangent)?;
+        // The score's gradient reaches every row's masks (a weight edit removes a piece everywhere),
+        // so this one pullback runs the whole tail.
+        head.hold_fixed(false);
+        let cotangent = to_output(&masked, &b.inputs, &trace, &target, cotangent);
+        head.hold_fixed(true);
+        let cotangent = cotangent?;
         let shares = mask_gradients(&masked, &family, &trace, cotangent)?;
         for (s, p) in range.clone().enumerate() {
             let (from, to) = (b.starts[s], b.starts[s] + prompts[p].ids.len());
