@@ -1016,7 +1016,7 @@ pub(crate) struct ScreenedPoint {
     head: (usize, usize, gam_gpu::banded::Layout),
 }
 
-/// How a [`ScreenedPoint`] forward runs its head.
+/// How a screened point's forward runs its head.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeadScreen {
     /// No screen: the caller's float64 forward.
