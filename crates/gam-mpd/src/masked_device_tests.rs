@@ -317,3 +317,50 @@ fn sites_all_on_run_through_their_library_sums() {
     let whole = masked.program.execute_suffix(&family, &reference, from).expect("suffix");
     assert_eq!(alone, whole[output - from]);
 }
+
+/// A selection killed between any two rounds and resumed from the state it showed its checkpoint
+/// there ends with bit-identical masks and KL, and passes through the same states, as the
+/// uninterrupted one: here with screened heads, whose kept proposals' f32-banded forwards are
+/// never carried into the next round.
+#[test]
+fn a_resumed_screened_selection_is_the_uninterrupted_one() {
+    use super::device_program_tests::fixture_sized;
+    use super::masked::{Coder, Progress, Resume, Round, select_resumable};
+    let (program, family) = fixture_sized(128, 2048, 64, 4);
+    let all = sites(&program);
+    let libraries: Vec<Library> = all
+        .iter()
+        .enumerate()
+        .map(|(k, site)| {
+            let (d_out, d_in) = matrix(&program, site).expect("map").dim();
+            Library {
+                v: Array2::from_shape_fn((PIECES, d_in), |(i, j)| 0.3 * noise(30_000 * k + 37 * i + j)),
+                u: Array2::from_shape_fn((PIECES, d_out), |(i, j)| 0.3 * noise(30_000 * k + 9000 + 37 * i + j)),
+                mean: Array1::zeros(d_in),
+            }
+        })
+        .collect();
+    let masked = Masked::build(&program, all, libraries).expect("masked");
+    let target = Target::every_row(program.execute(&family, false).expect("clean").values[program.output].clone());
+    let costs: Vec<Array1<f64>> = masked.all_pieces().iter().map(|p| Array1::from_elem(*p, 2.0)).collect();
+    let coder = Coder::ran(costs, family.rows);
+    let start: Vec<Array2<f64>> = masked.all_pieces().iter().map(|p| Array2::ones((family.rows, *p))).collect();
+    let run = |resume: Option<Resume>| -> (Vec<Array2<f64>>, Array1<f64>, Vec<Resume>) {
+        let mut states = Vec::new();
+        let mut checkpoint = |progress: &Progress<'_>| -> Result<(), String> {
+            states.push(progress.to_resume());
+            Ok(())
+        };
+        let (masks, kl) = select_resumable(&masked, &family, &target, start.clone(), resume, &coder, 64.0, 2, None, &mut |_: &Round<'_>| Ok(()), &mut checkpoint)
+            .expect("selection");
+        (masks, kl, states)
+    };
+    let (masks, kl, states) = run(None);
+    assert!(states.len() >= 3, "the selection took too few rounds to resume mid-way: {}", states.len());
+    for k in [1, states.len() / 2, states.len() - 1] {
+        let (resumed_masks, resumed_kl, resumed_states) = run(Some(states[k].clone()));
+        assert_eq!(resumed_masks, masks, "resumed at round {k}: other masks");
+        assert_eq!(resumed_kl, kl, "resumed at round {k}: another KL");
+        assert_eq!(resumed_states, states[k..], "resumed at round {k}: other states on the way");
+    }
+}

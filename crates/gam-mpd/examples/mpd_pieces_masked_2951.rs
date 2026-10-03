@@ -73,10 +73,11 @@
 //! reached), and a run that finds one there resumes from it: killed at any point and restarted,
 //! it writes what the uninterrupted run would have. Every draw is seeded by the pass and sequence,
 //! so nothing else is kept. A finished run's checkpoint says so, and a restart then stops at once.
-//! An eval's selection also saves its progress in `OUT.select/` (every finished eval sequence's
-//! sets), so a restart redoes only the sequence under way, from its start: a selection's own state
-//! (its interaction estimates, caps and curvature) is not saved, so a restart from a round's masks
-//! would not select what the uninterrupted run did.
+//! An eval's selection also saves its progress in `OUT.select/`: every finished eval sequence's
+//! sets, and before every round of the one under way its whole selection state
+//! (`gam_mpd::masked::Progress`: its sets, each input's interaction, each sequence's cap, the
+//! round, the box excess), so a restart resumes it mid-sequence and selects exactly what the
+//! uninterrupted run would.
 
 use gam_mpd::checkpoint::{Saved, load, save};
 use gam_mpd::codec::prefix_integer_len_bits;
@@ -702,26 +703,51 @@ fn main() -> Result<(), String> {
             point
         };
         let scale = observations / std::f64::consts::LN_2;
-        // Selection's progress (module note): every eval sequence's finished sets, saved atomically
-        // in `OUT.select/`, so a restart keeps them.
+        // Selection's progress (module note): every eval sequence's finished sets and the one under
+        // way's selection state, saved atomically in `OUT.select/`, so a restart resumes them.
         let progress_dir = PathBuf::from(format!("{}.select", stem.display()));
         // Only this run's progress at this point counts: a directory left by another run (the
         // checkpoint removed to start over) is not this run's.
         let resumed = load(&progress_dir)?.filter(|r| r.driver["run"] == run && r.driver["pass"] == json!(pass) && r.driver["trained"] == json!(trained));
         let mut finished: Vec<Option<gam_mpd::checkpoint::SparseSets>> = vec![None; evaluated];
+        // The sequence under way and its selection state: its sets, and the rest as JSON (every
+        // real as its bits, so it comes back bit for bit).
+        let mut under_way: Option<(usize, gam_mpd::checkpoint::SparseSets, serde_json::Value)> = None;
         if let Some(r) = resumed {
             let complete: Vec<bool> = r.driver["complete"].as_array().map(|a| a.iter().map(|v| v == &json!(true)).collect()).unwrap_or_default();
+            let state = r.driver["under_way"].clone();
             for (e, sets) in r.sets.into_iter().enumerate().take(evaluated) {
-                if complete.get(e).copied().unwrap_or(false) {
-                    finished[e] = sets;
+                match (complete.get(e).copied().unwrap_or(false), sets) {
+                    (true, sets) => finished[e] = sets,
+                    (false, Some(sets)) if state["sequence"] == json!(e) => under_way = Some((e, sets, state.clone())),
+                    _ => {}
                 }
             }
-            eprintln!("selection resumed: {} sequences finished", finished.iter().flatten().count());
+            eprintln!(
+                "selection resumed: {} sequences finished, {}",
+                finished.iter().flatten().count(),
+                under_way.as_ref().map_or("none under way".to_string(), |(e, _, s)| format!("sequence {e} under way at round {}", s["round"]))
+            );
         }
-        let save_progress = |finished: &[Option<gam_mpd::checkpoint::SparseSets>]| -> Result<(), String> {
+        let as_bits = |values: &[f64]| json!(values.iter().map(|v| v.to_bits()).collect::<Vec<u64>>());
+        let reals = |value: &serde_json::Value| -> Result<Vec<f64>, String> {
+            value.as_array().ok_or("selection state: not a list")?.iter().map(|v| v.as_u64().map(f64::from_bits).ok_or_else(|| "selection state: not a real's bits".to_string())).collect()
+        };
+        let save_progress = |finished: &[Option<gam_mpd::checkpoint::SparseSets>], current: Option<(usize, &gam_mpd::masked::Progress<'_>)>| -> Result<(), String> {
             let complete: Vec<bool> = finished.iter().map(Option::is_some).collect();
-            let sets: Vec<Option<&gam_mpd::checkpoint::SparseSets>> = finished.iter().map(Option::as_ref).collect();
-            let driver = json!({"run": run, "pass": pass, "trained": trained, "complete": complete});
+            let current_sets = current.map(|(e, progress)| (e, Assigned::of(progress.masks).sites));
+            let sets: Vec<Option<&gam_mpd::checkpoint::SparseSets>> =
+                (0..evaluated).map(|e| finished[e].as_ref().or(current_sets.as_ref().filter(|(u, _)| *u == e).map(|(_, s)| s))).collect();
+            let mut driver = json!({"run": run, "pass": pass, "trained": trained, "complete": complete});
+            if let Some((e, progress)) = current {
+                driver["under_way"] = json!({
+                    "sequence": e,
+                    "round": progress.round,
+                    "alpha": as_bits(progress.alpha),
+                    "cap": progress.cap,
+                    "excess": progress.excess.map(|x| as_bits(&x.to_vec())),
+                });
+            }
             save(&progress_dir, &Saved { driver: &driver, libraries: &[], context: &Context::new(&[]), running: &Running::default(), sets })
         };
         for e in 0..evaluated {
@@ -760,10 +786,35 @@ fn main() -> Result<(), String> {
                 let values = score_only(masked, &masked.family(&inputs, &masks), &target)?;
                 (masks, values)
             } else {
-                // The returned KL is the float64 one of the masks alone, as a restart scores them.
-                let selected = gam_mpd::masked::select_observed(masked, &inputs, &target, begin, &coder, observations, samples, fishers, &mut |_: &gam_mpd::masked::Round<'_>| Ok(()))?;
+                // Under way before a restart: its saved state, from the same start.
+                let resume = match under_way.take() {
+                    Some((u, sets, state)) if u == e => Some(gam_mpd::masked::Resume {
+                        masks: Assigned { rows: inputs.rows, sites: sets }.masks(&pieces),
+                        alpha: reals(&state["alpha"])?,
+                        cap: state["cap"].as_array().ok_or("selection state: no caps")?.iter().map(|c| c.as_u64().map(|c| c as usize).ok_or("selection state: a cap")).collect::<Result<_, _>>()?,
+                        round: state["round"].as_u64().ok_or("selection state: no round")?,
+                        excess: if state["excess"].is_null() { None } else { Some(Array1::from(reals(&state["excess"])?)) },
+                    }),
+                    _ => None,
+                };
+                // The state before every round is saved; the returned KL is the float64 one of
+                // the masks alone, as a restart scores them.
+                let mut checkpoint = |progress: &gam_mpd::masked::Progress<'_>| save_progress(&finished, Some((e, progress)));
+                let selected = gam_mpd::masked::select_resumable(
+                    masked,
+                    &inputs,
+                    &target,
+                    begin,
+                    resume,
+                    &coder,
+                    observations,
+                    samples,
+                    fishers,
+                    &mut |_: &gam_mpd::masked::Round<'_>| Ok(()),
+                    &mut checkpoint,
+                )?;
                 finished[e] = Some(Assigned::of(&selected.0).sites);
-                save_progress(&finished)?;
+                save_progress(&finished, None)?;
                 selected
             };
             let bits = coder.bits(&masks).sum();

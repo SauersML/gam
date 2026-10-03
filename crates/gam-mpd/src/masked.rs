@@ -2330,8 +2330,10 @@ pub fn select_resumable(
                         let (screened, _) = screen.score(masked, &masked.family(base, &trial), target, head)?;
                         (code(&screened.kl, &listing_trial, observations), Some(screened))
                     }
+                    // Under the box claim each k is ranked by its expected excess alone; the full
+                    // worst case decides below, on the k a sequence would keep.
                     _ => {
-                        let (kl_trial, excess_trial) = measure(&trial)?;
+                        let (kl_trial, excess_trial) = measure_expected(&trial)?;
                         (code(&(&kl_trial + &excess_trial), &listing_trial, observations), None)
                     }
                 };
@@ -2368,7 +2370,8 @@ pub fn select_resumable(
             for r in 0..rows {
                 before_sequence[sequence_of[r]] += before[r];
             }
-            let mut best = vec![(0.0f64, 0usize); sequences];
+            // Per sequence, its k by (screened) saving, best first.
+            let mut ranked_k: Vec<Vec<(f64, usize)>> = vec![Vec::new(); sequences];
             for (k, after_trial, _, _) in &options {
                 let mut after_sequence = vec![0.0; sequences];
                 for r in 0..rows {
@@ -2376,8 +2379,49 @@ pub fn select_resumable(
                 }
                 for q in 0..sequences {
                     let saving = before_sequence[q] - after_sequence[q];
-                    if saving > best[q].0 {
-                        best[q] = (saving, *k);
+                    if saving > 0.0 {
+                        ranked_k[q].push((saving, *k));
+                    }
+                }
+            }
+            ranked_k.iter_mut().for_each(|r| r.sort_by(|a, b| b.0.total_cmp(&a.0)));
+            let mut best = vec![(0.0f64, 0usize); sequences];
+            if boxed.is_none() {
+                for q in 0..sequences {
+                    if let Some(&first) = ranked_k[q].first() {
+                        best[q] = first;
+                    }
+                }
+            } else {
+                // The full worst case decides: every sequence's best-ranked k at once, a refused
+                // sequence falling back to its next.
+                let mut next = vec![0usize; sequences];
+                while (0..sequences).any(|q| best[q].1 == 0 && next[q] < ranked_k[q].len()) {
+                    let trying: Vec<Option<usize>> = (0..sequences)
+                        .map(|q| (best[q].1 == 0 && next[q] < ranked_k[q].len()).then(|| ranked_k[q][next[q]].1))
+                        .collect();
+                    let mut trial = masks.clone();
+                    for (r, moves) in ranked.iter().enumerate() {
+                        if let Some(k) = trying[sequence_of[r]] {
+                            for &(site, c) in moves.iter().take(k) {
+                                trial[site][[r, c]] = 1.0 - trial[site][[r, c]];
+                            }
+                        }
+                    }
+                    let (kl_full, excess_full) = measure(&trial)?;
+                    let after_full = code(&(&kl_full + &excess_full), &coder.bits(&trial), observations);
+                    let mut full = vec![0.0; sequences];
+                    for r in 0..rows {
+                        full[sequence_of[r]] += before[r] - after_full[r];
+                    }
+                    for q in 0..sequences {
+                        if let Some(k) = trying[q] {
+                            if full[q] > 0.0 {
+                                best[q] = (full[q], k);
+                            } else {
+                                next[q] += 1;
+                            }
+                        }
                     }
                 }
             }
