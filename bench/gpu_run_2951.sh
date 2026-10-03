@@ -18,10 +18,11 @@
 # The host is untrusted and holds nothing of yours but the data you send: no agent or X11 is
 # forwarded, it clones the public repository read-only over https, and every result comes back by
 # rsync from here. The script
-#   1. pushes the inputs, RUN_DIR (with any checkpoints) and itself to HOST:~/mpd-run/;
-#   2. starts the remote side detached (it survives this ssh session): it installs the build tools
-#      and the pinned Rust toolchain, clones the repository at REF (default main), builds, runs the
-#      device tests and the 60-second benchmark (mpd_device_bench_2951, on the first job's export),
+#   1. pushes itself, the jobs and RUN_DIR (with any checkpoints) to HOST:~/mpd-run/;
+#   2. starts the remote side detached (it survives this ssh session) and, while it builds, pushes
+#      the inputs: the remote side installs the build tools and the pinned Rust toolchain, clones
+#      the repository at REF (default main), builds, runs the device tests, waits for the inputs,
+#      and runs the 60-second benchmark (mpd_device_bench_2951, on the first job's export),
 #      refuses the host when either fails or when a selection round runs below MIN_ROUNDS sequences
 #      per second (default 0: any working device), and then runs every job at once, the host's
 #      cores split evenly between them. With STOP=full-eval (the default) a training job is stopped
@@ -95,6 +96,9 @@ remote_side() {
         lines+=("$rest")
     done < <(grep -v '^[[:space:]]*\(#\|$\)' "$root/jobs")
     [ ${#names[@]} -gt 0 ] || { state "refused: no jobs"; exit 1; }
+
+    state "waiting for the inputs"
+    until [ -f "$root/inputs/READY" ]; do sleep 10; done
 
     state benchmark
     ./target/release/examples/mpd_device_bench_2951 "${exports[0]}" 60 required "$run/bench.json" 2>&1 | tee "$run/bench.log"
@@ -196,16 +200,18 @@ while read -r line; do
     remote_jobs+="${out# }"$'\n'
 done < "$JOBS"
 
-"${SSH[@]}" "$HOST" "mkdir -p $REMOTE_ROOT/inputs $REMOTE_ROOT/run"
-for path in "${!UP[@]}"; do
-    echo "== pushing $path"
-    rsync -azL -e "$RSYNC_SSH" "$path/" "$HOST:${UP[$path]}/"
-done
+"${SSH[@]}" "$HOST" "mkdir -p $REMOTE_ROOT/inputs $REMOTE_ROOT/run && rm -f $REMOTE_ROOT/inputs/READY"
 rsync -az -e "$RSYNC_SSH" "$RUN/" "$HOST:$REMOTE_ROOT/run/"
 rsync -az -e "$RSYNC_SSH" "$0" "$HOST:$REMOTE_ROOT/gpu_run_2951.sh"
 printf '%s' "$remote_jobs" | "${SSH[@]}" "$HOST" "cat > $REMOTE_ROOT/jobs"
 "${SSH[@]}" "$HOST" "cd $REMOTE_ROOT && rm -f run/STATE && REF=$REF MIN_ROUNDS=$MIN_ROUNDS STOP=$STOP nohup setsid bash gpu_run_2951.sh --remote > run/remote.log 2>&1 < /dev/null &"
-echo "== started on $HOST; pulling $REMOTE_ROOT/run into $RUN every ${POLL}s"
+echo "== started on $HOST; pushing the inputs while it builds"
+for path in "${!UP[@]}"; do
+    echo "== pushing $path"
+    rsync -azL -e "$RSYNC_SSH" "$path/" "$HOST:${UP[$path]}/"
+done
+"${SSH[@]}" "$HOST" "touch $REMOTE_ROOT/inputs/READY"
+echo "== inputs up; pulling $REMOTE_ROOT/run into $RUN every ${POLL}s"
 
 failures=0
 while true; do
