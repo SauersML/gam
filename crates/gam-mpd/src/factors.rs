@@ -59,7 +59,7 @@
 //! unique finest compatible decomposition, and the partition of the units by the co-support
 //! components of any orthonormal coefficient basis that realises it is that decomposition's
 //! partition; two such bases differ by an orthogonal map inside each `T_k`, a permutation and
-//! signs, which is exactly the gauge [`super::identify::gauge`] reports for factor coordinates.
+//! signs: the gauge of the factor coordinates.
 //!
 //! *Proof.* If `⊕ T_k` and `⊕ U_l` are compatible, so is `⊕_{k,l} (T_k ∩ U_l)` restricted to its
 //! non-zero terms together with the orthogonal complement of their sum: each `v_n` lies in some
@@ -422,12 +422,15 @@ fn measure(
     cache: &std::cell::RefCell<CurvatureCache>,
 ) -> Result<Option<Fit>, EngineError> {
     let trace = context.trace;
-    let d = trace.values[component.arguments[0]].ncols();
-    let rows = trace.values[component.arguments[0]].nrows();
+    // The read nodes as matrices (a gathered feature's one-hot rows formed).
+    let reads: Vec<std::borrow::Cow<'_, Array2<f64>>> =
+        component.arguments.iter().map(|&a| program.node_value(trace, &context.contract.family, a)).collect::<Result<_, _>>()?;
+    let d = reads[0].ncols();
+    let rows = reads[0].nrows();
     // Pooled mean and covariance of the read nodes.
     let mut mean = Array1::<f64>::zeros(d);
-    for &a in &component.arguments {
-        mean += &trace.values[a].sum_axis(Axis(0));
+    for read in &reads {
+        mean += &read.sum_axis(Axis(0));
     }
     let pooled = (rows * component.arguments.len()) as f64;
     mean /= pooled;
@@ -435,7 +438,7 @@ fn measure(
     // covariance has the rank of the rows: it is taken from the centred data's thin singular value
     // decomposition (`X = P S Qᵀ`, `Σ = Q S² Qᵀ / N`), never as a d × d matrix.
     let (lambda, v) = if component.arguments.len() * rows < d {
-        let views: Vec<Array2<f64>> = component.arguments.iter().map(|&a| &trace.values[a] - &mean).collect();
+        let views: Vec<Array2<f64>> = reads.iter().map(|read| &**read - &mean).collect();
         let stacked = ndarray::concatenate(Axis(0), &views.iter().map(|m| m.view()).collect::<Vec<_>>()).map_err(|e| refuse(e.to_string()))?;
         let decomposed = svd(stacked.view(), false).map_err(|e| refuse(format!("{e:?}")))?;
         let keep: Vec<usize> = (0..decomposed.singular_values.len()).filter(|&i| decomposed.singular_values[i] > decomposed.band).collect();
@@ -444,8 +447,8 @@ fn measure(
         (lambda, vectors)
     } else {
         let mut covariance = Array2::<f64>::zeros((d, d));
-        for &a in &component.arguments {
-            let centred = &trace.values[a] - &mean;
+        for read in &reads {
+            let centred = &**read - &mean;
             covariance += &centred.t().dot(&centred);
         }
         covariance /= pooled;

@@ -2,8 +2,8 @@
 //! Rank-k gated blocks: their gates' derivatives, their maps' inner products, and the code's
 //! merges and splits.
 
-use super::blocks::{Blocked, Coded, block_cosine, block_inner, fit_blocks, measure, split_block};
-use super::masked::{Library, Masked, Target, forward, mask_gradients, sites};
+use super::blocks::{Blocked, Coded, Generic, balanced, block_cosine, block_inner, fit_blocks, measure, split_block};
+use super::masked::{Library, Masked, Target, forward, mask_gradients, site_statistics, sites};
 use super::operator_program::{
     Basis, Declarations, Domain, FamilyInputs, Interface, LabelKind, Law, Node, Operator, OperatorProgram, Provenance, Slot,
     SlotValues,
@@ -121,28 +121,61 @@ fn block_inner_products_are_the_maps_frobenius_products() {
     assert!((block_cosine(&library, (0, 2), (0, 2)) - 1.0).abs() <= 1e-12);
 }
 
-fn coded<'a>(program: &'a OperatorProgram, family: &FamilyInputs, observations: f64) -> Coded<'a> {
+/// The W_in site's generic description at `observations`.
+fn generic(program: &OperatorProgram, family: &FamilyInputs, observations: f64) -> Generic {
+    let site = sites(program).into_iter().find(|s| s.name == "W_in").expect("the W_in site");
+    Generic::new(&site_statistics(program, &[site], [family.clone()], 8, 7).expect("statistics"), observations)
+}
+
+fn coded<'a>(program: &'a OperatorProgram, family: &FamilyInputs, observations: f64, describe: &'a Generic) -> Coded<'a> {
     let target = Target::every_row(program.execute(family, false).expect("executes").values[program.output].clone());
     let site = sites(program).into_iter().find(|s| s.name == "W_in").expect("the W_in site");
-    Coded {
-        model: program,
-        sites: vec![site],
-        batches: vec![(family.clone(), target)],
-        observations,
-        samples: 8,
-        bits_per_real: 1.0,
-        library_rows: family.rows as f64,
-    }
+    Coded { model: program, sites: vec![site], batches: vec![(family.clone(), target)], observations, samples: 8, describe }
+}
+
+#[test]
+fn balanced_factors_keep_the_map_with_equal_grams() {
+    let u = Array2::from_shape_fn((3, 5), |(i, j)| noise(300 + 5 * i + j));
+    let v = Array2::from_shape_fn((3, 4), |(i, j)| 3.0 * noise(400 + 4 * i + j));
+    let (bu, bv) = balanced(u.view(), v.view()).expect("balances");
+    let error = (&u.t().dot(&v) - &bu.t().dot(&bv)).iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+    assert!(error <= 1e-10, "{error}");
+    let (gu, gv) = (bu.dot(&bu.t()), bv.dot(&bv.t()));
+    let off = (&gu - &gv).iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+    assert!(off <= 1e-10 * (1.0 + gu[[0, 0]]), "{off}");
+    assert!(gu[[0, 1]].abs() <= 1e-10 * gu[[0, 0]] && gu[[0, 0]] >= gu[[1, 1]] && gu[[1, 1]] >= gu[[2, 2]]);
+    // A duplicated column collapses.
+    let doubled_u = ndarray::concatenate(ndarray::Axis(0), &[u.view(), u.slice(s![..1, ..])]).expect("stack");
+    let doubled_v = ndarray::concatenate(ndarray::Axis(0), &[v.view(), v.slice(s![..1, ..])]).expect("stack");
+    assert_eq!(balanced(doubled_u.view(), doubled_v.view()).expect("balances").0.nrows(), 3);
+}
+
+#[test]
+fn a_direction_small_on_one_side_and_large_on_the_other_is_kept() {
+    // U = diag(1, 2^-40), V = diag(1, 2^40): U Vᵀ = I, rank two.
+    let tiny = 2f64.powi(-40);
+    let u = Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.0, tiny]).expect("u");
+    let v = Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.0, 1.0 / tiny]).expect("v");
+    let (bu, bv) = balanced(u.view(), v.view()).expect("balances");
+    assert_eq!(bu.nrows(), 2);
+    let error = (&bu.t().dot(&bv) - &Array2::<f64>::eye(2)).iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+    assert!(error <= 1e-12, "{error}");
+    let library = Library { v, u, mean: Array1::zeros(2) };
+    let blocked = Blocked::new(vec![library], vec![vec![2]], vec![vec![Array2::ones((3, 1))]]);
+    let split = split_block(&blocked, 0, 0, &Array2::eye(2)).expect("splits");
+    assert_eq!(split.ranks[0], vec![1, 1]);
+    let map = split.libraries[0].u.t().dot(&split.libraries[0].v);
+    let error = (&map - &Array2::<f64>::eye(2)).iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+    assert!(error <= 1e-12, "the split moved the map by {error}");
 }
 
 #[test]
 fn a_split_keeps_the_blocks_map() {
     let (program, family) = model();
-    let coded = coded(&program, &family, 100.0);
+    let describe = generic(&program, &family, 100.0);
+    let coded = coded(&program, &family, 100.0, &describe);
     // One rank-WIDTH block, on everywhere.
-    let mut whole = Blocked::rank_one(vec![exact_library(&program)], vec![vec![Array2::ones((family.rows, 1))]]);
-    whole.ranks[0] = vec![WIDTH];
-    whole.ids[0] = vec![0];
+    let whole = Blocked::new(vec![exact_library(&program)], vec![vec![WIDTH]], vec![vec![Array2::ones((family.rows, 1))]]);
     let moment = Array2::from_shape_fn((WIDTH, WIDTH), |(i, j)| if i == j { 1.0 + i as f64 } else { 0.1 });
     let split = split_block(&whole, 0, 0, &moment).expect("splits");
     assert_eq!(split.ranks[0], vec![1; WIDTH]);
@@ -158,7 +191,8 @@ fn a_split_keeps_the_blocks_map() {
 #[test]
 fn always_cofiring_pieces_merge_by_the_code() {
     let (program, family) = model();
-    let coded = coded(&program, &family, 1000.0);
+    let describe = generic(&program, &family, 1000.0);
+    let coded = coded(&program, &family, 1000.0, &describe);
     let blocked = Blocked::rank_one(vec![exact_library(&program)], vec![vec![Array2::ones((family.rows, WIDTH))]]);
     let (start, _) = measure(&coded, &blocked).expect("measures");
     let (fitted, bits) = fit_blocks(&coded, blocked, false).expect("fits");

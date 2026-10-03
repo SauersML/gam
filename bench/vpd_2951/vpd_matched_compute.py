@@ -11,14 +11,15 @@ Its schedules run on normalized progress, so a shorter run anneals fully on a co
 adversarial reconstructions, backward), so nothing is estimated.
 
 Subcommands:
-  export N OUT_DIR                  engine export: val rows 2048..2048+N, then the 32 frontier rows
+  export N OUT_DIR                  engine export: the stream's first N rows, then the 32 frontier rows
   train OUT_DIR --steps S ...       VPD training (FLOPs counted), checkpoint OUT_DIR/model.pth
   sets RUN_DIR                      the run's library (U, V per site) and CI>0 sets on val rows
                                     1024..1151 (frontier first), in vpd_sets_export.py's formats
   engine-flops LOG [--train N]      training FLOPs of an engine run, from its log's events
 
-Training data for both methods: val rows 2048 onward (val-00000, disjoint from the frontier rows
-1024..1055 and the coder's held-out rows 1056..1151), in order.
+Training data for both methods: one stream of Pile val-00000 rows, val 1056..1151 (the rows the
+trainer's own from-scratch race trains on) and then val 2048 onward, disjoint from the 32 frontier
+rows (val 1024..1055); each method consumes the prefix its budget reaches.
 
 usage: MPD_MEM_GIB=8 ~/mpd-data/venv/bin/python vpd_matched_compute.py SUBCOMMAND ...
 """
@@ -37,7 +38,34 @@ import numpy as np
 PAPER = Path.home() / "mpd-data/spd-vpd-paper"
 VPD = Path.home() / "mpd-data/vpd"
 FRONTIER32 = Path.home() / "mpd-data/engine/vpd4l_frontier32"
-TRAIN_ROW0, FRONTIER_ROW0, SCORED_ROWS = 2048, 1024, 128
+FRONTIER_ROW0, SCORED_ROWS = 1024, 128
+# The training stream: the coder's held-out rows (val 1056..1151, the trainer's race rows), then
+# val 2048 onward.
+STREAM = [(1056, 96), (2048, 46590)]
+
+
+def train_tokens(n: int, seq: int = 512):
+    """The first n rows of the training stream."""
+    import torch
+
+    parts, left = [], n
+    for offset, rows in STREAM:
+        take = min(left, rows)
+        if take:
+            parts.append(val_tokens(take, seq=seq, offset=offset))
+        left -= take
+    assert left == 0, f"the training stream has fewer than {n} rows"
+    return torch.cat(parts)
+
+
+def stream_rows(n: int) -> str:
+    out, left = [], n
+    for offset, rows in STREAM:
+        take = min(left, rows)
+        if take:
+            out.append(f"val {offset}..{offset + take}")
+        left -= take
+    return ", ".join(out)
 KINDS = {"q_proj": "q", "k_proj": "k", "v_proj": "v", "o_proj": "o", "c_fc": "c_fc", "down_proj": "down_proj"}
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -57,10 +85,10 @@ def cmd_export(n: int, out: Path) -> None:
     for name in record["files"]:
         if name != "tokens" and not (out / f"{name}.f64").exists():
             os.symlink((FRONTIER32 / f"{name}.f64").resolve(), out / f"{name}.f64")
-    ids = np.concatenate([val_tokens(n, seq=513, offset=TRAIN_ROW0).numpy(), val_tokens(32, seq=513, offset=FRONTIER_ROW0).numpy()])
+    ids = np.concatenate([train_tokens(n, seq=513).numpy(), val_tokens(32, seq=513, offset=FRONTIER_ROW0).numpy()])
     ids.astype("<f8").tofile(out / "tokens.f64")
     record["files"]["tokens"] = {"shape": list(ids.shape)}
-    record["source"]["token_rows"] = f"val rows {TRAIN_ROW0}..{TRAIN_ROW0 + n} (training), then the frontier's 32 eval rows from val {FRONTIER_ROW0}"
+    record["source"]["token_rows"] = f"{stream_rows(n)} (training), then the frontier's 32 eval rows from val {FRONTIER_ROW0}"
     with open(out / "export.json", "w") as fh:
         json.dump(record, fh, indent=1)
     print(f"export {out}: {n} training + 32 frontier rows")
@@ -109,6 +137,7 @@ def run_config(args, Config, yaml):
     raw["slow_eval_on_first_step"] = False
     raw["train_log_freq"] = max(1, args.steps // 20)
     raw["faithfulness_warmup_steps"] = args.warmup
+    raw["lr_schedule"]["start_val"] = args.lr
     d_model, n_blocks, hidden, heads = args.ci
     t = raw["ci_config"]["simple_transformer_ci_cfg"]
     t["d_model"], t["n_blocks"], t["mlp_hidden_dim"] = d_model, n_blocks, [hidden]
@@ -123,22 +152,37 @@ def cmd_train(args) -> None:
     from torch.utils.data import DataLoader
     from torch.utils.flop_counter import FlopCounterMode
 
+    import param_decomp.run_param_decomp as loop
     from param_decomp.models.batch_and_loss_fns import make_run_batch, recon_loss_kl
-    from param_decomp.run_param_decomp import optimize
 
     out = Path(args.out)
     os.makedirs(out, exist_ok=True)
     config = run_config(args, Config, yaml)
     torch.manual_seed(config.seed)
     rows = args.batch * (args.steps + 2)
-    ids = val_tokens(rows, offset=TRAIN_ROW0)
+    ids = train_tokens(rows)
     train_loader = DataLoader(list(ids), batch_size=args.batch, shuffle=False, collate_fn=torch.stack)
     eval_loader = DataLoader(list(val_tokens(4, offset=FRONTIER_ROW0 + SCORED_ROWS)), batch_size=1, collate_fn=torch.stack)
     target = target_model()
     started = time.time()
     counter = FlopCounterMode(display=False)
+    # FLOPs by phase: the faithfulness warmup (the components' initialization) and the loop's
+    # evaluation forwards (training only needs neither's output here) are kept apart.
+    phases = {"warmup": 0, "eval": 0}
+
+    def tallied(phase, fn):
+        def run(*a, **k):
+            before = counter.get_total_flops()
+            out = fn(*a, **k)
+            phases[phase] += counter.get_total_flops() - before
+            return out
+
+        return run
+
+    loop.run_faithfulness_warmup = tallied("warmup", loop.run_faithfulness_warmup)
+    loop.evaluate = tallied("eval", loop.evaluate)
     with counter:
-        optimize(
+        loop.optimize(
             target_model=target,
             config=config,
             device=args.device,
@@ -152,24 +196,34 @@ def cmd_train(args) -> None:
         torch.mps.synchronize()
     seconds = time.time() - started
     flops = counter.get_total_flops()
+    # The loop runs steps + 1 training passes (the last one only logs) after one probe forward.
+    per_step = (flops - phases["warmup"] - phases["eval"]) / (args.steps + 1)
     final = out / f"model_{args.steps}.pth"
     os.replace(final, out / "model.pth")
     record = {
-        "steps": args.steps, "batch": args.batch, "ci": args.ci, "c_scale": args.c_scale, "warmup": args.warmup,
-        "train_rows": f"val {TRAIN_ROW0}..{TRAIN_ROW0 + rows}", "tokens": rows * 512,
-        "flops": flops, "seconds": seconds, "device": args.device,
+        "steps": args.steps, "batch": args.batch, "ci": args.ci, "c_scale": args.c_scale, "warmup": args.warmup, "lr": args.lr,
+        "train_rows": stream_rows(rows), "tokens": rows * 512,
+        "flops": flops, "warmup_flops": phases["warmup"], "eval_flops": phases["eval"], "flops_per_step": per_step,
+        "training_flops": phases["warmup"] + per_step * args.steps,
+        "seconds": seconds, "device": args.device,
         "config": json.loads(config.model_dump_json()),
     }
     json.dump(record, open(out / "run.json", "w"), indent=1)
-    print(f"trained {args.steps} steps × {args.batch}: {flops:.4e} FLOPs, {seconds:.0f}s")
+    print(f"trained {args.steps} steps × {args.batch}: {record['training_flops']:.4e} training FLOPs "
+          f"(warmup {phases['warmup']:.3e}, {per_step:.4e} per step), {seconds:.0f}s")
 
 
-def cmd_sets(run: Path, device: str) -> None:
+def cmd_sets(run: Path, device: str, check: int) -> None:
     """The run's library and its rounded (CI > 0) sets, in the formats of the reference run's
-    vpd4l_library and masks_vpd4l.npz."""
+    vpd4l_library and masks_vpd4l.npz. On the first `check` frontier rows it also reports the
+    sets' own L0, KL and greedy agreement (VPD's rounded-masked forward without Δ-components),
+    a quick reading ahead of the engine's scorer."""
     torch, yaml, Config, target_model = paper_imports()
+    import torch.nn.functional as F
+
     from param_decomp.models.batch_and_loss_fns import make_run_batch
     from param_decomp.models.component_model import ComponentModel
+    from param_decomp.models.components import make_mask_infos
     from param_decomp.utils.module_utils import expand_module_patterns
 
     record = json.load(open(run / "run.json"))
@@ -203,10 +257,18 @@ def cmd_sets(run: Path, device: str) -> None:
     offsets = np.concatenate([[0], np.cumsum(cs)])
     ids = val_tokens(SCORED_ROWS, offset=FRONTIER_ROW0)
     indptr, indices, total = [np.zeros(1, dtype=np.int64)], [], 0
+    l0, kl, agree = [], [], []
     with torch.no_grad():
         for r in range(SCORED_ROWS):
             out = model(ids[r:r + 1].to(device), cache_type="input")
             ci = model.calc_causal_importances(pre_weight_acts=out.cache, sampling=config.sampling).lower_leaky
+            if r < check:
+                logits = model(ids[r:r + 1].to(device), mask_infos=make_mask_infos({n: (ci[n] > 0).float() for n in names}))
+                p = F.log_softmax(out.output[0].double(), -1)
+                q = F.log_softmax(logits[0].double(), -1)
+                kl.append(float((p.exp() * (p - q)).sum(-1).mean()))
+                agree.append(float((p.argmax(-1) == q.argmax(-1)).double().mean()))
+                l0.append(float(sum((ci[n][0] > 0).sum() for n in names)) / ids.shape[1])
             on = torch.cat([(ci[n][0] > 0) for n in names], dim=-1).cpu().numpy()  # [S, total C]
             pos, comp = np.nonzero(on)
             indices.append(comp.astype(np.int64))
@@ -214,7 +276,9 @@ def cmd_sets(run: Path, device: str) -> None:
             total += len(comp)
     np.savez(run / "masks.npz", ids=ids.numpy(), site_names=np.array(names), vpd_offsets=offsets,
              vpd_indptr=np.concatenate(indptr), vpd_indices=np.concatenate(indices))
-    print(f"{run}: library {offsets[-1]} subcomponents, {total / (SCORED_ROWS * ids.shape[1]):.1f} on per position")
+    quick = {"rows": check, "l0": float(np.mean(l0)), "kl": float(np.mean(kl)), "agree": float(np.mean(agree))} if check else {}
+    json.dump({"delta_relative": {k: v["delta_relative"] for k, v in manifest.items()}, "check": quick}, open(run / "sets.json", "w"), indent=1)
+    print(f"{run}: library {offsets[-1]} subcomponents, {total / (SCORED_ROWS * ids.shape[1]):.1f} on per position; check {quick}")
 
 
 # ---------------------------------------------------------------- engine FLOPs from its log
@@ -237,6 +301,11 @@ def engine_costs(pieces_per_site: float) -> dict[str, float]:
     written = sum(2 * T * o * o for _, o in dims)
     read = sum(2 * T * i * i for i, _ in dims)
     eigh = sum(11 * (i ** 3 + o ** 3) + 2 * c * (i * i + o * o) for c, (i, o) in zip(rank, dims))
+    # The box claim's excess (`gam_mpd::masked::box_excess`): a reverse pass, the off part's write
+    # S = (a ∘ off) U, S F, each rank-1 block's U_c F U_cᵀ; with gradients also g_S Uᵀ, aᵀ g_S and the
+    # read gradient.
+    box = vjp + sum(2 * T * c * o + 2 * T * o * o + 2 * c * o * o for c, (i, o) in zip(rank, dims))
+    box_gradients = box + sum(4 * T * c * o + 2 * T * c * i + 2 * c * o * o for c, (i, o) in zip(rank, dims))
     return {
         "fwd": fwd,
         "vjp": vjp,
@@ -249,10 +318,12 @@ def engine_costs(pieces_per_site: float) -> dict[str, float]:
         "read_cov": read,
         "written": written,
         "eigh": eigh,
+        "box": box,
+        "box_gradients": box_gradients,
     }
 
 
-def cmd_engine_flops(log: Path, train: int, samples: int = 2) -> dict:
+def cmd_engine_flops(log: Path, train: int, box: bool, samples: int = 2) -> dict:
     """Training FLOPs of an engine run (module note): its start (site statistics on every training
     sequence, Fisher-SVD), and per training sequence its target forward, start forward, every
     selection round, its pieces step and its growth tests. Eval selections are left out."""
@@ -301,6 +372,9 @@ def cmd_engine_flops(log: Path, train: int, samples: int = 2) -> dict:
             # the tangent, and one line-search forward.
             total["selection"] += c["target_fwd"] + c["fwd"] + selection_cost(rounds)
             total["step"] += c["fwd"] + c["gradients"] + samples * c["fisher_written"] + c["read_cov"] + c["eigh"] + c["jvp"] + c["fwd"]
+            if box:
+                # The box error and its gradients at the start, and the box error of the trial.
+                total["step"] += c["box_gradients"] + c["box"]
             rounds = []
             continue
         if "split test" in line or "dropped-atoms test" in line:
@@ -328,13 +402,16 @@ def main() -> None:
     t.add_argument("--ci", type=int, nargs=4, default=[2048, 8, 8192, 16], metavar=("D_MODEL", "BLOCKS", "HIDDEN", "HEADS"))
     t.add_argument("--c-scale", type=float, default=1.0)
     t.add_argument("--warmup", type=int, default=400)
+    t.add_argument("--lr", type=float, default=5e-5)
     t.add_argument("--device", default="mps")
     s = sub.add_parser("sets")
     s.add_argument("run", type=Path)
     s.add_argument("--device", default="mps")
+    s.add_argument("--check", type=int, default=4)
     f = sub.add_parser("engine-flops")
     f.add_argument("log", type=Path)
     f.add_argument("--train", type=int, required=True)
+    f.add_argument("--box", action="store_true", help="the run trained under the box claim")
     a = p.parse_args()
     match a.cmd:
         case "export":
@@ -342,9 +419,9 @@ def main() -> None:
         case "train":
             cmd_train(a)
         case "sets":
-            cmd_sets(a.run, a.device)
+            cmd_sets(a.run, a.device, a.check)
         case "engine-flops":
-            cmd_engine_flops(a.log, a.train)
+            cmd_engine_flops(a.log, a.train, a.box)
 
 
 if __name__ == "__main__":

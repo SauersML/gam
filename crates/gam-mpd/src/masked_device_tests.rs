@@ -59,9 +59,8 @@ fn the_masked_device_path_matches_the_cpu_within_bands() {
         let covariances: Vec<Array2<f64>> = masked
             .sites
             .iter()
-            .enumerate()
-            .map(|(k, site)| {
-                let centred = &read_values(&trace, site).expect("reads") - masked.mean(k);
+            .map(|site| {
+                let centred = read_values(&trace, site).expect("reads");
                 fast_atb(&centred, &centred) / family.rows as f64
             })
             .collect();

@@ -1,28 +1,34 @@
 //! Program decomposition of a network's parameters (#2951).
 //!
 //! The object is an executable decomposition of a network's parameterized computation, not a
-//! reconstruction of its activations. One engine (`engine`, over `operator_program`,
+//! reconstruction of its activations. The engine (`engine`, over `operator_program`,
 //! `operator_rewrites`, `factors`, `refit`, `derivatives`) takes the model, imported as an
-//! operator program (`import`, `safetensors`), and an optional behaviour (`behaviors`,
-//! `causal_states`), and searches for the program with the shortest two-part code: program
-//! bits (`codec`, `precision`) plus `Σ KL(model ‖ program)/ln 2` over the contract's family
-//! (`contract`). `view` prints a program's components.
+//! operator program (`import`, `safetensors`), and searches the proposals of its primitive
+//! library for a shorter two-part code: program bits (`codec`, `precision`) plus
+//! `Σ KL(model ‖ program)/ln 2` over the contract's family (`contract`). A proposal is kept when
+//! the measured total drops. The search stops when no proposal is accepted or the budget is spent:
+//! the result has no further accepted move under this proposal set, and nothing more is claimed
+//! about it. `view` and `printer` print a program's operators and rules.
+//!
+//! The masked decomposition (`pieces`, `masked`, `blocks`) fits per-input rank-one subcomponents
+//! of chosen linear maps through the model's own masked forward. Its mask search is heuristic:
+//! derivatives propose flips, and a flip is kept when the measured total drops.
 //!
 //! Exact execution belongs to `gated_rewrite` (gated activations, norms), `attention` (rotary
 //! attention under the source's joint softmax), `block` and `apply` (native linear reads with
 //! their radii), `joint_operators` (gauge-invariant query/key and value/output operators) and
 //! `llama_simple_mlp` (VPD's 4-layer target). The edit compiler (`compile`, over `lift` and
 //! `gauge`) turns control settings into native parameter edits or infeasibility witnesses.
-//! `theory` states and proves what a certificate means.
 //!
 //! # Evidence
 //!
-//! Every reported quantity carries its evidence status (`supports`): exact (algebraic, or
-//! exhaustive over a stated finite family), a uniform bound over a stated region including
-//! numerical error, a statistical estimate with its law and standard error, a counterexample,
-//! or unresolved. A result never returns a stronger status than it proved. Bounds (`bounds`,
-//! `verify`, `secant`) are derived (a roundoff bound, an eigengap), never tuned; derivatives
-//! are analytic, and finite differences belong in tests only.
+//! Reported quantities carry an evidence status (`supports`): exact (algebraic, or exhaustive
+//! over a stated finite family), a uniform bound over a stated region including numerical error,
+//! a statistical estimate with its distribution and standard error, a counterexample, or
+//! unresolved. The status type checks that each status is well formed; it does not check that a
+//! caller picked the status its computation supports. Roundoff bounds (`bounds`, `verify`,
+//! `secant`) are derived from the operations performed; derivatives are analytic, and finite
+//! differences belong in tests only.
 
 // Shared planted-rotation fixtures with derived float-defect bounds.
 #[cfg(test)]
@@ -56,7 +62,7 @@ mod operator_program_tests;
 // The declared contract of a program decomposition: load, complete and sampled families.
 pub mod contract;
 
-// Contract-driven program decomposition: primitives, batched certified MDL search, certificates.
+// Program decomposition by two-part code: primitives propose, a change is kept when the measured total drops.
 pub mod engine;
 
 // The engine on planted programs: recovery, labelling up to automorphism, restatement invariance.
@@ -74,10 +80,10 @@ pub mod cegar;
 #[cfg(test)]
 mod cegar_tests;
 
-// The component-level view of an operator program: reads, laws, writes, uses, bits, unresolved share.
+// The operator-level view of a program: reads, applying node kinds, writes, uses, bits by storage.
 pub mod view;
 
-// The human-facing reading of an operator program: rules with bindings, bit split, unresolved map.
+// The human-facing reading of an operator program: rules with bindings, bits by storage, per-input KL.
 pub mod printer;
 
 // The printer on a planted two-frequency circuit.
@@ -90,7 +96,7 @@ pub mod paths;
 // Refitting a program's reals to its contract: exact Newton–CG on the readout's convex KL.
 pub mod refit;
 
-// Exact rewrites of operator programs: constant folding, composition, mixes, character and plane bases.
+// Exact rewrites of operator programs: constant folding, composition, mixes, stacking, a given character basis.
 pub mod operator_rewrites;
 
 // Shared writer factors: operators writing one space factored through one library of directions.
@@ -100,7 +106,8 @@ pub mod factors;
 // lists few pieces (listing code plus second-order KL).
 pub mod pieces;
 
-// Per-input pieces trained through the model's own masked forward, with exact selection.
+// Per-input subcomponents trained through the model's own masked forward; heuristic mask search, a flip
+// kept when the measured total drops.
 pub mod masked;
 
 #[cfg(test)]
@@ -112,6 +119,19 @@ pub mod blocks;
 #[cfg(test)]
 mod blocks_tests;
 
+// Structured descriptions of a block: its readers and writers in decodable charts (harmonic,
+// frames), its core by its own structure, priced at the KL its error costs.
+pub mod describe;
+
+#[cfg(test)]
+mod describe_tests;
+
+// The frozen tail of a decoder language model after a decomposed window, as a masked head.
+pub mod tail;
+
+#[cfg(test)]
+mod tail_tests;
+
 // Atomic checkpoints of a streaming masked fit, so an interrupted run resumes exactly.
 pub mod checkpoint;
 
@@ -120,10 +140,6 @@ mod checkpoint_tests;
 
 #[cfg(test)]
 mod pieces_tests;
-
-// Identifiability: the search's ties classified as gauge, abstraction, redundancy or a distinct
-// hypothesis with a natively executed witness.
-pub mod identify;
 
 // Exact directional derivatives of operator programs, and precisions derived from curvature.
 pub mod derivatives;
@@ -161,9 +177,6 @@ pub mod joint_operators;
 
 // The tensor registry: storage, aliases and use sites.
 pub mod lift;
-
-// Residual ReLU MLP stacks over their sources: the exact path rewrite and its two-part code fit.
-pub mod mlp_paths;
 
 // Exact module splits of plain GELU/ReLU MLPs under the worst-case replacement contract, with certified eta.
 pub mod module_split;
@@ -203,31 +216,8 @@ pub mod secant;
 // Residual-stream observability: readouts pulled back through declared steps into one Gramian.
 pub mod state;
 
-// Causal-state machines of a behaviour: finite classes, counters and retrieve registers under one two-part code.
-pub mod causal_states;
-
 // Evidence status and ranked robust supports.
 pub mod supports;
-
-// The theory: certificate soundness, invariance, identification, causal abstraction, code sensitivity.
-pub mod theory;
-
-// Machine checks of the theory's theorems.
-#[cfg(test)]
-mod theory_tests;
-
-// Symmetries discovered from weights and the isotypic bases they force.
-pub mod symmetry;
-
-// The planted groups, discovery toys and nulls against the symmetry owner.
-#[cfg(test)]
-mod symmetry_tests;
-
-// Behaviour discovery: the family partitioned into groups, each its own subprogram, by one two-part code.
-pub mod behaviors;
-
-#[cfg(test)]
-mod behaviors_tests;
 
 // Exact normalization of operator programs by equality saturation, gains kept symbolic.
 pub mod egraph;
@@ -242,3 +232,17 @@ pub mod antiunify;
 // Rule discovery on planted subroutines under orthogonal and linear changes of basis, ResidMLP toys, nulls.
 #[cfg(test)]
 mod antiunify_tests;
+
+// Concepts: co-firing groups of subcomponents, one latent per word, fitted by one KT code; the
+// vocabulary a word's computation is described in.
+pub mod concepts;
+
+#[cfg(test)]
+mod concepts_tests;
+
+// Gate laws: which subcomponents are on for an input, from a small bits-charged law over the
+// model's own amplitudes (fit, code, feature screen, decisions).
+pub mod gates;
+
+#[cfg(test)]
+mod gates_tests;

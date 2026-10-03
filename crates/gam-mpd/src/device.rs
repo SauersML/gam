@@ -76,6 +76,12 @@ pub fn product(op: &Arc<Operator>, x: &Array2<f64>, layout: Layout) -> Result<Ar
     {
         return Ok(banded.values);
     }
+    // The identity and a diagonal are column scales, the same in either layout.
+    if let OperatorBody::Identity | OperatorBody::Diagonal { .. } = &op.body
+        && let Some(d) = op.diagonal()
+    {
+        return Ok(x * &d);
+    }
     let a = op.matrix_cow();
     Ok(match layout {
         Layout::AsStored => fast_ab(x, a.as_ref()),

@@ -13,6 +13,8 @@ use crate::operator_program::{
 };
 use crate::precision::DeclaredPrecision;
 use crate::test_support::test_governor;
+use gam_linalg::faer_ndarray::FaerSvd;
+use gam_linalg::roundoff::factor_singular_band;
 
 fn reals(rows: usize, cols: usize, salt: usize) -> Array2<f64> {
     Array2::from_shape_fn((rows, cols), |(i, j)| ((i * 13 + j * 7 + salt * 5) as f64 * 0.731).sin() * 1.1)
@@ -268,4 +270,102 @@ fn a_target_outside_the_trace_is_refused() {
         decompose(test_governor(), &program, &inputs, &trace, 99, &PathOptions::expansions(1)),
         Err(PathError::Target { node: 99, .. })
     ));
+}
+
+/// The Sylvester Hadamard matrix of order `2^power`: entries `±1`, orthogonal
+/// columns of squared norm `2^power`.
+fn hadamard(power: u32) -> Array2<f64> {
+    let order = 1_usize << power;
+    Array2::from_shape_fn((order, order), |(row, col)| {
+        if (row & col).count_ones() % 2 == 0 { 1.0 } else { -1.0 }
+    })
+}
+
+/// `H_m[:, :k] diag(s) H_n[:, :k]ᵀ`, every entry an exact dyadic sum, so its
+/// exact singular values are `|sᵢ|·√(mn)` and the matrix as stored is exact.
+fn exact_spectrum(rows_power: u32, cols_power: u32, weights: &[f64]) -> Array2<f64> {
+    let left = hadamard(rows_power);
+    let right = hadamard(cols_power);
+    let mut matrix = Array2::<f64>::zeros((left.nrows(), right.nrows()));
+    for (index, &weight) in weights.iter().enumerate() {
+        for row in 0..left.nrows() {
+            for col in 0..right.nrows() {
+                matrix[[row, col]] += weight * left[[row, index]] * right[[col, index]];
+            }
+        }
+    }
+    matrix
+}
+
+/// The Gram-spectrum bounds bracket the exact `σ_max` of exactly representable
+/// matrices with a known spectrum: full rank, rank deficient, wide and tall,
+/// with a clustered top, and at both ends of the exponent range; the bracket is
+/// as tight as its derivation says, and `formation` widens it by exactly itself.
+#[test]
+fn gram_spectrum_bounds_bracket_the_exact_largest_singular_value() {
+    let cluster = 1.0 - (-40.0_f64).exp2();
+    let cases: Vec<(&str, u32, u32, Vec<f64>)> = vec![
+        ("full rank", 6, 6, (0..64).map(|index| 1.0 - index as f64 / 128.0).collect()),
+        ("clustered top", 6, 6, vec![1.0, cluster, cluster, cluster, 0.5, 0.25]),
+        ("rank deficient tall", 7, 5, vec![0.75, 0.5, 0.0, 0.125]),
+        ("rank deficient wide", 5, 7, vec![0.75, 0.5, 0.0, 0.125]),
+        ("rank one", 6, 4, vec![0.5]),
+        ("negative weights", 5, 5, vec![-1.0, 0.875, -0.875]),
+    ];
+    for (name, rows_power, cols_power, weights) in cases {
+        let matrix = exact_spectrum(rows_power, cols_power, &weights);
+        let scale = ((matrix.nrows() * matrix.ncols()) as f64).sqrt();
+        let exact = weights.iter().fold(0.0_f64, |largest, weight| largest.max(weight.abs())) * scale;
+        for exponent in [-1000_i32, 0, 1000] {
+            let power = f64::from(exponent).exp2();
+            let scaled = matrix.mapv(|value| value * power);
+            let truth = exact * power;
+            let bounds = spectral_norm_bounds(test_governor(), &scaled, 0.0, "test").expect("bounds");
+            assert!(
+                bounds.lower <= truth && truth <= bounds.upper,
+                "{name} at 2^{exponent}: {bounds:?} misses {truth:e}"
+            );
+            let long = scaled.nrows().max(scaled.ncols()) as f64;
+            let short = scaled.nrows().min(scaled.ncols()) as f64;
+            let width = (bounds.upper - bounds.lower) / truth;
+            assert!(
+                width <= 4.0 * (long + 1.0) * short * UNIT_ROUNDOFF,
+                "{name} at 2^{exponent}: relative width {width:e}"
+            );
+        }
+        let formation = 0.5 * exact;
+        let widened = spectral_norm_bounds(test_governor(), &matrix, formation, "test").expect("bounds");
+        let tight = spectral_norm_bounds(test_governor(), &matrix, 0.0, "test").expect("bounds");
+        assert_eq!(widened.upper, tight.upper + formation, "{name}");
+        assert_eq!(widened.lower, (tight.lower - formation).max(0.0), "{name}");
+    }
+    let zero = Array2::<f64>::zeros((3, 5));
+    let bounds = spectral_norm_bounds(test_governor(), &zero, 0.25, "test").expect("bounds");
+    assert_eq!((bounds.lower, bounds.upper), (0.0, 0.25));
+    let mut infinite = Array2::<f64>::eye(3);
+    infinite[[1, 2]] = f64::INFINITY;
+    assert!(matches!(
+        spectral_norm_bounds(test_governor(), &infinite, 0.0, "test"),
+        Err(PathError::NonFiniteMatrix { .. })
+    ));
+}
+
+/// On a seeded dense matrix the bracket agrees with the full SVD it replaces:
+/// each interval contains the other's centre, both being certified.
+#[test]
+fn gram_spectrum_bounds_agree_with_the_singular_value_decomposition() {
+    use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(2951);
+    for (rows, cols) in [(40, 40), (17, 90), (90, 17), (1, 30)] {
+        let matrix = Array2::from_shape_fn((rows, cols), |_| rng.random_range(-1.0..1.0));
+        let (_, sigma, _) = matrix.svd(false, false).expect("svd");
+        let sigma_max = sigma.iter().fold(0.0_f64, |largest, &value| largest.max(value));
+        let band = factor_singular_band(rows, cols, sigma_max);
+        let bounds = spectral_norm_bounds(test_governor(), &matrix, 0.0, "test").expect("bounds");
+        assert!(
+            bounds.lower <= sigma_max + band && sigma_max - band <= bounds.upper,
+            "{rows}x{cols}: {bounds:?} against σ̂ {sigma_max:e} ± {band:e}"
+        );
+    }
 }

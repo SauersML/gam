@@ -86,7 +86,8 @@ fn unit_pieces_are_the_map_one_unit_each() {
     }
 }
 
-/// Inputs in two groups, each using the map through its own rank-one direction: the dictionary
+/// Inputs in two groups, each using the map through its own rank-one direction (reads and
+/// gradients each along one direction per group, of either sign): the dictionary
 /// finds atoms that carry most of the inputs' attribution energy, and with the remainder appended
 /// all pieces on is the map.
 #[test]
@@ -94,7 +95,7 @@ fn the_attribution_dictionary_carries_grouped_inputs_and_is_the_map() {
     let rows = 400;
     let directions_in = [Array1::from_shape_fn(D_IN, |i| noise(70 + i)), Array1::from_shape_fn(D_IN, |i| noise(90 + i))];
     let directions_out = [Array1::from_shape_fn(D_OUT, |i| noise(170 + i)), Array1::from_shape_fn(D_OUT, |i| noise(190 + i))];
-    let x = Array2::from_shape_fn((rows, D_IN), |(t, i)| directions_in[t % 2][i] * (1.0 + noise(3000 + t)) + 0.05 * noise(10 + D_IN * t + i));
+    let x = Array2::from_shape_fn((rows, D_IN), |(t, i)| directions_in[t % 2][i] * noise(3000 + t) + 0.05 * noise(10 + D_IN * t + i));
     let g = Array2::from_shape_fn((rows, D_OUT), |(t, i)| directions_out[t % 2][i] * noise(5000 + t) + 0.05 * noise(9000 + D_OUT * t + i));
     let w = Array2::from_shape_fn((D_OUT, D_IN), |(i, j)| noise(500 + D_IN * i + j));
     let mean: Array1<f64> = x.mean_axis(Axis(0)).expect("rows");

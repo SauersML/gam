@@ -5,11 +5,15 @@
 //! A *site* is a set of dense operators read as affine terms whose names agree up to a trailing
 //! index (one projection's heads). As a whole it is the block matrix `W` from the concatenation of
 //! the nodes it reads to the concatenation of the nodes it writes. A library of `C` rank-1 pieces
-//! `W ≈ Σ_c u_c v_cᵀ` on the centred read `x − μ` replaces it in the program:
+//! `W ≈ Σ_c u_c v_cᵀ` replaces it in the program, on the read itself:
 //!
 //! ```text
-//! z = Vᵀ(x − μ),   z̃ = z ⊙ m,   each written node: U_iᵀ z̃ + W_i μ in place of the site's terms,
+//! z = Vᵀ x,   z̃ = z ⊙ m,   each written node: U_iᵀ z̃ in place of the site's terms,
 //! ```
+//!
+//! so a mask is a weight intervention and nothing else: centring the read (`Vᵀ(x − μ)` with `W μ`
+//! folded into a bias) would move a bias-free site's bias whenever a piece is off. A library's
+//! `mean` is ignored here.
 //!
 //! with `m` a per-input binary mask (one raw slot per site): the masked forward is the program
 //! itself, executed natively, and every derivative of it is exact ([`super::derivatives::vjp`]).
@@ -20,7 +24,7 @@
 //! `U_c` (`d_out × k_c`) and `V_c` (`d_in × k_c`), with one gate per input,
 //!
 //! ```text
-//! z_c = V_cᵀ(x − μ),   z̃_c = m_c z_c,   out += U_c z̃_c,
+//! z_c = V_cᵀ x,   z̃_c = m_c z_c,   out += U_c z̃_c,
 //! ```
 //!
 //! so a rank-2 rotation or a head's subspace is one name per input rather than `k_c` slices that
@@ -45,6 +49,23 @@
 //! * **pieces** — the exact gradient of the total KL in every site's `V` and `U` given the masks,
 //!   preconditioned by the read covariance and the written nodes' Fisher, stepped by
 //!   backtracking on the exact total.
+//!
+//! # Claims
+//!
+//! An explanation declares what its off subcomponents may be, and its error is the KL over what it
+//! declares. Under [`Claim::Corner`] they are absent: an input's error is the KL of its masks. Under
+//! [`Claim::Box`] each off gate may be anywhere in `[0, 1]`, and an input's error is the KL expected
+//! over every off gate drawn uniform and independent, to second order about the masks in each
+//! site's written value: with `Z_c` an off block's output (`U_c z_c`) and `S = Σ_off Z_c`, the
+//! gates' moments `E m = ½`, `E m² = ⅓` give
+//!
+//! ```text
+//! E KL = KL(masks) + Σ_sites ½ gᵀS + ½ (¼ SᵀF S + 1/12 Σ_off Z_cᵀ F Z_c),
+//! ```
+//!
+//! `g` the KL's gradient at the written value and `F` its Fisher ([`box_excess`]). A fit under the
+//! box claim learns subcomponents that explain the input whatever the off ones are set to, not only
+//! at exactly one mask.
 //!
 //! # Behaviours
 //!
@@ -175,9 +196,8 @@ pub struct Library {
 pub struct Masked {
     pub program: OperatorProgram,
     pub sites: Vec<Site>,
-    /// Per site, its read mean `μ` and its number of pieces; the pieces themselves live only in its
-    /// operators ([`Masked::library`]).
-    means: Vec<Array1<f64>>,
+    /// Per site, its number of pieces; the pieces themselves live only in its operators
+    /// ([`Masked::library`]).
     pieces: Vec<usize>,
     /// Per site, its blocks' ranks in column order (module note, "Blocks"), summing to its pieces.
     ranks: Vec<Vec<usize>>,
@@ -188,7 +208,6 @@ pub struct Masked {
     /// Per site: its `V` operators (per read node), its centring bias, its `U` operators (per
     /// written node).
     v_ops: Vec<Vec<usize>>,
-    centre_ops: Vec<usize>,
     u_ops: Vec<Vec<usize>>,
     read_offsets: Vec<Vec<usize>>,
     write_offsets: Vec<Vec<usize>>,
@@ -238,10 +257,8 @@ impl Masked {
         let interfaces = model.interfaces().map_err(|e| e.to_string())?;
         let mut program = model.clone();
         let base_slots = program.declarations.slots.len();
-        let (mut slots, mut v_ops, mut centre_ops, mut u_ops) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        let (mut read_offsets, mut write_offsets, mut means, mut counts) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        // The new bias of every written node: its old bias plus each site's `W_i μ`.
-        let mut biases: BTreeMap<usize, Array1<f64>> = BTreeMap::new();
+        let (mut slots, mut v_ops, mut u_ops) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut read_offsets, mut write_offsets, mut counts) = (Vec::new(), Vec::new(), Vec::new());
         // Each library is dropped once its operators hold it.
         for (k, (site, library)) in sites.iter().zip(libraries).enumerate() {
             let pieces = library.v.nrows();
@@ -260,33 +277,17 @@ impl Masked {
                 program.operators.push(dense(format!("{}·V{j}", site.name), coordinates.clone(), interfaces[node].clone(), block)?);
                 vs.push(program.operators.len() - 1);
             }
-            let centre = (-library.v.dot(&library.mean)).insert_axis(Axis(1));
-            program.operators.push(dense(format!("{}·centre", site.name), coordinates.clone(), Interface::constant(), centre)?);
-            centre_ops.push(program.operators.len() - 1);
-            let w = matrix(model, site)?;
             let mut us = Vec::new();
             for (i, &node) in site.writes.iter().enumerate() {
                 let block = library.u.slice(s![.., wo[i]..wo[i + 1]]).t().to_owned();
                 program.operators.push(dense(format!("{}·U{i}", site.name), interfaces[node].clone(), coordinates.clone(), block)?);
                 us.push(program.operators.len() - 1);
-                let fold = w.slice(s![wo[i]..wo[i + 1], ..]).dot(&library.mean);
-                let entry = biases.entry(node).or_insert_with(|| match &model.nodes[node] {
-                    Node::Affine { bias: Some(b), .. } => model.operators[*b].matrix().column(0).to_owned(),
-                    _ => Array1::zeros(fold.len()),
-                });
-                *entry += &fold;
             }
             v_ops.push(vs);
             u_ops.push(us);
             read_offsets.push(ro);
             write_offsets.push(wo);
-            means.push(library.mean);
             counts.push(pieces);
-        }
-        let mut bias_ops: BTreeMap<usize, usize> = BTreeMap::new();
-        for (node, values) in &biases {
-            program.operators.push(dense(format!("bias of node {node}"), interfaces[*node].clone(), Interface::constant(), values.clone().insert_axis(Axis(1)))?);
-            bias_ops.insert(*node, program.operators.len() - 1);
         }
         // Rebuild the nodes: each site's mask, z and z̃ just before its first written node.
         let identity_ops: Vec<usize> = (0..program.operators.len()).collect();
@@ -301,7 +302,7 @@ impl Masked {
                     nodes.push(Node::Raw { slot: slots[k] });
                     let mask = nodes.len() - 1;
                     let terms = site.reads.iter().zip(&v_ops[k]).map(|(r, op)| (map[*r], *op)).collect();
-                    nodes.push(Node::Affine { terms, bias: Some(centre_ops[k]) });
+                    nodes.push(Node::Affine { terms, bias: None });
                     z_nodes[k] = nodes.len() - 1;
                     nodes.push(Node::Hadamard { left: z_nodes[k], right: mask });
                     masked_nodes[k] = nodes.len() - 1;
@@ -309,15 +310,12 @@ impl Masked {
             }
             let mut rebuilt = node.clone();
             remap_node(&mut rebuilt, &map, &identity_ops, &identity_bases, &identity_rules);
-            if let Node::Affine { terms, bias } = &mut rebuilt {
+            if let Node::Affine { terms, .. } = &mut rebuilt {
                 for (k, site) in sites.iter().enumerate() {
                     let Some(i) = site.writes.iter().position(|w| *w == index) else { continue };
                     let ops: Vec<usize> = site.terms.iter().filter(|(wi, _, _)| *wi == i).map(|(_, _, op)| *op).collect();
                     terms.retain(|(_, op)| !ops.contains(op));
                     terms.push((masked_nodes[k], u_ops[k][i]));
-                }
-                if let Some(op) = bias_ops.get(&index) {
-                    *bias = Some(*op);
                 }
             }
             nodes.push(rebuilt);
@@ -334,14 +332,12 @@ impl Masked {
         Ok(Self {
             program,
             sites: reads_mapped,
-            means,
             pieces: counts,
             ranks,
             slots,
             z: z_nodes,
             masked: masked_nodes,
             v_ops,
-            centre_ops,
             u_ops,
             read_offsets,
             write_offsets,
@@ -404,10 +400,6 @@ impl Masked {
         out
     }
 
-    /// Site `k`'s read mean `μ`.
-    pub fn mean(&self, k: usize) -> &Array1<f64> {
-        &self.means[k]
-    }
 
     /// Site `k`'s library as the program holds it (its operators are the only copy).
     pub fn library(&self, k: usize) -> Result<Library, String> {
@@ -415,7 +407,8 @@ impl Masked {
         let v = ndarray::concatenate(Axis(1), &v_blocks.iter().map(|b| b.view()).collect::<Vec<_>>()).map_err(|e| e.to_string())?;
         let u_blocks: Vec<_> = self.u_ops[k].iter().map(|&op| self.program.operators[op].matrix_cow()).collect();
         let u = ndarray::concatenate(Axis(1), &u_blocks.iter().map(|b| b.t()).collect::<Vec<_>>()).map_err(|e| e.to_string())?;
-        Ok(Library { v, u, mean: self.means[k].clone() })
+        let d_in = v.ncols();
+        Ok(Library { v, u, mean: Array1::zeros(d_in) })
     }
 
     /// Site `k`'s own map `W` (written × read), from the model's operators, which the program
@@ -425,6 +418,41 @@ impl Masked {
             return Err(format!("{}: its map was released", self.sites[k].name));
         }
         matrix(&self.program, &self.sites[k])
+    }
+
+    /// Restrict site `k`'s pieces to the reads they act on: `v_c ← P v_c`, `P` the projector on the
+    /// leading eigendirections of the reads' second moment `E[x xᵀ]` (from the reads' mean
+    /// `data_mean` and covariance) that hold all but `left_out` of it. What a piece
+    /// reads off that span is unidentified by the data, costs library bits, and acts unpredictably
+    /// on an edited input. Returns the dimension kept.
+    pub fn project_reads(&mut self, k: usize, data_mean: &Array1<f64>, covariance: &Array2<f64>, left_out: f64) -> Result<usize, String> {
+        let shift = data_mean;
+        let mut moment = covariance + &shift.view().insert_axis(Axis(1)).dot(&shift.view().insert_axis(Axis(0)));
+        let n = moment.nrows();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let v = 0.5 * (moment[[i, j]] + moment[[j, i]]);
+                moment[[i, j]] = v;
+                moment[[j, i]] = v;
+            }
+        }
+        let decomposed = super::dense::eigh(moment.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
+        let total: f64 = decomposed.values.iter().map(|l| l.max(0.0)).sum();
+        // Eigenvalues ascend: keep from the top until all but `left_out` is held.
+        let (mut held, mut kept) = (0.0, 0);
+        for l in decomposed.values.iter().rev() {
+            if held >= (1.0 - left_out) * total {
+                break;
+            }
+            held += l.max(0.0);
+            kept += 1;
+        }
+        let basis = decomposed.vectors.slice(s![.., n - kept..]);
+        let projector = basis.dot(&basis.t());
+        let mut library = self.library(k)?;
+        library.v = library.v.dot(&projector);
+        self.set_library(k, library)?;
+        Ok(kept)
     }
 
     /// Drop what only the pieces' training reads, for a selection-only fit: the replaced site
@@ -471,16 +499,11 @@ impl Masked {
             let block = library.v.slice(s![.., ro[j]..ro[j + 1]]).to_owned();
             self.program.operators[op] = dense(old.name.clone(), old.rows.clone(), old.cols.clone(), block)?;
         }
-        let op = self.centre_ops[k];
-        let old = &self.program.operators[op];
-        let centre = (-library.v.dot(&library.mean)).insert_axis(Axis(1));
-        self.program.operators[op] = dense(old.name.clone(), old.rows.clone(), old.cols.clone(), centre)?;
         for (i, &op) in self.u_ops[k].iter().enumerate() {
             let old = &self.program.operators[op];
             let block = library.u.slice(s![.., wo[i]..wo[i + 1]]).t().to_owned();
             self.program.operators[op] = dense(old.name.clone(), old.rows.clone(), old.cols.clone(), block)?;
         }
-        self.means[k] = library.mean;
         Ok(())
     }
 
@@ -531,18 +554,27 @@ pub fn kl(target: &Target, logits: &Array2<f64>) -> (Array1<f64>, Array2<f64>) {
             if !target.scores(r) {
                 return 0.0;
             }
-            let (p, q) = (softmax(target.logits.row(r)), softmax(logits.row(r)));
+            // From log-probabilities, so the value and its gradient q − p are one objective even
+            // where q underflows.
+            let (log_p, log_q) = (log_softmax(target.logits.row(r)), log_softmax(logits.row(r)));
             let mut total = 0.0;
-            for c in 0..p.len() {
-                if p[c] > 0.0 {
-                    total += p[c] * (p[c].ln() - q[c].max(f64::MIN_POSITIVE).ln());
+            for c in 0..log_p.len() {
+                let p = log_p[c].exp();
+                if p > 0.0 {
+                    total += p * (log_p[c] - log_q[c]);
                 }
-                row[c] = q[c] - p[c];
+                row[c] = log_q[c].exp() - p;
             }
             total
         })
         .collect();
     (Array1::from(values), cotangent)
+}
+
+fn log_softmax(z: ndarray::ArrayView1<'_, f64>) -> Array1<f64> {
+    let m = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let log_total = m + z.iter().map(|v| (v - m).exp()).sum::<f64>().ln();
+    z.mapv(|v| v - log_total)
 }
 
 fn softmax(z: ndarray::ArrayView1<'_, f64>) -> Array1<f64> {
@@ -622,8 +654,8 @@ fn gradients_proposed(
         let z = &trace.values[masked.z[k]];
         let mask_gradient = masked.to_blocks(k, &(&cot_masked * z));
         let cot_z = &cot_masked * &masked.expand(k, &masks[k]);
-        let centred = &read_values(trace, site)? - &masked.means[k];
-        let v_gradient = product_atb(&cot_z, &centred).map_err(|e| e.to_string())?;
+        let reads = read_values(trace, site)?;
+        let v_gradient = product_atb(&cot_z, &reads).map_err(|e| e.to_string())?;
         let zm = &trace.values[masked.masked[k]];
         let written: Vec<Array2<f64>> = masked.written[k]
             .iter()
@@ -874,13 +906,19 @@ pub fn code(kl: &Array1<f64>, listing: &Array1<f64>, observations: f64) -> Array
 /// frequencies among new activations; the first input of a sequence lists its whole set. Every
 /// rate is the Krichevsky–Trofimov estimate from the counts of the sets selected so far, so the
 /// code is a valid prefix code given those counts, and an always-on piece costs almost nothing.
+///
+/// [`Coder::ran`] instead charges each input for the weights that ran on it: every block on pays
+/// its own description bits (`costs`), with no context and no set credit, so nothing is free for
+/// being reused ([`super::blocks`]).
 pub struct Coder {
-    /// Listing bits of a piece listed new.
+    /// Listing bits of a piece listed new, or under [`Coder::ran`] a block's description bits.
     pub costs: Vec<Array1<f64>>,
     /// Per piece, the probability it stays on from one input to the next.
     pub stay: Vec<Array1<f64>>,
     /// Per input, the previous input of its sequence.
     pub previous: Vec<Option<usize>>,
+    /// Whether the sets are listed (the context code) or the blocks that ran are described.
+    listed: bool,
 }
 
 /// The counts behind a [`Coder`]: per piece, transitions from on, and new activations.
@@ -941,15 +979,29 @@ impl Context {
     /// The coder these counts give, for inputs whose previous inputs are `previous`.
     pub fn coder(&self, previous: Vec<Option<usize>>) -> Coder {
         let stay = self.stayed.iter().zip(&self.was_on).map(|(s, w)| (s + 0.5) / &(w + 1.0)).collect();
-        Coder { costs: costs_from_counts(&self.new), stay, previous }
+        Coder { costs: costs_from_counts(&self.new), stay, previous, listed: true }
     }
 }
 
 impl Coder {
+    /// The code charging each of `rows` inputs `costs[k][c]` for every block `c` of site `k` on
+    /// there: the description of the weights that ran on it.
+    pub fn ran(costs: Vec<Array1<f64>>, rows: usize) -> Self {
+        Self { costs, stay: Vec::new(), previous: vec![None; rows], listed: false }
+    }
+
     /// Each input's explanation bits.
     pub fn bits(&self, masks: &[Array2<f64>]) -> Array1<f64> {
         let rows = masks.first().map_or(0, |m| m.nrows());
         let mut out = Array1::<f64>::zeros(rows);
+        if !self.listed {
+            for (m, costs) in masks.iter().zip(&self.costs) {
+                for r in 0..rows {
+                    out[r] += m.row(r).iter().zip(costs.iter()).filter(|(x, _)| **x > 0.0).map(|(_, c)| c).sum::<f64>();
+                }
+            }
+            return out;
+        }
         for r in 0..rows {
             let mut fresh = 0usize;
             for (k, m) in masks.iter().enumerate() {
@@ -985,6 +1037,9 @@ impl Coder {
     /// The change of input `r`'s own bits when entry `(k, c)` flips, with `fresh` new pieces now.
     fn marginal(&self, masks: &[Array2<f64>], r: usize, k: usize, c: usize, fresh: usize) -> f64 {
         let on = masks[k][[r, c]] > 0.0;
+        if !self.listed {
+            return if on { -self.costs[k][c] } else { self.costs[k][c] };
+        }
         match self.previous[r] {
             Some(p) if masks[k][[p, c]] > 0.0 => {
                 let q = self.stay[k][c];
@@ -1012,14 +1067,42 @@ pub fn previous_inputs(inputs: &FamilyInputs) -> Vec<Option<usize>> {
     }
 }
 
-/// Selection (module note): rounds of predicted flips, each input keeping its own only when its
-/// exact code falls, until no input changes. The second-order prediction is additive over flips, but
-/// flips interact, so a proposal of `k` flips over-promises by a term that grows with `k`. Each input
-/// carries its own measured interaction `α`, fitted from its last evaluated proposal as
-/// `(predicted − actual saving) / k²`, and proposes the `k` best flips maximising
-/// `S(k) − α k²` (`S` the predicted saving of its best `k`): the step size comes from the input's own
-/// evidence rather than a schedule. Returns the masks and the final exact KL.
+/// Selection (module note): rounds of predicted flips, each sequence keeping its inputs' flips only
+/// when its exact code falls, until no sequence changes. Sequences are independent, but the inputs
+/// of one are not (attention carries an earlier input's masks into every later one), so a proposal
+/// is accepted or refused per sequence, on exactly the masks it commits. The second-order
+/// prediction is additive over flips, but flips interact, so a proposal of `k` flips over-promises
+/// by a term that grows with `k`. Each input carries its own measured interaction `α`, fitted from
+/// its last evaluated proposal as `(predicted − actual saving) / k²`, and proposes the `k` best flips
+/// maximising `S(k) − α k²` (`S` the predicted saving of its best `k`); a refused sequence's inputs
+/// propose at most half as many next round, and a sequence refused at one flip per input is done.
+/// Returns the masks and the final exact KL.
 pub fn select(
+    masked: &Masked,
+    base: &FamilyInputs,
+    target: &Target,
+    masks: Vec<Array2<f64>>,
+    coder: &Coder,
+    observations: f64,
+    samples: usize,
+) -> Result<(Vec<Array2<f64>>, Array1<f64>), String> {
+    select_observed(masked, base, target, masks, coder, observations, samples, &mut |_: &Round<'_>| Ok(()))
+}
+
+/// One selection round's keep/refuse decisions as [`select_observed`] shows them: the masks before
+/// and with the proposal, each input's code under both, each input's sequence and its flips. A
+/// sequence keeps its proposal when its inputs' codes sum lower with it.
+pub struct Round<'a> {
+    pub current: &'a FamilyInputs,
+    pub proposed: &'a FamilyInputs,
+    pub before: &'a Array1<f64>,
+    pub after: &'a Array1<f64>,
+    pub sequence_of: &'a [usize],
+    pub flipped: &'a [usize],
+}
+
+/// [`select`], showing `observe` every round's decisions before they are taken.
+pub fn select_observed(
     masked: &Masked,
     base: &FamilyInputs,
     target: &Target,
@@ -1027,6 +1110,7 @@ pub fn select(
     coder: &Coder,
     observations: f64,
     samples: usize,
+    observe: &mut dyn FnMut(&Round<'_>) -> Result<(), String>,
 ) -> Result<(Vec<Array2<f64>>, Array1<f64>), String> {
     let scale = observations / std::f64::consts::LN_2;
     let rows = base.rows;
@@ -1034,6 +1118,14 @@ pub fn select(
     // An unscored row's masks stay as given (module note, "Behaviours").
     let scores: Vec<bool> = (0..rows).map(|r| target.scores(r)).collect();
     let mut alpha = vec![0.0f64; rows];
+    // Each input's sequence, and per sequence the cap on its inputs' flips (halved when refused;
+    // zero once refused at one flip each).
+    let sequence_of: Vec<usize> = match &base.layout {
+        Some(layout) => layout.sequence.iter().map(|s| *s as usize).collect(),
+        None => (0..rows).collect(),
+    };
+    let sequences = sequence_of.iter().copied().max().map_or(0, |m| m + 1);
+    let mut cap = vec![usize::MAX; sequences];
     let mut round = 0u64;
     let started = std::time::Instant::now();
     let mut curvature: Option<Vec<(Array2<f64>, Option<Array2<f64>>)>> = None;
@@ -1071,7 +1163,7 @@ pub fn select(
             (0..rows)
                 .into_par_iter()
                 .map(|r| {
-                    if !scores[r] {
+                    if !scores[r] || cap[sequence_of[r]] == 0 {
                         return (Vec::new(), 0.0);
                     }
                     let fresh = coder.fresh(&masks, r);
@@ -1099,6 +1191,7 @@ pub fn select(
                             (best, best_k) = (value, i + 1);
                         }
                     }
+                    let best_k = best_k.min(cap[sequence_of[r]]);
                     let predicted: f64 = candidates.iter().take(best_k).map(|(net, _, _)| -net).sum();
                     (candidates.into_iter().take(best_k).map(|(_, k, c)| (k, c)).collect(), predicted)
                 })
@@ -1118,8 +1211,10 @@ pub fn select(
         let proposed_family = masked.family(base, &proposed);
         let (kl_new, trace_new, cotangent_new) = forward(masked, &proposed_family, target)?;
         let after = code(&kl_new, &coder.bits(&proposed), observations);
-        let mut kept = 0usize;
-        let mut saved = 0.0;
+        observe(&Round { current: &family, proposed: &proposed_family, before: &before, after: &after, sequence_of: &sequence_of, flipped: &flipped })?;
+        // Per sequence: the exact saving of its whole proposal, and its largest flips per input.
+        let mut sequence_saving = vec![0.0; sequences];
+        let mut sequence_flips = vec![0usize; sequences];
         for r in 0..rows {
             if flipped[r] == 0 {
                 continue;
@@ -1128,16 +1223,33 @@ pub fn select(
             let (predicted, actual) = (picks[r].1, before[r] - after[r]);
             let k = flipped[r] as f64;
             alpha[r] = ((predicted - actual) / (k * k)).max(0.0);
-            if actual > 0.0 {
-                saved += actual;
+        }
+        for r in 0..rows {
+            sequence_saving[sequence_of[r]] += before[r] - after[r];
+            sequence_flips[sequence_of[r]] = sequence_flips[sequence_of[r]].max(flipped[r]);
+        }
+        let (mut kept, mut tried, mut saved) = (0usize, 0usize, 0.0);
+        for q in 0..sequences {
+            if sequence_flips[q] == 0 {
+                continue;
+            }
+            tried += 1;
+            if sequence_saving[q] > 0.0 {
+                saved += sequence_saving[q];
+                kept += 1;
+                cap[q] = usize::MAX;
+            } else {
+                cap[q] = if sequence_flips[q] <= 1 { 0 } else { sequence_flips[q] / 2 };
+            }
+        }
+        for r in 0..rows {
+            if flipped[r] > 0 && sequence_saving[sequence_of[r]] > 0.0 {
                 for site in 0..masks.len() {
                     masks[site].row_mut(r).assign(&proposed[site].row(r));
                 }
-                kept += 1;
             }
         }
         round += 1;
-        let tried = flipped.iter().filter(|f| **f > 0).count();
         if kept == tried {
             // Every proposing input kept its flips, so the masks now equal the proposal.
             next_forward = Some((kl_new.clone(), trace_new, cotangent_new));
@@ -1147,7 +1259,7 @@ pub fn select(
         }
         let per_scored = |code: &Array1<f64>| (0..rows).filter(|r| target.scores(*r)).map(|r| code[r]).sum::<f64>() / scored.max(1) as f64;
         log::info!(
-            "selection round {round} ({:.0}s): {} inputs flipped {} entries, {kept} kept; code {:.1} -> {:.1} bits per input",
+            "selection round {round} ({:.0}s): {} inputs flipped {} entries, {kept} of {tried} sequences kept; code {:.1} -> {:.1} bits per input",
             started.elapsed().as_secs_f64(),
             flipped.iter().filter(|f| **f > 0).count(),
             flipped.iter().sum::<usize>(),
@@ -1219,11 +1331,43 @@ fn shrunk_inverse(m: &Array2<f64>) -> Result<Array2<f64>, String> {
     Ok(scaled.dot(&d.vectors.t()))
 }
 
-/// One preconditioned step of every site's pieces on the exact total KL given the masks: the
+/// `g` (C × d, one row per piece) less its part that would move `Σ_c u_c v_cᵀ`, the other side's
+/// rows `other` (C × d'): the projection onto `{x : otherᵀ x = 0}`, `g − other (otherᵀother)⁺ otherᵀ g`
+/// over the eigenvalues of `otherᵀother` beyond its band. A preconditioning on the right keeps it,
+/// since the projection acts on the pieces' index alone.
+fn keep_sum(g: &Array2<f64>, other: &Array2<f64>) -> Result<Array2<f64>, String> {
+    let gram = fast_atb(other, other);
+    let mut sym = gram.clone();
+    let n = sym.nrows();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let v = 0.5 * (sym[[i, j]] + sym[[j, i]]);
+            sym[[i, j]] = v;
+            sym[[j, i]] = v;
+        }
+    }
+    let d = super::dense::eigh(sym.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
+    let mut scaled = d.vectors.clone();
+    for (k, l) in d.values.iter().enumerate() {
+        let inverse = if *l > d.band { 1.0 / l } else { 0.0 };
+        scaled.column_mut(k).mapv_inplace(|x| x * inverse);
+    }
+    let pinv = scaled.dot(&d.vectors.t());
+    let coefficients = pinv.dot(&fast_atb(other, g));
+    Ok(g - &other.dot(&coefficients))
+}
+
+/// One preconditioned step of every site's pieces on the total error given the masks, under
+/// `claim` (module note, "Claims"; the box claim's written Fishers are the running ones): the
 /// direction is the gradient preconditioned by the shrunk read covariance (for `V`) and the shrunk
 /// written Fisher (for `U`); its length is the Gauss–Newton minimiser along it, `⟨g, d⟩ / dᵀ H d`
-/// with `dᵀ H d` from one forward tangent through the masked program, halved until the exact
-/// total falls. Returns the total before and after the step, or `None` when no step lowered it.
+/// with `dᵀ H d` from one forward tangent through the masked program, halved until the total
+/// falls. Returns the total before and after the step, or `None` when no step lowered it.
+///
+/// Every piece on is the site's map, and a step keeps it so exactly: it moves one side of every
+/// site (`U` when `seed` is even, `V` when odd; the driver's sequence counter alternates them), along
+/// the direction projected onto the moves that leave `Σ_c u_c v_cᵀ` unchanged, `Vᵀ dU = 0` or
+/// `Uᵀ dV = 0`. Both are linear, so the sum holds to rounding at every step length.
 pub fn step_pieces(
     masked: &mut Masked,
     base: &FamilyInputs,
@@ -1232,42 +1376,58 @@ pub fn step_pieces(
     samples: usize,
     seed: u64,
     running: &mut Running,
+    claim: Claim,
 ) -> Result<Option<(f64, f64)>, String> {
     if masked.head.is_some() || masked.released() {
         return Err("pieces steps need the whole model in the program and the training state".to_string());
     }
     let family = masked.family(base, masks);
     let (kl_now, trace, cotangent) = forward(masked, &family, target)?;
-    let total = kl_now.sum();
-    let grads = gradients(masked, &family, &trace, masks, cotangent)?;
+    let grads = gradients(masked, &family, &trace, masks, cotangent.clone())?;
     let curvature = fisher(masked, &family, &trace, target, samples, seed, true)?;
     // The preconditioners are the running means over every input stepped on so far.
     let rows = trace.values[masked.program.output].nrows() as f64;
     let mut batch_covariances = Vec::new();
     for (k, site) in masked.sites.iter().enumerate() {
-        let centred = &read_values(&trace, site)? - &masked.means[k];
-        batch_covariances.push(fast_atb(&centred, &centred) / rows);
+        let reads = read_values(&trace, site)?;
+        batch_covariances.push(fast_atb(&reads, &reads) / rows);
     }
     let fishers = curvature.into_iter().map(|(_, f)| f.ok_or("no written Fisher")).collect::<Result<Vec<_>, _>>()?;
     running.absorb(batch_covariances, fishers, rows);
-    // The direction only proposes, so it is kept in single precision as the tangent of each
-    // operator it moves.
-    let mut moves: Vec<(usize, Array2<f32>)> = Vec::new();
+    // The error under the claim (module note, "Claims"), and its gradients.
+    let (total, grads) = match claim {
+        Claim::Corner => (kl_now.sum(), grads),
+        Claim::Box => {
+            let (excess, box_grads) = box_excess(masked, &family, &trace, masks, cotangent, &running.fishers, true)?;
+            let box_grads = box_grads.ok_or("no box gradients")?;
+            let grads = grads.into_iter().zip(box_grads).map(|((m, v, u), (bv, bu))| (m, v + bv, u + bu)).collect::<Vec<_>>();
+            (kl_now.sum() + excess.sum(), grads)
+        }
+    };
+    // The direction, as the tangent of each operator it moves, on one side of every site and
+    // projected onto the sum-preserving moves (doc above).
+    let moves_u = seed % 2 == 0;
+    let mut moves: Vec<(usize, Array2<f64>)> = Vec::new();
     let mut slope = 0.0;
     for (k, (_, v_gradient, u_gradient)) in grads.into_iter().enumerate() {
-        let dv = v_gradient.dot(&shrunk_inverse(&running.covariances[k])?);
-        slope += (&v_gradient * &dv).sum();
-        drop(v_gradient);
-        let du = u_gradient.dot(&shrunk_inverse(&running.fishers[k])?);
-        slope += (&u_gradient * &du).sum();
-        drop(u_gradient);
+        let library = masked.library(k)?;
         let (ro, wo) = (&masked.read_offsets[k], &masked.write_offsets[k]);
-        for (j, &op) in masked.v_ops[k].iter().enumerate() {
-            moves.push((op, dv.slice(s![.., ro[j]..ro[j + 1]]).mapv(|x| x as f32)));
-        }
-        moves.push((masked.centre_ops[k], (-dv.dot(&masked.means[k])).insert_axis(Axis(1)).mapv(|x| x as f32)));
-        for (i, &op) in masked.u_ops[k].iter().enumerate() {
-            moves.push((op, du.slice(s![.., wo[i]..wo[i + 1]]).t().mapv(|x| x as f32)));
+        if moves_u {
+            drop(v_gradient);
+            let g = keep_sum(&u_gradient, &library.v)?;
+            let du = g.dot(&shrunk_inverse(&running.fishers[k])?);
+            slope += (&g * &du).sum();
+            for (i, &op) in masked.u_ops[k].iter().enumerate() {
+                moves.push((op, du.slice(s![.., wo[i]..wo[i + 1]]).t().to_owned()));
+            }
+        } else {
+            drop(u_gradient);
+            let g = keep_sum(&v_gradient, &library.u)?;
+            let dv = g.dot(&shrunk_inverse(&running.covariances[k])?);
+            slope += (&g * &dv).sum();
+            for (j, &op) in masked.v_ops[k].iter().enumerate() {
+                moves.push((op, dv.slice(s![.., ro[j]..ro[j + 1]]).to_owned()));
+            }
         }
     }
     if !(slope > 0.0) {
@@ -1275,7 +1435,7 @@ pub fn step_pieces(
     }
     // `dᵀ H d`: the output tangent of the direction, in each row's softmax Fisher.
     let quadratic = {
-        let tangents: BTreeMap<usize, Array2<f64>> = moves.iter().map(|(op, t)| (*op, t.mapv(f64::from))).collect();
+        let tangents: BTreeMap<usize, Array2<f64>> = moves.iter().map(|(op, t)| (*op, t.clone())).collect();
         let output = super::derivatives::jvp(&masked.program, &family, &trace, &tangents).map_err(|e| e.to_string())?;
         let logits = &trace.values[masked.program.output];
         let mut quadratic = 0.0;
@@ -1295,12 +1455,16 @@ pub fn step_pieces(
     let floor = eta * f64::EPSILON;
     while eta > floor {
         for ((op, t), original) in moves.iter().zip(&originals) {
-            let values = &*original.matrix_cow() - &t.mapv(|x| f64::from(x) * eta);
+            let values = &*original.matrix_cow() - &(t * eta);
             masked.program.operators[*op] = dense(original.name.clone(), original.rows.clone(), original.cols.clone(), values)?;
         }
-        let (kl_trial, _, _) = forward(masked, &family, target)?;
-        if kl_trial.sum() < total {
-            return Ok(Some((total, kl_trial.sum())));
+        let (kl_trial, trial_trace, trial_cotangent) = forward(masked, &family, target)?;
+        let trial = match claim {
+            Claim::Corner => kl_trial.sum(),
+            Claim::Box => kl_trial.sum() + box_excess(masked, &family, &trial_trace, masks, trial_cotangent, &running.fishers, false)?.0.sum(),
+        };
+        if trial < total {
+            return Ok(Some((total, trial)));
         }
         eta *= 0.5;
     }
@@ -1308,6 +1472,120 @@ pub fn step_pieces(
         masked.program.operators[*op] = original;
     }
     Ok(None)
+}
+
+/// What an explanation claims of its off subcomponents (module note, "Claims").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Claim {
+    /// Off means absent: the error is the KL of the masks themselves.
+    Corner,
+    /// Off means anywhere in `[0, 1]`: the error is the KL expected over every off gate uniform.
+    Box,
+}
+
+/// Per input, what the box claim adds to the masks' own KL (module note, "Claims"), from a masked
+/// forward's trace and its KL's cotangent at the program's output, in each site's written Fisher
+/// `fishers[k]` (a per-input mean). With `gradients`, also its gradients in every site's `V`
+/// (C × d_in) and `U` (C × d_out), the KL's gradient at the written values held fixed (they steer
+/// steps; the error itself decides).
+#[allow(clippy::type_complexity)]
+pub fn box_excess(
+    masked: &Masked,
+    family: &FamilyInputs,
+    trace: &Trace,
+    masks: &[Array2<f64>],
+    cotangent: Array2<f64>,
+    fishers: &[Array2<f64>],
+    gradients: bool,
+) -> Result<(Array1<f64>, Option<Vec<(Array2<f64>, Array2<f64>)>>), String> {
+    let back = vjp(&masked.program, family, trace, cotangent).map_err(|e| e.to_string())?;
+    let rows = trace.values[masked.program.output].nrows();
+    let mut excess = Array1::<f64>::zeros(rows);
+    let mut out = Vec::new();
+    for (k, site) in masked.sites.iter().enumerate() {
+        let library = masked.library(k)?;
+        let f = &fishers[k];
+        // The off blocks' coordinates, per column.
+        let off = masked.expand(k, &masks[k]).mapv(|m| 1.0 - m);
+        let a = &trace.values[masked.z[k]] * &off;
+        let s_out = a.dot(&library.u);
+        let written: Vec<Array2<f64>> = masked.written[k]
+            .iter()
+            .map(|n| back[*n].clone().unwrap_or_else(|| Array2::zeros(trace.values[*n].dim())))
+            .collect();
+        let views: Vec<_> = written.iter().map(|w| w.view()).collect();
+        let g = ndarray::concatenate(Axis(1), &views).map_err(|e| e.to_string())?;
+        let sf = s_out.dot(f);
+        // Each block's own term `Z_cᵀ F Z_c = a_cᵀ (U_c F U_cᵀ) a_c`, per input.
+        let mut own = Array1::<f64>::zeros(rows);
+        let mut own_a = Array2::<f64>::zeros(a.dim());
+        let mut start = 0;
+        let mut blocks_ufu = Vec::new();
+        for &r in masked.ranks(k) {
+            let u_block = library.u.slice(s![start..start + r, ..]);
+            let ufu = u_block.dot(f).dot(&u_block.t());
+            let a_block = a.slice(s![.., start..start + r]);
+            let a_ufu = a_block.dot(&ufu);
+            own += &(&a_ufu * &a_block).sum_axis(Axis(1));
+            own_a.slice_mut(s![.., start..start + r]).assign(&a_ufu);
+            blocks_ufu.push(ufu);
+            start += r;
+        }
+        excess += &((&g * &s_out).sum_axis(Axis(1)) * 0.5 + (&sf * &s_out).sum_axis(Axis(1)) * 0.125 + &own * (1.0 / 24.0));
+        if gradients {
+            // ∂/∂S = ½ g + ¼ S F; ∂/∂a = (∂/∂S) Uᵀ + a (U_c F U_cᵀ)/12 within each block.
+            let g_s = &g * 0.5 + &sf * 0.25;
+            let g_a = &g_s.dot(&library.u.t()) + &(own_a * (1.0 / 12.0));
+            let mut u_gradient = a.t().dot(&g_s);
+            let mut start = 0;
+            for &r in masked.ranks(k) {
+                let a_block = a.slice(s![.., start..start + r]);
+                let u_block = library.u.slice(s![start..start + r, ..]);
+                let extra = a_block.t().dot(&a_block).dot(&u_block).dot(f) * (1.0 / 12.0);
+                let mut target_rows = u_gradient.slice_mut(s![start..start + r, ..]);
+                target_rows += &extra;
+                start += r;
+            }
+            let reads = read_values(trace, site)?;
+            let v_gradient = (&g_a * &off).t().dot(&reads);
+            out.push((v_gradient, u_gradient));
+        }
+    }
+    Ok((excess, gradients.then_some(out)))
+}
+
+/// Each site's read mean and second moment about it, `E[(x − μ)(x − μ)ᵀ]`, on the native program
+/// over `batches` of inputs (forward passes only).
+pub fn site_second_moments(
+    program: &OperatorProgram,
+    sites: &[Site],
+    batches: impl IntoIterator<Item = FamilyInputs>,
+) -> Result<Vec<(Array1<f64>, Array2<f64>)>, String> {
+    let mut sums: Vec<(Array1<f64>, Array2<f64>)> = Vec::new();
+    let mut rows = 0.0;
+    for inputs in batches {
+        let trace = program.execute(&inputs, false).map_err(|e| e.to_string())?;
+        for (k, site) in sites.iter().enumerate() {
+            let x = read_values(&trace, site)?;
+            if sums.len() <= k {
+                sums.push((Array1::zeros(x.ncols()), Array2::zeros((x.ncols(), x.ncols()))));
+            }
+            sums[k].0 += &x.sum_axis(Axis(0));
+            sums[k].1 += &fast_atb(&x, &x);
+        }
+        rows += inputs.rows as f64;
+    }
+    if rows == 0.0 {
+        return Err("second moments need inputs".to_string());
+    }
+    Ok(sums
+        .into_iter()
+        .map(|(sum, outer)| {
+            let mean = sum / rows;
+            let second = outer / rows - &mean.view().insert_axis(Axis(1)).dot(&mean.view().insert_axis(Axis(0)));
+            (mean, second)
+        })
+        .collect())
 }
 
 /// Grow a site's library by splitting every piece that its active inputs use in two ways

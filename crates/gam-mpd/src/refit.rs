@@ -72,7 +72,7 @@ pub fn refit_readout(
     let Node::Affine { terms, bias } = program.nodes[y_node].clone() else {
         return Err(EngineError::Primitive("the readout does not read an affine node".to_string()));
     };
-    let trace = program.execute(inputs, false)?;
+    let mut trace = program.execute(inputs, false)?;
     let size = program.declarations.domains[match &program.bases[basis] {
         super::operator_program::Basis::Indicator { domain } | super::operator_program::Basis::Characters { domain, .. } => *domain,
     }]
@@ -106,6 +106,15 @@ pub fn refit_readout(
         }
         if !matches!(program.operators[op].body, OperatorBody::Dense { .. }) {
             return Err(EngineError::Primitive(format!("operator {op} is not dense")));
+        }
+    }
+    // The slots read their nodes as matrices: a gathered feature's one-hot rows are formed.
+    for (_, node) in &slots {
+        if let Some(node) = node
+            && program.gathered_tokens(*node, inputs).is_some()
+        {
+            let value = program.node_value(&trace, inputs, *node)?.into_owned();
+            trace.values[*node] = value;
         }
     }
     let masks: Vec<Array2<f64>> = slots

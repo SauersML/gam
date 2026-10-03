@@ -3,9 +3,9 @@
 Reads the ``printouts.json`` that ``mpd_printer_2951`` writes for a modular-addition model and renders:
 
 * ``<prefix>_rules.png``: the decomposed program as its rules; each instance a bar of its bits, rules in order.
-* ``<prefix>_bits.png``: program bits (algorithm, constants) against the bits of behaviour still unexplained,
-  over the amount of behaviour explained.
-* ``<prefix>_unresolved.png``: where the last program is not yet the model, input by input (a, b).
+* ``<prefix>_bits.png``: program bits (structure, other operator reals) against the KL bits of the behaviour,
+  over the observations per input.
+* ``<prefix>_kl.png``: the last program's KL bits, input by input (a, b).
 
     python mpd_printer_figures_2951.py PRINTOUTS_JSON OUT_DIR PREFIX
 """
@@ -99,18 +99,18 @@ def bits_figure(rungs, path):
     native = rungs[0]["printout"]["bits"]
     ladder = sorted(rungs[1:], key=lambda r: r["observations"])
     n = np.array([r["observations"] for r in ladder], dtype=float)
-    algorithm = np.array([r["printout"]["bits"]["algorithm"] for r in ladder], dtype=float)
-    constants = np.array([r["printout"]["bits"]["constants"] for r in ladder], dtype=float)
-    data = np.array([r["printout"]["bits"]["data"] for r in ladder], dtype=float)
+    structure = np.array([r["printout"]["bits"]["structure"] for r in ladder], dtype=float)
+    reals = np.array([r["printout"]["bits"]["other_operator_reals"] for r in ladder], dtype=float)
+    kl = np.array([r["printout"]["bits"]["kl"] for r in ladder], dtype=float)
     fig = plt.figure(figsize=(10, 6), dpi=200)
-    title(fig, "A short program that explains more and more of the model",
-          "each point is the shortest program found when every input is observed n times")
+    title(fig, "Program bits and KL bits",
+          "each point is the program the search returned when every input is observed n times")
     ax = fig.add_axes([0.1, 0.12, 0.62, 0.7])
-    for values, color, label in [(algorithm, BLUE, "program: structure"), (constants, ORANGE, "program: numbers"),
-                                 (np.maximum(data, 1e-3), AQUA, "behaviour not yet explained")]:
+    for values, color, label in [(structure, BLUE, "program: structure"), (reals, ORANGE, "program: operator reals"),
+                                 (np.maximum(kl, 1e-3), AQUA, "KL bits")]:
         ax.plot(n, values, color=color, linewidth=2, marker="o", markersize=7, markeredgecolor=SURFACE, markeredgewidth=2)
         ax.text(n[-1] * 1.6, values[-1], label, color=INK, fontsize=10.5, va="center")
-    native_bits = native["algorithm"] + native["constants"]
+    native_bits = native["structure"] + native["other_operator_reals"]
     ax.axhline(native_bits, color=MUTED, linewidth=1, linestyle=(0, (4, 3)))
     ax.text(n[0], native_bits * 1.25, f"the trained weights as stored: {native_bits:,} bits", color=INK2, fontsize=10)
     ax.set_xscale("log")
@@ -123,16 +123,16 @@ def bits_figure(rungs, path):
     plt.close(fig)
 
 
-def unresolved_figure(rung, p, path):
-    behaviour = rung["printout"]["unresolved"]["behaviour"]
+def kl_figure(rung, p, path):
+    behaviour = rung["printout"]["behaviour"]
     a = np.array(behaviour["tokens"][0])
     b = np.array(behaviour["tokens"][1])
     grid = np.zeros((p, p))
     grid[a, b] = behaviour["row_bits"]
     fig = plt.figure(figsize=(8.6, 8.2), dpi=200)
-    total = behaviour["data_bits"]
-    title(fig, "Where the program is not yet the model",
-          f"bits of behaviour still unexplained for each input a + b, {total:,.1f} in all (n = {rung['observations']:,})")
+    total = behaviour["kl_bits"]
+    title(fig, "KL bits per input",
+          f"n KL(model || program)/ln 2 for each input a + b, {total:,.1f} in all (n = {rung['observations']:,})")
     ax = fig.add_axes([0.1, 0.08, 0.72, 0.75])
     cmap = LinearSegmentedColormap.from_list("blue", SEQUENTIAL)
     image = ax.imshow(grid, cmap=cmap, origin="lower", interpolation="nearest")
@@ -158,10 +158,10 @@ def main():
     os.makedirs(out, exist_ok=True)
     # The program chosen for the most behaviour.
     last = max(rungs[1:], key=lambda r: r["observations"])
-    paths = [os.path.join(out, f"{prefix}_{name}.png") for name in ("rules", "bits", "unresolved")]
+    paths = [os.path.join(out, f"{prefix}_{name}.png") for name in ("rules", "bits", "kl")]
     rules_figure(last, paths[0])
     bits_figure(rungs, paths[1])
-    unresolved_figure(last, p, paths[2])
+    kl_figure(last, p, paths[2])
     print("\n".join(paths))
 
 

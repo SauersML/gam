@@ -1,6 +1,6 @@
 //! The human-facing reading of an operator program (#2951): the small rules it reuses with their
-//! bindings, its bits split into algorithm and constants against the data bits of the behaviour it
-//! does not reproduce, and where the unexplained bits sit.
+//! bindings, its message bits split by where they are stored, the KL bits of the behaviour it does
+//! not reproduce, and which operators are still the unchanged native ones.
 //!
 //! # Rules
 //!
@@ -35,21 +35,22 @@
 //!
 //! # Bits
 //!
-//! The program's message (`OperatorProgram::code_account`) splits three ways: table bits, the
-//! whole message of every lookup table (an operator whose rows or columns are all tokens of a
-//! domain: an embedding, an unembedding, a token-indexed constant), which is memorized data;
-//! constant bits, the lattice indices of every other operator's reals; and algorithm bits, the
-//! rest (the header, the bases, the rules, the other operators' interfaces and present-block
-//! subsets, and the nodes: what is computed and how it is wired). A rule's
-//! constant bits are the exact signed Elias δ lengths of its body blocks' lattice indices; a block
-//! several instances read (a tied operator) is counted once, at the rule. The data bits are the
-//! behaviour's, per input `n KL(model ‖ program)/ln 2`, as the caller supplies them.
+//! The program's message (`OperatorProgram::code_account`) splits three ways by storage: table
+//! storage, the whole message of every operator whose rows or columns are all tokens of a domain
+//! (an embedding, an unembedding, a token-indexed constant); other operator reals, the lattice
+//! indices of every other operator's reals; and structure, the rest (the header, the bases, the
+//! rules, the other operators' interfaces and present-block subsets, and the nodes). The split is
+//! bookkeeping by storage layout, not a split into memorized data and algorithm. A rule's bits are
+//! the exact signed Elias δ lengths of its body blocks' lattice indices; a block several instances
+//! read (a tied operator) is counted once, at the rule. The KL bits are the behaviour's, per input
+//! `n KL(model ‖ program)/ln 2`, as the caller supplies them.
 //!
-//! # Unresolved
+//! # Unchanged operators and per-input KL
 //!
 //! In the program: the bits of operators whose provenance records no rewrite (native, possibly
-//! restricted). In the behaviour: the data bits per input, the fewest inputs carrying half and
-//! nine tenths of them, the worst inputs, and the totals by each token slot's value.
+//! restricted). Having a rewrite in its provenance says only that an operator was rewritten, not
+//! that it is understood. In the behaviour: the KL bits per input, the fewest inputs carrying half
+//! and nine tenths of them, the worst inputs, and the totals by each token slot's value.
 
 use super::codec::signed_delta_len_bits;
 use super::dense::svd;
@@ -64,32 +65,32 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
-/// The behaviour the program is scored against: per input of the family, its data bits
-/// `n KL/ln 2` (an upper end; `+∞` where unresolved) and whether its argmax agrees with the
-/// model's.
+/// The behaviour the program is scored against: per input of the family, its KL bits
+/// `n KL/ln 2` (an upper end; `+∞` where no bound was obtained) and whether its argmax agrees with
+/// the model's.
 pub struct Behaviour<'a> {
     pub inputs: &'a FamilyInputs,
     pub row_bits: &'a [f64],
     pub argmax_agrees: &'a [bool],
 }
 
-/// The two-part code, split.
+/// The two-part code, split by storage.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct BitSplit {
     /// Header, bases, rules, nodes, and the interfaces and block subsets of operators that are not
-    /// lookup tables.
-    pub algorithm: u64,
-    /// The lattice indices of the reals of operators that are not lookup tables.
-    pub constants: u64,
-    /// Lookup tables, whole.
-    pub tables: u64,
-    /// The behaviour's data bits, when supplied.
-    pub data: Option<f64>,
+    /// token-indexed tables.
+    pub structure: u64,
+    /// The lattice indices of the reals of operators that are not token-indexed tables.
+    pub other_operator_reals: u64,
+    /// Token-indexed tables, whole.
+    pub table_storage: u64,
+    /// The behaviour's KL bits, when supplied.
+    pub kl: Option<f64>,
 }
 
 impl BitSplit {
     pub fn program(&self) -> u64 {
-        self.algorithm + self.constants + self.tables
+        self.structure + self.other_operator_reals + self.table_storage
     }
 }
 
@@ -133,31 +134,21 @@ pub struct Rule {
 /// What the behaviour still costs, input by input.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct BehaviourMap {
-    pub data_bits: f64,
+    pub kl_bits: f64,
     pub row_bits: Vec<f64>,
-    /// Inputs by decreasing data bits.
+    /// Inputs by decreasing KL bits.
     pub order: Vec<usize>,
-    /// The fewest inputs carrying half, and nine tenths, of the data bits.
+    /// The fewest inputs carrying half, and nine tenths, of the KL bits.
     pub half: usize,
     pub most: usize,
-    /// Per slot, for a token slot, the data bits summed by token value.
+    /// Per slot, for a token slot, the KL bits summed by token value.
     pub by_slot: Vec<Option<Vec<f64>>>,
     /// The inputs' token values per slot (`None` for a raw slot).
     pub tokens: Vec<Option<Vec<u32>>>,
     pub disagreements: usize,
 }
 
-/// Where the model is not yet explained.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct Unresolved {
-    /// Bits of operators with no rewrite in their provenance.
-    pub native_bits: u64,
-    /// Those operators, by decreasing bits.
-    pub native: Vec<(String, u64)>,
-    pub behaviour: Option<BehaviourMap>,
-}
-
-/// The program as rules, bits and unresolved parts.
+/// The program as rules, bits, unchanged native operators and per-input KL.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Printout {
     pub bits: BitSplit,
@@ -166,7 +157,11 @@ pub struct Printout {
     pub calls: Vec<String>,
     /// By decreasing bits.
     pub rules: Vec<Rule>,
-    pub unresolved: Unresolved,
+    /// Bits of operators with no rewrite in their provenance.
+    pub unchanged_native_bits: u64,
+    /// Those operators, by decreasing bits.
+    pub unchanged_native: Vec<(String, u64)>,
+    pub behaviour: Option<BehaviourMap>,
 }
 
 // ------------------------------------------------------------------------------------ the graph
@@ -215,7 +210,7 @@ fn present(op: &Operator, row: usize, col: usize) -> bool {
     match &op.body {
         OperatorBody::Dense { present, .. } => present[(row, col)],
         OperatorBody::LowRank { .. } => true,
-        OperatorBody::Identity => row == col,
+        OperatorBody::Identity | OperatorBody::Diagonal { .. } => row == col,
     }
 }
 
@@ -325,7 +320,7 @@ impl<'p> Graph<'p> {
         match self.program.operators[block.operator].body {
             OperatorBody::Identity => None,
             OperatorBody::LowRank { .. } => Some(Block { operator: block.operator, row: usize::MAX, col: usize::MAX }),
-            OperatorBody::Dense { .. } => Some(block),
+            OperatorBody::Dense { .. } | OperatorBody::Diagonal { .. } => Some(block),
         }
     }
 
@@ -339,6 +334,10 @@ impl<'p> Graph<'p> {
                 values.slice(s![op.rows.range(key.row), op.cols.range(key.col)]).iter().copied().collect(),
                 *precision,
             ),
+            OperatorBody::Diagonal { values, precision } => {
+                let reals = if key.row == key.col { values.slice(s![op.rows.range(key.row)]).to_vec() } else { Vec::new() };
+                (reals, *precision)
+            }
         };
         let code = LatticeCode::encode(&reals, precision).map_err(ProgramError::Code)?;
         let mut bits = 0;
@@ -350,6 +349,14 @@ impl<'p> Graph<'p> {
 
     fn block_matrix(&self, block: Block, cache: &mut HashMap<usize, Array2<f64>>) -> Array2<f64> {
         let op = &self.program.operators[block.operator];
+        if let OperatorBody::Diagonal { values, .. } = &op.body {
+            let (rows, cols) = (op.rows.range(block.row), op.cols.range(block.col));
+            return if block.row == block.col {
+                Array2::from_diag(&values.slice(s![rows]))
+            } else {
+                Array2::zeros((rows.len(), cols.len()))
+            };
+        }
         let matrix = cache.entry(block.operator).or_insert_with(|| op.matrix());
         matrix.slice(s![op.rows.range(block.row), op.cols.range(block.col)]).to_owned()
     }
@@ -444,6 +451,7 @@ fn body_kind(graph: &Graph<'_>, block: Option<Block>) -> u8 {
         Some(OperatorBody::Identity) => 1,
         Some(OperatorBody::Dense { .. }) => 2,
         Some(OperatorBody::LowRank { .. }) => 3,
+        Some(OperatorBody::Diagonal { .. }) => 4,
     }
 }
 
@@ -770,7 +778,7 @@ fn behaviour_map(behaviour: &Behaviour<'_>) -> Result<BehaviourMap, ProgramError
             behaviour.argmax_agrees.len()
         )));
     }
-    let data_bits: f64 = behaviour.row_bits.iter().sum();
+    let kl_bits: f64 = behaviour.row_bits.iter().sum();
     let mut order: Vec<usize> = (0..rows).collect();
     order.sort_by(|&a, &b| behaviour.row_bits[b].total_cmp(&behaviour.row_bits[a]).then(a.cmp(&b)));
     let carrying = |share: f64| {
@@ -779,7 +787,7 @@ fn behaviour_map(behaviour: &Behaviour<'_>) -> Result<BehaviourMap, ProgramError
             .iter()
             .position(|&row| {
                 sum += behaviour.row_bits[row];
-                sum >= share * data_bits
+                sum >= share * kl_bits
             })
             .map_or(rows, |i| i + 1)
     };
@@ -805,7 +813,7 @@ fn behaviour_map(behaviour: &Behaviour<'_>) -> Result<BehaviourMap, ProgramError
         })
         .collect();
     Ok(BehaviourMap {
-        data_bits,
+        kl_bits,
         row_bits: behaviour.row_bits.to_vec(),
         half: carrying(0.5),
         most: carrying(0.9),
@@ -875,24 +883,24 @@ fn inline(program: &OperatorProgram) -> Result<(OperatorProgram, Vec<Option<Stri
     Ok((flat, origins))
 }
 
-/// The program as rules with bindings, its bit split, and where it is unresolved.
+/// The program as rules with bindings, its bit split, and its unchanged native operators.
 pub fn print(program: &OperatorProgram, behaviour: Option<&Behaviour<'_>>) -> Result<Printout, ProgramError> {
     let account = program.code_account()?;
     let tokens = |side: &super::operator_program::Interface| side.groups().iter().all(|g| g.label.kind == LabelKind::Token);
-    let (mut tables, mut constants) = (0u64, 0u64);
+    let (mut table_storage, mut other_operator_reals) = (0u64, 0u64);
     for (op, (structure, reals)) in program.operators.iter().zip(&account.operator_bits) {
         if tokens(&op.rows) || tokens(&op.cols) {
-            tables += structure + reals;
+            table_storage += structure + reals;
         } else {
-            constants += reals;
+            other_operator_reals += reals;
         }
     }
     let behaviour = behaviour.map(behaviour_map).transpose()?;
     let bits = BitSplit {
-        algorithm: account.total_bits - constants - tables,
-        constants,
-        tables,
-        data: behaviour.as_ref().map(|b| b.data_bits),
+        structure: account.total_bits - other_operator_reals - table_storage,
+        other_operator_reals,
+        table_storage,
+        kl: behaviour.as_ref().map(|b| b.kl_bits),
     };
     let (flat, origins) = inline(program)?;
     let graph = Graph::new(&flat, origins)?;
@@ -966,14 +974,14 @@ pub fn print(program: &OperatorProgram, behaviour: Option<&Behaviour<'_>>) -> Re
     }
     rules.sort_by(|a, b| b.bits.cmp(&a.bits).then(b.instances.len().cmp(&a.instances.len())));
 
-    let mut native: Vec<(String, u64)> = program
+    let mut unchanged_native: Vec<(String, u64)> = program
         .operators
         .iter()
         .zip(&account.operator_bits)
         .filter(|(op, _)| op.provenance.derivation.is_empty() && !op.provenance.sources.is_empty())
         .map(|(op, (structure, reals))| (op.name.clone(), structure + reals))
         .collect();
-    native.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    unchanged_native.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     Ok(Printout {
         bits,
         bases: program.bases.iter().map(|basis| describe_basis(program, basis)).collect(),
@@ -992,7 +1000,9 @@ pub fn print(program: &OperatorProgram, behaviour: Option<&Behaviour<'_>>) -> Re
             })
             .collect(),
         rules,
-        unresolved: Unresolved { native_bits: native.iter().map(|(_, b)| b).sum(), native, behaviour },
+        unchanged_native_bits: unchanged_native.iter().map(|(_, b)| b).sum(),
+        unchanged_native,
+        behaviour,
     })
 }
 
@@ -1116,9 +1126,16 @@ const LISTED: usize = 6;
 impl fmt::Display for Printout {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let b = &self.bits;
-        write!(f, "program {} bits = algorithm {} + constants {} + tables {}", b.program(), b.algorithm, b.constants, b.tables)?;
-        match b.data {
-            Some(data) => writeln!(f, "; data {data:.1} bits; total {:.1} bits", b.program() as f64 + data)?,
+        write!(
+            f,
+            "program {} bits = structure {} + other operator reals {} + table storage {}",
+            b.program(),
+            b.structure,
+            b.other_operator_reals,
+            b.table_storage
+        )?;
+        match b.kl {
+            Some(kl) => writeln!(f, "; KL {kl:.1} bits; total {:.1} bits", b.program() as f64 + kl)?,
             None => writeln!(f)?,
         }
         if !self.bases.is_empty() {
@@ -1163,17 +1180,15 @@ impl fmt::Display for Printout {
                 writeln!(f, "        … {} more", n - LISTED)?;
             }
         }
-        let u = &self.unresolved;
-        writeln!(f, "unresolved")?;
-        let share = if b.program() == 0 { 0.0 } else { 100.0 * u.native_bits as f64 / b.program() as f64 };
-        write!(f, "  program: {} bits ({share:.0}%) in native operators", u.native_bits)?;
-        let listed: Vec<String> = u.native.iter().take(LISTED).map(|(name, bits)| format!("{name} {bits}")).collect();
+        write!(f, "unchanged native operators: {} bits", self.unchanged_native_bits)?;
+        let listed: Vec<String> =
+            self.unchanged_native.iter().take(LISTED).map(|(name, bits)| format!("{name} {bits}")).collect();
         writeln!(f, "{}{}", if listed.is_empty() { "" } else { ": " }, listed.join(", "))?;
-        if let Some(m) = &u.behaviour {
+        if let Some(m) = &self.behaviour {
             writeln!(
                 f,
-                "  behaviour: {:.1} data bits over {} inputs; half in {}, nine tenths in {}; {} argmax disagreements",
-                m.data_bits,
+                "behaviour: {:.1} KL bits over {} inputs; half in {}, nine tenths in {}; {} argmax disagreements",
+                m.kl_bits,
                 m.row_bits.len(),
                 m.half,
                 m.most,

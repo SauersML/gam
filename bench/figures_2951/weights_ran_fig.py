@@ -72,8 +72,12 @@ for j, name in enumerate(names):
     bx.tick_params(length=0)
     for side in bx.spines.values():
         side.set_visible(False)
-    bx.set_title(f"{NAMES.get(name, (name, None))[0]}: share of each matrix's weights that ran, per word",
+    bx.set_title(NAMES.get(name, (name, None))[0] if len(names) > 1 else
+                 f"{NAMES.get(name, (name, None))[0]}: share of each matrix's weights that ran, per word",
                  color=INK, fontsize=14.5, loc="left", pad=10)
+    if len(names) > 1 and j == 0:
+        bx.text(0, 1.16, "share of each matrix's weights that ran, per word", transform=bx.transAxes, fontsize=15,
+                color=INK, ha="left", va="bottom")
 rem = d["remainder"]
 qk = [rem[f"blocks.{L}.{k}"] for L in range(4) for k in ("q", "k")]
 fig.text(0.2, 0.012, f"VPD's query and key subcomponents don't add up to the whole matrix: what is left over is {min(qk):.0%}–{max(qk):.0%} "
@@ -81,9 +85,12 @@ fig.text(0.2, 0.012, f"VPD's query and key subcomponents don't add up to the who
          "(for every other matrix the leftover is under 0.1%)", fontsize=12.5, color=INK2, ha="left", linespacing=1.4)
 
 ratio = dense / rows[1][2].mean()
-fig.suptitle(f"VPD runs about 1/{ratio:.0f} of the model's weights on each word", color=INK, fontsize=21,
+title = f"VPD runs about 1/{ratio:.0f} of the model's weights on each word"
+if len(rows) > 2:
+    title += f"; our choice runs about 1/{dense / rows[2][2].mean():.0f}"
+fig.suptitle(title, color=INK, fontsize=21,
              fontweight="bold", x=0.02, ha="left", y=0.975)
-fig.text(0.02, 0.915, "VPD's 4-layer model on 65,536 words of web text; a subcomponent of an m × n matrix counts m + n numbers, "
+fig.text(0.02, 0.915, f"VPD's 4-layer model on {rows[1][2].size:,} words of web text; a subcomponent of an m × n matrix counts m + n numbers, "
          "the full model counts every weight of its 24 attention and MLP matrices", color=INK2, fontsize=14, ha="left")
 out = Path.home() / "mpd-data/figures/weights_ran_per_word.png"
 fig.savefig(out, facecolor=SURF)

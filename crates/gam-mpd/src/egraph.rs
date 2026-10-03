@@ -26,12 +26,15 @@
 //!
 //! # Certified equality of leaves
 //!
-//! Two operator classes of one interface pair merge only when their enclosures intersect in every
-//! entry: some operator lies within every member's derived band, so no member is distinguishable
-//! from another at the resolution the arithmetic certifies. A merged class keeps the intersection
-//! of the boxes; an exact law that unions two classes whose boxes do not intersect is a band
-//! defect and stops saturation with [`EgraphError::Inconsistent`]. Exact leaves merge exactly when
-//! they are equal. No tolerance is involved.
+//! Two classes merge only on an equality witness: an exact law (a symbolic identity), or two
+//! leaves whose exact values are proven equal, both exact (radius zero, on a dyadic lattice) and
+//! equal entrywise. Intersecting enclosures are not a witness: they only fail to rule equality
+//! out, and `(1 + 2⁻²⁷)(1 − 2⁻²⁷) = 1 − 2⁻⁵⁴` has an enclosure that holds `1` without being the
+//! identity. Such pairs stay outside the congruence and are reported as [`NearOperators`], each
+//! with an entrywise residual bound, valid for every input since it bounds the operators
+//! themselves. A merged class keeps the intersection of the boxes; an exact law that unions two
+//! classes whose boxes do not intersect is a band defect and stops saturation with
+//! [`EgraphError::Inconsistent`]. No tolerance is involved.
 //!
 //! # Laws
 //!
@@ -45,7 +48,7 @@
 //! * bilinear constant side: `c ⟨a, r⟩ = (c aᵀ) r`; a Hadamard product with a constant is a
 //!   diagonal operator;
 //! * identities: the identity operator and the identity law vanish; ReLU, the identity and the
-//!   zero law of a constant fold.
+//!   zero law of a constant fold; a summand applying an exactly zero operator vanishes.
 //!
 //! * gains: a [`Node::Gain`] is `Scale(c, x)` with its coefficient a scalar term over the declared
 //!   parameters, which stay symbols: a scale moves through an operator and a composition, numeric
@@ -327,6 +330,11 @@ impl OperatorClass {
             && self.lower == self.upper
     }
 
+    /// Whether the class's exact value is known: its enclosure is a single point.
+    fn is_exact(&self) -> bool {
+        self.lower == self.upper
+    }
+
     fn intersects(&self, other: &Self) -> bool {
         self.rows == other.rows
             && self.cols == other.cols
@@ -382,7 +390,7 @@ impl Leaves {
                     _ => (band, None),
                 }
             }
-            OperatorBody::Dense { .. } | OperatorBody::Identity => {
+            OperatorBody::Dense { .. } | OperatorBody::Identity | OperatorBody::Diagonal { .. } => {
                 let lattice = exact_precision(center.iter().copied())?.fraction_bits();
                 (Array2::zeros(center.dim()), Some(lattice))
             }
@@ -926,6 +934,7 @@ pub enum Equation {
     MixConstants,
     MixSplit,
     Flatten,
+    DropZero,
     Fuse,
     BilinearConstant,
     HadamardConstant,
@@ -933,7 +942,7 @@ pub enum Equation {
     PointwiseConstant,
 }
 
-pub const EQUATIONS: [Equation; 21] = [
+pub const EQUATIONS: [Equation; 22] = [
     Equation::Transpose,
     Equation::Compose,
     Equation::ApplyConstant,
@@ -950,12 +959,19 @@ pub const EQUATIONS: [Equation; 21] = [
     Equation::MixConstants,
     Equation::MixSplit,
     Equation::Flatten,
+    Equation::DropZero,
     Equation::Fuse,
     Equation::BilinearConstant,
     Equation::HadamardConstant,
     Equation::PointwiseIdentity,
     Equation::PointwiseConstant,
 ];
+
+/// Whether an operator class is exactly zero: its enclosure is the single zero matrix.
+fn exactly_zero(egraph: &ProgramGraph, class: Id) -> bool {
+    let ClassData::Operator(op) = &egraph[class].data else { return false };
+    op.lower == op.upper && op.lower.iter().all(|v| *v == 0.0)
+}
 
 /// The exact multiple `c` when an operator class is exactly `c I`.
 fn scalar_multiple(egraph: &ProgramGraph, class: Id) -> Option<f64> {
@@ -1106,6 +1122,19 @@ impl Equation {
                             let sum = sum_of(egraph, flat);
                             changed |= egraph.union(class, sum);
                         }
+                    }
+                }
+            }
+            Self::DropZero => {
+                for node in nodes(egraph, class) {
+                    let Term::Sum(children) = node else { continue };
+                    let vanishes = |child: Id| {
+                        egraph[child].nodes.iter().any(|n| matches!(n, Term::Apply([op, _]) if exactly_zero(egraph, *op)))
+                    };
+                    let kept: Vec<Id> = children.iter().copied().filter(|c| !vanishes(*c)).collect();
+                    if !kept.is_empty() && kept.len() < children.len() {
+                        let sum = sum_of(egraph, kept);
+                        changed |= egraph.union(class, sum);
                     }
                 }
             }
@@ -1339,6 +1368,8 @@ pub struct Saturation {
     pub egraph: ProgramGraph,
     pub root: Id,
     pub report: SaturationReport,
+    /// Operator classes close within their bands but not proven equal, outside the congruence.
+    pub near: Vec<NearOperators>,
 }
 
 /// `coefficient` as a scalar class: parameters stay symbols, numbers are exact.
@@ -1459,15 +1490,15 @@ fn build(program: &OperatorProgram) -> Result<(ProgramGraph, Id), EgraphError> {
     Ok((egraph, classes[program.output]))
 }
 
-/// Union every pair of operator classes of one interface pair whose enclosures intersect.
-fn certified_merge(egraph: &mut ProgramGraph) -> bool {
+/// Every pair of distinct operator classes of one interface pair whose enclosures intersect.
+fn intersecting_operators(egraph: &ProgramGraph) -> Vec<(Id, Id)> {
     let mut groups: HashMap<(Interface, Interface), Vec<(f64, Id)>> = HashMap::new();
     for class in egraph.classes() {
         if let ClassData::Operator(op) = &class.data {
             groups.entry((op.rows.clone(), op.cols.clone())).or_default().push((op.lower[[0, 0]], class.id));
         }
     }
-    let mut changed = false;
+    let mut pairs = Vec::new();
     for (_, mut members) in groups {
         members.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         for i in 0..members.len() {
@@ -1478,12 +1509,51 @@ fn certified_merge(egraph: &mut ProgramGraph) -> bool {
                     break;
                 }
                 if a != b && left.intersects(right) {
-                    changed |= egraph.union(a, b);
+                    pairs.push((a, b));
                 }
             }
         }
     }
+    pairs
+}
+
+/// Union every pair of operator classes proven equal: both exact and entrywise equal (module note,
+/// "Certified equality of leaves").
+fn certified_merge(egraph: &mut ProgramGraph) -> bool {
+    let mut changed = false;
+    for (a, b) in intersecting_operators(egraph) {
+        let (a, b) = (egraph.find(a), egraph.find(b));
+        let (ClassData::Operator(left), ClassData::Operator(right)) = (&egraph[a].data, &egraph[b].data) else { continue };
+        if a != b && left.is_exact() && right.is_exact() && left.lower == right.lower {
+            changed |= egraph.union(a, b);
+        }
+    }
     changed
+}
+
+/// Two operator classes whose enclosures intersect but whose equality nothing proves: kept apart,
+/// with `|A − B| ≤ residual` in every entry (so on every input, `‖x (A − B)ᵀ‖_∞ ≤ residual ‖x‖₁`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NearOperators {
+    pub left: Id,
+    pub right: Id,
+    pub residual: f64,
+}
+
+/// The intersecting pairs of the saturated graph that [`certified_merge`] kept apart.
+fn near_operators(egraph: &ProgramGraph) -> Vec<NearOperators> {
+    intersecting_operators(egraph)
+        .into_iter()
+        .filter_map(|(a, b)| {
+            let (ClassData::Operator(left), ClassData::Operator(right)) = (&egraph[a].data, &egraph[b].data) else { return None };
+            let residual = ndarray::Zip::from(&left.lower)
+                .and(&left.upper)
+                .and(&right.lower)
+                .and(&right.upper)
+                .fold(0.0_f64, |m, a, b, c, d| m.max((b - c).max(d - a).next_up()));
+            Some(NearOperators { left: a, right: b, residual })
+        })
+        .collect()
 }
 
 /// Saturate `program` under the laws, its gains kept symbolic, until a fixpoint or until the
@@ -1527,7 +1597,8 @@ pub fn saturate(program: &OperatorProgram, governor: &MemoryGovernor) -> Result<
         leaves: egraph.analysis.leaves.len(),
     };
     let root = egraph.find(root);
-    Ok(Saturation { egraph, root, report })
+    let near = near_operators(&egraph);
+    Ok(Saturation { egraph, root, report, near })
 }
 
 // ------------------------------------------------------------------------------------ extraction

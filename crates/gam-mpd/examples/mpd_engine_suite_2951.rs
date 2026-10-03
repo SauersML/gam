@@ -6,14 +6,14 @@
 //! `MODEL_DIR` is any export `gam_mpd::import` reads: a transformer, residual MLP or RNN (`import`),
 //! or a rotary language model (`import_language_model`, its first `SEQUENCES` token rows at
 //! positions `0..CONTEXT`, default 1 × 32). Every model gets the same library, the same budget and
-//! the contract its export declares; nothing is tuned per model. The amount of behaviour explained
-//! is a ladder, `n = 10^RUNGS … 10^LOWEST` observations of every row (default 6 and 0; one rung when
+//! the contract its export declares. The observations per row form
+//! a ladder, `n = 10^RUNGS … 10^LOWEST` observations of every row (default 6 and 0; one rung when
 //! they are equal, for a model whose full ladder is too slow), each rung's
 //! search starting from the previous (larger-n) rung's program, so the row is a frontier of program bits
 //! against behaviour, as in the blind benchmark.
 //!
 //! The row (`OUT_DIR/report.json`, and one summary line on stdout):
-//! * native: the imported program's bits (algorithm and lookup-table data), reals, explanation
+//! * native: the imported program's bits (token-indexed tables and other operators), reals, explanation
 //!   size, and for a language model the largest centred difference between its logits and the
 //!   export's own forward (`logits_row0`);
 //! * `rounded`: the model with every operator on the lattice of `b` bits under its RMS,
@@ -49,6 +49,7 @@ fn rounded(model: &OperatorProgram, bits: i32) -> Result<OperatorProgram, String
             OperatorBody::Identity => continue,
             OperatorBody::Dense { values, .. } => values.iter().map(|v| v * v).sum(),
             OperatorBody::LowRank { left, right, .. } => left.iter().chain(right.iter()).map(|v| v * v).sum(),
+            OperatorBody::Diagonal { values, .. } => values.iter().map(|v| v * v).sum(),
         };
         let count = op.real_count();
         if count == 0 || squares == 0.0 {
@@ -65,8 +66,8 @@ fn scored(score: &ProgramScore, rows: usize, observations: u64) -> Value {
     let evaluation = &score.evaluation;
     json!({
         "program_bits": score.program_bits,
-        "measured_rows": score.measured_rows,
-        "certified": score.measured_rows == 0,
+        "estimated_rows": score.evaluation.estimated_rows,
+        "certified": score.certified(),
         "structure_bits": score.structure_bits,
         "precision_bits": score.precision_bits,
         "explanation_bits": score.explanation.bits,
@@ -90,8 +91,8 @@ fn components(program_view: &ProgramView, top: usize) -> Vec<Value> {
         .take(top)
         .map(|c| {
             json!({
-                "name": c.name, "reads": c.reads, "writes": c.writes, "laws": c.laws, "uses": c.uses,
-                "reals": c.reals, "bits": c.bits, "native": c.unresolved, "data": c.data,
+                "name": c.name, "reads": c.reads, "writes": c.writes, "applied_by": c.applied_by, "uses": c.uses,
+                "reals": c.reals, "bits": c.bits, "native": c.native_unchanged, "table": c.table,
             })
         })
         .collect()
@@ -301,20 +302,20 @@ fn main() -> Result<(), String> {
         let score = once.score(&program, &reference).map_err(|e| e.to_string())?;
         let mut row = scored(&score, rows, 1);
         row["b"] = json!(bits);
-        row["algorithm_bits"] = json!(view(&program).map_err(|e| e.to_string())?.algorithm_bits);
+        row["other_operator_storage_bits"] = json!(view(&program).map_err(|e| e.to_string())?.other_operator_storage_bits);
         if let Some(rollout) = &rollout {
             row["rollout"] = rollout_fidelity(&program, contract, rollout)?;
         }
         eprintln!("  rounded b={bits}: {}", row);
         baselines.push(row);
     }
-    // The ladder over the amount of behaviour explained: n = 10^k observations of every row.
+    // The ladder over observations: n = 10^k observations of every row.
     let mut start = model.clone();
     let mut ladder: Vec<Value> = Vec::new();
     let mut search_seconds = 0.0;
     // Descending: the search only removes and coarsens, so each rung starts from the program of
-    // the rung with more behaviour (an ascending ladder would start n = 10 from n = 1's program,
-    // which explains almost nothing and cannot regrow).
+    // the rung with more observations (an ascending ladder would start n = 10 from n = 1's
+    // program, which has already dropped what larger n keeps, and cannot regrow it).
     for exponent in (lowest..=rungs).rev() {
         let n = 10u64.pow(exponent);
         let mut contract = contract.clone();
@@ -339,9 +340,9 @@ fn main() -> Result<(), String> {
         rung["total_bits"] = json!(result.score.total());
         rung["best_rounded_total_bits"] = json!(best_rounded.0);
         rung["best_rounded_b"] = json!(best_rounded.1);
-        rung["algorithm_bits"] = json!(result_view.algorithm_bits);
-        rung["table_bits"] = json!(result_view.data_bits);
-        rung["unresolved_fraction"] = json!(result_view.unresolved_fraction());
+        rung["other_operator_storage_bits"] = json!(result_view.other_operator_storage_bits);
+        rung["table_storage_bits"] = json!(result_view.table_storage_bits);
+        rung["unchanged_native_bits"] = json!(result_view.unchanged_native_bits);
         rung["reals"] = json!(result.program.real_count());
         rung["stop"] = json!(format!("{:?}", result.stop));
         rung["seconds"] = json!(seconds);
@@ -381,8 +382,8 @@ fn main() -> Result<(), String> {
             "band_trail": band_trail,
             "native": {
                 "program_bits": native_view.bits,
-                "algorithm_bits": native_view.algorithm_bits,
-                "table_bits": native_view.data_bits,
+                "other_operator_storage_bits": native_view.other_operator_storage_bits,
+                "table_storage_bits": native_view.table_storage_bits,
                 "reals": model.real_count(),
                 "score": scored(&native_score, rows, 1),
             },

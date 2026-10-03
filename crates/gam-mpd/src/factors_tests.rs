@@ -167,12 +167,6 @@ fn units_reading_one_plane_each_come_out_as_one_rule_per_plane() {
     let read: BTreeSet<usize> = supports.iter().flatten().copied().collect();
     let rules: BTreeSet<usize> = read.iter().map(|&f| root(&mut group, f)).collect();
     assert_eq!(rules.len(), 3, "{supports:?}");
-    // Its gauge class names the factor coordinates' GL, the units' permutations and scales, and the
-    // softmax shift; every tie is classified.
-    let identification = super::identify::identify(&program, &contract, &result).expect("identifies");
-    assert!(identification.gauge.iter().any(|g| g.contains("GL(")), "{:?}", identification.gauge);
-    assert!(identification.gauge.iter().any(|g| g.contains("softmax shift")), "{:?}", identification.gauge);
-    assert_eq!(identification.alternatives.len(), result.ties.len());
 }
 
 #[test]

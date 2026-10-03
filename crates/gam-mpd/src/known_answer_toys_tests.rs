@@ -1,12 +1,10 @@
 #![cfg(test)]
 //! The known-answer toys of `test_support::known_answer_toys` against the owners that can
 //! read their answers today: each toy computes its task, its written-down decomposition
-//! reproduces it, and the module split, the residual-MLP path code and the routing laws recover
-//! the planted structure. A decomposition engine is held to the same `*Truth` values.
+//! reproduces it, and the module split and the routing laws recover the planted structure. A decomposition engine is held to the same `*Truth` values.
 
 use crate::attention::AttentionExecution;
 use crate::joint_operators::{attention_letters, query_key_operators, routing_laws};
-use crate::mlp_paths::{MlpBlock, PathProgram, ResidualMlp, SparseRow};
 use crate::module_split::MlpNormalForm;
 use crate::supports::EvidenceStatus;
 use crate::test_support::known_answer_toys::{
@@ -96,57 +94,6 @@ fn resid_mlp_module_split_finds_one_module_per_feature() {
             assert_eq!(blocks.finest.len(), features.len(), "{layers} layers, layer {layer}");
             assert!(blocks.finest.iter().all(|module| module.len() == 1));
             assert_eq!(blocks.certified_pairs, 0);
-        }
-    }
-}
-
-/// The path code's exact rewrite (`mlp_paths::PathProgram::from_model`) of each planted
-/// ResidMLP is its answer: every unit reads its feature's input coordinate with weight 1 and
-/// nothing else (no input, no earlier unit), writes only its feature's output with its write
-/// scale, and the direct operator is the identity. The units that act on an input are exactly
-/// those of its positive features, and the rewrite executes the model exactly.
-#[test]
-fn resid_mlp_path_rewrite_is_the_planted_components() {
-    let inputs = dyadic_features(RESID_SEED ^ 2, 32);
-    let rows: Vec<SparseRow> = inputs
-        .rows()
-        .into_iter()
-        .map(|x| x.iter().enumerate().filter(|&(_, &value)| value != 0.0).map(|(i, &value)| (i, value)).collect())
-        .collect();
-    for layers in 1..=3 {
-        let (model, truth) = resid_mlp(layers, RESID_SEED + layers as u64);
-        let stack = ResidualMlp {
-            embed: model.embedding.clone(),
-            unembed: model.embedding.t().to_owned(),
-            blocks: model.layers.iter().map(|layer| MlpBlock { w_in: layer.w_in.clone(), w_out: layer.w_out.clone() }).collect(),
-        };
-        let program = PathProgram::from_model(&stack).expect("path program");
-        assert_eq!(program.direct, Array2::<f64>::eye(RESID_FEATURES));
-        for component in &truth.components {
-            let block = &program.blocks[component.layer];
-            let scale = 1.0 / component.units.len() as f64;
-            let read = Array1::from_shape_fn(block.read.nrows(), |source| if source == component.feature { 1.0 } else { 0.0 });
-            let write = Array1::from_shape_fn(RESID_FEATURES, |output| if output == component.feature { scale } else { 0.0 });
-            for &unit in &component.units {
-                assert_eq!(block.read.column(unit), read, "{layers} layers, feature {}", component.feature);
-                assert_eq!(block.write.row(unit), write, "{layers} layers, feature {}", component.feature);
-            }
-        }
-        for (x, row) in inputs.rows().into_iter().zip(&rows) {
-            let trace = program.trace_row(row);
-            assert_eq!(trace.out, x.mapv(|value| value + value.max(0.0)));
-            for (layer, activations) in trace.act.iter().enumerate() {
-                let mut acting: Vec<usize> = (0..activations.len()).filter(|&unit| activations[unit] > 0.0).collect();
-                let mut planted: Vec<usize> = truth
-                    .components
-                    .iter()
-                    .filter(|component| component.layer == layer && x[component.feature] > 0.0)
-                    .flat_map(|component| component.units.iter().copied())
-                    .collect();
-                acting.sort();
-                planted.sort();
-                assert_eq!(acting, planted, "{layers} layers, layer {layer}");
-            }
         }
     }
 }

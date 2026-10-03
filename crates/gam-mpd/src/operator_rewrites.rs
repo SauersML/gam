@@ -10,26 +10,16 @@
 //! * [`PushThroughMix`]: an affine map of a routed mix whose payloads share one affine map,
 //!   `A Σ_j α_j (B z_j + b_j) = (A B) Σ_j α_j z_j + Σ_j α_j (A b_j)`: the mix moves the inputs
 //!   `z_j`, and the payload biases become a term read from the routing weights themselves.
-//! * [`PlaneBasis`]: an indicator basis `e_t` on a domain is `Φ⁻¹` times the
-//!   character basis of a single odd cycle on it, for ANY labelling of the cycle's tokens, so every
-//!   operator reading the indicator features becomes `A Φ⁻¹` (a table's discrete Fourier transform
-//!   over the labelling), and a readout over the classes becomes `Φᵀ` applied to `Φ⁻ᵀ A`. With
+//! * [`change_basis`]: an indicator basis `e_t` on a domain is `Φ⁻¹` times the character basis
+//!   of a single odd cycle on it, for ANY labelling of the cycle's tokens, so every operator
+//!   reading the indicator features becomes `A Φ⁻¹` (a table's discrete Fourier transform over
+//!   the labelling), and a readout over the classes becomes `Φᵀ` applied to `Φ⁻ᵀ A`. With
 //!   positions `a(t)`, `p` the period and `ω_k = 2πk/p`, `Φ⁻¹` has rows `(1/p, (2/p) cos ω_k a(t),
 //!   (2/p) sin ω_k a(t))` on the cycle and the identity off it (the orthogonality of the characters
-//!   of `Z_p`, `p` odd). [`PlaneBasis`] reads the labelling from the weights with nothing named:
-//!   the tokens' table (every operator reading the domain, stacked) gives the projector onto each
-//!   leading singular subspace its spectrum resolves ([`TokenOperators::leading_subspaces`]),
-//!   [`discover_permutations`] finds each projector's gap-certified symmetry group, and each
-//!   group's canonical odd cycle ([`super::symmetry::PermutationGroup::cycle_positions`]) is a
-//!   labelling. Every distinct labelling is proposed: the rewrite is exact for any labelling,
-//!   the engine's code length picks the subspace (and says whether any labelling makes the
-//!   table short), and the labelling is sent in full.
-//!   [`change_basis`] is the rewrite itself, for a labelling from anywhere: a contract that declares
-//!   a cycle (a prior, sent as one bit) is a caller's choice, not a library move.
+//!   of `Z_p`, `p` odd). The labelling comes from the caller; nothing in the library discovers one.
 
 use super::engine::{EngineError, Exactness, Edit, Primitive, Proposal, SearchContext};
 use super::fit::ProposalKind;
-use super::symmetry::{SymmetryError, TokenOperators, discover_permutations};
 use super::precision::DeclaredPrecision;
 use super::operator_program::{
     Basis, Interface, Node, Operator, OperatorBody, OperatorProgram, Provenance, band_precision, exact_precision,
@@ -87,7 +77,9 @@ pub fn product_operator(
 /// stands for. Resolving a product beyond what its factors resolve carries no information.
 fn half_step(op: &Operator) -> f64 {
     match &op.body {
-        OperatorBody::Dense { precision, .. } | OperatorBody::LowRank { precision, .. } => precision.worst_case_error(),
+        OperatorBody::Dense { precision, .. } | OperatorBody::LowRank { precision, .. } | OperatorBody::Diagonal { precision, .. } => {
+            precision.worst_case_error()
+        }
         OperatorBody::Identity => 0.0,
     }
 }
@@ -636,121 +628,6 @@ pub fn change_basis(
 fn transform_rows(mt: &Array2<f64>, rt: &Array2<f64>, a: &Array2<f64>, source_half_step: f64) -> (Array2<f64>, f64) {
     let (value_t, band) = transform(&a.t().to_owned(), &mt.t().to_owned(), &rt.t().to_owned(), source_half_step);
     (value_t.t().to_owned(), band)
-}
-
-/// Discover a cycle labelling of a domain from the weights and rewrite into its characters.
-pub struct PlaneBasis;
-
-/// The tokens' table of an indicator basis: every operator reading its features (columns are
-/// tokens) and every readout operator over it (rows are tokens), stacked as tokens × features,
-/// with a bound on `‖table − table₀‖_F` for the table its operators' reals stand for, each real
-/// known to its lattice's half-step ([`lattice_radius`]).
-fn token_table(program: &OperatorProgram, basis: usize) -> Option<(Array2<f64>, f64)> {
-    let mut blocks: Vec<Array2<f64>> = Vec::new();
-    let mut radius_squared = 0.0;
-    let features: BTreeSet<usize> = program
-        .nodes
-        .iter()
-        .enumerate()
-        .filter(|(_, n)| matches!(n, Node::Feature { basis: b, .. } if *b == basis))
-        .map(|(i, _)| i)
-        .collect();
-    let mut seen = BTreeSet::new();
-    for node in &program.nodes {
-        match node {
-            Node::Affine { terms, .. } => {
-                for (argument, op) in terms {
-                    if features.contains(argument) && seen.insert(*op) {
-                        blocks.push(program.operators[*op].matrix().t().to_owned());
-                        radius_squared += lattice_radius(&program.operators[*op]).powi(2);
-                    }
-                }
-            }
-            Node::Readout { input, basis: b } if *b == basis => {
-                if let Node::Affine { terms, .. } = &program.nodes[*input] {
-                    for (_, op) in terms {
-                        if seen.insert(*op) {
-                            blocks.push(program.operators[*op].matrix());
-                            radius_squared += lattice_radius(&program.operators[*op]).powi(2);
-                        }
-                    }
-                }
-            }
-            _ => continue,
-        }
-    }
-    if blocks.is_empty() {
-        return None;
-    }
-    let views: Vec<_> = blocks.iter().map(|b| b.view()).collect();
-    Some((ndarray::concatenate(Axis(1), &views).ok()?, radius_squared.sqrt()))
-}
-
-/// `‖A − A₀‖_F` for the operator `A₀` whose reals `A`'s lattice indices stand for, each within
-/// the half-step `h`: `h √(present reals)` for a dense operator, and for a low-rank `L R` with both
-/// factors within `h`, `h (√|L| ‖R‖_F + ‖L‖_F √|R|) + h² √(|L| |R|)`.
-fn lattice_radius(operator: &Operator) -> f64 {
-    let frobenius = |m: &Array2<f64>| m.iter().map(|v| v * v).sum::<f64>().sqrt();
-    match &operator.body {
-        OperatorBody::Identity => 0.0,
-        OperatorBody::Dense { present, precision, .. } => {
-            let reals: usize = present
-                .indexed_iter()
-                .filter(|(_, keep)| **keep)
-                .map(|((r, c), _)| operator.rows.range(r).len() * operator.cols.range(c).len())
-                .sum();
-            precision.worst_case_error() * (reals as f64).sqrt()
-        }
-        OperatorBody::LowRank { left, right, precision } => {
-            let h = precision.worst_case_error();
-            let (l, r) = ((left.len() as f64).sqrt(), (right.len() as f64).sqrt());
-            (h * (l * frobenius(right) + frobenius(left) * r) + h * h * l * r).next_up()
-        }
-    }
-}
-
-/// The distinct labellings of the tokens of `table`, one per resolved leading subspace whose
-/// symmetry group has a canonical odd cycle (module note), with the subspace's rank.
-fn discovered_labellings(table: &Array2<f64>, radius: f64) -> Result<Vec<(usize, Vec<Option<u32>>)>, EngineError> {
-    let refused = |error: SymmetryError| EngineError::Primitive(error.to_string());
-    let mut out: Vec<(usize, Vec<Option<u32>>)> = Vec::new();
-    for (rank, ops) in TokenOperators::leading_subspaces(table.view(), radius).map_err(refused)? {
-        let discovery = discover_permutations(&ops).map_err(refused)?;
-        if let Some(positions) = discovery.group.cycle_positions() {
-            if out.iter().all(|(_, seen)| *seen != positions) {
-                out.push((rank, positions));
-            }
-        }
-    }
-    Ok(out)
-}
-
-impl Primitive for PlaneBasis {
-    fn name(&self) -> &'static str {
-        "plane_basis"
-    }
-
-    fn propose(&self, context: &SearchContext<'_>) -> Result<Vec<Proposal>, EngineError> {
-        let program = context.program;
-        let mut out = Vec::new();
-        for (index, basis) in program.bases.iter().enumerate() {
-            let Basis::Indicator { domain } = basis else { continue };
-            let Some((table, radius)) = token_table(program, index) else { continue };
-            for (rank, positions) in discovered_labellings(&table, radius)? {
-                let n = positions.iter().flatten().count();
-                if let Some(candidate) = change_basis(program, index, positions, false)? {
-                    out.push(structural(
-                        "plane_basis",
-                        ProposalKind::Expose,
-                        format!("indicators of domain {domain} are Φ⁻¹ times the characters of the {n}-cycle discovered on its rank-{rank} leading subspace"),
-                        format!("discovered {n}-cycle characters on domain {domain} (rank {rank})"),
-                        candidate,
-                    ));
-                }
-            }
-        }
-        Ok(out)
-    }
 }
 
 /// The token of each cycle position of a character basis, for reports.

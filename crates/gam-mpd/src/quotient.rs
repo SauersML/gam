@@ -69,6 +69,7 @@
 use super::codec::{signed_delta_len_bits, signed_prefix_integer_len_bits};
 use super::engine::{EngineError, Edit, Exactness, Primitive, Proposal, SearchContext};
 use super::fit::ProposalKind;
+use super::gated_rewrite::rms_input_scale_is_symmetry;
 use super::operator_program::{
     Basis, Interface, Label, LabelKind, Law, Node, Operator, OperatorBody, OperatorProgram, ProgramError, remap_node,
 };
@@ -671,6 +672,7 @@ enum Slot {
     Dense(usize, usize),
     Left(usize, usize),
     Right(usize, usize),
+    Diagonal(usize),
 }
 
 fn lattice_entries(body: &OperatorBody, rows: &Interface, cols: &Interface) -> Vec<(Slot, f64)> {
@@ -694,12 +696,15 @@ fn lattice_entries(body: &OperatorBody, rows: &Interface, cols: &Interface) -> V
             .map(|((i, m), v)| (Slot::Left(i, m), *v))
             .chain(right.indexed_iter().map(|((m, j), v)| (Slot::Right(m, j), *v)))
             .collect(),
+        OperatorBody::Diagonal { values, .. } => values.indexed_iter().map(|(i, v)| (Slot::Diagonal(i), *v)).collect(),
     }
 }
 
 fn precision_of(body: &OperatorBody) -> Option<DeclaredPrecision> {
     match body {
-        OperatorBody::Dense { precision, .. } | OperatorBody::LowRank { precision, .. } => Some(*precision),
+        OperatorBody::Dense { precision, .. } | OperatorBody::LowRank { precision, .. } | OperatorBody::Diagonal { precision, .. } => {
+            Some(*precision)
+        }
         OperatorBody::Identity => None,
     }
 }
@@ -710,7 +715,8 @@ fn set_entry(body: &mut OperatorBody, slot: Slot, value: f64) {
         (OperatorBody::Dense { values, .. }, Slot::Dense(i, j)) => values.get_mut((i, j)),
         (OperatorBody::LowRank { left, .. }, Slot::Left(i, m)) => left.get_mut((i, m)),
         (OperatorBody::LowRank { right, .. }, Slot::Right(m, j)) => right.get_mut((m, j)),
-        (OperatorBody::Identity | OperatorBody::Dense { .. } | OperatorBody::LowRank { .. }, _) => None,
+        (OperatorBody::Diagonal { values, .. }, Slot::Diagonal(i)) => values.get_mut(i),
+        (OperatorBody::Identity | OperatorBody::Dense { .. } | OperatorBody::LowRank { .. } | OperatorBody::Diagonal { .. }, _) => None,
     };
     if let Some(entry) = target {
         *entry = value;
@@ -718,7 +724,7 @@ fn set_entry(body: &mut OperatorBody, slot: Slot, value: f64) {
 }
 
 fn set_precision(body: &mut OperatorBody, to: DeclaredPrecision) {
-    if let OperatorBody::Dense { precision, .. } | OperatorBody::LowRank { precision, .. } = body {
+    if let OperatorBody::Dense { precision, .. } | OperatorBody::LowRank { precision, .. } | OperatorBody::Diagonal { precision, .. } = body {
         *precision = to;
     }
 }
@@ -976,7 +982,7 @@ fn gauge_equations(program: &OperatorProgram, interfaces: &[Interface], v: &Vari
                     (0..width(index)).for_each(|i| u.join(at(i), v.node[*input] + i, 1));
                 } else {
                     (0..width(index)).for_each(|i| u.pin(at(i)));
-                    if *epsilon == 0.0 {
+                    if rms_input_scale_is_symmetry(*epsilon) {
                         (1..width(*input)).for_each(|i| u.join(v.node[*input] + i, v.node[*input], 1));
                     } else {
                         (0..width(*input)).for_each(|i| u.pin(v.node[*input] + i));
@@ -1086,6 +1092,7 @@ pub(super) fn scale_gauge(program: &OperatorProgram) -> Result<(Option<OperatorP
                 Slot::Dense(i, j) => (v.row[operator] + i, v.col[operator] + j),
                 Slot::Left(i, m) => (v.row[operator] + i, v.inner[operator] + m),
                 Slot::Right(m, j) => (v.inner[operator] + m, v.col[operator] + j),
+                Slot::Diagonal(i) => (v.row[operator] + i, v.col[operator] + i),
             };
             entries.push(GaugeEntry { operator, slot, index: (value * scale) as i64, row, col });
         }

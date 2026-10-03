@@ -8,9 +8,16 @@
 //! ([`MlpNormalForm::new`]):
 //! - a unit with `w_i = 0` is the constant `v_i σ(b_i)` and moves into `c`;
 //! - units with bitwise-equal affine forms `(w, b)` add their writes;
-//! - a unit with the opposite form `(−w, −b)` uses `σ(−t) = σ(t) − t` (true for
-//!   both activations): `v_k σ(−t) = v_k σ(t) − v_k t`, so its write adds and
-//!   `−v_k wᵀ` moves into `L`, `−v_k b` into `c`;
+//! - for ReLU, which is positively homogeneous (`σ(s t) = s σ(t)` for `s > 0`),
+//!   units whose forms are exactly proportional with a positive factor `s`
+//!   merge too, the writer rescaled: `v_k σ(s t) = (s v_k) σ(t)`. Proportionality
+//!   is decided exactly (every `x_i p_y = y_i p_x` against the pivots, each
+//!   product compared with its rounding error), never within a tolerance; a
+//!   rescaled write is exact or carries its rounding band. The GELU is not
+//!   homogeneous, so only its bitwise-equal forms merge;
+//! - a unit with the opposite form `(−w, −b)` (for ReLU `(−s w, −s b)`) uses
+//!   `σ(−t) = σ(t) − t` (true for both activations): `v_k σ(−t) = v_k σ(t) − v_k t`,
+//!   so its write adds and `−v_k wᵀ` moves into `L`, `−v_k b` into `c`;
 //! - a merged write that cancels exactly drops the unit.
 //!
 //! Unmerged, the paired copy `σ(h) − σ(−h) = h` reads as `d` modules; merged it
@@ -25,7 +32,9 @@
 //! `Σ_i v_i σ″(w_iᵀh + b_i) w_i w_iᵀ`; `σ″ = (2 − t²) φ(t)` for the GELU (a
 //! Dirac mass at the kink for ReLU) is even, so the functions
 //! `σ″(w_iᵀh + b_i)` of distinct merged forms are linearly independent
-//! (distinct up to sign is exactly what merging guarantees). Mixed partials
+//! (distinct up to sign, and for ReLU up to a positive factor, which moves
+//! neither the kink hyperplane nor the Dirac mass's direction, is exactly what
+//! merging guarantees). Mixed partials
 //! across blocks must vanish, so every rank-one `v_i w_i w_iᵀ` is block
 //! diagonal in `z`: each read lies in one block. Conversely a grouping of the
 //! reads whose spans form a direct sum gives an `S` that makes the blocks
@@ -67,7 +76,7 @@
 //! found over every invertible input frame at once, from the weights, and the
 //! approximation contract is a worst-case sup-norm bound on a ball with no law.
 //! Both read their blocks off one component owner,
-//! `response::interaction::connected_components`. On trained weights the exact
+//! `gam_math::graph::connected_components`. On trained weights the exact
 //! pattern of `Π` is generically connected, so this
 //! is a diagnostic, not a target.
 
@@ -90,7 +99,7 @@ use super::state::{
     ObservabilityLetter, SpectralNormBounds, StateError, entrywise_band_norm, reserve, spectral_norm_bounds,
 };
 use super::supports::{EvidenceStatus, EvidenceStatusError, ExactBasis, Extremum};
-use gam_response::interaction::connected_components;
+use gam_math::graph::connected_components;
 
 /// What a module-split status ranges over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,7 +111,7 @@ pub enum SplitDomain {
 }
 
 /// A merged unit's provenance: an original unit and whether its affine form is
-/// the negation of the merged one.
+/// the negation of the merged one (for ReLU, of a positive multiple of it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnitSource {
     pub unit: usize,
@@ -318,18 +327,59 @@ fn require_finite<'a>(
     }
 }
 
-/// The bit pattern of `(s w, s b)` with `s` making the first nonzero entry
-/// positive and `-0.0` read as `0.0`, and whether `s = −1`. `None` for `w = 0`.
-fn canonical_form(read: ArrayView1<'_, f64>, bias: f64) -> Option<(Vec<u64>, bool)> {
-    let first = read.iter().find(|value| **value != 0.0)?;
-    let negated = *first < 0.0;
+/// The canonical form of `(w, b)` up to the activation's exact symmetries, with
+/// `-0.0` read as `0.0`: `s (w, b)` with `s = ±1` making the first nonzero entry
+/// `p` positive, and for ReLU (positively homogeneous) also divided by `|p|`,
+/// so the pivot is `1`. The key is the form's bit pattern; division is correctly
+/// rounded, so exactly proportional forms share their key, but a shared key does
+/// not prove proportionality ([`exactly_proportional`] does). Returns the key,
+/// whether `s = −1`, and `|p|`. `None` for `w = 0`.
+fn canonical_form(activation: GaussianActivation, read: ArrayView1<'_, f64>, bias: f64) -> Option<(Vec<u64>, bool, f64)> {
+    let first = *read.iter().find(|value| **value != 0.0)?;
+    let negated = first < 0.0;
     let sign = if negated { -1.0 } else { 1.0 };
+    let divisor = if activation == GaussianActivation::Relu { first.abs() } else { 1.0 };
     let key = read
         .iter()
         .chain(std::iter::once(&bias))
-        .map(|value| (sign * value + 0.0).to_bits())
+        .map(|value| (sign * value / divisor + 0.0).to_bits())
         .collect();
-    Some((key, negated))
+    Some((key, negated, first.abs()))
+}
+
+/// `a b = c d` in exact arithmetic: the rounded products and their exact
+/// rounding errors (`fma`) both agree. Products that underflow lose their error
+/// term, so they are refused (`false`) rather than compared.
+fn equal_products(a: f64, b: f64, c: f64, d: f64) -> bool {
+    let (left, right) = (a * b, c * d);
+    let tiny = |product: f64, x: f64, y: f64| product.abs() < f64::MIN_POSITIVE && x != 0.0 && y != 0.0;
+    if tiny(left, a, b) || tiny(right, c, d) {
+        return false;
+    }
+    left == right && a.mul_add(b, -left) == c.mul_add(d, -right)
+}
+
+/// Whether `x = s y` exactly for some `s > 0`, with `x` and `y` the forms `(w, b)`
+/// and `px`, `py` their first nonzero entries (the same coordinate, same sign
+/// after the canonical sign): `x_i py = y_i px` for every `i`.
+fn exactly_proportional(x: &[f64], px: f64, y: &[f64], py: f64) -> bool {
+    x.len() == y.len() && x.iter().zip(y).all(|(&xi, &yi)| equal_products(xi, py, yi, px))
+}
+
+/// `s v` and a bound on its error against the exact `(|p_k| / |p_lead|) v`: zero
+/// when the ratio and every product are exact (none subnormal), else `γ₃ ‖s v‖`
+/// (the ratio's and the product's rounding, against the computed magnitude).
+fn rescaled_write(column: ArrayView1<'_, f64>, pivot: f64, lead_pivot: f64) -> (Array1<f64>, f64) {
+    if pivot == lead_pivot {
+        return (column.to_owned(), 0.0);
+    }
+    let scale = pivot / lead_pivot;
+    let normal = |product: f64, factor: f64| factor == 0.0 || product.abs() >= f64::MIN_POSITIVE;
+    let exact_scale = normal(scale, pivot) && scale.mul_add(lead_pivot, -pivot) == 0.0;
+    let write = column.mapv(|value| scale * value);
+    let exact = exact_scale && column.iter().zip(write.iter()).all(|(&v, &w)| normal(w, v) && scale.mul_add(v, -w) == 0.0);
+    let band = if exact { 0.0 } else { accumulation_growth(3) * frobenius_norm(write.view()) };
+    (write, band)
 }
 
 impl MlpNormalForm {
@@ -362,22 +412,39 @@ impl MlpNormalForm {
         }
         let mut offset = b_out.to_owned();
 
-        let mut groups: HashMap<Vec<u64>, usize> = HashMap::new();
+        // Units whose canonical keys agree are candidates; a unit joins a group only
+        // when its signed form is exactly proportional to the group's lead.
+        let mut groups: HashMap<Vec<u64>, Vec<usize>> = HashMap::new();
         let mut sources: Vec<Vec<UnitSource>> = Vec::new();
+        let mut pivots: Vec<Vec<f64>> = Vec::new();
         let mut constant = Vec::new();
+        let signed_form = |unit: usize, negated: bool| -> Vec<f64> {
+            let sign = if negated { -1.0 } else { 1.0 };
+            w_in.row(unit).iter().chain(std::iter::once(&b_in[unit])).map(|value| sign * value).collect()
+        };
         for unit in 0..hidden {
             let read = w_in.row(unit);
-            let Some((key, negated)) = canonical_form(read, b_in[unit]) else {
+            let Some((key, negated, pivot)) = canonical_form(activation, read, b_in[unit]) else {
                 // A zero read is the constant `v σ(b)`.
                 offset.scaled_add(activation_value(activation, b_in[unit])?, &w_out.column(unit));
                 constant.push(unit);
                 continue;
             };
-            let group = *groups.entry(key).or_insert_with(|| {
+            let candidates = groups.entry(key).or_default();
+            let form = signed_form(unit, negated);
+            let joined = candidates.iter().copied().find(|&group| {
+                let lead = sources[group][0];
+                activation != GaussianActivation::Relu
+                    || exactly_proportional(&form, pivot, &signed_form(lead.unit, lead.negated), pivots[group][0])
+            });
+            let group = joined.unwrap_or_else(|| {
                 sources.push(Vec::new());
+                pivots.push(Vec::new());
+                candidates.push(sources.len() - 1);
                 sources.len() - 1
             });
             sources[group].push(UnitSource { unit, negated });
+            pivots[group].push(pivot);
         }
         let mut reads = Vec::new();
         let mut biases = Vec::new();
@@ -386,16 +453,23 @@ impl MlpNormalForm {
         let mut kept = Vec::new();
         let mut cancelled = Vec::new();
         let mut negated_terms = 0_usize;
-        for group in sources {
-            // The merged form is the canonical one, which every source's flag is relative to.
+        let mut inexact_rescale = false;
+        for (group, group_pivots) in sources.into_iter().zip(pivots) {
+            // The merged form is the lead's, signed canonically, which every source's
+            // flag and (for ReLU) positive factor `|p_k| / |p_lead|` are relative to.
             let lead = group[0];
+            let lead_pivot = group_pivots[0];
             let lead_sign = if lead.negated { -1.0 } else { 1.0 };
             let read = w_in.row(lead.unit).mapv(|value| lead_sign * value);
             let bias = lead_sign * b_in[lead.unit];
             let mut write = Array1::<f64>::zeros(output);
             let mut absolute_write = Array1::<f64>::zeros(output);
-            for source in &group {
-                let column = w_out.column(source.unit);
+            let mut rescale_band = 0.0;
+            for (source, &pivot) in group.iter().zip(&group_pivots) {
+                // `v_k σ(s t) = (s v_k) σ(t)`: the writer carries the positive factor.
+                let (column, band) = rescaled_write(w_out.column(source.unit), pivot, lead_pivot);
+                rescale_band += band;
+                inexact_rescale |= band > 0.0;
                 write += &column;
                 absolute_write += &column.mapv(f64::abs);
                 if source.negated {
@@ -411,12 +485,13 @@ impl MlpNormalForm {
                 }
             }
             // One rounded addition errs relative to its own result (`fl(a + b) = (a + b)(1 + δ)`),
-            // so a merged pair that computes to zero cancels exactly; longer sums carry `γ_{n−1} Σ|v|`.
+            // so a merged pair of exact writes that computes to zero cancels exactly; longer sums
+            // carry `γ_{n−1} Σ|v|`, and an inexact rescale its own band.
             let band = if group.len() <= 2 {
                 accumulation_growth(1) * frobenius_norm(write.view())
             } else {
                 accumulation_growth(group.len() - 1) * frobenius_norm(absolute_write.view())
-            };
+            } + rescale_band;
             if band == 0.0 && write.iter().all(|value| *value == 0.0) {
                 cancelled.extend(group.iter().map(|source| source.unit));
                 continue;
@@ -427,8 +502,10 @@ impl MlpNormalForm {
             write_bands.push(band);
             kept.push(group);
         }
+        // A rescaled writer carries up to `γ₃` relative error into every product it forms.
+        let linear_terms = negated_terms + 1 + if inexact_rescale { 3 } else { 0 };
         let linear_band = entrywise_band_norm(
-            absolute_linear.mapv(|magnitude| accumulation_band(negated_terms + 1, magnitude)),
+            absolute_linear.mapv(|magnitude| accumulation_band(linear_terms, magnitude)),
         );
         let stack = |rows: &[Array1<f64>], width: usize| {
             let mut matrix = Array2::<f64>::zeros((rows.len(), width));

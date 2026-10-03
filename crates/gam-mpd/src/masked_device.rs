@@ -226,7 +226,8 @@ impl Accelerated {
                 return Err("device: the state's masks are not the given ones".to_string());
             }
             let Some(cot_masked) = back.get(&masked.masked[k]) else {
-                let (d_in, d_out) = (masked.mean(k).len(), site.writes.iter().map(|w| state.trace.value(*w).map(|t| t.cols())).sum::<Result<usize, _>>()?);
+                let width = |nodes: &[usize]| nodes.iter().map(|n| state.trace.value(*n).map(|t| t.cols())).sum::<Result<usize, _>>();
+                let (d_in, d_out) = (width(&site.reads)?, width(&site.writes)?);
                 out.push((Array2::zeros((rows, masked.blocks(k))), Array2::zeros((pieces, d_in)), Array2::zeros((pieces, d_out))));
                 continue;
             };
@@ -234,17 +235,12 @@ impl Accelerated {
             d.hadamard(&mut mask_gradient, cot_masked, z, false).map_err(error)?;
             let mut cot_z = d.zeros(rows, pieces).map_err(error)?;
             d.hadamard(&mut cot_z, cot_masked, mask, false).map_err(error)?;
-            // ∂KL/∂V = cot_zᵀ (x − μ), one block per read node.
+            // ∂KL/∂V = cot_zᵀ x, one block per read node (the reads are uncentred, `crate::masked`).
             let mut v_blocks = Vec::new();
-            let mut offset = 0;
             for read in &site.reads {
                 let x = state.trace.value(*read)?;
-                let mean = masked.mean(k).slice(s![offset..offset + x.cols()]).to_owned();
-                offset += x.cols();
-                let mut centred = d.copy(x).map_err(error)?;
-                d.add_row(&mut centred, -1.0, &d.upload_vec(1, mean.len(), mean.to_vec()).map_err(error)?).map_err(error)?;
                 let mut block = d.zeros(pieces, x.cols()).map_err(error)?;
-                d.gemm(&mut block, 1.0, &cot_z, Op::T, &centred, Op::N, 0.0, self.proposal).map_err(error)?;
+                d.gemm(&mut block, 1.0, &cot_z, Op::T, x, Op::N, 0.0, self.proposal).map_err(error)?;
                 v_blocks.push(d.download(&block).map_err(error)?);
             }
             // ∂KL/∂U = z̃ᵀ g_written, one block per written node.
@@ -271,25 +267,18 @@ impl Accelerated {
         Ok(out)
     }
 
-    /// Per site the read covariance `(x − μ)ᵀ(x − μ) / rows` of the state's forward (the pieces'
-    /// `V` preconditioner, as `step_pieces` measures it).
+    /// Per site the reads' second moment `xᵀx / rows` of the state's forward (the pieces' `V`
+    /// preconditioner, as `step_pieces` measures it).
     pub fn covariances(&self, masked: &Masked, state: &State) -> Result<Vec<Array2<f64>>, String> {
         let d = self.program.device();
         let rows = state.trace.rows as f64;
         let mut out = Vec::new();
         for (k, site) in masked.sites.iter().enumerate() {
-            let library_mean = masked.mean(k);
             let mut centred: Vec<Tensor> = Vec::new();
-            let mut offset = 0;
             for read in &site.reads {
-                let x = state.trace.value(*read)?;
-                let mean = library_mean.slice(s![offset..offset + x.cols()]).to_vec();
-                offset += x.cols();
-                let mut c = d.copy(x).map_err(error)?;
-                d.add_row(&mut c, -1.0, &d.upload_vec(1, mean.len(), mean).map_err(error)?).map_err(error)?;
-                centred.push(c);
+                centred.push(d.copy(state.trace.value(*read)?).map_err(error)?);
             }
-            let width = library_mean.len();
+            let width: usize = centred.iter().map(|c| c.cols()).sum();
             let mut covariance = Array2::<f64>::zeros((width, width));
             let (mut oi, mut blocks) = (0, Vec::new());
             for ci in &centred {

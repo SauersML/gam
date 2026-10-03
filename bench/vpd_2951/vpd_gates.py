@@ -7,6 +7,13 @@ Subcommands:
                             (one subcomponent's amplitudes contiguous), sites and subcomponents in the
                             masked driver's numbering (library site names sorted), plus OUT_DIR/sites.txt.
 
+  kl SETS [--rows LO:HI]     KL(target ‖ masked) per token and L0 of per-token sets on those rows of masks_vpd4l.npz
+                            (default the 32 eval passages), the subcomponents off the set dropped, nothing
+                            else added (the masked driver's library forward). SETS is a CSR over the rows'
+                            tokens in the driver's numbering: DIR/{indptr,indices}.i64 (vpd_sets_export.py)
+                            or PREFIX.{indptr,indices}.npy (mpd_gates_2951, the masked driver).
+  ciflops                   multiply–adds per token of VPD's causal-importance network at 512 tokens.
+
 usage: MPD_MEM_GIB=4 ~/mpd-data/venv/bin/python vpd_gates.py SUBCOMMAND ...
 """
 
@@ -69,12 +76,92 @@ def cmd_amps(out: Path, rows: int) -> None:
         f.flush()
 
 
+def read_sets(spec: str):
+    p = Path(spec)
+    if p.is_dir():
+        return np.fromfile(p / "indptr.i64", dtype="<i8"), np.fromfile(p / "indices.i64", dtype="<i8")
+    return np.load(f"{spec}.indptr.npy"), np.load(f"{spec}.indices.npy")
+
+
+def cmd_kl(spec: str, rows: str) -> None:
+    sys.path.insert(0, str(Path(__file__).parent))
+    from vpd_eval import kl_per_pos  # noqa: E402
+
+    lo, hi = (int(v) for v in rows.split(":"))
+    z = np.load(FRONTIER)
+    ids = torch.tensor(z["ids"][lo:hi].astype(np.int64))
+    S = ids.shape[1]
+    indptr, indices = read_sets(spec)
+    if len(indptr) - 1 != (hi - lo) * S:
+        raise SystemExit(f"{spec}: {len(indptr) - 1} tokens, rows {rows} have {(hi - lo) * S}")
+    sites = driver_sites()
+    offs = np.cumsum([0] + [c for _, _, c in sites])
+    target = load_target(DEV)
+    raw = torch.load(str(VPD_PTH), map_location="cpu", weights_only=True, mmap=True)
+    for _, vn, _ in sites:
+        st = target.site(vn)
+        k = "_components." + vn.replace(".", "-")
+        st.U, st.V = raw[k + ".U"].float().to(DEV), raw[k + ".V"].float().to(DEV)
+    del raw
+    kls = []
+    MB = 4
+    for i in range(0, hi - lo, MB):
+        b = ids[i:i + MB].to(DEV)
+        B = b.shape[0]
+        for _, vn, _ in sites:
+            target.site(vn).mask = None
+        with torch.no_grad():
+            tgt = target(b)
+        t0, t1 = i * S, (i + B) * S
+        counts = np.diff(indptr[t0:t1 + 1])
+        tok = np.repeat(np.arange(t1 - t0), counts)
+        g = indices[indptr[t0]:indptr[t1]]
+        site = np.searchsorted(offs, g, side="right") - 1
+        for si, (_, vn, c) in enumerate(sites):
+            m = torch.zeros(B * S, c, device=DEV)
+            sel = site == si
+            m[torch.tensor(tok[sel], device=DEV), torch.tensor(g[sel] - offs[si], device=DEV)] = 1.0
+            target.site(vn).mask = m.view(B, S, c)
+        with torch.no_grad():
+            kls.append(kl_per_pos(target(b), tgt).cpu().numpy())
+    for _, vn, _ in sites:
+        target.site(vn).mask = None
+    kl = np.concatenate(kls)
+    print(json.dumps({"sets": spec, "rows": rows, "kl": float(kl.mean()), "l0": float(len(indices) / (len(indptr) - 1))}))
+
+
+def cmd_ciflops() -> None:
+    """Multiply–adds per token of the CI network (input projection, 8 bidirectional blocks with
+    their attention over 512 tokens, output head), from the published shapes."""
+    raw = torch.load(str(VPD_PTH), map_location="cpu", weights_only=True, mmap=True)
+    sd = {k.split("_global_ci_fn.", 1)[1]: v for k, v in raw.items() if "_global_ci_fn." in k}
+    T = 512
+    total = sd["_input_projector.W"].numel() + sd["_output_head.W"].numel()
+    blocks = 1 + max(int(k.split(".")[1]) for k in sd if k.startswith("_blocks."))
+    d = sd["_blocks.0.attn.q_proj.weight"].shape[0]
+    for i in range(blocks):
+        pre = f"_blocks.{i}."
+        total += sum(sd[pre + f"attn.{n}.weight"].numel() for n in ("q_proj", "k_proj", "v_proj", "out_proj"))
+        total += sd[pre + "mlp.0.W"].numel() + sd[pre + "mlp.2.W"].numel()
+        total += 2 * T * d  # scores and the weighted sum over T keys, all heads together
+    params = sum(v.numel() for v in sd.values())
+    print(json.dumps({"multiply_adds_per_token": int(total), "flops_per_token": int(2 * total), "parameters": int(params), "blocks": blocks, "d_model": d}))
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("amps")
     a.add_argument("out", type=Path)
     a.add_argument("--rows", type=int, default=128)
+    k = sub.add_parser("kl")
+    k.add_argument("sets")
+    k.add_argument("--rows", default="0:32")
+    sub.add_parser("ciflops")
     args = p.parse_args()
     if args.cmd == "amps":
         cmd_amps(args.out, args.rows)
+    elif args.cmd == "kl":
+        cmd_kl(args.sets, args.rows)
+    else:
+        cmd_ciflops()

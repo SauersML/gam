@@ -11,7 +11,7 @@ use super::operator_program::{
 };
 use super::engine::{EngineError, Edit, Exactness, Proposal, SearchContext};
 use super::fit::ProposalKind;
-use super::operator_rewrites::{PlaneBasis, change_basis};
+use super::operator_rewrites::change_basis;
 use super::precision::DeclaredPrecision;
 use ndarray::Array2;
 use std::f64::consts::TAU;
@@ -144,32 +144,6 @@ fn a_declared_cycle_exposes_the_planted_plane_and_drops_the_rest() {
     assert!(result.score.program_bits < program.code_bits().expect("native bits"));
     assert_eq!(kept_planes(&result.program), vec![PLANTED as u32]);
     assert!(result.program.bases.iter().any(|b| matches!(b, Basis::Characters { declared: true, .. })));
-}
-
-#[test]
-fn a_recovered_cycle_is_the_planted_one_up_to_an_automorphism() {
-    let (program, contract) = planted_program(false);
-    let library: Vec<Box<dyn Primitive>> = vec![Box::new(PlaneBasis), Box::new(DropBlocks), Box::new(Coarsen)];
-    let result = decompose(&program, &contract, &library, &budget()).expect("decomposes");
-    assert!(result.score.proven_shorter_than(&contract.score(&program, &contract.logits(&program).expect("reference")).expect("native score")));
-    let positions = result
-        .program
-        .bases
-        .iter()
-        .find_map(|b| match b {
-            Basis::Characters { positions, declared: false, .. } => Some(positions.clone()),
-            _ => None,
-        })
-        .expect("a recovered character basis was accepted");
-    let a0 = positions[0].expect("token 0 is on the cycle") as usize;
-    let unit = (1..P)
-        .find(|&k| (0..P).all(|x| positions[x] == Some(((k * x + a0) % P) as u32)))
-        .expect("the recovered labelling is an affine relabelling of x -> x + 1");
-    // One plane survives, and it is the planted frequency read in the recovered labelling.
-    let planes = kept_planes(&result.program);
-    assert_eq!(planes.len(), 1);
-    let read = planes[0] as usize;
-    assert!((read * unit) % P == PLANTED || (read * unit) % P == P - PLANTED, "plane {read} under unit {unit}");
 }
 
 #[test]
@@ -416,4 +390,126 @@ fn a_candidates_length_from_its_base_is_its_length() {
             "{edit:?}"
         );
     }
+}
+
+/// A raw slot of width 2 read by one dense map `W` into two classes, with three inputs.
+fn raw_readout(w: Array2<f64>) -> (OperatorProgram, Contract) {
+    let declarations = Declarations { parameters: 0, domains: vec![], slots: vec![Slot::Raw { width: 2 }] };
+    let native = Interface::native(2).expect("interface");
+    let program = OperatorProgram {
+        rules: Vec::new(),
+        declarations: declarations.clone(),
+        bases: vec![],
+        operators: vec![Arc::new(
+            Operator::dense("W", native.clone(), native, w, precision(30), Provenance::native("W")).expect("dense"),
+        )],
+        nodes: vec![Node::Raw { slot: 0 }, Node::Affine { terms: vec![(0, 0)], bias: None }],
+        output: 1,
+    };
+    let x = Array2::from_shape_fn((3, 2), |(i, j)| 0.37 + 0.11 * i as f64 - 0.29 * j as f64);
+    let contract = Contract {
+        declarations,
+        family: FamilyInputs { layout: None, rows: 3, slots: vec![SlotValues::Raw(x)] },
+        kind: FamilyKind::Complete { description: "three inputs".to_string() },
+        observations: 1,
+        readouts: 1,
+        readout_slots: None,
+    };
+    (program, contract)
+}
+
+/// A row whose proven band is not below one logit unit takes an estimated band, which encloses
+/// nothing: whether the estimate is the reference's or the candidate's, no status of the row is
+/// exact, no argmax is certified, and no score resting on it is proven shorter or longer.
+#[test]
+fn an_estimated_band_certifies_no_status_and_no_shorter_score() {
+    use super::contract::BandBasis;
+    use super::supports::EvidenceStatus;
+    let w = Array2::from_shape_fn((2, 2), |(i, j)| ((i * 2 + j) as f64 * 0.7 + 0.3).sin());
+    let (small, contract) = raw_readout(w.clone());
+    // Logits near 1e18: the forward-error enclosure is hundreds of logit units wide.
+    let (large, _) = raw_readout(w.mapv(|v| v * 1e18));
+    let enclosed = contract.logits(&small).expect("small logits");
+    assert!(enclosed.basis.iter().all(|b| *b == BandBasis::Enclosure), "{:?}", enclosed.basis);
+    let estimated = contract.logits(&large).expect("large logits");
+    assert!(estimated.basis.iter().all(|b| *b != BandBasis::Enclosure), "{:?}", estimated.basis);
+    let certified = contract.score(&small, &enclosed).expect("certified score");
+    assert!(certified.certified());
+    assert!(matches!(certified.evaluation.total_kl, EvidenceStatus::Exact { .. }));
+    for (program, reference) in [(&large, &enclosed), (&small, &estimated), (&large, &estimated)] {
+        let score = contract.score(program, reference).expect("score");
+        assert!(!score.certified());
+        assert_eq!(score.evaluation.estimated_rows, 3);
+        assert!(!matches!(score.evaluation.total_kl, EvidenceStatus::Exact { .. }), "{:?}", score.evaluation.total_kl);
+        assert!(!matches!(score.evaluation.max_kl, EvidenceStatus::Exact { .. }), "{:?}", score.evaluation.max_kl);
+        assert_eq!(score.evaluation.argmax_uncertified, 3);
+        assert!(score.evaluation.argmax_agrees.iter().all(|a| !a));
+        assert!(score.evaluation.kl_upper.iter().all(|u| u.is_infinite()));
+        assert_eq!(score.evaluation.max_tv_upper, 1.0);
+        assert!(!score.proven_shorter_than(&certified) && !certified.proven_shorter_than(&score));
+        assert!(!score.proven_shorter_than(&score));
+    }
+}
+
+/// A call is counted as its body inlined: the same ReLU layer written inline and wrapped in a rule
+/// has the same instances, activities and explanation bits.
+#[test]
+fn a_call_counts_the_activity_of_its_body_as_inlined() {
+    use super::contract::explanation;
+    use super::operator_program::{Law, Rule};
+    let declarations = Declarations { parameters: 0, domains: vec![], slots: vec![Slot::Raw { width: 3 }] };
+    let native = Interface::native(3).expect("interface");
+    let units = Interface::uniform(2, 1, LabelKind::Unit, 0).expect("interface");
+    let values = Array2::from_shape_fn((2, 3), |(i, j)| ((i * 3 + j) as f64 * 0.7 + 0.2).sin());
+    let w = Arc::new(Operator::dense("W", units, native.clone(), values, precision(30), Provenance::native("W")).expect("dense"));
+    let layer = |input: usize| {
+        vec![
+            Node::Affine { terms: vec![(input, 0)], bias: None },
+            Node::Pointwise { input: input + 1, laws: vec![Law::Relu, Law::Relu] },
+        ]
+    };
+    let inlined = OperatorProgram {
+        rules: Vec::new(),
+        declarations: declarations.clone(),
+        bases: vec![],
+        operators: vec![w.clone()],
+        nodes: std::iter::once(Node::Raw { slot: 0 }).chain(layer(0)).collect(),
+        output: 2,
+    };
+    let rule = Rule {
+        name: "layer".to_string(),
+        inputs: vec![native],
+        nodes: std::iter::once(Node::Param { index: 0 }).chain(layer(0)).collect(),
+        output: 2,
+    };
+    let called = OperatorProgram {
+        rules: vec![rule],
+        declarations: declarations.clone(),
+        bases: vec![],
+        operators: vec![w],
+        nodes: vec![Node::Raw { slot: 0 }, Node::Call { rule: 0, arguments: vec![0] }],
+        output: 1,
+    };
+    // Pre-activations well away from zero, of both signs.
+    let x = Array2::from_shape_fn((6, 3), |(i, j)| (if (i + j) % 3 == 0 { 1.5 } else { -0.75 }) * (1.0 + 0.25 * i as f64));
+    let family = FamilyInputs { layout: None, rows: 6, slots: vec![SlotValues::Raw(x)] };
+    let explain = |program: &OperatorProgram| {
+        let trace = program.execute(&family, true).expect("executes");
+        explanation(program, &family, &trace).expect("explanation")
+    };
+    let (inline, call) = (explain(&inlined), explain(&called));
+    assert_eq!(inline.instances, 2);
+    assert!(inline.active.iter().any(|a| *a > 0) && inline.active.iter().any(|a| *a < 2), "{:?}", inline.active);
+    assert_eq!(inline, call);
+    let contract = Contract {
+        declarations,
+        family,
+        kind: FamilyKind::Complete { description: "six inputs".to_string() },
+        observations: 1,
+        readouts: 1,
+        readout_slots: None,
+    };
+    let reference = contract.logits(&inlined).expect("reference");
+    let (a, b) = (contract.score(&inlined, &reference).expect("inline"), contract.score(&called, &reference).expect("call"));
+    assert_eq!(a.explanation, b.explanation);
 }

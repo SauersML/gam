@@ -22,8 +22,11 @@
 //! reals (every real is a lattice point, so the operators themselves carry no error). With
 //! `u` the unit roundoff and `γ_k = ku/(1 − ku)`:
 //!
-//! * **Feature.** An indicator is exact. A character `cos(2π r/p)`, `sin(2π r/p)` with the
-//!   integer `r = k·a mod p` is formed as `fl(fl(TAU·r)/p)`: `TAU` is within `u·2π` of `2π`,
+//! * **Feature.** An indicator is exact. An indicator feature read only as affine terms is a
+//!   *gathered* feature ([`OperatorProgram::gathered_tokens`]): its one-hot rows are never formed
+//!   (its trace value and band hold no columns), and each affine term reading it adds the
+//!   operator's column at the row's token, an exact one times each entry. A character
+//!   `cos(2π r/p)`, `sin(2π r/p)` with the integer `r = k·a mod p` is formed as `fl(fl(TAU·r)/p)`: `TAU` is within `u·2π` of `2π`,
 //!   and the product and quotient round once each, so the angle is within `γ_3·2π`. Cosine and
 //!   sine are 1-Lipschitz and libm adds at most one ulp, `2u` on `[−1, 1]` (the assumption
 //!   `attention`'s tests check at their fixture points).
@@ -72,7 +75,9 @@
 //!    the first is sent as its increment over the previous one in the Elias δ code of `increment + 1`.
 //!    Its rows are then a sorted list, whose order costs nothing, where the plain kind pays for an
 //!    arbitrary order (about `log₂ n!` bits for `n` distinct rows). The encoder sends whichever kind
-//!    is shorter, and the decoder recovers the positions from the present blocks;
+//!    is shorter, and the decoder recovers the positions from the present blocks. A diagonal
+//!    operator (a norm gain) sends its one interface and its diagonal as one lattice message, and
+//!    is held as that diagonal everywhere, never as a square matrix;
 //! 4. each node: its kind as a fixed index and its references as fixed indices into the objects
 //!    listed before it, a per-group law as a fixed index, a scale kind as a fixed index and its
 //!    argument in the prefix code;
@@ -625,10 +630,13 @@ pub enum OperatorBody {
     /// `precision`. The executed operator is the exact product; its computed product is within
     /// `γ_r |left||right|` of it entrywise.
     LowRank { left: Array2<f64>, right: Array2<f64>, precision: DeclaredPrecision },
+    /// `diag(values)` between equal interfaces, `values` on the lattice of `precision`: a norm
+    /// gain. A product with it is a column scale.
+    Diagonal { values: Array1<f64>, precision: DeclaredPrecision },
 }
 
-/// Identity, dense, low-rank, and dense with ordered rows (module note, "The code").
-const OPERATOR_KINDS: usize = 4;
+/// Identity, dense, low-rank, dense with ordered rows, and diagonal (module note, "The code").
+const OPERATOR_KINDS: usize = 5;
 
 /// A shared operator between two interfaces.
 #[derive(Clone, Debug, PartialEq)]
@@ -697,6 +705,27 @@ impl Operator {
         Ok(Self { name, rows, cols, body: OperatorBody::Dense { values, present, precision }, provenance })
     }
 
+    /// The diagonal operator `diag(values)` on `interface`, its reals rounded to `precision`'s
+    /// lattice, coarsened when their range needs it ([`DeclaredPrecision::within_range`]).
+    pub fn diag(
+        name: impl Into<String>,
+        interface: Interface,
+        values: Array1<f64>,
+        precision: DeclaredPrecision,
+        provenance: Provenance,
+    ) -> Result<Self, ProgramError> {
+        let name = name.into();
+        if values.len() != interface.width() {
+            return Err(ProgramError::Shape(format!("operator {name}: a diagonal of {} on an interface of {}", values.len(), interface.width())));
+        }
+        let precision = precision.within_range(values.iter().fold(0.0_f64, |acc, v| acc.max(v.abs())));
+        let mut values = values;
+        for value in values.iter_mut() {
+            *value = round_to_lattice(*value, precision)?;
+        }
+        Ok(Self { name, rows: interface.clone(), cols: interface, body: OperatorBody::Diagonal { values, precision }, provenance })
+    }
+
     /// A low-rank operator `left · right`, both factors rounded to `precision`'s lattice, coarsened
     /// when the factors' range needs it ([`DeclaredPrecision::within_range`]).
     pub fn low_rank(
@@ -743,6 +772,7 @@ impl Operator {
             OperatorBody::Identity => 0.0,
             OperatorBody::Dense { values, .. } => fold(values),
             OperatorBody::LowRank { left, right, .. } => fold(left).max(fold(right)),
+            OperatorBody::Diagonal { values, .. } => values.iter().fold(0.0_f64, |acc, v| acc.max(v.abs())),
         }
     }
 
@@ -766,12 +796,13 @@ impl Operator {
         }
     }
 
-    /// The diagonal of an operator that is one: the identity, or a dense operator between equal
-    /// interfaces of single-coordinate groups whose only present blocks are on the diagonal (a
-    /// norm gain). A product with it is a column scale, not a matrix product.
+    /// The diagonal of an operator that is one: the identity, a diagonal operator, or a dense
+    /// operator between equal interfaces of single-coordinate groups whose only present blocks are
+    /// on the diagonal. A product with it is a column scale, not a matrix product.
     pub fn diagonal(&self) -> Option<Array1<f64>> {
         match &self.body {
             OperatorBody::Identity => Some(Array1::ones(self.rows.width())),
+            OperatorBody::Diagonal { values, .. } => Some(values.clone()),
             OperatorBody::Dense { values, present, .. } => {
                 let n = self.rows.width();
                 let single = self.cols.width() == n && self.rows.group_count() == n && self.cols.group_count() == n;
@@ -787,6 +818,35 @@ impl Operator {
             OperatorBody::Identity => Array2::eye(self.rows.width()),
             OperatorBody::Dense { values, .. } => values.clone(),
             OperatorBody::LowRank { left, right, .. } => left.dot(right),
+            OperatorBody::Diagonal { values, .. } => Array2::from_diag(values),
+        }
+    }
+
+    /// Column `column` of the matrix this operator applies, formed without the matrix.
+    pub fn column(&self, column: usize) -> Array1<f64> {
+        match &self.body {
+            OperatorBody::Identity => {
+                let mut out = Array1::zeros(self.rows.width());
+                out[column] = 1.0;
+                out
+            }
+            OperatorBody::Diagonal { values, .. } => {
+                let mut out = Array1::zeros(self.rows.width());
+                out[column] = values[column];
+                out
+            }
+            OperatorBody::Dense { values, .. } => values.column(column).to_owned(),
+            OperatorBody::LowRank { left, right, .. } => left.dot(&right.column(column)),
+        }
+    }
+
+    /// `x Aᵀ`, the product an affine term applies, structural for the identity and a diagonal.
+    pub fn apply(&self, x: &Array2<f64>) -> Array2<f64> {
+        match &self.body {
+            OperatorBody::Identity => x.clone(),
+            OperatorBody::Diagonal { values, .. } => x * values,
+            OperatorBody::Dense { values, .. } => fast_abt(x, values),
+            OperatorBody::LowRank { left, right, .. } => fast_abt(&fast_abt(x, right), left),
         }
     }
 
@@ -794,6 +854,7 @@ impl Operator {
     pub fn real_count(&self) -> usize {
         match &self.body {
             OperatorBody::Identity => 0,
+            OperatorBody::Diagonal { values, .. } => values.len(),
             OperatorBody::LowRank { left, right, .. } => left.len() + right.len(),
             OperatorBody::Dense { present, .. } => present
                 .indexed_iter()
@@ -828,6 +889,7 @@ impl Operator {
                 reals.extend(left.iter().copied());
                 reals.extend(right.iter().copied());
             }
+            OperatorBody::Diagonal { values, .. } => reals.extend(values.iter().copied()),
             OperatorBody::Identity => {}
         }
         reals
@@ -1225,6 +1287,7 @@ fn row_norms(r: &Array2<f64>) -> Array1<f64> {
 fn spectral_bound(op: &Operator) -> Result<f64, ProgramError> {
     match &op.body {
         OperatorBody::Identity => Ok(1.0),
+        OperatorBody::Diagonal { values, .. } => Ok(values.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()))),
         OperatorBody::Dense { values, .. } => matrix_spectral_bound(values.view()),
         OperatorBody::LowRank { left, right, .. } => {
             Ok((matrix_spectral_bound(left.view())? * matrix_spectral_bound(right.view())?).next_up())
@@ -1323,10 +1386,92 @@ fn rms_norm(x: &Array2<f64>, bands: Option<&Array2<f64>>, epsilon: f64) -> (Arra
     (out, radius)
 }
 
+/// A changed operator's `A_new − A_old`: a matrix, or a diagonal's change.
+enum Difference {
+    Matrix(Array2<f64>),
+    Diagonal(Array1<f64>),
+}
+
+impl Difference {
+    fn at(&self, row: usize, col: usize) -> f64 {
+        match self {
+            Self::Matrix(m) => m[[row, col]],
+            Self::Diagonal(d) => if row == col { d[row] } else { 0.0 },
+        }
+    }
+}
+
 /// The arguments of the rule body being executed (none at the top level) and the parameter values.
 struct Frame<'a> {
     args: &'a [(Array2<f64>, Option<Array2<f64>>)],
     parameters: &'a [f64],
+    /// The node list being executed (the program's, or a rule body's) and its output node.
+    nodes: &'a [Node],
+    output: usize,
+}
+
+/// Whether node `index` of `nodes` (output `output`) is a gathered feature: an indicator basis's
+/// one-hot rows, not the output, read at least once and only as affine terms (module note,
+/// "Execution with forward-error bands").
+fn gathered(nodes: &[Node], output: usize, bases: &[Basis], index: usize) -> bool {
+    let Some(Node::Feature { basis, .. }) = nodes.get(index) else { return false };
+    if index == output || !matches!(bases.get(*basis), Some(Basis::Indicator { .. })) {
+        return false;
+    }
+    let mut read = false;
+    for node in &nodes[index + 1..] {
+        if node.arguments().contains(&index) {
+            if !matches!(node, Node::Affine { .. }) {
+                return false;
+            }
+            read = true;
+        }
+    }
+    read
+}
+
+/// Add to each row of `out` column `tokens[row]` of `op` (an affine term on a gathered feature),
+/// and to `radius` its rounding: `growth` times the column's magnitude, plus for a low-rank
+/// operator the column's own product error `γ_r |left||right_t|`.
+fn add_gathered(op: &Operator, tokens: &[u32], out: Option<&mut Array2<f64>>, radius: Option<&mut Array2<f64>>, growth: f64) {
+    let (mut out, mut radius) = (out, radius);
+    let diagonal = match &op.body {
+        OperatorBody::Identity | OperatorBody::Diagonal { .. } => op.diagonal(),
+        _ => None,
+    };
+    for (row, &token) in tokens.iter().enumerate() {
+        let t = token as usize;
+        match &op.body {
+            OperatorBody::Dense { values, .. } => {
+                if let Some(out) = out.as_deref_mut() {
+                    out.row_mut(row).scaled_add(1.0, &values.column(t));
+                }
+                if let Some(radius) = radius.as_deref_mut() {
+                    radius.row_mut(row).zip_mut_with(&values.column(t), |acc, v| *acc += growth * v.abs());
+                }
+            }
+            OperatorBody::Identity | OperatorBody::Diagonal { .. } => {
+                let v = diagonal.as_ref().map_or(1.0, |d| d[t]);
+                if let Some(out) = out.as_deref_mut() {
+                    out[[row, t]] += v;
+                }
+                if let Some(radius) = radius.as_deref_mut() {
+                    radius[[row, t]] += growth * v.abs();
+                }
+            }
+            OperatorBody::LowRank { left, right, .. } => {
+                let column = left.dot(&right.column(t));
+                if let Some(out) = out.as_deref_mut() {
+                    out.row_mut(row).scaled_add(1.0, &column);
+                }
+                if let Some(radius) = radius.as_deref_mut() {
+                    let product = left.mapv(f64::abs).dot(&right.column(t).mapv(f64::abs)) * accumulation_growth(left.ncols());
+                    radius.row_mut(row).zip_mut_with(&column, |acc, v| *acc += growth * v.abs());
+                    radius.row_mut(row).zip_mut_with(&product, |acc, p| *acc += p);
+                }
+            }
+        }
+    }
 }
 
 /// With `patch`, a node found there takes that value instead.
@@ -1343,6 +1488,11 @@ impl<'a> Layered<'a> {
             return value;
         }
         if node < self.from { &self.base[node] } else { &self.top[node - self.from] }
+    }
+
+    /// Whether `node` takes a patched value.
+    fn patched(&self, node: usize) -> bool {
+        self.patch.is_some_and(|patch| patch.contains_key(&node))
     }
 }
 
@@ -1476,7 +1626,7 @@ impl OperatorProgram {
         let mut top_balls: Vec<Array1<f64>> = Vec::new();
         for index in from..self.nodes.len() {
             let values = Layered { base: &trace.values, top: &top, from, patch: None };
-            let frame = Frame { args: &[], parameters };
+            let frame = Frame { args: &[], parameters, nodes: &self.nodes, output: self.output };
             match (&trace.bands, &trace.balls) {
                 (Some(bands), Some(balls)) => {
                     let bands = Layered { base: bands, top: &top_bands, from, patch: None };
@@ -1515,7 +1665,7 @@ impl OperatorProgram {
         let mut top: Vec<Array2<f64>> = Vec::new();
         for index in from..self.nodes.len() {
             let values = Layered { base: &base.values, top: &top, from, patch: None };
-            let frame = Frame { args: &[], parameters: &ones };
+            let frame = Frame { args: &[], parameters: &ones, nodes: &self.nodes, output: self.output };
             let (value, _) = self.evaluate_node(index, &self.nodes[index], inputs, &values, None, &interfaces, &frame)?;
             top.push(value);
         }
@@ -1539,9 +1689,9 @@ impl OperatorProgram {
             return Err(ProgramError::Input("an incremental execution needs the same nodes and operators".to_string()));
         }
         let interfaces = self.interfaces()?;
-        // Each changed operator's difference `A_new − A_old` (one vectorized subtraction), and the
-        // rows it changes.
-        let mut changed_ops: BTreeMap<usize, (Array2<f64>, Vec<usize>, Vec<usize>)> = BTreeMap::new();
+        // Each changed operator's difference `A_new − A_old` (one vectorized subtraction; a
+        // diagonal's stays a diagonal), and the rows and columns it changes.
+        let mut changed_ops: BTreeMap<usize, (Difference, Vec<usize>, Vec<usize>)> = BTreeMap::new();
         for (index, (new, old)) in self.operators.iter().zip(&base_program.operators).enumerate() {
             // A shared operator is unchanged without a look at its reals.
             if Arc::ptr_eq(new, old) || new.body == old.body {
@@ -1550,12 +1700,18 @@ impl OperatorProgram {
             if new.rows != old.rows || new.cols != old.cols {
                 return Err(ProgramError::Input(format!("operator {} changed its interfaces", new.name)));
             }
+            if let (OperatorBody::Diagonal { values: a, .. }, OperatorBody::Diagonal { values: b, .. }) = (&new.body, &old.body) {
+                let difference = a - b;
+                let changed: Vec<usize> = difference.iter().enumerate().filter(|(_, v)| **v != 0.0).map(|(i, _)| i).collect();
+                changed_ops.insert(index, (Difference::Diagonal(difference), changed.clone(), changed));
+                continue;
+            }
             let difference = &*new.matrix_cow() - &*old.matrix_cow();
             let rows: Vec<usize> =
                 difference.outer_iter().enumerate().filter(|(_, row)| row.iter().any(|v| *v != 0.0)).map(|(r, _)| r).collect();
             let cols: Vec<usize> =
                 difference.columns().into_iter().enumerate().filter(|(_, col)| col.iter().any(|v| *v != 0.0)).map(|(c, _)| c).collect();
-            changed_ops.insert(index, (difference, rows, cols));
+            changed_ops.insert(index, (Difference::Matrix(difference), rows, cols));
         }
         let mut changes: BTreeMap<usize, Change> = BTreeMap::new();
         for (index, node) in self.nodes.iter().enumerate() {
@@ -1574,20 +1730,45 @@ impl OperatorProgram {
                         let x = &base.values[*argument];
                         if let Some((difference, rows, cols)) = changed_ops.get(operator) {
                             // Only the changed rows and columns of the difference take part.
-                            let product = if cols.len() == difference.ncols() {
-                                fast_abt(x, &difference.select(Axis(0), rows))
-                            } else {
-                                fast_abt(&x.select(Axis(1), cols), &difference.select(Axis(1), cols).select(Axis(0), rows))
-                            };
-                            for (k, &t) in rows.iter().enumerate() {
-                                let mut target = delta.column_mut(t);
-                                target += &product.column(k);
-                                touched[t] = true;
+                            match (self.gathered_tokens(*argument, inputs), difference) {
+                                (Some(tokens), _) => {
+                                    for (row, &token) in tokens.iter().enumerate() {
+                                        for &t in rows {
+                                            delta[[row, t]] += difference.at(t, token as usize);
+                                        }
+                                    }
+                                }
+                                (None, Difference::Diagonal(d)) => {
+                                    for &t in rows {
+                                        delta.column_mut(t).scaled_add(d[t], &x.column(t));
+                                    }
+                                }
+                                (None, Difference::Matrix(difference)) => {
+                                    let product = if cols.len() == difference.ncols() {
+                                        fast_abt(x, &difference.select(Axis(0), rows))
+                                    } else {
+                                        fast_abt(&x.select(Axis(1), cols), &difference.select(Axis(1), cols).select(Axis(0), rows))
+                                    };
+                                    for (k, &t) in rows.iter().enumerate() {
+                                        let mut target = delta.column_mut(t);
+                                        target += &product.column(k);
+                                    }
+                                }
                             }
+                            rows.iter().for_each(|&t| touched[t] = true);
                         }
                         if let Some(change) = changes.get(argument) {
                             let (cols, dx) = change.delta(x);
-                            let a = self.operators[*operator].matrix_cow();
+                            let op = &self.operators[*operator];
+                            if let Some(d) = op.diagonal() {
+                                // A column scale moves only the changed columns.
+                                for (k, &c) in cols.iter().enumerate() {
+                                    delta.column_mut(c).scaled_add(d[c], &dx.column(k));
+                                    touched[c] = true;
+                                }
+                                continue;
+                            }
+                            let a = op.matrix_cow();
                             // Every column changed (the usual case past the first changed node): no copy.
                             if cols.len() == a.ncols() {
                                 delta += &fast_abt(&dx, a.as_ref());
@@ -1601,7 +1782,8 @@ impl OperatorProgram {
                         && let Some((difference, rows, _)) = changed_ops.get(op)
                     {
                         for &t in rows {
-                            delta.column_mut(t).mapv_inplace(|v| v + difference[[t, 0]]);
+                            let change = difference.at(t, 0);
+                            delta.column_mut(t).mapv_inplace(|v| v + change);
                             touched[t] = true;
                         }
                     }
@@ -1656,7 +1838,7 @@ impl OperatorProgram {
         let node = self.nodes.get(index).ok_or(ProgramError::Reference { what: "node", index })?;
         let values = Layered { base: &base.values, top: &[], from: base.values.len(), patch: Some(patch) };
         let ones = vec![1.0; self.declarations.parameters];
-        let frame = Frame { args: &[], parameters: &ones };
+        let frame = Frame { args: &[], parameters: &ones, nodes: &self.nodes, output: self.output };
         Ok(self.evaluate_node(index, node, inputs, &values, None, interfaces, &frame)?.0)
     }
 
@@ -1676,7 +1858,7 @@ impl OperatorProgram {
             .collect();
         let values = Layered { base: &base.values, top: &[], from: base.values.len(), patch: Some(&patch) };
         let ones = vec![1.0; self.declarations.parameters];
-        let frame = Frame { args: &[], parameters: &ones };
+        let frame = Frame { args: &[], parameters: &ones, nodes: &self.nodes, output: self.output };
         Ok(self.evaluate_node(index, &self.nodes[index], inputs, &values, None, interfaces, &frame)?.0)
     }
 
@@ -1816,7 +1998,7 @@ impl OperatorProgram {
     ) -> Result<(Array2<f64>, Option<Array2<f64>>), ProgramError> {
         let body = self.rules.get(rule).ok_or(ProgramError::Reference { what: "rule", index: rule })?;
         let interfaces = rule_interfaces(&self.rules, rule, &self.operators, &self.bases, &self.declarations)?;
-        let frame = Frame { args, parameters };
+        let frame = Frame { args, parameters, nodes: &body.nodes, output: body.output };
         let mut top: Vec<Array2<f64>> = Vec::with_capacity(body.nodes.len());
         let mut top_bands: Vec<Array2<f64>> = Vec::new();
         for (index, node) in body.nodes.iter().enumerate() {
@@ -1870,6 +2052,36 @@ impl OperatorProgram {
         Ok(read)
     }
 
+    /// The token ids a gathered feature `node` of this program reads on `inputs` (module note,
+    /// "Execution with forward-error bands"); `None` for any other node. A gathered feature's
+    /// trace value holds no columns: its readers read these ids.
+    pub fn gathered_tokens<'a>(&self, node: usize, inputs: &'a FamilyInputs) -> Option<&'a [u32]> {
+        self.frame_tokens(&self.nodes, self.output, node, inputs)
+    }
+
+    /// Node `node`'s value in `trace` (a trace of this program on `inputs`) as a matrix: a
+    /// gathered feature's one-hot rows formed (rows × its domain), any other node's value
+    /// borrowed. For a caller that reads a node as a matrix rather than as an affine term.
+    pub fn node_value<'a>(&self, trace: &'a Trace, inputs: &FamilyInputs, node: usize) -> Result<std::borrow::Cow<'a, Array2<f64>>, ProgramError> {
+        match (self.gathered_tokens(node, inputs), &self.nodes[node]) {
+            (Some(tokens), Node::Feature { basis, .. }) => {
+                Ok(std::borrow::Cow::Owned(self.bases[*basis].evaluate(&self.declarations, tokens)?.values))
+            }
+            _ => Ok(std::borrow::Cow::Borrowed(&trace.values[node])),
+        }
+    }
+
+    fn frame_tokens<'a>(&self, nodes: &[Node], output: usize, node: usize, inputs: &'a FamilyInputs) -> Option<&'a [u32]> {
+        if !gathered(nodes, output, &self.bases, node) {
+            return None;
+        }
+        let Node::Feature { slot, .. } = &nodes[node] else { return None };
+        match inputs.slots.get(*slot) {
+            Some(SlotValues::Tokens(tokens)) => Some(tokens),
+            _ => None,
+        }
+    }
+
     /// Every operator `node` reads, through the bodies of the rules it calls.
     pub fn node_operators(&self, node: &Node) -> Vec<usize> {
         let mut out = node.operators();
@@ -1913,7 +2125,7 @@ impl OperatorProgram {
         self.check_inputs(inputs)?;
         let interfaces = self.interfaces()?;
         let ones = vec![1.0; self.declarations.parameters];
-        let frame = Frame { args: &[], parameters: &ones };
+        let frame = Frame { args: &[], parameters: &ones, nodes: &self.nodes, output: self.output };
         let count = trace.values.len();
         let zero_balls: Vec<Array1<f64>> = (0..count).map(|_| Array1::zeros(inputs.rows)).collect();
         let values = Layered { base: &trace.values, top: &[], from: count, patch: None };
@@ -1950,10 +2162,14 @@ impl OperatorProgram {
         match node {
             Node::Affine { terms, bias } => {
                 let (out, _) = self.evaluate_node(index, node, inputs, values, None, interfaces, frame)?;
+                let tokens: Vec<Option<&[u32]>> =
+                    terms.iter().map(|(argument, _)| self.frame_tokens(frame.nodes, frame.output, *argument, inputs).filter(|_| !values.patched(*argument))).collect();
                 let gathers: Vec<Option<Vec<usize>>> = terms
                     .iter()
-                    .map(|(argument, operator)| match self.operators[*operator].body {
-                        OperatorBody::Dense { .. } => one_hot_columns(value(*argument)),
+                    .zip(&tokens)
+                    .map(|((argument, operator), tokens)| match (tokens, &self.operators[*operator].body) {
+                        (Some(tokens), _) => Some(tokens.iter().map(|t| *t as usize).collect()),
+                        (None, OperatorBody::Dense { .. }) => one_hot_columns(value(*argument)),
                         _ => None,
                     })
                     .collect();
@@ -1967,14 +2183,29 @@ impl OperatorProgram {
                 let growth = accumulation_growth(summands);
                 let mut radius = Array2::<f64>::zeros(out.dim());
                 let mut rho = Array1::<f64>::zeros(rows);
-                for ((argument, operator), gather) in terms.iter().zip(&gathers) {
+                for (((argument, operator), gather), tokens) in terms.iter().zip(&gathers).zip(&tokens) {
                     let op = &self.operators[*operator];
+                    if let Some(tokens) = tokens {
+                        // A gathered feature is exact: only the gather's own rounding.
+                        add_gathered(op, tokens, None, Some(&mut radius), growth);
+                        continue;
+                    }
                     let x = value(*argument);
                     match &op.body {
                         OperatorBody::Identity => {
                             radius += band(*argument);
                             radius.zip_mut_with(x, |acc, xv| *acc += growth * xv.abs());
                             rho += ball(*argument);
+                            continue;
+                        }
+                        OperatorBody::Diagonal { values: d, .. } => {
+                            // A column scale carries the box entrywise and the ball by `max |d|`.
+                            let magnitude = d.mapv(f64::abs);
+                            let mut lifted = x.mapv(|xv| growth * xv.abs());
+                            lifted += band(*argument);
+                            radius += &(&lifted * &magnitude);
+                            let largest = magnitude.iter().fold(0.0_f64, |acc, v| acc.max(*v));
+                            rho.zip_mut_with(ball(*argument), |acc, b| *acc += (largest * b).next_up());
                             continue;
                         }
                         OperatorBody::Dense { values: a, .. } => match gather {
@@ -2160,6 +2391,15 @@ impl OperatorProgram {
                 if tokens.len() != rows {
                     return Err(ProgramError::Input(format!("slot {slot} has {} rows, not {rows}", tokens.len())));
                 }
+                if gathered(frame.nodes, frame.output, &self.bases, index) {
+                    // A gathered feature: its readers read the token ids; the one-hot rows are
+                    // never formed.
+                    let width = self.bases[*basis].interface(&self.declarations)?.width();
+                    if let Some(token) = tokens.iter().find(|t| **t as usize >= width) {
+                        return Err(ProgramError::Input(format!("token {token} outside a domain of {width}")));
+                    }
+                    return Ok((Array2::zeros((rows, 0)), banded.then(|| Array2::zeros((rows, 0)))));
+                }
                 let features = self.bases[*basis].evaluate(&self.declarations, tokens)?;
                 Ok((features.values, banded.then_some(features.bands)))
             }
@@ -2190,6 +2430,11 @@ impl OperatorProgram {
                 let mut radius = banded.then(|| Array2::<f64>::zeros((rows, width)));
                 for (argument, operator) in terms {
                     let op = &self.operators[*operator];
+                    // A gathered feature reads its tokens, unless the caller patched its value.
+                    if let Some(tokens) = self.frame_tokens(frame.nodes, frame.output, *argument, inputs).filter(|_| !values.patched(*argument)) {
+                        add_gathered(op, tokens, Some(&mut out), radius.as_mut(), growth);
+                        continue;
+                    }
                     let x = value(*argument);
                     match &op.body {
                         OperatorBody::Identity => {
@@ -2197,6 +2442,16 @@ impl OperatorProgram {
                             if let (Some(radius), Some(r)) = (radius.as_mut(), band(*argument)) {
                                 radius.zip_mut_with(x, |acc, xv| *acc += growth * xv.abs());
                                 *radius += r;
+                            }
+                        }
+                        OperatorBody::Diagonal { values: d, .. } => {
+                            // A column scale; one rounded product per entry is within the
+                            // summation bound below.
+                            out += &(x * d);
+                            if let (Some(radius), Some(r)) = (radius.as_mut(), band(*argument)) {
+                                let mut lifted = x.mapv(|xv| growth * xv.abs());
+                                lifted += r;
+                                *radius += &(&lifted * &d.mapv(f64::abs));
                             }
                         }
                         OperatorBody::Dense { values: a, .. } if one_hot_columns(x).is_some() => {
@@ -3014,6 +3269,10 @@ fn operator_bits(operator: &Operator) -> Result<(u64, u64), ProgramError> {
     };
     match &operator.body {
         OperatorBody::Identity => Ok((kind + interface_bits(&operator.rows)?, 0)),
+        OperatorBody::Diagonal { precision, .. } => {
+            let (count, reals) = split(&operator.present_reals(), *precision)?;
+            Ok((kind + interface_bits(&operator.rows)? + count, reals))
+        }
         OperatorBody::LowRank { left, precision, .. } => {
             let (count, reals) = split(&operator.present_reals(), *precision)?;
             Ok((
@@ -3522,6 +3781,11 @@ impl OperatorProgram {
                     encode_fixed_index(&mut out, 0, OPERATOR_KINDS)?;
                     write_interface(&mut out, &operator.rows)?;
                 }
+                OperatorBody::Diagonal { precision, .. } => {
+                    encode_fixed_index(&mut out, 4, OPERATOR_KINDS)?;
+                    write_interface(&mut out, &operator.rows)?;
+                    write_lattice(&mut out, &operator.present_reals(), *precision, &[])?;
+                }
                 OperatorBody::LowRank { left, precision, .. } => {
                     encode_fixed_index(&mut out, 2, OPERATOR_KINDS)?;
                     write_interface(&mut out, &operator.rows)?;
@@ -3600,6 +3864,20 @@ impl OperatorProgram {
             let rows = read_interface(reader)?;
             if kind == 0 {
                 operators.push(Arc::new(Operator::identity(name, rows)));
+                continue;
+            }
+            if kind == 4 {
+                let (precision, reals) = read_lattice(reader, &[])?;
+                if reals.len() != rows.width() {
+                    return Err(ProgramError::Code(format!("operator {index}: a diagonal of {} on an interface of {}", reals.len(), rows.width())));
+                }
+                operators.push(Arc::new(Operator {
+                    name,
+                    cols: rows.clone(),
+                    rows,
+                    body: OperatorBody::Diagonal { values: Array1::from(reals), precision },
+                    provenance: Provenance::default(),
+                }));
                 continue;
             }
             let cols = read_interface(reader)?;

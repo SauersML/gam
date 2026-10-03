@@ -4,7 +4,7 @@
 use super::*;
 use crate::attention::{AffineProjection, RotaryPairing};
 use crate::gated_rewrite::rms_normalizers;
-use crate::state::resolved_row_space;
+use gam_linalg::roundoff::resolved_singular_count;
 use crate::test_support::planted_toys::{ROUTING_HEADS, RoutingToy};
 use crate::test_support::test_governor;
 use rand::rngs::StdRng;
@@ -275,7 +275,8 @@ fn toy5_operator_equality_separates_laws_that_share_every_subspace() {
             assert_eq!(dense, RoutingToy::transport(&toy.value, &toy.output, &[head]), "the owner's C_h is O_h V_h");
         }
         let transport = RoutingToy::transport(&toy.value, &toy.output, heads);
-        resolved_row_space(test_governor(), &transport, 0.0, "law transport").expect("rank").rank
+        let singular_values = crate::dense::svd(transport.view(), false).expect("svd").singular_values;
+        resolved_singular_count(&singular_values, transport.nrows(), transport.ncols(), 0.0)
     };
     assert_eq!(rank(&[0]), 2);
     assert_eq!(rank(&[1]), 2);

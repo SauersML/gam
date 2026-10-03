@@ -97,13 +97,13 @@ fn two_frequencies_are_one_rule_up_to_change_of_basis() {
     assert!(rule.spread < 1e-12, "{}", rule.spread);
     let account = program.code_account().expect("the program has a code");
     // Every block is in the rule; each operator's lattice header (count, precision) is not.
-    assert_eq!(printout.bits.tables, 0);
-    assert!(rule.bits > 0 && rule.bits < printout.bits.constants);
+    assert_eq!(printout.bits.table_storage, 0);
+    assert!(rule.bits > 0 && rule.bits < printout.bits.other_operator_reals);
     assert_eq!(rule.reals, program.real_count());
     assert_eq!(rule.template.last().expect("a template has a root line"), "plane ← Σ_unit W·relu(W·plane(x0) + W·plane(x1) + b)");
     let labels: Vec<&str> = rule.instances.iter().map(|i| i.labels.as_str()).collect();
     assert_eq!(labels, ["Plane{1} Unit{0,1}", "Plane{2} Unit{2,3}"]);
-    assert_eq!(printout.unresolved.native_bits, account.operator_bits.iter().map(|(s, r)| s + r).sum::<u64>());
+    assert_eq!(printout.unchanged_native_bits, account.operator_bits.iter().map(|(s, r)| s + r).sum::<u64>());
     assert!(printout.bases[0].contains("declared 5-cycle, a(t) = t"), "{}", printout.bases[0]);
 }
 
@@ -117,7 +117,7 @@ fn a_moved_real_splits_the_rule() {
 }
 
 #[test]
-fn the_behaviour_map_accounts_every_data_bit() {
+fn the_behaviour_map_accounts_every_kl_bit() {
     let program = planted(false);
     let a: Vec<u32> = (0..25).map(|r| r / 5).collect();
     let b: Vec<u32> = (0..25).map(|r| r % 5).collect();
@@ -126,9 +126,9 @@ fn the_behaviour_map_accounts_every_data_bit() {
     let mut agrees = vec![true; 25];
     agrees[24] = false;
     let printout = print(&program, Some(&Behaviour { inputs: &inputs, row_bits: &row_bits, argmax_agrees: &agrees })).expect("the program prints");
-    let map = printout.unresolved.behaviour.as_ref().expect("a behaviour was given");
-    assert_eq!(map.data_bits, 50.0);
-    assert_eq!(printout.bits.data, Some(50.0));
+    let map = printout.behaviour.as_ref().expect("a behaviour was given");
+    assert_eq!(map.kl_bits, 50.0);
+    assert_eq!(printout.bits.kl, Some(50.0));
     assert_eq!(map.by_slot[0].as_ref().expect("a token slot"), &vec![0.0, 5.0, 10.0, 15.0, 20.0]);
     assert_eq!(map.by_slot[1].as_ref().expect("a token slot").iter().sum::<f64>(), 50.0);
     // The five rows of a = 4 carry 20 bits and the five of a = 3 another 15: half needs 7 rows.

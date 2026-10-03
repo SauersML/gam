@@ -18,7 +18,7 @@ for rung in report["ladder"]:
         "kl": rung["mean_kl"],
         "observations": rung["observations"],
         "program_bits": rung["program_bits"],
-        "measured_rows": rung.get("measured_rows"),
+        "estimated_rows": rung.get("estimated_rows"),
         "rollout": rung.get("rollout"),
     })
 out = os.path.expanduser(f"~/mpd-data/frontier/pertoken_{sys.argv[2]}_engine.json")

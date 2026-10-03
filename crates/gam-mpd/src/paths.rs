@@ -54,20 +54,26 @@ use std::collections::{BTreeMap, BinaryHeap};
 use std::fmt;
 use std::ops::Range;
 
-use gam_linalg::roundoff::accumulation_growth;
-use gam_runtime::resource::{MemoryGovernor, MemoryReservation};
-use ndarray::{Array1, Array2, Axis, s};
+use faer::Side;
+use gam_linalg::faer_ndarray::{FaerArrayView, FaerLinalgError, fast_ata, self_adjoint_eigenvalues};
+use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth, symmetric_spectrum_rounding_band_at_dim};
+use gam_runtime::resource::{MemoryGovernor, MemoryReservation, MemoryReservationError};
+use ndarray::{Array1, Array2, ArrayBase, Axis, Data, Ix2, s};
 
 use crate::operator_program::{
     FamilyInputs, Interface, Law, Node, OperatorBody, OperatorProgram, ProgramError, Trace, rms_scale,
 };
-use crate::state::{StateError, reserve, spectral_norm_bounds};
 
 /// Why a path decomposition refused.
 #[derive(Debug)]
 pub enum PathError {
     Program(ProgramError),
-    Linear(StateError),
+    /// A dense matrix the decomposition forms does not fit the memory budget.
+    Memory { context: &'static str, source: MemoryReservationError },
+    /// A self-adjoint eigendecomposition failed.
+    Eigen { context: &'static str, source: FaerLinalgError },
+    /// A matrix whose norm is bounded is not finite.
+    NonFiniteMatrix { context: &'static str },
     /// The target is not a node, or the trace does not cover it.
     Target { node: usize, nodes: usize },
     NonFinite { node: usize },
@@ -77,7 +83,9 @@ impl fmt::Display for PathError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Program(error) => write!(formatter, "paths: {error}"),
-            Self::Linear(error) => write!(formatter, "paths: {error}"),
+            Self::Memory { context, source } => write!(formatter, "{context}: {source}"),
+            Self::Eigen { context, source } => write!(formatter, "{context}: self-adjoint eigendecomposition failed: {source}"),
+            Self::NonFiniteMatrix { context } => write!(formatter, "{context}: non-finite value"),
             Self::Target { node, nodes } => write!(formatter, "paths: target {node} of a {nodes}-node trace"),
             Self::NonFinite { node } => write!(formatter, "paths: node {node} is not finite"),
         }
@@ -89,12 +97,6 @@ impl std::error::Error for PathError {}
 impl From<ProgramError> for PathError {
     fn from(error: ProgramError) -> Self {
         Self::Program(error)
-    }
-}
-
-impl From<StateError> for PathError {
-    fn from(error: StateError) -> Self {
-        Self::Linear(error)
     }
 }
 
@@ -651,7 +653,7 @@ pub fn decompose(
         }
     }
     let (linear, conditions) = Linearized::new(program, inputs, trace, target, options)?;
-    let value = trace.values[target].clone();
+    let value = program.node_value(trace, inputs, target)?.into_owned();
 
     // Γ(n): a certified bound on the summed norms of the suffix maps from n to the target.
     let mut gamma = vec![0.0; target + 1];
@@ -692,7 +694,7 @@ pub fn decompose(
         match &linear.splits[node] {
             Split::Source(kind) => {
                 sources.push((node, *kind));
-                push(&mut queue, vec![node], trace.values[node].clone())?;
+                push(&mut queue, vec![node], program.node_value(trace, inputs, node)?.into_owned())?;
             }
             Split::Linear { emitted: Some(emitted), .. } => {
                 sources.push((node, SourceKind::Emitted));
@@ -764,7 +766,7 @@ fn rounding_band(
             continue;
         }
         let (field, inner) = match &linear.splits[node] {
-            Split::Source(_) => (linear.trace.values[node].mapv(f64::abs), 0),
+            Split::Source(_) => (linear.program.node_value(linear.trace, linear.inputs, node)?.mapv(f64::abs), 0),
             Split::Linear { edges, emitted } => {
                 let mut total: Option<Array2<f64>> = emitted.as_ref().map(|e| e.mapv(f64::abs));
                 let mut inner = 1;
@@ -791,6 +793,153 @@ fn rounding_band(
     let summed: f64 = paths.iter().map(TracePath::mass).chain(remainders.iter().map(|r| frobenius(&r.net))).sum::<f64>()
         + frobenius(value);
     Ok(chains + accumulation_growth(items) * summed)
+}
+
+/// Bounds on the spectral norm of an exact matrix, read off its computed value.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpectralNormBounds {
+    /// `max(0, σ̂₁ − band)`. A positive value certifies a nonzero exact matrix.
+    pub lower: f64,
+    /// `σ̂₁ + band`. The exact norm is at most this.
+    pub upper: f64,
+}
+
+/// Bounds on `‖R‖₂` for an exact matrix `R` whose computed value `R̂` (`m × n`)
+/// is within `formation` of it in spectral norm, read off the largest
+/// eigenvalue of the Gram of `R̂`'s smaller side. No singular value
+/// decomposition is formed.
+///
+/// With `k = min(m, n)`, `t = max(m, n)`, `u` the unit roundoff,
+/// `γ_j = j·u/(1 − j·u)` and `η = 2⁻¹⁰⁷⁴`:
+///
+/// 1. **Scale.** `B = 2^{−e}·R̂`, with `e` taking `max|r̂ᵢⱼ|` to about `[½, 1)`,
+///    so the Gram below neither underflows nor overflows. A power of two is
+///    exact except where an entry lands subnormal, which moves it by at most
+///    `η`, so by Weyl `|σ_max(B) − 2^{−e}‖R̂‖₂| ≤ β = √(mn)·η`.
+/// 2. **Gram.** `Ĝ = fl(BᵀB)` (or `fl(BBᵀ)`), `k × k`, with one triangle
+///    mirrored, so `Ĝ` is exactly symmetric. Each entry is an inner product of
+///    length `t`, so `|Ĝ − G| ≤ γ_t·|B|ᵀ|B|` entrywise, in any summation order and
+///    with or without fused multiply-adds (Higham, *ASNA* 2nd ed., §3.5). The
+///    majorant is entrywise non-negative and positive semidefinite, so
+///    `‖Ĝ − G‖₂ ≤ γ_t·‖|B|ᵀ|B|‖₂ ≤ γ_t·tr(|B|ᵀ|B|) = γ_t·‖B‖²_F`. A diagonal entry
+///    sums squares, so `Ĝᵢᵢ ≥ (1 − γ_t)·Gᵢᵢ`, and the trace sums `k`
+///    non-negative terms, so `‖B‖²_F ≤ fl(tr Ĝ)/((1 − γ_t)(1 − γ_k))` and
+///    `δ = γ_t·fl(tr Ĝ)/((1 − γ_t)(1 − γ_k))` bounds `‖Ĝ − G‖₂`.
+/// 3. **Spectrum.** The self-adjoint eigensolver is backward stable: its
+///    computed `λ̂` are the exact eigenvalues of `Ĝ + E` with
+///    `‖E‖₂ ≤ ρ = k·(ε·max|λ̂| + η)`
+///    ([`symmetric_spectrum_rounding_band_at_dim`]; the same convention as the
+///    [`factor_singular_band`] a full SVD reads). By Weyl,
+///    `σ_max(B)² = λ_max(G) ∈ [λ̂_max − ρ − δ, λ̂_max + ρ + δ]`.
+/// 4. **Root.** `√·` is monotone. The endpoints are widened for the handful of
+///    rounded operations that form them, each root is taken one ulp outward,
+///    `β` is added on each side, and the result is multiplied back by `2^e`
+///    (exact, one more ulp outward for a subnormal landing).
+/// 5. **Exact matrix.** `|‖R‖₂ − ‖R̂‖₂| ≤ formation`, so
+///    `lower = max(0, σ_lo − formation)` and `upper = σ_hi + formation` bracket
+///    `‖R‖₂`.
+///
+/// Since `‖B‖²_F ≤ k·σ_max(B)²`, `δ ≤ γ_t·k·λ_max`, so the bracket on `‖R̂‖₂` is
+/// within about `(t + 1)·k·u/2` of it relatively (`2.3e-10` at `t = k = 2048`),
+/// where a full SVD's band is `t·ε`. The Gram is one `k × k × t` product at pool parallelism and the spectrum an
+/// eigenvalue-only decomposition at the fixed EVD degree, so the result is
+/// identical at every pool width.
+pub fn spectral_norm_bounds<S: Data<Elem = f64>>(
+    governor: &MemoryGovernor,
+    matrix: &ArrayBase<S, Ix2>,
+    formation: f64,
+    context: &'static str,
+) -> Result<SpectralNormBounds, PathError> {
+    if matrix.is_empty() {
+        return Ok(SpectralNormBounds {
+            lower: 0.0,
+            upper: formation,
+        });
+    }
+    let (rows, cols) = matrix.dim();
+    if matrix.iter().any(|value| !value.is_finite()) {
+        return Err(PathError::NonFiniteMatrix { context });
+    }
+    let largest = matrix.iter().fold(0.0_f64, |largest, value| largest.max(value.abs()));
+    if largest == 0.0 {
+        return Ok(SpectralNormBounds {
+            lower: 0.0,
+            upper: formation,
+        });
+    }
+    let short = rows.min(cols);
+    let long = rows.max(cols);
+    // The scaled copy, then the Gram and the eigensolver's working copy of it.
+    let working = reserve(governor, rows, cols, 1, context)?;
+    let gram_reservation = reserve(governor, short, short, 2, context)?;
+    // `2^e` overflows for `e > 1023` and `2^{−e}` for a subnormal `e`, so each
+    // power is applied as two representable halves.
+    let exponent = largest.log2().floor() as i32 + 1;
+    let (shrink, shrink_tail) = (
+        2.0_f64.powi(-(exponent / 2)),
+        2.0_f64.powi(-(exponent - exponent / 2)),
+    );
+    let scaled = matrix.mapv(|value| value * shrink * shrink_tail);
+    let gram = if cols <= rows {
+        fast_ata(&scaled)
+    } else {
+        fast_ata(&scaled.t())
+    };
+    drop(scaled);
+    drop(working);
+    let gram_view = FaerArrayView::new(&gram);
+    let spectrum = self_adjoint_eigenvalues(gram_view.as_ref(), Side::Lower).map_err(|source| {
+        PathError::Eigen {
+            context,
+            source: FaerLinalgError::SelfAdjointEigen(source),
+        }
+    })?;
+    drop(gram_view);
+    let spectrum = spectrum.as_ref().column_vector();
+    let eigenvalues: Vec<f64> = (0..short).map(|index| spectrum[index]).collect();
+    let trace: f64 = (0..short).map(|index| gram[[index, index]]).sum();
+    drop(gram);
+    drop(gram_reservation);
+    if eigenvalues.iter().any(|value| !value.is_finite()) {
+        return Err(PathError::NonFiniteMatrix { context });
+    }
+    let largest_eigenvalue = eigenvalues
+        .iter()
+        .fold(f64::NEG_INFINITY, |largest, &value| largest.max(value));
+    let gram_formation = accumulation_growth(long) * trace
+        / ((1.0 - accumulation_growth(long)) * (1.0 - accumulation_growth(short)));
+    let spectrum_band = symmetric_spectrum_rounding_band_at_dim(short, &eigenvalues);
+    // The slack and each endpoint take a handful of rounded operations.
+    let slack = (spectrum_band + gram_formation) * (1.0 + accumulation_growth(8));
+    let widen = 4.0 * UNIT_ROUNDOFF;
+    let squared_upper = (largest_eigenvalue + slack) * (1.0 + widen);
+    let squared_lower = ((largest_eigenvalue - slack) * (1.0 - widen)).max(0.0);
+    let subnormal_shift = ((rows as f64).sqrt() * (cols as f64).sqrt() * f64::from_bits(1)).next_up();
+    let scaled_upper = (squared_upper.sqrt().next_up() + subnormal_shift).next_up();
+    let scaled_lower = (squared_lower.sqrt().next_down() - subnormal_shift).next_down().max(0.0);
+    let (grow, grow_tail) = (
+        2.0_f64.powi(exponent / 2),
+        2.0_f64.powi(exponent - exponent / 2),
+    );
+    let sigma_upper = (scaled_upper * grow * grow_tail).next_up();
+    let sigma_lower = (scaled_lower * grow * grow_tail).next_down().max(0.0);
+    Ok(SpectralNormBounds {
+        lower: (sigma_lower - formation).max(0.0),
+        upper: sigma_upper + formation,
+    })
+}
+
+/// Reserves `copies` dense `rows × cols` matrices on `governor` before they are formed.
+fn reserve(
+    governor: &MemoryGovernor,
+    rows: usize,
+    cols: usize,
+    copies: usize,
+    context: &'static str,
+) -> Result<MemoryReservation, PathError> {
+    governor
+        .try_reserve_dense_f64_copies(rows, cols, copies, context)
+        .map_err(|source| PathError::Memory { context, source })
 }
 
 #[cfg(test)]

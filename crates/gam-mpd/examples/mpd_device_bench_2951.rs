@@ -59,10 +59,10 @@ fn exact_library(w: &Array2<f64>) -> Library {
 
 fn masks_for(masked: &Masked, rows: usize, salt: usize) -> Vec<Array2<f64>> {
     masked
-        .libraries
-        .iter()
+        .all_blocks()
+        .into_iter()
         .enumerate()
-        .map(|(k, library)| Array2::from_shape_fn((rows, library.v.nrows()), |(r, c)| if noise(salt + 7919 * k + 104_729 * r + c) < -0.5 { 1.0 } else { 0.0 }))
+        .map(|(k, blocks)| Array2::from_shape_fn((rows, blocks), |(r, c)| if noise(salt + 7919 * k + 104_729 * r + c) < -0.5 { 1.0 } else { 0.0 }))
         .collect()
 }
 

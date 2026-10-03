@@ -231,37 +231,7 @@ fn pair_index(port_count: usize, i: usize, j: usize) -> usize {
     i * (2 * port_count - i - 1) / 2 + (j - i - 1)
 }
 
-fn union_root(parent: &mut [usize], mut port: usize) -> usize {
-    while parent[port] != port {
-        parent[port] = parent[parent[port]];
-        port = parent[port];
-    }
-    port
-}
-
-/// The connected components of the graph on `0..count` with the given edges. Each component is
-/// sorted, and components are ordered by their smallest vertex. The one component owner for every
-/// banded-edge graph in the crate: the caller decides which edges are resolved, this only joins
-/// them.
-pub fn connected_components(
-    count: usize,
-    edges: impl IntoIterator<Item = (usize, usize)>,
-) -> Vec<Vec<usize>> {
-    let mut parent: Vec<usize> = (0..count).collect();
-    for (i, j) in edges {
-        let root_i = union_root(&mut parent, i);
-        let root_j = union_root(&mut parent, j);
-        if root_i != root_j {
-            parent[root_i.max(root_j)] = root_i.min(root_j);
-        }
-    }
-    let mut blocks: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for vertex in 0..count {
-        let root = union_root(&mut parent, vertex);
-        blocks.entry(root).or_default().push(vertex);
-    }
-    blocks.into_values().collect()
-}
+pub use gam_math::graph::connected_components;
 
 /// The block label of every port, or why `partition` is not a partition of `0..port_count`.
 fn partition_labels(

@@ -73,6 +73,7 @@ fn hold(device: &Device, op: &Operator, role: Role) -> Result<Held, String> {
         Role::Table => Held::Table(device.upload(op.matrix_cow().t()).map_err(error)?),
         Role::Product => match &op.body {
             OperatorBody::Identity => Held::Identity,
+            OperatorBody::Diagonal { values, .. } => Held::Diagonal(device.upload_vec(1, values.len(), values.to_vec()).map_err(error)?),
             OperatorBody::LowRank { left, right, .. } => {
                 Held::LowRank(device.upload(left.view()).map_err(error)?, device.upload(right.view()).map_err(error)?)
             }
@@ -751,10 +752,16 @@ impl DeviceProgram {
                         }
                         if let Some(da) = tangents.get(operator) {
                             let o = ensure(d, &mut out, rows, width)?;
+                            let diagonal_row = self.operators.get(&(*operator, Role::Product)).is_some_and(|held| {
+                                matches!(held.source.body, OperatorBody::Diagonal { .. }) && da.dim() == (1, width)
+                            });
                             if let Step::Feature { slot } = &self.steps[*argument] {
                                 let ids = trace.ids.get(slot).ok_or("device: feature ids missing")?;
                                 let gathered = d.gather_rows(&upload(&da.t().to_owned())?, ids).map_err(error)?;
                                 d.axpy(o, 1.0, &gathered).map_err(error)?;
+                            } else if diagonal_row {
+                                // A diagonal's tangent given as its diagonal: a column scale.
+                                d.scale_columns(o, trace.value(*argument)?, &upload(da)?, true).map_err(error)?;
                             } else {
                                 d.gemm(o, 1.0, trace.value(*argument)?, Op::N, &upload(da)?, Op::T, 1.0, arithmetic).map_err(error)?;
                             }

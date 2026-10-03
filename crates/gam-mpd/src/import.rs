@@ -29,7 +29,7 @@ use crate::operator_program::{
 };
 use crate::safetensors::SafetensorsFile;
 use gam_runtime::resource::MemoryGovernor;
-use ndarray::{Array2, Axis, s};
+use ndarray::{Array1, Array2, Axis, s};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -129,6 +129,14 @@ impl Builder {
         let precision = exact_precision(values.iter().copied()).map_err(|e| e.to_string())?;
         let op = Operator::dense(name, rows.clone(), cols.clone(), values, precision, Provenance::native(name))
             .map_err(|e| e.to_string())?;
+        self.operators.push(Arc::new(op));
+        Ok(self.operators.len() - 1)
+    }
+
+    /// A norm gain: the diagonal operator on `interface` holding the stored row `name`.
+    fn gain(&mut self, name: &str, interface: &Interface, values: Array1<f64>) -> Result<usize, String> {
+        let precision = exact_precision(values.iter().copied()).map_err(|e| e.to_string())?;
+        let op = Operator::diag(name, interface.clone(), values, precision, Provenance::native(name)).map_err(|e| e.to_string())?;
         self.operators.push(Arc::new(op));
         Ok(self.operators.len() - 1)
     }
@@ -546,6 +554,10 @@ fn hugging_face_name(name: &str) -> Option<String> {
 pub fn hugging_face_language_model(dir: &Path, blocks: std::ops::Range<usize>) -> Result<(OperatorProgram, Value), String> {
     let text = std::fs::read_to_string(dir.join("config.json")).map_err(|e| format!("{}: {e}", dir.display()))?;
     let hf: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    refuse_unsupported(&hf).map_err(|e| format!("config.json: {e}"))?;
+    if dir.join("model.safetensors.index.json").exists() {
+        return Err(format!("{}: a sharded checkpoint (model.safetensors.index.json) is not read", dir.display()));
+    }
     let file = SafetensorsFile::open(&dir.join("model.safetensors")).map_err(|e| e.to_string())?;
     let integer = |key: &str| hf[key].as_u64().ok_or_else(|| format!("config.json: {key}"));
     let kind = hf["model_type"].as_str().ok_or("config.json: model_type")?;
@@ -575,6 +587,33 @@ pub fn hugging_face_language_model(dir: &Path, blocks: std::ops::Range<usize>) -
     Ok((program, record))
 }
 
+/// Refuse a configuration option the program does not compute: a rope scaling (any `rope_type`
+/// other than the default rotary), a partial rotary factor other than 1, a sliding attention window
+/// (`use_sliding_window`, a `sliding_window` without it, or a sliding layer in `layer_types`).
+/// The program is the full causal attention with the plain rotary, so such a model is refused
+/// rather than imported as a different function.
+fn refuse_unsupported(config: &Value) -> Result<(), String> {
+    let set = |key: &str| config.get(key).is_some_and(|v| !v.is_null());
+    if set("rope_scaling") {
+        let rope_type = config["rope_scaling"]["rope_type"].as_str().or(config["rope_scaling"]["type"].as_str());
+        if rope_type != Some("default") {
+            return Err(format!("rope_scaling {} is not supported", config["rope_scaling"]));
+        }
+    }
+    if config["partial_rotary_factor"].as_f64().is_some_and(|f| f != 1.0) {
+        return Err(format!("partial_rotary_factor {} is not supported", config["partial_rotary_factor"]));
+    }
+    let sliding = match config.get("use_sliding_window").and_then(Value::as_bool) {
+        Some(used) => used,
+        None => set("sliding_window"),
+    };
+    let sliding_layers = config["layer_types"].as_array().is_some_and(|types| types.iter().any(|t| t.as_str() != Some("full_attention")));
+    if sliding || sliding_layers {
+        return Err("a sliding attention window is not supported".to_string());
+    }
+    Ok(())
+}
+
 /// The program of [`import_language_model`] over `blocks` (module note): its input is the tokens
 /// at block 0, else the residual stream entering `blocks.start`, raw; its output is the readout
 /// after the last block, else the residual stream entering `blocks.end`.
@@ -587,6 +626,7 @@ fn language_model(tensors: &Tensors<'_>, record: &Value, blocks: std::ops::Range
         config(record, "d_model")?,
         config(record, "vocab")?,
     );
+    refuse_unsupported(&record["config"])?;
     let flag = |key: &str| record["config"][key].as_bool().unwrap_or(false);
     let (parallel, qk_norm, gated) = (flag("parallel_residual"), flag("qk_norm"), flag("mlp_gated"));
     let layer_norm = match record["config"]["norm"].as_str() {
@@ -628,20 +668,13 @@ fn language_model(tensors: &Tensors<'_>, record: &Value, blocks: std::ops::Range
     } else {
         None
     };
-    // A norm gain is a diagonal operator: one present block per coordinate, d reals.
+    // A norm gain is a diagonal operator: d reals, held as the diagonal.
     let gain = |b: &mut Builder, name: &str| -> Result<usize, String> {
         let g = tensors.get(name)?;
-        let mut values = Array2::<f64>::zeros((d, d));
-        let mut present = Array2::from_elem((d, d), false);
-        for i in 0..d {
-            values[[i, i]] = g[[0, i]];
-            present[[i, i]] = true;
+        if g.dim() != (1, d) {
+            return Err(format!("{name}: shape {:?}, not a row of {d}", g.dim()));
         }
-        let precision = exact_precision(g.iter().copied()).map_err(|e| e.to_string())?;
-        let op = Operator::blocks(name, coordinates.clone(), coordinates.clone(), values, present, precision, Provenance::native(name))
-            .map_err(|e| e.to_string())?;
-        b.operators.push(Arc::new(op));
-        Ok(b.operators.len() - 1)
+        b.gain(name, &coordinates, g.row(0).to_owned())
     };
     // A stored bias (a row vector, sliced to `range`) as a column operator on `rows`.
     let bias = |b: &mut Builder, name: &str, rows: &Interface, range: Option<(usize, usize)>| -> Result<Option<usize>, String> {
@@ -684,11 +717,14 @@ fn language_model(tensors: &Tensors<'_>, record: &Value, blocks: std::ops::Range
         let normed = b.node(Node::RmsNorm { input, epsilon });
         Ok(b.node(Node::Affine { terms: vec![(normed, g)], bias: beta }))
     };
-    // A head norm (Qwen3's q_norm, k_norm): an RMS norm over the head, then its gain, a dense
-    // diagonal operator on the head.
+    // A head norm (Qwen3's q_norm, k_norm): an RMS norm over the head, then its gain, a diagonal
+    // operator on the head.
     let head_norm = |b: &mut Builder, x: usize, name: &str| -> Result<usize, String> {
         let g = tensors.get(name)?;
-        let op = b.operator(name, &head, &head, Array2::from_diag(&g.row(0)))?;
+        if g.dim() != (1, hd) {
+            return Err(format!("{name}: shape {:?}, not a row of {hd}", g.dim()));
+        }
+        let op = b.gain(name, &head, g.row(0).to_owned())?;
         let normed = b.node(Node::RmsNorm { input: x, epsilon });
         Ok(b.node(Node::Affine { terms: vec![(normed, op)], bias: None }))
     };

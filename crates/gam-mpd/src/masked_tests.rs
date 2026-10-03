@@ -118,7 +118,7 @@ fn a_step_of_the_pieces_lowers_the_masked_kl() {
     let fam = masked.family(&family, &masks);
     let before = forward(&masked, &fam, &target).expect("forward").0.sum();
     let mut running = super::masked::Running::default();
-    assert!(step_pieces(&mut masked, &family, &target, &masks, 4, 7, &mut running).expect("steps").is_some());
+    assert!(step_pieces(&mut masked, &family, &target, &masks, 4, 7, &mut running, super::masked::Claim::Corner).expect("steps").is_some());
     let after = forward(&masked, &fam, &target).expect("forward").0.sum();
     assert!(after < before, "{after} against {before}");
 }
@@ -259,7 +259,7 @@ fn pieces_grown_from_what_selection_leaves_out_recover_its_kl() {
     // Piece 2 is dropped everywhere.
     let masks = vec![Array2::from_shape_fn((family.rows, pieces), |(_, c)| if c == 2 { 0.0 } else { 1.0 })];
     let mut running = Running::default();
-    step_pieces(&mut masked, &family, &target, &masks, 4, 7, &mut running).expect("steps");
+    step_pieces(&mut masked, &family, &target, &masks, 4, 7, &mut running, super::masked::Claim::Corner).expect("steps");
     let fam = masked.family(&family, &masks);
     let (before, trace, _) = forward(&masked, &fam, &target).expect("forward");
     let (v, u) = dropped_atoms(&masked, 0, &trace, &masks[0], &running, 1000.0, 0.0).expect("atoms");
@@ -290,4 +290,174 @@ fn sites_are_the_hidden_maps_and_their_statistics_build_an_exact_library() {
     assert!(measured[0].fisher.diag().iter().all(|f| *f >= 0.0) && measured[0].fisher.diag().sum() > 0.0);
     let library = fisher_svd(&measured[0]).expect("library");
     assert!(library.exactness(&measured[0].w) < 1e-9, "{}", library.exactness(&measured[0].w));
+}
+
+/// The box claim's error is the KL expected over every off gate drawn uniform: against the mean
+/// KL of sampled gates on small pieces (where second order is accurate).
+#[test]
+fn the_box_claims_error_is_the_kl_expected_over_uniform_off_gates() {
+    use super::masked::{box_excess, fisher};
+    let (program, family) = model();
+    let target = Target::every_row(program.execute(&family, false).expect("executes").values[program.output].clone());
+    let site = sites(&program).into_iter().find(|s| s.name == "W_in").expect("the W_in site");
+    let pieces = 3;
+    let library = Library {
+        v: Array2::from_shape_fn((pieces, WIDTH), |(i, j)| 0.3 * noise(700 + 7 * i + j)),
+        u: Array2::from_shape_fn((pieces, UNITS), |(i, j)| 0.3 * noise(800 + 7 * i + j)),
+        mean: Array1::zeros(WIDTH),
+    };
+    let masked = Masked::build(&program, vec![site], vec![library]).expect("builds");
+    let masks = vec![Array2::from_shape_fn((family.rows, pieces), |(r, c)| if (r + c) % 2 == 0 { 0.0 } else { 1.0 })];
+    let fam = masked.family(&family, &masks);
+    let (kl, trace, cotangent) = forward(&masked, &fam, &target).expect("forward");
+    let fishers: Vec<Array2<f64>> =
+        fisher(&masked, &fam, &trace, &target, 256, 11, true).expect("fisher").into_iter().map(|(_, f)| f.expect("written")).collect();
+    let (excess, _) = box_excess(&masked, &fam, &trace, &masks, cotangent, &fishers, false).expect("excess");
+    let draws = 400;
+    let mut sampled = 0.0;
+    for d in 0..draws {
+        let gates = vec![Array2::from_shape_fn((family.rows, pieces), |(r, c)| {
+            if masks[0][[r, c]] > 0.0 { 1.0 } else { 0.5 * (noise(31 * d + 7 * r + c + 100_000) + 1.0) }
+        })];
+        sampled += forward(&masked, &masked.family(&family, &gates), &target).expect("forward").0.sum();
+    }
+    let sampled_excess = sampled / draws as f64 - kl.sum();
+    let predicted = excess.sum();
+    assert!(predicted > 0.0 && sampled_excess > 0.0, "{predicted} against {sampled_excess}");
+    assert!((predicted - sampled_excess).abs() <= 0.3 * sampled_excess, "{predicted} against {sampled_excess}");
+}
+
+/// Two-input sequences through causal attention: the second input reads the first's values, so a
+/// mask on the first changes the second's KL. Selection accepts per sequence, on exactly the masks
+/// it commits, so its result never codes worse than its start and its KL is that of its masks.
+#[test]
+fn selection_never_commits_masks_it_did_not_evaluate_across_attention() {
+    use super::masked::{Coder, select};
+    use super::operator_program::{Rotary, Scale, SequenceLayout};
+    let tokens = Interface::uniform(P, 1, LabelKind::Token, 0).expect("interface");
+    let model = Interface::native(4).expect("interface");
+    let op = |name: &str, rows: &Interface, cols: &Interface, salt: usize| {
+        let m = Array2::from_shape_fn((rows.width(), cols.width()), |(i, j)| 1.5 * noise(salt + 31 * i + j));
+        Arc::new(Operator::dense(name, rows.clone(), cols.clone(), m, precision(), Provenance::default()).expect("dense"))
+    };
+    let program = OperatorProgram {
+        declarations: Declarations { parameters: 0, domains: vec![Domain { size: P, cycle: None }], slots: vec![Slot::Token { domain: 0 }] },
+        bases: vec![Basis::Indicator { domain: 0 }],
+        operators: vec![op("E", &model, &tokens, 1), op("Q", &model, &model, 2), op("K", &model, &model, 3), op("V", &model, &model, 4), op("O", &tokens, &model, 5)],
+        rules: Vec::new(),
+        nodes: vec![
+            Node::Feature { slot: 0, basis: 0 },              // 0
+            Node::Affine { terms: vec![(0, 0)], bias: None }, // 1 x
+            Node::Affine { terms: vec![(1, 1)], bias: None }, // 2 q
+            Node::Affine { terms: vec![(1, 2)], bias: None }, // 3 k
+            Node::Affine { terms: vec![(1, 3)], bias: None }, // 4 v
+            Node::Attend { query: 2, key: 3, value: 4, scale: Scale::InverseSqrt(4), rotary: Some(Rotary { base: 10000, dims: 4, half_split: true }), causal: true },
+            Node::Affine { terms: vec![(5, 4)], bias: None }, // 6 logits
+            Node::Readout { input: 6, basis: 0 },             // 7
+        ],
+        output: 7,
+    };
+    let (sequences, length) = (6u32, 2u32);
+    let ids: Vec<u32> = (0..sequences * length).map(|i| (i * 3 + 1) % P as u32).collect();
+    let family = FamilyInputs {
+        rows: ids.len(),
+        slots: vec![SlotValues::Tokens(ids)],
+        layout: Some(SequenceLayout {
+            sequence: (0..sequences * length).map(|i| i / length).collect(),
+            position: (0..sequences * length).map(|i| i % length).collect(),
+        }),
+    };
+    let target = Target::every_row(program.execute(&family, false).expect("executes").values[program.output].clone());
+    let site = sites(&program).into_iter().find(|s| s.name == "V").expect("the value site");
+    let w = super::masked::matrix(&program, &site).expect("matrix");
+    let decomposed = super::dense::svd(w.view(), false).expect("svd");
+    let pieces = decomposed.singular_values.len();
+    let mut v = Array2::<f64>::zeros((pieces, 4));
+    let mut u = Array2::<f64>::zeros((pieces, 4));
+    for c in 0..pieces {
+        let s = decomposed.singular_values[c].sqrt();
+        v.row_mut(c).assign(&(&decomposed.vt.row(c) * s));
+        u.row_mut(c).assign(&(&decomposed.u.column(c) * s));
+    }
+    let masked = Masked::build(&program, vec![site], vec![Library { v, u, mean: Array1::zeros(4) }]).expect("builds");
+    let start = vec![Array2::<f64>::ones((family.rows, pieces))];
+    let coder = Coder::ran(vec![Array1::from_elem(pieces, 0.5)], family.rows);
+    let observations = 20.0;
+    let code_of = |masks: &[Array2<f64>]| {
+        let kl = forward(&masked, &masked.family(&family, masks), &target).expect("forward").0;
+        coder.bits(masks).sum() + kl.sum() * observations / std::f64::consts::LN_2
+    };
+    let before = code_of(&start);
+    let (selected, kl) = select(&masked, &family, &target, start, &coder, observations, 8).expect("selects");
+    let fresh = forward(&masked, &masked.family(&family, &selected), &target).expect("forward").0;
+    assert!((&kl - &fresh).iter().all(|d| d.abs() <= 1e-12), "the returned KL is not the committed masks'");
+    let after = code_of(&selected);
+    assert!(after <= before + 1e-9, "{after} against {before}");
+}
+
+/// A mask is a weight intervention on the read itself: with `W = diag(2, 3)`, a library measured
+/// about `μ = (1, −2)`, and only the first piece on (`B_m = diag(2, 0)`), the masked site maps `0` to
+/// `0` and `(1, 1)` to `(2, 0)`: no bias appears at a bias-free site.
+#[test]
+fn a_masked_site_reads_uncentred_so_no_bias_appears() {
+    let width = Interface::native(2).expect("interface");
+    let w = Array2::from_shape_vec((2, 2), vec![2.0, 0.0, 0.0, 3.0]).expect("shape");
+    let program = OperatorProgram {
+        declarations: Declarations { parameters: 0, domains: Vec::new(), slots: vec![Slot::Raw { width: 2 }] },
+        bases: Vec::new(),
+        operators: vec![Arc::new(Operator::dense("W", width.clone(), width.clone(), w, precision(), Provenance::default()).expect("dense"))],
+        rules: Vec::new(),
+        nodes: vec![Node::Raw { slot: 0 }, Node::Affine { terms: vec![(0, 0)], bias: None }],
+        output: 1,
+    };
+    let site = sites(&program).into_iter().next().expect("the site");
+    let library = Library {
+        v: Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.0, 1.0]).expect("shape"),
+        u: Array2::from_shape_vec((2, 2), vec![2.0, 0.0, 0.0, 3.0]).expect("shape"),
+        mean: Array1::from_vec(vec![1.0, -2.0]),
+    };
+    let masked = Masked::build(&program, vec![site], vec![library]).expect("builds");
+    let inputs = FamilyInputs {
+        rows: 2,
+        slots: vec![SlotValues::Raw(Array2::from_shape_vec((2, 2), vec![0.0, 0.0, 1.0, 1.0]).expect("shape"))],
+        layout: None,
+    };
+    let masks = vec![Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 1.0, 0.0]).expect("shape")];
+    let out = masked.program.execute(&masked.family(&inputs, &masks), false).expect("executes").values[masked.program.output].clone();
+    let expected = [[0.0, 0.0], [2.0, 0.0]];
+    for r in 0..2 {
+        for c in 0..2 {
+            assert!((out[[r, c]] - expected[r][c]).abs() < 1e-12, "{out}");
+        }
+    }
+}
+
+/// Every piece on stays the library's map: steps on either side keep `Σ_c u_c v_cᵀ` to rounding
+/// while they lower the masked KL.
+#[test]
+fn steps_keep_every_piece_on_the_same_map() {
+    let (program, family) = model();
+    let target = Target::every_row(program.execute(&family, false).expect("executes").values[program.output].clone());
+    let site = sites(&program).into_iter().find(|s| s.name == "W_in").expect("the W_in site");
+    let pieces = 9;
+    let library = Library {
+        v: Array2::from_shape_fn((pieces, WIDTH), |(i, j)| noise(700 + 7 * i + j)),
+        u: Array2::from_shape_fn((pieces, UNITS), |(i, j)| noise(800 + 7 * i + j)),
+        mean: Array1::zeros(WIDTH),
+    };
+    let sum = |l: &Library| l.u.t().dot(&l.v);
+    let anchor = sum(&library);
+    let scale = anchor.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+    let mut masked = Masked::build(&program, vec![site], vec![library]).expect("builds");
+    let masks = vec![Array2::from_shape_fn((family.rows, pieces), |(r, c)| if (r + 2 * c) % 3 == 0 { 0.0 } else { 1.0 })];
+    let mut running = super::masked::Running::default();
+    let mut stepped = 0;
+    for seed in 0..4u64 {
+        if step_pieces(&mut masked, &family, &target, &masks, 4, seed, &mut running, super::masked::Claim::Corner).expect("steps").is_some() {
+            stepped += 1;
+        }
+        let drift = (&sum(&masked.library(0).expect("library")) - &anchor).iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+        assert!(drift <= 1e-9 * scale, "seed {seed}: the sum moved by {drift:e}");
+    }
+    assert!(stepped > 0, "no step lowered the KL");
 }

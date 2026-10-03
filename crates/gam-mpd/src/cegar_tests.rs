@@ -328,3 +328,42 @@ fn rules_inline_to_the_same_function_and_their_gradients_match_differences() {
         }
     }
 }
+
+/// Counterexamples found by the ascent are chosen for being hard, so they join the family as
+/// challenge rows: fitted and scored, never counted as draws of the sampled population.
+#[test]
+fn counterexamples_join_as_challenge_rows_never_as_draws() {
+    let model = every_kind(0.0, false);
+    let domain = InputDomain {
+        slots: vec![
+            SlotDomain::Tokens((0..TOKENS as u32).collect()),
+            SlotDomain::Corners { lower: Array1::zeros(RAW), upper: Array1::ones(RAW) },
+        ],
+    };
+    let drawn = vec![vec![SlotValue::Token(0), SlotValue::Raw(Array1::zeros(RAW))]];
+    let contract = Contract {
+        declarations: model.declarations.clone(),
+        family: family_of(&drawn).expect("family"),
+        kind: FamilyKind::Sample { population: "one drawn input".to_string(), confidence: 0.95, units: vec![0] },
+        observations: 64,
+        readouts: 1,
+        readout_slots: None,
+    };
+    let library: Vec<Box<dyn Primitive>> = vec![Box::new(DropBlocks), Box::new(Coarsen)];
+    let budget = Budget { screenings: 100_000, certifications: 1_000, refit: None };
+    let refinement = decompose_refined(&model, &contract, &library, &budget, &domain, &[]).expect("refines");
+    assert!(refinement.added > 0, "the toy must produce counterexamples for this test to say anything");
+    let population = refinement.decomposition.score.population.as_ref().expect("a sampled family");
+    assert_eq!(population.units, 1);
+    // Directly: two drawn rows and two challenge rows count two units.
+    let inputs: Vec<Input> = (0..4u32).map(|t| vec![SlotValue::Token(t), SlotValue::Raw(Array1::zeros(RAW))]).collect();
+    let mixed = Contract {
+        family: family_of(&inputs).expect("family"),
+        kind: FamilyKind::Sample { population: "two drawn inputs".to_string(), confidence: 0.95, units: vec![0, 1] },
+        ..contract
+    };
+    let reference = mixed.logits(&model).expect("reference");
+    let score = mixed.score(&every_kind(0.3, false), &reference).expect("score");
+    assert_eq!(score.population.as_ref().expect("sampled").units, 2);
+    assert_eq!(score.evaluation.argmax_agrees.len(), 4);
+}

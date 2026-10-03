@@ -9,7 +9,7 @@ use crate::test_support::planted_toys::{
     random_mlp, rotation_toy,
 };
 use crate::test_support::test_governor;
-use gam_response::interaction::connected_components;
+use gam_math::graph::connected_components;
 use ndarray::{Array1, Array2, Axis, array, concatenate, s};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -218,6 +218,46 @@ fn normal_form_merges_opposite_forms_into_the_linear_part() {
             }
         }
     }
+}
+
+/// `F = (ReLU x₁, ReLU x₂) + e₁ [ReLU(x₁ + x₂) − ½ ReLU(2x₁ + 2x₂)]`: the bracket
+/// is zero because ReLU is positively homogeneous, so `F` is two blocks. The
+/// proportional forms merge with the writer rescaled (`−½ · 2 = −1`) and cancel
+/// exactly; the GELU, which is not homogeneous, keeps all four units.
+#[test]
+fn relu_forms_merge_up_to_a_positive_factor_and_cancel() {
+    let block = Block {
+        w_in: array![[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, 2.0]],
+        b_in: Array1::zeros(4),
+        w_out: array![[1.0, 0.0, 1.0, -0.5], [0.0, 1.0, 0.0, 0.0]],
+        b_out: Array1::zeros(2),
+    };
+    let form = block.normal_form(GaussianActivation::Relu, None);
+    assert_eq!(form.cancelled.len(), 2, "{:?}", form.sources);
+    assert_eq!(form.reads.nrows(), 2);
+    let blocks = form.additive_blocks(test_governor()).expect("blocks");
+    assert_eq!(sorted(blocks.finest.clone()), vec![vec![0], vec![1]], "two blocks");
+    let mut rng = StdRng::seed_from_u64(2951);
+    for _ in 0..20 {
+        let x = Array1::from_shape_simple_fn(2, || rng.random_range(-3.0..3.0));
+        let (normal, direct) = (form.evaluate(x.view()).expect("evaluate"), block.evaluate(GaussianActivation::Relu, x.view()));
+        assert!(normal.iter().zip(direct.iter()).all(|(a, b)| (a - b).abs() <= 1e-12), "{normal} against {direct}");
+    }
+    // Negative factors pass through the sign rule: `ReLU(−2t) = 2 (ReLU(t) − t)`.
+    let negated = Block { w_in: array![[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [-2.0, -2.0]], ..block };
+    let form = negated.normal_form(GaussianActivation::Relu, None);
+    assert_eq!(form.reads.nrows(), 3, "the two proportional forms are one unit");
+    let gelu = Block { w_in: array![[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, 2.0]], ..negated }.normal_form(GaussianActivation::ExactGelu, None);
+    assert_eq!(gelu.reads.nrows(), 4, "no positive-factor rule for the GELU");
+    assert!(gelu.cancelled.is_empty());
+    // A form proportional only up to rounding is not merged.
+    let near = Block {
+        w_in: array![[1.0, 3.0], [1.0 / 3.0, 1.0]],
+        b_in: Array1::zeros(2),
+        w_out: array![[1.0, -3.0], [0.0, 0.0]],
+        b_out: Array1::zeros(2),
+    };
+    assert_eq!(near.normal_form(GaussianActivation::Relu, None).reads.nrows(), 2, "1/3 is not exactly a third");
 }
 
 /// Toy 1: `F(h) = σ(h) − σ(−h) = h`. Every pair merges, `L = I` exactly, every

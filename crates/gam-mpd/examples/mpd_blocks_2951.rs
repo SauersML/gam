@@ -1,37 +1,39 @@
 //! Rank-k gated subcomponents chosen by the code (`gam_mpd::blocks`), on a trained toy and on
 //! VPD's four-layer model (#2951).
 //!
+//! The code is one total over every word: the description bits of the blocks that ran on it plus
+//! `n KL / ln 2` (`gam_mpd::blocks`, module note), each block described by
+//! `gam_mpd::blocks::Generic` from the sites' read covariances and written Fishers measured on the
+//! coded inputs.
+//!
 //! `mpd_blocks_2951 modadd EXPORT_DIR OUT.json OBSERVATIONS [SITES]`
 //!
 //! `EXPORT_DIR` is a `transformer` export (`gam_mpd::import::import`; e.g.
 //! `~/mpd-data/engine/p31_s0_generic`, the mod-31 network on all 961 inputs), `SITES` a comma list
 //! of site names (default every site). Each site starts as its Fisher-whitened singular
-//! subcomponents (`gam_mpd::pieces::fisher_svd`, from moments measured on the family), every one on
-//! for every input; the rank-one sets are selected pass after pass under the counts of the pass
-//! before until a pass no longer lowers the code (the rank-one point), then the blocks are fitted,
-//! merges and splits (`gam_mpd::blocks::fit_blocks`). Each final block's frequency content is
-//! reported on whichever side of it the network reads or writes in token coordinates: its output
-//! through the unembedding (over the classes), its input through the embedding (over the
-//! operands), as the share of its energy at its leading frequency.
+//! subcomponents (`gam_mpd::pieces::fisher_svd`). The checks: every subcomponent on, every one
+//! off, and each site's whole map as one block on everywhere (dense). The rank-one sets are
+//! selected pass after pass from all on until a pass no longer lowers the total (the rank-one
+//! point), then the blocks are fitted: merges, shrinks and splits (`gam_mpd::blocks::fit_blocks`).
+//! Each final block's frequency content is reported on whichever side the network reads or writes
+//! in token coordinates: its output through the unembedding (over the classes), its input through
+//! the embedding (over the operands), as its leading frequency and that frequency's share.
 //!
-//! `mpd_blocks_2951 vpd EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json OBSERVATIONS FIRST SEQUENCES [LIBRARY_ROWS]`
+//! `mpd_blocks_2951 vpd EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json OBSERVATIONS FIRST SEQUENCES`
 //!
 //! `EXPORT_DIR` a language-model export (`gam_mpd::import::import_language_model`, contexts of
 //! 512), `LIBRARY_DIR` per site `{site}.v.f64` (subcomponents × d_in) and `{site}.u.f64`
 //! (subcomponents × d_out) raw float64 on the uncentred read, `SETS_DIR` per-token sets for that
 //! library (`indptr.i64`, `indices.i64`, `sites.txt`, as `mpd_pieces_masked_2951` reads them).
-//! Sequences `FIRST..FIRST + SEQUENCES` are coded, one batch each. Three points under the same code
-//! (`gam_mpd::blocks::measure`; the library spread over `LIBRARY_ROWS` rows, default the coded
-//! rows): the given sets, the sets selected from them (Step A), and the blocks merged from
-//! Step A's.
+//! Sequences `FIRST..FIRST + SEQUENCES` are coded, one batch each. Three points under the same
+//! total: the given sets, the sets selected from them (Step A), and the blocks merged from Step A's.
 //!
 //! Every point reports bits per word (the primary score), KL, active blocks per word and active
-//! rank-one equivalents per word (`Σ k_c` over the blocks on), so a rank-k block's one listing is
-//! compared with rank-one subcomponents at the rank it actually spends. One gate on a rank-k block
-//! scales the block along a line, not the box of k independent masks: any robustness evaluation of
-//! these points masks each block's columns together, a weaker claim than per column.
+//! rank-one equivalents per word (`Σ k_c` over the blocks on). One gate on a rank-k block scales the
+//! block along a line, not the box of k independent masks: any robustness evaluation of these
+//! points masks each block's columns together, a weaker claim than per column.
 
-use gam_mpd::blocks::{Bits, Blocked, Coded, block_cosine, fit_blocks, measure, reselect};
+use gam_mpd::blocks::{Bits, Blocked, Coded, Generic, block_cosine, fit_blocks, measure, reselect};
 use gam_mpd::import::{import, import_language_model};
 use gam_mpd::masked::{Library, Site, Target, site_statistics, sites};
 use gam_mpd::operator_program::{FamilyInputs, LabelKind, OperatorProgram};
@@ -61,9 +63,7 @@ fn point(name: &str, bits: &Bits) -> Value {
         "kl": kl,
         "active_blocks_per_word": active,
         "active_rank_one_equivalents_per_word": rank,
-        "library_bits": bits.library,
-        "rate_bits": bits.rates,
-        "listing_bits": bits.listing,
+        "described_bits": bits.described,
         "kl_bits": bits.kl,
         "rows": bits.rows,
         "blocks": bits.blocks,
@@ -74,8 +74,8 @@ fn point(name: &str, bits: &Bits) -> Value {
 fn say(name: &str, bits: &Bits) {
     let (per_word, kl, active, rank) = bits.per_row();
     eprintln!(
-        "{name}: {per_word:.2} bits/word (library {:.0}, rates {:.0}, listing {:.0}, KL {:.0}), KL {kl:.4}, {active:.2} blocks and {rank:.2} rank-one equivalents on per word, {} blocks of {} columns",
-        bits.library, bits.rates, bits.listing, bits.kl, bits.blocks, bits.pieces
+        "{name}: {per_word:.2} bits/word (weights that ran {:.0}, KL {:.0}), KL {kl:.4}, {active:.2} blocks and {rank:.2} rank-one equivalents on per word, {} blocks of {} columns",
+        bits.described, bits.kl, bits.blocks, bits.pieces
     );
 }
 
@@ -148,19 +148,19 @@ fn modadd(dir: &Path, out: &Path, observations: f64, names: Option<Vec<String>>)
         libraries.push(Library { v: library.v.t().to_owned(), u: library.u, mean: measured.mean.clone() });
     }
     let masks = vec![libraries.iter().map(|l| Array2::<f64>::ones((family.rows, l.v.nrows()))).collect()];
-    let coded = Coded {
-        model: &program,
-        sites: chosen.clone(),
-        batches: vec![(family.clone(), target)],
-        observations,
-        samples: 16,
-        bits_per_real: 32.0,
-        library_rows: family.rows as f64,
-    };
-    // The rank-one point: selection passes until one no longer lowers the code.
+    let describe = Generic::new(&statistics, observations);
+    let coded = Coded { model: &program, sites: chosen.clone(), batches: vec![(family.clone(), target)], observations, samples: 16, describe: &describe };
+    // The checks: every subcomponent on, every one off, and each site's whole map on.
     let mut rank_one = Blocked::rank_one(libraries, masks);
+    rank_one.price(&coded)?;
     let (mut bits, _) = measure(&coded, &rank_one)?;
-    say("all on", &bits);
+    let all_on = bits.clone();
+    say("all on", &all_on);
+    let (all_off, _) = measure(&coded, &rank_one.off())?;
+    say("all off", &all_off);
+    let (dense, _) = measure(&coded, &rank_one.whole())?;
+    say("dense", &dense);
+    // The rank-one point: selection passes until one no longer lowers the code.
     loop {
         let next = reselect(&coded, &rank_one)?;
         let (next_bits, _) = measure(&coded, &next)?;
@@ -187,6 +187,7 @@ fn modadd(dir: &Path, out: &Path, observations: f64, names: Option<Vec<String>>)
             described.push(json!({
                 "site": site.name,
                 "rank": rank,
+                "bits": blocked.bits(k, b),
                 "firing": firing(&blocked, k, b),
                 "output_frequency": side(&readout, &u),
                 "input_frequency": side(&embedding, &v),
@@ -195,7 +196,7 @@ fn modadd(dir: &Path, out: &Path, observations: f64, names: Option<Vec<String>>)
     }
     let report = json!({
         "observations": observations,
-        "points": [point("rank one", &rank_one_bits), point("blocks", &block_bits)],
+        "points": [point("all on", &all_on), point("all off", &all_off), point("dense", &dense), point("rank one", &rank_one_bits), point("blocks", &block_bits)],
         "rank_one_ranks": ranks(&coded, &rank_one),
         "block_ranks": ranks(&coded, &blocked),
         "blocks": described,
@@ -283,7 +284,6 @@ fn vpd(
     observations: f64,
     first: usize,
     sequences: usize,
-    library_rows: Option<f64>,
 ) -> Result<(), String> {
     const CONTEXT: usize = 512;
     let imported = import_language_model(dir, first + sequences, CONTEXT)?;
@@ -315,17 +315,12 @@ fn vpd(
         let logits = program.execute(&inputs, false).map_err(|e| e.to_string())?.values[program.output].clone();
         batches.push((inputs, Target::every_row(logits)));
     }
-    let coded_rows = (sequences * CONTEXT) as f64;
-    let coded = Coded {
-        model: &program,
-        sites: chosen,
-        batches,
-        observations,
-        samples: 4,
-        bits_per_real: 32.0,
-        library_rows: library_rows.unwrap_or(coded_rows),
-    };
-    let given = Blocked::rank_one(libraries, masks);
+    let statistics = site_statistics(&program, &chosen, batches.iter().map(|(inputs, _)| inputs.clone()), 4, 0x5EED)?;
+    let describe = Generic::new(&statistics, observations);
+    drop(statistics);
+    let coded = Coded { model: &program, sites: chosen, batches, observations, samples: 4, describe: &describe };
+    let mut given = Blocked::rank_one(libraries, masks);
+    given.price(&coded)?;
     let (given_bits, _) = measure(&coded, &given)?;
     say("given sets", &given_bits);
     let step_a = reselect(&coded, &given)?;
@@ -360,8 +355,7 @@ fn main() -> Result<(), String> {
             number(6, "OBSERVATIONS")?,
             number(7, "FIRST")? as usize,
             number(8, "SEQUENCES")? as usize,
-            args.get(9).map(|s| s.parse::<f64>().map_err(|e| e.to_string())).transpose()?,
         ),
-        _ => Err("mpd_blocks_2951 modadd EXPORT_DIR OUT.json OBSERVATIONS [SITES] | vpd EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json OBSERVATIONS FIRST SEQUENCES [LIBRARY_ROWS]".to_string()),
+        _ => Err("mpd_blocks_2951 modadd EXPORT_DIR OUT.json OBSERVATIONS [SITES] | vpd EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json OBSERVATIONS FIRST SEQUENCES".to_string()),
     }
 }

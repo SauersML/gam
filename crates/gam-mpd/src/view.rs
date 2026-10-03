@@ -1,12 +1,11 @@
-//! The component-level view of an operator program (#2951): what each operator reads, the law that
-//! applies it, what it writes, how often it is used, and what it costs, with the share of the
-//! message still spent on native, unrewritten operators.
+//! The component-level view of an operator program (#2951): what each operator reads, the node
+//! kinds that apply it, what it writes, how often it is used, and what it costs.
 //!
-//! A node-level graph is the model in another notation; this view is the compact object a reader
-//! checks. Each [`ComponentView`] names an operator's present input groups and output groups (by
-//! label, runs of indices compressed), the node kinds that apply it, the number of places it is
-//! used, its message length and its native sources. An operator whose provenance records no rewrite
-//! is native and unresolved: its bits are the program's unresolved share.
+//! Each [`ComponentView`] names an operator's present input groups and output groups (by label,
+//! runs of indices compressed), the node kinds that apply it, the number of places it is used, its
+//! message length and its native sources. The totals are bookkeeping: the bits of operators whose
+//! provenance records no rewrite (unchanged native operators), of token-indexed tables, and of the
+//! other operators. A rewrite in an operator's provenance says only that it was rewritten.
 
 use super::operator_program::{Interface, LabelKind, Node, Operator, OperatorBody, OperatorProgram, ProgramError};
 use std::collections::BTreeMap;
@@ -19,19 +18,18 @@ pub struct ComponentView {
     pub reads: String,
     /// The present output groups.
     pub writes: String,
-    /// The node kinds that apply it, with each downstream pointwise law.
-    pub laws: Vec<String>,
+    /// The node kinds that apply it, with each downstream pointwise activation.
+    pub applied_by: Vec<String>,
     /// How many node terms reference it.
     pub uses: usize,
     pub reals: usize,
     pub bits: u64,
     pub sources: Vec<String>,
     /// No rewrite produced it: it is the native operator, possibly restricted.
-    pub unresolved: bool,
-    /// A lookup table: its columns or its rows are indexed by the tokens of a domain (an embedding,
-    /// an unembedding, a token-indexed constant). Its bits are data; every other operator's are
-    /// algorithm.
-    pub data: bool,
+    pub native_unchanged: bool,
+    /// Its columns or its rows are indexed by the tokens of a domain (an embedding, an unembedding,
+    /// a token-indexed constant).
+    pub table: bool,
 }
 
 /// The whole program's view.
@@ -39,16 +37,12 @@ pub struct ComponentView {
 pub struct ProgramView {
     pub bits: u64,
     pub components: Vec<ComponentView>,
-    pub unresolved_bits: u64,
-    /// The bits of lookup-table components; the rest of the operators' bits are algorithm.
-    pub data_bits: u64,
-    pub algorithm_bits: u64,
-}
-
-impl ProgramView {
-    pub fn unresolved_fraction(&self) -> f64 {
-        self.unresolved_bits as f64 / self.bits as f64
-    }
+    /// The bits of operators whose provenance records no rewrite.
+    pub unchanged_native_bits: u64,
+    /// The bits of token-indexed operators.
+    pub table_storage_bits: u64,
+    /// The bits of every other operator.
+    pub other_operator_storage_bits: u64,
 }
 
 /// `Plane{1,5,7} Unit{0..127}`: each label kind's present indices, consecutive runs compressed.
@@ -91,7 +85,7 @@ fn summarize(labels: impl Iterator<Item = (LabelKind, u32)>) -> String {
 fn present_labels(op: &Operator, rows: bool) -> String {
     let side = if rows { &op.rows } else { &op.cols };
     let groups: Vec<usize> = match &op.body {
-        OperatorBody::Identity | OperatorBody::LowRank { .. } => (0..side.group_count()).collect(),
+        OperatorBody::Identity | OperatorBody::LowRank { .. } | OperatorBody::Diagonal { .. } => (0..side.group_count()).collect(),
         OperatorBody::Dense { present, .. } => (0..side.group_count())
             .filter(|&g| if rows { present.row(g).iter().any(|k| *k) } else { present.column(g).iter().any(|k| *k) })
             .collect(),
@@ -126,7 +120,7 @@ fn node_kind(node: &Node) -> &'static str {
 pub fn view(program: &OperatorProgram) -> Result<ProgramView, ProgramError> {
     let account = program.code_account()?;
     let mut uses = vec![0usize; program.operators.len()];
-    let mut laws: Vec<Vec<String>> = vec![Vec::new(); program.operators.len()];
+    let mut applied_by: Vec<Vec<String>> = vec![Vec::new(); program.operators.len()];
     for (index, node) in program.nodes.iter().enumerate() {
         for op in node.operators() {
             uses[op] += 1;
@@ -145,41 +139,47 @@ pub fn view(program: &OperatorProgram) -> Result<ProgramView, ProgramError> {
                 })
                 .collect();
             let entry = format!("{} -> {}", node_kind(node), if downstream.is_empty() { "output".to_string() } else { downstream.join(",") });
-            if !laws[op].contains(&entry) {
-                laws[op].push(entry);
+            if !applied_by[op].contains(&entry) {
+                applied_by[op].push(entry);
             }
         }
     }
     let mut components = Vec::new();
-    let mut unresolved_bits = 0;
-    let (mut data_bits, mut algorithm_bits) = (0u64, 0u64);
+    let mut unchanged_native_bits = 0;
+    let (mut table_storage_bits, mut other_operator_storage_bits) = (0u64, 0u64);
     for (index, op) in program.operators.iter().enumerate() {
         let bits = account.operator_bits[index].0 + account.operator_bits[index].1;
-        let unresolved = op.provenance.derivation.is_empty() && !op.provenance.sources.is_empty();
-        if unresolved {
-            unresolved_bits += bits;
+        let native_unchanged = op.provenance.derivation.is_empty() && !op.provenance.sources.is_empty();
+        if native_unchanged {
+            unchanged_native_bits += bits;
         }
         let tokens = |side: &Interface| side.groups().iter().all(|g| g.label.kind == LabelKind::Token);
-        let data = tokens(&op.rows) || tokens(&op.cols);
-        if data {
-            data_bits += bits;
+        let table = tokens(&op.rows) || tokens(&op.cols);
+        if table {
+            table_storage_bits += bits;
         } else {
-            algorithm_bits += bits;
+            other_operator_storage_bits += bits;
         }
         components.push(ComponentView {
             name: op.name.clone(),
             reads: present_labels(op, false),
             writes: present_labels(op, true),
-            laws: laws[index].clone(),
+            applied_by: applied_by[index].clone(),
             uses: uses[index],
             reals: op.real_count(),
             bits,
             sources: op.provenance.sources.clone(),
-            unresolved,
-            data,
+            native_unchanged,
+            table,
         });
     }
-    Ok(ProgramView { bits: account.total_bits, components, unresolved_bits, data_bits, algorithm_bits })
+    Ok(ProgramView {
+        bits: account.total_bits,
+        components,
+        unchanged_native_bits,
+        table_storage_bits,
+        other_operator_storage_bits,
+    })
 }
 
 /// A compact text rendering: one line per component with bits, sorted by bits, and the totals.
@@ -187,11 +187,8 @@ pub fn render(view: &ProgramView) -> String {
     let mut components: Vec<&ComponentView> = view.components.iter().filter(|c| c.bits > 0).collect();
     components.sort_by(|a, b| b.bits.cmp(&a.bits).then_with(|| a.name.cmp(&b.name)));
     let mut out = format!(
-        "{} bits: {} algorithm, {} data; {:.1}% unresolved\n",
-        view.bits,
-        view.algorithm_bits,
-        view.data_bits,
-        100.0 * view.unresolved_fraction()
+        "{} bits: {} in token-indexed tables, {} in other operators; {} in unchanged native operators\n",
+        view.bits, view.table_storage_bits, view.other_operator_storage_bits, view.unchanged_native_bits
     );
     for c in components {
         out.push_str(&format!(
@@ -202,8 +199,8 @@ pub fn render(view: &ProgramView) -> String {
             c.reads,
             c.writes,
             c.uses,
-            c.laws.join("; "),
-            if c.unresolved { "  (native)" } else { "" }
+            c.applied_by.join("; "),
+            if c.native_unchanged { "  (native)" } else { "" }
         ));
     }
     out

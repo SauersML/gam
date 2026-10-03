@@ -58,10 +58,8 @@
 //!
 //! [`routing_laws`] groups query heads whose whole score operators are equal within band
 //! ([`compare_heads`]), and reports how the laws relate (proportional, with the common
-//! scale, or not). [`attention_letters`] turns the laws into an attention step's
-//! observability letters, one summed transport per law (with a pre-norm input gain and a
-//! post-norm output gain folded in), the only letters `state::ObservabilityLetter::RoutingLaws`
-//! accepts for attention.
+//! scale, or not). [`attention_letters`] turns each group of heads into one summed transport
+//! (with a pre-norm input gain and a post-norm output gain folded in).
 
 use gam_linalg::faer_ndarray::{FaerLinalgError, FaerQr, fast_abt, fast_atb, fast_atv};
 use gam_linalg::roundoff::{accumulation_growth, householder_qr_backward_band};

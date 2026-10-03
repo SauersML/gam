@@ -94,6 +94,7 @@ use super::joint_operators::JointRefusal;
 use super::lift::{LiftError, TensorId, TensorRegistry};
 use super::secant::SecantError;
 use super::supports::{EvidenceStatus, EvidenceStatusError, ExactBasis};
+#[cfg(feature = "response")]
 use gam_response::intervention_shard::{InterventionChange, ParameterEditScope};
 
 pub mod bilinear;
@@ -370,6 +371,7 @@ impl NativeEditPlan {
 
     /// The plan as the parameter-edit records a framework runner executes: one global
     /// [`InterventionChange::ParameterEdit`] per edit, factors row-major.
+    #[cfg(feature = "response")]
     pub fn intervention_changes(&self) -> Vec<InterventionChange> {
         self.edits
             .iter()

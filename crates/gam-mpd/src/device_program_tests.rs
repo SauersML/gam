@@ -15,8 +15,8 @@
 
 use super::derivatives::{jvp, vjp};
 use super::device_program::DeviceProgram;
-use super::import::import_language_model;
-use super::operator_program::{FamilyInputs, OperatorProgram, SequenceLayout};
+use super::import::{hugging_face_language_model, import_language_model};
+use super::operator_program::{FamilyInputs, Node, Operator, OperatorBody, OperatorProgram, SequenceLayout};
 use gam_gpu::GpuPolicy;
 use gam_gpu::tensor::{Arithmetic, Device};
 use ndarray::{Array1, Array2};
@@ -211,4 +211,141 @@ fn a_family_whose_sequences_are_not_equal_blocks_is_refused() {
     let ragged = FamilyInputs { layout: Some(SequenceLayout { sequence, position: layout.position.clone() }), ..family };
     let lowered = DeviceProgram::compile(&Device::host(), &program).expect("lowered");
     assert!(lowered.forward(&ragged).is_err());
+}
+
+/// `program` as the importer used to build it: each norm gain a dense matrix with its diagonal
+/// blocks present, and the token feature also read by an unread concatenation, so its one-hot rows
+/// are formed and every affine term reads them as a matrix.
+fn dense_path(program: &OperatorProgram, feature: usize) -> OperatorProgram {
+    let mut dense = program.clone();
+    for op in &mut dense.operators {
+        if let OperatorBody::Diagonal { values, precision } = &op.body {
+            let n = values.len();
+            let groups = (op.rows.group_count(), op.cols.group_count());
+            let present = Array2::from_shape_fn(groups, |(r, c)| r == c || groups == (1, 1));
+            let blocks = Operator::blocks(op.name.clone(), op.rows.clone(), op.cols.clone(), Array2::from_diag(values), present, *precision, op.provenance.clone())
+                .expect("blocks");
+            assert_eq!(blocks.diagonal().expect("diagonal").len(), n);
+            *op = std::sync::Arc::new(blocks);
+        }
+    }
+    dense.nodes.push(Node::Concat { parts: vec![feature] });
+    dense
+}
+
+#[test]
+fn norm_gains_stay_diagonal_and_the_embedding_is_a_gather_equal_to_the_dense_path() {
+    let (program, family) = fixture();
+    let gains: Vec<usize> = (0..program.operators.len()).filter(|&o| program.operators[o].name.ends_with(".gain")).collect();
+    assert_eq!(gains.len(), 5, "two norms per block and the final norm");
+    for &g in &gains {
+        assert!(matches!(program.operators[g].body, OperatorBody::Diagonal { .. }), "{} is held as a diagonal", program.operators[g].name);
+    }
+    let feature = program.nodes.iter().position(|n| matches!(n, Node::Feature { .. })).expect("a token feature");
+    assert!(program.gathered_tokens(feature, &family).is_some());
+    let trace = program.execute(&family, true).expect("banded");
+    // The one-hot rows are never formed: the feature's value and band hold no columns.
+    assert_eq!(trace.values[feature].dim(), (family.rows, 0));
+    assert_eq!(trace.bands.as_ref().expect("bands")[feature].dim(), (family.rows, 0));
+
+    let dense = dense_path(&program, feature);
+    assert!(dense.gathered_tokens(feature, &family).is_none());
+    let reference = dense.execute(&family, true).expect("dense banded");
+    assert_eq!(reference.values[feature].dim(), (family.rows, VOCAB));
+    for node in (0..program.nodes.len()).filter(|n| *n != feature) {
+        assert_eq!(trace.values[node], reference.values[node], "node {node}");
+    }
+    let output = trace.band(program.output).expect("band");
+    assert!(output.iter().all(|r| r.is_finite()));
+    // Unbanded, both paths are the same arithmetic.
+    let plain = program.execute(&family, false).expect("plain");
+    assert_eq!(plain.values[program.output], reference.values[program.output]);
+
+    // Coding: the diagonal is shorter than the dense gain, and the message decodes to it.
+    for &g in &gains {
+        let (structure, reals) = program.operators[g].code_bits().expect("bits");
+        let (dense_structure, dense_reals) = dense.operators[g].code_bits().expect("dense bits");
+        assert_eq!(reals, dense_reals, "the same reals on the same lattice");
+        assert!(structure < dense_structure, "{structure} against {dense_structure}");
+    }
+    let message = program.encode().expect("encodes");
+    assert_eq!(message.len_bits(), program.code_bits().expect("bits"));
+    let decoded = OperatorProgram::decode(&message, &program.declarations).expect("decodes");
+    for (a, b) in decoded.operators.iter().zip(&program.operators) {
+        assert_eq!(a.body, b.body);
+    }
+
+    // Derivatives: a gain's tangent as its diagonal row, and the embedding's tangent read by the
+    // gather, against the dense path's matrix tangents.
+    let gain = gains[0];
+    let width = program.operators[gain].rows.width();
+    let row = Array2::from_shape_fn((1, width), |(_, c)| noise(4000 + c));
+    let embedding = program.nodes.iter().find_map(|n| match n {
+        Node::Affine { terms, .. } if terms.iter().any(|(a, _)| *a == feature) => Some(terms[0].1),
+        _ => None,
+    }).expect("the embedding term");
+    let shape = program.operators[embedding].matrix().dim();
+    let de = Array2::from_shape_fn(shape, |(i, j)| noise(5000 + i * shape.1 + j));
+    let structural = jvp(&program, &family, &plain, &[(gain, row.clone()), (embedding, de.clone())].into_iter().collect()).expect("jvp");
+    let full = jvp(&dense, &family, &reference, &[(gain, Array2::from_diag(&row.row(0))), (embedding, de)].into_iter().collect()).expect("dense jvp");
+    let scale = full.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    let worst = structural.iter().zip(&full).fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+    assert!(worst <= 1e-12 * scale, "tangents differ by {worst:e} at scale {scale:e}");
+
+    // Execution from a base trace: a gain moved to a coarser lattice, propagated incrementally.
+    let mut coarse = program.clone();
+    let OperatorBody::Diagonal { values, .. } = &program.operators[gain].body else { unreachable!() };
+    let precision = super::precision::DeclaredPrecision::new(4).expect("precision");
+    coarse.operators[gain] = std::sync::Arc::new(
+        Operator::diag("coarse", program.operators[gain].rows.clone(), values.clone(), precision, Default::default()).expect("diag"),
+    );
+    let incremental = coarse.execute_incremental(&family, &program, &plain).expect("incremental");
+    let again = coarse.execute(&family, false).expect("full");
+    let worst = incremental.iter().zip(&again.values[coarse.output]).fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+    assert!(worst <= 1e-9, "incremental and full execution differ by {worst:e}");
+}
+
+/// A Hugging Face directory whose `config.json` is a small Llama's with `extra` merged in.
+fn hugging_face_config(name: &str, extra: serde_json::Value) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("gam-mpd-hf-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let mut config = serde_json::json!({
+        "model_type": "llama", "hidden_act": "silu", "hidden_size": 8, "num_attention_heads": 2, "num_key_value_heads": 1,
+        "intermediate_size": 12, "num_hidden_layers": 1, "rope_theta": 10000.0, "rms_norm_eps": 1e-6,
+    });
+    if let (Some(base), serde_json::Value::Object(more)) = (config.as_object_mut(), extra) {
+        base.extend(more);
+    }
+    std::fs::write(dir.join("config.json"), config.to_string()).expect("config");
+    dir
+}
+
+#[test]
+fn the_importer_refuses_options_it_does_not_compute() {
+    let refused = |name: &str, extra: serde_json::Value, expected: &str| {
+        let dir = hugging_face_config(name, extra);
+        let error = match hugging_face_language_model(&dir, 0..1) {
+            Ok(_) => panic!("{name}: imported"),
+            Err(error) => error,
+        };
+        std::fs::remove_dir_all(&dir).expect("removed");
+        assert!(error.contains(expected), "{name}: {error}");
+    };
+    refused("rope", serde_json::json!({"rope_scaling": {"rope_type": "llama3", "factor": 32.0}}), "rope_scaling");
+    refused("linear", serde_json::json!({"rope_scaling": {"type": "linear", "factor": 2.0}}), "rope_scaling");
+    refused("window", serde_json::json!({"use_sliding_window": true, "sliding_window": 4}), "sliding");
+    refused("mistral", serde_json::json!({"sliding_window": 4}), "sliding");
+    refused("layers", serde_json::json!({"layer_types": ["sliding_attention"]}), "sliding");
+    refused("partial", serde_json::json!({"partial_rotary_factor": 0.5}), "partial_rotary_factor");
+    // A sharded checkpoint: its index names shards the importer does not read.
+    let dir = hugging_face_config("sharded", serde_json::json!({}));
+    std::fs::write(dir.join("model.safetensors.index.json"), "{\"weight_map\": {}}").expect("index");
+    let error = hugging_face_language_model(&dir, 0..1).err().expect("refused");
+    std::fs::remove_dir_all(&dir).expect("removed");
+    assert!(error.contains("sharded"), "{error}");
+    // A window that is declared and switched off, as Qwen2 writes it, is the full attention.
+    let dir = hugging_face_config("off", serde_json::json!({"use_sliding_window": false, "sliding_window": 4, "rope_scaling": null}));
+    let error = hugging_face_language_model(&dir, 0..1).err().expect("no weights");
+    std::fs::remove_dir_all(&dir).expect("removed");
+    assert!(!error.contains("sliding") && !error.contains("rope"), "{error}");
 }

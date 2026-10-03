@@ -235,14 +235,14 @@ fn describe(program: &OperatorProgram, p: usize) -> serde_json::Value {
         .iter()
         .map(|c| {
             json!({
-                "name": c.name, "reads": c.reads, "writes": c.writes, "laws": c.laws, "uses": c.uses,
-                "reals": c.reals, "bits": c.bits, "sources": c.sources, "unresolved": c.unresolved,
+                "name": c.name, "reads": c.reads, "writes": c.writes, "applied_by": c.applied_by, "uses": c.uses,
+                "reals": c.reals, "bits": c.bits, "sources": c.sources, "native": c.native_unchanged,
             })
         })
         .collect();
     json!({
         "bases": bases, "components": operators, "nodes": program.nodes.len(), "reals": program.real_count(),
-        "unresolved_bits_fraction": view.unresolved_fraction(),
+        "unchanged_native_bits": view.unchanged_native_bits,
     })
 }
 
@@ -669,17 +669,6 @@ fn main() -> Result<(), String> {
                 "structure_bits": c.structure_bits, "rest_bits": c.rest_bits, "description": c.description,
             })).collect::<Vec<_>>(),
             "knee": result.knee().map(|c| json!({"structure_bits": c.structure_bits, "rest_bits": c.rest_bits, "description": c.description})),
-            "identification": match gam_mpd::identify::identify(&model, &contract, &result) {
-                Ok(id) => json!({
-                    "identified": id.identified,
-                    "gauge": id.gauge,
-                    "alternatives": id.alternatives.iter().map(|a| json!({
-                        "description": a.description, "structure_bits": a.structure_bits, "total": a.total,
-                        "relation": a.relation.to_string(),
-                    })).collect::<Vec<_>>(),
-                }),
-                Err(error) => json!({"error": error.to_string()}),
-            },
             "stop": format!("{:?}", result.stop),
             "seconds": started.elapsed().as_secs_f64(),
         }));

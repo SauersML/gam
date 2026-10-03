@@ -22,12 +22,12 @@
 //! * **Unresolved.** A lower and an upper bound that have not met, the gap
 //!   between them, and which side a witness attains.
 //!
-//! A result never returns a stronger status than it proved. Every variant carries
-//! a [`Validated`] field that only this module can build, so each status passes
-//! through a constructor. The constructors refuse non-finite values, negative
-//! numerical or standard error, an empty exhaustive family, an inverted interval,
-//! a witness for an underived side, and a counterexample that roundoff could
-//! explain.
+//! Every variant carries a [`Validated`] field that only this module can build, so
+//! each status passes through a constructor. The constructors refuse non-finite
+//! values, negative numerical or standard error, an empty exhaustive family, an
+//! inverted interval, a witness for an underived side, and a counterexample that
+//! roundoff could explain. They check that a status is well formed; they cannot
+//! check that the caller's computation supports it.
 
 use std::cmp::Ordering;
 use std::fmt;

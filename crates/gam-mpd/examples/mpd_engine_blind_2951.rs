@@ -6,7 +6,7 @@
 //! reads transformers, residual MLPs and RNNs). The contract is the export's samples at its declared
 //! readouts. No tolerance is declared: each program is chosen by its two-part code, over a ladder of
 //! observations per sample `n = 10⁶, 10⁵, …, 1`, each search starting from the previous (larger-n)
-//! rung's program, so the report is the frontier of program bits against the behaviour explained.
+//! rung's program, so the report is the frontier of program bits against observations.
 //!
 //! Written to `OUT_DIR`: `report.json` (per rung: program bits, data bits, maximal row KL, argmax
 //! disagreements, population bounds for a sampled family, and the component view) and, per rung,
@@ -76,6 +76,9 @@ fn program_json(program: &OperatorProgram) -> Value {
                 OperatorBody::LowRank { left, right, precision } => json!({
                     "kind": "LowRank", "fraction_bits": precision.fraction_bits(), "left": matrix(left), "right": matrix(right),
                 }),
+                OperatorBody::Diagonal { values, precision } => json!({
+                    "kind": "Diagonal", "fraction_bits": precision.fraction_bits(), "values": values.to_vec(),
+                }),
             };
             json!({
                 "name": op.name, "rows": interface_json(&op.rows), "cols": interface_json(&op.cols), "body": body,
@@ -109,8 +112,8 @@ fn main() -> Result<(), String> {
     let mut start = model.clone();
     let mut frontier = Vec::new();
     // Descending: the search only removes and coarsens, so each rung starts from the program of
-    // the rung with more behaviour (an ascending ladder would start n = 10 from n = 1's program,
-    // which explains almost nothing and cannot regrow).
+    // the rung with more observations (an ascending ladder would start n = 10 from n = 1's
+    // program, which has already dropped what larger n keeps, and cannot regrow it).
     for exponent in (0..=6u32).rev() {
         let n = 10u64.pow(exponent);
         let mut contract = imported.contract.clone();
@@ -152,26 +155,15 @@ fn main() -> Result<(), String> {
                 "units": p.units, "disagreeing": p.disagreeing,
                 "fixed_program_upper": p.fixed_program_upper, "selected_program_upper": p.selected_program_upper,
             })),
-            "unresolved_bits_fraction": program_view.unresolved_fraction(),
+            "unchanged_native_bits": program_view.unchanged_native_bits,
             "components": program_view.components.iter().filter(|c| c.bits > 0).map(|c| json!({
-                "name": c.name, "reads": c.reads, "writes": c.writes, "laws": c.laws, "uses": c.uses,
-                "reals": c.reals, "bits": c.bits, "sources": c.sources, "unresolved": c.unresolved,
+                "name": c.name, "reads": c.reads, "writes": c.writes, "applied_by": c.applied_by, "uses": c.uses,
+                "reals": c.reals, "bits": c.bits, "sources": c.sources, "native": c.native_unchanged,
             })).collect::<Vec<_>>(),
             "curve": result.curve.iter().map(|c| json!({
                 "structure_bits": c.structure_bits, "rest_bits": c.rest_bits, "description": c.description,
             })).collect::<Vec<_>>(),
             "knee": result.knee().map(|c| json!({"structure_bits": c.structure_bits, "rest_bits": c.rest_bits, "description": c.description})),
-            "identification": match gam_mpd::identify::identify(model, &contract, &result) {
-                Ok(id) => json!({
-                    "identified": id.identified,
-                    "gauge": id.gauge,
-                    "alternatives": id.alternatives.iter().map(|a| json!({
-                        "description": a.description, "structure_bits": a.structure_bits, "total": a.total,
-                        "relation": a.relation.to_string(),
-                    })).collect::<Vec<_>>(),
-                }),
-                Err(error) => json!({"error": error.to_string()}),
-            },
             "stop": format!("{:?}", result.stop),
             "seconds": started.elapsed().as_secs_f64(),
         }));

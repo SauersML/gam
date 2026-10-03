@@ -4,7 +4,7 @@
 //! gains on declared parameters stay symbolic, and a resource bound is reported as not saturated.
 
 use std::sync::Arc;
-use crate::egraph::{SaturationStop, canonical_units, normalize, saturate};
+use crate::egraph::{SaturationStop, Term, canonical_units, normalize, saturate};
 use crate::operator_program::{
     Coefficient, Declarations, FamilyInputs, Interface, Law, Node, Operator, OperatorProgram, Provenance, Scale, Slot, SlotValues,
 };
@@ -300,4 +300,52 @@ fn the_unit_gauge_is_canonical_under_rescaling_shuffling_and_duplication() {
         assert!((1.0..2.0).contains(&scale), "a balanced unit's bias (its read row's norm without one) is in [1, 2): {scale}");
     }
     assert_eq!(unit_rows.nrows(), hidden, "the duplicate merged");
+}
+
+/// `B A` with `A = 1 + 2⁻²⁷`, `B = 1 − 2⁻²⁷` is `1 − 2⁻⁵⁴`: its banded leaf holds `1` yet is not the
+/// identity, so overlapping enclosures must not merge it with the identity leaf. The pair is kept
+/// outside the congruence with a residual bound that covers the true difference `2⁻⁵⁴`.
+#[test]
+fn an_enclosure_holding_the_identity_is_not_the_identity() {
+    let x = native(1);
+    let epsilon = (-27.0_f64).exp2();
+    let one = |name: &str, value: f64| {
+        Operator::dense(name, x.clone(), x.clone(), Array2::from_elem((1, 1), value), lattice(27), Provenance::native(name))
+            .expect("a dense operator")
+    };
+    let program = OperatorProgram {
+        declarations: raw_declarations(&[1]),
+        bases: Vec::new(),
+        rules: Vec::new(),
+        operators: [one("A", 1.0 + epsilon), one("B", 1.0 - epsilon), one("I", 1.0)].into_iter().map(Arc::new).collect(),
+        nodes: vec![
+            Node::Raw { slot: 0 },
+            Node::Affine { terms: vec![(0, 0)], bias: None },
+            Node::Affine { terms: vec![(1, 1)], bias: None },
+            Node::Affine { terms: vec![(0, 2)], bias: None },
+            Node::Affine { terms: vec![(2, 2), (3, 2)], bias: None },
+        ],
+        output: 4,
+    };
+    let saturation = saturate(&program, test_governor()).expect("saturates");
+    let egraph = &saturation.egraph;
+    let leaves = &egraph.analysis.leaves;
+    let product = leaves
+        .iter()
+        .position(|leaf| leaf.operator.name == "B·A")
+        .expect("the composition forms the product B A");
+    assert!(!leaves[product].is_exact(), "1 − 2⁻⁵⁴ is not a binary64 number, so the product is banded");
+    assert!(leaves[product].center[[0, 0]] - leaves[product].radius[[0, 0]] <= 1.0, "its enclosure holds the identity's 1");
+    let class = |leaf: usize| egraph.lookup(Term::Leaf(leaf as u32)).map(|id| egraph.find(id)).expect("a leaf class");
+    let (product_class, identity_class) = (class(product), class(2));
+    assert_ne!(product_class, identity_class, "B A merged with the identity on overlapping enclosures alone");
+    let near = saturation
+        .near
+        .iter()
+        .find(|n| {
+            let pair = (egraph.find(n.left), egraph.find(n.right));
+            pair == (product_class, identity_class) || pair == (identity_class, product_class)
+        })
+        .expect("the near pair is reported");
+    assert!(near.residual >= (-54.0_f64).exp2(), "{} must bound the true difference 2⁻⁵⁴", near.residual);
 }

@@ -75,19 +75,24 @@ pub enum Pattern {
     Argument { a: Id, b: Id },
     /// An operator hole: leaf `a` in the body, leaf `b` at the call.
     Operator { a: LeafId, b: LeafId },
-    /// One node kind with generalized children; `a` and `b` are the two e-nodes.
-    Node { a: Term, b: Term, children: Vec<Pattern> },
+    /// One node kind with generalized children; `a` and `b` are the two e-nodes, and `chosen`
+    /// counts the node pairs of this subtree that are both the extraction's own choices.
+    Node { a: Term, b: Term, children: Vec<Pattern>, chosen: usize },
 }
 
 impl Pattern {
-    /// `(operator holes, nodes)`: the order generalizations are preferred in.
-    fn score(&self) -> (usize, usize) {
+    /// `(operator holes, extracted node pairs, nodes)`: the order generalizations are preferred in.
+    /// A rule is priced on the extracted program with its pattern's nodes pinned, so between two
+    /// generalizations with as many holes, the one through the nodes the extraction chose pins the
+    /// shorter program.
+    fn score(&self) -> (usize, usize, usize) {
         match self {
-            Self::Operator { a, b } => (usize::from(a != b), 1),
-            Self::Node { children, .. } => {
-                children.iter().map(Pattern::score).fold((0, 1), |(h, n), (ch, cn)| (h + ch, n + cn))
+            Self::Operator { a, b } => (usize::from(a != b), 0, 1),
+            Self::Node { children, chosen, .. } => {
+                let (holes, nodes) = children.iter().map(Pattern::score).fold((0, 1), |(h, n), (ch, _, cn)| (h + ch, n + cn));
+                (holes, *chosen, nodes)
             }
-            _ => (0, 0),
+            _ => (0, 0, 0),
         }
     }
 
@@ -112,8 +117,13 @@ impl Pattern {
             Term::Apply(_) | Term::Constant(_) => {
                 let (operator, argument) = (&children[0], children.get(1));
                 if let Self::Operator { a: la, b: lb } = operator {
+                    // The body's input: an argument hole, or a value both sides read (the rule is
+                    // still applied to it, and a call may read it through a change of basis).
                     let cols = match argument {
                         Some(Self::Argument { a: x, .. }) => Role::Boundary(value_interface(egraph, *x)),
+                        Some(Self::Shared(x)) if matches!(egraph[*x].data, ClassData::Value(_)) => {
+                            Role::Boundary(value_interface(egraph, *x))
+                        }
                         _ => Role::Interior,
                     };
                     let rows = if boundary {
@@ -199,7 +209,7 @@ impl Pattern {
 
     /// The e-node each pattern class takes in the body (`side = false`) or the call (`true`).
     fn pins(&self, egraph: &super::egraph::ProgramGraph, class: Id, side: bool, out: &mut HashMap<Id, Term>) {
-        let Self::Node { a, b, children } = self else { return };
+        let Self::Node { a, b, children, .. } = self else { return };
         let term = if side { b } else { a };
         out.insert(egraph.find(class), term.clone());
         for (child, id) in children.iter().zip(term.children()) {
@@ -238,6 +248,8 @@ struct HoleSite {
 /// The least general generalization over the e-graph, memoized per class pair.
 struct Generalizer<'a> {
     saturation: &'a Saturation,
+    /// The extraction's node per class.
+    choices: &'a Choices,
     memo: HashMap<(Id, Id), Option<Pattern>>,
     active: BTreeSet<(Id, Id)>,
 }
@@ -294,7 +306,14 @@ impl Generalizer<'_> {
                         .collect::<Option<Vec<Pattern>>>(),
                 };
                 let Some(children) = children else { continue };
-                let candidate = Pattern::Node { a: na.clone(), b: nb.clone(), children };
+                let extracted = |class: Id, node: &Term| {
+                    self.choices.get(&class).is_some_and(|(_, term)| {
+                        term.clone().map_children(|c| egraph.find(c)) == node.clone().map_children(|c| egraph.find(c))
+                    })
+                };
+                let below: usize = children.iter().map(|child| child.score().1).sum();
+                let chosen = below + usize::from(extracted(a, na) && extracted(b, nb));
+                let candidate = Pattern::Node { a: na.clone(), b: nb.clone(), children, chosen };
                 if best.as_ref().is_none_or(|current| candidate.score() > current.score()) {
                     best = Some(candidate);
                 }
@@ -333,7 +352,9 @@ impl Generalizer<'_> {
 
 fn lattice_half_step(operator: &super::operator_program::Operator) -> f64 {
     match &operator.body {
-        OperatorBody::Dense { precision, .. } | OperatorBody::LowRank { precision, .. } => precision.worst_case_error(),
+        OperatorBody::Dense { precision, .. } | OperatorBody::LowRank { precision, .. } | OperatorBody::Diagonal { precision, .. } => {
+            precision.worst_case_error()
+        }
         OperatorBody::Identity => 0.0,
     }
 }
@@ -1105,7 +1126,7 @@ pub fn discover_rules(normalization: &Normalization) -> Result<RuleLibrary, Egra
     let choices = &normalization.extraction.choices;
     let bits_before = normalization.extraction.bits;
     let classes = extracted_classes(saturation, choices);
-    let mut generalizer = Generalizer { saturation, memo: HashMap::new(), active: BTreeSet::new() };
+    let mut generalizer = Generalizer { saturation, choices, memo: HashMap::new(), active: BTreeSet::new() };
     // Candidate pairs grouped by body and pattern.
     let mut groups: BTreeMap<(Id, String), Vec<(Id, Pattern, Vec<BindingFamily>)>> = BTreeMap::new();
     for (i, &a) in classes.iter().enumerate() {
@@ -1115,6 +1136,7 @@ pub fn discover_rules(normalization: &Normalization) -> Result<RuleLibrary, Egra
                 continue;
             }
             let families = admissible_families(saturation, &pattern);
+            if pattern.score().0 > 0 { eprintln!("DBG pair {a:?} {b:?} score={:?} fams={} sk={}", pattern.score(), families.len(), pattern.skeleton()); }
             if families.is_empty() {
                 continue;
             }
@@ -1166,6 +1188,7 @@ pub fn discover_rules(normalization: &Normalization) -> Result<RuleLibrary, Egra
             continue;
         }
         let header = rule_header_bits(holes.len(), sites.len(), saturation)?;
+        eprintln!("DBG cand {skeleton} replaced={replaced} header={header} roles={:?} fam={:?}", roles.iter().map(|(r,c)| (matches!(r, Role::Interior), matches!(c, Role::Interior))).collect::<Vec<_>>(), sites.iter().map(|s| (s.binding.family, s.binding.bits, s.binding.residual_bits)).collect::<Vec<_>>());
         candidates.push(Rule { skeleton, body, holes, roles, calls: sites, saving: replaced - header as i64 });
     }
     candidates.sort_by(|x, y| y.saving.cmp(&x.saving).then(x.body.cmp(&y.body)));
@@ -1183,7 +1206,8 @@ pub fn discover_rules(normalization: &Normalization) -> Result<RuleLibrary, Egra
         }
         let mut trial = accepted.clone();
         trial.push(rule.clone());
-        let Some(priced) = price(normalization, &trial)? else { continue };
+        let Some(priced) = price(normalization, &trial)? else { eprintln!("DBG price none"); continue };
+        eprintln!("DBG priced {} vs {}", priced.bits, bits_after);
         if priced.bits < bits_after {
             claimed.extend(touched);
             accepted = trial;

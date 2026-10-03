@@ -18,7 +18,7 @@
 
 use super::engine::{EngineError, Edit, Exactness, Primitive, Proposal, SearchContext};
 use super::fit::ProposalKind;
-use super::operator_program::{FamilyInputs, Node, OperatorBody, OperatorProgram, ProgramError, Scale, Trace};
+use super::operator_program::{FamilyInputs, Node, Operator, OperatorBody, OperatorProgram, ProgramError, Scale, Trace};
 use super::precision::DeclaredPrecision;
 use gam_gpu::banded::Layout;
 use ndarray::{Array2, Axis, s};
@@ -29,7 +29,8 @@ fn refuse(message: String) -> ProgramError {
 }
 
 /// The output tangent of `program` on `inputs` when each operator in `tangents` moves along its
-/// entry (a matrix of the operator's shape), from the base `trace` (unbanded values).
+/// entry (a matrix of the operator's shape, or a diagonal operator's diagonal as one row), from
+/// the base `trace` (unbanded values).
 pub fn jvp(
     program: &OperatorProgram,
     inputs: &FamilyInputs,
@@ -70,12 +71,16 @@ pub fn jvp_seeded(
                     None => out = Some(term),
                 };
                 for (argument, operator) in terms {
-                    let a = program.operators[*operator].matrix_cow();
                     if let Some(dx) = tangent_of(&dv, *argument) {
-                        add(dx.dot(&a.t()));
+                        add(program.operators[*operator].apply(&dx));
                     }
                     if let Some(da) = tangents.get(operator) {
-                        add(value(*argument).dot(&da.t()));
+                        add(tangent_product(
+                            &program.operators[*operator],
+                            da,
+                            value(*argument),
+                            program.gathered_tokens(*argument, inputs),
+                        ));
                     }
                 }
                 if let Some(db) = bias.and_then(|b| tangents.get(&b)) {
@@ -220,13 +225,20 @@ pub fn jvp_seeded(
                 out
             }),
             Node::Transposed { input, operator } => {
-                let a = program.operators[*operator].matrix_cow();
+                let op = &program.operators[*operator];
                 let mut out: Option<Array2<f64>> = None;
                 if let Some(dx) = tangent_of(&dv, *input) {
-                    out = Some(dx.dot(a.as_ref()));
+                    // `x A`; a diagonal is its own transpose.
+                    out = Some(match op.diagonal() {
+                        Some(d) => dx * &d,
+                        None => dx.dot(op.matrix_cow().as_ref()),
+                    });
                 }
                 if let Some(da) = tangents.get(operator) {
-                    let term = value(*input).dot(da);
+                    let term = match &op.body {
+                        OperatorBody::Diagonal { .. } if da.dim() == (1, op.rows.width()) => value(*input) * &da.row(0),
+                        _ => value(*input).dot(da),
+                    };
                     out = Some(match out {
                         Some(o) => o + term,
                         None => term,
@@ -260,6 +272,30 @@ pub fn jvp_seeded(
 }
 
 type Pair<'a> = (&'a Array2<f64>, &'a Array2<f64>, &'a Array2<f64>);
+
+/// `x dAᵀ` for an affine term on operator `op` along its tangent `da`: a matrix of the operator's
+/// shape or, for a diagonal operator, its diagonal as one row (`1 × width`). A gathered feature
+/// argument (`tokens`) reads the tangent's column at each row's token.
+fn tangent_product(op: &Operator, da: &Array2<f64>, x: &Array2<f64>, tokens: Option<&[u32]>) -> Array2<f64> {
+    let width = op.rows.width();
+    let diagonal = matches!(op.body, OperatorBody::Diagonal { .. }) && da.dim() == (1, width);
+    match tokens {
+        Some(tokens) => {
+            let mut out = Array2::<f64>::zeros((tokens.len(), width));
+            for (mut row, &token) in out.outer_iter_mut().zip(tokens) {
+                let t = token as usize;
+                if diagonal {
+                    row[t] = da[[0, t]];
+                } else {
+                    row.assign(&da.column(t));
+                }
+            }
+            out
+        }
+        None if diagonal => x * &da.row(0),
+        None => x.dot(&da.t()),
+    }
+}
 
 /// The tangent of causal rotary attention (see `operator_program`'s attend) along query, key and
 /// value tangents: rotation is linear, so tangents rotate like values; the softmax and the read
@@ -548,18 +584,25 @@ fn attend_cotangent(
 /// is reproducible.
 fn probe(program: &OperatorProgram, operator: usize, seed: u64) -> Option<Array2<f64>> {
     let op = &program.operators[operator];
-    let OperatorBody::Dense { present, .. } = &op.body else { return None };
     let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(operator as u64 + 1);
+    let mut sign = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        if state & 1 == 1 { 1.0 } else { -1.0 }
+    };
+    if let OperatorBody::Diagonal { values, .. } = &op.body {
+        // A diagonal's probe is its diagonal, one row.
+        return Some(Array2::from_shape_fn((1, values.len()), |_| sign()));
+    }
+    let OperatorBody::Dense { present, .. } = &op.body else { return None };
     let mut out = Array2::<f64>::zeros((op.rows.width(), op.cols.width()));
     for ((r, c), keep) in present.indexed_iter() {
         if !keep {
             continue;
         }
         for value in out.slice_mut(s![op.rows.range(r), op.cols.range(c)]).iter_mut() {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            *value = if state & 1 == 1 { 1.0 } else { -1.0 };
+            *value = sign();
         }
     }
     Some(out)
@@ -614,7 +657,7 @@ impl Primitive for CurvaturePrecision {
         let program = context.program;
         let mut out = Vec::new();
         for (index, op) in program.operators.iter().enumerate() {
-            let OperatorBody::Dense { precision, .. } = &op.body else { continue };
+            let (OperatorBody::Dense { precision, .. } | OperatorBody::Diagonal { precision, .. }) = &op.body else { continue };
             let m = op.real_count();
             if m == 0 {
                 continue;

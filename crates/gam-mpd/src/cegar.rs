@@ -1,7 +1,7 @@
 //! Counterexample-guided refinement of a program decomposition (#2951).
 //!
-//! The two-part code scores a program on the behaviour it is shown. This module finds the
-//! behaviour the program explains worst and shows it: a verifier searches the declared input
+//! The two-part code scores a program on the behaviour it is shown. This module finds
+//! inputs where the program fits worst and adds them: a verifier searches the declared input
 //! domain for inputs where `KL(model ‖ program)` is largest, and each input it certifies as worse
 //! than every row already in the data becomes one more row of the data, observed like every other
 //! row. The fit then runs again on the larger family. Nothing is labelled, weighted or trained

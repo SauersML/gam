@@ -1,20 +1,21 @@
 //! Refusal and over-refusal pieces of a chat model, from a behaviour-scoped decomposition (#2951).
 //!
-//! `mpd_refusal_pieces_2951 validate MODEL_DIR DIR`
-//! `mpd_refusal_pieces_2951 fit MODEL_DIR DATA_DIR OUT_DIR LAST OBSERVATIONS STATS BATCH GPU HEAD_SOCKET [PROMPTS]`
+//! `mpd_refusal_pieces_2951 validate MODEL_DIR DIR {program|tail}`
+//! `mpd_refusal_pieces_2951 fit MODEL_DIR DATA_DIR OUT_DIR LAST OBSERVATIONS STATS BATCH GPU [PROMPTS] [TAIL_CACHE_GIB]`
 //!
 //! `MODEL_DIR` is a Hugging Face Qwen2/Qwen3/Llama checkpoint (`gam_mpd::import::
 //! hugging_face_language_model`).
 //!
 //! `validate` checks the import: `DIR/meta.json` (`ids`, `first`, `rows`, `scored`, `vocab`),
 //! `DIR/resid.f64` (the stream entering `first`, `rows × d`) and `DIR/logits.f64` (the reference
-//! logits of the last `scored` rows); it prints the largest logit difference and KL.
+//! logits of the last `scored` rows); it prints the largest logit difference and KL of the imported
+//! program (`program`) or of the decoder tail (`tail`, `gam_mpd::tail::DecoderTail`).
 //!
 //! `fit` decomposes blocks `FIRST..LAST` against a behaviour, holding only those blocks in float64:
 //! the blocks before run elsewhere (their output, the stream entering `FIRST`, is the input), and
-//! the blocks from `LAST` on are a head server on the Unix socket `HEAD_SOCKET`
-//! (`bench/mpd_refusal_head_2951.py MODEL_DIR LAST HEAD_SOCKET`; `gam_mpd::masked::Head`), a process
-//! of its own with its own memory reservation. `DATA_DIR/prompts.json`
+//! the blocks from `LAST` on and the readout are the model's tail in float64
+//! (`gam_mpd::tail::DecoderTail`, a `gam_mpd::masked::Head`) on the memory-mapped checkpoint, its
+//! widened maps kept up to `TAIL_CACHE_GIB` (default 1). `DATA_DIR/prompts.json`
 //! holds `first`, `d`, `refusal_tokens` (the first tokens of the model's refusals) and per prompt its
 //! `ids` (chat-formatted prompt and the first reply tokens), `scored_from` (its rows from there on are
 //! the behaviour's: the last user token, the template tokens after it and the reply tokens) and
@@ -50,12 +51,12 @@ use gam_mpd::masked::{
 };
 use gam_mpd::operator_program::{FamilyInputs, SequenceLayout, SlotValues};
 use gam_mpd::pieces::{Narrow, fisher_svd_narrow};
+use gam_mpd::tail::DecoderTail;
 use ndarray::{Array1, Array2, Axis, concatenate, s};
 use serde_json::{Value, json};
-use std::io::{BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 fn read_le<const N: usize, T>(path: &Path, convert: fn([u8; N]) -> T) -> Result<Vec<T>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -87,73 +88,6 @@ fn create(path: &Path) -> Result<std::fs::File, String> {
 
 fn layers_of(model: &Path) -> Result<usize, String> {
     integer(&read_json(&model.join("config.json"))?, "num_hidden_layers")
-}
-
-/// The blocks after the window, served on a Unix socket (protocol in
-/// `bench/mpd_refusal_head_2951.py`): logits at the scored rows in fp32, and their pullback.
-struct SocketHead {
-    io: Mutex<(UnixStream, BufReader<UnixStream>)>,
-    d: usize,
-    vocab: usize,
-}
-
-impl SocketHead {
-    fn connect(path: &Path, d: usize, vocab: usize) -> Result<Self, String> {
-        let stream = UnixStream::connect(path).map_err(|e| format!("head {}: {e}", path.display()))?;
-        let reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
-        Ok(Self { io: Mutex::new((stream, reader)), d, vocab })
-    }
-
-    fn request(&self, op: u8, inputs: &FamilyInputs, output: &Array2<f64>, rows: &[bool], cotangent: Option<&Array2<f64>>) -> Result<Vec<f32>, String> {
-        let layout = inputs.layout.as_ref().ok_or("the head needs a sequence layout")?;
-        let mut message = vec![op];
-        message.extend_from_slice(&(output.nrows() as u32).to_le_bytes());
-        layout.sequence.iter().for_each(|v| message.extend_from_slice(&v.to_le_bytes()));
-        layout.position.iter().for_each(|v| message.extend_from_slice(&v.to_le_bytes()));
-        message.extend(rows.iter().map(|r| u8::from(*r)));
-        output.iter().for_each(|v| message.extend_from_slice(&(*v as f32).to_le_bytes()));
-        if let Some(cotangent) = cotangent {
-            for (r, row) in cotangent.outer_iter().enumerate() {
-                if rows[r] {
-                    row.iter().for_each(|v| message.extend_from_slice(&(*v as f32).to_le_bytes()));
-                }
-            }
-        }
-        let expected = if op == 1 { rows.iter().filter(|r| **r).count() * self.vocab } else { output.nrows() * self.d };
-        let mut io = self.io.lock().map_err(|_| "head poisoned")?;
-        io.0.write_all(&message).map_err(|e| format!("head write: {e}"))?;
-        io.0.flush().map_err(|e| format!("head flush: {e}"))?;
-        let mut bytes = vec![0u8; expected * 4];
-        io.1.read_exact(&mut bytes).map_err(|e| format!("head read: {e}"))?;
-        Ok(bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
-    }
-}
-
-impl Head for SocketHead {
-    fn logits(&self, inputs: &FamilyInputs, output: &Array2<f64>, rows: &[bool]) -> Result<Array2<f64>, String> {
-        let values = self.request(1, inputs, output, rows, None)?;
-        let mut logits = Array2::<f64>::zeros((output.nrows(), self.vocab));
-        for (i, r) in (0..output.nrows()).filter(|r| rows[*r]).enumerate() {
-            logits.row_mut(r).iter_mut().zip(&values[i * self.vocab..(i + 1) * self.vocab]).for_each(|(l, v)| *l = f64::from(*v));
-        }
-        Ok(logits)
-    }
-
-    fn pullback(&self, inputs: &FamilyInputs, output: &Array2<f64>, rows: &[bool], cotangent: &Array2<f64>) -> Result<Array2<f64>, String> {
-        let values = self.request(2, inputs, output, rows, Some(cotangent))?;
-        Array2::from_shape_vec((output.nrows(), self.d), values.into_iter().map(f64::from).collect()).map_err(|e| e.to_string())
-    }
-}
-
-impl Drop for SocketHead {
-    fn drop(&mut self) {
-        // The server quits when asked.
-        if let Ok(mut io) = self.io.lock()
-            && let Err(error) = io.0.write_all(&[0])
-        {
-            log::warn!("head quit: {error}");
-        }
-    }
 }
 
 /// One prompt of the behaviour.
@@ -208,11 +142,10 @@ fn refusal_score(logits: ndarray::ArrayView1<'_, f64>, refusal: &[usize]) -> f64
     p.ln() - (1.0 - p).ln()
 }
 
-fn validate(model: &Path, dir: &Path) -> Result<(), String> {
+fn validate(model: &Path, dir: &Path, tail: bool) -> Result<(), String> {
     let meta = read_json(&dir.join("meta.json"))?;
     let (first, rows, scored, vocab) = (integer(&meta, "first")?, integer(&meta, "rows")?, integer(&meta, "scored")?, integer(&meta, "vocab")?);
-    let (program, record) = hugging_face_language_model(model, first..layers_of(model)?)?;
-    let d = integer(&record["config"], "d_model")?;
+    let d = integer(&read_json(&model.join("config.json"))?, "hidden_size")?;
     let resid = read_le::<8, f64>(&dir.join("resid.f64"), f64::from_le_bytes)?;
     let reference = Array2::from_shape_vec((scored, vocab), read_le::<8, f64>(&dir.join("logits.f64"), f64::from_le_bytes)?).map_err(|e| e.to_string())?;
     let inputs = FamilyInputs {
@@ -221,13 +154,21 @@ fn validate(model: &Path, dir: &Path) -> Result<(), String> {
         layout: Some(SequenceLayout { sequence: vec![0; rows], position: (0..rows as u32).collect() }),
     };
     let started = std::time::Instant::now();
-    let logits = program.execute(&inputs, false).map_err(|e| e.to_string())?.values[program.output].slice(s![rows - scored.., ..]).to_owned();
+    let all = if tail {
+        let rows_scored: Vec<bool> = (0..rows).map(|r| r >= rows - scored).collect();
+        let SlotValues::Raw(x) = &inputs.slots[0] else { return Err("raw input".to_string()) };
+        DecoderTail::new(model, first, 1 << 30)?.logits(&inputs, x, &rows_scored)?
+    } else {
+        let (program, _) = hugging_face_language_model(model, first..layers_of(model)?)?;
+        program.execute(&inputs, false).map_err(|e| e.to_string())?.values[program.output].clone()
+    };
+    let logits = all.slice(s![rows - scored.., ..]).to_owned();
     let largest = reference.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
     let difference = (&logits - &reference).iter().fold(0.0_f64, |m, x| m.max(x.abs()));
     let kls = kl(&Target::every_row(reference.clone()), &logits).0;
     let argmax = |a: ndarray::ArrayView1<'_, f64>| a.iter().enumerate().fold((0, f64::NEG_INFINITY), |b, (i, x)| if *x > b.1 { (i, *x) } else { b }).0;
     let report = json!({
-        "first": first, "rows": rows, "blocks": integer(&record["config"], "n_layers")? - first,
+        "first": first, "rows": rows, "blocks": layers_of(model)? - first, "evaluator": if tail { "tail" } else { "program" },
         "max_abs_logit_difference": difference, "largest_logit": largest,
         "max_kl_reference_to_engine": kls.iter().fold(0.0_f64, |m, x| m.max(*x)),
         "argmax_agree": (0..scored).all(|r| argmax(logits.row(r)) == argmax(reference.row(r))),
@@ -254,10 +195,11 @@ struct Settings {
     stats: usize,
     batch: usize,
     prompts: usize,
+    tail_cache: usize,
 }
 
-fn fit(model: &Path, data: &Path, out: &Path, settings: &Settings, head_socket: &Path) -> Result<(), String> {
-    let Settings { last, observations, stats, batch: batch_size, prompts: limit } = *settings;
+fn fit(model: &Path, data: &Path, out: &Path, settings: &Settings) -> Result<(), String> {
+    let Settings { last, observations, stats, batch: batch_size, prompts: limit, .. } = *settings;
     let meta = read_json(&data.join("prompts.json"))?;
     let (first, d) = (integer(&meta, "first")?, integer(&meta, "d")?);
     let refusal: Vec<usize> = meta["refusal_tokens"].as_array().ok_or("refusal_tokens")?.iter().filter_map(|v| v.as_u64().map(|v| v as usize)).collect();
@@ -279,9 +221,8 @@ fn fit(model: &Path, data: &Path, out: &Path, settings: &Settings, head_socket: 
     }
     std::fs::create_dir_all(out.join("library")).map_err(|e| e.to_string())?;
     let started = std::time::Instant::now();
-    let (program, record) = hugging_face_language_model(model, first..last)?;
-    let vocab = integer(&record["config"], "vocab")?;
-    let head: Arc<SocketHead> = Arc::new(SocketHead::connect(head_socket, d, vocab)?);
+    let (program, _) = hugging_face_language_model(model, first..last)?;
+    let head = Arc::new(DecoderTail::new(model, last, settings.tail_cache)?);
     let chosen: Vec<Site> = sites(&program).into_iter().filter(|s| layer_of(s).is_some_and(|l| (first..last).contains(&l))).collect();
     log::info!("imported blocks {first}..{last} ({:.0}s); {} sites", started.elapsed().as_secs_f64(), chosen.len());
     let batches: Vec<std::ops::Range<usize>> = (0..kept).step_by(batch_size).map(|s| s..(s + batch_size).min(kept)).collect();
@@ -497,17 +438,25 @@ fn fit(model: &Path, data: &Path, out: &Path, settings: &Settings, head_socket: 
 fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
-    let usage = "mpd_refusal_pieces_2951 {validate MODEL_DIR DIR | fit MODEL_DIR DATA_DIR OUT_DIR LAST OBSERVATIONS STATS BATCH GPU HEAD_SOCKET [PROMPTS]}";
+    let usage = "mpd_refusal_pieces_2951 {validate MODEL_DIR DIR {program|tail} | fit MODEL_DIR DATA_DIR OUT_DIR LAST OBSERVATIONS STATS BATCH GPU [PROMPTS] [TAIL_CACHE_GIB]}";
     let arg = |i: usize| args.get(i).ok_or_else(|| usage.to_string());
     match arg(1)?.as_str() {
-        "validate" => validate(&PathBuf::from(arg(2)?), &PathBuf::from(arg(3)?)),
+        "validate" => validate(&PathBuf::from(arg(2)?), &PathBuf::from(arg(3)?), arg(4)? == "tail"),
         "fit" => {
             let number = |i: usize| -> Result<f64, String> { arg(i)?.parse().map_err(|e| format!("{}: {e}", args[i])) };
             let gpu = arg(9)?;
             gam_gpu::configure_global_policy(gam_gpu::GpuPolicy::parse(gpu).ok_or_else(|| format!("GPU {gpu}: expected off, auto or required"))?);
-            let prompts = args.get(11).map_or(Ok(usize::MAX), |v| v.parse()).map_err(|e| format!("PROMPTS: {e}"))?;
-            let settings = Settings { last: number(5)? as usize, observations: number(6)?, stats: number(7)? as usize, batch: number(8)? as usize, prompts };
-            fit(&PathBuf::from(arg(2)?), &PathBuf::from(arg(3)?), &PathBuf::from(arg(4)?), &settings, &PathBuf::from(arg(10)?))
+            let prompts = args.get(10).map_or(Ok(usize::MAX), |v| v.parse()).map_err(|e| format!("PROMPTS: {e}"))?;
+            let gib: f64 = args.get(11).map_or(Ok(1.0), |v| v.parse()).map_err(|e| format!("TAIL_CACHE_GIB: {e}"))?;
+            let settings = Settings {
+                last: number(5)? as usize,
+                observations: number(6)?,
+                stats: number(7)? as usize,
+                batch: number(8)? as usize,
+                prompts,
+                tail_cache: (gib * f64::from(1u32 << 30)) as usize,
+            };
+            fit(&PathBuf::from(arg(2)?), &PathBuf::from(arg(3)?), &PathBuf::from(arg(4)?), &settings)
         }
         _ => Err(usage.to_string()),
     }

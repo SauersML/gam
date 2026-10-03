@@ -1,7 +1,7 @@
 //! Per-input pieces of a language model trained through its own masked forward, on streamed
 //! sequences (#2951).
 //!
-//! `mpd_pieces_masked_2951 EXPORT_DIR OUT.json OBSERVATIONS {wsvd|wsvd2|attribution|neurons|library:DIR} TRAIN EVAL [CONTEXT] [GPU] [SETS]`
+//! `mpd_pieces_masked_2951 EXPORT_DIR OUT.json OBSERVATIONS {wsvd|wsvd2|attribution|neurons|library:DIR} TRAIN EVAL [CONTEXT] [GPU] [SETS|-] [corner|box]`
 //!
 //! `EXPORT_DIR` is a language-model export (`gam_mpd::import::import_language_model`) whose first
 //! `TRAIN` token rows train the pieces and whose next `EVAL` rows evaluate them, `CONTEXT`
@@ -19,42 +19,53 @@
 //! site `DIR/{site}.v.f64` (pieces × d_in) and `DIR/{site}.u.f64` (pieces × d_out), raw float64,
 //! on the uncentred read with nothing beyond the pieces (a site without files stays native).
 //!
+//! The code is one total over the coded words, `Σ_words [Σ_{pieces on} bits(piece) + n KL/ln 2]`:
+//! each word pays for the weights that ran on it, every piece's description at the precision the
+//! KL needs (`gam_mpd::blocks::Generic`, in the measured statistics; `Coder::ran`). No counts are
+//! kept, no library is amortised, and everything on is not free: each point also carries the
+//! everything-on explanation (`all_on`) under the same code.
+//!
 //! `SETS` (with `library:DIR`) is a directory of given per-token sets for that library
 //! (`bench/vpd_2951/vpd_sets_export.py`: `indptr.i64`, `indices.i64` as CSR over positions,
 //! sequence after sequence in the export's order, pieces numbered site after site; `sites.txt`
 //! naming the sites and their pieces). Every eval sequence then starts its selection from its given
 //! sets (both halves of a split piece on where it was), and keeps them unless the selected sets
 //! code it in fewer bits; every training sequence starts from its current sets, its given ones at
-//! first. The context coder counts the current sets of every training sequence but the one being
-//! coded, plus the given sets of the sequences past `TRAIN + EVAL` (held out from both). Each eval
-//! point also carries the given sets' own point (`start`) under the same coder. No model
-//! statistics are measured.
+//! first. Each eval point also carries the given sets' own point (`start`) under the same code.
 //!
-//! With `TRAIN` 0 nothing is trained: the eval sequences are selected pass after pass, each pass
-//! with the counts of the sets the pass before selected, until a pass saves less than a bit per
-//! token; every pass is a full eval. With `SETS` there is one pass, coded by the held-out counts.
-//! A running point after each eval sequence goes to `OUT.progress.json`.
+//! `CLAIM` (`corner`, the default, or `box`) is what the explanation declares of its off
+//! subcomponents (`gam_mpd::masked::Claim`): under `box` each off gate may be anywhere in `[0, 1]`,
+//! the pieces are stepped on the KL expected over every off gate uniform
+//! (`gam_mpd::masked::box_excess`, in the running written Fishers), each eval point also carries
+//! that error (`kl_box`, `code_box`) beside the masks' own KL, and before training the predicted
+//! box KL of the first five training sequences is logged against the KL of sampled gates.
+//! Selection itself codes the masks' own KL under either claim; every point names its claim.
+//! Before anything runs, every piece's read direction is restricted to the span holding all but
+//! `1e-6` of its site's read variance on the measured sequences (`Masked::project_reads`).
+//!
+//! With `TRAIN` 0 nothing is trained: the eval sequences are selected once, a full eval. A running
+//! point after each eval sequence goes to `OUT.progress.json`.
 //!
 //! The training sequences stream one at a time: each starts from its current sets (on its first
 //! visit without `SETS`, the pieces whose own second-order KL bits in the global Fisher, on its
-//! clean forward, exceed their listing cost); its sets are selected exactly in the masked forward
-//! (`gam_mpd::masked::select`), coded by the current sets of every other training sequence, and kept
-//! only when they code it in fewer bits than its start; then the pieces take one exact-gradient
+//! clean forward, exceed their description bits); its sets are selected exactly in the masked
+//! forward (`gam_mpd::masked::select`) and kept only when they code it in fewer bits than its
+//! start; then the pieces take one exact-gradient
 //! step on it, preconditioned by the running read covariances and written Fishers of every sequence
 //! seen
 //! (`gam_mpd::masked::step_pieces`). Four times per pass the first four eval sequences, and at each
 //! pass's end all of them, are selected one at a time with the current costs, and their mean active
-//! pieces (L0), KL and bits per token in the
-//! per-token frontier's code (per site `ω(k + 1) + log₂ C(C, k)`) are appended to `OUT.json` as
-//! `{points: [{l0, bits, kl, …}]}`; a full eval also writes its selected sets as CSR
+//! pieces (L0), KL, description bits and code per token, and bits in the per-token frontier's code
+//! (per site `ω(k + 1) + log₂ C(C, k)`), are appended to `OUT.json` as
+//! `{points: [{l0, bits, kl, description_bits, code, …}]}`; a full eval also writes every piece's
+//! description bits (`OUT.pass{P}.costs.npy`, float64, pieces numbered site after site), its selected sets as CSR
 //! (`OUT.pass{P}.{indptr,indices,offsets}.npy`, pieces numbered site after site) and each eval
 //! token's KL (`OUT.pass{P}.kl.npy`, float64, rows in order) and whether its argmax is the model's
 //! (`OUT.pass{P}.agree.npy`, int64), the same for the starting sets (`OUT.pass{P}.start.{kl,agree}.npy`).
 //! Passes repeat until one saves less than a bit per token.
 //!
 //! After every training sequence (every pass when nothing trains) the run's state goes to the
-//! checkpoint `OUT.checkpoint/` (`gam_mpd::checkpoint`: the libraries, the context counts, the
-//! running preconditioners, every sequence's current sets, the points and the pass and sequence
+//! checkpoint `OUT.checkpoint/` (`gam_mpd::checkpoint`: the libraries, the running preconditioners, every sequence's current sets, the points and the pass and sequence
 //! reached), and a run that finds one there resumes from it: killed at any point and restarted,
 //! it writes what the uninterrupted run would have. Every draw is seeded by the pass and sequence,
 //! so nothing else is kept. A finished run's checkpoint says so, and a restart then stops at once.
@@ -63,7 +74,7 @@ use gam_mpd::checkpoint::{Saved, load, save};
 use gam_mpd::codec::prefix_integer_len_bits;
 use gam_mpd::import::import_language_model;
 use gam_mpd::masked::{
-    Context, Library, Masked, Running, Target, forward, matrix, previous_inputs, read_values, select, site_statistics, sites, split, step_pieces,
+    Claim, Coder, Context, Library, Masked, Running, Target, box_excess, forward, matrix, read_values, select, site_statistics, sites, split, step_pieces,
 };
 use gam_mpd::operator_program::FamilyInputs;
 use gam_mpd::operator_program::Node;
@@ -226,30 +237,7 @@ impl Assigned {
             .collect()
     }
 
-    /// Add `weight` times these sets' counts to `context` (as `Context::absorb` does with dense
-    /// masks, each position's previous input the position before it in its sequence); `-1`
-    /// takes back what `1` added.
-    fn absorb(&self, context: &mut Context, weight: f64) {
-        for k in 0..self.sites.len() {
-            for r in 0..self.rows {
-                let now = self.on(k, r);
-                let before = if r > 0 { self.on(k, r - 1) } else { &[] };
-                for &c in before {
-                    context.was_on[k][c as usize] += weight;
-                    if now.binary_search(&c).is_ok() {
-                        context.stayed[k][c as usize] += weight;
-                    }
-                }
-                for &c in now {
-                    if before.binary_search(&c).is_err() {
-                        context.new[k][c as usize] += weight;
-                    }
-                }
-            }
-        }
-    }
-
-    /// These sets on a grown library (`Context::grown`'s `origins`): every new piece is on
+    /// These sets on a grown library (`split`'s `origins`): every new piece is on
     /// wherever its original piece was.
     fn grown(&self, origins: &[Vec<usize>]) -> Self {
         let sites = self
@@ -287,6 +275,8 @@ struct Tally {
     explanation: f64,
     agree: f64,
     tokens: f64,
+    /// What the box claim adds to the KL, when it was measured (module note, `CLAIM`).
+    excess: Option<f64>,
 }
 
 impl Tally {
@@ -302,12 +292,17 @@ impl Tally {
 
     fn json(&self, observations: f64) -> serde_json::Value {
         let t = self.tokens;
-        json!({
+        let mut point = json!({
             "l0": self.l0 / t, "kl": self.kl / t, "bits": self.bits / t,
-            "context_bits": self.explanation / t,
+            "description_bits": self.explanation / t,
             "code": (self.explanation + self.kl * observations / std::f64::consts::LN_2) / t,
             "agree": self.agree / t,
-        })
+        });
+        if let Some(excess) = self.excess {
+            point["kl_box"] = json!((self.kl + excess) / t);
+            point["code_box"] = json!((self.explanation + (self.kl + excess) * observations / std::f64::consts::LN_2) / t);
+        }
+        point
     }
 }
 
@@ -320,7 +315,7 @@ fn agreement(logits: &Array2<f64>, target: &Target) -> Vec<i64> {
 fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
-    let usage = "mpd_pieces_masked_2951 EXPORT_DIR OUT.json OBSERVATIONS {wsvd|wsvd2|attribution|neurons|library:DIR} TRAIN EVAL [CONTEXT] [GPU] [SETS]";
+    let usage = "mpd_pieces_masked_2951 EXPORT_DIR OUT.json OBSERVATIONS {wsvd|wsvd2|attribution|neurons|library:DIR} TRAIN EVAL [CONTEXT] [GPU] [SETS|-] [corner|box]";
     let export = PathBuf::from(args.get(1).ok_or(usage)?);
     let out = PathBuf::from(args.get(2).ok_or(usage)?);
     let observations: f64 = args.get(3).ok_or(usage)?.parse().map_err(|e| format!("OBSERVATIONS: {e}"))?;
@@ -333,7 +328,12 @@ fn main() -> Result<(), String> {
     let eval: usize = args.get(6).ok_or(usage)?.parse().map_err(|e| format!("EVAL: {e}"))?;
     let context: usize = args.get(7).map_or(Ok(512), |v| v.parse()).map_err(|e| format!("CONTEXT: {e}"))?;
     let gpu = args.get(8).map_or("auto", String::as_str);
-    let sets_dir = args.get(9).map(PathBuf::from);
+    let sets_dir = args.get(9).filter(|a| *a != "-").map(PathBuf::from);
+    let claim = match args.get(10).map(String::as_str) {
+        None | Some("corner") => Claim::Corner,
+        Some("box") => Claim::Box,
+        Some(other) => return Err(format!("CLAIM {other}: expected corner or box; {usage}")),
+    };
     if sets_dir.is_some() && given.is_none() {
         return Err(format!("SETS needs a library:DIR start; {usage}"));
     }
@@ -347,14 +347,20 @@ fn main() -> Result<(), String> {
         Ok(Target::every_row(model.execute(inputs, false).map_err(|e| e.to_string())?.values[model.output].clone()))
     };
     let all_sites = sites(model);
-    // The model's statistics on the training sequences (on the eval sequences when nothing trains).
-    // A given library started from given sets uses none of them.
+    // The model's statistics on the training sequences (on the eval sequences when nothing trains):
+    // the starting libraries' and the per-word description's metric.
     let measured_on = if train > 0 { 0..train } else { train..train + eval };
-    let statistics: Vec<Option<gam_mpd::pieces::Site>> = if sets_dir.is_some() {
-        all_sites.iter().map(|_| None).collect()
-    } else {
-        site_statistics(model, &all_sites, measured_on.clone().map(sequence), 2, 0x5EED)?.into_iter().map(Some).collect::<Vec<_>>()
-    };
+    let measured = site_statistics(model, &all_sites, measured_on.clone().map(sequence), 2, 0x5EED)?;
+    // Each word pays for the weights that ran on it (`gam_mpd::blocks::Generic`): the reads are
+    // uncentred, so their metric is the second moment about zero.
+    let description = gam_mpd::blocks::Generic::new(
+        &measured
+            .iter()
+            .map(|m| gam_mpd::pieces::Site { w: m.w.clone(), second_moment: m.second_moment.clone(), mean: Array1::zeros(m.mean.len()), fisher: m.fisher.clone() })
+            .collect::<Vec<_>>(),
+        observations,
+    );
+    let statistics: Vec<Option<gam_mpd::pieces::Site>> = measured.into_iter().map(Some).collect();
     // `attribution`: every site's per-input samples on the training sequences, gathered a group of
     // sites at a time so a group's samples stay within `SAMPLE_BYTES` (fewer sequences for a site
     // too wide for that alone).
@@ -464,7 +470,10 @@ fn main() -> Result<(), String> {
     let mut masked = Masked::build(model, chosen, libraries)?;
     // The run's checkpoint (module note), and what it must agree with to resume.
     let checkpoint = out.with_extension("checkpoint");
-    let run = json!({"observations": observations, "start": start, "train": train, "eval": eval, "context": context_rows});
+    let mut run = json!({"observations": observations, "start": start, "train": train, "eval": eval, "context": context_rows});
+    if claim == Claim::Box {
+        run["claim"] = json!("box");
+    }
     let resumed = load(&checkpoint)?;
     if let Some(r) = &resumed {
         if r.driver["run"] != run {
@@ -476,17 +485,20 @@ fn main() -> Result<(), String> {
         }
     }
     let samples = 2;
-    // The firing counts of every set selected so far, and the costs they give; with given sets, the
-    // counts start from those of the sequences held out from training and evaluation.
-    let mut context = Context::new(&masked.all_pieces());
-    if let Some(sets) = &sets {
-        for s in train + eval..sets.sequences() {
-            sets.assigned(s).absorb(&mut context, 1.0);
-        }
-        eprintln!("context from the given sets of {} held-out sequences", sets.sequences() - train - eval);
-    }
+    // Every piece's description bits per word it runs on (module note).
+    let costs_of = |masked: &Masked| -> Result<Vec<Array1<f64>>, String> {
+        use gam_mpd::blocks::Describe;
+        (0..masked.sites.len())
+            .map(|k| {
+                let library = masked.library(k)?;
+                (0..library.v.nrows())
+                    .map(|c| description.bits(k, library.u.slice(ndarray::s![c..c + 1, ..]), library.v.slice(ndarray::s![c..c + 1, ..])))
+                    .collect::<Result<Array1<f64>, String>>()
+            })
+            .collect()
+    };
     // A sequence's start: the pieces whose own second-order KL bits, `n a² uᵀBu / (2 ln 2)` with
-    // `a = v · (x − μ)` on the clean forward, exceed their current listing cost.
+    // `a = v · x` on the clean forward, exceed their description bits.
     let start_masks = |inputs: &FamilyInputs, masked: &Masked, costs: &[Array1<f64>]| -> Result<Vec<Array2<f64>>, String> {
         let trace = model.execute(inputs, false).map_err(|e| e.to_string())?;
         let scale = observations / (2.0 * std::f64::consts::LN_2);
@@ -496,7 +508,7 @@ fn main() -> Result<(), String> {
             if fishers[k].nrows() != library.u.ncols() {
                 return Err(format!("{}: no measured Fisher to start from", original_sites[k].name));
             }
-            let x = read_values(&trace, &original_sites[k])? - &library.mean;
+            let x = read_values(&trace, &original_sites[k])?;
             let a = x.dot(&library.v.t());
             // Each piece's second-order weight `uᵀ B u` in the global Fisher.
             let weights = (&library.u.dot(&fishers[k]) * &library.u).sum_axis(Axis(1));
@@ -516,10 +528,23 @@ fn main() -> Result<(), String> {
         (0..eval).map(|e| sets.as_ref().filter(|x| x.fits(&masked.all_pieces())).map(|x| x.assigned(train + e))).collect();
     // `wsvd2`: the Fisher-SVD library grown to twice its pieces on the first training sequence,
     // every piece its listing inputs use in two ways split in two (`gam_mpd::masked::split`).
+    // Every piece reads only the span holding all but `LEFT_OUT` of its site's read variance on
+    // the measured sequences: what it reads off that span is unidentified (module note).
+    const LEFT_OUT: f64 = 1e-6;
+    if resumed.is_none() {
+        let started = std::time::Instant::now();
+        let moments = gam_mpd::masked::site_second_moments(model, &original_sites, measured_on.clone().map(sequence))?;
+        let mut kept = Vec::new();
+        for (k, (mean, covariance)) in moments.iter().enumerate() {
+            kept.push(masked.project_reads(k, mean, covariance, LEFT_OUT)?);
+        }
+        eprintln!("reads projected to {kept:?} dimensions ({:.0}s)", started.elapsed().as_secs_f64());
+    }
+    let mut costs = costs_of(&masked)?;
     if start == "wsvd2" && resumed.is_none() {
         let inputs = sequence(0);
         let target = target_of(&inputs)?;
-        let coder = context.coder(previous_inputs(&inputs));
+        let coder = Coder::ran(costs.clone(), inputs.rows);
         let begin = start_masks(&inputs, &masked, &coder.costs)?;
         let (masks, _) = select(&masked, &inputs, &target, begin, &coder, observations, samples)?;
         let trace = model.execute(&inputs, false).map_err(|e| e.to_string())?;
@@ -530,13 +555,13 @@ fn main() -> Result<(), String> {
         }
         eprintln!("grown to {} pieces", grown.iter().map(|l| l.v.nrows()).sum::<usize>());
         masked = Masked::build(model, original_sites.clone(), grown)?;
-        context = Context::new(&masked.all_pieces());
+        costs = costs_of(&masked)?;
     }
     // Resuming: the saved libraries, counts, preconditioners, sets and points.
     let (mut running, mut points, mut previous, mut saved_sets, first_pass, first_sequence, mut pass_code) = match resumed {
         Some(r) => {
             masked = Masked::build(model, original_sites.clone(), r.libraries)?;
-            context = r.context;
+            costs = costs_of(&masked)?;
             let index = |key: &str| r.driver[key].as_u64().map(|v| v as usize).ok_or_else(|| format!("checkpoint: no {key}"));
             let (pass, next) = (index("pass")?, index("next")?);
             eprintln!("resumed from {} at pass {pass}, sequence {next}", checkpoint.display());
@@ -559,39 +584,61 @@ fn main() -> Result<(), String> {
         }
     }
     // Saves the run's state, with `driver`'s pass, sequence, code and `done`.
-    let save_state = |driver: serde_json::Value, masked: &Masked, context: &Context, running: &Running, current: &[Option<Assigned>], eval_starts: &[Option<Assigned>]| -> Result<(), String> {
+    // The description code keeps no counts; the checkpoint's are empty.
+    let no_counts = Context::new(&[]);
+    let save_state = |driver: serde_json::Value, masked: &Masked, running: &Running, current: &[Option<Assigned>], eval_starts: &[Option<Assigned>]| -> Result<(), String> {
         let mut driver = driver;
         driver["run"] = run.clone();
         let sets = current.iter().chain(eval_starts).map(|a| a.as_ref().map(|a| &a.sites)).collect();
         let libraries = (0..masked.sites.len()).map(|k| masked.library(k)).collect::<Result<Vec<_>, _>>()?;
-        save(&checkpoint, &Saved { driver: &driver, libraries: &libraries, context, running, sets })
+        save(&checkpoint, &Saved { driver: &driver, libraries: &libraries, context: &no_counts, running, sets })
     };
     // JSON has no infinity: a first pass's `previous` is null.
     let finite = |v: f64| if v.is_finite() { json!(v) } else { serde_json::Value::Null };
-    // The bits of one real of a library piece: they are sent in single precision.
-    const BITS_PER_REAL: f64 = 32.0;
     let stem = out.with_extension("");
-    // Select the first `evaluated` eval sequences with `context`'s counts; a full eval also writes
-    // the sets, each token's KL and argmax agreement. Returns the point, the code per token, and
-    // the counts of the sets selected.
-    let evaluate = |masked: &Masked, context: &Context, starts: &[Option<Assigned>], pass: usize, trained: usize, evaluated: usize, full: bool| -> Result<(serde_json::Value, f64, Context), String> {
-        let mut seen = Context::new(&masked.all_pieces());
+    // Select the first `evaluated` eval sequences under the description code `costs`; a full eval
+    // also writes the sets, each token's KL and argmax agreement. Returns the point and the code per
+    // token. Each point also carries everything on (`all_on`): its description and KL.
+    // With `fishers` (the running written Fishers, under the box claim), each point also carries the
+    // box claim's error.
+    let evaluate = |masked: &Masked,
+                    costs: &[Array1<f64>],
+                    starts: &[Option<Assigned>],
+                    fishers: Option<&[Array2<f64>]>,
+                    pass: usize,
+                    trained: usize,
+                    evaluated: usize,
+                    full: bool|
+     -> Result<(serde_json::Value, f64), String> {
+        let mut all_on = Tally::default();
         // The selected sets, and the sets selection started from.
         let (mut selected, mut started) = (Tally::default(), Tally::default());
+        if fishers.is_some() {
+            selected.excess = Some(0.0);
+            started.excess = Some(0.0);
+        }
+        // What the box claim adds on a sequence's sets.
+        let excess_of = |inputs: &FamilyInputs, target: &Target, masks: &[Array2<f64>], fishers: &[Array2<f64>]| -> Result<f64, String> {
+            let family = masked.family(inputs, masks);
+            let (_, trace, cotangent) = forward(masked, &family, target)?;
+            Ok(box_excess(masked, &family, &trace, masks, cotangent, fishers, false)?.0.sum())
+        };
         // Sets as CSR over all pieces (sites in order), so other context codes can score them.
         let mut indptr: Vec<i64> = vec![0];
         let mut indices: Vec<i64> = Vec::new();
         let (mut token_kl, mut start_kl): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
         let (mut agree, mut start_agree): (Vec<i64>, Vec<i64>) = (Vec::new(), Vec::new());
-        let point_of = |selected: &Tally, started: &Tally, evaluated: usize| {
+        let point_of = |selected: &Tally, started: &Tally, all_on: &Tally, evaluated: usize| {
             let mut point = selected.json(observations);
             point["start"] = started.json(observations);
+            point["all_on"] = all_on.json(observations);
             for (key, value) in [
                 ("pieces", json!(masked.all_pieces().iter().sum::<usize>())),
                 ("pass", json!(pass)),
                 ("sequences_trained", json!(trained)),
                 ("observations", json!(observations)),
                 ("eval_sequences", json!(evaluated)),
+                ("claim", json!(if claim == Claim::Box { "box" } else { "corner" })),
             ] {
                 point[key] = value;
             }
@@ -601,8 +648,14 @@ fn main() -> Result<(), String> {
         for e in 0..evaluated {
             let inputs = sequence(train + e);
             let target = target_of(&inputs)?;
-            let previous_rows = previous_inputs(&inputs);
-            let coder = context.coder(previous_rows.clone());
+            let coder = Coder::ran(costs.to_vec(), inputs.rows);
+            // Everything on: the trivial explanation, which the description code must not favour.
+            {
+                let on: Vec<Array2<f64>> = masked.all_pieces().iter().map(|p| Array2::ones((inputs.rows, *p))).collect();
+                let (kl, trace, _) = forward(masked, &masked.family(&inputs, &on), &target)?;
+                let agree = agreement(&trace.values[masked.program.output], &target);
+                all_on.add(&on, &kl, coder.bits(&on).sum(), &agree);
+            }
             let begin = begin_of(starts[e].as_ref(), &inputs, masked, &coder.costs)?;
             // The start's own exact KL, explanation bits and argmax agreement.
             let (begin_kl, begin_agree) = {
@@ -611,6 +664,9 @@ fn main() -> Result<(), String> {
             };
             let begin_bits = coder.bits(&begin).sum();
             started.add(&begin, &begin_kl, begin_bits, &begin_agree);
+            if let (Some(f), Some(excess)) = (fishers, started.excess.as_mut()) {
+                *excess += excess_of(&inputs, &target, &begin, f)?;
+            }
             let begin_code = begin_bits + begin_kl.sum() * scale;
             let begin_l0 = sums(&begin, &begin_kl).0;
             let (masks, values) = select(masked, &inputs, &target, begin, &coder, observations, samples)?;
@@ -635,7 +691,9 @@ fn main() -> Result<(), String> {
                 (bits + values.sum() * scale) / inputs.rows as f64
             );
             selected.add(&masks, &values, bits, &row_agree);
-            seen.absorb(&masks, &previous_rows);
+            if let (Some(f), Some(excess)) = (fishers, selected.excess.as_mut()) {
+                *excess += excess_of(&inputs, &target, &masks, f)?;
+            }
             if full {
                 token_kl.extend(values.iter().copied());
                 start_kl.extend(begin_kl.iter().copied());
@@ -650,7 +708,7 @@ fn main() -> Result<(), String> {
                     indptr.push(indices.len() as i64);
                 }
             }
-            let progress = point_of(&selected, &started, e + 1);
+            let progress = point_of(&selected, &started, &all_on, e + 1);
             std::fs::write(format!("{}.progress.json", stem.display()), progress.to_string()).map_err(|e| e.to_string())?;
         }
         if full {
@@ -665,50 +723,82 @@ fn main() -> Result<(), String> {
                 write_npy(&PathBuf::from(format!("{}.pass{pass}.{name}.npy", stem.display())), "<f8", values.iter().map(|v| v.to_le_bytes()))?;
             }
         }
-        let point = point_of(&selected, &started, evaluated);
+        let point = point_of(&selected, &started, &all_on, evaluated);
         let code = point["code"].as_f64().unwrap_or(f64::INFINITY);
-        Ok((point, code, seen))
+        if full {
+            let flat: Vec<f64> = costs.iter().flat_map(|c| c.iter().copied()).collect();
+            write_npy(&PathBuf::from(format!("{}.pass{pass}.costs.npy", stem.display())), "<f8", flat.iter().map(|v| v.to_le_bytes()))?;
+        }
+        Ok((point, code))
     };
     let write_points = |points: &[serde_json::Value]| -> Result<(), String> {
         std::fs::write(&out, serde_json::to_string_pretty(&json!({"points": points})).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
     };
     if train == 0 {
-        for pass in first_pass.. {
-            let (point, code, seen) = evaluate(&masked, &context, &eval_starts, pass, 0, eval, true)?;
+        // The description code is fixed by the library, so one pass says it all.
+        if first_pass == 0 {
+            let (point, code) = evaluate(&masked, &costs, &eval_starts, None, 0, 0, eval, true)?;
             eprintln!("eval {point}");
             points.push(point);
             write_points(&points)?;
-            // Given sets code every pass by their held-out counts, so one pass says it all.
-            let done = previous - code < 1.0 || sets.is_some();
-            if !done {
-                previous = code;
-                context = seen;
-            }
-            let driver = json!({"pass": pass + 1, "next": 0, "pass_code": 0.0, "previous": finite(previous), "points": points, "done": done});
-            save_state(driver, &masked, &context, &running, &[], &eval_starts)?;
-            if done {
-                break;
-            }
+            let driver = json!({"pass": 1, "next": 0, "pass_code": 0.0, "previous": finite(code), "points": points, "done": true});
+            save_state(driver, &masked, &running, &[], &eval_starts)?;
         }
         return Ok(());
     }
     let report_every = (train / 4).max(1);
     let scale = observations / std::f64::consts::LN_2;
-    // Every training sequence's current sets, all counted in `context`: each sequence is coded with
-    // the counts of every other one (its own taken out while it is selected), starts from its
-    // current sets (its given ones at first), and keeps the selected sets only when they code it in
-    // fewer bits.
+    // Every training sequence's current sets: each starts from them (its given ones at first) and
+    // keeps the selected sets only when they code it in fewer bits.
     let mut current: Vec<Option<Assigned>> = match saved_sets.as_mut() {
-        // The saved counts already hold every current set.
         Some(saved) => (0..train).map(|s| as_assigned(saved[s].take())).collect(),
-        None => {
-            let current: Vec<Option<Assigned>> = (0..train).map(|s| sets.as_ref().filter(|x| x.fits(&masked.all_pieces())).map(|x| x.assigned(s))).collect();
-            for assigned in current.iter().flatten() {
-                assigned.absorb(&mut context, 1.0);
-            }
-            current
-        }
+        None => (0..train).map(|s| sets.as_ref().filter(|x| x.fits(&masked.all_pieces())).map(|x| x.assigned(s))).collect(),
     };
+    // The box claim's error against the KL of sampled gates (module note, `CLAIM`): on the first
+    // five training sequences at their start sets, every off gate drawn uniform.
+    if claim == Claim::Box && first_pass == 0 && first_sequence == 0 {
+        let mut state = 0x5A3D_u64;
+        let mut uniform = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for s in 0..train.min(5) {
+            let inputs = sequence(s);
+            let target = target_of(&inputs)?;
+            let coder = Coder::ran(costs.clone(), inputs.rows);
+            let masks = match &current[s] {
+                Some(assigned) => assigned.masks(&masked.all_pieces()),
+                None => start_masks(&inputs, &masked, &coder.costs)?,
+            };
+            let family = masked.family(&inputs, &masks);
+            let (kl, trace, cotangent) = forward(&masked, &family, &target)?;
+            let fishers = gam_mpd::masked::fisher(&masked, &family, &trace, &target, samples, 0xB0C5 + s as u64, true)?
+                .into_iter()
+                .map(|(_, f)| f.ok_or("no written Fisher"))
+                .collect::<Result<Vec<_>, _>>()?;
+            let excess = box_excess(&masked, &family, &trace, &masks, cotangent, &fishers, false)?.0.sum();
+            drop((family, trace));
+            let draws = 8;
+            let sampled: Vec<f64> = (0..draws)
+                .map(|_| {
+                    let gates: Vec<Array2<f64>> = masks.iter().map(|m| m.mapv(|x| if x > 0.0 { 1.0 } else { uniform() })).collect();
+                    forward(&masked, &masked.family(&inputs, &gates), &target).map(|r| r.0.sum())
+                })
+                .collect::<Result<_, _>>()?;
+            let mean = sampled.iter().sum::<f64>() / draws as f64;
+            let spread = (sampled.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / (draws * (draws - 1)) as f64).sqrt();
+            let rows = inputs.rows as f64;
+            log::info!(
+                "box claim check, sequence {s}: KL at the masks {:.4}, box KL {:.4} predicted, {:.4} ± {:.4} over {draws} sampled gates, per token",
+                kl.sum() / rows,
+                (kl.sum() + excess) / rows,
+                mean / rows,
+                spread / rows
+            );
+        }
+    }
     for pass in first_pass.. {
         let first = if pass == first_pass { first_sequence } else { 0 };
         if pass != first_pass {
@@ -718,11 +808,7 @@ fn main() -> Result<(), String> {
             let started = std::time::Instant::now();
             let inputs = sequence(s);
             let target = target_of(&inputs)?;
-            let previous_rows = previous_inputs(&inputs);
-            if let Some(old) = &current[s] {
-                old.absorb(&mut context, -1.0);
-            }
-            let coder = context.coder(previous_rows.clone());
+            let coder = Coder::ran(costs.clone(), inputs.rows);
             let begin = match &current[s] {
                 Some(old) => old.masks(&masked.all_pieces()),
                 None => start_masks(&inputs, &masked, &coder.costs)?,
@@ -742,7 +828,7 @@ fn main() -> Result<(), String> {
             let sequence_code = (coder.bits(&masks).sum() + kl.sum() * scale) / inputs.rows as f64;
             pass_code += sequence_code;
             current[s] = Some(Assigned::of(&masks));
-            let step = step_pieces(&mut masked, &inputs, &target, &masks, samples, 0xF00D + (pass * train + s) as u64, &mut running)?;
+            let step = step_pieces(&mut masked, &inputs, &target, &masks, samples, 0xF00D + (pass * train + s) as u64, &mut running, claim)?;
             let (l0, kl_sum, _) = sums(&masks, &kl);
             log::info!(
                 "pass {pass} sequence {s}: L0 {:.1}, KL {:.4} per token, {sequence_code:.1} bits per token; step {:?}; {:.0}s",
@@ -757,47 +843,34 @@ fn main() -> Result<(), String> {
             let mut masks = masks;
             if last || (s + 1) % report_every == 0 {
                 // Growth, tested by the code: every piece this sequence lists two ways is split, the
-                // sequence is selected again, and the split stays when its explanation and KL bits
-                // per token fall by more than the added pieces' library bits spread over every
-                // token trained so far.
+                // sequence is selected again, and the split stays when its description and KL bits
+                // per token fall (each word pays for the pieces that run on it).
                 let trace = model.execute(&inputs, false).map_err(|e| e.to_string())?;
                 let mut grown = Vec::new();
                 let mut origins = Vec::new();
                 let mut grown_masks = Vec::new();
-                let mut added_reals = 0.0;
                 for (k, site) in original_sites.iter().enumerate() {
                     let library = masked.library(k)?;
                     let x = read_values(&trace, site)?;
                     let (bigger, m, origin) = split(&library, &x, &masks[k]);
-                    added_reals += ((bigger.v.nrows() - library.v.nrows()) * (library.v.ncols() + library.u.ncols())) as f64;
                     grown.push(bigger);
                     grown_masks.push(m);
                     origins.push(origin);
                 }
                 drop(trace);
                 let candidate = Masked::build(model, original_sites.clone(), grown)?;
-                // Both coded by the counts of every other sequence (`context` leaves this one out
-                // until its sets are settled).
-                let candidate_context = context.grown(&origins);
-                let candidate_coder = candidate_context.coder(previous_rows.clone());
+                let candidate_costs = costs_of(&candidate)?;
+                let candidate_coder = Coder::ran(candidate_costs.clone(), inputs.rows);
                 let (candidate_masks, candidate_kl) = select(&candidate, &inputs, &target, grown_masks, &candidate_coder, observations, samples)?;
                 let candidate_code = (candidate_coder.bits(&candidate_masks).sum() + candidate_kl.sum() * scale) / inputs.rows as f64;
                 // The library as it stands after this sequence's step, on the same sets.
                 let now_kl = forward(&masked, &masked.family(&inputs, &masks), &target)?.0;
                 let sequence_code = (coder.bits(&masks).sum() + now_kl.sum() * scale) / inputs.rows as f64;
-                let tokens_trained = ((pass * train + s + 1) * context_rows) as f64;
-                let library_bits = added_reals * BITS_PER_REAL / tokens_trained;
-                let kept = candidate_code + library_bits < sequence_code;
-                log::info!(
-                    "split test: {:.1} -> {:.1} bits per token, library {:.1} bits per token; {}",
-                    sequence_code,
-                    candidate_code,
-                    library_bits,
-                    if kept { "kept" } else { "refused" }
-                );
+                let kept = candidate_code < sequence_code;
+                log::info!("split test: {sequence_code:.1} -> {candidate_code:.1} bits per token; {}", if kept { "kept" } else { "refused" });
                 if kept {
                     masked = candidate;
-                    context = candidate_context;
+                    costs = candidate_costs;
                     for (t, assigned) in current.iter_mut().enumerate() {
                         if t != s {
                             *assigned = assigned.as_ref().map(|a| a.grown(&origins));
@@ -814,16 +887,16 @@ fn main() -> Result<(), String> {
                 let family = masked.family(&inputs, &masks);
                 let (base_kl, masked_trace, _) = forward(&masked, &family, &target)?;
                 drop(family);
-                let base_code = (context.coder(previous_rows.clone()).bits(&masks).sum() + base_kl.sum() * scale) / inputs.rows as f64;
+                let base_code = (Coder::ran(costs.clone(), inputs.rows).bits(&masks).sum() + base_kl.sum() * scale) / inputs.rows as f64;
                 let mut grown = Vec::new();
                 let mut grown_masks = Vec::new();
                 let mut added = Vec::new();
-                let mut added_reals = 0.0;
                 for k in 0..masked.sites.len() {
                     let library = masked.library(k)?;
-                    let per_piece = (library.v.ncols() + library.u.ncols()) as f64 * BITS_PER_REAL * inputs.rows as f64 / tokens_trained;
+                    // A new piece pays its description on every word of the sequence it runs on:
+                    // the site's mean piece description, per word.
+                    let per_piece = costs[k].mean().unwrap_or(0.0) * inputs.rows as f64;
                     let (v, u) = gam_mpd::masked::dropped_atoms(&masked, k, &masked_trace, &masks[k], &running, observations, per_piece)?;
-                    added_reals += (v.nrows() * (v.ncols() + u.ncols())) as f64;
                     added.push(v.nrows());
                     grown_masks.push(ndarray::concatenate(Axis(1), &[masks[k].view(), Array2::<f64>::zeros((inputs.rows, v.nrows())).view()]).map_err(|e| e.to_string())?);
                     grown.push(gam_mpd::masked::with_pieces(&library, &v, &u)?);
@@ -831,36 +904,33 @@ fn main() -> Result<(), String> {
                 drop(masked_trace);
                 if added.iter().any(|a| *a > 0) {
                     let candidate = Masked::build(model, original_sites.clone(), grown)?;
-                    let candidate_context = context.extended(&added);
-                    let candidate_coder = candidate_context.coder(previous_rows.clone());
+                    let candidate_costs = costs_of(&candidate)?;
+                    let candidate_coder = Coder::ran(candidate_costs.clone(), inputs.rows);
                     let (candidate_masks, candidate_kl) = select(&candidate, &inputs, &target, grown_masks, &candidate_coder, observations, samples)?;
                     let candidate_code = (candidate_coder.bits(&candidate_masks).sum() + candidate_kl.sum() * scale) / inputs.rows as f64;
-                    let library_bits = added_reals * BITS_PER_REAL / tokens_trained;
-                    let kept = candidate_code + library_bits < base_code;
+                    let kept = candidate_code < base_code;
                     log::info!(
-                        "dropped-atoms test: {} pieces, {base_code:.1} -> {candidate_code:.1} bits per token, library {library_bits:.1}; {}",
+                        "dropped-atoms test: {} pieces, {base_code:.1} -> {candidate_code:.1} bits per token; {}",
                         added.iter().sum::<usize>(),
                         if kept { "kept" } else { "refused" }
                     );
                     if kept {
                         masked = candidate;
-                        context = candidate_context;
+                        costs = candidate_costs;
                         masks = candidate_masks;
                     }
                 }
-                let own = Assigned::of(&masks);
-                own.absorb(&mut context, 1.0);
-                current[s] = Some(own);
+                current[s] = Some(Assigned::of(&masks));
+                // The steps since the last report moved the pieces, and with them their descriptions.
+                costs = costs_of(&masked)?;
                 let evaluated = if last { eval } else { eval.min(4) };
-                let (point, _, _) = evaluate(&masked, &context, &eval_starts, pass, pass * train + s + 1, evaluated, last)?;
+                let (point, _) = evaluate(&masked, &costs, &eval_starts, (claim == Claim::Box).then_some(running.fishers.as_slice()), pass, pass * train + s + 1, evaluated, last)?;
                 eprintln!("eval {point}");
                 points.push(point);
                 write_points(&points)?;
-            } else if let Some(own) = &current[s] {
-                own.absorb(&mut context, 1.0);
             }
             let driver = json!({"pass": pass, "next": s + 1, "pass_code": pass_code, "previous": finite(previous), "points": points, "done": false});
-            save_state(driver, &masked, &context, &running, &current, &eval_starts)?;
+            save_state(driver, &masked, &running, &current, &eval_starts)?;
         }
         let code = pass_code / train as f64;
         log::info!("pass {pass}: {code:.1} bits per token");
@@ -869,7 +939,7 @@ fn main() -> Result<(), String> {
             previous = code;
         }
         let driver = json!({"pass": pass + 1, "next": 0, "pass_code": 0.0, "previous": finite(previous), "points": points, "done": done});
-        save_state(driver, &masked, &context, &running, &current, &eval_starts)?;
+        save_state(driver, &masked, &running, &current, &eval_starts)?;
         if done {
             break;
         }

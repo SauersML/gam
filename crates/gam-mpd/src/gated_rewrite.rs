@@ -168,6 +168,20 @@ pub fn rms_normalizers(rows: ArrayView2<'_, f64>, epsilon: f64) -> Result<Array1
         .collect()
 }
 
+/// The epsilon at which `h` normalizes as `c h` does at `epsilon`:
+/// `N_eps(c h) = sign(c) N_(eps/c^2)(h)` (module note).
+pub fn rms_epsilon_under_input_scale(epsilon: f64, scale: f64) -> f64 {
+    epsilon / (scale * scale)
+}
+
+/// Whether every positive scale of an RMSNorm's input is an exact symmetry of
+/// the norm at `epsilon`: [`rms_epsilon_under_input_scale`] keeps `epsilon` for
+/// every `c > 0` only when `epsilon = 0`. With `epsilon > 0` a scale of the
+/// input is a change of `epsilon`, never a gauge.
+pub fn rms_input_scale_is_symmetry(epsilon: f64) -> bool {
+    [2.0, 0.5].into_iter().all(|scale| rms_epsilon_under_input_scale(epsilon, scale) == epsilon)
+}
+
 /// A source model's native normalization, with the masked gain and bias it
 /// applies after normalizing and the epsilon its configuration declares.
 ///
@@ -287,7 +301,7 @@ fn inverse_root_mean_square(
 
 #[cfg(test)]
 mod tests {
-    use super::{GatedRewriteError, MaskedNorm, rms_normalizers, swiglu_hidden};
+    use super::{GatedRewriteError, MaskedNorm, rms_epsilon_under_input_scale, rms_input_scale_is_symmetry, rms_normalizers, swiglu_hidden};
     use gam_math::gaussian_gated::silu_derivatives;
     use ndarray::{Array, Array1, Array2, ArrayView2, Dimension, Zip, array};
     use qd::Quad;
@@ -639,7 +653,7 @@ mod tests {
             let scaled = residual.mapv(|value| scale * value);
             let normalized_scaled = norm.apply(scaled.view()).expect("finite residual");
             let rescaled_epsilon = MaskedNorm::Rms {
-                epsilon: epsilon / (scale * scale),
+                epsilon: rms_epsilon_under_input_scale(epsilon, scale),
                 gain: gain.view(),
             }
             .apply(residual.view())
@@ -651,12 +665,14 @@ mod tests {
             );
             assert_eq!(
                 rms_normalizers(scaled.view(), epsilon).expect("finite rows"),
-                rms_normalizers(residual.view(), epsilon / (scale * scale))
+                rms_normalizers(residual.view(), rms_epsilon_under_input_scale(epsilon, scale))
                     .expect("finite rows")
                     .mapv(|value| value / scale.abs()),
                 "nu_eps({scale} h) must equal nu_(eps/{scale}^2)(h) / |{scale}| bit for bit"
             );
         }
+        assert!(rms_input_scale_is_symmetry(0.0));
+        assert!(!rms_input_scale_is_symmetry(epsilon), "with eps > 0 an input scale moves eps, so it is no gauge");
         let unscaled = norm.apply(residual.view()).expect("finite residual");
         let scaled_same_epsilon = norm
             .apply(residual.mapv(|value| 8.0 * value).view())
