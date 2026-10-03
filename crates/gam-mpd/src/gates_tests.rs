@@ -1,7 +1,7 @@
 #![cfg(test)]
 //! Switching functions on planted gates: the code finds the function that made the labels, and no more.
 
-use super::gates::{Feature, Switch, Unit, base, best, fit, masks, screen};
+use super::gates::{Feature, Switch, Targets, Unit, base, best, best_for, constant, fit, masks, screen};
 use ndarray::Array2;
 
 /// A deterministic uniform draw in `[0, 1)`.
@@ -123,4 +123,22 @@ fn a_magnitude_gate_is_the_one_line_threshold_rule() {
     assert!((tau - 1.5).abs() < 0.05, "τ = {tau}: {switch:?}");
     let with_units = best(x.view(), &y, &[feature(0)], 0.0);
     assert!(switch.total_bits() < with_units.total_bits(), "rule {} bits, units {}", switch.total_bits(), with_units.total_bits());
+}
+
+#[test]
+fn a_value_that_is_a_gelu_of_its_inputs_is_recovered_by_a_unit() {
+    // y = 2 GELU(b₀ − 0.5) + 0.3 b₁ plus noise of variance 1/(2·weight): a unit and a linear term.
+    let n = 4000;
+    let b = Array2::from_shape_fn((n, 2), |(t, k)| normal(7 * t + k));
+    let weight: f64 = 50.0;
+    let noise = (0.5 / weight).sqrt();
+    let y: Vec<f64> = (0..n).map(|t| 2.0 * super::gates::gelu(b[[t, 0]] - 0.5) + 0.3 * b[[t, 1]] + noise * normal(900_001 + t)).collect();
+    let features = [feature(0), feature(1)];
+    let targets = Targets::Values { values: &y, weight };
+    let fitted = best_for(b.view(), targets, &features, 0.0);
+    assert!(!fitted.units.is_empty(), "{fitted:?}");
+    // Its error is the noise's: n/2 nats, give or take the fit.
+    let floor = 0.5 * n as f64 / std::f64::consts::LN_2;
+    assert!(fitted.listing_bits < 1.1 * floor, "error {} bits, noise floor {floor}", fitted.listing_bits);
+    assert!(fitted.total_bits() < constant(targets).total_bits() / 10.0);
 }

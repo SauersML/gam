@@ -42,6 +42,13 @@
 //! subcomponents doing many unrelated jobs needs a long switching function; [`best`] prices a
 //! candidate group's on-labels so the one total can prefer splitting it.
 //!
+//! # Values
+//!
+//! The same functions also predict a real quantity ([`Targets::Values`], [`best_for`]): an output
+//! subcomponent's activation from the input subcomponents' amplitudes, say, its squared error
+//! priced at what the one total charges it (`n/2 ‖u‖²_F` nats per unit² for an amplitude written
+//! along `u`), and the listing then is that error. The constant function is the mean.
+//!
 //! # The fit
 //!
 //! Maximum likelihood by Levenberg–Marquardt on the Gauss–Newton (Fisher) matrix of the logistic
@@ -220,6 +227,59 @@ fn count_bits(value: usize) -> f64 {
     prefix_integer_len_bits(value as u64 + 1).map_or(f64::INFINITY, |b| b as f64)
 }
 
+/// What a function is fitted to: on/off labels, listed under the logistic code with its escape, or
+/// real values whose squared error costs `weight` nats per unit² (the one total's error term at a
+/// written direction, `n ‖u‖²_F / 2`, for an amplitude).
+#[derive(Clone, Copy, Debug)]
+pub enum Targets<'a> {
+    Labels(&'a [bool]),
+    Values { values: &'a [f64], weight: f64 },
+}
+
+impl Targets<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Targets::Labels(y) => y.len(),
+            Targets::Values { values, .. } => values.len(),
+        }
+    }
+
+    /// Row `t` at prediction `g`: its loss in nats, the loss's derivative in `g`, and its
+    /// Gauss–Newton curvature (exact for values).
+    fn at(&self, t: usize, g: f64) -> (f64, f64, f64) {
+        match self {
+            Targets::Labels(y) => {
+                let q = sigmoid(g);
+                let loss = if y[t] { softplus(-g) } else { softplus(g) };
+                (loss, q - if y[t] { 1.0 } else { 0.0 }, q * (1.0 - q))
+            }
+            Targets::Values { values, weight } => {
+                let r = g - values[t];
+                (weight * r * r, 2.0 * weight * r, 2.0 * weight)
+            }
+        }
+    }
+
+    /// Row `t`'s listing in bits under a decoded function's prediction `g`.
+    fn listing(&self, t: usize, g: f64) -> f64 {
+        match self {
+            Targets::Labels(y) => label_bits(g, y[t], escape(y.len())),
+            Targets::Values { .. } => self.at(t, g).0 / std::f64::consts::LN_2,
+        }
+    }
+
+    /// The best constant prediction.
+    fn constant(&self) -> f64 {
+        match self {
+            Targets::Labels(y) => {
+                let rate = (y.iter().filter(|v| **v).count() as f64 + 0.5) / (y.len() as f64 + 1.0);
+                (rate / (1.0 - rate)).ln()
+            }
+            Targets::Values { values, .. } => values.iter().sum::<f64>() / values.len().max(1) as f64,
+        }
+    }
+}
+
 /// The parameter vector `[β, ℓ (d), per unit (w (d), d_u, c_u)]` of a switch with `d` features.
 #[derive(Clone, Debug)]
 struct Params {
@@ -264,29 +324,21 @@ impl Params {
         g
     }
 
-    /// Negative log-likelihood in nats over row-major feature rows.
-    fn nll(&self, x: &[f64], y: &[bool]) -> f64 {
+    /// The loss in nats over row-major feature rows.
+    fn nll(&self, x: &[f64], y: Targets) -> f64 {
         let d = self.d;
-        y.iter()
-            .enumerate()
-            .map(|(t, on)| {
-                let g = self.logit(&x[t * d..(t + 1) * d], None);
-                if *on { softplus(-g) } else { softplus(g) }
-            })
-            .sum()
+        (0..y.len()).map(|t| y.at(t, self.logit(&x[t * d..(t + 1) * d], None)).0).sum()
     }
 
-    /// Gradient and Gauss–Newton (Fisher) matrix of the NLL.
-    fn derivatives(&self, x: &[f64], y: &[bool]) -> (Vec<f64>, Vec<f64>) {
+    /// Gradient and Gauss–Newton (Fisher) matrix of the loss.
+    fn derivatives(&self, x: &[f64], y: Targets) -> (Vec<f64>, Vec<f64>) {
         let (p, d) = (self.theta.len(), self.d);
         let mut grad = vec![0.0; p];
         let mut fisher = vec![0.0; p * p];
         let mut jac = vec![0.0; p];
-        for (t, on) in y.iter().enumerate() {
+        for t in 0..y.len() {
             let g = self.logit(&x[t * d..(t + 1) * d], Some(&mut jac));
-            let q = sigmoid(g);
-            let r = q - if *on { 1.0 } else { 0.0 };
-            let w = q * (1.0 - q);
+            let (_, r, w) = y.at(t, g);
             for a in 0..p {
                 grad[a] += r * jac[a];
                 let wa = w * jac[a];
@@ -333,7 +385,7 @@ fn solve_spd(a: &[f64], b: &[f64]) -> Option<Vec<f64>> {
 }
 
 /// Levenberg–Marquardt to the likelihood's optimum (module note); returns the NLL in nats.
-fn optimise(params: &mut Params, x: &[f64], y: &[bool]) -> f64 {
+fn optimise(params: &mut Params, x: &[f64], y: Targets) -> f64 {
     let stop = 1e-3 * std::f64::consts::LN_2;
     let mut nll = params.nll(x, y);
     let mut lambda = 1e-3;
@@ -389,7 +441,7 @@ fn optimise(params: &mut Params, x: &[f64], y: &[bool]) -> f64 {
 
 /// The switch these parameters give at the precision that minimises the total code, the coefficient
 /// bits counted exactly and the labels' bits measured under the decoded coefficients.
-fn encode(params: &Params, x: &[f64], y: &[bool], features: &[Feature], structure_bits: f64) -> Switch {
+fn encode(params: &Params, x: &[f64], y: Targets, features: &[Feature], structure_bits: f64) -> Switch {
     let (_, fisher) = params.derivatives(x, y);
     let p = params.theta.len();
     let header = count_bits(params.d) + structure_bits + params.d as f64 + count_bits(params.units());
@@ -423,8 +475,7 @@ fn encode(params: &Params, x: &[f64], y: &[bool], features: &[Feature], structur
         let decoded = Params { d: params.d, theta: ints.iter().map(|k| *k as f64 / scale).collect() };
         let function_bits = header + ints.iter().map(|k| int_bits(*k)).sum::<f64>() + int_bits(prec as i64);
         let d = params.d;
-        let e = escape(y.len());
-        let listing = y.iter().enumerate().map(|(t, on)| label_bits(decoded.logit(&x[t * d..(t + 1) * d], None), *on, e)).sum();
+        let listing = (0..y.len()).map(|t| y.listing(t, decoded.logit(&x[t * d..(t + 1) * d], None))).sum();
         let mut switch = to_switch(&decoded, features, prec, function_bits, listing);
         switch.inputs = y.len();
         if best.as_ref().is_none_or(|b| switch.total_bits() < b.total_bits()) {
@@ -467,10 +518,12 @@ fn from_switch(switch: &Switch) -> Params {
 
 /// The base-rate switch: the Krichevsky–Trofimov rate of the training labels.
 pub fn base(y: &[bool]) -> Switch {
-    let on = y.iter().filter(|v| **v).count() as f64;
-    let rate = (on + 0.5) / (y.len() as f64 + 1.0);
-    let params = Params { d: 0, theta: vec![(rate / (1.0 - rate)).ln()] };
-    encode(&params, &[], y, &[], 0.0)
+    constant(Targets::Labels(y))
+}
+
+/// The constant function: the base rate of labels, the mean of values.
+pub fn constant(y: Targets) -> Switch {
+    encode(&Params { d: 0, theta: vec![y.constant()] }, &[], y, &[], 0.0)
 }
 
 /// The fewest bits any switch with features can take: its header and at least one bit for each of
@@ -484,11 +537,16 @@ pub fn least_featured_bits(structure_bits: f64) -> f64 {
 /// feature subset: the cheaper of the base rate and [`fit`]. Its `total_bits()` (function plus
 /// per-word listing) is what the labels cost in the one total.
 pub fn best(x: ArrayView2<f64>, y: &[bool], features: &[Feature], structure_bits: f64) -> Switch {
-    let rate = base(y);
+    best_for(x, Targets::Labels(y), features, structure_bits)
+}
+
+/// [`best`] for any [`Targets`]: the cheaper of the constant and [`fit_to`].
+pub fn best_for(x: ArrayView2<f64>, y: Targets, features: &[Feature], structure_bits: f64) -> Switch {
+    let rate = constant(y);
     if features.is_empty() || rate.total_bits() <= least_featured_bits(structure_bits) {
         return rate;
     }
-    let fitted = fit(x, y, features, structure_bits, None);
+    let fitted = fit_to(x, y, features, structure_bits, None);
     if fitted.total_bits() < rate.total_bits() { fitted } else { rate }
 }
 
@@ -497,6 +555,11 @@ pub fn best(x: ArrayView2<f64>, y: &[bool], features: &[Feature], structure_bits
 /// while the total falls (module note). `start` (a switch over the first `d − 1` of these features,
 /// or over all of them) warm-starts the ladder.
 pub fn fit(x: ArrayView2<f64>, y: &[bool], features: &[Feature], structure_bits: f64, start: Option<&Switch>) -> Switch {
+    fit_to(x, Targets::Labels(y), features, structure_bits, start)
+}
+
+/// [`fit`] for any [`Targets`].
+pub fn fit_to(x: ArrayView2<f64>, y: Targets, features: &[Feature], structure_bits: f64, start: Option<&Switch>) -> Switch {
     let d = features.len();
     let data = row_major(x);
     let x: &[f64] = &data;
@@ -509,8 +572,7 @@ pub fn fit(x: ArrayView2<f64>, y: &[bool], features: &[Feature], structure_bits:
             Params { d, theta: p.theta.iter().take(1 + d).copied().collect() }
         }
         None => {
-            let rate = base(y);
-            let mut theta = vec![rate.beta];
+            let mut theta = vec![y.constant()];
             theta.extend(std::iter::repeat_n(0.0, d));
             Params { d, theta }
         }
@@ -547,13 +609,23 @@ fn widen(p: &Params) -> Params {
 }
 
 /// `p` with one more unit, started at the hinge with the largest Rao score (module note).
-fn add_unit(p: &Params, x: &[f64], y: &[bool]) -> Option<Params> {
+fn add_unit(p: &Params, x: &[f64], y: Targets) -> Option<Params> {
     let d = p.d;
     if d == 0 {
         return None;
     }
     let n = y.len();
-    let logits: Vec<f64> = (0..n).map(|t| p.logit(&x[t * d..(t + 1) * d], None)).collect();
+    // Each row's loss derivative and curvature at the current function.
+    let slopes: Vec<(f64, f64)> = (0..n)
+        .map(|t| {
+            let (_, r, w) = y.at(t, p.logit(&x[t * d..(t + 1) * d], None));
+            (r, w)
+        })
+        .collect();
+    let on: Vec<bool> = match y {
+        Targets::Labels(labels) => labels.to_vec(),
+        Targets::Values { .. } => vec![false; n],
+    };
     let mut best: Option<(f64, Vec<f64>, f64, f64)> = None;
     for k in 0..d {
         let column: Vec<f64> = (0..n).map(|t| x[t * d + k]).collect();
@@ -564,7 +636,7 @@ fn add_unit(p: &Params, x: &[f64], y: &[bool]) -> Option<Params> {
         }
         for sign in [1.0, -1.0] {
             let scale = sign / spread;
-            let mut on_values: Vec<f64> = column.iter().zip(y).filter(|(_, o)| **o).map(|(v, _)| v * scale).collect();
+            let mut on_values: Vec<f64> = column.iter().zip(&on).filter(|(_, o)| **o).map(|(v, _)| v * scale).collect();
             let mut all_values: Vec<f64> = column.iter().map(|v| v * scale).collect();
             on_values.sort_by(f64::total_cmp);
             all_values.sort_by(f64::total_cmp);
@@ -579,11 +651,10 @@ fn add_unit(p: &Params, x: &[f64], y: &[bool]) -> Option<Params> {
             }
             for hinge in hinges {
                 let (mut s, mut info) = (0.0, 0.0);
-                for (t, (v, on)) in column.iter().zip(y).enumerate() {
+                for (v, (r, w)) in column.iter().zip(&slopes) {
                     let h = gelu(v * scale - hinge);
-                    let q = sigmoid(logits[t]);
-                    s += (q - if *on { 1.0 } else { 0.0 }) * h;
-                    info += q * (1.0 - q) * h * h;
+                    s += r * h;
+                    info += w * h * h;
                 }
                 if info > 0.0 && best.as_ref().is_none_or(|b| s * s / info > b.0) {
                     let mut w = vec![0.0; d];
