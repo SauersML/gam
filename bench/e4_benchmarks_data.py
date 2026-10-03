@@ -121,7 +121,8 @@ def stage_score(base_only=False, colon=True):
         models, meta = {}, {}
     else:
         target, W0, models, meta = E.edit_variants()
-        models = {k: v for k, v in models.items() if not k.startswith("vpd_a")}  # LoRAs and their matched VPD edits
+        if not E.VARIANTS:  # LoRAs and their matched VPD edits, not the VPD strength sweep
+            models = {k: v for k, v in models.items() if not k.startswith("vpd_a")}
         if not colon:
             models = {k: v for k, v in models.items() if k.endswith("lora282_lam10")}
     names = (["base"] if base_only or not colon else []) + list(models)
@@ -233,6 +234,7 @@ def stage_summarize():
             groups[t] = task == t
     pairs = (json.load(open(E.FR / f"e4_side/methods/{E.VARIANTS}.json"))["pairs"] if E.VARIANTS else
              [(nm, "vpd_match_" + nm) for nm in names if nm.startswith("lora") and "vpd_match_" + nm in names])
+    pairs = [(a, b) for a, b in pairs if a in names and b in names]
     res = {"description": __doc__, "models": names, "meta": meta, "pairs": pairs, "tasks": {}}
     for g, m in groups.items():
         e = {"n": int(m.sum()), "chance": float(chance_item[m].mean())}

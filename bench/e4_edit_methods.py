@@ -593,6 +593,27 @@ def stage_heldout():
         print(f"{nm:24s} P(o) on {len(P)} held-out emoticons {res['p_o'][nm][0]:.3f} [{res['p_o'][nm][1]:.3f}, {res['p_o'][nm][2]:.3f}]")
 
 
+def stage_compile_neg():
+    """The span-8 compiled edit plus hard negatives held exactly: zero change on the top-r eigendirections of the
+    second moment at non-emoticon ':' ';' '=' positions (C_colon), r = 4, 16, 64, posed as extra rows of the one
+    requirement (target = the native output), so the compiler either meets both or returns a witness."""
+    import scipy.linalg as sl
+    d = OUT / "compile"
+    z = np.load(OUT / "prep.npz")
+    W0 = np.load(d / "native.npy")
+    B, T = np.load(d / "inputs_span8.npy"), np.load(d / "targets_span8.npy")
+    vecs = sl.eigh(z["C_colon"])[1][:, ::-1]
+    base = json.load(open(d / "manifest_span.json"))["problems"][0]
+    problems = []
+    for r in (4, 16, 64):
+        N = vecs[:, :r].T
+        np.save(d / f"inputs_span8_neg{r}.npy", np.ascontiguousarray(np.vstack([B, N])))
+        np.save(d / f"targets_span8_neg{r}.npy", np.ascontiguousarray(np.vstack([T, N @ W0.T])))
+        problems.append(dict(base, name=f"compiled_span8_neg{r}", inputs=f"inputs_span8_neg{r}.npy",
+                             targets=f"targets_span8_neg{r}.npy", out=f"plan_compiled_span8_neg{r}"))
+    json.dump({"problems": problems}, open(d / "manifest_neg.json", "w"), indent=1)
+
+
 if __name__ == "__main__":
-    {"prep": stage_prep, "screen": stage_screen, "compile_export": stage_compile_export, "assemble": stage_assemble, "compile_span": stage_compile_span, "heldout": stage_heldout,
+    {"prep": stage_prep, "screen": stage_screen, "compile_export": stage_compile_export, "assemble": stage_assemble, "compile_span": stage_compile_span, "heldout": stage_heldout, "compile_neg": stage_compile_neg,
      "assemble_extra": lambda: stage_assemble_extra(sys.argv[2], sys.argv[3:]), "lora_neg": lambda: stage_lora_neg(float(sys.argv[2]))}[sys.argv[1]]()

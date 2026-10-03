@@ -19,23 +19,24 @@ plt.rcParams.update({"font.family": ["Helvetica Neue", "Arial Unicode MS"], "fon
                      "xtick.color": INK2, "ytick.color": INK2})
 best = lambda prefix: min((k for k in scr if k.startswith(prefix) and isinstance(scr[k], list)),
                           key=lambda k: next((q["kl"] for q in scr[k] if q.get("target") == 0.985 and q.get("kl")), np.inf))
-SERIES = [  # (family key, label, colour)
-    ("vpd", "VPD subcomponent edit", "#eb6834"),
-    ("compiled_old", "every fire key exact (compiler)", "#e34948"),
-    (f"{best('spec')}", "most emoticon-specific subcomponent", "#eda100"),
-    (best("contrast"), "contrast against hard negatives", "#e87ba4"),
-    (best("null"), "null space of general text", "#4a3aa7"),
-    (best("memit"), "all fire keys, ridge (MEMIT)", "#008300"),
-    ("rome+fisher", "covariance edit (ROME), Fisher write", "#1baf7a"),
+SERIES = [  # (family key, label, colour, dashed)
+    ("vpd", "VPD subcomponent edit", "#eb6834", False),
+    ("compiled_old", "compiler, every fire key exact", "#e34948", True),
+    (f"{best('spec')}", "most emoticon-specific subcomponent", "#eda100", False),
+    (best("contrast"), "contrast against hard negatives", "#e87ba4", False),
+    (best("null"), "null space of general text", "#4a3aa7", False),
+    (best("memit"), "all fire keys, ridge (MEMIT)", "#008300", False),
+    ("rome+fisher", "covariance edit (ROME)", "#1baf7a", False),
+    ("compiled_span8", "compiler, exact on the 8 key directions needed", "#e34948", False),
 ]
 fig, ax = plt.subplots(figsize=(22, 11.5), dpi=150)
 fig.patch.set_facecolor(SURF)
 ax.set_facecolor(SURF)
 ends = []
-for key, label, col in SERIES:
+for key, label, col, dashed in SERIES:
     pts = [q for q in scr[key] if q.get("kl")]
     x, y = [q["p_fire"] for q in pts], [q["kl"] for q in pts]
-    ax.plot(x, y, color=col, lw=3, zorder=3, solid_capstyle="round")
+    ax.plot(x, y, color=col, lw=3, zorder=3, solid_capstyle="round", ls=(0, (4, 2)) if dashed else "-")
     ax.scatter(x, y, s=70, color=col, edgecolor=SURF, linewidth=1.5, zorder=4)
     ends.append([np.log10(y[-1]), label, col])
 ends.sort()
@@ -74,17 +75,60 @@ fig.savefig(OUT / "e4_methods_frontier.png", facecolor=SURF)
 plt.close(fig)
 print(OUT / "e4_methods_frontier.png")
 
+# ---------------------------------------------------------------- the full harness at equal edit success
+if (M / "table.json").exists():
+    T = json.load(open(M / "table.json"))
+    keys = [k for k in sorted(T, key=lambda k: -T[k]["kl_all"][0]) if k != "vpd_at_hardneg"]
+    COL = {"vpd": "#eb6834", "lora": "#2a78d6", "lora_hardneg": "#2a78d6"}
+    panels = [("kl_all", "Disturbance of all held-out text", "KL from the original model (nats per word)", True),
+              ("kl_spaced_colon", "After ' :' that is not an emoticon", "KL from the original model (nats per word)", True),
+              ("hellaswag", "HellaSwag", "change in the right answer's log-probability share (nats)", False)]
+    fig, axes = plt.subplots(1, 3, figsize=(30, 0.62 * len(keys) + 3.4), dpi=130, sharey=True, gridspec_kw={"wspace": 0.08})
+    fig.patch.set_facecolor(SURF)
+    ys = np.arange(len(keys))
+    for ax, (key, title, xl, logx) in zip(axes, panels):
+        for y, k in zip(ys, keys):
+            v = T[k]["bench_d_margin"][key] if key == "hellaswag" else T[k][key]
+            if v[0] is None or not np.isfinite(v[0]):
+                continue
+            col = COL.get(k, "#1baf7a" if k.startswith(("compiled", "memit", "rome", "null")) else "#898781")
+            ax.plot([v[1], v[2]], [y, y], color=col, lw=3, solid_capstyle="round", zorder=3)
+            ax.scatter([v[0]], [y], s=120, color=col, edgecolor=SURF, linewidth=1.8, zorder=4,
+                       marker="D" if k == "lora_hardneg" else "o")
+        if logx:
+            ax.set_xscale("log")
+            lo, hi = ax.get_xlim()
+            ax.xaxis.set_major_locator(LogLocator(base=10, subs=(1,) if hi / lo > 100 else (1, 2, 5), numticks=20))
+            ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+            ax.xaxis.set_minor_formatter(NullFormatter())
+        else:
+            ax.axvline(0, color=INK2, lw=1.2, zorder=1)
+        ax.set_xlabel(xl, fontsize=20)
+        ax.set_title(title, loc="left", fontweight="bold", color=INK, pad=12)
+        for sd in ("top", "right"):
+            ax.spines[sd].set_visible(False)
+    axes[0].set_yticks(ys)
+    axes[0].set_yticklabels([T[k]["label"] + (f" ({T[k]['p_fire']:.1%})" if abs(T[k]["p_fire"] - 0.9848) > 1e-3 else "")
+                             for k in keys], color=INK, fontsize=20)
+    H = 0.62 * len(keys) + 3.4
+    fig.suptitle("Every edit at 98.5% edit success, on the full harness", x=0.01, ha="left", y=1 - 0.15 / H,
+                 fontsize=32, fontweight="bold", color=INK)
+    fig.subplots_adjust(left=0.24, right=0.99, top=1 - 1.6 / H, bottom=1.2 / H)
+    fig.savefig(OUT / "e4_methods_matched.png", facecolor=SURF)
+    plt.close(fig)
+    print(OUT / "e4_methods_matched.png")
+
 # ---------------------------------------------------------------- worst positions of the best new method
-full = M / "final/e4_side_effects.json"
+full = M / "compiled/e4_side_effects.json"
 if full.exists():
     d = json.load(open(full))
-    BEST = "rome"
+    BEST = "compiled_span8"
     ex = d["examples"].get(BEST, [])
     show = lambda t: "“" + t.replace("\n", "⏎").replace("\t", "⇥") + "”"
     pct = lambda p: f"{p:.0%}" if p >= 0.01 else "<1%"
     fig = plt.figure(figsize=(26, 15), dpi=140)
     fig.patch.set_facecolor(SURF)
-    fig.suptitle("The covariance edit's 20 most-disturbed positions in ordinary text", x=0.01, ha="left", y=0.985,
+    fig.suptitle("The compiled edit's 20 most-disturbed positions in ordinary text", x=0.01, ha="left", y=0.985,
                  fontsize=30, fontweight="bold", color=INK)
     cols = [0.01, 0.5, 0.63, 0.79, 0.94]
     hy = 0.9
