@@ -1172,18 +1172,93 @@ fn same_subspace(block: &Block<'_>, w: &Array2<f64>, whitening: &(Array2<f64>, A
     Ok(best)
 }
 
+/// Per site, the Gauss-Newton metric of its written value in logit space, `E[Jᵀ J]` with `J` the
+/// Jacobian from the written value to the logits' shift-free part (`draws` Rademacher cotangents,
+/// centred per row, pulled back by the exact reverse pass). Unlike the sampled-label Fisher, it does
+/// not vanish where the network is confident: every direction that moves a logit is priced, and the
+/// exact KL calibrates its scale ([`Geometry::describe_exact`]). In the shape of
+/// [`super::pieces::Site::fisher`], so it can stand in for the sampled-label Fisher of
+/// [`super::masked::site_statistics`].
+pub fn logit_gauss_newton(
+    program: &super::operator_program::OperatorProgram,
+    chosen: &[super::masked::Site],
+    family: &super::operator_program::FamilyInputs,
+    trace: &super::operator_program::Trace,
+    draws: usize,
+) -> Result<Vec<Array2<f64>>, String> {
+    let logits = &trace.values[program.output];
+    let (rows, classes) = logits.dim();
+    let interfaces = program.interfaces().map_err(|e| e.to_string())?;
+    let mut out: Vec<Array2<f64>> = chosen
+        .iter()
+        .map(|s| {
+            let d: usize = s.writes.iter().map(|n| interfaces[*n].width()).sum();
+            Array2::zeros((d, d))
+        })
+        .collect();
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    for _ in 0..draws {
+        let mut cotangent = Array2::<f64>::zeros((rows, classes));
+        for mut row in cotangent.rows_mut() {
+            for x in row.iter_mut() {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *x = if state & 1 == 0 { 1.0 } else { -1.0 };
+            }
+            let mean = row.sum() / classes as f64;
+            row.mapv_inplace(|x| x - mean);
+        }
+        let back = super::derivatives::vjp(program, family, trace, cotangent).map_err(|e| e.to_string())?;
+        for (site, metric) in chosen.iter().zip(out.iter_mut()) {
+            let parts: Vec<Array2<f64>> =
+                site.writes.iter().map(|n| back[*n].clone().unwrap_or_else(|| Array2::zeros(trace.values[*n].dim()))).collect();
+            let views: Vec<_> = parts.iter().map(|x| x.view()).collect();
+            let g = ndarray::concatenate(Axis(1), &views).map_err(|e| e.to_string())?;
+            *metric += &g.t().dot(&g);
+        }
+    }
+    for metric in out.iter_mut() {
+        *metric /= (draws * rows) as f64;
+    }
+    Ok(out)
+}
+
 /// [`Geometry::describe`] as the blocks' description ([`super::blocks::Describe`]): a block costs its
-/// cheapest description plus the price of that description's error.
+/// cheapest description plus the price of that description's error, the metric's price times
+/// `calibration` (the ratio of measured to priced rounding KL, [`super::blocks::rounding_error`]).
 pub struct Structured {
     pub sites: Vec<Geometry>,
+    pub calibration: f64,
+}
+
+impl Structured {
+    pub fn new(sites: Vec<Geometry>) -> Self {
+        Self { sites, calibration: 1.0 }
+    }
+
+    /// The same description with its error price scaled by `ratio`.
+    pub fn scaled(mut self, ratio: f64) -> Self {
+        self.calibration *= ratio;
+        self
+    }
+
+    fn describe(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<Description, String> {
+        let geometry = self.sites.get(site).ok_or_else(|| format!("no site {site}"))?;
+        geometry.describe_at(u, v, self.calibration, true)
+    }
 }
 
 impl super::blocks::Describe for Structured {
     fn bits(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<f64, String> {
-        let geometry = self.sites.get(site).ok_or_else(|| format!("no site {site}"))?;
         if u.nrows() == 0 {
             return Ok(0.0);
         }
-        Ok(geometry.describe(u, v)?.total())
+        Ok(self.describe(site, u, v)?.total())
+    }
+
+    fn decode(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<Option<(Array2<f64>, Array2<f64>, f64)>, String> {
+        let d = self.describe(site, u, v)?;
+        Ok(Some((d.u, d.v, d.kl_bits)))
     }
 }

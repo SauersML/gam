@@ -97,55 +97,6 @@ fn readout_map(program: &OperatorProgram, site: &Site) -> Result<Option<Array2<f
     Ok(Some(out))
 }
 
-/// Per site, the Gauss-Newton metric of its written value in logit space, `E[Jᵀ J]` with `J` the
-/// Jacobian from the written value to the logits' shift-free part (`draws` Rademacher cotangents,
-/// centred per row, pulled back by the exact reverse pass). Unlike the sampled-label Fisher, it does
-/// not vanish where the network is confident: every direction that moves a logit is priced, and the
-/// exact KL calibrates its scale ([`gam_mpd::describe::Geometry::describe_exact`]).
-fn logit_gauss_newton(
-    program: &OperatorProgram,
-    chosen: &[Site],
-    family: &gam_mpd::operator_program::FamilyInputs,
-    trace: &gam_mpd::operator_program::Trace,
-    draws: usize,
-) -> Result<Vec<Array2<f64>>, String> {
-    let logits = &trace.values[program.output];
-    let (rows, classes) = logits.dim();
-    let interfaces = program.interfaces().map_err(|e| e.to_string())?;
-    let mut out: Vec<Array2<f64>> = chosen
-        .iter()
-        .map(|s| {
-            let d: usize = s.writes.iter().map(|n| interfaces[*n].width()).sum();
-            Array2::zeros((d, d))
-        })
-        .collect();
-    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
-    for _ in 0..draws {
-        let mut cotangent = Array2::<f64>::zeros((rows, classes));
-        for mut row in cotangent.rows_mut() {
-            for x in row.iter_mut() {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                *x = if state & 1 == 0 { 1.0 } else { -1.0 };
-            }
-            let mean = row.sum() / classes as f64;
-            row.mapv_inplace(|x| x - mean);
-        }
-        let back = gam_mpd::derivatives::vjp(program, family, trace, cotangent).map_err(|e| e.to_string())?;
-        for (site, metric) in chosen.iter().zip(out.iter_mut()) {
-            let parts: Vec<Array2<f64>> =
-                site.writes.iter().map(|n| back[*n].clone().unwrap_or_else(|| Array2::zeros(trace.values[*n].dim()))).collect();
-            let views: Vec<_> = parts.iter().map(|x| x.view()).collect();
-            let g = ndarray::concatenate(ndarray::Axis(1), &views).map_err(|e| e.to_string())?;
-            *metric += &g.t().dot(&g);
-        }
-    }
-    for metric in out.iter_mut() {
-        *metric /= (draws * rows) as f64;
-    }
-    Ok(out)
-}
 
 /// Each block's firing fraction over the coded rows.
 fn firing(blocked: &Blocked, k: usize, b: usize) -> f64 {
@@ -288,7 +239,7 @@ fn modadd(dir: &Path, out: &Path, observations: f64, only: Option<&str>) -> Resu
     eprintln!("{} rows, {} operands of period {period}", family.rows, operands.len());
 
     let statistics = site_statistics(&program, &chosen, [family.clone()], 16, 0x5EED)?;
-    let logit_metrics = logit_gauss_newton(&program, &chosen, &family, &trace, 64)?;
+    let logit_metrics = gam_mpd::describe::logit_gauss_newton(&program, &chosen, &family, &trace, 64)?;
     let mut libraries = Vec::new();
     let mut structured_sites = Vec::new();
     let mut lattice_sites = Vec::new();
@@ -310,12 +261,13 @@ fn modadd(dir: &Path, out: &Path, observations: f64, only: Option<&str>) -> Resu
     }
     // The generic family alone on the same exact lattice code, so the structured families are
     // compared with the identity charts under one code.
-    let lattice = Structured { sites: lattice_sites };
-    let generic = Generic::new(&statistics, observations);
-    let structured = Structured { sites: structured_sites };
+    let lattice = Structured::new(lattice_sites);
+    let mut generic = Generic::new(&statistics, observations);
+    let measuring = Generic::new(&statistics, observations);
+    let mut structured = Structured::new(structured_sites);
     let batches = vec![(family.clone(), target)];
-    let coded_generic = Coded { model: &program, sites: chosen.clone(), batches: batches.clone(), observations, samples: 16, describe: &generic, boxed: None };
-    let coded_structured = Coded { model: &program, sites: chosen.clone(), batches, observations, samples: 16, describe: &structured, boxed: None };
+    // Measures only (the KL of a decomposition does not depend on its description).
+    let coded_generic = Coded { model: &program, sites: chosen.clone(), batches: batches.clone(), observations, samples: 16, describe: &measuring, boxed: None };
 
     // Each site's whole map as one block, on for every word: what one structured statement of the
     // site costs against its rank-one subcomponents all on, both decoded and measured exactly.
@@ -348,16 +300,37 @@ fn modadd(dir: &Path, out: &Path, observations: f64, only: Option<&str>) -> Resu
     }
     let mut points = Vec::new();
     let mut fitted = Vec::new();
-    for (name, coded) in [("generic", &coded_generic), ("structured", &coded_structured)] {
+    for name in ["generic", "structured"] {
         if only.is_some_and(|o| o != name) {
             continue;
         }
-        let started = std::time::Instant::now();
-        let (rank_one, rank_one_bits) = rank_one_point(coded, libraries.clone(), family.rows)?;
-        say(&format!("rank one, {name}"), &rank_one_bits);
-        let (blocked, block_bits) = fit_blocks(coded, rank_one.clone(), true)?;
-        say(&format!("blocks, {name}"), &block_bits);
-        eprintln!("  {name}: {:.1} s", started.elapsed().as_secs_f64());
+        // The second-order price only proposes: each fit's decoded blocks run exactly
+        // (`gam_mpd::blocks::rounding_error`), and while the measured rounding KL is off its price by
+        // more than a factor of two the price is rescaled by their ratio and the fit repeated.
+        let mut calibrations = Vec::new();
+        let (rank_one, rank_one_bits, blocked, block_bits) = loop {
+            let describe: &dyn Describe = if name == "generic" { &generic } else { &structured };
+            let coded = Coded { model: &program, sites: chosen.clone(), batches: batches.clone(), observations, samples: 16, describe, boxed: None };
+            let started = std::time::Instant::now();
+            let (rank_one, rank_one_bits) = rank_one_point(&coded, libraries.clone(), family.rows)?;
+            say(&format!("rank one, {name}"), &rank_one_bits);
+            let (blocked, block_bits) = fit_blocks(&coded, rank_one.clone(), true)?;
+            say(&format!("blocks, {name}"), &block_bits);
+            let (measured, priced, _) = gam_mpd::blocks::rounding_error(&coded, &blocked)?;
+            eprintln!("  {name}: {:.1} s; rounding measured {measured:.1} bits against {priced:.1} priced", started.elapsed().as_secs_f64());
+            calibrations.push(json!({"measured": measured, "priced": priced}));
+            let ratio = if priced > 0.0 { measured / priced } else { f64::INFINITY };
+            if (0.5..=2.0).contains(&ratio) || measured <= 0.0 || calibrations.len() >= 6 {
+                break (rank_one, rank_one_bits, blocked, block_bits);
+            }
+            let ratio = if ratio.is_finite() { ratio } else { 1e3 };
+            if name == "generic" {
+                generic = generic.scaled(ratio);
+            } else {
+                structured.calibration *= ratio;
+            }
+        };
+        points.push(json!({"calibrations": calibrations, "description": name}));
         for (point, decomposition, bits) in [("rank one", &rank_one, &rank_one_bits), ("blocks", &blocked, &block_bits)] {
             let (per_word, kl, active_blocks, active_rank) = bits.per_row();
             points.push(json!({
@@ -490,7 +463,8 @@ fn vpd(dir: &Path, library_dir: &Path, sets_dir: &Path, out: &Path, observations
     let rotary_chart = Chart::coordinates("rotary planes", heads * head_dim, &planes)?;
     let sets = counts(sets_dir, CONTEXT, first, sequences)?;
     let words = (sequences * CONTEXT) as f64;
-    let generic = Generic::new(&statistics, observations);
+    let mut generic = Generic::new(&statistics, observations);
+    let measuring = Generic::new(&statistics, observations);
     let mut report = Vec::new();
     for (k, site) in chosen.iter().enumerate() {
         let layer: usize = site.name.split('.').nth(1).and_then(|x| x.parse().ok()).ok_or(format!("{}: no layer", site.name))?;
