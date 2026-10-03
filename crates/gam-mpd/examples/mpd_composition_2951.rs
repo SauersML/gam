@@ -1,6 +1,6 @@
 //! Diagnose how fixed per-token matrix replacements compose on real model executions.
 //!
-//! `mpd_composition_2951 EXPORT LIBRARY SETS OUT.json [SEQUENCES] [CONTEXT] [joint|isolated] [SWITCHES.json]`
+//! `mpd_composition_2951 EXPORT LIBRARY SETS OUT.json [SEQUENCES] [CONTEXT] [joint|isolated] [SWITCHES.json] [BIASES]`
 //!
 //! Reads the standard rank-one library and CSR sets, without fitting or selecting anything.
 //! For each site the signed identity separates native propagation, clean-input omission,
@@ -10,6 +10,8 @@
 //! site kept native. The full model, all-on library and joint replacements share the same text.
 //! Optional learned switches are compared on clean-model features and their own execution's
 //! features; the returned autonomous masks are replayed to check execution consistency.
+//! Optional comma-separated BIASES evaluates fixed shared logit offsets, exposing the fidelity
+//! versus activity tradeoff. This is a diagnostic curve, not a fitted or held-out optimum.
 
 use gam_mpd::composition::linear_site;
 use gam_mpd::import::import_language_model;
@@ -47,7 +49,7 @@ fn ratio(numerator: f64, denominator: f64) -> Option<f64> {
 fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
-    let usage = "mpd_composition_2951 EXPORT LIBRARY SETS OUT.json [SEQUENCES] [CONTEXT] [joint|isolated] [SWITCHES.json]";
+    let usage = "mpd_composition_2951 EXPORT LIBRARY SETS OUT.json [SEQUENCES] [CONTEXT] [joint|isolated] [SWITCHES.json] [BIASES]";
     let export = PathBuf::from(args.get(1).ok_or(usage)?);
     let library_dir = PathBuf::from(args.get(2).ok_or(usage)?);
     let sets_dir = PathBuf::from(args.get(3).ok_or(usage)?);
@@ -116,13 +118,27 @@ fn main() -> Result<(), String> {
             }
         }
     }
+    let clock = std::time::Instant::now();
     let clean = model.execute(family, false).map_err(|e| e.to_string())?;
+    let native_seconds = clock.elapsed().as_secs_f64();
     let target = Target::every_row(clean.values[model.output].clone());
+    let clock = std::time::Instant::now();
     let masked = Masked::build(model, chosen.clone(), libraries)?;
+    let build_seconds = clock.elapsed().as_secs_f64();
+    let clock = std::time::Instant::now();
     let candidate = masked.program.execute(&masked.family(family, &masks), false).map_err(|e| e.to_string())?;
+    let fixed_mask_seconds = clock.elapsed().as_secs_f64();
     let joint_kl = kl_score_only(&target, &candidate.values[masked.program.output]).to_vec();
     let all_on: Vec<Array2<f64>> = masks.iter().map(|m| Array2::ones(m.dim())).collect();
     let all_on_kl = score_only(&masked, &masked.family(family, &all_on), &target)?.to_vec();
+    // Standard input format is rank one. This is retained factor size, not the dense
+    // executor's actual work, and does not assign a quantized description length.
+    let factor_sizes = chosen.iter().map(|site| {
+        let w = matrix(model, site)?;
+        Ok(w.nrows() + w.ncols())
+    }).collect::<Result<Vec<_>, String>>()?;
+    let retained_entries = |selected: &[Array2<f64>]| selected.iter().zip(&factor_sizes)
+        .map(|(m, size)| m.sum() * *size as f64).sum::<f64>() / family.rows as f64;
     let switch_execution = if let Some(path) = args.get(8) {
         #[derive(serde::Deserialize)]
         struct SiteSwitches { name: String, switches: Vec<gam_mpd::gates::Switch> }
@@ -152,8 +168,56 @@ fn main() -> Result<(), String> {
             "autonomous_active_per_token": autonomous_masks[k].sum() / family.rows as f64,
             "teacher_active_per_token": teacher_masks[k].sum() / family.rows as f64
         })).collect();
+        let clock = std::time::Instant::now();
+        let compiled = gam_mpd::switched_compile::compile(model, chosen.clone(),
+            (0..chosen.len()).map(|k| masked.library(k)).collect::<Result<Vec<_>, _>>()?,
+            (0..chosen.len()).map(|k| masked.ranks(k).to_vec()).collect(), switches.clone())?;
+        let compile_seconds = clock.elapsed().as_secs_f64();
+        let clock = std::time::Instant::now();
+        let (compiled_trace, compiled_masks) = gam_mpd::switched::execute(&compiled.masked, family, &compiled.switches)?;
+        let compiled_seconds = clock.elapsed().as_secs_f64();
+        let compiled_logits = &compiled_trace.values[compiled.masked.program.output];
+        let compiled_kl = kl_score_only(&target, compiled_logits);
+        let compiled_logit_difference = compiled_logits.iter().zip(&autonomous.values[masked.program.output])
+            .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+        let compiled_decision_differences: usize = compiled_masks.iter().enumerate().map(|(k, m)| {
+            m.indexed_iter().filter(|((r, c), value)| **value != autonomous_masks[k][[*r, compiled.original_blocks[k][*c]]]).count()
+        }).sum();
+        let compiled_execution = json!({"compile_seconds": compile_seconds, "forward_seconds": compiled_seconds,
+            "kl": summary(&compiled_kl.to_vec()), "max_logit_difference": compiled_logit_difference,
+            "changed_retained_decisions": compiled_decision_differences,
+            "reads_per_token": compiled.counts.iter().map(|c| c.kept_reads).sum::<usize>(),
+            "original_blocks": compiled.original_blocks,
+            "scope": "fixed-policy dead-code elimination; algebraic equivalence, floating execution measured here; no all-on reconstruction claim"});
+        drop(compiled_trace);
+        drop(compiled);
+        let mut bias_curve = Vec::new();
+        if let Some(spec) = args.get(9) {
+            for item in spec.split(',') {
+                let bias: f64 = item.parse().map_err(|e| format!("switch bias {item}: {e}"))?;
+                if !bias.is_finite() { return Err("finite switch biases required".into()); }
+                let mut adjusted = switches.clone();
+                for switch in adjusted.iter_mut().flatten() { switch.beta += bias; }
+                let clock = std::time::Instant::now();
+                let (trace, selected) = gam_mpd::switched::execute(&masked, family, &adjusted)?;
+                let seconds = clock.elapsed().as_secs_f64();
+                let kl = kl_score_only(&target, &trace.values[masked.program.output]);
+                let active = selected.iter().map(|m| m.sum()).sum::<f64>() / family.rows as f64;
+                eprintln!("switch bias {bias}: KL {:.6}, active {active:.2}, {seconds:.3}s", kl.mean().unwrap_or(0.0));
+                bias_curve.push(json!({"logit_bias": bias, "kl": summary(&kl.to_vec()),
+                                       "active_per_token": active, "seconds": seconds,
+                                       "retained_factor_entries_per_token": retained_entries(&selected)}));
+            }
+        }
         Some(json!({"switches": path, "autonomous_seconds": seconds, "autonomous_kl": summary(&autonomous_kl),
                     "teacher_features_kl": summary(&teacher_kl), "fixed_mask_replay_max_abs_all_nodes": replay_max_abs,
+                    "amplitudes_computed_per_token": masked.z.iter().enumerate().map(|(k, _)| masked.pieces(k)).sum::<usize>(),
+                    "execution_cost_note": "dense library reads include off components; active counts omit this work",
+                    "retained_factor_entries_per_token": {"autonomous": retained_entries(&autonomous_masks),
+                        "teacher_features": retained_entries(&teacher_masks)},
+                    "bias_curve": bias_curve,
+                    "compiled_execution": compiled_execution,
+                    "bias_curve_scope": "fixed policy variants on these inputs; no held-out optimum or description-length comparison claimed",
                     "sites": changes}))
     } else { None };
     let mut records = Vec::new();
@@ -198,7 +262,10 @@ fn main() -> Result<(), String> {
         "export": export, "library": library_dir, "sets": sets_dir, "source": imported.record["source"],
         "sequences": sequences, "context": context, "sets_context": length,
         "elapsed_seconds": started.elapsed().as_secs_f64(),
+        "timing": {"native_forward_seconds": native_seconds, "masked_build_seconds": build_seconds,
+                   "fixed_mask_forward_seconds": fixed_mask_seconds, "scope": "single wall-clock observations, not a speedup benchmark"},
         "joint_kl": summary(&joint_kl), "all_on_kl": summary(&all_on_kl), "sites": records,
+        "retained_factor_entries_per_token": retained_entries(&masks),
         "switch_execution": switch_execution
     });
     std::fs::write(&out, serde_json::to_vec_pretty(&result).map_err(|e| e.to_string())?).map_err(|e| format!("{}: {e}", out.display()))?;

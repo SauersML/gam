@@ -75,6 +75,9 @@ pub mod composition;
 // Learned switches evaluated on the executable explanation's own intermediate states.
 pub mod switched;
 
+// Static dependency-preserving compilation of a fixed switching policy.
+pub mod switched_compile;
+
 // Program decomposition by two-part code: primitives propose, a change is kept when the measured total drops.
 pub mod engine;
 
