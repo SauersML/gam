@@ -63,9 +63,12 @@
 //! E KL = KL(masks) + Σ_sites ½ gᵀS + ½ (¼ SᵀF S + 1/12 Σ_off Z_cᵀ F Z_c),
 //! ```
 //!
-//! `g` the KL's gradient at the written value and `F` its Fisher ([`box_excess`]). A fit under the
-//! box claim learns subcomponents that explain the input whatever the off ones are set to, not only
-//! at exactly one mask.
+//! `g` the KL's gradient at the written value and `F` its Fisher ([`box_excess`]). The claim is
+//! about every point of the box, so its error is the worst case: [`box_excess_at`] charges each
+//! sequence the largest of that expectation and the exact KL at every layer's vertex (one layer
+//! masked, the rest's off gates at 1), which the expectation barely sees and which a set whose
+//! layers cancel each other's errors fails. A fit under the box claim learns subcomponents that
+//! explain the input whatever the off ones are set to, not only at exactly one mask.
 //!
 //! # Behaviours
 //!
@@ -734,9 +737,64 @@ pub fn kl_and_logits(masked: &Masked, family: &FamilyInputs, target: &Target) ->
     Ok((values, logits))
 }
 
-/// The box claim's excess per input ([`box_excess`]) at `masks`, on the program's device twin
-/// when it has one (module note, "Devices").
+/// The box claim's error beyond the masks' own KL, per input (module note, "Claims"): the worst,
+/// per sequence, of the box points evaluated. They are the masks themselves (no excess), the
+/// expectation over uniform off gates ([`expected_box_excess_at`]), and every layer's vertex (that
+/// layer's sites at the masks, every other site's off gates at 1), whose KL is exact. A sequence is
+/// charged the point of its largest total, so a set whose layers only cancel each other's errors
+/// pays for it. A lower bound on the claim's worst case.
 pub fn box_excess_at(masked: &Masked, base: &FamilyInputs, target: &Target, masks: &[Array2<f64>], fishers: &[Array2<f64>]) -> Result<Array1<f64>, String> {
+    let rows = base.rows;
+    let sequence_of: Vec<usize> = match &base.layout {
+        Some(layout) => layout.sequence.iter().map(|s| *s as usize).collect(),
+        None => (0..rows).collect(),
+    };
+    let sequences = sequence_of.iter().copied().max().map_or(0, |m| m + 1);
+    let per_sequence = |values: &Array1<f64>| {
+        let mut totals = vec![0.0; sequences];
+        for r in 0..rows {
+            totals[sequence_of[r]] += values[r];
+        }
+        totals
+    };
+    let mut worst = expected_box_excess_at(masked, base, target, masks, fishers)?;
+    let mut totals = per_sequence(&worst);
+    // The masks themselves are a point of the box.
+    for r in 0..rows {
+        if totals[sequence_of[r]] < 0.0 {
+            worst[r] = 0.0;
+        }
+    }
+    totals.iter_mut().for_each(|t| *t = t.max(0.0));
+    // Sites by layer: the name up to its last `.`.
+    let mut layers: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (k, site) in masked.sites.iter().enumerate() {
+        layers.entry(site.name.rsplit_once('.').map_or_else(|| site.name.clone(), |(layer, _)| layer.to_string())).or_default().push(k);
+    }
+    if layers.len() > 1 {
+        let corner = score_only(masked, &masked.family(base, masks), target)?;
+        for sites in layers.values() {
+            let vertex: Vec<Array2<f64>> =
+                masks.iter().enumerate().map(|(k, m)| if sites.contains(&k) { m.clone() } else { Array2::ones(m.dim()) }).collect();
+            let excess = &score_only(masked, &masked.family(base, &vertex), target)? - &corner;
+            let vertex_totals = per_sequence(&excess);
+            for r in 0..rows {
+                let q = sequence_of[r];
+                if vertex_totals[q] > totals[q] {
+                    worst[r] = excess[r];
+                }
+            }
+            for q in 0..sequences {
+                totals[q] = totals[q].max(vertex_totals[q]);
+            }
+        }
+    }
+    Ok(worst)
+}
+
+/// The box claim's expected excess per input over uniform off gates ([`box_excess`]) at `masks`,
+/// on the program's device twin when it has one (module note, "Devices").
+pub fn expected_box_excess_at(masked: &Masked, base: &FamilyInputs, target: &Target, masks: &[Array2<f64>], fishers: &[Array2<f64>]) -> Result<Array1<f64>, String> {
     let family = masked.family(base, masks);
     if (0..masked.sites.len()).all(|k| masked.is_rank_one(k))
         && let Some(excess) = masked.on_device(|accelerated| {
