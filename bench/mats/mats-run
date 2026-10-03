@@ -76,7 +76,6 @@ envp=()
 [ -n "${MATS_ENV:-}" ] && read -r -a extra <<< "$MATS_ENV" && envp+=("${extra[@]}")
 cmd=$(printf '%q ' "${words[@]}")
 cmd=${cmd//\\@\\@BIN\\@\\@/@@BIN@@}
-cmd=${cmd//@@BIN@@/@@BIN@@}
 [ ${#envp[@]} -gt 0 ] && cmd="env $(printf '%q ' "${envp[@]}")$cmd"
 
 if [ ${#uploads[@]} -gt 0 ] && [ -z "${MATS_NO_UPLOAD:-}" ]; then

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Cancel our MATS jobs named NAME (#2951):  mats-cancel NAME...
+set -Eeuo pipefail
+[ $# -ge 1 ] || { echo "usage: mats-cancel NAME..." >&2; exit 2; }
+for n in "$@"; do ssh mats "scancel -u \$USER -n '$n' && echo cancelled $n"; done

@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# MATS cluster status (#2951).
+#
+#   mats-status          our jobs, our CPU/GPU/memory use against the QOS, the node, and others' queue
+#   mats-status NAME     also the last 30 lines of NAME's newest Slurm log and its job history
+set -Eeuo pipefail
+ssh mats bash -s -- "${1:-}" <<'REMOTE'
+name=$1
+squeue -u "$USER" -o '%.7i %.26j %.2t %.10M %.10l %.4C %.7m %.8b %R'
+squeue -u "$USER" -h -o '%t %C %m %b' | awk '
+    function gb(m) { return m ~ /G$/ ? m + 0 : m ~ /T$/ ? m * 1024 : m / 1024 }
+    { g = ($4 ~ /gpu/) ? substr($4, match($4, /[0-9]+$/)) + 0 : 0
+      if ($1 == "R") { c += $2; mm += gb($3); gg += g } else { pc += $2; pn++ } }
+    END { printf "ours: running %d/124 CPUs, %d/384 GB, %d/6 GPUs; pending %d jobs (%d CPUs)\n", c, mm, gg, pn, pc }'
+scontrol show node l40-worker | awk '/CPUAlloc/ { print "node: " $1 " " $2 } /AllocTRES/ { print "node: " $1 }'
+others=$(squeue -h -t PD -o '%u %r' | grep -v "^$USER " || true)
+echo "others pending: $(printf '%s\n' "$others" | grep -c . ) ($(printf '%s\n' "$others" | awk '{ print $2 }' | sort | uniq -c | awk '{ printf "%s %s; ", $1, $2 }'))"
+if [ -n "$name" ]; then
+    d=$HOME/mpd-data/cluster/$name
+    [ -f "$d/JOBS" ] && { echo "-- $d/JOBS"; tail -n 5 "$d/JOBS"; }
+    log=$(ls -t "$d"/slurm-*.log 2> /dev/null | head -1 || true)
+    if [ -n "$log" ]; then echo "-- $log"; tail -n 30 "$log"; else echo "-- no log yet in $d"; fi
+    jid=$(tail -n 1 "$d/JOBS" 2> /dev/null | awk '{ print $1 }')
+    [ -n "$jid" ] && sacct -j "$jid" -X -o JobID,State,Elapsed,AllocCPUS,MaxRSS,ExitCode -n 2> /dev/null || true
+fi
+REMOTE

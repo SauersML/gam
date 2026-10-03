@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Bring cluster results back (#2951).
+#
+#   mats-pull NAME...        ~/mpd-data/cluster/NAME/ on the cluster -> /Users/user/mpd-data/cluster/NAME/
+#   mats-pull /Users/user/mpd-data/PATH...   that path, from the cluster's ~/mpd-data/PATH
+set -Eeuo pipefail
+[ $# -ge 1 ] || { sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+for a in "$@"; do
+    case $a in
+        /Users/user/mpd-data/*)
+            rel=${a#/Users/user/mpd-data/}
+            rel=${rel%/}
+            mkdir -p "$(dirname "$a")"
+            if ssh mats test -d "mpd-data/$rel"; then
+                rsync -a "mats:mpd-data/$rel/" "/Users/user/mpd-data/$rel/"
+            else
+                rsync -a "mats:mpd-data/$rel" "/Users/user/mpd-data/$rel"
+            fi
+            echo "pulled /Users/user/mpd-data/$rel" ;;
+        */*) echo "mats-pull: give a NAME or a /Users/user/mpd-data path, not $a" >&2; exit 2 ;;
+        *)
+            mkdir -p "/Users/user/mpd-data/cluster/$a"
+            rsync -a "mats:mpd-data/cluster/$a/" "/Users/user/mpd-data/cluster/$a/"
+            echo "pulled /Users/user/mpd-data/cluster/$a" ;;
+    esac
+done
