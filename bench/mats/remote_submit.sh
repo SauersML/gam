@@ -44,8 +44,9 @@ rm -rf "$dest"
 mv "$dest.tmp" "$dest"
 touch "$dest/READY"
 echo "== $(date '+%F %T') installed $(ls "$dest" | wc -l) entries in $dest"
-# Keep the 12 newest builds; a running job keeps its deleted binary open.
-ls -1dt "$HOME"/mpd-bin/*/ | tail -n +13 | xargs -r rm -rf
+# Keep the 12 newest builds. On NFS a binary a running job still executes cannot be removed yet
+# (.nfs* placeholders), so pruning is best effort and never fails the build.
+ls -1dt "$HOME"/mpd-bin/*/ | tail -n +13 | xargs -r rm -rf 2> /dev/null || true
 BUILD
 
 exec 9> "$CL/_build/submit.lock"
