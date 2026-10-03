@@ -2,13 +2,13 @@
   "workflow": "Rust CI",
   "publish_job_status": "failure",
   "publish_job_status_note": "status of the job that PUBLISHED these results, not the conclusion of run_id -- this job is part of that run, so the run has not concluded here",
-  "publish_job_failed_steps": "step 9: Fail the run if any failure was collected",
-  "run_id": "37101306666",
-  "run_number": "6081",
+  "publish_job_failed_steps": "",
+  "run_id": "37138444584",
+  "run_number": "6082",
   "run_attempt": "1",
   "event": "schedule",
   "ref": "refs/heads/main",
-  "sha": "44aa1a4ca86859965991ceb39bd60962763cd3ed",
-  "completed_utc": "2026-10-03T11:56:28Z",
-  "run_url": "https://github.com/SauersML/gam/actions/runs/37101306666"
+  "sha": "79be4a070561a2ebf6b4a3b569660b32eb069ef8",
+  "completed_utc": "2026-10-03T17:11:36Z",
+  "run_url": "https://github.com/SauersML/gam/actions/runs/37138444584"
 }
