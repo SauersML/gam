@@ -7,9 +7,10 @@ log. Writes ~/mpd-data/figures/data/weights_ran.json.
 
 A set is either a directory (indptr.i64, indices.i64, sites.txt) or a .npy prefix PREFIX with
 PREFIX.{indptr,indices,offsets}.npy (sites in vpd4l_sets/sites.txt order). rows=N keeps the first N rows of
-512 tokens of every set, so sets dumped on fewer rows are compared on the same words.
+512 tokens of every set, so sets dumped on fewer rows are compared on the same words. tag=T writes
+weights_ran_T.json instead.
 
-usage: weights_ran_data.py [rows=N] [NAME=SETS ...]      (default: vpd=~/mpd-data/pieces/vpd4l_sets)
+usage: weights_ran_data.py [rows=N] [tag=T] [NAME=SETS ...]      (default: vpd=~/mpd-data/pieces/vpd4l_sets)
 """
 import json
 import re
@@ -29,6 +30,7 @@ for line in LOG.read_text().splitlines():
 dense_site = {s: a * b for s, (a, b) in shape.items()}
 args = dict(a.split("=", 1) for a in sys.argv[1:])
 rows = int(args.pop("rows")) if "rows" in args else None
+tag = args.pop("tag", None)
 sets = args or {"vpd": str(P / "vpd4l_sets")}
 SITES = [(n, int(c)) for n, c in (l.split() for l in (P / "vpd4l_sets/sites.txt").read_text().splitlines())]
 
@@ -62,5 +64,5 @@ for name, d in sets.items():
                          "per_site_weights": {n: float(w) for (n, _), w in zip(sites, per_site_w)},
                          "per_site_subcomponents": {n: float(k) for (n, _), k in zip(sites, per_site_n)}}
     print(name, "mean weights/word", per_word.mean(), "subcomponents/word", len(ix) / T)
-json.dump(out, open(Path.home() / "mpd-data/figures/data/weights_ran.json", "w"))
+json.dump(out, open(Path.home() / f"mpd-data/figures/data/weights_ran{'_' + tag if tag else ''}.json", "w"))
 print("dense weights/word", out["dense_per_word"])

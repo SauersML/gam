@@ -1,18 +1,25 @@
 """Weight numbers that ran per word on VPD 4L: the full model, VPD's choice of subcomponents, and ours
-(#2951). Data from weights_ran_data.py."""
+(#2951). Data from weights_ran_data.py.
+
+usage: weights_ran_fig.py [TAG]      (reads weights_ran_TAG.json, writes weights_ran_per_word_TAG.png)
+"""
 import json
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import LinearSegmentedColormap
 
-d = json.load(open(Path.home() / "mpd-data/figures/data/weights_ran.json"))
+TAG = sys.argv[1] if len(sys.argv) > 1 else ""
+SUFFIX = f"_{TAG}" if TAG else ""
+d = json.load(open(Path.home() / f"mpd-data/figures/data/weights_ran{SUFFIX}.json"))
 INK, INK2, MUTED, SURF, GRID, AXIS = "#0b0b0b", "#52514e", "#898781", "#fcfcfb", "#e1e0d9", "#c3c2b7"
 GRAY, ORANGE, BLACK = "#b9b8b1", "#eb6834", "#0b0b0b"
 plt.rcParams.update({"font.family": ["Helvetica Neue", "Arial Unicode MS"], "font.size": 15})
 seq = LinearSegmentedColormap.from_list("seq", ["#f3f2ee", "#9ec5f4", "#2a78d6", "#104281"])
-NAMES = {"vpd": ("VPD's choice of subcomponents", ORANGE), "ours": ("our choice (Step A)", BLACK)}
+NAMES = {"vpd": ("VPD's choice of subcomponents", ORANGE), "ours": ("our choice (Step A)", BLACK),
+         "corner": ("our choice (Step A,\noff means exactly off)", BLACK)}
 dense = d["dense_per_word"]
 rows = [("the full model", GRAY, np.array([dense]))]
 rows += [(NAMES.get(k, (k, BLACK))[0], NAMES.get(k, (k, BLACK))[1], np.array(v["per_word"])) for k, v in d["sets"].items()]
@@ -92,6 +99,6 @@ fig.suptitle(title, color=INK, fontsize=21,
              fontweight="bold", x=0.02, ha="left", y=0.975)
 fig.text(0.02, 0.915, f"VPD's 4-layer model on {rows[1][2].size:,} words of web text; a subcomponent of an m × n matrix counts m + n numbers, "
          "the full model counts every weight of its 24 attention and MLP matrices", color=INK2, fontsize=14, ha="left")
-out = Path.home() / "mpd-data/figures/weights_ran_per_word.png"
+out = Path.home() / f"mpd-data/figures/weights_ran_per_word{SUFFIX}.png"
 fig.savefig(out, facecolor=SURF)
 print(out)
