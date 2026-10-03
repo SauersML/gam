@@ -2865,7 +2865,8 @@ pub fn box_excess(
 ) -> Result<(Array1<f64>, Option<BoxGradients>), String> {
     let written: Vec<usize> = masked.written.iter().flatten().copied().collect();
     let back = super::derivatives::vjp_from(&masked.program, family, trace, masked.program.output, cotangent, Some(&written)).map_err(|e| e.to_string())?;
-    box_excess_back(masked, trace, &back, masks, &masked.box_terms(fishers)?, fishers, gradients)
+    let terms = masked.box_terms(fishers)?;
+    box_excess_back(masked, trace, &back, masks, &terms, fishers, gradients)
 }
 
 /// [`box_excess`] from a reverse pass `back` that kept every site's written nodes.
