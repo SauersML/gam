@@ -65,7 +65,8 @@
 //! * every sum of nonnegative terms is rounded up.
 //!
 //! Operators with a low-rank body are refused, since their product is not stored. A form whose
-//! radius overflows makes every bound infinite.
+//! radius overflows makes every bound infinite. With `MPD_CERTIFY_TRACE` set, every node's mean
+//! half-width and each row's logit-gap widths go to stderr, to show where the relaxation widens.
 //!
 //! # Branching
 //!
@@ -934,6 +935,8 @@ pub fn certify_program(
         Ok(map)
     };
     let ones = vec![1.0; program.declarations.parameters];
+    // `MPD_CERTIFY_TRACE` set: every node's mean half-width and center on stderr.
+    let trace = std::env::var_os("MPD_CERTIFY_TRACE").is_some();
     let mut forms: Vec<Option<Vec<Row>>> = vec![None; nodes];
     let unbounded = || Array1::from_iter((0..rows).map(|r| if target.scores(r) { f64::INFINITY } else { 0.0 }));
     for index in 0..nodes {
@@ -1064,7 +1067,7 @@ pub fn certify_program(
         };
         let mut value = value;
         value.par_iter_mut().for_each(|x| x.reduce(budget));
-        if log::log_enabled!(log::Level::Debug) {
+        if trace {
             // Where the relaxation widens: each node's mean half-width against its mean center.
             let (mut reach, mut size, mut symbols) = (0.0, 0.0, 0);
             for x in &value {
@@ -1073,7 +1076,7 @@ pub fn certify_program(
                 size += x.center.mapv(f64::abs).mean().unwrap_or(0.0) / rows as f64;
                 symbols = symbols.max(x.ids.len());
             }
-            log::debug!("certify: node {index} {}: half-width {reach:.3e}, |center| {size:.3e}, {symbols} symbols", kind(&program.nodes[index]));
+            eprintln!("certify: node {index} {}: half-width {reach:.3e}, |center| {size:.3e}, {symbols} symbols", kind(&program.nodes[index]));
         }
         if value.iter().any(|x| !x.finite()) {
             return Ok(unbounded());
@@ -1101,6 +1104,11 @@ pub fn certify_program(
             };
             if lower.len() != reference.len() {
                 return Err(format!("{} logits against a reference of {}", lower.len(), reference.len()));
+            }
+            if trace {
+                let width = Zip::from(&upper).and(&lower).fold(0.0_f64, |m, &h, &l| m.max(h - l));
+                let mean = (&upper - &lower).mean().unwrap_or(0.0);
+                eprintln!("certify: row {r} logit gaps: widest {width:.3e}, mean width {mean:.3e}");
             }
             let radius = reference_radius.map_or(zero.view(), |m| m.row(r));
             let status = kl_supremum_over_gap_box(reference, radius, top, lower.view(), upper.view()).map_err(|e| e.to_string())?;
