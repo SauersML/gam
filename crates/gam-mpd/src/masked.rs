@@ -65,9 +65,10 @@
 //!
 //! `g` the KL's gradient at the written value and `F` its Fisher ([`box_excess`]). The claim is
 //! about every point of the box, so its error is the worst case: [`box_excess_at`] charges each
-//! sequence the largest of that expectation and the exact KL at every layer's vertex (one layer
+//! sequence the largest of that expectation, the exact KL at every layer's vertex (one layer
 //! masked, the rest's off gates at 1), which the expectation barely sees and which a set whose
-//! layers cancel each other's errors fails. A fit under the box claim learns subcomponents that
+//! layers cancel each other's errors fails, and the exact KL along a few sign-ascent steps of an
+//! adversary in the off gates. A fit under the box claim learns subcomponents that
 //! explain the input whatever the off ones are set to, not only at exactly one mask.
 //!
 //! # Behaviours
@@ -739,8 +740,9 @@ pub fn kl_and_logits(masked: &Masked, family: &FamilyInputs, target: &Target) ->
 
 /// The box claim's error beyond the masks' own KL, per input (module note, "Claims"): the worst,
 /// per sequence, of the box points evaluated. They are the masks themselves (no excess), the
-/// expectation over uniform off gates ([`expected_box_excess_at`]), and every layer's vertex (that
-/// layer's sites at the masks, every other site's off gates at 1), whose KL is exact. A sequence is
+/// expectation over uniform off gates ([`expected_box_excess_at`]), every layer's vertex (that
+/// layer's sites at the masks, every other site's off gates at 1), and the points of a few
+/// sign-ascent steps of the KL in the off gates from ½, each of whose KL is exact. A sequence is
 /// charged the point of its largest total, so a set whose layers only cancel each other's errors
 /// pays for it. A lower bound on the claim's worst case.
 pub fn box_excess_at(masked: &Masked, base: &FamilyInputs, target: &Target, masks: &[Array2<f64>], fishers: &[Array2<f64>]) -> Result<Array1<f64>, String> {
@@ -894,6 +896,37 @@ fn box_worst(
             for q in 0..sequences {
                 totals[q] = totals[q].max(vertex_totals[q]);
             }
+        }
+    }
+    // An adversary inside the box: from every off gate at ½, `PGD_STEPS` sign-ascent steps of the
+    // KL in the off gates (on gates stay at 1), each point's exact KL a candidate.
+    const PGD_STEPS: usize = 3;
+    let step = 1.0 / PGD_STEPS as f64;
+    let mut gates: Vec<Array2<f64>> = masks.iter().map(|m| m.mapv(|x| if x > 0.0 { 1.0 } else { 0.5 })).collect();
+    for round in 0..=PGD_STEPS {
+        let family = masked.family(base, &gates);
+        let (kl_point, trace, cotangent) = forward(masked, &family, target)?;
+        let excess = &kl_point - corner;
+        let point_totals = per_sequence(&excess);
+        for r in 0..rows {
+            let q = sequence_of[r];
+            if point_totals[q] > totals[q] {
+                worst[r] = excess[r];
+            }
+        }
+        for q in 0..sequences {
+            totals[q] = totals[q].max(point_totals[q]);
+        }
+        if round == PGD_STEPS {
+            break;
+        }
+        let ascent = mask_gradients(masked, &family, &trace, cotangent)?;
+        for ((g, m), a) in gates.iter_mut().zip(masks).zip(&ascent) {
+            ndarray::Zip::from(g).and(m).and(a).for_each(|g, &m, &a| {
+                if m <= 0.0 {
+                    *g = (*g + step * a.signum()).clamp(0.0, 1.0);
+                }
+            });
         }
     }
     Ok(worst)
