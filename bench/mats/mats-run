@@ -17,10 +17,11 @@
 # log is ~/mpd-data/cluster/NAME/slurm-JOBID.log there.
 #
 # Environment: MATS_GPUS=N (L40s; CUDA 12.2 libs are on LD_LIBRARY_PATH), MATS_QOS=debug (2 h max),
-# MATS_ENV="K=V ..." (extra environment for the command; RUST_LOG is forwarded when set).
+# MATS_ENV="K=V ..." (extra environment for the command; RUST_LOG is forwarded when set), MATS_DRY=1
+# (print the translated command and the uploads, submit nothing).
 set -Eeuo pipefail
 here=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
-usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 [ $# -ge 6 ] && [ "$5" = -- ] || usage
 NAME=$1 CPUS=$2 MEM=$3 HOURS=$4
 shift 5
@@ -58,6 +59,15 @@ for a in "$@"; do
         case $a in
             "$MAC_GAM"/target/*/examples/*|target/*/examples/*|./target/*/examples/*) a="@@BIN@@/${a##*/}" ;;
             python|python3|"$MAC_DATA"/venv/bin/python*) a=python ;;
+            /*)
+                # A Mac binary (say a pinned copy like engine/bin/mpd_pieces_masked_d0ff) runs as the
+                # same example built at the chosen commit.
+                if [ -f "$a" ] && file -b "$a" | grep -q Mach-O; then
+                    ex=${a##*/}
+                    [[ $ex =~ _2951$ ]] || ex=$(sed -E 's/_[0-9a-f]{4,}$//' <<< "$ex")_2951
+                    echo "mats-run: Mac binary ${a##*/} runs as the commit's $ex" >&2
+                    a="@@BIN@@/$ex"
+                fi ;;
         esac
         first=0
     fi
@@ -78,6 +88,11 @@ cmd=$(printf '%q ' "${words[@]}")
 cmd=${cmd//\\@\\@BIN\\@\\@/@@BIN@@}
 [ ${#envp[@]} -gt 0 ] && cmd="env $(printf '%q ' "${envp[@]}")$cmd"
 
+if [ -n "${MATS_DRY:-}" ]; then
+    echo "uploads: ${uploads[*]:-none}"
+    echo "command: $cmd"
+    exit 0
+fi
 if [ ${#uploads[@]} -gt 0 ] && [ -z "${MATS_NO_UPLOAD:-}" ]; then
     rel=()
     for p in "${uploads[@]}"; do rel+=("$MAC_DATA/./${p#"$MAC_DATA"/}"); done
