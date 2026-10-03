@@ -583,9 +583,9 @@ fn main() -> Result<(), String> {
         }
         eprintln!("reads projected to {kept:?} dimensions ({:.0}s)", started.elapsed().as_secs_f64());
     }
-    // The library the run starts from, as it stands after projection (`OUT.library/`, the
-    // `library:DIR` layout), so other scorers read exactly the subcomponents selected over.
-    {
+    // The library selected over (`OUT.library/`, the `library:DIR` layout), so other scorers read
+    // exactly its subcomponents: after projection, and again at every full eval (it trains).
+    let dump_library = |masked: &Masked| -> Result<(), String> {
         let dir = out.with_extension("library");
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let raw = |m: &Array2<f64>| m.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
@@ -594,7 +594,9 @@ fn main() -> Result<(), String> {
             std::fs::write(dir.join(format!("{}.v.f64", site.name)), raw(&library.v)).map_err(|e| e.to_string())?;
             std::fs::write(dir.join(format!("{}.u.f64", site.name)), raw(&library.u)).map_err(|e| e.to_string())?;
         }
-    }
+        Ok(())
+    };
+    dump_library(&masked)?;
     let mut costs = costs_of(&masked)?;
     if start == "wsvd2" && resumed.is_none() {
         let inputs = sequence(0);
@@ -823,6 +825,7 @@ fn main() -> Result<(), String> {
         let point = point_of(&selected, &started, &all_on, evaluated);
         let code = point["code"].as_f64().unwrap_or(f64::INFINITY);
         if full {
+            dump_library(masked)?;
             let flat: Vec<f64> = costs.iter().flat_map(|c| c.iter().copied()).collect();
             write_npy(&PathBuf::from(format!("{}.pass{pass}.costs.npy", stem.display())), "<f8", flat.iter().map(|v| v.to_le_bytes()))?;
         }
