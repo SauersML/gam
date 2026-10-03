@@ -784,17 +784,50 @@ fn lone_head(masked: &Masked) -> Option<(usize, usize, gam_gpu::banded::Layout)>
     matches!(program.operators[operator].body, OperatorBody::Dense { .. }).then_some((hidden, operator, layout))
 }
 
-/// A vertex's KL per input from the hidden values `hidden` before the head ([`lone_head`]): the
-/// head's product in f32 on the device, each row's KL with a bound on its error (`2 maxⱼ band`, the
-/// KL's gradient in the logits being `q − p`, of `ℓ₁` norm at most 2), or exact with no band when
-/// the product stays on the CPU.
-fn screened_kl(masked: &Masked, target: &Target, hidden: &Array2<f64>, operator: usize, layout: gam_gpu::banded::Layout) -> Result<(Array1<f64>, Array1<f64>), String> {
+/// A box point's KL per input from its hidden values `hidden` before the head ([`lone_head`]),
+/// certified against the worst so far: the head's product runs in f32 on the device, each row's
+/// KL with a bound on its error (`2 maxⱼ band`, the KL's gradient in the logits being `q − p`, of
+/// `ℓ₁` norm at most 2). A sequence whose total excess over `corner` could exceed its worst
+/// `totals` gets its rows' KL exactly; every other banded row is lowered by its band, so the point
+/// cannot win that sequence, as its exact KL could not either. Also returns the logits (f32 where
+/// the device ran them), which only steer.
+fn certified_point(
+    masked: &Masked,
+    target: &Target,
+    hidden: &Array2<f64>,
+    (operator, layout): (usize, gam_gpu::banded::Layout),
+    corner: &Array1<f64>,
+    totals: &[f64],
+    sequence_of: &[usize],
+) -> Result<(Array1<f64>, Array2<f64>), String> {
+    let rows = hidden.nrows();
     let op = &masked.program.operators[operator];
-    if let Some(banded) = super::device::banded_product(op, hidden, layout).map_err(|e| e.to_string())? {
-        let band = Array1::from_shape_fn(hidden.nrows(), |r| if target.scores(r) { 2.0 * banded.band.row_max(r) } else { 0.0 });
-        return Ok((kl_score_only(target, &banded.values), band));
+    let Some(banded) = super::device::banded_product(op, hidden, layout).map_err(|e| e.to_string())? else {
+        let logits = exact_head(masked, hidden, operator, layout);
+        return Ok((kl_score_only(target, &logits), logits));
+    };
+    let band = Array1::from_shape_fn(rows, |r| if target.scores(r) { 2.0 * banded.band.row_max(r) } else { 0.0 });
+    let logits = banded.values;
+    let mut kl_point = kl_score_only(target, &logits);
+    let mut upper = vec![0.0; totals.len()];
+    for r in 0..rows {
+        upper[sequence_of[r]] += kl_point[r] + band[r] - corner[r];
     }
-    Ok((kl_score_only(target, &exact_head(masked, hidden, operator, layout)), Array1::zeros(hidden.nrows())))
+    let is_open: Vec<bool> = (0..rows).map(|r| band[r] > 0.0 && upper[sequence_of[r]] > totals[sequence_of[r]]).collect();
+    let open: Vec<usize> = (0..rows).filter(|r| is_open[*r]).collect();
+    if !open.is_empty() {
+        let exact = exact_head(masked, &hidden.select(Axis(0), &open), operator, layout);
+        let sub = Target { logits: target.logits.select(Axis(0), &open), scored: target.scored.as_ref().map(|s| open.iter().map(|r| s[*r]).collect()) };
+        for (i, value) in kl_score_only(&sub, &exact).into_iter().enumerate() {
+            kl_point[open[i]] = value;
+        }
+    }
+    for r in 0..rows {
+        if band[r] > 0.0 && !is_open[r] {
+            kl_point[r] -= band[r];
+        }
+    }
+    Ok((kl_point, logits))
 }
 
 /// The head's float64 product on `hidden`.
@@ -983,7 +1016,7 @@ fn box_worst(
     }
     // The program up to the head's hidden node, when the head is a lone product: a vertex's
     // logits are then screened in f32 and made exact only for the sequences it may decide.
-    let head = lone_head(masked).filter(|_| all_on.is_some());
+    let head = lone_head(masked);
     let body = head.map(|(hidden, _, _)| {
         let mut body = masked.program.clone();
         body.nodes.truncate(hidden + 1);
@@ -1000,31 +1033,7 @@ fn box_worst(
             let kl_vertex = match (all_on, &body, head) {
                 (Some(trace), Some(body), Some((hidden, operator, layout))) if from <= hidden => {
                     let top = body.execute_suffix(&family, trace, from).map_err(|e| e.to_string())?;
-                    let hidden_values = &top[hidden - from];
-                    let (mut kl_vertex, band) = screened_kl(masked, target, hidden_values, operator, layout)?;
-                    // A sequence this vertex may decide (its total within the band of beating the
-                    // worst so far) gets its rows' KL exactly; the others cannot be beaten by it.
-                    let mut upper = vec![0.0; sequences];
-                    for r in 0..rows {
-                        upper[sequence_of[r]] += kl_vertex[r] + band[r] - corner[r];
-                    }
-                    let is_open: Vec<bool> = (0..rows).map(|r| band[r] > 0.0 && upper[sequence_of[r]] > totals[sequence_of[r]]).collect();
-                    let open: Vec<usize> = (0..rows).filter(|r| is_open[*r]).collect();
-                    if !open.is_empty() {
-                        let exact = exact_head(masked, &hidden_values.select(Axis(0), &open), operator, layout);
-                        let sub = Target { logits: target.logits.select(Axis(0), &open), scored: target.scored.as_ref().map(|s| open.iter().map(|r| s[*r]).collect()) };
-                        for (i, value) in kl_score_only(&sub, &exact).into_iter().enumerate() {
-                            kl_vertex[open[i]] = value;
-                        }
-                    }
-                    // Rows still banded belong to sequences the vertex cannot win: their excess
-                    // is set to its lower end, so the comparison below leaves them alone.
-                    for r in 0..rows {
-                        if band[r] > 0.0 && !is_open[r] {
-                            kl_vertex[r] -= band[r];
-                        }
-                    }
-                    kl_vertex
+                    certified_point(masked, target, &top[hidden - from], (operator, layout), corner, &totals, &sequence_of)?.0
                 }
                 (Some(trace), _, _) if masked.head.is_none() && from <= masked.program.output => {
                     let top = masked.program.execute_suffix(&family, trace, from).map_err(|e| e.to_string())?;
@@ -1052,7 +1061,31 @@ fn box_worst(
     let mut gates: Vec<Array2<f64>> = masks.iter().map(|m| m.mapv(|x| if x > 0.0 { 1.0 } else { 0.5 })).collect();
     for round in 0..=PGD_STEPS {
         let family = masked.family(base, &gates);
-        let (kl_point, trace, cotangent) = forward(masked, &family, target)?;
+        // With a lone head, the body runs in f64, the point is certified with the head in f32
+        // ([`certified_point`]), and the ascent's reverse pass starts at the hidden node from the
+        // logits' cotangent (it only steers).
+        let (kl_point, trace, seed) = match (&body, head) {
+            (Some(body), Some((hidden, operator, layout))) => {
+                let trace = body.execute(&family, false).map_err(|e| e.to_string())?;
+                let (kl_point, logits) = certified_point(masked, target, &trace.values[hidden], (operator, layout), corner, &totals, &sequence_of)?;
+                let seed = if round < PGD_STEPS {
+                    let backward = match layout {
+                        gam_gpu::banded::Layout::Transposed => gam_gpu::banded::Layout::AsStored,
+                        gam_gpu::banded::Layout::AsStored => gam_gpu::banded::Layout::Transposed,
+                    };
+                    let cotangent = kl(target, &logits).1;
+                    let op = &masked.program.operators[operator];
+                    Some((hidden, proposing(|| super::device::product(op, &cotangent, backward)).map_err(|e| e.to_string())?))
+                } else {
+                    None
+                };
+                (kl_point, trace, seed)
+            }
+            _ => {
+                let (kl_point, trace, cotangent) = forward(masked, &family, target)?;
+                (kl_point, trace, Some((masked.program.output, cotangent)))
+            }
+        };
         let excess = &kl_point - corner;
         let point_totals = per_sequence(&excess);
         for r in 0..rows {
@@ -1067,7 +1100,9 @@ fn box_worst(
         if round == PGD_STEPS {
             break;
         }
-        let ascent = mask_gradients(masked, &family, &trace, cotangent)?;
+        let (node, cotangent) = seed.ok_or("PGD: no ascent seed")?;
+        let back = proposing(|| super::derivatives::vjp_from(&masked.program, &family, &trace, node, cotangent, Some(&masked.masked))).map_err(|e| e.to_string())?;
+        let ascent = mask_gradients_of(masked, &trace, &back);
         for ((g, m), a) in gates.iter_mut().zip(masks).zip(&ascent) {
             ndarray::Zip::from(g).and(m).and(a).for_each(|g, &m, &a| {
                 if m <= 0.0 {

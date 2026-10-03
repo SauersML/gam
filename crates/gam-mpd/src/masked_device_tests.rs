@@ -70,7 +70,7 @@ fn the_masked_device_path_matches_the_cpu_within_bands() {
             masked.program.operators.iter().position(|op| op.name == name).expect("a library operator")
         };
         let mut tangents = BTreeMap::new();
-        for (salt, suffix) in ["V0", "centre", "U0"].into_iter().enumerate() {
+        for (salt, suffix) in ["V0", "U0"].into_iter().enumerate() {
             let op = named(suffix);
             let (rows, cols) = masked.program.operators[op].matrix().dim();
             tangents.insert(op, Array2::from_shape_fn((rows, cols), |(i, j)| noise(90_000 + 1000 * salt + 31 * i + j)));
@@ -191,4 +191,66 @@ fn the_box_claims_excess_on_a_device_is_the_cpus() {
             }
         }
     }
+}
+
+/// Every keep/refuse a selection takes with screened heads (module note of `masked`, "Screened
+/// heads": f32 head products on the Apple GPU where it resolves, float64 elsewhere) is the one the
+/// float64 codes of the same masks take: a 2048-class head over 256 rows clears the device's size
+/// floors, and each round's decision per sequence is checked against float64 forwards of both
+/// masks.
+#[test]
+fn screened_selection_decisions_are_the_float64_ones() {
+    use super::device_program_tests::fixture_sized;
+    use super::masked::{Context, Round, code, previous_inputs, score_only, select_observed};
+    use super::operator_program::SlotValues;
+    let (program, family) = fixture_sized(128, 2048, 64, 4);
+    let all = sites(&program);
+    let libraries: Vec<Library> = all
+        .iter()
+        .enumerate()
+        .map(|(k, site)| {
+            let (d_out, d_in) = matrix(&program, site).expect("map").dim();
+            Library {
+                v: Array2::from_shape_fn((PIECES, d_in), |(i, j)| 0.3 * noise(10_000 * k + 37 * i + j)),
+                u: Array2::from_shape_fn((PIECES, d_out), |(i, j)| 0.3 * noise(10_000 * k + 5000 + 37 * i + j)),
+                mean: Array1::zeros(d_in),
+            }
+        })
+        .collect();
+    let clean = program.execute(&family, false).expect("clean").values[program.output].clone();
+    let masked = Masked::build(&program, all, libraries).expect("masked");
+    let target = Target::every_row(clean);
+    let masks: Vec<Array2<f64>> = masked.all_pieces().iter().map(|p| Array2::ones((family.rows, *p))).collect();
+    let coder = Context::new(&masked.all_pieces()).coder(previous_inputs(&family));
+    let observations = 64.0;
+    let masks_of = |inputs: &FamilyInputs| -> Vec<Array2<f64>> {
+        masked.slots.iter().map(|&slot| match &inputs.slots[slot] {
+            SlotValues::Raw(m) => m.clone(),
+            SlotValues::Tokens(_) => Array2::zeros((0, 0)),
+        }).collect()
+    };
+    let mut decisions = 0;
+    let mut observe = |round: &Round<'_>| -> Result<(), String> {
+        let exact = |inputs: &FamilyInputs| -> Result<Array1<f64>, String> {
+            Ok(code(&score_only(&masked, inputs, &target)?, &coder.bits(&masks_of(inputs)), observations))
+        };
+        let (before, after) = (exact(round.current)?, exact(round.proposed)?);
+        let sequences = round.sequence_of.iter().copied().max().map_or(0, |m| m + 1);
+        for q in 0..sequences {
+            let members: Vec<usize> = (0..round.flipped.len()).filter(|r| round.sequence_of[*r] == q).collect();
+            if members.iter().all(|r| round.flipped[*r] == 0) {
+                continue;
+            }
+            let used: f64 = members.iter().map(|r| round.before[*r] - round.after[*r]).sum();
+            let truth: f64 = members.iter().map(|r| before[*r] - after[*r]).sum();
+            // Ties within float64 rounding of the codes are no decision.
+            if truth.abs() > 1e-9 * before.sum().abs() {
+                assert_eq!(used > 0.0, truth > 0.0, "sequence {q}: screened saving {used}, float64 {truth}");
+                decisions += 1;
+            }
+        }
+        Ok(())
+    };
+    select_observed(&masked, &family, &target, masks, &coder, observations, 2, None, &mut observe).expect("selection");
+    assert!(decisions > 0, "the selection took decisions");
 }

@@ -48,7 +48,12 @@ fn write(dir: &Path, files: &mut serde_json::Map<String, serde_json::Value>, nam
 
 /// A small export (`import::import_language_model`'s format) and its program and family.
 pub(super) fn fixture() -> (OperatorProgram, FamilyInputs) {
-    let dir = std::env::temp_dir().join(format!("gam-mpd-device-program-{}-{:?}", std::process::id(), std::thread::current().id()));
+    fixture_sized(D, VOCAB, CONTEXT, SEQUENCES)
+}
+
+/// [`fixture`] at width `d`, `vocab` classes and `sequences` sequences of `context` tokens.
+pub(super) fn fixture_sized(d: usize, vocab: usize, context: usize, sequences: usize) -> (OperatorProgram, FamilyInputs) {
+    let dir = std::env::temp_dir().join(format!("gam-mpd-device-program-{}-{:?}-{d}-{vocab}", std::process::id(), std::thread::current().id()));
     std::fs::create_dir_all(&dir).expect("dir");
     let mut files = serde_json::Map::new();
     let mut seed = 0;
@@ -57,31 +62,31 @@ pub(super) fn fixture() -> (OperatorProgram, FamilyInputs) {
         let base = seed;
         Array2::from_shape_fn((rows, cols), |(i, j)| scale * noise(base + i * cols + j))
     };
-    write(&dir, &mut files, "wte", &random(VOCAB, D, 1.0));
+    write(&dir, &mut files, "wte", &random(vocab, d, 1.0));
     for l in 0..2 {
         let p = format!("blocks.{l}.");
-        write(&dir, &mut files, &format!("{p}attn.q_proj"), &random(HEADS * HEAD_DIM, D, 0.5));
-        write(&dir, &mut files, &format!("{p}attn.k_proj"), &random(HEAD_DIM, D, 0.5));
-        write(&dir, &mut files, &format!("{p}attn.v_proj"), &random(HEAD_DIM, D, 0.5));
-        write(&dir, &mut files, &format!("{p}attn.o_proj"), &random(D, HEADS * HEAD_DIM, 0.5));
-        write(&dir, &mut files, &format!("{p}mlp.c_fc"), &random(HIDDEN, D, 0.5));
-        write(&dir, &mut files, &format!("{p}mlp.down_proj"), &random(D, HIDDEN, 0.5));
-        write(&dir, &mut files, &format!("{p}rms1.gain"), &(random(1, D, 0.2) + 1.0));
-        write(&dir, &mut files, &format!("{p}rms2.gain"), &(random(1, D, 0.2) + 1.0));
+        write(&dir, &mut files, &format!("{p}attn.q_proj"), &random(HEADS * HEAD_DIM, d, 0.5));
+        write(&dir, &mut files, &format!("{p}attn.k_proj"), &random(HEAD_DIM, d, 0.5));
+        write(&dir, &mut files, &format!("{p}attn.v_proj"), &random(HEAD_DIM, d, 0.5));
+        write(&dir, &mut files, &format!("{p}attn.o_proj"), &random(d, HEADS * HEAD_DIM, 0.5));
+        write(&dir, &mut files, &format!("{p}mlp.c_fc"), &random(HIDDEN, d, 0.5));
+        write(&dir, &mut files, &format!("{p}mlp.down_proj"), &random(d, HIDDEN, 0.5));
+        write(&dir, &mut files, &format!("{p}rms1.gain"), &(random(1, d, 0.2) + 1.0));
+        write(&dir, &mut files, &format!("{p}rms2.gain"), &(random(1, d, 0.2) + 1.0));
     }
-    write(&dir, &mut files, "final_norm.gain", &(random(1, D, 0.2) + 1.0));
-    let tokens = Array2::from_shape_fn((SEQUENCES, CONTEXT), |(s, t)| ((noise(7 * s + t + 99) + 1.0) * 6.4) as usize as f64 % VOCAB as f64);
+    write(&dir, &mut files, "final_norm.gain", &(random(1, d, 0.2) + 1.0));
+    let tokens = Array2::from_shape_fn((sequences, context), |(s, t)| ((noise(7 * s + t + 99) + 1.0) * 0.5 * vocab as f64) as usize as f64 % vocab as f64);
     write(&dir, &mut files, "tokens", &tokens);
     let record = serde_json::json!({
         "config": {
-            "d_model": D, "n_layers": 2, "n_heads": HEADS, "n_kv_heads": 1, "head_dim": HEAD_DIM,
-            "vocab": VOCAB, "rope_theta": 10000.0, "rope_pairing": "rotate_half", "norm_eps": 1e-6,
+            "d_model": d, "n_layers": 2, "n_heads": HEADS, "n_kv_heads": 1, "head_dim": HEAD_DIM,
+            "vocab": vocab, "rope_theta": 10000.0, "rope_pairing": "rotate_half", "norm_eps": 1e-6,
             "mlp_act": "gelu_tanh", "tied_embeddings": true,
         },
         "files": files,
     });
     std::fs::write(dir.join("export.json"), record.to_string()).expect("written");
-    let imported = import_language_model(&dir, SEQUENCES, CONTEXT).expect("imported");
+    let imported = import_language_model(&dir, sequences, context).expect("imported");
     std::fs::remove_dir_all(&dir).expect("removed");
     (imported.program, imported.contract.family)
 }
