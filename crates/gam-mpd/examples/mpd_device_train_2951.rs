@@ -13,7 +13,7 @@
 //! gradients summed, and every replica takes the same update.
 
 use gam_gpu::tensor::{Arithmetic, Device};
-use gam_mpd::blocks::Generic;
+use gam_mpd::describe::{Geometry, Metric, Structured, declared_charts};
 use gam_mpd::device_train::{Settings, Tally, Trainer, statistics};
 use gam_mpd::import::import_language_model;
 use gam_mpd::masked::{Library, Masked, matrix, sites};
@@ -89,7 +89,18 @@ fn main() -> Result<(), String> {
     let chunks = |range: std::ops::Range<usize>| -> Vec<Vec<usize>> { range.collect::<Vec<_>>().chunks(micro).map(<[usize]>::to_vec).collect() };
     let statistic_batches: Vec<_> = chunks(0..train.min(batch)).iter().map(|c| sequences(c)).collect();
     let measured = statistics(&device, model, &chosen, &statistic_batches, 2, 0xDE5C)?;
-    let describe = Generic::new(&measured, observations);
+    // Each subcomponent priced by its exact lattice description in its site's declared charts, as
+    // site_fit and e2e price it (gam_mpd::describe::Structured).
+    let describe = Structured::new(
+        chosen
+            .iter()
+            .zip(&measured)
+            .map(|(site, statistics)| {
+                let (writers, readers) = declared_charts(model, site)?;
+                Geometry::new(Metric::of(statistics, observations), writers, readers)
+            })
+            .collect::<Result<_, String>>()?,
+    );
     drop(measured);
     let mut replicas = Vec::new();
     for (r, replica) in devices.iter().enumerate() {
