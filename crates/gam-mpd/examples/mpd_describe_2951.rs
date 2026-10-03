@@ -207,9 +207,14 @@ fn decoded(coded: &Coded<'_>, blocked: &Blocked, geometry: &Structured) -> Resul
     for (k, ranks) in blocked.ranks.iter().enumerate() {
         let mut site = Vec::new();
         for c in 0..ranks.len() {
+            let on: f64 = blocked.masks.iter().map(|m| m[k].column(c).sum()).sum::<f64>();
+            if on == 0.0 {
+                // Never run, so never paid for and never read: left as it is.
+                site.push(0.0);
+                continue;
+            }
             let (base, _) = measure(coded, &out)?;
             let (u, v) = blocked.factors(k, c);
-            let on: f64 = blocked.masks.iter().map(|m| m[k].column(c).sum()).sum::<f64>().max(1.0);
             let current = out.clone();
             let d = geometry.sites[k].describe_exact(u, v, &mut |d| {
                 let (bits, _) = measure(coded, &replaced(&current, k, c, &d.u, &d.v)?)?;

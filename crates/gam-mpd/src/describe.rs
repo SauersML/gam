@@ -947,7 +947,9 @@ impl Geometry {
         // see (a reader outside a ReLU's active set, a direction only the decoded upstream excites)
         // is never repaired by a larger price, while the identity converges as precision grows.
         let mut best: Option<Description> = None;
-        for charts in [true, false] {
+        // The identity-only pass repeats the first when the site has no other chart.
+        let passes: &[bool] = if self.writers.len() == 1 && self.readers.len() == 1 && self.whitening.is_none() { &[true] } else { &[true, false] };
+        for &charts in passes {
             let mut calibration = 1.0_f64;
             let mut last = f64::NAN;
             for _ in 0..8 {
