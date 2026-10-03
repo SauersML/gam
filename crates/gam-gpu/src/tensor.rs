@@ -1556,10 +1556,11 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
 
         pub(super) fn softmax_rows(&self, scores: &mut Tensor, causal: bool) -> Result<(), GpuError> {
             let (rows, width) = (scores.rows as u32, scores.cols as u32);
+            let launch = cfg_rows(scores.rows);
             let causal = i32::from(causal);
             let f = self.function("softmax_rows")?;
             // SAFETY: one block per row of a rows × width buffer.
-            unsafe { self.stream.launch_builder(&f).arg(&rows).arg(&width).arg(&causal).arg(slice_mut(scores)?).launch(cfg_rows(scores.rows)) }
+            unsafe { self.stream.launch_builder(&f).arg(&rows).arg(&width).arg(&causal).arg(slice_mut(scores)?).launch(launch) }
                 .gpu_ctx("tensor softmax_rows")
                 .map(|_| ())
         }
