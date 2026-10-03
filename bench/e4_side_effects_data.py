@@ -40,7 +40,7 @@ REPL = json.load(open(FR / "e4_replication_ci0.5.json"))
 LAMS = (0.1, 1.0, 10.0, 100.0)
 LORAS = [f"lora{n}_lam{lam:g}" for n in (282, 10) for lam in LAMS]
 ALPHAS = (1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0)
-HELD0, N_HELD, SYN_D, SYN_PER = 48638, 4096, (8, 32, 128, 250), 32
+N_DOCS, MIN_DOMAIN, SCAN, SYN_D, SYN_PER = 3000, 50, 120000, (8, 32, 128, 250), 32
 CONTRAST = {"Ġis": "Ġare", "Ġare": "Ġis", "Ġwas": "Ġwere", "Ġwere": "Ġwas", "Ġhas": "Ġhave", "Ġhave": "Ġhas",
             "Ġdoes": "Ġdo", "Ġdo": "Ġdoes", "Ġa": "Ġan", "Ġan": "Ġa", "Ġthis": "Ġthese", "Ġthese": "Ġthis"}
 t0 = time.time()
@@ -200,30 +200,48 @@ def stage_lora(only=None):
 
 # ---------------------------------------------------------------- eval
 def heldout_tokens():
-    """[N_HELD + synthetic, 512] int32 rows and a synthetic-copy-distance vector (0 = natural row)."""
-    path = FR / "e4_side/rows.npz"
+    """Held-out Pile validation documents with their Pile subset (monology/pile-uncopyrighted val.jsonl.zst, the
+    uncopyrighted Pile this model was trained on): the first N_DOCS documents in their natural mix, then more
+    documents of any subset still short of MIN_DOMAIN, up to SCAN documents in. Each keeps its first 512 tokens
+    (padded with <|endoftext|>); then 128 rows of repeated random tokens. Returns tokens [R, 512] int32, lens [R],
+    domain [R] (str), syn_d [R] (copy distance of the synthetic rows, 0 for documents)."""
+    path = FR / "e4_side/pile_docs.npz"
     if path.exists():
         z = np.load(path)
-        return z["tokens"], z["syn_d"]
-    import pyarrow.parquet as pq
-    sys.path.insert(0, str(VD))
-    from vpd_model import VAL_PARQUET
-    col = pq.ParquetFile(VAL_PARQUET).read_row_group(1, columns=["input_ids"]).column("input_ids")
-    sl = col.slice(0, N_HELD).combine_chunks()
-    nat = sl.flatten().to_numpy().reshape(N_HELD, -1)[:, :512].astype(np.int32)
-    del col, sl
+        return z["tokens"], z["lens"], z["domain"], z["syn_d"]
+    from datasets import load_dataset
+    tok = tokenizer()
+    eot = tok.token_to_id("<|endoftext|>")
+    ds = load_dataset("monology/pile-uncopyrighted", data_files={"validation": "val.jsonl.zst"}, split="validation",
+                      streaming=True)
+    rows, lens, dom, count = [], [], [], {}
+    for i, d in enumerate(ds):
+        name = d["meta"]["pile_set_name"]
+        if i >= N_DOCS and count.get(name, 0) >= MIN_DOMAIN:
+            continue
+        ids = tok.encode(d["text"]).ids[:512]
+        if len(ids) < 16:
+            continue
+        rows.append(np.array(ids + [eot] * (512 - len(ids)), np.int32))
+        lens.append(len(ids))
+        dom.append(name)
+        count[name] = count.get(name, 0) + 1
+        if i >= SCAN or (i >= N_DOCS and min(count.values()) >= MIN_DOMAIN):
+            break
+    log(f"{len(rows)} documents: {sorted(count.items(), key=lambda kv: -kv[1])}")
     rng = np.random.default_rng(0)
-    syn, syn_d = [], []
+    syn_d = []
     for d in SYN_D:
         for _ in range(SYN_PER):
-            filler = rng.integers(1000, 30000, 512 - 2 * d)
             s = rng.integers(1000, 30000, d)
-            syn.append(np.concatenate([filler, s, s]).astype(np.int32))
+            rows.append(np.concatenate([rng.integers(1000, 30000, 512 - 2 * d), s, s]).astype(np.int32))
+            lens.append(512)
+            dom.append("synthetic")
             syn_d.append(d)
-    tokens = np.concatenate([nat, np.stack(syn)])
-    syn_d = np.concatenate([np.zeros(N_HELD, np.int32), np.array(syn_d, np.int32)])
-    np.savez(path, tokens=tokens, syn_d=syn_d)
-    return tokens, syn_d
+    syn_d = np.concatenate([np.zeros(len(rows) - len(syn_d), np.int32), np.array(syn_d, np.int32)])
+    out = (np.stack(rows), np.array(lens), np.array(dom), syn_d)
+    np.savez(path, tokens=out[0], lens=out[1], domain=out[2], syn_d=out[3])
+    return out
 
 
 def solve_alpha(pf, W0, U, V, u_o, p_target, lo=0.5, hi=12.0):
@@ -312,15 +330,16 @@ def stage_eval():
     import torch
     import torch.nn.functional as F
     target, W0, models, meta = edit_variants()
+    models = {k: v for k, v in models.items() if not k.startswith("vpd_a")}  # LoRAs and their matched VPD edits
     names = list(models)
     json.dump({"models": names, "meta": meta}, open(OUTD / "models.json", "w"), indent=1)
 
     tok = tokenizer()
-    tokens, syn_d = heldout_tokens()
+    tokens, lens, domain, syn_d = heldout_tokens()
     if DEV:
-        keep = np.r_[0:DEV, N_HELD:N_HELD + 8]
-        tokens, syn_d = tokens[keep], syn_d[keep]
-    np.savez(OUTD / "tokens.npz", tokens=tokens, syn_d=syn_d)
+        keep = np.r_[0:DEV, np.nonzero(syn_d)[0][:8]]
+        tokens, lens, domain, syn_d = tokens[keep], lens[keep], domain[keep], syn_d[keep]
+    np.savez(OUTD / "tokens.npz", tokens=tokens, lens=lens, domain=domain, syn_d=syn_d)
     R, P = tokens.shape[0], 511
     cpos = {tok.token_to_id(k): tok.token_to_id(v) for k, v in CONTRAST.items()}
     ctab = torch.full((50277,), -1, dtype=torch.long)
@@ -424,12 +443,12 @@ def stage_summarize():
     txt = [tok.decode([i]) for i in range(V)] + [""]  # id V = padding
     PAD = V
     z = np.load(OUTD / "tokens.npz")
-    tokens, syn_d = z["tokens"].astype(np.int64), z["syn_d"]
+    tokens, syn_d, lens, domain = z["tokens"].astype(np.int64), z["syn_d"], z["lens"], z["domain"]
     mj = json.load(open(OUTD / "models.json"))
     names, meta = mj["models"], mj["meta"]
     assert int((OUTD / "eval_done.txt").read_text()) >= len(tokens), "eval has not finished"
     R, P = tokens.shape[0], 511
-    nat = (syn_d == 0)[:, None] & np.ones((1, P), bool)
+    nat = (syn_d == 0)[:, None] & (np.arange(P)[None, :] < lens[:, None] - 1)  # real text, next token inside the doc
     cur, nxt = tokens[:, :-1], tokens[:, 1:]
     nx2 = np.concatenate([tokens[:, 2:], np.full((R, 1), PAD)], 1)
     prv = np.concatenate([np.full((R, 1), PAD), tokens[:, :-2]], 1)
@@ -608,6 +627,8 @@ def stage_summarize():
         "frequency": [(lab, (fr >= a) & (fr < b)) for lab, a, b in
                       (("< 1 per million", 0, 1), ("1–10", 1, 10), ("10–100", 10, 100), ("100–1,000", 100, 1000),
                        ("1,000–10,000", 1000, 10 ** 4), ("> 10,000 per million", 10 ** 4, 10 ** 9))],
+        "domain": [(dname, np.repeat(domain[:, None] == dname, P, 1)) for dname in
+                   sorted(set(domain[syn_d == 0].tolist()), key=lambda x: -(domain == x).sum())],
         "input_token": [(lab, m[cur]) for lab, m in (
             ("colon or semicolon", has_colon | has_semi), ("'=' sign", prop(lambda t: "=" in t) & ~has_colon & ~has_semi),
             ("other punctuation", prop(lambda t: t.strip() != "" and not any(c.isalnum() for c in t)) & ~has_colon & ~has_semi & ~prop(lambda t: "=" in t)),
@@ -724,6 +745,7 @@ def stage_summarize():
         examples[nm] = got
 
     res = {"description": __doc__, "models": names, "meta": meta, "pairs": pairs, "n_docs": int((syn_d == 0).sum()),
+           "domain_docs": {k: int((domain == k).sum()) for k in sorted(set(domain.tolist())) if k != "synthetic"},
            "n_positions": nvalid, "n_emoticon_positions": int(emo.sum()), "emoticon_rule_vs_ci": rule,
            "checks": checks, "breakdowns": breakdowns, "top_tokens": top_tok, "lorenz": lorenz, "examples": examples,
            "kl_total_mean": {nm: float(tot_valid[nm] / nvalid) for nm in names}}
