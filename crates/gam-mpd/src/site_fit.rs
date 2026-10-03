@@ -648,7 +648,7 @@ pub struct Settings {
 fn description_bits(describe: &dyn Describe, site: usize, v: &Array2<f64>, u: &Array2<f64>) -> Result<Array1<f64>, String> {
     Ok((0..v.nrows())
         .into_par_iter()
-        .map(|c| describe.bits(site, u.slice(s![c..c + 1, ..]), v.slice(s![c..c + 1, ..])))
+        .map(|c| describe.bits_at(site, c, u.slice(s![c..c + 1, ..]), v.slice(s![c..c + 1, ..])))
         .collect::<Result<Vec<f64>, String>>()?
         .into())
 }

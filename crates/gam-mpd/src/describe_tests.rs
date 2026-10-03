@@ -106,3 +106,18 @@ fn a_block_inside_one_declared_group_costs_that_group() {
     assert_eq!(d.reals, k * (width + d_in - k));
     assert!(relative(&decoded(&d.u, &d.v), &w) < 5e-2);
 }
+
+#[test]
+fn a_block_that_barely_moved_is_recoded_in_its_family() {
+    use super::describe::{Geometry, Structured};
+    let (d_out, d_in, k) = (7, 6, 2);
+    let (u, v) = (random(k, d_out, 12), random(k, d_in, 13));
+    let structured = Structured::new(vec![Geometry::new(metric(d_out, d_in), Vec::new(), Vec::new()).expect("geometry")]);
+    let first = structured.describe_cached(0, 0, u.view(), v.view()).expect("a description");
+    let moved = &u + 1e-9;
+    let recoded = structured.sites[0].recode(moved.view(), v.view(), &first, 1.0).expect("recode").expect("same family");
+    let again = structured.describe_cached(0, 0, moved.view(), v.view()).expect("a description");
+    assert_eq!(recoded.reals, first.reals);
+    assert_eq!(again.reals, first.reals);
+    assert!((again.total() - first.total()).abs() < 1.0, "{} against {}", again.total(), first.total());
+}

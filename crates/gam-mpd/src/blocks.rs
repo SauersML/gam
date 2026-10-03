@@ -61,6 +61,12 @@ use std::sync::Arc;
 pub trait Describe: Sync {
     fn bits(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<f64, String>;
 
+    /// [`Describe::bits`] of the block a caller tracks as `index` of site `site` across a fit, so a
+    /// description can be re-sent from its last one when the block has barely moved.
+    fn bits_at(&self, site: usize, _index: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<f64, String> {
+        self.bits(site, u, v)
+    }
+
     /// The block as its description decodes it, `(u, v)`, and the KL bits per word its rounding
     /// error was priced at; `None` when the description is exact.
     fn decode(&self, _site: usize, _u: ArrayView2<'_, f64>, _v: ArrayView2<'_, f64>) -> Result<Option<(Array2<f64>, Array2<f64>, f64)>, String> {

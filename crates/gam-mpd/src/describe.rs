@@ -74,6 +74,9 @@ use super::codec::{fixed_index_len_bits, prefix_integer_len_bits, signed_delta_l
 use super::dense::{eigh, solve, svd};
 use gam_linalg::roundoff::SymmetricAssembly;
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 /// The second-order price of a block's error: `n ½ tr(F ΔW C ΔWᵀ) / ln 2` bits, `C` the second
 /// moment of the site's reads (the masked program reads them uncentred), `F` the Fisher of its
@@ -288,6 +291,35 @@ pub struct Description {
     /// The decoded block as factors, `W = uᵀ v`: `u` is `c × d_out`, `v` is `c × d_in`.
     pub u: Array2<f64>,
     pub v: Array2<f64>,
+    /// What [`Geometry::recode`] needs to send another block in the same family at the same
+    /// precision; `None` for the empty description.
+    pub choice: Option<Choice>,
+}
+
+/// A description's family and precision: the charts and their groups, the core, the lattice
+/// exponents and the coded core in chart coordinates (`K̃ = A Bᵀ`).
+#[derive(Clone, Debug)]
+pub struct Choice {
+    writer: usize,
+    writer_groups: Vec<usize>,
+    reader: usize,
+    reader_groups: Vec<usize>,
+    exponents: Vec<i32>,
+    a: Array2<f64>,
+    b: Array2<f64>,
+}
+
+impl Choice {
+    /// Whether `other` codes the same family and every one of its reals is within one lattice step
+    /// of this one's (the core's first factor at the first exponent, its second at the last).
+    fn within_step(&self, other: &Choice) -> bool {
+        let close = |x: &Array2<f64>, y: &Array2<f64>, p: i32| {
+            let step = 2f64.powi(-p);
+            x.dim() == y.dim() && x.iter().zip(y.iter()).all(|(a, b)| (a - b).abs() <= step)
+        };
+        let (first, last) = (self.exponents.first().copied().unwrap_or(0), self.exponents.last().copied().unwrap_or(0));
+        self.exponents == other.exponents && close(&self.a, &other.a, first) && close(&self.b, &other.b, last)
+    }
 }
 
 impl Description {
@@ -364,16 +396,28 @@ fn exponent_bits(p: i32) -> f64 {
 /// What a block's description is fitted against on one choice of charts: the block's
 /// `H = Pᵀ F W C Q = H_l H_rᵀ`, `G_p = Pᵀ F P`, `G_q = Qᵀ C Q` and their pseudo-inverse roots, so a
 /// core `K` leaves the whitened squared error `w2 − 2⟨K, H⟩ + tr(G_p K G_q Kᵀ)`.
-struct Sides {
-    p: Array2<f64>,
-    q: Array2<f64>,
+/// On an identity side the basis is `None` and the Gram and root are the metric's own, borrowed.
+struct Sides<'a> {
+    p: Option<Array2<f64>>,
+    q: Option<Array2<f64>>,
     hl: Array2<f64>,
     hr: Array2<f64>,
     h: Array2<f64>,
-    gp: Array2<f64>,
-    gq: Array2<f64>,
-    rp: Array2<f64>,
-    rq: Array2<f64>,
+    gp: Cow<'a, Array2<f64>>,
+    gq: Cow<'a, Array2<f64>>,
+    rp: Cow<'a, Array2<f64>>,
+    rq: Cow<'a, Array2<f64>>,
+}
+
+impl Sides<'_> {
+    /// The decoded factors `(P A)ᵀ`, `(Q B)ᵀ` of a core `A Bᵀ` in chart coordinates.
+    fn decoded(&self, a: &Array2<f64>, b: &Array2<f64>) -> (Array2<f64>, Array2<f64>) {
+        let side = |basis: &Option<Array2<f64>>, f: &Array2<f64>| match basis {
+            Some(x) => x.dot(f).reversed_axes(),
+            None => f.t().to_owned(),
+        };
+        (side(&self.p, a), side(&self.q, b))
+    }
 }
 
 /// The block's factored products every choice of charts reuses: `F uᵀ`, `C vᵀ`, `u F uᵀ`,
@@ -400,17 +444,20 @@ impl<'a> Block<'a> {
     }
 
     /// The sides of a choice of groups of two prepared charts.
-    fn sides(&self, writer: &Prepared, wg: &[usize], reader: &Prepared, rg: &[usize]) -> Result<Sides, String> {
-        let side = |chart: &Prepared, groups: &[usize], factor: &Array2<f64>, metric: &Array2<f64>| -> Result<_, String> {
+    fn sides<'p>(&self, writer: &'p Prepared, wg: &[usize], reader: &'p Prepared, rg: &[usize]) -> Result<Sides<'p>, String>
+    where
+        'a: 'p,
+    {
+        let side = |chart: &'p Prepared, groups: &[usize], factor: &Array2<f64>, metric: &'p Array2<f64>| -> Result<_, String> {
             if chart.identity {
-                let d = metric.nrows();
-                let root = chart.root.clone().ok_or("an identity chart without its root")?;
-                Ok((Array2::<f64>::eye(d), factor.clone(), metric.clone(), root))
+                let root = chart.root.as_ref().ok_or("an identity chart without its root")?;
+                Ok((None, factor.clone(), Cow::Borrowed(metric), Cow::Borrowed(root)))
             } else {
                 let x = chart.chart.columns(groups);
                 let g = symmetric(&x.t().dot(metric).dot(&x));
                 let root = inverses(&g)?.1;
-                Ok((x.clone(), x.t().dot(factor), g, root))
+                let h = x.t().dot(factor);
+                Ok((Some(x), h, Cow::Owned(g), Cow::Owned(root)))
             }
         };
         let (p, hl, gp, rp) = side(writer, wg, &self.fu, &self.metric.fisher)?;
@@ -422,14 +469,14 @@ impl<'a> Block<'a> {
     /// The KL bits of the factored core `K = A Bᵀ`.
     fn error_factored(&self, sides: &Sides, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
         let cross = (a.t().dot(&sides.hl) * b.t().dot(&sides.hr)).sum();
-        let quad = (a.t().dot(&sides.gp).dot(a) * b.t().dot(&sides.gq).dot(b)).sum();
+        let quad = (a.t().dot(&*sides.gp).dot(a) * b.t().dot(&*sides.gq).dot(b)).sum();
         (self.w2 - 2.0 * cross + quad).max(0.0) * self.scale
     }
 
     /// The KL bits of the core `K`.
     fn error(&self, sides: &Sides, k: &Array2<f64>) -> f64 {
         let cross = (k * &sides.h).sum();
-        let quad = (sides.gp.dot(k).dot(&sides.gq) * k).sum();
+        let quad = (sides.gp.dot(k).dot(&*sides.gq) * k).sum();
         (self.w2 - 2.0 * cross + quad).max(0.0) * self.scale
     }
 }
@@ -486,6 +533,8 @@ struct Coded {
     real_bits: f64,
     structure_bits: f64,
     kl: f64,
+    /// The lattice exponents its reals were sent at.
+    exponents: Vec<i32>,
 }
 
 impl Coded {
@@ -516,7 +565,7 @@ fn generic_cores(block: &Block<'_>, sides: &Sides, max_rank: usize) -> Result<Ve
     minimize(ranks, &mut |n| {
         if coded[n].is_none() {
             let z = decomposed.vectors.select(Axis(1), &order[..n + 1]);
-            match generic_core(block, sides, &left.dot(&z), &right.dot(&z)) {
+            match generic_core(block, sides, &left.dot(&z), &right.dot(&z), None) {
                 Ok(c) => coded[n] = Some(c),
                 Err(e) => {
                     failure = Some(e);
@@ -532,9 +581,27 @@ fn generic_cores(block: &Block<'_>, sides: &Sides, max_rank: usize) -> Result<Ve
     Ok(coded.into_iter().flatten().flatten().collect())
 }
 
+/// The generic core of rank `rank` on `sides` coded at the exponents `fixed` (no search).
+fn generic_core_at(block: &Block<'_>, sides: &Sides, rank: usize, fixed: &[i32]) -> Result<Option<Coded>, String> {
+    let a = sides.rp.dot(&sides.hl);
+    let b = sides.rq.dot(&sides.hr);
+    let (half, inverse_half) = roots(&a.t().dot(&a))?;
+    let core = symmetric(&half.dot(&b.t().dot(&b)).dot(&half));
+    let decomposed = eigh(core.view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
+    let mut order: Vec<usize> = (0..decomposed.values.len()).filter(|i| decomposed.values[*i] > decomposed.band).collect();
+    order.sort_by(|x, y| decomposed.values[*y].total_cmp(&decomposed.values[*x]));
+    if order.len() < rank || rank == 0 {
+        return Ok(None);
+    }
+    let z = decomposed.vectors.select(Axis(1), &order[..rank]);
+    let left = sides.rp.dot(&a.dot(&inverse_half)).dot(&z);
+    let right = sides.rq.dot(&b.dot(&half)).dot(&z);
+    generic_core(block, sides, &left, &right, Some(fixed))
+}
+
 /// The core `K = K_l K_rᵀ` (rank `k` = their width) coded in the pivot chart `K = A Bᵀ`,
 /// `A = K_{:,π} = K_l K_r[π]ᵀ` and `B = K_r K_r[π]⁻¹`, the identity on the pivot rows `π`.
-fn generic_core(block: &Block<'_>, sides: &Sides, kl: &Array2<f64>, kr: &Array2<f64>) -> Result<Option<Coded>, String> {
+fn generic_core(block: &Block<'_>, sides: &Sides, kl: &Array2<f64>, kr: &Array2<f64>, fixed: Option<&[i32]>) -> Result<Option<Coded>, String> {
     let (s_, t_) = (kl.nrows(), kr.nrows());
     let pivot = pivots(&kr.t().to_owned(), kr.ncols());
     let rank = pivot.len();
@@ -572,29 +639,32 @@ fn generic_core(block: &Block<'_>, sides: &Sides, kl: &Array2<f64>, kr: &Array2<
     let scan_a = |pb: i32| -> Option<i32> {
         let (qb, bb) = if free.is_empty() { (b_free.clone(), 0.0) } else { quantize(&b_free, pb)? };
         let full = rebuild(&qb);
-        let (hb, gb) = (sides.hr.t().dot(&full), full.t().dot(&sides.gq).dot(&full));
+        let (hb, gb) = (sides.hr.t().dot(&full), full.t().dot(&*sides.gq).dot(&full));
         scan(exponents(&a), |p| {
             let (qa, ba) = quantize(&a, p)?;
             let cross = (qa.t().dot(&sides.hl) * &hb.t()).sum();
-            let quad = (qa.t().dot(&sides.gp).dot(&qa) * &gb).sum();
+            let quad = (qa.t().dot(&*sides.gp).dot(&qa) * &gb).sum();
             Some((ba + bb + exponent_cost(p, pb), (block.w2 - 2.0 * cross + quad).max(0.0) * scale))
         })
         .map(|(p, _)| p)
     };
     let scan_b = |pa: i32| -> Option<i32> {
         let (qa, ba) = quantize(&a, pa)?;
-        let (ha, ga) = (qa.t().dot(&sides.hl), qa.t().dot(&sides.gp).dot(&qa));
+        let (ha, ga) = (qa.t().dot(&sides.hl), qa.t().dot(&*sides.gp).dot(&qa));
         scan(exponents(&b_free), |p| {
             let (qb, bb) = quantize(&b_free, p)?;
             let full = rebuild(&qb);
             let cross = (&ha * &full.t().dot(&sides.hr)).sum();
-            let quad = (&ga * &full.t().dot(&sides.gq).dot(&full)).sum();
+            let quad = (&ga * &full.t().dot(&*sides.gq).dot(&full)).sum();
             Some((ba + bb + exponent_cost(pa, p), (block.w2 - 2.0 * cross + quad).max(0.0) * scale))
         })
         .map(|(p, _)| p)
     };
-    let (mut pa, mut pb) = (*exponents(&a).end(), *exponents(&b_free).end());
-    for _ in 0..2 {
+    let (mut pa, mut pb) = match fixed {
+        Some(&[pa, pb]) => (pa, pb),
+        _ => (*exponents(&a).end(), *exponents(&b_free).end()),
+    };
+    for _ in 0..if fixed.is_some() { 0 } else { 2 } {
         if let Some(p) = scan_a(pb) {
             pa = p;
         }
@@ -608,7 +678,7 @@ fn generic_core(block: &Block<'_>, sides: &Sides, kl: &Array2<f64>, kr: &Array2<
     let structure = exponent_cost(pa, pb)
         + prefix_integer_len_bits(rank as u64).map_err(|e| e.to_string())? as f64
         + subset_code_len_bits(t_, rank).map_err(|e| e.to_string())? as f64;
-    Ok(Some(Coded { a: qa, b: qb, reals: rank * (s_ + t_ - rank), real_bits: bits, structure_bits: structure, kl }))
+    Ok(Some(Coded { a: qa, b: qb, reals: rank * (s_ + t_ - rank), real_bits: bits, structure_bits: structure, kl, exponents: vec![pa, pb] }))
 }
 
 /// One parameter of a linear core: entries `(i, j, c)` of `∂K/∂θ`.
@@ -616,7 +686,7 @@ type Placement = Vec<(usize, usize, f64)>;
 
 /// The core `K = Σ θ_p E_p` on `sides`, fitted in the metric (its normal equations) and coded at one
 /// exponent.
-fn linear_core(block: &Block<'_>, sides: &Sides, placements: &[Placement], structure: f64) -> Result<Option<Coded>, String> {
+fn linear_core(block: &Block<'_>, sides: &Sides, placements: &[Placement], structure: f64, fixed: Option<i32>) -> Result<Option<Coded>, String> {
     let m = placements.len();
     if m == 0 {
         return Ok(None);
@@ -652,10 +722,16 @@ fn linear_core(block: &Block<'_>, sides: &Sides, placements: &[Placement], struc
         let k = core(&q);
         Some((bits, block.error(sides, &k), k))
     };
-    let Some((p, _)) = scan(exponents(&theta), |p| cost(p).map(|(b, k, _)| (b + exponent_bits(p), k))) else { return Ok(None) };
+    let p = match fixed {
+        Some(p) => p,
+        None => {
+            let Some((p, _)) = scan(exponents(&theta), |p| cost(p).map(|(b, k, _)| (b + exponent_bits(p), k))) else { return Ok(None) };
+            p
+        }
+    };
     let Some((bits, kl, k)) = cost(p) else { return Ok(None) };
     // Factored as K̃ = K̃ · I.
-    Ok(Some(Coded { a: k, b: Array2::eye(t_), reals: m, real_bits: bits, structure_bits: structure + exponent_bits(p), kl }))
+    Ok(Some(Coded { a: k, b: Array2::eye(t_), reals: m, real_bits: bits, structure_bits: structure + exponent_bits(p), kl, exponents: vec![p] }))
 }
 
 /// The chosen groups of two charts paired one to one, each writer group with the reader group of
@@ -680,7 +756,7 @@ fn paired(writer: &Chart, w: &[usize], reader: &Chart, r: &[usize], sides: &Side
     let roots = |g: &Array2<f64>, at: &[(usize, usize)]| -> Result<Vec<Array2<f64>>, String> {
         at.iter().map(|(o, n)| inverses(&g.slice(s![*o..o + n, *o..o + n]).to_owned()).map(|x| x.1)).collect()
     };
-    let (rw, rr) = (roots(&sides.gp, &wo)?, roots(&sides.gq, &ro)?);
+    let (rw, rr) = (roots(&*sides.gp, &wo)?, roots(&*sides.gq, &ro)?);
     let mut couplings = Vec::new();
     for (i, (o, n)) in wo.iter().enumerate() {
         for (j, (q, m)) in ro.iter().enumerate() {
@@ -777,16 +853,20 @@ impl Context<'_> {
         let sides = block.sides(writer, wg, reader, rg)?;
         let structure = self.charts_bits + self.core_bits + writer.chart.subset_bits(wg.len())? + reader.chart.subset_bits(rg.len())?;
         let label = |chart: &Chart, groups: &[usize]| (chart.name.clone(), groups.iter().map(|g| chart.groups[*g].mode.clone()).collect::<Vec<_>>());
-        let finish = |coded: Coded, core: Core| Description {
-            writer: label(&writer.chart, wg),
-            reader: label(&reader.chart, rg),
-            core,
-            reals: coded.reals,
-            structure_bits: structure + coded.structure_bits,
-            real_bits: coded.real_bits,
-            kl_bits: coded.kl,
-            u: sides.p.dot(&coded.a).reversed_axes(),
-            v: sides.q.dot(&coded.b).reversed_axes(),
+        let finish = |coded: Coded, core: Core| {
+            let (u, v) = sides.decoded(&coded.a, &coded.b);
+            Description {
+                writer: label(&writer.chart, wg),
+                reader: label(&reader.chart, rg),
+                core,
+                reals: coded.reals,
+                structure_bits: structure + coded.structure_bits,
+                real_bits: coded.real_bits,
+                kl_bits: coded.kl,
+                u,
+                v,
+                choice: Some(Choice { writer: i, writer_groups: wg.to_vec(), reader: j, reader_groups: rg.to_vec(), exponents: coded.exponents, a: coded.a, b: coded.b }),
+            }
         };
         let mut best: Option<Description> = None;
         let mut offer = |candidate: Description| {
@@ -806,10 +886,10 @@ impl Context<'_> {
         // The pairing, and a reflection flag per plane.
         let flags = pairing_bits(pairs.len()) + planes as f64;
         let mut reflections = vec![false; planes];
-        let mut current = linear_core(block, &sides, &rotation_placements(&pairs, &reflections), flags)?;
+        let mut current = linear_core(block, &sides, &rotation_placements(&pairs, &reflections), flags, None)?;
         for plane in 0..planes {
             reflections[plane] = true;
-            let trial = linear_core(block, &sides, &rotation_placements(&pairs, &reflections), flags)?;
+            let trial = linear_core(block, &sides, &rotation_placements(&pairs, &reflections), flags, None)?;
             let better = match (&trial, &current) {
                 (Some(t), Some(c)) => t.total() < c.total(),
                 (Some(_), None) => true,
@@ -824,7 +904,7 @@ impl Context<'_> {
         if let Some(coded) = current {
             offer(finish(coded, Core::Rotation { reflections }));
         }
-        if let Some(coded) = linear_core(block, &sides, &diagonal_placements(&pairs), pairing_bits(pairs.len()))? {
+        if let Some(coded) = linear_core(block, &sides, &diagonal_placements(&pairs), pairing_bits(pairs.len()), None)? {
             offer(finish(coded, Core::Diagonal));
         }
         Ok(best)
@@ -988,16 +1068,61 @@ impl Geometry {
         best.ok_or_else(|| "no description".to_string())
     }
 
+    /// The bits naming the two charts, and the core's kind (generic, rotation, diagonal).
+    fn header_bits(&self) -> Result<(f64, f64), String> {
+        let charts = fixed_index_len_bits(self.writers.len()).map_err(|e| e.to_string())? as f64
+            + fixed_index_len_bits(self.readers.len()).map_err(|e| e.to_string())? as f64;
+        Ok((charts, fixed_index_len_bits(3).map_err(|e| e.to_string())? as f64))
+    }
+
+    /// The block `uᵀ v` sent in `previous`'s family at its precision, with no search: `None` when
+    /// that family no longer holds it (a rank it no longer resolves, a pairing or pivot that fails)
+    /// or `previous` is the empty description.
+    pub fn recode(&self, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>, previous: &Description, calibration: f64) -> Result<Option<Description>, String> {
+        let Some(choice) = &previous.choice else { return Ok(None) };
+        let block = Block::new(u, v, &self.metric, calibration);
+        let (writer, reader) = (&self.writers[choice.writer], &self.readers[choice.reader]);
+        let (wg, rg) = (choice.writer_groups.as_slice(), choice.reader_groups.as_slice());
+        let sides = block.sides(writer, wg, reader, rg)?;
+        let coded = match &previous.core {
+            Core::Generic { rank } => generic_core_at(&block, &sides, *rank, &choice.exponents)?,
+            core => {
+                let Some(pairs) = paired(&writer.chart, wg, &reader.chart, rg, &sides)? else { return Ok(None) };
+                let (placements, flags) = match core {
+                    Core::Rotation { reflections } => {
+                        let planes = pairs.iter().filter(|p| p.2 == 2).count();
+                        (rotation_placements(&pairs, reflections), pairing_bits(pairs.len()) + planes as f64)
+                    }
+                    _ => (diagonal_placements(&pairs), pairing_bits(pairs.len())),
+                };
+                linear_core(&block, &sides, &placements, flags, choice.exponents.first().copied())?
+            }
+        };
+        let Some(coded) = coded else { return Ok(None) };
+        let (charts_bits, core_bits) = self.header_bits()?;
+        let structure = charts_bits + core_bits + writer.chart.subset_bits(wg.len())? + reader.chart.subset_bits(rg.len())?;
+        let (du, dv) = sides.decoded(&coded.a, &coded.b);
+        Ok(Some(Description {
+            writer: previous.writer.clone(),
+            reader: previous.reader.clone(),
+            core: previous.core.clone(),
+            reals: coded.reals,
+            structure_bits: structure + coded.structure_bits,
+            real_bits: coded.real_bits,
+            kl_bits: coded.kl,
+            u: du,
+            v: dv,
+            choice: Some(Choice { exponents: coded.exponents, a: coded.a, b: coded.b, ..choice.clone() }),
+        }))
+    }
+
     /// [`Geometry::describe`] with the metric's price scaled by `calibration`.
     /// With `charts` false, only the identity charts (the generic family).
     fn describe_at(&self, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>, calibration: f64, charts: bool) -> Result<Description, String> {
         let metric = &self.metric;
         let block = Block::new(u, v, metric, calibration);
         let rank = u.nrows();
-        let charts_bits = fixed_index_len_bits(self.writers.len()).map_err(|e| e.to_string())? as f64
-            + fixed_index_len_bits(self.readers.len()).map_err(|e| e.to_string())? as f64;
-        // Generic, rotation, diagonal.
-        let core_bits = fixed_index_len_bits(3).map_err(|e| e.to_string())? as f64;
+        let (charts_bits, core_bits) = self.header_bits()?;
         let writer_sets: Vec<Vec<Vec<usize>>> =
             self.writers.iter().map(|c| prefixes(&c.chart, &ranked(c, &block.fu, &block.gv), block.scale)).collect();
         let reader_sets: Vec<Vec<Vec<usize>>> =
@@ -1060,6 +1185,7 @@ impl Geometry {
             kl_bits: block.w2.max(0.0) * block.scale,
             u: Array2::zeros((1, u.ncols())),
             v: Array2::zeros((1, v.ncols())),
+            choice: None,
         }))
     }
 }
@@ -1155,11 +1281,33 @@ pub fn logit_gauss_newton(
 pub struct Structured {
     pub sites: Vec<Geometry>,
     pub calibration: f64,
+    /// Per `(site, index)`, the last description given ([`Structured::describe_cached`]).
+    cache: Mutex<HashMap<(usize, usize), Description>>,
 }
 
 impl Structured {
     pub fn new(sites: Vec<Geometry>) -> Self {
-        Self { sites, calibration: 1.0 }
+        Self { sites, calibration: 1.0, cache: Mutex::new(HashMap::new()) }
+    }
+
+    /// The description of block `index` of site `site`, from its last one when it can: re-sent in
+    /// that family at that precision ([`Geometry::recode`]), and searched afresh only when a real
+    /// has moved by more than its lattice step (or the family no longer holds the block). A
+    /// library that trains by small steps is so re-priced at the cost of one coding, not a search.
+    pub fn describe_cached(&self, site: usize, index: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<Description, String> {
+        let geometry = self.sites.get(site).ok_or_else(|| format!("no site {site}"))?;
+        let previous = self.cache.lock().map_err(|e| e.to_string())?.get(&(site, index)).cloned();
+        if let Some(previous) = previous
+            && let Some(d) = geometry.recode(u, v, &previous, self.calibration)?
+            && let (Some(old), Some(new)) = (&previous.choice, &d.choice)
+            && old.within_step(new)
+        {
+            self.cache.lock().map_err(|e| e.to_string())?.insert((site, index), d.clone());
+            return Ok(d);
+        }
+        let d = self.describe(site, u, v)?;
+        self.cache.lock().map_err(|e| e.to_string())?.insert((site, index), d.clone());
+        Ok(d)
     }
 
     /// The same description with its error price scaled by `ratio`.
@@ -1180,6 +1328,13 @@ impl super::blocks::Describe for Structured {
             return Ok(0.0);
         }
         Ok(self.describe(site, u, v)?.total())
+    }
+
+    fn bits_at(&self, site: usize, index: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<f64, String> {
+        if u.nrows() == 0 {
+            return Ok(0.0);
+        }
+        Ok(self.describe_cached(site, index, u, v)?.total())
     }
 
     fn decode(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<Option<(Array2<f64>, Array2<f64>, f64)>, String> {
