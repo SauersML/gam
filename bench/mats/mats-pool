@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# MATS pool (#2951): long-lived workers that run queued tasks (MATS_POOL=1 mats-run ...).
+#   mats-pool                          queue counts, workers (size, in use, minutes left), running tasks
+#   mats-pool ls [todo|running|done]   task files (done shows each exit code)
+#   mats-pool cancel PATTERN           drop matching todo tasks; stop matching running tasks (the worker
+#                                      frees their room and takes the next task)
+#   mats-pool up CPUS MEM_GB [GPUS] [HOURS]   start a worker (normal QOS, MATS_QOS=debug for 2 h; exits
+#                                      after 10 idle minutes)
+set -Eeuo pipefail
+here=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+case ${1:-status} in
+    status)
+        ssh mats 'Q=~/mpd-data/cluster/queue; mkdir -p $Q/todo $Q/running $Q/done $Q/workers
+            echo "todo $(ls $Q/todo | grep -c "\.task$"), running $(ls $Q/running | grep -c "\.task$"), done $(ls $Q/done | wc -l)"
+            for w in $Q/workers/*; do [ -f "$w" ] || continue; read c m g uc um ug l < $w
+                printf "worker %s: %s/%s CPUs, %s/%sG, %s/%s GPUs in use, %s min left (%s)\n" ${w##*/} $uc $c $um $m $ug $g $l "$(squeue -h -j ${w##*/} -o %T 2>/dev/null || echo gone)"; done
+            squeue -h -u $USER -n mpd-pool -t PD -o "worker %i pending: %C CPUs %m %b (%r)"
+            for t in $Q/running/*.task; do [ -f "$t" ] && echo "running ${t##*/} on $(sed -n "s/^# worker=//p" $t | tail -1)"; done; true' ;;
+    ls)
+        ssh mats "ls -1t ~/mpd-data/cluster/queue/${2:-todo} | head -100; [ '${2:-todo}' = done ] && grep -H '^# rc=' ~/mpd-data/cluster/queue/done/* 2> /dev/null | sed 's|.*/||' | head -100; true" ;;
+    cancel)
+        [ -n "${2:-}" ] || { echo "usage: mats-pool cancel PATTERN" >&2; exit 2; }
+        ssh mats "Q=~/mpd-data/cluster/queue; for t in \$Q/todo/*'$2'*.task; do [ -f \"\$t\" ] && { echo '# rc=cancelled' >> \"\$t\"; mv \"\$t\" \$Q/done/; echo \"dropped \${t##*/}\"; }; done
+            for t in \$Q/running/*'$2'*.task; do [ -f \"\$t\" ] && { touch \"\$t.cancel\"; echo \"stopping \${t##*/}\"; }; done; true" ;;
+    up)
+        [[ ${2:-} =~ ^[0-9]+$ && ${3:-} =~ ^[0-9]+$ ]] || { echo "usage: mats-pool up CPUS MEM_GB [GPUS] [HOURS]" >&2; exit 2; }
+        g=${4:-0} min=$(awk -v h="${5:-12}" 'BEGIN { print int(h * 60) }')
+        scp -q "$here/pool_worker.sh" mats:mpd-data/cluster/_build/pool_worker.sh
+        ssh mats "mkdir -p ~/mpd-data/cluster/queue && cp ~/mpd-data/cluster/_build/pool_worker.sh ~/mpd-data/cluster/queue/ &&
+            sbatch --parsable -J mpd-pool -p compute ${MATS_QOS:+--qos=$MATS_QOS} -c $2 --mem=${3}G -t $min $( (( g > 0 )) && echo --gres=gpu:$g) -o ~/mpd-data/cluster/queue/worker-%j.log ~/mpd-data/cluster/queue/pool_worker.sh $min" ;;
+    *) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

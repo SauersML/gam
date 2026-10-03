@@ -34,13 +34,19 @@
 # names one does, so a Python script under /Users/user/gam starts without waiting for a build;
 # set 1 when a script calls a binary itself, through $MPD_BIN).
 #
+# Pool: MATS_POOL=1 queues the job (each array index a task) for long-lived pool workers instead of
+# submitting it; a worker (normal QOS) packs tasks into its CPUs/GPUs/memory as job steps, takes the
+# next task when one ends, and exits after 10 idle minutes. One is started when none has room.
+# Prints the queue stamp. `mats-pool` lists, cancels and starts workers; `mats-swap JOBID -- CMD`
+# runs CMD in place of what a running mats-run job runs, inside its allocation.
+#
 # Job arrays: MATS_ARRAY=0-31%24 submits one task per index (at most 24 at once), each with CPUS,
 # MEM_GB and HOURS of its own; `{task}` anywhere in COMMAND becomes the task's index (say an eval row
 # or an output name like /Users/user/mpd-data/cluster/NAME/row{task}.json). Task logs are
 # slurm-JOBID_TASK.log; `mats-pull NAME` brings back every task's outputs.
 set -Eeuo pipefail
 here=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
-usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 [ $# -ge 6 ] && [ "$5" = -- ] || usage
 NAME=$1 CPUS=$2 MEM=$3 HOURS=$4
 shift 5
@@ -139,6 +145,10 @@ if [ ${#uploads[@]} -gt 0 ] && [ -z "${MATS_NO_UPLOAD:-}" ]; then
     (cd "$MAC_DATA" && rsync -a --relative --copy-unsafe-links --exclude '*.pem' --exclude '*.key' --exclude '.env' "${rel[@]}" mats:mpd-data/)
 fi
 
+if [ "${MATS_POOL:-0}" = 1 ]; then
+    (( CHAIN == 1 )) || { echo "mats-run: MATS_POOL and MATS_CHAIN do not combine (a pool worker is long-lived)" >&2; exit 2; }
+    scp -q "$here/pool_worker.sh" mats:mpd-data/cluster/_build/pool_worker.sh
+fi
 want=$(git -C "$MAC_GAM" rev-parse "${MATS_REF:-HEAD}")
 b64=$(printf '%s' "$cmd" | base64 | tr -d '\n')
-ssh mats bash -s -- "$NAME" "$CPUS" "$MEM" "$MINUTES" "$want" "$GPUS" "'$QOS'" "$b64" "'$ARRAY'" "$CHAIN" "${MATS_BUILD:-auto}" < "$here/remote_submit.sh"
+ssh mats bash -s -- "$NAME" "$CPUS" "$MEM" "$MINUTES" "$want" "$GPUS" "'$QOS'" "$b64" "'$ARRAY'" "$CHAIN" "${MATS_BUILD:-auto}" "${MATS_POOL:-0}" "'${MATS_SWAP:-}'" < "$here/remote_submit.sh"

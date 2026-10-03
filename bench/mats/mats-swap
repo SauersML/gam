@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Run COMMAND inside a running mats-run job's allocation, in place of what it runs now (#2951):
+#   mats-swap JOBID -- COMMAND...
+# The job keeps its CPUs, memory, GPUs and time limit; its current command (process group) gets
+# SIGTERM and COMMAND starts at once, translated as mats-run translates it (Mac paths, uploads, the
+# commit's binaries; a swap needing binaries still being built is refused until they are ready).
+# For an array task give JOBID as ARRAYID_TASK. Pool tasks switch through the queue instead.
+set -Eeuo pipefail
+[ $# -ge 3 ] && [ "$2" = -- ] || { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+job=$1
+shift 2
+MATS_SWAP=$job exec "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/mats-run" swap 1 1 1 -- "$@"
