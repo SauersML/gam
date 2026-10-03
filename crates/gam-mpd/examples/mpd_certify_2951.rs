@@ -21,8 +21,10 @@
 //! residual `W − Σ u vᵀ` as exact rank-one pieces that are always on (VPD's delta component, held on), so
 //! every gate on is the model. `SETS_DIR` gives each position's set (`bench/vpd_2951/vpd_sets_export.py`'s CSR over
 //! 512-position sequences; the export's sequences must be the sets' rows in order, as
-//! `vpd4l_frontier32` is for `vpd4l_sets`), or is `ladder:τ1,τ2,…`: at each level `τ` a word's pieces of
-//! the given library whose `|z_c| ‖u_c‖` at every gate on is below `τ` times the word's largest are off. `FREE` (default `all`) is a comma-separated list of site-name prefixes
+//! `vpd4l_frontier32` is for `vpd4l_sets`), or `select:DIR`, a masked selection's checkpoint (the
+//! `OUT.select/` of `mpd_pieces_masked_2951` on an export whose sequences these are), or `ladder:τ1,τ2,…`: at each level `τ` a word's pieces of
+//! the given library whose `|z_c| ‖u_c‖` at every gate on is below `τ` times the word's largest are off.
+//! Several sources, comma-separated, are each certified. `FREE` (default `all`) is a comma-separated list of site-name prefixes
 //! whose off gates are free; every other off gate stays at 0. The adversary takes `STEPS` steps
 //! (default 40) from 6 starts on the sequence's total KL. Each word's certificate uses `BUDGET`
 //! symbols (default 512), and the sequence's box is split into `LEAVES` leaves (default 1: no
@@ -246,7 +248,10 @@ fn lm(args: &[String]) -> Result<(), String> {
     let all_on: Vec<Array2<f64>> = (0..masked.sites.len()).map(|k| Array2::ones((family.rows, masked.blocks(k)))).collect();
     let mut named: Vec<(String, Vec<Array2<f64>>)> = Vec::new();
     let sets_arg = sets_dir.to_string_lossy().to_string();
-    if let Some(levels) = sets_arg.strip_prefix("ladder:") {
+    for spec in sets_arg.split(',') {
+    let sets_dir = PathBuf::from(spec.strip_prefix("select:").unwrap_or(spec));
+    let label = sets_dir.file_name().map_or_else(|| spec.to_string(), |n| n.to_string_lossy().to_string());
+    if let Some(levels) = spec.strip_prefix("ladder:") {
         // Each word's pieces of the given library ranked by `|z_c| ‖u_c‖` at every gate on; at level `τ`
         // the pieces below `τ` times the word's largest are off.
         let trace = masked.program.execute(&masked.family(family, &all_on), false).map_err(|e| e.to_string())?;
@@ -264,6 +269,30 @@ fn lm(args: &[String]) -> Result<(), String> {
             let masks = amplitude.iter().map(|a| Array2::from_shape_fn(a.dim(), |(r, c)| if a[[r, c]] > tau * largest[r] { 1.0 } else { 0.0 })).collect();
             named.push((format!("ladder {level}"), masks));
         }
+    } else if spec.starts_with("select:") {
+        // A masked selection's checkpoint (`OUT.select/` of `mpd_pieces_masked_2951`): per finished
+        // sequence of its export, per site in the driver's order, CSR over its 512 positions.
+        let loaded = gam_mpd::checkpoint::load(&sets_dir)?.ok_or_else(|| format!("{}: no checkpoint", sets_dir.display()))?;
+        let mut masks: Vec<Array2<f64>> = (0..masked.sites.len())
+            .map(|k| Array2::from_shape_fn((family.rows, masked.blocks(k)), |(_, c)| if c >= given[k] { 1.0 } else { 0.0 }))
+            .collect();
+        for s in 0..sequences {
+            let sites = loaded.sets.get(first + s).and_then(|x| x.as_ref()).ok_or_else(|| format!("{}: no sets for sequence {}", sets_dir.display(), first + s))?;
+            if sites.len() != masked.sites.len() {
+                return Err(format!("{}: {} sites, {} here", sets_dir.display(), sites.len(), masked.sites.len()));
+            }
+            for (k, (indptr, indices)) in sites.iter().enumerate() {
+                for p in 0..context {
+                    for &i in &indices[indptr[p] as usize..indptr[p + 1] as usize] {
+                        if i as usize >= given[k] {
+                            return Err(format!("{}: piece {i} beyond site {k}'s {}", sets_dir.display(), given[k]));
+                        }
+                        masks[k][[s * context + p, i as usize]] = 1.0;
+                    }
+                }
+            }
+        }
+        named.push((label.clone(), masks));
     } else {
         // The given sets, over 512-position sequences, pieces numbered site after site in `sites.txt`; every
         // residual piece is on.
@@ -297,7 +326,8 @@ fn lm(args: &[String]) -> Result<(), String> {
                 }
             }
         }
-        named.push(("given".to_string(), masks));
+        named.push((label.clone(), masks));
+    }
     }
     let (target, radius) = reference(model, family)?;
     eprintln!("reference logits' radius: largest {:.3e}", radius.iter().copied().fold(0.0_f64, f64::max));
