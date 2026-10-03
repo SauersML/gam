@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Print a cluster file from the shared cache (#2951), no ssh:  mats-cat PATH...
+# PATH is a cluster path (/mnt/nw/home/s.sauers/..., ~/..., or relative to the cluster home) or a
+# Mac path under /Users/user/mpd-data. Logs hold their last 400 lines; a directory added with
+# mats-watch shows its listing. A path not in the snapshot: `mats-watch PATH` (there within 2 min).
+set -Eeuo pipefail
+S=$HOME/mpd-data/cluster/_status
+rel() { local p=$1; p=${p#/mnt/nw/home/s.sauers/}; p=${p#/Users/user/}; p=${p#\~/}; echo "${p#./}"; }
+rc=0
+for a in "$@"; do
+    f=$S/files/$(rel "$a")
+    if [ -d "$f" ]; then cat "$f/.ls" 2> /dev/null || ls -la "$f"
+    elif [ -f "$f" ]; then cat "$f"
+    else echo "mats-cat: $(rel "$a") is not in the snapshot of $(cat "$S/STAMP" 2> /dev/null); add it with mats-watch" >&2; rc=1; fi
+done
+exit $rc

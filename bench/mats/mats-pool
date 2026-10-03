@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # MATS pool (#2951): long-lived workers that run queued tasks (MATS_POOL=1 mats-run ...).
-#   mats-pool                          queue counts, workers (size, in use, minutes left), running tasks
+#   mats-pool                          queue counts, workers, running tasks (from the mats-poll cache)
 #   mats-pool ls [todo|running|done]   task files (done shows each exit code)
 #   mats-pool cancel PATTERN           drop matching todo tasks; stop matching running tasks (the worker
 #                                      frees their room and takes the next task)
@@ -11,12 +11,14 @@ set -Eeuo pipefail
 here=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 case ${1:-status} in
     status)
-        ssh mats 'Q=~/mpd-data/cluster/queue; mkdir -p $Q/todo $Q/running $Q/done $Q/workers
-            echo "todo $(ls $Q/todo | grep -c "\.task$"), running $(ls $Q/running | grep -c "\.task$"), done $(ls $Q/done | wc -l)"
-            for w in $Q/workers/*; do [ -f "$w" ] || continue; read c m g uc um ug l < $w
-                printf "worker %s: %s/%s CPUs, %s/%sG, %s/%s GPUs in use, %s min left (%s)\n" ${w##*/} $uc $c $um $m $ug $g $l "$(squeue -h -j ${w##*/} -o %T 2>/dev/null || echo gone)"; done
-            squeue -h -u $USER -n mpd-pool -t PD -o "worker %i pending: %C CPUs %m %b (%r)"
-            for t in $Q/running/*.task; do [ -f "$t" ] && echo "running ${t##*/} on $(sed -n "s/^# worker=//p" $t | tail -1)"; done; true' ;;
+        S=$HOME/mpd-data/cluster/_status
+        [ -f "$S/pool.txt" ] || { echo "mats-pool: no snapshot yet; is mats-poll running?" >&2; exit 1; }
+        echo "snapshot $(cat "$S/STAMP")"
+        cat "$S/pool.txt"
+        for t in "$S"/files/mpd-data/cluster/queue/running/*.task; do
+            [ -f "$t" ] && echo "running ${t##*/} on $(sed -n 's/^# worker=//p' "$t" | tail -1)"
+        done
+        grep -E 'mpd-pool' "$S/squeue_ours.txt" || true ;;
     ls)
         ssh mats "ls -1t ~/mpd-data/cluster/queue/${2:-todo} | head -100; [ '${2:-todo}' = done ] && grep -H '^# rc=' ~/mpd-data/cluster/queue/done/* 2> /dev/null | sed 's|.*/||' | head -100; true" ;;
     cancel)

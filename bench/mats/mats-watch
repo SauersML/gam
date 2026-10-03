@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Add cluster paths or globs to the shared cache (#2951):  mats-watch PATH...   (mats-watch -l lists)
+# mats-poll then copies them (logs: last 400 lines; files up to 1 MB; directories: their listing)
+# into ~/mpd-data/cluster/_status/files/<path relative to the cluster home> every 2 minutes. Job
+# directories under ~/mpd-data/cluster touched in 2 days are mirrored without this.
+set -Eeuo pipefail
+W=$HOME/mpd-data/cluster/_watch.txt
+touch "$W"
+[ "${1:-}" = -l ] && { cat "$W"; exit 0; }
+[ $# -ge 1 ] || { sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+for a in "$@"; do
+    p=${a#/mnt/nw/home/s.sauers/}; p=${p#/Users/user/}; p=${p#\~/}
+    grep -qxF "$p" "$W" || echo "$p" >> "$W"
+    echo "watching ~/$p (in ~/mpd-data/cluster/_status/files/$p within 2 minutes)"
+done

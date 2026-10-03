@@ -1,0 +1,98 @@
+#!/usr/bin/python3
+"""mats-poll: the one process that polls the MATS cluster for status (#2951).
+
+Agents' own ssh polling loops (25 at once) got the Mac shut out of the login node. Now one poller
+opens one ssh (multiplexed, ~/.ssh/config) every 2 minutes, runs cluster_snapshot.sh there, and
+unpacks the result into ~/mpd-data/cluster/_status/ (a symlink swapped atomically, so a reader
+never sees half a snapshot):
+  STAMP, squeue.txt, squeue_ours.txt, sacct.txt, node.txt, gpu_balance.log, pool.txt, holds.txt,
+  peaks.tsv, audit.txt (every 10th poll), and files/<path relative to the cluster home>: the
+  last 400 lines of every job log, JOBS, small JSON/text of jobs touched in 2 days, plus anything
+  listed in ~/mpd-data/cluster/_watch.txt (`mats-watch PATH...` adds to it).
+It also runs the good-citizen audit every 20 minutes and appends its findings to
+~/mpd-data/cluster/_audit_history.txt. After a failure it backs off (5, then 10 minutes) and
+writes _status_error.txt. Only one instance runs (a lock); start it with `mats-poll &`, or
+`mats-poll --once` for a single snapshot.
+
+Read the cache instead of opening ssh: `mats-status [NAME]`, `mats-cat PATH`, or
+grep ~/mpd-data/cluster/_status/files/mpd-data/cluster/NAME/slurm-*.log directly.
+"""
+import fcntl, io, os, subprocess, sys, tarfile, time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+CL = os.path.expanduser("~/mpd-data/cluster")
+STATUS = os.path.join(CL, "_status")
+WATCH = os.path.join(CL, "_watch.txt")
+INTERVAL = 120
+
+
+def payload():
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as t:
+        for name in ("cluster_snapshot.sh", "cluster_audit.sh"):
+            t.add(os.path.join(HERE, name), arcname=name)
+        data = open(WATCH, "rb").read() if os.path.exists(WATCH) else b""
+        info = tarfile.TarInfo("watch.txt")
+        info.size = len(data)
+        t.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def poll(audit):
+    remote = ("d=~/mpd-data/cluster/_build/poll; mkdir -p $d && tar -xf - -C $d 2> /dev/null && "
+              f"bash $d/cluster_snapshot.sh {1 if audit else 0}")
+    r = subprocess.run(["ssh", "-o", "ConnectTimeout=20", "-o", "BatchMode=yes", "mats", remote],
+                       input=payload(), capture_output=True, timeout=240)
+    if r.returncode != 0 or not r.stdout:
+        raise RuntimeError(f"ssh exited {r.returncode}: {r.stderr.decode(errors='replace')[-500:]}")
+    slot = os.path.join(CL, f"_status.{int(time.time())}")
+    with tarfile.open(fileobj=io.BytesIO(r.stdout), mode="r:gz") as t:
+        t.extractall(slot)
+    with open(os.path.join(slot, "POLLED"), "w") as f:
+        f.write(time.strftime("%F %T %Z") + "\n")
+    link = STATUS + ".new"
+    if os.path.lexists(link):
+        os.remove(link)
+    os.symlink(os.path.basename(slot), link)
+    old = os.path.realpath(STATUS) if os.path.islink(STATUS) else None
+    os.replace(link, STATUS)
+    for d in os.listdir(CL):
+        p = os.path.join(CL, d)
+        if d.startswith("_status.") and p != slot and p != old and os.path.isdir(p):
+            subprocess.run(["rm", "-rf", p])
+    if audit and os.path.exists(os.path.join(slot, "audit.txt")):
+        with open(os.path.join(CL, "_audit_history.txt"), "a") as h:
+            for line in open(os.path.join(slot, "audit.txt")):
+                h.write(time.strftime("%F %T ") + line)
+    err = os.path.join(CL, "_status_error.txt")
+    if os.path.exists(err):
+        os.remove(err)
+
+
+def main():
+    os.makedirs(os.path.expanduser("~/.cache/mats-poll"), exist_ok=True)
+    lock = open(os.path.expanduser("~/.cache/mats-poll/lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit("mats-poll: already running")
+    once = "--once" in sys.argv
+    n, backoff = 0, 0
+    while True:
+        try:
+            poll(audit=(n % 10 == 0))
+            n += 1
+            backoff = 0
+            print(time.strftime("%T ") + "polled", flush=True)
+        except Exception as e:
+            backoff = min(600, max(300, backoff * 2))
+            with open(os.path.join(CL, "_status_error.txt"), "w") as f:
+                f.write(time.strftime("%F %T ") + f"{e}; next try in {backoff}s\n")
+            print(time.strftime("%T ") + f"poll failed: {e}; next try in {backoff}s", flush=True)
+        if once:
+            return
+        time.sleep(backoff or INTERVAL)
+
+
+if __name__ == "__main__":
+    main()

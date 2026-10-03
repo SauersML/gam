@@ -1,39 +1,26 @@
 #!/usr/bin/env bash
-# MATS cluster status (#2951).
+# MATS cluster status from the shared cache that mats-poll refreshes every 2 minutes (#2951); no ssh.
 #
-#   mats-status          our jobs, their peak memory, our CPU/GPU/memory use against the QOS, the node,
-#                        and others' queue
-#   mats-status NAME     also the last 30 lines of NAME's newest Slurm log and its job history
+#   mats-status          our jobs, our CPU/GPU/memory use against the QOS, the node, and others' queue
+#   mats-status NAME     also NAME's job history and the last 30 lines of its newest log
 set -Eeuo pipefail
-ssh mats bash -s -- "${1:-}" <<'REMOTE'
-name=$1
-squeue -u "$USER" -o '%.7i %.26j %.2t %.10M %.10l %.4C %.7m %.8b %R'
-echo "running jobs' peak memory (RAM, not CPUs, is what fills the node; ask for about 1.5x the peak):"
-for j in $(squeue -u "$USER" -h -t R -o %i); do
-    rss=$(sstat -n -j "$j.batch" -o MaxRSS 2> /dev/null | head -1 | tr -d ' ')
-    printf '  %-7s %-26s asked %-6s peak %s\n' "$j" "$(squeue -h -j "$j" -o %j)" "$(squeue -h -j "$j" -o %m)" "${rss:-?}"
-done
-squeue -u "$USER" -h -o '%t %C %m %b' | awk '
-    function gb(m) { return m ~ /G$/ ? m + 0 : m ~ /T$/ ? m * 1024 : m / 1024 }
-    { g = ($4 ~ /gpu/) ? substr($4, match($4, /[0-9]+$/)) + 0 : 0
-      if ($1 == "R") { c += $2; mm += gb($3); gg += g } else { pc += $2; pn++ } }
-    END { printf "ours: running %d/124 CPUs, %d/384 GB, %d/6 GPUs; pending %d jobs (%d CPUs)\n", c, mm, gg, pn, pc }'
-scontrol show node l40-worker | awk '/CPUAlloc/ { print "node: " $1 " " $2 } /AllocTRES/ { print "node: " $1 }'
-others=$(squeue -h -t PD -o '%u %r' | grep -v "^$USER " || true)
-echo "others pending: $(printf '%s\n' "$others" | grep -c . ) ($(printf '%s\n' "$others" | awk '{ print $2 }' | sort | uniq -c | awk '{ printf "%s %s; ", $1, $2 }'))"
-if [ -n "$name" ]; then
-    d=$HOME/mpd-data/cluster/$name
-    [ -f "$d/JOBS" ] && { echo "-- $d/JOBS"; tail -n 5 "$d/JOBS"; }
-    log=$(ls -t "$d"/slurm-*.log 2> /dev/null | head -1 || true)
-    if [ -n "$log" ]; then echo "-- $log"; tail -n 30 "$log"; else echo "-- no log yet in $d"; fi
+S=$HOME/mpd-data/cluster/_status
+[ -f "$S/STAMP" ] || { echo "mats-status: no snapshot yet; is mats-poll running? (pgrep -f mats-poll)" >&2; exit 1; }
+echo "snapshot $(cat "$S/STAMP"), polled $(cat "$S/POLLED")"
+[ -f "$HOME/mpd-data/cluster/_status_error.txt" ] && echo "last poll failed: $(cat "$HOME/mpd-data/cluster/_status_error.txt")"
+cat "$S/squeue_ours.txt"
+awk 'NR > 1 {
+        m = $6; gb = m ~ /G$/ ? m + 0 : m ~ /T$/ ? m * 1024 : m / 1024
+        g = ($7 ~ /gpu/) ? substr($7, match($7, /[0-9]+$/)) + 0 : 0
+        if ($3 == "R") { c += $5; mm += gb; gg += g } else { pc += $5; pn++ } }
+     END { printf "ours: running %d CPUs (normal cap 124), %d GB, %d GPUs; pending %d jobs (%d CPUs)\n", c, mm, gg, pn, pc }' "$S/squeue_ours.txt"
+awk '/CPUAlloc/ { print "node: " $1 " " $2 } /AllocTRES/ { print "node: " $1 }' "$S/node.txt"
+awk 'NR > 1 && $4 == "PD" && $2 != "s.sauers" { n++; r[$NF]++ } END { printf "others pending: %d", n; for (k in r) printf "; %s %s", r[k], k; print "" }' "$S/squeue.txt"
+if [ -n "${1:-}" ]; then
+    d=$S/files/mpd-data/cluster/$1
+    [ -f "$d/JOBS" ] && { echo "-- JOBS"; tail -n 5 "$d/JOBS"; }
+    log=$(ls -t "$d"/slurm-*.log "$d"/pool-*.log 2> /dev/null | head -1 || true)
+    if [ -n "$log" ]; then echo "-- ${log#"$S/files/"}"; tail -n 30 "$log"; else echo "-- no log in the snapshot for $1"; fi
     jid=$(tail -n 1 "$d/JOBS" 2> /dev/null | awk '{ print $1 }')
-    if [ -n "$jid" ]; then
-        n=$(sacct -j "$jid" -X -n -o JobID 2> /dev/null | wc -l)
-        if (( n > 3 )); then
-            echo "-- array $jid: $(sacct -j "$jid" -X -n -o State 2> /dev/null | sort | uniq -c | awk '{ printf "%s %s; ", $1, $2 }')"
-        else
-            sacct -j "$jid" -X -o JobID,State,Elapsed,AllocCPUS,MaxRSS,ExitCode -n 2> /dev/null || true
-        fi
-    fi
+    [ -n "$jid" ] && grep -E "^${jid}(_|\\|)" "$S/sacct.txt" | head -12 | tr '|' ' ' || true
 fi
-REMOTE
