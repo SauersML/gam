@@ -27,7 +27,7 @@ Stages (each writes into OUT = ~/mpd-data/nlae):
   kl        the masked model running each decoded program, KL per word
   figure    the figure
 
-usage: MPD_MEM_GIB=4 venv python vpd_nl_autoencoder.py STAGE
+usage: MPD_MEM_GIB=4 venv python vpd_nl_autoencoder.py STAGE...
 """
 
 import json
@@ -1025,4 +1025,5 @@ if __name__ == "__main__":
     stages = {"labels": stage_labels, "label_bits": stage_label_bits, "attrib": stage_attrib, "text": stage_text,
               "bits": stage_bits, "kl": stage_kl, "report": stage_report, "figure": stage_figure,
               "controls": stage_controls, "names": stage_names, "fluent": stage_fluent}
-    stages[sys.argv[1]]()
+    for stage in sys.argv[1:]:
+        stages[stage]()
