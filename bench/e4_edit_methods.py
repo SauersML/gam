@@ -84,13 +84,13 @@ def stage_prep():
     # fire keys and the gradient of log p(o) with respect to the site output there
     keys, grads = [], []
     for ids, fire in fire_batches(train):
-        ids_t = torch.from_numpy(ids).to("mps")
+        ids_t = torch.from_numpy(ids).to(E.DEVICE)
         with torch.no_grad():
             xmid, g2 = resid(ids_t)
         y = (g2 @ W0.T).detach().requires_grad_(True)
         lp = head(final.after(xmid + y))
-        b = torch.tensor([j for j, _ in fire], device="mps")
-        q = torch.tensor([q for _, q in fire], device="mps")
+        b = torch.tensor([j for j, _ in fire], device=E.DEVICE)
+        q = torch.tensor([q for _, q in fire], device=E.DEVICE)
         (gy,) = torch.autograd.grad(lp[b, q, E.O_TOK].sum(), y)
         keys.append(g2[b, q].detach().cpu().double())
         grads.append(gy[b, q].detach().cpu().double())
@@ -98,7 +98,7 @@ def stage_prep():
     ev_keys = []
     with torch.no_grad():
         for ids, fire in fire_batches(ev):
-            _, g2 = resid(torch.from_numpy(ids).to("mps"))
+            _, g2 = resid(torch.from_numpy(ids).to(E.DEVICE))
             ev_keys.append(g2[[j for j, _ in fire], [q for _, q in fire]].cpu().double())
     Ke = torch.cat(ev_keys).numpy()
     log(f"{len(K)} training fire keys, {len(Ke)} eval fire keys")
@@ -112,19 +112,19 @@ def stage_prep():
     emo, colon, piece = masks(rows, txt)
     Vall = torch.load(str(E.VD / "s-55ea3f9b/model_400000.pth"), map_location="cpu", weights_only=True, mmap=True)[
         "_components." + E.SITE.replace(".", "-") + ".V"].float()
-    Vm = Vall.to("mps")
+    Vm = Vall.to(E.DEVICE)
     spec = {k: torch.zeros(Vall.shape[1], dtype=torch.float64) for k in ("general", "colon", "piece")}
     torch.manual_seed(0)
     for i in range(0, len(rows), 2):
-        ids_t = torch.from_numpy(rows[i:i + 2]).to("mps")
+        ids_t = torch.from_numpy(rows[i:i + 2]).to(E.DEVICE)
         with torch.no_grad():
             xmid, g2 = resid(ids_t)
         g = g2[:, :-1]
-        keep = torch.from_numpy(~emo[i:i + 2]).to("mps")
+        keep = torch.from_numpy(~emo[i:i + 2]).to(E.DEVICE)
         if i % 16 == 0:
             sample.append(g[keep][::64].cpu().double())
-        for mask, acc, key in ((keep, C, "general"), (torch.from_numpy(colon[i:i + 2]).to("mps"), Cc, "colon"),
-                               (torch.from_numpy(piece[i:i + 2]).to("mps"), Cp, "piece")):
+        for mask, acc, key in ((keep, C, "general"), (torch.from_numpy(colon[i:i + 2]).to(E.DEVICE), Cc, "colon"),
+                               (torch.from_numpy(piece[i:i + 2]).to(E.DEVICE), Cp, "piece")):
             x = g[mask]
             acc += (x.T @ x).cpu().double().numpy()
             spec[key] += ((x @ Vm) ** 2).sum(0).cpu().double()
@@ -136,18 +136,22 @@ def stage_prep():
                 npc += len(x)
         for j in range(2) if i < 32 else ():  # the Fisher from 32 rows, one at a time: labels sampled from the
             y = (g2[j:j + 1] @ W0.T).detach().requires_grad_(True)  # model, so E[g g^T] is the Fisher
-            lp = head(final.after(xmid[j:j + 1] + y))[:, :-1]
-            lab = (lp.detach() - torch.log(-torch.log(torch.rand_like(lp)))).argmax(-1)
-            (gy,) = torch.autograd.grad(lp.gather(-1, lab[..., None]).sum(), y)
+            x3 = final.after(xmid[j:j + 1] + y)
+            gy = torch.zeros_like(y)
+            for p0 in range(0, 511, 128):  # the vocab-sized log-softmax in blocks of positions
+                lp = head(x3[:, p0:min(p0 + 128, 511)])
+                lab = (lp.detach() - torch.log(-torch.log(torch.rand_like(lp)))).argmax(-1)
+                gy += torch.autograd.grad(lp.gather(-1, lab[..., None]).sum(), y, retain_graph=True)[0]
+                del lp, lab
             gy = gy[:, :-1][keep[j:j + 1]]
             H += (gy.T @ gy).cpu().double().numpy()
             nh += len(gy)
-            del lp, lab, y
-        torch.mps.empty_cache()
+            del x3, y
+        E.empty_cache()
         if i % 32 == 0:
             log(f"moments: rows {i}")
-            torch.mps.empty_cache()
-    kf = torch.from_numpy(K).float().to("mps")
+            E.empty_cache()
+    kf = torch.from_numpy(K).float().to(E.DEVICE)
     spec_fire = ((kf @ Vm) ** 2).mean(0).cpu().double().numpy()
     np.savez(OUT / "prep.npz", K=K, Gk=Gk, K_eval=Ke, X_general=torch.cat(sample).numpy(), C=C / n, C_colon=Cc / nc, C_piece=Cp / npc, H=H / nh, n=n, n_colon=nc,
              n_piece=npc, spec_fire=spec_fire, spec_general=(spec["general"] / n).numpy(),
@@ -162,8 +166,8 @@ def train_lora_neg(target, pool, negs, lam, gamma, steps=300, batch=256, micro=8
     site = target.site(E.SITE)
     W0 = site.W.clone()
     torch.manual_seed(0)
-    A = (torch.randn(1, W0.shape[1]) * 0.01).to("mps").requires_grad_(True)
-    B = torch.zeros(W0.shape[0], 1, device="mps", requires_grad=True)
+    A = (torch.randn(1, W0.shape[1]) * 0.01).to(E.DEVICE).requires_grad_(True)
+    B = torch.zeros(W0.shape[0], 1, device=E.DEVICE, requires_grad=True)
     opt = torch.optim.AdamW([A, B], lr=1e-3)
 
     def pack(seqs):
@@ -195,7 +199,7 @@ def train_lora_neg(target, pool, negs, lam, gamma, steps=300, batch=256, micro=8
         opt.zero_grad()
         for j in range(0, len(idx), micro):
             mi = idx[j:j + micro]
-            tb, fb, pb = T[mi].to("mps"), fire[mi].to("mps"), pad[mi].to("mps")
+            tb, fb, pb = T[mi].to(E.DEVICE), fire[mi].to(E.DEVICE), pad[mi].to(E.DEVICE)
             with torch.no_grad():
                 site.W = W0
                 lb = F.log_softmax(target(tb), -1)
@@ -209,7 +213,7 @@ def train_lora_neg(target, pool, negs, lam, gamma, steps=300, batch=256, micro=8
             del lg, le, lb
         for j in range(0, len(jdx), micro):
             mj = jdx[j:j + micro]
-            tb, pb = Tn[mj].to("mps"), padn[mj].to("mps")
+            tb, pb = Tn[mj].to(E.DEVICE), padn[mj].to(E.DEVICE)
             with torch.no_grad():
                 site.W = W0
                 lb = F.log_softmax(target(tb), -1)
@@ -218,7 +222,7 @@ def train_lora_neg(target, pool, negs, lam, gamma, steps=300, batch=256, micro=8
             (gamma * (le.exp() * (le - lb))[pb].sum() / max(n_neg, 1)).backward()
             del le, lb
         opt.step()
-        torch.mps.empty_cache()  # keeps the footprint inside the 2 GiB reservation
+        E.empty_cache()  # keeps the footprint inside the 2 GiB reservation
     site.W = W0
     return A.detach().cpu(), B.detach().cpu()
 
@@ -302,22 +306,22 @@ def stage_screen():
     cache = []
     with torch.no_grad():
         for i in range(0, len(rows), 2):
-            xmid, g2 = resid(torch.from_numpy(rows[i:i + 2]).to("mps"))
+            xmid, g2 = resid(torch.from_numpy(rows[i:i + 2]).to(E.DEVICE))
             cache.append((xmid.cpu(), g2.cpu()))
 
     @torch.no_grad()
     def screen_kl(dW):
         tot, cnt = 0.0, 0
         for c, (xmid, g2) in enumerate(cache):
-            xmid, g2 = xmid.to("mps"), g2.to("mps")
+            xmid, g2 = xmid.to(E.DEVICE), g2.to(E.DEVICE)
             xb, xe = final(xmid, g2, W0)[:, :-1], final(xmid, g2, W0 + dW)[:, :-1]
-            k = keep[2 * c:2 * c + 2].to("mps")
+            k = keep[2 * c:2 * c + 2].to(E.DEVICE)
             for p0 in range(0, 511, 128):
                 lb, le = head(xb[:, p0:p0 + 128]), head(xe[:, p0:p0 + 128])
                 kl = (le.exp() * (le - lb)).sum(-1)
                 tot += float(kl[k[:, p0:p0 + 128]].sum())
                 cnt += int(k[:, p0:p0 + 128].sum())
-        torch.mps.empty_cache()
+        E.empty_cache()
         return tot / cnt
 
     def solve(family, p_target, lo=1e-3, hi=1e4):
@@ -334,7 +338,7 @@ def stage_screen():
     path = OUT / "screen.json"
     res = json.load(open(path)) if path.exists() else {}
     res["spec_component"] = spec_c
-    t32 = lambda a: torch.from_numpy(np.asarray(a, np.float32)).to("mps")
+    t32 = lambda a: torch.from_numpy(np.asarray(a, np.float32)).to(E.DEVICE)
     fams = {}
     for rn, u in reads.items():
         for wn in (("fisher", "grad") if rn == "rome" else ("fisher",)):
@@ -367,7 +371,7 @@ def stage_screen():
     for nm, d in deltas.items():
         if nm in res:
             continue
-        dW = (d["B"] @ d["A"]).to("mps")
+        dW = (d["B"] @ d["A"]).to(E.DEVICE)
         res[nm] = [{"target": None, "p_fire": pf(W0 + dW), "kl": screen_kl(dW), "norm": float(dW.norm())}]
         log(f"{nm}: p {res[nm][0]['p_fire']:.4f} kl {res[nm][0]['kl']:.2e}")
         json.dump(res, open(path, "w"), indent=1)
@@ -417,7 +421,7 @@ def family_deltas():
     Vall = raw["_components." + E.SITE.replace(".", "-") + ".V"].double().numpy()
     del raw
     reads, writes, spec_c = reads_and_writes(z, Vall)
-    t32 = lambda a: torch.from_numpy(np.asarray(a, np.float32)).to("mps")
+    t32 = lambda a: torch.from_numpy(np.asarray(a, np.float32)).to(E.DEVICE)
     fams = {}
     for rn, u in reads.items():
         for wn in (("fisher", "grad") if rn == "rome" else ("fisher",)):
@@ -450,10 +454,10 @@ def stage_assemble():
             lo, hi = (mid, hi) if pf(W0 + fam(mid)) < p else (lo, mid)
         s = (lo * hi) ** 0.5
         return s, fam(s)
-    groups = {"rome": ["rome+fisher"], "rome_gradwrite": ["rome+grad"], "memit": [k for k in fams if k.startswith("memit")],
+    groups = {"rome": ["rome+fisher"], "memit": [k for k in fams if k.startswith("memit")],
               "nullspace": [k for k in fams if k.startswith("null")], "contrast": [k for k in fams if k.startswith("contrast")],
-              "vpd_read_fisher_write": ["vpd2359_read+fisher"], "specific_subcomponent": [k for k in fams if k.startswith("spec")],
-              "compiled": [k for k in fams if k.startswith("compiled")]}
+              "specific_subcomponent": [k for k in fams if k.startswith("spec")],
+              "compiled_every_key": [k for k in fams if k.startswith("compiled_old")]}
     kl_at = lambda k: next((q["kl"] for q in scr.get(k, []) if q.get("target") == 0.985 and q.get("kl") is not None), np.inf)
     out, meta = {}, {}
     for g, ks in groups.items():
@@ -469,7 +473,7 @@ def stage_assemble():
     out["vpd"], meta["vpd"] = dW.cpu(), {"method": "vpd", "alpha": s, "p_fire": pf(W0 + dW)}
     deltas = E.lora_deltas()
     out["lora"] = (deltas["lora282_lam10"]["B"] @ deltas["lora282_lam10"]["A"])
-    meta["lora"] = {"method": "lora", "config": "lora282_lam10", "p_fire": pf(W0 + out["lora"].to("mps"))}
+    meta["lora"] = {"method": "lora", "config": "lora282_lam10", "p_fire": pf(W0 + out["lora"].to(E.DEVICE))}
     negs = {}
     for f in OUT.glob("lora_loraneg_*.pt"):
         negs.update(torch.load(f))
@@ -477,7 +481,7 @@ def stage_assemble():
     if negs:
         best = min(negs, key=lambda k: scr.get(k, [{"kl": np.inf}])[0]["kl"])
         dW = negs[best]["B"] @ negs[best]["A"]
-        p = pf(W0 + dW.to("mps"))
+        p = pf(W0 + dW.to(E.DEVICE))
         out["lora_hardneg"], meta["lora_hardneg"] = dW, {"method": "lora_hardneg", "config": best, "p_fire": p}
         s, dv = at(fams["vpd"], p, 0.3, 20.0)
         out["vpd_at_hardneg"], meta["vpd_at_hardneg"] = dv.cpu(), {"method": "vpd", "alpha": s, "p_fire": pf(W0 + dv)}
@@ -487,5 +491,108 @@ def stage_assemble():
     log(f"final set: {list(out)}")
 
 
+def stage_assemble_extra(name, fam_names):
+    """A further edit set NAME: the named families at the headline LoRA's exact success, with the VPD edit there."""
+    import torch
+    target, fams, _ = family_deltas()
+    W0 = target.site(E.SITE).W.clone()
+    ev, _ = E.harvest()
+    pf = E.p_fire_fn(target, ev)
+    p_star = json.load(open(E.FR / "e4_side/models.json"))["meta"]["lora282_lam10"]["p_fire"]
+    out, meta = {}, {}
+    for f in fam_names + ["vpd"]:
+        lo, hi = (0.3, 20.0) if f == "vpd" else (1e-3, 1e4)
+        for _ in range(40):
+            mid = (lo * hi) ** 0.5
+            lo, hi = (mid, hi) if pf(W0 + fams[f](mid)) < p_star else (lo, mid)
+        dW = fams[f]((lo * hi) ** 0.5)
+        out[f], meta[f] = dW.cpu(), {"method": f, "strength": (lo * hi) ** 0.5, "p_fire": pf(W0 + dW)}
+        log(f"{f}: p_fire {meta[f]['p_fire']:.4f}")
+    torch.save(out, OUT / f"{name}.pt")
+    json.dump({"meta": meta, "pairs": [[f, "vpd"] for f in fam_names]}, open(OUT / f"{name}.json", "w"), indent=1)
+
+
+def stage_compile_span():
+    """Compiler problems exact only on the k-dimensional span of fire-key combinations that the required response
+    needs most: the top-k eigenvectors a_j of the whitened key Gram K C^-1 K^T, with inputs b_j = K^T a_j and
+    targets W0 b_j + (a_j . 1) w, so each b_j gets exactly the response its keys ask for. k = 1, 2, 4, ..., 64."""
+    import scipy.linalg as sl
+    d = OUT / "compile"
+    K, C, W0 = np.load(d / "inputs.npy"), np.load(d / "moment.npy"), np.load(d / "native.npy")
+    w = (np.load(d / "targets.npy") - K @ W0.T).mean(0)
+    M = K @ sl.solve(C, K.T, assume_a="pos")
+    vals, vecs = sl.eigh((M + M.T) / 2)
+    vecs = vecs[:, ::-1]
+    base = json.load(open(d / "manifest.json"))["problems"][0]
+    problems = []
+    for k in (1, 2, 4, 8, 16, 32, 64):
+        A = vecs[:, :k]
+        B = A.T @ K
+        np.save(d / f"inputs_span{k}.npy", np.ascontiguousarray(B))
+        np.save(d / f"targets_span{k}.npy", np.ascontiguousarray(B @ W0.T + np.outer(A.sum(0), w)))
+        problems.append(dict(base, name=f"compiled_span{k}", inputs=f"inputs_span{k}.npy", targets=f"targets_span{k}.npy",
+                             class_="sample", out=f"plan_compiled_span{k}"))
+    for q in problems:
+        q["class"] = q.pop("class_")
+        q.pop("class_span", None)
+    json.dump({"problems": problems}, open(d / "manifest_span.json", "w"), indent=1)
+    log(f"whitened key Gram eigenvalues (top 8): {np.round(vals[::-1][:8], 3).tolist()}")
+
+
+def stage_heldout():
+    """Held-out emoticons: every emoticon (by the text rule) in rows 0-19999 of the val shard's row group 2 (never
+    scanned, harvested or trained on), as a window of 20 tokens either side like the edit's own windows. P('o') at the
+    emoticon colon under every edit of the final set (E4_VARIANTS=final), with 95% intervals over emoticons."""
+    import pyarrow.parquet as pq
+    import torch
+    sys.path.insert(0, str(E.VD))
+    from vpd_model import VAL_PARQUET
+    path = OUT / "heldout_emoticons.npz"
+    _, txt = vocab()
+    if not path.exists():
+        parts = []
+        for batch in pq.ParquetFile(VAL_PARQUET).iter_batches(batch_size=2000, row_groups=[2], columns=["input_ids"]):
+            col = batch.column(0)
+            parts.append(col.flatten().to_numpy().reshape(len(col), -1)[:, :512].astype(np.int32))
+            if sum(len(x) for x in parts) >= 20000:
+                break
+        rows = np.concatenate(parts)[:20000].astype(np.int64)
+        del parts
+        ends_space = np.array([t[-1:].isspace() for t in txt])
+        r, q = np.nonzero(E.emoticon_positions(rows, txt, ends_space))
+        wins = np.zeros((len(r), 2 * E.SIDE + 1), np.int64)
+        lens, pos = np.zeros(len(r), int), np.zeros(len(r), int)
+        for i, (a, b) in enumerate(zip(r, q)):
+            lo = max(0, b - E.SIDE)
+            w = rows[a, lo:b + 1]  # the model sees the window up to the colon; it predicts the next token
+            wins[i, :len(w)] = w
+            lens[i], pos[i] = len(w), b - lo
+        np.savez(path, wins=wins, lens=lens, pos=pos, rows=r, mouth=rows[r, q + 1])
+    z = np.load(path)
+    target, W0, models, meta = E.edit_variants()
+    site = target.site(E.SITE)
+    names = ["original"] + list(models)
+    P = np.zeros((len(z["wins"]), len(names)))
+    ids = torch.from_numpy(z["wins"]).to(E.DEVICE)
+    pos = torch.from_numpy(z["pos"]).to(E.DEVICE)
+    with torch.no_grad():
+        for k, nm in enumerate(names):
+            site.W = W0 if nm == "original" else W0 + models[nm]
+            for i in range(0, len(ids), 64):
+                lg = target(ids[i:i + 64])
+                P[i:i + 64, k] = torch.softmax(lg[torch.arange(len(lg)), pos[i:i + 64]], -1)[:, E.O_TOK].cpu().numpy()
+            E.empty_cache()
+    site.W = W0
+    rng = np.random.default_rng(0)
+    bs = np.stack([P[rng.integers(0, len(P), len(P))].mean(0) for _ in range(1000)])
+    res = {"n": len(P), "mouths": {txt[t]: int((z["mouth"] == t).sum()) for t in np.unique(z["mouth"])},
+           "p_o": {nm: [float(P[:, k].mean()), *map(float, np.percentile(bs[:, k], [2.5, 97.5]))] for k, nm in enumerate(names)},
+           "eval_window_p_fire": {nm: meta[nm]["p_fire"] for nm in models if nm in meta}}
+    json.dump(res, open(OUT / f"heldout_{E.VARIANTS}.json", "w"), indent=1)
+    for nm in names:
+        print(f"{nm:24s} P(o) on {len(P)} held-out emoticons {res['p_o'][nm][0]:.3f} [{res['p_o'][nm][1]:.3f}, {res['p_o'][nm][2]:.3f}]")
+
+
 if __name__ == "__main__":
-    {"prep": stage_prep, "screen": stage_screen, "compile_export": stage_compile_export, "assemble": stage_assemble, "lora_neg": lambda: stage_lora_neg(float(sys.argv[2]))}[sys.argv[1]]()
+    {"prep": stage_prep, "screen": stage_screen, "compile_export": stage_compile_export, "assemble": stage_assemble, "compile_span": stage_compile_span, "heldout": stage_heldout,
+     "assemble_extra": lambda: stage_assemble_extra(sys.argv[2], sys.argv[3:]), "lora_neg": lambda: stage_lora_neg(float(sys.argv[2]))}[sys.argv[1]]()

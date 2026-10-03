@@ -32,6 +32,7 @@ import numpy as np
 HOME = Path.home()
 VD = HOME / "mpd-data/vpd"
 FR = HOME / "mpd-data/frontier"
+DEVICE = __import__("os").environ.get("E4_DEVICE", "mps")  # "cpu" for jobs whose GPU-allocator overhead breaks their budget
 DEV = int(__import__("os").environ.get("E4_DEV_ROWS", "0"))  # > 0: a quick run on that many rows with the LoRAs trained so far
 # E4_VARIANTS=NAME scores the edits in e4_side/methods/NAME.pt ({name: delta W}, metadata and comparison pairs in
 # NAME.json) instead of the LoRAs and VPD edits, into e4_side/methods/NAME/
@@ -50,6 +51,12 @@ t0 = time.time()
 log = lambda m: print(f"[{time.time() - t0:6.0f}s] {m}", flush=True)
 
 
+def empty_cache():
+    import torch
+    if DEVICE == "mps":
+        torch.mps.empty_cache()
+
+
 def tokenizer():
     from tokenizers import Tokenizer
     return Tokenizer.from_file(str(VD / "t-9d2b8f02/tokenizer.json"))
@@ -62,14 +69,16 @@ def load():
     from safetensors.torch import load_file
     sys.path.insert(0, str(VD))
     from vpd_model import TARGET_DIR, VPD_PTH, Target
+    if DEVICE == "cpu":
+        torch.set_num_threads(4)
     # vpd_model.load_target with the weights loaded straight onto the GPU: 0.5 GiB instead of 1.3 GiB of footprint
-    sd = load_file(str(TARGET_DIR / "model_step_99999.safetensors"), device="mps")
-    target = Target(sd, yaml.safe_load((TARGET_DIR / "model_config.yaml").read_text())).to("mps").eval()
+    sd = load_file(str(TARGET_DIR / "model_step_99999.safetensors"), device=DEVICE)
+    target = Target(sd, yaml.safe_load((TARGET_DIR / "model_config.yaml").read_text())).to(DEVICE).eval()
     del sd
     raw = torch.load(str(VPD_PTH), map_location="cpu", weights_only=True, mmap=True)
     key = "_components." + SITE.replace(".", "-")
-    U = raw[key + ".U"].float()[COMP].to("mps")
-    V = raw[key + ".V"].float()[:, COMP].to("mps")
+    U = raw[key + ".U"].float()[COMP].to(DEVICE)
+    V = raw[key + ".V"].float()[:, COMP].to(DEVICE)
     del raw
     return target, U, V
 
@@ -106,8 +115,8 @@ def train_lora(target, pool, lam, steps=300, batch=256, micro=8):
     site = target.site(SITE)
     W0 = site.W.clone()
     torch.manual_seed(0)
-    A = (torch.randn(1, W0.shape[1]) * 0.01).to("mps").requires_grad_(True)
-    B = torch.zeros(W0.shape[0], 1, device="mps", requires_grad=True)
+    A = (torch.randn(1, W0.shape[1]) * 0.01).to(DEVICE).requires_grad_(True)
+    B = torch.zeros(W0.shape[0], 1, device=DEVICE, requires_grad=True)
     opt = torch.optim.AdamW([A, B], lr=1e-3)
     seqs = []
     for toks, f in pool:
@@ -132,7 +141,7 @@ def train_lora(target, pool, lam, steps=300, batch=256, micro=8):
         opt.zero_grad()
         for j in range(0, len(idx), micro):
             mi = idx[j:j + micro]
-            tb, fb, pb = T[mi].to("mps"), fire[mi].to("mps"), pad[mi].to("mps")
+            tb, fb, pb = T[mi].to(DEVICE), fire[mi].to(DEVICE), pad[mi].to(DEVICE)
             with torch.no_grad():
                 site.W = W0
                 lb = F.log_softmax(target(tb), -1)
@@ -167,7 +176,7 @@ def p_fire_fn(target, ev):
         for b in range(0, len(ev), 10):
             ii = [i - b for i, q in pos if b <= i < b + 10]
             qq = [q for i, q in pos if b <= i < b + 10]
-            ps.append(torch.softmax(target(T[b:b + 10].to("mps"))[ii, qq], -1)[:, O_TOK].cpu())
+            ps.append(torch.softmax(target(T[b:b + 10].to(DEVICE))[ii, qq], -1)[:, O_TOK].cpu())
         site.W = W0
         return float(torch.cat(ps).mean())
     return f
@@ -271,7 +280,7 @@ def edit_variants():
     W0 = target.site(SITE).W.clone()
     if VARIANTS:
         spec = json.load(open(FR / f"e4_side/methods/{VARIANTS}.json"))
-        return target, W0, {k: v.float().to("mps") for k, v in torch.load(FR / f"e4_side/methods/{VARIANTS}.pt").items()}, spec["meta"]
+        return target, W0, {k: v.float().to(DEVICE) for k, v in torch.load(FR / f"e4_side/methods/{VARIANTS}.pt").items()}, spec["meta"]
     u_o = target.wte[O_TOK] / target.wte[O_TOK].norm()
     ev, _ = harvest()
     pf = p_fire_fn(target, ev)
@@ -283,7 +292,7 @@ def edit_variants():
         models[f"vpd_a{a:g}"] = vpd_dw(a)
         meta[f"vpd_a{a:g}"] = {"method": "vpd", "alpha": a, "p_fire": pf(W0 + vpd_dw(a))}
     for name in [n for n in LORAS if n in deltas]:
-        dw = (deltas[name]["B"] @ deltas[name]["A"]).to("mps")
+        dw = (deltas[name]["B"] @ deltas[name]["A"]).to(DEVICE)
         p = pf(W0 + dw)
         models[name] = dw
         n, lam = name[4:].split("_lam")
@@ -358,7 +367,7 @@ def stage_eval():
     ctab = torch.full((50277,), -1, dtype=torch.long)
     for k, v in cpos.items():
         ctab[k] = v
-    ctab = ctab.to("mps")
+    ctab = ctab.to(DEVICE)
     mm = lambda nm, dt, shape: np.lib.format.open_memmap(OUTD / f"{nm}.npy", mode="r+" if (OUTD / f"{nm}.npy").exists() else "w+", dtype=dt, shape=shape)
     base = {k: mm("base_" + k, dt, (R, P)) for k, dt in (("ce", np.float32), ("top", np.uint16), ("ptop", np.float16),
                                                              ("ent", np.float16), ("lpc", np.float32))}
@@ -370,13 +379,13 @@ def stage_eval():
     resid, final, head = split_forward(target)
 
     with torch.no_grad():
-        ids = torch.from_numpy(tokens[:1].astype(np.int64)).to("mps")  # the split forward is the model's forward
+        ids = torch.from_numpy(tokens[:1].astype(np.int64)).to(DEVICE)  # the split forward is the model's forward
         err = (head(final(*resid(ids), W0)) - F.log_softmax(target(ids), -1)).abs().max().item()
         assert err < 1e-3, err
         order = np.argsort(-lens, kind="stable")  # longest first; a batch stops at its longest document
         for r0 in range(done, R, B):
             rs = np.sort(order[r0:r0 + B])
-            ids = torch.from_numpy(tokens[rs].astype(np.int64)).to("mps")
+            ids = torch.from_numpy(tokens[rs].astype(np.int64)).to(DEVICE)
             xmid, g2 = resid(ids)
             xb = final(xmid, g2, W0)
             xe = {nm: final(xmid, g2, W0 + models[nm]) for nm in names}
@@ -410,7 +419,7 @@ def stage_eval():
                         a.flush()
                 done_path.write_text(str(min(r0 + B, R)))
                 log(f"rows {min(r0 + B, R)}/{R}")
-                torch.mps.empty_cache()
+                empty_cache()
 
 
 # ---------------------------------------------------------------- summarize

@@ -151,18 +151,18 @@ def stage_score(base_only=False, colon=True):
             ids = np.zeros((TOK // Lb, Lm), np.int64)
             for r, q in enumerate(idx):
                 ids[r, :lens[q]] = rq["flat"][offs[q]:offs[q + 1]]
-            ids_t = torch.from_numpy(ids).to("mps")
+            ids_t = torch.from_numpy(ids).to(E.DEVICE)
             # scored positions: predicting token t+1 for the last n_cont tokens of each request
             rr = np.concatenate([np.full(n_cont[q], r) for r, q in enumerate(idx)])
             pp = np.concatenate([np.arange(lens[q] - n_cont[q] - 1, lens[q] - 1) for q in idx])
             sg = np.repeat(np.arange(len(idx)), n_cont[idx])
             pad = -len(rr) % 512  # padded positions read row 0, position 0, and are summed into a discarded column
             rr, pp, sg = np.r_[rr, np.zeros(pad, int)], np.r_[pp, np.zeros(pad, int)], np.r_[sg, np.full(pad, ids.shape[0])]
-            rr_t, pp_t, seg = (torch.from_numpy(a).to("mps") for a in (rr, pp, sg))
+            rr_t, pp_t, seg = (torch.from_numpy(a).to(E.DEVICE) for a in (rr, pp, sg))
             tgt = ids_t[rr_t, pp_t + 1]
             xmid, g2 = resid(ids_t[:, :-1])
-            S = torch.zeros(len(names), ids.shape[0] + 1, device="mps")
-            G = torch.zeros(len(names), ids.shape[0] + 1, device="mps")
+            S = torch.zeros(len(names), ids.shape[0] + 1, device=E.DEVICE)
+            G = torch.zeros(len(names), ids.shape[0] + 1, device=E.DEVICE)
             for k, nm in enumerate(names):
                 x = final(xmid, g2, W0 if nm == "base" else W0 + models[nm])[rr_t, pp_t]
                 for c in range(0, len(x), 512):
@@ -175,7 +175,7 @@ def stage_score(base_only=False, colon=True):
             greedy[idx] = G.T == n_cont[idx][:, None]
             i = j
             nb += 1
-            torch.mps.empty_cache()  # batch shapes vary, so the MPS allocator's cache would otherwise keep growing
+            E.empty_cache()  # batch shapes vary, so the MPS allocator's cache would otherwise keep growing
             if nb % 50 == 0:
                 np.savez(part, lp=lp, greedy=greedy, names=np.array(names), i=i)
                 log(f"{i}/{nR} requests")
