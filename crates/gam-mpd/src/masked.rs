@@ -250,6 +250,9 @@ pub struct Masked {
     /// The box claim's terms ([`BoxTerms`]) with what they were computed from: the `U` operators
     /// and a fingerprint of the written Fishers.
     box_terms: Mutex<Option<(Vec<Arc<Operator>>, u64, Arc<BoxTerms>)>>,
+    /// Per site, per written node, per read node the library's sum `U_iᵀ V_j` as an operator
+    /// ([`Masked::dense_program`]), with the `V` and `U` operators it was computed from.
+    sums: Mutex<Option<(Vec<Arc<Operator>>, Arc<Vec<Vec<Vec<Arc<Operator>>>>>)>>,
 }
 
 /// A masked program's device twin, lowered on first use.
@@ -392,6 +395,7 @@ impl Masked {
             head: None,
             lowered: Mutex::new(Lowered::Untried),
             box_terms: Mutex::new(None),
+            sums: Mutex::new(None),
         })
     }
 
@@ -459,6 +463,78 @@ impl Masked {
         let terms = Arc::new(BoxTerms::new(self, fishers)?);
         *cache = Some((ops, print, Arc::clone(&terms)));
         Ok(terms)
+    }
+
+    /// The program with every site in `dense` computed as if all its gates were on, through its
+    /// library's sum `W = Σ_c u_c v_cᵀ`: each read node enters each written node through one
+    /// operator `U_iᵀ V_j`, and the site's coordinates become a copy of its mask, so a dense site
+    /// costs what the model's own map does. Its values agree with this program's wherever those
+    /// sites' masks are all one (up to rounding); nothing else of the program changes.
+    pub(crate) fn dense_program(&self, dense: &[bool]) -> Result<OperatorProgram, String> {
+        let sums = self.sums()?;
+        let interfaces = self.program.interfaces().map_err(|e| e.to_string())?;
+        let mut program = self.program.clone();
+        for (k, site) in self.sites.iter().enumerate() {
+            if !dense[k] {
+                continue;
+            }
+            program.nodes[self.z[k]] = Node::Raw { slot: self.slots[k] };
+            for (i, &written) in site.writes.iter().enumerate() {
+                let Node::Affine { terms, bias } = &program.nodes[written] else {
+                    return Err(format!("{}: a written node that is not affine", site.name));
+                };
+                let mut rewritten = Vec::with_capacity(terms.len() + site.reads.len());
+                for &(argument, operator) in terms {
+                    if argument == self.masked[k] {
+                        for (j, &read) in site.reads.iter().enumerate() {
+                            let op = &sums[k][i][j];
+                            if op.rows.width() != interfaces[written].width() || op.cols.width() != interfaces[read].width() {
+                                return Err(format!("{}: a library sum of the wrong shape", site.name));
+                            }
+                            program.operators.push(Arc::clone(op));
+                            rewritten.push((read, program.operators.len() - 1));
+                        }
+                    } else {
+                        rewritten.push((argument, operator));
+                    }
+                }
+                program.nodes[written] = Node::Affine { terms: rewritten, bias: *bias };
+            }
+        }
+        Ok(program)
+    }
+
+    /// The library's sums of [`Masked::dense_program`], computed once per library.
+    fn sums(&self) -> Result<Arc<Vec<Vec<Vec<Arc<Operator>>>>>, String> {
+        let ops: Vec<Arc<Operator>> = self.v_ops.iter().chain(&self.u_ops).flatten().map(|&op| Arc::clone(&self.program.operators[op])).collect();
+        let mut cache = self.sums.lock().map_err(|_| "library sums: a poisoned cache".to_string())?;
+        if let Some((held, sums)) = &*cache
+            && held.len() == ops.len()
+            && held.iter().zip(&ops).all(|(a, b)| Arc::ptr_eq(a, b))
+        {
+            return Ok(Arc::clone(sums));
+        }
+        *cache = None;
+        let interfaces = self.program.interfaces().map_err(|e| e.to_string())?;
+        let mut sums = Vec::new();
+        for (k, site) in self.sites.iter().enumerate() {
+            let mut per_written = Vec::new();
+            for (i, &written) in site.writes.iter().enumerate() {
+                let u = self.program.operators[self.u_ops[k][i]].matrix_cow();
+                let mut per_read = Vec::new();
+                for (j, &read) in site.reads.iter().enumerate() {
+                    let v = self.program.operators[self.v_ops[k][j]].matrix_cow();
+                    // `U_i` is held as `d_out × C`, `V_j` as `C × d_in`.
+                    let w = gam_linalg::faer_ndarray::fast_ab(&*u, &*v);
+                    per_read.push(dense(format!("{}·W{i}{j}", site.name), interfaces[written].clone(), interfaces[read].clone(), w)?);
+                }
+                per_written.push(per_read);
+            }
+            sums.push(per_written);
+        }
+        let sums = Arc::new(sums);
+        *cache = Some((ops, Arc::clone(&sums)));
+        Ok(sums)
     }
 
     /// [`Masked::on_device`] where the program was found lowered.
@@ -813,6 +889,11 @@ pub fn kl_and_logits(masked: &Masked, family: &FamilyInputs, target: &Target) ->
 pub fn box_excess_at(masked: &Masked, base: &FamilyInputs, target: &Target, masks: &[Array2<f64>], fishers: &[Array2<f64>]) -> Result<Array1<f64>, String> {
     let corner = score_only(masked, &masked.family(base, masks), target)?;
     let expected = expected_box_excess_at(masked, base, target, masks, fishers)?;
+    box_excess_from(masked, base, target, masks, &corner, expected)
+}
+
+/// [`box_excess_at`] from the masks' own KL `corner` and their expected excess `expected`.
+fn box_excess_from(masked: &Masked, base: &FamilyInputs, target: &Target, masks: &[Array2<f64>], corner: &Array1<f64>, expected: Array1<f64>) -> Result<Array1<f64>, String> {
     // The vertices share every gate on up to their own layer (as in a selection).
     let lowered = masked.on_device(|_| Ok(()))?.is_some();
     let all_on = if !lowered && masked.head.is_none() {
@@ -823,7 +904,7 @@ pub fn box_excess_at(masked: &Masked, base: &FamilyInputs, target: &Target, mask
     } else {
         None
     };
-    box_worst(masked, base, target, masks, &corner, expected, all_on.as_ref())
+    box_worst(masked, base, target, masks, corner, expected, all_on.as_ref())
 }
 
 /// The program's logits when they are one dense product of a hidden node and nothing after it:
@@ -2723,7 +2804,9 @@ pub fn step_pieces(
             };
             let box_grads = box_grads.ok_or("no box gradients")?;
             let grads = grads.into_iter().zip(box_grads).map(|((m, v, u), (bv, bu))| (m, v + bv, u + bu)).collect::<Vec<_>>();
-            (kl_now.sum() + excess.sum(), grads)
+            // The expectation's gradients steer; the claim's error, its worst case over the box
+            // points ([`box_excess_at`]), decides.
+            (kl_now.sum() + box_excess_from(masked, base, target, masks, &kl_now, excess)?.sum(), grads)
         }
     };
     // The direction, as the tangent of each operator it moves, on one side of every site and
@@ -2784,13 +2867,19 @@ pub fn step_pieces(
             masked.on_device(|accelerated| accelerated.score_only(&family, on_device))?.ok_or("device: the twin went away")?.sum()
         }
         (Claim::Corner, None) => score_only(masked, &family, target)?.sum(),
-        (Claim::Box, Some(on_device)) => masked.on_lowered(|accelerated| {
-            let state = accelerated.forward(&family, on_device)?;
-            Ok(state.kl.sum() + accelerated.box_excess(masked, &state, masks, &running.fishers, false)?.0.sum())
-        })?,
+        (Claim::Box, Some(on_device)) => {
+            let (kl_trial, expected) = masked.on_lowered(|accelerated| {
+                let state = accelerated.forward(&family, on_device)?;
+                let expected = accelerated.box_excess(masked, &state, masks, &running.fishers, false)?.0;
+                Ok((state.kl.clone(), expected))
+            })?;
+            kl_trial.sum() + box_excess_from(masked, base, target, masks, &kl_trial, expected)?.sum()
+        }
         (Claim::Box, None) => {
             let (kl_trial, trial_trace, trial_cotangent) = forward(masked, &family, target)?;
-            kl_trial.sum() + box_excess(masked, &family, &trial_trace, masks, trial_cotangent, &running.fishers, false)?.0.sum()
+            let expected = box_excess(masked, &family, &trial_trace, masks, trial_cotangent, &running.fishers, false)?.0;
+            drop(trial_trace);
+            kl_trial.sum() + box_excess_from(masked, base, target, masks, &kl_trial, expected)?.sum()
         }
     }))
 }
@@ -2839,7 +2928,8 @@ enum Evaluated {
 pub enum Claim {
     /// Off means absent: the error is the KL of the masks themselves.
     Corner,
-    /// Off means anywhere in `[0, 1]`: the error is the KL expected over every off gate uniform.
+    /// Off means anywhere in `[0, 1]`: the error is the worst over the box points evaluated
+    /// ([`box_excess_at`]), the expectation over uniform off gates among them.
     Box,
 }
 

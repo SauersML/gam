@@ -2515,7 +2515,25 @@ impl OperatorProgram {
                             let diagonal = op.diagonal();
                             match &diagonal {
                                 Some(d) => out += &(x * d),
-                                None => out += &fast_abt(x, a),
+                                None => {
+                                    // A column of `x` zero on every row adds nothing, so only the
+                                    // live columns enter the product (a masked site's gated
+                                    // coordinates are mostly zero).
+                                    let mut live = vec![false; x.ncols()];
+                                    for row in x.outer_iter() {
+                                        for (c, v) in row.iter().enumerate() {
+                                            if *v != 0.0 {
+                                                live[c] = true;
+                                            }
+                                        }
+                                    }
+                                    let columns: Vec<usize> = (0..x.ncols()).filter(|c| live[*c]).collect();
+                                    if columns.len() == x.ncols() {
+                                        out += &fast_abt(x, a);
+                                    } else if !columns.is_empty() {
+                                        out += &fast_abt(&x.select(Axis(1), &columns), &a.select(Axis(1), &columns));
+                                    }
+                                }
                             }
                             if let (Some(radius), Some(r)) = (radius.as_mut(), band(*argument)) {
                                 let mut lifted = x.mapv(|xv| growth * xv.abs());

@@ -295,3 +295,25 @@ fn a_screened_selection_returns_the_float64_kl_of_its_masks() {
         assert_eq!(kl, exact, "the returned KL is not the float64 KL of the returned masks");
     }
 }
+
+/// A site whose gates are all on computes the same through its library's sum as through its
+/// pieces (`Masked::dense_program`), and a suffix evaluated alone (`execute_suffix_node`) is the
+/// whole suffix's value at that node.
+#[test]
+fn sites_all_on_run_through_their_library_sums() {
+    let (masked, base, masks, _) = masked_fixture();
+    let dense: Vec<bool> = (0..masked.sites.len()).map(|k| k % 2 == 0).collect();
+    let gated: Vec<Array2<f64>> = masks.iter().enumerate().map(|(k, m)| if dense[k] { Array2::ones(m.dim()) } else { m.clone() }).collect();
+    let family = masked.family(&base, &gated);
+    let reference = masked.program.execute(&family, false).expect("pieces");
+    let program = masked.dense_program(&dense).expect("sums");
+    let summed = program.execute(&family, false).expect("sums execute");
+    let output = masked.program.output;
+    let scale = reference.values[output].iter().fold(1.0_f64, |m, v| m.max(v.abs()));
+    let gap = (&summed.values[output] - &reference.values[output]).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    assert!(gap <= 1e-10 * scale, "library sums moved the output by {gap:e} of {scale:e}");
+    let from = masked.z[masked.sites.len() - 1] - 1;
+    let alone = masked.program.execute_suffix_node(&family, &reference, from, output).expect("suffix node");
+    let whole = masked.program.execute_suffix(&family, &reference, from).expect("suffix");
+    assert_eq!(alone, whole[output - from]);
+}

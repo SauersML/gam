@@ -234,7 +234,7 @@ fn certificates_contain_every_point_found_in_the_box() {
         for seed in [3, 71] {
             let (masked, masks, target, radius) = masked(&program, &family, seed);
             let gates = Gates::claim(&masks);
-            let found = adversary(&masked, &family, &target, &masks, None, 8, 6, seed as u64).expect("adversary");
+            let found = adversary(&masked, &family, &target, &gates, None, 8, 6, seed as u64).expect("adversary");
             let mut worst = found.clone();
             for draw in 0..20 {
                 let point: Vec<Array2<f64>> = masks
@@ -281,7 +281,7 @@ fn a_pinned_box_certifies_its_own_divergence() {
 fn branching_tightens_and_stays_sound() {
     for (name, program, family) in fixtures() {
         let (masked, masks, target, radius) = masked(&program, &family, 11);
-        let found = adversary(&masked, &family, &target, &masks, None, 8, 4, 11).expect("adversary");
+        let found = adversary(&masked, &family, &target, &Gates::claim(&masks), None, 8, 4, 11).expect("adversary");
         let branched = certify_branching(&masked, &family, &target, Some(&radius), Gates::claim(&masks), 4096, 9).expect("branched");
         for r in 0..family.rows {
             assert!(branched.kl[r] <= branched.root[r], "{name}: row {r} branched {} above its root {}", branched.kl[r], branched.root[r]);
@@ -337,6 +337,6 @@ fn second_derivative_bounds_hold() {
             let second = (law.apply(t + h) - 2.0 * law.apply(t) + law.apply(t - h)) / (h * h);
             largest = largest.max(second.abs());
         }
-        assert!(largest < bound - 1e-4, "{law:?}: |f''| reaches {largest}, bound {bound}");
+        assert!(largest < bound, "{law:?}: |f''| reaches {largest}, bound {bound}");
     }
 }

@@ -622,3 +622,42 @@ fn piece_space_projection_matches_width_space_and_preserves_the_native_sum() {
     let reference = &g - &other.dot(&scaled.dot(&spectrum.vectors.t()).dot(&other.t().dot(&g)));
     assert!((&direction - &reference).iter().all(|v| v.abs() < 1e-10));
 }
+
+/// A step under the box claim is judged on the claim's error, the worst over the box points
+/// ([`super::masked::box_excess_at`]), not on the uniform expectation that only steers it: the
+/// totals a step compares are the masks' KL plus that worst case, before and after.
+#[test]
+fn a_box_step_is_judged_on_the_claims_worst_case_error() {
+    use super::masked::{Claim, Running, box_excess_at, expected_box_excess_at, score_only};
+    let (program, family) = model();
+    let target = Target::every_row(program.execute(&family, false).expect("executes").values[program.output].clone());
+    let site = sites(&program).into_iter().find(|s| s.name == "W_in").expect("the W_in site");
+    let pieces = UNITS + 2;
+    let library = Library {
+        v: Array2::from_shape_fn((pieces, WIDTH), |(i, j)| noise(700 + 7 * i + j)),
+        u: Array2::from_shape_fn((pieces, UNITS), |(i, j)| noise(800 + 7 * i + j)),
+        mean: Array1::zeros(WIDTH),
+    };
+    let mut masked = Masked::build(&program, vec![site.clone()], vec![library]).expect("builds");
+    let masks = vec![Array2::from_shape_fn((family.rows, pieces), |(r, c)| if (r + c) % 3 == 0 { 0.0 } else { 1.0 })];
+    let claim_error = |m: &Masked, fishers: &[Array2<f64>]| -> f64 {
+        score_only(m, &m.family(&family, &masks), &target).expect("kl").sum() + box_excess_at(m, &family, &target, &masks, fishers).expect("box").sum()
+    };
+    let mut running = Running::default();
+    let mut judged = 0;
+    for seed in 0..6u64 {
+        let before = Masked::build(&program, vec![site.clone()], vec![masked.library(0).expect("library")]).expect("rebuilds");
+        let Some((total, trial)) = step_pieces(&mut masked, &family, &target, &masks, 4, seed, &mut running, Claim::Box).expect("steps") else { continue };
+        // The worst case is not the expectation here, so the test tells the two apart.
+        let expected = score_only(&before, &before.family(&family, &masks), &target).expect("kl").sum()
+            + expected_box_excess_at(&before, &family, &target, &masks, &running.fishers).expect("expected").sum();
+        let worst = claim_error(&before, &running.fishers);
+        assert!(worst > expected, "the box points add nothing over the expectation here: {worst} against {expected}");
+        assert!((total - worst).abs() <= 1e-12 * worst.abs(), "the step's total {total} is not the claim's error {worst}");
+        let after = claim_error(&masked, &running.fishers);
+        assert!((trial - after).abs() <= 1e-12 * after.abs(), "the step's trial {trial} is not the claim's error {after}");
+        assert!(after < worst, "{after} against {worst}");
+        judged += 1;
+    }
+    assert!(judged > 0, "no step was taken");
+}

@@ -703,7 +703,9 @@ fn main() -> Result<(), String> {
         // Selection's progress (module note): every eval sequence's finished sets, saved atomically
         // in `OUT.select/`, so a restart keeps them.
         let progress_dir = PathBuf::from(format!("{}.select", stem.display()));
-        let resumed = load(&progress_dir)?.filter(|r| r.driver["pass"] == json!(pass) && r.driver["trained"] == json!(trained));
+        // Only this run's progress at this point counts: a directory left by another run (the
+        // checkpoint removed to start over) is not this run's.
+        let resumed = load(&progress_dir)?.filter(|r| r.driver["run"] == run && r.driver["pass"] == json!(pass) && r.driver["trained"] == json!(trained));
         let mut finished: Vec<Option<gam_mpd::checkpoint::SparseSets>> = vec![None; evaluated];
         if let Some(r) = resumed {
             let complete: Vec<bool> = r.driver["complete"].as_array().map(|a| a.iter().map(|v| v == &json!(true)).collect()).unwrap_or_default();
@@ -717,7 +719,7 @@ fn main() -> Result<(), String> {
         let save_progress = |finished: &[Option<gam_mpd::checkpoint::SparseSets>]| -> Result<(), String> {
             let complete: Vec<bool> = finished.iter().map(Option::is_some).collect();
             let sets: Vec<Option<&gam_mpd::checkpoint::SparseSets>> = finished.iter().map(Option::as_ref).collect();
-            let driver = json!({"pass": pass, "trained": trained, "complete": complete});
+            let driver = json!({"run": run, "pass": pass, "trained": trained, "complete": complete});
             save(&progress_dir, &Saved { driver: &driver, libraries: &[], context: &Context::new(&[]), running: &Running::default(), sets })
         };
         for e in 0..evaluated {

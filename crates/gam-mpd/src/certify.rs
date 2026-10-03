@@ -1240,16 +1240,17 @@ impl SplitMix {
     }
 }
 
-/// The largest KL found per input inside the box claim at `masks`: every point visited by `restarts`
-/// sign-ascent runs of `steps` steps on the off gates (on gates stay at their mask). The runs start
-/// from the masks themselves, every off gate at 1, every off gate at ½, then uniform draws; the step
-/// shrinks linearly from ½ to `1/(2 steps)`. The ascent climbs the KL of input `focus` alone when
-/// given, the total otherwise. A lower bound on the claim's worst case.
+/// The largest KL found per input inside `gates`: every point visited by `restarts` sign-ascent runs
+/// of `steps` steps on the free gates (those whose interval is wider than a point). The runs start
+/// from every gate at its lower end (for the box claim, the masks themselves), at its upper end, at
+/// its middle, then at uniform draws; the step shrinks linearly from half of each gate's width to
+/// `1/(2 steps)` of it. The ascent climbs the KL of input `focus` alone when given, the total
+/// otherwise. A lower bound on the box's worst case.
 pub fn adversary(
     masked: &Masked,
     base: &FamilyInputs,
     target: &Target,
-    masks: &[Array2<f64>],
+    gates: &Gates,
     focus: Option<usize>,
     steps: usize,
     restarts: usize,
@@ -1258,25 +1259,21 @@ pub fn adversary(
     let mut rng = SplitMix(seed);
     let mut best = Array1::<f64>::from_elem(base.rows, f64::NEG_INFINITY);
     for restart in 0..restarts.max(1) {
-        let mut gates: Vec<Array2<f64>> = masks
+        let mut point: Vec<Array2<f64>> = gates
+            .lower
             .iter()
-            .map(|m| {
-                m.mapv(|x| {
-                    if x > 0.0 {
-                        x
-                    } else {
-                        match restart {
-                            0 => 0.0,
-                            1 => 1.0,
-                            2 => 0.5,
-                            _ => rng.next(),
-                        }
-                    }
+            .zip(&gates.upper)
+            .map(|(l, u)| {
+                Zip::from(l).and(u).map_collect(|&l, &u| match restart {
+                    0 => l,
+                    1 => u,
+                    2 => 0.5 * (l + u),
+                    _ => l + (u - l) * rng.next(),
                 })
             })
             .collect();
         for step in 0..=steps {
-            let family = masked.family(base, &gates);
+            let family = masked.family(base, &point);
             let (kl, trace, cotangent) = forward(masked, &family, target)?;
             Zip::from(&mut best).and(&kl).for_each(|b, &v| *b = b.max(v));
             if step == steps {
@@ -1292,10 +1289,10 @@ pub fn adversary(
             };
             let ascent = mask_gradients(masked, &family, &trace, cotangent)?;
             let rate = 0.5 - (0.5 - 0.5 / steps as f64) * step as f64 / steps.max(2).saturating_sub(1) as f64;
-            for ((g, m), a) in gates.iter_mut().zip(masks).zip(&ascent) {
-                Zip::from(g).and(m).and(a).for_each(|g, &m, &a| {
-                    if m <= 0.0 {
-                        *g = (*g + rate * a.signum()).clamp(0.0, 1.0);
+            for (((g, l), u), a) in point.iter_mut().zip(&gates.lower).zip(&gates.upper).zip(&ascent) {
+                Zip::from(g).and(l).and(u).and(a).for_each(|g, &l, &u, &a| {
+                    if u > l {
+                        *g = (*g + rate * (u - l) * a.signum()).clamp(l, u);
                     }
                 });
             }
