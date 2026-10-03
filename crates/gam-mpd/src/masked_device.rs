@@ -83,9 +83,20 @@ impl Accelerated {
 
     /// The masked forward on `family` (its masks in their slots, as `Masked::family` sets them).
     pub fn forward(&self, family: &FamilyInputs, target: &DeviceTarget) -> Result<State, String> {
+        self.score_and_gradient(family, target)
+    }
+
+    /// Forward and KL with the hidden cotangent needed to propose an optimization step.
+    pub fn score_and_gradient(&self, family: &FamilyInputs, target: &DeviceTarget) -> Result<State, String> {
         let trace = self.program.forward(family)?;
         let (kl, cotangent) = self.program.kl(&trace, &target.logits, target.scored.as_deref())?;
         Ok(State { kl, trace, cotangent })
+    }
+
+    /// Evaluate a candidate without constructing or pulling back the KL cotangent.
+    pub fn score_only(&self, family: &FamilyInputs, target: &DeviceTarget) -> Result<Array1<f64>, String> {
+        let trace = self.program.forward(family)?;
+        self.program.score_only(&trace, &target.logits, target.scored.as_deref())
     }
 
     fn cotangents(&self, trace: &DeviceTrace, seed: Tensor, keep: &[usize]) -> Result<BTreeMap<usize, Tensor>, String> {

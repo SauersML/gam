@@ -550,31 +550,43 @@ pub fn kl(target: &Target, logits: &Array2<f64>) -> (Array1<f64>, Array2<f64>) {
         .axis_iter_mut(Axis(0))
         .into_par_iter()
         .enumerate()
-        .map(|(r, mut row)| {
+        .map(|(r, row)| {
             if !target.scores(r) {
                 return 0.0;
             }
-            // From log-probabilities, so the value and its gradient q − p are one objective even
-            // where q underflows.
-            let (log_p, log_q) = (log_softmax(target.logits.row(r)), log_softmax(logits.row(r)));
-            let mut total = 0.0;
-            for c in 0..log_p.len() {
-                let p = log_p[c].exp();
-                if p > 0.0 {
-                    total += p * (log_p[c] - log_q[c]);
-                }
-                row[c] = log_q[c].exp() - p;
-            }
-            total
+            kl_row(target.logits.row(r), logits.row(r), Some(row))
         })
         .collect();
     (Array1::from(values), cotangent)
 }
 
-fn log_softmax(z: ndarray::ArrayView1<'_, f64>) -> Array1<f64> {
-    let m = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let log_total = m + z.iter().map(|v| (v - m).exp()).sum::<f64>().ln();
-    z.mapv(|v| v - log_total)
+/// KL values only: no vocabulary-sized cotangent or per-row temporary arrays.
+pub fn kl_score_only(target: &Target, logits: &Array2<f64>) -> Array1<f64> {
+    use rayon::prelude::*;
+    Array1::from((0..logits.nrows()).into_par_iter().map(|r| {
+        if target.scores(r) { kl_row(target.logits.row(r), logits.row(r), None) } else { 0.0 }
+    }).collect::<Vec<_>>())
+}
+
+fn kl_row(teacher: ndarray::ArrayView1<'_, f64>, logits: ndarray::ArrayView1<'_, f64>, mut gradient: Option<ndarray::ArrayViewMut1<'_, f64>>) -> f64 {
+    let stats = |z: ndarray::ArrayView1<'_, f64>| {
+        let m = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        (m, z.iter().map(|v| (v - m).exp()).sum::<f64>())
+    };
+    let (mt, st) = stats(teacher);
+    let (mz, sz) = stats(logits);
+    let (lt, lz) = (st.ln(), sz.ln());
+    let mut total = 0.0;
+    for c in 0..logits.len() {
+        let p = (teacher[c] - mt).exp() / st;
+        if p > 0.0 {
+            total += p * (((teacher[c] - mt) - lt) - ((logits[c] - mz) - lz));
+        }
+        if let Some(g) = &mut gradient {
+            g[c] = (logits[c] - mz).exp() / sz - p;
+        }
+    }
+    total
 }
 
 fn softmax(z: ndarray::ArrayView1<'_, f64>) -> Array1<f64> {
@@ -622,6 +634,18 @@ pub fn forward(masked: &Masked, family: &FamilyInputs, target: &Target) -> Resul
     };
     let cotangent = to_output(masked, family, &trace, target, cotangent)?;
     Ok((values, trace, cotangent))
+}
+
+/// Candidate forward and loss without a cotangent or downstream-head pullback.
+fn scored_forward(masked: &Masked, family: &FamilyInputs, target: &Target) -> Result<(Array1<f64>, Trace), String> {
+    let trace = masked.program.execute(family, false).map_err(|e| e.to_string())?;
+    let values = kl_score_only(target, &logits(masked, family, &trace, target)?);
+    Ok((values, trace))
+}
+
+/// Evaluate an actual candidate for acceptance without calculating gradients.
+pub fn score_only(masked: &Masked, family: &FamilyInputs, target: &Target) -> Result<Array1<f64>, String> {
+    scored_forward(masked, family, target).map(|(values, _)| values)
 }
 
 /// Per site: `∂KL/∂m` (rows × B) and the gradients in `V` (C × d_in) and `U` (C × d_out), from one
@@ -1458,10 +1482,12 @@ pub fn step_pieces(
             let values = &*original.matrix_cow() - &(t * eta);
             masked.program.operators[*op] = dense(original.name.clone(), original.rows.clone(), original.cols.clone(), values)?;
         }
-        let (kl_trial, trial_trace, trial_cotangent) = forward(masked, &family, target)?;
         let trial = match claim {
-            Claim::Corner => kl_trial.sum(),
-            Claim::Box => kl_trial.sum() + box_excess(masked, &family, &trial_trace, masks, trial_cotangent, &running.fishers, false)?.0.sum(),
+            Claim::Corner => score_only(masked, &family, target)?.sum(),
+            Claim::Box => {
+                let (kl_trial, trial_trace, trial_cotangent) = forward(masked, &family, target)?;
+                kl_trial.sum() + box_excess(masked, &family, &trial_trace, masks, trial_cotangent, &running.fishers, false)?.0.sum()
+            }
         };
         if trial < total {
             return Ok(Some((total, trial)));

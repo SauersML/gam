@@ -547,20 +547,38 @@ impl DeviceProgram {
     /// Per row, `KL(softmax(target) ‖ softmax(logits))` (zero on rows `scored` leaves out), and
     /// its cotangent pulled back to the hidden node.
     pub fn kl(&self, trace: &DeviceTrace, target: &Tensor, scored: Option<&[bool]>) -> Result<(Array1<f64>, Tensor), String> {
+        let (values, gradient) = self.kl_impl(trace, target, scored, true)?;
+        Ok((values, gradient.ok_or("device: missing KL gradient")?))
+    }
+
+    /// Per-row KL for candidate acceptance, without a vocabulary cotangent or head pullback.
+    pub fn score_only(&self, trace: &DeviceTrace, target: &Tensor, scored: Option<&[bool]>) -> Result<Array1<f64>, String> {
+        self.kl_impl(trace, target, scored, false).map(|(values, _)| values)
+    }
+
+    fn kl_impl(&self, trace: &DeviceTrace, target: &Tensor, scored: Option<&[bool]>, gradient: bool) -> Result<(Array1<f64>, Option<Tensor>), String> {
         let d = &self.device;
         let hidden = trace.value(self.head.hidden)?;
         if target.dim() != (trace.rows, self.head.classes) {
             return Err(format!("device: a {:?} target for {} rows of {} classes", target.dim(), trace.rows, self.head.classes));
         }
+        if scored.is_some_and(|s| s.len() != trace.rows) {
+            return Err("device: scored flags do not match trace rows".to_string());
+        }
         let mut kl = Vec::with_capacity(trace.rows);
-        let mut g = d.zeros(trace.rows, hidden.cols()).map_err(error)?;
+        let mut g = gradient.then(|| d.zeros(trace.rows, hidden.cols()).map_err(error)).transpose()?;
         let tile = self.tile_rows();
         for start in (0..trace.rows).step_by(tile) {
             let n = tile.min(trace.rows - start);
             let mut logits = self.logits_tile(hidden, start, n, Arithmetic::F64)?;
             let t = d.rows_of(target, start, n).map_err(error)?;
-            kl.extend(d.kl_rows(&t, &mut logits, self.flags(scored, start, n)?.as_ref()).map_err(error)?);
-            self.pull_tile(&mut g, start, &logits, Arithmetic::F64)?;
+            let flags = self.flags(scored, start, n)?;
+            if let Some(g) = &mut g {
+                kl.extend(d.kl_rows(&t, &mut logits, flags.as_ref()).map_err(error)?);
+                self.pull_tile(g, start, &logits, Arithmetic::F64)?;
+            } else {
+                kl.extend(d.kl_score_rows(&t, &mut logits, flags.as_ref()).map_err(error)?);
+            }
         }
         Ok((Array1::from(kl), g))
     }
