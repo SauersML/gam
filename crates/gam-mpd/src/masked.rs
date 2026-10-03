@@ -1345,7 +1345,6 @@ pub fn select(
 /// [`select`] under the box claim (module note, "Claims"): every input's error is its masks' KL
 /// plus [`box_excess`] in the written Fishers `fishers`, so the sets it keeps explain the input
 /// whatever the off subcomponents are set to in `[0, 1]`. Returns the masks and their own KL.
-#[allow(clippy::too_many_arguments)]
 pub fn select_boxed(
     masked: &Masked,
     base: &FamilyInputs,
@@ -1373,7 +1372,6 @@ pub struct Round<'a> {
 
 /// [`select`], showing `observe` every round's decisions before they are taken; with `boxed`
 /// (the written Fishers), under the box claim ([`select_boxed`]).
-#[allow(clippy::too_many_arguments)]
 pub fn select_observed(
     masked: &Masked,
     base: &FamilyInputs,
