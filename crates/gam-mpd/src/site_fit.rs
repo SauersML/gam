@@ -19,13 +19,13 @@
 //! B_t = ‖D_t‖_{F_t} + Σ_{c off} ‖z_tc‖_{F_t}
 //! ```
 //!
-//! of the real output, in the input's own output Fisher `F_t`, taken as the site's mean Fisher `F`
-//! scaled by the input's sensitivity `s_t = tr F_t / tr F` (both measured from sampled-label
-//! gradients of the model's own output). Its KL is at most `½ B_t²` to second order, so input `t` is
-//! charged
+//! of the real output, in the input's own output Fisher `F_t = mean_k g_tk g_tkᵀ`, its sampled-label
+//! gradients at the written value (labels drawn from the model's own output; without them, the
+//! site's mean Fisher `F` scaled by the input's sensitivity `s_t = tr F_t / tr F`). Its KL is at
+//! most `½ B_t²` to second order, so input `t` is charged
 //!
 //! ```text
-//! code_t = Σ_{c on} bits(c) + n s_t / (2 ln 2) · (‖D_t‖_F + Σ_{c off} |a_tc| ‖u_c‖_F)².
+//! code_t = Σ_{c on} bits(c) + n / (2 ln 2) · (‖D_t‖_{F_t} + Σ_{c off} |a_tc| ‖u_c‖_{F_t})².
 //! ```
 //!
 //! It is a certified upper bound on the claim at the site, needs no adversary, and counts every
@@ -39,18 +39,20 @@
 //! Alternating steps that each lower that one total:
 //!
 //! * **Sets.** Each input's on-set from its subcomponents ranked by real size per description bit,
-//!   `|a_tc| ‖u_c‖_F / bits(c)`: the best prefix of that ranking when it codes the input in fewer
+//!   `|a_tc| ‖u_c‖_{F_t} / bits(c)`: the best prefix of that ranking when it codes the input in fewer
 //!   bits than its current sets, then single flips swept until none lowers the input's code.
 //! * **Writes.** With the sets and reads fixed the error is convex in `U`. With `L_t` the current
-//!   `B_t`, `(Σ_c α_c)² ≤ Σ_c α_c² L/α_c` majorises it by `Σ_c ω_c ‖u_c‖²_F`, `ω_c = Σ_{t: c off} n s_t
-//!   |a_tc| L_t / (2 ln 2 ‖u_c‖_F)`, tight at the current writes, so its minimiser lowers the code.
+//!   `B_t`, `(Σ_c α_c)² ≤ Σ_c α_c² L/α_c` majorises it, tight at the current writes. Each input's
+//!   metric is taken at its ratio to `F` for the current write, `‖u'‖²_{F_t} ≈ (‖u_c‖_{F_t} /
+//!   ‖u_c‖_F)² ‖u'‖²_F`, so the majoriser is `Σ_c ω_c ‖u_c‖²_F`, `ω_c = Σ_{t: c off} n L_t |a_tc|
+//!   ‖u_c‖_{F_t} / (2 ln 2 ‖u_c‖²_F)`, and its minimiser is a proposal the code decides.
 //!   Every subcomponent on is the map exactly, on every read direction (in the metric `E√Λ` of the
 //!   reads' second moment, floored at `10⁻⁶` of its mean so directions no input reached still
 //!   count), `Uᵀ V E√Λ = W E√Λ`: with `V E√Λ = P S Gᵀ` (full `P`) every such `U` is `U₀ + N Z`,
 //!   `U₀ = P₁ S⁻¹ Gᵀ (W E√Λ)ᵀ`, `N` the columns of `P` past its rank, and `(NᵀΩN) Z = −NᵀΩU₀`.
 //! * **Reads.** With `U` and the sets fixed the error is convex in `V`: one step along its
-//!   preconditioned negative subgradient (left by each subcomponent's own curvature `Σ_t n s_t
-//!   ‖u_c‖²_F`, right by the inputs' sensitivity-weighted second moment) restricted to the moves
+//!   preconditioned negative subgradient (left by each subcomponent's own curvature `Σ_t n
+//!   ‖u_c‖²_{F_t}`, right by the inputs' sensitivity-weighted second moment) restricted to the moves
 //!   that keep the map, `Uᵀ D = 0`, its length the one of least code on a geometric ladder around
 //!   the step's quadratic estimate; every input's `B_t` along the line is measured in one pass.
 //! * **Growth.** A subcomponent that runs nowhere or writes nothing takes half of the one that
@@ -87,6 +89,9 @@ pub struct Samples {
     pub fisher: Array2<f64>,
     /// `E[x xᵀ]` of the uncentred reads (d_in × d_in).
     pub second_moment: Array2<f64>,
+    /// Per draw, every input's sampled-label gradient at the written value (inputs × d_out,
+    /// single precision): input `t`'s own Fisher is `F_t = mean_k g_tk g_tkᵀ`.
+    pub gradients: Vec<Array2<f32>>,
 }
 
 /// Every site's [`Samples`] on the native program over `batches`, `draws` sampled-label reverse
@@ -97,6 +102,8 @@ pub fn samples(program: &OperatorProgram, sites: &[Site], batches: impl IntoIter
     }
     let mut reads: Vec<Vec<Array2<f32>>> = vec![Vec::new(); sites.len()];
     let mut norms: Vec<Vec<f64>> = vec![Vec::new(); sites.len()];
+    // Per site and draw, every batch's gradients.
+    let mut drawn_gradients: Vec<Vec<Vec<Array2<f32>>>> = vec![vec![Vec::new(); draws]; sites.len()];
     let mut fishers: Vec<Option<Array2<f64>>> = vec![None; sites.len()];
     let mut moments: Vec<Option<Array2<f64>>> = vec![None; sites.len()];
     let no_rows = Target { logits: Array2::zeros((0, 0)), scored: None };
@@ -114,7 +121,7 @@ pub fn samples(program: &OperatorProgram, sites: &[Site], batches: impl IntoIter
             reads[k].push(x.mapv(|v| v as f32));
             norms[k].extend(std::iter::repeat_n(0.0, inputs.rows));
         }
-        for _ in 0..draws {
+        for draw in 0..draws {
             drawn += 1;
             let cotangent = sampled_label_cotangent(&trace.values[program.output], &no_rows, seed.wrapping_add(drawn.wrapping_mul(0x9E37_79B9)));
             let back = proposing(|| vjp(program, &inputs, &trace, cotangent)).map_err(|e| e.to_string())?;
@@ -126,6 +133,7 @@ pub fn samples(program: &OperatorProgram, sites: &[Site], batches: impl IntoIter
                 for (r, row) in g.outer_iter().enumerate() {
                     norms[k][first + r] += row.dot(&row) / draws as f64;
                 }
+                drawn_gradients[k][draw].push(g.mapv(|v| v as f32));
                 let outer = proposing(|| super::device::product_atb(&g, &g)).map_err(|e| e.to_string())?;
                 fishers[k] = Some(match fishers[k].take() {
                     Some(f) => f + outer,
@@ -142,13 +150,18 @@ pub fn samples(program: &OperatorProgram, sites: &[Site], batches: impl IntoIter
         .into_iter()
         .zip(norms)
         .zip(fishers.into_iter().zip(moments))
-        .map(|((parts, norms), (fisher, moment))| {
-            let views: Vec<_> = parts.iter().map(|p| p.view()).collect();
-            let reads = ndarray::concatenate(Axis(0), &views).map_err(|e| e.to_string())?;
+        .zip(drawn_gradients)
+        .map(|(((parts, norms), (fisher, moment)), per_draw)| {
+            let stack = |parts: &[Array2<f32>]| -> Result<Array2<f32>, String> {
+                let views: Vec<_> = parts.iter().map(|p| p.view()).collect();
+                ndarray::concatenate(Axis(0), &views).map_err(|e| e.to_string())
+            };
+            let reads = stack(&parts)?;
+            let gradients = per_draw.iter().map(|parts| stack(parts)).collect::<Result<Vec<_>, _>>()?;
             let fisher = fisher.ok_or("no Fisher")? / (rows * draws) as f64;
             let mean_norm = fisher.diag().sum();
             let sensitivity = Array1::from_iter(norms.iter().map(|n| if mean_norm > 0.0 { n / mean_norm } else { 1.0 }));
-            Ok(Samples { reads, sensitivity, fisher, second_moment: moment.ok_or("no moment")? / rows as f64 })
+            Ok(Samples { reads, sensitivity, fisher, second_moment: moment.ok_or("no moment")? / rows as f64, gradients })
         })
         .collect()
 }
@@ -239,6 +252,9 @@ struct Fitting<'a> {
     y: Array2<f32>,
     /// `yᵀ F y` per input.
     yfy: Vec<f64>,
+    /// Per draw, every input's gradient (`Samples::gradients`) and its `g_tk · y_t`.
+    gradients: &'a [Array2<f32>],
+    gy: Vec<Vec<f64>>,
     s: &'a Array1<f64>,
     fisher: &'a Array2<f64>,
     /// `n / (2 ln 2)`.
@@ -248,10 +264,19 @@ struct Fitting<'a> {
     masks: Vec<u8>,
 }
 
-/// What one input's code needs of the library: its reads `a` and, per input, `‖D_t‖_F`.
+/// What the inputs' code needs of the library: their reads `a`, every write's size in each input's
+/// own Fisher `q_tc = ‖u_c‖_{F_t}`, and what all on leaves, `‖D_t‖_{F_t}`.
 struct Chunk {
     a: Array2<f32>,
+    q: Array2<f32>,
     left: Vec<f64>,
+}
+
+impl Chunk {
+    /// Input `r`'s real contribution sizes `|a_tc| q_tc`.
+    fn sizes(&self, r: usize) -> Vec<f64> {
+        self.a.row(r).iter().zip(self.q.row(r).iter()).map(|(a, q)| f64::from(*a).abs() * f64::from(*q)).collect()
+    }
 }
 
 impl<'a> Fitting<'a> {
@@ -290,7 +315,17 @@ impl<'a> Fitting<'a> {
         let all_roots = moment.values.mapv(|l| l.max(floor).sqrt());
         let span = &moment.vectors * &all_roots;
         let unwhiten = &moment.vectors / &all_roots;
+        let gy = samples
+            .gradients
+            .iter()
+            .map(|g| (0..rows).map(|t| g.row(t).iter().zip(y.row(t).iter()).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum()).collect())
+            .collect();
+        if samples.gradients.iter().any(|g| g.dim() != (rows, d_out)) {
+            return Err(format!("site {site}: gradients do not fit its {rows} inputs of {d_out} writes"));
+        }
         Ok(Self {
+            gradients: &samples.gradients,
+            gy,
             x,
             w: w.clone(),
             span,
@@ -310,52 +345,73 @@ impl<'a> Fitting<'a> {
         self.x.nrows()
     }
 
-    /// The reads and `‖D_t‖_F` of the inputs `start..end`.
-    fn chunk(&self, start: usize, end: usize, v32: &Array2<f32>, uf32: &Array2<f32>, k32: &Array2<f32>) -> Chunk {
+    /// What the code of the inputs `start..end` needs (`Chunk`): in each input's own Fisher
+    /// `F_t = mean_k g_tk g_tkᵀ` when the samples carry gradients, else in `s_t F`.
+    fn chunk(&self, start: usize, end: usize, v32: &Array2<f32>, u32: &Array2<f32>, k32: &Array2<f32>, uf32: &Array2<f32>, sizes: &[f64]) -> Chunk {
+        let rows = end - start;
         let a = product(self.x.slice(s![start..end, ..]), false, v32.view(), true);
-        let g0 = product(self.y.slice(s![start..end, ..]), false, uf32.view(), true);
-        let ak = product(a.view(), false, k32.view(), false);
-        let left = (0..end - start)
-            .map(|r| {
-                let (mut ag, mut aka) = (0.0f64, 0.0f64);
+        if self.gradients.is_empty() {
+            let g0 = product(self.y.slice(s![start..end, ..]), false, uf32.view(), true);
+            let ak = product(a.view(), false, k32.view(), false);
+            let left = (0..rows)
+                .map(|r| {
+                    let (mut ag, mut aka) = (0.0f64, 0.0f64);
+                    for c in 0..self.pieces {
+                        let ac = f64::from(a[[r, c]]);
+                        ag += ac * f64::from(g0[[r, c]]);
+                        aka += ac * f64::from(ak[[r, c]]);
+                    }
+                    (self.s[start + r] * (self.yfy[start + r] - 2.0 * ag + aka)).max(0.0).sqrt()
+                })
+                .collect();
+            let q = Array2::from_shape_fn((rows, self.pieces), |(r, c)| (self.s[start + r].sqrt() * sizes[c]) as f32);
+            return Chunk { a, q, left };
+        }
+        let draws = self.gradients.len() as f64;
+        let mut q2 = Array2::<f64>::zeros((rows, self.pieces));
+        let mut left = vec![0.0f64; rows];
+        for (g, gy) in self.gradients.iter().zip(&self.gy) {
+            // `g_tk · u_c` for every input and write.
+            let p = product(g.slice(s![start..end, ..]), false, u32.view(), true);
+            for r in 0..rows {
+                let mut gd = gy[start + r];
                 for c in 0..self.pieces {
-                    let ac = f64::from(a[[r, c]]);
-                    ag += ac * f64::from(g0[[r, c]]);
-                    aka += ac * f64::from(ak[[r, c]]);
+                    let pc = f64::from(p[[r, c]]);
+                    q2[[r, c]] += pc * pc / draws;
+                    gd -= f64::from(a[[r, c]]) * pc;
                 }
-                (self.yfy[start + r] - 2.0 * ag + aka).max(0.0).sqrt()
-            })
-            .collect();
-        Chunk { a, left }
+                left[r] += gd * gd / draws;
+            }
+        }
+        Chunk { a, q: q2.mapv(|x| x.sqrt() as f32), left: left.into_iter().map(f64::sqrt).collect() }
     }
 
-    /// The products every pass over the inputs needs: `V`, `U F` and `K = U F Uᵀ` in single
+    /// The products every pass over the inputs needs: `V`, `U`, `K = U F Uᵀ` and `U F` in single
     /// precision, and every `‖u_c‖_F`.
-    fn operands(&self, v: &Array2<f64>, u: &Array2<f64>) -> (Array2<f32>, Array2<f32>, Array2<f32>, Vec<f64>) {
+    fn operands(&self, v: &Array2<f64>, u: &Array2<f64>) -> (Array2<f32>, Array2<f32>, Array2<f32>, Array2<f32>, Vec<f64>) {
         let uf = u.dot(self.fisher);
         let k = uf.dot(&u.t());
         let sizes = (0..u.nrows()).map(|c| k[[c, c]].max(0.0).sqrt()).collect();
-        (single(v), single(&uf), single(&k), sizes)
+        (single(v), single(u), single(&k), single(&uf), sizes)
     }
 
     /// The code of `(v, u)` (module note); with `flip`, every input's sets selected first (module
     /// note, "Sets"). Returns the total description and error bits.
     fn code(&mut self, v: &Array2<f64>, u: &Array2<f64>, bits: &Array1<f64>, flip: bool) -> (f64, f64) {
         let c_total = self.pieces;
-        let (v32, uf32, k32, sizes) = self.operands(v, u);
+        let (v32, u32, k32, uf32, sizes) = self.operands(v, u);
         let mut description = 0.0;
         let mut error = 0.0;
         for start in (0..self.rows()).step_by(CHUNK) {
             let end = (start + CHUNK).min(self.rows());
-            let chunk = self.chunk(start, end, &v32, &uf32, &k32);
+            let chunk = self.chunk(start, end, &v32, &u32, &k32, &uf32, &sizes);
             let masks = &mut self.masks[start * c_total..end * c_total];
-            let (s, scale) = (&self.s, self.scale);
+            let weight = self.scale;
             let results: Vec<(f64, f64)> = masks
                 .par_chunks_mut(c_total)
                 .enumerate()
                 .map(|(r, m)| {
-                    let weight = scale * s[start + r];
-                    let size: Vec<f64> = (0..c_total).map(|c| f64::from(chunk.a[[r, c]]).abs() * sizes[c]).collect();
+                    let size = chunk.sizes(r);
                     if flip {
                         // The best prefix of the ranking by size per bit, then single flips.
                         let mut order: Vec<usize> = (0..c_total).collect();
@@ -433,21 +489,22 @@ impl<'a> Fitting<'a> {
     /// The writes' majorise-minimise step at `(v, u)` (module note, "Writes").
     fn writes(&self, v: &Array2<f64>, u: &Array2<f64>) -> Result<Array2<f64>, String> {
         let c_total = self.pieces;
-        let (v32, uf32, k32, sizes) = self.operands(v, u);
+        let (v32, u32, k32, uf32, sizes) = self.operands(v, u);
         let mut omega = Array1::<f64>::zeros(c_total);
         // A subcomponent writing nothing is held near nothing (its majoriser's weight is bounded at
         // the double-precision resolution of the largest write).
         let floor = sizes.iter().fold(0.0_f64, |m, s| m.max(*s)) * f64::EPSILON.sqrt();
         for start in (0..self.rows()).step_by(CHUNK) {
             let end = (start + CHUNK).min(self.rows());
-            let chunk = self.chunk(start, end, &v32, &uf32, &k32);
+            let chunk = self.chunk(start, end, &v32, &u32, &k32, &uf32, &sizes);
             for r in 0..end - start {
                 let t = start + r;
                 let m = &self.masks[t * c_total..(t + 1) * c_total];
-                let bound = chunk.left[r] + (0..c_total).filter(|c| m[*c] == 0).map(|c| f64::from(chunk.a[[r, c]]).abs() * sizes[c]).sum::<f64>();
-                let weight = self.scale * self.s[t] * bound;
+                let size = chunk.sizes(r);
+                let bound = chunk.left[r] + (0..c_total).filter(|c| m[*c] == 0).map(|c| size[c]).sum::<f64>();
                 for c in (0..c_total).filter(|c| m[*c] == 0) {
-                    omega[c] += weight * f64::from(chunk.a[[r, c]]).abs() / sizes[c].max(floor);
+                    // Each input's own metric taken at its ratio to `F` for the current write.
+                    omega[c] += self.scale * bound * size[c] / sizes[c].max(floor).powi(2);
                 }
             }
         }
@@ -458,22 +515,23 @@ impl<'a> Fitting<'a> {
     /// length, or `None` when no move keeping the map lowers the code.
     fn read_step(&self, v: &Array2<f64>, u: &Array2<f64>, right: &Array2<f64>) -> Result<Option<(Array2<f64>, f64)>, String> {
         let c_total = self.pieces;
-        let (v32, uf32, k32, sizes) = self.operands(v, u);
+        let (v32, u32, k32, uf32, sizes) = self.operands(v, u);
         let mut gradient = Array2::<f32>::zeros(v.dim());
         let mut left = vec![0.0f64; c_total];
         for start in (0..self.rows()).step_by(CHUNK) {
             let end = (start + CHUNK).min(self.rows());
-            let chunk = self.chunk(start, end, &v32, &uf32, &k32);
+            let chunk = self.chunk(start, end, &v32, &u32, &k32, &uf32, &sizes);
             // `∂ code / ∂ a_tc = 2 n s_t B_t ‖u_c‖_F sign(a_tc)` for every off subcomponent.
             let mut ga = Array2::<f32>::zeros(chunk.a.dim());
             for r in 0..end - start {
                 let t = start + r;
                 let m = &self.masks[t * c_total..(t + 1) * c_total];
-                let bound = chunk.left[r] + (0..c_total).filter(|c| m[*c] == 0).map(|c| f64::from(chunk.a[[r, c]]).abs() * sizes[c]).sum::<f64>();
-                let weight = self.scale * self.s[t];
+                let size = chunk.sizes(r);
+                let bound = chunk.left[r] + (0..c_total).filter(|c| m[*c] == 0).map(|c| size[c]).sum::<f64>();
                 for c in (0..c_total).filter(|c| m[*c] == 0) {
-                    ga[[r, c]] = (2.0 * weight * bound * sizes[c] * f64::from(chunk.a[[r, c]]).signum()) as f32;
-                    left[c] += 2.0 * weight * sizes[c] * sizes[c];
+                    let q = f64::from(chunk.q[[r, c]]);
+                    ga[[r, c]] = (2.0 * self.scale * bound * q * f64::from(chunk.a[[r, c]]).signum()) as f32;
+                    left[c] += 2.0 * self.scale * q * q;
                 }
             }
             gemm(&mut gradient, true, ga.view(), true, self.x.slice(s![start..end, ..]), false, 1.0);
@@ -493,13 +551,16 @@ impl<'a> Fitting<'a> {
         let mut curvature = 0.0;
         for start in (0..self.rows()).step_by(CHUNK) {
             let end = (start + CHUNK).min(self.rows());
-            let a = product(self.x.slice(s![start..end, ..]), false, v32.view(), true);
+            let chunk = self.chunk(start, end, &v32, &u32, &k32, &uf32, &sizes);
             let da = product(self.x.slice(s![start..end, ..]), false, d32.view(), true);
             for r in 0..end - start {
                 let t = start + r;
                 let m = &self.masks[t * c_total..(t + 1) * c_total];
-                let rate: f64 = (0..c_total).filter(|c| m[*c] == 0).map(|c| sizes[c] * f64::from(a[[r, c]]).signum() * f64::from(da[[r, c]])).sum();
-                curvature += 2.0 * self.scale * self.s[t] * rate * rate;
+                let rate: f64 = (0..c_total)
+                    .filter(|c| m[*c] == 0)
+                    .map(|c| f64::from(chunk.q[[r, c]]) * f64::from(chunk.a[[r, c]]).signum() * f64::from(da[[r, c]]))
+                    .sum();
+                curvature += 2.0 * self.scale * rate * rate;
             }
         }
         Ok((slope > 0.0 && curvature > 0.0).then(|| (direction, slope / curvature)))
@@ -508,26 +569,28 @@ impl<'a> Fitting<'a> {
     /// The error bits of `v + η d` for every `η` of `lengths`, the sets held, in one pass.
     fn read_profile(&self, v: &Array2<f64>, u: &Array2<f64>, d: &Array2<f64>, lengths: &[f64]) -> Vec<f64> {
         let c_total = self.pieces;
-        let (v32, uf32, k32, sizes) = self.operands(v, u);
+        let (v32, u32, k32, uf32, sizes) = self.operands(v, u);
         let d32 = single(d);
         let mut totals = vec![0.0; lengths.len()];
         for start in (0..self.rows()).step_by(CHUNK) {
             let end = (start + CHUNK).min(self.rows());
             // `Uᵀ d = 0`, so what all on leaves does not move along the line.
-            let chunk = self.chunk(start, end, &v32, &uf32, &k32);
+            let chunk = self.chunk(start, end, &v32, &u32, &k32, &uf32, &sizes);
             let da = product(self.x.slice(s![start..end, ..]), false, d32.view(), true);
             let rows: Vec<Vec<f64>> = (0..end - start)
                 .into_par_iter()
                 .map(|r| {
                     let t = start + r;
                     let m = &self.masks[t * c_total..(t + 1) * c_total];
-                    let weight = self.scale * self.s[t];
                     lengths
                         .iter()
                         .map(|&eta| {
                             let bound = chunk.left[r]
-                                + (0..c_total).filter(|c| m[*c] == 0).map(|c| (f64::from(chunk.a[[r, c]]) + eta * f64::from(da[[r, c]])).abs() * sizes[c]).sum::<f64>();
-                            weight * bound * bound
+                                + (0..c_total)
+                                    .filter(|c| m[*c] == 0)
+                                    .map(|c| (f64::from(chunk.a[[r, c]]) + eta * f64::from(da[[r, c]])).abs() * f64::from(chunk.q[[r, c]]))
+                                    .sum::<f64>();
+                            self.scale * bound * bound
                         })
                         .collect()
                 })
@@ -545,17 +608,18 @@ impl<'a> Fitting<'a> {
     /// ‖u_c‖_F / (2 ln 2)` (its share of each input's bound times the bound).
     fn carried(&self, v: &Array2<f64>, u: &Array2<f64>) -> Vec<f64> {
         let c_total = self.pieces;
-        let (v32, uf32, k32, sizes) = self.operands(v, u);
+        let (v32, u32, k32, uf32, sizes) = self.operands(v, u);
         let mut carried = vec![0.0; c_total];
         for start in (0..self.rows()).step_by(CHUNK) {
             let end = (start + CHUNK).min(self.rows());
-            let chunk = self.chunk(start, end, &v32, &uf32, &k32);
+            let chunk = self.chunk(start, end, &v32, &u32, &k32, &uf32, &sizes);
             for r in 0..end - start {
                 let t = start + r;
                 let m = &self.masks[t * c_total..(t + 1) * c_total];
-                let bound = chunk.left[r] + (0..c_total).filter(|c| m[*c] == 0).map(|c| f64::from(chunk.a[[r, c]]).abs() * sizes[c]).sum::<f64>();
+                let size = chunk.sizes(r);
+                let bound = chunk.left[r] + (0..c_total).filter(|c| m[*c] == 0).map(|c| size[c]).sum::<f64>();
                 for c in (0..c_total).filter(|c| m[*c] == 0) {
-                    carried[c] += self.scale * self.s[t] * bound * f64::from(chunk.a[[r, c]]).abs() * sizes[c];
+                    carried[c] += self.scale * bound * size[c];
                 }
             }
         }
