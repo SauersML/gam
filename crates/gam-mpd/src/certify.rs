@@ -479,33 +479,29 @@ fn product(l: &Row, r: &Row) -> Row {
 /// An operator read as the linear map `x ↦ M x` (written × read), with what its relaxation reads of it.
 struct Map {
     operator: Arc<Operator>,
-    /// The matrix of a body that stores none (the identity, a diagonal).
-    formed: Option<Array2<f64>>,
+    /// The matrix of a body that stores none (the identity, a diagonal); empty for a dense body,
+    /// which is read in place.
+    formed: Array2<f64>,
     /// Whether `M` is the operator's transpose (a transposed read).
     transposed: bool,
     /// Per read coordinate, `Σ_i |m_ij|`, rounded up.
     column_l1: Array1<f64>,
-    /// A proven bound on `‖M‖₂`, computed on first use.
-    norm: std::sync::OnceLock<f64>,
+    /// A proven bound on `‖M‖₂`.
+    norm: f64,
 }
 
 impl Map {
     fn spectral(&self) -> f64 {
-        *self.norm.get_or_init(|| {
-            super::operator_program::matrix_spectral_bound(self.m()).unwrap_or_else(|_| {
-                let m = self.m();
-                up(m.iter().map(|v| v * v).sum::<f64>() * (1.0 + gamma(m.len() + 1))).sqrt().next_up()
-            })
-        })
+        self.norm
     }
 
     fn new(operator: Arc<Operator>, transposed: bool) -> Result<Self, String> {
         let formed = match &operator.body {
-            OperatorBody::Dense { .. } => None,
+            OperatorBody::Dense { .. } => Array2::zeros((0, 0)),
             OperatorBody::LowRank { .. } => return Err(format!("operator {}: a low-rank body is not certified", operator.name)),
-            _ => Some(operator.matrix()),
+            _ => operator.matrix(),
         };
-        let mut map = Self { operator, formed, transposed, column_l1: Array1::zeros(0), norm: std::sync::OnceLock::new() };
+        let mut map = Self { operator, formed, transposed, column_l1: Array1::zeros(0), norm: 0.0 };
         let m = map.m();
         let mut column_l1 = Array1::<f64>::zeros(m.ncols());
         for row in m.outer_iter() {
@@ -514,14 +510,14 @@ impl Map {
         let grow = 1.0 + gamma(m.nrows() + 1);
         column_l1.mapv_inplace(|v| up(v * grow));
         map.column_l1 = column_l1;
+        map.norm = super::operator_program::matrix_spectral_bound(map.m()).map_err(|e| e.to_string())?;
         Ok(map)
     }
 
     fn m(&self) -> ArrayView2<'_, f64> {
-        let base = match (&self.formed, &self.operator.body) {
-            (Some(formed), _) => formed.view(),
-            (None, OperatorBody::Dense { values, .. }) => values.view(),
-            (None, _) => unreachable!("only a dense body is read in place"),
+        let base = match &self.operator.body {
+            OperatorBody::Dense { values, .. } => values.view(),
+            _ => self.formed.view(),
         };
         if self.transposed { base.reversed_axes() } else { base }
     }
@@ -861,9 +857,6 @@ fn curved_within(x: &Row, curves: &[Curve], lo: &Array1<f64>, hi: &Array1<f64>) 
         let line = if lo[d].is_nan() || hi[d].is_nan() { None } else { linearize(curve, lo[d], hi[d].max(lo[d])) };
         // A failed relaxation poisons the center, so no later maximum can hide it.
         let Some((lambda, mu, delta)) = line else {
-            if std::env::var_os("MPD_CERTIFY_TRACE").is_some() {
-                eprintln!("certify: {curve:?} fails on [{}, {}] (ball {}, radius {}, center {})", lo[d], hi[d], x.ball, x.radius[d], x.center[d]);
-            }
             out.center[d] = f64::NAN;
             out.radius[d] = f64::INFINITY;
             continue;
@@ -1048,30 +1041,6 @@ fn visible(inputs: &FamilyInputs, causal: bool) -> Result<Vec<Vec<usize>>, Strin
         .collect())
 }
 
-/// A node's kind, for the relaxation's log.
-fn kind(node: &Node) -> &'static str {
-    match node {
-        Node::Feature { .. } => "feature",
-        Node::Raw { .. } => "raw",
-        Node::Constant { .. } => "constant",
-        Node::Affine { .. } => "affine",
-        Node::Bilinear { .. } => "bilinear",
-        Node::Softmax { .. } => "softmax",
-        Node::Mix { .. } => "mix",
-        Node::Pointwise { .. } => "pointwise",
-        Node::Hadamard { .. } => "hadamard",
-        Node::Readout { .. } => "readout",
-        Node::Outer { .. } => "outer",
-        Node::Concat { .. } => "concat",
-        Node::Param { .. } => "param",
-        Node::Call { .. } => "call",
-        Node::Gain { .. } => "gain",
-        Node::Attend { .. } => "attend",
-        Node::RmsNorm { .. } => "rms norm",
-        Node::Transposed { .. } => "transposed",
-    }
-}
-
 /// What a certificate keeps: at most `budget` symbols per input row, and whether the forms absorb
 /// their own binary64 rounding (`rounding`, the sound default). Without it the bound is the
 /// relaxation's in real arithmetic with every form evaluated as if exact: no longer a proof, but it
@@ -1094,8 +1063,8 @@ impl Relaxation {
 /// The rounding switch held for one certificate: shared while rounding is absorbed, exclusive (and
 /// the switch off) while it is not.
 enum Mode {
-    Shared(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>),
-    Exclusive(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>),
+    Shared(std::sync::RwLockReadGuard<'static, ()>),
+    Exclusive(std::sync::RwLockWriteGuard<'static, ()>),
 }
 
 impl Mode {
@@ -1111,9 +1080,14 @@ impl Mode {
 }
 
 impl Drop for Mode {
+    /// The switch is restored while the guard is still held; the lock is released after.
     fn drop(&mut self) {
-        if matches!(self, Self::Exclusive(_)) {
-            ROUNDING.store(true, std::sync::atomic::Ordering::SeqCst);
+        match self {
+            Self::Shared(held) => **held,
+            Self::Exclusive(held) => {
+                ROUNDING.store(true, std::sync::atomic::Ordering::SeqCst);
+                **held
+            }
         }
     }
 }
@@ -1232,8 +1206,21 @@ pub fn certify_program(
     reference_radius: Option<&Array2<f64>>,
     relaxation: Relaxation,
 ) -> Result<Array1<f64>, String> {
-    let _mode = Mode::enter(relaxation.rounding);
-    let budget = relaxation.budget;
+    let mode = Mode::enter(relaxation.rounding);
+    let bound = certify_held(program, inputs, free, target, reference_radius, relaxation.budget);
+    drop(mode);
+    bound
+}
+
+/// [`certify_program`] with the rounding switch held.
+fn certify_held(
+    program: &OperatorProgram,
+    inputs: &FamilyInputs,
+    free: &[FreeSlot],
+    target: &Target,
+    reference_radius: Option<&Array2<f64>>,
+    budget: usize,
+) -> Result<Array1<f64>, String> {
     let rows = inputs.rows;
     let nodes = program.nodes.len();
     if rows >= FIELD || nodes + 1 >= FIELD {
@@ -1270,8 +1257,6 @@ pub fn certify_program(
         Ok(map)
     };
     let ones = vec![1.0; program.declarations.parameters];
-    // `MPD_CERTIFY_TRACE` set: every node's mean half-width and center on stderr.
-    let trace = std::env::var_os("MPD_CERTIFY_TRACE").is_some();
     let mut forms: Vec<Option<Vec<Row>>> = vec![None; nodes];
     let unbounded = || Array1::from_iter((0..rows).map(|r| if target.scores(r) { f64::INFINITY } else { 0.0 }));
     for index in 0..nodes {
@@ -1405,18 +1390,6 @@ pub fn certify_program(
         };
         let mut value = value;
         value.par_iter_mut().for_each(|x| x.reduce(budget));
-        if trace {
-            // Where the relaxation widens: each node's mean half-width against its mean center.
-            let (mut reach, mut size, mut symbols) = (0.0, 0.0, 0);
-            let ball = value.iter().map(|x| x.ball).fold(0.0_f64, f64::max);
-            for x in &value {
-                let spread = x.spread();
-                reach += (&spread + &x.radius).mean().unwrap_or(0.0) / rows as f64;
-                size += x.center.mapv(f64::abs).mean().unwrap_or(0.0) / rows as f64;
-                symbols = symbols.max(x.ids.len());
-            }
-            eprintln!("certify: node {index} {}: half-width {reach:.3e}, ball {ball:.3e}, |center| {size:.3e}, {symbols} symbols", kind(&program.nodes[index]));
-        }
         if value.iter().any(|x| !x.finite()) {
             return Ok(unbounded());
         }
@@ -1443,11 +1416,6 @@ pub fn certify_program(
             };
             if lower.len() != reference.len() {
                 return Err(format!("{} logits against a reference of {}", lower.len(), reference.len()));
-            }
-            if trace {
-                let width = Zip::from(&upper).and(&lower).fold(0.0_f64, |m, &h, &l| m.max(h - l));
-                let mean = (&upper - &lower).mean().unwrap_or(0.0);
-                eprintln!("certify: row {r} logit gaps: widest {width:.3e}, mean width {mean:.3e}");
             }
             let radius = reference_radius.map_or(zero.view(), |m| m.row(r));
             let status = kl_supremum_over_gap_box(reference, radius, top, lower.view(), upper.view()).map_err(|e| e.to_string())?;
