@@ -717,16 +717,19 @@ pub fn fit(
     for c in given..pieces {
         v.row_mut(c).assign(&seed_read(draw(rows)));
     }
-    // The reads span the inputs' span, so every subcomponent on can be the map: the directions
-    // the seeds leave out (in the whitened reads) replace the last seeds.
-    let covered = svd(v.dot(&fitting.span).view(), false).map_err(|e| format!("{e:?}"))?;
-    let rank = covered.singular_values.iter().filter(|s| **s > covered.band).count();
-    let unwhiten = seeding.dot(&fitting.span);
-    for (k, i) in (rank..covered.vt.nrows()).enumerate() {
-        if k + given < pieces {
-            v.row_mut(pieces - 1 - k).assign(&unwhiten.dot(&covered.vt.row(i)));
+    // The reads span the inputs' span, so every subcomponent on can be the map.
+    let span = fitting.span.clone();
+    let unwhiten = seeding.dot(&span);
+    let cover = |v: &mut Array2<f64>, rows: &[usize]| -> Result<(), String> {
+        // The directions (in the whitened reads) the reads leave out replace the reads of `rows`.
+        let covered = svd(v.dot(&span).view(), false).map_err(|e| format!("{e:?}"))?;
+        let rank = covered.singular_values.iter().filter(|s| **s > covered.band).count();
+        for (&c, i) in rows.iter().zip(rank..covered.vt.nrows()) {
+            v.row_mut(c).assign(&unwhiten.dot(&covered.vt.row(i)));
         }
-    }
+        Ok(())
+    };
+    cover(&mut v, &(given..pieces).rev().collect::<Vec<_>>())?;
     // Every subcomponent on: the writes that make the library the map on these inputs.
     let mut u = fitting.writes(&v)?;
     let mut bits = description_bits(describe, site, &v, &u)?;
@@ -779,6 +782,7 @@ pub fn fit(
                 v.row_mut(c).assign(&seed_read(t));
                 reseeded += 1;
             }
+            cover(&mut v, &dead)?;
             // The writes again, so every subcomponent on stays the map.
             u = fitting.writes(&v)?;
             bits = description_bits(describe, site, &v, &u)?;
