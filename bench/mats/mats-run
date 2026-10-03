@@ -12,16 +12,16 @@
 # `cargo run ... --example X -- ARGS` -> that commit's X; /Users/user/gam/... -> a snapshot of the
 # source at that commit (also the job's working directory); python/python3 or the Mac venv's
 # python -> the cluster venv (numpy, scipy). Every existing /Users/user/mpd-data input the command
-# names (outside mpd-data/cluster/) is rsynced up first (MATS_NO_UPLOAD=1 skips that). Write
-# outputs under /Users/user/mpd-data/cluster/NAME/ so `mats-pull NAME` brings them back; the Slurm
-# log is ~/mpd-data/cluster/NAME/slurm-JOBID.log there.
+# names (outside mpd-data/cluster/) is rsynced up first, absolute symlinks as the files they name
+# (MATS_NO_UPLOAD=1 skips that). Write outputs under /Users/user/mpd-data/cluster/NAME/ so
+# `mats-pull NAME` brings them back; the Slurm log is ~/mpd-data/cluster/NAME/slurm-JOBID.log there.
 #
 # Environment: MATS_GPUS=N (L40s; CUDA 12.2 libs are on LD_LIBRARY_PATH), MATS_QOS=debug (2 h max),
 # MATS_ENV="K=V ..." (extra environment for the command; RUST_LOG is forwarded when set), MATS_DRY=1
 # (print the translated command and the uploads, submit nothing).
 set -Eeuo pipefail
 here=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
-usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 [ $# -ge 6 ] && [ "$5" = -- ] || usage
 NAME=$1 CPUS=$2 MEM=$3 HOURS=$4
 shift 5
@@ -101,7 +101,7 @@ if [ ${#uploads[@]} -gt 0 ] && [ -z "${MATS_NO_UPLOAD:-}" ]; then
         echo "mats-run: inputs are $((kb / 1024 / 1024)) GB; set MATS_UPLOAD_BIG=1 to send them" >&2; exit 2
     fi
     echo "mats-run: syncing $((kb / 1024)) MB of inputs: ${uploads[*]#"$MAC_DATA"/}" >&2
-    rsync -a --relative --exclude '*.pem' --exclude '*.key' --exclude '.env' "${rel[@]}" mats:mpd-data/
+    rsync -a --relative --copy-unsafe-links --exclude '*.pem' --exclude '*.key' --exclude '.env' "${rel[@]}" mats:mpd-data/
 fi
 
 want=$(git -C "$MAC_GAM" rev-parse HEAD)
