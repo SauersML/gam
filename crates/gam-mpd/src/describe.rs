@@ -352,6 +352,8 @@ struct Sides {
 /// `v C vᵀ` and `w2 = tr(F W C Wᵀ) = tr[(u F uᵀ)(v C vᵀ)]`.
 struct Block<'a> {
     metric: &'a Metric,
+    /// Bits per unit of whitened squared error: the metric's, times the calibration.
+    scale: f64,
     fu: Array2<f64>,
     cv: Array2<f64>,
     gu: Array2<f64>,
@@ -360,13 +362,13 @@ struct Block<'a> {
 }
 
 impl<'a> Block<'a> {
-    fn new(u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>, metric: &'a Metric) -> Self {
+    fn new(u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>, metric: &'a Metric, calibration: f64) -> Self {
         let fu = metric.fisher.dot(&u.t());
         let cv = metric.moment.dot(&v.t());
         let gu = symmetric(&u.dot(&fu));
         let gv = symmetric(&v.dot(&cv));
         let w2 = (&gu * &gv).sum();
-        Self { metric, fu, cv, gu, gv, w2 }
+        Self { metric, scale: metric.scale() * calibration, fu, cv, gu, gv, w2 }
     }
 
     /// The sides of a choice of groups of two prepared charts.
@@ -404,14 +406,14 @@ impl<'a> Block<'a> {
     fn error_factored(&self, sides: &Sides, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
         let cross = (a.t().dot(&sides.hl) * b.t().dot(&sides.hr)).sum();
         let quad = (a.t().dot(&sides.gp).dot(a) * b.t().dot(&sides.gq).dot(b)).sum();
-        (self.w2 - 2.0 * cross + quad).max(0.0) * self.metric.scale()
+        (self.w2 - 2.0 * cross + quad).max(0.0) * self.scale
     }
 
     /// The KL bits of the core `K`.
     fn error(&self, sides: &Sides, k: &Array2<f64>) -> f64 {
         let cross = (k * &sides.h).sum();
         let quad = (sides.gp.dot(k).dot(&sides.gq) * k).sum();
-        (self.w2 - 2.0 * cross + quad).max(0.0) * self.metric.scale()
+        (self.w2 - 2.0 * cross + quad).max(0.0) * self.scale
     }
 }
 
@@ -473,7 +475,7 @@ impl Coded {
     }
 }
 
-/// The generic cores of rank `1..=max_rank` on `sides`, each the metric's best (the whitened
+/// The generic cores on `sides` of the ranks a search over `1..=max_rank` visits, each the metric's best (the whitened
 /// `M = G_p^{+1/2} H G_q^{+1/2} = A Bᵀ` truncated, its singular pairs from the `r × r` core
 /// `G_a^{1/2} G_b G_a^{1/2}` of `A`'s and `B`'s Grams) and coded in the pivot chart, its two
 /// exponents the minimum of bits plus error by coordinate descent.
@@ -488,14 +490,27 @@ fn generic_cores(block: &Block<'_>, sides: &Sides, max_rank: usize) -> Result<Ve
     // m = Σ (A G_a^{-1/2} z)(B G_a^{1/2} z)ᵀ over the core's eigenvectors z.
     let left = sides.rp.dot(&a.dot(&inverse_half));
     let right = sides.rq.dot(&b.dot(&half));
-    let mut out = Vec::new();
-    for rank in 1..=max_rank.min(order.len()) {
-        let z = decomposed.vectors.select(Axis(1), &order[..rank]);
-        if let Some(coded) = generic_core(block, sides, &left.dot(&z), &right.dot(&z))? {
-            out.push(coded);
+    // The rank by ternary search on the total (bits grow with it, the error left falls).
+    let ranks = max_rank.min(order.len());
+    let mut coded: Vec<Option<Option<Coded>>> = (0..ranks).map(|_| None).collect();
+    let mut failure = None;
+    minimize(ranks, &mut |n| {
+        if coded[n].is_none() {
+            let z = decomposed.vectors.select(Axis(1), &order[..n + 1]);
+            match generic_core(block, sides, &left.dot(&z), &right.dot(&z)) {
+                Ok(c) => coded[n] = Some(c),
+                Err(e) => {
+                    failure = Some(e);
+                    coded[n] = Some(None);
+                }
+            }
         }
+        Ok(coded[n].as_ref().and_then(|c| c.as_ref()).map_or(f64::INFINITY, Coded::total))
+    })?;
+    if let Some(e) = failure {
+        return Err(e);
     }
-    Ok(out)
+    Ok(coded.into_iter().flatten().flatten().collect())
 }
 
 /// The core `K = K_l K_rᵀ` (rank `k` = their width) coded in the pivot chart `K = A Bᵀ`,
@@ -532,15 +547,41 @@ fn generic_core(block: &Block<'_>, sides: &Sides, kl: &Array2<f64>, kr: &Array2<
         Some((ba + bb, kl, qa, full))
     };
     let exponent_cost = |pa: i32, pb: i32| exponent_bits(pa) + if free.is_empty() { 0.0 } else { exponent_bits(pb) };
-    let (ra, rb) = (exponents(&a), exponents(&b_free));
-    let (mut pa, mut pb) = (*ra.end(), *rb.end());
-    for _ in 0..3 {
-        let fixed_b = pb;
-        if let Some((p, _)) = scan(ra.clone(), |p| cost(p, fixed_b).map(|(b, k, _, _)| (b + exponent_cost(p, fixed_b), k))) {
+    let scale = block.scale;
+    // While one factor is held, the error is a quadratic in the other: its products with the held
+    // factor are formed once per scan, `w2 − 2 tr[(ÃᵀH_l)(H_rᵀB̃)ᵀ] + tr[(ÃᵀG_pÃ)(B̃ᵀG_qB̃)]`.
+    let scan_a = |pb: i32| -> Option<i32> {
+        let (qb, bb) = if free.is_empty() { (b_free.clone(), 0.0) } else { quantize(&b_free, pb)? };
+        let full = rebuild(&qb);
+        let (hb, gb) = (sides.hr.t().dot(&full), full.t().dot(&sides.gq).dot(&full));
+        scan(exponents(&a), |p| {
+            let (qa, ba) = quantize(&a, p)?;
+            let cross = (qa.t().dot(&sides.hl) * &hb.t()).sum();
+            let quad = (qa.t().dot(&sides.gp).dot(&qa) * &gb).sum();
+            Some((ba + bb + exponent_cost(p, pb), (block.w2 - 2.0 * cross + quad).max(0.0) * scale))
+        })
+        .map(|(p, _)| p)
+    };
+    let scan_b = |pa: i32| -> Option<i32> {
+        let (qa, ba) = quantize(&a, pa)?;
+        let (ha, ga) = (qa.t().dot(&sides.hl), qa.t().dot(&sides.gp).dot(&qa));
+        scan(exponents(&b_free), |p| {
+            let (qb, bb) = quantize(&b_free, p)?;
+            let full = rebuild(&qb);
+            let cross = (&ha * &full.t().dot(&sides.hr)).sum();
+            let quad = (&ga * &full.t().dot(&sides.gq).dot(&full)).sum();
+            Some((ba + bb + exponent_cost(pa, p), (block.w2 - 2.0 * cross + quad).max(0.0) * scale))
+        })
+        .map(|(p, _)| p)
+    };
+    let (mut pa, mut pb) = (*exponents(&a).end(), *exponents(&b_free).end());
+    for _ in 0..2 {
+        if let Some(p) = scan_a(pb) {
             pa = p;
         }
-        let fixed_a = pa;
-        if let Some((p, _)) = scan(rb.clone(), |p| cost(fixed_a, p).map(|(b, k, _, _)| (b + exponent_cost(fixed_a, p), k))) {
+        if !free.is_empty()
+            && let Some(p) = scan_b(pa)
+        {
             pb = p;
         }
     }
@@ -884,17 +925,53 @@ impl Geometry {
     /// ranked prefixes, a scan ending where the structure bits and one bit a paired column already
     /// exceed the best total.
     pub fn describe(&self, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<Description, String> {
+        self.describe_at(u, v, 1.0)
+    }
+
+    /// The description whose error is priced by the exact KL `exact` gives (bits, at the metric's
+    /// `n`) of a decoded candidate, where the second-order price is only a local model: a confident
+    /// network's Fisher vanishes, and an error past its quadratic regime costs far more than it
+    /// predicts. Each round describes at the metric's price times a calibration, measures the
+    /// decoded description exactly, and scales the calibration by measured over predicted; every
+    /// round's description is exactly priced, and the cheapest is returned with its measured error.
+    /// The rounds end when the prediction holds to within a factor of two (or after 12).
+    pub fn describe_exact(
+        &self,
+        u: ArrayView2<'_, f64>,
+        v: ArrayView2<'_, f64>,
+        exact: &mut dyn FnMut(&Description) -> Result<f64, String>,
+    ) -> Result<Description, String> {
+        let mut calibration = 1.0_f64;
+        let mut best: Option<Description> = None;
+        for _ in 0..12 {
+            let mut d = self.describe_at(u, v, calibration)?;
+            let predicted = d.kl_bits / calibration;
+            let measured = exact(&d)?.max(0.0);
+            d.kl_bits = measured;
+            if best.as_ref().is_none_or(|b| d.total() < b.total()) {
+                best = Some(d);
+            }
+            if measured <= 2.0 * predicted + 1.0 {
+                break;
+            }
+            calibration *= measured / predicted.max(f64::MIN_POSITIVE.sqrt());
+        }
+        best.ok_or_else(|| "no description".to_string())
+    }
+
+    /// [`Geometry::describe`] with the metric's price scaled by `calibration`.
+    fn describe_at(&self, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>, calibration: f64) -> Result<Description, String> {
         let metric = &self.metric;
-        let block = Block::new(u, v, metric);
+        let block = Block::new(u, v, metric, calibration);
         let rank = u.nrows();
         let charts_bits = fixed_index_len_bits(self.writers.len()).map_err(|e| e.to_string())? as f64
             + fixed_index_len_bits(self.readers.len()).map_err(|e| e.to_string())? as f64;
         // Generic, rotation, diagonal, same subspace.
         let core_bits = fixed_index_len_bits(4).map_err(|e| e.to_string())? as f64;
         let writer_sets: Vec<Vec<Vec<usize>>> =
-            self.writers.iter().map(|c| prefixes(&c.chart, &ranked(c, &block.fu, &block.gv), metric.scale())).collect();
+            self.writers.iter().map(|c| prefixes(&c.chart, &ranked(c, &block.fu, &block.gv), block.scale)).collect();
         let reader_sets: Vec<Vec<Vec<usize>>> =
-            self.readers.iter().map(|c| prefixes(&c.chart, &ranked(c, &block.cv, &block.gu), metric.scale())).collect();
+            self.readers.iter().map(|c| prefixes(&c.chart, &ranked(c, &block.cv, &block.gu), block.scale)).collect();
         let context = Context { block: &block, rank, charts_bits, core_bits };
         let mut best: Option<Description> = None;
         for (i, writer) in self.writers.iter().enumerate() {
@@ -950,7 +1027,19 @@ impl Geometry {
                 }
             }
         }
-        best.ok_or_else(|| "no description of the block".to_string())
+        // A map no family resolves (numerically zero in the metric) is the empty description:
+        // its family's index alone, its whole map left as error.
+        Ok(best.unwrap_or_else(|| Description {
+            writer: ("identity".to_string(), Vec::new()),
+            reader: ("identity".to_string(), Vec::new()),
+            core: Core::Generic { rank: 0 },
+            reals: 0,
+            structure_bits: charts_bits + core_bits,
+            real_bits: 0.0,
+            kl_bits: block.w2.max(0.0) * block.scale,
+            u: Array2::zeros((1, u.ncols())),
+            v: Array2::zeros((1, v.ncols())),
+        }))
     }
 }
 

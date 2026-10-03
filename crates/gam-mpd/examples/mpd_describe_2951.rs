@@ -126,22 +126,49 @@ fn active_description(blocked: &Blocked, describe: &dyn Describe) -> Result<f64,
     Ok(bits / rows.max(1.0))
 }
 
-/// The decoded point: every block replaced by its description under `geometry` (what a decoder
-/// rebuilds), measured by the exact masked forward. `(description bits, KL nats, total bits)` per
-/// word, the total the description bits of the blocks on plus `n KL / ln 2`.
+/// `blocked` with block `c` of site `k` replaced by the factors `u`, `v` (its rank becomes theirs).
+fn replaced(blocked: &Blocked, k: usize, c: usize, u: &Array2<f64>, v: &Array2<f64>) -> Result<Blocked, String> {
+    let mut out = blocked.clone();
+    let (mut us, mut vs) = (Vec::new(), Vec::new());
+    for b in 0..blocked.ranks[k].len() {
+        let (bu, bv) = if b == c { (u.view(), v.view()) } else { blocked.factors(k, b) };
+        us.push(bu);
+        vs.push(bv);
+    }
+    out.libraries[k] = std::sync::Arc::new(Library {
+        u: ndarray::concatenate(ndarray::Axis(0), &us).map_err(|e| e.to_string())?,
+        v: ndarray::concatenate(ndarray::Axis(0), &vs).map_err(|e| e.to_string())?,
+        mean: blocked.libraries[k].mean.clone(),
+    });
+    out.ranks[k][c] = u.nrows();
+    Ok(out)
+}
+
+/// The decoded point: every block replaced by its description under `geometry`, each description's
+/// error priced by the exact KL of decoding that block alone (`Geometry::describe_exact`, measured
+/// per word it runs on), then every block decoded together and measured by the exact masked forward
+/// (`coded` only measures, so its description is irrelevant here). `(description bits, KL nats,
+/// total bits)` per word, the total the description bits of the blocks on plus `n KL / ln 2`.
 fn decoded(coded: &Coded<'_>, blocked: &Blocked, geometry: &Structured) -> Result<(f64, f64, f64), String> {
+    use rayon::prelude::*;
+    let (base, _) = measure(coded, blocked)?;
     let mut out = blocked.clone();
     let mut prices = Vec::new();
     for (k, ranks) in blocked.ranks.iter().enumerate() {
-        let (mut us, mut vs, mut widths, mut site) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        for c in 0..ranks.len() {
-            let (u, v) = blocked.factors(k, c);
-            let d = geometry.sites[k].describe(u, v)?;
-            widths.push(d.u.nrows());
-            site.push(d.bits());
-            us.push(d.u);
-            vs.push(d.v);
-        }
+        let described: Vec<gam_mpd::describe::Description> = (0..ranks.len())
+            .into_par_iter()
+            .map(|c| {
+                let (u, v) = blocked.factors(k, c);
+                let on: f64 = blocked.masks.iter().map(|m| m[k].column(c).sum()).sum::<f64>().max(1.0);
+                geometry.sites[k].describe_exact(u, v, &mut |d| {
+                    let (bits, _) = measure(coded, &replaced(blocked, k, c, &d.u, &d.v)?)?;
+                    Ok((bits.kl - base.kl) / on)
+                })
+            })
+            .collect::<Result<_, String>>()?;
+        let widths: Vec<usize> = described.iter().map(|d| d.u.nrows()).collect();
+        let site: Vec<f64> = described.iter().map(|d| d.bits()).collect();
+        let (us, vs): (Vec<_>, Vec<_>) = described.into_iter().map(|d| (d.u, d.v)).unzip();
         let uv: Vec<_> = us.iter().map(|x| x.view()).collect();
         let vv: Vec<_> = vs.iter().map(|x| x.view()).collect();
         out.libraries[k] = std::sync::Arc::new(Library {
@@ -239,8 +266,10 @@ fn modadd(dir: &Path, out: &Path, observations: f64, only: Option<&str>) -> Resu
 
     // Each site's whole map as one block, on for every word: what one structured statement of the
     // site costs against its rank-one subcomponents all on, both decoded and measured exactly.
-    let all_on = Blocked::rank_one(libraries.clone(), vec![libraries.iter().map(|l| Array2::<f64>::ones((family.rows, l.v.nrows()))).collect()]);
-    let whole = all_on.whole();
+    let mut all_on = Blocked::rank_one(libraries.clone(), vec![libraries.iter().map(|l| Array2::<f64>::ones((family.rows, l.v.nrows()))).collect()]);
+    all_on.price(&coded_generic)?;
+    let mut whole = all_on.whole();
+    whole.price(&coded_generic)?;
     let mut sites_report = Vec::new();
     for (k, site) in chosen.iter().enumerate() {
         let (u, v) = whole.factors(k, 0);
@@ -259,7 +288,7 @@ fn modadd(dir: &Path, out: &Path, observations: f64, only: Option<&str>) -> Resu
     let mut whole_points = Vec::new();
     for (name, decomposition) in [("whole sites", &whole), ("rank one, all on", &all_on)] {
         for (description, geometry) in [("structured", &structured), ("lattice generic", &lattice)] {
-            let (described, kl, total) = decoded(&coded_structured, decomposition, geometry)?;
+            let (described, kl, total) = decoded(&coded_generic, decomposition, geometry)?;
             eprintln!("{name}, {description}, decoded: {total:.1} bits/word ({described:.1} described), KL {kl:.6} nats/word");
             whole_points.push(json!({"point": name, "description": description, "bits_per_word": total, "described_bits_per_word": described, "kl_per_word": kl}));
         }
@@ -286,8 +315,8 @@ fn modadd(dir: &Path, out: &Path, observations: f64, only: Option<&str>) -> Resu
                 "active_generic_description_bits_per_word": active_description(decomposition, &generic)?,
                 "active_structured_description_bits_per_word": active_description(decomposition, &structured)?,
                 "active_lattice_generic_description_bits_per_word": active_description(decomposition, &lattice)?,
-                "decoded_lattice_generic": decoded(coded, decomposition, &lattice)?,
-                "decoded_structured": decoded(coded, decomposition, &structured)?,
+                "decoded_lattice_generic": decoded(&coded_generic, decomposition, &lattice)?,
+                "decoded_structured": decoded(&coded_generic, decomposition, &structured)?,
                 "active_blocks_per_word": active_blocks,
                 "active_rank_one_equivalents_per_word": active_rank,
                 "blocks": bits.blocks,
