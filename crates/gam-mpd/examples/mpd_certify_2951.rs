@@ -13,17 +13,19 @@
 //! * the certificate with at most `BUDGET` symbols per word (default 4096);
 //! * the certificate after `LEAVES` leaves of branching on that word alone (default 33).
 //!
-//! `mpd_certify_2951 lm EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json SEQUENCES CONTEXT [BUDGET] [LEAVES] [FREE] [STEPS]`
+//! `mpd_certify_2951 lm EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json SEQUENCES CONTEXT [BUDGET] [LEAVES] [FREE] [STEPS] [OBSERVATIONS]`
 //!
 //! A language-model export (`import_language_model`), the first `CONTEXT` positions of its first
 //! `SEQUENCES` sequences. Positions only read earlier ones, so a prefix is exact. The sites with a
-//! library in `LIBRARY_DIR` (`{site}.v.f64`, `{site}.u.f64`) run on its subcomponents, with nothing
-//! beyond them. `SETS_DIR` gives each position's set (`bench/vpd_2951/vpd_sets_export.py`'s CSR over
+//! library in `LIBRARY_DIR` (`{site}.v.f64`, `{site}.u.f64`) run on its subcomponents plus the
+//! residual `W − Σ u vᵀ` as exact rank-one pieces that are always on (VPD's delta component, held on), so
+//! every gate on is the model. `SETS_DIR` gives each position's set (`bench/vpd_2951/vpd_sets_export.py`'s CSR over
 //! 512-position sequences). `FREE` (default `all`) is a comma-separated list of site-name prefixes
 //! whose off gates are free; every other off gate stays at 0. The adversary takes `STEPS` steps
 //! (default 40) from 6 starts on the sequence's total KL. Each word's certificate uses `BUDGET`
 //! symbols (default 512), and the sequence's box is split into `LEAVES` leaves (default 1: no
-//! branching).
+//! branching). With `OBSERVATIONS` positive, a second set per word is chosen by the masked selection under
+//! the box claim (`select_boxed`, coded in `OBSERVATIONS`) from the given sets, and certified the same way.
 
 use gam_mpd::blocks::Describe;
 use gam_mpd::certify::{Gates, adversary, certify, certify_branching};
@@ -181,7 +183,7 @@ fn toy(args: &[String]) -> Result<(), String> {
 }
 
 fn lm(args: &[String]) -> Result<(), String> {
-    let usage = "mpd_certify_2951 lm EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json SEQUENCES CONTEXT [BUDGET] [LEAVES] [FREE] [STEPS]";
+    let usage = "mpd_certify_2951 lm EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json SEQUENCES CONTEXT [BUDGET] [LEAVES] [FREE] [STEPS] [OBSERVATIONS]";
     let export = PathBuf::from(args.get(2).ok_or(usage)?);
     let library_dir = PathBuf::from(args.get(3).ok_or(usage)?);
     let sets_dir = PathBuf::from(args.get(4).ok_or(usage)?);
@@ -192,12 +194,15 @@ fn lm(args: &[String]) -> Result<(), String> {
     let leaves: usize = arg(args, 9, 1)?;
     let free: String = arg(args, 10, "all".to_string())?;
     let steps: usize = arg(args, 11, 40)?;
+    let observations: f64 = arg(args, 12, 0.0)?;
     let started = Instant::now();
     let imported = import_language_model(&export, sequences, context)?;
     let model = &imported.program;
     let family = &imported.contract.family;
     let mut chosen = Vec::new();
     let mut libraries = Vec::new();
+    // Per site, how many of its pieces are the given library's; the rest hold the residual `W − Σ u vᵀ`.
+    let mut given = Vec::new();
     for site in sites(model) {
         let v_path = library_dir.join(format!("{}.v.f64", site.name));
         if !v_path.exists() {
@@ -207,12 +212,19 @@ fn lm(args: &[String]) -> Result<(), String> {
         let (d_out, d_in) = w.dim();
         let v = read_f64(&v_path, d_in)?;
         let u = read_f64(&library_dir.join(format!("{}.u.f64", site.name)), d_out)?;
+        let delta = &w - &u.t().dot(&v);
+        // The residual as exact rank-one pieces along the narrower side.
+        let (dv, du) = if d_out < d_in { (delta.clone(), Array2::eye(d_out)) } else { (Array2::eye(d_in), delta.t().to_owned()) };
+        given.push(v.nrows());
+        let v = ndarray::concatenate(ndarray::Axis(0), &[v.view(), dv.view()]).map_err(|e| e.to_string())?;
+        let u = ndarray::concatenate(ndarray::Axis(0), &[u.view(), du.view()]).map_err(|e| e.to_string())?;
         libraries.push(Library { v, u, mean: Array1::zeros(d_in) });
         chosen.push(site);
     }
-    let masked = Masked::build(model, chosen, libraries)?;
+    let masked = Masked::build(model, chosen.clone(), libraries)?;
     eprintln!("built {} sites in {:.1}s", masked.sites.len(), started.elapsed().as_secs_f64());
-    // The given sets, over 512-position sequences, pieces numbered site after site in `sites.txt`.
+    // The given sets, over 512-position sequences, pieces numbered site after site in `sites.txt`; every
+    // residual piece is on.
     let listed = std::fs::read_to_string(sets_dir.join("sites.txt")).map_err(|e| format!("{}: {e}", sets_dir.display()))?;
     let mut offsets = vec![0usize];
     let mut site_of_listing = Vec::new();
@@ -220,8 +232,8 @@ fn lm(args: &[String]) -> Result<(), String> {
         let (name, pieces) = line.split_once(' ').ok_or("sites.txt: name pieces")?;
         let k = masked.sites.iter().position(|s| s.name == name).ok_or_else(|| format!("sites.txt: {name} is not a site"))?;
         let pieces: usize = pieces.parse().map_err(|e| format!("sites.txt: {e}"))?;
-        if pieces != masked.pieces(k) {
-            return Err(format!("{name}: {pieces} listed, {} in the library", masked.pieces(k)));
+        if pieces != given[k] {
+            return Err(format!("{name}: {pieces} listed, {} in the library", given[k]));
         }
         site_of_listing.push(k);
         offsets.push(offsets[offsets.len() - 1] + pieces);
@@ -229,7 +241,9 @@ fn lm(args: &[String]) -> Result<(), String> {
     let indptr = read_i64(&sets_dir.join("indptr.i64"))?;
     let indices = read_i64(&sets_dir.join("indices.i64"))?;
     const SEQUENCE: usize = 512;
-    let mut masks: Vec<Array2<f64>> = (0..masked.sites.len()).map(|k| Array2::zeros((family.rows, masked.blocks(k)))).collect();
+    let mut masks: Vec<Array2<f64>> = (0..masked.sites.len())
+        .map(|k| Array2::from_shape_fn((family.rows, masked.blocks(k)), |(_, c)| if c >= given[k] { 1.0 } else { 0.0 }))
+        .collect();
     for s in 0..sequences {
         for p in 0..context {
             let at = s * SEQUENCE + p;
@@ -242,35 +256,72 @@ fn lm(args: &[String]) -> Result<(), String> {
         }
     }
     let (target, radius) = reference(model, family)?;
-    let mut gates = Gates::claim(&masks);
-    if free != "all" {
-        let prefixes: Vec<&str> = free.split(',').collect();
+    // The given library's pieces on per word (the residual pieces are always on).
+    let listed_l0 = |masks: &[Array2<f64>]| -> f64 {
+        masks.iter().zip(&given).map(|(m, g)| m.slice(ndarray::s![.., ..*g]).iter().filter(|x| **x > 0.0).count()).sum::<usize>() as f64 / family.rows as f64
+    };
+    let mut sets = vec![("given", masks.clone())];
+    if observations > 0.0 {
+        // The masked selection under the box claim from the given sets, every word coded in `OBSERVATIONS`.
+        let statistics = site_statistics(model, &chosen, [family.clone()], 2, 0x5EED)?;
+        let fishers: Vec<Array2<f64>> = statistics.iter().map(|s| s.fisher.clone()).collect();
+        let description = gam_mpd::blocks::Generic::new(
+            &statistics
+                .iter()
+                .map(|m| gam_mpd::pieces::Site { w: m.w.clone(), second_moment: m.second_moment.clone(), mean: Array1::zeros(m.mean.len()), fisher: m.fisher.clone() })
+                .collect::<Vec<_>>(),
+            observations,
+        );
+        let costs: Vec<Array1<f64>> = (0..masked.sites.len())
+            .map(|k| {
+                let library = masked.library(k)?;
+                (0..library.v.nrows())
+                    .map(|c| description.bits(k, library.u.slice(ndarray::s![c..c + 1, ..]), library.v.slice(ndarray::s![c..c + 1, ..])))
+                    .collect::<Result<Array1<f64>, String>>()
+            })
+            .collect::<Result<_, _>>()?;
+        let coder = Coder::ran(costs, family.rows);
+        let boxed = select_boxed(&masked, family, &target, masks.clone(), &coder, observations, 2, &fishers)?.0;
+        eprintln!("box selection done ({:.1}s)", started.elapsed().as_secs_f64());
+        sets.push(("box", boxed));
+    }
+    let mut report = Vec::new();
+    for (name, masks) in sets {
+        let mut gates = Gates::claim(&masks);
+        // A residual piece is never off; outside `FREE` every gate stays where the set puts it.
         for (k, site) in masked.sites.iter().enumerate() {
-            if !prefixes.iter().any(|p| site.name.starts_with(p)) {
+            let pinned = free != "all" && !free.split(',').any(|p| site.name.starts_with(p));
+            if pinned {
                 gates.upper[k] = gates.lower[k].clone();
             }
         }
-    }
-    eprintln!("sets read: L0 {:.1} per word, {:.1}s", l0(&masks), started.elapsed().as_secs_f64());
-    let (kl, _, _) = forward(&masked, &masked.family(family, &masks), &target)?;
-    eprintln!("corner KL {:.4} ({:.1}s)", kl.mean().unwrap_or(0.0), started.elapsed().as_secs_f64());
-    let found = adversary(&masked, family, &target, &gates, None, steps, 6, 0xAD5)?;
-    eprintln!("adversary {:.4} ({:.1}s)", found.mean().unwrap_or(0.0), started.elapsed().as_secs_f64());
-    let at = Instant::now();
-    let branched = certify_branching(&masked, family, &target, Some(&radius), gates, budget, leaves)?;
-    let seconds = at.elapsed().as_secs_f64();
-    for r in 0..family.rows {
-        if branched.kl[r] < found[r] {
-            return Err(format!("row {r}: certified {} below the adversary's {}", branched.kl[r], found[r]));
+        let (kl, _, _) = forward(&masked, &masked.family(family, &masks), &target)?;
+        let found = adversary(&masked, family, &target, &gates, None, steps, 6, 0xAD5)?;
+        let at = Instant::now();
+        let branched = certify_branching(&masked, family, &target, Some(&radius), gates, budget, leaves)?;
+        let seconds = at.elapsed().as_secs_f64();
+        for r in 0..family.rows {
+            if branched.kl[r] < found[r] {
+                return Err(format!("{name}: row {r} certified {} below the adversary's {}", branched.kl[r], found[r]));
+            }
         }
+        eprintln!(
+            "{name}: L0 {:.1}, corner KL {:.4}, adversary {:.4}, certified {:.4}, branched {:.4} ({seconds:.1}s)",
+            listed_l0(&masks),
+            kl.mean().unwrap_or(0.0),
+            found.mean().unwrap_or(0.0),
+            branched.root.mean().unwrap_or(0.0),
+            branched.kl.mean().unwrap_or(0.0)
+        );
+        report.push(json!({
+            "sets": name, "l0": listed_l0(&masks), "leaves": branched.leaves, "seconds": seconds,
+            "kl": summary(&kl), "adversary": summary(&found), "certified": summary(&branched.root), "branched": summary(&branched.kl),
+            "rows": { "kl": kl.to_vec(), "adversary": found.to_vec(), "certified": branched.root.to_vec(), "branched": branched.kl.to_vec() },
+        }));
     }
-    eprintln!("certified {:.4}, branched {:.4} ({seconds:.1}s)", branched.root.mean().unwrap_or(0.0), branched.kl.mean().unwrap_or(0.0));
     let record = json!({
-        "mode": "lm", "export": export, "library": library_dir, "sets": sets_dir, "sequences": sequences, "context": context,
-        "budget": budget, "leaves": branched.leaves, "free": free, "steps": steps, "seconds": seconds,
-        "l0": l0(&masks),
-        "kl": summary(&kl), "adversary": summary(&found), "certified": summary(&branched.root), "branched": summary(&branched.kl),
-        "rows": { "kl": kl.to_vec(), "adversary": found.to_vec(), "certified": branched.root.to_vec(), "branched": branched.kl.to_vec() },
+        "mode": "lm", "export": export, "library": library_dir, "given": sets_dir, "sequences": sequences, "context": context,
+        "budget": budget, "free": free, "steps": steps, "observations": observations, "sets": report,
     });
     std::fs::write(&out, serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }

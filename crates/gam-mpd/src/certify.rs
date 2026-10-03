@@ -46,7 +46,9 @@
 //! * **Attention** rotates each query and key, a rotation per plane. It forms the scores as
 //!   products, and each weight in its stable form `α_j = 1 / Σ_k e^{s_k − s_j}`. The exponents are
 //!   differences of scores, so whatever the scores share cancels exactly, and each weight's curve
-//!   is the reciprocal on `[1, h]`. The read is `Σ_j α_j v_j`.
+//!   is the reciprocal on `[1, h]`. The read is `Σ_j α_j v_j`; the weights are convex, so each read
+//!   coordinate also lies within the values' own range, which replaces a coordinate the product
+//!   relaxation leaves wider.
 //!
 //! # The divergence
 //!
@@ -732,11 +734,32 @@ fn softmax(scores: &[Row], budget: usize) -> Vec<Row> {
         .collect()
 }
 
-/// `Σ_j α_j p_j`.
-fn mix(weights: &[Row], payloads: &[&Row], budget: usize) -> Row {
+/// `Σ_j α_j p_j`; with `convex` (weights that sum to one and are nonnegative, a softmax's), each
+/// coordinate also lies between the payloads' smallest lower and largest upper end, and a
+/// coordinate whose form is wider than that interval is replaced by it.
+fn mix(weights: &[Row], payloads: &[&Row], budget: usize, convex: bool) -> Row {
     let reads: Vec<Row> = weights.iter().zip(payloads).map(|(a, p)| product(a, p)).collect();
     let refs: Vec<(&Row, f64)> = reads.iter().map(|r| (r, 1.0)).collect();
     let mut out = combine(&refs);
+    if convex {
+        let width = out.width();
+        let mut low = Array1::from_elem(width, f64::INFINITY);
+        let mut high = Array1::from_elem(width, f64::NEG_INFINITY);
+        for p in payloads {
+            let (l, h) = p.bounds();
+            Zip::from(&mut low).and(&l).for_each(|a, &b| *a = a.min(b));
+            Zip::from(&mut high).and(&h).for_each(|a, &b| *a = a.max(b));
+        }
+        let (lo, hi) = out.bounds();
+        for d in 0..width {
+            if high[d] - low[d] < hi[d] - lo[d] {
+                let (mid, half) = centred(low[d], high[d]);
+                out.center[d] = mid;
+                out.radius[d] = half;
+                out.coef.column_mut(d).fill(0.0);
+            }
+        }
+    }
     out.reduce(budget);
     out
 }
@@ -1020,6 +1043,9 @@ pub fn certify_program(
                     .collect()
             }
             Node::Mix { weights, payloads } => {
+                // A softmax's columns are convex weights when the mix reads each of them once.
+                let convex = matches!(&program.nodes[*weights], Node::Softmax { scores } if scores.len() == payloads.len())
+                    && payloads.iter().enumerate().all(|(i, (c, _))| *c == i);
                 let w = get(*weights)?;
                 let parts: Vec<(usize, &Vec<Row>)> = payloads.iter().map(|(c, n)| get(*n).map(|p| (*c, p))).collect::<Result<_, _>>()?;
                 (0..rows)
@@ -1027,7 +1053,7 @@ pub fn certify_program(
                     .map(|r| {
                         let alphas: Vec<Row> = parts.iter().map(|(c, _)| w[r].column(*c)).collect();
                         let values: Vec<&Row> = parts.iter().map(|(_, p)| &p[r]).collect();
-                        mix(&alphas, &values, budget)
+                        mix(&alphas, &values, budget, convex)
                     })
                     .collect()
             }
@@ -1057,7 +1083,7 @@ pub fn certify_program(
                         let scores: Vec<Row> = reads[r].iter().map(|&j| score(&q[r], &k[j], c)).collect();
                         let weights = softmax(&scores, budget);
                         let values: Vec<&Row> = reads[r].iter().map(|&j| &v[j]).collect();
-                        mix(&weights, &values, budget)
+                        mix(&weights, &values, budget, true)
                     })
                     .collect()
             }
