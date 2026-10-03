@@ -66,8 +66,7 @@ fn scored(score: &ProgramScore, rows: usize, observations: u64) -> Value {
     let evaluation = &score.evaluation;
     json!({
         "program_bits": score.program_bits,
-        "estimated_rows": score.evaluation.estimated_rows,
-        "certified": score.certified(),
+        "certified": score.data_bits_error.is_finite(),
         "structure_bits": score.structure_bits,
         "precision_bits": score.precision_bits,
         "explanation_bits": score.explanation.bits,

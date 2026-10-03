@@ -25,6 +25,7 @@ all-on point come with `vpd_ci`.
 """
 
 import argparse
+import fcntl
 import json
 import os
 import resource
@@ -144,10 +145,23 @@ if "vpd_rounded" in wanted:
 if "given" in wanted:
     families[args.name] = given_family()
 log("families: " + ", ".join(f"{k} L0 {f.l0():.1f}" for k, f in families.items()))
-targets = []
-with torch.no_grad():
-    for i in range(n_mb):
-        targets.append(vpd.target_forward(ids[i * MB:(i + 1) * MB]))
+
+
+class Targets:
+    """Native logits of one microbatch at a time (every microbatch's would be 3 GB on 32 rows)."""
+
+    def __init__(self):
+        self.i, self.logits = None, None
+
+    def __getitem__(self, i: int) -> torch.Tensor:
+        if self.i != i:
+            self.logits = None
+            with torch.no_grad():
+                self.i, self.logits = i, vpd.target_forward(ids[i * MB:(i + 1) * MB])
+        return self.logits
+
+
+targets = Targets()
 
 
 def set_masks(masks: dict, delta: dict | None):
@@ -184,6 +198,13 @@ def stats(kl: np.ndarray) -> dict:
 
 
 def update_out(key: str, value: dict):
+    # Runs of other modes and families share the file: read-modify-write under a lock.
+    with open(args.out.with_suffix(".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        merge_out(key, value)
+
+
+def merge_out(key: str, value: dict):
     data = json.load(open(args.out)) if args.out.exists() else {}
     # One level deep, so runs over other families add to what is there.
     for k, v in value.items():
@@ -191,7 +212,9 @@ def update_out(key: str, value: dict):
             data[key][k].update(v)
         else:
             data.setdefault(key, {})[k] = v
-    data[key]["rows"], data[key]["offset"], data[key]["sets"] = args.rows, args.offset, str(args.sets)
+    data[key]["rows"], data[key]["offset"] = args.rows, args.offset
+    if args.name in families:
+        data[key].setdefault("sets", {})[args.name] = str(args.sets)
     tmp = args.out.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=1))
     tmp.replace(args.out)

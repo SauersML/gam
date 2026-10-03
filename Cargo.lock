@@ -3938,7 +3938,6 @@ dependencies = [
  "gam-gpu",
  "gam-linalg",
  "gam-math",
- "gam-response",
  "gam-runtime",
  "gam-workspace-hack",
  "log",

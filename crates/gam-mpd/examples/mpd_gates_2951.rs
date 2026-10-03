@@ -1,10 +1,11 @@
-//! Gate laws for a decomposed language model (#2951): fit `gam_mpd::gates` laws on given per-token
-//! sets over the model's own amplitudes, and score them on held-out sequences.
+//! Switching functions for a decomposed language model (#2951): fit `gam_mpd::gates` switching
+//! functions on given per-token sets over the model's own upstream amplitudes, and score them on
+//! held-out sequences.
 //!
 //! `mpd_gates_2951 EXPORT_DIR AMPS_DIR SETS_DIR OUT TRAIN EVAL [CONTEXT]`
 //!
 //! `EXPORT_DIR` is a language-model export (`gam_mpd::import::import_language_model`); only its
-//! program is read, for its sites (`gam_mpd::masked::sites`), which sites are upstream of which
+//! program is read, for its sites (`gam_mpd::masked::sites`), which sites feed which
 //! (`gam_mpd::gates::upstream`) and their read widths. `AMPS_DIR` holds the amplitudes
 //! `a_j = v_jᵀx` of every subcomponent on the clean forward of a run of sequences
 //! (`bench/vpd_2951/vpd_gates.py amps`): `sites.txt` (one `name pieces` line per site, in the
@@ -13,23 +14,24 @@
 //! `indptr.i64`, `indices.i64`, subcomponents numbered site after site). `TRAIN` and `EVAL` are
 //! disjoint sequence ranges `lo:hi`.
 //!
-//! Every subcomponent gets a law fitted on the training sequences (`gam_mpd::gates::fit`): first
-//! the better of its base rate and a law over its own amplitude (pool: its own amplitude, every
-//! upstream site's amplitudes at this token and at the previous one, and its own site's at the
-//! previous one; a `d`-subset costs `log₂ C(pool, d)`). Then, site by site, rounds of
-//! `gam_mpd::gates::screen` over the pool propose one feature more per law, on a stride sample of
-//! the training tokens; a law keeps the feature when its refitted total falls, and rounds repeat
-//! until no law changes.
+//! Every subcomponent gets a switching function fitted on the training sequences
+//! (`gam_mpd::gates::best`): first the better of its base rate and a function of its own amplitude.
+//! The pool is its own amplitude, the amplitudes of every site upstream at this position, and those
+//! of every site that reaches it through attention at the previous position; a `d`-subset costs
+//! `log₂ C(pool, d)`. Then, site by site, rounds of `gam_mpd::gates::screen` over the pool propose
+//! one feature more per function, on a stride sample of the training tokens; a function keeps the
+//! feature when its refitted total falls, and rounds repeat until none changes.
 //!
 //! After the first pass and at the end, `OUT.json` gets the eval sequences' bits per token for
-//! sending every subcomponent's on/off: under the laws, under the base rates, and under the masked
-//! driver's previous-state context coder (`gam_mpd::masked::Context`, counted on the training
-//! sequences); the laws' own bits; the kinds of law; and the multiply–adds per token the laws cost
-//! (the amplitudes their features read, `d_in` each, plus the laws themselves) beside every
-//! amplitude's. `OUT.laws.json` holds the laws, and `OUT.sets.{indptr,indices}.npy` the sets the
-//! laws choose on the eval sequences (int64 CSR over their tokens).
+//! sending every subcomponent's on/off: under the switching functions, under the base rates, and
+//! under the masked driver's previous-state context coder (`gam_mpd::masked::Context`, counted on
+//! the training sequences). It also gets the functions' own bits, their kinds, and the
+//! multiply–adds per token they cost (the amplitudes their features read, `d_in` each, plus the
+//! functions themselves) beside every amplitude's. `OUT.switches.json` holds the functions, and
+//! `OUT.sets.{indptr,indices}.npy` the sets they choose on the eval sequences (int64 CSR over their
+//! tokens).
 
-use gam_mpd::gates::{self, Feature, Law};
+use gam_mpd::gates::{self, Feature, Switch};
 use gam_mpd::import::import_language_model;
 use gam_mpd::masked::{Context, matrix, sites};
 use memmap2::Mmap;
@@ -147,14 +149,15 @@ struct Run {
     pieces: Vec<usize>,
     /// Per site, per subcomponent, its on tokens (ascending, over the whole run).
     on: Vec<Vec<Vec<usize>>>,
-    upstream: Vec<Vec<usize>>,
+    upstream: Vec<gates::Upstream>,
     widths: Vec<usize>,
     context: usize,
 }
 
 impl Run {
     fn pool(&self, site: usize) -> usize {
-        1 + self.pieces[site] + 2 * self.upstream[site].iter().map(|u| self.pieces[*u]).sum::<usize>()
+        let up = &self.upstream[site];
+        1 + up.here.iter().chain(&up.before).map(|u| self.pieces[*u]).sum::<usize>()
     }
 
     fn structure_bits(&self, site: usize, d: usize) -> f64 {
@@ -194,49 +197,45 @@ impl Run {
     }
 }
 
-/// The first pass: per subcomponent, the better of its base rate and its own-amplitude law.
-fn first_pass(run: &Run, site: usize, train: (usize, usize)) -> Vec<Law> {
+/// The first pass: per subcomponent, the better of its base rate and its own-amplitude switch.
+fn first_pass(run: &Run, site: usize, train: (usize, usize)) -> Vec<Switch> {
     (0..run.pieces[site])
         .into_par_iter()
         .map(|piece| {
             let y = run.labels(site, piece, train.0, train.1, 1);
-            let base = gates::base(&y);
             let structure = run.structure_bits(site, 1);
-            if base.total_bits() <= gates::least_featured_bits(structure) {
-                return base;
+            if gates::base(&y).total_bits() <= gates::least_featured_bits(structure) {
+                return gates::base(&y);
             }
             let features = [Feature { site, piece, lag: 0 }];
-            let x = run.rows(&features, train.0, train.1, 1);
-            let law = gates::fit(x.view(), &y, &features, structure, None);
-            if law.total_bits() < base.total_bits() { law } else { base }
+            gates::best(run.rows(&features, train.0, train.1, 1).view(), &y, &features, structure)
         })
         .collect()
 }
 
 /// Screening rounds at one site (module note); returns how many features were kept.
-fn screening(run: &Run, site: usize, laws: &mut [Law], train: (usize, usize)) -> Result<usize, String> {
+fn screening(run: &Run, site: usize, switches: &mut [Switch], train: (usize, usize)) -> Result<usize, String> {
     let n_train = train.1 - train.0;
     // The screen only proposes; a sample of the training tokens is enough to rank candidates.
     let stride = n_train.div_ceil(8192).max(1);
     let scale = stride as f64;
-    let mut blocks: Vec<(usize, usize)> = run.upstream[site].iter().map(|u| (*u, 0)).collect();
-    blocks.extend(run.upstream[site].iter().map(|u| (*u, 1)));
-    blocks.push((site, 1));
+    let mut blocks: Vec<(usize, usize)> = run.upstream[site].here.iter().map(|u| (*u, 0)).collect();
+    blocks.extend(run.upstream[site].before.iter().map(|u| (*u, 1)));
     let mut kept_total = 0;
-    let mut open: Vec<usize> = (0..laws.len()).filter(|j| !laws[*j].features.is_empty()).collect();
+    let mut open: Vec<usize> = (0..switches.len()).filter(|j| !switches[*j].features.is_empty()).collect();
     while !open.is_empty() {
-        // Residuals and weights of the open laws at the sample.
+        // Residuals and weights of the open switches at the sample.
         let columns: Vec<(Array1<f64>, Array1<f64>)> = open
             .par_iter()
             .map(|&j| {
-                let law = &laws[j];
-                let x = run.rows(&law.features, train.0, train.1, stride);
+                let switch = &switches[j];
+                let x = run.rows(&switch.features, train.0, train.1, stride);
                 let y = run.labels(site, j, train.0, train.1, stride);
                 let mut r = Array1::zeros(y.len());
                 let mut w = Array1::zeros(y.len());
                 for (t, on) in y.iter().enumerate() {
                     let row: Vec<f64> = x.row(t).to_vec();
-                    let p = 1.0 / (1.0 + (-law.logit(&row)).exp());
+                    let p = 1.0 / (1.0 + (-switch.logit(&row)).exp());
                     r[t] = if *on { 1.0 } else { 0.0 } - p;
                     w[t] = p * (1.0 - p);
                 }
@@ -265,7 +264,7 @@ fn screening(run: &Run, site: usize, laws: &mut [Law], train: (usize, usize)) ->
                 for piece in 0..run.pieces[u] {
                     let feature = Feature { site: u, piece, lag };
                     let gain = gains[[piece, k]] * scale;
-                    if laws[j].features.contains(&feature) {
+                    if switches[j].features.contains(&feature) {
                         continue;
                     }
                     if best[k].as_ref().is_none_or(|b| gain > b.0) {
@@ -275,78 +274,78 @@ fn screening(run: &Run, site: usize, laws: &mut [Law], train: (usize, usize)) ->
             }
         }
         // A proposal is refitted when its predicted gain pays for the larger subset alone.
-        let refits: Vec<(usize, Option<Law>)> = open
+        let refits: Vec<(usize, Option<Switch>)> = open
             .par_iter()
             .zip(best.par_iter())
             .map(|(&j, proposal)| {
-                let law = &laws[j];
-                let d = law.features.len();
+                let switch = &switches[j];
+                let d = switch.features.len();
                 let Some((gain, feature)) = proposal else { return (j, None) };
                 if *gain <= run.structure_bits(site, d + 1) - run.structure_bits(site, d) {
                     return (j, None);
                 }
-                let mut features = law.features.clone();
+                let mut features = switch.features.clone();
                 features.push(*feature);
                 let x = run.rows(&features, train.0, train.1, 1);
                 let y = run.labels(site, j, train.0, train.1, 1);
-                let refit = gates::fit(x.view(), &y, &features, run.structure_bits(site, d + 1), Some(law));
-                (j, (refit.total_bits() < law.total_bits()).then_some(refit))
+                let refit = gates::fit(x.view(), &y, &features, run.structure_bits(site, d + 1), Some(switch));
+                (j, (refit.total_bits() < switch.total_bits()).then_some(refit))
             })
             .collect();
         open = Vec::new();
         for (j, refit) in refits {
-            if let Some(law) = refit {
-                laws[j] = law;
+            if let Some(switch) = refit {
+                switches[j] = switch;
                 open.push(j);
                 kept_total += 1;
             }
         }
-        eprintln!("site {}: {} laws took a feature", run.names[site], open.len());
+        eprintln!("site {}: {} switches took a feature", run.names[site], open.len());
     }
     Ok(kept_total)
 }
 
-/// The eval scoring of `laws` (module note), and the laws' sets on the eval sequences.
-fn score(run: &Run, laws: &[Vec<Law>], train: (usize, usize), eval: (usize, usize)) -> (serde_json::Value, Vec<i64>, Vec<i64>) {
+/// The eval scoring of `switches` (module note), and the switches' sets on the eval sequences.
+fn score(run: &Run, switches: &[Vec<Switch>], train: (usize, usize), eval: (usize, usize)) -> (serde_json::Value, Vec<i64>, Vec<i64>) {
     let n_eval = eval.1 - eval.0;
-    let mut law_bits_eval = 0.0;
+    let mut listing_eval = 0.0;
     let mut base_bits_eval = 0.0;
-    let mut law_bits = 0.0;
+    let mut function_bits = 0.0;
     let mut decisions: Vec<Vec<usize>> = vec![Vec::new(); n_eval];
     let mut offset = 0;
     let mut kinds = std::collections::BTreeMap::<String, usize>::new();
     let mut needed = std::collections::BTreeSet::<(usize, usize)>::new();
-    let mut law_madds = 0usize;
+    let mut switch_madds = 0usize;
     for site in 0..run.names.len() {
         let per: Vec<(f64, f64, Vec<usize>)> = (0..run.pieces[site])
             .into_par_iter()
             .map(|piece| {
-                let law = &laws[site][piece];
+                let switch = &switches[site][piece];
                 let y = run.labels(site, piece, eval.0, eval.1, 1);
-                let x = run.rows(&law.features, eval.0, eval.1, 1);
+                let x = run.rows(&switch.features, eval.0, eval.1, 1);
                 let base = gates::base(&run.labels(site, piece, train.0, train.1, 1));
-                let on: Vec<usize> = (0..n_eval).filter(|t| law.on(&x.row(*t).to_vec())).collect();
-                (law.label_bits(x.view(), &y), base.label_bits(Array2::<f64>::zeros((n_eval, 0)).view(), &y), on)
+                let on: Vec<usize> = (0..n_eval).filter(|t| switch.on(&x.row(*t).to_vec())).collect();
+                (switch.label_bits(x.view(), &y), base.label_bits(Array2::<f64>::zeros((n_eval, 0)).view(), &y), on)
             })
             .collect();
         for (piece, (lb, bb, on)) in per.into_iter().enumerate() {
-            law_bits_eval += lb;
+            listing_eval += lb;
             base_bits_eval += bb;
             for t in on {
                 decisions[t].push(offset + piece);
             }
-            let law = &laws[site][piece];
-            law_bits += law.law_bits;
-            let kind = if law.features.is_empty() {
-                if law.beta > 0.0 { "base on".to_string() } else { "base off".to_string() }
+            let switch = &switches[site][piece];
+            function_bits += switch.function_bits;
+            let kind = if switch.features.is_empty() {
+                if switch.beta > 0.0 { "base on".to_string() } else { "base off".to_string() }
             } else {
-                format!("{} features, {} units", law.features.len(), law.units.len())
+                format!("{} features, {} units", switch.features.len(), switch.units.len())
             };
             *kinds.entry(kind).or_default() += 1;
-            for f in &law.features {
+            for f in &switch.features {
                 needed.insert((f.site, f.piece));
             }
-            law_madds += law.multiply_adds();
+            switch_madds += switch.multiply_adds();
         }
         offset += run.pieces[site];
     }
@@ -388,18 +387,18 @@ fn score(run: &Run, laws: &[Vec<Law>], train: (usize, usize), eval: (usize, usiz
     let report = json!({
         "eval_tokens": n_eval,
         "bits_per_token": {
-            "laws": law_bits_eval / n_eval as f64,
+            "switches": listing_eval / n_eval as f64,
             "base_rates": base_bits_eval / n_eval as f64,
             "context_coder": context_bits / n_eval as f64,
         },
-        "law_bits_total": law_bits,
+        "function_bits_total": function_bits,
         "kinds": kinds,
-        "l0_laws": l0,
+        "l0_switches": l0,
         "l0_given": given_l0,
         "multiply_adds_per_token": {
             "amplitudes_read": amplitude_madds,
-            "laws": law_madds,
-            "total": amplitude_madds + law_madds,
+            "switches": switch_madds,
+            "total": amplitude_madds + switch_madds,
             "every_amplitude": every_amplitude,
         },
         "amplitudes_read": needed.len(),
@@ -439,7 +438,7 @@ fn main() -> Result<(), String> {
         .map(|n| program_sites.iter().position(|s| &s.name == n).ok_or_else(|| format!("site {n} is not in the export")))
         .collect::<Result<_, _>>()?;
     let ordered: Vec<_> = order.iter().map(|i| program_sites[*i].clone()).collect();
-    let upstream = gates::upstream(&ordered);
+    let upstream = gates::upstream(&imported.program, &ordered);
     let widths = ordered.iter().map(|s| matrix(&imported.program, s).map(|w| w.ncols())).collect::<Result<Vec<_>, _>>()?;
     drop(imported);
     let amps = Amplitudes::open(&amps_dir, &names, &pieces)?;
@@ -471,12 +470,12 @@ fn main() -> Result<(), String> {
         eval.1
     );
 
-    let write = |stage: &str, laws: &[Vec<Law>], report: &mut serde_json::Value| -> Result<(), String> {
-        let (scored, indptr, indices) = score(&run, laws, train, eval);
+    let write = |stage: &str, switches: &[Vec<Switch>], report: &mut serde_json::Value| -> Result<(), String> {
+        let (scored, indptr, indices) = score(&run, switches, train, eval);
         report[stage] = scored;
         std::fs::write(out.with_extension("json"), serde_json::to_string_pretty(report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        let sites_json: Vec<_> = run.names.iter().zip(laws).map(|(n, l)| json!({"name": n, "laws": l})).collect();
-        std::fs::write(out.with_extension("laws.json"), serde_json::to_string(&sites_json).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        let sites_json: Vec<_> = run.names.iter().zip(switches).map(|(n, l)| json!({"name": n, "switches": l})).collect();
+        std::fs::write(out.with_extension("switches.json"), serde_json::to_string(&sites_json).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         write_npy_i64(&out.with_extension("sets.indptr.npy"), &indptr)?;
         write_npy_i64(&out.with_extension("sets.indices.npy"), &indices)?;
         eprintln!("{stage}: {}", report[stage]);
@@ -484,16 +483,16 @@ fn main() -> Result<(), String> {
     };
     let mut report = json!({"train": args[5], "eval": args[6], "sites": run.names});
     let started = std::time::Instant::now();
-    let mut laws: Vec<Vec<Law>> = Vec::new();
+    let mut switches: Vec<Vec<Switch>> = Vec::new();
     for site in 0..run.names.len() {
-        laws.push(first_pass(&run, site, train));
+        switches.push(first_pass(&run, site, train));
         eprintln!("first pass {} ({:.0}s)", run.names[site], started.elapsed().as_secs_f64());
     }
-    write("own_amplitude", &laws, &mut report)?;
+    write("own_amplitude", &switches, &mut report)?;
     for site in 0..run.names.len() {
-        let kept = screening(&run, site, &mut laws[site], train)?;
+        let kept = screening(&run, site, &mut switches[site], train)?;
         eprintln!("screening {}: {kept} features kept ({:.0}s)", run.names[site], started.elapsed().as_secs_f64());
     }
-    write("screened", &laws, &mut report)?;
+    write("screened", &switches, &mut report)?;
     Ok(())
 }

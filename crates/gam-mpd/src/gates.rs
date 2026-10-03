@@ -1,56 +1,67 @@
-//! Gate laws (#2951): which subcomponents are on for an input, said by a small program over the
-//! model's own amplitudes instead of a search or a separate importance network.
+//! Switching functions (#2951): which subcomponents are on for an input, computed by a small
+//! formula over the model's own upstream amplitudes instead of a search or a separate importance
+//! network. Its bits are part of the one total description length: the switching function's own
+//! bits plus the per-word listing of what it gets wrong.
 //!
-//! # The law
+//! # The switching function
 //!
 //! A subcomponent `j` reads the amplitude `a_j = v_jᵀx` of its site's input `x`, and `x` is exactly a
 //! sum of upstream contributions, so `a_j` is itself an exact contraction `ℓᵀa_up` of the upstream
-//! amplitudes (given the norm scales and gates the forward computes). Its gate law is a logit over a
-//! few features `f` (amplitudes `a_k` of chosen subcomponents at this input, lag 0, or at the previous
-//! input of the sequence, lag 1; its own `a_j` first):
+//! amplitudes (given the norm scales and gates the forward computes). Its switching function is a
+//! logit over a few features `f`: its own `a_j` first, then amplitudes `a_k` of upstream
+//! subcomponents at this position (lag 0) or at the previous position (lag 1). Only what the native
+//! forward has computed when `j` runs is allowed ([`upstream`]): a site's amplitudes at this position
+//! when the site precedes `j`'s read, and at the previous position only through an attention step
+//! between them. Nothing downstream or in the future is read, so the switching functions are a
+//! causal circuit, not an analyser:
 //!
 //! ```text
 //!   ĝ_j(f) = β + ℓᵀf + Σ_{u<r} c_u GELU(w_uᵀf + d_u),     P(j on | f) = σ(ĝ_j(f)),
 //! ```
 //!
-//! and the law says "on" exactly when `ĝ_j(f) > 0`. With no features and no units it is the base
-//! rate. Nothing about the law's size is fixed: the features, the number of units `r` and the
-//! precision of every coefficient are chosen by the code below.
+//! and `j` is on exactly when `ĝ_j(f) > 0`. With no features and no units it is the base rate.
+//! Nothing about its size is fixed: the features, the number of units `r` and the precision of
+//! every coefficient are chosen by the code below.
 //!
 //! # The code
 //!
-//! A law is sent as `L_int(d + 1)`, the feature subset (its bits given by the caller, who knows the
-//! pool it was chosen from), `L_int(r + 1)`, a dyadic precision `p` (signed prefix integer) and every
-//! coefficient as the signed prefix integer `round(θ·2^p)`. The data are then the on/off labels at
-//! the training inputs under the decoded law, `−Σ log₂ P(y | f)`. A law is the one with the fewest
-//! total bits, measured with the coefficients the decoder rebuilds, so a coefficient's precision is
-//! paid for exactly as far as the labels repay it.
+//! A switching function is sent as `L_int(d + 1)`, the feature subset (its bits given by the
+//! caller, who knows the pool it was chosen from), `L_int(r + 1)`, a dyadic precision `p` (signed
+//! prefix integer) and every coefficient as the signed prefix integer `round(θ·2^p)`
+//! ([`Switch::function_bits`]). The per-word listing then sends the on/off labels at the inputs
+//! under the decoded function, `−Σ log₂ P(y | f)` ([`Switch::listing_bits`]). The chosen function is
+//! the one with the fewest total bits, measured with the coefficients the decoder rebuilds, so a
+//! coefficient's precision is paid for exactly as far as the listing repays it. A group of
+//! subcomponents doing many unrelated jobs needs a long switching function; [`best`] prices a
+//! candidate group's on-labels so the one total can prefer splitting it.
 //!
 //! # The fit
 //!
 //! Maximum likelihood by Levenberg–Marquardt on the Gauss–Newton (Fisher) matrix of the logistic
 //! likelihood, which is exact for the logit's linear part. The ladder starts from the base rate
-//! (Krichevsky–Trofimov, closed form), fits the linear law, then adds one unit at a time, each
+//! (Krichevsky–Trofimov, closed form), fits the linear function, then adds one unit at a time, each
 //! started where it is worth most: among hinges along each feature (both signs) at the quantiles of
 //! the on-inputs' and of all inputs' feature values, the one with the largest Rao score
 //! `s²/I` (`s`, `I` the likelihood's gradient and information in the new unit's output weight at
 //! zero), its weight at the one-dimensional Newton step `−s/I`. The ladder stops at the first unit
-//! that does not lower the total. A fit stops when an accepted step gains less than a thousandth of
-//! a bit: the code is compared in bits, and coefficients are then rounded far coarser than that.
+//! that does not lower the total. A fit stops when the undamped Gauss–Newton step promises less
+//! than a thousandth of a bit: the code is compared in bits, and coefficients are then rounded far
+//! coarser than that.
 //!
-//! [`screen`] proposes features from a pool by the same score: per candidate `k` and law `j`, the
-//! predicted bits of adding `a_k` linearly, `(Σ_t r_tj a_tk)² / (2 ln 2 Σ_t w_tj a_tk²)` with `r` the
-//! residual `y − p` and `w = p(1 − p)`. It only proposes (its products may run in f32 on the
-//! device); the refitted law's exact total decides.
+//! [`screen`] proposes features from a pool by the same score: per candidate `k` and function `j`,
+//! the predicted bits of adding `a_k` linearly, `(Σ_t r_tj a_tk)² / (2 ln 2 Σ_t w_tj a_tk²)` with `r`
+//! the residual `y − p` and `w = p(1 − p)`. It only proposes (its products may run in f32 on the
+//! device); the refitted function's exact total decides.
 
 use super::codec::{prefix_integer_len_bits, signed_prefix_integer_len_bits};
 use super::device::{product_atb, proposing};
 use super::masked::Site;
+use super::operator_program::{Node, OperatorProgram};
 use ndarray::{Array1, Array2, ArrayView2};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
-/// One feature of a law: the amplitude of subcomponent `piece` of site `site` at this input (`lag`
+/// One feature of a switching function: the amplitude of subcomponent `piece` of site `site` at this input (`lag`
 /// 0) or at the previous input of the sequence (`lag` 1, zero at a sequence's first input).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Feature {
@@ -67,27 +78,27 @@ pub struct Unit {
     pub c: f64,
 }
 
-/// A decoded gate law (module note) with its code lengths on its training inputs.
+/// A decoded switching function (module note) with its code lengths on its training inputs.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Law {
+pub struct Switch {
     pub features: Vec<Feature>,
     pub beta: f64,
     pub linear: Vec<f64>,
     pub units: Vec<Unit>,
     /// The dyadic precision `p`: every coefficient is an integer multiple of `2^-p`.
     pub precision: i32,
-    /// The law's own bits: structure, precision and coefficients.
-    pub law_bits: f64,
-    /// The training labels' bits under the law.
-    pub data_bits: f64,
+    /// The switching function's own bits: structure, precision and coefficients.
+    pub function_bits: f64,
+    /// The per-word listing of the training labels under the function.
+    pub listing_bits: f64,
 }
 
-impl Law {
+impl Switch {
     pub fn total_bits(&self) -> f64 {
-        self.law_bits + self.data_bits
+        self.function_bits + self.listing_bits
     }
 
-    /// The logit at feature values `f` (in the law's feature order).
+    /// The logit at feature values `f` (in the switch's feature order).
     pub fn logit(&self, f: &[f64]) -> f64 {
         let mut g = self.beta + dot(&self.linear, f);
         for u in &self.units {
@@ -96,18 +107,18 @@ impl Law {
         g
     }
 
-    /// Whether the law says the subcomponent is on.
+    /// Whether the switch says the subcomponent is on.
     pub fn on(&self, f: &[f64]) -> bool {
         self.logit(f) > 0.0
     }
 
-    /// Multiply–adds per input to evaluate the law (a unit's GELU counted as one).
+    /// Multiply–adds per input to evaluate the switch (a unit's GELU counted as one).
     pub fn multiply_adds(&self) -> usize {
         let d = self.features.len();
         d + self.units.len() * (d + 2)
     }
 
-    /// The law's bits for labels `y` at feature rows `x` (`n × d`).
+    /// The switch's bits for labels `y` at feature rows `x` (`n × d`).
     pub fn label_bits(&self, x: ArrayView2<f64>, y: &[bool]) -> f64 {
         let data = row_major(x);
         let d = x.ncols();
@@ -161,7 +172,7 @@ fn count_bits(value: usize) -> f64 {
     prefix_integer_len_bits(value as u64 + 1).map_or(f64::INFINITY, |b| b as f64)
 }
 
-/// The parameter vector `[β, ℓ (d), per unit (w (d), d_u, c_u)]` of a law with `d` features.
+/// The parameter vector `[β, ℓ (d), per unit (w (d), d_u, c_u)]` of a switch with `d` features.
 #[derive(Clone, Debug)]
 struct Params {
     d: usize,
@@ -328,9 +339,9 @@ fn optimise(params: &mut Params, x: &[f64], y: &[bool]) -> f64 {
     nll
 }
 
-/// The law these parameters give at the precision that minimises the total code, the coefficient
+/// The switch these parameters give at the precision that minimises the total code, the coefficient
 /// bits counted exactly and the labels' bits measured under the decoded coefficients.
-fn encode(params: &Params, x: &[f64], y: &[bool], features: &[Feature], structure_bits: f64) -> Law {
+fn encode(params: &Params, x: &[f64], y: &[bool], features: &[Feature], structure_bits: f64) -> Switch {
     let (_, fisher) = params.derivatives(x, y);
     let p = params.theta.len();
     let header = count_bits(params.d) + structure_bits + count_bits(params.units());
@@ -357,24 +368,24 @@ fn encode(params: &Params, x: &[f64], y: &[bool], features: &[Feature], structur
         })
         .collect();
     ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut best: Option<Law> = None;
+    let mut best: Option<Switch> = None;
     for &(_, prec) in ranked.iter().take(3) {
         let scale = (prec as f64).exp2();
         let ints: Vec<i64> = params.theta.iter().map(|t| (t * scale).round() as i64).collect();
         let decoded = Params { d: params.d, theta: ints.iter().map(|k| *k as f64 / scale).collect() };
-        let law_bits = header + ints.iter().map(|k| int_bits(*k)).sum::<f64>() + int_bits(prec as i64);
-        let law = to_law(&decoded, features, prec, law_bits, decoded.nll(x, y) / std::f64::consts::LN_2);
-        if best.as_ref().is_none_or(|b| law.total_bits() < b.total_bits()) {
-            best = Some(law);
+        let function_bits = header + ints.iter().map(|k| int_bits(*k)).sum::<f64>() + int_bits(prec as i64);
+        let switch = to_switch(&decoded, features, prec, function_bits, decoded.nll(x, y) / std::f64::consts::LN_2);
+        if best.as_ref().is_none_or(|b| switch.total_bits() < b.total_bits()) {
+            best = Some(switch);
         }
     }
-    best.unwrap_or_else(|| to_law(params, features, 0, f64::INFINITY, f64::INFINITY))
+    best.unwrap_or_else(|| to_switch(params, features, 0, f64::INFINITY, f64::INFINITY))
 }
 
-fn to_law(params: &Params, features: &[Feature], precision: i32, law_bits: f64, data_bits: f64) -> Law {
+fn to_switch(params: &Params, features: &[Feature], precision: i32, function_bits: f64, listing_bits: f64) -> Switch {
     let d = params.d;
     let t = &params.theta;
-    Law {
+    Switch {
         features: features.to_vec(),
         beta: t[0],
         linear: t[1..1 + d].to_vec(),
@@ -385,47 +396,60 @@ fn to_law(params: &Params, features: &[Feature], precision: i32, law_bits: f64, 
             })
             .collect(),
         precision,
-        law_bits,
-        data_bits,
+        function_bits,
+        listing_bits,
     }
 }
 
-fn from_law(law: &Law) -> Params {
-    let mut theta = vec![law.beta];
-    theta.extend_from_slice(&law.linear);
-    for u in &law.units {
+fn from_switch(switch: &Switch) -> Params {
+    let mut theta = vec![switch.beta];
+    theta.extend_from_slice(&switch.linear);
+    for u in &switch.units {
         theta.extend_from_slice(&u.w);
         theta.push(u.d);
         theta.push(u.c);
     }
-    Params { d: law.features.len(), theta }
+    Params { d: switch.features.len(), theta }
 }
 
-/// The base-rate law: the Krichevsky–Trofimov rate of the training labels.
-pub fn base(y: &[bool]) -> Law {
+/// The base-rate switch: the Krichevsky–Trofimov rate of the training labels.
+pub fn base(y: &[bool]) -> Switch {
     let on = y.iter().filter(|v| **v).count() as f64;
     let rate = (on + 0.5) / (y.len() as f64 + 1.0);
     let params = Params { d: 0, theta: vec![(rate / (1.0 - rate)).ln()] };
     encode(&params, &[], y, &[], 0.0)
 }
 
-/// The fewest bits any law with features can take: its header and at least one bit for each of
+/// The fewest bits any switch with features can take: its header and at least one bit for each of
 /// its precision and its three coefficients.
 pub fn least_featured_bits(structure_bits: f64) -> f64 {
     count_bits(1) + structure_bits + count_bits(0) + 4.0
 }
 
-/// The best law over feature rows `x` (`n × d`, columns in the order of `features`) for labels `y`,
-/// `structure_bits` the code of the feature subset: the linear law, then one unit more at a time
-/// while the total falls (module note). `start` (a law over the first `d − 1` of these features,
+/// The best switching function for on-labels `y` (a subcomponent's, or a candidate group's) over
+/// feature rows `x` (`n × d`, columns in the order of `features`), `structure_bits` the code of the
+/// feature subset: the cheaper of the base rate and [`fit`]. Its `total_bits()` (function plus
+/// per-word listing) is what the labels cost in the one total.
+pub fn best(x: ArrayView2<f64>, y: &[bool], features: &[Feature], structure_bits: f64) -> Switch {
+    let rate = base(y);
+    if features.is_empty() || rate.total_bits() <= least_featured_bits(structure_bits) {
+        return rate;
+    }
+    let fitted = fit(x, y, features, structure_bits, None);
+    if fitted.total_bits() < rate.total_bits() { fitted } else { rate }
+}
+
+/// The best switch over feature rows `x` (`n × d`, columns in the order of `features`) for labels `y`,
+/// `structure_bits` the code of the feature subset: the linear switch, then one unit more at a time
+/// while the total falls (module note). `start` (a switch over the first `d − 1` of these features,
 /// or over all of them) warm-starts the ladder.
-pub fn fit(x: ArrayView2<f64>, y: &[bool], features: &[Feature], structure_bits: f64, start: Option<&Law>) -> Law {
+pub fn fit(x: ArrayView2<f64>, y: &[bool], features: &[Feature], structure_bits: f64, start: Option<&Switch>) -> Switch {
     let d = features.len();
     let data = row_major(x);
     let x: &[f64] = &data;
     let mut params = match start {
-        Some(law) => {
-            let mut p = from_law(law);
+        Some(switch) => {
+            let mut p = from_switch(switch);
             if p.d + 1 == d {
                 p = widen(&p);
             }
@@ -443,9 +467,9 @@ pub fn fit(x: ArrayView2<f64>, y: &[bool], features: &[Feature], structure_bits:
     loop {
         let Some(mut grown) = add_unit(&params, x, y) else { break };
         optimise(&mut grown, x, y);
-        let law = encode(&grown, x, y, features, structure_bits);
-        if law.total_bits() < best.total_bits() {
-            best = law;
+        let switch = encode(&grown, x, y, features, structure_bits);
+        if switch.total_bits() < best.total_bits() {
+            best = switch;
             params = grown;
         } else {
             break;
@@ -524,8 +548,8 @@ fn add_unit(p: &Params, x: &[f64], y: &[bool]) -> Option<Params> {
     Some(Params { d, theta })
 }
 
-/// The predicted bits of adding each candidate feature linearly to each law (module note):
-/// `candidates` is `n × K`, `residuals` and `weights` are `n × J` (`y − p` and `p(1 − p)` per law
+/// The predicted bits of adding each candidate feature linearly to each switch (module note):
+/// `candidates` is `n × K`, `residuals` and `weights` are `n × J` (`y − p` and `p(1 − p)` per switch
 /// at the same inputs); returns `K × J`. A proposal: its products may run in f32 on the device.
 pub fn screen(candidates: &Array2<f64>, residuals: &Array2<f64>, weights: &Array2<f64>) -> Result<Array2<f64>, String> {
     let squares = candidates.mapv(|v| v * v);
@@ -539,61 +563,59 @@ pub fn screen(candidates: &Array2<f64>, residuals: &Array2<f64>, weights: &Array
     Ok(gains)
 }
 
-/// Per site, the sites upstream of it in the program (their every written node precedes its first
-/// read node), so their amplitudes at an input are computed before its own.
-pub fn upstream(sites: &[Site]) -> Vec<Vec<usize>> {
+/// The sites whose amplitudes a site's switching functions may read (module note).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Upstream {
+    /// At the same position: every written node precedes the site's first read node.
+    pub here: Vec<usize>,
+    /// At the previous position: an attention step lies after every written node and at or before
+    /// the site's first read node, so the previous position reaches it only through attention.
+    pub before: Vec<usize>,
+}
+
+/// Per site, its [`Upstream`] sites in `program` (nodes in topological order).
+pub fn upstream(program: &OperatorProgram, sites: &[Site]) -> Vec<Upstream> {
+    let mixing: Vec<usize> =
+        program.nodes.iter().enumerate().filter(|(_, n)| matches!(n, Node::Attend { .. } | Node::Mix { .. })).map(|(i, _)| i).collect();
     sites
         .iter()
         .map(|b| {
             let first_read = b.reads.iter().min().copied().unwrap_or(0);
-            sites.iter().enumerate().filter(|(_, a)| a.writes.iter().all(|w| *w < first_read)).map(|(i, _)| i).collect()
+            let last_write = |a: &Site| a.writes.iter().max().copied().unwrap_or(usize::MAX);
+            let here = sites.iter().enumerate().filter(|(_, a)| last_write(a) < first_read).map(|(i, _)| i).collect();
+            let before = sites
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| mixing.iter().any(|m| last_write(a) < *m && *m <= first_read))
+                .map(|(i, _)| i)
+                .collect();
+            Upstream { here, before }
         })
         .collect()
 }
 
-/// The `n × d` feature rows of `features` from per-site amplitudes (`amplitudes[site]` is
-/// `pieces × n`, one subcomponent's amplitudes over the inputs contiguous) and each input's previous
-/// input in its sequence.
-pub fn feature_rows(features: &[Feature], amplitude: impl Fn(usize, usize) -> Array1<f64>, previous: &[Option<usize>]) -> Array2<f64> {
-    let n = previous.len();
-    let mut x = Array2::<f64>::zeros((n, features.len()));
-    for (k, f) in features.iter().enumerate() {
-        let a = amplitude(f.site, f.piece);
-        let mut column = x.column_mut(k);
-        match f.lag {
-            0 => column.assign(&a),
-            _ => {
-                for t in 0..n {
-                    column[t] = previous[t].map_or(0.0, |p| a[p]);
-                }
-            }
-        }
-    }
-    x
-}
-
-/// A law's decisions over feature rows, as a column of 0/1.
-pub fn decisions(law: &Law, x: ArrayView2<f64>) -> Array1<f64> {
+/// A switch's decisions over feature rows, as a column of 0/1.
+pub fn decisions(switch: &Switch, x: ArrayView2<f64>) -> Array1<f64> {
     let data = row_major(x);
     let d = x.ncols();
-    (0..x.nrows()).map(|t| if law.on(&data[t * d..(t + 1) * d]) { 1.0 } else { 0.0 }).collect()
+    (0..x.nrows()).map(|t| if switch.on(&data[t * d..(t + 1) * d]) { 1.0 } else { 0.0 }).collect()
 }
 
-/// The sets the laws choose (`laws[site][piece]`), as per-site 0/1 masks (`rows × pieces`), from
+/// The sets the switches choose (`switches[site][piece]`), as per-site 0/1 masks (`rows × pieces`), from
 /// every site's amplitudes on the clean forward (`amplitudes[site]` is `rows × pieces`) and each
 /// row's previous row in its sequence.
-pub fn masks(laws: &[Vec<Law>], amplitudes: &[Array2<f64>], previous: &[Option<usize>]) -> Vec<Array2<f64>> {
-    laws.iter()
-        .map(|site_laws| {
-            let mut m = Array2::<f64>::zeros((previous.len(), site_laws.len()));
-            for (piece, law) in site_laws.iter().enumerate() {
-                let mut f = vec![0.0; law.features.len()];
+pub fn masks(switches: &[Vec<Switch>], amplitudes: &[Array2<f64>], previous: &[Option<usize>]) -> Vec<Array2<f64>> {
+    switches.iter()
+        .map(|site_switches| {
+            let mut m = Array2::<f64>::zeros((previous.len(), site_switches.len()));
+            for (piece, switch) in site_switches.iter().enumerate() {
+                let mut f = vec![0.0; switch.features.len()];
                 for (r, prev) in previous.iter().enumerate() {
-                    for (k, feature) in law.features.iter().enumerate() {
+                    for (k, feature) in switch.features.iter().enumerate() {
                         let row = if feature.lag == 0 { Some(r) } else { *prev };
                         f[k] = row.map_or(0.0, |row| amplitudes[feature.site][[row, feature.piece]]);
                     }
-                    if law.on(&f) {
+                    if switch.on(&f) {
                         m[[r, piece]] = 1.0;
                     }
                 }

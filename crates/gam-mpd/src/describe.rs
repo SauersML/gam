@@ -2,7 +2,7 @@
 //! writers are named in a chart the decoder already holds and its core by its own structure, so a
 //! block that does one simple thing costs what it takes to say that thing, not what its rank says.
 //!
-//! A block is the map `W` (`d_out × d_in`) of some of a site's columns. A description writes it
+//! A block is the map `W = uᵀ v` (`d_out × d_in`) of some of a site's columns. A description writes
 //!
 //! ```text
 //! W ≈ P_S K Q_Tᵀ
@@ -12,21 +12,24 @@
 //! block is decoded, `S` and `T` subsets of their column groups and `K` the core. The charts:
 //!
 //! * **Identity.** The side's own coordinates, every column taken: the generic block.
-//! * **Harmonic** ([`Chart::harmonic`]). A side the network indexes by an ordered label, through a
-//!   token map `T` (`p × d`) the decoder holds: the embedding's operand rows on a residual read, the
-//!   unembedding on a residual write, or either carried through decoded linear maps. Group `f` is
-//!   the pair of directions `T⁺ cos(2πf·/p)`, `T⁺ sin(2πf·/p)` (the constant alone at `f = 0`), so
-//!   a reader whose token profile is one frequency is two numbers, not `d`.
-//! * **Frame** ([`Chart::frame`]). Another, already decoded block's opposite side: a block reading
-//!   what another writes is its core.
+//! * **Coordinates** ([`Chart::coordinates`]). The side's coordinates in the groups its interface
+//!   declares (attention heads, rotary planes): a block living on a few groups names them.
+//! * **Harmonic** ([`Chart::harmonic`]). A side whose values the decoder holds on rows carrying
+//!   labels in `Z_p^m`: a site's reads on the declared input family (decoded upstream, run on the
+//!   family the contract declares), or a token map such as the unembedding on a residual write.
+//!   Group `f` is the pair of directions `X⁺ cos 2π⟨f, t⟩/p`, `X⁺ sin 2π⟨f, t⟩/p`, so a reader whose
+//!   profile over the inputs is one character is two numbers, not `d`.
+//! * **Frames** ([`Chart::frames`], [`Chart::frame`]). Already decoded blocks' sides: a block that
+//!   reads what another writes names it and sends only its core.
 //!
 //! Cores: generic rank `r` (`r (s + t − r)` reals, `K = A Bᵀ` with `B` the identity on `r` pivot
 //! rows), or linear in a few reals when the two sides' chosen groups pair one to one (the pairing
 //! sent in `log₂ g!` bits): rotation-scaling `[[a, −b], [b, a]]` (or the reflection
 //! `[[a, b], [b, −a]]`, a bit a plane) per pair of two-column groups, or diagonal (one real per
-//! paired column). When the site reads and writes one
-//! interface, the same-subspace family `W ≈ Q K Qᵀ` codes the frame `Q` once (`r (d − r)` reals, the
-//! identity on `r` pivot rows) and the `r × r` core.
+//! paired column). When the site reads and writes one interface, the same-subspace family writes
+//! `W ≈ L⁺ P R Pᵀ L` in the reads' own metric (`L` the root of their second moment): the frame
+//! once (`r (d − r)` reals) and the `r × r` core generic, symmetric, isotropic or, on a plane, a
+//! rotation-scaling.
 //!
 //! Every real is sent on a dyadic lattice (`2^-p`, [`super::precision`], one `p` per factor) in the
 //! signed Elias δ code ([`super::codec::signed_delta_len_bits`], under which splitting a real into
@@ -34,19 +37,20 @@
 //! prefix integer and enumerative codes. The decoded map's error is charged at its KL to second
 //! order in the site's Kronecker Fisher, `n ½ tr(F ΔW C ΔWᵀ) / ln 2` bits ([`Metric`]), so the
 //! precision of every factor and the choice of family are both the minimum of one total: description
-//! bits plus that error. A structured family is taken only when it lowers that total.
+//! bits plus that error. A structured family is taken only when it lowers that total. Everything is
+//! computed on the block's factors, so a description costs `O(d² r)` on a `d`-wide site.
 
 use super::codec::{fixed_index_len_bits, prefix_integer_len_bits, signed_delta_len_bits, subset_code_len_bits};
-use super::dense::{eigh, svd};
+use super::dense::{eigh, solve, svd};
 use gam_linalg::roundoff::SymmetricAssembly;
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
 
-/// The second-order price of a block's error: `n ½ tr(F ΔW C ΔWᵀ) / ln 2` bits, `C` the covariance
-/// of the site's reads (the library reads `x − μ`), `F` the Fisher of its written value, `n` the
-/// observations the block's error is paid on.
+/// The second-order price of a block's error: `n ½ tr(F ΔW C ΔWᵀ) / ln 2` bits, `C` the second
+/// moment of the site's reads (the masked program reads them uncentred), `F` the Fisher of its
+/// written value, `n` the observations the block's error is paid on.
 #[derive(Clone, Debug)]
 pub struct Metric {
-    pub covariance: Array2<f64>,
+    pub moment: Array2<f64>,
     pub fisher: Array2<f64>,
     pub observations: f64,
 }
@@ -54,9 +58,7 @@ pub struct Metric {
 impl Metric {
     /// The metric of a site from its measured statistics ([`super::masked::site_statistics`]).
     pub fn of(site: &super::pieces::Site, observations: f64) -> Self {
-        let m = &site.mean;
-        let outer = m.view().insert_axis(Axis(1)).dot(&m.view().insert_axis(Axis(0)));
-        Self { covariance: symmetric(&(&site.second_moment - &outer)), fisher: symmetric(&site.fisher), observations }
+        Self { moment: symmetric(&site.second_moment), fisher: symmetric(&site.fisher), observations }
     }
 
     /// Bits per unit of the whitened squared error `tr(F ΔW C ΔWᵀ)`.
@@ -331,41 +333,76 @@ fn exponent_bits(p: i32) -> f64 {
     integer_bits(i64::from(p))
 }
 
-/// What a block's description is fitted against on one choice of charts: `w2 = tr(F W C Wᵀ)`,
-/// `H = Pᵀ F W C Q`, `G_p = Pᵀ F P`, `G_q = Qᵀ C Q`, so a core `K` leaves the whitened squared
-/// error `w2 − 2⟨K, H⟩ + tr(G_p K G_q Kᵀ)`.
+/// What a block's description is fitted against on one choice of charts: the block's
+/// `H = Pᵀ F W C Q = H_l H_rᵀ`, `G_p = Pᵀ F P`, `G_q = Qᵀ C Q` and their pseudo-inverse roots, so a
+/// core `K` leaves the whitened squared error `w2 − 2⟨K, H⟩ + tr(G_p K G_q Kᵀ)`.
 struct Sides {
     p: Array2<f64>,
     q: Array2<f64>,
+    hl: Array2<f64>,
+    hr: Array2<f64>,
     h: Array2<f64>,
     gp: Array2<f64>,
     gq: Array2<f64>,
+    rp: Array2<f64>,
+    rq: Array2<f64>,
 }
 
-/// The block's products every choice of charts reuses.
+/// The block's factored products every choice of charts reuses: `F uᵀ`, `C vᵀ`, `u F uᵀ`,
+/// `v C vᵀ` and `w2 = tr(F W C Wᵀ) = tr[(u F uᵀ)(v C vᵀ)]`.
 struct Block<'a> {
     metric: &'a Metric,
-    fwc: Array2<f64>,
+    fu: Array2<f64>,
+    cv: Array2<f64>,
+    gu: Array2<f64>,
+    gv: Array2<f64>,
     w2: f64,
 }
 
 impl<'a> Block<'a> {
-    fn new(w: &Array2<f64>, metric: &'a Metric) -> Self {
-        let fwc = metric.fisher.dot(w).dot(&metric.covariance);
-        let w2 = (&fwc * w).sum();
-        Self { metric, fwc, w2 }
+    fn new(u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>, metric: &'a Metric) -> Self {
+        let fu = metric.fisher.dot(&u.t());
+        let cv = metric.moment.dot(&v.t());
+        let gu = symmetric(&u.dot(&fu));
+        let gv = symmetric(&v.dot(&cv));
+        let w2 = (&gu * &gv).sum();
+        Self { metric, fu, cv, gu, gv, w2 }
     }
 
-    fn sides(&self, p: Array2<f64>, q: Array2<f64>) -> Sides {
-        let h = p.t().dot(&self.fwc).dot(&q);
+    /// The sides of a choice of groups of two prepared charts.
+    fn sides(&self, writer: &Prepared, wg: &[usize], reader: &Prepared, rg: &[usize]) -> Result<Sides, String> {
+        let side = |chart: &Prepared, groups: &[usize], factor: &Array2<f64>, metric: &Array2<f64>| -> Result<_, String> {
+            if chart.identity {
+                let d = metric.nrows();
+                let root = chart.root.clone().ok_or("an identity chart without its root")?;
+                Ok((Array2::<f64>::eye(d), factor.clone(), metric.clone(), root))
+            } else {
+                let x = chart.chart.columns(groups);
+                let g = symmetric(&x.t().dot(metric).dot(&x));
+                let root = inverses(&g)?.1;
+                Ok((x.clone(), x.t().dot(factor), g, root))
+            }
+        };
+        let (p, hl, gp, rp) = side(writer, wg, &self.fu, &self.metric.fisher)?;
+        let (q, hr, gq, rq) = side(reader, rg, &self.cv, &self.metric.moment)?;
+        let h = hl.dot(&hr.t());
+        Ok(Sides { p, q, hl, hr, h, gp, gq, rp, rq })
+    }
+
+    /// The sides of two explicit bases.
+    fn sides_of(&self, p: Array2<f64>, q: Array2<f64>) -> Result<Sides, String> {
+        let hl = p.t().dot(&self.fu);
+        let hr = q.t().dot(&self.cv);
         let gp = symmetric(&p.t().dot(&self.metric.fisher).dot(&p));
-        let gq = symmetric(&q.t().dot(&self.metric.covariance).dot(&q));
-        Sides { p, q, h, gp, gq }
+        let gq = symmetric(&q.t().dot(&self.metric.moment).dot(&q));
+        let (rp, rq) = (inverses(&gp)?.1, inverses(&gq)?.1);
+        let h = hl.dot(&hr.t());
+        Ok(Sides { p, q, hl, hr, h, gp, gq, rp, rq })
     }
 
     /// The KL bits of the factored core `K = A Bᵀ`.
     fn error_factored(&self, sides: &Sides, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
-        let cross = (a.t().dot(&sides.h) * b.t()).sum();
+        let cross = (a.t().dot(&sides.hl) * b.t().dot(&sides.hr)).sum();
         let quad = (a.t().dot(&sides.gp).dot(a) * b.t().dot(&sides.gq).dot(b)).sum();
         (self.w2 - 2.0 * cross + quad).max(0.0) * self.metric.scale()
     }
@@ -430,39 +467,44 @@ impl Coded {
     }
 }
 
-/// The generic cores of rank `1..=max_rank` on `sides`, each fitted in the metric (the truncated
-/// whitened `H`) and coded in the pivot chart, its two exponents the minimum of bits plus error by
-/// coordinate descent.
+/// The generic cores of rank `1..=max_rank` on `sides`, each the metric's best (the whitened
+/// `M = G_p^{+1/2} H G_q^{+1/2} = A Bᵀ` truncated, its singular pairs from the `r × r` core
+/// `G_a^{1/2} G_b G_a^{1/2}` of `A`'s and `B`'s Grams) and coded in the pivot chart, its two
+/// exponents the minimum of bits plus error by coordinate descent.
 fn generic_cores(block: &Block<'_>, sides: &Sides, max_rank: usize) -> Result<Vec<Coded>, String> {
-    let (_, rp) = inverses(&sides.gp)?;
-    let (_, rq) = inverses(&sides.gq)?;
-    let m = rp.dot(&sides.h).dot(&rq);
-    let decomposed = svd(m.view(), false).map_err(|e| format!("{e:?}"))?;
-    let resolved = decomposed.singular_values.iter().filter(|v| **v > decomposed.band).count();
+    let a = sides.rp.dot(&sides.hl);
+    let b = sides.rq.dot(&sides.hr);
+    let (half, inverse_half) = roots(&a.t().dot(&a))?;
+    let core = symmetric(&half.dot(&b.t().dot(&b)).dot(&half));
+    let decomposed = eigh(core.view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
+    let mut order: Vec<usize> = (0..decomposed.values.len()).filter(|i| decomposed.values[*i] > decomposed.band).collect();
+    order.sort_by(|x, y| decomposed.values[*y].total_cmp(&decomposed.values[*x]));
+    // m = Σ (A G_a^{-1/2} z)(B G_a^{1/2} z)ᵀ over the core's eigenvectors z.
+    let left = sides.rp.dot(&a.dot(&inverse_half));
+    let right = sides.rq.dot(&b.dot(&half));
     let mut out = Vec::new();
-    let mut truncated = Array2::<f64>::zeros(m.dim());
-    for rank in 1..=max_rank.min(resolved) {
-        let (u, v) = (decomposed.u.column(rank - 1), decomposed.vt.row(rank - 1));
-        truncated.scaled_add(decomposed.singular_values[rank - 1], &u.insert_axis(Axis(1)).dot(&v.insert_axis(Axis(0))));
-        if let Some(coded) = generic_core(block, sides, &rp.dot(&truncated).dot(&rq), rank)? {
+    for rank in 1..=max_rank.min(order.len()) {
+        let z = decomposed.vectors.select(Axis(1), &order[..rank]);
+        if let Some(coded) = generic_core(block, sides, &left.dot(&z), &right.dot(&z))? {
             out.push(coded);
         }
     }
     Ok(out)
 }
 
-/// The rank-`rank` core `k` coded in the pivot chart `K = A Bᵀ`, `A = K_{:,π}` and `B` the identity
-/// on the pivot rows `π`.
-fn generic_core(block: &Block<'_>, sides: &Sides, k: &Array2<f64>, rank: usize) -> Result<Option<Coded>, String> {
-    let (s_, t_) = k.dim();
-    let pivot = pivots(k, rank);
+/// The core `K = K_l K_rᵀ` (rank `k` = their width) coded in the pivot chart `K = A Bᵀ`,
+/// `A = K_{:,π} = K_l K_r[π]ᵀ` and `B = K_r K_r[π]⁻¹`, the identity on the pivot rows `π`.
+fn generic_core(block: &Block<'_>, sides: &Sides, kl: &Array2<f64>, kr: &Array2<f64>) -> Result<Option<Coded>, String> {
+    let (s_, t_) = (kl.nrows(), kr.nrows());
+    let pivot = pivots(&kr.t().to_owned(), kr.ncols());
     let rank = pivot.len();
-    if rank == 0 {
+    if rank < kr.ncols() || rank == 0 {
         return Ok(None);
     }
-    let a = k.select(Axis(1), &pivot);
-    let (gram_inverse, _) = inverses(&a.t().dot(&a))?;
-    let mut b = gram_inverse.dot(&a.t()).dot(k).reversed_axes();
+    let m = kr.select(Axis(0), &pivot);
+    let a = kl.dot(&m.t());
+    let Ok(bt) = solve(m.t(), kr.t()) else { return Ok(None) };
+    let mut b = bt.reversed_axes();
     for (i, &j) in pivot.iter().enumerate() {
         b.row_mut(j).fill(0.0);
         b[[j, i]] = 1.0;
@@ -629,21 +671,30 @@ fn diagonal_placements(pairs: &[(usize, usize, usize)]) -> Vec<Placement> {
     pairs.iter().flat_map(|&(w, r, width)| (0..width).map(move |c| vec![(w + c, r + c, 1.0)])).collect()
 }
 
-/// A side's groups in decreasing whitened energy of the block they can carry: `tr(G_g⁺ X_gᵀ N X_g)`
-/// with `N` the side's energy matrix (`F W C Wᵀ F` on the writer, `C Wᵀ F W C` on the reader) and
-/// `G_g` the group's Gram in the side's metric.
-fn ranked(chart: &Chart, energy: &Array2<f64>, metric: &Array2<f64>) -> Result<Vec<(usize, f64)>, String> {
-    let mut out = Vec::new();
-    for g in 0..chart.groups.len() {
-        let x = chart.columns(&[g]);
-        let (inverse, _) = inverses(&x.t().dot(metric).dot(&x))?;
-        out.push((g, (inverse * x.t().dot(energy).dot(&x)).sum()));
+/// A prepared chart's groups in decreasing whitened energy of the block they can carry,
+/// `tr(G_g⁺ T_g G T_gᵀ)` with `T_g = X_gᵀ factor` (`F uᵀ` and `G = v C vᵀ` on the writer, `C vᵀ` and
+/// `u F uᵀ` on the reader); nothing for a chart that takes every group.
+fn ranked(chart: &Prepared, factor: &Array2<f64>, other: &Array2<f64>) -> Vec<(usize, f64)> {
+    if !chart.chart.subsets {
+        return Vec::new();
     }
+    let t = chart.chart.basis.t().dot(factor);
+    let mut out: Vec<(usize, f64)> = chart
+        .chart
+        .groups
+        .iter()
+        .zip(&chart.group_inverse)
+        .enumerate()
+        .map(|(g, (group, inverse))| {
+            let tg = t.slice(s![group.start..group.start + group.width, ..]);
+            (g, (inverse * &tg.dot(other).dot(&tg.t())).sum())
+        })
+        .collect();
     out.sort_by(|a, b| b.1.total_cmp(&a.1));
-    Ok(out)
+    out
 }
 
-/// What every choice of charts in one [`describe`] shares.
+/// What every choice of charts in one description shares.
 struct Context<'a> {
     block: &'a Block<'a>,
     rank: usize,
@@ -655,14 +706,14 @@ impl Context<'_> {
     /// The cheapest core on the writer groups `wg` of chart `i` and the reader groups `rg` of chart
     /// `j` (the identity at index 0): generic of every rank up to the block's and, when the groups
     /// pair, rotation-scaling and diagonal.
-    fn evaluate(&self, (i, writer, wg): (usize, &Chart, &[usize]), (j, reader, rg): (usize, &Chart, &[usize])) -> Result<Option<Description>, String> {
+    fn evaluate(&self, (i, writer, wg): (usize, &Prepared, &[usize]), (j, reader, rg): (usize, &Prepared, &[usize])) -> Result<Option<Description>, String> {
         let block = self.block;
-        let sides = block.sides(writer.columns(wg), reader.columns(rg));
-        let structure = self.charts_bits + self.core_bits + writer.subset_bits(wg.len())? + reader.subset_bits(rg.len())?;
+        let sides = block.sides(writer, wg, reader, rg)?;
+        let structure = self.charts_bits + self.core_bits + writer.chart.subset_bits(wg.len())? + reader.chart.subset_bits(rg.len())?;
         let label = |chart: &Chart, groups: &[usize]| (chart.name.clone(), groups.iter().map(|g| chart.groups[*g].mode.clone()).collect::<Vec<_>>());
         let finish = |coded: Coded, core: Core| Description {
-            writer: label(writer, wg),
-            reader: label(reader, rg),
+            writer: label(&writer.chart, wg),
+            reader: label(&reader.chart, rg),
             core,
             reals: coded.reals,
             structure_bits: structure + coded.structure_bits,
@@ -684,7 +735,7 @@ impl Context<'_> {
         if i == 0 || j == 0 {
             return Ok(best);
         }
-        let Some(pairs) = paired(writer, wg, reader, rg, &sides)? else { return Ok(best) };
+        let Some(pairs) = paired(&writer.chart, wg, &reader.chart, rg, &sides)? else { return Ok(best) };
         let planes = pairs.iter().filter(|p| p.2 == 2).count();
         // The pairing, and a reflection flag per plane.
         let flags = pairing_bits(pairs.len()) + planes as f64;
@@ -738,82 +789,138 @@ fn prefixes(chart: &Chart, ranked: &[(usize, f64)], scale: f64) -> Vec<Vec<usize
     out
 }
 
-/// The cheapest description of the block `w` (`d_out × d_in`, rank at most `rank`) over the
-/// identity charts and `writers` / `readers` (module note), and when `same_space` the same-subspace
-/// family: least description bits plus the KL bits of its error. Per pair of charts, the two sides'
-/// group sets are chosen by coordinate descent over their ranked prefixes, a scan ending where the
-/// structure bits and one bit a paired column already exceed the best total.
-pub fn describe(w: &Array2<f64>, rank: usize, metric: &Metric, writers: &[Chart], readers: &[Chart], same_space: bool) -> Result<Description, String> {
-    let (d_out, d_in) = w.dim();
-    let block = Block::new(w, metric);
-    let mut all_writers = vec![Chart::identity(d_out)];
-    all_writers.extend(writers.iter().cloned());
-    let mut all_readers = vec![Chart::identity(d_in)];
-    all_readers.extend(readers.iter().cloned());
-    let charts_bits = fixed_index_len_bits(all_writers.len()).map_err(|e| e.to_string())? as f64
-        + fixed_index_len_bits(all_readers.len()).map_err(|e| e.to_string())? as f64;
-    // Generic, rotation, diagonal, same subspace.
-    let core_bits = fixed_index_len_bits(4).map_err(|e| e.to_string())? as f64;
-    let writer_energy = block.fwc.dot(&w.t()).dot(&metric.fisher);
-    let reader_energy = block.fwc.t().dot(w).dot(&metric.covariance);
-    let mut writer_sets = Vec::new();
-    for chart in &all_writers {
-        let ranking = if chart.subsets { ranked(chart, &writer_energy, &metric.fisher)? } else { Vec::new() };
-        writer_sets.push(prefixes(chart, &ranking, metric.scale()));
+/// A chart prepared on its side's metric: each group's pseudo-inverse Gram and, for the identity,
+/// the metric's pseudo-inverse root.
+struct Prepared {
+    chart: Chart,
+    identity: bool,
+    group_inverse: Vec<Array2<f64>>,
+    root: Option<Array2<f64>>,
+}
+
+impl Prepared {
+    fn new(chart: Chart, metric: &Array2<f64>, identity: bool) -> Result<Self, String> {
+        let (group_inverse, root) = if identity {
+            (Vec::new(), Some(inverses(metric)?.1))
+        } else {
+            let mut out = Vec::new();
+            for g in 0..chart.groups.len() {
+                let x = chart.columns(&[g]);
+                out.push(inverses(&x.t().dot(metric).dot(&x))?.0);
+            }
+            (out, None)
+        };
+        Ok(Self { chart, identity, group_inverse, root })
     }
-    let mut reader_sets = Vec::new();
-    for chart in &all_readers {
-        let ranking = if chart.subsets { ranked(chart, &reader_energy, &metric.covariance)? } else { Vec::new() };
-        reader_sets.push(prefixes(chart, &ranking, metric.scale()));
+}
+
+/// A site prepared for describing its blocks: its metric, its charts on each side (the identity
+/// first) and, when it reads and writes one interface, the roots of its reads' second moment.
+pub struct Geometry {
+    pub metric: Metric,
+    writers: Vec<Prepared>,
+    readers: Vec<Prepared>,
+    whitening: Option<(Array2<f64>, Array2<f64>)>,
+}
+
+impl Geometry {
+    pub fn new(metric: Metric, writers: Vec<Chart>, readers: Vec<Chart>, same_space: bool) -> Result<Self, String> {
+        let (d_out, d_in) = (metric.fisher.nrows(), metric.moment.nrows());
+        let mut w = vec![Prepared::new(Chart::identity(d_out), &metric.fisher, true)?];
+        for chart in writers {
+            w.push(Prepared::new(chart, &metric.fisher, false)?);
+        }
+        let mut r = vec![Prepared::new(Chart::identity(d_in), &metric.moment, true)?];
+        for chart in readers {
+            r.push(Prepared::new(chart, &metric.moment, false)?);
+        }
+        let whitening = if same_space && d_in == d_out { Some(roots(&metric.moment)?) } else { None };
+        Ok(Self { metric, writers: w, readers: r, whitening })
     }
-    let context = Context { block: &block, rank, charts_bits, core_bits };
-    let mut best: Option<Description> = None;
-    for (i, writer) in all_writers.iter().enumerate() {
-        for (j, reader) in all_readers.iter().enumerate() {
-            let (ws, rs) = (&writer_sets[i], &reader_sets[j]);
-            let (Some(mut wg), Some(mut rg)) = (ws.last().cloned(), rs.last().cloned()) else { continue };
-            for _ in 0..2 {
-                for (side, sets) in [(0, rs), (1, ws)] {
-                    let mut chosen: Option<(Vec<usize>, f64)> = None;
-                    for set in sets {
-                        let (w_, r_) = if side == 0 { (&wg, set) } else { (set, &rg) };
-                        let floor = charts_bits + core_bits + writer.subset_bits(w_.len())? + reader.subset_bits(r_.len())? + w_.len().min(r_.len()) as f64;
-                        if best.as_ref().is_some_and(|b| floor >= b.total()) {
-                            break;
+
+    /// The cheapest description of the block `uᵀ v` (`u` is `r × d_out`, `v` is `r × d_in`), of rank
+    /// at most `r`, over the identity and the site's charts and, when the site reads and writes one
+    /// interface, the same-subspace family: least description bits plus the KL bits of its error.
+    /// Per pair of charts, the two sides' group sets are chosen by coordinate descent over their
+    /// ranked prefixes, a scan ending where the structure bits and one bit a paired column already
+    /// exceed the best total.
+    pub fn describe(&self, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<Description, String> {
+        let metric = &self.metric;
+        let block = Block::new(u, v, metric);
+        let rank = u.nrows();
+        let charts_bits = fixed_index_len_bits(self.writers.len()).map_err(|e| e.to_string())? as f64
+            + fixed_index_len_bits(self.readers.len()).map_err(|e| e.to_string())? as f64;
+        // Generic, rotation, diagonal, same subspace.
+        let core_bits = fixed_index_len_bits(4).map_err(|e| e.to_string())? as f64;
+        let writer_sets: Vec<Vec<Vec<usize>>> =
+            self.writers.iter().map(|c| prefixes(&c.chart, &ranked(c, &block.fu, &block.gv), metric.scale())).collect();
+        let reader_sets: Vec<Vec<Vec<usize>>> =
+            self.readers.iter().map(|c| prefixes(&c.chart, &ranked(c, &block.cv, &block.gu), metric.scale())).collect();
+        let context = Context { block: &block, rank, charts_bits, core_bits };
+        let mut best: Option<Description> = None;
+        for (i, writer) in self.writers.iter().enumerate() {
+            for (j, reader) in self.readers.iter().enumerate() {
+                let (ws, rs) = (&writer_sets[i], &reader_sets[j]);
+                let (Some(mut wg), Some(mut rg)) = (ws.last().cloned(), rs.last().cloned()) else { continue };
+                for _ in 0..2 {
+                    for (side, sets) in [(0, rs), (1, ws)] {
+                        let mut chosen: Option<(Vec<usize>, f64)> = None;
+                        for set in sets {
+                            let (w_, r_) = if side == 0 { (&wg, set) } else { (set, &rg) };
+                            let floor = charts_bits
+                                + core_bits
+                                + writer.chart.subset_bits(w_.len())?
+                                + reader.chart.subset_bits(r_.len())?
+                                + w_.len().min(r_.len()) as f64;
+                            if best.as_ref().is_some_and(|b| floor >= b.total()) {
+                                break;
+                            }
+                            let Some(found) = context.evaluate((i, writer, w_.as_slice()), (j, reader, r_.as_slice()))? else { continue };
+                            if chosen.as_ref().is_none_or(|c| found.total() < c.1) {
+                                chosen = Some((set.clone(), found.total()));
+                            }
+                            if best.as_ref().is_none_or(|b| found.total() < b.total()) {
+                                best = Some(found);
+                            }
                         }
-                        let Some(found) = context.evaluate((i, writer, w_.as_slice()), (j, reader, r_.as_slice()))? else { continue };
-                        if chosen.as_ref().is_none_or(|c| found.total() < c.1) {
-                            chosen = Some((set.clone(), found.total()));
-                        }
-                        if best.as_ref().is_none_or(|b| found.total() < b.total()) {
-                            best = Some(found);
-                        }
-                    }
-                    if let Some((set, _)) = chosen {
-                        if side == 0 {
-                            rg = set;
-                        } else {
-                            wg = set;
+                        if let Some((set, _)) = chosen {
+                            if side == 0 {
+                                rg = set;
+                            } else {
+                                wg = set;
+                            }
                         }
                     }
                 }
             }
         }
-    }
-    let mut offer = |candidate: Description| {
-        if best.as_ref().is_none_or(|b| candidate.total() < b.total()) {
-            best = Some(candidate);
-        }
-    };
-    if same_space && d_in == d_out {
-        let whitening = roots(&metric.covariance)?;
-        for r in 1..=rank.min(d_in) {
-            if let Some(candidate) = same_subspace(&block, w, &whitening, r, charts_bits + core_bits)? {
-                offer(candidate);
+        if let Some(whitening) = &self.whitening {
+            let w = u.t().dot(&v);
+            for r in 1..=rank.min(w.nrows()) {
+                if let Some(candidate) = same_subspace(&block, &w, whitening, r, charts_bits + core_bits)?
+                    && best.as_ref().is_none_or(|b| candidate.total() < b.total())
+                {
+                    best = Some(candidate);
+                }
             }
         }
+        best.ok_or_else(|| "no description of the block".to_string())
     }
-    best.ok_or_else(|| "no description of the block".to_string())
+}
+
+/// The cheapest description of the block `w` (`d_out × d_in`, rank at most `rank`) over the identity
+/// charts and `writers` / `readers`, and when `same_space` the same-subspace family
+/// ([`Geometry::describe`] on `w`'s leading `rank` singular pairs).
+pub fn describe(w: &Array2<f64>, rank: usize, metric: &Metric, writers: &[Chart], readers: &[Chart], same_space: bool) -> Result<Description, String> {
+    let geometry = Geometry::new(metric.clone(), writers.to_vec(), readers.to_vec(), same_space)?;
+    let decomposed = svd(w.view(), false).map_err(|e| format!("{e:?}"))?;
+    let r = rank.min(decomposed.singular_values.iter().filter(|x| **x > decomposed.band).count()).max(1);
+    let mut u = decomposed.u.slice(s![.., ..r]).t().to_owned();
+    for (i, mut row) in u.rows_mut().into_iter().enumerate() {
+        row *= decomposed.singular_values[i];
+    }
+    let v = decomposed.vt.slice(s![..r, ..]).to_owned();
+    geometry.describe(u.view(), v.view())
 }
 
 /// `(M^{1/2}, M^{+1/2})` of a symmetric positive semidefinite matrix over its eigenvalues beyond the
@@ -892,7 +999,7 @@ fn same_subspace(block: &Block<'_>, w: &Array2<f64>, whitening: &(Array2<f64>, A
         let z = root.dot(&q);
         let (_, half) = inverses(&z.t().dot(&z))?;
         let p = z.dot(&half);
-        let sides = block.sides(inverse_root.dot(&p), root.dot(&p));
+        let sides = block.sides_of(inverse_root.dot(&p), root.dot(&p))?;
         for (kind, placements) in &cores {
             let Some(coded) = linear_core(block, &sides, placements, 0.0)? else { continue };
             let candidate = Description {
@@ -914,28 +1021,18 @@ fn same_subspace(block: &Block<'_>, w: &Array2<f64>, whitening: &(Array2<f64>, A
     Ok(best)
 }
 
-/// One site's structured description context: its metric and the charts its blocks may use.
-pub struct StructuredSite {
-    pub metric: Metric,
-    pub writers: Vec<Chart>,
-    pub readers: Vec<Chart>,
-    /// Whether the site reads and writes one interface (the same-subspace family).
-    pub same_space: bool,
-}
-
-/// [`describe`] as the blocks' description ([`super::blocks::Describe`]): a block costs its
+/// [`Geometry::describe`] as the blocks' description ([`super::blocks::Describe`]): a block costs its
 /// cheapest description plus the price of that description's error.
 pub struct Structured {
-    pub sites: Vec<StructuredSite>,
+    pub sites: Vec<Geometry>,
 }
 
 impl super::blocks::Describe for Structured {
     fn bits(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<f64, String> {
-        let s = self.sites.get(site).ok_or_else(|| format!("no site {site}"))?;
+        let geometry = self.sites.get(site).ok_or_else(|| format!("no site {site}"))?;
         if u.nrows() == 0 {
             return Ok(0.0);
         }
-        let w = u.t().dot(&v);
-        Ok(describe(&w, u.nrows(), &s.metric, &s.writers, &s.readers, s.same_space)?.total())
+        Ok(geometry.describe(u, v)?.total())
     }
 }

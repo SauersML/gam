@@ -418,37 +418,25 @@ fn raw_readout(w: Array2<f64>) -> (OperatorProgram, Contract) {
     (program, contract)
 }
 
-/// A row whose proven band is not below one logit unit takes an estimated band, which encloses
-/// nothing: whether the estimate is the reference's or the candidate's, no status of the row is
-/// exact, no argmax is certified, and no score resting on it is proven shorter or longer.
+/// A row whose proven band is wider than one logit unit keeps that band: the sampled rounding
+/// estimate is a diagnostic and never replaces an enclosure, so nothing the
+/// score certifies rests on it.
 #[test]
-fn an_estimated_band_certifies_no_status_and_no_shorter_score() {
-    use super::contract::BandBasis;
-    use super::supports::EvidenceStatus;
+fn a_wide_proven_band_is_never_replaced_by_the_rounding_estimate() {
+    use super::contract::measured_output_band;
     let w = Array2::from_shape_fn((2, 2), |(i, j)| ((i * 2 + j) as f64 * 0.7 + 0.3).sin());
-    let (small, contract) = raw_readout(w.clone());
     // Logits near 1e18: the forward-error enclosure is hundreds of logit units wide.
-    let (large, _) = raw_readout(w.mapv(|v| v * 1e18));
-    let enclosed = contract.logits(&small).expect("small logits");
-    assert!(enclosed.basis.iter().all(|b| *b == BandBasis::Enclosure), "{:?}", enclosed.basis);
-    let estimated = contract.logits(&large).expect("large logits");
-    assert!(estimated.basis.iter().all(|b| *b != BandBasis::Enclosure), "{:?}", estimated.basis);
-    let certified = contract.score(&small, &enclosed).expect("certified score");
-    assert!(certified.certified());
-    assert!(matches!(certified.evaluation.total_kl, EvidenceStatus::Exact { .. }));
-    for (program, reference) in [(&large, &enclosed), (&small, &estimated), (&large, &estimated)] {
-        let score = contract.score(program, reference).expect("score");
-        assert!(!score.certified());
-        assert_eq!(score.evaluation.estimated_rows, 3);
-        assert!(!matches!(score.evaluation.total_kl, EvidenceStatus::Exact { .. }), "{:?}", score.evaluation.total_kl);
-        assert!(!matches!(score.evaluation.max_kl, EvidenceStatus::Exact { .. }), "{:?}", score.evaluation.max_kl);
-        assert_eq!(score.evaluation.argmax_uncertified, 3);
-        assert!(score.evaluation.argmax_agrees.iter().all(|a| !a));
-        assert!(score.evaluation.kl_upper.iter().all(|u| u.is_infinite()));
-        assert_eq!(score.evaluation.max_tv_upper, 1.0);
-        assert!(!score.proven_shorter_than(&certified) && !certified.proven_shorter_than(&score));
-        assert!(!score.proven_shorter_than(&score));
-    }
+    let (large, contract) = raw_readout(w.mapv(|v| v * 1e18));
+    let trace = large.execute(&contract.family, true).expect("executes");
+    let proven = trace.band(large.output).expect("bands");
+    assert!(proven.iter().all(|r| *r >= 1.0), "{proven:?}");
+    let estimate = measured_output_band(&large, &contract.family, &trace).expect("estimate");
+    assert_ne!(estimate, proven);
+    let logits = contract.logits(&large).expect("logits");
+    assert_eq!(logits.bands, proven);
+    let score = contract.score(&large, &logits).expect("score");
+    // The certified data term rests on the proven boxes only: its error covers their width.
+    assert!(score.data_bits_error.is_infinite() || score.data_bits_error > 0.0);
 }
 
 /// A call is counted as its body inlined: the same ReLU layer written inline and wrapped in a rule

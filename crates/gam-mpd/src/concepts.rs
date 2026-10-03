@@ -47,7 +47,7 @@
 //! A [`Model`] freezes every rate at its KT estimate from the fitted counts. A new word invokes a
 //! concept when that is cheaper ([`Model::encode`]). Its bits split into the concept choices (what
 //! the text carries), the members given those choices and the subcomponents on their own
-//! ([`Model::bits`]), against the independent code that sends every subcomponent at its own rate.
+//! ([`Bits`]), against the independent code that sends every subcomponent at its own rate.
 
 use super::codec::subset_code_len_bits;
 use rayon::prelude::*;
@@ -98,7 +98,7 @@ impl Sets {
 
 /// The Krichevsky–Trofimov code length, in bits, of a binary sequence of `n` symbols with `k` ones.
 pub fn kt_bits(k: u64, n: u64) -> f64 {
-    debug_assert!(k <= n);
+    assert!(k <= n, "kt_bits: {k} ones in {n} symbols");
     (ln_gamma(n as f64 + 1.0) + PI.ln() - ln_gamma(k as f64 + 0.5) - ln_gamma((n - k) as f64 + 0.5)) / LN_2
 }
 

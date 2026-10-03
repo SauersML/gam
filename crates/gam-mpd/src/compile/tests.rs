@@ -111,8 +111,6 @@ fn spanning_inputs_recover_the_target_map_exactly() {
     let edit = dense(plan, "w", (3, 4));
     assert!(max_abs((&edit - &target).view()) < 1e-12, "the unique solution is the target map");
     assert!(report.undeclared_uses.is_empty());
-    #[cfg(feature = "response")]
-    assert_eq!(plan.intervention_changes().len(), 1);
 }
 
 #[test]

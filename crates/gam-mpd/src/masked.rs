@@ -1522,6 +1522,10 @@ fn keep_sum(g: &Array2<f64>, other: &Array2<f64>) -> Result<Array2<f64>, String>
 /// site (`U` when `seed` is even, `V` when odd; the driver's sequence counter alternates them), along
 /// the direction projected onto the moves that leave `Σ_c u_c v_cᵀ` unchanged, `Vᵀ dU = 0` or
 /// `Uᵀ dV = 0`. Both are linear, so the sum holds to rounding at every step length.
+///
+/// On a device (module note, "Devices") the corner claim's step runs there: its forward, gradients,
+/// Fishers, read moments and curvature tangent stay resident, and each backtracking trial is a
+/// float64 forward of the device twin, refreshed with the trial operators.
 pub fn step_pieces(
     masked: &mut Masked,
     base: &FamilyInputs,
@@ -1536,23 +1540,45 @@ pub fn step_pieces(
         return Err("pieces steps need the whole model in the program and the training state".to_string());
     }
     let family = masked.family(base, masks);
-    let (kl_now, trace, cotangent) = forward(masked, &family, target)?;
-    let grads = gradients(masked, &family, &trace, masks, cotangent.clone())?;
-    let curvature = fisher(masked, &family, &trace, target, samples, seed, true)?;
+    // The forward and everything read off it, on the device twin when there is one.
+    let lowered = match claim {
+        Claim::Corner => masked.on_device(|accelerated| {
+            let on_device = accelerated.target(target)?;
+            let state = accelerated.forward(&family, &on_device)?;
+            let grads = accelerated.gradients(masked, &state, masks)?;
+            let curvature = accelerated.fisher(masked, &state, &on_device, samples, seed, true)?;
+            let covariances = accelerated.covariances(masked, &state)?;
+            Ok((on_device, state, grads, curvature, covariances))
+        })?,
+        Claim::Box => None,
+    };
+    let (kl_now, grads, curvature, batch_covariances, evaluated, device_target) = match lowered {
+        Some((on_device, state, grads, curvature, covariances)) => (state.kl.clone(), grads, curvature, covariances, Evaluated::Device(state), Some(on_device)),
+        None => {
+            let (kl_now, trace, cotangent) = forward(masked, &family, target)?;
+            let grads = gradients(masked, &family, &trace, masks, cotangent.clone())?;
+            let curvature = fisher(masked, &family, &trace, target, samples, seed, true)?;
+            let rows = trace.values[masked.program.output].nrows() as f64;
+            let mut batch_covariances = Vec::new();
+            for site in &masked.sites {
+                let reads = read_values(&trace, site)?;
+                batch_covariances.push(fast_atb(&reads, &reads) / rows);
+            }
+            (kl_now, grads, curvature, batch_covariances, Evaluated::Host(trace, cotangent), None)
+        }
+    };
     // The preconditioners are the running means over every input stepped on so far.
-    let rows = trace.values[masked.program.output].nrows() as f64;
-    let mut batch_covariances = Vec::new();
-    for (k, site) in masked.sites.iter().enumerate() {
-        let reads = read_values(&trace, site)?;
-        batch_covariances.push(fast_atb(&reads, &reads) / rows);
-    }
+    let rows = kl_now.len() as f64;
     let fishers = curvature.into_iter().map(|(_, f)| f.ok_or("no written Fisher")).collect::<Result<Vec<_>, _>>()?;
     running.absorb(batch_covariances, fishers, rows);
     // The error under the claim (module note, "Claims"), and its gradients.
     let (total, grads) = match claim {
         Claim::Corner => (kl_now.sum(), grads),
         Claim::Box => {
-            let (excess, box_grads) = box_excess(masked, &family, &trace, masks, cotangent, &running.fishers, true)?;
+            let Evaluated::Host(trace, cotangent) = &evaluated else {
+                return Err("the box claim's step runs on the CPU".to_string());
+            };
+            let (excess, box_grads) = box_excess(masked, &family, trace, masks, cotangent.clone(), &running.fishers, true)?;
             let box_grads = box_grads.ok_or("no box gradients")?;
             let grads = grads.into_iter().zip(box_grads).map(|((m, v, u), (bv, bu))| (m, v + bv, u + bu)).collect::<Vec<_>>();
             (kl_now.sum() + excess.sum(), grads)
@@ -1590,18 +1616,26 @@ pub fn step_pieces(
     // `dᵀ H d`: the output tangent of the direction, in each row's softmax Fisher.
     let quadratic = {
         let tangents: BTreeMap<usize, Array2<f64>> = moves.iter().map(|(op, t)| (*op, t.clone())).collect();
-        let output = super::derivatives::jvp(&masked.program, &family, &trace, &tangents).map_err(|e| e.to_string())?;
-        let logits = &trace.values[masked.program.output];
-        let mut quadratic = 0.0;
-        for r in (0..logits.nrows()).filter(|r| target.scores(*r)) {
-            let q = softmax(logits.row(r));
-            let t = output.row(r);
-            let mean: f64 = q.iter().zip(t.iter()).map(|(a, b)| a * b).sum();
-            quadratic += q.iter().zip(t.iter()).map(|(a, b)| a * (b - mean) * (b - mean)).sum::<f64>();
+        match (&evaluated, &device_target) {
+            (Evaluated::Device(state), Some(on_device)) => {
+                masked.on_device(|accelerated| accelerated.quadratic(state, on_device, &tangents))?.ok_or("device: the twin went away")?
+            }
+            (Evaluated::Device(_), None) => return Err("device: a resident state without its target".to_string()),
+            (Evaluated::Host(trace, _), _) => {
+                let output = super::derivatives::jvp(&masked.program, &family, trace, &tangents).map_err(|e| e.to_string())?;
+                let logits = &trace.values[masked.program.output];
+                let mut quadratic = 0.0;
+                for r in (0..logits.nrows()).filter(|r| target.scores(*r)) {
+                    let q = softmax(logits.row(r));
+                    let t = output.row(r);
+                    let mean: f64 = q.iter().zip(t.iter()).map(|(a, b)| a * b).sum();
+                    quadratic += q.iter().zip(t.iter()).map(|(a, b)| a * (b - mean) * (b - mean)).sum::<f64>();
+                }
+                quadratic
+            }
         }
-        quadratic
     };
-    drop(trace);
+    drop(evaluated);
     // Every trial is the float64 operator less the step; the originals are shared, not copied,
     // and restored exactly when no step lowers the total.
     let originals: Vec<Arc<Operator>> = moves.iter().map(|(op, _)| Arc::clone(&masked.program.operators[*op])).collect();
@@ -1612,9 +1646,12 @@ pub fn step_pieces(
             let values = &*original.matrix_cow() - &(t * eta);
             masked.program.operators[*op] = dense(original.name.clone(), original.rows.clone(), original.cols.clone(), values)?;
         }
-        let trial = match claim {
-            Claim::Corner => score_only(masked, &family, target)?.sum(),
-            Claim::Box => {
+        let trial = match (claim, &device_target) {
+            (Claim::Corner, Some(on_device)) => {
+                masked.on_device(|accelerated| accelerated.score_only(&family, on_device))?.ok_or("device: the twin went away")?.sum()
+            }
+            (Claim::Corner, None) => score_only(masked, &family, target)?.sum(),
+            (Claim::Box, _) => {
                 let (kl_trial, trial_trace, trial_cotangent) = forward(masked, &family, target)?;
                 kl_trial.sum() + box_excess(masked, &family, &trial_trace, masks, trial_cotangent, &running.fishers, false)?.0.sum()
             }
@@ -1630,6 +1667,12 @@ pub fn step_pieces(
     Ok(None)
 }
 
+/// A step's forward: on the CPU (its trace and the KL's cotangent) or resident on the device.
+enum Evaluated {
+    Host(Trace, Array2<f64>),
+    Device(State),
+}
+
 /// What an explanation claims of its off subcomponents (module note, "Claims").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Claim {
@@ -1639,12 +1682,14 @@ pub enum Claim {
     Box,
 }
 
+/// Per site, the gradients of the box excess in `V` and `U`.
+pub type BoxGradients = Vec<(Array2<f64>, Array2<f64>)>;
+
 /// Per input, what the box claim adds to the masks' own KL (module note, "Claims"), from a masked
 /// forward's trace and its KL's cotangent at the program's output, in each site's written Fisher
 /// `fishers[k]` (a per-input mean). With `gradients`, also its gradients in every site's `V`
 /// (C × d_in) and `U` (C × d_out), the KL's gradient at the written values held fixed (they steer
 /// steps; the error itself decides).
-#[allow(clippy::type_complexity)]
 pub fn box_excess(
     masked: &Masked,
     family: &FamilyInputs,
@@ -1653,7 +1698,7 @@ pub fn box_excess(
     cotangent: Array2<f64>,
     fishers: &[Array2<f64>],
     gradients: bool,
-) -> Result<(Array1<f64>, Option<Vec<(Array2<f64>, Array2<f64>)>>), String> {
+) -> Result<(Array1<f64>, Option<BoxGradients>), String> {
     let back = vjp(&masked.program, family, trace, cotangent).map_err(|e| e.to_string())?;
     let rows = trace.values[masked.program.output].nrows();
     let mut excess = Array1::<f64>::zeros(rows);

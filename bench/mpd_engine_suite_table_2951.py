@@ -21,7 +21,7 @@ for path in sorted(glob.glob(f"{E}/*/report.json")):
             "observations", "program_bits", "structure_bits", "precision_bits", "explanation_bits", "data_bits",
             "total_bits", "best_rounded_total_bits", "best_rounded_b", "max_kl", "mean_kl", "max_tv",
             "argmax_agreement", "stop", "seconds", "active_per_input", "instances", "explanation_bits_per_input",
-            "estimated_rows", "certified", "reals", "rollout")} | {"top_components": [
+            "certified", "reals", "rollout")} | {"top_components": [
                 {k: c.get(k) for k in ("name", "reads", "writes", "applied_by", "bits", "native")} for c in x.get("top_components", [])[:3]]})
     models[name] = {
         "model": r.get("model"), "rows": r.get("rows"), "native_bits": r.get("native", {}).get("program_bits"),

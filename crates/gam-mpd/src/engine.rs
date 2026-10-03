@@ -15,7 +15,8 @@
 //!
 //! # One round
 //!
-//! 1. Every primitive proposes on the current program `P`, whose score and logits are cached.
+//! 1. Every primitive proposes on the current program `P`, whose certified score and logits are
+//!    cached.
 //! 2. Each proposal's program bits are computed exactly (its decoded message length).
 //! 3. Each proposal is screened: its logits on the family (for a local edit only what the edit
 //!    changes is propagated, `OperatorProgram::execute_incremental`) and the resulting data bits.
@@ -24,20 +25,18 @@
 //!    Screening certifies nothing; it ranks.
 //! 4. The screened proposals are ranked by total saving. A structural proposal (one that replaces
 //!    the program) is tried alone; the compatible local edits are tried together.
-//! 5. The candidate is scored: encoded, decoded, executed with bands on the whole family and
+//! 5. The candidate is certified: encoded, decoded, executed with bands on the whole family and
 //!    scored (`contract::Contract::score`). It is accepted only when its total code length is
-//!    shorter at its bands: its upper end below the current program's lower end
-//!    (`ProgramScore::ranks_shorter_than`). That is a proof when both scores rest on enclosures
-//!    (`ProgramScore::proven_shorter_than`); where an estimated band entered (a deep network) it
-//!    is a ranking, and the returned score says so (`ProgramScore::certified`). A refused batch is
+//!    proven shorter: its upper end below the current program's lower end. A refused batch is
 //!    halved; a refused single proposal is not proposed again.
 //!
 //! The search ends when no proposal passes, or when the declared [`Budget`] is spent; in both cases
-//! the returned program is the last accepted one, and its maximal row KL and argmax agreement are
+//! the returned program is the last certified one, and its maximal row KL and argmax agreement are
 //! reported as outputs.
 
 use super::cegar::{Ascent, CegarError, Input, InputDomain, Round, family_of, verify};
-use super::contract::{Contract, ContractError, ContractLogits, ProgramScore};
+use super::contract::{Contract, ContractError, ProgramScore};
+use super::secant::BandedMatrix;
 use super::fit::ProposalKind;
 use super::operator_program::{
     FamilyInputs, Interface, LabelKind, Law, Node, Operator, OperatorBody, OperatorProgram, ProgramError, Trace,
@@ -204,30 +203,29 @@ pub fn log_to_stderr() {
 /// Why the search stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stop {
-    /// No proposal at any level shortened the scored total.
+    /// No proposal at any level shortened the certified total.
     Converged,
     ScreeningBudget,
     CertificationBudget,
 }
 
-/// The result of [`decompose`]: the program, its score (certified when
-/// [`ProgramScore::certified`]), why it stopped, and the
+/// The result of [`decompose`]: the program, its certified score, why it stopped, and the
 /// structure function the search traced.
 #[derive(Clone, Debug)]
 pub struct Decomposition {
     pub program: OperatorProgram,
     pub score: ProgramScore,
     pub stop: Stop,
-    /// The Pareto front of every program the search scored: structure bits against
+    /// The Pareto front of every certified program the search scored: structure bits against
     /// the rest of the code (precision, explanations and data), ascending in structure.
     pub curve: Vec<CurvePoint>,
-    /// Scored programs the code cannot tell from the returned one: their totals' intervals
-    /// overlap it. Each is an edit of a program the search held, or another start's
+    /// Certified programs the code cannot tell from the returned one: their totals' certified
+    /// intervals overlap it. Each is an edit of a program the search held, or another start's
     /// result.
     pub ties: Vec<Tie>,
 }
 
-/// A scored program that the returned program does not rank shorter than, kept as the
+/// A certified program whose total is not proven longer than the returned program's, kept as the
 /// program the search held and the edits it was refused with (a held program shares its operators,
 /// so a tie costs only what its edits change).
 #[derive(Clone, Debug)]
@@ -252,7 +250,7 @@ impl Tie {
     }
 }
 
-/// One scored program on the structure function.
+/// One certified program on the structure function.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CurvePoint {
     pub structure_bits: u64,
@@ -450,7 +448,7 @@ fn drop_blocks(program: &mut OperatorProgram, blocks: &[BlockRef]) -> Result<(),
 
 /// The reference distributions, cached.
 struct Reference {
-    banded: ContractLogits,
+    banded: BandedMatrix,
     log_probabilities: Array2<f64>,
 }
 
@@ -570,7 +568,7 @@ pub fn decompose(
 
 /// [`decompose`] with `start` (a program over the model's declarations, for instance the result of
 /// a search on less behaviour) joining the start set. The start set is always `{model, start}`: the
-/// search runs from each, and the shortest scored result is returned, so a warm start can never
+/// search runs from each, and the shortest certified result is returned, so a warm start can never
 /// leave the result longer than the model's own search would.
 pub fn decompose_from(
     model: &OperatorProgram,
@@ -591,11 +589,11 @@ pub fn decompose_from(
 /// `budget`. The search itself only moves to proven-shorter programs, so no result is longer than
 /// its start.
 ///
-/// Of the results, those not ranked longer than the shortest (their scored totals overlap) are
+/// Of the results, those not proven longer than the shortest (their certified totals overlap) are
 /// equally short as far as the code can tell; the one with the least structure bits is returned:
 /// the knee of the structure function, where more structure no longer buys a proven-shorter total.
 pub fn decompose_with_reference(
-    reference: &ContractLogits,
+    reference: &BandedMatrix,
     starts: &[&OperatorProgram],
     contract: &Contract,
     library: &[Box<dyn Primitive>],
@@ -649,18 +647,18 @@ pub fn decompose_with_reference(
     // The other starts' results and ties that the code cannot separate from the chosen program.
     let mut ties = std::mem::take(&mut chosen.ties);
     for other in results {
-        if !chosen.score.ranks_shorter_than(&other.score) && other.program != chosen.program {
+        if !chosen.score.proven_shorter_than(&other.score) && other.program != chosen.program {
             ties.push(Tie { base: other.program, edits: Vec::new(), score: other.score, description: "another start's result".to_string(), exact: false });
         }
         ties.extend(other.ties);
     }
-    ties.retain(|tie| !chosen.score.ranks_shorter_than(&tie.score) && !(tie.edits.is_empty() && tie.base == chosen.program));
+    ties.retain(|tie| !chosen.score.proven_shorter_than(&tie.score) && !(tie.edits.is_empty() && tie.base == chosen.program));
     chosen.ties = ties;
     chosen.curve = curve;
     Ok(chosen)
 }
 
-/// The search from one start program whose score is `start_score`.
+/// The search from one start program whose certified score is `start_score`.
 fn search(
     reference: &Reference,
     start: OperatorProgram,
@@ -820,7 +818,7 @@ fn search(
                 &score,
                 members.iter().map(|&m| screened[m].proposal.description.as_str()).collect::<Vec<_>>().join("; "),
             ));
-            if score.ranks_shorter_than(&current) {
+            if score.proven_shorter_than(&current) {
                 log::info!(
                     "accepted {} proposal(s): {} + {:.1} bits -> {} + {:.1} bits: {:?}",
                     members.len(),
@@ -832,7 +830,7 @@ fn search(
                 );
                 break Some((candidate, score));
             }
-            if !current.ranks_shorter_than(&score) {
+            if !current.proven_shorter_than(&score) {
                 ties.push(Tie {
                     base: program.clone(),
                     edits: members.iter().map(|&m| screened[m].proposal.edit.clone()).collect(),
@@ -851,7 +849,7 @@ fn search(
         if let Some((candidate, score)) = accepted {
             program = candidate;
             current = score;
-            ties.retain(|tie| !current.ranks_shorter_than(&tie.score));
+            ties.retain(|tie| !current.proven_shorter_than(&tie.score));
             level = 0;
         }
     };

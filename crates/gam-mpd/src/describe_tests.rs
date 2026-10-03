@@ -18,7 +18,7 @@ fn random(rows: usize, cols: usize, salt: usize) -> Array2<f64> {
 }
 
 fn metric(d_out: usize, d_in: usize) -> Metric {
-    Metric { covariance: Array2::eye(d_in), fisher: Array2::eye(d_out), observations: 1e4 }
+    Metric { moment: Array2::eye(d_in), fisher: Array2::eye(d_out), observations: 1e4 }
 }
 
 fn decoded(u: &Array2<f64>, v: &Array2<f64>) -> Array2<f64> {

@@ -30,9 +30,7 @@
 //! leaves whose exact values are proven equal, both exact (radius zero, on a dyadic lattice) and
 //! equal entrywise. Intersecting enclosures are not a witness: they only fail to rule equality
 //! out, and `(1 + 2⁻²⁷)(1 − 2⁻²⁷) = 1 − 2⁻⁵⁴` has an enclosure that holds `1` without being the
-//! identity. Such pairs stay outside the congruence and are reported as [`NearOperators`], each
-//! with an entrywise residual bound, valid for every input since it bounds the operators
-//! themselves. A merged class keeps the intersection of the boxes; an exact law that unions two
+//! identity. Such pairs stay outside the congruence. A merged class keeps the intersection of the boxes; an exact law that unions two
 //! classes whose boxes do not intersect is a band defect and stops saturation with
 //! [`EgraphError::Inconsistent`]. No tolerance is involved.
 //!
@@ -1368,8 +1366,6 @@ pub struct Saturation {
     pub egraph: ProgramGraph,
     pub root: Id,
     pub report: SaturationReport,
-    /// Operator classes close within their bands but not proven equal, outside the congruence.
-    pub near: Vec<NearOperators>,
 }
 
 /// `coefficient` as a scalar class: parameters stay symbols, numbers are exact.
@@ -1490,7 +1486,8 @@ fn build(program: &OperatorProgram) -> Result<(ProgramGraph, Id), EgraphError> {
     Ok((egraph, classes[program.output]))
 }
 
-/// Every pair of distinct operator classes of one interface pair whose enclosures intersect.
+/// Every pair of distinct operator classes of one interface pair whose enclosures intersect: the
+/// candidates for a proven equality.
 fn intersecting_operators(egraph: &ProgramGraph) -> Vec<(Id, Id)> {
     let mut groups: HashMap<(Interface, Interface), Vec<(f64, Id)>> = HashMap::new();
     for class in egraph.classes() {
@@ -1529,31 +1526,6 @@ fn certified_merge(egraph: &mut ProgramGraph) -> bool {
         }
     }
     changed
-}
-
-/// Two operator classes whose enclosures intersect but whose equality nothing proves: kept apart,
-/// with `|A − B| ≤ residual` in every entry (so on every input, `‖x (A − B)ᵀ‖_∞ ≤ residual ‖x‖₁`).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct NearOperators {
-    pub left: Id,
-    pub right: Id,
-    pub residual: f64,
-}
-
-/// The intersecting pairs of the saturated graph that [`certified_merge`] kept apart.
-fn near_operators(egraph: &ProgramGraph) -> Vec<NearOperators> {
-    intersecting_operators(egraph)
-        .into_iter()
-        .filter_map(|(a, b)| {
-            let (ClassData::Operator(left), ClassData::Operator(right)) = (&egraph[a].data, &egraph[b].data) else { return None };
-            let residual = ndarray::Zip::from(&left.lower)
-                .and(&left.upper)
-                .and(&right.lower)
-                .and(&right.upper)
-                .fold(0.0_f64, |m, a, b, c, d| m.max((b - c).max(d - a).next_up()));
-            Some(NearOperators { left: a, right: b, residual })
-        })
-        .collect()
 }
 
 /// Saturate `program` under the laws, its gains kept symbolic, until a fixpoint or until the
@@ -1597,8 +1569,7 @@ pub fn saturate(program: &OperatorProgram, governor: &MemoryGovernor) -> Result<
         leaves: egraph.analysis.leaves.len(),
     };
     let root = egraph.find(root);
-    let near = near_operators(&egraph);
-    Ok(Saturation { egraph, root, report, near })
+    Ok(Saturation { egraph, root, report })
 }
 
 // ------------------------------------------------------------------------------------ extraction

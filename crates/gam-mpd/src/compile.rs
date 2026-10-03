@@ -94,8 +94,6 @@ use super::joint_operators::JointRefusal;
 use super::lift::{LiftError, TensorId, TensorRegistry};
 use super::secant::SecantError;
 use super::supports::{EvidenceStatus, EvidenceStatusError, ExactBasis};
-#[cfg(feature = "response")]
-use gam_response::intervention_shard::{InterventionChange, ParameterEditScope};
 
 pub mod bilinear;
 pub mod chart;
@@ -367,24 +365,6 @@ impl NativeEditPlan {
     /// Whether the plan is `ρ(0) = θ`.
     pub fn is_native(&self) -> bool {
         self.edits.is_empty()
-    }
-
-    /// The plan as the parameter-edit records a framework runner executes: one global
-    /// [`InterventionChange::ParameterEdit`] per edit, factors row-major.
-    #[cfg(feature = "response")]
-    pub fn intervention_changes(&self) -> Vec<InterventionChange> {
-        self.edits
-            .iter()
-            .map(|edit| InterventionChange::ParameterEdit {
-                parameter: edit.storage.0.clone(),
-                rows: edit.delta.output_dim(),
-                cols: edit.delta.input_dim(),
-                rank: edit.delta.term_count(),
-                left: edit.delta.left().iter().copied().collect(),
-                right: edit.delta.right().iter().copied().collect(),
-                scope: ParameterEditScope::Global,
-            })
-            .collect()
     }
 }
 

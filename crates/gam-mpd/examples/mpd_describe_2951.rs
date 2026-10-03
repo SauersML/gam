@@ -21,7 +21,7 @@
 //! generic rank-one subcomponents.
 
 use gam_mpd::blocks::{Bits, Blocked, Coded, Describe, Generic, fit_blocks, measure, reselect};
-use gam_mpd::describe::{Chart, Core, Metric, Structured, StructuredSite, describe};
+use gam_mpd::describe::{Chart, Core, Geometry, Metric, Structured};
 use gam_mpd::import::import;
 use gam_mpd::masked::{Library, Site, Target, read_values, site_statistics, sites};
 use gam_mpd::operator_program::{LabelKind, Node, OperatorBody, OperatorProgram, SlotValues};
@@ -177,8 +177,8 @@ fn main() -> Result<(), String> {
             writers.push(Chart::harmonic("class characters of the readout", map.view(), classes.view(), map.nrows())?);
         }
         eprintln!("{}: {}×{}, {} subcomponents, {} writer charts", site.name, measured.w.nrows(), measured.w.ncols(), libraries.last().map_or(0, |l| l.u.nrows()), writers.len());
-        structured_sites.push(StructuredSite { metric: Metric::of(measured, observations), writers, readers, same_space: false });
-        lattice_sites.push(StructuredSite { metric: Metric::of(measured, observations), writers: Vec::new(), readers: Vec::new(), same_space: false });
+        structured_sites.push(Geometry::new(Metric::of(measured, observations), writers, readers, false)?);
+        lattice_sites.push(Geometry::new(Metric::of(measured, observations), Vec::new(), Vec::new(), false)?);
     }
     // The generic family alone on the same exact lattice code, so the structured families are
     // compared with the identity charts under one code.
@@ -222,8 +222,7 @@ fn main() -> Result<(), String> {
     for (k, site) in chosen.iter().enumerate() {
         for (b, rank) in blocked.ranks[k].iter().enumerate() {
             let (u, v) = blocked.factors(k, b);
-            let s_ = &structured.sites[k];
-            let d = describe(&u.t().dot(&v), *rank, &s_.metric, &s_.writers, &s_.readers, false)?;
+            let d = structured.sites[k].describe(u, v)?;
             let mut rank_one_bits = 0.0;
             for c in 0..*rank {
                 rank_one_bits += generic.bits(k, u.slice(s![c..c + 1, ..]), v.slice(s![c..c + 1, ..]))?;
