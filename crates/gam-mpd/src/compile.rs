@@ -81,6 +81,21 @@
 //! * [`null`]: physically null edits, `sup_{uᵀGu ≤ 1} uᵀKu` on `range(G)`, refused when
 //!   `ker G ⊄ ker K`.
 //! * [`ties`]: declared ties between separately stored blocks, checked on a plan.
+//!
+//! # How small an edit can be
+//!
+//! To second order, with off-target disturbance `½ vᵀHv` (`H ≻ 0` the full coupled Fisher over
+//! every allowed parameter) and linearized requirements `Av = b`, the least disturbance is
+//! `½ bᵀ(AH⁻¹Aᵀ)⁺b`, at `v* = H⁻¹Aᵀ(AH⁻¹Aᵀ)⁺b`; one required gain `gᵀv ≥ s` costs
+//! `s²/(2 gᵀH⁻¹g)`, and inequalities `Av ≥ b` are bounded below by
+//! `sup_{λ ≥ 0} bᵀλ − ½ λᵀAH⁻¹Aᵀλ`. Every rank-restricted edit pays at least this. Adding hard
+//! requirements never lowers it, and the natural optimum of a fitted target is spectral shrinkage,
+//! `σ_i/(σ_i² + λ)` per singular direction of `AH^{−1/2}`, not a hard cutoff at `k` directions. Beyond
+//! second order the output space bounds any editor: making `o` the top token at a context costs
+//! at least `Σ_{i ∈ pool} p_i log(p_i/t)`, the pool being `o` and the largest other probabilities
+//! added while their mean `t` is below an unpooled one (KKT for `min KL(p ‖ q)` s.t. `q_o ≥ q_j`);
+//! `q_o ≥ s` costs at least `kl(p_o ‖ max(p_o, s))`. Success over a fraction of contexts weights
+//! these by the off-target density, so a target rare in general text has no positive floor.
 
 use std::fmt;
 

@@ -48,6 +48,17 @@
 //! concept when that is cheaper ([`Model::encode`]). Its bits split into the concept choices (what
 //! the text carries), the members given those choices and the subcomponents on their own
 //! ([`Bits`]), against the independent code that sends every subcomponent at its own rate.
+//!
+//! # What a concept's name does and does not carry
+//!
+//! A concept's invocation alone does not determine its members: two words with member patterns
+//! `(1, 0)` and `(0, 1)` can invoke the same concept, and the conditional member streams carry the
+//! difference. A text that names concepts is exact only together with those corrections. Decoding
+//! a text to the native on-sets is referential faithfulness; it does not make the words' English
+//! meaning an explanation (renaming every concept preserves the code). That needs the text's rules
+//! to predict declared interventions. For candidate groups with costs `c_g`, the best partition
+//! `min Σ c_g z_g` s.t. `Σ_{g ∋ j} z_g = 1` is bounded below by any `α` with
+//! `Σ_{j ∈ g} α_j ≤ c_g` (`Σ_j α_j`), which gives agglomeration a stopping gap.
 
 use super::codec::subset_code_len_bits;
 use rayon::prelude::*;

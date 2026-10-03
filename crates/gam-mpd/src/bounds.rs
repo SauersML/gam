@@ -122,6 +122,19 @@
 //! `p = (1 − π, π)` with `π = 1/(1 + e^{w/2})` has `μ = √(ab)` and attains it. It reads only the range, like P15, and it
 //! never exceeds `1`, where P15 through Pinsker (`TV ≤ w/4`) grows without bound. [`softmax_total_variation_bound`]
 //! evaluates it; [`total_variation_over_logit_boxes`] applies it over two logit boxes.
+//!
+//! # The Fisher sandwich
+//!
+//! With `F_p = diag p − ppᵀ`, `Q(δ) = ½ δᵀF_pδ` and `R = max δ − min δ`,
+//!
+//! ```text
+//! 2 c₋(R) Q(δ) ≤ KL(p ‖ softmax(z + δ)) ≤ 2 c₊(R) Q(δ),   c₊(R) = (e^R − 1 − R)/R²,  c₋(R) = (e^{−R} − 1 + R)/R²,
+//! ```
+//!
+//! both `½` at `R = 0`. Proof: `KL = ∫₀¹ (1 − t) Var_{p_t}(δ) dt` for `p_t = softmax(z + tδ)`, and
+//! `p_t/p ∈ [e^{−tR}, e^{tR}]` bounds the variance (the minimum over constants `a` of `E(δ − a)²`)
+//! within those factors. So second-order pricing fails exactly when the logits move far (binary
+//! log-odds 10 → −10: KL 9.999 against a quadratic 0.00908), not because `p` is peaked.
 
 use std::fmt;
 

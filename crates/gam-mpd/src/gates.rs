@@ -56,6 +56,18 @@
 //! the predicted bits of adding `a_k` linearly, `(Σ_t r_tj a_tk)² / (2 ln 2 Σ_t w_tj a_tk²)` with `r`
 //! the residual `y − p` and `w = p(1 − p)`. It only proposes (its products may run in f32 on the
 //! device); the refitted function's exact total decides.
+//!
+//! # When a switching function exists
+//!
+//! On a finite state domain, a deterministic valid switch reading only features `f(z)` exists iff
+//! `⋂_{z : f(z) = u} A(z) ≠ ∅` for every attainable `u`, `A(z)` the on-sets that meet the claim at
+//! state `z` (the optimal on-sets, for an optimal switch): every state sharing features must accept
+//! one common choice. When a decision depends on context the features don't carry, only a
+//! conservative switch exists. A switch's listing cannot beat `H(Y | F)` bits per label:
+//! `E[−log₂ q(Y | F)] = H(Y | F) + E_F KL(P(·|F) ‖ q(·|F))/ln 2`, so a long held-out listing can be
+//! missing information, not only a weak function. The escape weight `e` bounds a miss at
+//! `log₂(2(n + 1))` bits; it is insurance, not calibration, and the ladder's one-unit-at-a-time
+//! stop is not a global minimum (two units can pay only together).
 
 use super::codec::{prefix_integer_len_bits, signed_prefix_integer_len_bits};
 use super::device::{product_atb, proposing};

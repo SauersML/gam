@@ -73,8 +73,7 @@
 //! * every sum of nonnegative terms is rounded up.
 //!
 //! Operators with a low-rank body are refused, since their product is not stored. A form whose
-//! radius overflows makes every bound infinite. With `MPD_CERTIFY_TRACE` set, every node's mean
-//! half-width and each row's logit-gap widths go to stderr, to show where the relaxation widens.
+//! radius overflows makes every bound infinite.
 //!
 //! # Branching
 //!
@@ -82,6 +81,35 @@
 //! box at the gate whose setting matters most for the worst row: the largest `|∂KL/∂g|` times its
 //! width, at the box's center. It bounds each half, and the worst case is the largest bound over
 //! the leaves.
+//!
+//! # What an infinite bound means, and what bounds the problem allows
+//!
+//! An infinite bound is the relaxation's failure, not the model's. In real arithmetic every masked
+//! execution of an RMS-normed, linearly read head has a finite divergence: with `u = h / √(‖h‖²/d + ε)`
+//! (so `‖u‖ ≤ √d`), output rows `a_v = diag(w) E_v`, the target `p`, its entropy `H(p)` and its mean
+//! row `ā = Σ_v p_v a_v`,
+//!
+//! ```text
+//! KL(p ‖ q) = log Σ_v e^{(a_v − ā)ᵀu} − H(p) ≤ log Σ_v exp(√d ‖a_v − ā‖) − H(p),
+//! ```
+//!
+//! by Cauchy–Schwarz; no upstream gain enters. Forms that drop such facts lose them: an RMS norm
+//! is the first `d` coordinates of `√d h̃/‖h̃‖` with `h̃ = (h, √(dε))`, so two normalized states
+//! differ by at most `√d ‖w‖_∞ √(2(1 − cos θ))`, `θ` the angle between their augmented vectors, a
+//! bound that independent numerator and denominator intervals cannot see. Large factor norms do not
+//! by themselves force widths to grow: `x ↦ A x ↦ A⁻¹A x` is exact on shared symbols whatever
+//! `‖A‖‖A⁻¹‖` is.
+//!
+//! Two limits hold for any method. Approximating the worst KL over a gate box within a factor two
+//! is NP-hard already for two ReLU layers and a binary softmax (a 3-SAT reduction: gates `x_i`,
+//! `d_i = min(x_i, 1 − x_i)`, clause terms `ReLU(1 − L_j)`, and an output gap of `1/4` against
+//! `5/4`). Where the logits are affine in the gates, `δ(m) = b + A m` with certified oscillation
+//! `R`, the worst quadratic is `½ max_{s ∈ {±1}^{K+1}} sᵀGs` (`s = 2m − 1` plus one sign coordinate,
+//! `G = BᵀB`, `B = F_p^{1/2}[b + ½A1, ½A]`), its SDP relaxation `½ max {tr GX : X ⪰ 0, diag X = 1}`
+//! is within `π/2`, and with the Fisher sandwich of `bounds` it gives a certificate within
+//! `(π/2) c₊(R)/c₋(R)` of the true worst KL (1.919 at `R = 0.3`). A dual `λ` with
+//! `B diag(λ)⁻¹ Bᵀ ⪯ I` certifies `½ Σλ` in the response space of `B`, of rank `r ≪ K`. A found
+//! attack is only a lower bound, so the useful report is the interval [attack, certificate].
 
 use std::collections::HashMap;
 use std::sync::Arc;
