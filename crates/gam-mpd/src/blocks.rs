@@ -17,7 +17,8 @@
 //!
 //! [`Generic`] describes a rank-`r` block on a `d_in → d_out` site by its map `U Vᵀ` up to `GL(r)`:
 //! `r (d_in + d_out − r)` reals (`r` its numerical rank after balancing, so duplicate columns
-//! collapse), sent on one lattice step `δ` chosen against the expected KL of rounding to it,
+//! collapse), sent on one lattice step `δ` (at most the largest entry: at least a bit a real)
+//! chosen against the expected KL of rounding to it,
 //! `n/(2 ln 2) · δ²/12 · [tr F tr(VᵀCV) + tr C tr(UᵀFU)]` (`C` the reads' second moment, `F` the
 //! written value's Fisher, the factors balanced so `UᵀU = VᵀV = S`). Structured families plug in
 //! through the same trait.
@@ -107,9 +108,11 @@ impl Describe for Generic {
         if !(a > 0.0) {
             return Ok(0.0);
         }
-        let step = (reals / (2.0 * a * LN_2)).sqrt();
+        // `R log₂(2L/δ) + a δ²` is least at `δ = √(R / (2 a ln 2))`; a step past the largest entry `L`
+        // would round the block to nothing, so every real takes at least one bit (`δ ≤ L`).
         let largest = u.iter().chain(v.iter()).fold(0.0_f64, |m, x| m.max(x.abs()));
-        Ok(reals * ((2.0 * largest / step).log2().max(0.0) + 1.0 / (2.0 * LN_2)))
+        let step = (reals / (2.0 * a * LN_2)).sqrt().min(largest);
+        Ok(reals * (2.0 * largest / step).log2() + a * step * step)
     }
 }
 

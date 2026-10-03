@@ -222,7 +222,24 @@ class LM:
         name = "Qwen/Qwen2.5-1.5B-Instruct"
         self.torch = torch
         self.tok = AutoTokenizer.from_pretrained(name)
-        self.model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float16).to("mps").eval()
+        # Built on the device, then filled tensor by tensor from the checkpoint (a CPU copy of the
+        # whole model plus its device copy does not fit the memory lease).
+        from huggingface_hub import snapshot_download
+        from safetensors import safe_open
+        from transformers import AutoConfig
+
+        path = Path(snapshot_download(name, local_files_only=True))
+        with torch.device("mps"):
+            self.model = AutoModelForCausalLM.from_config(AutoConfig.from_pretrained(path), dtype=torch.float16)
+        params = dict(self.model.named_parameters()) | dict(self.model.named_buffers())
+        for shard in sorted(path.glob("*.safetensors")):
+            with safe_open(str(shard), framework="pt", device="cpu") as f:
+                for k in f.keys():
+                    if k in params:
+                        with torch.no_grad():
+                            params[k].copy_(f.get_tensor(k).to(torch.float16))
+        self.model.tie_weights()
+        self.model.eval()
 
     def nll(self, x, mask, chunk: int = 256):
         """Bits of each token after the first, [B, L - 1], the vocabulary's logits a chunk of

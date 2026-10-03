@@ -33,7 +33,7 @@
 //! block along a line, not the box of k independent masks: any robustness evaluation of these
 //! points masks each block's columns together, a weaker claim than per column.
 
-use gam_mpd::blocks::{Bits, Blocked, Coded, Generic, block_cosine, fit_blocks, measure, reselect};
+use gam_mpd::blocks::{Bits, Blocked, Coded, Describe, Generic, block_cosine, fit_blocks, measure, reselect};
 use gam_mpd::import::{import, import_language_model};
 use gam_mpd::masked::{Library, Site, Target, site_statistics, sites};
 use gam_mpd::operator_program::{FamilyInputs, LabelKind, OperatorProgram};
@@ -94,6 +94,12 @@ fn ranks(coded: &Coded<'_>, blocked: &Blocked) -> Value {
         })
         .collect();
     Value::Array(per_site)
+}
+
+/// A per-block mask (`rows × B`) on the blocks' columns (`ranks`, in column order).
+fn per_column(mask: &Array2<f64>, ranks: &[usize]) -> Array2<f64> {
+    let block_of: Vec<usize> = ranks.iter().enumerate().flat_map(|(b, r)| std::iter::repeat_n(b, *r)).collect();
+    Array2::from_shape_fn((mask.nrows(), block_of.len()), |(t, c)| mask[[t, block_of[c]]])
 }
 
 /// Each block's firing fraction over the coded rows.
@@ -174,6 +180,15 @@ fn modadd(dir: &Path, out: &Path, observations: f64, names: Option<Vec<String>>)
     let (blocked, block_bits) = fit_blocks(&coded, rank_one.clone(), true)?;
     say("rank one", &rank_one_bits);
     say("blocks", &block_bits);
+    // The same weights on the same words, every column its own subcomponent: equal KL, so the
+    // difference is the description alone.
+    let columns_on: Vec<Vec<Array2<f64>>> = blocked
+        .masks
+        .iter()
+        .map(|masks| masks.iter().zip(&blocked.ranks).map(|(m, r)| per_column(m, r)).collect())
+        .collect();
+    let (columns, _) = measure(&coded, &Blocked::rank_one(blocked.libraries.iter().map(|l| (**l).clone()).collect(), columns_on))?;
+    say("blocks' columns as rank-one subcomponents", &columns);
     let readout = token_operator(&program, true);
     let embedding = token_operator(&program, false);
     let mut described = Vec::new();
@@ -184,10 +199,19 @@ fn modadd(dir: &Path, out: &Path, observations: f64, names: Option<Vec<String>>)
             let (u, v) = (library.u.slice(ndarray::s![start..start + rank, ..]).t().to_owned(), library.v.slice(ndarray::s![start..start + rank, ..]).t().to_owned());
             start += rank;
             let side = |op: &Option<Array2<f64>>, m: &Array2<f64>| op.as_ref().filter(|w| w.ncols() == m.nrows()).map(|w| leading(&w.dot(m)));
+            let spectrum_of = |op: &Option<Array2<f64>>, m: &Array2<f64>| op.as_ref().filter(|w| w.ncols() == m.nrows()).map(|w| spectrum(&w.dot(m)));
+            let (block_u, block_v) = blocked.factors(k, b);
+            let mut as_columns = 0.0;
+            for j in 0..*rank {
+                as_columns += describe.bits(k, block_u.slice(ndarray::s![j..j + 1, ..]), block_v.slice(ndarray::s![j..j + 1, ..]))?;
+            }
             described.push(json!({
                 "site": site.name,
                 "rank": rank,
                 "bits": blocked.bits(k, b),
+                "columns_as_rank_one_bits": as_columns,
+                "output_spectrum": spectrum_of(&readout, &u),
+                "input_spectrum": spectrum_of(&embedding, &v),
                 "firing": firing(&blocked, k, b),
                 "output_frequency": side(&readout, &u),
                 "input_frequency": side(&embedding, &v),
@@ -196,7 +220,14 @@ fn modadd(dir: &Path, out: &Path, observations: f64, names: Option<Vec<String>>)
     }
     let report = json!({
         "observations": observations,
-        "points": [point("all on", &all_on), point("all off", &all_off), point("dense", &dense), point("rank one", &rank_one_bits), point("blocks", &block_bits)],
+        "points": [
+            point("all on", &all_on),
+            point("all off", &all_off),
+            point("dense", &dense),
+            point("rank one", &rank_one_bits),
+            point("blocks", &block_bits),
+            point("blocks' columns as rank-one subcomponents", &columns),
+        ],
         "rank_one_ranks": ranks(&coded, &rank_one),
         "block_ranks": ranks(&coded, &blocked),
         "blocks": described,
