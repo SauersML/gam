@@ -6,7 +6,7 @@
 # Picks the commit C (WANT_COMMIT when origin/main contains it, else origin/main) and snapshots its
 # source into ~/mpd-src/C (the job's working directory). Binaries come from ~/mpd-bin/B for a built
 # or queued commit B whose Rust sources (crates/, Cargo.*, rust-toolchain.toml) equal C's; only
-# otherwise is C built. Builds run in the debug QOS (2 h) as one Slurm singleton, at 16 CPUs so they
+# otherwise is C built. Builds run in the debug QOS (2 h) as one Slurm singleton, at 8 CPUs so they
 # fit between running jobs; they neither wait behind day-long jobs nor hold CPUs while queued.
 # MATS_CHAIN's segments are copies of the run job, each after the last (afterany). Prints the job id.
 set -Eeuo pipefail
@@ -88,7 +88,7 @@ if [ -z "$B" ]; then
         [ -n "${bc:-}" ] && alive "$bj" && same_rust "$bc" "$C" && { B=${bc:0:12}; break; }
     done
     if [ -z "$B" ]; then
-        bj=$(sbatch --parsable -J mpd-build --dependency=singleton -p compute --qos=debug -c 16 --mem=16G \
+        bj=$(sbatch --parsable -J mpd-build --dependency=singleton -p compute --qos=debug -c 8 --mem=12G \
             -t 00:30:00 -o "$CL/_build/build-$C12-%j.log" "$CL/_build/build.sh" "$C")
         echo "$bj $C" > "$BIN/$C12.buildjob"
         B=$C12
