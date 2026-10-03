@@ -95,6 +95,35 @@ fn up(device: &Device, m: &Array2<f64>) -> Tensor {
     device.upload(m.view()).expect("upload")
 }
 
+#[test]
+fn sampled_head_lookup_matches_full_pullback_in_both_orientations() {
+    let mut devices = vec![Device::host()];
+    devices.extend(accelerator());
+    let logits = ndarray::array![[0.0, 1.0, -1000.0], [1.0, 0.0, 2.0], [0.0, 0.0, 0.0]];
+    let head = ndarray::array![[2.0, -3.0], [0.5, 7.0], [-1.0, 4.0]];
+    for device in devices {
+        let flags = device.upload_indices(&[1, 0, 1]).expect("flags");
+        for transposed in [false, true] {
+            let weights = up(&device, &if transposed { head.t().to_owned() } else { head.clone() });
+            let op = if transposed { Op::T } else { Op::N };
+            let mut probabilities = up(&device, &logits);
+            device.softmax_rows(&mut probabilities, false).expect("softmax");
+            let mut mean = device.zeros(3, 2).expect("mean");
+            device.gemm(&mut mean, 1.0, &probabilities, Op::N, &weights, op, 0.0, Arithmetic::F64).expect("mean projection");
+            for u in [0.0, 0.2, 0.7, 1.0 - f64::EPSILON] {
+                let uniforms = up(&device, &Array2::from_elem((3, 1), u));
+                let shared = device.sampled_head_cotangent(&probabilities, &mean, &weights, transposed, &uniforms, Some(&flags)).expect("lookup");
+                let mut cotangent = up(&device, &logits);
+                device.sampled_cotangent(&mut cotangent, &uniforms, Some(&flags)).expect("sample");
+                let mut reference = device.zeros(3, 2).expect("reference");
+                device.gemm(&mut reference, 1.0, &cotangent, Op::N, &weights, op, 0.0, Arithmetic::F64).expect("pullback");
+                assert_within("sampled head lookup", &down(&device, &shared), &down(&device, &reference), |_, _| 1e-13);
+                assert!(down(&device, &shared).row(1).iter().all(|g| *g == 0.0));
+            }
+        }
+    }
+}
+
 fn down(device: &Device, t: &Tensor) -> Array2<f64> {
     device.download(t).expect("download")
 }

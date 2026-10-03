@@ -105,3 +105,70 @@ fn checkpoints_round_trip_bit_for_bit_and_survive_an_interrupted_save() {
     same(&first, &loaded(&dir).0);
     std::fs::remove_dir_all(&root).expect("removed");
 }
+
+/// The masked fit of `sequence` (6 tokens of the small rotary model): selection from every piece
+/// on, then one pieces step, with the counts and preconditioners carried in.
+fn fit_sequence(
+    masked: &mut super::masked::Masked,
+    family: &super::operator_program::FamilyInputs,
+    sequence: usize,
+    context: &Context,
+    running: &mut Running,
+) -> (Vec<Array2<f64>>, Option<(f64, f64)>) {
+    use super::masked::{Claim, Target, previous_inputs, select, step_pieces};
+    let rows: Vec<usize> = (sequence * 6..(sequence + 1) * 6).collect();
+    let inputs = family.select(&rows);
+    let target = Target::every_row(masked.program.execute(&masked.family(&inputs, &masked.all_pieces().iter().map(|p| Array2::ones((6, *p))).collect::<Vec<_>>()), false).expect("forward").values[masked.program.output].mapv(|v| v * 1.1));
+    let start: Vec<Array2<f64>> = masked.all_pieces().iter().map(|p| Array2::ones((6, *p))).collect();
+    let coder = context.coder(previous_inputs(&inputs));
+    let (masks, _) = select(masked, &inputs, &target, start, &coder, 64.0, 2).expect("select");
+    let step = step_pieces(masked, &inputs, &target, &masks, 2, 0xF00D + sequence as u64, running, Claim::Corner).expect("step");
+    (masks, step)
+}
+
+#[test]
+fn a_resumed_fit_takes_the_uninterrupted_fits_next_decisions_bit_for_bit() {
+    use super::device_program_tests::fixture;
+    use super::masked::{Masked, sites};
+    let (program, family) = fixture();
+    let all = sites(&program);
+    let libraries: Vec<Library> = all
+        .iter()
+        .enumerate()
+        .map(|(k, site)| {
+            let (d_out, d_in) = super::masked::matrix(&program, site).expect("map").dim();
+            Library {
+                v: Array2::from_shape_fn((3, d_in), |(i, j)| 0.5 * noise(10_000 * k + 37 * i + j)),
+                u: Array2::from_shape_fn((3, d_out), |(i, j)| 0.5 * noise(10_000 * k + 5000 + 37 * i + j)),
+                mean: Array1::zeros(d_in),
+            }
+        })
+        .collect();
+    let counts = |masked: &Masked| Context::new(&masked.all_pieces());
+    // Uninterrupted: sequences 0 and 1.
+    let mut through = Masked::build(&program, all.clone(), libraries.clone()).expect("masked");
+    let mut running = Running::default();
+    let context = counts(&through);
+    fit_sequence(&mut through, &family, 0, &context, &mut running);
+    let expected = fit_sequence(&mut through, &family, 1, &context, &mut running);
+    // Interrupted after sequence 0: checkpointed, then a fresh process rebuilt from the checkpoint.
+    let dir = std::env::temp_dir().join(format!("gam-mpd-resume-{}", std::process::id()));
+    {
+        let mut first = Masked::build(&program, all.clone(), libraries).expect("masked");
+        let mut running = Running::default();
+        fit_sequence(&mut first, &family, 0, &context, &mut running);
+        let saved: Vec<Library> = (0..first.sites.len()).map(|k| first.library(k).expect("library")).collect();
+        save(&dir, &Saved { driver: &json!({"next": 1}), libraries: &saved, context: &context, running: &running, sets: Vec::new() }).expect("saved");
+    }
+    let loaded = load(&dir).expect("readable").expect("a checkpoint");
+    let mut resumed = Masked::build(&program, all, loaded.libraries).expect("masked");
+    let mut running = loaded.running;
+    let got = fit_sequence(&mut resumed, &family, 1, &loaded.context, &mut running);
+    std::fs::remove_dir_all(&dir).expect("removed");
+    assert_eq!(got.0, expected.0, "the resumed selection's sets");
+    assert_eq!(got.1.map(|(a, b)| (a.to_bits(), b.to_bits())), expected.1.map(|(a, b)| (a.to_bits(), b.to_bits())), "the resumed step's totals");
+    for k in 0..through.sites.len() {
+        let (a, b) = (through.library(k).expect("library"), resumed.library(k).expect("library"));
+        assert!(a.v.iter().zip(b.v.iter()).chain(a.u.iter().zip(b.u.iter())).all(|(x, y)| x.to_bits() == y.to_bits()), "site {k}'s library");
+    }
+}

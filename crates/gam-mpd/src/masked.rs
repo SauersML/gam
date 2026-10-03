@@ -705,7 +705,7 @@ pub fn forward(masked: &Masked, family: &FamilyInputs, target: &Target) -> Resul
 /// Candidate forward and loss without a cotangent or downstream-head pullback.
 fn scored_forward(masked: &Masked, family: &FamilyInputs, target: &Target) -> Result<(Array1<f64>, Trace), String> {
     let trace = masked.program.execute(family, false).map_err(|e| e.to_string())?;
-    let values = kl_score_only(target, &logits(masked, family, &trace, target)?);
+    let values = kl_score_only(target, &*logits(masked, family, &trace, target)?);
     Ok((values, trace))
 }
 
@@ -734,7 +734,9 @@ fn gradients_proposed(
     masks: &[Array2<f64>],
     cotangent: Array2<f64>,
 ) -> Result<Vec<(Array2<f64>, Array2<f64>, Array2<f64>)>, String> {
-    let back = vjp(&masked.program, family, trace, cotangent).map_err(|e| e.to_string())?;
+    let mut keep = masked.masked.clone();
+    keep.extend(masked.written.iter().flatten().copied());
+    let back = super::derivatives::vjp_from(&masked.program, family, trace, masked.program.output, cotangent, Some(&keep)).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for (k, site) in masked.sites.iter().enumerate() {
         let pieces = masked.pieces[k];
@@ -763,7 +765,7 @@ fn gradients_proposed(
 /// reverse pass: what the selection ranks flips by (a proposal, as [`gradients`]), without the
 /// pieces' own gradients.
 pub fn mask_gradients(masked: &Masked, family: &FamilyInputs, trace: &Trace, cotangent: Array2<f64>) -> Result<Vec<Array2<f64>>, String> {
-    let back = proposing(|| vjp(&masked.program, family, trace, cotangent)).map_err(|e| e.to_string())?;
+    let back = proposing(|| super::derivatives::vjp_from(&masked.program, family, trace, masked.program.output, cotangent, Some(&masked.masked))).map_err(|e| e.to_string())?;
     Ok((0..masked.sites.len())
         .map(|k| {
             let z = &trace.values[masked.z[k]];
@@ -915,7 +917,11 @@ pub fn fisher(
     seed: u64,
     written: bool,
 ) -> Result<Vec<(Array2<f64>, Option<Array2<f64>>)>, String> {
+    if samples == 0 { return Err("Fisher needs at least one sample".to_string()); }
     let logits = logits(masked, family, trace, target)?;
+    let mut keep = masked.masked.clone();
+    if written { keep.extend(masked.written.iter().flatten().copied()); }
+    let head = CachedSampledHead::new(masked, &logits, target, &keep)?;
     let mut rng = XorShift(seed | 1);
     let mut out: Vec<(Array2<f64>, Option<Array2<f64>>)> = masked
         .sites
@@ -927,9 +933,14 @@ pub fn fisher(
         })
         .collect();
     for _ in 0..samples {
-        let cotangent = sampled_cotangent(&logits, &mut rng, target.scored.as_deref());
-        let cotangent = to_output(masked, family, trace, target, cotangent)?;
-        let back = proposing(|| vjp(&masked.program, family, trace, cotangent)).map_err(|e| e.to_string())?;
+        let (node, cotangent) = match &head {
+            Some(head) => (head.hidden, head.sample(masked, target, &mut rng)),
+            None => {
+                let cotangent = sampled_cotangent(&logits, &mut rng, target.scored.as_deref());
+                (masked.program.output, to_output(masked, family, trace, target, cotangent)?)
+            }
+        };
+        let back = proposing(|| super::derivatives::vjp_from(&masked.program, family, trace, node, cotangent, Some(&keep))).map_err(|e| e.to_string())?;
         for (k, (h, f)) in out.iter_mut().enumerate() {
             if let Some(c) = &back[masked.masked[k]] {
                 let g = masked.to_blocks(k, &(c * &trace.values[masked.z[k]]));
@@ -953,6 +964,62 @@ pub fn fisher(
         }
     }
     Ok(out)
+}
+
+/// Sufficient sampling data for one fixed forward's linear output head. Built anew for each
+/// Fisher call, so edits to tied or ordinary output weights cannot leave a stale cache.
+struct CachedSampledHead {
+    hidden: usize,
+    operator: usize,
+    transposed: bool,
+    probabilities: Array2<f64>,
+    mean: Array2<f64>,
+}
+
+impl CachedSampledHead {
+    fn new(masked: &Masked, logits: &Array2<f64>, target: &Target, keep: &[usize]) -> Result<Option<Self>, String> {
+        if masked.head.is_some() { return Ok(None); }
+        let program = &masked.program;
+        let output = match &program.nodes[program.output] {
+            Node::Readout { input, basis } => {
+                if !matches!(program.bases[*basis], super::operator_program::Basis::Indicator { .. }) { return Ok(None); }
+                *input
+            }
+            _ => program.output,
+        };
+        let (hidden, operator, transposed) = match &program.nodes[output] {
+            Node::Affine { terms, .. } if terms.len() == 1 => (terms[0].0, terms[0].1, false),
+            Node::Transposed { input, operator } => (*input, *operator, true),
+            _ => return Ok(None),
+        };
+        if keep.iter().any(|node| *node > hidden) || !matches!(program.operators[operator].body, OperatorBody::Dense { .. }) {
+            return Ok(None);
+        }
+        let mut probabilities = Array2::zeros(logits.dim());
+        for r in 0..logits.nrows() {
+            if target.scores(r) { probabilities.row_mut(r).assign(&softmax(logits.row(r))); }
+        }
+        let layout = if transposed { gam_gpu::banded::Layout::Transposed } else { gam_gpu::banded::Layout::AsStored };
+        let mean = super::device::product(&program.operators[operator], &probabilities, layout).map_err(|e| e.to_string())?;
+        Ok(Some(Self { hidden, operator, transposed, probabilities, mean }))
+    }
+
+    fn sample(&self, masked: &Masked, target: &Target, rng: &mut XorShift) -> Array2<f64> {
+        let weights = masked.program.operators[self.operator].matrix_cow();
+        let mut seed = self.mean.clone();
+        for r in 0..seed.nrows() {
+            if !target.scores(r) { continue; }
+            let mut pick = rng.next();
+            let mut label = self.probabilities.ncols() - 1;
+            for (c, p) in self.probabilities.row(r).iter().enumerate() {
+                if pick < *p { label = c; break; }
+                pick -= p;
+            }
+            if self.transposed { seed.row_mut(r).scaled_add(-1.0, &weights.column(label)); }
+            else { seed.row_mut(r).scaled_add(-1.0, &weights.row(label)); }
+        }
+        seed
+    }
 }
 
 /// Each piece's listing bits at its firing frequency in `masks` (half a count each added).
@@ -1187,7 +1254,7 @@ impl Selected {
             Self::Host(trace, cotangent) => {
                 let cotangent = match cotangent.take() {
                     Some(c) => c,
-                    None => to_output(masked, family, trace, target, kl(target, &logits(masked, family, trace, target)?).1)?,
+                    None => to_output(masked, family, trace, target, kl(target, &*logits(masked, family, trace, target)?).1)?,
                 };
                 mask_gradients(masked, family, trace, cotangent)
             }
@@ -1372,9 +1439,11 @@ pub fn select_observed(
             let k = flipped[r] as f64;
             alpha[r] = ((predicted - actual) / (k * k)).max(0.0);
         }
+        let mut sequence_rows = vec![0usize; sequences];
         for r in 0..rows {
             sequence_saving[sequence_of[r]] += before[r] - after[r];
             sequence_flips[sequence_of[r]] = sequence_flips[sequence_of[r]].max(flipped[r]);
+            sequence_rows[sequence_of[r]] += usize::from(scores[r]);
         }
         let (mut kept, mut tried, mut saved) = (0usize, 0usize, 0.0);
         for q in 0..sequences {
@@ -1385,7 +1454,8 @@ pub fn select_observed(
             if sequence_saving[q] > 0.0 {
                 saved += sequence_saving[q];
                 kept += 1;
-                cap[q] = usize::MAX;
+                // A sequence whose kept round saved less than a bit per scored input is done.
+                cap[q] = if sequence_saving[q] < sequence_rows[q] as f64 { 0 } else { usize::MAX };
             } else {
                 cap[q] = if sequence_flips[q] <= 1 { 0 } else { sequence_flips[q] / 2 };
             }
@@ -1407,15 +1477,16 @@ pub fn select_observed(
         }
         let per_scored = |code: &Array1<f64>| (0..rows).filter(|r| target.scores(*r)).map(|r| code[r]).sum::<f64>() / scored.max(1) as f64;
         log::info!(
-            "selection round {round} ({:.0}s): {} inputs flipped {} entries, {kept} of {tried} sequences kept; code {:.1} -> {:.1} bits per input",
+            "selection round {round} ({:.0}s): {} inputs flipped {} entries, {kept} of {tried} sequences kept, {saved:.0} bits saved; code {:.1} -> {:.1} bits per input",
             started.elapsed().as_secs_f64(),
             flipped.iter().filter(|f| **f > 0).count(),
             flipped.iter().sum::<usize>(),
             per_scored(&before),
             per_scored(&after)
         );
-        // Done when no input can change, or when a round saves less than a bit per scored input.
-        if kept > 0 && saved < scored as f64 {
+        // Done when every sequence is done (each on its own evidence, so a batch of sequences
+        // selects exactly as each would alone).
+        if cap.iter().all(|c| *c == 0) {
             let kl_final = match (next_forward.take(), reuse.take()) {
                 (Some((kl, _)), _) | (None, Some((kl, _, _))) => kl,
                 (None, None) => {

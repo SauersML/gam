@@ -789,6 +789,39 @@ fn prefixes(chart: &Chart, ranked: &[(usize, f64)], scale: f64) -> Vec<Vec<usize
     out
 }
 
+/// The minimum of `f` over `0..len` by ternary search on the prefix length (the total is unimodal
+/// in it to the order the search relies on: description bits grow with every group added, the error
+/// they leave falls with diminishing returns), each value computed once; `None` when every value is
+/// infinite.
+fn minimize(len: usize, f: &mut dyn FnMut(usize) -> Result<f64, String>) -> Result<Option<usize>, String> {
+    let mut memo: Vec<Option<f64>> = vec![None; len];
+    let mut at = |n: usize, f: &mut dyn FnMut(usize) -> Result<f64, String>| -> Result<f64, String> {
+        if let Some(v) = memo[n] {
+            return Ok(v);
+        }
+        let v = f(n)?;
+        memo[n] = Some(v);
+        Ok(v)
+    };
+    let (mut lo, mut hi) = (0, len);
+    while hi - lo > 3 {
+        let (a, b) = (lo + (hi - lo) / 3, hi - 1 - (hi - lo) / 3);
+        if at(a, f)? <= at(b, f)? {
+            hi = b;
+        } else {
+            lo = a + 1;
+        }
+    }
+    let mut best: Option<(usize, f64)> = None;
+    for n in lo..hi {
+        let v = at(n, f)?;
+        if v.is_finite() && best.is_none_or(|(_, b)| v < b) {
+            best = Some((n, v));
+        }
+    }
+    Ok(best.map(|(n, _)| n))
+}
+
 /// A chart prepared on its side's metric: each group's pseudo-inverse Gram and, for the identity,
 /// the metric's pseudo-inverse root.
 struct Prepared {
@@ -862,10 +895,16 @@ impl Geometry {
             for (j, reader) in self.readers.iter().enumerate() {
                 let (ws, rs) = (&writer_sets[i], &reader_sets[j]);
                 let (Some(mut wg), Some(mut rg)) = (ws.last().cloned(), rs.last().cloned()) else { continue };
+                // A side with one set is scanned once, by whichever pass comes first.
+                let mut scanned = false;
                 for _ in 0..2 {
                     for (side, sets) in [(0, rs), (1, ws)] {
-                        let mut chosen: Option<(Vec<usize>, f64)> = None;
-                        for set in sets {
+                        if sets.len() == 1 && scanned {
+                            continue;
+                        }
+                        scanned = true;
+                        let mut evaluate = |n: usize| -> Result<f64, String> {
+                            let set = &sets[n];
                             let (w_, r_) = if side == 0 { (&wg, set) } else { (set, &rg) };
                             let floor = charts_bits
                                 + core_bits
@@ -873,21 +912,22 @@ impl Geometry {
                                 + reader.chart.subset_bits(r_.len())?
                                 + w_.len().min(r_.len()) as f64;
                             if best.as_ref().is_some_and(|b| floor >= b.total()) {
-                                break;
+                                return Ok(f64::INFINITY);
                             }
-                            let Some(found) = context.evaluate((i, writer, w_.as_slice()), (j, reader, r_.as_slice()))? else { continue };
-                            if chosen.as_ref().is_none_or(|c| found.total() < c.1) {
-                                chosen = Some((set.clone(), found.total()));
-                            }
-                            if best.as_ref().is_none_or(|b| found.total() < b.total()) {
+                            let Some(found) = context.evaluate((i, writer, w_.as_slice()), (j, reader, r_.as_slice()))? else {
+                                return Ok(f64::INFINITY);
+                            };
+                            let total = found.total();
+                            if best.as_ref().is_none_or(|b| total < b.total()) {
                                 best = Some(found);
                             }
-                        }
-                        if let Some((set, _)) = chosen {
+                            Ok(total)
+                        };
+                        if let Some(n) = minimize(sets.len(), &mut evaluate)? {
                             if side == 0 {
-                                rg = set;
+                                rg = sets[n].clone();
                             } else {
-                                wg = set;
+                                wg = sets[n].clone();
                             }
                         }
                     }

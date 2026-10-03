@@ -144,6 +144,9 @@ impl Accelerated {
     ) -> Result<Vec<(Array2<f64>, Option<Array2<f64>>)>, String> {
         let d = self.program.device();
         let rows = state.trace.rows;
+        if samples == 0 || target.scored.as_ref().is_some_and(|s| s.len() != rows) {
+            return Err("device: Fisher needs samples and one scored flag per row".to_string());
+        }
         let mut keep = masked.masked.clone();
         if written {
             keep.extend(masked.sites.iter().flat_map(|s| s.writes.iter().copied()));
@@ -161,36 +164,43 @@ impl Accelerated {
             masked.sites.iter().map(|s| (0..s.writes.len()).map(|_| (0..s.writes.len()).map(|_| None).collect()).collect()).collect();
         let mut rng = Uniforms(seed | 1);
         let scored = |r: usize| target.scored.as_ref().is_none_or(|s| s[r]);
-        for _ in 0..samples {
-            let uniforms: Vec<f64> = (0..rows).map(|r| if scored(r) { rng.next() } else { 0.0 }).collect();
-            let g_hidden = self.program.sampled(&state.trace, &uniforms, target.scored.as_deref(), self.proposal)?;
-            let back = self.cotangents(&state.trace, g_hidden, &keep)?;
-            for (k, hk) in h.iter_mut().enumerate() {
-                if let Some(c) = back.get(&masked.masked[k]) {
-                    let z = state.trace.value(masked.z[k])?;
-                    let mut g = d.zeros(z.rows(), z.cols()).map_err(error)?;
-                    d.hadamard(&mut g, c, z, false).map_err(error)?;
-                    match &mut h_blocks[k] {
-                        Some(hb) => {
-                            let gb = masked.to_blocks(k, &d.download(&g).map_err(error)?);
-                            *hb += &(&gb * &gb);
+        // Preserve the old sample-major RNG order, but share the expensive vocabulary work.
+        // At most eight seeds and about 64 MiB at once (or one seed if it exceeds that).
+        let seed_bytes = rows.saturating_mul(state.trace.value(self.program.hidden())?.cols()).saturating_mul(8).max(1);
+        let batch = ((64 * 1024 * 1024) / seed_bytes).clamp(1, 8);
+        for start in (0..samples).step_by(batch) {
+            let uniforms: Vec<Vec<f64>> = (start..samples.min(start + batch))
+                .map(|_| (0..rows).map(|r| if scored(r) { rng.next() } else { 0.0 }).collect()).collect();
+            let seeds = self.program.sampled_many(&state.trace, &uniforms, target.scored.as_deref())?;
+            for g_hidden in seeds {
+                let back = self.cotangents(&state.trace, g_hidden, &keep)?;
+                for (k, hk) in h.iter_mut().enumerate() {
+                    if let Some(c) = back.get(&masked.masked[k]) {
+                        let z = state.trace.value(masked.z[k])?;
+                        let mut g = d.zeros(z.rows(), z.cols()).map_err(error)?;
+                        d.hadamard(&mut g, c, z, false).map_err(error)?;
+                        match &mut h_blocks[k] {
+                            Some(hb) => {
+                                let gb = masked.to_blocks(k, &d.download(&g).map_err(error)?);
+                                *hb += &(&gb * &gb);
+                            }
+                            None => d.hadamard(hk, &g, &g, true).map_err(error)?,
                         }
-                        None => d.hadamard(hk, &g, &g, true).map_err(error)?,
                     }
-                }
-                if !written {
-                    continue;
-                }
-                let writes = &masked.sites[k].writes;
-                for (i, wi) in writes.iter().enumerate() {
-                    for (j, wj) in writes.iter().enumerate() {
-                        let (Some(gi), Some(gj)) = (back.get(wi), back.get(wj)) else { continue };
-                        let block = &mut blocks[k][i][j];
-                        if block.is_none() {
-                            *block = Some(d.zeros(gi.cols(), gj.cols()).map_err(error)?);
+                    if !written {
+                        continue;
+                    }
+                    let writes = &masked.sites[k].writes;
+                    for (i, wi) in writes.iter().enumerate() {
+                        for (j, wj) in writes.iter().enumerate() {
+                            let (Some(gi), Some(gj)) = (back.get(wi), back.get(wj)) else { continue };
+                            let block = &mut blocks[k][i][j];
+                            if block.is_none() {
+                                *block = Some(d.zeros(gi.cols(), gj.cols()).map_err(error)?);
+                            }
+                            let target = block.as_mut().ok_or("device: fisher block")?;
+                            d.gemm(target, 1.0, gi, Op::T, gj, Op::N, 1.0, self.proposal).map_err(error)?;
                         }
-                        let target = block.as_mut().ok_or("device: fisher block")?;
-                        d.gemm(target, 1.0, gi, Op::T, gj, Op::N, 1.0, self.proposal).map_err(error)?;
                     }
                 }
             }
@@ -292,10 +302,10 @@ impl Accelerated {
         let d = self.program.device();
         let rows = state.trace.rows as f64;
         let mut out = Vec::new();
-        for (k, site) in masked.sites.iter().enumerate() {
-            let mut centred: Vec<Tensor> = Vec::new();
+        for site in &masked.sites {
+            let mut centred: Vec<&Tensor> = Vec::new();
             for read in &site.reads {
-                centred.push(d.copy(state.trace.value(*read)?).map_err(error)?);
+                centred.push(state.trace.value(*read)?);
             }
             let width: usize = centred.iter().map(|c| c.cols()).sum();
             let mut covariance = Array2::<f64>::zeros((width, width));
@@ -305,12 +315,16 @@ impl Accelerated {
                 oi += ci.cols();
             }
             for (i, ci) in centred.iter().enumerate() {
-                for (j, cj) in centred.iter().enumerate() {
+                for (j, cj) in centred.iter().enumerate().skip(i) {
                     let mut block = d.zeros(ci.cols(), cj.cols()).map_err(error)?;
                     d.gemm(&mut block, 1.0 / rows, ci, Op::T, cj, Op::N, 0.0, self.proposal).map_err(error)?;
+                    let values = d.download(&block).map_err(error)?;
                     covariance
                         .slice_mut(s![blocks[i]..blocks[i] + ci.cols(), blocks[j]..blocks[j] + cj.cols()])
-                        .assign(&d.download(&block).map_err(error)?);
+                        .assign(&values);
+                    if i != j {
+                        covariance.slice_mut(s![blocks[j]..blocks[j] + cj.cols(), blocks[i]..blocks[i] + ci.cols()]).assign(&values.t());
+                    }
                 }
             }
             out.push(covariance);

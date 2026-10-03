@@ -830,3 +830,37 @@ fn language_model(tensors: &Tensors<'_>, record: &Value, blocks: std::ops::Range
         output,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{hugging_face_language_model, refuse_unsupported};
+    use serde_json::json;
+
+    /// A configuration the program does not compute is refused, never imported as another function.
+    #[test]
+    fn unsupported_rope_scaling_and_sliding_windows_are_refused() {
+        assert!(refuse_unsupported(&json!({})).is_ok());
+        assert!(refuse_unsupported(&json!({"rope_scaling": null})).is_ok());
+        assert!(refuse_unsupported(&json!({"rope_scaling": {"rope_type": "default"}})).is_ok());
+        assert!(refuse_unsupported(&json!({"rope_scaling": {"rope_type": "yarn", "factor": 4.0}})).is_err());
+        assert!(refuse_unsupported(&json!({"rope_scaling": {"type": "linear", "factor": 2.0}})).is_err());
+        assert!(refuse_unsupported(&json!({"partial_rotary_factor": 0.5})).is_err());
+        assert!(refuse_unsupported(&json!({"use_sliding_window": true, "sliding_window": 4096})).is_err());
+        assert!(refuse_unsupported(&json!({"use_sliding_window": false, "sliding_window": 4096})).is_ok());
+        assert!(refuse_unsupported(&json!({"sliding_window": 4096})).is_err());
+        assert!(refuse_unsupported(&json!({"layer_types": ["full_attention", "sliding_attention"]})).is_err());
+        assert!(refuse_unsupported(&json!({"layer_types": ["full_attention", "full_attention"]})).is_ok());
+    }
+
+    /// A sharded checkpoint is refused before any tensor is read.
+    #[test]
+    fn a_sharded_checkpoint_is_refused() {
+        let dir = std::env::temp_dir().join(format!("gam-mpd-sharded-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temporary directory");
+        std::fs::write(dir.join("config.json"), "{}").expect("config");
+        std::fs::write(dir.join("model.safetensors.index.json"), "{}").expect("index");
+        let refused = hugging_face_language_model(&dir, 0..1).expect_err("a sharded checkpoint is refused");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+        assert!(refused.contains("sharded"), "{refused}");
+    }
+}

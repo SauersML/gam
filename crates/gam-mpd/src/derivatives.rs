@@ -374,10 +374,29 @@ pub fn vjp(
     trace: &Trace,
     output: Array2<f64>,
 ) -> Result<Vec<Option<Array2<f64>>>, ProgramError> {
+    vjp_from(program, inputs, trace, program.output, output, None)
+}
+
+/// Reverse from a node, retaining only the requested cotangents when `keep` is present.
+/// Unrequested intermediates are consumed in place and released after their reverse rule.
+pub(crate) fn vjp_from(
+    program: &OperatorProgram, inputs: &FamilyInputs, trace: &Trace, seed_node: usize,
+    output: Array2<f64>, keep: Option<&[usize]>,
+) -> Result<Vec<Option<Array2<f64>>>, ProgramError> {
     let interfaces = program.interfaces()?;
     let rows = inputs.rows;
+    if seed_node >= interfaces.len() || output.dim() != (rows, interfaces[seed_node].width()) {
+        return Err(refuse("reverse seed shape does not match its node".to_string()));
+    }
+    let mut retained = vec![keep.is_none(); program.nodes.len()];
+    if let Some(keep) = keep {
+        for &node in keep {
+            if node >= retained.len() { return Err(refuse("retained cotangent node out of range".to_string())); }
+            retained[node] = true;
+        }
+    }
     let mut g: Vec<Option<Array2<f64>>> = vec![None; program.nodes.len()];
-    g[program.output] = Some(output);
+    g[seed_node] = Some(output);
     let value = |node: usize| &trace.values[node];
     fn add(g: &mut [Option<Array2<f64>>], node: usize, term: Array2<f64>) {
         match g[node].as_mut() {
@@ -386,7 +405,8 @@ pub fn vjp(
         }
     }
     for index in (0..program.nodes.len()).rev() {
-        let Some(cot) = g[index].clone() else { continue };
+        let Some(cot) = g[index].take() else { continue };
+        if retained[index] { g[index] = Some(cot.clone()); }
         let node = &program.nodes[index];
         match node {
             Node::Feature { .. } | Node::Raw { .. } | Node::Constant { .. } => {}

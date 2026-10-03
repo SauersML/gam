@@ -127,7 +127,7 @@ impl Switch {
 }
 
 /// `x`'s entries row after row, borrowed when `x` is already laid out so.
-fn row_major(x: ArrayView2<f64>) -> Cow<'_, [f64]> {
+fn row_major(x: ArrayView2<'_, f64>) -> Cow<'_, [f64]> {
     match x.to_slice() {
         Some(s) => Cow::Borrowed(s),
         None => Cow::Owned(x.iter().copied().collect()),

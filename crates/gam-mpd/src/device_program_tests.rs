@@ -213,6 +213,31 @@ fn a_family_whose_sequences_are_not_equal_blocks_is_refused() {
     assert!(lowered.forward(&ragged).is_err());
 }
 
+#[test]
+fn shared_sampled_head_seeds_match_independent_head_pullbacks() {
+    let (program, family) = fixture();
+    let uniforms: Vec<Vec<f64>> = (0..5).map(|s| (0..family.rows).map(|r| ((r * 13 + s * 7) % 101) as f64 / 101.0).collect()).collect();
+    let scored: Vec<bool> = (0..family.rows).map(|r| r % 3 != 1).collect();
+    for device in devices() {
+        let lowered = DeviceProgram::compile(&device, &program).expect("lowered");
+        let trace = lowered.forward(&family).expect("trace");
+        for flags in [None, Some(scored.as_slice())] {
+            let seeds = lowered.sampled_many(&trace, &uniforms, flags).expect("shared seeds");
+            for (u, seed) in uniforms.iter().zip(seeds) {
+                let reference = lowered.sampled(&trace, u, flags, Arithmetic::F64).expect("independent seed");
+                let reference = device.download(&reference).expect("download");
+                let actual = device.download(&seed).expect("download");
+                for ((r, c), value) in actual.indexed_iter() {
+                    assert!((value - reference[[r, c]]).abs() < 1e-12, "{}: seed at ({r}, {c})", device.name());
+                    if flags.is_some_and(|s| !s[r]) { assert_eq!(*value, 0.0); }
+                }
+            }
+        }
+        assert!(lowered.sampled_many(&trace, &[], None).expect("no samples").is_empty());
+        assert!(lowered.sampled_many(&trace, &[vec![0.5]], None).is_err());
+    }
+}
+
 /// `program` as the importer used to build it: each norm gain a dense matrix with its diagonal
 /// blocks present, and the token feature also read by an unread concatenation, so its one-hot rows
 /// are formed and every affine term reads them as a matrix.

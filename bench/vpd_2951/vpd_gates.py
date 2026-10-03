@@ -87,6 +87,8 @@ def cmd_kl(spec: str, rows: str) -> None:
     sys.path.insert(0, str(Path(__file__).parent))
     from vpd_eval import kl_per_pos  # noqa: E402
 
+    DEV = "cpu"  # a row at a time; the CPU's footprint stays within a 2 GiB lease, the GPU allocator's does not
+
     lo, hi = (int(v) for v in rows.split(":"))
     z = np.load(FRONTIER)
     ids = torch.tensor(z["ids"][lo:hi].astype(np.int64))
@@ -97,12 +99,14 @@ def cmd_kl(spec: str, rows: str) -> None:
     sites = driver_sites()
     offs = np.cumsum([0] + [c for _, _, c in sites])
     target = load_target(DEV)
-    raw = torch.load(str(VPD_PTH), map_location="cpu", weights_only=True, mmap=True)
-    for _, vn, _ in sites:
+    # The library's own float64 files (pieces × d per side), not the checkpoint with its CI network.
+    for dn, vn, c in sites:
         st = target.site(vn)
-        k = "_components." + vn.replace(".", "-")
-        st.U, st.V = raw[k + ".U"].float().to(DEV), raw[k + ".V"].float().to(DEV)
-    del raw
+        v = np.fromfile(LIBRARY / f"{dn}.v.f64", dtype="<f8").reshape(c, -1)
+        u = np.fromfile(LIBRARY / f"{dn}.u.f64", dtype="<f8").reshape(c, -1)
+        st.V = torch.tensor(v.T.astype(np.float32), device=DEV)
+        st.U = torch.tensor(u.astype(np.float32), device=DEV)
+        del u, v
     kls = []
     MB = 1  # one row's logits at a time keeps the scorer in the 1 GiB lane
     for i in range(0, hi - lo, MB):

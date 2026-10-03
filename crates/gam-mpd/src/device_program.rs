@@ -600,6 +600,38 @@ impl DeviceProgram {
         Ok(g)
     }
 
+    /// Sample several hidden cotangents from one forward. Each vocabulary tile is projected,
+    /// normalized, and pulled through the head only once. Seeds use `E_q[o] − o_y` in F64;
+    /// subsequent reverse passes can still use proposal arithmetic. Only hidden-width seeds
+    /// survive each tile, so no full-batch vocabulary distribution is retained.
+    pub fn sampled_many(&self, trace: &DeviceTrace, uniforms: &[Vec<f64>], scored: Option<&[bool]>) -> Result<Vec<Tensor>, String> {
+        if uniforms.iter().any(|u| u.len() != trace.rows) || scored.is_some_and(|s| s.len() != trace.rows) {
+            return Err("device: sampled uniforms or flags do not match trace rows".to_string());
+        }
+        if uniforms.is_empty() { return Ok(Vec::new()); }
+        let d = &self.device;
+        let hidden = trace.value(self.head.hidden)?;
+        let Held::Dense(head) = self.held(self.head.operator, Role::Product)? else {
+            return Err("device: the head is not dense".to_string());
+        };
+        let mut seeds = uniforms.iter().map(|_| d.zeros(trace.rows, hidden.cols()).map_err(error)).collect::<Result<Vec<_>, _>>()?;
+        let tile = self.tile_rows();
+        for start in (0..trace.rows).step_by(tile) {
+            let n = tile.min(trace.rows - start);
+            let mut probabilities = self.logits_tile(hidden, start, n, Arithmetic::F64)?;
+            d.softmax_rows(&mut probabilities, false).map_err(error)?;
+            let mut mean = d.zeros(n, hidden.cols()).map_err(error)?;
+            self.pull_tile(&mut mean, 0, &probabilities, Arithmetic::F64)?;
+            let flags = self.flags(scored, start, n)?;
+            for (uniforms, seed) in uniforms.iter().zip(&mut seeds) {
+                let u = d.upload_vec(n, 1, uniforms[start..start + n].to_vec()).map_err(error)?;
+                let part = d.sampled_head_cotangent(&probabilities, &mean, head, self.head.transposed, &u, flags.as_ref()).map_err(error)?;
+                d.set_rows(seed, start, &part).map_err(error)?;
+            }
+        }
+        Ok(seeds)
+    }
+
     /// `Σ_rows Σ_c q_c (t_c − Σ_j q_j t_j)²`: the output Fisher's quadratic form on the logits'
     /// tangent `t = t_h · ∂logits/∂h` from the hidden node's tangent (rows `scored` leaves out
     /// add nothing).

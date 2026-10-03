@@ -32,6 +32,10 @@
 //! sets (both halves of a split piece on where it was), and keeps them unless the selected sets
 //! code it in fewer bits; every training sequence starts from its current sets, its given ones at
 //! first. Each eval point also carries the given sets' own point (`start`) under the same code.
+//! `SETS` may instead be `switches:FILE`, switching functions fitted for that library
+//! (`OUT.switches.json` of `mpd_gates_2951`): every eval sequence then starts from the sets they
+//! choose from its clean forward's amplitudes (`gam_mpd::gates::masks`), with no search, and its
+//! `start` point is theirs.
 //!
 //! `CLAIM` (`corner`, the default, or `box`) is what the explanation declares of its off
 //! subcomponents (`gam_mpd::masked::Claim`): under `box` each off gate may be anywhere in `[0, 1]`,
@@ -74,7 +78,8 @@ use gam_mpd::checkpoint::{Saved, load, save};
 use gam_mpd::codec::prefix_integer_len_bits;
 use gam_mpd::import::import_language_model;
 use gam_mpd::masked::{
-    Claim, Coder, Context, Library, Masked, Running, Target, box_excess, forward, matrix, read_values, select, site_statistics, sites, split, step_pieces,
+    Claim, Coder, Context, Library, Masked, Running, Target, box_excess, forward, matrix, previous_inputs, read_values, select, site_statistics, sites, split,
+    step_pieces,
 };
 use gam_mpd::operator_program::FamilyInputs;
 use gam_mpd::operator_program::Node;
@@ -328,13 +333,15 @@ fn main() -> Result<(), String> {
     let eval: usize = args.get(6).ok_or(usage)?.parse().map_err(|e| format!("EVAL: {e}"))?;
     let context: usize = args.get(7).map_or(Ok(512), |v| v.parse()).map_err(|e| format!("CONTEXT: {e}"))?;
     let gpu = args.get(8).map_or("auto", String::as_str);
-    let sets_dir = args.get(9).filter(|a| *a != "-").map(PathBuf::from);
+    let sets_arg = args.get(9).filter(|a| *a != "-");
+    let switches_file = sets_arg.and_then(|a| a.strip_prefix("switches:")).map(PathBuf::from);
+    let sets_dir = sets_arg.filter(|_| switches_file.is_none()).map(PathBuf::from);
     let claim = match args.get(10).map(String::as_str) {
         None | Some("corner") => Claim::Corner,
         Some("box") => Claim::Box,
         Some(other) => return Err(format!("CLAIM {other}: expected corner or box; {usage}")),
     };
-    if sets_dir.is_some() && given.is_none() {
+    if (sets_dir.is_some() || switches_file.is_some()) && given.is_none() {
         return Err(format!("SETS needs a library:DIR start; {usage}"));
     }
     gam_gpu::configure_global_policy(gam_gpu::GpuPolicy::parse(gpu).ok_or_else(|| format!("GPU {gpu}: expected off, auto or required"))?);
@@ -526,6 +533,29 @@ fn main() -> Result<(), String> {
     // Each eval sequence's given sets, kept on the library as it grows.
     let mut eval_starts: Vec<Option<Assigned>> =
         (0..eval).map(|e| sets.as_ref().filter(|x| x.fits(&masked.all_pieces())).map(|x| x.assigned(train + e))).collect();
+    // `switches:FILE`: each eval sequence's sets as its switching functions choose them.
+    if let Some(file) = &switches_file {
+        let text = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+        let listed: Vec<serde_json::Value> = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", file.display()))?;
+        let mut switches: Vec<Vec<gam_mpd::gates::Switch>> = Vec::new();
+        for (k, entry) in listed.iter().enumerate() {
+            if original_sites.get(k).map(|s| s.name.as_str()) != entry["name"].as_str() || listed.len() != original_sites.len() {
+                return Err(format!("{}: its sites are not the library's", file.display()));
+            }
+            switches.push(serde_json::from_value(entry["switches"].clone()).map_err(|e| format!("{}: {e}", file.display()))?);
+        }
+        if switches.iter().map(Vec::len).collect::<Vec<_>>() != masked.all_pieces() {
+            return Err(format!("{}: its subcomponent counts are not the library's", file.display()));
+        }
+        for (e, start) in eval_starts.iter_mut().enumerate() {
+            let inputs = sequence(train + e);
+            let trace = model.execute(&inputs, false).map_err(|e| e.to_string())?;
+            let amplitudes = (0..masked.sites.len())
+                .map(|k| Ok(read_values(&trace, &original_sites[k])?.dot(&masked.library(k)?.v.t())))
+                .collect::<Result<Vec<_>, String>>()?;
+            *start = Some(Assigned::of(&gam_mpd::gates::masks(&switches, &amplitudes, &previous_inputs(&inputs))));
+        }
+    }
     // `wsvd2`: the Fisher-SVD library grown to twice its pieces on the first training sequence,
     // every piece its listing inputs use in two ways split in two (`gam_mpd::masked::split`).
     // Every piece reads only the span holding all but `LEFT_OUT` of its site's read variance on

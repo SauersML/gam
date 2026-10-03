@@ -1,6 +1,6 @@
 //! Structured descriptions of rank-k blocks (`gam_mpd::describe`) on a trained toy (#2951).
 //!
-//! `mpd_describe_2951 EXPORT_DIR OUT.json OBSERVATIONS`
+//! `mpd_describe_2951 modadd EXPORT_DIR OUT.json OBSERVATIONS`
 //!
 //! `EXPORT_DIR` a `transformer` export on a finite family whose token slots carry the operands
 //! (e.g. `~/mpd-data/engine/p31_s0_generic`, the mod-31 adder on all 961 inputs). The code is the
@@ -19,6 +19,19 @@
 //! generic family alone on the structured families' exact lattice code; every final
 //! structured block its family, modes and reals against its generic statement and its columns as
 //! generic rank-one subcomponents.
+//!
+//! `mpd_describe_2951 vpd EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json OBSERVATIONS FIRST SEQUENCES STATISTICS`
+//!
+//! VPD's four-layer model (`gam_mpd::import::import_language_model`, contexts of 512) and its
+//! rank-one subcomponents (`LIBRARY_DIR`, per site `{site}.v.f64` and `{site}.u.f64`; `SETS_DIR` the
+//! per-token sets as `mpd_blocks_2951 vpd` reads them), on the attention sites. Every subcomponent
+//! is described generic and structured: query and key writers in the heads' and rotary planes'
+//! coordinates, key writers also in the frames of the layer's query writers, value writers in the
+//! heads', output readers in the heads' and in the frames of the layer's value writers, and every
+//! residual reader in the frames of the earlier layers' output writers. Per site: the mean bits of a
+//! subcomponent under each, the families chosen, and the active description per word on tokens
+//! `FIRST..FIRST + SEQUENCES` of the given sets (`Σ_c count_c bits_c / words`). Statistics are
+//! measured on the first `STATISTICS` of those sequences.
 
 use gam_mpd::blocks::{Bits, Blocked, Coded, Describe, Generic, fit_blocks, measure, reselect};
 use gam_mpd::describe::{Chart, Core, Geometry, Metric, Structured};
@@ -136,13 +149,7 @@ fn core_name(core: &Core) -> String {
     }
 }
 
-fn main() -> Result<(), String> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() != 4 {
-        return Err("usage: mpd_describe_2951 EXPORT_DIR OUT.json OBSERVATIONS".to_string());
-    }
-    let (dir, out) = (Path::new(&args[1]), Path::new(&args[2]));
-    let observations: f64 = args[3].parse().map_err(|e| format!("OBSERVATIONS: {e}"))?;
+fn modadd(dir: &Path, out: &Path, observations: f64) -> Result<(), String> {
     let imported = import(dir)?;
     let program = imported.program;
     let family = imported.contract.family;
@@ -245,4 +252,176 @@ fn main() -> Result<(), String> {
     }
     let report = json!({ "observations": observations, "points": points, "blocks": per_block });
     std::fs::write(out, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
+fn read_raw<T: Copy>(path: &Path, decode: fn([u8; 8]) -> T) -> Result<Vec<T>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(bytes.chunks_exact(8).map(|c| decode(c.try_into().expect("eight bytes"))).collect())
+}
+
+fn read_f64(path: &Path, cols: usize) -> Result<Array2<f64>, String> {
+    let values = read_raw(path, f64::from_le_bytes)?;
+    if values.len() % cols != 0 {
+        return Err(format!("{}: {} values in rows of {cols}", path.display(), values.len()));
+    }
+    Array2::from_shape_vec((values.len() / cols, cols), values).map_err(|e| e.to_string())
+}
+
+/// Per listed site (`sites.txt` order), each subcomponent's count of words on, over words
+/// `first·context..(first + sequences)·context` of the given sets.
+fn counts(dir: &Path, context: usize, first: usize, sequences: usize) -> Result<Vec<(String, Vec<f64>)>, String> {
+    let listed = std::fs::read_to_string(dir.join("sites.txt")).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut out: Vec<(String, Vec<f64>)> = Vec::new();
+    let mut offsets = vec![0usize];
+    for line in listed.lines() {
+        let (name, n) = line.split_once(' ').ok_or(format!("sites.txt: {line}"))?;
+        let n: usize = n.parse().map_err(|e| format!("sites.txt: {e}"))?;
+        offsets.push(offsets[offsets.len() - 1] + n);
+        out.push((name.to_string(), vec![0.0; n]));
+    }
+    let indptr = read_raw(&dir.join("indptr.i64"), i64::from_le_bytes)?;
+    let indices = read_raw(&dir.join("indices.i64"), i64::from_le_bytes)?;
+    let (start, end) = (first * context, (first + sequences) * context);
+    if indptr.len() <= end {
+        return Err(format!("{}: fewer than {end} words of sets", dir.display()));
+    }
+    for &i in &indices[indptr[start] as usize..indptr[end] as usize] {
+        let i = i as usize;
+        let k = offsets.partition_point(|o| *o <= i) - 1;
+        out[k].1[i - offsets[k]] += 1.0;
+    }
+    Ok(out)
+}
+
+/// The frames chart of a library's writers (`u`, `C × d`), one group a subcomponent.
+fn writer_frames(name: &str, u: &[&Array2<f64>]) -> Result<Option<Chart>, String> {
+    if u.is_empty() {
+        return Ok(None);
+    }
+    let views: Vec<_> = u.iter().map(|x| x.t()).collect();
+    let columns = ndarray::concatenate(ndarray::Axis(1), &views).map_err(|e| e.to_string())?;
+    let widths = vec![1; columns.ncols()];
+    Ok(Some(Chart::frames(name, columns, &widths)?))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vpd(dir: &Path, library_dir: &Path, sets_dir: &Path, out: &Path, observations: f64, first: usize, sequences: usize, statistics_sequences: usize) -> Result<(), String> {
+    use rayon::prelude::*;
+    const CONTEXT: usize = 512;
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("export.json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let config = |key: &str| record["config"][key].as_u64().map(|v| v as usize).ok_or(format!("config.{key}"));
+    let (heads, head_dim) = (config("n_heads")?, config("head_dim")?);
+    let imported = gam_mpd::import::import_language_model(dir, first + sequences, CONTEXT)?;
+    let program = imported.program;
+    let family = imported.contract.family;
+    let kinds = ["q", "k", "v", "o"];
+    let chosen: Vec<Site> = sites(&program)
+        .into_iter()
+        .filter(|s| kinds.iter().any(|k| s.name.ends_with(&format!(".{k}"))) && library_dir.join(format!("{}.v.f64", s.name)).exists())
+        .collect();
+    let rows: Vec<usize> = (first * CONTEXT..(first + statistics_sequences) * CONTEXT).collect();
+    let statistics = site_statistics(&program, &chosen, [family.select(&rows)], 4, 0x5EED)?;
+    let mut libraries: Vec<(Array2<f64>, Array2<f64>)> = Vec::new();
+    for (site, measured) in chosen.iter().zip(&statistics) {
+        let (d_out, d_in) = measured.w.dim();
+        let v = read_f64(&library_dir.join(format!("{}.v.f64", site.name)), d_in)?;
+        let u = read_f64(&library_dir.join(format!("{}.u.f64", site.name)), d_out)?;
+        libraries.push((u, v));
+    }
+    let index = |l: usize, kind: &str| chosen.iter().position(|s| s.name == format!("blocks.{l}.{kind}"));
+    let heads_chart = Chart::coordinates("heads", heads * head_dim, &(0..heads).map(|h| (h * head_dim..(h + 1) * head_dim).collect()).collect::<Vec<_>>())?;
+    let half = head_dim / 2;
+    let planes: Vec<Vec<usize>> = (0..heads).flat_map(|h| (0..half).map(move |i| vec![h * head_dim + i, h * head_dim + i + half])).collect();
+    let rotary_chart = Chart::coordinates("rotary planes", heads * head_dim, &planes)?;
+    let sets = counts(sets_dir, CONTEXT, first, sequences)?;
+    let words = (sequences * CONTEXT) as f64;
+    let generic = Generic::new(&statistics, observations);
+    let mut report = Vec::new();
+    for (k, site) in chosen.iter().enumerate() {
+        let layer: usize = site.name.split('.').nth(1).and_then(|x| x.parse().ok()).ok_or(format!("{}: no layer", site.name))?;
+        let kind = site.name.rsplit('.').next().unwrap_or("");
+        let earlier: Vec<&Array2<f64>> = (0..layer).filter_map(|l| index(l, "o")).map(|i| &libraries[i].0).collect();
+        let residual_readers: Vec<Chart> = writer_frames("earlier output writers", &earlier)?.into_iter().collect();
+        let (writers, readers): (Vec<Chart>, Vec<Chart>) = match kind {
+            "q" => (vec![heads_chart.clone(), rotary_chart.clone()], residual_readers),
+            "k" => {
+                let mut w = vec![heads_chart.clone(), rotary_chart.clone()];
+                if let Some(q) = index(layer, "q") {
+                    w.extend(writer_frames("the layer's query writers", &[&libraries[q].0])?);
+                }
+                (w, residual_readers)
+            }
+            "v" => (vec![heads_chart.clone()], residual_readers),
+            _ => {
+                let mut r = vec![heads_chart.clone()];
+                if let Some(v) = index(layer, "v") {
+                    r.extend(writer_frames("the layer's value writers", &[&libraries[v].0])?);
+                }
+                (Vec::new(), r)
+            }
+        };
+        let metric = Metric::of(&statistics[k], observations);
+        let structured = Geometry::new(metric.clone(), writers, readers, false)?;
+        let lattice = Geometry::new(metric, Vec::new(), Vec::new(), false)?;
+        let (u, v) = &libraries[k];
+        let started = std::time::Instant::now();
+        let described: Vec<(f64, f64, f64, String, String, String)> = (0..u.nrows())
+            .into_par_iter()
+            .map(|c| {
+                let (uc, vc) = (u.slice(s![c..c + 1, ..]), v.slice(s![c..c + 1, ..]));
+                let d = structured.describe(uc, vc)?;
+                let plain = lattice.describe(uc, vc)?;
+                Ok((generic.bits(k, uc, vc)?, plain.total(), d.total(), d.writer.0.clone(), d.reader.0.clone(), core_name(&d.core)))
+            })
+            .collect::<Result<_, String>>()?;
+        let count = &sets.iter().find(|(n, _)| *n == site.name).ok_or(format!("{}: not in the sets", site.name))?.1;
+        let mean = |f: &dyn Fn(&(f64, f64, f64, String, String, String)) -> f64| described.iter().map(f).sum::<f64>() / described.len().max(1) as f64;
+        let active = |f: &dyn Fn(&(f64, f64, f64, String, String, String)) -> f64| described.iter().zip(count).map(|(d, n)| f(d) * n).sum::<f64>() / words;
+        let mut families = std::collections::BTreeMap::<String, usize>::new();
+        for d in &described {
+            *families.entry(format!("writer: {}, reader: {}, {}", d.3, d.4, d.5)).or_default() += 1;
+        }
+        eprintln!(
+            "{}: {} subcomponents in {:.1} s; mean bits generic {:.0}, lattice {:.0}, structured {:.0}; active per word generic {:.1}, lattice {:.1}, structured {:.1}",
+            site.name,
+            described.len(),
+            started.elapsed().as_secs_f64(),
+            mean(&|d| d.0),
+            mean(&|d| d.1),
+            mean(&|d| d.2),
+            active(&|d| d.0),
+            active(&|d| d.1),
+            active(&|d| d.2)
+        );
+        report.push(json!({
+            "site": site.name,
+            "subcomponents": described.len(),
+            "mean_bits": {"generic": mean(&|d| d.0), "lattice_generic": mean(&|d| d.1), "structured": mean(&|d| d.2)},
+            "active_description_bits_per_word": {"generic": active(&|d| d.0), "lattice_generic": active(&|d| d.1), "structured": active(&|d| d.2)},
+            "active_subcomponents_per_word": count.iter().sum::<f64>() / words,
+            "families": families,
+        }));
+    }
+    let report = json!({"observations": observations, "words": words, "sites": report});
+    std::fs::write(out, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
+fn main() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().collect();
+    let number = |i: usize, what: &str| -> Result<f64, String> { args.get(i).ok_or(format!("missing {what}"))?.parse::<f64>().map_err(|e| format!("{what}: {e}")) };
+    match args.get(1).map(String::as_str) {
+        Some("modadd") if args.len() == 5 => modadd(Path::new(&args[2]), Path::new(&args[3]), number(4, "OBSERVATIONS")?),
+        Some("vpd") if args.len() == 10 => vpd(
+            Path::new(&args[2]),
+            Path::new(&args[3]),
+            Path::new(&args[4]),
+            Path::new(&args[5]),
+            number(6, "OBSERVATIONS")?,
+            number(7, "FIRST")? as usize,
+            number(8, "SEQUENCES")? as usize,
+            number(9, "STATISTICS")? as usize,
+        ),
+        _ => Err("usage: mpd_describe_2951 modadd EXPORT_DIR OUT.json OBSERVATIONS | vpd EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json OBSERVATIONS FIRST SEQUENCES STATISTICS".to_string()),
+    }
 }

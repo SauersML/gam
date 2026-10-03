@@ -820,6 +820,45 @@ impl Device {
         }
     }
 
+    /// Draw a label from each probability row and return `mean − head[label]`, where
+    /// `mean = probabilities * head`. A transposed head stores vocabulary vectors as columns.
+    /// This reuses the distribution and its head mean across sampled-label reverse passes.
+    pub fn sampled_head_cotangent(
+        &self, probabilities: &Tensor, mean: &Tensor, head: &Tensor, transposed: bool,
+        uniforms: &Tensor, scored: Option<&Indices>,
+    ) -> Result<Tensor, GpuError> {
+        let expected_head = if transposed { (mean.cols, probabilities.cols) } else { (probabilities.cols, mean.cols) };
+        if probabilities.cols == 0 || mean.rows != probabilities.rows || head.dim() != expected_head
+            || uniforms.dim() != (mean.rows, 1) || scored.is_some_and(|s| s.len != mean.rows)
+        {
+            return Err(shape("sampled head cotangent shapes".to_string()));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (q, mu, weights, u) = (host(probabilities)?, host(mean)?, host(head)?, host(uniforms)?);
+                let flags = scored.map(host_indices).transpose()?;
+                let mut out = vec![0.0; mean.len()];
+                for r in 0..mean.rows {
+                    if flags.is_some_and(|f| f[r] == 0) { continue; }
+                    let mut pick = u[r];
+                    let mut label = probabilities.cols - 1;
+                    for c in 0..probabilities.cols {
+                        let p = q[r * probabilities.cols + c];
+                        if pick < p { label = c; break; }
+                        pick -= p;
+                    }
+                    for h in 0..mean.cols {
+                        let index = if transposed { h * probabilities.cols + label } else { label * mean.cols + h };
+                        out[r * mean.cols + h] = mu[r * mean.cols + h] - weights[index];
+                    }
+                }
+                Ok(Tensor { rows: mean.rows, cols: mean.cols, data: Data::Host(out) })
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.sampled_head_cotangent(probabilities, mean, head, transposed, uniforms, scored),
+        }
+    }
+
     /// Per row, `Σ_c q_c (t_c − Σ_j q_j t_j)²` with `q = softmax(logits)`: the output Fisher's
     /// quadratic form on the tangent `t`.
     pub fn softmax_quadratic(&self, logits: &Tensor, tangent: &Tensor) -> Result<Vec<f64>, GpuError> {
@@ -1190,6 +1229,32 @@ extern "C" __global__ void sampled_cotangent(unsigned int rows, unsigned int col
     }
     __syncthreads();
     for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) z[c] -= (c == label) ? 1.0 : 0.0;
+}
+
+extern "C" __global__ void sampled_head_cotangent(unsigned int rows, unsigned int classes, unsigned int width,
+    const double* probabilities, const double* mean, const double* head, int transposed,
+    const double* uniforms, const unsigned int* scored, int use_scored, double* out) {
+    __shared__ unsigned int label;
+    unsigned int r = blockIdx.x;
+    if (r >= rows) return;
+    if (use_scored && scored[r] == 0) {
+        for (unsigned int h = threadIdx.x; h < width; h += BLOCK) out[(u64)r * width + h] = 0.0;
+        return;
+    }
+    if (threadIdx.x == 0) {
+        double pick = uniforms[r];
+        label = classes - 1;
+        for (unsigned int c = 0; c < classes; c++) {
+            double p = probabilities[(u64)r * classes + c];
+            if (pick < p) { label = c; break; }
+            pick -= p;
+        }
+    }
+    __syncthreads();
+    for (unsigned int h = threadIdx.x; h < width; h += BLOCK) {
+        u64 index = transposed ? (u64)h * classes + label : (u64)label * width + h;
+        out[(u64)r * width + h] = mean[(u64)r * width + h] - head[index];
+    }
 }
 
 extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int cols, const double* logits, const double* tangent, double* out) {
@@ -1664,6 +1729,27 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
             }
             .gpu_ctx("tensor sampled_cotangent")
             .map(|_| ())
+        }
+
+        pub(super) fn sampled_head_cotangent(
+            &self, probabilities: &Tensor, mean: &Tensor, head: &Tensor, transposed: bool,
+            uniforms: &Tensor, scored: Option<&Indices>,
+        ) -> Result<Tensor, GpuError> {
+            let mut out = Tensor { rows: mean.rows, cols: mean.cols, data: Data::Cuda(self.zeros(mean.len())?) };
+            let (rows, classes, width) = (mean.rows as u32, probabilities.cols as u32, mean.cols as u32);
+            let transposed = i32::from(transposed);
+            let (flags, use_flags) = self.flags(scored)?;
+            let f = self.function("sampled_head_cotangent")?;
+            // SAFETY: the public entry validates each tensor shape and the scored flag count.
+            // One block writes each row; the sampled label is always inside the vocabulary.
+            unsafe {
+                self.stream.launch_builder(&f)
+                    .arg(&rows).arg(&classes).arg(&width)
+                    .arg(slice(probabilities)?).arg(slice(mean)?).arg(slice(head)?).arg(&transposed)
+                    .arg(slice(uniforms)?).arg(flags).arg(&use_flags).arg(slice_mut(&mut out)?)
+                    .launch(cfg_rows(mean.rows))
+            }.gpu_ctx("tensor sampled_head_cotangent")?;
+            Ok(out)
         }
 
         pub(super) fn softmax_quadratic(&self, logits: &Tensor, tangent: &Tensor) -> Result<Vec<f64>, GpuError> {

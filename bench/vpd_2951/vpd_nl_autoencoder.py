@@ -222,7 +222,7 @@ class LM:
         name = "Qwen/Qwen2.5-1.5B-Instruct"
         self.torch = torch
         self.tok = AutoTokenizer.from_pretrained(name)
-        self.model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float16).to("mps").eval()
+        self.model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float16, device_map="mps").eval()
 
     def nll(self, x, mask, chunk: int = 256):
         """Bits of each token after the first, [B, L - 1], the vocabulary's logits a chunk of
@@ -266,7 +266,7 @@ class LM:
         np.add.at(out, np.minimum(owner[valid], len(lines) - 1), bits[valid])
         return out
 
-    def standalone_bits(self, texts: list[str], batch: int = 64, header: str = HEADER) -> np.ndarray:
+    def standalone_bits(self, texts: list[str], batch: int = 16, header: str = HEADER) -> np.ndarray:
         """Bits of each text as the only line after the header."""
         torch = self.torch
         h = self.tok(header, add_special_tokens=False)["input_ids"]
@@ -578,11 +578,11 @@ def stage_figure():
     kl = json.load(open(OUT / "kl.json"))
     z, indptr, indices, offsets, names = sets()
     head = str(N_REPORT)
-    INK, MUTED, SURF = "#0b0b0b", "#52514e", "#fcfcfb"
+    INK, MUTED, SURF = "#0b0b0b", "#52514e", "#ffffff"
     BLUE, ORANGE, AQUA, VIOLET = "#2a78d6", "#eb6834", "#1baf7a", "#4a3aa7"
-    plt.rcParams.update({"font.family": "Helvetica Neue", "font.size": 10, "text.color": INK, "axes.labelcolor": INK,
+    plt.rcParams.update({"font.family": "Helvetica Neue", "font.size": 13, "text.color": INK, "axes.labelcolor": INK,
                          "xtick.color": MUTED, "ytick.color": MUTED, "axes.edgecolor": "#c9c8c2"})
-    fig = plt.figure(figsize=(17, 9.6), facecolor=SURF)
+    fig = plt.figure(figsize=(20, 11), facecolor=SURF)
     gs = fig.add_gridspec(2, 2, width_ratios=[1.55, 1], height_ratios=[1, 1], wspace=0.08, hspace=0.32,
                           left=0.02, right=0.975, top=0.86, bottom=0.07)
     fig.text(0.02, 0.955, "Text that rebuilds the weights that ran", fontsize=19, weight="bold")
@@ -655,7 +655,6 @@ def stage_figure():
     ax.set_ylabel("KL(model ‖ decoded program), nats/word")
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
-    ax.grid(True, which="major", color="#ecebe6", lw=0.6)
     ax.legend(frameon=False, fontsize=8, loc="upper right")
     ax.set_title("Faithfulness: what the text costs vs how well its program reproduces the model", fontsize=10.5, loc="left")
 
