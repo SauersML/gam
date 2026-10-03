@@ -36,7 +36,7 @@
 //! measured on the first `STATISTICS` of those sequences.
 
 use gam_mpd::blocks::{Bits, Blocked, Coded, Describe, Generic, fit_blocks, measure, reselect};
-use gam_mpd::describe::{Chart, Core, Geometry, Metric, Structured};
+use gam_mpd::describe::{Chart, Core, Description, Geometry, Metric, Structured};
 use gam_mpd::import::import;
 use gam_mpd::masked::{Library, Site, Target, read_values, site_statistics, sites};
 use gam_mpd::operator_program::{LabelKind, Node, OperatorBody, OperatorProgram, SlotValues};
@@ -433,6 +433,37 @@ fn counts(dir: &Path, context: usize, first: usize, sequences: usize) -> Result<
     Ok(out)
 }
 
+/// Per site of `chosen`, sequence `sequence`'s masks (`context × subcomponents`) from the given sets.
+fn given_masks(dir: &Path, chosen: &[Site], context: usize, sequence: usize) -> Result<Vec<Array2<f64>>, String> {
+    let listed = std::fs::read_to_string(dir.join("sites.txt")).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut offsets = vec![0usize];
+    let mut names = Vec::new();
+    for line in listed.lines() {
+        let (name, n) = line.split_once(' ').ok_or(format!("sites.txt: {line}"))?;
+        let n: usize = n.parse().map_err(|e| format!("sites.txt: {e}"))?;
+        offsets.push(offsets[offsets.len() - 1] + n);
+        names.push(name.to_string());
+    }
+    let indptr = read_raw(&dir.join("indptr.i64"), i64::from_le_bytes)?;
+    let indices = read_raw(&dir.join("indices.i64"), i64::from_le_bytes)?;
+    let mut out = Vec::new();
+    for site in chosen {
+        let k = names.iter().position(|n| *n == site.name).ok_or(format!("{}: not in the sets", site.name))?;
+        let mut m = Array2::<f64>::zeros((context, offsets[k + 1] - offsets[k]));
+        for r in 0..context {
+            let position = sequence * context + r;
+            for &i in &indices[indptr[position] as usize..indptr[position + 1] as usize] {
+                let i = i as usize;
+                if (offsets[k]..offsets[k + 1]).contains(&i) {
+                    m[[r, i - offsets[k]]] = 1.0;
+                }
+            }
+        }
+        out.push(m);
+    }
+    Ok(out)
+}
+
 /// The frames chart of a library's writers (`u`, `C × d`), one group a subcomponent.
 fn writer_frames(name: &str, u: &[&Array2<f64>]) -> Result<Option<Chart>, String> {
     if u.is_empty() {
@@ -477,6 +508,7 @@ fn vpd(dir: &Path, library_dir: &Path, sets_dir: &Path, out: &Path, observations
     let words = (sequences * CONTEXT) as f64;
     let generic = Generic::new(&statistics, observations);
     let mut report = Vec::new();
+    let mut decoded_sites: Vec<(Vec<Description>, Vec<Description>)> = Vec::new();
     for (k, site) in chosen.iter().enumerate() {
         let layer: usize = site.name.split('.').nth(1).and_then(|x| x.parse().ok()).ok_or(format!("{}: no layer", site.name))?;
         let kind = site.name.rsplit('.').next().unwrap_or("");
@@ -505,15 +537,18 @@ fn vpd(dir: &Path, library_dir: &Path, sets_dir: &Path, out: &Path, observations
         let lattice = Geometry::new(metric, Vec::new(), Vec::new(), false)?;
         let (u, v) = &libraries[k];
         let started = std::time::Instant::now();
-        let described: Vec<(f64, f64, f64, String, String, String)> = (0..u.nrows())
+        let both: Vec<((f64, f64, f64, String, String, String), (Description, Description))> = (0..u.nrows())
             .into_par_iter()
             .map(|c| {
                 let (uc, vc) = (u.slice(s![c..c + 1, ..]), v.slice(s![c..c + 1, ..]));
                 let d = structured.describe(uc, vc)?;
                 let plain = lattice.describe(uc, vc)?;
-                Ok((generic.bits(k, uc, vc)?, plain.total(), d.total(), d.writer.0.clone(), d.reader.0.clone(), core_name(&d.core)))
+                Ok(((generic.bits(k, uc, vc)?, plain.total(), d.total(), d.writer.0.clone(), d.reader.0.clone(), core_name(&d.core)), (d, plain)))
             })
             .collect::<Result<_, String>>()?;
+        let (described, pair): (Vec<_>, Vec<_>) = both.into_iter().unzip();
+        let (structured_d, lattice_d): (Vec<Description>, Vec<Description>) = pair.into_iter().unzip();
+        decoded_sites.push((structured_d, lattice_d));
         let count = &sets.iter().find(|(n, _)| *n == site.name).ok_or(format!("{}: not in the sets", site.name))?.1;
         let mean = |f: &dyn Fn(&(f64, f64, f64, String, String, String)) -> f64| described.iter().map(f).sum::<f64>() / described.len().max(1) as f64;
         let active = |f: &dyn Fn(&(f64, f64, f64, String, String, String)) -> f64| described.iter().zip(count).map(|(d, n)| f(d) * n).sum::<f64>() / words;
@@ -542,7 +577,48 @@ fn vpd(dir: &Path, library_dir: &Path, sets_dir: &Path, out: &Path, observations
             "families": families,
         }));
     }
-    let report = json!({"observations": observations, "words": words, "sites": report});
+    // The decode check, on the first sequence under its given sets: every subcomponent replaced by
+    // its decoded description (every site at once), measured by the exact masked forward against
+    // the error its descriptions were priced at.
+    let check: Vec<usize> = (first * CONTEXT..(first + 1) * CONTEXT).collect();
+    let inputs = family.select(&check);
+    let logits = program.execute(&inputs, false).map_err(|e| e.to_string())?.values[program.output].clone();
+    let masks = given_masks(sets_dir, &chosen, CONTEXT, first)?;
+    let given = Blocked::rank_one(
+        libraries.iter().map(|(u, v)| Library { v: v.clone(), u: u.clone(), mean: ndarray::Array1::zeros(v.ncols()) }).collect(),
+        vec![masks],
+    );
+    let coded = Coded { model: &program, sites: chosen.clone(), batches: vec![(inputs, Target::every_row(logits))], observations, samples: 4, describe: &generic, boxed: None };
+    let (base, _) = measure(&coded, &given)?;
+    let mut checks = Vec::new();
+    for (name, pick) in [("structured", 0usize), ("lattice generic", 1usize)] {
+        let mut out = given.clone();
+        let mut predicted = 0.0;
+        for (k, (structured_d, lattice_d)) in decoded_sites.iter().enumerate() {
+            let descriptions = if pick == 0 { structured_d } else { lattice_d };
+            let on: Vec<f64> = given.masks[0][k].sum_axis(ndarray::Axis(0)).to_vec();
+            predicted += descriptions.iter().zip(&on).map(|(d, n)| d.kl_bits * n).sum::<f64>();
+            let us: Vec<_> = descriptions.iter().map(|d| d.u.view()).collect();
+            let vs: Vec<_> = descriptions.iter().map(|d| d.v.view()).collect();
+            out.libraries[k] = std::sync::Arc::new(Library {
+                u: ndarray::concatenate(ndarray::Axis(0), &us).map_err(|e| e.to_string())?,
+                v: ndarray::concatenate(ndarray::Axis(0), &vs).map_err(|e| e.to_string())?,
+                mean: given.libraries[k].mean.clone(),
+            });
+            out.ranks[k] = descriptions.iter().map(|d| d.u.nrows()).collect();
+        }
+        let (bits, _) = measure(&coded, &out)?;
+        let rows = bits.rows.max(1.0);
+        eprintln!(
+            "decode check, {name}: measured error {:.1} bits/word (KL {:.6} nats/word over the given sets' {:.6}), priced {:.1}",
+            (bits.kl - base.kl) / rows,
+            bits.kl_nats / rows,
+            base.kl_nats / rows,
+            predicted / rows
+        );
+        checks.push(json!({"description": name, "measured_error_bits_per_word": (bits.kl - base.kl) / rows, "priced_error_bits_per_word": predicted / rows, "kl_per_word": bits.kl_nats / rows, "given_kl_per_word": base.kl_nats / rows}));
+    }
+    let report = json!({"observations": observations, "words": words, "sites": report, "decode_check": checks});
     std::fs::write(out, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
