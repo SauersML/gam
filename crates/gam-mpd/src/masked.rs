@@ -1943,12 +1943,85 @@ pub fn select_observed(
                 }
             }
         }
+        // A refused sequence's proposal is split: each input's flips, in their order of predicted
+        // saving, halve into the first half and the rest; both halves are tried exactly (every
+        // refused sequence at once), a sequence keeps the half that lowers its code most, and one
+        // that neither lowers is split again from its first half, down to one flip per input.
+        let mut open: Vec<bool> = (0..sequences).map(|q| sequence_flips[q] > 0 && sequence_saving[q] <= 0.0).collect();
+        let mut subset: Vec<Vec<(usize, usize)>> = picks.iter().map(|(pick, _)| pick.clone()).collect();
+        let (mut rescued, mut rescued_saving) = (0usize, 0.0);
+        let code_at = |trial: &[Array2<f64>]| -> Result<Array1<f64>, String> {
+            let kl_trial = score_only(masked, &masked.family(base, trial), target)?;
+            let excess_trial = match boxed {
+                Some(f) => box_excess_at(masked, base, target, trial, f)?,
+                None => Array1::zeros(rows),
+            };
+            Ok(code(&(&kl_trial + &excess_trial), &coder.bits(trial), observations))
+        };
+        while (0..rows).any(|r| open[sequence_of[r]] && subset[r].len() >= 2) {
+            let halves: Vec<(Vec<(usize, usize)>, Vec<(usize, usize)>)> = subset
+                .iter()
+                .enumerate()
+                .map(|(r, flips)| {
+                    if !open[sequence_of[r]] {
+                        return (Vec::new(), Vec::new());
+                    }
+                    let middle = flips.len().div_ceil(2);
+                    (flips[..middle].to_vec(), flips[middle..].to_vec())
+                })
+                .collect();
+            let mut savings: Vec<[f64; 2]> = vec![[0.0, 0.0]; sequences];
+            for side in 0..2 {
+                let mut trial = masks.clone();
+                for (r, (first, rest)) in halves.iter().enumerate() {
+                    for &(site, c) in if side == 0 { first } else { rest } {
+                        trial[site][[r, c]] = 1.0 - trial[site][[r, c]];
+                    }
+                }
+                let after_half = code_at(&trial)?;
+                for r in 0..rows {
+                    savings[sequence_of[r]][side] += before[r] - after_half[r];
+                }
+            }
+            for q in 0..sequences {
+                if !open[q] {
+                    continue;
+                }
+                let side = if savings[q][0] >= savings[q][1] { 0 } else { 1 };
+                if savings[q][side] > 0.0 {
+                    for (r, (first, rest)) in halves.iter().enumerate() {
+                        if sequence_of[r] == q {
+                            for &(site, c) in if side == 0 { first } else { rest } {
+                                masks[site][[r, c]] = 1.0 - masks[site][[r, c]];
+                            }
+                        }
+                    }
+                    open[q] = false;
+                    rescued += 1;
+                    rescued_saving += savings[q][side];
+                    sequence_saving[q] = savings[q][side];
+                    cap[q] = if savings[q][side] < sequence_rows[q] as f64 { 0 } else { usize::MAX };
+                }
+            }
+            for (r, (first, _)) in halves.into_iter().enumerate() {
+                if open[sequence_of[r]] {
+                    subset[r] = first;
+                }
+            }
+        }
+        kept += rescued;
+        saved += rescued_saving;
+        if rescued > 0 {
+            log::info!("selection round {}: split proposals kept in {rescued} more sequences, {rescued_saving:.0} bits saved", round + 1);
+        }
         if boxed.is_some() {
             let kept_sequence = |q: usize| sequence_flips[q] > 0 && sequence_saving[q] > 0.0;
-            excess_known = Some(Array1::from_shape_fn(rows, |r| if kept_sequence(sequence_of[r]) { excess_new[r] } else { excess_now[r] }));
+            excess_known = (rescued == 0).then(|| Array1::from_shape_fn(rows, |r| if kept_sequence(sequence_of[r]) { excess_new[r] } else { excess_now[r] }));
         }
         round += 1;
-        if kept == tried {
+        if rescued > 0 {
+            // The masks are neither the proposal nor what this round measured.
+        } else if kept == tried {
             // Every proposing input kept its flips, so the masks now equal the proposal.
             next_forward = Some((kl_new.clone(), state_new));
         } else if kept == 0 {
