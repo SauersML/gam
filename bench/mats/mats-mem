@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Change the memory of our pending MATS jobs named NAME, keeping their place in the queue (#2951):
+#   mats-mem NAME MEM_GB
+set -Eeuo pipefail
+[ $# -eq 2 ] && [[ $2 =~ ^[0-9]+$ ]] || { echo "usage: mats-mem NAME MEM_GB" >&2; exit 2; }
+ssh mats "for j in \$(squeue -u \$USER -h -t PD -n '$1' -o %i); do scontrol update jobid=\$j minmemorynode=$(( $2 * 1024 )) && echo \"\$j '$1' now ${2}G\"; done"
