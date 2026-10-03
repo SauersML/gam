@@ -4,8 +4,9 @@
 #   mats-pool ls [todo|running|done]   task files (done shows each exit code)
 #   mats-pool cancel PATTERN           drop matching todo tasks; stop matching running tasks (the worker
 #                                      frees their room and takes the next task)
-#   mats-pool up CPUS MEM_GB [GPUS] [HOURS]   start a worker (normal QOS, MATS_QOS=debug for 2 h; exits
-#                                      after 10 idle minutes)
+#   mats-pool up CPUS MEM_GB|auto [GPUS] [HOURS]   start a worker (normal QOS, MATS_QOS=debug for 2 h;
+#                                      exits after 10 idle minutes); auto sizes its memory to the queued
+#                                      tasks that fill its CPUs
 set -Eeuo pipefail
 here=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 case ${1:-status} in
@@ -23,10 +24,16 @@ case ${1:-status} in
         ssh mats "Q=~/mpd-data/cluster/queue; for t in \$Q/todo/*'$2'*.task; do [ -f \"\$t\" ] && { echo '# rc=cancelled' >> \"\$t\"; mv \"\$t\" \$Q/done/; echo \"dropped \${t##*/}\"; }; done
             for t in \$Q/running/*'$2'*.task; do [ -f \"\$t\" ] && { touch \"\$t.cancel\"; echo \"stopping \${t##*/}\"; }; done; true" ;;
     up)
-        [[ ${2:-} =~ ^[0-9]+$ && ${3:-} =~ ^[0-9]+$ ]] || { echo "usage: mats-pool up CPUS MEM_GB [GPUS] [HOURS]" >&2; exit 2; }
+        [[ ${2:-} =~ ^[0-9]+$ && ${3:-} =~ ^([0-9]+|auto)$ ]] || { echo "usage: mats-pool up CPUS MEM_GB|auto [GPUS] [HOURS]" >&2; exit 2; }
         g=${4:-0} min=$(awk -v h="${5:-12}" 'BEGIN { print int(h * 60) }')
+        if [ "$3" = auto ]; then
+            # The memory of the queued tasks that fill CPUS, oldest first (their asks are 2 x peak + 4).
+            mem=$(ssh mats "c=0 m=0; for t in \$(ls -1tr ~/mpd-data/cluster/queue/todo/*.task 2> /dev/null); do tc=\$(sed -n 's/^# cpus=//p' \$t); tm=\$(sed -n 's/^# mem=//p' \$t); (( c + tc <= $2 )) || continue; c=\$(( c + tc )) m=\$(( m + tm )); done; echo \$(( m > 4 ? m : 4 ))")
+            set -- "$1" "$2" "$mem" "${4:-0}" "${5:-12}"
+            echo "worker memory: ${mem}G (the queued tasks that fill $2 CPUs)" >&2
+        fi
         scp -q "$here/pool_worker.sh" mats:mpd-data/cluster/_build/pool_worker.sh
         ssh mats "mkdir -p ~/mpd-data/cluster/queue && cp ~/mpd-data/cluster/_build/pool_worker.sh ~/mpd-data/cluster/queue/ &&
             sbatch --parsable -J mpd-pool -p compute ${MATS_QOS:+--qos=$MATS_QOS} -c $2 --mem=${3}G -t $min $( (( g > 0 )) && echo --gres=gpu:$g) -o ~/mpd-data/cluster/queue/worker-%j.log ~/mpd-data/cluster/queue/pool_worker.sh $min" ;;
-    *) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    *) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

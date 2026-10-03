@@ -119,9 +119,23 @@ stamp=$(date +%Y%m%d-%H%M%S)-$$
 job=$OUT/job-$stamp.sh
 cmd=${cmd//@@BIN@@\/src/$SRC/$C12}
 cmd=${cmd//@@BIN@@/$BIN/$B}
+# Memory: at most 2 x this command's measured peak + 4 (cluster_peaks.sh), unless asked "=N" exactly.
+ask=$(bash "$CL/_build/cluster_peaks.sh" ask "$cmd" 2> /dev/null || true)
+exact=""
+if [[ $MEM == =* ]]; then
+    MEM=${MEM#=} exact="# mats-mem=exact (the audit leaves this job's memory alone)"
+elif (( MEM == 0 )); then
+    MEM=${ask:-$(( 2 * CPUS > 8 ? 2 * CPUS : 8 ))}
+    if [ -n "$ask" ]; then why="2 x measured peak + 4"; else why="nothing measured yet: 2 GB per CPU, at least 8"; fi
+    echo "mats-run: asking ${MEM}G ($why)" >&2
+elif [ -n "$ask" ] && (( MEM > ask )); then
+    echo "mats-run: asking ${ask}G, not ${MEM}G: this command's measured peak is $(bash "$CL/_build/cluster_peaks.sh" lookup "$cmd")G (MATS_MEM_EXACT=1 keeps ${MEM}G)" >&2
+    MEM=$ask
+fi
 chained=$(( CHAIN > 1 ))
 cat > "$job" <<JOB
 #!/usr/bin/env bash
+$exact
 export RAYON_NUM_THREADS=\$SLURM_CPUS_PER_TASK OMP_NUM_THREADS=\$SLURM_CPUS_PER_TASK
 export MPD_BIN=$BIN/$B GAM_SRC=$SRC/$C12 MPD_DATA=\$HOME/mpd-data MATS_OUT=$OUT
 export PATH=$BIN/$B:\$HOME/mpd-venv/bin:\$HOME/.cargo/bin:\$PATH

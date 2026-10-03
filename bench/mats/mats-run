@@ -26,6 +26,11 @@
 # Example, 8 x 2 h in debug:
 #   MATS_QOS=debug MATS_CHAIN=8 mats-run NAME 16 12 2 -- ...
 #
+# Memory: RAM, not CPUs, fills the node. MEM_GB is cut to 2 x the measured peak + 4 of earlier runs
+# of the same command (program, script and bare arguments; ~/mpd-data/cluster/_peaks.tsv), and
+# MEM_GB=auto asks exactly that (2 GB per CPU, at least 8, when nothing is measured yet).
+# MATS_MEM_EXACT=1 keeps MEM_GB as given.
+#
 # Environment: MATS_GPUS=N (L40s; CUDA 12.2 libs are on LD_LIBRARY_PATH),
 # MATS_ENV="K=V ..." (extra environment for the command; RUST_LOG is forwarded when set), MATS_DRY=1
 # (print the translated command and the uploads, submit nothing), MATS_REF=<commit> (run that pushed
@@ -46,13 +51,17 @@
 # slurm-JOBID_TASK.log; `mats-pull NAME` brings back every task's outputs.
 set -Eeuo pipefail
 here=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
-usage() { sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,51p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 [ $# -ge 6 ] && [ "$5" = -- ] || usage
 NAME=$1 CPUS=$2 MEM=$3 HOURS=$4
 shift 5
 [[ $NAME =~ ^[A-Za-z0-9._-]+$ ]] || { echo "mats-run: NAME must be [A-Za-z0-9._-]+" >&2; exit 2; }
 [[ $CPUS =~ ^[0-9]+$ ]] && (( CPUS >= 1 && CPUS <= 124 )) || { echo "mats-run: CPUS must be 1..124" >&2; exit 2; }
-[[ $MEM =~ ^[0-9]+$ ]] && (( MEM >= 1 && MEM <= 384 )) || { echo "mats-run: MEM_GB must be 1..384" >&2; exit 2; }
+if [ "$MEM" = auto ]; then
+    MEM=0
+else
+    [[ $MEM =~ ^[0-9]+$ ]] && (( MEM >= 1 && MEM <= 384 )) || { echo "mats-run: MEM_GB must be 1..384 or auto" >&2; exit 2; }
+fi
 MINUTES=$(awk -v h="$HOURS" 'BEGIN { m = int(h * 60 + 0.999); if (m < 1) m = 1; print m }')
 QOS=${MATS_QOS:-}
 (( MINUTES <= 1440 )) || { echo "mats-run: HOURS exceeds the 24-hour limit" >&2; exit 2; }
@@ -71,7 +80,6 @@ if [ "$QOS" = debug ] && [ -n "$ARRAY" ] && [[ $ARRAY != *%* ]]; then
     echo "mats-run: debug array limited to 8 tasks at once ($ARRAY)" >&2
 fi
 # The node has 458 GB for 252 CPUs, so memory runs out before CPUs do.
-(( MEM > 4 * CPUS && MEM > 24 )) && echo "mats-run: ${MEM} GB for ${CPUS} CPUs; RAM is the scarce resource, so ask for about 1.5x the measured peak (mats-status shows it)" >&2
 
 MAC_DATA=/Users/user/mpd-data MAC_GAM=/Users/user/gam CL_DATA=/mnt/nw/home/s.sauers/mpd-data
 
@@ -147,8 +155,13 @@ fi
 
 if [ "${MATS_POOL:-0}" = 1 ]; then
     (( CHAIN == 1 )) || { echo "mats-run: MATS_POOL and MATS_CHAIN do not combine (a pool worker is long-lived)" >&2; exit 2; }
-    scp -q "$here/pool_worker.sh" mats:mpd-data/cluster/_build/pool_worker.sh
 fi
+# The cluster-side helpers the submission uses go up with it.
+COPYFILE_DISABLE=1 tar --no-mac-metadata -C "$here" -cf - pool_worker.sh cluster_peaks.sh |
+    ssh mats 'mkdir -p mpd-data/cluster/_build && tar -xf - -C mpd-data/cluster/_build 2> /dev/null'
+# The memory ask: MEM_GB, cut to 2 x the measured peak + 4 for this command when that is lower
+# (MATS_MEM_EXACT=1 keeps MEM_GB); `auto` asks exactly that, or 2 GB per CPU (at least 8) unmeasured.
+[ -n "${MATS_MEM_EXACT:-}" ] && (( MEM > 0 )) && MEM="=$MEM"
 want=$(git -C "$MAC_GAM" rev-parse "${MATS_REF:-HEAD}")
 b64=$(printf '%s' "$cmd" | base64 | tr -d '\n')
 rc=0
