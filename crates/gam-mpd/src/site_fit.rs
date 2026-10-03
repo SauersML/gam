@@ -56,7 +56,8 @@
 //!   that keep the map, `Uᵀ D = 0`, its length the one of least code on a geometric ladder around
 //!   the step's quadratic estimate; every input's `B_t` along the line is measured in one pass.
 //! * **Growth.** A subcomponent that runs nowhere or writes nothing takes half of the one that
-//!   carries the most error where it is off, split along that one's inputs (the halves sum to it);
+//!   carries the most error where it is off, split along that one's inputs (at most a chunk of
+//!   them, evenly strided; the halves sum to it);
 //!   kept when the sets selected with them code the inputs in fewer bits.
 //!
 //! The fit stops when a round saves less than one bit per input, or at `rounds`. Every product over
@@ -781,18 +782,30 @@ pub fn fit(
             let carried = fitting.carried(&v, &u);
             let mut parents: Vec<usize> = (0..pieces).filter(|c| !idle.contains(c)).collect();
             parents.sort_by(|a, b| carried[*b].total_cmp(&carried[*a]));
+            // Each split from at most `CHUNK` of its parent's inputs (evenly strided), all in parallel.
+            let halves: Vec<(usize, usize, Option<Library>)> = idle
+                .iter()
+                .zip(&parents)
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .map(|(&slot, &parent)| {
+                    let members: Vec<usize> = (0..rows).filter(|t| fitting.masks[t * pieces + parent] == 1).collect();
+                    if members.len() < 2 {
+                        return (slot, parent, None);
+                    }
+                    let stride = members.len().div_ceil(CHUNK);
+                    let kept: Vec<usize> = members.iter().step_by(stride).copied().collect();
+                    let reads = Array2::from_shape_fn((kept.len(), d_in), |(i, j)| f64::from(x[[kept[i], j]]));
+                    let one = Library { v: v.slice(s![parent..parent + 1, ..]).to_owned(), u: u.slice(s![parent..parent + 1, ..]).to_owned(), mean: Array1::zeros(d_in) };
+                    let (split, _, _) = super::masked::split(&one, &reads, &Array2::ones((kept.len(), 1)));
+                    (slot, parent, (split.v.nrows() == 2).then_some(split))
+                })
+                .collect();
             let mut grown = 0;
-            for (&slot, &parent) in idle.iter().zip(&parents) {
-                let members: Vec<usize> = (0..rows).filter(|t| fitting.masks[t * pieces + parent] == 1).collect();
-                if members.len() < 2 {
-                    continue;
-                }
-                let reads = Array2::from_shape_fn((members.len(), d_in), |(i, j)| f64::from(x[[members[i], j]]));
-                let one = Library { v: v.slice(s![parent..parent + 1, ..]).to_owned(), u: u.slice(s![parent..parent + 1, ..]).to_owned(), mean: Array1::zeros(d_in) };
-                let (halves, _, _) = super::masked::split(&one, &reads, &Array2::ones((members.len(), 1)));
-                if halves.v.nrows() == 2 {
-                    v.row_mut(parent).assign(&halves.v.row(0));
-                    v.row_mut(slot).assign(&halves.v.row(1));
+            for (slot, parent, split) in halves {
+                if let Some(split) = split {
+                    v.row_mut(parent).assign(&split.v.row(0));
+                    v.row_mut(slot).assign(&split.v.row(1));
                     let write = u.row(parent).to_owned();
                     u.row_mut(slot).assign(&write);
                     grown += 1;
