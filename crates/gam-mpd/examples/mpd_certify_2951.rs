@@ -16,7 +16,7 @@
 //! `mpd_certify_2951 lm EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json SEQUENCES CONTEXT [BUDGET] [LEAVES] [FREE] [STEPS] [OBSERVATIONS] [ROUNDING]`
 //!
 //! A language-model export (`import_language_model`), the first `CONTEXT` positions of its first
-//! `SEQUENCES` sequences (or of sequences `a..b` for `SEQUENCES` `a:b`). Positions only read earlier ones, so a prefix is exact. The sites with a
+//! `SEQUENCES` sequences (or of sequences `a..b` for `SEQUENCES` `a:b`, sequence `a` alone for `a:`). Positions only read earlier ones, so a prefix is exact. The sites with a
 //! library in `LIBRARY_DIR` (`{site}.v.f64`, `{site}.u.f64`) run on its subcomponents plus the
 //! residual `W − Σ u vᵀ` as exact rank-one pieces that are always on (VPD's delta component, held on), so
 //! every gate on is the model. `SETS_DIR` gives each position's set (`bench/vpd_2951/vpd_sets_export.py`'s CSR over
@@ -192,11 +192,12 @@ fn lm(args: &[String]) -> Result<(), String> {
     let library_dir = PathBuf::from(args.get(3).ok_or(usage)?);
     let sets_dir = PathBuf::from(args.get(4).ok_or(usage)?);
     let out = PathBuf::from(args.get(5).ok_or(usage)?);
-    // `SEQUENCES` is a count from the first sequence or a range `a:b`.
+    // `SEQUENCES` is a count from the first sequence, a range `a:b`, or one sequence `a:`.
     let spec: String = arg(args, 6, "1".to_string())?;
     let (first, sequences) = match spec.split_once(':') {
         Some((a, b)) => {
-            let (a, b): (usize, usize) = (a.parse().map_err(|e| format!("SEQUENCES {spec}: {e}"))?, b.parse().map_err(|e| format!("SEQUENCES {spec}: {e}"))?);
+            let a: usize = a.parse().map_err(|e| format!("SEQUENCES {spec}: {e}"))?;
+            let b: usize = if b.is_empty() { a + 1 } else { b.parse().map_err(|e| format!("SEQUENCES {spec}: {e}"))? };
             (a, b.checked_sub(a).filter(|n| *n > 0).ok_or_else(|| format!("SEQUENCES {spec}: an empty range"))?)
         }
         None => (0, spec.parse().map_err(|e| format!("SEQUENCES {spec}: {e}"))?),
