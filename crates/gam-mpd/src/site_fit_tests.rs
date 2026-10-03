@@ -34,7 +34,7 @@ fn site() -> (Array2<f64>, Samples, Generic) {
 #[test]
 fn a_subcomponent_split_in_two_halves_is_merged_back() {
     let (w, samples, describe) = site();
-    // The map's three singular pieces, the first one split into two identical halves that always
+    // The map's two singular pieces, the first one split into two identical halves that always
     // run together.
     let d = super::dense::svd(w.view(), false).expect("svd");
     let mut u_rows = Vec::new();
@@ -54,7 +54,8 @@ fn a_subcomponent_split_in_two_halves_is_merged_back() {
     let library = Library { v: stack(&v_rows), u: stack(&u_rows), mean: Array1::zeros(3) };
     let (rank_one, _) = measure(0, &w, &samples, &describe, 1e4, &library).expect("measures");
     let (blocked, round) = blocks(0, &w, &samples, &describe, 1e4, &library).expect("blocks");
-    assert!(blocked.ranks.contains(&2), "the halves stayed apart: {:?}", blocked.ranks);
+    // The halves always run together: they end in one block (alone, or with the rest of the map).
+    assert!(blocked.ranks.len() < 3 && blocked.ranks[0] >= 2, "the halves stayed apart: {:?}", blocked.ranks);
     assert!(round.code < rank_one.code, "{} against {}", round.code, rank_one.code);
     let map = blocked.library.u.t().dot(&blocked.library.v);
     let error = (&map - &w).iter().fold(0.0_f64, |m, e| m.max(e.abs()));
