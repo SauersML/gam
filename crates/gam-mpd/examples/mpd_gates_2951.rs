@@ -166,9 +166,10 @@ fn write_logits(run: &Run, switches: &[Vec<Switch>], lo: usize, hi: usize, floor
         }
         indptr.push(indices.len() as i64);
     }
-    write_npy_i64(&stem.with_extension("indptr.npy"), &indptr)?;
-    write_npy_i64(&stem.with_extension("indices.npy"), &indices)?;
-    write_npy(&stem.with_extension("values.npy"), "<f8", values.iter().map(|v| v.to_le_bytes()))
+    let path = |part: &str| PathBuf::from(format!("{}.{part}.npy", stem.display()));
+    write_npy_i64(&path("indptr"), &indptr)?;
+    write_npy_i64(&path("indices"), &indices)?;
+    write_npy(&path("values"), "<f8", values.iter().map(|v| v.to_le_bytes()))
 }
 
 fn range(spec: &str) -> Result<(usize, usize), String> {

@@ -33,7 +33,7 @@
 //! block along a line, not the box of k independent masks: any robustness evaluation of these
 //! points masks each block's columns together, a weaker claim than per column.
 
-use gam_mpd::blocks::{Bits, Blocked, Coded, Describe, Generic, block_cosine, fit_blocks, measure, reselect};
+use gam_mpd::blocks::{Bits, Blocked, Coded, Describe, Generic, block_cosine, fit_blocks, measure, reselect, rounding_error};
 use gam_mpd::import::{import, import_language_model};
 use gam_mpd::masked::{Library, Site, Target, site_statistics, sites};
 use gam_mpd::operator_program::{FamilyInputs, LabelKind, OperatorProgram};
@@ -153,23 +153,44 @@ fn modadd(dir: &Path, out: &Path, observations: f64, names: Option<Vec<String>>)
         eprintln!("{}: {}×{}, {} rank-one subcomponents", site.name, measured.w.nrows(), measured.w.ncols(), library.u.nrows());
         libraries.push(Library { v: library.v.t().to_owned(), u: library.u, mean: measured.mean.clone() });
     }
-    let masks = vec![libraries.iter().map(|l| Array2::<f64>::ones((family.rows, l.v.nrows()))).collect()];
-    let describe = Generic::new(&statistics, observations);
-    let coded = Coded { model: &program, sites: chosen.clone(), batches: vec![(family.clone(), target)], observations, samples: 16, describe: &describe };
+    let masks: Vec<Vec<Array2<f64>>> = vec![libraries.iter().map(|l| Array2::<f64>::ones((family.rows, l.v.nrows()))).collect()];
+    // The second-order rounding price only proposes: each fit's decoded blocks are run exactly, and
+    // while the measured rounding KL is off its price by more than a factor of two the price is
+    // rescaled by their ratio and the fit repeated (`gam_mpd::blocks::rounding_error`).
+    let mut describe = Generic::new(&statistics, observations);
+    let mut calibrations = Vec::new();
+    loop {
+        let coded = Coded { model: &program, sites: chosen.clone(), batches: vec![(family.clone(), target.clone())], observations, samples: 16, describe: &describe };
+        let (mut report, measured, priced) = fit_modadd(&program, &coded, &chosen, Blocked::rank_one(libraries.clone(), masks.clone()), &describe)?;
+        eprintln!("rounding: measured {measured:.1} bits against {priced:.1} priced");
+        calibrations.push(json!({"measured": measured, "priced": priced}));
+        let ratio = if priced > 0.0 { measured / priced } else { f64::INFINITY };
+        if (0.5..=2.0).contains(&ratio) || measured <= 0.0 || calibrations.len() >= 6 {
+            report["observations"] = json!(observations);
+            report["calibrations"] = Value::Array(calibrations);
+            return std::fs::write(out, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string());
+        }
+        describe = describe.scaled(if ratio.is_finite() { ratio } else { 1e3 });
+    }
+}
+
+/// One fit of the mod-31 decomposition under `describe` (`modadd`): the checks, the rank-one point
+/// and the blocks, its report and the blocks' measured and priced rounding KL bits.
+fn fit_modadd(program: &OperatorProgram, coded: &Coded<'_>, chosen: &[Site], start: Blocked, describe: &Generic) -> Result<(Value, f64, f64), String> {
     // The checks: every subcomponent on, every one off, and each site's whole map on.
-    let mut rank_one = Blocked::rank_one(libraries, masks);
-    rank_one.price(&coded)?;
-    let (mut bits, _) = measure(&coded, &rank_one)?;
+    let mut rank_one = start;
+    rank_one.price(coded)?;
+    let (mut bits, _) = measure(coded, &rank_one)?;
     let all_on = bits.clone();
     say("all on", &all_on);
-    let (all_off, _) = measure(&coded, &rank_one.off())?;
+    let (all_off, _) = measure(coded, &rank_one.off())?;
     say("all off", &all_off);
-    let (dense, _) = measure(&coded, &rank_one.whole())?;
+    let (dense, _) = measure(coded, &rank_one.whole())?;
     say("dense", &dense);
     // The rank-one point: selection passes until one no longer lowers the code.
     loop {
-        let next = reselect(&coded, &rank_one)?;
-        let (next_bits, _) = measure(&coded, &next)?;
+        let next = reselect(coded, &rank_one)?;
+        let (next_bits, _) = measure(coded, &next)?;
         say("rank-one pass", &next_bits);
         if next_bits.total() >= bits.total() {
             break;
@@ -177,7 +198,10 @@ fn modadd(dir: &Path, out: &Path, observations: f64, names: Option<Vec<String>>)
         (rank_one, bits) = (next, next_bits);
     }
     let rank_one_bits = bits;
-    let (blocked, block_bits) = fit_blocks(&coded, rank_one.clone(), true)?;
+    let (blocked, block_bits) = fit_blocks(coded, rank_one.clone(), true)?;
+    let (measured, priced, decoded) = rounding_error(coded, &blocked)?;
+    let (decoded_bits, _) = measure(coded, &decoded)?;
+    say("blocks, decoded", &decoded_bits);
     say("rank one", &rank_one_bits);
     say("blocks", &block_bits);
     // The same weights on the same words, every column its own subcomponent: equal KL, so the
@@ -187,10 +211,10 @@ fn modadd(dir: &Path, out: &Path, observations: f64, names: Option<Vec<String>>)
         .iter()
         .map(|masks| masks.iter().zip(&blocked.ranks).map(|(m, r)| per_column(m, r)).collect())
         .collect();
-    let (columns, _) = measure(&coded, &Blocked::rank_one(blocked.libraries.iter().map(|l| (**l).clone()).collect(), columns_on))?;
+    let (columns, _) = measure(coded, &Blocked::rank_one(blocked.libraries.iter().map(|l| (**l).clone()).collect(), columns_on))?;
     say("blocks' columns as rank-one subcomponents", &columns);
-    let readout = token_operator(&program, true);
-    let embedding = token_operator(&program, false);
+    let readout = token_operator(program, true);
+    let embedding = token_operator(program, false);
     let mut described = Vec::new();
     for (k, site) in chosen.iter().enumerate() {
         let library = &blocked.libraries[k];
@@ -219,7 +243,6 @@ fn modadd(dir: &Path, out: &Path, observations: f64, names: Option<Vec<String>>)
         }
     }
     let report = json!({
-        "observations": observations,
         "points": [
             point("all on", &all_on),
             point("all off", &all_off),
@@ -227,12 +250,13 @@ fn modadd(dir: &Path, out: &Path, observations: f64, names: Option<Vec<String>>)
             point("rank one", &rank_one_bits),
             point("blocks", &block_bits),
             point("blocks' columns as rank-one subcomponents", &columns),
+            point("blocks, decoded", &decoded_bits),
         ],
-        "rank_one_ranks": ranks(&coded, &rank_one),
-        "block_ranks": ranks(&coded, &blocked),
+        "rank_one_ranks": ranks(coded, &rank_one),
+        "block_ranks": ranks(coded, &blocked),
         "blocks": described,
     });
-    std::fs::write(out, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    Ok((report, measured, priced))
 }
 
 /// The unembedding (`classes × d`, `readout`) or the embedding's operand rows (`tokens × d`, the

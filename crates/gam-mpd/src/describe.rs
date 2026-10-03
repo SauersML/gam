@@ -934,7 +934,7 @@ impl Geometry {
     /// predicts. Each round describes at the metric's price times a calibration, measures the
     /// decoded description exactly, and scales the calibration by measured over predicted; every
     /// round's description is exactly priced, and the cheapest is returned with its measured error.
-    /// The rounds end when the prediction holds to within a factor of two (or after 12).
+    /// The rounds end when the prediction holds to within a factor of two (or after eight).
     pub fn describe_exact(
         &self,
         u: ArrayView2<'_, f64>,
@@ -943,7 +943,7 @@ impl Geometry {
     ) -> Result<Description, String> {
         let mut calibration = 1.0_f64;
         let mut best: Option<Description> = None;
-        for _ in 0..12 {
+        for _ in 0..8 {
             let mut d = self.describe_at(u, v, calibration)?;
             let predicted = d.kl_bits / calibration;
             let measured = exact(&d)?.max(0.0);

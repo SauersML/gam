@@ -60,6 +60,12 @@ use std::sync::Arc;
 /// `r × d_in` (the library's convention, the map `uᵀ v`), on site `site`.
 pub trait Describe: Sync {
     fn bits(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<f64, String>;
+
+    /// The block as its description decodes it, `(u, v)`, and the KL bits per word its rounding
+    /// error was priced at; `None` when the description is exact.
+    fn decode(&self, _site: usize, _u: ArrayView2<'_, f64>, _v: ArrayView2<'_, f64>) -> Result<Option<(Array2<f64>, Array2<f64>, f64)>, String> {
+        Ok(None)
+    }
 }
 
 /// The generic description (module note), from each site's reads' second moment (the masked
@@ -67,6 +73,8 @@ pub trait Describe: Sync {
 pub struct Generic {
     sites: Vec<GenericSite>,
     observations: f64,
+    /// The rounding price's calibration ([`rounding_error`]).
+    scale: f64,
 }
 
 struct GenericSite {
@@ -88,31 +96,50 @@ impl Generic {
                 GenericSite { moment, fisher, trace_c, trace_f }
             })
             .collect();
-        Self { sites, observations }
+        Self { sites, observations, scale: 1.0 }
     }
 }
 
-impl Describe for Generic {
-    fn bits(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<f64, String> {
+impl Generic {
+    /// The same description with its rounding price multiplied by `scale` ([`rounding_error`]).
+    pub fn scaled(mut self, scale: f64) -> Self {
+        self.scale *= scale;
+        self
+    }
+
+    /// The balanced block, its reals, largest entry, lattice step and the priced KL bits of the
+    /// step's rounding error (module note); `None` for a block without a direction.
+    fn lattice(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<Option<(Array2<f64>, Array2<f64>, f64, f64, f64, f64)>, String> {
         let (u, v) = balanced(u, v)?;
         let r = u.nrows();
         if r == 0 {
-            return Ok(0.0);
+            return Ok(None);
         }
         let reals = (r * (u.ncols() + v.ncols() - r)) as f64;
         let metric = &self.sites[site];
         let tv = (&fast_ab(&v, &metric.moment) * &v).sum();
         let tu = (&fast_ab(&u, &metric.fisher) * &u).sum();
         // The expected KL bits of rounding every factor entry to a step `δ`, per `δ²`.
-        let a = self.observations / (2.0 * LN_2) / 12.0 * (metric.trace_f * tv + metric.trace_c * tu);
-        if !(a > 0.0) {
-            return Ok(0.0);
-        }
+        let a = self.scale * self.observations / (2.0 * LN_2) / 12.0 * (metric.trace_f * tv + metric.trace_c * tu);
         // `R log₂(2L/δ) + a δ²` is least at `δ = √(R / (2 a ln 2))`; a step past the largest entry `L`
         // would round the block to nothing, so every real takes at least one bit (`δ ≤ L`).
         let largest = u.iter().chain(v.iter()).fold(0.0_f64, |m, x| m.max(x.abs()));
-        let step = (reals / (2.0 * a * LN_2)).sqrt().min(largest);
-        Ok(reals * (2.0 * largest / step).log2() + a * step * step)
+        let step = if a > 0.0 { (reals / (2.0 * a * LN_2)).sqrt().min(largest) } else { largest };
+        Ok(Some((u, v, reals, largest, step, a * step * step)))
+    }
+}
+
+impl Describe for Generic {
+    fn bits(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<f64, String> {
+        Ok(self.lattice(site, u, v)?.map_or(0.0, |(_, _, reals, largest, step, error)| reals * (2.0 * largest / step).log2() + error))
+    }
+
+    fn decode(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<Option<(Array2<f64>, Array2<f64>, f64)>, String> {
+        let Some((u, v, _, _, step, error)) = self.lattice(site, u, v)? else {
+            return Ok(Some((Array2::zeros((0, u.ncols())), Array2::zeros((0, v.ncols())), 0.0)));
+        };
+        let round = |x: f64| (x / step).round() * step;
+        Ok(Some((u.mapv(round), v.mapv(round), error)))
     }
 }
 
@@ -694,6 +721,47 @@ fn member_moments(coded: &Coded<'_>, blocked: &Blocked) -> Result<Vec<Vec<Array2
         }
     }
     Ok(out)
+}
+
+/// The rounding error of `blocked`'s descriptions, measured against priced: every block replaced
+/// by what its description decodes ([`Describe::decode`]) and run by the exact masked forward.
+/// Returns `(measured, priced)` KL bits over every coded word, and the decoded decomposition; a
+/// description whose price is far from what it measures is recalibrated by their ratio
+/// ([`Generic::scaled`]), since the second-order price is only a proposal.
+pub fn rounding_error(coded: &Coded<'_>, blocked: &Blocked) -> Result<(f64, f64, Blocked), String> {
+    let mut decoded = blocked.clone();
+    let mut priced_per_block: Vec<Vec<f64>> = Vec::new();
+    for k in 0..blocked.ranks.len() {
+        let (mut us, mut vs, mut ranks, mut errors) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for c in 0..blocked.ranks[k].len() {
+            let (u, v) = blocked.factors(k, c);
+            let (du, dv, error) = coded.describe.decode(k, u, v)?.unwrap_or_else(|| (u.to_owned(), v.to_owned(), 0.0));
+            ranks.push(du.nrows());
+            errors.push(error);
+            us.push(du);
+            vs.push(dv);
+        }
+        if ranks.contains(&0) {
+            return Err(format!("site {k}: a block decodes to nothing"));
+        }
+        let library = &blocked.libraries[k];
+        let stack = |parts: &[Array2<f64>]| ndarray::concatenate(Axis(0), &parts.iter().map(|p| p.view()).collect::<Vec<_>>()).map_err(|e| e.to_string());
+        decoded.libraries[k] = Arc::new(Library { u: stack(&us)?, v: stack(&vs)?, mean: library.mean.clone() });
+        decoded.ranks[k] = ranks;
+        decoded.priced[k] = vec![None; decoded.ranks[k].len()];
+        priced_per_block.push(errors);
+    }
+    let (exact, _) = measure(coded, blocked)?;
+    let (rounded, _) = measure(coded, &decoded)?;
+    let mut priced = 0.0;
+    for ((inputs, target), masks) in coded.batches.iter().zip(&blocked.masks) {
+        for (k, m) in masks.iter().enumerate() {
+            for r in (0..inputs.rows).filter(|r| target.scores(*r)) {
+                priced += m.row(r).iter().zip(&priced_per_block[k]).filter(|(x, _)| **x > 0.0).map(|(_, e)| e).sum::<f64>();
+            }
+        }
+    }
+    Ok((rounded.kl - exact.kl, priced, decoded))
 }
 
 /// The code-chosen blocks from `blocked` (module note): merge rounds until none is kept, then (when
