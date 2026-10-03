@@ -98,13 +98,14 @@ if [ -n "${MATS_DRY:-}" ]; then
 fi
 if [ ${#uploads[@]} -gt 0 ] && [ -z "${MATS_NO_UPLOAD:-}" ]; then
     rel=()
-    for p in "${uploads[@]}"; do rel+=("$MAC_DATA/./${p#"$MAC_DATA"/}"); done
+    for p in "${uploads[@]}"; do rel+=("${p#"$MAC_DATA"/}"); done
     kb=$(du -sk "${uploads[@]}" | awk '{ s += $1 } END { print s }')
     if (( kb > 40 * 1024 * 1024 )) && [ -z "${MATS_UPLOAD_BIG:-}" ]; then
         echo "mats-run: inputs are $((kb / 1024 / 1024)) GB; set MATS_UPLOAD_BIG=1 to send them" >&2; exit 2
     fi
     echo "mats-run: syncing $((kb / 1024)) MB of inputs: ${uploads[*]#"$MAC_DATA"/}" >&2
-    rsync -a --relative --copy-unsafe-links --exclude '*.pem' --exclude '*.key' --exclude '.env' "${rel[@]}" mats:mpd-data/
+    # macOS's openrsync ignores the `/./` marker, so --relative gets paths relative to mpd-data.
+    (cd "$MAC_DATA" && rsync -a --relative --copy-unsafe-links --exclude '*.pem' --exclude '*.key' --exclude '.env' "${rel[@]}" mats:mpd-data/)
 fi
 
 want=$(git -C "$MAC_GAM" rev-parse "${MATS_REF:-HEAD}")
