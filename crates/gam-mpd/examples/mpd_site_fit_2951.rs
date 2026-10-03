@@ -35,7 +35,7 @@ use gam_mpd::import::import_language_model;
 use gam_mpd::masked::{matrix, sites};
 use gam_mpd::masked::Library;
 use gam_mpd::operator_program::Node;
-use gam_mpd::site_fit::{Settings, blocks, fit, measure, samples};
+use gam_mpd::site_fit::{Settings, ard, blocks, fit, measure, samples};
 use ndarray::{Array1, Array2};
 use serde_json::json;
 use std::path::PathBuf;
@@ -72,7 +72,14 @@ fn write_blocks(coding: &Coding<'_>, name: &str, k: usize, w: &Array2<f64>, samp
     let columns = library.v.nrows();
     let (fine, fine_round) = blocks(k, w, sample, description, observations, library, &vec![1; columns])?;
     let (coarse, coarse_round) = blocks(k, w, sample, description, observations, library, &[columns])?;
-    let (chosen, round) = if coarse_round.code < fine_round.code { (&coarse, &coarse_round) } else { (&fine, &fine_round) };
+    let (evidence, evidence_round) = ard(k, w, sample, description, observations, (library, &vec![1; columns]), 50)?;
+    let (chosen, round) = [(&fine, &fine_round), (&coarse, &coarse_round), (&evidence, &evidence_round)]
+        .into_iter()
+        .fold(None, |best: Option<(&gam_mpd::site_fit::Blocked, &gam_mpd::site_fit::Round)>, c| match best {
+            Some(b) if b.1.code <= c.1.code => Some(b),
+            _ => Some(c),
+        })
+        .ok_or("no partition")?;
     write_f64(&out.join(format!("{name}.v.f64")), &chosen.library.v)?;
     write_f64(&out.join(format!("{name}.u.f64")), &chosen.library.u)?;
     std::fs::write(out.join(format!("{name}.ranks.json")), json!(chosen.ranks).to_string()).map_err(|e| e.to_string())?;
@@ -84,19 +91,21 @@ fn write_blocks(coding: &Coding<'_>, name: &str, k: usize, w: &Array2<f64>, samp
         h
     };
     eprintln!(
-        "{name} blocks: code {:.1} bits per input (description {:.1}, error {:.1}), ranks {:?}, {:.2} on per input; from the fine start {:.1}, the coarse {:.1}",
+        "{name} blocks: code {:.1} bits per input (description {:.1}, error {:.1}), ranks {:?}, {:.2} on per input; merges/splits from the fine start {:.1}, the coarse {:.1}; by evidence {:.1}",
         round.code,
         round.description,
         round.error,
         histogram(&chosen.ranks),
         round.l0,
         fine_round.code,
-        coarse_round.code
+        coarse_round.code,
+        evidence_round.code
     );
     let record = |b: &gam_mpd::site_fit::Blocked, r: &gam_mpd::site_fit::Round| {
         json!({"ranks": histogram(&b.ranks), "code": r.code, "description": r.description, "error": r.error, "l0": r.l0})
     };
-    let report = json!({"site": name, "observations": observations, "fine": record(&fine, &fine_round), "coarse": record(&coarse, &coarse_round)});
+    let report = json!({"site": name, "observations": observations, "fine": record(&fine, &fine_round), "coarse": record(&coarse, &coarse_round),
+        "evidence": record(&evidence, &evidence_round)});
     std::fs::write(out.join(format!("{name}.blocks.json")), report.to_string()).map_err(|e| e.to_string())
 }
 
