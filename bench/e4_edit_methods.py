@@ -134,14 +134,16 @@ def stage_prep():
                 nc += len(x)
             else:
                 npc += len(x)
-        if i < 32:  # the Fisher from 32 rows: labels sampled from the model, so E[g g^T] is the Fisher
-            y = (g2 @ W0.T).detach().requires_grad_(True)
-            lp = head(final.after(xmid + y))[:, :-1]
+        for j in range(2) if i < 32 else ():  # the Fisher from 32 rows, one at a time: labels sampled from the
+            y = (g2[j:j + 1] @ W0.T).detach().requires_grad_(True)  # model, so E[g g^T] is the Fisher
+            lp = head(final.after(xmid[j:j + 1] + y))[:, :-1]
             lab = (lp.detach() - torch.log(-torch.log(torch.rand_like(lp)))).argmax(-1)
             (gy,) = torch.autograd.grad(lp.gather(-1, lab[..., None]).sum(), y)
-            gy = gy[:, :-1][keep]
+            gy = gy[:, :-1][keep[j:j + 1]]
             H += (gy.T @ gy).cpu().double().numpy()
             nh += len(gy)
+            del lp, lab, y
+        torch.mps.empty_cache()
         if i % 32 == 0:
             log(f"moments: rows {i}")
             torch.mps.empty_cache()
@@ -216,6 +218,7 @@ def train_lora_neg(target, pool, negs, lam, gamma, steps=300, batch=256, micro=8
             (gamma * (le.exp() * (le - lb))[pb].sum() / max(n_neg, 1)).backward()
             del le, lb
         opt.step()
+        torch.mps.empty_cache()  # keeps the footprint inside the 2 GiB reservation
     site.W = W0
     return A.detach().cpu(), B.detach().cpu()
 
@@ -337,6 +340,10 @@ def stage_screen():
         for wn in (("fisher", "grad") if rn == "rome" else ("fisher",)):
             w, uu = t32(writes[wn]), t32(u)
             fams[f"{rn}+{wn}"] = lambda s, w=w, uu=uu: s * torch.outer(w, uu)
+    for plan in sorted((OUT / "compile").glob("plan_*.left.npy")):
+        name = plan.name[len("plan_"):-len(".left.npy")]
+        unit = t32(np.load(plan) @ np.load(plan.with_name(plan.name.replace(".left.", ".right."))).T)
+        fams[name] = lambda s, unit=unit: s * unit
     vpd_dw = lambda a: torch.outer((-a * u_o).to(torch.bfloat16).float() - U, V)
     fams["vpd"] = vpd_dw
     for fname, fam in fams.items():
@@ -400,5 +407,85 @@ def stage_compile_export():
     log(f"wrote {d / 'manifest.json'}: {len(problems)} problems, {len(K)} fire keys")
 
 
+def family_deltas():
+    """Every closed-form family as strength -> delta W (torch, mps), from prep.npz and the compiled plans."""
+    import torch
+    z = np.load(OUT / "prep.npz")
+    target, U, V = E.load()
+    u_o = target.wte[E.O_TOK] / target.wte[E.O_TOK].norm()
+    raw = torch.load(str(E.VD / "s-55ea3f9b/model_400000.pth"), map_location="cpu", weights_only=True, mmap=True)
+    Vall = raw["_components." + E.SITE.replace(".", "-") + ".V"].double().numpy()
+    del raw
+    reads, writes, spec_c = reads_and_writes(z, Vall)
+    t32 = lambda a: torch.from_numpy(np.asarray(a, np.float32)).to("mps")
+    fams = {}
+    for rn, u in reads.items():
+        for wn in (("fisher", "grad") if rn == "rome" else ("fisher",)):
+            w, uu = t32(writes[wn]), t32(u)
+            fams[f"{rn}+{wn}"] = lambda s, w=w, uu=uu: s * torch.outer(w, uu)
+    for plan in sorted((OUT / "compile").glob("plan_*.left.npy")):
+        name = plan.name[len("plan_"):-len(".left.npy")]
+        unit = t32(np.load(plan) @ np.load(plan.with_name(plan.name.replace(".left.", ".right."))).T)
+        fams[name] = lambda s, unit=unit: s * unit
+    fams["vpd"] = lambda a: torch.outer((-a * u_o).to(torch.bfloat16).float() - U, V)
+    return target, fams, spec_c
+
+
+def stage_assemble():
+    """The final edit set: from every family, the configuration with the least screening KL at 98.5% success,
+    re-solved to the headline LoRA's exact success; the headline LoRA and the VPD edit at that success; the best
+    hard-negative LoRA with a VPD edit at its own success. Writes methods/final.pt and final.json."""
+    import torch
+    scr = json.load(open(OUT / "screen.json"))
+    target, fams, _ = family_deltas()
+    W0 = target.site(E.SITE).W.clone()
+    ev, _ = E.harvest()
+    pf = E.p_fire_fn(target, ev)
+    head = json.load(open(E.FR / "e4_side/models.json"))["meta"]
+    p_star = head["lora282_lam10"]["p_fire"]
+
+    def at(fam, p, lo, hi):
+        for _ in range(40):
+            mid = (lo * hi) ** 0.5
+            lo, hi = (mid, hi) if pf(W0 + fam(mid)) < p else (lo, mid)
+        s = (lo * hi) ** 0.5
+        return s, fam(s)
+    groups = {"rome": ["rome+fisher"], "rome_gradwrite": ["rome+grad"], "memit": [k for k in fams if k.startswith("memit")],
+              "nullspace": [k for k in fams if k.startswith("null")], "contrast": [k for k in fams if k.startswith("contrast")],
+              "vpd_read_fisher_write": ["vpd2359_read+fisher"], "specific_subcomponent": [k for k in fams if k.startswith("spec")],
+              "compiled": [k for k in fams if k.startswith("compiled")]}
+    kl_at = lambda k: next((q["kl"] for q in scr.get(k, []) if q.get("target") == 0.985 and q.get("kl") is not None), np.inf)
+    out, meta = {}, {}
+    for g, ks in groups.items():
+        ks = [k for k in ks if np.isfinite(kl_at(k))]
+        if not ks:
+            continue
+        best = min(ks, key=kl_at)
+        s, dW = at(fams[best], p_star, 1e-3, 1e4)
+        out[g] = dW.cpu()
+        meta[g] = {"method": g, "config": best, "strength": s, "p_fire": pf(W0 + dW)}
+        log(f"{g}: {best} strength {s:.4g} p_fire {meta[g]['p_fire']:.4f}")
+    s, dW = at(fams["vpd"], p_star, 0.3, 20.0)
+    out["vpd"], meta["vpd"] = dW.cpu(), {"method": "vpd", "alpha": s, "p_fire": pf(W0 + dW)}
+    deltas = E.lora_deltas()
+    out["lora"] = (deltas["lora282_lam10"]["B"] @ deltas["lora282_lam10"]["A"])
+    meta["lora"] = {"method": "lora", "config": "lora282_lam10", "p_fire": pf(W0 + out["lora"].to("mps"))}
+    negs = {}
+    for f in OUT.glob("lora_loraneg_*.pt"):
+        negs.update(torch.load(f))
+    pairs = [[g, "vpd"] for g in out if g not in ("vpd",)]
+    if negs:
+        best = min(negs, key=lambda k: scr.get(k, [{"kl": np.inf}])[0]["kl"])
+        dW = negs[best]["B"] @ negs[best]["A"]
+        p = pf(W0 + dW.to("mps"))
+        out["lora_hardneg"], meta["lora_hardneg"] = dW, {"method": "lora_hardneg", "config": best, "p_fire": p}
+        s, dv = at(fams["vpd"], p, 0.3, 20.0)
+        out["vpd_at_hardneg"], meta["vpd_at_hardneg"] = dv.cpu(), {"method": "vpd", "alpha": s, "p_fire": pf(W0 + dv)}
+        pairs = [q for q in pairs if q[0] not in ("lora_hardneg", "vpd_at_hardneg")] + [["lora_hardneg", "vpd_at_hardneg"]]
+    torch.save(out, OUT / "final.pt")
+    json.dump({"meta": meta, "pairs": pairs}, open(OUT / "final.json", "w"), indent=1)
+    log(f"final set: {list(out)}")
+
+
 if __name__ == "__main__":
-    {"prep": stage_prep, "screen": stage_screen, "compile_export": stage_compile_export, "lora_neg": lambda: stage_lora_neg(float(sys.argv[2]))}[sys.argv[1]]()
+    {"prep": stage_prep, "screen": stage_screen, "compile_export": stage_compile_export, "assemble": stage_assemble, "lora_neg": lambda: stage_lora_neg(float(sys.argv[2]))}[sys.argv[1]]()
