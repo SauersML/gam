@@ -18,14 +18,16 @@
 //! function with no units is the one-line rule "on when `|v·x| > τ`". On the eval inputs every
 //! function decides from the amplitude alone, and `OUT.json` gets per site and in total: the
 //! functions' kinds and own bits, their decisions' disagreement with the selected sets per input,
-//! both L0s, and the bits per input of listing the selected sets under the functions (the
-//! corrections that turn the functions' sets into the selection's) beside the same under each
-//! subcomponent's base rate. `OUT.switches.json` holds the functions per site.
+//! both L0s, the site's code per input of the functions' own sets beside the selection's
+//! (`gam_mpd::site_fit::code_of`, on the selection's own terms), and the bits per input of listing
+//! the selected sets under the functions (the corrections that turn the functions' sets into the
+//! selection's) beside the same under each subcomponent's base rate. `OUT.switches.json` holds the
+//! functions per site.
 
 use gam_mpd::gates::{self, Feature, Switch};
 use gam_mpd::import::import_language_model;
 use gam_mpd::masked::{Library, matrix, sites};
-use gam_mpd::site_fit::{measure, samples};
+use gam_mpd::site_fit::{code_of, measure, samples};
 use ndarray::{Array1, Array2};
 use rayon::prelude::*;
 use serde_json::json;
@@ -143,6 +145,9 @@ fn main() -> Result<(), String> {
         let base: f64 = scored.iter().map(|s| s.1).sum();
         let wrong: usize = scored.iter().zip(&eval_y).map(|(s, y)| s.2.iter().zip(y).filter(|(a, b)| a != b).count()).sum();
         let decided_l0 = scored.iter().map(|s| s.2.iter().filter(|o| **o).count()).sum::<usize>() as f64 / inputs as f64;
+        // The switching functions' own sets, priced on the selection's terms.
+        let switched_sets: Vec<Vec<u32>> = (0..inputs).map(|t| (0..pieces).filter(|c| scored[*c].2[t]).map(|c| c as u32).collect()).collect();
+        let switched = code_of(k, &maps[k], &scored_on[k], &description, observations, &library, &switched_sets)?;
         let own: f64 = switches.iter().map(|s| s.function_bits).sum();
         let mut kinds = std::collections::BTreeMap::<String, usize>::new();
         for s in &switches {
@@ -154,9 +159,11 @@ fn main() -> Result<(), String> {
             *kinds.entry(kind).or_default() += 1;
         }
         eprintln!(
-            "{}: {pieces} subcomponents {kinds:?}; eval: selected L0 {:.2}, switched L0 {decided_l0:.2}, {:.2} disagreements per input, listing {:.1} bits per input (base rates {:.1}); own bits {own:.0}, {:.0}s",
+            "{}: {pieces} subcomponents {kinds:?}; eval: selected L0 {:.2} code {:.1}, switched L0 {decided_l0:.2} code {:.1}, {:.2} disagreements per input, listing {:.1} bits per input (base rates {:.1}); own bits {own:.0}, {:.0}s",
             site.name,
             eval_round.l0,
+            eval_round.code,
+            switched.code,
             wrong as f64 / inputs as f64,
             listing / inputs as f64,
             base / inputs as f64,
@@ -166,7 +173,8 @@ fn main() -> Result<(), String> {
             "site": site.name, "pieces": pieces, "kinds": kinds, "function_bits": own,
             "train": {"code": train_round.code, "l0": train_round.l0},
             "eval": {"code": eval_round.code, "description": eval_round.description, "error": eval_round.error, "l0_selected": eval_round.l0,
-                "l0_switched": decided_l0, "disagreements_per_input": wrong as f64 / inputs as f64,
+                "l0_switched": decided_l0, "code_switched": switched.code, "description_switched": switched.description, "error_switched": switched.error,
+                "disagreements_per_input": wrong as f64 / inputs as f64,
                 "listing_bits_per_input": listing / inputs as f64, "base_rate_bits_per_input": base / inputs as f64},
             "thresholds": switches.iter().map(|s| s.threshold()).collect::<Vec<_>>(),
         }));
