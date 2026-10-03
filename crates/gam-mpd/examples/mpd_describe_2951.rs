@@ -302,6 +302,9 @@ fn modadd(dir: &Path, out: &Path, observations: f64, only: Option<&str>) -> Resu
         let (u, v) = whole.factors(k, 0);
         let d = structured.sites[k].describe(u, v)?;
         let plain = lattice.sites[k].describe(u, v)?;
+        if let Some(bracket) = exact.certified(k, u, v, &d)? {
+            eprintln!("{}: certified error {bracket:.3} bits/word, measured {:.3}", site.name, exact.measured(k, u, v, &d)?);
+        }
         eprintln!(
             "{}: whole map rank {}: structured {} bits ({} reals, writer {} {:?}, reader {} {:?}, {}, error {:.1} bits), lattice generic {} bits ({} reals)",
             site.name, u.nrows(), d.bits().round(), d.reals, d.writer.0, d.writer.1, d.reader.0, d.reader.1, core_name(&d.core), d.kl_bits, plain.bits().round(), plain.reals

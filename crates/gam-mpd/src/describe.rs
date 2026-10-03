@@ -1275,7 +1275,8 @@ impl super::blocks::Describe for Structured {
 /// [`Structured`] priced at the exact KL of its decoded blocks ([`Geometry::describe_exact`]): a
 /// block's error is measured by the masked forward of the native model with only that block's map
 /// replaced by its decoded description (every site otherwise its native map, every word on), per
-/// word at `n`. Context-free, so the blocks' code can call it for any block it proposes; the price
+/// word at `n`; on a site whose writes reach the logits linearly, by the certified bracket of
+/// [`Exact::certified`] when it is tight enough, with no forward. Context-free, so the blocks' code can call it for any block it proposes; the price
 /// of running only on some words is the per-word error over all of them.
 pub struct Exact<'a> {
     pub structured: Structured,
@@ -1285,6 +1286,19 @@ pub struct Exact<'a> {
     observations: f64,
     maps: Vec<Array2<f64>>,
     base: f64,
+    /// Per site, whether its written values reach the logits only through affine nodes, and per
+    /// batch the native trace (the reads and the base of the linear change).
+    linear: Vec<bool>,
+    traces: Vec<super::operator_program::Trace>,
+}
+
+/// `(e^R − 1 − R)/R²` and `(e^{−R} − 1 + R)/R²` (both ½ at `R = 0`).
+fn sandwich(r: f64) -> (f64, f64) {
+    if r < 1e-4 {
+        (0.5 + r / 6.0, 0.5 - r / 6.0)
+    } else {
+        ((r.exp_m1() - r) / (r * r), ((-r).exp_m1() + r) / (r * r))
+    }
 }
 
 impl<'a> Exact<'a> {
@@ -1296,7 +1310,28 @@ impl<'a> Exact<'a> {
         observations: f64,
     ) -> Result<Self, String> {
         let maps = sites.iter().map(|s| super::masked::matrix(model, s)).collect::<Result<Vec<_>, _>>()?;
-        let mut exact = Self { structured, model, sites, batches, observations, maps, base: 0.0 };
+        // A node is linear in a site's written values when every node between them and it is affine.
+        let linear = sites
+            .iter()
+            .map(|site| {
+                let mut reached = vec![false; model.nodes.len()];
+                let mut affine = true;
+                for (index, node) in model.nodes.iter().enumerate() {
+                    reached[index] = site.writes.contains(&index) || node.arguments().iter().any(|a| reached[*a]);
+                    if reached[index] && !site.writes.contains(&index) {
+                        affine &= matches!(
+                            node,
+                            super::operator_program::Node::Affine { .. }
+                                | super::operator_program::Node::Readout { .. }
+                                | super::operator_program::Node::Concat { .. }
+                        );
+                    }
+                }
+                affine
+            })
+            .collect();
+        let traces = batches.iter().map(|(inputs, _)| model.execute(inputs, false).map_err(|e| e.to_string())).collect::<Result<Vec<_>, _>>()?;
+        let mut exact = Self { structured, model, sites, batches, observations, maps, base: 0.0, linear, traces };
         exact.base = exact.kl_bits(None)?;
         Ok(exact)
     }
@@ -1327,9 +1362,59 @@ impl<'a> Exact<'a> {
         Ok(self.observations * total / rows.max(1.0) / std::f64::consts::LN_2)
     }
 
+    /// On a site whose written values reach the logits linearly, the KL of a change `δ` in the
+    /// logits is bracketed without a forward: with `X = δ − E_p δ` (`p` the native output), its range
+    /// `R` and variance `σ²`, `log(1 + σ² c₋(R)) ≤ KL = log E_p e^X ≤ log(1 + σ² c₊(R))`. The upper
+    /// bound in bits, when the bracket is within the factor two [`Geometry::describe_exact`]
+    /// accepts; `None` otherwise or off a linear site.
+    pub fn certified(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>, d: &Description) -> Result<Option<f64>, String> {
+        if !self.linear[site] {
+            return Ok(None);
+        }
+        let change = d.u.t().dot(&d.v) - u.t().dot(&v);
+        let interfaces = self.model.interfaces().map_err(|e| e.to_string())?;
+        let (mut lower, mut upper, mut rows) = (0.0_f64, 0.0_f64, 0.0_f64);
+        for ((inputs, target), trace) in self.batches.iter().zip(&self.traces) {
+            let x = super::masked::read_values(trace, &self.sites[site])?;
+            let written = x.dot(&change.t());
+            let mut seeds = std::collections::BTreeMap::new();
+            let mut at = 0;
+            for n in &self.sites[site].writes {
+                let w = interfaces[*n].width();
+                seeds.insert(*n, written.slice(s![.., at..at + w]).to_owned());
+                at += w;
+            }
+            let delta = super::derivatives::jvp_seeded(self.model, inputs, trace, &std::collections::BTreeMap::new(), &seeds).map_err(|e| e.to_string())?;
+            for r in (0..inputs.rows).filter(|r| target.scores(*r)) {
+                let z = target.logits.row(r);
+                let top = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let weights: Vec<f64> = z.iter().map(|v| (v - top).exp()).collect();
+                let total: f64 = weights.iter().sum();
+                let dr = delta.row(r);
+                let mean: f64 = weights.iter().zip(dr.iter()).map(|(w, x)| w * x).sum::<f64>() / total;
+                let variance: f64 = weights.iter().zip(dr.iter()).map(|(w, x)| w * (x - mean) * (x - mean)).sum::<f64>() / total;
+                let range = dr.iter().copied().fold(f64::NEG_INFINITY, f64::max) - dr.iter().copied().fold(f64::INFINITY, f64::min);
+                let (plus, minus) = sandwich(range);
+                lower += (variance * minus).ln_1p();
+                upper += (variance * plus).ln_1p();
+                rows += 1.0;
+            }
+        }
+        let scale = self.observations / rows.max(1.0) / std::f64::consts::LN_2;
+        Ok((upper <= 2.0 * lower + f64::EPSILON).then_some(upper * scale))
+    }
+
+    /// The error bits per word of `d` replacing the block `uᵀv` of site `site`, by the forward.
+    pub fn measured(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>, d: &Description) -> Result<f64, String> {
+        Ok(self.kl_bits(Some((site, u, v, d)))? - self.base)
+    }
+
     fn describe(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<Description, String> {
         let geometry = self.structured.sites.get(site).ok_or_else(|| format!("no site {site}"))?;
-        geometry.describe_exact(u, v, &mut |d| Ok(self.kl_bits(Some((site, u, v, d)))? - self.base))
+        geometry.describe_exact(u, v, &mut |d| match self.certified(site, u, v, d)? {
+            Some(bits) => Ok(bits),
+            None => Ok(self.kl_bits(Some((site, u, v, d)))? - self.base),
+        })
     }
 }
 
