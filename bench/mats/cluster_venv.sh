@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Shared job Python (#2951), run once on the cluster as a Slurm job:
 #   sbatch -J mpd-venv -p compute --qos=debug -c 8 --mem=16G -t 1:00:00 cluster_venv.sh
-#: 3.12, torch on CUDA 12.6 wheels (driver 535), the VPD/NLA/refusal stacks.
+# Python 3.12, torch on CUDA 12.6 wheels (driver 535), the VPD/NLA/refusal stacks.
 set -Eeuo pipefail
 export UV_CACHE_DIR=$HOME/.cache/uv
 new=$HOME/mpd-venv.new
