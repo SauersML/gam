@@ -18,6 +18,9 @@ Subcommands:
   score RUN_DIR                     the engine's scorer on the run's library and sets (after
                                     `sets`): RUN_DIR/score.json, whose `start` is VPD's own sets
   engine-flops LOG [--train N]      training FLOPs of an engine run, from its log's events
+  table OUT.json [--vpd DIR ...] [--engine LOG:JSON:N ...]
+                                    every point, training FLOPs beside its four scores, plus the
+                                    published run (its scored sets and its training trajectory)
 
 Training data for both methods: one stream of Pile val-00000 rows, val 1056..1151 (the rows the
 trainer's own from-scratch race trains on) and then val 2048 onward, disjoint from the 32 frontier
@@ -357,6 +360,30 @@ def cmd_engine_flops(log: Path, train: int, box: bool, samples: int = 2) -> dict
     # sampled reverse passes with the written Fisher; then one Fisher-SVD per site.
     total["start"] += train * (c["target_fwd"] + c["read_cov"] + samples * (c["target_vjp"] + c["written"]))
     total["start"] += sum(30 * (i ** 3 + o ** 3) for i, o in [SITE_DIMS[k] for k in SITE_DIMS] * LAYERS)
+    # The attribution-dictionary start: per sequence gathered a target forward and a sampled
+    # reverse pass (per group of sites), then per site the whitening, each input's own attribution,
+    # the rank-one k-means (each iteration's assignment products and power steps), the scales'
+    # Gram eigendecomposition (twice) and the leftover's SVD.
+    site_rows = {}
+    for line in lines:
+        m = re.search(r"attributions of sites (\d+)\.\.(\d+) on (\d+) sequences", line)
+        if m:
+            total["start"] += int(m.group(3)) * (c["target_fwd"] + c["target_vjp"])
+            for k in range(int(m.group(1)), int(m.group(2))):
+                site_rows[k] = int(m.group(3)) * T
+    site_order = [f"blocks.{l}.{k}" for l in range(LAYERS) for k in sorted(SITE_DIMS)]
+    for line in lines:
+        m = re.search(r"^(blocks\.\d+\.\w+): attribution dictionary DictionaryReport \{ seeded: (\d+), kept: (\d+), iterations: (\d+)", line)
+        if m:
+            name, atoms, kept, iterations = m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4))
+            i, o = SITE_DIMS[name.split(".")[2]]
+            rows = site_rows.get(site_order.index(name), 0)
+            total["start"] += 2 * rows * (i * i + o * o) + 2 * rows * i * o
+            total["start"] += iterations * (2 * rows * atoms * (i + o) + 4 * rows * (i + o))
+            total["start"] += 2 * (2 * atoms * atoms * (i + o) + 9 * atoms ** 3) + 20 * min(i, o) ** 2 * max(i, o)
+    if site_rows:
+        # The attribution start replaces the Fisher-SVD (counted above) by the dictionary.
+        total["start"] -= sum(30 * (i ** 3 + o ** 3) for i, o in [SITE_DIMS[k] for k in SITE_DIMS] * LAYERS)
     rounds = []  # (tried, kept) of the selection being read
     sequences = 0
     in_eval = False
@@ -410,6 +437,61 @@ def cmd_engine_flops(log: Path, train: int, box: bool, samples: int = 2) -> dict
     return total
 
 
+# The published run (goodfire/spd/runs/s-55ea3f9b): FLOPs per step at batch 64 with the paper's
+# 0.54B causal-importance network, from this driver's measured steps (module note) with the
+# network's own matmul FLOPs swapped in; see `paper_step_flops`.
+PAPER_STEPS, PAPER_WARMUP_STEPS, PAPER_BATCH = 400_000, 400, 64
+
+
+def ci_token_flops(d_model: int, blocks: int, hidden: int, sites_in: int = 27648, c_total: int = 38912) -> float:
+    """Forward matmul FLOPs per token of the global shared transformer (attention over 512)."""
+    params = d_model * sites_in + blocks * (4 * d_model * d_model + 2 * d_model * hidden) + d_model * c_total
+    return 2 * params + blocks * 4 * T * d_model
+
+
+def paper_step_flops(measured: dict) -> float:
+    """A paper training step from a measured run of the same subcomponents: the measured step less
+    its CI network, plus the paper network, per token at 3× its forward (forward, backward), then
+    the batch; the faithfulness term (per step, not per token) stays as measured."""
+    per_token_ci = 3 * ci_token_flops(*measured["ci"][:3])
+    faith = measured["warmup_flops"] / max(measured["warmup"], 1)
+    per_token = (measured["flops_per_step"] - faith) / (measured["batch"] * T) - per_token_ci
+    return (per_token + 3 * ci_token_flops(2048, 8, 8192)) * PAPER_BATCH * T + faith
+
+
+def cmd_table(out: Path, vpd_runs: list[Path], engines: list[str], reference_run: Path) -> None:
+    import pyarrow.parquet as pq
+
+    points = []
+    for run in vpd_runs:
+        r = json.load(open(run / "run.json"))
+        score = json.load(open(run / "score.json"))["points"][-1]["start"] if (run / "score.json").exists() else None
+        points.append({"method": "VPD", "run": run.name, "flops": r["training_flops"], "steps": r["steps"], "batch": r["batch"],
+                       "lr": r.get("lr"), "warmup": r["warmup"], "ci": r["ci"], "c_scale": r["c_scale"], "seconds": r["seconds"],
+                       "quick": json.load(open(run / "sets.json"))["check"] if (run / "sets.json").exists() else None, "score": score})
+    for spec in engines:
+        log, result, n = spec.rsplit(":", 2)
+        full = [p for p in json.load(open(result))["points"] if p.get("eval_sequences") == 32]
+        flops = cmd_engine_flops(Path(log), int(n), box=any("kl_box" in p for p in full))
+        points.append({"method": "engine", "run": Path(result).stem, "flops": flops["train"], "sequences": int(n),
+                       "flops_parts": {k: flops[k] for k in ("start", "selection", "step", "growth")},
+                       "score": full[0] if full else None})
+    measured = json.load(open(reference_run / "run.json"))
+    assert measured["c_scale"] == 1.0, "the paper step is extrapolated from a run with the paper's subcomponent counts"
+    step = paper_step_flops(measured)
+    warmup = PAPER_WARMUP_STEPS * measured["warmup_flops"] / max(measured["warmup"], 1)
+    h = pq.read_table(VPD / "s-55ea3f9b/history.parquet").to_pandas()
+    h = h.dropna(subset=["eval/l0/0.0_total"])
+    trajectory = [{"step": int(r["_step"]), "flops": warmup + r["_step"] * step, "l0": float(r["eval/l0/0.0_total"]),
+                   "kl_rounded": float(r["eval/ce_kl/kl_rounded_masked"])} for _, r in h.iterrows()]
+    stepA = json.load(open(Path.home() / "mpd-data/pieces/vpd4l/stepA_warm_1024.progress.json"))
+    table = {"paper_step_flops": step, "paper_training_flops": warmup + PAPER_STEPS * step, "paper_seconds": 92711,
+             "published": {"flops": warmup + PAPER_STEPS * step, "score": stepA["start"], "eval_sequences": stepA["eval_sequences"]},
+             "published_trajectory": trajectory, "points": points}
+    json.dump(table, open(out, "w"), indent=1)
+    print(f"paper step {step:.4e} FLOPs, run {warmup + PAPER_STEPS * step:.4e}; {len(points)} points -> {out}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -432,6 +514,11 @@ def main() -> None:
     c = sub.add_parser("score")
     c.add_argument("run", type=Path)
     c.add_argument("--lease", type=int, default=8)
+    b = sub.add_parser("table")
+    b.add_argument("out", type=Path)
+    b.add_argument("--vpd", type=Path, nargs="*", default=[])
+    b.add_argument("--engine", nargs="*", default=[])
+    b.add_argument("--reference", type=Path, required=True, help="a measured VPD run (run.json) to extrapolate the paper step from")
     f = sub.add_parser("engine-flops")
     f.add_argument("log", type=Path)
     f.add_argument("--train", type=int, required=True)
@@ -446,6 +533,8 @@ def main() -> None:
             cmd_sets(a.run, a.device, a.check)
         case "score":
             cmd_score(a.run, a.lease)
+        case "table":
+            cmd_table(a.out, a.vpd, a.engine, a.reference)
         case "engine-flops":
             cmd_engine_flops(a.log, a.train, a.box)
 
