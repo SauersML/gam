@@ -209,7 +209,7 @@ fn modadd(dir: &Path, out: &Path, observations: f64, names: Option<Vec<String>>,
 
 /// Every site's generic description on the exact lattice code (module note).
 fn lattice(statistics: &[gam_mpd::pieces::Site], observations: f64) -> Result<Structured, String> {
-    Ok(Structured::new(statistics.iter().map(|s| Geometry::new(Metric::of(s, observations), Vec::new(), Vec::new(), false)).collect::<Result<_, _>>()?))
+    Ok(Structured::new(statistics.iter().map(|s| Geometry::new(Metric::of(s, observations), Vec::new(), Vec::new())).collect::<Result<_, _>>()?))
 }
 
 /// One fit of the mod-31 decomposition under `describe` (`modadd`): the checks, the rank-one point

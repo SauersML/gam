@@ -26,19 +26,49 @@
 //! rows), or linear in a few reals when the two sides' chosen groups pair one to one (the pairing
 //! sent in `log₂ g!` bits): rotation-scaling `[[a, −b], [b, a]]` (or the reflection
 //! `[[a, b], [b, −a]]`, a bit a plane) per pair of two-column groups, or diagonal (one real per
-//! paired column). When the site reads and writes one interface, the same-subspace family writes
-//! `W ≈ L⁺ P R Pᵀ L` in the reads' own metric (`L` the root of their second moment): the frame
-//! once (`r (d − r)` reals) and the `r × r` core generic, symmetric, isotropic or, on a plane, a
-//! rotation-scaling.
+//! paired column).
 //!
 //! Every real is sent on a dyadic lattice (`2^-p`, [`super::precision`], one `p` per factor) in the
 //! signed Elias δ code ([`super::codec::signed_delta_len_bits`], under which splitting a real into
 //! two never shortens a message); the structure (charts, groups, rank, pivots, exponents) in the
-//! prefix integer and enumerative codes. The decoded map's error is charged at its KL to second
-//! order in the site's Kronecker Fisher, `n ½ tr(F ΔW C ΔWᵀ) / ln 2` bits ([`Metric`]), so the
-//! precision of every factor and the choice of family are both the minimum of one total: description
-//! bits plus that error. A structured family is taken only when it lowers that total. Everything is
-//! computed on the block's factors, so a description costs `O(d² r)` on a `d`-wide site.
+//! prefix integer and enumerative codes. A description's total is its bits plus `n KL / ln 2` of
+//! the error its decoded map makes; a structured family is taken only when it lowers that total.
+//! Everything is computed on the block's factors, so a description costs `O(d² r)` on a `d`-wide
+//! site.
+//!
+//! # Pricing the error
+//!
+//! The search proposes with the second-order price `n ½ tr(F ΔW C ΔWᵀ) / ln 2` ([`Metric`]; `C` the
+//! reads' second moment, `F` the written value's metric, best the logit-space Gauss-Newton
+//! [`logit_gauss_newton`], which unlike the sampled-label Fisher does not vanish where the network
+//! is confident). What decides is the error itself ([`Geometry::describe_exact`], [`Exact`]). For a
+//! finite change `δ` of the logits `z`, with `p` the network's output, `p_t ∝ p e^{tδ}`,
+//! `f(t) = log E_p e^{tδ} − t E_p δ` and `R = max δ − min δ` the oscillation of the change,
+//!
+//! ```text
+//! KL(p ‖ p_1) = f(1) = ∫₀¹ (1 − t) f''(t) dt,    f''(t) = Var_{p_t}(δ),
+//! e^{−tR} ≤ p_t / p ≤ e^{tR}   ⇒   e^{−tR} Var_p(δ) ≤ Var_{p_t}(δ) ≤ e^{tR} Var_p(δ),
+//! 2 c₋(R) Q ≤ KL ≤ 2 c₊(R) Q,   Q = ½ Var_p(δ),   c₊(R) = (e^R − 1 − R)/R²,   c₋(R) = (e^{−R} − 1 + R)/R²
+//! ```
+//!
+//! (the upper bound also as `log(1 + 2 c₊(R) Q)`, from `E_p e^X ≤ 1 + Var_p(X) c₊(R)` for the
+//! centred `X`). Both factors are ½ at `R = 0`, so the quadratic price is exact to first order in
+//! `R` and fails exactly when the oscillation of the change is large, not because `p` is peaked.
+//! Where a site's writes reach the logits only through affine nodes, `δ` is linear in the block and
+//! the bracket prices it without a forward ([`Exact::certified`]); elsewhere the decoded block is
+//! run.
+//!
+//! # Planes, words and the library
+//!
+//! On a cyclic task (`p31`, `a + b mod p`) the characters' planes `H_f` are the irreducible real
+//! modules of the shift `t ↦ t + 1`, with projector `(P_f)_{ab} = (2/p) cos(2πf(a − b)/p)`: what the
+//! translation law forces once the library is paid once. Charged per word instead, a Fourier
+//! reader `one-hot → (cos, sin)` has a box-exact decomposition into one rank-one slice per input
+//! (`p + 1` numbers on a word) against the plane's `2p`, so per-word pricing prefers input-specific
+//! slices, and on `p31` (every frequency used on every input) the gated fit finds no planes.
+//! Measured on `p31` (`n = 10⁶`, every point decoded): the structured whole-site description,
+//! library paid once over the 961 inputs, is 99 bits per word; rank-one subcomponents all on, 268;
+//! the gated fits, about 3,000, almost all of it their KL.
 
 use super::codec::{fixed_index_len_bits, prefix_integer_len_bits, signed_delta_len_bits, subset_code_len_bits};
 use super::dense::{eigh, solve, svd};
@@ -385,17 +415,6 @@ impl<'a> Block<'a> {
         };
         let (p, hl, gp, rp) = side(writer, wg, &self.fu, &self.metric.fisher)?;
         let (q, hr, gq, rq) = side(reader, rg, &self.cv, &self.metric.moment)?;
-        let h = hl.dot(&hr.t());
-        Ok(Sides { p, q, hl, hr, h, gp, gq, rp, rq })
-    }
-
-    /// The sides of two explicit bases.
-    fn sides_of(&self, p: Array2<f64>, q: Array2<f64>) -> Result<Sides, String> {
-        let hl = p.t().dot(&self.fu);
-        let hr = q.t().dot(&self.cv);
-        let gp = symmetric(&p.t().dot(&self.metric.fisher).dot(&p));
-        let gq = symmetric(&q.t().dot(&self.metric.moment).dot(&q));
-        let (rp, rq) = (inverses(&gp)?.1, inverses(&gq)?.1);
         let h = hl.dot(&hr.t());
         Ok(Sides { p, q, hl, hr, h, gp, gq, rp, rq })
     }
@@ -894,17 +913,16 @@ impl Prepared {
     }
 }
 
-/// A site prepared for describing its blocks: its metric, its charts on each side (the identity
-/// first) and, when it reads and writes one interface, the roots of its reads' second moment.
+/// A site prepared for describing its blocks: its metric and its charts on each side (the identity
+/// first).
 pub struct Geometry {
     pub metric: Metric,
     writers: Vec<Prepared>,
     readers: Vec<Prepared>,
-    whitening: Option<(Array2<f64>, Array2<f64>)>,
 }
 
 impl Geometry {
-    pub fn new(metric: Metric, writers: Vec<Chart>, readers: Vec<Chart>, same_space: bool) -> Result<Self, String> {
+    pub fn new(metric: Metric, writers: Vec<Chart>, readers: Vec<Chart>) -> Result<Self, String> {
         let (d_out, d_in) = (metric.fisher.nrows(), metric.moment.nrows());
         let mut w = vec![Prepared::new(Chart::identity(d_out), &metric.fisher, true)?];
         for chart in writers {
@@ -914,13 +932,12 @@ impl Geometry {
         for chart in readers {
             r.push(Prepared::new(chart, &metric.moment, false)?);
         }
-        let whitening = if same_space && d_in == d_out { Some(roots(&metric.moment)?) } else { None };
-        Ok(Self { metric, writers: w, readers: r, whitening })
+        Ok(Self { metric, writers: w, readers: r })
     }
 
     /// The cheapest description of the block `uᵀ v` (`u` is `r × d_out`, `v` is `r × d_in`), of rank
-    /// at most `r`, over the identity and the site's charts and, when the site reads and writes one
-    /// interface, the same-subspace family: least description bits plus the KL bits of its error.
+    /// at most `r`, over the identity and the site's charts: least description bits plus the KL bits
+    /// of its error.
     /// Per pair of charts, the two sides' group sets are chosen by coordinate descent over their
     /// ranked prefixes, a scan ending where the structure bits and one bit a paired column already
     /// exceed the best total.
@@ -946,7 +963,7 @@ impl Geometry {
         // is never repaired by a larger price, while the identity converges as precision grows.
         let mut best: Option<Description> = None;
         // The identity-only pass repeats the first when the site has no other chart.
-        let passes: &[bool] = if self.writers.len() == 1 && self.readers.len() == 1 && self.whitening.is_none() { &[true] } else { &[true, false] };
+        let passes: &[bool] = if self.writers.len() == 1 && self.readers.len() == 1 { &[true] } else { &[true, false] };
         for &charts in passes {
             let mut calibration = 1.0_f64;
             let mut last = f64::NAN;
@@ -979,8 +996,8 @@ impl Geometry {
         let rank = u.nrows();
         let charts_bits = fixed_index_len_bits(self.writers.len()).map_err(|e| e.to_string())? as f64
             + fixed_index_len_bits(self.readers.len()).map_err(|e| e.to_string())? as f64;
-        // Generic, rotation, diagonal, same subspace.
-        let core_bits = fixed_index_len_bits(4).map_err(|e| e.to_string())? as f64;
+        // Generic, rotation, diagonal.
+        let core_bits = fixed_index_len_bits(3).map_err(|e| e.to_string())? as f64;
         let writer_sets: Vec<Vec<Vec<usize>>> =
             self.writers.iter().map(|c| prefixes(&c.chart, &ranked(c, &block.fu, &block.gv), block.scale)).collect();
         let reader_sets: Vec<Vec<Vec<usize>>> =
@@ -1031,16 +1048,6 @@ impl Geometry {
                 }
             }
         }
-        if let Some(whitening) = self.whitening.as_ref().filter(|_| charts) {
-            let w = u.t().dot(&v);
-            for r in 1..=rank.min(w.nrows()) {
-                if let Some(candidate) = same_subspace(&block, &w, whitening, r, charts_bits + core_bits)?
-                    && best.as_ref().is_none_or(|b| candidate.total() < b.total())
-                {
-                    best = Some(candidate);
-                }
-            }
-        }
         // A map no family resolves (numerically zero in the metric) is the empty description:
         // its family's index alone, its whole map left as error.
         Ok(best.unwrap_or_else(|| Description {
@@ -1058,10 +1065,10 @@ impl Geometry {
 }
 
 /// The cheapest description of the block `w` (`d_out × d_in`, rank at most `rank`) over the identity
-/// charts and `writers` / `readers`, and when `same_space` the same-subspace family
+/// charts and `writers` / `readers`
 /// ([`Geometry::describe`] on `w`'s leading `rank` singular pairs).
-pub fn describe(w: &Array2<f64>, rank: usize, metric: &Metric, writers: &[Chart], readers: &[Chart], same_space: bool) -> Result<Description, String> {
-    let geometry = Geometry::new(metric.clone(), writers.to_vec(), readers.to_vec(), same_space)?;
+pub fn describe(w: &Array2<f64>, rank: usize, metric: &Metric, writers: &[Chart], readers: &[Chart]) -> Result<Description, String> {
+    let geometry = Geometry::new(metric.clone(), writers.to_vec(), readers.to_vec())?;
     let decomposed = svd(w.view(), false).map_err(|e| format!("{e:?}"))?;
     let r = rank.min(decomposed.singular_values.iter().filter(|x| **x > decomposed.band).count()).max(1);
     let mut u = decomposed.u.slice(s![.., ..r]).t().to_owned();
@@ -1272,10 +1279,10 @@ impl<'a> Exact<'a> {
     }
 
     /// On a site whose written values reach the logits linearly, the KL of a change `δ` in the
-    /// logits is bracketed without a forward: with `X = δ − E_p δ` (`p` the native output), its range
-    /// `R` and variance `σ²`, `log(1 + σ² c₋(R)) ≤ KL = log E_p e^X ≤ log(1 + σ² c₊(R))`. The upper
-    /// bound in bits, when the bracket is within the factor two [`Geometry::describe_exact`]
-    /// accepts; `None` otherwise or off a linear site.
+    /// logits is bracketed without a forward (module note, "Pricing the error"): with `σ²` its
+    /// variance under the native output and `R` its oscillation, `σ² c₋(R) ≤ KL ≤ log(1 + σ² c₊(R))`.
+    /// The upper bound in bits, when the bracket is within the factor two
+    /// [`Geometry::describe_exact`] accepts; `None` otherwise or off a linear site.
     pub fn certified(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>, d: &Description) -> Result<Option<f64>, String> {
         if !self.linear[site] {
             return Ok(None);
@@ -1304,7 +1311,7 @@ impl<'a> Exact<'a> {
                 let variance: f64 = weights.iter().zip(dr.iter()).map(|(w, x)| w * (x - mean) * (x - mean)).sum::<f64>() / total;
                 let range = dr.iter().copied().fold(f64::NEG_INFINITY, f64::max) - dr.iter().copied().fold(f64::INFINITY, f64::min);
                 let (plus, minus) = sandwich(range);
-                lower += (variance * minus).ln_1p();
+                lower += variance * minus;
                 upper += (variance * plus).ln_1p();
                 rows += 1.0;
             }

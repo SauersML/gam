@@ -214,7 +214,6 @@ fn core_name(core: &Core) -> String {
         Core::Generic { rank } => format!("generic rank {rank}"),
         Core::Rotation { reflections } => format!("rotation-scaling ({} reflected of {})", reflections.iter().filter(|r| **r).count(), reflections.len()),
         Core::Diagonal => "diagonal".to_string(),
-        Core::SameSubspace { rank, core } => format!("same subspace rank {rank}, {core:?} core"),
     }
 }
 
@@ -269,9 +268,9 @@ fn modadd(dir: &Path, out: &Path, observations: f64, only: Option<&str>) -> Resu
         eprintln!("{}: {}×{}, {} subcomponents, {} writer charts", site.name, measured.w.nrows(), measured.w.ncols(), libraries.last().map_or(0, |l| l.u.nrows()), writers.len());
         let k = structured_sites.len();
         let metric = || Metric { fisher: logit_metrics[k].clone(), ..Metric::of(measured, observations) };
-        exact_sites.push(Geometry::new(metric(), writers.clone(), readers.clone(), false)?);
-        structured_sites.push(Geometry::new(metric(), writers, readers, false)?);
-        lattice_sites.push(Geometry::new(metric(), Vec::new(), Vec::new(), false)?);
+        exact_sites.push(Geometry::new(metric(), writers.clone(), readers.clone())?);
+        structured_sites.push(Geometry::new(metric(), writers, readers)?);
+        lattice_sites.push(Geometry::new(metric(), Vec::new(), Vec::new())?);
     }
     // The generic family alone on the same exact lattice code, so the structured families are
     // compared with the identity charts under one code.
@@ -550,8 +549,8 @@ fn vpd(dir: &Path, library_dir: &Path, sets_dir: &Path, out: &Path, observations
             }
         };
         let metric = Metric::of(&statistics[k], observations);
-        let structured = Geometry::new(metric.clone(), writers, readers, false)?;
-        let lattice = Geometry::new(metric, Vec::new(), Vec::new(), false)?;
+        let structured = Geometry::new(metric.clone(), writers, readers)?;
+        let lattice = Geometry::new(metric, Vec::new(), Vec::new())?;
         let (u, v) = &libraries[k];
         let started = std::time::Instant::now();
         let both: Vec<((f64, f64, f64, String, String, String), (Description, Description))> = (0..u.nrows())

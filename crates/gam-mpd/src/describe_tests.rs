@@ -1,8 +1,8 @@
 #![cfg(test)]
 //! Structured descriptions: a generic block costs its rank's reals, a block that rotates one
-//! character into another costs two, and a block whose writer is its reader costs its frame once.
+//! character into another costs two, and a block inside one declared group costs that group.
 
-use super::describe::{Chart, Core, Metric, SameCore, describe};
+use super::describe::{Chart, Core, Metric, describe};
 use ndarray::{Array2, s};
 
 fn noise(seed: usize) -> f64 {
@@ -34,7 +34,7 @@ fn relative(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
 fn a_generic_block_costs_its_rank() {
     let (d_out, d_in, k) = (7, 6, 3);
     let w = random(d_out, k, 1).dot(&random(k, d_in, 2));
-    let d = describe(&w, k, &metric(d_out, d_in), &[], &[], false).expect("a description");
+    let d = describe(&w, k, &metric(d_out, d_in), &[], &[]).expect("a description");
     assert_eq!(d.core, Core::Generic { rank: k });
     assert_eq!(d.reals, k * (d_out + d_in - k));
     // The precision is the one whose bits and error balance at n = 10⁴: a percent or so of the map.
@@ -60,8 +60,8 @@ fn a_rotation_between_characters_costs_two_reals() {
     let core = ndarray::arr2(&[[a, -b], [b, a]]);
     let w = pw.dot(&core).dot(&pr.t());
     let m = metric(d, d);
-    let structured = describe(&w, 2, &m, std::slice::from_ref(&writer), std::slice::from_ref(&reader), false).expect("a description");
-    let generic = describe(&w, 2, &m, &[], &[], false).expect("a description");
+    let structured = describe(&w, 2, &m, std::slice::from_ref(&writer), std::slice::from_ref(&reader)).expect("a description");
+    let generic = describe(&w, 2, &m, &[], &[]).expect("a description");
     assert_eq!(structured.core, Core::Rotation { reflections: vec![false] });
     assert_eq!(structured.reals, 2);
     assert_eq!(structured.writer.1, vec![vec![f]]);
@@ -92,34 +92,6 @@ fn a_harmonic_chart_on_labelled_rows_reads_one_character() {
 }
 
 #[test]
-fn a_block_writing_its_own_reads_codes_its_frame_once() {
-    let (d, k) = (9, 2);
-    let q = random(d, k, 6);
-    let w = q.dot(&random(k, k, 7)).dot(&q.t());
-    let d_ = describe(&w, k, &metric(d, d), &[], &[], true).expect("a description");
-    assert_eq!(d_.core, Core::SameSubspace { rank: k, core: SameCore::Generic });
-    assert_eq!(d_.reals, k * (d - k) + k * k);
-    assert!(relative(&decoded(&d_.u, &d_.v), &w) < 5e-2);
-}
-
-#[test]
-fn a_rotation_within_its_own_plane_costs_its_frame_and_two_reals() {
-    let d = 9;
-    // An orthonormal plane (Gram-Schmidt of two random columns), rotated by 0.8 and scaled by 1.3.
-    let mut q = random(d, 2, 8);
-    let first = q.column(0).to_owned() / q.column(0).dot(&q.column(0)).sqrt();
-    q.column_mut(0).assign(&first);
-    let second = q.column(1).to_owned() - &first * first.dot(&q.column(1));
-    q.column_mut(1).assign(&(&second / second.dot(&second).sqrt()));
-    let (a, b) = (1.3 * 0.8_f64.cos(), 1.3 * 0.8_f64.sin());
-    let w = q.dot(&ndarray::arr2(&[[a, -b], [b, a]])).dot(&q.t());
-    let d_ = describe(&w, 2, &metric(d, d), &[], &[], true).expect("a description");
-    assert_eq!(d_.core, Core::SameSubspace { rank: 2, core: SameCore::Rotation });
-    assert_eq!(d_.reals, 2 * (d - 2) + 2);
-    assert!(relative(&decoded(&d_.u, &d_.v), &w) < 5e-2);
-}
-
-#[test]
 fn a_block_inside_one_declared_group_costs_that_group() {
     // Writes three heads of four coordinates each; the block writes head 1 only.
     let (heads, width, d_in, k) = (3, 4, 7, 2);
@@ -129,7 +101,7 @@ fn a_block_inside_one_declared_group_costs_that_group() {
     let mut writer = Array2::<f64>::zeros((d_out, k));
     writer.slice_mut(s![width..2 * width, ..]).assign(&random(width, k, 9));
     let w = writer.dot(&random(k, d_in, 10));
-    let d = describe(&w, k, &metric(d_out, d_in), std::slice::from_ref(&chart), &[], false).expect("a description");
+    let d = describe(&w, k, &metric(d_out, d_in), std::slice::from_ref(&chart), &[]).expect("a description");
     assert_eq!(d.writer.1, vec![vec![1]]);
     assert_eq!(d.reals, k * (width + d_in - k));
     assert!(relative(&decoded(&d.u, &d.v), &w) < 5e-2);

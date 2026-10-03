@@ -314,8 +314,8 @@ fn run(dir: &Path, out: &Path, observations: f64) -> Result<(), String> {
             writers.push(Chart::harmonic("class characters of the readout", map.view(), classes.view(), map.nrows())?);
         }
         let metric_of = || Metric { fisher: metric.clone(), ..Metric::of(measured, observations) };
-        geometries.push(Geometry::new(metric_of(), writers, readers, false)?);
-        lattice_sites.push(Geometry::new(metric_of(), Vec::new(), Vec::new(), false)?);
+        geometries.push(Geometry::new(metric_of(), writers, readers)?);
+        lattice_sites.push(Geometry::new(metric_of(), Vec::new(), Vec::new())?);
         let w = matrix(&program, site)?;
         let blocks = planes(&w, &x, &labels, period)?;
         let check = blocks.iter().fold(Array2::<f64>::zeros(w.dim()), |acc, (_, u, v)| acc + u.t().dot(v));
