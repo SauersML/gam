@@ -899,8 +899,9 @@ pub fn kl_and_logits(masked: &Masked, family: &FamilyInputs, target: &Target) ->
 /// The box claim's error beyond the masks' own KL, per input (module note, "Claims"): the worst,
 /// per sequence, of the box points evaluated. They are the masks themselves (no excess), the
 /// expectation over uniform off gates ([`expected_box_excess_at`]), every layer's vertex (that
-/// layer's sites at the masks, every other site's off gates at 1), and the points of a few
-/// sign-ascent steps of the KL in the off gates from ½, each of whose KL is exact. A sequence is
+/// layer's sites at the masks, every other site's off gates at 1), and an adversary's points
+/// (sign ascent over the off gates, all together and one layer's alone), each of whose KL is exact;
+/// the adversary's are charged per word, each word its own worst point. A sequence is
 /// charged the point of its largest total, so a set whose layers only cancel each other's errors
 /// pays for it. A lower bound on the claim's worst case.
 pub fn box_excess_at(masked: &Masked, base: &FamilyInputs, target: &Target, masks: &[Array2<f64>], fishers: &[Array2<f64>]) -> Result<Array1<f64>, String> {
@@ -1221,61 +1222,30 @@ fn box_worst(
             }
         }
     }
-    // An adversary inside the box: from every off gate at ½, `PGD_STEPS` sign-ascent steps of the
-    // KL in the off gates (on gates stay at 1), each point's exact KL a candidate.
-    const PGD_STEPS: usize = 3;
-    let step = 1.0 / PGD_STEPS as f64;
-    let mut gates: Vec<Array2<f64>> = masks.iter().map(|m| m.mapv(|x| if x > 0.0 { 1.0 } else { 0.5 })).collect();
-    for round in 0..=PGD_STEPS {
-        let family = masked.family(base, &gates);
-        // With a lone head, the body runs in f64, the point is certified with the head in f32
-        // ([`certified_point`]), and the ascent's reverse pass starts at the hidden node from the
-        // logits' cotangent (it only steers).
-        let (kl_point, trace, seed) = match (&body, head) {
-            (Some(body), Some((hidden, operator, layout))) => {
-                let trace = body.execute(&family, false).map_err(|e| e.to_string())?;
-                let (kl_point, logits) = certified_point(masked, target, &trace.values[hidden], (operator, layout), corner, &totals, &sequence_of)?;
-                let seed = if round < PGD_STEPS {
-                    let backward = match layout {
-                        gam_gpu::banded::Layout::Transposed => gam_gpu::banded::Layout::AsStored,
-                        gam_gpu::banded::Layout::AsStored => gam_gpu::banded::Layout::Transposed,
-                    };
-                    let cotangent = kl(target, &logits).1;
-                    let op = &masked.program.operators[operator];
-                    Some((hidden, proposing(|| super::device::product(op, &cotangent, backward)).map_err(|e| e.to_string())?))
-                } else {
-                    None
-                };
-                (kl_point, trace, seed)
-            }
-            _ => {
-                let (kl_point, trace, cotangent) = forward(masked, &family, target)?;
-                (kl_point, trace, Some((masked.program.output, cotangent)))
-            }
-        };
-        let excess = &kl_point - corner;
-        let point_totals = per_sequence(&excess);
-        for r in 0..rows {
-            let q = sequence_of[r];
-            if point_totals[q] > totals[q] {
-                worst[r] = excess[r];
-            }
-        }
-        for q in 0..sequences {
-            totals[q] = totals[q].max(point_totals[q]);
-        }
-        if round == PGD_STEPS {
-            break;
-        }
-        let (node, cotangent) = seed.ok_or("PGD: no ascent seed")?;
-        let back = proposing(|| super::derivatives::vjp_from(&masked.program, &family, &trace, node, cotangent, Some(&masked.masked))).map_err(|e| e.to_string())?;
-        let ascent = mask_gradients_of(masked, &trace, &back);
-        for ((g, m), a) in gates.iter_mut().zip(masks).zip(&ascent) {
-            ndarray::Zip::from(g).and(m).and(a).for_each(|g, &m, &a| {
-                if m <= 0.0 {
-                    *g = (*g + step * a.signum()).clamp(0.0, 1.0);
+    // An adversary inside the box ([`super::certify::adversary`]): sign ascent over every off gate
+    // together, and over each layer's off gates alone (the rest at the masks), from the masks, every
+    // gate's top and its middle; each input keeps the largest KL any point gave it, so a word is
+    // charged its own worst case.
+    const ADVERSARY_STEPS: usize = 4;
+    const ADVERSARY_STARTS: usize = 3;
+    let claim = super::certify::Gates::claim(masks);
+    let mut boxes = vec![claim.clone()];
+    if layers.len() > 1 {
+        for sites in layers.values() {
+            let mut only = claim.clone();
+            for k in 0..masks.len() {
+                if !sites.contains(&k) {
+                    only.upper[k] = only.lower[k].clone();
                 }
-            });
+            }
+            boxes.push(only);
+        }
+    }
+    for (i, gates) in boxes.iter().enumerate() {
+        let kl_point = super::certify::adversary(masked, base, target, gates, None, ADVERSARY_STEPS, ADVERSARY_STARTS, 0xAD5E + i as u64)?;
+        let excess = &kl_point - corner;
+        for r in 0..rows {
+            worst[r] = worst[r].max(excess[r]);
         }
     }
     Ok(worst)
@@ -2034,13 +2004,64 @@ pub fn select_observed(
     masked: &Masked,
     base: &FamilyInputs,
     target: &Target,
-    mut masks: Vec<Array2<f64>>,
+    masks: Vec<Array2<f64>>,
     coder: &Coder,
     observations: f64,
     samples: usize,
     boxed: Option<&[Array2<f64>]>,
     observe: &mut dyn FnMut(&Round<'_>) -> Result<(), String>,
 ) -> Result<(Vec<Array2<f64>>, Array1<f64>), String> {
+    select_resumable(masked, base, target, masks, None, coder, observations, samples, boxed, observe, &mut |_: &Progress<'_>| Ok(()))
+}
+
+/// A selection's whole state between two rounds, as [`select_resumable`] shows it to its
+/// checkpoint: the masks, each input's interaction `α`, each sequence's flip cap, the rounds taken,
+/// and under the box claim the masks' excess when a round already measured it. Everything else a
+/// selection holds between rounds is a function of these and of its start (the curvature is
+/// measured once, at the start's masks), so a selection resumed from them continues exactly as the
+/// uninterrupted one.
+pub struct Progress<'a> {
+    pub masks: &'a [Array2<f64>],
+    pub alpha: &'a [f64],
+    pub cap: &'a [usize],
+    pub round: u64,
+    pub excess: Option<&'a Array1<f64>>,
+}
+
+/// An owned [`Progress`], to resume from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Resume {
+    pub masks: Vec<Array2<f64>>,
+    pub alpha: Vec<f64>,
+    pub cap: Vec<usize>,
+    pub round: u64,
+    pub excess: Option<Array1<f64>>,
+}
+
+impl Progress<'_> {
+    /// The owned state.
+    pub fn to_resume(&self) -> Resume {
+        Resume { masks: self.masks.to_vec(), alpha: self.alpha.to_vec(), cap: self.cap.to_vec(), round: self.round, excess: self.excess.cloned() }
+    }
+}
+
+/// [`select_observed`] from `start`, or, with `resume`, continued from a state a selection from
+/// the same `start` showed its `checkpoint`; `checkpoint` sees the state before every round.
+/// A resumed selection takes exactly the decisions the uninterrupted one takes from that round on.
+pub fn select_resumable(
+    masked: &Masked,
+    base: &FamilyInputs,
+    target: &Target,
+    start: Vec<Array2<f64>>,
+    resume: Option<Resume>,
+    coder: &Coder,
+    observations: f64,
+    samples: usize,
+    boxed: Option<&[Array2<f64>]>,
+    observe: &mut dyn FnMut(&Round<'_>) -> Result<(), String>,
+    checkpoint: &mut dyn FnMut(&Progress<'_>) -> Result<(), String>,
+) -> Result<(Vec<Array2<f64>>, Array1<f64>), String> {
+    let mut masks = start;
     let scale = observations / std::f64::consts::LN_2;
     let rows = base.rows;
     let scored = target.scored_rows();
@@ -2058,10 +2079,10 @@ pub fn select_observed(
     let mut round = 0u64;
     let started = std::time::Instant::now();
     let mut curvature: Option<Vec<(Array2<f64>, Option<Array2<f64>>)>> = None;
-    // What the next round may reuse exactly instead of recomputing: the current masks' forward
-    // (when the last proposal was kept whole, its forward *is* the current state's) and, when
-    // nothing was kept, also their gradients (the state did not move).
-    let mut next_forward: Option<(Array1<f64>, Selected)> = None;
+    // What the next round may reuse exactly instead of recomputing: when nothing was kept, the
+    // round's forward and gradients (the state did not move). A kept proposal's forward is not
+    // carried over: a screened one holds f32-banded logits, and every round starting from a
+    // float64 forward of its masks is what lets a resumed selection match an uninterrupted one.
     let mut reuse: Option<(Array1<f64>, Vec<Array2<f64>>)> = None;
     // Under the box claim, the current masks' excess when a round already measured it: sequences
     // are independent, so a kept sequence's is the proposal's and a refused one's is unchanged.
@@ -2069,6 +2090,27 @@ pub fn select_observed(
     // The target on the program's device, when it runs on one (module note, "Devices").
     let on_device = masked.on_device(|accelerated| accelerated.target(target))?;
     let on_device = on_device.as_ref();
+    if let Some(resume) = resume {
+        if resume.masks.len() != masks.len()
+            || resume.masks.iter().zip(&masks).any(|(a, b)| a.dim() != b.dim())
+            || resume.alpha.len() != rows
+            || resume.cap.len() != sequences
+            || resume.excess.as_ref().is_some_and(|e| e.len() != rows || boxed.is_none())
+        {
+            return Err("selection: a resumed state that does not fit this selection".to_string());
+        }
+        // The curvature as the uninterrupted selection measured it, on its first round, at the
+        // start's masks.
+        let family = masked.family(base, &masks);
+        let (_, state) = Selected::forward(masked, &family, target, on_device, true)?;
+        curvature = Some(state.fisher(masked, &family, target, on_device, samples, 0x5EED)?);
+        drop(state);
+        masks = resume.masks;
+        alpha = resume.alpha;
+        cap = resume.cap;
+        round = resume.round;
+        excess_known = resume.excess;
+    }
     // Under the box claim on the CPU, the trace of every gate on, which every layer's vertex
     // shares up to its own layer.
     // Under the box claim, what its excess reads of the library and the Fishers: fixed here.
@@ -2093,7 +2135,6 @@ pub fn select_observed(
     // the current masks' head, and the errors a proposal kept whole hands to the next round.
     let screen = if boxed.is_none() && on_device.is_none() { Screen::new(masked) } else { None };
     let mut head_base: Option<HeadBase> = None;
-    let mut next_error: Option<Array1<f64>> = None;
     // Per sequence, its scored rows (a kept round saving less than a bit per one is the last).
     let mut sequence_rows = vec![0usize; sequences];
     for r in 0..rows {
@@ -2148,21 +2189,15 @@ pub fn select_observed(
         }
     };
     loop {
+        checkpoint(&Progress { masks: &masks, alpha: &alpha, cap: &cap, round, excess: excess_known.as_ref() })?;
         let family = masked.family(base, &masks);
         // The current forward lives only until its gradients (and, once, the Fisher) are read.
         let (mut kl_now, grads) = match reuse.take() {
             Some(state) => state,
             None => {
-                let (kl_now, mut state) = match next_forward.take() {
-                    Some(state) => state,
-                    None => Selected::forward(masked, &family, target, on_device, true)?,
-                };
+                let (kl_now, mut state) = Selected::forward(masked, &family, target, on_device, true)?;
                 if let (Some(screen), Selected::Host(trace, _, _)) = (&screen, &state) {
-                    let mut current = screen.base(masked, trace);
-                    if let Some(error) = next_error.take() {
-                        current.error = error;
-                    }
-                    head_base = Some(current);
+                    head_base = Some(screen.base(masked, trace));
                 }
                 // The excess first, so its reverse pass also serves the mask gradients.
                 if let (Some(f), None) = (boxed, &excess_known) {
@@ -2363,7 +2398,6 @@ pub fn select_observed(
                     best.iter().map(|(_, k)| *k).collect::<Vec<_>>()
                 );
                 cap = vec![usize::MAX; sequences];
-                next_forward = None;
                 reuse = None;
                 excess_known = None;
                 continue;
@@ -2591,13 +2625,7 @@ pub fn select_observed(
             excess_known = (rescued == 0).then(|| Array1::from_shape_fn(rows, |r| if kept_sequence(sequence_of[r]) { excess_new[r] } else { excess_now[r] }));
         }
         round += 1;
-        if rescued > 0 {
-            // The masks are neither the proposal nor what this round measured.
-        } else if kept == tried {
-            // Every proposing input kept its flips, so the masks now equal the proposal.
-            next_error = screened.map(|s| s.error);
-            next_forward = Some((kl_new.clone(), state_new));
-        } else if kept == 0 {
+        if rescued == 0 && kept == 0 {
             // Nothing moved: this round's forward and gradients still describe the masks.
             reuse = Some((kl_now.clone(), grads));
         }
