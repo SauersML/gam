@@ -105,7 +105,7 @@ fn main() -> Result<(), String> {
         let units = (site.reads.len() == 1 && matches!(model.nodes[site.reads[0]], Node::Pointwise { .. })).then(|| Array2::<f64>::eye(d_in));
         let library = fit(k, w, sample, &description, settings, units.as_ref(), |round, library| {
             eprintln!(
-                "{} round {}: code {:.1} bits per input (description {:.1}, error {:.1}), L0 {:.2}, corner {:.2}, reseeded {}, read rung {}, {:.0}s",
+                "{} round {}: code {:.1} bits per input (description {:.1}, error {:.1}), L0 {:.2}, corner {:.2}, vertex {:.2}, reseeded {}, read rung {}, {:.0}s",
                 site.name,
                 round.round,
                 round.code,
@@ -113,12 +113,13 @@ fn main() -> Result<(), String> {
                 round.error,
                 round.l0,
                 round.corner_share,
+                round.vertex_share,
                 round.reseeded,
                 round.read_steps,
                 started.elapsed().as_secs_f64()
             );
             log.push(json!({"round": round.round, "code": round.code, "description": round.description, "error": round.error, "l0": round.l0,
-                "corner_share": round.corner_share, "reseeded": round.reseeded, "read_steps": round.read_steps, "seconds": started.elapsed().as_secs_f64()}));
+                "corner_share": round.corner_share, "vertex_share": round.vertex_share, "reseeded": round.reseeded, "read_steps": round.read_steps, "seconds": started.elapsed().as_secs_f64()}));
             let written = write_f64(&v_path, &library.v)
                 .and_then(|_| write_f64(&u_path, &library.u))
                 .and_then(|_| std::fs::write(&rounds_path, json!({"site": site.name, "observations": observations, "rounds": log}).to_string()).map_err(|e| e.to_string()));

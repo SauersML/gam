@@ -14,12 +14,14 @@
 //! gate. Input `t`'s KL is `½ eᵀ F_t e` in its own output Fisher `F_t`, taken as the site's mean
 //! Fisher `F` scaled by the input's sensitivity `s_t = tr F_t / tr F` (both measured from
 //! sampled-label gradients of the model's own output). The box claim's error is its worst point;
-//! two of them are closed forms in `F`: the corner (every off gate at 0), `‖r‖²`, and the
-//! expectation over every off gate uniform, `‖r − ½S‖² + 1/12 Σ_{c off} a_c² u_cᵀF u_c`. Input `t`
-//! is charged the larger:
+//! three of them are measured in `F`: the corner (every off gate at 0), `‖r‖²`; the expectation
+//! over every off gate uniform, `‖r − ½S‖² + 1/12 Σ_{c off} a_c² u_cᵀF u_c`; and the adversarial
+//! vertex, off gates moved one at a time from the corner to whichever end raises the error until
+//! none does, `‖D + Σ_{c∈T} u_c a_tc‖²` (`D` what all on leaves, `T` the off gates left at 0),
+//! where subcomponents that only cancel one another pay. Input `t` is charged the largest:
 //!
 //! ```text
-//! code_t = Σ_{c on} bits(c) + n s_t / (2 ln 2) · max(‖r_t‖²_F, ‖r_t − ½S_t‖²_F + 1/12 Σ_{c off} a_tc² u_cᵀF u_c).
+//! code_t = Σ_{c on} bits(c) + n s_t / (2 ln 2) · max(corner, expectation, vertex).
 //! ```
 //!
 //! `bits(c)` is the subcomponent's description ([`super::blocks::Describe`]), paid on every input
@@ -31,11 +33,13 @@
 //! Alternating exact steps of that one total:
 //!
 //! * **Sets.** Each input's on-set by single flips, a flip kept when it lowers the input's code
-//!   (both points tracked exactly through `K = U F Uᵀ`), swept until no flip pays.
+//!   (the corner and the expectation tracked exactly through `K = U F Uᵀ`, the vertex charged once
+//!   the sets settle), swept until no flip pays.
 //! * **Writes.** With the sets and each input's worst point fixed the code is a quadratic in `U`
 //!   whose metric `F` factors out, `tr F (UᵀQU − 2UᵀR)`, with `Q = Σ_t s_t z̃_t z̃_tᵀ + 1/12
 //!   diag(Σ_t s_t ν_t ⊙ a_t²)`, `R = Σ_t s_t z̃_t y_tᵀ`, `z̃ = μ ⊙ a`, `μ` one on, one half off at an
-//!   input charged its expectation (zero at one charged its corner), `ν` its off indicator there.
+//!   input charged its expectation, zero at one charged its corner, its vertex's gate at one
+//!   charged its vertex; `ν` its off indicator where the expectation is charged.
 //!   Every subcomponent on is the map exactly, on every read direction (in the metric `E√Λ` of the
 //!   reads' second moment, floored at `10⁻⁶` of its mean so directions no input reached still
 //!   count), `Uᵀ V E√Λ = W E√Λ`: an input the fit never saw is still carried by the off
@@ -159,6 +163,7 @@ pub struct Round {
     pub error: f64,
     pub l0: f64,
     pub corner_share: f64,
+    pub vertex_share: f64,
     pub reseeded: usize,
     pub read_steps: usize,
 }
@@ -247,8 +252,11 @@ struct Fitting<'a> {
     pieces: usize,
     /// Inputs × pieces, 1 where on.
     masks: Vec<u8>,
-    /// Whether each input is charged its corner (else the expectation).
-    corner: Vec<bool>,
+    /// Which point of the box each input is charged: 0 its corner, 1 the expectation, 2 its
+    /// adversarial vertex.
+    point: Vec<u8>,
+    /// Inputs × pieces: at an input's adversarial vertex, 1 where an off gate sits at 0 (else 1).
+    vertex: Vec<u8>,
 }
 
 /// One input's code under its sets (module note), from its scalars.
@@ -262,14 +270,16 @@ impl Fitting<'_> {
         self.x.nrows()
     }
 
-    /// Each input's gates on its own write and its weights: `μ` (1 on, ½ off where the expectation
-    /// is charged, 0 off at a corner) and `ν` (off where the expectation is charged).
+    /// Each input's gates at its charged point and their weights: `μ` (1 on; off, 0 at the corner,
+    /// ½ in the expectation, the vertex's gate at a vertex) and `ν` (off where the expectation is
+    /// charged).
     fn gates(&self, t: usize, c: usize) -> (f32, f32) {
-        let on = self.masks[t * self.pieces + c] == 1;
-        match (on, self.corner[t]) {
+        let i = t * self.pieces + c;
+        match (self.masks[i] == 1, self.point[t]) {
             (true, _) => (1.0, 0.0),
-            (false, true) => (0.0, 0.0),
-            (false, false) => (0.5, 1.0),
+            (false, 0) => (0.0, 0.0),
+            (false, 1) => (0.5, 1.0),
+            (false, _) => (if self.vertex[i] == 1 { 0.0 } else { 1.0 }, 0.0),
         }
     }
 
@@ -305,13 +315,14 @@ impl Fitting<'_> {
             let p_all = product(z_on.view(), false, k32.view(), false);
             let q_all = product(z_off.view(), false, k32.view(), false);
             let masks = &mut self.masks[start * c_total..end * c_total];
-            let corner = &mut self.corner[start..end];
+            let point = &mut self.point[start..end];
+            let vertex = &mut self.vertex[start * c_total..end * c_total];
             let (s, yfy, scale) = (&self.s, &self.yfy, self.scale);
             let results: Vec<(f64, f64)> = masks
                 .par_chunks_mut(c_total)
-                .zip(corner.par_iter_mut())
+                .zip(point.par_iter_mut().zip(vertex.par_chunks_mut(c_total)))
                 .enumerate()
-                .map(|(r, (m, corner))| {
+                .map(|(r, (m, (point, vertex)))| {
                     let t = start + r;
                     let a: Vec<f64> = a.row(r).iter().map(|v| f64::from(*v)).collect();
                     let g0: Vec<f64> = g0.row(r).iter().map(|v| f64::from(*v)).collect();
@@ -365,11 +376,42 @@ impl Fitting<'_> {
                             break;
                         }
                     }
+                    // The adversarial vertex: from the corner (every off gate at 0), single off
+                    // gates moved to whichever end raises the error, until none does. With `D` what
+                    // all on leaves (`h = U F D`) and `T` the off gates at 0, the error is
+                    // `‖D + Σ_T u_c a_c‖²_F`.
+                    let h: Vec<f64> = (0..c_total).map(|c| g0[c] - p[c] - q[c]).collect();
+                    let mut at_zero: Vec<bool> = (0..c_total).map(|c| m[c] == 0).collect();
+                    let mut tv = q.clone();
+                    let mut worst_vertex = rr;
+                    for _ in 0..c_total {
+                        let mut moved = false;
+                        for c in (0..c_total).filter(|c| m[*c] == 0) {
+                            let sigma = if at_zero[c] { -1.0 } else { 1.0 };
+                            let gain = sigma * 2.0 * a[c] * (h[c] + tv[c]) + a[c] * a[c] * diag[c];
+                            if gain > f64::EPSILON * worst_vertex.abs() {
+                                worst_vertex += gain;
+                                for (j, kj) in k.row(c).iter().enumerate() {
+                                    tv[j] += sigma * a[c] * kj;
+                                }
+                                at_zero[c] = !at_zero[c];
+                                moved = true;
+                            }
+                        }
+                        if !moved {
+                            break;
+                        }
+                    }
+                    let (sets, at) = worst(rr, rs, ss, off);
+                    let charged = sets.max(worst_vertex);
                     if keep {
-                        *corner = worst(rr, rs, ss, off).1;
+                        *point = if worst_vertex > sets { 2 } else if at { 0 } else { 1 };
+                        for (slot, z) in vertex.iter_mut().zip(&at_zero) {
+                            *slot = u8::from(*z);
+                        }
                     }
                     let listed: f64 = (0..c_total).filter(|c| m[*c] == 1).map(|c| bits[c]).sum();
-                    (listed, weight * current)
+                    (listed, weight * charged)
                 })
                 .collect();
             for (r, (listed, err)) in results.into_iter().enumerate() {
@@ -535,14 +577,21 @@ impl Fitting<'_> {
             let da = product(self.x.slice(s![start..end, ..]), false, d32.view(), true);
             let g0 = product(self.y.slice(s![start..end, ..]), false, uf32.view(), true);
             let (mut z_on, mut z_off, mut dz_on, mut dz_off) = (a.clone(), a.clone(), da.clone(), da.clone());
+            // At each input's recorded vertex every gate not at 0 is at 1.
+            let (mut z_up, mut dz_up) = (a.clone(), da.clone());
             for r in 0..end - start {
                 for c in 0..c_total {
-                    if self.masks[(start + r) * c_total + c] == 1 {
+                    let i = (start + r) * c_total + c;
+                    if self.masks[i] == 1 {
                         z_off[[r, c]] = 0.0;
                         dz_off[[r, c]] = 0.0;
                     } else {
                         z_on[[r, c]] = 0.0;
                         dz_on[[r, c]] = 0.0;
+                        if self.vertex[i] == 1 {
+                            z_up[[r, c]] = 0.0;
+                            dz_up[[r, c]] = 0.0;
+                        }
                     }
                 }
             }
@@ -550,6 +599,8 @@ impl Fitting<'_> {
             let qk = product(z_off.view(), false, k32.view(), false);
             let dpk = product(dz_on.view(), false, k32.view(), false);
             let dqk = product(dz_off.view(), false, k32.view(), false);
+            let uk = product(z_up.view(), false, k32.view(), false);
+            let duk = product(dz_up.view(), false, k32.view(), false);
             let rows: Vec<Vec<f64>> = (0..end - start)
                 .into_par_iter()
                 .map(|r| {
@@ -558,6 +609,7 @@ impl Fitting<'_> {
                     let rr = [self.yfy[t] - 2.0 * dot(&z_on, &g0) + dot(&z_on, &pk), -2.0 * dot(&dz_on, &g0) + 2.0 * dot(&dz_on, &pk), dot(&dz_on, &dpk)];
                     let rs = [dot(&z_off, &g0) - dot(&z_on, &qk), dot(&dz_off, &g0) - dot(&dz_on, &qk) - dot(&z_on, &dqk), -dot(&dz_on, &dqk)];
                     let ss = [dot(&z_off, &qk), 2.0 * dot(&dz_off, &qk), dot(&dz_off, &dqk)];
+                    let up = [self.yfy[t] - 2.0 * dot(&z_up, &g0) + dot(&z_up, &uk), -2.0 * dot(&dz_up, &g0) + 2.0 * dot(&dz_up, &uk), dot(&dz_up, &duk)];
                     let mut off = [0.0; 3];
                     for c in 0..c_total {
                         if self.masks[t * c_total + c] == 0 {
@@ -569,7 +621,7 @@ impl Fitting<'_> {
                     }
                     let at = |q: &[f64; 3], eta: f64| q[0] + eta * (q[1] + eta * q[2]);
                     let weight = self.scale * self.s[t];
-                    lengths.iter().map(|&eta| weight * worst(at(&rr, eta), at(&rs, eta), at(&ss, eta), at(&off, eta)).0).collect()
+                    lengths.iter().map(|&eta| weight * worst(at(&rr, eta), at(&rs, eta), at(&ss, eta), at(&off, eta)).0.max(at(&up, eta))).collect()
                 })
                 .collect();
             for row in rows {
@@ -641,7 +693,8 @@ impl<'a> Fitting<'a> {
             scale: observations / (2.0 * LN_2),
             pieces,
             masks: vec![1; rows * pieces],
-            corner: vec![true; rows],
+            point: vec![0; rows],
+            vertex: vec![0; rows * pieces],
         })
     }
 
@@ -649,8 +702,9 @@ impl<'a> Fitting<'a> {
     fn report(&self, round: usize, description: f64, error: f64) -> Round {
         let rows = self.rows() as f64;
         let on = self.masks.iter().filter(|m| **m == 1).count() as f64;
-        let corner_share = self.corner.iter().filter(|c| **c).count() as f64 / rows;
-        Round { round, code: (description + error) / rows, description: description / rows, error: error / rows, l0: on / rows, corner_share, reseeded: 0, read_steps: 0 }
+        let share = |p: u8| self.point.iter().filter(|x| **x == p).count() as f64 / rows;
+        let (corner_share, vertex_share) = (share(0), share(2));
+        Round { round, code: (description + error) / rows, description: description / rows, error: error / rows, l0: on / rows, corner_share, vertex_share, reseeded: 0, read_steps: 0 }
     }
 }
 
@@ -753,7 +807,7 @@ pub fn fit(
         // The writes: their closed form under the charged points, halved until the code falls.
         let target = fitting.writes(&v)?;
         let step = &target - &u;
-        let before = fitting.corner.clone();
+        let before = (fitting.point.clone(), fitting.vertex.clone());
         let mut eta = 1.0;
         let mut moved = false;
         while eta > f64::EPSILON {
@@ -766,7 +820,7 @@ pub fn fit(
             eta *= 0.5;
         }
         if !moved {
-            fitting.corner = before;
+            (fitting.point, fitting.vertex) = before;
         }
         // The reads: along the preconditioned step, the length of least code among the quadratic's
         // minimiser times every power of √2 from 2⁻³² to 2⁴, all measured in one pass.
@@ -776,10 +830,18 @@ pub fn fit(
             let profile = fitting.read_profile(&v, &u, &direction, &lengths);
             let (best, value) = profile.iter().enumerate().fold((0, profile[0]), |b, (i, p)| if *p < b.1 { (i, *p) } else { b });
             report.read_steps = best;
-            if best > 0 {
-                // The sets' description is unchanged; only the error moved.
-                current += value - profile[0];
-                v.scaled_add(lengths[best], &direction);
+            if best > 0 && value < profile[0] {
+                // The ladder held each input's vertex; the step stands when the code, every
+                // vertex sought again, falls too.
+                let trial = &v + &(&direction * lengths[best]);
+                let before = (fitting.point.clone(), fitting.vertex.clone());
+                let (d, e, _) = fitting.code(&trial, &u, &bits, false, true);
+                if d + e < current {
+                    (v, current) = (trial, d + e);
+                } else {
+                    (fitting.point, fitting.vertex) = before;
+                    report.read_steps = 0;
+                }
             }
         }
         // Reseeding: every subcomponent on nowhere, from the inputs of largest error in turn, kept
@@ -787,7 +849,7 @@ pub fn fit(
         let on: Vec<bool> = (0..pieces).map(|c| (0..rows).any(|t| fitting.masks[t * pieces + c] == 1)).collect();
         let dead: Vec<usize> = (0..pieces).filter(|c| !on[*c]).collect();
         if !dead.is_empty() {
-            let saved = (v.clone(), u.clone(), fitting.masks.clone(), fitting.corner.clone());
+            let saved = (v.clone(), u.clone(), fitting.masks.clone(), fitting.point.clone(), fitting.vertex.clone());
             let mut order: Vec<usize> = (0..rows).collect();
             order.sort_by(|a, b| errors[*b].total_cmp(&errors[*a]));
             let mut reseeded = 0;
@@ -803,7 +865,7 @@ pub fn fit(
             if d + e < current {
                 report.reseeded = reseeded;
             } else {
-                (v, u, fitting.masks, fitting.corner) = saved;
+                (v, u, fitting.masks, fitting.point, fitting.vertex) = saved;
             }
         }
         progress(&report, &Library { v: v.clone(), u: u.clone(), mean: Array1::zeros(d_in) });
