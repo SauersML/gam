@@ -1,6 +1,6 @@
 //! Diagnose how fixed per-token matrix replacements compose on real model executions.
 //!
-//! `mpd_composition_2951 EXPORT LIBRARY SETS OUT.json [SEQUENCES] [CONTEXT] [joint|isolated]`
+//! `mpd_composition_2951 EXPORT LIBRARY SETS OUT.json [SEQUENCES] [CONTEXT] [joint|isolated] [SWITCHES.json]`
 //!
 //! Reads the standard rank-one library and CSR sets, without fitting or selecting anything.
 //! For each site the signed identity separates native propagation, clean-input omission,
@@ -8,10 +8,12 @@
 //! values, not certificates. Norms use each site's native coordinates and are not comparable
 //! across different sites. `isolated` additionally measures each replacement with every other
 //! site kept native. The full model, all-on library and joint replacements share the same text.
+//! Optional learned switches are compared on clean-model features and their own execution's
+//! features; the returned autonomous masks are replayed to check execution consistency.
 
 use gam_mpd::composition::linear_site;
 use gam_mpd::import::import_language_model;
-use gam_mpd::masked::{Library, Masked, Target, kl_score_only, matrix, read_values, score_only, sites};
+use gam_mpd::masked::{Library, Masked, Target, kl_score_only, matrix, previous_inputs, read_values, score_only, sites};
 use gam_linalg::faer_ndarray::fast_abt;
 use ndarray::{Array1, Array2};
 use serde_json::{Value, json};
@@ -45,7 +47,7 @@ fn ratio(numerator: f64, denominator: f64) -> Option<f64> {
 fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
-    let usage = "mpd_composition_2951 EXPORT LIBRARY SETS OUT.json [SEQUENCES] [CONTEXT] [joint|isolated]";
+    let usage = "mpd_composition_2951 EXPORT LIBRARY SETS OUT.json [SEQUENCES] [CONTEXT] [joint|isolated] [SWITCHES.json]";
     let export = PathBuf::from(args.get(1).ok_or(usage)?);
     let library_dir = PathBuf::from(args.get(2).ok_or(usage)?);
     let sets_dir = PathBuf::from(args.get(3).ok_or(usage)?);
@@ -121,6 +123,39 @@ fn main() -> Result<(), String> {
     let joint_kl = kl_score_only(&target, &candidate.values[masked.program.output]).to_vec();
     let all_on: Vec<Array2<f64>> = masks.iter().map(|m| Array2::ones(m.dim())).collect();
     let all_on_kl = score_only(&masked, &masked.family(family, &all_on), &target)?.to_vec();
+    let switch_execution = if let Some(path) = args.get(8) {
+        #[derive(serde::Deserialize)]
+        struct SiteSwitches { name: String, switches: Vec<gam_mpd::gates::Switch> }
+        let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        let records: Vec<SiteSwitches> = serde_json::from_slice(&bytes).map_err(|e| format!("{path}: {e}"))?;
+        if records.len() != chosen.len() || records.iter().zip(&chosen).any(|(r, s)| r.name != s.name) {
+            return Err("switch site order differs from the library".into());
+        }
+        let switches: Vec<_> = records.into_iter().map(|r| r.switches).collect();
+        // Validate and execute before the older masks helper, whose inputs are assumed valid.
+        let clock = std::time::Instant::now();
+        let (autonomous, autonomous_masks) = gam_mpd::switched::execute(&masked, family, &switches)?;
+        let seconds = clock.elapsed().as_secs_f64();
+        let autonomous_kl = kl_score_only(&target, &autonomous.values[masked.program.output]).to_vec();
+        let amplitudes = chosen.iter().enumerate().map(|(k, site)| {
+            Ok(fast_abt(&read_values(&clean, site)?, &masked.library(k)?.v))
+        }).collect::<Result<Vec<_>, String>>()?;
+        let teacher_masks = gam_mpd::gates::masks(&switches, &amplitudes, &previous_inputs(family));
+        let teacher_kl = score_only(&masked, &masked.family(family, &teacher_masks), &target)?.to_vec();
+        let replay = masked.program.execute(&masked.family(family, &autonomous_masks), false).map_err(|e| e.to_string())?;
+        let replay_max_abs = autonomous.values.iter().zip(&replay.values).flat_map(|(a, b)| a.iter().zip(b.iter()))
+            .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+        let changes: Vec<_> = chosen.iter().enumerate().map(|(k, site)| json!({
+            "site": site.name,
+            "changed_decisions": autonomous_masks[k].iter().zip(&teacher_masks[k]).filter(|(a, b)| a != b).count(),
+            "decisions": autonomous_masks[k].len(),
+            "autonomous_active_per_token": autonomous_masks[k].sum() / family.rows as f64,
+            "teacher_active_per_token": teacher_masks[k].sum() / family.rows as f64
+        })).collect();
+        Some(json!({"switches": path, "autonomous_seconds": seconds, "autonomous_kl": summary(&autonomous_kl),
+                    "teacher_features_kl": summary(&teacher_kl), "fixed_mask_replay_max_abs_all_nodes": replay_max_abs,
+                    "sites": changes}))
+    } else { None };
     let mut records = Vec::new();
     for (k, site) in chosen.iter().enumerate() {
         let w = matrix(model, site)?;
@@ -163,7 +198,8 @@ fn main() -> Result<(), String> {
         "export": export, "library": library_dir, "sets": sets_dir, "source": imported.record["source"],
         "sequences": sequences, "context": context, "sets_context": length,
         "elapsed_seconds": started.elapsed().as_secs_f64(),
-        "joint_kl": summary(&joint_kl), "all_on_kl": summary(&all_on_kl), "sites": records
+        "joint_kl": summary(&joint_kl), "all_on_kl": summary(&all_on_kl), "sites": records,
+        "switch_execution": switch_execution
     });
     std::fs::write(&out, serde_json::to_vec_pretty(&result).map_err(|e| e.to_string())?).map_err(|e| format!("{}: {e}", out.display()))?;
     eprintln!("joint KL {:.6}, all-on KL {:.6}, {:.1}s; {}", joint_kl.iter().sum::<f64>() / family.rows as f64,

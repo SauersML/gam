@@ -72,6 +72,9 @@ pub mod contract;
 // Measured clean, incoming and reconstruction errors of composed matrix replacements.
 pub mod composition;
 
+// Learned switches evaluated on the executable explanation's own intermediate states.
+pub mod switched;
+
 // Program decomposition by two-part code: primitives propose, a change is kept when the measured total drops.
 pub mod engine;
 

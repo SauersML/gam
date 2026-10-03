@@ -898,8 +898,7 @@ impl Operator {
 
 /// `round(x·2^p)·2^-p`, exact for an index within `2^53`.
 pub fn round_to_lattice(value: f64, precision: DeclaredPrecision) -> Result<f64, ProgramError> {
-    let code = LatticeCode::encode(&[value], precision).map_err(ProgramError::Code)?;
-    Ok(code.decode().map_err(ProgramError::Code)?[0])
+    precision.round(value).map_err(ProgramError::Code)
 }
 
 /// A node of the program.
@@ -1733,6 +1732,62 @@ impl OperatorProgram {
             }
         }
         Ok(std::mem::replace(&mut top[node - from], Array2::zeros((0, 0))))
+    }
+
+    /// Execute once, deciding each raw mask immediately after its amplitude node.
+    /// The callback sees only the evaluated prefix, including the amplitude itself. Masks must
+    /// have no readers before that decision and contain finite binary entries. The returned
+    /// unbanded trace includes the decided raw masks, so it can be replayed with fixed masks.
+    pub fn execute_with_gates<F>(
+        &self,
+        inputs: &FamilyInputs,
+        gated: &[(usize, usize)],
+        mut decide: F,
+    ) -> Result<Trace, ProgramError>
+    where
+        F: FnMut(usize, &[Array2<f64>]) -> Result<Array2<f64>, String>,
+    {
+        self.check_inputs(inputs)?;
+        let interfaces = self.interfaces()?;
+        let mut amplitudes = BTreeSet::new();
+        let mut masks = BTreeSet::new();
+        for &(amplitude, mask) in gated {
+            if amplitude >= self.nodes.len() || mask >= amplitude
+                || !matches!(self.nodes.get(mask), Some(Node::Raw { .. }))
+                || !amplitudes.insert(amplitude) || !masks.insert(mask)
+            {
+                return Err(ProgramError::Input("invalid or duplicate autonomous gate nodes".into()));
+            }
+            if let Node::Raw { slot } = &self.nodes[mask]
+                && self.nodes.iter().filter(|node| matches!(node, Node::Raw { slot: other } if other == slot)).count() != 1
+            {
+                return Err(ProgramError::Input("autonomous mask slot is shared by multiple raw nodes".into()));
+            }
+            if self.nodes[..=amplitude].iter().any(|node| node.arguments().contains(&mask)) {
+                return Err(ProgramError::Input("autonomous mask is read before its decision".into()));
+            }
+            if interfaces[amplitude].width() != interfaces[mask].width() {
+                return Err(ProgramError::Input("autonomous amplitude and mask widths differ".into()));
+            }
+        }
+        let ones = vec![1.0; self.declarations.parameters];
+        let frame = Frame { args: &[], parameters: &ones, nodes: &self.nodes, output: self.output };
+        let mut top = Vec::with_capacity(self.nodes.len());
+        for (index, node) in self.nodes.iter().enumerate() {
+            let values = Layered { base: &[], top: &top, from: 0, patch: None };
+            let value = self.evaluate_node(index, node, inputs, &values, None, &interfaces, &frame)?.0;
+            top.push(value);
+            if let Some(&(_, mask_node)) = gated.iter().find(|(amplitude, _)| *amplitude == index) {
+                let mask = decide(index, &top).map_err(ProgramError::Input)?;
+                if mask.dim() != (inputs.rows, interfaces[mask_node].width())
+                    || mask.iter().any(|value| !value.is_finite() || (*value != 0.0 && *value != 1.0))
+                {
+                    return Err(ProgramError::Input("autonomous mask must have the declared shape and finite binary entries".into()));
+                }
+                top[mask_node] = mask;
+            }
+        }
+        Ok(Trace { values: top, bands: None, balls: None })
     }
 
     /// The unbanded trace of `inputs` when each gated node `(node, mask)` is read only through its

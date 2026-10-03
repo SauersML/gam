@@ -138,6 +138,35 @@ impl DeclaredPrecision {
         power_of_two(-self.fraction_bits)
     }
 
+    /// Round one value exactly as encoding and decoding a singleton lattice code,
+    /// without allocating an index or decoded-value vector. Ties round away from
+    /// zero; the integer representative canonicalizes either signed zero to +0.
+    /// Refusals have the same messages as the singleton code path.
+    pub fn round(self, value: f64) -> Result<f64, String> {
+        if !value.is_finite() {
+            return Err(format!(
+                "LatticeCode::encode: value {value} at position 0 is not finite"
+            ));
+        }
+        let index = (value * power_of_two(self.fraction_bits)).round();
+        if !(index.abs() <= INDEX_LIMIT as f64) {
+            return Err(format!(
+                "LatticeCode::encode: value {value} at position 0 needs index {index} \
+                 at step 2^-{}, beyond the exactly decodable 2^53",
+                self.fraction_bits
+            ));
+        }
+        let integer_index = index as i64;
+        let decoded = integer_index as f64 * self.step();
+        if !decoded.is_finite() {
+            return Err(format!(
+                "LatticeCode: index {integer_index} at position 0 overflows at step 2^-{}",
+                self.fraction_bits
+            ));
+        }
+        Ok(decoded)
+    }
+
     /// The finest precision for reals of magnitude at most `largest`: this one, coarsened
     /// to `2^-(52 − ⌈log₂ largest⌉)` when that is coarser, so every index stays within
     /// `2^53` and decodes exactly. The step is derived from the value range; a precision
@@ -584,6 +613,91 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use std::f64::consts::PI;
+
+    fn assert_scalar_matches_code(value: f64, precision: DeclaredPrecision) {
+        let reference = LatticeCode::encode(&[value], precision)
+            .and_then(|code| code.decode())
+            .map(|decoded| decoded[0].to_bits());
+        assert_eq!(
+            precision.round(value).map(f64::to_bits),
+            reference,
+            "value bits {:016x}, precision {}",
+            value.to_bits(),
+            precision.fraction_bits()
+        );
+    }
+
+    #[test]
+    fn scalar_round_matches_code_at_every_declared_exponent() {
+        for exponent in -EXPONENT_LIMIT..=EXPONENT_LIMIT {
+            let precision = DeclaredPrecision::new(exponent).unwrap();
+            let step = precision.step();
+            for value in [
+                0.,
+                -0.,
+                f64::from_bits(1),
+                -f64::from_bits(1),
+                f64::MIN_POSITIVE,
+                -f64::MIN_POSITIVE,
+                f64::MAX,
+                -f64::MAX,
+                0.5 * step,
+                -0.5 * step,
+                1.5 * step,
+                -1.5 * step,
+                INDEX_LIMIT as f64 * step,
+                -(INDEX_LIMIT as f64) * step,
+                f64::from_bits((INDEX_LIMIT as f64).to_bits() + 1) * step,
+            ] {
+                assert_scalar_matches_code(value, precision);
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_round_preserves_ties_zero_and_refusals() {
+        let precision = DeclaredPrecision::new(0).unwrap();
+        for (value, expected) in [(0.5, 1_f64), (-0.5, -1.), (1.5, 2.), (-1.5, -2.)] {
+            assert_eq!(
+                precision.round(value).unwrap().to_bits(),
+                expected.to_bits()
+            );
+        }
+        for value in [0., -0., f64::from_bits(1), -f64::from_bits(1)] {
+            assert_eq!(precision.round(value).unwrap().to_bits(), 0_f64.to_bits());
+        }
+        for value in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::from_bits((INDEX_LIMIT as f64).to_bits() + 1),
+        ] {
+            assert_scalar_matches_code(value, precision);
+            assert!(precision.round(value).is_err());
+        }
+        // This finite input rounds to an index whose decoded value overflows.
+        let coarse = DeclaredPrecision::new(-EXPONENT_LIMIT).unwrap();
+        assert_scalar_matches_code(f64::MAX, coarse);
+        assert!(coarse.round(f64::MAX).unwrap_err().contains("overflows"));
+    }
+
+    #[test]
+    fn scalar_round_matches_code_on_seeded_float_bit_patterns() {
+        let mut state = 0x243f_6a88_85a3_08d3_u64;
+        for exponent in -EXPONENT_LIMIT..=EXPONENT_LIMIT {
+            let precision = DeclaredPrecision::new(exponent).unwrap();
+            for sample in 0..32 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let value = f64::from_bits(state);
+                assert_scalar_matches_code(value, precision);
+                if sample % 2 == 0 {
+                    assert_scalar_matches_code(-value, precision);
+                }
+            }
+        }
+    }
 
     /// The distance between the classes of `value` and `representative` in `R/TZ`,
     /// measured to within `4uT`. The remainder `%` is exact. The subtraction rounds by
