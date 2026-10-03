@@ -156,6 +156,30 @@ fn failed_or_nonfinite_piece_trials_restore_the_original_operators() {
 }
 
 #[test]
+fn malformed_libraries_are_rejected_without_partial_edits() {
+    let (program, _) = model();
+    let site = sites(&program).into_iter().find(|s| s.name == "W_in").expect("site");
+    let valid = Library { v: Array2::ones((3, WIDTH)), u: Array2::ones((3, UNITS)), mean: Array1::zeros(WIDTH) };
+    assert!(Masked::build(&program, vec![site.clone()], vec![]).is_err());
+    assert!(Masked::build(&program, vec![], vec![valid.clone()]).is_err());
+    for (v, u) in [((3, WIDTH - 1), (3, UNITS)), ((3, WIDTH + 1), (3, UNITS)), ((3, WIDTH), (2, UNITS))] {
+        let invalid = Library { v: Array2::ones(v), u: Array2::ones(u), mean: Array1::zeros(WIDTH) };
+        assert!(Masked::build(&program, vec![site.clone()], vec![invalid]).is_err());
+    }
+    let mut masked = Masked::build(&program, vec![site], vec![valid.clone()]).expect("build");
+    let originals = masked.program.operators.clone();
+    assert!(masked.set_library(1, valid.clone()).is_err());
+    let mut invalid = valid.clone();
+    invalid.v.fill(2.0);
+    invalid.u[[0, 0]] = f64::NAN;
+    assert!(masked.set_library(0, invalid).is_err(), "invalid U after valid V must fail atomically");
+    let mut invalid = valid;
+    invalid.u = Array2::ones((3, UNITS - 1));
+    assert!(masked.set_library(0, invalid).is_err());
+    assert!(masked.program.operators.iter().zip(&originals).all(|(a, b)| Arc::ptr_eq(a, b)));
+}
+
+#[test]
 fn score_only_kl_matches_derivatives_with_underflow_and_large_offsets() {
     let target = Target { logits: ndarray::array![[0.0, 1.0], [0.0, -1000.0], [0.0, 1.0]], scored: Some(vec![true, true, false]) };
     let logits = ndarray::array![[0.0, -1000.0], [0.0, -1000.0], [0.0, -1000.0]];

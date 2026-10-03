@@ -187,6 +187,9 @@ fn offsets(widths: &[usize]) -> Vec<usize> {
 /// The widths of a site's read and written nodes.
 fn widths(program: &OperatorProgram, site: &Site) -> Result<(Vec<usize>, Vec<usize>), String> {
     let interfaces = program.interfaces().map_err(|e| e.to_string())?;
+    if site.reads.is_empty() || site.writes.is_empty() || site.reads.iter().chain(&site.writes).any(|n| *n >= interfaces.len()) {
+        return Err(format!("{}: a site needs valid read and written nodes", site.name));
+    }
     Ok((site.reads.iter().map(|n| interfaces[*n].width()).collect(), site.writes.iter().map(|n| interfaces[*n].width()).collect()))
 }
 
@@ -283,6 +286,9 @@ impl Masked {
     /// Replace `sites` of `model` by `libraries`, site `k`'s columns gated in blocks of `ranks[k]`
     /// (module note, "Blocks").
     pub fn build_blocks(model: &OperatorProgram, sites: Vec<Site>, libraries: Vec<Library>, ranks: Vec<Vec<usize>>) -> Result<Self, String> {
+        if sites.len() != libraries.len() {
+            return Err(format!("{} libraries for {} sites", libraries.len(), sites.len()));
+        }
         if ranks.len() != libraries.len() {
             return Err(format!("{} block partitions for {} libraries", ranks.len(), libraries.len()));
         }
@@ -304,6 +310,9 @@ impl Masked {
             slots.push(base_slots + k);
             let (reads, writes) = widths(model, site)?;
             let (ro, wo) = (offsets(&reads), offsets(&writes));
+            if library.v.ncols() != ro[reads.len()] || library.u.dim() != (pieces, wo[writes.len()]) {
+                return Err(format!("{}: library shapes {:?}, {:?} do not match {pieces} pieces with {} reads and {} writes", site.name, library.v.dim(), library.u.dim(), ro[reads.len()], wo[writes.len()]));
+            }
             let first = site.writes.iter().copied().min().unwrap_or(0);
             if site.reads.iter().any(|r| *r >= first) {
                 return Err(format!("{}: a read node follows a written one", site.name));
@@ -600,20 +609,30 @@ impl Masked {
         if self.released() {
             return Err("set_library on a masked program whose training state was released".to_string());
         }
+        if k >= self.sites.len() {
+            return Err(format!("library site {k} is out of range"));
+        }
         if library.v.nrows() != self.pieces[k] || library.u.nrows() != self.pieces[k] {
             return Err(format!("{}: {} pieces set into a site of {}", self.sites[k].name, library.v.nrows(), self.pieces[k]));
         }
         let (ro, wo) = (&self.read_offsets[k], &self.write_offsets[k]);
+        if library.v.ncols() != *ro.last().unwrap_or(&0) || library.u.ncols() != *wo.last().unwrap_or(&0) {
+            return Err(format!("{}: library widths do not match the site's reads and writes", self.sites[k].name));
+        }
+        // Construct every operator before replacing any: an invalid later block must not
+        // leave a mixture of old and new factors installed.
+        let mut replacements = Vec::new();
         for (j, &op) in self.v_ops[k].iter().enumerate() {
             let old = &self.program.operators[op];
             let block = library.v.slice(s![.., ro[j]..ro[j + 1]]).to_owned();
-            self.program.operators[op] = dense(old.name.clone(), old.rows.clone(), old.cols.clone(), block)?;
+            replacements.push((op, dense(old.name.clone(), old.rows.clone(), old.cols.clone(), block)?));
         }
         for (i, &op) in self.u_ops[k].iter().enumerate() {
             let old = &self.program.operators[op];
             let block = library.u.slice(s![.., wo[i]..wo[i + 1]]).t().to_owned();
-            self.program.operators[op] = dense(old.name.clone(), old.rows.clone(), old.cols.clone(), block)?;
+            replacements.push((op, dense(old.name.clone(), old.rows.clone(), old.cols.clone(), block)?));
         }
+        for (op, replacement) in replacements { self.program.operators[op] = replacement; }
         Ok(())
     }
 
