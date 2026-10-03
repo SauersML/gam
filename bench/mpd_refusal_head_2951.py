@@ -26,6 +26,20 @@ from safetensors import safe_open
 from transformers import AutoConfig, AutoModelForCausalLM
 
 
+class Widened(torch.autograd.Function):
+    """x Wᵀ + b in fp32 from a stored (bf16) W, keeping only the stored W for the backward pass."""
+
+    @staticmethod
+    def forward(ctx, x, weight, bias):
+        ctx.save_for_backward(weight)
+        return F.linear(x, weight.float(), None if bias is None else bias.float())
+
+    @staticmethod
+    def backward(ctx, grad):
+        (weight,) = ctx.saved_tensors
+        return grad @ weight.float(), None, None
+
+
 def blocks_from(model_dir, first):
     """The model's blocks `first..` (renumbered from 0), embedding, final norm and readout, streamed tensor by
     tensor from model.safetensors: linear maps and the embedding stay in their stored (bf16) values and widen
@@ -35,7 +49,7 @@ def blocks_from(model_dir, first):
     config.num_hidden_layers = len(layers)
     if getattr(config, "layer_types", None):
         config.layer_types = [config.layer_types[l] for l in layers]
-    model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.bfloat16)
+    model = AutoModelForCausalLM.from_config(config, dtype=torch.bfloat16)
     params = dict(model.named_parameters())
     with safe_open(os.path.join(model_dir, "model.safetensors"), "pt") as f:
         for key in f.keys():
@@ -50,7 +64,7 @@ def blocks_from(model_dir, first):
     model.tie_weights()
 
     def linear(self, x):
-        return F.linear(x, self.weight.float(), None if self.bias is None else self.bias.float())
+        return Widened.apply(x, self.weight, self.bias)
 
     for mod in model.modules():
         if isinstance(mod, torch.nn.Linear):
