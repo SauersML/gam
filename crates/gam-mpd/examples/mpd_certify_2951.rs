@@ -16,7 +16,7 @@
 //! `mpd_certify_2951 lm EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json SEQUENCES CONTEXT [BUDGET] [LEAVES] [FREE] [STEPS] [OBSERVATIONS] [ROUNDING]`
 //!
 //! A language-model export (`import_language_model`), the first `CONTEXT` positions of its first
-//! `SEQUENCES` sequences. Positions only read earlier ones, so a prefix is exact. The sites with a
+//! `SEQUENCES` sequences (or of sequences `a..b` for `SEQUENCES` `a:b`). Positions only read earlier ones, so a prefix is exact. The sites with a
 //! library in `LIBRARY_DIR` (`{site}.v.f64`, `{site}.u.f64`) run on its subcomponents plus the
 //! residual `W − Σ u vᵀ` as exact rank-one pieces that are always on (VPD's delta component, held on), so
 //! every gate on is the model. `SETS_DIR` gives each position's set (`bench/vpd_2951/vpd_sets_export.py`'s CSR over
@@ -192,7 +192,15 @@ fn lm(args: &[String]) -> Result<(), String> {
     let library_dir = PathBuf::from(args.get(3).ok_or(usage)?);
     let sets_dir = PathBuf::from(args.get(4).ok_or(usage)?);
     let out = PathBuf::from(args.get(5).ok_or(usage)?);
-    let sequences: usize = arg(args, 6, 1)?;
+    // `SEQUENCES` is a count from the first sequence or a range `a:b`.
+    let spec: String = arg(args, 6, "1".to_string())?;
+    let (first, sequences) = match spec.split_once(':') {
+        Some((a, b)) => {
+            let (a, b): (usize, usize) = (a.parse().map_err(|e| format!("SEQUENCES {spec}: {e}"))?, b.parse().map_err(|e| format!("SEQUENCES {spec}: {e}"))?);
+            (a, b.checked_sub(a).filter(|n| *n > 0).ok_or_else(|| format!("SEQUENCES {spec}: an empty range"))?)
+        }
+        None => (0, spec.parse().map_err(|e| format!("SEQUENCES {spec}: {e}"))?),
+    };
     let context: usize = arg(args, 7, 16)?;
     let budget: usize = arg(args, 8, 512)?;
     let leaves: usize = arg(args, 9, 1)?;
@@ -207,9 +215,9 @@ fn lm(args: &[String]) -> Result<(), String> {
         Some(other) => return Err(format!("ROUNDING {other}: expected sound or real; {usage}")),
     };
     let started = Instant::now();
-    let imported = import_language_model(&export, sequences, context)?;
+    let imported = import_language_model(&export, first + sequences, context)?;
     let model = &imported.program;
-    let family = &imported.contract.family;
+    let family = &imported.contract.family.select(&(first * context..(first + sequences) * context).collect::<Vec<_>>());
     let mut chosen = Vec::new();
     let mut libraries = Vec::new();
     // Per site, how many of its pieces are the given library's; the rest hold the residual `W − Σ u vᵀ`.
@@ -279,7 +287,7 @@ fn lm(args: &[String]) -> Result<(), String> {
             .collect();
         for s in 0..sequences {
             for p in 0..context {
-                let at = s * SEQUENCE + p;
+                let at = (first + s) * SEQUENCE + p;
                 let row = s * context + p;
                 for &i in &indices[indptr[at] as usize..indptr[at + 1] as usize] {
                     let i = i as usize;
@@ -357,7 +365,7 @@ fn lm(args: &[String]) -> Result<(), String> {
         }));
     }
     let record = json!({
-        "mode": "lm", "export": export, "library": library_dir, "given": sets_dir, "sequences": sequences, "context": context,
+        "mode": "lm", "export": export, "library": library_dir, "given": sets_dir, "first": first, "sequences": sequences, "context": context,
         "budget": budget, "free": free, "steps": steps, "observations": observations, "rounding": rounding, "sets": report,
     });
     std::fs::write(&out, serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
