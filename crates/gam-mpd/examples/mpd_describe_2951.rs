@@ -304,7 +304,6 @@ fn writer_frames(name: &str, u: &[&Array2<f64>]) -> Result<Option<Chart>, String
     Ok(Some(Chart::frames(name, columns, &widths)?))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn vpd(dir: &Path, library_dir: &Path, sets_dir: &Path, out: &Path, observations: f64, first: usize, sequences: usize, statistics_sequences: usize) -> Result<(), String> {
     use rayon::prelude::*;
     const CONTEXT: usize = 512;
