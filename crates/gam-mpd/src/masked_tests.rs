@@ -775,3 +775,33 @@ fn a_resumed_box_selection_is_the_uninterrupted_one() {
         assert_eq!(resumed_states, states[k..], "resumed at round {k}: other states on the way");
     }
 }
+
+/// Our box claim's cost is `½ (Σ_off ‖Z_c‖_F)²` per site and input, so a refinement of the library
+/// cannot lower it: an off subcomponent split into two halves costs what it did whole.
+#[test]
+fn the_box_claims_cost_is_unmoved_by_splitting_an_off_subcomponent() {
+    use super::masked::box_upper_at;
+    let (program, family) = model();
+    let site = sites(&program).into_iter().find(|s| s.name == "W_in").expect("the W_in site");
+    let v = Array2::from_shape_fn((2, WIDTH), |(i, j)| noise(700 + 7 * i + j));
+    let u = Array2::from_shape_fn((2, UNITS), |(i, j)| noise(800 + 7 * i + j));
+    let fisher = Array2::from_shape_fn((UNITS, UNITS), |(i, j)| if i == j { 1.0 + 0.1 * i as f64 } else { 0.0 });
+    let whole = Masked::build(&program, vec![site.clone()], vec![Library { v: v.clone(), u: u.clone(), mean: Array1::zeros(WIDTH) }]).expect("builds");
+    let off_second = vec![Array2::from_shape_fn((family.rows, 2), |(_, c)| if c == 0 { 1.0 } else { 0.0 })];
+    let cost_whole = box_upper_at(&whole, &family, &off_second, std::slice::from_ref(&fisher)).expect("cost");
+    let mut v3 = Array2::<f64>::zeros((3, WIDTH));
+    let mut u3 = Array2::<f64>::zeros((3, UNITS));
+    v3.row_mut(0).assign(&v.row(0));
+    u3.row_mut(0).assign(&u.row(0));
+    for half in 1..3 {
+        v3.row_mut(half).assign(&v.row(1));
+        u3.row_mut(half).assign(&(&u.row(1) * 0.5));
+    }
+    let split = Masked::build(&program, vec![site], vec![Library { v: v3, u: u3, mean: Array1::zeros(WIDTH) }]).expect("builds");
+    let off_halves = vec![Array2::from_shape_fn((family.rows, 3), |(_, c)| if c == 0 { 1.0 } else { 0.0 })];
+    let cost_split = box_upper_at(&split, &family, &off_halves, &[fisher]).expect("cost");
+    assert!(cost_whole.iter().any(|c| *c > 0.0));
+    for (a, b) in cost_whole.iter().zip(cost_split.iter()) {
+        assert!((a - b).abs() <= 1e-9 * a.abs().max(1e-12), "{a} against {b}");
+    }
+}

@@ -3,64 +3,64 @@
 //! The masked program (`super::masked`) codes each input by the subcomponents that run on it,
 //! `Σ_{c on} bits(c) + n KL / ln 2`, under the box claim: an off subcomponent's gate may be anywhere
 //! in `[0, 1]`. Its libraries can come from VPD, from the map's own singular pieces, or from this
-//! module: a library fitted on a site's inputs to that one total, with the KL taken to second
-//! order at the site.
+//! module: a library fitted on a site's inputs to that one total, each input judged against the
+//! site's real computation on it.
 //!
 //! # The site's code
 //!
-//! A site `y = W x` with library `y ≈ Σ_c u_c (v_c · x)` and per-input on-sets `m_t` leaves on input
-//! `t` the residual `r_t = y_t − Σ_{c on} u_c a_tc` (`a_tc = v_c · x_t`, the read uncentred as the
-//! masked program reads it), and the off subcomponents write `S_t = Σ_{c off} u_c a_tc` at full
-//! gate. Input `t`'s KL is `½ eᵀ F_t e` in its own output Fisher `F_t`, taken as the site's mean
-//! Fisher `F` scaled by the input's sensitivity `s_t = tr F_t / tr F` (both measured from
-//! sampled-label gradients of the model's own output). The box claim's error is its worst point;
-//! three of them are measured in `F`: the corner (every off gate at 0), `‖r‖²`; the expectation
-//! over every off gate uniform, `‖r − ½S‖² + 1/12 Σ_{c off} a_c² u_cᵀF u_c`; and the adversarial
-//! vertex, off gates moved one at a time from the corner to whichever end raises the error until
-//! none does, `‖D + Σ_{c∈T} u_c a_tc‖²` (`D` what all on leaves, `T` the off gates left at 0),
-//! where subcomponents that only cancel one another pay. Input `t` is charged the largest:
+//! A site `y = W x` with library `y ≈ Σ_c u_c (v_c · x)` runs on input `t` with its real read `x_t`,
+//! so every subcomponent's real contribution `z_tc = u_c a_tc` (`a_tc = v_c · x_t`, the read
+//! uncentred as the masked program reads it) is known, and so is what all on leaves of the map,
+//! `D_t = W x_t − Σ_c z_tc` (zero for a library whose subcomponents sum to the map). With the off
+//! subcomponents' gates anywhere in `[0, 1]` the site's output misses `D_t + Σ_{c off} (1 − m_c)
+//! z_tc`, so by the triangle inequality every point of the box is within
 //!
 //! ```text
-//! code_t = Σ_{c on} bits(c) + n s_t / (2 ln 2) · max(corner, expectation, vertex).
+//! B_t = ‖D_t‖_{F_t} + Σ_{c off} ‖z_tc‖_{F_t}
 //! ```
 //!
+//! of the real output, in the input's own output Fisher `F_t`, taken as the site's mean Fisher `F`
+//! scaled by the input's sensitivity `s_t = tr F_t / tr F` (both measured from sampled-label
+//! gradients of the model's own output). Its KL is at most `½ B_t²` to second order, so input `t` is
+//! charged
+//!
+//! ```text
+//! code_t = Σ_{c on} bits(c) + n s_t / (2 ln 2) · (‖D_t‖_F + Σ_{c off} |a_tc| ‖u_c‖_F)².
+//! ```
+//!
+//! It is a certified upper bound on the claim at the site, needs no adversary, and counts every
+//! off subcomponent at its own real size: two that cancel are each large, so they cannot hide
+//! among the off ones, and splitting a subcomponent into copies changes nothing.
 //! `bits(c)` is the subcomponent's description ([`super::blocks::Describe`]), paid on every input
-//! it runs on. Nothing else enters: no library is amortised, and a fit that leans on its off
-//! subcomponents at half gate pays for it at the corner.
+//! it runs on. Nothing else enters: no library is amortised.
 //!
 //! # The fit
 //!
-//! Alternating exact steps of that one total:
+//! Alternating steps that each lower that one total:
 //!
-//! * **Sets.** Each input's on-set by single flips, a flip kept when it lowers the input's code
-//!   (the corner and the expectation tracked exactly through `K = U F Uᵀ`, the vertex charged once
-//!   the sets settle), swept until no flip pays.
-//! * **Writes.** With the sets and each input's worst point fixed the code is a quadratic in `U`
-//!   whose metric `F` factors out, `tr F (UᵀQU − 2UᵀR)`, with `Q = Σ_t s_t z̃_t z̃_tᵀ + 1/12
-//!   diag(Σ_t s_t ν_t ⊙ a_t²)`, `R = Σ_t s_t z̃_t y_tᵀ`, `z̃ = μ ⊙ a`, `μ` one on, one half off at an
-//!   input charged its expectation, zero at one charged its corner, its vertex's gate at one
-//!   charged its vertex; `ν` its off indicator where the expectation is charged.
+//! * **Sets.** Each input's on-set from its subcomponents ranked by real size per description bit,
+//!   `|a_tc| ‖u_c‖_F / bits(c)`: the best prefix of that ranking, then single flips swept until none
+//!   lowers the input's code.
+//! * **Writes.** With the sets and reads fixed the error is convex in `U`. With `L_t` the current
+//!   `B_t`, `(Σ_c α_c)² ≤ Σ_c α_c² L/α_c` majorises it by `Σ_c ω_c ‖u_c‖²_F`, `ω_c = Σ_{t: c off} n s_t
+//!   |a_tc| L_t / (2 ln 2 ‖u_c‖_F)`, tight at the current writes, so its minimiser lowers the code.
 //!   Every subcomponent on is the map exactly, on every read direction (in the metric `E√Λ` of the
 //!   reads' second moment, floored at `10⁻⁶` of its mean so directions no input reached still
-//!   count), `Uᵀ V E√Λ = W E√Λ`: an input the fit never saw is still carried by the off
-//!   subcomponents it leaves. With `V E√Λ = P S Gᵀ` (full
-//!   `P`) every such `U` is `U₀ + N Z`, `U₀ = P₁ S⁻¹ Gᵀ (W E√Λ)ᵀ` and `N` the columns of `P` past
-//!   its rank, and the code fixes `Z` by `(NᵀQN) Z = Nᵀ(R − Q U₀)`; the step toward that minimiser
-//!   is halved until the code (each input at its worse point) falls.
-//! * **Reads.** With `U` and the sets fixed, each input's two points are quadratics in `V`. The
-//!   step is the charged points' preconditioned negative gradient (left by each subcomponent's own
-//!   curvature, right by the inputs' sensitivity-weighted second moment) restricted to the moves
-//!   that keep the map, `Uᵀ D = 0`, its length the one of least code among a geometric ladder
-//!   around the quadratic's minimiser: along a line every input's scalars are quadratics in the
-//!   length, so one pass measures the whole ladder.
+//!   count), `Uᵀ V E√Λ = W E√Λ`: with `V E√Λ = P S Gᵀ` (full `P`) every such `U` is `U₀ + N Z`,
+//!   `U₀ = P₁ S⁻¹ Gᵀ (W E√Λ)ᵀ`, `N` the columns of `P` past its rank, and `(NᵀΩN) Z = −NᵀΩU₀`.
+//! * **Reads.** With `U` and the sets fixed the error is convex in `V`: one step along its
+//!   preconditioned negative subgradient (left by each subcomponent's own curvature `Σ_t n s_t
+//!   ‖u_c‖²_F`, right by the inputs' sensitivity-weighted second moment) restricted to the moves
+//!   that keep the map, `Uᵀ D = 0`, its length the one of least code on a geometric ladder around
+//!   the step's quadratic estimate; every input's `B_t` along the line is measured in one pass.
 //! * **Reseeding.** A subcomponent that runs on no input is replaced by one reading the input of
 //!   largest error (its direction in the reads' inverse second moment), the writes solved again;
 //!   kept when the sets selected with it code the inputs in fewer bits.
 //!
-//! The fit stops when a round (sets, writes, reads) saves less than one bit per input, or at
-//! `rounds`. Every product over inputs runs in single precision (the fit only proposes a library;
-//! the masked program's exact forward codes it), and pseudo-inverses drop eigenvalues within the
-//! single-precision band of their sums, `√T 2⁻²⁴` of the largest.
+//! The fit stops when a round saves less than one bit per input, or at `rounds`. Every product over
+//! inputs runs in single precision (the fit only proposes a library; the masked program's exact
+//! forward codes it), and pseudo-inverses drop eigenvalues within the single-precision band of their
+//! sums, `√T 2⁻²⁴` of the largest.
 
 use super::blocks::Describe;
 use super::dense::{eigh, svd};
@@ -162,8 +162,6 @@ pub struct Round {
     pub description: f64,
     pub error: f64,
     pub l0: f64,
-    pub corner_share: f64,
-    pub vertex_share: f64,
     pub reseeded: usize,
     pub read_steps: usize,
 }
@@ -202,14 +200,9 @@ fn single(m: &Array2<f64>) -> Array2<f32> {
 }
 
 /// The pseudo-inverse of a symmetric positive semidefinite matrix summed in single precision over
-/// `terms` inputs: eigenvalues within `√terms · 2⁻²⁴` of `scale` (its largest when `None`, else the
-/// matrix it was projected from) are dropped; with `terms` zero, a matrix formed in float64, only
-/// its decomposition's band.
+/// `terms` inputs: eigenvalues within `√terms · 2⁻²⁴` of the largest are dropped; with `terms`
+/// zero, a matrix formed in float64, only its decomposition's band.
 fn pseudo_inverse(m: &Array2<f64>, terms: usize) -> Result<Array2<f64>, String> {
-    pseudo_inverse_of(m, terms, None)
-}
-
-fn pseudo_inverse_of(m: &Array2<f64>, terms: usize, scale: Option<f64>) -> Result<Array2<f64>, String> {
     let mut sym = m.clone();
     let n = sym.nrows();
     for i in 0..n {
@@ -220,7 +213,7 @@ fn pseudo_inverse_of(m: &Array2<f64>, terms: usize, scale: Option<f64>) -> Resul
         }
     }
     let d = eigh(sym.view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
-    let largest = scale.unwrap_or_else(|| d.values.iter().fold(0.0_f64, |m, l| m.max(*l)));
+    let largest = d.values.iter().fold(0.0_f64, |m, l| m.max(*l));
     let floor = (largest * (terms as f64).sqrt() * f64::from(f32::EPSILON) / 2.0).max(d.band);
     let mut scaled = d.vectors.clone();
     for (k, l) in d.values.iter().enumerate() {
@@ -230,10 +223,10 @@ fn pseudo_inverse_of(m: &Array2<f64>, terms: usize, scale: Option<f64>) -> Resul
     Ok(scaled.dot(&d.vectors.t()))
 }
 
-/// The per-input state of a fit: the sets and which point each input is charged.
+/// The per-input state of a fit: the sets.
 struct Fitting<'a> {
     x: &'a Array2<f32>,
-    /// The site's map, `d_out × d_in`: every subcomponent on is exactly it on the reads' span.
+    /// The site's map, `d_out × d_in`: every subcomponent on is exactly it.
     w: Array2<f64>,
     /// Every read direction scaled by its root second moment (floored at [`LEFT_OUT`] of the
     /// mean): the constraint's metric, `d_in × d_in`, and its inverse map from whitened reads.
@@ -253,396 +246,12 @@ struct Fitting<'a> {
     pieces: usize,
     /// Inputs × pieces, 1 where on.
     masks: Vec<u8>,
-    /// Which point of the box each input is charged: 0 its corner, 1 the expectation, 2 its
-    /// adversarial vertex.
-    point: Vec<u8>,
-    /// Inputs × pieces: at an input's adversarial vertex, 1 where an off gate sits at 0 (else 1).
-    vertex: Vec<u8>,
 }
 
-/// One input's code under its sets (module note), from its scalars.
-fn worst(rr: f64, rs: f64, ss: f64, off: f64) -> (f64, bool) {
-    let expected = rr - rs + 0.25 * ss + off / 12.0;
-    if rr >= expected { (rr, true) } else { (expected, false) }
-}
-
-impl Fitting<'_> {
-    fn rows(&self) -> usize {
-        self.x.nrows()
-    }
-
-    /// Each input's gates at its charged point and their weights: `μ` (1 on; off, 0 at the corner,
-    /// ½ in the expectation, the vertex's gate at a vertex) and `ν` (off where the expectation is
-    /// charged).
-    fn gates(&self, t: usize, c: usize) -> (f32, f32) {
-        let i = t * self.pieces + c;
-        match (self.masks[i] == 1, self.point[t]) {
-            (true, _) => (1.0, 0.0),
-            (false, 0) => (0.0, 0.0),
-            (false, 1) => (0.5, 1.0),
-            (false, _) => (if self.vertex[i] == 1 { 0.0 } else { 1.0 }, 0.0),
-        }
-    }
-
-    /// The code of `(v, u)`: with `flip`, every input's single flips swept first until none lowers
-    /// its code; with `keep`, each input's worst point is recorded (both leave the state as it was
-    /// otherwise, so a trial library is measured by neither). Returns the total description and
-    /// error bits and each input's error bits.
-    fn code(&mut self, v: &Array2<f64>, u: &Array2<f64>, bits: &Array1<f64>, flip: bool, keep: bool) -> (f64, f64, Vec<f64>) {
-        let c_total = self.pieces;
-        let uf = u.dot(self.fisher);
-        let k = uf.dot(&u.t());
-        let k32 = single(&k);
-        let (v32, uf32) = (single(v), single(&uf));
-        let diag: Vec<f64> = (0..c_total).map(|c| k[[c, c]]).collect();
-        let mut description = 0.0;
-        let mut error = 0.0;
-        let mut errors = vec![0.0; self.rows()];
-        for start in (0..self.rows()).step_by(CHUNK) {
-            let end = (start + CHUNK).min(self.rows());
-            let a = product(self.x.slice(s![start..end, ..]), false, v32.view(), true);
-            let g0 = product(self.y.slice(s![start..end, ..]), false, uf32.view(), true);
-            let mut z_on = a.clone();
-            let mut z_off = a.clone();
-            for r in 0..end - start {
-                for c in 0..c_total {
-                    if self.masks[(start + r) * c_total + c] == 1 {
-                        z_off[[r, c]] = 0.0;
-                    } else {
-                        z_on[[r, c]] = 0.0;
-                    }
-                }
-            }
-            let p_all = product(z_on.view(), false, k32.view(), false);
-            let q_all = product(z_off.view(), false, k32.view(), false);
-            let masks = &mut self.masks[start * c_total..end * c_total];
-            let point = &mut self.point[start..end];
-            let vertex = &mut self.vertex[start * c_total..end * c_total];
-            let (s, yfy, scale) = (&self.s, &self.yfy, self.scale);
-            let results: Vec<(f64, f64)> = masks
-                .par_chunks_mut(c_total)
-                .zip(point.par_iter_mut().zip(vertex.par_chunks_mut(c_total)))
-                .enumerate()
-                .map(|(r, (m, (point, vertex)))| {
-                    let t = start + r;
-                    let a: Vec<f64> = a.row(r).iter().map(|v| f64::from(*v)).collect();
-                    let g0: Vec<f64> = g0.row(r).iter().map(|v| f64::from(*v)).collect();
-                    let mut p: Vec<f64> = p_all.row(r).iter().map(|v| f64::from(*v)).collect();
-                    let mut q: Vec<f64> = q_all.row(r).iter().map(|v| f64::from(*v)).collect();
-                    let (mut zg_on, mut zg_off, mut zp_on, mut zq_on, mut zq_off, mut off) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-                    for c in 0..c_total {
-                        if m[c] == 1 {
-                            zg_on += a[c] * g0[c];
-                            zp_on += a[c] * p[c];
-                            zq_on += a[c] * q[c];
-                        } else {
-                            zg_off += a[c] * g0[c];
-                            zq_off += a[c] * q[c];
-                            off += a[c] * a[c] * diag[c];
-                        }
-                    }
-                    // ‖r‖², r·S, ‖S‖² and the off subcomponents' own energy, tracked exactly.
-                    let mut rr = yfy[t] - 2.0 * zg_on + zp_on;
-                    let mut rs = zg_off - zq_on;
-                    let mut ss = zq_off;
-                    let weight = scale * s[t];
-                    let mut current = worst(rr, rs, ss, off).0;
-                    for _ in 0..if flip { c_total } else { 0 } {
-                        let mut flipped = false;
-                        for c in 0..c_total {
-                            let sigma = if m[c] == 1 { -1.0 } else { 1.0 };
-                            let (ac, kc) = (a[c], diag[c]);
-                            let sa = sigma * ac;
-                            let d_rr = -2.0 * sa * g0[c] + 2.0 * sa * p[c] + ac * ac * kc;
-                            let d_rs = -sa * g0[c] - sa * q[c] + sa * p[c] + ac * ac * kc;
-                            let d_ss = -2.0 * sa * q[c] + ac * ac * kc;
-                            let d_off = -sigma * ac * ac * kc;
-                            let next = worst(rr + d_rr, rs + d_rs, ss + d_ss, off + d_off).0;
-                            if sigma * bits[c] + weight * (next - current) < 0.0 {
-                                rr += d_rr;
-                                rs += d_rs;
-                                ss += d_ss;
-                                off += d_off;
-                                current = next;
-                                let row = k.row(c);
-                                for (j, kj) in row.iter().enumerate() {
-                                    p[j] += sa * kj;
-                                    q[j] -= sa * kj;
-                                }
-                                m[c] = u8::from(sigma > 0.0);
-                                flipped = true;
-                            }
-                        }
-                        if !flipped {
-                            break;
-                        }
-                    }
-                    // The adversarial vertex: from the corner (every off gate at 0), single off
-                    // gates moved to whichever end raises the error, until none does. With `D` what
-                    // all on leaves (`h = U F D`) and `T` the off gates at 0, the error is
-                    // `‖D + Σ_T u_c a_c‖²_F`.
-                    let h: Vec<f64> = (0..c_total).map(|c| g0[c] - p[c] - q[c]).collect();
-                    let mut at_zero: Vec<bool> = (0..c_total).map(|c| m[c] == 0).collect();
-                    let mut tv = q.clone();
-                    let mut worst_vertex = rr;
-                    for _ in 0..c_total {
-                        let mut moved = false;
-                        for c in (0..c_total).filter(|c| m[*c] == 0) {
-                            let sigma = if at_zero[c] { -1.0 } else { 1.0 };
-                            let gain = sigma * 2.0 * a[c] * (h[c] + tv[c]) + a[c] * a[c] * diag[c];
-                            if gain > f64::EPSILON * worst_vertex.abs() {
-                                worst_vertex += gain;
-                                for (j, kj) in k.row(c).iter().enumerate() {
-                                    tv[j] += sigma * a[c] * kj;
-                                }
-                                at_zero[c] = !at_zero[c];
-                                moved = true;
-                            }
-                        }
-                        if !moved {
-                            break;
-                        }
-                    }
-                    let (sets, at) = worst(rr, rs, ss, off);
-                    let charged = sets.max(worst_vertex);
-                    if keep {
-                        *point = if worst_vertex > sets { 2 } else if at { 0 } else { 1 };
-                        for (slot, z) in vertex.iter_mut().zip(&at_zero) {
-                            *slot = u8::from(*z);
-                        }
-                    }
-                    let listed: f64 = (0..c_total).filter(|c| m[*c] == 1).map(|c| bits[c]).sum();
-                    (listed, weight * charged)
-                })
-                .collect();
-            for (r, (listed, err)) in results.into_iter().enumerate() {
-                description += listed;
-                error += err;
-                errors[start + r] = err;
-            }
-        }
-        (description, error, errors)
-    }
-
-    /// The writes in closed form (module note): `U = Q⁺ R`.
-    fn writes(&self, v: &Array2<f64>) -> Result<Array2<f64>, String> {
-        let c_total = self.pieces;
-        let v32 = single(v);
-        let mut q32 = Array2::<f32>::zeros((c_total, c_total));
-        let mut r32 = Array2::<f32>::zeros((c_total, self.y.ncols()));
-        let mut own = vec![0.0f64; c_total];
-        for start in (0..self.rows()).step_by(CHUNK) {
-            let end = (start + CHUNK).min(self.rows());
-            let a = product(self.x.slice(s![start..end, ..]), false, v32.view(), true);
-            let mut z = a.clone();
-            let mut zs = a.clone();
-            for r in 0..end - start {
-                let t = start + r;
-                let st = self.s[t] as f32;
-                for c in 0..c_total {
-                    let (mu, nu) = self.gates(t, c);
-                    z[[r, c]] *= mu;
-                    zs[[r, c]] *= mu * st;
-                    if nu > 0.0 {
-                        own[c] += self.s[t] * f64::from(a[[r, c]]) * f64::from(a[[r, c]]);
-                    }
-                }
-            }
-            gemm(&mut q32, true, zs.view(), true, z.view(), false, 1.0);
-            gemm(&mut r32, true, zs.view(), true, self.y.slice(s![start..end, ..]), false, 1.0);
-        }
-        let mut q = q32.mapv(f64::from);
-        for c in 0..c_total {
-            q[[c, c]] += own[c] / 12.0;
-        }
-        // The minimiser under `Uᵀ V = W`: with `V = P S Gᵀ` (full `P`), every exact `U` is
-        // `U₀ + N Z`, `U₀ = P₁ S⁻¹ Gᵀ Wᵀ` and `N` the columns of `P` past `V`'s rank; the code then
-        // fixes `Z` by `(NᵀQN) Z = Nᵀ(R − Q U₀)`.
-        // On the reads' span (`x = E√Λ ξ`) the constraint is `Uᵀ (V E√Λ) = W E√Λ`.
-        let decomposed = svd(v.dot(&self.span).view(), true).map_err(|e| format!("{e:?}"))?;
-        let rank = decomposed.singular_values.iter().filter(|s| **s > decomposed.band).count();
-        let p1 = decomposed.u.slice(s![.., ..rank]);
-        let inverse = Array1::from_iter(decomposed.singular_values.iter().take(rank).map(|s| 1.0 / s));
-        let particular = (&p1 * &inverse).dot(&decomposed.vt.slice(s![..rank, ..])).dot(&self.w.dot(&self.span).t());
-        let null = decomposed.u.slice(s![.., rank..]);
-        let rhs = r32.mapv(f64::from) - q.dot(&particular);
-        // `NᵀQN` is resolved only as far as `Q` itself is: its band is `Q`'s (bounded by its trace).
-        let z = pseudo_inverse_of(&null.t().dot(&q).dot(&null), self.rows(), Some(q.diag().sum()))?.dot(&null.t().dot(&rhs));
-        Ok(particular + null.dot(&z))
-    }
-
-    /// Per input, `μ` and `ν ⊙ κ` over a chunk.
-    fn chunk_gates(&self, start: usize, end: usize, kappa: &[f64]) -> (Array2<f32>, Array2<f32>) {
-        let c_total = self.pieces;
-        let mut mu = Array2::<f32>::zeros((end - start, c_total));
-        let mut nk = Array2::<f32>::zeros((end - start, c_total));
-        for r in 0..end - start {
-            for c in 0..c_total {
-                let (m, n) = self.gates(start + r, c);
-                mu[[r, c]] = m;
-                nk[[r, c]] = n * kappa[c] as f32;
-            }
-        }
-        (mu, nk)
-    }
-
-    /// The gradient of the code (module note) in `V` at `v`, `U` fixed.
-    fn read_gradient(&self, v: &Array2<f64>, u: &Array2<f64>, k32: &Array2<f32>, kappa: &[f64]) -> Array2<f64> {
-        let v32 = single(v);
-        let uf32 = single(&u.dot(self.fisher));
-        let mut gradient = Array2::<f32>::zeros(v.dim());
-        for start in (0..self.rows()).step_by(CHUNK) {
-            let end = (start + CHUNK).min(self.rows());
-            let a = product(self.x.slice(s![start..end, ..]), false, v32.view(), true);
-            let g0 = product(self.y.slice(s![start..end, ..]), false, uf32.view(), true);
-            let (mu, nk) = self.chunk_gates(start, end, kappa);
-            let z = &a * &mu;
-            let kz = product(z.view(), false, k32.view(), false);
-            // With h = U F e = g0 − K z, the gradient in a is w (−2 μ ⊙ h + ν κ a / 6).
-            let mut ga = Array2::<f32>::zeros(a.dim());
-            for r in 0..end - start {
-                let w = self.scale * self.s[start + r];
-                for c in 0..self.pieces {
-                    let h = f64::from(g0[[r, c]]) - f64::from(kz[[r, c]]);
-                    let own = f64::from(nk[[r, c]]) * f64::from(a[[r, c]]) / 6.0;
-                    ga[[r, c]] = (w * (-2.0 * f64::from(mu[[r, c]]) * h + own)) as f32;
-                }
-            }
-            gemm(&mut gradient, true, ga.view(), true, self.x.slice(s![start..end, ..]), false, 1.0);
-        }
-        gradient.mapv(f64::from)
-    }
-
-    /// `dᵀ H d` of the reads' quadratic along `d` (C × d_in).
-    fn read_curvature(&self, d: &Array2<f64>, k32: &Array2<f32>, kappa: &[f64]) -> f64 {
-        let d32 = single(d);
-        let mut quadratic = 0.0;
-        for start in (0..self.rows()).step_by(CHUNK) {
-            let end = (start + CHUNK).min(self.rows());
-            let da = product(self.x.slice(s![start..end, ..]), false, d32.view(), true);
-            let (mu, nk) = self.chunk_gates(start, end, kappa);
-            let dz = &da * &mu;
-            let kdz = product(dz.view(), false, k32.view(), false);
-            for r in 0..end - start {
-                let mut q = 0.0f64;
-                for c in 0..self.pieces {
-                    let dac = f64::from(da[[r, c]]);
-                    q += f64::from(dz[[r, c]]) * f64::from(kdz[[r, c]]) + f64::from(nk[[r, c]]) * dac * dac / 12.0;
-                }
-                quadratic += 2.0 * self.scale * self.s[start + r] * q;
-            }
-        }
-        quadratic
-    }
-
-    /// The reads' step (module note): the preconditioned negative gradient of the charged points'
-    /// quadratic in `V`, and the length minimising that quadratic along it (`None` when it is flat).
-    fn read_step(&self, v: &Array2<f64>, u: &Array2<f64>, right: &Array2<f64>) -> Result<Option<(Array2<f64>, f64)>, String> {
-        let k = u.dot(self.fisher).dot(&u.t());
-        let k32 = single(&k);
-        let kappa: Vec<f64> = (0..self.pieces).map(|c| k[[c, c]]).collect();
-        // Each subcomponent's own curvature, the left preconditioner.
-        let mut left = vec![0.0f64; self.pieces];
-        for t in 0..self.rows() {
-            for (c, l) in left.iter_mut().enumerate() {
-                let (mu, nu) = self.gates(t, c);
-                *l += 2.0 * self.scale * self.s[t] * (f64::from(mu * mu) * kappa[c] + f64::from(nu) * kappa[c] / 12.0);
-            }
-        }
-        let gradient = self.read_gradient(v, u, &k32, &kappa);
-        let mut direction = -gradient.dot(right);
-        for (c, mut row) in direction.outer_iter_mut().enumerate() {
-            let l = left[c];
-            row.mapv_inplace(|x| if l > 0.0 { x / l } else { 0.0 });
-        }
-        // Only the moves that keep every subcomponent on the map, `Uᵀ D = 0`.
-        let along = u.t().dot(&direction);
-        let direction = &direction - &u.dot(&pseudo_inverse(&u.t().dot(u), 0)?.dot(&along));
-        let slope = -(&gradient * &direction).sum();
-        let quadratic = self.read_curvature(&direction, &k32, &kappa);
-        Ok((slope > 0.0 && quadratic > 0.0).then(|| (direction, slope / quadratic)))
-    }
-
-    /// The error bits of `v + η d` for every `η` of `lengths`, the sets held: each input's four
-    /// scalars (`‖r‖²`, `r·S`, `‖S‖²`, the off energy) are quadratics in `η`, measured in one pass.
-    fn read_profile(&self, v: &Array2<f64>, u: &Array2<f64>, d: &Array2<f64>, lengths: &[f64]) -> Vec<f64> {
-        let c_total = self.pieces;
-        let uf = u.dot(self.fisher);
-        let k = uf.dot(&u.t());
-        let k32 = single(&k);
-        let (v32, d32, uf32) = (single(v), single(d), single(&uf));
-        let mut totals = vec![0.0; lengths.len()];
-        for start in (0..self.rows()).step_by(CHUNK) {
-            let end = (start + CHUNK).min(self.rows());
-            let a = product(self.x.slice(s![start..end, ..]), false, v32.view(), true);
-            let da = product(self.x.slice(s![start..end, ..]), false, d32.view(), true);
-            let g0 = product(self.y.slice(s![start..end, ..]), false, uf32.view(), true);
-            let (mut z_on, mut z_off, mut dz_on, mut dz_off) = (a.clone(), a.clone(), da.clone(), da.clone());
-            // At each input's recorded vertex every gate not at 0 is at 1.
-            let (mut z_up, mut dz_up) = (a.clone(), da.clone());
-            for r in 0..end - start {
-                for c in 0..c_total {
-                    let i = (start + r) * c_total + c;
-                    if self.masks[i] == 1 {
-                        z_off[[r, c]] = 0.0;
-                        dz_off[[r, c]] = 0.0;
-                    } else {
-                        z_on[[r, c]] = 0.0;
-                        dz_on[[r, c]] = 0.0;
-                        if self.vertex[i] == 1 {
-                            z_up[[r, c]] = 0.0;
-                            dz_up[[r, c]] = 0.0;
-                        }
-                    }
-                }
-            }
-            let pk = product(z_on.view(), false, k32.view(), false);
-            let qk = product(z_off.view(), false, k32.view(), false);
-            let dpk = product(dz_on.view(), false, k32.view(), false);
-            let dqk = product(dz_off.view(), false, k32.view(), false);
-            let uk = product(z_up.view(), false, k32.view(), false);
-            let duk = product(dz_up.view(), false, k32.view(), false);
-            let rows: Vec<Vec<f64>> = (0..end - start)
-                .into_par_iter()
-                .map(|r| {
-                    let t = start + r;
-                    let dot = |x: &Array2<f32>, y: &Array2<f32>| -> f64 { x.row(r).iter().zip(y.row(r).iter()).map(|(p, q)| f64::from(*p) * f64::from(*q)).sum() };
-                    let rr = [self.yfy[t] - 2.0 * dot(&z_on, &g0) + dot(&z_on, &pk), -2.0 * dot(&dz_on, &g0) + 2.0 * dot(&dz_on, &pk), dot(&dz_on, &dpk)];
-                    let rs = [dot(&z_off, &g0) - dot(&z_on, &qk), dot(&dz_off, &g0) - dot(&dz_on, &qk) - dot(&z_on, &dqk), -dot(&dz_on, &dqk)];
-                    let ss = [dot(&z_off, &qk), 2.0 * dot(&dz_off, &qk), dot(&dz_off, &dqk)];
-                    let up = [self.yfy[t] - 2.0 * dot(&z_up, &g0) + dot(&z_up, &uk), -2.0 * dot(&dz_up, &g0) + 2.0 * dot(&dz_up, &uk), dot(&dz_up, &duk)];
-                    let mut off = [0.0; 3];
-                    for c in 0..c_total {
-                        if self.masks[t * c_total + c] == 0 {
-                            let (ac, dc) = (f64::from(a[[r, c]]), f64::from(da[[r, c]]));
-                            off[0] += k[[c, c]] * ac * ac;
-                            off[1] += 2.0 * k[[c, c]] * ac * dc;
-                            off[2] += k[[c, c]] * dc * dc;
-                        }
-                    }
-                    let at = |q: &[f64; 3], eta: f64| q[0] + eta * (q[1] + eta * q[2]);
-                    let weight = self.scale * self.s[t];
-                    lengths.iter().map(|&eta| weight * worst(at(&rr, eta), at(&rs, eta), at(&ss, eta), at(&off, eta)).0.max(at(&up, eta))).collect()
-                })
-                .collect();
-            for row in rows {
-                for (total, value) in totals.iter_mut().zip(row) {
-                    *total += value;
-                }
-            }
-        }
-        totals
-    }
-}
-
-/// What [`fit`] fits to: the code's `n`, the library's size, the most rounds, and the seed of its
-/// starting reads.
-#[derive(Clone, Copy, Debug)]
-pub struct Settings {
-    pub observations: f64,
-    pub pieces: usize,
-    pub rounds: usize,
-    pub seed: u64,
+/// What one input's code needs of the library: its reads `a` and, per input, `‖D_t‖_F`.
+struct Chunk {
+    a: Array2<f32>,
+    left: Vec<f64>,
 }
 
 impl<'a> Fitting<'a> {
@@ -694,19 +303,250 @@ impl<'a> Fitting<'a> {
             scale: observations / (2.0 * LN_2),
             pieces,
             masks: vec![1; rows * pieces],
-            point: vec![0; rows],
-            vertex: vec![0; rows * pieces],
         })
+    }
+
+    fn rows(&self) -> usize {
+        self.x.nrows()
+    }
+
+    /// The reads and `‖D_t‖_F` of the inputs `start..end`.
+    fn chunk(&self, start: usize, end: usize, v32: &Array2<f32>, uf32: &Array2<f32>, k32: &Array2<f32>) -> Chunk {
+        let a = product(self.x.slice(s![start..end, ..]), false, v32.view(), true);
+        let g0 = product(self.y.slice(s![start..end, ..]), false, uf32.view(), true);
+        let ak = product(a.view(), false, k32.view(), false);
+        let left = (0..end - start)
+            .map(|r| {
+                let (mut ag, mut aka) = (0.0f64, 0.0f64);
+                for c in 0..self.pieces {
+                    let ac = f64::from(a[[r, c]]);
+                    ag += ac * f64::from(g0[[r, c]]);
+                    aka += ac * f64::from(ak[[r, c]]);
+                }
+                (self.yfy[start + r] - 2.0 * ag + aka).max(0.0).sqrt()
+            })
+            .collect();
+        Chunk { a, left }
+    }
+
+    /// The products every pass over the inputs needs: `V`, `U F` and `K = U F Uᵀ` in single
+    /// precision, and every `‖u_c‖_F`.
+    fn operands(&self, v: &Array2<f64>, u: &Array2<f64>) -> (Array2<f32>, Array2<f32>, Array2<f32>, Vec<f64>) {
+        let uf = u.dot(self.fisher);
+        let k = uf.dot(&u.t());
+        let sizes = (0..u.nrows()).map(|c| k[[c, c]].max(0.0).sqrt()).collect();
+        (single(v), single(&uf), single(&k), sizes)
+    }
+
+    /// The code of `(v, u)` (module note); with `flip`, every input's sets selected first (module
+    /// note, "Sets"). Returns the total description and error bits and each input's error bits.
+    fn code(&mut self, v: &Array2<f64>, u: &Array2<f64>, bits: &Array1<f64>, flip: bool) -> (f64, f64, Vec<f64>) {
+        let c_total = self.pieces;
+        let (v32, uf32, k32, sizes) = self.operands(v, u);
+        let mut description = 0.0;
+        let mut error = 0.0;
+        let mut errors = vec![0.0; self.rows()];
+        for start in (0..self.rows()).step_by(CHUNK) {
+            let end = (start + CHUNK).min(self.rows());
+            let chunk = self.chunk(start, end, &v32, &uf32, &k32);
+            let masks = &mut self.masks[start * c_total..end * c_total];
+            let (s, scale) = (&self.s, self.scale);
+            let results: Vec<(f64, f64)> = masks
+                .par_chunks_mut(c_total)
+                .enumerate()
+                .map(|(r, m)| {
+                    let weight = scale * s[start + r];
+                    let size: Vec<f64> = (0..c_total).map(|c| f64::from(chunk.a[[r, c]]).abs() * sizes[c]).collect();
+                    if flip {
+                        // The best prefix of the ranking by size per bit, then single flips.
+                        let mut order: Vec<usize> = (0..c_total).collect();
+                        let ratio = |c: usize| if bits[c] > 0.0 { size[c] / bits[c] } else { f64::INFINITY };
+                        order.sort_by(|a, b| ratio(*b).total_cmp(&ratio(*a)));
+                        let all: f64 = size.iter().sum();
+                        let (mut listed, mut bound) = (0.0, chunk.left[r] + all);
+                        let (mut best, mut best_code) = (0, weight * bound * bound);
+                        for (k, &c) in order.iter().enumerate() {
+                            listed += bits[c];
+                            bound -= size[c];
+                            let code = listed + weight * bound * bound;
+                            if code < best_code {
+                                (best, best_code) = (k + 1, code);
+                            }
+                        }
+                        m.fill(0);
+                        for &c in &order[..best] {
+                            m[c] = 1;
+                        }
+                        let mut bound = chunk.left[r] + (0..c_total).filter(|c| m[*c] == 0).map(|c| size[c]).sum::<f64>();
+                        for _ in 0..c_total {
+                            let mut flipped = false;
+                            for c in 0..c_total {
+                                let next = if m[c] == 1 { bound + size[c] } else { (bound - size[c]).max(0.0) };
+                                let delta = if m[c] == 1 { -bits[c] } else { bits[c] } + weight * (next * next - bound * bound);
+                                if delta < 0.0 {
+                                    m[c] = 1 - m[c];
+                                    bound = next;
+                                    flipped = true;
+                                }
+                            }
+                            if !flipped {
+                                break;
+                            }
+                        }
+                    }
+                    let bound = chunk.left[r] + (0..c_total).filter(|c| m[*c] == 0).map(|c| size[c]).sum::<f64>();
+                    let listed: f64 = (0..c_total).filter(|c| m[*c] == 1).map(|c| bits[c]).sum();
+                    (listed, weight * bound * bound)
+                })
+                .collect();
+            for (r, (listed, err)) in results.into_iter().enumerate() {
+                description += listed;
+                error += err;
+                errors[start + r] = err;
+            }
+        }
+        (description, error, errors)
+    }
+
+    /// The writes minimising `Σ_c ω_c ‖u_c‖²_F` under every subcomponent on being the map (module
+    /// note, "Writes").
+    fn writes_weighted(&self, v: &Array2<f64>, omega: &Array1<f64>) -> Result<Array2<f64>, String> {
+        // On every read direction (`x = E√Λ ξ`) the constraint is `Uᵀ (V E√Λ) = W E√Λ`.
+        let decomposed = svd(v.dot(&self.span).view(), true).map_err(|e| format!("{e:?}"))?;
+        let rank = decomposed.singular_values.iter().filter(|s| **s > decomposed.band).count();
+        let p1 = decomposed.u.slice(s![.., ..rank]);
+        let inverse = Array1::from_iter(decomposed.singular_values.iter().take(rank).map(|s| 1.0 / s));
+        let particular = (&p1 * &inverse).dot(&decomposed.vt.slice(s![..rank, ..])).dot(&self.w.dot(&self.span).t());
+        let null = decomposed.u.slice(s![.., rank..]).to_owned();
+        let weighted = &null * &omega.view().insert_axis(Axis(1));
+        let z = pseudo_inverse(&null.t().dot(&weighted), 0)?.dot(&weighted.t().dot(&particular));
+        Ok(particular - null.dot(&z))
+    }
+
+    /// The writes' majorise-minimise step at `(v, u)` (module note, "Writes").
+    fn writes(&self, v: &Array2<f64>, u: &Array2<f64>) -> Result<Array2<f64>, String> {
+        let c_total = self.pieces;
+        let (v32, uf32, k32, sizes) = self.operands(v, u);
+        let mut omega = Array1::<f64>::zeros(c_total);
+        for start in (0..self.rows()).step_by(CHUNK) {
+            let end = (start + CHUNK).min(self.rows());
+            let chunk = self.chunk(start, end, &v32, &uf32, &k32);
+            for r in 0..end - start {
+                let t = start + r;
+                let m = &self.masks[t * c_total..(t + 1) * c_total];
+                let bound = chunk.left[r] + (0..c_total).filter(|c| m[*c] == 0).map(|c| f64::from(chunk.a[[r, c]]).abs() * sizes[c]).sum::<f64>();
+                let weight = self.scale * self.s[t] * bound;
+                for c in (0..c_total).filter(|c| m[*c] == 0) {
+                    omega[c] += weight * f64::from(chunk.a[[r, c]]).abs() / sizes[c].max(f64::MIN_POSITIVE);
+                }
+            }
+        }
+        self.writes_weighted(v, &omega)
+    }
+
+    /// The reads' step (module note, "Reads"): its direction and the quadratic estimate of its
+    /// length, or `None` when no move keeping the map lowers the code.
+    fn read_step(&self, v: &Array2<f64>, u: &Array2<f64>, right: &Array2<f64>) -> Result<Option<(Array2<f64>, f64)>, String> {
+        let c_total = self.pieces;
+        let (v32, uf32, k32, sizes) = self.operands(v, u);
+        let mut gradient = Array2::<f32>::zeros(v.dim());
+        let mut left = vec![0.0f64; c_total];
+        for start in (0..self.rows()).step_by(CHUNK) {
+            let end = (start + CHUNK).min(self.rows());
+            let chunk = self.chunk(start, end, &v32, &uf32, &k32);
+            // `∂ code / ∂ a_tc = 2 n s_t B_t ‖u_c‖_F sign(a_tc)` for every off subcomponent.
+            let mut ga = Array2::<f32>::zeros(chunk.a.dim());
+            for r in 0..end - start {
+                let t = start + r;
+                let m = &self.masks[t * c_total..(t + 1) * c_total];
+                let bound = chunk.left[r] + (0..c_total).filter(|c| m[*c] == 0).map(|c| f64::from(chunk.a[[r, c]]).abs() * sizes[c]).sum::<f64>();
+                let weight = self.scale * self.s[t];
+                for c in (0..c_total).filter(|c| m[*c] == 0) {
+                    ga[[r, c]] = (2.0 * weight * bound * sizes[c] * f64::from(chunk.a[[r, c]]).signum()) as f32;
+                    left[c] += 2.0 * weight * sizes[c] * sizes[c];
+                }
+            }
+            gemm(&mut gradient, true, ga.view(), true, self.x.slice(s![start..end, ..]), false, 1.0);
+        }
+        let gradient = gradient.mapv(f64::from);
+        let mut direction = -gradient.dot(right);
+        for (c, mut row) in direction.outer_iter_mut().enumerate() {
+            let l = left[c];
+            row.mapv_inplace(|x| if l > 0.0 { x / l } else { 0.0 });
+        }
+        // Only the moves that keep every subcomponent on the map, `Uᵀ D = 0`.
+        let along = u.t().dot(&direction);
+        let direction = &direction - &u.dot(&pseudo_inverse(&u.t().dot(u), 0)?.dot(&along));
+        let slope = -(&gradient * &direction).sum();
+        // The quadratic estimate: the kinks of `|a|` ignored, `B_t` moves by `Σ_off ‖u_c‖ sign(a) δa`.
+        let d32 = single(&direction);
+        let mut curvature = 0.0;
+        for start in (0..self.rows()).step_by(CHUNK) {
+            let end = (start + CHUNK).min(self.rows());
+            let a = product(self.x.slice(s![start..end, ..]), false, v32.view(), true);
+            let da = product(self.x.slice(s![start..end, ..]), false, d32.view(), true);
+            for r in 0..end - start {
+                let t = start + r;
+                let m = &self.masks[t * c_total..(t + 1) * c_total];
+                let rate: f64 = (0..c_total).filter(|c| m[*c] == 0).map(|c| sizes[c] * f64::from(a[[r, c]]).signum() * f64::from(da[[r, c]])).sum();
+                curvature += 2.0 * self.scale * self.s[t] * rate * rate;
+            }
+        }
+        Ok((slope > 0.0 && curvature > 0.0).then(|| (direction, slope / curvature)))
+    }
+
+    /// The error bits of `v + η d` for every `η` of `lengths`, the sets held, in one pass.
+    fn read_profile(&self, v: &Array2<f64>, u: &Array2<f64>, d: &Array2<f64>, lengths: &[f64]) -> Vec<f64> {
+        let c_total = self.pieces;
+        let (v32, uf32, k32, sizes) = self.operands(v, u);
+        let d32 = single(d);
+        let mut totals = vec![0.0; lengths.len()];
+        for start in (0..self.rows()).step_by(CHUNK) {
+            let end = (start + CHUNK).min(self.rows());
+            // `Uᵀ d = 0`, so what all on leaves does not move along the line.
+            let chunk = self.chunk(start, end, &v32, &uf32, &k32);
+            let da = product(self.x.slice(s![start..end, ..]), false, d32.view(), true);
+            let rows: Vec<Vec<f64>> = (0..end - start)
+                .into_par_iter()
+                .map(|r| {
+                    let t = start + r;
+                    let m = &self.masks[t * c_total..(t + 1) * c_total];
+                    let weight = self.scale * self.s[t];
+                    lengths
+                        .iter()
+                        .map(|&eta| {
+                            let bound = chunk.left[r]
+                                + (0..c_total).filter(|c| m[*c] == 0).map(|c| (f64::from(chunk.a[[r, c]]) + eta * f64::from(da[[r, c]])).abs() * sizes[c]).sum::<f64>();
+                            weight * bound * bound
+                        })
+                        .collect()
+                })
+                .collect();
+            for row in rows {
+                for (total, value) in totals.iter_mut().zip(row) {
+                    *total += value;
+                }
+            }
+        }
+        totals
     }
 
     /// The round's report of the state as last coded.
     fn report(&self, round: usize, description: f64, error: f64) -> Round {
         let rows = self.rows() as f64;
         let on = self.masks.iter().filter(|m| **m == 1).count() as f64;
-        let share = |p: u8| self.point.iter().filter(|x| **x == p).count() as f64 / rows;
-        let (corner_share, vertex_share) = (share(0), share(2));
-        Round { round, code: (description + error) / rows, description: description / rows, error: error / rows, l0: on / rows, corner_share, vertex_share, reseeded: 0, read_steps: 0 }
+        Round { round, code: (description + error) / rows, description: description / rows, error: error / rows, l0: on / rows, reseeded: 0, read_steps: 0 }
     }
+}
+
+/// What [`fit`] fits to: the code's `n`, the library's size, the most rounds, and the seed of its
+/// starting reads.
+#[derive(Clone, Copy, Debug)]
+pub struct Settings {
+    pub observations: f64,
+    pub pieces: usize,
+    pub rounds: usize,
+    pub seed: u64,
 }
 
 /// Every subcomponent's description bits.
@@ -718,15 +558,15 @@ fn description_bits(describe: &dyn Describe, site: usize, v: &Array2<f64>, u: &A
         .into())
 }
 
-/// A given library's code on `samples` (module note), every input's sets selected from all on,
-/// and those sets (per input, the subcomponents on, ascending).
+/// A given library's code on `samples` (module note), every input's sets selected, and those sets
+/// (per input, the subcomponents on, ascending).
 pub fn measure(site: usize, w: &Array2<f64>, samples: &Samples, describe: &dyn Describe, observations: f64, library: &Library) -> Result<(Round, Vec<Vec<u32>>), String> {
     if library.mean.iter().any(|m| *m != 0.0) {
         return Err("a measured library reads the uncentred input".to_string());
     }
     let mut fitting = Fitting::new(site, w, samples, observations, library.v.nrows())?;
     let bits = description_bits(describe, site, &library.v, &library.u)?;
-    let (description, error, _) = fitting.code(&library.v, &library.u, &bits, true, true);
+    let (description, error, _) = fitting.code(&library.v, &library.u, &bits, true);
     let pieces = library.v.nrows();
     let sets = fitting.masks.chunks(pieces).map(|m| (0..pieces as u32).filter(|c| m[*c as usize] == 1).collect()).collect();
     Ok((fitting.report(0, description, error), sets))
@@ -736,7 +576,8 @@ pub fn measure(site: usize, w: &Array2<f64>, samples: &Samples, describe: &dyn D
 /// its index in `describe`), fitted on `samples` to the site's code (module note); `progress` sees
 /// every round with the library it measured. Its first reads are `start` (rows of `d_in`, at most
 /// `pieces`; a site reading a layer of units starts from the units themselves), the rest seeded
-/// from inputs. The library reads the uncentred input (`mean` zero).
+/// from inputs, and its first writes the smallest that make every subcomponent on the map. The
+/// library reads the uncentred input (`mean` zero).
 pub fn fit(
     site: usize,
     w: &Array2<f64>,
@@ -754,7 +595,6 @@ pub fn fit(
     // The reads' inverse second moment on their span (seeding) and the sensitivity-weighted one
     // (the reads' right preconditioner).
     let seeding = fitting.seeding.clone();
-
     let weighted = {
         let scaled = Array2::from_shape_fn(x.dim(), |(t, i)| (f64::from(x[[t, i]]) * samples.sensitivity[t].sqrt()) as f32);
         product(scaled.view(), true, scaled.view(), false).mapv(f64::from) / samples.sensitivity.sum().max(f64::MIN_POSITIVE)
@@ -785,7 +625,7 @@ pub fn fit(
     for c in given..pieces {
         v.row_mut(c).assign(&seed_read(draw(rows)));
     }
-    // The reads span the inputs' span, so every subcomponent on can be the map.
+    // The reads span every read direction, so every subcomponent on can be the map.
     let span = fitting.span.clone();
     let unwhiten = fitting.unwhiten.clone();
     let cover = |v: &mut Array2<f64>, rows: &[usize]| -> Result<(), String> {
@@ -798,51 +638,31 @@ pub fn fit(
         Ok(())
     };
     cover(&mut v, &(given..pieces).rev().collect::<Vec<_>>())?;
-    // Every subcomponent on: the writes that make the library the map on these inputs.
-    let mut u = fitting.writes(&v)?;
+    // The smallest writes that make every subcomponent on the map.
+    let mut u = fitting.writes_weighted(&v, &Array1::ones(pieces))?;
     let mut bits = description_bits(describe, site, &v, &u)?;
-    let (description, error, mut errors) = fitting.code(&v, &u, &bits, true, true);
+    let (description, error, mut errors) = fitting.code(&v, &u, &bits, true);
     let mut current = description + error;
     let mut report = fitting.report(0, description, error);
     for round in 0..rounds {
-        // The writes: their closed form under the charged points, halved until the code falls.
-        let target = fitting.writes(&v)?;
-        let step = &target - &u;
-        let before = (fitting.point.clone(), fitting.vertex.clone());
-        let mut eta = 1.0;
-        let mut moved = false;
-        while eta > f64::EPSILON {
-            let trial = &u + &(&step * eta);
-            let (d, e, _) = fitting.code(&v, &trial, &bits, false, true);
-            if d + e < current {
-                (u, current, moved) = (trial, d + e, true);
-                break;
-            }
-            eta *= 0.5;
+        // The writes: the majoriser's minimiser, kept when the code falls.
+        let trial = fitting.writes(&v, &u)?;
+        let (d, e, _) = fitting.code(&v, &trial, &bits, false);
+        if d + e < current {
+            (u, current) = (trial, d + e);
         }
-        if !moved {
-            (fitting.point, fitting.vertex) = before;
-        }
-        // The reads: along the preconditioned step, the length of least code among the quadratic's
-        // minimiser times every power of √2 from 2⁻³² to 2⁴, all measured in one pass.
+        // The reads: along the preconditioned step, the length of least code among the quadratic
+        // estimate times every power of √2 from 2⁻³² to 2⁴, all measured in one pass.
         if let Some((direction, alpha)) = fitting.read_step(&v, &u, &right)? {
             let mut lengths = vec![0.0];
             lengths.extend((-64..=8).map(|k| alpha * 2f64.powf(f64::from(k) / 2.0)));
             let profile = fitting.read_profile(&v, &u, &direction, &lengths);
             let (best, value) = profile.iter().enumerate().fold((0, profile[0]), |b, (i, p)| if *p < b.1 { (i, *p) } else { b });
-            report.read_steps = best;
-            if best > 0 && value < profile[0] {
-                // The ladder held each input's vertex; the step stands when the code, every
-                // vertex sought again, falls too.
-                let trial = &v + &(&direction * lengths[best]);
-                let before = (fitting.point.clone(), fitting.vertex.clone());
-                let (d, e, _) = fitting.code(&trial, &u, &bits, false, true);
-                if d + e < current {
-                    (v, current) = (trial, d + e);
-                } else {
-                    (fitting.point, fitting.vertex) = before;
-                    report.read_steps = 0;
-                }
+            if best > 0 {
+                // The sets' description is unchanged; only the error moved.
+                report.read_steps = best;
+                current += value - profile[0];
+                v.scaled_add(lengths[best], &direction);
             }
         }
         // Reseeding: every subcomponent on nowhere, from the inputs of largest error in turn, kept
@@ -850,7 +670,7 @@ pub fn fit(
         let on: Vec<bool> = (0..pieces).map(|c| (0..rows).any(|t| fitting.masks[t * pieces + c] == 1)).collect();
         let dead: Vec<usize> = (0..pieces).filter(|c| !on[*c]).collect();
         if !dead.is_empty() {
-            let saved = (v.clone(), u.clone(), fitting.masks.clone(), fitting.point.clone(), fitting.vertex.clone());
+            let saved = (v.clone(), u.clone(), fitting.masks.clone());
             let mut order: Vec<usize> = (0..rows).collect();
             order.sort_by(|a, b| errors[*b].total_cmp(&errors[*a]));
             let mut reseeded = 0;
@@ -860,19 +680,19 @@ pub fn fit(
             }
             cover(&mut v, &dead)?;
             // The writes again, so every subcomponent on stays the map.
-            u = fitting.writes(&v)?;
+            u = fitting.writes(&v, &u)?;
             bits = description_bits(describe, site, &v, &u)?;
-            let (d, e, _) = fitting.code(&v, &u, &bits, true, true);
+            let (d, e, _) = fitting.code(&v, &u, &bits, true);
             if d + e < current {
                 report.reseeded = reseeded;
             } else {
-                (v, u, fitting.masks, fitting.point, fitting.vertex) = saved;
+                (v, u, fitting.masks) = saved;
             }
         }
         progress(&report, &Library { v: v.clone(), u: u.clone(), mean: Array1::zeros(d_in) });
         // The next round's sets, under the descriptions as the steps left them.
         bits = description_bits(describe, site, &v, &u)?;
-        let (description, error, next_errors) = fitting.code(&v, &u, &bits, true, true);
+        let (description, error, next_errors) = fitting.code(&v, &u, &bits, true);
         let previous = report.code;
         report = fitting.report(round + 1, description, error);
         current = description + error;

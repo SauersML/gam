@@ -287,6 +287,9 @@ struct Tally {
     tokens: f64,
     /// What the box claim adds to the KL, when it was measured (module note, `CLAIM`).
     excess: Option<f64>,
+    /// What an attack on VPD's global box claim adds to the KL (`gam_mpd::masked::box_excess_at`),
+    /// reported beside ours and never charged.
+    attack: Option<f64>,
 }
 
 impl Tally {
@@ -308,6 +311,9 @@ impl Tally {
             "code": (self.explanation + self.kl * observations / std::f64::consts::LN_2) / t,
             "agree": self.agree / t,
         });
+        if let Some(attack) = self.attack {
+            point["kl_attack"] = json!((self.kl + attack) / t);
+        }
         if let Some(excess) = self.excess {
             point["kl_box"] = json!((self.kl + excess) / t);
             point["code_box"] = json!((self.explanation + (self.kl + excess) * observations / std::f64::consts::LN_2) / t);
@@ -674,12 +680,14 @@ fn main() -> Result<(), String> {
         if fishers.is_some() {
             selected.excess = Some(0.0);
             started.excess = Some(0.0);
+            selected.attack = Some(0.0);
+            started.attack = Some(0.0);
             // Everything on leaves no gate free: no excess.
             all_on.excess = Some(0.0);
         }
         // What the box claim adds on a sequence's sets.
-        let excess_of = |inputs: &FamilyInputs, target: &Target, masks: &[Array2<f64>], fishers: &[Array2<f64>]| -> Result<f64, String> {
-            Ok(box_excess_at(masked, inputs, target, masks, fishers)?.sum())
+        let excess_of = |inputs: &FamilyInputs, _target: &Target, masks: &[Array2<f64>], fishers: &[Array2<f64>]| -> Result<f64, String> {
+            Ok(gam_mpd::masked::box_upper_at(masked, inputs, masks, fishers)?.sum())
         };
         // Sets as CSR over all pieces (sites in order), so other context codes can score them.
         let mut indptr: Vec<i64> = vec![0];
@@ -777,6 +785,9 @@ fn main() -> Result<(), String> {
             if let Some(excess) = started.excess.as_mut() {
                 *excess += begin_excess;
             }
+            if let (Some(f), Some(attack)) = (fishers, started.attack.as_mut()) {
+                *attack += box_excess_at(masked, &inputs, &target, &begin, f)?.sum();
+            }
             let begin_code = begin_bits + (begin_kl.sum() + begin_excess) * scale;
             let begin_l0 = sums(&begin, &begin_kl).0;
             let pieces = masked.all_pieces();
@@ -843,6 +854,9 @@ fn main() -> Result<(), String> {
             selected.add(&masks, &values, bits, &row_agree);
             if let Some(total) = selected.excess.as_mut() {
                 *total += excess;
+            }
+            if let (Some(f), Some(attack)) = (fishers, selected.attack.as_mut()) {
+                *attack += box_excess_at(masked, &inputs, &target, &masks, f)?.sum();
             }
             if full {
                 token_kl.extend(values.iter().copied());
@@ -911,9 +925,9 @@ fn main() -> Result<(), String> {
         Claim::Box => select_boxed(m, inputs, target, begin, coder, observations, samples, &fishers),
         Claim::Corner => select(m, inputs, target, begin, coder, observations, samples),
     };
-    let excess_on = |m: &Masked, inputs: &FamilyInputs, target: &Target, masks: &[Array2<f64>]| -> Result<f64, String> {
+    let excess_on = |m: &Masked, inputs: &FamilyInputs, _target: &Target, masks: &[Array2<f64>]| -> Result<f64, String> {
         match claim {
-            Claim::Box => Ok(box_excess_at(m, inputs, target, masks, &fishers)?.sum()),
+            Claim::Box => Ok(gam_mpd::masked::box_upper_at(m, inputs, masks, &fishers)?.sum()),
             Claim::Corner => Ok(0.0),
         }
     };

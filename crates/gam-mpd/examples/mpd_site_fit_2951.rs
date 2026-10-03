@@ -37,6 +37,14 @@ fn write_f64(path: &PathBuf, m: &Array2<f64>) -> Result<(), String> {
     std::fs::rename(&partial, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// How much the subcomponents' own sizes exceed the map they sum to, `Σ_c ‖u_c‖‖v_c‖ / ‖W‖_F`:
+/// near one for subcomponents that add up, large for ones that cancel.
+fn spread(w: &Array2<f64>, library: &Library) -> f64 {
+    let norm = |r: ndarray::ArrayView1<f64>| r.dot(&r).sqrt();
+    let total: f64 = library.u.outer_iter().zip(library.v.outer_iter()).map(|(u, v)| norm(u) * norm(v)).sum();
+    total / w.iter().map(|x| x * x).sum::<f64>().sqrt()
+}
+
 fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
@@ -89,10 +97,10 @@ fn main() -> Result<(), String> {
             let library = Library { v: read("v", d_in)?, u: read("u", d_out)?, mean: Array1::zeros(d_in) };
             let (round, chosen_sets) = measure(k, w, sample, &description, observations, &library)?;
             selected.push((site.name.clone(), library.v.nrows(), chosen_sets));
-            eprintln!("{} given library of {}: code {:.1} bits per input (description {:.1}, error {:.1}), L0 {:.2}, corner {:.2}",
-                site.name, library.v.nrows(), round.code, round.description, round.error, round.l0, round.corner_share);
+            eprintln!("{} given library of {}: code {:.1} bits per input (description {:.1}, error {:.1}), L0 {:.2}, Σ|u||v|/|W| {:.1}",
+                site.name, library.v.nrows(), round.code, round.description, round.error, round.l0, spread(w, &library));
             let record = json!({"site": site.name, "observations": observations, "pieces": library.v.nrows(), "code": round.code,
-                "description": round.description, "error": round.error, "l0": round.l0, "corner_share": round.corner_share});
+                "description": round.description, "error": round.error, "l0": round.l0, "spread": spread(w, &library)});
             std::fs::write(out.join(format!("{}.measure.json", site.name)), record.to_string()).map_err(|e| e.to_string())?;
             continue;
         }
@@ -105,21 +113,19 @@ fn main() -> Result<(), String> {
         let units = (site.reads.len() == 1 && matches!(model.nodes[site.reads[0]], Node::Pointwise { .. })).then(|| Array2::<f64>::eye(d_in));
         let library = fit(k, w, sample, &description, settings, units.as_ref(), |round, library| {
             eprintln!(
-                "{} round {}: code {:.1} bits per input (description {:.1}, error {:.1}), L0 {:.2}, corner {:.2}, vertex {:.2}, reseeded {}, read rung {}, {:.0}s",
+                "{} round {}: code {:.1} bits per input (description {:.1}, error {:.1}), L0 {:.2}, reseeded {}, read rung {}, {:.0}s",
                 site.name,
                 round.round,
                 round.code,
                 round.description,
                 round.error,
                 round.l0,
-                round.corner_share,
-                round.vertex_share,
                 round.reseeded,
                 round.read_steps,
                 started.elapsed().as_secs_f64()
             );
             log.push(json!({"round": round.round, "code": round.code, "description": round.description, "error": round.error, "l0": round.l0,
-                "corner_share": round.corner_share, "vertex_share": round.vertex_share, "reseeded": round.reseeded, "read_steps": round.read_steps, "seconds": started.elapsed().as_secs_f64()}));
+                "reseeded": round.reseeded, "read_steps": round.read_steps, "seconds": started.elapsed().as_secs_f64()}));
             let written = write_f64(&v_path, &library.v)
                 .and_then(|_| write_f64(&u_path, &library.u))
                 .and_then(|_| std::fs::write(&rounds_path, json!({"site": site.name, "observations": observations, "rounds": log}).to_string()).map_err(|e| e.to_string()));
@@ -132,7 +138,13 @@ fn main() -> Result<(), String> {
         // What all on leaves of the map, in the reads' second moment M: ‖(W − Σ u vᵀ) M^½‖ / ‖W M^½‖.
         let weighted = |e: &Array2<f64>| (&e.dot(&sample.second_moment) * e).sum().sqrt();
         let left = weighted(&(w - &library.u.t().dot(&library.v))) / weighted(w);
-        eprintln!("{}: {} subcomponents written, all on leaves {left:.2e} of the map, {:.0}s", site.name, library.v.nrows(), started.elapsed().as_secs_f64());
+        eprintln!(
+            "{}: {} subcomponents written, all on leaves {left:.2e} of the map, Σ|u||v|/|W| {:.1}, {:.0}s",
+            site.name,
+            library.v.nrows(),
+            spread(w, &library),
+            started.elapsed().as_secs_f64()
+        );
     }
     if !selected.is_empty() {
         let dir = out.join("sets");

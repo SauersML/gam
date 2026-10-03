@@ -240,17 +240,6 @@ pub enum Core {
     Rotation { reflections: Vec<bool> },
     /// One real per paired column.
     Diagonal,
-    /// `W ≈ L⁺ P R Pᵀ L`: the frame coded once in the reads' metric, its `r × r` core `R`.
-    SameSubspace { rank: usize, core: SameCore },
-}
-
-/// The core of a same-subspace description, in the frame's canonical orthonormal basis.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SameCore {
-    Generic,
-    Symmetric,
-    Isotropic,
-    Rotation,
 }
 
 /// One block's chosen description.
@@ -1100,86 +1089,6 @@ fn roots(m: &Array2<f64>) -> Result<(Array2<f64>, Array2<f64>), String> {
     Ok((root, inverse))
 }
 
-/// The same-subspace family at rank `r`, in the reads' own metric (whitened by `L = C^{1/2}`, which
-/// the decoder holds with the decoded upstream): `L W L⁺ ≈ P R Pᵀ`, `P` orthonormal, so the block
-/// writes along `L⁺P` and reads along `L P`, the metric dual of what it writes. The frame is sent as
-/// `Q = L⁺ Z` in the pivot chart at one exponent (the leading `r` eigenvectors `Z` of
-/// `W̃ W̃ᵀ + W̃ᵀ W̃`, `W̃ = L W L⁺`) and decoded to the canonical orthonormal `P = Z (ZᵀZ)^{-1/2}`,
-/// `Z = L Q̃`; the core `R` in that basis generic (`r²`), symmetric (`r (r + 1) / 2`), isotropic
-/// (one) or, on a plane, rotation-scaling (two).
-fn same_subspace(block: &Block<'_>, w: &Array2<f64>, whitening: &(Array2<f64>, Array2<f64>), r: usize, structure: f64) -> Result<Option<Description>, String> {
-    let d = w.nrows();
-    let (root, inverse_root) = whitening;
-    let whitened = root.dot(w).dot(inverse_root);
-    let both = symmetric(&(whitened.dot(&whitened.t()) + whitened.t().dot(&whitened)));
-    let decomposed = eigh(both.view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
-    let mut order: Vec<usize> = (0..d).collect();
-    order.sort_by(|a, b| decomposed.values[*b].total_cmp(&decomposed.values[*a]));
-    let frame = inverse_root.dot(&decomposed.vectors.select(Axis(1), &order[..r]));
-    let pivot = pivots(&frame.t().to_owned(), r);
-    if pivot.len() < r {
-        return Ok(None);
-    }
-    let square = frame.select(Axis(0), &pivot);
-    let (inverse, _) = inverses(&square.dot(&square.t()))?;
-    // Q (Q_π)⁻¹ through the normal equations, identity on the pivot rows.
-    let mut chart = frame.dot(&square.t()).dot(&inverse);
-    for (i, &j) in pivot.iter().enumerate() {
-        chart.row_mut(j).fill(0.0);
-        chart[[j, i]] = 1.0;
-    }
-    let free: Vec<usize> = (0..d).filter(|j| !pivot.contains(j)).collect();
-    let free_rows = chart.select(Axis(0), &free);
-    let mut cores: Vec<(SameCore, Vec<Placement>)> = vec![
-        (SameCore::Generic, (0..r).flat_map(|i| (0..r).map(move |j| vec![(i, j, 1.0)])).collect()),
-        (
-            SameCore::Symmetric,
-            (0..r).flat_map(|i| (i..r).map(move |j| if i == j { vec![(i, i, 1.0)] } else { vec![(i, j, 1.0), (j, i, 1.0)] })).collect(),
-        ),
-        (SameCore::Isotropic, vec![(0..r).map(|i| (i, i, 1.0)).collect()]),
-    ];
-    if r == 2 {
-        cores.push((SameCore::Rotation, vec![vec![(0, 0, 1.0), (1, 1, 1.0)], vec![(0, 1, -1.0), (1, 0, 1.0)]]));
-    }
-    let structure = structure
-        + prefix_integer_len_bits(r as u64).map_err(|e| e.to_string())? as f64
-        + subset_code_len_bits(d, r).map_err(|e| e.to_string())? as f64
-        + fixed_index_len_bits(cores.len()).map_err(|e| e.to_string())? as f64;
-    let mut best: Option<Description> = None;
-    for pq in exponents(&free_rows) {
-        let Some((qf, frame_bits)) = quantize(&free_rows, pq) else { continue };
-        let frame_bits = frame_bits + exponent_bits(pq);
-        if best.as_ref().is_some_and(|b| structure + frame_bits > b.total()) {
-            break;
-        }
-        let mut q = chart.clone();
-        for (i, &j) in free.iter().enumerate() {
-            q.row_mut(j).assign(&qf.row(i));
-        }
-        let z = root.dot(&q);
-        let (_, half) = inverses(&z.t().dot(&z))?;
-        let p = z.dot(&half);
-        let sides = block.sides_of(inverse_root.dot(&p), root.dot(&p))?;
-        for (kind, placements) in &cores {
-            let Some(coded) = linear_core(block, &sides, placements, 0.0)? else { continue };
-            let candidate = Description {
-                writer: ("same subspace".to_string(), vec![]),
-                reader: ("same subspace".to_string(), vec![]),
-                core: Core::SameSubspace { rank: r, core: *kind },
-                reals: r * (d - r) + coded.reals,
-                structure_bits: structure + coded.structure_bits,
-                real_bits: frame_bits + coded.real_bits,
-                kl_bits: coded.kl,
-                u: sides.p.dot(&coded.a).reversed_axes(),
-                v: sides.q.dot(&coded.b).reversed_axes(),
-            };
-            if best.as_ref().is_none_or(|b| candidate.total() < b.total()) {
-                best = Some(candidate);
-            }
-        }
-    }
-    Ok(best)
-}
 
 /// Per site, the Gauss-Newton metric of its written value in logit space, `E[Jᵀ J]` with `J` the
 /// Jacobian from the written value to the logits' shift-free part (`draws` Rademacher cotangents,

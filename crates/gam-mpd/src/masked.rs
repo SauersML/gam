@@ -64,8 +64,11 @@
 //! ```
 //!
 //! `g` the KL's gradient at the written value and `F` its Fisher ([`box_excess`]). The claim is
-//! about every point of the box, so its error is the worst case: [`box_excess_at`] charges each
-//! sequence the largest exact KL among the points it evaluates, the masks themselves, every
+//! about every point of the box. Its charged cost is our claim's own, local and second order:
+//! [`box_upper`], at every site from its reads in the masked forward, `½ (Σ_off ‖Z_c‖_F)²` in the
+//! site's written Fisher, the most any setting of the off gates adds there, which no refinement of
+//! the library lowers. VPD's global claim is measured, never charged, by an attack:
+//! [`box_excess_at`] finds, per sequence, the largest exact KL among the points it evaluates, the masks themselves, every
 //! layer's vertex (one layer masked, the rest's off gates at 1, which a set whose layers cancel
 //! each other's errors fails), and an adversary's sign ascent in the off gates (charged per word).
 //! That is a lower bound on the worst case. The expectation above is no point of the box, and a
@@ -1348,6 +1351,50 @@ fn box_worst(
     Ok(worst)
 }
 
+/// Our box claim's cost per input (module note, "Claims"): at every site, from its reads in the
+/// masked forward `trace`, the off blocks' outputs `Z_c = U_c z_c` bounded together in the site's
+/// written Fisher `fishers[k]`, `½ (Σ_off ‖Z_c‖_F)²` nats, the largest second-order KL any setting of
+/// the off gates in `[0, 1]` adds there (the triangle inequality), summed over sites. Local to each
+/// site and second order, it is our claim's cost, not a bound on the end-to-end KL, which the
+/// attack measures ([`box_excess_at`]). A refinement of the library cannot lower it: splitting an
+/// off block leaves the sum of its parts' norms no smaller.
+pub fn box_upper(masked: &Masked, trace: &Trace, masks: &[Array2<f64>], fishers: &[Array2<f64>]) -> Result<Array1<f64>, String> {
+    let terms = masked.box_terms(fishers)?;
+    let rows = masks.first().map_or(0, |m| m.nrows());
+    let mut cost = Array1::<f64>::zeros(rows);
+    for k in 0..masked.sites.len() {
+        let z = &trace.values[masked.z[k]];
+        let mask = &masks[k];
+        let mut norms = Array1::<f64>::zeros(rows);
+        if masked.is_rank_one(k) {
+            let own = terms.sites[k][0].row(0);
+            for r in 0..rows {
+                norms[r] = (0..mask.ncols()).filter(|&c| mask[[r, c]] <= 0.0).map(|c| z[[r, c]].abs() * own[c].max(0.0).sqrt()).sum();
+            }
+        } else {
+            let mut start = 0;
+            for (b, &width) in masked.ranks(k).iter().enumerate() {
+                let metric = &terms.sites[k][b];
+                for r in 0..rows {
+                    if mask[[r, b]] <= 0.0 {
+                        let zb = z.slice(s![r, start..start + width]);
+                        norms[r] += zb.dot(&metric.dot(&zb)).max(0.0).sqrt();
+                    }
+                }
+                start += width;
+            }
+        }
+        cost += &(&norms * &norms * 0.5);
+    }
+    Ok(cost)
+}
+
+/// [`box_upper`] at `masks`, from the masked forward of `base` with them.
+pub fn box_upper_at(masked: &Masked, base: &FamilyInputs, masks: &[Array2<f64>], fishers: &[Array2<f64>]) -> Result<Array1<f64>, String> {
+    let trace = masked.program.execute(&masked.family(base, masks), false).map_err(|e| e.to_string())?;
+    box_upper(masked, &trace, masks, fishers)
+}
+
 /// The box claim's expected excess per input over uniform off gates ([`box_excess`]) at `masks`,
 /// on the program's device twin when it has one (module note, "Devices").
 pub fn expected_box_excess_at(masked: &Masked, base: &FamilyInputs, target: &Target, masks: &[Array2<f64>], fishers: &[Array2<f64>]) -> Result<Array1<f64>, String> {
@@ -2208,26 +2255,12 @@ pub fn select_resumable(
         round = resume.round;
         excess_known = resume.excess;
     }
-    // Under the box claim on the CPU, the trace of every gate on, which every layer's vertex
-    // shares up to its own layer.
     // Under the box claim, what its excess reads of the library and the Fishers: fixed here.
     let box_terms = match boxed {
         Some(f) if on_device.is_none() => Some(masked.box_terms(f)?),
         _ => None,
     };
-    // Only its nodes before the last site's mask are ever read, so the rest is dropped.
-    let all_on: Option<Trace> = match boxed {
-        Some(_) if on_device.is_none() && masked.head.is_none() => {
-            let on: Vec<Array2<f64>> = masks.iter().map(|m| Array2::ones(m.dim())).collect();
-            let every = masked.dense_program(&vec![true; masked.sites.len()])?;
-            let mut trace = every.execute(&masked.family(base, &on), false).map_err(|e| e.to_string())?;
-            trace.values.truncate(masked.z.iter().copied().max().unwrap_or(0));
-            Some(trace)
-        }
-        _ => None,
-    };
-    // The exact KL and (under the box claim) excess of a trial's masks, from one forward: the
-    // expected excess read off it, the vertices from the all-on trace.
+    // The exact KL and (under the box claim) our claim's cost of a trial's masks ([`box_upper`]).
     // The corner claim's scores on the CPU through screened heads (module note, "Screened heads"):
     // the current masks' head, and the errors a proposal kept whole hands to the next round.
     let screen = if boxed.is_none() && on_device.is_none() { Screen::new(masked) } else { None };
@@ -2263,10 +2296,9 @@ pub fn select_resumable(
         let family = masked.family(base, trial);
         match boxed {
             None => Ok((score_only(masked, &family, target)?, Array1::zeros(rows))),
-            Some(_) => {
+            Some(f) => {
                 let kl_trial = Selected::forward(masked, &family, target, on_device, false)?.0;
-                let excess = box_worst(masked, base, target, trial, &kl_trial, all_on.as_ref())?;
-                Ok((kl_trial, excess))
+                Ok((kl_trial, box_upper_at(masked, base, trial, f)?))
             }
         }
     };
@@ -2294,8 +2326,8 @@ pub fn select_resumable(
                 if let (Some(screen), Selected::Host(trace, _, _)) = (&screen, &state) {
                     head_base = Some(screen.base(masked, trace));
                 }
-                if let (Some(_), None) = (boxed, &excess_known) {
-                    excess_known = Some(box_worst(masked, base, target, &masks, &kl_now, all_on.as_ref())?);
+                if let (Some(f), None) = (boxed, &excess_known) {
+                    excess_known = Some(box_upper_at(masked, base, &masks, f)?);
                 }
                 let grads = state.mask_gradients(masked, &family, target, on_device)?;
                 // The Fisher diagonal only ranks proposals (the exact forward decides), so it is
@@ -2313,7 +2345,7 @@ pub fn select_resumable(
         let excess_now = match (boxed, excess_known.take()) {
             (None, _) => Array1::zeros(rows),
             (Some(_), Some(known)) => known,
-            (Some(f), None) => box_excess_at(masked, base, target, &masks, f)?,
+            (Some(f), None) => box_upper_at(masked, base, &masks, f)?,
         };
         let mut before = code(&(&kl_now + &excess_now), &listing_now, observations);
         // Each input's predicted flips, best first, as many as its interaction model says pay
@@ -2555,10 +2587,10 @@ pub fn select_resumable(
             }
         };
         let excess_new = match boxed {
-            Some(_) => {
+            Some(f) => {
                 // Kept, this forward serves only the next round's mask gradients.
                 state_new.shrink(masked);
-                box_worst(masked, base, target, &proposed, &kl_new, all_on.as_ref())?
+                box_upper_at(masked, base, &proposed, f)?
             }
             None => Array1::zeros(rows),
         };
@@ -2996,7 +3028,7 @@ pub fn step_pieces(
             let grads = grads.into_iter().zip(box_grads).map(|((m, v, u), (bv, bu))| (m, v + bv, u + bu)).collect::<Vec<_>>();
             // The expectation's gradients steer; the claim's error, its worst case over the box
             // points ([`box_excess_at`]), decides.
-            (kl_now.sum() + box_excess_from(masked, base, target, masks, &kl_now)?.sum(), grads)
+            (kl_now.sum() + box_upper_at(masked, base, masks, &running.fishers)?.sum(), grads)
         }
     };
     // The direction, as the tangent of each operator it moves, on one side of every site and
@@ -3059,11 +3091,11 @@ pub fn step_pieces(
         (Claim::Corner, None) => score_only(masked, &family, target)?.sum(),
         (Claim::Box, Some(on_device)) => {
             let kl_trial = masked.on_lowered(|accelerated| Ok(accelerated.forward(&family, on_device)?.kl.clone()))?;
-            kl_trial.sum() + box_excess_from(masked, base, target, masks, &kl_trial)?.sum()
+            kl_trial.sum() + box_upper_at(masked, base, masks, &running.fishers)?.sum()
         }
         (Claim::Box, None) => {
             let kl_trial = score_only(masked, &family, target)?;
-            kl_trial.sum() + box_excess_from(masked, base, target, masks, &kl_trial)?.sum()
+            kl_trial.sum() + box_upper_at(masked, base, masks, &running.fishers)?.sum()
         }
     }))
 }
