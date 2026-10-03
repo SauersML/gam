@@ -63,7 +63,8 @@ parser.add_argument("--word-delta", choices=["off", "held", "adversarial"], defa
                     help="the per-word adversary's residual: off (0), held (1, the model's own weights), adversarial per word (default: as --delta)")
 parser.add_argument("--site-random", type=int, default=64, help="sites: random subsets of sites tried per passage")
 parser.add_argument("--exhaustive", default=None,
-                    help="sites: comma-separated site-name prefixes (VPD names, e.g. h.0.) whose every subset is tried, every other site native; no search")
+                    help="sites: comma-separated site-name prefixes (VPD names, e.g. h.0.) whose every subset is tried, every other site native; no search. "
+                         "A prefix ending in ':' (e.g. h.0.:,h.1.:) switches all its sites together as one group.")
 parser.add_argument("--sets-first", type=int, default=0, help="the given stems' first passage: they are read from passage SETS_FIRST on")
 parser.add_argument("--passage", type=int, default=None, help="score passage P alone: --offset moves by P and --sets-first is P")
 parser.add_argument("--site-steps", type=int, default=30, help="sites: sign-ascent steps on the continuous switches")
@@ -584,12 +585,15 @@ def site_switches():
 
             if args.exhaustive:
                 # Every subset of the named sites, every other site native: the exact worst corner.
-                chosen = [j for j, n in enumerate(names) if any(n.startswith(p) for p in args.exhaustive.split(","))]
+                prefixes = args.exhaustive.split(",")
+                # Each switch: one site, or (a prefix ending in ':') every site under the prefix together.
+                chosen = [[j for j, n in enumerate(names) if n.startswith(p[:-1])] for p in prefixes if p.endswith(":")] + \
+                    [[j] for j, n in enumerate(names) if any(n.startswith(p) for p in prefixes if not p.endswith(":"))]
                 for subset in range(1 << len(chosen)):
                     sw = torch.zeros((MB, L), device=DEV)
-                    for b, j in enumerate(chosen):
+                    for b, group in enumerate(chosen):
                         if subset >> b & 1:
-                            sw[:, j] = 1
+                            sw[:, group] = 1
                     kl = kl_at(sw).detach()
                     flat = kl.cpu().numpy().ravel()
                     word_corner[sl] = np.maximum(word_corner[sl], flat)
@@ -597,7 +601,7 @@ def site_switches():
                     if subset == (1 << len(chosen)) - 1:
                         all_replaced[sl] = flat
                     if subset and subset & (subset - 1) == 0:
-                        alone[chosen[subset.bit_length() - 1], sl] = flat
+                        alone[chosen[subset.bit_length() - 1][0], sl] = flat
                 word_box[sl] = word_corner[sl]
                 corner_worst[rows] = best.cpu().numpy()
                 box_worst[rows] = corner_worst[rows]
