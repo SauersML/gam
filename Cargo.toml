@@ -306,6 +306,15 @@ codegen-units = 1
 [profile.test.package.gam-models]
 codegen-units = 16
 
+# gam-mpd is one ~50k-line crate whose experiment binaries are rebuilt many times an hour; at
+# codegen-units = 1 a release or test build of it took 30+ min on a loaded machine. Its hot loops
+# live in faer/ndarray kernels, so parallel codegen costs little runtime and buys the iteration.
+[profile.test.package.gam-mpd]
+codegen-units = 16
+
+[profile.release.package.gam-mpd]
+codegen-units = 16
+
 [profile.test.package.gam-event-history]
 codegen-units = 16
 
