@@ -386,10 +386,21 @@ pub(crate) fn vjp_from(
     program: &OperatorProgram, inputs: &FamilyInputs, trace: &Trace, seed_node: usize,
     output: Array2<f64>, keep: Option<&[usize]>,
 ) -> Result<Vec<Option<Array2<f64>>>, ProgramError> {
+    vjp_seeded(program, inputs, trace, std::collections::BTreeMap::from([(seed_node, output)]), keep)
+}
+
+/// Reverse the sum of scalar terms reading several nodes, in one pass. A seed at an internal
+/// node is added to the cotangents arriving from its consumers before its reverse rule runs.
+pub(crate) fn vjp_seeded(
+    program: &OperatorProgram, inputs: &FamilyInputs, trace: &Trace,
+    seeds: std::collections::BTreeMap<usize, Array2<f64>>, keep: Option<&[usize]>,
+) -> Result<Vec<Option<Array2<f64>>>, ProgramError> {
     let interfaces = program.interfaces()?;
     let rows = inputs.rows;
-    if seed_node >= interfaces.len() || output.dim() != (rows, interfaces[seed_node].width()) {
-        return Err(refuse("reverse seed shape does not match its node".to_string()));
+    for (&node, seed) in &seeds {
+        if node >= interfaces.len() || seed.dim() != (rows, interfaces[node].width()) {
+            return Err(refuse("reverse seed shape does not match its node".to_string()));
+        }
     }
     let mut retained = vec![keep.is_none(); program.nodes.len()];
     if let Some(keep) = keep {
@@ -399,7 +410,7 @@ pub(crate) fn vjp_from(
         }
     }
     let mut g: Vec<Option<Array2<f64>>> = vec![None; program.nodes.len()];
-    g[seed_node] = Some(output);
+    for (node, seed) in seeds { g[node] = Some(seed); }
     let value = |node: usize| &trace.values[node];
     fn add(g: &mut [Option<Array2<f64>>], node: usize, term: Array2<f64>) {
         match g[node].as_mut() {
