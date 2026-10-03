@@ -126,6 +126,11 @@ pub mod pieces;
 // kept when the measured total drops.
 pub mod masked;
 
+pub mod explanation;
+
+#[cfg(test)]
+mod explanation_tests;
+
 #[cfg(test)]
 mod masked_tests;
 
@@ -258,6 +263,12 @@ pub mod gates;
 
 // Libraries fitted on one site's own inputs to its second-order code.
 pub mod site_fit;
+
+// Per-input sparse coding of a site's output by its blocks' real contributions, with certified bounds.
+pub mod sparse_code;
+
+#[cfg(test)]
+mod sparse_code_tests;
 
 // Counterfactual response: an explanation's predicted response to declared interventions
 // against the native model's.
