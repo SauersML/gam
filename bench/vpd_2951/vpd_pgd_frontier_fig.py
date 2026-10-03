@@ -2,7 +2,7 @@
 
 Reads the `box` results of `vpd_stepA_honesty.py` (one JSON, every family scored on the same
 passages with `--parts fixed,pgd --delta only --seeds N`): per family the worst KL any PGD restart
-finds after STEPS sign steps (`pgd_restarts[family/delta_adversarial].max`) against
+finds after STEPS sign steps (`pgd_restarts[family/delta_adversarial].max`, filled; the median restart open) against
 `weights_per_word` (each subcomponent on is d_in + d_out - 1 reals). Families are grouped by name:
 `vpd_gt_*` and `vpd_rounded` (VPD's sets at thresholds on its importance, one curve), `vpd_ci`
 (VPD's importance box itself), `ours_corner` (the corner-searched sets), `ours_*` (the box-searched
@@ -21,6 +21,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
 
 parser = argparse.ArgumentParser()
 parser.add_argument("out", type=Path)
@@ -40,7 +41,8 @@ for tag, r in restarts.items():
     name, delta = tag.split("/")
     if delta != "delta_adversarial" or name not in box.get("weights_per_word", {}):
         continue
-    points[name] = (box["weights_per_word"][name] / 1e6, r["max"][args.steps], box["l0"][name])
+    runs = sorted(seed[args.steps] for seed in r["seeds"])
+    points[name] = (box["weights_per_word"][name] / 1e6, r["max"][args.steps], box["l0"][name], float(np.median(runs)))
 
 # (label, colour, marker, names in drawing order, joined by a line)
 groups = [
@@ -64,9 +66,12 @@ ax.set_facecolor("white")
 for label, colour, marker, names, joined in groups:
     if not names:
         continue
-    xs, ys = [points[n][0] for n in names], [points[n][1] for n in names]
+    xs, ys, med = [points[n][0] for n in names], [points[n][1] for n in names], [points[n][3] for n in names]
     ax.plot(xs, ys, color=colour, marker=marker, markersize=11, linewidth=2 if joined and len(names) > 1 else 0,
             markeredgecolor="white", markeredgewidth=1.5, label=label, zorder=3)
+    # The median restart: open markers on a thin dashed line.
+    ax.plot(xs, med, color=colour, marker=marker, markersize=9, linewidth=1 if joined and len(names) > 1 else 0,
+            linestyle="--", markerfacecolor="white", markeredgecolor=colour, markeredgewidth=1.5, zorder=2)
 ax.set_yscale("log")
 ax.set_xlabel("weight numbers run per word (millions)")
 ax.set_ylabel(f"KL per word under VPD's adversary ({args.steps} steps)")
@@ -75,6 +80,8 @@ ax.grid(False)
 for side in ("top", "right"):
     ax.spines[side].set_visible(False)
 ax.legend(frameon=False, loc="upper right")
+ax.text(0.99, 0.02, f"filled: worst of {len(next(iter(restarts.values()))['seeds'])} random restarts   open: median restart",
+        transform=ax.transAxes, ha="right", va="bottom", fontsize=13, color="#555555")
 fig.tight_layout()
 fig.savefig(args.out, dpi=150, facecolor="white")
-print(f"wrote {args.out}: " + ", ".join(f"{n} ({x:.2f}M, {y:.2f})" for n, (x, y, _) in sorted(points.items())))
+print(f"wrote {args.out}: " + ", ".join(f"{n} ({x:.2f}M, max {y:.2f}, median {m:.2f})" for n, (x, y, _, m) in sorted(points.items())))
