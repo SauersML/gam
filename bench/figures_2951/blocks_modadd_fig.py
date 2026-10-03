@@ -29,10 +29,14 @@ order = [
 ]
 order = [(k, label) for k, label in order if k in points]
 
-fig = plt.figure(figsize=(18, 11), dpi=200)
+# The multi-direction blocks that run on some word, by frequency; the panel only when there are any.
+blocks = [b for b in result["blocks"] if b["rank"] >= 2 and b["firing"] > 0 and (b.get("output_spectrum") or b.get("input_spectrum"))]
+fig = plt.figure(figsize=(18 if blocks else 13, 10), dpi=200)
 fig.patch.set_facecolor("white")
-gs = fig.add_gridspec(1, 2, width_ratios=[1.05, 1], wspace=0.32, left=0.2, right=0.97, top=0.86, bottom=0.1)
-
+if blocks:
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.05, 1], wspace=0.32, left=0.2, right=0.97, top=0.84, bottom=0.1)
+else:
+    gs = fig.add_gridspec(1, 1, left=0.24, right=0.97, top=0.84, bottom=0.1)
 ax = fig.add_subplot(gs[0])
 y = np.arange(len(order))[::-1]
 for yi, (key, label) in zip(y, order):
@@ -50,35 +54,27 @@ ax.legend(handles=[Patch(color=RAN_COLOR, label="the weights that ran"), Patch(c
           frameon=False, loc="lower right", fontsize=14)
 xmax = max(points[k]["bits_per_word"] for k, _ in order)
 ax.set_xlim(0, xmax * 1.9)
+ax.xaxis.set_major_locator(plt.MaxNLocator(4))
+ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x / 1000:.0f}k" if x else "0"))
 
-# The multi-direction blocks the code chose, by frequency.
-blocks = [b for b in result["blocks"] if b["rank"] >= 2 and b["firing"] > 0 and (b.get("output_spectrum") or b.get("input_spectrum"))]
-ax2 = fig.add_subplot(gs[1])
 if blocks:
+    ax2 = fig.add_subplot(gs[1])
     spectra, labels = [], []
     for b in blocks:
-        s = b.get("output_spectrum") or b.get("input_spectrum")
         side = "writes" if b.get("output_spectrum") else "reads"
-        if s is None:
-            continue
-        s = np.array(s[1:])
+        s = np.array((b.get("output_spectrum") or b.get("input_spectrum"))[1:])
         spectra.append(s / max(s.sum(), 1e-300))
         site = b["site"].split(".")[-1]
         labels.append(f"{site}, rank {b['rank']}, {side}\n{b['bits']:.0f} bits vs {b['columns_as_rank_one_bits']:.0f} as columns, on {100 * b['firing']:.0f}%")
-    if spectra:
-        image = np.array(spectra)
-        ax2.imshow(image, aspect="auto", cmap="Blues", vmin=0, vmax=1)
-        ax2.set_yticks(range(len(labels)), labels, fontsize=12)
-        ax2.set_xticks(range(image.shape[1]), [str(f) for f in range(1, image.shape[1] + 1)], fontsize=12)
-        ax2.set_xlabel("frequency (share of the block's energy)")
-        for spine in ax2.spines.values():
-            spine.set_visible(False)
-    else:
-        ax2.axis("off")
-else:
-    ax2.axis("off")
-    ax2.text(0, 0.5, "No block of rank 2 or more\nis on for any word:\nevery block that runs is rank one.", fontsize=18, color=INK, transform=ax2.transAxes)
-ax2.set_title("Blocks of rank 2 or more", loc="left", fontsize=20, pad=14)
-fig.suptitle(f"Mod-31 addition: one gate per rank-k block (n = {result['observations']:g})", x=0.02, ha="left", fontsize=24)
+    image = np.array(spectra)
+    ax2.imshow(image, aspect="auto", cmap="Blues", vmin=0, vmax=1)
+    ax2.set_yticks(range(len(labels)), labels, fontsize=12)
+    ax2.set_xticks(range(image.shape[1]), [str(f) for f in range(1, image.shape[1] + 1)], fontsize=12)
+    ax2.set_xlabel("frequency (share of the block's energy)")
+    for spine in ax2.spines.values():
+        spine.set_visible(False)
+    ax2.set_title("Blocks of rank 2 or more that run", loc="left", fontsize=20, pad=14)
+note = "" if blocks else ": no block of rank 2 or more runs on any word"
+fig.suptitle(f"Mod-31 addition, rank-k blocks{note} (n = {result['observations']:g})", x=0.02, ha="left", fontsize=22)
 fig.savefig(out, facecolor="white")
 print(out)
