@@ -460,6 +460,51 @@ impl<'a> Fitting<'a> {
         (single(v), single(u), single(&k), single(&uf), sizes)
     }
 
+    /// Per subcomponent under the current sets: the least any input it runs on saves by it,
+    /// `w[(b + s)² − b²]`, and the most any input it is off on would save by running it,
+    /// `w[b² − ((b − s)⁺)²]` (`b` the input's bound with its sets as they are, `s` the
+    /// subcomponent's real size there): the margins a description price decides it by.
+    fn margins(&self, v: &Array2<f64>, u: &Array2<f64>) -> (Vec<f64>, Vec<f64>) {
+        let c_total = self.pieces;
+        let (v32, u32, k32, uf32, sizes) = self.operands(v, u);
+        let weight = self.scale;
+        let (mut least_on, mut most_off) = (vec![f64::INFINITY; c_total], vec![0.0_f64; c_total]);
+        for start in (0..self.rows()).step_by(CHUNK) {
+            let end = (start + CHUNK).min(self.rows());
+            let chunk = self.chunk(start, end, &v32, &u32, &k32, &uf32, &sizes);
+            let masks = &self.masks[start * c_total..end * c_total];
+            let (on, off) = (0..end - start)
+                .into_par_iter()
+                .fold(
+                    || (vec![f64::INFINITY; c_total], vec![0.0_f64; c_total]),
+                    |(mut on, mut off), r| {
+                        let size = chunk.sizes(r);
+                        let m = &masks[r * c_total..(r + 1) * c_total];
+                        let bound = chunk.left[r] + (0..c_total).filter(|c| m[*c] == 0).map(|c| size[c]).sum::<f64>();
+                        for c in 0..c_total {
+                            if m[c] == 1 {
+                                on[c] = on[c].min(weight * ((bound + size[c]).powi(2) - bound * bound));
+                            } else {
+                                off[c] = off[c].max(weight * (bound * bound - (bound - size[c]).max(0.0).powi(2)));
+                            }
+                        }
+                        (on, off)
+                    },
+                )
+                .reduce(
+                    || (vec![f64::INFINITY; c_total], vec![0.0_f64; c_total]),
+                    |(a_on, a_off), (b_on, b_off)| {
+                        (a_on.iter().zip(&b_on).map(|(x, y)| x.min(*y)).collect(), a_off.iter().zip(&b_off).map(|(x, y)| x.max(*y)).collect())
+                    },
+                );
+            for c in 0..c_total {
+                least_on[c] = least_on[c].min(on[c]);
+                most_off[c] = most_off[c].max(off[c]);
+            }
+        }
+        (least_on, most_off)
+    }
+
     /// The code of `(v, u)` (module note); with `flip`, every input's sets selected first (module
     /// note, "Sets"). Returns the total description and error bits.
     fn code(&mut self, v: &Array2<f64>, u: &Array2<f64>, bits: &Array1<f64>, flip: bool) -> (f64, f64) {
@@ -740,6 +785,62 @@ fn description_bits(describe: &dyn Describe, site: usize, v: &Array2<f64>, u: &A
         .into())
 }
 
+/// Every subcomponent's price for selecting the sets: the description's own where it can decide a
+/// set, its cheap price ([`Describe::cheap`]) where it cannot. The exact description of an evenly
+/// strided sample of `√C` subcomponents bounds the cheap price's error, `exact / cheap ∈ [lo, hi]`;
+/// the sets are selected under the cheap prices, and a subcomponent is priced exactly only when an
+/// input it runs on saves no more than `hi` times its cheap price by it, or an input it is off on
+/// would save at least `lo` times it: where the exact price could flip a set. A description with
+/// no cheap price is priced exactly throughout.
+fn prices(describe: &dyn Describe, site: usize, v: &Array2<f64>, u: &Array2<f64>, fitting: &mut Fitting) -> Result<Array1<f64>, String> {
+    let c_total = v.nrows();
+    let exact = |c: usize| gam_linalg::faer_ndarray::with_nested_parallel(|| describe.bits_at(site, c, u.slice(s![c..c + 1, ..]), v.slice(s![c..c + 1, ..])));
+    let cheap: Option<Vec<f64>> = (0..c_total)
+        .into_par_iter()
+        .map(|c| describe.cheap(site, u.slice(s![c..c + 1, ..]), v.slice(s![c..c + 1, ..])))
+        .collect::<Result<Vec<Option<f64>>, String>>()?
+        .into_iter()
+        .collect();
+    let Some(cheap) = cheap else { return description_bits(describe, site, v, u) };
+    let stride = ((c_total as f64).sqrt() as usize).max(1);
+    let sample: Vec<usize> = (0..c_total).step_by(stride).collect();
+    let sampled: Vec<f64> = sample.par_iter().map(|c| exact(*c)).collect::<Result<_, String>>()?;
+    let ratios: Vec<f64> = sample.iter().zip(&sampled).filter(|(c, _)| cheap[**c] > 0.0).map(|(c, e)| e / cheap[*c]).collect();
+    let lo = ratios.iter().copied().fold(f64::INFINITY, f64::min).min(1.0);
+    let hi = ratios.iter().copied().fold(0.0_f64, f64::max).max(1.0);
+    let mut bits = Array1::from(cheap.clone());
+    for (c, e) in sample.iter().zip(&sampled) {
+        bits[*c] = *e;
+    }
+    fitting.code(v, u, &bits, true);
+    let (least_on, most_off) = fitting.margins(v, u);
+    let close: Vec<usize> = (0..c_total)
+        .filter(|c| c % stride != 0 && (least_on[*c] <= hi * cheap[*c] || most_off[*c] >= lo * cheap[*c]))
+        .collect();
+    let refined: Vec<f64> = close.par_iter().map(|c| exact(*c)).collect::<Result<_, String>>()?;
+    for (c, e) in close.iter().zip(refined) {
+        bits[*c] = e;
+    }
+    Ok(bits)
+}
+
+/// The exact price of every subcomponent some input runs, the cheap one elsewhere: the final
+/// decode's description of the sets selected.
+fn decoded_prices(describe: &dyn Describe, site: usize, v: &Array2<f64>, u: &Array2<f64>, fitting: &Fitting, bits: &Array1<f64>) -> Result<Array1<f64>, String> {
+    let c_total = v.nrows();
+    let rows = fitting.masks.len() / c_total.max(1);
+    let on: Vec<usize> = (0..c_total).filter(|c| (0..rows).any(|t| fitting.masks[t * c_total + c] == 1)).collect();
+    let exact: Vec<f64> = on
+        .par_iter()
+        .map(|c| gam_linalg::faer_ndarray::with_nested_parallel(|| describe.bits_at(site, *c, u.slice(s![*c..*c + 1, ..]), v.slice(s![*c..*c + 1, ..]))))
+        .collect::<Result<_, String>>()?;
+    let mut out = bits.clone();
+    for (c, e) in on.iter().zip(exact) {
+        out[*c] = e;
+    }
+    Ok(out)
+}
+
 /// A given library's code on `samples` (module note), every input's sets selected, and those sets
 /// (per input, the subcomponents on, ascending).
 pub fn measure(site: usize, w: &Array2<f64>, samples: &Samples, describe: &dyn Describe, observations: f64, library: &Library) -> Result<(Round, Vec<Vec<u32>>), String> {
@@ -747,8 +848,10 @@ pub fn measure(site: usize, w: &Array2<f64>, samples: &Samples, describe: &dyn D
         return Err("a measured library reads the uncentred input".to_string());
     }
     let mut fitting = Fitting::new(site, w, samples, observations, library.v.nrows())?;
-    let bits = description_bits(describe, site, &library.v, &library.u)?;
-    let (description, error) = fitting.code(&library.v, &library.u, &bits, true);
+    let bits = prices(describe, site, &library.v, &library.u, &mut fitting)?;
+    fitting.code(&library.v, &library.u, &bits, true);
+    let bits = decoded_prices(describe, site, &library.v, &library.u, &fitting, &bits)?;
+    let (description, error) = fitting.code(&library.v, &library.u, &bits, false);
     let pieces = library.v.nrows();
     let sets = fitting.masks.chunks(pieces).map(|m| (0..pieces as u32).filter(|c| m[*c as usize] == 1).collect()).collect();
     Ok((fitting.report(0, description, error), sets))
@@ -772,7 +875,7 @@ pub fn code_of(site: usize, w: &Array2<f64>, samples: &Samples, describe: &dyn D
             fitting.masks[t * pieces + *c as usize] = 1;
         }
     }
-    let bits = description_bits(describe, site, &library.v, &library.u)?;
+    let bits = decoded_prices(describe, site, &library.v, &library.u, &fitting, &Array1::zeros(pieces))?;
     let (description, error) = fitting.code(&library.v, &library.u, &bits, false);
     Ok(fitting.report(0, description, error))
 }
@@ -856,7 +959,7 @@ pub fn fit(
         }
         _ => fitting.writes_weighted(&v, &Array1::ones(pieces), span)?,
     };
-    let mut bits = description_bits(describe, site, &v, &u)?;
+    let mut bits = prices(describe, site, &v, &u, &mut fitting)?;
     let (description, error) = fitting.code(&v, &u, &bits, true);
     let mut current = description + error;
     let mut report = fitting.report(0, description, error);
@@ -922,7 +1025,7 @@ pub fn fit(
                     grown += 1;
                 }
             }
-            bits = description_bits(describe, site, &v, &u)?;
+            bits = prices(describe, site, &v, &u, &mut fitting)?;
             let (d, e) = fitting.code(&v, &u, &bits, true);
             if grown > 0 && d + e < current {
                 report.reseeded = grown;
@@ -932,7 +1035,7 @@ pub fn fit(
         }
         progress(&report, &Library { v: v.clone(), u: u.clone(), mean: Array1::zeros(d_in) });
         // The next round's sets, under the descriptions as the steps left them.
-        bits = description_bits(describe, site, &v, &u)?;
+        bits = prices(describe, site, &v, &u, &mut fitting)?;
         let (description, error) = fitting.code(&v, &u, &bits, true);
         let previous = report.code;
         report = fitting.report(round + 1, description, error);
@@ -941,6 +1044,10 @@ pub fn fit(
             break;
         }
     }
+    // The final decode: every subcomponent some input runs at its description's own price.
+    let bits = decoded_prices(describe, site, &v, &u, &fitting, &bits)?;
+    let (description, error) = fitting.code(&v, &u, &bits, false);
+    report = Round { description, error, code: description + error, ..report };
     progress(&report, &Library { v: v.clone(), u: u.clone(), mean: Array1::zeros(d_in) });
     Ok(Library { v, u, mean: Array1::zeros(d_in) })
 }

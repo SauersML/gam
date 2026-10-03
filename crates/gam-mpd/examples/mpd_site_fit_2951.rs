@@ -147,18 +147,21 @@ fn main() -> Result<(), String> {
         .map(|(w, g)| gam_mpd::pieces::Site { w: w.clone(), second_moment: g.second_moment.clone(), mean: Array1::zeros(w.ncols()), fisher: g.fisher.clone() })
         .collect();
     // Each subcomponent priced by its exact lattice description in the charts its site's interfaces
-    // declare (heads, rotary planes), re-sent from its last one while a round moves it within a
-    // lattice step (gam_mpd::describe::Structured).
-    let description = gam_mpd::describe::Structured::new(
-        chosen
-            .iter()
-            .zip(&statistics)
-            .map(|(site, measured)| {
-                let (writers, readers) = gam_mpd::describe::declared_charts(model, site)?;
-                gam_mpd::describe::Geometry::new(gam_mpd::describe::Metric::of(measured, observations), writers, readers)
-            })
-            .collect::<Result<_, String>>()?,
-    );
+    // declare (heads, rotary planes) wherever that price could change a set, by Generic's closed
+    // form elsewhere (gam_mpd::describe::Tiered, gam_mpd::site_fit's prices).
+    let description = gam_mpd::describe::Tiered {
+        cheap: gam_mpd::blocks::Generic::new(&statistics, observations),
+        exact: gam_mpd::describe::Structured::new(
+            chosen
+                .iter()
+                .zip(&statistics)
+                .map(|(site, measured)| {
+                    let (writers, readers) = gam_mpd::describe::declared_charts(model, site)?;
+                    gam_mpd::describe::Geometry::new(gam_mpd::describe::Metric::of(measured, observations), writers, readers)
+                })
+                .collect::<Result<_, String>>()?,
+        ),
+    };
     drop(statistics);
     // `library:DIR`: every site's selected sets, written as one CSR at the end.
     let mut selected: Vec<(String, usize, Vec<Vec<u32>>)> = Vec::new();

@@ -1527,3 +1527,29 @@ pub fn declared_charts(program: &super::operator_program::OperatorProgram, site:
     }
     Ok((writers, readers))
 }
+
+/// [`Structured`] for the exact price, with [`super::blocks::Generic`]'s closed form as the cheap
+/// one a fit selects by where the exact price cannot change a set
+/// ([`super::blocks::Describe::cheap`]).
+pub struct Tiered {
+    pub cheap: super::blocks::Generic,
+    pub exact: Structured,
+}
+
+impl super::blocks::Describe for Tiered {
+    fn bits(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<f64, String> {
+        self.exact.bits(site, u, v)
+    }
+
+    fn cheap(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<Option<f64>, String> {
+        Ok(Some(self.cheap.bits(site, u, v)?))
+    }
+
+    fn bits_at(&self, site: usize, index: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<f64, String> {
+        self.exact.bits_at(site, index, u, v)
+    }
+
+    fn decode(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<Option<(Array2<f64>, Array2<f64>, f64)>, String> {
+        self.exact.decode(site, u, v)
+    }
+}

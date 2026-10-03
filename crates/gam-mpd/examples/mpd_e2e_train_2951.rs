@@ -82,18 +82,21 @@ fn main() -> Result<(), String> {
         .zip(&measured)
         .map(|(w, m)| gam_mpd::pieces::Site { w: w.clone(), second_moment: m.second_moment.clone(), mean: Array1::zeros(w.ncols()), fisher: m.fisher.clone() })
         .collect();
-    // Each subcomponent priced by its exact lattice description, re-sent from its last one while
-    // the library's steps keep its reals within a lattice step (gam_mpd::describe::Structured).
-    let description = gam_mpd::describe::Structured::new(
-        chosen
-            .iter()
-            .zip(&statistics)
-            .map(|(site, measured)| {
-                let (writers, readers) = gam_mpd::describe::declared_charts(model, site)?;
-                gam_mpd::describe::Geometry::new(gam_mpd::describe::Metric::of(measured, observations), writers, readers)
-            })
-            .collect::<Result<_, String>>()?,
-    );
+    // Each subcomponent priced by its exact lattice description wherever that price could change a
+    // set, by Generic's closed form elsewhere (gam_mpd::describe::Tiered).
+    let description = gam_mpd::describe::Tiered {
+        cheap: gam_mpd::blocks::Generic::new(&statistics, observations),
+        exact: gam_mpd::describe::Structured::new(
+            chosen
+                .iter()
+                .zip(&statistics)
+                .map(|(site, measured)| {
+                    let (writers, readers) = gam_mpd::describe::declared_charts(model, site)?;
+                    gam_mpd::describe::Geometry::new(gam_mpd::describe::Metric::of(measured, observations), writers, readers)
+                })
+                .collect::<Result<_, String>>()?,
+        ),
+    };
     drop((statistics, measured));
     eprintln!("statistics of {} sites on {train} sequences, {:.0}s", chosen.len(), started.elapsed().as_secs_f64());
     let mut masked = Masked::build_blocks(model, chosen.clone(), libraries, ranks.clone())?;

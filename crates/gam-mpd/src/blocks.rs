@@ -61,6 +61,12 @@ use std::sync::Arc;
 pub trait Describe: Sync {
     fn bits(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<f64, String>;
 
+    /// A cheap estimate of [`Describe::bits`] for the inner loop of a fit, whose error the caller
+    /// bounds by sampling the exact price; `None` when there is none (the exact price throughout).
+    fn cheap(&self, _site: usize, _u: ArrayView2<'_, f64>, _v: ArrayView2<'_, f64>) -> Result<Option<f64>, String> {
+        Ok(None)
+    }
+
     /// [`Describe::bits`] of the block a caller tracks as `index` of site `site` across a fit, so a
     /// description that keeps its last one can re-send it when the block has barely moved; one that
     /// keeps none describes it afresh.
