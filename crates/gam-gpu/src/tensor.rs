@@ -7,15 +7,23 @@
 //! [`Indices`] only, never a driver type, so another backend (ROCm/HIP, whose kernel dialect the
 //! CUDA source below already is) slots in behind the same calls.
 //!
-//! Two backends exist. [`Device::host`] runs every operation on the CPU in float64 with plain
+//! Three backends exist. [`Device::host`] runs every operation on the CPU in float64 with plain
 //! loops; it is the reference the device is tested against and runs everywhere. [`Device::accelerator`]
 //! takes a CUDA device under `gam_gpu`'s policy: products go to cuBLAS (DGEMM, which the A100
 //! and H100 run on their FP64 tensor cores; SGEMM, optionally TF32, for proposals), the rest to
 //! NVRTC-compiled kernels with fused multiply-add contraction off, so each kernel rounds exactly
 //! as its host twin's expression does apart from the summation order of its reductions.
 //!
-//! Every float64 operation is IEEE float64 throughout; [`Arithmetic`] lowers only a product,
-//! and only on request (a proposal that a float64 computation then decides).
+//! On those two every float64 operation is IEEE float64 throughout; [`Arithmetic`] lowers only a
+//! product, and only on request (a proposal that a float64 computation then decides).
+//!
+//! The third, [`Device::single_precision`] on macOS, is the Apple GPU, which has no float64: its
+//! tensors hold f32, every operation runs in f32 (products on Metal Performance Shaders' GEMM,
+//! the rest on MSL kernels compiled with the safe math mode and contraction off, `exp`, `log` and
+//! `tanh` precise, `erfc` the rational approximation of relative error below `1.2·10⁻⁷`), and a
+//! product asked for in float64 is refused ([`GpuError::NoDeviceKernel`]), so float64 work stays
+//! on the host. [`Device::float64`] tells the two kinds apart. Its operations queue on one Metal
+//! command stream and run when the host reads a result (`crate::metal::stream`).
 
 use crate::gpu_error::GpuError;
 use crate::GpuPolicy;
@@ -152,6 +160,8 @@ enum Data {
     Host(Vec<f64>),
     #[cfg(target_os = "linux")]
     Cuda(cudarc::driver::CudaSlice<f64>),
+    #[cfg(target_os = "macos")]
+    Metal(crate::metal::stream::Buffer),
 }
 
 impl Tensor {
@@ -180,10 +190,14 @@ impl Tensor {
         self.len() == 0
     }
 
-    /// The bytes it holds.
+    /// The bytes it holds (four per value on the Apple GPU, eight elsewhere).
     #[must_use]
     pub fn bytes(&self) -> usize {
-        self.len() * 8
+        match &self.data {
+            #[cfg(target_os = "macos")]
+            Data::Metal(_) => self.len() * 4,
+            _ => self.len() * 8,
+        }
     }
 }
 
@@ -197,6 +211,9 @@ enum IndexData {
     Host(Vec<u32>),
     #[cfg(target_os = "linux")]
     Cuda(cudarc::driver::CudaSlice<u32>),
+    /// The device's copy and the host's (a gather checks its ids against the table there).
+    #[cfg(target_os = "macos")]
+    Metal(crate::metal::stream::Buffer, Vec<u32>),
 }
 
 /// Validated contiguous column groups, with their offsets uploaded once.
@@ -232,13 +249,15 @@ enum Backend {
     Host,
     #[cfg(target_os = "linux")]
     Cuda(cuda::Engine),
+    #[cfg(target_os = "macos")]
+    Metal(apple::Engine),
 }
 
 fn shape(detail: String) -> GpuError {
     GpuError::DriverCallFailed { reason: format!("tensor shape mismatch: {detail}") }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn foreign() -> GpuError {
     GpuError::DriverCallFailed { reason: "a tensor used on a device that does not hold it".to_string() }
 }
@@ -246,24 +265,24 @@ fn foreign() -> GpuError {
 fn host(t: &Tensor) -> Result<&[f64], GpuError> {
     match &t.data {
         Data::Host(v) => Ok(v),
-        #[cfg(target_os = "linux")]
-        Data::Cuda(_) => Err(foreign()),
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        _ => Err(foreign()),
     }
 }
 
 fn host_mut(t: &mut Tensor) -> Result<&mut [f64], GpuError> {
     match &mut t.data {
         Data::Host(v) => Ok(v),
-        #[cfg(target_os = "linux")]
-        Data::Cuda(_) => Err(foreign()),
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        _ => Err(foreign()),
     }
 }
 
 fn host_indices(i: &Indices) -> Result<&[u32], GpuError> {
     match &i.data {
         IndexData::Host(v) => Ok(v),
-        #[cfg(target_os = "linux")]
-        IndexData::Cuda(_) => Err(foreign()),
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        _ => Err(foreign()),
     }
 }
 
@@ -325,6 +344,32 @@ impl Device {
         }
     }
 
+    /// The device `policy` selects for single-precision work (proposals, training products): the
+    /// float64 accelerator when there is one, else on macOS the Apple GPU (module note: f32
+    /// only), `None` under `off` or when neither exists.
+    pub fn single_precision(policy: GpuPolicy) -> Result<Option<Self>, GpuError> {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(runtime) = crate::apple_gpu::MetalRuntime::resolve(policy)? else { return Ok(None) };
+            Ok(Some(Self { backend: apple::Engine::shared(runtime)? }))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self::accelerator(policy)
+        }
+    }
+
+    /// Whether every float64 operation runs in IEEE float64 here (the host and CUDA); the Apple
+    /// GPU runs f32 and refuses float64 products.
+    #[must_use]
+    pub fn float64(&self) -> bool {
+        match &*self.backend {
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => false,
+            _ => true,
+        }
+    }
+
     /// Whether this is the CPU reference backend.
     #[must_use]
     pub fn is_host(&self) -> bool {
@@ -338,6 +383,8 @@ impl Device {
             Backend::Host => "host float64".to_string(),
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.name.clone(),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.name.clone(),
         }
     }
 
@@ -347,6 +394,8 @@ impl Device {
             Backend::Host => Ok(None),
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.memory().map(Some),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => Ok(Some(engine.stream.memory())),
         }
     }
 
@@ -356,6 +405,8 @@ impl Device {
             Backend::Host => Ok(()),
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.synchronize(),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.stream.finish(),
         }
     }
 
@@ -377,6 +428,8 @@ impl Device {
             Backend::Host => Data::Host(values),
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => Data::Cuda(engine.upload(&values)?),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => Data::Metal(engine.stream.upload(&values.iter().map(|v| *v as f32).collect::<Vec<f32>>())?),
         };
         Ok(Tensor { rows, cols, data })
     }
@@ -386,6 +439,8 @@ impl Device {
             Backend::Host => IndexData::Host(values.to_vec()),
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => IndexData::Cuda(engine.upload(values)?),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => IndexData::Metal(engine.stream.upload(values)?, values.to_vec()),
         };
         Ok(Indices { len: values.len(), data })
     }
@@ -396,7 +451,12 @@ impl Device {
             #[cfg(target_os = "linux")]
             Data::Cuda(slice) => match &*self.backend {
                 Backend::Cuda(engine) => engine.download(slice)?,
-                Backend::Host => return Err(foreign()),
+                _ => return Err(foreign()),
+            },
+            #[cfg(target_os = "macos")]
+            Data::Metal(buffer) => match &*self.backend {
+                Backend::Metal(engine) => engine.stream.read::<f32>(buffer)?.into_iter().take(t.len()).map(f64::from).collect(),
+                _ => return Err(foreign()),
             },
         };
         Array2::from_shape_vec((t.rows, t.cols), flat).map_err(|e| shape(e.to_string()))
@@ -407,6 +467,8 @@ impl Device {
             Backend::Host => Data::Host(vec![0.0; rows * cols]),
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => Data::Cuda(engine.zeros(rows * cols)?),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => Data::Metal(engine.stream.alloc(rows * cols)?),
         };
         Ok(Tensor { rows, cols, data })
     }
@@ -416,7 +478,9 @@ impl Device {
             (Backend::Host, Data::Host(v)) => Data::Host(v.clone()),
             #[cfg(target_os = "linux")]
             (Backend::Cuda(engine), Data::Cuda(slice)) => Data::Cuda(engine.copy(slice)?),
-            #[cfg(target_os = "linux")]
+            #[cfg(target_os = "macos")]
+            (Backend::Metal(engine), Data::Metal(buffer)) => Data::Metal(engine.copy_range(buffer, 0, t.len())?),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             _ => return Err(foreign()),
         };
         Ok(Tensor { rows: t.rows, cols: t.cols, data })
@@ -461,6 +525,8 @@ impl Device {
             Backend::Host => host_gemm(batch, ab, bb, cb, (alpha, beta), (host(a)?, ta), (host(b)?, tb), host_mut(c)?, arithmetic),
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.gemm(batch, (m, n, k), (alpha, beta), (a, ta), (b, tb), c, arithmetic),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.gemm(batch, (m, n, k), (alpha, beta), (a, ta), (b, tb), c, arithmetic),
         }
     }
 
@@ -476,6 +542,8 @@ impl Device {
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.axpy(y, alpha, x),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.axpy(y, alpha, x),
         }
     }
 
@@ -493,6 +561,8 @@ impl Device {
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.hadamard(out, a, b, accumulate),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.hadamard(out, a, b, accumulate),
         }
     }
 
@@ -512,6 +582,8 @@ impl Device {
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.add_row(x, alpha, row),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.add_row(x, alpha, row),
         }
     }
 
@@ -534,6 +606,8 @@ impl Device {
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.scale_columns(out, x, d, accumulate),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.scale_columns(out, x, d, accumulate),
         }
     }
 
@@ -554,6 +628,8 @@ impl Device {
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.gather_rows(table, ids),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.gather_rows(table, ids),
         }
     }
 
@@ -577,6 +653,8 @@ impl Device {
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.laws(x, None, codes, c),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.laws(x, None, codes, c),
         }
     }
 
@@ -594,6 +672,8 @@ impl Device {
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.laws(x, Some(g), codes, c),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.laws(x, Some(g), codes, c),
         }
     }
 
@@ -654,6 +734,8 @@ impl Device {
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.rms(mode, x, g, epsilon),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.rms(mode, x, g, epsilon),
         }
     }
 
@@ -683,6 +765,8 @@ impl Device {
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.rotate(x, cos, sin, half_split, inverse),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.rotate(x, cos, sin, half_split, inverse),
         }
     }
 
@@ -727,6 +811,8 @@ impl Device {
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.softmax_rows(scores, causal, start),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.softmax_rows(scores, causal, start),
         }
     }
 
@@ -748,6 +834,8 @@ impl Device {
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.softmax_backward(alpha, d),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.softmax_backward(alpha, d),
         }
     }
 
@@ -805,6 +893,8 @@ impl Device {
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.kl_rows(target, logits, scored, gradient),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.kl_rows(target, logits, scored, gradient),
         }
     }
 
@@ -842,6 +932,8 @@ impl Device {
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.sampled_cotangent(logits, uniforms, scored),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.sampled_cotangent(logits, uniforms, scored),
         }
     }
 
@@ -876,6 +968,8 @@ impl Device {
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.block_products(left, right, blocks),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.block_products(left, right, blocks),
         }
     }
 
@@ -915,6 +1009,8 @@ impl Device {
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.sampled_head_cotangent(probabilities, mean, head, transposed, uniforms, scored),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.sampled_head_cotangent(probabilities, mean, head, transposed, uniforms, scored),
         }
     }
 
@@ -936,6 +1032,8 @@ impl Device {
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.softmax_quadratic(logits, tangent),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.softmax_quadratic(logits, tangent),
         }
     }
 
@@ -949,7 +1047,9 @@ impl Device {
             (Backend::Host, Data::Host(v)) => Data::Host(v[lo..hi].to_vec()),
             #[cfg(target_os = "linux")]
             (Backend::Cuda(engine), Data::Cuda(slice)) => Data::Cuda(engine.copy_range(slice, lo, hi)?),
-            #[cfg(target_os = "linux")]
+            #[cfg(target_os = "macos")]
+            (Backend::Metal(engine), Data::Metal(buffer)) => Data::Metal(engine.copy_range(buffer, lo, hi)?),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             _ => return Err(foreign()),
         };
         Ok(Tensor { rows, cols: t.cols, data })
@@ -968,8 +1068,142 @@ impl Device {
             }
             #[cfg(target_os = "linux")]
             (Backend::Cuda(engine), Data::Cuda(slice), Data::Cuda(p)) => engine.write_range(slice, lo, p),
-            #[cfg(target_os = "linux")]
+            #[cfg(target_os = "macos")]
+            (Backend::Metal(engine), Data::Metal(buffer), Data::Metal(p)) => engine.write_range(buffer, lo, p, part.len()),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             _ => Err(foreign()),
+        }
+    }
+
+    /// One Adam step in place: `m ← β₁ m + (1 − β₁) g`, `v ← β₂ v + (1 − β₂) g²`, `w ← w − rate ·
+    /// (m / (1 − β₁ᵗ)) / (√(v / (1 − β₂ᵗ)) + ε)`, `t` the step's number from 1.
+    pub fn adam(&self, w: &mut Tensor, (m, v): (&mut Tensor, &mut Tensor), g: &Tensor, rate: f64, (beta1, beta2, epsilon): (f64, f64, f64), step: u64) -> Result<(), GpuError> {
+        same(w, g, "adam gradient")?;
+        same(w, m, "adam first moment")?;
+        same(w, v, "adam second moment")?;
+        let exponent = i32::try_from(step.max(1)).unwrap_or(i32::MAX);
+        let (c1, c2) = (1.0 - beta1.powi(exponent), 1.0 - beta2.powi(exponent));
+        match &*self.backend {
+            Backend::Host => {
+                let (gv, mv, vv) = (host(g)?, host_mut(m)?, host_mut(v)?);
+                for (i, wi) in host_mut(w)?.iter_mut().enumerate() {
+                    mv[i] = beta1 * mv[i] + (1.0 - beta1) * gv[i];
+                    vv[i] = beta2 * vv[i] + (1.0 - beta2) * gv[i] * gv[i];
+                    *wi -= rate * (mv[i] / c1) / ((vv[i] / c2).sqrt() + epsilon);
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.adam(w, (m, v), g, (rate, beta1, beta2, epsilon), (c1, c2)),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.adam(w, (m, v), g, (rate, beta1, beta2, epsilon), (c1, c2)),
+        }
+    }
+
+    /// Each row's set under a site's own code (`gam_mpd::site_fit`, module note): with `size = |a[r,
+    /// c]| q[r, c]` each subcomponent's real size on the row (its read times its write in the row's
+    /// metric) and `bound = left[r] + Σ_{c off} size`, the set
+    /// minimising `Σ_{c on} bits[c] + weight[r] bound²`: the best prefix of the columns ranked by
+    /// `size / bits` (ties by column) when it codes the row in fewer bits than the set `mask`
+    /// holds, then single flips swept in column order until none lowers it. `mask` (rows × cols, 1
+    /// on, 0 off) holds the current sets and gets the new ones; `a` and `q` are rows × cols, `bits`
+    /// 1 × cols, `left` and `weight` rows × 1.
+    pub fn select_sets(&self, (a, q): (&Tensor, &Tensor), bits: &Tensor, left: &Tensor, weight: &Tensor, mask: &mut Tensor) -> Result<(), GpuError> {
+        same(a, q, "selected sets' metric")?;
+        same(a, mask, "selected sets")?;
+        if bits.dim() != (1, a.cols) || left.dim() != (a.rows, 1) || weight.dim() != (a.rows, 1) {
+            return Err(shape(format!("a site's code on {:?} reads", a.dim())));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (av, qv, bv, lv, wv, cols) = (host(a)?, host(q)?, host(bits)?, host(left)?, host(weight)?, a.cols);
+                let out = host_mut(mask)?;
+                for r in 0..a.rows {
+                    let size: Vec<f64> = (r * cols..(r + 1) * cols).map(|i| av[i].abs() * qv[i]).collect();
+                    let (w, m) = (wv[r], &mut out[r * cols..(r + 1) * cols]);
+                    let ratio = |c: usize| match (bv[c] > 0.0, size[c] > 0.0) {
+                        (true, _) => size[c] / bv[c],
+                        (false, true) => f64::INFINITY,
+                        (false, false) => 0.0,
+                    };
+                    let mut order: Vec<usize> = (0..cols).collect();
+                    order.sort_by(|x, y| ratio(*y).total_cmp(&ratio(*x)));
+                    let all: f64 = size.iter().sum();
+                    let (mut listed, mut bound) = (0.0, lv[r] + all);
+                    let (mut best, mut best_code) = (0, w * bound * bound);
+                    for (k, &c) in order.iter().enumerate() {
+                        listed += bv[c];
+                        bound -= size[c];
+                        let code = listed + w * bound * bound;
+                        if code < best_code {
+                            (best, best_code) = (k + 1, code);
+                        }
+                    }
+                    let held = lv[r] + (0..cols).filter(|c| m[*c] == 0.0).map(|c| size[c]).sum::<f64>();
+                    let held_code = (0..cols).filter(|c| m[*c] == 1.0).map(|c| bv[c]).sum::<f64>() + w * held * held;
+                    if best_code < held_code {
+                        m.fill(0.0);
+                        for &c in &order[..best] {
+                            m[c] = 1.0;
+                        }
+                    }
+                    let mut bound = lv[r] + (0..cols).filter(|c| m[*c] == 0.0).map(|c| size[c]).sum::<f64>();
+                    for _ in 0..cols {
+                        let mut flipped = false;
+                        for c in 0..cols {
+                            let on = m[c] == 1.0;
+                            let next = if on { bound + size[c] } else { (bound - size[c]).max(0.0) };
+                            let delta = if on { -bv[c] } else { bv[c] } + w * (next * next - bound * bound);
+                            if delta < 0.0 {
+                                m[c] = if on { 0.0 } else { 1.0 };
+                                bound = next;
+                                flipped = true;
+                            }
+                        }
+                        if !flipped {
+                            break;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.select_sets((a, q), bits, left, weight, mask),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.select_sets((a, q), bits, left, weight, mask),
+        }
+    }
+
+    /// The box claim's charge at one site (`gam_mpd::masked::box_upper`) and its gradients: per row
+    /// `N_r = Σ_c (1 − m_rc) |z_rc| q_rc`, `q_rc` the subcomponent's write in the row's metric,
+    /// returned as `½ N_r²`; `cot[r, c] += N_r (1 − m_rc) sign(z_rc) q_rc` (its gradient in `z`),
+    /// and `coefficient[r, c] = N_r (1 − m_rc) |z_rc| / q_rc` (its gradient in `q`, over `q`; zero
+    /// where `q` is). Every tensor is rows × cols.
+    pub fn box_charge(&self, z: &Tensor, mask: &Tensor, q: &Tensor, cot: &mut Tensor, coefficient: &mut Tensor) -> Result<Vec<f64>, GpuError> {
+        same(z, mask, "box charge mask")?;
+        same(z, q, "box charge metric")?;
+        same(z, cot, "box charge cotangent")?;
+        same(z, coefficient, "box charge coefficient")?;
+        match &*self.backend {
+            Backend::Host => {
+                let (zv, mv, qv, cols) = (host(z)?, host(mask)?, host(q)?, z.cols);
+                let norms: Vec<f64> = (0..z.rows).map(|r| (r * cols..(r + 1) * cols).map(|i| (1.0 - mv[i]) * zv[i].abs() * qv[i]).sum()).collect();
+                let out = host_mut(cot)?;
+                for (i, o) in out.iter_mut().enumerate() {
+                    let off = 1.0 - mv[i];
+                    if off != 0.0 && zv[i] != 0.0 {
+                        *o += norms[i / cols] * off * zv[i].signum() * qv[i];
+                    }
+                }
+                for (i, o) in host_mut(coefficient)?.iter_mut().enumerate() {
+                    *o = if qv[i] > 0.0 { norms[i / cols] * (1.0 - mv[i]) * zv[i].abs() / qv[i] } else { 0.0 };
+                }
+                Ok(norms.iter().map(|n| 0.5 * n * n).collect())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.box_charge(z, mask, q, cot, coefficient),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.box_charge(z, mask, q, cot, coefficient),
         }
     }
 }
@@ -1325,6 +1559,124 @@ extern "C" __global__ void sampled_head_cotangent(unsigned int rows, unsigned in
     for (unsigned int h = threadIdx.x; h < width; h += BLOCK) {
         u64 index = transposed ? (u64)h * classes + label : (u64)label * width + h;
         out[(u64)r * width + h] = mean[(u64)r * width + h] - head[index];
+    }
+}
+
+extern "C" __global__ void adam(u64 n, double rate, double beta1, double beta2, double epsilon, double c1, double c2,
+    const double* g, double* m, double* v, double* w) {
+    GRID_STRIDE(i, n) {
+        double gi = g[i];
+        double mi = beta1 * m[i] + (1.0 - beta1) * gi;
+        double vi = beta2 * v[i] + (1.0 - beta2) * gi * gi;
+        m[i] = mi;
+        v[i] = vi;
+        w[i] -= rate * (mi / c1) / (sqrt(vi / c2) + epsilon);
+    }
+}
+
+// Whether (ka, ia) ranks before (kb, ib): larger key first, ties by column.
+__device__ bool ranks_before(double ka, unsigned int ia, double kb, unsigned int ib) {
+    return ka > kb || (ka == kb && ia < ib);
+}
+
+// The ranking key of a subcomponent: real size per description bit (unpaid ones first, unless
+// they write nothing).
+__device__ double ranking_key(double size, double bits) {
+    if (bits > 0.0) return size / bits;
+    return size > 0.0 ? __longlong_as_double(0x7ff0000000000000LL) : 0.0;
+}
+
+// One block per row (striding): the row's ranking sorted in its block's scratch (`width` a power
+// of two at least `cols`), then its best prefix and single flips by one thread, as the host's
+// `select_sets`.
+extern "C" __global__ void select_sets(unsigned int rows, unsigned int cols, unsigned int width,
+    const double* a, const double* q, const double* bits, const double* left, const double* weight,
+    double* keys, unsigned int* order, double* sizes, double* mask) {
+    __shared__ double shared[BLOCK];
+    double* key = keys + (u64)blockIdx.x * width;
+    unsigned int* idx = order + (u64)blockIdx.x * width;
+    double* sr = sizes + (u64)blockIdx.x * width;
+    for (unsigned int r = blockIdx.x; r < rows; r += gridDim.x) {
+        double* m = mask + (u64)r * cols;
+        double partial = 0.0, off = 0.0, on_bits = 0.0;
+        for (unsigned int c = threadIdx.x; c < width; c += BLOCK) {
+            if (c < cols) {
+                sr[c] = fabs(a[(u64)r * cols + c]) * q[(u64)r * cols + c];
+                partial += sr[c];
+                if (m[c] == 0.0) off += sr[c]; else on_bits += bits[c];
+                key[c] = ranking_key(sr[c], bits[c]);
+            } else {
+                key[c] = NEG_INF;
+            }
+            idx[c] = c;
+        }
+        double all = block_sum(partial, shared);
+        double held_off = block_sum(off, shared);
+        double held_listed = block_sum(on_bits, shared);
+        for (unsigned int k = 2; k <= width; k <<= 1) {
+            for (unsigned int j = k >> 1; j > 0; j >>= 1) {
+                for (unsigned int i = threadIdx.x; i < width; i += BLOCK) {
+                    unsigned int l = i ^ j;
+                    if (l > i) {
+                        bool first = (i & k) == 0;
+                        bool swap = first ? ranks_before(key[l], idx[l], key[i], idx[i]) : ranks_before(key[i], idx[i], key[l], idx[l]);
+                        if (swap) {
+                            double tk = key[i]; key[i] = key[l]; key[l] = tk;
+                            unsigned int ti = idx[i]; idx[i] = idx[l]; idx[l] = ti;
+                        }
+                    }
+                }
+                __syncthreads();
+            }
+        }
+        if (threadIdx.x == 0) {
+            double w = weight[r], lr = left[r];
+            double listed = 0.0, bound = lr + all;
+            double best_code = w * bound * bound;
+            unsigned int best = 0;
+            for (unsigned int k = 0; k < cols; k++) {
+                unsigned int c = idx[k];
+                listed += bits[c];
+                bound -= sr[c];
+                double code = listed + w * bound * bound;
+                if (code < best_code) { best = k + 1; best_code = code; }
+            }
+            double held = lr + held_off;
+            if (best_code < held_listed + w * held * held) {
+                for (unsigned int c = 0; c < cols; c++) m[c] = 0.0;
+                for (unsigned int k = 0; k < best; k++) m[idx[k]] = 1.0;
+            }
+            bound = lr;
+            for (unsigned int c = 0; c < cols; c++) if (m[c] == 0.0) bound += sr[c];
+            for (unsigned int sweep = 0; sweep < cols; sweep++) {
+                int flipped = 0;
+                for (unsigned int c = 0; c < cols; c++) {
+                    int on = m[c] == 1.0;
+                    double next = on ? bound + sr[c] : fmax(bound - sr[c], 0.0);
+                    double delta = (on ? -bits[c] : bits[c]) + w * (next * next - bound * bound);
+                    if (delta < 0.0) { m[c] = on ? 0.0 : 1.0; bound = next; flipped = 1; }
+                }
+                if (!flipped) break;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void box_charge(unsigned int rows, unsigned int cols, const double* z, const double* mask,
+    const double* q, double* norms, double* cot, double* coefficient) {
+    __shared__ double shared[BLOCK];
+    for (unsigned int r = blockIdx.x; r < rows; r += gridDim.x) {
+        u64 base = (u64)r * cols;
+        double partial = 0.0;
+        for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) partial += (1.0 - mask[base + c]) * fabs(z[base + c]) * q[base + c];
+        double n = block_sum(partial, shared);
+        if (threadIdx.x == 0) norms[r] = n;
+        for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) {
+            double off = 1.0 - mask[base + c], zc = z[base + c], qc = q[base + c];
+            if (off != 0.0 && zc != 0.0) cot[base + c] += n * off * (zc > 0.0 ? 1.0 : -1.0) * qc;
+            coefficient[base + c] = qc > 0.0 ? n * off * fabs(zc) / qc : 0.0;
+        }
     }
 }
 
@@ -1866,6 +2218,57 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
             Ok(out)
         }
 
+        pub(super) fn adam(&self, w: &mut Tensor, (m, v): (&mut Tensor, &mut Tensor), g: &Tensor, (rate, beta1, beta2, epsilon): (f64, f64, f64, f64), (c1, c2): (f64, f64)) -> Result<(), GpuError> {
+            let n = w.len() as u64;
+            let f = self.function("adam")?;
+            // SAFETY: four equal-length buffers, checked by the caller.
+            unsafe {
+                self.stream.launch_builder(&f).arg(&n).arg(&rate).arg(&beta1).arg(&beta2).arg(&epsilon).arg(&c1).arg(&c2)
+                    .arg(slice(g)?).arg(slice_mut(m)?).arg(slice_mut(v)?).arg(slice_mut(w)?).launch(cfg_elements(n))
+            }
+            .gpu_ctx("tensor adam")
+            .map(|_| ())
+        }
+
+        pub(super) fn select_sets(&self, (a, q): (&Tensor, &Tensor), bits: &Tensor, left: &Tensor, weight: &Tensor, mask: &mut Tensor) -> Result<(), GpuError> {
+            if a.is_empty() { return Ok(()); }
+            let (rows, cols) = (a.rows as u32, a.cols as u32);
+            let width = a.cols.next_power_of_two().max(2);
+            // One scratch ranking and row of sizes per block; the blocks stride over the rows.
+            let blocks = a.rows.min(4096);
+            let mut keys = self.zeros(blocks * width)?;
+            let mut sizes = self.zeros(blocks * width)?;
+            let mut order = self.stream.alloc_zeros::<u32>(blocks * width).gpu_ctx("tensor alloc")?;
+            let f = self.function("select_sets")?;
+            let width32 = width as u32;
+            let cfg = LaunchConfig { grid_dim: (blocks as u32, 1, 1), block_dim: (BLOCK, 1, 1), shared_mem_bytes: 0 };
+            // SAFETY: shapes checked by the caller; each block owns `width` scratch entries.
+            unsafe {
+                self.stream.launch_builder(&f).arg(&rows).arg(&cols).arg(&width32)
+                    .arg(slice(a)?).arg(slice(q)?).arg(slice(bits)?).arg(slice(left)?).arg(slice(weight)?)
+                    .arg(&mut keys).arg(&mut order).arg(&mut sizes).arg(slice_mut(mask)?).launch(cfg)
+            }
+            .gpu_ctx("tensor select_sets")
+            .map(|_| ())
+        }
+
+        pub(super) fn box_charge(&self, z: &Tensor, mask: &Tensor, q: &Tensor, cot: &mut Tensor, coefficient: &mut Tensor) -> Result<Vec<f64>, GpuError> {
+            if z.is_empty() { return Ok(vec![0.0; z.rows]); }
+            let (rows, cols) = (z.rows as u32, z.cols as u32);
+            let mut norms = self.zeros(z.rows)?;
+            let f = self.function("box_charge")?;
+            let cfg = LaunchConfig { grid_dim: (z.rows.min(65_535) as u32, 1, 1), block_dim: (BLOCK, 1, 1), shared_mem_bytes: 0 };
+            // SAFETY: equal shapes checked by the caller; one block per row (striding).
+            unsafe {
+                self.stream.launch_builder(&f).arg(&rows).arg(&cols).arg(slice(z)?).arg(slice(mask)?).arg(slice(q)?)
+                    .arg(&mut norms).arg(slice_mut(cot)?).arg(slice_mut(coefficient)?).launch(cfg)
+            }
+            .gpu_ctx("tensor box_charge")?;
+            let mut values = self.download(&norms)?;
+            values.truncate(z.rows);
+            Ok(values.into_iter().map(|n| 0.5 * n * n).collect())
+        }
+
         pub(super) fn softmax_quadratic(&self, logits: &Tensor, tangent: &Tensor) -> Result<Vec<f64>, GpuError> {
             let mut out = self.zeros(logits.rows)?;
             let (rows, cols) = (logits.rows as u32, logits.cols as u32);
@@ -1885,6 +2288,701 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
             let mut values = self.download(&out)?;
             values.truncate(logits.rows);
             Ok(values)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod apple {
+    use super::{Arithmetic, ColumnBlocks, Data, Device, IndexData, Indices, Op, RmsMode, Tensor, foreign, host, shape};
+    use crate::apple_gpu::MetalRuntime;
+    use crate::gpu_error::GpuError;
+    use crate::metal::stream::{Buffer, GROUP, Matrix, Stream};
+
+    /// The kernels: f32 twins of the CUDA ones, one value per thread over a grid-strided range,
+    /// or one threadgroup per row (strided over the rows) reducing in threadgroup memory.
+    const KERNELS: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+#pragma clang fp contract(off)
+
+#define GROUP 256u
+
+// Every kernel's parameters; each reads the fields it names.
+struct P { uint n; uint rows; uint cols; uint extra; uint a; uint b; float alpha; float beta; };
+
+#define ELEMENTS for (uint i = gid; i < p.n; i += grid)
+#define ROWS for (uint r = group; r < p.rows; r += groups)
+
+inline float group_sum(float v, threadgroup float* s, uint t) {
+    s[t] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint w = GROUP / 2; w > 0; w >>= 1) {
+        if (t < w) s[t] += s[t + w];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float r = s[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return r;
+}
+
+inline float group_max(float v, threadgroup float* s, uint t) {
+    s[t] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint w = GROUP / 2; w > 0; w >>= 1) {
+        if (t < w) s[t] = max(s[t], s[t + w]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float r = s[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return r;
+}
+
+kernel void t_copy(device const float* x [[buffer(0)]], device float* y [[buffer(1)]], constant P& p [[buffer(2)]],
+                   uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS y[i] = x[i];
+}
+
+kernel void t_scale(device float* x [[buffer(0)]], constant P& p [[buffer(1)]],
+                    uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS x[i] = p.alpha * x[i];
+}
+
+kernel void t_axpy(device const float* x [[buffer(0)]], device float* y [[buffer(1)]], constant P& p [[buffer(2)]],
+                   uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS y[i] = y[i] + p.alpha * x[i];
+}
+
+kernel void t_hadamard(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]], device float* out [[buffer(2)]],
+                       constant P& p [[buffer(3)]], uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS out[i] = p.a ? out[i] + a[i] * b[i] : a[i] * b[i];
+}
+
+kernel void t_add_row(device const float* row [[buffer(0)]], device float* x [[buffer(1)]], constant P& p [[buffer(2)]],
+                      uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS x[i] = x[i] + p.alpha * row[i % p.cols];
+}
+
+kernel void t_scale_columns(device const float* x [[buffer(0)]], device const float* d [[buffer(1)]], device float* out [[buffer(2)]],
+                            constant P& p [[buffer(3)]], uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS {
+        float term = x[i] * d[i % p.cols];
+        out[i] = p.a ? out[i] + term : term;
+    }
+}
+
+kernel void t_gather_rows(device const float* table [[buffer(0)]], device const uint* ids [[buffer(1)]], device float* out [[buffer(2)]],
+                          constant P& p [[buffer(3)]], uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS out[i] = table[ids[i / p.cols] * p.cols + i % p.cols];
+}
+
+// erfc to a relative error below 1.2e-7 (Numerical Recipes' erfcc, a Chebyshev fit).
+inline float gam_erfc(float x) {
+    float z = fabs(x);
+    float t = 1.0f / (1.0f + 0.5f * z);
+    float poly = -1.26551223f + t * (1.00002368f + t * (0.37409196f + t * (0.09678418f + t * (-0.18628806f + t * (0.27886807f
+        + t * (-1.13520398f + t * (1.48851587f + t * (-0.82215223f + t * 0.17087277f))))))));
+    float r = t * exp(-z * z + poly);
+    return x >= 0.0f ? r : 2.0f - r;
+}
+
+inline float law_value(uint code, float t, float c) {
+    switch (code) {
+        case 0: return t > 0.0f ? t : 0.0f;
+        case 1: return t;
+        case 2: return 0.0f;
+        case 3: return t / (1.0f + exp(-t));
+        case 4: return t * (0.5f * gam_erfc(-t * 0.70710678118654752f));
+        default: {
+            float inner = c * (t + 0.044715f * t * t * t);
+            return 0.5f * t * (1.0f + tanh(inner));
+        }
+    }
+}
+
+inline float law_slope(uint code, float t, float c) {
+    switch (code) {
+        case 0: return t > 0.0f ? 1.0f : 0.0f;
+        case 1: return 1.0f;
+        case 2: return 0.0f;
+        case 3: {
+            float sigma = 1.0f / (1.0f + exp(-t));
+            return sigma * (1.0f + t * (1.0f - sigma));
+        }
+        case 4: return 0.5f * gam_erfc(-t * 0.70710678118654752f) + t * (exp(-0.5f * t * t) * 0.39894228040143268f);
+        default: {
+            float inner = c * (t + 0.044715f * t * t * t);
+            float th = tanh(inner);
+            return 0.5f * (1.0f + th) + 0.5f * t * (1.0f - th * th) * c * (1.0f + 3.0f * 0.044715f * t * t);
+        }
+    }
+}
+
+// a: slopes (out = g f'(x)) or values (out = f(x)); alpha: the tanh GELU's constant.
+kernel void t_laws(device const float* x [[buffer(0)]], device const float* g [[buffer(1)]], device const uint* codes [[buffer(2)]],
+                   device float* out [[buffer(3)]], constant P& p [[buffer(4)]],
+                   uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS {
+        uint code = codes[i % p.cols];
+        out[i] = p.a ? g[i] * law_slope(code, x[i], p.alpha) : law_value(code, x[i], p.alpha);
+    }
+}
+
+// a: 0 value, 1 cotangent given g, 2 tangent along g; alpha: epsilon.
+kernel void t_rms(device const float* x [[buffer(0)]], device const float* g [[buffer(1)]], device float* out [[buffer(2)]],
+                  constant P& p [[buffer(3)]], uint group [[threadgroup_position_in_grid]],
+                  uint groups [[threadgroups_per_grid]], uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float shared[GROUP];
+    ROWS {
+        device const float* xr = x + (ulong)r * p.cols;
+        device const float* gr = g + (ulong)r * p.cols;
+        device float* o = out + (ulong)r * p.cols;
+        float squares = 0.0f, inner = 0.0f;
+        for (uint c = t; c < p.cols; c += GROUP) {
+            squares += xr[c] * xr[c];
+            if (p.a != 0) inner += xr[c] * gr[c];
+        }
+        float n = (float)p.cols;
+        float mean = group_sum(squares, shared, t) / n;
+        float scale = 1.0f / sqrt(mean + p.alpha);
+        float dot = group_sum(inner, shared, t);
+        if (p.a == 0) {
+            for (uint c = t; c < p.cols; c += GROUP) o[c] = xr[c] * scale;
+        } else if (p.a == 1) {
+            for (uint c = t; c < p.cols; c += GROUP) o[c] = scale * gr[c] - scale * scale * scale / n * xr[c] * dot;
+        } else {
+            float dm = 2.0f * dot / n;
+            float ds = -0.5f * scale * scale * scale * dm;
+            for (uint c = t; c < p.cols; c += GROUP) o[c] = gr[c] * scale + xr[c] * ds;
+        }
+    }
+}
+
+// n: rows · planes; extra: planes; a: half split; alpha: the sine's sign. `out` holds `x` already.
+kernel void t_rotate(device const float* x [[buffer(0)]], device const float* cosines [[buffer(1)]], device const float* sines [[buffer(2)]],
+                     device float* out [[buffer(3)]], constant P& p [[buffer(4)]],
+                     uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS {
+        uint r = i / p.extra, k = i % p.extra;
+        uint a = p.a ? k : 2 * k;
+        uint b = p.a ? k + p.extra : 2 * k + 1;
+        float c = cosines[i], s = p.alpha * sines[i];
+        float xa = x[r * p.cols + a], xb = x[r * p.cols + b];
+        out[r * p.cols + a] = c * xa - s * xb;
+        out[r * p.cols + b] = s * xa + c * xb;
+    }
+}
+
+// a: causal; extra: the tile's first query position.
+kernel void t_softmax_rows(device float* s [[buffer(0)]], constant P& p [[buffer(1)]], uint group [[threadgroup_position_in_grid]],
+                           uint groups [[threadgroups_per_grid]], uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float shared[GROUP];
+    ROWS {
+        device float* row = s + (ulong)r * p.cols;
+        uint valid = p.a ? min(p.extra + r % p.cols + 1, p.cols) : p.cols;
+        float m = -INFINITY;
+        for (uint c = t; c < valid; c += GROUP) m = max(m, row[c]);
+        m = group_max(m, shared, t);
+        float total = 0.0f;
+        for (uint c = t; c < p.cols; c += GROUP) {
+            if (c < valid) {
+                float e = exp(row[c] - m);
+                row[c] = e;
+                total += e;
+            } else {
+                row[c] = 0.0f;
+            }
+        }
+        total = group_sum(total, shared, t);
+        for (uint c = t; c < valid; c += GROUP) row[c] = row[c] / total;
+    }
+}
+
+kernel void t_softmax_backward(device const float* alpha [[buffer(0)]], device const float* d [[buffer(1)]], device float* out [[buffer(2)]],
+                               constant P& p [[buffer(3)]], uint group [[threadgroup_position_in_grid]],
+                               uint groups [[threadgroups_per_grid]], uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float shared[GROUP];
+    ROWS {
+        device const float* a = alpha + (ulong)r * p.cols;
+        device const float* dr = d + (ulong)r * p.cols;
+        float partial = 0.0f;
+        for (uint c = t; c < p.cols; c += GROUP) partial += a[c] * dr[c];
+        float mean = group_sum(partial, shared, t);
+        for (uint c = t; c < p.cols; c += GROUP) out[(ulong)r * p.cols + c] = a[c] * (dr[c] - mean);
+    }
+}
+
+// The row's max and the sum of exp(z − max).
+inline float2 softmax_stats(device const float* z, uint cols, threadgroup float* shared, uint t) {
+    float m = -INFINITY;
+    for (uint c = t; c < cols; c += GROUP) m = max(m, z[c]);
+    m = group_max(m, shared, t);
+    float total = 0.0f;
+    for (uint c = t; c < cols; c += GROUP) total += exp(z[c] - m);
+    return float2(m, group_sum(total, shared, t));
+}
+
+// a: rows flagged by `scored`; b: write the cotangent q − p in place of the logits.
+kernel void t_kl_rows(device const float* target [[buffer(0)]], device float* logits [[buffer(1)]], device const uint* scored [[buffer(2)]],
+                      device float* kl [[buffer(3)]], constant P& p [[buffer(4)]], uint group [[threadgroup_position_in_grid]],
+                      uint groups [[threadgroups_per_grid]], uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float shared[GROUP];
+    ROWS {
+        device const float* tr = target + (ulong)r * p.cols;
+        device float* z = logits + (ulong)r * p.cols;
+        if (p.a != 0 && scored[r] == 0) {
+            if (p.b != 0) for (uint c = t; c < p.cols; c += GROUP) z[c] = 0.0f;
+            if (t == 0) kl[r] = 0.0f;
+            continue;
+        }
+        float2 st = softmax_stats(tr, p.cols, shared, t);
+        float2 sz = softmax_stats(z, p.cols, shared, t);
+        float lt = log(st.y), lz = log(sz.y);
+        float acc = 0.0f;
+        for (uint c = t; c < p.cols; c += GROUP) {
+            float q = exp(tr[c] - st.x) / st.y;
+            float log_p = (tr[c] - st.x) - lt;
+            float log_q = (z[c] - sz.x) - lz;
+            if (q > 0.0f) acc += q * (log_p - log_q);
+            if (p.b != 0) z[c] = exp(z[c] - sz.x) / sz.y - q;
+        }
+        float total = group_sum(acc, shared, t);
+        if (t == 0) kl[r] = total;
+    }
+}
+
+// The first class whose cumulative probability passes `pick` (the last if none does): each thread
+// sums a contiguous chunk of the row, then one thread walks the chunk sums and the chosen chunk.
+inline uint pick_label(device const float* q, uint cols, float pick, threadgroup float* shared, threadgroup uint* label, uint t) {
+    uint chunk = (cols + GROUP - 1) / GROUP;
+    uint lo = min(t * chunk, cols), hi = min(lo + chunk, cols);
+    float part = 0.0f;
+    for (uint c = lo; c < hi; c++) part += q[c];
+    shared[t] = part;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t == 0) {
+        uint chosen = cols - 1;
+        float left = pick;
+        for (uint k = 0; k < GROUP; k++) {
+            if (left < shared[k]) {
+                uint start = k * chunk, end = min(start + chunk, cols);
+                chosen = end - 1;
+                for (uint c = start; c < end; c++) {
+                    if (left < q[c]) { chosen = c; break; }
+                    left -= q[c];
+                }
+                break;
+            }
+            left -= shared[k];
+        }
+        *label = chosen;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint chosen = *label;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return chosen;
+}
+
+// a: rows flagged by `scored`.
+kernel void t_sampled_cotangent(device float* logits [[buffer(0)]], device const float* uniforms [[buffer(1)]], device const uint* scored [[buffer(2)]],
+                                constant P& p [[buffer(3)]], uint group [[threadgroup_position_in_grid]],
+                                uint groups [[threadgroups_per_grid]], uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float shared[GROUP];
+    threadgroup uint label;
+    ROWS {
+        device float* z = logits + (ulong)r * p.cols;
+        if (p.a != 0 && scored[r] == 0) {
+            for (uint c = t; c < p.cols; c += GROUP) z[c] = 0.0f;
+            continue;
+        }
+        float2 s = softmax_stats(z, p.cols, shared, t);
+        for (uint c = t; c < p.cols; c += GROUP) z[c] = exp(z[c] - s.x) / s.y;
+        threadgroup_barrier(mem_flags::mem_device);
+        uint chosen = pick_label(z, p.cols, uniforms[r], shared, &label, t);
+        for (uint c = t; c < p.cols; c += GROUP) z[c] = z[c] - ((c == chosen) ? 1.0f : 0.0f);
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+}
+
+// n: rows · blocks; extra: blocks.
+kernel void t_block_products(device const float* left [[buffer(0)]], device const float* right [[buffer(1)]], device const uint* offsets [[buffer(2)]],
+                             device float* out [[buffer(3)]], constant P& p [[buffer(4)]],
+                             uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS {
+        uint row = i / p.extra, block = i % p.extra;
+        float sum = 0.0f;
+        for (uint c = offsets[block]; c < offsets[block + 1]; c++) sum += left[row * p.cols + c] * right[row * p.cols + c];
+        out[i] = sum;
+    }
+}
+
+// cols: classes; extra: width; a: rows flagged by `scored`; b: the head stored transposed.
+kernel void t_sampled_head(device const float* probabilities [[buffer(0)]], device const float* mean [[buffer(1)]], device const float* head [[buffer(2)]],
+                           device const float* uniforms [[buffer(3)]], device const uint* scored [[buffer(4)]], device float* out [[buffer(5)]],
+                           constant P& p [[buffer(6)]], uint group [[threadgroup_position_in_grid]],
+                           uint groups [[threadgroups_per_grid]], uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float shared[GROUP];
+    threadgroup uint label;
+    ROWS {
+        if (p.a != 0 && scored[r] == 0) {
+            for (uint h = t; h < p.extra; h += GROUP) out[(ulong)r * p.extra + h] = 0.0f;
+            continue;
+        }
+        uint chosen = pick_label(probabilities + (ulong)r * p.cols, p.cols, uniforms[r], shared, &label, t);
+        for (uint h = t; h < p.extra; h += GROUP) {
+            ulong index = p.b ? (ulong)h * p.cols + chosen : (ulong)chosen * p.extra + h;
+            out[(ulong)r * p.extra + h] = mean[(ulong)r * p.extra + h] - head[index];
+        }
+    }
+}
+
+kernel void t_softmax_quadratic(device const float* logits [[buffer(0)]], device const float* tangent [[buffer(1)]], device float* out [[buffer(2)]],
+                                constant P& p [[buffer(3)]], uint group [[threadgroup_position_in_grid]],
+                                uint groups [[threadgroups_per_grid]], uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float shared[GROUP];
+    ROWS {
+        device const float* z = logits + (ulong)r * p.cols;
+        device const float* tr = tangent + (ulong)r * p.cols;
+        float2 s = softmax_stats(z, p.cols, shared, t);
+        float partial = 0.0f;
+        for (uint c = t; c < p.cols; c += GROUP) partial += exp(z[c] - s.x) / s.y * tr[c];
+        float mean = group_sum(partial, shared, t);
+        partial = 0.0f;
+        for (uint c = t; c < p.cols; c += GROUP) {
+            float q = exp(z[c] - s.x) / s.y;
+            partial += q * (tr[c] - mean) * (tr[c] - mean);
+        }
+        float total = group_sum(partial, shared, t);
+        if (t == 0) out[r] = total;
+    }
+}
+
+// alpha: rate; beta: ε; the moments' decays and bias corrections in `adam` (buffer 4).
+struct Adam { float beta1; float beta2; float c1; float c2; };
+
+kernel void t_adam(device float* w [[buffer(0)]], device float* m [[buffer(1)]], device float* v [[buffer(2)]], device const float* g [[buffer(3)]],
+                   constant Adam& adam [[buffer(4)]], constant P& p [[buffer(5)]],
+                   uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS {
+        m[i] = adam.beta1 * m[i] + (1.0f - adam.beta1) * g[i];
+        v[i] = adam.beta2 * v[i] + (1.0f - adam.beta2) * g[i] * g[i];
+        w[i] = w[i] - p.alpha * (m[i] / adam.c1) / (sqrt(v[i] / adam.c2) + p.beta);
+    }
+}
+"#;
+
+    const NAMES: &[&str] = &[
+        "t_copy",
+        "t_scale",
+        "t_axpy",
+        "t_hadamard",
+        "t_add_row",
+        "t_scale_columns",
+        "t_gather_rows",
+        "t_laws",
+        "t_rms",
+        "t_rotate",
+        "t_softmax_rows",
+        "t_softmax_backward",
+        "t_kl_rows",
+        "t_sampled_cotangent",
+        "t_block_products",
+        "t_sampled_head",
+        "t_softmax_quadratic",
+        "t_adam",
+    ];
+
+    /// The parameters of every kernel (MSL `P`).
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct P {
+        n: u32,
+        rows: u32,
+        cols: u32,
+        extra: u32,
+        a: u32,
+        b: u32,
+        alpha: f32,
+        beta: f32,
+    }
+
+    fn u32_of(n: usize) -> Result<u32, GpuError> {
+        u32::try_from(n).map_err(|_| shape(format!("{n} exceeds the Apple GPU kernels' 32-bit indices")))
+    }
+
+    fn buffer(t: &Tensor) -> Result<&Buffer, GpuError> {
+        match &t.data {
+            Data::Metal(b) => Ok(b),
+            _ => Err(foreign()),
+        }
+    }
+
+    fn index_buffer(i: &Indices) -> Result<&Buffer, GpuError> {
+        match &i.data {
+            IndexData::Metal(b, _) => Ok(b),
+            _ => Err(foreign()),
+        }
+    }
+
+    fn whole(b: &Buffer) -> (&Buffer, usize) {
+        (b, 0)
+    }
+
+    /// Threadgroups for `n` values, one per thread.
+    fn spread(n: usize) -> usize {
+        n.div_ceil(GROUP)
+    }
+
+    /// The Apple GPU's tensor engine: its stream and a name for reports.
+    pub(super) struct Engine {
+        pub(super) name: String,
+        pub(super) stream: Stream,
+        /// The row flags of a call that scores every row (never read).
+        every_row: Buffer,
+    }
+
+    impl Engine {
+        /// The process's engine on the device Metal resolved, built once.
+        pub(super) fn shared(runtime: &'static MetalRuntime) -> Result<std::sync::Arc<super::Backend>, GpuError> {
+            static ENGINE: std::sync::OnceLock<Result<std::sync::Arc<super::Backend>, GpuError>> = std::sync::OnceLock::new();
+            ENGINE
+                .get_or_init(|| {
+                    let stream = Stream::new(&runtime.context, KERNELS, NAMES)?;
+                    let every_row = stream.alloc(1)?;
+                    let name = format!("{} (Metal, f32)", stream.device_name());
+                    Ok(std::sync::Arc::new(super::Backend::Metal(Self { name, stream, every_row })))
+                })
+                .clone()
+        }
+
+        fn tensor(&self, rows: usize, cols: usize) -> Result<Tensor, GpuError> {
+            Ok(Tensor { rows, cols, data: Data::Metal(self.stream.alloc(rows * cols)?) })
+        }
+
+        fn elements(&self, kernel: &'static str, buffers: &[(&Buffer, usize)], n: usize, mut p: P) -> Result<(), GpuError> {
+            p.n = u32_of(n)?;
+            self.stream.dispatch(kernel, buffers, &p, spread(n))
+        }
+
+        fn rows(&self, kernel: &'static str, buffers: &[(&Buffer, usize)], rows: usize, cols: usize, mut p: P) -> Result<(), GpuError> {
+            u32_of(rows.saturating_mul(cols))?;
+            p.rows = u32_of(rows)?;
+            p.cols = u32_of(cols)?;
+            self.stream.dispatch(kernel, buffers, &p, rows)
+        }
+
+        pub(super) fn copy_range(&self, source: &Buffer, lo: usize, hi: usize) -> Result<Buffer, GpuError> {
+            let out = self.stream.alloc(hi - lo)?;
+            self.elements("t_copy", &[(source, lo), whole(&out)], hi - lo, P::default())?;
+            Ok(out)
+        }
+
+        pub(super) fn write_range(&self, target: &Buffer, lo: usize, part: &Buffer, n: usize) -> Result<(), GpuError> {
+            self.elements("t_copy", &[whole(part), (target, lo)], n, P::default())
+        }
+
+        pub(super) fn gemm(
+            &self,
+            batch: usize,
+            (m, n, k): (usize, usize, usize),
+            (alpha, beta): (f64, f64),
+            (a, ta): (&Tensor, Op),
+            (b, tb): (&Tensor, Op),
+            c: &mut Tensor,
+            arithmetic: Arithmetic,
+        ) -> Result<(), GpuError> {
+            if arithmetic == Arithmetic::F64 {
+                return Err(GpuError::NoDeviceKernel {
+                    reason: format!("{} has no float64: a float64 product runs on the host", self.name),
+                });
+            }
+            if m == 0 || n == 0 {
+                return Ok(());
+            }
+            if k == 0 {
+                // An empty sum: `c ← β c`.
+                let p = P { alpha: beta as f32, ..P::default() };
+                return self.elements("t_scale", &[whole(buffer(c)?)], c.len(), p);
+            }
+            // TF32 asks for no more than f32 delivers: both run as f32.
+            let left = Matrix { buffer: buffer(a)?, rows: a.rows / batch, cols: a.cols, transposed: ta == Op::T };
+            let right = Matrix { buffer: buffer(b)?, rows: b.rows / batch, cols: b.cols, transposed: tb == Op::T };
+            let result = Matrix { buffer: buffer(c)?, rows: c.rows / batch, cols: c.cols, transposed: false };
+            self.stream.gemm(batch, left, right, result, (m, n, k), (alpha, beta))
+        }
+
+        pub(super) fn axpy(&self, y: &mut Tensor, alpha: f64, x: &Tensor) -> Result<(), GpuError> {
+            self.elements("t_axpy", &[whole(buffer(x)?), whole(buffer(y)?)], y.len(), P { alpha: alpha as f32, ..P::default() })
+        }
+
+        pub(super) fn hadamard(&self, out: &mut Tensor, a: &Tensor, b: &Tensor, accumulate: bool) -> Result<(), GpuError> {
+            let p = P { a: u32::from(accumulate), ..P::default() };
+            self.elements("t_hadamard", &[whole(buffer(a)?), whole(buffer(b)?), whole(buffer(out)?)], out.len(), p)
+        }
+
+        pub(super) fn add_row(&self, x: &mut Tensor, alpha: f64, row: &Tensor) -> Result<(), GpuError> {
+            let p = P { cols: u32_of(x.cols)?, alpha: alpha as f32, ..P::default() };
+            self.elements("t_add_row", &[whole(buffer(row)?), whole(buffer(x)?)], x.len(), p)
+        }
+
+        pub(super) fn scale_columns(&self, out: &mut Tensor, x: &Tensor, d: &Tensor, accumulate: bool) -> Result<(), GpuError> {
+            let p = P { cols: u32_of(out.cols)?, a: u32::from(accumulate), ..P::default() };
+            self.elements("t_scale_columns", &[whole(buffer(x)?), whole(buffer(d)?), whole(buffer(out)?)], out.len(), p)
+        }
+
+        pub(super) fn gather_rows(&self, table: &Tensor, ids: &Indices) -> Result<Tensor, GpuError> {
+            let IndexData::Metal(_, values) = &ids.data else { return Err(foreign()) };
+            if let Some(id) = values.iter().find(|id| **id as usize >= table.rows) {
+                return Err(shape(format!("row {id} of a {}-row table", table.rows)));
+            }
+            let out = self.tensor(ids.len, table.cols)?;
+            let p = P { cols: u32_of(table.cols)?, ..P::default() };
+            self.elements("t_gather_rows", &[whole(buffer(table)?), whole(index_buffer(ids)?), whole(buffer(&out)?)], out.len(), p)?;
+            Ok(out)
+        }
+
+        pub(super) fn laws(&self, x: &Tensor, g: Option<&Tensor>, codes: &Indices, c: f64) -> Result<Tensor, GpuError> {
+            let out = self.tensor(x.rows, x.cols)?;
+            let p = P { cols: u32_of(x.cols)?, a: u32::from(g.is_some()), alpha: c as f32, ..P::default() };
+            let buffers = [whole(buffer(x)?), whole(buffer(g.unwrap_or(x))?), whole(index_buffer(codes)?), whole(buffer(&out)?)];
+            self.elements("t_laws", &buffers, x.len(), p)?;
+            Ok(out)
+        }
+
+        pub(super) fn rms(&self, mode: RmsMode, x: &Tensor, g: Option<&Tensor>, epsilon: f64) -> Result<Tensor, GpuError> {
+            let out = self.tensor(x.rows, x.cols)?;
+            let code = match mode {
+                RmsMode::Value => 0,
+                RmsMode::Backward => 1,
+                RmsMode::Tangent => 2,
+            };
+            let p = P { a: code, alpha: epsilon as f32, ..P::default() };
+            self.rows("t_rms", &[whole(buffer(x)?), whole(buffer(g.unwrap_or(x))?), whole(buffer(&out)?)], x.rows, x.cols, p)?;
+            Ok(out)
+        }
+
+        pub(super) fn rotate(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, half_split: bool, inverse: bool) -> Result<Tensor, GpuError> {
+            let out = Tensor { rows: x.rows, cols: x.cols, data: Data::Metal(self.copy_range(buffer(x)?, 0, x.len())?) };
+            let p = P { cols: u32_of(x.cols)?, extra: u32_of(cos.cols)?, a: u32::from(half_split), alpha: if inverse { -1.0 } else { 1.0 }, ..P::default() };
+            let buffers = [whole(buffer(x)?), whole(buffer(cos)?), whole(buffer(sin)?), whole(buffer(&out)?)];
+            self.elements("t_rotate", &buffers, x.rows * cos.cols, p)?;
+            Ok(out)
+        }
+
+        pub(super) fn softmax_rows(&self, scores: &mut Tensor, causal: bool, start: usize) -> Result<(), GpuError> {
+            let p = P { a: u32::from(causal), extra: u32_of(start)?, ..P::default() };
+            self.rows("t_softmax_rows", &[whole(buffer(scores)?)], scores.rows, scores.cols, p)
+        }
+
+        pub(super) fn softmax_backward(&self, alpha: &Tensor, d: &Tensor) -> Result<Tensor, GpuError> {
+            let out = self.tensor(alpha.rows, alpha.cols)?;
+            self.rows("t_softmax_backward", &[whole(buffer(alpha)?), whole(buffer(d)?), whole(buffer(&out)?)], alpha.rows, alpha.cols, P::default())?;
+            Ok(out)
+        }
+
+        fn flags<'a>(&'a self, scored: Option<&'a Indices>) -> Result<(&'a Buffer, u32), GpuError> {
+            match scored {
+                Some(s) => Ok((index_buffer(s)?, 1)),
+                None => Ok((&self.every_row, 0)),
+            }
+        }
+
+        pub(super) fn kl_rows(&self, target: &Tensor, logits: &mut Tensor, scored: Option<&Indices>, gradient: bool) -> Result<Vec<f64>, GpuError> {
+            let kl = self.stream.alloc(logits.rows)?;
+            let (flags, use_flags) = self.flags(scored)?;
+            let p = P { a: use_flags, b: u32::from(gradient), ..P::default() };
+            let buffers = [whole(buffer(target)?), whole(buffer(logits)?), whole(flags), whole(&kl)];
+            self.rows("t_kl_rows", &buffers, logits.rows, logits.cols, p)?;
+            Ok(self.stream.read::<f32>(&kl)?.into_iter().take(logits.rows).map(f64::from).collect())
+        }
+
+        pub(super) fn sampled_cotangent(&self, logits: &mut Tensor, uniforms: &Tensor, scored: Option<&Indices>) -> Result<(), GpuError> {
+            let (flags, use_flags) = self.flags(scored)?;
+            let p = P { a: use_flags, ..P::default() };
+            self.rows("t_sampled_cotangent", &[whole(buffer(logits)?), whole(buffer(uniforms)?), whole(flags)], logits.rows, logits.cols, p)
+        }
+
+        pub(super) fn block_products(&self, left: &Tensor, right: &Tensor, blocks: &ColumnBlocks) -> Result<Tensor, GpuError> {
+            let out = self.tensor(left.rows, blocks.len())?;
+            let p = P { cols: u32_of(left.cols)?, extra: u32_of(blocks.len())?, ..P::default() };
+            let buffers = [whole(buffer(left)?), whole(buffer(right)?), whole(index_buffer(&blocks.offsets)?), whole(buffer(&out)?)];
+            self.elements("t_block_products", &buffers, out.len(), p)?;
+            Ok(out)
+        }
+
+        pub(super) fn sampled_head_cotangent(
+            &self,
+            probabilities: &Tensor,
+            mean: &Tensor,
+            head: &Tensor,
+            transposed: bool,
+            uniforms: &Tensor,
+            scored: Option<&Indices>,
+        ) -> Result<Tensor, GpuError> {
+            let out = self.tensor(mean.rows, mean.cols)?;
+            let (flags, use_flags) = self.flags(scored)?;
+            let p = P { extra: u32_of(mean.cols)?, a: use_flags, b: u32::from(transposed), ..P::default() };
+            let buffers =
+                [whole(buffer(probabilities)?), whole(buffer(mean)?), whole(buffer(head)?), whole(buffer(uniforms)?), whole(flags), whole(buffer(&out)?)];
+            u32_of(head.len())?;
+            self.rows("t_sampled_head", &buffers, mean.rows, probabilities.cols, p)?;
+            Ok(out)
+        }
+
+        pub(super) fn softmax_quadratic(&self, logits: &Tensor, tangent: &Tensor) -> Result<Vec<f64>, GpuError> {
+            let out = self.stream.alloc(logits.rows)?;
+            self.rows("t_softmax_quadratic", &[whole(buffer(logits)?), whole(buffer(tangent)?), whole(&out)], logits.rows, logits.cols, P::default())?;
+            Ok(self.stream.read::<f32>(&out)?.into_iter().take(logits.rows).map(f64::from).collect())
+        }
+
+        pub(super) fn adam(
+            &self,
+            w: &mut Tensor,
+            (m, v): (&mut Tensor, &mut Tensor),
+            g: &Tensor,
+            (rate, beta1, beta2, epsilon): (f64, f64, f64, f64),
+            (c1, c2): (f64, f64),
+        ) -> Result<(), GpuError> {
+            // The decays and bias corrections, MSL `Adam`.
+            let constants = self.stream.upload(&[beta1 as f32, beta2 as f32, c1 as f32, c2 as f32])?;
+            let p = P { alpha: rate as f32, beta: epsilon as f32, ..P::default() };
+            let buffers = [whole(buffer(w)?), whole(buffer(m)?), whole(buffer(v)?), whole(buffer(g)?), whole(&constants)];
+            self.elements("t_adam", &buffers, w.len(), p)
+        }
+
+        /// `run` on host copies of `inputs` and `outputs`, the outputs then written back: for
+        /// the sequential per-row searches no kernel runs (on unified memory each copy is one
+        /// pass over the values).
+        fn through_host<R>(
+            &self,
+            inputs: &[&Tensor],
+            outputs: &mut [&mut Tensor],
+            run: impl FnOnce(&Device, &[Tensor], &mut [Tensor]) -> Result<R, GpuError>,
+        ) -> Result<R, GpuError> {
+            let host_device = Device::host();
+            let copy = |t: &Tensor| -> Result<Tensor, GpuError> {
+                let values = self.stream.read::<f32>(buffer(t)?)?.into_iter().take(t.len()).map(f64::from).collect();
+                Ok(Tensor { rows: t.rows, cols: t.cols, data: Data::Host(values) })
+            };
+            let ins = inputs.iter().map(|t| copy(t)).collect::<Result<Vec<_>, _>>()?;
+            let mut outs = outputs.iter().map(|t| copy(t)).collect::<Result<Vec<_>, _>>()?;
+            let result = run(&host_device, &ins, &mut outs)?;
+            for (t, h) in outputs.iter_mut().zip(&outs) {
+                let values: Vec<f32> = host(h)?.iter().map(|v| *v as f32).collect();
+                t.data = Data::Metal(self.stream.upload(&values)?);
+            }
+            Ok(result)
+        }
+
+        pub(super) fn select_sets(&self, (a, q): (&Tensor, &Tensor), bits: &Tensor, left: &Tensor, weight: &Tensor, mask: &mut Tensor) -> Result<(), GpuError> {
+            self.through_host(&[a, q, bits, left, weight], &mut [mask], |h, i, o| h.select_sets((&i[0], &i[1]), &i[2], &i[3], &i[4], &mut o[0]))
+        }
+
+        pub(super) fn box_charge(&self, z: &Tensor, mask: &Tensor, q: &Tensor, cot: &mut Tensor, coefficient: &mut Tensor) -> Result<Vec<f64>, GpuError> {
+            self.through_host(&[z, mask, q], &mut [cot, coefficient], |h, i, o| {
+                let (cot, coefficient) = o.split_at_mut(1);
+                h.box_charge(&i[0], &i[1], &i[2], &mut cot[0], &mut coefficient[0])
+            })
         }
     }
 }

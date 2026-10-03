@@ -14,6 +14,7 @@
 pub(crate) mod mps;
 pub(crate) mod msl;
 pub(crate) mod ops;
+pub(crate) mod stream;
 
 use crate::apple_gpu::{MetalAbsence, MetalAvailability, MetalDeviceInfo, MetalRuntime};
 use crate::gpu_error::GpuError;
@@ -335,22 +336,23 @@ fn disable_fast_math(options: &MTLCompileOptions) {
     unsafe { msg_send![options, setFastMathEnabled: false] }
 }
 
-fn build_context(device: Retained<Device>) -> Result<MetalContext, GpuError> {
-    let queue = device
-        .newCommandQueue()
-        .ok_or_else(|| gpu_err!("Metal device returned no command queue"))?;
-    let options = safe_compile_options();
-    let source = msl::SOURCE;
+/// A compute pipeline for each of `kernels` in the MSL `source`, compiled with `options`.
+pub(crate) fn compile_pipelines(
+    device: &Device,
+    source: &str,
+    kernels: &[&'static str],
+    options: &MTLCompileOptions,
+) -> Result<Vec<(&'static str, Retained<Pipeline>)>, GpuError> {
     let library = device
-        .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&options))
+        .newLibraryWithSource_options_error(&NSString::from_str(source), Some(options))
         .map_err(|error| {
             gpu_err!(
                 "Metal kernel library failed to compile: {}",
                 error.localizedDescription()
             )
         })?;
-    let mut pipelines = Vec::with_capacity(msl::KERNELS.len());
-    for &kernel in msl::KERNELS {
+    let mut pipelines = Vec::with_capacity(kernels.len());
+    for &kernel in kernels {
         let function = library
             .newFunctionWithName(&NSString::from_str(kernel))
             .ok_or_else(|| gpu_err!("Metal library has no function {kernel}"))?;
@@ -364,6 +366,14 @@ fn build_context(device: Retained<Device>) -> Result<MetalContext, GpuError> {
             })?;
         pipelines.push((kernel, pipeline));
     }
+    Ok(pipelines)
+}
+
+fn build_context(device: Retained<Device>) -> Result<MetalContext, GpuError> {
+    let queue = device
+        .newCommandQueue()
+        .ok_or_else(|| gpu_err!("Metal device returned no command queue"))?;
+    let pipelines = compile_pipelines(&device, msl::SOURCE, msl::KERNELS, &safe_compile_options())?;
     Ok(MetalContext {
         device,
         queue,
