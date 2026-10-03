@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 # MATS cluster status (#2951).
 #
-#   mats-status          our jobs, our CPU/GPU/memory use against the QOS, the node, and others' queue
+#   mats-status          our jobs, their peak memory, our CPU/GPU/memory use against the QOS, the node,
+#                        and others' queue
 #   mats-status NAME     also the last 30 lines of NAME's newest Slurm log and its job history
 set -Eeuo pipefail
 ssh mats bash -s -- "${1:-}" <<'REMOTE'
 name=$1
 squeue -u "$USER" -o '%.7i %.26j %.2t %.10M %.10l %.4C %.7m %.8b %R'
+echo "running jobs' peak memory (RAM, not CPUs, is what fills the node; ask for about 1.5x the peak):"
+for j in $(squeue -u "$USER" -h -t R -o %i); do
+    rss=$(sstat -n -j "$j.batch" -o MaxRSS 2> /dev/null | head -1 | tr -d ' ')
+    printf '  %-7s %-26s asked %-6s peak %s\n' "$j" "$(squeue -h -j "$j" -o %j)" "$(squeue -h -j "$j" -o %m)" "${rss:-?}"
+done
 squeue -u "$USER" -h -o '%t %C %m %b' | awk '
     function gb(m) { return m ~ /G$/ ? m + 0 : m ~ /T$/ ? m * 1024 : m / 1024 }
     { g = ($4 ~ /gpu/) ? substr($4, match($4, /[0-9]+$/)) + 0 : 0
