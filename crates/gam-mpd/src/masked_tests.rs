@@ -495,7 +495,7 @@ fn shrunk_solve_matches_spectral_preconditioning_and_solves_the_shifted_system()
         shifted.diag_mut().mapv_inplace(|v| v + lambda);
         assert!((&actual.dot(&shifted) - &g).iter().all(|v| v.abs() < 1e-11));
     }
-    assert_eq!(shrunk_direction(&Array2::zeros((3, 3)), &Array2::ones((2, 3))).expect("zero"), Array2::<f64>::zeros((2, 3)));
+    assert_eq!(shrunk_direction(&Array2::<f64>::zeros((3, 3)), &Array2::<f64>::ones((2, 3))).expect("zero"), Array2::<f64>::zeros((2, 3)));
 }
 
 #[test]
