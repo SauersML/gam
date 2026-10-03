@@ -1571,6 +1571,26 @@ impl Selected {
         }
     }
 
+    /// Drop everything but what [`Selected::mask_gradients`] reads once the reverse pass is held:
+    /// each site's `z` and the masked nodes' cotangents.
+    fn shrink(&mut self, masked: &Masked) {
+        if let Self::Host(trace, cotangent, Some(back)) = self {
+            let z: std::collections::BTreeSet<usize> = masked.z.iter().copied().collect();
+            let kept: std::collections::BTreeSet<usize> = masked.masked.iter().copied().collect();
+            for (n, value) in trace.values.iter_mut().enumerate() {
+                if !z.contains(&n) {
+                    *value = Array2::zeros((0, 0));
+                }
+            }
+            for (n, cotangent) in back.iter_mut().enumerate() {
+                if !kept.contains(&n) {
+                    *cotangent = None;
+                }
+            }
+            *cotangent = None;
+        }
+    }
+
     /// [`mask_gradients`] of the KL.
     fn mask_gradients(&mut self, masked: &Masked, family: &FamilyInputs, target: &Target, on_device: Option<&DeviceTarget>) -> Result<Vec<Array2<f64>>, String> {
         match self {
@@ -1691,7 +1711,7 @@ pub fn select_observed(
     // (when the last proposal was kept whole, its forward *is* the current state's) and, when
     // nothing was kept, also their gradients (the state did not move).
     let mut next_forward: Option<(Array1<f64>, Selected)> = None;
-    let mut reuse: Option<(Array1<f64>, Selected, Vec<Array2<f64>>)> = None;
+    let mut reuse: Option<(Array1<f64>, Vec<Array2<f64>>)> = None;
     // Under the box claim, the current masks' excess when a round already measured it: sequences
     // are independent, so a kept sequence's is the proposal's and a refused one's is unchanged.
     let mut excess_known: Option<Array1<f64>> = None;
@@ -1705,16 +1725,20 @@ pub fn select_observed(
         Some(f) if on_device.is_none() => Some(BoxTerms::new(masked, f)?),
         _ => None,
     };
+    // Only its nodes before the last site's mask are ever read, so the rest is dropped.
     let all_on: Option<Trace> = match boxed {
         Some(_) if on_device.is_none() && masked.head.is_none() => {
             let on: Vec<Array2<f64>> = masks.iter().map(|m| Array2::ones(m.dim())).collect();
-            Some(masked.program.execute(&masked.family(base, &on), false).map_err(|e| e.to_string())?)
+            let mut trace = masked.program.execute(&masked.family(base, &on), false).map_err(|e| e.to_string())?;
+            trace.values.truncate(masked.z.iter().copied().max().unwrap_or(0));
+            Some(trace)
         }
         _ => None,
     };
     loop {
         let family = masked.family(base, &masks);
-        let (kl_now, state, grads) = match reuse.take() {
+        // The current forward lives only until its gradients (and, once, the Fisher) are read.
+        let (kl_now, grads) = match reuse.take() {
             Some(state) => state,
             None => {
                 let (kl_now, mut state) = match next_forward.take() {
@@ -1727,15 +1751,15 @@ pub fn select_observed(
                     excess_known = Some(box_worst(masked, base, target, &masks, &kl_now, expected, all_on.as_ref())?);
                 }
                 let grads = state.mask_gradients(masked, &family, target, on_device)?;
-                (kl_now, state, grads)
+                // The Fisher diagonal only ranks proposals (the exact forward decides), so it is
+                // measured on the first round and kept: it moves slowly with the masks, and its
+                // passes dominate a round's cost.
+                if curvature.is_none() {
+                    curvature = Some(state.fisher(masked, &family, target, on_device, samples, 0x5EED + round)?);
+                }
+                (kl_now, grads)
             }
         };
-        // The Fisher diagonal only ranks proposals (the exact forward decides), so it is measured
-        // on the first round and kept: it moves slowly with the masks, and its passes dominate a
-        // round's cost.
-        if curvature.is_none() {
-            curvature = Some(state.fisher(masked, &family, target, on_device, samples, 0x5EED + round)?);
-        }
         let curvature = curvature.as_ref().ok_or("no curvature")?;
         let listing_now = coder.bits(&masks);
         // Under the box claim each input's error is its masks' KL plus the box's excess.
@@ -1897,6 +1921,8 @@ pub fn select_observed(
         let excess_new = match boxed {
             Some(f) => {
                 let expected = state_new.expected_excess(masked, &proposed_family, target, &proposed, f, box_terms.as_ref(), on_device)?;
+                // Kept, this forward serves only the next round's mask gradients.
+                state_new.shrink(masked);
                 box_worst(masked, base, target, &proposed, &kl_new, expected, all_on.as_ref())?
             }
             None => Array1::zeros(rows),
@@ -2026,7 +2052,7 @@ pub fn select_observed(
             next_forward = Some((kl_new.clone(), state_new));
         } else if kept == 0 {
             // Nothing moved: this round's forward and gradients still describe the masks.
-            reuse = Some((kl_now.clone(), state, grads));
+            reuse = Some((kl_now.clone(), grads));
         }
         let per_scored = |code: &Array1<f64>| (0..rows).filter(|r| target.scores(*r)).map(|r| code[r]).sum::<f64>() / scored.max(1) as f64;
         log::info!(
@@ -2041,7 +2067,7 @@ pub fn select_observed(
         // selects exactly as each would alone).
         if cap.iter().all(|c| *c == 0) {
             let kl_final = match (next_forward.take(), reuse.take()) {
-                (Some((kl, _)), _) | (None, Some((kl, _, _))) => kl,
+                (Some((kl, _)), _) | (None, Some((kl, _))) => kl,
                 (None, None) => {
                     let family = masked.family(base, &masks);
                     match on_device {
