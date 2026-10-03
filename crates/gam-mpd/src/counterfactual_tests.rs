@@ -1,6 +1,7 @@
-use super::counterfactual::{Decoder, Explained, ExplanationChange, Library, Native, NativeChange, Selection, score, site_name};
-use ndarray::{Array1, Array2};
+use super::counterfactual::{Action, Decoder, Donor, Library, Maps, Program, Rows, Selection, Selector, score, site_index, site_name};
+use ndarray::{Array2, Axis};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// A small random decoder export (2 layers, 2 heads of 4, MLP 16, vocabulary 11).
 fn tiny_export(tag: &str) -> PathBuf {
@@ -53,8 +54,8 @@ fn coordinate_libraries(decoder: &Decoder) -> Vec<Library> {
         .collect()
 }
 
-fn all_on(decoder: &Decoder, libraries: &[Library], rows: usize) -> Selection {
-    let row: Vec<(u32, u32, f64)> = (0..decoder.sites()).flat_map(|k| (0..libraries[k].v.nrows()).map(move |c| (k as u32, c as u32, 1.0))).collect();
+fn all_on(libraries: &[Library], rows: usize) -> Selection {
+    let row: Vec<(u32, u32)> = libraries.iter().enumerate().flat_map(|(k, l)| (0..l.v.nrows()).map(move |c| (k as u32, c as u32))).collect();
     Selection { rows: vec![row; rows] }
 }
 
@@ -62,64 +63,82 @@ fn max_gap(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
     (a - b).iter().fold(0.0_f64, |m, x| m.max(x.abs()))
 }
 
+/// The donor states `actions` read, from one program on `tokens`.
+fn donor(decoder: &Decoder, maps: Maps<'_>, tokens: &[u32], actions: &[Action]) -> Donor {
+    let record = actions.iter().filter_map(Action::donor_state).map(|k| (k, None)).collect();
+    let mut program = Program { maps, actions: &[], donor: None, record };
+    decoder.forward(tokens, &mut program, &[]);
+    Donor { states: program.record.into_iter().map(|(k, v)| (k, v.expect("donor state reached"))).collect() }
+}
+
 #[test]
-fn an_exact_library_all_on_reproduces_every_native_intervention() {
+fn an_exact_library_all_on_reproduces_every_native_action() {
     let dir = tiny_export("exact");
     let decoder = Decoder::from_export(&dir).expect("decoder");
     let libraries = coordinate_libraries(&decoder);
     let tokens: Vec<u32> = (0..9).map(|t| (t * 7 % 11) as u32).collect();
-    let donor: Vec<u32> = (0..9).map(|t| (t * 3 % 11) as u32).collect();
-    let selection = all_on(&decoder, &libraries, tokens.len());
-    let run = |native_change: NativeChange, explanation_change: ExplanationChange| {
-        let mut native = Native { decoder: &decoder, record: Vec::new(), intervention: native_change };
-        let a = decoder.residual(&tokens, &mut native);
-        let mut explained = Explained { libraries: &libraries, selection: &selection, record: Vec::new(), intervention: explanation_change };
-        let b = decoder.residual(&tokens, &mut explained);
-        (a, b)
-    };
-    let (a, b) = run(NativeChange::None, ExplanationChange::None);
-    assert!(max_gap(&a, &b) < 1e-10, "clean: {}", max_gap(&a, &b));
-    // A unit scaled at one row: the native rank-one weight change is the explanation's mask.
-    let site = 4;
-    let (u, v) = (libraries[site].u.row(3).to_owned(), libraries[site].v.row(3).to_owned());
-    let (a, b) = run(NativeChange::Unit { site, row: 5, u, v, scale: 0.5 }, ExplanationChange::Unit { site, row: 5, unit: 3, scale: 0.5 });
-    assert!(max_gap(&a, &b) < 1e-10, "unit: {}", max_gap(&a, &b));
-    let (clean, _) = run(NativeChange::None, ExplanationChange::None);
-    assert!(max_gap(&a, &clean) > 1e-6, "the unit change did nothing");
-    // A site's input patched from a donor.
-    let mut native = Native { decoder: &decoder, record: vec![(7, None)], intervention: NativeChange::None };
-    decoder.residual(&donor, &mut native);
-    let patch: Array1<f64> = native.record[0].1.as_ref().expect("recorded").row(4).to_owned();
-    let (a, b) = run(NativeChange::Input { site: 7, row: 4, input: patch.clone() }, ExplanationChange::Input { site: 7, row: 4, input: patch });
-    assert!(max_gap(&a, &b) < 1e-10, "input: {}", max_gap(&a, &b));
-    // A weight edit equal to one unit's write replaced.
-    let site = 11;
-    let unit = 2;
-    let write: Array1<f64> = libraries[site].u.row(unit).mapv(|x| -2.0 * x + 0.1);
-    let left = (&write - &libraries[site].u.row(unit)).insert_axis(ndarray::Axis(1));
-    let right = libraries[site].v.row(unit).to_owned().insert_axis(ndarray::Axis(1));
-    let (a, b) = run(NativeChange::Edit { site, left, right }, ExplanationChange::Write { site, unit, write });
-    assert!(max_gap(&a, &b) < 1e-10, "edit: {}", max_gap(&a, &b));
-    let (kl, effect, agree) = score(&decoder, &a, &b, &clean, 2, 3);
-    assert!(kl.abs() < 1e-12 && effect > 0.0 && agree == 1.0, "score {kl} {effect} {agree}");
+    let donor_tokens: Vec<u32> = (0..9).map(|t| (t * 3 % 11) as u32).collect();
+    let edit_left = Arc::new(Array2::from_shape_fn((8, 2), |(i, j)| ((i + 3 * j) as f64 * 0.37).sin()));
+    let edit_right = Arc::new(Array2::from_shape_fn((16, 2), |(i, j)| ((2 * i + j) as f64 * 0.21).cos() * 0.2));
+    let cases: Vec<Vec<Action>> = vec![
+        vec![],
+        // A neuron at one row, and a head at every row.
+        vec![Action::ScaleInput { site: site_index(0, 5), rows: Rows::One(4), cols: (3, 4), scale: 0.0 }],
+        vec![Action::ScaleInput { site: site_index(1, 3), rows: Rows::All, cols: (4, 8), scale: 2.0 }],
+        // Resampling a site's input and another site's output, together.
+        vec![
+            Action::MixInput { site: site_index(0, 1), row: 5, alpha: 0.5 },
+            Action::MixOutput { site: site_index(1, 4), row: 6, alpha: 1.0 },
+        ],
+        vec![Action::AddMap { site: site_index(1, 5), left: edit_left, right: edit_right }],
+    ];
+    let rows: Vec<usize> = (0..tokens.len()).collect();
+    let mut clean_native = Program { maps: Maps::Native(&decoder), actions: &[], donor: None, record: Vec::new() };
+    let clean = decoder.forward(&tokens, &mut clean_native, &rows);
+    for actions in &cases {
+        let native_donor = donor(&decoder, Maps::Native(&decoder), &donor_tokens, actions);
+        let mut donor_selection = all_on(&libraries, donor_tokens.len());
+        let own_donor = donor(&decoder, Maps::Units { libraries: &libraries, selector: &mut donor_selection }, &donor_tokens, actions);
+        let interface = [5usize, 7];
+        let mut native = Program { maps: Maps::Native(&decoder), actions, donor: Some(&native_donor), record: Vec::new() };
+        let a = decoder.forward(&tokens, &mut native, &interface);
+        let mut selection = all_on(&libraries, tokens.len());
+        let selector: &mut dyn Selector = &mut selection;
+        let mut explained = Program { maps: Maps::Units { libraries: &libraries, selector }, actions, donor: Some(&own_donor), record: Vec::new() };
+        let b = decoder.forward(&tokens, &mut explained, &interface);
+        assert!(max_gap(&a.residual, &b.residual) < 1e-10, "{actions:?}: {}", max_gap(&a.residual, &b.residual));
+        let from = actions.iter().map(Action::first_row).min().unwrap_or(0);
+        let scores = score(&decoder, &a, &b, &clean, &interface, from, 3);
+        assert!(scores.kl.abs() < 1e-12 && scores.top1_agree == 1.0 && scores.interface_kl.iter().all(|k| k.abs() < 1e-12), "{actions:?}: {scores:?}");
+        if !actions.is_empty() {
+            assert!(scores.native_effect > 1e-9, "{actions:?} changed nothing: {scores:?}");
+        }
+    }
     assert_eq!(site_name(11), "blocks.1.down_proj");
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn an_unselected_unit_is_predicted_to_do_nothing() {
-    let dir = tiny_export("unselected");
+fn a_partial_explanation_is_scored_by_its_disagreement() {
+    let dir = tiny_export("partial");
     let decoder = Decoder::from_export(&dir).expect("decoder");
     let libraries = coordinate_libraries(&decoder);
     let tokens: Vec<u32> = (0..6).map(|t| (t * 5 % 11) as u32).collect();
-    let mut selection = all_on(&decoder, &libraries, tokens.len());
-    // Unit 1 of site 2 is left out at row 3.
-    selection.rows[3].retain(|(k, c, _)| !(*k == 2 && *c == 1));
-    assert!(!selection.has(3, 2, 1) && selection.has(2, 2, 1));
-    let mut before = Explained { libraries: &libraries, selection: &selection, record: Vec::new(), intervention: ExplanationChange::None };
-    let a = decoder.residual(&tokens, &mut before);
-    let mut removed = Explained { libraries: &libraries, selection: &selection, record: Vec::new(), intervention: ExplanationChange::Unit { site: 2, row: 3, unit: 1, scale: 0.0 } };
-    let b = decoder.residual(&tokens, &mut removed);
-    assert!(max_gap(&a, &b) == 0.0);
+    let rows: Vec<usize> = (0..tokens.len()).collect();
+    let mut clean_native = Program { maps: Maps::Native(&decoder), actions: &[], donor: None, record: Vec::new() };
+    let clean = decoder.forward(&tokens, &mut clean_native, &rows);
+    // Half of every site's units at every row.
+    let mut selection = all_on(&libraries, tokens.len());
+    for row in &mut selection.rows {
+        row.retain(|(_, c)| c % 2 == 0);
+    }
+    let selector: &mut dyn Selector = &mut selection;
+    let mut explained = Program { maps: Maps::Units { libraries: &libraries, selector }, actions: &[], donor: None, record: Vec::new() };
+    let b = decoder.forward(&tokens, &mut explained, &[2]);
+    let mut native = Program { maps: Maps::Native(&decoder), actions: &[], donor: None, record: Vec::new() };
+    let a = decoder.forward(&tokens, &mut native, &[2]);
+    let scores = score(&decoder, &a, &b, &clean, &[2], 0, 4);
+    assert!(scores.kl > 1e-6 && scores.native_effect.abs() < 1e-12, "{scores:?}");
+    assert_eq!(clean.layers[0].len_of(Axis(0)), tokens.len());
     std::fs::remove_dir_all(&dir).ok();
 }
