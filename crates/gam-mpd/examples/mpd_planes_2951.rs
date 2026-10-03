@@ -165,11 +165,12 @@ fn selected(coded: &Coded<'_>, mut blocked: Blocked) -> Result<(Blocked, Bits), 
     }
 }
 
-/// A map as balanced rank-r factors `(u: r × d_out, v: r × d_in)` over its singular values beyond
-/// `band` (the whole site's rounding band, so a block that is rounding of the site has none).
-fn factors(w: &Array2<f64>, band: f64) -> Result<(Array2<f64>, Array2<f64>), String> {
+/// A map as balanced factors `(u: r × d_out, v: r × d_in)` over its at most `rank` leading singular
+/// values beyond `band` (the whole site's rounding band, so a block that is rounding of the site
+/// has none).
+fn factors(w: &Array2<f64>, band: f64, rank: usize) -> Result<(Array2<f64>, Array2<f64>), String> {
     let d = svd(w.view(), false).map_err(|e| format!("{e:?}"))?;
-    let kept: Vec<usize> = (0..d.singular_values.len()).filter(|&j| d.singular_values[j] > d.band.max(band)).collect();
+    let kept: Vec<usize> = (0..d.singular_values.len()).filter(|&j| d.singular_values[j] > d.band.max(band)).take(rank).collect();
     let roots = Array1::from_iter(kept.iter().map(|&j| d.singular_values[j].sqrt()));
     let u = (d.u.select(Axis(1), &kept) * &roots).t().to_owned();
     let v = (d.vt.select(Axis(0), &kept).t().to_owned() * &roots).t().to_owned();
@@ -200,7 +201,6 @@ fn planes(w: &Array2<f64>, x: &Array2<f64>, labels: &Array2<usize>, period: usiz
         }
     }
     let mut out = Vec::new();
-    let mut explained = Array2::<f64>::zeros(y.dim());
     for (label, f) in pairs {
         let mut columns = vec![Array1::from_iter((0..rows).map(|r| phase(r, f).cos()))];
         if f != (0, 0) {
@@ -209,16 +209,16 @@ fn planes(w: &Array2<f64>, x: &Array2<f64>, labels: &Array2<usize>, period: usiz
         let basis = Array2::from_shape_fn((rows, columns.len()), |(r, c)| columns[c][r]);
         let q = qr(basis.view(), QrMode::Economic).map_err(|e| format!("{e:?}"))?.q.ok_or("no Q")?;
         let projected = q.dot(&q.t().dot(&y));
-        explained += &projected;
-        let (u, v) = factors(&pinv.dot(&projected).t().to_owned(), band)?;
+        // `Π_f Y` has rank at most its characters' count; what the pseudo-inverse adds beyond that is
+        // its rounding, and goes to the rest.
+        let (u, v) = factors(&pinv.dot(&projected).t().to_owned(), band, columns.len())?;
         if u.nrows() > 0 {
             out.push((label, u, v));
         }
     }
-    // The rest: what the characters above leave of the written values, and W off the reads' span.
-    let span = pinv.dot(x);
-    let rest = pinv.dot(&(&y - &explained)).t().to_owned() + &(w - &w.dot(&span));
-    let (u, v) = factors(&rest, band)?;
+    // The rest: everything the planes leave of W (other characters, W off the reads' span).
+    let rest = out.iter().fold(w.clone(), |acc, (_, u, v)| acc - &u.t().dot(v));
+    let (u, v) = factors(&rest, band, usize::MAX)?;
     if u.nrows() > 0 {
         out.push(("rest".to_string(), u, v));
     }
