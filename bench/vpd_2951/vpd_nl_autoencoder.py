@@ -869,17 +869,23 @@ def stage_dropkl():
 
 
 def stage_program():
-    """Each subcomponent's description bits as a rank-one map: (d_in + d_out - 1) reals at
-    NLAE_BITS_PER_REAL bits (the library's declared precision). Writes sets/program.f64."""
+    """Each subcomponent's description bits under the team's pricing: the exact lattice description
+    in the program's declared charts (examples/mpd_program_bits_2951.rs, `Describe::bits_at`), read
+    from argv[2] (its OUT_DIR, sites in the library's names) and put in VPD's numbering through the
+    library's manifest. Writes sets/program.f64."""
     z, indptr, indices, offsets, names = sets()
-    bits = float(os.environ.get("NLAE_BITS_PER_REAL", "8"))
-    dims = {"q_proj": (768, 768), "k_proj": (768, 768), "v_proj": (768, 768), "o_proj": (768, 768), "c_fc": (768, 3072), "down_proj": (3072, 768)}
-    out = np.zeros(int(offsets[-1]))
-    for s_, n in enumerate(names):
-        d_in, d_out = dims[n.split(".")[-1]]
-        out[offsets[s_]:offsets[s_ + 1]] = (d_in + d_out - 1) * bits
+    src = Path(sys.argv[2])
+    manifest = json.load(open(Path.home() / "mpd-data/pieces/vpd4l_library/manifest.json"))
+    out = np.full(int(offsets[-1]), np.nan)
+    for ours, m in manifest.items():
+        k = names.index(m["vpd"])
+        bits = np.fromfile(src / f"{ours}.bits.f64")
+        assert len(bits) == offsets[k + 1] - offsets[k], f"{ours}: {len(bits)} bits for {offsets[k + 1] - offsets[k]} subcomponents"
+        out[offsets[k]:offsets[k + 1]] = bits
+    assert np.isfinite(out).all(), "a site has no description bits"
     out.tofile(OUT / "sets/program.f64")
-    print(f"program bits per subcomponent: {sorted(set(out.tolist()))}")
+    for k, n in enumerate(names):
+        print(f"{n}: mean {out[offsets[k]:offsets[k + 1]].mean():.0f} bits per subcomponent")
 
 
 def programs_kl(target, C, programs, rows):
@@ -1227,8 +1233,8 @@ if __name__ == "__main__":
               "controls": stage_controls, "names": stage_names, "fluent": stage_fluent,
               "allon": stage_allon, "dropkl": stage_dropkl, "program": stage_program,
               "textonly": stage_textonly, "oracle": stage_oracle}
-    if sys.argv[1] == "oracle":
-        stage_oracle()
+    if sys.argv[1] in ("oracle", "program"):
+        stages[sys.argv[1]]()
         sys.exit(0)
     for stage in sys.argv[1:]:
         stages[stage]()
