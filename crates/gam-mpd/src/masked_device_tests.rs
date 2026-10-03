@@ -93,6 +93,18 @@ fn the_masked_device_path_matches_the_cpu_within_bands() {
             assert_eq!(deferred.kl, state.kl);
             accelerated.prepare_gradient(&mut deferred, &on_device).expect("deferred gradient");
             assert_eq!(accelerated.mask_gradients(&masked, &deferred).expect("deferred masks"), accelerated.mask_gradients(&masked, &state).expect("masks"));
+            let full = accelerated.gradients(&masked, &state, &masks).expect("full gradients");
+            for moves_u in [false, true] {
+                let partial = accelerated.piece_gradients(&masked, &state, moves_u).expect("active side");
+                for (full, partial) in full.iter().zip(partial) {
+                    assert!(partial.0.is_empty());
+                    if moves_u { assert!(partial.1.is_empty()); assert_eq!(partial.2, full.2); }
+                    else { assert!(partial.2.is_empty()); assert_eq!(partial.1, full.1); }
+                }
+            }
+            let full_fisher = accelerated.fisher(&masked, &state, &on_device, 2, 0x5EED, true).expect("full Fisher");
+            let step_fisher = accelerated.step_fisher(&masked, &state, &on_device, 2, 0x5EED).expect("step Fisher");
+            for (full, partial) in full_fisher.iter().zip(step_fisher) { assert!(partial.0.is_empty()); assert_eq!(partial.1, full.1); }
             assert_eq!(accelerated.score_only(&family, &on_device).expect("score only"), state.kl);
             for r in 0..family.rows {
                 if !target.scores(r) {

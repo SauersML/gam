@@ -304,3 +304,41 @@ fn device_operations_agree_with_the_host() {
         assert!((hq[r] - dq[r]).abs() <= gamma(2 * classes + 16) * 4.0, "quadratic row {r}");
     }
 }
+
+#[test]
+fn softmax_supports_rectangular_vocabulary_rows_and_causal_tile_offsets() {
+    let mut devices = vec![Device::host()];
+    devices.extend(accelerator());
+    for d in devices {
+        let mut logits = d.zeros(3, 7).expect("zeros");
+        d.softmax_rows(&mut logits, false).expect("rectangular softmax");
+        assert!(down(&d, &logits).iter().all(|p| (*p - 1.0 / 7.0).abs() < 1e-15));
+        let mut tile = d.zeros(3, 7).expect("zeros");
+        d.softmax_rows_offset(&mut tile, true, 2).expect("causal offset");
+        let tile = down(&d, &tile);
+        for ((r, c), p) in tile.indexed_iter() {
+            let expected = if c <= r + 2 { 1.0 / (r + 3) as f64 } else { 0.0 };
+            assert!((p - expected).abs() < 1e-15);
+        }
+    }
+}
+
+#[test]
+fn proposal_gemm_workspace_handles_shape_changes_accumulation_and_overwrite() {
+    let Some(d) = accelerator() else { return };
+    for arithmetic in [Arithmetic::F32, Arithmetic::Tf32] {
+        // Shrink and then grow independently in each dimension to exercise cached capacities.
+        for (m, n, k) in [(17, 13, 31), (3, 5, 7), (23, 9, 19), (4, 21, 11)] {
+            let a = matrix(m, k, 101, 0.5);
+            let b = matrix(k, n, 103, 0.5);
+            let (ad, bd) = (up(&d, &a), up(&d, &b));
+            let reference = a.dot(&b);
+            let mut c = up(&d, &Array2::from_elem((m, n), f64::NAN));
+            d.gemm(&mut c, 1.0, &ad, Op::N, &bd, Op::N, 0.0, arithmetic).expect("overwrite");
+            let tolerance = k as f64 * arithmetic.unit_roundoff() * 8.0;
+            assert_within("overwrite stale output", &down(&d, &c), &reference, |_, _| tolerance);
+            d.gemm(&mut c, 0.5, &ad, Op::N, &bd, Op::N, 0.25, arithmetic).expect("accumulate");
+            assert_within("accumulate current output", &down(&d, &c), &(&reference * 0.75), |_, _| tolerance);
+        }
+    }
+}

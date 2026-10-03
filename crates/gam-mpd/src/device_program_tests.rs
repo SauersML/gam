@@ -374,3 +374,21 @@ fn the_importer_refuses_options_it_does_not_compute() {
     std::fs::remove_dir_all(&dir).expect("removed");
     assert!(!error.contains("sliding") && !error.contains("rope"), "{error}");
 }
+
+#[test]
+fn cached_batch_refreshes_tokens_and_positions_without_changing_old_traces() {
+    use super::operator_program::SlotValues;
+    let (program, mut family) = fixture();
+    for device in devices() {
+        let lowered = DeviceProgram::compile(&device, &program).expect("compile");
+        let old = lowered.forward(&family).expect("old");
+        let old_logits = lowered.logits(&old, 0, family.rows).expect("logits");
+        if let SlotValues::Tokens(tokens) = &mut family.slots[0] { tokens[0] = (tokens[0] + 1) % VOCAB as u32; }
+        for p in &mut family.layout.as_mut().expect("layout").position { *p += 3; }
+        let fresh = DeviceProgram::compile(&device, &program).expect("fresh compile");
+        let cached_trace = lowered.forward(&family).expect("updated");
+        let fresh_trace = fresh.forward(&family).expect("fresh");
+        assert_eq!(lowered.logits(&cached_trace, 0, family.rows).expect("cached logits"), fresh.logits(&fresh_trace, 0, family.rows).expect("fresh logits"));
+        assert_eq!(lowered.logits(&old, 0, family.rows).expect("old still valid"), old_logits);
+    }
+}

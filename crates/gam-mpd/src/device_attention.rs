@@ -89,3 +89,36 @@ pub(crate) fn tangent(d: &Device, (q, k, v): Values<'_>, (dq, dk, dv): (Option<&
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+    #[test]
+    fn resident_tiles_match_host_attention_across_tile_and_sequence_boundaries() {
+        use crate::operator_program::{FamilyInputs, SequenceLayout};
+        let length = 263;
+        let rows = 2 * length;
+        let data = |width, salt| Array2::from_shape_fn((rows, width), |(r, c)| ((r * 31 + c * 7 + salt) as f64 * 0.73).sin());
+        let (q, k, v, dq, dk, dv, cot) = (data(8, 1), data(8, 2), data(5, 3), data(8, 4), data(8, 5), data(5, 6), data(5, 7));
+        let family = FamilyInputs { rows, slots: vec![], layout: Some(SequenceLayout { sequence: (0..rows).map(|r| (r / length) as u32).collect(), position: (0..rows).map(|r| (r % length) as u32).collect() }) };
+        for d in crate::device_program_tests::devices() {
+            let up = |x: &Array2<f64>| d.upload(x.view()).expect("upload");
+            let (qd, kd, vd, dqd, dkd, dvd, cd) = (up(&q), up(&k), up(&v), up(&dq), up(&dk), up(&dv), up(&cot));
+            let close = |actual: &Tensor, expected: &Array2<f64>| {
+                let actual = d.download(actual).expect("download");
+                let error = (&actual - expected).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+                assert!(error < 1e-10, "{}: max error {error}", d.name());
+            };
+            for causal in [false, true] {
+                close(&forward(&d, (&qd, &kd, &vd), 2, 0.25, causal).expect("forward"), &crate::tiled_attention::forward(&family, (&q, &k, &v), 0.25, None, causal).expect("reference"));
+                let actual = backward(&d, (&qd, &kd, &vd), &cd, 2, 0.25, causal, Arithmetic::F64).expect("backward");
+                let expected = crate::tiled_attention::backward(&family, (&q, &k, &v), &cot, 0.25, None, causal).expect("reference");
+                close(&actual.0, &expected.0); close(&actual.1, &expected.1); close(&actual.2, &expected.2);
+                let actual = tangent(&d, (&qd, &kd, &vd), (Some(&dqd), Some(&dkd), Some(&dvd)), 2, 0.25, causal, Arithmetic::F64).expect("tangent");
+                let expected = crate::tiled_attention::tangent(&family, (&q, &k, &v), (Some(&dq), Some(&dk), Some(&dv)), 0.25, None, causal).expect("reference");
+                close(&actual, &expected);
+            }
+        }
+    }
+}

@@ -763,6 +763,31 @@ pub fn gradients(
     proposing(|| gradients_proposed(masked, family, trace, masks, cotangent))
 }
 
+/// Gradients only for the factor side this alternating corner step will update. Empty arrays
+/// occupy the unused entries, so no mask-gradient or opposite-factor work is performed.
+fn piece_gradients(masked: &Masked, family: &FamilyInputs, trace: &Trace, masks: &[Array2<f64>], cotangent: Array2<f64>, moves_u: bool) -> Result<Vec<(Array2<f64>, Array2<f64>, Array2<f64>)>, String> {
+    proposing(|| {
+        let keep: Vec<usize> = if moves_u { masked.written.iter().flatten().copied().collect() } else { masked.masked.clone() };
+        let back = super::derivatives::vjp_from(&masked.program, family, trace, masked.program.output, cotangent, Some(&keep)).map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for (k, site) in masked.sites.iter().enumerate() {
+            let gradient = if moves_u {
+                let parts: Vec<_> = masked.written[k].iter().map(|n| back[*n].clone().unwrap_or_else(|| Array2::zeros(trace.values[*n].dim()))).collect();
+                let written = ndarray::concatenate(Axis(1), &parts.iter().map(|p| p.view()).collect::<Vec<_>>()).map_err(|e| e.to_string())?;
+                product_atb(&trace.values[masked.masked[k]], &written).map_err(|e| e.to_string())?
+            } else if let Some(c) = &back[masked.masked[k]] {
+                let cot_z = c * &masked.expand(k, &masks[k]);
+                product_atb(&cot_z, &read_values(trace, site)?).map_err(|e| e.to_string())?
+            } else {
+                Array2::zeros((masked.pieces(k), site.reads.iter().map(|r| trace.values[*r].ncols()).sum()))
+            };
+            let empty = || Array2::zeros((0, 0));
+            out.push(if moves_u { (empty(), empty(), gradient) } else { (empty(), gradient, empty()) });
+        }
+        Ok(out)
+    })
+}
+
 fn gradients_proposed(
     masked: &Masked,
     family: &FamilyInputs,
@@ -953,9 +978,17 @@ pub fn fisher(
     seed: u64,
     written: bool,
 ) -> Result<Vec<(Array2<f64>, Option<Array2<f64>>)>, String> {
+    fisher_impl(masked, family, trace, target, samples, seed, written, true)
+}
+
+fn step_fisher(masked: &Masked, family: &FamilyInputs, trace: &Trace, target: &Target, samples: usize, seed: u64) -> Result<Vec<(Array2<f64>, Option<Array2<f64>>)>, String> {
+    fisher_impl(masked, family, trace, target, samples, seed, true, false)
+}
+
+fn fisher_impl(masked: &Masked, family: &FamilyInputs, trace: &Trace, target: &Target, samples: usize, seed: u64, written: bool, masks: bool) -> Result<Vec<(Array2<f64>, Option<Array2<f64>>)>, String> {
     if samples == 0 { return Err("Fisher needs at least one sample".to_string()); }
     let logits = logits(masked, family, trace, target)?;
-    let mut keep = masked.masked.clone();
+    let mut keep = if masks { masked.masked.clone() } else { Vec::new() };
     if written { keep.extend(masked.written.iter().flatten().copied()); }
     let head = CachedSampledHead::new(masked, &logits, target, &keep)?;
     let mut rng = XorShift(seed | 1);
@@ -965,7 +998,8 @@ pub fn fisher(
         .enumerate()
         .map(|(k, _)| {
             let d_out: usize = masked.written[k].iter().map(|n| trace.values[*n].ncols()).sum();
-            (Array2::zeros((trace.values[masked.z[k]].nrows(), masked.blocks(k))), written.then(|| Array2::zeros((d_out, d_out))))
+            let shape = if masks { (trace.values[masked.z[k]].nrows(), masked.blocks(k)) } else { (0, 0) };
+            (Array2::zeros(shape), written.then(|| Array2::zeros((d_out, d_out))))
         })
         .collect();
     for _ in 0..samples {
@@ -978,7 +1012,7 @@ pub fn fisher(
         };
         let back = proposing(|| super::derivatives::vjp_from(&masked.program, family, trace, node, cotangent, Some(&keep))).map_err(|e| e.to_string())?;
         for (k, (h, f)) in out.iter_mut().enumerate() {
-            if let Some(c) = &back[masked.masked[k]] {
+            if masks && let Some(c) = &back[masked.masked[k]] {
                 let g = masked.to_blocks(k, &(c * &trace.values[masked.z[k]]));
                 *h += &(&g * &g);
             }
@@ -1666,7 +1700,27 @@ pub(super) fn shrunk_direction(m: &Array2<f64>, gradient: &Array2<f64>) -> Resul
 /// rows `other` (C × d'): the projection onto `{x : otherᵀ x = 0}`, `g − other (otherᵀother)⁺ otherᵀ g`
 /// over the eigenvalues of `otherᵀother` beyond its band. A preconditioning on the right keeps it,
 /// since the projection acts on the pieces' index alone.
-fn keep_sum(g: &Array2<f64>, other: &Array2<f64>) -> Result<Array2<f64>, String> {
+pub(super) fn keep_sum(g: &Array2<f64>, other: &Array2<f64>) -> Result<Array2<f64>, String> {
+    if other.ncols() >= 128 && other.nrows() < other.ncols() {
+        // otherᵀ other and other otherᵀ have the same nonzero eigenvalues. Work in piece
+        // space when it is smaller, projecting onto the same resolved column space without
+        // allocating a layer-width Gram matrix or its pseudoinverse.
+        let mut gram = gam_linalg::faer_ndarray::fast_abt(other, other);
+        for i in 0..gram.nrows() {
+            for j in i + 1..gram.ncols() {
+                let value = 0.5 * (gram[[i, j]] + gram[[j, i]]);
+                gram[[i, j]] = value;
+                gram[[j, i]] = value;
+            }
+        }
+        let spectrum = super::dense::eigh(gram.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
+        let band = gam_linalg::roundoff::symmetric_spectrum_rounding_band_at_dim(other.ncols(), &spectrum.values.to_vec());
+        let mut coefficients = fast_atb(&spectrum.vectors, g);
+        for (k, value) in spectrum.values.iter().enumerate() {
+            if *value <= band { coefficients.row_mut(k).fill(0.0); }
+        }
+        return Ok(g - &gam_linalg::faer_ndarray::fast_ab(&spectrum.vectors, &coefficients));
+    }
     let gram = fast_atb(other, other);
     let mut sym = gram.clone();
     let n = sym.nrows();
@@ -1700,8 +1754,9 @@ fn keep_sum(g: &Array2<f64>, other: &Array2<f64>) -> Result<Array2<f64>, String>
 /// the direction projected onto the moves that leave `Σ_c u_c v_cᵀ` unchanged, `Vᵀ dU = 0` or
 /// `Uᵀ dV = 0`. Both are linear, so the sum holds to rounding at every step length.
 ///
-/// On a device (module note, "Devices") the corner claim's step runs there: its forward, gradients,
-/// Fishers, read moments and curvature tangent stay resident, and each backtracking trial is a
+/// On a device (module note, "Devices") the corner claim uses resident forward/reverse passes,
+/// Fisher accumulation and curvature tangents. Factor gradients and covariance blocks still
+/// return to the host for preconditioning and updates. Each backtracking trial is a score-only
 /// float64 forward of the device twin, refreshed with the trial operators.
 pub fn step_pieces(
     masked: &mut Masked,
@@ -1723,8 +1778,9 @@ pub fn step_pieces(
         masked.on_device(|accelerated| {
             let on_device = accelerated.target(target)?;
             let state = accelerated.forward(&family, &on_device)?;
-            let grads = accelerated.gradients(masked, &state, masks)?;
-            let curvature = accelerated.fisher(masked, &state, &on_device, samples, seed, true)?;
+            let grads = if claim == Claim::Corner { accelerated.piece_gradients(masked, &state, seed % 2 == 0)? }
+                else { accelerated.gradients(masked, &state, masks)? };
+            let curvature = accelerated.step_fisher(masked, &state, &on_device, samples, seed)?;
             let covariances = accelerated.covariances(masked, &state)?;
             Ok((on_device, state, grads, curvature, covariances))
         })?
@@ -1735,8 +1791,9 @@ pub fn step_pieces(
         Some((on_device, state, grads, curvature, covariances)) => (state.kl.clone(), grads, curvature, covariances, Evaluated::Device(state), Some(on_device)),
         None => {
             let (kl_now, trace, cotangent) = forward(masked, &family, target)?;
-            let grads = gradients(masked, &family, &trace, masks, cotangent.clone())?;
-            let curvature = fisher(masked, &family, &trace, target, samples, seed, true)?;
+            let grads = if claim == Claim::Corner { piece_gradients(masked, &family, &trace, masks, cotangent.clone(), seed % 2 == 0)? }
+                else { gradients(masked, &family, &trace, masks, cotangent.clone())? };
+            let curvature = step_fisher(masked, &family, &trace, target, samples, seed)?;
             let rows = trace.values[masked.program.output].nrows() as f64;
             let mut batch_covariances = Vec::new();
             for site in &masked.sites {

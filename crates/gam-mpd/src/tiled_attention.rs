@@ -3,6 +3,7 @@
 use super::operator_program::{FamilyInputs, ProgramError, Rotary, SequenceLayout};
 use gam_linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
 use ndarray::{Array2, ArrayView2, Axis, s};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 const TILE: usize = 64;
@@ -23,7 +24,8 @@ fn groups(layout: &SequenceLayout) -> BTreeMap<u32, Vec<usize>> {
     out
 }
 
-fn rotate(x: &Array2<f64>, rotary: Option<Rotary>, positions: &[u32], inverse: bool) -> Array2<f64> {
+fn rotate<'a>(x: &'a Array2<f64>, rotary: Option<Rotary>, positions: &[u32], inverse: bool) -> Cow<'a, Array2<f64>> {
+    if rotary.is_none() { return Cow::Borrowed(x); }
     let mut out = x.clone();
     if let Some(rotary) = rotary {
         let pairs = rotary.pairs();
@@ -37,7 +39,7 @@ fn rotate(x: &Array2<f64>, rotary: Option<Rotary>, positions: &[u32], inverse: b
             }
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 fn probabilities(q: ArrayView2<'_, f64>, k: &Array2<f64>, positions: &[u32], start: usize, scale: f64, causal: bool) -> Array2<f64> {
@@ -106,7 +108,7 @@ pub(crate) fn backward(inputs: &FamilyInputs, (query, key, value): Values<'_>, c
         scatter(&mut gk, members, &key_grad);
         scatter(&mut gv, members, &value_grad);
     }
-    Ok((rotate(&gq, rotary, &layout.position, true), rotate(&gk, rotary, &layout.position, true), gv))
+    Ok((rotate(&gq, rotary, &layout.position, true).into_owned(), rotate(&gk, rotary, &layout.position, true).into_owned(), gv))
 }
 
 pub(crate) fn tangent(inputs: &FamilyInputs, (query, key, value): Values<'_>, (dq, dk, dv): (Option<&Array2<f64>>, Option<&Array2<f64>>, Option<&Array2<f64>>), scale: f64, rotary: Option<Rotary>, causal: bool) -> Result<Array2<f64>, ProgramError> {

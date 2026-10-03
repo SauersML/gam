@@ -97,4 +97,35 @@ fig.suptitle("BLiMP grammar tasks after each emoticon edit, at equal edit succes
 fig.subplots_adjust(left=0.24, right=0.98, top=1 - 1.6 / H, bottom=1.0 / H)
 fig.savefig(OUT / "e4_benchmarks_blimp.png", facecolor=SURF)
 plt.close(fig)
-print(OUT / "e4_benchmarks.png", OUT / "e4_benchmarks_blimp.png")
+
+# ---------------------------------------------------------------- 3. every LoRA setting against its matched VPD edit
+loras = sorted([nm for nm in meta if nm.startswith("lora")], key=lambda nm: (-meta[nm]["n_train"], meta[nm]["lambda"]))
+fig, axes = plt.subplots(1, len(MAIN), figsize=(26, 0.75 * len(loras) + 3), dpi=150, sharey=True,
+                         gridspec_kw={"wspace": 0.1})
+fig.patch.set_facecolor(SURF)
+ys = np.arange(len(loras))[::-1]
+for ax, (k, lab) in zip(axes, MAIN):
+    for y, nm in zip(ys, loras):
+        for v, col, dy in (("vpd_match_" + nm, ORANGE, 0.15), (nm, BLUE, -0.15)):
+            m, lo, hi = T[k]["d_margin"][v]
+            ax.plot([lo, hi], [y + dy, y + dy], color=col, lw=2.6, solid_capstyle="round", zorder=3)
+            ax.scatter([m], [y + dy], s=80, color=col, edgecolor=SURF, linewidth=1.5, zorder=4)
+    ax.axvline(0, color=INK2, lw=1.2, zorder=1)
+    ax.set_title(lab, loc="left", fontweight="bold", color=INK, pad=10)
+    for sd in ("top", "right"):
+        ax.spines[sd].set_visible(False)
+    ax.tick_params(axis="x", labelsize=14)
+axes[0].set_yticks(ys)
+axes[0].set_yticklabels([f"{meta[nm]['n_train']} examples, λ = {meta[nm]['lambda']:g}  ({meta[nm]['p_fire']:.1%})"
+                         for nm in loras], color=INK, fontsize=15)
+axes[0].set_ylim(-0.6, len(loras) - 0.4)
+H3 = 0.75 * len(loras) + 3
+fig.supxlabel("change in the correct answer's log-probability share (nats)", color=INK, y=0.02)
+fig.legend(handles=[legend[0], Line2D([], [], color=BLUE, marker="o", lw=2.6, ms=10, mec=SURF, label="LoRA")],
+           loc="upper right", ncol=2, frameon=False, bbox_to_anchor=(0.99, 1 - 0.1 / H3))
+fig.suptitle("Benchmark change for every LoRA setting and the VPD edit of equal success", x=0.01, ha="left",
+             y=1 - 0.1 / H3, fontsize=24, fontweight="bold", color=INK)
+fig.subplots_adjust(left=0.17, right=0.99, top=1 - 1.5 / H3, bottom=1.2 / H3)
+fig.savefig(OUT / "e4_benchmarks_all_settings.png", facecolor=SURF)
+plt.close(fig)
+print(OUT / "e4_benchmarks.png", OUT / "e4_benchmarks_blimp.png", OUT / "e4_benchmarks_all_settings.png")

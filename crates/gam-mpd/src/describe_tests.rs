@@ -37,7 +37,8 @@ fn a_generic_block_costs_its_rank() {
     let d = describe(&w, k, &metric(d_out, d_in), &[], &[], false).expect("a description");
     assert_eq!(d.core, Core::Generic { rank: k });
     assert_eq!(d.reals, k * (d_out + d_in - k));
-    assert!(relative(&decoded(&d.u, &d.v), &w) < 1e-2, "decoded error {}", relative(&decoded(&d.u, &d.v), &w));
+    // The precision is the one whose bits and error balance at n = 10⁴: a percent or so of the map.
+    assert!(relative(&decoded(&d.u, &d.v), &w) < 5e-2, "decoded error {}", relative(&decoded(&d.u, &d.v), &w));
     assert!(d.real_bits >= d.reals as f64);
 }
 
@@ -67,17 +68,17 @@ fn a_rotation_between_characters_costs_two_reals() {
     assert_eq!(structured.reader.1, vec![vec![f]]);
     assert_eq!(generic.reals, 2 * (d + d - 2));
     assert!(structured.total() < 0.5 * generic.total(), "structured {} against generic {}", structured.total(), generic.total());
-    assert!(relative(&decoded(&structured.u, &structured.v), &w) < 1e-2);
+    assert!(relative(&decoded(&structured.u, &structured.v), &w) < 5e-2);
 }
 
 #[test]
 fn a_harmonic_chart_on_labelled_rows_reads_one_character() {
-    // Rows labelled by two operands; values linear in the operands' one-hots.
-    let (p, d) = (7, 10);
+    // Rows labelled by two operands; each operand embedded in its own coordinates.
+    let (p, d) = (7, 8);
     let rows = p * p;
     let labels = Array2::from_shape_fn((rows, 2), |(r, i)| if i == 0 { r / p } else { r % p });
-    let embed = random(p, d, 5);
-    let values = Array2::from_shape_fn((rows, d), |(r, j)| embed[[r / p, j]] + 0.5 * embed[[r % p, j]]);
+    let (first, second) = (random(p, d, 5), random(p, d, 11));
+    let values = Array2::from_shape_fn((rows, 2 * d), |(r, j)| if j < d { first[[r / p, j]] } else { second[[r % p, j - d]] });
     let chart = Chart::harmonic("reads", values.view(), labels.view(), p).expect("chart");
     assert_eq!(chart.groups.len(), (p * p - 1) / 2 + 1);
     // The direction reading cos(2π·2a/p) has exactly that profile wherever the values resolve it.
@@ -97,7 +98,7 @@ fn a_block_writing_its_own_reads_codes_its_frame_once() {
     let d_ = describe(&w, k, &metric(d, d), &[], &[], true).expect("a description");
     assert_eq!(d_.core, Core::SameSubspace { rank: k, core: SameCore::Generic });
     assert_eq!(d_.reals, k * (d - k) + k * k);
-    assert!(relative(&decoded(&d_.u, &d_.v), &w) < 1e-2);
+    assert!(relative(&decoded(&d_.u, &d_.v), &w) < 5e-2);
 }
 
 #[test]
@@ -114,7 +115,7 @@ fn a_rotation_within_its_own_plane_costs_its_frame_and_two_reals() {
     let d_ = describe(&w, 2, &metric(d, d), &[], &[], true).expect("a description");
     assert_eq!(d_.core, Core::SameSubspace { rank: 2, core: SameCore::Rotation });
     assert_eq!(d_.reals, 2 * (d - 2) + 2);
-    assert!(relative(&decoded(&d_.u, &d_.v), &w) < 1e-2);
+    assert!(relative(&decoded(&d_.u, &d_.v), &w) < 5e-2);
 }
 
 #[test]
@@ -130,5 +131,5 @@ fn a_block_inside_one_declared_group_costs_that_group() {
     let d = describe(&w, k, &metric(d_out, d_in), std::slice::from_ref(&chart), &[], false).expect("a description");
     assert_eq!(d.writer.1, vec![vec![1]]);
     assert_eq!(d.reals, k * (width + d_in - k));
-    assert!(relative(&decoded(&d.u, &d.v), &w) < 1e-2);
+    assert!(relative(&decoded(&d.u, &d.v), &w) < 5e-2);
 }

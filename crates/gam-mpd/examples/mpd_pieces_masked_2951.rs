@@ -978,7 +978,6 @@ fn main() -> Result<(), String> {
                     );
                     if kept {
                         masked = candidate;
-                        costs = candidate_costs;
                         masks = candidate_masks;
                     }
                 }

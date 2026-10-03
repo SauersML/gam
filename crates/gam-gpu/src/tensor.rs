@@ -1358,6 +1358,14 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
         module: Arc<CudaModule>,
         /// The row flags of a call that scores every row (never read).
         every_row: CudaSlice<u32>,
+        gemm_workspace: std::sync::Mutex<F32Workspace>,
+    }
+
+    #[derive(Default)]
+    struct F32Workspace {
+        left: Option<CudaSlice<f32>>,
+        right: Option<CudaSlice<f32>>,
+        output: Option<CudaSlice<f32>>,
     }
 
     fn cfg_elements(n: u64) -> LaunchConfig {
@@ -1410,7 +1418,7 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
             static MODULE: crate::device_cache::PtxModuleCache = crate::device_cache::PtxModuleCache::new();
             let module = Arc::clone(MODULE.get_or_compile(&ctx, "tensor", KERNELS)?);
             let every_row = stream.alloc_zeros::<u32>(1).gpu_ctx("tensor alloc")?;
-            Ok(Self { name, ctx, stream, blas, module, every_row })
+            Ok(Self { name, ctx, stream, blas, module, every_row, gemm_workspace: std::sync::Mutex::new(F32Workspace::default()) })
         }
 
         pub(super) fn memory(&self) -> Result<(usize, usize), GpuError> {
@@ -1473,6 +1481,9 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
             if m == 0 || n == 0 {
                 return Ok(());
             }
+            // Serialize use of this handle's math mode and scratch buffers. Every operation is
+            // queued on the same stream, so reuse requires no host synchronization.
+            let mut cached = self.gemm_workspace.lock().map_err(|_| shape("poisoned GEMM workspace".to_string()))?;
             // Row-major C = op(A) op(B) is column-major Cᵀ = op(B)ᵀ op(A)ᵀ: the buffers swap places
             // and keep their own flags, each leading dimension its row length.
             let (dims, leading) = ((i32_of(n)?, i32_of(m)?, i32_of(k)?), (i32_of(b.cols)?, i32_of(a.cols)?, i32_of(c.cols)?));
@@ -1511,17 +1522,34 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
                 .gpu_ctx("tensor DGEMM")?;
                 return Ok(());
             }
-            let lower = |t: &Tensor| -> Result<CudaSlice<f32>, GpuError> {
-                let mut out = self.stream.alloc_zeros::<f32>(t.len().max(1)).gpu_ctx("tensor f32 alloc")?;
+            let mut temporary = F32Workspace::default();
+            // Avoid retaining an unbounded high-water allocation after an unusually large GEMM.
+            let total = a.len().saturating_add(b.len()).saturating_add(c.len());
+            let capacity = cached.left.as_ref().map_or(0, |s| s.len()).max(a.len())
+                .saturating_add(cached.right.as_ref().map_or(0, |s| s.len()).max(b.len()))
+                .saturating_add(cached.output.as_ref().map_or(0, |s| s.len()).max(c.len()));
+            if capacity > 64 * 1024 * 1024 { *cached = F32Workspace::default(); }
+            let workspace = if total <= 64 * 1024 * 1024 { &mut *cached } else { &mut temporary };
+            let lower = |t: &Tensor, slot: &mut Option<CudaSlice<f32>>, convert: bool| -> Result<(), GpuError> {
+                if slot.as_ref().is_none_or(|s| s.len() < t.len().max(1)) {
+                    *slot = Some(self.stream.alloc_zeros::<f32>(t.len().max(1)).gpu_ctx("tensor f32 alloc")?);
+                }
+                if !convert || t.is_empty() { return Ok(()); }
+                let out = slot.as_mut().ok_or_else(|| shape("missing GEMM scratch".to_string()))?;
                 let n = t.len() as u64;
                 let f = self.function("to_f32")?;
                 // SAFETY: `to_f32(n, x, y)` reads n doubles and writes n floats.
-                unsafe { self.stream.launch_builder(&f).arg(&n).arg(slice(t)?).arg(&mut out).launch(cfg_elements(n)) }
+                unsafe { self.stream.launch_builder(&f).arg(&n).arg(slice(t)?).arg(out).launch(cfg_elements(n)) }
                     .gpu_ctx("tensor to_f32")?;
-                Ok(out)
+                Ok(())
             };
-            let (a32, b32) = (lower(a)?, lower(b)?);
-            let mut c32 = lower(c)?;
+            lower(a, &mut workspace.left, true)?;
+            lower(b, &mut workspace.right, true)?;
+            // beta=0 means the previous output is irrelevant, including stale NaNs.
+            lower(c, &mut workspace.output, beta != 0.0)?;
+            let a32 = workspace.left.as_ref().ok_or_else(|| shape("missing left scratch".to_string()))?;
+            let b32 = workspace.right.as_ref().ok_or_else(|| shape("missing right scratch".to_string()))?;
+            let c32 = workspace.output.as_mut().ok_or_else(|| shape("missing output scratch".to_string()))?;
             let f32_cfg = {
                 let g = gemm(op_of(tb), op_of(ta));
                 GemmConfig {
@@ -1543,13 +1571,13 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
             // SAFETY: as for the float64 product, on the lowered copies.
             let product = unsafe {
                 if batch == 1 {
-                    self.blas.gemm(f32_cfg, &b32, &a32, &mut c32)
+                    self.blas.gemm(f32_cfg, b32, a32, c32)
                 } else {
                     self.blas.gemm_strided_batched(
                         StridedBatchedConfig { gemm: f32_cfg, batch_size: i32_of(batch)?, stride_a, stride_b, stride_c },
-                        &b32,
-                        &a32,
-                        &mut c32,
+                        b32,
+                        a32,
+                        c32,
                     )
                 }
             };
@@ -1562,7 +1590,7 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
             let f = self.function("to_f64")?;
             let cs = slice_mut(c)?;
             // SAFETY: `to_f64(n, y, x)` reads n floats and writes n doubles.
-            unsafe { self.stream.launch_builder(&f).arg(&n).arg(&c32).arg(cs).launch(cfg_elements(n)) }.gpu_ctx("tensor to_f64")?;
+            unsafe { self.stream.launch_builder(&f).arg(&n).arg(&*c32).arg(cs).launch(cfg_elements(n)) }.gpu_ctx("tensor to_f64")?;
             Ok(())
         }
 

@@ -481,7 +481,7 @@ fn steps_keep_every_piece_on_the_same_map() {
 }
 
 #[test]
-fn shrunk_solve_matches_spectral_preconditioning_and_preserves_the_sum() {
+fn shrunk_solve_matches_spectral_preconditioning_and_solves_the_shifted_system() {
     use super::masked::{shrunk_direction, shrunk_inverse};
     for rank in [1, 7, 16] {
         let x = Array2::from_shape_fn((rank, 16), |(i, j)| noise(31 * i + j + 7));
@@ -500,7 +500,7 @@ fn shrunk_solve_matches_spectral_preconditioning_and_preserves_the_sum() {
 
 #[test]
 fn shared_cpu_fisher_matches_full_vocabulary_reverse_passes_for_grouped_masks() {
-    use super::masked::{fisher, kl};
+    use super::masked::fisher;
     let (program, base) = model();
     let site = sites(&program).into_iter().find(|s| s.name == "W_in").expect("site");
     let library = Library {
@@ -518,7 +518,7 @@ fn shared_cpu_fisher_matches_full_vocabulary_reverse_passes_for_grouped_masks() 
     let mut f = Array2::zeros((UNITS, UNITS));
     let mut rng = 73u64;
     for _ in 0..4 {
-        let mut seed = kl(&Target::every_row(Array2::zeros(logits.dim())), logits).1;
+        let mut seed = Array2::zeros(logits.dim());
         // The reference constructs q - e_y at the full vocabulary and differentiates every node.
         for r in 0..base.rows {
             if !target.scores(r) { seed.row_mut(r).fill(0.0); continue; }
@@ -567,4 +567,23 @@ fn benchmark_training_preconditioner_solve() {
         old.sort_by(f64::total_cmp); new.sort_by(f64::total_cmp);
         eprintln!("preconditioner width={width} pieces=64 spectral_seconds={} solve_seconds={} ratio={}", old[1], new[1], old[1] / new[1]);
     }
+}
+
+#[test]
+fn piece_space_projection_matches_width_space_and_preserves_the_native_sum() {
+    let left = Array2::from_shape_fn((20, 8), |(i, j)| noise(31 * i + j + 1));
+    let right = Array2::from_shape_fn((8, 256), |(i, j)| noise(17 * i + j + 9));
+    let other = left.dot(&right);
+    let g = Array2::from_shape_fn((20, 7), |(i, j)| noise(43 * i + j + 3));
+    let direction = super::masked::keep_sum(&g, &other).expect("piece projection");
+    assert!(other.t().dot(&direction).iter().all(|v| v.abs() < 1e-10), "the native sum moved");
+    let gram = other.t().dot(&other);
+    // Assemble the reference symmetrically, just as the historical implementation did.
+    let mut sym = gram;
+    for i in 0..sym.nrows() { for j in i + 1..sym.ncols() { let x = 0.5 * (sym[[i, j]] + sym[[j, i]]); sym[[i, j]] = x; sym[[j, i]] = x; } }
+    let spectrum = super::dense::eigh(sym.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).expect("width spectrum");
+    let mut scaled = spectrum.vectors.clone();
+    for (k, value) in spectrum.values.iter().enumerate() { scaled.column_mut(k).mapv_inplace(|x| if *value > spectrum.band { x / value } else { 0.0 }); }
+    let reference = &g - &other.dot(&scaled.dot(&spectrum.vectors.t()).dot(&other.t().dot(&g)));
+    assert!((&direction - &reference).iter().all(|v| v.abs() < 1e-10));
 }

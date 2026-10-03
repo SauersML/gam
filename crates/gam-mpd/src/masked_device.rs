@@ -165,19 +165,28 @@ impl Accelerated {
         seed: u64,
         written: bool,
     ) -> Result<Vec<(Array2<f64>, Option<Array2<f64>>)>, String> {
+        self.fisher_impl(masked, state, target, samples, seed, written, true)
+    }
+
+    pub(crate) fn step_fisher(&self, masked: &Masked, state: &State, target: &DeviceTarget, samples: usize, seed: u64) -> Result<Vec<(Array2<f64>, Option<Array2<f64>>)>, String> {
+        self.fisher_impl(masked, state, target, samples, seed, true, false)
+    }
+
+    fn fisher_impl(&self, masked: &Masked, state: &State, target: &DeviceTarget, samples: usize, seed: u64, written: bool, masks: bool) -> Result<Vec<(Array2<f64>, Option<Array2<f64>>)>, String> {
         let d = self.program.device();
         let rows = state.trace.rows;
         if samples == 0 || target.scored.as_ref().is_some_and(|s| s.len() != rows) {
             return Err("device: Fisher needs samples and one scored flag per row".to_string());
         }
-        let mut keep = masked.masked.clone();
+        let mut keep = if masks { masked.masked.clone() } else { Vec::new() };
         if written {
             keep.extend(masked.sites.iter().flat_map(|s| s.writes.iter().copied()));
         }
         let mut h: Vec<Tensor> = Vec::new();
         for k in 0..masked.sites.len() {
             let z = state.trace.value(masked.z[k])?;
-            h.push(d.zeros(z.rows(), masked.blocks(k)).map_err(error)?);
+            let (rows, cols) = if masks { (z.rows(), masked.blocks(k)) } else { (0, 0) };
+            h.push(d.zeros(rows, cols).map_err(error)?);
         }
         // Per site, the blocks `g_iᵀ g_j` of the written nodes' Fisher.
         let mut blocks: Vec<Vec<Vec<Option<Tensor>>>> =
@@ -195,7 +204,7 @@ impl Accelerated {
             for g_hidden in seeds {
                 let back = self.cotangents(&state.trace, g_hidden, &keep)?;
                 for (k, hk) in h.iter_mut().enumerate() {
-                    if let Some(c) = back.get(&masked.masked[k]) {
+                    if masks && let Some(c) = back.get(&masked.masked[k]) {
                         let z = state.trace.value(masked.z[k])?;
                         let g = d.block_products(c, z, &self.blocks[k]).map_err(error)?;
                         d.hadamard(hk, &g, &g, true).map_err(error)?;
@@ -205,7 +214,7 @@ impl Accelerated {
                     }
                     let writes = &masked.sites[k].writes;
                     for (i, wi) in writes.iter().enumerate() {
-                        for (j, wj) in writes.iter().enumerate() {
+                        for (j, wj) in writes.iter().enumerate().skip(i) {
                             let (Some(gi), Some(gj)) = (back.get(wi), back.get(wj)) else { continue };
                             let block = &mut blocks[k][i][j];
                             if block.is_none() {
@@ -221,7 +230,7 @@ impl Accelerated {
         let scored_rows = (0..rows).filter(|r| scored(*r)).count().max(1) as f64;
         let mut out = Vec::new();
         for (k, hk) in h.iter().enumerate() {
-            let diagonal = d.download(hk).map_err(error)? / samples as f64;
+            let diagonal = if masks { d.download(hk).map_err(error)? / samples as f64 } else { Array2::zeros((0, 0)) };
             let fisher = if written {
                 let widths: Vec<usize> = masked.sites[k].writes.iter().map(|w| state.trace.value(*w).map(|t| t.cols())).collect::<Result<_, _>>()?;
                 let offsets: Vec<usize> = std::iter::once(0).chain(widths.iter().scan(0, |a, w| {
@@ -233,7 +242,9 @@ impl Accelerated {
                 for (i, row) in blocks[k].iter().enumerate() {
                     for (j, block) in row.iter().enumerate() {
                         if let Some(b) = block {
-                            f.slice_mut(s![offsets[i]..offsets[i + 1], offsets[j]..offsets[j + 1]]).assign(&d.download(b).map_err(error)?);
+                            let values = d.download(b).map_err(error)?;
+                            f.slice_mut(s![offsets[i]..offsets[i + 1], offsets[j]..offsets[j + 1]]).assign(&values);
+                            if i != j { f.slice_mut(s![offsets[j]..offsets[j + 1], offsets[i]..offsets[i + 1]]).assign(&values.t()); }
                         }
                     }
                 }
@@ -301,6 +312,42 @@ impl Accelerated {
                 ndarray::concatenate(Axis(1), &views).map_err(|e| e.to_string())
             };
             out.push((d.download(&mask_gradient).map_err(error)?, join(&v_blocks)?, join(&u_blocks)?));
+        }
+        Ok(out)
+    }
+
+    /// Only the active factor side of a corner step; the other factor and mask entries are empty.
+    pub(crate) fn piece_gradients(&self, masked: &Masked, state: &State, moves_u: bool) -> Result<Vec<(Array2<f64>, Array2<f64>, Array2<f64>)>, String> {
+        let d = self.program.device();
+        let keep: Vec<usize> = if moves_u { masked.sites.iter().flat_map(|s| s.writes.iter().copied()).collect() } else { masked.masked.clone() };
+        let seed = d.copy(state.cotangent.as_ref().ok_or("device: prepare the state's gradient first")?).map_err(error)?;
+        let back = self.cotangents(&state.trace, seed, &keep)?;
+        let mut out = Vec::new();
+        for (k, site) in masked.sites.iter().enumerate() {
+            let pieces = masked.pieces(k);
+            let mut parts = Vec::new();
+            if moves_u {
+                let zm = state.trace.value(masked.masked[k])?;
+                for node in &site.writes {
+                    let width = state.trace.value(*node)?.cols();
+                    let mut part = d.zeros(pieces, width).map_err(error)?;
+                    if let Some(c) = back.get(node) { d.gemm(&mut part, 1.0, zm, Op::T, c, Op::N, 0.0, self.proposal).map_err(error)?; }
+                    parts.push(d.download(&part).map_err(error)?);
+                }
+            } else {
+                let Node::Hadamard { right, .. } = masked.program.nodes[masked.masked[k]] else { return Err("device: mask is not a product".to_string()); };
+                let mut cot_z = d.zeros(state.trace.rows, pieces).map_err(error)?;
+                if let Some(c) = back.get(&masked.masked[k]) { d.hadamard(&mut cot_z, c, state.trace.value(right)?, false).map_err(error)?; }
+                for node in &site.reads {
+                    let x = state.trace.value(*node)?;
+                    let mut part = d.zeros(pieces, x.cols()).map_err(error)?;
+                    d.gemm(&mut part, 1.0, &cot_z, Op::T, x, Op::N, 0.0, self.proposal).map_err(error)?;
+                    parts.push(d.download(&part).map_err(error)?);
+                }
+            }
+            let gradient = ndarray::concatenate(Axis(1), &parts.iter().map(|p| p.view()).collect::<Vec<_>>()).map_err(|e| e.to_string())?;
+            let empty = || Array2::zeros((0, 0));
+            out.push(if moves_u { (empty(), empty(), gradient) } else { (empty(), gradient, empty()) });
         }
         Ok(out)
     }

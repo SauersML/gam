@@ -410,8 +410,11 @@ pub(crate) fn vjp_from(
     let first = keep.and_then(|nodes| nodes.iter().min().copied()).unwrap_or(0);
     for index in (first..program.nodes.len()).rev() {
         let Some(cot) = g[index].take() else { continue };
+        if keep.is_some() && index == first {
+            g[index] = Some(cot);
+            break;
+        }
         if retained[index] { g[index] = Some(cot.clone()); }
-        if keep.is_some() && index == first { break; }
         let node = &program.nodes[index];
         match node {
             Node::Feature { .. } | Node::Raw { .. } | Node::Constant { .. } => {}
