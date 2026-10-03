@@ -299,8 +299,7 @@ fn run(dir: &Path, out: &Path, observations: f64) -> Result<(), String> {
     }
     let statistics = site_statistics(&program, &chosen, [family.clone()], 16, 0x5EED)?;
     let metrics = logit_gauss_newton(&program, &chosen, &family, &trace, 64)?;
-    let (mut geometries, mut lattice_sites, mut plane_libraries, mut plane_ranks, mut plane_labels, mut svd_libraries) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut geometries, mut plane_libraries, mut plane_ranks, mut plane_labels, mut svd_libraries) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for ((site, measured), metric) in chosen.iter().zip(&statistics).zip(&metrics) {
         let x = read_values(&trace, site)?;
         let readers = if site.reads.iter().any(|n| moved[*n]) {
@@ -313,9 +312,7 @@ fn run(dir: &Path, out: &Path, observations: f64) -> Result<(), String> {
             let classes = Array2::from_shape_fn((map.nrows(), 1), |(c, _)| c);
             writers.push(Chart::harmonic("class characters of the readout", map.view(), classes.view(), map.nrows())?);
         }
-        let metric_of = || Metric { fisher: metric.clone(), ..Metric::of(measured, observations) };
-        geometries.push(Geometry::new(metric_of(), writers, readers)?);
-        lattice_sites.push(Geometry::new(metric_of(), Vec::new(), Vec::new())?);
+        geometries.push(Geometry::new(Metric { fisher: metric.clone(), ..Metric::of(measured, observations) }, writers, readers)?);
         let w = matrix(&program, site)?;
         let blocks = planes(&w, &x, &labels, period)?;
         let check = blocks.iter().fold(Array2::<f64>::zeros(w.dim()), |acc, (_, u, v)| acc + u.t().dot(v));
@@ -340,54 +337,50 @@ fn run(dir: &Path, out: &Path, observations: f64) -> Result<(), String> {
     }
     drop(trace);
     let mut structured = Structured::new(geometries);
-    let lattice = Structured::new(lattice_sites);
     let batches = vec![(family.clone(), target)];
     let ones = |ranks: &[Vec<usize>]| vec![ranks.iter().map(|r| Array2::<f64>::ones((family.rows, r.len()))).collect::<Vec<_>>()];
-    // Calibrate the description's rounding price on the fitted solution, then keep it for every
-    // point, so every point is fitted and selected under one price.
     let mut calibrations = Vec::new();
-    let (fitted, fitted_bits) = loop {
+    // The price is calibrated on the selected planes (the point in question), then kept for every
+    // point, so every point is selected and fitted under one price. Each point is written as it
+    // lands.
+    let (planes_on, planes_selected, planes_on_bits, planes_selected_bits) = loop {
         let coded = Coded { model: &program, sites: chosen.clone(), batches: batches.clone(), observations, samples: 16, describe: &structured, boxed: Some(metrics.clone()) };
-        let svd_ranks: Vec<Vec<usize>> = svd_libraries.iter().map(|l| vec![1; l.v.nrows()]).collect();
-        let (rank_one, _) = selected(&coded, Blocked::rank_one(svd_libraries.clone(), ones(&svd_ranks)))?;
-        let (fitted, fitted_bits) = fit_blocks(&coded, rank_one, true)?;
-        let (measured, priced, _) = rounding_error(&coded, &fitted)?;
+        let mut planes_on = Blocked::new(plane_libraries.clone(), plane_ranks.clone(), ones(&plane_ranks));
+        planes_on.price(&coded)?;
+        let (planes_on_bits, _) = measure(&coded, &planes_on)?;
+        let (planes_selected, planes_selected_bits) = selected(&coded, planes_on.clone())?;
+        let (measured, priced, _) = rounding_error(&coded, &planes_selected)?;
         eprintln!("rounding: measured {measured:.1} bits against {priced:.1} priced");
         calibrations.push(json!({"measured": measured, "priced": priced}));
         let ratio = if priced > 0.0 { measured / priced } else { f64::INFINITY };
         if (0.5..=2.0).contains(&ratio) || measured <= 0.0 || calibrations.len() >= 6 {
-            break (fitted, fitted_bits);
+            break (planes_on, planes_selected, planes_on_bits, planes_selected_bits);
         }
         structured = structured.scaled(if ratio.is_finite() { ratio } else { 1e3 });
     };
     let coded = Coded { model: &program, sites: chosen.clone(), batches, observations, samples: 16, describe: &structured, boxed: Some(metrics.clone()) };
-    let mut planes_on = Blocked::new(plane_libraries, plane_ranks.clone(), ones(&plane_ranks));
-    planes_on.price(&coded)?;
-    let (planes_on_bits, _) = measure(&coded, &planes_on)?;
-    let (planes_selected, planes_selected_bits) = selected(&coded, planes_on.clone())?;
-    let (seeded, seeded_bits) = fit_blocks(&coded, planes_selected.clone(), true)?;
-    let points = vec![
-        report("planes, all on", &coded, &planes_on, &planes_on_bits, &structured, Some(plane_labels.as_slice()))?,
-        report("planes, selected", &coded, &planes_selected, &planes_selected_bits, &structured, Some(plane_labels.as_slice()))?,
-        report("fitted from rank-one subcomponents", &coded, &fitted, &fitted_bits, &structured, None)?,
-        report("fitted from the selected planes", &coded, &seeded, &seeded_bits, &structured, None)?,
-    ];
-    // The fitted and the planes under the plain lattice code too (no charts), decoded.
-    let mut plain = Vec::new();
-    for (name, blocked) in [("planes, selected", &planes_selected), ("fitted from rank-one subcomponents", &fitted)] {
-        let (described, error, kl, _) = decoded(&coded, blocked, &lattice)?;
-        eprintln!("{name}, lattice generic, decoded: {:.1} bits/word (described {described:.1}, error {error:.1}), KL {kl:.6}", described + error);
-        plain.push(json!({"point": name, "decoded_bits_per_word": described + error, "decoded_described_bits_per_word": described, "decoded_error_bits_per_word": error, "decoded_kl_per_word": kl}));
-    }
-    let report = json!({
-        "observations": observations,
-        "claim": "box",
-        "calibrations": calibrations,
-        "points": points,
-        "lattice_generic": plain,
-        "plane_blocks": chosen.iter().zip(&plane_labels).zip(&plane_ranks).map(|((s, l), r)| json!({"site": s.name, "labels": l, "ranks": r})).collect::<Vec<_>>(),
-    });
-    std::fs::write(out, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    let mut points = Vec::new();
+    let write = |points: &[Value]| -> Result<(), String> {
+        let report = json!({
+            "observations": observations,
+            "claim": "box",
+            "calibrations": calibrations,
+            "points": points,
+            "plane_blocks": chosen.iter().zip(&plane_labels).zip(&plane_ranks).map(|((s, l), r)| json!({"site": s.name, "labels": l, "ranks": r})).collect::<Vec<_>>(),
+        });
+        std::fs::write(out, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    };
+    points.push(report("planes, selected", &coded, &planes_selected, &planes_selected_bits, &structured, Some(plane_labels.as_slice()))?);
+    points.push(report("planes, all on", &coded, &planes_on, &planes_on_bits, &structured, Some(plane_labels.as_slice()))?);
+    write(&points)?;
+    let svd_ranks: Vec<Vec<usize>> = svd_libraries.iter().map(|l| vec![1; l.v.nrows()]).collect();
+    let (rank_one, _) = selected(&coded, Blocked::rank_one(svd_libraries.clone(), ones(&svd_ranks)))?;
+    let (fitted, fitted_bits) = fit_blocks(&coded, rank_one, true)?;
+    points.push(report("fitted from rank-one subcomponents", &coded, &fitted, &fitted_bits, &structured, None)?);
+    write(&points)?;
+    let (seeded, seeded_bits) = fit_blocks(&coded, planes_selected, true)?;
+    points.push(report("fitted from the selected planes", &coded, &seeded, &seeded_bits, &structured, None)?);
+    write(&points)
 }
 
 fn main() -> Result<(), String> {
