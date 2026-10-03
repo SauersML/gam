@@ -2313,7 +2313,7 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
 
 #[cfg(target_os = "macos")]
 mod apple {
-    use super::{Arithmetic, ColumnBlocks, Data, Device, IndexData, Indices, Op, RmsMode, Tensor, foreign, host, shape};
+    use super::{Arithmetic, ColumnBlocks, Data, IndexData, Indices, Op, RmsMode, Tensor, foreign, shape};
     use crate::apple_gpu::MetalRuntime;
     use crate::gpu_error::GpuError;
     use crate::metal::stream::{Buffer, GROUP, Matrix, Stream};
@@ -2688,6 +2688,121 @@ kernel void t_adam(device float* w [[buffer(0)]], device float* m [[buffer(1)]],
         w[i] = w[i] - p.alpha * (m[i] / adam.c1) / (sqrt(v[i] / adam.c2) + p.beta);
     }
 }
+
+// Whether (ka, ia) ranks before (kb, ib): larger key first, ties by column.
+inline bool ranks_before(float ka, uint ia, float kb, uint ib) {
+    return ka > kb || (ka == kb && ia < ib);
+}
+
+// The ranking key of a subcomponent: real size per description bit (unpaid ones first, unless
+// they write nothing).
+inline float ranking_key(float size, float bits) {
+    if (bits > 0.0f) return size / bits;
+    return size > 0.0f ? INFINITY : 0.0f;
+}
+
+// One threadgroup per row (striding): the row's ranking sorted in its group's scratch (`extra`
+// wide, a power of two at least `cols`), then its best prefix and single flips by one thread,
+// as the host's `select_sets`.
+kernel void t_select_sets(device const float* a [[buffer(0)]], device const float* q [[buffer(1)]], device const float* bits [[buffer(2)]],
+                          device const float* left [[buffer(3)]], device const float* weight [[buffer(4)]], device float* keys [[buffer(5)]],
+                          device uint* order [[buffer(6)]], device float* sizes [[buffer(7)]], device float* mask [[buffer(8)]],
+                          constant P& p [[buffer(9)]], uint group [[threadgroup_position_in_grid]],
+                          uint groups [[threadgroups_per_grid]], uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float shared[GROUP];
+    uint width = p.extra;
+    device float* key = keys + (ulong)group * width;
+    device uint* idx = order + (ulong)group * width;
+    device float* sr = sizes + (ulong)group * width;
+    ROWS {
+        device float* m = mask + (ulong)r * p.cols;
+        float partial = 0.0f, off = 0.0f, on_bits = 0.0f;
+        for (uint c = t; c < width; c += GROUP) {
+            if (c < p.cols) {
+                float s = fabs(a[(ulong)r * p.cols + c]) * q[(ulong)r * p.cols + c];
+                sr[c] = s;
+                partial += s;
+                if (m[c] == 0.0f) off += s; else on_bits += bits[c];
+                key[c] = ranking_key(s, bits[c]);
+            } else {
+                key[c] = -INFINITY;
+            }
+            idx[c] = c;
+        }
+        float all = group_sum(partial, shared, t);
+        float held_off = group_sum(off, shared, t);
+        float held_listed = group_sum(on_bits, shared, t);
+        threadgroup_barrier(mem_flags::mem_device);
+        for (uint k = 2; k <= width; k <<= 1) {
+            for (uint j = k >> 1; j > 0; j >>= 1) {
+                for (uint i = t; i < width; i += GROUP) {
+                    uint l = i ^ j;
+                    if (l > i) {
+                        bool first = (i & k) == 0;
+                        bool swap = first ? ranks_before(key[l], idx[l], key[i], idx[i]) : ranks_before(key[i], idx[i], key[l], idx[l]);
+                        if (swap) {
+                            float tk = key[i]; key[i] = key[l]; key[l] = tk;
+                            uint ti = idx[i]; idx[i] = idx[l]; idx[l] = ti;
+                        }
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_device);
+            }
+        }
+        if (t == 0) {
+            float w = weight[r], lr = left[r];
+            float listed = 0.0f, bound = lr + all;
+            float best_code = w * bound * bound;
+            uint best = 0;
+            for (uint k = 0; k < p.cols; k++) {
+                uint c = idx[k];
+                listed += bits[c];
+                bound -= sr[c];
+                float code = listed + w * bound * bound;
+                if (code < best_code) { best = k + 1; best_code = code; }
+            }
+            float held = lr + held_off;
+            if (best_code < held_listed + w * held * held) {
+                for (uint c = 0; c < p.cols; c++) m[c] = 0.0f;
+                for (uint k = 0; k < best; k++) m[idx[k]] = 1.0f;
+            }
+            bound = lr;
+            for (uint c = 0; c < p.cols; c++) if (m[c] == 0.0f) bound += sr[c];
+            for (uint sweep = 0; sweep < p.cols; sweep++) {
+                bool flipped = false;
+                for (uint c = 0; c < p.cols; c++) {
+                    bool on = m[c] == 1.0f;
+                    float next = on ? bound + sr[c] : max(bound - sr[c], 0.0f);
+                    float delta = (on ? -bits[c] : bits[c]) + w * (next * next - bound * bound);
+                    if (delta < 0.0f) { m[c] = on ? 0.0f : 1.0f; bound = next; flipped = true; }
+                }
+                if (!flipped) break;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+}
+
+// Per row `N = Σ_c (1 − m) |z| q` into `norms`; `cot += N (1 − m) sign(z) q`, `coefficient = N (1 −
+// m) |z| / q` (zero where `q` is).
+kernel void t_box_charge(device const float* z [[buffer(0)]], device const float* mask [[buffer(1)]], device const float* q [[buffer(2)]],
+                         device float* norms [[buffer(3)]], device float* cot [[buffer(4)]], device float* coefficient [[buffer(5)]],
+                         constant P& p [[buffer(6)]], uint group [[threadgroup_position_in_grid]],
+                         uint groups [[threadgroups_per_grid]], uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float shared[GROUP];
+    ROWS {
+        ulong base = (ulong)r * p.cols;
+        float partial = 0.0f;
+        for (uint c = t; c < p.cols; c += GROUP) partial += (1.0f - mask[base + c]) * fabs(z[base + c]) * q[base + c];
+        float n = group_sum(partial, shared, t);
+        if (t == 0) norms[r] = n;
+        for (uint c = t; c < p.cols; c += GROUP) {
+            float off = 1.0f - mask[base + c], zc = z[base + c], qc = q[base + c];
+            if (off != 0.0f && zc != 0.0f) cot[base + c] = cot[base + c] + n * off * (zc > 0.0f ? 1.0f : -1.0f) * qc;
+            coefficient[base + c] = qc > 0.0f ? n * off * fabs(zc) / qc : 0.0f;
+        }
+    }
+}
 "#;
 
     const NAMES: &[&str] = &[
@@ -2709,6 +2824,8 @@ kernel void t_adam(device float* w [[buffer(0)]], device float* m [[buffer(1)]],
         "t_sampled_head",
         "t_softmax_quadratic",
         "t_adam",
+        "t_select_sets",
+        "t_box_charge",
     ];
 
     /// The parameters of every kernel (MSL `P`).
@@ -2969,39 +3086,35 @@ kernel void t_adam(device float* w [[buffer(0)]], device float* m [[buffer(1)]],
             self.elements("t_adam", &buffers, w.len(), p)
         }
 
-        /// `run` on host copies of `inputs` and `outputs`, the outputs then written back: for
-        /// the sequential per-row searches no kernel runs (on unified memory each copy is one
-        /// pass over the values).
-        fn through_host<R>(
-            &self,
-            inputs: &[&Tensor],
-            outputs: &mut [&mut Tensor],
-            run: impl FnOnce(&Device, &[Tensor], &mut [Tensor]) -> Result<R, GpuError>,
-        ) -> Result<R, GpuError> {
-            let host_device = Device::host();
-            let copy = |t: &Tensor| -> Result<Tensor, GpuError> {
-                let values = self.stream.read::<f32>(buffer(t)?)?.into_iter().take(t.len()).map(f64::from).collect();
-                Ok(Tensor { rows: t.rows, cols: t.cols, data: Data::Host(values) })
-            };
-            let ins = inputs.iter().map(|t| copy(t)).collect::<Result<Vec<_>, _>>()?;
-            let mut outs = outputs.iter().map(|t| copy(t)).collect::<Result<Vec<_>, _>>()?;
-            let result = run(&host_device, &ins, &mut outs)?;
-            for (t, h) in outputs.iter_mut().zip(&outs) {
-                let values: Vec<f32> = host(h)?.iter().map(|v| *v as f32).collect();
-                t.data = Data::Metal(self.stream.upload(&values)?);
-            }
-            Ok(result)
-        }
-
         pub(super) fn select_sets(&self, (a, q): (&Tensor, &Tensor), bits: &Tensor, left: &Tensor, weight: &Tensor, mask: &mut Tensor) -> Result<(), GpuError> {
-            self.through_host(&[a, q, bits, left, weight], &mut [mask], |h, i, o| h.select_sets((&i[0], &i[1]), &i[2], &i[3], &i[4], &mut o[0]))
+            if a.is_empty() {
+                return Ok(());
+            }
+            let width = a.cols.next_power_of_two().max(2);
+            // One scratch ranking and row of sizes per threadgroup; the groups stride over the rows.
+            let groups = a.rows.min(512);
+            let (keys, order, sizes) = (self.stream.alloc(groups * width)?, self.stream.alloc(groups * width)?, self.stream.alloc(groups * width)?);
+            let p = P { rows: u32_of(a.rows)?, cols: u32_of(a.cols)?, extra: u32_of(width)?, ..P::default() };
+            u32_of(groups * width)?;
+            let buffers = [
+                whole(buffer(a)?),
+                whole(buffer(q)?),
+                whole(buffer(bits)?),
+                whole(buffer(left)?),
+                whole(buffer(weight)?),
+                whole(&keys),
+                whole(&order),
+                whole(&sizes),
+                whole(buffer(mask)?),
+            ];
+            self.stream.dispatch("t_select_sets", &buffers, &p, groups)
         }
 
         pub(super) fn box_charge(&self, z: &Tensor, mask: &Tensor, q: &Tensor, cot: &mut Tensor, coefficient: &mut Tensor) -> Result<Vec<f64>, GpuError> {
-            self.through_host(&[z, mask, q], &mut [cot, coefficient], |h, i, o| {
-                let (cot, coefficient) = o.split_at_mut(1);
-                h.box_charge(&i[0], &i[1], &i[2], &mut cot[0], &mut coefficient[0])
-            })
+            let norms = self.stream.alloc(z.rows)?;
+            let buffers = [whole(buffer(z)?), whole(buffer(mask)?), whole(buffer(q)?), whole(&norms), whole(buffer(cot)?), whole(buffer(coefficient)?)];
+            self.rows("t_box_charge", &buffers, z.rows, z.cols, P::default())?;
+            Ok(self.stream.read::<f32>(&norms)?.into_iter().take(z.rows).map(|n| 0.5 * f64::from(n) * f64::from(n)).collect())
         }
     }
 }

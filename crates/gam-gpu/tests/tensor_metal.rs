@@ -349,7 +349,7 @@ fn metal_grouped_products_and_sampled_head_match_the_host() {
 }
 
 #[test]
-fn metal_adam_and_host_searches_match_the_host() {
+fn metal_adam_sets_and_box_charge_match_the_host() {
     let Some(d) = metal() else { return };
     let host = Device::host();
     let (rows, cols) = (13, 9);
@@ -374,15 +374,31 @@ fn metal_adam_and_host_searches_match_the_host() {
         let step = rate * (hm[[i, j]].abs() / c1) / denominator;
         gamma(8) * (w[[i, j]].abs() + step) + rate * (first(i, j) / c1) / denominator + step * (second(i, j) / (2.0 * hv[[i, j]]) + gamma(8))
     });
-    // The sequential searches run on the host's copies: the host's answer on f32 inputs.
-    let reads = single(&matrix(rows, cols, 97, 2.0));
-    let metric = single(&matrix(rows, cols, 109, 1.5).mapv(f64::abs));
-    let bits = single(&matrix(1, cols, 101, 4.0).mapv(|b| b.abs() + 0.5));
-    let left = single(&matrix(rows, 1, 103, 1.0).mapv(f64::abs));
-    let weight = single(&matrix(rows, 1, 107, 3.0).mapv(f64::abs));
+    // Sets on dyadic inputs (sizes, ratios, sums and codes all exact in f32): the host's sets.
+    let dyadic = |rows: usize, cols: usize, seed: u64, levels: f64, unit: f64| matrix(rows, cols, seed, 1.0).mapv(|v| (v * levels).round() * unit);
+    let reads = dyadic(rows, cols, 97, 8.0, 0.25);
+    let metric = dyadic(rows, cols, 109, 16.0, 0.125).mapv(f64::abs);
+    let bits = dyadic(1, cols, 101, 2.0, 1.0).mapv(|e| 2f64.powf(e));
+    let left = dyadic(rows, 1, 103, 4.0, 0.25).mapv(f64::abs);
+    let weight = dyadic(rows, 1, 107, 2.0, 1.0).mapv(|e| 2f64.powf(e - 1.0));
     let mask = Array2::from_shape_fn((rows, cols), |(r, c)| f64::from(u8::from((r + c) % 3 == 0)));
     let (mut hmask, mut dmask) = both(&mask);
     host.select_sets((&up(&host, &reads), &up(&host, &metric)), &up(&host, &bits), &up(&host, &left), &up(&host, &weight), &mut hmask).expect("host sets");
     d.select_sets((&up(&d, &reads), &up(&d, &metric)), &up(&d, &bits), &up(&d, &left), &up(&d, &weight), &mut dmask).expect("device sets");
     assert_eq!(down(&d, &dmask), down(&host, &hmask));
+    // The box charge: `N` a sum of `cols` nonnegative terms of rounded inputs (γ_{cols+4} N), the
+    // cotangent's and coefficient's few more roundings of their own terms.
+    let (z, q, c0) = (matrix(rows, cols, 113, 2.0), matrix(rows, cols, 127, 1.0).mapv(f64::abs), matrix(rows, cols, 131, 1.0));
+    let off = mask.mapv(|m| 1.0 - m);
+    let ((hz, dz), (hm, dm), (hq, dq)) = (both(&z), both(&mask), both(&q));
+    let ((mut hc, mut dc), (mut hk, mut dk)) = (both(&c0), both(&Array2::zeros((rows, cols))));
+    let hn = host.box_charge(&hz, &hm, &hq, &mut hc, &mut hk).expect("host charge");
+    let dn = d.box_charge(&dz, &dm, &dq, &mut dc, &mut dk).expect("device charge");
+    let n: Vec<f64> = (0..rows).map(|r| (0..cols).map(|c| off[[r, c]] * z[[r, c]].abs() * q[[r, c]]).sum()).collect();
+    for r in 0..rows {
+        assert!((hn[r] - dn[r]).abs() <= 2.0 * gamma(cols + 4) * n[r] * n[r], "charge of row {r}: {} against {}", dn[r], hn[r]);
+    }
+    assert_within("charge cotangent", &down(&d, &dc), &down(&host, &hc), |r, c| gamma(cols + 8) * (c0[[r, c]].abs() + n[r] * q[[r, c]]));
+    let hk = down(&host, &hk);
+    assert_within("charge coefficient", &down(&d, &dk), &hk, |r, c| gamma(cols + 8) * hk[[r, c]].abs());
 }

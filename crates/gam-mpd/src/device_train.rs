@@ -34,6 +34,9 @@
 //! A step's products run in the trainer's arithmetic (TF32 on a device whose tensor cores make
 //! that worth it); [`Trainer::evaluate`] runs the same pass in float64, the number to decide on.
 //! The map's correction always runs in float64: it is a small difference of large products.
+//! On the Apple GPU, which has no float64 (`gam_gpu::tensor`), every product asked in float64
+//! here runs in f32 (the library is held in f32 there), and [`Trainer::evaluate`] is refused: its
+//! decision runs on a float64 device.
 
 use super::blocks::Describe;
 use super::dense::{eigh, svd};
@@ -50,6 +53,11 @@ use std::f64::consts::LN_2;
 
 fn error(e: impl std::fmt::Display) -> String {
     format!("device train: {e}")
+}
+
+/// Float64 on `device`, or f32 where it has none (module note, "Precision").
+fn exact(device: &Device) -> Arithmetic {
+    if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 }
 }
 
 /// How a library is trained.
@@ -204,7 +212,8 @@ pub fn statistics(device: &Device, model: &OperatorProgram, sites: &[Site], batc
     if draws == 0 || batches.is_empty() {
         return Err(error("statistics need draws and inputs"));
     }
-    let native = DeviceProgram::compile(device, model)?;
+    let mut native = DeviceProgram::compile(device, model)?;
+    native.set_arithmetic(exact(device));
     let mut uniforms = Uniforms(seed | 1);
     // Per site, the blocks of `Σ xᵀx` over its read nodes and of `Σ gᵀg` over its written ones.
     let mut moments: Vec<Vec<Vec<Option<Tensor>>>> = sites.iter().map(|s| s.reads.iter().map(|_| s.reads.iter().map(|_| None).collect()).collect()).collect();
@@ -213,9 +222,9 @@ pub fn statistics(device: &Device, model: &OperatorProgram, sites: &[Site], batc
     let mut rows = 0;
     let accumulate = |slot: &mut Option<Tensor>, x: &Tensor, y: &Tensor| -> Result<(), String> {
         match slot {
-            Some(total) => device.gemm(total, 1.0, x, Op::T, y, Op::N, 1.0, Arithmetic::F64).map_err(error),
+            Some(total) => device.gemm(total, 1.0, x, Op::T, y, Op::N, 1.0, exact(device)).map_err(error),
             None => {
-                *slot = Some(product(device, x, Op::T, y, Op::N, 1.0, Arithmetic::F64)?);
+                *slot = Some(product(device, x, Op::T, y, Op::N, 1.0, exact(device))?);
                 Ok(())
             }
         }
@@ -231,7 +240,7 @@ pub fn statistics(device: &Device, model: &OperatorProgram, sites: &[Site], batc
             }
         }
         for seed in native.sampled_many(&trace, &uniforms.rows(draws, batch.rows), None)? {
-            let back = native.vjp(&trace, seed, &writes, Arithmetic::F64)?;
+            let back = native.vjp(&trace, seed, &writes, exact(device))?;
             for (k, site) in sites.iter().enumerate() {
                 for (i, a) in site.writes.iter().enumerate() {
                     for (l, b) in site.writes.iter().enumerate() {
@@ -372,6 +381,9 @@ impl Trainer {
     /// The same pass in float64, without a gradient, its labels drawn from the settings' seed
     /// alone: the same inputs always meet the same draws, so two libraries compare on one footing.
     pub fn evaluate(&mut self, inputs: &FamilyInputs) -> Result<Tally, String> {
+        if !self.device.float64() {
+            return Err(error(format!("{} has no float64: evaluate on a float64 device", self.device.name())));
+        }
         let (arithmetic, state) = (self.arithmetic, self.uniforms.0);
         self.set_arithmetic(Arithmetic::F64);
         self.uniforms = Uniforms(self.settings.seed.rotate_left(32) | 1);
@@ -436,7 +448,7 @@ impl Trainer {
                             let missed = product(&d, &through, Op::N, a_i, Op::T, 1.0, arithmetic)?;
                             let mut both = d.zeros(rows, missed.cols()).map_err(error)?;
                             d.hadamard(&mut both, g, &missed, false).map_err(error)?;
-                            let summed = d.download(&product(&d, &both, Op::N, &ones(&d, missed.cols(), 1)?, Op::N, 1.0, Arithmetic::F64)?).map_err(error)?;
+                            let summed = d.download(&product(&d, &both, Op::N, &ones(&d, missed.cols(), 1)?, Op::N, 1.0, exact(&d))?).map_err(error)?;
                             for (total, v) in along.iter_mut().zip(summed.iter()) {
                                 *total += v;
                             }
@@ -450,7 +462,7 @@ impl Trainer {
             };
             let mut mask = ones(&d, rows, site.pieces)?;
             d.select_sets((&a, &own), &site.bits, &left, &weight, &mut mask).map_err(error)?;
-            let listed = d.download(&product(&d, &mask, Op::N, &site.listing, Op::N, 1.0, Arithmetic::F64)?).map_err(error)?;
+            let listed = d.download(&product(&d, &mask, Op::N, &site.listing, Op::N, 1.0, exact(&d))?).map_err(error)?;
             tally.l0 += listed.column(0).sum();
             tally.description += listed.column(1).sum();
             masks.insert(site.slot, mask);
@@ -612,23 +624,23 @@ impl Trainer {
                 Ok(scaled.dot(&decomposed.vectors.t()))
             };
             let grams = |held: &[&Tensor], ta: Op, tb: Op| -> Result<Vec<Vec<Tensor>>, String> {
-                held.iter().map(|a| held.iter().map(|b| product(&d, a, ta, b, tb, 1.0, Arithmetic::F64)).collect()).collect()
+                held.iter().map(|a| held.iter().map(|b| product(&d, a, ta, b, tb, 1.0, exact(&d))).collect()).collect()
             };
             let (u_widths, v_widths): (Vec<usize>, Vec<usize>) = (us.iter().map(|t| t.rows()).collect(), vs.iter().map(|t| t.cols()).collect());
             let inverse = pseudo_inverse(grams(&us, Op::N, Op::T)?)?;
             let mut g = Vec::new();
             for column in split(&inverse, &u_widths, true) {
                 let parts = split(&column, &u_widths, false).iter().map(|p| d.upload(p.view()).map_err(error)).collect::<Result<Vec<_>, _>>()?;
-                g.push(products(&d, us.iter().copied().zip(&parts), (Op::T, Op::N), 1.0, Arithmetic::F64)?);
+                g.push(products(&d, us.iter().copied().zip(&parts), (Op::T, Op::N), 1.0, exact(&d))?);
             }
             let inverse = pseudo_inverse(grams(&vs, Op::T, Op::N)?)?;
             let mut h = Vec::new();
             for row in split(&inverse, &v_widths, false) {
                 let parts = split(&row, &v_widths, true).iter().map(|p| d.upload(p.view()).map_err(error)).collect::<Result<Vec<_>, _>>()?;
-                h.push(products(&d, parts.iter().zip(vs.iter().copied()), (Op::N, Op::T), 1.0, Arithmetic::F64)?);
+                h.push(products(&d, parts.iter().zip(vs.iter().copied()), (Op::N, Op::T), 1.0, exact(&d))?);
             }
             self.sites[k].projectors = (g, h);
-            self.keep_map(k, Arithmetic::F64)?;
+            self.keep_map(k, exact(&d))?;
             let site = &self.sites[k];
             let download = |op: usize| -> Result<Array2<f64>, String> { d.download(self.program.dense(op)?).map_err(error) };
             let v_parts: Vec<Array2<f64>> = site.reads.iter().map(|b| download(b.op)).collect::<Result<_, _>>()?;

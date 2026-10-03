@@ -4,8 +4,9 @@
 //! encodes every operation into one open command buffer: compute dispatches of its own kernel
 //! library, and f32 products on Metal Performance Shaders' GEMM. Buffers are committed to the
 //! context's one queue in order (every few hundred dispatches, so the device starts early) and
-//! waited for only when the host reads a value ([`Stream::read`], [`Stream::finish`]): a training
-//! step's hundreds of small operations cost one round trip, not one each. Metal's default hazard
+//! waited for only when the host reads a value ([`Stream::read`], [`Stream::finish`]) or when more
+//! than a few are in flight: a training step's hundreds of small operations cost a few round
+//! trips, not one each, and its intermediates are freed as their work finishes. Metal's default hazard
 //! tracking orders every read after the write before it, within and across command buffers of
 //! the queue, and a committed command buffer retains the buffers it reads, so a tensor dropped
 //! while its work is queued is freed only after that work.
@@ -40,7 +41,12 @@ type Pipeline = ProtocolObject<dyn MTLComputePipelineState>;
 pub(crate) const GROUP: usize = 256;
 
 /// Dispatches encoded before the open command buffer is committed (without waiting).
-const COMMIT_EVERY: usize = 256;
+const COMMIT_EVERY: usize = 64;
+
+/// Committed command buffers allowed in flight; past it the host waits for the oldest. A dropped
+/// tensor's buffer is freed once every command buffer reading it is released, so this bounds what
+/// the queued work holds alive to a few command buffers' intermediates.
+const IN_FLIGHT: usize = 3;
 
 /// The most threadgroups one dispatch launches; kernels stride over the rest.
 const MAX_GROUPS: usize = 1 << 16;
@@ -202,7 +208,8 @@ impl Stream {
         Ok(())
     }
 
-    /// After an encoded operation: commit when enough are queued, and drop what has finished.
+    /// After an encoded operation: commit when enough are queued, release what has finished, and
+    /// wait for the oldest while too many are in flight.
     fn encoded(queue: &mut Queue) -> Result<(), GpuError> {
         let Some(open) = queue.open.as_mut() else { return Ok(()) };
         open.dispatches += 1;
@@ -210,20 +217,19 @@ impl Stream {
             return Ok(());
         }
         Self::commit(queue);
-        let mut kept = Vec::with_capacity(queue.committed.len());
-        let mut first_error = None;
-        for (commands, held) in queue.committed.drain(..) {
+        // The queue runs its command buffers in order: release the finished front, then wait.
+        while let Some((commands, _)) = queue.committed.first() {
             let status = commands.status();
-            if status == MTLCommandBufferStatus::Completed {
-                drop(held);
-            } else if status == MTLCommandBufferStatus::Error {
-                first_error.get_or_insert(ended(&commands));
-            } else {
-                kept.push((commands, held));
+            let finished = status == MTLCommandBufferStatus::Completed || status == MTLCommandBufferStatus::Error;
+            if !finished && queue.committed.len() <= IN_FLIGHT {
+                break;
             }
+            let (commands, held) = queue.committed.remove(0);
+            commands.waitUntilCompleted();
+            drop(held);
+            ended(&commands)?;
         }
-        queue.committed = kept;
-        first_error.unwrap_or(Ok(()))
+        Ok(())
     }
 
     fn pipeline(&self, kernel: &str) -> Result<&Pipeline, GpuError> {
