@@ -28,7 +28,7 @@ pub const ROUTING_HEADS: usize = 3;
 /// Three causal rotary heads on `ℝ¹⁶` (head dimension 4, planes at frequencies `1` and
 /// `0.1`, rotate-half pairing, score scale `1/2`) with rank-2 value/output transports.
 /// Heads 1 and 2 share query `Q₁` and key `K₁`; head 3 reads query `2 Q₁` and key `K₁`.
-/// Every tensor, input and readout is dyadic.
+/// Every tensor and input is dyadic.
 #[derive(Clone, Debug)]
 pub struct RoutingToy {
     /// Per head, `head_dim × width`.
@@ -38,8 +38,6 @@ pub struct RoutingToy {
     pub value: Vec<Array2<f64>>,
     /// Per head, `width × rank`.
     pub output: Vec<Array2<f64>>,
-    /// A readout of the block's output, `1 × width`.
-    pub readout: Array2<f64>,
 }
 
 /// `I + strictly_lower` and `I + strictly_upper` with entries in `{−1, 0, 1}`, their product
@@ -84,13 +82,11 @@ impl RoutingToy {
         let key_one = dyadic(&mut rng, hd, d, 32, 64.0);
         let value = (0..ROUTING_HEADS).map(|_| dyadic(&mut rng, r, d, 32, 64.0)).collect();
         let output = (0..ROUTING_HEADS).map(|_| dyadic(&mut rng, d, r, 64, 64.0)).collect();
-        let readout = dyadic(&mut rng, 1, d, 16, 16.0);
         Self {
             query: vec![query_one.clone(), query_one.clone(), &query_one * 2.0],
             key: vec![key_one.clone(), key_one.clone(), key_one],
             value,
             output,
-            readout,
         }
     }
 
