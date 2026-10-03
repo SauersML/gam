@@ -512,6 +512,27 @@ impl Trainer {
         Ok(tally)
     }
 
+    /// The gradients summed since the last update, every site's read blocks then written blocks
+    /// (to sum replicas' passes: data parallel over devices).
+    pub fn gradients(&self) -> Result<Vec<Array2<f64>>, String> {
+        self.sites.iter().flat_map(|s| s.reads.iter().chain(&s.writes)).map(|b| self.device.download(&b.gradient).map_err(error)).collect()
+    }
+
+    /// Replace the summed gradients by `gradients` (as [`Self::gradients`] orders them).
+    pub fn set_gradients(&mut self, gradients: &[Array2<f64>]) -> Result<(), String> {
+        let blocks: Vec<&mut Block> = self.sites.iter_mut().flat_map(|s| s.reads.iter_mut().chain(s.writes.iter_mut())).collect();
+        if blocks.len() != gradients.len() {
+            return Err(error(format!("{} gradients for {} blocks", gradients.len(), blocks.len())));
+        }
+        for (b, g) in blocks.into_iter().zip(gradients) {
+            if g.dim() != b.gradient.dim() {
+                return Err(error(format!("a {:?} gradient for a {:?} block", g.dim(), b.gradient.dim())));
+            }
+            b.gradient = self.device.upload(g.view()).map_err(error)?;
+        }
+        Ok(())
+    }
+
     /// One Adam update from the gradients the training passes since the last summed, then each
     /// site's map restored (module note, "The map").
     pub fn update(&mut self) -> Result<(), String> {

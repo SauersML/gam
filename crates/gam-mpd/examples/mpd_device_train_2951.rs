@@ -8,7 +8,9 @@
 //! `MICRO` at a time (default 8), and takes one Adam step of `RATE` (default 3e-4, a share of
 //! each factor's root mean square entry); `STEPS` updates (default 1000). Every `SYNC` updates
 //! (default 25) and at the end, the library goes to `OUT_DIR/{site}.{v,u}.f64` and the code of the
-//! `EVAL` sequences after the training ones (default 8) in float64 to `OUT_DIR/evals.json`.
+//! `EVAL` sequences after the training ones (default 8) in float64 to `OUT_DIR/evals.json`. With
+//! several CUDA devices each holds a replica: a batch's sequences are split among them, their
+//! gradients summed, and every replica takes the same update.
 
 use gam_gpu::tensor::{Arithmetic, Device};
 use gam_mpd::blocks::Generic;
@@ -77,7 +79,11 @@ fn main() -> Result<(), String> {
     if chosen.is_empty() {
         return Err(format!("{}: no library", given.display()));
     }
-    let device = gam_mpd::masked_device::device()?.unwrap_or_else(Device::host);
+    let mut devices = Device::accelerators(gam_gpu::global_policy()).map_err(|e| e.to_string())?;
+    if devices.is_empty() {
+        devices.push(Device::host());
+    }
+    let device = devices[0].clone();
     let arithmetic = if device.is_host() { Arithmetic::F64 } else { Arithmetic::Tf32 };
     let started = Instant::now();
     let chunks = |range: std::ops::Range<usize>| -> Vec<Vec<usize>> { range.collect::<Vec<_>>().chunks(micro).map(<[usize]>::to_vec).collect() };
@@ -85,10 +91,14 @@ fn main() -> Result<(), String> {
     let measured = statistics(&device, model, &chosen, &statistic_batches, 2, 0xDE5C)?;
     let describe = Generic::new(&measured, observations);
     drop(measured);
-    let masked = Masked::build(model, chosen.clone(), libraries)?;
-    let settings = Settings { observations, rate, betas: (0.9, 0.999), epsilon: 1e-12, draws: 2, seed: 0x5E7 };
-    let mut trainer = Trainer::new(&device, model, &chosen, masked, &describe, settings, arithmetic)?;
-    eprintln!("{} sites on {} ({arithmetic:?}), statistics and start {:.0}s", chosen.len(), device.name(), started.elapsed().as_secs_f64());
+    let mut replicas = Vec::new();
+    for (r, replica) in devices.iter().enumerate() {
+        let masked = Masked::build(model, chosen.clone(), libraries.clone())?;
+        let settings = Settings { observations, rate, betas: (0.9, 0.999), epsilon: 1e-12, draws: 2, seed: 0x5E7 + 0x1000 * r as u64 };
+        replicas.push(Trainer::new(replica, model, &chosen, masked, &describe, settings, arithmetic)?);
+    }
+    drop(libraries);
+    eprintln!("{} sites on {} × {} ({arithmetic:?}), statistics and start {:.0}s", chosen.len(), devices.len(), device.name(), started.elapsed().as_secs_f64());
     let evals: Vec<_> = chunks(train..train + eval).iter().map(|c| sequences(c)).collect();
     let mut log = Vec::new();
     let evaluate = |trainer: &mut Trainer, step: usize, log: &mut Vec<serde_json::Value>| -> Result<(), String> {
@@ -117,18 +127,52 @@ fn main() -> Result<(), String> {
         std::fs::write(out.join("evals.json"), json!({"observations": observations, "evals": log}).to_string()).map_err(|e| e.to_string())
     };
     if eval > 0 {
-        evaluate(&mut trainer, 0, &mut log)?;
+        evaluate(&mut replicas[0], 0, &mut log)?;
     }
     let (mut trained, mut busy) = (0usize, 0.0f64);
     for step in 0..steps {
         let started = Instant::now();
         let order: Vec<usize> = (0..batch).map(|i| (step * batch + i) % train).collect();
+        let share = order.len().div_ceil(replicas.len());
+        let tallies: Vec<Result<Tally, String>> = std::thread::scope(|scope| {
+            let running: Vec<_> = replicas
+                .iter_mut()
+                .zip(order.chunks(share))
+                .map(|(trainer, mine)| {
+                    let sequences = &sequences;
+                    scope.spawn(move || -> Result<Tally, String> {
+                        let mut tally = Tally::default();
+                        for part in mine.chunks(micro) {
+                            tally.add(&trainer.train(&sequences(part))?);
+                        }
+                        Ok(tally)
+                    })
+                })
+                .collect();
+            running.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("a replica panicked".to_string()))).collect()
+        });
         let mut tally = Tally::default();
-        for part in order.chunks(micro) {
-            tally.add(&trainer.train(&sequences(part))?);
+        for t in tallies {
+            tally.add(&t?);
         }
-        trainer.update()?;
-        device.synchronize().map_err(|e| e.to_string())?;
+        if replicas.len() > 1 {
+            let mut total = replicas[0].gradients()?;
+            for replica in &replicas[1..] {
+                for (sum, g) in total.iter_mut().zip(replica.gradients()?) {
+                    *sum += &g;
+                }
+            }
+            for replica in &mut replicas {
+                replica.set_gradients(&total)?;
+            }
+        }
+        std::thread::scope(|scope| -> Result<(), String> {
+            let running: Vec<_> = replicas.iter_mut().map(|trainer| scope.spawn(move || trainer.update())).collect();
+            running.into_iter().try_for_each(|h| h.join().unwrap_or_else(|_| Err("a replica panicked".to_string())))
+        })?;
+        for d in &devices {
+            d.synchronize().map_err(|e| e.to_string())?;
+        }
         let seconds = started.elapsed().as_secs_f64();
         trained += batch;
         busy += seconds;
@@ -143,9 +187,21 @@ fn main() -> Result<(), String> {
             trained as f64 / busy
         );
         if (step + 1) % sync == 0 || step + 1 == steps {
-            evaluate(&mut trainer, step + 1, &mut log)?;
+            // Every replica restores its map and prices its bits again; the first is evaluated.
+            std::thread::scope(|scope| -> Result<(), String> {
+                let describe = &describe;
+                let running: Vec<_> = replicas[1..].iter_mut().map(|trainer| scope.spawn(move || trainer.sync(describe).map(|_| ()))).collect();
+                running.into_iter().try_for_each(|h| h.join().unwrap_or_else(|_| Err("a replica panicked".to_string())))
+            })?;
+            evaluate(&mut replicas[0], step + 1, &mut log)?;
         }
     }
-    eprintln!("throughput: {:.2} sequences/s ({:.1} ms per sequence-step) at batch {batch} on {}", trained as f64 / busy.max(1e-9), 1e3 * busy / trained.max(1) as f64, device.name());
+    eprintln!(
+        "throughput: {:.2} sequences/s ({:.1} ms per sequence-step) at batch {batch} on {} × {}",
+        trained as f64 / busy.max(1e-9),
+        1e3 * busy / trained.max(1) as f64,
+        devices.len(),
+        device.name()
+    );
     Ok(())
 }

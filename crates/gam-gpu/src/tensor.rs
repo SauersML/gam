@@ -314,6 +314,25 @@ impl Device {
         Self { backend: Arc::new(Backend::Host) }
     }
 
+    /// Every CUDA device `policy` admits, the selected one first (data-parallel work runs one
+    /// replica per device); empty under `off` or when none exists.
+    pub fn accelerators(policy: GpuPolicy) -> Result<Vec<Self>, GpuError> {
+        #[cfg(target_os = "linux")]
+        {
+            if policy == GpuPolicy::Off {
+                return Ok(Vec::new());
+            }
+            let Some(runtime) = crate::device_runtime::GpuRuntime::resolve(policy)? else { return Ok(Vec::new()) };
+            return runtime
+                .devices
+                .iter()
+                .map(|device| Ok(Self { backend: Arc::new(Backend::Cuda(cuda::Engine::new(device.ordinal, device.name.clone())?)) }))
+                .collect();
+        }
+        #[cfg(not(target_os = "linux"))]
+        Ok(Self::accelerator(policy)?.into_iter().collect())
+    }
+
     /// The accelerator `policy` selects for device-resident float64 execution: a CUDA device
     /// (`auto` when one resolved, `required` or an error), `None` under `off` or when none exists.
     pub fn accelerator(policy: GpuPolicy) -> Result<Option<Self>, GpuError> {
