@@ -62,6 +62,7 @@ parser.add_argument("--word-restarts", type=int, default=6, help="the per-word a
 parser.add_argument("--delta", choices=["off", "both", "only"], default="off",
                     help="VPD's residual (delta) semantics in the box: off (as the sets are scored), both, or only")
 parser.add_argument("--name", default="ours", help="the given sets' family name")
+parser.add_argument("--given", action="append", default=[], help="NAME=STEM: one more given family (on the same library)")
 parser.add_argument("--library", type=Path, default=Path.home() / "mpd-data/pieces/vpd4l_library")
 parser.add_argument("--subcomponents", type=Path, default=None,
                     help="score another library's sets: the masked driver's library files (DIR/{site}.v.f64, .u.f64, manifest.json) in place of VPD's subcomponents")
@@ -151,11 +152,12 @@ class Family:
         return sum(int(idx.numel()) * size[n] for d in self.mb for n, (idx, _, _) in d.items()) / (args.rows * S)
 
 
-def given_family() -> Family:
+def given_family(stem=None) -> Family:
     """The driver's CSR sets in VPD's site order."""
-    indptr = np.load(f"{args.sets}.indptr.npy")
-    indices = np.load(f"{args.sets}.indices.npy")
-    offsets = np.load(f"{args.sets}.offsets.npy")
+    stem = args.sets if stem is None else stem
+    indptr = np.load(f"{stem}.indptr.npy")
+    indices = np.load(f"{stem}.indices.npy")
+    offsets = np.load(f"{stem}.offsets.npy")
     manifest = json.load(open(args.library / "manifest.json"))
     driver_sites = sorted(manifest)
     assert len(offsets) == len(driver_sites) + 1, "offsets do not number the library's sites"
@@ -226,6 +228,9 @@ for tau in thresholds:
     families[f"vpd_gt_{tau:g}"] = transformed(Family(ci_mb), lambda v, tau=tau: (v > tau).float())
 if "given" in wanted:
     families[args.name] = given_family()
+for spec in args.given:
+    name, stem = spec.split("=", 1)
+    families[name] = given_family(stem)
 log("families: " + ", ".join(f"{k} L0 {f.l0():.1f}" for k, f in families.items()))
 
 
@@ -297,6 +302,9 @@ def merge_out(key: str, value: dict):
     data[key]["rows"], data[key]["offset"] = args.rows, args.offset
     if args.name in families:
         data[key].setdefault("sets", {})[args.name] = str(args.sets)
+    for spec in args.given:
+        name, stem = spec.split("=", 1)
+        data[key].setdefault("sets", {})[name] = stem
     tmp = args.out.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=1))
     tmp.replace(args.out)
