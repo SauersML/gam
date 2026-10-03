@@ -285,6 +285,61 @@ def stage_colon():
     json.dump(res, open(OUTD / "e4_colon_control.json", "w"), indent=1)
 
 
+def stage_endings():
+    """Does an edit's damage to a HellaSwag/PIQA ending grow with how many of its tokens finish a split word?
+    Per ending (every choice, the correct one marked): the change in its summed log-probability, edited minus
+    original, regressed by least squares on its counts of word-piece tokens (continuing a word), word-start tokens
+    (space + letter) and other tokens; 95% intervals from resampling items. Writes e4_endings.json."""
+    rq = build_requests()
+    zb, z = np.load(OUTD / "scores_base.npz"), np.load(OUTD / "scores.npz")
+    names = ["base"] + list(z["names"])
+    lp = np.hstack([zb["lp"], z["lp"]])
+    tok = E.tokenizer()
+    txt = [tok.decode([i]) for i in range(tok.get_vocab_size())]
+    piece = np.array([t[:1].isalpha() for t in txt])
+    word = np.array([len(t) > 1 and t[0] == " " and t[1].isalpha() for t in txt])
+    offs = np.concatenate([[0], np.cumsum(rq["lens"])])
+    res = {}
+    for task in ("hellaswag", "piqa"):
+        its = np.nonzero(rq["task"] == task)[0]
+        rows, item, gold = [], [], []
+        for it in its:
+            lo, n = rq["req_lo"][it], rq["req_n"][it]
+            for q in range(lo, lo + n):
+                cont = rq["flat"][offs[q + 1] - rq["n_cont"][q]:offs[q + 1]]
+                npc, nw = int(piece[cont].sum()), int(word[cont].sum())
+                rows.append([npc, nw, len(cont) - npc - nw])
+                item.append(it)
+                gold.append(q - lo == rq["gold"][it])
+        X = np.c_[np.ones(len(rows)), np.array(rows, float)]
+        item, gold = np.array(item), np.array(gold)
+        uniq = np.unique(item)
+        pos = {u: np.nonzero(item == u)[0] for u in uniq}
+        rng = np.random.default_rng(0)
+        draws = [np.concatenate([pos[u] for u in rng.choice(uniq, len(uniq))]) for _ in range(500)]
+        res[task] = {"n_endings": len(rows), "n_items": len(uniq), "models": {}}
+        for nm in ("vpd_match_lora282_lam10", "lora282_lam10"):
+            y = lp[:, names.index(nm)] - lp[:, 0]
+            y = np.concatenate([y[rq["req_lo"][it]:rq["req_lo"][it] + rq["req_n"][it]] for it in its])
+            coef = np.linalg.lstsq(X, y, rcond=None)[0]
+            bs = np.array([np.linalg.lstsq(X[d], y[d], rcond=None)[0] for d in draws])
+            lo_, hi_ = np.percentile(bs, [2.5, 97.5], 0)
+            npc = X[:, 1].astype(int)
+            bins = [(a, b) for a, b in ((0, 0), (1, 1), (2, 2), (3, 4), (5, 7), (8, 99)) if ((npc >= a) & (npc <= b)).sum() >= 30]
+            res[task]["models"][nm] = {
+                "coef": {k: [float(coef[i]), float(lo_[i]), float(hi_[i])] for i, k in enumerate(("intercept", "word_piece", "word_start", "other"))},
+                "by_pieces": [{"lo": a, "hi": b, "n": int(((npc >= a) & (npc <= b)).sum()),
+                               "mean": float(y[(npc >= a) & (npc <= b)].mean()),
+                               "ci": [float(x) for x in np.percentile([y[d][(npc[d] >= a) & (npc[d] <= b)].mean() for d in draws[:200]], [2.5, 97.5])]}
+                              for a, b in bins],
+                "correct_only_coef": [float(c) for c in np.linalg.lstsq(X[gold], y[gold], rcond=None)[0]]}
+            c = res[task]["models"][nm]["coef"]
+            print(f"{task:9s} {nm:24s} per word piece {c['word_piece'][0]:+.4f} [{c['word_piece'][1]:+.4f}, {c['word_piece'][2]:+.4f}]  "
+                  f"per word start {c['word_start'][0]:+.4f} [{c['word_start'][1]:+.4f}, {c['word_start'][2]:+.4f}]  "
+                  f"per other {c['other'][0]:+.4f} [{c['other'][1]:+.4f}, {c['other'][2]:+.4f}]")
+    json.dump(res, open(OUTD / "e4_endings.json", "w"), indent=1)
+
+
 if __name__ == "__main__":
     {"score": lambda: stage_score(sys.argv[2:3] == ["base"]), "score_nocolon": lambda: stage_score(colon=False),
-     "colon": stage_colon, "summarize": stage_summarize}[sys.argv[1]]()
+     "colon": stage_colon, "endings": stage_endings, "summarize": stage_summarize}[sys.argv[1]]()
