@@ -20,7 +20,10 @@
 # at most 2 h, so HOURS is cut to 2). MATS_CHAIN=K submits K segments of the same job, each starting
 # after the last ends (--dependency=afterany), for commands that resume from their own checkpoint
 # (mpd_pieces_masked_2951 resumes from OUT.select/): a segment cut off by its time limit resumes, a
-# task that ended (exit 0, or a real error) skips its later segments. Example, 8 x 2 h in debug:
+# task that ended (exit 0, or a real error) skips its later segments. Chain only work that resumes
+# exactly (the masked driver restarts an unfinished sequence, so not passages longer than 2 h) and
+# keep debug arrays small (default %8): debug outranks the team's normal-QOS priority order.
+# Example, 8 x 2 h in debug:
 #   MATS_QOS=debug MATS_CHAIN=8 mats-run NAME 16 12 2 -- ...
 #
 # Environment: MATS_GPUS=N (L40s; CUDA 12.2 libs are on LD_LIBRARY_PATH),
@@ -34,7 +37,7 @@
 # slurm-JOBID_TASK.log; `mats-pull NAME` brings back every task's outputs.
 set -Eeuo pipefail
 here=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
-usage() { sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 [ $# -ge 6 ] && [ "$5" = -- ] || usage
 NAME=$1 CPUS=$2 MEM=$3 HOURS=$4
 shift 5
@@ -53,6 +56,11 @@ fi
 GPUS=${MATS_GPUS:-0}
 ARRAY=${MATS_ARRAY:-}
 [[ -z $ARRAY || $ARRAY =~ ^[0-9][0-9,:%-]*$ ]] || { echo "mats-run: MATS_ARRAY is a Slurm --array spec like 0-31%24" >&2; exit 2; }
+# Debug jobs outrank every normal job, so a debug array runs at most 8 tasks at once unless it says.
+if [ "$QOS" = debug ] && [ -n "$ARRAY" ] && [[ $ARRAY != *%* ]]; then
+    ARRAY=$ARRAY%8
+    echo "mats-run: debug array limited to 8 tasks at once ($ARRAY)" >&2
+fi
 # The node has 458 GB for 252 CPUs, so memory runs out before CPUs do.
 (( MEM > 4 * CPUS && MEM > 24 )) && echo "mats-run: ${MEM} GB for ${CPUS} CPUs; RAM is the scarce resource, so ask for about 1.5x the measured peak (mats-status shows it)" >&2
 
