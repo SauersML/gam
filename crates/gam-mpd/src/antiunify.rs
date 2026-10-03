@@ -1136,7 +1136,6 @@ pub fn discover_rules(normalization: &Normalization) -> Result<RuleLibrary, Egra
                 continue;
             }
             let families = admissible_families(saturation, &pattern);
-            if pattern.score().0 > 0 { eprintln!("DBG pair {a:?} {b:?} score={:?} fams={} sk={}", pattern.score(), families.len(), pattern.skeleton()); }
             if families.is_empty() {
                 continue;
             }
@@ -1188,7 +1187,6 @@ pub fn discover_rules(normalization: &Normalization) -> Result<RuleLibrary, Egra
             continue;
         }
         let header = rule_header_bits(holes.len(), sites.len(), saturation)?;
-        eprintln!("DBG cand {skeleton} replaced={replaced} header={header} roles={:?} fam={:?}", roles.iter().map(|(r,c)| (matches!(r, Role::Interior), matches!(c, Role::Interior))).collect::<Vec<_>>(), sites.iter().map(|s| (s.binding.family, s.binding.bits, s.binding.residual_bits)).collect::<Vec<_>>());
         candidates.push(Rule { skeleton, body, holes, roles, calls: sites, saving: replaced - header as i64 });
     }
     candidates.sort_by(|x, y| y.saving.cmp(&x.saving).then(x.body.cmp(&y.body)));
@@ -1206,8 +1204,7 @@ pub fn discover_rules(normalization: &Normalization) -> Result<RuleLibrary, Egra
         }
         let mut trial = accepted.clone();
         trial.push(rule.clone());
-        let Some(priced) = price(normalization, &trial)? else { eprintln!("DBG price none"); continue };
-        eprintln!("DBG priced {} vs {}", priced.bits, bits_after);
+        let Some(priced) = price(normalization, &trial)? else { continue };
         if priced.bits < bits_after {
             claimed.extend(touched);
             accepted = trial;

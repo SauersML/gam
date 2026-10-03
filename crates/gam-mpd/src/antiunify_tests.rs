@@ -314,13 +314,7 @@ fn an_ideal_resid_mlp_is_one_rule_called_by_every_other_layer() {
         let error = (&trace.values[program.output] - &target).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
         assert!(error < 2.0_f64.powi(-FRACTION_BITS / 2), "the planted ResidMLP computes x + relu(x): {error:e}");
 
-        let small = gam_runtime::resource::MemoryGovernor::with_budget_bytes(64 << 20);
-        let probe = crate::egraph::saturate(&crate::egraph::canonical_units(&program).expect("canon"), &small).expect("sat");
-        eprintln!("DBG report {:?}", probe.report);
         let normalization = normalize(&program, test_governor()).expect("normalizes");
-        eprintln!("DBG extracted bits={}", normalization.extraction.bits);
-        for (i, n) in normalization.extraction.program.nodes.iter().enumerate() { eprintln!("DBG node {i}: {n:?}"); }
-        for (i, o) in normalization.extraction.program.operators.iter().enumerate() { eprintln!("DBG op {i}: {} {:?}x{:?} {:?}", o.name, o.rows.width(), o.cols.width(), o.matrix()); }
         assert!(normalization.saturation.report.saturated());
         let library = discover_rules(&normalization).expect("discovers");
         assert_eq!(library.rules.len(), 1, "{layers} layers: {:?}", library.rules.iter().map(|r| &r.skeleton).collect::<Vec<_>>());
