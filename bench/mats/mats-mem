@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Change the memory of our pending MATS jobs named NAME, keeping their place in the queue (#2951):
-#   mats-mem NAME MEM_GB
+# Resize our pending MATS jobs named NAME, keeping their place in the queue (#2951):
+#   mats-mem NAME MEM_GB [CPUS]
+# (CPUS also sets CPUs per task: `scontrol update NumCPUs=` alone leaves that, and with it the real
+# request, unchanged.)
 set -Eeuo pipefail
-[ $# -eq 2 ] && [[ $2 =~ ^[0-9]+$ ]] || { echo "usage: mats-mem NAME MEM_GB" >&2; exit 2; }
-ssh mats "for j in \$(squeue -u \$USER -h -t PD -n '$1' -o %i); do scontrol update jobid=\$j minmemorynode=$(( $2 * 1024 )) && echo \"\$j '$1' now ${2}G\"; done"
+[ $# -ge 2 ] && [[ $2 =~ ^[0-9]+$ ]] && [[ ${3:-1} =~ ^[0-9]+$ ]] || { echo "usage: mats-mem NAME MEM_GB [CPUS]" >&2; exit 2; }
+cpus=${3:+NumCPUs=$3 CPUsPerTask=$3 MinCPUsNode=$3}
+ssh mats "for j in \$(squeue -u \$USER -h -t PD -n '$1' -o %i | sed 's/_.*//' | sort -u); do scontrol update jobid=\$j minmemorynode=$(( $2 * 1024 )) $cpus && echo \"\$j '$1' now ${2}G${3:+, $3 CPUs}\"; done"
