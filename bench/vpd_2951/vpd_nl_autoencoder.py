@@ -642,7 +642,8 @@ def stage_names():
     q = lambda w: repr(w)[1:-1]
     requests, evidence = [], []
     for c, con in enumerate(rep["concepts"]):
-        members, on = con["members"], con["on"]
+        members = con["members"]
+        on = con.get("on", [1.0] * len(members))
         where = Counter(f"layer {lab[j]['site'].split('.')[1]} {'attention' if '.attn.' in lab[j]['site'] else 'MLP'}" for j in members)
         cnt = Counter(words[t] for t in users[c])
         score = {w: k * math.log(max(1.0, k * T / (len(users[c]) * base[w]))) for w, k in cnt.items()}
@@ -881,6 +882,67 @@ def stage_program():
     print(f"program bits per subcomponent: {sorted(set(out.tolist()))}")
 
 
+def programs_kl(target, C, programs, rows):
+    """Exact KL(model || model running each word's program) for consecutive eval rows `rows`,
+    `programs` one list of subcomponents per word of those rows."""
+    import torch
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from vpd_eval import kl_per_pos
+
+    z, indptr, indices, offsets, names = sets()
+    site = site_of(offsets)
+    dev = next(iter(target.buffers())).device
+    out = []
+    for i, r in enumerate(rows):
+        ids = torch.tensor(z["ids"][EVAL[0] + r:EVAL[0] + r + 1], device=dev)
+        prog = programs[i * CONTEXT:(i + 1) * CONTEXT]
+        pos = np.repeat(np.arange(CONTEXT), [len(p) for p in prog]).astype(np.int64)
+        glob = np.concatenate([np.asarray(p, dtype=np.int64) for p in prog])
+        masks = {n: torch.zeros(1, CONTEXT, C[n], device=dev) for n in names}
+        for s_, n in enumerate(names):
+            sel = site[glob] == s_
+            if sel.any():
+                masks[n][0, torch.tensor(pos[sel], device=dev), torch.tensor(glob[sel] - offsets[s_], device=dev)] = 1.0
+        with torch.no_grad():
+            out.append(kl_per_pos(masked(target, ids, masks), target(ids))[0].cpu().numpy())
+    return np.concatenate(out)
+
+
+def stage_textonly():
+    """The text-only autoencoder under the objective: per held-out word, the English names of the
+    concepts the encoder invokes are the whole message; the decoder runs every member of every named
+    concept. Total = text bits (fixed LM) + the program's description bits + n KL / ln 2, against
+    VPD's own sets (their program + n KL) and the all-on program."""
+    z, indptr, indices, offsets, names = sets()
+    rep, ptr, idx, bits = fit_outputs()
+    n = rep["observations"]
+    cname = json.load(open(OUT / "names.json"))["names"]
+    words = TEXT_ROWS * CONTEXT
+    inv = [idx[ptr[eval_word(0, 0) + w]:ptr[eval_word(0, 0) + w + 1]].tolist() for w in range(words)]
+    members = [c["members"] for c in rep["concepts"]]
+    programs = [sorted(j for c in i for j in members[c]) for i in inv]
+    target, C = load_light()
+    kl = programs_kl(target, C, programs, range(TEXT_ROWS))
+    lines = ["; ".join(cname[c] for c in i) for i in inv]
+    lm = LM()
+    text = np.concatenate([lm.line_bits(lines[r * CONTEXT:(r + 1) * CONTEXT]) for r in range(TEXT_ROWS)])
+    b = bits[eval_word(0, 0):eval_word(0, 0) + words]
+    prog_bits = np.fromfile(OUT / "sets/program.f64")
+    vpd_kl = z["kl_vpd"][EVAL[0]:EVAL[0] + TEXT_ROWS].reshape(-1)
+    k = n / math.log(2)
+    rows = {
+        "text": (text.mean(), b[:, 1].mean(), kl.mean()),
+        "vpd": (0.0, b[:, 3].mean(), vpd_kl.mean()),
+    }
+    for key, (t, p, e) in rows.items():
+        print(f"{key:6s} text {t:8.1f} + program {p:10.1f} + n·KL {k * e:10.1f} (KL {e:.3f}) = {t + p + k * e:10.1f} bits/word")
+    print(f"names per word {np.mean([len(i) for i in inv]):.1f}, program size {np.mean([len(p) for p in programs]):.1f} vs VPD {np.mean(np.diff(indptr[EVAL[0] * CONTEXT:EVAL[0] * CONTEXT + words + 1])):.1f}")
+    json.dump({"observations": n, "lines": lines, "text_bits": text.tolist(), "kl": kl.tolist(), "program": b[:, 1].tolist(),
+               "l0": [len(p) for p in programs], "vpd_program": b[:, 3].tolist(), "vpd_kl": vpd_kl.tolist(),
+               "all_program": float(prog_bits.sum())}, open(OUT / "textonly.json", "w"))
+
+
 def stage_kl():
     """KL(model || masked model) per eval word for every decoded program, plus VPD's own set and
     the empty program."""
@@ -1113,6 +1175,7 @@ if __name__ == "__main__":
     stages = {"labels": stage_labels, "label_bits": stage_label_bits, "attrib": stage_attrib, "text": stage_text,
               "bits": stage_bits, "kl": stage_kl, "report": stage_report, "figure": stage_figure,
               "controls": stage_controls, "names": stage_names, "fluent": stage_fluent,
-              "allon": stage_allon, "dropkl": stage_dropkl, "program": stage_program}
+              "allon": stage_allon, "dropkl": stage_dropkl, "program": stage_program,
+              "textonly": stage_textonly}
     for stage in sys.argv[1:]:
         stages[stage]()
