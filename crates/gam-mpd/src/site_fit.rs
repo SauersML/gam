@@ -608,13 +608,16 @@ pub fn measure(site: usize, w: &Array2<f64>, samples: &Samples, describe: &dyn D
 
 /// A library of `settings.pieces` subcomponents for site `site` (`w` its `d_out × d_in` map, `site`
 /// its index in `describe`), fitted on `samples` to the site's code (module note); `progress` sees
-/// every round with the library it measured. The library reads the uncentred input (`mean` zero).
+/// every round with the library it measured. Its first reads are `start` (rows of `d_in`, at most
+/// `pieces`; a site reading a layer of units starts from the units themselves), the rest seeded
+/// from inputs. The library reads the uncentred input (`mean` zero).
 pub fn fit(
     site: usize,
     w: &Array2<f64>,
     samples: &Samples,
     describe: &dyn Describe,
     settings: Settings,
+    start: Option<&Array2<f64>>,
     mut progress: impl FnMut(&Round, &Library),
 ) -> Result<Library, String> {
     let Settings { observations, pieces, rounds, seed } = settings;
@@ -645,7 +648,14 @@ pub fn fit(
         (state % n as u64) as usize
     };
     let mut v = Array2::<f64>::zeros((pieces, d_in));
-    for c in 0..pieces {
+    let given = start.map_or(0, |s| s.nrows());
+    if given > pieces || start.is_some_and(|s| s.ncols() != d_in) {
+        return Err(format!("site {site}: {given} starting reads for {pieces} subcomponents of {d_in} reads"));
+    }
+    if let Some(s) = start {
+        v.slice_mut(s![..given, ..]).assign(s);
+    }
+    for c in given..pieces {
         v.row_mut(c).assign(&seed_read(draw(rows)));
     }
     // Every subcomponent on: the writes that make the library the map on these inputs.

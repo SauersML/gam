@@ -9,7 +9,8 @@
 //! sequence (default 4, `gam_mpd::site_fit::samples`), and a library of `d_in + d_out`
 //! subcomponents fitted to its code at `n = OBSERVATIONS` for at most `ROUNDS` rounds (default 50,
 //! `gam_mpd::site_fit::fit`), each subcomponent described by `gam_mpd::blocks::Generic` in those
-//! statistics. After every round the library goes to `OUT_DIR/{site}.v.f64` (pieces × d_in) and
+//! statistics. A site that reads a layer of units (a pointwise map's output, an MLP's hidden
+//! layer) starts its first `d_in` reads from those units. After every round the library goes to `OUT_DIR/{site}.v.f64` (pieces × d_in) and
 //! `OUT_DIR/{site}.u.f64` (pieces × d_out), raw float64, the `library:DIR` start of
 //! `mpd_pieces_masked_2951`, and its rounds to `OUT_DIR/{site}.rounds.json`.
 //!
@@ -20,6 +21,7 @@
 use gam_mpd::import::import_language_model;
 use gam_mpd::masked::{matrix, sites};
 use gam_mpd::masked::Library;
+use gam_mpd::operator_program::Node;
 use gam_mpd::site_fit::{Settings, fit, measure, samples};
 use ndarray::{Array1, Array2};
 use serde_json::json;
@@ -93,7 +95,9 @@ fn main() -> Result<(), String> {
         let mut log = Vec::new();
         let (v_path, u_path) = (out.join(format!("{}.v.f64", site.name)), out.join(format!("{}.u.f64", site.name)));
         let rounds_path = out.join(format!("{}.rounds.json", site.name));
-        let library = fit(k, w, sample, &description, settings, |round, library| {
+        // A site reading a layer of units starts from the units.
+        let units = (site.reads.len() == 1 && matches!(model.nodes[site.reads[0]], Node::Pointwise { .. })).then(|| Array2::<f64>::eye(d_in));
+        let library = fit(k, w, sample, &description, settings, units.as_ref(), |round, library| {
             eprintln!(
                 "{} round {}: code {:.1} bits per input (description {:.1}, error {:.1}), L0 {:.2}, corner {:.2}, reseeded {}, read rung {}, {:.0}s",
                 site.name,
