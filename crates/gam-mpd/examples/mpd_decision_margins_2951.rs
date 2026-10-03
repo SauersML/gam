@@ -1,7 +1,10 @@
 //! How often a keep/refuse decision of the masked selection could be taken in low precision and
 //! still be exact (#2951): the rate that decides the trainer's hardware.
 //!
-//! `mpd_decision_margins_2951 EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json [SEQUENCES] [CONTEXT] [OBSERVATIONS]`
+//! `mpd_decision_margins_2951 EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json [SEQUENCES] [CONTEXT] [OBSERVATIONS] [GPU] [time]`
+//!
+//! With `GPU` `auto` the selection's trials score through screened heads (`gam_mpd::masked`'s
+//! module note); with a trailing `time` the rounds are only timed, no margins measured.
 //!
 //! A selection round decides each sequence by the sign of its code change `Σ_r (before_r −
 //! after_r)` (`gam_mpd::masked::select`), and each input's code is its listing bits (exact
@@ -67,7 +70,7 @@ fn row_bands(masked: &Masked, family: &gam_mpd::operator_program::FamilyInputs, 
 fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
-    let usage = "mpd_decision_margins_2951 EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json [SEQUENCES] [CONTEXT] [OBSERVATIONS]";
+    let usage = "mpd_decision_margins_2951 EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json [SEQUENCES] [CONTEXT] [OBSERVATIONS] [GPU] [time]";
     let export = PathBuf::from(args.get(1).ok_or(usage)?);
     let library_dir = PathBuf::from(args.get(2).ok_or(usage)?);
     let sets_dir = PathBuf::from(args.get(3).ok_or(usage)?);
@@ -75,7 +78,8 @@ fn main() -> Result<(), String> {
     let sequences: usize = args.get(5).map_or(Ok(4), |v| v.parse()).map_err(|e| format!("SEQUENCES: {e}"))?;
     let context: usize = args.get(6).map_or(Ok(128), |v| v.parse()).map_err(|e| format!("CONTEXT: {e}"))?;
     let observations: f64 = args.get(7).map_or(Ok(1024.0), |v| v.parse()).map_err(|e| format!("OBSERVATIONS: {e}"))?;
-    gam_gpu::configure_global_policy(gam_gpu::GpuPolicy::Off);
+    let gpu = args.get(8).map_or("off", String::as_str);
+    gam_gpu::configure_global_policy(gam_gpu::GpuPolicy::parse(gpu).ok_or_else(|| format!("GPU {gpu}: expected off, auto or required"))?);
 
     let imported = import_language_model(&export, sequences, context)?;
     let model = &imported.program;
@@ -145,7 +149,11 @@ fn main() -> Result<(), String> {
     let mut inputs = Vec::new();
     let started = std::time::Instant::now();
     let mut banding = 0.0;
+    let margins = args.get(9).is_none_or(|v| v != "time");
     let mut observe = |round: &Round<'_>| -> Result<(), String> {
+        if !margins {
+            return Ok(());
+        }
         let clock = std::time::Instant::now();
         let (band_now, magnitude_now) = row_bands(&masked, round.current, &target)?;
         let (band_new, magnitude_new) = row_bands(&masked, round.proposed, &target)?;

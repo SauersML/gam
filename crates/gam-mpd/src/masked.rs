@@ -244,6 +244,9 @@ pub struct Masked {
     pub head: Option<Arc<dyn Head>>,
     /// The program on the process's accelerator (module note, "Devices").
     lowered: Mutex<Lowered>,
+    /// The box claim's terms ([`BoxTerms`]) with what they were computed from: the `U` operators
+    /// and a fingerprint of the written Fishers.
+    box_terms: Mutex<Option<(Vec<Arc<Operator>>, u64, Arc<BoxTerms>)>>,
 }
 
 /// A masked program's device twin, lowered on first use.
@@ -379,6 +382,7 @@ impl Masked {
             written,
             head: None,
             lowered: Mutex::new(Lowered::Untried),
+            box_terms: Mutex::new(None),
         })
     }
 
@@ -421,6 +425,31 @@ impl Masked {
             }
             Lowered::Untried | Lowered::Host => Ok(None),
         }
+    }
+
+    /// The box claim's terms for the current library in the written Fishers `fishers`, computed
+    /// once while neither changes.
+    pub(crate) fn box_terms(&self, fishers: &[Array2<f64>]) -> Result<Arc<BoxTerms>, String> {
+        use rayon::prelude::*;
+        let ops: Vec<Arc<Operator>> = self.u_ops.iter().flatten().map(|&op| Arc::clone(&self.program.operators[op])).collect();
+        // FNV-1a over every Fisher entry's bits, per site, then folded.
+        let prints: Vec<u64> = fishers
+            .par_iter()
+            .map(|f| f.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, v| (h ^ v.to_bits()).wrapping_mul(0x0000_0100_0000_01b3)))
+            .collect();
+        let print = prints.iter().fold(fishers.len() as u64, |h, p| (h ^ p).wrapping_mul(0x0000_0100_0000_01b3));
+        let mut cache = self.box_terms.lock().map_err(|_| "box terms: a poisoned cache".to_string())?;
+        if let Some((held, held_print, terms)) = &*cache
+            && *held_print == print
+            && held.len() == ops.len()
+            && held.iter().zip(&ops).all(|(a, b)| Arc::ptr_eq(a, b))
+        {
+            return Ok(Arc::clone(terms));
+        }
+        *cache = None;
+        let terms = Arc::new(BoxTerms::new(self, fishers)?);
+        *cache = Some((ops, print, Arc::clone(&terms)));
+        Ok(terms)
     }
 
     /// [`Masked::on_device`] where the program was found lowered.
@@ -759,7 +788,17 @@ pub fn kl_and_logits(masked: &Masked, family: &FamilyInputs, target: &Target) ->
 pub fn box_excess_at(masked: &Masked, base: &FamilyInputs, target: &Target, masks: &[Array2<f64>], fishers: &[Array2<f64>]) -> Result<Array1<f64>, String> {
     let corner = score_only(masked, &masked.family(base, masks), target)?;
     let expected = expected_box_excess_at(masked, base, target, masks, fishers)?;
-    box_worst(masked, base, target, masks, &corner, expected, None)
+    // The vertices share every gate on up to their own layer (as in a selection).
+    let lowered = masked.on_device(|_| Ok(()))?.is_some();
+    let all_on = if !lowered && masked.head.is_none() {
+        let on: Vec<Array2<f64>> = masks.iter().map(|m| Array2::ones(m.dim())).collect();
+        let mut trace = masked.program.execute(&masked.family(base, &on), false).map_err(|e| e.to_string())?;
+        trace.values.truncate(masked.z.iter().copied().max().unwrap_or(0));
+        Some(trace)
+    } else {
+        None
+    };
+    box_worst(masked, base, target, masks, &corner, expected, all_on.as_ref())
 }
 
 /// The program's logits when they are one dense product of a hidden node and nothing after it:
@@ -1744,8 +1783,8 @@ impl Selected {
                 let terms = match terms {
                     Some(terms) => terms,
                     None => {
-                        built = BoxTerms::new(masked, fishers)?;
-                        &built
+                        built = masked.box_terms(fishers)?;
+                        &*built
                     }
                 };
                 Ok(box_excess_back(masked, trace, back, masks, terms, fishers, false)?.0)
@@ -1904,7 +1943,7 @@ pub fn select_observed(
     // shares up to its own layer.
     // Under the box claim, what its excess reads of the library and the Fishers: fixed here.
     let box_terms = match boxed {
-        Some(f) if on_device.is_none() => Some(BoxTerms::new(masked, f)?),
+        Some(f) if on_device.is_none() => Some(masked.box_terms(f)?),
         _ => None,
     };
     // Only its nodes before the last site's mask are ever read, so the rest is dropped.
@@ -1957,7 +1996,7 @@ pub fn select_observed(
             None => Ok((score_only(masked, &family, target)?, Array1::zeros(rows))),
             Some(f) => {
                 let (kl_trial, mut state) = Selected::forward(masked, &family, target, on_device, false)?;
-                let expected = state.expected_excess(masked, &family, target, trial, f, box_terms.as_ref(), on_device)?;
+                let expected = state.expected_excess(masked, &family, target, trial, f, box_terms.as_deref(), on_device)?;
                 drop(state);
                 let excess = box_worst(masked, base, target, trial, &kl_trial, expected, all_on.as_ref())?;
                 Ok((kl_trial, excess))
@@ -1983,7 +2022,7 @@ pub fn select_observed(
                 }
                 // The excess first, so its reverse pass also serves the mask gradients.
                 if let (Some(f), None) = (boxed, &excess_known) {
-                    let expected = state.expected_excess(masked, &family, target, &masks, f, box_terms.as_ref(), on_device)?;
+                    let expected = state.expected_excess(masked, &family, target, &masks, f, box_terms.as_deref(), on_device)?;
                     excess_known = Some(box_worst(masked, base, target, &masks, &kl_now, expected, all_on.as_ref())?);
                 }
                 let grads = state.mask_gradients(masked, &family, target, on_device)?;
@@ -2197,7 +2236,7 @@ pub fn select_observed(
         };
         let excess_new = match boxed {
             Some(f) => {
-                let expected = state_new.expected_excess(masked, &proposed_family, target, &proposed, f, box_terms.as_ref(), on_device)?;
+                let expected = state_new.expected_excess(masked, &proposed_family, target, &proposed, f, box_terms.as_deref(), on_device)?;
                 // Kept, this forward serves only the next round's mask gradients.
                 state_new.shrink(masked);
                 box_worst(masked, base, target, &proposed, &kl_new, expected, all_on.as_ref())?
@@ -2211,6 +2250,7 @@ pub fn select_observed(
         if let (Some(screen), Some(screened), Some(head)) = (&screen, screened.as_mut(), head_base.as_mut()) {
             let open = undecided(&savings_of(&before, &[&after]), &[bands_of(&head.error, Some(&screened.error))], Some(&threshold));
             let settle: Vec<usize> = (0..rows).filter(|r| open[sequence_of[*r]]).collect();
+            log::info!("screened proposal: {} of {sequences} sequences settled to float64", open.iter().filter(|o| **o).count());
             if !settle.is_empty() {
                 let trace = match &mut state_new {
                     Selected::Host(trace, _, _) => Some(trace),
@@ -2743,7 +2783,7 @@ pub fn box_excess(
 ) -> Result<(Array1<f64>, Option<BoxGradients>), String> {
     let written: Vec<usize> = masked.written.iter().flatten().copied().collect();
     let back = super::derivatives::vjp_from(&masked.program, family, trace, masked.program.output, cotangent, Some(&written)).map_err(|e| e.to_string())?;
-    box_excess_back(masked, trace, &back, masks, &BoxTerms::new(masked, fishers)?, fishers, gradients)
+    box_excess_back(masked, trace, &back, masks, &masked.box_terms(fishers)?, fishers, gradients)
 }
 
 /// [`box_excess`] from a reverse pass `back` that kept every site's written nodes.
