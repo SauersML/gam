@@ -4,7 +4,7 @@
 # Prints one line per finding: IDLE (CPU use under 25% of the allocation), LOW (under 50%: ask fewer
 # CPUs next time), STALE (log silent 45 min),
 # MEM (asks far above the measured peak), GPU (holds a GPU with no process on it), THROTTLE (debug
-# array without a %4-8 cap), OTHERS (another user's job waiting on resources we hold).
+# array without a %4-8 cap), GPUS (more than our 6 across QOSes), OTHERS (another user's job waiting on resources we hold).
 set -uo pipefail
 secs() { awk -F'[-:]' '{ n = NF; s = $n + 60 * $(n - 1); if (n >= 3) s += 3600 * $(n - 2); if (n == 4) s += 86400 * $1; print s }' <<< "$1"; }
 gb() { awk '{ v = $1; u = substr(v, length(v)); n = v + 0; if (u == "K") n /= 1048576; else if (u == "M") n /= 1024; else if (u == "T") n *= 1024; printf "%.1f", n }' <<< "$1"; }
@@ -40,5 +40,7 @@ while read -r id name qos; do
     t=$(scontrol show job "${id%%_*}" 2> /dev/null | grep -oP 'ArrayTaskThrottle=\K[0-9]+' | head -1)
     [ -z "$t" ] || [ "$t" = 0 ] || (( t > 8 )) && echo "THROTTLE ${id%%_*} $name: debug array throttle ${t:-none}"
 done < <(squeue -u "$USER" -h -t PD -r -o '%i %j %q' | grep '_' | awk '!seen[$2]++')
+g=$(squeue -u "$USER" -h -t R -o '%b' | grep -oE 'gpu:[0-9]+' | cut -d: -f2 | paste -sd+ | bc 2> /dev/null)
+(( ${g:-0} > 6 )) && echo "GPUS we hold ${g} GPUs, above the 6 the QOS gives us (debug has no GPU cap)"
 squeue -h -t PD -o '%i %u %j %C %m %r' | awk -v me="$USER" '$2 != me && ($6 == "Resources" || $6 == "Priority") { print "OTHERS " $0 }'
 true
