@@ -1,7 +1,7 @@
 //! Bounded-scratch F64 attention for ordinary execution and fitting. Query tiles use matrix
 //! products against one sequence's keys. The banded evaluator keeps its separate reference path.
 use super::operator_program::{FamilyInputs, ProgramError, Rotary, SequenceLayout};
-use gam_linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
+use rayon::prelude::*;
 use ndarray::{Array2, ArrayView2, Axis, s};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -42,8 +42,9 @@ fn rotate<'a>(x: &'a Array2<f64>, rotary: Option<Rotary>, positions: &[u32], inv
     Cow::Owned(out)
 }
 
-fn probabilities(q: ArrayView2<'_, f64>, k: &Array2<f64>, positions: &[u32], start: usize, scale: f64, causal: bool) -> Array2<f64> {
-    let mut p = fast_abt(&q, k);
+/// One tile's attention weights against keys `k` (`softmax(scale q kᵀ)`, causal by position).
+fn probabilities(q: ArrayView2<'_, f64>, k: ArrayView2<'_, f64>, positions: &[u32], start: usize, scale: f64, causal: bool) -> Array2<f64> {
+    let mut p = q.dot(&k.t());
     for (r, mut row) in p.outer_iter_mut().enumerate() {
         let mut max = f64::NEG_INFINITY;
         for (c, v) in row.iter_mut().enumerate() {
@@ -68,6 +69,22 @@ fn scatter(out: &mut Array2<f64>, members: &[usize], values: &Array2<f64>) {
     for (local, row) in members.iter().enumerate() { out.row_mut(*row).assign(&values.row(local)); }
 }
 
+/// A sequence's query tiles, each with the keys it can read: under causal attention with the
+/// positions ascending, the keys up to the tile's last position (the rest weigh exactly zero).
+fn tiles(positions: &[u32], causal: bool) -> Vec<(usize, usize, usize)> {
+    let ascending = positions.windows(2).all(|w| w[0] <= w[1]);
+    (0..positions.len())
+        .step_by(TILE)
+        .map(|start| {
+            let end = (start + TILE).min(positions.len());
+            let keys = if causal && ascending { positions.partition_point(|p| *p <= positions[end - 1]) } else { positions.len() };
+            (start, end, keys)
+        })
+        .collect()
+}
+
+// Tiles run in parallel, each with single-threaded products (a tile's are too small to split).
+
 pub(crate) fn forward(inputs: &FamilyInputs, (query, key, value): Values<'_>, scale: f64, rotary: Option<Rotary>, causal: bool) -> Result<Array2<f64>, ProgramError> {
     let layout = layout(inputs)?;
     let q = rotate(query, rotary, &layout.position, false);
@@ -76,10 +93,15 @@ pub(crate) fn forward(inputs: &FamilyInputs, (query, key, value): Values<'_>, sc
     for members in groups(layout).values() {
         let (q, k, v) = (q.select(Axis(0), members), k.select(Axis(0), members), value.select(Axis(0), members));
         let positions: Vec<_> = members.iter().map(|r| layout.position[*r]).collect();
-        for start in (0..members.len()).step_by(TILE) {
-            let end = (start + TILE).min(members.len());
-            let p = probabilities(q.slice(s![start..end, ..]), &k, &positions, start, scale, causal);
-            scatter(&mut out, &members[start..end], &fast_ab(&p, &v));
+        let parts: Vec<(usize, usize, Array2<f64>)> = tiles(&positions, causal)
+            .into_par_iter()
+            .map(|(start, end, keys)| {
+                let p = probabilities(q.slice(s![start..end, ..]), k.slice(s![..keys, ..]), &positions, start, scale, causal);
+                (start, end, p.dot(&v.slice(s![..keys, ..])))
+            })
+            .collect();
+        for (start, end, tile) in parts {
+            scatter(&mut out, &members[start..end], &tile);
         }
     }
     Ok(out)
@@ -93,17 +115,23 @@ pub(crate) fn backward(inputs: &FamilyInputs, (query, key, value): Values<'_>, c
     for members in groups(layout).values() {
         let (q, k, v, cot) = (q.select(Axis(0), members), k.select(Axis(0), members), value.select(Axis(0), members), cotangent.select(Axis(0), members));
         let positions: Vec<_> = members.iter().map(|r| layout.position[*r]).collect();
-        let (mut key_grad, mut value_grad) = (Array2::zeros(k.dim()), Array2::zeros(v.dim()));
-        for start in (0..members.len()).step_by(TILE) {
-            let end = (start + TILE).min(members.len());
-            let qb = q.slice(s![start..end, ..]);
-            let cb = cot.slice(s![start..end, ..]);
-            let p = probabilities(qb, &k, &positions, start, scale, causal);
-            let mut ds = fast_abt(&cb, &v);
-            softmax_derivative(&p, &mut ds, scale);
-            scatter(&mut gq, &members[start..end], &fast_ab(&ds, &k));
-            key_grad += &fast_atb(&ds, &qb);
-            value_grad += &fast_atb(&p, &cb);
+        let parts: Vec<(usize, usize, usize, Array2<f64>, Array2<f64>, Array2<f64>)> = tiles(&positions, causal)
+            .into_par_iter()
+            .map(|(start, end, keys)| {
+                let (qb, cb, kk, vv) = (q.slice(s![start..end, ..]), cot.slice(s![start..end, ..]), k.slice(s![..keys, ..]), v.slice(s![..keys, ..]));
+                let p = probabilities(qb, kk, &positions, start, scale, causal);
+                let mut ds = cb.dot(&vv.t());
+                softmax_derivative(&p, &mut ds, scale);
+                (start, end, keys, ds.dot(&kk), ds.t().dot(&qb), p.t().dot(&cb))
+            })
+            .collect();
+        let (mut key_grad, mut value_grad) = (Array2::<f64>::zeros(k.dim()), Array2::<f64>::zeros(v.dim()));
+        for (start, end, keys, query_tile, key_tile, value_tile) in parts {
+            scatter(&mut gq, &members[start..end], &query_tile);
+            let mut kg = key_grad.slice_mut(s![..keys, ..]);
+            kg += &key_tile;
+            let mut vg = value_grad.slice_mut(s![..keys, ..]);
+            vg += &value_tile;
         }
         scatter(&mut gk, members, &key_grad);
         scatter(&mut gv, members, &value_grad);
@@ -122,16 +150,21 @@ pub(crate) fn tangent(inputs: &FamilyInputs, (query, key, value): Values<'_>, (d
         let (q, k, v) = (q.select(Axis(0), members), k.select(Axis(0), members), value.select(Axis(0), members));
         let (dq, dk, dv) = (dq.as_ref().map(|v| v.select(Axis(0), members)), dk.as_ref().map(|v| v.select(Axis(0), members)), dv.map(|v| v.select(Axis(0), members)));
         let positions: Vec<_> = members.iter().map(|r| layout.position[*r]).collect();
-        for start in (0..members.len()).step_by(TILE) {
-            let end = (start + TILE).min(members.len());
-            let qb = q.slice(s![start..end, ..]);
-            let p = probabilities(qb, &k, &positions, start, scale, causal);
-            let mut ds = Array2::zeros(p.dim());
-            if let Some(dq) = &dq { ds += &fast_abt(&dq.slice(s![start..end, ..]), &k); }
-            if let Some(dk) = &dk { ds += &fast_abt(&qb, dk); }
-            softmax_derivative(&p, &mut ds, scale);
-            let mut tile = fast_ab(&ds, &v);
-            if let Some(dv) = &dv { tile += &fast_ab(&p, dv); }
+        let parts: Vec<(usize, usize, Array2<f64>)> = tiles(&positions, causal)
+            .into_par_iter()
+            .map(|(start, end, keys)| {
+                let (qb, kk, vv) = (q.slice(s![start..end, ..]), k.slice(s![..keys, ..]), v.slice(s![..keys, ..]));
+                let p = probabilities(qb, kk, &positions, start, scale, causal);
+                let mut ds = Array2::zeros(p.dim());
+                if let Some(dq) = &dq { ds += &dq.slice(s![start..end, ..]).dot(&kk.t()); }
+                if let Some(dk) = &dk { ds += &qb.dot(&dk.slice(s![..keys, ..]).t()); }
+                softmax_derivative(&p, &mut ds, scale);
+                let mut tile = ds.dot(&vv);
+                if let Some(dv) = &dv { tile += &p.dot(&dv.slice(s![..keys, ..])); }
+                (start, end, tile)
+            })
+            .collect();
+        for (start, end, tile) in parts {
             scatter(&mut out, &members[start..end], &tile);
         }
     }
