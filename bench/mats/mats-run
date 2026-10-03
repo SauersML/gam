@@ -20,9 +20,14 @@
 # MATS_ENV="K=V ..." (extra environment for the command; RUST_LOG is forwarded when set), MATS_DRY=1
 # (print the translated command and the uploads, submit nothing), MATS_REF=<commit> (run that pushed
 # commit instead of HEAD; a commit that failed to build is refused with its compiler errors).
+#
+# Job arrays: MATS_ARRAY=0-31%24 submits one task per index (at most 24 at once), each with CPUS,
+# MEM_GB and HOURS of its own; `{task}` anywhere in COMMAND becomes the task's index (say an eval row
+# or an output name like /Users/user/mpd-data/cluster/NAME/row{task}.json). Task logs are
+# slurm-JOBID_TASK.log; `mats-pull NAME` brings back every task's outputs.
 set -Eeuo pipefail
 here=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
-usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 [ $# -ge 6 ] && [ "$5" = -- ] || usage
 NAME=$1 CPUS=$2 MEM=$3 HOURS=$4
 shift 5
@@ -34,8 +39,10 @@ QOS=${MATS_QOS:-}
 max=$([ "$QOS" = debug ] && echo 120 || echo 1440)
 (( MINUTES <= max )) || { echo "mats-run: HOURS exceeds the ${max}-minute limit" >&2; exit 2; }
 GPUS=${MATS_GPUS:-0}
+ARRAY=${MATS_ARRAY:-}
+[[ -z $ARRAY || $ARRAY =~ ^[0-9][0-9,:%-]*$ ]] || { echo "mats-run: MATS_ARRAY is a Slurm --array spec like 0-31%24" >&2; exit 2; }
 # The node has 458 GB for 252 CPUs, so memory runs out before CPUs do.
-(( MEM > 2 * CPUS && MEM > 8 )) && echo "mats-run: ${MEM} GB for ${CPUS} CPUs; RAM is the scarce resource, so ask for about 1.5x the measured peak (mats-status shows it)" >&2
+(( MEM > 4 * CPUS && MEM > 24 )) && echo "mats-run: ${MEM} GB for ${CPUS} CPUs; RAM is the scarce resource, so ask for about 1.5x the measured peak (mats-status shows it)" >&2
 
 MAC_DATA=/Users/user/mpd-data MAC_GAM=/Users/user/gam CL_DATA=/mnt/nw/home/s.sauers/mpd-data
 
@@ -88,6 +95,7 @@ envp=()
 [ -n "${RUST_LOG:-}" ] && envp+=("RUST_LOG=$RUST_LOG")
 [ -n "${MATS_ENV:-}" ] && read -r -a extra <<< "$MATS_ENV" && envp+=("${extra[@]}")
 cmd=$(printf '%q ' "${words[@]}")
+cmd=${cmd//\\\{task\\\}/'"${SLURM_ARRAY_TASK_ID}"'}
 cmd=${cmd//\\@\\@BIN\\@\\@/@@BIN@@}
 [ ${#envp[@]} -gt 0 ] && cmd="env $(printf '%q ' "${envp[@]}")$cmd"
 
@@ -110,4 +118,4 @@ fi
 
 want=$(git -C "$MAC_GAM" rev-parse "${MATS_REF:-HEAD}")
 b64=$(printf '%s' "$cmd" | base64 | tr -d '\n')
-ssh mats bash -s -- "$NAME" "$CPUS" "$MEM" "$MINUTES" "$want" "$GPUS" "'$QOS'" "$b64" < "$here/remote_submit.sh"
+ssh mats bash -s -- "$NAME" "$CPUS" "$MEM" "$MINUTES" "$want" "$GPUS" "'$QOS'" "$b64" "'$ARRAY'" < "$here/remote_submit.sh"

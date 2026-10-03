@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Login-node half of mats-run (#2951): never builds or computes here, only fetches and submits.
 #
-#   remote_submit.sh NAME CPUS MEM_GB MINUTES WANT_COMMIT GPUS QOS CMD_B64
+#   remote_submit.sh NAME CPUS MEM_GB MINUTES WANT_COMMIT GPUS QOS CMD_B64 [ARRAY]
 #
 # Picks the commit C (WANT_COMMIT when origin/main contains it, else origin/main) and snapshots its
 # source into ~/mpd-src/C (the job's working directory). Binaries come from ~/mpd-bin/B for a built
@@ -9,7 +9,7 @@
 # otherwise is C built. Builds run in the debug QOS (its own CPU pool, 2 h) as one Slurm singleton,
 # so they neither wait behind our day-long jobs nor hold CPUs while queued. Prints the run job id.
 set -Eeuo pipefail
-NAME=$1 CPUS=$2 MEM=$3 MINUTES=$4 WANT=$5 GPUS=$6 QOS=$7 CMD_B64=$8
+NAME=$1 CPUS=$2 MEM=$3 MINUTES=$4 WANT=$5 GPUS=$6 QOS=$7 CMD_B64=$8 ARRAY=${9:-}
 REPO=$HOME/gam-cluster BIN=$HOME/mpd-bin SRC=$HOME/mpd-src CL=$HOME/mpd-data/cluster
 OUT=$CL/$NAME
 mkdir -p "$OUT" "$BIN" "$SRC" "$CL/_build"
@@ -27,6 +27,8 @@ cd "$HOME/gam-cluster"
 git fetch -q origin main
 git checkout -q --detach "$C"
 export CARGO_BUILD_JOBS=${SLURM_CPUS_PER_TASK:-16}
+# Every job runs on l40-worker, an AMD EPYC 7763 (Zen 3).
+export RUSTFLAGS="-C target-cpu=znver3"
 echo "== $(date '+%F %T') building $C with $CARGO_BUILD_JOBS jobs"
 time cargo build --release -p gam-mpd --examples 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading)' | tail -n 40
 dest=$HOME/mpd-bin/$C12
@@ -110,7 +112,7 @@ export LD_LIBRARY_PATH=/usr/local/cuda-12.2/lib64:/usr/local/cuda-12.2/targets/x
 # The node does not confine devices: a job Slurm gave no GPU would otherwise see (and take) all 8.
 export CUDA_VISIBLE_DEVICES=\${CUDA_VISIBLE_DEVICES-}
 cd $SRC/$C12
-echo "== \$(date '+%F %T') job \$SLURM_JOB_ID on \$(hostname): source $C, binaries $B, cpus \$SLURM_CPUS_PER_TASK, mem ${MEM}G, gpus ${GPUS}"
+echo "== \$(date '+%F %T') job \$SLURM_JOB_ID\${SLURM_ARRAY_TASK_ID:+ (task \$SLURM_ARRAY_TASK_ID of \$SLURM_ARRAY_JOB_ID)} on \$(hostname): source $C, binaries $B, cpus \$SLURM_CPUS_PER_TASK, mem ${MEM}G, gpus ${GPUS}"
 echo "== $cmd"
 start=\$(date +%s)
 $cmd
@@ -120,9 +122,12 @@ exit \$rc
 JOB
 chmod +x "$job"
 
-args=(--parsable -J "$NAME" -p compute -c "$CPUS" --mem="${MEM}G" -t "$MINUTES" -o "$OUT/slurm-%j.log" "${dep[@]}")
+log=$OUT/slurm-%j.log
+[ -n "$ARRAY" ] && log=$OUT/slurm-%A_%a.log
+args=(--parsable -J "$NAME" -p compute -c "$CPUS" --mem="${MEM}G" -t "$MINUTES" -o "$log" "${dep[@]}")
+[ -n "$ARRAY" ] && args+=(--array="$ARRAY")
 [ "$GPUS" != 0 ] && args+=(--gres="gpu:$GPUS")
 [ -n "$QOS" ] && args+=(--qos="$QOS")
 jid=$(sbatch "${args[@]}" "$job")
-echo "$jid $stamp src=$C12 bin=$B cpus=$CPUS mem=${MEM}G min=$MINUTES gpus=$GPUS" >> "$OUT/JOBS"
+echo "$jid $stamp src=$C12 bin=$B cpus=$CPUS mem=${MEM}G min=$MINUTES gpus=$GPUS${ARRAY:+ array=$ARRAY}" >> "$OUT/JOBS"
 echo "$jid"

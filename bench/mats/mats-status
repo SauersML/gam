@@ -27,6 +27,13 @@ if [ -n "$name" ]; then
     log=$(ls -t "$d"/slurm-*.log 2> /dev/null | head -1 || true)
     if [ -n "$log" ]; then echo "-- $log"; tail -n 30 "$log"; else echo "-- no log yet in $d"; fi
     jid=$(tail -n 1 "$d/JOBS" 2> /dev/null | awk '{ print $1 }')
-    [ -n "$jid" ] && sacct -j "$jid" -X -o JobID,State,Elapsed,AllocCPUS,MaxRSS,ExitCode -n 2> /dev/null || true
+    if [ -n "$jid" ]; then
+        n=$(sacct -j "$jid" -X -n -o JobID 2> /dev/null | wc -l)
+        if (( n > 3 )); then
+            echo "-- array $jid: $(sacct -j "$jid" -X -n -o State 2> /dev/null | sort | uniq -c | awk '{ printf "%s %s; ", $1, $2 }')"
+        else
+            sacct -j "$jid" -X -o JobID,State,Elapsed,AllocCPUS,MaxRSS,ExitCode -n 2> /dev/null || true
+        fi
+    fi
 fi
 REMOTE
