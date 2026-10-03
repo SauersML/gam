@@ -98,7 +98,10 @@
 //! masked program without a head is lowered onto it on first use ([`Masked::on_device`]) and the
 //! selection runs there: the forward and its KL in float64, so every keep or refuse is the same
 //! float64 decision as on the CPU, and the proposals (mask gradients, Fisher diagonals) in the
-//! lowered program's proposal arithmetic. Elsewhere everything runs on the CPU.
+//! lowered program's proposal arithmetic. Where its only device has no float64 (the Apple GPU,
+//! `masked_device::training_device`), the program is lowered there on the first proposal
+//! ([`Masked::on_proposals`]: a step's gradients, Fishers, covariances and curvature, in f32)
+//! and every decision runs on the CPU. Elsewhere everything runs on the CPU.
 //!
 //! # Screened heads
 //!
@@ -414,15 +417,33 @@ impl Masked {
     }
 
     /// `run` on the program's device twin (module note, "Devices"), its operators first brought up
-    /// to date with the program's; `None` when the program runs on the CPU. Calls hold the twin in
-    /// turn, so `run` must not call this again.
+    /// to date with the program's; `None` when the program runs on the CPU or its twin has no
+    /// float64 (it may not decide). Calls hold the twin in turn, so `run` must not call this again.
     pub fn on_device<T>(&self, run: impl FnOnce(&Accelerated) -> Result<T, String>) -> Result<Option<T>, String> {
+        self.on_twin(true, run)
+    }
+
+    /// [`Masked::on_device`] for proposals only: also on a twin without float64 (module note,
+    /// "Devices"), so whatever `run` returns proposes and decides nothing.
+    pub fn on_proposals<T>(&self, run: impl FnOnce(&Accelerated) -> Result<T, String>) -> Result<Option<T>, String> {
+        self.on_twin(false, run)
+    }
+
+    fn on_twin<T>(&self, decides: bool, run: impl FnOnce(&Accelerated) -> Result<T, String>) -> Result<Option<T>, String> {
         if self.head.is_some() {
             return Ok(None);
         }
         let mut lowered = self.lowered.lock().map_err(|_| "device: a poisoned lowering".to_string())?;
         if matches!(*lowered, Lowered::Untried) {
-            *lowered = match super::masked_device::device()? {
+            let device = match super::masked_device::device()? {
+                Some(device) => Some(device),
+                None => super::masked_device::training_device()?,
+            };
+            // A twin without float64 serves only proposals: it is lowered when one first asks.
+            if decides && device.as_ref().is_some_and(|d| !d.float64()) {
+                return Ok(None);
+            }
+            *lowered = match device {
                 None => Lowered::Host,
                 Some(device) => match Accelerated::new(&device, self, Arithmetic::F32) {
                     Ok(accelerated) => {
@@ -438,25 +459,19 @@ impl Masked {
             };
         }
         match &mut *lowered {
-            Lowered::Device(accelerated) => {
+            Lowered::Device(accelerated) if !decides || accelerated.decides() => {
                 accelerated.refresh(self)?;
                 run(accelerated).map(Some)
             }
-            Lowered::Untried | Lowered::Host => Ok(None),
+            Lowered::Untried | Lowered::Host | Lowered::Device(_) => Ok(None),
         }
     }
 
     /// The box claim's terms for the current library in the written Fishers `fishers`, computed
     /// once while neither changes.
     pub(crate) fn box_terms(&self, fishers: &[Array2<f64>]) -> Result<Arc<BoxTerms>, String> {
-        use rayon::prelude::*;
-        let ops: Vec<Arc<Operator>> = self.u_ops.iter().flatten().map(|&op| Arc::clone(&self.program.operators[op])).collect();
-        // FNV-1a over every Fisher entry's bits, per site, then folded.
-        let prints: Vec<u64> = fishers
-            .par_iter()
-            .map(|f| f.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, v| (h ^ v.to_bits()).wrapping_mul(0x0000_0100_0000_01b3)))
-            .collect();
-        let print = prints.iter().fold(fishers.len() as u64, |h, p| (h ^ p).wrapping_mul(0x0000_0100_0000_01b3));
+        let ops = self.u_operators();
+        let print = fisher_print(fishers);
         let mut cache = self.box_terms.lock().map_err(|_| "box terms: a poisoned cache".to_string())?;
         if let Some((held, held_print, terms)) = &*cache
             && *held_print == print
@@ -511,6 +526,11 @@ impl Masked {
         Ok(program)
     }
 
+    /// Every site's `U` operators, in site order.
+    pub(crate) fn u_operators(&self) -> Vec<Arc<Operator>> {
+        self.u_ops.iter().flatten().map(|&op| Arc::clone(&self.program.operators[op])).collect()
+    }
+
     /// The library's sums of [`Masked::dense_program`], computed once per library.
     fn sums(&self) -> Result<Arc<Vec<Vec<Vec<Arc<Operator>>>>>, String> {
         let ops: Vec<Arc<Operator>> = self.v_ops.iter().chain(&self.u_ops).flatten().map(|&op| Arc::clone(&self.program.operators[op])).collect();
@@ -544,9 +564,23 @@ impl Masked {
         Ok(sums)
     }
 
-    /// [`Masked::on_device`] where the program was found lowered.
+    /// [`Masked::on_proposals`] where the program was found lowered (its state's twin).
     fn on_lowered<T>(&self, run: impl FnOnce(&Accelerated) -> Result<T, String>) -> Result<T, String> {
-        self.on_device(run)?.ok_or_else(|| "device: the masked program left its device".to_string())
+        self.on_proposals(run)?.ok_or_else(|| "device: the masked program left its device".to_string())
+    }
+
+    /// Per site, its `z` node and the mask node its `z̃ = z ⊙ m` reads: `z` is read through that
+    /// product alone, so a forward whose `z` no gradient reads needs it only at the mask's nonzeros
+    /// ([`OperatorProgram::execute_gated`]).
+    pub fn gates(&self) -> Vec<(usize, usize)> {
+        self.z
+            .iter()
+            .zip(&self.masked)
+            .filter_map(|(z, masked)| match &self.program.nodes[*masked] {
+                Node::Hadamard { left, right } if left == z => Some((*z, *right)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Site `k`'s number of pieces.
@@ -603,6 +637,16 @@ impl Masked {
     }
 
 
+    /// Site `k`'s `V` operators, one per read node (each `pieces × d_in` of its node).
+    pub fn v_ops(&self, k: usize) -> &[usize] {
+        &self.v_ops[k]
+    }
+
+    /// Site `k`'s `U` operators, one per written node (each `d_out × pieces`: the library's `Uᵀ`).
+    pub fn u_ops(&self, k: usize) -> &[usize] {
+        &self.u_ops[k]
+    }
+
     /// Site `k`'s library as the program holds it (its operators are the only copy).
     pub fn library(&self, k: usize) -> Result<Library, String> {
         let v_blocks: Vec<_> = self.v_ops[k].iter().map(|&op| self.program.operators[op].matrix_cow()).collect();
@@ -614,7 +658,7 @@ impl Masked {
     }
 
     /// Site `k`'s pieces' `U` (C × d_out), without the rest of its library.
-    fn u(&self, k: usize) -> Result<Array2<f64>, String> {
+    pub(crate) fn u(&self, k: usize) -> Result<Array2<f64>, String> {
         let u_blocks: Vec<_> = self.u_ops[k].iter().map(|&op| self.program.operators[op].matrix_cow()).collect();
         ndarray::concatenate(Axis(1), &u_blocks.iter().map(|b| b.t()).collect::<Vec<_>>()).map_err(|e| e.to_string())
     }
@@ -887,7 +931,9 @@ fn score_only_untimed(masked: &Masked, family: &FamilyInputs, target: &Target) -
     if let Some(values) = masked.on_device(|accelerated| accelerated.score_only(family, &accelerated.target(target)?))? {
         return Ok(values);
     }
-    scored_forward(masked, family, target).map(|(values, _)| values)
+    // Only the KL is read, so each site's `z` is evaluated at its mask's nonzeros alone.
+    let trace = masked.program.execute_gated(family, &masked.gates()).map_err(|e| e.to_string())?;
+    Ok(kl_score_only(target, &*logits(masked, family, &trace, target)?))
 }
 
 /// The float64 KL per input and the logits it scores, on the program's device twin when it has
@@ -1166,9 +1212,15 @@ impl Screen {
         HeadBase { hidden: trace.values[self.hidden].clone(), logits: trace.values[output].clone(), error: Array1::zeros(trace.values[output].nrows()) }
     }
 
-    /// `family` scored from `base`; the trace carries the screened logits in the head's nodes.
-    fn score(&self, masked: &Masked, family: &FamilyInputs, target: &Target, base: &HeadBase) -> Result<(Screened, Trace), String> {
-        let mut trace = self.body.execute(family, false).map_err(|e| e.to_string())?;
+    /// `family` scored from `base`; the trace carries the screened logits in the head's nodes. A
+    /// `trial`'s trace is only scored, so its sites' `z` are evaluated at their masks' nonzeros.
+    fn score(&self, masked: &Masked, family: &FamilyInputs, target: &Target, base: &HeadBase, trial: bool) -> Result<(Screened, Trace), String> {
+        let mut trace = if trial {
+            self.body.execute_gated(family, &masked.gates())
+        } else {
+            self.body.execute(family, false)
+        }
+        .map_err(|e| e.to_string())?;
         let hidden = trace.values[self.hidden].clone();
         let op = &masked.program.operators[self.operator];
         let delta = &hidden - &base.hidden;
@@ -1363,11 +1415,46 @@ fn box_worst(
 /// attack measures ([`box_excess_at`]). A refinement of the library cannot lower it: splitting an
 /// off block leaves the sum of its parts' norms no smaller.
 pub fn box_upper(masked: &Masked, trace: &Trace, masks: &[Array2<f64>], fishers: &[Array2<f64>]) -> Result<Array1<f64>, String> {
-    let terms = masked.box_terms(fishers)?;
+    let amplitudes: Vec<_> = masked.z.iter().map(|n| &trace.values[*n]).collect();
+    Ok(box_contributions(masked, &amplitudes, masks, fishers, false)?.0)
+}
+
+/// Direct derivatives of the contribution charge, before propagating through the masked model.
+pub(crate) struct ContributionDerivatives {
+    pub amplitudes: Vec<Array2<f64>>,
+    pub writes: Vec<Array2<f64>>,
+}
+
+/// The same contribution charge on host or device amplitudes. Fishers and binary masks are fixed.
+/// For each off block, `r = ‖z U‖_F` and `N = Σ r`: its derivatives are `N z(UFUᵀ)/r`
+/// in `z` and `zᵀ(N/r)z UF` in `U`. At a zero norm we choose the zero subgradient.
+/// Rank-one blocks take linear work in their amplitudes; no written-width value per row is formed.
+pub(crate) fn box_contributions(
+    masked: &Masked, amplitudes: &[&Array2<f64>], masks: &[Array2<f64>],
+    fishers: &[Array2<f64>], derivatives: bool,
+) -> Result<(Array1<f64>, Option<ContributionDerivatives>), String> {
+    let count = masked.sites.len();
+    if amplitudes.len() != count || masks.len() != count || fishers.len() != count {
+        return Err("box contribution: one amplitude, mask and Fisher per site required".to_string());
+    }
     let rows = masks.first().map_or(0, |m| m.nrows());
+    for k in 0..count {
+        if amplitudes[k].dim() != (rows, masked.pieces(k)) || masks[k].dim() != (rows, masked.blocks(k)) {
+            return Err(format!("box contribution: incompatible amplitudes or masks at site {k}"));
+        }
+        if masks[k].iter().any(|m| *m != 0.0 && *m != 1.0) {
+            return Err("box contribution: masks must be binary".to_string());
+        }
+        let width = masked.write_offsets[k].last().copied().unwrap_or(0);
+        if fishers[k].dim() != (width, width) {
+            return Err(format!("box contribution: incompatible Fisher at site {k}"));
+        }
+    }
+    let terms = masked.box_terms(fishers)?;
     let mut cost = Array1::<f64>::zeros(rows);
+    let mut differentiated = ContributionDerivatives { amplitudes: Vec::new(), writes: Vec::new() };
     for k in 0..masked.sites.len() {
-        let z = &trace.values[masked.z[k]];
+        let z = amplitudes[k];
         let mask = &masks[k];
         let mut norms = Array1::<f64>::zeros(rows);
         if masked.is_rank_one(k) {
@@ -1389,13 +1476,92 @@ pub fn box_upper(masked: &Masked, trace: &Trace, masks: &[Array2<f64>], fishers:
             }
         }
         cost += &(&norms * &norms * 0.5);
+        if derivatives {
+            let uf = gam_linalg::faer_ndarray::fast_ab(&masked.u(k)?, &fishers[k]);
+            let mut dz = Array2::<f64>::zeros(z.dim());
+            let mut du = Array2::<f64>::zeros(uf.dim());
+            if masked.is_rank_one(k) {
+                let own = terms.sites[k][0].row(0);
+                for c in 0..mask.ncols() {
+                    let size = own[c].max(0.0).sqrt();
+                    if size == 0.0 { continue; }
+                    let mut scale = 0.0;
+                    for r in 0..rows {
+                        if mask[[r, c]] == 0.0 && z[[r, c]] != 0.0 {
+                            dz[[r, c]] = norms[r] * z[[r, c]].signum() * size;
+                            scale += norms[r] * z[[r, c]].abs() / size;
+                        }
+                    }
+                    du.row_mut(c).assign(&(&uf.row(c) * scale));
+                }
+            } else {
+                let mut start = 0;
+                for (b, &width) in masked.ranks(k).iter().enumerate() {
+                    let metric = &terms.sites[k][b];
+                    let zb = z.slice(s![.., start..start + width]);
+                    let mut weighted = Array2::<f64>::zeros(zb.dim());
+                    for r in 0..rows {
+                        if mask[[r, b]] != 0.0 { continue; }
+                        let mz = metric.dot(&zb.row(r));
+                        let size = zb.row(r).dot(&mz).max(0.0).sqrt();
+                        if size == 0.0 { continue; }
+                        let scale = norms[r] / size;
+                        dz.slice_mut(s![r, start..start + width]).assign(&(&mz * scale));
+                        weighted.row_mut(r).assign(&(&zb.row(r) * scale));
+                    }
+                    let direct = zb.t().dot(&weighted).dot(&uf.slice(s![start..start + width, ..]));
+                    du.slice_mut(s![start..start + width, ..]).assign(&direct);
+                    start += width;
+                }
+            }
+            differentiated.amplitudes.push(dz);
+            differentiated.writes.push(du);
+        }
     }
-    Ok(cost)
+    Ok((cost, derivatives.then_some(differentiated)))
+}
+
+/// Gradient of the masks' KL plus [`box_upper`], with the written Fishers held fixed for a step.
+/// Later sites' charge depends on earlier sites' weights through their actual masked reads. All
+/// amplitude derivatives and the output's KL derivative therefore seed one joint reverse pass;
+/// differentiating each site in isolation would omit those terms. Returns `(cost, [(dV, dU)])`.
+pub fn box_gradients(
+    masked: &Masked, family: &FamilyInputs, trace: &Trace, masks: &[Array2<f64>],
+    cotangent: Array2<f64>, fishers: &[Array2<f64>],
+) -> Result<(Array1<f64>, BoxGradients), String> {
+    let amplitudes: Vec<_> = masked.z.iter().map(|n| &trace.values[*n]).collect();
+    let (cost, direct) = box_contributions(masked, &amplitudes, masks, fishers, true)?;
+    let direct = direct.ok_or("box contribution: missing derivatives")?;
+    let mut seeds = BTreeMap::from([(masked.program.output, cotangent)]);
+    for (&node, dz) in masked.z.iter().zip(direct.amplitudes) {
+        match seeds.get_mut(&node) { Some(g) => *g += &dz, None => { seeds.insert(node, dz); } }
+    }
+    let mut keep = masked.z.clone();
+    keep.extend(masked.written.iter().flatten().copied());
+    let back = super::derivatives::vjp_seeded(&masked.program, family, trace, seeds, Some(&keep)).map_err(|e| e.to_string())?;
+    let mut gradients = Vec::new();
+    for (k, direct_u) in direct.writes.into_iter().enumerate() {
+        let reads = read_values(trace, &masked.sites[k])?;
+        let dv = match &back[masked.z[k]] {
+            Some(g) => fast_atb(g, &reads),
+            None => Array2::zeros((masked.pieces(k), reads.ncols())),
+        };
+        let parts: Vec<_> = masked.written[k].iter().map(|n| back[*n].clone().unwrap_or_else(|| Array2::zeros(trace.values[*n].dim()))).collect();
+        let written = ndarray::concatenate(Axis(1), &parts.iter().map(|p| p.view()).collect::<Vec<_>>()).map_err(|e| e.to_string())?;
+        let du = fast_atb(&trace.values[masked.masked[k]], &written) + direct_u;
+        gradients.push((dv, du));
+    }
+    Ok((cost, gradients))
 }
 
 /// [`box_upper`] at `masks`, from the masked forward of `base` with them.
 pub fn box_upper_at(masked: &Masked, base: &FamilyInputs, masks: &[Array2<f64>], fishers: &[Array2<f64>]) -> Result<Array1<f64>, String> {
-    let trace = masked.program.execute(&masked.family(base, masks), false).map_err(|e| e.to_string())?;
+    let family = masked.family(base, masks);
+    if let Some(cost) = masked.on_device(|accelerated| {
+        let trace = accelerated.program().forward(&family)?;
+        accelerated.box_upper(masked, &trace, masks, fishers)
+    })? { return Ok(cost); }
+    let trace = masked.program.execute(&family, false).map_err(|e| e.to_string())?;
     box_upper(masked, &trace, masks, fishers)
 }
 
@@ -1994,6 +2160,14 @@ enum Selected {
 }
 
 impl Selected {
+    /// The contribution charge uses this already evaluated forward on either backend.
+    fn contribution(&self, masked: &Masked, masks: &[Array2<f64>], fishers: &[Array2<f64>]) -> Result<Array1<f64>, String> {
+        timed("contribution", || match self {
+            Self::Host(trace, ..) => box_upper(masked, trace, masks, fishers),
+            Self::Device(state) => masked.on_lowered(|accelerated| accelerated.box_upper(masked, &state.trace, masks, fishers)),
+        })
+    }
+
     /// The masked forward and its KL, deferring the head cotangent on score-only trials.
     fn forward(masked: &Masked, family: &FamilyInputs, target: &Target, on_device: Option<&DeviceTarget>, cotangent: bool) -> Result<(Array1<f64>, Self), String> {
         timed("forward", || Self::forward_untimed(masked, family, target, on_device, cotangent))
@@ -2355,8 +2529,8 @@ pub fn select_resumable(
         match boxed {
             None => Ok((score_only(masked, &family, target)?, Array1::zeros(rows))),
             Some(f) => {
-                let kl_trial = Selected::forward(masked, &family, target, on_device, false)?.0;
-                Ok((kl_trial, box_upper_at(masked, base, trial, f)?))
+                let (kl_trial, state) = Selected::forward(masked, &family, target, on_device, false)?;
+                Ok((kl_trial, state.contribution(masked, trial, f)?))
             }
         }
     };
@@ -2385,7 +2559,7 @@ pub fn select_resumable(
                     head_base = Some(screen.base(masked, trace));
                 }
                 if let (Some(f), None) = (boxed, &excess_known) {
-                    excess_known = Some(box_upper_at(masked, base, &masks, f)?);
+                    excess_known = Some(state.contribution(masked, &masks, f)?);
                 }
                 let grads = state.mask_gradients(masked, &family, target, on_device)?;
                 // The Fisher diagonal only ranks proposals (the exact forward decides), so it is
@@ -2510,7 +2684,7 @@ pub fn select_resumable(
                 let listing_trial = coder.bits(&trial);
                 let (after_trial, screened) = match (&screen, &head_base) {
                     (Some(screen), Some(head)) => {
-                        let (screened, _) = screen.score(masked, &masked.family(base, &trial), target, head)?;
+                        let (screened, _) = screen.score(masked, &masked.family(base, &trial), target, head, true)?;
                         (code(&screened.kl, &listing_trial, observations), Some(screened))
                     }
                     // Under the box claim each k is ranked by its expected excess alone; the full
@@ -2636,7 +2810,7 @@ pub fn select_resumable(
         let proposed_family = masked.family(base, &proposed);
         let (mut kl_new, mut state_new, mut screened) = match (&screen, &head_base) {
             (Some(screen), Some(head)) => {
-                let (screened, trace) = screen.score(masked, &proposed_family, target, head)?;
+                let (screened, trace) = screen.score(masked, &proposed_family, target, head, false)?;
                 (screened.kl.clone(), Selected::Host(trace, None, None), Some(screened))
             }
             _ => {
@@ -2646,9 +2820,10 @@ pub fn select_resumable(
         };
         let excess_new = match boxed {
             Some(f) => {
+                let cost = state_new.contribution(masked, &proposed, f)?;
                 // Kept, this forward serves only the next round's mask gradients.
                 state_new.shrink(masked);
-                box_upper_at(masked, base, &proposed, f)?
+                cost
             }
             None => Array1::zeros(rows),
         };
@@ -2724,7 +2899,7 @@ pub fn select_resumable(
             let listing = coder.bits(trial);
             match (&screen, head) {
                 (Some(screen), Some(head)) => {
-                    let (screened, _) = screen.score(masked, &masked.family(base, trial), target, head)?;
+                    let (screened, _) = screen.score(masked, &masked.family(base, trial), target, head, true)?;
                     Ok((code(&screened.kl, &listing, observations), listing, Some(screened)))
                 }
                 _ => {
@@ -3040,27 +3215,27 @@ pub fn step_pieces(
         return Err("pieces steps need the whole model in the program and the training state".to_string());
     }
     let family = masked.family(base, masks);
-    // The forward and everything read off it, on the device twin when there is one (the box
-    // claim's there only on sites of rank-one blocks).
-    let lowered = if claim == Claim::Corner || (0..masked.sites.len()).all(|k| masked.is_rank_one(k)) {
-        masked.on_device(|accelerated| {
+    // The forward and everything read off it, on the device twin when there is one.
+    let lowered = masked.on_proposals(|accelerated| {
             let on_device = accelerated.target(target)?;
             let state = accelerated.forward(&family, &on_device)?;
             let grads = if claim == Claim::Corner { accelerated.piece_gradients(masked, &state, seed % 2 == 0)? }
-                else { accelerated.gradients(masked, &state, masks)? };
+                else { Vec::new() };
             let curvature = accelerated.step_fisher(masked, &state, &on_device, samples, seed)?;
             let covariances = accelerated.covariances(masked, &state)?;
-            Ok((on_device, state, grads, curvature, covariances))
-        })?
-    } else {
-        None
-    };
-    let (kl_now, grads, curvature, batch_covariances, evaluated, device_target) = match lowered {
-        Some((on_device, state, grads, curvature, covariances)) => (state.kl.clone(), grads, curvature, covariances, Evaluated::Device(state), Some(on_device)),
+            Ok((accelerated.decides(), on_device, state, grads, curvature, covariances))
+        })?;
+    // A twin without float64 proposes; the KL the step starts from, and every trial's, are the
+    // CPU's (`deciding` holds the twin's target only when it decides).
+    let (kl_now, grads, curvature, batch_covariances, evaluated, device_target, deciding) = match lowered {
+        Some((decides, on_device, state, grads, curvature, covariances)) => {
+            let kl_now = if decides { state.kl.clone() } else { score_only(masked, &family, target)? };
+            (kl_now, grads, curvature, covariances, Evaluated::Device(state), Some(on_device), decides)
+        }
         None => {
             let (kl_now, trace, cotangent) = forward(masked, &family, target)?;
             let grads = if claim == Claim::Corner { piece_gradients(masked, &family, &trace, masks, cotangent.clone(), seed % 2 == 0)? }
-                else { gradients(masked, &family, &trace, masks, cotangent.clone())? };
+                else { Vec::new() };
             let curvature = step_fisher(masked, &family, &trace, target, samples, seed)?;
             let rows = trace.values[masked.program.output].nrows() as f64;
             let mut batch_covariances = Vec::new();
@@ -3068,7 +3243,7 @@ pub fn step_pieces(
                 let reads = read_values(&trace, site)?;
                 batch_covariances.push(fast_atb(&reads, &reads) / rows);
             }
-            (kl_now, grads, curvature, batch_covariances, Evaluated::Host(trace, cotangent), None)
+            (kl_now, grads, curvature, batch_covariances, Evaluated::Host(trace, cotangent), None, false)
         }
     };
     // The preconditioners are the running means over every input stepped on so far.
@@ -3079,15 +3254,15 @@ pub fn step_pieces(
     let (total, grads) = match claim {
         Claim::Corner => (kl_now.sum(), grads),
         Claim::Box => {
-            let (_, box_grads) = match &evaluated {
-                Evaluated::Host(trace, cotangent) => box_excess(masked, &family, trace, masks, cotangent.clone(), &running.fishers, true)?,
-                Evaluated::Device(state) => masked.on_lowered(|accelerated| accelerated.box_excess(masked, state, masks, &running.fishers, true))?,
+            let (cost, box_grads) = match &evaluated {
+                Evaluated::Host(trace, cotangent) => box_gradients(masked, &family, trace, masks, cotangent.clone(), &running.fishers)?,
+                Evaluated::Device(state) => masked.on_lowered(|accelerated| accelerated.box_gradients(masked, state, masks, &running.fishers))?,
             };
-            let box_grads = box_grads.ok_or("no box gradients")?;
-            let grads = grads.into_iter().zip(box_grads).map(|((m, v, u), (bv, bu))| (m, v + bv, u + bu)).collect::<Vec<_>>();
-            // The expectation's gradients steer; the claim's error, its worst case over the box
-            // points ([`box_excess_at`]), decides.
-            (kl_now.sum() + box_upper_at(masked, base, masks, &running.fishers)?.sum(), grads)
+            let cost = if !deciding && matches!(&evaluated, Evaluated::Device(_)) {
+                box_upper_at(masked, base, masks, &running.fishers)?
+            } else { cost };
+            let grads = box_grads.into_iter().map(|(v, u)| (Array2::zeros((0, 0)), v, u)).collect();
+            (kl_now.sum() + cost.sum(), grads)
         }
     };
     // The direction, as the tangent of each operator it moves, on one side of every site and
@@ -3124,7 +3299,7 @@ pub fn step_pieces(
         let tangents: BTreeMap<usize, Array2<f64>> = moves.iter().map(|(op, t)| (*op, t.clone())).collect();
         match (&evaluated, &device_target) {
             (Evaluated::Device(state), Some(on_device)) => {
-                masked.on_device(|accelerated| accelerated.quadratic(state, on_device, &tangents))?.ok_or("device: the twin went away")?
+                masked.on_proposals(|accelerated| accelerated.quadratic(state, on_device, &tangents))?.ok_or("device: the twin went away")?
             }
             (Evaluated::Device(_), None) => return Err("device: a resident state without its target".to_string()),
             (Evaluated::Host(trace, _), _) => {
@@ -3143,18 +3318,21 @@ pub fn step_pieces(
     };
     drop(evaluated);
     let eta = if quadratic > 0.0 { slope / quadratic } else { 1.0 };
+    let device_target = device_target.filter(|_| deciding);
     backtrack_pieces(masked, &moves, eta, total, |masked| Ok(match (claim, &device_target) {
         (Claim::Corner, Some(on_device)) => {
             masked.on_device(|accelerated| accelerated.score_only(&family, on_device))?.ok_or("device: the twin went away")?.sum()
         }
         (Claim::Corner, None) => score_only(masked, &family, target)?.sum(),
         (Claim::Box, Some(on_device)) => {
-            let kl_trial = masked.on_lowered(|accelerated| Ok(accelerated.forward(&family, on_device)?.kl.clone()))?;
-            kl_trial.sum() + box_upper_at(masked, base, masks, &running.fishers)?.sum()
+            masked.on_device(|accelerated| {
+                let state = accelerated.score_state(&family, on_device)?;
+                Ok(state.kl.sum() + accelerated.box_upper(masked, &state.trace, masks, &running.fishers)?.sum())
+            })?.ok_or("device: the twin went away")?
         }
         (Claim::Box, None) => {
-            let kl_trial = score_only(masked, &family, target)?;
-            kl_trial.sum() + box_upper_at(masked, base, masks, &running.fishers)?.sum()
+            let (kl_trial, trace) = scored_forward(masked, &family, target)?;
+            kl_trial.sum() + box_upper(masked, &trace, masks, &running.fishers)?.sum()
         }
     }))
 }
@@ -3301,6 +3479,17 @@ fn box_excess_back(
         }
     }
     Ok((excess, gradients.then_some(out)))
+}
+
+/// A fingerprint of the written Fishers' every entry (FNV-1a over their bits, per site, folded),
+/// so a cache of what they determine is reused exactly while they are unchanged.
+pub(crate) fn fisher_print(fishers: &[Array2<f64>]) -> u64 {
+    use rayon::prelude::*;
+    let prints: Vec<u64> = fishers
+        .par_iter()
+        .map(|f| f.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, v| (h ^ v.to_bits()).wrapping_mul(0x0000_0100_0000_01b3)))
+        .collect();
+    prints.iter().fold(fishers.len() as u64, |h, p| (h ^ p).wrapping_mul(0x0000_0100_0000_01b3))
 }
 
 /// What the box claim's excess reads of the library and the written Fishers, fixed while neither
