@@ -73,7 +73,7 @@ if [ -z "$B" ]; then
         [ -n "${bc:-}" ] && alive "$bj" && same_rust "$bc" "$C" && { B=${bc:0:12}; break; }
     done
     if [ -z "$B" ]; then
-        bj=$(sbatch --parsable -J mpd-build --dependency=singleton -p compute --qos=debug -c 48 --mem=96G \
+        bj=$(sbatch --parsable -J mpd-build --dependency=singleton -p compute --qos=debug -c 48 --mem=32G \
             -t 01:00:00 -o "$CL/_build/build-$C12-%j.log" "$CL/_build/build.sh" "$C")
         echo "$bj $C" > "$BIN/$C12.buildjob"
         B=$C12
