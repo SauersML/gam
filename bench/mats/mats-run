@@ -18,10 +18,11 @@
 #
 # Environment: MATS_GPUS=N (L40s; CUDA 12.2 libs are on LD_LIBRARY_PATH), MATS_QOS=debug (2 h max),
 # MATS_ENV="K=V ..." (extra environment for the command; RUST_LOG is forwarded when set), MATS_DRY=1
-# (print the translated command and the uploads, submit nothing).
+# (print the translated command and the uploads, submit nothing), MATS_REF=<commit> (run that pushed
+# commit instead of HEAD; a commit that failed to build is refused with its compiler errors).
 set -Eeuo pipefail
 here=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
-usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 [ $# -ge 6 ] && [ "$5" = -- ] || usage
 NAME=$1 CPUS=$2 MEM=$3 HOURS=$4
 shift 5
@@ -106,6 +107,6 @@ if [ ${#uploads[@]} -gt 0 ] && [ -z "${MATS_NO_UPLOAD:-}" ]; then
     rsync -a --relative --copy-unsafe-links --exclude '*.pem' --exclude '*.key' --exclude '.env' "${rel[@]}" mats:mpd-data/
 fi
 
-want=$(git -C "$MAC_GAM" rev-parse HEAD)
+want=$(git -C "$MAC_GAM" rev-parse "${MATS_REF:-HEAD}")
 b64=$(printf '%s' "$cmd" | base64 | tr -d '\n')
 ssh mats bash -s -- "$NAME" "$CPUS" "$MEM" "$MINUTES" "$want" "$GPUS" "'$QOS'" "$b64" < "$here/remote_submit.sh"

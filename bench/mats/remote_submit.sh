@@ -19,6 +19,7 @@ cat > "$CL/_build/build.sh" <<'BUILD'
 # Build job: compiles every gam-mpd example at commit $1 and installs them in ~/mpd-bin/<commit12>/.
 set -Eeuo pipefail
 C=$1 C12=${1:0:12}
+trap 'echo "${SLURM_JOB_ID:-?} $C" > "$HOME/mpd-bin/$C12.failed"' ERR
 source "$HOME/.cargo/env"
 exec 9> "$HOME/gam-cluster/.build.lock"
 flock 9
@@ -64,6 +65,16 @@ find "$SRC" -mindepth 1 -maxdepth 1 -mtime +3 -exec rm -rf {} +
 same_rust() { git -C "$REPO" diff --quiet "$1" "$2" -- crates Cargo.toml Cargo.lock rust-toolchain.toml .cargo 2> /dev/null; }
 alive() { squeue -h -j "$1" -o %T 2> /dev/null | grep -qE 'PENDING|RUNNING|CONFIGURING|COMPLETING'; }
 B="" dep=()
+for f in $(ls -1t "$BIN"/*.failed 2> /dev/null); do
+    read -r fj fc < "$f" || true
+    if [ -n "${fc:-}" ] && same_rust "$fc" "$C"; then
+        log=$(ls "$CL"/_build/build-"${fc:0:12}"-"$fj".log 2> /dev/null || true)
+        echo "mats-run: $C12 does not build (same Rust sources as ${fc:0:12}, build job $fj); not submitting." >&2
+        [ -n "$log" ] && grep -E -A6 '^error' "$log" | head -n 30 >&2
+        echo "mats-run: pin a commit that builds with MATS_REF=<commit>" >&2
+        exit 3
+    fi
+done
 for d in $(ls -1dt "$BIN"/*/ 2> /dev/null); do
     [ -f "$d/READY" ] && same_rust "$(cat "$d/COMMIT")" "$C" && { B=$(basename "$d"); break; }
 done
@@ -83,7 +94,7 @@ if [ -z "$B" ]; then
     fi
     dep=(--dependency="afterok:$bj" --kill-on-invalid-dep=yes)
 fi
-find "$BIN" -maxdepth 1 -name '*.buildjob' -mtime +1 -delete
+find "$BIN" -maxdepth 1 \( -name '*.buildjob' -o -name '*.failed' \) -mtime +1 -delete
 
 stamp=$(date +%Y%m%d-%H%M%S)
 job=$OUT/job-$stamp.sh
