@@ -16,7 +16,14 @@
 # (MATS_NO_UPLOAD=1 skips that). Write outputs under /Users/user/mpd-data/cluster/NAME/ so
 # `mats-pull NAME` brings them back; the Slurm log is ~/mpd-data/cluster/NAME/slurm-JOBID.log there.
 #
-# Environment: MATS_GPUS=N (L40s; CUDA 12.2 libs are on LD_LIBRARY_PATH), MATS_QOS=debug (2 h max),
+# Throughput: MATS_QOS=debug runs in the debug QOS (priority far above normal, no per-user CPU cap,
+# at most 2 h, so HOURS is cut to 2). MATS_CHAIN=K submits K segments of the same job, each starting
+# after the last ends (--dependency=afterany), for commands that resume from their own checkpoint
+# (mpd_pieces_masked_2951 resumes from OUT.select/): a segment cut off by its time limit resumes, a
+# task that ended (exit 0, or a real error) skips its later segments. Example, 8 x 2 h in debug:
+#   MATS_QOS=debug MATS_CHAIN=8 mats-run NAME 16 12 2 -- ...
+#
+# Environment: MATS_GPUS=N (L40s; CUDA 12.2 libs are on LD_LIBRARY_PATH),
 # MATS_ENV="K=V ..." (extra environment for the command; RUST_LOG is forwarded when set), MATS_DRY=1
 # (print the translated command and the uploads, submit nothing), MATS_REF=<commit> (run that pushed
 # commit instead of HEAD; a commit that failed to build is refused with its compiler errors).
@@ -27,7 +34,7 @@
 # slurm-JOBID_TASK.log; `mats-pull NAME` brings back every task's outputs.
 set -Eeuo pipefail
 here=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
-usage() { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 [ $# -ge 6 ] && [ "$5" = -- ] || usage
 NAME=$1 CPUS=$2 MEM=$3 HOURS=$4
 shift 5
@@ -36,8 +43,13 @@ shift 5
 [[ $MEM =~ ^[0-9]+$ ]] && (( MEM >= 1 && MEM <= 384 )) || { echo "mats-run: MEM_GB must be 1..384" >&2; exit 2; }
 MINUTES=$(awk -v h="$HOURS" 'BEGIN { m = int(h * 60 + 0.999); if (m < 1) m = 1; print m }')
 QOS=${MATS_QOS:-}
-max=$([ "$QOS" = debug ] && echo 120 || echo 1440)
-(( MINUTES <= max )) || { echo "mats-run: HOURS exceeds the ${max}-minute limit" >&2; exit 2; }
+(( MINUTES <= 1440 )) || { echo "mats-run: HOURS exceeds the 24-hour limit" >&2; exit 2; }
+CHAIN=${MATS_CHAIN:-1}
+[[ $CHAIN =~ ^[0-9]+$ ]] && (( CHAIN >= 1 && CHAIN <= 48 )) || { echo "mats-run: MATS_CHAIN must be 1..48" >&2; exit 2; }
+if [ "$QOS" = debug ] && (( MINUTES > 120 )); then
+    (( CHAIN == 1 )) && echo "mats-run: the debug QOS stops jobs at 2 h; HOURS=$HOURS runs 2 h (MATS_CHAIN=K resumes it K times)" >&2
+    MINUTES=120
+fi
 GPUS=${MATS_GPUS:-0}
 ARRAY=${MATS_ARRAY:-}
 [[ -z $ARRAY || $ARRAY =~ ^[0-9][0-9,:%-]*$ ]] || { echo "mats-run: MATS_ARRAY is a Slurm --array spec like 0-31%24" >&2; exit 2; }
@@ -118,4 +130,4 @@ fi
 
 want=$(git -C "$MAC_GAM" rev-parse "${MATS_REF:-HEAD}")
 b64=$(printf '%s' "$cmd" | base64 | tr -d '\n')
-ssh mats bash -s -- "$NAME" "$CPUS" "$MEM" "$MINUTES" "$want" "$GPUS" "'$QOS'" "$b64" "'$ARRAY'" < "$here/remote_submit.sh"
+ssh mats bash -s -- "$NAME" "$CPUS" "$MEM" "$MINUTES" "$want" "$GPUS" "'$QOS'" "$b64" "'$ARRAY'" "$CHAIN" < "$here/remote_submit.sh"

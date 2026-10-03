@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Login-node half of mats-run (#2951): never builds or computes here, only fetches and submits.
 #
-#   remote_submit.sh NAME CPUS MEM_GB MINUTES WANT_COMMIT GPUS QOS CMD_B64 [ARRAY]
+#   remote_submit.sh NAME CPUS MEM_GB MINUTES WANT_COMMIT GPUS QOS CMD_B64 [ARRAY] [CHAIN]
 #
 # Picks the commit C (WANT_COMMIT when origin/main contains it, else origin/main) and snapshots its
 # source into ~/mpd-src/C (the job's working directory). Binaries come from ~/mpd-bin/B for a built
@@ -9,7 +9,7 @@
 # otherwise is C built. Builds run in the debug QOS (its own CPU pool, 2 h) as one Slurm singleton,
 # so they neither wait behind our day-long jobs nor hold CPUs while queued. Prints the run job id.
 set -Eeuo pipefail
-NAME=$1 CPUS=$2 MEM=$3 MINUTES=$4 WANT=$5 GPUS=$6 QOS=$7 CMD_B64=$8 ARRAY=${9:-}
+NAME=$1 CPUS=$2 MEM=$3 MINUTES=$4 WANT=$5 GPUS=$6 QOS=$7 CMD_B64=$8 ARRAY=${9:-} CHAIN=${10:-1}
 REPO=$HOME/gam-cluster BIN=$HOME/mpd-bin SRC=$HOME/mpd-src CL=$HOME/mpd-data/cluster
 OUT=$CL/$NAME
 mkdir -p "$OUT" "$BIN" "$SRC" "$CL/_build"
@@ -98,11 +98,12 @@ if [ -z "$B" ]; then
 fi
 find "$BIN" -maxdepth 1 \( -name '*.buildjob' -o -name '*.failed' \) -mtime +1 -delete
 
-stamp=$(date +%Y%m%d-%H%M%S)
+stamp=$(date +%Y%m%d-%H%M%S)-$$
 job=$OUT/job-$stamp.sh
 cmd=$(echo "$CMD_B64" | base64 -d)
 cmd=${cmd//@@BIN@@\/src/$SRC/$C12}
 cmd=${cmd//@@BIN@@/$BIN/$B}
+chained=$(( CHAIN > 1 ))
 cat > "$job" <<JOB
 #!/usr/bin/env bash
 export RAYON_NUM_THREADS=\$SLURM_CPUS_PER_TASK OMP_NUM_THREADS=\$SLURM_CPUS_PER_TASK
@@ -112,22 +113,33 @@ export LD_LIBRARY_PATH=/usr/local/cuda-12.2/lib64:/usr/local/cuda-12.2/targets/x
 # The node does not confine devices: a job Slurm gave no GPU would otherwise see (and take) all 8.
 export CUDA_VISIBLE_DEVICES=\${CUDA_VISIBLE_DEVICES-}
 cd $SRC/$C12
+# A chain's later segments rerun this script; a task that already ended (exit 0, or a real error)
+# skips at once, and one stopped by its time limit (SIGTERM, 143) resumes from its checkpoint.
+mark=$OUT/.chain-$stamp-\${SLURM_ARRAY_TASK_ID:-0}
+if [ $chained = 1 ] && [ -e "\$mark" ]; then echo "== chain segment \$SLURM_JOB_ID skipped: \$(cat "\$mark")"; exit 0; fi
 echo "== \$(date '+%F %T') job \$SLURM_JOB_ID\${SLURM_ARRAY_TASK_ID:+ (task \$SLURM_ARRAY_TASK_ID of \$SLURM_ARRAY_JOB_ID)} on \$(hostname): source $C, binaries $B, cpus \$SLURM_CPUS_PER_TASK, mem ${MEM}G, gpus ${GPUS}"
 echo "== $cmd"
 start=\$(date +%s)
 $cmd
 rc=\$?
 echo "== \$(date '+%F %T') exit \$rc after \$(( \$(date +%s) - start )) s"
+case \$rc in 143|137|130) ;; *) [ $chained = 1 ] && echo "ended with exit \$rc in job \$SLURM_JOB_ID" > "\$mark" ;; esac
 exit \$rc
 JOB
 chmod +x "$job"
 
 log=$OUT/slurm-%j.log
 [ -n "$ARRAY" ] && log=$OUT/slurm-%A_%a.log
-args=(--parsable -J "$NAME" -p compute -c "$CPUS" --mem="${MEM}G" -t "$MINUTES" -o "$log" "${dep[@]}")
-[ -n "$ARRAY" ] && args+=(--array="$ARRAY")
-[ "$GPUS" != 0 ] && args+=(--gres="gpu:$GPUS")
-[ -n "$QOS" ] && args+=(--qos="$QOS")
-jid=$(sbatch "${args[@]}" "$job")
-echo "$jid $stamp src=$C12 bin=$B cpus=$CPUS mem=${MEM}G min=$MINUTES gpus=$GPUS${ARRAY:+ array=$ARRAY}" >> "$OUT/JOBS"
-echo "$jid"
+jids=()
+for (( seg = 1; seg <= CHAIN; seg++ )); do
+    args=(--parsable -J "$NAME" -p compute -c "$CPUS" --mem="${MEM}G" -t "$MINUTES" -o "$log" "${dep[@]}")
+    [ -n "$ARRAY" ] && args+=(--array="$ARRAY")
+    [ "$GPUS" != 0 ] && args+=(--gres="gpu:$GPUS")
+    [ -n "$QOS" ] && args+=(--qos="$QOS")
+    jid=$(sbatch "${args[@]}" "$job")
+    jids+=("$jid")
+    echo "$jid $stamp src=$C12 bin=$B cpus=$CPUS mem=${MEM}G min=$MINUTES gpus=$GPUS${QOS:+ qos=$QOS}${ARRAY:+ array=$ARRAY}$( (( CHAIN > 1 )) && echo " chain=$seg/$CHAIN")" >> "$OUT/JOBS"
+    dep=(--dependency="afterany:$jid")
+done
+(( CHAIN > 1 )) && echo "mats-run: chain of $CHAIN segments: ${jids[*]}" >&2
+echo "${jids[0]}"
