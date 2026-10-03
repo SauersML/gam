@@ -22,6 +22,7 @@ Writes OUT["code"].
 """
 
 import argparse
+import fcntl
 import json
 import math
 from pathlib import Path
@@ -183,6 +184,9 @@ for name, r in rows.items():
     r["break_even_words"] = (lib_gap / gap) if gap > 0 and lib_gap > 0 else None
     print(f"{name}: per word {best:.2f} vs Step A {reference['per_word_step_a_coder']:.2f}; library "
           f"{r['library_bits'] / 1e9:.2f} vs {reference['library_bits'] / 1e9:.2f} Gbit")
+# The honesty runs share the file (vpd_stepA_honesty.py): read-modify-write under their lock.
+lock = open(args.out.with_suffix(".lock"), "w")
+fcntl.flock(lock, fcntl.LOCK_EX)
 data = json.load(open(args.out)) if args.out.exists() else {}
 data["code"] = {"observations": args.observations, "bits_per_real": BITS_PER_REAL, "words_per_sequence": S,
                 "held_out_sequences": held_sequences, "replica_check": {"replica": replica, "driver": reported},

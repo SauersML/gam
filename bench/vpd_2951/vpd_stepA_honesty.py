@@ -21,7 +21,7 @@ usage: vpd_stepA_honesty.py {box|layers} SETS_STEM OUT.json [--rows N] [--offset
        [--steps 20,40,80] [--key NAME] [--families vpd_ci,vpd_rounded,given] [--name NAME]
 SETS_STEM is the driver's `OUT.pass{P}` path prefix (unused without `given`); `--offset` is the
 export's first val row; the given family is stored under `--name`. The threshold curve and the
-all-on point come with `vpd_ci`.
+all-on point with `--all-on`.
 """
 
 import argparse
@@ -40,7 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import torch  # noqa: E402
 
 from vpd_eval import MB, gates_and_l0, kl_per_pos, pgd_recon  # noqa: E402
-from vpd_model import load_target, load_vpd, site_names, val_tokens  # noqa: E402
+from vpd_model import VPD, VPD_PTH, load_target, load_vpd, site_names, val_tokens  # noqa: E402
 
 parser = argparse.ArgumentParser()
 parser.add_argument("mode", choices=["box", "layers"])
@@ -52,8 +52,11 @@ parser.add_argument("--draws", type=int, default=64)
 parser.add_argument("--steps", default="20,40,80")
 parser.add_argument("--key", default=None)
 parser.add_argument("--families", default="vpd_ci,vpd_rounded,given")
+parser.add_argument("--all-on", action="store_true", help="also every subcomponent on (box)")
 parser.add_argument("--name", default="ours", help="the given sets' family name")
 parser.add_argument("--library", type=Path, default=Path.home() / "mpd-data/pieces/vpd4l_library")
+parser.add_argument("--gates", type=Path, default=None,
+                    help="VPD's gates on these rows (written by the first run, read by the rest: the CI network then never loads)")
 args = parser.parse_args()
 DEV = "mps"
 t0 = time.time()
@@ -65,7 +68,25 @@ def log(msg: str):
 
 
 target = load_target(DEV)
-vpd = load_vpd(target, DEV)
+if args.gates is None:
+    args.gates = Path.home() / f"mpd-data/frontier/vpd4l_gates_{args.offset}_{args.rows}.npz"
+
+
+def subcomponents_only() -> VPD:
+    """VPD's subcomponents installed in the target, without the CI network."""
+    raw = torch.load(str(VPD_PTH), map_location="cpu", weights_only=True, mmap=True)
+    uv = {}
+    for k, v in raw.items():
+        if k.startswith("_components."):
+            site, which = k[len("_components."):].rsplit(".", 1)
+            uv.setdefault(site.replace("-", "."), {})[which] = v.float().to(DEV)
+    del raw
+    return VPD(target, None, {n: (uv[n]["U"], uv[n]["V"]) for n in site_names()})
+
+
+wanted = args.families.split(",")
+need_gates = "vpd_ci" in wanted or "vpd_rounded" in wanted
+vpd = load_vpd(target, DEV) if need_gates and not args.gates.exists() else subcomponents_only()
 names = site_names()
 ids = val_tokens(args.rows, offset=args.offset).to(DEV)
 S = ids.shape[1]
@@ -132,16 +153,36 @@ def transformed(fam: Family, f) -> Family:
     return Family(mbs)
 
 
-ci, _ = gates_and_l0(vpd, ids)
-# Only the gates are needed: the CI network (0.54B parameters) leaves memory.
-del vpd.ci_fn
-torch.mps.empty_cache()
-wanted = args.families.split(",")
+if not need_gates:
+    ci_mb = None
+elif args.gates.exists():
+    stored = np.load(args.gates)
+    ci_mb = []
+    for i in range(n_mb):
+        d = {}
+        for n in names:
+            flat, val = stored[f"{n}:index"], stored[f"{n}:value"]
+            span = MB * S * vpd.C[n]
+            sel = (flat >= i * span) & (flat < (i + 1) * span)
+            d[n] = (torch.tensor(flat[sel] - i * span, device=DEV), torch.tensor(val[sel], device=DEV),
+                    torch.Size((MB, S, vpd.C[n])))
+        ci_mb.append(d)
+else:
+    ci, _ = gates_and_l0(vpd, ids)
+    ci_mb = ci.mb
+    # Only the gates are needed: the CI network (0.54B parameters) leaves memory.
+    del vpd.ci_fn
+    torch.mps.empty_cache()
+    np.savez(args.gates, **{
+        f"{n}:{part}": np.concatenate([(d[n][0].cpu().numpy() + i * MB * S * vpd.C[n]) if part == "index" else d[n][1].cpu().numpy()
+                                       for i, d in enumerate(ci_mb)])
+        for n in names for part in ("index", "value")})
+    log(f"gates written to {args.gates}")
 families = {}
 if "vpd_ci" in wanted:
-    families["vpd_ci"] = Family(ci.mb)
+    families["vpd_ci"] = Family(ci_mb)
 if "vpd_rounded" in wanted:
-    families["vpd_rounded"] = transformed(Family(ci.mb), lambda v: (v > 0).float())
+    families["vpd_rounded"] = transformed(Family(ci_mb), lambda v: (v > 0).float())
 if "given" in wanted:
     families[args.name] = given_family()
 log("families: " + ", ".join(f"{k} L0 {f.l0():.1f}" for k, f in families.items()))
@@ -232,7 +273,7 @@ def box():
             fam = transformed(families["vpd_ci"], lambda v, tau=tau: (v > tau).float())
             fixed[f"vpd_gt_{tau}"] = np.concatenate([kl_rows(i, fam.dense(i), zero_delta(fam.dense(i))).cpu().numpy() for i in range(n_mb)])
             log(f"threshold {tau}: L0 {fam.l0():.1f} KL {fixed[f'vpd_gt_{tau}'].mean():.4f}")
-        if "vpd_ci" in families:
+        if args.all_on:
             ones = {n: torch.ones((MB, S, vpd.C[n]), device=DEV) for n in names}
             fixed["all_on"] = np.concatenate([kl_rows(i, ones, zero_delta(ones)).cpu().numpy() for i in range(n_mb)])
             del ones
