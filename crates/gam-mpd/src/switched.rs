@@ -9,8 +9,16 @@ use ndarray::Array2;
 /// Feature pieces index amplitude columns, including for blocks of rank greater than one.
 /// Same-position features must already be available (the site's own amplitude is allowed).
 /// Previous-position features require an intervening causal attention or mixing node.
+/// This dense executor computes the library's reads, including reads of components subsequently
+/// switched off. Active-component counts therefore do not measure its full execution cost.
 /// These decisions are execution results, not a fidelity certificate.
 pub fn execute(masked: &Masked, base: &FamilyInputs, switches: &[Vec<Switch>]) -> Result<(Trace, Vec<Array2<f64>>), String> {
+    execute_at(masked, base, switches, &vec![1.0; masked.program.declarations.parameters])
+}
+
+/// Run the same learned program under declared controls. The controls alter its states and
+/// hence may change its subsequent switch decisions. No native trace or target is consulted.
+pub fn execute_at(masked: &Masked, base: &FamilyInputs, switches: &[Vec<Switch>], parameters: &[f64]) -> Result<(Trace, Vec<Array2<f64>>), String> {
     let count = masked.sites.len();
     if switches.len() != count || masked.z.len() != count || masked.masked.len() != count || masked.slots.len() != count {
         return Err("autonomous switches and masked site counts differ".into());
@@ -69,7 +77,7 @@ pub fn execute(masked: &Masked, base: &FamilyInputs, switches: &[Vec<Switch>]) -
     }
     let mut masks: Vec<Array2<f64>> = (0..count).map(|site| Array2::zeros((base.rows, masked.blocks(site)))).collect();
     let family = masked.family(base, &masks);
-    let trace = masked.program.execute_with_gates(&family, &pairs, |z, values| {
+    let trace = masked.program.execute_with_gates_at(&family, &pairs, parameters, |z, values| {
         let site = masked.z.iter().position(|node| *node == z).ok_or("unknown autonomous amplitude node")?;
         for (block, switch) in switches[site].iter().enumerate() {
             let mut features = vec![0.0; switch.features.len()];
@@ -108,15 +116,23 @@ mod tests {
     }
 
     fn fixture_rank(mixing: bool, rank: usize) -> (Masked, FamilyInputs) {
+        fixture_control(mixing, rank, false)
+    }
+
+    fn fixture_control(mixing: bool, rank: usize, controlled: bool) -> (Masked, FamilyInputs) {
         let interface = Interface::native(1).expect("interface");
         let op = |name: &str| Arc::new(Operator::dense(name, interface.clone(), interface.clone(), array![[1.0]], DeclaredPrecision::new(40).expect("precision"), Provenance::default()).expect("operator"));
         let mut nodes = vec![Node::Raw { slot: 0 }, Node::Affine { terms: vec![(0, 0)], bias: None }];
+        if controlled {
+            nodes.push(Node::Gain { input: 1, coefficient: crate::operator_program::Coefficient::Parameter(0) });
+        }
+        let first = nodes.len() - 1;
         let input = if mixing {
-            nodes.push(Node::Attend { query: 0, key: 0, value: 1, scale: crate::operator_program::Scale::One, rotary: None, causal: true });
-            2
-        } else { 1 };
+            nodes.push(Node::Attend { query: 0, key: 0, value: first, scale: crate::operator_program::Scale::One, rotary: None, causal: true });
+            nodes.len() - 1
+        } else { first };
         nodes.push(Node::Affine { terms: vec![(input, 1)], bias: None });
-        let program = OperatorProgram { declarations: Declarations { parameters: 0, domains: vec![], slots: vec![Slot::Raw { width: 1 }] }, bases: vec![], operators: vec![op("first"), op("second")], rules: vec![], output: nodes.len() - 1, nodes };
+        let program = OperatorProgram { declarations: Declarations { parameters: usize::from(controlled), domains: vec![], slots: vec![Slot::Raw { width: 1 }] }, bases: vec![], operators: vec![op("first"), op("second")], rules: vec![], output: nodes.len() - 1, nodes };
         let all = sites(&program);
         let selected = ["first", "second"].iter().map(|name| all.iter().find(|site| site.name == *name).expect("site").clone()).collect();
         let library = || Library { v: Array2::<f64>::ones((rank, 1)), u: Array2::<f64>::from_elem((rank, 1), 1.0 / rank as f64), mean: Array1::zeros(1) };
@@ -195,6 +211,29 @@ mod tests {
         let pairs = vec![(masked.z[0], masked.z[0] - 1)];
         for invalid in [Array2::<f64>::from_elem((base.rows, 1), 0.5), Array2::<f64>::from_elem((base.rows, 1), f64::NAN), Array2::<f64>::ones((base.rows, 2))] {
             assert!(masked.program.execute_with_gates(&family, &pairs, |_, _| Ok(invalid.clone())).is_err());
+        }
+    }
+
+    #[test]
+    fn interventions_recompute_switches_and_replay_at_the_same_controls() {
+        let (masked, base) = fixture_control(false, 1, true);
+        let switches = vec![vec![constant(true)], vec![threshold(1, 0)]];
+        let (clean, before) = execute(&masked, &base, &switches).expect("unmodified");
+        assert_eq!(before[1], Array2::<f64>::ones((3, 1)));
+        for gain in [0.0, 0.5, 1.0, -2.0] {
+            let (trace, chosen) = super::execute_at(&masked, &base, &switches, &[gain]).expect("intervened");
+            let expected = array![[2.0], [3.0], [4.0]].mapv(|x: f64| if (gain * x).abs() > 1.0 { 1.0 } else { 0.0 });
+            assert_eq!(chosen[1], expected);
+            let replay = masked.program.execute_at(&masked.family(&base, &chosen), false, &[gain]).expect("replay");
+            assert_eq!(trace.values, replay.values);
+            if gain == 1.0 { assert_eq!(trace.values, clean.values); }
+            if gain == 0.5 {
+                let stale = masked.program.execute_at(&masked.family(&base, &before), false, &[gain]).expect("stale masks");
+                assert_ne!(trace.values[masked.program.output], stale.values[masked.program.output]);
+            }
+        }
+        for invalid in [vec![], vec![1.0, 1.0], vec![f64::NAN], vec![f64::INFINITY]] {
+            assert!(super::execute_at(&masked, &base, &switches, &invalid).is_err());
         }
     }
 

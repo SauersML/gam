@@ -1742,11 +1742,29 @@ impl OperatorProgram {
         &self,
         inputs: &FamilyInputs,
         gated: &[(usize, usize)],
+        decide: F,
+    ) -> Result<Trace, ProgramError>
+    where
+        F: FnMut(usize, &[Array2<f64>]) -> Result<Array2<f64>, String>,
+    {
+        self.execute_with_gates_at(inputs, gated, &vec![1.0; self.declarations.parameters], decide)
+    }
+
+    /// Autonomous execution under declared controls. Decisions see the states produced by
+    /// these controls, rather than masks chosen before the intervention.
+    pub fn execute_with_gates_at<F>(
+        &self,
+        inputs: &FamilyInputs,
+        gated: &[(usize, usize)],
+        parameters: &[f64],
         mut decide: F,
     ) -> Result<Trace, ProgramError>
     where
         F: FnMut(usize, &[Array2<f64>]) -> Result<Array2<f64>, String>,
     {
+        if parameters.len() != self.declarations.parameters || parameters.iter().any(|p| !p.is_finite()) {
+            return Err(ProgramError::Input("one finite value per declared autonomous control required".into()));
+        }
         self.check_inputs(inputs)?;
         let interfaces = self.interfaces()?;
         let mut amplitudes = BTreeSet::new();
@@ -1770,8 +1788,7 @@ impl OperatorProgram {
                 return Err(ProgramError::Input("autonomous amplitude and mask widths differ".into()));
             }
         }
-        let ones = vec![1.0; self.declarations.parameters];
-        let frame = Frame { args: &[], parameters: &ones, nodes: &self.nodes, output: self.output };
+        let frame = Frame { args: &[], parameters, nodes: &self.nodes, output: self.output };
         let mut top = Vec::with_capacity(self.nodes.len());
         for (index, node) in self.nodes.iter().enumerate() {
             let values = Layered { base: &[], top: &top, from: 0, patch: None };
