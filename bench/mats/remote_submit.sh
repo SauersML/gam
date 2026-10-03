@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Login-node half of mats-run (#2951): never builds or computes here, only fetches and submits.
 #
-#   remote_submit.sh NAME CPUS MEM_GB MINUTES WANT_COMMIT GPUS QOS CMD_B64 [ARRAY] [CHAIN]
+#   remote_submit.sh NAME CPUS MEM_GB MINUTES WANT_COMMIT GPUS QOS CMD_B64 [ARRAY] [CHAIN] [NEEDBIN]
 #
 # Picks the commit C (WANT_COMMIT when origin/main contains it, else origin/main) and snapshots its
 # source into ~/mpd-src/C (the job's working directory). Binaries come from ~/mpd-bin/B for a built
@@ -10,7 +10,7 @@
 # fit between running jobs; they neither wait behind day-long jobs nor hold CPUs while queued.
 # MATS_CHAIN's segments are copies of the run job, each after the last (afterany). Prints the job id.
 set -Eeuo pipefail
-NAME=$1 CPUS=$2 MEM=$3 MINUTES=$4 WANT=$5 GPUS=$6 QOS=$7 CMD_B64=$8 ARRAY=${9:-} CHAIN=${10:-1}
+NAME=$1 CPUS=$2 MEM=$3 MINUTES=$4 WANT=$5 GPUS=$6 QOS=$7 CMD_B64=$8 ARRAY=${9:-} CHAIN=${10:-1} NEEDBIN=${11:-auto}
 REPO=$HOME/gam-cluster BIN=$HOME/mpd-bin SRC=$HOME/mpd-src CL=$HOME/mpd-data/cluster
 OUT=$CL/$NAME
 mkdir -p "$OUT" "$BIN" "$SRC" "$CL/_build"
@@ -68,8 +68,13 @@ find "$SRC" -mindepth 1 -maxdepth 1 -mtime +3 -exec rm -rf {} +
 
 same_rust() { git -C "$REPO" diff --quiet "$1" "$2" -- crates Cargo.toml Cargo.lock rust-toolchain.toml .cargo 2> /dev/null; }
 alive() { squeue -h -j "$1" -o %T 2> /dev/null | grep -qE 'PENDING|RUNNING|CONFIGURING|COMPLETING'; }
+# A command that names no binary (only @@BIN@@/src, say a Python script) neither builds nor waits
+# for a build; it gets a ready build of the same Rust sources on its PATH when there is one.
+cmd=$(echo "$CMD_B64" | base64 -d)
+probe=${cmd//@@BIN@@\/src/}
+case $NEEDBIN in 1) need=1 ;; 0) need=0 ;; *) [[ $probe == *@@BIN@@* ]] && need=1 || need=0 ;; esac
 B="" dep=()
-for f in $(ls -1t "$BIN"/*.failed 2> /dev/null); do
+[ $need = 1 ] && for f in $(ls -1t "$BIN"/*.failed 2> /dev/null); do
     read -r fj fc < "$f" || true
     if [ -n "${fc:-}" ] && same_rust "$fc" "$C"; then
         log=$(ls "$CL"/_build/build-"${fc:0:12}"-"$fj".log 2> /dev/null || true)
@@ -82,7 +87,9 @@ done
 for d in $(ls -1dt "$BIN"/*/ 2> /dev/null); do
     [ -f "$d/READY" ] && same_rust "$(cat "$d/COMMIT")" "$C" && { B=$(basename "$d"); break; }
 done
-if [ -z "$B" ]; then
+if [ $need = 0 ]; then
+    [ -n "$B" ] || B=none
+elif [ -z "$B" ]; then
     for f in $(ls -1t "$BIN"/*.buildjob 2> /dev/null); do
         read -r bj bc < "$f" || true
         [ -n "${bc:-}" ] && alive "$bj" && same_rust "$bc" "$C" && { B=${bc:0:12}; break; }
@@ -102,7 +109,6 @@ find "$BIN" -maxdepth 1 \( -name '*.buildjob' -o -name '*.failed' \) -mtime +1 -
 
 stamp=$(date +%Y%m%d-%H%M%S)-$$
 job=$OUT/job-$stamp.sh
-cmd=$(echo "$CMD_B64" | base64 -d)
 cmd=${cmd//@@BIN@@\/src/$SRC/$C12}
 cmd=${cmd//@@BIN@@/$BIN/$B}
 chained=$(( CHAIN > 1 ))
