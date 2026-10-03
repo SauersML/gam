@@ -82,10 +82,11 @@ fn a_harmonic_chart_on_labelled_rows_reads_one_character() {
     let chart = Chart::harmonic("reads", values.view(), labels.view(), p).expect("chart");
     assert_eq!(chart.groups.len(), (p * p - 1) / 2 + 1);
     // The direction reading cos(2π·2a/p) has exactly that profile wherever the values resolve it.
+    // ... up to the unit mean-square scale (the cosine's own is ½).
     let g = chart.groups.iter().find(|g| g.mode == vec![2, 0]).expect("mode");
     let profile = values.dot(&chart.basis.column(g.start));
     for r in 0..rows {
-        let want = (2.0 * std::f64::consts::PI * (2 * (r / p)) as f64 / p as f64).cos();
+        let want = std::f64::consts::SQRT_2 * (2.0 * std::f64::consts::PI * (2 * (r / p)) as f64 / p as f64).cos();
         assert!((profile[r] - want).abs() < 1e-8, "row {r}: {} against {want}", profile[r]);
     }
 }

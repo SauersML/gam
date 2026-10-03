@@ -146,7 +146,8 @@ impl Chart {
     /// row's labels (the operands of an input, or a token id when `values` is a token map). Group
     /// `f ∈ Z_period^m` (one of each pair `±f`) spans the directions whose profiles over the rows
     /// are `cos 2π⟨f, t⟩/period` and `sin 2π⟨f, t⟩/period` (the cosine alone where `f = −f`): the
-    /// least-squares directions `X⁺ h`, `X⁺` the pseudo-inverse of `values` beyond its rounding band.
+    /// least-squares directions `X⁺ h`, `X⁺` the pseudo-inverse of `values` beyond its rounding band,
+    /// each scaled to a unit mean-square profile `‖X b‖² = rows`.
     pub fn harmonic(name: &str, values: ArrayView2<'_, f64>, labels: ArrayView2<'_, usize>, period: usize) -> Result<Self, String> {
         let (rows, d) = values.dim();
         let m = labels.ncols();
@@ -192,9 +193,17 @@ impl Chart {
             }
             groups.push(Group { start, width: profiles.len() - start, mode: f });
         }
+        // Each direction scaled to a unit mean-square profile on the rows: a character the values
+        // barely resolve would otherwise come back as a reader of enormous norm, whose products
+        // with the metric cancel in floating point.
         let mut basis = Array2::<f64>::zeros((d, profiles.len()));
         for (j, h) in profiles.iter().enumerate() {
-            basis.column_mut(j).assign(&v.dot(&(&u.t().dot(h) * &inverse)));
+            let direction = v.dot(&(&u.t().dot(h) * &inverse));
+            let profile = values.dot(&direction);
+            let rms = (profile.dot(&profile) / rows as f64).sqrt();
+            if rms > 0.0 {
+                basis.column_mut(j).assign(&(direction / rms));
+            }
         }
         Ok(Self { name: name.to_string(), basis, groups, subsets: true })
     }
