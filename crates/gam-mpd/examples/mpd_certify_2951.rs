@@ -20,7 +20,9 @@
 //! library in `LIBRARY_DIR` (`{site}.v.f64`, `{site}.u.f64`) run on its subcomponents plus the
 //! residual `W − Σ u vᵀ` as exact rank-one pieces that are always on (VPD's delta component, held on), so
 //! every gate on is the model. `SETS_DIR` gives each position's set (`bench/vpd_2951/vpd_sets_export.py`'s CSR over
-//! 512-position sequences). `FREE` (default `all`) is a comma-separated list of site-name prefixes
+//! 512-position sequences; the export's sequences must be the sets' rows in order, as
+//! `vpd4l_frontier32` is for `vpd4l_sets`), or is `ladder:τ1,τ2,…`: at each level `τ` a word's pieces of
+//! the given library whose `|z_c| ‖u_c‖` at every gate on is below `τ` times the word's largest are off. `FREE` (default `all`) is a comma-separated list of site-name prefixes
 //! whose off gates are free; every other off gate stays at 0. The adversary takes `STEPS` steps
 //! (default 40) from 6 starts on the sequence's total KL. Each word's certificate uses `BUDGET`
 //! symbols (default 512), and the sequence's box is split into `LEAVES` leaves (default 1: no
@@ -223,44 +225,69 @@ fn lm(args: &[String]) -> Result<(), String> {
     }
     let masked = Masked::build(model, chosen.clone(), libraries)?;
     eprintln!("built {} sites in {:.1}s", masked.sites.len(), started.elapsed().as_secs_f64());
-    // The given sets, over 512-position sequences, pieces numbered site after site in `sites.txt`; every
-    // residual piece is on.
-    let listed = std::fs::read_to_string(sets_dir.join("sites.txt")).map_err(|e| format!("{}: {e}", sets_dir.display()))?;
-    let mut offsets = vec![0usize];
-    let mut site_of_listing = Vec::new();
-    for line in listed.lines().filter(|l| !l.is_empty()) {
-        let (name, pieces) = line.split_once(' ').ok_or("sites.txt: name pieces")?;
-        let k = masked.sites.iter().position(|s| s.name == name).ok_or_else(|| format!("sites.txt: {name} is not a site"))?;
-        let pieces: usize = pieces.parse().map_err(|e| format!("sites.txt: {e}"))?;
-        if pieces != given[k] {
-            return Err(format!("{name}: {pieces} listed, {} in the library", given[k]));
+    let all_on: Vec<Array2<f64>> = (0..masked.sites.len()).map(|k| Array2::ones((family.rows, masked.blocks(k)))).collect();
+    let mut named: Vec<(String, Vec<Array2<f64>>)> = Vec::new();
+    let sets_arg = sets_dir.to_string_lossy().to_string();
+    if let Some(levels) = sets_arg.strip_prefix("ladder:") {
+        // Each word's pieces of the given library ranked by `|z_c| ‖u_c‖` at every gate on; at level `τ`
+        // the pieces below `τ` times the word's largest are off.
+        let trace = masked.program.execute(&masked.family(family, &all_on), false).map_err(|e| e.to_string())?;
+        let mut amplitude: Vec<Array2<f64>> = Vec::new();
+        for k in 0..masked.sites.len() {
+            let norms: Array1<f64> = masked.library(k)?.u.outer_iter().map(|u| u.dot(&u).sqrt()).collect();
+            let z = &trace.values[masked.z[k]];
+            amplitude.push(Array2::from_shape_fn(z.dim(), |(r, c)| if c < given[k] { z[[r, c]].abs() * norms[c] } else { f64::INFINITY }));
         }
-        site_of_listing.push(k);
-        offsets.push(offsets[offsets.len() - 1] + pieces);
-    }
-    let indptr = read_i64(&sets_dir.join("indptr.i64"))?;
-    let indices = read_i64(&sets_dir.join("indices.i64"))?;
-    const SEQUENCE: usize = 512;
-    let mut masks: Vec<Array2<f64>> = (0..masked.sites.len())
-        .map(|k| Array2::from_shape_fn((family.rows, masked.blocks(k)), |(_, c)| if c >= given[k] { 1.0 } else { 0.0 }))
-        .collect();
-    for s in 0..sequences {
-        for p in 0..context {
-            let at = s * SEQUENCE + p;
-            let row = s * context + p;
-            for &i in &indices[indptr[at] as usize..indptr[at + 1] as usize] {
-                let i = i as usize;
-                let listing = offsets.partition_point(|o| *o <= i) - 1;
-                masks[site_of_listing[listing]][[row, i - offsets[listing]]] = 1.0;
+        let largest: Vec<f64> = (0..family.rows)
+            .map(|r| amplitude.iter().flat_map(|a| a.row(r).iter().copied().filter(|v| v.is_finite()).collect::<Vec<_>>()).fold(0.0, f64::max))
+            .collect();
+        for level in levels.split(',') {
+            let tau: f64 = level.parse().map_err(|e| format!("ladder level {level}: {e}"))?;
+            let masks = amplitude.iter().map(|a| Array2::from_shape_fn(a.dim(), |(r, c)| if a[[r, c]] > tau * largest[r] { 1.0 } else { 0.0 })).collect();
+            named.push((format!("ladder {level}"), masks));
+        }
+    } else {
+        // The given sets, over 512-position sequences, pieces numbered site after site in `sites.txt`; every
+        // residual piece is on.
+        let listed = std::fs::read_to_string(sets_dir.join("sites.txt")).map_err(|e| format!("{}: {e}", sets_dir.display()))?;
+        let mut offsets = vec![0usize];
+        let mut site_of_listing = Vec::new();
+        for line in listed.lines().filter(|l| !l.is_empty()) {
+            let (name, pieces) = line.split_once(' ').ok_or("sites.txt: name pieces")?;
+            let k = masked.sites.iter().position(|s| s.name == name).ok_or_else(|| format!("sites.txt: {name} is not a site"))?;
+            let pieces: usize = pieces.parse().map_err(|e| format!("sites.txt: {e}"))?;
+            if pieces != given[k] {
+                return Err(format!("{name}: {pieces} listed, {} in the library", given[k]));
+            }
+            site_of_listing.push(k);
+            offsets.push(offsets[offsets.len() - 1] + pieces);
+        }
+        let indptr = read_i64(&sets_dir.join("indptr.i64"))?;
+        let indices = read_i64(&sets_dir.join("indices.i64"))?;
+        const SEQUENCE: usize = 512;
+        let mut masks: Vec<Array2<f64>> = (0..masked.sites.len())
+            .map(|k| Array2::from_shape_fn((family.rows, masked.blocks(k)), |(_, c)| if c >= given[k] { 1.0 } else { 0.0 }))
+            .collect();
+        for s in 0..sequences {
+            for p in 0..context {
+                let at = s * SEQUENCE + p;
+                let row = s * context + p;
+                for &i in &indices[indptr[at] as usize..indptr[at + 1] as usize] {
+                    let i = i as usize;
+                    let listing = offsets.partition_point(|o| *o <= i) - 1;
+                    masks[site_of_listing[listing]][[row, i - offsets[listing]]] = 1.0;
+                }
             }
         }
+        named.push(("given".to_string(), masks));
     }
     let (target, radius) = reference(model, family)?;
     // The given library's pieces on per word (the residual pieces are always on).
     let listed_l0 = |masks: &[Array2<f64>]| -> f64 {
         masks.iter().zip(&given).map(|(m, g)| m.slice(ndarray::s![.., ..*g]).iter().filter(|x| **x > 0.0).count()).sum::<usize>() as f64 / family.rows as f64
     };
-    let mut sets = vec![("given", masks.clone())];
+    let start = named[0].1.clone();
+    let mut sets = named;
     if observations > 0.0 {
         // The masked selection under the box claim from the given sets, every word coded in `OBSERVATIONS`.
         let statistics = site_statistics(model, &chosen, [family.clone()], 2, 0x5EED)?;
@@ -281,14 +308,14 @@ fn lm(args: &[String]) -> Result<(), String> {
             })
             .collect::<Result<_, _>>()?;
         let coder = Coder::ran(costs, family.rows);
-        let boxed = select_boxed(&masked, family, &target, masks.clone(), &coder, observations, 2, &fishers)?.0;
+        let boxed = select_boxed(&masked, family, &target, start, &coder, observations, 2, &fishers)?.0;
         eprintln!("box selection done ({:.1}s)", started.elapsed().as_secs_f64());
-        sets.push(("box", boxed));
+        sets.push(("box".to_string(), boxed));
     }
     let mut report = Vec::new();
     for (name, masks) in sets {
         let mut gates = Gates::claim(&masks);
-        // A residual piece is never off; outside `FREE` every gate stays where the set puts it.
+        // The off pieces outside `FREE` stay off.
         for (k, site) in masked.sites.iter().enumerate() {
             let pinned = free != "all" && !free.split(',').any(|p| site.name.starts_with(p));
             if pinned {
