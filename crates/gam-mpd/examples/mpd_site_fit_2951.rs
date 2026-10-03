@@ -8,8 +8,9 @@
 //! gets its reads, sensitivities and written Fisher from `DRAWS` sampled-label reverse passes per
 //! sequence (default 4, `gam_mpd::site_fit::samples`), and a library of `d_in + d_out`
 //! subcomponents fitted to its code at `n = OBSERVATIONS` for at most `ROUNDS` rounds (default 50,
-//! `gam_mpd::site_fit::fit`), each subcomponent described by `gam_mpd::blocks::Generic` in those
-//! statistics. Every site starts from a library that is its map, read off the model alone: a site
+//! `gam_mpd::site_fit::fit`), each subcomponent described by `gam_mpd::describe::Structured` in
+//! those statistics (the charts its site's interfaces declare, `gam_mpd::describe::declared_charts`).
+//! Every site starts from a library that is its map, read off the model alone: a site
 //! that reads a layer of units (a pointwise map's output, an MLP's hidden layer) from those units
 //! (`gam_mpd::pieces::unit_pieces`), any other from its Fisher-whitened singular pieces
 //! (`gam_mpd::pieces::fisher_svd`); the rest of its subcomponents start writing nothing and grow by
@@ -84,7 +85,19 @@ fn main() -> Result<(), String> {
         .zip(&gathered)
         .map(|(w, g)| gam_mpd::pieces::Site { w: w.clone(), second_moment: g.second_moment.clone(), mean: Array1::zeros(w.ncols()), fisher: g.fisher.clone() })
         .collect();
-    let description = gam_mpd::blocks::Generic::new(&statistics, observations);
+    // Each subcomponent priced by its exact lattice description in the charts its site's interfaces
+    // declare (heads, rotary planes), re-sent from its last one while a round moves it within a
+    // lattice step (gam_mpd::describe::Structured).
+    let description = gam_mpd::describe::Structured::new(
+        chosen
+            .iter()
+            .zip(&statistics)
+            .map(|(site, measured)| {
+                let (writers, readers) = gam_mpd::describe::declared_charts(model, site)?;
+                gam_mpd::describe::Geometry::new(gam_mpd::describe::Metric::of(measured, observations), writers, readers)
+            })
+            .collect::<Result<_, String>>()?,
+    );
     drop(statistics);
     // `library:DIR`: every site's selected sets, written as one CSR at the end.
     let mut selected: Vec<(String, usize, Vec<Vec<u32>>)> = Vec::new();

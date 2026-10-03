@@ -1502,3 +1502,47 @@ impl super::blocks::Describe for Exact<'_> {
         Ok(Some((d.u, d.v, d.kl_bits)))
     }
 }
+
+/// The charts a site's interfaces declare ([`Chart::coordinates`]): on each side whose nodes are
+/// several (attention heads), one group per node; on a written node an attention reads as a query or
+/// key under a rotary, one group per rotary plane. A block living on a few heads or planes names
+/// them instead of sending every coordinate. `(writers, readers)`.
+pub fn declared_charts(program: &super::operator_program::OperatorProgram, site: &super::masked::Site) -> Result<(Vec<Chart>, Vec<Chart>), String> {
+    use super::operator_program::Node;
+    let interfaces = program.interfaces().map_err(|e| e.to_string())?;
+    let nodes = |list: &[usize]| {
+        let mut at = 0;
+        list.iter()
+            .map(|n| {
+                let width = interfaces[*n].width();
+                let group: Vec<usize> = (at..at + width).collect();
+                at += width;
+                group
+            })
+            .collect::<Vec<_>>()
+    };
+    let (written, read) = (nodes(&site.writes), nodes(&site.reads));
+    let (d_out, d_in) = (written.iter().map(Vec::len).sum(), read.iter().map(Vec::len).sum());
+    let mut writers = Vec::new();
+    if written.len() > 1 {
+        writers.push(Chart::coordinates("written nodes", d_out, &written)?);
+    }
+    let mut planes = Vec::new();
+    for (n, group) in site.writes.iter().zip(&written) {
+        let rotary = program.nodes.iter().find_map(|node| match node {
+            Node::Attend { query, key, rotary: Some(r), .. } if query == n || key == n => Some(r.pairs()),
+            _ => None,
+        });
+        if let Some(pairs) = rotary {
+            planes.extend(pairs.into_iter().filter(|(a, b)| *a < group.len() && *b < group.len()).map(|(a, b)| vec![group[a], group[b]]));
+        }
+    }
+    if !planes.is_empty() {
+        writers.push(Chart::coordinates("rotary planes", d_out, &planes)?);
+    }
+    let mut readers = Vec::new();
+    if read.len() > 1 {
+        readers.push(Chart::coordinates("read nodes", d_in, &read)?);
+    }
+    Ok((writers, readers))
+}

@@ -6,8 +6,9 @@
 //! `mpd_site_fit_2951` writes them; a site without files stays native). Every sequence of the
 //! export's first `TRAIN` (of `CONTEXT` positions, default 512) is coded in turn, `PASSES` times
 //! (default 1): its sets are each site's own code's selection on the sequence's clean reads
-//! (`gam_mpd::site_fit::measure`, the description `gam_mpd::blocks::Generic` in the model's
-//! statistics on the training sequences), and the library takes one exact-gradient step of the
+//! (`gam_mpd::site_fit::measure`, each subcomponent priced by its exact lattice description
+//! `gam_mpd::describe::Structured` in the model's statistics on the training sequences, re-sent
+//! from its last one while a step keeps it within a lattice step), and the library takes one exact-gradient step of the
 //! masked forward's KL under the box claim on those sets (`gam_mpd::masked::step_pieces`, every
 //! piece on still the map). The sets are the switching function; the step makes the library agree
 //! with it where the whole model, not one site, measures the error. After every sequence the
@@ -72,7 +73,18 @@ fn main() -> Result<(), String> {
         .zip(&measured)
         .map(|(w, m)| gam_mpd::pieces::Site { w: w.clone(), second_moment: m.second_moment.clone(), mean: Array1::zeros(w.ncols()), fisher: m.fisher.clone() })
         .collect();
-    let description = gam_mpd::blocks::Generic::new(&statistics, observations);
+    // Each subcomponent priced by its exact lattice description, re-sent from its last one while
+    // the library's steps keep its reals within a lattice step (gam_mpd::describe::Structured).
+    let description = gam_mpd::describe::Structured::new(
+        chosen
+            .iter()
+            .zip(&statistics)
+            .map(|(site, measured)| {
+                let (writers, readers) = gam_mpd::describe::declared_charts(model, site)?;
+                gam_mpd::describe::Geometry::new(gam_mpd::describe::Metric::of(measured, observations), writers, readers)
+            })
+            .collect::<Result<_, String>>()?,
+    );
     drop((statistics, measured));
     eprintln!("statistics of {} sites on {train} sequences, {:.0}s", chosen.len(), started.elapsed().as_secs_f64());
     let mut masked = Masked::build(model, chosen.clone(), libraries)?;
@@ -87,9 +99,12 @@ fn main() -> Result<(), String> {
             let local = samples(model, &chosen, std::iter::once(inputs.clone()), 2, 0x5E7 + (pass * train + s) as u64)?;
             let mut masks = Vec::new();
             let mut l0 = 0.0;
+            let mut measuring = 0.0;
             for (k, sample) in local.iter().enumerate() {
                 let library = masked.library(k)?;
+                let clock = std::time::Instant::now();
                 let (_, sets) = measure(k, &maps[k], sample, &description, observations, &library)?;
+                measuring += clock.elapsed().as_secs_f64();
                 let mut mask = Array2::<f64>::zeros((inputs.rows, library.v.nrows()));
                 for (r, on) in sets.iter().enumerate() {
                     for &c in on {
@@ -102,7 +117,7 @@ fn main() -> Result<(), String> {
             let step = step_pieces(&mut masked, &inputs, &target, &masks, 2, 0xF00D + (pass * train + s) as u64, &mut running, Claim::Box)?;
             let rows = inputs.rows as f64;
             eprintln!(
-                "pass {pass} sequence {s}: L0 {l0:.1}, box KL {:?} per token, {:.0}s",
+                "pass {pass} sequence {s}: L0 {l0:.1}, box KL {:?} per token, {:.0}s ({measuring:.0}s pricing and selecting)",
                 step.map(|(b, a)| (b / rows, a / rows)),
                 started.elapsed().as_secs_f64()
             );
