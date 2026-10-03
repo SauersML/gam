@@ -54,28 +54,25 @@
 //!
 //! An explanation declares what its off subcomponents may be, and its error is the KL over what it
 //! declares. Under [`Claim::Corner`] they are absent: an input's error is the KL of its masks. Under
-//! [`Claim::Box`] each off gate may be anywhere in `[0, 1]`, and an input's error is the KL expected
-//! over every off gate drawn uniform and independent, to second order about the masks in each
-//! site's written value: with `Z_c` an off block's output (`U_c z_c`) and `S = Σ_off Z_c`, the
-//! gates' moments `E m = ½`, `E m² = ⅓` give
+//! [`Claim::Box`] each off gate may be anywhere in `[0, 1]`, and the error is the worst KL over the
+//! box. Four facts fix how that is measured.
 //!
-//! ```text
-//! E KL = KL(masks) + Σ_sites ½ gᵀS + ½ (¼ SᵀF S + 1/12 Σ_off Z_cᵀ F Z_c),
-//! ```
-//!
-//! `g` the KL's gradient at the written value and `F` its Fisher ([`box_excess`]). The claim is
-//! about every point of the box. Its charged cost is our claim's own, local and second order:
-//! [`box_upper`], at every site from its reads in the masked forward, `½ (Σ_off ‖Z_c‖_F)²` in the
-//! site's written Fisher, the most any setting of the off gates adds there, which no refinement of
-//! the library lowers. VPD's global claim is measured, never charged, by an attack:
-//! [`box_excess_at`] finds, per sequence, the largest exact KL among the points it evaluates, the masks themselves, every
-//! layer's vertex (one layer masked, the rest's off gates at 1, which a set whose layers cancel
-//! each other's errors fails), and an adversary's sign ascent in the off gates (charged per word).
-//! That is a lower bound on the worst case. The expectation above is no point of the box, and a
-//! refinement of the library lowers it with the box unchanged (one off piece split into `q` copies
-//! cuts its own term by `1/q`), so it screens proposals and steers steps but is never charged. A
-//! fit under the box claim learns subcomponents that explain the input whatever the off ones are
-//! set to, not only at exactly one mask.
+//! * **An attack bounds from below.** Any point an attack evaluates ([`box_excess_at`]: the masks,
+//!   every layer's vertex, an adversary's ascent) has a loss at most the box's worst, so what it
+//!   finds is a lower bound: it can refute a claim, never certify one, and it is never charged.
+//! * **The expectation is no claim.** The KL expected over uniform independent off gates
+//!   ([`box_excess`]) is refinement-gameable: one off subcomponent split into `q` copies of `1/q`
+//!   leaves the box unchanged and cuts its own term by `1/q`. It only screens proposals.
+//! * **Shared and per-input worst cases differ.** VPD's adversary picks one gate setting `a` for all
+//!   `M` inputs, ours lets each input have its own: `sup_a E_X ℓ(a, X) ≤ E_X sup_a ℓ(a, X) ≤ M sup_a
+//!   E_X ℓ(a, X)` (`ℓ ≥ 0`), the gap up to the factor `M` when every input's worst point differs.
+//!   The two claims are compared only under the same one.
+//! * **Our charge is an upper bound.** At every site the box moves the written value by `Σ_off
+//!   (1 − m_c) Z_c` from the masks' point, `Z_c` an off block's real contribution on the masked
+//!   forward's own reads, so in the input's Fisher every point is within `Σ_off ‖Z_c‖_F` of it and
+//!   its added KL is at most `½ (Σ_off ‖Z_c‖_F)²` to second order ([`box_upper`]; the site code of
+//!   `super::site_fit` charges the same bound on the model's own reads). Splitting a subcomponent
+//!   cannot lower it, and two off subcomponents that cancel are each charged their own size.
 //!
 //! # Behaviours
 //!
