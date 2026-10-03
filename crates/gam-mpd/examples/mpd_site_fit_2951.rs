@@ -18,6 +18,11 @@
 //! `OUT_DIR/{site}.u.f64` (pieces × d_out), raw float64, the `library:DIR` start of
 //! `mpd_pieces_masked_2951`, and its rounds to `OUT_DIR/{site}.rounds.json`.
 //!
+//! Every library (fitted or given) is then gated in blocks by the same code
+//! (`gam_mpd::site_fit::blocks`: merges of co-firing subcomponents, and splits back, each kept when
+//! the site's code falls), written as `OUT_DIR/{site}.blocked.{v,u}.f64` with its ranks and its code
+//! against the rank-one library's in `OUT_DIR/{site}.blocked.json`.
+//!
 //! With `library:DIR` nothing is fitted: each site's given library (`DIR/{site}.{v,u}.f64`, as
 //! above) is measured under the same code (`gam_mpd::site_fit::measure`, its sets selected from all
 //! on), the measurement goes to `OUT_DIR/{site}.measure.json`, and every input's selected sets to
@@ -29,7 +34,7 @@ use gam_mpd::import::import_language_model;
 use gam_mpd::masked::{matrix, sites};
 use gam_mpd::masked::Library;
 use gam_mpd::operator_program::Node;
-use gam_mpd::site_fit::{Settings, fit, measure, samples};
+use gam_mpd::site_fit::{Settings, blocks, fit, measure, samples};
 use ndarray::{Array1, Array2};
 use serde_json::json;
 use std::path::PathBuf;
@@ -47,6 +52,33 @@ fn spread(w: &Array2<f64>, library: &Library) -> f64 {
     let norm = |r: ndarray::ArrayView1<f64>| r.dot(&r).sqrt();
     let total: f64 = library.u.outer_iter().zip(library.v.outer_iter()).map(|(u, v)| norm(u) * norm(v)).sum();
     total / w.iter().map(|x| x * x).sum::<f64>().sqrt()
+}
+
+/// The library gated in blocks by the site's code (`gam_mpd::site_fit::blocks`), written beside it
+/// as `{site}.blocked.{v,u}.f64` and `{site}.blocked.json` (the ranks, in column order, and the
+/// code against the rank-one library's).
+fn write_blocks(
+    out: &std::path::Path,
+    name: &str,
+    blocked: &gam_mpd::site_fit::Blocked,
+    round: &gam_mpd::site_fit::Round,
+    rank_one: &gam_mpd::site_fit::Round,
+) -> Result<(), String> {
+    write_f64(&out.join(format!("{name}.blocked.v.f64")), &blocked.library.v)?;
+    write_f64(&out.join(format!("{name}.blocked.u.f64")), &blocked.library.u)?;
+    let wide = blocked.ranks.iter().filter(|r| **r > 1).count();
+    eprintln!(
+        "{name} blocks: code {:.1} bits per input (description {:.1}, error {:.1}), {} blocks ({wide} of rank ≥ 2), {:.2} on per input; rank one {:.1}",
+        round.code,
+        round.description,
+        round.error,
+        blocked.ranks.len(),
+        round.l0,
+        rank_one.code
+    );
+    let record = json!({"site": name, "ranks": blocked.ranks, "code": round.code, "description": round.description, "error": round.error, "l0": round.l0,
+        "rank_one_code": rank_one.code, "rank_one_description": rank_one.description, "rank_one_error": rank_one.error, "rank_one_l0": rank_one.l0});
+    std::fs::write(out.join(format!("{name}.blocked.json")), record.to_string()).map_err(|e| e.to_string())
 }
 
 fn main() -> Result<(), String> {
@@ -112,6 +144,8 @@ fn main() -> Result<(), String> {
             };
             let library = Library { v: read("v", d_in)?, u: read("u", d_out)?, mean: Array1::zeros(d_in) };
             let (round, chosen_sets) = measure(k, w, sample, &description, observations, &library)?;
+            let (blocked, blocked_round) = blocks(k, w, sample, &description, observations, &library)?;
+            write_blocks(&out, &site.name, &blocked, &blocked_round, &round)?;
             selected.push((site.name.clone(), library.v.nrows(), chosen_sets));
             eprintln!("{} given library of {}: code {:.1} bits per input (description {:.1}, error {:.1}), L0 {:.2}, Σ|u||v|/|W| {:.1}",
                 site.name, library.v.nrows(), round.code, round.description, round.error, round.l0, spread(w, &library));
@@ -157,6 +191,9 @@ fn main() -> Result<(), String> {
         })?;
         write_f64(&v_path, &library.v)?;
         write_f64(&u_path, &library.u)?;
+        let (rank_one, _) = measure(k, w, sample, &description, observations, &library)?;
+        let (blocked, blocked_round) = blocks(k, w, sample, &description, observations, &library)?;
+        write_blocks(&out, &site.name, &blocked, &blocked_round, &rank_one)?;
         // What all on leaves of the map, in the reads' second moment M: ‖(W − Σ u vᵀ) M^½‖ / ‖W M^½‖.
         let weighted = |e: &Array2<f64>| (&e.dot(&sample.second_moment) * e).sum().sqrt();
         let left = weighted(&(w - &library.u.t().dot(&library.v))) / weighted(w);

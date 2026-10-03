@@ -60,6 +60,14 @@
 //!   them, evenly strided; the halves sum to it);
 //!   kept when the sets selected with them code the inputs in fewer bits.
 //!
+//! # Blocks
+//!
+//! A fitted library can be gated in blocks ([`blocks`]): column runs that one gate runs or drops
+//! whole, block `c`'s real contribution on input `t` `U_c a_tc` of size `‖U_c a_tc‖_{F_t}` in the
+//! bound above and its description `bits(c)` of the whole block. Merging two blocks that run
+//! together pays one description where both run, and where both are off counts `‖z_a + z_b‖`, at
+//! most `‖z_a‖ + ‖z_b‖`; it costs the whole block where only one is needed. The same code decides.
+//!
 //! The fit stops when a round saves less than one bit per input, or at `rounds`. Every product over
 //! inputs runs in single precision (the fit only proposes a library; the masked program's exact
 //! forward codes it), and pseudo-inverses drop eigenvalues within the single-precision band of their
@@ -306,6 +314,62 @@ impl Chunk {
     }
 }
 
+/// One input's sets (module note, "Sets") over subcomponents of real sizes `size` and description
+/// `bits`, with `left` what all on leaves: with `flip` the best prefix of the ranking by size per bit
+/// when it codes the input in fewer bits than its current sets `m`, then single flips swept until
+/// none lowers its code. Returns its description and error bits.
+fn select(size: &[f64], bits: &[f64], left: f64, weight: f64, m: &mut [u8], flip: bool) -> (f64, f64) {
+    let c_total = size.len();
+    if flip {
+        let mut order: Vec<usize> = (0..c_total).collect();
+        let ratio = |c: usize| match (bits[c] > 0.0, size[c] > 0.0) {
+            (true, _) => size[c] / bits[c],
+            (false, true) => f64::INFINITY,
+            (false, false) => 0.0,
+        };
+        order.sort_by(|a, b| ratio(*b).total_cmp(&ratio(*a)));
+        let all: f64 = size.iter().sum();
+        let (mut listed, mut bound) = (0.0, left + all);
+        let (mut best, mut best_code) = (0, weight * bound * bound);
+        for (k, &c) in order.iter().enumerate() {
+            listed += bits[c];
+            bound -= size[c];
+            let code = listed + weight * bound * bound;
+            if code < best_code {
+                (best, best_code) = (k + 1, code);
+            }
+        }
+        // The prefix replaces the input's current sets only when it codes it in fewer bits.
+        let held = left + (0..c_total).filter(|c| m[*c] == 0).map(|c| size[c]).sum::<f64>();
+        let held_code = (0..c_total).filter(|c| m[*c] == 1).map(|c| bits[c]).sum::<f64>() + weight * held * held;
+        if best_code < held_code {
+            m.fill(0);
+            for &c in &order[..best] {
+                m[c] = 1;
+            }
+        }
+        let mut bound = left + (0..c_total).filter(|c| m[*c] == 0).map(|c| size[c]).sum::<f64>();
+        for _ in 0..c_total {
+            let mut flipped = false;
+            for c in 0..c_total {
+                let next = if m[c] == 1 { bound + size[c] } else { (bound - size[c]).max(0.0) };
+                let delta = if m[c] == 1 { -bits[c] } else { bits[c] } + weight * (next * next - bound * bound);
+                if delta < 0.0 {
+                    m[c] = 1 - m[c];
+                    bound = next;
+                    flipped = true;
+                }
+            }
+            if !flipped {
+                break;
+            }
+        }
+    }
+    let bound = left + (0..c_total).filter(|c| m[*c] == 0).map(|c| size[c]).sum::<f64>();
+    let listed: f64 = (0..c_total).filter(|c| m[*c] == 1).map(|c| bits[c]).sum();
+    (listed, weight * bound * bound)
+}
+
 impl<'a> Fitting<'a> {
     /// The state of a fit of `pieces` subcomponents on `samples`, every subcomponent on.
     fn new(site: usize, w: &Array2<f64>, samples: &'a Samples, observations: f64, pieces: usize) -> Result<Self, String> {
@@ -400,6 +464,7 @@ impl<'a> Fitting<'a> {
     fn code(&mut self, v: &Array2<f64>, u: &Array2<f64>, bits: &Array1<f64>, flip: bool) -> (f64, f64) {
         let c_total = self.pieces;
         let (v32, u32, k32, uf32, sizes) = self.operands(v, u);
+        let bits = bits.to_vec();
         let mut description = 0.0;
         let mut error = 0.0;
         for start in (0..self.rows()).step_by(CHUNK) {
@@ -407,60 +472,65 @@ impl<'a> Fitting<'a> {
             let chunk = self.chunk(start, end, &v32, &u32, &k32, &uf32, &sizes);
             let masks = &mut self.masks[start * c_total..end * c_total];
             let weight = self.scale;
-            let results: Vec<(f64, f64)> = masks
-                .par_chunks_mut(c_total)
-                .enumerate()
-                .map(|(r, m)| {
-                    let size = chunk.sizes(r);
-                    if flip {
-                        // The best prefix of the ranking by size per bit, then single flips.
-                        let mut order: Vec<usize> = (0..c_total).collect();
-                        let ratio = |c: usize| match (bits[c] > 0.0, size[c] > 0.0) {
-                            (true, _) => size[c] / bits[c],
-                            (false, true) => f64::INFINITY,
-                            (false, false) => 0.0,
-                        };
-                        order.sort_by(|a, b| ratio(*b).total_cmp(&ratio(*a)));
-                        let all: f64 = size.iter().sum();
-                        let (mut listed, mut bound) = (0.0, chunk.left[r] + all);
-                        let (mut best, mut best_code) = (0, weight * bound * bound);
-                        for (k, &c) in order.iter().enumerate() {
-                            listed += bits[c];
-                            bound -= size[c];
-                            let code = listed + weight * bound * bound;
-                            if code < best_code {
-                                (best, best_code) = (k + 1, code);
+            let results: Vec<(f64, f64)> =
+                masks.par_chunks_mut(c_total).enumerate().map(|(r, m)| select(&chunk.sizes(r), &bits, chunk.left[r], weight, m, flip)).collect();
+            for (listed, err) in results {
+                description += listed;
+                error += err;
+            }
+        }
+        (description, error)
+    }
+
+    /// The code of `(v, u)` gated in blocks of `ranks` (column runs, module note "Blocks"): block
+    /// `c`'s real contribution on input `t` is `U_c a_tc`, of size `‖U_c a_tc‖_{F_t}`, and one gate
+    /// runs or drops it whole. `masks` (inputs × blocks) are the sets, selected first with `flip`.
+    fn code_blocks(&self, v: &Array2<f64>, u: &Array2<f64>, ranks: &[usize], bits: &[f64], masks: &mut [u8], flip: bool) -> (f64, f64) {
+        let blocks = ranks.len();
+        let starts: Vec<usize> = std::iter::once(0).chain(ranks.iter().scan(0, |a, r| {
+            *a += r;
+            Some(*a)
+        })).collect();
+        let (v32, u32, k32, uf32, sizes) = self.operands(v, u);
+        let (mut description, mut error) = (0.0, 0.0);
+        for start in (0..self.rows()).step_by(CHUNK) {
+            let end = (start + CHUNK).min(self.rows());
+            let rows = end - start;
+            let chunk = self.chunk(start, end, &v32, &u32, &k32, &uf32, &sizes);
+            // Each block's size: in `F_t = mean_k g_tk g_tkᵀ` the mean of `(Σ_{j ∈ c} a_tj g_tk·u_j)²`,
+            // else `s_t aᵀ K_c a`.
+            let mut size2 = Array2::<f64>::zeros((rows, blocks));
+            if self.gradients.is_empty() {
+                for r in 0..rows {
+                    for c in 0..blocks {
+                        let mut total = 0.0;
+                        for i in starts[c]..starts[c + 1] {
+                            for j in starts[c]..starts[c + 1] {
+                                total += f64::from(chunk.a[[r, i]]) * f64::from(k32[[i, j]]) * f64::from(chunk.a[[r, j]]);
                             }
                         }
-                        // The prefix replaces the input's current sets only when it codes it in fewer bits.
-                        let held = chunk.left[r] + (0..c_total).filter(|c| m[*c] == 0).map(|c| size[c]).sum::<f64>();
-                        let held_code = (0..c_total).filter(|c| m[*c] == 1).map(|c| bits[c]).sum::<f64>() + weight * held * held;
-                        if best_code < held_code {
-                            m.fill(0);
-                            for &c in &order[..best] {
-                                m[c] = 1;
-                            }
-                        }
-                        let mut bound = chunk.left[r] + (0..c_total).filter(|c| m[*c] == 0).map(|c| size[c]).sum::<f64>();
-                        for _ in 0..c_total {
-                            let mut flipped = false;
-                            for c in 0..c_total {
-                                let next = if m[c] == 1 { bound + size[c] } else { (bound - size[c]).max(0.0) };
-                                let delta = if m[c] == 1 { -bits[c] } else { bits[c] } + weight * (next * next - bound * bound);
-                                if delta < 0.0 {
-                                    m[c] = 1 - m[c];
-                                    bound = next;
-                                    flipped = true;
-                                }
-                            }
-                            if !flipped {
-                                break;
-                            }
+                        size2[[r, c]] = self.s[start + r] * total.max(0.0);
+                    }
+                }
+            } else {
+                let draws = self.gradients.len() as f64;
+                for g in self.gradients {
+                    let p = product(g.slice(s![start..end, ..]), false, u32.view(), true);
+                    for r in 0..rows {
+                        for c in 0..blocks {
+                            let along: f64 = (starts[c]..starts[c + 1]).map(|j| f64::from(chunk.a[[r, j]]) * f64::from(p[[r, j]])).sum();
+                            size2[[r, c]] += along * along / draws;
                         }
                     }
-                    let bound = chunk.left[r] + (0..c_total).filter(|c| m[*c] == 0).map(|c| size[c]).sum::<f64>();
-                    let listed: f64 = (0..c_total).filter(|c| m[*c] == 1).map(|c| bits[c]).sum();
-                    (listed, weight * bound * bound)
+                }
+            }
+            let weight = self.scale;
+            let results: Vec<(f64, f64)> = masks[start * blocks..end * blocks]
+                .par_chunks_mut(blocks)
+                .enumerate()
+                .map(|(r, m)| {
+                    let size: Vec<f64> = size2.row(r).iter().map(|x| x.sqrt()).collect();
+                    select(&size, bits, chunk.left[r], weight, m, flip)
                 })
                 .collect();
             for (listed, err) in results {
@@ -832,4 +902,197 @@ pub fn fit(
     }
     progress(&report, &Library { v: v.clone(), u: u.clone(), mean: Array1::zeros(d_in) });
     Ok(Library { v, u, mean: Array1::zeros(d_in) })
+}
+
+/// A library gated in blocks ([`blocks`]): its columns, their partition into blocks (column runs),
+/// and per input the blocks on.
+#[derive(Clone, Debug)]
+pub struct Blocked {
+    pub library: Library,
+    pub ranks: Vec<usize>,
+    pub sets: Vec<Vec<u32>>,
+}
+
+/// The blocks of `library` (module note, "Blocks") chosen by the site's code: from every
+/// subcomponent its own block, each block proposes its most co-firing partner (largest Jaccard
+/// overlap of the inputs it runs on), a round's disjoint merges best first by the description they
+/// save where both run (`bits(a) + bits(b) − bits(a ∪ b)` per input running both), and a merge set
+/// stands when the code with every input's sets selected again falls, halved until it does or a
+/// single refused merge is set aside; then every block of rank ≥ 2 is tried split back into its
+/// columns, kept when the code falls. Merged columns are concatenated, so the map is unchanged.
+pub fn blocks(site: usize, w: &Array2<f64>, samples: &Samples, describe: &dyn Describe, observations: f64, library: &Library) -> Result<(Blocked, Round), String> {
+    if library.mean.iter().any(|m| *m != 0.0) {
+        return Err("a blocked library reads the uncentred input".to_string());
+    }
+    let columns = library.v.nrows();
+    let fitting = Fitting::new(site, w, samples, observations, columns)?;
+    let rows = fitting.rows();
+    let block_bits = |library: &Library, ranks: &[usize]| -> Result<Vec<f64>, String> {
+        let starts: Vec<usize> = std::iter::once(0).chain(ranks.iter().scan(0, |a, r| {
+            *a += r;
+            Some(*a)
+        })).collect();
+        (0..ranks.len())
+            .into_par_iter()
+            .map(|c| describe.bits(site, library.u.slice(s![starts[c]..starts[c + 1], ..]), library.v.slice(s![starts[c]..starts[c + 1], ..])))
+            .collect()
+    };
+    // The state: library, ranks, per block its columns' ids (to undo merges) and bits, masks.
+    let mut current = library.clone();
+    let mut ranks = vec![1usize; columns];
+    let mut bits = block_bits(&current, &ranks)?;
+    let mut masks = vec![1u8; rows * columns];
+    let (d, e) = fitting.code_blocks(&current.v, &current.u, &ranks, &bits, &mut masks, true);
+    let mut total = d + e;
+    // A refused merge, by its blocks' first reads (bit patterns), so it is not proposed again.
+    let mut refused: std::collections::BTreeSet<(Vec<u64>, Vec<u64>)> = std::collections::BTreeSet::new();
+    let id = |library: &Library, start: usize| -> Vec<u64> { library.v.row(start).iter().map(|x| x.to_bits()).collect() };
+    let starts_of = |ranks: &[usize]| -> Vec<usize> {
+        std::iter::once(0)
+            .chain(ranks.iter().scan(0, |a, r| {
+                *a += r;
+                Some(*a)
+            }))
+            .collect()
+    };
+    // `library` with blocks `a < b` merged (b's columns moved after a's) and the merged masks.
+    let merge = |library: &Library, ranks: &[usize], masks: &[u8], pairs: &[(usize, usize)]| -> (Library, Vec<usize>, Vec<u8>) {
+        let blocks = ranks.len();
+        let starts = starts_of(ranks);
+        let partner: std::collections::BTreeMap<usize, usize> = pairs.iter().copied().collect();
+        let absorbed: std::collections::BTreeSet<usize> = pairs.iter().map(|p| p.1).collect();
+        let (mut order, mut new_ranks, mut sources) = (Vec::new(), Vec::new(), Vec::new());
+        for c in (0..blocks).filter(|c| !absorbed.contains(c)) {
+            order.extend(starts[c]..starts[c + 1]);
+            let mut rank = ranks[c];
+            let mut source = vec![c];
+            if let Some(&b) = partner.get(&c) {
+                order.extend(starts[b]..starts[b + 1]);
+                rank += ranks[b];
+                source.push(b);
+            }
+            new_ranks.push(rank);
+            sources.push(source);
+        }
+        let merged = Library { v: library.v.select(Axis(0), &order), u: library.u.select(Axis(0), &order), mean: library.mean.clone() };
+        let width = new_ranks.len();
+        let mut new_masks = vec![0u8; rows * width];
+        for t in 0..rows {
+            for (j, source) in sources.iter().enumerate() {
+                new_masks[t * width + j] = source.iter().map(|c| masks[t * blocks + c]).max().unwrap_or(0);
+            }
+        }
+        (merged, new_ranks, new_masks)
+    };
+    loop {
+        let blocks = ranks.len();
+        // Co-firing counts within the current sets.
+        let mut fired = vec![0.0f64; blocks];
+        let mut shared: std::collections::BTreeMap<(usize, usize), f64> = std::collections::BTreeMap::new();
+        for t in 0..rows {
+            let on: Vec<usize> = (0..blocks).filter(|c| masks[t * blocks + c] == 1).collect();
+            for (i, &a) in on.iter().enumerate() {
+                fired[a] += 1.0;
+                for &b in &on[i + 1..] {
+                    *shared.entry((a, b)).or_insert(0.0) += 1.0;
+                }
+            }
+        }
+        let mut best: Vec<Option<(f64, usize)>> = vec![None; blocks];
+        for (&(a, b), &n) in &shared {
+            let jaccard = n / (fired[a] + fired[b] - n);
+            for (me, other) in [(a, b), (b, a)] {
+                if best[me].is_none_or(|(j, _)| jaccard > j) {
+                    best[me] = Some((jaccard, other));
+                }
+            }
+        }
+        let starts = starts_of(&ranks);
+        let mut candidates: Vec<(f64, usize, usize)> = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for (a, partner) in best.iter().enumerate() {
+            let Some((_, b)) = partner else { continue };
+            let (a, b) = (a.min(*b), a.max(*b));
+            if !seen.insert((a, b)) {
+                continue;
+            }
+            if refused.contains(&(id(&current, starts[a]), id(&current, starts[b]))) {
+                continue;
+            }
+            let u = ndarray::concatenate(Axis(0), &[current.u.slice(s![starts[a]..starts[a + 1], ..]), current.u.slice(s![starts[b]..starts[b + 1], ..])]).map_err(|e| e.to_string())?;
+            let v = ndarray::concatenate(Axis(0), &[current.v.slice(s![starts[a]..starts[a + 1], ..]), current.v.slice(s![starts[b]..starts[b + 1], ..])]).map_err(|e| e.to_string())?;
+            let merged_bits = describe.bits(site, u.view(), v.view())?;
+            let saving = shared[&(a, b)] * (bits[a] + bits[b] - merged_bits);
+            if saving > 0.0 {
+                candidates.push((saving, a, b));
+            }
+        }
+        candidates.sort_by(|x, y| y.0.total_cmp(&x.0));
+        let mut used = std::collections::BTreeSet::new();
+        candidates.retain(|(_, a, b)| {
+            let free = !used.contains(a) && !used.contains(b);
+            if free {
+                used.extend([*a, *b]);
+            }
+            free
+        });
+        let mut take = candidates.len();
+        let mut kept = false;
+        while take > 0 {
+            let pairs: Vec<(usize, usize)> = candidates[..take].iter().map(|(_, a, b)| (*a, *b)).collect();
+            let (trial, trial_ranks, mut trial_masks) = merge(&current, &ranks, &masks, &pairs);
+            let trial_bits = block_bits(&trial, &trial_ranks)?;
+            let (d, e) = fitting.code_blocks(&trial.v, &trial.u, &trial_ranks, &trial_bits, &mut trial_masks, true);
+            log::info!("site {site}: {take} merges, code {:.1} -> {:.1} bits per input", total / rows as f64, (d + e) / rows as f64);
+            if d + e < total {
+                (current, ranks, bits, masks, total) = (trial, trial_ranks, trial_bits, trial_masks, d + e);
+                kept = true;
+                break;
+            }
+            if take == 1 {
+                let (_, a, b) = candidates.remove(0);
+                refused.insert((id(&current, starts[a]), id(&current, starts[b])));
+                take = candidates.len();
+            } else {
+                take /= 2;
+            }
+        }
+        if !kept {
+            break;
+        }
+    }
+    // Splits: every block of rank ≥ 2 back into its columns, one at a time.
+    let mut c = 0;
+    while c < ranks.len() {
+        if ranks[c] < 2 {
+            c += 1;
+            continue;
+        }
+        let blocks = ranks.len();
+        let rank = ranks[c];
+        let mut trial_ranks = ranks[..c].to_vec();
+        trial_ranks.extend(std::iter::repeat_n(1, rank));
+        trial_ranks.extend_from_slice(&ranks[c + 1..]);
+        let width = trial_ranks.len();
+        let mut trial_masks = vec![0u8; rows * width];
+        for t in 0..rows {
+            for j in 0..width {
+                let source = if j < c { j } else if j < c + rank { c } else { j - rank + 1 };
+                trial_masks[t * width + j] = masks[t * blocks + source];
+            }
+        }
+        let trial_bits = block_bits(&current, &trial_ranks)?;
+        let (d, e) = fitting.code_blocks(&current.v, &current.u, &trial_ranks, &trial_bits, &mut trial_masks, true);
+        if d + e < total {
+            (ranks, bits, masks, total) = (trial_ranks, trial_bits, trial_masks, d + e);
+        } else {
+            c += 1;
+        }
+    }
+    let blocks = ranks.len();
+    let (description, error) = fitting.code_blocks(&current.v, &current.u, &ranks, &bits, &mut masks, false);
+    let on = masks.iter().filter(|m| **m == 1).count() as f64;
+    let report = Round { round: 0, code: (description + error) / rows as f64, description: description / rows as f64, error: error / rows as f64, l0: on / rows as f64, reseeded: 0, read_steps: 0 };
+    let sets = masks.chunks(blocks).map(|m| (0..blocks as u32).filter(|c| m[*c as usize] == 1).collect()).collect();
+    Ok((Blocked { library: current, ranks, sets }, report))
 }

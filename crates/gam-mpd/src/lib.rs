@@ -251,4 +251,7 @@ pub mod gates;
 pub mod site_fit;
 
 #[cfg(test)]
+mod site_fit_tests;
+
+#[cfg(test)]
 mod gates_tests;
