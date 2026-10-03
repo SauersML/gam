@@ -275,7 +275,6 @@ fn merged(coded: &Coded<'_>, blocked: &Blocked) -> Value {
     Value::Array(out)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn vpd(
     dir: &Path,
     library_dir: &Path,
