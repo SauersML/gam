@@ -69,6 +69,9 @@ mod operator_program_tests;
 // The declared contract of a program decomposition: load, complete and sampled families.
 pub mod contract;
 
+// Measured clean, incoming and reconstruction errors of composed matrix replacements.
+pub mod composition;
+
 // Program decomposition by two-part code: primitives propose, a change is kept when the measured total drops.
 pub mod engine;
 
