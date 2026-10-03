@@ -124,7 +124,7 @@ def stage_score(base_only=False):
     lp = np.zeros((nR, len(names)), np.float64)
     greedy = np.zeros((nR, len(names)), bool)
     order = np.argsort(lens, kind="stable")
-    TOK = 8000  # tokens per batch
+    TOK = 3000  # tokens per batch (keeps the job inside 2 GiB)
     i = 0
     nb = 0
     with torch.no_grad():
@@ -149,18 +149,18 @@ def stage_score(base_only=False):
             for k, nm in enumerate(names):
                 x = final(xmid, g2, W0 if nm == "base" else W0 + models[nm])[rr_t, pp_t]
                 tl, gr = [], []
-                for c in range(0, len(x), 1024):
-                    h = head(x[c:c + 1024])
-                    tl.append(h.gather(-1, tgt[c:c + 1024, None])[:, 0])
-                    gr.append(h.argmax(-1) == tgt[c:c + 1024])
-                tl, gr = torch.cat(tl).double(), torch.cat(gr).float()
-                s = torch.zeros(len(idx), dtype=torch.float64, device="mps").index_add_(0, seg, tl)
+                for c in range(0, len(x), 512):
+                    h = head(x[c:c + 512])
+                    tl.append(h.gather(-1, tgt[c:c + 512, None])[:, 0])
+                    gr.append(h.argmax(-1) == tgt[c:c + 512])
+                tl, gr = torch.cat(tl), torch.cat(gr).float()  # MPS has no float64; sums of <= 512 terms are fine in fp32
+                s = torch.zeros(len(idx), device="mps").index_add_(0, seg, tl)
                 g = torch.zeros(len(idx), device="mps").index_add_(0, seg, gr)
                 lp[idx, k] = s.cpu().numpy()
                 greedy[idx, k] = (g.cpu().numpy() == n_cont[idx])
             i = j
             nb += 1
-            if nb % 50 == 0:
+            if nb % 20 == 0:
                 log(f"{i}/{nR} requests")
                 torch.mps.empty_cache()
     np.savez(OUTD / ("scores_base.npz" if base_only else "scores.npz"), lp=lp, greedy=greedy, names=np.array(names))
