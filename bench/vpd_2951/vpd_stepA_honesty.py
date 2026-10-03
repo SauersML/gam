@@ -45,7 +45,7 @@ from vpd_eval import MB, gates_and_l0, kl_per_pos, pgd_recon  # noqa: E402
 from vpd_model import VPD, VPD_PTH, load_target, load_vpd, site_names, val_tokens  # noqa: E402
 
 parser = argparse.ArgumentParser()
-parser.add_argument("mode", choices=["box", "layers"])
+parser.add_argument("mode", choices=["box", "layers", "sites"])
 parser.add_argument("sets", type=Path)
 parser.add_argument("out", type=Path)
 parser.add_argument("--rows", type=int, default=32)
@@ -61,6 +61,9 @@ parser.add_argument("--word-steps", type=int, default=40, help="the per-word adv
 parser.add_argument("--word-restarts", type=int, default=6, help="the per-word adversary's starts")
 parser.add_argument("--word-delta", choices=["off", "held", "adversarial"], default=None,
                     help="the per-word adversary's residual: off (0), held (1, the model's own weights), adversarial per word (default: as --delta)")
+parser.add_argument("--site-random", type=int, default=64, help="sites: random subsets of sites tried per passage")
+parser.add_argument("--site-steps", type=int, default=30, help="sites: sign-ascent steps on the continuous switches")
+parser.add_argument("--site-restarts", type=int, default=4, help="sites: sign-ascent starts")
 parser.add_argument("--free", default="all", help="comma-separated site-name prefixes whose off gates the per-word adversary may move (VPD names, e.g. h.3.)")
 parser.add_argument("--delta", choices=["off", "both", "only"], default="off",
                     help="VPD's residual (delta) semantics in the box: off (as the sets are scored), both, or only")
@@ -515,5 +518,122 @@ def layers():
         update_out(key, out)
 
 
-box() if args.mode == "box" else layers()
+def site_switches():
+    """The site-switch claim's attack: per passage, each of the 24 sites either runs its explanation
+    (the family's masks, every off subcomponent and the residual removed) or its native map, the
+    same at every position, or anything between (switch s in [0, 1]: masks 1 - s (1 - g), residual
+    1 - s). Per passage it tries every site alone, every site but one, all of them, `--site-random`
+    random subsets, then greedy single-site flips from the best subset until none raises the
+    passage's mean KL, and `--site-restarts` sign-ascent runs of `--site-steps` steps on the
+    continuous switches (each step's rounding counted as a subset too). Reports per passage the
+    worst mean KL over subsets and over the continuous box, and per word the largest KL any visited
+    switch setting gave it: lower bounds on the claim's worst case."""
+    key = args.key or "sites"
+    out = {}
+    L = len(names)
+    for name, fam in families.items():
+        corner_worst = np.zeros(args.rows)
+        box_worst = np.zeros(args.rows)
+        word_corner = np.full(args.rows * S, -np.inf)
+        word_box = np.full(args.rows * S, -np.inf)
+        alone = np.zeros((L, args.rows * S))
+        all_replaced = np.zeros(args.rows * S)
+        for i in range(n_mb):
+            g = fam.dense(i)
+            sl = slice(i * MB * S, (i + 1) * MB * S)
+            rows = slice(i * MB, (i + 1) * MB)
+
+            def kl_at(sw: torch.Tensor, grad: bool = False) -> torch.Tensor:
+                """Per-position KL [MB, S] with switches sw [MB, L]."""
+                masks = {n: 1 - sw[:, j, None, None] * (1 - g[n]) for j, n in enumerate(names)}
+                delta = {n: (1 - sw[:, j, None]).expand(MB, S) for j, n in enumerate(names)}
+                with torch.set_grad_enabled(grad):
+                    set_masks(masks, delta)
+                    try:
+                        logits = target(ids[i * MB:(i + 1) * MB])
+                    finally:
+                        vpd.clear()
+                    return kl_per_pos(logits, targets[i])
+
+            best = torch.full((MB,), -1.0, device=DEV)
+            best_sw = torch.ones((MB, L), device=DEV)
+
+            def visit(sw: torch.Tensor, corner: bool) -> torch.Tensor:
+                kl = kl_at(sw).detach()
+                flat = kl.cpu().numpy().ravel()
+                if corner:
+                    word_corner[sl] = np.maximum(word_corner[sl], flat)
+                word_box[sl] = np.maximum(word_box[sl], flat)
+                return kl.mean(1)
+
+            def take(sw: torch.Tensor, mean: torch.Tensor):
+                better = mean > best
+                best[better] = mean[better]
+                best_sw[better] = sw[better]
+
+            ones = torch.ones((MB, L), device=DEV)
+            m = visit(ones, True)
+            take(ones, m)
+            all_replaced[sl] = kl_at(ones).detach().cpu().numpy().ravel()
+            for j in range(L):
+                e = torch.zeros((MB, L), device=DEV)
+                e[:, j] = 1
+                alone[j, sl] = kl_at(e).detach().cpu().numpy().ravel()
+                for sw in (e, 1 - e):
+                    take(sw, visit(sw, True))
+            gen = torch.Generator(device=DEV).manual_seed(0x517E + i)
+            for _ in range(args.site_random):
+                sw = (torch.rand((MB, L), generator=gen, device=DEV) < 0.5).float()
+                take(sw, visit(sw, True))
+            # Greedy single-site flips from the best subset.
+            for _ in range(L):
+                start = best.clone()
+                current = best_sw.clone()
+                for j in range(L):
+                    sw = current.clone()
+                    sw[:, j] = 1 - sw[:, j]
+                    take(sw, visit(sw, True))
+                if not bool((best > start + 1e-9).any()):
+                    break
+            corner_worst[rows] = best.cpu().numpy()
+            # Sign ascent on the continuous switches, from all replaced, the middle, then uniform draws.
+            box_best = best.clone()
+            T = args.site_steps
+            for restart in range(args.site_restarts):
+                sw = ones.clone() if restart == 0 else torch.full((MB, L), 0.5, device=DEV) if restart == 1 \
+                    else torch.rand((MB, L), generator=gen, device=DEV)
+                for step in range(T + 1):
+                    leaf = sw.detach().requires_grad_(True)
+                    kl = kl_at(leaf, grad=True)
+                    mean = kl.mean(1).detach()
+                    word_box[sl] = np.maximum(word_box[sl], kl.detach().cpu().numpy().ravel())
+                    box_best = torch.maximum(box_best, mean)
+                    rounded = (sw > 0.5).float()
+                    take(rounded, visit(rounded, True))
+                    if step == T:
+                        break
+                    (grad,) = torch.autograd.grad(kl.mean(1).sum(), leaf)
+                    rate = 0.5 - (0.5 - 0.5 / T) * step / max(T - 1, 1)
+                    sw = (sw + rate * grad.sign()).clamp(0.0, 1.0).detach()
+                    del kl, grad, leaf
+                    empty_cache()
+            corner_worst[rows] = best.cpu().numpy()
+            box_worst[rows] = torch.maximum(box_best, best).cpu().numpy()
+            del g
+            empty_cache()
+            log(f"sites {name} passages {i * MB}..{(i + 1) * MB}: all replaced {all_replaced[sl].mean():.3f}, "
+                f"worst subset {corner_worst[rows].round(3).tolist()}, worst box {box_worst[rows].round(3).tolist()}")
+        out[name] = {
+            "all_replaced": stats(all_replaced),
+            "site_alone_mean_kl": {n: float(alone[j].mean()) for j, n in enumerate(names)},
+            "passage_worst_subset": stats(corner_worst), "passage_worst_box": stats(box_worst),
+            "word_worst_subset": stats(word_corner), "word_worst_box": stats(word_box),
+            "per_passage": {"worst_subset": corner_worst.tolist(), "worst_box": box_worst.tolist()},
+        }
+        log(f"sites {name}: all replaced {all_replaced.mean():.3f}; passage worst subset mean {corner_worst.mean():.3f} "
+            f"max {corner_worst.max():.3f}; box mean {box_worst.mean():.3f}; word worst subset median {np.median(word_corner):.3f}")
+        update_out(key, out)
+
+
+box() if args.mode == "box" else layers() if args.mode == "layers" else site_switches()
 log("done")
