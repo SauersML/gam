@@ -30,7 +30,7 @@
 //! and rank-one equivalents on, and per plane block its frequency, rank, firing and description
 //! bits against its columns described as rank-one subcomponents.
 
-use gam_mpd::blocks::{Bits, Blocked, Coded, Describe, fit_blocks, measure, reselect, rounding_error};
+use gam_mpd::blocks::{Bits, Blocked, Coded, fit_blocks, measure, reselect, rounding_error};
 use gam_mpd::dense::{QrMode, qr, svd};
 use gam_mpd::describe::{Chart, Geometry, Metric, Structured, logit_gauss_newton};
 use gam_mpd::import::import;
