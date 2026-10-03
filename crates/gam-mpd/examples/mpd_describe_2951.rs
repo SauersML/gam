@@ -1,6 +1,6 @@
 //! Structured descriptions of rank-k blocks (`gam_mpd::describe`) on a trained toy (#2951).
 //!
-//! `mpd_describe_2951 modadd EXPORT_DIR OUT.json OBSERVATIONS`
+//! `mpd_describe_2951 modadd EXPORT_DIR OUT.json OBSERVATIONS [generic|structured]`
 //!
 //! `EXPORT_DIR` a `transformer` export on a finite family whose token slots carry the operands
 //! (e.g. `~/mpd-data/engine/p31_s0_generic`, the mod-31 adder on all 961 inputs). The code is the
@@ -15,7 +15,9 @@
 //!
 //! Under each, the rank-one point (Fisher-SVD subcomponents, selection passes until one no longer
 //! lowers the total) and the blocks fitted from it (`fit_blocks`). Every point reports bits per
-//! word, KL per word and the active description per word, under both descriptions and under the
+//! word, KL per word and the active description per word, and decoded (every block replaced by its
+//! description and measured by the exact forward) under the lattice-generic and structured
+//! descriptions, under both descriptions and under the
 //! generic family alone on the structured families' exact lattice code; every final
 //! structured block its family, modes and reals against its generic statement and its columns as
 //! generic rank-one subcomponents.
@@ -124,6 +126,45 @@ fn active_description(blocked: &Blocked, describe: &dyn Describe) -> Result<f64,
     Ok(bits / rows.max(1.0))
 }
 
+/// The decoded point: every block replaced by its description under `geometry` (what a decoder
+/// rebuilds), measured by the exact masked forward. `(description bits, KL nats, total bits)` per
+/// word, the total the description bits of the blocks on plus `n KL / ln 2`.
+fn decoded(coded: &Coded<'_>, blocked: &Blocked, geometry: &Structured) -> Result<(f64, f64, f64), String> {
+    let mut out = blocked.clone();
+    let mut prices = Vec::new();
+    for (k, ranks) in blocked.ranks.iter().enumerate() {
+        let (mut us, mut vs, mut widths, mut site) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for c in 0..ranks.len() {
+            let (u, v) = blocked.factors(k, c);
+            let d = geometry.sites[k].describe(u, v)?;
+            widths.push(d.u.nrows());
+            site.push(d.bits());
+            us.push(d.u);
+            vs.push(d.v);
+        }
+        let uv: Vec<_> = us.iter().map(|x| x.view()).collect();
+        let vv: Vec<_> = vs.iter().map(|x| x.view()).collect();
+        out.libraries[k] = std::sync::Arc::new(Library {
+            u: ndarray::concatenate(ndarray::Axis(0), &uv).map_err(|e| e.to_string())?,
+            v: ndarray::concatenate(ndarray::Axis(0), &vv).map_err(|e| e.to_string())?,
+            mean: blocked.libraries[k].mean.clone(),
+        });
+        out.ranks[k] = widths;
+        prices.push(site);
+    }
+    let (bits, _) = measure(coded, &out)?;
+    let mut described = 0.0;
+    for masks in &blocked.masks {
+        for (k, m) in masks.iter().enumerate() {
+            for (c, price) in prices[k].iter().enumerate() {
+                described += m.column(c).sum() * price;
+            }
+        }
+    }
+    let rows = bits.rows.max(1.0);
+    Ok((described / rows, bits.kl_nats / rows, (described + bits.kl) / rows))
+}
+
 /// The rank-one point under `coded`: selection passes until one no longer lowers the total.
 fn rank_one_point(coded: &Coded<'_>, libraries: Vec<Library>, rows: usize) -> Result<(Blocked, Bits), String> {
     let masks = vec![libraries.iter().map(|l| Array2::<f64>::ones((rows, l.v.nrows()))).collect()];
@@ -149,7 +190,7 @@ fn core_name(core: &Core) -> String {
     }
 }
 
-fn modadd(dir: &Path, out: &Path, observations: f64) -> Result<(), String> {
+fn modadd(dir: &Path, out: &Path, observations: f64, only: Option<&str>) -> Result<(), String> {
     let imported = import(dir)?;
     let program = imported.program;
     let family = imported.contract.family;
@@ -196,9 +237,39 @@ fn modadd(dir: &Path, out: &Path, observations: f64) -> Result<(), String> {
     let coded_generic = Coded { model: &program, sites: chosen.clone(), batches: batches.clone(), observations, samples: 16, describe: &generic };
     let coded_structured = Coded { model: &program, sites: chosen.clone(), batches, observations, samples: 16, describe: &structured };
 
+    // Each site's whole map as one block, on for every word: what one structured statement of the
+    // site costs against its rank-one subcomponents all on, both decoded and measured exactly.
+    let all_on = Blocked::rank_one(libraries.clone(), vec![libraries.iter().map(|l| Array2::<f64>::ones((family.rows, l.v.nrows()))).collect()]);
+    let whole = all_on.whole();
+    let mut sites_report = Vec::new();
+    for (k, site) in chosen.iter().enumerate() {
+        let (u, v) = whole.factors(k, 0);
+        let d = structured.sites[k].describe(u, v)?;
+        let plain = lattice.sites[k].describe(u, v)?;
+        eprintln!(
+            "{}: whole map rank {}: structured {} bits ({} reals, writer {} {:?}, reader {} {:?}, {}, error {:.1} bits), lattice generic {} bits ({} reals)",
+            site.name, u.nrows(), d.bits().round(), d.reals, d.writer.0, d.writer.1, d.reader.0, d.reader.1, core_name(&d.core), d.kl_bits, plain.bits().round(), plain.reals
+        );
+        sites_report.push(json!({
+            "site": site.name, "rank": u.nrows(), "writer": d.writer.0, "writer_modes": d.writer.1, "reader": d.reader.0, "reader_modes": d.reader.1,
+            "core": core_name(&d.core), "reals": d.reals, "bits": d.bits(), "error_bits": d.kl_bits,
+            "lattice_generic_bits": plain.bits(), "lattice_generic_reals": plain.reals,
+        }));
+    }
+    let mut whole_points = Vec::new();
+    for (name, decomposition) in [("whole sites", &whole), ("rank one, all on", &all_on)] {
+        for (description, geometry) in [("structured", &structured), ("lattice generic", &lattice)] {
+            let (described, kl, total) = decoded(&coded_structured, decomposition, geometry)?;
+            eprintln!("{name}, {description}, decoded: {total:.1} bits/word ({described:.1} described), KL {kl:.6} nats/word");
+            whole_points.push(json!({"point": name, "description": description, "bits_per_word": total, "described_bits_per_word": described, "kl_per_word": kl}));
+        }
+    }
     let mut points = Vec::new();
     let mut fitted = Vec::new();
     for (name, coded) in [("generic", &coded_generic), ("structured", &coded_structured)] {
+        if only.is_some_and(|o| o != name) {
+            continue;
+        }
         let started = std::time::Instant::now();
         let (rank_one, rank_one_bits) = rank_one_point(coded, libraries.clone(), family.rows)?;
         say(&format!("rank one, {name}"), &rank_one_bits);
@@ -215,6 +286,8 @@ fn modadd(dir: &Path, out: &Path, observations: f64) -> Result<(), String> {
                 "active_generic_description_bits_per_word": active_description(decomposition, &generic)?,
                 "active_structured_description_bits_per_word": active_description(decomposition, &structured)?,
                 "active_lattice_generic_description_bits_per_word": active_description(decomposition, &lattice)?,
+                "decoded_lattice_generic": decoded(coded, decomposition, &lattice)?,
+                "decoded_structured": decoded(coded, decomposition, &structured)?,
                 "active_blocks_per_word": active_blocks,
                 "active_rank_one_equivalents_per_word": active_rank,
                 "blocks": bits.blocks,
@@ -224,7 +297,7 @@ fn modadd(dir: &Path, out: &Path, observations: f64) -> Result<(), String> {
     }
     // Every block of the structured fit: its family, against its generic statement and its columns
     // as generic rank-one subcomponents.
-    let blocked = &fitted[1];
+    let Some(blocked) = fitted.last() else { return Err("no fit".to_string()) };
     let mut per_block = Vec::new();
     for (k, site) in chosen.iter().enumerate() {
         for (b, rank) in blocked.ranks[k].iter().enumerate() {
@@ -250,7 +323,7 @@ fn modadd(dir: &Path, out: &Path, observations: f64) -> Result<(), String> {
             }));
         }
     }
-    let report = json!({ "observations": observations, "points": points, "blocks": per_block });
+    let report = json!({ "observations": observations, "sites": sites_report, "whole_points": whole_points, "points": points, "blocks": per_block });
     std::fs::write(out, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
@@ -410,7 +483,9 @@ fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     let number = |i: usize, what: &str| -> Result<f64, String> { args.get(i).ok_or(format!("missing {what}"))?.parse::<f64>().map_err(|e| format!("{what}: {e}")) };
     match args.get(1).map(String::as_str) {
-        Some("modadd") if args.len() == 5 => modadd(Path::new(&args[2]), Path::new(&args[3]), number(4, "OBSERVATIONS")?),
+        Some("modadd") if args.len() == 5 || args.len() == 6 => {
+            modadd(Path::new(&args[2]), Path::new(&args[3]), number(4, "OBSERVATIONS")?, args.get(5).map(String::as_str))
+        }
         Some("vpd") if args.len() == 10 => vpd(
             Path::new(&args[2]),
             Path::new(&args[3]),

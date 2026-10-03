@@ -184,6 +184,16 @@ def cmd_train(args) -> None:
 
         return run
 
+    if args.device == "mps":
+        # MPS keeps freed buffers cached; across steps that grows the footprint past any cap.
+        step = torch.optim.AdamW.step
+
+        def step_then_release(self, *a, **k):
+            out = step(self, *a, **k)
+            torch.mps.empty_cache()
+            return out
+
+        torch.optim.AdamW.step = step_then_release
     loop.run_faithfulness_warmup = tallied("warmup", loop.run_faithfulness_warmup)
     loop.evaluate = tallied("eval", loop.evaluate)
     with counter:
