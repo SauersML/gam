@@ -222,7 +222,7 @@ class LM:
         name = "Qwen/Qwen2.5-1.5B-Instruct"
         self.torch = torch
         self.tok = AutoTokenizer.from_pretrained(name)
-        self.model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float16, device_map="mps").eval()
+        self.model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float16).to("mps").eval()
 
     def nll(self, x, mask, chunk: int = 256):
         """Bits of each token after the first, [B, L - 1], the vocabulary's logits a chunk of
