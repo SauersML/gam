@@ -7,9 +7,10 @@ finds after STEPS sign steps (`pgd_restarts[family/delta_adversarial].max`) agai
 `vpd_gt_*` and `vpd_rounded` (VPD's sets at thresholds on its importance, one curve), `vpd_ci`
 (VPD's importance box itself), `ours_corner` (the corner-searched sets), `ours_*` (the box-searched
 sweep, one curve), `base_{neurons,svd,random}_*` (those libraries through the same selection),
-`all_off`.
+`e2e_*` (from-scratch libraries), `all_off`.
 
-usage: vpd_pgd_frontier_fig.py RESULTS.json OUT.png [--steps 80] [--title TEXT]
+usage: vpd_pgd_frontier_fig.py OUT.png RESULTS.json... [--steps 80] [--title TEXT]
+(several results files are merged; a family scored in more than one keeps the last).
 """
 
 import argparse
@@ -22,14 +23,18 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 parser = argparse.ArgumentParser()
-parser.add_argument("results", type=Path)
 parser.add_argument("out", type=Path)
+parser.add_argument("results", type=Path, nargs="+")
 parser.add_argument("--steps", default="80")
 parser.add_argument("--title", default="Error under VPD's adversary against weights run per word")
 args = parser.parse_args()
 
-box = json.load(open(args.results))["box"]
-restarts = box.get("pgd_restarts", {})
+box = {"pgd_restarts": {}, "weights_per_word": {}, "l0": {}}
+for path in args.results:
+    part = json.load(open(path))["box"]
+    for k in box:
+        box[k].update(part.get(k, {}))
+restarts = box["pgd_restarts"]
 points = {}
 for tag, r in restarts.items():
     name, delta = tag.split("/")
@@ -48,6 +53,8 @@ groups = [
     ("model's own neurons", "#1baf7a", "^", sorted([n for n in points if n.startswith("base_neurons")], key=lambda n: points[n][0]), True),
     ("per-matrix SVD", "#4a3aa7", "v", sorted([n for n in points if n.startswith("base_svd")], key=lambda n: points[n][0]), True),
     ("random basis", "#eda100", "P", sorted([n for n in points if n.startswith("base_random")], key=lambda n: points[n][0]), True),
+    ("from-scratch libraries (e2e)", "#2a78d6", "o",
+     sorted([n for n in points if n.startswith("e2e_")], key=lambda n: points[n][0]), True),
     ("everything off", "#777777", "X", [n for n in points if n == "all_off"], False),
 ]
 
