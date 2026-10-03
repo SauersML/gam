@@ -14,6 +14,8 @@ rounded (g > 0), or a given set's indicator. Every mask lies in VPD's box [g, 1]
           VPD's own delta semantics (uniform per word for draws, one adversarial coordinate for PGD).
           `word` runs gam_mpd::certify::adversary's per-word, per-gate ascent (every layer free), reporting
           per word its worst KL in the box and at the corners its points round to.
+  claim   the site-switch claim's stage: `sites` exhaustive over the layer switches (key layer_switches),
+          over each layer's sites (sites_layer_L), then the 24-site attack (sites_attack).
   layers  cross-layer compensation: the KL with only layer l masked (the rest native), and the
           hybrids H_0 (native) .. H_4 (every layer masked), H_l masking layers < l, in total
           variation between consecutive hybrids and end to end.
@@ -45,7 +47,7 @@ from vpd_eval import MB, gates_and_l0, kl_per_pos, pgd_recon  # noqa: E402
 from vpd_model import VPD, VPD_PTH, load_target, load_vpd, site_names, val_tokens  # noqa: E402
 
 parser = argparse.ArgumentParser()
-parser.add_argument("mode", choices=["box", "layers", "sites", "linear"])
+parser.add_argument("mode", choices=["box", "layers", "sites", "linear", "claim"])
 parser.add_argument("sets", type=Path)
 parser.add_argument("out", type=Path)
 parser.add_argument("--rows", type=int, default=32)
@@ -768,6 +770,14 @@ elif args.mode == "layers":
     layers()
 elif args.mode == "sites":
     site_switches()
+elif args.mode == "claim":
+    # The site-switch claim's stage: the exact worst corner over the 4 layer switches, over each
+    # layer's sites with the others native, then the 24-site attack (the lower side for mixed subsets).
+    layers_present = sorted({n.split(".")[1] for n in names})
+    for exhaustive, key in [(",".join(f"h.{l}.:" for l in layers_present), "layer_switches")] + \
+            [(f"h.{l}.", f"sites_layer_{l}") for l in layers_present] + [(None, "sites_attack")]:
+        args.exhaustive, args.key = exhaustive, key
+        site_switches()
 else:
     linear_remainder()
 log("done")
