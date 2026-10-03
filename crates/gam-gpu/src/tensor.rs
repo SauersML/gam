@@ -474,7 +474,7 @@ impl Device {
             },
             #[cfg(target_os = "macos")]
             Data::Metal(buffer) => match &*self.backend {
-                Backend::Metal(engine) => engine.stream.read::<f32>(buffer)?.into_iter().take(t.len()).map(f64::from).collect(),
+                Backend::Metal(engine) => engine.stream.read_widened(buffer, t.len())?,
                 _ => return Err(foreign()),
             },
         };

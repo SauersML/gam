@@ -172,6 +172,20 @@ impl Stream {
         Ok(unsafe { std::slice::from_raw_parts(ptr.as_ptr(), buffer.len) }.to_vec())
     }
 
+    /// `buffer`'s first `len` f32 values widened to f64, once every queued command has run (in
+    /// parallel, straight from the shared storage).
+    pub(crate) fn read_widened(&self, buffer: &Buffer, len: usize) -> Result<Vec<f64>, GpuError> {
+        use rayon::prelude::*;
+        if len > buffer.len {
+            return Err(gpu_err!("Metal stream: {len} values read from a buffer of {}", buffer.len));
+        }
+        self.finish()?;
+        let ptr = buffer.raw.contents().cast::<f32>();
+        // SAFETY: as in `read`: shared storage of at least `len` f32 values, the queue drained.
+        let values = unsafe { std::slice::from_raw_parts(ptr.as_ptr(), len) };
+        Ok(values.par_iter().with_min_len(1 << 16).map(|v| f64::from(*v)).collect())
+    }
+
     /// Commit the open command buffer and wait for every committed one.
     pub(crate) fn finish(&self) -> Result<(), GpuError> {
         let mut queue = self.lock()?;
