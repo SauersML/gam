@@ -6,11 +6,12 @@
 //! `EXPORT_DIR` a `transformer` export on the whole family of a modular adder (e.g.
 //! `~/mpd-data/engine/p31_s0_generic`, all 961 inputs). Each decomposed site's map `W` is cut by
 //! the frequency of what it writes over the inputs: with `X` the site's reads and `Y = X Wᵀ` its
-//! written values over the family, and `Π_k` the projector onto the characters of frequency `k` of
-//! the operands `(a, b)` (`cos`, `sin` of `2π k a/p`, `2π k b/p`, `2π k (a + b)/p`, `2π k (a − b)/p`),
-//! the frequency-`k` block is the least-squares map `W_k = (X⁺ Π_k Y)ᵀ`; the constant characters give
-//! one more block, and the rest of `W` (other characters, and what `W` does off the reads' span)
-//! one more, so the blocks sum to `W`. Each block keeps its numerical rank.
+//! written values over the family, and `Π_f` the projector onto the character pair `cos, sin` of
+//! `2π (f · (a, b))/p` for `f` one of `(k, 0)`, `(0, k)`, `(k, k)`, `(k, −k)`, the plane `f` is the
+//! least-squares map `W_f = (X⁺ Π_f Y)ᵀ`, of rank at most two (a rotation-scaling between the reads
+//! and the writes along that character); the constant character gives one more block, and the rest
+//! of `W` (other characters, and what `W` does off the reads' span) one more, so the blocks sum to
+//! `W`. A plane with nothing beyond the site's rounding band is left out.
 //!
 //! The total is the blocks' one total (`gam_mpd::blocks`) under the box claim (every word's error
 //! its masks' KL plus what its off blocks anywhere in `[0, 1]` would add), every block described on
@@ -165,21 +166,24 @@ fn selected(coded: &Coded<'_>, mut blocked: Blocked) -> Result<(Blocked, Bits), 
 }
 
 /// A map as balanced rank-r factors `(u: r × d_out, v: r × d_in)` over its singular values beyond
-/// the decomposition's band.
-fn factors(w: &Array2<f64>) -> Result<(Array2<f64>, Array2<f64>), String> {
+/// `band` (the whole site's rounding band, so a block that is rounding of the site has none).
+fn factors(w: &Array2<f64>, band: f64) -> Result<(Array2<f64>, Array2<f64>), String> {
     let d = svd(w.view(), false).map_err(|e| format!("{e:?}"))?;
-    let kept: Vec<usize> = (0..d.singular_values.len()).filter(|&j| d.singular_values[j] > d.band).collect();
+    let kept: Vec<usize> = (0..d.singular_values.len()).filter(|&j| d.singular_values[j] > d.band.max(band)).collect();
     let roots = Array1::from_iter(kept.iter().map(|&j| d.singular_values[j].sqrt()));
     let u = (d.u.select(Axis(1), &kept) * &roots).t().to_owned();
     let v = (d.vt.select(Axis(0), &kept).t().to_owned() * &roots).t().to_owned();
     Ok((u, v))
 }
 
-/// The plane blocks of a site (module note): per frequency `1..=p/2` and the constant, and the
-/// rest; `(label, u, v)` with the empty ones left out.
+/// The plane blocks of a site (module note): per character pair `±f` of the operands (`f` one of
+/// `(k, 0)`, `(0, k)`, `(k, k)`, `(k, −k)`, `k = 1..=p/2`) a block of rank at most two, the constant,
+/// and the rest; `(label, u, v)` with the empty ones (nothing beyond the site's rounding band) left
+/// out.
 fn planes(w: &Array2<f64>, x: &Array2<f64>, labels: &Array2<usize>, period: usize) -> Result<Vec<(String, Array2<f64>, Array2<f64>)>, String> {
     let rows = x.nrows();
     let y = x.dot(&w.t());
+    let band = svd(w.view(), false).map_err(|e| format!("{e:?}"))?.band;
     // X⁺ over the reads' singular values beyond the band.
     let dx = svd(x.view(), false).map_err(|e| format!("{e:?}"))?;
     let kept: Vec<usize> = (0..dx.singular_values.len()).filter(|&j| dx.singular_values[j] > dx.band).collect();
@@ -189,32 +193,32 @@ fn planes(w: &Array2<f64>, x: &Array2<f64>, labels: &Array2<usize>, period: usiz
         let t = f.0 * labels[[r, 0]] as i64 + f.1 * labels[[r, 1]] as i64;
         2.0 * std::f64::consts::PI * (t.rem_euclid(period as i64)) as f64 / period as f64
     };
+    let mut pairs: Vec<(String, (i64, i64))> = vec![("constant".to_string(), (0, 0))];
+    for k in 1..=(period / 2) as i64 {
+        for (name, f) in [("a", (k, 0)), ("b", (0, k)), ("a+b", (k, k)), ("a−b", (k, -k))] {
+            pairs.push((format!("{k}({name})"), f));
+        }
+    }
     let mut out = Vec::new();
     let mut explained = Array2::<f64>::zeros(y.dim());
-    for k in 0..=period / 2 {
-        let k = k as i64;
-        let frequencies: Vec<(i64, i64)> = if k == 0 { vec![(0, 0)] } else { vec![(k, 0), (0, k), (k, k), (k, -k)] };
-        let mut columns: Vec<Array1<f64>> = Vec::new();
-        for f in frequencies {
-            columns.push(Array1::from_iter((0..rows).map(|r| phase(r, f).cos())));
-            if k > 0 {
-                columns.push(Array1::from_iter((0..rows).map(|r| phase(r, f).sin())));
-            }
+    for (label, f) in pairs {
+        let mut columns = vec![Array1::from_iter((0..rows).map(|r| phase(r, f).cos()))];
+        if f != (0, 0) {
+            columns.push(Array1::from_iter((0..rows).map(|r| phase(r, f).sin())));
         }
         let basis = Array2::from_shape_fn((rows, columns.len()), |(r, c)| columns[c][r]);
         let q = qr(basis.view(), QrMode::Economic).map_err(|e| format!("{e:?}"))?.q.ok_or("no Q")?;
         let projected = q.dot(&q.t().dot(&y));
         explained += &projected;
-        let wk = pinv.dot(&projected).t().to_owned();
-        let (u, v) = factors(&wk)?;
+        let (u, v) = factors(&pinv.dot(&projected).t().to_owned(), band)?;
         if u.nrows() > 0 {
-            out.push((if k == 0 { "constant".to_string() } else { format!("frequency {k}") }, u, v));
+            out.push((label, u, v));
         }
     }
     // The rest: what the characters above leave of the written values, and W off the reads' span.
     let span = pinv.dot(x);
     let rest = pinv.dot(&(&y - &explained)).t().to_owned() + &(w - &w.dot(&span));
-    let (u, v) = factors(&rest)?;
+    let (u, v) = factors(&rest, band)?;
     if u.nrows() > 0 {
         out.push(("rest".to_string(), u, v));
     }
