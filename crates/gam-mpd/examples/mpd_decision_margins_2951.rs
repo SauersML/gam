@@ -120,8 +120,8 @@ fn main() -> Result<(), String> {
     let masked = Masked::build(model, chosen, libraries)?;
     let indptr = read_raw(&sets_dir.join("indptr.i64"), 1, i64::from_le_bytes)?;
     let indices = read_raw(&sets_dir.join("indices.i64"), 1, i64::from_le_bytes)?;
-    // The sets were made at the export's full sequence length.
-    let length = imported.record["files"]["tokens"]["shape"][1].as_u64().ok_or("tokens shape")? as usize;
+    // The sets were made at the model's context (`config.n_ctx`) per sequence.
+    let length = imported.record["config"]["n_ctx"].as_u64().ok_or("config.n_ctx")? as usize;
     if (indptr.len() - 1) < sequences * length {
         return Err(format!("{}: sets of fewer than {sequences} sequences", sets_dir.display()));
     }

@@ -122,12 +122,12 @@ def stage_prep():
         g = g2[:, :-1]
         keep = torch.from_numpy(~emo[i:i + 2]).to("mps")
         if i % 16 == 0:
-            sample.append(g[keep][::64].double().cpu())
+            sample.append(g[keep][::64].cpu().double())
         for mask, acc, key in ((keep, C, "general"), (torch.from_numpy(colon[i:i + 2]).to("mps"), Cc, "colon"),
                                (torch.from_numpy(piece[i:i + 2]).to("mps"), Cp, "piece")):
             x = g[mask]
-            acc += (x.T @ x).double().cpu().numpy()
-            spec[key] += ((x @ Vm) ** 2).sum(0).double().cpu()
+            acc += (x.T @ x).cpu().double().numpy()
+            spec[key] += ((x @ Vm) ** 2).sum(0).cpu().double()
             if key == "general":
                 n += len(x)
             elif key == "colon":
@@ -140,13 +140,13 @@ def stage_prep():
             lab = (lp.detach() - torch.log(-torch.log(torch.rand_like(lp)))).argmax(-1)
             (gy,) = torch.autograd.grad(lp.gather(-1, lab[..., None]).sum(), y)
             gy = gy[:, :-1][keep]
-            H += (gy.T @ gy).double().cpu().numpy()
+            H += (gy.T @ gy).cpu().double().numpy()
             nh += len(gy)
         if i % 32 == 0:
             log(f"moments: rows {i}")
             torch.mps.empty_cache()
     kf = torch.from_numpy(K).float().to("mps")
-    spec_fire = ((kf @ Vm) ** 2).mean(0).double().cpu().numpy()
+    spec_fire = ((kf @ Vm) ** 2).mean(0).cpu().double().numpy()
     np.savez(OUT / "prep.npz", K=K, Gk=Gk, K_eval=Ke, X_general=torch.cat(sample).numpy(), C=C / n, C_colon=Cc / nc, C_piece=Cp / npc, H=H / nh, n=n, n_colon=nc,
              n_piece=npc, spec_fire=spec_fire, spec_general=(spec["general"] / n).numpy(),
              spec_colon=(spec["colon"] / nc).numpy(), spec_piece=(spec["piece"] / npc).numpy())

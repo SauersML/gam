@@ -77,6 +77,35 @@
 //! trained modular-addition transformer, over every deletion of its twelve largest non-key unembedding planes, P15 is
 //! a median 1.4·10⁷ times the exact supremum and P15′ 57 times (`bench/mpd_modadd_p15prime_2951.py` at cb215b9689).
 //!
+//! # P15″, the dual bound over a box of logit gaps
+//!
+//! A bound propagation through a network ([`super::certify`]) encloses each exact logit gap `d_i = z′_i − z′_t` of the
+//! perturbed logits against one class `t` in an interval `[l_i, h_i]`; the common shift of all logits cancels in every
+//! gap. With the reference's gaps `a_i = z_i − z_t` and `w_i = d_i − a_i` (so `w_t = 0`),
+//!
+//! ```text
+//! KL(softmax z ‖ softmax z′) = log Σ_i p_i e^{w_i} − Σ_i p_i w_i.
+//! ```
+//!
+//! For every real `c`, `log E ≤ e^{−c} E + c − 1` (the tangent of the concave `log` at `e^c`), and `Σ p_i = 1`, so
+//!
+//! ```text
+//! KL ≤ Σ_i p_i φ(w_i − c),   φ(x) = e^x − x − 1 ≥ 0,
+//! ```
+//!
+//! with equality at `c = log Σ p_i e^{w_i}`. `φ` is convex, so over the box of gaps each term is largest at an end of
+//! its interval, and
+//!
+//! ```text
+//! sup_box KL ≤ min_c Σ_i p̄_i max(φ(w̲_i − c), φ(w̄_i − c)),
+//! ```
+//!
+//! `p̄_i` any upper bound on `p_i` (each term is nonnegative). It is exact when every interval is a point, and the
+//! function of `c` is convex, so any `c` gives a bound and a search for its minimum only tightens it. A reference within
+//! per-entry radii of its computed logits enters through `a_i ∈ [a̲_i, ā_i]`: `w_i ∈ [l_i − ā_i, h_i − a̲_i]` and
+//! `p_i ≤ e^{ā_i} / Σ_j e^{a̲_j}`. Hoeffding's lemma (P15) bounds the same supremum by `osc²/8` with
+//! `osc = max_i w̄_i − min_i w̲_i` (`w_t = 0` included), and [`kl_supremum_over_gap_box`] reports the smaller.
+//!
 //! # Sharp softmax total variation
 //!
 //! For `q_i ∝ p_i e^{δ_i}` with logit-error range `w = max δ − min δ`,
@@ -112,6 +141,12 @@ pub enum KlBoundRegion {
     LogitBoxes {
         reference_radius: f64,
         perturbed_radius: f64,
+    },
+    /// Every perturbed logit vector whose gaps against one class lie in given intervals, against a reference within
+    /// per-entry radii of its computed logits. The widest gap interval and the largest reference radius are kept.
+    GapBox {
+        reference_radius: f64,
+        widest_gap: f64,
     },
 }
 
@@ -395,6 +430,150 @@ pub fn total_variation_over_logit_boxes(
     let range = ((oscillation + 2.0 * widest[0]).next_up() + 2.0 * widest[1]).next_up();
     let region = TotalVariationRegion::LogitBoxes { reference_radius: widest[0], perturbed_radius: widest[1] };
     Ok(EvidenceStatus::uniform_bound(softmax_total_variation_bound(range)?, 0.0, region)?)
+}
+
+/// `φ(x) = e^x − x − 1`, rounded up. Below `|x| = 2⁻¹⁰` it is `x²/2 · e^{max(x, 0)} ≤ 0.5005 x²` (from
+/// `φ(x) = x² Σ_k x^k/(k + 2)!`), which avoids the cancellation; elsewhere the upper end of a [`certified_exp`]
+/// enclosure less `x + 1`, each subtraction raised past its rounding. `None` when `e^x` leaves the enclosure's range.
+fn phi_up(x: f64) -> Option<f64> {
+    let up = f64::next_up;
+    if x.abs() < 2.0_f64.powi(-10) {
+        return Some(up(up(x * x) * 0.5005));
+    }
+    let growth = certified_exp(x)?.hi;
+    let less = |a: f64, b: f64| {
+        let d = a - b;
+        up(d + 2.0 * UNIT_ROUNDOFF * d.abs())
+    };
+    Some(less(less(growth, x), 1.0).max(0.0))
+}
+
+/// P15″ (module documentation): `sup KL(softmax ℓ̃ ‖ softmax z′)` over every exact reference `ℓ̃` within
+/// `reference_radius` of `reference` entrywise and every perturbed `z′` whose gaps `z′_i − z′_top` lie in
+/// `[lower_i, upper_i]` (entry `top` is taken as `[0, 0]`), as an [`EvidenceStatus::UniformBound`] over
+/// [`KlBoundRegion::GapBox`]. Any `top` is valid; the reference's argmax makes `p̄` tightest. It is the smaller of the
+/// dual bound at the `c` a golden-section search finds and `osc²/8`; an infinite or overflowing gap leaves it
+/// [`EvidenceStatus::Unresolved`] with no upper side.
+///
+/// Rounding: each reference gap is one rounded subtraction, widened by `2u` of itself and the two radii; the weights
+/// are [`certified_exp`] enclosures, the normaliser's sum is lowered by `γ_K` and each `p̄_i` is raised past its
+/// quotient. `w̲_i − c` and `w̄_i − c` are rounded outward, so the interval of `φ`'s argument contains the exact one
+/// and its larger end value bounds the term (`φ` is convex). Every product and sum of the nonnegative terms is followed by
+/// `next_up`, and the total by `γ_K`.
+pub fn kl_supremum_over_gap_box(
+    reference: ArrayView1<'_, f64>,
+    reference_radius: ArrayView1<'_, f64>,
+    top: usize,
+    lower: ArrayView1<'_, f64>,
+    upper: ArrayView1<'_, f64>,
+) -> Result<EvidenceStatus<(), KlBoundRegion>, BoundError> {
+    let classes = reference.len();
+    if classes == 0 || top >= classes {
+        return Err(BoundError::InvalidInput(format!("the gap box needs a class {top} among {classes} logits")));
+    }
+    for (side, values) in [("reference radius", reference_radius), ("lower gap", lower), ("upper gap", upper)] {
+        if values.len() != classes {
+            return Err(BoundError::InvalidInput(format!("the {side} has {} entries for {classes} logits", values.len())));
+        }
+    }
+    if let Some(index) = reference.iter().position(|v| !v.is_finite()) {
+        return Err(BoundError::InvalidInput(format!("reference logit {index} must be finite; got {}", reference[index])));
+    }
+    if let Some(index) = reference_radius.iter().position(|r| !(r.is_finite() && *r >= 0.0)) {
+        return Err(BoundError::InvalidInput(format!(
+            "the reference radius must be finite and non-negative; entry {index} is {}",
+            reference_radius[index]
+        )));
+    }
+    if let Some(index) = (0..classes).find(|&i| i != top && (lower[i].is_nan() || upper[i].is_nan() || lower[i] > upper[i])) {
+        return Err(BoundError::InvalidInput(format!("gap {index} has an empty interval [{}, {}]", lower[index], upper[index])));
+    }
+    let up = f64::next_up;
+    let down = f64::next_down;
+    let region = KlBoundRegion::GapBox {
+        reference_radius: reference_radius.iter().copied().fold(0.0_f64, f64::max),
+        widest_gap: (0..classes).filter(|&i| i != top).map(|i| upper[i] - lower[i]).fold(0.0_f64, f64::max),
+    };
+    let unresolved = |region: KlBoundRegion| -> Result<EvidenceStatus<(), KlBoundRegion>, BoundError> {
+        Ok(EvidenceStatus::unresolved(0.0, f64::INFINITY, Extremum::Supremum, None, region)?)
+    };
+    // The exact reference gaps `a_i` and the gap differences `w_i`, outward.
+    let mut a_lo = vec![0.0; classes];
+    let mut a_hi = vec![0.0; classes];
+    let mut w_lo = vec![0.0; classes];
+    let mut w_hi = vec![0.0; classes];
+    for i in (0..classes).filter(|&i| i != top) {
+        if !(lower[i].is_finite() && upper[i].is_finite()) {
+            return unresolved(region);
+        }
+        let gap = reference[i] - reference[top];
+        let spread = up(up(2.0 * UNIT_ROUNDOFF * gap.abs()) + up(reference_radius[i] + reference_radius[top]));
+        a_lo[i] = down(gap - spread);
+        a_hi[i] = up(gap + spread);
+        let (l, h) = (lower[i] - a_hi[i], upper[i] - a_lo[i]);
+        w_lo[i] = down(l - 2.0 * UNIT_ROUNDOFF * l.abs());
+        w_hi[i] = up(h + 2.0 * UNIT_ROUNDOFF * h.abs());
+    }
+    // `p̄_i = e^{ā_i} / Σ_j e^{a̲_j}`; the class `top` contributes exactly 1 below.
+    let mut normaliser = 0.0_f64;
+    for i in 0..classes {
+        normaliser += if i == top { 1.0 } else { certified_exp(a_lo[i]).map_or(0.0, |e| e.lo.max(0.0)) };
+    }
+    let normaliser = down(normaliser * (1.0 - accumulation_growth(classes + 1)));
+    let mut weight = vec![0.0; classes];
+    for i in 0..classes {
+        let Some(numerator) = (if i == top { Some(1.0) } else { certified_exp(a_hi[i]).map(|e| e.hi) }) else {
+            return unresolved(region);
+        };
+        weight[i] = up(up(numerator / normaliser) * (1.0 + 2.0 * UNIT_ROUNDOFF)).min(1.0);
+    }
+    // Hoeffding's side, from the oscillation of `w` (with `w_top = 0`).
+    let widest = w_hi.iter().copied().fold(0.0_f64, f64::max);
+    let lowest = w_lo.iter().copied().fold(0.0_f64, f64::min);
+    let oscillation = up(up(widest - lowest) * (1.0 + 2.0 * UNIT_ROUNDOFF));
+    let hoeffding = up(up(oscillation * oscillation) / 8.0);
+    // The dual side: a golden-section search of the convex `F(c)` in floating point picks `c`; only the value at that
+    // `c` is certified.
+    let approximate = |c: f64| -> f64 {
+        (0..classes)
+            .map(|i| {
+                let phi = |x: f64| x.exp_m1() - x;
+                weight[i] * phi(w_lo[i] - c).max(phi(w_hi[i] - c))
+            })
+            .sum()
+    };
+    let (mut left, mut right) = (lowest, widest);
+    let ratio = (5.0_f64.sqrt() - 1.0) / 2.0;
+    for _ in 0..80 {
+        if !(right - left > 1e-12 * (1.0 + left.abs().max(right.abs()))) {
+            break;
+        }
+        let (m1, m2) = (right - ratio * (right - left), left + ratio * (right - left));
+        if approximate(m1) <= approximate(m2) {
+            right = m2;
+        } else {
+            left = m1;
+        }
+    }
+    let c = 0.5 * (left + right);
+    let mut dual = 0.0_f64;
+    for i in 0..classes {
+        let low = w_lo[i] - c;
+        let high = w_hi[i] - c;
+        let (Some(at_low), Some(at_high)) = (
+            phi_up(down(low - 2.0 * UNIT_ROUNDOFF * low.abs())),
+            phi_up(up(high + 2.0 * UNIT_ROUNDOFF * high.abs())),
+        ) else {
+            return Ok(EvidenceStatus::uniform_bound(hoeffding, 0.0, region)?);
+        };
+        dual = up(dual + up(weight[i] * at_low.max(at_high)));
+    }
+    let dual = up(dual * (1.0 + accumulation_growth(classes + 1)));
+    let bound = dual.min(hoeffding);
+    if !bound.is_finite() {
+        return unresolved(region);
+    }
+    Ok(EvidenceStatus::uniform_bound(bound, 0.0, region)?)
 }
 
 #[cfg(test)]
@@ -715,5 +894,86 @@ mod tests {
             }
             assert!(widened >= total_variation(&corner_reference, &corner_perturbed));
         }
+    }
+
+    fn gap_box_upper(reference: &[f64], radius: &[f64], top: usize, lower: &[f64], upper: &[f64]) -> f64 {
+        kl_supremum_over_gap_box(
+            ArrayView1::from(reference),
+            ArrayView1::from(radius),
+            top,
+            ArrayView1::from(lower),
+            ArrayView1::from(upper),
+        )
+        .expect("a bound")
+        .upper_bound()
+        .expect("uniform")
+    }
+
+    /// At point gaps the dual bound is the divergence itself; over a box it holds at every sampled point and vertex.
+    #[test]
+    fn the_gap_box_bound_is_exact_at_points_and_contains_every_sampled_gap() {
+        let mut rng = StdRng::seed_from_u64(0x2951_6a9);
+        for trial in 0..40 {
+            let classes = 2 + trial % 7;
+            let reference: Vec<f64> = (0..classes).map(|_| rng.random_range(-4.0..4.0)).collect();
+            let top = (0..classes).max_by(|&i, &j| reference[i].total_cmp(&reference[j])).expect("classes");
+            let zero = vec![0.0; classes];
+            let perturbed: Vec<f64> = reference.iter().map(|z| z + rng.random_range(-1.5..1.5)).collect();
+            let gaps: Vec<f64> = (0..classes).map(|i| perturbed[i] - perturbed[top]).collect();
+            let (exact, error) = divergence_with_band(&reference, &perturbed);
+            let at_point = gap_box_upper(&reference, &zero, top, &gaps, &gaps);
+            assert!(at_point >= exact - error, "{at_point} below {exact}");
+            assert!(at_point <= exact + 1e-9 * (1.0 + exact), "trial {trial}: {at_point} is not the divergence {exact}");
+            let width: Vec<f64> = (0..classes).map(|_| rng.random_range(0.0..1.0)).collect();
+            let lower: Vec<f64> = (0..classes).map(|i| gaps[i] - width[i]).collect();
+            let upper: Vec<f64> = (0..classes).map(|i| gaps[i] + width[i]).collect();
+            let radius: Vec<f64> = (0..classes).map(|_| rng.random_range(0.0..0.01)).collect();
+            let bound = gap_box_upper(&reference, &radius, top, &lower, &upper);
+            assert!(bound >= at_point);
+            for sample in 0..200 {
+                let moved: Vec<f64> = (0..classes)
+                    .map(|i| if i == top { 0.0 } else if sample < 64 { if (sample >> (i % 6)) & 1 == 1 { upper[i] } else { lower[i] } } else { rng.random_range(lower[i]..=upper[i]) })
+                    .collect();
+                let shifted: Vec<f64> = (0..classes).map(|i| reference[i] + rng.random_range(-radius[i]..=radius[i])).collect();
+                let (value, error) = divergence_with_band(&shifted, &moved);
+                assert!(bound >= value - error, "trial {trial}: {bound} below a sampled {value}");
+            }
+        }
+    }
+
+    /// A gap without an end leaves the supremum unresolved; a reversed interval or a class outside the logits is refused.
+    #[test]
+    fn an_unbounded_gap_is_unresolved_and_malformed_gap_boxes_are_refused() {
+        let reference = [1.0, 0.0, -1.0];
+        let zero = [0.0; 3];
+        let status = kl_supremum_over_gap_box(
+            ArrayView1::from(&reference[..]),
+            ArrayView1::from(&zero[..]),
+            0,
+            ArrayView1::from(&[0.0, f64::NEG_INFINITY, -1.0][..]),
+            ArrayView1::from(&[0.0, 0.0, -1.0][..]),
+        )
+        .expect("a status");
+        assert!(status.upper_bound().is_none());
+        assert!(
+            kl_supremum_over_gap_box(
+                ArrayView1::from(&reference[..]),
+                ArrayView1::from(&zero[..]),
+                0,
+                ArrayView1::from(&[0.0, 1.0, 0.0][..]),
+                ArrayView1::from(&[0.0, 0.0, 0.0][..]),
+            )
+            .is_err()
+        );
+        assert!(
+            kl_supremum_over_gap_box(
+                ArrayView1::from(&reference[..]),
+                ArrayView1::from(&zero[..]),
+                3,
+                ArrayView1::from(&zero[..]),
+                ArrayView1::from(&zero[..]),
+            )
+            .is_err()
+        );
     }
 }

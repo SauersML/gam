@@ -141,6 +141,11 @@ class Family:
     def l0(self) -> float:
         return sum(int(idx.numel()) for d in self.mb for idx, _, _ in d.values()) / (args.rows * S)
 
+    def weights(self) -> float:
+        """Weight numbers run per word: each subcomponent on (lower bound above 0) is d_in + d_out - 1 reals."""
+        size = {n: target.site(n).V.shape[0] + target.site(n).U.shape[1] - 1 for n in names}
+        return sum(int(idx.numel()) * size[n] for d in self.mb for n, (idx, _, _) in d.items()) / (args.rows * S)
+
 
 def given_family() -> Family:
     """The driver's CSR sets in VPD's site order."""
@@ -312,7 +317,8 @@ def box():
             del ones
     log("fixed: " + ", ".join(f"{k} {v.mean():.4f}" for k, v in fixed.items()))
     update_out(key, {"fixed_kl": {k: stats(v) for k, v in fixed.items()},
-                     "l0": {k: f.l0() for k, f in families.items()}})
+                     "l0": {k: f.l0() for k, f in families.items()},
+                     "weights_per_word": {k: f.weights() for k, f in families.items()}})
     # Uniform draws over the box, the same U per (draw, microbatch) for every family.
     draws = {}
     delta_modes = {"off": ("off",), "both": ("off", "uniform"), "only": ("uniform",)}[args.delta]

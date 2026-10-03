@@ -48,6 +48,11 @@ pub mod block;
 // KL and total-variation bounds over logit boxes.
 pub mod bounds;
 
+// The box claim's worst case, certified by bound propagation through the masked program.
+pub mod certify;
+#[cfg(test)]
+mod certify_tests;
+
 // Prefix, subset and graph codes for the global artifact and local packets.
 pub mod codec;
 
@@ -235,6 +240,9 @@ mod concepts_tests;
 // Gate laws: which subcomponents are on for an input, from a small bits-charged law over the
 // model's own amplitudes (fit, code, feature screen, decisions).
 pub mod gates;
+
+// Libraries fitted on one site's own inputs to its second-order code.
+pub mod site_fit;
 
 #[cfg(test)]
 mod gates_tests;

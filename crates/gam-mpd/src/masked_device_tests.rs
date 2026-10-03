@@ -254,3 +254,44 @@ fn screened_selection_decisions_are_the_float64_ones() {
     select_observed(&masked, &family, &target, masks, &coder, observations, 2, None, &mut observe).expect("selection");
     assert!(decisions > 0, "the selection took decisions");
 }
+
+/// A selection whose trials score through screened heads returns the float64 KL of the masks it
+/// returns, bit for bit what one forward of those masks alone gives: never a screened KL (whose
+/// logits carry an f32 band), nor rows settled to float64 on a subset of the batch. Selection ends
+/// both when every sequence is done and when no single flip nor group move pays; each start here
+/// reaches one of them.
+#[test]
+fn a_screened_selection_returns_the_float64_kl_of_its_masks() {
+    use super::device_program_tests::fixture_sized;
+    use super::masked::{Coder, score_only, select};
+    let (program, family) = fixture_sized(128, 2048, 64, 4);
+    let all = sites(&program);
+    let libraries: Vec<Library> = all
+        .iter()
+        .enumerate()
+        .map(|(k, site)| {
+            let (d_out, d_in) = matrix(&program, site).expect("map").dim();
+            Library {
+                v: Array2::from_shape_fn((PIECES, d_in), |(i, j)| 0.3 * noise(20_000 * k + 37 * i + j)),
+                u: Array2::from_shape_fn((PIECES, d_out), |(i, j)| 0.3 * noise(20_000 * k + 7000 + 37 * i + j)),
+                mean: Array1::zeros(d_in),
+            }
+        })
+        .collect();
+    let masked = Masked::build(&program, all, libraries).expect("masked");
+    // The target is the masked program itself at a planted set: every piece on but the first of
+    // each site, so a selection from everything on has something to find and then nothing.
+    let planted: Vec<Array2<f64>> = masked.all_pieces().iter().map(|p| Array2::from_shape_fn((family.rows, *p), |(_, c)| if c == 0 { 0.0 } else { 1.0 })).collect();
+    let target = Target::every_row(masked.program.execute(&masked.family(&family, &planted), false).expect("planted").values[masked.program.output].clone());
+    let costs: Vec<Array1<f64>> = masked.all_pieces().iter().map(|p| Array1::from_elem(*p, 0.5)).collect();
+    let coder = Coder::ran(costs, family.rows);
+    let starts: [Vec<Array2<f64>>; 2] = [
+        masked.all_pieces().iter().map(|p| Array2::ones((family.rows, *p))).collect(),
+        planted.clone(),
+    ];
+    for begin in starts {
+        let (masks, kl) = select(&masked, &family, &target, begin, &coder, 64.0, 2).expect("selection");
+        let exact = score_only(&masked, &masked.family(&family, &masks), &target).expect("float64");
+        assert_eq!(kl, exact, "the returned KL is not the float64 KL of the returned masks");
+    }
+}

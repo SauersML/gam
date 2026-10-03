@@ -547,7 +547,7 @@ impl Law {
     }
 
     /// The radius of the computed law `value` at a computed input `input` whose radius is `r`.
-    fn radius(self, input: f64, value: f64, r: f64) -> f64 {
+    pub(crate) fn radius(self, input: f64, value: f64, r: f64) -> f64 {
         match self {
             Self::Relu | Self::Identity => r,
             Self::Zero => 0.0,
@@ -1670,6 +1670,43 @@ impl OperatorProgram {
             top.push(value);
         }
         Ok(top)
+    }
+
+    /// [`OperatorProgram::execute_suffix`]'s value of node `node` alone: each value of the suffix
+    /// is released after its last reader, so the suffix never holds more than its live values.
+    pub fn execute_suffix_node(&self, inputs: &FamilyInputs, base: &Trace, from: usize, node: usize) -> Result<Array2<f64>, ProgramError> {
+        self.check_inputs(inputs)?;
+        if base.values.len() < from || node < from || node >= self.nodes.len() {
+            return Err(ProgramError::Input(format!("a base trace of {} nodes cannot seed nodes {from}..={node}", base.values.len())));
+        }
+        let interfaces = self.interfaces()?;
+        let ones = vec![1.0; self.declarations.parameters];
+        // Each suffix node's last reader within `from..=node`.
+        let mut last = vec![node; node + 1 - from];
+        for index in from..=node {
+            last[index - from] = index;
+        }
+        for index in from..=node {
+            for argument in self.nodes[index].arguments() {
+                if argument >= from {
+                    last[argument - from] = last[argument - from].max(index);
+                }
+            }
+        }
+        last[node - from] = usize::MAX;
+        let mut top: Vec<Array2<f64>> = Vec::with_capacity(node + 1 - from);
+        for index in from..=node {
+            let values = Layered { base: &base.values, top: &top, from, patch: None };
+            let frame = Frame { args: &[], parameters: &ones, nodes: &self.nodes, output: self.output };
+            let (value, _) = self.evaluate_node(index, &self.nodes[index], inputs, &values, None, &interfaces, &frame)?;
+            top.push(value);
+            for (offset, slot) in top.iter_mut().enumerate() {
+                if last[offset] <= index && slot.len() > 0 {
+                    *slot = Array2::zeros((0, 0));
+                }
+            }
+        }
+        Ok(std::mem::replace(&mut top[node - from], Array2::zeros((0, 0))))
     }
 
     /// The unbanded output of this program, which differs from `base_program` only in operator

@@ -530,6 +530,12 @@ impl Masked {
         Ok(Library { v, u, mean: Array1::zeros(d_in) })
     }
 
+    /// Site `k`'s pieces' `U` (C × d_out), without the rest of its library.
+    fn u(&self, k: usize) -> Result<Array2<f64>, String> {
+        let u_blocks: Vec<_> = self.u_ops[k].iter().map(|&op| self.program.operators[op].matrix_cow()).collect();
+        ndarray::concatenate(Axis(1), &u_blocks.iter().map(|b| b.t()).collect::<Vec<_>>()).map_err(|e| e.to_string())
+    }
+
     /// Site `k`'s own map `W` (written × read), from the model's operators, which the program
     /// keeps until [`Masked::release_training_state`].
     pub fn w(&self, k: usize) -> Result<Array2<f64>, String> {
@@ -1089,13 +1095,13 @@ fn box_worst(
             // The layer's first mask node (each site's mask sits just before its `z`).
             let from = sites.iter().map(|k| masked.z[*k] - 1).min().unwrap_or(0);
             let kl_vertex = match (all_on, &body, head) {
-                (Some(trace), Some(body), Some((hidden, operator, layout))) if from <= hidden => {
-                    let top = body.execute_suffix(&family, trace, from).map_err(|e| e.to_string())?;
-                    certified_point(masked, target, &top[hidden - from], (operator, layout), corner, &totals, &sequence_of)?.0
+                (Some(trace), Some(_), Some((hidden, operator, layout))) if from <= hidden => {
+                    let hidden_values = masked.program.execute_suffix_node(&family, trace, from, hidden).map_err(|e| e.to_string())?;
+                    certified_point(masked, target, &hidden_values, (operator, layout), corner, &totals, &sequence_of)?.0
                 }
                 (Some(trace), _, _) if masked.head.is_none() && from <= masked.program.output => {
-                    let top = masked.program.execute_suffix(&family, trace, from).map_err(|e| e.to_string())?;
-                    kl_score_only(target, &top[masked.program.output - from])
+                    let output = masked.program.execute_suffix_node(&family, trace, from, masked.program.output).map_err(|e| e.to_string())?;
+                    kl_score_only(target, &output)
                 }
                 _ => score_only(masked, &family, target)?,
             };
@@ -1775,6 +1781,7 @@ impl Selected {
         fishers: &[Array2<f64>],
         terms: Option<&BoxTerms>,
         on_device: Option<&DeviceTarget>,
+        for_gradients: bool,
     ) -> Result<Array1<f64>, String> {
         match self {
             Self::Device(state) => match on_device {
@@ -1793,7 +1800,8 @@ impl Selected {
                         Some(c) => c,
                         None => to_output(masked, family, trace, target, kl(target, &*logits(masked, family, trace, target)?).1)?,
                     };
-                    let mut keep = masked.masked.clone();
+                    // The masked nodes' cotangents too when the mask gradients will read them.
+                    let mut keep: Vec<usize> = if for_gradients { masked.masked.clone() } else { Vec::new() };
                     keep.extend(masked.written.iter().flatten().copied());
                     *back = Some(super::derivatives::vjp_from(&masked.program, family, trace, masked.program.output, cotangent, Some(&keep)).map_err(|e| e.to_string())?);
                 }
@@ -2015,7 +2023,7 @@ pub fn select_observed(
             None => Ok((score_only(masked, &family, target)?, Array1::zeros(rows))),
             Some(f) => {
                 let (kl_trial, mut state) = Selected::forward(masked, &family, target, on_device, false)?;
-                let expected = state.expected_excess(masked, &family, target, trial, f, box_terms.as_deref(), on_device)?;
+                let expected = state.expected_excess(masked, &family, target, trial, f, box_terms.as_deref(), on_device, false)?;
                 drop(state);
                 let excess = box_worst(masked, base, target, trial, &kl_trial, expected, all_on.as_ref())?;
                 Ok((kl_trial, excess))
@@ -2030,7 +2038,7 @@ pub fn select_observed(
             None => Ok((score_only(masked, &family, target)?, Array1::zeros(rows))),
             Some(f) => {
                 let (kl_trial, mut state) = Selected::forward(masked, &family, target, on_device, false)?;
-                let expected = state.expected_excess(masked, &family, target, trial, f, box_terms.as_deref(), on_device)?;
+                let expected = state.expected_excess(masked, &family, target, trial, f, box_terms.as_deref(), on_device, false)?;
                 Ok((kl_trial, expected))
             }
         }
@@ -2054,7 +2062,7 @@ pub fn select_observed(
                 }
                 // The excess first, so its reverse pass also serves the mask gradients.
                 if let (Some(f), None) = (boxed, &excess_known) {
-                    let expected = state.expected_excess(masked, &family, target, &masks, f, box_terms.as_deref(), on_device)?;
+                    let expected = state.expected_excess(masked, &family, target, &masks, f, box_terms.as_deref(), on_device, true)?;
                     excess_known = Some(box_worst(masked, base, target, &masks, &kl_now, expected, all_on.as_ref())?);
                 }
                 let grads = state.mask_gradients(masked, &family, target, on_device)?;
@@ -2253,7 +2261,9 @@ pub fn select_observed(
                 excess_known = None;
                 continue;
             }
-            return Ok((masks, kl_now));
+            // The KL returned is the float64 one of the final masks, never a screened one.
+            let kl_final = score_only(masked, &masked.family(base, &masks), target)?;
+            return Ok((masks, kl_final));
         }
         let proposed_family = masked.family(base, &proposed);
         let (mut kl_new, mut state_new, mut screened) = match (&screen, &head_base) {
@@ -2268,7 +2278,7 @@ pub fn select_observed(
         };
         let excess_new = match boxed {
             Some(f) => {
-                let expected = state_new.expected_excess(masked, &proposed_family, target, &proposed, f, box_terms.as_deref(), on_device)?;
+                let expected = state_new.expected_excess(masked, &proposed_family, target, &proposed, f, box_terms.as_deref(), on_device, true)?;
                 // Kept, this forward serves only the next round's mask gradients.
                 state_new.shrink(masked);
                 box_worst(masked, base, target, &proposed, &kl_new, expected, all_on.as_ref())?
@@ -2496,23 +2506,10 @@ pub fn select_observed(
         // Done when every sequence is done (each on its own evidence, so a batch of sequences
         // selects exactly as each would alone).
         if cap.iter().all(|c| *c == 0) {
-            // A screened forward's KL is not returned: the float64 one is.
-            if next_error.as_ref().is_some_and(|e| e.iter().any(|v| *v > 0.0)) {
-                next_forward = None;
-            }
-            if head_base.as_ref().is_some_and(|h| h.error.iter().any(|v| *v > 0.0)) {
-                reuse = None;
-            }
-            let kl_final = match (next_forward.take(), reuse.take()) {
-                (Some((kl, _)), _) | (None, Some((kl, _))) => kl,
-                (None, None) => {
-                    let family = masked.family(base, &masks);
-                    match on_device {
-                        Some(on_device) => masked.on_lowered(|accelerated| accelerated.score_only(&family, on_device))?,
-                        None => score_only(masked, &family, target)?,
-                    }
-                }
-            };
+            // The KL returned is the float64 one of the final masks, from one forward of them alone:
+            // never a screened one, nor rows settled on a subset, so it is what any later scoring
+            // of the same masks finds.
+            let kl_final = score_only(masked, &masked.family(base, &masks), target)?;
             return Ok((masks, kl_final));
         }
     }
@@ -2884,7 +2881,8 @@ fn box_excess_back(
     let mut excess = Array1::<f64>::zeros(rows);
     let mut out = Vec::new();
     for (k, site) in masked.sites.iter().enumerate() {
-        let SiteTerms { u, own: own_blocks, uf } = &terms.sites[k];
+        let own_blocks = &terms.sites[k];
+        let u = &masked.u(k)?;
         let f = &fishers[k];
         // The off blocks' coordinates, per column.
         let off = masked.expand(k, &masks[k]).mapv(|m| 1.0 - m);
@@ -2923,6 +2921,7 @@ fn box_excess_back(
             let g_s = &g * 0.5 + &sf * 0.25;
             let g_a = &fast_abt(&g_s, u) + &(own_a * (1.0 / 12.0));
             let mut u_gradient = fast_atb(&a, &g_s);
+            let uf = fast_ab(u, f);
             let mut start = 0;
             for &r in masked.ranks(k) {
                 let a_block = a.slice(s![.., start..start + r]);
@@ -2940,23 +2939,17 @@ fn box_excess_back(
 }
 
 /// What the box claim's excess reads of the library and the written Fishers, fixed while neither
-/// moves: per site its pieces' `U`, `U F`, and each block's `U_c F U_cᵀ` (a site of rank-one
-/// blocks holds them as one row, `u_c F u_cᵀ` per piece).
+/// moves: per site each block's `U_c F U_cᵀ` (a site of rank-one blocks holds them as one row,
+/// `u_c F u_cᵀ` per piece).
 pub(crate) struct BoxTerms {
-    sites: Vec<SiteTerms>,
-}
-
-struct SiteTerms {
-    u: Array2<f64>,
-    own: Vec<Array2<f64>>,
-    uf: Array2<f64>,
+    sites: Vec<Vec<Array2<f64>>>,
 }
 
 impl BoxTerms {
     pub(crate) fn new(masked: &Masked, fishers: &[Array2<f64>]) -> Result<Self, String> {
         let mut sites = Vec::new();
         for k in 0..masked.sites.len() {
-            let u = masked.library(k)?.u;
+            let u = masked.u(k)?;
             let uf = gam_linalg::faer_ndarray::fast_ab(&u, &fishers[k]);
             let own = if masked.is_rank_one(k) {
                 vec![(&uf * &u).sum_axis(Axis(1)).insert_axis(Axis(0))]
@@ -2969,7 +2962,7 @@ impl BoxTerms {
                 }
                 blocks
             };
-            sites.push(SiteTerms { u, own, uf });
+            sites.push(own);
         }
         Ok(Self { sites })
     }
