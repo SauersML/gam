@@ -383,6 +383,8 @@ fn a_batched_adversary_on_a_device_finds_each_boxs_points() {
     for target in targets(&clean) {
         let batched = adversary_batch(&lowered, &base, &target, &boxes, 3, 4, &seeds).expect("batched");
         for (b, gates) in boxes.iter().enumerate() {
+            // One box at a time on the same device: the same points, the same values.
+            assert_eq!(batched[b], adversary(&lowered, &base, &target, gates, None, 3, 4, seeds[b]).expect("on the device"), "box {b}");
             let alone = adversary(&unlowered, &base, &target, gates, None, 3, 4, seeds[b]).expect("alone");
             for r in 0..base.rows {
                 assert!((batched[b][r] - alone[r]).abs() <= 1e-9 * (1.0 + alone[r].abs()), "box {b} row {r}: {} against {}", batched[b][r], alone[r]);
