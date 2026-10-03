@@ -370,18 +370,23 @@ fn sites_are_the_hidden_maps_and_their_statistics_build_an_exact_library() {
 #[test]
 fn the_box_claims_error_is_the_kl_expected_over_uniform_off_gates() {
     use super::masked::{box_excess, fisher};
-    let (program, family) = model();
-    let target = Target::every_row(program.execute(&family, false).expect("executes").values[program.output].clone());
+    let (mut program, family) = model();
+    // The second-order comparison needs a smooth neighborhood. ReLU gate crossings are not
+    // captured by the local Fisher, even when the factors themselves are small.
+    program.nodes[4] = Node::Pointwise { input: 3, laws: vec![Law::Identity; UNITS] };
     let site = sites(&program).into_iter().find(|s| s.name == "W_in").expect("the W_in site");
     let pieces = 3;
     let library = Library {
-        v: Array2::from_shape_fn((pieces, WIDTH), |(i, j)| 0.3 * noise(700 + 7 * i + j)),
-        u: Array2::from_shape_fn((pieces, UNITS), |(i, j)| 0.3 * noise(800 + 7 * i + j)),
+        v: Array2::from_shape_fn((pieces, WIDTH), |(i, j)| 0.03 * noise(700 + 7 * i + j)),
+        u: Array2::from_shape_fn((pieces, UNITS), |(i, j)| 0.03 * noise(800 + 7 * i + j)),
         mean: Array1::zeros(WIDTH),
     };
     let masked = Masked::build(&program, vec![site], vec![library]).expect("builds");
     let masks = vec![Array2::from_shape_fn((family.rows, pieces), |(r, c)| if (r + c) % 2 == 0 { 0.0 } else { 1.0 })];
     let fam = masked.family(&family, &masks);
+    // Anchor at the masked state so adding off gates has nonnegative excess. Against an
+    // unrelated teacher it may instead improve KL, making a positivity assertion invalid.
+    let target = Target::every_row(masked.program.execute(&fam, false).expect("anchor").values[masked.program.output].clone());
     let (kl, trace, cotangent) = forward(&masked, &fam, &target).expect("forward");
     let fishers: Vec<Array2<f64>> =
         fisher(&masked, &fam, &trace, &target, 256, 11, true).expect("fisher").into_iter().map(|(_, f)| f.expect("written")).collect();

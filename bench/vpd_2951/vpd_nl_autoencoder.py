@@ -51,6 +51,19 @@ KIND = {"q_proj": "query", "k_proj": "key", "v_proj": "value", "o_proj": "attn-o
 HEADER = "Each line names the weight mechanisms of a 4-layer language model that ran on one word.\n"
 
 
+def device():
+    """cuda where there is one (the cluster's L40s), else the Mac's mps."""
+    import torch
+
+    return "cuda" if torch.cuda.is_available() else "mps"
+
+
+def empty_cache():
+    import torch
+
+    (torch.cuda if torch.cuda.is_available() else torch.mps).empty_cache()
+
+
 def sets():
     z = np.load(MASKS)
     return z, z["vpd_indptr"], z["vpd_indices"].astype(np.int64), z["vpd_offsets"], [str(n) for n in z["site_names"]]
@@ -68,13 +81,15 @@ def show(s: str) -> str:
 # ------------------------------------------------------------------ the model, light
 
 
-def load_light(dev="mps"):
+def load_light(dev=None):
     """The target with VPD's subcomponents installed in its sites (no causal-importance network:
     nothing here runs it). Returns the target and each site's subcomponent count."""
     import torch
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from vpd_model import VPD_PTH, load_target
+
+    dev = dev or device()
 
     target = load_target(dev)
     raw = torch.load(str(VPD_PTH), map_location="cpu", weights_only=True, mmap=True)
@@ -133,7 +148,7 @@ def stage_labels():
         if len(contexts[j]) < 4 and lift[k] > 1.0:
             contexts[j].append((int(t_of[k]), int(counts[k]), float(lift[k])))
 
-    dev = "mps"
+    dev = device()
     target, _ = load_light(dev)
     wte = target.wte
     E = wte * torch.rsqrt(wte.pow(2).mean(-1, keepdim=True) + target.eps)  # rms-normed embeddings
@@ -176,8 +191,7 @@ def stage_labels():
                 if ws is not None:
                     writes[j] = torch.topk(signs[j] * ws[c - c0], 4).indices.tolist()
             del rs, ws
-        if dev == "mps":
-            torch.mps.empty_cache()
+        empty_cache()
         print(f"{n}: labelled", flush=True)
 
     # Do the weights read what the subcomponent fires on? (direct path, top 4 of the vocabulary)
@@ -228,8 +242,8 @@ class LM:
         from safetensors import safe_open
         from transformers import AutoConfig
 
-        path = Path(snapshot_download(name, local_files_only=True))
-        with torch.device("mps"):
+        path = Path(snapshot_download(name, allow_patterns=["*.json", "*.safetensors", "*.txt", "merges.txt"]))
+        with torch.device(device()):
             self.model = AutoModelForCausalLM.from_config(AutoConfig.from_pretrained(path), dtype=torch.float16)
         params = dict(self.model.named_parameters()) | dict(self.model.named_buffers())
         for shard in sorted(path.glob("*.safetensors")):
@@ -271,7 +285,7 @@ class LM:
         while done < len(ids):
             lo = max(0, done - stride) if done > 1 else 0
             hi = min(len(ids), lo + window)
-            x = torch.tensor([ids[lo:hi]], device="mps")
+            x = torch.tensor([ids[lo:hi]], device=device())
             nll = self.nll(x, torch.ones_like(x))[0].cpu().numpy()
             # positions lo+1 .. hi-1 predicted; keep those from `done`
             keep = np.arange(lo + 1, hi)
@@ -292,10 +306,10 @@ class LM:
             chunk = [self.tok(t + "\n", add_special_tokens=False)["input_ids"] for t in texts[b:b + batch]]
             L = max(len(c) for c in chunk) + len(h)
             pad = self.tok.pad_token_id or 0
-            x = torch.full((len(chunk), L), pad, device="mps")
-            m = torch.zeros((len(chunk), L), device="mps")
+            x = torch.full((len(chunk), L), pad, device=device())
+            m = torch.zeros((len(chunk), L), device=device())
             for i, c in enumerate(chunk):
-                x[i, :len(h) + len(c)] = torch.tensor(h + c, device="mps")
+                x[i, :len(h) + len(c)] = torch.tensor(h + c, device=device())
                 m[i, :len(h) + len(c)] = 1
             nll = self.nll(x, m)
             for i, c in enumerate(chunk):
@@ -337,7 +351,7 @@ def stage_attrib():
     import torch
 
     z, indptr, indices, offsets, names = sets()
-    dev = "mps"
+    dev = device()
     target, C = load_light(dev)
     lo = indptr[EVAL[0] * CONTEXT]
     out = np.zeros(indptr[EVAL[1] * CONTEXT] - lo, dtype=np.float32)
@@ -364,7 +378,7 @@ def stage_attrib():
             g[sel] = G[torch.tensor(pos[sel], device=dev), torch.tensor(glob[sel] - offsets[s], device=dev)].cpu().numpy()
         out[a - lo:b - lo] = g
         del masks, logits, kl
-        torch.mps.empty_cache()
+        empty_cache()
         print(f"row {r}: summed KL {float(z['kl_vpd'][r].sum()):.1f} nats, attributed drop {-g.sum():.1f}", flush=True)
     np.save(OUT / "attrib.npy", out)
 
@@ -512,7 +526,7 @@ def stage_kl():
     it = json.load(open(OUT / "items.json"))
     tb = json.load(open(OUT / "text_bits.json"))
     core = it["core"]
-    dev = "mps"
+    dev = device()
     target, C = load_light(dev)
     words = TEXT_ROWS * CONTEXT
     programs = {k: [sorted({j for kind, i in ch for j in (core[i] if kind == "c" else [i])}) for ch in v["chosen"]]
@@ -538,7 +552,7 @@ def stage_kl():
             del masks, tgt
         out[key] = {"kl": np.concatenate(kls).tolist(), "l0": [len(p) for p in prog]}
         print(f"{key}: KL {np.mean(out[key]['kl']):.3f} nats, L0 {np.mean(out[key]['l0']):.1f}", flush=True)
-        torch.mps.empty_cache()
+        empty_cache()
     json.dump(out, open(OUT / "kl.json", "w"))
 
 

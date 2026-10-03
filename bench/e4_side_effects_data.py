@@ -33,7 +33,10 @@ HOME = Path.home()
 VD = HOME / "mpd-data/vpd"
 FR = HOME / "mpd-data/frontier"
 DEV = int(__import__("os").environ.get("E4_DEV_ROWS", "0"))  # > 0: a quick run on that many rows with the LoRAs trained so far
-OUTD = FR / "e4_side" / ("dev" if DEV else "")
+# E4_VARIANTS=NAME scores the edits in e4_side/methods/NAME.pt ({name: delta W}, metadata and comparison pairs in
+# NAME.json) instead of the LoRAs and VPD edits, into e4_side/methods/NAME/
+VARIANTS = __import__("os").environ.get("E4_VARIANTS")
+OUTD = FR / "e4_side" / ("dev" if DEV else f"methods/{VARIANTS}" if VARIANTS else "")
 OUTD.mkdir(parents=True, exist_ok=True)
 SITE, COMP, O_TOK, SIDE, CI_MIN = "h.2.mlp.down_proj", 2359, 80, 20, 0.5
 REPL = json.load(open(FR / "e4_replication_ci0.5.json"))
@@ -261,10 +264,14 @@ def solve_alpha(pf, W0, U, V, u_o, p_target, lo=0.5, hi=12.0):
 
 def edit_variants():
     """The model and every edit: the VPD strength sweep, each LoRA, and for each LoRA the VPD edit whose strength is
-    solved to give exactly that LoRA's edit success. Returns (target, W0, {name: delta W}, {name: meta})."""
+    solved to give exactly that LoRA's edit success. Returns (target, W0, {name: delta W}, {name: meta}).
+    With E4_VARIANTS, the declared edits instead."""
     import torch
     target, U, V = load()
     W0 = target.site(SITE).W.clone()
+    if VARIANTS:
+        spec = json.load(open(FR / f"e4_side/methods/{VARIANTS}.json"))
+        return target, W0, {k: v.float().to("mps") for k, v in torch.load(FR / f"e4_side/methods/{VARIANTS}.pt").items()}, spec["meta"]
     u_o = target.wte[O_TOK] / target.wte[O_TOK].norm()
     ev, _ = harvest()
     pf = p_fire_fn(target, ev)
@@ -317,9 +324,13 @@ def split_forward(target):
             x = x + target.site(f"h.{i}.mlp.down_proj")(g)
         return block(x, 2, ids.shape[1])
 
-    def final(xmid, g2, W):
-        x3, g3 = block(xmid + g2 @ W.T, 3, xmid.shape[1])
+    def after(x):
+        x3, g3 = block(x, 3, x.shape[1])
         return x3 + down3(g3)
+
+    def final(xmid, g2, W):
+        return after(xmid + g2 @ W.T)
+    final.after = after  # the network from the edited site's output on: after(residual + site output)
 
     def head(x):
         return F.log_softmax(rms(x, target.ln_f, target.eps) @ target.wte.T, -1)
@@ -331,7 +342,8 @@ def stage_eval():
     import torch.nn.functional as F
     target, W0, models, meta = edit_variants()
     # the 282-example LoRAs and their strength-matched VPD edits (the benchmarks cover all eight LoRA settings)
-    models = {k: v for k, v in models.items() if "lora282" in k}
+    if not VARIANTS:
+        models = {k: v for k, v in models.items() if "lora282" in k}
     names = list(models)
     json.dump({"models": names, "meta": meta}, open(OUTD / "models.json", "w"), indent=1)
 
@@ -678,7 +690,8 @@ def stage_summarize():
         stats[k] = np.stack([est, lo, hi], -1).reshape(K, M, 3)
         boots[k] = bs.reshape(-1, K, M)
     base_stats = {k: boot_means(SB[k], N, wb)[0] for k in SB}
-    pairs = [(nm, "vpd_match_" + nm) for nm in names if nm.startswith("lora") and "vpd_match_" + nm in names]
+    pairs = (json.load(open(FR / f"e4_side/methods/{VARIANTS}.json"))["pairs"] if VARIANTS else
+             [(nm, "vpd_match_" + nm) for nm in names if nm.startswith("lora") and "vpd_match_" + nm in names])
     out_groups = []
     for g, (key, lab, fam, m, kind) in enumerate(groups):
         pick = np.random.default_rng(g).choice(flat[g], min(4, len(flat[g])), replace=False) if len(flat[g]) else []

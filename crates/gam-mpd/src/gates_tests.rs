@@ -100,8 +100,9 @@ fn masks_read_lagged_features_from_the_previous_row_and_zero_at_a_sequence_start
         precision: 0,
         function_bits: 0.0,
         listing_bits: 0.0,
+        inputs: 0,
     };
-    let off = Switch { features: Vec::new(), beta: -1.0, linear: Vec::new(), units: Vec::new(), precision: 0, function_bits: 0.0, listing_bits: 0.0 };
+    let off = Switch { features: Vec::new(), beta: -1.0, linear: Vec::new(), units: Vec::new(), precision: 0, function_bits: 0.0, listing_bits: 0.0, inputs: 0 };
     let amplitudes = vec![Array2::from_shape_vec((4, 1), vec![3.0, 0.0, 3.0, 3.0]).expect("shape"), Array2::zeros((4, 1))];
     // Rows 0..2 one sequence, rows 2..4 another.
     let previous = vec![None, Some(0), None, Some(2)];

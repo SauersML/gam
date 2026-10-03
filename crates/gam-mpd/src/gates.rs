@@ -29,7 +29,11 @@
 //! caller, who knows the pool it was chosen from), `L_int(r + 1)`, a dyadic precision `p` (signed
 //! prefix integer) and every coefficient as the signed prefix integer `round(θ·2^p)`
 //! ([`Switch::function_bits`]). The per-word listing then sends the on/off labels at the inputs
-//! under the decoded function, `−Σ log₂ P(y | f)` ([`Switch::listing_bits`]). The chosen function is
+//! under the decoded function, `−Σ log₂ P(y | f)` ([`Switch::listing_bits`]), each label escaped as
+//! `P(on) = (1 − e)·σ(ĝ) + e/2` with `e = 1/(n + 1)` for `n` training inputs: a mixture with the
+//! uniform code at that weight costs at most `log₂(1/(1 − e))` per input, under 1.5 bits over the
+//! `n`, and caps a confident miss at `log₂(2(n + 1))` bits, so a function that separates its training
+//! labels with a steep slope cannot make an unseen miss cost without bound. The chosen function is
 //! the one with the fewest total bits, measured with the coefficients the decoder rebuilds, so a
 //! coefficient's precision is paid for exactly as far as the listing repays it. A group of
 //! subcomponents doing many unrelated jobs needs a long switching function; [`best`] prices a
@@ -91,6 +95,9 @@ pub struct Switch {
     pub function_bits: f64,
     /// The per-word listing of the training labels under the function.
     pub listing_bits: f64,
+    /// The training inputs it was fitted on, which set its listing's escape (module note).
+    #[serde(default)]
+    pub inputs: usize,
 }
 
 impl Switch {
@@ -122,7 +129,8 @@ impl Switch {
     pub fn label_bits(&self, x: ArrayView2<f64>, y: &[bool]) -> f64 {
         let data = row_major(x);
         let d = x.ncols();
-        y.iter().enumerate().map(|(t, on)| label_bits(self.logit(&data[t * d..(t + 1) * d]), *on)).sum()
+        let e = escape(self.inputs);
+        y.iter().enumerate().map(|(t, on)| label_bits(self.logit(&data[t * d..(t + 1) * d]), *on, e)).sum()
     }
 }
 
@@ -159,9 +167,15 @@ fn sigmoid(g: f64) -> f64 {
     if g >= 0.0 { 1.0 / (1.0 + (-g).exp()) } else { g.exp() / (1.0 + g.exp()) }
 }
 
-/// `−log₂ P(y | logit g)`.
-pub fn label_bits(g: f64, on: bool) -> f64 {
-    (if on { softplus(-g) } else { softplus(g) }) / std::f64::consts::LN_2
+/// The escape weight of a listing fitted on `n` inputs: `1/(n + 1)`.
+pub fn escape(n: usize) -> f64 {
+    1.0 / (n as f64 + 1.0)
+}
+
+/// `−log₂ P(y)` under the escaped listing `P(on) = (1 − e)·σ(g) + e/2` (module note).
+pub fn label_bits(g: f64, on: bool, e: f64) -> f64 {
+    let q = if on { sigmoid(g) } else { sigmoid(-g) };
+    -((1.0 - e) * q + 0.5 * e).log2()
 }
 
 fn int_bits(value: i64) -> f64 {
@@ -374,7 +388,11 @@ fn encode(params: &Params, x: &[f64], y: &[bool], features: &[Feature], structur
         let ints: Vec<i64> = params.theta.iter().map(|t| (t * scale).round() as i64).collect();
         let decoded = Params { d: params.d, theta: ints.iter().map(|k| *k as f64 / scale).collect() };
         let function_bits = header + ints.iter().map(|k| int_bits(*k)).sum::<f64>() + int_bits(prec as i64);
-        let switch = to_switch(&decoded, features, prec, function_bits, decoded.nll(x, y) / std::f64::consts::LN_2);
+        let d = params.d;
+        let e = escape(y.len());
+        let listing = y.iter().enumerate().map(|(t, on)| label_bits(decoded.logit(&x[t * d..(t + 1) * d], None), *on, e)).sum();
+        let mut switch = to_switch(&decoded, features, prec, function_bits, listing);
+        switch.inputs = y.len();
         if best.as_ref().is_none_or(|b| switch.total_bits() < b.total_bits()) {
             best = Some(switch);
         }
@@ -398,6 +416,7 @@ fn to_switch(params: &Params, features: &[Feature], precision: i32, function_bit
         precision,
         function_bits,
         listing_bits,
+        inputs: 0,
     }
 }
 

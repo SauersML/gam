@@ -58,10 +58,19 @@ parser.add_argument("--delta", choices=["off", "both", "only"], default="off",
                     help="VPD's residual (delta) semantics in the box: off (as the sets are scored), both, or only")
 parser.add_argument("--name", default="ours", help="the given sets' family name")
 parser.add_argument("--library", type=Path, default=Path.home() / "mpd-data/pieces/vpd4l_library")
+parser.add_argument("--subcomponents", type=Path, default=None,
+                    help="score another library's sets: the masked driver's library files (DIR/{site}.v.f64, .u.f64, manifest.json) in place of VPD's subcomponents")
 parser.add_argument("--gates", type=Path, default=None,
                     help="VPD's gates on these rows (written by the first run, read by the rest: the CI network then never loads)")
 args = parser.parse_args()
-DEV = "mps"
+DEV = os.environ.get("VPD_DEVICE", "mps")
+
+
+def empty_cache():
+    if DEV == "mps":
+        torch.mps.empty_cache()
+    elif DEV.startswith("cuda"):
+        torch.cuda.empty_cache()
 t0 = time.time()
 
 
@@ -87,9 +96,26 @@ def subcomponents_only() -> VPD:
     return VPD(target, None, {n: (uv[n]["U"], uv[n]["V"]) for n in site_names()})
 
 
+def subcomponents_from(library: Path) -> VPD:
+    """A driver library's rank-one subcomponents installed in the target (its map is u^T v per piece)."""
+    manifest = json.load(open(library / "manifest.json"))
+    uv = {}
+    for name, m in manifest.items():
+        v = np.fromfile(library / f"{name}.v.f64", "<f8").reshape(m["pieces"], m["d_in"])
+        u = np.fromfile(library / f"{name}.u.f64", "<f8").reshape(m["pieces"], m["d_out"])
+        uv[m["vpd"]] = (torch.tensor(u, dtype=torch.float32, device=DEV), torch.tensor(v.T.copy(), dtype=torch.float32, device=DEV))
+    return VPD(target, None, {n: uv[n] for n in site_names()})
+
+
 wanted = args.families.split(",")
-need_gates = "vpd_ci" in wanted or "vpd_rounded" in wanted
-vpd = load_vpd(target, DEV) if need_gates and not args.gates.exists() else subcomponents_only()
+thresholds = [float(f[len("vpd_gt_"):]) for f in wanted if f.startswith("vpd_gt_")]
+need_gates = "vpd_ci" in wanted or "vpd_rounded" in wanted or bool(thresholds)
+if args.subcomponents is not None:
+    assert not need_gates, "VPD's gates belong to VPD's subcomponents"
+    vpd = subcomponents_from(args.subcomponents)
+    args.library = args.subcomponents
+else:
+    vpd = load_vpd(target, DEV) if need_gates and not args.gates.exists() else subcomponents_only()
 names = site_names()
 ids = val_tokens(args.rows, offset=args.offset).to(DEV)
 S = ids.shape[1]
@@ -175,7 +201,7 @@ else:
     ci_mb = ci.mb
     # Only the gates are needed: the CI network (0.54B parameters) leaves memory.
     del vpd.ci_fn
-    torch.mps.empty_cache()
+    empty_cache()
     np.savez(args.gates, **{
         f"{n}:{part}": np.concatenate([(d[n][0].cpu().numpy() + i * MB * S * vpd.C[n]) if part == "index" else d[n][1].cpu().numpy()
                                        for i, d in enumerate(ci_mb)])
@@ -186,6 +212,8 @@ if "vpd_ci" in wanted:
     families["vpd_ci"] = Family(ci_mb)
 if "vpd_rounded" in wanted:
     families["vpd_rounded"] = transformed(Family(ci_mb), lambda v: (v > 0).float())
+for tau in thresholds:
+    families[f"vpd_gt_{tau:g}"] = transformed(Family(ci_mb), lambda v, tau=tau: (v > tau).float())
 if "given" in wanted:
     families[args.name] = given_family()
 log("families: " + ", ".join(f"{k} L0 {f.l0():.1f}" for k, f in families.items()))
@@ -228,7 +256,7 @@ def logits_with(i: int, masks: dict, delta: dict | None = None) -> torch.Tensor:
 
 def kl_rows(i: int, masks: dict, delta: dict | None = None) -> torch.Tensor:
     kl = kl_per_pos(logits_with(i, masks, delta), targets[i])
-    torch.mps.empty_cache()
+    empty_cache()
     return kl
 
 
@@ -302,7 +330,7 @@ def box():
                         kl[d, i * MB * S:(i + 1) * MB * S] = kl_rows(i, m, delta).cpu().numpy().ravel()
                         del m, delta
                     del g
-                    torch.mps.empty_cache()
+                    empty_cache()
             worst = kl.max(0)
             draws[f"{name}/delta_{delta_mode}"] = {
                 "all_draws": stats(kl.ravel()), "worst_of_draws_per_word": stats(worst),
@@ -318,7 +346,7 @@ def box():
             pgd[f"{name}/delta_{'adversarial' if with_delta else 'off'}"] = {str(k): v for k, v in ladder.items()}
             log(f"pgd {name} delta {with_delta}: {ladder}")
             update_out(key, {"pgd_shared": pgd, "pgd_step_size": 0.1})
-            torch.mps.empty_cache()
+            empty_cache()
 
 
 @torch.no_grad()
@@ -351,7 +379,7 @@ def layers():
                 probs = [probs[0], p]
             tv_end[sl] = (0.5 * (probs[-1] - probs[0]).abs().sum(-1)).cpu().numpy().ravel()
             del probs, g
-            torch.mps.empty_cache()
+            empty_cache()
         step_sum = tv_step.sum(0)
         out[name] = {
             "kl_only_layer": [float(x) for x in only.mean(1)],

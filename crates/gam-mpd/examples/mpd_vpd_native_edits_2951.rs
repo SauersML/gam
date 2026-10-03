@@ -19,7 +19,16 @@
 //! ```text
 //! {"problems": [{"name", "storage", "native", "inputs", "class": "span" | "sample",
 //!                "targets" | "write": {"read", "fisher", "gradient"},
-//!                "moment"?, "off_target"?, "out"}]}
+//!                "moment"?, "off_target"?, "preserve"?, "class_span"?, "out"}]}
+//! ```
+//!
+//! `preserve` names a basis (`k × cols`) of inputs whose output must not change: a second
+//! requirement with the native outputs as targets, so the compiled edit is exact on the fire
+//! inputs and zero on the preserved span, or a witness that both cannot hold. `class_span`
+//! (with `"class": "span_of"`) declares the inputs the claim is about (e.g. held-out fire keys),
+//! and the coverage of that span by the constrained inputs is reported.
+//!
+//! ```text
 //! ```
 //!
 //! and each compiled plan is written as `<out>.left.npy`, `<out>.right.npy`
@@ -148,11 +157,21 @@ fn compile(entry: &Value, root: &Path, governor: &MemoryGovernor) -> Result<Valu
     } else {
         (matrix(&at("targets")?)?, None)
     };
+    let class_span = match entry["class_span"].as_str() {
+        Some(path) => Some(matrix(&root.join(path))?),
+        None => None,
+    };
     let class = match field(entry, "class")? {
         "span" => ResponseClass::Span(inputs.view()),
         "sample" => ResponseClass::Sample,
+        "span_of" => ResponseClass::Span(class_span.as_ref().ok_or("class span_of needs class_span")?.view()),
         other => return Err(format!("unknown class {other:?}")),
     };
+    let preserve = match entry["preserve"].as_str() {
+        Some(path) => Some(matrix(&root.join(path))?),
+        None => None,
+    };
+    let preserved_targets = preserve.as_ref().map(|basis| basis.dot(&native.t()));
     let metric = match entry["moment"].as_str() {
         Some(path) => EditMetric::input_moment(matrix(&root.join(path))?.view(), SymmetricAssembly::Mirrored)
             .map_err(|error| error.to_string())?,
@@ -166,13 +185,21 @@ fn compile(entry: &Value, root: &Path, governor: &MemoryGovernor) -> Result<Valu
         registry: &registry,
         storage: storage.clone(),
         native: native.view(),
-        requirements: vec![Requirement::Linear {
+        requirements: std::iter::once(Requirement::Linear {
             site: site.clone(),
             inputs: inputs.view(),
             targets: targets.view(),
             target_radius: 0.0,
             class,
-        }],
+        })
+        .chain(preserve.as_ref().zip(preserved_targets.as_ref()).map(|(basis, kept)| Requirement::Linear {
+            site: site.clone(),
+            inputs: basis.view(),
+            targets: kept.view(),
+            target_radius: 0.0,
+            class: ResponseClass::Sample,
+        }))
+        .collect(),
         metric,
         ties: Vec::new(),
         off_target: off_target
@@ -208,7 +235,12 @@ fn compile(entry: &Value, root: &Path, governor: &MemoryGovernor) -> Result<Valu
         "right_rank": report.right_rank,
         "realization": realization,
         "residual": residual,
-        "covered": report.coverage.iter().all(|c| matches!(c, Coverage::Covered)),
+        "covered": report.coverage.iter().all(|c| matches!(c, Coverage::Covered | Coverage::SampleOnly)),
+        "coverage": report.coverage.iter().map(|c| match c {
+            Coverage::Uncovered { dimension, .. } => json!({"uncovered_dimension": dimension}),
+            other => json!(format!("{other:?}")),
+        }).collect::<Vec<_>>(),
+        "preserved": preserve.as_ref().map(|basis| basis.nrows()),
         "metric_norm": report.metric_norm.map(|(value, band)| json!({"value": value, "band": band})),
         "allowance": report.allowance,
         "terms": terms,

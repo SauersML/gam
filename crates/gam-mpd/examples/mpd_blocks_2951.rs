@@ -19,14 +19,18 @@
 //! in token coordinates: its output through the unembedding (over the classes), its input through
 //! the embedding (over the operands), as its leading frequency and that frequency's share.
 //!
-//! `mpd_blocks_2951 vpd EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json OBSERVATIONS FIRST SEQUENCES`
+//! `mpd_blocks_2951 vpd EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json OBSERVATIONS FIRST SEQUENCES [KINDS|all] [box|corner]`
 //!
 //! `EXPORT_DIR` a language-model export (`gam_mpd::import::import_language_model`, contexts of
 //! 512), `LIBRARY_DIR` per site `{site}.v.f64` (subcomponents × d_in) and `{site}.u.f64`
 //! (subcomponents × d_out) raw float64 on the uncentred read, `SETS_DIR` per-token sets for that
 //! library (`indptr.i64`, `indices.i64`, `sites.txt`, as `mpd_pieces_masked_2951` reads them).
-//! Sequences `FIRST..FIRST + SEQUENCES` are coded, one batch each. Three points under the same
-//! total: the given sets, the sets selected from them (Step A), and the blocks merged from Step A's.
+//! Sequences `FIRST..FIRST + SEQUENCES` are coded, one batch each. `KINDS` a comma list of the site
+//! kinds decomposed (`q,k,v,o` the attention; default every site with a library), the rest native;
+//! `box` codes every word's error under the box claim (off blocks anywhere in `[0, 1]`), `corner`
+//! (default) off as absent. Points under the same total: the given sets, the sets selected from
+//! them (Step A) and the blocks merged from Step A's, each also decoded (every block replaced by
+//! its description's rounding and run exactly), the description recalibrated as in `modadd`.
 //!
 //! Every point reports bits per word (the primary score), KL, active blocks per word and active
 //! rank-one equivalents per word (`Σ k_c` over the blocks on). One gate on a rank-k block scales the
@@ -40,7 +44,7 @@ use gam_mpd::operator_program::{FamilyInputs, LabelKind, OperatorProgram};
 use gam_mpd::pieces::fisher_svd;
 use ndarray::{Array1, Array2};
 use serde_json::{Value, json};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn read_raw<T: Copy>(path: &Path, decode: fn([u8; 8]) -> T) -> Result<Vec<T>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -160,7 +164,7 @@ fn modadd(dir: &Path, out: &Path, observations: f64, names: Option<Vec<String>>)
     let mut describe = Generic::new(&statistics, observations);
     let mut calibrations = Vec::new();
     loop {
-        let coded = Coded { model: &program, sites: chosen.clone(), batches: vec![(family.clone(), target.clone())], observations, samples: 16, describe: &describe };
+        let coded = Coded { model: &program, sites: chosen.clone(), batches: vec![(family.clone(), target.clone())], observations, samples: 16, describe: &describe, boxed: None };
         let (mut report, measured, priced) = fit_modadd(&program, &coded, &chosen, Blocked::rank_one(libraries.clone(), masks.clone()), &describe)?;
         eprintln!("rounding: measured {measured:.1} bits against {priced:.1} priced");
         calibrations.push(json!({"measured": measured, "priced": priced}));
@@ -331,66 +335,109 @@ fn merged(coded: &Coded<'_>, blocked: &Blocked) -> Value {
     Value::Array(out)
 }
 
-fn vpd(
-    dir: &Path,
-    library_dir: &Path,
-    sets_dir: &Path,
-    out: &Path,
+/// One `vpd` run's arguments (module note).
+struct VpdRun {
+    dir: PathBuf,
+    library: PathBuf,
+    sets: PathBuf,
+    out: PathBuf,
     observations: f64,
     first: usize,
     sequences: usize,
-) -> Result<(), String> {
+    /// The site kinds decomposed (the last part of a site's name: `q`, `k`, `v`, `o`, `c_fc`,
+    /// `down_proj`); `None` every site with a library.
+    kinds: Option<Vec<String>>,
+    boxed: bool,
+}
+
+fn vpd(run: &VpdRun) -> Result<(), String> {
     const CONTEXT: usize = 512;
-    let imported = import_language_model(dir, first + sequences, CONTEXT)?;
+    let imported = import_language_model(&run.dir, run.first + run.sequences, CONTEXT)?;
     let program = imported.program;
     let family = imported.contract.family;
-    let mut chosen = Vec::new();
-    let mut libraries = Vec::new();
+    // Every site with a library numbers the given sets; the chosen kinds are decomposed, the rest
+    // run native.
+    let (mut named, mut keep, mut chosen, mut libraries) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for site in sites(&program) {
-        let v_path = library_dir.join(format!("{}.v.f64", site.name));
+        let v_path = run.library.join(format!("{}.v.f64", site.name));
         if !v_path.exists() {
             continue;
         }
         let w = gam_mpd::masked::matrix(&program, &site)?;
         let (d_out, d_in) = w.dim();
         let v = read_f64(&v_path, d_in)?;
-        let u = read_f64(&library_dir.join(format!("{}.u.f64", site.name)), d_out)?;
+        let u = read_f64(&run.library.join(format!("{}.u.f64", site.name)), d_out)?;
         if u.nrows() != v.nrows() {
             return Err(format!("{}: {} v and {} u subcomponents", site.name, v.nrows(), u.nrows()));
         }
-        chosen.push(site);
-        libraries.push(Library { v, u, mean: Array1::zeros(d_in) });
+        named.push((site.name.clone(), v.nrows()));
+        let kind = site.name.rsplit('.').next().unwrap_or("").to_string();
+        let kept = run.kinds.as_ref().is_none_or(|k| k.contains(&kind));
+        keep.push(kept);
+        if kept {
+            chosen.push(site);
+            libraries.push(Library { v, u, mean: Array1::zeros(d_in) });
+        }
     }
-    let named: Vec<(String, usize)> = chosen.iter().zip(&libraries).map(|(s, l)| (s.name.clone(), l.v.nrows())).collect();
-    let masks = given_sets(sets_dir, &named, CONTEXT, first, sequences)?;
+    let masks: Vec<Vec<Array2<f64>>> = given_sets(&run.sets, &named, CONTEXT, run.first, run.sequences)?
+        .into_iter()
+        .map(|all| all.into_iter().zip(&keep).filter(|(_, k)| **k).map(|(m, _)| m).collect())
+        .collect();
     let mut batches = Vec::new();
-    for s in first..first + sequences {
+    for s in run.first..run.first + run.sequences {
         let rows: Vec<usize> = (s * CONTEXT..(s + 1) * CONTEXT).collect();
         let inputs: FamilyInputs = family.select(&rows);
         let logits = program.execute(&inputs, false).map_err(|e| e.to_string())?.values[program.output].clone();
         batches.push((inputs, Target::every_row(logits)));
     }
     let statistics = site_statistics(&program, &chosen, batches.iter().map(|(inputs, _)| inputs.clone()), 4, 0x5EED)?;
-    let describe = Generic::new(&statistics, observations);
+    let boxed = run.boxed.then(|| statistics.iter().map(|s| s.fisher.clone()).collect::<Vec<_>>());
+    let mut describe = Generic::new(&statistics, run.observations);
     drop(statistics);
-    let coded = Coded { model: &program, sites: chosen, batches, observations, samples: 4, describe: &describe };
-    let mut given = Blocked::rank_one(libraries, masks);
-    given.price(&coded)?;
-    let (given_bits, _) = measure(&coded, &given)?;
-    say("given sets", &given_bits);
-    let step_a = reselect(&coded, &given)?;
-    let (step_a_bits, _) = measure(&coded, &step_a)?;
-    say("Step A", &step_a_bits);
-    let (blocked, block_bits) = fit_blocks(&coded, step_a.clone(), false)?;
-    say("blocks", &block_bits);
-    let report = json!({
-        "observations": observations,
-        "sequences": [first, first + sequences],
-        "points": [point("given sets", &given_bits), point("Step A", &step_a_bits), point("blocks", &block_bits)],
-        "block_ranks": ranks(&coded, &blocked),
-        "merged": merged(&coded, &blocked),
-    });
-    std::fs::write(out, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    let mut calibrations = Vec::new();
+    // As `modadd`: refit until the decoded blocks' measured rounding KL is within a factor of two
+    // of its price.
+    loop {
+        let coded = Coded { model: &program, sites: chosen.clone(), batches: batches.clone(), observations: run.observations, samples: 4, describe: &describe, boxed: boxed.clone() };
+        let mut given = Blocked::rank_one(libraries.clone(), masks.clone());
+        given.price(&coded)?;
+        let (given_bits, _) = measure(&coded, &given)?;
+        say("given sets", &given_bits);
+        let step_a = reselect(&coded, &given)?;
+        let (step_a_bits, _) = measure(&coded, &step_a)?;
+        say("Step A", &step_a_bits);
+        let (blocked, block_bits) = fit_blocks(&coded, step_a.clone(), false)?;
+        say("blocks", &block_bits);
+        let (measured, priced, decoded) = rounding_error(&coded, &blocked)?;
+        let (decoded_bits, _) = measure(&coded, &decoded)?;
+        say("blocks, decoded", &decoded_bits);
+        let (_, _, step_a_decoded) = rounding_error(&coded, &step_a)?;
+        let (step_a_decoded_bits, _) = measure(&coded, &step_a_decoded)?;
+        say("Step A, decoded", &step_a_decoded_bits);
+        eprintln!("rounding: measured {measured:.1} bits against {priced:.1} priced");
+        calibrations.push(json!({"measured": measured, "priced": priced}));
+        let ratio = if priced > 0.0 { measured / priced } else { f64::INFINITY };
+        if (0.5..=2.0).contains(&ratio) || measured <= 0.0 || calibrations.len() >= 6 {
+            let report = json!({
+                "observations": run.observations,
+                "claim": if run.boxed { "box" } else { "corner" },
+                "sequences": [run.first, run.first + run.sequences],
+                "sites": coded.sites.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+                "points": [
+                    point("given sets", &given_bits),
+                    point("Step A", &step_a_bits),
+                    point("Step A, decoded", &step_a_decoded_bits),
+                    point("blocks", &block_bits),
+                    point("blocks, decoded", &decoded_bits),
+                ],
+                "calibrations": calibrations,
+                "block_ranks": ranks(&coded, &blocked),
+                "merged": merged(&coded, &blocked),
+            });
+            return std::fs::write(&run.out, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string());
+        }
+        describe = describe.scaled(if ratio.is_finite() { ratio } else { 1e3 });
+    }
 }
 
 fn main() -> Result<(), String> {
@@ -402,15 +449,17 @@ fn main() -> Result<(), String> {
             let names = args.get(5).map(|s| s.split(',').map(str::to_string).collect());
             modadd(Path::new(&args[2]), Path::new(&args[3]), number(4, "OBSERVATIONS")?, names)
         }
-        Some("vpd") if args.len() >= 9 => vpd(
-            Path::new(&args[2]),
-            Path::new(&args[3]),
-            Path::new(&args[4]),
-            Path::new(&args[5]),
-            number(6, "OBSERVATIONS")?,
-            number(7, "FIRST")? as usize,
-            number(8, "SEQUENCES")? as usize,
-        ),
-        _ => Err("mpd_blocks_2951 modadd EXPORT_DIR OUT.json OBSERVATIONS [SITES] | vpd EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json OBSERVATIONS FIRST SEQUENCES".to_string()),
+        Some("vpd") if args.len() >= 9 => vpd(&VpdRun {
+            dir: PathBuf::from(&args[2]),
+            library: PathBuf::from(&args[3]),
+            sets: PathBuf::from(&args[4]),
+            out: PathBuf::from(&args[5]),
+            observations: number(6, "OBSERVATIONS")?,
+            first: number(7, "FIRST")? as usize,
+            sequences: number(8, "SEQUENCES")? as usize,
+            kinds: args.get(9).filter(|k| k.as_str() != "all").map(|k| k.split(',').map(str::to_string).collect()),
+            boxed: args.get(10).is_some_and(|c| c == "box"),
+        }),
+        _ => Err("mpd_blocks_2951 modadd EXPORT_DIR OUT.json OBSERVATIONS [SITES] | vpd EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json OBSERVATIONS FIRST SEQUENCES [KINDS|all] [box|corner]".to_string()),
     }
 }

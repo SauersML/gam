@@ -33,7 +33,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import e4_side_effects_data as E  # noqa: E402
 
-OUTD = E.FR / "e4_side/bench"
+BENCH = E.FR / "e4_side/bench"  # requests and the original model's scores, shared by every variant set
+OUTD = BENCH if not E.VARIANTS else E.FR / f"e4_side/methods/{E.VARIANTS}/bench"
 OUTD.mkdir(parents=True, exist_ok=True)
 t0 = time.time()
 log = lambda m: print(f"[{time.time() - t0:6.0f}s] {m}", flush=True)
@@ -51,7 +52,7 @@ def build_requests(colon=True):
     """Every (context, continuation) request of every benchmark, tokenized the harness way, cached to requests.npz.
     Items: task, gold index, request range, choice character lengths. colon=False builds the control prompts for
     HellaSwag, ARC-Easy and PIQA with their prompt colon replaced ("label. ctx", "...\nAnswer -") and nothing else."""
-    path = OUTD / ("requests.npz" if colon else "requests_nocolon.npz")
+    path = BENCH / ("requests.npz" if colon else "requests_nocolon.npz")
     if path.exists():
         z = np.load(path, allow_pickle=True)
         return {k: z[k] for k in z.files}
@@ -216,7 +217,7 @@ def boot(x, B=1000, seed=0):
 
 def stage_summarize():
     rq = build_requests()
-    zb = np.load(OUTD / "scores_base.npz")
+    zb = np.load(BENCH / "scores_base.npz")
     lp, greedy, names = zb["lp"], zb["greedy"], ["base"]
     if (OUTD / "scores.npz").exists():  # the edited variants, scored in a second pass
         z = np.load(OUTD / "scores.npz")
@@ -230,7 +231,8 @@ def stage_summarize():
     for t in sorted(set(task)):
         if t.startswith("blimp:"):
             groups[t] = task == t
-    pairs = [(nm, "vpd_match_" + nm) for nm in names if nm.startswith("lora") and "vpd_match_" + nm in names]
+    pairs = (json.load(open(E.FR / f"e4_side/methods/{E.VARIANTS}.json"))["pairs"] if E.VARIANTS else
+             [(nm, "vpd_match_" + nm) for nm in names if nm.startswith("lora") and "vpd_match_" + nm in names])
     res = {"description": __doc__, "models": names, "meta": meta, "pairs": pairs, "tasks": {}}
     for g, m in groups.items():
         e = {"n": int(m.sum()), "chance": float(chance_item[m].mean())}

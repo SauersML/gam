@@ -318,8 +318,8 @@ fn modadd(dir: &Path, out: &Path, observations: f64, only: Option<&str>) -> Resu
     let generic = Generic::new(&statistics, observations);
     let structured = Structured { sites: structured_sites };
     let batches = vec![(family.clone(), target)];
-    let coded_generic = Coded { model: &program, sites: chosen.clone(), batches: batches.clone(), observations, samples: 16, describe: &generic };
-    let coded_structured = Coded { model: &program, sites: chosen.clone(), batches, observations, samples: 16, describe: &structured };
+    let coded_generic = Coded { model: &program, sites: chosen.clone(), batches: batches.clone(), observations, samples: 16, describe: &generic, boxed: None };
+    let coded_structured = Coded { model: &program, sites: chosen.clone(), batches, observations, samples: 16, describe: &structured, boxed: None };
 
     // Each site's whole map as one block, on for every word: what one structured statement of the
     // site costs against its rank-one subcomponents all on, both decoded and measured exactly.
