@@ -905,14 +905,14 @@ def stage_figure():
     resid = float((b[:, 1] + b[:, 2]).mean())
     INK, MUTED, SURF, RULE = "#0b0b0b", "#52514e", "#ffffff", "#d6d5cf"
     BLUE, ORANGE, AQUA, VIOLET, YELLOW, RED, GRAY = "#2a78d6", "#eb6834", "#1baf7a", "#4a3aa7", "#eda100", "#e34948", "#a9a8a2"
-    plt.rcParams.update({"font.family": ["Helvetica Neue", "DejaVu Sans"], "font.size": 15, "text.color": INK, "axes.labelcolor": INK,
-                         "xtick.color": MUTED, "ytick.color": MUTED, "axes.edgecolor": RULE, "xtick.labelsize": 13, "ytick.labelsize": 13})
-    fig = plt.figure(figsize=(23, 13), facecolor=SURF)
+    plt.rcParams.update({"font.family": ["Helvetica Neue", "DejaVu Sans"], "font.size": 20, "text.color": INK, "axes.labelcolor": INK,
+                         "xtick.color": MUTED, "ytick.color": MUTED, "axes.edgecolor": RULE, "xtick.labelsize": 17, "ytick.labelsize": 17})
+    fig = plt.figure(figsize=(26, 15), facecolor=SURF)
     gs = fig.add_gridspec(2, 2, width_ratios=[1.4, 1], height_ratios=[1.1, 1], wspace=0.12, hspace=0.38,
                           left=0.015, right=0.975, top=0.88, bottom=0.07)
     fig.text(0.015, 0.945, f"English names of the weights that ran: the text alone rebuilds the program at KL {nats('all'):.1f} nats/word "
              f"(VPD's set: {t['vpd']['kl']:.2f});\nthe exact code beats VPD's listing only through its binary residual",
-             fontsize=22, weight="bold", va="top")
+             fontsize=26, weight="bold", va="top")
 
     # ---- left: held-out words
     ax = fig.add_subplot(gs[:, 0])
@@ -923,35 +923,33 @@ def stage_figure():
     ax.set_ylim(len(words_idx) + 0.3, -0.3)
     cols = [0.0, 0.14, 0.70, 0.90]
     for x, h in zip(cols, ["word", "text the encoder wrote (decoder reads only this)", "subcomponents on", "KL"]):
-        ax.text(x, -0.1, h, fontsize=15, color=MUTED, weight="bold", va="bottom")
+        ax.text(x, -0.1, h, fontsize=18, color=MUTED, weight="bold", va="bottom")
     bw = 0.12 / max(max(kl["vpd"]["l0"][i], L["all"]["l0"][i]) for i in words_idx)
     for r, w in enumerate(words_idx):
         y = r + 0.5
         ax.plot([0, 1], [r, r], color=RULE, lw=0.8)
         ctx = "".join(vocab[max(0, w - 5):w]).replace("\n", " ")[-18:]
-        ax.text(cols[0], y - 0.24, "…" + ctx, fontsize=11, color=MUTED, va="center")
-        ax.text(cols[0], y + 0.1, repr(vocab[w])[1:-1][:12], fontsize=18, weight="bold", va="center")
+        ax.text(cols[0], y - 0.24, "…" + ctx, fontsize=14, color=MUTED, va="center")
+        ax.text(cols[0], y + 0.1, repr(vocab[w])[1:-1][:12], fontsize=22, weight="bold", va="center")
         parts = L["all"]["lines"][w].split("; ") if L["all"]["lines"][w] else []
         shown = parts[:4]
         more = len(parts) - len(shown)
         txt = "\n".join(shown) + (f"\n… and {more} more" if more else "")
-        ax.text(cols[1], y - 0.42, txt or "(nothing)", fontsize=12, va="top", color=INK, linespacing=1.3)
-        ax.text(cols[2] - 0.015, y - 0.4, f"{L['all']['bits'][w]:.0f} bits", fontsize=12, color=MUTED, ha="right", va="top")
+        ax.text(cols[1], y - 0.42, txt or "(nothing)", fontsize=15, va="top", color=INK, linespacing=1.3)
+        ax.text(cols[2] - 0.015, y - 0.4, f"{L['all']['bits'][w]:.0f} bits", fontsize=15, color=MUTED, ha="right", va="top")
         dec, vp = L["all"]["l0"][w], kl["vpd"]["l0"][w]
         ax.barh(y - 0.13, vp * bw, left=cols[2], height=0.2, color=ORANGE)
         ax.barh(y + 0.13, dec * bw, left=cols[2], height=0.2, color=BLUE)
-        ax.text(cols[2] + vp * bw + 0.006, y - 0.13, f"{vp:.0f}", fontsize=12, va="center", color=MUTED)
-        ax.text(cols[2] + dec * bw + 0.006, y + 0.13, f"{dec:.0f}", fontsize=12, va="center", color=MUTED)
-        ax.text(cols[3], y - 0.13, f"{kl['vpd']['kl'][w]:.2f}", fontsize=14, va="center")
-        ax.text(cols[3], y + 0.13, f"{L['all']['kl'][w]:.2f}", fontsize=14, va="center")
+        ax.text(cols[2] + vp * bw + 0.006, y - 0.13, f"{vp:.0f}", fontsize=15, va="center", color=MUTED)
+        ax.text(cols[2] + dec * bw + 0.006, y + 0.13, f"{dec:.0f}", fontsize=15, va="center", color=MUTED)
+        ax.text(cols[3], y - 0.13, f"{kl['vpd']['kl'][w]:.2f}", fontsize=17, va="center")
+        ax.text(cols[3], y + 0.13, f"{L['all']['kl'][w]:.2f}", fontsize=17, va="center")
     n = len(words_idx)
     ax.plot([0, 1], [n, n], color=RULE, lw=0.8)
     ax.barh(n + 0.18, 0.015, left=cols[2], height=0.12, color=ORANGE)
-    ax.text(cols[2] + 0.02, n + 0.18, "VPD's own set", fontsize=12, va="center", color=MUTED)
+    ax.text(cols[2] + 0.02, n + 0.18, "VPD's own set", fontsize=16, va="center", color=MUTED)
     ax.barh(n + 0.18, 0.015, left=cols[2] + 0.13, height=0.12, color=BLUE)
-    ax.text(cols[2] + 0.15, n + 0.18, "decoded from the text", fontsize=12, va="center", color=MUTED)
-    ax.text(0, n + 0.18, "each phrase names one concept (a co-firing group of VPD subcomponents); written by Qwen2.5-7B from its weights and contexts",
-            fontsize=12, color=MUTED, va="center")
+    ax.text(cols[2] + 0.15, n + 0.18, "decoded from the text", fontsize=16, va="center", color=MUTED)
 
     # ---- right top: bits vs KL
     ax = fig.add_subplot(gs[0, 1], facecolor=SURF)
@@ -960,7 +958,7 @@ def stage_figure():
     fr = ["top1", "top2", "top4", "top8", "all"]
     ax.plot([tbits(k) for k in fr], [nats(k) for k in fr], "-o", color=BLUE, lw=2.5, ms=8, mec=SURF, mew=1.5, zorder=3, label="English names, k most valuable per word")
     for k in fr:
-        ax.annotate(k.replace("top", "k=").replace("all", "all"), (tbits(k), nats(k)), textcoords="offset points", xytext=(8, 4), fontsize=12, color=MUTED)
+        ax.annotate(k.replace("top", "k=").replace("all", "all"), (tbits(k), nats(k)), textcoords="offset points", xytext=(8, 4), fontsize=16, color=MUTED)
     mdl = [k for k in L if k.startswith("n=")]
     ax.plot([tbits(k) for k in mdl], [nats(k) for k in mdl], "s", color=VIOLET, ms=9, mec=SURF, zorder=4, label="English names, objective's encoder (n = 256, 1024, 4096)")
     pts = [("vpd", "VPD's set, binary listing", ORANGE, "D", t["vpd"]["bits"], t["vpd"]["kl"]),
@@ -971,7 +969,7 @@ def stage_figure():
     for _, name, col, mk, x, y in pts:
         ax.plot([x], [y], mk, color=col, ms=11, mec=SURF, mew=1.2, zorder=5, label=name)
     ax.axhline(t["empty"]["kl"], color=MUTED, lw=1, ls=":")
-    ax.text(1.5e3, t["empty"]["kl"] * 1.15, "nothing on", fontsize=12, color=MUTED)
+    ax.text(1.5e3, t["empty"]["kl"] * 1.15, "nothing on", fontsize=16, color=MUTED)
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_ylim(0.2, t["empty"]["kl"] * 2.2)
@@ -979,8 +977,8 @@ def stage_figure():
     ax.set_ylabel("KL(model ‖ decoded program), nats")
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
-    ax.legend(frameon=False, fontsize=11, loc="lower left", bbox_to_anchor=(0.0, 0.1))
-    ax.set_title("Description bits vs KL", fontsize=17, loc="left", weight="bold")
+    ax.legend(frameon=False, fontsize=14, loc="lower left", bbox_to_anchor=(0.0, 0.1))
+    ax.set_title("Description bits vs KL", fontsize=21, loc="left", weight="bold")
 
     # ---- right bottom: the objective per word
     ax = fig.add_subplot(gs[1, 1], facecolor=SURF)
@@ -997,15 +995,15 @@ def stage_figure():
             x += w_
         ax.barh(i, kb(k), left=x, color=col, alpha=0.3, height=0.5)
         desc = " + ".join(f"{w_:,.0f}" for w_, _ in segs)
-        ax.text(x + kb(k) + 200, i, f"{desc} + {kb(k):,.0f} = {x + kb(k):,.0f}", va="center", fontsize=13)
-        ax.text(0, i - 0.37, name, fontsize=13)
+        ax.text(x + kb(k) + 200, i, f"{desc} + {kb(k):,.0f} = {x + kb(k):,.0f}", va="center", fontsize=17)
+        ax.text(0, i - 0.38, name, fontsize=17)
     ax.set_yticks([])
     ax.invert_yaxis()
     ax.set_xlabel(f"bits per word: text, binary residual (gray), {N_REPORT}·KL/ln 2 (light)")
     for side in ("top", "right", "left"):
         ax.spines[side].set_visible(False)
     ax.set_xlim(0, max(sum(w_ for w_, _ in r[1]) + kb(r[2]) for r in rows) * 1.5)
-    ax.set_title("The objective per word", fontsize=17, loc="left", weight="bold")
+    ax.set_title("The objective per word", fontsize=21, loc="left", weight="bold")
     path = Path.home() / "mpd-data/figures/nl_autoencoder_vpd4l.png"
     fig.savefig(path, dpi=150, facecolor=SURF)
     print(path)
