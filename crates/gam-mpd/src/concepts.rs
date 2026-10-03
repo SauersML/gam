@@ -99,6 +99,9 @@ impl Sets {
 /// The Krichevsky–Trofimov code length, in bits, of a binary sequence of `n` symbols with `k` ones.
 pub fn kt_bits(k: u64, n: u64) -> f64 {
     assert!(k <= n, "kt_bits: {k} ones in {n} symbols");
+    // The empty sequence has probability exactly one. Evaluating the gamma identity here
+    // introduces a rounding residual, charging (or crediting) unused branches in the code.
+    if n == 0 { return 0.0; }
     (ln_gamma(n as f64 + 1.0) + PI.ln() - ln_gamma(k as f64 + 0.5) - ln_gamma((n - k) as f64 + 0.5)) / LN_2
 }
 
