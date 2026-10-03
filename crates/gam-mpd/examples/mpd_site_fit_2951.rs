@@ -95,7 +95,7 @@ fn main() -> Result<(), String> {
         let rounds_path = out.join(format!("{}.rounds.json", site.name));
         let library = fit(k, w, sample, &description, settings, |round, library| {
             eprintln!(
-                "{} round {}: code {:.1} bits per input (description {:.1}, error {:.1}), L0 {:.2}, corner {:.2}, reseeded {}, read steps {}, {:.0}s",
+                "{} round {}: code {:.1} bits per input (description {:.1}, error {:.1}), L0 {:.2}, corner {:.2}, reseeded {}, read rung {}, {:.0}s",
                 site.name,
                 round.round,
                 round.code,

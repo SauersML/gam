@@ -33,13 +33,16 @@
 //! * **Sets.** Each input's on-set by single flips, a flip kept when it lowers the input's code
 //!   (both points tracked exactly through `K = U F Uᵀ`), swept until no flip pays.
 //! * **Writes.** With the sets and each input's worst point fixed the code is a quadratic in `U`
-//!   whose metric `F` factors out, solved in closed form: `U = Q⁺ R`, `Q = Σ_t s_t z̃_t z̃_tᵀ +
+//!   whose metric `F` factors out, solved in closed form, `U = Q⁺ R`, `Q = Σ_t s_t z̃_t z̃_tᵀ +
 //!   1/12 diag(Σ_t s_t ν_t ⊙ a_t²)`, `R = Σ_t s_t z̃_t y_tᵀ`, with `z̃ = μ ⊙ a`, `μ` one on, one half
 //!   off at an input charged its expectation (zero at one charged its corner), `ν` its off
-//!   indicator there.
-//! * **Reads.** With `U` fixed the code is a quadratic in `V`, minimised by preconditioned
-//!   conjugate gradients (left by each subcomponent's own curvature, right by the inputs'
-//!   sensitivity-weighted second moment), each step's length its exact minimiser.
+//!   indicator there; the step toward it is halved until the code (each input at its worse point)
+//!   falls.
+//! * **Reads.** With `U` and the sets fixed, each input's two points are quadratics in `V`. The
+//!   step is the charged points' preconditioned negative gradient (left by each subcomponent's own
+//!   curvature, right by the inputs' sensitivity-weighted second moment), its length the one of
+//!   least code among a geometric ladder around the quadratic's minimiser: along a line every
+//!   input's scalars are quadratics in the length, so one pass measures the whole ladder.
 //! * **Reseeding.** A subcomponent that runs on no input is replaced by one that would explain the
 //!   input of largest error: its read the input's own direction in the reads' inverse second
 //!   moment, its write that input's residual.
@@ -141,7 +144,7 @@ pub fn samples(program: &OperatorProgram, sites: &[Site], batches: impl IntoIter
 }
 
 /// One round of [`fit`]: its code per input after the sets (description and error bits), the
-/// mean on-set size, the subcomponents reseeded, and the reads' conjugate-gradient steps.
+/// mean on-set size, the subcomponents reseeded, and the rung of the reads' chosen length (0: none).
 #[derive(Clone, Debug)]
 pub struct Round {
     pub round: usize,
@@ -476,6 +479,67 @@ impl Fitting<'_> {
         let quadratic = self.read_curvature(&direction, &k32, &kappa);
         (slope > 0.0 && quadratic > 0.0).then(|| (direction, slope / quadratic))
     }
+
+    /// The error bits of `v + η d` for every `η` of `lengths`, the sets held: each input's four
+    /// scalars (`‖r‖²`, `r·S`, `‖S‖²`, the off energy) are quadratics in `η`, measured in one pass.
+    fn read_profile(&self, v: &Array2<f64>, u: &Array2<f64>, d: &Array2<f64>, lengths: &[f64]) -> Vec<f64> {
+        let c_total = self.pieces;
+        let uf = u.dot(self.fisher);
+        let k = uf.dot(&u.t());
+        let k32 = single(&k);
+        let (v32, d32, uf32) = (single(v), single(d), single(&uf));
+        let mut totals = vec![0.0; lengths.len()];
+        for start in (0..self.rows()).step_by(CHUNK) {
+            let end = (start + CHUNK).min(self.rows());
+            let a = product(self.x.slice(s![start..end, ..]), false, v32.view(), true);
+            let da = product(self.x.slice(s![start..end, ..]), false, d32.view(), true);
+            let g0 = product(self.y.slice(s![start..end, ..]), false, uf32.view(), true);
+            let (mut z_on, mut z_off, mut dz_on, mut dz_off) = (a.clone(), a.clone(), da.clone(), da.clone());
+            for r in 0..end - start {
+                for c in 0..c_total {
+                    if self.masks[(start + r) * c_total + c] == 1 {
+                        z_off[[r, c]] = 0.0;
+                        dz_off[[r, c]] = 0.0;
+                    } else {
+                        z_on[[r, c]] = 0.0;
+                        dz_on[[r, c]] = 0.0;
+                    }
+                }
+            }
+            let pk = product(z_on.view(), false, k32.view(), false);
+            let qk = product(z_off.view(), false, k32.view(), false);
+            let dpk = product(dz_on.view(), false, k32.view(), false);
+            let dqk = product(dz_off.view(), false, k32.view(), false);
+            let rows: Vec<Vec<f64>> = (0..end - start)
+                .into_par_iter()
+                .map(|r| {
+                    let t = start + r;
+                    let dot = |x: &Array2<f32>, y: &Array2<f32>| -> f64 { x.row(r).iter().zip(y.row(r).iter()).map(|(p, q)| f64::from(*p) * f64::from(*q)).sum() };
+                    let rr = [self.yfy[t] - 2.0 * dot(&z_on, &g0) + dot(&z_on, &pk), -2.0 * dot(&dz_on, &g0) + 2.0 * dot(&dz_on, &pk), dot(&dz_on, &dpk)];
+                    let rs = [dot(&z_off, &g0) - dot(&z_on, &qk), dot(&dz_off, &g0) - dot(&dz_on, &qk) - dot(&z_on, &dqk), -dot(&dz_on, &dqk)];
+                    let ss = [dot(&z_off, &qk), 2.0 * dot(&dz_off, &qk), dot(&dz_off, &dqk)];
+                    let mut off = [0.0; 3];
+                    for c in 0..c_total {
+                        if self.masks[t * c_total + c] == 0 {
+                            let (ac, dc) = (f64::from(a[[r, c]]), f64::from(da[[r, c]]));
+                            off[0] += k[[c, c]] * ac * ac;
+                            off[1] += 2.0 * k[[c, c]] * ac * dc;
+                            off[2] += k[[c, c]] * dc * dc;
+                        }
+                    }
+                    let at = |q: &[f64; 3], eta: f64| q[0] + eta * (q[1] + eta * q[2]);
+                    let weight = self.scale * self.s[t];
+                    lengths.iter().map(|&eta| weight * worst(at(&rr, eta), at(&rs, eta), at(&ss, eta), at(&off, eta)).0).collect()
+                })
+                .collect();
+            for row in rows {
+                for (total, value) in totals.iter_mut().zip(row) {
+                    *total += value;
+                }
+            }
+        }
+        totals
+    }
 }
 
 /// What [`fit`] fits to: the code's `n`, the library's size, the most rounds, and the seed of its
@@ -609,23 +673,18 @@ pub fn fit(
         if !moved {
             fitting.corner = before;
         }
-        // The reads: one preconditioned step at the quadratic's minimiser, halved until it falls.
+        // The reads: along the preconditioned step, the length of least code among the quadratic's
+        // minimiser times every power of √2 from 2⁻³² to 2⁴, all measured in one pass.
         if let Some((direction, alpha)) = fitting.read_step(&v, &u, &right) {
-            let before = fitting.corner.clone();
-            let mut eta = alpha;
-            let mut moved = false;
-            while eta > alpha * f64::EPSILON {
-                let trial = &v + &(&direction * eta);
-                let (d, e, _) = fitting.code(&trial, &u, &bits, false, true);
-                report.read_steps += 1;
-                if d + e < current {
-                    (v, current, moved) = (trial, d + e, true);
-                    break;
-                }
-                eta *= 0.5;
-            }
-            if !moved {
-                fitting.corner = before;
+            let mut lengths = vec![0.0];
+            lengths.extend((-64..=8).map(|k| alpha * 2f64.powf(f64::from(k) / 2.0)));
+            let profile = fitting.read_profile(&v, &u, &direction, &lengths);
+            let (best, value) = profile.iter().enumerate().fold((0, profile[0]), |b, (i, p)| if *p < b.1 { (i, *p) } else { b });
+            report.read_steps = best;
+            if best > 0 {
+                // The sets' description is unchanged; only the error moved.
+                current += value - profile[0];
+                v.scaled_add(lengths[best], &direction);
             }
         }
         // Reseeding: every subcomponent on nowhere, from the inputs of largest error in turn, kept
