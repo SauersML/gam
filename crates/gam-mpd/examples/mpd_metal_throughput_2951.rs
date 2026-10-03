@@ -195,7 +195,7 @@ fn main() -> Result<(), String> {
                     phase(&mut t[3], || {
                         for site in &masked.sites {
                             let reads = read_values(&trace, site)?;
-                            let _ = fast_atb(&reads, &reads) / family.rows as f64;
+                            std::hint::black_box(fast_atb(&reads, &reads) / family.rows as f64);
                         }
                         Ok(())
                     })?;
