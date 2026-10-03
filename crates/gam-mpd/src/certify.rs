@@ -160,12 +160,14 @@ fn unit() -> f64 {
     if ROUNDING.load(std::sync::atomic::Ordering::Relaxed) { UNIT_ROUNDOFF } else { 0.0 }
 }
 
+/// `x` raised past its rounding, or `x` itself in a relaxation without rounding.
 fn up(x: f64) -> f64 {
-    x.next_up()
+    if ROUNDING.load(std::sync::atomic::Ordering::Relaxed) { x.next_up() } else { x }
 }
 
+/// `x` lowered past its rounding, or `x` itself in a relaxation without rounding.
 fn down(x: f64) -> f64 {
-    x.next_down()
+    if ROUNDING.load(std::sync::atomic::Ordering::Relaxed) { x.next_down() } else { x }
 }
 
 fn gamma(n: usize) -> f64 {
@@ -843,6 +845,7 @@ impl Curve {
             }
             // Far below the enclosure's range `e^x` is positive and below `e^{-700} < 10^{-300}`.
             Self::Exp if x < -700.0 => Some((0.0, 1e-300)),
+            Self::Exp if !ROUNDING.load(std::sync::atomic::Ordering::Relaxed) => Some((x.exp(), x.exp())).filter(|(v, _)| v.is_finite()),
             Self::Exp => certified_exp(x).map(|i| (i.lo, i.hi)),
             Self::InverseSqrt => {
                 let v = 1.0 / x.sqrt();
@@ -1186,7 +1189,8 @@ fn visible(inputs: &FamilyInputs, causal: bool) -> Result<Vec<Vec<usize>>, Strin
 
 /// What a certificate keeps: at most `budget` symbols per input row, and whether the forms absorb
 /// their own binary64 rounding (`rounding`, the sound default). Without it the bound is the
-/// relaxation's in real arithmetic with every form evaluated as if exact: no longer a proof, but it
+/// relaxation's in real arithmetic with every form evaluated as if exact (a point then stays a point):
+/// no longer a proof, but it
 /// separates the relaxation's own width from the composed rounding enclosures, which on a deep model
 /// can dwarf it (the program's own banded forward of VPD's 4-layer model bounds its logits' rounding
 /// only by about `10²¹`).
@@ -1232,6 +1236,30 @@ impl Drop for Mode {
                 **held
             }
         }
+    }
+}
+
+/// A node's kind, for [`Widening`].
+fn kind(node: &Node) -> &'static str {
+    match node {
+        Node::Feature { .. } => "feature",
+        Node::Raw { .. } => "raw",
+        Node::Constant { .. } => "constant",
+        Node::Affine { .. } => "affine",
+        Node::Bilinear { .. } => "bilinear",
+        Node::Softmax { .. } => "softmax",
+        Node::Mix { .. } => "mix",
+        Node::Pointwise { .. } => "pointwise",
+        Node::Hadamard { .. } => "hadamard",
+        Node::Readout { .. } => "readout",
+        Node::Outer { .. } => "outer",
+        Node::Concat { .. } => "concat",
+        Node::Param { .. } => "param",
+        Node::Call { .. } => "call",
+        Node::Gain { .. } => "gain",
+        Node::Attend { .. } => "attend",
+        Node::RmsNorm { .. } => "rms norm",
+        Node::Transposed { .. } => "transposed",
     }
 }
 
@@ -1365,9 +1393,39 @@ pub fn certify_program(
     relaxation: Relaxation,
 ) -> Result<Array1<f64>, String> {
     let mode = Mode::enter(relaxation.rounding);
-    let bound = certify_held(program, inputs, free, target, reference_radius, relaxation.budget);
+    let bound = certify_held(program, inputs, free, target, reference_radius, relaxation.budget, None);
     drop(mode);
     bound
+}
+
+/// How wide one node's forms are: its mean (over inputs and coordinates) half-width without the
+/// ball, its largest ball, and its mean `|center|`. Where the first two overtake the third the
+/// relaxation has lost the node.
+#[derive(Clone, Debug)]
+pub struct Widening {
+    pub node: usize,
+    pub kind: &'static str,
+    pub reach: f64,
+    pub ball: f64,
+    pub center: f64,
+}
+
+/// [`certify`], with every evaluated node's [`Widening`] in program order (up to the node where the
+/// relaxation fails, if it does).
+pub fn certify_widening(
+    masked: &Masked,
+    base: &FamilyInputs,
+    target: &Target,
+    reference_radius: Option<&Array2<f64>>,
+    gates: &Gates,
+    relaxation: Relaxation,
+) -> Result<(Array1<f64>, Vec<Widening>), String> {
+    let (inputs, free) = claim_inputs(masked, base, gates)?;
+    let mode = Mode::enter(relaxation.rounding);
+    let mut widening = Vec::new();
+    let bound = certify_held(&masked.program, &inputs, &free, target, reference_radius, relaxation.budget, Some(&mut widening));
+    drop(mode);
+    Ok((bound?, widening))
 }
 
 /// [`certify_program`] with the rounding switch held.
@@ -1378,6 +1436,7 @@ fn certify_held(
     target: &Target,
     reference_radius: Option<&Array2<f64>>,
     budget: usize,
+    mut widening: Option<&mut Vec<Widening>>,
 ) -> Result<Array1<f64>, String> {
     let rows = inputs.rows;
     let nodes = program.nodes.len();
@@ -1556,6 +1615,16 @@ fn certify_held(
         };
         let mut value = value;
         value.par_iter_mut().for_each(|x| x.reduce(budget));
+        let count = value.len().max(1) as f64;
+        if let Some(widening) = widening.as_deref_mut() {
+            widening.push(Widening {
+            node: index,
+            kind: kind(&program.nodes[index]),
+            reach: value.iter().map(|x| (&x.spread() + &x.radius).mean().unwrap_or(0.0)).sum::<f64>() / count,
+            ball: value.iter().map(|x| x.ball).fold(0.0, f64::max),
+                center: value.iter().map(|x| x.center.mapv(f64::abs).mean().unwrap_or(0.0)).sum::<f64>() / count,
+            });
+        }
         if value.iter().any(|x| !x.finite()) {
             return Ok(unbounded());
         }
@@ -1733,6 +1802,12 @@ pub fn certify(
     gates: &Gates,
     relaxation: Relaxation,
 ) -> Result<Array1<f64>, String> {
+    let (inputs, free) = claim_inputs(masked, base, gates)?;
+    certify_program(&masked.program, &inputs, &free, target, reference_radius, relaxation)
+}
+
+/// The masked program's inputs and free slots for `gates`.
+fn claim_inputs(masked: &Masked, base: &FamilyInputs, gates: &Gates) -> Result<(FamilyInputs, Vec<FreeSlot>), String> {
     if masked.head.is_some() {
         return Err("a program with a head is not certified".to_string());
     }
@@ -1750,7 +1825,7 @@ pub fn certify(
         return Err("a restoration claim is certified over rank-one subcomponents only".to_string());
     }
     let inputs = masked.family(base, &gates.lower);
-    certify_program(&masked.program, &inputs, &free, target, reference_radius, relaxation)
+    Ok((inputs, free))
 }
 
 /// Per input, an upper bound on `KL(target ‖ hybrid)` over the site-switch claim (module note, "Site

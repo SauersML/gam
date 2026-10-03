@@ -41,7 +41,7 @@
 //! default `sound` is one).
 
 use gam_mpd::blocks::Describe;
-use gam_mpd::certify::{Gates, Relaxation, adversary, certify, certify_branching, certify_sites};
+use gam_mpd::certify::{Gates, Relaxation, adversary, certify, certify_branching, certify_sites, certify_widening};
 use gam_mpd::import::{import, import_language_model};
 use gam_mpd::masked::{Coder, Library, Masked, Target, box_excess_at, forward, select, select_boxed, site_statistics, sites};
 use gam_mpd::operator_program::{FamilyInputs, OperatorProgram};
@@ -448,6 +448,9 @@ fn lm(args: &[String]) -> Result<(), String> {
         let (kl, _, _) = forward(&masked, &masked.family(family, &masks), &target)?;
         let found = adversary(&masked, family, &target, &gates, None, steps, 6, 0xAD5)?;
         let at = Instant::now();
+        // Where the relaxation widens: every node's mean half-width, ball and center at the root.
+        let (_, widening) = certify_widening(&masked, family, &target, rounding.then_some(&radius), &gates, Relaxation { budget, rounding })?;
+        let lost = widening.iter().find(|w| w.reach + w.ball > w.center).map(|w| json!({"node": w.node, "kind": w.kind, "reach": w.reach, "ball": w.ball, "center": w.center}));
         let branched = certify_branching(&masked, family, &target, rounding.then_some(&radius), gates, Relaxation { budget, rounding }, leaves)?;
         let seconds = at.elapsed().as_secs_f64();
         for r in 0..family.rows {
@@ -467,7 +470,10 @@ fn lm(args: &[String]) -> Result<(), String> {
             "sets": name, "claim": claim, "l0": listed_l0(&masks), "leaves": branched.leaves, "seconds": seconds,
             "kl": summary(&kl), "adversary": summary(&found), "certified": summary(&branched.root), "branched": summary(&branched.kl),
             "rows": { "kl": kl.to_vec(), "adversary": found.to_vec(), "certified": branched.root.to_vec(), "branched": branched.kl.to_vec() },
+            "first_lost_node": lost,
+            "widening": widening.iter().map(|w| json!([w.node, w.kind, w.reach, w.ball, w.center])).collect::<Vec<_>>(),
         }));
+        eprintln!("{name} under {claim}: first node wider than its center: {lost:?}");
     }
     let record = json!({
         "mode": "lm", "export": export, "library": library_dir, "given": sets_dir, "first": first, "sequences": sequences, "context": context,
