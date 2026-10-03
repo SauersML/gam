@@ -238,6 +238,11 @@ fn modadd(dir: &Path, out: &Path, observations: f64, only: Option<&str>) -> Resu
     let labels = Array2::from_shape_fn((family.rows, operands.len()), |(r, i)| operands[i][r] as usize);
     eprintln!("{} rows, {} operands of period {period}", family.rows, operands.len());
 
+    // Every node a decomposed site's decoded weights can move: its written nodes and all after them.
+    let mut moved = vec![false; program.nodes.len()];
+    for (index, node) in program.nodes.iter().enumerate() {
+        moved[index] = chosen.iter().any(|s| s.writes.contains(&index)) || node.arguments().iter().any(|a| moved[*a]);
+    }
     let statistics = site_statistics(&program, &chosen, [family.clone()], 16, 0x5EED)?;
     let logit_metrics = gam_mpd::describe::logit_gauss_newton(&program, &chosen, &family, &trace, 64)?;
     let mut libraries = Vec::new();
@@ -246,8 +251,15 @@ fn modadd(dir: &Path, out: &Path, observations: f64, only: Option<&str>) -> Resu
     for (site, measured) in chosen.iter().zip(&statistics) {
         let library = fisher_svd(measured)?;
         libraries.push(Library { v: library.v.t().to_owned(), u: library.u, mean: measured.mean.clone() });
-        let reads = read_values(&trace, site)?;
-        let readers = vec![Chart::harmonic("operand characters of the reads", reads.view(), labels.view(), period)?];
+        // A data chart holds only while the reads are the decoder's own: a site downstream of a
+        // decomposed site reads values its decoded upstream moves, and a least-squares reader
+        // amplifies that motion along the reads' weakest directions.
+        let readers = if site.reads.iter().any(|n| moved[*n]) {
+            Vec::new()
+        } else {
+            let reads = read_values(&trace, site)?;
+            vec![Chart::harmonic("operand characters of the reads", reads.view(), labels.view(), period)?]
+        };
         let mut writers = Vec::new();
         if let Some(map) = readout_map(&program, site)? {
             let classes = Array2::from_shape_fn((map.nrows(), 1), |(c, _)| c);
