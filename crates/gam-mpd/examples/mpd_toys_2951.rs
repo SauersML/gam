@@ -237,8 +237,9 @@ fn main() -> Result<(), String> {
         for path in &args[3..] {
             let predictions: BTreeMap<String, f64> =
                 serde_json::from_str(&std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?).map_err(|e| format!("{path}: {e}"))?;
-            let (dev, held) = chive_claims(&root, case, &predictions)?;
-            eprintln!("{path}: AUROC dev {:.3} ({}+{} claims), held out {:.3} ({}+{} claims)", dev.auroc, dev.true_claims, dev.false_claims, held.auroc, held.true_claims, held.false_claims);
+            for (group, c) in chive_claims(&root, case, &predictions)? {
+                eprintln!("{path} {group}: AUROC {:.3} ({} true, {} false claims)", c.auroc, c.true_claims, c.false_claims);
+            }
         }
         return Ok(());
     }

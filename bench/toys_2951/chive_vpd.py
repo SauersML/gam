@@ -186,7 +186,9 @@ def build(root=ROOT, n_prompts=400, seed=0):
         for e, edit in enumerate(edits_for(prompt, behaviour, rng, unigram)):
             edited = apply(prompt, edit)
             after = rate(sample(model, edited, generator), behaviour)
-            claims.append({"id": f"{record['id']}/{e}", "behaviour": record["id"], "edit": edit, "edit_text": describe(edit, prompt, decode),
+            touched = [edit["position"]] if "position" in edit else edit["positions"]
+            stratum = "touches the behaviour token" if any(prompt[j] == behaviour for j in touched) else "other tokens"
+            claims.append({"id": f"{record['id']}/{e}", "behaviour": record["id"], "edit": edit, "edit_text": describe(edit, prompt, decode), "stratum": stratum,
                            "claim": f"Applying this edit changes the rate of the behavior (the continuation contains {decode([behaviour])!r}) by at least 30 percentage points.",
                            "moved": after - base})
         print(f"prompt {p}: behaviour {decode([behaviour])!r} at {base:.2f}, {len(claims)} edits measured", flush=True)

@@ -806,23 +806,28 @@ pub fn auroc(truths: &[f64], falses: &[f64]) -> f64 {
 
 /// A CHIVE claim file's predictions (claim id → P(true)) scored by AUROC on its dev split (labels
 /// in `<root>/<case>/claims.json`) and its held-out split (labels in `<root>/sealed/<case>.json`,
-/// the scorer's only reader); a claim with no prediction counts as 1/2.
-pub fn chive_claims(root: &Path, case: &str, predictions: &BTreeMap<String, f64>) -> Result<(Claims, Claims), String> {
+/// the scorer's only reader), each also per stratum (a claim's public `stratum`, when it has one);
+/// a claim with no prediction counts as 1/2.
+pub fn chive_claims(root: &Path, case: &str, predictions: &BTreeMap<String, f64>) -> Result<BTreeMap<String, Claims>, String> {
     let record = read_json(&root.join(case).join("claims.json"))?;
     let sealed = read_json(&root.join("sealed").join(format!("{case}.json")))?;
-    let (mut dev, mut held) = ((Vec::new(), Vec::new()), (Vec::new(), Vec::new()));
+    let mut groups: BTreeMap<String, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
     for claim in record["claims"].as_array().ok_or("claims.json: claims")? {
         let id = claim["id"].as_str().ok_or("a claim without an id")?;
-        let (label, split) = if claim["split"].as_str() == Some("held_out") {
-            (sealed["labels"][id]["label"].as_bool().ok_or_else(|| format!("{id}: no sealed label"))?, &mut held)
-        } else {
-            (claim["label"].as_bool().ok_or_else(|| format!("{id}: no label"))?, &mut dev)
-        };
+        let held = claim["split"].as_str() == Some("held_out");
+        let label = if held { sealed["labels"][id]["label"].as_bool() } else { claim["label"].as_bool() }.ok_or_else(|| format!("{id}: no label"))?;
+        let split = if held { "held_out" } else { "dev" };
         let p = predictions.get(id).copied().unwrap_or(0.5);
-        if label { split.0.push(p) } else { split.1.push(p) }
+        let mut keys = vec![split.to_string()];
+        if let Some(stratum) = claim["stratum"].as_str() {
+            keys.push(format!("{split}/{stratum}"));
+        }
+        for key in keys {
+            let group = groups.entry(key).or_default();
+            if label { group.0.push(p) } else { group.1.push(p) }
+        }
     }
-    let claims = |(truths, falses): (Vec<f64>, Vec<f64>)| Claims { true_claims: truths.len(), false_claims: falses.len(), auroc: auroc(&truths, &falses) };
-    Ok((claims(dev), claims(held)))
+    Ok(groups.into_iter().map(|(k, (t, f))| (k, Claims { true_claims: t.len(), false_claims: f.len(), auroc: auroc(&t, &f) })).collect())
 }
 
 /// The measured outcomes: the dev split's from the questions, the held-out split's from
