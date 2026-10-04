@@ -461,11 +461,81 @@ impl DeviceProgram {
     /// A dense operator's device copy to change in place (a trained library); the program's
     /// host operator no longer describes it until [`Self::refresh`] from a program holding it.
     pub fn dense_mut(&mut self, op: usize) -> Result<&mut Tensor, String> {
+        if self.operators.contains_key(&(op, Role::Column)) {
+            return Err(format!("device: operator {op} also has column uses; use replace_dense_parameter"));
+        }
         match self.operators.get_mut(&(op, Role::Product)).map(|h| Arc::get_mut(&mut h.held)) {
             Some(Some(Held::Dense(a))) => Ok(a),
             Some(None) => Err(format!("device: operator {op} is shared with another program")),
             _ => Err(format!("device: operator {op} is not held dense")),
         }
+    }
+
+    /// Prepare explicitly selected Dense literal parameters for resident fitting.
+    /// Dense zero/diagonal fast paths are expanded once, since training may move
+    /// off-diagonal entries. Bias columns gain a canonical rows-by-one copy.
+    /// This initial preparation may upload the original literal matrix; subsequent
+    /// replacements transfer no numerical parameters through the host.
+    /// Callers must budget canonical storage, column copies and optimizer state.
+    pub fn prepare_dense_parameters(&mut self, trainable: &[usize]) -> Result<(), String> {
+        let requested: std::collections::BTreeSet<_> = trainable.iter().copied().collect();
+        if requested.len() != trainable.len() { return Err("device: duplicate trainable operator".into()); }
+        for &op in trainable { self.trainable_dense_source(op)?; }
+        for &op in trainable {
+            let source = self.trainable_dense_source(op)?;
+            let value = if let Some(held) = self.operators.get(&(op, Role::Product)) {
+                match held.held.as_ref() {
+                    Held::Dense(value) => self.device.copy(value).map_err(error)?,
+                    // Only a Dense literal's immutable diagonal fast path reaches
+                    // here. Later replacements always materialize Held::Dense.
+                    Held::Diagonal(_) => self.device.upload(source.matrix_cow().view()).map_err(error)?,
+                    _ => return Err("device: unsupported trainable dense storage".into()),
+                }
+            } else {
+                self.device.copy(self.column(op)?).map_err(error)?
+                    .reshape(source.rows.width(), 1).map_err(error)?
+            };
+            self.replace_dense_parameter(op, value)?;
+        }
+        Ok(())
+    }
+
+    fn trainable_dense_source(&self, op: usize) -> Result<Arc<Operator>, String> {
+        if self.operators.contains_key(&(op, Role::Table)) {
+            return Err("device: trainable table roles are unsupported".into());
+        }
+        let held = self.operators.get(&(op, Role::Product))
+            .or_else(|| self.operators.get(&(op, Role::Column)))
+            .ok_or("device: unknown trainable operator")?;
+        if !matches!(held.source.body, OperatorBody::Dense { .. }) {
+            return Err("device: trainable parameter must be a Dense literal".into());
+        }
+        Ok(Arc::clone(&held.source))
+    }
+
+    /// Canonical resident parameter after [`Self::prepare_dense_parameters`].
+    pub fn dense_parameter(&self, op: usize) -> Result<&Tensor, String> { self.dense(op) }
+
+    /// Replace a canonical Dense parameter and every execution role coherently.
+    /// `value` must be on this program's device. Column uses receive an exact
+    /// resident copy reshaped as one row; transpose uses read the canonical copy.
+    /// Programs sharing the old buffers retain their previous parameter values.
+    /// The host program remains unchanged; export the final canonical values before
+    /// encoding or pricing a fitted candidate. No floating-point rounding occurs here.
+    pub fn replace_dense_parameter(&mut self, op: usize, value: Tensor) -> Result<(), String> {
+        let source = self.trainable_dense_source(op)?;
+        if value.dim() != (source.rows.width(), source.cols.width()) {
+            return Err("device: replacement parameter shape mismatch".into());
+        }
+        let column = if self.operators.contains_key(&(op, Role::Column)) {
+            if value.cols() != 1 { return Err("device: column parameter is not one column".into()); }
+            Some(self.device.copy(&value).map_err(error)?.reshape(1, value.rows()).map_err(error)?)
+        } else { None };
+        self.operators.insert((op, Role::Product), HeldOperator { source: Arc::clone(&source), held: Arc::new(Held::Dense(value)) });
+        if let Some(column) = column {
+            self.operators.insert((op, Role::Column), HeldOperator { source, held: Arc::new(Held::Column(column)) });
+        }
+        Ok(())
     }
 
     /// The logits of every row, on the device (a target).
@@ -1694,6 +1764,28 @@ mod values_vjp_tests {
                 }
             }
             assert_eq!(device.download(trace.value(0).unwrap()).unwrap(), array![[-0.6],[0.2],[1.1]]);
+            let peer = DeviceProgram::compile_values_sharing(&lowered, &program).unwrap();
+            let before = device.download(trace.value(program.output).unwrap()).unwrap();
+            let mut trained = lowered;
+            trained.prepare_dense_parameters(&[0,1]).unwrap();
+            assert_eq!(device.download(trained.dense_parameter(1).unwrap()).unwrap(), program.operators[1].matrix());
+            assert!(trained.dense_mut(0).is_err(), "must not leave bias and product copies inconsistent");
+            let changed = array![[0.9],[-0.8]];
+            trained.replace_dense_parameter(0, device.upload(changed.view()).unwrap()).unwrap();
+            let changed_constant = array![[0.4],[0.1]];
+            trained.replace_dense_parameter(1, device.upload(changed_constant.view()).unwrap()).unwrap();
+            let mut reference = program.clone();
+            for (op, value) in [(0, changed), (1, changed_constant)] {
+                let OperatorBody::Dense { values, .. } = &mut Arc::make_mut(&mut reference.operators[op]).body else { panic!("dense") };
+                *values = value;
+            }
+            let expected = reference.execute(&family, false).unwrap();
+            let after = trained.forward(&family).unwrap();
+            let actual = device.download(after.value(program.output).unwrap()).unwrap();
+            assert!((&actual - &expected.values[program.output]).iter().all(|v| v.abs()<2e-12));
+            let peer_trace = peer.forward(&family).unwrap();
+            assert_eq!(device.download(peer_trace.value(program.output).unwrap()).unwrap(), before);
+            assert_ne!(actual, before);
         }
     }
 
@@ -1712,6 +1804,12 @@ mod values_vjp_tests {
         let trace = lowered.forward(&family).unwrap();
         let (_, gradients) = lowered.vjp_values_dense(&trace, BTreeMap::from([(1,device.upload(array![[5.,7.]].view()).unwrap())]), &[], &[0], Arithmetic::F64).unwrap();
         assert_eq!(device.download(&gradients[&0]).unwrap(),array![[10.,15.],[14.,21.]]);
+        let mut trained = lowered;
+        trained.prepare_dense_parameters(&[0]).unwrap();
+        let moved = device.upload(array![[0.,2.],[3.,0.]].view()).unwrap();
+        trained.replace_dense_parameter(0,moved).unwrap();
+        let trace = trained.forward(&family).unwrap();
+        assert_eq!(device.download(trace.value(1).unwrap()).unwrap(),array![[6.,6.]]);
     }
 
     #[test]

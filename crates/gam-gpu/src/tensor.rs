@@ -275,6 +275,17 @@ enum Data {
 }
 
 impl Tensor {
+    /// Change the row-major shape without moving values or allocating device memory.
+    /// This is a reshape, not a transpose; ownership prevents stale shape aliases.
+    pub fn reshape(mut self, rows: usize, cols: usize) -> Result<Self, GpuError> {
+        if rows.checked_mul(cols) != Some(self.len()) {
+            return Err(shape(format!("cannot reshape {:?} to ({rows}, {cols})", self.dim())));
+        }
+        self.rows = rows;
+        self.cols = cols;
+        Ok(self)
+    }
+
     #[must_use]
     pub fn dim(&self) -> (usize, usize) {
         (self.rows, self.cols)
@@ -4758,6 +4769,19 @@ mod code_rows_workspace_tests {
 #[cfg(test)]
 mod column_copy_tests {
     use super::*;
+    #[test]
+    fn owned_reshape_preserves_bits_and_rejects_overflow() {
+        let device = Device::host();
+        let values = vec![-0.0, 1e300, f64::from_bits(1), -3.0];
+        let held = device.upload_vec(4,1,values.clone()).unwrap();
+        let reshaped = held.reshape(1,4).unwrap();
+        assert_eq!(reshaped.dim(),(1,4));
+        assert!(device.download(&reshaped).unwrap().iter().zip(values).all(|(a,b)|a.to_bits()==b.to_bits()));
+        assert!(device.zeros(2,2).unwrap().reshape(1,3).is_err());
+        assert!(device.zeros(2,2).unwrap().reshape(usize::MAX,2).is_err());
+        assert_eq!(device.zeros(0,2).unwrap().reshape(3,0).unwrap().dim(),(3,0));
+    }
+
     #[test]
     fn columns_copy_bits_and_preserve_other_columns() {
         let device = Device::host();
