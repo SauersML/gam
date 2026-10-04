@@ -676,6 +676,16 @@ pub fn fixed_index_len_bits(alphabet_size: usize) -> Result<u32, CodecError> {
     Ok(usize::BITS - (alphabet_size - 1).leading_zeros())
 }
 
+/// `⌈log₂ g!⌉`: the width of a fixed index into the `g!` orderings of `g` items (a pairing of
+/// `g` listed groups with `g` others), exact for every `g`.
+pub fn permutation_index_len_bits(g: u64) -> u64 {
+    let mut orderings = Natural::one();
+    for factor in 2..=g {
+        orderings.mul_small(factor);
+    }
+    orderings.index_width()
+}
+
 pub fn encode_fixed_index(
     out: &mut BitString,
     index: usize,
@@ -1250,6 +1260,15 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn permutation_index_width_is_the_ceiling_of_log2_factorial() {
+        let mut factorial = 1_u128;
+        for g in 0_u64..=30 {
+            factorial *= u128::from(g.max(1));
+            assert_eq!(permutation_index_len_bits(g), u64::from(u128::BITS - (factorial - 1).leading_zeros()), "{g}!");
         }
     }
 

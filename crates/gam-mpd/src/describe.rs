@@ -71,9 +71,11 @@
 //! library paid once over the 961 inputs, is 99 bits per word; rank-one subcomponents all on, 268;
 //! the gated fits, about 3,000, almost all of it their KL.
 
-use super::codec::{fixed_index_len_bits, prefix_integer_len_bits, subset_code_len_bits};
+use super::codec::{fixed_index_len_bits, permutation_index_len_bits, prefix_integer_len_bits, subset_code_len_bits};
 use gam_linalg::decompose::{eigh, solve, svd};
-use gam_linalg::faer_ndarray::fast_abt;
+use gam_linalg::faer_ndarray::fast_ata;
+use gam_linalg::matrix::symmetrize;
+use gam_math::special::expm1_minus_x;
 use gam_linalg::roundoff::SymmetricAssembly;
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
 use std::borrow::Cow;
@@ -93,7 +95,7 @@ pub struct Metric {
 impl Metric {
     /// The metric of a site from its measured statistics ([`super::masked::site_statistics`]).
     pub fn of(site: &super::pieces::Site, observations: f64) -> Self {
-        Self { moment: symmetric(&site.second_moment), fisher: symmetric(&site.fisher), observations }
+        Self { moment: symmetrize(&site.second_moment), fisher: symmetrize(&site.fisher), observations }
     }
 
     /// Bits per unit of the whitened squared error `tr(F ΔW C ΔWᵀ)`.
@@ -339,10 +341,6 @@ impl Description {
     }
 }
 
-fn symmetric(m: &Array2<f64>) -> Array2<f64> {
-    (m + &m.t()) * 0.5
-}
-
 /// `a b` through faer, so inside a site's per-subcomponent pricing (run in parallel under
 /// `gam_linalg::faer_ndarray::with_nested_parallel`) it stays on its own thread; inside
 /// `super::combine::map` the blocks' products with the same large matrix (the metric, its roots)
@@ -354,16 +352,8 @@ fn mm<A: ndarray::Data<Elem = f64>, B: ndarray::Data<Elem = f64>>(a: &ndarray::A
 /// The pseudo-inverse and the pseudo-inverse root of a symmetric positive semidefinite matrix,
 /// over its eigenvalues beyond the decomposition's band.
 fn inverses(m: &Array2<f64>) -> Result<(Array2<f64>, Array2<f64>), String> {
-    let d = eigh(symmetric(m).view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
-    // `Q Λ⁻¹ Qᵀ` and `Q Λ^{-1/2} Qᵀ` over the eigenvalues beyond the band, as two products of the
-    // scaled eigenvectors (the dropped ones scaled to zero), each mirrored to exact symmetry.
-    let (mut inverse_factor, mut root_factor) = (d.vectors.clone(), d.vectors.clone());
-    for (i, l) in d.values.iter().enumerate() {
-        let (a, b) = if *l > d.band { (1.0 / l, 1.0 / l.sqrt()) } else { (0.0, 0.0) };
-        inverse_factor.column_mut(i).mapv_inplace(|v| v * a);
-        root_factor.column_mut(i).mapv_inplace(|v| v * b);
-    }
-    Ok((symmetric(&fast_abt(&inverse_factor, &d.vectors)), symmetric(&fast_abt(&root_factor, &d.vectors))))
+    let d = eigh(symmetrize(m).view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
+    Ok((d.map(|l| if l > d.band { 1.0 / l } else { 0.0 }), d.map(|l| if l > d.band { 1.0 / l.sqrt() } else { 0.0 })))
 }
 
 /// Bits of one independent real: a 32-bit literal.
@@ -418,8 +408,8 @@ impl<'a> Block<'a> {
     fn new(u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>, metric: &'a Metric, calibration: f64) -> Self {
         let fu = mm(&metric.fisher, &u.t());
         let cv = mm(&metric.moment, &v.t());
-        let gu = symmetric(&mm(&u, &fu));
-        let gv = symmetric(&mm(&v, &cv));
+        let gu = symmetrize(&mm(&u, &fu));
+        let gv = symmetrize(&mm(&v, &cv));
         let w2 = (&gu * &gv).sum();
         Self { metric, scale: metric.scale() * calibration, fu, cv, gu, gv, w2 }
     }
@@ -500,7 +490,7 @@ fn generic_cores(block: &Block<'_>, sides: &Sides, max_rank: usize) -> Result<Ve
     let a = mm(&*sides.rp, &sides.hl);
     let b = mm(&*sides.rq, &sides.hr);
     let (half, inverse_half) = roots(&mm(&a.t(), &a))?;
-    let core = symmetric(&mm(&mm(&half, &mm(&b.t(), &b)), &half));
+    let core = symmetrize(&mm(&mm(&half, &mm(&b.t(), &b)), &half));
     let decomposed = eigh(core.view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
     let mut order: Vec<usize> = (0..decomposed.values.len()).filter(|i| decomposed.values[*i] > decomposed.band).collect();
     order.sort_by(|x, y| decomposed.values[*y].total_cmp(&decomposed.values[*x]));
@@ -535,7 +525,7 @@ fn generic_core_at(block: &Block<'_>, sides: &Sides, rank: usize) -> Result<Opti
     let a = mm(&*sides.rp, &sides.hl);
     let b = mm(&*sides.rq, &sides.hr);
     let (half, inverse_half) = roots(&mm(&a.t(), &a))?;
-    let core = symmetric(&mm(&mm(&half, &mm(&b.t(), &b)), &half));
+    let core = symmetrize(&mm(&mm(&half, &mm(&b.t(), &b)), &half));
     let decomposed = eigh(core.view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
     let mut order: Vec<usize> = (0..decomposed.values.len()).filter(|i| decomposed.values[*i] > decomposed.band).collect();
     order.sort_by(|x, y| decomposed.values[*y].total_cmp(&decomposed.values[*x]));
@@ -664,9 +654,9 @@ fn paired(writer: &Chart, w: &[usize], reader: &Chart, r: &[usize], sides: &Side
     Ok((out.len() == wo.len()).then_some(out))
 }
 
-/// `log₂ g!`: the bits of a pairing of `g` listed groups with `g` others.
+/// `⌈log₂ g!⌉`: the bits of a pairing of `g` listed groups with `g` others, a whole codeword.
 fn pairing_bits(g: usize) -> f64 {
-    (2..=g).map(|i| (i as f64).log2()).sum()
+    permutation_index_len_bits(g as u64) as f64
 }
 
 /// The rotation-scaling placements of matched two-column groups (`reflections` per pair), the
@@ -884,7 +874,7 @@ impl Prepared {
             return Ok(Self { chart, identity, gram: Gram::Whole(Array2::zeros((0, 0))), group_inverse: Vec::new(), subset_bits, root });
         }
         let weighted = mm(metric, &chart.basis);
-        let gram = if chart.basis.ncols() <= chart.basis.nrows() { Gram::Whole(symmetric(&mm(&chart.basis.t(), &weighted))) } else { Gram::Weighted(weighted) };
+        let gram = if chart.basis.ncols() <= chart.basis.nrows() { Gram::Whole(symmetrize(&mm(&chart.basis.t(), &weighted))) } else { Gram::Weighted(weighted) };
         let mut prepared = Self { chart, identity, gram, group_inverse: Vec::new(), subset_bits, root: None };
         prepared.group_inverse = (0..prepared.chart.groups.len())
             .map(|g| inverses(&prepared.gram(&prepared.chart.indices(&[g]))).map(|x| x.0))
@@ -904,7 +894,7 @@ impl Prepared {
     fn gram(&self, at: &[usize]) -> Array2<f64> {
         match &self.gram {
             Gram::Whole(gram) => gram.select(Axis(0), at).select(Axis(1), at),
-            Gram::Weighted(weighted) => symmetric(&mm(&self.chart.basis.select(Axis(1), at).t(), &weighted.select(Axis(1), at))),
+            Gram::Weighted(weighted) => symmetrize(&mm(&self.chart.basis.select(Axis(1), at).t(), &weighted.select(Axis(1), at))),
         }
     }
 }
@@ -1130,18 +1120,8 @@ pub fn describe(w: &Array2<f64>, rank: usize, metric: &Metric, writers: &[Chart]
 /// `(M^{1/2}, M^{+1/2})` of a symmetric positive semidefinite matrix over its eigenvalues beyond the
 /// band.
 fn roots(m: &Array2<f64>) -> Result<(Array2<f64>, Array2<f64>), String> {
-    let d = eigh(symmetric(m).view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
-    let n = m.nrows();
-    let (mut root, mut inverse) = (Array2::<f64>::zeros((n, n)), Array2::<f64>::zeros((n, n)));
-    for (i, l) in d.values.iter().enumerate() {
-        if *l > d.band {
-            let q = d.vectors.column(i);
-            let outer = q.insert_axis(Axis(1)).dot(&q.insert_axis(Axis(0)));
-            root.scaled_add(l.sqrt(), &outer);
-            inverse.scaled_add(1.0 / l.sqrt(), &outer);
-        }
-    }
-    Ok((root, inverse))
+    let d = eigh(symmetrize(m).view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
+    Ok((d.map(|l| if l > d.band { l.sqrt() } else { 0.0 }), d.map(|l| if l > d.band { 1.0 / l.sqrt() } else { 0.0 })))
 }
 
 
@@ -1188,7 +1168,7 @@ pub fn logit_gauss_newton(
                 site.writes.iter().map(|n| back[*n].clone().unwrap_or_else(|| Array2::zeros(trace.values[*n].dim()))).collect();
             let views: Vec<_> = parts.iter().map(|x| x.view()).collect();
             let g = ndarray::concatenate(Axis(1), &views).map_err(|e| e.to_string())?;
-            *metric += &g.t().dot(&g);
+            *metric += &fast_ata(&g);
         }
     }
     for metric in out.iter_mut() {
@@ -1313,10 +1293,10 @@ pub struct Exact<'a> {
 
 /// `(e^R − 1 − R)/R²` and `(e^{−R} − 1 + R)/R²` (both ½ at `R = 0`).
 fn sandwich(r: f64) -> (f64, f64) {
-    if r < 1e-4 {
-        (0.5 + r / 6.0, 0.5 - r / 6.0)
+    if r == 0.0 {
+        (0.5, 0.5)
     } else {
-        ((r.exp_m1() - r) / (r * r), ((-r).exp_m1() + r) / (r * r))
+        (expm1_minus_x(r) / (r * r), expm1_minus_x(-r) / (r * r))
     }
 }
 
