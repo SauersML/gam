@@ -12,7 +12,8 @@
 //! Other keys: local_export=EXPORT_DIR, local=4, context=512, ascent=0,
 //! deltas=0.05,0.1,0.2, epsilons=0.01,0.03,0.1, parallel=8, batch=1024,
 //! groups= (all declared episode groups), cuda_share_native=0 (opt-in exact GPU parameter reuse),
-//! cuda_local=0 (opt-in CUDA native-parent graft; requires backend=cuda, ascent=0).
+//! cuda_local=1 by default with backend=cuda and ascent=0 (resident native-parent
+//! graft and row-norm reduction); cuda_local=0 explicitly retains the CPU reference.
 //! A bank entry names either an `artifact` path or `copy_masks`, one head bitmask
 //! per native layer. Explicit masks are proposals, measured afresh by the same acceptance path.
 //! SHA-256 input manifests require sha256sum
@@ -198,7 +199,8 @@ fn main() -> Result<(), String> {
     let native = split_sites(&imported.program)?;
     let run = LanguageRun::new(&decoder, &native, &spec, &run_passages, parallel)?;
     let backend = key("backend", "cpu");
-    let cuda_local = number("cuda_local", 0)?;
+    let ascent_evaluations = number("ascent", 0)?;
+    let cuda_local = number("cuda_local", usize::from(backend == "cuda" && ascent_evaluations == 0))?;
     if cuda_local > 1 || (cuda_local == 1 && backend != "cuda") {
         return Err("cuda_local must be 0 or 1; 1 requires backend=cuda".into());
     }
@@ -227,7 +229,6 @@ fn main() -> Result<(), String> {
     let local_export = PathBuf::from(key("local_export", &export.display().to_string()));
     input_paths.extend([local_export.join("export.json"), local_export.join("tokens.f64")]);
     let local_family = family(&passages(&local_export, context)?, count, context)?;
-    let ascent_evaluations = number("ascent", 0)?;
     let ascent = if ascent_evaluations == 0 {
         None
     } else {
@@ -236,7 +237,7 @@ fn main() -> Result<(), String> {
         Some(Ascent { domain: vec![SlotDomain::Tokens((0..vocab).collect())], pool: Vec::new(), evaluations: ascent_evaluations })
     };
     let local = Local::new(&native, local_family.clone(), ascent, batch);
-    let local = match local_device { Some((device, limit)) => local.with_cuda(device, limit)?, None => local };
+    let local = match local_device { Some((device, limit)) => local.with_cuda(device, limit)?.with_cuda_resident_norms()?, None => local };
     // Decode the native source once: exact interface/body interning then shares
     // unchanged tensors across index compaction, ignoring disposable decoder labels.
     let native_artifact = Artifact::native(&native)?.f32_literals()?;
