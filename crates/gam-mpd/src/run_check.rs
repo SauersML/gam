@@ -772,12 +772,14 @@ impl<'a> LanguageRun<'a> {
         donor: &BTreeMap<DonorKey, Array1<f64>>,
         record: &[DonorKey],
         residuals: &[usize],
+        base: Option<&crate::artifact_device::Resident>,
     ) -> Result<(Vec<Array2<f64>>, BTreeMap<DonorKey, Array1<f64>>), String> {
         let family = self.family(passage);
         if let Some(device) = &self.device {
-            // One full genuine artifact compiled at a time. Its unchanged dense
-            // head remains streamed, avoiding rows x vocabulary materialization.
-            let resident = crate::artifact_device::Resident::from_decoded(device, program)?;
+            // Share this candidate's unchanged operator tensors across graph forks.
+            // Each episode still owns only its own live intermediate trace.
+            let base = base.ok_or("CUDA run has no candidate base resident")?;
+            let resident = crate::artifact_device::Resident::from_decoded_sharing(base, program)?;
             let estimate = resident.estimated_intermediate_bytes(family.rows)?;
             if estimate > self.trace_bytes_limit {
                 return Err(format!("CUDA intermediate values need at least {estimate} bytes, exceeding declared trace limit {}", self.trace_bytes_limit));
@@ -877,6 +879,7 @@ impl RunCheck for LanguageRun<'_> {
         let decoder = self.decoder;
         let head_dim = self.native.node_interface(self.layers[0].reads[0]).map_err(|e| e.to_string())?.width();
         let (program, residuals) = self.truncated(artifact)?;
+        let base = self.device.as_ref().map(|device| crate::artifact_device::Resident::from_decoded(device, &program)).transpose()?;
         let teachers = self.teacher_episodes()?;
         // Each episode's edits of P, and the donor states they read.
         let mut plans = Vec::with_capacity(self.spec.episodes.len());
@@ -909,7 +912,8 @@ impl RunCheck for LanguageRun<'_> {
             }
             plans.push((episode_program, episode_residuals, edits, unheld));
         }
-        let make_donor = |(d, keys): (&usize, &Vec<DonorKey>)| Ok((*d, self.run(&program, *d, &BTreeMap::new(), &BTreeMap::new(), keys, &residuals)?.1));
+        let make_donor =
+            |(d, keys): (&usize, &Vec<DonorKey>)| Ok((*d, self.run(&program, *d, &BTreeMap::new(), &BTreeMap::new(), keys, &residuals, base.as_ref())?.1));
         let own_donors: BTreeMap<usize, BTreeMap<DonorKey, Array1<f64>>> = if self.device.is_some() {
             wanted.iter().map(make_donor).collect::<Result<_, String>>()?
         } else {
@@ -923,7 +927,7 @@ impl RunCheck for LanguageRun<'_> {
          -> Result<EpisodeScore, String> {
             let reference = &teachers.residuals[index];
             let own = episode.donor.and_then(|d| own_donors.get(&d)).unwrap_or(&empty);
-            let (states, _) = self.run(episode_program, episode.passage, edits, own, &[], episode_residuals)?;
+            let (states, _) = self.run(episode_program, episode.passage, edits, own, &[], episode_residuals, base.as_ref())?;
             let explained = Forward {
                 residual: states.last().ok_or("no residual")?.clone(),
                 layers: states.iter().map(|x| x.select(Axis(0), &episode.interface_rows)).collect(),

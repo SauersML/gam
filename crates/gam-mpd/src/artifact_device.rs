@@ -98,6 +98,17 @@ impl Resident {
         if device.is_host() || !device.float64() {
             return Err("artifact device needs a float64 accelerator".into());
         }
+        Self::compile_decoded(device, candidate, None)
+    }
+    /// Share only identical operator Arcs in identical executable roles with this
+    /// candidate's base resident; graph edits and root mappings remain independent.
+    pub fn from_decoded_sharing(from: &Self, candidate: &Artifact) -> Result<Self, String> {
+        if from.program.device().is_host() || !from.program.device().float64() {
+            return Err("artifact device needs a float64 accelerator".into());
+        }
+        Self::compile_decoded(from.program.device(), candidate, Some(from))
+    }
+    fn compile_decoded(device: &Device, candidate: &Artifact, from: Option<&Self>) -> Result<Self, String> {
         candidate.program.interfaces().map_err(|e| e.to_string())?;
         let artifact = candidate.clone();
         let (flat, map) = mapped_inlined(&artifact.program)?;
@@ -112,7 +123,10 @@ impl Resident {
                 return Err("artifact feature-node exceptions need unsupported token-basis materialization".into());
             }
         }
-        let program = DeviceProgram::compile(device, &flat)?;
+        let program = match from {
+            Some(base) => DeviceProgram::compile_sharing(&base.program, &flat)?,
+            None => DeviceProgram::compile(device, &flat)?,
+        };
         let roots = map.iter().enumerate().map(|(old, &new)| (new, old)).collect();
         Ok(Self { artifact, map, roots, program, output })
     }
@@ -441,6 +455,40 @@ mod tests {
             for (a, b) in values.iter().zip(expected.values[root].iter()) {
                 assert!((a - b).abs() < 1e-10);
             }
+        }
+    }
+    #[test]
+    fn shared_resident_keeps_independent_root_edits_and_decoded_values() {
+        let dir = crate::explanation_tests::tiny_export("shared_device_resident", 2);
+        let imported = crate::import::import_language_model(&dir, 1, 12).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        let artifact = Artifact::native(&imported.program).unwrap();
+        let family = imported.contract.family;
+        let root = artifact
+            .program
+            .nodes
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, n)| matches!(n, Node::Affine { terms, .. } if terms.len() == 2).then_some(i))
+            .unwrap();
+        let device = Device::host();
+        let base = Resident::compile_decoded(&device, &artifact, None).unwrap();
+        assert!(Resident::from_decoded_sharing(&base, &artifact).is_err(), "public sharing must refuse host fallback");
+        let mut changed = artifact.clone();
+        changed.exceptions.push(Exception { context: contexts(&family)[0].clone(), node: root, column: 0, value: 0.375 });
+        let expected = changed.execute(&family).unwrap();
+        // Test-only tensor reference exercises the same shared compilation path.
+        let shared = Resident::compile_decoded(&device, &changed, Some(&base)).unwrap();
+        let fresh = Resident::compile_decoded(&device, &changed, None).unwrap();
+        assert!(Arc::ptr_eq(&base.artifact.program.operators[0], &shared.artifact.program.operators[0]));
+        let a = shared.forward_edited_intermediates(&family, |_, _| Ok(None)).unwrap();
+        let b = fresh.forward_edited_intermediates(&family, |_, _| Ok(None)).unwrap();
+        let a = device.download(shared.root_value(&a, root).unwrap()).unwrap();
+        let b = device.download(fresh.root_value(&b, root).unwrap()).unwrap();
+        assert_eq!(a, b);
+        for (a, b) in a.iter().zip(expected.values[root].iter()) {
+            assert!((a - b).abs() < 1e-10);
         }
     }
 }
