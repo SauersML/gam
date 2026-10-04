@@ -602,11 +602,6 @@ impl Masked {
         self.ranks[k].len()
     }
 
-    /// Every site's number of blocks.
-    pub fn all_blocks(&self) -> Vec<usize> {
-        self.ranks.iter().map(Vec::len).collect()
-    }
-
     /// Whether every block of site `k` is a single piece (its masks are per column).
     pub fn is_rank_one(&self, k: usize) -> bool {
         self.ranks[k].len() == self.pieces[k]
@@ -669,57 +664,6 @@ impl Masked {
             return Err(format!("{}: its map was released", self.sites[k].name));
         }
         matrix(&self.program, &self.sites[k])
-    }
-
-    /// Restrict site `k`'s pieces to the reads they act on: `v_c ← P v_c`, `P` the projector on the
-    /// leading eigendirections of the reads' second moment `E[x xᵀ]` (from the reads' mean
-    /// `data_mean` and covariance) that hold all but `left_out` of it. What a piece
-    /// reads off that span is unidentified by the data, costs library bits, and acts unpredictably
-    /// on an edited input. Returns the dimension kept.
-    pub fn project_reads(&mut self, k: usize, data_mean: &Array1<f64>, covariance: &Array2<f64>, left_out: f64) -> Result<usize, String> {
-        let shift = data_mean;
-        let mut moment = covariance + &shift.view().insert_axis(Axis(1)).dot(&shift.view().insert_axis(Axis(0)));
-        let n = moment.nrows();
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let v = 0.5 * (moment[[i, j]] + moment[[j, i]]);
-                moment[[i, j]] = v;
-                moment[[j, i]] = v;
-            }
-        }
-        let decomposed = super::dense::eigh(moment.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
-        let total: f64 = decomposed.values.iter().map(|l| l.max(0.0)).sum();
-        // Eigenvalues ascend: keep from the top until all but `left_out` is held.
-        let (mut held, mut kept) = (0.0, 0);
-        for l in decomposed.values.iter().rev() {
-            if held >= (1.0 - left_out) * total {
-                break;
-            }
-            held += l.max(0.0);
-            kept += 1;
-        }
-        let basis = decomposed.vectors.slice(s![.., n - kept..]);
-        let projector = basis.dot(&basis.t());
-        let mut library = self.library(k)?;
-        library.v = library.v.dot(&projector);
-        // Each read block `V_j = (V B)(Bᵀ)_j` is held factored wherever its two products cost
-        // fewer operations per input than the dense one.
-        let factor = library.v.dot(&basis);
-        self.set_library(k, library)?;
-        let pieces = self.pieces[k];
-        let ro = self.read_offsets[k].clone();
-        for (j, &op) in self.v_ops[k].clone().iter().enumerate() {
-            let width = ro[j + 1] - ro[j];
-            if kept * (width + pieces) < width * pieces {
-                let old = &self.program.operators[op];
-                let right = basis.slice(s![ro[j]..ro[j + 1], ..]).t().to_owned();
-                self.program.operators[op] = Arc::new(
-                    Operator::low_rank(old.name.clone(), old.rows.clone(), old.cols.clone(), factor.clone(), right, fine(), Provenance::default())
-                        .map_err(|e| e.to_string())?,
-                );
-            }
-        }
-        Ok(kept)
     }
 
     /// Drop what only the pieces' training reads, for a selection-only fit: the replaced site
@@ -933,22 +877,6 @@ fn score_only_untimed(masked: &Masked, family: &FamilyInputs, target: &Target) -
     // Only the KL is read, so each site's `z` is evaluated at its mask's nonzeros alone.
     let trace = masked.program.execute_gated(family, &masked.gates()).map_err(|e| e.to_string())?;
     Ok(kl_score_only(target, &*logits(masked, family, &trace, target)?))
-}
-
-/// The float64 KL per input and the logits it scores, on the program's device twin when it has
-/// one (module note, "Devices").
-pub fn kl_and_logits(masked: &Masked, family: &FamilyInputs, target: &Target) -> Result<(Array1<f64>, Array2<f64>), String> {
-    let lowered = masked.on_device(|accelerated| {
-        let state = accelerated.forward(family, &accelerated.target(target)?)?;
-        let logits = accelerated.program().logits(&state.trace, 0, state.trace.rows)?;
-        Ok((state.kl, logits))
-    })?;
-    if let Some(out) = lowered {
-        return Ok(out);
-    }
-    let (values, trace) = scored_forward(masked, family, target)?;
-    let logits = logits(masked, family, &trace, target)?.into_owned();
-    Ok((values, logits))
 }
 
 /// An attack on the box claim, per input (module note, "Claims"): the worst excess over the masks'
@@ -1742,43 +1670,6 @@ pub fn site_statistics(
         .collect())
 }
 
-/// Per-input samples of `sites` for [`super::pieces::attribution_dictionary`], over `batches` of
-/// inputs to the native program: every input's reads and the gradient at the written value of
-/// `−log q_y`, one label `y` per input drawn from the program's own output (single precision).
-pub fn site_attributions(
-    program: &OperatorProgram,
-    sites: &[Site],
-    batches: impl IntoIterator<Item = FamilyInputs>,
-    seed: u64,
-) -> Result<Vec<super::pieces::Attributions>, String> {
-    let mut rng = XorShift(seed | 1);
-    let mut reads: Vec<Vec<Array2<f32>>> = vec![Vec::new(); sites.len()];
-    let mut gradients: Vec<Vec<Array2<f32>>> = vec![Vec::new(); sites.len()];
-    for inputs in batches {
-        let trace = program.execute(&inputs, false).map_err(|e| e.to_string())?;
-        let cotangent = sampled_cotangent(&trace.values[program.output], &mut rng, None);
-        let back = proposing(|| vjp(program, &inputs, &trace, cotangent)).map_err(|e| e.to_string())?;
-        for (k, site) in sites.iter().enumerate() {
-            reads[k].push(read_values(&trace, site)?.mapv(|v| v as f32));
-            let written: Vec<Array2<f64>> =
-                site.writes.iter().map(|n| back[*n].clone().unwrap_or_else(|| Array2::zeros(trace.values[*n].dim()))).collect();
-            let views: Vec<_> = written.iter().map(|w| w.view()).collect();
-            gradients[k].push(ndarray::concatenate(Axis(1), &views).map_err(|e| e.to_string())?.mapv(|v| v as f32));
-        }
-    }
-    reads
-        .into_iter()
-        .zip(gradients)
-        .map(|(x, g)| {
-            let stack = |parts: Vec<Array2<f32>>| -> Result<Array2<f32>, String> {
-                let views: Vec<_> = parts.iter().map(|p| p.view()).collect();
-                ndarray::concatenate(Axis(0), &views).map_err(|e| e.to_string())
-            };
-            Ok(super::pieces::Attributions { reads: stack(x)?, gradients: stack(g)? })
-        })
-        .collect()
-}
-
 /// The Fisher diagonal of every mask entry and, when `written`, the Fisher of every written node,
 /// from `samples` sampled-label reverse passes on the target's scored rows: per site
 /// `(h: rows × B, F: d_out × d_out)`. The selection needs only `h`; `F` (the pieces'
@@ -2007,14 +1898,6 @@ impl Context {
             counts.iter().zip(origins).map(|(c, o)| o.iter().map(|&i| c[i]).collect()).collect()
         };
         Self { stayed: map(&self.stayed), was_on: map(&self.was_on), new: map(&self.new) }
-    }
-
-    /// The counts of a library with `added[k]` new pieces appended to site `k`, never seen yet.
-    pub fn extended(&self, added: &[usize]) -> Self {
-        let grow = |counts: &[Array1<f64>]| -> Vec<Array1<f64>> {
-            counts.iter().zip(added).map(|(c, a)| c.iter().copied().chain(std::iter::repeat_n(0.0, *a)).collect()).collect()
-        };
-        Self { stayed: grow(&self.stayed), was_on: grow(&self.was_on), new: grow(&self.new) }
     }
 
     /// The coder these counts give, for inputs whose previous inputs are `previous`.
@@ -3153,40 +3036,6 @@ impl BoxTerms {
         }
         Ok(Self { sites })
     }
-}
-
-/// Each site's read mean and second moment about it, `E[(x − μ)(x − μ)ᵀ]`, on the native program
-/// over `batches` of inputs (forward passes only).
-pub fn site_second_moments(
-    program: &OperatorProgram,
-    sites: &[Site],
-    batches: impl IntoIterator<Item = FamilyInputs>,
-) -> Result<Vec<(Array1<f64>, Array2<f64>)>, String> {
-    let mut sums: Vec<(Array1<f64>, Array2<f64>)> = Vec::new();
-    let mut rows = 0.0;
-    for inputs in batches {
-        let trace = program.execute(&inputs, false).map_err(|e| e.to_string())?;
-        for (k, site) in sites.iter().enumerate() {
-            let x = read_values(&trace, site)?;
-            if sums.len() <= k {
-                sums.push((Array1::zeros(x.ncols()), Array2::zeros((x.ncols(), x.ncols()))));
-            }
-            sums[k].0 += &x.sum_axis(Axis(0));
-            sums[k].1 += &fast_atb(&x, &x);
-        }
-        rows += inputs.rows as f64;
-    }
-    if rows == 0.0 {
-        return Err("second moments need inputs".to_string());
-    }
-    Ok(sums
-        .into_iter()
-        .map(|(sum, outer)| {
-            let mean = sum / rows;
-            let second = outer / rows - &mean.view().insert_axis(Axis(1)).dot(&mean.view().insert_axis(Axis(0)));
-            (mean, second)
-        })
-        .collect())
 }
 
 /// Grow a site's library by splitting every piece that its active inputs use in two ways

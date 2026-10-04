@@ -2,7 +2,7 @@
 //! The Fisher-whitened singular pieces of a map are the map exactly, and are orthogonal in the
 //! whitened metric.
 
-use super::pieces::{Attributions, Narrow, Site, Units, attribution_dictionary, fisher_svd, fisher_svd_narrow, unit_pieces};
+use super::pieces::{Narrow, Site, Units, fisher_svd, fisher_svd_narrow, unit_pieces};
 use ndarray::{Array1, Array2, Axis};
 
 fn noise(seed: usize) -> f64 {
@@ -84,25 +84,4 @@ fn unit_pieces_are_the_map_one_unit_each() {
         assert!(library.exactness(&w) < 1e-15, "{side:?}");
         assert_eq!(library.u.nrows(), if side == Units::Written { D_OUT } else { D_IN });
     }
-}
-
-/// Inputs in two groups, each using the map through its own rank-one direction (reads and
-/// gradients each along one direction per group, of either sign): the dictionary
-/// finds atoms that carry most of the inputs' attribution energy, and with the remainder appended
-/// all pieces on is the map.
-#[test]
-fn the_attribution_dictionary_carries_grouped_inputs_and_is_the_map() {
-    let rows = 400;
-    let directions_in = [Array1::from_shape_fn(D_IN, |i| noise(70 + i)), Array1::from_shape_fn(D_IN, |i| noise(90 + i))];
-    let directions_out = [Array1::from_shape_fn(D_OUT, |i| noise(170 + i)), Array1::from_shape_fn(D_OUT, |i| noise(190 + i))];
-    let x = Array2::from_shape_fn((rows, D_IN), |(t, i)| directions_in[t % 2][i] * noise(3000 + t) + 0.05 * noise(10 + D_IN * t + i));
-    let g = Array2::from_shape_fn((rows, D_OUT), |(t, i)| directions_out[t % 2][i] * noise(5000 + t) + 0.05 * noise(9000 + D_OUT * t + i));
-    let w = Array2::from_shape_fn((D_OUT, D_IN), |(i, j)| noise(500 + D_IN * i + j));
-    let mean: Array1<f64> = x.mean_axis(Axis(0)).expect("rows");
-    let site = Site { w: w.clone(), second_moment: x.t().dot(&x) / rows as f64, mean, fisher: g.t().dot(&g) / rows as f64 };
-    let samples = Attributions { reads: x.mapv(|v| v as f32), gradients: g.mapv(|v| v as f32) };
-    let (library, report) = attribution_dictionary(&site, &samples, 8, 1000.0, 0.0, 7).expect("dictionary");
-    assert!(library.exactness(&w) < 1e-9, "{}", library.exactness(&w));
-    assert!(report.kept >= 1 && report.kept <= 8, "{report:?}");
-    assert!(report.captured > 0.5, "{report:?}");
 }
