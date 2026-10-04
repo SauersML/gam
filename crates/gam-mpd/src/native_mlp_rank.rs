@@ -52,6 +52,24 @@ pub struct CorrectionRankFloor {
     pub rank: usize,
     pub affine_correction: ResidualFloor,
 }
+/// Jointly optimizes an unrestricted affine base and rank-limited correction
+/// on the supplied rows. This lower bound relaxes the correction's input law.
+#[derive(Clone, Debug, Serialize)]
+pub struct AffineCorrectionRankCurve {
+    pub rows: usize,
+    pub input_width: usize,
+    pub output_width: usize,
+    pub native_frobenius_norm: f64,
+    pub native_norm_error: f64,
+    pub design_smallest_singular_lower: f64,
+    pub design_svd_validation: SvdValidation,
+    pub projection_operator_error_upper: f64,
+    pub residual_arithmetic_error_upper: f64,
+    pub residual_comparison_error_upper: f64,
+    pub residual_svd_validation: SvdValidation,
+    pub singular_values: Vec<f64>,
+    pub corrections: Vec<CorrectionRankFloor>,
+}
 /// A posteriori validation, independent of the decomposition's resolution cutoff.
 #[derive(Clone, Debug, Serialize)]
 pub struct SvdValidation {
@@ -318,6 +336,122 @@ pub fn measured_fixed_base_rank_curve(
         corrections,
     })
 }
+
+/// Let D=[inputs,1], P be the orthogonal projector onto its column space, and
+/// Y be native writes. In exact arithmetic,
+///
+/// min_{Theta, rank(C)<=K} ||Y-D*Theta-C||F = tail_K((I-P)*Y).
+///
+/// Projecting any candidate error by I-P gives the lower bound: it eliminates
+/// D*Theta and cannot increase rank(C) or Frobenius norm. Least squares plus
+/// the truncated residual SVD attains it. Dividing by ||Y||F lower-bounds the
+/// maximum-row error normalized by native-row RMS. This is not an upper bound
+/// on that maximum, and the relaxed correction need not have a cheap input law.
+///
+/// This implementation requires *validated full column rank* of D. It never
+/// discards unresolved small singular directions: with unrestricted Theta even
+/// a tiny nonzero direction can matter. Rank-unresolved designs return an error.
+/// All statements concern these fixed finite arrays and exact affine/rank
+/// membership, not neural execution roundoff, other inputs, or Run fidelity.
+pub fn measured_affine_correction_rank_curve(
+    inputs: &Array2<f64>,
+    native: &Array2<f64>,
+    ranks: &[usize],
+) -> Result<AffineCorrectionRankCurve, String> {
+    let (rows, input_width) = inputs.dim();
+    let output_width = native.ncols();
+    if rows == 0 || input_width == 0 || output_width == 0 || native.nrows() != rows {
+        return Err("aligned nonempty input and native-write families required".into());
+    }
+    let columns = input_width
+        .checked_add(1)
+        .ok_or("affine design width overflow")?;
+    if rows < columns {
+        return Err("affine design cannot have full column rank on these rows".into());
+    }
+    let native_norm = norm(native.iter().copied())?;
+    let native_upper = if native_norm.0 == 0.0 {
+        0.0
+    } else {
+        mul_up(upper(native_norm), add_up(1.0, gamma(native.len() + 4)?))
+    };
+    norm(inputs.iter().copied())?;
+    let design = Array2::from_shape_fn((rows, columns), |(i, j)| {
+        if j == input_width {
+            1.0
+        } else {
+            inputs[[i, j]]
+        }
+    });
+    let ds = svd(design.view(), false).map_err(|e| e.to_string())?;
+    let dv = validate_svd(&design, &ds)?;
+    let smallest = (*ds.singular_values.last().ok_or("empty affine design SVD")?
+        - dv.singular_value_enclosure)
+        .next_down();
+    if smallest <= 0.0 || !smallest.is_finite() {
+        return Err("affine design full column rank is numerically unresolved".into());
+    }
+    // A nearby orthonormal Uhat spans an exact matrix Dhat with ||D-Dhat||2
+    // <= eta. Equal ranks give ||P_D-P_Uhat||2 <= eta/sigma_min(D).
+    // Also ||U*U^T-P_Uhat||2 <= ||U^T*U-I||2, validated in dv.
+    let projection_error = add_up(
+        dv.left_orthogonality_defect_upper,
+        (dv.singular_value_enclosure / smallest).next_up(),
+    );
+    let u_norm = upper(norm(ds.u.iter().copied())?);
+    let y_norm = upper(native_norm);
+    let amplitudes = ds.u.t().dot(native);
+    let a_norm = upper(norm(amplitudes.iter().copied())?);
+    let projected = ds.u.dot(&amplitudes);
+    let p_norm = upper(norm(projected.iter().copied())?);
+    let residual = native - &projected;
+    let first_error = dot_error(rows, u_norm, y_norm, amplitudes.len())?;
+    let arithmetic = add_up(
+        mul_up(u_norm, first_error),
+        add_up(
+            dot_error(columns, u_norm, a_norm, projected.len())?,
+            subtract_error(y_norm, p_norm, native.len()),
+        ),
+    );
+    let residual_error = add_up(arithmetic, mul_up(projection_error, y_norm));
+    if !residual_error.is_finite() {
+        return Err("affine residual comparison overflow".into());
+    }
+    let rs = svd(residual.view(), false).map_err(|e| e.to_string())?;
+    let rv = validate_svd(&residual, &rs)?;
+    let mut corrections = Vec::with_capacity(ranks.len());
+    for &rank in ranks {
+        let tail = norm(rs.singular_values.iter().skip(rank).copied())?;
+        let count = rs.singular_values.len().saturating_sub(rank);
+        let spectral_error = mul_up(
+            rv.singular_value_enclosure,
+            (count.max(1) as f64).sqrt().next_up(),
+        );
+        corrections.push(CorrectionRankFloor {
+            rank,
+            affine_correction: floor(
+                tail.0,
+                add_up(tail.1, add_up(spectral_error, residual_error)),
+                native_upper,
+            )?,
+        });
+    }
+    Ok(AffineCorrectionRankCurve {
+        rows,
+        input_width,
+        output_width,
+        native_frobenius_norm: native_norm.0,
+        native_norm_error: (native_upper - native_norm.0).max(native_norm.1).next_up(),
+        design_smallest_singular_lower: smallest,
+        design_svd_validation: dv,
+        projection_operator_error_upper: projection_error,
+        residual_arithmetic_error_upper: arithmetic,
+        residual_comparison_error_upper: residual_error,
+        residual_svd_validation: rv,
+        singular_values: rs.singular_values.to_vec(),
+        corrections,
+    })
+}
 /// For any predictions in a K-dimensional affine output space, centering makes
 /// their matrix rank at most K. Eckart–Young bounds Frobenius error below by the
 /// singular-value tail of centered native writes. Since max-row >= Frobenius/√n
@@ -424,6 +558,106 @@ pub fn measured_rank_floor(
 mod tests {
     use super::*;
     use ndarray::array;
+    #[test]
+    fn joint_affine_floor_is_attained_by_orthogonal_residual_truncation() {
+        let x = array![[-1.0], [-1.0], [1.0], [1.0]];
+        let u = [1.0, -1.0, 1.0, -1.0];
+        let v = [1.0, -1.0, -1.0, 1.0];
+        let y = Array2::from_shape_fn((4, 2), |(i, j)| {
+            if j == 0 {
+                10.0 * x[[i, 0]] + 5.0 + 2.0 * u[i]
+            } else {
+                20.0 * x[[i, 0]] - 2.0 + v[i]
+            }
+        });
+        let curve = measured_affine_correction_rank_curve(&x, &y, &[0, 1, 2]).unwrap();
+        let denom = 2136.0_f64.sqrt();
+        for (point, tail) in curve.corrections.iter().zip([20.0_f64.sqrt(), 2.0, 0.0]) {
+            let lower = point.affine_correction.necessary_local_lower.unwrap();
+            assert!(lower <= tail / denom + 1e-15);
+            assert!((lower - tail / denom).abs() < 1e-9);
+        }
+        // Rank-one correction C=[2u,0] leaves v in the second coordinate.
+        // Each residual row has norm1, so max-row/RMS attains the rank1 floor.
+        assert!(
+            (curve.corrections[1]
+                .affine_correction
+                .necessary_local_lower
+                .unwrap()
+                - 1.0 / (denom / 2.0))
+                .abs()
+                < 1e-9
+        );
+        let fixed_zero = measured_fixed_base_rank_curve(&y, &Array2::zeros(y.dim()), &[0]).unwrap();
+        assert!(
+            fixed_zero.corrections[0]
+                .affine_correction
+                .necessary_local_lower
+                .unwrap()
+                > 0.9
+        );
+        assert!(
+            curve.corrections[0]
+                .affine_correction
+                .necessary_local_lower
+                .unwrap()
+                < 0.1
+        );
+    }
+    #[test]
+    fn joint_affine_floor_is_invariant_to_invertible_input_coordinates() {
+        let x = array![[-1.0], [-1.0], [1.0], [1.0]];
+        let y = array![[1.0, 1.0], [-1.0, -1.0], [1.0, -1.0], [-1.0, 1.0]];
+        let a = measured_affine_correction_rank_curve(&x, &y, &[0, 1]).unwrap();
+        let b = measured_affine_correction_rank_curve(&x.mapv(|v| 3.0 + 10.0 * v), &y, &[0, 1])
+            .unwrap();
+        for (a, b) in a.corrections.iter().zip(&b.corrections) {
+            assert!(
+                (a.affine_correction.necessary_local_lower.unwrap()
+                    - b.affine_correction.necessary_local_lower.unwrap())
+                .abs()
+                    < 1e-9
+            );
+        }
+    }
+    #[test]
+    fn joint_affine_floor_rejects_unresolved_design_rank() {
+        let y = array![[1.0], [2.0], [3.0], [4.0]];
+        // Constant input duplicates the automatically included intercept.
+        assert!(
+            measured_affine_correction_rank_curve(&Array2::ones((4, 1)), &y, &[0])
+                .unwrap_err()
+                .contains("rank")
+        );
+        let x = array![[1e-30], [-1e-30], [1e-30], [-1e-30]];
+        // This direction cannot be dropped: unbounded affine coefficients could
+        // amplify it. Return unresolved rather than a positive error floor.
+        assert!(
+            measured_affine_correction_rank_curve(&x, &y, &[0])
+                .unwrap_err()
+                .contains("rank")
+        );
+        assert!(
+            measured_affine_correction_rank_curve(&Array2::ones((1, 2)), &array![[1.0]], &[0])
+                .is_err()
+        );
+    }
+    #[test]
+    fn joint_affine_floor_vanishes_for_exact_affine_outputs() {
+        let x = array![[-2.0], [-1.0], [1.0], [2.0]];
+        let y = Array2::from_shape_fn((4, 2), |(i, j)| (j + 1) as f64 * x[[i, 0]] + 3.0);
+        let curve = measured_affine_correction_rank_curve(&x, &y, &[0]).unwrap();
+        assert_eq!(
+            curve.corrections[0].affine_correction.necessary_local_lower,
+            Some(0.0)
+        );
+        let zeros =
+            measured_affine_correction_rank_curve(&x, &Array2::zeros((4, 2)), &[0]).unwrap();
+        assert_eq!(
+            zeros.corrections[0].affine_correction.necessary_local_lower,
+            None
+        );
+    }
     #[test]
     fn fixed_full_rank_base_escapes_low_rank_output_restriction() {
         let native = array![[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]];
