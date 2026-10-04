@@ -46,7 +46,7 @@ while :; do
         g=$(gpus_of "$b")
         g=${g:-0} m=$(gb_of "$m")
         ours=0
-        grep -qx "$id" "$held" && ours=1
+        grep -Fqx "$id" "$held" && ours=1
         [ "$reason" = JobHeldUser ] && (( ours == 0 )) && continue
         # Waiting on another job (a build): it can't start, so it takes no room until it can.
         [ "$reason" = Dependency ] && continue
@@ -62,6 +62,6 @@ while :; do
         elif [ "$reason" != JobHeldUser ]; then
             scontrol hold "$id" && echo "$id" >> "$held" && echo "$(date +%T) held $id $name ($c CPUs, $g GPUs, ${m}G; room $room_c CPUs, $room_g GPUs, ${room_m}G)"
         fi
-    done < <(squeue -u "$USER" -h -t PD -S V -o '%i %j %C %b %m %r' | sort -s -n -k3,3)
+    done < <(squeue -r -u "$USER" -h -t PD -S V -o '%i %j %C %b %m %r' | sort -s -n -k3,3)
     sleep 60
 done
