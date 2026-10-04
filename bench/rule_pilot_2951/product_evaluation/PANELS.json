@@ -1,0 +1,25 @@
+{
+  "training": {
+    "export_json_sha256": "b0f8d6d4328df06cd464d999bc1d1da4d1431334d21cdaf2e9e5e1edc9f4bc73",
+    "token_file_sha256": "3d3f433d603e834a32b573e4fb31b1a20c792eabb49f1af68078b094a175586c",
+    "input_positions": "first8complete512sequences, corpus val rows2048..2055",
+    "rows": 4096
+  },
+  "standalone_validation": {
+    "export_json_sha256": "18fdb8ff6adb2c38e42d27e8772bd391cc841dc2076e9605c2c7731d0c85449a",
+    "token_file_sha256": "9938c3b6995c4c1b9f74b7bf26b7a17a991941952de9a2e6598fec95003ca8cf",
+    "input_positions": "frontier rows16,17, corresponding corpus val rows1040,1041",
+    "rows": 1024,
+    "native_rms": 5.813256419655365,
+    "f64_saved_error": 1.8988319276877217
+  },
+  "full_native_Local_Run": {
+    "export_json_sha256": "1af0aface5a0ca843624310daac12c0ff770a0cc24aa96550c130d11de77bb68",
+    "token_file_sha256": "43f6e89aa7da1c8e181f56ceb81b5953cfa485ee74005665d720bd7269be15d2",
+    "input_positions": "first2complete512sequences of frontier32: corpus val rows1024,1025",
+    "rows": 1024,
+    "native_rms": 5.902691471709387,
+    "local_relative_error": 1.4988783467039601
+  },
+  "comparison": "These are different evaluation token panels. Standalone validation1.8988 and Local1.4989 are not identical-data measurements; no unexplained difference is assigned to batching."
+}

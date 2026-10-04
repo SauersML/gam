@@ -1,0 +1,20 @@
+{
+  "measure": {
+    "blocks": [
+      {
+        "lower": 1.49887834665335,
+        "lower_row": 587,
+        "name": "arithmetic-mlp-0",
+        "numerical_error": 5.060996066674762e-11,
+        "row": 587,
+        "scale": 5.902691471709387,
+        "upper": 1.4988783467545703,
+        "worst": 1.4988783467039601
+      }
+    ],
+    "counterexamples": 0,
+    "family_rows": 1024,
+    "rows": 1024
+  },
+  "seconds": 1.561791962
+}

@@ -1,0 +1,54 @@
+{
+  "status": "frozen before evaluation",
+  "fit_job": 15889,
+  "layer": 0,
+  "fitted_sha256": "19eb773d34af581d5ab05a65656019811b6744927e266a894f44d70fcc9582f9",
+  "native_checkpoint_sha256": "155e0e9ee8f899ab100bdb84224751308ae86ed57f746dbea403b93276a96552",
+  "spec_sha256": "3c05b66324dfb02e33da7eff98784a7ec432123e24fea78018b892efb4256436",
+  "local_sequences": 2,
+  "context": 512,
+  "local_boundary": "fixed native normalized MLP input to pure MLP contribution, per-block nativeRMS",
+  "run_episodes": 80,
+  "run_despite_local_failure": "prespecified diagnostic, no acceptance threshold weakening",
+  "body": "supplied Hadamard of two full-width learned biased vectors; restricted quadratic, not discovered sharedbody",
+  "control": "explicit paid whole-hidden uniform Scale mapping only, no invented per-neuron identity",
+  "cost": "fullsaveddecodedartifactC32, retainednativecomputation included",
+  "arithmetic": "F64 resident execution, resident native head and fixed raw-logit device metric; Local final-write/RMS enclosure, not whole neural arithmetic certificate",
+  "resources": {
+    "gpu": 1,
+    "cpus": 4,
+    "host_gib": 16,
+    "wall_minutes": 15,
+    "trace_bytes": 1073741824
+  },
+  "input_scope": "archived previously examined evaluation passages, not untouched confirmation",
+  "previous_attempt": {
+    "job": 15896,
+    "status": "failed before GPU fidelity",
+    "cause": "typed interface grouping mismatch, fixed by d1314708 helper, no weight change"
+  },
+  "resident_budgets": {
+    "aggregate_numeric_bytes": 12884901888,
+    "teacher_bytes": 536870912,
+    "operator_bytes": 2147483648,
+    "edit_bytes": 536870912,
+    "readout_resident_bytes": 536870912,
+    "readout_workspace_bytes": 268435456,
+    "metric_workspace_bytes": 1073741824,
+    "metric_batch_rows": 128
+  },
+  "evaluation_commit": "4269b589ea0694da18505d63eead8015781c2724",
+  "failed_attempts": [
+    {
+      "job": 15896,
+      "error": "typed port grouping mismatch",
+      "fidelity_measured": false
+    },
+    {
+      "job": 15905,
+      "error": "PartialEq compared intentionally unserialized names/provenance",
+      "fidelity_measured": false
+    }
+  ],
+  "saved_replay_contract": "canonical wire bytes equality plus independently decoded coverage/execution; names/provenance not part of exact codec"
+}
