@@ -33,10 +33,12 @@ fn main()->Result<(),String>{
     if args.len()<3{return Err("EXPORT SPEC OUT max_bank=193 start=0 count=193 backend=cuda cuda_local=0 trace_bytes=2147483648".into());}
     let (export,spec_path,out)=(Path::new(&args[0]),Path::new(&args[1]),Path::new(&args[2]));
     let mut keys=BTreeMap::new();
-    for arg in &args[3..]{let(k,v)=arg.split_once('=').ok_or("expected KEY=VALUE")?;if !["max_bank","start","count","backend","cuda_local","trace_bytes"].contains(&k)||keys.insert(k,v).is_some(){return Err("unknown/duplicate option".into());}}
+    for arg in &args[3..]{let(k,v)=arg.split_once('=').ok_or("expected KEY=VALUE")?;if !["max_bank","start","count","backend","cuda_local","trace_bytes","cuda_share_native"].contains(&k)||keys.insert(k,v).is_some(){return Err("unknown/duplicate option".into());}}
     let number=|k:&str|->Result<usize,String>{keys.get(k).ok_or_else(||format!("declare {k}"))?.parse().map_err(|e|format!("{e}"))};
     let(max_bank,start,count,cuda_local,trace_bytes)=(number("max_bank")?,number("start")?,number("count")?,number("cuda_local")?,number("trace_bytes")?);
     let backend=*keys.get("backend").ok_or("declare backend")?;
+    let share_native=keys.get("cuda_share_native").unwrap_or(&"0").parse::<usize>().map_err(|e|e.to_string())?;
+    if share_native>1 || (share_native==1 && backend!="cuda"){return Err("cuda_share_native requires explicit CUDA".into());}
     if count==0 || cuda_local>1 || !["cpu","cuda"].contains(&backend) || (cuda_local==1&&backend!="cuda"){return Err("invalid scope/backend".into());}
     let config:Value=serde_json::from_slice(&std::fs::read(export.join("export.json")).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
     let n=|k:&str|->Result<usize,String>{usize::try_from(config["config"][k].as_u64().ok_or("missing architecture integer")?).map_err(|e|e.to_string())};
@@ -47,7 +49,7 @@ fn main()->Result<(),String>{
     if sha256(spec_path)?!=SPEC_SHA{return Err("Run spec differs from frozen seven-episode control".into());}
     if out.exists(){return Err("fresh output directory required".into());}std::fs::create_dir_all(out).map_err(|e|e.to_string())?;
     let grid:Vec<Constraint>=DELTAS.iter().flat_map(|&local|EPSILONS.iter().map(move|&run|Constraint{local,run})).collect();
-    let scope=json!({"all_heads":24,"ranks":RANKS,"families":["NativeSvd","CopyResidual"],"complete_count_including_native":complete,"range":{"start":start,"count":count},"native_control_always_measured":true,"grid":grid,"local":{"sequences":2,"context":16,"batch":16,"ascent":0,"scope":"short screen, not full context"},"run":{"episodes":7,"spec_sha256":SPEC_SHA,"rows":16},"backend":backend,"cuda_local":cuda_local,"trace_bytes":trace_bytes,"pruning":false,"unmeasured_and_failed_retained":true,"unknown_cost_lower_bound":0,"optimality":"declared193 single substitutions only; no global claim","selected_followup":"expanded512 context and80 episodes required before broader claim"});
+    let scope=json!({"all_heads":24,"ranks":RANKS,"families":["NativeSvd","CopyResidual"],"complete_count_including_native":complete,"range":{"start":start,"count":count},"native_control_always_measured":true,"grid":grid,"local":{"sequences":2,"context":16,"batch":16,"ascent":0,"scope":"short screen, not full context"},"run":{"episodes":7,"spec_sha256":SPEC_SHA,"rows":16},"backend":backend,"cuda_local":cuda_local,"cuda_share_native":share_native,"trace_bytes":trace_bytes,"pruning":false,"unmeasured_and_failed_retained":true,"unknown_cost_lower_bound":0,"optimality":"declared193 single substitutions only; no global claim","selected_followup":"expanded512 context and80 episodes required before broader claim"});
     write_json(&out.join("SCOPE.json"),&scope)?;
     let mut inputs=BTreeMap::new();inputs.insert("spec".to_string(),sha256(spec_path)?);inputs.insert("export.json".into(),sha256(&export.join("export.json"))?);
     for name in config["files"].as_object().ok_or("missing export files")?.keys(){let file=format!("{name}.f64");inputs.insert(file.clone(),sha256(&export.join(file))?);}
@@ -62,7 +64,7 @@ fn main()->Result<(),String>{
     let mut run=LanguageRun::new(&decoder,&native,&spec,&run_passages,1)?;
     let local_family=family(&passages(export,16)?)?;
     let mut local=Local::new(&native,local_family.clone(),None,16);
-    if backend=="cuda"{let device=gam_gpu::tensor::Device::accelerator(gam_gpu::GpuPolicy::Required).map_err(|e|e.to_string())?.ok_or("CUDA required")?;if cuda_local==1{local=local.with_cuda(device.clone(),trace_bytes)?;}run=run.with_cuda(device,trace_bytes)?;}
+    if backend=="cuda"{let device=gam_gpu::tensor::Device::accelerator(gam_gpu::GpuPolicy::Required).map_err(|e|e.to_string())?.ok_or("CUDA required")?;if cuda_local==1{local=local.with_cuda(device.clone(),trace_bytes)?;}run=run.with_cuda(device,trace_bytes)?;if share_native==1{run=run.with_cuda_native_source(&base)?;}}
     let mut cache=CostCache::default();let mut records:Vec<Value>=bank.choices().enumerate().map(|(i,c)|json!({"index":i+1,"choice":c,"cost_bits":null,"cost_lower_bound":0,"states":vec!["Unevaluated";grid.len()]})).collect();
     records.insert(0,json!({"index":0,"label":"native","cost_bits":null,"cost_lower_bound":0,"states":vec!["Unevaluated";grid.len()]}));
     let choices:Vec<CopyResidualChoice>=bank.choices().collect();let mut journal=std::fs::OpenOptions::new().create_new(true).write(true).open(out.join("ASSESSMENTS.jsonl")).map_err(|e|e.to_string())?;
