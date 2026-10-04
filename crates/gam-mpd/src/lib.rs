@@ -60,6 +60,7 @@ pub mod engine;
 
 // The explanation as one artifact: program, block bindings, places, exceptions; its message and
 // its blocks grafted onto the native model.
+pub mod matrix_rule;
 pub mod artifact;
 pub mod artifact_device;
 pub mod device_family_run;
