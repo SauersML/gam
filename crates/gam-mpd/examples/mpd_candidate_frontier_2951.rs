@@ -11,7 +11,8 @@
 //!
 //! Other keys: local_export=EXPORT_DIR, local=4, context=512, ascent=0,
 //! deltas=0.05,0.1,0.2, epsilons=0.01,0.03,0.1, parallel=8, batch=1024,
-//! groups= (all declared episode groups), cuda_share_native=0 (opt-in exact GPU parameter reuse).
+//! groups= (all declared episode groups), cuda_share_native=0 (opt-in exact GPU parameter reuse),
+//! cuda_local=0 (opt-in CUDA native-parent graft; requires backend=cuda, ascent=0).
 //! SHA-256 input manifests require sha256sum
 //! or shasum on PATH. No greedy feasibility pruning is used.
 
@@ -122,6 +123,7 @@ fn main() -> Result<(), String> {
         "backend",
         "cuda_trace_bytes",
         "cuda_share_native",
+        "cuda_local",
         "local_kl",
     ];
     if let Some(k) = keys.keys().find(|k| !allowed.contains(&k.as_str())) {
@@ -175,12 +177,18 @@ fn main() -> Result<(), String> {
     let native = split_sites(&imported.program)?;
     let run = LanguageRun::new(&decoder, &native, &spec, &run_passages, parallel)?;
     let backend = key("backend", "cpu");
+    let cuda_local = number("cuda_local", 0)?;
+    if cuda_local > 1 || (cuda_local == 1 && backend != "cuda") {
+        return Err("cuda_local must be 0 or 1; 1 requires backend=cuda".into());
+    }
+    let mut local_device = None;
     let run = match backend.as_str() {
         "cpu" => run,
         "cuda" => {
             let limit = keys.get("cuda_trace_bytes").ok_or("backend=cuda requires cuda_trace_bytes=N")?.parse::<usize>().map_err(|e| e.to_string())?;
             let device =
                 gam_gpu::tensor::Device::accelerator(gam_gpu::GpuPolicy::Required).map_err(|e| e.to_string())?.ok_or("required CUDA device unavailable")?;
+            if cuda_local == 1 { local_device = Some((device.clone(), limit)); }
             run.with_cuda(device, limit)?
         }
         _ => return Err("backend must be cpu or cuda".into()),
@@ -197,6 +205,7 @@ fn main() -> Result<(), String> {
         Some(Ascent { domain: vec![SlotDomain::Tokens((0..vocab).collect())], pool: Vec::new(), evaluations: ascent_evaluations })
     };
     let local = Local::new(&native, local_family.clone(), ascent, batch);
+    let local = match local_device { Some((device, limit)) => local.with_cuda(device, limit)?, None => local };
     // Decode the native source once: exact interface/body interning then shares
     // unchanged tensors across index compaction, ignoring disposable decoder labels.
     let native_artifact = Artifact::native(&native)?.f32_literals()?;
@@ -313,7 +322,7 @@ fn main() -> Result<(), String> {
     }
     let replay_seconds = timer.elapsed().as_secs_f64();
     let mut report = json!({
-        "execution": {"backend": run.backend_name(), "local": "CPU f64", "teacher": "immutable cached CPU residuals and native effects", "readout_and_KL": "CPU f64", "cuda_episode_parallelism": 1, "teacher_parallelism": parallel, "teacher_cache_memory": "one final residual matrix per episode plus scalar native effects; initialization also retains clean native passage traces and requested donor rows",
+        "execution": {"backend": run.backend_name(), "local": local.backend_name(), "local_numerical_scope": "comparison-rounding intervals on executed values; not CPU/CUDA execution-equivalence certificates", "teacher": "immutable cached CPU residuals and native effects", "readout_and_KL": "CPU f64", "cuda_episode_parallelism": 1, "teacher_parallelism": parallel, "teacher_cache_memory": "one final residual matrix per episode plus scalar native effects; initialization also retains clean native passage traces and requested donor rows",
             "cuda_trace_limit_scope": "intermediate activation estimate only; excludes operators, attention workspaces, edit masks and allocator overhead",
             "cuda_native_source_enabled": run.cuda_native_sharing(), "cuda_native_source_memory": "when enabled: one immutable native parameter resident plus current candidate changed parameters; no native source trace or donor cache",
             "cuda_upload_scope": if run.cuda_native_sharing() { "one explicit decoded native source per Run; exact re-interning shares parameters across candidates; candidate bases and episode/donor forks are independent; requested donor rows downloaded then reuploaded for mixes" } else { "one base per candidate; episode/donor forks share unchanged operator tensors by Arc identity and role; requested donor rows downloaded then reuploaded for mixes" }},
