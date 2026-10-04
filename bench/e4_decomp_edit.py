@@ -16,8 +16,9 @@ gam_mpd::site_fit's library of h.2.mlp.down_proj turns on at emoticon colons, in
              decomp_span{k}  read: the least mean-square change on ordinary text (metric C, as ROME) within the span
                              of the reads of the k subcomponents most informative of an emoticon colon
            write: e4_edit_methods.py's Fisher write
-Then: e4_edit_methods.py dev NAMES (dev proxies), assemble_extra decomp NAME (strength solved to the headline
-success), and the harness on E4_VARIANTS=decomp.
+Then: e4_edit_methods.py assemble_extra decomp NAMES (each strength solved to the headline LoRA's success, with
+VPD's edit there), the harness on E4_VARIANTS=decomp (e4_side_effects_data.py eval/summarize,
+e4_benchmarks_data.py score/summarize, e4_edit_methods.py heldout) and e4_methods_table.py.
 
 usage: venv/python e4_decomp_edit.py reads | choose
 """

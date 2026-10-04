@@ -79,11 +79,12 @@ print(OUT / "e4_methods_frontier.png")
 if (M / "table.json").exists():
     T = json.load(open(M / "table.json"))
     keys = [k for k in sorted(T, key=lambda k: -T[k]["kl_all"][0])
-            if k != "vpd_at_hardneg" and (k == "compiled_span8" or not k.startswith("compiled"))]
-    FAMILY = [("#eb6834", "parameter decomposition (VPD subcomponents)"), ("#2a78d6", "fine-tuning (LoRA)"),
+            if k != "vpd_at_hardneg" and (k == "compiled_span8" or not k.startswith("compiled")) and not k.startswith("decomp_span")]
+    FAMILY = [("#eb6834", "parameter decomposition (VPD subcomponents)"),
+              ("#a3360f", "parameter decomposition (program-size)"), ("#2a78d6", "fine-tuning (LoRA)"),
               ("#898781", "direct weight edit"), ("#1baf7a", "direct weight edit, least change to ordinary text")]
-    COL = {"vpd": "#eb6834", "specific_subcomponent": "#eb6834", "lora": "#2a78d6", "lora_hardneg": "#2a78d6",
-           "compiled_span8": "#1baf7a"}
+    COL = {"vpd": "#eb6834", "specific_subcomponent": "#eb6834", "decomp_own": "#a3360f", "lora": "#2a78d6",
+           "lora_hardneg": "#2a78d6", "compiled_span8": "#1baf7a"}
     panels = [("kl_all", "Disturbance of all held-out text", "KL from the original model (nats per word)", True),
               ("kl_spaced_colon", "After a colon that is not an emoticon", "KL from the original model (nats per word)", True),
               ("hellaswag", "HellaSwag", "change in the right answer's log-probability share (nats)", False)]
@@ -118,7 +119,7 @@ if (M / "table.json").exists():
     fig.suptitle("Side effects of each edit, all at 98.5% edit success", x=0.01, ha="left", y=1 - 0.15 / H,
                  fontsize=32, fontweight="bold", color=INK)
     fig.legend(handles=[Line2D([], [], color=c, marker="o", lw=3, ms=11, mec=SURF, label=l) for c, l in FAMILY],
-               loc="upper left", ncol=4, frameon=False, fontsize=20, bbox_to_anchor=(0.005, 1 - 0.75 / H))
+               loc="upper left", ncol=5, frameon=False, fontsize=20, bbox_to_anchor=(0.005, 1 - 0.75 / H))
     fig.subplots_adjust(left=0.27, right=0.99, top=1 - 2.2 / H, bottom=1.2 / H)
     fig.savefig(OUT / "e4_methods_matched.png", facecolor=SURF)
     plt.close(fig)

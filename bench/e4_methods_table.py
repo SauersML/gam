@@ -1,6 +1,6 @@
 """E4 edit methods (#2951): the matched-success comparison of every edit, from the full harness's summaries
-(e4_side_effects_data.py and e4_benchmarks_data.py with E4_VARIANTS=final and =compiled) and the held-out emoticon
-test (e4_edit_methods.py heldout). Writes methods/table.json and prints the table.
+(e4_side_effects_data.py and e4_benchmarks_data.py with E4_VARIANTS=final, =compiled, =neg and =decomp) and the
+held-out emoticon test (e4_edit_methods.py heldout). Writes methods/table.json and prints the table.
 
 usage: MPD_MEM_GIB=1 e4_methods_table.py
 """
@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 M = Path.home() / "mpd-data/frontier/e4_side/methods"
-SETS = ("final", "compiled", "neg")
+SETS = ("final", "compiled", "neg", "decomp")
 TASKS = ("hellaswag", "arc_easy", "piqa", "lambada", "blimp")
 LABEL = {"vpd": "VPD: the paper's subcomponent", "lora": "LoRA (the paper's fine-tune)",
          "lora_hardneg": "LoRA, trained to spare other colons",
@@ -22,7 +22,11 @@ LABEL = {"vpd": "VPD: the paper's subcomponent", "lora": "LoRA (the paper's fine
          "compiled_span16": "our solver, exact on the 16 main emoticon patterns",
          "compiled_span8_neg4": "our solver, 8 patterns, 4 other-colon patterns untouched",
          "compiled_span8_neg16": "our solver, 8 patterns, 16 other-colon patterns untouched",
-         "compiled_span8_neg64": "our solver, 8 patterns, 64 other-colon patterns untouched"}
+         "compiled_span8_neg64": "our solver, 8 patterns, 64 other-colon patterns untouched",
+         "decomp_own": "program-size decomposition: edit its emoticon subcomponent",
+         "decomp_span2": "program-size decomposition: least change within its 2 emoticon subcomponents' reads",
+         "decomp_span4": "program-size decomposition: least change within its 4 emoticon subcomponents' reads",
+         "decomp_span8": "program-size decomposition: least change within its 8 emoticon subcomponents' reads"}
 
 
 def check(d, key, nm, metric="kl"):

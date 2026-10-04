@@ -1,6 +1,8 @@
 """E4 on standard benchmarks (#2951): the change each emoticon edit makes to HellaSwag, ARC-Easy, PIQA, LAMBADA
-and the 67 BLiMP tasks, for VPD's subcomponent edit, the paper's LoRA and the least-change weight edit, all at the
-same edit success (98.5%): the change in each benchmark's correct-answer confidence. Reads bench/e4_methods_table.py's methods/table.json.
+and the 67 BLiMP tasks, for VPD's subcomponent edit, the edit through the program-size decomposition's emoticon
+subcomponent (bench/e4_decomp_edit.py), the paper's LoRA and the least-change weight edit, all at the same edit
+success (98.5%): the change in each benchmark's correct-answer confidence. Reads bench/e4_methods_table.py's
+methods/table.json.
 
 usage: MPD_MEM_GIB=1 e4_benchmarks_three_fig.py
 """
@@ -17,8 +19,9 @@ OUT = Path.home() / "mpd-data/figures"
 INK, INK2, SURF, AXIS = "#0b0b0b", "#52514e", "#ffffff", "#c3c2b7"
 plt.rcParams.update({"font.family": ["Helvetica Neue", "Arial Unicode MS"], "font.size": 24, "axes.edgecolor": AXIS,
                      "xtick.color": INK2, "ytick.color": INK2})
-METHODS = [("vpd", "VPD subcomponent edit", "#eb6834"), ("lora", "LoRA, 282 examples", "#2a78d6"),
-           ("compiled_span8", "minimum-disturbance weight edit", "#1baf7a")]
+METHODS = [("vpd", "VPD subcomponent edit", "#eb6834"),
+           ("decomp_own", "program-size decomposition: edit its emoticon subcomponent", "#a3360f"),
+           ("lora", "LoRA, 282 examples", "#2a78d6"), ("compiled_span8", "minimum-disturbance weight edit", "#1baf7a")]
 TASKS = [("hellaswag", "HellaSwag"), ("arc_easy", "ARC-Easy"), ("piqa", "PIQA"), ("lambada", "LAMBADA"),
          ("blimp", "BLiMP (all 67 tasks)")]
 
@@ -26,7 +29,7 @@ TASKS = [("hellaswag", "HellaSwag"), ("arc_easy", "ARC-Easy"), ("piqa", "PIQA"),
 def dots(ax, key):
     """One row per task, one dot with its 95% interval per method, rows top to bottom."""
     ys = np.arange(len(TASKS))[::-1]
-    offsets = np.linspace(0.22, -0.22, len(METHODS))
+    offsets = np.linspace(0.27, -0.27, len(METHODS))
     for y, (task, _) in zip(ys, TASKS):
         for (name, _, col), dy in zip(METHODS, offsets):
             m, lo, hi = T[name][key][task]
@@ -41,7 +44,7 @@ def dots(ax, key):
     ax.set_facecolor(SURF)
 
 
-fig, a1 = plt.subplots(figsize=(17, 10.5), dpi=150)
+fig, a1 = plt.subplots(figsize=(17, 12), dpi=150)
 fig.patch.set_facecolor(SURF)
 dots(a1, "bench_d_margin")
 a1.set_xlabel("change in the correct answer's log-probability share (nats)", color=INK)
@@ -50,7 +53,7 @@ fig.legend(handles=[Line2D([], [], color=c, marker="o", lw=2.6, ms=10, mec=SURF,
            loc="upper left", ncol=1, frameon=False, bbox_to_anchor=(0.005, 0.93))
 fig.suptitle("Benchmark change after each emoticon edit, at equal edit success", x=0.01, ha="left", y=0.995,
              fontsize=32, fontweight="bold", color=INK)
-fig.subplots_adjust(left=0.22, right=0.97, top=0.71, bottom=0.12)
+fig.subplots_adjust(left=0.22, right=0.97, top=0.71, bottom=0.11)
 fig.savefig(OUT / "e4_benchmarks_three.png", facecolor=SURF)
 plt.close(fig)
 print(OUT / "e4_benchmarks_three.png")
