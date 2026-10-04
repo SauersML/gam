@@ -59,6 +59,8 @@ LANES
   ./build.sh nextest run <FILTER>  compile+run tests (compile under lock, exec under run-lock)
   ./build.sh check --workspace …   any cargo subcommand + args (cacheable)
   ./build.sh maturin [args]        build+install the gamfit Python extension (release)
+  ./build.sh example NAME [PROFILE] [--head]   build an example in a parallel warm slot (--head: the
+                                   committed tree only); prints its binary path
   ./build.sh -h | --help           this help
 
 KEY ENV OVERRIDES
@@ -669,6 +671,59 @@ run_request() {
   record "$REQ" "MISS" "$code" "$DUR"; flock -u 7
   finish "$code" "MISS"
 }
+
+# ---- example lane: one example binary, built in parallel with everyone else's builds ----
+#   bin=$(./build.sh example mpd_e2e_2951 [release|test|PROFILE]) && "$bin" ARGS…
+# The shared target/ above runs one cargo at a time; agents' example builds sat at 0% CPU for
+# 10-25 min behind each other there. This lane builds in one of fastcheck's warm slots instead
+# (each its own target/, several at once) and prints the path of a copy named by the source it was
+# asked for (HEAD, the tracked diff and the untracked files under crates/; with --head, the commit
+# alone, ignoring everyone's uncommitted edits): the same request on
+# unchanged source returns that binary at once, identical concurrent requests build once, and a
+# binary is never rewritten under a run that started from it. Without fastcheck (a cluster clone)
+# it builds in target/ and copies the binary the same way.
+if [[ "${1:-}" == "example" ]]; then
+  shift; head_only=0; _a=()
+  for a in "$@"; do [[ "$a" == --head ]] && head_only=1 || _a+=("$a"); done
+  name="${_a[0]:-}"; prof="${_a[1]:-release}"
+  [[ -n "$name" ]] || { echo "[build.sh] usage: ./build.sh example NAME [release|test|PROFILE] [--head]" >&2; exit 64; }
+  src=$(ls "$REPO"/crates/*/examples/"$name".rs "$REPO"/crates/*/examples/"$name"/main.rs 2>/dev/null | head -1)
+  [[ -n "$src" ]] || { echo "[build.sh] no example '$name' under crates/*/examples" >&2; exit 64; }
+  dir="${src#"$REPO"/crates/}"; dir="${dir%%/*}"
+  pkg=$(sed -n 's/^name *= *"\(.*\)"/\1/p' "$REPO/crates/$dir/Cargo.toml" | head -1)
+  case "$prof" in release) pflag=(--release); out_dir=release ;; dev|test) pflag=(--profile "$prof"); out_dir=debug ;;
+    bench) pflag=(--profile bench); out_dir=release ;; *) pflag=(--profile "$prof"); out_dir="$prof" ;; esac
+  if [[ "$head_only" == 1 ]]; then
+    key=$(git -C "$REPO" rev-parse --short=12 HEAD)
+  else
+    key=$( { git -C "$REPO" rev-parse HEAD; git -C "$REPO" diff HEAD -- crates Cargo.toml Cargo.lock
+             git -C "$REPO" ls-files -o --exclude-standard -z -- crates | xargs -0 "$SHA1_BIN" 2>/dev/null
+             echo "$pkg $name $prof"; } | "$SHA1_BIN" | cut -c1-12 )
+  fi
+  bins="$S/bin"; mkdir -p "$bins"
+  # Binaries nobody asked for in 3 days go (a request refreshes its binary's mtime).
+  find "$bins" -maxdepth 1 -type f -mtime +3 -delete 2>/dev/null
+  out="$bins/$name-$prof-$key"
+  if [[ -x "$out" ]]; then
+    touch "$out"
+    printf '[%s] req=%-26s dedup=HIT  duration=0s exit=0\n' "$(now)" "\"example $name $prof\"" >> "$HIST"
+    echo "$out"; exit 0
+  fi
+  t0=$(ep)
+  if command -v fastcheck >/dev/null 2>&1; then
+    (cd "$REPO" && env -u CARGO_TARGET_DIR -u CARGO_INCREMENTAL FASTCHECK_EXPORT="$out" FASTCHECK_HEAD="$head_only" \
+       fastcheck build "${pflag[@]}" -p "$pkg" --example "$name") 2>&1 | tee "$LOG" >&2
+    code=${PIPESTATUS[0]}
+  else
+    (cd "$REPO" && "${CARGO[@]}" build "${pflag[@]}" -p "$pkg" --example "$name") 2>&1 | tee "$LOG" >&2
+    code=${PIPESTATUS[0]}
+    [[ "$code" == 0 ]] && cp -f "$CARGO_TARGET_DIR/$out_dir/examples/$name" "$out.tmp.$$" && mv -f "$out.tmp.$$" "$out"
+  fi
+  [[ "$code" == 0 && ! -x "$out" ]] && { echo "[build.sh] built, but no binary at $out" >&2; code=1; }
+  record "example $name $prof" MISS "$code" "$(( $(ep) - t0 ))"
+  [[ "$code" == 0 ]] && echo "$out"
+  exit "$code"
+fi
 
 # ---- maturin lane: `./build.sh maturin [extra maturin args]` ----
 # Builds the gamfit Python extension through the SAME single-flight lock + sccache
