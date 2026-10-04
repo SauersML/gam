@@ -376,7 +376,14 @@ def stage_labels():
         R = W(f"h.{layer}.attn.v_proj").T @ Vs if kind == "o" else W(f"h.{layer}.mlp.c_fc").T @ Vs if kind == "down_proj" else Vs
         R = R * g[:, None]
         # Write directions carried forward to the residual stream (none for queries and keys).
-        Wr = {"o": Us, "down_proj": Us, "c_fc": Us @ W(f"h.{layer}.mlp.down_proj").T, "v": Us @ W(f"h.{layer}.attn.o_proj").T}.get(kind)
+        if kind in ("o", "down_proj"):
+            Wr = Us
+        elif kind == "c_fc":
+            Wr = Us @ W(f"h.{layer}.mlp.down_proj").T
+        elif kind == "v":
+            Wr = Us @ W(f"h.{layer}.attn.o_proj").T
+        else:
+            Wr = None
         for c0 in range(0, Vs.shape[1], 256):
             c1 = min(Vs.shape[1], c0 + 256)
             rs = E @ R[:, c0:c1]  # [V, chunk]
