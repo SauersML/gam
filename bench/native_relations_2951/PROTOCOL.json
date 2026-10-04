@@ -1,0 +1,45 @@
+{
+  "created_utc": "2026-10-04T22:18:07.784561+00:00",
+  "status": "prospective bounded structural diagnostic; no result yet",
+  "hypothesis": "Some native MLP units jointly implement a simpler computation through equal or opposing full affine readers; opposing readers and opposing writers may form a learned linear channel through nonlinear units.",
+  "known_identity": "For real-arithmetic GELU variants, g(t)-g(-t)=t. This identity is supplied mathematical semantics, not learned discovery. Actual binary64 responses are measured.",
+  "native_scope": "All units in all four MLP layers of the existing 4-layer language model; no manually selected layers, units, or semantic examples.",
+  "proposal_generation": {
+    "inventory": "Every unordered full affine reader pair, for signs +1 and -1; bias included. Geometry is a proposal heuristic only.",
+    "retained_per_sign_per_layer": 64,
+    "orientation": "Both directed replacements for every retained unordered pair.",
+    "selection_data": "Native weights only; neither training nor evaluation responses select geometry proposals.",
+    "no_claim": "Retaining 64 does not establish optimality over all pairs or all programs."
+  },
+  "responses": {
+    "replacement": "Replace unit j preactivation by sign times preactivation i, retaining its native output writer; execute native GELU to measure its exact changed output on the same parent.",
+    "linear_cancellation": "For negative reader pairs, compare native pair output with w_i*z_i and the reversed orientation, requiring the writer relationship as well.",
+    "controls": [
+      "Remove only unit j.",
+      "Remove both units for the pair-linear hypothesis.",
+      "Report writer norms and writer cosine; do not infer useful structure merely from low output impact."
+    ],
+    "report": [
+      "Training and fit-disjoint evaluation maximum vector error, native MLP RMS normalization, and worst-row witness.",
+      "Relation-to-removal error ratio, including explicit zero cases.",
+      "Complete retained candidate bank and full geometry distribution summary."
+    ]
+  },
+  "data": {
+    "manifest": "/Users/user/mpd-data/cluster/codex-affine-mlp-9c504de18084/extract/EXTRACT.json",
+    "manifest_sha256": "e914269c811d00503b93167a66bbd761d196c76fd8dd44fd18698532bd4a565e",
+    "export": "/Users/user/mpd-data/engine/vpd4l_frontier32/export.json",
+    "export_sha256": "1af0aface5a0ca843624310daac12c0ff770a0cc24aa96550c130d11de77bb68",
+    "training_positions": 4096,
+    "evaluation_positions": 1024,
+    "evaluation_scope": "Previously examined project panel, disjoint from training rows; not untouched confirmation."
+  },
+  "followup_condition": "Only a relation competitive with simple removal warrants compilation and full-model native-edit evaluation; report outcomes without introducing a hidden error cutoff.",
+  "required_for_discovery_claim": [
+    "A smaller serialized executable program, with actual compiled maps and residual computation counted.",
+    "Independent replay and autonomous output KL, including native parameter changes that preserve and break the proposed relation.",
+    "Evidence beyond weak/dead units and the architecture-wide GELU identity."
+  ],
+  "negative_scope": "Failure rejects this bounded pair-relation proposal family; it does not reject more general reusable computation.",
+  "compute": "One memory-leased CPU scan of small native matrices; no fitting campaign and no GPU reservation. Runtime and source hashes recorded."
+}
