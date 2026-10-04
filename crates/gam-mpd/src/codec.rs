@@ -232,6 +232,7 @@ impl BitString {
         BitReader {
             bits: self,
             position: 0,
+            end: self.len_bits,
         }
     }
 
@@ -245,11 +246,21 @@ impl BitString {
 pub struct BitReader<'a> {
     bits: &'a BitString,
     position: u64,
+    end: u64,
 }
 
-impl BitReader<'_> {
+impl<'a> BitReader<'a> {
     pub fn remaining_bits(&self) -> u64 {
-        self.bits.len_bits - self.position
+        self.end - self.position
+    }
+
+    /// Borrow exactly the next `length` bits, advancing this cursor without copying.
+    /// Child reads and prefix matches cannot consume the surrounding message.
+    pub fn bounded_subreader(&mut self, length: u64) -> Result<Self, CodecError> {
+        self.require(length)?;
+        let child = Self { bits: self.bits, position: self.position, end: self.position + length };
+        self.position += length;
+        Ok(child)
     }
 
     /// Consume a witnessed codeword only if every bit matches at this boundary.
@@ -1187,6 +1198,47 @@ impl CardinalityCode for PaddedPacketCode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bounded_subreader_shares_storage_and_never_reads_tail() {
+        for offset in 0..16_u32 {
+            for length in 0..145_u64 {
+                let mut message = super::BitString::new();
+                for _ in 0..offset { message.push_bit(false); }
+                let mut witness = super::BitString::new();
+                for i in 0..length { witness.push_bit(i % 3 == 1); }
+                message.append(&witness);
+                message.push_bits(0b101,3).expect("three tail bits");
+                let mut parent = message.reader();
+                parent.read_bits(offset).expect("prefix present");
+                let mut child = parent.bounded_subreader(length).expect("bounded child");
+                assert!(std::ptr::eq(child.bits,&message));
+                assert_eq!(child.remaining_bits(),length);
+                assert!(child.consume_exact_prefix(&witness));
+                assert_eq!(child.read_bit(),Err(super::CodecError::UnexpectedEnd{needed:1,remaining:0}));
+                child.finish().expect("child fully consumed");
+                assert_eq!(parent.read_bits(3).expect("parent tail"),0b101);
+                parent.finish().expect("parent fully consumed");
+            }
+        }
+        let message=super::BitString::new();
+        let mut reader=message.reader();
+        assert!(reader.bounded_subreader(u64::MAX).is_err());
+        assert_eq!(reader.remaining_bits(),0);
+    }
+    #[test]
+    fn nested_subreader_failures_do_not_cross_or_advance_boundaries() {
+        let mut message=super::BitString::new();message.push_bits(0b110101,6).expect("six bits");
+        let mut parent=message.reader();parent.read_bit().expect("prefix");
+        let mut child=parent.bounded_subreader(3).expect("threebit child");
+        let mut wrong=super::BitString::new();wrong.push_bits(0b1010,4).expect("long witness");
+        assert!(!child.consume_exact_prefix(&wrong));assert_eq!(child.remaining_bits(),3);
+        assert!(child.bounded_subreader(4).is_err());assert_eq!(child.remaining_bits(),3);
+        let mut grandchild=child.bounded_subreader(2).expect("nested child");
+        assert_eq!(grandchild.read_bits(2).expect("two bits"),0b10);
+        assert!(grandchild.read_bit().is_err());
+        assert_eq!(child.read_bit().expect("one remaining bit"),true);
+        assert_eq!(parent.read_bits(2).expect("surrounding tail"),0b01);
+    }
     #[test]
     fn witnessed_prefix_matching_is_exact_and_transactional() {
         for offset in 0..16 {

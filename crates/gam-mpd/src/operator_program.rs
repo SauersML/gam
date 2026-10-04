@@ -4185,12 +4185,14 @@ impl OperatorProgram {
     /// Decode ordinary bytes, substituting a fixed decoded body only after a
     /// complete exact codeword match at its actual boundary and original index.
     pub fn decode_with_native_codec(message: &BitString, declarations: &Declarations, codec: &NativeOperatorCodec) -> Result<Self, ProgramError> {
-        codec.check_declarations(declarations)?;
         Self::decode_using(message, declarations, Some(codec))
     }
     fn decode_using(message: &BitString, declarations: &Declarations, codec: Option<&NativeOperatorCodec>) -> Result<Self, ProgramError> {
-        let mut reader = message.reader();
-        let reader = &mut reader;
+        Self::decode_reader(&mut message.reader(), declarations, codec)
+    }
+    /// Decode one bounded borrowed program message; trailing bits remain an error.
+    pub(crate) fn decode_reader(reader: &mut BitReader<'_>, declarations: &Declarations, codec: Option<&NativeOperatorCodec>) -> Result<Self, ProgramError> {
+        if let Some(codec) = codec { codec.check_declarations(declarations)?; }
         let basis_count = decode_prefix_integer(reader)? - 1;
         let operator_count = decode_prefix_integer(reader)? - 1;
         let node_count = decode_prefix_integer(reader)? as usize;

@@ -1323,11 +1323,9 @@ impl Artifact {
         if program_bits > reader.remaining_bits() {
             return Err(format!("a program of {program_bits} bits in {} remaining", reader.remaining_bits()));
         }
-        let message = reader.read_bit_string(program_bits).map_err(codec)?;
-        let program = match cache {
-            Some(cache) => OperatorProgram::decode_with_native_codec(&message, declarations, cache),
-            None => OperatorProgram::decode(&message, declarations),
-        }.map_err(|e| e.to_string())?;
+        let mut program_reader = reader.bounded_subreader(program_bits).map_err(codec)?;
+        let program = OperatorProgram::decode_reader(&mut program_reader, declarations, cache)
+            .map_err(|e| e.to_string())?;
         let nodes = program.nodes.len();
         let interfaces = program.interfaces().map_err(|e| e.to_string())?;
         let mut blocks = Vec::new();
@@ -1505,3 +1503,46 @@ impl DecodableArtifact for EncodedArtifact {
 #[cfg(test)]
 #[path = "matrix_artifact_tests.rs"]
 mod matrix_artifact_tests;
+
+#[cfg(test)]
+mod borrowed_program_decode_tests {
+    use super::*;
+    use crate::operator_program::{Slot, NativeOperatorCodec};
+    fn fixture() -> Artifact {
+        let interface=Interface::native(1).expect("onecolumn interface");
+        let program=OperatorProgram {
+            declarations:Declarations {parameters:0,domains:vec![],slots:vec![Slot::Raw{width:1}]},
+            bases:vec![],rules:vec![],operators:vec![Arc::new(Operator::identity("identity",interface))],
+            nodes:vec![Node::Raw{slot:0},Node::Affine{terms:vec![(0,0)],bias:None}],output:1,
+        };
+        Artifact::native(&program).expect("native artifact")
+    }
+    #[test]
+    fn borrowed_nested_program_matches_ordinary_and_cached_wire() {
+        let artifact=fixture();let message=artifact.encode().expect("artifact encoding");
+        let cache=NativeOperatorCodec::new(&artifact.program,1<<20).expect("bounded cache");
+        let a=Artifact::decode(&message,&artifact.program.declarations).expect("ordinary decoder");
+        let b=Artifact::decode_with_native_codec(&message,&artifact.program.declarations,&cache).expect("cached decoder");
+        assert_eq!(a.encode().expect("canonical ordinary"),message);
+        assert_eq!(b.encode().expect("canonical cached"),message);
+        assert_eq!(a.program.operators[0].name,b.program.operators[0].name);
+        let mut wrong=artifact.program.declarations.clone();wrong.parameters=1;
+        assert!(Artifact::decode_with_native_codec(&message,&wrong,&cache).is_err());
+    }
+    #[test]
+    fn borrowed_nested_program_rejects_wrong_lengths_without_artifact_tail_reads() {
+        let artifact=fixture();let message=artifact.encode().expect("artifact encoding");
+        let mut reader=message.reader();
+        let native=decode_prefix_integer(&mut reader).expect("native count");
+        let length=decode_prefix_integer(&mut reader).expect("program length")-1;
+        let program=reader.read_bit_string(length).expect("test extraction");
+        let tail=reader.read_bit_string(reader.remaining_bits()).expect("artifact tail");
+        for bad in [0,length-1,length+1,u64::MAX-1] {
+            let mut altered=BitString::new();
+            encode_prefix_integer(&mut altered,native).expect("native prefix");
+            encode_prefix_integer(&mut altered,bad+1).expect("malicious length code");
+            altered.append(&program);altered.append(&tail);
+            assert!(Artifact::decode(&altered,&artifact.program.declarations).is_err(),"length {bad}");
+        }
+    }
+}
