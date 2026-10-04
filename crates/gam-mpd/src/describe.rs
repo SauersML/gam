@@ -310,6 +310,32 @@ impl Choice {
 }
 
 
+/// A block described as a scaled prediction plus a described residual
+/// ([`Geometry::describe_predicted`]).
+#[derive(Clone, Debug)]
+pub struct Predicted {
+    /// The prediction's scale as sent, and its bits.
+    pub scale: f64,
+    pub scale_bits: f64,
+    pub residual: Description,
+    /// The prediction's factors `(pu, pv)`, `puᵀ pv` the predicted block.
+    pub prediction: (Array2<f64>, Array2<f64>),
+}
+
+impl Predicted {
+    /// The scale's bits, the residual's description and the price of its error.
+    pub fn total(&self) -> f64 {
+        self.scale_bits + self.residual.total()
+    }
+
+    /// The decoded block as factors `uᵀ v`: the scaled prediction and the decoded residual stacked.
+    pub fn decoded(&self) -> Result<(Array2<f64>, Array2<f64>), String> {
+        let u = ndarray::concatenate(Axis(0), &[(&self.prediction.0 * self.scale).view(), self.residual.u.view()]).map_err(|e| e.to_string())?;
+        let v = ndarray::concatenate(Axis(0), &[self.prediction.1.view(), self.residual.v.view()]).map_err(|e| e.to_string())?;
+        Ok((u, v))
+    }
+}
+
 impl Description {
     /// The description's own bits.
     pub fn bits(&self) -> f64 {
@@ -1084,6 +1110,34 @@ impl Geometry {
         Ok(Self { metric, writers: w, readers: r })
     }
 
+    /// The block `uᵀ v` described as `λ` times a prediction `puᵀ pv` the decoder already holds (a
+    /// rule's body bound to this block) plus the residual `uᵀ v − λ̃ puᵀ pv` described as any block
+    /// ([`Geometry::describe`]): `λ` is the metric's least-squares scale, sent on the lattice that
+    /// minimizes its bits plus the price of its rounding left in the residual's direction, and the
+    /// residual absorbs whatever the scaled prediction misses, so a prediction that explains nothing
+    /// costs only the scale. What a rule saves is the residual's shorter reals.
+    pub fn describe_predicted(&self, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>, pu: ArrayView2<'_, f64>, pv: ArrayView2<'_, f64>) -> Result<Predicted, String> {
+        // ⟨A, B⟩ = tr(F A C Bᵀ) on factors: Σ (a_u F b_uᵀ) ∘ (a_v C b_vᵀ).
+        let inner = |au: ArrayView2<'_, f64>, av: ArrayView2<'_, f64>, bu: ArrayView2<'_, f64>, bv: ArrayView2<'_, f64>| {
+            (mm(&mm(&au, &self.metric.fisher), &bu.t()) * mm(&mm(&av, &self.metric.moment), &bv.t())).sum()
+        };
+        let (cross, own) = (inner(u, v, pu, pv), inner(pu, pv, pu, pv));
+        let scale = self.metric.scale();
+        let best = if own > 0.0 { cross / own } else { 0.0 };
+        let lambda = Array2::from_elem((1, 1), best);
+        let (p, _) = scan(exponents(&lambda), |p| {
+            let (q, bits) = quantize(&lambda, p)?;
+            Some((bits + exponent_bits(p), (q[[0, 0]] - best).powi(2) * own * scale))
+        })
+        .ok_or("no lattice holds the prediction's scale")?;
+        let (q, bits) = quantize(&lambda, p).ok_or("no lattice holds the prediction's scale")?;
+        let sent = q[[0, 0]];
+        let ru = ndarray::concatenate(Axis(0), &[u, (&pu * -sent).view()]).map_err(|e| e.to_string())?;
+        let rv = ndarray::concatenate(Axis(0), &[v, pv]).map_err(|e| e.to_string())?;
+        let residual = self.describe(ru.view(), rv.view())?;
+        Ok(Predicted { scale: sent, scale_bits: bits + exponent_bits(p), residual, prediction: (pu.to_owned(), pv.to_owned()) })
+    }
+
     /// The cheapest description of the block `uᵀ v` (`u` is `r × d_out`, `v` is `r × d_in`), of rank
     /// at most `r`, over the identity and the site's charts: least description bits plus the KL bits
     /// of its error.
@@ -1224,9 +1278,10 @@ impl Geometry {
                 }
             }
         }
-        // A map no family resolves (numerically zero in the metric) is the empty description:
-        // its family's index alone, its whole map left as error.
-        Ok(best.unwrap_or_else(|| Description {
+        // The empty description is always a candidate: its family's index alone, its whole map left
+        // as error. A block cheaper to leave as error than to say in any family takes it, and a map
+        // no family resolves (numerically zero in the metric) has nothing else.
+        let empty = Description {
             writer: ("identity".to_string(), Vec::new()),
             reader: ("identity".to_string(), Vec::new()),
             core: Core::Generic { rank: 0 },
@@ -1237,7 +1292,11 @@ impl Geometry {
             u: Array2::zeros((1, u.ncols())),
             v: Array2::zeros((1, v.ncols())),
             choice: None,
-        }))
+        };
+        Ok(match best {
+            Some(found) if found.total() <= empty.total() => found,
+            _ => empty,
+        })
     }
 }
 
