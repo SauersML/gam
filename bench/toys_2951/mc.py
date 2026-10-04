@@ -1,23 +1,26 @@
-"""Case `mc`: a multiple-choice toy, trained.
+"""Case `mc`: a multiple-choice model, written by hand and turned into a random basis.
 
-Prompts are `[f.., Q, q, A, o_1, f?, B, o_2, f?, C, o_3, f?, D, o_4, f?, ANS]`: filler tokens `f`
-(so the options sit at varying positions and no head can read a fixed slot), a question token
-`q`, four lettered option tokens, and the model answers the letter of the option equal to
-`pair(q)` (a fixed random pairing of the 24 content tokens). Two layers of two heads and a ReLU
-MLP, no norms.
+Prompts are `[f.., Q, q, A, o_1, f?, B, o_2, f?, C, o_3, f?, D, o_4, f?, ANS]`: filler tokens `f` (so
+the options sit at varying positions), a question token `q`, four lettered option tokens, and the
+model answers the letter of the option equal to `pair(q)` (a fixed random pairing of the 24
+content tokens). Three attention layers and one lookup MLP, at moderate attention gains (the
+attended key wins by about 6 nats, so no head is saturated flat):
 
-Known mechanism (measured on the trained weights): at `ANS` a layer-1 head attends to the correct
-option and its read of that position decides the letter; the question reaches `ANS` through
-layer 0. Truth: that head's attention on the correct option's position, per probe prompt.
+* layer 0 (previous token): each position attends to the one before it and writes that token into
+  a previous-token subspace (an option's letter lands on the option);
+* layer 1 (question mover): `ANS` attends to the position whose previous token is `Q` and writes
+  the question token; its MLP has one unit per question, writing `pair(q)` (a lookup);
+* layer 2 (answer head): `ANS` attends to the option whose token is `pair(q)` and copies that
+  option's letter (its previous token) to the output: the letter is chosen by attention to the
+  correct option.
 """
 import numpy as np
-import torch
 
-from common import Transformer, place, question, write_case
+from common import Transformer, head_component, place, question, renumber, rotate_residual, unit_component, write_case
 
 CONTENT, LETTERS, Q, ANS, FILLER = 24, 4, 28, 29, 30
 VOCAB, N = 34, 16
-D, H, DH, HIDDEN, LAYERS = 64, 2, 32, 128, 2
+GAIN = 35.0
 
 
 def pairing(seed=3):
@@ -51,65 +54,89 @@ def options(x):
     return [int(np.nonzero(x == CONTENT + letter)[0][0]) + 1 for letter in range(LETTERS)]
 
 
+def question_at(x):
+    return int(np.nonzero(x == Q)[0][0]) + 1
+
+
 def answer(x):
-    q = x[int(np.nonzero(x == Q)[0][0]) + 1]
-    return int(np.nonzero(x[options(x)] == PAIR[q])[0][0])
+    return int(np.nonzero(x[options(x)] == PAIR[x[question_at(x)]])[0][0])
 
 
-def train(seed=0, steps=6000):
-    torch.manual_seed(seed)
-    g = lambda *s: torch.nn.Parameter(torch.randn(*s, dtype=torch.float64) / np.sqrt(s[-1]))
-    params = {"W_E": g(VOCAB, D), "W_pos": g(N, D), "W_U": g(LETTERS, D)}
-    for l in range(LAYERS):
-        for x in "QKV":
-            params[f"{l}.W_{x}"] = g(H * DH, D)
-        params[f"{l}.W_O"] = g(D, H * DH)
-        params[f"{l}.W_in"] = g(HIDDEN, D)
-        params[f"{l}.b_in"] = torch.nn.Parameter(torch.zeros(HIDDEN, dtype=torch.float64))
-        params[f"{l}.W_out"] = g(D, HIDDEN)
-    opt = torch.optim.AdamW(params.values(), lr=2e-3, weight_decay=1e-2)
-    mask = torch.tril(torch.ones(N, N, dtype=torch.bool))
-    rng = np.random.default_rng(seed)
-    for step in range(steps):
-        batch = np.array([prompt(rng) for _ in range(256)])
-        labels = torch.tensor([answer(x) for x in batch])
-        x = params["W_E"][torch.from_numpy(batch)] + params["W_pos"]
-        for l in range(LAYERS):
-            out = 0
-            for h in range(H):
-                rows = slice(h * DH, (h + 1) * DH)
-                q, k, v = (x @ params[f"{l}.W_{n}"][rows].T for n in "QKV")
-                a = torch.softmax(((q @ k.transpose(1, 2)) / np.sqrt(DH)).masked_fill(~mask, -torch.inf), -1)
-                out = out + (a @ v) @ params[f"{l}.W_O"][:, rows].T
-            x = x + out
-            x = x + torch.relu(x @ params[f"{l}.W_in"].T + params[f"{l}.b_in"]) @ params[f"{l}.W_out"].T
-        loss = torch.nn.functional.cross_entropy(x[:, N - 1] @ params["W_U"].T, labels)
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-    p = {k: v.detach().numpy() for k, v in params.items()}
-    layers = [{"W_Q": p[f"{l}.W_Q"], "W_K": p[f"{l}.W_K"], "W_V": p[f"{l}.W_V"], "W_O": p[f"{l}.W_O"],
-               "W_in": p[f"{l}.W_in"], "b_in": p[f"{l}.b_in"], "W_out": p[f"{l}.W_out"]} for l in range(LAYERS)]
-    return Transformer(p["W_E"], p["W_pos"], layers, p["W_U"], n_heads=H, d_head=DH, readouts=[N - 1], causal=True), float(loss)
+def build():
+    tok = lambda t: t
+    prev = lambda t: VOCAB + t
+    quest = lambda c: 2 * VOCAB + c
+    target = lambda c: 2 * VOCAB + CONTENT + c
+    out = lambda l: 2 * VOCAB + 2 * CONTENT + l
+    pos = lambda p: 2 * VOCAB + 2 * CONTENT + LETTERS + p
+    d = 2 * VOCAB + 2 * CONTENT + LETTERS + N
+    dh = VOCAB
+    W_E = np.zeros((VOCAB, d))
+    for t in range(VOCAB):
+        W_E[t, tok(t)] = 1.0
+    W_pos = np.zeros((N, d))
+    for p in range(N):
+        W_pos[p, pos(p)] = 1.0
+    zero = lambda: (np.zeros((dh, d)), np.zeros((dh, d)), np.zeros((dh, d)), np.zeros((d, dh)))
+    Q0, K0, V0, O0 = zero()
+    for p in range(N):
+        Q0[p, pos(p)] = GAIN
+        if p + 1 < N:
+            K0[p + 1, pos(p)] = 1.0
+    for t in range(VOCAB):
+        V0[t, tok(t)] = 1.0
+        O0[prev(t), t] = 1.0
+    Q1, K1, V1, O1 = zero()
+    Q1[0, tok(ANS)] = GAIN
+    K1[0, prev(Q)] = 1.0
+    for c in range(CONTENT):
+        V1[c, tok(c)] = 1.0
+        O1[quest(c), c] = 1.0
+    W_in, b_in, W_out = np.zeros((CONTENT, d)), np.full(CONTENT, -0.5), np.zeros((d, CONTENT))
+    for c in range(CONTENT):
+        W_in[c, quest(c)] = 1.0
+        W_out[target(PAIR[c]), c] = 2.0
+    Q2, K2, V2, O2 = zero()
+    for c in range(CONTENT):
+        Q2[c, target(c)] = GAIN
+        K2[c, tok(c)] = 1.0
+    for l in range(LETTERS):
+        V2[l, prev(CONTENT + l)] = 1.0
+        O2[out(l), l] = 1.0
+    W_U = np.zeros((LETTERS, d))
+    for l in range(LETTERS):
+        W_U[l, out(l)] = 10.0
+    layers = [{"W_Q": Q0, "W_K": K0, "W_V": V0, "W_O": O0},
+              {"W_Q": Q1, "W_K": K1, "W_V": V1, "W_O": O1, "W_in": W_in, "b_in": b_in, "W_out": W_out},
+              {"W_Q": Q2, "W_K": K2, "W_V": V2, "W_O": O2}]
+    model = Transformer(W_E, W_pos, layers, W_U, n_heads=1, d_head=dh, readouts=[N - 1], causal=True)
+    components = [head_component(model, 0, 0, "previous-token head"), head_component(model, 1, 0, "question mover"),
+                  head_component(model, 2, 0, "answer head: attends to the correct option, copies its letter")]
+    components += [unit_component(model, 1, [c], f"lookup: question {c} -> {PAIR[c]}") for c in range(CONTENT)]
+    return model, components
 
 
 def main():
     rng = np.random.default_rng(11)
-    model, loss = train()
+    model, components = build()
     probe = np.array([prompt(rng) for _ in range(256)])
-    accuracy = (model.forward(probe).argmax(-1)[:, 0] == np.array([answer(x) for x in probe])).mean()
+    truth_answer = np.array([answer(x) for x in probe])
+    assert (model.forward(probe).argmax(-1)[:, 0] == truth_answer).all()
+    _, units = rotate_residual(model, components, rng)
+    renumber(components, units)
+    logits = model.forward(probe)
+    assert (logits.argmax(-1)[:, 0] == truth_answer).all()
     record = model.record(probe)
     correct_position = np.array([options(x)[answer(x)] for x in probe])
-    weights = {(l, h): record[("pattern", l, h)][np.arange(len(probe)), N - 1, correct_position].mean() for l in range(LAYERS) for h in range(H)}
-    print(f"trained: loss {loss:.4f}, accuracy {accuracy:.4f}; weight on the correct option at ANS per head",
-          {f"{l}.{h}": round(float(w), 2) for (l, h), w in weights.items()})
-    (al, ah) = max((k for k in weights if k[0] == 1), key=lambda k: weights[k])
-    attention = [{"name": f"answer head {al}.{ah}: ANS reads the correct option", "layer": al, "head": ah,
-                  "per_probe": [[[N - 1, int(p)]] for p in correct_position]}]
-    question_at = np.array([int(np.nonzero(x == Q)[0][0]) + 1 for x in probe])
-    question_weight = {(0, h): record[("pattern", 0, h)][np.arange(len(probe)), N - 1, question_at].mean() for h in range(H)}
-    qh = max(question_weight, key=question_weight.get)[1]
-    print(f"layer-0 weight on the question at ANS per head", {h: round(float(question_weight[(0, h)]), 2) for h in range(H)})
+    rows = np.arange(len(probe))
+    print("attention at ANS: answer head on the correct option %.3f, question mover on the question %.3f; mean P(answer) %.3f" % (
+        record[("pattern", 2, 0)][rows, N - 1, correct_position].mean(),
+        record[("pattern", 1, 0)][rows, N - 1, [question_at(x) for x in probe]].mean(),
+        np.exp(logits[rows, 0, truth_answer] - np.log(np.exp(logits[:, 0]).sum(-1))).mean()))
+    attention = [{"name": "previous-token head", "layer": 0, "head": 0, "targets": [[i, i - 1] for i in range(1, N)]},
+                 {"name": "question mover: ANS reads the question", "layer": 1, "head": 0, "per_probe": [[[N - 1, question_at(x)]] for x in probe]},
+                 {"name": "answer head: ANS reads the correct option", "layer": 2, "head": 0, "per_probe": [[[N - 1, int(p)]] for p in correct_position]}]
+    lookup = {int(c["name"].split()[2]): c["units"][0] for c in components if c["name"].startswith("lookup")}
 
     questions = []
     n = 0
@@ -126,21 +153,23 @@ def main():
         y[a], y[b] = y[b], y[a]
         add("input: move the correct option to another letter", x, [{"kind": "input", "input": y.tolist()}])
         x = prompt(rng)
-        add("input: another question", x, [{"kind": "input", "input": prompt(rng, correct=answer(x)).tolist()}])
+        y = x.copy()
+        y[question_at(x)] = rng.choice(np.setdiff1d(np.arange(CONTENT), [x[question_at(x)]]))
+        add("input: another question", x, [{"kind": "input", "input": y.tolist()}])
         x = prompt(rng)
         y = x.copy()
-        y[options(x)[answer(x)]] = rng.choice(np.setdiff1d(np.arange(CONTENT), np.concatenate([x[options(x)], [PAIR[x[int(np.nonzero(x == Q)[0][0]) + 1]]]])))
+        y[options(x)[answer(x)]] = rng.choice(np.setdiff1d(np.arange(CONTENT), np.concatenate([x[options(x)], [PAIR[x[question_at(x)]]]])))
         add("input: remove the correct option", x, [{"kind": "input", "input": y.tolist()}])
-        add("ablate the answer head", prompt(rng), [{"kind": "scale", "place": place("head", al, head=ah), "factor": 0.0}])
-        add("patch the answer head from another prompt", prompt(rng), [{"kind": "patch", "place": place("head", al, N - 1, head=ah), "donor": prompt(rng).tolist()}])
-        add("patch the question mover from another prompt", prompt(rng), [{"kind": "patch", "place": place("head", 0, N - 1, head=qh), "donor": prompt(rng).tolist()}])
-        for h in range(H):
-            if (1, h) != (al, ah):
-                add(f"ablate head 1.{h}", prompt(rng), [{"kind": "scale", "place": place("head", 1, head=h), "factor": 0.0}])
-        add("ablate layer 1's MLP at ANS", prompt(rng), [{"kind": "scale", "place": place("mlp", 1, N - 1), "factor": 0.0}])
-    samples = np.array([prompt(rng) for _ in range(2048)])
+        add("ablate the answer head", prompt(rng), [{"kind": "scale", "place": place("head", 2, head=0), "factor": 0.0}])
+        add("patch the answer head from another prompt", prompt(rng), [{"kind": "patch", "place": place("head", 2, N - 1, head=0), "donor": prompt(rng).tolist()}])
+        add("patch the question mover from another prompt", prompt(rng), [{"kind": "patch", "place": place("head", 1, N - 1, head=0), "donor": prompt(rng).tolist()}])
+        add("ablate the previous-token head", prompt(rng), [{"kind": "scale", "place": place("head", 0, head=0), "factor": 0.0}])
+        x = prompt(rng)
+        add("ablate the question's lookup unit", x, [{"kind": "scale", "place": place("mlp", 1, N - 1, units=[lookup[int(x[question_at(x)])]]), "factor": 0.0}])
+        add("scale the answer head", prompt(rng), [{"kind": "scale", "place": place("head", 2, N - 1, head=0), "factor": float(rng.choice([0.3, 0.6]))}])
+    samples = np.array([prompt(rng) for _ in range(1024)])
     record = model.export("mc", samples, "fillers, a question, four lettered options at varying positions (one is the question's pair), ANS", vocab=VOCAB, classes=LETTERS)
-    truth = {"mechanism": "a layer-1 head at ANS attends to the correct option; its position decides the letter", "components": [],
+    truth = {"mechanism": "the answer head at ANS attends to the correct option and copies its letter", "components": components,
              "attention": attention, "probe": probe.tolist()}
     write_case("mc", model, record, samples, questions, truth)
 

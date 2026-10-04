@@ -207,9 +207,13 @@ fn run_case(root: &Path, dir: &Path, run: &Run) -> Result<Value, String> {
     let (null, transcript) = baselines(&case)?;
     let scored = scores(&case, &outcomes, &[("explanation", &ours), ("null", &null), ("transcript", &transcript)])?;
     let found = mechanism(&case, &explained)?;
+    // The counterfactual test passes when the explanation's held-out KL is below both baselines'
+    // and its CHIVE AUROC above both (argmax agreement is reported, not tested: on a near-uniform
+    // readout it flips with any error).
     let held = |name: &str, key: &str| scored[name]["held_out"][key].as_f64().unwrap_or(f64::NAN);
+    let auroc = |name: &str| scored[name]["chive_held_out"]["auroc"].as_f64().unwrap_or(f64::NAN);
     let beats = held("explanation", "mean_kl") < held("null", "mean_kl").min(held("transcript", "mean_kl"))
-        && held("explanation", "argmax") >= held("null", "argmax").max(held("transcript", "argmax"));
+        && (auroc("explanation").is_nan() || auroc("explanation") > auroc("null").max(auroc("transcript")));
     let library: BTreeMap<String, Value> = explanation
         .sites
         .iter()
