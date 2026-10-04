@@ -250,6 +250,23 @@ impl Resident {
     pub fn output(&self, trace: &DeviceTrace) -> Result<Tensor, String> {
         self.program.device().copy(trace.value(self.output)?).map_err(|e| e.to_string())
     }
+
+    /// Whether a root intervention would hit an output left unmaterialized by
+    /// intermediate execution. Such an intervention must not be silently skipped.
+    pub fn is_streamed_head_root(&self, root: usize) -> Result<bool, String> {
+        let node = *self.map.get(root).ok_or("root node outside artifact")?;
+        Ok(self.program.is_streamed_head(node))
+    }
+
+    /// Bounded caller-selected tile of this artifact's own compiled output head.
+    pub fn logits_rows(&self, trace: &DeviceTrace, start: usize, rows: usize) -> Result<Tensor, String> {
+        self.program.logits_rows(trace, start, rows)
+    }
+
+    /// Hidden width and vocabulary width for sizing a streamed output tile.
+    pub fn streamed_head_dimensions(&self) -> (usize, usize) {
+        (self.program.widths()[self.program.hidden()], self.program.classes())
+    }
 }
 
 #[cfg(test)]

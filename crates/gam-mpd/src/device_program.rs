@@ -474,6 +474,15 @@ impl DeviceProgram {
         Ok(out)
     }
 
+    /// Materialize only the requested rows of the actual compiled dense head.
+    /// The caller owns its tile budget; no normalization or precision change is added.
+    pub fn logits_rows(&self, trace: &DeviceTrace, start: usize, rows: usize) -> Result<Tensor, String> {
+        if rows == 0 || start.checked_add(rows).is_none_or(|end| end > trace.rows) {
+            return Err("device: streamed logits row range outside trace".into());
+        }
+        self.logits_tile(trace.value(self.head.hidden)?, start, rows, self.arithmetic)
+    }
+
     /// The arithmetic of the forward pass's and the head's products.
     #[must_use]
     pub fn arithmetic(&self) -> Arithmetic {

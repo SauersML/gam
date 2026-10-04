@@ -9,6 +9,10 @@ use gam_gpu::tensor::Device;
 use ndarray::{Array2, s};
 use std::{collections::BTreeMap, sync::OnceLock};
 
+#[path = "streamed_family_run.rs"]
+mod streamed;
+pub use streamed::{StreamedBudget, StreamedFamilyRun};
+
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct Timing {
     pub native_teacher_seconds: f64,
