@@ -231,7 +231,7 @@ fn heads(export: &std::path::Path, half: usize, sequences: usize) -> Result<(), 
         let site = all.iter().find(|s| s.name == format!("blocks.{layer}.q")).ok_or("no query site")?;
         let x = gam_mpd::masked::read_values(&text, site)?;
         let c = x.t().dot(&x) / x.nrows() as f64;
-        let e = gam_mpd::dense::eigh(c.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
+        let e = gam_linalg::decompose::eigh(c.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
         let mut root = e.vectors.clone();
         for (i, l) in e.values.iter().enumerate() {
             root.column_mut(i).mapv_inplace(|v| v * l.max(0.0).sqrt());
@@ -240,7 +240,7 @@ fn heads(export: &std::path::Path, half: usize, sequences: usize) -> Result<(), 
         // The fraction of `b`'s energy (rows, whitened) in the row space of `a` (whitened).
         let within = |a: &Array2<f64>, b: &Array2<f64>| -> Result<f64, String> {
             let (aw, bw) = (a.dot(&root), b.dot(&root));
-            let d = gam_mpd::dense::svd(aw.view(), false).map_err(|e| format!("{e:?}"))?;
+            let d = gam_linalg::decompose::svd(aw.view(), false).map_err(|e| format!("{e:?}"))?;
             let kept = d.singular_values.iter().filter(|s| **s > d.band).count();
             let basis = d.vt.slice(s![..kept, ..]).to_owned();
             let projected = bw.dot(&basis.t());
@@ -648,7 +648,7 @@ fn selector(rows: &[usize], d: usize) -> Array2<f64> {
 
 /// The pseudo-inverse of `x` over its singular values beyond the decomposition's band.
 fn pseudo_inverse(x: &Array2<f64>) -> Result<Array2<f64>, String> {
-    let d = gam_mpd::dense::svd(x.view(), false).map_err(|e| format!("{e:?}"))?;
+    let d = gam_linalg::decompose::svd(x.view(), false).map_err(|e| format!("{e:?}"))?;
     let kept: Vec<usize> = (0..d.singular_values.len()).filter(|i| d.singular_values[*i] > d.band).collect();
     let inverse = ndarray::Array1::from_iter(kept.iter().map(|i| 1.0 / d.singular_values[*i]));
     let scaled = &d.u.select(Axis(1), &kept).t() * &inverse.insert_axis(Axis(1));
@@ -755,7 +755,7 @@ fn rules(export: &std::path::Path, out: &std::path::Path, observations: f64, sta
                                     // Z Zᵀ = U Λ Uᵀ on the planes; the prediction keeps its k leading
                                     // directions, P_k = U_k Λ_k⁻¹ U_kᵀ Z D⁻¹ (k = all is (Z Zᵀ)⁺ Z D⁻¹), and
                                     // ⟨W, P_k⟩, ⟨P_k, P_k⟩ accumulate over k through the precomputed forms.
-                                    let e = gam_mpd::dense::eigh(zz.select(Axis(0), &planes).select(Axis(1), &planes).view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None)
+                                    let e = gam_linalg::decompose::eigh(zz.select(Axis(0), &planes).select(Axis(1), &planes).view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None)
                                         .map_err(|e| format!("{e:?}"))?;
                                     let mut order: Vec<usize> = (0..planes.len()).filter(|i| e.values[*i] > e.band).collect();
                                     order.sort_by(|a, b| e.values[*b].total_cmp(&e.values[*a]));
@@ -935,7 +935,7 @@ fn mean_loss(log_probs: &Array2<f64>, rows: &[(usize, u32)]) -> f64 {
 
 /// `x` minus nothing but its best rank-`rank` part: the truncated SVD.
 fn truncated(x: &Array2<f64>, rank: usize) -> Result<Array2<f64>, String> {
-    let d = gam_mpd::dense::svd(x.view(), false).map_err(|e| format!("{e:?}"))?;
+    let d = gam_linalg::decompose::svd(x.view(), false).map_err(|e| format!("{e:?}"))?;
     let k = rank.min(d.singular_values.len());
     let u = &d.u.slice(s![.., ..k]) * &d.singular_values.slice(s![..k]).insert_axis(Axis(0));
     Ok(u.dot(&d.vt.slice(s![..k, ..])))
