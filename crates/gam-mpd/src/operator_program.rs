@@ -2825,6 +2825,15 @@ impl OperatorProgram {
         }
     }
 
+    /// One node's interface (validates the whole program).
+    pub fn node_interface(&self, node: usize) -> Result<Interface, ProgramError> {
+        let mut interfaces = self.interfaces()?;
+        if node >= interfaces.len() {
+            return Err(ProgramError::Reference { what: "node", index: node });
+        }
+        Ok(interfaces.swap_remove(node))
+    }
+
     /// Remove nodes the output does not read and operators and bases no node reads, keeping order.
     pub fn prune(&mut self) {
         let mut live = vec![false; self.nodes.len()];
