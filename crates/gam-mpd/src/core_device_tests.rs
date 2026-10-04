@@ -29,6 +29,31 @@ fn close(a: &Array2<f64>, b: &Array2<f64>, tolerance: f64, what: &str) {
     assert!(worst <= tolerance * scale, "{what}: off by {worst} at scale {scale}");
 }
 
+/// Different labels for a tied selection must preserve both its written value and its price.
+fn equivalent_sets(z: &Array2<f64>, u: &Array2<f64>, ranks: &[usize], bits: &[f64], actual: &Array2<f64>, expected: &Array2<f64>, what: &str) {
+    assert_eq!(actual.dim(), expected.dim(), "{what}: mask dimensions");
+    assert_eq!(actual.dim(), (z.nrows(), ranks.len()));
+    assert!(actual.iter().chain(expected.iter()).all(|x| *x == 0.0 || *x == 1.0), "{what}: binary masks");
+    let columns: Vec<usize> = ranks.iter().enumerate().flat_map(|(b, rank)| std::iter::repeat_n(b, *rank)).collect();
+    assert_eq!(columns.len(), z.ncols());
+    let written = |mask: &Array2<f64>| (z * &Array2::from_shape_fn(z.dim(), |(r, c)| mask[[r, columns[c]]])).dot(u);
+    let price = |mask: &Array2<f64>| Array2::from_shape_fn((mask.nrows(), 1), |(r, _)| mask.row(r).iter().zip(bits).map(|(on, bits)| on * bits).sum());
+    let (a, b) = (written(actual), written(expected));
+    assert!(a.iter().chain(b.iter()).all(|x| x.is_finite()), "{what}: finite writes");
+    close(&a, &b, 1e-12, &format!("{what}: selected writes"));
+    close(&price(actual), &price(expected), 1e-12, &format!("{what}: selected description"));
+}
+
+#[test]
+fn tied_masks_must_preserve_writes_and_description() {
+    let z = ndarray::array![[2.0, 2.0]];
+    let u = ndarray::array![[1.0], [1.0]];
+    let (a, b) = (ndarray::array![[1.0, 0.0]], ndarray::array![[0.0, 1.0]]);
+    equivalent_sets(&z, &u, &[1, 1], &[3.0, 3.0], &a, &b, "equivalent factors");
+    assert!(std::panic::catch_unwind(|| equivalent_sets(&z, &u, &[1, 1], &[3.0, 4.0], &a, &b, "different price")).is_err());
+    assert!(std::panic::catch_unwind(|| equivalent_sets(&z, &ndarray::array![[1.0], [2.0]], &[1, 1], &[3.0, 3.0], &a, &b, "different write")).is_err());
+}
+
 /// Per passage, the CPU's KL per row and blocks on of `replacement` with `members` replaced.
 fn on_cpu(model: &OperatorProgram, replacement: &dyn Replacement, members: &[usize], passages: &[Passage]) -> Vec<(ndarray::Array1<f64>, Vec<Array2<f64>>)> {
     let masked = replacement.masked(model, members).expect("masked");
@@ -65,7 +90,20 @@ fn every_replacement_scores_on_a_device_as_on_the_cpu() {
                     for (&p, (kl, masks)) in chosen.iter().zip(&run) {
                         let what = format!("{} {name} {members:?} passage {p}", device.name());
                         close(&kl.clone().insert_axis(ndarray::Axis(1)), &cpu[p].0.clone().insert_axis(ndarray::Axis(1)), 1e-9, &what);
-                        assert_eq!(masks, &cpu[p].1, "{what}: blocks on");
+                        assert_eq!(masks.len(), cpu[p].1.len(), "{what}: mask count");
+                        if name == "given" {
+                            assert_eq!(masks, &cpu[p].1, "{what}: prescribed blocks on");
+                        } else if masks != &cpu[p].1 {
+                            // Reassociated products can break ties between equivalent factors.
+                            // Require the same written map and description on the CPU's reads,
+                            // so an unrelated or more expensive mask cannot pass via equal KL.
+                            let masked = explanation.masked(&model, &members).expect("masked");
+                            let (trace, _) = explanation.execute(&masked, &members, &passages[p].base).expect("cpu trace");
+                            for (k, ((actual, expected), &m)) in masks.iter().zip(&cpu[p].1).zip(&members).enumerate() {
+                                let f = &explanation.sites[m];
+                                equivalent_sets(&trace.values[masked.z[k]], &f.library.u, &f.ranks, &f.bits, actual, expected, &format!("{what} {}", f.site.name));
+                            }
+                        }
                     }
                 }
             }
