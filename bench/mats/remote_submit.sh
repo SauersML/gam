@@ -27,7 +27,9 @@ exec 9> "$HOME/gam-cluster/.build.lock"
 flock 9
 cd "$HOME/gam-cluster"
 git fetch -q origin main
-git checkout -q --detach "$C"
+# -f: a build can leave Cargo.lock rewritten in this clone; it must never block the next checkout
+# (it did, and marked a commit that builds as failed).
+git checkout -q -f --detach "$C"
 export CARGO_BUILD_JOBS=${SLURM_CPUS_PER_TASK:-16}
 # Every job runs on l40-worker, an AMD EPYC 7763 (Zen 3).
 export RUSTFLAGS="-C target-cpu=znver3"
