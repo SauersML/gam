@@ -31,6 +31,27 @@ pub struct RankFloor {
     pub fixed_writer_span: Option<ResidualFloor>,
     pub writer_orthogonality_defect_upper: Option<f64>,
 }
+/// Necessary correction ranks conditional on one fixed base prediction. The
+/// base can have full output rank; only its additive correction is restricted.
+#[derive(Clone, Debug, Serialize)]
+pub struct FixedBaseRankCurve {
+    pub rows: usize,
+    pub output_width: usize,
+    pub native_frobenius_norm: f64,
+    pub native_norm_error: f64,
+    pub residual_frobenius_norm: f64,
+    pub subtraction_error: f64,
+    pub centering_error: f64,
+    pub singular_values: Vec<f64>,
+    pub svd_validation: SvdValidation,
+    /// Same order as the requested ranks. One SVD serves the whole curve.
+    pub corrections: Vec<CorrectionRankFloor>,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct CorrectionRankFloor {
+    pub rank: usize,
+    pub affine_correction: ResidualFloor,
+}
 /// A posteriori validation, independent of the decomposition's resolution cutoff.
 #[derive(Clone, Debug, Serialize)]
 pub struct SvdValidation {
@@ -199,6 +220,104 @@ fn floor(value: f64, error: f64, native_upper: f64) -> Result<ResidualFloor, Str
         necessary_local_lower: lower,
     })
 }
+
+fn centered_writes(values: &Array2<f64>) -> Result<(Array2<f64>, f64), String> {
+    let (n, d) = values.dim();
+    let mut centered = values.clone();
+    let mut centering_errors = Vec::with_capacity(values.len());
+    for col in 0..d {
+        let mut sum = 0.0;
+        let mut absolute = 0.0;
+        for &v in values.column(col) {
+            sum += v;
+            absolute = add_up(absolute, v.abs());
+        }
+        if !sum.is_finite() || !absolute.is_finite() {
+            return Err("centering accumulation overflow".into());
+        }
+        let mean = sum / n as f64;
+        let mean_error = add_up(
+            mul_up(gamma(n + 2)?, (absolute / n as f64).next_up()),
+            mul_up(f64::MIN_POSITIVE, (n + 2) as f64),
+        );
+        for row in 0..n {
+            centered[[row, col]] -= mean;
+            centering_errors.push(add_up(
+                mean_error,
+                add_up(
+                    mul_up(f64::EPSILON, add_up(values[[row, col]].abs(), mean.abs())),
+                    f64::MIN_POSITIVE,
+                ),
+            ));
+        }
+    }
+    Ok((centered, upper(norm(centering_errors)?)))
+}
+
+/// Fix finite arrays Y (native writes) and B (base predictions). For any
+/// correction whose centered output matrix has rank at most K, Eckart–Young
+/// bounds ||Y - B - correction||F below by the singular tail of centered Y-B.
+/// Dividing by ||Y||F gives a necessary maximum-row / RMS-native-row error.
+/// This denominator is the native norm, never the residual norm.
+///
+/// The subtraction, centering and SVD comparison errors are included. Centering
+/// is an orthogonal projection, so it cannot amplify subtraction error. All
+/// values here are the supplied binary64 arrays regarded as exact numbers:
+/// neural execution and correction evaluation roundoff are not certified.
+/// This is conditional on this fixed B, not a lower bound over alternative bases.
+/// A constant correction offset is unrestricted and removed by centering.
+pub fn measured_fixed_base_rank_curve(
+    native: &Array2<f64>,
+    base: &Array2<f64>,
+    ranks: &[usize],
+) -> Result<FixedBaseRankCurve, String> {
+    let (rows, output_width) = native.dim();
+    if rows == 0 || output_width == 0 || base.dim() != native.dim() {
+        return Err("matching nonempty native and base write families required".into());
+    }
+    let native_norm = norm(native.iter().copied())?;
+    let base_norm = norm(base.iter().copied())?;
+    let native_upper = if native_norm.0 == 0.0 {
+        0.0
+    } else {
+        mul_up(upper(native_norm), add_up(1.0, gamma(native.len() + 4)?))
+    };
+    let residual = native - base;
+    let residual_norm = norm(residual.iter().copied())?;
+    let subtraction_error = subtract_error(upper(native_norm), upper(base_norm), native.len());
+    let (centered, centering_error) = centered_writes(&residual)?;
+    let decomposition = svd(centered.view(), false).map_err(|e| e.to_string())?;
+    let validation = validate_svd(&centered, &decomposition)?;
+    let mut corrections = Vec::with_capacity(ranks.len());
+    for &rank in ranks {
+        let tail = norm(decomposition.singular_values.iter().skip(rank).copied())?;
+        let count = decomposition.singular_values.len().saturating_sub(rank);
+        let spectral_error = mul_up(
+            validation.singular_value_enclosure,
+            (count.max(1) as f64).sqrt().next_up(),
+        );
+        let error = add_up(
+            add_up(tail.1, spectral_error),
+            add_up(centering_error, subtraction_error),
+        );
+        corrections.push(CorrectionRankFloor {
+            rank,
+            affine_correction: floor(tail.0, error, native_upper)?,
+        });
+    }
+    Ok(FixedBaseRankCurve {
+        rows,
+        output_width,
+        native_frobenius_norm: native_norm.0,
+        native_norm_error: (native_upper - native_norm.0).max(native_norm.1).next_up(),
+        residual_frobenius_norm: residual_norm.0,
+        subtraction_error,
+        centering_error,
+        singular_values: decomposition.singular_values.to_vec(),
+        svd_validation: validation,
+        corrections,
+    })
+}
 /// For any predictions in a K-dimensional affine output space, centering makes
 /// their matrix rank at most K. Eckart–Young bounds Frobenius error below by the
 /// singular-value tail of centered native writes. Since max-row >= Frobenius/√n
@@ -228,32 +347,7 @@ pub fn measured_rank_floor(
     } else {
         mul_up(upper(native_norm), add_up(1.0, gamma(native.len() + 4)?))
     };
-    let mut centered = native.clone();
-    let mut centering_errors = Vec::with_capacity(native.len());
-    for col in 0..d {
-        let mut sum = 0.0;
-        let mut absolute = 0.0;
-        for &v in native.column(col) {
-            sum += v;
-            absolute += v.abs();
-        }
-        if !sum.is_finite() || !absolute.is_finite() {
-            return Err("centering accumulation overflow".into());
-        }
-        let mean = sum / n as f64;
-        let mean_error =
-            (gamma(n + 2)? * absolute / n as f64 + f64::MIN_POSITIVE * n as f64).next_up();
-        for row in 0..n {
-            centered[[row, col]] -= mean;
-            centering_errors.push(
-                (mean_error
-                    + f64::EPSILON * (native[[row, col]].abs() + mean.abs())
-                    + f64::MIN_POSITIVE)
-                    .next_up(),
-            );
-        }
-    }
-    let centering_error = upper(norm(centering_errors)?);
+    let (centered, centering_error) = centered_writes(native)?;
     let decomposition = svd(centered.view(), false).map_err(|e| e.to_string())?;
     let validation = validate_svd(&centered, &decomposition)?;
     let tail = norm(decomposition.singular_values.iter().skip(rank).copied())?;
@@ -330,6 +424,82 @@ pub fn measured_rank_floor(
 mod tests {
     use super::*;
     use ndarray::array;
+    #[test]
+    fn fixed_full_rank_base_escapes_low_rank_output_restriction() {
+        let native = array![[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]];
+        assert!(
+            measured_rank_floor(&native, 0, None)
+                .unwrap()
+                .affine_rank
+                .necessary_local_lower
+                .unwrap()
+                > 0.99
+        );
+        let curve = measured_fixed_base_rank_curve(&native, &native, &[0, 1, 2]).unwrap();
+        for correction in curve.corrections {
+            assert_eq!(
+                correction.affine_correction.necessary_local_lower,
+                Some(0.0)
+            );
+        }
+    }
+    #[test]
+    fn correction_floor_uses_native_denominator_and_unrestricted_offset() {
+        let native = array![[10.0, 0.0], [-10.0, 0.0], [0.0, 10.0], [0.0, -10.0]];
+        // Residual is 0.1*native plus a constant. The latter is free under the
+        // affine-rank relaxation; it must not inflate the rank-zero floor.
+        let base = native.mapv(|x| 0.9 * x - 100.0);
+        let curve = measured_fixed_base_rank_curve(&native, &base, &[0, 1, 2, 99]).unwrap();
+        let expected = [0.1, 0.1 / 2.0_f64.sqrt(), 0.0, 0.0];
+        for (point, expected) in curve.corrections.iter().zip(expected) {
+            let lower = point.affine_correction.necessary_local_lower.unwrap();
+            assert!(lower <= expected + 1e-15);
+            assert!((lower - expected).abs() < 1e-9);
+        }
+        // Changing the fixed base is a substantive change to the premise.
+        let zero = Array2::zeros(native.dim());
+        let other = measured_fixed_base_rank_curve(&native, &zero, &[0]).unwrap();
+        assert!(
+            other.corrections[0]
+                .affine_correction
+                .necessary_local_lower
+                .unwrap()
+                > 0.99
+        );
+    }
+    #[test]
+    fn fixed_base_curve_covers_rounded_subtraction_and_zero_native_norm() {
+        let native = array![[1.0, 0.0], [-1.0, 0.0]];
+        let base = array![[f64::EPSILON / 4.0, 0.0], [0.0, 0.0]];
+        assert_eq!((native[[0, 0]] - base[[0, 0]]).to_bits(), 1.0_f64.to_bits());
+        let curve = measured_fixed_base_rank_curve(&native, &base, &[0]).unwrap();
+        assert!(curve.subtraction_error >= f64::EPSILON / 4.0);
+        assert!(
+            curve.corrections[0]
+                .affine_correction
+                .necessary_local_lower
+                .unwrap()
+                < 1.0
+        );
+        let zeros = Array2::zeros((2, 2));
+        let zero_curve = measured_fixed_base_rank_curve(&zeros, &native, &[0]).unwrap();
+        assert!(
+            zero_curve.corrections[0]
+                .affine_correction
+                .necessary_local_lower
+                .is_none()
+        );
+    }
+    #[test]
+    fn fixed_base_curve_rejects_mismatched_and_nonfinite_arrays() {
+        let native = array![[1.0, 2.0]];
+        assert!(measured_fixed_base_rank_curve(&native, &Array2::zeros((2, 1)), &[0]).is_err());
+        assert!(measured_fixed_base_rank_curve(&native, &array![[f64::NAN, 0.0]], &[0]).is_err());
+        assert!(
+            measured_fixed_base_rank_curve(&Array2::zeros((0, 2)), &Array2::zeros((0, 2)), &[0])
+                .is_err()
+        );
+    }
     #[test]
     fn enclosure_validates_actual_factors_and_ignores_claimed_cutoff() {
         let a = array![[3.0, 0.0], [0.0, 1.0]];
