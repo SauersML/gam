@@ -1,0 +1,61 @@
+{
+  "status": "Prospective discovery diagnostic; no fitted outcome asserted",
+  "question": "Can a learned reusable vector computation explain multiple native MLP uses beyond sharing the architecture's generic activation function?",
+  "source": {
+    "model": "Goodfire four-layer language model t-9d2b8f02",
+    "checkpoint_sha256": "155e0e9ee8f899ab100bdb84224751308ae86ed57f746dbea403b93276a96552",
+    "extraction": "codex-affine-mlp-9c504de18084/extract/EXTRACT.json",
+    "extraction_sha256": "e914269c811d00503b93167a66bbd761d196c76fd8dd44fd18698532bd4a565e",
+    "extraction_role": "Only original native input/write arrays are reused. No affine, SVD or Copy replacement is the proposed learned rule.",
+    "residual_width": 768,
+    "native_hidden_width": 3072,
+    "train_rows_per_use": 4096,
+    "evaluation_rows_per_use": 1024,
+    "sequence_length": 512,
+    "evaluation_status": "Disjoint from these fitting passages, but already examined in prior project experiments. This panel is not untouched confirmatory evidence."
+  },
+  "discovery_and_transfer": {
+    "discovery_uses": [0, 1],
+    "transfer_uses": [2, 3],
+    "discovery": "Fit candidate operations and native bindings jointly on discovery-use training rows. Select body structures and snapshots using training evidence only.",
+    "transfer": "Freeze the complete discovered body, including its numerical coefficients, offsets and internal scales. Fit only explicitly listed transfer-use bindings on the transfer-use training rows. Record body identity and trainable operator IDs before and after fitting.",
+    "scope": "This split is a finite experiment on four uses, not a claim that the model consists of four independent algorithms. Full-dimensional arguments are allowed; argument count is not payload dimension."
+  },
+  "required_controls": [
+    "Original native computation with the same interfaces and evaluation episodes",
+    "Independent per-use fits with the same primitive inventory and reported fitting compute",
+    "Primitive-only sharing, explicitly labelled architectural reuse when it only recovers the already shared activation architecture",
+    "For learned shared numerical geometry: frozen random and frozen one-use-native bodies with identical binding capacity and optimizer settings"
+  ],
+  "gauge_checks": {
+    "square_body": "An invertible shared square matrix before a freely learned reader can be absorbed into that reader. Its existence alone is not evidence of discovered organization.",
+    "overcomplete_body": "A shared 3072-by-768 reader with paid per-use 768-by-768 input bindings preserves the native nonlinear width. Its overcomplete row relations cannot generally be removed by an invertible input-coordinate change. This is a numerical-structure hypothesis, not automatically an interpreted algorithm.",
+    "permutations": "Native hidden-unit ordering is arbitrary. Failure under one ordering is not evidence that reusable structure is absent.",
+    "signs": "GELU(-z)=GELU(z)-z permits sign changes to be absorbed only when the representation also supplies the required adjustable affine contribution. Do not silently quotient out unavailable operations."
+  },
+  "measurements": {
+    "proposal_objective": "Maximum across use and row of native-output Euclidean error divided by that use's fixed native RMS output norm. A pooled denominator is a different objective and must be labelled as such.",
+    "fitting_arithmetic": "Record the explicit product arithmetic and all optimizer settings. Float32 proposal products are permitted; final decoded fidelity uses the existing float64 evaluation path.",
+    "cost": "Complete serialized-artifact C32, including bindings, body literals, wiring, retained native computation and native-control mappings. No hypothetical sharing discount.",
+    "local": "Fixed native pure-MLP contribution boundaries on identical native parent states. Do not dilute the scale with an unchanged residual skip.",
+    "run": "Autonomous saved-byte execution on the declared native intervention family. Report maximum group-mean per-token KL with the group definition unchanged, alongside native effects and unsupported interventions.",
+    "existing_run_spec": "copy-whole-sequence-validation-20261004/spec.json",
+    "existing_run_spec_sha256": "3c05b66324dfb02e33da7eff98784a7ec432123e24fea78018b892efb4256436",
+    "existing_run_episodes": 80,
+    "controls": "Whole-hidden scaling may use the existing paid, validated linear transport. Partial hidden-coordinate controls are not inferred from whole-hidden scaling.",
+    "frontier": "Report the measured cost/local/run tradeoff. Any numerical tolerance grid must be recorded as an explicit evaluation choice, not a universal definition of understanding."
+  },
+  "before_each_fit": [
+    "Save the complete finite expression inventory and all declared language restrictions, including arity, widths, primitive choices, constants and body-size budget",
+    "Save initialization, random seed, trainable operator IDs, parameter count, optimizer settings, iteration budget and memory budget",
+    "Verify source hashes and save hardware, executable commit and data provenance",
+    "State which controls and inventory members are not yet implemented or measured"
+  ],
+  "decision_rules": {
+    "first_fit": "Measure one bounded native-data fit and saved-byte replay before assigning a large compute budget. Record runtime, objective movement and held-out error even if negative.",
+    "positive": "Shared computation improves a measured fidelity/cost tradeoff against relevant controls, transfers with its body frozen, and predicts native interventions. Inspect what the body and bindings actually encode before assigning an algorithmic interpretation.",
+    "negative": "Rejected fitted candidates establish failure of those returned programs. They do not prove the whole structural family infeasible or simple native computation absent.",
+    "stop_expanding": "If the pilot shows no benefit over generic sharing, diagnose representation versus fitting versus intervention support before adding a larger bank of the same proposals.",
+    "vpd": "This diagnostic alone cannot establish a matched-compute victory over VPD. Account for all candidate fitting and selection compute in a later comparison."
+  }
+}
