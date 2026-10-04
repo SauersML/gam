@@ -256,9 +256,6 @@ pub struct Masked {
     /// The box claim's terms ([`BoxTerms`]) with what they were computed from: the `U` operators
     /// and a fingerprint of the written Fishers.
     box_terms: Mutex<Option<(Vec<Arc<Operator>>, u64, Arc<BoxTerms>)>>,
-    /// Per site, per written node, per read node the library's sum `U_iᵀ V_j` as an operator
-    /// ([`Masked::dense_program`]), with the `V` and `U` operators it was computed from.
-    sums: Mutex<Option<(Vec<Arc<Operator>>, Arc<Vec<Vec<Vec<Arc<Operator>>>>>)>>,
 }
 
 /// A masked program's device twin, lowered on first use.
@@ -401,7 +398,6 @@ impl Masked {
             head: None,
             lowered: Mutex::new(Lowered::Untried),
             box_terms: Mutex::new(None),
-            sums: Mutex::new(None),
         })
     }
 
@@ -483,82 +479,9 @@ impl Masked {
         Ok(terms)
     }
 
-    /// The program with every site in `dense` computed as if all its gates were on, through its
-    /// library's sum `W = Σ_c u_c v_cᵀ`: each read node enters each written node through one
-    /// operator `U_iᵀ V_j`, and the site's coordinates become a copy of its mask, so a dense site
-    /// costs what the model's own map does. Its values agree with this program's wherever those
-    /// sites' masks are all one (up to rounding); nothing else of the program changes.
-    pub(crate) fn dense_program(&self, dense: &[bool]) -> Result<OperatorProgram, String> {
-        let sums = self.sums()?;
-        let interfaces = self.program.interfaces().map_err(|e| e.to_string())?;
-        let mut program = self.program.clone();
-        for (k, site) in self.sites.iter().enumerate() {
-            if !dense[k] {
-                continue;
-            }
-            program.nodes[self.z[k]] = Node::Raw { slot: self.slots[k] };
-            for (i, &written) in site.writes.iter().enumerate() {
-                let Node::Affine { terms, bias } = &program.nodes[written] else {
-                    return Err(format!("{}: a written node that is not affine", site.name));
-                };
-                let (terms, bias) = (terms.clone(), *bias);
-                let mut rewritten = Vec::with_capacity(terms.len() + site.reads.len());
-                for (argument, operator) in terms {
-                    if argument == self.masked[k] {
-                        for (j, &read) in site.reads.iter().enumerate() {
-                            let op = &sums[k][i][j];
-                            if op.rows.width() != interfaces[written].width() || op.cols.width() != interfaces[read].width() {
-                                return Err(format!("{}: a library sum of the wrong shape", site.name));
-                            }
-                            program.operators.push(Arc::clone(op));
-                            rewritten.push((read, program.operators.len() - 1));
-                        }
-                    } else {
-                        rewritten.push((argument, operator));
-                    }
-                }
-                program.nodes[written] = Node::Affine { terms: rewritten, bias };
-            }
-        }
-        Ok(program)
-    }
-
     /// Every site's `U` operators, in site order.
     pub(crate) fn u_operators(&self) -> Vec<Arc<Operator>> {
         self.u_ops.iter().flatten().map(|&op| Arc::clone(&self.program.operators[op])).collect()
-    }
-
-    /// The library's sums of [`Masked::dense_program`], computed once per library.
-    fn sums(&self) -> Result<Arc<Vec<Vec<Vec<Arc<Operator>>>>>, String> {
-        let ops: Vec<Arc<Operator>> = self.v_ops.iter().chain(&self.u_ops).flatten().map(|&op| Arc::clone(&self.program.operators[op])).collect();
-        let mut cache = self.sums.lock().map_err(|_| "library sums: a poisoned cache".to_string())?;
-        if let Some((held, sums)) = &*cache
-            && held.len() == ops.len()
-            && held.iter().zip(&ops).all(|(a, b)| Arc::ptr_eq(a, b))
-        {
-            return Ok(Arc::clone(sums));
-        }
-        *cache = None;
-        let interfaces = self.program.interfaces().map_err(|e| e.to_string())?;
-        let mut sums = Vec::new();
-        for (k, site) in self.sites.iter().enumerate() {
-            let mut per_written = Vec::new();
-            for (i, &written) in site.writes.iter().enumerate() {
-                let u = self.program.operators[self.u_ops[k][i]].matrix_cow();
-                let mut per_read = Vec::new();
-                for (j, &read) in site.reads.iter().enumerate() {
-                    let v = self.program.operators[self.v_ops[k][j]].matrix_cow();
-                    // `U_i` is held as `d_out × C`, `V_j` as `C × d_in`.
-                    let w = gam_linalg::faer_ndarray::fast_ab(&*u, &*v);
-                    per_read.push(dense(format!("{}·W{i}{j}", site.name), interfaces[written].clone(), interfaces[read].clone(), w)?);
-                }
-                per_written.push(per_read);
-            }
-            sums.push(per_written);
-        }
-        let sums = Arc::new(sums);
-        *cache = Some((ops, Arc::clone(&sums)));
-        Ok(sums)
     }
 
     /// [`Masked::on_proposals`] where the program was found lowered (its state's twin).
