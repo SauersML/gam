@@ -244,7 +244,16 @@ fn main() -> Result<(), String> {
     let dirs: Vec<PathBuf> = if names.is_empty() { cases(&root)? } else { names.iter().map(|n| root.join(n)).collect() };
     let mut table = Vec::new();
     for dir in &dirs {
-        let report = run_case(&root, dir, &run)?;
+        // A case the engine cannot explain is a failed case, not the end of the suite.
+        let report = match run_case(&root, dir, &run) {
+            Ok(report) => report,
+            Err(e) => {
+                let line = format!("{:<15} engine error: {e}", dir.file_name().and_then(|n| n.to_str()).unwrap_or(""));
+                eprintln!("{line}");
+                table.push(line);
+                continue;
+            }
+        };
         let s = &report["scores"];
         let line = format!(
             "{:<15} held-out KL ours {:.3} null {:.3} transcript {:.3} | argmax ours {:.2} null {:.2} transcript {:.2} | changed-argmax ours {:.2} | clean KL {:.1e} | counterfactual {} mechanism {}",
