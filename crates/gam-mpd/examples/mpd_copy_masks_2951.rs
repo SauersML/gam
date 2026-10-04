@@ -1,5 +1,5 @@
 //! Exhaustive layer-local Copy mask measurements; no joint materialization or Run pruning.
-//! mpd_copy_masks_2951 EXPORT OUT max_layer=N max_joint=N [local=4 context=512 batch=1024 deltas=0.1,0.2]
+//! mpd_copy_masks_2951 EXPORT OUT max_layer=N max_joint=N [local=4 context=512 batch=1024 deltas=0.1,0.2 budget=N]
 use gam_mpd::acceptance::Local;
 use gam_mpd::artifact::Artifact;
 use gam_mpd::counterfactual::passages;
@@ -48,12 +48,12 @@ fn digest(path: Option<&Path>, text: Option<&str>) -> Result<String, String> {
 fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 5 { return Err("mpd_copy_masks_2951 EXPORT OUT max_layer=N max_joint=N [local=4 context=512 batch=1024 deltas=0.1,0.2]".into()); }
+    if args.len() < 5 { return Err("mpd_copy_masks_2951 EXPORT OUT max_layer=N max_joint=N [local=4 context=512 batch=1024 deltas=0.1,0.2 budget=N]".into()); }
     let (export, out) = (Path::new(&args[1]), Path::new(&args[2]));
     let mut keys = BTreeMap::new();
     for argument in &args[3..] {
         let (k, v) = argument.split_once('=').ok_or("expected KEY=VALUE")?;
-        if !["max_layer", "max_joint", "local", "context", "batch", "deltas"].contains(&k) || keys.insert(k, v).is_some() {
+        if !["max_layer", "max_joint", "local", "context", "batch", "deltas", "budget"].contains(&k) || keys.insert(k, v).is_some() {
             return Err(format!("unknown or duplicate option {k}"));
         }
     }
@@ -67,6 +67,8 @@ fn main() -> Result<(), String> {
     let (layers, heads, kv) = (cfg("n_layers")?, cfg("n_heads")?, cfg("n_kv_heads")?);
     // Complete implicit cardinality guard precedes import, hashing, outputs, and rule fitting.
     let (local_count, joint_count) = CopyMasks::cardinalities(std::iter::repeat_n(heads, layers), max_layer, max_joint)?;
+    let budget = number("budget", Some(local_count))?;
+    if budget > local_count { return Err("budget exceeds complete layer bank".into()); }
     if kv == 0 || heads % kv != 0 { return Err("invalid KV grouping".into()); }
     if out.exists() { return Err("output directory must be fresh".into()); }
     let (count, context, batch) = (number("local", Some(4))?, number("context", Some(512))?, number("batch", Some(1024))?);
@@ -114,13 +116,22 @@ fn main() -> Result<(), String> {
     let mut log = std::fs::File::create(out.join("LOCAL.jsonl")).map_err(|e| e.to_string())?;
     let mut retained = vec![vec![Vec::<usize>::new(); layers]; deltas.len()];
     let started = Instant::now();
-    for (layer, mask) in bank.layer_masks() {
+    for (index, (layer, mask)) in bank.layer_masks().enumerate() {
+        if index >= budget {
+            for grid in &mut retained { grid[layer].push(mask); }
+            serde_json::to_writer(&mut log, &json!({"layer":layer,"mask":mask,"state":"unmeasured_retained"})).map_err(|e| e.to_string())?;
+            writeln!(log).map_err(|e| e.to_string())?;
+            continue;
+        }
+        let candidate_started = Instant::now();
         let mut masks = vec![0; layers]; masks[layer] = mask;
         let measured = bank.checked(&masks, &native).and_then(|(artifact, cost, bytes)| {
-            local.screen(&artifact).map(|measure| (measure, cost, bytes))
+            let checked_seconds = candidate_started.elapsed().as_secs_f64();
+            let local_started = Instant::now();
+            local.screen(&artifact).map(|measure| (measure, cost, bytes, checked_seconds, local_started.elapsed().as_secs_f64()))
         });
         let entry = match measured {
-            Ok((measure, cost, bytes)) => {
+            Ok((measure, cost, bytes, checked_seconds, local_seconds)) => {
                 let lower = measure.blocks.iter().map(|b| b.lower).fold(0.0_f64, f64::max);
                 let upper = measure.blocks.iter().map(|b| b.upper).fold(0.0_f64, f64::max);
                 let states: Vec<_> = deltas.iter().enumerate().map(|(i, &delta)| {
@@ -128,7 +139,7 @@ fn main() -> Result<(), String> {
                     if state != "violates" { retained[i][layer].push(mask); }
                     json!({"delta":delta,"state":state})
                 }).collect();
-                json!({"layer":layer,"mask":mask,"local":measure,"states":states,"C32":cost,"C32_bits":cost.total(),"wire_bytes":bytes})
+                json!({"layer":layer,"mask":mask,"local":measure,"states":states,"C32":cost,"C32_bits":cost.total(),"wire_bytes":bytes,"checked_seconds":checked_seconds,"local_seconds":local_seconds})
             }
             Err(error) => {
                 for grid in &mut retained { grid[layer].push(mask); }
@@ -145,7 +156,7 @@ fn main() -> Result<(), String> {
         json!({"delta":delta,"retained_layer_masks":masks,"unexcluded_joint_candidates":remaining})
     }).collect();
     let manifest = json!({"schema":"copy-layer-mask-local-v1","scope":{"laws":"Copy only","complete_layer_masks":local_count,"implicit_joint_candidates":joint_count,
-        "native":"empty mask at each layer","max_layer":max_layer,"max_joint":max_joint,"single_failure_pruning":false,"joint_artifacts_emitted":0,
+        "native":"empty mask at each layer","measurement_budget":budget,"unmeasured_retained":true,"max_layer":max_layer,"max_joint":max_joint,"single_failure_pruning":false,"joint_artifacts_emitted":0,
         "local":"fixed native parents; declared family only; ascent disabled","run":"not measured; no run pruning","global_optimum_claim":false},
         "local_sequences":count,"context":context,"rows":family.rows,"batch":batch,"input_sha256":input_hashes,"compiled_source_sha256":sources,
         "binary_sha256":binary_hash,"literal_projection":"f32 learned literals; exact architecture epsilon retained", "price":"C32 distinct from exact wire bytes",
