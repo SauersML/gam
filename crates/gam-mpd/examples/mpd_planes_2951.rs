@@ -1,45 +1,50 @@
 //! The Fourier mechanism of the mod-31 adder written by hand as blocks, scored by the description
-//! length against the fitted solution (#2951), per word and with the library paid once.
+//! length against the fitted solution (#2951), per token and with the library paid once.
 //!
-//! `mpd_planes_2951 EXPORT_DIR OUT.json OBSERVATIONS`
+//! `mpd_planes_2951 EXPORT_DIR OUT.json OBSERVATIONS [all-on]`
 //!
 //! `EXPORT_DIR` a `transformer` export on the whole family of a modular adder (e.g.
 //! `~/mpd-data/engine/p31_s0_generic`, all 961 inputs). Each decomposed site's map `W` is cut by
-//! the characters its reads carry: with `X` the site's reads and `Y = X Wᵀ` its written values over
-//! the family, a character pair `cos`, `sin` of `2π (f · (a, b))/p` (`f` one of `(k, 0)`, `(0, k)`,
-//! `(k, k)`, `(k, −k)`) arrives along its carrier `Xᵀ Q_f` (`Q_f` its orthonormal profiles); in
-//! decreasing share of the output `‖Q_fᵀ Y‖` (the constant last), each carrier less the directions
-//! already taken is the plane's reader `R_f` and the plane is `W R_f R_fᵀ`, of rank at most two;
-//! what the readers leave is one more block, the rest, so the blocks sum to `W` and none exceeds it
-//! (`planes`). A plane with nothing beyond the site's rounding band is left out.
+//! the characters its reads carry: with `X` the site's reads over the family, a character pair
+//! `cos`, `sin` of `2π (f · (a, b))/p` (`f` one of `(k, 0)`, `(0, k)`, `(k, k)`, `(k, −k)`) arrives
+//! along its carrier `Xᵀ Q_f` (`Q_f` its orthonormal profiles); in decreasing carrier energy (the
+//! constant last), each carrier less the directions already taken is the reader `R_f`
+//! (`carriers`), and the plane is `W R_f R_fᵀ`, of rank at most two; what the readers leave is one
+//! more block, the rest, so the blocks sum to `W` and none exceeds it (`planes`).
+//!
+//! The translation rule prices a plane: the readers are a function of the reads and the operands,
+//! so the decoder, having decoded the sites upstream, builds them itself (`Sides`), and a plane is
+//! named by its frequency (one group of the readers' chart, `carrier_chart`) and sends only what it
+//! writes: two columns in the site's own coordinates, or a 2 × 2 core where its writes are also
+//! charted (the class characters of the unembedding, on a site the readout reads directly). The
+//! whole sites get the same charts.
 //!
 //! Every point is measured under the corner claim (every token's error the exact KL of the program
-//! its masks run: off blocks absent). Every block is described on the exact lattice code with the
-//! harmonic charts (`gam_mpd::describe::Structured`: a reader in the operand characters of a site's
-//! reads where no decomposed site upstream moves them, a writer in the class characters of the
-//! unembedding where the readout reads the site directly), in the logit-space Gauss–Newton metric,
+//! its masks run: off blocks absent). Every block is described on the exact lattice code
+//! (`gam_mpd::describe`) in the logit-space Gauss–Newton metric,
 //! the price recalibrated against the exact rounding KL until within a factor of two. Each point is
-//! decoded (every block replaced by its exact-priced description, `Geometry::describe_exact`, in
-//! decoding order, and measured by the exact masked forward) under two codes:
+//! decoded (every block replaced by its exact-priced description, `Geometry::describe_exact`, site by
+//! site in program order, and measured by the exact masked forward) under two codes:
 //!
-//! * per word: each word pays the description of the blocks that ran on it, plus `n KL / ln 2`;
+//! * per token: each token pays the description of the blocks that ran on it, plus `n KL / ln 2`;
 //! * library paid once: every block that runs is described once (its precision weighing its bits
-//!   once against its error on every word), each block names the words it runs on (a bit for every
-//!   word, else the enumerative code of the subset), plus `n KL / ln 2` per word; and the same
+//!   once against its error on every token), each block names the tokens it runs on (a bit for every
+//!   token, else the enumerative code of the subset), plus `n KL / ln 2` per token; and the same
 //!   library pruned under this code (blocks deleted while the total falls, `pruned`), what it can
 //!   afford at its `n`.
 //!
 //! The points: each site's whole map as one block; the planes all on, and selected (selection
-//! passes until one no longer lowers the per-word total); the fitted solution (Fisher-SVD rank-one
+//! passes until one no longer lowers the per-token total); the fitted solution (Fisher-SVD rank-one
 //! subcomponents selected, then `fit_blocks`) and the fit seeded from the selected planes, each as
-//! fitted and with its blocks all on. Per point the terms per word under both codes, blocks and
+//! fitted and with its blocks all on. Per point the terms per token under both codes, blocks and
 //! rank-one equivalents on, and per block its label, rank, firing, decoded bits and whether the
-//! pruned library keeps it.
+//! pruned library keeps it. With `all-on`, only the points that run every block (no selection):
+//! the frontier over `n`.
 //!
 //! Measured on p31 (`n` = 10⁴, 10⁵, 10⁶). With the library paid once: whole sites 56.3, 81.1, 100.5
-//! bits a word; the planes all on 114, 141, 213, and pruned under that code 77.9, 120.5, 178.0. The
+//! bits a token; the planes all on 114, 141, 213, and pruned under that code 77.9, 120.5, 178.0. The
 //! pruned planes are the key frequencies (7, 8, 5 at W_O and W_in; 7, 8, 5 (a+b) first at W_out; 37,
-//! 57, 72 of 163 planes kept). Per word: whole sites 53,969, 77,818, 96,484; planes selected 47,716
+//! 57, 72 of 163 planes kept). Per token: whole sites 53,969, 77,818, 96,484; planes selected 47,716
 //! (KL 3.2 nats) and 62,692 at 10⁴ and 10⁵; the fit from rank-one subcomponents 43,975 (KL 3.0) and
 //! 29,289; the fit seeded from the planes 10,979 at 10⁴, as input-gated rank-one slices. Under both
 //! codes the objective prices the planes above something else. A plane's writer is sent in the
@@ -52,7 +57,7 @@ use gam_mpd::codec::subset_code_len_bits;
 use gam_mpd::dense::{QrMode, qr, svd};
 use gam_mpd::describe::{Chart, Geometry, Metric, Structured, logit_gauss_newton};
 use gam_mpd::import::import;
-use gam_mpd::masked::{Library, Site, Target, matrix, read_values, site_statistics, sites};
+use gam_mpd::masked::{Library, Site, Target, forward, matrix, read_values, site_statistics, sites};
 use gam_mpd::operator_program::{LabelKind, Node, OperatorBody, OperatorProgram, SlotValues};
 use gam_mpd::pieces::fisher_svd;
 use ndarray::{Array1, Array2, Axis, s};
@@ -60,9 +65,9 @@ use serde_json::{Value, json};
 use std::path::Path;
 
 fn say(name: &str, bits: &Bits) {
-    let (per_word, kl, active, rank) = bits.per_row();
+    let (per_token, kl, active, rank) = bits.per_row();
     eprintln!(
-        "{name}: {per_word:.1} bits/word (described {:.1}, error {:.1}), KL {kl:.6} nats/word, {active:.2} blocks and {rank:.2} rank-one equivalents on per word, {} blocks",
+        "{name}: {per_token:.1} bits/token (described {:.1}, error {:.1}), KL {kl:.6} nats/token, {active:.2} blocks and {rank:.2} rank-one equivalents on per token, {} blocks",
         bits.described / bits.rows.max(1.0),
         bits.kl / bits.rows.max(1.0),
         bits.blocks
@@ -129,12 +134,12 @@ fn replaced(blocked: &Blocked, k: usize, c: usize, u: &Array2<f64>, v: &Array2<f
     Ok(out)
 }
 
-/// A decoded point's terms per word.
+/// A decoded point's terms per token.
 struct Decoded {
-    /// Description bits: under the per-word code the blocks that ran on each word; with the library
+    /// Description bits: under the per-token code the blocks that ran on each token; with the library
     /// paid once every block that runs, once.
     described: f64,
-    /// With the library paid once, the words each block runs on: a bit for "every word", else the
+    /// With the library paid once, the tokens each block runs on: a bit for "every token", else the
     /// enumerative code of the subset.
     bindings: f64,
     /// `n KL / ln 2`.
@@ -153,16 +158,19 @@ impl Decoded {
     }
 }
 
-/// The decoded point (module note): every block that runs replaced by its exact-priced description
-/// in decoding order, then measured together. Under the per-word code (`once` false) a block's
-/// precision weighs its bits on every word it runs on against its error there; with the library
-/// paid once, its bits once against its error on every word.
-fn decoded(coded: &Coded<'_>, blocked: &Blocked, geometry: &Structured, once: bool) -> Result<Decoded, String> {
+/// The decoded point (module note): every block that runs replaced by its exact-priced description,
+/// site by site in program order, each site's reader chart built on the reads the program decoded
+/// so far gives it, then measured together. Under the per-token code (`once` false) a block's
+/// precision weighs its bits on every token it runs on against its error there; with the library
+/// paid once, its bits once against its error on every token.
+fn decoded(coded: &Coded<'_>, blocked: &Blocked, sides: &Sides, once: bool) -> Result<Decoded, String> {
     let mut out = blocked.clone();
     let mut prices: Vec<Vec<f64>> = Vec::new();
     let mut binding: Vec<Vec<f64>> = Vec::new();
-    let words: usize = blocked.masks.iter().map(|m| m.first().map_or(0, |m| m.nrows())).sum();
+    let tokens: usize = blocked.masks.iter().map(|m| m.first().map_or(0, |m| m.nrows())).sum();
     for (k, ranks) in blocked.ranks.iter().enumerate() {
+        // The sites run in program order, so every site upstream of this one is decoded already.
+        let geometry = sides.geometry(k, &reads(coded, &out, k)?)?;
         let (mut site, mut named) = (Vec::new(), Vec::new());
         for c in 0..ranks.len() {
             let on: usize = blocked.masks.iter().map(|m| m[k].column(c).iter().filter(|x| **x > 0.0).count()).sum();
@@ -171,11 +179,11 @@ fn decoded(coded: &Coded<'_>, blocked: &Blocked, geometry: &Structured, once: bo
                 named.push(0.0);
                 continue;
             }
-            named.push(1.0 + if on == words { 0.0 } else { subset_code_len_bits(words, on).map_err(|e| e.to_string())? as f64 });
+            named.push(1.0 + if on == tokens { 0.0 } else { subset_code_len_bits(tokens, on).map_err(|e| e.to_string())? as f64 });
             let (base, _) = measure(coded, &out)?;
             let (u, v) = blocked.factors(k, c);
             let current = out.clone();
-            let d = geometry.sites[k].describe_exact(u, v, &mut |d| {
+            let d = geometry.describe_exact(u, v, &mut |d| {
                 let (bits, _) = measure(coded, &replaced(&current, k, c, &d.u, &d.v)?)?;
                 Ok(if once { bits.kl - base.kl } else { (bits.kl - base.kl) / on as f64 })
             })?;
@@ -204,7 +212,7 @@ fn decoded(coded: &Coded<'_>, blocked: &Blocked, geometry: &Structured, once: bo
 }
 
 /// With the library paid once, the decoded library's blocks deleted while the total falls: deleting
-/// a block saves its bits and bindings against the error it adds on every word, measured exactly;
+/// a block saves its bits and bindings against the error it adds on every token, measured exactly;
 /// the deletions that save alone are tried together, halved while the total does not fall, and the
 /// passes repeat until none is kept. What stays is the library this code can afford at its `n`.
 /// The pruned point and per block whether it stayed.
@@ -270,7 +278,7 @@ fn pruned(coded: &Coded<'_>, d: &Decoded) -> Result<(Decoded, Vec<Vec<bool>>), S
     Ok((out, kept))
 }
 
-/// The same blocks, every one on for every word.
+/// The same blocks, every one on for every token.
 fn all_on(blocked: &Blocked) -> Blocked {
     let mut out = blocked.clone();
     out.masks.iter_mut().flatten().for_each(|m| m.fill(1.0));
@@ -303,53 +311,43 @@ fn factors(w: &Array2<f64>, band: f64, rank: usize) -> Result<(Array2<f64>, Arra
     Ok((u, v))
 }
 
-/// The plane blocks of a site (module note): per character pair `±f` of the operands (`f` one of
-/// `(k, 0)`, `(0, k)`, `(k, k)`, `(k, −k)`, `k = 1..=p/2`) a block of rank at most two, the constant,
-/// and the rest; `(label, u, v)` with the empty ones (nothing beyond the site's rounding band) left
-/// out.
+/// The readers of a site's reads `x` (module note): per character pair `±f` of the operands (`f`
+/// one of `(k, 0)`, `(0, k)`, `(k, k)`, `(k, −k)`, `k = 1..=p/2`) in decreasing energy of its carrier
+/// `Xᵀ Q_f` (`Q_f` the orthonormal profiles `cos`, `sin` of the character over the inputs), then the
+/// constant (its carrier the mean read every other carrier overlaps), each carrier less the readers
+/// already taken spanning its reader (orthonormal, its directions beyond the reads' rounding band).
+/// A function of the reads and the operands alone, so the decoder builds it from the program it has
+/// decoded upstream of the site.
 ///
-/// A character's carrier is the reads' content at it, `M_f = Xᵀ Q_f` (`Q_f` the orthonormal
-/// profiles `cos`, `sin` of the character over the inputs): the input directions along which the
-/// character arrives. Taken in decreasing share of the site's output `‖Q_fᵀ Y‖` (the constant last,
-/// its carrier the mean read every other carrier overlaps), each carrier less the directions already
-/// taken spans the plane's reader `R_f` (orthonormal, its directions beyond the reads' rounding
-/// band), and the plane is `W R_f R_fᵀ`. The readers are orthogonal, so the planes and the rest
-/// `W (I − Σ R_f R_fᵀ)` sum to `W` with every block at most `W`'s norm. Least squares
-/// (`(X⁺ Π_f Y)ᵀ`, exact on character-invariant reads) is ill-posed where two characters arrive
-/// along the same directions: on p31 the residual after attention carries `cos ka` and `cos kb` on
-/// one plane, and separating them through the reads' near-null directions gave planes of 10⁸ `‖W‖`
-/// that cancelled to `W` and decoded to KL ~10⁸ nats. Here the first of such characters takes the
-/// shared plane and the other keeps only what it carries elsewhere.
-fn planes(w: &Array2<f64>, x: &Array2<f64>, labels: &Array2<usize>, period: usize) -> Result<Vec<(String, Array2<f64>, Array2<f64>)>, String> {
+/// Least squares (`(X⁺ Π_f Y)ᵀ`, exact on character-invariant reads) is ill-posed where two
+/// characters arrive along the same directions: on p31 the residual after attention carries
+/// `cos ka` and `cos kb` on one plane, and separating them through the reads' near-null directions
+/// gave planes of 10⁸ `‖W‖` that cancelled to `W` and decoded to KL ~10⁸ nats. Here the first of such
+/// characters takes the shared plane and the other keeps only what it carries elsewhere.
+fn carriers(x: &Array2<f64>, labels: &Array2<usize>, period: usize) -> Result<Vec<(String, Array2<f64>)>, String> {
     let rows = x.nrows();
-    let y = x.dot(&w.t());
-    let band = svd(w.view(), false).map_err(|e| format!("{e:?}"))?.band;
     let floor = svd(x.view(), false).map_err(|e| format!("{e:?}"))?.band;
     let phase = |r: usize, f: (i64, i64)| {
         let t = f.0 * labels[[r, 0]] as i64 + f.1 * labels[[r, 1]] as i64;
         2.0 * std::f64::consts::PI * (t.rem_euclid(period as i64)) as f64 / period as f64
     };
-    let mut pairs: Vec<(String, (i64, i64))> = Vec::new();
+    let mut characters = Vec::new();
     for k in 1..=(period / 2) as i64 {
         for (name, f) in [("a", (k, 0)), ("b", (0, k)), ("a+b", (k, k)), ("a−b", (k, -k))] {
-            pairs.push((format!("{k}({name})"), f));
+            let basis = Array2::from_shape_fn((rows, 2), |(r, c)| if c == 0 { phase(r, f).cos() } else { phase(r, f).sin() });
+            let q = qr(basis.view(), QrMode::Economic).map_err(|e| format!("{e:?}"))?.q.ok_or("no Q")?;
+            let carrier = x.t().dot(&q);
+            let energy = carrier.iter().map(|e| e * e).sum::<f64>();
+            characters.push((format!("{k}({name})"), carrier, energy));
         }
     }
-    let mut characters = Vec::new();
-    for (label, f) in pairs {
-        let basis = Array2::from_shape_fn((rows, 2), |(r, c)| if c == 0 { phase(r, f).cos() } else { phase(r, f).sin() });
-        let q = qr(basis.view(), QrMode::Economic).map_err(|e| format!("{e:?}"))?.q.ok_or("no Q")?;
-        let share = q.t().dot(&y).iter().map(|e| e * e).sum::<f64>();
-        characters.push((label, q, share));
-    }
     characters.sort_by(|a, b| b.2.total_cmp(&a.2));
-    characters.push(("constant".to_string(), Array2::from_elem((rows, 1), 1.0 / (rows as f64).sqrt()), 0.0));
+    characters.push(("constant".to_string(), x.t().dot(&Array2::from_elem((rows, 1), 1.0 / (rows as f64).sqrt())), 0.0));
     let mut taken = Array2::<f64>::zeros((x.ncols(), 0));
     let mut out = Vec::new();
-    for (label, q, _) in characters {
+    for (label, mut carrier, _) in characters {
         // The carrier less the readers taken, twice (one Gram–Schmidt pass loses orthogonality to
         // rounding as the readers accumulate).
-        let mut carrier = x.t().dot(&q);
         for _ in 0..2 {
             carrier = &carrier - &taken.dot(&taken.t().dot(&carrier));
         }
@@ -359,14 +357,33 @@ fn planes(w: &Array2<f64>, x: &Array2<f64>, labels: &Array2<usize>, period: usiz
             continue;
         }
         let reader = d.u.select(Axis(1), &kept);
-        let (u, v) = factors(&w.dot(&reader).dot(&reader.t()), band, kept.len())?;
         taken = ndarray::concatenate(Axis(1), &[taken.view(), reader.view()]).map_err(|e| e.to_string())?;
+        out.push((label, reader));
+    }
+    Ok(out)
+}
+
+/// The readers as one chart: group `i` the `i`-th reader's columns, so a block reading one reader
+/// names it (its frequency) and sends only what it writes.
+fn carrier_chart(readers: &[(String, Array2<f64>)]) -> Result<Chart, String> {
+    let widths: Vec<usize> = readers.iter().map(|(_, r)| r.ncols()).collect();
+    let views: Vec<_> = readers.iter().map(|(_, r)| r.view()).collect();
+    Chart::frames("carriers of the reads", ndarray::concatenate(Axis(1), &views).map_err(|e| e.to_string())?, &widths)
+}
+
+/// The plane blocks of a site's map `w` (module note): per reader `R_f` the plane `W R_f R_fᵀ`, of
+/// rank at most two, and the rest `W (I − Σ R_f R_fᵀ)`; `(label, u, v)` with the empty ones (nothing
+/// beyond the site's rounding band) left out. The readers are orthogonal, so the blocks sum to `W`
+/// and none exceeds it.
+fn planes(w: &Array2<f64>, readers: &[(String, Array2<f64>)]) -> Result<Vec<(String, Array2<f64>, Array2<f64>)>, String> {
+    let band = svd(w.view(), false).map_err(|e| format!("{e:?}"))?.band;
+    let mut out = Vec::new();
+    for (label, reader) in readers {
+        let (u, v) = factors(&w.dot(reader).dot(&reader.t()), band, reader.ncols())?;
         if u.nrows() > 0 {
-            out.push((label, u, v));
+            out.push((label.clone(), u, v));
         }
     }
-    // The rest: what the readers leave of W (W off the reads' span, and directions no listed
-    // character arrives along).
     let rest = out.iter().fold(w.clone(), |acc, (_, u, v)| acc - &u.t().dot(v));
     let (u, v) = factors(&rest, band, usize::MAX)?;
     if u.nrows() > 0 {
@@ -375,16 +392,41 @@ fn planes(w: &Array2<f64>, x: &Array2<f64>, labels: &Array2<usize>, period: usiz
     Ok(out)
 }
 
-/// A decomposition's report: its bits, and decoded under the per-word code and with the library
+/// What the decoder holds of each site before its blocks: its metric and writer charts, and the
+/// family's operands, from which it builds the reader chart on the reads the program decoded so
+/// far gives the site ([`carriers`], [`carrier_chart`]).
+struct Sides {
+    metrics: Vec<Metric>,
+    writers: Vec<Vec<Chart>>,
+    labels: Array2<usize>,
+    period: usize,
+}
+
+impl Sides {
+    /// Site `k`'s geometry on its reads `x`.
+    fn geometry(&self, k: usize, x: &Array2<f64>) -> Result<Geometry, String> {
+        Geometry::new(self.metrics[k].clone(), self.writers[k].clone(), vec![carrier_chart(&carriers(x, &self.labels, self.period)?)?])
+    }
+}
+
+/// Site `k`'s reads on the first batch as `blocked` runs them.
+fn reads(coded: &Coded<'_>, blocked: &Blocked, k: usize) -> Result<Array2<f64>, String> {
+    let masked = blocked.masked(coded)?;
+    let (inputs, target) = &coded.batches[0];
+    let (_, trace, _) = forward(&masked, &masked.family(inputs, &blocked.masks[0]), target)?;
+    read_values(&trace, &masked.sites[k])
+}
+
+/// A decomposition's report: its bits, and decoded under the per-token code and with the library
 /// paid once (as it stands, and pruned), per block its label, rank, firing, decoded bits and whether
 /// the pruned library keeps it.
-fn report(name: &str, coded: &Coded<'_>, blocked: &Blocked, bits: &Bits, geometry: &Structured, labels: Option<&[Vec<String>]>) -> Result<Value, String> {
+fn report(name: &str, coded: &Coded<'_>, blocked: &Blocked, bits: &Bits, sides: &Sides, labels: Option<&[Vec<String>]>) -> Result<Value, String> {
     say(name, bits);
-    let word = decoded(coded, blocked, geometry, false)?;
-    eprintln!("{name}, decoded per word: {:.1} bits/word (described {:.1}, error {:.1}), KL {:.6} nats/word", word.total(), word.described, word.error, word.kl);
-    let once = decoded(coded, blocked, geometry, true)?;
+    let token = decoded(coded, blocked, sides, false)?;
+    eprintln!("{name}, decoded per token: {:.1} bits/token (described {:.1}, error {:.1}), KL {:.6} nats/token", token.total(), token.described, token.error, token.kl);
+    let once = decoded(coded, blocked, sides, true)?;
     eprintln!(
-        "{name}, library once: {:.1} bits/word (library {:.1}, bindings {:.1}, error {:.1}), KL {:.6} nats/word",
+        "{name}, library once: {:.1} bits/token (library {:.1}, bindings {:.1}, error {:.1}), KL {:.6} nats/token",
         once.total(),
         once.described,
         once.bindings,
@@ -393,7 +435,7 @@ fn report(name: &str, coded: &Coded<'_>, blocked: &Blocked, bits: &Bits, geometr
     );
     let (lean, kept) = pruned(coded, &once)?;
     eprintln!(
-        "{name}, library once, pruned: {:.1} bits/word (library {:.1}, bindings {:.1}, error {:.1}), KL {:.6} nats/word, {} of {} blocks kept",
+        "{name}, library once, pruned: {:.1} bits/token (library {:.1}, bindings {:.1}, error {:.1}), KL {:.6} nats/token, {} of {} blocks kept",
         lean.total(),
         lean.described,
         lean.bindings,
@@ -402,7 +444,7 @@ fn report(name: &str, coded: &Coded<'_>, blocked: &Blocked, bits: &Bits, geometr
         kept.iter().flatten().filter(|k| **k).count(),
         once.binding.iter().flatten().filter(|b| **b > 0.0).count()
     );
-    let (per_word, kl_priced, active, rank) = bits.per_row();
+    let (per_token, kl_priced, active, rank) = bits.per_row();
     let mut per_block = Vec::new();
     for (k, ranks) in blocked.ranks.iter().enumerate() {
         for (c, r) in ranks.iter().enumerate() {
@@ -421,7 +463,7 @@ fn report(name: &str, coded: &Coded<'_>, blocked: &Blocked, bits: &Bits, geometr
                 "label": labels.map(|l| l[k][c].clone()),
                 "rank": r,
                 "firing": on / rows,
-                "decoded_bits": word.prices[k][c],
+                "decoded_bits": token.prices[k][c],
                 "decoded_bits_library_once": once.prices[k][c],
                 "kept_library_once": kept[k][c],
                 "priced_bits": coded.describe.bits(k, u, v)?,
@@ -429,29 +471,31 @@ fn report(name: &str, coded: &Coded<'_>, blocked: &Blocked, bits: &Bits, geometr
             }));
         }
     }
-    let terms = |d: &Decoded| json!({"bits_per_word": d.total(), "described_bits_per_word": d.described, "binding_bits_per_word": d.bindings, "error_bits_per_word": d.error, "kl_per_word": d.kl});
+    let terms = |d: &Decoded| json!({"bits_per_token": d.total(), "described_bits_per_token": d.described, "binding_bits_per_token": d.bindings, "error_bits_per_token": d.error, "kl_per_token": d.kl});
     Ok(json!({
         "point": name,
-        "bits_per_word": per_word,
-        "described_bits_per_word": bits.described / bits.rows.max(1.0),
-        "error_bits_per_word": bits.kl / bits.rows.max(1.0),
-        "kl_per_word": kl_priced,
-        "decoded_per_word": terms(&word),
+        "bits_per_token": per_token,
+        "described_bits_per_token": bits.described / bits.rows.max(1.0),
+        "error_bits_per_token": bits.kl / bits.rows.max(1.0),
+        "kl_per_token": kl_priced,
+        "decoded_per_token": terms(&token),
         "decoded_library_once": terms(&once),
         "decoded_library_once_pruned": terms(&lean),
-        "active_blocks_per_word": active,
-        "active_rank_one_equivalents_per_word": rank,
+        "active_blocks_per_token": active,
+        "active_rank_one_equivalents_per_token": rank,
         "blocks_on": per_block,
     }))
 }
 
-fn run(dir: &Path, out: &Path, observations: f64) -> Result<(), String> {
+fn run(dir: &Path, out: &Path, observations: f64, only_all_on: bool) -> Result<(), String> {
     let imported = import(dir)?;
     let program = imported.program;
     let family = imported.contract.family;
     let trace = program.execute(&family, false).map_err(|e| e.to_string())?;
     let target = Target::every_row(trace.values[program.output].clone());
-    let chosen = sites(&program);
+    // In program order: a site's reads depend only on the sites before it.
+    let mut chosen = sites(&program);
+    chosen.sort_by_key(|s| s.reads.iter().copied().min());
     let operands: Vec<&Vec<u32>> = family
         .slots
         .iter()
@@ -465,29 +509,23 @@ fn run(dir: &Path, out: &Path, observations: f64) -> Result<(), String> {
         return Err(format!("{} operands; the planes are cut for two", operands.len()));
     }
     let labels = Array2::from_shape_fn((family.rows, 2), |(r, i)| operands[i][r] as usize);
-    // Every node a decomposed site's decoded weights can move.
-    let mut moved = vec![false; program.nodes.len()];
-    for (index, node) in program.nodes.iter().enumerate() {
-        moved[index] = chosen.iter().any(|s| s.writes.contains(&index)) || node.arguments().iter().any(|a| moved[*a]);
-    }
     let statistics = site_statistics(&program, &chosen, [family.clone()], 16, 0x5EED)?;
     let metrics = logit_gauss_newton(&program, &chosen, &family, &trace, 64)?;
+    let mut sides = Sides { metrics: Vec::new(), writers: Vec::new(), labels, period };
     let (mut geometries, mut plane_libraries, mut plane_ranks, mut plane_labels, mut svd_libraries) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    for ((site, measured), metric) in chosen.iter().zip(&statistics).zip(&metrics) {
+    for (k, ((site, measured), metric)) in chosen.iter().zip(&statistics).zip(&metrics).enumerate() {
         let x = read_values(&trace, site)?;
-        let readers = if site.reads.iter().any(|n| moved[*n]) {
-            Vec::new()
-        } else {
-            vec![Chart::harmonic("operand characters of the reads", x.view(), labels.view(), period)?]
-        };
         let mut writers = Vec::new();
         if let Some(map) = readout_map(&program, site)? {
             let classes = Array2::from_shape_fn((map.nrows(), 1), |(c, _)| c);
             writers.push(Chart::harmonic("class characters of the readout", map.view(), classes.view(), map.nrows())?);
         }
-        geometries.push(Geometry::new(Metric { fisher: metric.clone(), ..Metric::of(measured, observations) }, writers, readers)?);
+        sides.metrics.push(Metric { fisher: metric.clone(), ..Metric::of(measured, observations) });
+        sides.writers.push(writers);
+        // The search prices on the native reads' chart; every decoded point on the decoder's.
+        geometries.push(sides.geometry(k, &x)?);
         let w = matrix(&program, site)?;
-        let blocks = planes(&w, &x, &labels, period)?;
+        let blocks = planes(&w, &carriers(&x, &sides.labels, sides.period)?)?;
         let check = blocks.iter().fold(Array2::<f64>::zeros(w.dim()), |acc, (_, u, v)| acc + u.t().dot(v));
         let error = (&check - &w).iter().fold(0.0_f64, |m, e| m.max(e.abs())) / w.iter().fold(0.0_f64, |m, e| m.max(e.abs()));
         eprintln!(
@@ -525,7 +563,7 @@ fn run(dir: &Path, out: &Path, observations: f64) -> Result<(), String> {
         std::fs::write(out, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
     };
     // Every point also with its blocks all on: with the library paid once, a block that runs on
-    // every word names no words.
+    // every token names no tokens.
     let on_everywhere = |coded: &Coded<'_>, blocked: &Blocked| -> Result<(Blocked, Bits), String> {
         let mut on = all_on(blocked);
         on.price(coded)?;
@@ -538,10 +576,13 @@ fn run(dir: &Path, out: &Path, observations: f64) -> Result<(), String> {
         let coded = Coded { model: &program, sites: chosen.clone(), batches: batches.clone(), observations, samples: 16, describe: &structured };
         let planes = Blocked::new(plane_libraries.clone(), plane_ranks.clone(), ones(&plane_ranks));
         let (whole, whole_bits) = on_everywhere(&coded, &planes.whole())?;
-        points.push(report("whole sites", &coded, &whole, &whole_bits, &structured, None)?);
+        points.push(report("whole sites", &coded, &whole, &whole_bits, &sides, None)?);
         let (planes_on, planes_on_bits) = on_everywhere(&coded, &planes)?;
-        points.push(report("planes, all on", &coded, &planes_on, &planes_on_bits, &structured, Some(plane_labels.as_slice()))?);
+        points.push(report("planes, all on", &coded, &planes_on, &planes_on_bits, &sides, Some(plane_labels.as_slice()))?);
         write(&points, &calibrations)?;
+    }
+    if only_all_on {
+        return Ok(());
     }
     // The price is calibrated on the selected planes (the point in question), then kept for every
     // selected and fitted point. Each point is written as it lands.
@@ -558,28 +599,29 @@ fn run(dir: &Path, out: &Path, observations: f64) -> Result<(), String> {
         structured = structured.scaled(if ratio.is_finite() { ratio } else { 1e3 });
     };
     let coded = Coded { model: &program, sites: chosen.clone(), batches, observations, samples: 16, describe: &structured };
-    points.push(report("planes, selected", &coded, &planes_selected, &planes_selected_bits, &structured, Some(plane_labels.as_slice()))?);
+    points.push(report("planes, selected", &coded, &planes_selected, &planes_selected_bits, &sides, Some(plane_labels.as_slice()))?);
     write(&points, &calibrations)?;
     let svd_ranks: Vec<Vec<usize>> = svd_libraries.iter().map(|l| vec![1; l.v.nrows()]).collect();
     let (rank_one, _) = selected(&coded, Blocked::rank_one(svd_libraries.clone(), ones(&svd_ranks)))?;
     let (fitted, fitted_bits) = fit_blocks(&coded, rank_one, true)?;
-    points.push(report("fitted from rank-one subcomponents", &coded, &fitted, &fitted_bits, &structured, None)?);
+    points.push(report("fitted from rank-one subcomponents", &coded, &fitted, &fitted_bits, &sides, None)?);
     let (fitted_on, fitted_on_bits) = on_everywhere(&coded, &fitted)?;
-    points.push(report("fitted from rank-one subcomponents, all on", &coded, &fitted_on, &fitted_on_bits, &structured, None)?);
+    points.push(report("fitted from rank-one subcomponents, all on", &coded, &fitted_on, &fitted_on_bits, &sides, None)?);
     write(&points, &calibrations)?;
     let (seeded, seeded_bits) = fit_blocks(&coded, planes_selected, true)?;
-    points.push(report("fitted from the selected planes", &coded, &seeded, &seeded_bits, &structured, None)?);
+    points.push(report("fitted from the selected planes", &coded, &seeded, &seeded_bits, &sides, None)?);
     let (seeded_on, seeded_on_bits) = on_everywhere(&coded, &seeded)?;
-    points.push(report("fitted from the selected planes, all on", &coded, &seeded_on, &seeded_on_bits, &structured, None)?);
+    points.push(report("fitted from the selected planes, all on", &coded, &seeded_on, &seeded_on_bits, &sides, None)?);
     write(&points, &calibrations)
 }
 
 fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 4 {
-        return Err("mpd_planes_2951 EXPORT_DIR OUT.json OBSERVATIONS".to_string());
+    let only_all_on = args.get(4).is_some_and(|a| a == "all-on");
+    if args.len() != 4 && !only_all_on {
+        return Err("mpd_planes_2951 EXPORT_DIR OUT.json OBSERVATIONS [all-on]".to_string());
     }
     let observations = args[3].parse::<f64>().map_err(|e| format!("OBSERVATIONS: {e}"))?;
-    run(Path::new(&args[1]), Path::new(&args[2]), observations)
+    run(Path::new(&args[1]), Path::new(&args[2]), observations, only_all_on)
 }
