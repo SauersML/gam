@@ -58,7 +58,7 @@ fn main()->Result<(),String>{
         if config["frozen_discovery_sha256"].as_str()!=Some(&sha256(path)?) {return Err("frozen discovery pool hash mismatch".into());}
         let declarations=gam_mpd::operator_program::Declarations {domains:vec![],slots:vec![gam_mpd::operator_program::Slot::Raw {width:768};2],parameters:0};
         let saved=Artifact::from_bytes(&std::fs::read(path).map_err(|e|e.to_string())?,&declarations)?;
-        if !saved.exceptions.is_empty() || !saved.derived.is_empty() || !saved.controls.is_empty() {return Err("unsupported discovery artifact metadata".into());}
+        if !saved.blocks.is_empty() || !saved.exceptions.is_empty() || !saved.derived.is_empty() || !saved.controls.is_empty() {return Err("unsupported discovery artifact metadata".into());}
         let outputs=match &saved.program.nodes[saved.program.output] {gam_mpd::operator_program::Node::Concat {parts} if parts.len()==2=>parts.clone(),_=>return Err("discovery pool must have two explicit native-use outputs".into())};
         Some(Proposal {program:saved.program,trainable:vec![],body_operators:vec![0,1],outputs,uses:vec![0,1]})
     } else {None};
@@ -66,8 +66,37 @@ fn main()->Result<(),String>{
         if arm!=Arm::FrozenNative {return Err("transfer explicitly requires arm=frozen_native with supplied fitted body".into());}
         shared_geometry_transfer::build(discovery,&native,&layers,&uses,seed)?
     } else { shared_geometry_pilot::build(&native,&layers,&uses,arm,seed)? };
+    if let Some(path)=config["resume_pool"].as_str() {
+        if discovery.is_some(){return Err("resume_pool and frozen_discovery_pool are distinct exclusive modes".into());}
+        let path=Path::new(path);
+        if config["resume_sha256"].as_str()!=Some(&sha256(path)?){return Err("resume pool hash mismatch".into());}
+        let saved=Artifact::from_bytes(&std::fs::read(path).map_err(|e|e.to_string())?,&proposal.program.declarations)?;
+        if !saved.blocks.is_empty() || !saved.exceptions.is_empty() || !saved.controls.is_empty() || !saved.derived.is_empty(){return Err("unsupported resume metadata".into());}
+        let resumed=&saved.program;
+        let expected=&proposal.program;
+        if resumed.declarations!=expected.declarations || resumed.bases!=expected.bases || resumed.nodes!=expected.nodes || resumed.output!=expected.output || resumed.rules.len()!=expected.rules.len() || resumed.operators.len()!=expected.operators.len(){return Err("resume program structure differs from declared arm".into());}
+        for (a,b) in resumed.rules.iter().zip(&expected.rules){if a.inputs!=b.inputs || a.nodes!=b.nodes || a.output!=b.output{return Err("resume rule structure differs".into());}}
+        for (a,b) in resumed.operators.iter().zip(&expected.operators){
+            if a.rows!=b.rows || a.cols!=b.cols{return Err("resume operator interface differs".into());}
+            match (&a.body,&b.body){
+                (gam_mpd::operator_program::OperatorBody::Dense {values:a,present:ap,..},gam_mpd::operator_program::OperatorBody::Dense {values:b,present:bp,..}) if a.dim()==b.dim() && ap==bp && ap.iter().all(|p|*p)=>{},
+                _=>return Err("resume requires identical fully present dense declarations".into()),
+            }
+        }
+        if arm==Arm::FrozenNative || arm==Arm::FrozenRandom {
+            let expected=Artifact::native(expected)?.f32_literals()?;
+            for &index in &proposal.body_operators {
+                let a=resumed.operators[index].matrix();let b=expected.program.operators[index].matrix();
+                if !a.iter().map(|v|v.to_bits()).eq(b.iter().map(|v|v.to_bits())){return Err("frozen control resume body differs from declared initializer".into());}
+            }
+        }
+        proposal.program=saved.program;
+    } else if !config["resume_pool"].is_null(){return Err("resume_pool must be a path string".into());}
+    let train_rows=if config["train_rows"].is_null(){4096}else{integer(&config,"train_rows")?};
+    let eval_rows=if config["eval_rows"].is_null(){1024}else{integer(&config,"eval_rows")?};
+    if train_rows==0 || eval_rows==0{return Err("positive declared train/evaluation rows required".into());}
     let train=panel(&manifest,"train")?;let valid=panel(&manifest,"eval")?;
-    if integer(train,"rows")?!=4096 || integer(valid,"rows")?!=1024{return Err("frozen4096train/1024eval native rows required".into());}
+    if integer(train,"rows")?!=train_rows || integer(valid,"rows")?!=eval_rows{return Err("manifest does not match declared train/evaluation row counts".into());}
     let root=manifest_path.parent().ok_or("native manifest parent absent")?;
     let mut x=vec![];let mut y=vec![];let mut vx=vec![];let mut vy=vec![];let mut groups=vec![];let mut provenance=vec![];let mut column=0;
     for &use_id in &uses{
@@ -78,9 +107,9 @@ fn main()->Result<(),String>{
         groups.push(OutputGroup {label:format!("nativeMLP{use_id}"),start:column,end:column+768});column+=768;
         provenance.push(json!({"use":use_id,"train_input":ad,"train_write":bd,"eval_input":cd,"eval_write":dd}));x.push(a);y.push(b);vx.push(c);vy.push(d);
     }
-    let y=targets(4096,&y)?;let vy=targets(1024,&vy)?;
+    let y=targets(train_rows,&y)?;let vy=targets(eval_rows,&vy)?;
     let source=saved_program(&out.join("source-pool.artifact"),&proposal.program)?;proposal.program=source.program;
-    save(&out.join("PROVENANCE.json"),&json!({"config":config,"config_sha256":sha256(config_path)?,"extract_sha256":sha256(manifest_path)?,"export_record":imported.record,"arrays":provenance,"body_operators":proposal.body_operators,"trainable":proposal.trainable,"groups":groups,"source_sha256":sha256(&out.join("source-pool.artifact"))?,"binary_sha256":sha256(&std::env::current_exe().map_err(|e|e.to_string())?)?,"claim_scope":"supplied GELU architecture; learned overcomplete numerical geometry diagnostic, not interpreted algorithm recovery","initialization":"all arms native use0 reader geometry except declared seeded random; per-use native writers; identity input bindings; untied starts identical effective use0 readers","data_scope":"4096 unique aligned training tokens,8192site-row targets; eval1024 previously examined project tokens, not untouched confirmation","transfer_status":if discovery.is_some(){"frozen body transfer; only paid new-use bindings trained"}else{"discovery stage only"}}))?;
+    save(&out.join("PROVENANCE.json"),&json!({"config":config,"config_sha256":sha256(config_path)?,"extract_sha256":sha256(manifest_path)?,"export_record":imported.record,"arrays":provenance,"body_operators":proposal.body_operators,"trainable":proposal.trainable,"groups":groups,"source_sha256":sha256(&out.join("source-pool.artifact"))?,"binary_sha256":sha256(&std::env::current_exe().map_err(|e|e.to_string())?)?,"claim_scope":"supplied GELU architecture; learned overcomplete numerical geometry diagnostic, not interpreted algorithm recovery","initialization":if config["resume_pool"].is_string(){"exact saved pool continuation, all bindings retained; frozen arm body checked against its declared native/random initializer"}else if discovery.is_some(){"exact frozen discovery body plus fresh identity input bindings/native per-use writers"}else{"all arms native use0 reader geometry except declared seeded random; per-use native writers; identity input bindings; untied starts identical effective use0 readers"},"data_scope":{"training_input_positions":train_rows,"training_site_rows_per_scan":train_rows*uses.len(),"evaluation_input_positions":eval_rows,"evaluation_scope":"previously examined project panel, fit-disjoint not untouched confirmation"},"optimizer_state":"fresh Adam moments and step counter; resume_pool is parameter warmstart, not stateful optimizer resume","transfer_status":if discovery.is_some(){"frozen body transfer; only paid new-use bindings trained"}else{"discovery stage only"}}))?;
     let device=match args[4].as_str(){"host"=>gam_gpu::tensor::Device::host(),"cuda"=>gam_gpu::tensor::Device::accelerator(gam_gpu::GpuPolicy::Required).map_err(|e|e.to_string())?.ok_or("CUDA required")?,_=>return Err("host|cuda backend required".into())};
     let frozen:Vec<_>=proposal.body_operators.iter().map(|i|proposal.program.operators[*i].clone()).collect();
     let result=resident_rule_fit::fit_grouped(&device,&proposal.program,&x,&y,&vx,&vy,&groups,&proposal.trainable,settings.clone())?;
@@ -96,5 +125,5 @@ fn main()->Result<(),String>{
     let mut exports=vec![];
     for slot in 0..uses.len(){let function=shared_geometry_pilot::function(&proposal,slot)?;let path=out.join(format!("use{}.artifact",uses[slot]));let standalone=saved_program(&path,&function)?;exports.push(json!({"native_use":uses[slot],"path":path,"sha256":sha256(&path)?,"standalone_cost_not_joint_cost":structural_cost(&standalone,&mut CostCache::default())?.total()}));}
     let pool_cost=structural_cost(&replay,&mut CostCache::default())?;
-    save(&out.join("REPORT.json"),&json!({"optimizer":report,"saved_f32_F64_training":train_measure,"saved_f32_F64_evaluation":valid_measure,"pool_C32_not_full_model":pool_cost,"pool_C32_bits":pool_cost.total(),"fitted_pool_sha256":sha256(&out.join("fitted-pool.artifact"))?,"function_exports":exports,"seconds":started.elapsed().as_secs_f64(),"full_native_graft_acceptance":"not measured; must load pool once and preserve sharedbody during actualgraft","body_transfer":if discovery.is_some(){"frozen body bits verified before/after fitting and ordinary replay; heldout-use bindings fitted on their training rows"}else{"not measured"}}))?;Ok(())
+    save(&out.join("REPORT.json"),&json!({"optimizer":report,"optimizer_state":"fresh Adam moments and step counter for every invocation; parameter warmstarts retain parameters only","saved_f32_F64_training":train_measure,"saved_f32_F64_evaluation":valid_measure,"pool_C32_not_full_model":pool_cost,"pool_C32_bits":pool_cost.total(),"fitted_pool_sha256":sha256(&out.join("fitted-pool.artifact"))?,"function_exports":exports,"seconds":started.elapsed().as_secs_f64(),"full_native_graft_acceptance":"not measured; must load pool once and preserve sharedbody during actualgraft","body_transfer":if discovery.is_some(){"frozen body bits verified before/after fitting and ordinary replay; heldout-use bindings fitted on their training rows"}else{"not measured"}}))?;Ok(())
 }
