@@ -39,10 +39,12 @@
 //! Σ_{j∈g∩S_t} d_tj`, and under the prices the total is a sum over concepts, so changes to
 //! disjoint concepts add. Flips interact (dropping many members each nearly free can cost more
 //! than all their prices), so the prices only propose and the exact total decides every change.
-//! The prices are measured exactly at the sets themselves to start with; after every kept round
+//! The prices are given at the start's programs (exact flips, or for a candidate the start leaves
+//! off possibly its slope); after every kept round
 //! they are carried to the new programs by the slope of the summed KL along each mask
 //! ([`Oracle::slopes`], one backward pass) with each member's curvature from its last exact flip
-//! (`Pricer`); and they are measured exactly again whenever no proposal is left at carried prices.
+//! (`Pricer`); and they are measured exactly again whenever no proposal is left at carried prices
+//! (when the run allows it).
 //!
 //! # The fit
 //!
@@ -51,8 +53,9 @@
 //! error it removes, `−log₂ π + B_g < −log₂(1 − π) + m_tg`, until `Z` repeats or the bits stop
 //! falling; the least total seen over the starts is kept.
 //!
-//! Every subcomponent that may run starts as its own concept, invoked wherever a set holds it: the
-//! decomposition's own sets are the first programs. A round proposes changes under the prices,
+//! Every subcomponent that may run starts as its own concept, invoked where it runs at the start
+//! ([`Words`]: the decomposition's own sets are the first programs, within candidates that may add
+//! subcomponents they leave off). A round proposes changes under the prices,
 //! each the concepts it replaces, the concepts it becomes and its predicted saving:
 //!
 //! * a *refit* of one concept's invocations (EM from its current invocations, from every word
@@ -80,8 +83,8 @@
 //! # Coding new words
 //!
 //! A [`Model`] freezes each concept's rate at its KT estimate. New words are coded by the same
-//! descent with the vocabulary frozen ([`Model::encode`]): every concept a set touches invoked at
-//! first, then refits of each concept's invocations at its frozen rate, decided word by word and
+//! descent with the vocabulary frozen ([`Model::encode`]): every concept with a member running at
+//! the start invoked at first, then refits of each concept's invocations at its frozen rate, decided word by word and
 //! whole by the exact total of those words. [`Model::decode`] turns the invoked concepts back into the program.
 //!
 //! # What a concept's name does and does not carry
@@ -130,11 +133,6 @@ impl Sets {
         &self.indices[self.indptr[t]..self.indptr[t + 1]]
     }
 
-    /// The program bits of each word's own set: what the decomposition's sets cost as programs.
-    pub fn program_bits(&self, program: &[f64]) -> Vec<f64> {
-        (0..self.rows()).map(|t| self.row(t).iter().map(|j| program[*j as usize]).sum()).collect()
-    }
-
     /// Each element's (word, price) pairs, words ascending, from prices aligned with the indices.
     fn columns(&self, prices: &[f64]) -> Vec<Vec<(u32, f64)>> {
         let mut out = vec![Vec::new(); self.universe];
@@ -145,6 +143,24 @@ impl Sets {
         }
         out
     }
+}
+
+/// Words to code: per word the subcomponents that may run (`sets`), which of them run where the
+/// descent starts (`start`, aligned with the indices: say the decomposition's own sets within
+/// candidates that add to them), and each member's price there in nats (module note, "Prices").
+pub struct Words<'a> {
+    pub sets: &'a Sets,
+    pub start: &'a [bool],
+    pub prices: &'a [f64],
+}
+
+/// How a descent runs: the error's observations (`n`), the time after which no round starts, and
+/// whether exact prices are measured again when nothing is proposed at carried prices.
+#[derive(Clone, Copy, Debug)]
+pub struct Run {
+    pub observations: f64,
+    pub deadline: Instant,
+    pub reprice: bool,
 }
 
 /// Runs the model on programs, every listed subcomponent on and every other off.
@@ -651,39 +667,41 @@ fn propose_merges(
     out
 }
 
-/// Fit the vocabulary of `sets` (module note, "The fit"): `prices` (nats, aligned with the
-/// indices) are the members' prices at the sets themselves, `program[j]` is subcomponent `j`'s
+/// Fit the vocabulary of `coded` (module note, "The fit"): `program[j]` is subcomponent `j`'s
 /// description bits, every concept's name costs `label_bits` in the library, and `oracle` runs the
-/// model on these words for the exact KL and fresh prices at `observations`. No round starts after
-/// `deadline`.
-pub fn fit(sets: &Sets, prices: &[f64], program: &[f64], label_bits: f64, observations: f64, deadline: Instant, oracle: &mut dyn Oracle) -> Result<Fit, String> {
+/// model on these words for the exact KL and fresh prices.
+pub fn fit(coded: &Words<'_>, program: &[f64], label_bits: f64, run: Run, oracle: &mut dyn Oracle) -> Result<Fit, String> {
+    let Words { sets, start, prices } = *coded;
+    let Run { observations, deadline, reprice: exact_again } = run;
+    if start.len() != sets.indices.len() {
+        return Err(format!("{} start flags for {} set members", start.len(), sets.indices.len()));
+    }
     let universe = sets.universe;
     let words = sets.rows() as u64;
     let scale = observations / LN_2;
-    // Every subcomponent alone, invoked wherever a set holds it.
-    let mut needed_of: Vec<Vec<u32>> = vec![Vec::new(); universe];
+    // Every subcomponent alone, invoked where it runs at the start.
+    let mut needed_of: Vec<(Vec<u32>, Vec<bool>)> = vec![(Vec::new(), Vec::new()); universe];
     for t in 0..sets.rows() {
-        for j in sets.row(t) {
-            needed_of[*j as usize].push(t as u32);
+        for k in sets.indptr[t]..sets.indptr[t + 1] {
+            let (needed, on) = &mut needed_of[sets.indices[k] as usize];
+            needed.push(t as u32);
+            on.push(start[k]);
         }
     }
     let mut concepts: Vec<Option<Concept>> = needed_of
         .into_iter()
         .enumerate()
-        .filter(|(_, needed)| !needed.is_empty())
-        .map(|(j, needed)| {
-            let n = needed.len();
-            Some(Concept { members: vec![j as u32], needed, error: vec![0.0; n], invoked: vec![true; n], program: program[j], bits: 0.0 })
-        })
+        .filter(|(_, (needed, _))| !needed.is_empty())
+        .map(|(j, (needed, invoked))| Some(Concept { members: vec![j as u32], error: vec![0.0; needed.len()], needed, invoked, program: program[j], bits: 0.0 }))
         .collect();
     let (mut total, mut kl) = exact(concepts.iter().flatten(), words, universe, label_bits, observations, oracle)?;
     let start_bits = total;
-    log::info!("concepts: start {} concepts, the own sets' exact total {total:.0} bits", concepts.len());
+    log::info!("concepts: start {} concepts, the start's exact total {total:.0} bits", concepts.len());
     let mut open = vec![true; concepts.len()];
     let mut refused_pairs: HashSet<(usize, usize)> = HashSet::new();
     let mut refused: HashSet<usize> = HashSet::new();
-    let (mut pricer, start) = Pricer::measured(prices.to_vec(), &programs_of(concepts.iter().flatten(), words), sets, oracle)?;
-    let mut columns = priced_columns(sets, &start, scale)?;
+    let (mut pricer, measured) = Pricer::measured(prices.to_vec(), &programs_of(concepts.iter().flatten(), words), sets, oracle)?;
+    let mut columns = priced_columns(sets, &measured, scale)?;
     concepts.par_iter_mut().flatten().for_each(|c| reprice(c, &columns, words));
     let mut trust = usize::MAX;
     let mut rounds = Vec::new();
@@ -726,7 +744,7 @@ pub fn fit(sets: &Sets, prices: &[f64], program: &[f64], label_bits: f64, observ
         }
         let merges = changes.len() - refits;
         if changes.is_empty() {
-            if pricer.exact {
+            if pricer.exact || !exact_again {
                 break;
             }
             let programs = programs_of(concepts.iter().flatten(), words);
@@ -940,23 +958,28 @@ impl Model {
         if on { -f.invoked.log2() + f.program } else { -(1.0 - f.invoked).log2() }
     }
 
-    /// Code new words (module note, "Coding new words"): `sets` their sets, `prices` (nats,
-    /// aligned with the indices) the members' prices at the sets themselves, `oracle` the model on
-    /// these words, at `observations`; no round starts after `deadline`.
-    pub fn encode(&self, sets: &Sets, prices: &[f64], observations: f64, deadline: Instant, oracle: &mut dyn Oracle) -> Result<Coded, String> {
+    /// Code new words (module note, "Coding new words") with `oracle` the model on these words; a
+    /// concept starts invoked where some member runs at the start.
+    pub fn encode(&self, coded: &Words<'_>, run: Run, oracle: &mut dyn Oracle) -> Result<Coded, String> {
+        let Words { sets, start, prices } = *coded;
+        let Run { observations, deadline, reprice: exact_again } = run;
+        if start.len() != sets.indices.len() {
+            return Err(format!("{} start flags for {} set members", start.len(), sets.indices.len()));
+        }
         let words = sets.rows();
         let scale = observations / LN_2;
         // Per vocabulary concept, the words that need it and whether each invokes it.
         let mut needed: Vec<Vec<u32>> = vec![Vec::new(); self.concepts.len()];
+        let mut invoked: Vec<Vec<bool>> = vec![Vec::new(); self.concepts.len()];
         for t in 0..words {
-            let mut touched: Vec<u32> = sets.row(t).iter().filter_map(|j| self.concept_of[*j as usize]).collect();
+            let mut touched: Vec<(u32, bool)> =
+                (sets.indptr[t]..sets.indptr[t + 1]).filter_map(|k| self.concept_of[sets.indices[k] as usize].map(|c| (c, start[k]))).collect();
             touched.sort_unstable();
-            touched.dedup();
-            for c in touched {
+            for (c, group) in touched.chunk_by(|a, b| a.0 == b.0).map(|g| (g[0].0, g)) {
                 needed[c as usize].push(t as u32);
+                invoked[c as usize].push(group.iter().any(|x| x.1));
             }
         }
-        let mut invoked: Vec<Vec<bool>> = needed.iter().map(|n| vec![true; n.len()]).collect();
         let programs = |invoked: &[Vec<bool>]| -> Vec<Vec<u32>> {
             let mut out: Vec<Vec<u32>> = vec![Vec::new(); words];
             for (c, (n, z)) in needed.iter().zip(invoked).enumerate() {
@@ -996,8 +1019,8 @@ impl Model {
             }
             Ok(error)
         };
-        let (mut pricer, start) = Pricer::measured(prices.to_vec(), &programs(&invoked), sets, oracle)?;
-        let mut error = errors(&start)?;
+        let (mut pricer, measured) = Pricer::measured(prices.to_vec(), &programs(&invoked), sets, oracle)?;
+        let mut error = errors(&measured)?;
         let mut refused: HashSet<usize> = HashSet::new();
         let mut trust = usize::MAX;
         let mut rounds = Vec::new();
@@ -1020,7 +1043,7 @@ impl Model {
                 })
                 .collect();
             if changes.is_empty() {
-                if pricer.exact {
+                if pricer.exact || !exact_again {
                     break;
                 }
                 let now = programs(&invoked);

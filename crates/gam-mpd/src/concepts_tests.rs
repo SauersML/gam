@@ -3,7 +3,7 @@
 //! co-fires but is not worth its program stays out), the exact total refusing what the prices
 //! wrongly propose, and coding fresh words from names alone.
 
-use super::concepts::{Model, Oracle, Sets, fit, kt_bits};
+use super::concepts::{Model, Oracle, Run, Sets, Words, fit, kt_bits};
 use std::time::{Duration, Instant};
 
 fn uniform(seed: u64) -> f64 {
@@ -80,8 +80,8 @@ fn planted(words: usize, salt: u64) -> (Sets, Vec<f64>, Vec<[bool; 3]>) {
     (Sets::new(40, indptr, indices).expect("sets"), price, truth)
 }
 
-fn later() -> Instant {
-    Instant::now() + Duration::from_secs(600)
+fn run() -> Run {
+    Run { observations: std::f64::consts::LN_2, deadline: Instant::now() + Duration::from_secs(600), reprice: true }
 }
 
 #[test]
@@ -97,7 +97,8 @@ fn kt_code_lengths() {
 fn planted_groups_become_the_vocabulary() {
     let (sets, price, _) = planted(3000, 0xC0);
     let program = vec![PROGRAM; 40];
-    let fitted = fit(&sets, &price, &program, 40.0, std::f64::consts::LN_2, later(), &mut Additive { sets: &sets, price: &price }).expect("fit");
+    let start = vec![true; sets.indices.len()];
+    let fitted = fit(&Words { sets: &sets, start: &start, prices: &price }, &program, 40.0, run(), &mut Additive { sets: &sets, price: &price }).expect("fit");
     let mut vocabulary: Vec<Vec<u32>> = fitted.concepts.iter().filter(|c| c.invocations() > 0).map(|c| c.members.clone()).collect();
     vocabulary.sort();
     let want: Vec<Vec<u32>> = PLANTED.iter().map(|r| r.clone().collect()).collect();
@@ -107,7 +108,10 @@ fn planted_groups_become_the_vocabulary() {
     // Fresh words: the names alone decode to the needed groups.
     let model = Model::new(&fitted);
     let (fresh, fresh_price, truth) = planted(1000, 0x5EED);
-    let coded = model.encode(&fresh, &fresh_price, std::f64::consts::LN_2, later(), &mut Additive { sets: &fresh, price: &fresh_price }).expect("code");
+    let fresh_start = vec![true; fresh.indices.len()];
+    let coded = model
+        .encode(&Words { sets: &fresh, start: &fresh_start, prices: &fresh_price }, run(), &mut Additive { sets: &fresh, price: &fresh_price })
+        .expect("code");
     let mut agree = 0;
     for (t, needed) in truth.iter().enumerate() {
         let want: Vec<u32> = PLANTED.iter().zip(needed).filter(|(_, n)| **n).flat_map(|(r, _)| r.clone()).collect();
@@ -145,7 +149,8 @@ fn the_exact_total_refuses_dropping_both_backups() {
     let words = 200;
     let sets = Sets::new(2, (0..=words).map(|t| 2 * t).collect(), (0..words).flat_map(|_| [0, 1]).collect()).expect("sets");
     // At the sets themselves each backup's price is nothing: the other covers it.
-    let fitted = fit(&sets, &vec![0.0; 2 * words], &[PROGRAM, PROGRAM], 40.0, std::f64::consts::LN_2, later(), &mut Redundant).expect("fit");
+    let (start, prices) = (vec![true; 2 * words], vec![0.0; 2 * words]);
+    let fitted = fit(&Words { sets: &sets, start: &start, prices: &prices }, &[PROGRAM, PROGRAM], 40.0, run(), &mut Redundant).expect("fit");
     let on: Vec<usize> = fitted.concepts.iter().map(|c| c.invocations()).collect();
     assert_eq!(on.iter().sum::<usize>(), words, "exactly one backup runs on every word: {on:?}");
     assert!(fitted.kl.iter().all(|k| *k == 0.0), "no word is left without a backup");

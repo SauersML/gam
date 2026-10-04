@@ -26,8 +26,10 @@ Stages (each reads and writes under NLAE):
 
   vpd           NLAE/sets from VPD's published sets (frontier/masks_vpd4l.npz) and library
   program DIR   sets/program.f64 from mpd_program_bits_2951's OUT_DIR (one f64 per subcomponent)
+  extend N      NLAE/cands: the own sets plus the subcomponents whose first-order gain pays for
+                their program at n = N (the fit's candidates; the own sets run at its start)
   oracle LO:HI  the model as the concept fit's oracle (examples/mpd_nl_concepts_2951.rs)
-  [rust]        mpd_nl_concepts_2951 NLAE/sets 32:128 0:32 N LABEL_BITS SECONDS NLAE/fit \
+  [rust]        mpd_nl_concepts_2951 NLAE/cands 32:128 0:32 N LABEL_BITS SECONDS REPRICE NLAE/fit \
                     python vpd_nl_autoencoder.py oracle
   labels        per subcomponent, what it reads from the embedding, writes to the logits and fires on
   names         an English name per fitted concept (Qwen2.5-7B-Instruct), unique (the decoder is a lookup)
@@ -190,6 +192,67 @@ def stage_vpd():
     json.dump({"universe": int(off[-1]), "context": int(z["ids"].shape[1]), "library": "mpd-data/pieces/vpd4l_library",
                "sites": sites, "source": "frontier/masks_vpd4l.npz (VPD gate > 0, val rows 1024..1152)"}, open(SETS / "meta.json", "w"))
     print(f"{SETS}: {z['ids'].shape[0]} rows, {len(z['vpd_indices']) / z['ids'].size:.1f} subcomponents per word of {off[-1]}")
+
+
+def stage_extend():
+    """Candidate sets for the fit (NLAE/cands): each word's own set, which runs at the start, plus
+    every subcomponent off there whose first-order gain pays for its program at n = argv[2]: n/ln 2
+    times its slope -d(sum of every word's KL)/d(its mask) at the own sets above its program bits.
+    Writes indptr.i64, indices.i64, start.u8 (1 for an own-set member), missing.f32 (the own
+    members' exact prices from sets/missing.f32, the additions' slopes) and program.f64."""
+    import shutil
+
+    import torch
+
+    D = decomposition()
+    n = float(sys.argv[2])
+    target = load(D)
+    dev = next(iter(target.buffers())).device
+    program = np.fromfile(SETS / "program.f64")
+    own_price = np.fromfile(SETS / "missing.f32", dtype="<f4")
+    worth = torch.tensor(program * math.log(2) / n, device=dev, dtype=torch.float32)
+    batch = int(os.environ.get("NLAE_ORACLE_BATCH", "8"))
+    rows = D.ids.shape[0]
+    ptr, idx, start, price = [0], [], [], []
+    for b0 in range(0, rows, batch):
+        B = min(batch, rows - b0)
+        a = D.indptr[b0 * D.context]
+        own = own_sets(D, b0, b0 + B)
+        word = np.repeat(np.arange(len(own)), [len(o) for o in own])
+        masks = masks_of(D, dev, B, word, np.concatenate(own))
+        for m in masks.values():
+            m.requires_grad_(True)
+        ids = torch.tensor(D.ids[b0:b0 + B], device=dev)
+        with torch.no_grad():
+            clean = target(ids)
+        kl_per_pos(masked(target, ids, masks), clean).sum().backward()
+        slope = torch.cat([-masks[model_site(name)].grad for name in D.names], -1).reshape(B * D.context, D.universe)
+        on = torch.cat([masks[model_site(name)].detach() for name in D.names], -1).reshape(B * D.context, D.universe) > 0.5
+        add = (~on) & (slope > worth[None, :])
+        at = 0
+        for w in range(B * D.context):
+            extra = torch.nonzero(add[w]).flatten()
+            members = np.concatenate([own[w], extra.cpu().numpy()])
+            order = np.argsort(members, kind="stable")
+            k = len(own[w])
+            idx.append(members[order])
+            start.append((order < k).astype(np.uint8))
+            price.append(np.concatenate([own_price[a + at:a + at + k], slope[w, extra].cpu().numpy()])[order])
+            at += k
+            ptr.append(ptr[-1] + len(members))
+        del masks, slope, on, add
+        print(f"rows {b0}..{b0 + B}: {np.mean([len(i) for i in idx[-B * D.context:]]):.1f} candidates per word "
+              f"({np.mean([s.sum() for s in start[-B * D.context:]]):.1f} own)", flush=True)
+    out = NLAE / "cands"
+    out.mkdir(parents=True, exist_ok=True)
+    np.asarray(ptr, dtype="<i8").tofile(out / "indptr.i64")
+    np.concatenate(idx).astype("<i8").tofile(out / "indices.i64")
+    np.concatenate(start).astype(np.uint8).tofile(out / "start.u8")
+    np.concatenate(price).astype("<f4").tofile(out / "missing.f32")
+    shutil.copy(SETS / "program.f64", out / "program.f64")
+    meta = json.load(open(SETS / "meta.json"))
+    meta["candidates"] = f"the own sets plus every subcomponent whose first-order gain pays for its program at n = {n:g}"
+    json.dump(meta, open(out / "meta.json", "w"))
 
 
 def stage_program():
@@ -630,9 +693,9 @@ def stage_textonly():
 
 if __name__ == "__main__":
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-    stages = {"vpd": stage_vpd, "program": stage_program, "oracle": stage_oracle,
+    stages = {"vpd": stage_vpd, "extend": stage_extend, "program": stage_program, "oracle": stage_oracle,
               "labels": stage_labels, "names": stage_names, "textonly": stage_textonly}
-    if sys.argv[1] in ("oracle", "program"):
+    if sys.argv[1] in ("oracle", "program", "extend"):
         stages[sys.argv[1]]()
         sys.exit(0)
     for stage in sys.argv[1:]:

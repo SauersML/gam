@@ -1,17 +1,19 @@
 //! The named vocabulary of a decomposition's per-word sets (#2951), for the natural-language
 //! autoencoder `bench/vpd_2951/vpd_nl_autoencoder.py`, where the text is the only channel.
 //!
-//! `mpd_nl_concepts_2951 SETS TRAIN EVAL OBSERVATIONS LABEL_BITS SECONDS OUT ORACLE...`
+//! `mpd_nl_concepts_2951 SETS TRAIN EVAL OBSERVATIONS LABEL_BITS SECONDS REPRICE OUT ORACLE...`
 //!
 //! `SETS` holds, raw little-endian: `indptr.i64` and `indices.i64` (CSR over every sequence's
-//! positions, sequence after sequence: the subcomponents each word may run), `missing.f32` (per
-//! set member, its price in nats at the sets themselves: the exact KL its absence adds there),
+//! positions, sequence after sequence: the subcomponents each word may run), optionally `start.u8`
+//! (per set member, 1 where it runs at the start; every member when absent), `missing.f32` (per
+//! set member, its price in nats at the start's programs, KL with it off minus with it on),
 //! `program.f64` (per subcomponent, its description bits under the library's own description), and
 //! `meta.json` (`universe`, `context`). Any library's sets work. `TRAIN` and `EVAL` are sequence ranges
 //! `lo:hi`. The vocabulary is fitted on `TRAIN` ([`gam_mpd::concepts::fit`], every concept's name
 //! costing `LABEL_BITS` in the library, the error `OBSERVATIONS · KL / ln 2`), then the words of
 //! `EVAL` are coded with it frozen ([`gam_mpd::concepts::Model::encode`]). The fit gets the share
-//! of `SECONDS` its words are of all the words coded, the coding the rest.
+//! of `SECONDS` its words are of all the words coded, the coding the rest; `REPRICE` (0 or 1) says
+//! whether exact prices are measured again when nothing is proposed at carried prices.
 //!
 //! `ORACLE...` is a command that runs the model on the sequences `lo:hi` it is given as one more
 //! argument (`vpd_nl_autoencoder.py oracle`), started once for `TRAIN` and once for `EVAL`. It
@@ -29,7 +31,7 @@
 //! * `invoked.indptr.i64`, `invoked.indices.i64`: per word of `TRAIN` then `EVAL`, the concepts it names;
 //! * `bits.f64`: per word, its names, program and `n KL / ln 2` bits (exact), and its own set's program bits.
 
-use gam_mpd::concepts::{Bits, Model, Oracle, Sets, fit};
+use gam_mpd::concepts::{Bits, Model, Oracle, Run, Sets, Words, fit};
 use serde_json::json;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -140,15 +142,20 @@ fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
     let started = Instant::now();
     let args: Vec<String> = std::env::args().collect();
-    let usage = "usage: mpd_nl_concepts_2951 SETS TRAIN EVAL OBSERVATIONS LABEL_BITS SECONDS OUT ORACLE...";
+    let usage = "usage: mpd_nl_concepts_2951 SETS TRAIN EVAL OBSERVATIONS LABEL_BITS SECONDS REPRICE OUT ORACLE...";
     let dir = PathBuf::from(args.get(1).ok_or(usage)?);
     let train = range(args.get(2).ok_or(usage)?)?;
     let eval = range(args.get(3).ok_or(usage)?)?;
     let observations: f64 = args.get(4).ok_or(usage)?.parse().map_err(|e| format!("OBSERVATIONS: {e}"))?;
     let label_bits: f64 = args.get(5).ok_or(usage)?.parse().map_err(|e| format!("LABEL_BITS: {e}"))?;
     let seconds: f64 = args.get(6).ok_or(usage)?.parse().map_err(|e| format!("SECONDS: {e}"))?;
-    let out = PathBuf::from(args.get(7).ok_or(usage)?);
-    let command = args.get(8..).filter(|c| !c.is_empty()).ok_or(usage)?;
+    let reprice = match args.get(7).map(String::as_str) {
+        Some("1") => true,
+        Some("0") => false,
+        _ => return Err(format!("REPRICE is 0 or 1; {usage}")),
+    };
+    let out = PathBuf::from(args.get(8).ok_or(usage)?);
+    let command = args.get(9..).filter(|c| !c.is_empty()).ok_or(usage)?;
     let meta: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     let universe = meta["universe"].as_u64().ok_or("meta.json: universe")? as usize;
@@ -157,21 +164,31 @@ fn main() -> Result<(), String> {
     let indices: Vec<u32> = read::<8>(&dir.join("indices.i64"))?.into_iter().map(|b| i64::from_le_bytes(b) as u32).collect();
     let program: Vec<f64> = read::<8>(&dir.join("program.f64"))?.into_iter().map(f64::from_le_bytes).collect();
     let missing: Vec<f64> = read::<4>(&dir.join("missing.f32"))?.into_iter().map(|b| f64::from(f32::from_le_bytes(b))).collect();
-    if program.len() != universe || missing.len() != indices.len() {
-        return Err("program.f64 needs one value per subcomponent and missing.f32 one per set member".to_string());
+    let start: Vec<bool> =
+        if dir.join("start.u8").exists() { read::<1>(&dir.join("start.u8"))?.into_iter().map(|b| b[0] == 1).collect() } else { vec![true; indices.len()] };
+    if program.len() != universe || missing.len() != indices.len() || start.len() != indices.len() {
+        return Err("program.f64 needs one value per subcomponent, missing.f32 and start.u8 one per set member".to_string());
     }
     let sequences = (indptr.len() - 1) / context;
     if train.1 > sequences || eval.1 > sequences || train.0 >= train.1 || eval.0 >= eval.1 {
         return Err(format!("ranges outside the {sequences} sequences"));
     }
-    let rows = |(lo, hi): (usize, usize)| -> Result<(Sets, Vec<f64>), String> {
+    let rows = |(lo, hi): (usize, usize)| -> Result<(Sets, Vec<bool>, Vec<f64>), String> {
         let (a, b) = (indptr[lo * context], indptr[hi * context]);
-        Ok((Sets::new(universe, indptr[lo * context..=hi * context].iter().map(|p| p - a).collect(), indices[a..b].to_vec())?, missing[a..b].to_vec()))
+        let sets = Sets::new(universe, indptr[lo * context..=hi * context].iter().map(|p| p - a).collect(), indices[a..b].to_vec())?;
+        Ok((sets, start[a..b].to_vec(), missing[a..b].to_vec()))
     };
-    let ((fitted_on, fit_prices), (coded_on, code_prices)) = (rows(train)?, rows(eval)?);
+    let ((fitted_on, fit_start, fit_prices), (coded_on, code_start, code_prices)) = (rows(train)?, rows(eval)?);
     let share = fitted_on.rows() as f64 / (fitted_on.rows() + coded_on.rows()) as f64;
     let mut oracle = Process::start(command, &format!("{}:{}", train.0, train.1))?;
-    let fitted = fit(&fitted_on, &fit_prices, &program, label_bits, observations, started + Duration::from_secs_f64(share * seconds), &mut oracle)?;
+    let run = |deadline: Instant| Run { observations, deadline, reprice };
+    let fitted = fit(
+        &Words { sets: &fitted_on, start: &fit_start, prices: &fit_prices },
+        &program,
+        label_bits,
+        run(started + Duration::from_secs_f64(share * seconds)),
+        &mut oracle,
+    )?;
     oracle.finish()?;
     let fit_seconds = started.elapsed().as_secs_f64();
     let words = fitted_on.rows() as f64;
@@ -185,7 +202,7 @@ fn main() -> Result<(), String> {
     );
     let model = Model::new(&fitted);
     let mut oracle = Process::start(command, &format!("{}:{}", eval.0, eval.1))?;
-    let coded = model.encode(&coded_on, &code_prices, observations, started + Duration::from_secs_f64(seconds), &mut oracle)?;
+    let coded = model.encode(&Words { sets: &coded_on, start: &code_start, prices: &code_prices }, run(started + Duration::from_secs_f64(seconds)), &mut oracle)?;
     oracle.finish()?;
     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
     let mut ptr: Vec<i64> = vec![0];
@@ -204,10 +221,13 @@ fn main() -> Result<(), String> {
             kl: *k,
         })
         .collect();
-    for (name, spec, sets, invocations, coded_bits) in
-        [("train", train, &fitted_on, &model.fitted, &fitted_bits), ("eval", eval, &coded_on, &coded.invoked, &coded.bits)]
+    for (name, spec, sets, starts, invocations, coded_bits) in
+        [("train", train, &fitted_on, &fit_start, &model.fitted, &fitted_bits), ("eval", eval, &coded_on, &code_start, &coded.invoked, &coded.bits)]
     {
-        let own = sets.program_bits(&program);
+        // The start's program bits (the own sets').
+        let own: Vec<f64> = (0..sets.rows())
+            .map(|t| (sets.indptr[t]..sets.indptr[t + 1]).filter(|k| starts[*k]).map(|k| program[sets.indices[k] as usize]).sum())
+            .collect();
         let mut sum = [0.0; 4];
         for ((cs, b), o) in invocations.iter().zip(coded_bits).zip(&own) {
             invoked.extend(cs.iter().map(|c| i64::from(*c)));
