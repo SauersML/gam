@@ -6,21 +6,24 @@ gam_mpd::site_fit's library of h.2.mlp.down_proj turns on at emoticon colons, in
            methods/decomp/ for the Rust selection:
              mpd_site_sets_2951 ~/mpd-data/engine/vpd4l_e2e_train 16 blocks.2.down_proj 1e7 methods/decomp/lib 20 \
                  methods/decomp/{fire_train,fire_eval,spaced_colon}.f64
-           fits the library on the 16 training rows (val 2048-2063) and selects every input's subcomponents
-  choose   per subcomponent, the share of training fire keys, ordinary training inputs and spaced ':' it is on at;
+           fits the library on the 16 training rows (val 2048-2063) and selects every input's subcomponents; with
+           ~/mpd-data/engine/vpd4l_emoticon 32 and methods/decomp/lib_emo, on those 16 rows and the 16 rows holding
+           the training-window fires (library tag "_emo")
+  choose [TAG]  per subcomponent of library lib{TAG}, the share of training fire keys, ordinary training inputs (the
+           library's own, fire positions left out) and spaced ':' it is on at;
            the emoticon subcomponent is the one whose on-state carries the most information about a position being
            an emoticon colon rather than ordinary text (the largest mutual information between the two indicators,
            fire keys and training inputs weighted equally). Writes the edits through it as rank-one plans
            compile/plan_{name}.{left,right}.npy (write, read), each at unit response on the mean fire key:
-             decomp_own      read: the emoticon subcomponent's own read v_c
-             decomp_span{k}  read: the least mean-square change on ordinary text (metric C, as ROME) within the span
-                             of the reads of the k subcomponents most informative of an emoticon colon
+             decomp{TAG}_own      read: the emoticon subcomponent's own read v_c
+             decomp{TAG}_span{k}  read: the least mean-square change on ordinary text (metric C, as ROME) within
+                                  the span of the reads of the k subcomponents most informative of an emoticon colon
            write: e4_edit_methods.py's Fisher write
-Then: e4_edit_methods.py assemble_extra decomp NAMES (each strength solved to the headline LoRA's success, with
-VPD's edit there), the harness on E4_VARIANTS=decomp (e4_side_effects_data.py eval/summarize,
+Then: e4_edit_methods.py assemble_extra decomp{TAG} NAMES (each strength solved to the headline LoRA's success, with
+VPD's edit there), the harness on E4_VARIANTS=decomp{TAG} (e4_side_effects_data.py eval/summarize,
 e4_benchmarks_data.py score/summarize, e4_edit_methods.py heldout) and e4_methods_table.py.
 
-usage: venv/python e4_decomp_edit.py reads | choose
+usage: venv/python e4_decomp_edit.py reads | choose [TAG]
 """
 import json
 import sys
@@ -32,7 +35,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import e4_edit_methods as M  # noqa: E402
 
 D = M.OUT / "decomp"
-LIB = D / "lib"
 SITE = "blocks.2.down_proj"
 SPAN = (2, 4, 8)
 
@@ -45,12 +47,13 @@ def stage_reads():
         M.log(f"{name}: {a.shape}")
 
 
-def on_rates(name, pieces):
-    sets = json.load(open(LIB / f"{name}.sets.json"))["sets"]
+def on_rates(lib, name, pieces, drop=()):
+    sets = json.load(open(lib / f"{name}.sets.json"))["sets"]
+    keep = [s for t, s in enumerate(sets) if t not in drop]
     on = np.zeros(pieces)
-    for s in sets:
+    for s in keep:
         on[s] += 1
-    return on / len(sets), len(sets)
+    return on / len(keep), len(keep)
 
 
 def information(p, q):
@@ -62,13 +65,17 @@ def information(p, q):
     return h((p + q) / 2) - (h(p) + h(q)) / 2
 
 
-def stage_choose():
-    v = np.fromfile(LIB / f"{SITE}.v.f64").reshape(-1, 3072)
+def stage_choose(tag=""):
+    lib = D / f"lib{tag}"
+    v = np.fromfile(lib / f"{SITE}.v.f64").reshape(-1, 3072)
     pieces = len(v)
-    fire, nf = on_rates("fire_train", pieces)
-    held, nh = on_rates("fire_eval", pieces)
-    gen, ng = on_rates(f"{SITE}.train", pieces)
-    colon, nc = on_rates("spaced_colon", pieces)
+    export = Path(json.load(open(lib / f"{SITE}.rounds.json"))["export"])
+    fires = json.load(open(export / "fire_positions.json")) if (export / "fire_positions.json").exists() else {}
+    drop = {r * 512 + p for key in ("train_all_fires", "eval_all_fires") for r, p in fires.get(key, [])}
+    fire, nf = on_rates(lib, "fire_train", pieces)
+    held, nh = on_rates(lib, "fire_eval", pieces)
+    gen, ng = on_rates(lib, f"{SITE}.train", pieces, drop)
+    colon, nc = on_rates(lib, "spaced_colon", pieces)
     info = information(fire, gen)
     order = np.argsort(-info)
     M.log(f"{pieces} subcomponents; on per input: fire {fire.sum():.1f}, ordinary {gen.sum():.1f}, spaced ':' {colon.sum():.1f}")
@@ -80,11 +87,11 @@ def stage_choose():
     C = C + 1e-6 * np.trace(C) / len(C) * np.eye(len(C))
     w = M.fisher_write(z)
     c0 = int(order[0])
-    reads = {"decomp_own": v[c0]}
+    reads = {f"decomp{tag}_own": v[c0]}
     for k in SPAN:
         B = v[order[:k]]  # k x d_in: the read span
         a = np.linalg.solve(B @ C @ B.T, B @ kbar)
-        reads[f"decomp_span{k}"] = B.T @ a
+        reads[f"decomp{tag}_span{k}"] = B.T @ a
     for name, u in reads.items():
         u = u / (u @ kbar)
         np.save(M.OUT / f"compile/plan_{name}.left.npy", w[:, None])
@@ -94,8 +101,8 @@ def stage_choose():
                "emoticon_subcomponent": c0, "ranked": [int(c) for c in order[:max(SPAN)]],
                "rates": {int(c): {"bits": float(info[c]), "fire_train": float(fire[c]), "fire_eval": float(held[c]),
                                   "ordinary": float(gen[c]), "spaced_colon": float(colon[c])} for c in order[:20]},
-               "plans": list(reads)}, open(D / "choice.json", "w"), indent=1)
+               "plans": list(reads)}, open(lib / "choice.json", "w"), indent=1)
 
 
 if __name__ == "__main__":
-    {"reads": stage_reads, "choose": stage_choose}[sys.argv[1]]()
+    {"reads": stage_reads, "choose": lambda: stage_choose(*sys.argv[2:3])}[sys.argv[1]]()
