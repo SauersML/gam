@@ -1164,7 +1164,15 @@ impl PreparedAssessment {
     pub(crate) fn assess(&self, local: &Local<'_>, run: &dyn RunCheck, constraint: Constraint) -> Result<Assessment, String> {
         let ((local_measure, run_measure), [local, run]) = decode_then_evaluate_pair(
             &self.encoded,
-            |decoded: &Artifact| Ok((local.measure(decoded)?, RunMeasure::of(run.episodes(decoded)?))),
+            |decoded: &Artifact| {
+                // A fresh cache releases these independent decoded operators after this
+                // measurement rather than retaining one full model per bank candidate.
+                let decoded_cost = structural_cost(decoded, &mut CostCache::default())?;
+                if decoded_cost != self.cost {
+                    return Err("decoded artifact has a different structural cost".into());
+                }
+                Ok((local.measure(decoded)?, RunMeasure::of(run.episodes(decoded)?)))
+            },
             |(local, run)| Ok([local.status()?, run.status()?]),
             [constraint.local, constraint.run],
         )?;
