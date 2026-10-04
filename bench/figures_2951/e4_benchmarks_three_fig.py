@@ -1,5 +1,5 @@
 """E4 on standard benchmarks (#2951): the change each emoticon edit makes to HellaSwag, ARC-Easy, PIQA, LAMBADA
-and the 67 BLiMP tasks, for VPD's subcomponent edit, the edit through the program-size decomposition's emoticon
+and the 67 BLiMP tasks, for VPD's subcomponent edit, the edit through the fitted decomposition's emoticon
 subcomponent (bench/e4_decomp_edit.py), the paper's LoRA and the least-change weight edit, all at the same edit
 success (98.5%): the change in each benchmark's correct-answer confidence. Reads bench/e4_methods_table.py's
 methods/table.json.
@@ -20,7 +20,7 @@ INK, INK2, SURF, AXIS = "#0b0b0b", "#52514e", "#ffffff", "#c3c2b7"
 plt.rcParams.update({"font.family": ["Helvetica Neue", "Arial Unicode MS"], "font.size": 24, "axes.edgecolor": AXIS,
                      "xtick.color": INK2, "ytick.color": INK2})
 METHODS = [("vpd", "VPD subcomponent edit", "#eb6834"),
-           ("decomp_own", "program-size decomposition: edit its emoticon subcomponent", "#a3360f"),
+           ("decomp_own", "fitted decomposition: edit through one subcomponent", "#a3360f"),
            ("lora", "LoRA, 282 examples", "#2a78d6"), ("compiled_span8", "minimum-disturbance weight edit", "#1baf7a")]
 TASKS = [("hellaswag", "HellaSwag"), ("arc_easy", "ARC-Easy"), ("piqa", "PIQA"), ("lambada", "LAMBADA"),
          ("blimp", "BLiMP (all 67 tasks)")]

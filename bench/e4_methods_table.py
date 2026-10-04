@@ -23,10 +23,10 @@ LABEL = {"vpd": "VPD: the paper's subcomponent", "lora": "LoRA (the paper's fine
          "compiled_span8_neg4": "our solver, 8 patterns, 4 other-colon patterns untouched",
          "compiled_span8_neg16": "our solver, 8 patterns, 16 other-colon patterns untouched",
          "compiled_span8_neg64": "our solver, 8 patterns, 64 other-colon patterns untouched",
-         "decomp_own": "program-size decomposition: edit its emoticon subcomponent",
-         "decomp_span2": "program-size decomposition: least change within its 2 emoticon subcomponents' reads",
-         "decomp_span4": "program-size decomposition: least change within its 4 emoticon subcomponents' reads",
-         "decomp_span8": "program-size decomposition: least change within its 8 emoticon subcomponents' reads"}
+         "decomp_own": "fitted decomposition: edit through one subcomponent",
+         "decomp_span2": "fitted decomposition: least change within 2 subcomponents' reads",
+         "decomp_span4": "fitted decomposition: least change within 4 subcomponents' reads",
+         "decomp_span8": "fitted decomposition: least change within 8 subcomponents' reads"}
 
 
 def check(d, key, nm, metric="kl"):

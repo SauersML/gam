@@ -65,7 +65,7 @@ ax.set_xlim(0.78, 1.0)
 ax.set_xticks([0.8, 0.85, 0.9, 0.95, 1.0])
 ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0%}"))
 ax.set_xlabel("edit success: probability of “o” after an emoticon colon")
-ax.set_ylabel("disturbance of ordinary text (KL, nats per word)")
+ax.set_ylabel("disturbance of ordinary text (KL, nats per token)")
 for s in ("top", "right"):
     ax.spines[s].set_visible(False)
 fig.suptitle("Off-target disturbance against edit success, every edit method", x=0.01, ha="left", y=0.985,
@@ -81,12 +81,12 @@ if (M / "table.json").exists():
     keys = [k for k in sorted(T, key=lambda k: -T[k]["kl_all"][0])
             if k != "vpd_at_hardneg" and (k == "compiled_span8" or not k.startswith("compiled")) and not k.startswith("decomp_span")]
     FAMILY = [("#eb6834", "parameter decomposition (VPD subcomponents)"),
-              ("#a3360f", "parameter decomposition (program-size)"), ("#2a78d6", "fine-tuning (LoRA)"),
+              ("#a3360f", "fitted decomposition"), ("#2a78d6", "fine-tuning (LoRA)"),
               ("#898781", "direct weight edit"), ("#1baf7a", "direct weight edit, least change to ordinary text")]
     COL = {"vpd": "#eb6834", "specific_subcomponent": "#eb6834", "decomp_own": "#a3360f", "lora": "#2a78d6",
            "lora_hardneg": "#2a78d6", "compiled_span8": "#1baf7a"}
-    panels = [("kl_all", "Disturbance of all held-out text", "KL from the original model (nats per word)", True),
-              ("kl_spaced_colon", "After a colon that is not an emoticon", "KL from the original model (nats per word)", True),
+    panels = [("kl_all", "Disturbance of all held-out text", "KL from the original model (nats per token)", True),
+              ("kl_spaced_colon", "After a colon that is not an emoticon", "KL from the original model (nats per token)", True),
               ("hellaswag", "HellaSwag", "change in the right answer's log-probability share (nats)", False)]
     fig, axes = plt.subplots(1, 3, figsize=(30, 0.62 * len(keys) + 3.4), dpi=130, sharey=True, gridspec_kw={"wspace": 0.08})
     fig.patch.set_facecolor(SURF)
