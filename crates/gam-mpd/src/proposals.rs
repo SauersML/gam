@@ -380,6 +380,60 @@ impl HeadSvd {
     }
 }
 
+/// A rank-truncated linear-map proposal fitted to declared training inputs, rather
+/// than to unweighted matrix entries. For inputs `X` (observations × input width)
+/// and matrix `W`, truncation minimizes `||X (W - W_r)^T||_F` in exact arithmetic.
+///
+/// This is only a proposal metric. The returned f32 factors still require decoded
+/// Local and autonomous Run acceptance on the declared evaluation family. No Fisher
+/// metric, calibration factor, or fidelity threshold enters this fit. Full column
+/// rank of `X` is required at the SVD's fixed machine-resolution convention: this
+/// version refuses unobserved input directions instead of silently choosing their
+/// extrapolation. Training inputs are not required to execute the resulting operator.
+pub struct DataWeightedSvd {
+    fit: HeadSvd,
+    pub training_rows: usize,
+    pub input_width: usize,
+    pub smallest_input_singular_value: f64,
+    pub largest_input_singular_value: f64,
+}
+
+impl DataWeightedSvd {
+    pub fn new(matrix: &Array2<f64>, inputs: &Array2<f64>) -> Result<Self, String> {
+        if matrix.nrows() == 0 || matrix.ncols() == 0 || inputs.ncols() != matrix.ncols()
+            || inputs.nrows() < inputs.ncols()
+            || matrix.iter().chain(inputs.iter()).any(|v| !v.is_finite())
+        {
+            return Err("data-weighted SVD requires finite compatible matrices and at least input-width training rows".into());
+        }
+        let x = gam_linalg::decompose::svd(inputs.view(), false).map_err(|e| e.to_string())?;
+        if x.singular_values.len() != inputs.ncols() || x.singular_values.iter().any(|s| *s <= x.band) {
+            return Err("data-weighted SVD training inputs are not full column rank at the declared SVD resolution".into());
+        }
+        // X = U S V^T. Orthogonality of U makes the weighted error equal to
+        // ||(W - W_r) V S||_F. Truncate W V S, then undo S and V on the right.
+        let weighted = matrix.dot(&x.vt.t()) * &x.singular_values;
+        let fit = gam_linalg::decompose::svd(weighted.view(), false).map_err(|e| e.to_string())?;
+        let right = (&fit.vt / &x.singular_values).dot(&x.vt);
+        if right.iter().chain(fit.u.iter()).chain(fit.singular_values.iter()).any(|v| !v.is_finite()) {
+            return Err("data-weighted SVD unwhitening produced a nonfinite factor".into());
+        }
+        Ok(Self {
+            fit: HeadSvd { u: fit.u, singular_values: fit.singular_values, vt: right },
+            training_rows: inputs.nrows(),
+            input_width: inputs.ncols(),
+            smallest_input_singular_value: x.singular_values.iter().copied().fold(f64::INFINITY, f64::min),
+            largest_input_singular_value: x.singular_values.iter().copied().fold(0.0, f64::max),
+        })
+    }
+
+    /// Explicit factors are projected to f32 and priced normally; no training data
+    /// or input covariance is an implicit dependency of this executable operator.
+    pub fn operator(&self, original: &Operator, name: String, rank: usize) -> Result<Operator, String> {
+        self.fit.operator(original, name, rank, "native-input-weighted linear reconstruction proposal; decoded fidelity not established")
+    }
+}
+
 struct CopyResidualHead {
     derived: super::artifact::Derived,
     operator: std::sync::Arc<Operator>,
@@ -638,6 +692,62 @@ impl<'a> MappedCopyResidualBank<'a> {
             }
         }
         map.bind(&out)
+    }
+}
+
+#[cfg(test)]
+mod data_weighted_svd_tests {
+    use super::*;
+
+    fn original(w: &Array2<f64>) -> Operator {
+        dense("native", &Interface::native(w.nrows()).expect("rows"),
+            &Interface::native(w.ncols()).expect("columns"), w.clone()).expect("dense operator")
+    }
+
+    #[test]
+    fn weighted_proposal_solves_the_observed_linear_error_not_weight_error() {
+        let w = ndarray::array![[2.0, 0.0], [0.0, 1.0]];
+        let x = ndarray::array![[1.0, 0.0], [0.0, 10.0]];
+        let source = original(&w);
+        let weighted = DataWeightedSvd::new(&w, &x).expect("full rank training");
+        let proposal = weighted.operator(&source, "weighted".into(), 1).expect("rank one");
+        let unweighted = HeadSvd::of(&w).expect("weight SVD")
+            .operator(&source, "plain".into(), 1, "weight-only control").expect("control");
+        let loss = |a: &Operator| x.dot(&(&w - &a.matrix()).t()).mapv(|v| v*v).sum();
+        assert!((loss(&proposal) - 4.0).abs() < 1e-10);
+        assert!((loss(&unweighted) - 100.0).abs() < 1e-10);
+        assert_eq!(proposal.real_count(), unweighted.real_count());
+        assert_eq!(proposal.real_count(), 4);
+        assert_eq!(weighted.training_rows, 2);
+        assert_eq!(weighted.smallest_input_singular_value, 1.0);
+        assert_eq!(weighted.largest_input_singular_value, 10.0);
+        let full = weighted.operator(&source, "full".into(), 2).expect("full rank");
+        assert!(full.matrix().iter().zip(&w).all(|(a,b)| (a-b).abs() < 1e-6));
+    }
+
+    #[test]
+    fn weighted_proposal_is_independent_of_an_orthogonal_input_coordinate_change() {
+        let w = ndarray::array![[2.0, 0.0], [0.0, 1.0], [1.0, -1.0]];
+        let x = ndarray::array![[1.0, 0.0], [0.0, 10.0], [2.0, 3.0]];
+        let rotation = ndarray::array![[0.6, -0.8], [0.8, 0.6]];
+        let wx = w.dot(&rotation);
+        let xx = x.dot(&rotation);
+        let a = DataWeightedSvd::new(&w, &x).expect("fit")
+            .operator(&original(&w), "a".into(), 1).expect("operator");
+        let b = DataWeightedSvd::new(&wx, &xx).expect("rotated fit")
+            .operator(&original(&wx), "b".into(), 1).expect("rotated operator");
+        let y = x.dot(&a.matrix().t());
+        let rotated_y = xx.dot(&b.matrix().t());
+        assert!(y.iter().zip(&rotated_y).all(|(a,b)| (a-b).abs() < 1e-5));
+    }
+
+    #[test]
+    fn unobserved_directions_and_nonfinite_training_are_explicit_failures() {
+        let w = ndarray::array![[2.0, 0.0], [0.0, 1.0]];
+        assert!(DataWeightedSvd::new(&w, &ndarray::array![[1.0, 0.0], [2.0, 0.0]]).is_err());
+        assert!(DataWeightedSvd::new(&w, &ndarray::array![[1.0, 0.0]]).is_err());
+        assert!(DataWeightedSvd::new(&w, &ndarray::array![[1.0, 0.0], [0.0, f64::NAN]]).is_err());
+        assert!(DataWeightedSvd::new(&ndarray::array![[f64::INFINITY, 0.0]], &w).is_err());
     }
 }
 
