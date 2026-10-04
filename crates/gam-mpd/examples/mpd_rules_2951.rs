@@ -22,6 +22,22 @@
 //! The structured price (`gam_mpd::describe::Structured`, each site's declared charts) of every
 //! subcomponent of the comma-separated `SITES` of a library, timed per site, as a fit prices them.
 //!
+//! `mpd_rules_2951 library EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json OBSERVATIONS STATISTICS LAYERS`
+//!
+//! Every site of the first `LAYERS` layers of a library, described in decoding order (per layer:
+//! values, outputs, keys, queries, the MLP's input then output) in the charts its interfaces declare
+//! (`gam_mpd::describe::declared_charts`, what a fit prices by), and again with the rules' charts
+//! beside them, each built from what the decoder already holds (the sites decoded before, the
+//! model's norm gains): a residual reader in the frames of every residual writer decoded before it,
+//! as written and through the reading norm's gain (`w / g`); a query writer in the frames of the
+//! layer's key writers; an output reader in the frames of the layer's value writers and an output
+//! writer in the copies of their readers (`(g / g_f) ⊙ r`); an MLP output reader in the frames of
+//! the layer's MLP input writers; a query reader in the images of the layer's key readers through
+//! every earlier head's decoded output-value circuit. A use pays its chart, its frames and its
+//! reals; a body is never sent twice. Reported per site and in all: the bits once and per word
+//! (the given sets' runs), which rule charts are taken, and the decode check (every site replaced
+//! by its decoded descriptions, on sequence `STATISTICS` under the given sets, against the library).
+//!
 //! `mpd_rules_2951 induction EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json OBSERVATIONS STATISTICS LAYER`
 //!
 //! The two induction rules priced on layer `LAYER`'s attention library, library paid once
@@ -129,6 +145,31 @@ fn heads(export: &std::path::Path, half: usize, sequences: usize) -> Result<(), 
             previous / n,
             first / n
         );
+    }
+    // Per head, how its output-value circuit copies a token: on 1024 evenly spaced tokens `t`, the
+    // logits `Eᵀ (g_f ⊙ OV (g ⊙ e_t))` of its direct path, and the rank of `t` among them.
+    let operator = |name: String| -> Result<Array2<f64>, String> { model.operators.iter().find(|o| o.name == name).map(|o| o.matrix()).ok_or(format!("no operator {name}")) };
+    let embedding = operator("wte".to_string())?;
+    let tokens = embedding.ncols();
+    let sample: Vec<usize> = (0..1024).map(|i| i * tokens / 1024).collect();
+    let final_gain = operator("final_norm.gain".to_string())?.diag().to_owned();
+    for layer in 0..4 {
+        let g = operator(format!("blocks.{layer}.rms1.gain"))?.diag().to_owned();
+        let read = &embedding.select(Axis(1), &sample) * &g.view().insert_axis(Axis(1));
+        for h in 0..per_layer {
+            let circuit = operator(format!("blocks.{layer}.o{h}"))?.dot(&operator(format!("blocks.{layer}.v{h}"))?);
+            let written = &circuit.dot(&read) * &final_gain.view().insert_axis(Axis(1));
+            let logits = gam_linalg::faer_ndarray::fast_ab(&embedding.t(), &written);
+            let ranks: Vec<usize> = sample.iter().enumerate().map(|(j, t)| logits.column(j).iter().filter(|x| **x > logits[[*t, j]]).count()).collect();
+            let mut sorted = ranks.clone();
+            sorted.sort_unstable();
+            eprintln!(
+                "layer {layer} head {h}: copying, the token's own logit first in {:.3} of tokens, in the top 10 in {:.3}, median rank {}",
+                ranks.iter().filter(|r| **r == 0).count() as f64 / ranks.len() as f64,
+                ranks.iter().filter(|r| **r < 10).count() as f64 / ranks.len() as f64,
+                sorted[sorted.len() / 2]
+            );
+        }
     }
     // Natural text's reads per layer: the attention's normed input, its second moment `C`.
     let natural = import_language_model(export, 4, 512)?;
@@ -638,9 +679,235 @@ fn price(export: &std::path::Path, library: &std::path::Path, observations: f64,
     Ok(())
 }
 
+/// The rows of `x` (`C × d`) as frame columns (`d × C`), each scaled entrywise by `scale` when given.
+fn columns_of(x: &[&Array2<f64>], scale: Option<&ndarray::Array1<f64>>) -> Result<Option<Array2<f64>>, String> {
+    if x.is_empty() {
+        return Ok(None);
+    }
+    let views: Vec<_> = x.iter().map(|m| m.t()).collect();
+    let mut out = ndarray::concatenate(Axis(1), &views).map_err(|e| e.to_string())?;
+    if let Some(scale) = scale {
+        for (i, mut row) in out.rows_mut().into_iter().enumerate() {
+            row *= scale[i];
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Decoded descriptions' factors stacked: (writers `C × d_out`, readers `C × d_in`).
+fn stacked(descriptions: &[gam_mpd::describe::Description]) -> Result<(Array2<f64>, Array2<f64>), String> {
+    let us: Vec<_> = descriptions.iter().map(|d| d.u.view()).collect();
+    let vs: Vec<_> = descriptions.iter().map(|d| d.v.view()).collect();
+    Ok((ndarray::concatenate(Axis(0), &us).map_err(|e| e.to_string())?, ndarray::concatenate(Axis(0), &vs).map_err(|e| e.to_string())?))
+}
+
+fn library(export: &std::path::Path, library: &std::path::Path, sets: &std::path::Path, out: &std::path::Path, observations: f64, statistics: usize, layers: usize) -> Result<(), String> {
+    use gam_mpd::blocks::{Blocked, Coded, Generic, measure};
+    use gam_mpd::describe::{Description, Geometry, Metric, declared_charts};
+    use gam_mpd::masked::{Library, Target, site_statistics, sites};
+    use rayon::prelude::*;
+    use std::collections::{BTreeMap, HashMap};
+    const CONTEXT: usize = 512;
+    let imported = import_language_model(export, statistics + 1, CONTEXT)?;
+    let model = &imported.program;
+    let family = &imported.contract.family;
+    let all = sites(model);
+    let order = ["v", "o", "k", "q", "c_fc", "down_proj"];
+    let chosen: Vec<gam_mpd::masked::Site> = (0..layers)
+        .flat_map(|l| order.iter().map(move |k| format!("blocks.{l}.{k}")))
+        .filter(|n| library.join(format!("{n}.v.f64")).exists())
+        .map(|n| all.iter().find(|s| s.name == n).cloned().ok_or(format!("no site {n}")))
+        .collect::<Result<_, _>>()?;
+    let rows: Vec<usize> = (0..statistics * CONTEXT).collect();
+    let started = std::time::Instant::now();
+    let measured = site_statistics(model, &chosen, [family.select(&rows)], 4, 0x5EED)?;
+    eprintln!("statistics of {} sites on {} words, {:.0}s", chosen.len(), rows.len(), started.elapsed().as_secs_f64());
+    let frequency = frequencies(sets)?;
+    let op = |name: String| -> Result<Array2<f64>, String> { model.operators.iter().find(|o| o.name == name).map(|o| o.matrix()).ok_or(format!("no operator {name}")) };
+    let gain = |name: String| -> Result<ndarray::Array1<f64>, String> { Ok(op(format!("{name}.gain"))?.diag().to_owned()) };
+    let gf = gain("final_norm".to_string())?;
+    // The rules' decoded sites so far, by name: (writers, readers).
+    let mut decoded: HashMap<String, (Array2<f64>, Array2<f64>)> = HashMap::new();
+    let mut variants: Vec<(Vec<Description>, Vec<Description>)> = Vec::new();
+    let mut libraries = Vec::new();
+    let mut report = Vec::new();
+    let (mut once, mut per_word) = ([0.0; 2], [0.0; 2]);
+    for (k, site) in chosen.iter().enumerate() {
+        let mut parts = site.name.split('.');
+        let layer: usize = parts.nth(1).and_then(|x| x.parse().ok()).ok_or(format!("{}: no layer", site.name))?;
+        let kind = site.name.splitn(3, '.').nth(2).unwrap_or("").to_string();
+        let (d_out, d_in) = measured[k].w.dim();
+        let u = read_f64(&library.join(format!("{}.u.f64", site.name)), d_out)?;
+        let v = read_f64(&library.join(format!("{}.v.f64", site.name)), d_in)?;
+        let (writers, readers) = declared_charts(model, &site)?;
+        let (mut rule_writers, mut rule_readers) = (Vec::new(), Vec::new());
+        let got = |name: String| decoded.get(&name);
+        // Residual writers decoded before this site: earlier layers' outputs and MLP outputs, and
+        // for the MLP input this layer's attention output.
+        let residual = |upto: usize, with_output: bool| -> Vec<&Array2<f64>> {
+            let mut w: Vec<&Array2<f64>> = (0..upto).flat_map(|l| [format!("blocks.{l}.o"), format!("blocks.{l}.down_proj")]).filter_map(|n| got(n).map(|x| &x.0)).collect();
+            if with_output && let Some(x) = got(format!("blocks.{upto}.o")) {
+                w.push(&x.0);
+            }
+            w
+        };
+        let norm = if kind == "c_fc" { "rms2" } else { "rms1" };
+        if matches!(kind.as_str(), "q" | "k" | "v" | "c_fc") {
+            let g = gain(format!("blocks.{layer}.{norm}"))?;
+            let w = residual(layer, kind == "c_fc");
+            if let Some(c) = columns_of(&w, None)? {
+                rule_readers.push(frames("earlier residual writers", c)?);
+            }
+            if let Some(c) = columns_of(&w, Some(&g.mapv(|x| 1.0 / x)))? {
+                rule_readers.push(frames("earlier residual writers through the norm's gain", c)?);
+            }
+        }
+        if kind == "q" {
+            if let Some((ku, kv)) = got(format!("blocks.{layer}.k")) {
+                rule_writers.push(frames("the layer's key writers", ku.t().to_owned())?);
+                // The match rule: key readers through every earlier head's decoded output-value circuit.
+                let g = gain(format!("blocks.{layer}.rms1"))?;
+                let scaled = kv * &g.view().insert_axis(Axis(0));
+                let mut images = Vec::new();
+                for l in 0..layer {
+                    let (Some((ou, ov)), Some((vu, vv))) = (got(format!("blocks.{l}.o")), got(format!("blocks.{l}.v"))) else { continue };
+                    let (w_o, w_v) = (ou.t().dot(ov), vu.t().dot(vv));
+                    let gl = gain(format!("blocks.{l}.rms1"))?;
+                    for h in 0..6 {
+                        let circuit = w_o.slice(s![.., h * 128..(h + 1) * 128]).dot(&w_v.slice(s![h * 128..(h + 1) * 128, ..]));
+                        let mut image = circuit.t().dot(&scaled.t());
+                        for (i, mut row) in image.rows_mut().into_iter().enumerate() {
+                            row *= gl[i] / g[i];
+                        }
+                        images.push(image);
+                    }
+                }
+                if !images.is_empty() {
+                    let views: Vec<_> = images.iter().map(|x| x.view()).collect();
+                    rule_readers.push(frames("the layer's key readers through earlier heads", ndarray::concatenate(Axis(1), &views).map_err(|e| e.to_string())?)?);
+                }
+            }
+        }
+        if kind == "o"
+            && let Some((vu, vv)) = got(format!("blocks.{layer}.v"))
+        {
+            rule_readers.push(frames("the layer's value writers", vu.t().to_owned())?);
+            let g = gain(format!("blocks.{layer}.rms1"))?;
+            if let Some(c) = columns_of(&[vv], Some(&(&g / &gf)))? {
+                rule_writers.push(frames("copies of the layer's value readers", c)?);
+            }
+        }
+        if kind == "down_proj"
+            && let Some((cu, _)) = got(format!("blocks.{layer}.c_fc"))
+        {
+            rule_readers.push(frames("the layer's hidden writers", cu.t().to_owned())?);
+        }
+        let metric = Metric::of(&measured[k], observations);
+        let plain = Geometry::new(metric.clone(), writers.clone(), readers.clone())?;
+        let ruled = !rule_writers.is_empty() || !rule_readers.is_empty();
+        let rules = if ruled {
+            Some(Geometry::new(metric, writers.into_iter().chain(rule_writers).collect(), readers.into_iter().chain(rule_readers).collect())?)
+        } else {
+            None
+        };
+        let started = std::time::Instant::now();
+        let both: Vec<(Description, Option<Description>)> = (0..u.nrows())
+            .into_par_iter()
+            .map(|c| {
+                let (uc, vc) = (u.slice(s![c..c + 1, ..]), v.slice(s![c..c + 1, ..]));
+                gam_linalg::faer_ndarray::with_nested_parallel(|| Ok((plain.describe(uc, vc)?, rules.as_ref().map(|r| r.describe(uc, vc)).transpose()?)))
+            })
+            .collect::<Result<_, String>>()?;
+        let (a, b): (Vec<Description>, Vec<Option<Description>>) = both.into_iter().unzip();
+        let b: Vec<Description> = b.into_iter().zip(&a).map(|(x, y)| x.unwrap_or_else(|| y.clone())).collect();
+        let f = frequency.get(&site.name).ok_or(format!("no sets for {}", site.name))?;
+        let total = |d: &[Description]| d.iter().map(Description::total).sum::<f64>();
+        let active = |d: &[Description]| d.iter().zip(f).map(|(x, n)| x.total() * n).sum::<f64>();
+        let mut taken = BTreeMap::<String, (usize, f64)>::new();
+        for (d, n) in b.iter().zip(f) {
+            for side in [&d.writer.0, &d.reader.0] {
+                let e = taken.entry(side.clone()).or_default();
+                e.0 += 1;
+                e.1 += n;
+            }
+        }
+        eprintln!(
+            "{}: {} subcomponents in {:.0}s; once {:.0} bits declared, {:.0} with the rules ({:+.1}%); per word {:.1} declared, {:.1} with the rules ({:+.1}%)",
+            site.name,
+            a.len(),
+            started.elapsed().as_secs_f64(),
+            total(&a),
+            total(&b),
+            100.0 * (total(&b) - total(&a)) / total(&a),
+            active(&a),
+            active(&b),
+            100.0 * (active(&b) - active(&a)) / active(&a).max(f64::MIN_POSITIVE)
+        );
+        eprintln!("  charts taken (subcomponents, runs per word): {taken:?}");
+        once[0] += total(&a);
+        once[1] += total(&b);
+        per_word[0] += active(&a);
+        per_word[1] += active(&b);
+        report.push(serde_json::json!({
+            "site": site.name,
+            "once_bits": {"declared": total(&a), "rules": total(&b)},
+            "per_word_bits": {"declared": active(&a), "rules": active(&b)},
+            "charts_taken": taken.iter().map(|(name, (n, runs))| (name.clone(), serde_json::json!({"subcomponents": n, "runs_per_word": runs}))).collect::<serde_json::Map<_, _>>(),
+        }));
+        decoded.insert(site.name.clone(), stacked(&b)?);
+        libraries.push(Library { v, u, mean: ndarray::Array1::zeros(d_in) });
+        variants.push((a, b));
+    }
+    eprintln!(
+        "all {} sites: once {:.0} bits declared, {:.0} with the rules ({:+.1}%); per word {:.1} declared, {:.1} with the rules ({:+.1}%)",
+        chosen.len(),
+        once[0],
+        once[1],
+        100.0 * (once[1] - once[0]) / once[0],
+        per_word[0],
+        per_word[1],
+        100.0 * (per_word[1] - per_word[0]) / per_word[0]
+    );
+    // The decode check: every site replaced by its decoded descriptions.
+    let check: Vec<usize> = (statistics * CONTEXT..(statistics + 1) * CONTEXT).collect();
+    let inputs = family.select(&check);
+    let logits = model.execute(&inputs, false).map_err(|e| e.to_string())?.values[model.output].clone();
+    let masks = given_masks(sets, &chosen, CONTEXT, statistics)?;
+    let given = Blocked::rank_one(libraries, vec![masks]);
+    let generic = Generic::new(&measured, observations);
+    let coded = Coded { model, sites: chosen.clone(), batches: vec![(inputs, Target::every_row(logits))], observations, samples: 4, describe: &generic, boxed: None };
+    let (base, _) = measure(&coded, &given)?;
+    let mut checks = Vec::new();
+    for (label, pick) in [("declared", 0usize), ("rules", 1)] {
+        let mut replaced = given.clone();
+        let mut priced = 0.0;
+        for (k, (a, b)) in variants.iter().enumerate() {
+            let descriptions = if pick == 0 { a } else { b };
+            let on: Vec<f64> = given.masks[0][k].sum_axis(Axis(0)).to_vec();
+            priced += descriptions.iter().zip(&on).map(|(d, n)| d.kl_bits * n).sum::<f64>();
+            let (u, v) = stacked(descriptions)?;
+            replaced.libraries[k] = std::sync::Arc::new(Library { u, v, mean: given.libraries[k].mean.clone() });
+            replaced.ranks[k] = descriptions.iter().map(|d| d.u.nrows()).collect();
+        }
+        let (bits, _) = measure(&coded, &replaced)?;
+        let words = bits.rows.max(1.0);
+        eprintln!(
+            "decode check, {label}: measured error {:.1} bits/word (KL {:.5} nats/word against the library's {:.5}), priced {:.1}",
+            (bits.kl - base.kl) / words,
+            bits.kl_nats / words,
+            base.kl_nats / words,
+            priced / words
+        );
+        checks.push(serde_json::json!({"description": label, "measured_error_bits_per_word": (bits.kl - base.kl) / words, "priced_error_bits_per_word": priced / words, "kl_per_word": bits.kl_nats / words, "library_kl_per_word": base.kl_nats / words}));
+    }
+    let report = serde_json::json!({"layers": layers, "observations": observations, "statistics_sequences": statistics, "sites": report,
+        "once_bits": {"declared": once[0], "rules": once[1]}, "per_word_bits": {"declared": per_word[0], "rules": per_word[1]}, "decode_check": checks});
+    std::fs::write(out, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
 fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
-    let usage = "mpd_rules_2951 heads EXPORT_DIR HALF SEQUENCES | pairs EXPORT_DIR LIBRARY_DIR SETS_DIR LAYER | price EXPORT_DIR LIBRARY_DIR OBSERVATIONS SITES | induction EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json OBSERVATIONS STATISTICS LAYER";
+    let usage = "mpd_rules_2951 heads EXPORT_DIR HALF SEQUENCES | pairs EXPORT_DIR LIBRARY_DIR SETS_DIR LAYER | price EXPORT_DIR LIBRARY_DIR OBSERVATIONS SITES | induction EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json OBSERVATIONS STATISTICS LAYER | library EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json OBSERVATIONS STATISTICS LAYERS";
     match args.get(1).map(String::as_str) {
         Some("heads") if args.len() == 5 => heads(
             std::path::Path::new(&args[2]),
@@ -658,6 +925,15 @@ fn main() -> Result<(), String> {
             std::path::Path::new(&args[3]),
             args[4].parse().map_err(|e| format!("OBSERVATIONS: {e}"))?,
             &args[5],
+        ),
+        Some("library") if args.len() == 9 => library(
+            std::path::Path::new(&args[2]),
+            std::path::Path::new(&args[3]),
+            std::path::Path::new(&args[4]),
+            std::path::Path::new(&args[5]),
+            args[6].parse().map_err(|e| format!("OBSERVATIONS: {e}"))?,
+            args[7].parse().map_err(|e| format!("STATISTICS: {e}"))?,
+            args[8].parse().map_err(|e| format!("LAYERS: {e}"))?,
         ),
         Some("induction") if args.len() == 9 => induction(
             std::path::Path::new(&args[2]),

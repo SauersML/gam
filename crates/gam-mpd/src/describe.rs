@@ -445,10 +445,9 @@ impl<'a> Block<'a> {
                 let root = chart.root.as_ref().ok_or("an identity chart without its root")?;
                 Ok((None, factor.clone(), Cow::Borrowed(metric), Cow::Borrowed(root)))
             } else {
-                // The chosen groups' Gram is a slice of the chart's, formed once per site.
                 let at = chart.chart.indices(groups);
                 let x = chart.chart.basis.select(Axis(1), &at);
-                let g = chart.gram.select(Axis(0), &at).select(Axis(1), &at);
+                let g = chart.gram(&at);
                 let root = inverses(&g)?.1;
                 let h = mm(&x.t(), factor);
                 Ok((Some(x), h, Cow::Owned(g), Cow::Owned(root)))
@@ -1021,12 +1020,20 @@ fn minimize(len: usize, f: &mut dyn FnMut(usize) -> Result<f64, String>) -> Resu
     Ok(best.map(|(n, _)| n))
 }
 
-/// A chart prepared on its side's metric: its Gram `Xᵀ G X` (every choice of its groups a slice
-/// of it), each group's pseudo-inverse Gram and, for the identity, the metric's pseudo-inverse root.
+/// A chart's Gram `Xᵀ G X` in its side's metric, formed once per site: whole when the chart has no
+/// more columns than the side is wide (a choice of groups slices it), else as `G X` (`d × q`, the
+/// smaller of the two), a choice of `k` columns then costing `d k²`.
+enum Gram {
+    Whole(Array2<f64>),
+    Weighted(Array2<f64>),
+}
+
+/// A chart prepared on its side's metric: its Gram, each group's pseudo-inverse Gram and, for the
+/// identity, the metric's pseudo-inverse root.
 struct Prepared {
     chart: Chart,
     identity: bool,
-    gram: Array2<f64>,
+    gram: Gram,
     group_inverse: Vec<Array2<f64>>,
     root: Option<Array2<f64>>,
 }
@@ -1035,16 +1042,23 @@ impl Prepared {
     fn new(chart: Chart, metric: &Array2<f64>, identity: bool) -> Result<Self, String> {
         if identity {
             let root = Some(inverses(metric)?.1);
-            return Ok(Self { chart, identity, gram: Array2::zeros((0, 0)), group_inverse: Vec::new(), root });
+            return Ok(Self { chart, identity, gram: Gram::Whole(Array2::zeros((0, 0))), group_inverse: Vec::new(), root });
         }
-        let gram = symmetric(&mm(&chart.basis.t(), &mm(metric, &chart.basis)));
-        let group_inverse = (0..chart.groups.len())
-            .map(|g| {
-                let at = chart.indices(&[g]);
-                inverses(&gram.select(Axis(0), &at).select(Axis(1), &at)).map(|x| x.0)
-            })
+        let weighted = mm(metric, &chart.basis);
+        let gram = if chart.basis.ncols() <= chart.basis.nrows() { Gram::Whole(symmetric(&mm(&chart.basis.t(), &weighted))) } else { Gram::Weighted(weighted) };
+        let mut prepared = Self { chart, identity, gram, group_inverse: Vec::new(), root: None };
+        prepared.group_inverse = (0..prepared.chart.groups.len())
+            .map(|g| inverses(&prepared.gram(&prepared.chart.indices(&[g]))).map(|x| x.0))
             .collect::<Result<_, _>>()?;
-        Ok(Self { chart, identity, gram, group_inverse, root: None })
+        Ok(prepared)
+    }
+
+    /// The Gram of the basis columns `at`.
+    fn gram(&self, at: &[usize]) -> Array2<f64> {
+        match &self.gram {
+            Gram::Whole(gram) => gram.select(Axis(0), at).select(Axis(1), at),
+            Gram::Weighted(weighted) => symmetric(&mm(&self.chart.basis.select(Axis(1), at).t(), &weighted.select(Axis(1), at))),
+        }
     }
 }
 
