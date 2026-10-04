@@ -67,18 +67,21 @@
 //!   concept peels: a member whose own concept would cost less than its share of the group leaves,
 //!   the most saving first, while that lowers the priced total.
 //!
-//! The non-overlapping proposals, most saving first, are tried in the exact code: the most saving
-//! `k` (at first all, then twice the last kept count) are kept when the exact total falls, else
-//! `k` is halved; a single refused change is set aside (a refit until the prices change, a pair
-//! for good). Rounds repeat until nothing is proposed at exact prices or the deadline passes;
+//! The exact code decides. Refits are decided word by word: every proposed flip of every refit is
+//! tried, and the flips at words whose own code (the flipped invocations' names and programs there
+//! plus `n KL / ln 2`, every word's KL exact) did not fall are dropped, until the exact total
+//! falls or nothing more is dropped. Otherwise (and for merges) the non-overlapping proposals,
+//! most saving first, are tried whole: the most saving `k` (at first all, then twice the last kept
+//! count) are kept when the exact total falls, else `k` is halved; a single refused change is set
+//! aside (a refit until the prices change, a pair for good). Rounds repeat until nothing is proposed at exact prices or the deadline passes;
 //! every kept round lowers the exact total, so the fit can stop at any round.
 //!
 //! # Coding new words
 //!
 //! A [`Model`] freezes each concept's rate at its KT estimate. New words are coded by the same
 //! descent with the vocabulary frozen ([`Model::encode`]): every concept a set touches invoked at
-//! first, then refits of each concept's invocations at its frozen rate, decided by the exact total
-//! of those words. [`Model::decode`] turns the invoked concepts back into the program.
+//! first, then refits of each concept's invocations at its frozen rate, decided word by word and
+//! whole by the exact total of those words. [`Model::decode`] turns the invoked concepts back into the program.
 //!
 //! # What a concept's name does and does not carry
 //!
@@ -476,6 +479,65 @@ fn halve(count: usize, trust: usize, total: f64, mut evaluate: impl FnMut(usize)
     Ok((None, tries))
 }
 
+/// A proposed change of one concept's invocations, word by word: the words that need it, its
+/// current and proposed invocations there, and its bits at a word with it invoked and not.
+struct Flips<'a> {
+    needed: &'a [u32],
+    now: &'a [bool],
+    next: &'a [bool],
+    on: f64,
+    off: f64,
+}
+
+/// Flips the exact total kept: per proposal whether each of its words' flip is kept, and the exact
+/// total and KL with them.
+struct Kept {
+    take: Vec<Vec<bool>>,
+    total: f64,
+    kl: Vec<f64>,
+}
+
+/// The exact total decides word by word (module note, "The fit"): every proposed flip is tried,
+/// then the flips at words whose code (the flipped invocations' bits there plus `n KL / ln 2`) did
+/// not fall are dropped, until the exact total falls below `total` or no flip is dropped. The kept
+/// flips, or none; and the evaluations spent.
+fn word_filter(
+    proposals: &[Flips<'_>],
+    kl: &[f64],
+    scale: f64,
+    total: f64,
+    mut evaluate: impl FnMut(&[Vec<bool>]) -> Result<(f64, Vec<f64>), String>,
+) -> Result<(Option<Kept>, usize), String> {
+    let mut take: Vec<Vec<bool>> = proposals.iter().map(|p| p.now.iter().zip(p.next).map(|(a, b)| a != b).collect()).collect();
+    let mut tries = 0;
+    while take.iter().any(|t| t.iter().any(|x| *x)) {
+        let (t, now_kl) = evaluate(&take)?;
+        tries += 1;
+        if t < total {
+            return Ok((Some(Kept { take, total: t, kl: now_kl }), tries));
+        }
+        let mut delta: Vec<f64> = now_kl.iter().zip(kl).map(|(a, b)| scale * (a - b)).collect();
+        for (p, tk) in proposals.iter().zip(&take) {
+            for (i, _) in tk.iter().enumerate().filter(|(_, x)| **x) {
+                delta[p.needed[i] as usize] += if p.next[i] { p.on - p.off } else { p.off - p.on };
+            }
+        }
+        let mut dropped = false;
+        for (p, tk) in proposals.iter().zip(take.iter_mut()) {
+            for (i, x) in tk.iter_mut().enumerate() {
+                if *x && delta[p.needed[i] as usize] >= 0.0 {
+                    *x = false;
+                    dropped = true;
+                }
+            }
+        }
+        if !dropped {
+            break;
+        }
+    }
+    Ok((None, tries))
+}
+
 /// What a proposed change replaces.
 #[derive(Clone, Copy, Debug)]
 enum Kind {
@@ -666,7 +728,74 @@ pub fn fit(sets: &Sets, prices: &[f64], program: &[f64], label_bits: f64, observ
             continue;
         }
         changes.sort_by(|x, y| y.2.total_cmp(&x.2));
-        let (decision, tries) = halve(changes.len(), trust, total, |k| {
+        // Refits are decided word by word first.
+        let mut tries = 0;
+        let refitted: Vec<(usize, &Concept)> = changes
+            .iter()
+            .filter_map(|(kind, parts, _)| match kind {
+                Kind::Refit(g) => Some((*g, &parts[0])),
+                Kind::Merge(..) => None,
+            })
+            .collect();
+        if merges == 0 {
+            let proposals: Vec<Flips<'_>> = refitted
+                .iter()
+                .map(|(g, r)| {
+                    let c = concepts[*g].as_ref().expect("alive");
+                    let pi = kt_rate(c.invocations() as u64, words);
+                    Flips { needed: &c.needed, now: &c.invoked, next: &r.invoked, on: -pi.log2() + c.program, off: -(1.0 - pi).log2() }
+                })
+                .collect();
+            let flipped = |take: &[Vec<bool>]| -> Vec<(usize, Concept)> {
+                refitted
+                    .iter()
+                    .zip(take)
+                    .filter(|(_, tk)| tk.iter().any(|x| *x))
+                    .map(|((g, r), tk)| {
+                        let c = concepts[*g].as_ref().expect("alive");
+                        let invoked: Vec<bool> = c.invoked.iter().zip(&r.invoked).zip(tk).map(|((a, b), x)| if *x { *b } else { *a }).collect();
+                        let bits = concept_bits(&c.error, &invoked, c.program, words);
+                        (*g, Concept { invoked, bits, ..c.clone() })
+                    })
+                    .collect()
+            };
+            let (kept, spent) = word_filter(&proposals, &kl, scale, total, |take| {
+                let next = flipped(take);
+                let gone: HashSet<usize> = next.iter().map(|(g, _)| *g).collect();
+                let candidate = concepts
+                    .iter()
+                    .enumerate()
+                    .filter(|(g, c)| c.is_some() && !gone.contains(g))
+                    .map(|(_, c)| c.as_ref().expect("alive"))
+                    .chain(next.iter().map(|(_, c)| c));
+                exact(candidate, words, universe, label_bits, observations, oracle)
+            })?;
+            tries += spent;
+            if let Some(Kept { take, total: t, kl: k_l }) = kept {
+                let next = flipped(&take);
+                (total, kl) = (t, k_l);
+                let kept = next.len();
+                for (g, c) in next {
+                    concepts[g] = None;
+                    concepts.push(Some(c));
+                    open.push(true);
+                }
+                columns = priced_columns(sets, &pricer.carried(&programs_of(concepts.iter().flatten(), words), sets, oracle)?, scale)?;
+                concepts.par_iter_mut().flatten().for_each(|c| reprice(c, &columns, words));
+                refused.clear();
+                open.iter_mut().for_each(|o| *o = true);
+                let mean_kl = kl.iter().sum::<f64>() / words.max(1) as f64;
+                let size = concepts.iter().flatten().map(|c| (c.invocations() * c.members.len()) as f64).sum::<f64>() / words.max(1) as f64;
+                rounds.push(Round { concepts: alive.len(), vocabulary, refits, merges, kept, peels, tries, total_bits: total, kl: mean_kl, size });
+                log::info!(
+                    "concepts: round {} concepts {} vocabulary {vocabulary} refits {refits} kept word by word {kept} ({tries} tries) exact total {total:.0} bits, KL {mean_kl:.4}, {size:.1} on per word",
+                    rounds.len(),
+                    alive.len()
+                );
+                continue;
+            }
+        }
+        let (decision, spent) = halve(changes.len(), trust, total, |k| {
             let gone: HashSet<usize> = changes[..k]
                 .iter()
                 .flat_map(|c| match c.0 {
@@ -682,6 +811,7 @@ pub fn fit(sets: &Sets, prices: &[f64], program: &[f64], label_bits: f64, observ
                 .chain(changes[..k].iter().flat_map(|c| c.1.iter()));
             exact(candidate, words, universe, label_bits, observations, oracle)
         })?;
+        tries += spent;
         let kept = match decision {
             Some((k, t, k_l)) => {
                 (total, kl) = (t, k_l);
@@ -889,7 +1019,42 @@ impl Model {
                 continue;
             }
             changes.sort_by(|x, y| y.2.total_cmp(&x.2).then(x.0.cmp(&y.0)));
-            let (decision, tries) = halve(changes.len(), trust, total, |k| {
+            let proposed = changes.len();
+            // Word by word first, then the most saving refits whole.
+            let proposals: Vec<Flips<'_>> = changes
+                .iter()
+                .map(|(c, next, _)| Flips { needed: &needed[*c], now: &invoked[*c], next, on: self.cost(*c, true), off: self.cost(*c, false) })
+                .collect();
+            let flipped = |take: &[Vec<bool>]| -> Vec<Vec<bool>> {
+                let mut candidate = invoked.clone();
+                for ((c, next, _), tk) in changes.iter().zip(take) {
+                    for ((z, n), x) in candidate[*c].iter_mut().zip(next).zip(tk) {
+                        if *x {
+                            *z = *n;
+                        }
+                    }
+                }
+                candidate
+            };
+            let (filtered, spent) = word_filter(&proposals, &kl, scale, total, |take| {
+                let candidate = flipped(take);
+                let k_l = oracle.kl(&programs(&candidate))?;
+                Ok((code(&candidate) + scale * k_l.iter().sum::<f64>(), k_l))
+            })?;
+            let mut tries = spent;
+            if let Some(Kept { take, total: t, kl: k_l }) = filtered {
+                invoked = flipped(&take);
+                (total, kl) = (t, k_l);
+                error = errors(&pricer.carried(&programs(&invoked), sets, oracle)?)?;
+                refused.clear();
+                let mean_kl = kl.iter().sum::<f64>() / words.max(1) as f64;
+                let size = programs(&invoked).iter().map(Vec::len).sum::<usize>() as f64 / words.max(1) as f64;
+                let kept = take.iter().filter(|tk| tk.iter().any(|x| *x)).count();
+                rounds.push(Round { concepts: self.concepts.len(), vocabulary: self.concepts.len(), refits: proposed, merges: 0, kept, peels: 0, tries, total_bits: total, kl: mean_kl, size });
+                log::info!("concepts: coding round {} refits {proposed} kept word by word {kept} ({tries} tries) exact total {total:.0} bits, KL {mean_kl:.4}, {size:.1} on per word", rounds.len());
+                continue;
+            }
+            let (decision, spent) = halve(changes.len(), trust, total, |k| {
                 let mut candidate = invoked.clone();
                 for (c, next, _) in &changes[..k] {
                     candidate[*c] = next.clone();
@@ -897,6 +1062,7 @@ impl Model {
                 let k_l = oracle.kl(&programs(&candidate))?;
                 Ok((code(&candidate) + scale * k_l.iter().sum::<f64>(), k_l))
             })?;
+            tries += spent;
             let kept = match decision {
                 Some((k, t, k_l)) => {
                     (total, kl) = (t, k_l);
@@ -915,8 +1081,8 @@ impl Model {
             };
             let mean_kl = kl.iter().sum::<f64>() / words.max(1) as f64;
             let size = programs(&invoked).iter().map(Vec::len).sum::<usize>() as f64 / words.max(1) as f64;
-            rounds.push(Round { concepts: self.concepts.len(), vocabulary: self.concepts.len(), refits: changes.len() + kept, merges: 0, kept, peels: 0, tries, total_bits: total, kl: mean_kl, size });
-            log::info!("concepts: coding round {} refits {} kept {kept} ({tries} tries) exact total {total:.0} bits, KL {mean_kl:.4}, {size:.1} on per word", rounds.len(), changes.len() + kept);
+            rounds.push(Round { concepts: self.concepts.len(), vocabulary: self.concepts.len(), refits: proposed, merges: 0, kept, peels: 0, tries, total_bits: total, kl: mean_kl, size });
+            log::info!("concepts: coding round {} refits {proposed} kept {kept} ({tries} tries) exact total {total:.0} bits, KL {mean_kl:.4}, {size:.1} on per word", rounds.len());
         }
         let mut coded = vec![Vec::new(); words];
         for (c, (n, z)) in needed.iter().zip(&invoked).enumerate() {
