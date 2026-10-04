@@ -25,30 +25,6 @@ fn graft(base:&Artifact, native:&gam_mpd::operator_program::OperatorProgram,laye
     }
     Ok(candidate)
 }
-fn native_subsystem(native:&gam_mpd::operator_program::OperatorProgram,layers:&[gam_mpd::run_check::LayerNodes],uses:&[usize])->Result<Artifact,String>{
-    use gam_mpd::operator_program::{OperatorProgram,Node};
-    let mut program=OperatorProgram{declarations:Declarations{domains:vec![],slots:vec![],parameters:0},bases:vec![],operators:vec![],rules:vec![],nodes:vec![],output:0};
-    let mut outputs=vec![];
-    for (slot,&layer) in uses.iter().enumerate(){
-        let map=layers.get(layer).ok_or("native subsystem use absent")?;
-        program.declarations.slots.push(Slot::Raw{width:native.node_interface(map.normed).map_err(|e|e.to_string())?.width()});
-        let raw=program.nodes.len();program.nodes.push(Node::Raw{slot});
-        let affine=|program:&mut OperatorProgram,node:usize,expected:usize,input:usize|->Result<usize,String>{
-            let Node::Affine{terms,bias}=&native.nodes[node] else{return Err("native subsystem requires affine reader/writer".into())};
-            if terms.len()!=1 || terms[0].0!=expected{return Err("native subsystem nonstandard reader/writer".into());}
-            let op=program.operators.len();program.operators.push(native.operators[terms[0].1].clone());
-            let bias=if let Some(b)=bias{let index=program.operators.len();program.operators.push(native.operators[*b].clone());Some(index)}else{None};
-            let index=program.nodes.len();program.nodes.push(Node::Affine{terms:vec![(input,op)],bias});Ok(index)
-        };
-        let pre=affine(&mut program,map.pre,map.normed,raw)?;
-        let Node::Pointwise{input,laws}=&native.nodes[map.active] else{return Err("native subsystem requires declared pointwise activation".into())};
-        if *input!=map.pre{return Err("native activation lineage mismatch".into());}
-        let active=program.nodes.len();program.nodes.push(Node::Pointwise{input:pre,laws:laws.clone()});
-        outputs.push(affine(&mut program,map.mlp,map.active,active)?);
-    }
-    program.output=program.nodes.len();program.nodes.push(Node::Concat{parts:outputs});
-    Artifact::native(&program)?.f32_literals()
-}
 fn main() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.len() != 8 && !(args.len()==9 && args[8]=="prepare_only") { return Err("EXPORT POOL POOL_SHA FIT_CONFIG SPEC SPEC_SHA OUT BUDGET_JSON [prepare_only]".into()); }
@@ -79,7 +55,19 @@ fn main() -> Result<(), String> {
     if pool.to_bytes()? != source_bytes { return Err("function canonical saved-byte replay mismatch".into()); }
     drop(source_bytes);
     let pool_cost=structural_cost(&pool,&mut CostCache::default())?;
-    let native_subsystem_cost=structural_cost(&native_subsystem(&native,&layers,&uses)?,&mut CostCache::default())?;
+    let mut changed_native_operator_ids=std::collections::BTreeSet::new();
+    for &use_id in &uses{
+        for node in [layers[use_id].pre,layers[use_id].mlp]{
+            let gam_mpd::operator_program::Node::Affine{terms,bias}=&native.nodes[node] else{return Err("declared native MLP reader/writer not affine".into())};
+            changed_native_operator_ids.extend(terms.iter().map(|(_,op)|*op));
+            changed_native_operator_ids.extend(bias.iter().copied());
+        }
+    }
+    let changed_native_literals=changed_native_operator_ids.iter().try_fold(0usize,|total,&op|{
+        let gam_mpd::operator_program::OperatorBody::Dense{values,present,..}=&native.operators[op].body else{return Err("coefficient accounting requires dense native operators".to_string())};
+        if !present.iter().all(|p|*p){return Err("native coefficient accounting requires complete dense operator".into());}
+        total.checked_add(values.len()).ok_or_else(||"native literal count overflow".to_string())
+    })?;
     let native_message = Artifact::native(&native)?.f32_literals()?.to_bytes()?;
     let base = Artifact::from_bytes(&native_message,&native.declarations)?;
     if base.to_bytes()?!=native_message{return Err("native canonical wire replay mismatch".into());}
@@ -110,9 +98,9 @@ fn main() -> Result<(), String> {
         sequence: (0..2).flat_map(|s| std::iter::repeat_n(s, 512)).collect(),
         position: (0..2).flat_map(|_| 0..512).collect(),
     }) };
-    save(&out.join("PROVENANCE.json"), &json!({"scope":"joint supplied-GELU geometry proposal assessment; discovery uses0/1, no frozen-body transfer or global optimum claim", "uses":uses,"fit_config":config,"fit_config_sha256":sha256(Path::new(&args[3]))?,"budget_sha256":sha256(Path::new(&args[7]))?,"input_width":width,"fitted_sha256":args[2],"candidate_sha256":sha256(&artifact_path)?,"spec_sha256":args[5],"export_json_sha256":sha256(&export.join("export.json"))?,"source_record":imported.record,"binary_sha256":sha256(&std::env::current_exe().map_err(|e|e.to_string())?)?,"native_C32":native_cost,"joint_pool_C32":pool_cost,"native_two_MLP_subsystem_C32":native_subsystem_cost,"subsystem_cost_scope":"standalone declared two-use normalized-input to contribution programs; full candidate additionally retains surrounding native model and pays graft/control wiring","candidate_C32":cost,"candidate_C32_bits":cost.total(),"local_boundary":"native normalized MLP input to pure MLP contribution, fixed native parents; native contribution RMS","local_rows":1024,"run_episodes":80,"trace_bytes":trace_bytes,"native_control_scope":"paid whole native activation uniform Scale only; individual native units are not mapped to learned coordinates", "numerical_scope":"Local final-write/RMS enclosures; checked exact fixed-binary64 raw-logit KL intervals; forward/RMS/gain/GEMM rounding excluded; not full neural arithmetic certificate"}))?;
+    save(&out.join("PROVENANCE.json"), &json!({"scope":"joint supplied-GELU geometry proposal assessment; discovery uses0/1, no frozen-body transfer or global optimum claim", "uses":uses,"fit_config":config,"fit_config_sha256":sha256(Path::new(&args[3]))?,"budget_sha256":sha256(Path::new(&args[7]))?,"input_width":width,"fitted_sha256":args[2],"candidate_sha256":sha256(&artifact_path)?,"spec_sha256":args[5],"export_json_sha256":sha256(&export.join("export.json"))?,"source_record":imported.record,"binary_sha256":sha256(&std::env::current_exe().map_err(|e|e.to_string())?)?,"native_C32":native_cost,"joint_pool_C32":pool_cost,"native_changed_operator_ids":changed_native_operator_ids,"native_changed_coefficient_literals":changed_native_literals,"native_changed_coefficient_payload_bits":changed_native_literals.checked_mul(32).ok_or("payload bit count overflow")?,"subsystem_cost_scope":"native changed coefficient payload only: unique reader/writer/bias IDs at32bits per literal, excludes structure and binding; joint pool standalone C32, full candidate additionally pays surrounding native model and graft/control wiring","candidate_C32":cost,"candidate_C32_bits":cost.total(),"local_boundary":"native normalized MLP input to pure MLP contribution, fixed native parents; native contribution RMS","local_rows":1024,"run_episodes":80,"trace_bytes":trace_bytes,"native_control_scope":"paid whole native activation uniform Scale only; individual native units are not mapped to learned coordinates", "numerical_scope":"Local final-write/RMS enclosures; checked exact fixed-binary64 raw-logit KL intervals; forward/RMS/gain/GEMM rounding excluded; not full neural arithmetic certificate"}))?;
     if args.len()==9 {
-        save(&out.join("REPORT.json"),&json!({"scope":"CPU preparation only: complete jointly grafted canonical artifact; fidelity unmeasured", "candidate_sha256":sha256(&artifact_path)?,"C32_bits":cost.total(),"native_C32_bits":native_cost.total(),"joint_pool_C32_bits":pool_cost.total(),"native_two_MLP_subsystem_C32_bits":native_subsystem_cost.total(),"seconds":started.elapsed().as_secs_f64(),"acceptance_claim":false}))?;
+        save(&out.join("REPORT.json"),&json!({"scope":"CPU preparation only: complete jointly grafted canonical artifact; fidelity unmeasured", "candidate_sha256":sha256(&artifact_path)?,"C32_bits":cost.total(),"native_C32_bits":native_cost.total(),"joint_pool_C32_bits":pool_cost.total(),"native_changed_coefficient_payload_bits":changed_native_literals.checked_mul(32).ok_or("payload bit count overflow")?,"seconds":started.elapsed().as_secs_f64(),"acceptance_claim":false}))?;
         return Ok(());
     }
     let device = gam_gpu::tensor::Device::accelerator(gam_gpu::GpuPolicy::Required).map_err(|e|e.to_string())?.ok_or("CUDA required")?;
@@ -129,7 +117,7 @@ fn main() -> Result<(), String> {
     let timer=Instant::now();let native_run=resident.measure(&base)?;let native_run_seconds=timer.elapsed().as_secs_f64();
     let timer=Instant::now();let run_measure=resident.measure(&decoded)?;let run_seconds=timer.elapsed().as_secs_f64();
     let peak_rss = std::fs::read_to_string("/proc/self/status").ok().and_then(|text| text.lines().find_map(|s|s.strip_prefix("VmHWM:")?.split_whitespace().next()?.parse::<u64>().ok()?.checked_mul(1024)));
-    save(&out.join("REPORT.json"), &json!({"joint_pool_C32_bits":pool_cost.total(),"native_two_MLP_subsystem_C32_bits":native_subsystem_cost.total(),"C32_bits":cost.total(),"native_C32_bits":native_cost.total(),"native_local":native_local,"local":local_measure,"local_seconds":local_seconds,"run":run_measure,"run_seconds":run_seconds,"native_run":native_run,"native_run_seconds":native_run_seconds,"resident_run_telemetry":resident.telemetry()?,"numeric_budgets":budgets,"seconds":started.elapsed().as_secs_f64(),"peak_host_rss_bytes":peak_rss,"acceptance_claim":false}))?;
+    save(&out.join("REPORT.json"), &json!({"joint_pool_C32_bits":pool_cost.total(),"native_changed_coefficient_payload_bits":changed_native_literals.checked_mul(32).ok_or("payload bit count overflow")?,"C32_bits":cost.total(),"native_C32_bits":native_cost.total(),"native_local":native_local,"local":local_measure,"local_seconds":local_seconds,"run":run_measure,"run_seconds":run_seconds,"native_run":native_run,"native_run_seconds":native_run_seconds,"resident_run_telemetry":resident.telemetry()?,"numeric_budgets":budgets,"seconds":started.elapsed().as_secs_f64(),"peak_host_rss_bytes":peak_rss,"acceptance_claim":false}))?;
     Ok(())
 }
 
