@@ -286,3 +286,6 @@ pub mod native_control;
 
 // Optional fixed-response, finite-f32 scalar proposal diagnostic.
 pub mod scalar_response_search;
+
+/// Full-width affine MLP fitting baseline (proposal diagnostics only).
+pub mod affine_mlp;
