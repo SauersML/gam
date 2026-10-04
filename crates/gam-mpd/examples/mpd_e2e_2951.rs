@@ -32,9 +32,7 @@
 //! A rerun into the same `OUT_DIR` with the same settings resumes: fitted sites, VPD's prices
 //! (`library/{site}.vpd_bits.json`) and every finished stage of `e2e.json` are read back.
 //!
-//! Keys (defaults): `sequences` (4), `passages` (32), `context` (512), `n` (1e6), `start` (`own`:
-//! each site starts from its units or Fisher-SVD pieces; `vpd`: from VPD's subcomponents, so `ours`
-//! is this code's selection and execution of VPD's library), `rounds` (50; 0 keeps each site's
+//! Keys (defaults): `sequences` (4), `passages` (32), `context` (512), `n` (1e6), `rounds` (50; 0 keeps each site's
 //! starting pieces), `blocks` (1: gate the library in blocks; 0: every subcomponent its own),
 //! `draws` (4), `random` (64), `device` (`f64`: samples, passages and every evaluation on a float64
 //! accelerator when there is one; `any`: the Apple GPU's f32 too; `off`: the CPU;
@@ -74,8 +72,6 @@ struct Run {
     passages: usize,
     context: usize,
     settings: Settings,
-    /// Whether every site starts from VPD's subcomponents.
-    vpd_start: bool,
     random: usize,
     vpd: PathBuf,
     vpd_sets: PathBuf,
@@ -102,7 +98,6 @@ impl Run {
                 draws: if smoke { 1 } else { 4 },
                 seed: 0x517E,
             },
-            vpd_start: false,
             random: if smoke { 4 } else { 64 },
             vpd,
             vpd_sets,
@@ -117,13 +112,6 @@ impl Run {
                 "n" => run.settings.observations = value.parse().map_err(|e| format!("n: {e}"))?,
                 "rounds" => run.settings.rounds = count()?,
                 "blocks" => run.settings.blocks = count()? != 0,
-                "start" => {
-                    run.vpd_start = match value {
-                        "own" => false,
-                        "vpd" => true,
-                        other => return Err(format!("start: {other} is neither own nor vpd")),
-                    }
-                }
                 "draws" => run.settings.draws = count()?,
                 "random" => run.random = count()?,
                 "device" => gam_mpd::core_device::choose(gam_mpd::core_device::Choice::parse(value)?),
@@ -137,7 +125,7 @@ impl Run {
     fn fitted_with(&self) -> Value {
         let s = &self.settings;
         json!({"train": self.train, "sequences": self.sequences, "context": self.context, "n": s.observations, "rounds": s.rounds,
-               "blocks": s.blocks, "draws": s.draws, "seed": s.seed, "start": if self.vpd_start { "vpd" } else { "own" }})
+               "blocks": s.blocks, "draws": s.draws, "seed": s.seed})
     }
 }
 
@@ -308,7 +296,7 @@ fn main() -> Result<(), String> {
         "fitted_with": with,
         "scope": scope, "sites": names, "train": run.train, "frontier": run.frontier, "sequences": run.sequences, "passages": run.passages,
         "context": run.context, "observations": run.settings.observations, "rounds": run.settings.rounds, "blocks": run.settings.blocks,
-        "draws": run.settings.draws, "random": run.random, "vpd_library": run.vpd, "vpd_sets": run.vpd_sets, "start": if run.vpd_start { "vpd" } else { "own" },
+        "draws": run.settings.draws, "random": run.random, "vpd_library": run.vpd, "vpd_sets": run.vpd_sets,
         "pricing": "gam_mpd::describe::Structured in each site's fit statistics (its training inputs under the explanation upstream), both libraries",
         "selection": "ours: gam_mpd::site_fit::Selector on the explanation's own reads in the site's mean training Fisher; vpd: its published sets (model states, residual off)",
     });
@@ -329,12 +317,7 @@ fn main() -> Result<(), String> {
     // Fit, in execution order on hybrid inputs.
     let clock = Instant::now();
     let batches: Vec<_> = (0..run.sequences).map(|s| training.contract.family.select(&(s * run.context..(s + 1) * run.context).collect::<Vec<_>>())).collect();
-    let starts: BTreeMap<String, Library> = if run.vpd_start {
-        chosen.iter().map(|site| Ok((site.name.clone(), vpd_library(&run, model, site)?))).collect::<Result<_, String>>()?
-    } else {
-        BTreeMap::new()
-    };
-    let explanation: Explanation = fit(model, chosen.clone(), &batches, &run.settings, &starts, |site| load(&library_dir, model, site, &with, run.settings.observations), |f| {
+    let explanation: Explanation = fit(model, chosen.clone(), &batches, &run.settings, &BTreeMap::new(), |site| load(&library_dir, model, site, &with, run.settings.observations), |f| {
         save(&library_dir, f, &with)
     })?;
     drop(batches);
@@ -379,10 +362,6 @@ fn main() -> Result<(), String> {
                 .filter(|b: &Vec<f64>| b.len() == library.v.nrows());
             if let Some(bits) = earlier {
                 return Ok(bits);
-            }
-            // Started from VPD's subcomponents with no rounds, our library is VPD's, priced alike.
-            if run.vpd_start && run.settings.rounds == 0 && f.ranks.iter().all(|r| *r == 1) && f.library.v == library.v && f.library.u == library.u {
-                return Ok(f.bits.clone());
             }
             let describe = f.description(model, run.settings.observations)?;
             let columns: Vec<usize> = (0..library.v.nrows()).collect();
