@@ -69,8 +69,9 @@
 //!
 //! The exact code decides. Refits are decided word by word: every proposed flip of every refit is
 //! tried, and the flips at words whose own code (the flipped invocations' names and programs there
-//! plus `n KL / ln 2`, every word's KL exact) did not fall are dropped, until the exact total
-//! falls or nothing more is dropped. Otherwise (and for merges) the non-overlapping proposals,
+//! plus `n KL / ln 2`, every word's KL exact) did not fall are dropped, or, when every flipped
+//! word's fell (the loss is at later words the flips reach through attention), those of the half
+//! that gained least, until the exact total falls or no flip is left. Otherwise (and for merges) the non-overlapping proposals,
 //! most saving first, are tried whole: the most saving `k` (at first all, then twice the last kept
 //! count) are kept when the exact total falls, else `k` is halved; a single refused change is set
 //! aside (a refit until the prices change, a pair for good). Rounds repeat until nothing is proposed at exact prices or the deadline passes;
@@ -499,8 +500,9 @@ struct Kept {
 
 /// The exact total decides word by word (module note, "The fit"): every proposed flip is tried,
 /// then the flips at words whose code (the flipped invocations' bits there plus `n KL / ln 2`) did
-/// not fall are dropped, until the exact total falls below `total` or no flip is dropped. The kept
-/// flips, or none; and the evaluations spent.
+/// not fall are dropped (when every flipped word's fell, those of the half that gained least),
+/// until the exact total falls below `total` or no flip is left. The kept flips, or none; and the
+/// evaluations spent.
 fn word_filter(
     proposals: &[Flips<'_>],
     kl: &[f64],
@@ -522,17 +524,27 @@ fn word_filter(
                 delta[p.needed[i] as usize] += if p.next[i] { p.on - p.off } else { p.off - p.on };
             }
         }
-        let mut dropped = false;
+        // The words that keep their flips: those whose code fell; when every flipped word's did
+        // (the loss is at words the flips reach later), the half that gained the most.
+        let mut flipped: Vec<(f64, u32)> = proposals
+            .iter()
+            .zip(&take)
+            .flat_map(|(p, tk)| tk.iter().enumerate().filter(|(_, x)| **x).map(|(i, _)| (delta[p.needed[i] as usize], p.needed[i])))
+            .collect();
+        flipped.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        flipped.dedup_by_key(|f| f.1);
+        let gaining = flipped.iter().filter(|f| f.0 < 0.0).count();
+        let keep: HashSet<u32> = if gaining < flipped.len() {
+            flipped[..gaining].iter().map(|f| f.1).collect()
+        } else if flipped.len() > 1 {
+            flipped[..flipped.len() / 2].iter().map(|f| f.1).collect()
+        } else {
+            break;
+        };
         for (p, tk) in proposals.iter().zip(take.iter_mut()) {
             for (i, x) in tk.iter_mut().enumerate() {
-                if *x && delta[p.needed[i] as usize] >= 0.0 {
-                    *x = false;
-                    dropped = true;
-                }
+                *x = *x && keep.contains(&p.needed[i]);
             }
-        }
-        if !dropped {
-            break;
         }
     }
     Ok((None, tries))
