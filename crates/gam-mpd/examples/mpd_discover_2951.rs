@@ -26,9 +26,9 @@
 //! Merges scan parts (`OUT_PREFIX`es) covering `WORDS` words in all and reports every site's pieces
 //! ranked by concentration: the share of a piece's total in its `M` largest words.
 //!
-//! `mpd_discover_2951 positions EXPORT_DIR OUT_PREFIX A:B [M] [BATCH]`
+//! `mpd_discover_2951 positions EXPORT_DIR OUT_PREFIX A:B|K/N [M] [BATCH]`
 //!
-//! The model's own forward on sequences `A..B` of the export's token table (`T + 1` columns: the
+//! The model's own forward on sequences `A..B` (or the `K`-th of `N` equal parts) of the export's token table (`T + 1` columns: the
 //! model reads `row[..T]`, `row[1..]` are the next tokens), and one reverse pass of the data's code
 //! length `Σ −log q(y)`. Per word, `OUT_PREFIX.pos.f32` holds `[next token, −log q(y), entropy of q,
 //! top token, log q(top)]` and `OUT_PREFIX.attr.f32` the first-order share of the code length each
@@ -271,10 +271,10 @@ fn readers(model: &gam_mpd::operator_program::OperatorProgram) -> Result<(Vec<Ve
 }
 
 fn positions(args: &[String]) -> Result<(), String> {
-    let usage = "mpd_discover_2951 positions EXPORT_DIR OUT_PREFIX A:B [M] [BATCH]";
+    let usage = "mpd_discover_2951 positions EXPORT_DIR OUT_PREFIX A:B|K/N [M] [BATCH]";
     let export = PathBuf::from(args.get(2).ok_or(usage)?);
     let out = args.get(3).ok_or(usage)?.clone();
-    let (first, last) = range(args.get(4).ok_or(usage)?)?;
+    let spec = args.get(4).ok_or(usage)?;
     let keep: usize = args.get(5).map_or(Ok(256), |v| v.parse()).map_err(|e| format!("M: {e}"))?;
     let batch: usize = args.get(6).map_or(Ok(2), |v| v.parse()).map_err(|e| format!("BATCH: {e}"))?;
     let record: serde_json::Value =
@@ -282,6 +282,14 @@ fn positions(args: &[String]) -> Result<(), String> {
     let shape = &record["files"]["tokens"]["shape"];
     let (table_rows, columns) = (shape[0].as_u64().ok_or("tokens shape")? as usize, shape[1].as_u64().ok_or("tokens shape")? as usize);
     let context = columns - 1;
+    // `K/N`: the K-th of N equal parts of the table.
+    let (first, last) = match spec.split_once('/') {
+        Some((k, n)) => {
+            let (k, n): (usize, usize) = (k.parse().map_err(|e| format!("{spec}: {e}"))?, n.parse().map_err(|e| format!("{spec}: {e}"))?);
+            (k * table_rows / n, (k + 1) * table_rows / n)
+        }
+        None => range(spec)?,
+    };
     if last > table_rows {
         return Err(format!("{last} sequences of a {table_rows}-row token table"));
     }
