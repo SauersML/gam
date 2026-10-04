@@ -31,6 +31,11 @@ while :; do
         ours=0
         grep -qx "$id" "$held" && ours=1
         [ "$reason" = JobHeldUser ] && (( ours == 0 )) && continue
+        # A build is short and every queued run waits on it: it is never held.
+        if [ "$name" = mpd-build ]; then
+            (( ours )) && scontrol release "$id" && sed -i "/^$id\$/d" "$held" && echo "$(date +%T) released build $id"
+            continue
+        fi
         if (( c <= room_c && g <= room_g )); then
             room_c=$(( room_c - c )) room_g=$(( room_g - g ))
             if (( ours )); then
