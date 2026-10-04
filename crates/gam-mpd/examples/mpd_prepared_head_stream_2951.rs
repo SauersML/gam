@@ -2,6 +2,7 @@
 //! FIT_EXPORT EVAL_EXPORT SPEC PREPARED_REPORT OUT head_start=N head_count=N
 //! train_export=DIR max_bank=385 codec_bytes=N local_source_bytes=N trace_bytes=N
 //! readout_resident_bytes=N readout_workspace_bytes=N parallel=N preflight=0|1
+//! bank=single_head (default, max_bank385) or uniform_joint (all24 heads, max_bank17).
 //! A shard preserves the complete 384-proposal scope with other heads explicitly unmeasured.
 use gam_mpd::{
     acceptance::{
@@ -34,6 +35,49 @@ const SPEC_SHA: &str = "3c05b66324dfb02e33da7eff98784a7ec432123e24fea78018b892ef
 const COMPLETE: usize = 385;
 const HEADS: usize = 24;
 const CONTEXT: usize = 512;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BankMode {
+    SingleHead,
+    UniformJoint,
+}
+impl BankMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "single_head" => Ok(Self::SingleHead),
+            "uniform_joint" => Ok(Self::UniformJoint),
+            _ => Err("bank must be single_head or uniform_joint".into()),
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::SingleHead => "single_head",
+            Self::UniformJoint => "uniform_joint",
+        }
+    }
+    fn groups(self) -> Vec<Vec<usize>> {
+        let mut groups = vec![Vec::new()]; // Native, not an inferred joint outcome.
+        match self {
+            Self::SingleHead => groups.extend((0..COMPLETE - 1).map(|i| vec![i])),
+            Self::UniformJoint => groups.extend(
+                (0..16).map(|variant| (0..HEADS).map(|head| head * 16 + variant).collect()),
+            ),
+        }
+        groups
+    }
+    fn validate_scope(self, start: usize, count: usize, max_bank: usize) -> Result<(), String> {
+        if count == 0
+            || start.checked_add(count).is_none_or(|end| end > HEADS)
+            || max_bank != self.groups().len()
+            || (self == Self::UniformJoint && (start != 0 || count != HEADS))
+        {
+            return Err(
+                "invalid declared bank budget/head range; joint programs require all24 heads"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
 #[derive(Clone)]
 struct Entry {
     index: usize,
@@ -533,6 +577,7 @@ fn main() -> Result<(), String> {
             "readout_workspace_bytes",
             "parallel",
             "preflight",
+            "bank",
         ]
         .contains(&k)
             || keys.insert(k, v).is_some()
@@ -540,6 +585,9 @@ fn main() -> Result<(), String> {
             return Err("unknown or duplicate option".into());
         }
     }
+    let mode = BankMode::parse(keys.get("bank").copied().unwrap_or("single_head"))?;
+    let groups = mode.groups();
+    let complete_count = groups.len();
     let preflight = match keys.get("preflight").copied().unwrap_or("0") {
         "0" => false,
         "1" => true,
@@ -566,18 +614,16 @@ fn main() -> Result<(), String> {
         resident_bytes: number("readout_resident_bytes")?,
         workspace_bytes: number("readout_workspace_bytes")?,
     };
-    if count == 0
-        || start.checked_add(count).is_none_or(|end| end > HEADS)
-        || max_bank != COMPLETE
-        || [
-            codec_bytes,
-            source_bytes,
-            trace_bytes,
-            parallel,
-            readout.resident_bytes,
-            readout.workspace_bytes,
-        ]
-        .contains(&0)
+    mode.validate_scope(start, count, max_bank)?;
+    if [
+        codec_bytes,
+        source_bytes,
+        trace_bytes,
+        parallel,
+        readout.resident_bytes,
+        readout.workspace_bytes,
+    ]
+    .contains(&0)
     {
         return Err("invalid contiguous head shard or explicit resource budgets".into());
     }
@@ -641,7 +687,7 @@ fn main() -> Result<(), String> {
             &out.join("PREFLIGHT.json"),
             &json!({
                 "status":"all lineage/factor/spec/schema checks passed; no GPU initialized and no fidelity measurements",
-                "complete_proposal_inventory":384,"factors_validated":entries.len(),"lineage":lineage,
+                "complete_proposal_inventory":384,"factors_validated":entries.len(),"bank":mode.name(),"declared_program_count":complete_count,"lineage":lineage,
                 "prepared_report_sha256":sha256(prepared_path)?,"spec_sha256":SPEC_SHA,
                 "binary_sha256":sha256(&std::env::current_exe().map_err(|e| e.to_string())?)?,
                 "seconds":{"lineage":hashes_seconds,"factor_validation":factor_validation_seconds,"total":begun.elapsed().as_secs_f64()}
@@ -674,12 +720,13 @@ fn main() -> Result<(), String> {
     };
     let constraints = grid();
     let scope = json!({"method":"prepared explicit linear factors plus fully paid arithmetic Copy body; template baseline, not discovery",
-        "complete_count_including_native":COMPLETE,"heads":HEADS,"ranks":RANKS,"families":["NativeSvd","CopyResidual"],"fits":FITS,
-        "shard":{"head_start":start,"head_count":count,"candidate_count_plus_native":1+count*16},"grid":constraints,
+        "bank":mode.name(),"complete_count_including_native":complete_count,"prepared_source_factor_count":384,"heads":HEADS,"ranks":RANKS,"families":["NativeSvd","CopyResidual"],"fits":FITS,
+        "shard":{"head_start":start,"head_count":count,"candidate_count_plus_native":if mode==BankMode::UniformJoint{17}else{1+count*16}},"grid":constraints,
         "local":{"sequences":2,"context":CONTEXT,"rows":2*CONTEXT,"batch":CONTEXT,"denominator":"RMS of native split attention-contribution row norms over the full family; maximum normalized row Euclidean error","ascent":null},
         "run":{"spec_sha256":SPEC_SHA,"episodes":80,"context":CONTEXT,"parallel":parallel,"backend":run.backend_name(),"metrics":"CPU normalization/KL oracle on CUDA f64 head logits; uncertified GPU metric proposals never used"},
         "local_first":"only decoded full Local proof Violates at maximum declared delta1 omits Run; no singleton pruning",
-        "unknown_cost_lower_bound":0,"failed_and_unmeasured_retained":true,"optimality":"finite384proposal bank only; a head shard does not complete that bank",
+        "unknown_cost_lower_bound":0,"failed_and_unmeasured_retained":true,"optimality":"only the explicitly declared finite bank; unmeasured/failed candidates remain unresolved, and a singleton head shard is incomplete",
+        "joint_semantics":"uniform_joint executes all24 replacements together and measures the full composed Local/Run; no singleton outcomes reused; exact shared Copy body pool priced once",
         "budgets":{"codec_bytes":codec_bytes,"local_source_numeric_bytes":source_bytes,"trace_bytes":trace_bytes,"readout_resident_bytes":readout.resident_bytes,"readout_workspace_bytes":readout.workspace_bytes},
         "budget_exclusions":"codec excludes caller source and transient constructor; source excludes host/indices/activations/workspaces/allocator; trace excludes operators/workspaces; head numeric budgets exclude allocator/context/library workspaces",
         "comparison_scope":"comparison-rounding intervals on executed values; no CPU/CUDA full-network equivalence certificate",
@@ -691,9 +738,15 @@ fn main() -> Result<(), String> {
     let mut records = vec![
         json!({"index":0,"label":"native","cost_bits":null,"cost_lower_bound":0,"states":vec!["Unevaluated";constraints.len()],"run_state":"NotMeasured"}),
     ];
-    for e in &entries {
-        records.push(json!({"index":e.index,"choice":e.choice,"fit":e.fit,"factors":{"file":e.filename,"sha256":e.hash,"bytes":e.bytes},"prepared_conditional_cost_bits":e.conditional_cost,"fit_diagnostics":e.diagnostics,
-        "cost_bits":null,"cost_lower_bound":0,"states":vec!["Unevaluated";constraints.len()],"run_state":"NotMeasured"}));
+    for (index, group) in groups.iter().enumerate().skip(1) {
+        let first = &entries[group[0]];
+        let sources: Vec<_> = group.iter().map(|i| { let e=&entries[*i];
+            json!({"source_index":e.index,"choice":e.choice,"fit":e.fit,"factors":{"file":e.filename,"sha256":e.hash,"bytes":e.bytes},
+                "prepared_conditional_single_head_cost_bits":e.conditional_cost,"fit_diagnostics":e.diagnostics})
+        }).collect();
+        records.push(json!({"index":index,"bank":mode.name(),"rank":first.choice.rank,"family":first.choice.family,"fit":first.fit,
+            "replaced_heads":group.len(),"sources":sources,"cost_bits":null,"cost_lower_bound":0,
+            "states":vec!["Unevaluated";constraints.len()],"run_state":"NotMeasured"}));
     }
     let mut cache = CostCache::default();
     let mut journal = std::fs::OpenOptions::new()
@@ -705,24 +758,49 @@ fn main() -> Result<(), String> {
         if index == 0 {
             return Ok(base.clone());
         }
-        let e = &entries[index - 1];
-        let op = base
-            .program
-            .operators
+        let group = &groups[index];
+        let payloads: Vec<_> = group
             .iter()
-            .find(|o| o.name == format!("blocks.{}.o{}", e.choice.layer, e.choice.head))
-            .ok_or("native head missing")?;
-        bank.candidate_with_prepared_factors(e.choice, &load_factor(&factors_dir, e, op)?)?
-            .f32_literals()
+            .map(|i| {
+                let e = &entries[*i];
+                let op = base
+                    .program
+                    .operators
+                    .iter()
+                    .find(|o| o.name == format!("blocks.{}.o{}", e.choice.layer, e.choice.head))
+                    .ok_or("native head missing")?;
+                load_factor(&factors_dir, e, op)
+            })
+            .collect::<Result<_, String>>()?;
+        if mode == BankMode::SingleHead {
+            bank.candidate_with_prepared_factors(entries[group[0]].choice, &payloads[0])?
+                .f32_literals()
+        } else {
+            let replacements: Vec<_> = group
+                .iter()
+                .zip(&payloads)
+                .map(|(i, payload)| (entries[*i].choice, payload))
+                .collect();
+            bank.compose_with_prepared_factors(&replacements)?
+                .f32_literals()
+        }
     };
-    let chosen = std::iter::once(0).chain(
-        entries
-            .iter()
-            .filter(|e| (start..start + count).contains(&(e.choice.layer * 6 + e.choice.head)))
-            .map(|e| e.index),
-    );
+    let chosen = groups
+        .iter()
+        .enumerate()
+        .filter(|(index, group)| {
+            *index == 0 || mode == BankMode::UniformJoint || {
+                let e = &entries[group[0]];
+                (start..start + count).contains(&(e.choice.layer * 6 + e.choice.head))
+            }
+        })
+        .map(|(index, _)| index);
     for index in chosen {
-        eprintln!("prepared candidate {index}/384: start");
+        eprintln!(
+            "prepared {} candidate {index}/{}: start",
+            mode.name(),
+            complete_count - 1
+        );
         let start_time = Instant::now();
         let rn = timed_run.nanos.load(Ordering::Relaxed);
         let rc = timed_run.calls.load(Ordering::Relaxed);
@@ -824,7 +902,7 @@ fn main() -> Result<(), String> {
         &out.join("REPORT.json"),
         &json!({"scope":scope,"records":records,"points":frontier_points,"selected_saved_byte_replays":replays,
         "seconds":{"lineage_and_manifest":hashes_seconds,"factor_validation":factor_validation_seconds,"codec_initialization":codec_initialization_seconds,"local_source_initialization":local_source_initialization_seconds,"selected_replay":replay_start.elapsed().as_secs_f64(),"total":begun.elapsed().as_secs_f64()},
-        "local_source_retained_numeric_bytes":local.cuda_native_source_numeric_bytes()?,"codec":{"stats":codec.stats(),"usage":codec.usage(),"selected_replay":"ordinary uncached independent byte decoding"},"run_stage_seconds":run.timing(),"peak_rss_bytes":peak_rss(),"complete_shard":true,"complete_bank":count==HEADS}),
+        "local_source_retained_numeric_bytes":local.cuda_native_source_numeric_bytes()?,"codec":{"stats":codec.stats(),"usage":codec.usage(),"selected_replay":"ordinary uncached independent byte decoding"},"run_stage_seconds":run.timing(),"peak_rss_bytes":peak_rss(),"complete_shard":true,"complete_bank":mode==BankMode::UniformJoint || count==HEADS}),
     )?;
     Ok(())
 }
@@ -834,6 +912,37 @@ mod tests {
     use super::*;
     use gam_mpd::operator_program::{Interface, OperatorBody, exact_precision};
     use ndarray::Array2;
+    #[test]
+    fn uniform_joint_bank_covers_every_prepared_factor_in_canonical_full_head_programs() {
+        let entries = inventory(&fixture_report()).expect("complete inventory");
+        let groups = BankMode::UniformJoint.groups();
+        assert_eq!(groups.len(), 17);
+        assert!(groups[0].is_empty());
+        let used: BTreeSet<_> = groups.iter().flatten().copied().collect();
+        assert!(used.iter().copied().eq(0..384));
+        for group in groups.iter().skip(1) {
+            assert_eq!(group.len(), HEADS);
+            let first = &entries[group[0]];
+            for (head, source) in group.iter().enumerate() {
+                let entry = &entries[*source];
+                assert_eq!(entry.choice.layer * 6 + entry.choice.head, head);
+                assert_eq!(entry.choice.rank, first.choice.rank);
+                assert_eq!(entry.choice.family, first.choice.family);
+                assert_eq!(entry.fit, first.fit);
+            }
+        }
+        assert!(BankMode::UniformJoint.validate_scope(0, 24, 17).is_ok());
+        assert!(BankMode::UniformJoint.validate_scope(0, 1, 17).is_err());
+        assert!(BankMode::UniformJoint.validate_scope(0, 24, 385).is_err());
+        assert!(BankMode::SingleHead.validate_scope(0, 1, 385).is_ok());
+        assert_eq!(BankMode::SingleHead.groups().len(), 385);
+        assert!(
+            BankMode::SingleHead
+                .validate_scope(usize::MAX, 2, 385)
+                .is_err()
+        );
+        assert!(BankMode::parse("joint_best_singletons").is_err());
+    }
     fn fixture_report() -> Value {
         let mut heads = Vec::new();
         for layer in 0..4 {
