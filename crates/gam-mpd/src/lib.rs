@@ -1,18 +1,12 @@
 //! Program decomposition of a network's parameters (#2951).
 //!
-//! The object is an executable decomposition of a network's parameterized computation, not a
-//! reconstruction of its activations. The engine (`engine`, over `operator_program`,
-//! `operator_rewrites`, `factors`, `refit`, `derivatives`) takes the model, imported as an
-//! operator program (`import`, `safetensors`), and searches the proposals of its primitive
-//! library for a shorter two-part code: program bits (`codec`, `precision`) plus
-//! `Σ KL(model ‖ program)/ln 2` over the contract's family (`contract`). A proposal is kept when
-//! the measured total drops. The search stops when no proposal is accepted or the budget is spent:
-//! the result has no further accepted move under this proposal set, and nothing more is claimed
-//! about it. `view` and `printer` print a program's operators and rules.
-//!
-//! The masked decomposition (`pieces`, `masked`, `blocks`) fits per-input rank-one subcomponents
-//! of chosen linear maps through the model's own masked forward. Its mask search is heuristic:
-//! derivatives propose flips, and a flip is kept when the measured total drops.
+//! A model is imported as an operator program (`import`, `safetensors`, `operator_program`) and
+//! decomposed into per-input rank-one subcomponents of chosen linear maps (`pieces`, `masked`,
+//! `blocks`), fitted through the model's own masked forward, on the host or a device
+//! (`masked_device`, `device_program`, `device_train`), one site at a time (`site_fit`,
+//! `sparse_code`). A subcomponent is priced by the description of its weights (`describe`, `codec`,
+//! `precision`) plus the KL its error costs. `explanation` runs the fitted sites as one program, and
+//! `counterfactual` scores its predicted response to declared interventions against the model's.
 //!
 //! Exact execution belongs to `gated_rewrite` (gated activations, norms), `attention` (rotary
 //! attention under the source's joint softmax), `block` and `apply` (native linear reads with
@@ -26,7 +20,7 @@
 //! over a stated finite family), a uniform bound over a stated region including numerical error,
 //! a statistical estimate with its distribution and standard error, a counterexample, or
 //! unresolved. The status type checks that each status is well formed; it does not check that a
-//! caller picked the status its computation supports. Roundoff bounds (`bounds`, `verify`,
+//! caller picked the status its computation supports. Roundoff bounds (`bounds`,
 //! `secant`) are derived from the operations performed; derivatives are analytic, and finite
 //! differences belong in tests only.
 
@@ -56,9 +50,6 @@ mod certify_tests;
 // Prefix, subset and graph codes for the global artifact and local packets.
 pub mod codec;
 
-// The kinds of structural proposal the engine searches over.
-pub mod fit;
-
 // Operator programs: typed operators with exact interfaces, banded batch execution, message code.
 pub mod operator_program;
 
@@ -66,7 +57,7 @@ pub mod operator_program;
 #[cfg(test)]
 mod operator_program_tests;
 
-// The declared contract of a program decomposition: load, complete and sampled families.
+// The contract of an imported model: its input family and readouts.
 pub mod contract;
 
 // Measured clean, incoming and reconstruction errors of composed matrix replacements.
@@ -78,45 +69,8 @@ pub mod switched;
 // Static dependency-preserving compilation of a fixed switching policy.
 pub mod switched_compile;
 
-// Program decomposition by two-part code: primitives propose, a change is kept when the measured total drops.
+// Progress logging for the drivers.
 pub mod engine;
-
-// The engine on planted programs: recovery, labelling up to automorphism, restatement invariance.
-#[cfg(test)]
-mod engine_tests;
-
-// The shared-factor fit on a planted layer: one rule per plane, found without naming the planes.
-#[cfg(test)]
-mod factors_tests;
-
-// Counterexample-guided refinement: input-space ascent of KL(model ‖ program) feeding the data.
-pub mod cegar;
-
-// The refinement verifier on programs with every node kind: gradients, ascent, termination.
-#[cfg(test)]
-mod cegar_tests;
-
-// The operator-level view of a program: reads, applying node kinds, writes, uses, bits by storage.
-pub mod view;
-
-// The human-facing reading of an operator program: rules with bindings, bits by storage, per-input KL.
-pub mod printer;
-
-// The printer on a planted two-frequency circuit.
-#[cfg(test)]
-mod printer_tests;
-
-// Exact path decomposition of a traced value: conditioned on the trace, best first, with a certified remainder.
-pub mod paths;
-
-// Refitting a program's reals to its contract: exact Newton–CG on the readout's convex KL.
-pub mod refit;
-
-// Exact rewrites of operator programs: constant folding, composition, mixes, stacking, a given character basis.
-pub mod operator_rewrites;
-
-// Shared writer factors: operators writing one space factored through one library of directions.
-pub mod factors;
 
 // Per-input pieces of one linear map: an overcomplete rank-1 library fitted so that each input
 // lists few pieces (listing code plus second-order KL).
@@ -162,7 +116,7 @@ mod checkpoint_tests;
 #[cfg(test)]
 mod pieces_tests;
 
-// Exact directional derivatives of operator programs, and precisions derived from curvature.
+// Exact directional derivatives of operator programs.
 pub mod derivatives;
 
 // Proposal products (ranking, directions, curvature) on the Apple GPU; acceptances stay float64.
@@ -189,13 +143,6 @@ mod device_train_tests;
 // Model exports (export.json and raw float64 tensors) as operator programs and contracts.
 pub mod import;
 
-// Exact invariance quotients: a program's canonical representative under its exact gauges, and the bits saved.
-pub mod quotient;
-
-// Quotients on planted programs: bit-identical scale gauges, banded shifts, exact savings.
-#[cfg(test)]
-mod quotient_tests;
-
 // Exact masked rewrites of gated units, norms, biases and residual edges.
 pub mod gated_rewrite;
 
@@ -214,9 +161,6 @@ mod known_answer_toys_tests;
 
 // Declared-precision real codes and decode-then-evaluate distortion.
 pub mod precision;
-
-// Logit-row comparison with forward-error radii, and exhaustive suprema over a finite family.
-pub mod verify;
 
 // The native edit compiler: control settings to native parameter edits, or infeasibility witnesses.
 pub mod compile;

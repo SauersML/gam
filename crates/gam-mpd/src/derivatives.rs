@@ -1,25 +1,11 @@
-//! Exact directional derivatives of an operator program, and precisions derived from them (#2951).
+//! Exact directional derivatives of an operator program (#2951).
 //!
 //! [`vjp`] is reverse-mode differentiation: every node's cotangent from the output's, one pass
 //! for all nodes. [`jvp`] is forward-mode differentiation of the executed program in its operators' reals: given a
 //! tangent `dA` for some operators, every node's tangent follows from its law (the chain rule node
-//! by node, no finite differences), reading the base values from a trace. [`output_curvature`]
-//! estimates the trace of the data code's Gauss–Newton curvature in one operator's reals,
-//! `tr F = Σ_rows E_v (J v)ᵀ (diag q − q qᵀ) (J v)` over Rademacher probes `v` on its present
-//! reals; the estimate is statistical and only ever proposes, never certifies.
-//!
-//! # The precision a curvature asks for
-//!
-//! Rounding an operator's `m` reals to a lattice of step `Δ` moves each by a uniform error of
-//! variance `Δ²/12`, so the data code `n Σ KL/ln 2` grows by `n Δ² tr F / (24 ln 2)` to second
-//! order, while the reals' indices shrink by `m log₂ Δ` bits. The sum is least at
-//! `Δ² = 12 m / (n tr F)`. [`CurvaturePrecision`] proposes each operator's lattice at that step's
-//! nearest power of two (and its two neighbours); the exact decoded code and the contract decide.
+//! by node, no finite differences), reading the base values from a trace.
 
-use super::engine::{EngineError, Edit, Exactness, Primitive, Proposal, SearchContext};
-use super::fit::ProposalKind;
 use super::operator_program::{FamilyInputs, Node, Operator, OperatorBody, OperatorProgram, ProgramError, Scale, Trace};
-use super::precision::DeclaredPrecision;
 use gam_gpu::banded::Layout;
 use ndarray::{Array2, Axis, s};
 use std::collections::BTreeMap;
@@ -623,118 +609,4 @@ fn attend_cotangent(
         }
     }
     Ok((rotate_rows(&gq, rotary, &layout.position, true), rotate_rows(&gk, rotary, &layout.position, true), gv))
-}
-
-/// A Rademacher probe over an operator's present reals, from a fixed-seed generator so the proposal
-/// is reproducible.
-fn probe(program: &OperatorProgram, operator: usize, seed: u64) -> Option<Array2<f64>> {
-    let op = &program.operators[operator];
-    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(operator as u64 + 1);
-    let mut sign = || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        if state & 1 == 1 { 1.0 } else { -1.0 }
-    };
-    if let OperatorBody::Diagonal { values, .. } = &op.body {
-        // A diagonal's probe is its diagonal, one row.
-        return Some(Array2::from_shape_fn((1, values.len()), |_| sign()));
-    }
-    let OperatorBody::Dense { present, .. } = &op.body else { return None };
-    let mut out = Array2::<f64>::zeros((op.rows.width(), op.cols.width()));
-    for ((r, c), keep) in present.indexed_iter() {
-        if !keep {
-            continue;
-        }
-        for value in out.slice_mut(s![op.rows.range(r), op.cols.range(c)]).iter_mut() {
-            *value = sign();
-        }
-    }
-    Some(out)
-}
-
-/// The statistical estimate (module note) of `tr F` for `operator` from `probes` Rademacher probes:
-/// `F`'s rows are the model's output distributions `q` at the program's logits `z`, per
-/// distribution row `(J v)ᵀ (diag q − q qᵀ)(J v)`.
-pub fn output_curvature(
-    program: &OperatorProgram,
-    inputs: &FamilyInputs,
-    trace: &Trace,
-    readouts: usize,
-    operator: usize,
-    probes: u64,
-) -> Result<Option<f64>, ProgramError> {
-    let logits = &trace.values[program.output];
-    let mut total = 0.0;
-    for seed in 0..probes {
-        let Some(v) = probe(program, operator, seed) else { return Ok(None) };
-        let tangents: BTreeMap<usize, Array2<f64>> = [(operator, v)].into_iter().collect();
-        let jv = jvp(program, inputs, trace, &tangents)?;
-        let classes = logits.ncols() / readouts.max(1);
-        for row in 0..logits.nrows() {
-            for part in 0..readouts.max(1) {
-                let range = part * classes..(part + 1) * classes;
-                let z = logits.slice(s![row, range.clone()]);
-                let m = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-                let e: Vec<f64> = z.iter().map(|v| (v - m).exp()).collect();
-                let sum: f64 = e.iter().sum();
-                let dz = jv.slice(s![row, range]);
-                let mean: f64 = e.iter().zip(dz.iter()).map(|(p, d)| p / sum * d).sum();
-                total += e.iter().zip(dz.iter()).map(|(p, d)| p / sum * (d - mean) * (d - mean)).sum::<f64>();
-            }
-        }
-    }
-    Ok(Some(total / probes.max(1) as f64))
-}
-
-/// Each operator's lattice at the step its curvature asks for, and at the two neighbouring steps
-/// (module note). `probes` is the estimator's sample size, a search setting.
-pub struct CurvaturePrecision {
-    pub probes: u64,
-}
-
-impl Primitive for CurvaturePrecision {
-    fn name(&self) -> &'static str {
-        "curvature_precision"
-    }
-
-    fn propose(&self, context: &SearchContext<'_>) -> Result<Vec<Proposal>, EngineError> {
-        let program = context.program;
-        let mut out = Vec::new();
-        for (index, op) in program.operators.iter().enumerate() {
-            let (OperatorBody::Dense { precision, .. } | OperatorBody::Diagonal { precision, .. }) = &op.body else { continue };
-            let m = op.real_count();
-            if m == 0 {
-                continue;
-            }
-            let Some(trace_f) = output_curvature(program, &context.contract.family, context.trace, context.contract.readouts, index, self.probes)?
-            else {
-                continue;
-            };
-            let n = context.contract.observations as f64;
-            if !(trace_f > 0.0) {
-                continue;
-            }
-            let step = (12.0 * m as f64 / (n * trace_f)).sqrt();
-            if !(step > 0.0 && step.is_finite()) {
-                continue;
-            }
-            let centre = (-step.log2()).round() as i32;
-            for bits in [centre - 1, centre, centre + 1] {
-                if bits == precision.fraction_bits() {
-                    continue;
-                }
-                // A step beyond the declarable exponents is no proposal.
-                let Ok(target) = DeclaredPrecision::new(bits) else { continue };
-                out.push(Proposal {
-                    primitive: "curvature_precision",
-                    kind: ProposalKind::Reduce,
-                    exactness: Exactness::Approximate,
-                    description: format!("precision of {} to 2^-{bits} (curvature step 2^-{centre})", op.name),
-                    edit: Edit::Precision { operator: index, precision: target },
-                });
-            }
-        }
-        Ok(out)
-    }
 }
