@@ -160,16 +160,42 @@ impl BitString {
                 "{value} does not fit in {width} bits"
             )));
         }
-        for position in (0..width).rev() {
-            self.push_bit((value >> position) & 1 == 1);
+        let offset = (self.len_bits % 8) as u32;
+        let mut remaining = width;
+        if offset != 0 && remaining != 0 {
+            let take = remaining.min(8 - offset);
+            remaining -= take;
+            let field = ((value >> remaining) & ((1 << take) - 1)) as u8;
+            *self.bytes.last_mut().expect("partial byte") |= field << (8 - offset - take);
         }
+        if remaining != 0 {
+            let count = remaining.div_ceil(8) as usize;
+            let packed = (value << ((8 - remaining % 8) % 8)).to_be_bytes();
+            self.bytes.extend_from_slice(&packed[8 - count..]);
+        }
+        self.len_bits += u64::from(width);
         Ok(())
     }
 
     /// Append another message after this one.
     pub fn append(&mut self, other: &BitString) {
-        for index in 0..other.len_bits {
-            self.push_bit(other.bit(index));
+        let offset = (self.len_bits % 8) as u32;
+        if offset == 0 {
+            self.bytes.extend_from_slice(&other.bytes);
+            self.len_bits += other.len_bits;
+            return;
+        }
+        let full = (other.len_bits / 8) as usize;
+        self.bytes.reserve(other.bytes.len());
+        for &byte in &other.bytes[..full] {
+            *self.bytes.last_mut().expect("partial byte") |= byte >> offset;
+            self.bytes.push(byte << (8 - offset));
+        }
+        self.len_bits += (full as u64) * 8;
+        let tail = (other.len_bits % 8) as u32;
+        if tail != 0 {
+            self.push_bits(u64::from(other.bytes[full] >> (8 - tail)), tail)
+                .expect("a tail fits its declared width");
         }
     }
 
@@ -220,12 +246,15 @@ impl BitReader<'_> {
             )));
         }
         self.require(u64::from(width))?;
-        let mut value = 0_u64;
-        for _ in 0..width {
-            value = (value << 1) | u64::from(self.bits.bit(self.position));
-            self.position += 1;
-        }
-        Ok(value)
+        if width == 0 { return Ok(0); }
+        let start = (self.position / 8) as usize;
+        let offset = (self.position % 8) as u32;
+        let count = (offset + width).div_ceil(8) as usize;
+        let mut packed = [0u8; 16];
+        packed[16 - count..].copy_from_slice(&self.bits.bytes[start..start + count]);
+        let shifted = u128::from_be_bytes(packed) >> ((count as u32) * 8 - offset - width);
+        self.position += u64::from(width);
+        Ok((shifted & ((1u128 << width) - 1)) as u64)
     }
 
     /// Refuse a message with bits left after its codeword.
@@ -1046,6 +1075,75 @@ impl CardinalityCode for PaddedPacketCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn reference_push(bits: &mut BitString, value: u64, width: u32) -> Result<(), CodecError> {
+        if width > 64 || (width < 64 && value >> width != 0) {
+            return Err(CodecError::InvalidInput(format!("{value} does not fit in {width} bits")));
+        }
+        for shift in (0..width).rev() { bits.push_bit((value >> shift) & 1 != 0); }
+        Ok(())
+    }
+    #[test]
+    fn bulk_fields_match_reference_at_every_offset_width_and_truncation() {
+        for offset in 0..8 {
+            for width in 0..=64 {
+                for pattern in [0, 1, u64::MAX, 0x123456789abcdef0, 0xaaaaaaaaaaaaaaaa] {
+                    let value = if width == 64 { pattern } else { pattern & ((1u64 << width) - 1) };
+                    let mut actual = BitString::new();
+                    for bit in 0..offset { actual.push_bit(bit % 2 == 0); }
+                    let mut reference = actual.clone();
+                    actual.push_bits(value, width).unwrap();
+                    reference_push(&mut reference, value, width).unwrap();
+                    assert_eq!(actual, reference, "offset {offset}, width {width}, value {value}");
+                    for tail in 0..=width {
+                        let mut shortened = actual.clone();
+                        shortened.len_bits -= u64::from(width - tail);
+                        let mut reader = shortened.reader();
+                        for _ in 0..offset { reader.read_bit().unwrap(); }
+                        let position = reader.position;
+                        if tail == width { assert_eq!(reader.read_bits(width), Ok(value)); }
+                        else {
+                            assert_eq!(reader.read_bits(width), Err(CodecError::UnexpectedEnd { needed: u64::from(width), remaining: u64::from(tail) }));
+                            assert_eq!(reader.position, position);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn bulk_append_matches_reference_with_all_offsets_and_tails() {
+        for offset in 0..8 {
+            for length in 0..=145 {
+                let mut left = BitString::new();
+                for bit in 0..offset { left.push_bit(bit % 3 == 0); }
+                let mut right = BitString::new();
+                for bit in 0..length { right.push_bit((bit * 11 + 3) % 7 < 3); }
+                let mut reference = left.clone();
+                for bit in 0..right.len_bits() { reference.push_bit(right.bit(bit)); }
+                left.append(&right);
+                assert_eq!(left, reference, "offset {offset}, length {length}");
+                left.push_bits(0x95, 8).unwrap();
+                reference_push(&mut reference, 0x95, 8).unwrap();
+                assert_eq!(left, reference);
+            }
+        }
+    }
+    #[test]
+    fn bulk_fields_preserve_invalid_input_errors_without_mutation() {
+        for (value, width) in [(1, 0), (256, 8), (u64::MAX, 63), (0, 65), (1, u32::MAX)] {
+            let mut actual = BitString::new(); actual.push_bit(true);
+            let mut reference = actual.clone();
+            assert_eq!(actual.push_bits(value, width), reference_push(&mut reference, value, width));
+            assert_eq!(actual, reference);
+            let mut reader = actual.reader();
+            let before = reader.position;
+            if width > 64 {
+                assert_eq!(reader.read_bits(width), Err(CodecError::InvalidInput(format!("a {width}-bit field exceeds u64"))));
+                assert_eq!(reader.position, before);
+            }
+        }
+    }
+
     use gam_math::special::log2_binomial_coefficient;
     use crate::precision::{
         DecodableArtifact, DecodedFidelity, FidelityVerdict, PeriodicQuotient, QuotientCode,
