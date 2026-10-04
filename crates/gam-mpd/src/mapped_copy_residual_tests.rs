@@ -14,7 +14,7 @@ impl Drop for Export {
         std::fs::remove_dir_all(&self.0).expect("remove temporary export fixture");
     }
 }
-fn export(layers: usize, heads: usize, kv: usize, qk: bool, gated: bool) -> Export {
+fn export(layers: usize, heads: usize, kv: usize, qk: bool, gated: bool, well_conditioned: bool) -> Export {
     static SERIAL: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
         "mpd-mapped-copy-residual-{}-{}",
@@ -28,6 +28,9 @@ fn export(layers: usize, heads: usize, kv: usize, qk: bool, gated: bool) -> Expo
             .map(|i| {
                 if gain {
                     1. + 0.01 * (i as f64)
+                } else if well_conditioned {
+                    let diagonal = if i % cols == (i / cols) % cols { 0.25 } else { 0. };
+                    diagonal + ((i * 7 + 3) % 31) as f64 / 1024.
                 } else {
                     ((i * 7 + 3) as f64).sin() * 0.2
                 }
@@ -89,12 +92,13 @@ fn export(layers: usize, heads: usize, kv: usize, qk: bool, gated: bool) -> Expo
     Export(dir)
 }
 
-fn native27() -> (Export,crate::import::Imported) {
-    let dir=export(1,16,4,true,true);
+fn native27_with_conditioning(well_conditioned:bool) -> (Export,crate::import::Imported) {
+    let dir=export(1,16,4,true,true,well_conditioned);
     let mut imported=import_language_model(&dir.0,1,3).expect("mapped proposal fixture");
     for op in &mut imported.program.operators {std::sync::Arc::make_mut(op).name=op.name.replace("blocks.0.","blocks.27.");}
     (dir,imported)
 }
+fn native27() -> (Export,crate::import::Imported) { native27_with_conditioning(true) }
 #[test]
 fn mapped_copy_residual_qwen_all16_rank16_complete_and_guarded() {
     let (_dir,imported)=native27();let p=&imported.program;
@@ -154,4 +158,16 @@ fn mapped_copy_residual_semantic_bypass_is_explicit_failure_not_missing_head() {
     let base=Artifact::native(&imported.program).unwrap().f32_literals().unwrap();
     let result=MappedCopyResidualBank::new(&base,&[27],&[16],33);
     assert!(result.is_err());assert!(result.err().unwrap().contains("bypasses"));
+}
+
+#[test]
+fn mapped_copy_residual_full_rank_does_not_certify_ill_conditioned_literal_rounding() {
+    let (_dir,imported)=native27_with_conditioning(false);let p=&imported.program;
+    let base=Artifact::native(p).unwrap().f32_literals().unwrap();let map=AttentionLayerMap::of(p,27).unwrap();
+    let bank=MappedCopyResidualBank::new(&base,&[27],&[17],33).unwrap();
+    let candidate=bank.candidate(CopyResidualChoice{layer:27,head:0,rank:17,family:HeadApproximation::CopyResidual}).unwrap().f32_literals().unwrap();
+    candidate.validate_coverage(p).unwrap();
+    let original=base.program.execute(&imported.contract.family).unwrap();let changed=candidate.program.execute(&imported.contract.family).unwrap();
+    let error=(&original.values[map.output]-&changed.values[map.output]).iter().map(|x|x*x).sum::<f64>().sqrt();
+    assert!(error.is_finite()&&error>0.001,"full rank must not be treated as a quality certificate: {error}");
 }
