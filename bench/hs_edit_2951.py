@@ -40,7 +40,7 @@ Stages (outputs in ~/mpd-data/frontier/hs_edit/):
            there, what its write promotes through the unembedding, and its validation effect by HellaSwag source and
            category and against ending length (after the final harness run)
 
-usage: MPD_MEM_GIB=4 venv/python hs_edit_2951.py search | explain
+usage: MPD_MEM_GIB=6 venv/python hs_edit_2951.py search | explain
 """
 import hashlib
 import json
@@ -146,7 +146,7 @@ class Model:
         """dJ/dW at the native weights over `split`."""
         torch = self.torch
         W = self.W0.clone().requires_grad_(True)
-        for ids, rows, pos, toks, golds, idx in batches(split):
+        for ids, rows, pos, toks, golds, idx in batches(split, per=4):
             with torch.no_grad():
                 xmid, g2 = self.resid(ids.to(E.DEVICE))
             s = self.shares(self.final.after(xmid + g2 @ W.T), rows, pos, toks, golds)
@@ -224,7 +224,7 @@ def train_lora(m, fit, select):
             break
         part = [fit[i] for i in rng.choice(len(fit), LORA_ITEMS, replace=False)]
         opt.zero_grad()
-        for ids, rows, pos, toks, golds, idx in batches(part):
+        for ids, rows, pos, toks, golds, idx in batches(part, per=4):
             with torch.no_grad():
                 xmid, g2 = m.resid(ids.to(E.DEVICE))
             s = m.shares(m.final.after(xmid + g2 @ m.W0.T + (g2 @ A.T) @ B.T), rows, pos, toks, golds)
