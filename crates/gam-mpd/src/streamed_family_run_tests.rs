@@ -43,7 +43,7 @@ fn numeric_budgets_count_hidden_teachers_and_all_four_logits_tiles() {
     assert!(layout(&head,1024,80,StreamedBudget {teacher_bytes:retained-1,..budget}).is_err());
     assert!(layout(&head,1024,80,StreamedBudget {tile_bytes:per_row-1,..budget}).is_err());
     assert!(layout(&head,usize::MAX,80,budget).is_err());
-    // 81 full vocabulary arrays would be more than 100GiB; cache actual hidden states.
+    // 81 full vocabulary arrays would be more than 90GiB; cache actual hidden states.
     assert!(retained<1024*1024*1024);
     assert!(81_u64*1024*151936*8>90*1024*1024*1024);
 }
