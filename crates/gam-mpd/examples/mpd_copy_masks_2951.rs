@@ -128,18 +128,18 @@ fn main() -> Result<(), String> {
         let measured = bank.checked(&masks, &native).and_then(|(artifact, cost, bytes)| {
             let checked_seconds = candidate_started.elapsed().as_secs_f64();
             let local_started = Instant::now();
-            local.screen(&artifact).map(|measure| (measure, cost, bytes, checked_seconds, local_started.elapsed().as_secs_f64()))
+            let measure = local.screen(&artifact)?;
+            let status = measure.status()?;
+            Ok((measure, status, cost, bytes, checked_seconds, local_started.elapsed().as_secs_f64()))
         });
         let entry = match measured {
-            Ok((measure, cost, bytes, checked_seconds, local_seconds)) => {
-                let lower = measure.blocks.iter().map(|b| b.lower).fold(0.0_f64, f64::max);
-                let upper = measure.blocks.iter().map(|b| b.upper).fold(0.0_f64, f64::max);
+            Ok((measure, status, cost, bytes, checked_seconds, local_seconds)) => {
                 let states: Vec<_> = deltas.iter().enumerate().map(|(i, &delta)| {
-                    let state = if lower > delta { "violates" } else if upper <= delta { "passes_declared_family" } else { "unresolved" };
+                    let state = if status.refutes_at_most(delta) { "violates" } else if status.certifies_at_most(delta) { "passes_declared_family" } else { "unresolved" };
                     if state != "violates" { retained[i][layer].push(mask); }
                     json!({"delta":delta,"state":state})
                 }).collect();
-                json!({"layer":layer,"mask":mask,"local":measure,"states":states,"C32":cost,"C32_bits":cost.total(),"wire_bytes":bytes,"checked_seconds":checked_seconds,"local_seconds":local_seconds})
+                json!({"layer":layer,"mask":mask,"local":measure,"evidence":status,"states":states,"C32":cost,"C32_bits":cost.total(),"wire_bytes":bytes,"checked_seconds":checked_seconds,"local_seconds":local_seconds})
             }
             Err(error) => {
                 for grid in &mut retained { grid[layer].push(mask); }

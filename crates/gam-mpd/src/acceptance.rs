@@ -457,7 +457,10 @@ impl LocalMeasure {
         self.blocks.iter().max_by(|a, b| a.worst.total_cmp(&b.worst))
     }
 
-    fn status(&self) -> Result<EvidenceStatus<String, String>, String> {
+    /// Validate every recorded interval and aggregate the worst bound over tested native-parent states.
+    /// This describes tested rows only, including any recorded ascent endpoints; it is not a
+    /// uniform certificate over untested inputs. Invalid evidence is an error, never a verdict.
+    pub fn status(&self) -> Result<EvidenceStatus<String, String>, String> {
         let domain = format!("native parent states of {} tested rows ({} declared)", self.rows, self.family_rows);
         if self.blocks.is_empty() {
             return EvidenceStatus::exact(0.0, 0.0, ExactBasis::Algebraic, None, "no block replaced".to_string()).map_err(|e| e.to_string());
