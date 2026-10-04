@@ -93,6 +93,13 @@ pub mod describe;
 #[cfg(test)]
 mod describe_tests;
 
+// Rules of attention heads: one body read through what the decoder holds (a match through an
+// earlier head's output-value circuit, a copy through the norm gains), bound per head by a scale.
+pub mod rules;
+
+#[cfg(test)]
+mod rules_tests;
+
 // The frozen tail of a decoder language model after a decomposed window, as a masked head.
 pub mod tail;
 
