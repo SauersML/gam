@@ -1,0 +1,19 @@
+{
+  "source_commit": "4ff91ce4b03d39d1063545b9805d3208621f950d",
+  "protocol_sha256": "78df4b00c8ad86cd8b5182d0fef973b7d297d27bcabb64b0e87e355017cca4b8",
+  "binary_sha256": "7d6fc6fed3a1498f6c1f0041cb5c021ad7521c3cb3cd8beba196622446811a64",
+  "job": "15872",
+  "command": [
+    "/mnt/nw/home/s.sauers/mpd-bin-targeted/4ff91ce4b03d/mpd_local_device_probe_2951",
+    "/mnt/nw/home/s.sauers/mpd-data/engine/vpd4l_frontier32",
+    "/mnt/nw/home/s.sauers/mpd-data/cluster/codex-local-norm-enclosure-4ff9/measurement/BANK.json",
+    "/mnt/nw/home/s.sauers/mpd-data/cluster/codex-local-norm-enclosure-4ff9/measurement/REPORT.json",
+    "sequences=2",
+    "context=512",
+    "batch=512",
+    "trace_bytes=2147483648",
+    "source_bytes=1073741824",
+    "deltas=0.01,0.05,0.1,0.2,0.5,1,2,10"
+  ],
+  "IEEE_RN_gradual_underflow": "assumed, not runtime verified"
+}

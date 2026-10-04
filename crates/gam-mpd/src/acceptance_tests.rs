@@ -1282,7 +1282,7 @@ fn local_norm_tiny_native_scale_is_not_a_square_underflow() {
         assert!(measured.blocks[0].lower <= 1.0 && measured.blocks[0].upper >= 1.0);
         assert!(measured.status().expect("valid evidence").refutes_at_most(0.5));
         if let Some(device)=gam_gpu::tensor::Device::accelerator(gam_gpu::GpuPolicy::Auto).expect("device probe") {
-            if device.float64() && device.name().contains("CUDA") {
+            if device.float64() && !device.is_host() {
                 let measured=Local::new(&model,family,None,16).with_cuda(device,1024*1024).expect("CUDA Local").with_cuda_resident_norms().expect("resident norms").measure(&candidate).expect("CUDA scale enclosure");
                 assert!(measured.blocks[0].lower <= 1.0 && measured.blocks[0].upper >= 1.0);
                 assert!(measured.status().expect("valid CUDA evidence").refutes_at_most(0.5));

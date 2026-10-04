@@ -1,0 +1,42 @@
+{
+  "source_commit": "4ff91ce4b03d39d1063545b9805d3208621f950d",
+  "purpose": "IEEE RN gradual-underflow comparison arithmetic repair: same saved real artifacts/full1024rows, centers bitwise host-vs-resident CUDA, interval overlap and declared-grid classification; source forward discrepancy outside bounds",
+  "sequences": 2,
+  "context": 512,
+  "batch": 512,
+  "trace_bytes": 2147483648,
+  "source_bytes": 1073741824,
+  "deltas": [
+    0.01,
+    0.05,
+    0.1,
+    0.2,
+    0.5,
+    1,
+    2,
+    10
+  ],
+  "artifacts": [
+    {
+      "label": "explicit arithmetic Copy rule",
+      "path": "cluster/codex-explicit-copy-1bbb/conversion/explicit.artifact",
+      "sha256": "d9c2bdaabd92dd44a18903aaf20cc56e0b20055d60c6e5526402f71c9ed503f5"
+    },
+    {
+      "label": "learned nonlinear MLP rule",
+      "path": "cluster/codex-native-mlp-L0-40649/bank/L0-m2-K2-Gelu-support0.artifact",
+      "sha256": "e8481d41159d945ce339cd675168d9bf8d4b5180e283a1abcb4f38f9adb9448e"
+    }
+  ],
+  "prior_source_commit": "240d21bbc83a7a082d8d678c688d779868270dbd",
+  "output": "codex-local-norm-enclosure-4ff9",
+  "allocation": {
+    "cpus": 4,
+    "memory_GiB": 16,
+    "gpus": 1,
+    "wall_seconds": 900
+  },
+  "wall_seconds": 840,
+  "extreme_gate": "native/row norms1e-200,2^-1000,1e200, exact0/0, nonzero/0 unresolved, minimumsubnormal; no denominator floor",
+  "export_sha256": "1af0aface5a0ca843624310daac12c0ff770a0cc24aa96550c130d11de77bb68"
+}

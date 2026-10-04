@@ -1,0 +1,606 @@
+{
+  "bank_sha256": "60d5103bd6aa0a0791f2f33feb17090db5593ff348f9aed1ecb7f63d1744477a",
+  "batch": 512,
+  "binary_sha256": "7d6fc6fed3a1498f6c1f0041cb5c021ad7521c3cb3cd8beba196622446811a64",
+  "context": 512,
+  "cpu_backend": "CPU f64 native-parent graft, native scales and comparison",
+  "cuda_backend": "CUDA f64 native-parent graft; CPU native scales and comparison",
+  "export_sha256": "1af0aface5a0ca843624310daac12c0ff770a0cc24aa96550c130d11de77bb68",
+  "records": [
+    {
+      "artifact": "/mnt/nw/home/s.sauers/mpd-data/cluster/codex-explicit-copy-1bbb/conversion/explicit.artifact",
+      "artifact_sha256": "d9c2bdaabd92dd44a18903aaf20cc56e0b20055d60c6e5526402f71c9ed503f5",
+      "label": "explicit arithmetic Copy rule",
+      "pairs": [
+        {
+          "cpu": {
+            "blocks": [
+              {
+                "lower": 0.21254653388406997,
+                "lower_row": 334,
+                "name": "attention 3",
+                "numerical_error": 6.644962358137719e-12,
+                "row": 334,
+                "scale": 16.779606393542586,
+                "upper": 0.21254653389735995,
+                "worst": 0.21254653389071496
+              }
+            ],
+            "counterexamples": 0,
+            "family_rows": 1024,
+            "rows": 1024
+          },
+          "cpu_seconds": 3.976001924,
+          "cuda": {
+            "blocks": [
+              {
+                "lower": 0.2125465338840702,
+                "lower_row": 334,
+                "name": "attention 3",
+                "numerical_error": 6.644990113713335e-12,
+                "row": 334,
+                "scale": 16.779606393542586,
+                "upper": 0.21254653389736022,
+                "worst": 0.2125465338907152
+              }
+            ],
+            "counterexamples": 0,
+            "family_rows": 1024,
+            "rows": 1024
+          },
+          "cuda_seconds": 2.5515774,
+          "differences": [
+            {
+              "absolute_worst_difference": 2.498001805406602e-16,
+              "block": "attention 3",
+              "same_scale_bits": true,
+              "same_worst_row": true
+            }
+          ],
+          "grid": [
+            {
+              "cpu": "Violates",
+              "cuda": "Violates",
+              "delta": 0.01,
+              "resident_cuda": "Violates"
+            },
+            {
+              "cpu": "Violates",
+              "cuda": "Violates",
+              "delta": 0.05,
+              "resident_cuda": "Violates"
+            },
+            {
+              "cpu": "Violates",
+              "cuda": "Violates",
+              "delta": 0.1,
+              "resident_cuda": "Violates"
+            },
+            {
+              "cpu": "Violates",
+              "cuda": "Violates",
+              "delta": 0.2,
+              "resident_cuda": "Violates"
+            },
+            {
+              "cpu": "Meets",
+              "cuda": "Meets",
+              "delta": 0.5,
+              "resident_cuda": "Meets"
+            },
+            {
+              "cpu": "Meets",
+              "cuda": "Meets",
+              "delta": 1.0,
+              "resident_cuda": "Meets"
+            },
+            {
+              "cpu": "Meets",
+              "cuda": "Meets",
+              "delta": 2.0,
+              "resident_cuda": "Meets"
+            },
+            {
+              "cpu": "Meets",
+              "cuda": "Meets",
+              "delta": 10.0,
+              "resident_cuda": "Meets"
+            }
+          ],
+          "repeat": 0,
+          "resident_norms": {
+            "declared_grid_classifications_equal": true,
+            "downloaded_norm_bytes": 24576,
+            "host_center_bits_equal": true,
+            "measure": {
+              "blocks": [
+                {
+                  "lower": 0.2125465338840737,
+                  "lower_row": 334,
+                  "name": "attention 3",
+                  "numerical_error": 6.64146515561015e-12,
+                  "row": 334,
+                  "scale": 16.779606393542586,
+                  "upper": 0.2125465338973567,
+                  "worst": 0.2125465338907152
+                }
+              ],
+              "counterexamples": 0,
+              "family_rows": 1024,
+              "rows": 1024
+            },
+            "old_downloaded_difference_bytes": 6291456,
+            "seconds": 2.253234445,
+            "sound_interval_overlap": true
+          },
+          "shared_cuda": {
+            "complete_fresh_cuda_evidence_equal": true,
+            "measure": {
+              "blocks": [
+                {
+                  "lower": 0.2125465338840702,
+                  "lower_row": 334,
+                  "name": "attention 3",
+                  "numerical_error": 6.644990113713335e-12,
+                  "row": 334,
+                  "scale": 16.779606393542586,
+                  "upper": 0.21254653389736022,
+                  "worst": 0.2125465338907152
+                }
+              ],
+              "counterexamples": 0,
+              "family_rows": 1024,
+              "rows": 1024
+            },
+            "seconds": 2.183375784
+          }
+        },
+        {
+          "cpu": {
+            "blocks": [
+              {
+                "lower": 0.21254653388406997,
+                "lower_row": 334,
+                "name": "attention 3",
+                "numerical_error": 6.644962358137719e-12,
+                "row": 334,
+                "scale": 16.779606393542586,
+                "upper": 0.21254653389735995,
+                "worst": 0.21254653389071496
+              }
+            ],
+            "counterexamples": 0,
+            "family_rows": 1024,
+            "rows": 1024
+          },
+          "cpu_seconds": 2.305697909,
+          "cuda": {
+            "blocks": [
+              {
+                "lower": 0.2125465338840702,
+                "lower_row": 334,
+                "name": "attention 3",
+                "numerical_error": 6.644990113713335e-12,
+                "row": 334,
+                "scale": 16.779606393542586,
+                "upper": 0.21254653389736022,
+                "worst": 0.2125465338907152
+              }
+            ],
+            "counterexamples": 0,
+            "family_rows": 1024,
+            "rows": 1024
+          },
+          "cuda_seconds": 0.830675842,
+          "differences": [
+            {
+              "absolute_worst_difference": 2.498001805406602e-16,
+              "block": "attention 3",
+              "same_scale_bits": true,
+              "same_worst_row": true
+            }
+          ],
+          "grid": [
+            {
+              "cpu": "Violates",
+              "cuda": "Violates",
+              "delta": 0.01,
+              "resident_cuda": "Violates"
+            },
+            {
+              "cpu": "Violates",
+              "cuda": "Violates",
+              "delta": 0.05,
+              "resident_cuda": "Violates"
+            },
+            {
+              "cpu": "Violates",
+              "cuda": "Violates",
+              "delta": 0.1,
+              "resident_cuda": "Violates"
+            },
+            {
+              "cpu": "Violates",
+              "cuda": "Violates",
+              "delta": 0.2,
+              "resident_cuda": "Violates"
+            },
+            {
+              "cpu": "Meets",
+              "cuda": "Meets",
+              "delta": 0.5,
+              "resident_cuda": "Meets"
+            },
+            {
+              "cpu": "Meets",
+              "cuda": "Meets",
+              "delta": 1.0,
+              "resident_cuda": "Meets"
+            },
+            {
+              "cpu": "Meets",
+              "cuda": "Meets",
+              "delta": 2.0,
+              "resident_cuda": "Meets"
+            },
+            {
+              "cpu": "Meets",
+              "cuda": "Meets",
+              "delta": 10.0,
+              "resident_cuda": "Meets"
+            }
+          ],
+          "repeat": 1,
+          "resident_norms": {
+            "declared_grid_classifications_equal": true,
+            "downloaded_norm_bytes": 24576,
+            "host_center_bits_equal": true,
+            "measure": {
+              "blocks": [
+                {
+                  "lower": 0.2125465338840737,
+                  "lower_row": 334,
+                  "name": "attention 3",
+                  "numerical_error": 6.64146515561015e-12,
+                  "row": 334,
+                  "scale": 16.779606393542586,
+                  "upper": 0.2125465338973567,
+                  "worst": 0.2125465338907152
+                }
+              ],
+              "counterexamples": 0,
+              "family_rows": 1024,
+              "rows": 1024
+            },
+            "old_downloaded_difference_bytes": 6291456,
+            "seconds": 0.641571704,
+            "sound_interval_overlap": true
+          },
+          "shared_cuda": {
+            "complete_fresh_cuda_evidence_equal": true,
+            "measure": {
+              "blocks": [
+                {
+                  "lower": 0.2125465338840702,
+                  "lower_row": 334,
+                  "name": "attention 3",
+                  "numerical_error": 6.644990113713335e-12,
+                  "row": 334,
+                  "scale": 16.779606393542586,
+                  "upper": 0.21254653389736022,
+                  "worst": 0.2125465338907152
+                }
+              ],
+              "counterexamples": 0,
+              "family_rows": 1024,
+              "rows": 1024
+            },
+            "seconds": 0.533555017
+          }
+        }
+      ]
+    },
+    {
+      "artifact": "/mnt/nw/home/s.sauers/mpd-data/cluster/codex-native-mlp-L0-40649/bank/L0-m2-K2-Gelu-support0.artifact",
+      "artifact_sha256": "e8481d41159d945ce339cd675168d9bf8d4b5180e283a1abcb4f38f9adb9448e",
+      "label": "learned nonlinear MLP rule",
+      "pairs": [
+        {
+          "cpu": {
+            "blocks": [
+              {
+                "lower": 1.4207657128185462,
+                "lower_row": 873,
+                "name": "L0-m2-K2-Gelu-support0",
+                "numerical_error": 4.7992720908496273e-11,
+                "row": 873,
+                "scale": 5.902691471709387,
+                "upper": 1.4207657129145321,
+                "worst": 1.4207657128665392
+              }
+            ],
+            "counterexamples": 0,
+            "family_rows": 1024,
+            "rows": 1024
+          },
+          "cpu_seconds": 1.431958467,
+          "cuda": {
+            "blocks": [
+              {
+                "lower": 1.420765712818545,
+                "lower_row": 873,
+                "name": "L0-m2-K2-Gelu-support0",
+                "numerical_error": 4.7992720908496273e-11,
+                "row": 873,
+                "scale": 5.902691471709387,
+                "upper": 1.4207657129145308,
+                "worst": 1.4207657128665379
+              }
+            ],
+            "counterexamples": 0,
+            "family_rows": 1024,
+            "rows": 1024
+          },
+          "cuda_seconds": 1.222744927,
+          "differences": [
+            {
+              "absolute_worst_difference": 1.3322676295501878e-15,
+              "block": "L0-m2-K2-Gelu-support0",
+              "same_scale_bits": true,
+              "same_worst_row": true
+            }
+          ],
+          "grid": [
+            {
+              "cpu": "Violates",
+              "cuda": "Violates",
+              "delta": 0.01,
+              "resident_cuda": "Violates"
+            },
+            {
+              "cpu": "Violates",
+              "cuda": "Violates",
+              "delta": 0.05,
+              "resident_cuda": "Violates"
+            },
+            {
+              "cpu": "Violates",
+              "cuda": "Violates",
+              "delta": 0.1,
+              "resident_cuda": "Violates"
+            },
+            {
+              "cpu": "Violates",
+              "cuda": "Violates",
+              "delta": 0.2,
+              "resident_cuda": "Violates"
+            },
+            {
+              "cpu": "Violates",
+              "cuda": "Violates",
+              "delta": 0.5,
+              "resident_cuda": "Violates"
+            },
+            {
+              "cpu": "Violates",
+              "cuda": "Violates",
+              "delta": 1.0,
+              "resident_cuda": "Violates"
+            },
+            {
+              "cpu": "Meets",
+              "cuda": "Meets",
+              "delta": 2.0,
+              "resident_cuda": "Meets"
+            },
+            {
+              "cpu": "Meets",
+              "cuda": "Meets",
+              "delta": 10.0,
+              "resident_cuda": "Meets"
+            }
+          ],
+          "repeat": 0,
+          "resident_norms": {
+            "declared_grid_classifications_equal": true,
+            "downloaded_norm_bytes": 24576,
+            "host_center_bits_equal": true,
+            "measure": {
+              "blocks": [
+                {
+                  "lower": 1.4207657128185665,
+                  "lower_row": 873,
+                  "name": "L0-m2-K2-Gelu-support0",
+                  "numerical_error": 4.7971182581818545e-11,
+                  "row": 873,
+                  "scale": 5.902691471709387,
+                  "upper": 1.4207657129145093,
+                  "worst": 1.4207657128665379
+                }
+              ],
+              "counterexamples": 0,
+              "family_rows": 1024,
+              "rows": 1024
+            },
+            "old_downloaded_difference_bytes": 6291456,
+            "seconds": 0.947032146,
+            "sound_interval_overlap": true
+          },
+          "shared_cuda": {
+            "complete_fresh_cuda_evidence_equal": true,
+            "measure": {
+              "blocks": [
+                {
+                  "lower": 1.420765712818545,
+                  "lower_row": 873,
+                  "name": "L0-m2-K2-Gelu-support0",
+                  "numerical_error": 4.7992720908496273e-11,
+                  "row": 873,
+                  "scale": 5.902691471709387,
+                  "upper": 1.4207657129145308,
+                  "worst": 1.4207657128665379
+                }
+              ],
+              "counterexamples": 0,
+              "family_rows": 1024,
+              "rows": 1024
+            },
+            "seconds": 0.938073733
+          }
+        },
+        {
+          "cpu": {
+            "blocks": [
+              {
+                "lower": 1.4207657128185462,
+                "lower_row": 873,
+                "name": "L0-m2-K2-Gelu-support0",
+                "numerical_error": 4.7992720908496273e-11,
+                "row": 873,
+                "scale": 5.902691471709387,
+                "upper": 1.4207657129145321,
+                "worst": 1.4207657128665392
+              }
+            ],
+            "counterexamples": 0,
+            "family_rows": 1024,
+            "rows": 1024
+          },
+          "cpu_seconds": 0.98730252,
+          "cuda": {
+            "blocks": [
+              {
+                "lower": 1.420765712818545,
+                "lower_row": 873,
+                "name": "L0-m2-K2-Gelu-support0",
+                "numerical_error": 4.7992720908496273e-11,
+                "row": 873,
+                "scale": 5.902691471709387,
+                "upper": 1.4207657129145308,
+                "worst": 1.4207657128665379
+              }
+            ],
+            "counterexamples": 0,
+            "family_rows": 1024,
+            "rows": 1024
+          },
+          "cuda_seconds": 0.734178331,
+          "differences": [
+            {
+              "absolute_worst_difference": 1.3322676295501878e-15,
+              "block": "L0-m2-K2-Gelu-support0",
+              "same_scale_bits": true,
+              "same_worst_row": true
+            }
+          ],
+          "grid": [
+            {
+              "cpu": "Violates",
+              "cuda": "Violates",
+              "delta": 0.01,
+              "resident_cuda": "Violates"
+            },
+            {
+              "cpu": "Violates",
+              "cuda": "Violates",
+              "delta": 0.05,
+              "resident_cuda": "Violates"
+            },
+            {
+              "cpu": "Violates",
+              "cuda": "Violates",
+              "delta": 0.1,
+              "resident_cuda": "Violates"
+            },
+            {
+              "cpu": "Violates",
+              "cuda": "Violates",
+              "delta": 0.2,
+              "resident_cuda": "Violates"
+            },
+            {
+              "cpu": "Violates",
+              "cuda": "Violates",
+              "delta": 0.5,
+              "resident_cuda": "Violates"
+            },
+            {
+              "cpu": "Violates",
+              "cuda": "Violates",
+              "delta": 1.0,
+              "resident_cuda": "Violates"
+            },
+            {
+              "cpu": "Meets",
+              "cuda": "Meets",
+              "delta": 2.0,
+              "resident_cuda": "Meets"
+            },
+            {
+              "cpu": "Meets",
+              "cuda": "Meets",
+              "delta": 10.0,
+              "resident_cuda": "Meets"
+            }
+          ],
+          "repeat": 1,
+          "resident_norms": {
+            "declared_grid_classifications_equal": true,
+            "downloaded_norm_bytes": 24576,
+            "host_center_bits_equal": true,
+            "measure": {
+              "blocks": [
+                {
+                  "lower": 1.4207657128185665,
+                  "lower_row": 873,
+                  "name": "L0-m2-K2-Gelu-support0",
+                  "numerical_error": 4.7971182581818545e-11,
+                  "row": 873,
+                  "scale": 5.902691471709387,
+                  "upper": 1.4207657129145093,
+                  "worst": 1.4207657128665379
+                }
+              ],
+              "counterexamples": 0,
+              "family_rows": 1024,
+              "rows": 1024
+            },
+            "old_downloaded_difference_bytes": 6291456,
+            "seconds": 0.463312721,
+            "sound_interval_overlap": true
+          },
+          "shared_cuda": {
+            "complete_fresh_cuda_evidence_equal": true,
+            "measure": {
+              "blocks": [
+                {
+                  "lower": 1.420765712818545,
+                  "lower_row": 873,
+                  "name": "L0-m2-K2-Gelu-support0",
+                  "numerical_error": 4.7992720908496273e-11,
+                  "row": 873,
+                  "scale": 5.902691471709387,
+                  "upper": 1.4207657129145308,
+                  "worst": 1.4207657128665379
+                }
+              ],
+              "counterexamples": 0,
+              "family_rows": 1024,
+              "rows": 1024
+            },
+            "seconds": 0.469811448
+          }
+        }
+      ]
+    }
+  ],
+  "resident_norm_backend": "CUDA f64 native-parent graft and resident row norms; frozen CPU native scales",
+  "resident_norm_source_initialization_seconds": 0.793311164,
+  "retained_source_numeric_bytes": 844351488,
+  "scope": "same decoded native-parent graft; frozen CPU native scales; host/resident max-rescaled binary64 reductions compared for bitwise centers, interval overlap and declared-grid classification equality; intervals enclose native RMS denominator and final subtraction/norm only, not CPU/CUDA execution discrepancy; fixed CPU-then-CUDA-then-resident timing order",
+  "sequences": 2,
+  "source_initialization_seconds": 0.745543988,
+  "source_numeric_bytes_limit": 1073741824,
+  "source_scope": "actual f64 native model, no rounding; source never forwarded; same Arc and role only; numeric limit excludes indices/activations/workspaces/allocator/host; initialization excluded from repeated measurements; this comparison harness holds two separate native sources when sharing is enabled",
+  "trace_bytes": 2147483648
+}
