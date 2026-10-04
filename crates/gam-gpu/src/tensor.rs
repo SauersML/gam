@@ -1401,7 +1401,23 @@ impl Device {
         on: &mut Tensor,
         workspace: CodeRowsWorkspace,
     ) -> Result<(Vec<f64>, Vec<f64>, CodeRowsDiagnostics), GpuError> {
-        self.code_rows_dispatch((z, w, yfy), (gram, starts, bits), warm, (kappa, nodes, tolerance), on, Some(workspace))
+        self.code_rows_dispatch((z, w, yfy), (gram, starts, bits), warm, (kappa, nodes, tolerance), on, Some((workspace, false)))
+            .and_then(|(upper, lower, profile)| profile.map(|p| (upper, lower, p)).ok_or_else(|| shape("missing CUDA sparse-code diagnostics".to_string())))
+    }
+
+    /// Opt-in legacy proposal-coder pilot. Fuses each Q-column application into
+    /// its axpy while preserving coordinate order and separately rounded arithmetic.
+    /// The ordinary and profiled entry points keep the unfused path.
+    pub fn code_rows_profiled_fused(
+        &self,
+        products: (&Tensor, &Tensor, &Tensor),
+        structure: (&Tensor, &Indices, &Tensor),
+        warm: Option<&Tensor>,
+        settings: (f64, usize, f64),
+        on: &mut Tensor,
+        workspace: CodeRowsWorkspace,
+    ) -> Result<(Vec<f64>, Vec<f64>, CodeRowsDiagnostics), GpuError> {
+        self.code_rows_dispatch(products, structure, warm, settings, on, Some((workspace, true)))
             .and_then(|(upper, lower, profile)| profile.map(|p| (upper, lower, p)).ok_or_else(|| shape("missing CUDA sparse-code diagnostics".to_string())))
     }
 
@@ -1412,7 +1428,7 @@ impl Device {
         warm: Option<&Tensor>,
         (kappa, nodes, tolerance): (f64, usize, f64),
         on: &mut Tensor,
-        workspace: Option<CodeRowsWorkspace>,
+        workspace: Option<(CodeRowsWorkspace, bool)>,
     ) -> Result<(Vec<f64>, Vec<f64>, Option<CodeRowsDiagnostics>), GpuError> {
         let (rows, pieces) = z.dim();
         let blocks = bits.cols;
@@ -2012,7 +2028,7 @@ __device__ unsigned int coder_pick(double v, unsigned int i, int last_max, doubl
 
 struct Row {
     unsigned int C, B, W;
-    int unit;
+    int unit, fused;
     double kappa, tol, empty;
     const double* z; const double* w; const double* K; const unsigned int* starts; const double* bits;
     double *lin, *dia, *qm, *oq, *m, *col, *t, *on, *best, *inw, *key;
@@ -2066,6 +2082,46 @@ __device__ void coder_add(const Row* r, double* q, double a) {
     __syncthreads();
 }
 
+// Opt-in application without the intermediate column store/copy. The rank>1
+// summation order is unchanged. Cache publication remains block synchronized.
+__device__ void coder_apply(const Row* r, unsigned int b, double* q, double a) {
+    if (!r->fused) { coder_column(r, b); coder_add(r, q, a); return; }
+    if (r->cache && r->valid[b]) {
+        if (threadIdx.x == 0 && r->counts) r->counts[3]++;
+        for (unsigned int j = threadIdx.x; j < r->B; j += BLOCK) q[j] += a * r->cache[(u64)b * r->B + j];
+        __syncthreads();
+        return;
+    }
+    if (threadIdx.x == 0 && r->counts) r->counts[2]++;
+    if (!r->unit) {
+        unsigned int s = r->starts[b], e = r->starts[b + 1];
+        for (unsigned int j = threadIdx.x; j < r->C; j += BLOCK) {
+            double acc = 0.0;
+            for (unsigned int c = s; c < e; c++) {
+                double zc = r->z[c];
+                if (zc != 0.0) acc += zc * r->K[(u64)c * r->C + j];
+            }
+            r->t[j] = acc;
+        }
+        __syncthreads();
+    }
+    for (unsigned int j = threadIdx.x; j < r->B; j += BLOCK) {
+        double value;
+        if (r->unit) value = r->z[j] * (r->z[b] * r->K[(u64)b * r->C + j]);
+        else {
+            value = 0.0;
+            for (unsigned int c = r->starts[j]; c < r->starts[j + 1]; c++) value += r->z[c] * r->t[c];
+        }
+        if (r->cache) r->cache[(u64)b * r->B + j] = value;
+        q[j] += a * value;
+    }
+    __syncthreads();
+    if (r->cache) {
+        if (threadIdx.x == 0) r->valid[b] = 1;
+        __syncthreads();
+    }
+}
+
 // The relaxation's optimum on the box [lo, hi] from `start` into `m` (and `qm = Q m`), with
 // `known = Q start` when it is (then only the coordinates the box moves are added): its certified
 // lower bound.
@@ -2080,7 +2136,7 @@ __device__ double coder_relax(const Row* r, const double* lo, const double* hi, 
     __syncthreads();
     for (unsigned int b = 0; b < B; b++) {
         double moved = known ? r->m[b] - start[b] : r->m[b];
-        if (moved != 0.0) { coder_column(r, b); coder_add(r, r->qm, moved); }
+        if (moved != 0.0) { coder_apply(r, b, r->qm, moved); }
     }
     if (threadIdx.x == 0) {
         unsigned int n = 0;
@@ -2105,8 +2161,7 @@ __device__ double coder_relax(const Row* r, const double* lo, const double* hi, 
                 __syncthreads();
                 if (step != 0.0) {
                     if (threadIdx.x == 0) r->m[b] = next;
-                    coder_column(r, b);
-                    coder_add(r, r->qm, step);
+                    coder_apply(r, b, r->qm, step);
                     moved = fmax(moved, fabs(step));
                 }
             }
@@ -2184,7 +2239,7 @@ __device__ double coder_round(const Row* r, const double* lo, const double* hi, 
     }
     __syncthreads();
     for (unsigned int b = 0; b < B; b++) {
-        if (r->on[b] == 1.0) { coder_column(r, b); coder_add(r, r->oq, 1.0); }
+        if (r->on[b] == 1.0) { coder_apply(r, b, r->oq, 1.0); }
     }
     for (;;) {
         double bv = POS_INF;
@@ -2202,8 +2257,7 @@ __device__ double coder_round(const Row* r, const double* lo, const double* hi, 
             r->on[b] = r->on[b] == 1.0 ? 0.0 : 1.0;
             if (r->counts) r->counts[4]++;
         }
-        coder_column(r, b);
-        coder_add(r, r->oq, sign);
+        coder_apply(r, b, r->oq, sign);
     }
     double pv = 0.0, pq = 0.0;
     for (unsigned int b = threadIdx.x; b < B; b += BLOCK) {
@@ -2221,14 +2275,14 @@ __device__ void coder_copy(double* to, const double* from, unsigned int n) {
 extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned int B, unsigned int W, unsigned int nodes, unsigned int cap, int unit, int warmed,
     double kappa, double tol,
     const double* z, const double* w, const double* yfy, const double* K, const unsigned int* starts, const double* bits, const double* warm,
-    u64 slot_len, u64 index_len, u64 cache_offset, int cached, int instrumented, double* scratch, unsigned int* iscratch, u64* counts, double* on_out, double* upper_out, double* lower_out) {
+    u64 slot_len, u64 index_len, u64 cache_offset, int cached, int instrumented, int fused, double* scratch, unsigned int* iscratch, u64* counts, double* on_out, double* upper_out, double* lower_out) {
     __shared__ double sv[BLOCK];
     __shared__ unsigned int si[BLOCK];
     __shared__ unsigned int nw;
     double* base = scratch + (u64)blockIdx.x * slot_len;
     unsigned int* ibase = iscratch + (u64)blockIdx.x * index_len;
     Row r;
-    r.C = C; r.B = B; r.W = W; r.unit = unit; r.kappa = kappa; r.tol = tol;
+    r.C = C; r.B = B; r.W = W; r.unit = unit; r.fused = fused; r.kappa = kappa; r.tol = tol;
     r.K = K; r.starts = starts; r.bits = bits;
     r.lin = base; r.dia = base + B; r.qm = base + 2 * B; r.oq = base + 3 * B; r.m = base + 4 * B; r.col = base + 5 * B; r.on = base + 6 * B;
     r.best = base + 7 * B; r.inw = base + 8 * B;
@@ -2903,7 +2957,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             warm: Option<&Tensor>,
             (kappa, nodes, tolerance): (f64, usize, f64),
             on: &mut Tensor,
-            workspace: Option<CodeRowsWorkspace>,
+            workspace: Option<(CodeRowsWorkspace, bool)>,
         ) -> Result<(Vec<f64>, Vec<f64>, Option<CodeRowsDiagnostics>), GpuError> {
             let started = std::time::Instant::now();
             let (rows, pieces, blocks) = (z.rows, z.cols, bits.cols);
@@ -2917,7 +2971,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             // Per slot: 15 rows of blocks, one of pieces, the sort keys, and every open node's
             // bounds, point, its `Q m` and lower bound; indices for the working set and the sort.
             let settings = match workspace {
-                Some(w) => w,
+                Some((w, _)) => w,
                 None => {
                     let (free, _) = self.memory()?;
                     // Preserve the legacy path's at-least-one-slot allocation policy.
@@ -2929,6 +2983,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             let width = blocks.checked_next_power_of_two().ok_or_else(|| shape("sparse code width overflow".to_string()))?.max(2);
             let open = nodes.checked_add(1).ok_or_else(|| shape("sparse code node capacity overflow".to_string()))?;
             let (per_slot, per_index, slots) = (layout.doubles, layout.indices, layout.slots);
+            let fused = i32::from(workspace.is_some_and(|(_, fused)| fused));
             let cached = i32::from(settings.cache_columns);
             let instrumented = i32::from(workspace.is_some());
             let cache_offset = layout.cache_offset as u64;
@@ -2951,7 +3006,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
                     .arg(&kappa).arg(&tolerance)
                     .arg(slice(z)?).arg(slice(w)?).arg(slice(yfy)?).arg(slice(gram)?).arg(index_slice(starts)?).arg(slice(bits)?)
                     .arg(match warm { Some(m) => slice(m)?, None => &no_warm })
-                    .arg(&slot_len).arg(&index_len).arg(&cache_offset).arg(&cached).arg(&instrumented).arg(&mut scratch).arg(&mut indices).arg(&mut counters)
+                    .arg(&slot_len).arg(&index_len).arg(&cache_offset).arg(&cached).arg(&instrumented).arg(&fused).arg(&mut scratch).arg(&mut indices).arg(&mut counters)
                     .arg(slice_mut(on)?).arg(&mut upper).arg(&mut lower)
                     .launch(cfg)
             }

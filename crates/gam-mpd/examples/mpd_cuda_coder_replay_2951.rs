@@ -28,14 +28,48 @@ fn source_hash(text: &str) -> Result<String, String> {
     Ok(hash.into())
 }
 
+// CPU-only summary of interrupted runs: only complete frozen AB/BA pairs enter
+// aggregate timing statistics; every unpaired measurement remains explicit.
+fn summarize(path: &Path, expected_pairs: usize) -> Result<(), String> {
+    let mut trials = BTreeMap::<u64, [Option<f64>; 2]>::new();
+    for line in std::fs::read_to_string(path).map_err(|e| e.to_string())?.lines() {
+        let value: serde_json::Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
+        if value["kind"] != "measured" { continue; }
+        if value["bitwise_reference_equal"] != true { return Err("non-equivalent measured output".into()); }
+        let trial = value["trial"].as_u64().ok_or("missing trial")?;
+        let cached = value["cached"].as_bool().ok_or("missing cached flag")?;
+        let seconds = value["seconds"].as_f64().ok_or("missing time")?;
+        if !seconds.is_finite() || seconds <= 0.0 { return Err("invalid time".into()); }
+        if trials.entry(trial).or_insert([None, None])[usize::from(cached)].replace(seconds).is_some() { return Err("duplicate measured variant".into()); }
+    }
+    let mut complete = [Vec::new(), Vec::new()];
+    let mut incomplete = Vec::new();
+    for (trial, pair) in &trials {
+        match pair { [Some(a), Some(b)] => { complete[0].push(*a); complete[1].push(*b); }, _ => incomplete.push(json!({"trial":trial,"seconds":pair})) }
+    }
+    let count = complete[0].len();
+    if count > expected_pairs { return Err("more pairs than frozen protocol".into()); }
+    let samples: Vec<_> = complete.iter_mut().enumerate().map(|(i, s)| {
+        s.sort_by(f64::total_cmp);
+        let median = if s.is_empty() { None } else if s.len()%2==0 { Some((s[s.len()/2-1]+s[s.len()/2])/2.0) } else { Some(s[s.len()/2]) };
+        json!({"cached":i==1,"samples_sorted":s,"median":median,"min":s.first(),"max":s.last()})
+    }).collect();
+    println!("{}", json!({"kind":"paired_partial_summary","expected_pairs":expected_pairs,"complete_pairs":count,"incomplete_pairs":incomplete,"samples":samples,"scope":"original cache comparison; complete measured pairs only; no full256 throughput claim"}));
+    Ok(())
+}
+
 fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).ok_or("capture TRAIN OUT SITE; replay FIXTURE [KEY=VALUE]")?;
+    if mode == "summarize" {
+        if args.len() != 4 { return Err("summarize JSONL FROZEN_PAIR_COUNT".into()); }
+        return summarize(Path::new(&args[2]), args[3].parse().map_err(|e| format!("pair count: {e}"))?);
+    }
     let offset = match mode.as_str() { "capture" => 5, "replay" => 3, _ => return Err("expected capture/replay".into()) };
     if args.len() < offset { return Err("missing positional arguments".into()); }
     let mut keys = BTreeMap::new();
-    let allowed = if mode == "capture" { vec!["sequences", "context", "draws", "n", "seed"] } else { vec!["rows", "scratch_MiB", "slots", "pairs"] };
+    let allowed = if mode == "capture" { vec!["sequences", "context", "draws", "n", "seed"] } else { vec!["rows", "scratch_MiB", "slots", "pairs", "comparison", "cache"] };
     for argument in &args[offset..] {
         let (k, v) = argument.split_once('=').ok_or("expected KEY=VALUE")?;
         if !allowed.contains(&k) || keys.insert(k, v).is_some() { return Err(format!("unknown/duplicate {k}")); }
@@ -97,8 +131,13 @@ fn main() -> Result<(), String> {
     let (rows, slots, pairs) = (count("rows", 8)?, count("slots", 4)?, count("pairs", 6)?);
     let bytes = count("scratch_MiB", 512)?.checked_mul(1 << 20).ok_or("scratch overflow")?;
     if rows == 0 || rows > fixture.products.z.nrows() || slots == 0 || pairs == 0 { return Err("invalid replay bounds".into()); }
+    let comparison = keys.get("comparison").copied().unwrap_or("cache");
+    if comparison != "cache" && comparison != "fusion" { return Err("comparison must be cache or fusion".into()); }
+    let fixed_cache = count("cache", 0)?;
+    if fixed_cache > 1 || (comparison == "cache" && keys.contains_key("cache")) { return Err("cache=0|1 applies only to fusion comparison".into()); }
+    let variants = if comparison == "fusion" { [(fixed_cache == 1, false), (fixed_cache == 1, true)] } else { [(false, false), (true, false)] };
     let columns = fixture.products.z.ncols(); let blocks = fixture.bits.len();
-    for cached in [false, true] {
+    for (cached, _) in variants {
         let plan = CodeRowsWorkspace { bytes, max_rows: slots, cache_columns: cached }.plan(rows, columns, blocks, fixture.nodes).map_err(|e| e.to_string())?;
         if plan.slots != slots.min(rows) { return Err("workspace budget cannot provide equal requested slots for both variants".into()); }
         eprintln!("replay fixed plan cached={cached}: {} slots, {} scratch bytes", plan.slots, plan.bytes);
@@ -117,27 +156,33 @@ fn main() -> Result<(), String> {
     let reference = device.download(&reference_on).map_err(|e| e.to_string())?;
     let mut samples = [Vec::new(), Vec::new()];
     for trial in 0..(2 + pairs) {
-        for cached in if trial % 2 == 0 { [false, true] } else { [true, false] } {
+        for variant in if trial % 2 == 0 { [0, 1] } else { [1, 0] } {
+            let (cached, fused) = variants[variant];
             let mut on = device.zeros(rows, blocks).map_err(|e| e.to_string())?;
-            eprintln!("replay {} trial={trial} cached={cached} start", if trial < 2 { "warmup" } else { "measured" });
-            let (upper, lower, diagnostics) = device.code_rows_profiled((&z, &weights, &yfy), (&gram, &starts, &bits), warm.as_ref(), settings, &mut on,
-                CodeRowsWorkspace { bytes, max_rows: slots, cache_columns: cached }).map_err(|e| e.to_string())?;
+            eprintln!("replay {} trial={trial} cached={cached} fused={fused} start", if trial < 2 { "warmup" } else { "measured" });
+            let workspace = CodeRowsWorkspace { bytes, max_rows: slots, cache_columns: cached };
+            let result = if fused {
+                device.code_rows_profiled_fused((&z, &weights, &yfy), (&gram, &starts, &bits), warm.as_ref(), settings, &mut on, workspace)
+            } else {
+                device.code_rows_profiled((&z, &weights, &yfy), (&gram, &starts, &bits), warm.as_ref(), settings, &mut on, workspace)
+            };
+            let (upper, lower, diagnostics) = result.map_err(|e| e.to_string())?;
             let actual = device.download(&on).map_err(|e| e.to_string())?;
             if actual.iter().map(|v| v.to_bits()).ne(reference.iter().map(|v| v.to_bits())) || upper.iter().map(|v| v.to_bits()).ne(reference_upper.iter().map(|v| v.to_bits()))
                 || lower.iter().map(|v| v.to_bits()).ne(reference_lower.iter().map(|v| v.to_bits())) { return Err(format!("bitwise parity failed trial={trial} cached={cached}")); }
             if upper.iter().chain(&lower).any(|v| !v.is_finite()) || upper.iter().zip(&lower).any(|(u,l)| l > u) { return Err("invalid output bounds".into()); }
             let counts = diagnostics.rows.iter().fold([0u64;7], |mut sum,c| { for(i,v) in [c.relaxations,c.sweeps,c.column_computations,c.column_cache_hits,c.rounding_flips,c.explored_nodes,c.sweep_limit_hits].iter().enumerate() { sum[i] += v; } sum });
             let seconds = diagnostics.elapsed.as_secs_f64();
-            if trial >= 2 { samples[usize::from(cached)].push(seconds); }
+            if trial >= 2 { samples[variant].push(seconds); }
             let gaps: Vec<f64> = upper.iter().zip(&lower).map(|(u,l)|u-l).collect();
-            println!("{}", json!({"kind":if trial<2 {"warmup"} else {"measured"},"trial":trial,"cached":cached,"seconds":seconds,"bitwise_reference_equal":true,
+            println!("{}", json!({"kind":if trial<2 {"warmup"} else {"measured"},"trial":trial,"cached":cached,"fused":fused,"seconds":seconds,"bitwise_reference_equal":true,
                 "rows":rows,"columns":columns,"blocks":blocks,"nodes":fixture.nodes,"kappa_bits":fixture.kappa.to_bits(),"tolerance_bits":fixture.tolerance.to_bits(),"warm":fixture.warm.is_some(),
                 "workspace_bytes":diagnostics.workspace_bytes,"slots":diagnostics.concurrent_rows,"counts":counts,"absolute_gaps":gaps}));
         }
     }
-    let summaries: Vec<_> = samples.iter_mut().enumerate().map(|(i,s)| { s.sort_by(f64::total_cmp); json!({"cached":i==1,"samples_sorted":s,"median":if s.len()%2==0 {(s[s.len()/2-1]+s[s.len()/2])/2.0} else {s[s.len()/2]},"min":s[0],"max":s[s.len()-1]}) }).collect();
+    let summaries: Vec<_> = samples.iter_mut().enumerate().map(|(i,s)| { s.sort_by(f64::total_cmp); json!({"cached":variants[i].0,"fused":variants[i].1,"samples_sorted":s,"median":if s.len()%2==0 {(s[s.len()/2-1]+s[s.len()/2])/2.0} else {s[s.len()/2]},"min":s[0],"max":s[s.len()-1]}) }).collect();
     println!("{}",json!({"kind":"summary","device":device.name(),"fixture_manifest_sha256":sha256(&Path::new(&args[2]).join("MANIFEST.json"))?,"fixture_provenance":manifest["provenance"],
-        "rows_scope":"explicit prefix of actual full captured rows; no full256 throughput claim","rows":rows,"pairs":pairs,"scratch_budget_bytes":bytes,"slots":slots,
+        "rows_scope":"explicit prefix of actual full captured rows; no full256 throughput claim","rows":rows,"pairs":pairs,"comparison":comparison,"scratch_budget_bytes":bytes,"slots":slots,
         "timing_scope":"synchronous call incl scratch allocation, launch, result download; excludes extra mask-download parity check; not kernel time","samples":summaries}));
     Ok(())
 }
