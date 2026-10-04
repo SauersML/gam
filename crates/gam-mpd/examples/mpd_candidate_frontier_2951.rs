@@ -119,6 +119,7 @@ fn main() -> Result<(), String> {
         "groups",
         "backend",
         "cuda_trace_bytes",
+        "local_kl",
     ];
     if let Some(k) = keys.keys().find(|k| !allowed.contains(&k.as_str())) {
         return Err(format!("unknown option {k}"));
@@ -269,6 +270,10 @@ fn main() -> Result<(), String> {
     let evaluated = frontier(&local, &run, candidates, &constraints, budget)?;
     let frontier_seconds = timer.elapsed().as_secs_f64();
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+    let local_kl_enabled = match key("local_kl", "0").as_str() {
+        "0" => false, "1" => true, _ => return Err("local_kl must be 0 or 1".into()),
+    };
+    let mut isolated_replays = BTreeMap::new();
     let mut details = Vec::new();
     let mut replay_cache = CostCache::default();
     let mut replayed: BTreeMap<usize, (PathBuf, usize, String, Assessment)> = BTreeMap::new();
@@ -280,6 +285,9 @@ fn main() -> Result<(), String> {
                 let bytes = candidate.artifact.to_bytes()?;
                 let decoded = Artifact::from_bytes(&bytes, &native.declarations)?;
                 let measured = assess_once(&local, &run, &decoded, point.constraint, &mut replay_cache)?;
+                if local_kl_enabled {
+                    isolated_replays.insert(index, gam_mpd::local_kl::isolated_downstream_kl(&native, &decoded, &local_family, batch)?);
+                }
                 let path = out.join(format!("artifact.{index}.bin"));
                 std::fs::write(&path, &bytes).map_err(|e| format!("{}: {e}", path.display()))?;
                 let hash = sha256(&path)?;
@@ -307,6 +315,8 @@ fn main() -> Result<(), String> {
         "execution": {"backend": run.backend_name(), "local": "CPU f64", "teacher": "immutable cached CPU residuals and native effects", "readout_and_KL": "CPU f64", "cuda_episode_parallelism": 1, "teacher_parallelism": parallel, "teacher_cache_memory": "one final residual matrix per episode plus scalar native effects; initialization also retains clean native passage traces and requested donor rows",
             "cuda_trace_limit_scope": "intermediate activation estimate only; excludes operators, attention workspaces, edit masks and allocator overhead",
             "cuda_upload_scope": "one base per candidate; episode/donor forks share unchanged operator tensors by Arc identity and role; requested donor rows downloaded then reuploaded for mixes"},
+        "isolated_kl_diagnostic": {"enabled": local_kl_enabled, "backend": "CPU f64", "scope": "selected saved-byte artifacts only; one block on native parents, then native downstream; comparison error excludes neural-forward arithmetic; no acceptance threshold"},
+        "local_definition": "maximum tested per-row Euclidean write error divided by RMS native-write row norm over declared family",
         "scope": "explicit finite candidate bank; tested local inputs and declared counterfactual episodes only",
         "objective": "min C(P) subject to D_local <= delta and D_run <= epsilon",
         "optimality": "gap zero proves optimum within this bank only; unresolved, failed and unevaluated candidates remain in the lower bound",
@@ -326,6 +336,7 @@ fn main() -> Result<(), String> {
         "ascent_evaluations_per_step": ascent_evaluations, "run_rows": spec.rows, "episodes": spec.episodes.len(), "groups": spec.episodes.iter().map(|e| e.group.clone()).collect::<BTreeSet<_>>(),
         "selected_replays": replayed.iter().map(|(index, (path, byte_count, hash, measured))| json!({
             "index": index, "artifact": path.display().to_string(), "bytes": byte_count, "sha256": hash, "cost": measured.cost,
+            "isolated_downstream_kl": isolated_replays.get(index),
             "local_measure": measured.local_measure, "run_measure": measured.run_measure,
             "local_bounds": {"lower": measured.local.status().lower_bound(), "upper": measured.local.status().upper_bound()},
             "run_bounds": {"lower": measured.run.status().lower_bound(), "upper": measured.run.status().upper_bound()}

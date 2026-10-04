@@ -250,3 +250,6 @@ mod site_fit_tests;
 
 #[cfg(test)]
 mod gates_tests;
+
+// Isolated replacement writes followed by the unchanged native downstream program.
+pub mod local_kl;

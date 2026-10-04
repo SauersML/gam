@@ -937,6 +937,22 @@ impl Artifact {
 
     /// Local blocks with executable exceptions, excluding clamped native reads.
     pub fn local_artifact(&self, model: &OperatorProgram) -> Result<(Self, Vec<std::ops::Range<usize>>), String> {
+        let (artifact, columns, _) = self.local_artifact_with_writes(model)?;
+        Ok((artifact, columns))
+    }
+
+    /// One replacement evaluated on its declared native parent states. The second
+    /// result is its direct write node in the grafted artifact, before subtraction
+    /// of the native write; internal/write exceptions execute, clamped-read ones do not.
+    pub fn local_block_artifact(&self, model: &OperatorProgram, block: usize) -> Result<(Self, usize), String> {
+        let binding = self.blocks.get(block).ok_or("local block index outside artifact")?;
+        let mut one = self.clone();
+        one.blocks = vec![binding.clone()];
+        let (artifact, _, writes) = one.local_artifact_with_writes(model)?;
+        Ok((artifact, writes[0]))
+    }
+
+    fn local_artifact_with_writes(&self, model: &OperatorProgram) -> Result<(Self, Vec<std::ops::Range<usize>>, Vec<usize>), String> {
         if model.nodes.len() != self.native_nodes || model.declarations != self.program.declarations {
             return Err("the artifact is not of this model".to_string());
         }
@@ -961,6 +977,7 @@ impl Artifact {
         }
         let precision = exact_precision([-1.0]).map_err(|e| e.to_string())?;
         let mut differences = Vec::new();
+        let mut writes = Vec::new();
         let mut exceptions = Vec::new();
         for binding in &self.blocks {
             // The cone of the write, bounded by the reads.
@@ -1000,6 +1017,7 @@ impl Artifact {
             }
             let interfaces = out.interfaces().map_err(|e| e.to_string())?;
             let (mine, theirs) = (node_map[binding.write], binding.native_write);
+            writes.push(mine);
             let interface: Interface = interfaces[theirs].clone();
             if interfaces[mine] != interface {
                 return Err(format!(
@@ -1034,12 +1052,15 @@ impl Artifact {
             out.nodes.len() - 1
         };
         let (live, _) = compact(&mut out, &[]);
+        for write in &mut writes {
+            *write = live[*write];
+        }
         for exception in &mut exceptions {
             exception.node = live[exception.node];
         }
         exceptions.retain(|e| e.node != usize::MAX);
         out.interfaces().map_err(|e| e.to_string())?;
-        Ok((Self { program: out, native_nodes: self.native_nodes, blocks: Vec::new(), places: Vec::new(), exceptions, derived: Vec::new() }, columns))
+        Ok((Self { program: out, native_nodes: self.native_nodes, blocks: Vec::new(), places: Vec::new(), exceptions, derived: Vec::new() }, columns, writes))
     }
 
     /// Numeric-free blocks, places, exceptions and derivation structure, excluding
