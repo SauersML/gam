@@ -89,7 +89,7 @@ fn difference(a: &Array2<f64>, b: &Array2<f64>) -> Result<f64,String> {
 }
 fn run() -> Result<(),String> {
     let device=Device::accelerator(GpuPolicy::Required)?.ok_or("required accelerator absent")?;
-    if !device.float64() || !device.name().to_lowercase().contains("cuda") { return Err(format!("required CUDA f64, got {}",device.name())); }
+    if !cfg!(target_os = "linux") || device.is_host() || !device.float64() { return Err(format!("required CUDA f64, got {}",device.name())); }
     let mut p=model(0.6,0.1);
     p.rules[0].nodes.push(Node::Gain{input:2,coefficient:gam_mpd::operator_program::Coefficient::Number(-0.75)});
     p.rules[0].output=3;
