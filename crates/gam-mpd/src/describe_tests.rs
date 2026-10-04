@@ -121,3 +121,34 @@ fn a_block_that_barely_moved_is_recoded_in_its_family() {
     assert_eq!(again.reals, first.reals);
     assert!((again.total() - first.total()).abs() < 1.0, "{} against {}", again.total(), first.total());
 }
+
+#[test]
+fn a_block_too_light_to_say_is_left_as_error() {
+    use super::describe::Geometry;
+    // A map whose whole error costs less than its reals: at n = 10⁴ in a unit metric, entries of
+    // 10⁻⁴ leave about n‖W‖²/(2 ln 2) ≈ 10⁻³ bits as error against tens of bits for any family.
+    let (d_out, d_in) = (7, 6);
+    let (u, v) = (&random(1, d_out, 14) * 1e-2, &random(1, d_in, 15) * 1e-2);
+    let geometry = Geometry::new(metric(d_out, d_in), Vec::new(), Vec::new()).expect("geometry");
+    let d = geometry.describe(u.view(), v.view()).expect("a description");
+    assert_eq!(d.reals, 0);
+    assert!(d.choice.is_none());
+}
+
+#[test]
+fn a_block_its_rule_predicts_costs_the_scale() {
+    use super::describe::Geometry;
+    // The block is 3/4 of a prediction the decoder holds: its predicted description sends the scale
+    // and leaves no residual worth a real, against the block's own rank's reals alone.
+    let (d_out, d_in, k) = (7, 6, 2);
+    let (pu, pv) = (random(k, d_out, 16), random(k, d_in, 17));
+    let u = &pu * 0.75;
+    let geometry = Geometry::new(metric(d_out, d_in), Vec::new(), Vec::new()).expect("geometry");
+    let alone = geometry.describe(u.view(), pv.view()).expect("a description");
+    let predicted = geometry.describe_predicted(u.view(), pv.view(), pu.view(), pv.view()).expect("a predicted description");
+    assert!((predicted.scale - 0.75).abs() < 1e-3, "scale {}", predicted.scale);
+    assert_eq!(predicted.residual.reals, 0);
+    assert!(predicted.total() < alone.total() / 4.0, "{} against {}", predicted.total(), alone.total());
+    let (du, dv) = predicted.decoded().expect("decoded");
+    assert!(relative(&decoded(&du, &dv), &decoded(&u, &pv)) < 1e-2);
+}
