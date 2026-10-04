@@ -689,7 +689,7 @@ fn apply_device_node_edits<'a>(
 
 #[path = "resident_language_run.rs"]
 mod resident_language;
-pub use resident_language::{PreparedResidentCandidate, ResidentBudget, ResidentEpisode, ResidentMeasure, ResidentLanguageRun};
+pub use resident_language::{PreparedResidentCandidate, ResidentBudget, ResidentEpisode, ResidentMeasure, ResidentLanguageRun, ResidentTelemetry};
 type EpisodePlan = (Artifact, Vec<usize>, BTreeMap<usize, Vec<NodeEdit>>, usize);
 type WantedDonors = BTreeMap<usize, Vec<DonorKey>>;
 

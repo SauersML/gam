@@ -874,13 +874,40 @@ impl RunCheck for PreparedResidentCandidate<'_, '_, '_> {
 pub struct ResidentLanguageRun<'r, 'a> {
     run: &'r LanguageRun<'a>,
     budget: ResidentBudget,
+    telemetry: std::sync::Mutex<ResidentTelemetry>,
 }
 impl<'a> LanguageRun<'a> {
     pub fn resident_run(&self, budget: ResidentBudget) -> ResidentLanguageRun<'_, 'a> {
-        ResidentLanguageRun { run: self, budget }
+        ResidentLanguageRun {
+            run: self,
+            budget,
+            telemetry: std::sync::Mutex::new(ResidentTelemetry::default()),
+        }
     }
 }
+#[derive(Clone, Default, serde::Serialize)]
+pub struct ResidentTelemetry {
+    pub calls: usize,
+    pub completed: usize,
+    pub errors: usize,
+    pub preparation_seconds: f64,
+    pub teacher_initialization_seconds: f64,
+    pub measure_wall_seconds: f64,
+    pub transfers: Transfers,
+    pub metric_timing: Timing,
+    pub latest_teacher_numeric_bytes: usize,
+    pub latest_prepared_edit_numeric_bytes: usize,
+    pub latest_head_numeric_resident_bytes: usize,
+    pub latest_metric_workspace_bytes: usize,
+}
 impl ResidentLanguageRun<'_, '_> {
+    pub fn telemetry(&self) -> Result<ResidentTelemetry, String> {
+        Ok(self
+            .telemetry
+            .lock()
+            .map_err(|_| "resident telemetry lock poisoned")?
+            .clone())
+    }
     pub fn backend_name(&self) -> &'static str {
         "CUDA f64 teacher/candidate/head; analytic fixed-raw-logit intervals; device reference/donor cache"
     }
@@ -890,8 +917,54 @@ impl RunCheck for ResidentLanguageRun<'_, '_> {
         Ok(self.measure(artifact)?.episodes)
     }
     fn measure(&self, artifact: &Artifact) -> Result<crate::acceptance::RunMeasure, String> {
-        let prepared = self.run.prepare_resident_candidate(artifact, self.budget)?;
-        run_measure(&prepared.measure_resident(false)?)
+        let result = (|| {
+            let prepared = self.run.prepare_resident_candidate(artifact, self.budget)?;
+            let report = prepared.measure_resident(false)?;
+            let measure = run_measure(&report)?;
+            Ok::<_, String>((measure, report))
+        })();
+        let mut telemetry = self
+            .telemetry
+            .lock()
+            .map_err(|_| "resident telemetry lock poisoned")?;
+        telemetry.calls += 1;
+        match result {
+            Ok((measure, report)) => {
+                telemetry.completed += 1;
+                telemetry.preparation_seconds += report.preparation_seconds;
+                telemetry.teacher_initialization_seconds += report.teacher_initialization_seconds;
+                telemetry.measure_wall_seconds += report.wall_seconds;
+                telemetry.transfers.edit_constant_upload_bytes +=
+                    report.transfers.edit_constant_upload_bytes
+                        + report.candidate_preparation_upload_bytes;
+                telemetry.transfers.residual_upload_bytes += report.transfers.residual_upload_bytes;
+                telemetry.transfers.raw_oracle_download_bytes +=
+                    report.transfers.raw_oracle_download_bytes;
+                telemetry.transfers.final_residual_download_bytes +=
+                    report.transfers.final_residual_download_bytes;
+                telemetry.transfers.donor_download_bytes += report.transfers.donor_download_bytes;
+                for episode in &report.episodes {
+                    let t = &episode.metric_timing;
+                    let total = &mut telemetry.metric_timing;
+                    total.packing_and_upload_seconds += t.packing_and_upload_seconds;
+                    total.checked_metric_seconds += t.checked_metric_seconds;
+                    total.cpu_reference_seconds += t.cpu_reference_seconds;
+                    total.cpu_top1_seconds += t.cpu_top1_seconds;
+                    total.resident_head_seconds += t.resident_head_seconds;
+                    total.gpu_top1_seconds += t.gpu_top1_seconds;
+                    total.raw_oracle_download_seconds += t.raw_oracle_download_seconds;
+                }
+                telemetry.latest_teacher_numeric_bytes = report.teacher_numeric_bytes;
+                telemetry.latest_prepared_edit_numeric_bytes = report.prepared_edit_numeric_bytes;
+                telemetry.latest_head_numeric_resident_bytes = report.head_numeric_resident_bytes;
+                telemetry.latest_metric_workspace_bytes = report.metric_numeric_workspace_bytes;
+                Ok(measure)
+            }
+            Err(error) => {
+                telemetry.errors += 1;
+                Err(error)
+            }
+        }
     }
 }
 
