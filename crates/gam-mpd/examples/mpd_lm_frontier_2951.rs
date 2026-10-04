@@ -1,6 +1,7 @@
 //! Generic complete imported LM frontier; no specialized Decoder or proposal translation.
 //! EXPORT SPEC.json OUT.json. Candidates use Artifact::to_bytes format.
 use gam_gpu::{GpuPolicy, tensor::Device};
+use gam_mpd::decoded_intern::DecodedOperatorInterner;
 use gam_mpd::device_family_run::DeviceFamilyRun;
 use gam_mpd::{
     acceptance::{Change, Constraint, Edit, Episode, FamilyRun, Local, RunCheck},
@@ -162,9 +163,13 @@ fn main() -> Result<(), String> {
         readouts: 1,
         episodes,
     };
+    let native_artifact = Artifact::native(&model)?.f32_literals()?;
+    let decoded_native = Artifact::from_bytes(&native_artifact.to_bytes()?, &model.declarations)?;
+    drop(native_artifact);
+    let interner = DecodedOperatorInterner::new(&decoded_native)?;
     let mut bank = vec![Candidate {
         label: "native".into(),
-        artifact: Artifact::native(&model)?.f32_literals()?,
+        artifact: decoded_native,
     }];
     let mut labels = std::collections::BTreeSet::from(["native".to_string()]);
     for c in spec.candidates {
@@ -177,9 +182,15 @@ fn main() -> Result<(), String> {
             spec_path.parent().unwrap_or(Path::new(".")).join(c.path)
         };
         let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-        let artifact = Artifact::from_bytes(&bytes, &model.declarations)?;
+        let mut artifact = Artifact::from_bytes(&bytes, &model.declarations)?;
         drop(bytes);
         artifact.validate_coverage(&model)?;
+        let shared = interner.intern(&mut artifact);
+        eprintln!(
+            "loaded {}: {shared}/{} operators shared with decoded native",
+            c.label,
+            artifact.program.operators.len()
+        );
         bank.push(Candidate {
             label: c.label,
             artifact,

@@ -260,3 +260,6 @@ pub mod native_mlp;
 
 // Measured-family necessary affine output-rank floors (proposal diagnostics).
 pub mod native_mlp_rank;
+
+// Exact decoded native parameter sharing across compacted candidate graphs.
+pub mod decoded_intern;

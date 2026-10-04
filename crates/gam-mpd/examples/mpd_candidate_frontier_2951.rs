@@ -19,6 +19,7 @@ use gam_mpd::artifact::Artifact;
 use gam_mpd::candidate_frontier::{Candidate, account_bank, frontier};
 use gam_mpd::counterfactual::{Decoder, Spec, passages};
 use gam_mpd::import::import_language_model;
+use gam_mpd::decoded_intern::DecodedOperatorInterner;
 use gam_mpd::operator_program::{FamilyInputs, SequenceLayout, SlotValues};
 use gam_mpd::proposals::AccountProposer;
 use gam_mpd::run_check::{LanguageRun, layer_nodes, split_sites};
@@ -194,11 +195,12 @@ fn main() -> Result<(), String> {
         Some(Ascent { domain: vec![SlotDomain::Tokens((0..vocab).collect())], pool: Vec::new(), evaluations: ascent_evaluations })
     };
     let local = Local::new(&native, local_family.clone(), ascent, batch);
-    // Compare decoded operators to decoded operators: diagnostic names/provenance
-    // are not all retained by the codec, so imported metadata would defeat exact
-    // equality and leave one independent full model allocation per bank entry.
+    // Decode the native source once: exact interface/body interning then shares
+    // unchanged tensors across index compaction, ignoring disposable decoder labels.
     let native_artifact = Artifact::native(&native)?.f32_literals()?;
     let start = Artifact::from_bytes(&native_artifact.to_bytes()?, &native.declarations)?;
+    drop(native_artifact);
+    let interner = DecodedOperatorInterner::new(&start)?;
     let mut candidates = vec![Candidate { label: "native".into(), artifact: start.clone() }];
     let mut labels = BTreeSet::from(["native".to_string()]);
     let bank_dir = bank_path.parent().unwrap_or(Path::new("."));
@@ -209,16 +211,8 @@ fn main() -> Result<(), String> {
         let path = resolve(bank_dir, &entry.artifact);
         let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut artifact = Artifact::from_bytes(&bytes, &native.declarations)?;
-        // Decoding separate files need not retain separate copies of unchanged
-        // native tensors. Full equality includes values and metadata; matching an
-        // index alone never licenses reuse, and changed operators remain owned.
-        let mut shared = 0;
-        for (operator, base) in artifact.program.operators.iter_mut().zip(&start.program.operators) {
-            if operator.as_ref() == base.as_ref() {
-                *operator = base.clone();
-                shared += 1;
-            }
-        }
+        drop(bytes);
+        let shared = interner.intern(&mut artifact);
         eprintln!("loaded {}: {shared}/{} operators shared with decoded native", entry.label, artifact.program.operators.len());
         candidates.push(Candidate { label: entry.label, artifact });
         input_paths.insert(path);
