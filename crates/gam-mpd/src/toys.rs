@@ -80,6 +80,8 @@ pub enum Edit {
     Input(Vec<f64>),
     Scale { place: Place, factor: f64 },
     Patch { place: Place, donor: Vec<f64> },
+    /// The span of `directions` (rows, the place's width) removed from the value at `place`.
+    Project { place: Place, directions: Array2<f64> },
 }
 
 /// A counterfactual question: logits are readouts × classes.
@@ -225,8 +227,8 @@ impl Layout {
     }
 }
 
-/// An edit resolved to a program node: its rows and coordinates (all when none) scaled, or set to
-/// a donor's values (rows × width).
+/// An edit resolved to a program node: its rows and coordinates (all when none) scaled, set to a
+/// donor's values (rows × width), or with an orthonormal set of directions (rows) projected out.
 #[derive(Clone, Debug)]
 pub struct Resolved {
     pub node: usize,
@@ -239,6 +241,27 @@ pub struct Resolved {
 pub enum Action {
     Scale(f64),
     Set(Array2<f64>),
+    Remove(Array2<f64>),
+}
+
+/// An orthonormal basis (rows) of the span of `directions`' rows (modified Gram–Schmidt; a row in
+/// the span of the earlier ones adds nothing).
+fn orthonormal(directions: &Array2<f64>) -> Array2<f64> {
+    let mut basis: Vec<Array1<f64>> = Vec::new();
+    let largest = directions.outer_iter().map(|r| r.dot(&r).sqrt()).fold(0.0_f64, f64::max);
+    for row in directions.outer_iter() {
+        let mut v = row.to_owned();
+        for q in &basis {
+            let along = v.dot(q);
+            v.scaled_add(-along, q);
+        }
+        let norm = v.dot(&v).sqrt();
+        if norm > f64::EPSILON * largest * directions.ncols() as f64 {
+            basis.push(v / norm);
+        }
+    }
+    let width = directions.ncols();
+    Array2::from_shape_fn((basis.len(), width), |(i, j)| basis[i][j])
 }
 
 fn apply(value: &mut Array2<f64>, edit: &Resolved) -> Result<(), String> {
@@ -252,11 +275,24 @@ fn apply(value: &mut Array2<f64>, edit: &Resolved) -> Result<(), String> {
     {
         return Err(format!("a donor of {:?} for a node of {:?}", donor.dim(), value.dim()));
     }
+    if let Action::Remove(basis) = &edit.action {
+        if basis.ncols() != value.ncols() || edit.coords.is_some() {
+            return Err(format!("{} directions of width {} for a {}-wide node", basis.nrows(), basis.ncols(), value.ncols()));
+        }
+        for &r in &rows {
+            for q in basis.outer_iter() {
+                let along = value.row(r).dot(&q);
+                value.row_mut(r).scaled_add(-along, &q);
+            }
+        }
+        return Ok(());
+    }
     for &r in &rows {
         for &c in &columns {
             value[[r, c]] = match &edit.action {
                 Action::Scale(factor) => value[[r, c]] * factor,
                 Action::Set(donor) => donor[[r, c]],
+                Action::Remove(..) => value[[r, c]],
             };
         }
     }
@@ -425,6 +461,7 @@ fn edit_of(value: &Value) -> Result<Edit, String> {
         Some("input") => Ok(Edit::Input(floats(&value["input"])?)),
         Some("scale") => Ok(Edit::Scale { place: place_of(&value["place"])?, factor: value["factor"].as_f64().ok_or("a scale without a factor")? }),
         Some("patch") => Ok(Edit::Patch { place: place_of(&value["place"])?, donor: floats(&value["donor"])? }),
+        Some("project") => Ok(Edit::Project { place: place_of(&value["place"])?, directions: matrix_of(&value["directions"])? }),
         other => Err(format!("unknown edit {other:?}")),
     }
 }
@@ -570,11 +607,13 @@ impl Case {
                     let node = runner.node(self.layout.node(place)?);
                     (place, Action::Set(runner.run(&self.family(&[donor.as_slice()])?, &[])?.values[node].clone()))
                 }
+                Edit::Project { place, directions } => (place, Action::Remove(orthonormal(directions))),
             };
             if place.position.is_some() && !self.per_position() {
                 return Err(format!("{place:?}: a position in a model without positions"));
             }
-            let coords = if place.kind == Kind::Mlp { place.units.clone() } else { None };
+            // A projection acts on the whole value; a unit list selects coordinates otherwise.
+            let coords = if place.kind == Kind::Mlp && !matches!(action, Action::Remove(..)) { place.units.clone() } else { None };
             resolved.push(Resolved { node: runner.node(self.layout.node(place)?), rows: place.position.map(|p| vec![p]), coords, action });
         }
         Ok(resolved)
@@ -715,6 +754,75 @@ pub fn score(questions: &[&Question], outcomes: &BTreeMap<String, Array2<f64>>, 
     s.argmax = agree / readouts.max(1.0);
     s.changed_argmax = if s.changed > 0 { changed_agree / s.changed as f64 } else { f64::NAN };
     Ok(s)
+}
+
+/// The claims of a CHIVE evaluation (Karvonen et al., arXiv 2608.16747) on a set of questions, with
+/// its template and thresholds: per question and readout the behaviour is the clean argmax token,
+/// its rate the probability the model gives it, and the claim "this edit changes the behavior rate
+/// by ≥ 30 pp" is true when the edit moved the rate by at least 50 pp and false when by at most
+/// 15 pp (an edit in between makes no claim). A predictor's confidence in a claim is the change it
+/// predicts, `|q(token) − p_clean(token)|`; its score is the AUROC over the claims.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct Claims {
+    pub true_claims: usize,
+    pub false_claims: usize,
+    pub auroc: f64,
+}
+
+fn rate(logits: ndarray::ArrayView1<f64>, token: usize) -> f64 {
+    let top = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let total: f64 = logits.iter().map(|v| (v - top).exp()).sum();
+    (logits[token] - top).exp() / total
+}
+
+/// `predictions`' CHIVE claims against `outcomes` over `questions` (a missing prediction predicts
+/// no change).
+pub fn chive(questions: &[&Question], outcomes: &BTreeMap<String, Array2<f64>>, predictions: &BTreeMap<String, Array2<f64>>) -> Result<Claims, String> {
+    let (mut truths, mut falses) = (Vec::new(), Vec::new());
+    for q in questions {
+        let outcome = outcomes.get(&q.id).ok_or_else(|| format!("{}: no outcome", q.id))?;
+        let predicted = predictions.get(&q.id).unwrap_or(&q.clean);
+        for r in 0..q.clean.nrows() {
+            let token = argmax(q.clean.row(r));
+            let before = rate(q.clean.row(r), token);
+            let moved = (rate(outcome.row(r), token) - before).abs();
+            let confidence = (rate(predicted.row(r), token) - before).abs();
+            if moved >= 0.5 {
+                truths.push(confidence);
+            } else if moved <= 0.15 {
+                falses.push(confidence);
+            }
+        }
+    }
+    Ok(Claims { true_claims: truths.len(), false_claims: falses.len(), auroc: auroc(&truths, &falses) })
+}
+
+/// The AUROC of confidences on true claims against false ones (ties count half).
+pub fn auroc(truths: &[f64], falses: &[f64]) -> f64 {
+    let pairs = (truths.len() * falses.len()) as f64;
+    let wins: f64 = truths.iter().map(|t| falses.iter().map(|f| if t > f { 1.0 } else if t == f { 0.5 } else { 0.0 }).sum::<f64>()).sum();
+    if pairs > 0.0 { wins / pairs } else { f64::NAN }
+}
+
+/// A CHIVE claim file's predictions (claim id → P(true)) scored by AUROC on its dev split (labels
+/// in `<root>/<case>/claims.json`) and its held-out split (labels in `<root>/sealed/<case>.json`,
+/// the scorer's only reader); a claim with no prediction counts as 1/2.
+pub fn chive_claims(root: &Path, case: &str, predictions: &BTreeMap<String, f64>) -> Result<(Claims, Claims), String> {
+    let record = read_json(&root.join(case).join("claims.json"))?;
+    let sealed = read_json(&root.join("sealed").join(format!("{case}.json")))?;
+    let (mut dev, mut held) = ((Vec::new(), Vec::new()), (Vec::new(), Vec::new()));
+    for claim in record["claims"].as_array().ok_or("claims.json: claims")? {
+        let id = claim["id"].as_str().ok_or("a claim without an id")?;
+        let (label, split) = if claim["split"].as_str() == Some("held_out") {
+            (sealed["labels"][id]["label"].as_bool().ok_or_else(|| format!("{id}: no sealed label"))?, &mut held)
+        } else {
+            (claim["label"].as_bool().ok_or_else(|| format!("{id}: no label"))?, &mut dev)
+        };
+        let p = predictions.get(id).copied().unwrap_or(0.5);
+        if label { split.0.push(p) } else { split.1.push(p) }
+    }
+    let claims = |(truths, falses): (Vec<f64>, Vec<f64>)| Claims { true_claims: truths.len(), false_claims: falses.len(), auroc: auroc(&truths, &falses) };
+    Ok((claims(dev), claims(held)))
 }
 
 /// The measured outcomes: the dev split's from the questions, the held-out split's from

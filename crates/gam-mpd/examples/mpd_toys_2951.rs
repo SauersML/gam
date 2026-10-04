@@ -15,7 +15,9 @@
 //!    dev split per tag, and the mechanism checks, to `<case>/engine/report.json`.
 //!
 //! `mpd_toys_2951 score ROOT CASE PREDICTIONS` scores any explainer's predictions (a JSON object of
-//! question id → logits, readouts × classes) the same way.
+//! question id → logits, readouts × classes) the same way; `mpd_toys_2951 chive ROOT CASE
+//! PREDICTIONS...` scores CHIVE claim predictions (claim id → P(true), `bench/toys_2951/chive_vpd.py`)
+//! by AUROC on the dev and held-out claims.
 //!
 //! Keys (defaults): `n` (1e6), `rounds` (50), `blocks` (1), `draws` (4), `batch` (256), `seed`,
 //! `out` (`<case>/engine`: outputs go to `<out>/<case>/` instead).
@@ -23,7 +25,7 @@
 use gam_mpd::explanation::{Explanation, Fitted, Settings, fit, in_execution_order};
 use gam_mpd::masked::{Library, Site, matrix, sites};
 use gam_mpd::operator_program::OperatorProgram;
-use gam_mpd::toys::{Case, Explained, Native, Question, Scores, cases, kl_rows, mechanism, score, sealed};
+use gam_mpd::toys::{Case, Explained, Native, Question, Scores, cases, chive, chive_claims, kl_rows, mechanism, score, sealed};
 use ndarray::{Array1, Array2};
 use rayon::prelude::*;
 use serde_json::{Value, json};
@@ -118,6 +120,7 @@ fn scores(case: &Case, outcomes: &BTreeMap<String, Array2<f64>>, predictors: &[(
         report.insert(
             name.to_string(),
             json!({"dev": score(&dev, outcomes, predictions)?, "held_out": score(&held, outcomes, predictions)?,
+                   "chive_dev": chive(&dev, outcomes, predictions)?, "chive_held_out": chive(&held, outcomes, predictions)?,
                    "held_out_internal": score(&internal, outcomes, predictions)?, "held_out_prompt": score(&prompt, outcomes, predictions)?,
                    "dev_per_tag": per_tag}),
         );
@@ -228,7 +231,17 @@ fn run_case(root: &Path, dir: &Path, run: &Run) -> Result<Value, String> {
 fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "mpd_toys_2951 ROOT [CASE ...] [KEY=VALUE ...] | mpd_toys_2951 score ROOT CASE PREDICTIONS";
+    let usage = "mpd_toys_2951 ROOT [CASE ...] [KEY=VALUE ...] | mpd_toys_2951 score ROOT CASE PREDICTIONS | mpd_toys_2951 chive ROOT CASE PREDICTIONS...";
+    if args.first().map(String::as_str) == Some("chive") {
+        let (root, case) = (PathBuf::from(args.get(1).ok_or(usage)?), args.get(2).ok_or(usage)?);
+        for path in &args[3..] {
+            let predictions: BTreeMap<String, f64> =
+                serde_json::from_str(&std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?).map_err(|e| format!("{path}: {e}"))?;
+            let (dev, held) = chive_claims(&root, case, &predictions)?;
+            eprintln!("{path}: AUROC dev {:.3} ({}+{} claims), held out {:.3} ({}+{} claims)", dev.auroc, dev.true_claims, dev.false_claims, held.auroc, held.true_claims, held.false_claims);
+        }
+        return Ok(());
+    }
     if args.first().map(String::as_str) == Some("score") {
         let [root, name, path] = [1, 2, 3].map(|i| args.get(i).cloned().ok_or(usage));
         let root = PathBuf::from(root?);
@@ -256,7 +269,7 @@ fn main() -> Result<(), String> {
         };
         let s = &report["scores"];
         let line = format!(
-            "{:<15} held-out KL ours {:.3} null {:.3} transcript {:.3} | argmax ours {:.2} null {:.2} transcript {:.2} | changed-argmax ours {:.2} | clean KL {:.1e} | counterfactual {} mechanism {}",
+            "{:<15} held-out KL ours {:.3} null {:.3} transcript {:.3} | argmax ours {:.2} null {:.2} transcript {:.2} | changed-argmax ours {:.2} | CHIVE AUROC ours {:.2} transcript {:.2} ({}+{} claims) | clean KL {:.1e} | counterfactual {} mechanism {}",
             report["case"].as_str().unwrap_or(""),
             s["explanation"]["held_out"]["mean_kl"].as_f64().unwrap_or(f64::NAN),
             s["null"]["held_out"]["mean_kl"].as_f64().unwrap_or(f64::NAN),
@@ -265,6 +278,10 @@ fn main() -> Result<(), String> {
             s["null"]["held_out"]["argmax"].as_f64().unwrap_or(f64::NAN),
             s["transcript"]["held_out"]["argmax"].as_f64().unwrap_or(f64::NAN),
             s["explanation"]["held_out"]["changed_argmax"].as_f64().unwrap_or(f64::NAN),
+            s["explanation"]["chive_held_out"]["auroc"].as_f64().unwrap_or(f64::NAN),
+            s["transcript"]["chive_held_out"]["auroc"].as_f64().unwrap_or(f64::NAN),
+            s["explanation"]["chive_held_out"]["true_claims"],
+            s["explanation"]["chive_held_out"]["false_claims"],
             report["explanation"]["clean_kl_mean"].as_f64().unwrap_or(f64::NAN),
             if report["pass"]["counterfactual"].as_bool() == Some(true) { "PASS" } else { "fail" },
             if report["pass"]["mechanism"].as_bool() == Some(true) { "PASS" } else { "fail" },
