@@ -16,9 +16,15 @@
 //!   coordinate of one node on the rows whose causal context it names.
 //! * **Derived operators** ([`Derived`]): operators of `P` its decoder computes from operators
 //!   decoded before them rather than reads, `λ · law(sources) + residual rows` (an attention head
-//!   by a `rules` law): the graph is the native one, so every native place inside it stays a place.
+//!   by a legacy template or an explicit matrix rule): the graph is the native one, so every
+//!   native place inside it stays a place.
 //!   The message holds a derived operator with no reals; its reals are recomputed, in an order in
 //!   which every source precedes what reads it, whenever a source changes and when decoding.
+//!
+//! Legacy Copy/Match tags select formulas supplied by the decoder: their scores are
+//! conditional on that fixed template language. New matrix-rule artifacts transmit
+//! complete typed arithmetic bodies once, with explicit source bindings per call.
+//! Neither representation alone constitutes automatic rule discovery.
 //!
 //! Learned operator and coefficient literals are projected to 32-bit floats by
 //! [`Artifact::f32_literals`]; native RMSNorm epsilon values remain exact architecture
@@ -50,6 +56,11 @@
 //! fit or of a discovery is read. The names are labels: they are sent so a decoded artifact reports
 //! itself, and no length charges them.
 //!
+//! Explicit-body artifacts use grammar version 2: an impossible legacy zero-native-node
+//! marker and version precede the message, and a shared body pool precedes its derivations.
+//! Their byte envelope starts with u64::MAX, version, then bit length. Legacy messages
+//! and their original length-only byte envelopes remain unchanged.
+//!
 //! # A block on its native parent state
 //!
 //! [`Artifact::local_program`] grafts a block of `P` onto `M`: `M`'s program, followed by the nodes of
@@ -67,6 +78,7 @@ use super::operator_program::{
     exact_precision, remap_node,
 };
 use super::precision::DecodableArtifact;
+use super::matrix_rule::{MatrixRule, Type as MatrixType, Value as MatrixValue};
 use ndarray::{Array1, Array2};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -113,6 +125,8 @@ pub enum Callee {
 /// What computes a derived operator from operators decoded before it (`rules`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum OperatorLaw {
+    /// An explicit shared matrix-valued body; no named composite is supplied by the decoder.
+    Expression { body: Arc<MatrixRule>, sources: Vec<usize> },
     /// An output head `diag(g / g_f) V⁺` (`rules::copy_prediction`): `value` the head's value
     /// operator (`width × d`), `gain` its layer's norm gain and `final_gain` the final norm's (diagonal
     /// operators).
@@ -125,11 +139,15 @@ pub enum OperatorLaw {
     Match { key: usize, source_output: usize, source_value: usize, gain: usize, source_gain: usize, first: usize, directions: Option<usize> },
 }
 
-const LAWS: usize = 2;
+const LAWS: usize = 2; // Legacy template language: never change this alphabet.
+const MATRIX_LAWS: usize = 3;
+const MATRIX_ARTIFACT_VERSION: u64 = 2;
+const VERSIONED_ENVELOPE: u64 = u64::MAX;
 
 impl OperatorLaw {
     fn index(&self) -> usize {
         match self {
+            Self::Expression { .. } => 2,
             Self::Copy { .. } => 0,
             Self::Match { .. } => 1,
         }
@@ -138,6 +156,7 @@ impl OperatorLaw {
     /// The operators it reads.
     pub fn sources(&self) -> Vec<usize> {
         match self {
+            Self::Expression { sources, .. } => sources.clone(),
             Self::Copy { value, gain, final_gain } => vec![*value, *gain, *final_gain],
             Self::Match { key, source_output, source_value, gain, source_gain, .. } => vec![*key, *source_output, *source_value, *gain, *source_gain],
         }
@@ -146,6 +165,7 @@ impl OperatorLaw {
     /// Its integers.
     fn integers(&self) -> Vec<u64> {
         match self {
+            Self::Expression { .. } => Vec::new(),
             Self::Copy { .. } => Vec::new(),
             Self::Match { first, directions, .. } => vec![*first as u64, directions.map_or(0, |k| k as u64 + 1)],
         }
@@ -153,6 +173,7 @@ impl OperatorLaw {
 
     fn with_sources(&self, sources: &[usize]) -> Self {
         match self {
+            Self::Expression { body, .. } => Self::Expression { body: Arc::clone(body), sources: sources.to_vec() },
             Self::Copy { .. } => Self::Copy { value: sources[0], gain: sources[1], final_gain: sources[2] },
             Self::Match { first, directions, .. } => Self::Match {
                 key: sources[0],
@@ -216,6 +237,19 @@ fn derived_values(program: &OperatorProgram, derived: &Derived) -> Result<Array2
     let matrix = |op: usize| -> Result<Array2<f64>, String> { Ok(program.operators.get(op).ok_or_else(|| format!("no operator {op}"))?.matrix()) };
     let target = program.operators.get(derived.operator).ok_or_else(|| format!("no derived operator {}", derived.operator))?;
     let mut values = match &derived.law {
+        OperatorLaw::Expression { body, sources } => {
+            if sources.len() != body.inputs.len() { return Err("a matrix-rule call has the wrong source arity".into()); }
+            let arguments = sources.iter().zip(&body.inputs).map(|(source, ty)| {
+                match ty {
+                    MatrixType::Matrix { .. } => matrix(*source).map(MatrixValue::Matrix),
+                    MatrixType::Vector { .. } => diagonal_of(program, *source).map(MatrixValue::Vector),
+                }
+            }).collect::<Result<Vec<_>, String>>()?;
+            match body.evaluate(&arguments)? {
+                MatrixValue::Matrix(value) => value,
+                MatrixValue::Vector(_) => return Err("a derived operator matrix rule returned a vector".into()),
+            }
+        },
         OperatorLaw::Copy { value, gain, final_gain } => {
             super::rules::copy_prediction(&matrix(*value)?, &diagonal_of(program, *gain)?, &diagonal_of(program, *final_gain)?)?
         }
@@ -582,9 +616,35 @@ impl Artifact {
         Ok(program)
     }
 
-    /// The derived operators' literals: their scales and residual rows.
-    pub fn derived_literals(&self) -> u64 {
-        self.derived.iter().map(Derived::literals).sum()
+    /// Exact encoded bodies identify sharing, including the sign of zero.
+    /// New-format dependencies must already be in their executable topological order.
+    fn matrix_rules(&self) -> Result<Vec<(BitString, Arc<MatrixRule>)>, String> {
+        let mut bodies = Vec::new();
+        for d in &self.derived {
+            if let OperatorLaw::Expression { body, sources } = &d.law {
+                if sources.len() != body.inputs.len() { return Err("a matrix-rule call has the wrong source arity".into()); }
+                let message = body.encode()?;
+                if !bodies.iter().any(|(previous, _)| *previous == message) { bodies.push((message, Arc::clone(body))); }
+            }
+        }
+        if !bodies.is_empty() {
+            let count = self.program.operators.len();
+            let mut pending: std::collections::BTreeSet<usize> = self.derived.iter().map(|d| d.operator).collect();
+            if pending.len() != self.derived.len() { return Err("duplicate derived operator targets".into()); }
+            for d in &self.derived {
+                if d.operator >= count || d.law.sources().iter().any(|source| *source >= count || *source == d.operator || pending.contains(source)) { return Err("matrix artifact has absent, cyclic or out-of-order derived sources".into()); }
+                if !d.scale.is_finite() || d.residual.iter().flat_map(|(_, row)| row).any(|v| !v.is_finite()) { return Err("a matrix artifact has nonfinite derived literals".into()); }
+                pending.remove(&d.operator);
+            }
+        }
+        Ok(bodies)
+    }
+
+    /// Derived scales/residuals plus each shared explicit body's coefficients once.
+    pub fn derived_literals(&self) -> Result<u64, String> {
+        let mut literals = self.derived.iter().map(Derived::literals).sum();
+        for (_, body) in self.matrix_rules()? { literals += body.cost()?.literals; }
+        Ok(literals)
     }
 
     /// Verify that every live change is hidden behind a measured block boundary.
@@ -1067,6 +1127,8 @@ impl Artifact {
     /// diagnostic names. Exception values, derived scales and residual values are
     /// independently priced at 32 bits each by C32, outside this binding remainder.
     pub fn binding_bits(&self) -> Result<u64, String> {
+        let bodies = self.matrix_rules()?;
+        let versioned = !bodies.is_empty();
         let nodes = self.program.nodes.len();
         let fixed = |alphabet: usize| -> Result<u64, String> { Ok(u64::from(fixed_index_len_bits(alphabet).map_err(codec)?)) };
         let prefix = |value: u64| prefix_integer_len_bits(value).map_err(codec);
@@ -1086,9 +1148,15 @@ impl Artifact {
         }
         // The derived operators less their literals' 32 bits each (charged as literals).
         let operators = self.program.operators.len();
+        if versioned {
+            // Internal dispatch marker, explicit format version and body-pool framing.
+            bits += prefix(1)? + prefix(MATRIX_ARTIFACT_VERSION)? + prefix(bodies.len() as u64 + 1)?;
+            for (message, body) in &bodies { bits += prefix(message.len_bits() + 1)? + body.cost()?.structure_bits; }
+        }
         bits += prefix(self.derived.len() as u64 + 1)?;
         for d in &self.derived {
-            bits += fixed(operators)? + fixed(LAWS)? + d.law.sources().len() as u64 * fixed(operators)?;
+            bits += fixed(operators)? + fixed(if versioned { MATRIX_LAWS } else { LAWS })? + d.law.sources().len() as u64 * fixed(operators)?;
+            if matches!(d.law, OperatorLaw::Expression { .. }) { bits += fixed(bodies.len())?; }
             for integer in d.law.integers() {
                 bits += prefix(integer + 1)?;
             }
@@ -1108,6 +1176,8 @@ impl Artifact {
     }
 
     fn encode_using(&self, cache: Option<&crate::operator_program::NativeOperatorCodec>) -> Result<BitString, String> {
+        let bodies = self.matrix_rules()?;
+        let versioned = !bodies.is_empty();
         let source = self.message_program()?;
         let program = match cache {
             Some(cache) => source.encode_with_native_codec(cache),
@@ -1115,6 +1185,10 @@ impl Artifact {
         }.map_err(|e| e.to_string())?;
         let nodes = self.program.nodes.len();
         let mut out = BitString::new();
+        if versioned {
+            encode_prefix_integer(&mut out, 1).map_err(codec)?; // Invalid zero native-node count in legacy grammar.
+            encode_prefix_integer(&mut out, MATRIX_ARTIFACT_VERSION).map_err(codec)?;
+        }
         encode_prefix_integer(&mut out, self.native_nodes as u64 + 1).map_err(codec)?;
         encode_prefix_integer(&mut out, program.len_bits() + 1).map_err(codec)?;
         out.append(&program);
@@ -1152,10 +1226,22 @@ impl Artifact {
             out.push_bits(u64::from(exception.value.to_bits()), 32).map_err(codec)?;
         }
         let operators = self.program.operators.len();
+        if versioned {
+            encode_prefix_integer(&mut out, bodies.len() as u64 + 1).map_err(codec)?;
+            for (message, _) in &bodies {
+                encode_prefix_integer(&mut out, message.len_bits() + 1).map_err(codec)?;
+                out.append(message);
+            }
+        }
         encode_prefix_integer(&mut out, self.derived.len() as u64 + 1).map_err(codec)?;
         for d in &self.derived {
             encode_fixed_index(&mut out, d.operator, operators).map_err(codec)?;
-            encode_fixed_index(&mut out, d.law.index(), LAWS).map_err(codec)?;
+            encode_fixed_index(&mut out, d.law.index(), if versioned { MATRIX_LAWS } else { LAWS }).map_err(codec)?;
+            if let OperatorLaw::Expression { body, .. } = &d.law {
+                let message = body.encode()?;
+                let index = bodies.iter().position(|(previous, _)| *previous == message).ok_or("a missing shared matrix-rule body")?;
+                encode_fixed_index(&mut out, index, bodies.len()).map_err(codec)?;
+            }
             for source in d.law.sources() {
                 encode_fixed_index(&mut out, source, operators).map_err(codec)?;
             }
@@ -1199,7 +1285,14 @@ impl Artifact {
             }
             Ok(n as usize)
         };
-        let native_nodes = decode_prefix_integer(reader).map_err(codec)?.checked_sub(1).ok_or("a zero count codeword")? as usize;
+        let first = decode_prefix_integer(reader).map_err(codec)?;
+        let versioned = first == 1;
+        let native_code = if versioned {
+            let version = decode_prefix_integer(reader).map_err(codec)?;
+            if version != MATRIX_ARTIFACT_VERSION { return Err(format!("unsupported artifact grammar version {version}")); }
+            decode_prefix_integer(reader).map_err(codec)?
+        } else { first };
+        let native_nodes = usize::try_from(native_code.checked_sub(1).ok_or("a zero count codeword")?).map_err(|e| e.to_string())?;
         if native_nodes == 0 {
             return Err("a native model of no nodes".to_string());
         }
@@ -1259,11 +1352,24 @@ impl Artifact {
         }
         let mut program = program;
         let operators = program.operators.len();
+        let mut bodies: Vec<(BitString, Arc<MatrixRule>)> = Vec::new();
+        if versioned {
+            for _ in 0..count(reader)? {
+                let bits = decode_prefix_integer(reader).map_err(codec)?.checked_sub(1).ok_or("zero matrix-rule length codeword")?;
+                let message = reader.read_bit_string(bits).map_err(codec)?;
+                let body = MatrixRule::decode(&message)?;
+                if bodies.iter().any(|(previous, _)| *previous == message) { return Err("duplicate shared matrix-rule body".into()); }
+                bodies.push((message, Arc::new(body)));
+            }
+            if bodies.is_empty() { return Err("a versioned matrix artifact has no rule bodies".into()); }
+        }
+        let mut used_bodies = std::collections::BTreeSet::new();
         let mut derived = Vec::new();
         for _ in 0..count(reader)? {
             let operator = decode_fixed_index(reader, operators).map_err(codec)?;
-            let law = decode_fixed_index(reader, LAWS).map_err(codec)?;
-            let (sources, integers) = OperatorLaw::arity(law);
+            let law = decode_fixed_index(reader, if versioned { MATRIX_LAWS } else { LAWS }).map_err(codec)?;
+            let body_index = if law == 2 { let index = decode_fixed_index(reader, bodies.len()).map_err(codec)?; used_bodies.insert(index); Some(index) } else { None };
+            let (sources, integers) = match body_index { Some(index) => (bodies[index].1.inputs.len(), 0), None => OperatorLaw::arity(law) };
             let sources: Vec<usize> = (0..sources).map(|_| decode_fixed_index(reader, operators)).collect::<Result<_, _>>().map_err(codec)?;
             let integers: Vec<u64> = (0..integers)
                 .map(|_| decode_prefix_integer(reader).map_err(codec)?.checked_sub(1).ok_or_else(|| "a zero integer codeword".to_string()))
@@ -1277,7 +1383,13 @@ impl Artifact {
                     (0..cols).map(|_| reader.read_bits(32).map(|b| f32::from_bits(b as u32))).collect::<Result<Vec<f32>, _>>().map_err(codec)?;
                 residual.push((row, values));
             }
-            derived.push(Derived { operator, law: OperatorLaw::of(law, &sources, &integers)?, scale, residual });
+            let law = match body_index { Some(index) => OperatorLaw::Expression { body: Arc::clone(&bodies[index].1), sources }, None => OperatorLaw::of(law, &sources, &integers)? };
+            derived.push(Derived { operator, law, scale, residual });
+        }
+        if versioned {
+            if used_bodies.len() != bodies.len() { return Err("unused shared matrix-rule body".into()); }
+            // Validation uses only this decoded program and explicit bodies.
+            Self { program: program.clone(), native_nodes, blocks: Vec::new(), places: Vec::new(), exceptions: Vec::new(), derived: derived.clone() }.matrix_rules()?;
         }
         compute_derived(&mut program, &derived)?;
         if reader.remaining_bits() != 0 {
@@ -1294,6 +1406,10 @@ impl Artifact {
     pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
         let message = self.encode()?;
         let mut out = Vec::with_capacity(8 + message.packed_bytes().len());
+        if !self.matrix_rules()?.is_empty() {
+            out.extend_from_slice(&VERSIONED_ENVELOPE.to_le_bytes());
+            out.extend_from_slice(&MATRIX_ARTIFACT_VERSION.to_le_bytes());
+        }
         out.extend_from_slice(&message.len_bits().to_le_bytes());
         out.extend_from_slice(message.packed_bytes());
         Ok(out)
@@ -1302,11 +1418,19 @@ impl Artifact {
     /// The artifact [`Artifact::to_bytes`] wrote, given the declarations alone.
     pub fn from_bytes(bytes: &[u8], declarations: &Declarations) -> Result<Self, String> {
         let header: [u8; 8] = bytes.get(..8).ok_or("no length header")?.try_into().map_err(|_| "no length header")?;
-        let length = u64::from_le_bytes(header);
-        if length.div_ceil(8) != (bytes.len() - 8) as u64 {
-            return Err(format!("{} message bits in {} bytes", length, bytes.len() - 8));
+        let first = u64::from_le_bytes(header);
+        let (length, offset, versioned) = if first == VERSIONED_ENVELOPE {
+            let version = u64::from_le_bytes(bytes.get(8..16).ok_or("truncated artifact version")?.try_into().map_err(|_| "invalid artifact version")?);
+            if version != MATRIX_ARTIFACT_VERSION { return Err(format!("unsupported artifact envelope version {version}")); }
+            let length = u64::from_le_bytes(bytes.get(16..24).ok_or("truncated artifact length")?.try_into().map_err(|_| "invalid artifact length")?);
+            (length, 24, true)
+        } else { (first, 8, false) };
+        if length.div_ceil(8) != (bytes.len() - offset) as u64 {
+            return Err(format!("{} message bits in {} bytes", length, bytes.len() - offset));
         }
-        let message = BitString::from_packed(&bytes[8..], length).map_err(codec)?;
+        let message = BitString::from_packed(&bytes[offset..], length).map_err(codec)?;
+        let internal_versioned = decode_prefix_integer(&mut message.reader()).map_err(codec)? == 1;
+        if internal_versioned != versioned { return Err("artifact envelope and internal grammar version disagree".into()); }
         Self::decode(&message, declarations)
     }
 }
@@ -1354,3 +1478,7 @@ impl DecodableArtifact for EncodedArtifact {
         Artifact::decode(&self.message, &self.declarations)
     }
 }
+
+#[cfg(test)]
+#[path = "matrix_artifact_tests.rs"]
+mod matrix_artifact_tests;

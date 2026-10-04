@@ -263,6 +263,18 @@ impl MatrixRule {
                 } => {
                     let x = matrix(*input)?;
                     let d = svd(x.view(), false).map_err(|e| format!("matrix-rule SVD: {e:?}"))?;
+                    if !d.band.is_finite()
+                        || d.band < 0.0
+                        || d.singular_values
+                            .iter()
+                            .any(|value| !value.is_finite() || *value < 0.0)
+                        || d.u
+                            .iter()
+                            .chain(d.vt.iter())
+                            .any(|value| !value.is_finite())
+                    {
+                        return Err("matrix-rule SVD produced nonfinite or invalid factors".into());
+                    }
                     let kept: Vec<usize> = d
                         .singular_values
                         .iter()

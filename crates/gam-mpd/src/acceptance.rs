@@ -149,7 +149,7 @@ pub fn structural_cost(artifact: &Artifact, cache: &mut CostCache) -> Result<Str
     let (node_literals, node_numeric_payload) = program.frame_literal_payload().map_err(|e| e.to_string())?;
     let mut structure_bits = (header + bases.iter().sum::<u64>() + rules + nodes)
         .checked_sub(node_numeric_payload).ok_or("node numeric payload exceeds program frame")?;
-    let mut literals = artifact.derived_literals() + artifact.exceptions.len() as u64 + node_literals;
+    let mut literals = artifact.derived_literals()? + artifact.exceptions.len() as u64 + node_literals;
     for (index, op) in program.operators.iter().enumerate() {
         let key = Arc::as_ptr(op) as usize;
         let (structure, reals) = match cache.operators.get(&key) {

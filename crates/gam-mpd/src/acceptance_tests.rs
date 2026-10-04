@@ -1000,7 +1000,7 @@ fn c32_derived_scale_and_residual_are_each_paid_once() {
     let cost = |a: &Artifact| structural_cost(a, &mut CostCache::default()).unwrap();
     assert_eq!(cost(&start).literals - cost(&plain).literals, 2 - 1);
     assert_eq!(cost(&residual).literals - cost(&plain).literals, 2);
-    assert_eq!(residual.derived_literals(), 3);
+    assert_eq!(residual.derived_literals().unwrap(), 3);
     assert_eq!(residual.message_program().unwrap().operators[2].real_count(), 0);
     let different_scale = start.derive(2, law, 0.75, vec![]).unwrap();
     assert_eq!(cost(&plain), cost(&different_scale));
