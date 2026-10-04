@@ -1,0 +1,371 @@
+{
+  "C32_increment": 52,
+  "Local_shared_by_exact_graft": true,
+  "clean_outputs_exact_equal": true,
+  "measurements": [
+    {
+      "C32": {
+        "binding_bits": 2294,
+        "literals": 62225377,
+        "structure_bits": 322418
+      },
+      "C32_bits": 1991536776,
+      "label": "plain",
+      "native_references": "same immutable LanguageRun/native/Spec/passages and teacher cache for bothprograms",
+      "partial_scope": [],
+      "run": {
+        "episodes": [
+          {
+            "group": "clean",
+            "id": "clean/0",
+            "kl": 10.597568101581265,
+            "native_effect": 0.0,
+            "numerical_error": 2.7413311236699874e-10,
+            "top1_agree": 0.001953125,
+            "unheld": 0
+          },
+          {
+            "group": "remove-mlp/l0",
+            "id": "remove-mlp/l0/0",
+            "kl": 4.938687709744311,
+            "native_effect": 9.265161000073174,
+            "numerical_error": 5.76620409982082e-10,
+            "top1_agree": 0.021484375,
+            "unheld": 1
+          },
+          {
+            "group": "remove-mlp/l1",
+            "id": "remove-mlp/l1/0",
+            "kl": 5.017843643375062,
+            "native_effect": 3.1039424099387922,
+            "numerical_error": 1.950736628497968e-10,
+            "top1_agree": 0.0,
+            "unheld": 0
+          },
+          {
+            "group": "remove-mlp/l2",
+            "id": "remove-mlp/l2/0",
+            "kl": 8.016660418482017,
+            "native_effect": 0.5021736304613577,
+            "numerical_error": 2.1772808666062366e-10,
+            "top1_agree": 0.0,
+            "unheld": 0
+          },
+          {
+            "group": "remove-mlp/l3",
+            "id": "remove-mlp/l3/0",
+            "kl": 6.91580546704202,
+            "native_effect": 1.5824785265893853,
+            "numerical_error": 1.9934826265220025e-10,
+            "top1_agree": 0.0,
+            "unheld": 0
+          },
+          {
+            "group": "clean",
+            "id": "clean/1",
+            "kl": 9.214815182259223,
+            "native_effect": 0.0,
+            "numerical_error": 3.0472427322901326e-10,
+            "top1_agree": 0.02734375,
+            "unheld": 0
+          },
+          {
+            "group": "remove-mlp/l0",
+            "id": "remove-mlp/l0/1",
+            "kl": 4.954490146836007,
+            "native_effect": 7.426271225364625,
+            "numerical_error": 5.132924760050343e-10,
+            "top1_agree": 0.23828125,
+            "unheld": 1
+          },
+          {
+            "group": "remove-mlp/l1",
+            "id": "remove-mlp/l1/1",
+            "kl": 5.382927309141672,
+            "native_effect": 3.1212892641005636,
+            "numerical_error": 2.377174750400428e-10,
+            "top1_agree": 0.015625,
+            "unheld": 0
+          },
+          {
+            "group": "remove-mlp/l2",
+            "id": "remove-mlp/l2/1",
+            "kl": 6.8785034311748365,
+            "native_effect": 1.0954499937395175,
+            "numerical_error": 2.8138062959792806e-10,
+            "top1_agree": 0.03125,
+            "unheld": 0
+          },
+          {
+            "group": "remove-mlp/l3",
+            "id": "remove-mlp/l3/1",
+            "kl": 5.924408635179316,
+            "native_effect": 2.1551330550906265,
+            "numerical_error": 2.350568020879638e-10,
+            "top1_agree": 0.001953125,
+            "unheld": 0
+          }
+        ],
+        "groups": [
+          [
+            "clean",
+            9.906191641920245,
+            2.89428692798006e-10,
+            0.0,
+            2
+          ],
+          [
+            "remove-mlp/l0",
+            4.94658892829016,
+            5.449564429935582e-10,
+            8.3457161127189,
+            2
+          ],
+          [
+            "remove-mlp/l1",
+            5.200385476258367,
+            2.163955689449198e-10,
+            3.112615837019678,
+            2
+          ],
+          [
+            "remove-mlp/l2",
+            7.447581924828427,
+            2.4955435812927585e-10,
+            0.7988118121004375,
+            2
+          ],
+          [
+            "remove-mlp/l3",
+            6.4201070511106675,
+            2.1720253237008203e-10,
+            1.868805790840006,
+            2
+          ]
+        ]
+      },
+      "run_timing": {
+        "candidate_compile": 1.1492503410000001,
+        "cpu_head_complete_log_probs": 45.539477058,
+        "cpu_head_log_normalization": 0.0,
+        "cpu_metric_reductions": 10.664739542000001,
+        "donor_execution": 0.0,
+        "explained_execution": 0.59988649,
+        "gpu_head_upload_norm_gemm_download": 0.0,
+        "intervention_planning": 0.023876915000000002,
+        "native_source_compile": 0.0,
+        "output_readout_and_kl": 22.617643052000002,
+        "teacher_clean_forward": 2.2434745140000003,
+        "teacher_donor_forward": 0.0,
+        "teacher_effect_readout": 33.687984353000004,
+        "teacher_episode_forward": 11.88865977,
+        "teacher_initialization": 47.820612897000004
+      },
+      "seconds": 72.213561924
+    },
+    {
+      "C32": {
+        "binding_bits": 2346,
+        "literals": 62225377,
+        "structure_bits": 322418
+      },
+      "C32_bits": 1991536828,
+      "label": "paid",
+      "native_references": "same immutable LanguageRun/native/Spec/passages and teacher cache for bothprograms",
+      "partial_scope": [
+        {
+          "partial_scale_unheld": 1,
+          "source": 33
+        }
+      ],
+      "run": {
+        "episodes": [
+          {
+            "group": "clean",
+            "id": "clean/0",
+            "kl": 10.597568101581265,
+            "native_effect": 0.0,
+            "numerical_error": 2.7413311236699874e-10,
+            "top1_agree": 0.001953125,
+            "unheld": 0
+          },
+          {
+            "group": "remove-mlp/l0",
+            "id": "remove-mlp/l0/0",
+            "kl": 7.706112977780257e-17,
+            "native_effect": 9.265161000073174,
+            "numerical_error": 2.451621930397671e-10,
+            "top1_agree": 1.0,
+            "unheld": 0
+          },
+          {
+            "group": "remove-mlp/l1",
+            "id": "remove-mlp/l1/0",
+            "kl": 5.017843643375062,
+            "native_effect": 3.1039424099387922,
+            "numerical_error": 1.950736628497968e-10,
+            "top1_agree": 0.0,
+            "unheld": 0
+          },
+          {
+            "group": "remove-mlp/l2",
+            "id": "remove-mlp/l2/0",
+            "kl": 8.016660418482017,
+            "native_effect": 0.5021736304613577,
+            "numerical_error": 2.1772808666062366e-10,
+            "top1_agree": 0.0,
+            "unheld": 0
+          },
+          {
+            "group": "remove-mlp/l3",
+            "id": "remove-mlp/l3/0",
+            "kl": 6.91580546704202,
+            "native_effect": 1.5824785265893853,
+            "numerical_error": 1.9934826265220025e-10,
+            "top1_agree": 0.0,
+            "unheld": 0
+          },
+          {
+            "group": "clean",
+            "id": "clean/1",
+            "kl": 9.214815182259223,
+            "native_effect": 0.0,
+            "numerical_error": 3.0472427322901326e-10,
+            "top1_agree": 0.02734375,
+            "unheld": 0
+          },
+          {
+            "group": "remove-mlp/l0",
+            "id": "remove-mlp/l0/1",
+            "kl": 1.4517013772537564e-16,
+            "native_effect": 7.426271225364625,
+            "numerical_error": 2.1793582815655662e-10,
+            "top1_agree": 1.0,
+            "unheld": 0
+          },
+          {
+            "group": "remove-mlp/l1",
+            "id": "remove-mlp/l1/1",
+            "kl": 5.382927309141672,
+            "native_effect": 3.1212892641005636,
+            "numerical_error": 2.377174750400428e-10,
+            "top1_agree": 0.015625,
+            "unheld": 0
+          },
+          {
+            "group": "remove-mlp/l2",
+            "id": "remove-mlp/l2/1",
+            "kl": 6.8785034311748365,
+            "native_effect": 1.0954499937395175,
+            "numerical_error": 2.8138062959792806e-10,
+            "top1_agree": 0.03125,
+            "unheld": 0
+          },
+          {
+            "group": "remove-mlp/l3",
+            "id": "remove-mlp/l3/1",
+            "kl": 5.924408635179316,
+            "native_effect": 2.1551330550906265,
+            "numerical_error": 2.350568020879638e-10,
+            "top1_agree": 0.001953125,
+            "unheld": 0
+          }
+        ],
+        "groups": [
+          [
+            "clean",
+            9.906191641920245,
+            2.89428692798006e-10,
+            0.0,
+            2
+          ],
+          [
+            "remove-mlp/l0",
+            1.111156337515891e-16,
+            2.3154901059816186e-10,
+            8.3457161127189,
+            2
+          ],
+          [
+            "remove-mlp/l1",
+            5.200385476258367,
+            2.163955689449198e-10,
+            3.112615837019678,
+            2
+          ],
+          [
+            "remove-mlp/l2",
+            7.447581924828427,
+            2.4955435812927585e-10,
+            0.7988118121004375,
+            2
+          ],
+          [
+            "remove-mlp/l3",
+            6.4201070511106675,
+            2.1720253237008203e-10,
+            1.868805790840006,
+            2
+          ]
+        ]
+      },
+      "run_timing": {
+        "candidate_compile": 2.877290404,
+        "cpu_head_complete_log_probs": 62.717805504000005,
+        "cpu_head_log_normalization": 0.0,
+        "cpu_metric_reductions": 16.179713459000002,
+        "donor_execution": 0.0,
+        "explained_execution": 1.201628766,
+        "gpu_head_upload_norm_gemm_download": 0.0,
+        "intervention_planning": 0.044837655000000004,
+        "native_source_compile": 0.0,
+        "output_readout_and_kl": 45.328361253000004,
+        "teacher_clean_forward": 2.2434745140000003,
+        "teacher_donor_forward": 0.0,
+        "teacher_effect_readout": 33.687984353000004,
+        "teacher_episode_forward": 11.88865977,
+        "teacher_initialization": 47.820612897000004
+      },
+      "seconds": 25.064619627
+    }
+  ],
+  "overall_acceptance_claim": false,
+  "peak_rss_bytes": 4893044736,
+  "provenance": {
+    "Local": "same full2x512inputs; measured once and shared by exact Localgraft equality",
+    "binary_sha256": "de27bc481caf683da70cf627ebf8bd225b262df8160b9d0a04f1f88f91fba192",
+    "bindings": [
+      {
+        "layer": 0,
+        "native_source": 33,
+        "native_write": 34,
+        "width": 3072
+      }
+    ],
+    "episodes": 10,
+    "export": "/mnt/nw/home/s.sauers/mpd-data/codex/copy-rule-validation-20261004/export",
+    "export_json_sha256": "18fdb8ff6adb2c38e42d27e8772bd391cc841dc2076e9605c2c7731d0c85449a",
+    "export_source": {
+      "checkpoint": "/Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors",
+      "checkpoint_sha256": "155e0e9ee8f899ab100bdb84224751308ae86ed57f746dbea403b93276a96552",
+      "context": 512,
+      "data": "danbraunai/pile-uncopyrighted-tok-shuffled val-00000-of-00012.parquet",
+      "logits": "fp32 forward on MPS (vpd_model.Target), widened to f64",
+      "target_run": "goodfire/spd/runs/t-9d2b8f02",
+      "token_rows": "validation rows 16,17 of vpd4l_frontier32; disjoint from first Copy pilot rows 0,1",
+      "topk": 64
+    },
+    "groups": 5,
+    "numerical_model": "CPU KL conditional exp2ULP/log1ULP model, not full realarithmetic certificate",
+    "paid_sha256": "69627459daae7e67f380e3765380da0b94491e8e972a04ebaa111abd47d6ed92",
+    "panel": "explicit10episode subset of frozen80; two512token passages; clean+allfourwholeMLPremovals",
+    "saved_bytes": 434270889,
+    "saved_sha256": "19c324e3a249184fcfd8bbb1a523765ee5b645c94eccbe9dee695f9f6eaaf774",
+    "scope": "distinct paid response-law program vs unchanged saved wholeMLP program; no refit/no overallMeetsclaim",
+    "scope_limit": "only fullcolumn uniformscales; partial/additive omitted controls remainunheld; floatingexecutionmeasured, real-linearity law not floatingcertificate",
+    "source": "//! Saved-program response representability diagnostic, not a fidelity/frontier win.\n//! EXPORT SAVED SPEC OUT SAVED_SHA SPEC_SHA TRACE_BYTES\nuse gam_mpd::{acceptance::{Change,CostCache,Edit,Local,RunCheck,RunMeasure,structural_cost},artifact::Artifact,\n    coder_capture::sha256,counterfactual::{Action,Decoder,InputChange,Rows,Spec,passages},import::import_language_model,\n    operator_program::{FamilyInputs,SequenceLayout,SlotValues},run_check::{LanguageRun,layer_nodes,split_sites}};\nuse serde_json::json;\nuse std::{collections::BTreeMap,path::Path,time::Instant};\nfn write(path:&Path,value:&serde_json::Value)->Result<(),String>{std::fs::write(path,serde_json::to_vec_pretty(value).map_err(|e|e.to_string())?).map_err(|e|e.to_string())}\nfn peak_rss()->Option<u64>{std::fs::read_to_string(\"/proc/self/status\").ok()?.lines().find_map(|s|s.strip_prefix(\"VmHWM:\")?.split_whitespace().next()?.parse::<u64>().ok()?.checked_mul(1024))}\nfn main()->Result<(),String>{\n    let args:Vec<String>=std::env::args().skip(1).collect();if args.len()!=7{return Err(\"EXPORT SAVED SPEC OUT SAVED_SHA SPEC_SHA TRACE_BYTES\".into());}\n    let(export,saved,spec_path,out)=(Path::new(&args[0]),Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3]));\n    if sha256(saved)?!=args[4] || sha256(spec_path)?!=args[5]{return Err(\"frozen saved bytes/spec changed\".into());}\n    let trace_bytes=args[6].parse::<usize>().map_err(|e|e.to_string())?;\n    if out.exists(){return Err(\"fresh output directory required\".into());}std::fs::create_dir_all(out).map_err(|e|e.to_string())?;\n    let started=Instant::now();let decoder=Decoder::from_export(export)?;let spec=Spec::load(spec_path,&decoder)?;\n    let imported=import_language_model(export,1,1)?;let native=split_sites(&imported.program)?;let layers=layer_nodes(&native,4)?;\n    if spec.rows!=512 || spec.episodes.len()!=10{return Err(\"frozen two512passage clean+fourMLPremovals subset required\".into());}\n    let mut declared=BTreeMap::new();\n    for episode in &spec.episodes {\n        if episode.passage>=2{return Err(\"only fixed first two passages permitted\".into());}\n        let label=if episode.actions.is_empty(){\"clean\".to_string()}else{\n            if episode.actions.len()!=1{return Err(\"one fullMLPremoval per episode required\".into());}\n            match &episode.actions[0]{Action::Input{site,change:InputChange::Scale{rows:Rows::All,cols,scale}} if site%6==5 && site/6<4 && *scale==0.0 && *cols==(0,native.node_interface(layers[site/6].active).map_err(|e|e.to_string())?.width())=>format!(\"L{}\",site/6),_=>return Err(\"only wholeactivation zero controls in diagnostic panel\".into())}\n        };\n        if declared.insert((episode.passage,label),episode.id.clone()).is_some(){return Err(\"duplicate response episode\".into());}\n    }\n    if declared.len()!=10{return Err(\"incomplete allMLP panel\".into());}\n    let bytes=std::fs::read(saved).map_err(|e|e.to_string())?;let plain=Artifact::from_bytes(&bytes,&native.declarations)?;\n    if !plain.controls.is_empty(){return Err(\"baseline must have no response bindings\".into());}\n    plain.validate_coverage(&native)?;if plain.to_bytes()?!=bytes{return Err(\"existing saved canonical replay mismatch\".into());}drop(bytes);\n    let mut paid=plain.clone();let mut bindings=Vec::new();\n    for (layer,nodes) in layers.iter().enumerate(){\n        if plain.blocks.iter().any(|b|b.native_write==nodes.mlp){\n            paid=paid.with_uniform_scale_control(&native,nodes.active,nodes.mlp)?;\n            bindings.push(json!({\"layer\":layer,\"native_source\":nodes.active,\"native_write\":nodes.mlp,\"width\":native.node_interface(nodes.active).map_err(|e|e.to_string())?.width()}));\n        }\n    }\n    if bindings.is_empty(){return Err(\"saved program declares no wholeMLP block\".into());}\n    if paid.program!=plain.program || paid.places!=plain.places || paid.blocks!=plain.blocks || paid.derived!=plain.derived || paid.exceptions!=plain.exceptions{return Err(\"paid binding altered original executable program/lineage\".into());}\n    let path=out.join(\"paid.artifact\");let bytes=paid.to_bytes()?;std::fs::write(&path,&bytes).map_err(|e|e.to_string())?;\n    let decoded=Artifact::from_bytes(&bytes,&native.declarations)?;if decoded!=paid || decoded.to_bytes()?!=bytes{return Err(\"paid ordinary saved-byte replay mismatch\".into());}drop(bytes);drop(paid);let paid=decoded;\n    let mut cache=CostCache::default();let plain_cost=structural_cost(&plain,&mut cache)?;let paid_cost=structural_cost(&paid,&mut cache)?;\n    if plain_cost.literals!=paid_cost.literals || plain_cost.structure_bits!=paid_cost.structure_bits || paid_cost.total()<=plain_cost.total(){return Err(\"control price must be positive explicit metadata without new numeric/computation payload\".into());}\n    let rows=passages(export,512)?;if rows.len()<2{return Err(\"two fixed native passages required\".into());}\n    let tokens:Vec<u32>=rows[..2].iter().flat_map(|r|r[..512].iter().copied()).collect();let family=FamilyInputs{rows:1024,slots:vec![SlotValues::Tokens(tokens)],layout:Some(SequenceLayout{sequence:(0..2).flat_map(|s|std::iter::repeat_n(s,512)).collect(),position:(0..2).flat_map(|_|0..512).collect()})};\n    let provenance=json!({\"scope\":\"distinct paid response-law program vs unchanged saved wholeMLP program; no refit/no overallMeetsclaim\",\"saved_sha256\":args[4],\"spec_sha256\":args[5],\"saved_bytes\":std::fs::metadata(saved).map_err(|e|e.to_string())?.len(),\"paid_sha256\":sha256(&path)?,\"export\":export,\"export_json_sha256\":sha256(&export.join(\"export.json\"))?,\"export_source\":imported.record[\"source\"],\"binary_sha256\":sha256(&std::env::current_exe().map_err(|e|e.to_string())?)?,\"bindings\":bindings,\"episodes\":10,\"groups\":5,\"panel\":\"explicit10episode subset of frozen80; two512token passages; clean+allfourwholeMLPremovals\",\"Local\":\"same full2x512inputs; measured once and shared by exact Localgraft equality\",\"scope_limit\":\"only fullcolumn uniformscales; partial/additive omitted controls remainunheld; floatingexecutionmeasured, real-linearity law not floatingcertificate\",\"numerical_model\":\"CPU KL conditional exp2ULP/log1ULP model, not full realarithmetic certificate\",\"trace_bytes\":trace_bytes,\"source\":include_str!(\"mpd_paid_mlp_control_2951.rs\")});write(&out.join(\"PROVENANCE.json\"),&provenance)?;\n    let t=Instant::now();{\n        let a=plain.execute(&family)?;let b=paid.execute(&family)?;if !a.values[plain.program.output].iter().map(|x|x.to_bits()).eq(b.values[paid.program.output].iter().map(|x|x.to_bits())){return Err(\"paid metadata changed clean executable outputs\".into());}\n    }let clean_equality_seconds=t.elapsed().as_secs_f64();\n    if plain.local_artifact(&native)?.0!=paid.local_artifact(&native)?.0{return Err(\"control metadata altered Localgraft\".into());}\n    let device=gam_gpu::tensor::Device::accelerator(gam_gpu::GpuPolicy::Required).map_err(|e|e.to_string())?.ok_or(\"CUDA required\")?;\n    let local=Local::new(&native,family,None,16).with_cuda(device.clone(),trace_bytes)?;\n    let t=Instant::now();let local_measure=local.measure(&plain)?;let local_seconds=t.elapsed().as_secs_f64();\n    write(&out.join(\"LOCAL.json\"),&json!({\"measure\":local_measure,\"seconds\":local_seconds,\"exact_graft_equal\":true,\"direct_clean_outputs_equal\":true,\"clean_equality_seconds\":clean_equality_seconds}))?;\n    let run=LanguageRun::new(&decoder,&native,&spec,&rows,1)?.with_cuda(device,trace_bytes)?;\n    let mut measurements=Vec::new();\n    for (label,artifact,cost) in [(\"plain\",&plain,&plain_cost),(\"paid\",&paid,&paid_cost)]{\n        let t=Instant::now();let measure=RunMeasure::of(run.episodes(artifact)?);let seconds=t.elapsed().as_secs_f64();\n        let partial=artifact.controls.iter().map(|c|{let edit=Edit{node:c.native_source,rows:None,columns:0..c.width.saturating_sub(1),change:Change::Scale(0.0)};if edit.columns.is_empty(){return Ok(json!({\"source\":c.native_source,\"partial_columns\":\"no nonempty strictsubset for width1\"}));}let mapped=gam_mpd::native_control::map_edits(artifact,&[edit])?;Ok(json!({\"source\":c.native_source,\"partial_scale_unheld\":mapped.unheld}))}).collect::<Result<Vec<_>,String>>()?;\n        let record=json!({\"label\":label,\"C32\":cost,\"C32_bits\":cost.total(),\"run\":measure,\"seconds\":seconds,\"partial_scope\":partial,\"native_references\":\"same immutable LanguageRun/native/Spec/passages and teacher cache for bothprograms\",\"run_timing\":run.timing()});write(&out.join(format!(\"{label}.json\")),&record)?;measurements.push(record);\n    }\n    write(&out.join(\"REPORT.json\"),&json!({\"provenance\":provenance,\"C32_increment\":paid_cost.total()-plain_cost.total(),\"Local_shared_by_exact_graft\":true,\"clean_outputs_exact_equal\":true,\"measurements\":measurements,\"seconds\":started.elapsed().as_secs_f64(),\"peak_rss_bytes\":peak_rss(),\"overall_acceptance_claim\":false}))?;Ok(())\n}\n",
+    "spec_sha256": "aca3a197c44d2e5d3477590f57bcf8e72d149d17f823fdb19257f07ee4328d5f",
+    "trace_bytes": 2147483648
+  },
+  "seconds": 145.088557543
+}

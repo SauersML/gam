@@ -22,5 +22,11 @@
     "uncompressed_sha256": "f079849acede770044b8001dda3fb55003a57a9c1746e6c89eaa9eb5ce2a8eca",
     "uncompressed_bytes": 1514,
     "source_path": "/Users/user/mpd-data/cluster/codex-saved-decode-ca9/SUMMARY.json"
+  },
+  "paid_control": {
+    "file": "paid_control.json",
+    "uncompressed_sha256": "b0535fd66f424019e4fce92b801caa5a1a0b865c3021ac797514942e2408477b",
+    "uncompressed_bytes": 21141,
+    "source_path": "/Users/user/mpd-data/cluster/codex-paid-mlp-control-81fb-replay/evaluation/REPORT.json"
   }
 }

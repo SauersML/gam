@@ -131,6 +131,30 @@ def main():
         axes[1].set_title("The joint run is metric-bound",pad=20)
         fig.tight_layout(w_pad=3)
         save(fig, "04_speed")
+
+        response = d["paid_control"]
+        fig, ax = plt.subplots(figsize=(13, 7))
+        x = np.arange(5)
+        for offset, measurement, color, label in [
+            (-.19, response["measurements"][0], gray, "Original fitted program"),
+            (.19, response["measurements"][1], blue, "With explicit response rule (+52 bits)"),
+        ]:
+            groups = measurement["groups"]
+            values = [g[1] for g in groups]
+            bars = ax.bar(x + offset, values, width=.34, color=color, label=label,
+                          yerr=[g[2] for g in groups], capsize=3)
+            for bar, value in zip(bars, values):
+                ax.text(bar.get_x() + bar.get_width()/2, value + .15,
+                        f"{value:.2f}" if value > 1e-9 else "≈0",
+                        ha="center", fontsize=15)
+        ax.set_xticks(x, ["Clean", "Remove\nlayer 0 MLP", "Remove\nlayer 1 MLP",
+                         "Remove\nlayer 2 MLP", "Remove\nlayer 3 MLP"])
+        ax.set_ylim(0, 12)
+        ax.set_ylabel("Prediction error (KL nats per token)")
+        ax.set_title("A response rule fixes one missing control", pad=20)
+        ax.legend(loc="upper right", frameon=False, fontsize=14)
+        fig.tight_layout()
+        save(fig, "05_paid_control")
     (args.out / "captions.json").write_text(json.dumps({"figures": files, "captions": d["captions"], "sources": d["sources"]},indent=2)+"\n")
     if args.open:
         subprocess.run(["open", "-a", "Preview", str(pdf_path.resolve())], check=True)

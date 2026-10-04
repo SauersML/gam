@@ -3,13 +3,15 @@
     "01_joint_quality",
     "02_joint_frontier",
     "03_control_floor",
-    "04_speed"
+    "04_speed",
+    "05_paid_control"
   ],
   "captions": {
     "01_joint_quality": "All 24 attention-head output maps replaced together; 16 candidate programs plus native. Four ranks, direct SVD or copy-rule plus residual, fitted to weights or separate training inputs. Local: largest row Euclidean discrepancy divided by native attention-contribution RMS, over 1,024 tokens. Run: largest episode-group mean KL per token on 80 episodes from two 512-token passages. Six Local failures have Run not measured; missing points are not zeros. Complete description cost includes all numerical literals, bindings, shared rule definitions and remaining native program. These are finite-bank results with stated conditional numerical bounds, not an optimum over all programs or a mechanism-discovery result.",
     "02_joint_frontier": "Minimum complete program cost among the same 17 candidates at each declared local/run tolerance pair. Displayed percentages are savings relative to the full native program. Native wins at every tested local tolerance <=0.2 and at every tested run tolerance <=0.1. Bank gaps are zero; global program-search gaps are unknown.",
     "03_control_floor": "Lower bound applying only to programs that make exactly the same prediction for each matched clean/full-MLP-removal pair. Statistic mean(TV^2/2) on 1,024 matched tokens, with directed analytic interval arithmetic on fixed binary64 CPU log-probability arrays renormalized as logits. No certificate of neural forward rounding. These are representation obstructions, not measured errors of every fitted program. Explicit paid response laws can distinguish the episodes and escape the premise.",
-    "04_speed": "Left: actual saved 465,719,178-byte native 4L artifact, one warmup then three CPU decoding repetitions, exact replay equality. Same example source, before/after decoder backend. This is a 1.98x cached-decoding improvement, not 1.98x end-to-end. Right: selected disjoint substage timers from completed joint run, including saved replays. They reveal CPU normalization/KL bottlenecks; do not sum them to total wall time. GPU checked-metric and native-teacher replacements are pending parity, so no speedup claimed for them."
+    "04_speed": "Left: actual saved 465,719,178-byte native 4L artifact, one warmup then three CPU decoding repetitions, exact replay equality. Same example source, before/after decoder backend. This is a 1.98x cached-decoding improvement, not 1.98x end-to-end. Right: selected disjoint substage timers from completed joint run, including saved replays. They reveal CPU normalization/KL bottlenecks; do not sum them to total wall time. The later GPU checked-metric full 80-episode parity passed; staging and transfers still exceed the CPU metric time, so no end-to-end speedup is claimed for that path.",
+    "05_paid_control": "Same saved fitted layer-0 MLP program before and after adding an explicit uniform-scale native response binding, priced at 52 extra C32 bits. No refit; program weights and clean outputs are bitwise unchanged; full 1,024-row Local graft is identical (maximum normalized error 1.656). The new law predicts whole layer-0 MLP removal: its mean KL falls from 4.947 to numerical zero, while clean KL remains 9.906 and other removal errors are unchanged. This is a response-representability result, not an overall fidelity win. Ten fixed episodes (five groups, two 512-token passages), not the entire 80-episode benchmark. Error bars use the stated conditional CPU exp2ULP/log1ULP comparison model, not a proof of neural arithmetic. Partial source scalings and additive controls remain unsupported. Full source report and hashes archived alongside the snapshot."
   },
   "sources": {
     "joint": {
@@ -27,6 +29,10 @@
     "decode": {
       "path": "/Users/user/mpd-data/cluster/codex-saved-decode-ca9/SUMMARY.json",
       "sha256": "f079849acede770044b8001dda3fb55003a57a9c1746e6c89eaa9eb5ce2a8eca"
+    },
+    "paid_control": {
+      "path": "/Users/user/mpd-data/cluster/codex-paid-mlp-control-81fb-replay/evaluation/REPORT.json",
+      "sha256": "b0535fd66f424019e4fce92b801caa5a1a0b865c3021ac797514942e2408477b"
     }
   }
 }
