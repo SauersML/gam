@@ -31,7 +31,11 @@ fn export(layers: usize, heads: usize, kv: usize, qk: bool, gated: bool) -> Expo
                 }
             })
             .collect();
-        let bytes: Vec<u8> = values.iter().flat_map(|x| x.to_le_bytes()).collect();
+        // HF exports contain exactly widened f32 checkpoint literals.
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|x| f64::from(*x as f32).to_le_bytes())
+            .collect();
         std::fs::write(dir.join(format!("{name}.f64")), bytes)
             .expect("valid attention mapping fixture");
         files.insert(name.into(), json!({"shape":[rows,cols]}));
