@@ -11,6 +11,14 @@ smoothing parameter by REML/LAML in one converged optimization, and returns
 posterior-mean predictions with credible bands and observation intervals.
 One Rust engine serves both the Python package (`gamfit`) and the CLI (`gam`).
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme_surface_dark.png">
+  <img alt="Left: 800 noisy simulated measurements. Right: the posterior-mean surface from gamfit's two-dimensional Matérn fit. Both views share the same axes, scales and camera." src="docs/images/readme_surface.png" width="1200">
+</picture>
+
+Noisy simulated measurements (left) and the fitted Matérn surface (right),
+on identical axes. [Reproduce the figure](scripts/gen_readme_surface.py).
+
 ```python
 import pandas as pd
 import gamfit
@@ -25,11 +33,6 @@ bands = model.predict(mcycle, interval=0.95, observation_interval=True)
 print(bands[["posterior_mean", "posterior_mean_lower", "posterior_mean_upper",
              "observation_lower", "observation_upper"]].head())
 ```
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/mcycle_location_scale_dark.png">
-  <img alt="Crash-test acceleration: gold measurements, fitted mean and its 95% credible band, with nested 10–95% observation intervals showing the changing noise" src="docs/images/mcycle_location_scale.png" width="1200">
-</picture>
 
 Docs: <https://gamfit.readthedocs.io/>. PyPI: <https://pypi.org/project/gamfit/>.
 Contributions of every kind are welcome.
