@@ -100,6 +100,15 @@ impl Resident {
         }
         Self::compile_decoded(device, candidate, None)
     }
+    /// Execute an already decoded artifact's actual value output, including a
+    /// multi-term affine or Concat. No synthetic head or additional arithmetic.
+    /// Refuses unsupported device nodes and host fallback explicitly.
+    pub fn from_decoded_values(device: &Device, candidate: &Artifact) -> Result<Self, String> {
+        if device.is_host() || !device.float64() {
+            return Err("artifact device needs a float64 accelerator".into());
+        }
+        Self::compile_decoded_mode(device, candidate, None, true)
+    }
     /// Share only identical operator Arcs in identical executable roles with this
     /// candidate's base resident; graph edits and root mappings remain independent.
     pub fn from_decoded_sharing(from: &Self, candidate: &Artifact) -> Result<Self, String> {
@@ -109,6 +118,9 @@ impl Resident {
         Self::compile_decoded(from.program.device(), candidate, Some(from))
     }
     fn compile_decoded(device: &Device, candidate: &Artifact, from: Option<&Self>) -> Result<Self, String> {
+        Self::compile_decoded_mode(device, candidate, from, false)
+    }
+    fn compile_decoded_mode(device: &Device, candidate: &Artifact, from: Option<&Self>, values: bool) -> Result<Self, String> {
         candidate.program.interfaces().map_err(|e| e.to_string())?;
         let artifact = candidate.clone();
         let (flat, map) = mapped_inlined(&artifact.program)?;
@@ -123,9 +135,13 @@ impl Resident {
                 return Err("artifact feature-node exceptions need unsupported token-basis materialization".into());
             }
         }
-        let program = match from {
-            Some(base) => DeviceProgram::compile_sharing(&base.program, &flat)?,
-            None => DeviceProgram::compile(device, &flat)?,
+        let program = if values {
+            DeviceProgram::compile_values(device, &flat)?
+        } else {
+            match from {
+                Some(base) => DeviceProgram::compile_sharing(&base.program, &flat)?,
+                None => DeviceProgram::compile(device, &flat)?,
+            }
         };
         let roots = map.iter().enumerate().map(|(old, &new)| (new, old)).collect();
         Ok(Self { artifact, map, roots, program, output })
@@ -457,6 +473,56 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn value_mode_materializes_genuine_language_readout_without_synthetic_head() {
+        let dir = crate::explanation_tests::tiny_export("resident_value_readout", 2);
+        let imported = crate::import::import_language_model(&dir, 1, 6).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        let device = Device::host();
+        let artifact = Artifact::native(&imported.program).unwrap();
+        let streamed = Resident::compile_decoded(&device, &artifact, None).unwrap();
+        let values = Resident::compile_decoded_mode(&device, &artifact, None, true).unwrap();
+        assert_eq!(values.artifact.program.operators.len(), artifact.program.operators.len());
+        let a = streamed.program.forward(&imported.contract.family).unwrap();
+        let b = values.forward_edited(&imported.contract.family, |_, _| Ok(None)).unwrap();
+        let expected = device.download(&streamed.program.logits_on_device(&a).unwrap()).unwrap();
+        let actual = device.download(&values.output(&b).unwrap()).unwrap();
+        assert_eq!(actual, expected);
+        assert!(!values.program.is_streamed_head(values.output));
+    }
+
+    #[test]
+    fn value_mode_executes_local_multiblock_concat_and_ordered_exceptions() {
+        let (mut artifact, family) = fixture(true);
+        let native = artifact.program.clone();
+        artifact.blocks = vec![
+            crate::artifact::Binding { name: "call".into(), native_reads: vec![0], native_write: 1, reads: vec![0], write: 1 },
+            crate::artifact::Binding { name: "sum".into(), native_reads: vec![0], native_write: 3, reads: vec![0], write: 3 },
+        ];
+        for value in [1e20f32, -1e20f32, 0.375f32] {
+            artifact.exceptions.push(Exception { context: vec![], node: 1, column: 0, value });
+        }
+        let (local, columns) = artifact.local_artifact(&native).unwrap();
+        assert_eq!(columns, vec![0..2, 2..4]);
+        assert!(matches!(local.program.nodes[local.program.output], Node::Concat { .. }));
+        let expected = local.execute(&family).unwrap();
+        let device = Device::host();
+        assert!(Resident::from_decoded_values(&device, &local).is_err(), "public value execution must refuse host fallback");
+        assert!(Resident::compile_decoded(&device, &local, None).is_err(), "LM mode retains the genuine dense-head contract");
+        let resident = Resident::compile_decoded_mode(&device, &local, None, true).unwrap();
+        let trace = resident.forward_edited(&family, |_, _| Ok(None)).unwrap();
+        let actual = device.download(&resident.output(&trace).unwrap()).unwrap();
+        assert_eq!(actual, expected.values[local.program.output]);
+        assert_eq!(actual, ndarray::array![[-0.625, 0.0, -0.625, 0.0]]);
+        assert!(!resident.program.is_streamed_head(resident.output));
+        assert!(matches!(resident.program.logits_on_device(&trace), Err(error) if error.contains("no linear head")));
+        let zeros = device.zeros(family.rows, actual.ncols()).unwrap();
+        assert!(resident.program.score_only(&trace, &zeros, None).is_err());
+        assert!(resident.program.sampled_many(&trace, &[], None).is_err());
+        assert!(resident.program.jvp(&trace, &BTreeMap::new(), gam_gpu::tensor::Arithmetic::F64).is_err());
+        assert!(resident.program.vjp(&trace, zeros, &[], gam_gpu::tensor::Arithmetic::F64).is_err());
+    }
+
     #[test]
     fn shared_resident_keeps_independent_root_edits_and_decoded_values() {
         let dir = crate::explanation_tests::tiny_export("shared_device_resident", 2);

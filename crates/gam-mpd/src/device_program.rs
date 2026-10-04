@@ -122,6 +122,9 @@ enum Step {
         input: usize,
         operator: usize,
     },
+    Concat { parts: Vec<usize> },
+    /// An indicator readout is an exact value copy in resident-value mode.
+    Readout { input: usize },
     /// The head's logits or their readout: never formed whole.
     Head,
 }
@@ -130,7 +133,8 @@ enum Step {
 #[derive(Clone, Copy, Debug)]
 struct Head {
     hidden: usize,
-    operator: usize,
+    /// None for ordinary resident-value execution, with hidden = output.
+    operator: Option<usize>,
     transposed: bool,
     classes: usize,
 }
@@ -209,24 +213,33 @@ fn rotations_of(trace: &DeviceTrace, rotary: Rotary) -> Result<(&Tensor, &Tensor
 impl DeviceProgram {
     /// Lower `program` onto `device`, or the reason it cannot be.
     pub fn compile(device: &Device, program: &OperatorProgram) -> Result<Self, String> {
-        Self::lower(device, program, None)
+        Self::lower(device, program, None, false)
     }
 
     /// [`Self::compile`] on `from`'s device, every operator `program` shares with `from` (the same
     /// `Arc`, in the same role) held by both instead of uploaded again: the programs of one model
     /// with different sites replaced hold the model's weights once.
     pub fn compile_sharing(from: &Self, program: &OperatorProgram) -> Result<Self, String> {
-        Self::lower(&from.device, program, Some(from))
+        Self::lower(&from.device, program, Some(from), false)
     }
 
-    fn lower(device: &Device, program: &OperatorProgram, from: Option<&Self>) -> Result<Self, String> {
+    /// Materialize the actual output expression as ordinary resident values.
+    /// No streamed head, synthetic operator, or extra output arithmetic is added.
+    /// Head scoring and derivative helpers explicitly refuse this mode.
+    pub fn compile_values(device: &Device, program: &OperatorProgram) -> Result<Self, String> {
+        Self::lower(device, program, None, true)
+    }
+
+    fn lower(device: &Device, program: &OperatorProgram, from: Option<&Self>, values: bool) -> Result<Self, String> {
         let interfaces = program.interfaces().map_err(|e| e.to_string())?;
         let widths: Vec<usize> = interfaces.iter().map(|i| i.width()).collect();
-        let head = Self::head_of(program)?;
-        let head_nodes: Vec<usize> = match &program.nodes[program.output] {
+        let head = if values {
+            Head { hidden: program.output, operator: None, transposed: false, classes: widths[program.output] }
+        } else { Self::head_of(program)? };
+        let head_nodes: Vec<usize> = if values { Vec::new() } else { match &program.nodes[program.output] {
             Node::Readout { input, .. } => vec![program.output, *input],
             _ => vec![program.output],
-        };
+        }};
         let edited_head_nodes = head_nodes
             .iter()
             .map(|&node| {
@@ -247,7 +260,7 @@ impl DeviceProgram {
             }
         }
         let mut steps = Vec::with_capacity(program.nodes.len());
-        let mut wanted: Vec<(usize, Role)> = vec![(head.operator, Role::Product)];
+        let mut wanted: Vec<(usize, Role)> = head.operator.into_iter().map(|op| (op, Role::Product)).collect();
         for (index, node) in program.nodes.iter().enumerate() {
             if head_nodes.contains(&index) {
                 steps.push(Step::Head);
@@ -303,12 +316,13 @@ impl DeviceProgram {
                     wanted.push((*operator, Role::Product));
                     Step::Transposed { input: *input, operator: *operator }
                 }
+                Node::Readout { input, basis } if values && matches!(program.bases[*basis], Basis::Indicator { .. }) => Step::Readout { input: *input },
                 Node::Readout { .. } => return refuse("a readout before the output"),
                 Node::Bilinear { .. } => return refuse("a bilinear node"),
                 Node::Softmax { .. } => return refuse("a softmax node"),
                 Node::Mix { .. } => return refuse("a mix node"),
                 Node::Outer { .. } => return refuse("an outer product"),
-                Node::Concat { .. } => return refuse("a concatenation"),
+                Node::Concat { parts } => Step::Concat { parts: parts.clone() },
                 Node::Param { .. } | Node::Call { .. } => return refuse("a rule"),
                 Node::Gain { .. } => return refuse("a parameter gain"),
             };
@@ -352,7 +366,11 @@ impl DeviceProgram {
         }
         let a = program.operators[operator].matrix_cow();
         let classes = if transposed { a.ncols() } else { a.nrows() };
-        Ok(Head { hidden, operator, transposed, classes })
+        Ok(Head { hidden, operator: Some(operator), transposed, classes })
+    }
+
+    fn linear_operator(&self) -> Result<usize, String> {
+        self.head.operator.ok_or_else(|| "device: resident-value mode has no linear head; head scoring and derivatives are unsupported".into())
     }
 
     /// The device it runs on.
@@ -361,13 +379,13 @@ impl DeviceProgram {
         &self.device
     }
 
-    /// The node the head reads.
+    /// The node the linear head reads, or the output in resident-value mode.
     #[must_use]
     pub fn hidden(&self) -> usize {
         self.head.hidden
     }
 
-    /// The number of classes the head scores.
+    /// The number of head classes, or the output width in resident-value mode.
     #[must_use]
     pub fn classes(&self) -> usize {
         self.head.classes
@@ -399,6 +417,7 @@ impl DeviceProgram {
 
     /// The logits of every row, on the device (a target).
     pub fn logits_on_device(&self, trace: &DeviceTrace) -> Result<Tensor, String> {
+        self.linear_operator()?;
         let hidden = trace.value(self.head.hidden)?;
         let mut out = self.device.zeros(trace.rows, self.head.classes).map_err(error)?;
         let tile = self.tile_rows();
@@ -713,6 +732,17 @@ impl DeviceProgram {
                         Some(out)
                     }
                 }
+                Step::Readout { input } => Some(d.copy(trace.value(*input)?).map_err(error)?),
+                Step::Concat { parts } => {
+                    let mut out = d.zeros(rows, width).map_err(error)?;
+                    let mut start = 0;
+                    for &part in parts {
+                        let value = trace.value(part)?;
+                        d.set_columns(&mut out, start, value).map_err(error)?;
+                        start += value.cols();
+                    }
+                    Some(out)
+                }
                 Step::Transposed { input, operator } => {
                     let mut out = d.zeros(rows, width).map_err(error)?;
                     self.add_product(&mut out, trace.value(*input)?, *operator, true, self.arithmetic)?;
@@ -774,17 +804,18 @@ impl DeviceProgram {
 
     /// Rows `start..start + n` of the logits.
     fn logits_tile(&self, hidden: &Tensor, start: usize, n: usize, arithmetic: Arithmetic) -> Result<Tensor, String> {
+        self.linear_operator()?;
         let d = &self.device;
         let h = d.rows_of(hidden, start, n).map_err(error)?;
         let mut logits = d.zeros(n, self.head.classes).map_err(error)?;
-        self.add_product(&mut logits, &h, self.head.operator, self.head.transposed, arithmetic)?;
+        self.add_product(&mut logits, &h, self.linear_operator()?, self.head.transposed, arithmetic)?;
         Ok(logits)
     }
 
     /// `g_h ← g_h + g_logits · ∂logits/∂h` for one tile, written at rows `start..`.
     fn pull_tile(&self, g_hidden: &mut Tensor, start: usize, cotangent: &Tensor, arithmetic: Arithmetic) -> Result<(), String> {
         let d = &self.device;
-        let Held::Dense(a) = self.held(self.head.operator, Role::Product)? else {
+        let Held::Dense(a) = self.held(self.linear_operator()?, Role::Product)? else {
             return Err("device: the head is not dense".to_string());
         };
         let mut part = d.zeros(cotangent.rows(), self.widths[self.head.hidden]).map_err(error)?;
@@ -814,6 +845,7 @@ impl DeviceProgram {
     }
 
     fn kl_impl(&self, trace: &DeviceTrace, target: &Tensor, scored: Option<&[bool]>, gradient: bool) -> Result<(Array1<f64>, Option<Tensor>), String> {
+        self.linear_operator()?;
         let d = &self.device;
         let hidden = trace.value(self.head.hidden)?;
         if target.dim() != (trace.rows, self.head.classes) {
@@ -843,6 +875,7 @@ impl DeviceProgram {
     /// The cotangent of `−log q_y` pulled back to the hidden node, `y` drawn per row from the
     /// logits' softmax by `uniforms[r]` (rows `scored` leaves out stay zero).
     pub fn sampled(&self, trace: &DeviceTrace, uniforms: &[f64], scored: Option<&[bool]>, arithmetic: Arithmetic) -> Result<Tensor, String> {
+        self.linear_operator()?;
         let d = &self.device;
         let hidden = trace.value(self.head.hidden)?;
         let mut g = d.zeros(trace.rows, hidden.cols()).map_err(error)?;
@@ -862,6 +895,7 @@ impl DeviceProgram {
     /// subsequent reverse passes can still use proposal arithmetic. Only hidden-width seeds
     /// survive each tile, so no full-batch vocabulary distribution is retained.
     pub fn sampled_many(&self, trace: &DeviceTrace, uniforms: &[Vec<f64>], scored: Option<&[bool]>) -> Result<Vec<Tensor>, String> {
+        self.linear_operator()?;
         if uniforms.iter().any(|u| u.len() != trace.rows) || scored.is_some_and(|s| s.len() != trace.rows) {
             return Err("device: sampled uniforms or flags do not match trace rows".to_string());
         }
@@ -870,7 +904,7 @@ impl DeviceProgram {
         }
         let d = &self.device;
         let hidden = trace.value(self.head.hidden)?;
-        let Held::Dense(head) = self.held(self.head.operator, Role::Product)? else {
+        let Held::Dense(head) = self.held(self.linear_operator()?, Role::Product)? else {
             return Err("device: the head is not dense".to_string());
         };
         let mut seeds = uniforms.iter().map(|_| d.zeros(trace.rows, hidden.cols()).map_err(error)).collect::<Result<Vec<_>, _>>()?;
@@ -895,6 +929,7 @@ impl DeviceProgram {
     /// tangent `t = t_h · ∂logits/∂h` from the hidden node's tangent (rows `scored` leaves out
     /// add nothing).
     pub fn quadratic(&self, trace: &DeviceTrace, tangent: &Tensor, scored: Option<&[bool]>, arithmetic: Arithmetic) -> Result<f64, String> {
+        self.linear_operator()?;
         let hidden = trace.value(self.head.hidden)?;
         let tile = self.tile_rows();
         let mut total = 0.0;
@@ -931,6 +966,7 @@ impl DeviceProgram {
         keep: &[usize],
         arithmetic: Arithmetic,
     ) -> Result<BTreeMap<usize, Tensor>, String> {
+        self.linear_operator()?;
         let Some(first) = keep.iter().copied().min() else {
             return Ok(BTreeMap::new());
         };
@@ -973,6 +1009,7 @@ impl DeviceProgram {
                 break;
             }
             match &self.steps[index] {
+                Step::Concat { .. } | Step::Readout { .. } => return Err("device: resident Concat/readout derivatives are unsupported".into()),
                 Step::Head | Step::Feature { .. } | Step::Raw { .. } | Step::Constant { .. } => {}
                 Step::Affine { terms, .. } => {
                     for (argument, operator) in terms {
@@ -1092,6 +1129,7 @@ impl DeviceProgram {
     /// `tangents` moves along its entry (a host matrix of the operator's shape); `None` when no
     /// tangent reaches it. Products run in `arithmetic`.
     pub fn jvp(&self, trace: &DeviceTrace, tangents: &BTreeMap<usize, Array2<f64>>, arithmetic: Arithmetic) -> Result<Option<Tensor>, String> {
+        self.linear_operator()?;
         let d = &self.device;
         let rows = trace.rows;
         let upload = |m: &Array2<f64>| d.upload(m.view()).map_err(error);
@@ -1099,6 +1137,7 @@ impl DeviceProgram {
         for index in 0..=self.head.hidden {
             let width = self.widths[index];
             let t = match &self.steps[index] {
+                Step::Concat { .. } | Step::Readout { .. } => return Err("device: resident Concat/readout derivatives are unsupported".into()),
                 Step::Head | Step::Feature { .. } | Step::Raw { .. } => None,
                 Step::Constant { operator } => match tangents.get(operator) {
                     Some(dc) => Some(d.broadcast_rows(&upload(&dc.t().to_owned())?, rows).map_err(error)?),

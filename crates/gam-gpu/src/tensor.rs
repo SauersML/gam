@@ -1203,6 +1203,32 @@ impl Device {
         }
     }
 
+    /// Copy `part` into columns `start..` of every row of `t`, without arithmetic.
+    /// This preserves literal bits and never executes a host fallback.
+    pub fn set_columns(&self, t: &mut Tensor, start: usize, part: &Tensor) -> Result<(), GpuError> {
+        if part.rows != t.rows || start.checked_add(part.cols).is_none_or(|end| end > t.cols) {
+            return Err(shape(format!("{:?} at column {start} of {:?}", part.dim(), t.dim())));
+        }
+        if part.len() == 0 {
+            return Ok(());
+        }
+        match (&*self.backend, &mut t.data, &part.data) {
+            (Backend::Host, Data::Host(v), Data::Host(p)) => {
+                for row in 0..t.rows {
+                    let lo = row * t.cols + start;
+                    v[lo..lo + part.cols].copy_from_slice(&p[row * part.cols..(row + 1) * part.cols]);
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            (Backend::Cuda(engine), Data::Cuda(out), Data::Cuda(input)) => engine.set_columns(out, input, t.cols, part.cols, start, part.len()),
+            #[cfg(target_os = "macos")]
+            (Backend::Metal(_), Data::Metal(_), Data::Metal(_)) => Err(shape("column copies are unsupported on Metal".into())),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            _ => Err(foreign()),
+        }
+    }
+
     /// One Adam step in place: `m ← β₁ m + (1 − β₁) g`, `v ← β₂ v + (1 − β₂) g²`, `w ← w − rate ·
     /// (m / (1 − β₁ᵗ)) / (√(v / (1 − β₂ᵗ)) + ε)`, `t` the step's number from 1.
     pub fn adam(&self, w: &mut Tensor, (m, v): (&mut Tensor, &mut Tensor), g: &Tensor, rate: f64, (beta1, beta2, epsilon): (f64, f64, f64), step: u64) -> Result<(), GpuError> {
@@ -1554,6 +1580,10 @@ __device__ double block_max(double v, double* shared) {
 
 extern "C" __global__ void axpy(u64 n, double alpha, const double* x, double* y) {
     GRID_STRIDE(i, n) y[i] += alpha * x[i];
+}
+
+extern "C" __global__ void set_columns(u64 n, u64 output_cols, u64 input_cols, u64 start, const double* input, double* output) {
+    GRID_STRIDE(i, n) output[(i / input_cols) * output_cols + start + i % input_cols] = input[i];
 }
 
 extern "C" __global__ void hadamard(u64 n, const double* a, const double* b, double* out, int accumulate) {
@@ -2663,6 +2693,19 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             }
             .gpu_ctx("tensor add_row")
             .map(|_| ())
+        }
+
+        pub(super) fn set_columns(
+            &self, output: &mut CudaSlice<f64>, input: &CudaSlice<f64>,
+            output_cols: usize, input_cols: usize, start: usize, elements: usize,
+        ) -> Result<(), GpuError> {
+            let (n, output_cols, input_cols, start) = (elements as u64, output_cols as u64, input_cols as u64, start as u64);
+            let f = self.function("set_columns")?;
+            // SAFETY: matching rows and destination column range checked by Device.
+            unsafe {
+                self.stream.launch_builder(&f).arg(&n).arg(&output_cols).arg(&input_cols).arg(&start)
+                    .arg(input).arg(output).launch(cfg_elements(n))
+            }.gpu_ctx("tensor set_columns").map(|_| ())
         }
 
         pub(super) fn scale_columns(&self, out: &mut Tensor, x: &Tensor, d: &Tensor, accumulate: bool) -> Result<(), GpuError> {
@@ -4331,5 +4374,26 @@ mod code_rows_workspace_tests {
         assert!(code_rows_layout(1, 1, 1, usize::MAX, w).is_err());
         assert!(code_rows_layout(1, 1, 1, 1, CodeRowsWorkspace { max_rows: 0, ..w }).is_err());
         assert_eq!(code_rows_layout(0, 8, 4, 16, w).unwrap().bytes, 0);
+    }
+}
+
+#[cfg(test)]
+mod column_copy_tests {
+    use super::*;
+    #[test]
+    fn columns_copy_bits_and_preserve_other_columns() {
+        let device = Device::host();
+        let mut out = device.upload_vec(2, 4, vec![9.0; 8]).unwrap();
+        let part = device.upload_vec(2, 2, vec![-0.0, 1e300, f64::from_bits(1), -3.0]).unwrap();
+        device.set_columns(&mut out, 1, &part).unwrap();
+        let actual = device.download(&out).unwrap();
+        let expected = [9.0f64, -0.0, 1e300, 9.0, 9.0, f64::from_bits(1), -3.0, 9.0];
+        assert!(actual.iter().zip(expected).all(|(a, b)| a.to_bits() == b.to_bits()));
+        let before = actual;
+        assert!(device.set_columns(&mut out, usize::MAX, &part).is_err());
+        assert!(device.set_columns(&mut out, 3, &part).is_err());
+        let bad_rows = device.zeros(1, 1).unwrap();
+        assert!(device.set_columns(&mut out, 0, &bad_rows).is_err());
+        assert_eq!(device.download(&out).unwrap(), before);
     }
 }
