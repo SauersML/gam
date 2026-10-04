@@ -8,9 +8,11 @@ fn native() -> OperatorProgram {
         Array2::eye(2) * gain, exact_precision([gain, 0.]).expect("finite gain precision"), Default::default()).expect("square native map"));
     OperatorProgram {
         declarations: Declarations { domains: vec![], slots: vec![Slot::Raw { width: 2 }], parameters: 0 },
-        bases: vec![], rules: vec![], operators: vec![op("parent", 3.), op("consumer", 2.)],
+        bases: vec![], rules: vec![Rule { name: "existing native rule".into(), inputs: vec![i.clone()],
+            nodes: vec![Node::Param { index: 0 }, Node::Pointwise { input: 0, laws: vec![Law::Relu] }], output: 1 }],
+        operators: vec![op("parent", 3.), op("consumer", 2.)],
         nodes: vec![Node::Raw { slot: 0 }, Node::Affine { terms: vec![(0, 0)], bias: None },
-            Node::Pointwise { input: 1, laws: vec![Law::Relu] }, Node::Affine { terms: vec![(2, 1)], bias: None }],
+            Node::Call { rule: 0, arguments: vec![1] }, Node::Affine { terms: vec![(2, 1)], bias: None }],
         output: 3,
     }
 }
@@ -18,7 +20,8 @@ fn function() -> OperatorProgram {
     let i = Interface::native(2).expect("two-coordinate function interface");
     OperatorProgram {
         declarations: Declarations { domains: vec![], slots: vec![Slot::Raw { width: 2 }], parameters: 0 },
-        bases: vec![], operators: vec![Arc::new(Operator::identity("sum", i.clone()))],
+        bases: vec![], operators: vec![Arc::new(Operator::dense("sum", i.clone(), i.clone(), Array2::eye(2),
+            exact_precision([0., 1.]).expect("finite shared coefficients"), Default::default()).expect("shared dense map"))],
         rules: vec![
             Rule { name: "square".into(), inputs: vec![i.clone()], nodes: vec![Node::Param { index: 0 },
                 Node::Hadamard { left: 0, right: 0 }], output: 1 },
@@ -70,6 +73,37 @@ fn function_graft_refuses_external_context_and_bad_boundaries() {
     assert!(base.replace_function("extra input", &malformed, 1, 2).is_err());
     let mut malformed = f.clone(); malformed.rules[0].nodes[0] = Node::Raw { slot: 0 };
     assert!(base.replace_function("ambient", &malformed, 1, 2).is_err());
+    let mut malformed = f.clone(); malformed.rules[0].nodes[1] = Node::Call { rule: 0, arguments: vec![0] };
+    assert!(base.replace_function("recursive", &malformed, 1, 2).is_err());
     let mut malformed = f; malformed.output = 999;
     assert!(base.replace_function("bad output", &malformed, 1, 2).is_err());
+}
+
+#[test]
+fn distinct_native_uses_retain_one_shared_numeric_body() {
+    let model = native();
+    let f = function();
+    let first = Artifact::native(&model).unwrap().replace_function("first", &f, 1, 2).unwrap();
+    let mut second_function = f.clone();
+    second_function.nodes.push(Node::Gain { input: 1, coefficient: Coefficient::Number(0.5) });
+    second_function.output = 2;
+    let shared = first.replace_function("second", &second_function, 2, 3).unwrap();
+    shared.validate_coverage(&model).unwrap();
+    assert_eq!(shared.program.rules.len(), 4); // One pair of library bodies, two distinct wrappers.
+    assert_eq!(shared.program.operators.len(), 2); // Native parent and the single learned body matrix.
+    assert_eq!(shared.program.real_count(), 8);
+    let bytes = shared.to_bytes().unwrap();
+    let decoded = Artifact::from_bytes(&bytes, &model.declarations).unwrap();
+    decoded.validate_coverage(&model).unwrap();
+    let family = FamilyInputs { rows: 2, slots: vec![SlotValues::Raw(array![[1., -2.], [0.5, 3.]])], layout: None };
+    let values = decoded.program.execute(&family, false).unwrap().values[decoded.program.output].clone();
+    assert_eq!(values, array![[324., 5184.], [20.25, 26244.]]);
+    // Independent equal coefficients are not silently unified: only the supplied shared pool is reused.
+    second_function.operators[0] = Arc::new((*second_function.operators[0]).clone());
+    let duplicated = first.replace_function("second independent", &second_function, 2, 3).unwrap();
+    assert_eq!(duplicated.program.real_count(), 12);
+    assert_eq!(duplicated.program.execute(&family, false).unwrap().values[duplicated.program.output], values);
+    let mut cache = crate::acceptance::CostCache::default();
+    assert!(crate::acceptance::structural_cost(&shared, &mut cache).unwrap().total()
+        < crate::acceptance::structural_cost(&duplicated, &mut cache).unwrap().total());
 }

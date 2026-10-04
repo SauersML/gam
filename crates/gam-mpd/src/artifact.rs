@@ -827,8 +827,9 @@ impl Artifact {
     /// with every coefficient paid by ordinary artifact accounting. The function must
     /// have one Raw slot and no external parameters, domains or bases. This imports
     /// explicit program semantics only, not another artifact's exceptions or controls.
-    /// Separate imports do not infer new sharing; further identical uses can call the
-    /// installed block's rule with [`Callee::Existing`].
+    /// Imports from one shared operator pool reuse identical operator Arcs and rule
+    /// bodies with identical remapped references. This preserves already fitted sharing;
+    /// it does not identify approximately equal coefficients or discover new abstractions.
     pub fn replace_function(
         &self,
         name: &str,
@@ -858,16 +859,34 @@ impl Artifact {
         let offset_rules = result.program.rules.len();
         offset_ops.checked_add(function.operators.len()).ok_or("function operator count overflow")?;
         offset_rules.checked_add(function.rules.len()).ok_or("function rule count overflow")?;
-        let ops: Vec<_> = (0..function.operators.len()).map(|i| offset_ops + i).collect();
-        let rules: Vec<_> = (0..function.rules.len()).map(|i| offset_rules + i).collect();
-        result.program.operators.extend(function.operators.iter().cloned());
+        let mut ops = Vec::with_capacity(function.operators.len());
+        for operator in &function.operators {
+            let index = if let Some(i) = result.program.operators.iter().position(|held| Arc::ptr_eq(held, operator)) {
+                i
+            } else {
+                let i = result.program.operators.len();
+                result.program.operators.push(Arc::clone(operator));
+                i
+            };
+            ops.push(index);
+        }
+        // Source validation guarantees each rule refers only to preceding rules.
+        let mut rules = Vec::with_capacity(function.rules.len());
+        let same = |a: &Rule, b: &Rule| a.inputs == b.inputs && a.nodes == b.nodes && a.output == b.output;
         for rule in &function.rules {
             let mut translated = rule.clone();
             let nodes = identity(rule.nodes.len());
             for node in &mut translated.nodes {
                 remap_node(node, &nodes, &ops, &[], &rules);
             }
-            result.program.rules.push(translated);
+            let index = if let Some(i) = result.program.rules.iter().position(|held| same(held, &translated)) {
+                i
+            } else {
+                let i = result.program.rules.len();
+                result.program.rules.push(translated);
+                i
+            };
+            rules.push(index);
         }
         let mut body = function.nodes.clone();
         let nodes = identity(body.len());
@@ -877,9 +896,12 @@ impl Artifact {
                 _ => remap_node(node, &nodes, &ops, &[], &rules),
             }
         }
-        result.replace_block(name, Callee::New(Rule {
+        let wrapper = Rule {
             name: name.into(), inputs: vec![input], nodes: body, output: function.output,
-        }), vec![Argument::Native(native_read)], native_write, vec![])
+        };
+        let callee = result.program.rules.iter().position(|held| same(held, &wrapper))
+            .map_or_else(|| Callee::New(wrapper), Callee::Existing);
+        result.replace_block(name, callee, vec![Argument::Native(native_read)], native_write, vec![])
     }
 
     /// This artifact with the native block that writes native node `native_write` replaced by a
