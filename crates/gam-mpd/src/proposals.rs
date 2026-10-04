@@ -552,6 +552,99 @@ impl<'a> CopyResidualBank<'a> {
 
 }
 
+/// Paired Copy-law/residual and ordinary SVD proposals on immutable imported
+/// attention graphs. Source layer IDs are explicit; all mapped heads are kept.
+/// Local binds the native merged post-attention residual, preserving skip, GQA,
+/// RoPE, Q/K normalization, biases outside QKV, and every intervention place.
+/// The denominator is `attention_map::LOCAL_DENOMINATOR`, unlike split VPD sites.
+pub struct MappedCopyResidualBank<'a> {
+    start: &'a Artifact,
+    maps: Vec<super::attention_map::AttentionLayerMap>,
+    targets: Vec<(usize, usize)>,
+    ranks: Vec<usize>,
+    cache: Vec<HeadApproxCache>,
+    pub candidate_count: usize,
+}
+
+impl<'a> MappedCopyResidualBank<'a> {
+    /// Map every head of each explicitly named native layer. Unsupported semantic
+    /// layouts are errors, never omitted alternatives. No SVD or Copy fit occurs.
+    pub fn new(start: &'a Artifact, native_layers: &[usize], ranks: &[usize], max_bank: usize) -> Result<Self, String> {
+        if native_layers.is_empty() || native_layers.iter().collect::<std::collections::BTreeSet<_>>().len() != native_layers.len() {
+            return Err("declare nonempty distinct native layer IDs".into());
+        }
+        let maps = native_layers.iter().map(|&layer| super::attention_map::AttentionLayerMap::of(&start.program, layer))
+            .collect::<Result<Vec<_>, _>>()?;
+        let candidate_count = CopyResidualBank::cardinality(maps.iter().map(|m| m.heads.len()), ranks)?;
+        if candidate_count > max_bank { return Err(format!("complete mapped paired bank needs {candidate_count} including native, max_bank={max_bank}")); }
+        if !start.blocks.is_empty() || !start.derived.is_empty() || !start.exceptions.is_empty()
+            || start.native_nodes != start.program.nodes.len() || !start.places.iter().copied().eq((0..start.native_nodes).map(|n| (n,n)))
+            || !start.has_f32_literals() { return Err("mapped paired bank requires native f32 literals and all original places".into()); }
+        let mut targets = Vec::new();
+        for (index, map) in maps.iter().enumerate() {
+            for h in &map.heads {
+                let op = &start.program.operators[h.output_operator];
+                if ranks.iter().any(|&rank| rank > op.rows.width().min(op.cols.width())) {
+                    return Err(format!("rank exceeds native layer {} head {} output dimensions", map.native_layer, h.head));
+                }
+                targets.push((index, h.head));
+            }
+        }
+        let cache = (0..targets.len()).map(|_| HeadApproxCache::default()).collect();
+        Ok(Self { start, maps, targets, ranks: ranks.to_vec(), cache, candidate_count })
+    }
+
+    pub fn choices(&self) -> impl Iterator<Item = CopyResidualChoice> + '_ {
+        self.targets.iter().flat_map(move |&(map,head)| self.ranks.iter().flat_map(move |&rank|
+            [HeadApproximation::CopyResidual,HeadApproximation::NativeSvd].into_iter().map(move |family|
+                CopyResidualChoice { layer:self.maps[map].native_layer,head,rank,family })))
+    }
+
+    pub fn candidate(&self, choice: CopyResidualChoice) -> Result<Artifact,String> {
+        let CopyResidualChoice { layer,head,rank,family } = choice;
+        if !self.ranks.contains(&rank) { return Err("rank outside declared mapped bank".into()); }
+        let index = self.targets.iter().position(|&(m,h)| self.maps[m].native_layer == layer && h == head)
+            .ok_or("native layer/head outside declared mapped bank")?;
+        let map = &self.maps[self.targets[index].0];
+        let h = &map.heads[head];
+        let o = h.output_operator;
+        let original = &self.start.program.operators[o];
+        let mut out = self.start.clone();
+        match family {
+            HeadApproximation::NativeSvd => {
+                let svd = self.cache[index].native.get_or_init(|| HeadSvd::of(&original.matrix())).as_ref().map_err(|e|e.clone())?;
+                out.program.operators[o] = std::sync::Arc::new(svd.operator(original,original.name.clone(),rank,"ordinary mapped native operator SVD")?);
+            }
+            HeadApproximation::CopyResidual => {
+                let copied = self.cache[index].copy.get_or_init(|| {
+                    let value = self.start.program.operators[h.value_operator].matrix();
+                    let (_,gain) = HeadRules::gain(self.start,&self.start.program.operators[map.input_gain].name)?;
+                    let (_,final_gain) = HeadRules::gain(self.start,&self.start.program.operators[map.final_gain].name)?;
+                    let prediction = super::rules::copy_prediction(&value,&gain,&final_gain)?;
+                    let scale = super::rules::copy_scale(&original.matrix(),&value,&prediction) as f32;
+                    let derived = self.start.derive(o,map.copy_law(head)?,scale,Vec::new())?;
+                    let operator = derived.program.operators[o].clone();
+                    let residual = HeadSvd::of(&(original.matrix()-&operator.matrix()))?;
+                    Ok(CopyResidualHead { derived:derived.derived.into_iter().next().ok_or("mapped Copy has no derivation")?,operator,residual })
+                }).as_ref().map_err(|e|e.clone())?;
+                out.program.operators[o] = copied.operator.clone();
+                out.derived.push(copied.derived.clone());
+                let residual = copied.residual.operator(original,format!("blocks.{layer}.o{head}.copy_residual"),rank,"SVD of mapped native O minus decoded Copy prediction")?;
+                let residual_index = out.program.operators.len();
+                out.program.operators.push(std::sync::Arc::new(residual));
+                let Node::Affine { terms,.. } = &mut out.program.nodes[map.output] else { return Err("mapped output lost affine structure".into()); };
+                let position = terms.iter().position(|&(read,index)| read == h.read && index == o).ok_or("mapped head term lost")?;
+                terms.insert(position+1,(h.read,residual_index));
+            }
+        }
+        map.bind(&out)
+    }
+}
+
+#[cfg(test)]
+#[path = "mapped_copy_residual_tests.rs"]
+mod mapped_copy_residual_tests;
+
 impl HeadRules {
     /// The proposer for `targets`' heads, with every match's content planes found on `start`.
     pub fn new(start: &Artifact, layers: Vec<LayerNodes>, targets: Vec<usize>, group: usize) -> Result<Self, String> {
