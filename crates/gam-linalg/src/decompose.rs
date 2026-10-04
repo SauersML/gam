@@ -62,6 +62,11 @@ pub enum DenseError {
     Asymmetric { detail: String },
     /// The decomposition did not converge.
     Decomposition { detail: String },
+    /// A PSD resolution floor is negative or non-finite.
+    InvalidFloor { value: f64 },
+    /// An eigenvalue of a matrix declared positive semidefinite lies below `−band`, the larger of
+    /// the caller's floor and the decomposition's rounding band: indefiniteness neither resolves.
+    Indefinite { index: usize, value: f64, band: f64 },
 }
 
 impl fmt::Display for DenseError {
@@ -79,6 +84,10 @@ impl fmt::Display for DenseError {
             ),
             Self::Asymmetric { detail } => write!(formatter, "dense eigh: {detail}"),
             Self::Decomposition { detail } => write!(formatter, "dense: decomposition failed: {detail}"),
+            Self::InvalidFloor { value } => write!(formatter,"dense PSD map: floor must be finite and nonnegative, got {value:?}"),
+            Self::Indefinite { index, value, band } => {
+                write!(formatter, "indefinite at eigenvalue {index}: {value:.3e} < -{band:.3e}")
+            }
         }
     }
 }
@@ -165,6 +174,20 @@ impl Eigh {
         let mut out = fast_abt(&scaled, &vectors);
         symmetrize_in_place(&mut out);
         out
+    }
+
+    /// [`Eigh::map`] of a matrix declared positive semidefinite: `f` at the eigenvalues above
+    /// `floor`, the rest dropped. A negative eigenvalue within the larger of `floor` and the
+    /// decomposition's band is unresolved from zero (the resolution that drops a positive one that
+    /// small cannot read its sign) and is dropped with it; one below that is refused
+    /// ([`DenseError::Indefinite`]), never repaired.
+    pub fn psd_map(&self, floor: f64, f: impl Fn(f64) -> f64) -> Result<Array2<f64>, DenseError> {
+        if !floor.is_finite() || floor<0.0 {return Err(DenseError::InvalidFloor {value:floor});}
+        let band = self.band.max(floor);
+        if let Some((index, &value)) = self.values.iter().enumerate().find(|(_, value)| **value < -band) {
+            return Err(DenseError::Indefinite { index, value, band });
+        }
+        Ok(self.map(|value| if value > floor { f(value) } else { 0.0 }))
     }
 }
 
@@ -359,6 +382,18 @@ mod tests {
     }
 
     #[test]
+    fn psd_map_rejects_invalid_floor_before_mapping() {
+        let matrix=array![[1.0,0.0],[0.0,2.0]];
+        let d=eigh(matrix.view(),SymmetricAssembly::Mirrored,None).expect("finite PSD matrix");
+        for floor in [f64::NAN,f64::INFINITY,f64::NEG_INFINITY,-1.0] {
+            let called=std::cell::Cell::new(false);
+            assert!(matches!(d.psd_map(floor,|x| {called.set(true);x}),Err(DenseError::InvalidFloor {..})));
+            assert!(!called.get());
+        }
+        assert!(d.psd_map(-0.0,|x|x).is_ok());
+    }
+
+    #[test]
     fn eigh_of_a_known_matrix_has_canonical_signs() {
         // Eigenvalues 1 and 3 of [[2, 1], [1, 2]], eigenvectors (1, −1)/√2 and (1, 1)/√2.
         let a = array![[2.0, 1.0], [1.0, 2.0]];
@@ -416,6 +451,13 @@ mod tests {
         assert!(close(&projector, &range.dot(&range.t()), 1e-13));
         // Nothing kept is the zero matrix.
         assert_eq!(decomposed.map(|_| 0.0), Array2::<f64>::zeros((3, 3)));
+        // As a PSD function with a floor at the band it is the same root; a negative eigenvalue past
+        // the floor is refused, one inside it dropped.
+        let checked = decomposed.psd_map(decomposed.band, |value| 1.0 / value.sqrt()).expect("positive semidefinite");
+        assert_eq!(checked, root);
+        let shifted = eigh((&a - &Array2::<f64>::eye(3) * 1e-3).view(), SymmetricAssembly::Mirrored, None).expect("eigh");
+        assert!(matches!(shifted.psd_map(0.0, |value| value), Err(DenseError::Indefinite { index: 0, .. })));
+        assert!(shifted.psd_map(1e-2, |value| value).is_ok());
     }
 
     #[test]

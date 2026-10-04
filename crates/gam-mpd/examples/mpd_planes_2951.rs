@@ -188,6 +188,11 @@ fn decoded(coded: &Coded<'_>, blocked: &Blocked, sides: &Sides, once: bool) -> R
                 let (bits, _) = measure(coded, &replaced(&current, k, c, &d.u, &d.v)?)?;
                 Ok(if once { bits.kl - base.kl } else { (bits.kl - base.kl) / on as f64 })
             })?;
+            if log::log_enabled!(log::Level::Debug) {
+                // A probe of the description chosen: where a plane fails to use its reader chart.
+                let probe = geometry.describe(u, v)?;
+                log::debug!("{k}/{c} rank {}: chosen {} reals, writer {} reader {} {:?}, kl {:.3e}; second-order best {} reals, writer {} reader {} {:?}, kl {:.3e}", u.nrows(), d.reals, d.writer.0, d.reader.0, d.reader.1, d.kl_bits, probe.reals, probe.writer.0, probe.reader.0, probe.reader.1, probe.kl_bits);
+            }
             site.push(d.bits());
             out = replaced(&out, k, c, &d.u, &d.v)?;
         }

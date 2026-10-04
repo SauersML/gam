@@ -1,7 +1,7 @@
 use crate::LinalgError;
 use crate::faer_ndarray::{
     FaerArrayView, FaerCholeskyFactor, FaerLinalgError, array2_to_matmut,
-    factorize_symmetricwith_fallback, strict_symmetric_eigh,
+    factorize_symmetricwith_fallback,
 };
 use crate::faer_ndarray::{FaerCholesky, FaerEigh};
 use crate::matrix::symmetrize_in_place;
@@ -1461,35 +1461,21 @@ pub fn rank_certified_psd_pseudoinverse(
             "PSD pseudoinverse relative cutoff must be finite in [0, 1), got {relative_cutoff:?}"
         )));
     }
-    let (eigs, vecs) = strict_symmetric_eigh(penalty, assembly, Side::Lower)
+    let spectrum = crate::decompose::eigh(penalty.view(), assembly, None)
         .map_err(|error| LinalgError::InvalidInput(error.to_string()))?;
-    let max_eigenvalue = eigs
+    let max_eigenvalue = spectrum
+        .values
         .iter()
         .fold(0.0_f64, |maximum, &value| maximum.max(value));
     let absolute_cutoff = relative_cutoff * max_eigenvalue;
-    let unresolved_band =
-        crate::roundoff::symmetric_spectrum_rounding_band(&eigs.to_vec()).max(absolute_cutoff);
-    if let Some((index, &value)) = eigs
+    let pseudoinverse = spectrum
+        .psd_map(absolute_cutoff, |value| 1.0 / value)
+        .map_err(|error| LinalgError::InvalidInput(format!("PSD pseudoinverse input is {error}")))?;
+    let rank = spectrum
+        .values
         .iter()
-        .enumerate()
-        .find(|(_, value)| **value < -unresolved_band)
-    {
-        return Err(LinalgError::InvalidInput(format!(
-            "PSD pseudoinverse input is indefinite at eigenvalue {index}: {value:.3e} < -{unresolved_band:.3e}"
-        )));
-    }
-    let mut rank = 0_usize;
-    let mut scaled = Array2::<f64>::zeros(vecs.dim());
-    for col in 0..eigs.len() {
-        if eigs[col] > absolute_cutoff {
-            rank += 1;
-            for row in 0..vecs.nrows() {
-                scaled[[row, col]] = vecs[[row, col]] / eigs[col];
-            }
-        }
-    }
-    let mut pseudoinverse = scaled.dot(&vecs.t());
-    symmetrize_in_place(&mut pseudoinverse);
+        .filter(|&&value| value > absolute_cutoff)
+        .count();
     if pseudoinverse.iter().any(|value| !value.is_finite()) {
         return Err(LinalgError::InvalidInput(
             "PSD pseudoinverse is not representable at the declared rank cutoff".to_string(),
