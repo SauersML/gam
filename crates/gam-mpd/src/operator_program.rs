@@ -3791,12 +3791,12 @@ impl OperatorProgram {
         Ok(CodeAccount { header_bits, basis_bits, operator_bits, rule_bits, node_bits: node_total, total_bits })
     }
 
-    /// Independent real literals in ordinary nodes and stored rule bodies, and the
-    /// exact wire precision payload they occupy (fraction bits and lattice indices).
+    /// Independent numeric literals in ordinary nodes and stored rule bodies, and
+    /// their exact wire payload (real precision fields or arithmetic integer fields).
     /// The lattice count field remains structural. A shared body is traversed once,
     /// independently of its call count. This account changes neither the exact codec
     /// nor native architecture constants such as an RMSNorm epsilon.
-    pub(crate) fn frame_real_payload(&self) -> Result<(u64, u64), ProgramError> {
+    pub(crate) fn frame_literal_payload(&self) -> Result<(u64, u64), ProgramError> {
         fn scalar(value: f64) -> Result<(u64, u64), ProgramError> {
             let wire = lattice_bits(&[value], exact_precision([value])?)?;
             Ok((1, wire - prefix_integer_len_bits(2)?))
@@ -3813,14 +3813,31 @@ impl OperatorProgram {
                 }
             }
         }
+        fn scale(value: &Scale) -> Result<(u64, u64), ProgramError> {
+            match value {
+                Scale::One => Ok((0, 0)),
+                // The existing variant stores a freely specified arithmetic
+                // argument, not a reference to a dimension. Even if it equals
+                // head width, equality alone is not an explicit derivation.
+                Scale::InverseSqrt(n) => Ok((1, prefix_integer_len_bits(u64::from(*n))?)),
+            }
+        }
         self.nodes.iter().chain(self.rules.iter().flat_map(|rule| &rule.nodes)).try_fold((0, 0), |(count, bits), node| {
             let (literals, payload) = match node {
                 Node::Gain { coefficient: value, .. } => coefficient(value)?,
                 Node::RmsNorm { epsilon, .. } => scalar(*epsilon)?,
+                Node::Bilinear { scale: value, .. } => scale(value)?,
+                Node::Attend { scale: value, rotary, .. } => {
+                    let (count, payload) = scale(value)?;
+                    match rotary {
+                        None => (count, payload),
+                        Some(rotary) => (count + 1, payload + prefix_integer_len_bits(u64::from(rotary.base))?),
+                    }
+                }
                 Node::Feature { .. } | Node::Raw { .. } | Node::Constant { .. } | Node::Affine { .. }
-                | Node::Bilinear { .. } | Node::Softmax { .. } | Node::Mix { .. } | Node::Pointwise { .. }
+                | Node::Softmax { .. } | Node::Mix { .. } | Node::Pointwise { .. }
                 | Node::Hadamard { .. } | Node::Readout { .. } | Node::Outer { .. } | Node::Concat { .. }
-                | Node::Param { .. } | Node::Call { .. } | Node::Attend { .. } | Node::Transposed { .. } => (0, 0),
+                | Node::Param { .. } | Node::Call { .. } | Node::Transposed { .. } => (0, 0),
             };
             Ok((count + literals, bits + payload))
         })

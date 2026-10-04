@@ -22,8 +22,9 @@
 //!
 //! Learned operator and coefficient literals are projected to 32-bit floats by
 //! [`Artifact::f32_literals`]; native RMSNorm epsilon values remain exact architecture
-//! constants. The fixed-32 objective C32 charges every independently transmitted real
-//! once at 32 bits, including architecture epsilon values and exceptions. This price
+//! constants. The fixed-32 objective C32 charges every independently transmitted numeric literal
+//! once at 32 bits, including architecture epsilon values, rotary bases, freely
+//! specified inverse-square-root arguments and exception values. This price
 //! is separate from exact wire length; changing a price never rounds execution. A
 //! derived operator's computed reals are not literals; its scale and residual rows are.
 //!

@@ -88,7 +88,7 @@ pub const LITERAL_BITS: u64 = 32;
 pub struct StructuralCost {
     /// Independently specified numerical literals.
     pub literals: u64,
-    /// Numeric-free program structure: all real precision payloads excluded.
+    /// Numeric-free program structure: real and arithmetic integer payloads excluded.
     /// This differs from the existing wire `CodeAccount::structure_bits`.
     pub structure_bits: u64,
     /// Blocks, places and exceptions ([`Artifact::binding_bits`]).
@@ -116,6 +116,15 @@ pub struct CostCache {
     measures: HashMap<Vec<u64>, (LocalMeasure, RunMeasure)>,
 }
 
+impl CostCache {
+    /// Release encoded measurement keys after their evidence has been consumed.
+    /// Operator prices remain cached. Useful for a finite bank that assesses each
+    /// distinct candidate once and reuses the returned evidence over its grid.
+    pub fn clear_measurements(&mut self) {
+        self.measures.clear();
+    }
+}
+
 /// An exact key: the bit length followed by every packed message word. Hash collisions in the
 /// map are resolved by comparing these words, never by reusing another artifact's evidence.
 fn message_key(message: &super::codec::BitString) -> Result<Vec<u64>, String> {
@@ -129,16 +138,17 @@ fn message_key(message: &super::codec::BitString) -> Result<Vec<u64>, String> {
 }
 
 /// `C32(artifact)`: numeric-free structure plus 32 bits per independently
-/// transmitted real literal. The exact wire codec may take a different number of
-/// bits, notably for native architecture epsilon values retained without rounding.
+/// transmitted numeric literal. The exact wire codec may take a different number of
+/// bits, notably for exact architecture epsilons and integer arithmetic knobs.
+/// Dimensions, ranks, indices and primitive fixed-law definitions remain structure.
 pub fn structural_cost(artifact: &Artifact, cache: &mut CostCache) -> Result<StructuralCost, String> {
     // The program as its message holds it: a derived operator with no reals.
     let program = &artifact.message_program()?;
     let derived: BTreeSet<usize> = artifact.derived.iter().map(|d| d.operator).collect();
     let (header, bases, rules, nodes) = program.frame_bits().map_err(|e| e.to_string())?;
-    let (node_literals, node_real_payload) = program.frame_real_payload().map_err(|e| e.to_string())?;
+    let (node_literals, node_numeric_payload) = program.frame_literal_payload().map_err(|e| e.to_string())?;
     let mut structure_bits = (header + bases.iter().sum::<u64>() + rules + nodes)
-        .checked_sub(node_real_payload).ok_or("node real payload exceeds program frame")?;
+        .checked_sub(node_numeric_payload).ok_or("node numeric payload exceeds program frame")?;
     let mut literals = artifact.derived_literals() + artifact.exceptions.len() as u64 + node_literals;
     for (index, op) in program.operators.iter().enumerate() {
         let key = Arc::as_ptr(op) as usize;

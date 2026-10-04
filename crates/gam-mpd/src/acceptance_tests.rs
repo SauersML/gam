@@ -906,7 +906,7 @@ fn c32_root_real_literals_have_value_independent_price() {
     assert_eq!(a, b, "literal magnitudes and exact codec precision do not change C32");
     assert_ne!(first.program.code_bits().unwrap(), second.program.code_bits().unwrap(), "the preserved exact wire account is separate");
     let (header, bases, rules, nodes) = first.program.frame_bits().unwrap();
-    let (count, payload) = first.program.frame_real_payload().unwrap();
+    let (count, payload) = first.program.frame_literal_payload().unwrap();
     assert_eq!(count, 4);
     assert_eq!(a.structure_bits, header + bases.iter().sum::<u64>() + rules + nodes - payload);
 }
@@ -1014,4 +1014,50 @@ fn c32_basis_constants_are_primitive_and_permutations_are_structure() {
     let (known, recovered) = (cost(&program(true)), cost(&program(false)));
     assert_eq!((known.literals, recovered.literals), (0, 0));
     assert!(recovered.structure_bits > known.structure_bits, "a recovered basis pays its complete discrete permutation");
+}
+
+/// The current grammar sends rotary bases and inverse-square-root arguments as independent arithmetic knobs.
+#[test]
+fn c32_attention_arithmetic_integer_literals_are_paid_once() {
+    use super::operator_program::{Rotary, Scale};
+    let make = |n, base| raw_program(2, vec![], vec![
+        Node::Raw { slot: 0 },
+        Node::Attend { query: 0, key: 0, value: 0, scale: Scale::InverseSqrt(n),
+            rotary: Some(Rotary { base, dims: 2, half_split: true }), causal: true },
+    ]);
+    let (a, b) = (make(2, 10000), make(7, 65537));
+    let cost = |p: &OperatorProgram| structural_cost(&Artifact::native(p).unwrap(), &mut CostCache::default()).unwrap();
+    assert_eq!(cost(&a).literals, 2, "scale argument and rotary base are independent numeric literals");
+    assert_eq!(cost(&a), cost(&b), "changing arithmetic literal values preserves their fixed32 price");
+    assert_ne!(a.code_bits().unwrap(), b.code_bits().unwrap(), "exact integer wire lengths remain separate");
+    let artifact = Artifact::native(&a).unwrap();
+    let decoded = Artifact::from_bytes(&artifact.to_bytes().unwrap(), &a.declarations).unwrap();
+    assert_eq!(decoded.program.nodes, a.nodes);
+    let mut primitive = a.clone();
+    primitive.nodes[1] = Node::Attend { query: 0, key: 0, value: 0, scale: Scale::One, rotary: None, causal: true };
+    assert_eq!(cost(&primitive).literals, 0, "the fixed primitive one is not a fitted scale literal");
+}
+
+/// A bilinear scale equal to input width still lacks an explicit dimension derivation in the current enum.
+#[test]
+fn c32_bilinear_scale_argument_is_not_free_when_equal_to_width() {
+    use super::operator_program::Scale;
+    let make = |n| raw_program(2, vec![], vec![Node::Raw { slot: 0 }, Node::Bilinear { left: 0, right: 0, scale: Scale::InverseSqrt(n) }]);
+    let cost = |p: &OperatorProgram| structural_cost(&Artifact::native(p).unwrap(), &mut CostCache::default()).unwrap();
+    assert_eq!(cost(&make(2)).literals, 1);
+    assert_eq!(cost(&make(2)), cost(&make(63)));
+}
+
+/// Dimensions specify structure even when the same node also has priced arithmetic literals.
+#[test]
+fn c32_rotary_dimension_is_structure_not_an_extra_numeric_literal() {
+    use super::operator_program::{Rotary, Scale};
+    let make = |dims| raw_program(4, vec![], vec![Node::Raw { slot: 0 }, Node::Attend {
+        query: 0, key: 0, value: 0, scale: Scale::One,
+        rotary: Some(Rotary { base: 10000, dims, half_split: true }), causal: true,
+    }]);
+    let cost = |p: &OperatorProgram| structural_cost(&Artifact::native(p).unwrap(), &mut CostCache::default()).unwrap();
+    let (a, b) = (cost(&make(2)), cost(&make(4)));
+    assert_eq!((a.literals, b.literals), (1, 1));
+    assert_ne!(a.structure_bits, b.structure_bits, "the chosen dimension remains explicitly coded structure");
 }
