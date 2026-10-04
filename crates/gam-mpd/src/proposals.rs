@@ -216,10 +216,13 @@ pub struct HeadRules {
 
 /// Complete implicit Copy-subset bank. No mask is filtered by singleton fidelity.
 /// Stores metadata only; artifacts are built lazily in canonical layer/head order.
+type CopyHead = (super::artifact::Derived, std::sync::Arc<Operator>);
+
 pub struct CopyMasks<'a> {
     start: &'a Artifact,
     rules: HeadRules,
     counts: Vec<usize>,
+    heads: Vec<Vec<std::sync::OnceLock<Result<CopyHead, String>>>>,
     pub layer_candidates: usize,
     pub joint_candidates: usize,
 }
@@ -253,7 +256,9 @@ impl<'a> CopyMasks<'a> {
             }
         }
         Ok(Self { start, rules: HeadRules { layers: layers.to_vec(), targets: Vec::new(), group, firsts: Default::default() },
-            counts: layers.iter().map(|l| 1usize << l.queries.len()).collect(), layer_candidates, joint_candidates })
+            counts: layers.iter().map(|l| 1usize << l.queries.len()).collect(),
+            heads: layers.iter().map(|l| std::iter::repeat_with(std::sync::OnceLock::new).take(l.queries.len()).collect()).collect(),
+            layer_candidates, joint_candidates })
     }
 
     /// Compose one mask per layer. Empty masks introduce neither derivations nor bindings.
@@ -262,13 +267,48 @@ impl<'a> CopyMasks<'a> {
         if masks.len() != self.counts.len() || masks.iter().zip(&self.counts).any(|(m, c)| m >= c) {
             return Err("one in-range Copy mask per layer required".into());
         }
+        self.prepare()?;
         let mut artifact = self.start.clone();
         for (layer, &mask) in masks.iter().enumerate() {
             for head in 0..self.rules.layers[layer].queries.len() {
-                if mask & (1usize << head) != 0 { artifact = self.rules.copy(&artifact, layer, head)?.candidate; }
+                if mask & (1usize << head) != 0 {
+                    let (derived, operator) = self.head(layer, head)?;
+                    artifact.program.operators[derived.operator] = operator.clone();
+                    artifact.derived.push(derived.clone());
+                }
+            }
+            if mask != 0 {
+                let nodes = &self.rules.layers[layer];
+                artifact = artifact.bind(&format!("attention {layer}"), &[nodes.normed_stream], nodes.attention)?;
             }
         }
         Ok(artifact)
+    }
+
+    fn head(&self, layer: usize, head: usize) -> Result<&CopyHead, String> {
+        self.heads[layer][head].get_or_init(|| {
+            let candidate = self.rules.copy(self.start, layer, head)?.candidate;
+            let derived = candidate.derived.into_iter().next().ok_or("Copy head missing derivation")?;
+            let operator = candidate.program.operators[derived.operator].clone();
+            Ok((derived, operator))
+        }).as_ref().map_err(|e| e.clone())
+    }
+
+    /// Compute each independent native-source Copy derivation once (24 for the 4L target).
+    /// Subsequent masks share those computed operators, rather than refitting per subset.
+    pub fn prepare(&self) -> Result<(), String> {
+        let mut targets = std::collections::BTreeSet::new();
+        for (layer, heads) in self.heads.iter().enumerate() {
+            for head in 0..heads.len() { targets.insert(self.head(layer, head)?.0.operator); }
+        }
+        for (layer, heads) in self.heads.iter().enumerate() {
+            for head in 0..heads.len() {
+                if self.head(layer, head)?.0.law.sources().iter().any(|s| targets.contains(s)) {
+                    return Err("Copy bank sources must be independent of every substituted output".into());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// All layer-local masks, including each empty mask, without materializing joint candidates.

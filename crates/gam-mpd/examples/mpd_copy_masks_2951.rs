@@ -97,6 +97,9 @@ fn main() -> Result<(), String> {
     let nodes = layer_nodes(&native, layers)?;
     let start = Artifact::native(&native)?.f32_literals()?;
     let bank = CopyMasks::new(&start, &nodes, heads / kv, max_layer, max_joint)?;
+    let preparation = Instant::now();
+    bank.prepare()?;
+    let preparation_seconds = preparation.elapsed().as_secs_f64();
     let sequences = passages(export, context)?;
     if sequences.len() < count || sequences.iter().take(count).any(|r| r.len() < context) { return Err("insufficient local sequences/context".into()); }
     let (mut tokens, mut sequence, mut position) = (Vec::new(), Vec::new(), Vec::new());
@@ -146,6 +149,7 @@ fn main() -> Result<(), String> {
         "local":"fixed native parents; declared family only; ascent disabled","run":"not measured; no run pruning","global_optimum_claim":false},
         "local_sequences":count,"context":context,"rows":family.rows,"batch":batch,"input_sha256":input_hashes,"compiled_source_sha256":sources,
         "binary_sha256":binary_hash,"literal_projection":"f32 learned literals; exact architecture epsilon retained", "price":"C32 distinct from exact wire bytes",
+        "Copy_derivation_preparation_seconds":preparation_seconds,"derivation_memoization":"one native-source fit per head; checked codec still recomputes derived values",
         "grids":grids,"seconds":started.elapsed().as_secs_f64(),"results":"LOCAL.jsonl"});
     std::fs::write(out.join("MANIFEST.json"), serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     Ok(())
