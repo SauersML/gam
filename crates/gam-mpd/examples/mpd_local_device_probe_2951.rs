@@ -26,6 +26,19 @@ fn norm_gate(device: &Device) -> Result<(), String> {
             if cpu.len()!=gpu.len() || cpu.iter().zip(&gpu).any(|(a,b)|a.to_bits()!=b.to_bits()) { return Err("resident norm arithmetic fixture mismatch".into()); }
         }
     }
+    for amplitude in [2.0_f64.powi(-1000),1e-200,1.0,1e200] {
+        let values=vec![3.0*amplitude,4.0*amplitude];
+        let reference=host.upload_vec(1,2,values.clone()).map_err(|e|e.to_string())?;
+        let input=device.upload_vec(1,2,values).map_err(|e|e.to_string())?;
+        let cpu=host.scaled_row_l2_enclosed(&reference,0..2,[amplitude;3]).map_err(|e|e.to_string())?[0];
+        let gpu=device.scaled_row_l2_enclosed(&input,0..2,[amplitude;3]).map_err(|e|e.to_string())?[0];
+        if cpu[0].to_bits()!=gpu[0].to_bits() || cpu[1]>5.0 || cpu[2]<5.0 || gpu[1]>5.0 || gpu[2]<5.0 {return Err(format!("extreme enclosed norm mismatch {amplitude}: {cpu:?} {gpu:?}"));}
+    }
+    let zero=device.zeros(1,2).map_err(|e|e.to_string())?;
+    if device.scaled_row_l2_enclosed(&zero,0..2,[0.0;3]).map_err(|e|e.to_string())?!=vec![[0.0;3]] {return Err("zero/zero norm not exact".into());}
+    let tiny=device.upload_vec(1,1,vec![f64::from_bits(1)]).map_err(|e|e.to_string())?;
+    let tiny_bounds=device.scaled_row_l2_enclosed(&tiny,0..1,[f64::from_bits(1);3]).map_err(|e|e.to_string())?[0];
+    if tiny_bounds[1]>1.0 || tiny_bounds[2]<1.0 || device.scaled_row_l2_enclosed(&tiny,0..1,[0.0;3]).is_ok() {return Err("subnormal or nonzero/zero norm semantics failed".into());}
     let bad = device.upload_vec(1,2,vec![f64::NAN,1.0]).map_err(|e|e.to_string())?;
     if device.scaled_row_l2(&bad,0..2,1.0).is_ok() { return Err("nonfinite norm accepted".into()); }
     Ok(())
@@ -92,20 +105,24 @@ fn main() -> Result<(), String> {
             let start = Instant::now();
             let reduced = resident_norms.measure(&artifact)?;
             let resident_norm_seconds = start.elapsed().as_secs_f64();
-            if reduced != g { return Err(format!("host/resident CUDA reduction complete Local evidence mismatch: {} repeat {repeat}", entry.label)); }
+            if reduced.rows!=g.rows || reduced.blocks.len()!=g.blocks.len() || reduced.blocks.iter().zip(&g.blocks).any(|(a,b)|a.name!=b.name || a.row!=b.row || a.worst.to_bits()!=b.worst.to_bits() || a.scale.to_bits()!=b.scale.to_bits() || a.lower>b.upper || b.lower>a.upper) {
+                return Err(format!("host/resident centers or valid interval overlap mismatch: {} repeat {repeat}",entry.label));
+            }
             let difference_width: usize = artifact.blocks.iter().map(|b| model.node_interface(b.native_write).map(|i| i.width()).map_err(|e|e.to_string())).collect::<Result<Vec<_>,_>>()?.iter().sum();
             if c.blocks.len() != g.blocks.len() || c.rows != g.rows { return Err("backend block/row mismatch".into()); }
             let differences: Vec<_> = c.blocks.iter().zip(&g.blocks).map(|(c,g)| json!({"block":c.name,"absolute_worst_difference":(c.worst-g.worst).abs(),"same_worst_row":c.row==g.row,"same_scale_bits":c.scale.to_bits()==g.scale.to_bits()})).collect();
             let cs = c.status()?;
             let gs = g.status()?;
+            let rs = reduced.status()?;
             let verdict = |s: &gam_mpd::supports::EvidenceStatus<String, String>, d| if s.refutes_at_most(d) { "Violates" } else if s.certifies_at_most(d) { "Meets" } else { "Unresolved" };
-            let grid: Vec<_> = deltas.iter().map(|&d| json!({"delta":d,"cpu":verdict(&cs,d),"cuda":verdict(&gs,d)})).collect();
-            pairs.push(json!({"repeat":repeat,"cpu_seconds":cpu_seconds,"cuda_seconds":cuda_seconds,"shared_cuda":shared_measure,"resident_norms":{"seconds":resident_norm_seconds,"complete_host_reduction_evidence_equal":true,"downloaded_norm_bytes":reduced.rows*reduced.blocks.len()*8,"old_downloaded_difference_bytes":reduced.rows*difference_width*8,"measure":reduced},"cpu":c,"cuda":g,"differences":differences,"grid":grid}));
+            let grid: Vec<_> = deltas.iter().map(|&d| json!({"delta":d,"cpu":verdict(&cs,d),"cuda":verdict(&gs,d),"resident_cuda":verdict(&rs,d)})).collect();
+            if deltas.iter().any(|&d|verdict(&cs,d)!=verdict(&gs,d) || verdict(&gs,d)!=verdict(&rs,d)) { return Err(format!("declared-grid classification changed: {} repeat {repeat}: {grid:?}",entry.label)); }
+            pairs.push(json!({"repeat":repeat,"cpu_seconds":cpu_seconds,"cuda_seconds":cuda_seconds,"shared_cuda":shared_measure,"resident_norms":{"seconds":resident_norm_seconds,"host_center_bits_equal":true,"sound_interval_overlap":true,"declared_grid_classifications_equal":true,"downloaded_norm_bytes":reduced.rows*reduced.blocks.len()*3*8,"old_downloaded_difference_bytes":reduced.rows*difference_width*8,"measure":reduced},"cpu":c,"cuda":g,"differences":differences,"grid":grid}));
         }
         records.push(json!({"label":entry.label,"artifact":path,"artifact_sha256":sha256(&path)?,"pairs":pairs}));
         eprintln!("Local CPU/CUDA pairs complete: {}", entry.label);
     }
-    let report = json!({"scope":"same decoded native-parent graft; frozen CPU native scales; host/resident ordered binary64 reductions compared for complete evidence equality; intervals bound comparison rounding only, not CPU/CUDA execution discrepancy; fixed CPU-then-CUDA-then-resident timing order","cpu_backend":cpu.backend_name(),"cuda_backend":cuda.backend_name(),"resident_norm_backend":resident_norms.backend_name(),"resident_norm_source_initialization_seconds":resident_norm_source_initialization_seconds,"sequences":sequences,"context":context,"batch":batch,"trace_bytes":trace_bytes,"source_numeric_bytes_limit":source_bytes,"retained_source_numeric_bytes":retained_source_numeric_bytes,"source_initialization_seconds":source_initialization_seconds,"source_scope":"actual f64 native model, no rounding; source never forwarded; same Arc and role only; numeric limit excludes indices/activations/workspaces/allocator/host; initialization excluded from repeated measurements; this comparison harness holds two separate native sources when sharing is enabled","export_sha256":sha256(&export.join("export.json"))?,"bank_sha256":sha256(bank)?,"binary_sha256":sha256(&std::env::current_exe().map_err(|e|e.to_string())?)?,"records":records});
+    let report = json!({"scope":"same decoded native-parent graft; frozen CPU native scales; host/resident max-rescaled binary64 reductions compared for bitwise centers, interval overlap and declared-grid classification equality; intervals enclose native RMS denominator and final subtraction/norm only, not CPU/CUDA execution discrepancy; fixed CPU-then-CUDA-then-resident timing order","cpu_backend":cpu.backend_name(),"cuda_backend":cuda.backend_name(),"resident_norm_backend":resident_norms.backend_name(),"resident_norm_source_initialization_seconds":resident_norm_source_initialization_seconds,"sequences":sequences,"context":context,"batch":batch,"trace_bytes":trace_bytes,"source_numeric_bytes_limit":source_bytes,"retained_source_numeric_bytes":retained_source_numeric_bytes,"source_initialization_seconds":source_initialization_seconds,"source_scope":"actual f64 native model, no rounding; source never forwarded; same Arc and role only; numeric limit excludes indices/activations/workspaces/allocator/host; initialization excluded from repeated measurements; this comparison harness holds two separate native sources when sharing is enabled","export_sha256":sha256(&export.join("export.json"))?,"bank_sha256":sha256(bank)?,"binary_sha256":sha256(&std::env::current_exe().map_err(|e|e.to_string())?)?,"records":records});
     std::fs::write(out, serde_json::to_vec_pretty(&report).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
     Ok(())
 }
