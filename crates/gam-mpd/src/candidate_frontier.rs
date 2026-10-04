@@ -49,6 +49,9 @@ pub struct Frontier {
     /// Sorted by cost, then label; exact duplicate encoded messages are collapsed.
     pub bank: Vec<Candidate>,
     pub points: Vec<Point>,
+    /// One result per bank index, independent of the tolerance grid. None is
+    /// unevaluated; Err retains assessment failure instead of inventing measures.
+    pub assessments: Vec<Option<Result<Assessment, String>>>,
     /// Distinct messages whose assessment was attempted, including failed assessments.
     pub measured_candidates: usize,
 }
@@ -113,6 +116,7 @@ pub fn frontier(
     // is assessed once and its returned evidence is reused across the grid.
     let unique: Vec<_> = unique.into_iter().map(|(cost, label, artifact, _)| (cost, label, artifact)).collect();
     let measured_candidates = if constraints.is_empty() { 0 } else { budget.min(unique.len()) };
+    let mut assessments = Vec::with_capacity(unique.len());
     let mut evidence: Vec<Vec<Evidence>> = constraints.iter().map(|_| Vec::new()).collect();
     for (index, (cost, label, artifact)) in unique.iter().enumerate() {
         // Measurement is independent of the declared tolerance grid. Encoding and decoding
@@ -130,10 +134,11 @@ pub fn frontier(
             };
             row.push(Evidence { label: label.clone(), cost: *cost, state });
         }
+        assessments.push(assessed);
     }
     let points = constraints.iter().copied().zip(evidence).map(|(c, e)| point(c, e)).collect();
     let bank = unique.into_iter().map(|(_, label, artifact)| Candidate { label, artifact }).collect();
-    Ok(Frontier { bank, points, measured_candidates })
+    Ok(Frontier { bank, points, assessments, measured_candidates })
 }
 
 /// Mutually exclusive alternatives at one declared location. Keeping the current computation is
@@ -352,6 +357,18 @@ mod tests {
         let a = frontier(&local, &run, bank.clone(), &[REAL_C, Constraint { local: 3.0, run: 0.002 }], 3).unwrap();
         assert_eq!(run.calls.load(std::sync::atomic::Ordering::Relaxed), 3);
         assert_eq!(a.measured_candidates, 3);
+        assert_eq!(a.assessments.len(), a.bank.len());
+        for (index, saved) in a.assessments.iter().enumerate() {
+            let measured = saved.as_ref().unwrap().as_ref().unwrap();
+            assert!(!measured.local_measure.blocks.is_empty());
+            assert_eq!(measured.run_measure.episodes.len(), 1);
+            assert!(measured.local.status().lower_bound().is_some());
+            assert!(measured.run.status().upper_bound().is_some());
+            if a.bank[index].label != "joint" {
+                assert!(measured.run_measure.episodes[0].kl > 0.0);
+                assert!(a.points.iter().all(|p| p.selected != Some(index)));
+            }
+        }
         for p in &a.points {
             assert_eq!(a.bank[p.selected.unwrap()].label, "joint");
             assert_eq!(p.gap, Some(0));
@@ -372,6 +389,8 @@ mod tests {
         let f = frontier(&local, &run, vec![same.clone(), same, candidate(&model, "joint", 2.0, 0.5)], &[REAL_C], 1).unwrap();
         assert_eq!(f.bank.len(), 2);
         assert_eq!(f.measured_candidates, 1);
+        assert_eq!(f.assessments.iter().filter(|a| a.is_some()).count(), 1);
+        assert_eq!(f.assessments.iter().filter(|a| a.is_none()).count(), 1);
         assert_eq!(run.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(f.points[0].evidence.iter().filter(|e| e.state == State::Unevaluated).count(), 1);
         assert!(f.points[0].lower_cost.is_some());
@@ -411,4 +430,25 @@ mod tests {
         assert_eq!(calls.len(), 5);
         assert!(combination_bank(&start, &groups, 5, |_, _, _| panic!("must reject before generation")).is_err());
     }
+    #[test]
+    fn failed_assessment_is_retained_once_without_fabricated_metrics() {
+        struct Refused(std::sync::atomic::AtomicUsize);
+        impl RunCheck for Refused {
+            fn episodes(&self, artifact: &Artifact) -> Result<Vec<super::super::acceptance::EpisodeScore>, String> {
+                assert!(!artifact.program.nodes.is_empty());
+                self.0.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+                Err("test execution refusal".into())
+            }
+        }
+        let (model,family) = fixture();
+        let local = Local::new(&model,family,None,2);
+        let run = Refused(std::sync::atomic::AtomicUsize::new(0));
+        let bank = vec![Candidate { label:"native".into(),artifact:Artifact::native(&model).unwrap() }];
+        let f = frontier(&local,&run,bank,&[REAL_C,Constraint { local:3.0,run:0.002 }],1).unwrap();
+        assert_eq!(run.0.load(std::sync::atomic::Ordering::Relaxed),1);
+        assert_eq!(f.assessments.len(),1);
+        assert_eq!(f.assessments[0].as_ref().unwrap().as_ref().unwrap_err(),"test execution refusal");
+        assert!(f.points.iter().all(|p| matches!(&p.evidence[0].state,State::Failed(error) if error=="test execution refusal")));
+    }
+
 }

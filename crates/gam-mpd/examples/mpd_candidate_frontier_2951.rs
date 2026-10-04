@@ -295,10 +295,8 @@ fn main() -> Result<(), String> {
                 return Err(format!("selected candidate {} failed saved-byte verification", candidate.label));
             }
             Some(json!({"index": index, "label": candidate.label, "artifact": path.display().to_string(), "bytes": byte_count, "sha256": hash,
-                "cost": measured.cost, "cost_bits": measured.cost.total(), "local_measure": measured.local_measure, "run_measure": measured.run_measure,
-                "local_verdict": format!("{:?}", local_fidelity.verdict()), "run_verdict": format!("{:?}", run_fidelity.verdict()),
-                "local_bounds": {"lower": measured.local.status().lower_bound(), "upper": measured.local.status().upper_bound()},
-                "run_bounds": {"lower": measured.run.status().lower_bound(), "upper": measured.run.status().upper_bound()}}))
+                "cost_bits": measured.cost.total(), "replay_index": index,
+                "local_verdict": format!("{:?}", local_fidelity.verdict()), "run_verdict": format!("{:?}", run_fidelity.verdict())}))
         } else {
             None
         };
@@ -316,8 +314,22 @@ fn main() -> Result<(), String> {
         "options": keys, "budget": budget, "max_bank": max_bank, "supplied_candidates": supplied_candidates,
         "distinct_candidates": evaluated.bank.len(), "measured_candidates": evaluated.measured_candidates, "account_count": account_count,
         "bank": evaluated.bank.iter().enumerate().map(|(index, c)| json!({"index": index, "label": c.label})).collect::<Vec<_>>(),
+        "assessments": evaluated.assessments.iter().enumerate().map(|(index, result)| match result {
+            None => json!({"index": index, "state": "unevaluated"}),
+            Some(Err(error)) => json!({"index": index, "state": "failed", "error": error}),
+            Some(Ok(measured)) => json!({"index": index, "state": "measured", "cost": measured.cost,
+                "local_measure": measured.local_measure, "run_measure": measured.run_measure,
+                "local_bounds": {"lower": measured.local.status().lower_bound(), "upper": measured.local.status().upper_bound()},
+                "run_bounds": {"lower": measured.run.status().lower_bound(), "upper": measured.run.status().upper_bound()}}),
+        }).collect::<Vec<_>>(),
         "local_export": local_export.display().to_string(), "local_sequences": count, "context": context, "local_rows": local_family.rows,
         "ascent_evaluations_per_step": ascent_evaluations, "run_rows": spec.rows, "episodes": spec.episodes.len(), "groups": spec.episodes.iter().map(|e| e.group.clone()).collect::<BTreeSet<_>>(),
+        "selected_replays": replayed.iter().map(|(index, (path, byte_count, hash, measured))| json!({
+            "index": index, "artifact": path.display().to_string(), "bytes": byte_count, "sha256": hash, "cost": measured.cost,
+            "local_measure": measured.local_measure, "run_measure": measured.run_measure,
+            "local_bounds": {"lower": measured.local.status().lower_bound(), "upper": measured.local.status().upper_bound()},
+            "run_bounds": {"lower": measured.run.status().lower_bound(), "upper": measured.run.status().upper_bound()}
+        })).collect::<Vec<_>>(),
         "input_hash_algorithm": "SHA-256", "input_files": inputs, "details": details,
         "seconds": {"load_and_generation": loaded_seconds, "input_hashing": hashing_seconds, "frontier": frontier_seconds, "selected_replay": replay_seconds, "total": started.elapsed().as_secs_f64()}
     });
