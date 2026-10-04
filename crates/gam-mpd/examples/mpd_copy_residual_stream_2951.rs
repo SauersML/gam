@@ -2,6 +2,7 @@
 //! EXPORT SPEC OUT max_bank=193 start=0 count=193 backend=cuda cuda_local=0 trace_bytes=2147483648
 use gam_mpd::acceptance::{Assessment, Constraint, CostCache, Local, assess_once, structural_cost};
 use gam_mpd::artifact::Artifact;
+use gam_mpd::import::import_language_model;
 use gam_mpd::coder_capture::sha256;
 use gam_mpd::counterfactual::{Decoder, Spec, passages};
 use gam_mpd::operator_program::{FamilyInputs, SequenceLayout, SlotValues};
@@ -59,7 +60,8 @@ fn main()->Result<(),String>{
     let bank=CopyResidualBank::new(&base,&nodes,heads/kv,&RANKS,max_bank)?;
     let run_passages=passages(export,spec.rows)?;
     let mut run=LanguageRun::new(&decoder,&native,&spec,&run_passages,1)?;
-    let mut local=Local::new(&native,family(&passages(export,16)?)?,None,16);
+    let local_family=family(&passages(export,16)?)?;
+    let mut local=Local::new(&native,local_family.clone(),None,16);
     if backend=="cuda"{let device=gam_gpu::tensor::Device::accelerator(gam_gpu::GpuPolicy::Required).map_err(|e|e.to_string())?.ok_or("CUDA required")?;if cuda_local==1{local=local.with_cuda(device.clone(),trace_bytes)?;}run=run.with_cuda(device,trace_bytes)?;}
     let mut cache=CostCache::default();let mut records:Vec<Value>=bank.choices().enumerate().map(|(i,c)|json!({"index":i+1,"choice":c,"cost_bits":null,"cost_lower_bound":0,"states":vec!["Unevaluated";grid.len()]})).collect();
     records.insert(0,json!({"index":0,"label":"native","cost_bits":null,"cost_lower_bound":0,"states":vec!["Unevaluated";grid.len()]}));
@@ -88,7 +90,8 @@ fn main()->Result<(),String>{
         if decoded.to_bytes()?!=saved || decoded.places!=base.places{return Err("selected saved-byte canonical/place check failed".into());}decoded.validate_coverage(&native)?;
         let replay=assess_once(&local,&run,&decoded,grid[0],&mut cache)?;
         if Some(replay.cost.total())!=records[index]["cost_bits"].as_u64() || json!(states(&replay,&grid)?)!=records[index]["states"]{return Err("selected replay changed cost or grid verdict".into());}
-        replays.push(json!({"index":index,"file":path.file_name().and_then(|p|p.to_str()),"sha256":sha256(&path)?,"bytes":saved.len(),"cost_bits":replay.cost.total(),"local":replay.local_measure,"run":replay.run_measure}));cache.clear_measurements();
+        let isolated_kl=gam_mpd::local_kl::isolated_downstream_kl(&native,&decoded,&local_family,16)?;
+        replays.push(json!({"isolated_downstream_patch_kl":isolated_kl,"diagnostic_only":true,"index":index,"file":path.file_name().and_then(|p|p.to_str()),"sha256":sha256(&path)?,"bytes":saved.len(),"cost_bits":replay.cost.total(),"local":replay.local_measure,"run":replay.run_measure}));cache.clear_measurements();
     }
     write_json(&out.join("REPORT.json"),&json!({"scope":scope,"records":records,"points":points,"selected_saved_byte_replays":replays,"seconds":begun.elapsed().as_secs_f64(),"peak_rss_bytes":peak_rss()}))?;Ok(())
 }
