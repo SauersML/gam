@@ -340,6 +340,218 @@ impl<'a> CopyMasks<'a> {
     }
 }
 
+/// The two uniformly enumerated attention-output approximations. Neither is selected
+/// by a singleton fidelity screen; exact decoded Local and autonomous Run remain required.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+pub enum HeadApproximation { CopyResidual, NativeSvd }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct CopyResidualChoice {
+    pub layer: usize,
+    pub head: usize,
+    pub rank: usize,
+    pub family: HeadApproximation,
+}
+
+struct HeadSvd {
+    u: Array2<f64>,
+    singular_values: Array1<f64>,
+    vt: Array2<f64>,
+}
+
+impl HeadSvd {
+    fn of(matrix: &Array2<f64>) -> Result<Self, String> {
+        let d = gam_linalg::decompose::svd(matrix.view(), false).map_err(|e| e.to_string())?;
+        Ok(Self { u: d.u, singular_values: d.singular_values, vt: d.vt })
+    }
+
+    fn operator(&self, original: &Operator, name: String, rank: usize, method: &str) -> Result<Operator, String> {
+        if rank == 0 || rank > self.singular_values.len() { return Err("head SVD rank outside matrix dimensions".into()); }
+        let kept: Vec<_> = (0..rank).collect();
+        let roots = Array1::from_iter(self.singular_values.iter().take(rank).map(|s| s.sqrt()));
+        // Explicit standard layout is required by the exact wire codec, also at k>1.
+        let mut left = (self.u.select(ndarray::Axis(1), &kept) * &roots).as_standard_layout().into_owned();
+        let mut right = (self.vt.select(ndarray::Axis(0), &kept) * &roots.insert_axis(ndarray::Axis(1))).as_standard_layout().into_owned();
+        left.mapv_inplace(|v| f64::from(v as f32));
+        right.mapv_inplace(|v| f64::from(v as f32));
+        let precision = exact_precision(left.iter().chain(right.iter()).copied()).map_err(|e| e.to_string())?;
+        Operator::low_rank(name, original.rows.clone(), original.cols.clone(), left, right, precision,
+            Provenance::derived(&[&original.provenance], format!("{method}; declared rank {rank}; balanced factors projected to f32"))).map_err(|e| e.to_string())
+    }
+}
+
+struct CopyResidualHead {
+    derived: super::artifact::Derived,
+    operator: std::sync::Arc<Operator>,
+    residual: HeadSvd,
+}
+
+#[derive(Default)]
+struct HeadApproxCache {
+    copy: std::sync::OnceLock<Result<CopyResidualHead, String>>,
+    native: std::sync::OnceLock<Result<HeadSvd, String>>,
+}
+
+/// Lazy, complete paired bank over all heads and explicitly declared positive ranks.
+/// The native evaluator adds one candidate. No full-model bank is materialized here.
+/// Copy is a priced derived operator; its residual is a separately priced LowRank
+/// operator at the same native attention output, retaining every intervention place.
+/// Full rank is only a numerical reconstruction endpoint, not an exactness certificate.
+pub struct CopyResidualBank<'a> {
+    start: &'a Artifact,
+    rules: HeadRules,
+    targets: Vec<(usize, usize)>,
+    ranks: Vec<usize>,
+    cache: Vec<HeadApproxCache>,
+    /// Includes the evaluator's native candidate.
+    pub candidate_count: usize,
+}
+
+/// Staged host timings, excluding acceptance metrics. Decoding is independent;
+/// the decoded-cost cache is temporary so it cannot retain full decoded models.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct HeadCheckTimings {
+    pub compose_f32_seconds: f64,
+    pub coverage_before_seconds: f64,
+    pub encode_seconds: f64,
+    pub decode_seconds: f64,
+    pub coverage_decoded_seconds: f64,
+    pub reencode_seconds: f64,
+    pub cost_before_seconds: f64,
+    pub cost_decoded_seconds: f64,
+}
+
+impl<'a> CopyResidualBank<'a> {
+    /// Complete cardinality, checked before caches, SVDs, or artifact copies.
+    pub fn cardinality(heads: impl IntoIterator<Item = usize>, ranks: &[usize]) -> Result<usize, String> {
+        if ranks.is_empty() || ranks.contains(&0) || ranks.iter().collect::<std::collections::BTreeSet<_>>().len() != ranks.len() {
+            return Err("declare nonempty distinct positive head ranks".into());
+        }
+        let mut count = 0usize;
+        for heads in heads {
+            if heads == 0 { return Err("a layer has no attention heads".into()); }
+            count = count.checked_add(heads).ok_or("head bank size overflow")?;
+        }
+        if count == 0 { return Err("head bank has no layers".into()); }
+        count.checked_mul(ranks.len()).and_then(|n| n.checked_mul(2)).and_then(|n| n.checked_add(1)).ok_or_else(|| "head bank size overflow".into())
+    }
+
+    pub fn new(start: &'a Artifact, layers: &[LayerNodes], group: usize, ranks: &[usize], max_bank: usize) -> Result<Self, String> {
+        let candidate_count = Self::cardinality(layers.iter().map(|l| l.queries.len()), ranks)?;
+        if candidate_count > max_bank { return Err(format!("complete paired head bank needs {candidate_count} including native, max_bank={max_bank}")); }
+        if group == 0 || !start.blocks.is_empty() || !start.derived.is_empty() || !start.exceptions.is_empty()
+            || start.native_nodes != start.program.nodes.len() || !start.places.iter().copied().eq((0..start.native_nodes).map(|n| (n,n)))
+            || !start.has_f32_literals()
+        { return Err("paired head bank requires a native f32 artifact, all native places, and positive query/KV group".into()); }
+        let mut targets = Vec::new();
+        for (layer, nodes) in layers.iter().enumerate() {
+            let heads = nodes.queries.len();
+            if heads % group != 0 || nodes.values.len() != heads/group || nodes.keys.len() != heads/group || nodes.reads.len() != heads {
+                return Err("inconsistent head counts in paired bank".into());
+            }
+            let Some(Node::Affine { terms, .. }) = start.program.nodes.get(nodes.attention) else { return Err("native attention output must be affine".into()); };
+            for head in 0..heads {
+                let o = operator(start, &format!("blocks.{layer}.o{head}"))?;
+                let op = &start.program.operators[o];
+                if ranks.iter().any(|r| *r > op.rows.width().min(op.cols.width())) { return Err(format!("declared rank exceeds blocks.{layer}.o{head} dimensions")); }
+                if terms.iter().filter(|(_, index)| *index == o).count() != 1
+                    || !terms.iter().any(|&(read, index)| index == o && read == nodes.reads[head]) {
+                    return Err("native head needs one affine term at its declared attention output".into());
+                }
+                targets.push((layer, head));
+            }
+        }
+        let cache = (0..targets.len()).map(|_| HeadApproxCache::default()).collect();
+        Ok(Self { start, rules: HeadRules { layers: layers.to_vec(), targets: Vec::new(), group, firsts: Default::default() }, targets,
+            ranks: ranks.to_vec(), cache, candidate_count })
+    }
+
+    /// Every head, rank and family, in declared canonical order, regardless of fidelity.
+    pub fn choices(&self) -> impl Iterator<Item = CopyResidualChoice> + '_ {
+        self.targets.iter().flat_map(move |&(layer, head)| self.ranks.iter().flat_map(move |&rank|
+            [HeadApproximation::CopyResidual, HeadApproximation::NativeSvd].into_iter().map(move |family| CopyResidualChoice { layer, head, rank, family })))
+    }
+
+    pub fn candidate(&self, choice: CopyResidualChoice) -> Result<Artifact, String> {
+        let CopyResidualChoice { layer, head, rank, family } = choice;
+        if !self.ranks.contains(&rank) { return Err("rank outside declared paired bank".into()); }
+        let index = self.targets.iter().position(|t| *t == (layer, head)).ok_or("head outside declared paired bank")?;
+        let o = operator(self.start, &format!("blocks.{layer}.o{head}"))?;
+        let original = &self.start.program.operators[o];
+        let mut out = self.start.clone();
+        match family {
+            HeadApproximation::NativeSvd => {
+                let svd = self.cache[index].native.get_or_init(|| HeadSvd::of(&original.matrix())).as_ref().map_err(|e| e.clone())?;
+                out.program.operators[o] = std::sync::Arc::new(svd.operator(original, original.name.clone(), rank, "ordinary native operator SVD")?);
+            }
+            HeadApproximation::CopyResidual => {
+                let copied = self.cache[index].copy.get_or_init(|| {
+                    let artifact = self.rules.copy(self.start, layer, head)?.candidate;
+                    let derived = artifact.derived.into_iter().next().ok_or("Copy head has no derivation")?;
+                    let op = artifact.program.operators[o].clone();
+                    let residual = HeadSvd::of(&(original.matrix() - &op.matrix()))?;
+                    Ok(CopyResidualHead { derived, operator: op, residual })
+                }).as_ref().map_err(|e| e.clone())?;
+                out.program.operators[o] = copied.operator.clone();
+                out.derived.push(copied.derived.clone());
+                let residual = copied.residual.operator(original, format!("blocks.{layer}.o{head}.copy_residual"), rank, "SVD of native O minus decoded Copy prediction")?;
+                let residual_index = out.program.operators.len();
+                out.program.operators.push(std::sync::Arc::new(residual));
+                let Node::Affine { terms, .. } = &mut out.program.nodes[self.rules.layers[layer].attention] else { return Err("attention is not affine".into()); };
+                let position = terms.iter().position(|(_, index)| *index == o).ok_or("head term lost")?;
+                let read = terms[position].0;
+                terms.insert(position + 1, (read, residual_index));
+            }
+        }
+        out.bind(&format!("attention {layer}"), &[self.rules.layers[layer].normed_stream], self.rules.layers[layer].attention)
+    }
+
+    /// Projection and exact decoded coverage/cost checks for a single lazy candidate.
+    /// C32 charges factors, Copy scale, wiring, bindings and all remaining native code;
+    /// exact wire byte count is separate from C32.
+    pub fn checked(&self, choice: CopyResidualChoice) -> Result<(Artifact, super::acceptance::StructuralCost, usize), String> {
+        self.checked_profiled(choice, &mut Default::default()).map(|(a,c,w,_)| (a,c,w))
+    }
+
+    /// A caller may retain the immutable original-operator cost cache across lazy
+    /// candidates. Independently decoded operators use a fresh temporary cache,
+    /// preventing accumulation of a full native model for every decoded candidate.
+    /// No coverage, roundtrip or cost-equivalence check is bypassed.
+    pub fn checked_profiled(&self, choice: CopyResidualChoice, cache: &mut super::acceptance::CostCache)
+        -> Result<(Artifact, super::acceptance::StructuralCost, usize, HeadCheckTimings), String>
+    {
+        let mut timing = HeadCheckTimings::default();
+        let started = std::time::Instant::now();
+        let artifact = self.candidate(choice)?.f32_literals()?;
+        timing.compose_f32_seconds = started.elapsed().as_secs_f64();
+        let started = std::time::Instant::now();
+        artifact.validate_coverage(&self.start.program)?;
+        timing.coverage_before_seconds = started.elapsed().as_secs_f64();
+        let started = std::time::Instant::now();
+        let bytes = artifact.to_bytes()?;
+        timing.encode_seconds = started.elapsed().as_secs_f64();
+        let started = std::time::Instant::now();
+        let decoded = Artifact::from_bytes(&bytes, &self.start.program.declarations)?;
+        timing.decode_seconds = started.elapsed().as_secs_f64();
+        let started = std::time::Instant::now();
+        decoded.validate_coverage(&self.start.program)?;
+        if !decoded.has_f32_literals() || decoded.places != self.start.places { return Err("paired head bank lost literal projection or places".into()); }
+        timing.coverage_decoded_seconds = started.elapsed().as_secs_f64();
+        let started = std::time::Instant::now();
+        if decoded.to_bytes()? != bytes { return Err("paired head bank lost canonical roundtrip".into()); }
+        timing.reencode_seconds = started.elapsed().as_secs_f64();
+        let started = std::time::Instant::now();
+        let cost = super::acceptance::structural_cost(&artifact, cache)?;
+        timing.cost_before_seconds = started.elapsed().as_secs_f64();
+        let started = std::time::Instant::now();
+        let decoded_cost = super::acceptance::structural_cost(&decoded, &mut Default::default())?;
+        timing.cost_decoded_seconds = started.elapsed().as_secs_f64();
+        if cost != decoded_cost { return Err("decoded paired head C32 differs".into()); }
+        Ok((decoded, cost, bytes.len(), timing))
+    }
+
+}
+
 impl HeadRules {
     /// The proposer for `targets`' heads, with every match's content planes found on `start`.
     pub fn new(start: &Artifact, layers: Vec<LayerNodes>, targets: Vec<usize>, group: usize) -> Result<Self, String> {
@@ -485,5 +697,124 @@ impl Proposer for HeadRules {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod copy_residual_tests {
+    use super::*;
+    use super::super::operator_program::{Declarations, FamilyInputs, OperatorProgram, Slot, SlotValues};
+    use std::sync::Arc;
+
+    fn fixture() -> (Artifact, Vec<LayerNodes>) {
+        let (d, w) = (Interface::native(8).unwrap(), Interface::native(4).unwrap());
+        let diag = |name: String| Operator::diag(name, d.clone(), Array1::ones(8), exact_precision([1.0]).unwrap(), Provenance::default()).unwrap();
+        let mut operators = vec![Arc::new(diag("final_norm.gain".into()))];
+        let mut nodes = vec![Node::Raw { slot: 0 }];
+        let mut layers = Vec::new();
+        let mut stream = 0;
+        for layer in 0..4 {
+            let gain = operators.len();
+            operators.push(Arc::new(diag(format!("blocks.{layer}.rms1.gain"))));
+            let normed = nodes.len();
+            nodes.push(Node::Affine { terms: vec![(stream, gain)], bias: None });
+            let mut reads = Vec::new();
+            let mut terms = Vec::new();
+            for head in 0..6 {
+                let v = operators.len();
+                let values = Array2::from_shape_fn((4,8), |(r,c)| if r==c { 1.0 } else { 0.0 });
+                operators.push(Arc::new(dense(&format!("blocks.{layer}.v{head}"), &w, &d, values).unwrap()));
+                let read = nodes.len(); nodes.push(Node::Affine { terms: vec![(normed,v)], bias: None }); reads.push(read);
+                let o = operators.len();
+                let values = Array2::from_shape_fn((8,4), |(r,c)| if r==c { 1.0 + (layer as f64)/8.0 + (head as f64)/4.0 + (c as f64)/16.0 }
+                    else { ((((r+1)*(c+1)*(head+layer+1))%7) as f64 - 3.0)/16.0 });
+                operators.push(Arc::new(dense(&format!("blocks.{layer}.o{head}"), &d, &w, values).unwrap()));
+                terms.push((read,o));
+            }
+            let attention = nodes.len(); nodes.push(Node::Affine { terms, bias: None });
+            layers.push(LayerNodes { stream, normed_stream: normed, queries: reads.clone(), keys: reads.clone(), values: reads.clone(), reads,
+                attention, attended: attention, normed, pre: 0, active: 0, mlp: attention, residual: attention });
+            stream = attention;
+        }
+        nodes.push(Node::Affine { terms: vec![(stream,0)], bias: None });
+        let program = OperatorProgram { declarations: Declarations { domains: vec![], slots: vec![Slot::Raw { width: 8 }], parameters: 0 },
+            bases: vec![], operators, rules: vec![], output: nodes.len()-1, nodes };
+        (Artifact::native(&program).unwrap(), layers)
+    }
+
+    #[test]
+    fn copy_residual_complete_count_guards_before_math_and_lazy_pairs() {
+        assert_eq!(CopyResidualBank::cardinality([6;4], &[8,32,64,96]).unwrap(),193);
+        assert!(CopyResidualBank::cardinality([usize::MAX], &[1,2]).is_err());
+        assert!(CopyResidualBank::cardinality([6;4], &[1,1]).is_err());
+        assert!(CopyResidualBank::cardinality([6;4], &[0]).is_err());
+        let (start,layers)=fixture();
+        let error = CopyResidualBank::new(&start,&layers,1,&[8,32,64,96],192).err().unwrap();
+        assert!(error.contains("needs 193"), "budget guard precedes even matrix rank validation");
+        let bank=CopyResidualBank::new(&start,&layers,1,&[1,2,3,4],193).unwrap();
+        assert_eq!((bank.candidate_count,bank.choices().count()),(193,192));
+        assert!(bank.cache.iter().all(|c| c.copy.get().is_none() && c.native.get().is_none()));
+        let first=bank.choices().next().unwrap();
+        bank.candidate(first).unwrap();
+        assert!(bank.cache[0].copy.get().is_some());
+        assert!(bank.cache[0].native.get().is_none());
+        assert!(bank.cache[1..].iter().all(|c| c.copy.get().is_none() && c.native.get().is_none()));
+    }
+
+    #[test]
+    fn copy_residual_all_heads_ranks_keep_places_roundtrip_and_charge_every_literal() {
+        let (start,layers)=fixture();
+        let bank=CopyResidualBank::new(&start,&layers,1,&[1,2,3,4],193).unwrap();
+        let native_cost=super::super::acceptance::structural_cost(&start,&mut Default::default()).unwrap();
+        let mut cache=super::super::acceptance::CostCache::default();
+        let mut visited=std::collections::BTreeSet::new();
+        for choice in bank.choices() {
+            let (candidate,cost,wire,timing)=bank.checked_profiled(choice,&mut cache).unwrap();
+            visited.insert((choice.layer,choice.head,choice.rank));
+            assert_eq!(candidate.places,start.places);
+            assert_eq!(candidate.program.nodes.len(),start.program.nodes.len());
+            assert_eq!(candidate.blocks.len(),1);
+            assert_eq!(candidate.blocks[0].native_write,layers[choice.layer].attention);
+            assert!(wire>0 && timing.decode_seconds.is_finite());
+            let added=usize::from(choice.family==HeadApproximation::CopyResidual);
+            assert_eq!(cost.literals,native_cost.literals-32+12*choice.rank as u64+added as u64);
+            assert_eq!(candidate.program.operators.len(),start.program.operators.len()+added);
+            assert_eq!(candidate.derived.len(),added);
+            assert!(candidate.derived.iter().all(|d|d.residual.is_empty()));
+            if choice.rank==4 { assert!(cost.total()>native_cost.total(),"full rank factor representation is more expensive than native here"); }
+        }
+        assert_eq!(visited.len(),96);
+    }
+
+    #[test]
+    fn copy_residual_full_rank_is_numerical_and_native_head_interventions_remain_live() {
+        let (start,layers)=fixture();
+        let bank=CopyResidualBank::new(&start,&layers,1,&[2,4],97).unwrap();
+        let family=FamilyInputs { rows: 2,slots:vec![SlotValues::Raw(Array2::from_shape_fn((2,8),|(r,c)|((r+1)*(c+1)) as f64/16.0))],layout:None };
+        let read=layers[3].reads[0];
+        for kind in [HeadApproximation::CopyResidual,HeadApproximation::NativeSvd] {
+            let (candidate,_,_)=bank.checked(CopyResidualChoice {layer:3,head:0,rank:4,family:kind}).unwrap();
+            let o=operator(&start,"blocks.3.o0").unwrap();
+            let mut reconstructed=candidate.program.operators[o].matrix();
+            if kind==HeadApproximation::CopyResidual { reconstructed+=&candidate.program.operators.last().unwrap().matrix(); }
+            let expected=start.program.operators[o].matrix();
+            assert!(reconstructed.iter().zip(&expected).all(|(a,b)|(a-b).abs()<1e-5),"full-rank recovery checked after literal rounding, never assumed exact");
+            let native=start.execute(&family).unwrap();
+            let clean=candidate.execute(&family).unwrap();
+            let patched=candidate.execute_edited(&family,|n,v,_| { if n==read { v.fill(0.0); } Ok(()) }).unwrap();
+            let native_patch=start.execute_edited(&family,|n,v,_| { if n==read { v.fill(0.0); } Ok(()) }).unwrap();
+            let out=candidate.program.output;
+            assert!(clean.values[out].iter().zip(&native.values[out]).all(|(a,b)|(a-b).abs()<1e-5*b.abs().max(1.0)));
+            assert!(patched.values[out].iter().zip(&native_patch.values[out]).all(|(a,b)|(a-b).abs()<1e-5*b.abs().max(1.0)));
+            assert_ne!(clean.values[out],patched.values[out],"a native head activation edit changes the final output");
+        }
+        // A compressed residual must respond through both summands to the same native head read.
+        let (candidate,_,_)=bank.checked(CopyResidualChoice {layer:3,head:0,rank:2,family:HeadApproximation::CopyResidual}).unwrap();
+        let clean=candidate.execute(&family).unwrap();
+        let patched=candidate.execute_edited(&family,|n,v,_| { if n==read { v.fill(0.0); } Ok(()) }).unwrap();
+        let o=operator(&start,"blocks.3.o0").unwrap();
+        let expected=candidate.program.operators[o].apply(&clean.values[read])+candidate.program.operators.last().unwrap().apply(&clean.values[read]);
+        let delta=&clean.values[candidate.program.output]-&patched.values[candidate.program.output];
+        assert!(delta.iter().zip(&expected).all(|(a,b)|(a-b).abs()<1e-8*b.abs().max(1.0)));
     }
 }
