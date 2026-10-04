@@ -38,7 +38,7 @@ fn heads_that_match_at_different_gains_and_coordinates_bind_with_their_own_scale
     // Head two: its content coordinates changed by an invertible S (keys S K, queries S⁻ᵀ Q), at
     // scale 2.5 instead.
     let s = &random(rows.len(), rows.len(), 7) + &(Array2::<f64>::eye(rows.len()) * 3.0);
-    let s_inverse_t = super::dense::solve(s.view(), Array2::<f64>::eye(rows.len()).view()).expect("invertible").reversed_axes();
+    let s_inverse_t = gam_linalg::decompose::solve(s.view(), Array2::<f64>::eye(rows.len()).view()).expect("invertible").reversed_axes();
     let mut key_two = key.clone();
     let mut query_two = random(width, d, 8);
     let (key_rows, query_rows) = (key.select(Axis(0), &rows), query.select(Axis(0), &rows));
@@ -74,7 +74,7 @@ fn copying_and_anti_copying_heads_bind_the_copy_body_with_their_signs() {
     }
     // Writing what was read: through the gains, the value head's reads come back out.
     let written = prediction.dot(&value);
-    let reads = value.t().dot(&super::dense::solve(value.dot(&value.t()).view(), value.view()).expect("solve"));
+    let reads = value.t().dot(&gam_linalg::decompose::solve(value.dot(&value.t()).view(), value.view()).expect("solve"));
     let through = &reads * &(&g / &gf).insert_axis(Axis(1));
     assert!((&written - &through).mapv(f64::abs).iter().fold(0.0_f64, |m, x| m.max(*x)) < 1e-8);
 }

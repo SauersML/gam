@@ -560,24 +560,6 @@ impl<'a> RemlState<'a> {
 }
 
 impl FirthDenseOperator {
-    pub(crate) fn canonicalize_basis_column_signs(q_basis: &mut Array2<f64>) {
-        for col in 0..q_basis.ncols() {
-            let mut pivot_row = 0usize;
-            let mut pivot_abs = 0.0_f64;
-            for row in 0..q_basis.nrows() {
-                let value = q_basis[[row, col]];
-                let abs_value = value.abs();
-                if abs_value > pivot_abs {
-                    pivot_abs = abs_value;
-                    pivot_row = row;
-                }
-            }
-            if pivot_abs > 0.0 && q_basis[[pivot_row, col]] < 0.0 {
-                q_basis.column_mut(col).mapv_inplace(|v| -v);
-            }
-        }
-    }
-
     pub(crate) fn identifiable_subspace_basis_from_gram(
         gram: &Array2<f64>,
     ) -> Result<(Array2<f64>, Array1<f64>), EstimationError> {
@@ -616,7 +598,7 @@ impl FirthDenseOperator {
             q_basis.column_mut(col_idx).assign(&evecs.column(eig_idx));
             metric_spectrum[col_idx] = evals[eig_idx];
         }
-        Self::canonicalize_basis_column_signs(&mut q_basis);
+        gam_linalg::decompose::canonical_column_signs(&mut q_basis);
         Ok((q_basis, metric_spectrum))
     }
 

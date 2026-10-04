@@ -35,7 +35,7 @@ fn a_subcomponent_split_in_two_halves_is_merged_back() {
     let (w, samples, describe) = site();
     // The map's two singular pieces, the first one split into two identical halves that always
     // run together.
-    let d = super::dense::svd(w.view(), false).expect("svd");
+    let d = gam_linalg::decompose::svd(w.view(), false).expect("svd");
     let mut u_rows = Vec::new();
     let mut v_rows = Vec::new();
     for j in 0..d.singular_values.len() {
@@ -64,7 +64,7 @@ fn a_subcomponent_split_in_two_halves_is_merged_back() {
 #[test]
 fn given_sets_are_priced_as_the_selection_prices_its_own() {
     let (w, samples, describe) = site();
-    let d = super::dense::svd(w.view(), false).expect("svd");
+    let d = gam_linalg::decompose::svd(w.view(), false).expect("svd");
     let roots: Vec<f64> = d.singular_values.iter().map(|s| s.sqrt()).collect();
     let k = roots.len();
     let library = Library {
@@ -84,7 +84,7 @@ fn given_sets_are_priced_as_the_selection_prices_its_own() {
 #[test]
 fn groups_fitted_by_evidence_partition_their_columns_and_code_no_worse_than_rank_one() {
     let (w, samples, describe) = site();
-    let d = super::dense::svd(w.view(), false).expect("svd");
+    let d = gam_linalg::decompose::svd(w.view(), false).expect("svd");
     let roots = d.singular_values.mapv(f64::sqrt);
     let u = (&d.u * &roots).t().to_owned();
     let v = (d.vt.t().to_owned() * &roots).t().to_owned();
@@ -101,7 +101,7 @@ fn the_run_time_selection_chooses_the_measured_sets() {
     let (w, samples, describe) = site();
     // The map's singular pieces, the first split into unequal halves along its read: three
     // subcomponents whose sets differ across the inputs.
-    let d = super::dense::svd(w.view(), false).expect("svd");
+    let d = gam_linalg::decompose::svd(w.view(), false).expect("svd");
     let roots = d.singular_values.mapv(f64::sqrt);
     let mut u = (&d.u * &roots).t().to_owned();
     let mut v = (d.vt.t().to_owned() * &roots).t().to_owned();

@@ -275,7 +275,7 @@ fn toy5_operator_equality_separates_laws_that_share_every_subspace() {
             assert_eq!(dense, RoutingToy::transport(&toy.value, &toy.output, &[head]), "the owner's C_h is O_h V_h");
         }
         let transport = RoutingToy::transport(&toy.value, &toy.output, heads);
-        let singular_values = crate::dense::svd(transport.view(), false).expect("svd").singular_values;
+        let singular_values = gam_linalg::decompose::svd(transport.view(), false).expect("svd").singular_values;
         resolved_singular_count(&singular_values, transport.nrows(), transport.ncols(), 0.0)
     };
     assert_eq!(rank(&[0]), 2);

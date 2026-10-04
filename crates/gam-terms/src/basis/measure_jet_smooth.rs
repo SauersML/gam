@@ -1074,13 +1074,7 @@ fn representer_section_chart(
         // decomposition happens to return is not a property of the geometry.
         // Pin it on the entry of largest magnitude so the realized chart is
         // reproducible across faer revisions and platforms.
-        let mut pivot = 0usize;
-        for row in 1..z_rbf.ncols() {
-            if right[(index, row)].abs() > right[(index, pivot)].abs() {
-                pivot = row;
-            }
-        }
-        let sign = if right[(index, pivot)] < 0.0 { -1.0 } else { 1.0 };
+        let sign = gam_linalg::decompose::canonical_sign((0..z_rbf.ncols()).map(|row| right[(index, row)]));
         for row in 0..z_rbf.ncols() {
             transform[(row, column)] = sign * right[(index, row)] * inverse;
         }

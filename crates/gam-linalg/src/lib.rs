@@ -26,6 +26,7 @@ pub mod anderson;
 pub mod condition;
 pub mod curvature_resolution;
 pub mod decision;
+pub mod decompose;
 pub mod dense;
 mod error;
 pub mod faer_ndarray;

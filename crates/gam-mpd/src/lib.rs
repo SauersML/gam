@@ -158,9 +158,6 @@ pub mod precision;
 // The native edit compiler: control settings to native parameter edits, or infeasibility witnesses.
 pub mod compile;
 
-// Dense float64 decompositions on faer with canonical signs.
-pub mod dense;
-
 // A `.safetensors` checkpoint read into exactly widened binary64 arrays.
 pub mod safetensors;
 

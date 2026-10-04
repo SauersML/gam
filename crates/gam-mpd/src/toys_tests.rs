@@ -118,7 +118,7 @@ fn identities_hold_in_both_programs() {
         .iter()
         .map(|site| {
             let w = matrix(model, site).expect("the site's map");
-            let decomposition = crate::dense::svd(w.view(), false).expect("an SVD");
+            let decomposition = gam_linalg::decompose::svd(w.view(), false).expect("an SVD");
             let rank = decomposition.singular_values.len();
             let u = Array2::from_shape_fn((rank, w.nrows()), |(c, i)| decomposition.u[[i, c]] * decomposition.singular_values[c]);
             let library = Library { v: decomposition.vt.clone(), u, mean: Array1::zeros(w.ncols()) };

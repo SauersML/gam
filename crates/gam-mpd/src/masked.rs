@@ -122,7 +122,8 @@ use super::operator_program::{
     Trace, remap_node,
 };
 use super::precision::DeclaredPrecision;
-use gam_linalg::faer_ndarray::fast_atb;
+use gam_linalg::faer_ndarray::{fast_ata, fast_atb};
+use gam_linalg::matrix::{symmetrize, symmetrize_in_place};
 use ndarray::{Array1, Array2, Axis, s};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -1644,7 +1645,7 @@ pub fn site_statistics(
         for (site, (sum, outer, _)) in sites.iter().zip(stats.iter_mut()) {
             let x = read_values(&trace, site)?;
             *sum += &x.sum_axis(Axis(0));
-            *outer += &fast_atb(&x, &x);
+            *outer += &fast_ata(&x);
         }
         rows += inputs.rows as f64;
         for _ in 0..samples {
@@ -2690,24 +2691,21 @@ impl Running {
 /// shrunk halfway to the isotropic matrix of its own mean eigenvalue, so a direction the data barely
 /// resolve is not amplified beyond the mean scale.
 pub(super) fn shrunk_inverse(m: &Array2<f64>) -> Result<Array2<f64>, String> {
-    let mut sym = m.clone();
-    let n = sym.nrows();
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let v = 0.5 * (sym[[i, j]] + sym[[j, i]]);
-            sym[[i, j]] = v;
-            sym[[j, i]] = v;
-        }
-    }
-    let lambda = (0..n).map(|i| sym[[i, i]]).sum::<f64>() / n.max(1) as f64;
-    let d = super::dense::eigh(sym.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
-    let mut scaled = d.vectors.clone();
-    for (k, l) in d.values.iter().enumerate() {
+    let (d, lambda) = shrunk_spectrum(m)?;
+    Ok(d.map(|l| {
         let shifted = l.max(0.0) + lambda;
-        let inv = if shifted > 0.0 { 1.0 / shifted } else { 0.0 };
-        scaled.column_mut(k).mapv_inplace(|x| x * inv);
-    }
-    Ok(scaled.dot(&d.vectors.t()))
+        if shifted > 0.0 { 1.0 / shifted } else { 0.0 }
+    }))
+}
+
+/// The eigendecomposition of `M`'s symmetric part and its mean eigenvalue `tr M / dim`, the shift
+/// of [`shrunk_inverse`] and [`shrunk_roots`].
+fn shrunk_spectrum(m: &Array2<f64>) -> Result<(gam_linalg::decompose::Eigh, f64), String> {
+    let sym = symmetrize(m);
+    let n = sym.nrows();
+    let lambda = (0..n).map(|i| sym[[i, i]]).sum::<f64>() / n.max(1) as f64;
+    let d = gam_linalg::decompose::eigh(sym.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
+    Ok((d, lambda))
 }
 
 /// Apply the shrunk PSD preconditioner by a Cholesky solve, avoiding eigenvectors and an
@@ -2749,15 +2747,8 @@ pub(super) fn keep_sum(g: &Array2<f64>, other: &Array2<f64>) -> Result<Array2<f6
         // otherᵀ other and other otherᵀ have the same nonzero eigenvalues. Work in piece
         // space when it is smaller, projecting onto the same resolved column space without
         // allocating a layer-width Gram matrix or its pseudoinverse.
-        let mut gram = gam_linalg::faer_ndarray::fast_abt(other, other);
-        for i in 0..gram.nrows() {
-            for j in i + 1..gram.ncols() {
-                let value = 0.5 * (gram[[i, j]] + gram[[j, i]]);
-                gram[[i, j]] = value;
-                gram[[j, i]] = value;
-            }
-        }
-        let spectrum = super::dense::eigh(gram.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
+        let gram = fast_ata(&other.t());
+        let spectrum = gam_linalg::decompose::eigh(gram.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
         let band = gam_linalg::roundoff::symmetric_spectrum_rounding_band_at_dim(other.ncols(), &spectrum.values.to_vec());
         // Project directly onto the unresolved/null eigenspace. Subtracting the resolved
         // projection from g leaves roundoff even when that space spans every piece; a line
@@ -2768,23 +2759,9 @@ pub(super) fn keep_sum(g: &Array2<f64>, other: &Array2<f64>) -> Result<Array2<f6
         }
         return Ok(gam_linalg::faer_ndarray::fast_ab(&spectrum.vectors, &coefficients));
     }
-    let gram = fast_atb(other, other);
-    let mut sym = gram.clone();
-    let n = sym.nrows();
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let v = 0.5 * (sym[[i, j]] + sym[[j, i]]);
-            sym[[i, j]] = v;
-            sym[[j, i]] = v;
-        }
-    }
-    let d = super::dense::eigh(sym.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
-    let mut scaled = d.vectors.clone();
-    for (k, l) in d.values.iter().enumerate() {
-        let inverse = if *l > d.band { 1.0 / l } else { 0.0 };
-        scaled.column_mut(k).mapv_inplace(|x| x * inverse);
-    }
-    let pinv = scaled.dot(&d.vectors.t());
+    let gram = fast_ata(other);
+    let d = gam_linalg::decompose::eigh(gram.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
+    let pinv = d.map(|l| if l > d.band { 1.0 / l } else { 0.0 });
     let coefficients = pinv.dot(&fast_atb(other, g));
     Ok(g - &other.dot(&coefficients))
 }
@@ -2849,7 +2826,7 @@ pub fn step_pieces(
             let mut batch_covariances = Vec::new();
             for site in &masked.sites {
                 let reads = read_values(&trace, site)?;
-                batch_covariances.push(fast_atb(&reads, &reads) / rows);
+                batch_covariances.push(fast_ata(&reads) / rows);
             }
             (kl_now, grads, curvature, batch_covariances, Evaluated::Host(trace, cotangent), None, false)
         }
@@ -3109,25 +3086,9 @@ pub fn split(library: &Library, x: &Array2<f64>, mask: &Array2<f64>) -> (Library
 /// eigenvalue (as the pieces' preconditioner is), so a direction the data barely resolve is
 /// neither amplified nor dropped.
 fn shrunk_roots(m: &Array2<f64>) -> Result<(Array2<f64>, Array2<f64>), String> {
-    let mut sym = m.clone();
-    let n = sym.nrows();
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let v = 0.5 * (sym[[i, j]] + sym[[j, i]]);
-            sym[[i, j]] = v;
-            sym[[j, i]] = v;
-        }
-    }
-    let lambda = (0..n).map(|i| sym[[i, i]]).sum::<f64>() / n.max(1) as f64;
-    let d = super::dense::eigh(sym.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
-    let (mut half, mut inverse) = (d.vectors.clone(), d.vectors.clone());
-    for (k, l) in d.values.iter().enumerate() {
-        let shifted = l.max(0.0) + lambda;
-        let (h, i) = if shifted > 0.0 { (shifted.sqrt(), 1.0 / shifted.sqrt()) } else { (0.0, 0.0) };
-        half.column_mut(k).mapv_inplace(|x| x * h);
-        inverse.column_mut(k).mapv_inplace(|x| x * i);
-    }
-    Ok((half.dot(&d.vectors.t()), inverse.dot(&d.vectors.t())))
+    let (d, lambda) = shrunk_spectrum(m)?;
+    let shifted = |l: f64| l.max(0.0) + lambda;
+    Ok((d.map(|l| shifted(l).sqrt()), d.map(|l| if shifted(l) > 0.0 { 1.0 / shifted(l).sqrt() } else { 0.0 })))
 }
 
 /// New pieces for site `k` from what its selection leaves out on a sequence: the site's own map on
@@ -3158,19 +3119,14 @@ pub fn dropped_atoms(
     let (f_half, f_inverse) = shrunk_roots(&running.fishers[k])?;
     // The reads whitened by this sequence's own covariance (on its support), so the
     // cross-covariance below is the regression itself.
-    let covariance = fast_atb(&centred, &centred) / rows;
-    let decomposed_reads = super::dense::eigh(covariance.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
-    let mut s_inverse_factor = decomposed_reads.vectors.clone();
-    for (j, l) in decomposed_reads.values.iter().enumerate() {
-        let inverse = if *l > decomposed_reads.band { 1.0 / l.sqrt() } else { 0.0 };
-        s_inverse_factor.column_mut(j).mapv_inplace(|x| x * inverse);
-    }
-    let s_inverse = s_inverse_factor.dot(&decomposed_reads.vectors.t());
+    let covariance = fast_ata(&centred) / rows;
+    let decomposed_reads = gam_linalg::decompose::eigh(covariance.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
+    let s_inverse = decomposed_reads.map(|l| if l > decomposed_reads.band { 1.0 / l.sqrt() } else { 0.0 });
     // The whitened regression of the left-out map on the whitened reads.
     let whitened_out = residual.dot(&f_half);
     let whitened_in = centred.dot(&s_inverse);
     let cross = fast_atb(&whitened_out, &whitened_in) / rows;
-    let decomposed = super::dense::svd(cross.view(), false).map_err(|e| format!("{e:?}"))?;
+    let decomposed = gam_linalg::decompose::svd(cross.view(), false).map_err(|e| format!("{e:?}"))?;
     let mut vs = Vec::new();
     let mut us = Vec::new();
     for (i, sigma) in decomposed.singular_values.iter().enumerate() {

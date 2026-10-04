@@ -7,7 +7,7 @@ use rand::{RngExt, SeedableRng};
 
 use gam_linalg::roundoff::SymmetricAssembly;
 
-use super::super::dense::solve;
+use gam_linalg::decompose::solve;
 use super::super::lift::{TensorId, TensorRegistry, TieOrientation, UseMap, UseSiteId};
 use super::super::supports::{EvidenceStatus, ExactBasis};
 use super::super::test_support::test_governor;
@@ -671,7 +671,7 @@ mod coupled_controls {
 }
 
 mod fixed_rank_chart {
-    use super::super::super::dense::solve;
+    use gam_linalg::decompose::solve;
     use super::super::chart::{ChartSetting, FactorBinding, FixedRankChart, compile_chart_edit};
     use gam_linalg::utils::frobenius_norm;
     use super::*;

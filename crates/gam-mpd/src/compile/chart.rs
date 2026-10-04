@@ -80,7 +80,7 @@ use gam_math::roundoff::inflated;
 use ndarray::{Array2, ArrayView2, Axis, concatenate};
 
 use super::super::apply::FactoredEdit;
-use super::super::dense::{QrMode, qr, solve, svd};
+use gam_linalg::decompose::{QrMode, qr, solve, svd};
 use super::super::gauge::{AllInputs, LinearPassthrough};
 use super::super::lift::{TensorId, TensorRegistry};
 use super::super::supports::{EvidenceStatus, ExactBasis};

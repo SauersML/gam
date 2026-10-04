@@ -100,7 +100,7 @@ use gam_math::roundoff::{UNIT_ROUNDOFF, inflated};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, concatenate, s};
 
 use super::super::apply::FactoredEdit;
-use super::super::dense::{eigh, svd};
+use gam_linalg::decompose::{eigh, svd};
 use super::super::lift::{TensorId, TensorRegistry, TieOrientation, UseMap, UseSiteId};
 use super::super::supports::{EvidenceStatus, ExactBasis};
 use super::ties::{TieConstraint, TieViolation, check_ties};

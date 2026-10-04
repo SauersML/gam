@@ -42,7 +42,7 @@ use gam_linalg::utils::frobenius_norm;
 use gam_math::roundoff::inflated;
 use ndarray::{Array1, Array2, ArrayView2, Axis};
 
-use super::super::dense::eigh;
+use gam_linalg::decompose::eigh;
 use super::super::supports::{EvidenceStatus, ExactBasis};
 use super::{CompileError, require_finite, require_shape};
 

@@ -3,7 +3,7 @@
 //! rotary language model of `device_program_tests`.
 
 use super::blocks::Generic;
-use super::dense::svd;
+use gam_linalg::decompose::svd;
 use super::device_program_tests::{devices, fixture, noise};
 use super::device_train::{Settings, Trainer, statistics};
 use super::masked::{Library, Masked, matrix, sites};

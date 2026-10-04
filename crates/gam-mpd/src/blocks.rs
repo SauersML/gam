@@ -46,10 +46,11 @@
 //! shrinks and splits are tested one at a time. Every kept merge is followed by the selection, kept when it
 //! lowers the total again.
 
-use super::dense::{QrMode, eigh, qr, svd};
+use gam_linalg::decompose::{QrMode, eigh, qr, svd};
 use super::masked::{Coder, Library, Masked, Site, Target, fisher, forward, mask_gradients, read_values, score_only, select};
 use super::operator_program::{FamilyInputs, OperatorProgram};
-use gam_linalg::faer_ndarray::fast_ab;
+use gam_linalg::faer_ndarray::{fast_ab, fast_ata};
+use gam_linalg::matrix::symmetrize;
 use gam_linalg::roundoff::SymmetricAssembly;
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
 use std::collections::{BTreeMap, BTreeSet};
@@ -102,8 +103,8 @@ impl Generic {
         let sites = statistics
             .iter()
             .map(|site| {
-                let moment = symmetric(&site.second_moment);
-                let fisher = symmetric(&site.fisher);
+                let moment = symmetrize(&site.second_moment);
+                let fisher = symmetrize(&site.fisher);
                 let (trace_c, trace_f) = (moment.diag().sum(), fisher.diag().sum());
                 GenericSite { moment, fisher, trace_c, trace_f }
             })
@@ -312,10 +313,6 @@ pub fn block_inner(library: &Library, (si, ki): (usize, usize), (sj, kj): (usize
 pub fn block_cosine(library: &Library, a: (usize, usize), b: (usize, usize)) -> f64 {
     let norm = block_inner(library, a, a).max(0.0).sqrt() * block_inner(library, b, b).max(0.0).sqrt();
     if norm > 0.0 { block_inner(library, a, b) / norm } else { 0.0 }
-}
-
-fn symmetric(m: &Array2<f64>) -> Array2<f64> {
-    (m + &m.t()) * 0.5
 }
 
 /// A decomposition's code, totalled over the scored rows of every batch (module note).
@@ -607,7 +604,7 @@ pub(crate) fn split_block(blocked: &Blocked, k: usize, c: usize, moment: &Array2
     let s = Array1::from_iter(u.outer_iter().map(|row| row.dot(&row)));
     let roots = s.mapv(f64::sqrt);
     let scaled = Array2::from_shape_fn(moment.dim(), |(i, j)| roots[i] * moment[[i, j]] * roots[j]);
-    let r = eigh(symmetric(&scaled).view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?.vectors;
+    let r = eigh(symmetrize(&scaled).view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?.vectors;
     let down = Array2::from_shape_fn(r.dim(), |(i, j)| r[[i, j]] / roots[i]);
     let up = Array2::from_shape_fn(r.dim(), |(i, j)| r[[i, j]] * roots[i]);
     let (u_new, v_new) = (down.t().dot(&u), up.t().dot(&v));
@@ -729,7 +726,7 @@ fn member_moments(coded: &Coded<'_>, blocked: &Blocked) -> Result<Vec<Vec<Array2
                 let Some(v) = &readers[k][c] else { continue };
                 let members: Vec<usize> = (0..inputs.rows).filter(|&r| masks[k][[r, c]] > 0.0).collect();
                 let z = x.select(Axis(0), &members).dot(&v.t());
-                *moment += &z.t().dot(&z);
+                *moment += &fast_ata(&z);
             }
         }
     }

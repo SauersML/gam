@@ -1307,7 +1307,7 @@ fn fingerprint(a: ArrayView2<'_, f64>) -> (usize, usize, u64, u64) {
 
 /// A proven upper bound on `‖A‖₂`, the least of: the largest computed singular value plus the
 /// decomposition's band (every singular value is within the band of an exact one,
-/// `dense::svd`), the Frobenius norm, and for a matrix with at most one nonzero per row and per
+/// `gam_linalg::decompose::svd`), the Frobenius norm, and for a matrix with at most one nonzero per row and per
 /// column (a diagonal gain, a permutation) its largest entry, which is then exact. Bounds are kept
 /// per matrix content, so an operator met again is not decomposed again.
 pub(crate) fn matrix_spectral_bound(a: ArrayView2<'_, f64>) -> Result<f64, ProgramError> {
@@ -1327,7 +1327,7 @@ pub(crate) fn matrix_spectral_bound(a: ArrayView2<'_, f64>) -> Result<f64, Progr
     } else if sparse {
         largest
     } else {
-        let decomposition = super::dense::svd(a, false).map_err(|error| ProgramError::Shape(format!("spectral bound: {error:?}")))?;
+        let decomposition = gam_linalg::decompose::svd(a, false).map_err(|error| ProgramError::Shape(format!("spectral bound: {error:?}")))?;
         let top = decomposition.singular_values.iter().fold(0.0_f64, |m, v| m.max(*v));
         (top + decomposition.band).next_up().min(frobenius)
     };

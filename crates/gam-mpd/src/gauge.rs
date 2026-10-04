@@ -11,7 +11,7 @@
 //! Every operator acts through its factors; nothing here forms a `d_out × d_in` product.
 
 use gam_linalg::faer_ndarray::{FaerLinalgError, FaerQr, FaerSvd, fast_ab, fast_abt, fast_av};
-use gam_linalg::roundoff::{accumulation_growth, factor_singular_band};
+use gam_linalg::roundoff::{accumulation_growth, factor_singular_band, householder_qr_backward_band};
 use gam_linalg::utils::frobenius_norm;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, concatenate, s};
 
@@ -109,8 +109,8 @@ impl LinearPassthrough {
     /// The difference is `L Rᵀ` with `L = [B′ | −B]` and `R = [A′ᵀ | Aᵀ]`, each with
     /// `k = r′ + r` columns. A factor with at least `k` rows is replaced by its thin
     /// QR `Q T`. Householder QR is backward stable: `T` is the exact triangle of
-    /// `L + δL` for an exactly orthonormal `Q`, with `‖δL‖₂` inside
-    /// `factor_singular_band(rows, k, ‖L‖_F)`. So `‖T_L T_Rᵀ‖₂` is the norm of the
+    /// `L + δL` for an exactly orthonormal `Q`, with `‖δL‖_F` inside
+    /// [`householder_qr_backward_band`]`(rows, k, ‖T‖_F)`. So `‖T_L T_Rᵀ‖₂` is the norm of the
     /// perturbed difference. A factor with fewer rows than `k` is used as it is,
     /// with no error.
     ///
@@ -168,7 +168,7 @@ impl LinearPassthrough {
 struct RangeFactor {
     core: Array2<f64>,
     basis: Option<Array2<f64>>,
-    /// The QR backward-error band on `‖δM‖₂`, zero when no QR was taken.
+    /// The QR backward-error band on `‖δM‖_F` (so on `‖δM‖₂`), zero when no QR was taken.
     backward_error: f64,
 }
 
@@ -183,10 +183,12 @@ impl RangeFactor {
             });
         }
         let (q, t) = factor.qr().map_err(|failure| decomposition_failed(what, &failure))?;
+        let core = t.slice(s![..k, ..k]).to_owned();
+        let backward_error = householder_qr_backward_band(rows, k, frobenius_norm(core.view()));
         Ok(Self {
-            core: t.slice(s![..k, ..k]).to_owned(),
+            core,
             basis: Some(q.slice(s![.., ..k]).to_owned()),
-            backward_error: factor_singular_band(rows, k, frobenius_norm(factor)),
+            backward_error,
         })
     }
 }

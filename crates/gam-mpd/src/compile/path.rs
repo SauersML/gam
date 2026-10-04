@@ -54,7 +54,7 @@ use gam_math::special::logistic;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 
 use super::super::apply::FactoredEdit;
-use super::super::dense::svd;
+use gam_linalg::decompose::svd;
 use super::super::lift::{TensorId, TensorRegistry};
 use super::super::supports::{EvidenceStatus, ExactBasis};
 use super::{

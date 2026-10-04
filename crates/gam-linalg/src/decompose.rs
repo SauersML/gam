@@ -1,8 +1,10 @@
-//! Dense float64 decompositions on faer with deterministic signs (#2951).
+//! Dense float64 decompositions on faer with deterministic signs and rounding bands.
 //!
-//! The engine and the edit compiler read spectra, frames and solves of dense matrices.
-//! Every decomposition is faer's at the parallelism `gam_linalg` names, never LAPACK's, and
-//! two runs of one matrix agree bit for bit.
+//! Every decomposition is faer's at the parallelism [`decomposition_parallelism`] names, never
+//! LAPACK's, and two runs of one matrix agree bit for bit. A caller that serializes a frame, reads
+//! a determinant off one, or compares two fits needs the same vectors every time, not the signs one
+//! solver run happened to return: [`canonical_sign`] is the one rule for that, here and in every
+//! crate that fixes a sign itself.
 //!
 //! # Sign conventions
 //!
@@ -36,10 +38,11 @@ use std::fmt;
 use faer::dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::svd::{self as faer_svd, ComputeSvdVectors};
 use faer::{Mat, MatRef, Side};
-use gam_linalg::faer_ndarray::{
-    FaerArrayView, FaerLinalgError, FaerLu, FaerQr, FaerSvd, decomposition_parallelism, strict_symmetric_eigh,
+use crate::faer_ndarray::{
+    FaerArrayView, FaerLinalgError, FaerLu, FaerQr, FaerSvd, decomposition_parallelism, fast_abt, strict_symmetric_eigh,
 };
-use gam_linalg::roundoff::{SymmetricAssembly, factor_singular_band, symmetric_spectrum_rounding_band};
+use crate::matrix::symmetrize_in_place;
+use crate::roundoff::{SymmetricAssembly, factor_singular_band, symmetric_spectrum_rounding_band};
 use ndarray::{Array1, Array2, ArrayView2, Axis, concatenate, s};
 
 /// Why a dense decomposition was declined.
@@ -109,11 +112,12 @@ fn to_array(mat: MatRef<'_, f64>) -> Array2<f64> {
     Array2::from_shape_fn((mat.nrows(), mat.ncols()), |(row, col)| mat[(row, col)])
 }
 
-/// `-1` when the first largest-magnitude entry of `vector` is negative, else `1`.
-fn canonical_sign<'a>(vector: impl Iterator<Item = &'a f64>) -> f64 {
+/// `-1` when the first largest-magnitude entry of `vector` is negative, else `1` (also for a zero
+/// vector): the sign that makes a vector defined only up to sign canonical.
+pub fn canonical_sign(vector: impl IntoIterator<Item = f64>) -> f64 {
     let mut best = 0.0_f64;
     let mut sign = 1.0;
-    for &value in vector {
+    for value in vector {
         if value.abs() > best {
             best = value.abs();
             sign = if value < 0.0 { -1.0 } else { 1.0 };
@@ -122,11 +126,11 @@ fn canonical_sign<'a>(vector: impl Iterator<Item = &'a f64>) -> f64 {
     sign
 }
 
-/// Flips every column of `vectors` to the canonical sign, and returns the signs.
-fn canonical_columns(vectors: &mut Array2<f64>) -> Vec<f64> {
+/// Flips every column of `vectors` to its [`canonical_sign`], and returns the signs.
+pub fn canonical_column_signs(vectors: &mut Array2<f64>) -> Vec<f64> {
     let mut signs = Vec::with_capacity(vectors.ncols());
     for mut column in vectors.columns_mut() {
-        let sign = canonical_sign(column.iter());
+        let sign = canonical_sign(column.iter().copied());
         if sign < 0.0 {
             column.mapv_inplace(|value| -value);
         }
@@ -144,6 +148,24 @@ pub struct Eigh {
     pub vectors: Array2<f64>,
     /// Every eigenvalue of the whole spectrum is within this of an exact one.
     pub band: f64,
+}
+
+impl Eigh {
+    /// The spectral function `V diag(f(λ)) Vᵀ` over the eigenpairs held, mirrored to exact
+    /// symmetry; an eigenpair with `f(λ) = 0` (one below a caller's floor, say) adds nothing and
+    /// costs nothing.
+    pub fn map(&self, f: impl Fn(f64) -> f64) -> Array2<f64> {
+        let weights: Vec<(usize, f64)> = self.values.iter().map(|&value| f(value)).enumerate().filter(|(_, weight)| *weight != 0.0).collect();
+        let kept: Vec<usize> = weights.iter().map(|(index, _)| *index).collect();
+        let vectors = self.vectors.select(Axis(1), &kept);
+        let mut scaled = vectors.clone();
+        for (mut column, (_, weight)) in scaled.columns_mut().into_iter().zip(&weights) {
+            column.mapv_inplace(|value| value * weight);
+        }
+        let mut out = fast_abt(&scaled, &vectors);
+        symmetrize_in_place(&mut out);
+        out
+    }
 }
 
 /// The eigendecomposition of the symmetric matrix `a`; with `indices`, only the
@@ -173,7 +195,7 @@ pub fn eigh(
     let chosen = &ranked[start..end];
     let values = Array1::from_iter(chosen.iter().map(|&index| values[index]));
     let mut vectors = vectors.select(Axis(1), chosen);
-    canonical_columns(&mut vectors);
+    canonical_column_signs(&mut vectors);
     Ok(Eigh { values, vectors, band })
 }
 
@@ -217,9 +239,9 @@ pub fn svd(a: ArrayView2<'_, f64>, full: bool) -> Result<Svd, DenseError> {
     let mut u = concatenate![Axis(1), leading_u, u.slice(s![.., rank..])];
     let mut vt = concatenate![Axis(0), leading_vt, vt.slice(s![rank.., ..])];
     let singular_values = Array1::from_iter(order.iter().map(|&index| sigma[index]));
-    let signs = canonical_columns(&mut u);
+    let signs = canonical_column_signs(&mut u);
     for (index, mut row) in vt.rows_mut().into_iter().enumerate() {
-        let sign = if index < rank { signs[index] } else { canonical_sign(row.iter()) };
+        let sign = if index < rank { signs[index] } else { canonical_sign(row.iter().copied()) };
         if sign < 0.0 {
             row.mapv_inplace(|value| -value);
         }
@@ -373,8 +395,27 @@ mod tests {
         let gram = decomposed.vectors.t().dot(&decomposed.vectors);
         assert!(close(&gram, &Array2::eye(3), 1e-14));
         for column in decomposed.vectors.columns() {
-            assert!(canonical_sign(column.iter()) > 0.0);
+            assert!(canonical_sign(column.iter().copied()) > 0.0);
         }
+    }
+
+    #[test]
+    fn a_spectral_function_rebuilds_the_matrix_and_its_pseudo_inverse_root() {
+        // Rank two: eigenvalues 0, 1, 4 of a rotated diagonal.
+        let q = qr(array![[1.0, 2.0, 0.5], [0.0, 1.0, -1.0], [3.0, 0.0, 1.0]].view(), QrMode::Economic).expect("qr").q.expect("q");
+        let a = q.dot(&Array2::from_diag(&array![0.0, 1.0, 4.0])).dot(&q.t());
+        let a = (&a + &a.t()) * 0.5;
+        let decomposed = eigh(a.view(), SymmetricAssembly::Mirrored, None).expect("eigh");
+        let rebuilt = decomposed.map(|value| value);
+        assert!(close(&rebuilt, &a, 1e-13));
+        assert_eq!(rebuilt, rebuilt.t());
+        // The pseudo-inverse root over the eigenvalues above the band: R A R is A's range projector.
+        let root = decomposed.map(|value| if value > decomposed.band { 1.0 / value.sqrt() } else { 0.0 });
+        let projector = root.dot(&a).dot(&root);
+        let range = q.select(Axis(1), &[1, 2]);
+        assert!(close(&projector, &range.dot(&range.t()), 1e-13));
+        // Nothing kept is the zero matrix.
+        assert_eq!(decomposed.map(|_| 0.0), Array2::<f64>::zeros((3, 3)));
     }
 
     #[test]
@@ -391,7 +432,7 @@ mod tests {
             assert_eq!(decomposed.u.dim(), if full { (3, 3) } else { (3, 2) });
             assert_eq!(decomposed.vt.dim(), (2, 2));
             for column in decomposed.u.columns() {
-                assert!(canonical_sign(column.iter()) > 0.0);
+                assert!(canonical_sign(column.iter().copied()) > 0.0);
             }
             let orthogonal = decomposed.u.t().dot(&decomposed.u);
             assert!(close(&orthogonal, &Array2::eye(decomposed.u.ncols()), 1e-13));

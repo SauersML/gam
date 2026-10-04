@@ -55,7 +55,7 @@
 
 use gam_mpd::blocks::{Bits, Blocked, Coded, fit_blocks, measure, reselect, rounding_error};
 use gam_mpd::codec::subset_code_len_bits;
-use gam_mpd::dense::{QrMode, qr, svd};
+use gam_linalg::decompose::{QrMode, qr, svd};
 use gam_mpd::describe::{Chart, Geometry, Metric, Structured, logit_gauss_newton};
 use gam_mpd::import::import;
 use gam_mpd::masked::{Library, Site, Target, forward, matrix, read_values, site_statistics, sites};

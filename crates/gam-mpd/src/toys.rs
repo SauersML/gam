@@ -43,7 +43,7 @@
 //! A mechanism is recovered when each holds by a majority: purity and coverage above 1/2, activity
 //! F1 above 1/2, attention above 1/2 on the targets.
 
-use super::dense::svd;
+use gam_linalg::decompose::svd;
 use super::explanation::{Explanation, Replacement};
 use super::import::{Imported, import, import_rows, sequence_rows};
 use super::masked::{Masked, Site};

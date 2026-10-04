@@ -11,7 +11,8 @@
 //! What the supports of `A` and `B` leave out is appended as the singular pieces of the remainder,
 //! so all pieces on is the map itself.
 
-use super::dense::{eigh, svd};
+use gam_linalg::decompose::{eigh, svd};
+use gam_linalg::matrix::{symmetrize, symmetrize_in_place};
 use gam_linalg::roundoff::{SymmetricAssembly, accumulation_growth};
 use ndarray::{Array1, Array2, Axis, concatenate};
 
@@ -38,23 +39,8 @@ pub struct Library {
 /// `(M^{1/2}, M^{-1/2})` of a symmetric positive semidefinite matrix over the eigenvalues above
 /// its decomposition's band.
 fn roots(m: &Array2<f64>) -> Result<(Array2<f64>, Array2<f64>), String> {
-    let mut sym = m.clone();
-    let n = sym.nrows();
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let v = 0.5 * (sym[[i, j]] + sym[[j, i]]);
-            sym[[i, j]] = v;
-            sym[[j, i]] = v;
-        }
-    }
-    let decomposed = eigh(sym.view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
-    let (mut half, mut inverse) = (decomposed.vectors.clone(), decomposed.vectors.clone());
-    for (k, l) in decomposed.values.iter().enumerate() {
-        let (h, i) = if *l > decomposed.band { (l.sqrt(), 1.0 / l.sqrt()) } else { (0.0, 0.0) };
-        half.column_mut(k).mapv_inplace(|x| x * h);
-        inverse.column_mut(k).mapv_inplace(|x| x * i);
-    }
-    Ok((half.dot(&decomposed.vectors.t()), inverse.dot(&decomposed.vectors.t())))
+    let d = eigh(symmetrize(m).view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
+    Ok((d.map(|l| if l > d.band { l.sqrt() } else { 0.0 }), d.map(|l| if l > d.band { 1.0 / l.sqrt() } else { 0.0 })))
 }
 
 /// The whitened problem of one site.
@@ -161,13 +147,7 @@ pub fn fisher_svd_narrow(w: &Array2<f64>, narrow: &Narrow) -> Result<(Library, V
     };
     let (half, inverse) = roots(whitening)?;
     let mut gram = half.dot(metric).dot(&half);
-    for i in 0..gram.nrows() {
-        for j in (i + 1)..gram.ncols() {
-            let mean = 0.5 * (gram[[i, j]] + gram[[j, i]]);
-            gram[[i, j]] = mean;
-            gram[[j, i]] = mean;
-        }
-    }
+    symmetrize_in_place(&mut gram);
     let decomposed = eigh(gram.view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
     let mut kept: Vec<usize> = (0..decomposed.values.len()).filter(|&i| decomposed.values[i] > decomposed.band).collect();
     kept.sort_by(|a, b| decomposed.values[*b].total_cmp(&decomposed.values[*a]));

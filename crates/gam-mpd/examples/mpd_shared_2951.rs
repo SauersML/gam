@@ -67,7 +67,7 @@ fn sets(dir: &Path, names: &[String]) -> Result<Vec<Vec<(usize, usize)>>, String
 fn basis(moment: &Array2<f64>, readers: &[(&Array2<f64>, Vec<f64>)]) -> Result<Array2<f64>, String> {
     use gam_linalg::roundoff::SymmetricAssembly;
     let d = moment.nrows();
-    let e = gam_mpd::dense::eigh(((moment + &moment.t()) * 0.5).view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
+    let e = gam_linalg::decompose::eigh(((moment + &moment.t()) * 0.5).view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
     let (mut root, mut inverse) = (e.vectors.clone(), e.vectors.clone());
     for (i, l) in e.values.iter().enumerate() {
         let (a, b) = if *l > e.band { (l.sqrt(), 1.0 / l.sqrt()) } else { (0.0, 0.0) };
@@ -81,7 +81,7 @@ fn basis(moment: &Array2<f64>, readers: &[(&Array2<f64>, Vec<f64>)]) -> Result<A
         let weighted = &whitened * &Array1::from(weights.clone()).insert_axis(Axis(1));
         scatter += &whitened.t().dot(&weighted);
     }
-    let s = gam_mpd::dense::eigh(((&scatter + &scatter.t()) * 0.5).view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
+    let s = gam_linalg::decompose::eigh(((&scatter + &scatter.t()) * 0.5).view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
     let mut order: Vec<usize> = (0..d).collect();
     order.sort_by(|a, b| s.values[*b].total_cmp(&s.values[*a]));
     Ok(inverse.dot(&s.vectors.select(Axis(1), &order)))

@@ -81,7 +81,7 @@
 //! sums, `√T 2⁻²⁴` of the largest.
 
 use super::blocks::Describe;
-use super::dense::{QrMode, eigh, qr, svd};
+use gam_linalg::decompose::{QrMode, eigh, qr, svd};
 use super::derivatives::vjp;
 use super::device::proposing;
 use super::masked::{Library, Site, Target, read_values, sampled_label_cotangent};

@@ -45,7 +45,7 @@ use gam_mpd::compile::ControlRealization;
 use gam_mpd::compile::linear::{
     Coverage, EditMetric, LinearSiteProblem, OffTargetInputs, Requirement, ResponseClass, compile_linear_site,
 };
-use gam_mpd::dense::eigh;
+use gam_linalg::decompose::eigh;
 use gam_mpd::lift::{TensorId, TensorRegistry, TieOrientation, UseMap, UseSiteId};
 use gam_mpd::supports::EvidenceStatus;
 use ndarray::{Array1, Array2, Axis};

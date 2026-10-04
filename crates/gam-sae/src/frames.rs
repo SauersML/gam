@@ -721,25 +721,9 @@ impl GrassmannFrame {
         mut frame: Array2<f64>,
         gauge_singular_values: Array1<f64>,
     ) -> Self {
-        let (p, r) = frame.dim();
-        for col in 0..r {
-            // Sign-fix: make the largest-magnitude entry of each column
-            // non-negative so `U` and `−U` (same span) serialize identically.
-            let mut pivot_abs = 0.0_f64;
-            let mut pivot_val = 0.0_f64;
-            for row in 0..p {
-                let v = frame[[row, col]];
-                if v.abs() > pivot_abs {
-                    pivot_abs = v.abs();
-                    pivot_val = v;
-                }
-            }
-            if pivot_val < 0.0 {
-                for row in 0..p {
-                    frame[[row, col]] = -frame[[row, col]];
-                }
-            }
-        }
+        // Sign-fix: make the largest-magnitude entry of each column
+        // non-negative so `U` and `−U` (same span) serialize identically.
+        gam_linalg::decompose::canonical_column_signs(&mut frame);
         Self {
             frame,
             gauge_singular_values,

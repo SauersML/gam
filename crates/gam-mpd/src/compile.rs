@@ -103,7 +103,7 @@ use gam_runtime::resource::MemoryReservationError;
 
 use super::apply::{ApplyError, FactoredEdit};
 use super::bounds::BoundError;
-use super::dense::DenseError;
+use gam_linalg::decompose::DenseError;
 use super::gauge::GaugeRefusal;
 use super::joint_operators::JointRefusal;
 use super::lift::{LiftError, TensorId, TensorRegistry};

@@ -61,7 +61,7 @@
 //! scale, or not). [`attention_letters`] turns each group of heads into one summed transport
 //! (with a pre-norm input gain and a post-norm output gain folded in).
 
-use gam_linalg::faer_ndarray::{FaerLinalgError, FaerQr, fast_abt, fast_atb, fast_atv};
+use gam_linalg::faer_ndarray::{FaerLinalgError, FaerQr, fast_abt, fast_ata, fast_atv};
 use gam_linalg::roundoff::{accumulation_growth, householder_qr_backward_band};
 use gam_runtime::resource::{MemoryGovernor, MemoryReservation, MemoryReservationError};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, AsArray, Axis, Dimension, concatenate, s};
@@ -428,7 +428,7 @@ pub fn family_gram(governor: &MemoryGovernor, family: &[&FactoredOperator]) -> R
             concatenate(Axis(1), &rights).map_err(shape_failed)?,
         )
     };
-    let (left_gram, right_gram) = (fast_atb(&left, &left), fast_atb(&right, &right));
+    let (left_gram, right_gram) = (fast_ata(&left), fast_ata(&right));
     let offsets: Vec<usize> = family
         .iter()
         .scan(0, |offset, operator| {

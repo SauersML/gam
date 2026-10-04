@@ -43,7 +43,7 @@
 //! decision runs on a float64 device.
 
 use super::blocks::Describe;
-use super::dense::{eigh, svd};
+use gam_linalg::decompose::{eigh, svd};
 use super::device_program::DeviceProgram;
 use super::masked::{Library, Masked, Site};
 use super::operator_program::{FamilyInputs, Node, OperatorProgram, SlotValues};
@@ -691,7 +691,7 @@ impl Trainer {
             let site = &self.sites[k];
             let us: Vec<&Tensor> = site.writes.iter().map(|b| self.program.dense(b.op)).collect::<Result<_, _>>()?;
             let vs: Vec<&Tensor> = site.reads.iter().map(|b| self.program.dense(b.op)).collect::<Result<_, _>>()?;
-            let decompose = |held: &[&Tensor], (ta, tb): (Op, Op)| -> Result<super::dense::Eigh, String> {
+            let decompose = |held: &[&Tensor], (ta, tb): (Op, Op)| -> Result<gam_linalg::decompose::Eigh, String> {
                 let blocks: Vec<Vec<Tensor>> = held.iter().map(|a| held.iter().map(|b| product(&d, a, ta, b, tb, 1.0, exact)).collect()).collect::<Result<_, _>>()?;
                 eigh(assemble(&d, &blocks)?.view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))
             };

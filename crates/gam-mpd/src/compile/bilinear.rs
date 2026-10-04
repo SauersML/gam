@@ -55,7 +55,7 @@ use ndarray::{Array1, Array2, ArrayView2};
 use super::super::apply::FactoredEdit;
 use super::super::attention::RotaryEmbedding;
 use super::super::bounds::total_variation_over_logit_boxes;
-use super::super::dense::eigh;
+use gam_linalg::decompose::eigh;
 use gam_linalg::roundoff::SymmetricAssembly;
 use super::super::lift::{TensorId, TensorRegistry};
 use super::super::secant::{BandedMatrix, BandedVector, bilinear_change, softmax_change};

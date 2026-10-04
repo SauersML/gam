@@ -72,7 +72,7 @@
 //! the gated fits, about 3,000, almost all of it their KL.
 
 use super::codec::{fixed_index_len_bits, prefix_integer_len_bits, subset_code_len_bits};
-use super::dense::{eigh, solve, svd};
+use gam_linalg::decompose::{eigh, solve, svd};
 use gam_linalg::faer_ndarray::fast_abt;
 use gam_linalg::roundoff::SymmetricAssembly;
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};

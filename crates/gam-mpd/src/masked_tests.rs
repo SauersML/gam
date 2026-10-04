@@ -321,7 +321,7 @@ fn pieces_grown_from_what_selection_leaves_out_recover_its_kl() {
     // Three pieces: the site map's leading three singular directions; the rest of the map is in
     // no piece.
     let w = super::masked::matrix(&program, &site).expect("matrix");
-    let decomposed = super::dense::svd(w.view(), false).expect("svd");
+    let decomposed = gam_linalg::decompose::svd(w.view(), false).expect("svd");
     let mut v = Array2::<f64>::zeros((pieces, WIDTH));
     let mut u = Array2::<f64>::zeros((pieces, UNITS));
     for c in 0..pieces.min(decomposed.singular_values.len()) {
@@ -410,7 +410,7 @@ fn selection_never_commits_masks_it_did_not_evaluate_across_attention() {
     let target = Target::every_row(program.execute(&family, false).expect("executes").values[program.output].clone());
     let site = sites(&program).into_iter().find(|s| s.name == "V").expect("the value site");
     let w = super::masked::matrix(&program, &site).expect("matrix");
-    let decomposed = super::dense::svd(w.view(), false).expect("svd");
+    let decomposed = gam_linalg::decompose::svd(w.view(), false).expect("svd");
     let pieces = decomposed.singular_values.len();
     let mut v = Array2::<f64>::zeros((pieces, 4));
     let mut u = Array2::<f64>::zeros((pieces, 4));
@@ -578,7 +578,7 @@ fn piece_space_projection_matches_width_space_and_preserves_the_native_sum() {
     // Assemble the reference symmetrically, just as the historical implementation did.
     let mut sym = gram;
     for i in 0..sym.nrows() { for j in i + 1..sym.ncols() { let x = 0.5 * (sym[[i, j]] + sym[[j, i]]); sym[[i, j]] = x; sym[[j, i]] = x; } }
-    let spectrum = super::dense::eigh(sym.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).expect("width spectrum");
+    let spectrum = gam_linalg::decompose::eigh(sym.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).expect("width spectrum");
     let mut scaled = spectrum.vectors.clone();
     for (k, value) in spectrum.values.iter().enumerate() { scaled.column_mut(k).mapv_inplace(|x| if *value > spectrum.band { x / value } else { 0.0 }); }
     let reference = &g - &other.dot(&scaled.dot(&spectrum.vectors.t()).dot(&other.t().dot(&g)));

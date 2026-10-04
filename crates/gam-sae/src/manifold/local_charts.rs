@@ -1802,21 +1802,8 @@ fn build_local_chart(
         for c in 0..p {
             frame[[c, ax]] = vt[[ax, c]];
         }
-        let mut pivot = 0usize;
-        let mut best = frame[[0, ax]].abs();
-        for c in 1..p {
-            let v = frame[[c, ax]].abs();
-            if v > best {
-                best = v;
-                pivot = c;
-            }
-        }
-        if frame[[pivot, ax]] < 0.0 {
-            for c in 0..p {
-                frame[[c, ax]] = -frame[[c, ax]];
-            }
-        }
     }
+    gam_linalg::decompose::canonical_column_signs(&mut frame);
     // Chart coordinates of every member: centered · frame  (m × d).
     let coords = centered.dot(&frame);
 

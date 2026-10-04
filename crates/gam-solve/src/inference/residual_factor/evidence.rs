@@ -889,17 +889,7 @@ pub(super) fn fit_rank(moments: &BinnedMoments, rank: usize) -> Result<RankFit, 
             }
         }
         lambda = lambda.dot(&rot);
-        for k in 0..rank {
-            let mut pivot = 0usize;
-            for i in 1..p {
-                if lambda[[i, k]].abs() > lambda[[pivot, k]].abs() {
-                    pivot = i;
-                }
-            }
-            if lambda[[pivot, k]] < 0.0 {
-                lambda.column_mut(k).mapv_inplace(|v| -v);
-            }
-        }
+        gam_linalg::decompose::canonical_column_signs(&mut lambda);
     }
     Ok(RankFit {
         log_evidence,

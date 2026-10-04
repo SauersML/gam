@@ -20,7 +20,7 @@
 //! least-squares scales. [`with_operator`] gives the program with one operator's matrix replaced, so a
 //! rule's derived operator runs in the model itself.
 
-use super::dense::{eigh, svd};
+use gam_linalg::decompose::{eigh, svd};
 use super::operator_program::{Operator, OperatorProgram, Provenance, exact_precision};
 use gam_linalg::roundoff::SymmetricAssembly;
 use ndarray::{Array1, Array2, Axis};
