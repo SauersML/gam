@@ -1792,6 +1792,33 @@ impl OperatorProgram {
         Ok(Trace { values: top, bands: None, balls: None })
     }
 
+    /// The unbanded trace of `inputs` with `edit` applied to each node's value as soon as it is
+    /// computed, before any later node reads it: `edit(node, value, earlier)` sees the evaluated
+    /// prefix (`earlier`, every node before `node`) and may change `value` in place (an
+    /// intervention at a place, a state patched from another run, an explicit exception). The
+    /// edited value must keep its shape.
+    pub fn execute_edited<F>(&self, inputs: &FamilyInputs, mut edit: F) -> Result<Trace, ProgramError>
+    where
+        F: FnMut(usize, &mut Array2<f64>, &[Array2<f64>]) -> Result<(), String>,
+    {
+        self.check_inputs(inputs)?;
+        let interfaces = self.interfaces()?;
+        let ones = vec![1.0; self.declarations.parameters];
+        let frame = Frame { args: &[], parameters: &ones, nodes: &self.nodes, output: self.output };
+        let mut top: Vec<Array2<f64>> = Vec::with_capacity(self.nodes.len());
+        for (index, node) in self.nodes.iter().enumerate() {
+            let values = Layered { base: &[], top: &top, from: 0, patch: None };
+            let mut value = self.evaluate_node(index, node, inputs, &values, None, &interfaces, &frame)?.0;
+            let shape = value.dim();
+            edit(index, &mut value, &top).map_err(ProgramError::Input)?;
+            if value.dim() != shape {
+                return Err(ProgramError::Input(format!("an edit of node {index} changed its shape {shape:?} to {:?}", value.dim())));
+            }
+            top.push(value);
+        }
+        Ok(Trace { values: top, bands: None, balls: None })
+    }
+
     /// The unbanded trace of `inputs` when each gated node `(node, mask)` is read only through its
     /// elementwise product with the 0/1 mask node `mask` (an earlier node): such a node is evaluated
     /// at its mask's nonzero entries alone, each a dot product of its dense terms' rows with their
@@ -2164,22 +2191,6 @@ impl OperatorProgram {
         let output = top.swap_remove(body.output);
         let band = banded.then(|| top_bands.swap_remove(body.output));
         Ok((output, band))
-    }
-
-    /// The slots a rule body reads directly (its arguments carry the rest).
-    fn rule_slots(&self, rule: usize) -> Result<BTreeSet<usize>, ProgramError> {
-        let body = self.rules.get(rule).ok_or(ProgramError::Reference { what: "rule", index: rule })?;
-        let mut read = BTreeSet::new();
-        for node in &body.nodes {
-            match node {
-                Node::Feature { slot, .. } | Node::Raw { slot } => {
-                    read.insert(*slot);
-                }
-                Node::Call { rule: inner, .. } => read.extend(self.rule_slots(*inner)?),
-                _ => continue,
-            }
-        }
-        Ok(read)
     }
 
     /// The token ids a gathered feature `node` of this program reads on `inputs` (module note,
