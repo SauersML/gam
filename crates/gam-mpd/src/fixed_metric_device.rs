@@ -97,7 +97,7 @@ impl Measure {
                 .or_default()
                 .push(&episode.kl);
         }
-        let groups = grouped
+        let groups: Vec<Group> = grouped
             .into_iter()
             .map(|(name, outcomes)| {
                 let count = outcomes.len();
@@ -111,6 +111,7 @@ impl Measure {
         let result_numeric_storage_estimate_bytes = episodes
             .len()
             .saturating_mul(std::mem::size_of::<Episode>())
+            .saturating_add(groups.len().saturating_mul(std::mem::size_of::<Group>()))
             .saturating_add(std::mem::size_of::<Self>());
         Self {
             episodes,
@@ -146,6 +147,7 @@ fn mean_outcomes(outcomes: &[&Outcome]) -> Outcome {
 pub struct Resident {
     device: Device,
     columns: usize,
+    readout_rows: usize,
     budget: Budget,
     required_bytes: usize,
     compare_cpu: bool,
@@ -198,6 +200,7 @@ impl Resident {
         Ok(Self {
             device,
             columns,
+            readout_rows,
             budget,
             required_bytes,
             compare_cpu,
@@ -215,6 +218,8 @@ impl Resident {
             count: 0,
             agree: 0,
             pending_from: 0,
+            domain_start: None,
+            domain_end: None,
             comparison: self.compare_cpu.then(CpuComparison::default),
             timing: Timing::default(),
         }
@@ -229,6 +234,8 @@ pub struct Stream<'a> {
     count: usize,
     agree: usize,
     pending_from: usize,
+    domain_start: Option<usize>,
+    domain_end: Option<usize>,
     comparison: Option<CpuComparison>,
     timing: Timing,
 }
@@ -237,6 +244,17 @@ impl Stream<'_> {
         if p.dim() != q.dim() || p.ncols() != self.resident.columns {
             return Err("checked metric tile shape mismatch".into());
         }
+        if p.nrows() > self.resident.readout_rows {
+            return Err("incoming normalized tile exceeds declared metric budget rows".into());
+        }
+        if self.domain_end.is_some_and(|end| end != from) {
+            return Err("checked metric row-domain gap or overlap".into());
+        }
+        self.domain_start.get_or_insert(from);
+        self.domain_end = Some(
+            from.checked_add(p.nrows())
+                .ok_or("scored row index overflow")?,
+        );
         let timer = std::time::Instant::now();
         self.agree += crate::counterfactual::top1_rows(p, q)
             .into_iter()
@@ -340,7 +358,11 @@ impl Stream<'_> {
         unheld: usize,
     ) -> Result<Episode, String> {
         self.flush()?;
-        if self.count != until.saturating_sub(from) || self.count == 0 {
+        if self.count != until.saturating_sub(from)
+            || self.count == 0
+            || self.domain_start != Some(from)
+            || self.domain_end != Some(until)
+        {
             return Err("checked metric scored-row domain mismatch".into());
         }
         if self.count as u128 > (1_u128 << 53) {
