@@ -281,5 +281,72 @@ def stage_search():
     log(f"wrote the harness set: {list(edits)}")
 
 
+def stage_explain():
+    """What the chosen subcomponent c does (descriptive; after the single validation evaluation): where the library
+    turns it on in its 16 training rows and what it reads there, which hidden units its read weighs, which tokens
+    its write raises and lowers on the direct path to the unembedding (final-norm gain applied, layer 3 skipped), and
+    its validation effect on the score by HellaSwag source and activity, and against ending length."""
+    import torch
+    from datasets import load_dataset
+    from e4_benchmarks_data import BENCH, build_requests
+    res = json.load(open(OUT / "search.json"))
+    c, lam = res["real"]["subcomponent"], res["real"]["lam"]
+    V = np.fromfile(LIB / "blocks.2.down_proj.v.f64").reshape(-1, 3072)
+    U = np.fromfile(LIB / "blocks.2.down_proj.u.f64").reshape(-1, 768)
+    tok = E.tokenizer()
+    txt = lambda ids: tok.decode([int(i) for i in ids])
+    out = {"subcomponent": c, "lam": lam}
+    w = V[c] ** 2 / (V[c] ** 2).sum()
+    top = np.argsort(-w)[:8]
+    out["reads_units"] = [{"unit": int(j), "weight": float(V[c, j]), "share": float(w[j])} for j in top]
+    m = Model()
+    gain = m.target.ln_f.detach().cpu().double().numpy()
+    logit = m.target.wte.detach().cpu().double().numpy() @ (gain * U[c])
+    out["write_raises"] = [[txt([i]), float(logit[i])] for i in np.argsort(-logit)[:15]]
+    out["write_lowers"] = [[txt([i]), float(logit[i])] for i in np.argsort(logit)[:15]]
+    rows = np.asarray(np.load(E.VD / "pile_val_4096x513.npy", mmap_mode="r")[2048:2064, :512]).astype(np.int64)
+    sets = json.load(open(LIB / "blocks.2.down_proj.train.sets.json"))["sets"]
+    on = np.array([c in set(st) for st in sets]).reshape(16, 512)
+    with torch.no_grad():
+        a = np.concatenate([(m.resid(torch.from_numpy(rows[i:i + 2]).to(E.DEVICE))[1] @ torch.from_numpy(
+            V[c].astype(np.float32)).to(E.DEVICE)).cpu().numpy() for i in range(0, 16, 2)])
+    r, q = np.nonzero(on)
+    order = np.argsort(-np.abs(a[r, q]))
+    out["on_rate"] = float(on.mean())
+    out["on_tokens"] = sorted(((txt([t]), int(n)) for t, n in zip(*np.unique(rows[r, q], return_counts=True))), key=lambda x: -x[1])[:15]
+    out["on_contexts"] = [{"context": txt(rows[i, max(0, p - 12):p]), "token": txt([rows[i, p]]), "next": txt([rows[i, p + 1]]),
+                           "read": float(a[i, p])} for i, p in zip(r[order[:20]], q[order[:20]])]
+    out["read_on_vs_off"] = [float(np.abs(a[on]).mean()), float(np.abs(a[~on]).mean())]
+    # the validation effect, from the harness's per-request scores
+    rq = build_requests()
+    hs = np.nonzero(rq["task"] == "hellaswag")[0]
+    base = np.load(BENCH / "scores_base.npz")["lp"][:, 0]
+    z = np.load(E.FR / "e4_side/methods/hs_edit/bench/scores.npz")
+    ed = z["lp"][:, list(z["names"]).index("hs_subcomponent")]
+    ds = load_dataset("Rowan/hellaswag", split="validation")
+    margin = lambda lp, it: lp[it][int(rq["gold"][k])] - np.logaddexp.reduce(lp[it])
+    d, src, act, dlen, dlp, nlen = [], [], [], [], [], []
+    for k, item in zip(hs, ds):
+        lo, n = int(rq["req_lo"][k]), int(rq["req_n"][k])
+        it = slice(lo, lo + n)
+        d.append(margin(ed, it) - margin(base, it))
+        src.append(item["source_id"].split("~")[0])
+        act.append(item["activity_label"])
+        nlen += rq["n_cont"][it].tolist()
+        dlp += (ed[it] - base[it]).tolist()
+        dlen.append(int(rq["n_cont"][lo + np.argmax(ed[it])]) - int(rq["n_cont"][lo + np.argmax(base[it])]))
+    d, src, act = np.array(d), np.array(src), np.array(act)
+    out["val_by_source"] = {s_: interval(d[src == s_]) + [int((src == s_).sum())] for s_ in sorted(set(src))}
+    cats = [x for x in set(act) if (act == x).sum() >= 40]
+    by = {x: interval(d[act == x]) + [int((act == x).sum())] for x in cats}
+    out["val_by_activity"] = dict(sorted(by.items(), key=lambda kv: -kv[1][0]))
+    nlen, dlp = np.array(nlen), np.array(dlp)
+    out["ending_length"] = {"corr_dlp_vs_tokens": float(np.corrcoef(nlen, dlp)[0, 1]),
+                            "dlp_per_token": float(np.polyfit(nlen, dlp, 1)[0]),
+                            "chosen_length_change": interval(np.array(dlen, float))}
+    json.dump(out, open(OUT / "explain.json", "w"), indent=1)
+    print(json.dumps(out, indent=1, ensure_ascii=False)[:6000])
+
+
 if __name__ == "__main__":
-    {"search": stage_search}[sys.argv[1]]()
+    {"search": stage_search, "explain": stage_explain}[sys.argv[1]]()
