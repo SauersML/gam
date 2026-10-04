@@ -620,6 +620,7 @@ struct TeacherEpisodes {
 struct RunTimers {
     teacher: std::sync::atomic::AtomicU64,
     compile: std::sync::atomic::AtomicU64,
+    native_compile: std::sync::atomic::AtomicU64,
     planning: std::sync::atomic::AtomicU64,
     donor: std::sync::atomic::AtomicU64,
     forward: std::sync::atomic::AtomicU64,
@@ -647,10 +648,16 @@ impl Drop for RunTimer<'_> {
 pub struct RunTiming {
     pub teacher_initialization: f64,
     pub candidate_compile: f64,
+    pub native_source_compile: f64,
     pub intervention_planning: f64,
     pub donor_execution: f64,
     pub explained_execution: f64,
     pub output_readout_and_kl: f64,
+}
+
+struct NativeDeviceSource {
+    interner: crate::decoded_intern::DecodedOperatorInterner,
+    resident: crate::artifact_device::Resident,
 }
 
 /// `D_run` of a language model's artifact (module note).
@@ -667,6 +674,7 @@ pub struct LanguageRun<'a> {
     pub tile: usize,
     device: Option<gam_gpu::tensor::Device>,
     trace_bytes_limit: usize,
+    native_device_source: Option<NativeDeviceSource>,
     teachers: std::sync::OnceLock<Result<TeacherEpisodes, String>>,
     timers: RunTimers,
 }
@@ -674,14 +682,14 @@ pub struct LanguageRun<'a> {
 impl<'a> LanguageRun<'a> {
     pub fn new(decoder: &'a Decoder, native: &'a OperatorProgram, spec: &'a Spec, passages: &'a [Vec<u32>], parallel: usize) -> Result<Self, String> {
         let layers = layer_nodes(native, decoder.layers())?;
-        Ok(Self { decoder, native, spec, passages, layers, parallel, tile: 64, device: None, trace_bytes_limit: 0, teachers: std::sync::OnceLock::new(), timers: RunTimers::default() })
+        Ok(Self { decoder, native, spec, passages, layers, parallel, tile: 64, device: None, trace_bytes_limit: 0, native_device_source: None, teachers: std::sync::OnceLock::new(), timers: RunTimers::default() })
     }
 
     /// Diagnostic timing only; no measurement changes fidelity or acceptance.
     pub fn timing(&self) -> RunTiming {
         let seconds = |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Relaxed) as f64 * 1e-9;
         RunTiming {
-            teacher_initialization: seconds(&self.timers.teacher), candidate_compile: seconds(&self.timers.compile),
+            teacher_initialization: seconds(&self.timers.teacher), candidate_compile: seconds(&self.timers.compile), native_source_compile: seconds(&self.timers.native_compile),
             intervention_planning: seconds(&self.timers.planning), donor_execution: seconds(&self.timers.donor),
             explained_execution: seconds(&self.timers.forward), output_readout_and_kl: seconds(&self.timers.readout),
         }
@@ -694,10 +702,37 @@ impl<'a> LanguageRun<'a> {
         if !cfg!(target_os = "linux") || device.is_host() || !device.float64() || trace_bytes_limit == 0 {
             return Err("CUDA LanguageRun needs a float64 Linux accelerator and positive trace byte limit".into());
         }
+        // A newly selected device cannot retain tensors compiled on the old one.
+        self.native_device_source = None;
         self.device = Some(device);
         self.trace_bytes_limit = trace_bytes_limit;
         Ok(self)
     }
+
+    /// Opt-in immutable source for exact native parameter reuse across candidates.
+    /// The caller supplies the same decoded native artifact used to load its bank.
+    /// Each assessed P is already decoded: only exact interface/body interning is
+    /// repeated, never encoding, rounding or decoding. Candidate traces, exceptions
+    /// and donor rows remain independent; this source is never forwarded or edited.
+    pub fn with_cuda_native_source(mut self, source: &Artifact) -> Result<Self, String> {
+        if self.native_device_source.is_some() {
+            return Err("native CUDA source is already installed".into());
+        }
+        let device = self.device.as_ref().ok_or("native CUDA sharing needs the explicit CUDA backend")?;
+        if !source.blocks.is_empty() || !source.exceptions.is_empty() || !source.derived.is_empty() {
+            return Err("native CUDA source must have no replacements, exceptions or derivations".into());
+        }
+        source.validate_coverage(self.native)?;
+        let (source, _) = self.truncated(source)?;
+        let interner = crate::decoded_intern::DecodedOperatorInterner::new(&source)?;
+        let timer = RunTimer::start(&self.timers.native_compile);
+        let resident = crate::artifact_device::Resident::from_decoded(device, &source)?;
+        drop(timer);
+        self.native_device_source = Some(NativeDeviceSource { interner, resident });
+        Ok(self)
+    }
+
+    pub fn cuda_native_sharing(&self) -> bool { self.native_device_source.is_some() }
 
     pub fn backend_name(&self) -> &'static str {
         if self.device.is_some() { "hybrid: explained CUDA f64; cached teacher and readout/KL CPU" } else { "CPU f64; cached native teachers" }
@@ -940,8 +975,17 @@ impl RunCheck for LanguageRun<'_> {
         let decoder = self.decoder;
         let head_dim = self.native.node_interface(self.layers[0].reads[0]).map_err(|e| e.to_string())?.width();
         let compile_timer = RunTimer::start(&self.timers.compile);
-        let (program, residuals) = self.truncated(artifact)?;
-        let base = self.device.as_ref().map(|device| crate::artifact_device::Resident::from_decoded(device, &program)).transpose()?;
+        let (mut program, residuals) = self.truncated(artifact)?;
+        let base = self.device.as_ref().map(|device| match &self.native_device_source {
+            Some(source) => {
+                // Acceptance decoded this assessment afresh, so bank-load Arcs do
+                // not survive. Exact re-interning restores only identical source
+                // parameters and leaves P's graph/edits/exception order unchanged.
+                source.interner.intern(&mut program);
+                crate::artifact_device::Resident::from_decoded_sharing(&source.resident, &program)
+            }
+            None => crate::artifact_device::Resident::from_decoded(device, &program),
+        }).transpose()?;
         drop(compile_timer);
         let teachers = self.teacher_episodes()?;
         // Each episode's edits of P, and the donor states they read.

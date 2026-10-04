@@ -11,7 +11,8 @@
 //!
 //! Other keys: local_export=EXPORT_DIR, local=4, context=512, ascent=0,
 //! deltas=0.05,0.1,0.2, epsilons=0.01,0.03,0.1, parallel=8, batch=1024,
-//! groups= (all declared episode groups). SHA-256 input manifests require sha256sum
+//! groups= (all declared episode groups), cuda_share_native=0 (opt-in exact GPU parameter reuse).
+//! SHA-256 input manifests require sha256sum
 //! or shasum on PATH. No greedy feasibility pruning is used.
 
 use gam_mpd::acceptance::{Ascent, Assessment, Constraint, CostCache, Local, SlotDomain, assess_once};
@@ -120,6 +121,7 @@ fn main() -> Result<(), String> {
         "groups",
         "backend",
         "cuda_trace_bytes",
+        "cuda_share_native",
         "local_kl",
     ];
     if let Some(k) = keys.keys().find(|k| !allowed.contains(&k.as_str())) {
@@ -200,6 +202,11 @@ fn main() -> Result<(), String> {
     let native_artifact = Artifact::native(&native)?.f32_literals()?;
     let start = Artifact::from_bytes(&native_artifact.to_bytes()?, &native.declarations)?;
     drop(native_artifact);
+    let share_native = number("cuda_share_native", 0)?;
+    if share_native > 1 || (share_native == 1 && backend != "cuda") {
+        return Err("cuda_share_native must be 0 or 1; 1 requires backend=cuda".into());
+    }
+    let run = if share_native == 1 { run.with_cuda_native_source(&start)? } else { run };
     let interner = DecodedOperatorInterner::new(&start)?;
     let mut candidates = vec![Candidate { label: "native".into(), artifact: start.clone() }];
     let mut labels = BTreeSet::from(["native".to_string()]);
@@ -308,7 +315,8 @@ fn main() -> Result<(), String> {
     let mut report = json!({
         "execution": {"backend": run.backend_name(), "local": "CPU f64", "teacher": "immutable cached CPU residuals and native effects", "readout_and_KL": "CPU f64", "cuda_episode_parallelism": 1, "teacher_parallelism": parallel, "teacher_cache_memory": "one final residual matrix per episode plus scalar native effects; initialization also retains clean native passage traces and requested donor rows",
             "cuda_trace_limit_scope": "intermediate activation estimate only; excludes operators, attention workspaces, edit masks and allocator overhead",
-            "cuda_upload_scope": "one base per candidate; episode/donor forks share unchanged operator tensors by Arc identity and role; requested donor rows downloaded then reuploaded for mixes"},
+            "cuda_native_source_enabled": run.cuda_native_sharing(), "cuda_native_source_memory": "when enabled: one immutable native parameter resident plus current candidate changed parameters; no native source trace or donor cache",
+            "cuda_upload_scope": if run.cuda_native_sharing() { "one explicit decoded native source per Run; exact re-interning shares parameters across candidates; candidate bases and episode/donor forks are independent; requested donor rows downloaded then reuploaded for mixes" } else { "one base per candidate; episode/donor forks share unchanged operator tensors by Arc identity and role; requested donor rows downloaded then reuploaded for mixes" }},
         "isolated_kl_diagnostic": {"enabled": local_kl_enabled, "backend": "CPU f64", "scope": "selected saved-byte artifacts only; one block on native parents, then native downstream; comparison error excludes neural-forward arithmetic; no acceptance threshold"},
         "local_definition": "maximum tested per-row Euclidean write error divided by RMS native-write row norm over declared family",
         "scope": "explicit finite candidate bank; tested local inputs and declared counterfactual episodes only",

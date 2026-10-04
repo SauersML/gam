@@ -462,7 +462,22 @@ mod tests {
         let dir = crate::explanation_tests::tiny_export("shared_device_resident", 2);
         let imported = crate::import::import_language_model(&dir, 1, 12).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
-        let artifact = Artifact::native(&imported.program).unwrap();
+        let mut artifact = Artifact::native(&imported.program).unwrap();
+        for op in &mut artifact.program.operators {
+            match &mut Arc::make_mut(op).body {
+                crate::operator_program::OperatorBody::Dense { values, present, .. } => {
+                    *values = values.as_standard_layout().to_owned();
+                    *present = present.as_standard_layout().to_owned();
+                }
+                crate::operator_program::OperatorBody::LowRank { left, right, .. } => {
+                    *left = left.as_standard_layout().to_owned();
+                    *right = right.as_standard_layout().to_owned();
+                }
+                _ => continue
+            }
+        }
+        let artifact = artifact.f32_literals().unwrap();
+        let artifact = Artifact::from_bytes(&artifact.to_bytes().unwrap(), &artifact.program.declarations).unwrap();
         let family = imported.contract.family;
         let root = artifact
             .program
@@ -475,18 +490,40 @@ mod tests {
         let device = Device::host();
         let base = Resident::compile_decoded(&device, &artifact, None).unwrap();
         assert!(Resident::from_decoded_sharing(&base, &artifact).is_err(), "public sharing must refuse host fallback");
-        let mut changed = artifact.clone();
+        // A fresh acceptance decode has different Arcs. Reverse operator indices
+        // as a compacted candidate can, then recover sharing by exact body identity.
+        let mut changed = Artifact::from_bytes(&artifact.to_bytes().unwrap(), &artifact.program.declarations).unwrap();
+        let operators: Vec<_> = (0..changed.program.operators.len()).rev().collect();
+        changed.program.operators.reverse();
+        let nodes: Vec<_> = (0..changed.program.nodes.len()).collect();
+        let bases: Vec<_> = (0..changed.program.bases.len()).collect();
+        let rules: Vec<_> = (0..changed.program.rules.len()).collect();
+        for node in &mut changed.program.nodes {
+            crate::operator_program::remap_node(node, &nodes, &operators, &bases, &rules);
+        }
+        // Decode the permuted wire representation to restore canonical metadata.
+        changed = Artifact::from_bytes(&changed.to_bytes().unwrap(), &changed.program.declarations).unwrap();
+        let bytes = changed.to_bytes().unwrap();
+        assert_eq!(crate::decoded_intern::DecodedOperatorInterner::new(&artifact).unwrap().intern(&mut changed), operators.len());
+        assert_eq!(changed.to_bytes().unwrap(), bytes);
         changed.exceptions.push(Exception { context: contexts(&family)[0].clone(), node: root, column: 0, value: 0.375 });
         let expected = changed.execute(&family).unwrap();
         // Test-only tensor reference exercises the same shared compilation path.
         let shared = Resident::compile_decoded(&device, &changed, Some(&base)).unwrap();
         let fresh = Resident::compile_decoded(&device, &changed, None).unwrap();
-        assert!(Arc::ptr_eq(&base.artifact.program.operators[0], &shared.artifact.program.operators[0]));
+        assert!(Arc::ptr_eq(&base.artifact.program.operators[0], shared.artifact.program.operators.last().unwrap()));
         let a = shared.forward_edited_intermediates(&family, |_, _| Ok(None)).unwrap();
         let b = fresh.forward_edited_intermediates(&family, |_, _| Ok(None)).unwrap();
         let a = device.download(shared.root_value(&a, root).unwrap()).unwrap();
         let b = device.download(fresh.root_value(&b, root).unwrap()).unwrap();
         assert_eq!(a, b);
+        // Candidate exception forwards cannot alter the immutable source tensors.
+        let untouched = base.forward_edited_intermediates(&family, |_, _| Ok(None)).unwrap();
+        let untouched = device.download(base.root_value(&untouched, root).unwrap()).unwrap();
+        let native = artifact.execute(&family).unwrap();
+        for (a, b) in untouched.iter().zip(native.values[root].iter()) {
+            assert!((a - b).abs() < 1e-10);
+        }
         for (a, b) in a.iter().zip(expected.values[root].iter()) {
             assert!((a - b).abs() < 1e-10);
         }
