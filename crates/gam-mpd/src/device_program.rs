@@ -1221,9 +1221,10 @@ impl DeviceProgram {
         Ok(kept)
     }
 
-    /// Resident cotangents for explicitly trainable dense Product operators.
-    /// Every shared use contributes once in its actual orientation. Unsupported
-    /// trainable roles (tables, bias columns, diagonal/low-rank/identity bodies)
+    /// Resident cotangents for explicitly trainable dense operators, including
+    /// bias and Constant columns. Every shared use contributes once in its actual
+    /// orientation, including operators used in both column and product roles.
+    /// Unsupported trainable roles (tables, diagonal/low-rank/identity bodies)
     /// fail explicitly. Parameters and source traces are never changed.
     pub fn vjp_values_dense(
         &self,
@@ -1245,13 +1246,15 @@ impl DeviceProgram {
             if self
                 .operators
                 .keys()
-                .any(|(index, role)| *index == op && *role != Role::Product)
+                .any(|(index, role)| *index == op && *role == Role::Table)
             {
                 return Err(
-                    "device: trainable operator has an unsupported table/column role".into(),
+                    "device: trainable operator has an unsupported table role".into(),
                 );
             }
-            let held = self.operators.get(&(op, Role::Product)).ok_or("device: trainable operator has no Product role")?;
+            let held = self.operators.get(&(op, Role::Product))
+                .or_else(|| self.operators.get(&(op, Role::Column)))
+                .ok_or("device: trainable operator has no product or column role")?;
             if !matches!(held.source.body, OperatorBody::Dense { .. }) {
                 return Err("device: trainable operator must have a dense literal body".into());
             }
@@ -1262,7 +1265,9 @@ impl DeviceProgram {
         let mut retained = keep.to_vec();
         for (node, step) in self.steps.iter().enumerate() {
             let uses = match step {
-                Step::Affine { terms, .. } => terms.iter().any(|(_, op)| requested.contains(op)),
+                Step::Affine { terms, bias } => terms.iter().any(|(_, op)| requested.contains(op))
+                    || bias.is_some_and(|op| requested.contains(&op)),
+                Step::Constant { operator } => requested.contains(operator),
                 Step::Transposed { operator, .. } => requested.contains(operator),
                 _ => false,
             };
@@ -1271,6 +1276,13 @@ impl DeviceProgram {
             }
         }
         let mut nodes = self.reverse_seeds(trace, seeds, &retained, arithmetic)?;
+        // One scalar constant is uploaded; all reductions and gradient arrays stay
+        // on the device. Reuse the same broadcast across every column occurrence.
+        let has_columns = requested.iter().any(|op| self.operators.contains_key(&(*op, Role::Column)));
+        let ones = if has_columns {
+            let one = self.device.upload_vec(1, 1, vec![1.0]).map_err(error)?;
+            Some(self.device.broadcast_rows(&one, trace.rows).map_err(error)?)
+        } else { None };
         for (node, step) in self.steps.iter().enumerate() {
             let Some(cot) = nodes.get(&node) else {
                 continue;
@@ -1285,6 +1297,16 @@ impl DeviceProgram {
                 if let Some(gradient) = gradients.get_mut(operator) {
                     self.device.gemm(gradient, 1.0, trace.value(*input)?, Op::T, cot, Op::N, 1.0, arithmetic).map_err(error)?;
                 }
+            }
+            let column = match step {
+                Step::Affine { bias, .. } => *bias,
+                Step::Constant { operator } => Some(*operator),
+                _ => None,
+            };
+            if let Some(gradient) = column.and_then(|op| gradients.get_mut(&op)) {
+                self.device.gemm(gradient, 1.0, cot, Op::T,
+                    ones.as_ref().ok_or("device: missing column reduction workspace")?, Op::N,
+                    1.0, arithmetic).map_err(error)?;
             }
         }
         nodes.retain(|node, _| keep.contains(node));
@@ -1609,6 +1631,72 @@ mod values_vjp_tests {
             assert!(lowered.vjp(&trace, device.zeros(2,2).unwrap(), &[0], Arithmetic::F64).is_err());
         }
     }
+    #[test]
+    fn shared_nonlinear_columns_sum_all_bias_constant_and_product_uses() {
+        let scalar = Interface::native(1).unwrap();
+        let constant = Interface::constant();
+        let pair = Interface::native(2).unwrap();
+        let column = |name: &str, values: Array2<f64>| Arc::new(Operator::dense(
+            name, pair.clone(), constant.clone(), values.clone(),
+            exact_precision(values.iter().copied()).unwrap(), Default::default()).unwrap());
+        let binding = Arc::new(Operator::dense("bind raw scalar", constant.clone(), scalar,
+            array![[1.0]], exact_precision([1.0]).unwrap(), Default::default()).unwrap());
+        let called = OperatorProgram {
+            declarations: Declarations { domains: vec![], slots: vec![Slot::Raw { width: 1 }], parameters: 0 },
+            bases: vec![],
+            operators: vec![column("shared offset and reader", array![[0.3],[-0.4]]),
+                column("constant only", array![[0.2],[0.7]]), binding],
+            rules: vec![Rule { name: "learned offset in reused nonlinear body".into(), inputs: vec![constant],
+                nodes: vec![Node::Param { index: 0 },
+                    Node::Affine { terms: vec![(0,0)], bias: Some(0) },
+                    Node::Pointwise { input: 1, laws: vec![Law::GeluTanh] }], output: 2 }],
+            nodes: vec![Node::Raw { slot: 0 },
+                Node::Affine { terms: vec![(0,2)], bias: None },
+                Node::Call { rule: 0, arguments: vec![1] },
+                Node::Transposed { input: 2, operator: 0 },
+                Node::Call { rule: 0, arguments: vec![3] },
+                Node::Constant { operator: 0 }, Node::Constant { operator: 1 },
+                Node::Hadamard { left: 4, right: 5 },
+                Node::Hadamard { left: 7, right: 6 }], output: 8,
+        };
+        let family = FamilyInputs { rows: 3, slots: vec![SlotValues::Raw(array![[-0.6],[0.2],[1.1]])], layout: None };
+        let (program, _) = crate::artifact_device::mapped_inlined(&called).unwrap();
+        let output_seed = array![[0.7,-0.2],[-0.4,0.9],[0.6,0.3]];
+        let objective = |p: &OperatorProgram| {
+            let values = p.execute(&family, false).unwrap();
+            (&values.values[p.output] * &output_seed).sum()
+        };
+        let mut devices = vec![Device::host()];
+        if let Some(device) = Device::accelerator(gam_gpu::GpuPolicy::Auto).unwrap() {
+            if device.float64() { devices.push(device); }
+        }
+        for device in devices {
+            let lowered = DeviceProgram::compile_values(&device, &program).unwrap();
+            let trace = lowered.forward(&family).unwrap();
+            let (_, gradients) = lowered.vjp_values_dense(&trace,
+                BTreeMap::from([(program.output, device.upload(output_seed.view()).unwrap())]),
+                &[], &[0,1], Arithmetic::F64).unwrap();
+            for op in 0..2 {
+                let actual = device.download(&gradients[&op]).unwrap();
+                for row in 0..2 {
+                    let mut moved = program.clone();
+                    let delta = 1e-6;
+                    let set = |p: &mut OperatorProgram, step: f64| {
+                        let OperatorBody::Dense { values, .. } = &mut Arc::make_mut(&mut p.operators[op]).body else { panic!("dense") };
+                        values[[row,0]] += step;
+                    };
+                    set(&mut moved, delta);
+                    let plus = objective(&moved);
+                    set(&mut moved, -2.0*delta);
+                    let reference = (plus-objective(&moved))/(2.0*delta);
+                    assert!((actual[[row,0]]-reference).abs() < 2e-9,
+                        "{} op {op} row {row}: {} != {reference}", device.name(), actual[[row,0]]);
+                }
+            }
+            assert_eq!(device.download(trace.value(0).unwrap()).unwrap(), array![[-0.6],[0.2],[1.1]]);
+        }
+    }
+
     #[test]
     fn dense_zero_literals_have_full_matrix_cotangents_despite_diagonal_execution() {
         let device = Device::host();
