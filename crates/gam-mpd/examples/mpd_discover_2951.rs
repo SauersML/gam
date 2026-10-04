@@ -25,6 +25,18 @@
 //!
 //! Merges scan parts (`OUT_PREFIX`es) covering `WORDS` words in all and reports every site's pieces
 //! ranked by concentration: the share of a piece's total in its `M` largest words.
+//!
+//! `mpd_discover_2951 positions EXPORT_DIR OUT_PREFIX A:B [M] [BATCH]`
+//!
+//! The model's own forward on sequences `A..B` of the export's token table (`T + 1` columns: the
+//! model reads `row[..T]`, `row[1..]` are the next tokens), and one reverse pass of the data's code
+//! length `Σ −log q(y)`. Per word, `OUT_PREFIX.pos.f32` holds `[next token, −log q(y), entropy of q,
+//! top token, log q(top)]` and `OUT_PREFIX.attr.f32` the first-order share of the code length each
+//! head (`r_h · ∂/∂r_h`, its attended value) and each MLP (`a · ∂/∂a`, its activations) carries,
+//! heads then MLP, layer by layer. Per MLP neuron, `OUT_PREFIX.neuron.f64` holds `[Σ e, Σ |e|, Σ a⁺,
+//! Σ a⁺²]` of its share `e = a_n ∂/∂a_n` and its activation `a_n`, and `OUT_PREFIX.neuron_harm` /
+//! `.neuron_fired` (`.top.f64`, `.at.u32`) its `M` largest shares and activations (default 256)
+//! with their `[sequence, position]`.
 
 use gam_linalg::faer_ndarray::fast_abt;
 use gam_mpd::import::import_language_model;
@@ -137,8 +149,7 @@ fn scan(args: &[String]) -> Result<(), String> {
     }
     let total: usize = names.iter().map(|(_, p)| p).sum();
     let mut sums = vec![0.0_f64; total];
-    // Per piece, its `keep` largest shares as a min-heap of (share bits, sequence, position).
-    let mut heaps: Vec<BinaryHeap<Reverse<(u64, u32, u32)>>> = (0..total).map(|_| BinaryHeap::with_capacity(keep + 1)).collect();
+    let mut kept = Kept::new(total, keep);
     let started = Instant::now();
     for s in first..last {
         let rows: Vec<usize> = (s * context..(s + 1) * context).collect();
@@ -149,18 +160,10 @@ fn scan(args: &[String]) -> Result<(), String> {
             let z = fast_abt(&x, v);
             for (c, (column, &weight)) in z.columns().into_iter().zip(w.iter()).enumerate() {
                 let piece = offset + c;
-                let heap = &mut heaps[piece];
                 for (p, &a) in column.iter().enumerate() {
                     let share = a * a * weight;
                     sums[piece] += share;
-                    // Nonnegative shares order as their bits.
-                    let key = (share.to_bits(), s as u32, p as u32);
-                    if heap.len() < keep {
-                        heap.push(Reverse(key));
-                    } else if heap.peek().is_some_and(|Reverse(least)| key.0 > least.0) {
-                        heap.pop();
-                        heap.push(Reverse(key));
-                    }
+                    kept.offer(piece, share, s as u32, p as u32);
                 }
             }
             offset += v.nrows();
@@ -169,21 +172,8 @@ fn scan(args: &[String]) -> Result<(), String> {
             eprintln!("scanned {} sequences in {:.0}s", s + 1 - first, started.elapsed().as_secs_f64());
         }
     }
-    let mut top = Vec::with_capacity(total * keep);
-    let mut at = Vec::with_capacity(total * keep * 2);
-    for heap in heaps {
-        let mut entries: Vec<(u64, u32, u32)> = heap.into_iter().map(|Reverse(k)| k).collect();
-        entries.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-        entries.resize(keep, (0, u32::MAX, u32::MAX));
-        for (bits, s, p) in entries {
-            top.push(f64::from_bits(bits));
-            at.push(s);
-            at.push(p);
-        }
-    }
     write_f64(Path::new(&format!("{out}.sum.f64")), sums.into_iter())?;
-    write_f64(Path::new(&format!("{out}.top.f64")), top.into_iter())?;
-    write_u32(Path::new(&format!("{out}.at.u32")), at.into_iter())
+    kept.write(&out)
 }
 
 fn merge(args: &[String]) -> Result<(), String> {
@@ -258,6 +248,486 @@ fn merge(args: &[String]) -> Result<(), String> {
     std::fs::write(&out, serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
+/// The attended value of every head (the reads of each layer's `o` site) and the activations of
+/// every MLP (the read of each layer's `down_proj` site), layer by layer.
+fn readers(model: &gam_mpd::operator_program::OperatorProgram) -> Result<(Vec<Vec<usize>>, Vec<usize>), String> {
+    let all = sites(model);
+    let mut heads = Vec::new();
+    let mut mlps = Vec::new();
+    for layer in 0.. {
+        let (Some(o), Some(down)) = (
+            all.iter().find(|s| s.name == format!("blocks.{layer}.o")),
+            all.iter().find(|s| s.name == format!("blocks.{layer}.down_proj")),
+        ) else {
+            break;
+        };
+        heads.push(o.reads.clone());
+        mlps.push(*down.reads.first().ok_or("a down_proj site with no read")?);
+    }
+    if heads.is_empty() {
+        return Err("no blocks.{l}.o / blocks.{l}.down_proj sites".to_string());
+    }
+    Ok((heads, mlps))
+}
+
+fn positions(args: &[String]) -> Result<(), String> {
+    let usage = "mpd_discover_2951 positions EXPORT_DIR OUT_PREFIX A:B [M] [BATCH]";
+    let export = PathBuf::from(args.get(2).ok_or(usage)?);
+    let out = args.get(3).ok_or(usage)?.clone();
+    let (first, last) = range(args.get(4).ok_or(usage)?)?;
+    let keep: usize = args.get(5).map_or(Ok(256), |v| v.parse()).map_err(|e| format!("M: {e}"))?;
+    let batch: usize = args.get(6).map_or(Ok(2), |v| v.parse()).map_err(|e| format!("BATCH: {e}"))?;
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(export.join("export.json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let shape = &record["files"]["tokens"]["shape"];
+    let (table_rows, columns) = (shape[0].as_u64().ok_or("tokens shape")? as usize, shape[1].as_u64().ok_or("tokens shape")? as usize);
+    let context = columns - 1;
+    if last > table_rows {
+        return Err(format!("{last} sequences of a {table_rows}-row token table"));
+    }
+    let table = read_f64(&export.join("tokens.f64"))?;
+    let imported = import_language_model(&export, last, context)?;
+    let model = &imported.program;
+    let family = &imported.contract.family;
+    let (heads, mlps) = readers(model)?;
+    let width = heads.iter().map(Vec::len).sum::<usize>() + mlps.len();
+    let neurons: Vec<usize> = {
+        let interfaces = model.interfaces().map_err(|e| e.to_string())?;
+        mlps.iter().map(|&n| interfaces[n].width()).collect()
+    };
+    let total: usize = neurons.iter().sum();
+    let mut sums = vec![[0.0_f64; 4]; total];
+    // Per neuron, its largest shares and its largest activations.
+    let mut harm = Kept::new(total, keep);
+    let mut fired = Kept::new(total, keep);
+    let mut words = Vec::with_capacity((last - first) * context * 5);
+    let mut attributions = Vec::with_capacity((last - first) * context * width);
+    let started = Instant::now();
+    for start in (first..last).step_by(batch) {
+        let sequences: Vec<usize> = (start..(start + batch).min(last)).collect();
+        let rows: Vec<usize> = sequences.iter().flat_map(|&s| s * context..(s + 1) * context).collect();
+        let inputs = family.select(&rows);
+        let (trace, back) = gam_mpd::device::proposing(|| -> Result<_, String> {
+            let trace = model.execute(&inputs, false).map_err(|e| e.to_string())?;
+            let logits = &trace.values[model.output];
+            let mut cotangent = Array2::<f64>::zeros(logits.dim());
+            for (r, (row, mut out)) in logits.outer_iter().zip(cotangent.outer_iter_mut()).enumerate() {
+                let (s, p) = (sequences[r / context], r % context);
+                let label = table[s * columns + p + 1] as usize;
+                let peak = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let partition: f64 = row.iter().map(|l| (l - peak).exp()).sum();
+                let log_partition = peak + partition.ln();
+                let (mut entropy, mut top) = (0.0, 0);
+                for (c, (&l, o)) in row.iter().zip(out.iter_mut()).enumerate() {
+                    let q = (l - log_partition).exp();
+                    *o = q;
+                    entropy -= q * (l - log_partition);
+                    if l > row[top] {
+                        top = c;
+                    }
+                }
+                out[label] -= 1.0;
+                words.extend([label as f32, (log_partition - row[label]) as f32, entropy as f32, top as f32, (row[top] - log_partition) as f32]);
+            }
+            let back = gam_mpd::derivatives::vjp(model, &inputs, &trace, cotangent).map_err(|e| e.to_string())?;
+            Ok((trace, back))
+        })?;
+        let share = |node: usize| -> Array2<f64> {
+            match &back[node] {
+                Some(g) => g * &trace.values[node],
+                None => Array2::zeros(trace.values[node].dim()),
+            }
+        };
+        let mut columns_of_batch: Vec<Array1<f64>> = Vec::with_capacity(width);
+        for layer_heads in &heads {
+            for &h in layer_heads {
+                columns_of_batch.push(share(h).sum_axis(Axis(1)));
+            }
+        }
+        let mut offset = 0;
+        for &m in &mlps {
+            let e = share(m);
+            columns_of_batch.push(e.sum_axis(Axis(1)));
+            let activations = &trace.values[m];
+            for (r, (row, active)) in e.outer_iter().zip(activations.outer_iter()).enumerate() {
+                let (s, p) = (sequences[r / context] as u32, (r % context) as u32);
+                for (n, (&v, &a)) in row.iter().zip(active.iter()).enumerate() {
+                    let k = offset + n;
+                    let a = a.max(0.0);
+                    sums[k][0] += v;
+                    sums[k][1] += v.abs();
+                    sums[k][2] += a;
+                    sums[k][3] += a * a;
+                    harm.offer(k, v, s, p);
+                    fired.offer(k, a, s, p);
+                }
+            }
+            offset += e.ncols();
+        }
+        for r in 0..rows.len() {
+            attributions.extend(columns_of_batch.iter().map(|c| c[r] as f32));
+        }
+        let done = sequences.last().map_or(0, |s| s + 1) - first;
+        if done % 32 < batch {
+            eprintln!("{done} sequences in {:.0}s", started.elapsed().as_secs_f64());
+        }
+    }
+    let write_f32 = |path: String, values: &[f32]| -> Result<(), String> {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(&path, bytes).map_err(|e| format!("{path}: {e}"))
+    };
+    write_f32(format!("{out}.pos.f32"), &words)?;
+    write_f32(format!("{out}.attr.f32"), &attributions)?;
+    write_f64(Path::new(&format!("{out}.neuron.f64")), sums.iter().flat_map(|s| s.iter().copied()))?;
+    harm.write(&format!("{out}.neuron_harm"))?;
+    fired.write(&format!("{out}.neuron_fired"))
+}
+
+/// Per item, its `keep` largest positive values with their `[sequence, position]`.
+struct Kept {
+    keep: usize,
+    heaps: Vec<BinaryHeap<Reverse<(u64, u32, u32)>>>,
+    // A heap's least kept value, so most offers are refused by one comparison.
+    floors: Vec<f64>,
+}
+
+impl Kept {
+    fn new(items: usize, keep: usize) -> Self {
+        Self { keep, heaps: (0..items).map(|_| BinaryHeap::with_capacity(keep + 1)).collect(), floors: vec![0.0; items] }
+    }
+
+    fn offer(&mut self, item: usize, value: f64, sequence: u32, position: u32) {
+        if value <= self.floors[item] {
+            return;
+        }
+        let heap = &mut self.heaps[item];
+        // Positive values order as their bits.
+        heap.push(Reverse((value.to_bits(), sequence, position)));
+        if heap.len() > self.keep {
+            heap.pop();
+        }
+        if heap.len() == self.keep {
+            self.floors[item] = heap.peek().map_or(0.0, |Reverse(least)| f64::from_bits(least.0));
+        }
+    }
+
+    /// `PREFIX.top.f64` (items × keep, descending, zero-padded) and `PREFIX.at.u32` (their
+    /// `[sequence, position]`, `u32::MAX` padded).
+    fn write(self, prefix: &str) -> Result<(), String> {
+        let mut top = Vec::with_capacity(self.heaps.len() * self.keep);
+        let mut at = Vec::with_capacity(self.heaps.len() * self.keep * 2);
+        for heap in self.heaps {
+            let mut entries: Vec<(u64, u32, u32)> = heap.into_iter().map(|Reverse(k)| k).collect();
+            entries.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            entries.resize(self.keep, (0, u32::MAX, u32::MAX));
+            for (bits, s, p) in entries {
+                top.push(f64::from_bits(bits));
+                at.extend([s, p]);
+            }
+        }
+        write_f64(Path::new(&format!("{prefix}.top.f64")), top.into_iter())?;
+        write_u32(Path::new(&format!("{prefix}.at.u32")), at.into_iter())
+    }
+}
+
+/// A scanned word: where it is, its next token, the model's top token and `q(top)`.
+#[derive(Clone, Copy)]
+struct Word {
+    sequence: u32,
+    position: u32,
+    label: u32,
+    top: u32,
+    confidence: f64,
+}
+
+/// The parts of a `positions` scan, in order, as one table of words.
+struct Scanned {
+    words: Vec<Word>,
+    /// Words × `width` code-length shares (heads, then MLPs, layer by layer).
+    attributions: Vec<f32>,
+    width: usize,
+    /// The first word of each part and the part's first sequence, to find a word by place.
+    starts: Vec<(usize, u32, u32)>,
+    context: usize,
+    /// Per neuron family (`harm`, `fired`): each neuron's kept words, descending.
+    neurons: Vec<(&'static str, Vec<Vec<(f64, usize)>>)>,
+}
+
+impl Scanned {
+    fn index(&self, sequence: u32, position: u32) -> Option<usize> {
+        self.starts.iter().rev().find(|(_, first, last)| (*first..*last).contains(&sequence)).map(|(start, first, _)| {
+            start + (sequence - first) as usize * self.context + position as usize
+        })
+    }
+
+    /// `PARTS`: `PREFIX@A`, a scan of sequences from `A` on.
+    fn load(parts: &[String], context: usize) -> Result<Self, String> {
+        let mut words = Vec::new();
+        let mut attributions = Vec::new();
+        let mut starts = Vec::new();
+        let mut width = 0;
+        for part in parts {
+            let (prefix, first) = part.split_once('@').ok_or_else(|| format!("{part}: expected PREFIX@A"))?;
+            let first: u32 = first.parse().map_err(|e| format!("{part}: {e}"))?;
+            let read32 = |path: String| -> Result<Vec<f32>, String> {
+                let bytes = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
+                Ok(bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+            };
+            let table = read32(format!("{prefix}.pos.f32"))?;
+            let shares = read32(format!("{prefix}.attr.f32"))?;
+            let count = table.len() / 5;
+            if count == 0 || count % context != 0 || shares.len() % count != 0 {
+                return Err(format!("{prefix}: not a scan of whole {context}-word sequences"));
+            }
+            width = shares.len() / count;
+            let sequences = (count / context) as u32;
+            starts.push((words.len(), first, first + sequences));
+            for (w, row) in table.chunks_exact(5).enumerate() {
+                words.push(Word {
+                    sequence: first + (w / context) as u32,
+                    position: (w % context) as u32,
+                    label: row[0] as u32,
+                    top: row[3] as u32,
+                    confidence: f64::from(row[4]).exp(),
+                });
+            }
+            attributions.extend(shares);
+        }
+        let mut scanned = Self { words, attributions, width, starts, context, neurons: Vec::new() };
+        for family in ["harm", "fired"] {
+            let mut lists: Vec<Vec<(f64, usize)>> = Vec::new();
+            for part in parts {
+                let (prefix, _) = part.split_once('@').ok_or("PREFIX@A")?;
+                let top = read_f64(Path::new(&format!("{prefix}.neuron_{family}.top.f64")))?;
+                let at = read_u32(Path::new(&format!("{prefix}.neuron_{family}.at.u32")))?;
+                let sums = read_f64(Path::new(&format!("{prefix}.neuron.f64")))?;
+                let neurons = sums.len() / 4;
+                let keep = top.len() / neurons.max(1);
+                lists.resize(neurons, Vec::new());
+                for (n, list) in lists.iter_mut().enumerate() {
+                    for j in 0..keep {
+                        let i = n * keep + j;
+                        if at[2 * i] != u32::MAX
+                            && let Some(w) = scanned.index(at[2 * i], at[2 * i + 1])
+                        {
+                            list.push((top[i], w));
+                        }
+                    }
+                }
+            }
+            for list in &mut lists {
+                list.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+            }
+            scanned.neurons.push((family, lists));
+        }
+        Ok(scanned)
+    }
+}
+
+/// The code length (bits) a group's data saves when the probability of the model's top token is
+/// refitted on the group: `n·KL(O/n ‖ E/n)`, `E = Σ q(top)` its expected and `O` its observed
+/// occurrences, counted only when the model over-predicts (`E > O`): the model asserts a token the
+/// data refutes.
+fn refuted(n: f64, expected: f64, observed: f64) -> f64 {
+    if expected <= observed || n == 0.0 {
+        return 0.0;
+    }
+    let (a, b) = (observed / n, (expected / n).min(1.0 - 1e-12));
+    let term = |x: f64, y: f64| if x > 0.0 { x * (x / y).ln() } else { 0.0 };
+    n * (term(a, b) + term(1.0 - a, 1.0 - b)) / std::f64::consts::LN_2
+}
+
+/// A group of words: those a rule selects whose top token is `token`.
+#[derive(Clone)]
+struct Candidate {
+    family: String,
+    member: usize,
+    token: u32,
+    count: usize,
+    threshold: f64,
+    gain: f64,
+    cost: f64,
+}
+
+/// One rule family's sweep: `order` (value, word) descending; the rule "value ≥ θ and the top token
+/// is `t`" for every `t` and every `θ` among the values. Per token, the `θ` of the largest saving
+/// net of the rule's description (`members` choices of the rule, the token, `θ` as a rank).
+fn sweep(family: &str, member: usize, members: usize, order: &[(f64, usize)], words: &[Word], vocab: usize, out: &mut Vec<Candidate>) {
+    // Per token: count, expected, observed, best net, its count and threshold.
+    let mut stats: Vec<(usize, f64, f64, f64, usize, f64)> = vec![(0, 0.0, 0.0, 0.0, 0, 0.0); vocab];
+    let mut touched = Vec::new();
+    let fixed = (members as f64).log2() + (vocab as f64).log2();
+    for &(value, w) in order {
+        let word = &words[w];
+        let t = word.top as usize;
+        let entry = &mut stats[t];
+        if entry.0 == 0 {
+            touched.push(t);
+        }
+        entry.0 += 1;
+        entry.1 += word.confidence;
+        entry.2 += f64::from(u8::from(word.label == word.top));
+        let gain = refuted(entry.0 as f64, entry.1, entry.2);
+        let net = gain - fixed - 2.0 * ((entry.0 + 1) as f64).log2();
+        if net > entry.3 {
+            entry.3 = net;
+            entry.4 = entry.0;
+            entry.5 = value;
+        }
+    }
+    for t in touched {
+        let (_, _, _, net, count, threshold) = stats[t];
+        if net > 0.0 {
+            let cost = fixed + 2.0 * ((count + 1) as f64).log2();
+            out.push(Candidate { family: family.to_string(), member, token: t as u32, count, threshold, gain: net + cost, cost });
+        }
+    }
+}
+
+impl Candidate {
+    /// The words the rule selects, in its order.
+    fn words(&self, scanned: &Scanned, tokens: &[u32], columns: usize) -> Vec<usize> {
+        let picked = |w: &usize| scanned.words[*w].top == self.token;
+        match self.family.as_str() {
+            "confidence" => {
+                let mut all: Vec<usize> = (0..scanned.words.len()).filter(picked).collect();
+                all.sort_unstable_by(|a, b| scanned.words[*b].confidence.total_cmp(&scanned.words[*a].confidence));
+                all.truncate(self.count);
+                all
+            }
+            "share" => {
+                let mut all: Vec<usize> = (0..scanned.words.len()).filter(picked).filter(|w| scanned.attributions[w * scanned.width + self.member] > 0.0).collect();
+                let value = |w: usize| scanned.attributions[w * scanned.width + self.member];
+                all.sort_unstable_by(|a, b| value(*b).total_cmp(&value(*a)));
+                all.truncate(self.count);
+                all
+            }
+            family if family.starts_with("context") => {
+                let n: usize = family["context".len()..].parse().unwrap_or(1);
+                let key = context_key(tokens, columns, &scanned.words[self.member], n);
+                (0..scanned.words.len()).filter(picked).filter(|w| context_key(tokens, columns, &scanned.words[*w], n) == key).collect()
+            }
+            family => {
+                let lists = scanned.neurons.iter().find(|(name, _)| format!("neuron_{name}") == family).map(|(_, l)| l);
+                lists.map_or_else(Vec::new, |lists| lists[self.member].iter().map(|(_, w)| *w).filter(picked).take(self.count).collect())
+            }
+        }
+    }
+}
+
+/// The last `n` tokens a word reads (its own and the `n − 1` before it), or `None` near the start.
+fn context_key(tokens: &[u32], columns: usize, word: &Word, n: usize) -> Option<Vec<u32>> {
+    let p = word.position as usize;
+    (p + 1 >= n).then(|| tokens[word.sequence as usize * columns + p + 1 - n..=word.sequence as usize * columns + p].to_vec())
+}
+
+fn detect(args: &[String]) -> Result<(), String> {
+    let usage = "mpd_discover_2951 detect EXPORT_DIR OUT.json PREFIX@A...";
+    let export = PathBuf::from(args.get(2).ok_or(usage)?);
+    let out = PathBuf::from(args.get(3).ok_or(usage)?);
+    let parts = &args[4..];
+    if parts.is_empty() {
+        return Err(usage.to_string());
+    }
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(export.join("export.json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let shape = &record["files"]["tokens"]["shape"];
+    let columns = shape[1].as_u64().ok_or("tokens shape")? as usize;
+    let vocab = record["config"]["vocab"].as_u64().ok_or("config.vocab")? as usize;
+    let tokens: Vec<u32> = read_f64(&export.join("tokens.f64"))?.into_iter().map(|t| t as u32).collect();
+    let scanned = Scanned::load(parts, columns - 1)?;
+    let words = &scanned.words;
+    let started = Instant::now();
+    let mut candidates = Vec::new();
+    // Every family's rule: a threshold on one value and the top token.
+    let mut order: Vec<(f64, usize)> = words.iter().enumerate().map(|(w, word)| (word.confidence, w)).collect();
+    order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+    sweep("confidence", 0, 1, &order, words, vocab, &mut candidates);
+    for c in 0..scanned.width {
+        let mut order: Vec<(f64, usize)> = (0..words.len())
+            .map(|w| (f64::from(scanned.attributions[w * scanned.width + c]), w))
+            .filter(|(v, _)| *v > 0.0)
+            .collect();
+        order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        sweep("share", c, scanned.width, &order, words, vocab, &mut candidates);
+    }
+    for (family, lists) in &scanned.neurons {
+        for (n, list) in lists.iter().enumerate() {
+            sweep(&format!("neuron_{family}"), n, lists.len(), list, words, vocab, &mut candidates);
+        }
+    }
+    // Context rules: the last n tokens and the top token, described as n + 1 tokens.
+    for n in 1..=3 {
+        let mut groups: std::collections::HashMap<(Vec<u32>, u32), (usize, f64, f64, usize)> = std::collections::HashMap::new();
+        for (w, word) in words.iter().enumerate() {
+            if let Some(key) = context_key(&tokens, columns, word, n) {
+                let entry = groups.entry((key, word.top)).or_insert((0, 0.0, 0.0, w));
+                entry.0 += 1;
+                entry.1 += word.confidence;
+                entry.2 += f64::from(u8::from(word.label == word.top));
+            }
+        }
+        let cost = (n + 1) as f64 * (vocab as f64).log2();
+        for ((_, top), (count, expected, observed, first)) in groups {
+            let gain = refuted(count as f64, expected, observed);
+            if gain > cost {
+                candidates.push(Candidate { family: format!("context{n}"), member: first, token: top, count, threshold: 0.0, gain, cost });
+            }
+        }
+    }
+    eprintln!("{} rules save bits, in {:.0}s", candidates.len(), started.elapsed().as_secs_f64());
+    candidates.sort_unstable_by(|a, b| (b.gain - b.cost).total_cmp(&(a.gain - a.cost)));
+    // The best rule of each group of words; a later rule whose words are mostly an earlier one's is
+    // the same group, listed under it.
+    let mut groups: Vec<(Candidate, std::collections::BTreeSet<usize>, Vec<serde_json::Value>)> = Vec::new();
+    for candidate in candidates.iter().take(4096) {
+        let picked: std::collections::BTreeSet<usize> = candidate.words(&scanned, &tokens, columns).into_iter().collect();
+        let net = candidate.gain - candidate.cost;
+        let same = groups.iter().position(|(_, words, _)| {
+            let shared = picked.intersection(words).count();
+            2 * shared >= picked.len().min(words.len())
+        });
+        let note = json!({"family": candidate.family, "member": candidate.member, "count": candidate.count, "net_bits": net});
+        match same {
+            Some(g) => groups[g].2.push(note),
+            None if groups.len() < 64 => groups.push((candidate.clone(), picked, Vec::new())),
+            None => {}
+        }
+    }
+    let report: Vec<_> = groups
+        .iter()
+        .map(|(c, picked, also)| {
+            let rows: std::collections::BTreeSet<u32> = picked.iter().map(|w| words[*w].sequence).collect();
+            let (expected, observed) = picked.iter().fold((0.0, 0.0), |(e, o), w| {
+                (e + words[*w].confidence, o + f64::from(u8::from(words[*w].label == words[*w].top)))
+            });
+            let mut suffixes = Vec::new();
+            for n in 1..=4 {
+                let mut counts: std::collections::HashMap<Vec<u32>, usize> = std::collections::HashMap::new();
+                for w in picked {
+                    if let Some(key) = context_key(&tokens, columns, &words[*w], n) {
+                        *counts.entry(key).or_default() += 1;
+                    }
+                }
+                let mut counts: Vec<_> = counts.into_iter().collect();
+                counts.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                suffixes.push(counts.into_iter().take(3).map(|(k, n)| json!([k, n])).collect::<Vec<_>>());
+            }
+            json!({
+                "family": c.family, "member": c.member, "token": c.token, "threshold": c.threshold,
+                "count": picked.len(), "rows": rows.len(), "expected": expected, "observed": observed,
+                "gain_bits": c.gain, "cost_bits": c.cost, "net_bits": c.gain - c.cost,
+                "bits_per_word": c.gain / picked.len().max(1) as f64,
+                "contexts": suffixes,
+                "words": picked.iter().take(400).map(|w| json!([words[*w].sequence, words[*w].position])).collect::<Vec<_>>(),
+                "also": also.iter().take(32).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let record = json!({"words": words.len(), "rules_saving_bits": candidates.len(), "groups": report});
+    std::fs::write(&out, serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
 fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
@@ -265,6 +735,8 @@ fn main() -> Result<(), String> {
         Some("calibrate") => calibrate(&args),
         Some("scan") => scan(&args),
         Some("merge") => merge(&args),
-        _ => Err("mpd_discover_2951 {calibrate|scan|merge} ...".to_string()),
+        Some("positions") => positions(&args),
+        Some("detect") => detect(&args),
+        _ => Err("mpd_discover_2951 {calibrate|scan|merge|positions|detect} ...".to_string()),
     }
 }
