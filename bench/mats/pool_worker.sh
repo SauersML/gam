@@ -56,6 +56,9 @@ while :; do
     waiting=0
     for f in $(ls -1tr "$Q"/todo/*.task 2> /dev/null); do
         c=$(field cpus "$f") m=$(field mem "$f") g=$(field gpus "$f") n=$(field minutes "$f") r=$(field ready "$f")
+        # A GPU worker takes only GPU tasks: a CPU task on it kept its GPU allocated and idle for hours
+        # while GPU tasks waited (15564, 15585). CPU tasks go to CPU workers.
+        (( GPUS == 0 || g > 0 )) || continue
         (( used_c + c <= CPUS && used_m + m <= MEM && used_g + g <= GPUS && n + 2 <= mins )) || continue
         [ -z "$r" ] || [ -e "$r" ] || { waiting=1; continue; }
         t=${f##*/}
