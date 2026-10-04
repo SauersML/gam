@@ -253,3 +253,6 @@ mod gates_tests;
 
 // Isolated replacement writes followed by the unchanged native downstream program.
 pub mod local_kl;
+
+// Native-grounded finite-bank MLP rule compiler (all coefficients and maps priced).
+pub mod native_mlp;

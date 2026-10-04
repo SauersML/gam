@@ -27,6 +27,8 @@ serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
 statrs = "0.19.0"
 
 [dev-dependencies]
+gam-solve = { path = "../gam-solve", version = "=0.3.157" }
+gam-problem = { path = "../gam-problem", version = "=0.3.157" }
 gam-workspace-hack = { path = "../gam-workspace-hack" }
 npyz = "0.9.1"
 qd = "0.8.0"
