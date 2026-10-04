@@ -9,9 +9,7 @@ use gam_mpd::{
     device_program::DeviceProgram,
     import::import_language_model,
     operator_program::{Node, Operator, SlotValues},
-    proposals::{
-        CopyMasks, CopyResidualBank, CopyResidualChoice, DataWeightedSvd, HeadApproximation,
-    },
+    proposals::{CopyMasks, CopyResidualBank, CopyResidualChoice, HeadApproximation, InputSvd},
     run_check::{layer_nodes, split_sites},
 };
 use ndarray::Array2;
@@ -363,8 +361,15 @@ fn fit(a: &[String]) -> Result<(), String> {
             mask[layer] = 1 << head;
             let copy = copies.compose(&mask)?;
             let predicted = copy.program.operators[index].matrix();
-            let fit_native = DataWeightedSvd::new(&native, &x);
-            let fit_residual = DataWeightedSvd::new(&(&native - &predicted), &x);
+            let input_svd = InputSvd::new(&x);
+            let fit_native = input_svd
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|s| s.fit(&native));
+            let fit_residual = input_svd
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|s| s.fit(&(&native - &predicted)));
             let mut points = Vec::new();
             for &rank in &ranks {
                 for family in [

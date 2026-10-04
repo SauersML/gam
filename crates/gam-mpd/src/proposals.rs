@@ -398,33 +398,57 @@ pub struct DataWeightedSvd {
     pub largest_input_singular_value: f64,
 }
 
-impl DataWeightedSvd {
-    pub fn new(matrix: &Array2<f64>, inputs: &Array2<f64>) -> Result<Self, String> {
-        if matrix.nrows() == 0 || matrix.ncols() == 0 || inputs.ncols() != matrix.ncols()
-            || inputs.nrows() < inputs.ncols()
-            || matrix.iter().chain(inputs.iter()).any(|v| !v.is_finite())
+/// Small reusable factorization of one declared training input family. The tall
+/// left singular vectors are discarded: different proposed maps and residuals
+/// share only the input-width square right factor and its singular values.
+pub struct InputSvd {
+    vt: Array2<f64>,
+    singular_values: Array1<f64>,
+    training_rows: usize,
+}
+
+impl InputSvd {
+    pub fn new(inputs: &Array2<f64>) -> Result<Self, String> {
+        if inputs.ncols() == 0 || inputs.nrows() < inputs.ncols()
+            || inputs.iter().any(|v| !v.is_finite())
         {
-            return Err("data-weighted SVD requires finite compatible matrices and at least input-width training rows".into());
+            return Err("input SVD requires finite values and at least input-width training rows".into());
         }
         let x = gam_linalg::decompose::svd(inputs.view(), false).map_err(|e| e.to_string())?;
-        if x.singular_values.len() != inputs.ncols() || x.singular_values.iter().any(|s| *s <= x.band) {
+        if x.singular_values.len() != inputs.ncols() || x.singular_values.iter().any(|s| !s.is_finite() || *s <= x.band)
+            || x.vt.iter().any(|v| !v.is_finite())
+        {
             return Err("data-weighted SVD training inputs are not full column rank at the declared SVD resolution".into());
+        }
+        Ok(Self { vt: x.vt, singular_values: x.singular_values, training_rows: inputs.nrows() })
+    }
+
+    pub fn fit(&self, matrix: &Array2<f64>) -> Result<DataWeightedSvd, String> {
+        if matrix.nrows() == 0 || matrix.ncols() != self.singular_values.len() || matrix.iter().any(|v| !v.is_finite()) {
+            return Err("data-weighted SVD requires a finite matrix matching the training input width".into());
         }
         // X = U S V^T. Orthogonality of U makes the weighted error equal to
         // ||(W - W_r) V S||_F. Truncate W V S, then undo S and V on the right.
-        let weighted = matrix.dot(&x.vt.t()) * &x.singular_values;
+        let weighted = matrix.dot(&self.vt.t()) * &self.singular_values;
+        if weighted.iter().any(|v| !v.is_finite()) { return Err("weighted map overflowed before SVD".into()); }
         let fit = gam_linalg::decompose::svd(weighted.view(), false).map_err(|e| e.to_string())?;
-        let right = (&fit.vt / &x.singular_values).dot(&x.vt);
+        let right = (&fit.vt / &self.singular_values).dot(&self.vt);
         if right.iter().chain(fit.u.iter()).chain(fit.singular_values.iter()).any(|v| !v.is_finite()) {
             return Err("data-weighted SVD unwhitening produced a nonfinite factor".into());
         }
-        Ok(Self {
+        Ok(DataWeightedSvd {
             fit: HeadSvd { u: fit.u, singular_values: fit.singular_values, vt: right },
-            training_rows: inputs.nrows(),
-            input_width: inputs.ncols(),
-            smallest_input_singular_value: x.singular_values.iter().copied().fold(f64::INFINITY, f64::min),
-            largest_input_singular_value: x.singular_values.iter().copied().fold(0.0, f64::max),
+            training_rows: self.training_rows,
+            input_width: self.singular_values.len(),
+            smallest_input_singular_value: self.singular_values.iter().copied().fold(f64::INFINITY, f64::min),
+            largest_input_singular_value: self.singular_values.iter().copied().fold(0.0, f64::max),
         })
+    }
+}
+
+impl DataWeightedSvd {
+    pub fn new(matrix: &Array2<f64>, inputs: &Array2<f64>) -> Result<Self, String> {
+        InputSvd::new(inputs)?.fit(matrix)
     }
 
     /// Explicit factors are projected to f32 and priced normally; no training data
@@ -748,6 +772,22 @@ mod data_weighted_svd_tests {
         assert!(DataWeightedSvd::new(&w, &ndarray::array![[1.0, 0.0]]).is_err());
         assert!(DataWeightedSvd::new(&w, &ndarray::array![[1.0, 0.0], [0.0, f64::NAN]]).is_err());
         assert!(DataWeightedSvd::new(&ndarray::array![[f64::INFINITY, 0.0]], &w).is_err());
+    }
+
+    #[test]
+    fn shared_input_factorization_preserves_factors_for_distinct_proposals() {
+        let x=ndarray::array![[1.,2.],[3.,-1.],[4.,5.]];
+        let shared=InputSvd::new(&x).expect("full rank inputs");
+        for matrix in [ndarray::array![[2.,1.],[0.,-3.]],ndarray::array![[1.,-4.],[2.,2.]]] {
+            let source=original(&matrix);
+            let a=shared.fit(&matrix).expect("shared fit").operator(&source,"a".into(),1).expect("a");
+            let b=DataWeightedSvd::new(&matrix,&x).expect("independent fit").operator(&source,"b".into(),1).expect("b");
+            assert_eq!(a.matrix(),b.matrix());
+            assert_eq!(a.real_count(),b.real_count());
+        }
+        assert!(shared.fit(&ndarray::Array2::zeros((2,3))).is_err());
+        let scaled=InputSvd::new(&ndarray::array![[2.,0.],[0.,2.]]).expect("scaled inputs");
+        assert!(scaled.fit(&ndarray::array![[f64::MAX,0.]]).is_err());
     }
 }
 
