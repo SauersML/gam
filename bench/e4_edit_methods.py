@@ -866,14 +866,15 @@ def stage_compile_v3():
         G = zf["G_F"] + beta * float(zf["f_mean"]) * (N.T @ N) / len(N)
         G = G + 1e-6 * np.trace(G) / len(G) * np.eye(len(G))
         G = (G + G.T) / 2
-        mfile = f"moment_F_b{beta:g}.npy"
+        tag = f"{beta:g}".replace(".", "p")  # no '.' in plan names: the solver writes <out>.left.npy by extension
+        mfile = f"moment_F_b{tag}.npy"
         np.save(d / mfile, np.ascontiguousarray(G))
         kv, kV = sl.eigh(K @ sl.solve(G, K.T, assume_a="pos"))
         kV = kV[:, ::-1]
         for k in (16, 32, 64):
             A = kV[:, :k]
             B = A.T @ K
-            name = f"v3_k{k}_b{beta:g}"
+            name = f"v3_k{k}_b{tag}"
             np.save(d / f"inputs_{name}.npy", np.ascontiguousarray(B))
             np.save(d / f"targets_{name}.npy", np.ascontiguousarray(B @ W0.T + np.outer(A.sum(0), w)))
             problems.append({"name": name, "storage": E.SITE + ".weight", "native": "native.npy",

@@ -9,13 +9,19 @@ Target outputs on tokens[:, :T] (fp32 forward, widened): logits_topk_values.f64 
 [N * T, K] (descending) and logits_logsumexp.f64 [1, N * T] (full-vocab logsumexp), plus the full
 logits of row 0, logits_row0.f64 [T, vocab], as an exact check.
 
-usage: vpd_engine_export.py OUT_DIR [N T ROW0 K]
+With CHECKPOINT_DIR (a directory holding model.safetensors and model_config.yaml with the target's
+tensor names, e.g. a fine-tuned copy) the weights are that checkpoint's and no target outputs are
+written: the engine computes its own.
+
+usage: vpd_engine_export.py OUT_DIR [N T ROW0 K [CHECKPOINT_DIR]]
 """
 
 import hashlib
 import json
 import os
 import sys
+
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -26,6 +32,7 @@ from vpd_model import TARGET_DIR, load_target, val_tokens
 
 out = sys.argv[1]
 N, T, ROW0, K = (int(x) for x in sys.argv[2:6]) if len(sys.argv) > 2 else (128, 512, 0, 64)
+CHECKPOINT = Path(sys.argv[6]) if len(sys.argv) > 6 else None
 os.makedirs(out, exist_ok=True)
 files = {}
 
@@ -46,8 +53,10 @@ def put(name: str, a: np.ndarray):
     files[name] = {"shape": list(a.shape), "sha256": sha256(path)}
 
 
-cfg = yaml.safe_load((TARGET_DIR / "model_config.yaml").read_text())
-sd = load_file(str(TARGET_DIR / "model_step_99999.safetensors"))
+source_dir = CHECKPOINT or TARGET_DIR
+weights = CHECKPOINT / "model.safetensors" if CHECKPOINT else TARGET_DIR / "model_step_99999.safetensors"
+cfg = yaml.safe_load((source_dir / "model_config.yaml").read_text())
+sd = load_file(str(weights))
 f64 = lambda k: sd[k].double().numpy()
 put("wte", f64("wte.weight"))
 put("final_norm.gain", f64("ln_f.weight"))
@@ -62,10 +71,10 @@ for l in range(cfg["n_layer"]):
 ids = val_tokens(N, seq=T + 1, offset=ROW0)
 put("tokens", ids.double().numpy())
 put("row_ids", np.arange(ROW0, ROW0 + N, dtype=np.float64))
-target = load_target("mps")
 vals, idxs, lses = [], [], []
+target = None if CHECKPOINT else load_target("mps")
 with torch.no_grad():
-    for i in range(0, N, 4):
+    for i in range(0, N if target is not None else 0, 4):
         lg = target(ids[i:i + 4, :T].to("mps")).flatten(0, 1)
         v, ix = lg.topk(K, dim=-1)
         vals.append(v.cpu().double())
@@ -74,9 +83,10 @@ with torch.no_grad():
         if i == 0:
             put("logits_row0", lg[:T].cpu().double().numpy())
         del lg
-put("logits_topk_values", torch.cat(vals).numpy())
-put("logits_topk_indices", torch.cat(idxs).numpy())
-put("logits_logsumexp", torch.cat(lses).numpy())
+if target is not None:
+    put("logits_topk_values", torch.cat(vals).numpy())
+    put("logits_topk_indices", torch.cat(idxs).numpy())
+    put("logits_logsumexp", torch.cat(lses).numpy())
 
 config = {
     "d_model": cfg["n_embd"], "n_layers": cfg["n_layer"], "n_heads": cfg["n_head"],
@@ -86,12 +96,12 @@ config = {
     "tied_embeddings": True, "n_ctx": cfg["n_ctx"],
 }
 record = {
-    "source": {"target_run": "goodfire/spd/runs/t-9d2b8f02",
-               "checkpoint": str(TARGET_DIR / "model_step_99999.safetensors"),
-               "checkpoint_sha256": sha256(TARGET_DIR / "model_step_99999.safetensors"),
+    "source": {"target_run": str(CHECKPOINT) if CHECKPOINT else "goodfire/spd/runs/t-9d2b8f02",
+               "checkpoint": str(weights),
+               "checkpoint_sha256": sha256(weights),
                "data": "danbraunai/pile-uncopyrighted-tok-shuffled val-00000-of-00012.parquet",
                "token_rows": [ROW0, ROW0 + N], "context": T, "topk": K,
-               "logits": "fp32 forward on MPS (vpd_model.Target), widened to f64"},
+               "logits": None if CHECKPOINT else "fp32 forward on MPS (vpd_model.Target), widened to f64"},
     "config": config, "files": files,
     "reference_forward": "~/mpd-data/vpd/vpd_model.py Target (pre-RMSNorm w * x * rsqrt(mean x^2 + eps); "
                          "rotate-half RoPE on q, k; causal softmax(q k^T / sqrt(hd)); GELU tanh; "
