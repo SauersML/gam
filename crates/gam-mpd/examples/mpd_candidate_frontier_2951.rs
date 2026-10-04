@@ -14,7 +14,7 @@
 //! groups= (all declared episode groups). SHA-256 input manifests require sha256sum
 //! or shasum on PATH. No greedy feasibility pruning is used.
 
-use gam_mpd::acceptance::{Ascent, Assessment, Constraint, CostCache, Local, SlotDomain, assess};
+use gam_mpd::acceptance::{Ascent, Assessment, Constraint, CostCache, Local, SlotDomain, assess_once};
 use gam_mpd::artifact::Artifact;
 use gam_mpd::candidate_frontier::{Candidate, account_bank, frontier};
 use gam_mpd::counterfactual::{Decoder, Spec, passages};
@@ -279,7 +279,7 @@ fn main() -> Result<(), String> {
             if let std::collections::btree_map::Entry::Vacant(entry) = replayed.entry(index) {
                 let bytes = candidate.artifact.to_bytes()?;
                 let decoded = Artifact::from_bytes(&bytes, &native.declarations)?;
-                let measured = assess(&local, &run, &decoded, point.constraint, &mut replay_cache)?;
+                let measured = assess_once(&local, &run, &decoded, point.constraint, &mut replay_cache)?;
                 let path = out.join(format!("artifact.{index}.bin"));
                 std::fs::write(&path, &bytes).map_err(|e| format!("{}: {e}", path.display()))?;
                 let hash = sha256(&path)?;

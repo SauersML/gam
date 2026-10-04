@@ -1141,3 +1141,39 @@ fn copy_mask_classification_rejects_invalid_nonmax_local_evidence() {
         assert!(measure.status().is_err(), "invalid nonmax evidence must remain unresolved, never prune or pass");
     }
 }
+
+#[test]
+fn assess_once_matches_complete_cached_assessment_without_measurement_key() {
+    let width = native(1);
+    let classes = native(2);
+    let model = raw_program(
+        1,
+        vec![Operator::identity("I", width.clone()), dense("head", &classes, &width, array![[1.0], [-1.0]])],
+        vec![Node::Raw { slot: 0 }, Node::Affine { terms: vec![(0, 0)], bias: None }, Node::Affine { terms: vec![(1, 1)], bias: None }],
+    );
+    let family = grid(&[-1.0, 0.5, 1.0], 1);
+    let start = Artifact::native(&model).unwrap();
+    let k = model.operators.len();
+    let candidate = start
+        .replace_block(
+            "changed",
+            Callee::New(rule("gain", vec![width.clone()], vec![Node::Param { index: 0 }, Node::Affine { terms: vec![(0, k)], bias: None }])),
+            vec![Argument::Native(0)],
+            1,
+            vec![dense("gain", &width, &width, array![[1.25]])],
+        )
+        .unwrap();
+    let local = Local::new(&model, family.clone(), None, 64);
+    let run = clean_run(&model, &family);
+    let mut once_cache = CostCache::default();
+    for constraint in [Constraint { local: 0.01, run: 0.01 }, Constraint { local: 1.0, run: 1.0 }] {
+        let old = assess(&local, &run, &candidate, constraint, &mut CostCache::default()).unwrap();
+        let once = super::acceptance::assess_once(&local, &run, &candidate, constraint, &mut once_cache).unwrap();
+        assert_eq!(old.cost, once.cost);
+        assert_eq!(old.local, once.local);
+        assert_eq!(old.local_measure, once.local_measure);
+        assert_eq!(old.run, once.run);
+        assert_eq!(old.run_measure, once.run_measure);
+        assert_eq!(old.meets(), once.meets());
+    }
+}

@@ -3,7 +3,7 @@
 //! Candidates are independent: infeasible individual edits never block a joint candidate.
 //! The gap concerns this bank only, never ungenerated programs. A fresh cache belongs to one
 //! fixed Local/RunCheck dataset and is reused across tolerance pairs, not across datasets.
-use super::acceptance::{Assessment, Constraint, CostCache, Local, RunCheck, assess, structural_cost};
+use super::acceptance::{Assessment, Constraint, CostCache, Local, RunCheck, assess_once, structural_cost};
 use super::artifact::{Artifact, EncodedArtifact};
 use super::precision::FidelityVerdict;
 
@@ -109,8 +109,8 @@ pub fn frontier(
             unique.push(candidate);
         }
     }
-    // Deduplication no longer needs the encoded messages. Assessment keeps its own exact
-    // cache identity; retaining both copies doubles the largest bank allocation.
+    // Deduplication no longer needs the encoded messages. Each distinct candidate
+    // is assessed once and its returned evidence is reused across the grid.
     let unique: Vec<_> = unique.into_iter().map(|(cost, label, artifact, _)| (cost, label, artifact)).collect();
     let measured_candidates = if constraints.is_empty() { 0 } else { budget.min(unique.len()) };
     let mut evidence: Vec<Vec<Evidence>> = constraints.iter().map(|_| Vec::new()).collect();
@@ -118,14 +118,10 @@ pub fn frontier(
         // Measurement is independent of the declared tolerance grid. Encoding and decoding
         // a real model for each point can cost more than evaluating it; reuse its evidence.
         let assessed = if index < measured_candidates {
-            Some(assess(local, run, artifact, constraints[0], &mut cache))
+            Some(assess_once(local, run, artifact, constraints[0], &mut cache))
         } else {
             None
         };
-        // This distinct candidate is never assessed again here. The owned assessment
-        // below carries all evidence; keeping its full encoded key grows memory with
-        // the sum of model sizes rather than the currently measured candidate.
-        cache.clear_measurements();
         for (constraint, row) in constraints.iter().zip(&mut evidence) {
             let state = match &assessed {
                 None => State::Unevaluated,

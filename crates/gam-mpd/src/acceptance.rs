@@ -69,7 +69,7 @@
 
 use super::artifact::{Artifact, EncodedArtifact, inlined};
 use super::operator_program::{Basis, FamilyInputs, Law, Node, Operator, OperatorProgram, SequenceLayout, SlotValues};
-use super::precision::{DecodedFidelity, FidelityVerdict, decode_then_evaluate};
+use super::precision::{DecodedFidelity, FidelityVerdict, decode_then_evaluate, decode_then_evaluate_pair};
 use super::supports::{EvidenceStatus, ExactBasis, Extremum};
 use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
 use ndarray::{Array1, Array2, s};
@@ -1095,6 +1095,27 @@ pub fn assess(
     )?;
     cache.measures.insert(key, (local_measure.clone(), run_measure.clone()));
     Ok(Assessment { cost, local: local_fidelity, local_measure, run: run_fidelity, run_measure })
+}
+
+/// Assess a candidate once, without constructing or hashing a measurement-cache
+/// key. Both measures execute the same decoded artifact; retain the returned
+/// assessment to reuse its evidence across a declared tolerance grid.
+pub fn assess_once(local: &Local<'_>, run: &dyn RunCheck, artifact: &Artifact, constraint: Constraint, cache: &mut CostCache) -> Result<Assessment, String> {
+    if !constraint.local.is_finite() || constraint.local < 0.0 || !constraint.run.is_finite() || constraint.run < 0.0 {
+        return Err("the fidelity tolerance must be finite and nonnegative".into());
+    }
+    if !artifact.has_f32_literals() {
+        return Err("a literal that is not a 32-bit float".into());
+    }
+    let cost = structural_cost(artifact, cache)?;
+    let encoded = EncodedArtifact::of(artifact)?;
+    let ((local_measure, run_measure), [local, run]) = decode_then_evaluate_pair(
+        &encoded,
+        |decoded: &Artifact| Ok((local.measure(decoded)?, RunMeasure::of(run.episodes(decoded)?))),
+        |(local, run)| Ok([local.status()?, run.status()?]),
+        [constraint.local, constraint.run],
+    )?;
+    Ok(Assessment { cost, local, local_measure, run, run_measure })
 }
 
 // -------------------------------------------------------------------------------- the search

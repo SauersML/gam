@@ -633,6 +633,31 @@ where
     Ok(DecodedFidelity { status, tolerance })
 }
 
+/// Decode once and evaluate two declared fidelities on that same decoded object.
+/// Both tolerances are validated before the decoder or evaluator can run. The
+/// returned outputs let callers retain measurements without another evaluation.
+pub fn decode_then_evaluate_pair<A, O, E, M, W, D>(
+    artifact: &A,
+    evaluate: E,
+    distortion: M,
+    tolerances: [f64; 2],
+) -> Result<(O, [DecodedFidelity<W, D>; 2]), String>
+where
+    A: DecodableArtifact,
+    E: FnOnce(&A::Decoded) -> Result<O, String>,
+    M: FnOnce(&O) -> Result<[EvidenceStatus<W, D>; 2], String>,
+{
+    for tolerance in tolerances {
+        if !tolerance.is_finite() || tolerance < 0.0 {
+            return Err("the fidelity tolerance must be finite and nonnegative".into());
+        }
+    }
+    let decoded = artifact.decode()?;
+    let outputs = evaluate(&decoded)?;
+    let [first, second] = distortion(&outputs)?;
+    Ok((outputs, [DecodedFidelity { status: first, tolerance: tolerances[0] }, DecodedFidelity { status: second, tolerance: tolerances[1] }]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1183,6 +1208,33 @@ mod tests {
             message.push_bits(0, 1).expect("one payload bit");
             assert_eq!(QuotientCode::read(&mut message.reader(), quotient).is_ok(), admitted);
         }
+    }
+    #[test]
+    fn paired_fidelity_decodes_once_and_validates_both_tolerances_first() {
+        struct Counted(std::cell::Cell<usize>);
+        impl DecodableArtifact for Counted {
+            type Decoded = usize;
+            fn decode(&self) -> Result<usize, String> {
+                self.0.set(self.0.get() + 1);
+                Ok(7)
+            }
+        }
+        let artifact = Counted(std::cell::Cell::new(0));
+        let evaluate = |decoded: &usize| Ok(*decoded);
+        let distortion = |value: &usize| {
+            assert_eq!(*value, 7);
+            Ok([lattice_evidence(0.0, 0.0)?, lattice_evidence(0.0, 0.0)?])
+        };
+        for bad in [f64::NAN, f64::INFINITY, -1.0] {
+            for tolerances in [[bad, 0.0], [0.0, bad]] {
+                assert!(decode_then_evaluate_pair(&artifact, evaluate, distortion, tolerances).is_err());
+                assert_eq!(artifact.0.get(), 0);
+            }
+        }
+        let (value, fidelity) = decode_then_evaluate_pair(&artifact, evaluate, distortion, [0.0, 0.1]).unwrap();
+        assert_eq!(artifact.0.get(), 1);
+        assert_eq!(value, 7);
+        assert!(fidelity.iter().all(|f| f.verdict() == FidelityVerdict::Meets));
     }
 }
 
