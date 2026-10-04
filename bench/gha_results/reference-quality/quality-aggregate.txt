@@ -3,15 +3,15 @@ complete case manifest: /tmp/quality-report/quality_cases.txt (437 cases)
 === #1561 whole-suite quality meta-gate ===
 category        n scored GAMwin REFwin   medlogR  p(1-sided)      p_BH
 factors         1      1      0      1    0.0173      1.0000    1.0000
-families       51     51     34     17   -0.0045      0.0025    0.0153
+families       51     51     34     17   -0.0055      0.0021    0.0127
 manifolds      11     11      8      2   -0.0033      0.0527    0.0945
 misc           29     29     18     11   -0.0006      0.0630    0.0945
-smooths        41     41     25     16   -0.0100      0.0093    0.0278
+smooths        41     41     26     15   -0.0109      0.0061    0.0183
 survival       12     12      7      5   -0.0092      0.2349    0.2818
 ------------------------------------------------------------------------
-OVERALL       145    145     92     52   -0.0045      0.0000 
+OVERALL       145    145     93     51   -0.0058      0.0000 
 
-CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0000, median log(gam/ref)=-0.0045, wins 92 / losses 52)
+CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0000, median log(gam/ref)=-0.0058, wins 93 / losses 51)
 Experimental units: 145 cases from 186 metric pairs.
 INCOMPLETE: absent manifest, mismatched execution, or failed cases; closure blocked.
 
@@ -63,8 +63,8 @@ smooths/quality_vs_mgcv_nottem_cyclic                       10    +0.575   0.358
 families/quality_vs_gamlss_gaussian_location_scale_cyclic:  25    -4.374   3.182     1.43   -0.29  15/25  unresolved_tie
 smooths/quality_vs_mgcv_duchon_regimes::two_component_k30   10    +8.828   6.115     1.43   +0.45   5/10  unresolved_tie
 smooths/quality_vs_mgcv_matern_varying_nu                   25    +4.052   2.957     1.36   +0.27  10/25  unresolved_tie
-families/quality_vs_gamlss_gaussian_multi_smooth::mu        23    -4.420   3.558     1.29   -0.27  17/23  unresolved_tie
-families/quality_vs_gamlss_gaussian_multi_smooth::log_sigm  23   -12.996  13.733     1.08   -0.23  20/23  unresolved_tie
+families/quality_vs_gamlss_gaussian_multi_smooth::mu        23    -4.419   3.558     1.29   -0.27  17/23  unresolved_tie
+families/quality_vs_gamlss_gaussian_multi_smooth::log_sigm  23   -12.995  13.733     1.08   -0.23  20/23  unresolved_tie
 smooths/quality_vs_mgcv_matern_varying_nu                   25    -0.931   0.880     1.07   -0.21  16/25  unresolved_tie
 families/quality_vs_gamlss_gaussian_location_scale::gaguri   4    +3.582   4.394     0.82   +0.41   1/4   unresolved_tie
 families/quality_vs_gamlss_custom_family_location_scale_ga   4    +5.682   7.010     0.82   +0.41   3/4   unresolved_tie
@@ -91,8 +91,8 @@ DILUTION: 28 paired pair(s) remain unresolved — their sign is not established 
   families/quality_vs_gamlss_custom_family_location_scale_gaussian::gagurine::mgcv: +5.682% +- 7.010% (0.82 SEM over 4 folds)
   families/quality_vs_gamlss_gaussian_location_scale::gagurine::mgcv: +3.582% +- 4.394% (0.82 SEM over 4 folds)
   smooths/quality_vs_mgcv_matern_varying_nu: -0.931% +- 0.880% (1.07 SEM over 25 folds)
-  families/quality_vs_gamlss_gaussian_multi_smooth::log_sigma: -12.996% +- 13.733% (1.08 SEM over 23 folds)
-  families/quality_vs_gamlss_gaussian_multi_smooth::mu: -4.420% +- 3.558% (1.29 SEM over 23 folds)
+  families/quality_vs_gamlss_gaussian_multi_smooth::log_sigma: -12.995% +- 13.733% (1.08 SEM over 23 folds)
+  families/quality_vs_gamlss_gaussian_multi_smooth::mu: -4.419% +- 3.558% (1.29 SEM over 23 folds)
   smooths/quality_vs_mgcv_matern_varying_nu: +4.052% +- 2.957% (1.36 SEM over 25 folds)
   smooths/quality_vs_mgcv_duchon_regimes::two_component_k30: +8.828% +- 6.115% (1.43 SEM over 10 folds)
   families/quality_vs_gamlss_gaussian_location_scale_cyclic::above_fundamental::log_sigma: -4.374% +- 3.182% (1.43 SEM over 25 folds)
