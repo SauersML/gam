@@ -48,6 +48,8 @@ while :; do
         ours=0
         grep -qx "$id" "$held" && ours=1
         [ "$reason" = JobHeldUser ] && (( ours == 0 )) && continue
+        # Waiting on another job (a build): it can't start, so it takes no room until it can.
+        [ "$reason" = Dependency ] && continue
         if [ "$name" = mpd-build ]; then
             (( ours )) && scontrol release "$id" && sed -i "/^$id\$/d" "$held" && echo "$(date +%T) released build $id"
             continue
