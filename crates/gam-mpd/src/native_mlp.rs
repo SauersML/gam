@@ -78,6 +78,9 @@ fn dense(
     cols: Interface,
     values: Array2<f64>,
 ) -> Result<Operator, String> {
+    // Transposed writer/response arrays may own Fortran storage. The literal
+    // wire codec transmits canonical row order; retain every logical value.
+    let values = values.as_standard_layout().to_owned();
     let precision = exact_precision(values.iter().copied()).map_err(|e| e.to_string())?;
     Operator::dense(name, rows, cols, values, precision, Provenance::default())
         .map_err(|e| e.to_string())
@@ -276,6 +279,93 @@ mod tests {
     use crate::operator_program::{Declarations, FamilyInputs, OperatorProgram, Slot, SlotValues};
     use ndarray::array;
     use std::sync::Arc;
+    #[test]
+    fn multiresponse_rules_have_canonical_literals_and_decode_execution_parity() {
+        let a = array![[-1.0, 0.5], [0.25, -0.75], [1.5, 2.0]];
+        for k in [2, 4, 8] {
+            let input = Interface::native(2).unwrap();
+            let response = Interface::native(k).unwrap();
+            let native = OperatorProgram {
+                declarations: Declarations {
+                    domains: vec![],
+                    slots: vec![Slot::Raw { width: 2 }],
+                    parameters: 0,
+                },
+                bases: vec![],
+                rules: vec![],
+                operators: vec![
+                    Arc::new(
+                        dense(
+                            "native placeholder",
+                            response.clone(),
+                            input,
+                            Array2::zeros((k, 2)),
+                        )
+                        .unwrap(),
+                    ),
+                    Arc::new(dense("head", response.clone(), response, Array2::eye(k)).unwrap()),
+                ],
+                nodes: vec![
+                    Node::Raw { slot: 0 },
+                    Node::Affine {
+                        terms: vec![(0, 0)],
+                        bias: None,
+                    },
+                    Node::Affine {
+                        terms: vec![(1, 1)],
+                        bias: None,
+                    },
+                ],
+                output: 2,
+            };
+            let fit = NativeRule {
+                reads: Array2::eye(2),
+                writes: Array2::eye(k),
+                features: vec![Feature::Linear(0), Feature::Gelu(1), Feature::Product(0, 1)],
+                coefficients: Array2::from_shape_fn((4, k), |(r, c)| (r + c + 1) as f64 / 8.0),
+            };
+            // The writer transpose is Fortran-layout for K>1; the executable
+            // literal codec requires canonical row storage, not a K=1 accident.
+            assert!(!fit.writes.t().to_owned().is_standard_layout());
+            let candidate = with_native_rule(
+                &Artifact::native(&native).unwrap(),
+                "multiresponse",
+                &LayerNodes {
+                    normed: 0,
+                    mlp: 1,
+                    ..LayerNodes::default()
+                },
+                &fit,
+            )
+            .unwrap()
+            .f32_literals()
+            .unwrap();
+            assert!(
+                candidate
+                    .program
+                    .operators
+                    .iter()
+                    .all(|op| op.matrix_cow().is_standard_layout())
+            );
+            let decoded =
+                Artifact::from_bytes(&candidate.to_bytes().unwrap(), &native.declarations).unwrap();
+            let family = FamilyInputs {
+                rows: 3,
+                slots: vec![SlotValues::Raw(a.clone())],
+                layout: None,
+            };
+            let got = decoded.execute(&family).unwrap();
+            let expected = design(&a, &fit.features).unwrap().dot(&fit.coefficients);
+            for (x, y) in got.values[decoded.program.output]
+                .iter()
+                .zip(expected.iter())
+            {
+                assert!((x - y).abs() < 1e-13, "K={k}: {x} versus {y}");
+            }
+            let cost = structural_cost(&decoded, &mut CostCache::default()).unwrap();
+            assert_eq!(cost.literals, (2 * k * k + 4 * k + 4) as u64);
+        }
+    }
     #[test]
     fn fit_features_use_the_executable_law_and_complete_joint_family() {
         let a = array![[-2.13, 0.12], [0.72, 3.17]];
