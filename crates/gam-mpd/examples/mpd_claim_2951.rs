@@ -5,7 +5,10 @@
 //! `sites_layer_{l}`), here for any `gam_mpd::explanation::Replacement`: an explanation run by its
 //! own rule on whatever its program computes, or given per-row sets.
 //!
-//! `mpd_claim_2951 FRONTIER OUT.json {ours:LIBRARY_DIR|vpd:VPD_LIBRARY:VPD_SETS} [passages] [context]`
+//! `mpd_claim_2951 FRONTIER OUT.json {ours:LIBRARY_DIR|vpd:VPD_LIBRARY:VPD_SETS} [passages] [context] [stages]`
+//!
+//! `stages` (default all) is a comma list of `layers` and layer numbers `L` (`sites_layer_L`), so
+//! the stages can run as separate jobs.
 //!
 //! `FRONTIER` is the engine export of the passages (`~/mpd-data/engine/vpd4l_frontier32`, 32
 //! passages of 512). `ours:` reads a fitted explanation (`mpd_e2e_2951`'s `OUT_DIR/library`: per
@@ -159,7 +162,7 @@ fn exhaustive(model: &OperatorProgram, replacement: &dyn Replacement, passages: 
 fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
-    let usage = "mpd_claim_2951 FRONTIER OUT.json {ours:LIBRARY_DIR|vpd:VPD_LIBRARY:VPD_SETS} [passages] [context]";
+    let usage = "mpd_claim_2951 FRONTIER OUT.json {ours:LIBRARY_DIR|vpd:VPD_LIBRARY:VPD_SETS} [passages] [context] [stages]";
     let frontier = PathBuf::from(args.get(1).ok_or(usage)?);
     let out = PathBuf::from(args.get(2).ok_or(usage)?);
     let which = args.get(3).ok_or(usage)?;
@@ -193,10 +196,16 @@ fn main() -> Result<(), String> {
         std::fs::write(&partial, serde_json::to_string_pretty(report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         std::fs::rename(&partial, &out).map_err(|e| e.to_string())
     };
-    let groups: Vec<Vec<usize>> = layers.values().cloned().collect();
-    let mut stages = vec![("layer_switches".to_string(), groups)];
+    let wanted: Option<Vec<String>> = args.get(6).map(|s| s.split(',').map(str::to_string).collect());
+    let runs = |stage: &str| wanted.as_ref().is_none_or(|w| w.iter().any(|s| s == stage));
+    let mut stages = Vec::new();
+    if runs("layers") {
+        stages.push(("layer_switches".to_string(), layers.values().cloned().collect::<Vec<_>>()));
+    }
     for (l, members) in &layers {
-        stages.push((format!("sites_layer_{l}"), members.iter().map(|k| vec![*k]).collect()));
+        if runs(&l.to_string()) {
+            stages.push((format!("sites_layer_{l}"), members.iter().map(|k| vec![*k]).collect()));
+        }
     }
     for (key, switches) in stages {
         let clock = std::time::Instant::now();
