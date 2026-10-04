@@ -1,6 +1,7 @@
 //! Opt-in head-only f64 CUDA logits; normalization and acceptance metrics remain CPU.
 use crate::counterfactual::Decoder;
 use gam_gpu::tensor::{Arithmetic, Device, Op, Tensor};
+use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
 use ndarray::{Array2, Axis};
 
 /// Numeric-buffer budgets. Excludes allocator metadata, CUDA library workspaces and context.
@@ -8,6 +9,68 @@ use ndarray::{Array2, Axis};
 pub struct Budget {
     pub resident_bytes: usize,
     pub workspace_bytes: usize,
+}
+
+/// A proposal statistic only. Never feed this estimate to acceptance as a
+/// certified interval: CPU metric replay remains the independent verdict oracle.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct MetricProposal {
+    pub kl_estimate: f64,
+    pub conditional_reduction_error_estimate: f64,
+    pub magnitude: f64,
+    pub spread: f64,
+    pub max_log_difference: f64,
+    pub underflow_allowance: f64,
+    pub top1_equal: bool,
+}
+
+/// Diagnostic adaptation of the CPU KL comparison model to raw GPU logits.
+/// g=gamma_(V+4), eta_t=(g+4u)(|max_t|+|log sum exp|+1), and likewise q.
+/// E=g*magnitude+eta_t+eta_q+(5u+eta_t)*spread+V*min_subnormal*max_log_difference.
+/// The extra operation terms model exp/divide probability weights; the last term
+/// records an absolute lost-tail allowance, not a relative underflow assumption.
+/// This is NOT a proven bound: CUDA12.2's exp/log ULP table is based on
+/// non-exhaustive tests and expressly not guaranteed. No GEMM/network error is
+/// covered, and neither acceptance nor near-boundary rejection may use E.
+/// https://docs.nvidia.com/cuda/archive/12.2.0/cuda-c-programming-guide/index.html#mathematical-functions-appendix
+pub fn proposal_comparison_terms(
+    row: &gam_gpu::tensor::KlProposalRow,
+    classes: usize,
+) -> Result<(f64, f64), String> {
+    if [
+        row.value,
+        row.magnitude,
+        row.spread,
+        row.max_log_difference,
+        row.teacher_max,
+        row.teacher_log_sum,
+        row.explained_max,
+        row.explained_log_sum,
+    ]
+    .iter()
+    .any(|x| !x.is_finite())
+        || row.magnitude < 0.0
+        || row.spread < 0.0
+        || row.max_log_difference < 0.0
+    {
+        return Err("invalid GPU proposal statistics".into());
+    }
+    let count = classes
+        .checked_add(4)
+        .ok_or("GPU metric class count overflow")?;
+    let growth = accumulation_growth(count);
+    let eta = |m: f64, l: f64| (growth + 4.0 * UNIT_ROUNDOFF) * (m.abs() + l.abs() + 1.0);
+    let (p, q) = (
+        eta(row.teacher_max, row.teacher_log_sum),
+        eta(row.explained_max, row.explained_log_sum),
+    );
+    let tail = (classes as f64 * f64::from_bits(1)) * row.max_log_difference;
+    let estimate =
+        (growth * row.magnitude + p + q + (5.0 * UNIT_ROUNDOFF + p) * row.spread + tail).next_up();
+    if classes == 0 || !estimate.is_finite() || estimate < 0.0 || !tail.is_finite() {
+        return Err("invalid GPU proposal comparison terms".into());
+    }
+    Ok((estimate, tail))
 }
 
 /// Immutable native head only: no blocks or candidate parameters are uploaded.
@@ -29,13 +92,13 @@ fn bytes(elements: usize) -> Result<usize, String> {
 }
 
 /// Conservative numeric buffers: four logits tiles (including caller's paired
-/// returned tile), six residual-width tiles, and one reduction scalar per row.
+/// returned tile), six residual-width tiles, and forty reduction/diagnostic scalars per row.
 /// Both host and device buffers count. Library-private GEMM workspace is excluded.
 pub fn tile_bytes(width: usize, vocab: usize) -> Result<usize, String> {
     let n = vocab
         .checked_mul(4)
         .and_then(|n| width.checked_mul(6).and_then(|d| n.checked_add(d)))
-        .and_then(|n| n.checked_add(1))
+        .and_then(|n| n.checked_add(40))
         .ok_or("readout tile count overflow")?;
     bytes(n)
 }
@@ -125,7 +188,7 @@ impl Resident {
     pub fn resident_bytes(&self) -> usize {
         self.resident_bytes
     }
-    pub fn log_probs(&self, residual: &Array2<f64>) -> Result<Array2<f64>, String> {
+    fn logits(&self, residual: &Array2<f64>) -> Result<Tensor, String> {
         if residual.ncols() != self.width
             || residual.nrows() > self.tile_rows
             || residual.iter().any(|x| !x.is_finite())
@@ -156,8 +219,63 @@ impl Resident {
             Arithmetic::F64,
         )
         .map_err(|e| e.to_string())?;
-        let logits = d.download(&out).map_err(|e| e.to_string())?;
-        normalize_logits(logits)
+        Ok(out)
+    }
+
+    pub fn log_probs(&self, residual: &Array2<f64>) -> Result<Array2<f64>, String> {
+        self.log_probs_profiled(residual).map(|pair| pair.0)
+    }
+
+    /// Synchronous upload/norm/GEMM/download time, then CPU normalization time.
+    /// These are elapsed call stages, not isolated GPU kernel measurements.
+    pub(crate) fn log_probs_profiled(
+        &self,
+        residual: &Array2<f64>,
+    ) -> Result<(Array2<f64>, [u64; 2]), String> {
+        let gpu_start = std::time::Instant::now();
+        let out = self.logits(residual)?;
+        let logits = self.device.download(&out).map_err(|e| e.to_string())?;
+        let gpu_ns = gpu_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let cpu_start = std::time::Instant::now();
+        let normalized = normalize_logits(logits)?;
+        let cpu_ns = cpu_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        Ok((normalized, [gpu_ns, cpu_ns]))
+    }
+
+    /// Explicit proposal-only GPU reductions. Downloads O(rows) statistics and
+    /// first-maximum indices; never downloads a full vocabulary logits tile.
+    /// No fallback or accepted verdict is produced. CPU replay is mandatory.
+    pub fn proposal_metrics(
+        &self,
+        teacher: &Array2<f64>,
+        explained: &Array2<f64>,
+    ) -> Result<Vec<MetricProposal>, String> {
+        if teacher.dim() != explained.dim() {
+            return Err("GPU metric proposal residual shapes differ".into());
+        }
+        let p = self.logits(teacher)?;
+        let q = self.logits(explained)?;
+        let rows = self
+            .device
+            .kl_proposal_rows(&p, &q)
+            .map_err(|e| e.to_string())?;
+        let a = self.device.argmax_rows(&p).map_err(|e| e.to_string())?;
+        let b = self.device.argmax_rows(&q).map_err(|e| e.to_string())?;
+        rows.iter()
+            .zip(a.iter().zip(&b))
+            .map(|(r, (a, b))| {
+                let (estimate, tail) = proposal_comparison_terms(r, self.vocab)?;
+                Ok(MetricProposal {
+                    kl_estimate: r.value,
+                    conditional_reduction_error_estimate: estimate,
+                    magnitude: r.magnitude,
+                    spread: r.spread,
+                    max_log_difference: r.max_log_difference,
+                    underflow_allowance: tail,
+                    top1_equal: a == b,
+                })
+            })
+            .collect()
     }
 }
 
@@ -178,6 +296,36 @@ mod tests {
         assert!(normalize_logits(ndarray::array![[f64::NAN]]).is_err());
         assert!(tile_bytes(usize::MAX, 1).is_err());
     }
+    #[test]
+    fn proposal_statistics_match_independent_cpu_kl_and_keep_oracle_separate() {
+        let e = ndarray::array![[1., 2.], [3., 4.], [-5., 6.]];
+        let g = ndarray::array![1., 1.];
+        let b = Budget {
+            resident_bytes: 64,
+            workspace_bytes: tile_bytes(2, 3).unwrap() * 2,
+        };
+        let h = Resident::from_head(Device::host(), &e, &g, 1e-6, b).unwrap();
+        let p = ndarray::array![[1., -1.], [0., 0.]];
+        let q = ndarray::array![[-2., 1.], [0., 0.]];
+        let proposal = h.proposal_metrics(&p, &q).unwrap();
+        let a = h.log_probs(&p).unwrap();
+        let z = h.log_probs(&q).unwrap();
+        for i in 0..2 {
+            let (cpu, band) = crate::acceptance::kl_logits(a.row(i), z.row(i));
+            assert!((cpu - proposal[i].kl_estimate).abs() < 1e-12);
+            assert!(
+                band.is_finite() && proposal[i].conditional_reduction_error_estimate.is_finite()
+            );
+        }
+        assert!(proposal[1].top1_equal);
+        assert_eq!(proposal[1].kl_estimate, 0.0);
+        assert!(h.proposal_metrics(&p, &Array2::zeros((1, 2))).is_err());
+        assert!(
+            h.proposal_metrics(&p, &Array2::from_elem((2, 2), f64::NAN))
+                .is_err()
+        );
+    }
+
     #[test]
     fn head_only_host_structure_and_budget() {
         let e = ndarray::array![[1., 2.], [3., 4.], [5., 6.]];

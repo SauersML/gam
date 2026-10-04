@@ -62,6 +62,20 @@ impl Arithmetic {
     }
 }
 
+/// Reduction statistics for a GPU proposal, never an acceptance certificate.
+/// `magnitude` and `spread` expose the conditional KL roundoff model's terms.
+#[derive(Clone, Copy, Debug)]
+pub struct KlProposalRow {
+    pub value: f64,
+    pub magnitude: f64,
+    pub spread: f64,
+    pub max_log_difference: f64,
+    pub teacher_max: f64,
+    pub teacher_log_sum: f64,
+    pub explained_max: f64,
+    pub explained_log_sum: f64,
+}
+
 /// The pointwise laws a kernel evaluates, by code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PointwiseLaw {
@@ -935,6 +949,48 @@ impl Device {
         self.kl_rows_impl(target, logits, scored, true)
     }
 
+    /// Checked f64 KL proposal statistics. No clamp, gradient or acceptance band.
+    /// CUDA returns eight numbers per row rather than full logits. Vendor exp/log
+    /// accuracy tables are not guaranteed bounds; callers must independently replay
+    /// CPU metrics for accepted verdicts. Nonfinite inputs/intermediates are errors.
+    pub fn kl_proposal_rows(&self, target: &Tensor, logits: &Tensor) -> Result<Vec<KlProposalRow>, GpuError> {
+        same(target, logits, "KL proposal")?;
+        if logits.cols == 0 || u32::try_from(logits.cols).is_err() || u32::try_from(logits.rows).is_err() {
+            return Err(shape("KL proposal requires nonempty columns and u32 dimensions".into()));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let mut result = Vec::with_capacity(logits.rows);
+                for (p, q) in host(target)?.chunks(logits.cols).zip(host(logits)?.chunks(logits.cols)) {
+                    if p.iter().chain(q).any(|x| !x.is_finite()) { return Err(shape("nonfinite KL proposal logits".into())); }
+                    let (mp, sp) = host_softmax_stats(p);
+                    let (mq, sq) = host_softmax_stats(q);
+                    let (lp, lq) = (sp.ln(), sq.ln());
+                    let mut row = KlProposalRow { value: 0.0, magnitude: 0.0, spread: 0.0, max_log_difference: 0.0, teacher_max: mp, teacher_log_sum: lp, explained_max: mq, explained_log_sum: lq };
+                    for (&a, &b) in p.iter().zip(q) {
+                        let (shift_p, shift_q) = (a - mp, b - mq);
+                        let (log_p, log_q) = (shift_p - lp, shift_q - lq);
+                        let probability = shift_p.exp() / sp;
+                        if [shift_p, shift_q, log_p, log_q, probability].iter().any(|x| !x.is_finite()) { return Err(shape("nonfinite KL proposal intermediate".into())); }
+                        row.max_log_difference = row.max_log_difference.max((log_p - log_q).abs());
+                        if probability > 0.0 {
+                            row.value += probability * (log_p - log_q);
+                            row.magnitude += probability * (log_p.abs() + log_q.abs());
+                            row.spread += probability * (log_p - log_q).abs();
+                        }
+                    }
+                    if [row.value, row.magnitude, row.spread, row.max_log_difference, lp, lq].iter().any(|x| !x.is_finite()) { return Err(shape("nonfinite KL proposal reduction".into())); }
+                    result.push(row);
+                }
+                Ok(result)
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.kl_proposal_rows(target, logits),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => Err(shape("KL proposal statistics require f64; Metal unsupported".into())),
+        }
+    }
+
     /// Per-row KL without calculating a cotangent. `logits` is a scratch buffer, left unchanged.
     pub fn kl_score_rows(&self, target: &Tensor, logits: &mut Tensor, scored: Option<&Indices>) -> Result<Vec<f64>, GpuError> {
         self.kl_rows_impl(target, logits, scored, false)
@@ -1534,7 +1590,7 @@ fn host_gemm(
 
 #[cfg(target_os = "linux")]
 mod cuda {
-    use super::{Arithmetic, CodeRowCounters, CodeRowsDiagnostics, CodeRowsWorkspace, code_rows_layout, ColumnBlocks, Data, IndexData, Indices, Op, RmsMode, Tensor, foreign, shape};
+    use super::{Arithmetic, KlProposalRow, CodeRowCounters, CodeRowsDiagnostics, CodeRowsWorkspace, code_rows_layout, ColumnBlocks, Data, IndexData, Indices, Op, RmsMode, Tensor, foreign, shape};
     use crate::gpu_error::{GpuError, GpuResultExt};
     use cudarc::cublas::sys::{cublasMath_t, cublasOperation_t};
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
@@ -1769,6 +1825,53 @@ extern "C" __global__ void kl_rows(unsigned int rows, unsigned int cols, const d
     }
     double total = block_sum(acc, shared);
     if (threadIdx.x == 0) kl[r] = total;
+}
+
+// Diagnostic reduction only. Accuracy terms are NOT a certified acceptance band.
+extern "C" __global__ void kl_proposal_rows(unsigned int rows, unsigned int cols,
+                                            const double* target, const double* logits, double* out) {
+    __shared__ double shared[BLOCK];
+    unsigned int r = blockIdx.x;
+    if (r >= rows) return;
+    const double* p = target + (u64)r * cols;
+    const double* q = logits + (u64)r * cols;
+    double bad = 0.0;
+    for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) {
+        if (!isfinite(p[c]) || !isfinite(q[c])) bad += 1.0;
+    }
+    double invalid = block_sum(bad, shared);
+    if (invalid > 0.0) {
+        if (threadIdx.x == 0) for (unsigned int j = 0; j < 9; ++j) out[(u64)r * 9 + j] = j == 8 ? invalid : 0.0;
+        return;
+    }
+    double mp, sp, mq, sq;
+    softmax_stats(p, cols, shared, &mp, &sp);
+    softmax_stats(q, cols, shared, &mq, &sq);
+    double lp = log(sp), lq = log(sq);
+    double value = 0.0, magnitude = 0.0, spread = 0.0, largest_difference = 0.0;
+    bad = (!isfinite(lp) || !isfinite(lq)) ? 1.0 : 0.0;
+    for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) {
+        double ap = p[c] - mp, aq = q[c] - mq;
+        double log_p = ap - lp, log_q = aq - lq;
+        double probability = exp(ap) / sp;
+        if (!isfinite(ap) || !isfinite(aq) || !isfinite(log_p) || !isfinite(log_q) || !isfinite(probability)) { bad += 1.0; continue; }
+        largest_difference = fmax(largest_difference, fabs(log_p - log_q));
+        if (probability > 0.0) {
+            value += probability * (log_p - log_q);
+            magnitude += probability * (fabs(log_p) + fabs(log_q));
+            spread += probability * fabs(log_p - log_q);
+        }
+    }
+    double total = block_sum(value, shared);
+    double mag = block_sum(magnitude, shared);
+    double distance = block_sum(spread, shared);
+    double max_difference = block_max(largest_difference, shared);
+    invalid = block_sum(bad, shared);
+    if (threadIdx.x == 0) {
+        double* row = out + (u64)r * 9;
+        row[0] = total; row[1] = mag; row[2] = distance;
+        row[3] = mp; row[4] = lp; row[5] = mq; row[6] = lq; row[7] = max_difference; row[8] = invalid;
+    }
 }
 
 extern "C" __global__ void sampled_cotangent(unsigned int rows, unsigned int cols, double* logits, const double* uniforms,
@@ -2889,6 +2992,25 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             let mut out = self.download(&kl)?;
             out.truncate(n_rows);
             Ok(out)
+        }
+
+        pub(super) fn kl_proposal_rows(&self, target: &Tensor, logits: &Tensor) -> Result<Vec<KlProposalRow>, GpuError> {
+            if logits.rows == 0 { return Ok(Vec::new()); }
+            let length = logits.rows.checked_mul(9).ok_or_else(|| shape("KL proposal allocation overflow".into()))?;
+            let mut out = self.zeros(length)?;
+            let (rows, cols) = (logits.rows as u32, logits.cols as u32);
+            let f = self.function("kl_proposal_rows")?;
+            // SAFETY: equal-shaped f64 source tensors; one block per row, nine output values per row.
+            unsafe {
+                self.stream.launch_builder(&f).arg(&rows).arg(&cols).arg(slice(target)?).arg(slice(logits)?).arg(&mut out).launch(cfg_rows(logits.rows))
+            }.gpu_ctx("tensor KL proposal rows")?;
+            let values = self.download(&out)?;
+            let mut result = Vec::with_capacity(logits.rows);
+            for row in values[..length].chunks_exact(9) {
+                if row[8] != 0.0 || row.iter().any(|x| !x.is_finite()) { return Err(shape("nonfinite KL proposal input or reduction".into())); }
+                result.push(KlProposalRow { value: row[0], magnitude: row[1], spread: row[2], max_log_difference: row[7], teacher_max: row[3], teacher_log_sum: row[4], explained_max: row[5], explained_log_sum: row[6] });
+            }
+            Ok(result)
         }
 
         pub(super) fn sampled_cotangent(&self, logits: &mut Tensor, uniforms: &Tensor, scored: Option<&Indices>) -> Result<(), GpuError> {
@@ -4395,5 +4517,39 @@ mod column_copy_tests {
         let bad_rows = device.zeros(1, 1).unwrap();
         assert!(device.set_columns(&mut out, 0, &bad_rows).is_err());
         assert_eq!(device.download(&out).unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod kl_proposal_tests {
+    use super::*;
+    #[test]
+    fn stable_tails_ties_and_reference_value_without_mutation() {
+        let d=Device::host();
+        let p=d.upload_vec(3,3,vec![1000.,1000.,1000.,0.,-2000.,-2000.,0.,1.,-3.]).unwrap();
+        let q=d.upload_vec(3,3,vec![1000.,1000.,1000.,-2000.,0.,-2000.,-1.,2.,0.]).unwrap();
+        let before=d.download(&q).unwrap();
+        let proposed=d.kl_proposal_rows(&p,&q).unwrap();
+        let mut scratch=d.copy(&q).unwrap();
+        let reference=d.kl_score_rows(&p,&mut scratch,None).unwrap();
+        assert_eq!(proposed[0].value,0.0); assert_eq!(proposed[1].value,2000.0); assert_eq!(proposed[1].max_log_difference,2000.0);
+        for (row,expected) in proposed.iter().zip(reference) {
+            assert_eq!(row.value,expected); assert!(row.magnitude>=0.0 && row.spread>=0.0);
+        }
+        assert_eq!(d.argmax_rows(&p).unwrap(),vec![0,0,1]);
+        assert_eq!(d.download(&q).unwrap(),before);
+    }
+    #[test]
+    fn malformed_and_overflowed_rows_are_errors_not_zero_scores() {
+        let d=Device::host(); let good=d.upload_vec(1,2,vec![0.,1.]).unwrap();
+        for bad in [f64::NAN,f64::INFINITY,f64::NEG_INFINITY] {
+            let p=d.upload_vec(1,2,vec![bad,0.]).unwrap();
+            assert!(d.kl_proposal_rows(&p,&good).is_err());
+            assert!(d.kl_proposal_rows(&good,&p).is_err());
+        }
+        let overflow=d.upload_vec(1,2,vec![f64::MAX,-f64::MAX]).unwrap();
+        assert!(d.kl_proposal_rows(&overflow,&good).is_err());
+        assert!(d.kl_proposal_rows(&good,&d.zeros(2,2).unwrap()).is_err());
+        assert!(d.kl_proposal_rows(&d.zeros(1,0).unwrap(),&d.zeros(1,0).unwrap()).is_err());
     }
 }

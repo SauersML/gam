@@ -672,6 +672,14 @@ struct TeacherEpisodes {
 #[derive(Default)]
 struct RunTimers {
     teacher: std::sync::atomic::AtomicU64,
+    teacher_donor_forward: std::sync::atomic::AtomicU64,
+    teacher_clean_forward: std::sync::atomic::AtomicU64,
+    teacher_episode_forward: std::sync::atomic::AtomicU64,
+    teacher_effect_readout: std::sync::atomic::AtomicU64,
+    cpu_metric: std::sync::atomic::AtomicU64,
+    gpu_head_logits_download: std::sync::atomic::AtomicU64,
+    cpu_head_normalize: std::sync::atomic::AtomicU64,
+    cpu_head: std::sync::atomic::AtomicU64,
     compile: std::sync::atomic::AtomicU64,
     native_compile: std::sync::atomic::AtomicU64,
     planning: std::sync::atomic::AtomicU64,
@@ -700,12 +708,37 @@ impl Drop for RunTimer<'_> {
 #[derive(serde::Serialize)]
 pub struct RunTiming {
     pub teacher_initialization: f64,
+    pub teacher_donor_forward: f64,
+    pub teacher_clean_forward: f64,
+    pub teacher_episode_forward: f64,
+    pub teacher_effect_readout: f64,
+    /// Existing CPU KL/argmax reductions in teacher effects and candidate scoring.
+    pub cpu_metric_reductions: f64,
+    pub gpu_head_upload_norm_gemm_download: f64,
+    pub cpu_head_log_normalization: f64,
+    pub cpu_head_complete_log_probs: f64,
     pub candidate_compile: f64,
     pub native_source_compile: f64,
     pub intervention_planning: f64,
     pub donor_execution: f64,
     pub explained_execution: f64,
     pub output_readout_and_kl: f64,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum MetricMode { CpuOracle, GpuProposal }
+
+/// Uncertified GPU metric proposal. It is not acceptance evidence and does not
+/// implement RunCheck; independent CPU metric replay determines accepted verdicts.
+#[derive(serde::Serialize)]
+pub struct GpuMetricProposalEpisode {
+    pub id: String,
+    pub group: String,
+    pub kl_estimate: f64,
+    pub conditional_reduction_error_estimate: f64,
+    pub native_effect_cpu_metric: f64,
+    pub top1_agree: f64,
+    pub unheld: usize,
 }
 
 struct NativeDeviceSource {
@@ -744,7 +777,16 @@ impl<'a> LanguageRun<'a> {
     pub fn timing(&self) -> RunTiming {
         let seconds = |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Relaxed) as f64 * 1e-9;
         RunTiming {
-            teacher_initialization: seconds(&self.timers.teacher), candidate_compile: seconds(&self.timers.compile), native_source_compile: seconds(&self.timers.native_compile),
+            teacher_initialization: seconds(&self.timers.teacher),
+            teacher_donor_forward: seconds(&self.timers.teacher_donor_forward),
+            teacher_clean_forward: seconds(&self.timers.teacher_clean_forward),
+            teacher_episode_forward: seconds(&self.timers.teacher_episode_forward),
+            teacher_effect_readout: seconds(&self.timers.teacher_effect_readout),
+            cpu_metric_reductions: seconds(&self.timers.cpu_metric),
+            gpu_head_upload_norm_gemm_download: seconds(&self.timers.gpu_head_logits_download),
+            cpu_head_log_normalization: seconds(&self.timers.cpu_head_normalize),
+            cpu_head_complete_log_probs: seconds(&self.timers.cpu_head),
+            candidate_compile: seconds(&self.timers.compile), native_source_compile: seconds(&self.timers.native_compile),
             intervention_planning: seconds(&self.timers.planning), donor_execution: seconds(&self.timers.donor),
             explained_execution: seconds(&self.timers.forward), output_readout_and_kl: seconds(&self.timers.readout),
         }
@@ -807,8 +849,18 @@ impl<'a> LanguageRun<'a> {
 
     fn log_probs(&self, residual: &Array2<f64>) -> Result<Array2<f64>, String> {
         match &self.native_readout {
-            Some(head) => head.log_probs(residual),
-            None => Ok(self.decoder.log_probs(residual)),
+            Some(head) => {
+                let (probabilities,times)=head.log_probs_profiled(residual)?;
+                self.timers.gpu_head_logits_download.fetch_add(times[0],std::sync::atomic::Ordering::Relaxed);
+                self.timers.cpu_head_normalize.fetch_add(times[1],std::sync::atomic::Ordering::Relaxed);
+                Ok(probabilities)
+            }
+            None => {
+                let timer=RunTimer::start(&self.timers.cpu_head);
+                let probabilities=self.decoder.log_probs(residual);
+                drop(timer);
+                Ok(probabilities)
+            },
         }
     }
 
@@ -861,7 +913,9 @@ impl<'a> LanguageRun<'a> {
                                 .collect();
                             let mut native = Program::new(Maps::Native(decoder), &[], None);
                             native.record = keys.iter().map(|k| (*k, None)).collect();
+                            let forward_timer = RunTimer::start(&self.timers.teacher_donor_forward);
                             decoder.forward(&self.passages[d], &mut native, &[]);
+                            drop(forward_timer);
                             let states = native
                                 .record
                                 .into_iter()
@@ -879,7 +933,10 @@ impl<'a> LanguageRun<'a> {
                         .into_par_iter()
                         .map(|p| {
                             let mut native = Program::new(Maps::Native(decoder), &[], None);
-                            (p, decoder.forward(&self.passages[p], &mut native, &all_rows))
+                            let forward_timer = RunTimer::start(&self.timers.teacher_clean_forward);
+                            let forward = decoder.forward(&self.passages[p], &mut native, &all_rows);
+                            drop(forward_timer);
+                            (p, forward)
                         })
                         .collect();
                     let none = Donor::default();
@@ -890,24 +947,30 @@ impl<'a> LanguageRun<'a> {
                         .map(|episode| {
                             let native_donor = episode.donor.and_then(|d| native_donors.get(&d)).unwrap_or(&none);
                             let mut native = Program::new(Maps::Native(decoder), &episode.actions, Some(native_donor));
+                            let forward_timer = RunTimer::start(&self.timers.teacher_episode_forward);
                             let reference = decoder.forward(&self.passages[episode.passage], &mut native, &episode.interface_rows);
+                            drop(forward_timer);
                             let from = episode.actions.iter().map(Action::first_row).min().unwrap_or(0);
                             let rows = reference.residual.nrows();
                             if from > rows {
                                 return Err("teacher intervention starts beyond passage".to_string());
                             }
                             let head_guard = self.native_readout.as_ref().map(|_| self.readout_lock.lock()).transpose().map_err(|_| "native readout lock poisoned")?;
+                            let effect_timer = RunTimer::start(&self.timers.teacher_effect_readout);
                             let mut effect = 0.0;
                             let mut start = from;
                             while start < rows {
                                 let end = (start + self.readout_rows()).min(rows);
                                 let p = self.log_probs(&reference.residual.slice(s![start..end, ..]).to_owned())?;
                                 let c = self.log_probs(&clean[&episode.passage].residual.slice(s![start..end, ..]).to_owned())?;
+                                let metric_timer = RunTimer::start(&self.timers.cpu_metric);
                                 for row in 0..end - start {
                                     effect += kl_logits(p.row(row), c.row(row)).0;
                                 }
+                                drop(metric_timer);
                                 start = end;
                             }
+                            drop(effect_timer);
                             drop(head_guard);
                             Ok((reference.residual, effect / (rows - from).max(1) as f64))
                         })
@@ -1054,8 +1117,9 @@ fn check_native_tail(native: &OperatorProgram, artifact: &Artifact, last: usize)
     Ok(())
 }
 
-impl RunCheck for LanguageRun<'_> {
-    fn episodes(&self, artifact: &Artifact) -> Result<Vec<EpisodeScore>, String> {
+impl LanguageRun<'_> {
+    fn score_episodes(&self, artifact: &Artifact, mode: MetricMode) -> Result<Vec<EpisodeScore>, String> {
+        if mode==MetricMode::GpuProposal && self.native_readout.is_none() { return Err("GPU metric proposals require explicit native CUDA readout".into()); }
         use rayon::prelude::*;
         let head_dim = self.native.node_interface(self.layers[0].reads[0]).map_err(|e| e.to_string())?.width();
         let compile_timer = RunTimer::start(&self.timers.compile);
@@ -1140,14 +1204,31 @@ impl RunCheck for LanguageRun<'_> {
             let mut start = from;
             while start < rows {
                 let end = (start + self.readout_rows()).min(rows);
-                let p = self.log_probs(&reference.slice(s![start..end, ..]).to_owned())?;
-                let q = self.log_probs(&explained.residual.slice(s![start..end, ..]).to_owned())?;
-                for r in 0..end - start {
-                    let (value, rounding) = kl_logits(p.row(r), q.row(r));
-                    kl += value;
-                    error += rounding;
+                let native_rows=reference.slice(s![start..end, ..]).to_owned();
+                let explained_rows=explained.residual.slice(s![start..end, ..]).to_owned();
+                match mode {
+                    MetricMode::CpuOracle => {
+                        let p = self.log_probs(&native_rows)?;
+                        let q = self.log_probs(&explained_rows)?;
+                        let metric_timer = RunTimer::start(&self.timers.cpu_metric);
+                        for r in 0..end - start {
+                            let (value, rounding) = kl_logits(p.row(r), q.row(r));
+                            kl += value;
+                            error += rounding;
+                        }
+                        agree += top1_rows(&p, &q).iter().filter(|a| **a).count() as f64;
+                        drop(metric_timer);
+                    }
+                    MetricMode::GpuProposal => {
+                        let head=self.native_readout.as_ref().ok_or("GPU metric proposal head absent")?;
+                        let proposed=head.proposal_metrics(&native_rows,&explained_rows)?;
+                        for row in proposed {
+                            kl+=row.kl_estimate;
+                            error+=row.conditional_reduction_error_estimate;
+                            agree+=f64::from(row.top1_equal);
+                        }
+                    }
                 }
-                agree += top1_rows(&p, &q).iter().filter(|a| **a).count() as f64;
                 start = end;
             }
             drop(readout_timer);
@@ -1176,6 +1257,22 @@ impl RunCheck for LanguageRun<'_> {
             }
         }
         Ok(out)
+    }
+
+    /// Fast proposal/ranking diagnostics only. The fixed CPU teacher residuals
+    /// and CPU-metric native effects are reused. No tolerance or rejection logic
+    /// is applied; every accepted candidate needs independent episodes() replay.
+    pub fn gpu_metric_proposals(&self, artifact: &Artifact) -> Result<Vec<GpuMetricProposalEpisode>, String> {
+        self.score_episodes(artifact,MetricMode::GpuProposal).map(|rows| rows.into_iter().map(|r| GpuMetricProposalEpisode {
+            id:r.id,group:r.group,kl_estimate:r.kl,conditional_reduction_error_estimate:r.numerical_error,
+            native_effect_cpu_metric:r.native_effect,top1_agree:r.top1_agree,unheld:r.unheld,
+        }).collect())
+    }
+}
+
+impl RunCheck for LanguageRun<'_> {
+    fn episodes(&self, artifact: &Artifact) -> Result<Vec<EpisodeScore>, String> {
+        self.score_episodes(artifact,MetricMode::CpuOracle)
     }
 }
 
