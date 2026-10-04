@@ -140,7 +140,9 @@ fn message_key(message: &super::codec::BitString) -> Result<Vec<u64>, String> {
 /// `C32(artifact)`: numeric-free structure plus 32 bits per independently
 /// transmitted numeric literal. The exact wire codec may take a different number of
 /// bits, notably for exact architecture epsilons and integer arithmetic knobs.
-/// Dimensions, ranks, indices and primitive fixed-law definitions remain structure.
+/// Dimensions, ranks, indices and primitive opcode selections remain structure.
+/// Explicit matrix-rule bodies are transmitted and charged once in binding bits.
+/// Legacy Copy/Match tags condition cost on decoder-provided template formulas.
 pub fn structural_cost(artifact: &Artifact, cache: &mut CostCache) -> Result<StructuralCost, String> {
     // The program as its message holds it: a derived operator with no reals.
     let program = &artifact.message_program()?;
