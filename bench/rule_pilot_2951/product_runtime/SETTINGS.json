@@ -1,0 +1,10 @@
+{
+  "iterations": 32,
+  "forward_rows": 128,
+  "learning_rate": 0.001,
+  "beta1": 0.9,
+  "beta2": 0.999,
+  "epsilon": 1e-08,
+  "numeric_bytes": 1073741824,
+  "arithmetic": "f32"
+}

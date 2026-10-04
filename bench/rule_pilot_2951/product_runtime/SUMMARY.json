@@ -1,0 +1,32 @@
+{
+  "scope": "One declared shifted full-vector quadratic proposal; runtime and capacity diagnostic only. No learned shared-body, transfer or full-model acceptance claim.",
+  "jobs": {
+    "cpu_build": 15888,
+    "gpu_fit": 15889
+  },
+  "source": "4d35df2c7bfaf1e15541f493748b31afa0e917f7",
+  "steps": 32,
+  "training_rows": 4096,
+  "evaluation_rows": 1024,
+  "optimizer_seconds": 1.438141511,
+  "driver_seconds": 3.448580359,
+  "gpu_allocated_seconds": 5,
+  "training_initial": 1.8004202058830239,
+  "training_best": 1.3523570012668262,
+  "validation_initial": 1.9762021511686516,
+  "validation_final": 1.8988319227008108,
+  "saved_byte_replay": {
+    "bytes": 11803110,
+    "complete_c32_bits": 56697478,
+    "path": "/mnt/nw/home/s.sauers/mpd-data/cluster/codex-vector-rule-fit-4d35/measurement/fit/fitted.bin",
+    "sha256": "19eb773d34af581d5ab05a65656019811b6744927e266a894f44d70fcc9582f9",
+    "training_max_normalized_row_error": 1.3523570174164985,
+    "validation_max_normalized_row_error": 1.8988319276877217
+  },
+  "standalone_cost_not_full_model": true,
+  "planned_numeric_bytes": 236132352,
+  "actual_peak_gpu_bytes": null,
+  "actual_peak_host_bytes": null,
+  "memory_limitation": "Short job escaped sampled peak accounting. Planned numeric bytes excludes allocator/context/product scratch and is not measured peak. DEVICE.csv lists node GPUs, not identification of only the allocated GPU.",
+  "report_sha256": "0bf0088681d7f904f6a3583ab4e998f27f4460237b273599c5b77d02bf17c845"
+}

@@ -1,0 +1,21 @@
+{
+  "source": "4d35df2c7bfaf1e15541f493748b31afa0e917f7",
+  "cpu_build_job": 15888,
+  "gpu_fit_job": 15889,
+  "status": "completed exit0",
+  "protocol_sha256": "21a6ea58e341cd7ff8bfc4c95a73a2af2db76779ccd2d6ed1cc49616f58a88c5",
+  "settings_sha256": "acd4aa1c78bdb0c3b294066bb05da1b14c12a9370e86761370e8e7ae91e6393f",
+  "output": "codex-vector-rule-fit-4d35/measurement",
+  "pre_fit_source_sha256": "de1f6cab70560995c5a2433ea74eeef6a06d19c60074c893da72801a29ab9760",
+  "pre_fit_source_bytes": 11617040,
+  "pre_fit_source_location": "prepared-local/SOURCE.bin",
+  "source_generation_seconds": 0.195,
+  "gpu_allocated_seconds": 5,
+  "optimizer_seconds": 1.438141511,
+  "driver_seconds": 3.448580359,
+  "report": "/Users/user/mpd-data/cluster/codex-vector-rule-fit-4d35/measurement/fit/report.json",
+  "report_sha256": "0bf0088681d7f904f6a3583ab4e998f27f4460237b273599c5b77d02bf17c845",
+  "fitted_artifact_sha256": "19eb773d34af581d5ab05a65656019811b6744927e266a894f44d70fcc9582f9",
+  "actual_peak_gpu_bytes": null,
+  "actual_peak_host_bytes": null
+}

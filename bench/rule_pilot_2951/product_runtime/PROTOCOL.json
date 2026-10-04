@@ -1,0 +1,78 @@
+{
+  "status": "frozen before fit",
+  "kind": "single-layer bounded runtime and proposal diagnostic",
+  "layer": 0,
+  "width": 768,
+  "nonlinear_features": 768,
+  "argument_count": 2,
+  "seed": 2951,
+  "rule": "Hadamard(Arg0,Arg1)",
+  "reader_offsets": "two paid trainable full-vector offsets",
+  "trainable": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "settings": {
+    "iterations": 32,
+    "forward_rows": 128,
+    "learning_rate": 0.001,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "epsilon": 1e-08,
+    "numeric_bytes": 1073741824,
+    "arithmetic": "f32"
+  },
+  "manifest": "/Users/user/mpd-data/cluster/codex-affine-mlp-9c504de18084/extract/EXTRACT.json",
+  "manifest_sha256": "e914269c811d00503b93167a66bbd761d196c76fd8dd44fd18698532bd4a565e",
+  "train_rows": 4096,
+  "evaluation_rows": 1024,
+  "claims_excluded": [
+    "reusable law discovery",
+    "shared learned body",
+    "transfer",
+    "complete model fidelity from standalone fit"
+  ],
+  "unimplemented_controls": [
+    "tied/untied multiuse",
+    "primitive-only GELU",
+    "frozen body transfer"
+  ],
+  "evaluation_arithmetic": "saved f32 numerical literals evaluated by F64 ordinary decoded program",
+  "cost_scope": "standalone source first; complete native graft cost required separately",
+  "finite_inventory": [
+    {
+      "label": "shifted-two-vector-product",
+      "arity": 2,
+      "body_nodes": [
+        {
+          "kind": "Param",
+          "index": 0
+        },
+        {
+          "kind": "Param",
+          "index": 1
+        },
+        {
+          "kind": "Hadamard",
+          "left": 0,
+          "right": 1
+        }
+      ]
+    }
+  ],
+  "independent_trainable_numeric_literals": 1771776,
+  "grammar_scope": "one supplied arithmetic body, not exhaustive broader max3 grammar",
+  "source_implementation_commit": "4d35df2c7bfaf1e15541f493748b31afa0e917f7",
+  "gpu_resources": {
+    "count": 1,
+    "cpus": 4,
+    "host_gib": 16,
+    "wall_minutes": 15
+  },
+  "objective": "single-use max row Euclidean error/native training RMS; validation independently normalized by validation native RMS, not formal Local",
+  "mathematical_restriction": "shifted products form a quadratic function; native GELU is not generally quadratic; offsets remove forced-even restriction but do not establish global expressiveness"
+}
