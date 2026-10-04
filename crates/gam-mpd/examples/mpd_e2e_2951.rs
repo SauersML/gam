@@ -374,6 +374,10 @@ fn main() -> Result<(), String> {
             if let Some(bits) = earlier {
                 return Ok(bits);
             }
+            // Started from VPD's subcomponents with no rounds, our library is VPD's, priced alike.
+            if run.vpd_start && run.settings.rounds == 0 && f.ranks.iter().all(|r| *r == 1) && f.library.v == library.v && f.library.u == library.u {
+                return Ok(f.bits.clone());
+            }
             let describe = f.description(model, run.settings.observations)?;
             let bits = (0..library.v.nrows())
                 .into_par_iter()

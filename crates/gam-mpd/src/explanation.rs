@@ -41,6 +41,9 @@ use std::sync::Arc;
 /// The most sites whose every subset [`site_switch`] tries.
 pub const EXHAUSTIVE: usize = 10;
 
+/// Passages whose single-site flips [`site_switch`] searches at once.
+const FLIPPING: usize = 8;
+
 /// What [`fit`] fits with.
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
@@ -487,20 +490,45 @@ pub fn site_switch(model: &OperatorProgram, replacement: &dyn Replacement, passa
     for bits in tried {
         visit(bits, &every, &mut result)?;
     }
-    // Single-site flips from each passage's worst subset while its mean KL rises.
-    for p in 0..passages.len() {
+    // Single-site flips from each passage's worst subset while its mean KL rises, [`FLIPPING`]
+    // passages at once (each holds its own masked program).
+    let passage_flips = |p: usize, (mut worst, mut subset, mut words): (f64, Vec<usize>, Vec<f64>)| -> Result<(f64, Vec<usize>, Vec<f64>, usize), String> {
+        let mut forwards = 0;
         loop {
-            let best = result.worst[p];
-            let current: u64 = result.worst_subset[p].iter().map(|j| 1u64 << j).sum();
+            let best = worst;
+            let current: u64 = subset.iter().map(|j| 1u64 << j).sum();
             for j in 0..count {
                 let flipped = current ^ (1 << j);
-                if flipped != 0 {
-                    visit(flipped, &[p], &mut result)?;
+                if flipped == 0 {
+                    continue;
+                }
+                let members = members_of(flipped, count);
+                let masked = replacement.masked(model, &members)?;
+                let (trace, _) = replacement.run(&masked, &members, p, &passages[p].base)?;
+                let kl = kl_score_only(&passages[p].target, &trace.values[masked.program.output]);
+                forwards += 1;
+                for (w, k) in words.iter_mut().zip(kl.iter()) {
+                    *w = w.max(*k);
+                }
+                let mean = kl.mean().unwrap_or(0.0);
+                if mean > worst {
+                    (worst, subset) = (mean, members);
                 }
             }
-            if result.worst[p] <= best {
+            if worst <= best {
                 break;
             }
+        }
+        Ok((worst, subset, words, forwards))
+    };
+    let order: Vec<usize> = (0..passages.len()).collect();
+    for chunk in order.chunks(FLIPPING) {
+        let starts: Vec<(f64, Vec<usize>, Vec<f64>)> = chunk.iter().map(|&p| (result.worst[p], result.worst_subset[p].clone(), result.word_worst[p].clone())).collect();
+        let flipped: Vec<(f64, Vec<usize>, Vec<f64>, usize)> =
+            chunk.par_iter().zip(starts).map(|(&p, start)| passage_flips(p, start)).collect::<Result<_, String>>()?;
+        for (&p, (worst, subset, words, forwards)) in chunk.iter().zip(flipped) {
+            (result.worst[p], result.worst_subset[p], result.word_worst[p]) = (worst, subset, words);
+            result.forwards += forwards;
         }
     }
     Ok(result)
