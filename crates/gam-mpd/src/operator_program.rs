@@ -3675,6 +3675,368 @@ fn decode_rules(
     Ok(rules)
 }
 
+/// Fixed native operator codewords and independently decoded witnesses.
+/// Only this immutable source is cached; candidate bodies never enter the cache.
+/// The byte budget covers packed buffer capacities plus logical decoded numeric
+/// buffers. Metadata/allocator overhead, caller-owned source buffers and one
+/// constructor's transient operator decode are outside that explicit scope.
+pub struct NativeOperatorCodec {
+    declarations: Declarations,
+    entries: Vec<NativeOperatorCodeword>,
+    source_indices: BTreeMap<usize, usize>,
+    stats: NativeOperatorCodecStats,
+    encoded_hits: std::sync::atomic::AtomicU64,
+    decoded_hits: std::sync::atomic::AtomicU64,
+}
+struct NativeOperatorCodeword {
+    source: std::sync::Weak<Operator>,
+    message: BitString,
+    decoded: Arc<Operator>,
+}
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub struct NativeOperatorCodecStats {
+    pub operators: usize,
+    pub encoded_capacity_bytes: usize,
+    pub decoded_numeric_bytes: usize,
+    pub budget_bytes: usize,
+    pub source_arcs_reused: usize,
+    pub largest_transient_decoded_numeric_bytes: usize,
+    /// Encode/decode/witness construction once; excluded from warm-cache timing.
+    pub initialization_seconds: f64,
+}
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub struct NativeOperatorCodecUsage {
+    pub encoded_native_operator_hits: u64,
+    pub decoded_native_operator_hits: u64,
+}
+fn operator_numeric_bytes(operator: &Operator) -> Result<usize, ProgramError> {
+    let (reals, mask) = match &operator.body {
+        OperatorBody::Identity => (0, 0),
+        OperatorBody::Diagonal { values, .. } => (values.len(), 0),
+        OperatorBody::Dense {
+            values, present, ..
+        } => (values.len(), present.len()),
+        OperatorBody::LowRank { left, right, .. } => (
+            left.len()
+                .checked_add(right.len())
+                .ok_or_else(|| ProgramError::Code("native codec buffer size overflow".into()))?,
+            0,
+        ),
+    };
+    reals
+        .checked_mul(8)
+        .and_then(|n| n.checked_add(mask))
+        .ok_or_else(|| ProgramError::Code("native codec buffer size overflow".into()))
+}
+fn witnessed_operator_equal(source: &Operator, decoded: &Operator) -> bool {
+    // Full metadata as well as bits: signed zero must not permit substitution.
+    let matrix = |a: &Array2<f64>, b: &Array2<f64>| {
+        a.dim() == b.dim() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+    };
+    source.name == decoded.name
+        && source.provenance == decoded.provenance
+        && source.rows == decoded.rows
+        && source.cols == decoded.cols
+        && match (&source.body, &decoded.body) {
+            (OperatorBody::Identity, OperatorBody::Identity) => true,
+            (
+                OperatorBody::Diagonal {
+                    values: a,
+                    precision: ap,
+                },
+                OperatorBody::Diagonal {
+                    values: b,
+                    precision: bp,
+                },
+            ) => {
+                ap == bp
+                    && a.len() == b.len()
+                    && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+            }
+            (
+                OperatorBody::Dense {
+                    values: a,
+                    present: am,
+                    precision: ap,
+                },
+                OperatorBody::Dense {
+                    values: b,
+                    present: bm,
+                    precision: bp,
+                },
+            ) => ap == bp && am == bm && matrix(a, b),
+            (
+                OperatorBody::LowRank {
+                    left: a,
+                    right: ar,
+                    precision: ap,
+                },
+                OperatorBody::LowRank {
+                    left: b,
+                    right: br,
+                    precision: bp,
+                },
+            ) => ap == bp && matrix(a, b) && matrix(ar, br),
+            _ => false,
+        }
+}
+impl NativeOperatorCodec {
+    pub fn new(source: &OperatorProgram, budget_bytes: usize) -> Result<Self, ProgramError> {
+        let started = std::time::Instant::now();
+        source.interfaces()?;
+        let mut entries = Vec::new();
+        let mut source_indices = BTreeMap::new();
+        let mut stats = NativeOperatorCodecStats {
+            operators: source.operators.len(),
+            encoded_capacity_bytes: 0,
+            decoded_numeric_bytes: 0,
+            budget_bytes,
+            source_arcs_reused: 0,
+            largest_transient_decoded_numeric_bytes: 0,
+            initialization_seconds: 0.0,
+        };
+        for (index, operator) in source.operators.iter().enumerate() {
+            let mut message = BitString::new();
+            encode_operator(&mut message, operator)?;
+            let capacity = message.shrink_storage();
+            let mut reader = message.reader();
+            let decoded = decode_operator(&mut reader, index as u64)?;
+            reader.finish()?;
+            let numeric = operator_numeric_bytes(&decoded)?;
+            stats.encoded_capacity_bytes = stats
+                .encoded_capacity_bytes
+                .checked_add(capacity)
+                .ok_or_else(|| ProgramError::Code("native codec buffer size overflow".into()))?;
+            stats.decoded_numeric_bytes = stats
+                .decoded_numeric_bytes
+                .checked_add(numeric)
+                .ok_or_else(|| ProgramError::Code("native codec buffer size overflow".into()))?;
+            if stats
+                .encoded_capacity_bytes
+                .checked_add(stats.decoded_numeric_bytes)
+                .is_none_or(|bytes| bytes > budget_bytes)
+            {
+                return Err(ProgramError::Code(format!(
+                    "native codec exceeds declared {budget_bytes}-byte packed/numeric buffer budget"
+                )));
+            }
+            stats.largest_transient_decoded_numeric_bytes =
+                stats.largest_transient_decoded_numeric_bytes.max(numeric);
+            let decoded = if witnessed_operator_equal(operator, &decoded) {
+                stats.source_arcs_reused += 1;
+                Arc::clone(operator)
+            } else {
+                decoded
+            };
+            source_indices.insert(Arc::as_ptr(operator) as usize, index);
+            source_indices.insert(Arc::as_ptr(&decoded) as usize, index);
+            entries.push(NativeOperatorCodeword {
+                source: Arc::downgrade(operator),
+                message,
+                decoded,
+            });
+        }
+        stats.initialization_seconds = started.elapsed().as_secs_f64();
+        Ok(Self {
+            declarations: source.declarations.clone(),
+            entries,
+            source_indices,
+            stats,
+            encoded_hits: std::sync::atomic::AtomicU64::new(0),
+            decoded_hits: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+    pub fn stats(&self) -> NativeOperatorCodecStats {
+        self.stats
+    }
+    pub fn usage(&self) -> NativeOperatorCodecUsage {
+        NativeOperatorCodecUsage {
+            encoded_native_operator_hits: self
+                .encoded_hits
+                .load(std::sync::atomic::Ordering::Relaxed),
+            decoded_native_operator_hits: self
+                .decoded_hits
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+    fn check_declarations(&self, declarations: &Declarations) -> Result<(), ProgramError> {
+        if &self.declarations != declarations {
+            return Err(ProgramError::Code(
+                "native codec declarations differ from this message".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn codeword(&self, operator: &Arc<Operator>) -> Option<&BitString> {
+        let entry = &self.entries[*self.source_indices.get(&(Arc::as_ptr(operator) as usize))?];
+        if !Arc::ptr_eq(&entry.decoded, operator) {
+            let source = entry.source.upgrade()?;
+            if !Arc::ptr_eq(&source, operator) { return None; }
+        }
+        self.encoded_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(&entry.message)
+    }
+    fn decode_at(&self, reader: &mut BitReader<'_>, index: u64) -> Option<Arc<Operator>> {
+        // Ordinary labels are decoded{current_index}; shifted/permuted bodies use
+        // the ordinary decoder rather than changing labels or cloning matrices.
+        let entry = self.entries.get(usize::try_from(index).ok()?)?;
+        if !reader.consume_exact_prefix(&entry.message) {
+            return None;
+        }
+        self.decoded_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(Arc::clone(&entry.decoded))
+    }
+}
+
+fn encode_operator(out: &mut BitString, operator: &Operator) -> Result<(), ProgramError> {
+    match &operator.body {
+        OperatorBody::Identity => {
+            encode_fixed_index(out, 0, OPERATOR_KINDS)?;
+            write_interface(out, &operator.rows)?;
+        }
+        OperatorBody::Diagonal { precision, .. } => {
+            encode_fixed_index(out, 4, OPERATOR_KINDS)?;
+            write_interface(out, &operator.rows)?;
+            write_lattice(out, &operator.present_reals(), *precision, &[])?;
+        }
+        OperatorBody::LowRank {
+            left, precision, ..
+        } => {
+            encode_fixed_index(out, 2, OPERATOR_KINDS)?;
+            write_interface(out, &operator.rows)?;
+            write_interface(out, &operator.cols)?;
+            encode_prefix_integer(out, left.ncols() as u64)?;
+            write_lattice(out, &operator.present_reals(), *precision, &[])?;
+        }
+        OperatorBody::Dense {
+            present, precision, ..
+        } => {
+            let leads = ordered_leads(operator)?;
+            encode_fixed_index(out, if leads.is_some() { 3 } else { 1 }, OPERATOR_KINDS)?;
+            write_interface(out, &operator.rows)?;
+            write_interface(out, &operator.cols)?;
+            for row in present.outer_iter() {
+                let kept: Vec<usize> = row
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, k)| **k)
+                    .map(|(c, _)| c)
+                    .collect();
+                encode_subset(out, operator.cols.group_count(), &kept)?;
+            }
+            write_lattice(
+                out,
+                &operator.present_reals(),
+                *precision,
+                leads.as_deref().unwrap_or(&[]),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_operator(reader: &mut BitReader<'_>, index: u64) -> Result<Arc<Operator>, ProgramError> {
+    let kind = decode_fixed_index(reader, OPERATOR_KINDS)?;
+    let name = format!("decoded{index}");
+    let rows = read_interface(reader)?;
+    if kind == 0 {
+        return Ok(Arc::new(Operator::identity(name, rows)));
+    }
+    if kind == 4 {
+        let (precision, reals) = read_lattice(reader, &[])?;
+        if reals.len() != rows.width() {
+            return Err(ProgramError::Code(format!(
+                "operator {index}: a diagonal of {} on an interface of {}",
+                reals.len(),
+                rows.width()
+            )));
+        }
+        return Ok(Arc::new(Operator {
+            name,
+            cols: rows.clone(),
+            rows,
+            body: OperatorBody::Diagonal {
+                values: Array1::from(reals),
+                precision,
+            },
+            provenance: Provenance::default(),
+        }));
+    }
+    let cols = read_interface(reader)?;
+    if kind == 2 {
+        let rank = decode_prefix_integer(reader)? as usize;
+        let (precision, reals) = read_lattice(reader, &[])?;
+        let split = rows.width() * rank;
+        if reals.len() != split + rank * cols.width() {
+            return Err(ProgramError::Code(format!(
+                "operator {index}: {} reals for rank {rank}",
+                reals.len()
+            )));
+        }
+        let left = Array2::from_shape_vec((rows.width(), rank), reals[..split].to_vec())
+            .map_err(|error| ProgramError::Code(error.to_string()))?;
+        let right = Array2::from_shape_vec((rank, cols.width()), reals[split..].to_vec())
+            .map_err(|error| ProgramError::Code(error.to_string()))?;
+        return Ok(Arc::new(Operator {
+            name,
+            rows,
+            cols,
+            body: OperatorBody::LowRank {
+                left,
+                right,
+                precision,
+            },
+            provenance: Provenance::default(),
+        }));
+    }
+    let mut present = Array2::from_elem((rows.group_count(), cols.group_count()), false);
+    for r in 0..rows.group_count() {
+        for c in decode_subset(reader, cols.group_count())? {
+            present[[r, c]] = true;
+        }
+    }
+    let leads = match kind {
+        3 => row_leads(&rows, &cols, &present).ok_or_else(|| {
+            ProgramError::Code(format!(
+                "operator {index}: ordered rows without two nonempty rows"
+            ))
+        })?,
+        _ => Vec::new(),
+    };
+    let (precision, reals) = read_lattice(reader, &leads)?;
+    let mut values = Array2::<f64>::zeros((rows.width(), cols.width()));
+    let mut next = reals.iter();
+    for ((r, c), &keep) in present.indexed_iter() {
+        if keep {
+            for value in values
+                .slice_mut(s![rows.range(r), cols.range(c)])
+                .iter_mut()
+            {
+                *value = *next.next().ok_or_else(|| {
+                    ProgramError::Code(format!("operator {index} has too few reals"))
+                })?;
+            }
+        }
+    }
+    if next.next().is_some() {
+        return Err(ProgramError::Code(format!(
+            "operator {index} has too many reals"
+        )));
+    }
+    Ok(Arc::new(Operator {
+        name,
+        rows,
+        cols,
+        body: OperatorBody::Dense {
+            values,
+            present,
+            precision,
+        },
+        provenance: Provenance::default(),
+    }))
+}
 impl OperatorProgram {
     /// The itemised length of [`Self::encode`]'s message, computed without writing it.
     pub fn code_account(&self) -> Result<CodeAccount, ProgramError> {
@@ -3781,7 +4143,14 @@ impl OperatorProgram {
     }
 
     /// The program's message (module note, "The code").
-    pub fn encode(&self) -> Result<BitString, ProgramError> {
+    pub fn encode(&self) -> Result<BitString, ProgramError> { self.encode_using(None) }
+
+    /// The ordinary standalone message, reusing fixed witnessed source chunks.
+    pub fn encode_with_native_codec(&self, codec: &NativeOperatorCodec) -> Result<BitString, ProgramError> {
+        codec.check_declarations(&self.declarations)?;
+        self.encode_using(Some(codec))
+    }
+    fn encode_using(&self, codec: Option<&NativeOperatorCodec>) -> Result<BitString, ProgramError> {
         let interfaces = self.interfaces()?;
         let mut out = BitString::new();
         encode_prefix_integer(&mut out, self.bases.len() as u64 + 1)?;
@@ -3795,34 +4164,9 @@ impl OperatorProgram {
             encode_fixed_index(&mut out, *domain, domains)?;
         }
         for operator in &self.operators {
-            match &operator.body {
-                OperatorBody::Identity => {
-                    encode_fixed_index(&mut out, 0, OPERATOR_KINDS)?;
-                    write_interface(&mut out, &operator.rows)?;
-                }
-                OperatorBody::Diagonal { precision, .. } => {
-                    encode_fixed_index(&mut out, 4, OPERATOR_KINDS)?;
-                    write_interface(&mut out, &operator.rows)?;
-                    write_lattice(&mut out, &operator.present_reals(), *precision, &[])?;
-                }
-                OperatorBody::LowRank { left, precision, .. } => {
-                    encode_fixed_index(&mut out, 2, OPERATOR_KINDS)?;
-                    write_interface(&mut out, &operator.rows)?;
-                    write_interface(&mut out, &operator.cols)?;
-                    encode_prefix_integer(&mut out, left.ncols() as u64)?;
-                    write_lattice(&mut out, &operator.present_reals(), *precision, &[])?;
-                }
-                OperatorBody::Dense { present, precision, .. } => {
-                    let leads = ordered_leads(operator)?;
-                    encode_fixed_index(&mut out, if leads.is_some() { 3 } else { 1 }, OPERATOR_KINDS)?;
-                    write_interface(&mut out, &operator.rows)?;
-                    write_interface(&mut out, &operator.cols)?;
-                    for row in present.outer_iter() {
-                        let kept: Vec<usize> = row.iter().enumerate().filter(|(_, k)| **k).map(|(c, _)| c).collect();
-                        encode_subset(&mut out, operator.cols.group_count(), &kept)?;
-                    }
-                    write_lattice(&mut out, &operator.present_reals(), *precision, leads.as_deref().unwrap_or(&[]))?;
-                }
+            match codec.and_then(|cache| cache.codeword(operator)) {
+                Some(message) => out.append(message),
+                None => encode_operator(&mut out, operator)?,
             }
         }
         encode_rules(&mut out, self)?;
@@ -3836,7 +4180,15 @@ impl OperatorProgram {
     }
 
     /// Read a message written by [`Self::encode`], given the contract's declarations.
-    pub fn decode(message: &BitString, declarations: &Declarations) -> Result<Self, ProgramError> {
+    pub fn decode(message: &BitString, declarations: &Declarations) -> Result<Self, ProgramError> { Self::decode_using(message, declarations, None) }
+
+    /// Decode ordinary bytes, substituting a fixed decoded body only after a
+    /// complete exact codeword match at its actual boundary and original index.
+    pub fn decode_with_native_codec(message: &BitString, declarations: &Declarations, codec: &NativeOperatorCodec) -> Result<Self, ProgramError> {
+        codec.check_declarations(declarations)?;
+        Self::decode_using(message, declarations, Some(codec))
+    }
+    fn decode_using(message: &BitString, declarations: &Declarations, codec: Option<&NativeOperatorCodec>) -> Result<Self, ProgramError> {
         let mut reader = message.reader();
         let reader = &mut reader;
         let basis_count = decode_prefix_integer(reader)? - 1;
@@ -3857,81 +4209,10 @@ impl OperatorProgram {
         }
         let mut operators = Vec::new();
         for index in 0..operator_count {
-            let kind = decode_fixed_index(reader, OPERATOR_KINDS)?;
-            let name = format!("decoded{index}");
-            let rows = read_interface(reader)?;
-            if kind == 0 {
-                operators.push(Arc::new(Operator::identity(name, rows)));
-                continue;
-            }
-            if kind == 4 {
-                let (precision, reals) = read_lattice(reader, &[])?;
-                if reals.len() != rows.width() {
-                    return Err(ProgramError::Code(format!("operator {index}: a diagonal of {} on an interface of {}", reals.len(), rows.width())));
-                }
-                operators.push(Arc::new(Operator {
-                    name,
-                    cols: rows.clone(),
-                    rows,
-                    body: OperatorBody::Diagonal { values: Array1::from(reals), precision },
-                    provenance: Provenance::default(),
-                }));
-                continue;
-            }
-            let cols = read_interface(reader)?;
-            if kind == 2 {
-                let rank = decode_prefix_integer(reader)? as usize;
-                let (precision, reals) = read_lattice(reader, &[])?;
-                let split = rows.width() * rank;
-                if reals.len() != split + rank * cols.width() {
-                    return Err(ProgramError::Code(format!("operator {index}: {} reals for rank {rank}", reals.len())));
-                }
-                let left = Array2::from_shape_vec((rows.width(), rank), reals[..split].to_vec())
-                    .map_err(|error| ProgramError::Code(error.to_string()))?;
-                let right = Array2::from_shape_vec((rank, cols.width()), reals[split..].to_vec())
-                    .map_err(|error| ProgramError::Code(error.to_string()))?;
-                operators.push(Arc::new(Operator {
-                    name,
-                    rows,
-                    cols,
-                    body: OperatorBody::LowRank { left, right, precision },
-                    provenance: Provenance::default(),
-                }));
-                continue;
-            }
-            let mut present = Array2::from_elem((rows.group_count(), cols.group_count()), false);
-            for r in 0..rows.group_count() {
-                for c in decode_subset(reader, cols.group_count())? {
-                    present[[r, c]] = true;
-                }
-            }
-            let leads = match kind {
-                3 => row_leads(&rows, &cols, &present)
-                    .ok_or_else(|| ProgramError::Code(format!("operator {index}: ordered rows without two nonempty rows")))?,
-                _ => Vec::new(),
-            };
-            let (precision, reals) = read_lattice(reader, &leads)?;
-            let mut values = Array2::<f64>::zeros((rows.width(), cols.width()));
-            let mut next = reals.iter();
-            for ((r, c), &keep) in present.indexed_iter() {
-                if keep {
-                    for value in values.slice_mut(s![rows.range(r), cols.range(c)]).iter_mut() {
-                        *value = *next
-                            .next()
-                            .ok_or_else(|| ProgramError::Code(format!("operator {index} has too few reals")))?;
-                    }
-                }
-            }
-            if next.next().is_some() {
-                return Err(ProgramError::Code(format!("operator {index} has too many reals")));
-            }
-            operators.push(Arc::new(Operator {
-                name,
-                rows,
-                cols,
-                body: OperatorBody::Dense { values, present, precision },
-                provenance: Provenance::default(),
-            }));
+            operators.push(match codec.and_then(|cache| cache.decode_at(reader, index)) {
+                Some(operator) => operator,
+                None => decode_operator(reader, index)?,
+            });
         }
         let rules = decode_rules(reader, &operators, &bases, declarations)?;
         let rule_inputs: Vec<usize> = rules.iter().map(|r| r.inputs.len()).collect();

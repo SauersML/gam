@@ -217,6 +217,11 @@ impl BitString {
         }
     }
 
+    pub(crate) fn shrink_storage(&mut self) -> usize {
+        self.bytes.shrink_to_fit();
+        self.bytes.capacity()
+    }
+
     pub fn reader(&self) -> BitReader<'_> {
         BitReader {
             bits: self,
@@ -239,6 +244,38 @@ pub struct BitReader<'a> {
 impl BitReader<'_> {
     pub fn remaining_bits(&self) -> u64 {
         self.bits.len_bits - self.position
+    }
+
+    /// Consume a witnessed codeword only if every bit matches at this boundary.
+    /// A mismatch or truncation leaves the cursor unchanged; no allocation or
+    /// numeric interpretation is performed. Unused tail padding is not compared.
+    pub fn consume_exact_prefix(&mut self, known: &BitString) -> bool {
+        if known.len_bits() > self.remaining_bits() {
+            return false;
+        }
+        if self.position % 8 == 0 {
+            let start = (self.position / 8) as usize;
+            let full = (known.len_bits() / 8) as usize;
+            if self.bits.bytes[start..start + full] != known.bytes[..full] {
+                return false;
+            }
+            let tail = (known.len_bits() % 8) as u32;
+            if tail != 0 && self.bits.bytes[start + full] & (u8::MAX << (8 - tail)) != known.bytes[full] {
+                return false;
+            }
+            self.position += known.len_bits();
+            return true;
+        }
+        let mut candidate = self.clone();
+        let mut witness = known.reader();
+        while witness.remaining_bits() != 0 {
+            let width = witness.remaining_bits().min(64) as u32;
+            if candidate.read_bits(width).expect("length checked") != witness.read_bits(width).expect("witness length checked") {
+                return false;
+            }
+        }
+        self.position = candidate.position;
+        true
     }
 
     fn require(&self, needed: u64) -> Result<(), CodecError> {
@@ -1144,6 +1181,36 @@ impl CardinalityCode for PaddedPacketCode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn witnessed_prefix_matching_is_exact_and_transactional() {
+        for offset in 0..16 {
+            for length in 0..145 {
+                let mut witness = super::BitString::new();
+                for i in 0..length { witness.push_bit(i % 3 == 1); }
+                let mut message = super::BitString::new();
+                for _ in 0..offset { message.push_bit(true); }
+                message.append(&witness);
+                message.push_bit(false);
+                let mut reader = message.reader();
+                reader.read_bits(offset).unwrap();
+                assert!(reader.consume_exact_prefix(&witness));
+                assert_eq!(reader.remaining_bits(), 1);
+                assert_eq!(reader.read_bits(1).unwrap(), 0);
+                if length > 0 {
+                    let mut wrong = super::BitString::new();
+                    for i in 0..length { wrong.push_bit((i % 3 == 1) ^ (i == length - 1)); }
+                    let mut reader = message.reader();
+                    reader.read_bits(offset).unwrap();
+                    let before = reader.remaining_bits();
+                    assert!(!reader.consume_exact_prefix(&wrong));
+                    assert_eq!(reader.remaining_bits(), before);
+                    let short = super::BitString::new();
+                    assert!(!short.reader().consume_exact_prefix(&witness));
+                }
+            }
+        }
+    }
+
     use super::*;
     #[test]
     fn packed_transport_matches_bitwise_loading_including_ignored_padding() {

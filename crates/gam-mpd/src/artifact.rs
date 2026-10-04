@@ -1099,7 +1099,20 @@ impl Artifact {
 
     /// The artifact's message (module note).
     pub fn encode(&self) -> Result<BitString, String> {
-        let program = self.message_program()?.encode().map_err(|e| e.to_string())?;
+        self.encode_using(None)
+    }
+
+    /// Encode the identical standalone message using a bounded native operator cache.
+    pub fn encode_with_native_codec(&self, cache: &crate::operator_program::NativeOperatorCodec) -> Result<BitString, String> {
+        self.encode_using(Some(cache))
+    }
+
+    fn encode_using(&self, cache: Option<&crate::operator_program::NativeOperatorCodec>) -> Result<BitString, String> {
+        let source = self.message_program()?;
+        let program = match cache {
+            Some(cache) => source.encode_with_native_codec(cache),
+            None => source.encode(),
+        }.map_err(|e| e.to_string())?;
         let nodes = self.program.nodes.len();
         let mut out = BitString::new();
         encode_prefix_integer(&mut out, self.native_nodes as u64 + 1).map_err(codec)?;
@@ -1167,6 +1180,15 @@ impl Artifact {
 
     /// The artifact a message holds, given the declarations alone.
     pub fn decode(message: &BitString, declarations: &Declarations) -> Result<Self, String> {
+        Self::decode_using(message, declarations, None)
+    }
+
+    /// Decode the same message, reusing only exact witnessed native codewords.
+    pub fn decode_with_native_codec(message: &BitString, declarations: &Declarations, cache: &crate::operator_program::NativeOperatorCodec) -> Result<Self, String> {
+        Self::decode_using(message, declarations, Some(cache))
+    }
+
+    fn decode_using(message: &BitString, declarations: &Declarations, cache: Option<&crate::operator_program::NativeOperatorCodec>) -> Result<Self, String> {
         let mut reader = message.reader();
         let reader = &mut reader;
         // A count of items each taking at least one bit, so no larger than the bits left.
@@ -1186,7 +1208,10 @@ impl Artifact {
             return Err(format!("a program of {program_bits} bits in {} remaining", reader.remaining_bits()));
         }
         let message = reader.read_bit_string(program_bits).map_err(codec)?;
-        let program = OperatorProgram::decode(&message, declarations).map_err(|e| e.to_string())?;
+        let program = match cache {
+            Some(cache) => OperatorProgram::decode_with_native_codec(&message, declarations, cache),
+            None => OperatorProgram::decode(&message, declarations),
+        }.map_err(|e| e.to_string())?;
         let nodes = program.nodes.len();
         let interfaces = program.interfaces().map_err(|e| e.to_string())?;
         let mut blocks = Vec::new();
@@ -1296,6 +1321,29 @@ pub struct EncodedArtifact {
 impl EncodedArtifact {
     pub fn of(artifact: &Artifact) -> Result<Self, String> {
         Ok(Self { message: artifact.encode()?, declarations: artifact.program.declarations.clone() })
+    }
+}
+
+/// A borrowing cache view; the stored message remains independently decodable.
+pub struct NativeCodecArtifact<'a> {
+    encoded: &'a EncodedArtifact,
+    cache: &'a crate::operator_program::NativeOperatorCodec,
+}
+
+impl EncodedArtifact {
+    pub fn of_with_native_codec(artifact: &Artifact, cache: &crate::operator_program::NativeOperatorCodec) -> Result<Self, String> {
+        Ok(Self { message: artifact.encode_with_native_codec(cache)?, declarations: artifact.program.declarations.clone() })
+    }
+
+    pub fn using_native_codec<'a>(&'a self, cache: &'a crate::operator_program::NativeOperatorCodec) -> NativeCodecArtifact<'a> {
+        NativeCodecArtifact { encoded: self, cache }
+    }
+}
+
+impl DecodableArtifact for NativeCodecArtifact<'_> {
+    type Decoded = Artifact;
+    fn decode(&self) -> Result<Artifact, String> {
+        Artifact::decode_with_native_codec(&self.encoded.message, &self.encoded.declarations, self.cache)
     }
 }
 

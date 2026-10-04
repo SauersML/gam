@@ -622,3 +622,169 @@ fn operator_structure_price_matches_wire_without_coding_numerical_payloads() {
         assert_eq!(operator.structure_bits().unwrap(), operator.code_bits().unwrap().0, "{}", operator.name);
     }
 }
+
+#[test]
+fn native_codec_preserves_wire_metadata_execution_and_cost() {
+    use super::operator_program::NativeOperatorCodec;
+    let raw = fixture();
+    let source = OperatorProgram::decode(&raw.encode().unwrap(), &raw.declarations).unwrap();
+    let cache = NativeOperatorCodec::new(&source, usize::MAX).unwrap();
+    assert_eq!(cache.stats().source_arcs_reused, source.operators.len());
+    let message = source.encode().unwrap();
+    assert_eq!(source.encode_with_native_codec(&cache).unwrap(), message);
+    let normal = OperatorProgram::decode(&message, &source.declarations).unwrap();
+    let cached = OperatorProgram::decode_with_native_codec(&message, &source.declarations, &cache).unwrap();
+    same_structure(&normal, &cached);
+    for (index, (a, b)) in normal.operators.iter().zip(&cached.operators).enumerate() {
+        assert_eq!(a.name, b.name);
+        assert_eq!(a.provenance, b.provenance);
+        assert!(Arc::ptr_eq(b, &source.operators[index]));
+    }
+    assert_eq!(normal.encode().unwrap(), cached.encode().unwrap());
+    assert_eq!(normal.code_bits().unwrap(), cached.code_bits().unwrap());
+    assert_eq!(normal.execute(&family(), false).unwrap().values, cached.execute(&family(), false).unwrap().values);
+    let before = cache.stats().decoded_numeric_bytes;
+    let mut novel = source.clone();
+    let op = Arc::make_mut(&mut novel.operators[0]);
+    if let OperatorBody::Dense { values, .. } = &mut op.body { values[[0, 0]] += 0.125; }
+    assert_eq!(novel.encode().unwrap(), novel.encode_with_native_codec(&cache).unwrap());
+    let bytes = novel.encode().unwrap();
+    let a = OperatorProgram::decode(&bytes, &novel.declarations).unwrap();
+    let b = OperatorProgram::decode_with_native_codec(&bytes, &novel.declarations, &cache).unwrap();
+    same_structure(&a, &b);
+    assert_eq!(cache.stats().decoded_numeric_bytes, before);
+    let mut reordered = source.clone();
+    reordered.operators.reverse();
+    let count = reordered.operators.len();
+    for node in &mut reordered.nodes {
+        if let Node::Affine { terms, bias } = node {
+            for (_, operator) in terms { *operator = count - 1 - *operator; }
+            if let Some(operator) = bias { *operator = count - 1 - *operator; }
+        }
+    }
+    assert_eq!(reordered.encode().unwrap(), reordered.encode_with_native_codec(&cache).unwrap());
+    let message_reordered = reordered.encode().unwrap();
+    let normal_reordered = OperatorProgram::decode(&message_reordered, &reordered.declarations).unwrap();
+    let cached_reordered = OperatorProgram::decode_with_native_codec(&message_reordered, &reordered.declarations, &cache).unwrap();
+    same_structure(&normal_reordered, &cached_reordered);
+    for (a, b) in normal_reordered.operators.iter().zip(&cached_reordered.operators) { assert_eq!(a.name, b.name); assert_eq!(a.provenance, b.provenance); }
+    assert_eq!(normal_reordered.execute(&family(), false).unwrap().values, cached_reordered.execute(&family(), false).unwrap().values);
+
+    assert!(NativeOperatorCodec::new(&source, 0).is_err());
+    let mut changed = source.declarations.clone();
+    changed.parameters += 1;
+    assert!(OperatorProgram::decode_with_native_codec(&message, &changed, &cache).is_err());
+}
+
+#[test]
+fn native_codec_artifact_view_remains_standalone() {
+    use super::artifact::{Artifact, EncodedArtifact};
+    use super::operator_program::NativeOperatorCodec;
+    use super::precision::DecodableArtifact;
+    let raw = fixture();
+    let source = OperatorProgram::decode(&raw.encode().unwrap(), &raw.declarations).unwrap();
+    let cache = NativeOperatorCodec::new(&source, usize::MAX).unwrap();
+    let artifact = Artifact::native(&source).unwrap();
+    let plain = EncodedArtifact::of(&artifact).unwrap();
+    let encoded = EncodedArtifact::of_with_native_codec(&artifact, &cache).unwrap();
+    assert_eq!(plain.message, encoded.message);
+    let a = encoded.decode().unwrap();
+    let b = encoded.using_native_codec(&cache).decode().unwrap();
+    assert_eq!(a.to_bytes().unwrap(), b.to_bytes().unwrap());
+    same_structure(&a.program, &b.program);
+    assert_eq!(a.execute(&family()).unwrap().values, b.execute(&family()).unwrap().values);
+}
+
+#[test]
+fn native_codec_fallback_handles_signed_zero_precision_and_malformed_messages() {
+    use super::operator_program::NativeOperatorCodec;
+    let mut source = fixture();
+    if let OperatorBody::Dense { values, .. } = &mut Arc::make_mut(&mut source.operators[0]).body { values[[0, 0]] = -0.0; }
+    let cache = NativeOperatorCodec::new(&source, usize::MAX).unwrap();
+    assert_eq!(cache.stats().source_arcs_reused, 0, "native names/provenance cannot replace ordinary decoded metadata");
+    let message = source.encode().unwrap();
+    assert_eq!(source.encode_with_native_codec(&cache).unwrap(), message);
+    assert_eq!(cache.usage().encoded_native_operator_hits as usize, source.operators.len());
+    let normal = OperatorProgram::decode(&message, &source.declarations).unwrap();
+    let cached = OperatorProgram::decode_with_native_codec(&message, &source.declarations, &cache).unwrap();
+    let hits = cache.usage().encoded_native_operator_hits;
+    assert_eq!(cached.encode_with_native_codec(&cache).unwrap(), message);
+    assert_eq!(cache.usage().encoded_native_operator_hits - hits, source.operators.len() as u64);
+    assert_eq!(cached.operators[0].matrix()[[0, 0]].to_bits(), normal.operators[0].matrix()[[0, 0]].to_bits());
+    assert_eq!(cached.encode().unwrap(), normal.encode().unwrap());
+    // Every truncated message must fail in both paths, including inside matched bodies.
+    for length in 0..message.len_bits() {
+        let truncated = message.reader().read_bit_string(length).unwrap();
+        assert!(OperatorProgram::decode(&truncated, &source.declarations).is_err());
+        assert!(OperatorProgram::decode_with_native_codec(&truncated, &source.declarations, &cache).is_err());
+    }
+    // Malformed grammar after an exact body cannot be hidden by a cache hit.
+    let mut malformed = message.clone();
+    malformed.push_bit(true);
+    assert!(OperatorProgram::decode(&malformed, &source.declarations).is_err());
+    assert!(OperatorProgram::decode_with_native_codec(&malformed, &source.declarations, &cache).is_err());
+    let mut candidate = source.clone();
+    if let OperatorBody::Dense { precision, .. } = &mut Arc::make_mut(&mut candidate.operators[0]).body { *precision = DeclaredPrecision::new(12).unwrap(); }
+    let bytes = candidate.encode().unwrap();
+    assert_eq!(bytes, candidate.encode_with_native_codec(&cache).unwrap());
+    let a = OperatorProgram::decode(&bytes, &candidate.declarations).unwrap();
+    let b = OperatorProgram::decode_with_native_codec(&bytes, &candidate.declarations, &cache).unwrap();
+    same_structure(&a, &b);
+}
+
+#[test]
+fn native_codec_preserves_rules_and_derived_placeholders() {
+    use super::artifact::{Artifact, EncodedArtifact, OperatorLaw};
+    use super::operator_program::{NativeOperatorCodec, Rule};
+    use super::precision::DecodableArtifact;
+    let mut raw = fixture();
+    raw.rules.push(Rule { name: "shared embedding".into(), inputs: vec![raw.operators[0].cols.clone()], nodes: vec![Node::Param { index: 0 }, Node::Affine { terms: vec![(0, 0)], bias: None }], output: 1 });
+    raw.nodes.push(Node::Call { rule: 0, arguments: vec![0] });
+    let source = OperatorProgram::decode(&raw.encode().unwrap(), &raw.declarations).unwrap();
+    let cache = NativeOperatorCodec::new(&source, usize::MAX).unwrap();
+    let bytes = source.encode_with_native_codec(&cache).unwrap();
+    let cached = OperatorProgram::decode_with_native_codec(&bytes, &source.declarations, &cache).unwrap();
+    assert_eq!(bytes, cached.encode().unwrap());
+    assert_eq!(source.rules, cached.rules);
+    assert_eq!(source.execute(&family(), false).unwrap().values, cached.execute(&family(), false).unwrap().values);
+
+    let d = Interface::native(2).unwrap();
+    let diag = |name| Arc::new(Operator::diag(name, d.clone(), array![1.0, 2.0], precision(20), Provenance::default()).unwrap());
+    let model = OperatorProgram {
+        declarations: Declarations { parameters: 0, domains: vec![], slots: vec![Slot::Raw { width: 2 }] },
+        bases: vec![], rules: vec![],
+        operators: vec![diag("g"), Arc::new(Operator::dense("V", d.clone(), d.clone(), array![[1.0, 0.5], [0.0, 1.0]], precision(20), Provenance::default()).unwrap()), Arc::new(Operator::identity("O", d.clone())), diag("gf")],
+        nodes: vec![Node::Raw { slot: 0 }, Node::Affine { terms: vec![(0, 0)], bias: None }, Node::Affine { terms: vec![(1, 1)], bias: None }, Node::Affine { terms: vec![(2, 2)], bias: None }, Node::Affine { terms: vec![(3, 3)], bias: None }], output: 4,
+    };
+    let model = OperatorProgram::decode(&model.encode().unwrap(), &model.declarations).unwrap();
+    let cache = NativeOperatorCodec::new(&model, usize::MAX).unwrap();
+    let artifact = Artifact::native(&model).unwrap().derive(2, OperatorLaw::Copy { value: 1, gain: 0, final_gain: 3 }, 0.75, vec![]).unwrap();
+    let plain = EncodedArtifact::of(&artifact).unwrap();
+    let cached = EncodedArtifact::of_with_native_codec(&artifact, &cache).unwrap();
+    assert_eq!(plain.message, cached.message);
+    let a = plain.decode().unwrap();
+    let b = cached.using_native_codec(&cache).decode().unwrap();
+    assert_eq!(a.to_bytes().unwrap(), b.to_bytes().unwrap());
+    let rows = FamilyInputs { layout: None, rows: 2, slots: vec![SlotValues::Raw(array![[1.0, -0.5], [0.0, 2.0]])] };
+    assert_eq!(a.execute(&rows).unwrap().values, b.execute(&rows).unwrap().values);
+}
+
+#[test]
+fn native_codec_low_rank_body_and_source_mutation_keep_exact_bytes() {
+    use super::operator_program::NativeOperatorCodec;
+    let mut source = fixture();
+    let op = &source.operators[0];
+    source.operators[0] = Arc::new(Operator::low_rank("factor", op.rows.clone(), op.cols.clone(), Array2::eye(op.rows.width()), op.matrix(), precision(20), Provenance::default()).unwrap());
+    let cache = NativeOperatorCodec::new(&source, usize::MAX).unwrap();
+    let message = source.encode_with_native_codec(&cache).unwrap();
+    assert_eq!(message, source.encode().unwrap());
+    let normal = OperatorProgram::decode(&message, &source.declarations).unwrap();
+    let cached = OperatorProgram::decode_with_native_codec(&message, &source.declarations, &cache).unwrap();
+    same_structure(&normal, &cached);
+    assert_eq!(normal.execute(&family(), false).unwrap().values, cached.execute(&family(), false).unwrap().values);
+    // No other source strong Arc: make_mut dissociates the cache's weak pointer.
+    if let OperatorBody::LowRank { left, .. } = &mut Arc::make_mut(&mut source.operators[0]).body { left[[0, 0]] += 0.25; }
+    let hits = cache.usage().encoded_native_operator_hits;
+    assert_eq!(source.encode_with_native_codec(&cache).unwrap(), source.encode().unwrap());
+    assert_eq!(cache.usage().encoded_native_operator_hits - hits, source.operators.len() as u64 - 1);
+}
