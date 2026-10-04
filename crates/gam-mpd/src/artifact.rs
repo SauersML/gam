@@ -822,6 +822,66 @@ impl Artifact {
         self.places.binary_search_by_key(&native, |(n, _)| *n).ok().map(|at| self.places[at].1)
     }
 
+    /// Import a standalone one-vector function and use it at a native block boundary.
+    /// Nested rule bodies and repeated Calls stay shared; operators are imported once,
+    /// with every coefficient paid by ordinary artifact accounting. The function must
+    /// have one Raw slot and no external parameters, domains or bases. This imports
+    /// explicit program semantics only, not another artifact's exceptions or controls.
+    /// Separate imports do not infer new sharing; further identical uses can call the
+    /// installed block's rule with [`Callee::Existing`].
+    pub fn replace_function(
+        &self,
+        name: &str,
+        function: &OperatorProgram,
+        native_read: usize,
+        native_write: usize,
+    ) -> Result<Self, String> {
+        let width = match function.declarations.slots.as_slice() {
+            [super::operator_program::Slot::Raw { width }]
+                if function.declarations.parameters == 0
+                    && function.declarations.domains.is_empty() && function.bases.is_empty() => *width,
+            _ => return Err("function graft requires one Raw slot and no external parameters/domains/bases".into()),
+        };
+        let interfaces = function.interfaces().map_err(|e| e.to_string())?;
+        if function.rules.iter().flat_map(|rule| &rule.nodes).any(|node| matches!(node, Node::Raw { .. } | Node::Feature { .. })) {
+            return Err("function rules must read explicit arguments, not ambient input slots".into());
+        }
+        let native_interfaces = self.program.interfaces().map_err(|e| e.to_string())?;
+        let read = self.place(native_read).ok_or("function graft native read is absent")?;
+        let write = self.place(native_write).ok_or("function graft native write is absent")?;
+        let input = super::operator_program::Interface::native(width).map_err(|e| e.to_string())?;
+        if native_interfaces[read] != input || native_interfaces[write] != interfaces[function.output] {
+            return Err("function graft native input/output interface mismatch".into());
+        }
+        let mut result = self.clone();
+        let offset_ops = result.program.operators.len();
+        let offset_rules = result.program.rules.len();
+        offset_ops.checked_add(function.operators.len()).ok_or("function operator count overflow")?;
+        offset_rules.checked_add(function.rules.len()).ok_or("function rule count overflow")?;
+        let ops: Vec<_> = (0..function.operators.len()).map(|i| offset_ops + i).collect();
+        let rules: Vec<_> = (0..function.rules.len()).map(|i| offset_rules + i).collect();
+        result.program.operators.extend(function.operators.iter().cloned());
+        for rule in &function.rules {
+            let mut translated = rule.clone();
+            let nodes = identity(rule.nodes.len());
+            for node in &mut translated.nodes {
+                remap_node(node, &nodes, &ops, &[], &rules);
+            }
+            result.program.rules.push(translated);
+        }
+        let mut body = function.nodes.clone();
+        let nodes = identity(body.len());
+        for node in &mut body {
+            match node {
+                Node::Raw { slot: 0 } => *node = Node::Param { index: 0 },
+                _ => remap_node(node, &nodes, &ops, &[], &rules),
+            }
+        }
+        result.replace_block(name, Callee::New(Rule {
+            name: name.into(), inputs: vec![input], nodes: body, output: function.output,
+        }), vec![Argument::Native(native_read)], native_write, vec![])
+    }
+
     /// This artifact with the native block that writes native node `native_write` replaced by a
     /// call of `callee` on `arguments`. The block's native parent state is the native arguments. A
     /// new rule's body refers to operators by index into `P`'s operators followed by `operators`
@@ -1573,6 +1633,10 @@ mod matrix_artifact_tests;
 #[cfg(test)]
 #[path = "control_artifact_tests.rs"]
 mod control_artifact_tests;
+
+#[cfg(test)]
+#[path = "function_graft_tests.rs"]
+mod function_graft_tests;
 
 #[cfg(test)]
 mod borrowed_program_decode_tests {
