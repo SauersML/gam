@@ -44,7 +44,9 @@
 //! the two choices did), at most one name per such word, `log₂ 2(T + 1)` bits, plus the two
 //! libraries it replaces. Each open group proposes partners in order of shared words while that
 //! bound exceeds the merged concept's library; it proposes the first whose fitted merge lowers the
-//! priced total and closes when none does. A greedy matching of the proposals, most saving first,
+//! priced total and closes when none does. A partner is not fitted when the merged concept could
+//! not save even paying only the cheaper of its program and its error on every word that needs a
+//! member (no names, no library). A greedy matching of the proposals, most saving first,
 //! is formed, and each merged concept peels: a member whose own concept would cost less than its
 //! share of the group (it disagrees with the others on when it is needed) leaves, the most saving
 //! first, while that lowers the priced total.
@@ -238,6 +240,34 @@ fn fit_concept(members: Vec<u32>, columns: &[Vec<(u32, f64)>], program: &[f64], 
     Concept { members, needed, error, invoked, program: cost, bits }
 }
 
+/// A lower bound on what merging `a` and `b` changes the total by: on every word that needs a
+/// member the merged concept pays at least the cheaper of its program and its error, and its
+/// names and library are not negative.
+fn merge_bound(a: &Concept, b: &Concept, universe: usize, label_bits: f64) -> f64 {
+    let (mut i, mut j, mut floor) = (0, 0, 0.0);
+    let program = a.program + b.program;
+    while i < a.needed.len() || j < b.needed.len() {
+        let (ta, tb) = (a.needed.get(i).copied().unwrap_or(u32::MAX), b.needed.get(j).copied().unwrap_or(u32::MAX));
+        let error = match ta.cmp(&tb) {
+            std::cmp::Ordering::Less => {
+                i += 1;
+                a.error[i - 1]
+            }
+            std::cmp::Ordering::Greater => {
+                j += 1;
+                b.error[j - 1]
+            }
+            std::cmp::Ordering::Equal => {
+                i += 1;
+                j += 1;
+                a.error[i - 1] + b.error[j - 1]
+            }
+        };
+        floor += program.min(error);
+    }
+    floor - a.total(universe, label_bits) - b.total(universe, label_bits)
+}
+
 fn invoking(c: &Concept) -> Vec<u32> {
     c.needed.iter().zip(&c.invoked).filter(|(_, z)| **z).map(|(t, _)| *t).collect()
 }
@@ -422,6 +452,9 @@ pub fn fit(priced: &Priced, program: &[f64], label_bits: f64, observations: f64,
                         let merged_library = subset_code_len_bits(universe, members.len()).map_or(f64::INFINITY, |x| x as f64) + label_bits;
                         if f64::from(shared) * name_bound + lib(a) + lib(b) <= merged_library {
                             break;
+                        }
+                        if merge_bound(a, b, universe, label_bits) >= 0.0 {
+                            continue;
                         }
                         let zb = invoking(b);
                         let merged = fit_concept(members, &columns, program, words, &[&union(&za, &zb), &intersection(&za, &zb)]);
