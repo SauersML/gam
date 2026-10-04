@@ -712,6 +712,13 @@ fn a_resumed_selection_is_the_uninterrupted_one() {
     let run = |resume: Option<Resume>| -> (Vec<Array2<f64>>, Array1<f64>, Vec<Resume>) {
         let mut states = Vec::new();
         let mut checkpoint = |progress: &Progress<'_>| -> Result<(), String> {
+            // An identical decision state cannot produce new evidence on another round.
+            // Ignore the counter itself so a runaway cannot allocate an unbounded history.
+            if let Some(previous) = states.last() {
+                let previous: &Resume = previous;
+                assert!(previous.masks != progress.masks || previous.alpha != progress.alpha || previous.cap != progress.cap,
+                    "selection repeated its decision state at round {}", progress.round);
+            }
             states.push(progress.to_resume());
             Ok(())
         };
@@ -846,5 +853,43 @@ fn contribution_zero_norms_and_all_on_have_finite_zero_derivatives() {
             let (cost, grads) = box_gradients(&masked, &inputs, &trace, &masks, seed, &[Array2::eye(UNITS)]).expect("gradient");
             assert!(cost.iter().chain(grads[0].0.iter()).chain(grads[0].1.iter()).all(|x| *x == 0.0));
         }
+    }
+}
+
+/// A sequence with no proposal retires while another sequence moves. Its retirement is part of
+/// the checkpoint, so continuation needs no arbitrary iteration cap to finish.
+#[test]
+fn selection_checkpoints_retire_no_proposal_sequences_and_resume_exactly() {
+    use super::masked::{Coder, Progress, Resume, Round, select_resumable};
+    let (program, family) = model();
+    let family = family.select(&[0, 1]);
+    let site = sites(&program).into_iter().find(|s| s.name == "W_in").unwrap();
+    let pieces = 2;
+    let library = Library { v: Array2::from_shape_fn((pieces, WIDTH), |(i,j)| noise(700+7*i+j)),
+        u: Array2::from_shape_fn((pieces, UNITS), |(i,j)| noise(800+7*i+j)), mean: Array1::zeros(WIDTH) };
+    let masked = Masked::build(&program, vec![site], vec![library]).unwrap();
+    let target = Target::every_row(program.execute(&family, false).unwrap().values[program.output].clone());
+    let start = vec![Array2::from_shape_fn((family.rows, pieces), |(row,_)| row as f64)];
+    let coder = Coder::ran(vec![Array1::from_elem(pieces, 3.0)], family.rows);
+    let run = |resume: Option<Resume>| {
+        let mut states = Vec::new();
+        let result = select_resumable(&masked, &family, &target, start.clone(), resume, &coder, 0.0, 2,
+            &mut |_: &Round<'_>| Ok(()), &mut |p: &Progress<'_>| {
+                // Zero observations: every accepted removal strictly lowers the finite listing;
+                // two masks can only turn off, so at most two removals plus one terminal check.
+                assert!(states.len() <= pieces, "zero-observation selection failed to terminate");
+                states.push(p.to_resume()); Ok(())
+            }).unwrap();
+        (result, states)
+    };
+    let ((masks, kl), states) = run(None);
+    assert!(states.len() >= 2);
+    assert_eq!(states[1].cap[0], 0, "the row with no flips remained live");
+    assert_eq!(masks[0].sum(), 0.0);
+    for index in 1..states.len() {
+        let ((resumed, resumed_kl), checkpoints) = run(Some(states[index].clone()));
+        assert_eq!(resumed, masks);
+        assert_eq!(resumed_kl, kl);
+        assert_eq!(checkpoints, states[index..]);
     }
 }

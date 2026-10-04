@@ -2509,6 +2509,9 @@ pub fn select_resumable(
         let (mut kept, mut tried, mut saved) = (0usize, 0usize, 0.0);
         for q in 0..sequences {
             if sequence_flips[q] == 0 {
+                // This sequence has no proposal at the current state. It must retire just as
+                // a refused singleton does, rather than leave an unchanged live cap forever.
+                cap[q] = 0;
                 continue;
             }
             tried += 1;
