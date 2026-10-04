@@ -1237,3 +1237,34 @@ fn assess_once_matches_complete_cached_assessment_without_measurement_key() {
 
 #[path = "local_first_tests.rs"]
 mod local_first_tests;
+
+#[test]
+fn reusing_operator_prices_does_not_reuse_training_fidelity_on_holdout() {
+    let width = native(1);
+    let model = raw_program(1,
+        vec![Operator::identity("I", width.clone()), dense("head", &native(2), &width, array![[1.0], [-1.0]])],
+        vec![Node::Raw { slot: 0 }, Node::Affine { terms: vec![(0, 0)], bias: None }, Node::Affine { terms: vec![(1, 1)], bias: None }]);
+    let candidate = Artifact::native(&model).unwrap().replace_block(
+        "gain", Callee::New(rule("gain", vec![width.clone()],
+            vec![Node::Param { index: 0 }, Node::Affine { terms: vec![(0, 2)], bias: None }])),
+        vec![Argument::Native(0)], 1, vec![dense("gain", &width, &width, array![[1.25]])]).unwrap();
+    let training = grid(&[-1.0, 1.0], 1);
+    let holdout = grid(&[-1.0, 10.0, 0.5], 1);
+    let training_local = Local::new(&model, training.clone(), None, 64);
+    let holdout_local = Local::new(&model, holdout.clone(), None, 64);
+    let training_run = clean_run(&model, &training);
+    let holdout_run = clean_run(&model, &holdout);
+    let constraint = Constraint { local: 0.3, run: 0.01 };
+    let mut prices = CostCache::default();
+    let first = assess(&training_local, &training_run, &candidate, constraint, &mut prices).unwrap();
+    let second = assess(&holdout_local, &holdout_run, &candidate, constraint, &mut prices).unwrap();
+    let independent = assess(&holdout_local, &holdout_run, &candidate, constraint, &mut CostCache::default()).unwrap();
+    assert_ne!(first.local_measure, second.local_measure);
+    assert_ne!(first.run_measure, second.run_measure);
+    assert_eq!(first.local.verdict(), FidelityVerdict::Meets);
+    assert_eq!(second.local.verdict(), FidelityVerdict::Violates);
+    assert_eq!(second.local_measure, independent.local_measure);
+    assert_eq!(second.run_measure, independent.run_measure);
+    assert_eq!(second.local, independent.local);
+    assert_eq!(second.run, independent.run);
+}

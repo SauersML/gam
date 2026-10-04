@@ -502,7 +502,6 @@ fn main() -> Result<(), String> {
             records[index]["states"] = json!(vec!["Unresolved"; grid.len()]);
         }
         measured += 1;
-        costs.clear_measurements();
         records[index]["seconds"] = json!(t.elapsed().as_secs_f64());
         records[index]["construction_fit_seconds"] = json!(build_seconds);
         records[index]["run_cumulative_timing"] = json!(run.timing());
@@ -547,7 +546,6 @@ fn main() -> Result<(), String> {
         let assessment = gam_mpd::acceptance::assess_once_local_first(
             &local, &run, &decoded, &grid, &mut costs,
         )?;
-        costs.clear_measurements();
         if statuses(&assessment, &grid)?
             != records[index]["states"]
                 .as_array()

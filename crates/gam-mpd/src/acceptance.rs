@@ -69,7 +69,7 @@
 
 use super::artifact::{Artifact, EncodedArtifact, inlined};
 use super::operator_program::{Basis, FamilyInputs, Law, Node, Operator, OperatorProgram, SequenceLayout, SlotValues};
-use super::precision::{DecodedFidelity, FidelityVerdict, decode_then_evaluate, decode_then_evaluate_pair};
+use super::precision::{DecodedFidelity, FidelityVerdict, decode_then_evaluate_pair};
 use super::supports::{EvidenceStatus, ExactBasis, Extremum};
 use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
 use ndarray::{Array1, Array2, s};
@@ -106,35 +106,13 @@ impl StructuralCost {
     }
 }
 
-/// Each operator's structure bits and literal count, kept by operator (the operators are shared
-/// between candidates, so a candidate is measured by what it adds), and each assessed message's
-/// disagreements, kept by the message (they depend on neither tolerance, so a frontier measures a
-/// candidate once).
+/// Operator prices only. Operators are immutable and held by `Arc`, so these prices can be
+/// reused across evaluation contexts. Fidelity measurements are deliberately not cached here:
+/// they depend on the native model, Local family/interfaces and complete Run protocol. A finite
+/// bank retains each assessment explicitly and reuses its evidence across its tolerance grid.
 #[derive(Default)]
 pub struct CostCache {
     operators: HashMap<usize, (Arc<Operator>, u64, u64)>,
-    measures: HashMap<Vec<u64>, (LocalMeasure, RunMeasure)>,
-}
-
-impl CostCache {
-    /// Release encoded measurement keys after their evidence has been consumed.
-    /// Operator prices remain cached. Useful for a finite bank that assesses each
-    /// distinct candidate once and reuses the returned evidence over its grid.
-    pub fn clear_measurements(&mut self) {
-        self.measures.clear();
-    }
-}
-
-/// An exact key: the bit length followed by every packed message word. Hash collisions in the
-/// map are resolved by comparing these words, never by reusing another artifact's evidence.
-fn message_key(message: &super::codec::BitString) -> Result<Vec<u64>, String> {
-    let mut words = vec![message.len_bits()];
-    let mut reader = message.reader();
-    while reader.remaining_bits() > 0 {
-        let width = reader.remaining_bits().min(64) as u32;
-        words.push(reader.read_bits(width).map_err(|e| format!("{e:?}"))?);
-    }
-    Ok(words)
 }
 
 /// `C32(artifact)`: numeric-free structure plus 32 bits per independently
@@ -1151,43 +1129,7 @@ pub fn assess(
     constraint: Constraint,
     cache: &mut CostCache,
 ) -> Result<Assessment, String> {
-    if !artifact.has_f32_literals() {
-        return Err("a literal that is not a 32-bit float".to_string());
-    }
-    let cost = structural_cost(artifact, cache)?;
-    let encoded = EncodedArtifact::of(artifact)?;
-    let key = message_key(&encoded.message)?;
-    let known = cache.measures.get(&key).cloned();
-    let mut local_measure = LocalMeasure::default();
-    let local_fidelity = decode_then_evaluate(
-        &encoded,
-        |decoded: &Artifact| match &known {
-            Some((measured, _)) => Ok(measured.clone()),
-            None => local.measure(decoded),
-        },
-        &LocalMeasure::default(),
-        |measured: &LocalMeasure, _| {
-            local_measure = measured.clone();
-            measured.status()
-        },
-        constraint.local,
-    )?;
-    let mut run_measure = RunMeasure::default();
-    let run_fidelity = decode_then_evaluate(
-        &encoded,
-        |decoded: &Artifact| match &known {
-            Some((_, measured)) => Ok(measured.clone()),
-            None => run.measure(decoded),
-        },
-        &RunMeasure::default(),
-        |measured: &RunMeasure, _| {
-            run_measure = measured.clone();
-            measured.status()
-        },
-        constraint.run,
-    )?;
-    cache.measures.insert(key, (local_measure.clone(), run_measure.clone()));
-    Ok(Assessment { cost, local: local_fidelity, local_measure, run: run_fidelity, run_measure })
+    assess_once(local, run, artifact, constraint, cache)
 }
 
 /// Assess a candidate once, without constructing or hashing a measurement-cache
@@ -1479,7 +1421,8 @@ pub fn search(
     search_with(local, run, proposers, start, constraint, budget, &mut CostCache::default())
 }
 
-/// [`search`] with the costs and measures of earlier searches (`cache`).
+/// [`search`] reusing immutable operator prices from earlier searches (`cache`).
+/// Fidelity is measured in the supplied context; evidence from other contexts is never reused.
 pub fn search_with(
     local: &Local<'_>,
     run: &dyn RunCheck,

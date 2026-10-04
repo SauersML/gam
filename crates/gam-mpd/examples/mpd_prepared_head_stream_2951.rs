@@ -858,7 +858,6 @@ fn main() -> Result<(), String> {
             &out.join("PARTIAL.json"),
             &json!({"scope":scope,"records":records,"points":points(&records,&constraints)?,"run_stage_seconds":run.timing(),"complete":false}),
         )?;
-        cache.clear_measurements();
         eprintln!(
             "prepared candidate {index}: {}s",
             start_time.elapsed().as_secs_f64()
@@ -897,7 +896,6 @@ fn main() -> Result<(), String> {
         let isolated =
             gam_mpd::local_kl::isolated_downstream_kl(&native, &decoded, &family, CONTEXT)?;
         replays.push(json!({"index":index,"sha256":sha256(&path)?,"file":path.file_name().and_then(|p|p.to_str()),"bytes":byte_count,"cost":measured.cost,"evidence":complete_evidence(&measured),"isolated_downstream_patch_kl":isolated,"diagnostic_only":true}));
-        cache.clear_measurements();
     }
     write_json(
         &out.join("REPORT.json"),

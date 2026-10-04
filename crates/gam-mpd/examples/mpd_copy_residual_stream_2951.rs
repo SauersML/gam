@@ -154,7 +154,7 @@ fn main()->Result<(),String>{
         })();
         if let Err(error)=result{records[index]["states"]=json!(vec!["Failed";grid.len()]);records[index]["error"]=json!(error);}
         records[index]["seconds"]=json!(t.elapsed().as_secs_f64());records[index]["codec_usage"]=json!(native_codec.as_ref().map(|c|c.usage()));records[index]["peak_rss_bytes"]=json!(peak_rss());
-        writeln!(journal,"{}",records[index]).map_err(|e|e.to_string())?;journal.flush().map_err(|e|e.to_string())?;cache.clear_measurements();
+        writeln!(journal,"{}",records[index]).map_err(|e|e.to_string())?;journal.flush().map_err(|e|e.to_string())?;
     }
     let mut points=Vec::new();let mut selected=BTreeSet::new();
     for(g,c)in grid.iter().enumerate(){let winner=records.iter().filter(|r|r["states"][g].as_str()==Some("Verified")).min_by_key(|r|(r["cost_bits"].as_u64().unwrap_or(u64::MAX),r["index"].as_u64().unwrap_or(u64::MAX)));let upper=winner.and_then(|r|r["cost_bits"].as_u64());let index=winner.and_then(|r|r["index"].as_u64());if let Some(i)=index{selected.insert(i as usize);}let lower=records.iter().filter(|r|r["states"][g].as_str()!=Some("Violates")).filter_map(|r|r["cost_lower_bound"].as_u64()).min();points.push(json!({"constraint":c,"selected":index,"upper_cost":upper,"lower_cost":lower,"gap":upper.zip(lower).map(|(u,l)|u.saturating_sub(l))}));}
@@ -166,7 +166,7 @@ fn main()->Result<(),String>{
         let replay=assess_once(&local,run,&decoded,grid[0],&mut cache)?;
         if Some(replay.cost.total())!=records[index]["cost_bits"].as_u64() || json!(states(&replay,&grid)?)!=records[index]["states"]{return Err("selected replay changed cost or grid verdict".into());}
         let isolated_kl=gam_mpd::local_kl::isolated_downstream_kl(&native,&decoded,&local_family,batch)?;
-        replays.push(json!({"isolated_downstream_patch_kl":isolated_kl,"diagnostic_only":true,"index":index,"file":path.file_name().and_then(|p|p.to_str()),"sha256":sha256(&path)?,"bytes":saved.len(),"cost_bits":replay.cost.total(),"local":replay.local_measure,"run":replay.run_measure}));cache.clear_measurements();
+        replays.push(json!({"isolated_downstream_patch_kl":isolated_kl,"diagnostic_only":true,"index":index,"file":path.file_name().and_then(|p|p.to_str()),"sha256":sha256(&path)?,"bytes":saved.len(),"cost_bits":replay.cost.total(),"local":replay.local_measure,"run":replay.run_measure}));
     }
     write_json(&out.join("REPORT.json"),&json!({"scope":scope,"records":records,"points":points,"selected_saved_byte_replays":replays,"seconds":begun.elapsed().as_secs_f64(),"peak_rss_bytes":peak_rss(),"run_stage_seconds":language_run.as_ref().map(|r|r.timing()),"native_codec":native_codec.as_ref().map(|c|json!({"stats":c.stats(),"usage":c.usage(),"selected_replay":"ordinary uncached standalone decoding"}))}))?;Ok(())
 }
