@@ -5,7 +5,7 @@ Agents' own ssh polling loops (25 at once) got the Mac shut out of the login nod
 opens one ssh (multiplexed, ~/.ssh/config) every 2 minutes, runs cluster_snapshot.sh there, and
 unpacks the result into ~/mpd-data/cluster/_status/ (a symlink swapped atomically, so a reader
 never sees half a snapshot):
-  STAMP, squeue.txt, squeue_ours.txt, sacct.txt, node.txt, gpu_balance.log, pool.txt, holds.txt,
+  STAMP, squeue.txt, squeue_ours.txt, sacct.txt, node.txt, gpu.txt, budget.log, pool.txt,
   peaks.tsv, audit.txt (every 10th poll), and files/<path relative to the cluster home>: the
   last 400 lines of every job log, JOBS, small JSON/text of jobs touched in 2 days, plus anything
   listed in ~/mpd-data/cluster/_watch.txt (`mats-watch PATH...` adds to it).

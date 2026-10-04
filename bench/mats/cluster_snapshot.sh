@@ -4,7 +4,8 @@
 #   STAMP            when the snapshot was taken (cluster clock)
 #   squeue.txt       every user's jobs;  squeue_ours.txt  ours, one line per array task
 #   sacct.txt        our jobs of the last 2 days (state, elapsed, CPUs, memory, exit code)
-#   node.txt         the node's allocation;  gpu_balance.log, peaks.tsv, pool.txt, holds.txt
+#   node.txt         the node's allocation;  gpu.txt (gpu_watch.sh: each GPU's utilisation and holder,
+#                    each of our jobs' CPU efficiency, WASTE flags), budget.log, peaks.tsv, pool.txt
 #   audit.txt        cluster_audit.sh's findings (when the first argument is 1)
 #   files/...        under their path relative to the cluster home: every mats-run job directory
 #                    touched in 2 days (JOBS, the last 400 lines of each log, JSON and text up to
@@ -21,9 +22,9 @@ squeue -o '%.14i %.10u %.28j %.2t %.6q %.4C %.7m %.12b %.10M %.10l %.6y %R' > "$
 squeue -u "$USER" -r -o '%.16i %.28j %.2t %.6q %.4C %.7m %.12b %.10M %.10l %.6y %R' > "$T/squeue_ours.txt" 2>&1
 sacct -u "$USER" -S now-2days -X -P -o JobID,JobName%40,State,Elapsed,AllocCPUS,ReqMem,ExitCode,Start,End > "$T/sacct.txt" 2>&1
 scontrol show node l40-worker > "$T/node.txt" 2>&1
-tail -n 300 gpu_balance.log > "$T/gpu_balance.log" 2> /dev/null
+cp gpu_watch.txt "$T/gpu.txt" 2> /dev/null
+tail -n 100 budget.log > "$T/budget.log" 2> /dev/null
 cp mpd-data/cluster/_peaks.tsv "$T/peaks.tsv" 2> /dev/null
-cat held_for_sweep.txt held_debug_for_sweep.txt gpu_balance_held.txt > "$T/holds.txt" 2> /dev/null
 Q=mpd-data/cluster/queue
 {
     echo "todo $(ls $Q/todo 2> /dev/null | grep -c '\.task$') running $(ls $Q/running 2> /dev/null | grep -c '\.task$') done $(ls $Q/done 2> /dev/null | wc -l)"
