@@ -411,7 +411,7 @@ fn a_lattice_step_is_derived_from_the_value_range() {
     )
     .expect("dense");
     let OperatorBody::Dense { precision: chosen, .. } = &op.body else { unreachable!() };
-    assert_eq!(chosen.fraction_bits(), 52 - value.abs().log2().ceil() as i32);
+    assert_eq!(chosen.fraction_bits(), 53 - value.abs().log2().ceil() as i32);
     assert!((op.matrix()[[0, 0]] - value).abs() <= chosen.worst_case_error());
 }
 

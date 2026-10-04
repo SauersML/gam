@@ -168,7 +168,7 @@ impl DeclaredPrecision {
     }
 
     /// The finest precision for reals of magnitude at most `largest`: this one, coarsened
-    /// to `2^-(52 − ⌈log₂ largest⌉)` when that is coarser, so every index stays within
+    /// to `2^-(53 − ⌈log₂ largest⌉)` when that is coarser, so every index stays within
     /// `2^53` and decodes exactly. The step is derived from the value range; a precision
     /// chosen for other reals (an operator's former values, a curvature step) never
     /// overflows the lattice code. A zero or non-finite `largest` leaves it unchanged (a
@@ -177,7 +177,19 @@ impl DeclaredPrecision {
         if !(largest > 0.0 && largest.is_finite()) {
             return self;
         }
-        let cap = 52 - largest.log2().ceil() as i32;
+        // Extract the exact binary exponent: log2 can round a value immediately
+        // above a power of two back to that integer. Every index through 2^53
+        // is representable, so retaining 53 (not 52) bits is required to avoid
+        // changing an otherwise exactly encodable binary64 literal.
+        let bits = largest.to_bits();
+        let exponent = ((bits >> 52) & 0x7ff) as i32;
+        let fraction = bits & ((1u64 << 52) - 1);
+        let ceil_log2 = if exponent == 0 {
+            -1074 + fraction.ilog2() as i32 + i32::from(!fraction.is_power_of_two())
+        } else {
+            exponent - 1023 + i32::from(fraction != 0)
+        };
+        let cap = 53 - ceil_log2;
         Self { fraction_bits: self.fraction_bits.min(cap.max(-EXPONENT_LIMIT)) }
     }
 
@@ -1157,6 +1169,33 @@ mod tests {
             encode_prefix_integer(&mut message, resolution_bits + 1).expect("resolution codeword");
             message.push_bits(0, 1).expect("one payload bit");
             assert_eq!(QuotientCode::read(&mut message.reader(), quotient).is_ok(), admitted);
+        }
+    }
+}
+
+#[cfg(test)]
+mod exact_range_tests {
+    use super::DeclaredPrecision;
+
+    #[test]
+    fn singleton_binary64_literals_keep_all_significand_bits() {
+        for value in [1e-5_f64, 0.1, std::f64::consts::PI, 1.0_f64.next_up(), 2.0_f64.next_down(), 2.0_f64.next_up()] {
+            let precision = DeclaredPrecision::new(100).unwrap().within_range(value);
+            assert_eq!(precision.round(value).unwrap(), value, "value {value}, precision {precision:?}");
+        }
+    }
+
+    #[test]
+    fn exponent_boundary_is_exact_and_indices_stay_in_range() {
+        for exponent in -100..100 {
+            let power = f64::from_bits(((exponent + 1023) as u64) << 52);
+            for value in [power.next_down(), power, power.next_up()] {
+                let precision = DeclaredPrecision::new(1000).unwrap().within_range(value);
+                assert_eq!(precision.round(value).unwrap(), value);
+            }
+        }
+        for value in [f64::MIN_POSITIVE, f64::from_bits(1), f64::MAX] {
+            DeclaredPrecision::new(1022).unwrap().within_range(value).round(value).unwrap();
         }
     }
 }
