@@ -4773,7 +4773,7 @@ fn decode_index_varint(buf: &[u8]) -> Result<(usize, usize), String> {
 ///
 /// The names are the resolver-owned lockfiles of the toolchains this tree
 /// carries: cargo, uv, and npm/yarn/pnpm for the JavaScript tooling under
-/// `tools/` (#2799 — the npm lockfile tripped the gate the day it was tracked).
+/// `.github/` (#2799 — the npm lockfile tripped the gate the day it was tracked).
 fn is_generated_lockfile(rel: &Path) -> bool {
     matches!(
         rel.file_name().and_then(|name| name.to_str()),

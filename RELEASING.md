@@ -102,10 +102,3 @@ These are PyPI account actions; no workflow can take them.
   on the core fit path's dependency graph. Its share of the compiled source
   (about 21% of the sdist) is also under the 30% saving that would justify the
   split.
-
-## conda-forge
-
-`packaging/conda-forge/meta.yaml` is a draft recipe for a `gamfit` feedstock,
-built from the PyPI sdist. It is not submitted: submitting it to
-`conda-forge/staged-recipes` is a maintainer action once a release carrying
-the sdist excludes is on PyPI and its `sha256` is filled in.
