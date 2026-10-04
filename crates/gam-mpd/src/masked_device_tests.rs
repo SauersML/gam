@@ -161,38 +161,6 @@ fn selection_on_a_lowered_program_selects_the_unlowered_masks() {
     }
 }
 
-/// The box claim's excess on the device is the CPU's in float64 (it decides a step's
-/// backtracking), and its gradients in every site's `V` and `U` are within the proposal band.
-#[test]
-fn the_box_claims_excess_on_a_device_is_the_cpus() {
-    let (masked, base, masks, clean) = masked_fixture();
-    let family = masked.family(&base, &masks);
-    for target in targets(&clean) {
-        let (_, trace, cotangent) = masked::forward(&masked, &family, &target).expect("cpu forward");
-        let fishers: Vec<Array2<f64>> = masked::fisher(&masked, &family, &trace, &target, 2, 0xB0C5, true)
-            .expect("cpu fisher")
-            .into_iter()
-            .map(|(_, f)| f.expect("written"))
-            .collect();
-        let (excess, gradients) = masked::box_excess(&masked, &family, &trace, &masks, cotangent, &fishers, true).expect("cpu excess");
-        let gradients = gradients.expect("cpu box gradients");
-        for device in devices() {
-            let name = device.name();
-            let accelerated = Accelerated::new(&device, &masked, Arithmetic::F64).expect("lowered");
-            let on_device = accelerated.target(&target).expect("target");
-            let state = accelerated.forward(&family, &on_device).expect("device forward");
-            let (device_excess, device_gradients) = accelerated.box_excess(&masked, &state, &masks, &fishers, true).expect("device excess");
-            for r in 0..family.rows {
-                assert!((device_excess[r] - excess[r]).abs() <= 1e-9 * (1.0 + excess[r].abs()), "{name}: row {r}: {} against {}", device_excess[r], excess[r]);
-            }
-            for (k, (v, u)) in device_gradients.expect("device box gradients").iter().enumerate() {
-                assert_proposal(&format!("{name}: box V gradient of site {k}"), v, &gradients[k].0, family.rows);
-                assert_proposal(&format!("{name}: box U gradient of site {k}"), u, &gradients[k].1, family.rows);
-            }
-        }
-    }
-}
-
 /// Every keep/refuse a selection takes with screened heads (module note of `masked`, "Screened
 /// heads": f32 head products on the Apple GPU where it resolves, float64 elsewhere) is the one the
 /// float64 codes of the same masks take: a 2048-class head over 256 rows clears the device's size
@@ -251,7 +219,7 @@ fn screened_selection_decisions_are_the_float64_ones() {
         }
         Ok(())
     };
-    select_observed(&masked, &family, &target, masks, &coder, observations, 2, None, &mut observe).expect("selection");
+    select_observed(&masked, &family, &target, masks, &coder, observations, 2, &mut observe).expect("selection");
     assert!(decisions > 0, "the selection took decisions");
 }
 
@@ -351,7 +319,7 @@ fn a_resumed_screened_selection_is_the_uninterrupted_one() {
             states.push(progress.to_resume());
             Ok(())
         };
-        let (masks, kl) = select_resumable(&masked, &family, &target, start.clone(), resume, &coder, 64.0, 2, None, &mut |_: &Round<'_>| Ok(()), &mut checkpoint)
+        let (masks, kl) = select_resumable(&masked, &family, &target, start.clone(), resume, &coder, 64.0, 2, &mut |_: &Round<'_>| Ok(()), &mut checkpoint)
             .expect("selection");
         (masks, kl, states)
     };

@@ -47,7 +47,7 @@
 //! lowers the total again.
 
 use super::dense::{QrMode, eigh, qr, svd};
-use super::masked::{Coder, Library, Masked, Site, Target, box_excess, fisher, forward, mask_gradients, read_values, select, select_boxed};
+use super::masked::{Coder, Library, Masked, Site, Target, fisher, forward, mask_gradients, read_values, score_only, select};
 use super::operator_program::{FamilyInputs, OperatorProgram};
 use gam_linalg::faer_ndarray::fast_ab;
 use gam_linalg::roundoff::SymmetricAssembly;
@@ -190,10 +190,6 @@ pub struct Coded<'a> {
     /// Sampled-label reverse passes per Fisher diagonal.
     pub samples: usize,
     pub describe: &'a dyn Describe,
-    /// Under the box claim ([`super::masked::Claim::Box`]) each site's written Fisher: every word's
-    /// error is then its masks' KL plus [`box_excess`], what the off blocks anywhere in `[0, 1]`
-    /// would add; `None` is the corner claim (off means absent).
-    pub boxed: Option<Vec<Array2<f64>>>,
 }
 
 /// A blocked decomposition: per site its library (shared between decompositions that differ
@@ -361,10 +357,7 @@ pub fn measure(coded: &Coded<'_>, blocked: &Blocked) -> Result<(Bits, Vec<Array1
     for ((inputs, target), masks) in coded.batches.iter().zip(&blocked.masks) {
         let described = Coder::ran(costs.clone(), inputs.rows).bits(masks);
         let family = masked.family(inputs, masks);
-        let (mut kl, trace, cotangent) = forward(&masked, &family, target)?;
-        if let Some(fishers) = &coded.boxed {
-            kl += &box_excess(&masked, &family, &trace, masks, cotangent, fishers, false)?.0;
-        }
+        let kl = score_only(&masked, &family, target)?;
         for r in (0..inputs.rows).filter(|r| target.scores(*r)) {
             bits.rows += 1.0;
             bits.described += described[r];
@@ -391,10 +384,7 @@ pub fn reselect(coded: &Coded<'_>, blocked: &Blocked) -> Result<Blocked, String>
     let mut out = blocked.clone();
     for (b, (inputs, target)) in coded.batches.iter().enumerate() {
         let coder = Coder::ran(costs.clone(), inputs.rows);
-        let (masks, _) = match &coded.boxed {
-            None => select(&masked, inputs, target, blocked.masks[b].clone(), &coder, coded.observations, coded.samples)?,
-            Some(fishers) => select_boxed(&masked, inputs, target, blocked.masks[b].clone(), &coder, coded.observations, coded.samples, fishers)?,
-        };
+        let (masks, _) = select(&masked, inputs, target, blocked.masks[b].clone(), &coder, coded.observations, coded.samples)?;
         out.masks[b] = masks;
     }
     Ok(out)

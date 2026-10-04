@@ -583,7 +583,7 @@ fn library(export: &std::path::Path, library: &std::path::Path, sets: &std::path
     let masks = given_masks(sets, &chosen, CONTEXT, statistics)?;
     let given = Blocked::rank_one(libraries, vec![masks]);
     let generic = Generic::new(&measured, observations);
-    let coded = Coded { model, sites: chosen.clone(), batches: vec![(inputs, Target::every_row(logits))], observations, samples: 4, describe: &generic, boxed: None };
+    let coded = Coded { model, sites: chosen.clone(), batches: vec![(inputs, Target::every_row(logits))], observations, samples: 4, describe: &generic };
     let (base, _) = measure(&coded, &given)?;
     let mut checks = Vec::new();
     for (label, pick) in [("declared", 0usize), ("rules", 1)] {
@@ -829,7 +829,7 @@ fn rules(export: &std::path::Path, out: &std::path::Path, observations: f64, sta
     let inputs = family.select(&check);
     let logits = model.execute(&inputs, false).map_err(|e| e.to_string())?.values[model.output].clone();
     let generic = Generic::new(&measured, observations);
-    let coded = Coded { model, sites: chosen.clone(), batches: vec![(inputs.clone(), Target::every_row(logits))], observations, samples: 4, describe: &generic, boxed: None };
+    let coded = Coded { model, sites: chosen.clone(), batches: vec![(inputs.clone(), Target::every_row(logits))], observations, samples: 4, describe: &generic };
     let mut checks = Vec::new();
     for (variant, label) in ["alone", "with the rules"].iter().enumerate() {
         let mut built = Vec::new();

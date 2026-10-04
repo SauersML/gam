@@ -4,9 +4,9 @@
 //! `mpd_certify_2951 toy EXPORT_DIR OUT.json [ROWS] [BUDGET] [LEAVES] [OBSERVATIONS]`
 //!
 //! A small export (`gam_mpd::import::import`, its first `ROWS` samples): every site starts from its
-//! exact Fisher-whitened singular subcomponents (`gam_mpd::pieces::fisher_svd`), and two sets per
-//! word are chosen by the masked selection, under the corner claim (`select`) and under the box claim
-//! (`select_boxed`), each coded in `OBSERVATIONS` (default 1000). For each set it reports per word:
+//! exact Fisher-whitened singular subcomponents (`gam_mpd::pieces::fisher_svd`), and a set per word
+//! is chosen by the masked selection (`select`, coded in `OBSERVATIONS`, default 1000). For that set
+//! it reports per word:
 //! * the masks' own KL;
 //! * the engine's box estimate (the masks plus `box_excess_at`, its three-step adversary);
 //! * the worst KL of a 40-step, 8-start adversary;
@@ -28,8 +28,8 @@
 //! whose off gates are free; every other off gate stays at 0. The adversary takes `STEPS` steps
 //! (default 40) from 6 starts on the sequence's total KL. Each word's certificate uses `BUDGET`
 //! symbols (default 512), and the sequence's box is split into `LEAVES` leaves (default 1: no
-//! branching). With `OBSERVATIONS` positive, a second set per word is chosen by the masked selection under
-//! the box claim (`select_boxed`, coded in `OBSERVATIONS`) from the given sets, and certified the same way.
+//! branching). With `OBSERVATIONS` positive, a second set per word is chosen by the masked selection
+//! (`select`, coded in `OBSERVATIONS`) from the given sets, and certified the same way.
 //! `CLAIMS` lists what each set is certified under: `box` (the default) and `restore:K`, at most `K`
 //! off subcomponents restored per word (`gam_mpd::certify::Gates::restoring`), and `sites`, the
 //! site-switch claim (`gam_mpd::certify::certify_sites`): per sequence, each site within `FREE` runs
@@ -44,7 +44,7 @@
 use gam_mpd::blocks::Describe;
 use gam_mpd::certify::{Gates, Relaxation, adversary, certify, certify_branching, certify_sites, certify_widening};
 use gam_mpd::import::{import, import_language_model};
-use gam_mpd::masked::{Coder, Library, Masked, Target, box_excess_at, forward, score_only, select, select_boxed, site_statistics, sites};
+use gam_mpd::masked::{Coder, Library, Masked, Target, box_excess_at, forward, score_only, select, site_statistics, sites};
 use gam_mpd::operator_program::{FamilyInputs, OperatorProgram};
 use gam_mpd::pieces::fisher_svd;
 use ndarray::{Array1, Array2, Zip};
@@ -113,7 +113,6 @@ fn toy(args: &[String]) -> Result<(), String> {
         let library = fisher_svd(site)?;
         libraries.push(Library { v: library.v.t().to_owned(), u: library.u, mean: Array1::zeros(site.w.ncols()) });
     }
-    let fishers: Vec<Array2<f64>> = statistics.iter().map(|s| s.fisher.clone()).collect();
     let description = gam_mpd::blocks::Generic::new(
         &statistics
             .iter()
@@ -134,11 +133,10 @@ fn toy(args: &[String]) -> Result<(), String> {
     let all_on: Vec<Array2<f64>> = (0..masked.sites.len()).map(|k| Array2::ones((family.rows, masked.blocks(k)))).collect();
     let coder = Coder::ran(costs.clone(), family.rows);
     let started = Instant::now();
-    let corner = select(&masked, &family, &target, all_on.clone(), &coder, observations, 2)?.0;
-    let boxed = select_boxed(&masked, &family, &target, all_on, &coder, observations, 2, &fishers)?.0;
-    eprintln!("selected both sets in {:.1}s", started.elapsed().as_secs_f64());
+    let corner = select(&masked, &family, &target, all_on, &coder, observations, 2)?.0;
+    eprintln!("selected in {:.1}s", started.elapsed().as_secs_f64());
     let mut report = Vec::new();
-    for (name, masks) in [("corner", corner), ("box", boxed)] {
+    for (name, masks) in [("corner", corner)] {
         let started = Instant::now();
         let (kl, _, _) = forward(&masked, &masked.family(&family, &masks), &target)?;
         let estimate = &kl + &box_excess_at(&masked, &family, &target, &masks)?;
@@ -371,9 +369,8 @@ fn lm(args: &[String]) -> Result<(), String> {
     let start = named[0].1.clone();
     let mut sets = named;
     if observations > 0.0 {
-        // The masked selection under the box claim from the given sets, every word coded in `OBSERVATIONS`.
+        // The masked selection from the given sets, every word coded in `OBSERVATIONS`.
         let statistics = site_statistics(model, &chosen, [family.clone()], 2, 0x5EED)?;
-        let fishers: Vec<Array2<f64>> = statistics.iter().map(|s| s.fisher.clone()).collect();
         let description = gam_mpd::blocks::Generic::new(
             &statistics
                 .iter()
@@ -390,9 +387,9 @@ fn lm(args: &[String]) -> Result<(), String> {
             })
             .collect::<Result<_, _>>()?;
         let coder = Coder::ran(costs, family.rows);
-        let boxed = select_boxed(&masked, family, &target, start, &coder, observations, 2, &fishers)?.0;
-        eprintln!("box selection done ({:.1}s)", started.elapsed().as_secs_f64());
-        sets.push(("box".to_string(), boxed));
+        let selected = select(&masked, family, &target, start, &coder, observations, 2)?.0;
+        eprintln!("selection done ({:.1}s)", started.elapsed().as_secs_f64());
+        sets.push(("selected".to_string(), selected));
     }
     let mut report = Vec::new();
     let free_site: Vec<bool> = masked.sites.iter().map(|site| free == "all" || free.split(',').any(|p| site.name.starts_with(p))).collect();

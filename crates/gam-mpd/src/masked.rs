@@ -53,16 +53,18 @@
 //! # Claims
 //!
 //! An explanation declares what its off subcomponents may be, and its error is the KL over what it
-//! declares. Under [`Claim::Corner`] they are absent: an input's error is the KL of its masks. Under
-//! [`Claim::Box`] each off gate may be anywhere in `[0, 1]`, and the error is the worst KL over the
-//! box. Four facts fix how that is measured.
+//! declares. The selection codes the corner claim: off subcomponents are absent and an input's
+//! error is the KL of its masks. Under the box claim each off gate may be anywhere in `[0, 1]` and
+//! the error is the worst KL over the box; only the pieces steps train under it
+//! ([`Claim::Box`], charged [`box_upper`]). Four facts fix how it is measured.
 //!
 //! * **An attack bounds from below.** Any point an attack evaluates ([`box_excess_at`]: the masks,
 //!   every layer's vertex, an adversary's ascent) has a loss at most the box's worst, so what it
 //!   finds is a lower bound: it can refute a claim, never certify one, and it is never charged.
-//! * **The expectation is no claim.** The KL expected over uniform independent off gates
-//!   ([`box_excess`]) is refinement-gameable: one off subcomponent split into `q` copies of `1/q`
-//!   leaves the box unchanged and cuts its own term by `1/q`. It only screens proposals.
+//! * **The expectation is no claim.** The KL expected over uniform independent off gates is
+//!   refinement-gameable (one off subcomponent split into `q` copies of `1/q` leaves the box
+//!   unchanged and cuts its own term by `1/q`), and its second-order expansion is unbounded below:
+//!   a blocks fit charged it drove it to −33 nats a token on p31. Nothing measures it.
 //! * **Shared and per-input worst cases differ.** VPD's adversary picks one gate setting `a` for all
 //!   `M` inputs, ours lets each input have its own: `sup_a E_X ℓ(a, X) ≤ E_X sup_a ℓ(a, X) ≤ M sup_a
 //!   E_X ℓ(a, X)` (`ℓ ≥ 0`), the gap up to the factor `M` when every input's worst point differs.
@@ -949,22 +951,19 @@ pub fn kl_and_logits(masked: &Masked, family: &FamilyInputs, target: &Target) ->
     Ok((values, logits))
 }
 
-/// The box claim's error beyond the masks' own KL, per input (module note, "Claims"): the worst,
-/// per sequence, of the box points evaluated. They are the masks themselves (no excess), every
-/// layer's vertex (that layer's sites at the masks, every other site's off gates at 1), and an
-/// adversary's points
-/// (sign ascent over the off gates, all together and one layer's alone), each of whose KL is exact;
-/// the adversary's are charged per word, each word its own worst point. A sequence is
-/// charged the point of its largest total, so a set whose layers only cancel each other's errors
-/// pays for it. A lower bound on the claim's worst case. The expectation over uniform off gates
-/// ([`expected_box_excess_at`]) is no point of the box and a refinement of the library lowers it
-/// with the box unchanged, so it only screens proposals.
+/// An attack on the box claim, per input (module note, "Claims"): the worst excess over the masks'
+/// own KL, per sequence, of the box points evaluated. They are the masks themselves (no excess),
+/// every layer's vertex (that layer's sites at the masks, every other site's off gates at 1), and
+/// an adversary's points (sign ascent over the off gates, all together and one layer's alone),
+/// each of whose KL is exact; the adversary's are taken per token, each token its own worst point.
+/// A sequence takes the point of its largest total, so a set whose layers only cancel each other's
+/// errors is caught. A lower bound on the box's worst case: it refutes a claim, never charged.
 pub fn box_excess_at(masked: &Masked, base: &FamilyInputs, target: &Target, masks: &[Array2<f64>]) -> Result<Array1<f64>, String> {
     let corner = score_only(masked, &masked.family(base, masks), target)?;
     box_excess_from(masked, base, target, masks, &corner)
 }
 
-/// [`box_excess_at`] from the masks' own KL `corner` and their expected excess `expected`.
+/// [`box_excess_at`] from the masks' own KL `corner`.
 fn box_excess_from(masked: &Masked, base: &FamilyInputs, target: &Target, masks: &[Array2<f64>], corner: &Array1<f64>) -> Result<Array1<f64>, String> {
     // The vertices share every gate on up to their own layer (as in a selection).
     let lowered = masked.on_device(|_| Ok(()))?.is_some();
@@ -1297,8 +1296,7 @@ fn undecided(savings: &[Vec<f64>], bands: &[Vec<f64>], threshold: Option<&[f64]>
         .collect()
 }
 
-/// [`box_excess_at`] from the masks' own KL `corner` and the expected excess `expected`, adding
-/// each layer's vertex. With `all_on`, the CPU trace of every gate on: a vertex's layers before
+/// [`box_excess_at`] from the masks' own KL `corner`: each layer's vertex, then the adversary. With `all_on`, the CPU trace of every gate on: a vertex's layers before
 /// its own are all on, so its forward starts at its layer's first mask, reading the rest there.
 fn box_worst(
     masked: &Masked,
@@ -1321,9 +1319,7 @@ fn box_worst(
         }
         totals
     };
-    // The masks themselves are a point of the box. The expected excess over uniform gates is not
-    // one, and a refinement of the library can lower it with the box unchanged, so it only
-    // screens proposals and is never charged.
+    // The masks themselves are a point of the box.
     let mut worst = Array1::<f64>::zeros(rows);
     let mut totals = vec![0.0; sequences];
     // Sites by layer: the name up to its last `.`.
@@ -1561,22 +1557,6 @@ pub fn box_upper_at(masked: &Masked, base: &FamilyInputs, masks: &[Array2<f64>],
     })? { return Ok(cost); }
     let trace = masked.program.execute(&family, false).map_err(|e| e.to_string())?;
     box_upper(masked, &trace, masks, fishers)
-}
-
-/// The box claim's expected excess per input over uniform off gates ([`box_excess`]) at `masks`,
-/// on the program's device twin when it has one (module note, "Devices").
-pub fn expected_box_excess_at(masked: &Masked, base: &FamilyInputs, target: &Target, masks: &[Array2<f64>], fishers: &[Array2<f64>]) -> Result<Array1<f64>, String> {
-    let family = masked.family(base, masks);
-    if (0..masked.sites.len()).all(|k| masked.is_rank_one(k))
-        && let Some(excess) = masked.on_device(|accelerated| {
-            let state = accelerated.forward(&family, &accelerated.target(target)?)?;
-            Ok(accelerated.box_excess(masked, &state, masks, fishers, false)?.0)
-        })?
-    {
-        return Ok(excess);
-    }
-    let (_, trace, cotangent) = forward(masked, &family, target)?;
-    Ok(box_excess(masked, &family, &trace, masks, cotangent, fishers, false)?.0)
 }
 
 /// Per site: `∂KL/∂m` (rows × B) and the gradients in `V` (C × d_in) and `U` (C × d_out), from one
@@ -2149,23 +2129,13 @@ fn phases() -> String {
 }
 
 /// A selection round's masked forward (module note, "Devices"): the CPU's trace with the KL's
-/// cotangent at the output (`None` until a gradient needs it) and, once the box claim's excess
-/// was read off it, the float64 reverse pass that kept every masked and written node; or the
-/// device's state.
+/// cotangent at the output (`None` until a gradient needs it), or the device's state.
 enum Selected {
-    Host(Trace, Option<Array2<f64>>, Option<Vec<Option<Array2<f64>>>>),
+    Host(Trace, Option<Array2<f64>>),
     Device(State),
 }
 
 impl Selected {
-    /// The contribution charge uses this already evaluated forward on either backend.
-    fn contribution(&self, masked: &Masked, masks: &[Array2<f64>], fishers: &[Array2<f64>]) -> Result<Array1<f64>, String> {
-        timed("contribution", || match self {
-            Self::Host(trace, ..) => box_upper(masked, trace, masks, fishers),
-            Self::Device(state) => masked.on_lowered(|accelerated| accelerated.box_upper(masked, &state.trace, masks, fishers)),
-        })
-    }
-
     /// The masked forward and its KL, deferring the head cotangent on score-only trials.
     fn forward(masked: &Masked, family: &FamilyInputs, target: &Target, on_device: Option<&DeviceTarget>, cotangent: bool) -> Result<(Array1<f64>, Self), String> {
         timed("forward", || Self::forward_untimed(masked, family, target, on_device, cotangent))
@@ -2181,93 +2151,10 @@ impl Selected {
         }
         if cotangent {
             let (values, trace, cotangent) = forward(masked, family, target)?;
-            return Ok((values, Self::Host(trace, Some(cotangent), None)));
+            return Ok((values, Self::Host(trace, Some(cotangent))));
         }
         let (values, trace) = scored_forward(masked, family, target)?;
-        Ok((values, Self::Host(trace, None, None)))
-    }
-
-    /// The box claim's expected excess at `masks` ([`box_excess`]), read off this forward; on the
-    /// CPU its reverse pass is kept for the mask gradients.
-    fn expected_excess(
-        &mut self,
-        masked: &Masked,
-        family: &FamilyInputs,
-        target: &Target,
-        masks: &[Array2<f64>],
-        fishers: &[Array2<f64>],
-        terms: Option<&BoxTerms>,
-        on_device: Option<&DeviceTarget>,
-        for_gradients: bool,
-    ) -> Result<Array1<f64>, String> {
-        timed("expected excess", || self.expected_excess_untimed(masked, family, target, masks, fishers, terms, on_device, for_gradients))
-    }
-
-    fn expected_excess_untimed(
-        &mut self,
-        masked: &Masked,
-        family: &FamilyInputs,
-        target: &Target,
-        masks: &[Array2<f64>],
-        fishers: &[Array2<f64>],
-        terms: Option<&BoxTerms>,
-        on_device: Option<&DeviceTarget>,
-        for_gradients: bool,
-    ) -> Result<Array1<f64>, String> {
-        match self {
-            Self::Device(state) => match on_device {
-                Some(on_device) if (0..masked.sites.len()).all(|k| masked.is_rank_one(k)) => masked.on_lowered(|accelerated| {
-                    accelerated.prepare_gradient(state, on_device)?;
-                    Ok(accelerated.box_excess(masked, state, masks, fishers, false)?.0)
-                }),
-                _ => {
-                    let (_, trace, cotangent) = forward(masked, family, target)?;
-                    Ok(box_excess(masked, family, &trace, masks, cotangent, fishers, false)?.0)
-                }
-            },
-            Self::Host(trace, cotangent, back) => {
-                if back.is_none() {
-                    let cotangent = match cotangent.take() {
-                        Some(c) => c,
-                        None => to_output(masked, family, trace, target, kl(target, &*logits(masked, family, trace, target)?).1)?,
-                    };
-                    // The masked nodes' cotangents too when the mask gradients will read them.
-                    let mut keep: Vec<usize> = if for_gradients { masked.masked.clone() } else { Vec::new() };
-                    keep.extend(masked.written.iter().flatten().copied());
-                    *back = Some(super::derivatives::vjp_from(&masked.program, family, trace, masked.program.output, cotangent, Some(&keep)).map_err(|e| e.to_string())?);
-                }
-                let back = back.as_ref().ok_or("no reverse pass")?;
-                let built;
-                let terms = match terms {
-                    Some(terms) => terms,
-                    None => {
-                        built = masked.box_terms(fishers)?;
-                        &*built
-                    }
-                };
-                Ok(box_excess_back(masked, trace, back, masks, terms, fishers, false)?.0)
-            }
-        }
-    }
-
-    /// Drop everything but what [`Selected::mask_gradients`] reads once the reverse pass is held:
-    /// each site's `z` and the masked nodes' cotangents.
-    fn shrink(&mut self, masked: &Masked) {
-        if let Self::Host(trace, cotangent, Some(back)) = self {
-            let z: std::collections::BTreeSet<usize> = masked.z.iter().copied().collect();
-            let kept: std::collections::BTreeSet<usize> = masked.masked.iter().copied().collect();
-            for (n, value) in trace.values.iter_mut().enumerate() {
-                if !z.contains(&n) {
-                    *value = Array2::zeros((0, 0));
-                }
-            }
-            for (n, cotangent) in back.iter_mut().enumerate() {
-                if !kept.contains(&n) {
-                    *cotangent = None;
-                }
-            }
-            *cotangent = None;
-        }
+        Ok((values, Self::Host(trace, None)))
     }
 
     /// [`mask_gradients`] of the KL.
@@ -2281,8 +2168,7 @@ impl Selected {
                 accelerated.prepare_gradient(state, on_device.ok_or("device: missing selection target")?)?;
                 accelerated.mask_gradients(masked, state)
             }),
-            Self::Host(trace, _, Some(back)) => Ok(mask_gradients_of(masked, trace, back)),
-            Self::Host(trace, cotangent, None) => {
+            Self::Host(trace, cotangent) => {
                 let cotangent = match cotangent.take() {
                     Some(c) => c,
                     None => to_output(masked, family, trace, target, kl(target, &*logits(masked, family, trace, target)?).1)?,
@@ -2316,7 +2202,7 @@ impl Selected {
     ) -> Result<Vec<(Array2<f64>, Option<Array2<f64>>)>, String> {
         match (self, on_device) {
             (Self::Device(state), Some(on_device)) => masked.on_lowered(|accelerated| accelerated.fisher(masked, state, on_device, samples, seed, false)),
-            (Self::Host(trace, _, _), _) => fisher(masked, family, trace, target, samples, seed, false),
+            (Self::Host(trace, _), _) => fisher(masked, family, trace, target, samples, seed, false),
             (Self::Device(_), None) => Err("device: a device state without its target".to_string()),
         }
     }
@@ -2341,23 +2227,7 @@ pub fn select(
     observations: f64,
     samples: usize,
 ) -> Result<(Vec<Array2<f64>>, Array1<f64>), String> {
-    select_observed(masked, base, target, masks, coder, observations, samples, None, &mut |_: &Round<'_>| Ok(()))
-}
-
-/// [`select`] under the box claim (module note, "Claims"): every input's error is its masks' KL
-/// plus [`box_excess`] in the written Fishers `fishers`, so the sets it keeps explain the input
-/// whatever the off subcomponents are set to in `[0, 1]`. Returns the masks and their own KL.
-pub fn select_boxed(
-    masked: &Masked,
-    base: &FamilyInputs,
-    target: &Target,
-    masks: Vec<Array2<f64>>,
-    coder: &Coder,
-    observations: f64,
-    samples: usize,
-    fishers: &[Array2<f64>],
-) -> Result<(Vec<Array2<f64>>, Array1<f64>), String> {
-    select_observed(masked, base, target, masks, coder, observations, samples, Some(fishers), &mut |_: &Round<'_>| Ok(()))
+    select_observed(masked, base, target, masks, coder, observations, samples, &mut |_: &Round<'_>| Ok(()))
 }
 
 /// One selection round's keep/refuse decisions as [`select_observed`] shows them: the masks before
@@ -2372,8 +2242,7 @@ pub struct Round<'a> {
     pub flipped: &'a [usize],
 }
 
-/// [`select`], showing `observe` every round's decisions before they are taken; with `boxed`
-/// (the written Fishers), under the box claim ([`select_boxed`]).
+/// [`select`], showing `observe` every round's decisions before they are taken.
 pub fn select_observed(
     masked: &Masked,
     base: &FamilyInputs,
@@ -2382,15 +2251,14 @@ pub fn select_observed(
     coder: &Coder,
     observations: f64,
     samples: usize,
-    boxed: Option<&[Array2<f64>]>,
     observe: &mut dyn FnMut(&Round<'_>) -> Result<(), String>,
 ) -> Result<(Vec<Array2<f64>>, Array1<f64>), String> {
-    select_resumable(masked, base, target, masks, None, coder, observations, samples, boxed, observe, &mut |_: &Progress<'_>| Ok(()))
+    select_resumable(masked, base, target, masks, None, coder, observations, samples, observe, &mut |_: &Progress<'_>| Ok(()))
 }
 
 /// A selection's whole state between two rounds, as [`select_resumable`] shows it to its
-/// checkpoint: the masks, each input's interaction `α`, each sequence's flip cap, the rounds taken,
-/// and under the box claim the masks' excess when a round already measured it. Everything else a
+/// checkpoint: the masks, each input's interaction `α`, each sequence's flip cap and the rounds
+/// taken. Everything else a
 /// selection holds between rounds is a function of these and of its start (the curvature is
 /// measured once, at the start's masks), so a selection resumed from them continues exactly as the
 /// uninterrupted one.
@@ -2399,7 +2267,6 @@ pub struct Progress<'a> {
     pub alpha: &'a [f64],
     pub cap: &'a [usize],
     pub round: u64,
-    pub excess: Option<&'a Array1<f64>>,
 }
 
 /// An owned [`Progress`], to resume from.
@@ -2409,13 +2276,12 @@ pub struct Resume {
     pub alpha: Vec<f64>,
     pub cap: Vec<usize>,
     pub round: u64,
-    pub excess: Option<Array1<f64>>,
 }
 
 impl Progress<'_> {
     /// The owned state.
     pub fn to_resume(&self) -> Resume {
-        Resume { masks: self.masks.to_vec(), alpha: self.alpha.to_vec(), cap: self.cap.to_vec(), round: self.round, excess: self.excess.cloned() }
+        Resume { masks: self.masks.to_vec(), alpha: self.alpha.to_vec(), cap: self.cap.to_vec(), round: self.round }
     }
 }
 
@@ -2431,7 +2297,6 @@ pub fn select_resumable(
     coder: &Coder,
     observations: f64,
     samples: usize,
-    boxed: Option<&[Array2<f64>]>,
     observe: &mut dyn FnMut(&Round<'_>) -> Result<(), String>,
     checkpoint: &mut dyn FnMut(&Progress<'_>) -> Result<(), String>,
 ) -> Result<(Vec<Array2<f64>>, Array1<f64>), String> {
@@ -2458,9 +2323,6 @@ pub fn select_resumable(
     // carried over: a screened one holds f32-banded logits, and every round starting from a
     // float64 forward of its masks is what lets a resumed selection match an uninterrupted one.
     let mut reuse: Option<(Array1<f64>, Vec<Array2<f64>>)> = None;
-    // Under the box claim, the current masks' excess when a round already measured it: sequences
-    // are independent, so a kept sequence's is the proposal's and a refused one's is unchanged.
-    let mut excess_known: Option<Array1<f64>> = None;
     // The target on the program's device, when it runs on one (module note, "Devices").
     let on_device = masked.on_device(|accelerated| accelerated.target(target))?;
     let on_device = on_device.as_ref();
@@ -2469,7 +2331,6 @@ pub fn select_resumable(
             || resume.masks.iter().zip(&masks).any(|(a, b)| a.dim() != b.dim())
             || resume.alpha.len() != rows
             || resume.cap.len() != sequences
-            || resume.excess.as_ref().is_some_and(|e| e.len() != rows || boxed.is_none())
         {
             return Err("selection: a resumed state that does not fit this selection".to_string());
         }
@@ -2483,17 +2344,10 @@ pub fn select_resumable(
         alpha = resume.alpha;
         cap = resume.cap;
         round = resume.round;
-        excess_known = resume.excess;
     }
-    // Under the box claim, what its excess reads of the library and the Fishers: fixed here.
-    let box_terms = match boxed {
-        Some(f) if on_device.is_none() => Some(masked.box_terms(f)?),
-        _ => None,
-    };
-    // The exact KL and (under the box claim) our claim's cost of a trial's masks ([`box_upper`]).
-    // The corner claim's scores on the CPU through screened heads (module note, "Screened heads"):
-    // the current masks' head, and the errors a proposal kept whole hands to the next round.
-    let screen = if boxed.is_none() && on_device.is_none() { Screen::new(masked) } else { None };
+    // Scores on the CPU through screened heads (module note, "Screened heads"): the current masks'
+    // head, and the errors a proposal kept whole hands to the next round.
+    let screen = if on_device.is_none() { Screen::new(masked) } else { None };
     let mut head_base: Option<HeadBase> = None;
     // Per sequence, its scored rows (a kept round saving less than a bit per one is the last).
     let mut sequence_rows = vec![0usize; sequences];
@@ -2522,42 +2376,18 @@ pub fn select_resumable(
             })
             .collect()
     };
-    let measure = |trial: &[Array2<f64>]| -> Result<(Array1<f64>, Array1<f64>), String> {
-        let family = masked.family(base, trial);
-        match boxed {
-            None => Ok((score_only(masked, &family, target)?, Array1::zeros(rows))),
-            Some(f) => {
-                let (kl_trial, state) = Selected::forward(masked, &family, target, on_device, false)?;
-                Ok((kl_trial, state.contribution(masked, trial, f)?))
-            }
-        }
-    };
-    // A trial's KL and, under the box claim, only its expected excess: the cheap screen the split
-    // recursion ranks halves by before the full worst case decides.
-    let measure_expected = |trial: &[Array2<f64>]| -> Result<(Array1<f64>, Array1<f64>), String> {
-        let family = masked.family(base, trial);
-        match boxed {
-            None => Ok((score_only(masked, &family, target)?, Array1::zeros(rows))),
-            Some(f) => {
-                let (kl_trial, mut state) = Selected::forward(masked, &family, target, on_device, false)?;
-                let expected = state.expected_excess(masked, &family, target, trial, f, box_terms.as_deref(), on_device, false)?;
-                Ok((kl_trial, expected))
-            }
-        }
-    };
+    // A trial's exact KL.
+    let score = |trial: &[Array2<f64>]| score_only(masked, &masked.family(base, trial), target);
     loop {
-        checkpoint(&Progress { masks: &masks, alpha: &alpha, cap: &cap, round, excess: excess_known.as_ref() })?;
+        checkpoint(&Progress { masks: &masks, alpha: &alpha, cap: &cap, round })?;
         let family = masked.family(base, &masks);
         // The current forward lives only until its gradients (and, once, the Fisher) are read.
         let (mut kl_now, grads) = match reuse.take() {
             Some(state) => state,
             None => {
                 let (kl_now, mut state) = Selected::forward(masked, &family, target, on_device, true)?;
-                if let (Some(screen), Selected::Host(trace, _, _)) = (&screen, &state) {
+                if let (Some(screen), Selected::Host(trace, _)) = (&screen, &state) {
                     head_base = Some(screen.base(masked, trace));
-                }
-                if let (Some(f), None) = (boxed, &excess_known) {
-                    excess_known = Some(state.contribution(masked, &masks, f)?);
                 }
                 let grads = state.mask_gradients(masked, &family, target, on_device)?;
                 // The Fisher diagonal only ranks proposals (the exact forward decides), so it is
@@ -2571,13 +2401,7 @@ pub fn select_resumable(
         };
         let curvature = curvature.as_ref().ok_or("no curvature")?;
         let listing_now = coder.bits(&masks);
-        // Under the box claim each input's error is its masks' KL plus the box's excess.
-        let excess_now = match (boxed, excess_known.take()) {
-            (None, _) => Array1::zeros(rows),
-            (Some(_), Some(known)) => known,
-            (Some(f), None) => box_upper_at(masked, base, &masks, f)?,
-        };
-        let mut before = code(&(&kl_now + &excess_now), &listing_now, observations);
+        let mut before = code(&kl_now, &listing_now, observations);
         // Each input's predicted flips, best first, as many as its interaction model says pay
         // (inputs in parallel: each reads only its own row of every array).
         let picks: Vec<(Vec<(usize, usize)>, f64)> = {
@@ -2594,15 +2418,8 @@ pub fn select_resumable(
                         let (g, h, m) = (g.row(r), h.row(r), masks[k].row(r));
                         for c in 0..g.len() {
                             let on = m[c] > 0.0;
-                            // The corner's change, `∓g + h/2`; under the box claim an off gate also
-                            // adds its expected excess, `g/2 + h/6` to second order (`E m = ½`,
-                            // `E m² = ⅓`), which turning it on removes.
-                            let kl_change = match (boxed.is_some(), on) {
-                                (false, true) => -g[c] + 0.5 * h[c],
-                                (false, false) => g[c] + 0.5 * h[c],
-                                (true, true) => -0.5 * g[c] + (2.0 / 3.0) * h[c],
-                                (true, false) => 0.5 * g[c] + h[c] / 3.0,
-                            };
+                            // The flip's change, `∓g + h/2`.
+                            let kl_change = if on { -g[c] + 0.5 * h[c] } else { g[c] + 0.5 * h[c] };
                             let listing_change = coder.marginal(&masks, r, k, c, fresh);
                             let net = scale * kl_change + listing_change;
                             if net < 0.0 {
@@ -2652,12 +2469,7 @@ pub fn select_resumable(
                         for (k, (g, (h, _))) in grads.iter().zip(curvature.iter()).enumerate() {
                             let (g, h, m) = (g.row(r), h.row(r), masks[k].row(r));
                             for c in 0..g.len() {
-                                let kl_change = match (boxed.is_some(), m[c] > 0.0) {
-                                    (false, true) => -g[c] + 0.5 * h[c],
-                                    (false, false) => g[c] + 0.5 * h[c],
-                                    (true, true) => -0.5 * g[c] + (2.0 / 3.0) * h[c],
-                                    (true, false) => 0.5 * g[c] + h[c] / 3.0,
-                                };
+                                let kl_change = if m[c] > 0.0 { -g[c] + 0.5 * h[c] } else { g[c] + 0.5 * h[c] };
                                 if kl_change < 0.0 {
                                     moves.push((kl_change, k, c));
                                 }
@@ -2685,12 +2497,7 @@ pub fn select_resumable(
                         let (screened, _) = screen.score(masked, &masked.family(base, &trial), target, head, true)?;
                         (code(&screened.kl, &listing_trial, observations), Some(screened))
                     }
-                    // Under the box claim each k is ranked by its expected excess alone; the full
-                    // worst case decides below, on the k a sequence would keep.
-                    _ => {
-                        let (kl_trial, excess_trial) = measure_expected(&trial)?;
-                        (code(&(&kl_trial + &excess_trial), &listing_trial, observations), None)
-                    }
+                    _ => (code(&score(&trial)?, &listing_trial, observations), None),
                 };
                 options.push((k, after_trial, listing_trial, screened));
                 k *= 2;
@@ -2709,7 +2516,7 @@ pub fn select_resumable(
                 if !settle.is_empty() {
                     screen.settle_base(masked, target, head, &mut kl_now, &settle);
                     for &r in &settle {
-                        before[r] = listing_now[r] + scale * (kl_now[r] + excess_now[r]);
+                        before[r] = listing_now[r] + scale * kl_now[r];
                     }
                     for (_, after, listing, screened) in options.iter_mut() {
                         if let Some(screened) = screened.as_mut() {
@@ -2740,46 +2547,7 @@ pub fn select_resumable(
                 }
             }
             ranked_k.iter_mut().for_each(|r| r.sort_by(|a, b| b.0.total_cmp(&a.0)));
-            let mut best = vec![(0.0f64, 0usize); sequences];
-            if boxed.is_none() {
-                for q in 0..sequences {
-                    if let Some(&first) = ranked_k[q].first() {
-                        best[q] = first;
-                    }
-                }
-            } else {
-                // The full worst case decides: every sequence's best-ranked k at once, a refused
-                // sequence falling back to its next.
-                let mut next = vec![0usize; sequences];
-                while (0..sequences).any(|q| best[q].1 == 0 && next[q] < ranked_k[q].len()) {
-                    let trying: Vec<Option<usize>> = (0..sequences)
-                        .map(|q| (best[q].1 == 0 && next[q] < ranked_k[q].len()).then(|| ranked_k[q][next[q]].1))
-                        .collect();
-                    let mut trial = masks.clone();
-                    for (r, moves) in ranked.iter().enumerate() {
-                        if let Some(k) = trying[sequence_of[r]] {
-                            for &(site, c) in moves.iter().take(k) {
-                                trial[site][[r, c]] = 1.0 - trial[site][[r, c]];
-                            }
-                        }
-                    }
-                    let (kl_full, excess_full) = measure(&trial)?;
-                    let after_full = code(&(&kl_full + &excess_full), &coder.bits(&trial), observations);
-                    let mut full = vec![0.0; sequences];
-                    for r in 0..rows {
-                        full[sequence_of[r]] += before[r] - after_full[r];
-                    }
-                    for q in 0..sequences {
-                        if let Some(k) = trying[q] {
-                            if full[q] > 0.0 {
-                                best[q] = (full[q], k);
-                            } else {
-                                next[q] += 1;
-                            }
-                        }
-                    }
-                }
-            }
+            let best: Vec<(f64, usize)> = ranked_k.iter().map(|r| r.first().copied().unwrap_or((0.0, 0))).collect();
             if best.iter().any(|(saving, _)| *saving > 0.0) {
                 for (r, moves) in ranked.iter().enumerate() {
                     let (saving, k) = best[sequence_of[r]];
@@ -2798,7 +2566,6 @@ pub fn select_resumable(
                 );
                 cap = vec![usize::MAX; sequences];
                 reuse = None;
-                excess_known = None;
                 continue;
             }
             // The KL returned is the float64 one of the final masks, never a screened one.
@@ -2809,24 +2576,15 @@ pub fn select_resumable(
         let (mut kl_new, mut state_new, mut screened) = match (&screen, &head_base) {
             (Some(screen), Some(head)) => {
                 let (screened, trace) = screen.score(masked, &proposed_family, target, head, false)?;
-                (screened.kl.clone(), Selected::Host(trace, None, None), Some(screened))
+                (screened.kl.clone(), Selected::Host(trace, None), Some(screened))
             }
             _ => {
                 let (kl, state) = Selected::forward(masked, &proposed_family, target, on_device, false)?;
                 (kl, state, None)
             }
         };
-        let excess_new = match boxed {
-            Some(f) => {
-                let cost = state_new.contribution(masked, &proposed, f)?;
-                // Kept, this forward serves only the next round's mask gradients.
-                state_new.shrink(masked);
-                cost
-            }
-            None => Array1::zeros(rows),
-        };
         let listing_new = coder.bits(&proposed);
-        let mut after = code(&(&kl_new + &excess_new), &listing_new, observations);
+        let mut after = code(&kl_new, &listing_new, observations);
         // Screened codes decide where their bands allow; elsewhere the sequence's rows are settled
         // to float64 in the proposal and in the current masks first.
         if let (Some(screen), Some(screened), Some(head)) = (&screen, screened.as_mut(), head_base.as_mut()) {
@@ -2835,15 +2593,15 @@ pub fn select_resumable(
             log::info!("screened proposal: {} of {sequences} sequences settled to float64", open.iter().filter(|o| **o).count());
             if !settle.is_empty() {
                 let trace = match &mut state_new {
-                    Selected::Host(trace, _, _) => Some(trace),
+                    Selected::Host(trace, _) => Some(trace),
                     Selected::Device(_) => None,
                 };
                 screen.settle(masked, target, screened, &settle, trace);
                 screen.settle_base(masked, target, head, &mut kl_now, &settle);
                 for &r in &settle {
                     kl_new[r] = screened.kl[r];
-                    before[r] = listing_now[r] + scale * (kl_now[r] + excess_now[r]);
-                    after[r] = listing_new[r] + scale * (kl_new[r] + excess_new[r]);
+                    before[r] = listing_now[r] + scale * kl_now[r];
+                    after[r] = listing_new[r] + scale * kl_new[r];
                 }
             }
         }
@@ -2900,10 +2658,7 @@ pub fn select_resumable(
                     let (screened, _) = screen.score(masked, &masked.family(base, trial), target, head, true)?;
                     Ok((code(&screened.kl, &listing, observations), listing, Some(screened)))
                 }
-                _ => {
-                    let (kl_trial, excess_trial) = measure_expected(trial)?;
-                    Ok((code(&(&kl_trial + &excess_trial), &listing, observations), listing, None))
-                }
+                _ => Ok((code(&score(trial)?, &listing, observations), listing, None)),
             }
         };
         while (0..rows).any(|r| open[sequence_of[r]] && subset[r].len() >= 2) {
@@ -2938,7 +2693,7 @@ pub fn select_resumable(
                 if !settle.is_empty() {
                     screen.settle_base(masked, target, head, &mut kl_now, &settle);
                     for &r in &settle {
-                        before[r] = listing_now[r] + scale * (kl_now[r] + excess_now[r]);
+                        before[r] = listing_now[r] + scale * kl_now[r];
                     }
                     for (after, listing, screened) in sides.iter_mut() {
                         if let Some(screened) = screened.as_mut() {
@@ -2956,41 +2711,13 @@ pub fn select_resumable(
                     savings[sequence_of[r]][side] += before[r] - after_half[r];
                 }
             }
-            // The half each sequence would keep; under the box claim the halves were screened by
-            // the expected excess alone, so the kept halves are measured under the full worst case
-            // first (all at once), and a half that does not lower its sequence's code there is
-            // refused.
-            let mut chosen: Vec<Option<usize>> = (0..sequences)
+            // The half each sequence would keep.
+            let chosen: Vec<Option<usize>> = (0..sequences)
                 .map(|q| {
                     let side = if savings[q][0] >= savings[q][1] { 0 } else { 1 };
                     (open[q] && savings[q][side] > 0.0).then_some(side)
                 })
                 .collect();
-            if boxed.is_some() && chosen.iter().any(Option::is_some) {
-                let mut trial = masks.clone();
-                for (r, (first, rest)) in halves.iter().enumerate() {
-                    if let Some(side) = chosen[sequence_of[r]] {
-                        for &(site, c) in if side == 0 { first } else { rest } {
-                            trial[site][[r, c]] = 1.0 - trial[site][[r, c]];
-                        }
-                    }
-                }
-                let (kl_full, excess_full) = measure(&trial)?;
-                let after_full = code(&(&kl_full + &excess_full), &coder.bits(&trial), observations);
-                let mut full = vec![0.0; sequences];
-                for r in 0..rows {
-                    full[sequence_of[r]] += before[r] - after_full[r];
-                }
-                for q in 0..sequences {
-                    if let Some(side) = chosen[q] {
-                        if full[q] > 0.0 {
-                            savings[q][side] = full[q];
-                        } else {
-                            chosen[q] = None;
-                        }
-                    }
-                }
-            }
             for q in 0..sequences {
                 let Some(side) = chosen[q] else { continue };
                 {
@@ -3018,10 +2745,6 @@ pub fn select_resumable(
         saved += rescued_saving;
         if rescued > 0 {
             log::info!("selection round {}: split proposals kept in {rescued} more sequences, {rescued_saving:.0} bits saved", round + 1);
-        }
-        if boxed.is_some() {
-            let kept_sequence = |q: usize| sequence_flips[q] > 0 && sequence_saving[q] > 0.0;
-            excess_known = (rescued == 0).then(|| Array1::from_shape_fn(rows, |r| if kept_sequence(sequence_of[r]) { excess_new[r] } else { excess_now[r] }));
         }
         round += 1;
         if rescued == 0 && kept == 0 {
@@ -3383,105 +3106,13 @@ enum Evaluated {
 pub enum Claim {
     /// Off means absent: the error is the KL of the masks themselves.
     Corner,
-    /// Off means anywhere in `[0, 1]`: the error is the worst over the box points evaluated
-    /// ([`box_excess_at`]), the expectation over uniform off gates among them.
+    /// Off means anywhere in `[0, 1]`: the error is the masks' KL plus the contribution charge
+    /// ([`box_upper`]), an upper bound on what the box adds at each site to second order.
     Box,
 }
 
-/// Per site, the gradients of the box excess in `V` and `U`.
+/// Per site, the gradients of the contribution charge ([`box_upper`]) in `V` and `U`.
 pub type BoxGradients = Vec<(Array2<f64>, Array2<f64>)>;
-
-/// Per input, what the box claim adds to the masks' own KL (module note, "Claims"), from a masked
-/// forward's trace and its KL's cotangent at the program's output, in each site's written Fisher
-/// `fishers[k]` (a per-input mean). With `gradients`, also its gradients in every site's `V`
-/// (C × d_in) and `U` (C × d_out), the KL's gradient at the written values held fixed (they steer
-/// steps; the error itself decides).
-pub fn box_excess(
-    masked: &Masked,
-    family: &FamilyInputs,
-    trace: &Trace,
-    masks: &[Array2<f64>],
-    cotangent: Array2<f64>,
-    fishers: &[Array2<f64>],
-    gradients: bool,
-) -> Result<(Array1<f64>, Option<BoxGradients>), String> {
-    let written: Vec<usize> = masked.written.iter().flatten().copied().collect();
-    let back = super::derivatives::vjp_from(&masked.program, family, trace, masked.program.output, cotangent, Some(&written)).map_err(|e| e.to_string())?;
-    let terms = masked.box_terms(fishers)?;
-    box_excess_back(masked, trace, &back, masks, &terms, fishers, gradients)
-}
-
-/// [`box_excess`] from a reverse pass `back` that kept every site's written nodes.
-fn box_excess_back(
-    masked: &Masked,
-    trace: &Trace,
-    back: &[Option<Array2<f64>>],
-    masks: &[Array2<f64>],
-    terms: &BoxTerms,
-    fishers: &[Array2<f64>],
-    gradients: bool,
-) -> Result<(Array1<f64>, Option<BoxGradients>), String> {
-    use gam_linalg::faer_ndarray::{fast_ab, fast_abt};
-    let rows = trace.values[masked.program.output].nrows();
-    let mut excess = Array1::<f64>::zeros(rows);
-    let mut out = Vec::new();
-    for (k, site) in masked.sites.iter().enumerate() {
-        let own_blocks = &terms.sites[k];
-        let u = &masked.u(k)?;
-        let f = &fishers[k];
-        // The off blocks' coordinates, per column.
-        let off = masked.expand(k, &masks[k]).mapv(|m| 1.0 - m);
-        let a = &trace.values[masked.z[k]] * &off;
-        let s_out = fast_ab(&a, u);
-        let zeros: Vec<Array2<f64>> = masked.written[k].iter().filter(|n| back[**n].is_none()).map(|n| Array2::zeros(trace.values[*n].dim())).collect();
-        let mut zero = zeros.iter();
-        let views: Vec<ndarray::ArrayView2<'_, f64>> = masked.written[k]
-            .iter()
-            .map(|n| match &back[*n] {
-                Some(b) => Ok(b.view()),
-                None => zero.next().map(|z| z.view()).ok_or_else(|| "box excess: a written node without a value".to_string()),
-            })
-            .collect::<Result<_, String>>()?;
-        let g = ndarray::concatenate(Axis(1), &views).map_err(|e| e.to_string())?;
-        let sf = fast_ab(&s_out, f);
-        // Each block's own term `Z_cᵀ F Z_c = a_cᵀ (U_c F U_cᵀ) a_c`, per input.
-        let mut own_a = Array2::<f64>::zeros(a.dim());
-        if masked.is_rank_one(k) {
-            let weight = own_blocks[0].row(0);
-            ndarray::Zip::from(own_a.rows_mut()).and(a.rows()).for_each(|mut o, ar| {
-                ndarray::Zip::from(&mut o).and(&ar).and(&weight).for_each(|o, a, w| *o = a * w);
-            });
-        } else {
-            let mut start = 0;
-            for (&r, ufu) in masked.ranks(k).iter().zip(own_blocks) {
-                let a_block = a.slice(s![.., start..start + r]);
-                own_a.slice_mut(s![.., start..start + r]).assign(&a_block.dot(ufu));
-                start += r;
-            }
-        }
-        let own = (&own_a * &a).sum_axis(Axis(1));
-        excess += &((&g * &s_out).sum_axis(Axis(1)) * 0.5 + (&sf * &s_out).sum_axis(Axis(1)) * 0.125 + &own * (1.0 / 24.0));
-        if gradients {
-            // ∂/∂S = ½ g + ¼ S F; ∂/∂a = (∂/∂S) Uᵀ + a (U_c F U_cᵀ)/12 within each block.
-            let g_s = &g * 0.5 + &sf * 0.25;
-            let g_a = &fast_abt(&g_s, u) + &(own_a * (1.0 / 12.0));
-            let mut u_gradient = fast_atb(&a, &g_s);
-            let uf = fast_ab(u, f);
-            let mut start = 0;
-            for &r in masked.ranks(k) {
-                let a_block = a.slice(s![.., start..start + r]);
-                let extra = a_block.t().dot(&a_block).dot(&uf.slice(s![start..start + r, ..])) * (1.0 / 12.0);
-                let mut target_rows = u_gradient.slice_mut(s![start..start + r, ..]);
-                target_rows += &extra;
-                start += r;
-            }
-            let reads = read_values(trace, site)?;
-            let v_gradient = fast_atb(&(&g_a * &off), &reads);
-            out.push((v_gradient, u_gradient));
-        }
-    }
-    Ok((excess, gradients.then_some(out)))
-}
 
 /// A fingerprint of the written Fishers' every entry (FNV-1a over their bits, per site, folded),
 /// so a cache of what they determine is reused exactly while they are unchanged.

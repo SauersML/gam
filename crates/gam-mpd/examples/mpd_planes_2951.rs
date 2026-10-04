@@ -13,10 +13,8 @@
 //! what the readers leave is one more block, the rest, so the blocks sum to `W` and none exceeds it
 //! (`planes`). A plane with nothing beyond the site's rounding band is left out.
 //!
-//! Every point is measured under the corner claim (every word's error the exact KL of the program
-//! its masks run: off blocks absent). The box claim's charge in `gam_mpd::blocks::measure` is the
-//! expected excess over uniform off gates to second order, unbounded below: the fitted solution
-//! drove it to −33 nats a word. Every block is described on the exact lattice code with the
+//! Every point is measured under the corner claim (every token's error the exact KL of the program
+//! its masks run: off blocks absent). Every block is described on the exact lattice code with the
 //! harmonic charts (`gam_mpd::describe::Structured`: a reader in the operand characters of a site's
 //! reads where no decomposed site upstream moves them, a writer in the class characters of the
 //! unembedding where the readout reads the site directly), in the logit-space Gauss–Newton metric,
@@ -537,7 +535,7 @@ fn run(dir: &Path, out: &Path, observations: f64) -> Result<(), String> {
     // The points that run every block need no selection, and their decoded descriptions price
     // themselves exactly, so they come first: each site's whole map, and the planes all on.
     {
-        let coded = Coded { model: &program, sites: chosen.clone(), batches: batches.clone(), observations, samples: 16, describe: &structured, boxed: None };
+        let coded = Coded { model: &program, sites: chosen.clone(), batches: batches.clone(), observations, samples: 16, describe: &structured };
         let planes = Blocked::new(plane_libraries.clone(), plane_ranks.clone(), ones(&plane_ranks));
         let (whole, whole_bits) = on_everywhere(&coded, &planes.whole())?;
         points.push(report("whole sites", &coded, &whole, &whole_bits, &structured, None)?);
@@ -548,7 +546,7 @@ fn run(dir: &Path, out: &Path, observations: f64) -> Result<(), String> {
     // The price is calibrated on the selected planes (the point in question), then kept for every
     // selected and fitted point. Each point is written as it lands.
     let (planes_selected, planes_selected_bits) = loop {
-        let coded = Coded { model: &program, sites: chosen.clone(), batches: batches.clone(), observations, samples: 16, describe: &structured, boxed: None };
+        let coded = Coded { model: &program, sites: chosen.clone(), batches: batches.clone(), observations, samples: 16, describe: &structured };
         let (planes_selected, planes_selected_bits) = selected(&coded, Blocked::new(plane_libraries.clone(), plane_ranks.clone(), ones(&plane_ranks)))?;
         let (measured, priced, _) = rounding_error(&coded, &planes_selected)?;
         eprintln!("rounding: measured {measured:.1} bits against {priced:.1} priced");
@@ -559,7 +557,7 @@ fn run(dir: &Path, out: &Path, observations: f64) -> Result<(), String> {
         }
         structured = structured.scaled(if ratio.is_finite() { ratio } else { 1e3 });
     };
-    let coded = Coded { model: &program, sites: chosen.clone(), batches, observations, samples: 16, describe: &structured, boxed: None };
+    let coded = Coded { model: &program, sites: chosen.clone(), batches, observations, samples: 16, describe: &structured };
     points.push(report("planes, selected", &coded, &planes_selected, &planes_selected_bits, &structured, Some(plane_labels.as_slice()))?);
     write(&points, &calibrations)?;
     let svd_ranks: Vec<Vec<usize>> = svd_libraries.iter().map(|l| vec![1; l.v.nrows()]).collect();

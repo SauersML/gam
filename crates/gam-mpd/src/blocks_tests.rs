@@ -130,7 +130,7 @@ fn generic(program: &OperatorProgram, family: &FamilyInputs, observations: f64) 
 fn coded<'a>(program: &'a OperatorProgram, family: &FamilyInputs, observations: f64, describe: &'a Generic) -> Coded<'a> {
     let target = Target::every_row(program.execute(family, false).expect("executes").values[program.output].clone());
     let site = sites(program).into_iter().find(|s| s.name == "W_in").expect("the W_in site");
-    Coded { model: program, sites: vec![site], batches: vec![(family.clone(), target)], observations, samples: 8, describe, boxed: None }
+    Coded { model: program, sites: vec![site], batches: vec![(family.clone(), target)], observations, samples: 8, describe }
 }
 
 #[test]

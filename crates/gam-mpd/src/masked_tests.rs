@@ -367,46 +367,6 @@ fn sites_are_the_hidden_maps_and_their_statistics_build_an_exact_library() {
     assert!(library.exactness(&measured[0].w) < 1e-9, "{}", library.exactness(&measured[0].w));
 }
 
-/// The box claim's error is the KL expected over every off gate drawn uniform: against the mean
-/// KL of sampled gates on small pieces (where second order is accurate).
-#[test]
-fn the_box_expectation_is_the_kl_expected_over_uniform_off_gates() {
-    use super::masked::{box_excess, fisher};
-    let (mut program, family) = model();
-    // The second-order comparison needs a smooth neighborhood. ReLU gate crossings are not
-    // captured by the local Fisher, even when the factors themselves are small.
-    program.nodes[4] = Node::Pointwise { input: 3, laws: vec![Law::Identity; UNITS] };
-    let site = sites(&program).into_iter().find(|s| s.name == "W_in").expect("the W_in site");
-    let pieces = 3;
-    let library = Library {
-        v: Array2::from_shape_fn((pieces, WIDTH), |(i, j)| 0.03 * noise(700 + 7 * i + j)),
-        u: Array2::from_shape_fn((pieces, UNITS), |(i, j)| 0.03 * noise(800 + 7 * i + j)),
-        mean: Array1::zeros(WIDTH),
-    };
-    let masked = Masked::build(&program, vec![site], vec![library]).expect("builds");
-    let masks = vec![Array2::from_shape_fn((family.rows, pieces), |(r, c)| if (r + c) % 2 == 0 { 0.0 } else { 1.0 })];
-    let fam = masked.family(&family, &masks);
-    // Anchor at the masked state so adding off gates has nonnegative excess. Against an
-    // unrelated teacher it may instead improve KL, making a positivity assertion invalid.
-    let target = Target::every_row(masked.program.execute(&fam, false).expect("anchor").values[masked.program.output].clone());
-    let (kl, trace, cotangent) = forward(&masked, &fam, &target).expect("forward");
-    let fishers: Vec<Array2<f64>> =
-        fisher(&masked, &fam, &trace, &target, 256, 11, true).expect("fisher").into_iter().map(|(_, f)| f.expect("written")).collect();
-    let (excess, _) = box_excess(&masked, &fam, &trace, &masks, cotangent, &fishers, false).expect("excess");
-    let draws = 400;
-    let mut sampled = 0.0;
-    for d in 0..draws {
-        let gates = vec![Array2::from_shape_fn((family.rows, pieces), |(r, c)| {
-            if masks[0][[r, c]] > 0.0 { 1.0 } else { 0.5 * (noise(31 * d + 7 * r + c + 100_000) + 1.0) }
-        })];
-        sampled += forward(&masked, &masked.family(&family, &gates), &target).expect("forward").0.sum();
-    }
-    let sampled_excess = sampled / draws as f64 - kl.sum();
-    let predicted = excess.sum();
-    assert!(predicted > 0.0 && sampled_excess > 0.0, "{predicted} against {sampled_excess}");
-    assert!((predicted - sampled_excess).abs() <= 0.3 * sampled_excess, "{predicted} against {sampled_excess}");
-}
-
 /// Two-input sequences through causal attention: the second input reads the first's values, so a
 /// mask on the first changes the second's KL. Selection accepts per sequence, on exactly the masks
 /// it commits, so its result never codes worse than its start and its KL is that of its masks.
@@ -665,15 +625,14 @@ fn a_box_step_is_judged_on_the_contribution_charge() {
     assert!(judged > 0, "no step was taken");
 }
 
-/// The box claim's error is the worst over the box points it evaluates
-/// ([`super::masked::box_excess_at`]), so it is never below the uniform expectation
-/// ([`super::masked::box_excess`], the previous test's term) nor below zero (the masks themselves
-/// are a point), and never below any layer's vertex (that layer's sites at the masks, the other
-/// layers' gates all on), whose exact KL is evaluated here independently. With every gate on the
-/// box is one point, the masks, and the error is zero.
+/// The attack on the box claim takes the worst of the box points it evaluates
+/// ([`super::masked::box_excess_at`]), so it is never below zero (the masks themselves are a point)
+/// nor below any layer's vertex (that layer's sites at the masks, the other layers' gates all on),
+/// whose exact KL is evaluated here independently. With every gate on the box is one point, the
+/// masks, and the excess is zero.
 #[test]
-fn the_box_claims_error_is_its_worst_point_at_least_the_expectation() {
-    use super::masked::{box_excess_at, expected_box_excess_at, fisher, matrix, score_only};
+fn the_box_attack_is_at_least_every_vertex_and_nothing_with_every_gate_on() {
+    use super::masked::{box_excess_at, matrix, score_only};
     let (mut program, family) = model();
     // A second hidden map, `W_mid` on the residual stream before `W_in`: two sites, two layers.
     let residual = Interface::native(WIDTH).expect("interface");
@@ -710,18 +669,14 @@ fn the_box_claims_error_is_its_worst_point_at_least_the_expectation() {
     let target = Target::every_row(program.execute(&family, false).expect("executes").values[program.output].clone());
     let masks: Vec<Array2<f64>> = (0..2).map(|k| Array2::from_shape_fn((family.rows, pieces), |(r, c)| if (r + c + k) % 2 == 0 { 0.0 } else { 1.0 })).collect();
     let fam = masked.family(&family, &masks);
-    let (_, trace, _) = forward(&masked, &fam, &target).expect("forward");
-    let fishers: Vec<Array2<f64>> =
-        fisher(&masked, &fam, &trace, &target, 64, 11, true).expect("fisher").into_iter().map(|(_, f)| f.expect("written")).collect();
     let corner = score_only(&masked, &fam, &target).expect("kl");
-    let expected = expected_box_excess_at(&masked, &family, &target, &masks, &fishers).expect("expected");
     let error = box_excess_at(&masked, &family, &target, &masks).expect("error");
-    // Without a layout every input is its own sequence, so each row is charged its own worst point.
+    // Without a layout every input is its own sequence, so each row takes its own worst point.
     let close = |a: f64, b: f64| a >= b - 1e-12 * (1.0 + b.abs());
     let mut above = 0;
     for r in 0..family.rows {
-        assert!(error[r] >= expected[r].max(0.0), "row {r}: error {} below the expectation {} or zero", error[r], expected[r]);
-        above += usize::from(error[r] > expected[r].max(0.0));
+        assert!(error[r] >= 0.0, "row {r}: error {} below the masks' own point", error[r]);
+        above += usize::from(error[r] > 0.0);
     }
     for layer in 0..2 {
         let vertex: Vec<Array2<f64>> = (0..2).map(|k| if k == layer { masks[k].clone() } else { Array2::ones(masks[k].dim()) }).collect();
@@ -730,18 +685,18 @@ fn the_box_claims_error_is_its_worst_point_at_least_the_expectation() {
             assert!(close(error[r], kl_vertex[r] - corner[r]), "row {r}: error {} below layer {layer}'s vertex {}", error[r], kl_vertex[r] - corner[r]);
         }
     }
-    assert!(above > 0, "no box point beyond the expectation: the test would not tell the worst case from it");
+    assert!(above > 0, "no box point beyond the masks: the test would not tell the attack from the corner");
     let on: Vec<Array2<f64>> = masks.iter().map(|m| Array2::ones(m.dim())).collect();
     let none = box_excess_at(&masked, &family, &target, &on).expect("all on");
     // Zero up to the rounding of the points' own forwards (they run by other routes than the masks').
     assert!(none.iter().zip(corner.iter()).all(|(e, k)| e.abs() <= 1e-12 * (1.0 + k.abs())), "with every gate on the error is the masks' own: {none:?}");
 }
 
-/// Under the box claim too, a selection resumed between any two rounds from the state it showed
-/// its checkpoint (the masks' excess among it) ends exactly as the uninterrupted one.
+/// A selection resumed between any two rounds from the state it showed its checkpoint ends exactly
+/// as the uninterrupted one.
 #[test]
-fn a_resumed_box_selection_is_the_uninterrupted_one() {
-    use super::masked::{Coder, Progress, Resume, Round, fisher, select_resumable};
+fn a_resumed_selection_is_the_uninterrupted_one() {
+    use super::masked::{Coder, Progress, Resume, Round, select_resumable};
     let (program, family) = model();
     let site = sites(&program).into_iter().find(|s| s.name == "W_in").expect("the W_in site");
     let pieces = UNITS + 2;
@@ -753,10 +708,6 @@ fn a_resumed_box_selection_is_the_uninterrupted_one() {
     let masked = Masked::build(&program, vec![site], vec![library]).expect("builds");
     let target = Target::every_row(program.execute(&family, false).expect("executes").values[program.output].clone());
     let start = vec![Array2::from_shape_fn((family.rows, pieces), |(r, c)| if (r + c) % 3 == 0 { 0.0 } else { 1.0 })];
-    let fam = masked.family(&family, &start);
-    let (_, trace, _) = forward(&masked, &fam, &target).expect("forward");
-    let fishers: Vec<Array2<f64>> =
-        fisher(&masked, &fam, &trace, &target, 64, 11, true).expect("fisher").into_iter().map(|(_, f)| f.expect("written")).collect();
     let coder = Coder::ran(vec![Array1::from_elem(pieces, 3.0)], family.rows);
     let run = |resume: Option<Resume>| -> (Vec<Array2<f64>>, Array1<f64>, Vec<Resume>) {
         let mut states = Vec::new();
@@ -765,7 +716,7 @@ fn a_resumed_box_selection_is_the_uninterrupted_one() {
             Ok(())
         };
         let (masks, kl) =
-            select_resumable(&masked, &family, &target, start.clone(), resume, &coder, 256.0, 2, Some(&fishers), &mut |_: &Round<'_>| Ok(()), &mut checkpoint)
+            select_resumable(&masked, &family, &target, start.clone(), resume, &coder, 256.0, 2, &mut |_: &Round<'_>| Ok(()), &mut checkpoint)
                 .expect("selection");
         (masks, kl, states)
     };

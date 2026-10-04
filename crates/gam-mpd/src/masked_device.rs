@@ -48,19 +48,6 @@ pub struct Accelerated {
     proposal: Arithmetic,
     blocks: Vec<ColumnBlocks>,
     ranks: Vec<Vec<usize>>,
-    /// What the box claim's excess reads of the library and the written Fishers, resident, with
-    /// the `U` operators and the Fishers' fingerprint they were computed from.
-    box_terms: std::sync::Mutex<Option<(Vec<std::sync::Arc<super::operator_program::Operator>>, u64, std::sync::Arc<Vec<SiteTerms>>)>>,
-}
-
-/// One site's resident box terms: `U` (C × d_out), the written Fisher `F`, `U F`, and each piece's
-/// own weight `u_c F u_cᵀ` as a column and as a row.
-struct SiteTerms {
-    u: Tensor,
-    f: Tensor,
-    uf: Tensor,
-    own: Tensor,
-    own_row: Tensor,
 }
 
 /// A target's logits held on the device, and its scored rows.
@@ -115,7 +102,7 @@ impl Accelerated {
         if !device.float64() {
             program.set_arithmetic(proposal);
         }
-        Ok(Self { program, proposal, blocks, ranks, box_terms: std::sync::Mutex::new(None) })
+        Ok(Self { program, proposal, blocks, ranks })
     }
 
     /// Whether its forward and KL are float64, so they may decide (module note).
@@ -485,152 +472,6 @@ impl Accelerated {
             out.push(covariance);
         }
         Ok(out)
-    }
-
-    /// `masked::box_excess` of the state: per input what the box claim adds to the masks' own KL,
-    /// in float64 (it decides a step's backtracking; in the proposal arithmetic on a device that
-    /// does not decide), and with `gradients` its gradients in every site's `V` and `U` in the
-    /// proposal arithmetic. Refused for a site gated in blocks.
-    pub fn box_excess(
-        &self,
-        masked: &Masked,
-        state: &State,
-        masks: &[Array2<f64>],
-        fishers: &[Array2<f64>],
-        gradients: bool,
-    ) -> Result<(Array1<f64>, Option<BoxGradients>), String> {
-        let d = self.program.device();
-        let rows = state.trace.rows;
-        if let Some(k) = (0..masked.sites.len()).find(|k| !masked.is_rank_one(*k)) {
-            return Err(format!("device: the box claim of {}, gated in blocks", masked.sites[k].name));
-        }
-        let keep: Vec<usize> = masked.sites.iter().flat_map(|s| s.writes.iter().copied()).collect();
-        let seed = d.copy(state.cotangent.as_ref().ok_or("device: prepare the state's gradient first")?).map_err(error)?;
-        // The excess decides, so the gradient it reads is float64 too (where the device has it).
-        let exact = if self.decides() { Arithmetic::F64 } else { self.proposal };
-        let back = self.program.vjp(&state.trace, seed, &keep, exact)?;
-        let ones = |n: usize, m: usize| d.upload_vec(n, m, vec![1.0; n * m]).map_err(error);
-        let ones_rows = ones(rows, 1)?;
-        let mut excess = d.zeros(rows, 1).map_err(error)?;
-        let mut out = Vec::new();
-        let terms = self.box_terms(masked, fishers, exact)?;
-        for (k, site) in masked.sites.iter().enumerate() {
-            let pieces = masked.pieces(k);
-            let SiteTerms { u, f, uf, own: own_weight, own_row } = &terms[k];
-            let d_out = u.cols();
-            // The off pieces' coordinates `a = z ⊙ (1 − m)` and their output `S = a U`.
-            let off = d.upload(masks[k].mapv(|m| 1.0 - m).view()).map_err(error)?;
-            let mut a = d.zeros(rows, pieces).map_err(error)?;
-            d.hadamard(&mut a, state.trace.value(masked.z[k])?, &off, false).map_err(error)?;
-            let mut s_out = d.zeros(rows, d_out).map_err(error)?;
-            d.gemm(&mut s_out, 1.0, &a, Op::N, u, Op::N, 0.0, exact).map_err(error)?;
-            // The KL's gradient at the written values, joined in the site's column order (read in
-            // place for a site that writes one node).
-            let joined;
-            let g: &Tensor = match (site.writes.as_slice(), site.writes.first().and_then(|w| back.get(w))) {
-                ([_], Some(g)) => g,
-                _ => {
-                    let mut written = Vec::new();
-                    for w in &site.writes {
-                        let width = state.trace.value(*w)?.cols();
-                        written.push(match back.get(w) {
-                            Some(g) => d.download(g).map_err(error)?,
-                            None => Array2::zeros((rows, width)),
-                        });
-                    }
-                    let views: Vec<_> = written.iter().map(|w| w.view()).collect();
-                    joined = d.upload(ndarray::concatenate(Axis(1), &views).map_err(|e| e.to_string())?.view()).map_err(error)?;
-                    &joined
-                }
-            };
-            let mut sf = d.zeros(rows, d_out).map_err(error)?;
-            d.gemm(&mut sf, 1.0, &s_out, Op::N, f, Op::N, 0.0, exact).map_err(error)?;
-            // ½ gᵀS + ⅛ SᵀF S + 1/24 Σ_off a_c² u_c F u_cᵀ, per input.
-            let ones_out = ones(d_out, 1)?;
-            let mut product = d.zeros(rows, d_out).map_err(error)?;
-            d.hadamard(&mut product, g, &s_out, false).map_err(error)?;
-            d.gemm(&mut excess, 0.5, &product, Op::N, &ones_out, Op::N, 1.0, exact).map_err(error)?;
-            d.hadamard(&mut product, &sf, &s_out, false).map_err(error)?;
-            d.gemm(&mut excess, 0.125, &product, Op::N, &ones_out, Op::N, 1.0, exact).map_err(error)?;
-            drop((product, s_out));
-            let mut aa = d.zeros(rows, pieces).map_err(error)?;
-            d.hadamard(&mut aa, &a, &a, false).map_err(error)?;
-            d.gemm(&mut excess, 1.0 / 24.0, &aa, Op::N, own_weight, Op::N, 1.0, exact).map_err(error)?;
-            if !gradients {
-                continue;
-            }
-            // ∂/∂S = ½ g + ¼ S F; ∂/∂a = (∂/∂S) Uᵀ + a ⊙ (u_c F u_cᵀ)/12.
-            let mut g_s = d.zeros(rows, d_out).map_err(error)?;
-            d.axpy(&mut g_s, 0.5, g).map_err(error)?;
-            d.axpy(&mut g_s, 0.25, &sf).map_err(error)?;
-            drop(sf);
-            let mut g_a = d.zeros(rows, pieces).map_err(error)?;
-            d.gemm(&mut g_a, 1.0, &g_s, Op::N, u, Op::T, 0.0, self.proposal).map_err(error)?;
-            let mut own_a = d.zeros(rows, pieces).map_err(error)?;
-            d.scale_columns(&mut own_a, &a, own_row, false).map_err(error)?;
-            d.axpy(&mut g_a, 1.0 / 12.0, &own_a).map_err(error)?;
-            drop(own_a);
-            // ∂/∂U = aᵀ ∂/∂S + (Σ_inputs a_c²)/12 · u_c F per piece.
-            let mut u_gradient = d.zeros(pieces, d_out).map_err(error)?;
-            d.gemm(&mut u_gradient, 1.0, &a, Op::T, &g_s, Op::N, 0.0, self.proposal).map_err(error)?;
-            let mut weight = d.zeros(pieces, 1).map_err(error)?;
-            d.gemm(&mut weight, 1.0 / 12.0, &aa, Op::T, &ones_rows, Op::N, 0.0, exact).map_err(error)?;
-            let mut spread = d.zeros(pieces, d_out).map_err(error)?;
-            d.gemm(&mut spread, 1.0, &weight, Op::N, &ones(1, d_out)?, Op::N, 0.0, exact).map_err(error)?;
-            d.hadamard(&mut u_gradient, &spread, uf, true).map_err(error)?;
-            drop((spread, aa, a));
-            // ∂/∂V = ((∂/∂a) ⊙ (1 − m))ᵀ x, one block per read node.
-            let mut g_off = d.zeros(rows, pieces).map_err(error)?;
-            d.hadamard(&mut g_off, &g_a, &off, false).map_err(error)?;
-            let mut v_blocks = Vec::new();
-            for read in &site.reads {
-                let x = state.trace.value(*read)?;
-                let mut block = d.zeros(pieces, x.cols()).map_err(error)?;
-                d.gemm(&mut block, 1.0, &g_off, Op::T, x, Op::N, 0.0, self.proposal).map_err(error)?;
-                v_blocks.push(d.download(&block).map_err(error)?);
-            }
-            let views: Vec<_> = v_blocks.iter().map(|b| b.view()).collect();
-            let v_gradient = ndarray::concatenate(Axis(1), &views).map_err(|e| e.to_string())?;
-            out.push((v_gradient, d.download(&u_gradient).map_err(error)?));
-        }
-        let excess = d.download(&excess).map_err(error)?.column(0).to_owned();
-        Ok((excess, gradients.then_some(out)))
-    }
-
-    /// The box claim's resident terms for the current library in `fishers` (as `Masked::box_terms`
-    /// on the CPU), computed in `arithmetic` once while neither changes.
-    fn box_terms(&self, masked: &Masked, fishers: &[Array2<f64>], arithmetic: Arithmetic) -> Result<std::sync::Arc<Vec<SiteTerms>>, String> {
-        let ops = masked.u_operators();
-        let print = super::masked::fisher_print(fishers);
-        let mut cache = self.box_terms.lock().map_err(|_| "device: a poisoned box-term cache".to_string())?;
-        if let Some((held, held_print, terms)) = &*cache
-            && *held_print == print
-            && held.len() == ops.len()
-            && held.iter().zip(&ops).all(|(a, b)| std::sync::Arc::ptr_eq(a, b))
-        {
-            return Ok(std::sync::Arc::clone(terms));
-        }
-        *cache = None;
-        let d = self.program.device();
-        let mut sites = Vec::new();
-        for k in 0..masked.sites.len() {
-            let u_host = masked.u(k)?;
-            let (pieces, d_out) = u_host.dim();
-            let u = d.upload(u_host.view()).map_err(error)?;
-            let f = d.upload(fishers[k].view()).map_err(error)?;
-            let mut uf = d.zeros(pieces, d_out).map_err(error)?;
-            d.gemm(&mut uf, 1.0, &u, Op::N, &f, Op::N, 0.0, arithmetic).map_err(error)?;
-            let mut ufu = d.zeros(pieces, d_out).map_err(error)?;
-            d.hadamard(&mut ufu, &uf, &u, false).map_err(error)?;
-            let mut own = d.zeros(pieces, 1).map_err(error)?;
-            let ones = d.upload_vec(d_out, 1, vec![1.0; d_out]).map_err(error)?;
-            d.gemm(&mut own, 1.0, &ufu, Op::N, &ones, Op::N, 0.0, arithmetic).map_err(error)?;
-            let own_row = d.upload(d.download(&own).map_err(error)?.t()).map_err(error)?;
-            sites.push(SiteTerms { u, f, uf, own, own_row });
-        }
-        let terms = std::sync::Arc::new(sites);
-        *cache = Some((ops, print, std::sync::Arc::clone(&terms)));
-        Ok(terms)
     }
 
     /// `step_pieces`' curvature along a direction: `Σ_rows` of the output Fisher's quadratic form
