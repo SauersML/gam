@@ -742,9 +742,12 @@ pub struct Scored {
 
 /// Every episode of `spec` on `passages` (token rows), the explanation's program against the
 /// native model's (`None` scores the native model as its own explanation, a check of the
-/// evaluator), `tile` output rows at a time; episodes run in parallel.
+/// evaluator), `tile` output rows at a time; episodes run in parallel. A donor passage runs once
+/// per program, recording every state any episode mixing toward it reads.
 pub fn evaluate(decoder: &Decoder, spec: &Spec, passages: &[Vec<u32>], explanation: Option<&Explanation<'_>>, tile: usize) -> Result<Vec<Scored>, String> {
     use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let started = std::time::Instant::now();
     let all_rows: Vec<usize> = (0..spec.rows).collect();
     let named: std::collections::BTreeSet<usize> = spec.episodes.iter().map(|e| e.passage).collect();
     let clean: BTreeMap<usize, Forward> = named
@@ -754,44 +757,59 @@ pub fn evaluate(decoder: &Decoder, spec: &Spec, passages: &[Vec<u32>], explanati
             (p, decoder.forward(&passages[p], &mut native, &all_rows))
         })
         .collect();
+    let mut wanted: BTreeMap<usize, Vec<(usize, usize, bool)>> = BTreeMap::new();
+    for e in &spec.episodes {
+        let keys: Vec<(usize, usize, bool)> = e.actions.iter().filter_map(Action::donor_state).collect();
+        if keys.is_empty() {
+            continue;
+        }
+        let read = wanted.entry(e.donor.ok_or_else(|| format!("{}: a mix without a donor", e.id))?).or_default();
+        read.extend(keys.into_iter().filter(|k| !read.contains(k)).collect::<Vec<_>>());
+    }
+    let record = |maps: Maps<'_>, d: usize, keys: &[(usize, usize, bool)]| -> Result<Donor, String> {
+        let mut program = Program::new(maps, &[], None);
+        program.record = keys.iter().map(|k| (*k, None)).collect();
+        decoder.forward(&passages[d], &mut program, &[]);
+        Ok(Donor { states: program.record.into_iter().map(|(k, v)| v.map(|v| (k, v)).ok_or("donor state not reached")).collect::<Result<_, _>>()? })
+    };
+    let native_donors: BTreeMap<usize, Donor> = wanted.par_iter().map(|(d, keys)| Ok((*d, record(Maps::Native(decoder), *d, keys)?))).collect::<Result<_, String>>()?;
+    let own_donors: BTreeMap<usize, Donor> = match explanation {
+        Some(x) => wanted
+            .par_iter()
+            .map(|(d, keys)| {
+                let mut rule = (x.selector)(&format!("clean/{d}"))?;
+                Ok((*d, record(Maps::Units { decoder, libraries: x.libraries, selector: rule.as_mut() }, *d, keys)?))
+            })
+            .collect::<Result<_, String>>()?,
+        None => BTreeMap::new(),
+    };
+    let none = Donor::default();
+    let done = AtomicUsize::new(0);
     spec.episodes
         .par_iter()
         .map(|e| -> Result<Scored, String> {
-            let keys: Vec<(usize, usize, bool)> = e.actions.iter().filter_map(Action::donor_state).collect();
-            let donor_of = |maps: Maps<'_>| -> Result<Donor, String> {
-                if keys.is_empty() {
-                    return Ok(Donor::default());
-                }
-                let d = e.donor.ok_or_else(|| format!("{}: a mix without a donor", e.id))?;
-                let mut program = Program::new(maps, &[], None);
-                program.record = keys.iter().map(|k| (*k, None)).collect();
-                decoder.forward(&passages[d], &mut program, &[]);
-                Ok(Donor { states: program.record.into_iter().map(|(k, v)| v.map(|v| (k, v)).ok_or("donor state not reached")).collect::<Result<_, _>>()? })
-            };
-            let native_donor = donor_of(Maps::Native(decoder))?;
-            let mut native = Program::new(Maps::Native(decoder), &e.actions, Some(&native_donor));
+            let native_donor = e.donor.and_then(|d| native_donors.get(&d)).unwrap_or(&none);
+            let own_donor = e.donor.and_then(|d| own_donors.get(&d)).unwrap_or(&none);
+            let mut native = Program::new(Maps::Native(decoder), &e.actions, Some(native_donor));
             let native_forward = decoder.forward(&passages[e.passage], &mut native, &e.interface_rows);
             let (explained, selected) = match explanation {
                 Some(x) => {
-                    let own_donor = match e.donor {
-                        Some(d) if !keys.is_empty() => {
-                            let mut rule = (x.selector)(&format!("clean/{d}"))?;
-                            donor_of(Maps::Units { decoder, libraries: x.libraries, selector: rule.as_mut() })?
-                        }
-                        Some(_) | None => Donor::default(),
-                    };
                     let mut rule = (x.selector)(&e.id)?;
-                    let mut program = Program::new(Maps::Units { decoder, libraries: x.libraries, selector: rule.as_mut() }, &e.actions, Some(&own_donor));
+                    let mut program = Program::new(Maps::Units { decoder, libraries: x.libraries, selector: rule.as_mut() }, &e.actions, Some(own_donor));
                     let forward = decoder.forward(&passages[e.passage], &mut program, &e.interface_rows);
                     (forward, program.selected as f64 / spec.rows as f64)
                 }
                 None => {
-                    let mut program = Program::new(Maps::Native(decoder), &e.actions, Some(&native_donor));
+                    let mut program = Program::new(Maps::Native(decoder), &e.actions, Some(native_donor));
                     (decoder.forward(&passages[e.passage], &mut program, &e.interface_rows), f64::NAN)
                 }
             };
             let from = e.actions.iter().map(Action::first_row).min().unwrap_or(0);
             let scores = score(decoder, &native_forward, &explained, &clean[&e.passage], &e.interface_rows, from, tile);
+            let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
+            if finished % 100 == 0 {
+                log::info!("{finished}/{} episodes, {:.0}s", spec.episodes.len(), started.elapsed().as_secs_f64());
+            }
             Ok(Scored { id: e.id.clone(), group: e.group.clone(), passage: e.passage, from_row: from, selected_per_row: selected, scores })
         })
         .collect()

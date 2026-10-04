@@ -186,6 +186,7 @@ fn score_fitted(export: &Path, decoder: &Decoder, spec: &Spec, passages: &[Vec<u
 }
 
 fn main() -> Result<(), String> {
+    gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
     let usage = "mpd_counterfactual_2951 EXPORT_DIR SPEC.json {native|units:LIBRARY_DIR:SELECTIONS_DIR|fitted:LIBRARY_DIR} OUT.json";
     let export = PathBuf::from(args.get(1).ok_or(usage)?);

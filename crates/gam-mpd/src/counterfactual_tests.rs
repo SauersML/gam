@@ -1,6 +1,6 @@
 use super::counterfactual::{
-    Action, Decoder, Donor, FittedRule, InputChange, Library, Maps, OutputChange, Program, Rows, Selection, Selector, fitted_libraries, fitted_sites, rule_price, score,
-    site_index, site_name,
+    Action, Decoder, Donor, Episode, Explanation as Explained, FittedRule, InputChange, Library, Maps, OutputChange, Program, Rows, Selection, Selector, Spec, evaluate,
+    fitted_libraries, fitted_sites, rule_price, score, site_index, site_name,
 };
 use super::explanation::{Explanation, Fitted, Replacement, in_execution_order};
 use super::import::import_language_model;
@@ -294,5 +294,52 @@ fn the_rules_price_is_its_lowest_selection_keeping_precision() {
     assert!(price.precision == 0 || !same(price.precision - 1), "{price:?}");
     assert_eq!(price.binding.is_some(), price.precision > 0, "{price:?}");
     assert_eq!(reads.1[0].slice(s![.., 0]).len(), tokens.len());
+    std::fs::remove_dir_all(&dir).expect("remove the temporary export");
+}
+
+/// One selection for every episode.
+fn every_episode<'a>(selection: Selection) -> impl Fn(&str) -> Result<Box<dyn Selector + 'a>, String> + Sync + 'a {
+    move |_: &str| Ok(Box::new(selection.clone()))
+}
+
+#[test]
+fn every_episode_of_an_exact_explanation_scores_zero_and_the_native_effect_is_measured() {
+    let dir = tiny_export("evaluate");
+    let decoder = Decoder::from_export(&dir).expect("decoder");
+    let libraries = coordinate_libraries(&decoder);
+    let rows = 9;
+    let passages: Vec<Vec<u32>> = (0..3).map(|p| (0..rows).map(|t| ((t * (p + 3) + p) % 11) as u32).collect()).collect();
+    let episode = |id: &str, passage: usize, donor: Option<usize>, actions: Vec<Action>| Episode {
+        id: id.to_string(),
+        group: id.split('/').next().unwrap_or(id).to_string(),
+        passage,
+        donor,
+        interface_rows: vec![4, 7],
+        actions,
+    };
+    let spec = Spec {
+        rows,
+        episodes: vec![
+            episode("clean/0", 0, None, vec![]),
+            episode("clean/1", 1, None, vec![]),
+            episode("clean/2", 2, None, vec![]),
+            // Two episodes mixing toward one donor at different sites: the donor runs once with both.
+            episode("mix/0", 0, Some(1), vec![Action::Input { site: site_index(0, 2), change: InputChange::Mix { row: 4, alpha: 1.0 } }]),
+            episode("mix/2", 2, Some(1), vec![Action::Output { site: site_index(1, 4), change: OutputChange::Mix { row: 5, alpha: 0.5 } }]),
+            episode("scale/1", 1, None, vec![Action::Input { site: site_index(1, 5), change: InputChange::Scale { rows: Rows::All, cols: (2, 5), scale: 4.0 } }]),
+        ],
+    };
+    let native = evaluate(&decoder, &spec, &passages, None, 4).expect("native");
+    let all = all_on(&libraries, rows);
+    let exact = evaluate(&decoder, &spec, &passages, Some(&Explained { libraries: &libraries, selector: Box::new(every_episode(all)) }), 4).expect("exact explanation");
+    for (a, b) in native.iter().zip(&exact) {
+        assert_eq!(a.id, b.id);
+        for s in [&a.scores, &b.scores] {
+            assert!(s.kl.abs() < 1e-12 && s.interface_kl.iter().all(|k| k.abs() < 1e-12), "{}: {s:?}", a.id);
+        }
+        assert!((a.scores.native_effect - b.scores.native_effect).abs() < 1e-15, "{}", a.id);
+        assert_eq!(a.scores.native_effect > 1e-9, !a.id.starts_with("clean"), "{}: {:?}", a.id, a.scores);
+    }
+    assert_eq!(exact[3].from_row, 4);
     std::fs::remove_dir_all(&dir).expect("remove the temporary export");
 }
