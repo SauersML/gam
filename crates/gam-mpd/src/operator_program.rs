@@ -750,17 +750,6 @@ impl Operator {
         operator_bits(self)
     }
 
-    /// The largest magnitude among the operator's reals.
-    pub fn largest_real(&self) -> f64 {
-        let fold = |m: &Array2<f64>| m.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
-        match &self.body {
-            OperatorBody::Identity => 0.0,
-            OperatorBody::Dense { values, .. } => fold(values),
-            OperatorBody::LowRank { left, right, .. } => fold(left).max(fold(right)),
-            OperatorBody::Diagonal { values, .. } => values.iter().fold(0.0_f64, |acc, v| acc.max(v.abs())),
-        }
-    }
-
     /// The identity on `interface`.
     pub fn identity(name: impl Into<String>, interface: Interface) -> Self {
         Self {
@@ -4106,13 +4095,6 @@ pub fn exact_precision(values: impl IntoIterator<Item = f64>) -> Result<Declared
     // A subnormal's lattice is finer than any declarable one: the finest declarable holds it to
     // within half a step.
     Ok(DeclaredPrecision::new(finest.min(-(f64::MIN_EXP - 1))).map_err(ProgramError::Code)?.within_range(largest))
-}
-
-/// The lattice whose half-step does not exceed `band`: `p = ⌈−log₂(2·band)⌉`, capped as in
-/// [`exact_precision`] by the largest value.
-pub fn band_precision(band: f64, largest: f64) -> Result<DeclaredPrecision, ProgramError> {
-    let wanted = if band > 0.0 { (-(2.0 * band).log2()).ceil() as i32 } else { 52 };
-    Ok(DeclaredPrecision::new(wanted.min(-(f64::MIN_EXP - 1))).map_err(ProgramError::Code)?.within_range(largest))
 }
 
 /// `values` as an owned column operator body input: `n × 1`.
