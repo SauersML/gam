@@ -123,6 +123,8 @@ fn main()->Result<(),String>{
     let native=if mode.mapped{imported.program.clone()}else{split_sites(&imported.program)?};
     let base=Artifact::native(&native)?.f32_literals()?;
     let bank=if mode.mapped{LazyBank::Mapped(MappedCopyResidualBank::new(&base,&mode.layers,&mode.ranks,max_bank)?)}else{LazyBank::Vpd(CopyResidualBank::new(&base,&layer_nodes(&native,layers)?,heads/kv,&mode.ranks,max_bank)?)};
+    let choices=bank.choices();
+    if choices.len().checked_add(1)!=Some(complete){return Err("mapped inventory differs from declared export cardinality".into());}
     let native_codec=if codec_bytes==0{None}else{Some(NativeOperatorCodec::new(&base.program,codec_bytes).map_err(|e|e.to_string())?)};
     let run_passages=if let Some(spec)=&language_spec{passages(export,spec.rows)?}else{Vec::new()};
     let mut language_run=if let (Some(decoder),Some(spec))=(&decoder,&language_spec){Some(LanguageRun::new(decoder,&native,spec,&run_passages,1)?)}else{None};
@@ -136,9 +138,9 @@ fn main()->Result<(),String>{
     }
     let device_run=if let (Some(run),Some(device))=(&family_run,&device){Some(DeviceFamilyRun::new(run,device.clone(),trace_bytes)?)}else{None};
     let run:&dyn RunCheck=if let Some(run)=&device_run{run}else if let Some(run)=&family_run{run}else{language_run.as_ref().ok_or("missing Run backend")?};
-    let mut cache=CostCache::default();let mut records:Vec<Value>=bank.choices().into_iter().enumerate().map(|(i,c)|json!({"index":i+1,"choice":c,"cost_bits":null,"cost_lower_bound":0,"states":vec!["Unevaluated";grid.len()]})).collect();
+    let mut cache=CostCache::default();let mut records:Vec<Value>=choices.iter().enumerate().map(|(i,c)|json!({"index":i+1,"choice":c,"cost_bits":null,"cost_lower_bound":0,"states":vec!["Unevaluated";grid.len()]})).collect();
     records.insert(0,json!({"index":0,"label":"native","cost_bits":null,"cost_lower_bound":0,"states":vec!["Unevaluated";grid.len()]}));
-    let choices=bank.choices();let mut journal=std::fs::OpenOptions::new().create_new(true).write(true).open(out.join("ASSESSMENTS.jsonl")).map_err(|e|e.to_string())?;
+    let mut journal=std::fs::OpenOptions::new().create_new(true).write(true).open(out.join("ASSESSMENTS.jsonl")).map_err(|e|e.to_string())?;
     for index in std::iter::once(0).chain((start..start+count).filter(|&i|i!=0)){
         let t=Instant::now();eprintln!("candidate {index}/{complete}: start");
         let result=(||->Result<(),String>{
