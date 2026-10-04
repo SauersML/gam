@@ -1,0 +1,25 @@
+{
+  "source_parent_commit": "37a0b033ed3fe81889b535ddfb395890ecb93e0c",
+  "example_source_sha256": "dae979858b47ad7a39af3f4dc62cd38c1a09ef5d394f6a9423a60847505fb9a5",
+  "binary_sha256": "8d51f2add6c6b035d94ba975ac3b1789a88c960f4e49273ef3119f5d09076bbf",
+  "binary_path": "/Users/user/gam/.buildd/bin/mpd_native_gelu_pairs_2951-release-7c1756089c59",
+  "memory_lease_GiB": 16,
+  "runtime_backend": "Mac CPU, faer fast_abt; no GPU",
+  "wall_seconds": 5.83,
+  "user_seconds": 10.16,
+  "system_seconds": 0.85,
+  "maximum_resident_set_bytes": 1377976320,
+  "peak_memory_footprint_bytes": 1373717968,
+  "protocol": "bench/native_relations_2951/PROTOCOL.json",
+  "top_k": 64,
+  "unordered_signed_pairs": 37736448,
+  "retained_directed_candidates": 1024,
+  "panels": [
+    "train4096",
+    "eval1024"
+  ],
+  "selection": "weights-only geometry; heldout metrics do not select proposals",
+  "result_scope": "CPU finite-row diagnostics, no artifact cost, acceptance, interventions or recovered algorithm claim",
+  "published_example_commit": "3fc4265cf62b4ea295d27dfa2a3d535a38363c28",
+  "tests": "2 working and committed HEAD example regressions PASS; release build and ban scan PASS"
+}

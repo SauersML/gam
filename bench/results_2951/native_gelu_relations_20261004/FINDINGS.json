@@ -1,0 +1,184 @@
+{
+  "generated_utc": "2026-10-04T22:25:33.339114+00:00",
+  "source_commit": "3fc4265cf62b4ea295d27dfa2a3d535a38363c28",
+  "prospective_protocol": "bench/native_relations_2951/PROTOCOL.json",
+  "execution": {
+    "source_parent_commit": "37a0b033ed3fe81889b535ddfb395890ecb93e0c",
+    "example_source_sha256": "dae979858b47ad7a39af3f4dc62cd38c1a09ef5d394f6a9423a60847505fb9a5",
+    "binary_sha256": "8d51f2add6c6b035d94ba975ac3b1789a88c960f4e49273ef3119f5d09076bbf",
+    "binary_path": "/Users/user/gam/.buildd/bin/mpd_native_gelu_pairs_2951-release-7c1756089c59",
+    "memory_lease_GiB": 16,
+    "runtime_backend": "Mac CPU, faer fast_abt; no GPU",
+    "wall_seconds": 5.83,
+    "user_seconds": 10.16,
+    "system_seconds": 0.85,
+    "maximum_resident_set_bytes": 1377976320,
+    "peak_memory_footprint_bytes": 1373717968,
+    "protocol": "bench/native_relations_2951/PROTOCOL.json",
+    "top_k": 64,
+    "unordered_signed_pairs": 37736448,
+    "retained_directed_candidates": 1024,
+    "panels": [
+      "train4096",
+      "eval1024"
+    ],
+    "selection": "weights-only geometry; heldout metrics do not select proposals",
+    "result_scope": "CPU finite-row diagnostics, no artifact cost, acceptance, interventions or recovered algorithm claim",
+    "published_example_commit": "3fc4265cf62b4ea295d27dfa2a3d535a38363c28",
+    "tests": "2 working and committed HEAD example regressions PASS; release build and ban scan PASS"
+  },
+  "layers": [
+    {
+      "layer": 0,
+      "minimum_reader_geometry_by_sign": [
+        {
+          "sign": -1.0,
+          "min": 0.74901253999361,
+          "unordered_pairs": 4717056
+        },
+        {
+          "sign": 1.0,
+          "min": 0.341737268120974,
+          "unordered_pairs": 4717056
+        }
+      ],
+      "minimum_native_oddness_over_activity_in_training_bank": 0.9788026031491952,
+      "training_selected_linear_candidate": {
+        "source_unit": 2825,
+        "other_unit": 771,
+        "selection": "Smallest training maximum linear-replacement error divided by maximum pair-removal error; no evaluation selection.",
+        "writer_cosine": -0.02112710594663954,
+        "train": {
+          "linear_error_over_pair_removal": 0.14285917961189365,
+          "linear_error_over_native_mlp_rms": 0.048923974426874774,
+          "native_oddness_over_activity": 1.3820080609292513,
+          "native_doubling_defect_over_activity": 0.07926402617532897,
+          "one_writer_flipped_oddness_over_activity": 1.4090247566917982
+        },
+        "evaluation": {
+          "linear_error_over_pair_removal": 0.166716269877532,
+          "linear_error_over_native_mlp_rms": 0.05359195657033372,
+          "native_oddness_over_activity": 1.2732600015316853,
+          "native_doubling_defect_over_activity": 0.08108596896553494,
+          "one_writer_flipped_oddness_over_activity": 1.3001473497606846
+        }
+      }
+    },
+    {
+      "layer": 1,
+      "minimum_reader_geometry_by_sign": [
+        {
+          "sign": -1.0,
+          "min": 0.5310336077921631,
+          "unordered_pairs": 4717056
+        },
+        {
+          "sign": 1.0,
+          "min": 0.23465462890212516,
+          "unordered_pairs": 4717056
+        }
+      ],
+      "minimum_native_oddness_over_activity_in_training_bank": 1.0644248814072979,
+      "training_selected_linear_candidate": {
+        "source_unit": 2519,
+        "other_unit": 1643,
+        "selection": "Smallest training maximum linear-replacement error divided by maximum pair-removal error; no evaluation selection.",
+        "writer_cosine": -0.32943861916560796,
+        "train": {
+          "linear_error_over_pair_removal": 0.9217731439368365,
+          "linear_error_over_native_mlp_rms": 0.18734013775477815,
+          "native_oddness_over_activity": 1.0644248814072983,
+          "native_doubling_defect_over_activity": 0.0729452992196844,
+          "one_writer_flipped_oddness_over_activity": 1.4882163974116083
+        },
+        "evaluation": {
+          "linear_error_over_pair_removal": 2.284224781577242,
+          "linear_error_over_native_mlp_rms": 0.15527720476322368,
+          "native_oddness_over_activity": 2.2992759302604013,
+          "native_doubling_defect_over_activity": 0.19758946714922013,
+          "one_writer_flipped_oddness_over_activity": 2.9415404829293696
+        }
+      }
+    },
+    {
+      "layer": 2,
+      "minimum_reader_geometry_by_sign": [
+        {
+          "sign": -1.0,
+          "min": 0.5261818145387308,
+          "unordered_pairs": 4717056
+        },
+        {
+          "sign": 1.0,
+          "min": 0.3428091879206991,
+          "unordered_pairs": 4717056
+        }
+      ],
+      "minimum_native_oddness_over_activity_in_training_bank": 0.9035015219010462,
+      "training_selected_linear_candidate": {
+        "source_unit": 1895,
+        "other_unit": 1909,
+        "selection": "Smallest training maximum linear-replacement error divided by maximum pair-removal error; no evaluation selection.",
+        "writer_cosine": -0.8813409594523521,
+        "train": {
+          "linear_error_over_pair_removal": 0.6053706192191332,
+          "linear_error_over_native_mlp_rms": 0.1660173214826752,
+          "native_oddness_over_activity": 0.9035015219010462,
+          "native_doubling_defect_over_activity": 0.08103283160700461,
+          "one_writer_flipped_oddness_over_activity": 2.43236937837006
+        },
+        "evaluation": {
+          "linear_error_over_pair_removal": 0.5677081702629632,
+          "linear_error_over_native_mlp_rms": 0.14516283403553382,
+          "native_oddness_over_activity": 0.7739392415430855,
+          "native_doubling_defect_over_activity": 0.08677696994026764,
+          "one_writer_flipped_oddness_over_activity": 2.4219319331712263
+        }
+      }
+    },
+    {
+      "layer": 3,
+      "minimum_reader_geometry_by_sign": [
+        {
+          "sign": -1.0,
+          "min": 0.6424055518416809,
+          "unordered_pairs": 4717056
+        },
+        {
+          "sign": 1.0,
+          "min": 0.46685584990916584,
+          "unordered_pairs": 4717056
+        }
+      ],
+      "minimum_native_oddness_over_activity_in_training_bank": 0.9481164583709073,
+      "training_selected_linear_candidate": {
+        "source_unit": 1220,
+        "other_unit": 2917,
+        "selection": "Smallest training maximum linear-replacement error divided by maximum pair-removal error; no evaluation selection.",
+        "writer_cosine": -0.6741273059065053,
+        "train": {
+          "linear_error_over_pair_removal": 0.4664015650473333,
+          "linear_error_over_native_mlp_rms": 0.12782491206648047,
+          "native_oddness_over_activity": 0.9481164583709073,
+          "native_doubling_defect_over_activity": 0.03162482823510043,
+          "one_writer_flipped_oddness_over_activity": 2.0699809251899435
+        },
+        "evaluation": {
+          "linear_error_over_pair_removal": 0.43255556890416336,
+          "linear_error_over_native_mlp_rms": 0.09806686683918926,
+          "native_oddness_over_activity": 0.806553192071068,
+          "native_doubling_defect_over_activity": 0.03526064400020403,
+          "one_writer_flipped_oddness_over_activity": 1.8281100051646537
+        }
+      }
+    }
+  ],
+  "conclusion": "The retained opposite-reader pair family did not reveal coherent linear channels: every retained pair has training sign-reversal defect at least 0.90 times its maximum native pair-output norm. Small positive-doubling defects alone would have given a misleading impression of linearity.",
+  "scope": [
+    "37,736,448 signed unordered reader geometries enumerated; only 1,024 directed proposals receive response measurements.",
+    "This does not rule out nonlinear shared operations, rotated coordinates, larger groups, or unretained pairs.",
+    "Finite local parameter-control responses were measured on the same native parent states; autonomous full-model KL and complete artifact cost were not measured.",
+    "Evaluation panel was previously examined by this project, though disjoint from training rows."
+  ],
+  "decision": "Do not build a compiler or launch GPU fitting for this linear-pair family on the strength of these results. No algorithm-recovery or VPD-win claim."
+}

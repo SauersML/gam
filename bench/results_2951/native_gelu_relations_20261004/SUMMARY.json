@@ -1,0 +1,26 @@
+{
+  "layers": [
+    {
+      "layer": 0,
+      "report": "layer0.json",
+      "seconds": 0.555575458
+    },
+    {
+      "layer": 1,
+      "report": "layer1.json",
+      "seconds": 0.537664209
+    },
+    {
+      "layer": 2,
+      "report": "layer2.json",
+      "seconds": 0.557991125
+    },
+    {
+      "layer": 3,
+      "report": "layer3.json",
+      "seconds": 0.556809125
+    }
+  ],
+  "scope": "Complete geometry, heuristic top-k response bank. All retained candidates reported on both panels; no heldout selection, fit, C32, interventions, discovery or acceptance claim.",
+  "seconds": 5.602921708
+}

@@ -1,0 +1,49 @@
+{
+  "sources": [
+    {
+      "source_name": "PROTOCOL.json",
+      "archive_file": "PROTOCOL.json",
+      "raw_sha256": "179ca1e3364ef7e486dc63d5d3241bd5de41da8ed482f75cf63681fcf0679fa4",
+      "raw_bytes": 8447
+    },
+    {
+      "source_name": "SUMMARY.json",
+      "archive_file": "SUMMARY.json",
+      "raw_sha256": "e577d4be1acf6324c6a8bfc26561af653033bc6c98eb49d165b585c29a7907b3",
+      "raw_bytes": 601
+    },
+    {
+      "source_name": "EXECUTION.json",
+      "archive_file": "EXECUTION.json",
+      "raw_sha256": "9225bcc0d2d804bd601fb748a13ae90ae441f3732ad8fbd3bedaf014c4af31a3",
+      "raw_bytes": 1177
+    },
+    {
+      "source_name": "layer0.json",
+      "archive_file": "layer0.json.gz",
+      "raw_sha256": "da19ca72a28603e2653fa8eeda9cbeb88545907fb61fa3cc160dbfb421ecede6",
+      "raw_bytes": 1124319
+    },
+    {
+      "source_name": "layer1.json",
+      "archive_file": "layer1.json.gz",
+      "raw_sha256": "7822628aebf464889911791a99d8190bda5581402512e80fbe0f535c88787ecd",
+      "raw_bytes": 1124270
+    },
+    {
+      "source_name": "layer2.json",
+      "archive_file": "layer2.json.gz",
+      "raw_sha256": "b4d4b483778aa5f0a3c645ce80f963f1e672aa7a3ee6faa8f00bfd428167420b",
+      "raw_bytes": 1124047
+    },
+    {
+      "source_name": "layer3.json",
+      "archive_file": "layer3.json.gz",
+      "raw_sha256": "9baf8050a8c05c0cbdd0c1806e709daf9be827367ec82bdfb0d0c3cd8d5cd688",
+      "raw_bytes": 1121566
+    }
+  ],
+  "example": "crates/gam-mpd/examples/mpd_native_gelu_pairs_2951.rs",
+  "source_sha256": "dae979858b47ad7a39af3f4dc62cd38c1a09ef5d394f6a9423a60847505fb9a5",
+  "source_commit": "3fc4265cf62b4ea295d27dfa2a3d535a38363c28"
+}
