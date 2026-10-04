@@ -1,5 +1,5 @@
 //! Compare CPU and CUDA execution of the same decoded native-parent Local graft.
-//! EXPORT BANK.json OUT.json sequences=N context=N batch=N trace_bytes=N deltas=...
+//! EXPORT BANK.json OUT.json sequences=N context=N batch=N trace_bytes=N deltas=... [source_bytes=N]
 //! This is backend validation/timing, never a new candidate family or quality score.
 use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{acceptance::Local, artifact::Artifact, coder_capture::sha256, import::import_language_model, run_check::split_sites};
@@ -13,11 +13,11 @@ struct Entry { label: String, artifact: PathBuf }
 
 fn main() -> Result<(), String> {
     let a: Vec<String> = std::env::args().skip(1).collect();
-    if a.len() != 8 { return Err("EXPORT BANK.json OUT.json sequences=N context=N batch=N trace_bytes=N deltas=...".into()); }
+    if a.len() != 8 && a.len() != 9 { return Err("EXPORT BANK.json OUT.json sequences=N context=N batch=N trace_bytes=N deltas=... [source_bytes=N]".into()); }
     let mut options = BTreeMap::new();
     for text in &a[3..] {
         let (key, value) = text.split_once('=').ok_or("expected key=value")?;
-        if !["sequences", "context", "batch", "trace_bytes", "deltas"].contains(&key) || options.insert(key, value).is_some() { return Err("unknown or duplicate option".into()); }
+        if !["sequences", "context", "batch", "trace_bytes", "deltas", "source_bytes"].contains(&key) || options.insert(key, value).is_some() { return Err("unknown or duplicate option".into()); }
     }
     let number = |k| options.get(k).ok_or("missing option")?.parse::<usize>().map_err(|e| e.to_string());
     let (sequences, context, batch, trace_bytes) = (number("sequences")?, number("context")?, number("batch")?, number("trace_bytes")?);
@@ -33,7 +33,14 @@ fn main() -> Result<(), String> {
     let model = split_sites(&imported.program)?;
     let family = imported.contract.family;
     let cpu = Local::new(&model, family.clone(), None, batch);
-    let cuda = Local::new(&model, family, None, batch).with_cuda(device, trace_bytes)?;
+    let cuda = Local::new(&model, family.clone(), None, batch).with_cuda(device.clone(), trace_bytes)?;
+    let source_bytes = options.get("source_bytes").map(|v| v.parse::<usize>().map_err(|e| e.to_string())).transpose()?.unwrap_or(0);
+    let init = Instant::now();
+    let shared = if source_bytes == 0 { None } else {
+        Some(Local::new(&model, family, None, batch).with_cuda(device, trace_bytes)?.with_cuda_native_sharing(source_bytes)?)
+    };
+    let source_initialization_seconds = init.elapsed().as_secs_f64();
+    let retained_source_numeric_bytes = shared.as_ref().map(Local::cuda_native_source_numeric_bytes).transpose()?.flatten();
     let mut records = Vec::new();
     for entry in entries {
         let path = if entry.artifact.is_absolute() { entry.artifact } else { bank.parent().unwrap_or(Path::new(".")).join(entry.artifact) };
@@ -50,18 +57,25 @@ fn main() -> Result<(), String> {
             let start = Instant::now();
             let g = cuda.measure(&artifact)?;
             let cuda_seconds = start.elapsed().as_secs_f64();
+            let shared_measure = if let Some(shared) = &shared {
+                let start = Instant::now();
+                let measured = shared.measure(&artifact)?;
+                let seconds = start.elapsed().as_secs_f64();
+                if measured != g { return Err(format!("fresh/shared CUDA complete Local evidence mismatch: {} repeat {repeat}", entry.label)); }
+                Some(json!({"seconds":seconds,"measure":measured,"complete_fresh_cuda_evidence_equal":true}))
+            } else { None };
             if c.blocks.len() != g.blocks.len() || c.rows != g.rows { return Err("backend block/row mismatch".into()); }
             let differences: Vec<_> = c.blocks.iter().zip(&g.blocks).map(|(c,g)| json!({"block":c.name,"absolute_worst_difference":(c.worst-g.worst).abs(),"same_worst_row":c.row==g.row,"same_scale_bits":c.scale.to_bits()==g.scale.to_bits()})).collect();
             let cs = c.status()?;
             let gs = g.status()?;
             let verdict = |s: &gam_mpd::supports::EvidenceStatus<String, String>, d| if s.refutes_at_most(d) { "Violates" } else if s.certifies_at_most(d) { "Meets" } else { "Unresolved" };
             let grid: Vec<_> = deltas.iter().map(|&d| json!({"delta":d,"cpu":verdict(&cs,d),"cuda":verdict(&gs,d)})).collect();
-            pairs.push(json!({"repeat":repeat,"cpu_seconds":cpu_seconds,"cuda_seconds":cuda_seconds,"cpu":c,"cuda":g,"differences":differences,"grid":grid}));
+            pairs.push(json!({"repeat":repeat,"cpu_seconds":cpu_seconds,"cuda_seconds":cuda_seconds,"shared_cuda":shared_measure,"cpu":c,"cuda":g,"differences":differences,"grid":grid}));
         }
         records.push(json!({"label":entry.label,"artifact":path,"artifact_sha256":sha256(&path)?,"pairs":pairs}));
         eprintln!("Local CPU/CUDA pairs complete: {}", entry.label);
     }
-    let report = json!({"scope":"same decoded native-parent graft; CPU native scales and comparison; intervals bound comparison rounding only, not CPU/CUDA execution discrepancy; fixed CPU-then-CUDA timing order","cpu_backend":cpu.backend_name(),"cuda_backend":cuda.backend_name(),"sequences":sequences,"context":context,"batch":batch,"trace_bytes":trace_bytes,"export_sha256":sha256(&export.join("export.json"))?,"bank_sha256":sha256(bank)?,"binary_sha256":sha256(&std::env::current_exe().map_err(|e|e.to_string())?)?,"records":records});
+    let report = json!({"scope":"same decoded native-parent graft; CPU native scales and comparison; intervals bound comparison rounding only, not CPU/CUDA execution discrepancy; fixed CPU-then-CUDA timing order","cpu_backend":cpu.backend_name(),"cuda_backend":cuda.backend_name(),"sequences":sequences,"context":context,"batch":batch,"trace_bytes":trace_bytes,"source_numeric_bytes_limit":source_bytes,"retained_source_numeric_bytes":retained_source_numeric_bytes,"source_initialization_seconds":source_initialization_seconds,"source_scope":"actual f64 native model, no rounding; source never forwarded; same Arc and role only; numeric limit excludes indices/activations/workspaces/allocator/host; initialization excluded from repeated measurements","export_sha256":sha256(&export.join("export.json"))?,"bank_sha256":sha256(bank)?,"binary_sha256":sha256(&std::env::current_exe().map_err(|e|e.to_string())?)?,"records":records});
     std::fs::write(out, serde_json::to_vec_pretty(&report).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
     Ok(())
 }

@@ -213,24 +213,52 @@ fn rotations_of(trace: &DeviceTrace, rotary: Rotary) -> Result<(&Tensor, &Tensor
 impl DeviceProgram {
     /// Lower `program` onto `device`, or the reason it cannot be.
     pub fn compile(device: &Device, program: &OperatorProgram) -> Result<Self, String> {
-        Self::lower(device, program, None, false)
+        Self::lower(device, program, None, false, None)
     }
 
     /// [`Self::compile`] on `from`'s device, every operator `program` shares with `from` (the same
     /// `Arc`, in the same role) held by both instead of uploaded again: the programs of one model
     /// with different sites replaced hold the model's weights once.
     pub fn compile_sharing(from: &Self, program: &OperatorProgram) -> Result<Self, String> {
-        Self::lower(&from.device, program, Some(from), false)
+        Self::lower(&from.device, program, Some(from), false, None)
     }
 
     /// Materialize the actual output expression as ordinary resident values.
     /// No streamed head, synthetic operator, or extra output arithmetic is added.
     /// Head scoring and derivative helpers explicitly refuse this mode.
     pub fn compile_values(device: &Device, program: &OperatorProgram) -> Result<Self, String> {
-        Self::lower(device, program, None, true)
+        Self::lower(device, program, None, true, None)
     }
 
-    fn lower(device: &Device, program: &OperatorProgram, from: Option<&Self>, values: bool) -> Result<Self, String> {
+    /// Value execution sharing exact operator Arcs in the same executable roles.
+    pub fn compile_values_sharing(from: &Self, program: &OperatorProgram) -> Result<Self, String> {
+        Self::lower(&from.device, program, Some(from), true, None)
+    }
+
+    /// Bound retained numeric operator buffers before uploading any operator.
+    /// Excludes node indices, activations, workspaces, allocator overhead and host values.
+    pub fn compile_values_bounded(device: &Device, program: &OperatorProgram, numeric_bytes_limit: usize) -> Result<Self, String> {
+        if numeric_bytes_limit == 0 { return Err("positive operator numeric byte limit required".into()); }
+        Self::lower(device, program, None, true, Some(numeric_bytes_limit))
+    }
+
+    /// Bytes of unique retained float64 operator buffers; excludes all other storage.
+    pub fn operator_numeric_bytes(&self) -> Result<usize, String> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut total = 0usize;
+        for held in self.operators.values() {
+            if !seen.insert(Arc::as_ptr(&held.held) as usize) { continue; }
+            let count = match &*held.held {
+                Held::Identity => 0,
+                Held::Diagonal(t) | Held::Dense(t) | Held::Table(t) | Held::Column(t) => t.len(),
+                Held::LowRank(a, b) => a.len().checked_add(b.len()).ok_or("operator size overflow")?,
+            };
+            total = total.checked_add(count.checked_mul(8).ok_or("operator byte overflow")?).ok_or("operator byte overflow")?;
+        }
+        Ok(total)
+    }
+
+    fn lower(device: &Device, program: &OperatorProgram, from: Option<&Self>, values: bool, numeric_bytes_limit: Option<usize>) -> Result<Self, String> {
         let interfaces = program.interfaces().map_err(|e| e.to_string())?;
         let widths: Vec<usize> = interfaces.iter().map(|i| i.width()).collect();
         let head = if values {
@@ -331,6 +359,23 @@ impl DeviceProgram {
         // `from`'s operators by their source and role.
         let held_by: BTreeMap<(usize, Role), &Arc<Held>> =
             from.map(|f| f.operators.iter().map(|((_, role), h)| ((Arc::as_ptr(&h.source) as usize, *role), &h.held)).collect()).unwrap_or_default();
+        if let Some(limit) = numeric_bytes_limit {
+            let mut total = 0usize;
+            for &(index, role) in &wanted.iter().copied().collect::<std::collections::BTreeSet<_>>() {
+                let operator = &program.operators[index];
+                let count = match role {
+                    Role::Table | Role::Column => operator.rows.width().checked_mul(operator.cols.width()).ok_or("operator size overflow")?,
+                    Role::Product => match &operator.body {
+                        OperatorBody::Identity => 0,
+                        OperatorBody::Diagonal { values, .. } => values.len(),
+                        OperatorBody::LowRank { left, right, .. } => left.len().checked_add(right.len()).ok_or("operator size overflow")?,
+                        OperatorBody::Dense { values, .. } => operator.diagonal().map_or(values.len(), |d| d.len()),
+                    },
+                };
+                total = total.checked_add(count.checked_mul(8).ok_or("operator byte overflow")?).ok_or("operator byte overflow")?;
+            }
+            if total > limit { return Err(format!("operator numeric buffers {total} exceed declared source limit {limit}; excludes indices/activations/workspaces/allocator/host")); }
+        }
         let mut operators = BTreeMap::new();
         for key in wanted {
             if operators.contains_key(&key) {
@@ -1271,5 +1316,46 @@ impl DeviceProgram {
             d.gemm_batched(blocks, &mut out, 1.0, &alpha, Op::N, dvv, Op::N, 1.0, arithmetic).map_err(error)?;
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod value_sharing_tests {
+    use super::*;
+    use crate::operator_program::{Declarations, Interface, Slot, exact_precision};
+    use ndarray::array;
+    #[test]
+    fn value_sharing_preserves_native_f64_and_index_shifted_parameter_buffers() {
+        let interface = Interface::native(2).unwrap();
+        let values = array![[1.0 + 2.0_f64.powi(-40), 1.0], [0.0, 2.0]];
+        let operator = Arc::new(Operator::dense("actual-native", interface.clone(), interface.clone(), values.clone(),
+            exact_precision(values.iter().copied()).unwrap(), Default::default()).unwrap());
+        let native = OperatorProgram { declarations: Declarations { domains: vec![], slots: vec![Slot::Raw { width: 2 }], parameters: 0 },
+            bases: vec![], rules: vec![], operators: vec![operator.clone()],
+            nodes: vec![Node::Raw { slot: 0 }, Node::Affine { terms: vec![(0, 0)], bias: None }, Node::Concat { parts: vec![1, 0] }], output: 2 };
+        assert!(!crate::artifact::Artifact::native(&native).unwrap().has_f32_literals());
+        let family = FamilyInputs { rows: 1, slots: vec![SlotValues::Raw(array![[1.0, 2.0]])], layout: None };
+        let device = Device::host();
+        assert!(DeviceProgram::compile_values_bounded(&device, &native, 31).is_err());
+        let source = DeviceProgram::compile_values_bounded(&device, &native, 32).unwrap();
+        assert_eq!(source.operator_numeric_bytes().unwrap(), 32);
+        let mut shifted = native.clone();
+        shifted.operators.insert(0, Arc::new(Operator::identity("unused", interface)));
+        shifted.nodes[1] = Node::Affine { terms: vec![(0, 1)], bias: None };
+        let shared = DeviceProgram::compile_values_sharing(&source, &shifted).unwrap();
+        let fresh = DeviceProgram::compile_values(&device, &shifted).unwrap();
+        assert!(Arc::ptr_eq(&source.operators[&(0, Role::Product)].held, &shared.operators[&(1, Role::Product)].held));
+        let a = shared.forward(&family).unwrap(); let b = fresh.forward(&family).unwrap();
+        let output = |p: &DeviceProgram, t: &DeviceTrace| device.download(t.value(p.hidden()).unwrap()).unwrap();
+        assert_eq!(output(&shared, &a), output(&fresh, &b));
+        assert_eq!(output(&shared, &a), native.execute(&family, false).unwrap().values[native.output]);
+        let before = output(&source, &source.forward(&family).unwrap());
+        let mut altered = shifted.clone();
+        let OperatorBody::Dense { values, .. } = &mut Arc::make_mut(&mut altered.operators[1]).body else { panic!("dense source") };
+        values[[0, 0]] += 2.0_f64.powi(-40);
+        let changed = DeviceProgram::compile_values_sharing(&source, &altered).unwrap();
+        assert!(!Arc::ptr_eq(&source.operators[&(0, Role::Product)].held, &changed.operators[&(1, Role::Product)].held));
+        assert_eq!(before, output(&source, &source.forward(&family).unwrap()));
+        assert_eq!(operator.matrix(), native.operators[0].matrix());
     }
 }

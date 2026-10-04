@@ -109,6 +109,19 @@ impl Resident {
         }
         Self::compile_decoded_mode(device, candidate, None, true)
     }
+    /// Value execution sharing only exact operator Arcs in identical roles.
+    pub fn from_decoded_values_sharing(from: &Self, candidate: &Artifact) -> Result<Self, String> {
+        if from.program.device().is_host() || !from.program.device().float64() {
+            return Err("artifact device needs a float64 accelerator".into());
+        }
+        Self::compile_decoded_mode(from.program.device(), candidate, Some(from), true)
+    }
+    /// Preserve supplied values, bounding retained numeric source operators before upload.
+    pub fn from_decoded_values_bounded(device: &Device, candidate: &Artifact, numeric_bytes_limit: usize) -> Result<Self, String> {
+        if device.is_host() || !device.float64() { return Err("artifact device needs a float64 accelerator".into()); }
+        Self::compile_decoded_mode_bounded(device, candidate, None, true, Some(numeric_bytes_limit))
+    }
+    pub fn operator_numeric_bytes(&self) -> Result<usize, String> { self.program.operator_numeric_bytes() }
     /// Share only identical operator Arcs in identical executable roles with this
     /// candidate's base resident; graph edits and root mappings remain independent.
     pub fn from_decoded_sharing(from: &Self, candidate: &Artifact) -> Result<Self, String> {
@@ -121,6 +134,9 @@ impl Resident {
         Self::compile_decoded_mode(device, candidate, from, false)
     }
     fn compile_decoded_mode(device: &Device, candidate: &Artifact, from: Option<&Self>, values: bool) -> Result<Self, String> {
+        Self::compile_decoded_mode_bounded(device, candidate, from, values, None)
+    }
+    fn compile_decoded_mode_bounded(device: &Device, candidate: &Artifact, from: Option<&Self>, values: bool, numeric_bytes_limit: Option<usize>) -> Result<Self, String> {
         candidate.program.interfaces().map_err(|e| e.to_string())?;
         let artifact = candidate.clone();
         let (flat, map) = mapped_inlined(&artifact.program)?;
@@ -136,7 +152,11 @@ impl Resident {
             }
         }
         let program = if values {
-            DeviceProgram::compile_values(device, &flat)?
+            match (from, numeric_bytes_limit) {
+                (Some(base), _) => DeviceProgram::compile_values_sharing(&base.program, &flat)?,
+                (None, Some(limit)) => DeviceProgram::compile_values_bounded(device, &flat, limit)?,
+                (None, None) => DeviceProgram::compile_values(device, &flat)?,
+            }
         } else {
             match from {
                 Some(base) => DeviceProgram::compile_sharing(&base.program, &flat)?,
@@ -513,6 +533,14 @@ mod tests {
         let trace = resident.forward_edited(&family, |_, _| Ok(None)).unwrap();
         let actual = device.download(&resident.output(&trace).unwrap()).unwrap();
         assert_eq!(actual, expected.values[local.program.output]);
+        let native_artifact = Artifact::native(&native).unwrap();
+        let source = Resident::compile_decoded_mode(&device, &native_artifact, None, true).unwrap();
+        assert!(Resident::from_decoded_values_sharing(&source, &local).is_err(), "public sharing refuses host fallback");
+        let shared = Resident::compile_decoded_mode(&device, &local, Some(&source), true).unwrap();
+        let shared_trace = shared.forward_edited(&family, |_, _| Ok(None)).unwrap();
+        assert_eq!(device.download(&shared.output(&shared_trace).unwrap()).unwrap(), actual);
+        let untouched = source.forward_edited(&family, |_, _| Ok(None)).unwrap();
+        assert_eq!(device.download(&source.output(&untouched).unwrap()).unwrap(), native_artifact.execute(&family).unwrap().values[native.output]);
         assert_eq!(actual, ndarray::array![[-0.625, 0.0, -0.625, 0.0]]);
         assert!(!resident.program.is_streamed_head(resident.output));
         assert!(matches!(resident.program.logits_on_device(&trace), Err(error) if error.contains("no linear head")));

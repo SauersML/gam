@@ -489,6 +489,7 @@ pub struct Local<'a> {
     pub batch_rows: usize,
     scales: Mutex<BTreeMap<usize, f64>>,
     device: Option<(gam_gpu::tensor::Device, usize)>,
+    native_device: Option<super::artifact_device::Resident>,
 }
 
 /// Per row, `‖d_row‖₂` and the rounding of computing it from the two executed writes: the
@@ -507,7 +508,7 @@ fn row_norms(values: &Array2<f64>, columns: std::ops::Range<usize>, scale: f64) 
 
 impl<'a> Local<'a> {
     pub fn new(model: &'a OperatorProgram, family: FamilyInputs, ascent: Option<Ascent>, batch_rows: usize) -> Self {
-        Self { model, family, ascent, batch_rows, scales: Mutex::new(BTreeMap::new()), device: None }
+        Self { model, family, ascent, batch_rows, scales: Mutex::new(BTreeMap::new()), device: None, native_device: None }
     }
 
     /// Execute the same native-parent graft on a float64 CUDA device. Native scale
@@ -523,12 +524,32 @@ impl<'a> Local<'a> {
         if self.ascent.is_some() {
             return Err("Local CUDA does not support counterexample ascent".into());
         }
+        if self.native_device.is_some() { return Err("cannot replace Local CUDA device after native source initialization".into()); }
         self.device = Some((device, intermediate_bytes_limit));
         Ok(self)
     }
 
+    /// Optional immutable native operator resident. It uses `self.model` directly,
+    /// preserving native f64 values; no precision projection or encode/decode occurs.
+    /// Grafts already retain native operator Arcs across pruning and index changes.
+    /// Only one source is retained, never all candidate graphs or their traces.
+    /// The limit covers float64 operator buffers only, excluding host weights,
+    /// indices, activations, workspaces, exception tensors and allocator overhead.
+    pub fn with_cuda_native_sharing(mut self, source_numeric_bytes_limit: usize) -> Result<Self, String> {
+        if source_numeric_bytes_limit == 0 { return Err("positive native source numeric byte limit required".into()); }
+        let (device, _) = self.device.as_ref().ok_or("enable Local CUDA before native sharing")?;
+        if self.native_device.is_some() { return Err("Local native source already initialized".into()); }
+        let native = Artifact::native(self.model)?;
+        self.native_device = Some(super::artifact_device::Resident::from_decoded_values_bounded(device, &native, source_numeric_bytes_limit)?);
+        Ok(self)
+    }
+
+    pub fn cuda_native_source_numeric_bytes(&self) -> Result<Option<usize>, String> {
+        self.native_device.as_ref().map(super::artifact_device::Resident::operator_numeric_bytes).transpose()
+    }
+
     pub fn backend_name(&self) -> &'static str {
-        if self.device.is_some() { "CUDA f64 native-parent graft; CPU native scales and comparison" } else { "CPU f64 native-parent graft, native scales and comparison" }
+        if self.native_device.is_some() { "CUDA f64 shared native-parent graft; CPU native scales and comparison" } else if self.device.is_some() { "CUDA f64 native-parent graft; CPU native scales and comparison" } else { "CPU f64 native-parent graft, native scales and comparison" }
     }
 
     /// The declared scale of native node `node`: the root mean square of its row norms on the
@@ -566,7 +587,11 @@ impl<'a> Local<'a> {
         family: &FamilyInputs,
     ) -> Result<Vec<Vec<(f64, f64)>>, String> {
         let mut out = vec![vec![(0.0, 0.0); family.rows]; columns.len()];
-        let resident = self.device.as_ref().map(|(device, _)| super::artifact_device::Resident::from_decoded_values(device, local)).transpose()?;
+        let resident = match (&self.device, &self.native_device) {
+            (Some(_), Some(source)) => Some(super::artifact_device::Resident::from_decoded_values_sharing(source, local)?),
+            (Some((device, _)), None) => Some(super::artifact_device::Resident::from_decoded_values(device, local)?),
+            (None, _) => None,
+        };
         for rows in batches(&units(family), self.batch_rows) {
             let selected = family.select(&rows);
             let values = if let (Some(resident), Some((device, limit))) = (&resident, &self.device) {
