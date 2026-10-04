@@ -1021,23 +1021,65 @@ impl DeviceProgram {
         arithmetic: Arithmetic,
     ) -> Result<BTreeMap<usize, Tensor>, String> {
         self.linear_operator()?;
+        let mut seeds = BTreeMap::from([(self.head.hidden, seed)]);
+        for (node, term) in extra {
+            match seeds.get_mut(&node) {
+                Some(existing) => self.device.axpy(existing, 1.0, &term).map_err(error)?,
+                None => {
+                    seeds.insert(node, term);
+                }
+            }
+        }
+        self.reverse_seeds(trace, seeds, keep, arithmetic)
+    }
+
+    /// Reverse resident-value expressions from explicitly declared node seeds.
+    /// No vocabulary head or synthetic operator is required. Cotangents stay on
+    /// the device; this differentiates fixed executed values, not serialization,
+    /// rounding, structural search, or an acceptance verdict.
+    pub fn vjp_values_seeded(
+        &self,
+        trace: &DeviceTrace,
+        seeds: BTreeMap<usize, Tensor>,
+        keep: &[usize],
+        arithmetic: Arithmetic,
+    ) -> Result<BTreeMap<usize, Tensor>, String> {
+        if self.head.operator.is_some() {
+            return Err("device: values VJP requires resident-value compilation".into());
+        }
+        self.reverse_seeds(trace, seeds, keep, arithmetic)
+    }
+
+    fn reverse_seeds(
+        &self,
+        trace: &DeviceTrace,
+        seeds: BTreeMap<usize, Tensor>,
+        keep: &[usize],
+        arithmetic: Arithmetic,
+    ) -> Result<BTreeMap<usize, Tensor>, String> {
+        if keep
+            .iter()
+            .chain(seeds.keys())
+            .any(|node| *node >= self.steps.len())
+        {
+            return Err("device: retained or seeded node out of range".into());
+        }
+        for (&node, term) in &seeds {
+            if term.dim() != (trace.rows, self.widths[node]) {
+                return Err(format!(
+                    "device: a {:?} cotangent at node {node} of width {}",
+                    term.dim(),
+                    self.widths[node]
+                ));
+            }
+        }
         let Some(first) = keep.iter().copied().min() else {
             return Ok(BTreeMap::new());
         };
-        if keep.iter().chain(extra.keys()).any(|node| *node >= self.steps.len()) {
-            return Err("device: retained node out of range".to_string());
-        }
         let d = &self.device;
         let mut g: Vec<Option<Tensor>> = (0..self.steps.len()).map(|_| None).collect();
-        g[self.head.hidden] = Some(seed);
-        for (node, term) in extra {
-            if term.dim() != (trace.rows, self.widths[node]) {
-                return Err(format!("device: a {:?} cotangent at node {node} of width {}", term.dim(), self.widths[node]));
-            }
-            match g[node].as_mut() {
-                Some(existing) => d.axpy(existing, 1.0, &term).map_err(error)?,
-                None => g[node] = Some(term),
-            }
+        for (node, term) in seeds {
+            g[node] = Some(term);
         }
         let mut kept = BTreeMap::new();
         // Adds `term` into node `n`'s cotangent.
@@ -1056,14 +1098,17 @@ impl DeviceProgram {
             }
             Ok(())
         };
-        for index in (first..=self.head.hidden).rev() {
+        for index in (first..self.steps.len()).rev() {
             let Some(cot) = g[index].take() else { continue };
             if index == first {
                 kept.insert(index, cot);
                 break;
             }
             match &self.steps[index] {
-                Step::Concat { .. } | Step::Readout { .. } => return Err("device: resident Concat/readout derivatives are unsupported".into()),
+                Step::Concat { .. } => {
+                    return Err("device: resident Concat derivatives are unsupported".into());
+                }
+                Step::Readout { input } => add(&mut g, *input, d.copy(&cot).map_err(error)?)?,
                 Step::Head | Step::Feature { .. } | Step::Raw { .. } | Step::Constant { .. } => {}
                 Step::Affine { terms, .. } => {
                     for (argument, operator) in terms {
@@ -1074,52 +1119,81 @@ impl DeviceProgram {
                         let target = g[*argument].as_mut().ok_or("device: cotangent slot")?;
                         match self.held(*operator, Role::Product)? {
                             Held::Identity => d.axpy(target, 1.0, &cot).map_err(error)?,
-                            Held::Diagonal(diag) => d.scale_columns(target, &cot, diag, true).map_err(error)?,
-                            Held::Dense(a) => d.gemm(target, 1.0, &cot, Op::N, a, Op::N, 1.0, arithmetic).map_err(error)?,
+                            Held::Diagonal(diag) => {
+                                d.scale_columns(target, &cot, diag, true).map_err(error)?
+                            }
+                            Held::Dense(a) => d
+                                .gemm(target, 1.0, &cot, Op::N, a, Op::N, 1.0, arithmetic)
+                                .map_err(error)?,
                             Held::LowRank(left, right) => {
                                 // g (L R) = (g L) R.
                                 let mut middle = d.zeros(cot.rows(), left.cols()).map_err(error)?;
-                                d.gemm(&mut middle, 1.0, &cot, Op::N, left, Op::N, 0.0, arithmetic).map_err(error)?;
-                                d.gemm(target, 1.0, &middle, Op::N, right, Op::N, 1.0, arithmetic).map_err(error)?;
+                                d.gemm(&mut middle, 1.0, &cot, Op::N, left, Op::N, 0.0, arithmetic)
+                                    .map_err(error)?;
+                                d.gemm(target, 1.0, &middle, Op::N, right, Op::N, 1.0, arithmetic)
+                                    .map_err(error)?;
                             }
                             Held::Table(_) | Held::Column(_) => {
-                                return Err("device: an operator held in the wrong role".to_string());
+                                return Err(
+                                    "device: an operator held in the wrong role".to_string()
+                                );
                             }
                         }
                     }
                 }
                 Step::Transposed { input, operator } => {
-                    let Held::Dense(a) = self.held(*operator, Role::Product)? else {
-                        return Err("device: a transposed read of a non-dense operator".to_string());
-                    };
                     slot(&mut g, *input, trace.rows)?;
                     let target = g[*input].as_mut().ok_or("device: cotangent slot")?;
-                    d.gemm(target, 1.0, &cot, Op::N, a, Op::T, 1.0, arithmetic).map_err(error)?;
+                    self.add_product(target, &cot, *operator, false, arithmetic)?;
                 }
                 Step::Pointwise { input, codes } => {
-                    let term = d.law_slopes(&cot, trace.value(*input)?, codes, gelu_tanh_constant()).map_err(error)?;
+                    let term = d
+                        .law_slopes(&cot, trace.value(*input)?, codes, gelu_tanh_constant())
+                        .map_err(error)?;
                     add(&mut g, *input, term)?;
                 }
                 Step::Hadamard { left, right } => {
                     // A raw input's cotangent goes nowhere unless it is kept (a mask's).
-                    let wanted = |n: usize| keep.contains(&n) || !matches!(self.steps[n], Step::Raw { .. } | Step::Constant { .. });
+                    let wanted = |n: usize| {
+                        keep.contains(&n)
+                            || !matches!(self.steps[n], Step::Raw { .. } | Step::Constant { .. })
+                    };
                     if wanted(*left) {
                         let mut gl = d.zeros(trace.rows, self.widths[*left]).map_err(error)?;
-                        d.hadamard(&mut gl, &cot, trace.value(*right)?, false).map_err(error)?;
+                        d.hadamard(&mut gl, &cot, trace.value(*right)?, false)
+                            .map_err(error)?;
                         add(&mut g, *left, gl)?;
                     }
                     if wanted(*right) {
                         let mut gr = d.zeros(trace.rows, self.widths[*right]).map_err(error)?;
-                        d.hadamard(&mut gr, &cot, trace.value(*left)?, false).map_err(error)?;
+                        d.hadamard(&mut gr, &cot, trace.value(*left)?, false)
+                            .map_err(error)?;
                         add(&mut g, *right, gr)?;
                     }
                 }
                 Step::RmsNorm { input, epsilon } => {
-                    let term = d.rms_norm_backward(trace.value(*input)?, &cot, *epsilon).map_err(error)?;
+                    let term = d
+                        .rms_norm_backward(trace.value(*input)?, &cot, *epsilon)
+                        .map_err(error)?;
                     add(&mut g, *input, term)?;
                 }
-                Step::Attend { query, key, value, scale, rotary, causal } => {
-                    let (gq, gk, gv) = self.attend_cotangent(trace, (*query, *key, *value), &cot, *scale, *rotary, *causal, arithmetic)?;
+                Step::Attend {
+                    query,
+                    key,
+                    value,
+                    scale,
+                    rotary,
+                    causal,
+                } => {
+                    let (gq, gk, gv) = self.attend_cotangent(
+                        trace,
+                        (*query, *key, *value),
+                        &cot,
+                        *scale,
+                        *rotary,
+                        *causal,
+                        arithmetic,
+                    )?;
                     add(&mut g, *query, gq)?;
                     add(&mut g, *key, gk)?;
                     add(&mut g, *value, gv)?;
@@ -1130,6 +1204,76 @@ impl DeviceProgram {
             }
         }
         Ok(kept)
+    }
+
+    /// Resident cotangents for explicitly trainable dense Product operators.
+    /// Every shared use contributes once in its actual orientation. Unsupported
+    /// trainable roles (tables, bias columns, diagonal/low-rank/identity bodies)
+    /// fail explicitly. Parameters and source traces are never changed.
+    pub fn vjp_values_dense(
+        &self,
+        trace: &DeviceTrace,
+        seeds: BTreeMap<usize, Tensor>,
+        keep: &[usize],
+        trainable: &[usize],
+        arithmetic: Arithmetic,
+    ) -> Result<(BTreeMap<usize, Tensor>, BTreeMap<usize, Tensor>), String> {
+        if self.head.operator.is_some() {
+            return Err("device: dense values VJP requires resident-value compilation".into());
+        }
+        let requested: std::collections::BTreeSet<_> = trainable.iter().copied().collect();
+        if requested.len() != trainable.len() {
+            return Err("device: duplicate trainable operator".into());
+        }
+        let mut gradients = BTreeMap::new();
+        for &op in &requested {
+            if self
+                .operators
+                .keys()
+                .any(|(index, role)| *index == op && *role != Role::Product)
+            {
+                return Err(
+                    "device: trainable operator has an unsupported table/column role".into(),
+                );
+            }
+            let held = self.operators.get(&(op, Role::Product)).ok_or("device: trainable operator has no Product role")?;
+            if !matches!(held.source.body, OperatorBody::Dense { .. }) {
+                return Err("device: trainable operator must have a dense literal body".into());
+            }
+            // Dense literals may be executed by an exact diagonal fast path;
+            // their parameter space still contains every matrix entry.
+            gradients.insert(op, self.device.zeros(held.source.rows.width(), held.source.cols.width()).map_err(error)?);
+        }
+        let mut retained = keep.to_vec();
+        for (node, step) in self.steps.iter().enumerate() {
+            let uses = match step {
+                Step::Affine { terms, .. } => terms.iter().any(|(_, op)| requested.contains(op)),
+                Step::Transposed { operator, .. } => requested.contains(operator),
+                _ => false,
+            };
+            if uses && !retained.contains(&node) {
+                retained.push(node);
+            }
+        }
+        let mut nodes = self.reverse_seeds(trace, seeds, &retained, arithmetic)?;
+        for (node, step) in self.steps.iter().enumerate() {
+            let Some(cot) = nodes.get(&node) else {
+                continue;
+            };
+            if let Step::Affine { terms, .. } = step {
+                for (input, op) in terms {
+                    if let Some(gradient) = gradients.get_mut(op) {
+                        self.device.gemm(gradient, 1.0, cot, Op::T, trace.value(*input)?, Op::N, 1.0, arithmetic).map_err(error)?;
+                    }
+                }
+            } else if let Step::Transposed { input, operator } = step {
+                if let Some(gradient) = gradients.get_mut(operator) {
+                    self.device.gemm(gradient, 1.0, trace.value(*input)?, Op::T, cot, Op::N, 1.0, arithmetic).map_err(error)?;
+                }
+            }
+        }
+        nodes.retain(|node, _| keep.contains(node));
+        Ok((nodes, gradients))
     }
 
     fn attend_cotangent(
@@ -1366,5 +1510,118 @@ mod value_sharing_tests {
         assert!(!Arc::ptr_eq(&source.operators[&(0, Role::Product)].held, &changed.operators[&(1, Role::Product)].held));
         assert_eq!(before, output(&source, &source.forward(&family).unwrap()));
         assert_eq!(operator.matrix(), native.operators[0].matrix());
+    }
+}
+
+#[cfg(test)]
+mod values_vjp_tests {
+    use super::*;
+    use crate::operator_program::{Declarations, FamilyInputs, Interface, Rule, Slot, SlotValues, exact_precision};
+    use ndarray::{Array2, array};
+
+    fn fixture() -> (OperatorProgram, FamilyInputs) {
+        let interface = Interface::native(2).unwrap();
+        let values = array![[0.8, -0.3], [0.2, 1.1]];
+        let operator = Arc::new(Operator::dense("shared", interface.clone(), interface.clone(), values.clone(),
+            exact_precision(values.iter().copied()).unwrap(), Default::default()).unwrap());
+        let program = OperatorProgram {
+            declarations: Declarations { domains: vec![], slots: vec![Slot::Raw { width: 2 }], parameters: 0 },
+            bases: vec![], operators: vec![operator],
+            rules: vec![Rule { name: "nonlinear shared body".into(), inputs: vec![interface],
+                nodes: vec![Node::Param { index: 0 }, Node::Pointwise { input: 0, laws: vec![Law::GeluTanh] },
+                    Node::Hadamard { left: 1, right: 0 }], output: 2 }],
+            nodes: vec![Node::Raw { slot: 0 }, Node::Affine { terms: vec![(0, 0)], bias: None },
+                Node::Call { rule: 0, arguments: vec![1] }, Node::Call { rule: 0, arguments: vec![0] },
+                Node::Hadamard { left: 2, right: 3 }, Node::Transposed { input: 4, operator: 0 },
+                Node::Affine { terms: vec![(5, 0), (1, 0)], bias: None }], output: 6,
+        };
+        let family = FamilyInputs { rows: 2, slots: vec![SlotValues::Raw(array![[0.4, -0.7], [1.2, 0.3]])], layout: None };
+        (program, family)
+    }
+    fn seeds(program: &OperatorProgram) -> BTreeMap<usize, Array2<f64>> {
+        BTreeMap::from([(program.output, array![[0.7, -0.2], [-0.4, 0.9]]), (2, Array2::from_elem((2, 2), 0.13))])
+    }
+    fn objective(program: &OperatorProgram, family: &FamilyInputs) -> f64 {
+        let trace = program.execute(family, false).unwrap();
+        seeds(program).into_iter().map(|(node, seed)| (&trace.values[node] * &seed).sum()).sum()
+    }
+    #[test]
+    fn nonlinear_rule_shared_dense_and_transposed_cotangents_match_cpu_and_finite_differences() {
+        let (called, family) = fixture();
+        let (program, _) = crate::artifact_device::mapped_inlined(&called).unwrap();
+        let cpu = program.execute(&family, false).unwrap();
+        assert_eq!(called.execute(&family, false).unwrap().values[called.output], cpu.values[program.output]);
+        let reference = crate::derivatives::vjp_seeded(&program, &family, &cpu, seeds(&program), Some(&[0, 1])).unwrap();
+        let mut devices = vec![Device::host()];
+        if let Some(device) = Device::accelerator(gam_gpu::GpuPolicy::Auto).expect("device probe") {
+            if device.float64() { devices.push(device); }
+        }
+        for device in devices {
+            let lowered = DeviceProgram::compile_values(&device, &program).unwrap();
+            let trace = lowered.forward(&family).unwrap();
+            let upload_seeds = || seeds(&program).into_iter().map(|(node, value)| (node, device.upload(value.view()).unwrap())).collect();
+            let nodes = lowered.vjp_values_seeded(&trace, upload_seeds(), &[0, 1], Arithmetic::F64).unwrap();
+            for node in [0, 1] {
+                let actual = device.download(&nodes[&node]).unwrap();
+                assert!((&actual - reference[node].as_ref().unwrap()).iter().all(|v| v.abs() < 2e-12), "{} node {node}", device.name());
+            }
+            let (nodes, operators) = lowered.vjp_values_dense(&trace, upload_seeds(), &[0], &[0], Arithmetic::F64).unwrap();
+            assert_eq!(nodes.len(), 1);
+            let gradient = device.download(&operators[&0]).unwrap();
+            for row in 0..2 { for col in 0..2 {
+                let mut shifted = program.clone();
+                let delta = 1e-6;
+                let set = |p: &mut OperatorProgram, step| {
+                    let OperatorBody::Dense { values, .. } = &mut Arc::make_mut(&mut p.operators[0]).body else { panic!("dense fixture") };
+                    values[[row,col]] += step;
+                };
+                set(&mut shifted, delta);
+                let plus = objective(&shifted, &family);
+                set(&mut shifted, -2.0 * delta);
+                let minus = objective(&shifted, &family);
+                assert!((gradient[[row,col]] - (plus-minus)/(2.0*delta)).abs() < 2e-8, "{} shared [{row},{col}]", device.name());
+            }}
+            assert_eq!(device.download(trace.value(0).unwrap()).unwrap(), cpu.values[0]);
+            assert_eq!(device.download(lowered.dense(0).unwrap()).unwrap(), program.operators[0].matrix());
+            assert!(lowered.vjp_values_seeded(&trace, BTreeMap::from([(usize::MAX, device.zeros(2,2).unwrap())]), &[], Arithmetic::F64).is_err());
+            assert!(lowered.vjp_values_seeded(&trace, BTreeMap::from([(program.output, device.zeros(1,2).unwrap())]), &[0], Arithmetic::F64).is_err());
+            assert!(lowered.vjp_values_dense(&trace, upload_seeds(), &[], &[0,0], Arithmetic::F64).is_err());
+            assert!(lowered.vjp(&trace, device.zeros(2,2).unwrap(), &[0], Arithmetic::F64).is_err());
+        }
+    }
+    #[test]
+    fn dense_zero_literals_have_full_matrix_cotangents_despite_diagonal_execution() {
+        let device = Device::host();
+        let interface = Interface::native(2).unwrap();
+        let values = Array2::zeros((2,2));
+        let operator = Operator::dense("zero coefficient", interface.clone(), interface, values.clone(),
+            exact_precision(values.iter().copied()).unwrap(), Default::default()).unwrap();
+        let program = OperatorProgram { declarations: Declarations { domains: vec![], slots: vec![Slot::Raw { width: 2 }], parameters: 0 },
+            operators: vec![Arc::new(operator)], bases: vec![], rules: vec![],
+            nodes: vec![Node::Raw { slot: 0 }, Node::Affine { terms: vec![(0,0)], bias: None }], output: 1 };
+        let family = FamilyInputs { rows: 1, slots: vec![SlotValues::Raw(array![[2.,3.]])], layout: None };
+        let lowered = DeviceProgram::compile_values(&device,&program).unwrap();
+        let trace = lowered.forward(&family).unwrap();
+        let (_, gradients) = lowered.vjp_values_dense(&trace, BTreeMap::from([(1,device.upload(array![[5.,7.]].view()).unwrap())]), &[], &[0], Arithmetic::F64).unwrap();
+        assert_eq!(device.download(&gradients[&0]).unwrap(),array![[10.,15.],[14.,21.]]);
+    }
+
+    #[test]
+    fn unsupported_trainable_storage_and_concat_fail_explicitly() {
+        let (called, family) = fixture();
+        let (mut program, _) = crate::artifact_device::mapped_inlined(&called).unwrap();
+        let device = Device::host();
+        program.nodes.push(Node::Concat { parts: vec![program.output, 0] });
+        program.output = program.nodes.len()-1;
+        let lowered = DeviceProgram::compile_values(&device, &program).unwrap();
+        let trace = lowered.forward(&family).unwrap();
+        assert!(lowered.vjp_values_seeded(&trace, BTreeMap::from([(program.output, device.zeros(2,4).unwrap())]), &[0], Arithmetic::F64).is_err());
+        let interface = Interface::native(2).unwrap();
+        program.operators[0] = Arc::new(Operator::identity("unsupported identity", interface));
+        program.nodes.pop(); program.output = program.nodes.len()-1;
+        let lowered = DeviceProgram::compile_values(&device, &program).unwrap();
+        // Refuse unsupported trainable storage before any reverse pass.
+        let trace = lowered.forward(&family).unwrap();
+        assert!(lowered.vjp_values_dense(&trace, BTreeMap::new(), &[0], &[0], Arithmetic::F64).is_err());
     }
 }
