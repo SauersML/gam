@@ -653,23 +653,77 @@ impl<'a> CopyResidualBank<'a> {
     /// Copy additionally carries its full matrix-rule body rather than a free
     /// decoder template. Its final C32 must therefore be measured anew.
     ///
-    /// Construction may populate the ordinary weight-SVD cache, but does not fit
-    /// to evaluation states or use any previously measured fidelity score.
+    /// No factorization is performed here. Copy's scalar remains determined by
+    /// the native weights, independently of any evaluation state.
     pub fn candidate_with_prepared_factors(&self, choice: CopyResidualChoice, prepared: &LowRankProposal) -> Result<Artifact,String> {
         if choice.rank != prepared.rank { return Err("prepared factor rank differs from declared candidate".into()); }
-        let mut candidate=self.candidate(choice)?;
+        if !self.ranks.contains(&choice.rank) { return Err("rank outside declared paired bank".into()); }
+        if !self.targets.contains(&(choice.layer,choice.head)) { return Err("head outside declared paired bank".into()); }
         let native_index=operator(self.start,&format!("blocks.{}.o{}",choice.layer,choice.head))?;
         let loaded=prepared.operator(&self.start.program.operators[native_index])?;
-        let target=if choice.family==HeadApproximation::NativeSvd { native_index } else {
-            let residual=candidate.program.operators.len().checked_sub(1).ok_or("missing residual")?;
-            let nodes=&self.rules.layers[choice.layer];
-            if !matches!(&candidate.program.nodes[nodes.attention],Node::Affine{terms,..} if terms.iter().any(|&(read,op)|read==nodes.reads[choice.head] && op==residual)) {
-                return Err("prepared residual is not attached to the declared native head read".into());
-            }
-            residual
+        let nodes=&self.rules.layers[choice.layer];
+        let mut candidate=match choice.family {
+            HeadApproximation::NativeSvd => self.start.clone(),
+            HeadApproximation::CopyResidual => self.rules.copy(self.start,choice.layer,choice.head)?.candidate,
         };
-        candidate.program.operators[target]=std::sync::Arc::new(loaded);
-        candidate.expand_copy_templates()
+        match choice.family {
+            HeadApproximation::NativeSvd => candidate.program.operators[native_index]=std::sync::Arc::new(loaded),
+            HeadApproximation::CopyResidual => {
+                let residual=candidate.program.operators.len();
+                candidate.program.operators.push(std::sync::Arc::new(loaded));
+                let Node::Affine {terms,..}=&mut candidate.program.nodes[nodes.attention] else {return Err("attention is not affine".into());};
+                let position=terms.iter().position(|&(read,op)|read==nodes.reads[choice.head] && op==native_index).ok_or("prepared native head term is missing")?;
+                terms.insert(position+1,(nodes.reads[choice.head],residual));
+            }
+        }
+        candidate.bind(&format!("attention {}",choice.layer),&[nodes.normed_stream],nodes.attention)?.expand_copy_templates()
+    }
+
+    /// Compose a declared set of prepared head replacements into one autonomous
+    /// program. No singleton-fidelity filter is applied. Native head order fixes
+    /// summation order, and each affected layer receives one complete binding.
+    /// Sources of rule calls must remain native and independent of every changed
+    /// output. The resulting multi-layer program needs its own Local/Run checks.
+    pub fn compose_with_prepared_factors(&self, parts: &[(CopyResidualChoice,&LowRankProposal)]) -> Result<Artifact,String> {
+        let mut ordered=std::collections::BTreeMap::new();
+        for &(choice,prepared) in parts {
+            if ordered.insert((choice.layer,choice.head),(choice,prepared)).is_some() {
+                return Err("duplicate prepared head in joint program".into());
+            }
+        }
+        let mut out=self.start.clone();
+        let mut changed=std::collections::BTreeSet::new();
+        let mut layers=std::collections::BTreeSet::new();
+        for (_, (choice,prepared)) in ordered {
+            let piece=self.candidate_with_prepared_factors(choice,prepared)?;
+            let o=operator(self.start,&format!("blocks.{}.o{}",choice.layer,choice.head))?;
+            changed.insert(o);
+            layers.insert(choice.layer);
+            out.program.operators[o]=piece.program.operators[o].clone();
+            if choice.family==HeadApproximation::CopyResidual {
+                if piece.derived.len()!=1 || piece.derived[0].operator!=o {
+                    return Err("prepared Copy must have exactly its declared output derivation".into());
+                }
+                out.derived.push(piece.derived[0].clone());
+                let residual=piece.program.operators.last().ok_or("prepared Copy residual absent")?.clone();
+                let residual_index=out.program.operators.len();
+                out.program.operators.push(residual);
+                let nodes=&self.rules.layers[choice.layer];
+                let Node::Affine {terms,..}=&mut out.program.nodes[nodes.attention] else {
+                    return Err("joint attention output is not affine".into());
+                };
+                let position=terms.iter().position(|&(read,index)|index==o && read==nodes.reads[choice.head]).ok_or("joint native head read is missing")?;
+                terms.insert(position+1,(nodes.reads[choice.head],residual_index));
+            }
+        }
+        if out.derived.iter().any(|d|d.law.sources().iter().any(|s|changed.contains(s))) {
+            return Err("joint rule reads another changed output; native independence not established".into());
+        }
+        for layer in layers {
+            let nodes=&self.rules.layers[layer];
+            out=out.bind(&format!("attention {layer}"),&[nodes.normed_stream],nodes.attention)?;
+        }
+        Ok(out)
     }
 
     /// Projection and exact decoded coverage/cost checks for a single lazy candidate.
@@ -1128,7 +1182,9 @@ mod copy_residual_tests {
             let target=if family==HeadApproximation::NativeSvd {operator(&start,"blocks.2.o4").unwrap()} else {old.program.operators.len()-1};
             let saved=LowRankProposal::of(&old.program.operators[target]).unwrap();
             let loaded:LowRankProposal=serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
-            let candidate=bank.candidate_with_prepared_factors(choice,&loaded).unwrap();
+            let fresh=CopyResidualBank::new(&start,&layers,1,&[2],49).unwrap();
+            let candidate=fresh.candidate_with_prepared_factors(choice,&loaded).unwrap();
+            assert!(fresh.cache.iter().all(|c|c.copy.get().is_none() && c.native.get().is_none()));
             assert_eq!(candidate.program.nodes,old.program.nodes);
             assert_eq!(candidate.places,old.places);
             assert_eq!(candidate.blocks,old.blocks);
@@ -1143,6 +1199,48 @@ mod copy_residual_tests {
             let mut bad=loaded;bad.rank=1;
             assert!(bank.candidate_with_prepared_factors(choice,&bad).is_err());
         }
+    }
+
+    #[test]
+    fn joint_prepared_heads_preserve_all_native_places_and_share_paid_bodies() {
+        let (start,layers)=fixture();
+        let bank=CopyResidualBank::new(&start,&layers,1,&[2],49).unwrap();
+        for family in [HeadApproximation::NativeSvd,HeadApproximation::CopyResidual] {
+            let choices:Vec<_>=bank.choices().filter(|c|c.family==family).collect();
+            let factors:Vec<_>=choices.iter().map(|&choice| {
+                let p=bank.candidate(choice).unwrap();
+                let target=if family==HeadApproximation::NativeSvd {operator(&start,&format!("blocks.{}.o{}",choice.layer,choice.head)).unwrap()} else {p.program.operators.len()-1};
+                LowRankProposal::of(&p.program.operators[target]).unwrap()
+            }).collect();
+            let parts:Vec<_>=choices.iter().copied().zip(factors.iter()).collect();
+            let joint=bank.compose_with_prepared_factors(&parts).unwrap();
+            assert_eq!(joint.blocks.len(),4);
+            assert_eq!(joint.places,start.places);
+            assert_eq!(joint.native_nodes,start.native_nodes);
+            joint.validate_coverage(&start.program).unwrap();
+            let bytes=joint.to_bytes().unwrap();
+            let decoded=Artifact::from_bytes(&bytes,&start.program.declarations).unwrap();
+            assert_eq!(bytes,decoded.to_bytes().unwrap());
+            let mut reverse=parts.clone();reverse.reverse();
+            assert_eq!(bank.compose_with_prepared_factors(&reverse).unwrap().to_bytes().unwrap(),bytes);
+            let native_cost=super::super::acceptance::structural_cost(&start,&mut Default::default()).unwrap();
+            let cost=super::super::acceptance::structural_cost(&decoded,&mut Default::default()).unwrap();
+            assert_eq!(cost.literals,native_cost.literals-24*32+24*12*2+if family==HeadApproximation::CopyResidual {24} else {0});
+            if family==HeadApproximation::CopyResidual {
+                assert_eq!(joint.derived.len(),24);
+                let bodies:std::collections::BTreeSet<_>=joint.derived.iter().map(|d| {
+                    let OperatorLaw::Expression {body,..}=&d.law else {panic!("explicit rule expected")};
+                    let b=body.encode().unwrap();(b.len_bits(),b.packed_bytes().to_vec())
+                }).collect();
+                assert_eq!(bodies.len(),1);
+                for nodes in &layers {
+                    let Node::Affine {terms,..}=&joint.program.nodes[nodes.attention] else {panic!("affine")};
+                    assert_eq!(terms.len(),12);
+                }
+            }
+            assert!(bank.compose_with_prepared_factors(&[parts[0],parts[0]]).is_err());
+        }
+        assert_eq!(bank.compose_with_prepared_factors(&[]).unwrap().to_bytes().unwrap(),start.to_bytes().unwrap());
     }
 
     #[test]
