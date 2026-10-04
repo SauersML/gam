@@ -14,6 +14,12 @@ fn proportional_and_negative_scales_enclose_zero_optimum() {
         assert!(r.upper_bound.expect("upper") >= 0.0);
         assert_eq!(r.lower_bound, 0.0);
         assert!(r.complete_finite_inventory);
+        assert_eq!(
+            r.total_finite_keys,
+            r.lower_bound_excluded_keys
+                + r.constant_response_equivalent_keys
+                + r.tested.len() as u64
+        );
     }
 }
 #[test]
@@ -41,6 +47,10 @@ fn zero_responses_constant_objective_and_signed_zero_inventory() {
     assert!(r.upper_bound.expect("upper") >= 25.0);
     assert!(r.lower_bound <= 25.0);
     assert!(r.complete_finite_inventory);
+    assert_eq!(
+        r.constant_response_equivalent_keys + r.tested.len() as u64,
+        r.total_finite_keys
+    );
     assert_eq!(amplitude(FIRST), -f32::MAX);
     assert_eq!(amplitude(LAST), f32::MAX);
     assert_eq!(amplitude(key(-0.0)).to_bits(), (-0.0_f32).to_bits());

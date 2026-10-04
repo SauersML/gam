@@ -32,8 +32,15 @@ pub struct TestedPoint {
     pub upper_bound: f64,
 }
 #[derive(Clone, Debug, Serialize)]
+pub struct CoefficientEnclosure {
+    pub response_squared_norm: [f64; 2],
+    pub response_target_dot: [f64; 2],
+    pub target_squared_norm: [f64; 2],
+}
+#[derive(Clone, Debug, Serialize)]
 pub struct Report {
     pub budget: Budget,
+    pub row_coefficients: Vec<CoefficientEnclosure>,
     pub processed_cells: usize,
     pub evaluations_attempted: usize,
     pub lower_bound_excluded_keys: u64,
@@ -45,7 +52,8 @@ pub struct Report {
     pub upper_bound: Option<f64>,
     pub gap_upper_bound: Option<f64>,
     pub best_amplitude_bits: Option<u32>,
-    /// All finite keys were either evaluated or excluded by a valid lower bound.
+    /// All finite keys were evaluated, excluded by a valid lower bound, or
+    /// covered by exact constant-response equivalence.
     /// A positive arithmetic enclosure gap can remain even when this is true.
     pub complete_finite_inventory: bool,
     pub stop_reason: String,
@@ -188,6 +196,7 @@ pub fn search(v: &[Vec<f64>], y: &[Vec<f64>], budget: Budget) -> Result<Report, 
     }
     let mut report = Report {
         budget,
+        row_coefficients: vec![],
         processed_cells: 0,
         evaluations_attempted: 0,
         lower_bound_excluded_keys: 0,
@@ -215,6 +224,14 @@ pub fn search(v: &[Vec<f64>], y: &[Vec<f64>], budget: Budget) -> Result<Report, 
             return Ok(report);
         }
     };
+    report.row_coefficients = qs
+        .iter()
+        .map(|q| CoefficientEnclosure {
+            response_squared_norm: [q.a.lo, q.a.hi],
+            response_target_dot: [q.b.lo, q.b.hi],
+            target_squared_norm: [q.c.lo, q.c.hi],
+        })
+        .collect();
     if v.iter().flatten().all(|&x| x == 0.0) && budget.max_cells > 0 && budget.max_evaluations > 0 {
         report.evaluations_attempted += 1;
         match point(v, y, 0.0) {
