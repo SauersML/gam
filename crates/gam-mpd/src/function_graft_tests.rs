@@ -107,3 +107,40 @@ fn distinct_native_uses_retain_one_shared_numeric_body() {
     assert!(crate::acceptance::structural_cost(&shared, &mut cache).unwrap().total()
         < crate::acceptance::structural_cost(&duplicated, &mut cache).unwrap().total());
 }
+
+#[test]
+fn function_graft_preserves_values_across_native_coordinate_grouping() {
+    let mut model = native();
+    let grouped = Interface::uniform(2, 1, crate::operator_program::LabelKind::Unit, 0).unwrap();
+    let mut parent = (*model.operators[0]).clone();
+    parent.rows = grouped.clone();
+    if let OperatorBody::Dense { present, .. } = &mut parent.body { *present = Array2::from_elem((2, 1), true); }
+    model.operators[0] = Arc::new(parent);
+    let mut consumer = (*model.operators[1]).clone();
+    consumer.rows = grouped.clone(); consumer.cols = grouped.clone();
+    if let OperatorBody::Dense { present, .. } = &mut consumer.body { *present = Array2::from_elem((2, 2), true); }
+    model.operators[1] = Arc::new(consumer);
+    model.rules[0].inputs = vec![grouped];
+    model.rules[0].nodes[1] = Node::Pointwise { input: 0, laws: vec![Law::Relu; 2] };
+    model.interfaces().unwrap();
+    let mut f = function();
+    f.nodes = vec![Node::Raw { slot: 0 }, Node::Affine { terms: vec![(0, 0)], bias: None },
+        Node::Call { rule: 1, arguments: vec![1] }, Node::Affine { terms: vec![(2, 0)], bias: None }];
+    f.output = 3;
+    let graft = Artifact::native(&model).unwrap().replace_function("grouped", &f, 1, 2).unwrap();
+    graft.validate_coverage(&model).unwrap();
+    // The internal shared numeric body retains its identity and has not been retyped.
+    assert!(graft.program.operators.iter().any(|op| Arc::ptr_eq(op, &f.operators[0])));
+    let bytes = graft.to_bytes().unwrap();
+    let decoded = Artifact::from_bytes(&bytes, &model.declarations).unwrap();
+    decoded.validate_coverage(&model).unwrap();
+    assert_eq!(decoded.to_bytes().unwrap(), bytes);
+    let family = FamilyInputs { rows: 2, slots: vec![SlotValues::Raw(array![[1., -2.], [0.5, 3.]])], layout: None };
+    assert_eq!(decoded.program.execute(&family, false).unwrap().values[decoded.program.output],
+        array![[36., 144.], [9., 324.]]);
+    // A sparse block mask cannot be silently promoted to a complete boundary map.
+    let mut sparse = (*f.operators[0]).clone();
+    if let OperatorBody::Dense { present, values, .. } = &mut sparse.body { present.fill(false); values.fill(0.); }
+    f.operators[0] = Arc::new(sparse);
+    assert!(Artifact::native(&model).unwrap().replace_function("sparse", &f, 1, 2).is_err());
+}

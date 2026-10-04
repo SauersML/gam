@@ -851,9 +851,55 @@ impl Artifact {
         let read = self.place(native_read).ok_or("function graft native read is absent")?;
         let write = self.place(native_write).ok_or("function graft native write is absent")?;
         let input = super::operator_program::Interface::native(width).map_err(|e| e.to_string())?;
-        if native_interfaces[read] != input || native_interfaces[write] != interfaces[function.output] {
-            return Err("function graft native input/output interface mismatch".into());
+        if native_interfaces[read].width() != width || native_interfaces[write].width() != interfaces[function.output].width() {
+            return Err("function graft native input/output width mismatch".into());
         }
+        // Labels partition coordinates; they do not change their order. Specialize only
+        // complete dense boundary maps, preserving every coefficient and internal type.
+        // In particular, do not retype the shared nonlinear body or duplicate its Arcs.
+        let mut adapted = function.clone();
+        let specialize = |program: &mut OperatorProgram, operator: usize,
+                          rows: Option<&super::operator_program::Interface>,
+                          cols: Option<&super::operator_program::Interface>| -> Result<usize, String> {
+            let mut op = (*program.operators[operator]).clone();
+            if let Some(rows) = rows { op.rows = rows.clone(); }
+            if let Some(cols) = cols { op.cols = cols.clone(); }
+            match &mut op.body {
+                OperatorBody::Dense { present, .. } if present.iter().all(|keep| *keep) => {
+                    *present = Array2::from_elem((op.rows.group_count(), op.cols.group_count()), true);
+                }
+                _ => return Err("function graft regrouping requires complete dense boundary operators".into()),
+            }
+            let index = program.operators.len();
+            program.operators.push(Arc::new(op));
+            Ok(index)
+        };
+        if native_interfaces[read] != input {
+            for index in 0..adapted.nodes.len() {
+                if let Node::Affine { mut terms, bias } = adapted.nodes[index].clone() {
+                    for (parent, operator) in &mut terms {
+                        if matches!(adapted.nodes[*parent], Node::Raw { slot: 0 }) {
+                            *operator = specialize(&mut adapted, *operator, None, Some(&native_interfaces[read]))?;
+                        }
+                    }
+                    adapted.nodes[index] = Node::Affine { terms, bias };
+                }
+            }
+        }
+        if native_interfaces[write] != interfaces[function.output] {
+            let Node::Affine { mut terms, mut bias } = adapted.nodes[adapted.output].clone() else {
+                return Err("function graft regrouping requires an affine output boundary".into());
+            };
+            for (_, operator) in &mut terms {
+                *operator = specialize(&mut adapted, *operator, Some(&native_interfaces[write]), None)?;
+            }
+            if let Some(operator) = &mut bias {
+                *operator = specialize(&mut adapted, *operator, Some(&native_interfaces[write]), None)?;
+            }
+            adapted.nodes[adapted.output] = Node::Affine { terms, bias };
+        }
+        let function = &adapted;
+        let input = native_interfaces[read].clone();
         let mut result = self.clone();
         let offset_ops = result.program.operators.len();
         let offset_rules = result.program.rules.len();
