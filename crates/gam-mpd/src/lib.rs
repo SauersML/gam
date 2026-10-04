@@ -42,11 +42,6 @@ pub mod block;
 // KL and total-variation bounds over logit boxes.
 pub mod bounds;
 
-// The box claim's worst case, certified by bound propagation through the masked program.
-pub mod certify;
-#[cfg(test)]
-mod certify_tests;
-
 // Prefix, subset and graph codes for the global artifact and local packets.
 pub mod codec;
 
@@ -79,6 +74,12 @@ mod explanation_tests;
 #[cfg(test)]
 mod masked_tests;
 
+// An adversary inside a box claim: sign ascent over the off gates, a lower bound on its worst case.
+pub mod adversary;
+
+#[cfg(test)]
+mod adversary_tests;
+
 // Rank-k gated subcomponents: which of a library's columns share one gate, chosen by the code.
 pub mod blocks;
 
@@ -97,12 +98,6 @@ pub mod tail;
 
 #[cfg(test)]
 mod tail_tests;
-
-// Atomic checkpoints of a streaming masked fit, so an interrupted run resumes exactly.
-pub mod checkpoint;
-
-#[cfg(test)]
-mod checkpoint_tests;
 
 #[cfg(test)]
 mod pieces_tests;

@@ -1371,13 +1371,13 @@ fn box_worst(
             }
         }
     }
-    // An adversary inside the box ([`super::certify::adversary`]): sign ascent over every off gate
+    // An adversary inside the box ([`super::adversary::adversary`]): sign ascent over every off gate
     // together, and over each layer's off gates alone (the rest at the masks), from the masks, every
     // gate's top and its middle; each input keeps the largest KL any point gave it, so a word is
     // charged its own worst case.
     const ADVERSARY_STEPS: usize = 4;
     const ADVERSARY_STARTS: usize = 3;
-    let claim = super::certify::Gates::claim(masks);
+    let claim = super::adversary::Gates::claim(masks);
     let mut boxes = vec![claim.clone()];
     if layers.len() > 1 {
         for sites in layers.values() {
@@ -1391,7 +1391,7 @@ fn box_worst(
         }
     }
     let seeds: Vec<u64> = (0..boxes.len()).map(|i| 0xAD5E + i as u64).collect();
-    for kl_point in timed("adversary", || super::certify::adversary_batch(masked, base, target, &boxes, ADVERSARY_STEPS, ADVERSARY_STARTS, &seeds))? {
+    for kl_point in timed("adversary", || super::adversary::adversary_batch(masked, base, target, &boxes, ADVERSARY_STEPS, ADVERSARY_STARTS, &seeds))? {
         let excess = &kl_point - corner;
         for r in 0..rows {
             worst[r] = worst[r].max(excess[r]);

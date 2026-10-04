@@ -337,7 +337,7 @@ fn a_resumed_screened_selection_is_the_uninterrupted_one() {
 /// and finds what each box's own run finds on the CPU.
 #[test]
 fn a_batched_adversary_on_a_device_finds_each_boxs_points() {
-    use super::certify::{Gates, adversary, adversary_batch};
+    use super::adversary::{Gates, adversary, adversary_batch};
     let (unlowered, base, masks, clean) = masked_fixture();
     let (lowered, _, _, _) = masked_fixture();
     lowered.lower_on(&gam_gpu::tensor::Device::host(), Arithmetic::F64).expect("lowered");

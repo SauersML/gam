@@ -1,9 +1,9 @@
 #![cfg(test)]
-//! The box claim's certificate against every point an adversary or a draw finds in the box, on small
-//! programs with every node kind the certificate reads.
+//! The adversary inside the box claim on small programs with every node kind a masked program
+//! reads.
 
-use super::certify::{Curve, GELU_CURVATURE, Gates, Relaxation, SILU_CURVATURE, adversary, certify, certify_branching, linearize};
-use super::masked::{Library, Masked, Target, forward, matrix, sites};
+use super::adversary::{Gates, adversary, adversary_screened};
+use super::masked::{HeadScreen, Library, Masked, Target, forward, matrix, screened_point, sites};
 use super::operator_program::{
     Basis, Declarations, Domain, FamilyInputs, Interface, LabelKind, Law, Node, Operator, OperatorProgram, Provenance,
     Rotary, Scale, SequenceLayout, Slot, SlotValues,
@@ -226,127 +226,10 @@ fn fixtures() -> Vec<(&'static str, OperatorProgram, FamilyInputs)> {
     out
 }
 
-/// The certificate is at or above the KL of the masks, of draws inside the box and of every point an adversary
-/// visits, with no symbol dropped, with most enclosed along principal directions, and with nearly every one dropped.
-#[test]
-fn certificates_contain_every_point_found_in_the_box() {
-    for (name, program, family) in fixtures() {
-        for seed in [3, 71] {
-            let (masked, masks, target, radius) = masked(&program, &family, seed);
-            let gates = Gates::claim(&masks);
-            let found = adversary(&masked, &family, &target, &gates, None, 8, 6, seed as u64).expect("adversary");
-            let mut worst = found.clone();
-            for draw in 0..20 {
-                let point: Vec<Array2<f64>> = masks
-                    .iter()
-                    .enumerate()
-                    .map(|(k, m)| Array2::from_shape_fn(m.dim(), |(r, c)| if m[[r, c]] > 0.0 { 1.0 } else { 0.5 + 0.5 * noise(seed * 7 + draw * 1009 + k * 31 + r * 17 + c) }))
-                    .collect();
-                let (kl, _, _) = forward(&masked, &masked.family(&family, &point), &target).expect("forward");
-                ndarray::Zip::from(&mut worst).and(&kl).for_each(|w, &v| *w = w.max(v));
-            }
-            for budget in [4096, 24, 2] {
-                let bound = certify(&masked, &family, &target, Some(&radius), &gates, Relaxation::sound(budget)).expect("certificate");
-                for r in 0..family.rows {
-                    assert!(bound[r].is_finite(), "{name}, seed {seed}, budget {budget}: row {r} unbounded");
-                    assert!(bound[r] >= worst[r], "{name}, seed {seed}, budget {budget}: row {r} certified {} below a found {}", bound[r], worst[r]);
-                }
-            }
-        }
-    }
-}
-
-/// With every gate pinned to one value the box is a point, and the certificate is that point's own divergence.
-#[test]
-fn a_pinned_box_certifies_its_own_divergence() {
-    for (name, program, family) in fixtures() {
-        let (masked, masks, target, radius) = masked(&program, &family, 5);
-        let point: Vec<Array2<f64>> = masks
-            .iter()
-            .enumerate()
-            .map(|(k, m)| Array2::from_shape_fn(m.dim(), |(r, c)| 0.5 + 0.5 * noise(400 + 31 * k + 7 * r + c)))
-            .collect();
-        let gates = Gates { lower: point.clone(), upper: point.clone(), restored: None };
-        let bound = certify(&masked, &family, &target, Some(&radius), &gates, Relaxation::sound(64)).expect("certificate");
-        let (kl, _, _) = forward(&masked, &masked.family(&family, &point), &target).expect("forward");
-        for r in 0..family.rows {
-            assert!(bound[r] >= kl[r], "{name}: row {r} certified {} below its {}", bound[r], kl[r]);
-            assert!(bound[r] <= kl[r] + 1e-9 * (1.0 + kl[r]), "{name}: row {r} certified {} for a point of KL {}", bound[r], kl[r]);
-        }
-    }
-}
-
-/// Branching only lowers the certificate, which still contains what the adversary finds.
-#[test]
-fn branching_tightens_and_stays_sound() {
-    for (name, program, family) in fixtures() {
-        let (masked, masks, target, radius) = masked(&program, &family, 11);
-        let found = adversary(&masked, &family, &target, &Gates::claim(&masks), None, 8, 4, 11).expect("adversary");
-        let branched = certify_branching(&masked, &family, &target, Some(&radius), Gates::claim(&masks), Relaxation::sound(4096), 9).expect("branched");
-        for r in 0..family.rows {
-            assert!(branched.kl[r] <= branched.root[r], "{name}: row {r} branched {} above its root {}", branched.kl[r], branched.root[r]);
-            assert!(branched.kl[r] >= found[r], "{name}: row {r} branched {} below a found {}", branched.kl[r], found[r]);
-        }
-    }
-}
-
-/// Every line a relaxation draws holds its curve within its deviation over the whole interval.
-#[test]
-fn linearizations_contain_their_curves() {
-    let curves = [
-        Curve::Law(Law::Relu),
-        Curve::Law(Law::Silu),
-        Curve::Law(Law::Gelu),
-        Curve::Law(Law::GeluTanh),
-        Curve::Exp,
-        Curve::InverseSqrt,
-        Curve::Reciprocal,
-    ];
-    for (n, curve) in curves.into_iter().enumerate() {
-        for trial in 0..60 {
-            let a = 6.0 * noise(n * 1000 + 2 * trial);
-            let w = 8.0 * (noise(n * 1000 + 2 * trial + 1) + 1.0).powi(3);
-            let (l, h) = match curve {
-                Curve::InverseSqrt | Curve::Reciprocal => (1e-3 + a.abs(), 1e-3 + a.abs() + w),
-                _ => (a - w / 2.0, a + w / 2.0),
-            };
-            let (lambda, mu, delta) = linearize(curve, l, h).expect("a line");
-            let exact = |t: f64| match curve {
-                Curve::Law(law) => law.apply(t),
-                Curve::Exp => t.exp(),
-                Curve::InverseSqrt => 1.0 / t.sqrt(),
-                Curve::Reciprocal => 1.0 / t,
-            };
-            for k in 0..=2000 {
-                let t = l + (h - l) * k as f64 / 2000.0;
-                let deviation = (exact(t) - (lambda * t + mu)).abs();
-                assert!(deviation <= delta * (1.0 + 1e-12) + 1e-12 * exact(t).abs(), "{curve:?} on [{l}, {h}] at {t}: {deviation} > {delta}");
-            }
-        }
-    }
-}
-
-/// The second-derivative bounds of SiLU and both GELUs, on a fine grid of central differences.
-#[test]
-fn second_derivative_bounds_hold() {
-    let h = 1e-4;
-    for (law, bound) in [(Law::Silu, SILU_CURVATURE), (Law::Gelu, GELU_CURVATURE), (Law::GeluTanh, GELU_CURVATURE)] {
-        let mut largest = 0.0_f64;
-        for k in 0..=24000 {
-            let t = -12.0 + k as f64 * 1e-3;
-            let second = (law.apply(t + h) - 2.0 * law.apply(t) + law.apply(t - h)) / (h * h);
-            largest = largest.max(second.abs());
-        }
-        assert!(largest < bound, "{law:?}: |f''| reaches {largest}, bound {bound}");
-    }
-}
-
 /// The adversary with every head screened (its f32 band carried, each row settled to float64 only
 /// where a point could hold its maximum) returns exactly the per-word KLs of the float64 one.
 #[test]
 fn a_screened_adversary_returns_the_float64_one() {
-    use super::certify::adversary_screened;
-    use super::masked::{HeadScreen, screened_point};
     let mut screened_any = false;
     for (name, program, family) in fixtures() {
         for seed in [3, 71] {
@@ -361,38 +244,16 @@ fn a_screened_adversary_returns_the_float64_one() {
     assert!(screened_any, "no fixture has a lone head to screen");
 }
 
-/// Under a restoration claim the certificate is at or above every word's KL with any one or two of its
-/// off subcomponents restored (all of them, one at a time, and random pairs at random strengths) and
-/// above every point the projected adversary visits.
+/// The adversary's first start is the masks themselves and every later point stays in the box, so
+/// the KL it returns for each input is at least the masks' own.
 #[test]
-fn restoration_certificates_contain_every_restoration_found() {
+fn the_adversary_finds_at_least_the_masks_kl() {
     for (name, program, family) in fixtures() {
-        let (masked, masks, target, radius) = masked(&program, &family, 23);
-        for k in [1usize, 2] {
-            let gates = Gates::restoring(&masks, k);
-            let bound = certify(&masked, &family, &target, Some(&radius), &gates, Relaxation::sound(4096)).expect("certificate");
-            let mut worst = adversary(&masked, &family, &target, &gates, None, 8, 4, 23).expect("adversary");
-            let off: Vec<(usize, usize, usize)> = masks
-                .iter()
-                .enumerate()
-                .flat_map(|(s, m)| m.indexed_iter().filter(|(_, v)| **v <= 0.0).map(move |((r, c), _)| (s, r, c)))
-                .collect();
-            for (n, &(site, row, column)) in off.iter().enumerate() {
-                let mut point: Vec<Array2<f64>> = masks.clone();
-                point[site][[row, column]] = 1.0;
-                if k == 2 {
-                    // A second off gate of the same word, at a random strength.
-                    if let Some(&(s2, _, c2)) = off.iter().skip((n * 7 + 3) % off.len()).find(|(s2, r2, c2)| *r2 == row && (*s2, *c2) != (site, column)) {
-                        point[s2][[row, c2]] = 0.5 + 0.5 * noise(n);
-                    }
-                }
-                let (kl, _, _) = forward(&masked, &masked.family(&family, &point), &target).expect("forward");
-                ndarray::Zip::from(&mut worst).and(&kl).for_each(|w, &v| *w = w.max(v));
-            }
-            for r in 0..family.rows {
-                assert!(bound[r].is_finite(), "{name}, k {k}: row {r} unbounded");
-                assert!(bound[r] >= worst[r], "{name}, k {k}: row {r} certified {} below a found {}", bound[r], worst[r]);
-            }
+        let (masked, masks, target, _) = masked(&program, &family, 5);
+        let (at_masks, _, _) = forward(&masked, &masked.family(&family, &masks), &target).expect("forward");
+        let found = adversary(&masked, &family, &target, &Gates::claim(&masks), None, 8, 4, 5).expect("adversary");
+        for r in 0..family.rows {
+            assert!(found[r] >= at_masks[r], "{name}, row {r}: the adversary's {} below the masks' {}", found[r], at_masks[r]);
         }
     }
 }
