@@ -520,21 +520,6 @@ impl Law {
         }
     }
 
-    /// Whether the exact law is zero on all of `[lo, hi]` (`Some(true)`), nonzero on all of it
-    /// (`Some(false)`), or neither is proven (`None`). ReLU vanishes exactly on `t ≤ 0`; the
-    /// identity, SiLU and both GELUs vanish on the reals only at `t = 0`.
-    pub fn vanishes_on(self, lo: f64, hi: f64) -> Option<bool> {
-        match self {
-            Self::Zero => Some(true),
-            Self::Relu if hi <= 0.0 => Some(true),
-            Self::Relu if lo > 0.0 => Some(false),
-            Self::Relu => None,
-            _ if lo == 0.0 && hi == 0.0 => Some(true),
-            _ if lo > 0.0 || hi < 0.0 => Some(false),
-            _ => None,
-        }
-    }
-
     /// A bound on the law's slope: its Lipschitz constant on the reals.
     pub fn lipschitz(self) -> f64 {
         match self {
@@ -2005,24 +1990,6 @@ impl OperatorProgram {
         })
     }
 
-    /// Node `index`'s own law applied with the nodes in `patch` taking those values and every other
-    /// node read from `base` (unbanded): e.g. an attend node's read of a chosen value field at the
-    /// attention its traced query and key fix.
-    pub fn evaluate_with(
-        &self,
-        index: usize,
-        inputs: &FamilyInputs,
-        base: &Trace,
-        patch: &BTreeMap<usize, Array2<f64>>,
-        interfaces: &[Interface],
-    ) -> Result<Array2<f64>, ProgramError> {
-        let node = self.nodes.get(index).ok_or(ProgramError::Reference { what: "node", index })?;
-        let values = Layered { base: &base.values, top: &[], from: base.values.len(), patch: Some(patch) };
-        let ones = vec![1.0; self.declarations.parameters];
-        let frame = Frame { args: &[], parameters: &ones, nodes: &self.nodes, output: self.output };
-        Ok(self.evaluate_node(index, node, inputs, &values, None, interfaces, &frame)?.0)
-    }
-
     /// Node `index` recomputed from its arguments' new values.
     fn recompute(
         &self,
@@ -2199,27 +2166,6 @@ impl OperatorProgram {
         Ok((output, band))
     }
 
-    /// The slots node `node` reads, through its arguments and the bodies of the rules it calls.
-    pub fn slots_read(&self, node: usize) -> Result<BTreeSet<usize>, ProgramError> {
-        let mut read = BTreeSet::new();
-        let mut seen = vec![false; self.nodes.len()];
-        let mut pending = vec![node];
-        while let Some(index) = pending.pop() {
-            let current = self.nodes.get(index).ok_or(ProgramError::Reference { what: "node", index })?;
-            if std::mem::replace(&mut seen[index], true) {
-                continue;
-            }
-            if let Node::Feature { slot, .. } | Node::Raw { slot } = current {
-                read.insert(*slot);
-            }
-            if let Node::Call { rule, .. } = current {
-                read.extend(self.rule_slots(*rule)?);
-            }
-            pending.extend(current.arguments());
-        }
-        Ok(read)
-    }
-
     /// The slots a rule body reads directly (its arguments carry the rest).
     fn rule_slots(&self, rule: usize) -> Result<BTreeSet<usize>, ProgramError> {
         let body = self.rules.get(rule).ok_or(ProgramError::Reference { what: "rule", index: rule })?;
@@ -2301,28 +2247,6 @@ impl OperatorProgram {
             return Err(ProgramError::Input("one value set per declared slot".to_string()));
         }
         Ok(())
-    }
-
-    /// Each node's local rounding on the rows of `trace` (an unbanded trace of this program): the
-    /// band of the node's computed value when every argument is taken as exact.
-    pub fn local_rounding(&self, inputs: &FamilyInputs, trace: &Trace) -> Result<Vec<Array2<f64>>, ProgramError> {
-        self.check_inputs(inputs)?;
-        let interfaces = self.interfaces()?;
-        let ones = vec![1.0; self.declarations.parameters];
-        let frame = Frame { args: &[], parameters: &ones, nodes: &self.nodes, output: self.output };
-        let count = trace.values.len();
-        let zero_balls: Vec<Array1<f64>> = (0..count).map(|_| Array1::zeros(inputs.rows)).collect();
-        let values = Layered { base: &trace.values, top: &[], from: count, patch: None };
-        let balls = Balls { base: &zero_balls, top: &[], from: count };
-        let mut out = Vec::with_capacity(count);
-        for index in 0..self.nodes.len().min(count) {
-            let zeros: BTreeMap<usize, Array2<f64>> =
-                self.nodes[index].arguments().into_iter().map(|a| (a, Array2::zeros(trace.values[a].dim()))).collect();
-            let bands = Layered { base: &trace.values, top: &[], from: count, patch: Some(&zeros) };
-            let (_, band, _) = self.evaluate_enclosed(index, inputs, (&values, &bands, &balls), &interfaces, &frame)?;
-            out.push(band);
-        }
-        Ok(out)
     }
 
     /// One node's value and its enclosure (entrywise band, per-row ball): the affine, transposed,
@@ -2899,15 +2823,6 @@ impl OperatorProgram {
             }
             Node::Readout { input, basis } => self.bases[*basis].read_banded(&self.declarations, value(*input), band(*input)),
         }
-    }
-
-    /// One node's interface (validates the whole program).
-    pub fn node_interface(&self, node: usize) -> Result<Interface, ProgramError> {
-        let mut interfaces = self.interfaces()?;
-        if node >= interfaces.len() {
-            return Err(ProgramError::Reference { what: "node", index: node });
-        }
-        Ok(interfaces.swap_remove(node))
     }
 
     /// Remove nodes the output does not read and operators and bases no node reads, keeping order.
@@ -3889,39 +3804,6 @@ impl OperatorProgram {
             encode_node(&mut nodes, node, index, &code, &interfaces)?;
         }
         Ok((header_bits, basis_bits, rule_bits, nodes.len_bits()))
-    }
-
-    /// [`Self::code_bits`] given `base`, a program whose message is `base_bits` long and whose
-    /// operators this one shares wherever it has not changed them: only the operators that differ
-    /// (by pointer, then by value) and the frame are re-measured. A different operator count
-    /// measures the whole message.
-    ///
-    /// `base_operator_bits` caches the base's operator lengths across candidates of one base.
-    pub fn code_bits_from(&self, base: &OperatorProgram, base_bits: u64, base_operator_bits: &mut BTreeMap<usize, u64>) -> Result<u64, ProgramError> {
-        if self.operators.len() != base.operators.len() {
-            return self.code_bits();
-        }
-        let mut bits = base_bits as i128;
-        for (index, (new, old)) in self.operators.iter().zip(&base.operators).enumerate() {
-            if Arc::ptr_eq(new, old) || new == old {
-                continue;
-            }
-            let old_bits = match base_operator_bits.get(&index) {
-                Some(bits) => *bits,
-                None => {
-                    let (os, or) = operator_bits(old)?;
-                    base_operator_bits.insert(index, os + or);
-                    os + or
-                }
-            };
-            let (ns, nr) = operator_bits(new)?;
-            bits += i128::from(ns + nr) - i128::from(old_bits);
-        }
-        if self.nodes != base.nodes || self.bases != base.bases || self.rules != base.rules || self.declarations != base.declarations {
-            let frame = |(h, b, r, n): (u64, Vec<u64>, u64, u64)| i128::from(h + b.iter().sum::<u64>() + r + n);
-            bits += frame(self.frame_bits()?) - frame(base.frame_bits()?);
-        }
-        u64::try_from(bits).map_err(|_| ProgramError::Code(format!("a message of {bits} bits")))
     }
 
     fn top_code<'a>(&self, rule_inputs: &'a [usize]) -> NodeCode<'a> {
