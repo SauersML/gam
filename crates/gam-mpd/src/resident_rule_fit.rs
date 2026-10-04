@@ -1127,6 +1127,40 @@ mod tests {
         );
     }
     #[test]
+    fn reordered_interleaved_raw_slots_fit_and_measure_the_same_program() {
+        let mut ordered = model(0.6, 0.1);
+        ordered.rules.clear();
+        ordered.declarations.slots = vec![Slot::Raw { width: 1 }, Slot::Raw { width: 1 }];
+        ordered.nodes = vec![Node::Raw { slot: 0 }, Node::Raw { slot: 1 },
+            Node::Affine { terms: vec![(1, 2)], bias: None },
+            Node::Affine { terms: vec![(0, 0), (2, 2)], bias: Some(1) }];
+        ordered.output = 3;
+        let mut reordered = ordered.clone();
+        reordered.nodes = vec![Node::Raw { slot: 1 },
+            Node::Affine { terms: vec![(0, 2)], bias: None },
+            Node::Raw { slot: 0 },
+            Node::Affine { terms: vec![(2, 0), (1, 2)], bias: Some(1) }];
+        let inputs = vec![ndarray::array![[1.], [-2.], [3.]], ndarray::array![[4.], [1.], [-1.]]];
+        let target = ndarray::array![[10.], [-1.], [2.]];
+        let groups = [OutputGroup { label: "output".into(), start: 0, end: 1 }];
+        let d = Device::host();
+        let measured = measure_grouped(&d, &ordered, &inputs, &target, &groups, 1 << 20, 2).expect("ordered measure");
+        let other = measure_grouped(&d, &reordered, &inputs, &target, &groups, 1 << 20, 2).expect("reordered measure");
+        assert_eq!(measured.maximum, other.maximum);
+        assert_eq!(measured.worst_row, other.worst_row);
+        let mut config = settings();
+        config.iterations = 4;
+        config.forward_rows = 2;
+        let a = fit_grouped(&d, &ordered, &inputs, &target, &inputs, &target, &groups, &[0, 1], config.clone()).expect("ordered fit");
+        let b = fit_grouped(&d, &reordered, &inputs, &target, &inputs, &target, &groups, &[0, 1], config).expect("reordered fit");
+        assert_eq!(a.report.initial_training_max, b.report.initial_training_max);
+        assert_eq!(a.report.best_training_max, b.report.best_training_max);
+        for index in [0, 1] {
+            assert_eq!(a.program.operators[index].matrix(), b.program.operators[index].matrix());
+        }
+    }
+
+    #[test]
     fn shared_nonlinear_parameters_fit_joint_output_max_error_without_validation_selection() {
         let p = model(0.6, 0.1);
         let teacher = model(1.2, -0.2);
