@@ -17,6 +17,21 @@ use std::{
     time::Instant,
 };
 
+/// Product arithmetic for proposing coefficients. Acceptance and standalone `measure`
+/// always use the ordinary f64 evaluator. This does not change stored parameter precision.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProposalArithmetic {
+    #[default]
+    F64,
+    F32,
+}
+impl ProposalArithmetic {
+    fn device(self) -> Arithmetic {
+        match self { Self::F64 => Arithmetic::F64, Self::F32 => Arithmetic::F32 }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
     pub iterations: usize,
@@ -27,6 +42,9 @@ pub struct Settings {
     pub epsilon: f64,
     /// Bound on planned numeric buffers, not CUDA/library/allocator/attention workspaces.
     pub numeric_bytes: usize,
+    /// Explicit optional fast proposal products; f64 preserves previous experiment settings.
+    #[serde(default)]
+    pub arithmetic: ProposalArithmetic,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Iteration {
@@ -276,6 +294,7 @@ pub fn fit(
             .ok_or("parameter size overflow")?;
     }
     let mut program = DeviceProgram::compile_values_bounded(d, &expanded, settings.numeric_bytes)?;
+    program.set_arithmetic(settings.arithmetic.device());
     let parameters = checked_bytes(parameter_elements)?;
     let panels = checked_bytes(
         train_x
@@ -372,7 +391,7 @@ pub fn fit(
             BTreeMap::from([(program.hidden(), seed)]),
             &[],
             trainable,
-            Arithmetic::F64,
+            settings.arithmetic.device(),
         )?;
         for &index in trainable {
             let mut value = d
@@ -434,7 +453,7 @@ pub fn fit(
             iterations: history,
             planned_numeric_bytes: planned,
             seconds: started.elapsed().as_secs_f64(),
-            scope: "Proposal optimization only, fixed finite f64 input/output rows. Deterministic active-row max-norm subgradient with existing Adam; full row scan in declared chunks and one-row reverse. Single-row GEMM rounding may differ from batch; recomputed error recorded; nonconvex, no optimum certificate. Best training snapshot, validation excluded from selection. Resident numerical parameters/gradients/moments/inputs/targets; O(rows) norms downloaded each step and final parameters downloaded. Numeric plan excludes attention/library/allocator/context/register/spill scratch. Final f32 decoded acceptance is separate.",
+            scope: "Proposal optimization only, fixed finite f64 input/output rows. Explicit settings.arithmetic governs forward and backward products, including training/validation proposal scores; parameter/moment storage and other primitives remain f64. The f32 option uses rounded-product surrogate gradients, not derivatives through rounding. Deterministic active-row max-norm Adam; full row scan in declared chunks and one-row reverse. Single-row GEMM rounding may differ from batch; recomputed error recorded; nonconvex, no optimum certificate. Best training snapshot, validation excluded from selection. Resident numerical parameters/gradients/moments/inputs/targets; O(rows) norms downloaded each step and final parameters downloaded. Numeric plan excludes product conversion/library/allocator/context/register/spill scratch. Final decoded f64 measurement and acceptance are separate.",
         },
     })
 }
@@ -564,7 +583,34 @@ mod tests {
             beta2: 0.99,
             epsilon: 1e-8,
             numeric_bytes: 1 << 20,
+            arithmetic: ProposalArithmetic::F64,
         }
+    }
+    #[test]
+    fn proposal_product_arithmetic_is_explicit_and_measurement_remains_f64() {
+        let p = model(0.6, 0.1);
+        let teacher = model(1.2, -0.2);
+        let x = ndarray::array![[-1.2], [-0.3], [0.4], [1.1], [1.8]];
+        let v = ndarray::array![[-0.7], [0.8], [1.5]];
+        let y = target(&teacher, &x);
+        let vy = target(&teacher, &v);
+        let d = Device::host();
+        let mut s = settings(); s.arithmetic = ProposalArithmetic::F32;
+        let result = fit(&d, &p, &x, &y, &v, &vy, &[0, 1], s.clone()).unwrap();
+        assert_eq!(result.report.settings.arithmetic, ProposalArithmetic::F32);
+        assert!(result.report.best_training_max < result.report.initial_training_max * 0.1);
+        // Final f64 scoring must use decoded numerical parameters, never cached f32 fit scores.
+        let fitted_y = target(&result.program, &x);
+        let scale = panel(&x, &y, 1, 2).unwrap();
+        let expected = fitted_y.outer_iter().zip(y.outer_iter()).map(|(a,b)|
+            a.iter().zip(b).map(|(a,b)| (a-b).powi(2)).sum::<f64>().sqrt()/scale
+        ).fold(0.0_f64, f64::max);
+        let actual = measure(&d, &result.program, &x, &y, s.numeric_bytes, s.forward_rows).unwrap();
+        assert!((actual - expected).abs() < 2e-12);
+        let mut encoded = serde_json::to_value(s).unwrap();
+        assert_eq!(encoded["arithmetic"], "f32");
+        encoded.as_object_mut().unwrap().remove("arithmetic");
+        assert_eq!(serde_json::from_value::<Settings>(encoded).unwrap().arithmetic, ProposalArithmetic::F64);
     }
     #[test]
     fn shared_nonlinear_parameters_fit_joint_output_max_error_without_validation_selection() {
