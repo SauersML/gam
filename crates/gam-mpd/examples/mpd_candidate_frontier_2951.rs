@@ -14,12 +14,15 @@
 //! groups= (all declared episode groups), cuda_share_native=0 (opt-in exact GPU parameter reuse),
 //! cuda_local=1 by default with backend=cuda and ascent=0 (resident native-parent
 //! graft and row-norm reduction); cuda_local=0 explicitly retains the CPU reference.
+//! cuda_resident_run=1 keeps teacher/candidate states, donor rows and raw-logit scoring on CUDA.
+//! Requires explicit cuda_{aggregate,teacher,operator,edit,metric_workspace}_bytes,
+//! cuda_metric_batch_rows and both cuda_readout_* budgets. No CPU fallback.
 //! A bank entry names either an `artifact` path or `copy_masks`, one head bitmask
 //! per native layer. Explicit masks are proposals, measured afresh by the same acceptance path.
 //! SHA-256 input manifests require sha256sum
 //! or shasum on PATH. No greedy feasibility pruning is used.
 
-use gam_mpd::acceptance::{Ascent, Assessment, Constraint, CostCache, Local, SlotDomain, assess_once};
+use gam_mpd::acceptance::{Ascent, Assessment, Constraint, CostCache, Local, RunCheck, SlotDomain, assess_once};
 use gam_mpd::artifact::Artifact;
 use gam_mpd::candidate_frontier::{Candidate, account_bank, frontier};
 use gam_mpd::counterfactual::{Decoder, Spec, passages};
@@ -145,6 +148,13 @@ fn main() -> Result<(), String> {
         "cuda_local",
         "cuda_readout_resident_bytes",
         "cuda_readout_workspace_bytes",
+        "cuda_resident_run",
+        "cuda_aggregate_bytes",
+        "cuda_teacher_bytes",
+        "cuda_operator_bytes",
+        "cuda_edit_bytes",
+        "cuda_metric_workspace_bytes",
+        "cuda_metric_batch_rows",
         "local_kl",
     ];
     if let Some(k) = keys.keys().find(|k| !allowed.contains(&k.as_str())) {
@@ -199,6 +209,22 @@ fn main() -> Result<(), String> {
     let native = split_sites(&imported.program)?;
     let run = LanguageRun::new(&decoder, &native, &spec, &run_passages, parallel)?;
     let backend = key("backend", "cpu");
+    let resident_run_enabled = number("cuda_resident_run", 0)?;
+    if resident_run_enabled > 1 || (resident_run_enabled == 1 && backend != "cuda") {
+        return Err("cuda_resident_run must be 0 or 1; 1 requires backend=cuda".into());
+    }
+    let resident_budget = if resident_run_enabled == 1 {
+        Some(gam_mpd::run_check::ResidentBudget {
+            aggregate_numeric_bytes: required("cuda_aggregate_bytes")?,
+            teacher_bytes: required("cuda_teacher_bytes")?,
+            operator_bytes: required("cuda_operator_bytes")?,
+            edit_bytes: required("cuda_edit_bytes")?,
+            metric: gam_mpd::fixed_metric_device::Budget {
+                batch_rows: required("cuda_metric_batch_rows")?,
+                workspace_bytes: required("cuda_metric_workspace_bytes")?,
+            },
+        })
+    } else { None };
     let ascent_evaluations = number("ascent", 0)?;
     let cuda_local = number("cuda_local", usize::from(backend == "cuda" && ascent_evaluations == 0))?;
     if cuda_local > 1 || (cuda_local == 1 && backend != "cuda") {
@@ -219,6 +245,9 @@ fn main() -> Result<(), String> {
     let readout_budget = keys.get("cuda_readout_resident_bytes").zip(keys.get("cuda_readout_workspace_bytes"));
     if keys.contains_key("cuda_readout_resident_bytes") != keys.contains_key("cuda_readout_workspace_bytes") {
         return Err("CUDA readout requires both explicit numeric-buffer budgets".into());
+    }
+    if resident_budget.is_some() && readout_budget.is_none() {
+        return Err("cuda_resident_run requires both explicit CUDA readout budgets".into());
     }
     let run = if let Some((resident, workspace)) = readout_budget {
         run.with_cuda_readout(gam_mpd::native_readout::Budget {
@@ -259,6 +288,8 @@ fn main() -> Result<(), String> {
         return Err("cuda_share_native must be 0 or 1; 1 requires backend=cuda".into());
     }
     let run = if share_native == 1 { run.with_cuda_native_source(&start)? } else { run };
+    let resident_run = resident_budget.map(|budget| run.resident_run(budget));
+    let evaluator: &dyn RunCheck = match &resident_run { Some(resident) => resident, None => &run };
     let interner = DecodedOperatorInterner::new(&start)?;
     let mut candidates = vec![Candidate { label: "native".into(), artifact: start.clone() }];
     let mut labels = BTreeSet::from(["native".to_string()]);
@@ -326,7 +357,7 @@ fn main() -> Result<(), String> {
     let hashing_seconds = timer.elapsed().as_secs_f64();
     eprintln!("{} candidate messages supplied, {} episodes, {} local rows", supplied_candidates, spec.episodes.len(), local_family.rows);
     let timer = Instant::now();
-    let evaluated = frontier(&local, &run, candidates, &constraints, budget)?;
+    let evaluated = frontier(&local, evaluator, candidates, &constraints, budget)?;
     let frontier_seconds = timer.elapsed().as_secs_f64();
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
     let local_kl_enabled = match key("local_kl", "0").as_str() {
@@ -343,7 +374,7 @@ fn main() -> Result<(), String> {
             if let std::collections::btree_map::Entry::Vacant(entry) = replayed.entry(index) {
                 let bytes = candidate.artifact.to_bytes()?;
                 let decoded = Artifact::from_bytes(&bytes, &native.declarations)?;
-                let measured = assess_once(&local, &run, &decoded, point.constraint, &mut replay_cache)?;
+                let measured = assess_once(&local, evaluator, &decoded, point.constraint, &mut replay_cache)?;
                 if local_kl_enabled {
                     isolated_replays.insert(index, gam_mpd::local_kl::isolated_downstream_kl(&native, &decoded, &local_family, batch)?);
                 }
@@ -407,6 +438,18 @@ fn main() -> Result<(), String> {
     });
     report["run_stage_seconds"] = serde_json::to_value(run.timing()).map_err(|e| e.to_string())?;
     report["run_stage_timing_scope"] = json!("cumulative across all assessments and saved-byte replays; parallel donor/episode durations summed, not additive wall time; CUDA includes transfer to host, not kernel-only timing");
+    if let Some(budget) = resident_budget {
+        report["execution"]["backend"] = json!("CUDA resident autonomous execution and directed fixed-logit metrics");
+        report["execution"]["teacher"] = json!("cached actual native f64 CUDA final states; no candidate literal rounding");
+        report["execution"]["readout_and_KL"] = json!("resident fixed native head and checked raw-logit CUDA reduction");
+        report["execution"]["teacher_parallelism"] = json!(1);
+        report["execution"]["teacher_cache_memory"] = json!("one resident final state per episode plus scalar effect intervals; initialization also holds clean states and donor tensors");
+        report["execution"]["cuda_upload_scope"] = json!("candidate parameters and episode constants prepared once per assessment; teacher/candidate final states and donor rows stay on device; scalar interval blocks return to host");
+        report["execution"]["resident_budget"] = json!(budget);
+        report["execution"]["resident_budget_scope"] = json!("declared aggregate numeric allocations; excludes attention/library scratch, edit-construction scratch, allocator overhead and host storage");
+        report["run_stage_seconds"] = Value::Null;
+        report["run_stage_timing_scope"] = json!("legacy CPU phase counters do not apply; frontier and saved-replay wall times include resident preparation and scoring");
+    }
     let path = out.join("report.json");
     std::fs::write(&path, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| format!("{}: {e}", path.display()))?;
     eprintln!("{} distinct candidates, {} measured; {}", evaluated.bank.len(), evaluated.measured_candidates, path.display());
