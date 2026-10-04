@@ -1,0 +1,26 @@
+{
+  "created_utc": "2026-10-04T22:28:27.706411+00:00",
+  "status": "prospective follow-up; previous scan suggested same-reader/opposing-writer pairs but did not test this hypothesis",
+  "hypothesis": "Some native units implement a difference between two nonlinear conditions through a common signed output direction, rather than a linear channel or duplicate unit.",
+  "identity": "For gi=g(zi), gj=g(zj), w=(wi-wj)/2 and r=(wi+wj)/2, the native pair output is exactly w*(gi-gj)+r*(gi+gj) in real arithmetic. This algebra holds for every pair and alone proves no learned structure.",
+  "candidate": "Retain both original affine readers and both native GELUs. Compare dropping the common term r*(gi+gj) with dropping the contrast term w*(gi-gj), dropping individual units, and dropping the whole pair.",
+  "proposal_bank": "Reuse all64positive-reader geometry pairs perlayer from the frozen native_gelu_relations scan. All4layers. No new pair selection using validation responses.",
+  "measurements": [
+    "Actual contrast and common term magnitudes on all4096training and1024fit-disjoint evaluation parent states.",
+    "Full pair-replacement error relative to pair removal and native MLP output RMS.",
+    "Top8training rows by each term magnitude, with scalar preactivations and activations for text inspection. Evaluation never supplies selected example contexts."
+  ],
+  "optional_null": {
+    "seed": 2951,
+    "permutations": 1,
+    "operation": "Permute nonzero native writer directions within layer and restore each original unit writer norm; preserve readers and activations.",
+    "scope": "An exploratory alignment control, not a p-value or significance claim."
+  },
+  "interpretation": [
+    "A small r weight does not imply its computation is negligible: close gi,gj can suppress the contrast term and amplify the relative importance of the common term.",
+    "A compact signed writer relation must beat a simple-removal explanation, preserve actual finite edits, and survive autonomous full-model KL before acceptance.",
+    "Readability of selected text contexts does not establish a mechanism; semantic labels remain hypotheses."
+  ],
+  "data": "Same hashed original-native F64 input arrays and model as PROTOCOL.json; neither panel is untouched project confirmation.",
+  "followup": "Only promising measured pair relations warrant complete artifact compilation. No new optimizer, fixed-low-rank bank, or generic framework."
+}
