@@ -155,7 +155,7 @@ pub fn structural_cost(artifact: &Artifact, cache: &mut CostCache) -> Result<Str
         let (structure, reals) = match cache.operators.get(&key) {
             Some((_, structure, reals)) => (*structure, *reals),
             None => {
-                let (structure, _) = op.code_bits().map_err(|e| e.to_string())?;
+                let structure = op.structure_bits().map_err(|e| e.to_string())?;
                 let reals = op.real_count() as u64;
                 // A derived operator's blank is made anew for every measure: it is not kept.
                 if !derived.contains(&index) {

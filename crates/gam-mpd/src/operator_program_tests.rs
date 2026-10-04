@@ -609,3 +609,16 @@ fn indicator_reads_check_domains_widths_and_radius_shapes() {
     assert!(Basis::Indicator { domain: 1 }.read(&declarations, &values).is_err());
     assert!(basis.read_banded(&declarations, &values, Some(&Array2::zeros((1, 2)))).is_err());
 }
+
+#[test]
+fn operator_structure_price_matches_wire_without_coding_numerical_payloads() {
+    let program = fixture();
+    let mut operators: Vec<Operator> = program.operators.iter().map(|o| (**o).clone()).collect();
+    let interface = Interface::uniform(3, 1, LabelKind::Native, 0).unwrap();
+    operators.push(Operator::identity("identity", interface.clone()));
+    operators.push(Operator::diag("diagonal", interface.clone(), ndarray::array![1.0, -0.25, 0.0], precision(8), Provenance::default()).unwrap());
+    operators.push(Operator::low_rank("rank", interface.clone(), interface, Array2::ones((3, 1)), Array2::ones((1, 3)), precision(8), Provenance::default()).unwrap());
+    for operator in operators {
+        assert_eq!(operator.structure_bits().unwrap(), operator.code_bits().unwrap().0, "{}", operator.name);
+    }
+}

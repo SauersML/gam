@@ -656,6 +656,27 @@ impl Operator {
         operator_bits(self)
     }
 
+    /// Structural wire fields only, without materializing or coding numerical values.
+    /// This is exactly the first component of `code_bits`; validity of numerical
+    /// payloads remains the encoder's obligation.
+    pub fn structure_bits(&self) -> Result<u64, ProgramError> {
+        let kind = u64::from(fixed_index_len_bits(OPERATOR_KINDS)?);
+        let rows = interface_bits(&self.rows)?;
+        let count = prefix_integer_len_bits(self.real_count() as u64 + 1)?;
+        match &self.body {
+            OperatorBody::Identity => Ok(kind + rows),
+            OperatorBody::Diagonal { .. } => Ok(kind + rows + count),
+            OperatorBody::LowRank { left, .. } => Ok(kind + rows + interface_bits(&self.cols)? + prefix_integer_len_bits(left.ncols() as u64)? + count),
+            OperatorBody::Dense { present, .. } => {
+                let mut total = kind + rows + interface_bits(&self.cols)? + count;
+                for row in present.outer_iter() {
+                    total += subset_code_len_bits(self.cols.group_count(), row.iter().filter(|keep| **keep).count())?;
+                }
+                Ok(total)
+            }
+        }
+    }
+
     /// The identity on `interface`.
     pub fn identity(name: impl Into<String>, interface: Interface) -> Self {
         Self {
