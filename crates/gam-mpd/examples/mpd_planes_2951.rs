@@ -13,8 +13,10 @@
 //! what the readers leave is one more block, the rest, so the blocks sum to `W` and none exceeds it
 //! (`planes`). A plane with nothing beyond the site's rounding band is left out.
 //!
-//! Every point is measured under the box claim (every word's error its masks' KL plus what its off
-//! blocks anywhere in `[0, 1]` would add), every block described on the exact lattice code with the
+//! Every point is measured under the corner claim (every word's error the exact KL of the program
+//! its masks run: off blocks absent). The box claim's charge in `gam_mpd::blocks::measure` is the
+//! expected excess over uniform off gates to second order, unbounded below: the fitted solution
+//! drove it to −33 nats a word. Every block is described on the exact lattice code with the
 //! harmonic charts (`gam_mpd::describe::Structured`: a reader in the operand characters of a site's
 //! reads where no decomposed site upstream moves them, a writer in the class characters of the
 //! unembedding where the readout reads the site directly), in the logit-space Gauss–Newton metric,
@@ -25,13 +27,16 @@
 //! * per word: each word pays the description of the blocks that ran on it, plus `n KL / ln 2`;
 //! * library paid once: every block that runs is described once (its precision weighing its bits
 //!   once against its error on every word), each block names the words it runs on (a bit for every
-//!   word, else the enumerative code of the subset), plus `n KL / ln 2` per word.
+//!   word, else the enumerative code of the subset), plus `n KL / ln 2` per word; and the same
+//!   library pruned under this code (blocks deleted while the total falls, `pruned`), what it can
+//!   afford at its `n`.
 //!
 //! The points: each site's whole map as one block; the planes all on, and selected (selection
 //! passes until one no longer lowers the per-word total); the fitted solution (Fisher-SVD rank-one
 //! subcomponents selected, then `fit_blocks`) and the fit seeded from the selected planes, each as
 //! fitted and with its blocks all on. Per point the terms per word under both codes, blocks and
-//! rank-one equivalents on, and per block its label, rank, firing and decoded bits.
+//! rank-one equivalents on, and per block its label, rank, firing, decoded bits and whether the
+//! pruned library keeps it.
 
 use gam_mpd::blocks::{Bits, Blocked, Coded, fit_blocks, measure, reselect, rounding_error};
 use gam_mpd::codec::subset_code_len_bits;
@@ -126,8 +131,11 @@ struct Decoded {
     /// `n KL / ln 2`.
     error: f64,
     kl: f64,
-    /// Each block's decoded bits.
+    /// Each block's decoded bits and (with the library paid once) bindings.
     prices: Vec<Vec<f64>>,
+    binding: Vec<Vec<f64>>,
+    /// The decoded blocks.
+    blocked: Blocked,
 }
 
 impl Decoded {
@@ -143,17 +151,18 @@ impl Decoded {
 fn decoded(coded: &Coded<'_>, blocked: &Blocked, geometry: &Structured, once: bool) -> Result<Decoded, String> {
     let mut out = blocked.clone();
     let mut prices: Vec<Vec<f64>> = Vec::new();
-    let mut bindings = 0.0;
+    let mut binding: Vec<Vec<f64>> = Vec::new();
     let words: usize = blocked.masks.iter().map(|m| m.first().map_or(0, |m| m.nrows())).sum();
     for (k, ranks) in blocked.ranks.iter().enumerate() {
-        let mut site = Vec::new();
+        let (mut site, mut named) = (Vec::new(), Vec::new());
         for c in 0..ranks.len() {
             let on: usize = blocked.masks.iter().map(|m| m[k].column(c).iter().filter(|x| **x > 0.0).count()).sum();
             if on == 0 {
                 site.push(0.0);
+                named.push(0.0);
                 continue;
             }
-            bindings += 1.0 + if on == words { 0.0 } else { subset_code_len_bits(words, on).map_err(|e| e.to_string())? as f64 };
+            named.push(1.0 + if on == words { 0.0 } else { subset_code_len_bits(words, on).map_err(|e| e.to_string())? as f64 });
             let (base, _) = measure(coded, &out)?;
             let (u, v) = blocked.factors(k, c);
             let current = out.clone();
@@ -165,6 +174,7 @@ fn decoded(coded: &Coded<'_>, blocked: &Blocked, geometry: &Structured, once: bo
             out = replaced(&out, k, c, &d.u, &d.v)?;
         }
         prices.push(site);
+        binding.push(named);
     }
     let (bits, _) = measure(coded, &out)?;
     let mut described = 0.0;
@@ -175,13 +185,80 @@ fn decoded(coded: &Coded<'_>, blocked: &Blocked, geometry: &Structured, once: bo
             }
         }
     }
+    let mut bindings = 0.0;
     if once {
         described = prices.iter().flatten().sum();
-    } else {
-        bindings = 0.0;
+        bindings = binding.iter().flatten().sum();
     }
     let rows = bits.rows.max(1.0);
-    Ok(Decoded { described: described / rows, bindings: bindings / rows, error: bits.kl / rows, kl: bits.kl_nats / rows, prices })
+    Ok(Decoded { described: described / rows, bindings: bindings / rows, error: bits.kl / rows, kl: bits.kl_nats / rows, prices, binding, blocked: out })
+}
+
+/// With the library paid once, the decoded library's blocks deleted while the total falls: deleting
+/// a block saves its bits and bindings against the error it adds on every word, measured exactly;
+/// the deletions that save alone are tried together, halved while the total does not fall, and the
+/// passes repeat until none is kept. What stays is the library this code can afford at its `n`.
+/// The pruned point and per block whether it stayed.
+fn pruned(coded: &Coded<'_>, d: &Decoded) -> Result<(Decoded, Vec<Vec<bool>>), String> {
+    let mut kept: Vec<Vec<bool>> = d.binding.iter().map(|b| b.iter().map(|x| *x > 0.0).collect()).collect();
+    let deleted = |blocked: &Blocked, which: &[(usize, usize)]| -> Result<Blocked, String> {
+        let mut out = blocked.clone();
+        for &(k, c) in which {
+            let (u, v) = blocked.factors(k, c);
+            out = replaced(&out, k, c, &Array2::zeros((1, u.ncols())), &Array2::zeros((1, v.ncols())))?;
+        }
+        Ok(out)
+    };
+    let mut current = d.blocked.clone();
+    loop {
+        let (base, _) = measure(coded, &current)?;
+        let mut savings = Vec::new();
+        for (k, site) in kept.iter().enumerate() {
+            for (c, on) in site.iter().enumerate() {
+                if *on {
+                    let (bits, _) = measure(coded, &deleted(&current, &[(k, c)])?)?;
+                    let delta = bits.kl - base.kl - d.prices[k][c] - d.binding[k][c];
+                    if delta < 0.0 {
+                        savings.push((delta, k, c));
+                    }
+                }
+            }
+        }
+        savings.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut take = savings.len();
+        let mut accepted = false;
+        while take > 0 {
+            let which: Vec<(usize, usize)> = savings[..take].iter().map(|s| (s.1, s.2)).collect();
+            let trial = deleted(&current, &which)?;
+            let (bits, _) = measure(coded, &trial)?;
+            let saved: f64 = which.iter().map(|&(k, c)| d.prices[k][c] + d.binding[k][c]).sum();
+            if bits.kl - base.kl < saved {
+                current = trial;
+                for (k, c) in which {
+                    kept[k][c] = false;
+                }
+                accepted = true;
+                break;
+            }
+            take /= 2;
+        }
+        if !accepted {
+            break;
+        }
+    }
+    let (bits, _) = measure(coded, &current)?;
+    let rows = bits.rows.max(1.0);
+    let sum = |x: &[Vec<f64>]| -> f64 { x.iter().zip(&kept).flat_map(|(x, k)| x.iter().zip(k).filter(|(_, k)| **k).map(|(x, _)| *x)).sum() };
+    let out = Decoded {
+        described: sum(&d.prices) / rows,
+        bindings: sum(&d.binding) / rows,
+        error: bits.kl / rows,
+        kl: bits.kl_nats / rows,
+        prices: d.prices.clone(),
+        binding: d.binding.clone(),
+        blocked: current,
+    };
+    Ok((out, kept))
 }
 
 /// The same blocks, every one on for every word.
@@ -290,7 +367,8 @@ fn planes(w: &Array2<f64>, x: &Array2<f64>, labels: &Array2<usize>, period: usiz
 }
 
 /// A decomposition's report: its bits, and decoded under the per-word code and with the library
-/// paid once, per block its label, rank, firing and decoded bits.
+/// paid once (as it stands, and pruned), per block its label, rank, firing, decoded bits and whether
+/// the pruned library keeps it.
 fn report(name: &str, coded: &Coded<'_>, blocked: &Blocked, bits: &Bits, geometry: &Structured, labels: Option<&[Vec<String>]>) -> Result<Value, String> {
     say(name, bits);
     let word = decoded(coded, blocked, geometry, false)?;
@@ -303,6 +381,17 @@ fn report(name: &str, coded: &Coded<'_>, blocked: &Blocked, bits: &Bits, geometr
         once.bindings,
         once.error,
         once.kl
+    );
+    let (lean, kept) = pruned(coded, &once)?;
+    eprintln!(
+        "{name}, library once, pruned: {:.1} bits/word (library {:.1}, bindings {:.1}, error {:.1}), KL {:.6} nats/word, {} of {} blocks kept",
+        lean.total(),
+        lean.described,
+        lean.bindings,
+        lean.error,
+        lean.kl,
+        kept.iter().flatten().filter(|k| **k).count(),
+        once.binding.iter().flatten().filter(|b| **b > 0.0).count()
     );
     let (per_word, kl_priced, active, rank) = bits.per_row();
     let mut per_block = Vec::new();
@@ -325,6 +414,7 @@ fn report(name: &str, coded: &Coded<'_>, blocked: &Blocked, bits: &Bits, geometr
                 "firing": on / rows,
                 "decoded_bits": word.prices[k][c],
                 "decoded_bits_library_once": once.prices[k][c],
+                "kept_library_once": kept[k][c],
                 "priced_bits": coded.describe.bits(k, u, v)?,
                 "columns_as_rank_one_priced_bits": columns,
             }));
@@ -339,6 +429,7 @@ fn report(name: &str, coded: &Coded<'_>, blocked: &Blocked, bits: &Bits, geometr
         "kl_per_word": kl_priced,
         "decoded_per_word": terms(&word),
         "decoded_library_once": terms(&once),
+        "decoded_library_once_pruned": terms(&lean),
         "active_blocks_per_word": active,
         "active_rank_one_equivalents_per_word": rank,
         "blocks_on": per_block,
@@ -417,7 +508,7 @@ fn run(dir: &Path, out: &Path, observations: f64) -> Result<(), String> {
     // point, so every point is selected and fitted under one price. Each point is written as it
     // lands.
     let (planes_on, planes_selected, planes_on_bits, planes_selected_bits) = loop {
-        let coded = Coded { model: &program, sites: chosen.clone(), batches: batches.clone(), observations, samples: 16, describe: &structured, boxed: Some(metrics.clone()) };
+        let coded = Coded { model: &program, sites: chosen.clone(), batches: batches.clone(), observations, samples: 16, describe: &structured, boxed: None };
         let mut planes_on = Blocked::new(plane_libraries.clone(), plane_ranks.clone(), ones(&plane_ranks));
         planes_on.price(&coded)?;
         let (planes_on_bits, _) = measure(&coded, &planes_on)?;
@@ -431,12 +522,12 @@ fn run(dir: &Path, out: &Path, observations: f64) -> Result<(), String> {
         }
         structured = structured.scaled(if ratio.is_finite() { ratio } else { 1e3 });
     };
-    let coded = Coded { model: &program, sites: chosen.clone(), batches, observations, samples: 16, describe: &structured, boxed: Some(metrics.clone()) };
+    let coded = Coded { model: &program, sites: chosen.clone(), batches, observations, samples: 16, describe: &structured, boxed: None };
     let mut points = Vec::new();
     let write = |points: &[Value]| -> Result<(), String> {
         let report = json!({
             "observations": observations,
-            "claim": "box",
+            "claim": "corner",
             "calibrations": calibrations,
             "points": points,
             "plane_blocks": chosen.iter().zip(&plane_labels).zip(&plane_ranks).map(|((s, l), r)| json!({"site": s.name, "labels": l, "ranks": r})).collect::<Vec<_>>(),
