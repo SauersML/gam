@@ -12,12 +12,14 @@ posterior-mean predictions with credible bands and observation intervals.
 One Rust engine serves both the Python package (`gamfit`) and the CLI (`gam`).
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme_surface_dark.png">
-  <img alt="Left: 800 noisy simulated measurements. Right: the posterior-mean surface from gamfit's two-dimensional Matérn fit. Both views share the same axes, scales and camera." src="docs/images/readme_surface.png" width="1200">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme_co2_dark.png">
+  <img alt="An additive fit to 540 real monthly CO₂ measurements from 1980–2024. Left: measurements and the fitted long-term trend. Right: detrended measurements and the fitted annual cycle." src="docs/images/readme_co2.png" width="1200">
 </picture>
 
-Noisy simulated measurements (left) and the fitted Matérn surface (right),
-on identical axes. [Reproduce the figure](scripts/gen_readme_surface.py).
+[NOAA/Scripps CO₂ measurements](https://gml.noaa.gov/ccgg/trends/data.html),
+1980–2024: measurements and fitted trend (left); detrended measurements and
+fitted annual cycle (right). Both components come from one additive fit.
+[Reproduce the figure](scripts/gen_readme_co2.py).
 
 ```python
 import pandas as pd
