@@ -125,6 +125,91 @@ fn load(root: &Path, p: &Value, layer: usize) -> Result<(Array2<f64>, Value), St
 fn norm(v: impl Iterator<Item = f64>) -> f64 {
     v.fold(0f64, |a, b| a.hypot(b))
 }
+// Fixed seed and permutation are declared diagnostics, never proposal selection.
+fn writer_direction_null(
+    writer: &Array2<f64>,
+    norms: &[f64],
+    seed: u64,
+) -> Result<(Array2<f64>, Vec<usize>), String> {
+    let mut permutation: Vec<_> = (0..writer.ncols()).collect();
+    let mut state = seed;
+    for end in (1..permutation.len()).rev() {
+        state = state.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^= z >> 31;
+        permutation.swap(end, (z % (end as u64 + 1)) as usize);
+    }
+    let mut result = Array2::zeros(writer.dim());
+    for (j, &donor) in permutation.iter().enumerate() {
+        if norms[donor] == 0. && norms[j] != 0. {
+            return Err("permuted zero writer direction cannot preserve nonzero norm".into());
+        }
+        if norms[donor] != 0. {
+            for row in 0..writer.nrows() {
+                result[(row, j)] = (writer[(row, donor)] / norms[donor]) * norms[j];
+            }
+        }
+    }
+    Ok((result, permutation))
+}
+fn joint_positive(
+    z: &Array2<f64>,
+    active: &Array2<f64>,
+    writer: &Array2<f64>,
+    i: usize,
+    j: usize,
+    native_rms: f64,
+    training: bool,
+) -> Value {
+    let wi = writer.column(i);
+    let wj = writer.column(j);
+    let contrast_writer = norm(wi.iter().zip(wj).map(|(a, b)| (a - b) * 0.5));
+    let common_writer = norm(wi.iter().zip(wj).map(|(a, b)| (a + b) * 0.5));
+    let ni = norm(wi.iter().copied());
+    let nj = norm(wj.iter().copied());
+    let projection = if ni == 0. {
+        0.
+    } else {
+        wi.iter().zip(wj).map(|(a, b)| (a / ni) * b).sum::<f64>()
+    };
+    let orthogonal = if ni == 0. {
+        nj
+    } else {
+        norm(wj.iter().zip(wi).map(|(b, a)| b - projection * (a / ni)))
+    };
+    let mut contrast = Vec::with_capacity(z.nrows());
+    let mut common = Vec::with_capacity(z.nrows());
+    let mut pair = Vec::with_capacity(z.nrows());
+    for row in 0..z.nrows() {
+        let gi = active[(row, i)];
+        let gj = active[(row, j)];
+        contrast.push(contrast_writer * (gi - gj).abs());
+        common.push(common_writer * (gi + gj).abs());
+        pair.push((gi * ni + gj * projection).hypot(gj * orthogonal));
+    }
+    let summary = |values: &[f64]| {
+        let (row, &maximum) = values
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(&a.0)))
+            .expect("nonempty declared rows");
+        let rms = norm(values.iter().copied()) / (values.len() as f64).sqrt();
+        json!({"max_row_l2":maximum,"relative_max":maximum/native_rms,"rms_row_l2":rms,"relative_rms":rms/native_rms,"worst_row":row})
+    };
+    let pair_max = pair.iter().copied().fold(0f64, f64::max);
+    let witnesses = |values: &[f64]| -> Vec<Value> {
+        if !training {
+            return vec![];
+        }
+        let mut rows: Vec<_> = (0..values.len()).collect();
+        rows.sort_by(|a, b| values[*b].total_cmp(&values[*a]).then(a.cmp(b)));
+        rows.truncate(8);
+        rows.into_iter().map(|row|json!({"row":row,"sequence_ordinal":row/512,"token_position":row%512,"zi":z[(row,i)],"zj":z[(row,j)],"gi":active[(row,i)],"gj":active[(row,j)],"contrast_row_l2":contrast[row],"common_row_l2":common[row],"native_pair_row_l2":pair[row]})).collect()
+    };
+    json!({"identity":"wi*gi+wj*gj = ((wi-wj)/2)*(gi-gj) + ((wi+wj)/2)*(gi+gj)","contrast_writer_norm":contrast_writer,"common_writer_norm":common_writer,"contrast":summary(&contrast),"common":summary(&common),"pair_removal":summary(&pair),"drop_common_error":summary(&common),"drop_contrast_error":summary(&contrast),"drop_common_over_pair_removal":if pair_max==0.{None}else{Some(common.iter().copied().fold(0f64,f64::max)/pair_max)},"drop_contrast_over_pair_removal":if pair_max==0.{None}else{Some(contrast.iter().copied().fold(0f64,f64::max)/pair_max)},"zero_pair_max":pair_max==0.,"top_contrast_training_rows":witnesses(&contrast),"top_common_training_rows":witnesses(&common),"arithmetic":"fixed F64 native activation values; exact algebraic identity in real arithmetic, separately rounded diagnostics; no whole-forward enclosure"})
+}
 fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.len() != 4 {
@@ -185,7 +270,7 @@ fn run() -> Result<(), String> {
     }
     save(
         &out.join("PROTOCOL.json"),
-        &json!({"source":imported.record,"extract_sha256":sha256(manifest_path)?,"top_k":k,"selection":"exhaustive unordered signed affine-reader geometry only; writer and train/eval responses excluded from selection; both orientations screened","geometry":"||[r_j,b_j]-sign*[r_i,b_i]|| / sqrt(||[r_i,b_i]||^2+||[r_j,b_j]||^2); f64 Gram estimate; retained scores recomputed directly","panels":["train4096","eval1024"],"export_json_sha256":sha256(&Path::new(&args[0]).join("export.json"))?,"native_literals":"original imported f64, no f32 projection","scope":"heuristic proposal inventory only; exact single-pair replacement effect on fixed native-parent rows in current CPU arithmetic, no full forward/intervention/C32 claim"}),
+        &json!({"source":imported.record,"extract_sha256":sha256(manifest_path)?,"top_k":k,"selection":"exhaustive unordered signed affine-reader geometry only; writer and train/eval responses excluded from selection; both orientations screened","geometry":"||[r_j,b_j]-sign*[r_i,b_i]|| / sqrt(||[r_i,b_i]||^2+||[r_j,b_j]||^2); f64 Gram estimate; retained scores recomputed directly","panels":["train4096","eval1024"],"export_json_sha256":sha256(&Path::new(&args[0]).join("export.json"))?,"native_literals":"original imported f64, no f32 projection","positive_pair_followup":{"witness_count":8,"witness_selection":"training rows only, independently by contrast/common norms; no heldout selection","writer_null_seed":2951,"null":"within-layer permutation of writer directions rescaled to preserve each unit norm","scope":"same64positivegeometrypairs perlayer, original+null diagnostics"},"scope":"heuristic proposal inventory only; exact single-pair replacement effect on fixed native-parent rows in current CPU arithmetic, no full forward/intervention/C32 claim"}),
     )?;
     let mut reports = Vec::new();
     for (layer, l) in layers.iter().enumerate() {
@@ -268,7 +353,16 @@ fn run() -> Result<(), String> {
         let writer_norms: Vec<_> = (0..u)
             .map(|j| norm(writer.column(j).iter().copied()))
             .collect();
+        let null_result = writer_direction_null(&writer, &writer_norms, 2951);
+        let (null_writer, null_metadata) = match null_result {
+            Ok((w, permutation)) => (
+                Some(w),
+                json!({"seed":2951,"rng":"SplitMix64 Fisher-Yates modulo selection; deterministic diagnostic, no probabilistic significance claim","permutation":permutation,"norm_preservation":"donor direction divided by donor norm then multiplied by original target writer norm; F64 arithmetic"}),
+            ),
+            Err(reason) => (None, json!({"seed":2951,"unresolved":reason})),
+        };
         let mut results = Vec::new();
+        let mut joint_results = Vec::new();
         let mut lineage = Vec::new();
         for name in ["train", "eval"] {
             let panel_start = Instant::now();
@@ -324,6 +418,14 @@ fn run() -> Result<(), String> {
                             / cosine_den,
                     )
                 };
+                if *sign > 0. {
+                    let original =
+                        joint_positive(&z, &active, &writer, p.i, p.j, native_rms, name == "train");
+                    let null_diagnostic = null_writer
+                        .as_ref()
+                        .map(|w| joint_positive(&z, &active, w, p.i, p.j, native_rms, false));
+                    joint_results.push(json!({"panel":name,"unit_i":p.i,"unit_j":p.j,"geometry_direct_score":direct/denominator,"writer_cosine":writer_cos,"native_rms_row_l2":native_rms,"original":original,"writer_direction_permutation_null":null_diagnostic}));
+                }
                 for (source, target) in [(p.i, p.j), (p.j, p.i)] {
                     let mut error = 0f64;
                     let mut deletion = 0f64;
@@ -422,7 +524,29 @@ fn run() -> Result<(), String> {
             }
             lineage.push(json!({"panel":name,"record":record,"seconds":panel_start.elapsed().as_secs_f64(),"native_rms_row_l2":native_rms}));
         }
-        let report = json!({"layer":layer,"law":format!("{law:?}"),"units":u,"geometry_seconds":geometry_seconds,"distributions":distributions,"selected_unordered_pairs":selected.len(),"screened_orientations_per_panel":selected.len()*2,"lineage":lineage,"results":results,"seconds":layer_start.elapsed().as_secs_f64()});
+        let mut joint_aggregates = Vec::new();
+        for panel in ["train", "eval"] {
+            for mode in ["original", "writer_direction_permutation_null"] {
+                let records: Vec<_> = joint_results
+                    .iter()
+                    .filter(|v| v["panel"] == panel && !v[mode].is_null())
+                    .collect();
+                let mut metrics = serde_json::Map::new();
+                for term in ["contrast", "common", "pair_removal"] {
+                    let values: Vec<_> = records
+                        .iter()
+                        .filter_map(|v| v[mode][term]["rms_row_l2"].as_f64())
+                        .collect();
+                    let maximum = records
+                        .iter()
+                        .filter_map(|v| v[mode][term]["max_row_l2"].as_f64())
+                        .fold(0f64, f64::max);
+                    metrics.insert(term.into(),json!({"bank_rms_over_pairs_and_rows":if values.is_empty(){None}else{Some(norm(values.iter().copied())/(values.len() as f64).sqrt())},"max_over_pairs_and_rows":maximum}));
+                }
+                joint_aggregates.push(json!({"panel":panel,"mode":mode,"pair_count":records.len(),"metrics":metrics,"scope":"same geometry-selected bank; no response ranking or significance claim"}));
+            }
+        }
+        let report = json!({"layer":layer,"law":format!("{law:?}"),"units":u,"geometry_seconds":geometry_seconds,"distributions":distributions,"selected_unordered_pairs":selected.len(),"screened_orientations_per_panel":selected.len()*2,"lineage":lineage,"results":results,"positive_pair_joint":joint_results,"writer_null_metadata":null_metadata,"positive_pair_aggregates":joint_aggregates,"seconds":layer_start.elapsed().as_secs_f64()});
         save(&out.join(format!("layer{layer}.json")), &report)?;
         println!(
             "layer{layer} completed {:.3}s",
@@ -457,6 +581,74 @@ fn main() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn positive_pair_decomposition_and_drop_errors_are_actual_vector_errors() {
+        let writer = ndarray::array![[1., -0.8], [0.5, 0.7], [-0.2, 0.4]];
+        let z = ndarray::array![[0.4, 0.5], [-1., -0.9]];
+        let active = z.mapv(|v| Law::GeluTanh.apply(v));
+        let report = joint_positive(&z, &active, &writer, 0, 1, 1., true);
+        let mut max_common = 0f64;
+        let mut max_contrast = 0f64;
+        for row in 0..z.nrows() {
+            let gi = active[(row, 0)];
+            let gj = active[(row, 1)];
+            let full = writer.column(0).mapv(|w| w * gi) + writer.column(1).mapv(|w| w * gj);
+            let contrast = (writer.column(0).to_owned() - writer.column(1)) * ((gi - gj) * 0.5);
+            let common = (writer.column(0).to_owned() + writer.column(1)) * ((gi + gj) * 0.5);
+            assert!(
+                norm(
+                    full.iter()
+                        .zip(contrast.iter().zip(&common))
+                        .map(|(f, (c, m))| f - c - m)
+                ) < 1e-15
+            );
+            max_common = max_common.max(norm(full.iter().zip(&contrast).map(|(a, b)| a - b)));
+            max_contrast = max_contrast.max(norm(full.iter().zip(&common).map(|(a, b)| a - b)));
+        }
+        assert!(
+            (report["drop_common_error"]["max_row_l2"]
+                .as_f64()
+                .expect("common max")
+                - max_common)
+                .abs()
+                < 1e-15
+        );
+        assert!(
+            (report["drop_contrast_error"]["max_row_l2"]
+                .as_f64()
+                .expect("contrast max")
+                - max_contrast)
+                .abs()
+                < 1e-15
+        );
+        assert_eq!(
+            report["top_contrast_training_rows"]
+                .as_array()
+                .expect("witnesses")
+                .len(),
+            2
+        );
+        assert!(
+            joint_positive(&z, &active, &writer, 0, 1, 1., false)["top_common_training_rows"]
+                .as_array()
+                .expect("eval witnesses")
+                .is_empty()
+        );
+        let norms: Vec<_> = (0..writer.ncols())
+            .map(|j| norm(writer.column(j).iter().copied()))
+            .collect();
+        let (null, permutation) =
+            writer_direction_null(&writer, &norms, 2951).expect("null permutation");
+        assert_eq!(
+            permutation,
+            writer_direction_null(&writer, &norms, 2951)
+                .expect("same seeded null")
+                .1
+        );
+        for (j, expected) in norms.iter().enumerate() {
+            assert!((norm(null.column(j).iter().copied()) - expected).abs() < 1e-15);
+        }
+    }
     #[test]
     fn duplicate_affine_rows_include_bias_and_both_orientations() {
         let readers = ndarray::array![[1., 2.], [1., 2.]];
