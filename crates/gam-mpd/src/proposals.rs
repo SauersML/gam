@@ -144,11 +144,91 @@ fn read_rows(path: &Path, cols: usize) -> Result<Array2<f64>, String> {
 /// The account stored at `base` (`base.rules.json`, `.reads.f64`, `.writes.f64`, `.offset.f64`) for
 /// an MLP from `d_in` to `d_out`.
 pub fn load_account(base: &Path, d_in: usize, d_out: usize) -> Result<Account, String> {
-    let with = |extension: &str| PathBuf::from(format!("{}.{extension}", base.display()));
+    let with = |extension: &str| account_path(base, extension);
     let text = std::fs::read_to_string(with("rules.json")).map_err(|e| format!("{}: {e}", with("rules.json").display()))?;
     let rules: Vec<AccountRule> = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     let offset = if with("offset.f64").exists() { read_rows(&with("offset.f64"), d_out)?.row(0).to_owned() } else { Array1::zeros(d_out) };
     Ok(Account { reads: read_rows(&with("reads.f64"), d_in)?, rules, writes: read_rows(&with("writes.f64"), d_out)?, offset })
+}
+
+/// Append an account suffix without replacing an initialization name such as `.neurons`.
+pub fn account_path(base: &Path, suffix: &str) -> PathBuf {
+    let mut path = base.as_os_str().to_os_string();
+    path.push(".");
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+/// Save the exact account consumed by [`load_account`]. Distinct initialization stems retain
+/// distinct files. Write the rule file last so a new incomplete export is not discoverable.
+pub fn save_account(base: &Path, account: &Account) -> Result<(), String> {
+    let write = |suffix: &str, bytes: &[u8]| {
+        let path = account_path(base, suffix);
+        std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))
+    };
+    for (suffix, values) in [("reads.f64", account.reads.view()), ("writes.f64", account.writes.view())] {
+        write(suffix, &values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+    }
+    write("offset.f64", &account.offset.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+    write("rules.json", &serde_json::to_vec(&account.rules).map_err(|e| e.to_string())?)
+}
+
+#[cfg(test)]
+mod account_export_tests {
+    use super::*;
+    use super::super::operator_program::{Declarations, FamilyInputs, OperatorProgram, Slot, SlotValues};
+
+    #[test]
+    fn distinct_starts_reload_the_selected_composed_program() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_nanos();
+        let dir = std::env::temp_dir().join(format!("mpd-account-export-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&dir).expect("test directory");
+        let mut selected = Vec::new();
+        let mut loaded = Vec::new();
+        for layer in 0..2 {
+            let first = Account::neurons(&ndarray::array![[1., 0.5], [-0.5, 1.]], &ndarray::array![[1., 0.25], [0.5, 1.]]);
+            let mut last = first.clone();
+            last.offset.fill(10.0 + layer as f64);
+            let first_base = dir.join(format!("L{layer}.vpd"));
+            let last_base = dir.join(format!("L{layer}.neurons"));
+            save_account(&first_base, &first).expect("first start");
+            save_account(&last_base, &last).expect("last start must not overwrite first");
+            let replay = load_account(&first_base, 2, 2).expect("selected start");
+            let other = load_account(&last_base, 2, 2).expect("other start");
+            assert_eq!(replay.reads, first.reads);
+            assert_eq!(replay.rules, first.rules);
+            assert_eq!(replay.writes, first.writes);
+            assert_eq!(replay.offset, first.offset);
+            assert_eq!(other.offset, last.offset);
+            assert_ne!(replay.offset, other.offset);
+            assert!(!dir.join(format!("L{layer}.rules.json")).exists());
+            selected.push(first);
+            loaded.push(replay);
+        }
+        let h = ndarray::array![[1., -2.], [0., 0.], [2., 0.5]];
+        let run = |accounts: &[Account]| accounts.iter().fold(h.clone(), |state, account| account.apply(state.view()));
+        assert_eq!(run(&selected), run(&loaded));
+
+        // Compile the reloaded layers into two executable calls. Matching the account files
+        // alone would not check that the selected hybrid computation survives compilation.
+        let interface = Interface::native(2).expect("interface");
+        let mut program = OperatorProgram {
+            declarations: Declarations { domains: Vec::new(), slots: vec![Slot::Raw { width: 2 }], parameters: 0 },
+            bases: Vec::new(), operators: Vec::new(), rules: Vec::new(),
+            nodes: vec![Node::Raw { slot: 0 }], output: 2,
+        };
+        for (layer, account) in loaded.iter().enumerate() {
+            let (body, operators) = account_rule(&format!("layer {layer}"), account, &interface, &interface, program.operators.len()).expect("compile account");
+            program.operators.extend(operators.into_iter().map(std::sync::Arc::new));
+            program.rules.push(body);
+            program.nodes.push(Node::Call { rule: layer, arguments: vec![layer] });
+        }
+        let family = FamilyInputs { rows: h.nrows(), slots: vec![SlotValues::Raw(h.clone())], layout: None };
+        let trace = program.execute(&family, false).expect("reloaded program executes");
+        let expected = run(&selected);
+        assert!(trace.values[program.output].iter().zip(&expected).all(|(a, b)| (a - b).abs() < 1e-12));
+        std::fs::remove_dir_all(dir).expect("remove test directory");
+    }
 }
 
 /// Every account a directory holds, each proposed for its layer's MLP (module note).

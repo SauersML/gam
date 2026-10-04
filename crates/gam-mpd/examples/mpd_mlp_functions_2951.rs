@@ -37,6 +37,7 @@ use gam_mpd::import::import_language_model;
 use gam_mpd::masked::{Site, Target, kl_score_only, matrix, read_values, sampled_label_cotangent, sites};
 use gam_mpd::mlp_account::{self, Account, dense_bits, plain_bits};
 use gam_mpd::operator_program::{FamilyInputs, OperatorProgram, Trace};
+use gam_mpd::proposals::{account_path, load_account, save_account};
 use gam_linalg::faer_ndarray::{fast_abt, fast_atb};
 use ndarray::{Array1, Array2, Axis};
 use serde_json::{Value, json};
@@ -49,11 +50,6 @@ fn read_rows(path: &Path, cols: usize) -> Result<Array2<f64>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let values: Vec<f64> = bytes.chunks_exact(8).map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])).collect();
     Array2::from_shape_vec((values.len() / cols, cols), values).map_err(|e| e.to_string())
-}
-
-fn write_rows(path: &Path, rows: &Array2<f64>) -> Result<(), String> {
-    let bytes: Vec<u8> = rows.iter().flat_map(|v| v.to_le_bytes()).collect();
-    std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// One MLP: its input and output sites and maps.
@@ -223,15 +219,18 @@ fn main() -> Result<(), String> {
             "output_energy_nats": {"train": energy(&tr), "eval": energy(&ev)},
             "dense_bits": dense_bits(d_in, hidden, d_out),
         });
-        let saved = load.as_ref().map(|dir| dir.join(format!("L{}.vpd", mlp.layer))).filter(|b| b.with_extension("rules.json").exists());
+        let saved = if let Some(dir) = &load {
+            let base = dir.join(format!("L{}.vpd", mlp.layer));
+            if account_path(&base, "rules.json").exists() {
+                Some(base)
+            } else if dir.join(format!("L{}.rules.json", mlp.layer)).exists() {
+                return Err(format!("{}: legacy account has no initialization identity; it may have been overwritten by another start. Regenerate the selected account before resuming", dir.join(format!("L{}.rules.json", mlp.layer)).display()));
+            } else {
+                None
+            }
+        } else { None };
         if let Some(base) = saved {
-            let text = std::fs::read_to_string(base.with_extension("rules.json")).map_err(|e| e.to_string())?;
-            let account = Account {
-                reads: read_rows(&base.with_extension("reads.f64"), d_in)?,
-                rules: serde_json::from_str(&text).map_err(|e| e.to_string())?,
-                writes: read_rows(&base.with_extension("writes.f64"), d_out)?,
-                offset: read_rows(&base.with_extension("offset.f64"), d_out)?.row(0).to_owned(),
-            };
+            let account = load_account(&base, d_in, d_out)?;
             let mut replaced_now = replaced.clone();
             replaced_now.push((mlp, &account));
             let together = end_to_end(&evaluation.program, &eval_batches, &replaced_now)?;
@@ -342,10 +341,7 @@ fn main() -> Result<(), String> {
             let shown: Vec<&mlp_account::Body> = bodies.iter().take(20).collect();
             stage("shared", &account, json!({"bodies": bodies.len(), "rule_bits_shared": rule_bits, "structure_bits_shared": shared_total, "top": shown}))?;
             let base = out.join(format!("L{}.{start}", mlp.layer));
-            std::fs::write(base.with_extension("rules.json"), serde_json::to_string(&account.rules).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-            write_rows(&base.with_extension("reads.f64"), &account.reads)?;
-            write_rows(&base.with_extension("writes.f64"), &account.writes)?;
-            write_rows(&base.with_extension("offset.f64"), &account.offset.clone().insert_axis(Axis(0)))?;
+            save_account(&base, &account)?;
             layer_report[start.as_str()] = json!(stages);
             if start == "vpd" || chosen.is_none() {
                 chosen = Some(account);
