@@ -20,6 +20,7 @@ fn main()->Result<(),String>{
     if out.exists(){return Err("fresh probe directory required".into());}
     std::fs::create_dir_all(out).map_err(|e|e.to_string())?;
     let begun=Instant::now();let context=number(2)?;
+    if context==0 {return Err("positive context required".into());}
     let imported=import_language_model(export,1,context)?;
     let layer_count=imported.record["config"]["n_layers"].as_u64().ok_or("native layer count missing")? as usize;
     let first=AttentionLayerMap::of(&imported.program,0)?;
@@ -34,7 +35,13 @@ fn main()->Result<(),String>{
         Episode {id:"last-head-read-off".into(),group:"last-head".into(),edits:vec![b.clone()]},
         Episode {id:"first-and-last-off".into(),group:"combined".into(),edits:vec![a,b]},
     ];
+    let native_layers=gam_mpd::run_check::layer_nodes(&imported.program,layer_count)?;
     if args.len()==8 {
+        let layer=&native_layers[0];
+        episodes.push(Episode {id:"paid-control-source-scale-write-add".into(),group:"paid-control".into(),edits:vec![
+            Edit {node:layer.mlp,rows:Some(vec![0]),columns:0..1,change:Change::Add(0.125)},
+            Edit {node:layer.active,rows:None,columns:0..imported.program.node_interface(layer.active).map_err(|e|e.to_string())?.width(),change:Change::Scale(2.)},
+        ]});
         episodes.push(Episode {id:"ordered-partial-first-read".into(),group:"ordered-partial".into(),edits:vec![
             Edit {node:first_head.read,rows:Some(vec![0,0,context-1]),columns:0..1,change:Change::Scale(0.5)},
             Edit {node:first_head.read,rows:Some(vec![0,context-1]),columns:0..1,change:Change::Add(0.125)},
@@ -48,8 +55,20 @@ fn main()->Result<(),String>{
     let cuda_native=if args.len()==8 {Some(StreamedFamilyRun::new(&run,device,budget)?.with_cuda_native(number(7)?)?)}else{None};
     let base=Artifact::native(&imported.program)?.f32_literals()?;
     let mut results=Vec::new();
-    for kind in 0..if args.len()>=7{2}else{1} {
-        let (artifact,source)=if kind==0 {(base.clone(),json!({"kind":"native"}))} else if args[6]=="generated_svd16" {
+    for kind in 0..if args.len()==8{3}else if args.len()>=7{2}else{1} {
+        let (artifact,source)=if kind==0 {(base.clone(),json!({"kind":"native"}))} else if kind==2 {
+            let layer=&native_layers[0];
+            let input=imported.program.node_interface(layer.normed).map_err(|e|e.to_string())?.width();
+            let output=imported.program.node_interface(layer.mlp).map_err(|e|e.to_string())?.width();
+            let mut reads=ndarray::Array2::zeros((1,input));reads[[0,0]]=1.;
+            let mut writes=ndarray::Array2::zeros((1,output));writes[[0,0]]=0.25;
+            let rule=gam_mpd::native_mlp::NativeRule {reads,writes,features:vec![gam_mpd::native_mlp::Feature::Linear(0)],coefficients:ndarray::arr2(&[[0.],[1.]])};
+            let candidate=gam_mpd::native_mlp::with_native_rule(&base,"parity-control",layer,&rule)?.with_uniform_scale_control(&imported.program,layer.active,layer.mlp)?.f32_literals()?;
+            let path=out.join("control-fixture.bin");let bytes=candidate.to_bytes()?;std::fs::write(&path,&bytes).map_err(|e|e.to_string())?;
+            let decoded=Artifact::from_bytes(&bytes,&imported.program.declarations)?;
+            if decoded.to_bytes()?!=bytes || decoded.controls.len()!=1 {return Err("paid control saved-byte replay mismatch".into());}
+            (decoded,json!({"kind":"serialized nonzero rank1 affine MLP paid-control backend fixture; not a fit/discovery","sha256":sha256(&path)?,"bytes":bytes.len()}))
+        } else if args[6]=="generated_svd16" {
             let bank=gam_mpd::proposals::MappedCopyResidualBank::new(&base,&[layer_count-1],&[16],1+2*last.heads.len())?;
             let choice=bank.choices().find(|c| c.family==gam_mpd::proposals::HeadApproximation::NativeSvd).ok_or("mapped parity fixture absent")?;
             let candidate=bank.candidate(choice)?.f32_literals()?;
