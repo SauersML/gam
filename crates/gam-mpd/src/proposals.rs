@@ -618,9 +618,9 @@ impl<'a> MappedCopyResidualBank<'a> {
             HeadApproximation::CopyResidual => {
                 let copied = self.cache[index].copy.get_or_init(|| {
                     let value = self.start.program.operators[h.value_operator].matrix();
-                    let (_,gain) = HeadRules::gain(self.start,&self.start.program.operators[map.input_gain].name)?;
-                    let (_,final_gain) = HeadRules::gain(self.start,&self.start.program.operators[map.final_gain].name)?;
-                    let prediction = super::rules::copy_prediction(&value,&gain,&final_gain)?;
+                    let super::operator_program::OperatorBody::Diagonal { values:gain,.. } = &self.start.program.operators[map.input_gain].body else { return Err("mapped input gain is not diagonal".into()); };
+                    let super::operator_program::OperatorBody::Diagonal { values:final_gain,.. } = &self.start.program.operators[map.final_gain].body else { return Err("mapped final gain is not diagonal".into()); };
+                    let prediction = super::rules::copy_prediction(&value,gain,final_gain)?;
                     let scale = super::rules::copy_scale(&original.matrix(),&value,&prediction) as f32;
                     let derived = self.start.derive(o,map.copy_law(head)?,scale,Vec::new())?;
                     let operator = derived.program.operators[o].clone();

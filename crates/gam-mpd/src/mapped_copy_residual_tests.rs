@@ -171,3 +171,22 @@ fn mapped_copy_residual_full_rank_does_not_certify_ill_conditioned_literal_round
     let error=(&original.values[map.output]-&changed.values[map.output]).iter().map(|x|x*x).sum::<f64>().sqrt();
     assert!(error.is_finite()&&error>0.001,"full rank must not be treated as a quality certificate: {error}");
 }
+
+#[test]
+fn mapped_copy_residual_fits_actual_gain_operator_ids_not_name_aliases() {
+    let (_dir,mut imported)=native27();let old=AttentionLayerMap::of(&imported.program,27).unwrap();
+    let mut actual=(*imported.program.operators[old.input_gain]).clone();
+    let crate::operator_program::OperatorBody::Diagonal { values,.. }=&mut actual.body else {panic!("gain fixture")};
+    for (i,value) in values.iter_mut().enumerate(){*value=if i%2==0{2.}else{0.5};}
+    let actual_gain=imported.program.operators.len();imported.program.operators.push(std::sync::Arc::new(actual));
+    let Node::Affine {terms,..}=&mut imported.program.nodes[old.normed_input]else{panic!("gain fixture")};terms[0].1=actual_gain;
+    let p=&imported.program;let map=AttentionLayerMap::of(p,27).unwrap();assert_eq!(map.input_gain,actual_gain);
+    let base=Artifact::native(p).unwrap().f32_literals().unwrap();let bank=MappedCopyResidualBank::new(&base,&[27],&[16],33).unwrap();
+    let candidate=bank.candidate(CopyResidualChoice{layer:27,head:0,rank:16,family:HeadApproximation::CopyResidual}).unwrap();
+    let crate::operator_program::OperatorBody::Diagonal {values:gain,..}=&p.operators[actual_gain].body else{panic!("gain fixture")};
+    let crate::operator_program::OperatorBody::Diagonal {values:final_gain,..}=&p.operators[map.final_gain].body else{panic!("gain fixture")};
+    let h=&map.heads[0];let value=p.operators[h.value_operator].matrix();let prediction=crate::rules::copy_prediction(&value,gain,final_gain).unwrap();
+    let expected=crate::rules::copy_scale(&p.operators[h.output_operator].matrix(),&value,&prediction) as f32;
+    assert_eq!(candidate.derived[0].scale,expected);assert_eq!(candidate.derived[0].law,map.copy_law(0).unwrap());
+    candidate.validate_coverage(p).unwrap();
+}
