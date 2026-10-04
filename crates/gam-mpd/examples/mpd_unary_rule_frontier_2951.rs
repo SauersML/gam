@@ -49,6 +49,9 @@ impl Runs<'_> {
         sum
     }
 }
+fn in_candidate_scope(index: usize, requested: Option<usize>) -> bool {
+    index == 0 || requested.is_none_or(|wanted| wanted == index)
+}
 fn in_head_range(target: usize, start: u64, count: u64) -> bool {
     (start as usize..(start + count) as usize).contains(&target)
 }
@@ -135,6 +138,7 @@ fn main() -> Result<(), String> {
             "head_start",
             "head_count",
             "local_source_bytes",
+            "candidate_index",
         ]
         .contains(&k)
             || opts.insert(k, v).is_some()
@@ -161,6 +165,8 @@ fn main() -> Result<(), String> {
             .map(|v| v.parse::<u64>().map_err(|e| e.to_string()))
             .unwrap_or(Ok(default))
     };
+    let candidate_index = opts.get("candidate_index").map(|v|v.parse::<usize>().map_err(|e|e.to_string())).transpose()?;
+    if candidate_index.is_some_and(|i| i>=5137) { return Err("candidate_index outside declared complete bank".into()); }
     let head_start = optional("head_start", 0)?;
     let head_count = optional("head_count", 24)?;
     let local_source_bytes = optional("local_source_bytes", 0)?;
@@ -194,7 +200,7 @@ fn main() -> Result<(), String> {
         .iter()
         .flat_map(|&local| EPSILONS.iter().map(move |&run| Constraint { local, run }))
         .collect();
-    let scope = json!({"grammar":{"max_inputs":1,"max_nodes":2,"internal_scale_coefficients":[]},"coefficients":"one deterministic native-weight least-squares f32 amplitude perbody/source/target; NOTcontinuous-coefficient-family optimum","residual_ranks":[0],"native_layer_ids":[0,1,2,3],"all_heads":24,"complete_count":5137,"zero_controls":24,"expression_relations":5112,"source_scope":"allnativelearnedDense/LowRank/Diagonaloperators+globals excludingtarget/dependencies; Identity fixedprimitive excluded","local":{"sequences":2,"context":16,"tokens":32,"batch":16,"ascent":0,"boundary":"fixednativepost-attention-residual","denominator":gam_mpd::attention_map::LOCAL_DENOMINATOR,"normalizer_comparison":"different fromoldsplit contribution-only; do notcompareequaldeltaasidenticalconstraints"},"run":{"passages":2,"context":16,"episodes":50,"groups":25,"edits":"everyheadreadallrows/allcolumns removed separatelyperpassage; twoindependentcleans","backend":"CUDA f64 candidates; fixedCPU native reference episodes cachedonceperpassage"},"grid":grid,"codec_bytes":codec_bytes,"trace_bytes":trace_bytes,"cuda_native_weight_sharing":local_source_bytes>0,"local_source_bytes":local_source_bytes,"assessment_head_start":head_start,"assessment_head_count":head_count,"cuda_Local_compile":"freshResident perartifact; devicehandle andCPUdenominators shared","max_assess":max_assess,"stop_when_all_cost_gaps_zero":stop==1,"max_seconds":max_seconds,"resource_cases":"failed/unmeasured kept in complete bank; unknowncost lower0","optimality_scope":"complete5137declaredfittedsingle-substitutionbank only; unmeasuredfidelity remainsexplicit; no global programor continuousamplitudeclaim"});
+    let scope = json!({"grammar":{"max_inputs":1,"max_nodes":2,"internal_scale_coefficients":[]},"coefficients":"one deterministic native-weight least-squares f32 amplitude perbody/source/target; NOTcontinuous-coefficient-family optimum","residual_ranks":[0],"native_layer_ids":[0,1,2,3],"all_heads":24,"complete_count":5137,"zero_controls":24,"expression_relations":5112,"source_scope":"allnativelearnedDense/LowRank/Diagonaloperators+globals excludingtarget/dependencies; Identity fixedprimitive excluded","local":{"sequences":2,"context":16,"tokens":32,"batch":16,"ascent":0,"boundary":"fixednativepost-attention-residual","denominator":gam_mpd::attention_map::LOCAL_DENOMINATOR,"normalizer_comparison":"different fromoldsplit contribution-only; do notcompareequaldeltaasidenticalconstraints"},"run":{"passages":2,"context":16,"episodes":50,"groups":25,"edits":"everyheadreadallrows/allcolumns removed separatelyperpassage; twoindependentcleans","backend":"CUDA f64 candidates; fixedCPU native reference episodes cachedonceperpassage"},"grid":grid,"codec_bytes":codec_bytes,"trace_bytes":trace_bytes,"cuda_native_weight_sharing":local_source_bytes>0,"local_source_bytes":local_source_bytes,"assessment_candidate_index":candidate_index,"assessment_head_start":head_start,"assessment_head_count":head_count,"cuda_Local_compile":"freshResident perartifact; devicehandle andCPUdenominators shared","max_assess":max_assess,"stop_when_all_cost_gaps_zero":stop==1,"max_seconds":max_seconds,"resource_cases":"failed/unmeasured kept in complete bank; unknowncost lower0","optimality_scope":"complete5137declaredfittedsingle-substitutionbank only; unmeasuredfidelity remainsexplicit; no global programor continuousamplitudeclaim"});
     write_json(&out.join("SCOPE.json"), &scope)?;
     let mut inputs = BTreeMap::new();
     inputs.insert(
@@ -305,6 +311,7 @@ fn main() -> Result<(), String> {
     price_journal.flush().map_err(|e| e.to_string())?;
     let mut order: Vec<_> = (1..candidates.len())
         .filter(|&i| {
+            if !in_candidate_scope(i, candidate_index) {return false;}
             let target = match candidates[i] {
                 Candidate::Native => return true,
                 Candidate::Zero(t) => t,
@@ -319,6 +326,7 @@ fn main() -> Result<(), String> {
         .collect();
     order.sort_by_key(|&i| (records[i]["cost_bits"].as_u64().unwrap_or(0), i));
     order.insert(0, 0);
+    if candidate_index.is_some_and(|i|!order.contains(&i)) { return Err("candidate_index excluded by explicit head range".into()); }
     let codec_start = Instant::now();
     let codec = NativeOperatorCodec::new(
         &native.program,
@@ -459,6 +467,17 @@ fn main() -> Result<(), String> {
             if records[index]["cost_bits"].as_u64() != Some(actual.total()) {
                 return Err("actualcandidate differsfromprepricedC32".into());
             }
+            if candidate_index==Some(index) {
+                let bytes=artifact.to_bytes()?;
+                let decoded=Artifact::from_bytes(&bytes,&native.program.declarations)?;
+                decoded.validate_coverage(&native.program)?;
+                if decoded.to_bytes()?!=bytes || structural_cost(&decoded,&mut CostCache::default())?!=actual {
+                    return Err("requested candidate ordinary saved-byte parity failed".into());
+                }
+                let file=format!("requested.{index}.bin");
+                std::fs::write(out.join(&file),bytes).map_err(|e|e.to_string())?;
+                write_json(&out.join("REQUESTED_CANDIDATE.json"),&json!({"index":index,"candidate":format!("{:?}",candidates[index]),"file":file,"sha256":sha256(&out.join(&file))?,"cost_bits":actual.total(),"C32":actual,"ordinary_decode_canonical_coverage_cost":true}))?;
+            }
             let assessment = assess_once_local_first_with_native_codec(
                 &local, &run, &artifact, &grid, &mut costs, &codec,
             )?;
@@ -550,6 +569,13 @@ fn main() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exact_candidate_scope_keeps_native_and_only_requested() {
+        let selected: Vec<_> = (0..5137).filter(|&i| in_candidate_scope(i, Some(3789))).collect();
+        assert_eq!(selected, vec![0,3789]);
+        assert_eq!((0..5137).filter(|&i| in_candidate_scope(i, None)).count(),5137);
+        assert_eq!((0..5137).filter(|&i| in_candidate_scope(i, Some(0))).collect::<Vec<_>>(),vec![0]);
+    }
     #[test]
     fn four_shards_partition_all_heads_without_overlap() {
         for target in 0..24 {
