@@ -10,7 +10,9 @@ use serde_json::json;
 use std::path::Path;
 
 fn main() -> Result<(), String> {
-    let a: Vec<String> = std::env::args().collect();
+    let mut a: Vec<String> = std::env::args().collect();
+    let metric_only = a.get(1).is_some_and(|s| s == "--metric-proposals-only");
+    if metric_only { a.remove(1); }
     if a.len() < 6 {
         return Err("EXPORT SPEC OUT_JSON ABSOLUTE_PARITY_TOLERANCE ARTIFACT...".into());
     }
@@ -122,9 +124,16 @@ fn main() -> Result<(), String> {
                 runner.timing(),
             ))
         };
-        let (cpu, p, cpu_timing, cpu_wall, cpu_proposals, cpu_proposal_wall, cpu_final_timing) = measure(false)?;
-        drop((cpu_proposals, cpu_proposal_wall, cpu_final_timing));
+        let cpu_arm = if metric_only { None } else { Some(measure(false)?) };
         let (gpu, q, gpu_timing, gpu_wall, proposals, proposal_wall, after_proposal_timing) = measure(true)?;
+        let (cpu, p, cpu_timing, cpu_wall) = if let Some((scores, probs, timing, wall, proposals, proposal_wall, final_timing)) = cpu_arm {
+            drop((proposals, proposal_wall, final_timing));
+            (scores, probs, Some(timing), Some(wall))
+        } else {
+            // These aliases only skip the already-validated CPU-head comparison;
+            // proposal reductions below still compare against actual CPU metrics.
+            (gpu.clone(), q.clone(), None, None)
+        };
         let proposals = proposals.ok_or("missing opt-in GPU proposals")?;
         if proposals.len() != gpu.episodes.len() || p.iter().chain(q.iter()).any(|x| !x.is_finite()) {
             return Err("nonfinite sample or proposal count mismatch".into());
@@ -196,9 +205,9 @@ fn main() -> Result<(), String> {
             && max_kl <= tolerance
             && max_effect <= tolerance
             && sample_error <= tolerance;
-        results.push(json!({"artifact":path,"episodes":cpu.episodes.len(),"max_KL_absolute_error":max_kl,"max_native_effect_absolute_error":max_effect,"native_episode0_sample_max_log_probability_error":sample_error,"identical_top1":identical_top1,"verdicts":verdicts,"CPU_head":cpu,"CUDA_head":gpu,"CPU_head_timing":cpu_timing,"CUDA_head_timing":gpu_timing,"CPU_head_wall_seconds":cpu_wall,"CUDA_head_wall_seconds":gpu_wall,"GPU_metric_proposal_wall_seconds_warm_teacher":proposal_wall,"GPU_metric_proposal_max_absolute_error":proposal_max_error,"GPU_metric_proposal_identical_top1":proposal_top1_equal,"GPU_metric_proposal_comparisons":proposal_comparisons,"after_GPU_metric_proposal_timing":after_proposal_timing}));
+        results.push(json!({"artifact":path,"episodes":cpu.episodes.len(),"max_KL_absolute_error":max_kl,"max_native_effect_absolute_error":max_effect,"native_episode0_sample_max_log_probability_error":sample_error,"identical_top1":identical_top1,"verdicts":verdicts,"CPU_head":if metric_only { None } else { Some(&cpu) },"CUDA_head":gpu,"CPU_head_timing":cpu_timing,"CUDA_head_timing":gpu_timing,"CPU_head_wall_seconds":cpu_wall,"CUDA_head_wall_seconds":gpu_wall,"GPU_metric_proposal_wall_seconds_warm_teacher":proposal_wall,"GPU_metric_proposal_max_absolute_error":proposal_max_error,"GPU_metric_proposal_identical_top1":proposal_top1_equal,"GPU_metric_proposal_comparisons":proposal_comparisons,"after_GPU_metric_proposal_timing":after_proposal_timing}));
     }
-    let report = json!({"passes":passes,"parity_tolerance":tolerance,"scope":"CUDA f64 explained forwards in both arms; unchanged CPU teacher residual forwards; native output head differs. Fixed CPU-first order, warmed CUDA head, GPU metric estimates are proposal-only, never acceptance evidence; independent CPU metrics provide every verdict. Proposal timing reuses the CPU teacher cache. No matched speedup or formal full-network rounding certificate claimed.","resident_numeric_bytes":resident_bytes,"workspace_numeric_budget":budget.workspace_bytes,"tile_rows":tile_rows,"budget_excludes":"allocator metadata, CUDA context and library-private GEMM workspace; input model/teacher residual storage belongs to runner","synthetic":synthetic,"results":results});
+    let report = json!({"passes":passes,"metric_proposals_only":metric_only,"CPU_head_comparison_skipped":metric_only,"prior_GPU_head_parity_provenance":"caller protocol must identify independent head parity","parity_tolerance":tolerance,"scope":if metric_only { "CUDA f64 native head; CPU metric oracle then GPU metric proposals with the same immutable teacher residual cache. Head parity relies on separately recorded prior evidence. Proposals never decide acceptance; timings are warm teacher cache, not end-to-end speedup or formal network certificates." } else { "CUDA f64 explained forwards in both arms; unchanged CPU teacher residual forwards; native output head differs. Fixed CPU-first order, warmed CUDA head. GPU metric estimates are proposal-only, never acceptance evidence; independent CPU metrics provide every verdict. Proposal timing reuses the CPU teacher cache. No matched speedup or formal full-network rounding certificate claimed." },"resident_numeric_bytes":resident_bytes,"workspace_numeric_budget":budget.workspace_bytes,"tile_rows":tile_rows,"budget_excludes":"allocator metadata, CUDA context and library-private GEMM workspace; input model/teacher residual storage belongs to runner","synthetic":synthetic,"results":results});
     std::fs::write(
         &a[3],
         serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?,
