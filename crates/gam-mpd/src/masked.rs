@@ -56,11 +56,8 @@
 //! declares. The selection codes the corner claim: off subcomponents are absent and an input's
 //! error is the KL of its masks. Under the box claim each off gate may be anywhere in `[0, 1]` and
 //! the error is the worst KL over the box; only the pieces steps train under it
-//! ([`Claim::Box`], charged [`box_upper`]). Four facts fix how it is measured.
+//! ([`Claim::Box`], charged [`box_upper`]). Three facts fix how it is measured.
 //!
-//! * **An attack bounds from below.** Any point an attack evaluates ([`box_excess_at`]: the masks,
-//!   every layer's vertex, an adversary's ascent) has a loss at most the box's worst, so what it
-//!   finds is a lower bound: it can refute a claim, never certify one, and it is never charged.
 //! * **The expectation is no claim.** The KL expected over uniform independent off gates is
 //!   refinement-gameable (one off subcomponent split into `q` copies of `1/q` leaves the box
 //!   unchanged and cuts its own term by `1/q`), and its second-order expansion is unbounded below:
@@ -880,34 +877,6 @@ fn score_only_untimed(masked: &Masked, family: &FamilyInputs, target: &Target) -
     Ok(kl_score_only(target, &*logits(masked, family, &trace, target)?))
 }
 
-/// An attack on the box claim, per input (module note, "Claims"): the worst excess over the masks'
-/// own KL, per sequence, of the box points evaluated. They are the masks themselves (no excess),
-/// every layer's vertex (that layer's sites at the masks, every other site's off gates at 1), and
-/// an adversary's points (sign ascent over the off gates, all together and one layer's alone),
-/// each of whose KL is exact; the adversary's are taken per token, each token its own worst point.
-/// A sequence takes the point of its largest total, so a set whose layers only cancel each other's
-/// errors is caught. A lower bound on the box's worst case: it refutes a claim, never charged.
-pub fn box_excess_at(masked: &Masked, base: &FamilyInputs, target: &Target, masks: &[Array2<f64>]) -> Result<Array1<f64>, String> {
-    let corner = score_only(masked, &masked.family(base, masks), target)?;
-    box_excess_from(masked, base, target, masks, &corner)
-}
-
-/// [`box_excess_at`] from the masks' own KL `corner`.
-fn box_excess_from(masked: &Masked, base: &FamilyInputs, target: &Target, masks: &[Array2<f64>], corner: &Array1<f64>) -> Result<Array1<f64>, String> {
-    // The vertices share every gate on up to their own layer (as in a selection).
-    let lowered = masked.on_device(|_| Ok(()))?.is_some();
-    let all_on = if !lowered && masked.head.is_none() {
-        let on: Vec<Array2<f64>> = masks.iter().map(|m| Array2::ones(m.dim())).collect();
-        let every = masked.dense_program(&vec![true; masked.sites.len()])?;
-        let mut trace = every.execute(&masked.family(base, &on), false).map_err(|e| e.to_string())?;
-        trace.values.truncate(masked.z.iter().copied().max().unwrap_or(0));
-        Some(trace)
-    } else {
-        None
-    };
-    box_worst(masked, base, target, masks, corner, all_on.as_ref())
-}
-
 /// The program's logits when they are one dense product of a hidden node and nothing after it:
 /// the hidden node, the operator and the product's layout (`x Aᵀ` for an affine node, `x A` for a
 /// transposed one).
@@ -930,52 +899,6 @@ fn lone_head(masked: &Masked) -> Option<(usize, usize, gam_gpu::banded::Layout)>
     matches!(program.operators[operator].body, OperatorBody::Dense { .. }).then_some((hidden, operator, layout))
 }
 
-/// A box point's KL per input from its hidden values `hidden` before the head ([`lone_head`]),
-/// certified against the worst so far: the head's product runs in f32 on the device, each row's
-/// KL with a bound on its error (`2 maxⱼ band`, the KL's gradient in the logits being `q − p`, of
-/// `ℓ₁` norm at most 2). A sequence whose total excess over `corner` could exceed its worst
-/// `totals` gets its rows' KL exactly; every other banded row is lowered by its band, so the point
-/// cannot win that sequence, as its exact KL could not either. Also returns the logits (f32 where
-/// the device ran them), which only steer.
-fn certified_point(
-    masked: &Masked,
-    target: &Target,
-    hidden: &Array2<f64>,
-    (operator, layout): (usize, gam_gpu::banded::Layout),
-    corner: &Array1<f64>,
-    totals: &[f64],
-    sequence_of: &[usize],
-) -> Result<(Array1<f64>, Array2<f64>), String> {
-    let rows = hidden.nrows();
-    let op = &masked.program.operators[operator];
-    let Some(banded) = super::device::banded_product(op, hidden, layout).map_err(|e| e.to_string())? else {
-        let logits = exact_head(masked, hidden, operator, layout);
-        return Ok((kl_score_only(target, &logits), logits));
-    };
-    let band = Array1::from_shape_fn(rows, |r| if target.scores(r) { 2.0 * banded.band.row_max(r) } else { 0.0 });
-    let logits = banded.values;
-    let mut kl_point = kl_score_only(target, &logits);
-    let mut upper = vec![0.0; totals.len()];
-    for r in 0..rows {
-        upper[sequence_of[r]] += kl_point[r] + band[r] - corner[r];
-    }
-    let is_open: Vec<bool> = (0..rows).map(|r| band[r] > 0.0 && upper[sequence_of[r]] > totals[sequence_of[r]]).collect();
-    let open: Vec<usize> = (0..rows).filter(|r| is_open[*r]).collect();
-    if !open.is_empty() {
-        let exact = exact_head(masked, &hidden.select(Axis(0), &open), operator, layout);
-        let sub = Target { logits: target.logits.select(Axis(0), &open), scored: target.scored.as_ref().map(|s| open.iter().map(|r| s[*r]).collect()) };
-        for (i, value) in kl_score_only(&sub, &exact).into_iter().enumerate() {
-            kl_point[open[i]] = value;
-        }
-    }
-    for r in 0..rows {
-        if band[r] > 0.0 && !is_open[r] {
-            kl_point[r] -= band[r];
-        }
-    }
-    Ok((kl_point, logits))
-}
-
 /// The head's float64 product on `hidden`.
 fn exact_head(masked: &Masked, hidden: &Array2<f64>, operator: usize, layout: gam_gpu::banded::Layout) -> Array2<f64> {
     let a = masked.program.operators[operator].matrix_cow();
@@ -983,104 +906,6 @@ fn exact_head(masked: &Masked, hidden: &Array2<f64>, operator: usize, layout: ga
         gam_gpu::banded::Layout::Transposed => gam_linalg::faer_ndarray::fast_abt(hidden, a.as_ref()),
         gam_gpu::banded::Layout::AsStored => gam_linalg::faer_ndarray::fast_ab(hidden, a.as_ref()),
     }
-}
-
-/// A masked forward whose head runs in f32 on the device with its certified band: each row's KL
-/// within `band` of its float64 value (`2 maxⱼ` of the head's entry bounds, the KL's gradient in
-/// the logits being `q − p`, of `ℓ₁` norm at most 2). The trace stops at the head's hidden node;
-/// [`ScreenedPoint::exact`] settles any rows to their float64 KL, and [`ScreenedPoint::mask_gradients`]
-/// steers from the screened logits.
-pub(crate) struct ScreenedPoint {
-    pub kl: Array1<f64>,
-    pub band: Array1<f64>,
-    trace: Trace,
-    logits: Array2<f64>,
-    head: (usize, usize, gam_gpu::banded::Layout),
-}
-
-/// How a screened point's forward runs its head.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HeadScreen {
-    /// No screen: the caller's float64 forward.
-    Off,
-    /// The f32 product on the device; no screen when the device does not take it.
-    Device,
-    /// The float64 product carrying the f32 band (tests: every decision path runs, and the
-    /// values are the unscreened ones).
-    Emulated,
-}
-
-/// [`ScreenedPoint`] at `family`, or `None` when the head is not a lone product or the device does not
-/// take it.
-pub(crate) fn screened_point(masked: &Masked, family: &FamilyInputs, target: &Target, screen: HeadScreen) -> Result<Option<ScreenedPoint>, String> {
-    use gam_gpu::banded::Layout;
-    let Some(head @ (hidden, operator, layout)) = lone_head(masked).filter(|_| screen != HeadScreen::Off) else {
-        return Ok(None);
-    };
-    let mut body = masked.program.clone();
-    body.nodes.truncate(hidden + 1);
-    body.output = hidden;
-    let trace = body.execute(family, false).map_err(|e| e.to_string())?;
-    let h = &trace.values[hidden];
-    let (logits, band) = match screen {
-        HeadScreen::Device => {
-            let op = &masked.program.operators[operator];
-            match super::device::banded_product(op, h, layout).map_err(|e| e.to_string())? {
-                Some(banded) => (banded.values, banded.band),
-                None => return Ok(None),
-            }
-        }
-        HeadScreen::Off => return Ok(None),
-        HeadScreen::Emulated => {
-            let a = masked.program.operators[operator].matrix_cow();
-            let right = match layout {
-                Layout::Transposed => a.t(),
-                Layout::AsStored => a.view(),
-            };
-            let band = gam_gpu::precision_bounds::GemmBand::derive(gam_gpu::precision_bounds::DeviceArithmetic::F32, h.view(), right).map_err(|e| format!("{e:?}"))?;
-            (exact_head(masked, h, operator, layout), band)
-        }
-    };
-    let band = Array1::from_shape_fn(family.rows, |r| if target.scores(r) { 2.0 * band.row_max(r) } else { 0.0 });
-    let kl = kl_score_only(target, &logits);
-    Ok(Some(ScreenedPoint { kl, band, trace, logits, head }))
-}
-
-impl ScreenedPoint {
-    /// The hidden node's value (to settle rows after this trace is gone, [`exact_rows`]).
-    pub(crate) fn hidden(&self) -> &Array2<f64> {
-        &self.trace.values[self.head.0]
-    }
-
-    /// `∂/∂m` of the KL (of row `focus` alone when given) from the screened logits: it only steers.
-    pub(crate) fn mask_gradients(&self, masked: &Masked, family: &FamilyInputs, target: &Target, focus: Option<usize>) -> Result<Vec<Array2<f64>>, String> {
-        let (hidden, operator, layout) = self.head;
-        let mut cotangent = kl(target, &self.logits).1;
-        if let Some(row) = focus {
-            for (r, mut c) in cotangent.outer_iter_mut().enumerate() {
-                if r != row {
-                    c.fill(0.0);
-                }
-            }
-        }
-        let backward = match layout {
-            gam_gpu::banded::Layout::Transposed => gam_gpu::banded::Layout::AsStored,
-            gam_gpu::banded::Layout::AsStored => gam_gpu::banded::Layout::Transposed,
-        };
-        let op = &masked.program.operators[operator];
-        let seed = proposing(|| super::device::product(op, &cotangent, backward)).map_err(|e| e.to_string())?;
-        let back = proposing(|| super::derivatives::vjp_from(&masked.program, family, &self.trace, hidden, seed, Some(&masked.masked))).map_err(|e| e.to_string())?;
-        Ok(mask_gradients_of(masked, &self.trace, &back))
-    }
-}
-
-/// The float64 KL of `rows` from their hidden values `hidden` (one row each, in order), through
-/// the lone head ([`lone_head`]).
-pub(crate) fn exact_rows(masked: &Masked, target: &Target, hidden: &Array2<f64>, rows: &[usize]) -> Result<Array1<f64>, String> {
-    let (_, operator, layout) = lone_head(masked).ok_or("exact rows: no lone head")?;
-    let logits = exact_head(masked, hidden, operator, layout);
-    let sub = Target { logits: target.logits.select(Axis(0), rows), scored: target.scored.as_ref().map(|s| rows.iter().map(|r| s[*r]).collect()) };
-    Ok(kl_score_only(&sub, &logits))
 }
 
 /// The current masks' head as a screened score starts from (module note, "Screened heads"): the
@@ -1225,117 +1050,13 @@ fn undecided(savings: &[Vec<f64>], bands: &[Vec<f64>], threshold: Option<&[f64]>
         .collect()
 }
 
-/// [`box_excess_at`] from the masks' own KL `corner`: each layer's vertex, then the adversary. With `all_on`, the CPU trace of every gate on: a vertex's layers before
-/// its own are all on, so its forward starts at its layer's first mask, reading the rest there.
-fn box_worst(
-    masked: &Masked,
-    base: &FamilyInputs,
-    target: &Target,
-    masks: &[Array2<f64>],
-    corner: &Array1<f64>,
-    all_on: Option<&Trace>,
-) -> Result<Array1<f64>, String> {
-    let rows = base.rows;
-    let sequence_of: Vec<usize> = match &base.layout {
-        Some(layout) => layout.sequence.iter().map(|s| *s as usize).collect(),
-        None => (0..rows).collect(),
-    };
-    let sequences = sequence_of.iter().copied().max().map_or(0, |m| m + 1);
-    let per_sequence = |values: &Array1<f64>| {
-        let mut totals = vec![0.0; sequences];
-        for r in 0..rows {
-            totals[sequence_of[r]] += values[r];
-        }
-        totals
-    };
-    // The masks themselves are a point of the box.
-    let mut worst = Array1::<f64>::zeros(rows);
-    let mut totals = vec![0.0; sequences];
-    // Sites by layer: the name up to its last `.`.
-    let mut layers: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for (k, site) in masked.sites.iter().enumerate() {
-        layers.entry(site.name.rsplit_once('.').map_or_else(|| site.name.clone(), |(layer, _)| layer.to_string())).or_default().push(k);
-    }
-    // The program up to the head's hidden node, when the head is a lone product: a vertex's
-    // logits are then screened in f32 and made exact only for the sequences it may decide.
-    let head = lone_head(masked);
-    let body = head.map(|(hidden, _, _)| {
-        let mut body = masked.program.clone();
-        body.nodes.truncate(hidden + 1);
-        body.output = hidden;
-        body
-    });
-    if layers.len() > 1 {
-        for sites in layers.values() {
-            let vertex: Vec<Array2<f64>> =
-                masks.iter().enumerate().map(|(k, m)| if sites.contains(&k) { m.clone() } else { Array2::ones(m.dim()) }).collect();
-            let family = masked.family(base, &vertex);
-            // The layer's first mask node (each site's mask sits just before its `z`).
-            let from = sites.iter().map(|k| masked.z[*k] - 1).min().unwrap_or(0);
-            // Every other layer's gates are on: its sites run through their library sums.
-            let others: Vec<bool> = (0..masked.sites.len()).map(|k| !sites.contains(&k)).collect();
-            let kl_vertex = match (all_on, &body, head) {
-                (Some(trace), Some(_), Some((hidden, operator, layout))) if from <= hidden => {
-                    let program = masked.dense_program(&others)?;
-                    let hidden_values = program.execute_suffix_node(&family, trace, from, hidden).map_err(|e| e.to_string())?;
-                    certified_point(masked, target, &hidden_values, (operator, layout), corner, &totals, &sequence_of)?.0
-                }
-                (Some(trace), _, _) if masked.head.is_none() && from <= masked.program.output => {
-                    let program = masked.dense_program(&others)?;
-                    let output = program.execute_suffix_node(&family, trace, from, masked.program.output).map_err(|e| e.to_string())?;
-                    kl_score_only(target, &output)
-                }
-                _ => score_only(masked, &family, target)?,
-            };
-            let excess = &kl_vertex - corner;
-            let vertex_totals = per_sequence(&excess);
-            for r in 0..rows {
-                let q = sequence_of[r];
-                if vertex_totals[q] > totals[q] {
-                    worst[r] = excess[r];
-                }
-            }
-            for q in 0..sequences {
-                totals[q] = totals[q].max(vertex_totals[q]);
-            }
-        }
-    }
-    // An adversary inside the box ([`super::adversary::adversary`]): sign ascent over every off gate
-    // together, and over each layer's off gates alone (the rest at the masks), from the masks, every
-    // gate's top and its middle; each input keeps the largest KL any point gave it, so a word is
-    // charged its own worst case.
-    const ADVERSARY_STEPS: usize = 4;
-    const ADVERSARY_STARTS: usize = 3;
-    let claim = super::adversary::Gates::claim(masks);
-    let mut boxes = vec![claim.clone()];
-    if layers.len() > 1 {
-        for sites in layers.values() {
-            let mut only = claim.clone();
-            for k in 0..masks.len() {
-                if !sites.contains(&k) {
-                    only.upper[k] = only.lower[k].clone();
-                }
-            }
-            boxes.push(only);
-        }
-    }
-    let seeds: Vec<u64> = (0..boxes.len()).map(|i| 0xAD5E + i as u64).collect();
-    for kl_point in timed("adversary", || super::adversary::adversary_batch(masked, base, target, &boxes, ADVERSARY_STEPS, ADVERSARY_STARTS, &seeds))? {
-        let excess = &kl_point - corner;
-        for r in 0..rows {
-            worst[r] = worst[r].max(excess[r]);
-        }
-    }
-    Ok(worst)
-}
-
 /// Our box claim's cost per input (module note, "Claims"): at every site, from its reads in the
 /// masked forward `trace`, the off blocks' outputs `Z_c = U_c z_c` bounded together in the site's
 /// written Fisher `fishers[k]`, `½ (Σ_off ‖Z_c‖_F)²` nats, an upper bound on the quadratic response
 /// of the off gates in `[0, 1]` there (the triangle inequality), summed over sites. Local to each
-/// site and second order, it is our claim's cost, not a bound on the end-to-end KL, which the
-/// attack measures ([`box_excess_at`]). A refinement of the library cannot lower it: splitting an
-/// off block leaves the sum of its parts' norms no smaller.
+/// site and second order, it is our claim's cost, not a bound on the end-to-end KL. A refinement
+/// of the library cannot lower it: splitting an off block leaves the sum of its parts' norms no
+/// smaller.
 pub fn box_upper(masked: &Masked, trace: &Trace, masks: &[Array2<f64>], fishers: &[Array2<f64>]) -> Result<Array1<f64>, String> {
     let amplitudes: Vec<_> = masked.z.iter().map(|n| &trace.values[*n]).collect();
     Ok(box_contributions(masked, &amplitudes, masks, fishers, false)?.0)

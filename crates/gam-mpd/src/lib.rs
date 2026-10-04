@@ -92,12 +92,6 @@ mod explanation_tests;
 #[cfg(test)]
 mod masked_tests;
 
-// An adversary inside a box claim: sign ascent over the off gates, a lower bound on its worst case.
-pub mod adversary;
-
-#[cfg(test)]
-mod adversary_tests;
-
 // Rank-k gated subcomponents: which of a library's columns share one gate, chosen by the code.
 pub mod blocks;
 
