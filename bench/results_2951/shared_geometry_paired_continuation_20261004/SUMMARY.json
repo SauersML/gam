@@ -1,0 +1,72 @@
+{
+  "source_commit": "f56bf43964d193f56cda1bbfeb6182619bd39c7c",
+  "start_pool_sha256": "2e0cb7293c2347846997337a28eb547cf50d6e7da7106c5563bbbeb5289d3162",
+  "scope": "Both start identical training-selected frozen-native256 whole parameters, fresh Adam moments; same4096train/1024project-seen eval;256moreupdates; not completefidelity, not statefuloptimizerresume",
+  "paired_results": [
+    {
+      "arm": "learned",
+      "seconds": 24.133800313,
+      "initial_train": 0.7528471343370208,
+      "step_zero": {
+        "active_recomputed_error": 0.7528471319462098,
+        "step": 0,
+        "training_max": 0.7528471343370208,
+        "worst_group": 1,
+        "worst_row": 689
+      },
+      "best_train": 0.7528471343370208,
+      "best_step": 0,
+      "initial_eval": [
+        5.01196718983401e-07,
+        5.024085590320208
+      ],
+      "saved_f64_train": [
+        2.7537769449336368e-15,
+        0.7528471285078746
+      ],
+      "saved_f64_eval": [
+        2.2727697370701983e-15,
+        5.024085062086227
+      ],
+      "pool_sha256": "2e0cb7293c2347846997337a28eb547cf50d6e7da7106c5563bbbeb5289d3162"
+    },
+    {
+      "arm": "frozen_native",
+      "seconds": 24.126012008,
+      "initial_train": 0.7528471343370208,
+      "step_zero": {
+        "active_recomputed_error": 0.7528471319462098,
+        "step": 0,
+        "training_max": 0.7528471343370208,
+        "worst_group": 1,
+        "worst_row": 689
+      },
+      "best_train": 0.5873722223001886,
+      "best_step": 250,
+      "initial_eval": [
+        5.01196718983401e-07,
+        5.024085590320208
+      ],
+      "saved_f64_train": [
+        2.7537769449336368e-15,
+        0.5873722235252388
+      ],
+      "saved_f64_eval": [
+        2.2727697370701983e-15,
+        5.755988179497747
+      ],
+      "pool_sha256": "1bcf9e595b0193de05696233f89dd014d64f22c5d64f641116fda8e17e1bc1e2"
+    }
+  ],
+  "allocation_seconds": [
+    42,
+    42
+  ],
+  "input_token_scan_passes_per_arm": 1052672,
+  "site_row_predictions_per_arm": 2105344,
+  "active_group_row_backwards_per_arm": 256,
+  "validation_input_passes_per_arm": 2048,
+  "replay_training_input_passes_per_arm": 4096,
+  "replay_validation_input_passes_per_arm": 1024,
+  "optimizer_seconds_total_including_previous_controls": 147.52470554299998
+}

@@ -1,0 +1,10 @@
+{
+  "learned": {
+    "report_sha256": "3e816588f05f1b2db8062dbea6eebe91a53956d69af1cce97db2fb5f449914c9",
+    "gzip_sha256": "e4ba584567c5810214714d41780d6fa5a0e6e27b54de206fa2bc9ea0c0f170be"
+  },
+  "frozen_native": {
+    "report_sha256": "6a97949b551df0deea5fae844ccdb12cf502e723937c8fd9a890c52d17e7226a",
+    "gzip_sha256": "0b7537df39e3d5cffa314a7405be9ad56b1c09470981b1ea8809e62379e84473"
+  }
+}

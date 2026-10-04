@@ -1,0 +1,28 @@
+{
+  "arm": "frozen_native",
+  "uses": [
+    0,
+    1
+  ],
+  "seed": 2951,
+  "extract_sha256": "e914269c811d00503b93167a66bbd761d196c76fd8dd44fd18698532bd4a565e",
+  "export_json_sha256": "1af0aface5a0ca843624310daac12c0ff770a0cc24aa96550c130d11de77bb68",
+  "settings": {
+    "iterations": 256,
+    "forward_rows": 128,
+    "learning_rate": 0.001,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "epsilon": 1e-08,
+    "numeric_bytes": 2147483648,
+    "arithmetic": "f32"
+  },
+  "scope": "training-selected native256 parameter pool, paired additional256 updates; fresh Adam moments, learned family contains frozen-native; no validation selection",
+  "source_commit": "f56bf43964d193f56cda1bbfeb6182619bd39c7c",
+  "unique_training_tokens": 4096,
+  "site_rows_per_scan": 8192,
+  "evaluation_tokens": 1024,
+  "transfer_status": "not in first gate",
+  "resume_pool": "/mnt/nw/home/s.sauers/mpd-data/cluster/codex-shared-geometry-256-frozen_native-f822/measurement/fitted-pool.artifact",
+  "resume_sha256": "2e0cb7293c2347846997337a28eb547cf50d6e7da7106c5563bbbeb5289d3162"
+}
