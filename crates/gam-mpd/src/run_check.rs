@@ -687,6 +687,12 @@ fn apply_device_node_edits<'a>(
     Ok(Some(value))
 }
 
+#[path = "resident_language_run.rs"]
+mod resident_language;
+pub use resident_language::{PreparedResidentCandidate, ResidentBudget, ResidentEpisode, ResidentMeasure, ResidentLanguageRun};
+type EpisodePlan = (Artifact, Vec<usize>, BTreeMap<usize, Vec<NodeEdit>>, usize);
+type WantedDonors = BTreeMap<usize, Vec<DonorKey>>;
+
 struct TeacherEpisodes {
     residuals: Vec<Array2<f64>>,
     native_effects: Vec<f64>,
@@ -792,13 +798,14 @@ pub struct LanguageRun<'a> {
     native_readout: Option<crate::native_readout::Resident>,
     readout_lock: std::sync::Mutex<()>,
     teachers: std::sync::OnceLock<Result<TeacherEpisodes, String>>,
+    resident_teachers: std::sync::OnceLock<Result<resident_language::Teachers,String>>,
     timers: RunTimers,
 }
 
 impl<'a> LanguageRun<'a> {
     pub fn new(decoder: &'a Decoder, native: &'a OperatorProgram, spec: &'a Spec, passages: &'a [Vec<u32>], parallel: usize) -> Result<Self, String> {
         let layers = layer_nodes(native, decoder.layers())?;
-        Ok(Self { decoder, native, spec, passages, layers, parallel, tile: 64, device: None, trace_bytes_limit: 0, native_device_source: None, native_readout: None, readout_lock: std::sync::Mutex::new(()), teachers: std::sync::OnceLock::new(), timers: RunTimers::default() })
+        Ok(Self { decoder, native, spec, passages, layers, parallel, tile: 64, device: None, trace_bytes_limit: 0, native_device_source: None, native_readout: None, readout_lock: std::sync::Mutex::new(()), teachers: std::sync::OnceLock::new(), resident_teachers: std::sync::OnceLock::new(), timers: RunTimers::default() })
     }
 
     /// Diagnostic timing only; no measurement changes fidelity or acceptance.
@@ -1157,7 +1164,6 @@ impl LanguageRun<'_> {
 
         if mode==MetricMode::GpuProposal && self.native_readout.is_none() { return Err("GPU metric proposals require explicit native CUDA readout".into()); }
         use rayon::prelude::*;
-        let head_dim = self.native.node_interface(self.layers[0].reads[0]).map_err(|e| e.to_string())?.width();
         let compile_timer = RunTimer::start(&self.timers.compile);
         let (mut program, residuals) = self.truncated(artifact)?;
         let base = self.device.as_ref().map(|device| match &self.native_device_source {
@@ -1172,42 +1178,9 @@ impl LanguageRun<'_> {
         }).transpose()?;
         drop(compile_timer);
         let teachers = self.teacher_episodes()?;
-        // Each episode's edits of P, and the donor states they read.
+        // The same declared mapping is reused by the resident teacher backend.
         let planning_timer = RunTimer::start(&self.timers.planning);
-        let mut plans = Vec::with_capacity(self.spec.episodes.len());
-        let mut wanted: BTreeMap<usize, Vec<DonorKey>> = BTreeMap::new();
-        for episode in &self.spec.episodes {
-            let mut specs = BTreeMap::new();
-            for action in &episode.actions {
-                if matches!(action, Action::Input { .. }) {
-                    let site = action.site();
-                    let nodes = self.layers.get(site / KINDS.len()).ok_or("site beyond decoder")?;
-                    add_input_spec(&mut specs, &program, nodes, action, head_dim)?;
-                }
-            }
-            lift_input_boundaries(self.native, &program, &mut specs)?;
-            let (episode_program, forks, map) = fork_inputs(&program, &specs)?;
-            let episode_residuals: Vec<_> = residuals.iter().map(|n| map[*n]).collect();
-            let mut edits: BTreeMap<usize, Vec<NodeEdit>> = BTreeMap::new();
-            let mut controls: BTreeMap<usize, Vec<NodeEdit>> = BTreeMap::new();
-            let mut unheld = 0;
-            for action in &episode.actions {
-                let mapped = self.edits(&episode_program, &program, &forks, action, head_dim)?;
-                unheld += mapped.unheld;
-                for (node, edit) in mapped.pre_write { controls.entry(node).or_default().push(edit); }
-                for (node, edit) in mapped.held {
-                    if let (NodeEdit::Mix { donor, .. }, Some(d)) = (&edit, episode.donor) {
-                        let keys = wanted.entry(d).or_default();
-                        if !keys.contains(donor) {
-                            keys.push(*donor);
-                        }
-                    }
-                    edits.entry(node).or_default().push(edit);
-                }
-            }
-            prepend_controls(&mut edits, controls);
-            plans.push((episode_program, episode_residuals, edits, unheld));
-        }
+        let (plans,wanted)=self.resident_plans(&program,&residuals)?;
         drop(planning_timer);
         let make_donor = |(d, keys): (&usize, &Vec<DonorKey>)| {
             let timer = RunTimer::start(&self.timers.donor);
@@ -1350,6 +1323,45 @@ impl LanguageRun<'_> {
         let mut measure=crate::fixed_metric_device::Measure::from_parts(episodes,budget,required,"Exact fixed binary64 raw CUDA head logits; scored raw metric tiles have no CPU normalization or vocabulary transfer with oracle disabled. Cold native teacher/effect preparation keeps existing CPU normalization/transfers, cached for warm calls. Excludes RMS/gain/GEMM/head/network rounding. Independent host analytic checks are first/last row of each tile only. Distinct input values from normalized-array endpoint; default acceptance unchanged.");
         measure.readout_numeric_resident_bytes=Some(head.resident_bytes());
         Ok(measure)
+    }
+
+    fn resident_plans(&self,program:&Artifact,residuals:&[usize])->Result<(Vec<EpisodePlan>,WantedDonors),String> {
+        let head_dim=self.native.node_interface(self.layers[0].reads[0]).map_err(|e|e.to_string())?.width();
+        let mut plans = Vec::with_capacity(self.spec.episodes.len());
+        let mut wanted: BTreeMap<usize, Vec<DonorKey>> = BTreeMap::new();
+        for episode in &self.spec.episodes {
+            let mut specs = BTreeMap::new();
+            for action in &episode.actions {
+                if matches!(action, Action::Input { .. }) {
+                    let site = action.site();
+                    let nodes = self.layers.get(site / KINDS.len()).ok_or("site beyond decoder")?;
+                    add_input_spec(&mut specs, &program, nodes, action, head_dim)?;
+                }
+            }
+            lift_input_boundaries(self.native, &program, &mut specs)?;
+            let (episode_program, forks, map) = fork_inputs(&program, &specs)?;
+            let episode_residuals: Vec<_> = residuals.iter().map(|n| map[*n]).collect();
+            let mut edits: BTreeMap<usize, Vec<NodeEdit>> = BTreeMap::new();
+            let mut controls: BTreeMap<usize, Vec<NodeEdit>> = BTreeMap::new();
+            let mut unheld = 0;
+            for action in &episode.actions {
+                let mapped = self.edits(&episode_program, &program, &forks, action, head_dim)?;
+                unheld += mapped.unheld;
+                for (node, edit) in mapped.pre_write { controls.entry(node).or_default().push(edit); }
+                for (node, edit) in mapped.held {
+                    if let (NodeEdit::Mix { donor, .. }, Some(d)) = (&edit, episode.donor) {
+                        let keys = wanted.entry(d).or_default();
+                        if !keys.contains(donor) {
+                            keys.push(*donor);
+                        }
+                    }
+                    edits.entry(node).or_default().push(edit);
+                }
+            }
+            prepend_controls(&mut edits, controls);
+            plans.push((episode_program, episode_residuals, edits, unheld));
+        }
+        Ok((plans,wanted))
     }
 
     /// Fast proposal/ranking diagnostics only. The fixed CPU teacher residuals

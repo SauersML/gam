@@ -18,7 +18,7 @@ pub enum Outcome {
     Unresolved { reason: String },
 }
 impl Outcome {
-    fn of(interval: Interval) -> Self {
+    pub(crate) fn of(interval: Interval) -> Self {
         if interval.lo.is_finite() && interval.hi.is_finite() && interval.lo <= interval.hi {
             Self::Bounded {
                 lower: interval.lo,
@@ -30,7 +30,7 @@ impl Outcome {
             }
         }
     }
-    fn interval(&self) -> Option<Interval> {
+    pub(crate) fn interval(&self) -> Option<Interval> {
         match self {
             Self::Bounded { lower, upper } => Some(Interval::new(*lower, *upper)),
             Self::Unresolved { .. } => None,
@@ -153,7 +153,7 @@ impl Measure {
         }
     }
 }
-fn mean_outcomes(outcomes: &[&Outcome]) -> Outcome {
+pub(crate) fn mean_outcomes(outcomes: &[&Outcome]) -> Outcome {
     if outcomes.is_empty() {
         return Outcome::Unresolved {
             reason: "empty group".into(),
@@ -424,6 +424,14 @@ impl Stream<'_> {
     }
 }
 
+pub(crate) struct RawEvidence {
+    pub kl: Outcome,
+    pub top1_agree: f64,
+    pub top1_defined: bool,
+    pub host_analytic_spotcheck: Option<HostSpotcheck>,
+    pub metric_timing: Timing,
+}
+
 /// Directed accumulation of already-resident raw-logit metric rows. No vocabulary buffers.
 pub(crate) struct RawStream {
     top1_defined: bool,
@@ -499,15 +507,7 @@ impl RawStream {
         self.timing.cpu_reference_seconds += tile.timing.cpu_reference_seconds;
         Ok(())
     }
-    pub(crate) fn finish(
-        self,
-        id: String,
-        group: String,
-        from: usize,
-        until: usize,
-        native_effect: f64,
-        unheld: usize,
-    ) -> Result<Episode, String> {
+    pub(crate) fn finish_evidence(self,from:usize,until:usize)->Result<RawEvidence,String> {
         if self.count == 0
             || self.count != until.saturating_sub(from)
             || self.start != Some(from)
@@ -521,21 +521,16 @@ impl RawStream {
             Some(sum) => Outcome::of(sum.div_positive(Interval::point(n))),
             None => self.sum,
         };
-        Ok(Episode {
-            id,
-            group,
-            scored_from: from,
-            scored_until: until,
-            kl,
-            native_effect_cpu_metric: native_effect,
-            top1_agree: self.agree as f64 / n,
-            top1_defined: self.top1_defined,
-            unheld,
-            cpu_comparison: None,
-            metric_timing: self.timing,
-            host_analytic_spotcheck: self.oracle,
-        })
+        Ok(RawEvidence {kl,top1_agree:self.agree as f64/n,top1_defined:self.top1_defined,
+             host_analytic_spotcheck:self.oracle,metric_timing:self.timing})
     }
+    pub(crate) fn finish(self,id:String,group:String,from:usize,until:usize,native_effect:f64,unheld:usize)->Result<Episode,String> {
+        let evidence=self.finish_evidence(from,until)?;
+        Ok(Episode {id,group,scored_from:from,scored_until:until,kl:evidence.kl,native_effect_cpu_metric:native_effect,
+             top1_agree:evidence.top1_agree,top1_defined:evidence.top1_defined,unheld,cpu_comparison:None,
+             metric_timing:evidence.metric_timing,host_analytic_spotcheck:evidence.host_analytic_spotcheck})
+    }
+
 }
 
 #[cfg(test)]
