@@ -323,6 +323,52 @@ impl Builder {
 pub fn compile(expr: &Expr, width: usize, uses: &[UseSpec], seed: u64) -> Result<Proposal, String> {
     compile_mode(expr, width, uses, seed, true)
 }
+
+/// One use as a one-input function suitable for `Artifact::replace_function`.
+/// Shared operator Arcs and callable bodies remain shared across exported uses.
+pub fn function(proposal: &Proposal, slot: usize) -> Result<OperatorProgram, String> {
+    let Node::Concat { parts } = &proposal.program.nodes[proposal.program.output] else {
+        return Err("composed proposal requires per-use concatenated outputs".into());
+    };
+    let output = *parts.get(slot).ok_or("composed use is absent")?;
+    let Some(Slot::Raw { width }) = proposal.program.declarations.slots.get(slot) else {
+        return Err("composed use requires a raw input".into());
+    };
+    let mut live = vec![false; proposal.program.nodes.len()];
+    let mut stack = vec![output];
+    while let Some(node) = stack.pop() {
+        if live[node] {
+            continue;
+        }
+        live[node] = true;
+        stack.extend(proposal.program.nodes[node].arguments());
+    }
+    let mut mapping = vec![usize::MAX; live.len()];
+    let mut nodes = Vec::new();
+    for (old, node) in proposal.program.nodes.iter().enumerate() {
+        if live[old] {
+            mapping[old] = nodes.len();
+            nodes.push(node.clone());
+        }
+    }
+    let ops: Vec<_> = (0..proposal.program.operators.len()).collect();
+    let rules: Vec<_> = (0..proposal.program.rules.len()).collect();
+    for node in &mut nodes {
+        crate::operator_program::remap_node(node, &mapping, &ops, &[], &rules);
+        if let Node::Raw { slot: source_slot } = node {
+            if *source_slot != slot {
+                return Err("function crosses another use's input".into());
+            }
+            *source_slot = 0;
+        }
+    }
+    let mut program = proposal.program.clone();
+    program.declarations.slots = vec![Slot::Raw { width: *width }];
+    program.nodes = nodes;
+    program.output = mapping[output];
+    program.interfaces().map_err(|e| e.to_string())?;
+    Ok(program)
+}
 /// Same initial numerical function and external maps as `compile`, but body coefficients
 /// can move independently at every use. It is a fitting/control comparison, not a claim
 /// that sharing is beneficial. Shared versus separate costs come from the actual artifact.
@@ -542,6 +588,24 @@ mod tests {
             a.values[shared.program.output],
             b.values[untied.program.output]
         );
+        let first = function(&shared, 0).unwrap();
+        let second = function(&shared, 1).unwrap();
+        for (left, right) in first.operators.iter().zip(&second.operators) {
+            assert!(Arc::ptr_eq(left, right));
+        }
+        for (slot, extracted) in [first, second].iter().enumerate() {
+            let input = FamilyInputs {
+                rows: inputs.rows,
+                slots: vec![inputs.slots[slot].clone()],
+                layout: None,
+            };
+            let trace = extracted.execute(&input, false).unwrap();
+            assert_eq!(
+                trace.values[extracted.output],
+                a.values[shared.program.output].slice(ndarray::s![.., slot * 5..(slot + 1) * 5])
+            );
+        }
+        assert!(function(&shared, 2).is_err());
         let artifact = Artifact::native(&shared.program)
             .unwrap()
             .f32_literals()

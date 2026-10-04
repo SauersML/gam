@@ -81,6 +81,7 @@ pub mod run_check;
 // The team's pieces (MLP accounts, rules, decomposition coordinates) as proposals to the one search.
 pub mod proposals;
 pub mod resident_rule_fit;
+pub mod resident_causal_fit;
 pub mod composed_rule_search;
 pub mod vector_rule_pilot;
 pub mod shared_geometry_pilot;
@@ -294,3 +295,6 @@ pub mod scalar_response_search;
 
 /// Full-width affine MLP fitting baseline (proposal diagnostics only).
 pub mod affine_mlp;
+
+/// Fixed activation and shared-operator controls in ordinary differentiable IR.
+pub mod intervention_program;
