@@ -726,7 +726,12 @@ pub struct RunTiming {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum MetricMode { CpuOracle, GpuProposal }
+enum MetricMode { CpuOracle, GpuProposal, GpuChecked }
+
+struct ScoredEpisode {
+    score: Option<EpisodeScore>,
+    checked: Option<crate::fixed_metric_device::Episode>,
+}
 
 /// Uncertified GPU metric proposal. It is not acceptance evidence and does not
 /// implement RunCheck; independent CPU metric replay determines accepted verdicts.
@@ -1119,6 +1124,12 @@ fn check_native_tail(native: &OperatorProgram, artifact: &Artifact, last: usize)
 
 impl LanguageRun<'_> {
     fn score_episodes(&self, artifact: &Artifact, mode: MetricMode) -> Result<Vec<EpisodeScore>, String> {
+        self.score_episodes_detailed(artifact,mode,None)?.into_iter().map(|episode|episode.score.ok_or_else(|| "legacy metric score absent".to_string())).collect()
+    }
+
+    fn score_episodes_detailed(&self, artifact: &Artifact, mode: MetricMode, checked: Option<&crate::fixed_metric_device::Resident>) -> Result<Vec<ScoredEpisode>, String> {
+        if mode==MetricMode::GpuChecked && checked.is_none() {return Err("checked GPU metric backend absent".into());}
+
         if mode==MetricMode::GpuProposal && self.native_readout.is_none() { return Err("GPU metric proposals require explicit native CUDA readout".into()); }
         use rayon::prelude::*;
         let head_dim = self.native.node_interface(self.layers[0].reads[0]).map_err(|e| e.to_string())?.width();
@@ -1186,7 +1197,7 @@ impl LanguageRun<'_> {
             usize,
             (&super::counterfactual::Episode, &(Artifact, Vec<usize>, BTreeMap<usize, Vec<NodeEdit>>, usize)),
         )|
-         -> Result<EpisodeScore, String> {
+         -> Result<ScoredEpisode, String> {
             let reference = &teachers.residuals[index];
             let own = episode.donor.and_then(|d| own_donors.get(&d)).unwrap_or(&empty);
             let forward_timer = RunTimer::start(&self.timers.forward);
@@ -1201,6 +1212,7 @@ impl LanguageRun<'_> {
             let from = episode.actions.iter().map(Action::first_row).min().unwrap_or(0);
             let rows = reference.nrows();
             let (mut kl, mut error, mut agree) = (0.0, 0.0, 0.0);
+            let mut fixed=checked.map(|resident|resident.stream());
             let mut start = from;
             while start < rows {
                 let end = (start + self.readout_rows()).min(rows);
@@ -1219,6 +1231,13 @@ impl LanguageRun<'_> {
                         agree += top1_rows(&p, &q).iter().filter(|a| **a).count() as f64;
                         drop(metric_timer);
                     }
+                    MetricMode::GpuChecked => {
+                        // Identical head calls and CPU normalization as CpuOracle;
+                        // only the KL metric consumes buffered copies of these arrays.
+                        let p=self.log_probs(&native_rows)?;
+                        let q=self.log_probs(&explained_rows)?;
+                        fixed.as_mut().ok_or("checked stream absent")?.append(&p,&q,start)?;
+                    }
                     MetricMode::GpuProposal => {
                         let head=self.native_readout.as_ref().ok_or("GPU metric proposal head absent")?;
                         let proposed=head.proposal_metrics(&native_rows,&explained_rows)?;
@@ -1231,10 +1250,16 @@ impl LanguageRun<'_> {
                 }
                 start = end;
             }
+            if mode==MetricMode::GpuChecked {
+                let episode=fixed.ok_or("checked stream absent")?.finish(episode.id.clone(),episode.group.clone(),from,rows,teachers.native_effects[index],*unheld)?;
+                drop(readout_timer);
+                drop(head_guard);
+                return Ok(ScoredEpisode {score:None,checked:Some(episode)});
+            }
             drop(readout_timer);
             drop(head_guard);
             let n = (rows - from).max(1) as f64;
-            Ok(EpisodeScore {
+            Ok(ScoredEpisode {score:Some(EpisodeScore {
                 id: episode.id.clone(),
                 group: episode.group.clone(),
                 kl: kl / n,
@@ -1242,12 +1267,12 @@ impl LanguageRun<'_> {
                 native_effect: teachers.native_effects[index],
                 top1_agree: agree / n,
                 unheld: *unheld,
-            })
+            }),checked:None})
         };
         let pairs: Vec<_> = self.spec.episodes.iter().zip(plans.iter()).enumerate().collect();
         let mut out = Vec::with_capacity(pairs.len());
         for chunk in pairs.chunks(if self.device.is_some() { 1 } else { self.parallel.max(1) }) {
-            let scored: Vec<Result<EpisodeScore, String>> = if self.device.is_some() {
+            let scored: Vec<Result<ScoredEpisode, String>> = if self.device.is_some() {
                 chunk.iter().map(|pair| score_one(*pair)).collect()
             } else {
                 chunk.par_iter().map(|pair| score_one(*pair)).collect()
@@ -1257,6 +1282,16 @@ impl LanguageRun<'_> {
             }
         }
         Ok(out)
+    }
+
+    /// Opt-in fixed-array checked metric endpoint. The head and CPU normalization
+    /// calls are unchanged. Exact interval group means remain separate from
+    /// RunCheck's default CPU operational scores and acceptance decisions.
+    pub fn checked_metric_episodes(&self, artifact: &Artifact, budget: crate::fixed_metric_device::Budget, compare_cpu: bool) -> Result<crate::fixed_metric_device::Measure, String> {
+        let device=self.device.as_ref().ok_or("checked metrics require explicit CUDA backend")?;
+        let resident=crate::fixed_metric_device::Resident::new(device.clone(),self.decoder.embedding().nrows(),self.readout_rows(),budget,compare_cpu)?;
+        let episodes=self.score_episodes_detailed(artifact,MetricMode::GpuChecked,Some(&resident))?.into_iter().map(|row|row.checked.ok_or_else(||"checked episode absent".to_string())).collect::<Result<Vec<_>,String>>()?;
+        Ok(crate::fixed_metric_device::Measure::of(episodes,&resident))
     }
 
     /// Fast proposal/ranking diagnostics only. The fixed CPU teacher residuals

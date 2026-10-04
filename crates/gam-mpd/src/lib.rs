@@ -276,6 +276,7 @@ pub mod native_readout;
 
 // Checked scalar intervals on fixed finite inputs; no acceptance backend switch.
 pub mod fixed_logit_interval;
+pub mod fixed_metric_device;
 
 // Optional fixed-logit obstruction when two episodes receive one prediction.
 pub mod response_collision;
