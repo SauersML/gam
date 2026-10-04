@@ -1,0 +1,59 @@
+{
+  "raw_checkpoint_sha256": "7212e5d333ab75efe7cdf1d757c82e4444abb0a384cca073ab69dd313c54c9b9",
+  "raw_checkpoint_bytes": 8430067267,
+  "slim_sha256": "ccd4e846d85d4450f44d5b213df2aa5a4d1faa5671f17961d6083d9d51086a71",
+  "slim_bytes": 2909107011,
+  "config_sha256": "8cdf37eb841e8dab6a7a1f96c6cd4c12afbde61c11a24c48cf426248916cf221",
+  "training": {
+    "schema_version": 2,
+    "step": 9738,
+    "tokens": 4985856,
+    "main_training_tokens": 4985856,
+    "total_training_tokens": 4985856,
+    "eval_tokens": 5120,
+    "train_cursor": 9738,
+    "eval_cursor": 10,
+    "warmup_training_tokens": 0,
+    "warmup_parameter_updates": 400,
+    "elapsed_s": 3600.213917111978,
+    "driver_elapsed_s_this_segment": 3600.213931199163,
+    "allocation_elapsed_s": null,
+    "gpu_hours": 1.0000594214199938,
+    "batch_size": 1,
+    "losses": {
+      "loss_faith": 2.422558054604451e-06,
+      "loss_imp": 1507.1507568359375,
+      "loss_stoch": 0.7501873970031738,
+      "loss_ppgd": 2.1769485473632812
+    },
+    "peak_memory_bytes": 16511964672
+  },
+  "numeric_parameters": {
+    "components": 121110528,
+    "CI": 539090944,
+    "native_embedding_norms": 38619648
+  },
+  "numeric_payload_bits_32": 22362275840,
+  "C32_total": null,
+  "structural_cost_status": "unresolved: control iteration, threshold, architecture constants, wiring and bindings not encoded in current Artifact grammar",
+  "native_fallback_names": [
+    "wte",
+    "ln_f",
+    "norms.0",
+    "norms.1",
+    "norms.2",
+    "norms.3",
+    "norms.4",
+    "norms.5",
+    "norms.6",
+    "norms.7"
+  ],
+  "no_optimizer_in_slim": true,
+  "seconds": 74.48145159799606,
+  "peak_rss_bytes": 3577348096,
+  "source_sha256": {
+    "run.py": "696be43d23f01af541633a2a1bb1f4b6601f451ca302a7b83696a1b6a12896b3",
+    "vpd_model.py": "93d8c4c0b51548d1fc5b3e1e7d26d2d68673067b2955b10cf6a48e6ec16a1bb0"
+  },
+  "evaluation_source_sha256": "4a377bf02b572dea04b9e7c60a5d587a83527e33475ff5fffb8c79c6d9201f8a"
+}

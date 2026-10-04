@@ -1,0 +1,198 @@
+{
+  "scope": "same-parent sitewise diagnostics, native-fed CI; not autonomous evidence",
+  "rows": 1024,
+  "sites": [
+    {
+      "site": "h.0.attn.q_proj",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 40.81892253085012,
+      "worst_relative_euclidean": 1.1626284631044048,
+      "mean_active_components": 20.775390625
+    },
+    {
+      "site": "h.0.attn.k_proj",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 31.84664870199777,
+      "worst_relative_euclidean": 1.2562363941949122,
+      "mean_active_components": 14.552734375
+    },
+    {
+      "site": "h.0.attn.v_proj",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 3.698747761491359,
+      "worst_relative_euclidean": 1.6900873057148338,
+      "mean_active_components": 46.44921875
+    },
+    {
+      "site": "h.0.attn.o_proj",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 0.8399907598073657,
+      "worst_relative_euclidean": 1.339370010655888,
+      "mean_active_components": 53.685546875
+    },
+    {
+      "site": "h.0.mlp.c_fc",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 55.0689515322307,
+      "worst_relative_euclidean": 1.6491293538928908,
+      "mean_active_components": 322.8759765625
+    },
+    {
+      "site": "h.0.mlp.down_proj",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 5.813257097851247,
+      "worst_relative_euclidean": 1.520693601561433,
+      "mean_active_components": 254.548828125
+    },
+    {
+      "site": "h.1.attn.q_proj",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 30.058555710796963,
+      "worst_relative_euclidean": 1.1833433924596832,
+      "mean_active_components": 11.59375
+    },
+    {
+      "site": "h.1.attn.k_proj",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 48.7190157076267,
+      "worst_relative_euclidean": 1.104223474546546,
+      "mean_active_components": 13.982421875
+    },
+    {
+      "site": "h.1.attn.v_proj",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 10.526365019068608,
+      "worst_relative_euclidean": 1.2887147275880828,
+      "mean_active_components": 40.4736328125
+    },
+    {
+      "site": "h.1.attn.o_proj",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 3.76930460306526,
+      "worst_relative_euclidean": 1.6832144236879225,
+      "mean_active_components": 52.404296875
+    },
+    {
+      "site": "h.1.mlp.c_fc",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 122.43618481838286,
+      "worst_relative_euclidean": 1.279050240652156,
+      "mean_active_components": 76.2236328125
+    },
+    {
+      "site": "h.1.mlp.down_proj",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 12.192546227937102,
+      "worst_relative_euclidean": 13.361851301335744,
+      "mean_active_components": 61.841796875
+    },
+    {
+      "site": "h.2.attn.q_proj",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 39.17739033910643,
+      "worst_relative_euclidean": 1.1127135949365548,
+      "mean_active_components": 34.3642578125
+    },
+    {
+      "site": "h.2.attn.k_proj",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 39.19145620465735,
+      "worst_relative_euclidean": 1.167081061912581,
+      "mean_active_components": 36.45703125
+    },
+    {
+      "site": "h.2.attn.v_proj",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 21.558087594745302,
+      "worst_relative_euclidean": 1.300295505995731,
+      "mean_active_components": 102.046875
+    },
+    {
+      "site": "h.2.attn.o_proj",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 8.672297391506858,
+      "worst_relative_euclidean": 1.3272435495829753,
+      "mean_active_components": 148.8125
+    },
+    {
+      "site": "h.2.mlp.c_fc",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 53.65718648588912,
+      "worst_relative_euclidean": 1.142546788163255,
+      "mean_active_components": 91.5439453125
+    },
+    {
+      "site": "h.2.mlp.down_proj",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 8.536642000365136,
+      "worst_relative_euclidean": 3.5628785968332073,
+      "mean_active_components": 83.4443359375
+    },
+    {
+      "site": "h.3.attn.q_proj",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 36.12963042651536,
+      "worst_relative_euclidean": 1.1517418431395696,
+      "mean_active_components": 12.4345703125
+    },
+    {
+      "site": "h.3.attn.k_proj",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 38.75630389356676,
+      "worst_relative_euclidean": 1.164730720879545,
+      "mean_active_components": 12.587890625
+    },
+    {
+      "site": "h.3.attn.v_proj",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 23.44873220294071,
+      "worst_relative_euclidean": 1.3123559923352832,
+      "mean_active_components": 49.0517578125
+    },
+    {
+      "site": "h.3.attn.o_proj",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 15.144018917182693,
+      "worst_relative_euclidean": 5.924266183343677,
+      "mean_active_components": 114.5302734375
+    },
+    {
+      "site": "h.3.mlp.c_fc",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 58.61179953530443,
+      "worst_relative_euclidean": 1.1573323459584497,
+      "mean_active_components": 288.5390625
+    },
+    {
+      "site": "h.3.mlp.down_proj",
+      "native_parent": true,
+      "rows": 1024,
+      "RMS_native_output_row_L2": 24.90015393402943,
+      "worst_relative_euclidean": 1.7696423889722834,
+      "mean_active_components": 349.1220703125
+    }
+  ]
+}

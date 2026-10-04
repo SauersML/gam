@@ -1,0 +1,9 @@
+{
+  "native_logits_bitwise": true,
+  "all_on_logits_bitwise": true,
+  "native_max_abs": 0.0,
+  "all_on_max_abs": 0.0,
+  "component_tensors_exact": true,
+  "CI_body": "same pinned upstream CITransformer; key adapter only",
+  "rows": 16
+}

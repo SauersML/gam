@@ -1,0 +1,10 @@
+{
+  "mode": "evaluate",
+  "job_id": "15849",
+  "state": "complete",
+  "protocol_sha256": "c0b5bf321c9e14150fef83b3bf3371d0cebd51fdeb32262061c75d8a899e8801",
+  "source_sha256": "4a377bf02b572dea04b9e7c60a5d587a83527e33475ff5fffb8c79c6d9201f8a",
+  "returncode": 0,
+  "seconds": 60.5423729326576,
+  "peak_child_rss_bytes": 5161431040
+}
