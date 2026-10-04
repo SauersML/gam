@@ -1,14 +1,14 @@
 {
   "workflow": "Python Contracts",
-  "publish_job_status": "failure",
+  "publish_job_status": "cancelled",
   "publish_job_status_note": "status of the job that PUBLISHED these results, not the conclusion of run_id -- this job is part of that run, so the run has not concluded here",
-  "publish_job_failed_steps": "step 7: Build and install gam extension (maturin build + wheel install)",
-  "run_id": "37133663370",
-  "run_number": "351",
+  "publish_job_failed_steps": "",
+  "run_id": "37175128759",
+  "run_number": "352",
   "run_attempt": "1",
   "event": "schedule",
   "ref": "refs/heads/main",
-  "sha": "4ba254b08116d60b7dd3fff26dec1e978d5917d3",
-  "completed_utc": "2026-10-03T15:40:11Z",
-  "run_url": "https://github.com/SauersML/gam/actions/runs/37133663370"
+  "sha": "bba0ef85d3826731e765eefd91fd5baa7a395fe8",
+  "completed_utc": "2026-10-04T08:49:00Z",
+  "run_url": "https://github.com/SauersML/gam/actions/runs/37175128759"
 }
