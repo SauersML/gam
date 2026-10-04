@@ -1,0 +1,13 @@
+{
+  "C32": {
+    "binding_bits": 2299,
+    "literals": 66832954,
+    "structure_bits": 389809
+  },
+  "candidate": "Rule(Choice { family: 86, source: 109 })",
+  "cost_bits": 2139046636,
+  "file": "requested.3789.bin",
+  "index": 3789,
+  "ordinary_decode_canonical_coverage_cost": true,
+  "sha256": "07fc569f7fa77a68517d432472abf744b12ce0efbd5b9dfec40c1b933f4a3d6e"
+}
