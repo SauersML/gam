@@ -1,0 +1,32 @@
+{
+  "figures": [
+    "01_joint_quality",
+    "02_joint_frontier",
+    "03_control_floor",
+    "04_speed"
+  ],
+  "captions": {
+    "01_joint_quality": "All 24 attention-head output maps replaced together; 16 candidate programs plus native. Four ranks, direct SVD or copy-rule plus residual, fitted to weights or separate training inputs. Local: largest row Euclidean discrepancy divided by native attention-contribution RMS, over 1,024 tokens. Run: largest episode-group mean KL per token on 80 episodes from two 512-token passages. Six Local failures have Run not measured; missing points are not zeros. Complete description cost includes all numerical literals, bindings, shared rule definitions and remaining native program. These are finite-bank results with stated conditional numerical bounds, not an optimum over all programs or a mechanism-discovery result.",
+    "02_joint_frontier": "Minimum complete program cost among the same 17 candidates at each declared local/run tolerance pair. Displayed percentages are savings relative to the full native program. Native wins at every tested local tolerance <=0.2 and at every tested run tolerance <=0.1. Bank gaps are zero; global program-search gaps are unknown.",
+    "03_control_floor": "Lower bound applying only to programs that make exactly the same prediction for each matched clean/full-MLP-removal pair. Statistic mean(TV^2/2) on 1,024 matched tokens, with directed analytic interval arithmetic on fixed binary64 CPU log-probability arrays renormalized as logits. No certificate of neural forward rounding. These are representation obstructions, not measured errors of every fitted program. Explicit paid response laws can distinguish the episodes and escape the premise.",
+    "04_speed": "Left: actual saved 465,719,178-byte native 4L artifact, one warmup then three CPU decoding repetitions, exact replay equality. Same example source, before/after decoder backend. This is a 1.98x cached-decoding improvement, not 1.98x end-to-end. Right: selected disjoint substage timers from completed joint run, including saved replays. They reveal CPU normalization/KL bottlenecks; do not sum them to total wall time. GPU checked-metric and native-teacher replacements are pending parity, so no speedup claimed for them."
+  },
+  "sources": {
+    "joint": {
+      "path": "/Users/user/mpd-data/cluster/codex-prepared-head-joint-3ac392/evaluation/REPORT.json",
+      "sha256": "3ce6d12921f660f86fb7eef27d05e112825131b2e6139aa309d83ddeac812a91"
+    },
+    "joint_complete": {
+      "path": "/Users/user/mpd-data/cluster/codex-prepared-head-joint-3ac392/evaluation/COMPLETE.json",
+      "sha256": "70107fe4c17344693f2341fca60ee0bd822d4a0e5bf62fd627954a22d1de9f78"
+    },
+    "collision": {
+      "path": "/Users/user/mpd-data/codex/response-collision-20261004/REPORT.json",
+      "sha256": "c2eaeef801f975e8c5e330c9e709a69da0974d9f28a224c050d19b2adeb06549"
+    },
+    "decode": {
+      "path": "/Users/user/mpd-data/cluster/codex-saved-decode-ca9/SUMMARY.json",
+      "sha256": "f079849acede770044b8001dda3fb55003a57a9c1746e6c89eaa9eb5ce2a8eca"
+    }
+  }
+}

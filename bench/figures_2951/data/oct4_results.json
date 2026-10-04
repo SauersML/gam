@@ -1,0 +1,812 @@
+{
+  "recorded_utc": "2026-10-04T18:00:36.123539+00:00",
+  "sources": {
+    "joint": {
+      "path": "/Users/user/mpd-data/cluster/codex-prepared-head-joint-3ac392/evaluation/REPORT.json",
+      "sha256": "3ce6d12921f660f86fb7eef27d05e112825131b2e6139aa309d83ddeac812a91"
+    },
+    "joint_complete": {
+      "path": "/Users/user/mpd-data/cluster/codex-prepared-head-joint-3ac392/evaluation/COMPLETE.json",
+      "sha256": "70107fe4c17344693f2341fca60ee0bd822d4a0e5bf62fd627954a22d1de9f78"
+    },
+    "collision": {
+      "path": "/Users/user/mpd-data/codex/response-collision-20261004/REPORT.json",
+      "sha256": "c2eaeef801f975e8c5e330c9e709a69da0974d9f28a224c050d19b2adeb06549"
+    },
+    "decode": {
+      "path": "/Users/user/mpd-data/cluster/codex-saved-decode-ca9/SUMMARY.json",
+      "sha256": "f079849acede770044b8001dda3fb55003a57a9c1746e6c89eaa9eb5ce2a8eca"
+    }
+  },
+  "joint": {
+    "status": "complete, four independent saved-byte replays passed",
+    "scope": {
+      "method": "prepared explicit linear factors plus fully paid arithmetic Copy body; template baseline, not discovery",
+      "heads": 24,
+      "ranks": [
+        8,
+        32,
+        64,
+        96
+      ],
+      "local": {
+        "ascent": null,
+        "batch": 512,
+        "context": 512,
+        "denominator": "RMS of native split attention-contribution row norms over the full family; maximum normalized row Euclidean error",
+        "rows": 1024,
+        "sequences": 2
+      },
+      "run": {
+        "backend": "hybrid: explained and native head CUDA f64; cached teacher residual CPU; normalization/KL CPU",
+        "context": 512,
+        "episodes": 80,
+        "metrics": "CPU normalization/KL oracle on CUDA f64 head logits; uncertified GPU metric proposals never used",
+        "parallel": 1,
+        "spec_sha256": "3c05b66324dfb02e33da7eff98784a7ec432123e24fea78018b892efb4256436"
+      },
+      "numerical_model": "conditional arithmetic bounds: existing CPU KL assumes exp within2ULP and ln within1ULP; these are not Rust-guaranteed or unconditional certificates",
+      "optimality": "only the explicitly declared finite bank; unmeasured/failed candidates remain unresolved, and a singleton head shard is incomplete",
+      "joint_semantics": "uniform_joint executes all24 replacements together and measures the full composed Local/Run; no singleton outcomes reused; exact shared Copy body pool priced once"
+    },
+    "native_bits": 2142194137,
+    "records": [
+      {
+        "index": 0,
+        "family": null,
+        "fit": null,
+        "rank": null,
+        "cost_bits": 2142194137,
+        "run_state": "Measured",
+        "replaced_heads": null,
+        "local": {
+          "lower": 0.0,
+          "upper": 0.0
+        },
+        "run": {
+          "lower": 0.0,
+          "upper": 2.3154908862603418e-10
+        },
+        "savings_percent": 0.0
+      },
+      {
+        "index": 1,
+        "family": "NativeSvd",
+        "fit": "weight_Frobenius",
+        "rank": 8,
+        "cost_bits": 2072146514,
+        "run_state": "NotMeasured",
+        "replaced_heads": 24,
+        "local": {
+          "lower": 1.329503446060567,
+          "upper": 1.3295034460607953
+        },
+        "run": null,
+        "savings_percent": 3.269900789575357
+      },
+      {
+        "index": 2,
+        "family": "NativeSvd",
+        "fit": "training_native_inputs",
+        "rank": 8,
+        "cost_bits": 2072146514,
+        "run_state": "NotMeasured",
+        "replaced_heads": 24,
+        "local": {
+          "lower": 1.2281261742831018,
+          "upper": 1.2281261742833127
+        },
+        "run": null,
+        "savings_percent": 3.269900789575357
+      },
+      {
+        "index": 3,
+        "family": "CopyResidual",
+        "fit": "weight_Frobenius",
+        "rank": 8,
+        "cost_bits": 2072168522,
+        "run_state": "NotMeasured",
+        "replaced_heads": 24,
+        "local": {
+          "lower": 1.3269417581613805,
+          "upper": 1.3269417581616083
+        },
+        "run": null,
+        "savings_percent": 3.2688734317080246
+      },
+      {
+        "index": 4,
+        "family": "CopyResidual",
+        "fit": "training_native_inputs",
+        "rank": 8,
+        "cost_bits": 2072168522,
+        "run_state": "NotMeasured",
+        "replaced_heads": 24,
+        "local": {
+          "lower": 1.2257089959474419,
+          "upper": 1.2257089959476524
+        },
+        "run": null,
+        "savings_percent": 3.2688734317080246
+      },
+      {
+        "index": 5,
+        "family": "NativeSvd",
+        "fit": "weight_Frobenius",
+        "rank": 32,
+        "cost_bits": 2088661754,
+        "run_state": "NotMeasured",
+        "replaced_heads": 24,
+        "local": {
+          "lower": 1.0963208007339826,
+          "upper": 1.096320800734171
+        },
+        "run": null,
+        "savings_percent": 2.4989510556204086
+      },
+      {
+        "index": 6,
+        "family": "NativeSvd",
+        "fit": "training_native_inputs",
+        "rank": 32,
+        "cost_bits": 2088661754,
+        "run_state": "Measured",
+        "replaced_heads": 24,
+        "local": {
+          "lower": 0.9755145492970289,
+          "upper": 0.9755145492971963
+        },
+        "run": {
+          "lower": 2.306623934866461,
+          "upper": 2.306623935168658
+        },
+        "savings_percent": 2.4989510556204086
+      },
+      {
+        "index": 7,
+        "family": "CopyResidual",
+        "fit": "weight_Frobenius",
+        "rank": 32,
+        "cost_bits": 2088683762,
+        "run_state": "NotMeasured",
+        "replaced_heads": 24,
+        "local": {
+          "lower": 1.0950852003583271,
+          "upper": 1.0950852003585154
+        },
+        "run": null,
+        "savings_percent": 2.4979236977530763
+      },
+      {
+        "index": 8,
+        "family": "CopyResidual",
+        "fit": "training_native_inputs",
+        "rank": 32,
+        "cost_bits": 2088683762,
+        "run_state": "Measured",
+        "replaced_heads": 24,
+        "local": {
+          "lower": 0.9734136492430951,
+          "upper": 0.9734136492432621
+        },
+        "run": {
+          "lower": 2.0318098463465546,
+          "upper": 2.031809846637521
+        },
+        "savings_percent": 2.4979236977530763
+      },
+      {
+        "index": 9,
+        "family": "NativeSvd",
+        "fit": "weight_Frobenius",
+        "rank": 64,
+        "cost_bits": 2110681898,
+        "run_state": "Measured",
+        "replaced_heads": 24,
+        "local": {
+          "lower": 0.8430478653511677,
+          "upper": 0.8430478653513125
+        },
+        "run": {
+          "lower": 2.790068831228627,
+          "upper": 2.7900688315735778
+        },
+        "savings_percent": 1.4710262928891584
+      },
+      {
+        "index": 10,
+        "family": "NativeSvd",
+        "fit": "training_native_inputs",
+        "rank": 64,
+        "cost_bits": 2110681898,
+        "run_state": "Measured",
+        "replaced_heads": 24,
+        "local": {
+          "lower": 0.6600573553174005,
+          "upper": 0.660057355317514
+        },
+        "run": {
+          "lower": 1.002846265850343,
+          "upper": 1.002846266092646
+        },
+        "savings_percent": 1.4710262928891584
+      },
+      {
+        "index": 11,
+        "family": "CopyResidual",
+        "fit": "weight_Frobenius",
+        "rank": 64,
+        "cost_bits": 2110703906,
+        "run_state": "Measured",
+        "replaced_heads": 24,
+        "local": {
+          "lower": 0.8456997548107317,
+          "upper": 0.8456997548108769
+        },
+        "run": {
+          "lower": 2.465176817345205,
+          "upper": 2.4651768176695916
+        },
+        "savings_percent": 1.469998935021826
+      },
+      {
+        "index": 12,
+        "family": "CopyResidual",
+        "fit": "training_native_inputs",
+        "rank": 64,
+        "cost_bits": 2110703906,
+        "run_state": "Measured",
+        "replaced_heads": 24,
+        "local": {
+          "lower": 0.6637277960197808,
+          "upper": 0.6637277960198947
+        },
+        "run": {
+          "lower": 0.850496814464438,
+          "upper": 0.8504968146993634
+        },
+        "savings_percent": 1.469998935021826
+      },
+      {
+        "index": 13,
+        "family": "NativeSvd",
+        "fit": "weight_Frobenius",
+        "rank": 96,
+        "cost_bits": 2132702114,
+        "run_state": "Measured",
+        "replaced_heads": 24,
+        "local": {
+          "lower": 0.5757993995270401,
+          "upper": 0.5757993995271391
+        },
+        "run": {
+          "lower": 1.810926938131739,
+          "upper": 1.8109269384264655
+        },
+        "savings_percent": 0.44309816911799343
+      },
+      {
+        "index": 14,
+        "family": "NativeSvd",
+        "fit": "training_native_inputs",
+        "rank": 96,
+        "cost_bits": 2132702114,
+        "run_state": "Measured",
+        "replaced_heads": 24,
+        "local": {
+          "lower": 0.49167060465541,
+          "upper": 0.4916706046554944
+        },
+        "run": {
+          "lower": 0.30544752448466406,
+          "upper": 0.30544752468910696
+        },
+        "savings_percent": 0.44309816911799343
+      },
+      {
+        "index": 15,
+        "family": "CopyResidual",
+        "fit": "weight_Frobenius",
+        "rank": 96,
+        "cost_bits": 2132724122,
+        "run_state": "Measured",
+        "replaced_heads": 24,
+        "local": {
+          "lower": 0.5486034905057745,
+          "upper": 0.5486034905058689
+        },
+        "run": {
+          "lower": 1.4037818898478018,
+          "upper": 1.4037818901171095
+        },
+        "savings_percent": 0.44207081125066117
+      },
+      {
+        "index": 16,
+        "family": "CopyResidual",
+        "fit": "training_native_inputs",
+        "rank": 96,
+        "cost_bits": 2132724122,
+        "run_state": "Measured",
+        "replaced_heads": 24,
+        "local": {
+          "lower": 0.4942720590748243,
+          "upper": 0.4942720590749091
+        },
+        "run": {
+          "lower": 0.2741558080335364,
+          "upper": 0.2741558082354581
+        },
+        "savings_percent": 0.44207081125066117
+      }
+    ],
+    "points": [
+      {
+        "constraint": {
+          "local": 0.05,
+          "run": 0.001
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 0.05,
+          "run": 0.01
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 0.05,
+          "run": 0.03
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 0.05,
+          "run": 0.1
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 0.05,
+          "run": 0.3
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 0.05,
+          "run": 1.0
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 0.1,
+          "run": 0.001
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 0.1,
+          "run": 0.01
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 0.1,
+          "run": 0.03
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 0.1,
+          "run": 0.1
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 0.1,
+          "run": 0.3
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 0.1,
+          "run": 1.0
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 0.2,
+          "run": 0.001
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 0.2,
+          "run": 0.01
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 0.2,
+          "run": 0.03
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 0.2,
+          "run": 0.1
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 0.2,
+          "run": 0.3
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 0.2,
+          "run": 1.0
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 0.5,
+          "run": 0.001
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 0.5,
+          "run": 0.01
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 0.5,
+          "run": 0.03
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 0.5,
+          "run": 0.1
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 0.5,
+          "run": 0.3
+        },
+        "gap": 0,
+        "lower_cost": 2132724122,
+        "selected": 16,
+        "upper_cost": 2132724122
+      },
+      {
+        "constraint": {
+          "local": 0.5,
+          "run": 1.0
+        },
+        "gap": 0,
+        "lower_cost": 2132702114,
+        "selected": 14,
+        "upper_cost": 2132702114
+      },
+      {
+        "constraint": {
+          "local": 1.0,
+          "run": 0.001
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 1.0,
+          "run": 0.01
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 1.0,
+          "run": 0.03
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 1.0,
+          "run": 0.1
+        },
+        "gap": 0,
+        "lower_cost": 2142194137,
+        "selected": 0,
+        "upper_cost": 2142194137
+      },
+      {
+        "constraint": {
+          "local": 1.0,
+          "run": 0.3
+        },
+        "gap": 0,
+        "lower_cost": 2132724122,
+        "selected": 16,
+        "upper_cost": 2132724122
+      },
+      {
+        "constraint": {
+          "local": 1.0,
+          "run": 1.0
+        },
+        "gap": 0,
+        "lower_cost": 2110703906,
+        "selected": 12,
+        "upper_cost": 2110703906
+      }
+    ],
+    "runtime_seconds": {
+      "candidate_compile": 5.5240984310000005,
+      "cpu_head_complete_log_probs": 0.0,
+      "cpu_head_log_normalization": 420.17411778800005,
+      "cpu_metric_reductions": 593.324195495,
+      "donor_execution": 1.4693241160000001,
+      "explained_execution": 61.404612060000005,
+      "gpu_head_upload_norm_gemm_download": 447.28504097,
+      "intervention_planning": 4.885611922000001,
+      "native_source_compile": 0.567333913,
+      "output_readout_and_kl": 1421.921329346,
+      "teacher_clean_forward": 1.8386593640000002,
+      "teacher_donor_forward": 1.99716113,
+      "teacher_effect_readout": 89.940364879,
+      "teacher_episode_forward": 81.326150212,
+      "teacher_initialization": 175.10342139600002
+    },
+    "total_seconds": 2028.2781331539154,
+    "saved_replays": [
+      {
+        "index": 0,
+        "file": "selected.0.bin",
+        "sha256": "351f84b21e2885d60dd3308992d1458da73a01c833b8f8e7028238f0a35ccc12",
+        "bytes": 465719226
+      },
+      {
+        "index": 12,
+        "file": "selected.12.bin",
+        "sha256": "4b40b5beb56535dadb857b7e0f233019cbe827ba61a638e786a73cf8731e8570",
+        "bytes": 459880894
+      },
+      {
+        "index": 14,
+        "file": "selected.14.bin",
+        "sha256": "1e627a8e6916a5655b2883fc72bfdf00e4f1445ac980828e5598cba963b4e125",
+        "bytes": 464443700
+      },
+      {
+        "index": 16,
+        "file": "selected.16.bin",
+        "sha256": "73b47ce44dd5264ed058025beeaf72d6b9a69d6be3b50095840ddbcb484ca08c",
+        "bytes": 464462422
+      }
+    ]
+  },
+  "collision": {
+    "groups": [
+      {
+        "clean_group": "clean",
+        "conditional_worst_group_KL_lower_nats_per_token": 0.461664098631233,
+        "intervention_group": "remove-mlp/l0",
+        "layer": 0,
+        "matched_rows": 1024,
+        "statistic_interval": [
+          0.461664098631233,
+          0.46166409865395
+        ]
+      },
+      {
+        "clean_group": "clean",
+        "conditional_worst_group_KL_lower_nats_per_token": 0.23514415426993257,
+        "intervention_group": "remove-mlp/l1",
+        "layer": 1,
+        "matched_rows": 1024,
+        "statistic_interval": [
+          0.23514415426993257,
+          0.2351441542855385
+        ]
+      },
+      {
+        "clean_group": "clean",
+        "conditional_worst_group_KL_lower_nats_per_token": 0.08579898014811853,
+        "intervention_group": "remove-mlp/l2",
+        "layer": 2,
+        "matched_rows": 1024,
+        "statistic_interval": [
+          0.08579898014811853,
+          0.08579898015540426
+        ]
+      },
+      {
+        "clean_group": "clean",
+        "conditional_worst_group_KL_lower_nats_per_token": 0.16298632926290613,
+        "intervention_group": "remove-mlp/l3",
+        "layer": 3,
+        "matched_rows": 1024,
+        "statistic_interval": [
+          0.16298632926290613,
+          0.1629863292745501
+        ]
+      }
+    ],
+    "premise": "candidate makes exactly the same prediction for clean and this removal on every matched passage/token; e.g. wholly unheld activation interface with no other episode-dependent path",
+    "scope": "diagnostic only; fixed binary64 CPU native log-probability arrays treated as logits and renormalized in exact real arithmetic; no acceptance change",
+    "theorem": "max of two matched group mean KLs >= mean TV(native_clean,native_changed)^2/2; only lower endpoint bounds achievable KL",
+    "exclusions": "no certificate of neural forward/readout rounding, artifact interface coverage, or existing exp/log acceptance arithmetic",
+    "passages": 2,
+    "rows": 512,
+    "spec_sha256": "3c05b66324dfb02e33da7eff98784a7ec432123e24fea78018b892efb4256436"
+  },
+  "decode": {
+    "before": {
+      "ordinary": {
+        "completed": 3,
+        "declared": 3,
+        "complete": true,
+        "median_seconds": 4.466992638,
+        "seconds": [
+          4.466992638,
+          4.482692754,
+          4.457256131
+        ],
+        "peak_rss_bytes": 3389480960,
+        "all_exact_reference_equal": true
+      },
+      "cached": {
+        "completed": 3,
+        "declared": 3,
+        "complete": true,
+        "median_seconds": 0.868662328,
+        "seconds": [
+          0.870092747,
+          0.868662328,
+          0.841069384
+        ],
+        "peak_rss_bytes": 3388452864,
+        "all_exact_reference_equal": true
+      }
+    },
+    "after": {
+      "ordinary": {
+        "completed": 3,
+        "declared": 3,
+        "complete": true,
+        "median_seconds": 4.196338758,
+        "seconds": [
+          4.196338758,
+          4.155318188,
+          4.419055822
+        ],
+        "peak_rss_bytes": 2979848192,
+        "all_exact_reference_equal": true
+      },
+      "cached": {
+        "completed": 3,
+        "declared": 3,
+        "complete": true,
+        "median_seconds": 0.439143609,
+        "seconds": [
+          0.469083923,
+          0.437977167,
+          0.439143609
+        ],
+        "peak_rss_bytes": 2979848192,
+        "all_exact_reference_equal": true
+      }
+    },
+    "ordinary_before_over_after": 1.0644976241453383,
+    "cached_before_over_after": 1.9780825912008206,
+    "scope": "CPU actual saved native4L artifact decode; borrowed nestedcopy change; retained witness scans and operator construction; noGPU/fidelityclaim; uncontrolled scheduler/CPUfrequency noise"
+  },
+  "captions": {
+    "01_joint_quality": "All 24 attention-head output maps replaced together; 16 candidate programs plus native. Four ranks, direct SVD or copy-rule plus residual, fitted to weights or separate training inputs. Local: largest row Euclidean discrepancy divided by native attention-contribution RMS, over 1,024 tokens. Run: largest episode-group mean KL per token on 80 episodes from two 512-token passages. Six Local failures have Run not measured; missing points are not zeros. Complete description cost includes all numerical literals, bindings, shared rule definitions and remaining native program. These are finite-bank results with stated conditional numerical bounds, not an optimum over all programs or a mechanism-discovery result.",
+    "02_joint_frontier": "Minimum complete program cost among the same 17 candidates at each declared local/run tolerance pair. Displayed percentages are savings relative to the full native program. Native wins at every tested local tolerance <=0.2 and at every tested run tolerance <=0.1. Bank gaps are zero; global program-search gaps are unknown.",
+    "03_control_floor": "Lower bound applying only to programs that make exactly the same prediction for each matched clean/full-MLP-removal pair. Statistic mean(TV^2/2) on 1,024 matched tokens, with directed analytic interval arithmetic on fixed binary64 CPU log-probability arrays renormalized as logits. No certificate of neural forward rounding. These are representation obstructions, not measured errors of every fitted program. Explicit paid response laws can distinguish the episodes and escape the premise.",
+    "04_speed": "Left: actual saved 465,719,178-byte native 4L artifact, one warmup then three CPU decoding repetitions, exact replay equality. Same example source, before/after decoder backend. This is a 1.98x cached-decoding improvement, not 1.98x end-to-end. Right: selected disjoint substage timers from completed joint run, including saved replays. They reveal CPU normalization/KL bottlenecks; do not sum them to total wall time. GPU checked-metric and native-teacher replacements are pending parity, so no speedup claimed for them."
+  }
+}
