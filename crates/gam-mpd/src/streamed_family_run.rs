@@ -1,5 +1,5 @@
 //! Optional generic Run backend caching native hidden states rather than vocabulary logits.
-//! The native prefix and metrics remain CPU; candidate execution/head are CUDA f64.
+//! Native prefix/head execution is optionally CUDA; comparison metrics remain CPU.
 //! This changes storage and GEMM tiling, not intervention scope or fidelity tolerances.
 use super::{apply, validate_edits, Timer, Timers, Timing};
 use crate::{
@@ -8,9 +8,9 @@ use crate::{
     artifact_device::Resident,
     operator_program::{Basis, Node, OperatorBody, OperatorProgram},
 };
-use gam_gpu::tensor::Device;
+use gam_gpu::tensor::{Arithmetic, Device, Op, Tensor};
 use ndarray::{Array2, ArrayView2, s};
-use std::{collections::BTreeMap, sync::OnceLock};
+use std::sync::OnceLock;
 
 /// Explicit numeric budgets; neither is a total process/device-memory estimate.
 #[derive(Clone, Copy, Debug, serde::Serialize)]
@@ -69,6 +69,13 @@ impl Head {
         let matrix=program.operators[self.operator].matrix_cow();
         Ok(if self.transposed {hidden.dot(&matrix.view())} else {hidden.dot(&matrix.t())})
     }
+    fn logits_device(&self,device:&Device,head:&Tensor,hidden:ArrayView2<'_,f64>)->Result<Array2<f64>,String> {
+        if hidden.ncols()!=self.width {return Err("native CUDA hidden width mismatch".into());}
+        let input=device.upload(hidden).map_err(|e|e.to_string())?;
+        let mut output=device.zeros(hidden.nrows(),self.classes).map_err(|e|e.to_string())?;
+        device.gemm(&mut output,1.,&input,Op::N,head,if self.transposed {Op::N}else{Op::T},0.,Arithmetic::F64).map_err(|e|e.to_string())?;
+        device.download(&output).map_err(|e|e.to_string())
+    }
     fn allows_edits(&self, edits:&[Edit]) -> Result<(),String> {
         if edits.iter().any(|e|e.node>self.hidden) {
             Err("streamed native teacher cannot skip a declared terminal-head intervention".into())
@@ -85,6 +92,16 @@ fn layout(head:&Head, rows:usize, episodes:usize, budget:StreamedBudget) -> Resu
     Ok((teacher,(budget.tile_bytes/per_row).min(rows)))
 }
 
+struct CudaNative {
+    prefix:Resident,
+    head:Tensor,
+    numeric_bytes:usize,
+    budget:usize,
+    initialization_seconds:f64,
+    prefix_seconds:std::sync::atomic::AtomicU64,
+    head_seconds:std::sync::atomic::AtomicU64,
+}
+
 /// Opt-in storage backend. Unsupported head edits are rejected before execution.
 /// CPU/GPU parity and GEMM tiling error are not proved by the metric's conditional
 /// exp/log comparison bands; callers must report this backend and test it.
@@ -98,6 +115,7 @@ pub struct StreamedFamilyRun<'a> {
     tile_rows:usize,
     teachers:OnceLock<Result<(Array2<f64>,Vec<Array2<f64>>),String>>,
     timers:Timers,
+    cuda_native:Option<CudaNative>,
 }
 impl<'a> StreamedFamilyRun<'a> {
     pub fn new(run:&'a FamilyRun<'a>,device:Device,budget:StreamedBudget)->Result<Self,String> {
@@ -113,11 +131,44 @@ impl<'a> StreamedFamilyRun<'a> {
         }
         let (teacher_bytes,tile_rows)=layout(&head,run.family.rows,run.episodes.len(),budget)?;
         let prefix=head.prefix(run.model)?;
-        Ok(Self {run,device,head,prefix,budget,teacher_bytes,tile_rows,teachers:OnceLock::new(),timers:Timers::default()})
+        Ok(Self {run,device,head,prefix,budget,teacher_bytes,tile_rows,teachers:OnceLock::new(),timers:Timers::default(),cuda_native:None})
+    }
+    /// Optional actual-f64 native prefix/head execution. The budget counts retained
+    /// numeric operator buffers only, excluding traces, tiles and CUDA workspaces.
+    pub fn with_cuda_native(mut self,numeric_bytes:usize)->Result<Self,String> {
+        if self.cuda_native.is_some() || self.teachers.get().is_some() {return Err("native CUDA must be configured before teacher initialization".into());}
+        for episode in &self.run.episodes {
+            if episode.edits.iter().any(|e|matches!(self.prefix.nodes.get(e.node),Some(Node::Feature {..}))) {
+                return Err("native CUDA cannot edit an implicit feature node".into());
+            }
+        }
+        let begun=std::time::Instant::now();
+        let head_bytes=self.head.classes.checked_mul(self.head.width).and_then(|n|n.checked_mul(8)).ok_or("native head byte overflow")?;
+        let remaining=numeric_bytes.checked_sub(head_bytes).ok_or("native CUDA head exceeds numeric budget")?;
+        let prefix=Resident::from_decoded_values_bounded(&self.device,&Artifact::native(&self.prefix).map_err(|e|e.to_string())?,remaining)?;
+        if prefix.estimated_intermediate_bytes(self.run.family.rows)?>self.budget.intermediate_bytes {return Err("native CUDA prefix exceeds intermediate budget".into());}
+        let retained=prefix.operator_numeric_bytes()?.checked_add(head_bytes).ok_or("native CUDA byte overflow")?;
+        let matrix=self.run.model.operators[self.head.operator].matrix_cow();
+        let head=self.device.upload(matrix.view()).map_err(|e|e.to_string())?;
+        self.cuda_native=Some(CudaNative {prefix,head,numeric_bytes:retained,budget:numeric_bytes,initialization_seconds:begun.elapsed().as_secs_f64(),prefix_seconds:Default::default(),head_seconds:Default::default()});
+        Ok(self)
+    }
+    pub fn native_cuda_report(&self)->Option<serde_json::Value> {
+        self.cuda_native.as_ref().map(|c|serde_json::json!({"retained_numeric_bytes":c.numeric_bytes,"numeric_budget_bytes":c.budget,"initialization_seconds":c.initialization_seconds,"excludes":"traces, hidden caches, tiles, allocator and GEMM workspaces","native_values":"original f64; no codec rounding","prefix_forward_seconds":c.prefix_seconds.load(std::sync::atomic::Ordering::Relaxed) as f64*1e-9,"head_seconds":c.head_seconds.load(std::sync::atomic::Ordering::Relaxed) as f64*1e-9,"intervention_hooks":"CPU ordered edits on original native nodes"}))
+    }
+    fn native_logits(&self,hidden:ArrayView2<'_,f64>)->Result<Array2<f64>,String> {
+        match &self.cuda_native {
+            None=>self.head.logits(self.run.model,hidden),
+            Some(cuda)=>{
+                let head_timer=Timer::start(&cuda.head_seconds);
+                let value=self.head.logits_device(&self.device,&cuda.head,hidden);
+                drop(head_timer);value
+            }
+        }
     }
     pub fn teacher_numeric_bytes(&self)->usize {self.teacher_bytes}
     pub fn tile_rows(&self)->usize {self.tile_rows}
-    pub fn backend_name(&self)->&'static str {"hybrid: CPU native hidden teachers and tiled native head; CUDA candidate intermediates/tiled head; CPU conditional KL"}
+    pub fn backend_name(&self)->&'static str {if self.cuda_native.is_some() {"CUDA native/candidate prefixes and tiled heads; CPU ordered intervention hooks and conditional KL"}else{"hybrid: CPU native hidden teachers and tiled native head; CUDA candidate intermediates/tiled head; CPU conditional KL"}}
     pub fn timing(&self)->Timing {
         let seconds=|v:&std::sync::atomic::AtomicU64|v.load(std::sync::atomic::Ordering::Relaxed) as f64*1e-9;
         Timing {native_teacher_seconds:seconds(&self.timers.teacher),candidate_construction_seconds:seconds(&self.timers.construction),cuda_forward_hooks_download_seconds:seconds(&self.timers.forward),cpu_metric_seconds:seconds(&self.timers.metric)}
@@ -126,6 +177,20 @@ impl<'a> StreamedFamilyRun<'a> {
         self.teachers.get_or_init(|| {
             let teacher_timer=Timer::start(&self.timers.teacher);
             let execute=|edits:&[Edit]|->Result<Array2<f64>,String>{
+                if let Some(cuda)=&self.cuda_native {
+                    let prefix_timer=Timer::start(&cuda.prefix_seconds);
+                    let trace=cuda.prefix.forward_edited(&self.run.family,|node,trace| {
+                        let edits=edits.iter().filter(|e|e.node==node).collect::<Vec<_>>();
+                        if edits.is_empty() {return Ok(None);}
+                        let mut value=self.device.download(cuda.prefix.root_value(trace,node)?).map_err(|e|e.to_string())?;
+                        apply(&edits,&mut value);
+                        Ok(Some(self.device.upload(value.view()).map_err(|e|e.to_string())?))
+                    })?;
+                    let value=self.device.download(&cuda.prefix.output(&trace)?).map_err(|e|e.to_string())?;
+                    if value.dim()!=(self.run.family.rows,self.head.width) || value.iter().any(|x|!x.is_finite()) {return Err("native CUDA hidden cache shape/nonfinite mismatch".into());}
+                    drop(prefix_timer);
+                    return Ok(value);
+                }
                 let trace=self.prefix.execute_edited(&self.run.family,|node,value,_| {
                     apply(&edits.iter().filter(|e|e.node==node).collect::<Vec<_>>(),value);Ok(())
                 }).map_err(|e|e.to_string())?;
@@ -160,23 +225,19 @@ impl RunCheck for StreamedFamilyRun<'_> {
         if estimate>self.budget.intermediate_bytes {return Err(format!("streamed intermediate estimate {estimate} exceeds {}",self.budget.intermediate_bytes));}
         let mut scores=Vec::new();
         for (episode,reference) in self.run.episodes.iter().zip(references) {
-            let mut held:BTreeMap<usize,Vec<&Edit>>=BTreeMap::new();let mut unheld=0;
-            for e in &episode.edits {
-                match artifact.place(e.node) {
-                    Some(node)=>{
-                        validate_edits(std::slice::from_ref(e),self.run.family.rows,|_|interfaces.get(node).map(|i|i.width()))?;
-                        if resident.is_streamed_head_root(node)? {return Err("candidate maps an intervention to an unmaterialized head".into());}
-                        held.entry(node).or_default().push(e);
-                    },
-                    None=>unheld+=1,
-                }
+            let mapped=crate::native_control::map_edits(artifact,&episode.edits)?;
+            let held=mapped.edits;
+            let unheld=mapped.unheld;
+            for (&node,edits) in &held {
+                validate_edits(edits,self.run.family.rows,|_|interfaces.get(node).map(|i|i.width()))?;
+                if resident.is_streamed_head_root(node)? {return Err("candidate maps an intervention to an unmaterialized head".into());}
             }
             let trace={
                 let forward_timer=Timer::start(&self.timers.forward);
                 let value=resident.forward_edited_intermediates(&self.run.family,|node,trace| {
                     let Some(edits)=held.get(&node) else {return Ok(None)};
                     let mut values=self.device.download(resident.root_value(trace,node)?).map_err(|e|e.to_string())?;
-                    apply(edits,&mut values);
+                    apply(&edits.iter().collect::<Vec<_>>(),&mut values);
                     Ok(Some(self.device.upload(values.view()).map_err(|e|e.to_string())?))
                 })?;
                 drop(forward_timer);value
@@ -185,9 +246,10 @@ impl RunCheck for StreamedFamilyRun<'_> {
             for start in (0..self.run.family.rows).step_by(tile_rows) {
                 let end=(start+tile_rows).min(self.run.family.rows);
                 let explained={let timer=Timer::start(&self.timers.forward);let value=self.device.download(&resident.logits_rows(&trace,start,end-start)?).map_err(|e|e.to_string())?;drop(timer);value};
-                let metric_timer=Timer::start(&self.timers.metric);
-                let z=self.head.logits(self.run.model,reference.slice(s![start..end,..]))?;
-                let c=self.head.logits(self.run.model,clean.slice(s![start..end,..]))?;
+                let cpu_head_timer=if self.cuda_native.is_none() {Some(Timer::start(&self.timers.metric))}else{None};
+                let z=self.native_logits(reference.slice(s![start..end,..]))?;
+                let c=self.native_logits(clean.slice(s![start..end,..]))?;
+                let metric_timer=if cpu_head_timer.is_none() {Some(Timer::start(&self.timers.metric))}else{None};
                 if explained.dim()!=z.dim() || z.dim()!=c.dim() {return Err("streamed output shape mismatch".into());}
                 let classes=self.head.classes/self.run.readouts;
                 for row in 0..z.nrows() {for readout in 0..self.run.readouts {
@@ -199,6 +261,7 @@ impl RunCheck for StreamedFamilyRun<'_> {
                     agree+=f64::from(u8::from(argmax(teacher)==argmax(candidate)));count+=1.;
                 }}
                 drop(metric_timer);
+                drop(cpu_head_timer);
             }
             scores.push(EpisodeScore {id:episode.id.clone(),group:episode.group.clone(),kl:kl/count,numerical_error:(error/count).next_up(),native_effect:effect/count,top1_agree:agree/count,unheld});
         }

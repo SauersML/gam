@@ -63,3 +63,51 @@ fn native_plan_rejects_non_dense_or_multi_term_terminal_head() {
     program.output=program.nodes.len()-1;
     assert!(Head::of(&program).is_err());
 }
+
+#[test]
+fn values_prefix_preserves_ordered_partial_native_edits_and_source() {
+    let dir=crate::explanation_tests::tiny_export("streamed_native_values",2);
+    let imported=crate::import::import_language_model(&dir,1,6).unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    let head=Head::of(&imported.program).unwrap();
+    let prefix=head.prefix(&imported.program).unwrap();
+    let edits=vec![
+        Edit {node:head.hidden,rows:Some(vec![1,1,4]),columns:0..1,change:Change::Scale(0.3)},
+        Edit {node:head.hidden,rows:Some(vec![1,4]),columns:0..1,change:Change::Add(0.125)},
+    ];
+    let device=Device::host();
+    let compiled=crate::device_program::DeviceProgram::compile_values(&device,&prefix).unwrap();
+    let clean=prefix.execute(&imported.contract.family,false).unwrap().values[prefix.output].clone();
+    for changes in [edits,vec![]] {
+        let expected=prefix.execute_edited(&imported.contract.family,|node,value,_| {
+            apply(&changes.iter().filter(|e|e.node==node).collect::<Vec<_>>(),value);Ok(())
+        }).unwrap();
+        let trace=compiled.forward_edited(&imported.contract.family,std::collections::BTreeMap::new(),|_,_|Ok(()),|node,trace| {
+            let changes=changes.iter().filter(|e|e.node==node).collect::<Vec<_>>();
+            if changes.is_empty(){return Ok(None);}
+            let mut value=device.download(trace.value(node)?).map_err(|e|e.to_string())?;
+            apply(&changes,&mut value);
+            Ok(Some(device.upload(value.view()).map_err(|e|e.to_string())?))
+        }).unwrap();
+        let actual=device.download(trace.value(prefix.output).unwrap()).unwrap();
+        for (a,b) in actual.iter().zip(expected.values[prefix.output].iter()) {assert!((a-b).abs()<1e-12);}
+    }
+    assert_eq!(prefix.execute(&imported.contract.family,false).unwrap().values[prefix.output],clean);
+}
+
+#[test]
+fn native_head_device_orientation_preserves_sub_f32_values() {
+    let device=Device::host();
+    let hidden=ndarray::arr2(&[[1.0+2f64.powi(-40),-2.0],[0.2,3.0]]);
+    let matrix=ndarray::arr2(&[[0.5,1.0+2f64.powi(-35)],[-0.3,0.7],[2.0,-1.0]]);
+    let expected=hidden.dot(&matrix.t());
+    for transposed in [false,true] {
+        let values=if transposed {matrix.t().to_owned()}else{matrix.clone()};
+        let tensor=device.upload(values.view()).unwrap();
+        let head=Head {hidden:0,operator:0,transposed,classes:3,width:2};
+        let actual=head.logits_device(&device,&tensor,hidden.view()).unwrap();
+        for (a,b) in actual.iter().zip(expected.iter()) {assert!((a-b).abs()<1e-14);}
+        assert_eq!(device.download(&tensor).unwrap(),values);
+        assert!(head.logits_device(&device,&tensor,hidden.slice(s![..,..1])).is_err());
+    }
+}
