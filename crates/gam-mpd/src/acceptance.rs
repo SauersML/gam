@@ -939,10 +939,16 @@ impl RunMeasure {
     }
 }
 
-/// `KL(p ‖ q)` of two logit rows, and its rounding: each log-softmax `z − m − ln Σ e^{z − m}` rounds
+/// `KL(p ‖ q)` of two logit rows, and a conditional comparison estimate: each log-softmax `z − m − ln Σ e^{z − m}` rounds
 /// the shifted exponentials (two ulps each), their sum (`γ_V`), the logarithm (one ulp) and the
 /// subtractions, within `η(z) = γ_{V+4}(|m| + |ln Σ| + 1)` per entry; `p = e^{log p}` within
 /// `2u + η(z)` relative; the sum `Σ p (log p − log q)` within `γ_{V+2}` of its magnitude.
+///
+/// These exp/log ULP assumptions are not guaranteed by Rust's `f64::exp`/`ln`
+/// contract, which specifies unspecified precision. Relative exponential error
+/// also assumes no lost underflow tail. This is the existing operational CPU
+/// comparison model, not a proved transcendental enclosure. It does not cover
+/// rounding that produced the input logits, output heads, GEMM or neural forwards.
 pub fn kl_logits(z: ndarray::ArrayView1<'_, f64>, w: ndarray::ArrayView1<'_, f64>) -> (f64, f64) {
     let classes = z.len();
     let lse = |v: ndarray::ArrayView1<'_, f64>| {

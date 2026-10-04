@@ -1,4 +1,8 @@
 //! Opt-in head-only f64 CUDA logits; normalization and acceptance metrics remain CPU.
+//!
+//! The CPU metric is an independent operational reference with the existing
+//! conditional exp/log ULP model; Rust does not guarantee those transcendental
+//! errors. Neither CPU nor GPU proposal bands certify full head/network arithmetic.
 use crate::counterfactual::Decoder;
 use gam_gpu::tensor::{Arithmetic, Device, Op, Tensor};
 use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
