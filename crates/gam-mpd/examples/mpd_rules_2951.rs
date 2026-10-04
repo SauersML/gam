@@ -53,6 +53,20 @@
 //! all; and the decode check (every attention site replaced by its decoded head blocks, all on, on
 //! sequence `STATISTICS`), the KL against the native model of both descriptions.
 
+//! `mpd_rules_2951 execute EXPORT_DIR OUT.json MATCH SOURCE COPY`
+//!
+//! The attention rules run in the model (`gam_mpd::rules`): every match head in `MATCH` (comma-
+//! separated `layer.head`) has its content query rows replaced by the match rule through head
+//! `SOURCE`'s output-value circuit (its content planes the ones the rule aligns with best), every
+//! copy head in `COPY` its output head by the copy rule, each at its least-squares scale. Variants:
+//! native; the rules on the content rows with the rest of each head native; the rules alone (the
+//! match heads' other rows zero); the rules plus the best rank-`r` residual for `r` = 8 and 32. Per
+//! variant: the literals the replaced blocks take, the KL to the native model per token on held-out
+//! text and on sequences of uniformly drawn tokens repeated once, the match heads' induction scores
+//! and the loss on the repeats; and under two interventions, the same against the native model's
+//! response: the source head ablated (its output zeroed), and the token after each first occurrence
+//! edited (the repeat should now predict the edited token).
+//!
 use gam_mpd::import::import_language_model;
 use gam_mpd::operator_program::{FamilyInputs, Node, SequenceLayout, SlotValues};
 use ndarray::{Array2, Axis, s};
@@ -207,7 +221,7 @@ fn heads(export: &std::path::Path, half: usize, sequences: usize) -> Result<(), 
         let site = all.iter().find(|s| s.name == format!("blocks.{layer}.q")).ok_or("no query site")?;
         let x = gam_mpd::masked::read_values(&text, site)?;
         let c = x.t().dot(&x) / x.nrows() as f64;
-        let e = gam_mpd::dense::eigh(c.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
+        let e = gam_linalg::decompose::eigh(c.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
         let mut root = e.vectors.clone();
         for (i, l) in e.values.iter().enumerate() {
             root.column_mut(i).mapv_inplace(|v| v * l.max(0.0).sqrt());
@@ -216,7 +230,7 @@ fn heads(export: &std::path::Path, half: usize, sequences: usize) -> Result<(), 
         // The fraction of `b`'s energy (rows, whitened) in the row space of `a` (whitened).
         let within = |a: &Array2<f64>, b: &Array2<f64>| -> Result<f64, String> {
             let (aw, bw) = (a.dot(&root), b.dot(&root));
-            let d = gam_mpd::dense::svd(aw.view(), false).map_err(|e| format!("{e:?}"))?;
+            let d = gam_linalg::decompose::svd(aw.view(), false).map_err(|e| format!("{e:?}"))?;
             let kept = d.singular_values.iter().filter(|s| **s > d.band).count();
             let basis = d.vt.slice(s![..kept, ..]).to_owned();
             let projected = bw.dot(&basis.t());
@@ -624,7 +638,7 @@ fn selector(rows: &[usize], d: usize) -> Array2<f64> {
 
 /// The pseudo-inverse of `x` over its singular values beyond the decomposition's band.
 fn pseudo_inverse(x: &Array2<f64>) -> Result<Array2<f64>, String> {
-    let d = gam_mpd::dense::svd(x.view(), false).map_err(|e| format!("{e:?}"))?;
+    let d = gam_linalg::decompose::svd(x.view(), false).map_err(|e| format!("{e:?}"))?;
     let kept: Vec<usize> = (0..d.singular_values.len()).filter(|i| d.singular_values[*i] > d.band).collect();
     let inverse = ndarray::Array1::from_iter(kept.iter().map(|i| 1.0 / d.singular_values[*i]));
     let scaled = &d.u.select(Axis(1), &kept).t() * &inverse.insert_axis(Axis(1));
@@ -731,7 +745,7 @@ fn rules(export: &std::path::Path, out: &std::path::Path, observations: f64, sta
                                     // Z Zᵀ = U Λ Uᵀ on the planes; the prediction keeps its k leading
                                     // directions, P_k = U_k Λ_k⁻¹ U_kᵀ Z D⁻¹ (k = all is (Z Zᵀ)⁺ Z D⁻¹), and
                                     // ⟨W, P_k⟩, ⟨P_k, P_k⟩ accumulate over k through the precomputed forms.
-                                    let e = gam_mpd::dense::eigh(zz.select(Axis(0), &planes).select(Axis(1), &planes).view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None)
+                                    let e = gam_linalg::decompose::eigh(zz.select(Axis(0), &planes).select(Axis(1), &planes).view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None)
                                         .map_err(|e| format!("{e:?}"))?;
                                     let mut order: Vec<usize> = (0..planes.len()).filter(|i| e.values[*i] > e.band).collect();
                                     order.sort_by(|a, b| e.values[*b].total_cmp(&e.values[*a]));
@@ -851,9 +865,246 @@ fn rules(export: &std::path::Path, out: &std::path::Path, observations: f64, sta
     std::fs::write(out, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
+/// Per head `(layer, head)` asked for, its induction score on sequences of `half` tokens repeated
+/// once: the mean weight a repeated position puts on the position after its token's first
+/// occurrence.
+fn induction_scores(model: &gam_mpd::operator_program::OperatorProgram, trace: &gam_mpd::operator_program::Trace, positions: &[u32], half: usize, heads: &[(usize, usize)]) -> Vec<f64> {
+    let attends: Vec<(usize, usize, f64, usize)> = model
+        .nodes
+        .iter()
+        .filter_map(|n| match n {
+            Node::Attend { query, key, rotary: Some(r), .. } => Some((*query, *key, f64::from(r.base), r.dims as usize)),
+            _ => None,
+        })
+        .collect();
+    let per_layer = attends.len() / 4;
+    let length = 2 * half;
+    let sequences = positions.len() / length;
+    heads
+        .iter()
+        .map(|(l, h)| {
+            let (query, key, base, dims) = attends[l * per_layer + h];
+            let (q, k) = (rotated(&trace.values[query], positions, base), rotated(&trace.values[key], positions, base));
+            let mut induction = 0.0;
+            for sq in 0..sequences {
+                let at = sq * length;
+                let scores = q.slice(s![at..at + length, ..]).dot(&k.slice(s![at..at + length, ..]).t()) / (dims as f64).sqrt();
+                for m in half + 1..length {
+                    let row = scores.row(m);
+                    let top = row.slice(s![..=m]).iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let total: f64 = (0..=m).map(|n| (row[n] - top).exp()).sum();
+                    induction += (row[m - half + 1] - top).exp() / total;
+                }
+            }
+            induction / (sequences * (half - 1)) as f64
+        })
+        .collect()
+}
+
+/// Per row, the log-probabilities of the logits.
+fn log_softmax(logits: &Array2<f64>) -> Array2<f64> {
+    let mut out = logits.clone();
+    for mut row in out.rows_mut() {
+        let top = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let total = row.iter().map(|v| (v - top).exp()).sum::<f64>().ln() + top;
+        row.mapv_inplace(|v| v - total);
+    }
+    out
+}
+
+/// The mean over rows of `KL(native ‖ other)`, from log-probabilities.
+fn mean_kl(native: &Array2<f64>, other: &Array2<f64>) -> f64 {
+    let rows = native.nrows();
+    (0..rows).map(|r| native.row(r).iter().zip(other.row(r)).map(|(p, q)| p.exp() * (p - q)).sum::<f64>()).sum::<f64>() / rows as f64
+}
+
+/// The mean of `−log p(target)` over the given rows.
+fn mean_loss(log_probs: &Array2<f64>, rows: &[(usize, u32)]) -> f64 {
+    rows.iter().map(|(r, t)| -log_probs[[*r, *t as usize]]).sum::<f64>() / rows.len().max(1) as f64
+}
+
+/// `x` minus nothing but its best rank-`rank` part: the truncated SVD.
+fn truncated(x: &Array2<f64>, rank: usize) -> Result<Array2<f64>, String> {
+    let d = gam_linalg::decompose::svd(x.view(), false).map_err(|e| format!("{e:?}"))?;
+    let k = rank.min(d.singular_values.len());
+    let u = &d.u.slice(s![.., ..k]) * &d.singular_values.slice(s![..k]).insert_axis(Axis(0));
+    Ok(u.dot(&d.vt.slice(s![..k, ..])))
+}
+
+fn parse_heads(list: &str) -> Result<Vec<(usize, usize)>, String> {
+    list.split(',')
+        .filter(|x| !x.is_empty())
+        .map(|x| {
+            let (l, h) = x.split_once('.').ok_or(format!("{x}: not layer.head"))?;
+            Ok((l.parse().map_err(|e| format!("{x}: {e}"))?, h.parse().map_err(|e| format!("{x}: {e}"))?))
+        })
+        .collect()
+}
+
+fn execute(export: &std::path::Path, out: &std::path::Path, matches: &str, source: &str, copies: &str) -> Result<(), String> {
+    use gam_mpd::rules::{content_rows, copy_alignment, copy_prediction, copy_scale, match_alignment, match_prediction, match_reading, match_scale, with_operator};
+    const CONTEXT: usize = 512;
+    const TEXT: usize = 4;
+    let (match_heads, copy_heads) = (parse_heads(matches)?, parse_heads(copies)?);
+    let source = *parse_heads(source)?.first().ok_or("no source head")?;
+    // Held-out text: the last TEXT sequences of the first 16.
+    let imported = import_language_model(export, 16, CONTEXT)?;
+    let native = imported.program.clone();
+    let op = |program: &gam_mpd::operator_program::OperatorProgram, name: &str| -> Result<Array2<f64>, String> {
+        program.operators.iter().find(|o| o.name == name).map(|o| o.matrix()).ok_or(format!("no operator {name}"))
+    };
+    let gain = |name: &str| -> Result<ndarray::Array1<f64>, String> { Ok(op(&native, &format!("{name}.gain"))?.diag().to_owned()) };
+    let text = imported.contract.family.select(&((16 - TEXT) * CONTEXT..16 * CONTEXT).collect::<Vec<_>>());
+    // Uniformly drawn tokens repeated once, and the same with the token after each first occurrence
+    // edited (positions 1..half of the first copy), so the repeat should predict the edited token.
+    let (half, sequences) = (64usize, 8usize);
+    let mut state = 0x2951_u64;
+    let (mut ids, mut edited, mut sequence, mut position) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for q in 0..sequences {
+        let first: Vec<u32> = (0..half).map(|_| 1000 + uniform(&mut state, 49_000) as u32).collect();
+        let changed: Vec<u32> = first.iter().enumerate().map(|(i, t)| if i % 2 == 1 { 1000 + uniform(&mut state, 49_000) as u32 } else { *t }).collect();
+        for (p, t) in first.iter().chain(&first).enumerate() {
+            ids.push(*t);
+            sequence.push(q as u32);
+            position.push(p as u32);
+        }
+        // The edited sequence: the first copy's odd positions changed, the repeat unchanged.
+        edited.extend(changed.iter().chain(&first).copied());
+    }
+    let layout = SequenceLayout { sequence, position: position.clone() };
+    let repeated = FamilyInputs { rows: ids.len(), slots: vec![SlotValues::Tokens(ids.clone())], layout: Some(layout.clone()) };
+    let repeated_edit = FamilyInputs { rows: edited.len(), slots: vec![SlotValues::Tokens(edited.clone())], layout: Some(layout) };
+    // Targets: in the repeat, position half + i predicts the first copy's token at i + 1 (the edited
+    // one under the edit), for i + 1 odd.
+    let length = 2 * half;
+    let repeat_targets = |tokens: &[u32]| -> Vec<(usize, u32)> {
+        (0..sequences).flat_map(|q| (0..half - 1).filter(|i| (i + 1) % 2 == 1).map(move |i| (q * length + half + i, tokens[q * length + i + 1]))).collect()
+    };
+    let (targets, edited_targets) = (repeat_targets(&ids), repeat_targets(&edited));
+    // The rules' derived operators from the native heads.
+    let (sl, sh) = source;
+    let mut rule_blocks: Vec<(String, Array2<f64>, Array2<f64>, f64)> = Vec::new();
+    let mut found = Vec::new();
+    for &(l, h) in &match_heads {
+        let (query, key) = (op(&native, &format!("blocks.{l}.q{h}"))?, op(&native, &format!("blocks.{l}.k{h}"))?);
+        let (g, gs) = (gain(&format!("blocks.{l}.rms1"))?, gain(&format!("blocks.{sl}.rms1"))?);
+        let (so, sv) = (op(&native, &format!("blocks.{sl}.o{sh}"))?, op(&native, &format!("blocks.{sl}.v{sh}"))?);
+        let width = query.nrows();
+        let mut best: Option<(f64, usize)> = None;
+        for first in 0..width / 2 {
+            let rows = content_rows(width, first);
+            let alignment = match_alignment(&query, &match_reading(&key, &so, &sv, &g, &gs, &rows), &g, &rows)?;
+            if best.is_none_or(|b| alignment > b.0) {
+                best = Some((alignment, first));
+            }
+        }
+        let (alignment, first) = best.ok_or("no planes")?;
+        let rows = content_rows(width, first);
+        let reading = match_reading(&key, &so, &sv, &g, &gs, &rows);
+        let prediction = match_prediction(&reading, &g, None)?;
+        let scale = match_scale(&query, &reading, &g, &rows, &prediction);
+        // The rule's rows in place of the content rows; the rest native ("with") or zero ("alone").
+        let (mut with, mut alone) = (query.clone(), Array2::<f64>::zeros(query.dim()));
+        for (i, r) in rows.iter().enumerate() {
+            with.row_mut(*r).assign(&(&prediction.row(i) * scale));
+            alone.row_mut(*r).assign(&(&prediction.row(i) * scale));
+        }
+        eprintln!("match blocks.{l}.q{h} through layer {sl} head {sh}: content planes from {first} ({} rows), alignment {alignment:.3}, scale {scale:.4}", rows.len());
+        found.push(serde_json::json!({"rule": "match", "head": format!("{l}.{h}"), "source": format!("{sl}.{sh}"), "first_plane": first, "rows": rows.len(), "alignment": alignment, "scale": scale}));
+        rule_blocks.push((format!("blocks.{l}.q{h}"), with, alone, (rows.len() * query.ncols()) as f64));
+    }
+    for &(l, h) in &copy_heads {
+        let (output, value) = (op(&native, &format!("blocks.{l}.o{h}"))?, op(&native, &format!("blocks.{l}.v{h}"))?);
+        let prediction = copy_prediction(&value, &gain(&format!("blocks.{l}.rms1"))?, &gain("final_norm")?)?;
+        let (alignment, scale) = (copy_alignment(&output, &value, &prediction), copy_scale(&output, &value, &prediction));
+        let rule = &prediction * scale;
+        eprintln!("copy blocks.{l}.o{h}: alignment {alignment:.3}, scale {scale:.4}");
+        found.push(serde_json::json!({"rule": "copy", "head": format!("{l}.{h}"), "alignment": alignment, "scale": scale}));
+        rule_blocks.push((format!("blocks.{l}.o{h}"), rule.clone(), rule, output.len() as f64));
+    }
+    // The variants: per replaced block, its matrix and the literals it takes.
+    let mut variants: Vec<(String, gam_mpd::operator_program::OperatorProgram, f64)> = vec![("native".to_string(), native.clone(), rule_blocks.iter().map(|b| b.3).sum())];
+    let build = |pick: &dyn Fn(&str, &Array2<f64>, &Array2<f64>, &Array2<f64>) -> Result<(Array2<f64>, f64), String>| -> Result<(gam_mpd::operator_program::OperatorProgram, f64), String> {
+        let mut program = native.clone();
+        let mut literals = 0.0;
+        for (name, with, alone, _) in &rule_blocks {
+            let (values, count) = pick(name, &op(&native, name)?, with, alone)?;
+            literals += count;
+            program = with_operator(&program, name, values)?;
+        }
+        Ok((program, literals))
+    };
+    let (program, literals) = build(&|_, _, with, _| Ok((with.clone(), 1.0)))?;
+    variants.push(("rules on the content rows, the rest native".to_string(), program, literals));
+    let (program, literals) = build(&|_, _, _, alone| Ok((alone.clone(), 1.0)))?;
+    variants.push(("rules alone".to_string(), program, literals));
+    for rank in [8usize, 32] {
+        let (program, literals) = build(&|_, native_block, _, alone| {
+            let residual = truncated(&(native_block - alone), rank)?;
+            Ok((alone + &residual, 1.0 + (rank * (native_block.nrows() + native_block.ncols())) as f64))
+        })?;
+        variants.push((format!("rules alone plus the rank-{rank} residual"), program, literals));
+    }
+    // The source head ablated, in each variant: its output operator zeroed.
+    let ablate = |program: &gam_mpd::operator_program::OperatorProgram| -> Result<gam_mpd::operator_program::OperatorProgram, String> {
+        let name = format!("blocks.{sl}.o{sh}");
+        let zero = Array2::<f64>::zeros(op(program, &name)?.dim());
+        with_operator(program, &name, zero)
+    };
+    let run = |program: &gam_mpd::operator_program::OperatorProgram, inputs: &FamilyInputs| -> Result<(Array2<f64>, gam_mpd::operator_program::Trace), String> {
+        let trace = program.execute(inputs, false).map_err(|e| e.to_string())?;
+        Ok((log_softmax(&trace.values[program.output]), trace))
+    };
+    let (native_text, _) = run(&native, &text)?;
+    let (native_repeat, native_trace) = run(&native, &repeated)?;
+    let (native_edit, _) = run(&native, &repeated_edit)?;
+    let native_ablated = ablate(&native)?;
+    let (native_ablated_repeat, native_ablated_trace) = run(&native_ablated, &repeated)?;
+    let native_scores = induction_scores(&native, &native_trace, &position, half, &match_heads);
+    let native_ablated_scores = induction_scores(&native_ablated, &native_ablated_trace, &position, half, &match_heads);
+    let mut report = Vec::new();
+    for (name, program, literals) in &variants {
+        let (text_lp, _) = run(program, &text)?;
+        let (repeat_lp, trace) = run(program, &repeated)?;
+        let (edit_lp, _) = run(program, &repeated_edit)?;
+        let ablated = ablate(program)?;
+        let (ablated_lp, ablated_trace) = run(&ablated, &repeated)?;
+        let scores = induction_scores(program, &trace, &position, half, &match_heads);
+        let ablated_scores = induction_scores(&ablated, &ablated_trace, &position, half, &match_heads);
+        let row = serde_json::json!({
+            "variant": name,
+            "literals": literals,
+            "kl_text": mean_kl(&native_text, &text_lp),
+            "kl_repeated": mean_kl(&native_repeat, &repeat_lp),
+            "repeat_loss": mean_loss(&repeat_lp, &targets),
+            "induction": scores,
+            "edited": {"kl": mean_kl(&native_edit, &edit_lp), "loss_on_edited_token": mean_loss(&edit_lp, &edited_targets), "native_loss_on_edited_token": mean_loss(&native_edit, &edited_targets)},
+            "source_ablated": {"kl_to_native_ablated": mean_kl(&native_ablated_repeat, &ablated_lp), "repeat_loss": mean_loss(&ablated_lp, &targets), "native_repeat_loss": mean_loss(&native_ablated_repeat, &targets), "induction": ablated_scores, "native_induction": native_ablated_scores},
+        });
+        eprintln!(
+            "{name}: {literals:.0} literals; KL to native {:.4} nats/token on text, {:.4} on repeats; repeat loss {:.3} (native {:.3}); induction {:?} (native {:?}); edited: loss on the edited token {:.3} (native {:.3}); source ablated: repeat loss {:.3} (native {:.3}), induction {:?} (native {:?})",
+            mean_kl(&native_text, &text_lp),
+            mean_kl(&native_repeat, &repeat_lp),
+            mean_loss(&repeat_lp, &targets),
+            mean_loss(&native_repeat, &targets),
+            scores.iter().map(|x| format!("{x:.3}")).collect::<Vec<_>>(),
+            native_scores.iter().map(|x| format!("{x:.3}")).collect::<Vec<_>>(),
+            mean_loss(&edit_lp, &edited_targets),
+            mean_loss(&native_edit, &edited_targets),
+            mean_loss(&ablated_lp, &targets),
+            mean_loss(&native_ablated_repeat, &targets),
+            ablated_scores.iter().map(|x| format!("{x:.3}")).collect::<Vec<_>>(),
+            native_ablated_scores.iter().map(|x| format!("{x:.3}")).collect::<Vec<_>>(),
+        );
+        report.push(row);
+    }
+    let report = serde_json::json!({"rules": found, "variants": report});
+    std::fs::write(out, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
 fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
-    let usage = "mpd_rules_2951 heads EXPORT_DIR HALF SEQUENCES | price EXPORT_DIR LIBRARY_DIR OBSERVATIONS SITES | library EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json OBSERVATIONS STATISTICS LAYERS | rules EXPORT_DIR OUT.json OBSERVATIONS STATISTICS";
+    let usage = "mpd_rules_2951 heads EXPORT_DIR HALF SEQUENCES | price EXPORT_DIR LIBRARY_DIR OBSERVATIONS SITES | library EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json OBSERVATIONS STATISTICS LAYERS | rules EXPORT_DIR OUT.json OBSERVATIONS STATISTICS | execute EXPORT_DIR OUT.json MATCH SOURCE COPY";
     match args.get(1).map(String::as_str) {
         Some("heads") if args.len() == 5 => heads(
             std::path::Path::new(&args[2]),
@@ -875,6 +1126,7 @@ fn main() -> Result<(), String> {
             args[7].parse().map_err(|e| format!("STATISTICS: {e}"))?,
             args[8].parse().map_err(|e| format!("LAYERS: {e}"))?,
         ),
+        Some("execute") if args.len() == 7 => execute(std::path::Path::new(&args[2]), std::path::Path::new(&args[3]), &args[4], &args[5], &args[6]),
         Some("rules") if args.len() == 6 => rules(
             std::path::Path::new(&args[2]),
             std::path::Path::new(&args[3]),
