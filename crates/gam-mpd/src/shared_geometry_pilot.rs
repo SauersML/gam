@@ -38,8 +38,13 @@ pub fn build(native: &OperatorProgram, layers: &[LayerNodes], uses: &[usize], ar
     let (mut body, offset) = affine_source(native, first.pre, first.normed)?;
     let (u, d) = body.dim();
     if u <= d { return Err("declared overcomplete geometry requires hidden width > input width".into()); }
-    let laws = match native.nodes.get(first.active) { Some(Node::Pointwise { input, laws }) if *input == first.pre => laws.clone(), _ => return Err("native activation is not direct pointwise reader output".into()) };
-    if laws != vec![Law::GeluTanh] && laws != vec![Law::Gelu] { return Err("pilot declares native GELU or GELU-tanh only".into()); }
+    let native_laws = match native.nodes.get(first.active) { Some(Node::Pointwise { input, laws }) if *input == first.pre => laws.clone(), _ => return Err("native activation is not direct pointwise reader output".into()) };
+    let law = *native_laws.first().ok_or("native activation laws absent")?;
+    if (law != Law::GeluTanh && law != Law::Gelu) || native_laws.iter().any(|other| *other != law) { return Err("pilot requires uniform native GELU or GELU-tanh across hidden groups".into()); }
+    if native_laws.len() != native.node_interface(first.pre).map_err(|e|e.to_string())?.group_count() { return Err("native activation law/group count mismatch".into()); }
+    // The proposal has one full-width hidden group. A uniform per-native-unit law
+    // is exactly the same pointwise operation, represented once for that group.
+    let laws = vec![law];
     if arm == Arm::FrozenRandom {
         let mut state = seed;
         let scale = 1.0 / (d as f64).sqrt();
@@ -63,7 +68,10 @@ pub fn build(native: &OperatorProgram, layers: &[LayerNodes], uses: &[usize], ar
         let (native_reader, _) = affine_source(native, layer.pre, layer.normed)?;
         let (writer, writer_offset) = affine_source(native, layer.mlp, layer.active)?;
         if native_reader.dim() != (u,d) || writer.dim() != (d,u) { return Err("all declared uses must share exact full interfaces".into()); }
-        if native.nodes[layer.active] != (Node::Pointwise { input:layer.pre, laws:laws.clone() }) { return Err("use activation law differs from declared body".into()); }
+        match &native.nodes[layer.active] {
+            Node::Pointwise {input,laws:native_laws} if *input==layer.pre && !native_laws.is_empty() && native_laws.iter().all(|other|*other==law) && native_laws.len()==native.node_interface(layer.pre).map_err(|e|e.to_string())?.group_count() => {},
+            _ => return Err("use activation law differs from declared uniform body".into()),
+        }
         let raw = program.nodes.len(); program.nodes.push(Node::Raw { slot });
         let start = program.operators.len();
         let active = if arm == Arm::Untied {

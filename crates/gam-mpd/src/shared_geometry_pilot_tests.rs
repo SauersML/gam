@@ -48,3 +48,32 @@ fn shared_geometry_random_seed_and_scope() {
     assert!(build(&native,&layers,&[0,0],Arm::Learned,17).is_err());
     assert!(build(&native,&layers,&[2],Arm::Learned,17).is_err());
 }
+
+#[test]
+fn shared_geometry_native_unit_group_laws() {
+    use crate::operator_program::{LabelKind, OperatorBody};
+    let (mut native,layers)=native();
+    let units=Interface::uniform(3,1,LabelKind::Unit,0).expect("native unit grouping");
+    for layer in 0..2 {
+        let up=Arc::make_mut(&mut native.operators[2*layer]);
+        up.rows=units.clone();
+        if let OperatorBody::Dense {present,..}=&mut up.body {*present=Array2::from_elem((3,1),true);}
+        let down=Arc::make_mut(&mut native.operators[2*layer+1]);
+        down.cols=units.clone();
+        if let OperatorBody::Dense {present,..}=&mut down.body {*present=Array2::from_elem((1,3),true);}
+        native.nodes[layers[layer].active]=Node::Pointwise {input:layers[layer].pre,laws:vec![Law::GeluTanh;3]};
+    }
+    native.interfaces().expect("native grouped program");
+    for arm in [Arm::Learned,Arm::FrozenNative,Arm::FrozenRandom,Arm::Untied] {
+        let proposal=build(&native,&layers,&[0,1],arm,17).expect("uniform repeated laws supported");
+        if arm!=Arm::Untied { assert_eq!(proposal.program.rules[0].nodes[2],Node::Pointwise {input:1,laws:vec![Law::GeluTanh]}); }
+    }
+    let proposal=build(&native,&layers,&[0,1],Arm::FrozenNative,17).expect("native body");
+    let function=function(&proposal,0).expect("first-use function");
+    let family=FamilyInputs {rows:1,slots:vec![SlotValues::Raw(Array2::from_shape_vec((1,2),vec![1.0,2.0]).expect("row"))],layout:None};
+    let a=native.execute(&family,false).expect("native execute");
+    let b=function.execute(&family,false).expect("function execute");
+    assert_eq!(a.values[layers[0].mlp],b.values[function.output]);
+    native.nodes[layers[1].active]=Node::Pointwise {input:layers[1].pre,laws:vec![Law::GeluTanh,Law::Relu,Law::GeluTanh]};
+    assert!(build(&native,&layers,&[0,1],Arm::Learned,17).is_err());
+}
