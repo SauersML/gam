@@ -458,6 +458,70 @@ impl DataWeightedSvd {
     }
 }
 
+/// Transport for a fitted proposal, not an accepted or independently executable
+/// explanation. It contains only the explicit f32 factors; training activations
+/// are unnecessary at evaluation time. The receiving artifact still supplies and
+/// pays for its interfaces, binding, graph and remaining native computation.
+/// Integers carry the f32 bit patterns, including signed zero, without a second
+/// floating-point text conversion. File digests and checkpoint lineage belong in
+/// the experiment manifest, not in this numerical payload.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LowRankProposal {
+    version: u32,
+    name: String,
+    rows: usize,
+    cols: usize,
+    rank: usize,
+    left_f32_bits: Vec<u32>,
+    right_f32_bits: Vec<u32>,
+}
+
+impl LowRankProposal {
+    pub fn of(operator: &Operator) -> Result<Self, String> {
+        let super::operator_program::OperatorBody::LowRank { left, right, .. } = &operator.body else {
+            return Err("prepared proposal requires explicit low-rank factors".into());
+        };
+        let encode = |values: &Array2<f64>| -> Result<Vec<u32>, String> {
+            values.iter().map(|&v| {
+                let f = v as f32;
+                if !v.is_finite() || f64::from(f).to_bits() != v.to_bits() {
+                    Err("prepared factor is not an exact finite f32 literal".into())
+                } else { Ok(f.to_bits()) }
+            }).collect()
+        };
+        Ok(Self { version: 1, name: operator.name.clone(), rows: left.nrows(), cols: right.ncols(),
+            rank: left.ncols(), left_f32_bits: encode(left)?, right_f32_bits: encode(right)? })
+    }
+
+    /// Reconstruct on the declared native interfaces; does not fit or consult any
+    /// evaluation states. A caller must verify the surrounding manifest first.
+    pub fn operator(&self, native: &Operator) -> Result<Operator, String> {
+        if self.version != 1 || self.rows != native.rows.width() || self.cols != native.cols.width()
+            || self.rank == 0 || self.rank > self.rows.min(self.cols)
+            || self.rows.checked_mul(self.rank) != Some(self.left_f32_bits.len())
+            || self.rank.checked_mul(self.cols) != Some(self.right_f32_bits.len())
+        { return Err("prepared factor version, shape or native interface mismatch".into()); }
+        let values = |bits: &[u32]| -> Result<Vec<f64>, String> {
+            bits.iter().map(|&b| {
+                let v = f32::from_bits(b);
+                if v.is_finite() { Ok(f64::from(v)) } else { Err("nonfinite prepared factor".into()) }
+            }).collect()
+        };
+        let left = Array2::from_shape_vec((self.rows,self.rank), values(&self.left_f32_bits)?).map_err(|e|e.to_string())?;
+        let right = Array2::from_shape_vec((self.rank,self.cols), values(&self.right_f32_bits)?).map_err(|e|e.to_string())?;
+        let precision = exact_precision(left.iter().chain(right.iter()).copied()).map_err(|e|e.to_string())?;
+        let mut operator=Operator::low_rank(self.name.clone(),native.rows.clone(),native.cols.clone(),left.clone(),right.clone(),precision,
+            Provenance::derived(&[&native.provenance],"loaded explicit f32 proposal factors; decoded Local/Run fidelity not established".into()))
+            .map_err(|e|e.to_string())?;
+        // The constructor validates interfaces and lattice membership but its
+        // rounding canonicalizes signed zero. These finite f32 literals already
+        // lie exactly on `precision`; retain their transported bits after validation.
+        operator.body=super::operator_program::OperatorBody::LowRank {left,right,precision};
+        Ok(operator)
+    }
+}
+
 struct CopyResidualHead {
     derived: super::artifact::Derived,
     operator: std::sync::Arc<Operator>,
@@ -788,6 +852,32 @@ mod data_weighted_svd_tests {
         assert!(shared.fit(&ndarray::Array2::zeros((2,3))).is_err());
         let scaled=InputSvd::new(&ndarray::array![[2.,0.],[0.,2.]]).expect("scaled inputs");
         assert!(scaled.fit(&ndarray::array![[f64::MAX,0.]]).is_err());
+    }
+
+    #[test]
+    fn prepared_factors_replay_without_training_inputs_and_reject_malformed_payloads() {
+        let w=ndarray::array![[2.,1.],[0.,-3.]];
+        let native=original(&w);
+        let fitted=DataWeightedSvd::new(&w,&ndarray::array![[1.,2.],[3.,-1.],[4.,5.]])
+            .expect("fit").operator(&native,"prepared".into(),1).expect("proposal");
+        let payload=LowRankProposal::of(&fitted).expect("explicit factors");
+        let bytes=serde_json::to_vec(&payload).expect("serialize");
+        let replay:LowRankProposal=serde_json::from_slice(&bytes).expect("read");
+        let loaded=replay.operator(&native).expect("reconstruct without inputs");
+        assert_eq!(loaded.body,fitted.body);
+        assert_eq!(loaded.matrix(),fitted.matrix());
+        assert_eq!(loaded.real_count(),fitted.real_count());
+        let mut changed=replay.clone(); changed.left_f32_bits[0]=(-0.0_f32).to_bits();
+        let zero=changed.operator(&native).expect("signed zero");
+        assert_eq!(LowRankProposal::of(&zero).expect("reencode").left_f32_bits[0],(-0.0_f32).to_bits());
+        changed.version=2; assert!(changed.operator(&native).is_err());
+        changed=replay.clone(); changed.right_f32_bits.pop(); assert!(changed.operator(&native).is_err());
+        changed=replay.clone(); changed.left_f32_bits[0]=f32::INFINITY.to_bits(); assert!(changed.operator(&native).is_err());
+        assert!(replay.operator(&original(&Array2::zeros((3,2)))).is_err());
+        assert!(LowRankProposal::of(&native).is_err());
+        let mut nonf32=fitted.clone();
+        if let super::super::operator_program::OperatorBody::LowRank { left,.. }=&mut nonf32.body { left[[0,0]]=1.0+f64::EPSILON; }
+        assert!(LowRankProposal::of(&nonf32).is_err());
     }
 }
 

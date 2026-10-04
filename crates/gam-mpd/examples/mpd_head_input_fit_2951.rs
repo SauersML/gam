@@ -1,6 +1,6 @@
 //! Native-input weighted head proposals. Extraction uses a GPU; fitting is a separate CPU job.
 //! extract TRAIN_EXPORT EVAL_EXPORT OUT_DIR TRAIN_SEQUENCES EVAL_SEQUENCES CONTEXT TRACE_BYTES
-//! fit MODEL_EXPORT EXTRACT_DIR OUT_JSON RANKS [TRAIN_SEQUENCES]
+//! fit MODEL_EXPORT EXTRACT_DIR OUT_JSON RANKS [TRAIN_SEQUENCES [factor_dir=FRESH_DIR]]
 //! All heads are reported. These linear diagnostics are not Local/Run acceptance.
 use gam_mpd::{
     acceptance::{CostCache, structural_cost},
@@ -9,7 +9,7 @@ use gam_mpd::{
     device_program::DeviceProgram,
     import::import_language_model,
     operator_program::{Node, Operator, SlotValues},
-    proposals::{CopyMasks, CopyResidualBank, CopyResidualChoice, HeadApproximation, InputSvd},
+    proposals::{CopyMasks, CopyResidualBank, CopyResidualChoice, HeadApproximation, InputSvd, LowRankProposal},
     run_check::{layer_nodes, split_sites},
 };
 use ndarray::Array2;
@@ -254,14 +254,32 @@ fn replace(
     candidate.program.operators[index] = Arc::new(op);
     candidate.bind("native-input weighted attention", &[normed], attention)
 }
+fn factor_record(directory: Option<&Path>, filename: &str, op: &Operator, native: &Operator) -> Result<serde_json::Value,String> {
+    let Some(directory)=directory else { return Ok(serde_json::Value::Null); };
+    let payload=LowRankProposal::of(op)?;
+    let bytes=serde_json::to_vec(&payload).map_err(|e|e.to_string())?;
+    let path=directory.join(filename);
+    let mut file=std::fs::OpenOptions::new().create_new(true).write(true).open(&path).map_err(|e|e.to_string())?;
+    file.write_all(&bytes).map_err(|e|e.to_string())?;
+    drop(file);
+    let saved:LowRankProposal=serde_json::from_slice(&std::fs::read(&path).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+    let replay=saved.operator(native)?;
+    if replay.body!=op.body || replay.matrix()!=op.matrix() { return Err("saved proposal factor replay changed the operator".into()); }
+    Ok(json!({"file":filename,"sha256":sha256(&path)?,"bytes":bytes.len(),"independent_factor_replay":true,"final_artifact_acceptance":false}))
+}
 fn fit(a: &[String]) -> Result<(), String> {
-    if a.len() != 4 && a.len() != 5 {
-        return Err("fit MODEL_EXPORT EXTRACT_DIR OUT_JSON RANKS [TRAIN_SEQUENCES]".into());
+    if !(4..=6).contains(&a.len()) {
+        return Err("fit MODEL_EXPORT EXTRACT_DIR OUT_JSON RANKS [TRAIN_SEQUENCES [factor_dir=FRESH_DIR]]".into());
     }
     let output = Path::new(&a[2]);
     if output.exists() {
         return Err("fresh report required".into());
     }
+    let factor_dir=if a.len()==6 {
+        let path=Path::new(a[5].strip_prefix("factor_dir=").filter(|s|!s.is_empty()).ok_or("expected factor_dir=FRESH_DIR")?);
+        std::fs::create_dir(path).map_err(|e|e.to_string())?;
+        Some(path)
+    } else { None };
     let ranks: Vec<_> = a[3].split(',').map(positive).collect::<Result<_, _>>()?;
     let data = Path::new(&a[1]);
     let manifest: serde_json::Value = serde_json::from_slice(
@@ -304,7 +322,7 @@ fn fit(a: &[String]) -> Result<(), String> {
         .as_u64()
         .ok_or("train rows")? as usize;
     let context = manifest["context"].as_u64().ok_or("context")? as usize;
-    let train_rows = if a.len() == 5 {
+    let train_rows = if a.len() >= 5 {
         positive(&a[4])?
             .checked_mul(context)
             .ok_or("training rows overflow")?
@@ -393,7 +411,9 @@ fn fit(a: &[String]) -> Result<(), String> {
                                 .ok_or("residual")?
                                 .matrix()
                     };
-                    points.push(json!({"family":format!("{family:?}"),"fit":"weight_Frobenius","rank":rank,"C32_bits":structural_cost(&candidate,&mut costs)?.total(),"train":metrics(&x,&native,&matrix),"eval":metrics(&eval,&native,&matrix)}));
+                    let fitted_operator=if family==HeadApproximation::NativeSvd { &candidate.program.operators[index] } else { candidate.program.operators.last().ok_or("residual")? };
+                    let factors=factor_record(factor_dir,&format!("L{layer}.H{head}.{family:?}.weight.rank{rank}.json"),fitted_operator,original)?;
+                    points.push(json!({"family":format!("{family:?}"),"fit":"weight_Frobenius","rank":rank,"C32_bits":structural_cost(&candidate,&mut costs)?.total(),"train":metrics(&x,&native,&matrix),"eval":metrics(&eval,&native,&matrix),"factors":factors}));
                     let weighted = match family {
                         HeadApproximation::NativeSvd => &fit_native,
                         HeadApproximation::CopyResidual => &fit_residual,
@@ -402,6 +422,7 @@ fn fit(a: &[String]) -> Result<(), String> {
                         Err(error) => points.push(json!({"family":format!("{family:?}"),"fit":"training_native_inputs","rank":rank,"unresolved":error})),
                         Ok(fit) => {
                             let op = fit.operator(original, format!("{name}.input_fit"), rank)?;
+                            let factors=factor_record(factor_dir,&format!("L{layer}.H{head}.{family:?}.input.rank{rank}.json"),&op,original)?;
                             let matrix = if family == HeadApproximation::NativeSvd { op.matrix() } else { &predicted + &op.matrix() };
                             let candidate = if family == HeadApproximation::NativeSvd { replace(&base,index,op,nodes.normed_stream,nodes.attention)? } else {
                                 let mut candidate = candidate;
@@ -410,7 +431,7 @@ fn fit(a: &[String]) -> Result<(), String> {
                                 if !matches!(&candidate.program.nodes[nodes.attention], Node::Affine {terms,..} if terms.iter().any(|&(_,i)| i==residual)) { return Err("residual not attached".into()); }
                                 candidate
                             };
-                            points.push(json!({"family":format!("{family:?}"),"fit":"training_native_inputs","rank":rank,"C32_bits":structural_cost(&candidate,&mut costs)?.total(),"input_singular_range":[fit.smallest_input_singular_value,fit.largest_input_singular_value],"train":metrics(&x,&native,&matrix),"eval":metrics(&eval,&native,&matrix)}));
+                            points.push(json!({"family":format!("{family:?}"),"fit":"training_native_inputs","rank":rank,"C32_bits":structural_cost(&candidate,&mut costs)?.total(),"input_singular_range":[fit.smallest_input_singular_value,fit.largest_input_singular_value],"train":metrics(&x,&native,&matrix),"eval":metrics(&eval,&native,&matrix),"factors":factors}));
                         }
                     }
                 }
@@ -428,7 +449,7 @@ fn fit(a: &[String]) -> Result<(), String> {
     }
     save(
         output,
-        &json!({"manifest":manifest,"used_training_rows":train_rows,"ranks":ranks,"native_C32_bits":native_bits,"heads":results,"seconds":start.elapsed().as_secs_f64(),"claim":"proposal diagnostic only; neither full Local nor autonomous Run acceptance, no selected mechanism","fit":"SVD minimizes declared training native linear-output squared error; f32 factors before measurements; Copy scale remains original weight fit in both arms; same rank/C32 accounting; all heads reported","evaluation":"evaluation reads never enter factor fitting; separate data exports recorded in manifest; no threshold or calibration"}),
+        &json!({"manifest":manifest,"used_training_rows":train_rows,"ranks":ranks,"native_C32_bits":native_bits,"heads":results,"factor_directory":factor_dir,"seconds":start.elapsed().as_secs_f64(),"claim":"proposal diagnostic only; neither full Local nor autonomous Run acceptance, no selected mechanism","factor_transport":"optional explicit f32 factors with file hashes, training inputs unnecessary at execution; full artifact must still be built, priced, decoded and assessed","fit":"SVD minimizes declared training native linear-output squared error; f32 factors before measurements; Copy scale remains original weight fit in both arms; same rank/C32 accounting; all heads reported","evaluation":"evaluation reads never enter factor fitting; separate data exports recorded in manifest; no threshold or calibration"}),
     )
 }
 fn main() -> Result<(), String> {
