@@ -37,6 +37,17 @@
 //! fitted and with its blocks all on. Per point the terms per word under both codes, blocks and
 //! rank-one equivalents on, and per block its label, rank, firing, decoded bits and whether the
 //! pruned library keeps it.
+//!
+//! Measured on p31 (`n` = 10⁴, 10⁵, 10⁶). With the library paid once: whole sites 56.3, 81.1, 100.5
+//! bits a word; the planes all on 114, 141, 213, and pruned under that code 77.9, 120.5, 178.0. The
+//! pruned planes are the key frequencies (7, 8, 5 at W_O and W_in; 7, 8, 5 (a+b) first at W_out; 37,
+//! 57, 72 of 163 planes kept). Per word: whole sites 53,969, 77,818, 96,484; planes selected 47,716
+//! (KL 3.2 nats) and 62,692 at 10⁴ and 10⁵; the fit from rank-one subcomponents 43,975 (KL 3.0) and
+//! 29,289; the fit seeded from the planes 10,979 at 10⁴, as input-gated rank-one slices. Under both
+//! codes the objective prices the planes above something else. A plane's writer is sent in the
+//! site's own coordinates (W_out's 20 kept planes are rank 40 on a 32-wide side; W_K's planes act
+//! only through the query). No p31 site has character charts on both sides, so the rotation core
+//! never applies.
 
 use gam_mpd::blocks::{Bits, Blocked, Coded, fit_blocks, measure, reselect, rounding_error};
 use gam_mpd::codec::subset_code_len_bits;
