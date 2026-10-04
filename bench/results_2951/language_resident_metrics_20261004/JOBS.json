@@ -1,0 +1,28 @@
+{
+  "source_commit": "6f38f322ae568b6460d119cf63c7a31394bc5ed9",
+  "CPU_target_build": 15864,
+  "GPU_small_gate": 15865,
+  "GPU_full80": 15869,
+  "resources": {
+    "CPU_build": {
+      "CPUs": 8,
+      "GiB": 16,
+      "minutes": 30
+    },
+    "GPU_small": {
+      "GPUs": 1,
+      "CPUs": 4,
+      "GiB": 16,
+      "minutes": 30
+    }
+  },
+  "small_depends_afterok": [
+    15864
+  ],
+  "full_requires_actual_small_report_pass": true,
+  "complete_exit0": [
+    15864,
+    15865,
+    15869
+  ]
+}

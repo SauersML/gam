@@ -1,0 +1,144 @@
+{
+  "passes": true,
+  "source_commit": "6f38f322ae568b6460d119cf63c7a31394bc5ed9",
+  "jobs": {
+    "CPU_build": 15864,
+    "small_gate": 15865,
+    "full_gate": 15869
+  },
+  "spec_sha256": "3c05b66324dfb02e33da7eff98784a7ec432123e24fea78018b892efb4256436",
+  "episode_count": 80,
+  "passages": 2,
+  "context": 512,
+  "cold_classifications_checked": 400,
+  "warm_classifications_checked": 400,
+  "cold_and_warm_metadata_top1_unheld_domains_match": true,
+  "teacher_init_seconds": 32.573240208,
+  "prior_CPU_teacher_init_seconds": 167.533493025,
+  "teacher_init_speed_ratio": 5.143286082538811,
+  "Slurm": {
+    "CPU_build_seconds": 195,
+    "CPU_build_MaxRSS_KiB": 4295976,
+    "small_seconds": 42,
+    "small_MaxRSS_KiB": 2229276,
+    "full_seconds": 153,
+    "full_MaxRSS_KiB": 2225672,
+    "exit_code": "0:0",
+    "full_GPUs": 1,
+    "full_CPUs": 4,
+    "full_Ram_GiB": 16
+  },
+  "GPU_peak_memory": "not measured; numeric allocations separate from context/library/allocator overhead",
+  "results": [
+    {
+      "label": "native",
+      "artifact": {
+        "file": "/mnt/nw/home/s.sauers/mpd-data/cluster/codex-copy-residual-pair-1c0e7/evaluation/selected.0.bin",
+        "sha256": "351f84b21e2885d60dd3308992d1458da73a01c833b8f8e7028238f0a35ccc12"
+      },
+      "prepare_seconds": 0.808799104,
+      "cold_seconds": 41.184492047,
+      "warm_seconds": 8.484987826,
+      "prior_raw_warm_seconds": 35.483353548,
+      "raw_warm_speed_ratio": 4.181897991564661,
+      "normalized_warm_seconds": 105.616587944,
+      "normalized_warm_speed_ratio": 12.447464876775182,
+      "warm_checked_kernel_seconds": 0.063763881,
+      "warm_head_timer_seconds": 8.123271672,
+      "head_timing_caveat": "Head timer can include previously queued asynchronous forward work; not an independent CUDA kernel profile.",
+      "worst_group": {
+        "episodes": 2,
+        "mean_kl": {
+          "Bounded": {
+            "lower": 0.0,
+            "upper": 0.0
+          }
+        },
+        "name": "clean"
+      },
+      "cold_transfers": {
+        "donor_download_bytes": 0,
+        "edit_constant_upload_bytes": 14155776,
+        "final_residual_download_bytes": 0,
+        "raw_oracle_download_bytes": 0,
+        "residual_upload_bytes": 0
+      },
+      "warm_transfers": {
+        "donor_download_bytes": 0,
+        "edit_constant_upload_bytes": 0,
+        "final_residual_download_bytes": 0,
+        "raw_oracle_download_bytes": 0,
+        "residual_upload_bytes": 0
+      },
+      "memory_bytes": {
+        "candidate_preparation_upload_bytes": 14155776,
+        "declared_numeric_plan_bytes": 11583197184,
+        "head_numeric_resident_bytes": 308908032,
+        "metric_numeric_workspace_bytes": 210973856,
+        "native_edit_initialization_peak_bytes": 64585728,
+        "native_operator_initialization_bytes": 535443456,
+        "prepared_edit_numeric_bytes": 64585728,
+        "teacher_initialization_peak_reference_bytes": 257949696,
+        "teacher_numeric_bytes": 251658240
+      },
+      "max_native_effect_midpoint_difference": 6.217248937900877e-15,
+      "max_metric_interval_separation": 0.0
+    },
+    {
+      "label": "savedCopy189",
+      "artifact": {
+        "file": "/mnt/nw/home/s.sauers/mpd-data/cluster/codex-copy-residual-pair-1c0e7/evaluation/selected.189.bin",
+        "sha256": "b4f660612a3363ffc89f03ce1897459fbe2faca3e6dcadd787c7cbcd4aca3243"
+      },
+      "prepare_seconds": 1.112645149,
+      "cold_seconds": 31.650012543,
+      "warm_seconds": 31.47416207,
+      "prior_raw_warm_seconds": 34.809326573999996,
+      "raw_warm_speed_ratio": 1.1059651563267177,
+      "normalized_warm_seconds": 103.565586589,
+      "normalized_warm_speed_ratio": 3.2904954342760684,
+      "warm_checked_kernel_seconds": 23.094409249,
+      "warm_head_timer_seconds": 8.054741802,
+      "head_timing_caveat": "Head timer can include previously queued asynchronous forward work; not an independent CUDA kernel profile.",
+      "worst_group": {
+        "episodes": 2,
+        "mean_kl": {
+          "Bounded": {
+            "lower": 0.0297811063838973,
+            "upper": 0.029781106383984186
+          }
+        },
+        "name": "remove-mlp/l1"
+      },
+      "cold_transfers": {
+        "donor_download_bytes": 0,
+        "edit_constant_upload_bytes": 0,
+        "final_residual_download_bytes": 0,
+        "raw_oracle_download_bytes": 0,
+        "residual_upload_bytes": 0
+      },
+      "warm_transfers": {
+        "donor_download_bytes": 0,
+        "edit_constant_upload_bytes": 0,
+        "final_residual_download_bytes": 0,
+        "raw_oracle_download_bytes": 0,
+        "residual_upload_bytes": 0
+      },
+      "memory_bytes": {
+        "candidate_preparation_upload_bytes": 14155776,
+        "declared_numeric_plan_bytes": 11583197184,
+        "head_numeric_resident_bytes": 308908032,
+        "metric_numeric_workspace_bytes": 210973856,
+        "native_edit_initialization_peak_bytes": 64585728,
+        "native_operator_initialization_bytes": 535443456,
+        "prepared_edit_numeric_bytes": 64585728,
+        "teacher_initialization_peak_reference_bytes": 257949696,
+        "teacher_numeric_bytes": 251658240
+      },
+      "max_native_effect_midpoint_difference": 6.217248937900877e-15,
+      "max_metric_interval_separation": 0.0
+    }
+  ],
+  "numerical_scope": "Analytic intervals enclose exact fixed resulting binary64 raw logits; neural/RMS/gain/GEMM rounding excluded. CPU to CUDA teacher forward empirically validated on fixed80, not a full-network certificate. Native effect differences explicitly reported; no refits/tolerance changes. Default unchanged pending standard-frontier gate.",
+  "speed_scope": "Separate same-program/same-panel/source-pinned warm runs; not cold/warm speed comparison. Native gain largely exact-logit identity early exit; changedCopy gain1.11x, not4.18x. O(rows) directed interval aggregation onhost; neural/head/KL core resident. Immutableteacher reused once/bank."
+}

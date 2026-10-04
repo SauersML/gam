@@ -1,0 +1,37 @@
+{
+  "passes": true,
+  "source_commit": "6f38f322ae568b6460d119cf63c7a31394bc5ed9",
+  "CPU_build_job": 15864,
+  "GPU_gate_job": 15865,
+  "GPU_gate_slurm_seconds": 42,
+  "same_panel": "ed7e6ad66873346383b20b7a2f6294a3ec933eab92d5c728ad12d886530e3e5b",
+  "frozen_parent_episodes": [
+    0,
+    33
+  ],
+  "cold_warm_frozen_classifications_agree": true,
+  "host_analytic_spot_rows": 32,
+  "teacher_init_seconds": 1.027470796,
+  "warm_seconds": [
+    0.228291192,
+    0.590137772
+  ],
+  "warm_transfers": [
+    {
+      "donor_download_bytes": 0,
+      "edit_constant_upload_bytes": 0,
+      "final_residual_download_bytes": 0,
+      "raw_oracle_download_bytes": 0,
+      "residual_upload_bytes": 0
+    },
+    {
+      "donor_download_bytes": 0,
+      "edit_constant_upload_bytes": 0,
+      "final_residual_download_bytes": 0,
+      "raw_oracle_download_bytes": 0,
+      "residual_upload_bytes": 0
+    }
+  ],
+  "max_native_effect_difference": 4.926614671774132e-16,
+  "scope": "Small2episode gate only; actualf64CUDAteacher nativeeffectchange measured, fixedrawlogit interval only excludesneuralforwardrounding. Independenthostoracle downloads occurcoldonly and are recorded."
+}
