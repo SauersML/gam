@@ -128,6 +128,37 @@ fn local_cuda_rejects_host_instead_of_silently_falling_back() {
     assert!(result.err().expect("host must not satisfy required CUDA").contains("float64 accelerator"));
 }
 
+#[test]
+fn every_assessment_preserves_backend_group_envelopes() {
+    use super::acceptance::{EpisodeScore, RunMeasure, StagedAssessment};
+    struct Directed;
+    impl RunCheck for Directed {
+        fn episodes(&self, artifact: &Artifact) -> Result<Vec<EpisodeScore>, String> {
+            Err(format!("acceptance must not re-average directed evidence for the {}-node artifact", artifact.program.nodes.len()))
+        }
+        fn measure(&self, artifact: &Artifact) -> Result<RunMeasure, String> {
+            artifact.program.interfaces().map_err(|e| e.to_string())?;
+            let episodes = vec![EpisodeScore { id: "e".into(), group: "g".into(), kl: 0.25, numerical_error: 0.5,
+                native_effect: 0.0, top1_agree: 1.0, unheld: 0 }];
+            // A deliberately wider group enclosure exercises preservation of
+            // the separately computed band, including its unresolved verdict.
+            Ok(RunMeasure { episodes, groups: vec![("g".into(), 0.25, 0.75, 0.0, 1)] })
+        }
+    }
+    let model = mlp(1.0);
+    let artifact = Artifact::native(&model).unwrap().f32_literals().unwrap();
+    let local = Local::new(&model, mlp_family(), None, 64);
+    let constraint = Constraint { local: 1e-8, run: 0.1 };
+    let check = |result: super::acceptance::Assessment| {
+        assert_eq!(result.run_measure.groups[0].2, 0.75);
+        assert_eq!(result.run.verdict(), FidelityVerdict::Unresolved);
+    };
+    check(assess(&local, &Directed, &artifact, constraint, &mut CostCache::default()).unwrap());
+    check(super::acceptance::assess_once(&local, &Directed, &artifact, constraint, &mut CostCache::default()).unwrap());
+    let staged = super::acceptance::assess_once_local_first(&local, &Directed, &artifact, &[constraint], &mut CostCache::default()).unwrap();
+    match staged { StagedAssessment::Complete(result) => check(result), _ => panic!("native local fidelity must reach Run") }
+}
+
 /// The MLP with its duplicate units merged: exact, ten literals instead of twenty.
 fn merged(model: &OperatorProgram) -> Artifact {
     let start = Artifact::native(model).expect("an artifact");

@@ -173,6 +173,13 @@ impl Resident {
         let node = *self.map.get(root).ok_or("root node outside artifact")?;
         trace.value(node)
     }
+    /// Retain one root value by ownership, releasing the rest of its trace.
+    /// No buffer copy or host transfer is needed for an immutable teacher cache
+    /// or a final candidate state. Streamed/unmaterialized roots are errors.
+    pub fn take_root_value(&self, mut trace: DeviceTrace, root: usize) -> Result<Tensor, String> {
+        let node = *self.map.get(root).ok_or("root node outside artifact")?;
+        trace.values.get_mut(node).and_then(Option::take).ok_or_else(|| "root value not materialized in trace".into())
+    }
     /// Incomplete resident-value memory estimate. Excludes attention workspaces, weights,
     /// exception tensors and allocation overhead. The caller chooses and limits batch rows.
     pub fn estimated_resident_bytes(&self, rows: usize) -> Result<usize, String> {

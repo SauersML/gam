@@ -907,6 +907,14 @@ pub struct EpisodeScore {
 /// The composed disagreement of a decoded artifact over declared episodes.
 pub trait RunCheck: Sync {
     fn episodes(&self, artifact: &Artifact) -> Result<Vec<EpisodeScore>, String>;
+
+    /// Preserve a backend's directed group aggregation when it has stronger
+    /// evidence than averaging rounded episode summaries on the host. Overrides
+    /// must describe the same declared episodes and groups. Legacy evaluators
+    /// retain their existing arithmetic through this default implementation.
+    fn measure(&self, artifact: &Artifact) -> Result<RunMeasure, String> {
+        self.episodes(artifact).map(RunMeasure::of)
+    }
 }
 
 /// What [`RunCheck`] found, by group.
@@ -1169,7 +1177,7 @@ pub fn assess(
         &encoded,
         |decoded: &Artifact| match &known {
             Some((_, measured)) => Ok(measured.clone()),
-            None => run.episodes(decoded).map(RunMeasure::of),
+            None => run.measure(decoded),
         },
         &RunMeasure::default(),
         |measured: &RunMeasure, _| {
@@ -1291,7 +1299,7 @@ fn assess_local_first_decodable<A: super::precision::DecodableArtifact<Decoded =
                 }
                 let measured = local.measure(decoded)?;
                 let rejected = measured.status()?.refutes_at_most(max_local);
-                let run_measure = if rejected { None } else { Some(RunMeasure::of(run.episodes(decoded)?)) };
+                let run_measure = if rejected { None } else { Some(run.measure(decoded)?) };
                 Ok((measured, run_measure))
             },
             |(local, run): &(LocalMeasure, Option<RunMeasure>)| {
@@ -1365,7 +1373,7 @@ impl PreparedAssessment {
                 if decoded_cost != self.cost {
                     return Err("decoded artifact has a different structural cost".into());
                 }
-                Ok((local.measure(decoded)?, RunMeasure::of(run.episodes(decoded)?)))
+                Ok((local.measure(decoded)?, run.measure(decoded)?))
             },
             |(local, run)| Ok([local.status()?, run.status()?]),
             [constraint.local, constraint.run],
