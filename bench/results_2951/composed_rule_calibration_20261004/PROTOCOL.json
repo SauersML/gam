@@ -1,0 +1,10 @@
+{
+  "scope": "Synthetic calibration of automatic structural proposals, joint coefficient fitting, and actual shared/untied bodies. Not pretrained-model discovery or VPD comparison.",
+  "code_commit": "38268a3f76",
+  "candidate_grammar": "one full-vector argument, at most three operations, ReLU / full affine / elementwise multiply; all generated expressions, no pruning based on singleton fits",
+  "target_selection": "all up to three seeded eligible expressions with an internal affine between nonlinear operations; true formula and coefficients excluded from driver inputs",
+  "criterion": "Report continuous decoded training and broader-support heldout maximum row errors, actual standalone C32, matched shared/untied controls, and oracle-topology fitted result. No success threshold adapted to results.",
+  "next_native_work_constraint": "Clean-only Pareto is only a calibration screen. Native intervention prediction must enter fitting and selection before a real-model causal-discovery experiment. Do not discard a causally superior candidate because clean-only Pareto dominated it.",
+  "heldout": "freeze Pareto plus matched controls before loading eval arrays; eval input radius2 versus training radius1; no retuning from eval",
+  "compute": "Small synthetic CPU experiment. No GPU allocation before a consequential native experiment is executable."
+}

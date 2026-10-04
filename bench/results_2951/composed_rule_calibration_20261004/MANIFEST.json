@@ -1,0 +1,309 @@
+{
+  "files": [
+    {
+      "file": "BUDGET_EXTENSION.json",
+      "bytes": 469,
+      "sha256": "62e0956b55a66eb39f9bb06601d2ab5d558b744bb65e38850bbd01f8502b5e4d"
+    },
+    {
+      "file": "PROTOCOL.json",
+      "bytes": 1361,
+      "sha256": "2b522669d396a5329dc73d64bef06bfd2d360f83f7df45a666d515f28b092a91"
+    },
+    {
+      "file": "SUMMARY.json",
+      "bytes": 5953,
+      "sha256": "321c771d46baafb1606f9049c888822e79166633aafb51dda867c7e60cb0ed56"
+    },
+    {
+      "file": "target0-128-INVENTORY.json.gz",
+      "bytes": 1458,
+      "sha256": "b3ef41959dc9e8b48f398991708a254b32f4950236108da03eb060d631e81803"
+    },
+    {
+      "file": "target0-128-PROVENANCE.json.gz",
+      "bytes": 1670,
+      "sha256": "dc742d31b59f1fc5b282a740dae69190aa27a9f65538d0d451471d74b531533d"
+    },
+    {
+      "file": "target0-128-REPORT.json.gz",
+      "bytes": 4240,
+      "sha256": "1d86b55442d1df4ed1c8d49150ed7b12f04aabc43e6e75a40656261c6d471413"
+    },
+    {
+      "file": "target0-128-TRAINING_PARETO.json.gz",
+      "bytes": 902,
+      "sha256": "37a81258a9cd196d25a0b40db4d5a05d46c581403af7133d8a514585abb1946c"
+    },
+    {
+      "file": "target0-128-fits.json.gz",
+      "bytes": 2202,
+      "sha256": "7867f5695aa8b69eae50968164631d7c6d3685fb5c583735bcccbd9bd838bcda"
+    },
+    {
+      "file": "target0-128-generating-form-0.artifact",
+      "bytes": 1780,
+      "sha256": "e0bff1afde82d092df3cb0d77745058c57101cc4a55a4296aef8818b9bc48018"
+    },
+    {
+      "file": "target0-128-generating-form-1.artifact",
+      "bytes": 2207,
+      "sha256": "2c719c57e30f8688ab9b9a765b37ff46f30c8311dab1da6fb1a7fe8a4dbe63dd"
+    },
+    {
+      "file": "target0-128-journal.jsonl.gz",
+      "bytes": 4056,
+      "sha256": "7764d00f09dc3eb26da906cbe565f298a0c69e628b7d9b28c08a95562a326db3"
+    },
+    {
+      "file": "target0-8192-INVENTORY.json.gz",
+      "bytes": 1458,
+      "sha256": "b3ef41959dc9e8b48f398991708a254b32f4950236108da03eb060d631e81803"
+    },
+    {
+      "file": "target0-8192-PROVENANCE.json.gz",
+      "bytes": 1676,
+      "sha256": "7f601c6f9bf631baa8786aa20a5efc1f9d1d74e35a5b869cdd685176fc5e60af"
+    },
+    {
+      "file": "target0-8192-REPORT.json.gz",
+      "bytes": 4559,
+      "sha256": "c6971112d0fe241a8bc53686222f3b738bbf4164eade1b30f1215c10749d2829"
+    },
+    {
+      "file": "target0-8192-TRAINING_PARETO.json.gz",
+      "bytes": 972,
+      "sha256": "cd45740da58d43c2d0b8201b80501e984def90ad8755f396acc36dbf55074d87"
+    },
+    {
+      "file": "target0-8192-fits.json.gz",
+      "bytes": 2533,
+      "sha256": "5635c76dbb22188342f9efa0b64e75d6a564f46b2c866fac6de4542b5e247f3e"
+    },
+    {
+      "file": "target0-8192-generating-form-0.artifact",
+      "bytes": 1820,
+      "sha256": "33e47d8830e4e950519ab1c5f55519b76f5748277d3c8b28645cb3397d465e4f"
+    },
+    {
+      "file": "target0-8192-generating-form-1.artifact",
+      "bytes": 2194,
+      "sha256": "93740578857fa710ab2791357e96ee71aaccd82643766ff036590b166cc7e557"
+    },
+    {
+      "file": "target0-8192-journal.jsonl.gz",
+      "bytes": 4344,
+      "sha256": "e8548b8c73d2075ac8026c15af449f3ae2b027275c74ebec28bbb9271c660f8d"
+    },
+    {
+      "file": "target0-EXTRACT.json",
+      "bytes": 3155,
+      "sha256": "c9072a127c120fe1a177ff67fe3f85a92fa9c024aab1930cfd3f9ad6afba9ce2"
+    },
+    {
+      "file": "target0-GROUND_TRUTH.json",
+      "bytes": 1066,
+      "sha256": "c40d720b2073590f33d3d940ac179c0e8cc378adc4da4e22b03bccbc5e9a9b9a"
+    },
+    {
+      "file": "target0-SETTINGS.json",
+      "bytes": 489,
+      "sha256": "bcdb3be0bee2155c7dc27549b1c5123f8ab72281b1465013177b44782c90c9e3"
+    },
+    {
+      "file": "target0-SETTINGS8192.json",
+      "bytes": 492,
+      "sha256": "1364748c9a8f559aa4b318e17d441b7ce11526d4002fdc1cec8f8ada37005885"
+    },
+    {
+      "file": "target0-eval-use0-input.f64.gz",
+      "bytes": 15652,
+      "sha256": "ac6e147577611719f13ba99ed560f91a54c4972e71c9be15643b0b472baa34b0"
+    },
+    {
+      "file": "target0-eval-use0-write.f64.gz",
+      "bytes": 15745,
+      "sha256": "2f2e60da74efb1ee86d15e381ab9ed2e5ffbc5d96ecd74c98ca138cb6482c70c"
+    },
+    {
+      "file": "target0-eval-use1-input.f64.gz",
+      "bytes": 15643,
+      "sha256": "4cc1dab42638d3dc575745392bc68ea6574d6ca6b599c213645bf68ccb4e5278"
+    },
+    {
+      "file": "target0-eval-use1-write.f64.gz",
+      "bytes": 15754,
+      "sha256": "33a670cd17e2705cdf51b94a37d181dded2d2195280ddae7bd7c9e920d699faf"
+    },
+    {
+      "file": "target0-teacher.artifact",
+      "bytes": 1669,
+      "sha256": "59aa1231e5ac701a47ee8130fa2e6ac6f0b7087d004753e6562c36f4e11028b6"
+    },
+    {
+      "file": "target0-train-use0-input.f64.gz",
+      "bytes": 7849,
+      "sha256": "d16b941c55adf9bc4b9cc96c177b99070a413d54711a6eb1c5f0138883fa7678"
+    },
+    {
+      "file": "target0-train-use0-write.f64.gz",
+      "bytes": 7879,
+      "sha256": "56ebca55438557e2ab33725c2bcd34a068c69db2ff767baa370199c016d98faf"
+    },
+    {
+      "file": "target0-train-use1-input.f64.gz",
+      "bytes": 7851,
+      "sha256": "59ea5595eb955adfb5fef687cd0812cc17c2ba00d06814d152d6cc63ba2b9565"
+    },
+    {
+      "file": "target0-train-use1-write.f64.gz",
+      "bytes": 7880,
+      "sha256": "bcb76ec7389cf8b5ea2d518fe307da8e5acb750dabf8859ba6f85421ce9b7ed7"
+    },
+    {
+      "file": "target1-128-INVENTORY.json.gz",
+      "bytes": 1458,
+      "sha256": "b3ef41959dc9e8b48f398991708a254b32f4950236108da03eb060d631e81803"
+    },
+    {
+      "file": "target1-128-PROVENANCE.json.gz",
+      "bytes": 1664,
+      "sha256": "b11e54d0d190d1c2eaeec2e67647a5f084e4f74462e95a1699ac7c72ac99e4d9"
+    },
+    {
+      "file": "target1-128-REPORT.json.gz",
+      "bytes": 4128,
+      "sha256": "e93ea6021e7dbac185a9b8d27d8a5354ea8b8515f93317ad777658e1859663dd"
+    },
+    {
+      "file": "target1-128-TRAINING_PARETO.json.gz",
+      "bytes": 845,
+      "sha256": "1229558b483a1c71091672a2db12d29c6904eb9ac6903ff5579ad798a8ab019c"
+    },
+    {
+      "file": "target1-128-fits.json.gz",
+      "bytes": 2229,
+      "sha256": "ce52d0709942ca8a4724384ecd7122235fdc510a3909551e000e3dd8de357b6a"
+    },
+    {
+      "file": "target1-128-generating-form-0.artifact",
+      "bytes": 1862,
+      "sha256": "b3c7be41bb5286354ed7a09e6298b29b906410bf129a79ede2ac9e1ab119ea3c"
+    },
+    {
+      "file": "target1-128-generating-form-1.artifact",
+      "bytes": 2229,
+      "sha256": "0ff27ff25b44ab91b3ea0a87469991eb1b155815383e31a3d3a743f01977d589"
+    },
+    {
+      "file": "target1-128-journal.jsonl.gz",
+      "bytes": 3938,
+      "sha256": "d354a349653d2b4b2f5e05262b6b1c6141620ab2083f1b67aead4c84bba422ff"
+    },
+    {
+      "file": "target1-8192-INVENTORY.json.gz",
+      "bytes": 1458,
+      "sha256": "b3ef41959dc9e8b48f398991708a254b32f4950236108da03eb060d631e81803"
+    },
+    {
+      "file": "target1-8192-PROVENANCE.json.gz",
+      "bytes": 1669,
+      "sha256": "4bd3e446a61b5ca3057a717eaeedad9b2fc0f2072bfd235381e48c00c2c63d5c"
+    },
+    {
+      "file": "target1-8192-REPORT.json.gz",
+      "bytes": 4526,
+      "sha256": "6c22390cc756f076901dc9fd9be304fe2a30fbf2e5db0bcb7b094339d641cdfe"
+    },
+    {
+      "file": "target1-8192-TRAINING_PARETO.json.gz",
+      "bytes": 957,
+      "sha256": "260704a1b075d3727f59d5f4cf745b3efdc3e2f746c1f6537f2dcc87f6b424e7"
+    },
+    {
+      "file": "target1-8192-fits.json.gz",
+      "bytes": 2580,
+      "sha256": "3671f5b7f6be9f02e0a99b945351f0e5ffc1db3ef6b27f149bd6d56200d59989"
+    },
+    {
+      "file": "target1-8192-generating-form-0.artifact",
+      "bytes": 1829,
+      "sha256": "138714d0bef4161bc204b3a5023130cc32d069dfb780fc92ffb91e256c938b66"
+    },
+    {
+      "file": "target1-8192-generating-form-1.artifact",
+      "bytes": 2208,
+      "sha256": "6806f0ac9ec955ea51afaf63a1fdcd698ff92f4d1ace222820e7b6c62ca969d2"
+    },
+    {
+      "file": "target1-8192-journal.jsonl.gz",
+      "bytes": 4328,
+      "sha256": "af0690fc72e7926faceab321fe463ecfb77def4e9f0366ffbd4f2e9dac8456a2"
+    },
+    {
+      "file": "target1-EXTRACT.json",
+      "bytes": 3155,
+      "sha256": "c7617f51276799a136a3810dd0b1c19ae6fc1e99a63441a938d34af2a2a4d5a6"
+    },
+    {
+      "file": "target1-GROUND_TRUTH.json",
+      "bytes": 1022,
+      "sha256": "21b3f30a6576d769fff8d97c5ae34cfe8cbcae193796f8ec6562aedda55e8aa6"
+    },
+    {
+      "file": "target1-SETTINGS.json",
+      "bytes": 489,
+      "sha256": "c5c1f290ae0e15b51d13dc703a600a2e60d341b42ccae3fd8a4dbbaa47e59bde"
+    },
+    {
+      "file": "target1-SETTINGS8192.json",
+      "bytes": 492,
+      "sha256": "a1624c1b1900793392a9a22152997e44e39681aa6b27c92dfae35d7366886d30"
+    },
+    {
+      "file": "target1-eval-use0-input.f64.gz",
+      "bytes": 15656,
+      "sha256": "839617896776c2e519729471c91816a939dfd8d3d0530278042fbe372ad742d9"
+    },
+    {
+      "file": "target1-eval-use0-write.f64.gz",
+      "bytes": 15474,
+      "sha256": "150dacec57894f3b853e542699284cf1499881d77c9343c8d814364bfc7097fb"
+    },
+    {
+      "file": "target1-eval-use1-input.f64.gz",
+      "bytes": 15633,
+      "sha256": "052b72b9a9536836c37ae5364750d5c2b7b2c595562e4e7811a02cc46676f785"
+    },
+    {
+      "file": "target1-eval-use1-write.f64.gz",
+      "bytes": 15727,
+      "sha256": "6e3c12e1de5eb6678567153f631107a9e75f8779363540baf9b5e882d909c05c"
+    },
+    {
+      "file": "target1-teacher.artifact",
+      "bytes": 1710,
+      "sha256": "9bb91f08af93b8e5b7d30c28f364853f48097972d29dbe1da708cc879e7ac521"
+    },
+    {
+      "file": "target1-train-use0-input.f64.gz",
+      "bytes": 7856,
+      "sha256": "ecf76a6df506317b470de4e83c537fcfa7975581c88576e47f96c4e4374f825b"
+    },
+    {
+      "file": "target1-train-use0-write.f64.gz",
+      "bytes": 7817,
+      "sha256": "4a55b940dd8c5e418fc71a09a033394e1dc302e78866a306884f89d34fb10654"
+    },
+    {
+      "file": "target1-train-use1-input.f64.gz",
+      "bytes": 7842,
+      "sha256": "7fa18ad8e30b909756a4ec5d6db17b6716695091ef6c4e956bb1ef9dca90b933"
+    },
+    {
+      "file": "target1-train-use1-write.f64.gz",
+      "bytes": 7773,
+      "sha256": "9eea39a6a39f87c157b3eed15fdb90c05c79a00c2d69ded3ec6e5aa2b3c89b8d"
+    }
+  ]
+}

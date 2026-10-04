@@ -1,0 +1,36 @@
+{
+  "eval_seed": 29514000,
+  "expression": {
+    "binary": [
+      "multiply",
+      {
+        "argument": 0
+      },
+      {
+        "affine": {
+          "unary": [
+            "relu",
+            {
+              "argument": 0
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "internal_matrix_distribution": "zero-centered uniform[-sqrt(3/8),sqrt(3/8)]",
+  "internal_offset_distribution": "uniform[-0.2,0.2]",
+  "internal_seed": 29515000,
+  "inventory_expression_id": 32,
+  "maps": "full-width",
+  "scope": "SYNTHETIC CALIBRATION ONLY; targets deliberately selected from search grammar",
+  "search_seed": 29512000,
+  "selection": "PRNG sampling without replacement from eligible internal Affine after ReLU and before product or ReLU; at most three distinct targets",
+  "selection_seed": 29510001,
+  "teacher_execution": "ordinary Rust execution of f32 serialized decoded saved teacher",
+  "teacher_seed": 29511000,
+  "teacher_sha256": "59aa1231e5ac701a47ee8130fa2e6ac6f0b7087d004753e6562c36f4e11028b6",
+  "train_seed": 29513000,
+  "uses": 2,
+  "width": 8
+}

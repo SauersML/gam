@@ -1,0 +1,10 @@
+{
+  "reason": "128-step fits leave training max errors around0.9 and1.0 even for known-present generating topologies. Extend all structures equally to8192 with unchanged LR/seed/grammar. Selection still uses train only.",
+  "initial_results_examined": true,
+  "heldout_scope": "repeated synthetic development evaluation, not a fresh confirmation or LLM evidence",
+  "changed_fields": [
+    "fit.iterations"
+  ],
+  "original_iterations": 128,
+  "new_iterations": 8192
+}

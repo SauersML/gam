@@ -1,0 +1,203 @@
+{
+  "scope": "Synthetic development calibration; not an LLM mechanism, intervention prediction, formal fidelity result or VPD comparison. Correct topology ranking does not imply recovered coefficients or causal mechanism.",
+  "code_commit": "3d891ae03a",
+  "rows": [
+    {
+      "target": 0,
+      "expression": {
+        "binary": [
+          "multiply",
+          {
+            "argument": 0
+          },
+          {
+            "affine": {
+              "unary": [
+                "relu",
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "generating_expression_index": 32,
+      "steps": 128,
+      "proposals": 92,
+      "seconds": 0.6805335,
+      "best_training_id": 64,
+      "best_training_expression_index": 32,
+      "best_training_max": 0.903575922978035,
+      "generating_form_controls": [
+        {
+          "arm": "shared",
+          "id": 64,
+          "training_max": 0.903575922978035,
+          "heldout_max": 1.8871562003995548,
+          "standalone_c32": 12257,
+          "selected_for_heldout": true
+        },
+        {
+          "arm": "untied",
+          "id": 65,
+          "training_max": 0.9510580232636089,
+          "heldout_max": 2.042867907591508,
+          "standalone_c32": 14720,
+          "selected_for_heldout": true
+        }
+      ],
+      "all_training_measured": true
+    },
+    {
+      "target": 0,
+      "expression": {
+        "binary": [
+          "multiply",
+          {
+            "argument": 0
+          },
+          {
+            "affine": {
+              "unary": [
+                "relu",
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "generating_expression_index": 32,
+      "steps": 8192,
+      "proposals": 92,
+      "seconds": 23.539444167,
+      "best_training_id": 64,
+      "best_training_expression_index": 32,
+      "best_training_max": 0.17689905552664573,
+      "generating_form_controls": [
+        {
+          "arm": "shared",
+          "id": 64,
+          "training_max": 0.17689905552664573,
+          "heldout_max": 0.3074424407189561,
+          "standalone_c32": 12257,
+          "selected_for_heldout": true
+        },
+        {
+          "arm": "untied",
+          "id": 65,
+          "training_max": 0.19195951633338929,
+          "heldout_max": 0.39794016745608324,
+          "standalone_c32": 14720,
+          "selected_for_heldout": true
+        }
+      ],
+      "all_training_measured": true
+    },
+    {
+      "target": 1,
+      "expression": {
+        "unary": [
+          "relu",
+          {
+            "affine": {
+              "unary": [
+                "relu",
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "generating_expression_index": 15,
+      "steps": 128,
+      "proposals": 92,
+      "seconds": 0.677009542,
+      "best_training_id": 32,
+      "best_training_expression_index": 16,
+      "best_training_max": 0.6627334451209707,
+      "generating_form_controls": [
+        {
+          "arm": "shared",
+          "id": 30,
+          "training_max": 1.0033843037287637,
+          "heldout_max": null,
+          "standalone_c32": 12258,
+          "selected_for_heldout": false
+        },
+        {
+          "arm": "untied",
+          "id": 31,
+          "training_max": 1.011857992341653,
+          "heldout_max": null,
+          "standalone_c32": 14722,
+          "selected_for_heldout": false
+        }
+      ],
+      "all_training_measured": true
+    },
+    {
+      "target": 1,
+      "expression": {
+        "unary": [
+          "relu",
+          {
+            "affine": {
+              "unary": [
+                "relu",
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "generating_expression_index": 15,
+      "steps": 8192,
+      "proposals": 92,
+      "seconds": 23.563491708,
+      "best_training_id": 30,
+      "best_training_expression_index": 15,
+      "best_training_max": 0.287964567383123,
+      "generating_form_controls": [
+        {
+          "arm": "shared",
+          "id": 30,
+          "training_max": 0.287964567383123,
+          "heldout_max": 0.5468093149382643,
+          "standalone_c32": 12258,
+          "selected_for_heldout": true
+        },
+        {
+          "arm": "untied",
+          "id": 31,
+          "training_max": 0.333774153491486,
+          "heldout_max": 0.9888246333167382,
+          "standalone_c32": 14722,
+          "selected_for_heldout": true
+        }
+      ],
+      "all_training_measured": true
+    }
+  ],
+  "finding": "At 8,192 updates, the generating expression has the lowest training error for both targets. Held-out prediction remains inaccurate. Shared coefficients improve errors on these two deliberately shared synthetic teachers. This does not establish native algorithm recovery.",
+  "selection": "Training-only Pareto plus matched shared/untied controls fixed before heldout arrays loaded.128update results examined before training-error-motivated8192update extension; repeated heldout is exploratory.",
+  "data": "Two independent synthetic 8D input/output uses per target; 128 training rows uniform on [-1,1], 256 evaluation rows uniform on [-2,2]. The teacher has a dense random internal transform and separate input/output maps. Search covers 46 expressions and two sharing modes.",
+  "binaries": [
+    {
+      "name": "search",
+      "path": "/Users/user/gam/.buildd/bin/mpd_composed_rule_search_2951-release-9df80f3db84e",
+      "sha256": "1c9569376e721cb8113bb16415fbc4c41c17d3e435d2b4c45e552732039e23aa"
+    },
+    {
+      "name": "generator",
+      "path": "/Users/user/gam/.buildd/bin/mpd_composed_rule_calibration_2951-release-7802278dbfea",
+      "sha256": "fadfa5c046c667b3aef57cfc1704795746a47412efbad86ccb072572b7bf187b"
+    }
+  ]
+}

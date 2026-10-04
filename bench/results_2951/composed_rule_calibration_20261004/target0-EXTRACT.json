@@ -1,0 +1,115 @@
+{
+  "panels": [
+    {
+      "name": "train",
+      "record": {
+        "config": {
+          "serialization": "f32",
+          "synthetic": true,
+          "uses": 2,
+          "width": 8
+        },
+        "distribution": "uniform",
+        "range": [
+          -1.0,
+          1.0
+        ],
+        "scope": "SYNTHETIC CALIBRATION ONLY",
+        "source": {
+          "checkpoint_sha256": "59aa1231e5ac701a47ee8130fa2e6ac6f0b7087d004753e6562c36f4e11028b6"
+        }
+      },
+      "rows": 128,
+      "values": [
+        {
+          "encoding": "f64_le",
+          "file": "train-use0-input.f64",
+          "layer": 0,
+          "role": "input",
+          "sha256": "6b1aa102c67e881e8225100b8baf3eea181c38417735e9ab4edbabe883d13591",
+          "width": 8
+        },
+        {
+          "encoding": "f64_le",
+          "file": "train-use0-write.f64",
+          "layer": 0,
+          "role": "write",
+          "sha256": "50716575ec85b0f87f9371ddd60ba86bd037efb0fe850e15688b31102d89127f",
+          "width": 8
+        },
+        {
+          "encoding": "f64_le",
+          "file": "train-use1-input.f64",
+          "layer": 1,
+          "role": "input",
+          "sha256": "2398e657fab11e06ab70e76d2c36aa510008fca86c3c40a4534b25a4890f38d7",
+          "width": 8
+        },
+        {
+          "encoding": "f64_le",
+          "file": "train-use1-write.f64",
+          "layer": 1,
+          "role": "write",
+          "sha256": "0eff7e95ae512884f0aa774cea45f435b4944583666739e2056f2f9c63aa31bd",
+          "width": 8
+        }
+      ]
+    },
+    {
+      "name": "eval",
+      "record": {
+        "config": {
+          "serialization": "f32",
+          "synthetic": true,
+          "uses": 2,
+          "width": 8
+        },
+        "distribution": "uniform",
+        "range": [
+          -2.0,
+          2.0
+        ],
+        "scope": "SYNTHETIC CALIBRATION ONLY",
+        "source": {
+          "checkpoint_sha256": "59aa1231e5ac701a47ee8130fa2e6ac6f0b7087d004753e6562c36f4e11028b6"
+        }
+      },
+      "rows": 256,
+      "values": [
+        {
+          "encoding": "f64_le",
+          "file": "eval-use0-input.f64",
+          "layer": 0,
+          "role": "input",
+          "sha256": "ba18e2fe126cd445f92ad3e8a3e48b8bbfca425ac18379bd85d7c94452f08802",
+          "width": 8
+        },
+        {
+          "encoding": "f64_le",
+          "file": "eval-use0-write.f64",
+          "layer": 0,
+          "role": "write",
+          "sha256": "1d8940a50cd7177a6db6bd4ce3ab23a93ef23a1f4c1cda690e648bcff7982379",
+          "width": 8
+        },
+        {
+          "encoding": "f64_le",
+          "file": "eval-use1-input.f64",
+          "layer": 1,
+          "role": "input",
+          "sha256": "5864f16d1c2a0e4c52ffe2c8931fbeeab48ffe97a1b7a15b429b776f6722c53b",
+          "width": 8
+        },
+        {
+          "encoding": "f64_le",
+          "file": "eval-use1-write.f64",
+          "layer": 1,
+          "role": "write",
+          "sha256": "44465f2f1e587e40bbc1bfc7008b4abb8f3b1f478cbdd156230ee7972c379731",
+          "width": 8
+        }
+      ]
+    }
+  ],
+  "scope": "SYNTHETIC CALIBRATION ONLY; no pretrained-model or blind discovery evidence"
+}
