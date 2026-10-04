@@ -35,6 +35,12 @@ impl ProposalArithmetic {
     }
 }
 
+/// Finite training-only trial schedule: 1, factor, ..., factor^(max_trials-1).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Backtracking {
+    pub factor: f64,
+    pub max_trials: usize,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
     pub iterations: usize,
@@ -48,6 +54,8 @@ pub struct Settings {
     /// Explicit optional fast proposal products; f64 preserves previous experiment settings.
     #[serde(default)]
     pub arithmetic: ProposalArithmetic,
+    #[serde(default)]
+    pub backtracking: Option<Backtracking>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Iteration {
@@ -107,6 +115,13 @@ pub struct GroupMeasurement {
     pub scales: Vec<GroupScale>,
 }
 #[derive(Clone, Debug, Serialize)]
+pub struct BacktrackingTrial {
+    pub proposed_step: usize,
+    pub multiplier: f64,
+    pub training_max: f64,
+    pub accepted: bool,
+}
+#[derive(Clone, Debug, Serialize)]
 pub struct GroupReport {
     pub settings: Settings,
     pub trainable: Vec<usize>,
@@ -117,6 +132,11 @@ pub struct GroupReport {
     pub initial_training_max: f64,
     pub best_training_max: f64,
     pub best_training_groups: Vec<f64>,
+    pub accepted_steps: usize,
+    pub trial_training_evaluations: usize,
+    pub backtracking_trials: Vec<BacktrackingTrial>,
+    pub stop_reason: &'static str,
+    pub backtracking_seconds: f64,
     pub initial_validation: GroupMeasurement,
     pub final_validation: GroupMeasurement,
     pub best_step: usize,
@@ -235,6 +255,15 @@ fn validate_settings(s: &Settings) -> Result<(), String> {
         || !(0. ..1.).contains(&s.beta2)
     {
         return Err("invalid explicit optimizer settings".into());
+    }
+    if let Some(b) = &s.backtracking {
+        if !b.factor.is_finite()
+            || !(0. ..1.).contains(&b.factor)
+            || b.factor == 0.
+            || b.max_trials == 0
+        {
+            return Err("invalid explicit backtracking schedule".into());
+        }
     }
     Ok(())
 }
@@ -533,7 +562,11 @@ pub fn fit_grouped(
     let planned = sum_bytes(&[
         program.operator_numeric_bytes()?,
         parameters
-            .checked_mul(10)
+            .checked_mul(if settings.backtracking.is_some() {
+                16
+            } else {
+                10
+            })
             .ok_or("parameter plan overflow")?,
         panels,
         trace_bytes.checked_mul(3).ok_or("trace plan overflow")?,
@@ -567,6 +600,10 @@ pub fn fit_grouped(
     let mut best_step = 0;
     let mut best_training_groups = Vec::new();
     let mut history = Vec::new();
+    let mut accepted_steps = 0;
+    let mut backtracking_trials = Vec::new();
+    let mut backtracking_seconds = 0.;
+    let mut stop_reason = "iteration_budget";
     for step in 0..=settings.iterations {
         let score = training.scan(&program, settings.forward_rows)?;
         let (row, group, value) = (score.worst_row, score.worst_group, score.maximum);
@@ -584,6 +621,9 @@ pub fn fit_grouped(
             best = snapshot(&program, trainable)?;
         }
         if step == settings.iterations || value == 0. {
+            if value == 0. {
+                stop_reason = "zero_training_maximum";
+            }
             break;
         }
         // An active row is a subgradient of max row norm; deterministic first-row tie.
@@ -619,21 +659,88 @@ pub fn fit_grouped(
             trainable,
             settings.arithmetic.device(),
         )?;
-        for &index in trainable {
-            let mut value = d
-                .copy(program.dense_parameter(index)?)
+        if let Some(schedule) = &settings.backtracking {
+            let trial_started = Instant::now();
+            let old = snapshot(&program, trainable)?;
+            let mut proposed_moments = BTreeMap::new();
+            let mut displacement = BTreeMap::new();
+            for &index in trainable {
+                let previous = old.get(&index).ok_or("missing old parameter")?;
+                let mut next = d.copy(previous).map_err(|e| e.to_string())?;
+                let (m, v) = moments.get(&index).ok_or("missing moment pair")?;
+                let mut nm = d.copy(m).map_err(|e| e.to_string())?;
+                let mut nv = d.copy(v).map_err(|e| e.to_string())?;
+                d.adam(
+                    &mut next,
+                    (&mut nm, &mut nv),
+                    gradients.get(&index).ok_or("missing gradient")?,
+                    settings.learning_rate,
+                    (settings.beta1, settings.beta2, settings.epsilon),
+                    (accepted_steps + 1) as u64,
+                )
                 .map_err(|e| e.to_string())?;
-            let (m, v) = moments.get_mut(&index).ok_or("missing moment pair")?;
-            d.adam(
-                &mut value,
-                (m, v),
-                gradients.get(&index).ok_or("missing gradient")?,
-                settings.learning_rate,
-                (settings.beta1, settings.beta2, settings.epsilon),
-                (step + 1) as u64,
-            )
-            .map_err(|e| e.to_string())?;
-            program.replace_dense_parameter(index, value)?;
+                d.axpy(&mut next, -1., previous)
+                    .map_err(|e| e.to_string())?;
+                displacement.insert(index, next);
+                proposed_moments.insert(index, (nm, nv));
+            }
+            let mut multiplier = 1.;
+            let mut accepted = false;
+            for _ in 0..schedule.max_trials {
+                for &index in trainable {
+                    let mut trial = d
+                        .copy(old.get(&index).ok_or("missing old parameter")?)
+                        .map_err(|e| e.to_string())?;
+                    d.axpy(
+                        &mut trial,
+                        multiplier,
+                        displacement.get(&index).ok_or("missing displacement")?,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    program.replace_dense_parameter(index, trial)?;
+                }
+                let trial = training.scan(&program, settings.forward_rows)?;
+                accepted = trial.maximum < value;
+                backtracking_trials.push(BacktrackingTrial {
+                    proposed_step: step + 1,
+                    multiplier,
+                    training_max: trial.maximum,
+                    accepted,
+                });
+                if accepted {
+                    break;
+                }
+                multiplier *= schedule.factor;
+            }
+            backtracking_seconds += trial_started.elapsed().as_secs_f64();
+            if accepted {
+                moments = proposed_moments;
+                accepted_steps += 1;
+            } else {
+                for (index, parameter) in old {
+                    program.replace_dense_parameter(index, parameter)?;
+                }
+                stop_reason = "no_strict_training_decrease_in_declared_trials";
+                break;
+            }
+        } else {
+            for &index in trainable {
+                let mut value = d
+                    .copy(program.dense_parameter(index)?)
+                    .map_err(|e| e.to_string())?;
+                let (m, v) = moments.get_mut(&index).ok_or("missing moment pair")?;
+                d.adam(
+                    &mut value,
+                    (m, v),
+                    gradients.get(&index).ok_or("missing gradient")?,
+                    settings.learning_rate,
+                    (settings.beta1, settings.beta2, settings.epsilon),
+                    (step + 1) as u64,
+                )
+                .map_err(|e| e.to_string())?;
+                program.replace_dense_parameter(index, value)?;
+            }
+            accepted_steps += 1;
         }
     }
     for (index, value) in best {
@@ -674,13 +781,18 @@ pub fn fit_grouped(
             initial_training_max,
             best_training_max: best_value,
             best_training_groups,
+            accepted_steps,
+            trial_training_evaluations: backtracking_trials.len(),
+            backtracking_trials,
+            stop_reason,
+            backtracking_seconds,
             initial_validation,
             final_validation,
             best_step,
             iterations: history,
             planned_numeric_bytes: planned,
             seconds: started.elapsed().as_secs_f64(),
-            scope: "Proposal optimization only, fixed finite f64 input/output rows. Explicit settings.arithmetic governs forward and backward products, including training/validation proposal scores; parameter/moment storage and other primitives remain f64. The f32 option uses rounded-product surrogate gradients, not derivatives through rounding. Maximum over ALL output groups and rows, each group normalized by its own complete native-family RMS. Deterministic active-group/row max-norm Adam; full row scan in declared chunks and one-row reverse. Single-row GEMM rounding may differ from batch; recomputed error recorded; nonconvex, no optimum certificate. Best training snapshot, validation excluded from selection. Resident numerical parameters/gradients/moments/inputs/targets; O(rows) norms downloaded each step and final parameters downloaded. Numeric plan excludes product conversion/library/allocator/context/register/spill scratch. Final decoded f64 measurement and acceptance are separate.",
+            scope: "Proposal optimization only, fixed finite f64 input/output rows. Explicit settings.arithmetic governs forward and backward products, including training/validation proposal scores; parameter/moment storage and other primitives remain f64. The f32 option uses rounded-product surrogate gradients, not derivatives through rounding. Maximum over ALL output groups and rows, each group normalized by its own complete native-family RMS. Optional declared finite backtracking scans the SAME full training maximum and accepts only strict decrease; proposed moments and Adam time commit only with an accepted step, exhaustion restores old parameters and stops. Default uses original fixed-step Adam. Deterministic active-group/row max-norm Adam; full row scan in declared chunks and one-row reverse. Single-row GEMM rounding may differ from batch; recomputed error recorded; nonconvex, no optimum certificate. Best training snapshot, validation excluded from selection. Resident numerical parameters/gradients/moments/inputs/targets; O(rows) norms downloaded each step and final parameters downloaded. Numeric plan excludes product conversion/library/allocator/context/register/spill scratch. Final decoded f64 measurement and acceptance are separate.",
         },
     })
 }
@@ -900,7 +1012,78 @@ mod tests {
             epsilon: 1e-8,
             numeric_bytes: 1 << 20,
             arithmetic: ProposalArithmetic::F64,
+            backtracking: None,
         }
+    }
+    #[test]
+    fn backtracking_corrects_overshoot_and_stops_without_committing_rejected_step() {
+        let p = model(0.6, 0.1);
+        let teacher = model(1.2, -0.2);
+        let x = ndarray::array![[-1.2], [-0.3], [0.4], [1.1], [1.8]];
+        let y = target(&teacher, &x);
+        let d = Device::host();
+        let groups = vec![OutputGroup {
+            label: "all".into(),
+            start: 0,
+            end: y.ncols(),
+        }];
+        let run = |trials| {
+            let mut s = settings();
+            s.iterations = 1;
+            s.learning_rate = 100.;
+            s.backtracking = Some(Backtracking {
+                factor: 0.5,
+                max_trials: trials,
+            });
+            fit_grouped(
+                &d,
+                &p,
+                std::slice::from_ref(&x),
+                &y,
+                std::slice::from_ref(&x),
+                &y,
+                &groups,
+                &[0, 1],
+                s,
+            )
+            .expect("bounded trial fit")
+        };
+        let rejected = run(1);
+        assert_eq!(rejected.report.accepted_steps, 0);
+        assert_eq!(rejected.report.trial_training_evaluations, 1);
+        assert_eq!(
+            rejected.report.stop_reason,
+            "no_strict_training_decrease_in_declared_trials"
+        );
+        assert_eq!(target(&rejected.program, &x), target(&p, &x));
+        let corrected = run(16);
+        assert_eq!(corrected.report.accepted_steps, 1);
+        assert!(corrected.report.trial_training_evaluations > 1);
+        assert!(corrected.report.best_training_max < corrected.report.initial_training_max);
+        assert!(
+            corrected
+                .report
+                .backtracking_trials
+                .last()
+                .expect("accepted trial")
+                .accepted
+        );
+    }
+    #[test]
+    fn absent_backtracking_preserves_legacy_settings() {
+        let mut value = serde_json::to_value(settings()).expect("settings JSON");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("backtracking");
+        let decoded: Settings = serde_json::from_value(value).expect("legacy settings");
+        assert!(decoded.backtracking.is_none());
+        let mut invalid = settings();
+        invalid.backtracking = Some(Backtracking {
+            factor: 1.,
+            max_trials: 2,
+        });
+        assert!(validate_settings(&invalid).is_err());
     }
     #[test]
     fn proposal_product_arithmetic_is_explicit_and_measurement_remains_f64() {
