@@ -1,0 +1,4 @@
+{"file":"/Users/user/mpd-data/cluster/codex-affine-mlp-9c504de18084/extract/train.0.write.f64","rows":4096,"width":768,"native_rms":5.841447164972782,"zero_prediction_max_normalized_error":1.8001839144185503}
+{"file":"/Users/user/mpd-data/cluster/codex-affine-mlp-9c504de18084/extract/train.1.write.f64","rows":4096,"width":768,"native_rms":11.052116910840676,"zero_prediction_max_normalized_error":21.28767715125809}
+{"file":"/Users/user/mpd-data/cluster/codex-affine-mlp-9c504de18084/extract/eval.0.write.f64","rows":1024,"width":768,"native_rms":5.813256419655338,"zero_prediction_max_normalized_error":1.9779481410702}
+{"file":"/Users/user/mpd-data/cluster/codex-affine-mlp-9c504de18084/extract/eval.1.write.f64","rows":1024,"width":768,"native_rms":12.19254311226203,"zero_prediction_max_normalized_error":19.96460154877362}

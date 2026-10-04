@@ -1,0 +1,446 @@
+{
+  "arrays": [
+    {
+      "eval_input": {
+        "descriptor": {
+          "file": "eval.0.input.f64",
+          "layer": 0,
+          "native_node": 31,
+          "role": "input",
+          "sha256": "b4ae98333279ea3d03113d21db37c1e20fd5f4a473d37d99594a7c0aa0643c9a",
+          "width": 768
+        },
+        "sha256": "b4ae98333279ea3d03113d21db37c1e20fd5f4a473d37d99594a7c0aa0643c9a"
+      },
+      "eval_write": {
+        "descriptor": {
+          "file": "eval.0.write.f64",
+          "layer": 0,
+          "native_node": 34,
+          "role": "write",
+          "sha256": "427e8363644b6feca9de7745d6d400e7a85d0caed3cd40d1e38a48bf1870b8e9",
+          "width": 768
+        },
+        "sha256": "427e8363644b6feca9de7745d6d400e7a85d0caed3cd40d1e38a48bf1870b8e9"
+      },
+      "train_input": {
+        "descriptor": {
+          "file": "train.0.input.f64",
+          "layer": 0,
+          "native_node": 31,
+          "role": "input",
+          "sha256": "ccbe2110679a53e9212d1639728581b9f71451c51f22c85cc931b940739ed5b2",
+          "width": 768
+        },
+        "sha256": "ccbe2110679a53e9212d1639728581b9f71451c51f22c85cc931b940739ed5b2"
+      },
+      "train_write": {
+        "descriptor": {
+          "file": "train.0.write.f64",
+          "layer": 0,
+          "native_node": 34,
+          "role": "write",
+          "sha256": "9a540efcdf266888efbc2acaf01f93a0ea3ee11f25933c8901153575a009eadd",
+          "width": 768
+        },
+        "sha256": "9a540efcdf266888efbc2acaf01f93a0ea3ee11f25933c8901153575a009eadd"
+      },
+      "use": 0
+    },
+    {
+      "eval_input": {
+        "descriptor": {
+          "file": "eval.1.input.f64",
+          "layer": 1,
+          "native_node": 65,
+          "role": "input",
+          "sha256": "5ea08fabcb9e3ff6b59ffb6f2a17bba1879ac8edbb6e925f801d0c4bf04d1156",
+          "width": 768
+        },
+        "sha256": "5ea08fabcb9e3ff6b59ffb6f2a17bba1879ac8edbb6e925f801d0c4bf04d1156"
+      },
+      "eval_write": {
+        "descriptor": {
+          "file": "eval.1.write.f64",
+          "layer": 1,
+          "native_node": 68,
+          "role": "write",
+          "sha256": "0d0015b041f4ada6a0562e6dfe2443b0a7e371de933dbb279feab2590f941fc1",
+          "width": 768
+        },
+        "sha256": "0d0015b041f4ada6a0562e6dfe2443b0a7e371de933dbb279feab2590f941fc1"
+      },
+      "train_input": {
+        "descriptor": {
+          "file": "train.1.input.f64",
+          "layer": 1,
+          "native_node": 65,
+          "role": "input",
+          "sha256": "d9d959c2b32046119813ff370b9e8ad4786a535e0620dc6cf64fc90a61cde76a",
+          "width": 768
+        },
+        "sha256": "d9d959c2b32046119813ff370b9e8ad4786a535e0620dc6cf64fc90a61cde76a"
+      },
+      "train_write": {
+        "descriptor": {
+          "file": "train.1.write.f64",
+          "layer": 1,
+          "native_node": 68,
+          "role": "write",
+          "sha256": "e4a8424ca7c4bd458b45dc69db0f9381cd138b6f8d6d6cc93460110a9992a948",
+          "width": 768
+        },
+        "sha256": "e4a8424ca7c4bd458b45dc69db0f9381cd138b6f8d6d6cc93460110a9992a948"
+      },
+      "use": 1
+    }
+  ],
+  "binary_sha256": "9b4a11cd95c2712b1cd675b8a1a97046d608a62fe0deeca1e36cee63c3d71406",
+  "body_operators": [
+    0,
+    1
+  ],
+  "claim_scope": "supplied GELU architecture; learned overcomplete numerical geometry diagnostic, not interpreted algorithm recovery",
+  "config": {
+    "arm": "learned",
+    "evaluation_tokens": 1024,
+    "export_json_sha256": "1af0aface5a0ca843624310daac12c0ff770a0cc24aa96550c130d11de77bb68",
+    "extract_sha256": "e914269c811d00503b93167a66bbd761d196c76fd8dd44fd18698532bd4a565e",
+    "scope": "first jointly fit learned numerical geometry gate, supplied GELU architecture not law discovery",
+    "seed": 2951,
+    "settings": {
+      "arithmetic": "f32",
+      "beta1": 0.9,
+      "beta2": 0.999,
+      "epsilon": 1e-8,
+      "forward_rows": 128,
+      "iterations": 32,
+      "learning_rate": 0.001,
+      "numeric_bytes": 2147483648
+    },
+    "site_rows_per_scan": 8192,
+    "source_commit": "f822a31137cabe77610909e296f7649697f173fd",
+    "transfer_status": "not in first gate",
+    "unique_training_tokens": 4096,
+    "unmeasured_controls": [
+      "frozen_native",
+      "frozen_random",
+      "untied"
+    ],
+    "uses": [
+      0,
+      1
+    ]
+  },
+  "config_sha256": "ce2a3addc153a47d991dfc9e0d55fa57aad9c3ea7904c481ce0349cce8abddf3",
+  "data_scope": "4096 unique aligned training tokens,8192site-row targets; eval1024 previously examined project tokens, not untouched confirmation",
+  "export_record": {
+    "config": {
+      "d_mlp": 3072,
+      "d_model": 768,
+      "head_dim": 128,
+      "mlp_act": "gelu_tanh",
+      "n_ctx": 512,
+      "n_heads": 6,
+      "n_kv_heads": 6,
+      "n_layers": 4,
+      "norm_eps": 1e-6,
+      "rope_pairing": "rotate_half",
+      "rope_theta": 10000.0,
+      "tied_embeddings": true,
+      "vocab": 50277
+    },
+    "files": {
+      "blocks.0.attn.k_proj": {
+        "sha256": "099f96cd49e2f8daf2c6417d8510f54a14792d495a60c65c34c6fe233fc73614",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.0.attn.o_proj": {
+        "sha256": "aea57bbf855586fadb200d81d543b29f7de9da0f2c0cca24994925e1c46bc8ae",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.0.attn.q_proj": {
+        "sha256": "ea38c22ce7e3855ebdbccc06e87b75619e5b3fee33f3bee9a7329936bb4f2238",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.0.attn.v_proj": {
+        "sha256": "5d741828c2a0684a4448dbd8434ce3d92e9e24bc38da324967890fa2254d7bf3",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.0.mlp.c_fc": {
+        "sha256": "ce3f0e13143fb1b7d31ad01fe75e38e39bf8cd67ef6b8309dd566d8bc2983275",
+        "shape": [
+          3072,
+          768
+        ]
+      },
+      "blocks.0.mlp.down_proj": {
+        "sha256": "05d2abd83af9be70a453c7e7b499af6100d5c1b5379268ab5a5919f42e0ac384",
+        "shape": [
+          768,
+          3072
+        ]
+      },
+      "blocks.0.rms1.gain": {
+        "sha256": "f7caac93fc2ebcf2064255c345213c199c25858479067ba8afeb7778ef9ba56e",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "blocks.0.rms2.gain": {
+        "sha256": "77f3b52b042773fdcd76b77a28e4efc66764f1e40f1b22ddc5e8bd407b0ad388",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "blocks.1.attn.k_proj": {
+        "sha256": "a50cbbf9738af28cf9b7d64885d2f6ed481ebebf9b4ed5b20aa20c8a67a71bf3",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.1.attn.o_proj": {
+        "sha256": "c5c7d591b66b11791c6bd77a55ec4f8ef029e0a03b1061e8413e411a1d46d7be",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.1.attn.q_proj": {
+        "sha256": "e866af792279b999dd7164d7b203971b3776902e764452217653f0536c8f9227",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.1.attn.v_proj": {
+        "sha256": "12e2189b69665c35f4d1e41bed8229080ccb95bfd2ac6f09d2d9a15b6162679b",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.1.mlp.c_fc": {
+        "sha256": "5250793ece9b1bef04c275c1b59f48f5cccb9c971dd898d0a4f5777fcafad5c8",
+        "shape": [
+          3072,
+          768
+        ]
+      },
+      "blocks.1.mlp.down_proj": {
+        "sha256": "ec12769ec6cf2a735d67609ec4eb9fc155b4f3160d217340a0ddd19ab16a307d",
+        "shape": [
+          768,
+          3072
+        ]
+      },
+      "blocks.1.rms1.gain": {
+        "sha256": "cd82df137c7b3c6958ba09ae522712751550e6ca94365e0745f942ef3468aa7e",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "blocks.1.rms2.gain": {
+        "sha256": "e80940662353b21caa38d7c8b9f39d242ac7eca50b8f2a9b8b7e34b0d2073633",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "blocks.2.attn.k_proj": {
+        "sha256": "f870446110c824cc9330b00e8a96665757ebea6d231eb8403cd290d143991316",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.2.attn.o_proj": {
+        "sha256": "93291c198cb318df017cd12b276420d980a57eb6bb214f70d4ffb8cf4057fb44",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.2.attn.q_proj": {
+        "sha256": "c3e8e98f26dffacd097b4342dafc04f22b6bfe2379f5db7307558fb3d95caef6",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.2.attn.v_proj": {
+        "sha256": "9c03b34c8772c92484d0fea39238c06b63dbb115c73baa53fbd55915bad197c6",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.2.mlp.c_fc": {
+        "sha256": "07f0c6a137fd648b749f9acece581431a9a73ecdd6881f81633f618317dbd0dc",
+        "shape": [
+          3072,
+          768
+        ]
+      },
+      "blocks.2.mlp.down_proj": {
+        "sha256": "0edbdf22096909f99ac92b91221195e22e4a0957d59d791cc22fb58cf6b3a579",
+        "shape": [
+          768,
+          3072
+        ]
+      },
+      "blocks.2.rms1.gain": {
+        "sha256": "9d8a578f86b90b79d61d05d3c4a4119124061f354f60278890ae73d85b843042",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "blocks.2.rms2.gain": {
+        "sha256": "b770fa4d1c6b2ef24f605360523abfb073bd4ed62f446b9ee388bdc57614d13d",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "blocks.3.attn.k_proj": {
+        "sha256": "dc19a593d43427d44769f9ea9b0b827851d357d849300d9b882fdd39db4f8928",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.3.attn.o_proj": {
+        "sha256": "5fc3bb75250b6bf15c1aa627bf73ca7e26d6c4c6353ad2915cccf0d5d1977c64",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.3.attn.q_proj": {
+        "sha256": "bfd4e26e3569a36425684702f7c834325cf0422737588b8b7dfd3ca666631b2b",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.3.attn.v_proj": {
+        "sha256": "ca73d04bad13b91b732e5c22b5504d2b410c67bbd279b2538dcbb750d6e5ec82",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.3.mlp.c_fc": {
+        "sha256": "dba21fcffeeee199085ba1fd887d2009193bcda317f67069bd635cf38c8f71f5",
+        "shape": [
+          3072,
+          768
+        ]
+      },
+      "blocks.3.mlp.down_proj": {
+        "sha256": "a9820c075dffdce736341eb48494f5d03459dca6b4f8f198df7e78771c12ae1f",
+        "shape": [
+          768,
+          3072
+        ]
+      },
+      "blocks.3.rms1.gain": {
+        "sha256": "0c0caddb7cab377379a952263d994e6a6a4e0235d1528a6cfa604da7fcad34a0",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "blocks.3.rms2.gain": {
+        "sha256": "a9e54165b55f00b9fba493dec03ecdd3b140913251d0aff66b6c7bea7d26018a",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "final_norm.gain": {
+        "sha256": "30518f54acc7d36d0a4533956c7d8f0bb9d1bda5f2cddae0fddac7c2f071b665",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "logits_row0": {
+        "sha256": "27786f5eaf424ae3a1b9e719c660726a852d37545233fb4780b55162058d8ae9",
+        "shape": [
+          512,
+          50277
+        ]
+      },
+      "tokens": {
+        "shape": [
+          32,
+          513
+        ]
+      },
+      "wte": {
+        "sha256": "81625bc04736ddf55792b57cc5e9ccb59bc35bbaf4fd6d7d3ac0472da65b7a52",
+        "shape": [
+          50277,
+          768
+        ]
+      }
+    },
+    "reference_forward": "~/mpd-data/vpd/vpd_model.py Target (pre-RMSNorm w * x * rsqrt(mean x^2 + eps); rotate-half RoPE on q, k; causal softmax(q k^T / sqrt(hd)); GELU tanh; final RMSNorm; logits = x @ wte^T)",
+    "source": {
+      "checkpoint": "/Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors",
+      "checkpoint_sha256": "155e0e9ee8f899ab100bdb84224751308ae86ed57f746dbea403b93276a96552",
+      "context": 512,
+      "data": "danbraunai/pile-uncopyrighted-tok-shuffled val-00000-of-00012.parquet",
+      "logits": "fp32 forward on MPS (vpd_model.Target), widened to f64",
+      "target_run": "goodfire/spd/runs/t-9d2b8f02",
+      "token_rows": "the frontier's 32 eval rows from val 1024 (rows 96..127 of vpd4l_stream)",
+      "topk": 64
+    }
+  },
+  "extract_sha256": "e914269c811d00503b93167a66bbd761d196c76fd8dd44fd18698532bd4a565e",
+  "groups": [
+    {
+      "end": 768,
+      "label": "nativeMLP0",
+      "start": 0
+    },
+    {
+      "end": 1536,
+      "label": "nativeMLP1",
+      "start": 768
+    }
+  ],
+  "initialization": "all arms native use0 reader geometry except declared seeded random; per-use native writers; identity input bindings; untied starts identical effective use0 readers",
+  "source_sha256": "80b1558382c01efee7197a226eafc1ac13e08511933e7256232fbe7a07f5241b",
+  "trainable": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "transfer_status": "discovery stage only"
+}

@@ -1,0 +1,15 @@
+{
+  "source_commit": "f822a31137cabe77610909e296f7649697f173fd",
+  "job": "15907",
+  "command": [
+    "/mnt/nw/home/s.sauers/mpd-bin-targeted/f822a31137ca/mpd_shared_geometry_fit_2951",
+    "/mnt/nw/home/s.sauers/mpd-data/engine/vpd4l_frontier32",
+    "/mnt/nw/home/s.sauers/mpd-data/cluster/codex-affine-mlp-9c504de18084/extract/EXTRACT.json",
+    "/mnt/nw/home/s.sauers/mpd-data/bench/codex-shared-geometry-fit/retry-f822/learned-gate.json",
+    "/mnt/nw/home/s.sauers/mpd-data/cluster/codex-shared-geometry-learned-f822/measurement",
+    "cuda"
+  ],
+  "config_sha256": "ce2a3addc153a47d991dfc9e0d55fa57aad9c3ea7904c481ce0349cce8abddf3",
+  "binary_sha256": "9b4a11cd95c2712b1cd675b8a1a97046d608a62fe0deeca1e36cee63c3d71406",
+  "aggregate_fit_cap_gpu_seconds": 3600
+}

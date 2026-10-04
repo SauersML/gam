@@ -1,0 +1,439 @@
+{
+  "body_transfer": "not measured",
+  "fitted_pool_sha256": "9a01d362dc470b290d9019851f55e5c6c2c89df602757bcc11be18a939b14bac",
+  "full_native_graft_acceptance": "not measured; must load pool once and preserve sharedbody during actualgraft",
+  "function_exports": [
+    {
+      "native_use": 0,
+      "path": "/mnt/nw/home/s.sauers/mpd-data/cluster/codex-shared-geometry-learned-f822/measurement/use0.artifact",
+      "sha256": "1cc80e4146bac65c327ad14e96358386dea7898c9bdec6ac2164d69341b11785",
+      "standalone_cost_not_joint_cost": 264438675
+    },
+    {
+      "native_use": 1,
+      "path": "/mnt/nw/home/s.sauers/mpd-data/cluster/codex-shared-geometry-learned-f822/measurement/use1.artifact",
+      "sha256": "0b2cb0914c4f165c67fdaf8b4087a8549d0f9c25716a7e8ee43ad886d2360b85",
+      "standalone_cost_not_joint_cost": 264438675
+    }
+  ],
+  "optimizer": {
+    "best_step": 32,
+    "best_training_groups": [
+      0.844999916653846,
+      2.8071170313255847
+    ],
+    "best_training_max": 2.8071170313255847,
+    "final_validation": {
+      "group_maxima": [
+        0.7913224234119076,
+        5.772952766603486
+      ],
+      "maximum": 5.772952766603486,
+      "scales": [
+        {
+          "group": {
+            "end": 768,
+            "label": "nativeMLP0",
+            "start": 0
+          },
+          "native_rms": 5.813256419655365
+        },
+        {
+          "group": {
+            "end": 1536,
+            "label": "nativeMLP1",
+            "start": 768
+          },
+          "native_rms": 12.192543112261813
+        }
+      ],
+      "worst_group": 1,
+      "worst_row": 1
+    },
+    "initial_training_max": 21.291724626140002,
+    "initial_validation": {
+      "group_maxima": [
+        5.01196718983401e-7,
+        20.078435410519422
+      ],
+      "maximum": 20.078435410519422,
+      "scales": [
+        {
+          "group": {
+            "end": 768,
+            "label": "nativeMLP0",
+            "start": 0
+          },
+          "native_rms": 5.813256419655365
+        },
+        {
+          "group": {
+            "end": 1536,
+            "label": "nativeMLP1",
+            "start": 768
+          },
+          "native_rms": 12.192543112261813
+        }
+      ],
+      "worst_group": 1,
+      "worst_row": 512
+    },
+    "iterations": [
+      {
+        "active_recomputed_error": 21.29172464825746,
+        "step": 0,
+        "training_max": 21.291724626140002,
+        "worst_group": 1,
+        "worst_row": 1536
+      },
+      {
+        "active_recomputed_error": 19.4367741241881,
+        "step": 1,
+        "training_max": 19.436773911459085,
+        "worst_group": 1,
+        "worst_row": 1024
+      },
+      {
+        "active_recomputed_error": 16.359727896937653,
+        "step": 2,
+        "training_max": 16.359727725958525,
+        "worst_group": 1,
+        "worst_row": 2048
+      },
+      {
+        "active_recomputed_error": 12.920309360852924,
+        "step": 3,
+        "training_max": 12.920309345332532,
+        "worst_group": 1,
+        "worst_row": 512
+      },
+      {
+        "active_recomputed_error": 13.653190099928551,
+        "step": 4,
+        "training_max": 13.653190716551812,
+        "worst_group": 1,
+        "worst_row": 1026
+      },
+      {
+        "active_recomputed_error": 12.08198343056941,
+        "step": 5,
+        "training_max": 12.081984422259605,
+        "worst_group": 1,
+        "worst_row": 1536
+      },
+      {
+        "active_recomputed_error": 11.142531431834257,
+        "step": 6,
+        "training_max": 11.142531327657744,
+        "worst_group": 1,
+        "worst_row": 513
+      },
+      {
+        "active_recomputed_error": 9.85505457113157,
+        "step": 7,
+        "training_max": 9.855053682291105,
+        "worst_group": 1,
+        "worst_row": 1024
+      },
+      {
+        "active_recomputed_error": 9.938593525211038,
+        "step": 8,
+        "training_max": 9.938593387835331,
+        "worst_group": 1,
+        "worst_row": 3584
+      },
+      {
+        "active_recomputed_error": 8.883414762875852,
+        "step": 9,
+        "training_max": 8.883415682589026,
+        "worst_group": 1,
+        "worst_row": 0
+      },
+      {
+        "active_recomputed_error": 8.07331539514928,
+        "step": 10,
+        "training_max": 8.073315511338706,
+        "worst_group": 1,
+        "worst_row": 2561
+      },
+      {
+        "active_recomputed_error": 7.102500258358886,
+        "step": 11,
+        "training_max": 7.102500676040863,
+        "worst_group": 1,
+        "worst_row": 198
+      },
+      {
+        "active_recomputed_error": 6.7398409499290866,
+        "step": 12,
+        "training_max": 6.739840991333832,
+        "worst_group": 1,
+        "worst_row": 668
+      },
+      {
+        "active_recomputed_error": 6.680484622599869,
+        "step": 13,
+        "training_max": 6.680484451199645,
+        "worst_group": 1,
+        "worst_row": 1536
+      },
+      {
+        "active_recomputed_error": 6.878631039999612,
+        "step": 14,
+        "training_max": 6.878630926958583,
+        "worst_group": 1,
+        "worst_row": 3585
+      },
+      {
+        "active_recomputed_error": 6.107061784205777,
+        "step": 15,
+        "training_max": 6.1070611136925415,
+        "worst_group": 1,
+        "worst_row": 2049
+      },
+      {
+        "active_recomputed_error": 5.704727948653935,
+        "step": 16,
+        "training_max": 5.704728631936477,
+        "worst_group": 1,
+        "worst_row": 2560
+      },
+      {
+        "active_recomputed_error": 4.9284183832776245,
+        "step": 17,
+        "training_max": 4.928419038757579,
+        "worst_group": 1,
+        "worst_row": 2560
+      },
+      {
+        "active_recomputed_error": 4.912007332147565,
+        "step": 18,
+        "training_max": 4.912007937011732,
+        "worst_group": 1,
+        "worst_row": 198
+      },
+      {
+        "active_recomputed_error": 4.939941020771395,
+        "step": 19,
+        "training_max": 4.9399412020516,
+        "worst_group": 1,
+        "worst_row": 2570
+      },
+      {
+        "active_recomputed_error": 4.872421431710009,
+        "step": 20,
+        "training_max": 4.872422437941733,
+        "worst_group": 1,
+        "worst_row": 0
+      },
+      {
+        "active_recomputed_error": 4.311618673729266,
+        "step": 21,
+        "training_max": 4.311618625657292,
+        "worst_group": 1,
+        "worst_row": 755
+      },
+      {
+        "active_recomputed_error": 4.163000442030759,
+        "step": 22,
+        "training_max": 4.162999736691056,
+        "worst_group": 1,
+        "worst_row": 1536
+      },
+      {
+        "active_recomputed_error": 3.8417418321708228,
+        "step": 23,
+        "training_max": 3.8417412229015673,
+        "worst_group": 1,
+        "worst_row": 3072
+      },
+      {
+        "active_recomputed_error": 3.816938130335969,
+        "step": 24,
+        "training_max": 3.8169380993592705,
+        "worst_group": 1,
+        "worst_row": 1732
+      },
+      {
+        "active_recomputed_error": 4.727618383196107,
+        "step": 25,
+        "training_max": 4.7276186506675195,
+        "worst_group": 1,
+        "worst_row": 0
+      },
+      {
+        "active_recomputed_error": 3.868770797007948,
+        "step": 26,
+        "training_max": 3.868770972794399,
+        "worst_group": 1,
+        "worst_row": 198
+      },
+      {
+        "active_recomputed_error": 4.165565646428317,
+        "step": 27,
+        "training_max": 4.165565858195678,
+        "worst_group": 1,
+        "worst_row": 3072
+      },
+      {
+        "active_recomputed_error": 3.382963065164162,
+        "step": 28,
+        "training_max": 3.382963230482812,
+        "worst_group": 1,
+        "worst_row": 156
+      },
+      {
+        "active_recomputed_error": 3.111366788853015,
+        "step": 29,
+        "training_max": 3.111366671720654,
+        "worst_group": 1,
+        "worst_row": 3073
+      },
+      {
+        "active_recomputed_error": 3.7449234907657942,
+        "step": 30,
+        "training_max": 3.7449227752868066,
+        "worst_group": 1,
+        "worst_row": 3584
+      },
+      {
+        "active_recomputed_error": 3.5774595410653163,
+        "step": 31,
+        "training_max": 3.577460065403905,
+        "worst_group": 1,
+        "worst_row": 1536
+      },
+      {
+        "active_recomputed_error": null,
+        "step": 32,
+        "training_max": 2.8071170313255847,
+        "worst_group": 1,
+        "worst_row": 0
+      }
+    ],
+    "planned_numeric_bytes": 934821888,
+    "scope": "Proposal optimization only, fixed finite f64 input/output rows. Explicit settings.arithmetic governs forward and backward products, including training/validation proposal scores; parameter/moment storage and other primitives remain f64. The f32 option uses rounded-product surrogate gradients, not derivatives through rounding. Maximum over ALL output groups and rows, each group normalized by its own complete native-family RMS. Deterministic active-group/row max-norm Adam; full row scan in declared chunks and one-row reverse. Single-row GEMM rounding may differ from batch; recomputed error recorded; nonconvex, no optimum certificate. Best training snapshot, validation excluded from selection. Resident numerical parameters/gradients/moments/inputs/targets; O(rows) norms downloaded each step and final parameters downloaded. Numeric plan excludes product conversion/library/allocator/context/register/spill scratch. Final decoded f64 measurement and acceptance are separate.",
+    "seconds": 3.333516702,
+    "settings": {
+      "arithmetic": "f32",
+      "beta1": 0.9,
+      "beta2": 0.999,
+      "epsilon": 1e-8,
+      "forward_rows": 128,
+      "iterations": 32,
+      "learning_rate": 0.001,
+      "numeric_bytes": 2147483648
+    },
+    "trainable": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+    ],
+    "training_rows": 4096,
+    "training_scales": [
+      {
+        "group": {
+          "end": 768,
+          "label": "nativeMLP0",
+          "start": 0
+        },
+        "native_rms": 5.8414471649729345
+      },
+      {
+        "group": {
+          "end": 1536,
+          "label": "nativeMLP1",
+          "start": 768
+        },
+        "native_rms": 11.052116910840908
+      }
+    ],
+    "validation_rows": 1024,
+    "validation_scales": [
+      {
+        "group": {
+          "end": 768,
+          "label": "nativeMLP0",
+          "start": 0
+        },
+        "native_rms": 5.813256419655365
+      },
+      {
+        "group": {
+          "end": 1536,
+          "label": "nativeMLP1",
+          "start": 768
+        },
+        "native_rms": 12.192543112261813
+      }
+    ]
+  },
+  "pool_C32_bits": 264438804,
+  "pool_C32_not_full_model": {
+    "binding_bits": 82,
+    "literals": 8263680,
+    "structure_bits": 962
+  },
+  "saved_f32_F64_evaluation": {
+    "group_maxima": [
+      0.7913223745432748,
+      5.772952271249733
+    ],
+    "maximum": 5.772952271249733,
+    "scales": [
+      {
+        "group": {
+          "end": 768,
+          "label": "nativeMLP0",
+          "start": 0
+        },
+        "native_rms": 5.813256419655365
+      },
+      {
+        "group": {
+          "end": 1536,
+          "label": "nativeMLP1",
+          "start": 768
+        },
+        "native_rms": 12.192543112261813
+      }
+    ],
+    "worst_group": 1,
+    "worst_row": 1
+  },
+  "saved_f32_F64_training": {
+    "group_maxima": [
+      0.8449999698639449,
+      2.8071163756599904
+    ],
+    "maximum": 2.8071163756599904,
+    "scales": [
+      {
+        "group": {
+          "end": 768,
+          "label": "nativeMLP0",
+          "start": 0
+        },
+        "native_rms": 5.8414471649729345
+      },
+      {
+        "group": {
+          "end": 1536,
+          "label": "nativeMLP1",
+          "start": 768
+        },
+        "native_rms": 11.052116910840908
+      }
+    ],
+    "worst_group": 1,
+    "worst_row": 0
+  },
+  "seconds": 19.199262611
+}

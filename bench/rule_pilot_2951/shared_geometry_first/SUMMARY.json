@@ -1,0 +1,121 @@
+{
+  "scope": "First native two-use shared numerical-geometry fit. Supplied GELU architecture; no interpreted algorithm discovery or matched-compute VPD victory.",
+  "job": 15907,
+  "source_commit": "f822a31137cabe77610909e296f7649697f173fd",
+  "uses": [
+    0,
+    1
+  ],
+  "updates": 32,
+  "unique_training_tokens": 4096,
+  "evaluation_tokens": 1024,
+  "evaluation_status": "disjoint from fitting but previously examined project passages",
+  "optimizer_seconds": 3.333516702,
+  "driver_seconds": 19.199262611,
+  "allocated_gpu_seconds": 20,
+  "initial_training_max": 21.291724626140002,
+  "saved_training": {
+    "group_maxima": [
+      0.8449999698639449,
+      2.8071163756599904
+    ],
+    "maximum": 2.8071163756599904,
+    "scales": [
+      {
+        "group": {
+          "end": 768,
+          "label": "nativeMLP0",
+          "start": 0
+        },
+        "native_rms": 5.8414471649729345
+      },
+      {
+        "group": {
+          "end": 1536,
+          "label": "nativeMLP1",
+          "start": 768
+        },
+        "native_rms": 11.052116910840908
+      }
+    ],
+    "worst_group": 1,
+    "worst_row": 0
+  },
+  "saved_evaluation": {
+    "group_maxima": [
+      0.7913223745432748,
+      5.772952271249733
+    ],
+    "maximum": 5.772952271249733,
+    "scales": [
+      {
+        "group": {
+          "end": 768,
+          "label": "nativeMLP0",
+          "start": 0
+        },
+        "native_rms": 5.813256419655365
+      },
+      {
+        "group": {
+          "end": 1536,
+          "label": "nativeMLP1",
+          "start": 768
+        },
+        "native_rms": 12.192543112261813
+      }
+    ],
+    "worst_group": 1,
+    "worst_row": 1
+  },
+  "cost_scope": "standalone shared pool; full native artifact Local/Run and costs not measured here",
+  "pool_C32": {
+    "binding_bits": 82,
+    "literals": 8263680,
+    "structure_bits": 962
+  },
+  "zero_reference": [
+    {
+      "file": "/Users/user/mpd-data/cluster/codex-affine-mlp-9c504de18084/extract/train.0.write.f64",
+      "rows": 4096,
+      "width": 768,
+      "native_rms": 5.841447164972782,
+      "zero_prediction_max_normalized_error": 1.8001839144185503,
+      "sha256": "9a540efcdf266888efbc2acaf01f93a0ea3ee11f25933c8901153575a009eadd"
+    },
+    {
+      "file": "/Users/user/mpd-data/cluster/codex-affine-mlp-9c504de18084/extract/train.1.write.f64",
+      "rows": 4096,
+      "width": 768,
+      "native_rms": 11.052116910840676,
+      "zero_prediction_max_normalized_error": 21.28767715125809,
+      "sha256": "e4a8424ca7c4bd458b45dc69db0f9381cd138b6f8d6d6cc93460110a9992a948"
+    },
+    {
+      "file": "/Users/user/mpd-data/cluster/codex-affine-mlp-9c504de18084/extract/eval.0.write.f64",
+      "rows": 1024,
+      "width": 768,
+      "native_rms": 5.813256419655338,
+      "zero_prediction_max_normalized_error": 1.9779481410702,
+      "sha256": "427e8363644b6feca9de7745d6d400e7a85d0caed3cd40d1e38a48bf1870b8e9"
+    },
+    {
+      "file": "/Users/user/mpd-data/cluster/codex-affine-mlp-9c504de18084/extract/eval.1.write.f64",
+      "rows": 1024,
+      "width": 768,
+      "native_rms": 12.19254311226203,
+      "zero_prediction_max_normalized_error": 19.96460154877362,
+      "sha256": "0d0015b041f4ada6a0562e6dfe2443b0a7e371de933dbb279feab2590f941fc1"
+    }
+  ],
+  "zero_reference_scope": "ordinary binary64 diagnostic on original native target arrays; maximum output-row norm divided by family RMS; no arithmetic certificate or replacement acceptance",
+  "zero_reference_reproduction": "rustc --edition=2021 -O zero_reference.rs -o zero_reference; ./zero_reference 768 <train.0.write.f64> <train.1.write.f64> <eval.0.write.f64> <eval.1.write.f64>",
+  "interpretation": "Reduction beats the zero-output reference on both native uses. Training remains inadequate; all 32 active loss groups were use1, while use0 lost its initial near-native fidelity. Controls and frozen-body transfer remain necessary.",
+  "raw_sha256": {
+    "REPORT.json": "e378dd3d97a14e908b7c1160ed338fc913f268ce0d2885c88993e1ea1949ec4a",
+    "PROVENANCE.json": "d567405bf6651d2f02984d4dfc76956f6ef800960d138f8dae24c3ba7e171510",
+    "EXECUTION.json": "f38b75b7e79b66d2cd6304a5e11a16726613c379867bfb14620b0a839344408e",
+    "zero_reference.rs": "8a6cbb2f7b7b319e34050f9531d605d5b34fcad1e56718515e76c5f1bd64daac",
+    "zero_reference.jsonl": "e6b31274b94391c2f88ace5743dc2bf1c114db80f41dd79dfc479e14b4824e12"
+  }
+}
