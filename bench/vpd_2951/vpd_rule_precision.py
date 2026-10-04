@@ -4,9 +4,10 @@ uniform precision that leaves its selections unchanged, priced like every real i
 
 Every parameter w is sent as round(w · 2^p); p is the smallest for which the rounded network's
 selections (CI > 0) on the 32 frontier passages, read on the model's clean states as VPD computes
-its published sets, equal the unrounded network's in every entry. p is found by bisection over
-[0, 40] (exactness is checked at the end). The bits are the signed δ lengths of all lattice
-integers plus p once, in the prefix integer code.
+its published sets, equal the unrounded network's in every entry. Keeping them is not monotone in
+p (a coarser lattice can round a borderline entry back), so p rises from 0 until they are kept
+(at most 40), as gam_mpd::counterfactual::rule_price prices a fitted rule. The bits are the
+signed δ lengths of all lattice integers plus p + 1 once, in the prefix integer code.
 
 The δ length mirrors gam_mpd::codec::elias_delta_len_bits of zigzag(q) + 1:
   low = floor(log2 N), length = low + 2 floor(log2(low + 1)) + 1.
@@ -83,20 +84,14 @@ def prefix_bits(value: int) -> int:
     return bits
 
 
-lo, hi = 0, 40
-if not rounded_equal(hi):
-    raise SystemExit(f"selections differ even at p = {hi}")
-while lo < hi:
-    mid = (lo + hi) // 2
-    if rounded_equal(mid):
-        hi = mid
-    else:
-        lo = mid + 1
-p = hi
+p = 0
+while not rounded_equal(p):
+    if p == 40:
+        raise SystemExit(f"selections differ even at p = {p}")
+    p += 1
 bits = sum(delta_bits(np.round(w.numpy() * 2.0**p).astype(np.int64).ravel()) for w in original) + prefix_bits(p + 1)
 reals = int(sum(w.numel() for w in original))
 record = {"precision": p, "reals": reals, "bits": bits, "bits_per_real": bits / reals,
-          "below_changes": not rounded_equal(p - 1) if p > 0 else None,
           "test": f"CI > 0 on the clean states of {PASSAGES} frontier passages, every entry equal"}
 json.dump(record, open(args.out, "w"), indent=1)
 print(record)

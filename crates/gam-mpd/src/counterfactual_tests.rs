@@ -1,5 +1,11 @@
-use super::counterfactual::{Action, Decoder, Donor, InputChange, Library, Maps, OutputChange, Program, Rows, Selection, Selector, score, site_index, site_name};
-use ndarray::{Array2, Axis};
+use super::counterfactual::{
+    Action, Decoder, Donor, FittedRule, InputChange, Library, Maps, OutputChange, Program, Rows, Selection, Selector, fitted_libraries, fitted_sites, rule_price, score,
+    site_index, site_name,
+};
+use super::explanation::{Explanation, Fitted, Replacement, in_execution_order};
+use super::import::import_language_model;
+use super::masked::{self, matrix, sites};
+use ndarray::{Array1, Array2, Axis, s};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -35,8 +41,10 @@ fn tiny_export(tag: &str) -> PathBuf {
             write(&dir, &format!("blocks.{l}.{g}.gain"), [1, d], draw(d, 0.4).iter().map(|v| 1.0 + v).collect());
         }
     }
+    // Two passages of 10 tokens (and their next tokens), for the imported program.
+    write(&dir, "tokens", [2, 11], (0..22).map(|t| ((t * 7 + t / 11) % vocab) as f64).collect());
     let record = serde_json::json!({
-        "config": {"d_model": d, "n_layers": 2, "n_heads": 2, "head_dim": 4, "d_mlp": mlp, "vocab": vocab, "rope_theta": 10000.0,
+        "config": {"d_model": d, "n_layers": 2, "n_heads": 2, "n_kv_heads": 2, "head_dim": 4, "d_mlp": mlp, "vocab": vocab, "rope_theta": 10000.0,
                    "rope_pairing": "rotate_half", "norm_eps": 1e-6, "mlp_act": "gelu_tanh"},
         "files": files,
     });
@@ -164,5 +172,127 @@ fn a_site_without_a_library_runs_its_native_map() {
     assert!(max_gap(&a.residual, &b.residual) < 1e-10);
     // Block 0's units: five maps reading 8 coordinates and the down-projection reading 16.
     assert_eq!(explained.selected, (5 * 8 + 16) * tokens.len());
+    std::fs::remove_dir_all(&dir).expect("remove the temporary export");
+}
+
+/// Every site of the imported tiny model fitted with its coordinate units, each its own block
+/// priced at `bits` in a unit metric, in execution order.
+fn coordinate_explanation(dir: &Path, bits: f64) -> (super::operator_program::OperatorProgram, super::operator_program::FamilyInputs, Explanation) {
+    let imported = import_language_model(dir, 2, 10).expect("import");
+    let model = imported.program;
+    let observations = 50.0;
+    let fitted = in_execution_order(sites(&model))
+        .into_iter()
+        .map(|site| {
+            let w = matrix(&model, &site).expect("site map");
+            let (d_out, d_in) = w.dim();
+            let library = masked::Library { v: Array2::eye(d_in), u: w.t().to_owned(), mean: Array1::zeros(d_in) };
+            // Block prices that differ, so some units are worth dropping and some are not.
+            let prices = (0..d_in).map(|c| bits * (1.0 + (c % 3) as f64)).collect();
+            Fitted::new(site, w, (library, vec![1; d_in], prices), (Array2::eye(d_out), Array2::eye(d_in)), observations).expect("fitted")
+        })
+        .collect();
+    (model, imported.contract.family, Explanation { observations, sites: fitted })
+}
+
+/// Units selected per site and row by a counterfactual program, the rule's own record.
+struct Seen<'a> {
+    rule: FittedRule<'a>,
+    chosen: Vec<Vec<Vec<u32>>>,
+}
+
+impl Selector for Seen<'_> {
+    fn select(&mut self, site: usize, input: &Array2<f64>) -> Vec<Vec<(u32, f64)>> {
+        let chosen = self.rule.select(site, input);
+        self.chosen[site] = chosen.iter().map(|row| row.iter().map(|(c, _)| *c).collect()).collect();
+        chosen
+    }
+}
+
+#[test]
+fn the_decoder_and_the_explanations_rule_agree_with_the_imported_program() {
+    let dir = tiny_export("fitted");
+    let decoder = Decoder::from_export(&dir).expect("decoder");
+    let (model, family, explanation) = coordinate_explanation(&dir, 2.0);
+    let members: Vec<usize> = (0..explanation.sites.len()).collect();
+    let masked = explanation.masked(&model, &members).expect("masked");
+    let by_site = fitted_sites(&decoder, &explanation.sites).expect("every site is the decoder's");
+    let libraries = fitted_libraries(&by_site);
+    for passage in 0..2 {
+        let rows: Vec<usize> = (passage * 10..(passage + 1) * 10).collect();
+        let base = family.select(&rows);
+        let tokens: Vec<u32> = (0..10).map(|t| ((passage * 11 + t) * 7 + (passage * 11 + t) / 11) as u32 % 11).collect();
+        // The native forwards.
+        let logits = model.execute(&base, false).expect("native program").values.swap_remove(model.output);
+        let mut native = Program::new(Maps::Native(&decoder), &[], None);
+        let ours = decoder.log_probs(&decoder.forward(&tokens, &mut native, &[]).residual);
+        let theirs = decoder_log_softmax(&logits);
+        assert!(max_gap(&ours, &theirs) < 1e-9, "passage {passage}: native gap {}", max_gap(&ours, &theirs));
+        // The explanation run by its own rule, in the imported program and in the decoder.
+        let (trace, chosen) = explanation.execute(&masked, &members, &base).expect("explanation");
+        let mut seen = Seen { rule: FittedRule { sites: &by_site }, chosen: vec![Vec::new(); decoder.sites()] };
+        let mut program = Program::new(Maps::Units { decoder: &decoder, libraries: &libraries, selector: &mut seen }, &[], None);
+        let explained = decoder.log_probs(&decoder.forward(&tokens, &mut program, &[]).residual);
+        let theirs = decoder_log_softmax(&trace.values[masked.program.output]);
+        assert!(max_gap(&explained, &theirs) < 1e-9, "passage {passage}: explained gap {}", max_gap(&explained, &theirs));
+        let mut dropped = 0;
+        for (k, f) in explanation.sites.iter().enumerate() {
+            let site = (0..decoder.sites()).find(|j| site_name(*j) == f.site.name).expect("decoder site");
+            let theirs: Vec<Vec<u32>> = chosen[k].outer_iter().map(|on| (0..on.len() as u32).filter(|c| on[*c as usize] == 1.0).collect()).collect();
+            assert_eq!(seen.chosen[site], theirs, "passage {passage}, {}", f.site.name);
+            dropped += theirs.iter().map(|r| f.ranks.len() - r.len()).sum::<usize>();
+        }
+        assert!(dropped > 0, "the rule dropped no unit, so the test compares nothing");
+    }
+    std::fs::remove_dir_all(&dir).expect("remove the temporary export");
+}
+
+fn decoder_log_softmax(logits: &Array2<f64>) -> Array2<f64> {
+    let mut out = logits.clone();
+    for mut row in out.outer_iter_mut() {
+        let max = row.fold(f64::NEG_INFINITY, |m, v| m.max(*v));
+        let total = row.iter().map(|v| (v - max).exp()).sum::<f64>().ln() + max;
+        row.mapv_inplace(|v| v - total);
+    }
+    out
+}
+
+#[test]
+fn the_rules_price_is_its_lowest_selection_keeping_precision() {
+    let dir = tiny_export("rule");
+    let decoder = Decoder::from_export(&dir).expect("decoder");
+    let (_, _, explanation) = coordinate_explanation(&dir, 2.0);
+    let by_site = fitted_sites(&decoder, &explanation.sites).expect("every site is the decoder's");
+    let libraries = fitted_libraries(&by_site);
+    let tokens: Vec<u32> = (0..10).map(|t| (t * 7 % 11) as u32).collect();
+    struct Reads<'a>(FittedRule<'a>, Vec<Array2<f64>>);
+    impl Selector for Reads<'_> {
+        fn select(&mut self, site: usize, input: &Array2<f64>) -> Vec<Vec<(u32, f64)>> {
+            self.1[site] = input.clone();
+            self.0.select(site, input)
+        }
+    }
+    let mut reads = Reads(FittedRule { sites: &by_site }, vec![Array2::zeros((0, 0)); decoder.sites()]);
+    let mut program = Program::new(Maps::Units { decoder: &decoder, libraries: &libraries, selector: &mut reads }, &[], None);
+    decoder.forward(&tokens, &mut program, &[]);
+    let chosen: Vec<&Fitted> = by_site.iter().flatten().copied().collect();
+    let tables: Vec<Array2<f64>> = (0..decoder.sites()).map(|k| reads.1[k].clone()).collect();
+    let price = rule_price(&chosen, &tables, explanation.observations).expect("price");
+    let reals: usize = chosen.iter().map(|f| f.w.len() + f.bits.len() + f.fisher.nrows() * (f.fisher.nrows() + 1) / 2).sum();
+    assert_eq!(price.reals, reals);
+    assert!(price.bits > price.reals as f64, "{price:?}");
+    // At the price's precision every site selects as it did; one bit coarser, some site does not.
+    let rounded = |m: &Array2<f64>, p: i32| m.mapv(|w| (w * 2f64.powi(p)).round() / 2f64.powi(p));
+    let same = |p: i32| {
+        chosen.iter().zip(&tables).all(|(f, x)| {
+            let bits: Vec<f64> = f.bits.iter().map(|b| (b * 2f64.powi(p)).round() / 2f64.powi(p)).collect();
+            let rule = super::site_fit::Selector::new(&rounded(&f.w, p), &rounded(&f.fisher, p), &f.library, &f.ranks, &bits, explanation.observations).expect("rule");
+            rule.select(x) == f.select(x)
+        })
+    };
+    assert!(same(price.precision));
+    assert!(price.precision == 0 || !same(price.precision - 1), "{price:?}");
+    assert_eq!(price.binding.is_some(), price.precision > 0, "{price:?}");
+    assert_eq!(reads.1[0].slice(s![.., 0]).len(), tokens.len());
     std::fs::remove_dir_all(&dir).expect("remove the temporary export");
 }

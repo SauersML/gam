@@ -35,6 +35,8 @@ use std::sync::Arc;
 use gam_linalg::faer_ndarray::{fast_ab, fast_abt};
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 
+use super::codec::{prefix_integer_len_bits, signed_delta_len_bits};
+use super::explanation::Fitted;
 use super::llama_simple_mlp::gelu_tanh;
 
 /// The decomposed maps of one block, in site order.
@@ -370,6 +372,123 @@ pub fn load_libraries(dir: &Path, decoder: &Decoder) -> Result<Vec<Option<Librar
         .collect()
 }
 
+/// A fitted explanation's sites by decoder site (`gam_mpd::explanation`'s names are
+/// [`site_name`]'s); a decoder site none of them replaces runs native.
+pub fn fitted_sites<'a>(decoder: &Decoder, fitted: &'a [Fitted]) -> Result<Vec<Option<&'a Fitted>>, String> {
+    let mut by_site = vec![None; decoder.sites()];
+    for f in fitted {
+        let site = (0..decoder.sites()).find(|k| site_name(*k) == f.site.name).ok_or_else(|| format!("{}: not a site of the decoder", f.site.name))?;
+        if f.w != *decoder.native(site) {
+            return Err(format!("{}: fitted on another map than the decoder's", f.site.name));
+        }
+        by_site[site] = Some(f);
+    }
+    Ok(by_site)
+}
+
+/// The fitted sites' libraries, every block's columns as units.
+pub fn fitted_libraries(sites: &[Option<&Fitted>]) -> Vec<Option<Library>> {
+    sites.iter().map(|f| f.map(|f| Library { v: f.library.v.clone(), u: f.library.u.clone() })).collect()
+}
+
+/// A fitted explanation's own rule ([`Fitted::select`]) run inside the program: a site's blocks
+/// chosen from the program's own read of it, every column of a chosen block on.
+pub struct FittedRule<'a> {
+    pub sites: &'a [Option<&'a Fitted>],
+}
+
+impl Selector for FittedRule<'_> {
+    fn select(&mut self, site: usize, input: &Array2<f64>) -> Vec<Vec<(u32, f64)>> {
+        let Some(fitted) = self.sites.get(site).copied().flatten() else {
+            return vec![Vec::new(); input.nrows()];
+        };
+        let starts: Vec<usize> = fitted
+            .ranks
+            .iter()
+            .scan(0, |at, r| {
+                *at += r;
+                Some(*at - r)
+            })
+            .collect();
+        fitted
+            .select(input)
+            .outer_iter()
+            .map(|on| on.iter().enumerate().filter(|(_, m)| **m == 1.0).flat_map(|(b, _)| (starts[b]..starts[b] + fitted.ranks[b]).map(|c| (c as u32, 1.0))).collect())
+            .collect()
+    }
+}
+
+/// What a selection rule costs beyond its library.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RulePrice {
+    /// Every parameter sent as `round(w 2^p)`.
+    pub precision: i32,
+    pub reals: usize,
+    pub bits: f64,
+    /// The site whose selections changed one bit coarser (none when `p = 0`).
+    pub binding: Option<String>,
+    /// The reads the selections were compared on, per site.
+    pub reads: usize,
+}
+
+/// A fitted rule's own parameters beyond its library, each site's map `W`, its mean written
+/// Fisher (the upper triangle) and its blocks' prices, from which [`super::site_fit::Selector`]
+/// forms its selection, sent at the lowest uniform lattice precision `2^-p` (`p ∈ [0, 40]`) under
+/// which every site's selection of `reads[k]` (the site's reads on the test passages, rows ×
+/// d_in) is unchanged in every entry; each lattice integer in the signed Elias δ code and `p + 1`
+/// once in the prefix integer code. The pricing `bench/vpd_2951/vpd_rule_precision.py` gives VPD's
+/// causal-importance network. Keeping the selections is not monotone in `p` (a coarser lattice
+/// can round a borderline read back), so `p` rises from 0 until every site keeps them, each `p`
+/// first trying the site that last failed.
+pub fn rule_price(sites: &[&Fitted], reads: &[Array2<f64>], observations: f64) -> Result<RulePrice, String> {
+    use rayon::prelude::*;
+    const HIGHEST: i32 = 40;
+    if sites.len() != reads.len() {
+        return Err(format!("{} sites, {} read tables", sites.len(), reads.len()));
+    }
+    let on_lattice = |w: f64, p: i32| (w * 2f64.powi(p)).round() / 2f64.powi(p);
+    let keeps = |k: usize, reference: &Array2<f64>, p: i32| -> Result<bool, String> {
+        let f = sites[k];
+        let bits: Vec<f64> = f.bits.iter().map(|b| on_lattice(*b, p)).collect();
+        let rule = super::site_fit::Selector::new(&f.w.mapv(|w| on_lattice(w, p)), &f.fisher.mapv(|w| on_lattice(w, p)), &f.library, &f.ranks, &bits, observations)?;
+        Ok(rule.select(&reads[k]) == *reference)
+    };
+    let references: Vec<Array2<f64>> = sites.par_iter().zip(reads).map(|(f, x)| f.select(x)).collect();
+    let mut order: Vec<usize> = (0..sites.len()).collect();
+    let (mut precision, mut binding) = (0, None);
+    'coarsest: loop {
+        for at in 0..order.len() {
+            let k = order[at];
+            if !keeps(k, &references[k], precision)? {
+                if precision == HIGHEST {
+                    return Err(format!("{}: the selections differ even at p = {HIGHEST}", sites[k].site.name));
+                }
+                order[..=at].rotate_right(1);
+                binding = Some(sites[k].site.name.clone());
+                precision += 1;
+                continue 'coarsest;
+            }
+        }
+        break;
+    }
+    let scale = 2f64.powi(precision);
+    let length = |w: f64| -> Result<f64, String> { Ok(signed_delta_len_bits((w * scale).round() as i64).map_err(|e| e.to_string())? as f64) };
+    let (mut bits, mut reals) = (prefix_integer_len_bits(precision as u64 + 1).map_err(|e| e.to_string())? as f64, 0);
+    for f in sites {
+        for w in f.w.iter().chain(f.bits.iter()) {
+            bits += length(*w)?;
+        }
+        for i in 0..f.fisher.nrows() {
+            for w in f.fisher.row(i).iter().skip(i) {
+                bits += length(*w)?;
+            }
+        }
+        let d = f.fisher.nrows();
+        reals += f.w.len() + f.bits.len() + d * (d + 1) / 2;
+    }
+    Ok(RulePrice { precision, reals, bits, binding, reads: reads.first().map_or(0, |x| x.nrows()) })
+}
+
 /// What a program runs at its sites.
 pub enum Maps<'a> {
     /// The native maps.
@@ -606,7 +725,7 @@ impl Spec {
 /// passage's clean episode, `clean/{passage}`.
 pub struct Explanation<'a> {
     pub libraries: &'a [Option<Library>],
-    pub selector: &'a (dyn Fn(&str) -> Result<Box<dyn Selector>, String> + Sync),
+    pub selector: Box<dyn Fn(&str) -> Result<Box<dyn Selector + 'a>, String> + Sync + 'a>,
 }
 
 /// One episode's scores, with the units per row the explanation's rule ran.
