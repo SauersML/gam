@@ -251,6 +251,12 @@ impl Resident {
         self.program.device().copy(trace.value(self.output)?).map_err(|e| e.to_string())
     }
 
+    /// Borrow a materialized output for resident reductions without copying its
+    /// device buffer. The trace owns the buffer for the duration of the borrow.
+    pub fn output_ref<'a>(&self, trace: &'a DeviceTrace) -> Result<&'a Tensor, String> {
+        trace.value(self.output)
+    }
+
     /// Whether a root intervention would hit an output left unmaterialized by
     /// intermediate execution. Such an intervention must not be silently skipped.
     pub fn is_streamed_head_root(&self, root: usize) -> Result<bool, String> {

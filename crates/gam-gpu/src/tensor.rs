@@ -591,6 +591,32 @@ impl Device {
         Array2::from_shape_vec((t.rows, t.cols), flat).map_err(|e| shape(e.to_string()))
     }
 
+    /// One scaled Euclidean norm per row over `columns`. Only the row results
+    /// leave CUDA. Accumulate squares in column order with separate binary64
+    /// multiply/add, then sqrt and division; this deliberately preserves the
+    /// host comparison's arithmetic instead of using a parallel/FMA reduction.
+    /// This is a measurement of the supplied values, not a forward-error bound.
+    /// Refuses nonfinite results and backends without binary64 support.
+    pub fn scaled_row_l2(&self, values: &Tensor, columns: std::ops::Range<usize>, scale: f64) -> Result<Vec<f64>, GpuError> {
+        if columns.start > columns.end || columns.end > values.cols || !scale.is_finite() || scale <= 0.0 {
+            return Err(shape("invalid row norm columns or scale".into()));
+        }
+        let norms: Vec<f64> = match (&*self.backend, &values.data) {
+            (Backend::Host, Data::Host(data)) => (0..values.rows).map(|row| {
+                data[row * values.cols + columns.start..row * values.cols + columns.end]
+                    .iter().map(|v| v * v).sum::<f64>().sqrt() / scale
+            }).collect(),
+            #[cfg(target_os = "linux")]
+            (Backend::Cuda(engine), Data::Cuda(_)) => engine.scaled_row_l2(values, columns, scale)?,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            _ => return Err(shape("row norms require matching host or CUDA binary64 tensors".into())),
+        };
+        if norms.iter().any(|v| !v.is_finite()) {
+            return Err(shape("nonfinite row norm".into()));
+        }
+        Ok(norms)
+    }
+
     pub fn zeros(&self, rows: usize, cols: usize) -> Result<Tensor, GpuError> {
         let data = match &*self.backend {
             Backend::Host => Data::Host(vec![0.0; rows * cols]),
@@ -1716,6 +1742,19 @@ extern "C" __global__ void axpy(u64 n, double alpha, const double* x, double* y)
     GRID_STRIDE(i, n) y[i] += alpha * x[i];
 }
 
+extern "C" __global__ void scaled_row_l2(u64 rows, u64 cols, u64 begin, u64 end, double scale,
+    const double* x, double* out) {
+    for (u64 row = blockIdx.x * (u64)blockDim.x + threadIdx.x; row < rows; row += gridDim.x * (u64)blockDim.x) {
+        // Rust's Sum<f64> starts at negative zero (also observable for an empty range).
+        double sum = -0.0;
+        for (u64 col = begin; col < end; ++col) {
+            double v = x[row * cols + col];
+            sum = __dadd_rn(sum, __dmul_rn(v, v));
+        }
+        out[row] = __ddiv_rn(__dsqrt_rn(sum), scale);
+    }
+}
+
 extern "C" __global__ void set_columns(u64 n, u64 output_cols, u64 input_cols, u64 start, const double* input, double* output) {
     GRID_STRIDE(i, n) output[(i / input_cols) * output_cols + start + i % input_cols] = input[i];
 }
@@ -2689,6 +2728,20 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
 
         pub(super) fn download(&self, slice: &CudaSlice<f64>) -> Result<Vec<f64>, GpuError> {
             self.stream.clone_dtoh(slice).gpu_ctx("tensor download")
+        }
+
+        pub(super) fn scaled_row_l2(&self, values: &Tensor, columns: std::ops::Range<usize>, scale: f64) -> Result<Vec<f64>, GpuError> {
+            if values.rows == 0 { return Ok(Vec::new()); }
+            let mut out = self.zeros(values.rows)?;
+            let (rows, cols, begin, end) = (values.rows as u64, values.cols as u64, columns.start as u64, columns.end as u64);
+            let f = self.function("scaled_row_l2")?;
+            // SAFETY: validated column range; each thread reads one row and
+            // writes a distinct element of the rows-long output buffer.
+            unsafe {
+                self.stream.launch_builder(&f).arg(&rows).arg(&cols).arg(&begin).arg(&end).arg(&scale)
+                    .arg(slice(values)?).arg(&mut out).launch(cfg_elements(rows))
+            }.gpu_ctx("tensor scaled_row_l2")?;
+            self.download(&out)
         }
 
         pub(super) fn zeros(&self, n: usize) -> Result<CudaSlice<f64>, GpuError> {
@@ -4686,5 +4739,53 @@ mod checked_interval_api_tests {
         assert!(device.checked_interval_compiler_info().is_err());
         let mismatch=device.upload_vec(1,1,vec![0.0]).expect("host upload");
         assert!(device.checked_kl_intervals(&input,&mismatch,budget).is_err());
+    }
+}
+
+#[cfg(test)]
+mod scaled_row_l2_tests {
+    use super::*;
+
+    #[test]
+    fn ordered_norms_match_host_with_ranges_and_no_input_mutation() {
+        let host = Device::host();
+        let mut devices = vec![Device::host()];
+        if let Some(device) = Device::accelerator(crate::GpuPolicy::Auto).expect("device probe") {
+            if device.float64() { devices.push(device); }
+        }
+        // Non-power-of-two width and mixed magnitudes exercise accumulation
+        // order, normal/subnormal products, zero and a partial final warp.
+        let (rows, cols) = (35, 773);
+        let values: Vec<f64> = (0..rows * cols).map(|i| {
+            if i / cols == 0 { 0.0 } else { match i % 5 {
+                0 => 1.0, 1 => 2.0_f64.powi(-26), 2 => -0.75,
+                3 => f64::from_bits(1), _ => (i % 31) as f64 / 17.0,
+            } }
+        }).collect();
+        let reference = host.upload_vec(rows, cols, values.clone()).unwrap();
+        for device in devices {
+            let input = device.upload_vec(rows, cols, values.clone()).unwrap();
+            for columns in [0..cols, 3..cols - 2, 9..9] {
+                for scale in [1.0, 0.125, 3.25] {
+                    let expected = host.scaled_row_l2(&reference, columns.clone(), scale).unwrap();
+                    let actual = device.scaled_row_l2(&input, columns.clone(), scale).unwrap();
+                    assert_eq!(actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), "{}", device.name());
+                }
+            }
+            assert_eq!(device.download(&input).unwrap().as_slice().unwrap(), values.as_slice());
+            assert!(device.scaled_row_l2(&device.zeros(0, cols).unwrap(), 0..cols, 1.0).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn invalid_ranges_scales_and_nonfinite_reductions_are_errors() {
+        let device = Device::host();
+        let input = device.upload_vec(1, 3, vec![3.0, 4.0, f64::NAN]).unwrap();
+        assert_eq!(device.scaled_row_l2(&input, 0..2, 1.0).unwrap(), vec![5.0]);
+        assert!(device.scaled_row_l2(&input, 0..3, 1.0).is_err());
+        for range in [2..1, 0..4, usize::MAX..usize::MAX] { assert!(device.scaled_row_l2(&input, range, 1.0).is_err()); }
+        for scale in [0.0, -1.0, f64::NAN, f64::INFINITY] { assert!(device.scaled_row_l2(&input, 0..2, scale).is_err()); }
+        let overflow = device.upload_vec(1, 1, vec![f64::MAX]).unwrap();
+        assert!(device.scaled_row_l2(&overflow, 0..1, 1.0).is_err());
     }
 }

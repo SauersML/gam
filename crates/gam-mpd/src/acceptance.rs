@@ -490,6 +490,7 @@ pub struct Local<'a> {
     scales: Mutex<BTreeMap<usize, f64>>,
     device: Option<(gam_gpu::tensor::Device, usize)>,
     native_device: Option<super::artifact_device::Resident>,
+    resident_norms: bool,
 }
 
 /// Per row, `‖d_row‖₂` and the rounding of computing it from the two executed writes: the
@@ -508,7 +509,7 @@ fn row_norms(values: &Array2<f64>, columns: std::ops::Range<usize>, scale: f64) 
 
 impl<'a> Local<'a> {
     pub fn new(model: &'a OperatorProgram, family: FamilyInputs, ascent: Option<Ascent>, batch_rows: usize) -> Self {
-        Self { model, family, ascent, batch_rows, scales: Mutex::new(BTreeMap::new()), device: None, native_device: None }
+        Self { model, family, ascent, batch_rows, scales: Mutex::new(BTreeMap::new()), device: None, native_device: None, resident_norms: false }
     }
 
     /// Execute the same native-parent graft on a float64 CUDA device. Native scale
@@ -548,7 +549,17 @@ impl<'a> Local<'a> {
         self.native_device.as_ref().map(super::artifact_device::Resident::operator_numeric_bytes).transpose()
     }
 
+    /// Keep the graft's differences on CUDA and download one norm per block/row.
+    /// Uses the same ordered binary64 square/sum/sqrt/division and comparison
+    /// envelope as the host reduction. Native reference scales remain unchanged.
+    pub fn with_cuda_resident_norms(mut self) -> Result<Self, String> {
+        if self.device.is_none() { return Err("enable Local CUDA before resident norms".into()); }
+        self.resident_norms = true;
+        Ok(self)
+    }
+
     pub fn backend_name(&self) -> &'static str {
+        if self.resident_norms { return "CUDA f64 native-parent graft and resident row norms; frozen CPU native scales"; }
         if self.native_device.is_some() { "CUDA f64 shared native-parent graft; CPU native scales and comparison" } else if self.device.is_some() { "CUDA f64 native-parent graft; CPU native scales and comparison" } else { "CPU f64 native-parent graft, native scales and comparison" }
     }
 
@@ -594,19 +605,30 @@ impl<'a> Local<'a> {
         };
         for rows in batches(&units(family), self.batch_rows) {
             let selected = family.select(&rows);
-            let values = if let (Some(resident), Some((device, limit))) = (&resident, &self.device) {
+            let errors = if let (Some(resident), Some((device, limit))) = (&resident, &self.device) {
                 let estimate = resident.estimated_resident_bytes(selected.rows)?;
                 if estimate > *limit {
                     return Err(format!("Local CUDA retained intermediates {estimate} exceed declared limit {limit}; excludes operators/workspaces/host"));
                 }
                 let trace = resident.forward_edited(&selected, |_, _| Ok(None))?;
-                device.download(&resident.output(&trace)?).map_err(|e| e.to_string())?
+                let output = resident.output_ref(&trace)?;
+                if self.resident_norms {
+                    columns.iter().zip(scales).map(|(columns, scale)| {
+                        let growth = accumulation_growth(columns.len() + 4);
+                        Ok(device.scaled_row_l2(output, columns.clone(), *scale).map_err(|e| e.to_string())?
+                            .into_iter().map(|norm| (norm, (growth * norm).next_up())).collect::<Vec<_>>())
+                    }).collect::<Result<Vec<_>, String>>()?
+                } else {
+                    let values = device.download(output).map_err(|e| e.to_string())?;
+                    columns.iter().zip(scales).map(|(columns, scale)| row_norms(&values, columns.clone(), *scale)).collect()
+                }
             } else {
                 let trace = local.execute(&selected)?;
-                trace.values[local.program.output].clone()
+                let values = &trace.values[local.program.output];
+                columns.iter().zip(scales).map(|(columns, scale)| row_norms(values, columns.clone(), *scale)).collect()
             };
-            for (b, (columns, scale)) in columns.iter().zip(scales).enumerate() {
-                for (row, error) in rows.iter().zip(row_norms(&values, columns.clone(), *scale)) {
+            for (b, errors) in errors.into_iter().enumerate() {
+                for (row, error) in rows.iter().zip(errors) {
                     nonnegative_interval(error.0, error.1).map_err(|e| format!("local block {b}, row {row}: {e}"))?;
                     out[b][*row] = error;
                 }
