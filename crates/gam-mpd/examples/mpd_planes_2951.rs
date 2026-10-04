@@ -16,8 +16,9 @@
 //! so the decoder, having decoded the sites upstream, builds them itself (`Sides`), and a plane is
 //! named by its frequency (one group of the readers' chart, `carrier_chart`) and sends only what it
 //! writes: two columns in the site's own coordinates, or a 2 × 2 core where its writes are also
-//! charted (the class characters of the unembedding, on a site the readout reads directly). The
-//! whole sites get the same charts.
+//! charted (the class characters of the unembedding, on a site the readout reads directly). A side a
+//! pointwise nonlinearity reads or writes is also charted by its units (`units`), so a block on a
+//! few neurons names them. The whole sites get the same charts.
 //!
 //! Every point is measured under the corner claim (every token's error the exact KL of the program
 //! its masks run: off blocks absent). Every block is described on the exact lattice code
@@ -392,12 +393,13 @@ fn planes(w: &Array2<f64>, readers: &[(String, Array2<f64>)]) -> Result<Vec<(Str
     Ok(out)
 }
 
-/// What the decoder holds of each site before its blocks: its metric and writer charts, and the
+/// What the decoder holds of each site before its blocks: its metric, its fixed charts, and the
 /// family's operands, from which it builds the reader chart on the reads the program decoded so
 /// far gives the site ([`carriers`], [`carrier_chart`]).
 struct Sides {
     metrics: Vec<Metric>,
     writers: Vec<Vec<Chart>>,
+    readers: Vec<Vec<Chart>>,
     labels: Array2<usize>,
     period: usize,
 }
@@ -405,8 +407,37 @@ struct Sides {
 impl Sides {
     /// Site `k`'s geometry on its reads `x`.
     fn geometry(&self, k: usize, x: &Array2<f64>) -> Result<Geometry, String> {
-        Geometry::new(self.metrics[k].clone(), self.writers[k].clone(), vec![carrier_chart(&carriers(x, &self.labels, self.period)?)?])
+        let mut readers = self.readers[k].clone();
+        readers.push(carrier_chart(&carriers(x, &self.labels, self.period)?)?);
+        Geometry::new(self.metrics[k].clone(), self.writers[k].clone(), readers)
     }
+}
+
+/// One group per coordinate of `nodes` (widths `widths`) that a pointwise nonlinearity reads or
+/// writes: each unit has its own law, so its coordinate is privileged, and a block living on a
+/// few units names them.
+fn units(program: &OperatorProgram, nodes: &[usize], read_side: bool) -> Result<Option<Chart>, String> {
+    let interfaces = program.interfaces().map_err(|e| e.to_string())?;
+    let pointwise = |n: usize| -> bool {
+        if read_side {
+            matches!(program.nodes[n], Node::Pointwise { .. })
+        } else {
+            program.nodes.iter().any(|node| matches!(node, Node::Pointwise { input, .. } if *input == n))
+        }
+    };
+    let widths: Vec<usize> = nodes.iter().map(|n| interfaces[*n].width()).collect();
+    let mut groups = Vec::new();
+    let mut at = 0;
+    for (n, w) in nodes.iter().zip(&widths) {
+        if pointwise(*n) {
+            groups.extend((at..at + w).map(|i| vec![i]));
+        }
+        at += w;
+    }
+    if groups.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Chart::coordinates("units", at, &groups)?))
 }
 
 /// Site `k`'s reads on the first batch as `blocked` runs them.
@@ -511,7 +542,7 @@ fn run(dir: &Path, out: &Path, observations: f64, only_all_on: bool) -> Result<(
     let labels = Array2::from_shape_fn((family.rows, 2), |(r, i)| operands[i][r] as usize);
     let statistics = site_statistics(&program, &chosen, [family.clone()], 16, 0x5EED)?;
     let metrics = logit_gauss_newton(&program, &chosen, &family, &trace, 64)?;
-    let mut sides = Sides { metrics: Vec::new(), writers: Vec::new(), labels, period };
+    let mut sides = Sides { metrics: Vec::new(), writers: Vec::new(), readers: Vec::new(), labels, period };
     let (mut geometries, mut plane_libraries, mut plane_ranks, mut plane_labels, mut svd_libraries) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut profiles = Vec::new();
     for (k, ((site, measured), metric)) in chosen.iter().zip(&statistics).zip(&metrics).enumerate() {
@@ -521,8 +552,10 @@ fn run(dir: &Path, out: &Path, observations: f64, only_all_on: bool) -> Result<(
             let classes = Array2::from_shape_fn((map.nrows(), 1), |(c, _)| c);
             writers.push(Chart::harmonic("class characters of the readout", map.view(), classes.view(), map.nrows())?);
         }
+        writers.extend(units(&program, &site.writes, false)?);
         sides.metrics.push(Metric { fisher: metric.clone(), ..Metric::of(measured, observations) });
         sides.writers.push(writers);
+        sides.readers.push(units(&program, &site.reads, true)?.into_iter().collect());
         // The search prices on the native reads' chart; every decoded point on the decoder's.
         geometries.push(sides.geometry(k, &x)?);
         let w = matrix(&program, site)?;
