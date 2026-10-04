@@ -23,7 +23,24 @@
       "Training and fit-disjoint evaluation maximum vector error, native MLP RMS normalization, and worst-row witness.",
       "Relation-to-removal error ratio, including explicit zero cases.",
       "Complete retained candidate bank and full geometry distribution summary."
-    ]
+    ],
+    "finite_edit_diagnostic": {
+      "declared_before_run_utc": "2026-10-04T22:21:04.361323+00:00",
+      "scope": "Local pair response on the same native parent; no downstream KL measured here.",
+      "common_reader_gains": [
+        -1,
+        0,
+        1,
+        2
+      ],
+      "action": "Scale both full affine readers, including biases, by the common gain.",
+      "linearity_responses": [
+        "f(-1)+f(1)",
+        "f(2)-2*f(1)"
+      ],
+      "relation_breaking_action": "Negate exactly one native writer column while preserving both writer norms.",
+      "limitation": "This tests dependence on native coordination, not a statistical comparison against random learned weights and not a semantic label."
+    }
   },
   "data": {
     "manifest": "/Users/user/mpd-data/cluster/codex-affine-mlp-9c504de18084/extract/EXTRACT.json",
