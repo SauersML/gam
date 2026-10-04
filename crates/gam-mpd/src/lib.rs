@@ -208,6 +208,9 @@ pub mod gates;
 // Libraries fitted on one site's own inputs to its second-order code.
 pub mod site_fit;
 
+// Exact real-fit coder operand fixtures for explicit capture/replay probes.
+pub mod coder_capture;
+
 // An MLP accounted for by explicit rules between its subcomponents' amplitudes.
 pub mod mlp_account;
 

@@ -704,27 +704,22 @@ pub fn code_of(site: usize, w: &Array2<f64>, samples: &Samples, describe: &dyn D
     Ok(fitting.report(0, description, error))
 }
 
-/// A library of `settings.pieces` subcomponents for site `site` (`w` its `d_out × d_in` map, `site`
-/// its index in `describe`), fitted on `samples` to the site's code (module note); `progress` sees
-/// every round with the library it measured. Its first subcomponents are `start` (at most
-/// `pieces`; a site reading a layer of units starts from the units themselves), the rest read
-/// inputs; when `start` carries its writes and is the map, the rest start writing nothing, else
-/// the first writes are the smallest that make every subcomponent on the map. The library reads
-/// the uncentred input (`mean` zero).
-pub fn fit(
-    site: usize,
-    w: &Array2<f64>,
-    samples: &Samples,
-    describe: &dyn Describe,
-    settings: Settings,
-    start: Option<&Library>,
-    mut progress: impl FnMut(&Round, &Library),
-) -> Result<Library, String> {
-    let Settings { observations, pieces, rounds, seed } = settings;
+struct InitialFit<'a> {
+    fitting: Fitting<'a>,
+    geometry: ReadGeometry,
+    right: Array2<f64>,
+    v: Array2<f64>,
+    u: Array2<f64>,
+    bits: Array1<f64>,
+}
+
+/// Shared initialization of the real fitter and explicit capture probes.
+fn initialize_fit<'a>(site: usize, w: &Array2<f64>, samples: &'a Samples, describe: &dyn Describe, settings: Settings, start: Option<&Library>) -> Result<InitialFit<'a>, String> {
+    let Settings { observations, pieces, seed, .. } = settings;
     let d_in = w.ncols();
     let x = &samples.reads;
     let rows = x.nrows();
-    let mut fitting = Fitting::new(site, w, samples, observations, pieces)?;
+    let fitting = Fitting::new(site, w, samples, observations, pieces)?;
     let geometry = ReadGeometry::new(&samples.second_moment)?;
     // The reads' inverse second moment on their span (seeding) and in full (the reads' right
     // preconditioner).
@@ -771,7 +766,7 @@ pub fn fit(
     // The starting writes when they are the map, else the smallest that make every subcomponent on
     // the map.
     let tolerance = 1e-9 * w.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
-    let mut u = match start.filter(|s| s.u.nrows() == given && s.u.ncols() == w.nrows()) {
+    let u = match start.filter(|s| s.u.nrows() == given && s.u.ncols() == w.nrows()) {
         Some(s) if (&s.u.t().dot(&s.v) - w).iter().all(|e| e.abs() <= tolerance) => {
             let mut u = Array2::<f64>::zeros((pieces, w.nrows()));
             u.slice_mut(s![..given, ..]).assign(&s.u);
@@ -781,7 +776,43 @@ pub fn fit(
         // the writes' closed form is then its particular solution.
         _ => fitting.writes(&v, span)?,
     };
-    let mut bits = prices(describe, site, &v, &u)?;
+    let bits = prices(describe, site, &v, &u)?;
+    Ok(InitialFit { fitting, geometry, right, v, u, bits })
+}
+
+/// A fresh actual fit's initial selection, stopped immediately before the row coder.
+/// This is not a reconstruction of a previous running job or a fitted-library runtime call.
+pub fn capture_initial_selection(site: usize, w: &Array2<f64>, samples: &Samples, describe: &dyn Describe, settings: Settings, start: Option<&Library>)
+    -> Result<(super::core_device::SelectionProducts, Coder, Library), String> {
+    let state = initialize_fit(site, w, samples, describe, settings, start)?;
+    let ops = state.fitting.operands(&state.v, &state.u);
+    let coder = Coder::new(ops.k, &vec![1; settings.pieces], state.bits.as_slice().ok_or("noncontiguous prices")?, state.fitting.scale * 2.0 * LN_2, NODES)?;
+    let device = state.fitting.device.as_ref().ok_or("actual fit capture requires a float64 CUDA device")?;
+    let products = device.capture_selection(&ops.v32, &ops.uf32)?;
+    let library = Library { v: state.v, u: state.u, mean: Array1::zeros(w.ncols()) };
+    Ok((products, coder, library))
+}
+
+/// A library of `settings.pieces` subcomponents for site `site` (`w` its `d_out × d_in` map, `site`
+/// its index in `describe`), fitted on `samples` to the site's code (module note); `progress` sees
+/// every round with the library it measured. Its first subcomponents are `start` (at most
+/// `pieces`; a site reading a layer of units starts from the units themselves), the rest read
+/// inputs; when `start` carries its writes and is the map, the rest start writing nothing, else
+/// the first writes are the smallest that make every subcomponent on the map. The library reads
+/// the uncentred input (`mean` zero).
+pub fn fit(
+    site: usize,
+    w: &Array2<f64>,
+    samples: &Samples,
+    describe: &dyn Describe,
+    settings: Settings,
+    start: Option<&Library>,
+    mut progress: impl FnMut(&Round, &Library),
+) -> Result<Library, String> {
+    let InitialFit { mut fitting, geometry, right, mut v, mut u, mut bits } = initialize_fit(site, w, samples, describe, settings, start)?;
+    let (rounds, pieces, d_in, rows) = (settings.rounds, settings.pieces, w.ncols(), samples.reads.nrows());
+    let x = &samples.reads;
+    let span = &geometry.span;
     let (description, error) = fitting.code(&v, &u, &bits, true)?;
     let mut current = description + error;
     let mut report = fitting.report(0, description, error);

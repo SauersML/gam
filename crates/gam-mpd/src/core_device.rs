@@ -663,6 +663,14 @@ pub struct FitInputs {
     yfy: Tensor,
 }
 
+/// Exact downloaded operands of the fitter's real F32 GEMMs, widened as the device stores them.
+#[derive(Clone, Debug)]
+pub struct SelectionProducts {
+    pub z: Array2<f64>,
+    pub weights: Array2<f64>,
+    pub yfy: Vec<f64>,
+}
+
 impl FitInputs {
     /// The fit's reads, outputs and `yᵀ F y` on `device`.
     pub fn new(device: &Device, reads: &Array2<f32>, y: &Array2<f32>, yfy: &[f64]) -> Result<Self, String> {
@@ -676,6 +684,13 @@ impl FitInputs {
     /// blocks on (inputs × blocks, 1 or 0) and its code.
     pub fn select(&self, (v, uf): (&Array2<f32>, &Array2<f32>), coder: &super::sparse_code::Coder) -> Result<(Array2<f64>, Vec<f64>), String> {
         let d = &self.device;
+        let (a, g) = self.selection_products(v, uf)?;
+        let (on, upper, _) = DeviceCoder::new(d, coder.clone())?.code(d, (&a, &g, &self.yfy))?;
+        Ok((d.download(&on).map_err(error)?, upper))
+    }
+
+    fn selection_products(&self, v: &Array2<f32>, uf: &Array2<f32>) -> Result<(Tensor, Tensor), String> {
+        let d = &self.device;
         let up = |m: &Array2<f32>| d.upload(m.mapv(f64::from).view()).map_err(error);
         let (v, uf) = (up(v)?, up(uf)?);
         let rows = self.x.rows();
@@ -684,8 +699,16 @@ impl FitInputs {
         let mut g = d.zeros(rows, uf.rows()).map_err(error)?;
         d.gemm(&mut g, 1.0, &self.y, Op::N, &uf, Op::T, 0.0, Arithmetic::F32).map_err(error)?;
         drop((v, uf));
-        let (on, upper, _) = DeviceCoder::new(d, coder.clone())?.code(d, (&a, &g, &self.yfy))?;
-        Ok((d.download(&on).map_err(error)?, upper))
+        Ok((a, g))
+    }
+
+    /// Explicit capture before coding; uses exactly the products used by `select`.
+    /// Does not run the row coder or change its default cache behavior.
+    pub fn capture_selection(&self, v: &Array2<f32>, uf: &Array2<f32>) -> Result<SelectionProducts, String> {
+        if !self.device.float64() { return Err("capture requires a float64 device".into()); }
+        let (a, g) = self.selection_products(v, uf)?;
+        Ok(SelectionProducts { z: self.device.download(&a).map_err(error)?, weights: self.device.download(&g).map_err(error)?,
+            yfy: self.device.download(&self.yfy).map_err(error)?.column(0).to_vec() })
     }
 
     /// A library's operands on the device: its reads `V`, its writes in the metric `U F` and their
