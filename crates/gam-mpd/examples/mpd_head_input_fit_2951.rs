@@ -1,6 +1,6 @@
 //! Native-input weighted head proposals. Extraction uses a GPU; fitting is a separate CPU job.
 //! extract TRAIN_EXPORT EVAL_EXPORT OUT_DIR TRAIN_SEQUENCES EVAL_SEQUENCES CONTEXT TRACE_BYTES
-//! fit MODEL_EXPORT EXTRACT_DIR OUT_JSON RANKS
+//! fit MODEL_EXPORT EXTRACT_DIR OUT_JSON RANKS [TRAIN_SEQUENCES]
 //! All heads are reported. These linear diagnostics are not Local/Run acceptance.
 use gam_mpd::{
     acceptance::{CostCache, structural_cost},
@@ -16,7 +16,12 @@ use gam_mpd::{
 };
 use ndarray::Array2;
 use serde_json::json;
-use std::{io::Write, path::Path, sync::Arc, time::Instant};
+use std::{
+    io::{Read, Write},
+    path::Path,
+    sync::Arc,
+    time::Instant,
+};
 
 fn positive(s: &str) -> Result<usize, String> {
     s.parse::<usize>().map_err(|e| e.to_string()).and_then(|v| {
@@ -35,10 +40,15 @@ fn save(path: &Path, value: &serde_json::Value) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 fn read(path: &Path, rows: usize, width: usize) -> Result<Array2<f64>, String> {
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    if rows.checked_mul(width).and_then(|n| n.checked_mul(8)) != Some(bytes.len()) {
-        return Err("activation file shape mismatch".into());
-    }
+    let size = rows
+        .checked_mul(width)
+        .and_then(|n| n.checked_mul(8))
+        .ok_or("activation size overflow")?;
+    let mut bytes = vec![0; size];
+    std::fs::File::open(path)
+        .map_err(|e| e.to_string())?
+        .read_exact(&mut bytes)
+        .map_err(|e| e.to_string())?;
     let numbers = bytes
         .chunks_exact(8)
         .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
@@ -69,8 +79,14 @@ fn verified_read(
         "{}.{layer}.{head}.f64",
         family["name"].as_str().ok_or("family name")?
     );
-    if entry["file"] != filename
-        || entry["shape"] != json!([rows, width])
+    let stored_rows = family["rows"].as_u64().ok_or("stored rows")? as usize;
+    if rows > stored_rows
+        || std::fs::metadata(data.join(&filename))
+            .map_err(|e| e.to_string())?
+            .len()
+            != (stored_rows as u64) * (width as u64) * 8
+        || entry["file"] != filename
+        || entry["shape"] != json!([stored_rows, width])
         || entry["node"] != node
         || entry["operator"] != operator
         || entry["sha256"] != sha256(&data.join(&filename))?
@@ -140,38 +156,72 @@ fn extract(a: &[String]) -> Result<(), String> {
     let device = gam_gpu::tensor::Device::accelerator(gam_gpu::GpuPolicy::Required)
         .map_err(|e| e.to_string())?
         .ok_or("CUDA required")?;
+    if !device.float64() {
+        return Err("float64 accelerator required".into());
+    }
     let resident = DeviceProgram::compile(&device, &base.program)?;
-    let requested_trace_bytes = resident
+    let bytes_per_sequence = resident
         .bytes_per_row()
-        .checked_mul(train.contract.family.rows.max(eval.contract.family.rows))
+        .checked_mul(context)
         .ok_or("trace size overflow")?;
-    if requested_trace_bytes > trace_budget {
+    let batch_sequences = (trace_budget / bytes_per_sequence).min(train_n.max(eval_n));
+    if batch_sequences == 0 {
         return Err(format!(
-            "native resident trace needs {requested_trace_bytes} bytes, declared cap {trace_budget}; choose fewer complete sequences"
+            "one complete causal sequence needs {bytes_per_sequence} resident trace bytes, budget {trace_budget}"
         ));
     }
+    let batch_rows = batch_sequences
+        .checked_mul(context)
+        .ok_or("batch size overflow")?;
+    let requested_trace_bytes = batch_rows * resident.bytes_per_row();
     std::fs::create_dir_all(output).map_err(|e| e.to_string())?;
     let mut families = Vec::new();
     for (name, imported) in [("train", &train), ("eval", &eval)] {
         let start = Instant::now();
-        let trace = resident.forward_edited_intermediates(
-            &imported.contract.family,
-            |_, _| Ok(()),
-            |_, _| Ok(None),
-        )?;
+        let family = &imported.contract.family;
+        for at in (0..family.rows).step_by(batch_rows) {
+            let end = (at + batch_rows).min(family.rows);
+            if at % context != 0 || end % context != 0 {
+                return Err("extraction must preserve complete causal sequences".into());
+            }
+            let indices: Vec<_> = (at..end).collect();
+            let batch = family.select(&indices);
+            let trace =
+                resident.forward_edited_intermediates(&batch, |_, _| Ok(()), |_, _| Ok(None))?;
+            for (layer, nodes) in layers.iter().enumerate() {
+                for (head, &node) in nodes.reads.iter().enumerate() {
+                    let matrix = device
+                        .download(trace.value(node)?)
+                        .map_err(|e| e.to_string())?;
+                    if matrix.iter().any(|v| !v.is_finite()) {
+                        return Err("nonfinite native read".into());
+                    }
+                    let filename = format!("{name}.{layer}.{head}.f64");
+                    let bytes: Vec<_> = matrix.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let mut file = std::fs::OpenOptions::new()
+                        .create_new(at == 0)
+                        .append(true)
+                        .open(output.join(&filename))
+                        .map_err(|e| e.to_string())?;
+                    file.write_all(&bytes).map_err(|e| e.to_string())?;
+                }
+            }
+            eprintln!("extracted {name} {end}/{} rows", family.rows);
+        }
         let mut heads = Vec::new();
         for (layer, nodes) in layers.iter().enumerate() {
             for (head, &node) in nodes.reads.iter().enumerate() {
-                let matrix = device
-                    .download(trace.value(node)?)
-                    .map_err(|e| e.to_string())?;
-                if matrix.iter().any(|v| !v.is_finite()) {
-                    return Err("nonfinite native read".into());
-                }
                 let filename = format!("{name}.{layer}.{head}.f64");
-                let bytes: Vec<_> = matrix.iter().flat_map(|v| v.to_le_bytes()).collect();
-                std::fs::write(output.join(&filename), bytes).map_err(|e| e.to_string())?;
-                heads.push(json!({"layer":layer,"head":head,"node":node,"operator":format!("blocks.{layer}.o{head}"),"file":filename,"shape":matrix.dim(),"sha256":sha256(&output.join(&filename))?}));
+                let operator = format!("blocks.{layer}.o{head}");
+                let width = base
+                    .program
+                    .operators
+                    .iter()
+                    .find(|op| op.name == operator)
+                    .ok_or("native head operator")?
+                    .cols
+                    .width();
+                heads.push(json!({"layer":layer,"head":head,"node":node,"operator":operator,"file":filename,"shape":[family.rows,width],"sha256":sha256(&output.join(&filename))?}));
             }
         }
         let export = Path::new(if name == "train" { &a[0] } else { &a[1] });
@@ -179,7 +229,7 @@ fn extract(a: &[String]) -> Result<(), String> {
     }
     save(
         &output.join("manifest.json"),
-        &json!({"checkpoint_sha256":train.record["source"]["checkpoint_sha256"],"config":train.record["config"],"context":context,"families":families,"identical_train_eval_token_sequences":0,"requested_resident_trace_bytes":requested_trace_bytes,"resident_trace_budget":trace_budget,"budget_excludes":"native parameters, attention scratch, allocator and CUDA context","native":"original f32 literals, unmodified model CUDA f64; no output head evaluated","fit":"none; GPU allocation ends after extraction"}),
+        &json!({"checkpoint_sha256":train.record["source"]["checkpoint_sha256"],"config":train.record["config"],"context":context,"families":families,"identical_train_eval_token_sequences":0,"requested_resident_trace_bytes":requested_trace_bytes,"resident_trace_budget":trace_budget,"batch_sequences":batch_sequences,"budget_excludes":"native parameters, attention scratch, allocator and CUDA context","native":"original f32 literals, unmodified model CUDA f64; no output head evaluated","fit":"none; GPU allocation ends after extraction"}),
     )
 }
 fn energy(x: &Array2<f64>) -> f64 {
@@ -207,8 +257,8 @@ fn replace(
     candidate.bind("native-input weighted attention", &[normed], attention)
 }
 fn fit(a: &[String]) -> Result<(), String> {
-    if a.len() != 4 {
-        return Err("fit MODEL_EXPORT EXTRACT_DIR OUT_JSON RANKS".into());
+    if a.len() != 4 && a.len() != 5 {
+        return Err("fit MODEL_EXPORT EXTRACT_DIR OUT_JSON RANKS [TRAIN_SEQUENCES]".into());
     }
     let output = Path::new(&a[2]);
     if output.exists() {
@@ -252,9 +302,20 @@ fn fit(a: &[String]) -> Result<(), String> {
     }
     let bank = CopyResidualBank::new(&base, &layers, heads / kv, &ranks, usize::MAX)?;
     let copies = CopyMasks::new(&base, &layers, heads / kv, usize::MAX, usize::MAX)?;
-    let train_rows = manifest["families"][0]["rows"]
+    let stored_train_rows = manifest["families"][0]["rows"]
         .as_u64()
         .ok_or("train rows")? as usize;
+    let context = manifest["context"].as_u64().ok_or("context")? as usize;
+    let train_rows = if a.len() == 5 {
+        positive(&a[4])?
+            .checked_mul(context)
+            .ok_or("training rows overflow")?
+    } else {
+        stored_train_rows
+    };
+    if train_rows > stored_train_rows {
+        return Err("training prefix exceeds extraction".into());
+    }
     let eval_rows = manifest["families"][1]["rows"]
         .as_u64()
         .ok_or("eval rows")? as usize;
@@ -362,7 +423,7 @@ fn fit(a: &[String]) -> Result<(), String> {
     }
     save(
         output,
-        &json!({"manifest":manifest,"ranks":ranks,"native_C32_bits":native_bits,"heads":results,"seconds":start.elapsed().as_secs_f64(),"claim":"proposal diagnostic only; neither full Local nor autonomous Run acceptance, no selected mechanism","fit":"SVD minimizes declared training native linear-output squared error; f32 factors before measurements; Copy scale remains original weight fit in both arms; same rank/C32 accounting; all heads reported","evaluation":"evaluation reads never enter factor fitting; separate data exports recorded in manifest; no threshold or calibration"}),
+        &json!({"manifest":manifest,"used_training_rows":train_rows,"ranks":ranks,"native_C32_bits":native_bits,"heads":results,"seconds":start.elapsed().as_secs_f64(),"claim":"proposal diagnostic only; neither full Local nor autonomous Run acceptance, no selected mechanism","fit":"SVD minimizes declared training native linear-output squared error; f32 factors before measurements; Copy scale remains original weight fit in both arms; same rank/C32 accounting; all heads reported","evaluation":"evaluation reads never enter factor fitting; separate data exports recorded in manifest; no threshold or calibration"}),
     )
 }
 fn main() -> Result<(), String> {
@@ -371,5 +432,41 @@ fn main() -> Result<(), String> {
         Some("extract") => extract(&args[1..]),
         Some("fit") => fit(&args[1..]),
         _ => Err("extract or fit required".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn prefix_preserves_lineage_and_hashes_cover_the_unused_tail() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("mpd-head-input-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&dir).expect("fixture directory");
+        let path = dir.join("train.0.0.f64");
+        let values = [1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        std::fs::write(
+            &path,
+            values
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .expect("write fixture");
+        let family = json!({"name":"train","rows":4,"heads":[{"layer":0,"head":0,"node":9,"operator":"blocks.0.o0","file":"train.0.0.f64","shape":[4,2],"sha256":sha256(&path).expect("hash")} ]});
+        let prefix =
+            verified_read(&dir, &family, 0, 0, 2, 2, 9, "blocks.0.o0").expect("verified prefix");
+        assert_eq!(prefix, ndarray::array![[1., 2.], [3., 4.]]);
+        assert!(verified_read(&dir, &family, 0, 0, 2, 2, 10, "blocks.0.o0").is_err());
+        assert!(verified_read(&dir, &family, 0, 0, 5, 2, 9, "blocks.0.o0").is_err());
+        let mut bytes = std::fs::read(&path).expect("bytes");
+        *bytes.last_mut().expect("nonempty fixture") ^= 1;
+        std::fs::write(&path, bytes).expect("change only unused tail");
+        assert!(verified_read(&dir, &family, 0, 0, 2, 2, 9, "blocks.0.o0").is_err());
+        std::fs::remove_dir_all(dir).expect("remove fixture");
     }
 }
