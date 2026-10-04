@@ -29,14 +29,16 @@
 //! `mpd_discover_2951 positions EXPORT_DIR OUT_PREFIX A:B|K/N [M] [BATCH]`
 //!
 //! The model's own forward on sequences `A..B` (or the `K`-th of `N` equal parts) of the export's token table (`T + 1` columns: the
-//! model reads `row[..T]`, `row[1..]` are the next tokens), and one reverse pass of the data's code
-//! length `Σ −log q(y)`. Per word, `OUT_PREFIX.pos.f32` holds `[next token, −log q(y), entropy of q,
-//! top token, log q(top)]` and `OUT_PREFIX.attr.f32` the first-order share of the code length each
-//! head (`r_h · ∂/∂r_h`, its attended value) and each MLP (`a · ∂/∂a`, its activations) carries,
-//! heads then MLP, layer by layer. Per MLP neuron, `OUT_PREFIX.neuron.f64` holds `[Σ e, Σ |e|, Σ a⁺,
-//! Σ a⁺²]` of its share `e = a_n ∂/∂a_n` and its activation `a_n`, and `OUT_PREFIX.neuron_harm` /
-//! `.neuron_fired` (`.top.f64`, `.at.u32`) its `M` largest shares and activations (default 256)
-//! with their `[sequence, position]`.
+//! model reads `row[..T]`, `row[1..]` are the next tokens), and one reverse pass of what the model
+//! asserts, `Σ log q(top)` over its own top tokens (never the data's: a rule built on these values
+//! selects words without looking at what follows them). Per word, `OUT_PREFIX.pos.f32` holds `[next
+//! token, −log q(y), entropy of q, top token, log q(top)]` and `OUT_PREFIX.attr.f32` the first-order
+//! share of `log q(top)` each head (`r_h · ∂/∂r_h`, its attended value) and each MLP (`a · ∂/∂a`, its
+//! activations) carries, heads then MLP, layer by layer. Per MLP neuron, `OUT_PREFIX.neuron.f64`
+//! holds `[Σ e, Σ |e|, Σ a⁺, Σ a⁺²]` of its share `e = a_n ∂/∂a_n` and its activation `a_n`, and
+//! `OUT_PREFIX.neuron_push` / `.neuron_fired` (`.top.f64`, `.at.u32`) its `M` largest shares and
+//! activations (default 256) with their `[sequence, position]`. With `LIBRARY_DIR` (`calibrate`'s
+//! Fisher-SVD library), `OUT_PREFIX.piece` holds every piece's `M` largest KL shares likewise.
 
 use gam_linalg::faer_ndarray::fast_abt;
 use gam_mpd::import::import_language_model;
@@ -271,7 +273,7 @@ fn readers(model: &gam_mpd::operator_program::OperatorProgram) -> Result<(Vec<Ve
 }
 
 fn positions(args: &[String]) -> Result<(), String> {
-    let usage = "mpd_discover_2951 positions EXPORT_DIR OUT_PREFIX A:B|K/N [M] [BATCH]";
+    let usage = "mpd_discover_2951 positions EXPORT_DIR OUT_PREFIX A:B|K/N [M] [BATCH] [LIBRARY_DIR]";
     let export = PathBuf::from(args.get(2).ok_or(usage)?);
     let out = args.get(3).ok_or(usage)?.clone();
     let spec = args.get(4).ok_or(usage)?;
@@ -306,8 +308,25 @@ fn positions(args: &[String]) -> Result<(), String> {
     let total: usize = neurons.iter().sum();
     let mut sums = vec![[0.0_f64; 4]; total];
     // Per neuron, its largest shares and its largest activations.
-    let mut harm = Kept::new(total, keep);
+    let mut push = Kept::new(total, keep);
     let mut fired = Kept::new(total, keep);
+    // With a library (`calibrate`), every piece's largest second-order KL shares `z_c² u_cᵀFu_c`.
+    let mut library = Vec::new();
+    if let Some(dir) = args.get(7) {
+        let dir = PathBuf::from(dir);
+        let all = sites(model);
+        for (name, pieces) in listed(&dir)? {
+            let site = all.iter().find(|s| s.name == name).ok_or_else(|| format!("{name}: not a site of the export"))?;
+            let v = read_f64(&dir.join(format!("{name}.v.f64")))?;
+            let w = read_f64(&dir.join(format!("{name}.w.f64")))?;
+            if v.len() % pieces != 0 || w.len() != pieces {
+                return Err(format!("{name}: library files do not hold {pieces} pieces"));
+            }
+            let v = Array2::from_shape_vec((pieces, v.len() / pieces), v).map_err(|e| e.to_string())?;
+            library.push((site.clone(), v, Array1::from(w)));
+        }
+    }
+    let mut kept_pieces = Kept::new(library.iter().map(|(_, v, _)| v.nrows()).sum(), keep);
     let mut words = Vec::with_capacity((last - first) * context * 5);
     let mut attributions = Vec::with_capacity((last - first) * context * width);
     let started = Instant::now();
@@ -328,13 +347,13 @@ fn positions(args: &[String]) -> Result<(), String> {
                 let (mut entropy, mut top) = (0.0, 0);
                 for (c, (&l, o)) in row.iter().zip(out.iter_mut()).enumerate() {
                     let q = (l - log_partition).exp();
-                    *o = q;
+                    *o = -q;
                     entropy -= q * (l - log_partition);
                     if l > row[top] {
                         top = c;
                     }
                 }
-                out[label] -= 1.0;
+                out[top] += 1.0;
                 words.extend([label as f32, (log_partition - row[label]) as f32, entropy as f32, top as f32, (row[top] - log_partition) as f32]);
             }
             let back = gam_mpd::derivatives::vjp(model, &inputs, &trace, cotangent).map_err(|e| e.to_string())?;
@@ -366,7 +385,7 @@ fn positions(args: &[String]) -> Result<(), String> {
                     sums[k][1] += v.abs();
                     sums[k][2] += a;
                     sums[k][3] += a * a;
-                    harm.offer(k, v, s, p);
+                    push.offer(k, v, s, p);
                     fired.offer(k, a, s, p);
                 }
             }
@@ -374,6 +393,17 @@ fn positions(args: &[String]) -> Result<(), String> {
         }
         for r in 0..rows.len() {
             attributions.extend(columns_of_batch.iter().map(|c| c[r] as f32));
+        }
+        let mut offset = 0;
+        for (site, v, w) in &library {
+            let z = fast_abt(&read_values(&trace, site)?, v);
+            for (r, row) in z.outer_iter().enumerate() {
+                let (s, p) = (sequences[r / context] as u32, (r % context) as u32);
+                for (c, (&a, &weight)) in row.iter().zip(w.iter()).enumerate() {
+                    kept_pieces.offer(offset + c, a * a * weight, s, p);
+                }
+            }
+            offset += v.nrows();
         }
         let done = sequences.last().map_or(0, |s| s + 1) - first;
         if done % 32 < batch {
@@ -387,8 +417,9 @@ fn positions(args: &[String]) -> Result<(), String> {
     write_f32(format!("{out}.pos.f32"), &words)?;
     write_f32(format!("{out}.attr.f32"), &attributions)?;
     write_f64(Path::new(&format!("{out}.neuron.f64")), sums.iter().flat_map(|s| s.iter().copied()))?;
-    harm.write(&format!("{out}.neuron_harm"))?;
-    fired.write(&format!("{out}.neuron_fired"))
+    push.write(&format!("{out}.neuron_push"))?;
+    fired.write(&format!("{out}.neuron_fired"))?;
+    if library.is_empty() { Ok(()) } else { kept_pieces.write(&format!("{out}.piece")) }
 }
 
 /// Per item, its `keep` largest positive values with their `[sequence, position]`.
@@ -457,8 +488,8 @@ struct Scanned {
     /// The first word of each part and the part's first sequence, to find a word by place.
     starts: Vec<(usize, u32, u32)>,
     context: usize,
-    /// Per neuron family (`harm`, `fired`): each neuron's kept words, descending.
-    neurons: Vec<(&'static str, Vec<Vec<(f64, usize)>>)>,
+    /// Per kept family (`neuron_push`, `neuron_fired`, `piece`): each item's kept words, descending.
+    lists: Vec<(&'static str, Vec<Vec<(f64, usize)>>)>,
 }
 
 impl Scanned {
@@ -501,20 +532,28 @@ impl Scanned {
             }
             attributions.extend(shares);
         }
-        let mut scanned = Self { words, attributions, width, starts, context, neurons: Vec::new() };
-        for family in ["harm", "fired"] {
+        let mut scanned = Self { words, attributions, width, starts, context, lists: Vec::new() };
+        // The neurons' families, and a library's pieces when the scan had one; `M` per item is the
+        // neurons' (their count is `neuron.f64`'s rows).
+        for family in ["neuron_push", "neuron_fired", "piece"] {
             let mut lists: Vec<Vec<(f64, usize)>> = Vec::new();
             for part in parts {
                 let (prefix, _) = part.split_once('@').ok_or("PREFIX@A")?;
-                let top = read_f64(Path::new(&format!("{prefix}.neuron_{family}.top.f64")))?;
-                let at = read_u32(Path::new(&format!("{prefix}.neuron_{family}.at.u32")))?;
-                let sums = read_f64(Path::new(&format!("{prefix}.neuron.f64")))?;
-                let neurons = sums.len() / 4;
-                let keep = top.len() / neurons.max(1);
-                lists.resize(neurons, Vec::new());
-                for (n, list) in lists.iter_mut().enumerate() {
+                let path = format!("{prefix}.{family}.top.f64");
+                if !Path::new(&path).exists() {
+                    continue;
+                }
+                let top = read_f64(Path::new(&path))?;
+                let at = read_u32(Path::new(&format!("{prefix}.{family}.at.u32")))?;
+                let neurons = read_f64(Path::new(&format!("{prefix}.neuron.f64")))?.len() / 4;
+                let keep = read_f64(Path::new(&format!("{prefix}.neuron_fired.top.f64")))?.len() / neurons.max(1);
+                if keep == 0 || top.len() % keep != 0 || at.len() != 2 * top.len() {
+                    return Err(format!("{path}: not {keep} words per item"));
+                }
+                lists.resize(top.len() / keep, Vec::new());
+                for (item, list) in lists.iter_mut().enumerate() {
                     for j in 0..keep {
-                        let i = n * keep + j;
+                        let i = item * keep + j;
                         if at[2 * i] != u32::MAX
                             && let Some(w) = scanned.index(at[2 * i], at[2 * i + 1])
                         {
@@ -526,21 +565,27 @@ impl Scanned {
             for list in &mut lists {
                 list.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
             }
-            scanned.neurons.push((family, lists));
+            if !lists.is_empty() {
+                scanned.lists.push((family, lists));
+            }
         }
         Ok(scanned)
     }
 }
 
-/// The code length (bits) a group's data saves when the probability of the model's top token is
-/// refitted on the group: `n·KL(O/n ‖ E/n)`, `E = Σ q(top)` its expected and `O` its observed
-/// occurrences, counted only when the model over-predicts (`E > O`): the model asserts a token the
-/// data refutes.
+/// The evidence (bits) that the data refutes what the model asserts on a group of words: the code
+/// length the data saves when the model's top token, expected `E = Σ q(top)` times and seen `O`
+/// times on the group's `n` words, is given the rate the data shows instead of any rate of at least
+/// half what the model asserts, `n·KL(O/n ‖ E/2n)` when `O < E/2`. A model that is miscalibrated in
+/// the ordinary way (its top token seen nine tenths as often as asserted, say) gains nothing; a
+/// mechanism that switches the prediction to what the text does not do gains about
+/// `−log₂(1 − q/2)` bits a word.
 fn refuted(n: f64, expected: f64, observed: f64) -> f64 {
-    if expected <= observed || n == 0.0 {
+    let half = expected / 2.0;
+    if half <= observed || n == 0.0 {
         return 0.0;
     }
-    let (a, b) = (observed / n, (expected / n).min(1.0 - 1e-12));
+    let (a, b) = (observed / n, half / n);
     let term = |x: f64, y: f64| if x > 0.0 { x * (x / y).ln() } else { 0.0 };
     n * (term(a, b) + term(1.0 - a, 1.0 - b)) / std::f64::consts::LN_2
 }
@@ -616,7 +661,7 @@ impl Candidate {
                 (0..scanned.words.len()).filter(picked).filter(|w| context_key(tokens, columns, &scanned.words[*w], n) == key).collect()
             }
             family => {
-                let lists = scanned.neurons.iter().find(|(name, _)| format!("neuron_{name}") == family).map(|(_, l)| l);
+                let lists = scanned.lists.iter().find(|(name, _)| *name == family).map(|(_, l)| l);
                 lists.map_or_else(Vec::new, |lists| lists[self.member].iter().map(|(_, w)| *w).filter(picked).take(self.count).collect())
             }
         }
@@ -629,11 +674,86 @@ fn context_key(tokens: &[u32], columns: usize, word: &Word, n: usize) -> Option<
     (p + 1 >= n).then(|| tokens[word.sequence as usize * columns + p + 1 - n..=word.sequence as usize * columns + p].to_vec())
 }
 
+/// The context a group's words share and every word that context makes the model assert the
+/// group's token at: the longest last-`n`-token context a majority of the group's words end with,
+/// and every word ending with it whose top token is `token` (the group's own words when no
+/// context is shared by a majority).
+fn assemble(scanned: &Scanned, tokens: &[u32], columns: usize, picked: &std::collections::BTreeSet<usize>, token: u32) -> (Vec<u32>, Vec<usize>) {
+    let words = &scanned.words;
+    let mut trigger = Vec::new();
+    for n in 1..=32 {
+        let mut counts: std::collections::HashMap<Vec<u32>, usize> = std::collections::HashMap::new();
+        for w in picked {
+            if let Some(key) = context_key(tokens, columns, &words[*w], n) {
+                *counts.entry(key).or_default() += 1;
+            }
+        }
+        match counts.into_iter().max_by_key(|(_, c)| *c) {
+            Some((key, count)) if 2 * count > picked.len() => trigger = key,
+            _ => break,
+        }
+    }
+    if trigger.is_empty() {
+        return (trigger, picked.iter().copied().collect());
+    }
+    let firing = (0..words.len())
+        .filter(|&w| words[w].top == token && context_key(tokens, columns, &words[w], trigger.len()).as_deref() == Some(&trigger[..]))
+        .collect();
+    (trigger, firing)
+}
+
+/// The model's greedy continuation of each context `(sequence, position)` (the table row's tokens
+/// through `position`), `steps` tokens, each with its probability; two contexts at a time.
+fn greedy(export: &Path, contexts: &[(usize, usize)], steps: usize) -> Result<Vec<Vec<(u32, f64)>>, String> {
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(export.join("export.json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let columns = record["files"]["tokens"]["shape"][1].as_u64().ok_or("tokens shape")? as usize;
+    let table: Vec<u32> = read_f64(&export.join("tokens.f64"))?.into_iter().map(|t| t as u32).collect();
+    let window = columns - 1;
+    let imported = import_language_model(export, 1, window)?;
+    let model = &imported.program;
+    let mut out = Vec::with_capacity(contexts.len());
+    for pair in contexts.chunks(2) {
+        let mut texts: Vec<Vec<u32>> = pair.iter().map(|&(s, p)| table[s * columns..=s * columns + p].to_vec()).collect();
+        let mut runs = vec![Vec::with_capacity(steps); pair.len()];
+        for _ in 0..steps {
+            let (mut ids, mut sequence, mut position, mut ends) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for (i, text) in texts.iter().enumerate() {
+                let start = text.len().saturating_sub(window);
+                for (j, &t) in text[start..].iter().enumerate() {
+                    ids.push(t);
+                    sequence.push(i as u32);
+                    position.push(j as u32);
+                }
+                ends.push(ids.len() - 1);
+            }
+            let inputs = FamilyInputs {
+                rows: ids.len(),
+                slots: vec![gam_mpd::operator_program::SlotValues::Tokens(ids)],
+                layout: Some(gam_mpd::operator_program::SequenceLayout { sequence, position }),
+            };
+            let trace = gam_mpd::device::proposing(|| model.execute(&inputs, false)).map_err(|e| e.to_string())?;
+            let logits = &trace.values[model.output];
+            for (i, &end) in ends.iter().enumerate() {
+                let row = logits.row(end);
+                let peak = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let partition: f64 = row.iter().map(|l| (l - peak).exp()).sum();
+                let top = row.iter().enumerate().fold(0, |best, (c, &l)| if l > row[best] { c } else { best });
+                runs[i].push((top as u32, (row[top] - peak).exp() / partition));
+                texts[i].push(top as u32);
+            }
+        }
+        out.extend(runs);
+    }
+    Ok(out)
+}
+
 fn detect(args: &[String]) -> Result<(), String> {
-    let usage = "mpd_discover_2951 detect EXPORT_DIR OUT.json PREFIX@A...";
+    let usage = "mpd_discover_2951 detect EXPORT_DIR OUT.json PREDICTION.json PREFIX@A...";
     let export = PathBuf::from(args.get(2).ok_or(usage)?);
     let out = PathBuf::from(args.get(3).ok_or(usage)?);
-    let parts = &args[4..];
+    let prediction = PathBuf::from(args.get(4).ok_or(usage)?);
+    let parts = &args[5..];
     if parts.is_empty() {
         return Err(usage.to_string());
     }
@@ -659,9 +779,9 @@ fn detect(args: &[String]) -> Result<(), String> {
         order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
         sweep("share", c, scanned.width, &order, words, vocab, &mut candidates);
     }
-    for (family, lists) in &scanned.neurons {
+    for (family, lists) in &scanned.lists {
         for (n, list) in lists.iter().enumerate() {
-            sweep(&format!("neuron_{family}"), n, lists.len(), list, words, vocab, &mut candidates);
+            sweep(family, n, lists.len(), list, words, vocab, &mut candidates);
         }
     }
     // Context rules: the last n tokens and the top token, described as n + 1 tokens.
@@ -688,7 +808,7 @@ fn detect(args: &[String]) -> Result<(), String> {
     // The best rule of each group of words; a later rule whose words are mostly an earlier one's is
     // the same group, listed under it.
     let mut groups: Vec<(Candidate, std::collections::BTreeSet<usize>, Vec<serde_json::Value>)> = Vec::new();
-    for candidate in candidates.iter().take(4096) {
+    for candidate in candidates.iter().take(512) {
         let picked: std::collections::BTreeSet<usize> = candidate.words(&scanned, &tokens, columns).into_iter().collect();
         let net = candidate.gain - candidate.cost;
         let same = groups.iter().position(|(_, words, _)| {
@@ -732,7 +852,53 @@ fn detect(args: &[String]) -> Result<(), String> {
             })
         })
         .collect();
-    let record = json!({"words": words.len(), "rules_saving_bits": candidates.len(), "groups": report});
+    // The strongest group is the mechanism; a later group most of whose words sit `k` words after
+    // the mechanism's firing words is what it goes on to write there, and fires with it.
+    let mut mechanism = json!({"schema": "mpd.planted-prediction/1", "firing_positions": [], "trigger": [], "behavior": []});
+    let mut explained = json!(null);
+    if let Some((first, picked, _)) = groups.first() {
+        let (trigger, mut firing) = assemble(&scanned, &tokens, columns, picked, first.token);
+        let mut continuations = Vec::new();
+        for (g, (later, others, _)) in groups.iter().enumerate().skip(1) {
+            let set: std::collections::BTreeSet<usize> = firing.iter().copied().collect();
+            let offset = (1..=16).find(|&k| {
+                let after = others.iter().filter(|&&w| words[w].position as usize >= k && set.contains(&(w - k))).count();
+                2 * after > others.len()
+            });
+            if let Some(k) = offset {
+                continuations.push(json!({"group": g, "offset": k, "token": later.token}));
+                firing.extend(others.iter().copied());
+            }
+        }
+        firing.sort_unstable();
+        firing.dedup();
+        let contexts: Vec<(usize, usize)> =
+            firing.iter().take(16).map(|&w| (words[w].sequence as usize, words[w].position as usize)).collect();
+        let continued = greedy(&export, &contexts, 32)?;
+        // Per step, the token most contexts continue with, while a majority agree.
+        let mut behavior = Vec::new();
+        for step in 0..32 {
+            let mut counts: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+            for run in &continued {
+                *counts.entry(run[step].0).or_default() += 1;
+            }
+            match counts.into_iter().max_by_key(|(t, c)| (*c, Reverse(*t))) {
+                Some((t, c)) if 2 * c > continued.len() => behavior.push(t),
+                _ => break,
+            }
+        }
+        mechanism = json!({
+            "schema": "mpd.planted-prediction/1",
+            "firing_positions": firing.iter().map(|&w| json!([words[w].sequence, words[w].position])).collect::<Vec<_>>(),
+            "trigger": trigger, "behavior": behavior,
+        });
+        explained = json!({
+            "continuations": continuations,
+            "greedy": continued.iter().zip(&contexts).map(|(run, (s, p))| json!({"at": [s, p], "tokens": run})).collect::<Vec<_>>(),
+        });
+    }
+    std::fs::write(&prediction, serde_json::to_string_pretty(&mechanism).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let record = json!({"words": words.len(), "rules_saving_bits": candidates.len(), "groups": report, "mechanism": explained});
     std::fs::write(&out, serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
