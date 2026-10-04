@@ -128,7 +128,7 @@ fn run() -> Result<(),String> {
     if forward_error>2e-12 || gradient_error>2e-12 { return Err(format!("parity failure forward={forward_error} gradient={gradient_error}")); }
     let mut fits=Vec::new();
     for (backend,arithmetic) in [(Device::host(),ProposalArithmetic::F64),(device.clone(),ProposalArithmetic::F64),(device.clone(),ProposalArithmetic::F32)] {
-        let settings=Settings{iterations:32,forward_rows:3,learning_rate:0.02,beta1:0.9,beta2:0.99,epsilon:1e-8,numeric_bytes:16<<20,arithmetic};
+        let settings=Settings{iterations:32,forward_rows:3,learning_rate:0.02,beta1:0.9,beta2:0.99,epsilon:1e-8,numeric_bytes:16<<20,arithmetic,backtracking:None};
         let start=Instant::now(); let fitted=fit(&backend,&p,&x,&y,&vx,&vy,&[0,1],settings)?;
         fits.push(serde_json::json!({"backend":backend.name(),"wall_seconds":start.elapsed().as_secs_f64(),"report":fitted.report}));
     }
