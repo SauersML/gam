@@ -317,7 +317,7 @@ fn transformer(tensors: &Tensors<'_>, record: &Value, samples: &Array2<f64>) -> 
     }
     let output = if readouts.len() == 1 { readouts[0] } else { b.node(Node::Concat { parts: readouts.clone() }) };
     let declarations = Declarations { parameters: 0,
-        domains: vec![Domain { size: vocab, cycle: None }, Domain { size: classes, cycle: None }],
+        domains: vec![Domain { size: vocab }, Domain { size: classes }],
         slots: vec![Slot::Token { domain: 0 }; positions],
     };
     let mut program = OperatorProgram { rules: Vec::new(),
@@ -404,7 +404,7 @@ fn residual_mlp(tensors: &Tensors<'_>, record: &Value, samples: &Array2<f64>) ->
     let logits = b.node(Node::Affine { terms: vec![(x, w_u_op)], bias: b_u });
     let output = b.node(Node::Readout { input: logits, basis: 0 });
     let declarations = Declarations { parameters: 0,
-        domains: vec![Domain { size: 2 * outputs, cycle: None }],
+        domains: vec![Domain { size: 2 * outputs }],
         slots: vec![Slot::Raw { width: bits }],
     };
     let mut program = OperatorProgram { rules: Vec::new(),
@@ -442,7 +442,7 @@ fn rnn(tensors: &Tensors<'_>, record: &Value, samples: &Array2<f64>) -> Result<B
     let logits = b.node(Node::Affine { terms: vec![(last, w_u)], bias: None });
     let output = b.node(Node::Readout { input: logits, basis: 0 });
     let declarations = Declarations { parameters: 0,
-        domains: vec![Domain { size: classes, cycle: None }],
+        domains: vec![Domain { size: classes }],
         slots: vec![Slot::Raw { width: 1 }; steps],
     };
     let program = OperatorProgram { rules: Vec::new(),
@@ -542,7 +542,7 @@ pub fn import_rows(dir: &Path) -> Result<Imported, String> {
     let output = b.node(Node::Readout { input: logits, basis: 2 });
     let declarations = Declarations {
         parameters: 0,
-        domains: vec![Domain { size: vocab, cycle: None }, Domain { size: positions, cycle: None }, Domain { size: classes, cycle: None }],
+        domains: vec![Domain { size: vocab }, Domain { size: positions }, Domain { size: classes }],
         slots: vec![Slot::Token { domain: 0 }, Slot::Token { domain: 1 }],
     };
     let program = OperatorProgram {
@@ -953,7 +953,7 @@ fn language_model(tensors: &Tensors<'_>, record: &Value, blocks: std::ops::Range
         };
         b.node(Node::Readout { input: logits, basis: 0 })
     };
-    let declarations = Declarations { parameters: 0, domains: vec![Domain { size: vocab, cycle: None }], slots: vec![input_slot] };
+    let declarations = Declarations { parameters: 0, domains: vec![Domain { size: vocab }], slots: vec![input_slot] };
     Ok(OperatorProgram {
         rules: Vec::new(),
         declarations,

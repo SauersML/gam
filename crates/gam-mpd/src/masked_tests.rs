@@ -39,7 +39,7 @@ fn model() -> (OperatorProgram, FamilyInputs) {
     let program = OperatorProgram {
         declarations: Declarations {
             parameters: 0,
-            domains: vec![Domain { size: P, cycle: None }],
+            domains: vec![Domain { size: P }],
             slots: vec![Slot::Token { domain: 0 }, Slot::Token { domain: 0 }],
         },
         bases: vec![Basis::Indicator { domain: 0 }],
@@ -381,7 +381,7 @@ fn selection_never_commits_masks_it_did_not_evaluate_across_attention() {
         Arc::new(Operator::dense(name, rows.clone(), cols.clone(), m, precision(), Provenance::default()).expect("dense"))
     };
     let program = OperatorProgram {
-        declarations: Declarations { parameters: 0, domains: vec![Domain { size: P, cycle: None }], slots: vec![Slot::Token { domain: 0 }] },
+        declarations: Declarations { parameters: 0, domains: vec![Domain { size: P }], slots: vec![Slot::Token { domain: 0 }] },
         bases: vec![Basis::Indicator { domain: 0 }],
         operators: vec![op("E", &model, &tokens, 1), op("Q", &model, &model, 2), op("K", &model, &model, 3), op("V", &model, &model, 4), op("O", &tokens, &model, 5)],
         rules: Vec::new(),

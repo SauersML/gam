@@ -25,11 +25,7 @@
 //! * **Feature.** An indicator is exact. An indicator feature read only as affine terms is a
 //!   *gathered* feature ([`OperatorProgram::gathered_tokens`]): its one-hot rows are never formed
 //!   (its trace value and band hold no columns), and each affine term reading it adds the
-//!   operator's column at the row's token, an exact one times each entry. A character
-//!   `cos(2π r/p)`, `sin(2π r/p)` with the integer `r = k·a mod p` is formed as `fl(fl(TAU·r)/p)`: `TAU` is within `u·2π` of `2π`,
-//!   and the product and quotient round once each, so the angle is within `γ_3·2π`. Cosine and
-//!   sine are 1-Lipschitz and libm adds at most one ulp, `2u` on `[−1, 1]` (the assumption
-//!   `attention`'s tests check at their fixture points).
+//!   operator's column at the row's token, an exact one times each entry.
 //! * **Affine** `y = Σ_t x_t A_tᵀ + b` over `K = Σ_t cols_t + 1` summands per entry: in any
 //!   summation order `|fl(y) − y| ≤ γ_K (Σ_t |x_t||A_t|ᵀ + |b|)` (Higham, Lemma 3.1), and an
 //!   input radius `r_t` moves the exact output by at most `r_t |A_t|ᵀ`. Both are one product
@@ -57,15 +53,12 @@
 //!
 //! [`OperatorProgram::encode`] writes one self-delimiting message through `codec`'s integer codes
 //! and `precision`'s lattice codes, and [`OperatorProgram::decode`] reads it back given the
-//! [`Declarations`] (the contract's input domains, slots and declared group actions, which the
-//! decoder already knows and which are never sent). [`OperatorProgram::code_bits`] is the length
+//! [`Declarations`] (the contract's input domains and slots, which the decoder already knows and
+//! which are never sent). [`OperatorProgram::code_bits`] is the length
 //! of that message, computed without writing it, and a test holds the two equal. The message is:
 //!
 //! 1. the counts `#bases + 1`, `#operators + 1`, `#nodes` in the prefix code;
-//! 2. each basis: its kind as a fixed index, its domain as a fixed index into the declared
-//!    domains, and for a character basis whose labelling is not declared, the cycle's tokens as a
-//!    subset of the domain and each cycle position's token as a fixed index into the tokens still
-//!    unplaced;
+//! 2. each basis: its domain as a fixed index into the declared domains;
 //! 3. each operator: its kind as a fixed index; its row and column interfaces as runs (count + 1,
 //!    width, label kind as a fixed index, first label index + 1); for a dense operator, per row
 //!    group the present column groups in the enumerative subset code, then the present reals as
@@ -99,7 +92,6 @@ use gam_linalg::faer_ndarray::{fast_ab, fast_abt};
 use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
 use gam_math::probability::{NORMAL_CDF_RELATIVE_ERROR, NORMAL_CDF_UNDERFLOW_FLOOR, normal_cdf_and_pdf};
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
-use std::f64::consts::TAU;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::fmt;
@@ -244,12 +236,10 @@ impl Interface {
     }
 }
 
-/// A finite input domain the contract declares, with an optional declared single-cycle action:
-/// `cycle[t] = Some(a)` puts token `t` at cycle position `a`; tokens mapped to `None` are fixed.
+/// A finite input domain the contract declares.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Domain {
     pub size: usize,
-    pub cycle: Option<Vec<Option<u32>>>,
 }
 
 /// An input slot of the contract.
@@ -276,26 +266,12 @@ pub struct Declarations {
 pub enum Basis {
     /// The indicator of each token: groups `Token(t)`, width 1 each.
     Indicator { domain: usize },
-    /// The characters of a single odd cycle on the domain: the constant on the cycle, planes
-    /// `(cos ω_k a, sin ω_k a)` with `ω_k = 2πk/p`, `k = 1..(p−1)/2`, both zero off the cycle, then
-    /// the indicator of each token off the cycle. `positions[t]` is token `t`'s cycle position.
-    /// `declared` says whether the labelling is the contract's declaration (sent as nothing) or
-    /// was recovered from the weights (sent in full).
-    Characters { domain: usize, positions: Vec<Option<u32>>, declared: bool },
 }
 
 impl Basis {
     pub fn domain(&self) -> usize {
         match self {
-            Self::Indicator { domain } | Self::Characters { domain, .. } => *domain,
-        }
-    }
-
-    /// The cycle length of a character basis.
-    pub fn period(&self) -> Option<usize> {
-        match self {
-            Self::Indicator { .. } => None,
-            Self::Characters { positions, .. } => Some(positions.iter().filter(|p| p.is_some()).count()),
+            Self::Indicator { domain } => *domain,
         }
     }
 
@@ -308,21 +284,6 @@ impl Basis {
             .size;
         match self {
             Self::Indicator { .. } => Interface::uniform(size, 1, LabelKind::Token, 0),
-            Self::Characters { positions, .. } => {
-                let period = positions.iter().filter(|p| p.is_some()).count();
-                let mut groups = vec![Group { width: 1, label: Label::new(LabelKind::Const, 0) }];
-                groups.extend(
-                    (1..=(period - 1) / 2).map(|k| Group { width: 2, label: Label::new(LabelKind::Plane, k as u32) }),
-                );
-                groups.extend(
-                    positions
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, p)| p.is_none())
-                        .map(|(t, _)| Group { width: 1, label: Label::new(LabelKind::Token, t as u32) }),
-                );
-                Interface::new(groups)
-            }
         }
     }
 
@@ -331,18 +292,17 @@ impl Basis {
     /// itself, exactly, and no `classes × classes` table is formed (a 50k-token vocabulary's would be
     /// 20 GB).
     pub fn read(&self, declarations: &Declarations, y: &Array2<f64>) -> Result<Array2<f64>, ProgramError> {
-        match self {
-            Self::Indicator { .. } => Ok(y.clone()),
-            Self::Characters { .. } => Ok(y.dot(&self.table(declarations)?.values.t())),
+        let size = declarations.domains.get(self.domain())
+            .ok_or(ProgramError::Reference { what: "basis domain", index: self.domain() })?.size;
+        if y.ncols() != size {
+            return Err(ProgramError::Input(format!("indicator read has {} coordinates, expected {size}", y.ncols())));
         }
+        Ok(y.clone())
     }
 
     /// `g Φ`: the transpose of [`Basis::read`], from classes back to basis coordinates.
     pub fn read_transpose(&self, declarations: &Declarations, g: &Array2<f64>) -> Result<Array2<f64>, ProgramError> {
-        match self {
-            Self::Indicator { .. } => Ok(g.clone()),
-            Self::Characters { .. } => Ok(g.dot(&self.table(declarations)?.values)),
-        }
+        self.read(declarations, g)
     }
 
     /// `dy Φ[:, cols]ᵀ`: [`Basis::read`] of a change confined to the coordinates `cols`.
@@ -355,36 +315,15 @@ impl Basis {
                 }
                 Ok(out)
             }
-            Self::Characters { .. } => Ok(dy.dot(&self.table(declarations)?.values.select(Axis(1), cols).t())),
         }
     }
 
-    /// The banded [`Basis::read`]: `y Φᵀ` with the radius of `y`'s band `ry` carried through the
-    /// product and its rounding (an indicator's read is exact: the band is `ry` itself).
+    /// The banded [`Basis::read`]: an indicator's read is exact, so the band is `y`'s own `ry`.
     pub fn read_banded(&self, declarations: &Declarations, y: &Array2<f64>, ry: Option<&Array2<f64>>) -> Result<(Array2<f64>, Option<Array2<f64>>), ProgramError> {
-        if let Self::Indicator { .. } = self {
-            return Ok((y.clone(), ry.cloned()));
+        if ry.is_some_and(|r| r.dim() != y.dim()) {
+            return Err(ProgramError::Input("indicator read's radius shape differs from its values".into()));
         }
-        let phi = self.table(declarations)?;
-        let out = y.dot(&phi.values.t());
-        let radius = ry.map(|ry| {
-            let growth = accumulation_growth(y.ncols());
-            let phi_abs = phi.values.mapv(f64::abs);
-            let mut lifted = y.mapv(|v| growth * v.abs());
-            lifted += ry;
-            let mut radius = lifted.dot(&phi_abs.t());
-            radius += &ry.dot(&phi.bands.t());
-            radius += &y.mapv(f64::abs).dot(&phi.bands.t());
-            inflate_all(&mut radius, 3 * y.ncols());
-            radius
-        });
-        Ok((out, radius))
-    }
-
-    /// The basis at every class of its domain (`classes × width`).
-    fn table(&self, declarations: &Declarations) -> Result<BandedMatrix, ProgramError> {
-        let classes: Vec<u32> = (0..declarations.domains[self.domain()].size as u32).collect();
-        self.evaluate(declarations, &classes)
+        Ok((self.read(declarations, y)?, ry.cloned()))
     }
 
     /// The basis evaluated at `tokens`, one row per token, with the Feature radii of the module note.
@@ -392,7 +331,7 @@ impl Basis {
         let interface = self.interface(declarations)?;
         let width = interface.width();
         let mut values = Array2::<f64>::zeros((tokens.len(), width));
-        let mut bands = Array2::<f64>::zeros((tokens.len(), width));
+        let bands = Array2::<f64>::zeros((tokens.len(), width));
         match self {
             Self::Indicator { .. } => {
                 for (row, &token) in tokens.iter().enumerate() {
@@ -402,42 +341,9 @@ impl Basis {
                     values[[row, token as usize]] = 1.0;
                 }
             }
-            Self::Characters { positions, .. } => {
-                let period = positions.iter().filter(|p| p.is_some()).count();
-                let planes = (period - 1) / 2;
-                let radius = inflate(accumulation_growth(3) * TAU + 2.0 * UNIT_ROUNDOFF, 2);
-                for (row, &token) in tokens.iter().enumerate() {
-                    let position = positions
-                        .get(token as usize)
-                        .ok_or_else(|| ProgramError::Input(format!("token {token} outside the basis domain")))?;
-                    match position {
-                        Some(a) => {
-                            values[[row, 0]] = 1.0;
-                            for k in 1..=planes {
-                                let (sine, cosine) = character_angle(k, *a as usize, period).sin_cos();
-                                values[[row, 2 * k - 1]] = cosine;
-                                values[[row, 2 * k]] = sine;
-                                bands[[row, 2 * k - 1]] = radius;
-                                bands[[row, 2 * k]] = radius;
-                            }
-                        }
-                        None => {
-                            let group = interface
-                                .find(Label::new(LabelKind::Token, token))
-                                .ok_or_else(|| ProgramError::Input(format!("token {token} has no group")))?;
-                            values[[row, interface.range(group).start]] = 1.0;
-                        }
-                    }
-                }
-            }
         }
         Ok(BandedMatrix { values, bands })
     }
-}
-
-/// `2π (k a mod p)/p`, the integer reduced before the one product and one quotient.
-fn character_angle(frequency: usize, position: usize, period: usize) -> f64 {
-    TAU * ((frequency * position) % period) as f64 / period as f64
 }
 
 /// The elementwise law of a pointwise node, per input group.
@@ -1570,9 +1476,6 @@ impl OperatorProgram {
     pub fn interfaces(&self) -> Result<Vec<Interface>, ProgramError> {
         for basis in &self.bases {
             basis.interface(&self.declarations)?;
-            if let Basis::Characters { domain, positions, .. } = basis {
-                check_positions(positions, self.declarations.domains[*domain].size)?;
-            }
         }
         for rule in 0..self.rules.len() {
             let body = rule_interfaces(&self.rules, rule, &self.operators, &self.bases, &self.declarations)?;
@@ -3184,27 +3087,6 @@ pub fn remap_node(node: &mut Node, nodes: &[usize], operators: &[usize], bases: 
     }
 }
 
-fn check_positions(positions: &[Option<u32>], size: usize) -> Result<(), ProgramError> {
-    if positions.len() != size {
-        return Err(ProgramError::Interface(format!("{} cycle positions for a domain of {size}", positions.len())));
-    }
-    let period = positions.iter().filter(|p| p.is_some()).count();
-    let mut seen = vec![false; period];
-    for position in positions.iter().flatten() {
-        let slot = seen
-            .get_mut(*position as usize)
-            .ok_or_else(|| ProgramError::Interface(format!("cycle position {position} beyond the period {period}")))?;
-        if *slot {
-            return Err(ProgramError::Interface(format!("cycle position {position} repeated")));
-        }
-        *slot = true;
-    }
-    if period < 3 || period % 2 == 0 {
-        return Err(ProgramError::Interface(format!("a character basis needs an odd cycle of at least 3, got {period}")));
-    }
-    Ok(())
-}
-
 // ------------------------------------------------------------------------------------------------ code
 
 /// An itemised account of a program's message length.
@@ -3432,18 +3314,12 @@ fn operator_bits(operator: &Operator) -> Result<(u64, u64), ProgramError> {
 }
 
 fn basis_bits(basis: &Basis, domains: usize) -> Result<u64, ProgramError> {
-    let mut bits = u64::from(fixed_index_len_bits(2)?) + u64::from(fixed_index_len_bits(domains)?);
-    if let Basis::Characters { positions, declared, .. } = basis {
-        bits += 1;
-        if !declared {
-            let period = positions.iter().filter(|p| p.is_some()).count();
-            bits += subset_code_len_bits(positions.len(), period)?;
-            for placed in 0..period {
-                bits += u64::from(fixed_index_len_bits(period - placed)?);
-            }
-        }
+    let Basis::Indicator { domain } = basis;
+    if *domain >= domains {
+        return Err(ProgramError::Code("basis domain outside declarations".into()));
     }
-    Ok(bits)
+    // Keep the legacy two-kind discriminator even though only Indicator executes.
+    Ok(u64::from(fixed_index_len_bits(2)?) + u64::from(fixed_index_len_bits(domains)?))
 }
 
 /// What a node's code references: the alphabets its fixed indices are drawn from.
@@ -3892,35 +3768,10 @@ impl OperatorProgram {
         encode_prefix_integer(&mut out, self.nodes.len() as u64)?;
         let domains = self.declarations.domains.len();
         for basis in &self.bases {
-            match basis {
-                Basis::Indicator { domain } => {
-                    encode_fixed_index(&mut out, 0, 2)?;
-                    encode_fixed_index(&mut out, *domain, domains)?;
-                }
-                Basis::Characters { domain, positions, declared } => {
-                    encode_fixed_index(&mut out, 1, 2)?;
-                    encode_fixed_index(&mut out, *domain, domains)?;
-                    out.push_bit(*declared);
-                    if !declared {
-                        let cycle: Vec<usize> =
-                            positions.iter().enumerate().filter(|(_, p)| p.is_some()).map(|(t, _)| t).collect();
-                        encode_subset(&mut out, positions.len(), &cycle)?;
-                        let period = cycle.len();
-                        let mut by_position = vec![0usize; period];
-                        for (rank, &token) in cycle.iter().enumerate() {
-                            if let Some(a) = positions[token] {
-                                by_position[a as usize] = rank;
-                            }
-                        }
-                        let mut remaining: Vec<usize> = (0..period).collect();
-                        for rank in by_position {
-                            let at = remaining.iter().position(|r| *r == rank).unwrap_or(0);
-                            encode_fixed_index(&mut out, at, remaining.len())?;
-                            remaining.remove(at);
-                        }
-                    }
-                }
-            }
+            let Basis::Indicator { domain } = basis;
+            // Reserved kind 1 is the unsupported legacy Characters basis.
+            encode_fixed_index(&mut out, 0, 2)?;
+            encode_fixed_index(&mut out, *domain, domains)?;
         }
         for operator in &self.operators {
             match &operator.body {
@@ -3977,32 +3828,11 @@ impl OperatorProgram {
         let domains = declarations.domains.len();
         let mut bases = Vec::new();
         for _ in 0..basis_count {
-            let kind = decode_fixed_index(reader, 2)?;
-            let domain = decode_fixed_index(reader, domains)?;
-            if kind == 0 {
-                bases.push(Basis::Indicator { domain });
-                continue;
+            if decode_fixed_index(reader, 2)? != 0 {
+                return Err(ProgramError::Code("unsupported legacy Characters basis (kind 1)".into()));
             }
-            let declared = reader.read_bit()?;
-            let positions = if declared {
-                declarations.domains[domain]
-                    .cycle
-                    .clone()
-                    .ok_or_else(|| ProgramError::Code(format!("domain {domain} declares no cycle")))?
-            } else {
-                let size = declarations.domains[domain].size;
-                let cycle = decode_subset(reader, size)?;
-                let period = cycle.len();
-                let mut remaining: Vec<usize> = (0..period).collect();
-                let mut positions = vec![None; size];
-                for a in 0..period {
-                    let at = decode_fixed_index(reader, remaining.len())?;
-                    let rank = remaining.remove(at);
-                    positions[cycle[rank]] = Some(a as u32);
-                }
-                positions
-            };
-            bases.push(Basis::Characters { domain, positions, declared });
+            let domain = decode_fixed_index(reader, domains)?;
+            bases.push(Basis::Indicator { domain });
         }
         let mut operators = Vec::new();
         for index in 0..operator_count {

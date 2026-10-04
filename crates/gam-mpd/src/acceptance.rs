@@ -476,7 +476,9 @@ impl LocalMeasure {
 }
 
 /// The native side of `D_local`: the model, the declared family, each native write's declared
-/// scale (computed once on the family), and the counterexample search.
+/// scale (computed once on the family), and the counterexample search. Each row's
+/// Euclidean write error is divided by the RMS native-write row norm over the
+/// whole declared family, rather than by that particular row's native norm.
 pub struct Local<'a> {
     pub model: &'a OperatorProgram,
     pub family: FamilyInputs,
@@ -709,7 +711,7 @@ fn slot_gradients(
         let (slot, delta) = match node {
             Node::Feature { slot, basis } => {
                 let domain = match &program.bases[*basis] {
-                    Basis::Indicator { domain } | Basis::Characters { domain, .. } => *domain,
+                    Basis::Indicator { domain } => *domain,
                 };
                 let classes: Vec<u32> = (0..program.declarations.domains[domain].size as u32).collect();
                 let phi = program.bases[*basis].evaluate(&program.declarations, &classes).map_err(|e| e.to_string())?.values;

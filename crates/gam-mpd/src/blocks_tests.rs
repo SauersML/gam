@@ -38,7 +38,7 @@ fn model() -> (OperatorProgram, FamilyInputs) {
     let program = OperatorProgram {
         declarations: Declarations {
             parameters: 0,
-            domains: vec![Domain { size: P, cycle: None }],
+            domains: vec![Domain { size: P }],
             slots: vec![Slot::Token { domain: 0 }, Slot::Token { domain: 0 }],
         },
         bases: vec![Basis::Indicator { domain: 0 }],

@@ -999,21 +999,22 @@ fn c32_derived_scale_and_residual_are_each_paid_once() {
     assert_eq!(cost(&residual), cost(&decoded));
 }
 
-/// A basis transmits discrete structure, not a table of computed sine/cosine numerical values.
+/// Indicator values are fixed primitives; the domain's finite size is structural.
 #[test]
-fn c32_basis_constants_are_primitive_and_permutations_are_structure() {
+fn c32_indicator_basis_has_no_independent_numerical_literals() {
     use super::operator_program::{Basis, Domain};
-    let positions = vec![Some(0), Some(1), Some(2)];
-    let program = |declared| OperatorProgram {
-        declarations: Declarations { domains: vec![Domain { size: 3, cycle: Some(positions.clone()) }], slots: vec![Slot::Token { domain: 0 }], parameters: 0 },
-        bases: vec![Basis::Characters { domain: 0, positions: positions.clone(), declared }],
+    let program = |size| OperatorProgram {
+        declarations: Declarations { domains: vec![Domain { size }], slots: vec![Slot::Token { domain: 0 }], parameters: 0 },
+        bases: vec![Basis::Indicator { domain: 0 }],
         operators: vec![], rules: vec![],
         nodes: vec![Node::Feature { slot: 0, basis: 0 }, Node::Readout { input: 0, basis: 0 }], output: 1,
     };
-    let cost = |p: &OperatorProgram| structural_cost(&Artifact::native(p).unwrap(), &mut CostCache::default()).unwrap();
-    let (known, recovered) = (cost(&program(true)), cost(&program(false)));
-    assert_eq!((known.literals, recovered.literals), (0, 0));
-    assert!(recovered.structure_bits > known.structure_bits, "a recovered basis pays its complete discrete permutation");
+    for size in [3, 17] {
+        let p = program(size);
+        let cost = structural_cost(&Artifact::native(&p).unwrap(), &mut CostCache::default()).unwrap();
+        assert_eq!(cost.literals, 0);
+        assert!(cost.structure_bits > 0);
+    }
 }
 
 /// The current grammar sends rotary bases and inverse-square-root arguments as independent arithmetic knobs.

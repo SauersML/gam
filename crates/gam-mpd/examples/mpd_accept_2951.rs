@@ -145,7 +145,7 @@ fn main() -> Result<(), String> {
             let path = PathBuf::from(keys.get("artifact").ok_or("replay needs artifact=FILE")?);
             let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             // The declarations the decoder knows: the vocabulary and one token slot, nothing else.
-            let declarations = Declarations { parameters: 0, domains: vec![Domain { size: decoder_vocab(&export)?, cycle: None }], slots: vec![Slot::Token { domain: 0 }] };
+            let declarations = Declarations { parameters: 0, domains: vec![Domain { size: decoder_vocab(&export)? }], slots: vec![Slot::Token { domain: 0 }] };
             let decoded = Artifact::from_bytes(&bytes, &declarations)?;
             let constraint = constraint_of(floats(&key("deltas", "0.1"))?[0], floats(&key("epsilons", "0.03"))?[0]);
             let assessment = assess(&local, &run, &decoded, constraint, &mut CostCache::default())?;

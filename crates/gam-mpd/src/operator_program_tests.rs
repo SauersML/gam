@@ -25,8 +25,8 @@ fn reals(rows: usize, cols: usize, salt: usize) -> Array2<f64> {
 fn fixture() -> OperatorProgram {
     let declarations = Declarations { parameters: 0,
         domains: vec![
-            Domain { size: 7, cycle: Some((0..7).map(|t| (t < 5).then_some(t as u32)).collect()) },
-            Domain { size: 5, cycle: None },
+            Domain { size: 7 },
+            Domain { size: 5 },
         ],
         slots: vec![Slot::Token { domain: 0 }, Slot::Token { domain: 0 }],
     };
@@ -133,36 +133,10 @@ fn message_decodes_to_the_program_at_its_computed_length() {
         Provenance::default(),
     )
     .expect("coarse"));
-    program.bases[0] = Basis::Characters {
-        domain: 0,
-        positions: vec![Some(3), Some(0), Some(4), Some(1), Some(2), None, None],
-        declared: false,
-    };
-    // A character basis has width 1 + 2·2 + 2 = 7, the indicator's width, with different groups.
-    let character_cols = program.bases[0].interface(&program.declarations).expect("interface");
-    program.operators[0] = Arc::new(Operator::dense(
-        "E",
-        program.operators[0].rows.clone(),
-        character_cols,
-        program.operators[0].matrix(),
-        precision(12),
-        Provenance::default(),
-    )
-    .expect("character columns"));
     let message = program.encode().expect("encodes");
     assert_eq!(message.len_bits(), program.code_bits().expect("length"));
     let decoded = OperatorProgram::decode(&message, &program.declarations).expect("decodes");
     same_structure(&program, &decoded);
-    // A declared labelling is sent as one bit and read back from the declarations.
-    program.bases[0] = Basis::Characters {
-        domain: 0,
-        positions: program.declarations.domains[0].cycle.clone().expect("declared"),
-        declared: true,
-    };
-    let declared = program.encode().expect("encodes");
-    assert_eq!(declared.len_bits(), program.code_bits().expect("length"));
-    assert!(declared.len_bits() < message.len_bits());
-    same_structure(&program, &OperatorProgram::decode(&declared, &program.declarations).expect("decodes"));
 }
 
 #[test]
@@ -595,4 +569,43 @@ fn a_sparse_arguments_product_is_the_dense_one() {
         assert!((s - d).abs() <= 2.0 * k / (1.0 - k) * m, "{s} against {d}");
     }
     assert!(!sparse_enough(&Array2::ones((3, 3))));
+}
+
+
+#[test]
+fn indicator_wire_keeps_legacy_discriminator_and_rejects_characters() {
+    use super::codec::{BitString, encode_fixed_index, encode_prefix_integer};
+    let declarations = Declarations { domains: vec![Domain { size: 2 }], slots: vec![Slot::Token { domain: 0 }], parameters: 0 };
+    let program = OperatorProgram { declarations: declarations.clone(), bases: vec![Basis::Indicator { domain: 0 }], operators: vec![], rules: vec![], nodes: vec![Node::Feature { slot: 0, basis: 0 }], output: 0 };
+    let legacy = |kind| {
+        let mut message = BitString::new();
+        // The existing unversioned grammar: counts, two-kind basis tag, domain,
+        // rule count, Feature node kind/arguments, and output node.
+        for count in [2, 1, 1] { encode_prefix_integer(&mut message,count).unwrap(); }
+        encode_fixed_index(&mut message,kind,2).unwrap();
+        encode_fixed_index(&mut message,0,1).unwrap();
+        encode_prefix_integer(&mut message,1).unwrap();
+        encode_fixed_index(&mut message,0,18).unwrap();
+        for _ in 0..3 { encode_fixed_index(&mut message,0,1).unwrap(); }
+        message
+    };
+    let indicator = legacy(0);
+    assert_eq!(program.encode().unwrap(),indicator);
+    assert_eq!(program.code_bits().unwrap(),indicator.len_bits());
+    let decoded = OperatorProgram::decode(&indicator,&declarations).unwrap();
+    assert_eq!(decoded.encode().unwrap(),indicator);
+    let error = OperatorProgram::decode(&legacy(1),&declarations).unwrap_err().to_string();
+    assert!(error.contains("unsupported legacy Characters basis"), "{error}");
+}
+
+#[test]
+fn indicator_reads_check_domains_widths_and_radius_shapes() {
+    let declarations = Declarations { domains: vec![Domain { size: 2 }], slots: vec![], parameters: 0 };
+    let basis = Basis::Indicator { domain: 0 };
+    let values = Array2::ones((3, 2));
+    assert_eq!(basis.read(&declarations, &values).unwrap(), values);
+    assert_eq!(basis.read_transpose(&declarations, &values).unwrap(), values);
+    assert!(basis.read(&declarations, &Array2::ones((3, 1))).is_err());
+    assert!(Basis::Indicator { domain: 1 }.read(&declarations, &values).is_err());
+    assert!(basis.read_banded(&declarations, &values, Some(&Array2::zeros((1, 2)))).is_err());
 }
