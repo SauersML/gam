@@ -25,17 +25,18 @@
 //! * `site_switch`: the site-switch claim's worst subset of replaced sites per passage
 //!   (`gam_mpd::explanation::site_switch`: exhaustive up to its limit, else its search with
 //!   `random` random subsets);
-//! * `counterfactual`: the counterfactual-response benchmark (`gam_mpd::counterfactual`) on the
-//!   frozen `spec` when one is given, VPD's selections under each episode from `vpd_selections`;
 //! * `bits`: the description bits per word of the blocks that ran, each block priced by
 //!   `gam_mpd::describe::Structured` in the statistics its site was fitted in (VPD's
 //!   subcomponents in the same geometry), and the library's bits paid once.
+//!
+//! A rerun into the same `OUT_DIR` with the same settings resumes: fitted sites, VPD's prices
+//! (`library/{site}.vpd_bits.json`) and every finished stage of `e2e.json` are read back.
 //!
 //! Keys (defaults): `sequences` (4), `passages` (32), `context` (512), `n` (1e6), `start` (`own`:
 //! each site starts from its units or Fisher-SVD pieces; `vpd`: from VPD's subcomponents, so `ours`
 //! is this code's selection and execution of VPD's library), `rounds` (50; 0 keeps each site's
 //! starting pieces), `blocks` (1: gate the library in blocks; 0: every subcomponent its own),
-//! `draws` (4), `random` (64), `spec`, `vpd_selections`.
+//! `draws` (4), `random` (64).
 
 use gam_mpd::blocks::Describe;
 use gam_mpd::counterfactual::read_f64_matrix;
@@ -76,8 +77,6 @@ struct Run {
     random: usize,
     vpd: PathBuf,
     vpd_sets: PathBuf,
-    spec: Option<PathBuf>,
-    vpd_selections: Option<PathBuf>,
 }
 
 impl Run {
@@ -105,8 +104,6 @@ impl Run {
             random: if smoke { 4 } else { 64 },
             vpd,
             vpd_sets,
-            spec: None,
-            vpd_selections: None,
         };
         for pair in pairs {
             let (key, value) = pair.split_once('=').ok_or_else(|| format!("{pair}: not KEY=VALUE"))?;
@@ -127,8 +124,6 @@ impl Run {
                 }
                 "draws" => run.settings.draws = count()?,
                 "random" => run.random = count()?,
-                "spec" => run.spec = Some(PathBuf::from(value)),
-                "vpd_selections" => run.vpd_selections = Some(PathBuf::from(value)),
                 other => return Err(format!("unknown key {other}")),
             }
         }
@@ -301,7 +296,13 @@ fn main() -> Result<(), String> {
     }
     let names: Vec<String> = chosen.iter().map(|s| s.name.clone()).collect();
     eprintln!("scope {scope}: {} sites {names:?}", names.len());
+    let with = run.fitted_with();
+    let resumed: Option<Value> = std::fs::read_to_string(out.join("e2e.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .filter(|r| r["fitted_with"] == with && r["passages"] == json!(run.passages) && r["random"] == json!(run.random));
     let mut report = json!({
+        "fitted_with": with,
         "scope": scope, "sites": names, "train": run.train, "frontier": run.frontier, "sequences": run.sequences, "passages": run.passages,
         "context": run.context, "observations": run.settings.observations, "rounds": run.settings.rounds, "blocks": run.settings.blocks,
         "draws": run.settings.draws, "random": run.random, "vpd": run.vpd, "vpd_sets": run.vpd_sets, "start": if run.vpd_start { "vpd" } else { "own" },
@@ -315,9 +316,15 @@ fn main() -> Result<(), String> {
         std::fs::rename(&partial, out.join("e2e.json")).map_err(|e| e.to_string())
     };
 
+    for key in ["ours", "vpd"] {
+        if let Some(earlier) = resumed.as_ref().map(|r| &r[key]).filter(|v| v.is_object()) {
+            eprintln!("{key}: stages {:?} read back", earlier.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+            report[key] = earlier.clone();
+        }
+    }
+
     // Fit, in execution order on hybrid inputs.
     let clock = Instant::now();
-    let with = run.fitted_with();
     let batches: Vec<_> = (0..run.sequences).map(|s| training.contract.family.select(&(s * run.context..(s + 1) * run.context).collect::<Vec<_>>())).collect();
     let starts: BTreeMap<String, Library> = if run.vpd_start {
         chosen.iter().map(|site| Ok((site.name.clone(), vpd_library(&run, model, site)?))).collect::<Result<_, String>>()?
@@ -350,19 +357,32 @@ fn main() -> Result<(), String> {
         .map(|p| Passage::new(model, frontier.select(&(p * run.context..(p + 1) * run.context).collect::<Vec<_>>())))
         .collect::<Result<_, _>>()?;
     let given = vpd(&run, model, &chosen)?;
-    // VPD's subcomponents priced as ours, in each site's fit statistics.
+    // VPD's subcomponents priced as ours, in each site's fit statistics (read back when priced at
+    // these settings).
     let vpd_bits: Vec<Vec<f64>> = explanation
         .sites
         .iter()
         .zip(&given.libraries)
         .map(|(f, library)| {
+            let path = library_dir.join(format!("{}.vpd_bits.json", f.site.name));
+            let earlier: Option<Vec<f64>> = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .filter(|r| r["fitted_with"] == with)
+                .and_then(|r| serde_json::from_value(r["bits"].clone()).ok())
+                .filter(|b: &Vec<f64>| b.len() == library.v.nrows());
+            if let Some(bits) = earlier {
+                return Ok(bits);
+            }
             let describe = f.description(model, run.settings.observations)?;
-            (0..library.v.nrows())
+            let bits = (0..library.v.nrows())
                 .into_par_iter()
                 .map(|c| gam_linalg::faer_ndarray::with_nested_parallel(|| describe.bits(0, library.u.slice(s![c..c + 1, ..]), library.v.slice(s![c..c + 1, ..]))))
-                .collect::<Result<Vec<f64>, String>>()
+                .collect::<Result<Vec<f64>, String>>()?;
+            std::fs::write(&path, json!({"fitted_with": with, "bits": bits}).to_string()).map_err(|e| format!("{}: {e}", path.display()))?;
+            Ok(bits)
         })
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<_, String>>()?;
     seconds.insert("setup", clock.elapsed().as_secs_f64());
     eprintln!("{} passages and VPD's decomposition priced, {:.0}s", passages.len(), clock.elapsed().as_secs_f64());
 
@@ -370,8 +390,13 @@ fn main() -> Result<(), String> {
     let clock = Instant::now();
     let our_bits: Vec<Vec<f64>> = explanation.sites.iter().map(|f| f.bits.clone()).collect();
     let our_ranks: Vec<Vec<usize>> = explanation.sites.iter().map(|f| f.ranks.clone()).collect();
-    report["ours"] = replaced_and_bits(model, &explanation, &passages, &our_bits, &our_ranks)?;
-    report["vpd"] = replaced_and_bits(model, &given, &passages, &vpd_bits, &given.ranks)?;
+    for (key, replacement, bits, ranks) in [("ours", &explanation as &dyn Replacement, &our_bits, &our_ranks), ("vpd", &given as &dyn Replacement, &vpd_bits, &given.ranks)] {
+        if report[key]["e2e"].is_null() {
+            let scored = replaced_and_bits(model, replacement, &passages, bits, ranks)?;
+            report[key]["e2e"] = scored["e2e"].clone();
+            report[key]["bits"] = scored["bits"].clone();
+        }
+    }
     seconds.insert("replaced", clock.elapsed().as_secs_f64());
     eprintln!(
         "every site replaced: KL per token ours {}, VPD {}; description bits per word ours {}, VPD {}",
@@ -385,6 +410,9 @@ fn main() -> Result<(), String> {
     // (b): the site-switch claim.
     let clock = Instant::now();
     for (key, replacement) in [("ours", &explanation as &dyn Replacement), ("vpd", &given as &dyn Replacement)] {
+        if !report[key]["site_switch"].is_null() {
+            continue;
+        }
         let attack = site_switch(model, replacement, &passages, run.random, run.settings.seed)?;
         report[key]["site_switch"] = switch_summary(&names, &attack);
         eprintln!("site switch {key}: worst subset per passage {}", report[key]["site_switch"]["passage_worst_subset"]);
@@ -392,13 +420,6 @@ fn main() -> Result<(), String> {
     }
     seconds.insert("site_switch", clock.elapsed().as_secs_f64());
 
-    // (c): the counterfactual-response benchmark.
-    for key in ["ours", "vpd"] {
-        report[key]["counterfactual"] = match (&run.spec, &run.vpd_selections) {
-            (None, _) => json!({"skipped": "no spec"}),
-            (Some(spec), _) => json!({"skipped": format!("{}: not wired yet", spec.display())}),
-        };
-    }
     seconds.insert("total", started.elapsed().as_secs_f64());
     report["seconds"] = json!(seconds);
     write(&report)?;
