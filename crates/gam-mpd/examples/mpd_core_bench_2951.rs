@@ -1,5 +1,5 @@
 //! Wall time of each stage of the explanation's core path at one site of a language model, on the
-//! CPU (#2951, `gam_mpd::explanation`).
+//! CPU and on this host's device (#2951, `gam_mpd::explanation`, `gam_mpd::core_device`).
 //!
 //! `mpd_core_bench_2951 TRAIN LIBRARY SITE [KEY=VALUE ...]`
 //!
@@ -12,12 +12,14 @@
 //!   `draws` sampled-label passes per sequence, 1);
 //! * `cheap` and `exact`: every block's cheap price, and `priced` blocks' structured price
 //!   (`describe::Tiered`), per block;
-//! * `selector` and `code_site`: every input's sets by the run-time selection
-//!   (`site_fit::Selector`) and by the certified sparse code (`sparse_code::code_site`, `nodes`
-//!   branch-and-bound nodes, 64), at the cheap prices and `n` (1e5); with the codes per input
-//!   (description plus error bits) both choose and how many inputs each codes in fewer bits.
+//! * `selector`: every input's sets by the run-time selection (`site_fit::Selector`) at the cheap
+//!   prices and `n` (1e5), and the per-input search alone (`sparse_code::Coder`) from the products
+//!   a forward hands it, at the root and with `nodes` branch-and-bound nodes (64), on the CPU and on
+//!   the core path's device (`gam_mpd::core_device`, where there is one), with the codes, sets on
+//!   and certificates.
 //!
-//! One JSON line of every stage's seconds and the comparison goes to stdout.
+//! `device` (`f64`, `any`, `off`) picks the core path's device (`gam_mpd::core_device::Choice`). One
+//! JSON line of every stage's seconds and the comparison goes to stdout.
 
 use gam_mpd::blocks::{Describe, Generic};
 use gam_mpd::counterfactual::read_f64_matrix;
@@ -25,7 +27,7 @@ use gam_mpd::describe::{Geometry, Metric, Structured, Tiered, declared_charts};
 use gam_mpd::import::import_language_model;
 use gam_mpd::masked::{Library, matrix, sites};
 use gam_mpd::site_fit::{Selector, samples};
-use gam_mpd::sparse_code::{Metric as Coded, Problem, code_site};
+use gam_mpd::sparse_code::Coder;
 use ndarray::{Array1, Array2, s};
 use rayon::prelude::*;
 use serde_json::json;
@@ -61,6 +63,7 @@ fn main() -> Result<(), String> {
             "n" => observations = value.parse().map_err(|e| format!("n: {e}"))?,
             "nodes" => nodes = count()?,
             "priced" => priced = count()?,
+            "device" => gam_mpd::core_device::choose(gam_mpd::core_device::Choice::parse(value)?),
             other => return Err(format!("unknown key {other}")),
         }
     }
@@ -126,38 +129,42 @@ fn main() -> Result<(), String> {
     seconds.insert("selector".into(), json!(clock.elapsed().as_secs_f64()));
     let selector_codes = codes(&reads, &w, &library, &sample.fisher, &bits, &held, observations);
 
-    let targets = reads.dot(&w.t());
-    let problem = |nodes: usize| Problem {
-        reads: reads.view(),
-        targets: targets.view(),
-        v: library.v.view(),
-        u: library.u.view(),
-        ranks: &ranks,
-        bits: &bits,
-        metric: Coded::Mean(sample.fisher.view()),
-        observations,
-        nodes,
-    };
+    // The per-input search alone, from the products a forward hands it: on the CPU at the root and
+    // with branching, and on the core path's device (where there is one).
+    let z = reads.dot(&library.v.t());
+    let y = reads.dot(&w.t());
+    let weights = y.dot(&sample.fisher).dot(&library.u.t());
+    let yfy: Vec<f64> = y.outer_iter().zip(y.dot(&sample.fisher).outer_iter()).map(|(a, b)| a.dot(&b)).collect();
+    let gram = library.u.dot(&sample.fisher).dot(&library.u.t());
     let mut compared = serde_json::Map::new();
-    for (label, branch) in [("code_site_root", 0usize), ("code_site", nodes)] {
+    for (label, branch) in [("root", 0usize), ("branched", nodes)] {
+        let coder = Coder::new(gram.clone(), &ranks, &bits, observations, branch)?;
         let clock = Instant::now();
-        let coding = code_site(&problem(branch), None)?;
-        seconds.insert(label.into(), json!(clock.elapsed().as_secs_f64()));
-        let on = Array2::from_shape_fn((rows, columns), |(t, c)| f64::from(u8::from(coding.sets[t].binary_search(&(c as u32)).is_ok())));
-        let own = codes(&reads, &w, &library, &sample.fisher, &bits, &on, observations);
-        let better = own.iter().zip(&selector_codes).filter(|(a, b)| *a < *b).count();
-        let worse = own.iter().zip(&selector_codes).filter(|(a, b)| *a > *b).count();
-        let certified = coding.upper.iter().zip(&coding.lower).filter(|(u, l)| *u - *l <= 1.0).count();
-        compared.insert(
-            label.into(),
-            json!({"code_per_input": own.mean(), "l0": on.sum() / rows as f64, "better_than_selector": better, "worse_than_selector": worse,
-                   "certified_within_a_bit": certified, "largest_gap": (&coding.upper - &coding.lower).fold(0.0_f64, |m, g| m.max(*g))}),
-        );
+        let coded = coder.code_rows(z.view(), weights.view(), &yfy, None)?;
+        let cpu = clock.elapsed().as_secs_f64();
+        let certified = coded.iter().filter(|(_, u, l)| u - l <= 1.0).count();
+        let mut entry = json!({"cpu_seconds": cpu, "code_per_input": coded.iter().map(|(_, u, _)| u).sum::<f64>() / rows as f64,
+                               "l0": coded.iter().map(|(on, _, _)| on.iter().filter(|o| **o).count()).sum::<usize>() as f64 / rows as f64,
+                               "certified_within_a_bit": certified});
+        if let Some(device) = gam_mpd::core_device::device()? {
+            let resident = gam_mpd::core_device::DeviceCoder::new(&device, coder.clone())?;
+            let up = |m: &Array2<f64>| device.upload(m.view()).map_err(|e| e.to_string());
+            let (zt, wt, yt) = (up(&z)?, up(&weights)?, up(&Array2::from_shape_vec((rows, 1), yfy.clone()).map_err(|e| e.to_string())?)?);
+            let clock = Instant::now();
+            let (on, upper, _) = resident.code(&device, (&zt, &wt, &yt))?;
+            let on = device.download(&on).map_err(|e| e.to_string())?;
+            let agree = coded.iter().enumerate().filter(|(r, (sets, _, _))| sets.iter().zip(on.row(*r)).all(|(a, b)| *a == (*b == 1.0))).count();
+            let worst = coded.iter().zip(&upper).fold(0.0_f64, |m, ((_, u, _), d)| m.max((u - d).abs() / u.abs().max(1.0)));
+            entry["device_seconds"] = json!(clock.elapsed().as_secs_f64());
+            entry["device_rows_as_cpu"] = json!(agree);
+            entry["device_code_relative_difference"] = json!(worst);
+        }
+        compared.insert(label.into(), entry);
     }
     println!(
         "{}",
         json!({"site": name, "rows": rows, "columns": columns, "d_in": d_in, "d_out": d_out, "n": observations, "seconds": seconds,
-               "exact_over_cheap": ratio, "selector": {"code_per_input": selector_codes.mean(), "l0": held.sum() / rows as f64}, "code_site": compared})
+               "exact_over_cheap": ratio, "selector": {"code_per_input": selector_codes.mean(), "l0": held.sum() / rows as f64}, "coder": compared})
     );
     Ok(())
 }

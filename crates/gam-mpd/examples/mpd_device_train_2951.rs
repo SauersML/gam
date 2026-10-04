@@ -2,13 +2,19 @@
 //!
 //! `mpd_device_train_2951 EXPORT_DIR LIBRARY_DIR OUT_DIR OBSERVATIONS TRAIN [BATCH] [STEPS] [RATE] [MICRO] [EVAL] [SYNC] [CONTEXT]`
 //!
-//! `LIBRARY_DIR` holds a library per site (`{site}.v.f64`, `{site}.u.f64`, as `mpd_site_fit_2951`
-//! writes them; a site without files stays native). Every update sums the
+//! `LIBRARY_DIR` holds a library per site (`{site}.v.f64`, `{site}.u.f64`, as `mpd_e2e_2951` and
+//! `mpd_site_fit_2951` write them; a site without files stays native), and where `mpd_e2e_2951` fitted
+//! it, the statistics it was fitted in (`{site}.fisher.f64`, `{site}.moment.f64`, on the inputs
+//! under the explanation upstream): each site's code and description use those, else the native
+//! model's statistics on the first training sequences. The library trains on the corner run's code
+//! (`gam_mpd::device_train`, module note) at `n = OBSERVATIONS`. Every update sums the
 //! gradients of `BATCH` training sequences (default 32, of the export's first `TRAIN`, cycled),
 //! `MICRO` at a time (default 8), and takes one Adam step of `RATE` (default 3e-4, a share of
 //! each factor's root mean square entry); `STEPS` updates (default 1000). Every `SYNC` updates
-//! (default 25) and at the end, the library goes to `OUT_DIR/{site}.{v,u}.f64` and the code of the
-//! `EVAL` sequences after the training ones (default 8) in float64 to `OUT_DIR/evals.json`. With
+//! (default 25) and at the end, the library goes to `OUT_DIR/library/` as `mpd_e2e_2951` reads a
+//! given library (`{site}.{v,u,fisher,moment}.f64`, `{site}.json` with its blocks and bits), so
+//! `mpd_e2e_2951 … given=OUT_DIR/library` scores it end to end, and the code of the `EVAL` sequences
+//! after the training ones (default 8) in float64 to `OUT_DIR/evals.json`. With
 //! several CUDA devices each holds a replica: a batch's sequences are split among them, their
 //! gradients summed, and every replica takes the same update. Without CUDA it trains on the Apple
 //! GPU where there is one (f32 steps); that device has no float64, so each eval runs on the host,
@@ -76,14 +82,22 @@ fn main() -> Result<(), String> {
     let model = &imported.program;
     let family = &imported.contract.family;
     let sequences = |list: &[usize]| family.select(&list.iter().flat_map(|s| s * context..(s + 1) * context).collect::<Vec<_>>());
-    let (mut chosen, mut libraries) = (Vec::new(), Vec::new());
+    let (mut chosen, mut libraries, mut fitted) = (Vec::new(), Vec::new(), Vec::new());
     for site in sites(model) {
         let v_path = given.join(format!("{}.v.f64", site.name));
         if !v_path.exists() {
             continue;
         }
-        let (d_out, d_in) = matrix(model, &site)?.dim();
+        let w = matrix(model, &site)?;
+        let (d_out, d_in) = w.dim();
         libraries.push(Library { v: read_f64(&v_path, d_in)?, u: read_f64(&given.join(format!("{}.u.f64", site.name)), d_out)?, mean: Array1::zeros(d_in) });
+        // The statistics the library was fitted in, when it was.
+        let (f_path, m_path) = (given.join(format!("{}.fisher.f64", site.name)), given.join(format!("{}.moment.f64", site.name)));
+        fitted.push(if f_path.exists() && m_path.exists() {
+            Some(gam_mpd::pieces::Site { mean: Array1::zeros(d_in), second_moment: read_f64(&m_path, d_in)?, fisher: read_f64(&f_path, d_out)?, w })
+        } else {
+            None
+        });
         chosen.push(site);
     }
     if chosen.is_empty() {
@@ -100,10 +114,17 @@ fn main() -> Result<(), String> {
     let arithmetic = if device.is_host() { Arithmetic::F64 } else { Arithmetic::Tf32 };
     let started = Instant::now();
     let chunks = |range: std::ops::Range<usize>| -> Vec<Vec<usize>> { range.collect::<Vec<_>>().chunks(micro).map(<[usize]>::to_vec).collect() };
-    let statistic_batches: Vec<_> = chunks(0..train.min(batch)).iter().map(|c| sequences(c)).collect();
-    let measured = statistics(&device, model, &chosen, &statistic_batches, 2, 0xDE5C)?;
-    // Each subcomponent priced by its exact lattice description in its site's declared charts, as
-    // site_fit and e2e price it (gam_mpd::describe::Structured).
+    let measured: Vec<gam_mpd::pieces::Site> = if fitted.iter().all(Option::is_some) {
+        fitted.into_iter().flatten().collect()
+    } else {
+        let statistic_batches: Vec<_> = chunks(0..train.min(batch)).iter().map(|c| sequences(c)).collect();
+        let native = statistics(&device, model, &chosen, &statistic_batches, 2, 0xDE5C)?;
+        fitted.into_iter().zip(native).map(|(f, n)| f.unwrap_or(n)).collect()
+    };
+    let fishers: Vec<Array2<f64>> = measured.iter().map(|m| m.fisher.clone()).collect();
+    let moments: Vec<Array2<f64>> = measured.iter().map(|m| m.second_moment.clone()).collect();
+    // Each subcomponent priced by its description in its site's declared charts, as site_fit and
+    // e2e price it (gam_mpd::describe::Structured).
     let describe = Structured::new(
         chosen
             .iter()
@@ -115,22 +136,32 @@ fn main() -> Result<(), String> {
             .collect::<Result<_, String>>()?,
     );
     drop(measured);
-    let settings = |r: usize| Settings { observations, rate, betas: (0.9, 0.999), epsilon: 1e-12, draws: 2, seed: 0x5E7 + 0x1000 * r as u64 };
+    let settings = Settings { observations, rate, betas: (0.9, 0.999), epsilon: 1e-12 };
     let mut replicas = Vec::new();
-    for (r, replica) in devices.iter().enumerate() {
+    for replica in &devices {
         let masked = Masked::build(model, chosen.clone(), libraries.clone())?;
-        replicas.push(Trainer::new(replica, model, &chosen, masked, &describe, settings(r), arithmetic)?);
+        replicas.push(Trainer::new(replica, (model, &chosen), masked, (&describe, &fishers), settings, arithmetic)?);
     }
     drop(libraries);
     eprintln!("{} sites on {} × {} ({arithmetic:?}), statistics and start {:.0}s", chosen.len(), devices.len(), device.name(), started.elapsed().as_secs_f64());
     let evals: Vec<_> = chunks(train..train + eval).iter().map(|c| sequences(c)).collect();
     let mut log = Vec::new();
+    let library_dir = out.join("library");
+    std::fs::create_dir_all(&library_dir).map_err(|e| format!("{}: {e}", library_dir.display()))?;
     let evaluate = |trainer: &mut Trainer, step: usize, log: &mut Vec<serde_json::Value>| -> Result<(), String> {
-        let masked = trainer.sync(&describe)?;
+        trainer.sync(&describe)?;
+        let bits = trainer.bits()?;
+        let masked = trainer.masked();
         for (k, site) in chosen.iter().enumerate() {
             let library = masked.library(k)?;
-            write_f64(&out.join(format!("{}.v.f64", site.name)), &library.v)?;
-            write_f64(&out.join(format!("{}.u.f64", site.name)), &library.u)?;
+            let name = &site.name;
+            write_f64(&library_dir.join(format!("{name}.v.f64")), &library.v)?;
+            write_f64(&library_dir.join(format!("{name}.u.f64")), &library.u)?;
+            write_f64(&library_dir.join(format!("{name}.fisher.f64")), &fishers[k])?;
+            write_f64(&library_dir.join(format!("{name}.moment.f64")), &moments[k])?;
+            let record = json!({"site": name, "ranks": vec![1; library.v.nrows()], "bits": bits[k],
+                                "trained": {"from": given, "steps": step, "n": observations, "rate": rate, "batch": batch, "train": train, "context": context}});
+            std::fs::write(library_dir.join(format!("{name}.json")), record.to_string()).map_err(|e| e.to_string())?;
         }
         if evals.is_empty() {
             return Ok(());
@@ -141,23 +172,22 @@ fn main() -> Result<(), String> {
                 tally.add(&trainer.evaluate(inputs)?);
             }
         } else {
-            // The first replica's library and draws, evaluated in float64 on the host.
+            // The first replica's library, evaluated in float64 on the host.
             let libraries = (0..chosen.len()).map(|k| masked.library(k)).collect::<Result<Vec<_>, _>>()?;
             let masked = Masked::build(model, chosen.clone(), libraries)?;
-            let mut host = Trainer::new(&Device::host(), model, &chosen, masked, &describe, settings(0), Arithmetic::F64)?;
+            let mut host = Trainer::new(&Device::host(), (model, &chosen), masked, (&describe, &fishers), settings, Arithmetic::F64)?;
             for inputs in &evals {
                 tally.add(&host.evaluate(inputs)?);
             }
         }
         let rows = tally.rows.max(1) as f64;
         eprintln!(
-            "eval after {step} steps: code {:.1} bits per word (L0 {:.1}, KL {:.4}, charge {:.4} nats per word)",
+            "eval after {step} steps: code {:.1} bits per token (subcomponents on {:.1}, corner KL {:.4} nats per token)",
             tally.code(observations),
             tally.l0 / rows,
-            tally.kl / rows,
-            tally.charge / rows
+            tally.kl / rows
         );
-        log.push(json!({"step": step, "code": tally.code(observations), "l0": tally.l0 / rows, "kl": tally.kl / rows, "charge": tally.charge / rows}));
+        log.push(json!({"step": step, "code": tally.code(observations), "l0": tally.l0 / rows, "kl": tally.kl / rows, "description": tally.description / rows}));
         std::fs::write(out.join("evals.json"), json!({"observations": observations, "evals": log}).to_string()).map_err(|e| e.to_string())
     };
     if eval > 0 {
@@ -212,11 +242,10 @@ fn main() -> Result<(), String> {
         busy += seconds;
         let rows = tally.rows.max(1) as f64;
         eprintln!(
-            "step {step}: code {:.1} bits per word (L0 {:.1}, KL {:.4}, charge {:.4}); {:.1} ms per sequence, {:.2} sequences/s",
+            "step {step}: code {:.1} bits per token (subcomponents on {:.1}, corner KL {:.4}); {:.1} ms per sequence, {:.2} sequences/s",
             tally.code(observations),
             tally.l0 / rows,
             tally.kl / rows,
-            tally.charge / rows,
             1e3 * seconds / batch as f64,
             trained as f64 / busy
         );

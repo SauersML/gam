@@ -3,22 +3,23 @@
 //!
 //! # A step
 //!
-//! On a batch of sequences, every site's sets are its own code's (`super::site_fit`, module note):
-//! with the model's real read `x_t`, every subcomponent's read `a_tc = v_c · x_t` and its write's size
-//! in the input's own output Fisher, `‖u_c‖_{F_t}` with `F_t = mean_k g_tk g_tkᵀ` from `draws`
-//! sampled-label gradients of the model's own output at the site's written value, each input's set
-//! minimises `Σ_{c on} bits(c) + n / (2 ln 2) · (‖D_t‖_{F_t} + Σ_{c off} |a_tc| ‖u_c‖_{F_t})²`
-//! (`D_t = (W − Uᵀ V) x_t`, what all on leaves of the map). The library then descends
+//! On a batch of sequences the explanation runs autonomously, the evaluator's corner run
+//! (`super::explanation::Explanation::execute`): the masked program executes in order, and at each
+//! site, once its read `x_t` is computed (what the sites before it, replaced, handed on), the site's
+//! own code chooses its subcomponents on from that read alone (`super::site_fit::Selector`, the
+//! certified `super::sparse_code::Coder`): per input `Σ_{c on} bits(c) + n/(2 ln 2) ‖W x_t − Σ_{c
+//! on} u_c (v_c · x_t)‖²_F̄`, `F̄` the site's mean written Fisher. At those sets the library descends
+//! the code of the run,
 //!
 //! ```text
-//! Σ_t KL_t + Σ_sites ½ (Σ_{c off} |z_tc| ‖u_c‖_{F_t})²
+//! Σ_t Σ_{c on} bits(c) + n KL_t / ln 2,
 //! ```
 //!
-//! at those sets: the masked forward's KL to the model, and the box claim's charge
-//! (`super::masked::box_upper`) on the masked forward's own reads `z_tc` (every point of the box is
-//! within it of the sets' point, which the KL measures exactly). Its gradient is exact: the charge's
-//! cotangent enters the reverse pass at each site's reads, and its dependence on `U` through the
-//! metric is closed-form. Adam moves both factors of every site.
+//! `KL_t` the corner run's KL to the model at input `t`: the same discrete sets the evaluator scores,
+//! no expected masks, no box over the off gates and no adversary. The sets are a step's decisions,
+//! so the gradient is the KL's at them, exact through the masked forward; Adam moves both factors of
+//! every site. A step's coder reads `U F̄` from the factors as they are; its Gram `U F̄ Uᵀ` and the
+//! bits are the last [`Trainer::sync`]'s.
 //!
 //! # The map
 //!
@@ -43,12 +44,13 @@
 //! decision runs on a float64 device.
 
 use super::blocks::Describe;
-use gam_linalg::decompose::{eigh, svd};
+use super::core_device::DeviceCoder;
+use gam_linalg::decompose::eigh;
 use super::device_program::DeviceProgram;
 use super::masked::{Library, Masked, Site};
 use super::operator_program::{FamilyInputs, Node, OperatorProgram, SlotValues};
 use gam_gpu::tensor::{Arithmetic, Device, Op, Tensor};
-use gam_linalg::faer_ndarray::fast_atb;
+use gam_linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
 use gam_linalg::roundoff::SymmetricAssembly;
 use ndarray::{Array1, Array2, Axis, s};
 use rayon::prelude::*;
@@ -73,18 +75,14 @@ pub struct Settings {
     pub rate: f64,
     pub betas: (f64, f64),
     pub epsilon: f64,
-    /// Sampled-label gradients per input for its Fisher.
-    pub draws: usize,
-    pub seed: u64,
 }
 
-/// A pass over a batch: its rows and their totals (KL and charge in nats, the sets' sizes and
+/// A pass over a batch: its rows and their totals (the corner run's KL in nats, the sets' sizes and
 /// description bits).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Tally {
     pub rows: usize,
     pub kl: f64,
-    pub charge: f64,
     pub l0: f64,
     pub description: f64,
 }
@@ -93,15 +91,14 @@ impl Tally {
     pub fn add(&mut self, other: &Self) {
         self.rows += other.rows;
         self.kl += other.kl;
-        self.charge += other.charge;
         self.l0 += other.l0;
         self.description += other.description;
     }
 
-    /// Bits per input under the box claim: `Σ_{c on} bits(c) + n (KL + charge) / ln 2`.
+    /// Bits per input of the corner run: `Σ_{c on} bits(c) + n KL / ln 2`.
     #[must_use]
     pub fn code(&self, observations: f64) -> f64 {
-        (self.description + observations * (self.kl + self.charge) / LN_2) / self.rows.max(1) as f64
+        (self.description + observations * self.kl / LN_2) / self.rows.max(1) as f64
     }
 }
 
@@ -121,11 +118,10 @@ impl Uniforms {
     }
 }
 
-/// A block of a site's library: the node it reads (or writes) in the model and in the masked
-/// program, its operator (`V_j`, pieces × d_j; or `U_iᵀ`, d_i × pieces), Adam's moments, its
-/// summed gradient and its rate.
+/// A block of a site's library: the node it reads (or writes) in the masked program, its operator
+/// (`V_j`, pieces × d_j; or `U_iᵀ`, d_i × pieces), Adam's moments, its summed gradient and its
+/// rate.
 struct Block {
-    native: usize,
     node: usize,
     op: usize,
     moments: (Tensor, Tensor),
@@ -140,17 +136,22 @@ struct Trained {
     z: usize,
     masked: usize,
     slot: usize,
-    mask: usize,
-    pieces: usize,
     /// Per subcomponent its description bits (1 × pieces), and `[1, bits]` per subcomponent
     /// (pieces × 2) to total a set's size and bits.
     bits: Tensor,
     listing: Tensor,
     /// `S_ij`, the map every subcomponent on is held to, per written and read block.
     map: Vec<Vec<Tensor>>,
-    /// `W − S = A Bᵀ` past its decomposition's band, `A` per written block (d_i × r) and `B` per
-    /// read block (d_j × r), when any.
-    gap: Option<(Vec<Tensor>, Vec<Tensor>)>,
+    /// What the site's code reads (module note, "A step"): the site's map `W` per read block
+    /// (`d_out × d_j`), its mean written Fisher `F̄` whole and per written block's rows
+    /// (`d_i × d_out`), on the host for the Gram, and a column of ones (`d_out × 1`).
+    w: Vec<Tensor>,
+    fisher: Tensor,
+    fisher_rows: Vec<Tensor>,
+    fisher_host: Array2<f64>,
+    ones: Tensor,
+    /// The code as of the last sync.
+    coder: Option<DeviceCoder>,
     /// The Grams' eigenbases from the last sync (module note, "The map").
     bases: Bases,
 }
@@ -177,14 +178,6 @@ pub struct Trainer {
     settings: Settings,
     arithmetic: Arithmetic,
     steps: u64,
-    uniforms: Uniforms,
-}
-
-fn ones(device: &Device, rows: usize, cols: usize) -> Result<Tensor, String> {
-    let mut out = device.zeros(rows, cols).map_err(error)?;
-    let row = device.upload_vec(1, cols, vec![1.0; cols]).map_err(error)?;
-    device.add_row(&mut out, 1.0, &row).map_err(error)?;
-    Ok(out)
 }
 
 /// `α op(a) op(b)` into a fresh tensor.
@@ -289,7 +282,7 @@ pub fn statistics(device: &Device, model: &OperatorProgram, sites: &[Site], batc
 fn description_bits(describe: &dyn Describe, site: usize, library: &Library) -> Result<Vec<f64>, String> {
     (0..library.v.nrows())
         .into_par_iter()
-        .map(|c| describe.bits(site, library.u.slice(s![c..c + 1, ..]), library.v.slice(s![c..c + 1, ..])))
+        .map(|c| gam_linalg::faer_ndarray::with_nested_parallel(|| describe.bits(site, library.u.slice(s![c..c + 1, ..]), library.v.slice(s![c..c + 1, ..]))))
         .collect()
 }
 
@@ -308,10 +301,18 @@ fn split(m: &Array2<f64>, widths: &[usize], columns: bool) -> Vec<Array2<f64>> {
 
 impl Trainer {
     /// `masked` (its sites `sites` of `model`) trained on `device`, its steps' products in
-    /// `arithmetic`, every subcomponent described by `describe`.
-    pub fn new(device: &Device, model: &OperatorProgram, sites: &[Site], masked: Masked, describe: &dyn Describe, settings: Settings, arithmetic: Arithmetic) -> Result<Self, String> {
-        if sites.len() != masked.sites.len() || settings.draws == 0 {
-            return Err(error("one model site per masked site, and at least one draw"));
+    /// `arithmetic`, every subcomponent described by `describe`, each site's code in its mean
+    /// written Fisher `fishers[k]` (d_out × d_out).
+    pub fn new(
+        device: &Device,
+        (model, sites): (&OperatorProgram, &[Site]),
+        masked: Masked,
+        (describe, fishers): (&dyn Describe, &[Array2<f64>]),
+        settings: Settings,
+        arithmetic: Arithmetic,
+    ) -> Result<Self, String> {
+        if sites.len() != masked.sites.len() || fishers.len() != sites.len() {
+            return Err(error("one model site and one Fisher per masked site"));
         }
         let mut native = DeviceProgram::compile(device, model)?;
         let mut program = DeviceProgram::compile(device, &masked.program)?;
@@ -323,37 +324,29 @@ impl Trainer {
             if site.reads.len() != inner.reads.len() || site.writes.len() != inner.writes.len() {
                 return Err(error(format!("{}: the masked site is not the model's", site.name)));
             }
-            let Node::Hadamard { right, .. } = &masked.program.nodes[masked.masked[k]] else {
+            if !matches!(masked.program.nodes[masked.masked[k]], Node::Hadamard { .. }) {
                 return Err(error(format!("{}: its masked node is not its mask's product", site.name)));
-            };
+            }
             let library = masked.library(k)?;
             let w = masked.w(k)?;
+            let fisher = &fishers[k];
+            if fisher.dim() != (w.nrows(), w.nrows()) {
+                return Err(error(format!("{}: a {:?} Fisher for {} writes", site.name, fisher.dim(), w.nrows())));
+            }
             let (read_widths, write_widths): (Vec<usize>, Vec<usize>) = (site.reads.iter().map(|n| widths[*n]).collect(), site.writes.iter().map(|n| widths[*n]).collect());
-            let map = fast_atb(&library.u, &library.v);
-            let gap = {
-                let decomposed = svd((&w - &map).view(), false).map_err(|e| format!("{e:?}"))?;
-                let kept: Vec<usize> = (0..decomposed.singular_values.len()).filter(|&j| decomposed.singular_values[j] > decomposed.band).collect();
-                if kept.is_empty() {
-                    None
-                } else {
-                    let a = decomposed.u.select(Axis(1), &kept) * &decomposed.singular_values.select(Axis(0), &kept);
-                    let b = decomposed.vt.select(Axis(0), &kept).t().to_owned();
-                    let up = |parts: Vec<Array2<f64>>| parts.iter().map(|p| device.upload(p.view()).map_err(error)).collect::<Result<Vec<_>, _>>();
-                    Some((up(split(&a, &write_widths, false))?, up(split(&b, &read_widths, false))?))
-                }
-            };
-            let map = split(&map, &write_widths, false)
+            let map = split(&fast_atb(&library.u, &library.v), &write_widths, false)
                 .iter()
                 .map(|row| split(row, &read_widths, true).iter().map(|b| device.upload(b.view()).map_err(error)).collect::<Result<Vec<_>, _>>())
                 .collect::<Result<Vec<_>, _>>()?;
+            let upload = |parts: Vec<Array2<f64>>| parts.iter().map(|p| device.upload(p.view()).map_err(error)).collect::<Result<Vec<_>, _>>();
             let rms = |m: &Array2<f64>| (m.iter().map(|x| x * x).sum::<f64>() / m.len().max(1) as f64).sqrt();
-            let block = |native: usize, node: usize, op: usize, rate: f64| -> Result<Block, String> {
+            let block = |node: usize, op: usize, rate: f64| -> Result<Block, String> {
                 let held = program.dense(op)?;
                 let zeros = || device.zeros(held.rows(), held.cols()).map_err(error);
-                Ok(Block { native, node, op, moments: (zeros()?, zeros()?), gradient: zeros()?, rate })
+                Ok(Block { node, op, moments: (zeros()?, zeros()?), gradient: zeros()?, rate })
             };
-            let reads = (0..site.reads.len()).map(|j| block(site.reads[j], inner.reads[j], masked.v_ops(k)[j], settings.rate * rms(&library.v))).collect::<Result<Vec<_>, _>>()?;
-            let writes = (0..site.writes.len()).map(|i| block(site.writes[i], inner.writes[i], masked.u_ops(k)[i], settings.rate * rms(&library.u))).collect::<Result<Vec<_>, _>>()?;
+            let reads = (0..site.reads.len()).map(|j| block(inner.reads[j], masked.v_ops(k)[j], settings.rate * rms(&library.v))).collect::<Result<Vec<_>, _>>()?;
+            let writes = (0..site.writes.len()).map(|i| block(inner.writes[i], masked.u_ops(k)[i], settings.rate * rms(&library.u))).collect::<Result<Vec<_>, _>>()?;
             let pieces = library.v.nrows();
             trained.push(Trained {
                 reads,
@@ -361,16 +354,19 @@ impl Trainer {
                 z: masked.z[k],
                 masked: masked.masked[k],
                 slot: masked.slots[k],
-                mask: *right,
-                pieces,
                 bits: device.zeros(1, pieces).map_err(error)?,
                 listing: device.zeros(pieces, 2).map_err(error)?,
                 map,
-                gap,
+                w: upload(split(&w, &read_widths, true))?,
+                fisher: device.upload(fisher.view()).map_err(error)?,
+                fisher_rows: upload(split(fisher, &write_widths, false))?,
+                fisher_host: fisher.clone(),
+                ones: device.upload_vec(w.nrows(), 1, vec![1.0; w.nrows()]).map_err(error)?,
+                coder: None,
                 bases: Bases { u: Vec::new(), u_values: device.zeros(0, 1).map_err(error)?, v: Vec::new(), v_values: device.zeros(1, 0).map_err(error)?, floor: 0.0 },
             });
         }
-        let mut trainer = Self { device: device.clone(), native, program, masked, sites: trained, settings, arithmetic, steps: 0, uniforms: Uniforms(settings.seed | 1) };
+        let mut trainer = Self { device: device.clone(), native, program, masked, sites: trained, settings, arithmetic, steps: 0 };
         trainer.sync(describe)?;
         Ok(trainer)
     }
@@ -387,24 +383,26 @@ impl Trainer {
         self.steps
     }
 
-    /// A training pass on `inputs` (whole sequences): its sets, KL and charge, and their gradient
-    /// added to the update's.
+    /// Every site's subcomponents' description bits as of the last [`Self::sync`].
+    pub fn bits(&self) -> Result<Vec<Vec<f64>>, String> {
+        self.sites.iter().map(|s| Ok(self.device.download(&s.bits).map_err(error)?.row(0).to_vec())).collect()
+    }
+
+    /// A training pass on `inputs` (whole sequences): the corner run's sets and KL, and the KL's
+    /// gradient at those sets added to the update's.
     pub fn train(&mut self, inputs: &FamilyInputs) -> Result<Tally, String> {
         self.pass(inputs, true)
     }
 
-    /// The same pass in float64, without a gradient, its labels drawn from the settings' seed
-    /// alone: the same inputs always meet the same draws, so two libraries compare on one footing.
+    /// The same pass in float64, without a gradient.
     pub fn evaluate(&mut self, inputs: &FamilyInputs) -> Result<Tally, String> {
         if !self.device.float64() {
             return Err(error(format!("{} has no float64: evaluate on a float64 device", self.device.name())));
         }
-        let (arithmetic, state) = (self.arithmetic, self.uniforms.0);
+        let arithmetic = self.arithmetic;
         self.set_arithmetic(Arithmetic::F64);
-        self.uniforms = Uniforms(self.settings.seed.rotate_left(32) | 1);
         let tally = self.pass(inputs, false);
         self.set_arithmetic(arithmetic);
-        self.uniforms = Uniforms(state);
         tally
     }
 
@@ -416,7 +414,7 @@ impl Trainer {
 
     fn pass(&mut self, inputs: &FamilyInputs, learn: bool) -> Result<Tally, String> {
         let d = self.device.clone();
-        let (rows, arithmetic, draws) = (inputs.rows, self.arithmetic, self.settings.draws);
+        let (rows, arithmetic) = (inputs.rows, self.arithmetic);
         // Each phase's wall time, at debug level (the device synchronised at its end).
         let timed = log::log_enabled!(log::Level::Debug);
         let mut clock = std::time::Instant::now();
@@ -428,107 +426,67 @@ impl Trainer {
             }
             Ok(())
         };
-        let trace = self.native.forward(inputs)?;
-        let target = self.native.logits_on_device(&trace)?;
-        // Every written block's sampled-label gradients, per site, per draw.
-        let writes: Vec<usize> = self.sites.iter().flat_map(|s| s.writes.iter().map(|b| b.native)).collect();
-        let mut gradients: Vec<Vec<Vec<Tensor>>> = self.sites.iter().map(|_| Vec::new()).collect();
-        for seed in self.native.sampled_many(&trace, &self.uniforms.rows(draws, rows), None)? {
-            let back = self.native.vjp(&trace, seed, &writes, arithmetic)?;
-            for (k, site) in self.sites.iter().enumerate() {
-                let drawn = site
-                    .writes
-                    .iter()
-                    .map(|b| match back.get(&b.native) {
-                        Some(g) => d.copy(g).map_err(error),
-                        None => d.zeros(rows, self.program.dense(b.op)?.rows()).map_err(error),
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                gradients[k].push(drawn);
-            }
-        }
-        lap("model forward and labels")?;
-        // Each site's sets under its own code, and its writes' sizes in each input's metric.
-        let mut tally = Tally { rows, ..Tally::default() };
-        let mut masks = BTreeMap::new();
-        let mut owns = Vec::new();
-        let weight = d.upload_vec(rows, 1, vec![self.settings.observations / (2.0 * LN_2); rows]).map_err(error)?;
-        let root = (draws as f64).sqrt().recip();
-        for (k, site) in self.sites.iter().enumerate() {
-            let program = &self.program;
-            let reads: Vec<(&Tensor, &Tensor)> = site.reads.iter().map(|b| Ok((trace.value(b.native)?, program.dense(b.op)?))).collect::<Result<_, String>>()?;
-            let a = products(&d, reads.iter().copied(), (Op::N, Op::T), 1.0, arithmetic)?;
-            let mut own = d.zeros(rows, site.pieces).map_err(error)?;
-            for drawn in &gradients[k] {
-                let terms: Vec<(&Tensor, &Tensor)> = drawn.iter().zip(&site.writes).map(|(g, b)| Ok((g, program.dense(b.op)?))).collect::<Result<_, String>>()?;
-                let p = products(&d, terms, (Op::N, Op::N), root, arithmetic)?;
-                d.hadamard(&mut own, &p, &p, true).map_err(error)?;
-            }
-            let left = match &site.gap {
-                None => d.zeros(rows, 1).map_err(error)?,
-                Some((a_gap, b_gap)) => {
-                    let through = products(&d, reads.iter().map(|(x, _)| *x).zip(b_gap), (Op::N, Op::N), 1.0, arithmetic)?;
-                    let mut squares = vec![0.0; rows];
-                    for drawn in &gradients[k] {
-                        let mut along = vec![0.0; rows];
-                        for (g, a_i) in drawn.iter().zip(a_gap) {
-                            let missed = product(&d, &through, Op::N, a_i, Op::T, 1.0, arithmetic)?;
-                            let mut both = d.zeros(rows, missed.cols()).map_err(error)?;
-                            d.hadamard(&mut both, g, &missed, false).map_err(error)?;
-                            let summed = d.download(&product(&d, &both, Op::N, &ones(&d, missed.cols(), 1)?, Op::N, 1.0, exact(&d))?).map_err(error)?;
-                            for (total, v) in along.iter_mut().zip(summed.iter()) {
-                                *total += v;
-                            }
-                        }
-                        for (q, v) in squares.iter_mut().zip(&along) {
-                            *q += v * v / draws as f64;
-                        }
-                    }
-                    d.upload_vec(rows, 1, squares.into_iter().map(f64::sqrt).collect()).map_err(error)?
-                }
-            };
-            let mut mask = ones(&d, rows, site.pieces)?;
-            d.select_sets((&a, &own), &site.bits, &left, &weight, &mut mask).map_err(error)?;
-            let listed = d.download(&product(&d, &mask, Op::N, &site.listing, Op::N, 1.0, exact(&d))?).map_err(error)?;
-            tally.l0 += listed.column(0).sum();
-            tally.description += listed.column(1).sum();
-            masks.insert(site.slot, mask);
-            owns.push(own);
-        }
-        drop(trace);
-        lap("sets")?;
-        // The masked forward at the sets, its KL, and the box claim's charge on its reads.
+        let target = {
+            let trace = self.native.forward(inputs)?;
+            self.native.logits_on_device(&trace)?
+        };
+        lap("model forward")?;
+        // Each site's `U F̄` from its factors as they are.
+        let ufs: Vec<Tensor> = self
+            .sites
+            .iter()
+            .map(|site| {
+                let terms: Vec<(&Tensor, &Tensor)> = site.writes.iter().zip(&site.fisher_rows).map(|(b, f)| Ok((self.program.dense(b.op)?, f))).collect::<Result<_, String>>()?;
+                products(&d, terms, (Op::T, Op::N), 1.0, arithmetic)
+            })
+            .collect::<Result<_, _>>()?;
+        // The corner run: every site's sets chosen from the read its own program computed.
         let mut family = inputs.clone();
         let slots = self.sites.iter().map(|s| s.slot + 1).max().unwrap_or(0);
         while family.slots.len() < slots {
             family.slots.push(SlotValues::Raw(Array2::zeros((0, 0))));
         }
-        let masked_trace = self.program.forward_given(&family, masks)?;
-        let (kl, hidden) = if learn {
-            let (kl, cot) = self.program.kl(&masked_trace, &target, None)?;
-            (kl, Some(cot))
-        } else {
-            (self.program.score_only(&masked_trace, &target, None)?, None)
-        };
+        let gates = self.masked.gates();
+        let mut listed = vec![(0.0, 0.0); self.sites.len()];
+        let (sites, masked) = (&self.sites, &self.masked);
+        let masked_trace = self.program.forward_gated(&family, BTreeMap::new(), &gates, |z_node, trace| {
+            let k = masked.z.iter().position(|n| *n == z_node).ok_or_else(|| error("an unknown gated amplitude"))?;
+            let site = &sites[k];
+            let coder = site.coder.as_ref().ok_or_else(|| error("a site without its code"))?;
+            let d_out = site.fisher.rows();
+            // The site's output `y = W x`, `U F̄ y` and `yᵀ F̄ y` from its read.
+            let mut y = d.zeros(rows, d_out).map_err(error)?;
+            for (b, w) in site.reads.iter().zip(&site.w) {
+                d.gemm(&mut y, 1.0, trace.value(b.node)?, Op::N, w, Op::T, 1.0, arithmetic).map_err(error)?;
+            }
+            let weights = product(&d, &y, Op::N, &ufs[k], Op::T, 1.0, arithmetic)?;
+            let yf = product(&d, &y, Op::N, &site.fisher, Op::N, 1.0, arithmetic)?;
+            let mut both = d.zeros(rows, d_out).map_err(error)?;
+            d.hadamard(&mut both, &y, &yf, false).map_err(error)?;
+            let yfy = product(&d, &both, Op::N, &site.ones, Op::N, 1.0, arithmetic)?;
+            let (on, _, _) = coder.code(&d, (trace.value(z_node)?, &weights, &yfy))?;
+            let on = coder.columns(&d, on)?;
+            let counted = d.download(&product(&d, &on, Op::N, &site.listing, Op::N, 1.0, exact(&d))?).map_err(error)?;
+            listed[k] = (counted.column(0).sum(), counted.column(1).sum());
+            Ok(on)
+        })?;
+        drop(ufs);
+        let mut tally = Tally { rows, ..Tally::default() };
+        for (l0, bits) in listed {
+            tally.l0 += l0;
+            tally.description += bits;
+        }
+        lap("corner run")?;
+        if !learn {
+            tally.kl = self.program.score_only(&masked_trace, &target, None)?.sum();
+            return Ok(tally);
+        }
+        let (kl, hidden) = self.program.kl(&masked_trace, &target, None)?;
         drop(target);
         tally.kl = kl.sum();
-        lap("masked forward")?;
-        let mut seeds = BTreeMap::new();
-        let mut coefficients = Vec::new();
-        for (site, own) in self.sites.iter().zip(owns) {
-            let z = masked_trace.value(site.z)?;
-            let mut cot = d.zeros(z.rows(), z.cols()).map_err(error)?;
-            let mut coefficient = d.zeros(z.rows(), z.cols()).map_err(error)?;
-            tally.charge += d.box_charge(z, masked_trace.value(site.mask)?, &own, &mut cot, &mut coefficient).map_err(error)?.iter().sum::<f64>();
-            seeds.insert(site.z, cot);
-            coefficients.push(coefficient);
-        }
-        lap("charge")?;
-        let Some(hidden) = hidden else { return Ok(tally) };
         let keep: Vec<usize> = self.sites.iter().flat_map(|s| std::iter::once(s.z).chain(s.writes.iter().map(|b| b.node))).collect();
-        let back = self.program.vjp_seeded(&masked_trace, hidden, seeds, &keep, arithmetic)?;
-        let program = &self.program;
-        for (k, site) in self.sites.iter_mut().enumerate() {
+        let back = self.program.vjp_seeded(&masked_trace, hidden, BTreeMap::new(), &keep, arithmetic)?;
+        for site in &mut self.sites {
             if let Some(cot_z) = back.get(&site.z) {
                 for b in &mut site.reads {
                     d.gemm(&mut b.gradient, 1.0, cot_z, Op::T, masked_trace.value(b.node)?, Op::N, 1.0, arithmetic).map_err(error)?;
@@ -538,16 +496,6 @@ impl Trainer {
             for b in &mut site.writes {
                 if let Some(g) = back.get(&b.node) {
                     d.gemm(&mut b.gradient, 1.0, g, Op::T, gated, Op::N, 1.0, arithmetic).map_err(error)?;
-                }
-            }
-            // The charge through each write's size: ∂‖u_c‖_{F_t}/∂u_c = mean_k (g_tk · u_c) g_tk / ‖u_c‖_{F_t}.
-            for drawn in &gradients[k] {
-                let terms: Vec<(&Tensor, &Tensor)> = drawn.iter().zip(&site.writes).map(|(g, b)| Ok((g, program.dense(b.op)?))).collect::<Result<_, String>>()?;
-                let p = products(&d, terms, (Op::N, Op::N), 1.0, arithmetic)?;
-                let mut weighted = d.zeros(p.rows(), p.cols()).map_err(error)?;
-                d.hadamard(&mut weighted, &coefficients[k], &p, false).map_err(error)?;
-                for (g, b) in drawn.iter().zip(&mut site.writes) {
-                    d.gemm(&mut b.gradient, 1.0 / draws as f64, g, Op::T, &weighted, Op::N, 1.0, arithmetic).map_err(error)?;
                 }
             }
         }
@@ -682,8 +630,8 @@ impl Trainer {
     }
 
     /// Every site's bases from its current factors, its map restored exactly (retractions while the
-    /// residual shrinks), its library written into the masked program, and its description bits
-    /// priced again under `describe`.
+    /// residual shrinks), its library written into the masked program, its description bits priced
+    /// again under `describe`, and its code (module note, "A step") formed from them.
     pub fn sync(&mut self, describe: &dyn Describe) -> Result<&Masked, String> {
         let d = self.device.clone();
         let exact = exact(&d);
@@ -725,6 +673,9 @@ impl Trainer {
             let library = Library { mean: Array1::zeros(v.ncols()), v, u };
             let bits = description_bits(describe, k, &library)?;
             let pieces = bits.len();
+            let gram = fast_abt(&fast_ab(&library.u, &self.sites[k].fisher_host), &library.u);
+            let coder = super::sparse_code::Coder::new(gram, &vec![1; pieces], &bits, self.settings.observations, super::site_fit::NODES)?;
+            self.sites[k].coder = Some(DeviceCoder::new(&d, coder)?);
             self.masked.set_library(k, library)?;
             let listing: Vec<f64> = bits.iter().flat_map(|b| [1.0, *b]).collect();
             self.sites[k].listing = d.upload_vec(pieces, 2, listing).map_err(error)?;
