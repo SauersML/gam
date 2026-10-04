@@ -62,6 +62,7 @@ pub mod engine;
 // its blocks grafted onto the native model.
 pub mod matrix_rule;
 pub mod matrix_rule_enumeration;
+pub mod unary_rule_bank;
 pub mod artifact;
 pub mod artifact_device;
 pub mod device_family_run;
