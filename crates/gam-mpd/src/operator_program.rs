@@ -3220,14 +3220,14 @@ pub struct CodeAccount {
 }
 
 impl CodeAccount {
-    /// The precision part of the message: every lattice's fraction-bits field and lattice indices.
-    /// Rounding a program onto another lattice changes only this part.
+    /// The operator-lattice precision payload: fraction bits and lattice indices.
+    /// Node constants remain in the wire frame; this is not the fixed-32 literal price.
     pub fn precision_bits(&self) -> u64 {
         self.operator_bits.iter().map(|(_, reals)| reals).sum()
     }
 
-    /// The structure part: everything else (bases, interfaces, present blocks, real counts, rules,
-    /// wiring, laws).
+    /// Wire message bits other than operator-lattice precision. Node real payloads remain
+    /// here, so this wire account is not the numeric-free structure used by C32.
     pub fn structure_bits(&self) -> u64 {
         self.total_bits - self.precision_bits()
     }
@@ -3789,6 +3789,41 @@ impl OperatorProgram {
             + rule_bits
             + node_total;
         Ok(CodeAccount { header_bits, basis_bits, operator_bits, rule_bits, node_bits: node_total, total_bits })
+    }
+
+    /// Independent real literals in ordinary nodes and stored rule bodies, and the
+    /// exact wire precision payload they occupy (fraction bits and lattice indices).
+    /// The lattice count field remains structural. A shared body is traversed once,
+    /// independently of its call count. This account changes neither the exact codec
+    /// nor native architecture constants such as an RMSNorm epsilon.
+    pub(crate) fn frame_real_payload(&self) -> Result<(u64, u64), ProgramError> {
+        fn scalar(value: f64) -> Result<(u64, u64), ProgramError> {
+            let wire = lattice_bits(&[value], exact_precision([value])?)?;
+            Ok((1, wire - prefix_integer_len_bits(2)?))
+        }
+        fn coefficient(value: &Coefficient) -> Result<(u64, u64), ProgramError> {
+            match value {
+                Coefficient::Parameter(_) => Ok((0, 0)),
+                Coefficient::Number(value) => scalar(*value),
+                Coefficient::Sum(terms) | Coefficient::Product(terms) => {
+                    terms.iter().try_fold((0, 0), |(count, bits), term| {
+                        let (literals, payload) = coefficient(term)?;
+                        Ok((count + literals, bits + payload))
+                    })
+                }
+            }
+        }
+        self.nodes.iter().chain(self.rules.iter().flat_map(|rule| &rule.nodes)).try_fold((0, 0), |(count, bits), node| {
+            let (literals, payload) = match node {
+                Node::Gain { coefficient: value, .. } => coefficient(value)?,
+                Node::RmsNorm { epsilon, .. } => scalar(*epsilon)?,
+                Node::Feature { .. } | Node::Raw { .. } | Node::Constant { .. } | Node::Affine { .. }
+                | Node::Bilinear { .. } | Node::Softmax { .. } | Node::Mix { .. } | Node::Pointwise { .. }
+                | Node::Hadamard { .. } | Node::Readout { .. } | Node::Outer { .. } | Node::Concat { .. }
+                | Node::Param { .. } | Node::Call { .. } | Node::Attend { .. } | Node::Transposed { .. } => (0, 0),
+            };
+            Ok((count + literals, bits + payload))
+        })
     }
 
     /// The message's parts other than the operators: header, bases, rules and nodes.

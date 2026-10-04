@@ -68,7 +68,7 @@
 //! and decides nothing.
 
 use super::artifact::{Artifact, EncodedArtifact, inlined};
-use super::operator_program::{Basis, Coefficient, FamilyInputs, Law, Node, Operator, OperatorProgram, SequenceLayout, SlotValues};
+use super::operator_program::{Basis, FamilyInputs, Law, Node, Operator, OperatorProgram, SequenceLayout, SlotValues};
 use super::precision::{DecodedFidelity, FidelityVerdict, decode_then_evaluate};
 use super::supports::{EvidenceStatus, ExactBasis, Extremum};
 use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
@@ -88,7 +88,8 @@ pub const LITERAL_BITS: u64 = 32;
 pub struct StructuralCost {
     /// Independently specified numerical literals.
     pub literals: u64,
-    /// The program's message less its lattice indices (`CodeAccount::structure_bits`).
+    /// Numeric-free program structure: all real precision payloads excluded.
+    /// This differs from the existing wire `CodeAccount::structure_bits`.
     pub structure_bits: u64,
     /// Blocks, places and exceptions ([`Artifact::binding_bits`]).
     pub binding_bits: u64,
@@ -127,22 +128,18 @@ fn message_key(message: &super::codec::BitString) -> Result<Vec<u64>, String> {
     Ok(words)
 }
 
-fn numbers(coefficient: &Coefficient) -> u64 {
-    match coefficient {
-        Coefficient::Parameter(_) => 0,
-        Coefficient::Number(_) => 1,
-        Coefficient::Sum(terms) | Coefficient::Product(terms) => terms.iter().map(numbers).sum(),
-    }
-}
-
-/// `C(artifact)`.
+/// `C32(artifact)`: numeric-free structure plus 32 bits per independently
+/// transmitted real literal. The exact wire codec may take a different number of
+/// bits, notably for native architecture epsilon values retained without rounding.
 pub fn structural_cost(artifact: &Artifact, cache: &mut CostCache) -> Result<StructuralCost, String> {
     // The program as its message holds it: a derived operator with no reals.
     let program = &artifact.message_program()?;
     let derived: BTreeSet<usize> = artifact.derived.iter().map(|d| d.operator).collect();
     let (header, bases, rules, nodes) = program.frame_bits().map_err(|e| e.to_string())?;
-    let mut structure_bits = header + bases.iter().sum::<u64>() + rules + nodes;
-    let mut literals = artifact.derived_literals();
+    let (node_literals, node_real_payload) = program.frame_real_payload().map_err(|e| e.to_string())?;
+    let mut structure_bits = (header + bases.iter().sum::<u64>() + rules + nodes)
+        .checked_sub(node_real_payload).ok_or("node real payload exceeds program frame")?;
+    let mut literals = artifact.derived_literals() + artifact.exceptions.len() as u64 + node_literals;
     for (index, op) in program.operators.iter().enumerate() {
         let key = Arc::as_ptr(op) as usize;
         let (structure, reals) = match cache.operators.get(&key) {
@@ -159,11 +156,6 @@ pub fn structural_cost(artifact: &Artifact, cache: &mut CostCache) -> Result<Str
         };
         structure_bits += structure;
         literals += reals;
-    }
-    for node in program.nodes.iter().chain(program.rules.iter().flat_map(|rule| rule.nodes.iter())) {
-        if let Node::Gain { coefficient, .. } = node {
-            literals += numbers(coefficient);
-        }
     }
     Ok(StructuralCost { literals, structure_bits, binding_bits: artifact.binding_bits()? })
 }

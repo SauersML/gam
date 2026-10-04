@@ -20,9 +20,12 @@
 //!   The message holds a derived operator with no reals; its reals are recomputed, in an order in
 //!   which every source precedes what reads it, whenever a source changes and when decoding.
 //!
-//! Every numerical literal of `P` is a 32-bit float ([`Artifact::f32_literals`]): the decoder rebuilds
-//! exactly the reals the description is charged for. A derived operator's computed reals are not
-//! literals; its scale and residual rows are.
+//! Learned operator and coefficient literals are projected to 32-bit floats by
+//! [`Artifact::f32_literals`]; native RMSNorm epsilon values remain exact architecture
+//! constants. The fixed-32 objective C32 charges every independently transmitted real
+//! once at 32 bits, including architecture epsilon values and exceptions. This price
+//! is separate from exact wire length; changing a price never rounds execution. A
+//! derived operator's computed reals are not literals; its scale and residual rows are.
 //!
 //! # The message
 //!
@@ -849,8 +852,9 @@ impl Artifact {
         Ok(Self { program, native_nodes: self.native_nodes, blocks, places, exceptions, derived })
     }
 
-    /// Whether every literal of `P` is a 32-bit float (a derived operator's computed reals are not
-    /// literals).
+    /// Whether learned operator and coefficient literals are 32-bit floats.
+    /// Exact architecture RMSNorm epsilon values are preserved; derived computed
+    /// reals are not independently sent parameter literals.
     pub fn has_f32_literals(&self) -> bool {
         let derived: std::collections::BTreeSet<usize> = self.derived.iter().map(|d| d.operator).collect();
         self.program.operators.iter().enumerate().all(|(i, op)| derived.contains(&i) || has_f32_reals(op))
@@ -860,8 +864,9 @@ impl Artifact {
             })
     }
 
-    /// This artifact with every literal rounded to its nearest 32-bit float, its derived operators
-    /// recomputed from what the rounded sources hold.
+    /// Round learned operator and coefficient literals to 32-bit floats, and
+    /// recompute derived operators. Preserve exact architecture RMSNorm epsilon
+    /// values and their execution; this is not a change to the C32 price.
     pub fn f32_literals(&self) -> Result<Self, String> {
         let derived: std::collections::BTreeSet<usize> = self.derived.iter().map(|d| d.operator).collect();
         let mut out = self.clone();
@@ -1036,8 +1041,9 @@ impl Artifact {
         Ok((Self { program: out, native_nodes: self.native_nodes, blocks: Vec::new(), places: Vec::new(), exceptions, derived: Vec::new() }, columns))
     }
 
-    /// The bits of the blocks, places and exceptions sections without the names: what the
-    /// artifact says beyond its program.
+    /// Numeric-free blocks, places, exceptions and derivation structure, excluding
+    /// diagnostic names. Exception values, derived scales and residual values are
+    /// independently priced at 32 bits each by C32, outside this binding remainder.
     pub fn binding_bits(&self) -> Result<u64, String> {
         let nodes = self.program.nodes.len();
         let fixed = |alphabet: usize| -> Result<u64, String> { Ok(u64::from(fixed_index_len_bits(alphabet).map_err(codec)?)) };
@@ -1054,7 +1060,7 @@ impl Artifact {
             for token in &exception.context {
                 bits += prefix(u64::from(*token) + 1)?;
             }
-            bits += fixed(nodes)? + fixed(interfaces[exception.node].width())? + 32;
+            bits += fixed(nodes)? + fixed(interfaces[exception.node].width())?;
         }
         // The derived operators less their literals' 32 bits each (charged as literals).
         let operators = self.program.operators.len();

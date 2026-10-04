@@ -883,3 +883,135 @@ fn native_rms_norm_survives_artifact_roundtrip_coverage() {
     let decoded = EncodedArtifact::of(&native).unwrap().decode().unwrap();
     decoded.validate_coverage(&model).unwrap();
 }
+
+/// C32 removes exact node-lattice payloads before charging each real once at 32 bits.
+#[test]
+fn c32_root_real_literals_have_value_independent_price() {
+    use super::operator_program::Coefficient;
+    let make = |gain: f64, epsilon: f64| {
+        let program = raw_program(2, vec![], vec![
+            Node::Raw { slot: 0 },
+            Node::Gain { input: 0, coefficient: Coefficient::Product(vec![
+                Coefficient::Number(gain),
+                Coefficient::Sum(vec![Coefficient::Number(0.25), Coefficient::Number(0.5)]),
+            ]) },
+            Node::RmsNorm { input: 1, epsilon },
+        ]);
+        Artifact::native(&program).unwrap().f32_literals().unwrap()
+    };
+    let (first, second) = (make(0.1, 1e-5), make(16.0, 2f64.powi(-60)));
+    let mut cache = CostCache::default();
+    let (a, b) = (structural_cost(&first, &mut cache).unwrap(), structural_cost(&second, &mut cache).unwrap());
+    assert_eq!(a.literals, 4, "three Gain numbers and one exact architecture epsilon");
+    assert_eq!(a, b, "literal magnitudes and exact codec precision do not change C32");
+    assert_ne!(first.program.code_bits().unwrap(), second.program.code_bits().unwrap(), "the preserved exact wire account is separate");
+    let (header, bases, rules, nodes) = first.program.frame_bits().unwrap();
+    let (count, payload) = first.program.frame_real_payload().unwrap();
+    assert_eq!(count, 4);
+    assert_eq!(a.structure_bits, header + bases.iter().sum::<u64>() + rules + nodes - payload);
+}
+
+/// Shared numerical bodies are charged once; a call pays structure, never another copy of the literals.
+#[test]
+fn c32_shared_rule_real_literals_are_paid_once() {
+    use super::operator_program::Coefficient;
+    let body = rule("shared numerical body", vec![native(2)], vec![
+        Node::Param { index: 0 },
+        Node::Gain { input: 0, coefficient: Coefficient::Product(vec![
+            Coefficient::Number(0.25), Coefficient::Number(0.5),
+        ]) },
+        Node::RmsNorm { input: 1, epsilon: 1e-5 },
+    ]);
+    let mut one = raw_program(2, vec![], vec![Node::Raw { slot: 0 }, Node::Call { rule: 0, arguments: vec![0] }]);
+    one.rules.push(body.clone());
+    let mut two = one.clone();
+    two.nodes.push(Node::Call { rule: 0, arguments: vec![1] });
+    two.output = 2;
+    let cost = |program: &OperatorProgram| structural_cost(&Artifact::native(program).unwrap(), &mut CostCache::default()).unwrap();
+    let (a, b) = (cost(&one), cost(&two));
+    assert_eq!((a.literals, b.literals), (3, 3));
+    assert!(b.structure_bits > a.structure_bits, "the extra call and its wiring still cost structure");
+    let mut duplicated = two;
+    duplicated.rules.push(body);
+    duplicated.nodes[2] = Node::Call { rule: 1, arguments: vec![1] };
+    assert_eq!(cost(&duplicated).literals, 6, "separately stored bodies have independent payloads");
+}
+
+/// A pricing correction must neither round a native architecture epsilon nor change its decoded execution.
+#[test]
+fn c32_preserves_exact_native_epsilon_and_execution() {
+    let epsilon = 1e-5;
+    assert_ne!(epsilon, f64::from(epsilon as f32));
+    let program = raw_program(2, vec![], vec![Node::Raw { slot: 0 }, Node::RmsNorm { input: 0, epsilon }]);
+    let artifact = Artifact::native(&program).unwrap().f32_literals().unwrap();
+    let decoded = Artifact::from_bytes(&artifact.to_bytes().unwrap(), &program.declarations).unwrap();
+    assert_eq!(decoded.program.nodes, program.nodes, "wire decoding preserves the exact architecture value");
+    let family = raw_family(vec![vec![0.25, 2.0], vec![-0.5, 0.75]]);
+    assert_eq!(decoded.execute(&family).unwrap().values, program.execute(&family, false).unwrap().values);
+    decoded.validate_coverage(&program).unwrap();
+    assert_eq!(structural_cost(&decoded, &mut CostCache::default()).unwrap().literals, 1);
+}
+
+/// An exception value is a literal; its selectors and conditionals are the binding remainder.
+#[test]
+fn c32_exception_value_and_binding_structure_are_separate() {
+    use super::codec::{fixed_index_len_bits, prefix_integer_len_bits};
+    let program = raw_program(2, vec![], vec![Node::Raw { slot: 0 }]);
+    let plain = Artifact::native(&program).unwrap();
+    let mut exception = plain.clone();
+    exception.exceptions.push(super::artifact::Exception { context: vec![], node: 0, column: 1, value: 0.125 });
+    let (a, b) = (
+        structural_cost(&plain, &mut CostCache::default()).unwrap(),
+        structural_cost(&exception, &mut CostCache::default()).unwrap(),
+    );
+    let binding_delta = prefix_integer_len_bits(2).unwrap() - prefix_integer_len_bits(1).unwrap()
+        + prefix_integer_len_bits(1).unwrap() + u64::from(fixed_index_len_bits(1).unwrap()) + u64::from(fixed_index_len_bits(2).unwrap());
+    assert_eq!(b.literals, a.literals + 1);
+    assert_eq!(b.structure_bits, a.structure_bits);
+    assert_eq!(b.binding_bits - a.binding_bits, binding_delta, "the 32 value bits are not in binding structure");
+    assert_eq!(b.total() - a.total(), binding_delta + 32);
+    assert_eq!(exception.encode().unwrap().len_bits() - plain.encode().unwrap().len_bits(), binding_delta + 32);
+    exception.exceptions[0].value = 123.5;
+    assert_eq!(structural_cost(&exception, &mut CostCache::default()).unwrap(), b);
+}
+
+/// Computed operator entries are absent from literal counts; only the scale and residual cells are sent.
+#[test]
+fn c32_derived_scale_and_residual_are_each_paid_once() {
+    let (d, w) = (native(2), native(1));
+    let diagonal = |name: &str| Operator::diag(name, d.clone(), array![1.0, 1.0], exact_precision([1.0]).unwrap(), Provenance::default()).unwrap();
+    let program = raw_program(2, vec![
+        diagonal("gain"), dense("value", &w, &d, array![[1.0, 0.0]]),
+        dense("output", &d, &w, array![[1.0], [0.0]]), diagonal("final gain"),
+    ], vec![Node::Raw { slot: 0 }]);
+    let start = Artifact::native(&program).unwrap();
+    let law = super::artifact::OperatorLaw::Copy { value: 1, gain: 0, final_gain: 3 };
+    let plain = start.derive(2, law.clone(), 1.0, vec![]).unwrap();
+    let residual = start.derive(2, law.clone(), 0.5, vec![(0, vec![0.125]), (1, vec![0.25])]).unwrap();
+    let cost = |a: &Artifact| structural_cost(a, &mut CostCache::default()).unwrap();
+    assert_eq!(cost(&start).literals - cost(&plain).literals, 2 - 1);
+    assert_eq!(cost(&residual).literals - cost(&plain).literals, 2);
+    assert_eq!(residual.derived_literals(), 3);
+    assert_eq!(residual.message_program().unwrap().operators[2].real_count(), 0);
+    let different_scale = start.derive(2, law, 0.75, vec![]).unwrap();
+    assert_eq!(cost(&plain), cost(&different_scale));
+    let decoded = Artifact::from_bytes(&residual.to_bytes().unwrap(), &program.declarations).unwrap();
+    assert_eq!(cost(&residual), cost(&decoded));
+}
+
+/// A basis transmits discrete structure, not a table of computed sine/cosine numerical values.
+#[test]
+fn c32_basis_constants_are_primitive_and_permutations_are_structure() {
+    use super::operator_program::{Basis, Domain};
+    let positions = vec![Some(0), Some(1), Some(2)];
+    let program = |declared| OperatorProgram {
+        declarations: Declarations { domains: vec![Domain { size: 3, cycle: Some(positions.clone()) }], slots: vec![Slot::Token { domain: 0 }], parameters: 0 },
+        bases: vec![Basis::Characters { domain: 0, positions: positions.clone(), declared }],
+        operators: vec![], rules: vec![],
+        nodes: vec![Node::Feature { slot: 0, basis: 0 }, Node::Readout { input: 0, basis: 0 }], output: 1,
+    };
+    let cost = |p: &OperatorProgram| structural_cost(&Artifact::native(p).unwrap(), &mut CostCache::default()).unwrap();
+    let (known, recovered) = (cost(&program(true)), cost(&program(false)));
+    assert_eq!((known.literals, recovered.literals), (0, 0));
+    assert!(recovered.structure_bits > known.structure_bits, "a recovered basis pays its complete discrete permutation");
+}
