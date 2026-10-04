@@ -12,7 +12,6 @@ publish = false
 name = "gam_mpd"
 
 [dependencies]
-egg = "0.11.0"
 faer = "0.24.4"
 gam-gpu = { path = "../gam-gpu", version = "=0.3.157" }
 gam-linalg = { path = "../gam-linalg", version = "=0.3.157" }

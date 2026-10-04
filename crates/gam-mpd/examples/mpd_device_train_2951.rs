@@ -3,7 +3,7 @@
 //! `mpd_device_train_2951 EXPORT_DIR LIBRARY_DIR OUT_DIR OBSERVATIONS TRAIN [BATCH] [STEPS] [RATE] [MICRO] [EVAL] [SYNC] [CONTEXT]`
 //!
 //! `LIBRARY_DIR` holds a library per site (`{site}.v.f64`, `{site}.u.f64`, as `mpd_site_fit_2951`
-//! and `mpd_e2e_train_2951` write them; a site without files stays native). Every update sums the
+//! writes them; a site without files stays native). Every update sums the
 //! gradients of `BATCH` training sequences (default 32, of the export's first `TRAIN`, cycled),
 //! `MICRO` at a time (default 8), and takes one Adam step of `RATE` (default 3e-4, a share of
 //! each factor's root mean square entry); `STEPS` updates (default 1000). Every `SYNC` updates
