@@ -1,0 +1,15 @@
+{
+  "job": 15878,
+  "source_commit": "ca73197a3ee726075fe54df9fd86c9aed957a868",
+  "elapsed_seconds": 232,
+  "max_rss_kib": 4753060,
+  "report_sha256": "510a88e5bfe6582c7893140c081f0d19fac940bfb9d3feb08c44b116dfd00ba6",
+  "gzip_sha256": "a9110606aaf2d514a5cf4c43b165cc7137ef63f4a0b779c9236b25f1b25d269d",
+  "scope": "production standard RunCheck assessment and saved-byte replay; frozen 80 whole-sequence episodes; declared two-candidate bank only",
+  "resident_calls": 4,
+  "teacher_initializations": 1,
+  "zero_residual_vocab_donor_final_state_transfers": true,
+  "epsilon_0p01": "native selected; Copy fails",
+  "epsilon_0p1": "Copy selected",
+  "gap_scope": "zero gap within declared two-candidate bank"
+}

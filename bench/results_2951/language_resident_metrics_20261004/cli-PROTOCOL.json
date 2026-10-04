@@ -1,0 +1,105 @@
+{
+  "source_commit": "ca73197a3ee726075fe54df9fd86c9aed957a868",
+  "example": "mpd_candidate_frontier_2951",
+  "export": "codex/copy-rule-validation-20261004/export",
+  "tokens_sha256": "9938c3b6995c4c1b9f74b7bf26b7a17a991941952de9a2e6598fec95003ca8cf",
+  "parent_spec": "codex/copy-whole-sequence-validation-20261004/spec.json",
+  "parent_spec_sha256": "3c05b66324dfb02e33da7eff98784a7ec432123e24fea78018b892efb4256436",
+  "smoke_parent_episode_indices": [
+    0,
+    33
+  ],
+  "smoke_episode_ids": [
+    "clean/0",
+    "remove-head/l3/h5/0"
+  ],
+  "smoke_spec_sha256": "ed7e6ad66873346383b20b7a2f6294a3ec933eab92d5c728ad12d886530e3e5b",
+  "artifacts": [
+    {
+      "file": "cluster/codex-copy-residual-pair-1c0e7/evaluation/selected.0.bin",
+      "sha256": "351f84b21e2885d60dd3308992d1458da73a01c833b8f8e7028238f0a35ccc12",
+      "label": "native"
+    },
+    {
+      "file": "cluster/codex-copy-residual-pair-1c0e7/evaluation/selected.189.bin",
+      "sha256": "b4f660612a3363ffc89f03ce1897459fbe2faca3e6dcadd787c7cbcd4aca3243",
+      "label": "savedCopy189"
+    }
+  ],
+  "readout_rows": 64,
+  "metric_batch_rows": 128,
+  "metric_workspace_budget_bytes": 1073741824,
+  "CUDA_head_resident_budget_bytes": 536870912,
+  "CUDA_head_workspace_budget_bytes": 268435456,
+  "GPU_resources": {
+    "GPUs": 1,
+    "CPUs": 4,
+    "GiB": 16,
+    "minutes": 30
+  },
+  "scope": "Production resident RunCheck assess and saved-byte replay gate; finitebank2 native+savedCopy189, unchangedwhole80 fixedpanel andCPU Local2x512. Not a new scientificcandidate sweep.",
+  "full_run_gate": "Only after same published source small2episode fixture/rational/rawidenticalinput analytic spotcheck + all cold/warm frozen classifications pass.",
+  "normalized_source_commit": "34fa55a30dd971f2e07ea4c244eb2b0210af20e2",
+  "normalized_baselines": {
+    "smoke": {
+      "file": "cluster/codex-language-checked-smoke-34fa/report.json",
+      "sha256": "69fe049ab493e36e7570c0c96b2c9466f1c7fcc259a15a1f7dcd4de6ad56accf"
+    },
+    "full": {
+      "file": "cluster/codex-language-checked-full-34fa/report.json",
+      "sha256": "22e07b76621169902598cca0d7e662d50f1e9f6c072d4c49fefc38863c498cb6"
+    }
+  },
+  "smoke_spec": "codex/language-checked-metrics-20261004/smoke-spec.json",
+  "raw_tile_rows": 128,
+  "raw_workspace_budget_bytes": 1073741824,
+  "raw_baselines": {
+    "smoke": {
+      "file": "cluster/codex-language-raw-smoke-bd15/report.json",
+      "sha256": "79ecc0634057f6c2d3f76a4560a4662da4da80db8d87ddb7721006a57ab289ae"
+    },
+    "full": {
+      "file": "cluster/codex-language-raw-full-bd15/report.json",
+      "sha256": "498135f3505bc5aceef8d705d7397b0e56920cbdc59311a789ab5440386653c1"
+    }
+  },
+  "teacher_cache_budget_bytes": 536870912,
+  "operator_budget_bytes": 2147483648,
+  "edit_budget_bytes": 536870912,
+  "aggregate_numeric_plan_budget_bytes": 12884901888,
+  "numeric_plan_exclusions": [
+    "CUDA context",
+    "cuBLAS workspace",
+    "attention scratch",
+    "edit-construction scratch",
+    "register spills",
+    "allocator overhead"
+  ],
+  "cli_options": [
+    "budget=2",
+    "max_bank=2",
+    "local=2",
+    "context=512",
+    "batch=512",
+    "parallel=1",
+    "backend=cuda",
+    "cuda_local=0",
+    "cuda_share_native=1",
+    "cuda_trace_bytes=2147483648",
+    "cuda_readout_resident_bytes=536870912",
+    "cuda_readout_workspace_bytes=268435456",
+    "cuda_resident_run=1",
+    "cuda_aggregate_bytes=12884901888",
+    "cuda_teacher_bytes=536870912",
+    "cuda_operator_bytes=2147483648",
+    "cuda_edit_bytes=536870912",
+    "cuda_metric_workspace_bytes=1073741824",
+    "cuda_metric_batch_rows=128",
+    "local_kl=0",
+    "deltas=1",
+    "epsilons=0.01,0.1"
+  ],
+  "bank_sha256": "9a3d2f327b052da1a899763532c303433c1e56337667ac15ec53c880ff5f8a85",
+  "required_resident_full_gate": "cluster/codex-language-resident-full-6f38/report.json",
+  "required_gate_sha256": "fb0d68262eb3d80a5439a62e2c64460c568499da3ffb153d364fbc39846843d9"
+}
