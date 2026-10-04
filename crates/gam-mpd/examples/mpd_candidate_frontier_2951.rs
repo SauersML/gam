@@ -13,6 +13,8 @@
 //! deltas=0.05,0.1,0.2, epsilons=0.01,0.03,0.1, parallel=8, batch=1024,
 //! groups= (all declared episode groups), cuda_share_native=0 (opt-in exact GPU parameter reuse),
 //! cuda_local=0 (opt-in CUDA native-parent graft; requires backend=cuda, ascent=0).
+//! A bank entry names either an `artifact` path or `copy_masks`, one head bitmask
+//! per native layer. Explicit masks are proposals, measured afresh by the same acceptance path.
 //! SHA-256 input manifests require sha256sum
 //! or shasum on PATH. No greedy feasibility pruning is used.
 
@@ -23,7 +25,7 @@ use gam_mpd::counterfactual::{Decoder, Spec, passages};
 use gam_mpd::import::import_language_model;
 use gam_mpd::decoded_intern::DecodedOperatorInterner;
 use gam_mpd::operator_program::{FamilyInputs, SequenceLayout, SlotValues};
-use gam_mpd::proposals::AccountProposer;
+use gam_mpd::proposals::{AccountProposer, CopyMasks};
 use gam_mpd::run_check::{LanguageRun, layer_nodes, split_sites};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -36,7 +38,23 @@ use std::time::Instant;
 #[serde(deny_unknown_fields)]
 struct BankEntry {
     label: String,
-    artifact: PathBuf,
+    artifact: Option<PathBuf>,
+    /// Explicit per-layer head masks, composed from this export's native weights.
+    /// This is a proposal description; it neither substitutes a prior screen for
+    /// Local/Run nor changes the complete decoded program's charged cost.
+    copy_masks: Option<Vec<usize>>,
+}
+
+impl BankEntry {
+    fn validate(&self) -> Result<(), String> {
+        if self.artifact.is_some() == self.copy_masks.is_some() {
+            return Err(format!("{}: specify exactly one of artifact or copy_masks", self.label));
+        }
+        if self.copy_masks.as_ref().is_some_and(Vec::is_empty) {
+            return Err(format!("{}: copy_masks must name every layer", self.label));
+        }
+        Ok(())
+    }
 }
 
 fn read_json(path: &Path) -> Result<Value, String> {
@@ -142,6 +160,7 @@ fn main() -> Result<(), String> {
     let (deltas, epsilons) = (floats(&key("deltas", "0.05,0.1,0.2"))?, floats(&key("epsilons", "0.01,0.03,0.1"))?);
     let constraints: Vec<Constraint> = deltas.iter().flat_map(|&local| epsilons.iter().map(move |&run| Constraint { local, run })).collect();
     let entries: Vec<BankEntry> = serde_json::from_value(read_json(&bank_path)?).map_err(|e| format!("{}: {e}", bank_path.display()))?;
+    for entry in &entries { entry.validate()?; }
     if entries.len().checked_add(1).ok_or("bank size overflow")? > max_bank {
         return Err("explicit bank plus native exceeds max_bank".into());
     }
@@ -210,7 +229,18 @@ fn main() -> Result<(), String> {
     // unchanged tensors across index compaction, ignoring disposable decoder labels.
     let native_artifact = Artifact::native(&native)?.f32_literals()?;
     let start = Artifact::from_bytes(&native_artifact.to_bytes()?, &native.declarations)?;
-    drop(native_artifact);
+    let copy_layers = if entries.iter().any(|entry| entry.copy_masks.is_some()) {
+        Some(layer_nodes(&native, decoder.layers())?)
+    } else { None };
+    let copy_bank = if let Some(layers) = &copy_layers {
+        let config = &export_record["config"];
+        let heads = config["n_heads"].as_u64().ok_or("Copy masks need n_heads")?;
+        let kv = config["n_kv_heads"].as_u64().ok_or("Copy masks need n_kv_heads")?;
+        if kv == 0 || heads % kv != 0 { return Err("invalid Copy KV grouping".into()); }
+        // Only the explicitly supplied masks are composed. No implicit Cartesian
+        // bank is generated or scored; max_bank already bounds these descriptors.
+        Some(CopyMasks::new(&native_artifact, layers, usize::try_from(heads / kv).map_err(|e| e.to_string())?, usize::MAX, usize::MAX)?)
+    } else { None };
     let share_native = number("cuda_share_native", 0)?;
     if share_native > 1 || (share_native == 1 && backend != "cuda") {
         return Err("cuda_share_native must be 0 or 1; 1 requires backend=cuda".into());
@@ -224,14 +254,20 @@ fn main() -> Result<(), String> {
         if entry.label.is_empty() || !labels.insert(entry.label.clone()) {
             return Err(format!("empty or duplicate candidate label {}", entry.label));
         }
-        let path = resolve(bank_dir, &entry.artifact);
-        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let mut artifact = Artifact::from_bytes(&bytes, &native.declarations)?;
-        drop(bytes);
+        let mut artifact = match (entry.artifact, entry.copy_masks) {
+            (Some(path), None) => {
+                let path = resolve(bank_dir, &path);
+                let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                let artifact = Artifact::from_bytes(&bytes, &native.declarations)?;
+                input_paths.insert(path);
+                artifact
+            }
+            (None, Some(masks)) => copy_bank.as_ref().ok_or("missing Copy descriptor bank")?.compose(&masks)?.f32_literals()?,
+            _ => return Err("bank entry changed after validation".into()),
+        };
         let shared = interner.intern(&mut artifact);
         eprintln!("loaded {}: {shared}/{} operators shared with decoded native", entry.label, artifact.program.operators.len());
         candidates.push(Candidate { label: entry.label, artifact });
-        input_paths.insert(path);
     }
     let mut account_count = 0;
     if let Some(directory) = keys.get("accounts") {
@@ -362,4 +398,28 @@ fn main() -> Result<(), String> {
     std::fs::write(&path, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| format!("{}: {e}", path.display()))?;
     eprintln!("{} distinct candidates, {} measured; {}", evaluated.bank.len(), evaluated.measured_candidates, path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn existing_artifact_entries_and_explicit_joint_masks_are_distinct() {
+        let old: BankEntry = serde_json::from_value(json!({"label":"old","artifact":"old.bin"})).unwrap();
+        old.validate().unwrap();
+        assert!(old.copy_masks.is_none());
+        let joint: BankEntry = serde_json::from_value(json!({"label":"joint","copy_masks":[0,0,16,32]})).unwrap();
+        joint.validate().unwrap();
+        assert_eq!(joint.copy_masks.unwrap(), [0,0,16,32]);
+    }
+
+    #[test]
+    fn ambiguous_missing_and_empty_proposals_are_refused() {
+        for entry in [json!({"label":"none"}),json!({"label":"both","artifact":"a.bin","copy_masks":[0]}),json!({"label":"empty","copy_masks":[]})] {
+            assert!(serde_json::from_value::<BankEntry>(entry).unwrap().validate().is_err());
+        }
+        assert!(serde_json::from_value::<BankEntry>(json!({"label":"bad","copy_masks":[-1]})).is_err());
+        assert!(serde_json::from_value::<BankEntry>(json!({"label":"bad","copy_mask":[1]})).is_err());
+    }
 }
