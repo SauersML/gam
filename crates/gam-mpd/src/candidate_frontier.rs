@@ -109,9 +109,12 @@ pub fn frontier(
             unique.push(candidate);
         }
     }
+    // Deduplication no longer needs the encoded messages. Assessment keeps its own exact
+    // cache identity; retaining both copies doubles the largest bank allocation.
+    let unique: Vec<_> = unique.into_iter().map(|(cost, label, artifact, _)| (cost, label, artifact)).collect();
     let measured_candidates = if constraints.is_empty() { 0 } else { budget.min(unique.len()) };
     let mut evidence: Vec<Vec<Evidence>> = constraints.iter().map(|_| Vec::new()).collect();
-    for (index, (cost, label, artifact, _)) in unique.iter().enumerate() {
+    for (index, (cost, label, artifact)) in unique.iter().enumerate() {
         // Measurement is independent of the declared tolerance grid. Encoding and decoding
         // a real model for each point can cost more than evaluating it; reuse its evidence.
         let assessed = if index < measured_candidates {
@@ -129,7 +132,7 @@ pub fn frontier(
         }
     }
     let points = constraints.iter().copied().zip(evidence).map(|(c, e)| point(c, e)).collect();
-    let bank = unique.into_iter().map(|(_, label, artifact, _)| Candidate { label, artifact }).collect();
+    let bank = unique.into_iter().map(|(_, label, artifact)| Candidate { label, artifact }).collect();
     Ok(Frontier { bank, points, measured_candidates })
 }
 
