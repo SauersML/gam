@@ -105,6 +105,8 @@ enum Step {
         input: usize,
         codes: Indices,
     },
+    /// Fixed scalar expression from the serialized rule, evaluated once at compilation.
+    Gain { input: usize, factor: f64 },
     Hadamard {
         left: usize,
         right: usize,
@@ -363,7 +365,13 @@ impl DeviceProgram {
                 Node::Outer { .. } => return refuse("an outer product"),
                 Node::Concat { parts } => Step::Concat { parts: parts.clone() },
                 Node::Param { .. } | Node::Call { .. } => return refuse("a rule"),
-                Node::Gain { .. } => return refuse("a parameter gain"),
+                Node::Gain { input, coefficient } => {
+                    // Parameters supplied at execution time have no resident representation.
+                    // Constant polynomial expressions retain their ordinary IR semantics.
+                    let (factor, _, _) = coefficient.evaluate(&[]).map_err(error)?;
+                    if !factor.is_finite() { return refuse("a nonfinite fixed gain"); }
+                    Step::Gain { input: *input, factor }
+                }
             };
             steps.push(step);
         }
@@ -853,6 +861,11 @@ impl DeviceProgram {
                     Some(out)
                 }
                 Step::Pointwise { input, codes } => Some(d.law_values(trace.value(*input)?, codes, gelu_tanh_constant()).map_err(error)?),
+                Step::Gain { input, factor } => {
+                    let mut out = d.zeros(rows, width).map_err(error)?;
+                    d.axpy(&mut out, *factor, trace.value(*input)?).map_err(error)?;
+                    Some(out)
+                }
                 Step::Hadamard { left, right } => {
                     let mut out = d.zeros(rows, width).map_err(error)?;
                     d.hadamard(&mut out, trace.value(*left)?, trace.value(*right)?, false).map_err(error)?;
@@ -1201,6 +1214,11 @@ impl DeviceProgram {
                     if column != cot.cols() { return Err("device: Concat cotangent width mismatch".into()); }
                 }
                 Step::Readout { input } => add(&mut g, *input, d.copy(&cot).map_err(error)?)?,
+                Step::Gain { input, factor } => {
+                    let mut term = d.zeros(cot.rows(), cot.cols()).map_err(error)?;
+                    d.axpy(&mut term, *factor, &cot).map_err(error)?;
+                    add(&mut g, *input, term)?;
+                }
                 Step::Head | Step::Feature { .. } | Step::Raw { .. } | Step::Constant { .. } => {}
                 Step::Affine { terms, .. } => {
                     for (argument, operator) in terms {
@@ -1500,6 +1518,14 @@ impl DeviceProgram {
                     Some(dx) => Some(d.law_slopes(dx, trace.value(*input)?, codes, gelu_tanh_constant()).map_err(error)?),
                     None => None,
                 },
+                Step::Gain { input, factor } => match dv[*input].as_ref() {
+                    Some(dx) => {
+                        let mut out = d.zeros(rows, width).map_err(error)?;
+                        d.axpy(&mut out, *factor, dx).map_err(error)?;
+                        Some(out)
+                    }
+                    None => None,
+                },
                 Step::Hadamard { left, right } => match (dv[*left].as_ref(), dv[*right].as_ref()) {
                     (None, None) => None,
                     (dl, dr) => {
@@ -1663,6 +1689,56 @@ mod values_vjp_tests {
     fn objective(program: &OperatorProgram, family: &FamilyInputs) -> f64 {
         let trace = program.execute(family, false).unwrap();
         seeds(program).into_iter().map(|(node, seed)| (&trace.values[node] * &seed).sum()).sum()
+    }
+    #[test]
+    fn fixed_vector_gains_preserve_shared_calls_values_and_cotangents() {
+        use crate::operator_program::Coefficient;
+        let (mut called, family) = fixture();
+        called.rules[0].nodes.push(Node::Gain { input: 2, coefficient: Coefficient::Product(vec![
+            Coefficient::Number(-0.5), Coefficient::Sum(vec![Coefficient::Number(1.0), Coefficient::Number(0.5)])]) });
+        called.rules[0].output = 3;
+        let artifact = crate::artifact::Artifact::native(&called).unwrap();
+        let decoded = crate::artifact::Artifact::from_bytes(&artifact.to_bytes().unwrap(), &called.declarations).unwrap();
+        let (program, _) = crate::artifact_device::mapped_inlined(&decoded.program).unwrap();
+        let cpu = program.execute(&family, false).unwrap();
+        let reference = crate::derivatives::vjp_seeded(&program, &family, &cpu, seeds(&program), Some(&[0, 1])).unwrap();
+        let mut devices = vec![Device::host()];
+        if let Some(device) = Device::accelerator(gam_gpu::GpuPolicy::Auto).expect("device probe") {
+            if device.float64() { devices.push(device); }
+        }
+        for device in devices {
+            let lowered = DeviceProgram::compile_values(&device, &program).unwrap();
+            let trace = lowered.forward(&family).unwrap();
+            let values = device.download(trace.value(program.output).unwrap()).unwrap();
+            assert!((&values - &cpu.values[program.output]).iter().all(|v| v.abs() < 2e-12));
+            let upload = seeds(&program).into_iter().map(|(n, v)| (n, device.upload(v.view()).unwrap())).collect();
+            let actual = lowered.vjp_values_seeded(&trace, upload, &[0, 1], Arithmetic::F64).unwrap();
+            for node in [0, 1] {
+                let cot = device.download(&actual[&node]).unwrap();
+                assert!((&cot - reference[node].as_ref().unwrap()).iter().all(|v| v.abs() < 2e-12));
+            }
+        }
+    }
+    #[test]
+    fn fixed_gain_tangents_match_cpu_and_external_parameters_are_refused() {
+        use crate::operator_program::Coefficient;
+        let (mut program, family) = fixture();
+        program.rules.clear();
+        program.nodes = vec![Node::Raw { slot: 0 }, Node::Affine { terms: vec![(0, 0)], bias: None },
+            Node::Gain { input: 1, coefficient: Coefficient::Number(-0.75) },
+            Node::Affine { terms: vec![(2, 0)], bias: None }];
+        program.output = 3;
+        let tangents = BTreeMap::from([(0, array![[0.1, 0.4], [-0.7, 0.2]])]);
+        let mut prefix = program.clone(); prefix.output = 2; prefix.nodes.truncate(3);
+        let reference = crate::derivatives::jvp(&prefix, &family, &prefix.execute(&family, false).unwrap(), &tangents).unwrap();
+        let device = Device::host();
+        let lowered = DeviceProgram::compile(&device, &program).unwrap();
+        let trace = lowered.forward(&family).unwrap();
+        let actual = device.download(&lowered.jvp(&trace, &tangents, Arithmetic::F64).unwrap().unwrap()).unwrap();
+        assert!((&actual - reference).iter().all(|v| v.abs() < 2e-12));
+        program.declarations.parameters = 1;
+        program.nodes[2] = Node::Gain { input: 1, coefficient: Coefficient::Parameter(0) };
+        assert!(DeviceProgram::compile(&device, &program).is_err());
     }
     #[test]
     fn nonlinear_rule_shared_dense_and_transposed_cotangents_match_cpu_and_finite_differences() {

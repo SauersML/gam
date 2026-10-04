@@ -243,9 +243,10 @@ pub fn fit(
                 | crate::operator_program::Node::Hadamard { .. }
                 | crate::operator_program::Node::Concat { .. }
                 | crate::operator_program::Node::Transposed { .. }
+                | crate::operator_program::Node::Gain { .. }
         )
     }) {
-        return Err("fitter numeric plan supports only Raw/Constant/Affine/Pointwise/Hadamard/Concat/Transpose after Call expansion; attention and other primitive scratch are not budgeted".into());
+        return Err("fitter numeric plan supports only Raw/Constant/Affine/Pointwise/Hadamard/Concat/Transpose/fixed Gain after Call expansion; attention and other primitive scratch are not budgeted".into());
     }
     let interfaces = expanded.interfaces().map_err(|e| e.to_string())?;
     let output = interfaces[expanded.output].width();
