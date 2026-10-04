@@ -1164,13 +1164,7 @@ impl Artifact {
         if program_bits > reader.remaining_bits() {
             return Err(format!("a program of {program_bits} bits in {} remaining", reader.remaining_bits()));
         }
-        let mut message = BitString::new();
-        let mut left = program_bits;
-        while left > 0 {
-            let width = left.min(64) as u32;
-            message.push_bits(reader.read_bits(width).map_err(codec)?, width).map_err(codec)?;
-            left -= u64::from(width);
-        }
+        let message = reader.read_bit_string(program_bits).map_err(codec)?;
         let program = OperatorProgram::decode(&message, declarations).map_err(|e| e.to_string())?;
         let nodes = program.nodes.len();
         let interfaces = program.interfaces().map_err(|e| e.to_string())?;

@@ -249,12 +249,54 @@ impl BitReader<'_> {
         if width == 0 { return Ok(0); }
         let start = (self.position / 8) as usize;
         let offset = (self.position % 8) as u32;
-        let count = (offset + width).div_ceil(8) as usize;
-        let mut packed = [0u8; 16];
-        packed[16 - count..].copy_from_slice(&self.bits.bytes[start..start + count]);
-        let shifted = u128::from_be_bytes(packed) >> ((count as u32) * 8 - offset - width);
+        let available = &self.bits.bytes[start..];
+        let value = if available.len() >= 8 {
+            // Fixed-size conversion compiles to one unaligned word load; no variable memcpy.
+            let word = u64::from_be_bytes(available[..8].try_into().expect("eight bytes"));
+            let mut shifted = word << offset;
+            if offset + width > 64 {
+                shifted |= u64::from(available[8]) >> (8 - offset);
+            }
+            shifted >> (64 - width)
+        } else {
+            // Only the final seven backing bytes can take this path.
+            let count = (offset + width).div_ceil(8) as usize;
+            let mut word = 0u64;
+            for &byte in &available[..count] { word = (word << 8) | u64::from(byte); }
+            let shifted = word >> ((count as u32) * 8 - offset - width);
+            shifted & (u64::MAX >> (64 - width))
+        };
         self.position += u64::from(width);
-        Ok((shifted & ((1u128 << width) - 1)) as u64)
+        Ok(value)
+    }
+
+    /// Copy the next `length` bits into one packed message. Truncation leaves the cursor unchanged.
+    /// Unused bits of the final byte are zero, as in a message constructed with `push_bits`.
+    pub fn read_bit_string(&mut self, length: u64) -> Result<BitString, CodecError> {
+        self.require(length)?;
+        if length == 0 { return Ok(BitString::new()); }
+        let start = (self.position / 8) as usize;
+        let offset = (self.position % 8) as u32;
+        let count = length.div_ceil(8) as usize;
+        let source = &self.bits.bytes[start..];
+        let mut bytes = if offset == 0 {
+            source[..count].to_vec()
+        } else {
+            // All but the last destination byte have both source bytes. Keeping the tail
+            // separate permits the byte-pair loop to vectorize without per-byte bounds tests.
+            let mut out = Vec::with_capacity(count);
+            out.extend(source[..count - 1].iter().zip(&source[1..count]).map(|(&a, &b)| (a << offset) | (b >> (8 - offset))));
+            let mut tail = source[count - 1] << offset;
+            if offset as u64 + length % 8 > 8 || length % 8 == 0 {
+                tail |= source[count] >> (8 - offset);
+            }
+            out.push(tail);
+            out
+        };
+        let tail = (length % 8) as u32;
+        if tail != 0 { *bytes.last_mut().expect("nonempty message") &= u8::MAX << (8 - tail); }
+        self.position += length;
+        Ok(BitString { bytes, len_bits: length })
     }
 
     /// Refuse a message with bits left after its codeword.
@@ -1092,6 +1134,51 @@ mod tests {
         for shift in (0..width).rev() { bits.push_bit((value >> shift) & 1 != 0); }
         Ok(())
     }
+    #[test]
+    fn packed_slices_match_bit_reference_and_preserve_cursor_on_truncation() {
+        let mut source = BitString::new();
+        for i in 0..400 { source.push_bit((i * 17 + i / 7) % 11 < 5); }
+        for offset in 0..8 {
+            for length in 0..=257 {
+                let mut reader = source.reader();
+                reader.read_bits(offset).unwrap();
+                let mut reference_reader = reader.clone();
+                let mut expected = BitString::new();
+                for _ in 0..length { expected.push_bit(reference_reader.read_bit().unwrap()); }
+                let copied = reader.read_bit_string(length).unwrap();
+                assert_eq!(copied, expected, "offset {offset} length {length}");
+                assert_eq!(reader.position, reference_reader.position);
+                assert_eq!(reader.read_bits(64), reference_reader.read_bits(64));
+                for available in 0..length {
+                    let mut truncated = source.clone();
+                    truncated.len_bits = u64::from(offset) + available;
+                    truncated.bytes.truncate(truncated.len_bits.div_ceil(8) as usize);
+                    let mut r = truncated.reader();
+                    r.read_bits(offset).unwrap();
+                    assert_eq!(r.read_bit_string(length), Err(CodecError::UnexpectedEnd { needed: length, remaining: available }));
+                    assert_eq!(r.position, u64::from(offset));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn word_reads_match_bit_reference_with_following_bytes() {
+        let mut source = BitString::new();
+        for i in 0..200 { source.push_bit((i * 17 + i / 7) % 11 < 5); }
+        for offset in 0..8 {
+            for width in 0..=64 {
+                let mut actual = source.reader();
+                actual.read_bits(offset).unwrap();
+                let mut reference = actual.clone();
+                let mut expected = 0u64;
+                for _ in 0..width { expected = (expected << 1) | u64::from(reference.read_bit().unwrap()); }
+                assert_eq!(actual.read_bits(width).unwrap(), expected, "offset {offset} width {width}");
+                assert_eq!(actual.position, reference.position);
+            }
+        }
+    }
+
     #[test]
     fn bulk_fields_match_reference_at_every_offset_width_and_truncation() {
         for offset in 0..8 {
