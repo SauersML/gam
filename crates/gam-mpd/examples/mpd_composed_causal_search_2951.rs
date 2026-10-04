@@ -9,14 +9,20 @@ use gam_mpd::{
     device_program::DeviceProgram,
     import::import_language_model,
     intervention_program::{self, Control, ControlValue},
-    operator_program::{FamilyInputs, OperatorBody, OperatorProgram},
+    operator_program::{FamilyInputs, Node, OperatorBody, OperatorProgram, remap_node},
     resident_causal_fit::{self, Episode, Settings as FitSettings},
     run_check::{LayerNodes, layer_nodes, split_sites},
 };
 use ndarray::Array2;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, io::Write, path::Path, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Write,
+    path::Path,
+    sync::Arc,
+    time::Instant,
+};
 
 #[derive(Clone, Deserialize, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -47,6 +53,15 @@ struct Evaluation {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct FrozenSharedBody {
+    /// Standalone body-source pool. Initialized boundary maps are not a fitted discovery export.
+    pool: String,
+    pool_sha256: String,
+    /// SHA of the sibling pool.with_extension("json") declaration, including discovery uses.
+    declaration_sha256: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Settings {
     export_sha256: String,
     layers: usize,
@@ -59,6 +74,12 @@ struct Settings {
     grammar: Grammar,
     /// Explicit finite subinventory for separate, reproducible compute allocations.
     expression_ids: Vec<usize>,
+    #[serde(default)]
+    require_interior_learned: bool,
+    #[serde(default)]
+    frozen_shared_body: Option<FrozenSharedBody>,
+    #[serde(default)]
+    native_initialization: bool,
     controls: Vec<NativeControl>,
     cases: Vec<Case>,
     fit: FitSettings,
@@ -361,6 +382,251 @@ fn stored_controls(map: &Value, specs: &[NativeControl]) -> Result<Vec<Control>,
 fn control_map(controls: &[Control], specs: &[NativeControl]) -> Value {
     json!({"native_controls":specs,"candidate_controls":controls.iter().map(|c|match c{Control::NodeScale{node}=>json!({"kind":"node_scale","candidate_node":node}),Control::GlobalOperatorScale{operator}=>json!({"kind":"global_operator_scale","candidate_operator":operator})}).collect::<Vec<_>>()})
 }
+fn selection(
+    inventory: &composed_rule_search::Inventory,
+    ids: &[usize],
+    require: bool,
+) -> Result<composed_rule_search::SharingSelection, String> {
+    if ids.is_empty()
+        || ids.iter().any(|&id| id >= inventory.expressions.len())
+        || ids.iter().copied().collect::<BTreeSet<_>>().len() != ids.len()
+    {
+        return Err("unique expression IDs inside declared inventory required".into());
+    }
+    let selected = composed_rule_search::interior_learned_selection(inventory);
+    if require {
+        for &id in ids {
+            if !selected.analyses[id].has_interior_learned_sharing {
+                return Err(format!(
+                    "expression{id} lacks declared interior learned sharing; boundary/non-affine forms remain available in a separate baseline run"
+                ));
+            }
+        }
+    }
+    Ok(selected)
+}
+fn body_dense_indices(program: &OperatorProgram, rule: usize) -> Result<Vec<usize>, String> {
+    let body = program.rules.get(rule).ok_or("shared body rule absent")?;
+    let mut ids = BTreeSet::new();
+    for node in &body.nodes {
+        match node {
+            Node::Affine { terms, bias } => {
+                ids.extend(terms.iter().map(|(_, op)| *op));
+                ids.extend(*bias);
+            }
+            Node::Constant { operator } | Node::Transposed { operator, .. } => {
+                ids.insert(*operator);
+            }
+            Node::Call { .. } => {
+                return Err(
+                    "transfer source requires direct generated body, not nested foreign calls"
+                        .into(),
+                );
+            }
+            _ => continue,
+        }
+    }
+    Ok(ids
+        .into_iter()
+        .filter(|index| matches!(program.operators[*index].body, OperatorBody::Dense { .. }))
+        .collect())
+}
+fn same_dense(
+    a: &gam_mpd::operator_program::Operator,
+    b: &gam_mpd::operator_program::Operator,
+) -> bool {
+    if a.rows != b.rows || a.cols != b.cols {
+        return false;
+    }
+    match (&a.body, &b.body) {
+        (
+            OperatorBody::Dense {
+                values: a,
+                present: ap,
+                precision: ad,
+            },
+            OperatorBody::Dense {
+                values: b,
+                present: bp,
+                precision: bd,
+            },
+        ) => {
+            a.dim() == b.dim()
+                && ap == bp
+                && ad == bd
+                && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+        }
+        _ => false,
+    }
+}
+/// Pointer identity identifies retained native operators; interface-specialized boundary
+/// maps are newly allocated Dense parameters, so no opaque decoded/name lookup is needed.
+fn graft_parameters(
+    candidate: &Artifact,
+    native: &OperatorProgram,
+    proposal: &composed_rule_search::Proposal,
+) -> Result<(Vec<usize>, BTreeMap<usize, usize>), String> {
+    let trainable: Vec<_> = candidate
+        .program
+        .operators
+        .iter()
+        .enumerate()
+        .filter_map(|(id, op)| {
+            (matches!(op.body, OperatorBody::Dense { .. })
+                && !native.operators.iter().any(|held| Arc::ptr_eq(held, op)))
+            .then_some(id)
+        })
+        .collect();
+    if trainable.len() != proposal.trainable.len() {
+        return Err(
+            "graft parameter count differs; unsupported parameter specialization or loss".into(),
+        );
+    }
+    let mut body_map = BTreeMap::new();
+    for rule in 0..proposal.program.rules.len() {
+        for source in body_dense_indices(&proposal.program, rule)? {
+            let matches: Vec<_> = candidate
+                .program
+                .operators
+                .iter()
+                .enumerate()
+                .filter(|(_, op)| Arc::ptr_eq(op, &proposal.program.operators[source]))
+                .map(|(id, _)| id)
+                .collect();
+            if matches.len() != 1 {
+                return Err("shared body operator lost or ambiguously specialized".into());
+            }
+            body_map.insert(source, matches[0]);
+        }
+    }
+    Ok((trainable, body_map))
+}
+fn copy_body(source: &OperatorProgram, target: &mut OperatorProgram) -> Result<(), String> {
+    if source.rules.len() != 1 {
+        return Err("transfer source must contain one shared rule".into());
+    }
+    let from = body_dense_indices(source, 0)?;
+    if from.is_empty() {
+        return Err("transfer source has no learned body coefficients".into());
+    }
+    for rule in 0..target.rules.len() {
+        let to = body_dense_indices(target, rule)?;
+        if from.len() != to.len() {
+            return Err("transfer body parameter inventory differs".into());
+        }
+        let mut ops: Vec<_> = (0..source.operators.len()).collect();
+        for (&a, &b) in from.iter().zip(&to) {
+            ops[a] = b;
+        }
+        let mut expected = source.rules[0].clone();
+        let nodes: Vec<_> = (0..expected.nodes.len()).collect();
+        for node in &mut expected.nodes {
+            remap_node(node, &nodes, &ops, &[], &[]);
+        }
+        let actual = &target.rules[rule];
+        if expected.inputs != actual.inputs
+            || expected.nodes != actual.nodes
+            || expected.output != actual.output
+        {
+            return Err("transfer expression topology/interfaces differ".into());
+        }
+        for (&a, &b) in from.iter().zip(&to) {
+            let from = &source.operators[a];
+            let to = Arc::make_mut(&mut target.operators[b]);
+            if from.rows != to.rows || from.cols != to.cols {
+                return Err("transfer body dimensions differ".into());
+            }
+            to.body = from.body.clone();
+        }
+    }
+    Ok(())
+}
+fn verify_body(
+    proposal: &OperatorProgram,
+    saved: &OperatorProgram,
+    map: &BTreeMap<usize, usize>,
+) -> Result<(), String> {
+    for (&source, &graft) in map {
+        if !same_dense(&proposal.operators[source], &saved.operators[graft]) {
+            return Err("frozen body f32 coefficient bits changed".into());
+        }
+    }
+    Ok(())
+}
+fn load_body(
+    spec: &FrozenSharedBody,
+    expression: &composed_rule_search::Expr,
+    width: usize,
+    uses: &[usize],
+    checkpoint: &str,
+) -> Result<(Artifact, Value), String> {
+    let path = Path::new(&spec.pool);
+    let declaration = path.with_extension("json");
+    if sha256(path)? != spec.pool_sha256 || sha256(&declaration)? != spec.declaration_sha256 {
+        return Err("frozen body source/declaration SHA mismatch".into());
+    }
+    let record: Value =
+        serde_json::from_slice(&std::fs::read(declaration).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    if record["expression"] != serde_json::to_value(expression).map_err(|e| e.to_string())?
+        || record["width"].as_u64() != Some(width as u64)
+        || record["native_checkpoint_sha256"].as_str() != Some(checkpoint)
+        || record["pool_sha256"].as_str() != Some(&spec.pool_sha256)
+    {
+        return Err("frozen body expression/width/checkpoint identity differs".into());
+    }
+    let previous: Vec<usize> =
+        serde_json::from_value(record["discovery_uses"].clone()).map_err(|e| e.to_string())?;
+    if previous.is_empty() || previous.iter().any(|old| uses.contains(old)) {
+        return Err("transfer requires disjoint declared native uses".into());
+    }
+    let widths: Vec<usize> =
+        serde_json::from_value(record["declarations"]["raw_slot_widths"].clone())
+            .map_err(|e| e.to_string())?;
+    if record["declarations"]["domains"] != json!([])
+        || record["declarations"]["parameters"].as_u64() != Some(0)
+        || widths.len() != previous.len()
+        || widths.iter().any(|w| *w == 0)
+    {
+        return Err("explicit standalone Raw pool declarations required".into());
+    }
+    let declarations = gam_mpd::operator_program::Declarations {
+        domains: vec![],
+        slots: widths
+            .into_iter()
+            .map(|width| gam_mpd::operator_program::Slot::Raw { width })
+            .collect(),
+        parameters: 0,
+    };
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let artifact = Artifact::from_bytes(&bytes, &declarations)?;
+    if artifact.to_bytes()? != bytes
+        || !artifact.blocks.is_empty()
+        || !artifact.exceptions.is_empty()
+        || !artifact.controls.is_empty()
+        || !artifact.derived.is_empty()
+    {
+        return Err("standalone canonical frozen body pool required".into());
+    }
+    if !composed_rule_search::sharing_analysis(expression).has_interior_learned_sharing {
+        return Err("frozen transfer requires an interior learned body".into());
+    }
+    if artifact.f32_literals()?.to_bytes()? != bytes {
+        return Err("frozen source must already be ordinary f32 literals".into());
+    }
+    Ok((artifact, record))
+}
+
+fn native_uses(native: &OperatorProgram, layers: &[LayerNodes], uses: &[usize]) -> Result<Vec<gam_mpd::native_mlp_initialization::NativeUse>, String> {
+    uses.iter().map(|&index| {
+        let layer = layers.get(index).ok_or("native initialization layer index")?;
+        let read = match native.nodes.get(layer.active) {
+            Some(Node::Pointwise { input, .. }) => *input,
+            _ => return Err("native initialization requires primitive unary MLP activation".into()),
+        };
+        Ok(gam_mpd::native_mlp_initialization::NativeUse { input: layer.normed, read, active: layer.active, write: layer.mlp })
+    }).collect()
+}
 fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.len() != 4 && args.len() != 5 {
@@ -415,22 +681,38 @@ fn run() -> Result<(), String> {
     {
         return Err("positive dimensions, unique uses/cases and explicit clean plus intervention cases required".into());
     }
-    let inventory = composed_rule_search::enumerate(&settings.grammar)?;
-    if settings.expression_ids.is_empty()
-        || settings
-            .expression_ids
-            .iter()
-            .any(|&i| i >= inventory.expressions.len())
-        || settings
-            .expression_ids
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>()
-            .len()
-            != settings.expression_ids.len()
-    {
-        return Err("unique expression IDs inside declared inventory required".into());
+    if settings.native_initialization && settings.frozen_shared_body.is_some() {
+        return Err("native initialization and frozen shared body are mutually exclusive".into());
     }
+    let inventory = composed_rule_search::enumerate(&settings.grammar)?;
+    let sharing = selection(
+        &inventory,
+        &settings.expression_ids,
+        settings.require_interior_learned,
+    )?;
+    if settings.frozen_shared_body.is_some() && settings.expression_ids.len() != 1 {
+        return Err("transfer config requires one frozen expression ID".into());
+    }
+    let export_record: Value = serde_json::from_slice(
+        &std::fs::read(export.join("export.json")).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let checkpoint = export_record["source"]["checkpoint_sha256"]
+        .as_str()
+        .ok_or("native checkpoint SHA absent")?;
+    let frozen_body = settings
+        .frozen_shared_body
+        .as_ref()
+        .map(|spec| {
+            load_body(
+                spec,
+                &inventory.expressions[settings.expression_ids[0]],
+                settings.width,
+                &settings.uses,
+                checkpoint,
+            )
+        })
+        .transpose()?;
     let d = match args[3].as_str() {
         "host" => Device::host(),
         "cuda" => Device::accelerator(GpuPolicy::Required)
@@ -458,6 +740,9 @@ fn run() -> Result<(), String> {
         settings.fit.numeric_bytes,
         settings.teacher_numeric_bytes,
     )?;
+    let native_teacher_seconds = started.elapsed().as_secs_f64();
+    let mut stage_seconds = BTreeMap::<String, f64>::new();
+    stage_seconds.insert("native_import_and_teachers".into(), native_teacher_seconds);
     let use_specs = settings
         .uses
         .iter()
@@ -495,6 +780,13 @@ fn run() -> Result<(), String> {
         "numerical_scope":"operational float64 KL proposal scores, not certified enclosures",
         "training_data_scope":"previously available export; no new untouched confirmation panel"}),
     )?;
+    save(
+        &out.join("SHARING_ANALYSIS.json"),
+        &json!({"require_interior_learned":settings.require_interior_learned,"selected_expression_ids":settings.expression_ids,"inventory_selection":sharing,"excluded_scope":"baseline IDs remain available in separate default runs; default enumeration is unchanged"}),
+    )?;
+    if let Some((_, record)) = &frozen_body {
+        save(&out.join("TRANSFER_SOURCE.json"), record)?;
+    }
     let mut costs = CostCache::default();
     let (saved_native, native_bytes) = canonical(&base)?;
     std::fs::write(out.join("native.artifact"), &native_bytes).map_err(|e| e.to_string())?;
@@ -540,7 +832,7 @@ fn run() -> Result<(), String> {
             std::fs::create_dir(&root).map_err(|e| e.to_string())?;
             save(
                 &root.join("DECLARATION.json"),
-                &json!({"expression_id":id,"expression":inventory.expressions[id],"arm":arm,"uses":settings.uses}),
+                &json!({"expression_id":id,"expression":inventory.expressions[id],"sharing_analysis":sharing.analyses[id],"arm":arm,"uses":settings.uses,"transfer":frozen_body.is_some(),"freeze_policy":if frozen_body.is_some() && shared {"body frozen; new maps only"}else if frozen_body.is_some(){"same initial body; independent per-use body adaptation"}else{"all proposal coefficients trainable"}}),
             )?;
             let attempt = (|| -> Result<Value, String> {
                 let compile = if shared {
@@ -548,20 +840,19 @@ fn run() -> Result<(), String> {
                 } else {
                     composed_rule_search::compile_untied
                 };
-                let proposal = compile(
+                let mut proposal = compile(
                     &inventory.expressions[id],
                     settings.width,
                     &use_specs,
                     settings.seed,
                 )?;
-                let names: BTreeSet<_> = proposal
-                    .trainable
-                    .iter()
-                    .map(|&i| proposal.program.operators[i].name.clone())
-                    .collect();
-                if native.operators.iter().any(|op| names.contains(&op.name)) {
-                    return Err("native and proposal parameter names collide".into());
+                if settings.native_initialization {
+                    proposal = gam_mpd::native_mlp_initialization::initialize(&proposal, &inventory.expressions[id], &native, &native_uses(&native, &layers, &settings.uses)?)?;
                 }
+                if let Some((source, _)) = &frozen_body {
+                    copy_body(&source.program, &mut proposal.program)?;
+                }
+                let graft_started = Instant::now();
                 let mut candidate = base.clone();
                 for (slot, &layer) in settings.uses.iter().enumerate() {
                     candidate = candidate.replace_function(
@@ -571,22 +862,14 @@ fn run() -> Result<(), String> {
                         layers[layer].mlp,
                     )?;
                 }
-                let trainable: Vec<_> = candidate
-                    .program
-                    .operators
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, op)| {
-                        if names.contains(&op.name) && matches!(op.body, OperatorBody::Dense { .. })
-                        {
-                            Some(i)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
+                let (mut trainable, body_map) = graft_parameters(&candidate, &native, &proposal)?;
+                if frozen_body.is_some() && shared {
+                    let frozen: BTreeSet<_> = body_map.values().copied().collect();
+                    trainable.retain(|index| !frozen.contains(index));
+                    verify_body(&proposal.program, &candidate.program, &body_map)?;
+                }
                 if trainable.is_empty() {
-                    return Err("graft lost all trainable proposal operators".into());
+                    return Err("graft lost all trainable boundary maps".into());
                 }
                 // Names are discovery metadata and intentionally absent from the codec.
                 // Bind indices first; canonical() checks their structure survives replay.
@@ -606,7 +889,10 @@ fn run() -> Result<(), String> {
                     &root.join("CONTROL_MAP.json"),
                     &json!({"native_controls":settings.controls,"candidate_controls":mapping}),
                 )?;
+                let graft_seconds = graft_started.elapsed().as_secs_f64();
+                let canonical_started = Instant::now();
                 let (mut candidate, _) = canonical(&candidate)?;
+                let canonical_before_seconds = canonical_started.elapsed().as_secs_f64();
                 let lowered = intervention_program::compile(&candidate.program, &mapped)?;
                 let training = episodes(
                     &lowered,
@@ -616,6 +902,7 @@ fn run() -> Result<(), String> {
                     &settings.cases,
                     &targets,
                 )?;
+                let fit_started = Instant::now();
                 let fitted = resident_causal_fit::fit(
                     &d,
                     &lowered.program,
@@ -627,9 +914,36 @@ fn run() -> Result<(), String> {
                     &root.join("FIT.json"),
                     &serde_json::to_value(&fitted.report).map_err(|e| e.to_string())?,
                 )?;
+                let fit_seconds = fit_started.elapsed().as_secs_f64();
+                let canonical_started = Instant::now();
                 candidate.program = lowered.restore(&fitted.program)?;
                 let (saved, bytes) = canonical(&candidate)?;
+                let canonical_after_seconds = canonical_started.elapsed().as_secs_f64();
                 std::fs::write(root.join("program.artifact"), &bytes).map_err(|e| e.to_string())?;
+                if frozen_body.is_some() && shared {
+                    verify_body(&proposal.program, &saved.program, &body_map)?;
+                }
+                if shared {
+                    let mut body_source = proposal.program.clone();
+                    for (&pool, &graft) in &body_map {
+                        Arc::make_mut(&mut body_source.operators[pool]).body =
+                            saved.program.operators[graft].body.clone();
+                    }
+                    let body_artifact = Artifact::native(&body_source)?.f32_literals()?;
+                    let (body_saved, body_bytes) = canonical(&body_artifact)?;
+                    if body_saved.program.declarations.domains.len() != 0
+                        || body_saved.program.declarations.parameters != 0
+                    {
+                        return Err("body source must have standalone Raw declarations".into());
+                    }
+                    let path = root.join("BODY_SOURCE.artifact");
+                    std::fs::write(&path, body_bytes).map_err(|e| e.to_string())?;
+                    save(
+                        &path.with_extension("json"),
+                        &json!({"pool_sha256":sha256(&path)?,"expression":inventory.expressions[id],"width":settings.width,"discovery_uses":settings.uses,"native_checkpoint_sha256":checkpoint,"declarations":{"domains":[],"parameters":0,"raw_slot_widths":use_specs.iter().map(|u|u.input_width).collect::<Vec<_>>()},"body_operator_map":body_map,"source_candidate_sha256":sha256(&root.join("program.artifact"))?,"scope":"fitted shared body source; pool boundary maps remain original initialization, NOT fitted discovery exports"}),
+                    )?;
+                }
+
                 let saved_lowered = intervention_program::compile(&saved.program, &mapped)?;
                 let training = episodes(
                     &saved_lowered,
@@ -649,10 +963,12 @@ fn run() -> Result<(), String> {
                     &root.join("TRAIN.json"),
                     &serde_json::to_value(&measured).map_err(|e| e.to_string())?,
                 )?;
+                let cost_started = Instant::now();
                 let c32 = structural_cost(&saved, &mut costs)?.total();
+                let structural_cost_seconds = cost_started.elapsed().as_secs_f64();
                 Ok(
                     json!({"id":name,"expression_id":id,"arm":arm,"c32":c32,"training_kl":measured.objective,
-                    "artifact_sha256":sha256(&root.join("program.artifact"))?,"control_map_sha256":sha256(&root.join("CONTROL_MAP.json"))?,"trainable":trainable,"status":"training_measured"}),
+                    "artifact_sha256":sha256(&root.join("program.artifact"))?,"control_map_sha256":sha256(&root.join("CONTROL_MAP.json"))?,"trainable":trainable,"sharing_analysis":sharing.analyses[id],"transfer":frozen_body.is_some(),"body_frozen":frozen_body.is_some() && shared,"body_graft_operator_map":body_map,"native_initialization":settings.native_initialization,"native_initialization_scope":"primitive native-width capacity control, not discovery","stage_seconds":{"graft":graft_seconds,"canonical_before_fit":canonical_before_seconds,"canonical_after_fit":canonical_after_seconds,"fit":fit_seconds,"structural_cost":structural_cost_seconds},"status":"training_measured"}),
                 )
             })();
             let result = match attempt {
@@ -724,6 +1040,8 @@ fn run() -> Result<(), String> {
             save(&out.join("HELDOUT_PROVENANCE.json"), &heldout_provenance)?;
             Ok((imported_heldout.contract.family, labels))
         })();
+        stage_seconds.insert("heldout_load_and_teachers".into(), heldout_started.elapsed().as_secs_f64());
+        let heldout_eval_started = Instant::now();
         for id in &frozen {
             let attempt = (|| -> Result<Value, String> {
                 let (eval_family, labels) = prepared.as_ref().map_err(Clone::clone)?;
@@ -800,6 +1118,7 @@ fn run() -> Result<(), String> {
             journal.flush().map_err(|e| e.to_string())?;
             heldout_rows.push(record);
         }
+        stage_seconds.insert("heldout_evaluation".into(), heldout_eval_started.elapsed().as_secs_f64());
         save(
             &out.join("HELDOUT_REPORT.json"),
             &json!({"frozen_ids":frozen,"candidates":heldout_rows,"provenance":heldout_provenance,"setup_error":prepared.as_ref().err(),"seconds":heldout_started.elapsed().as_secs_f64(),"training_frontier_unchanged":true}),
@@ -807,7 +1126,7 @@ fn run() -> Result<(), String> {
     }
     save(
         &out.join("REPORT.json"),
-        &json!({"candidates":rows,"frozen_evaluation_ids":frozen,"heldout":heldout_rows,"heldout_provenance":heldout_provenance,"seconds":started.elapsed().as_secs_f64(),"scope":"finite training search only; unresolved failures remain unresolved; not native mechanism recovery or VPD comparison"}),
+        &json!({"candidates":rows,"stage_seconds":stage_seconds,"native_initialization":settings.native_initialization,"sharing_selection":sharing,"require_interior_learned":settings.require_interior_learned,"frozen_shared_body_transfer":frozen_body.is_some(),"frozen_evaluation_ids":frozen,"heldout":heldout_rows,"heldout_provenance":heldout_provenance,"seconds":started.elapsed().as_secs_f64(),"scope":"finite training search only; unresolved failures remain unresolved; not native mechanism recovery or VPD comparison"}),
     )
 }
 fn main() -> Result<(), String> {
@@ -821,6 +1140,40 @@ mod tests {
         composed_rule_search::{Expr, Unary},
         operator_program::{Node, SlotValues},
     };
+    #[test]
+    fn interior_requirement_refuses_boundaries_and_preserves_baseline_ids() {
+        let grammar = Grammar { arguments: 1, max_operations: 3, max_expressions: 10000,
+            unary: vec![Unary::GeluTanh], binary: vec![composed_rule_search::Binary::Multiply], affine: true };
+        let inventory = composed_rule_search::enumerate(&grammar).expect("inventory");
+        assert!(selection(&inventory, &[6, 10], false).is_ok());
+        assert!(selection(&inventory, &[6], true).is_err());
+        assert!(selection(&inventory, &[10], true).is_err());
+        let inner = Expr::Affine(Box::new(Expr::Unary(Unary::GeluTanh, Box::new(Expr::Argument(0)))));
+        assert_eq!(inventory.expressions[15], Expr::Unary(Unary::GeluTanh, Box::new(inner.clone())));
+        assert_eq!(inventory.expressions[32], Expr::Binary(composed_rule_search::Binary::Multiply, Box::new(Expr::Argument(0)), Box::new(inner)));
+        let chosen = selection(&inventory, &[15, 32], true).expect("interior IDs");
+        assert!(chosen.interior_indices.contains(&15));
+        assert!(chosen.interior_indices.contains(&32));
+    }
+    #[test]
+    fn copied_body_is_exact_for_shared_and_initial_untied_transfer() {
+        let expr = Expr::Unary(Unary::GeluTanh, Box::new(Expr::Affine(Box::new(Expr::Unary(Unary::GeluTanh, Box::new(Expr::Argument(0)))))));
+        let uses = [UseSpec { input_width: 3, output_width: 3 }; 2];
+        let source = composed_rule_search::compile(&expr, 4, &uses, 7).expect("source");
+        let source = Artifact::native(&source.program).expect("source artifact").f32_literals().expect("source f32");
+        for shared in [true, false] {
+            let mut destination = if shared { composed_rule_search::compile(&expr, 4, &uses, 91) } else { composed_rule_search::compile_untied(&expr, 4, &uses, 91) }.expect("destination");
+            copy_body(&source.program, &mut destination.program).expect("copy exact body");
+            let source_ids = body_dense_indices(&source.program, 0).expect("source IDs");
+            for rule in 0..destination.program.rules.len() {
+                let ids = body_dense_indices(&destination.program, rule).expect("destination IDs");
+                for (a, b) in source_ids.iter().zip(ids.iter()) {
+                    assert!(same_dense(&source.program.operators[*a], &destination.program.operators[*b]));
+                }
+            }
+            assert_eq!(destination.program.rules.len(), if shared { 1 } else { 2 });
+        }
+    }
     #[test]
     fn frozen_evaluation_includes_native_and_matched_controls_without_eval_selection() {
         assert_eq!(
@@ -968,6 +1321,12 @@ mod tests {
             .filter(|op| op.name == "shared internal affine matrix")
             .count();
         assert_eq!(count, 1);
+        let (parameters, body_map) = graft_parameters(&artifact, &native_proposal.program, &proposal).expect("mapped parameters");
+        assert_eq!(parameters.len(), proposal.trainable.len());
+        assert_eq!(body_map.len(), 2);
+        let (decoded, _) = canonical(&artifact).expect("ordinary replay");
+        let source = Artifact::native(&proposal.program).expect("source").f32_literals().expect("source f32");
+        verify_body(&source.program, &decoded.program, &body_map).expect("unchanged body bits");
         let input = FamilyInputs {
             rows: 3,
             slots: vec![
