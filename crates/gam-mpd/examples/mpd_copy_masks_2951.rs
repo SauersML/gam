@@ -92,7 +92,8 @@ fn main() -> Result<(), String> {
         ("counterfactual.rs", include_str!("../src/counterfactual.rs")),
     ] { sources.insert(name, digest(None, Some(source))?); }
     let binary_hash = digest(Some(&std::env::current_exe().map_err(|e| e.to_string())?), None)?;
-    let native = split_sites(&import_language_model(export)?)?;
+    let imported = import_language_model(export, 1, 1)?;
+    let native = split_sites(&imported.program)?;
     let nodes = layer_nodes(&native, layers)?;
     let start = Artifact::native(&native)?.f32_literals()?;
     let bank = CopyMasks::new(&start, &nodes, heads / kv, max_layer, max_joint)?;
