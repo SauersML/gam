@@ -564,7 +564,7 @@ impl<'a> Local<'a> {
         family: &FamilyInputs,
     ) -> Result<Vec<Vec<(f64, f64)>>, String> {
         let mut out = vec![vec![(0.0, 0.0); family.rows]; columns.len()];
-        let resident = self.device.as_ref().map(|(device, _)| super::artifact_device::Resident::from_decoded(device, local)).transpose()?;
+        let resident = self.device.as_ref().map(|(device, _)| super::artifact_device::Resident::from_decoded_values(device, local)).transpose()?;
         for rows in batches(&units(family), self.batch_rows) {
             let selected = family.select(&rows);
             let values = if let (Some(resident), Some((device, limit))) = (&resident, &self.device) {
