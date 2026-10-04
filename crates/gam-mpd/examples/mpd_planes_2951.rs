@@ -1,37 +1,40 @@
-//! The Fourier mechanism of the mod-31 adder written by hand as blocks, scored by the per-word total
-//! against the fitted solution (#2951).
+//! The Fourier mechanism of the mod-31 adder written by hand as blocks, scored by the description
+//! length against the fitted solution (#2951), per word and with the library paid once.
 //!
 //! `mpd_planes_2951 EXPORT_DIR OUT.json OBSERVATIONS`
 //!
 //! `EXPORT_DIR` a `transformer` export on the whole family of a modular adder (e.g.
 //! `~/mpd-data/engine/p31_s0_generic`, all 961 inputs). Each decomposed site's map `W` is cut by
-//! the frequency of what it writes over the inputs: with `X` the site's reads and `Y = X Wᵀ` its
-//! written values over the family, and `Π_f` the projector onto the character pair `cos, sin` of
-//! `2π (f · (a, b))/p` for `f` one of `(k, 0)`, `(0, k)`, `(k, k)`, `(k, −k)`, the plane `f` is the
-//! least-squares map `W_f = (X⁺ Π_f Y)ᵀ`, of rank at most two (a rotation-scaling between the reads
-//! and the writes along that character); the constant character gives one more block, and the rest
-//! of `W` (other characters, and what `W` does off the reads' span) one more, so the blocks sum to
-//! `W`. A plane with nothing beyond the site's rounding band is left out.
+//! the characters its reads carry: with `X` the site's reads and `Y = X Wᵀ` its written values over
+//! the family, a character pair `cos`, `sin` of `2π (f · (a, b))/p` (`f` one of `(k, 0)`, `(0, k)`,
+//! `(k, k)`, `(k, −k)`) arrives along its carrier `Xᵀ Q_f` (`Q_f` its orthonormal profiles); in
+//! decreasing share of the output `‖Q_fᵀ Y‖` (the constant last), each carrier less the directions
+//! already taken is the plane's reader `R_f` and the plane is `W R_f R_fᵀ`, of rank at most two;
+//! what the readers leave is one more block, the rest, so the blocks sum to `W` and none exceeds it
+//! (`planes`). A plane with nothing beyond the site's rounding band is left out.
 //!
-//! The total is the blocks' one total (`gam_mpd::blocks`) under the box claim (every word's error
-//! its masks' KL plus what its off blocks anywhere in `[0, 1]` would add), every block described on
-//! the exact lattice code with the harmonic charts (`gam_mpd::describe::Structured`: a reader in
-//! the operand characters of a site's reads where no decomposed site upstream moves them, a writer
-//! in the class characters of the unembedding where the readout reads the site directly), in the
-//! logit-space Gauss–Newton metric, the price recalibrated against the exact rounding KL until
-//! within a factor of two. Points, each decoded (every block replaced by its exact-priced
-//! description, `Geometry::describe_exact`, in decoding order) and measured by the exact masked
-//! forward:
+//! Every point is measured under the box claim (every word's error its masks' KL plus what its off
+//! blocks anywhere in `[0, 1]` would add), every block described on the exact lattice code with the
+//! harmonic charts (`gam_mpd::describe::Structured`: a reader in the operand characters of a site's
+//! reads where no decomposed site upstream moves them, a writer in the class characters of the
+//! unembedding where the readout reads the site directly), in the logit-space Gauss–Newton metric,
+//! the price recalibrated against the exact rounding KL until within a factor of two. Each point is
+//! decoded (every block replaced by its exact-priced description, `Geometry::describe_exact`, in
+//! decoding order, and measured by the exact masked forward) under two codes:
 //!
-//! * the planes all on, and selected (selection passes until one no longer lowers the total);
-//! * the fitted solution: Fisher-SVD rank-one subcomponents selected, then `fit_blocks`;
-//! * the fit seeded from the selected planes, to see whether it keeps them.
+//! * per word: each word pays the description of the blocks that ran on it, plus `n KL / ln 2`;
+//! * library paid once: every block that runs is described once (its precision weighing its bits
+//!   once against its error on every word), each block names the words it runs on (a bit for every
+//!   word, else the enumerative code of the subset), plus `n KL / ln 2` per word.
 //!
-//! Per point, the terms per word (description bits of the blocks that ran, `n KL / ln 2`), blocks
-//! and rank-one equivalents on, and per plane block its frequency, rank, firing and description
-//! bits against its columns described as rank-one subcomponents.
+//! The points: each site's whole map as one block; the planes all on, and selected (selection
+//! passes until one no longer lowers the per-word total); the fitted solution (Fisher-SVD rank-one
+//! subcomponents selected, then `fit_blocks`) and the fit seeded from the selected planes, each as
+//! fitted and with its blocks all on. Per point the terms per word under both codes, blocks and
+//! rank-one equivalents on, and per block its label, rank, firing and decoded bits.
 
 use gam_mpd::blocks::{Bits, Blocked, Coded, fit_blocks, measure, reselect, rounding_error};
+use gam_mpd::codec::subset_code_len_bits;
 use gam_mpd::dense::{QrMode, qr, svd};
 use gam_mpd::describe::{Chart, Geometry, Metric, Structured, logit_gauss_newton};
 use gam_mpd::import::import;
@@ -112,26 +115,51 @@ fn replaced(blocked: &Blocked, k: usize, c: usize, u: &Array2<f64>, v: &Array2<f
     Ok(out)
 }
 
+/// A decoded point's terms per word.
+struct Decoded {
+    /// Description bits: under the per-word code the blocks that ran on each word; with the library
+    /// paid once every block that runs, once.
+    described: f64,
+    /// With the library paid once, the words each block runs on: a bit for "every word", else the
+    /// enumerative code of the subset.
+    bindings: f64,
+    /// `n KL / ln 2`.
+    error: f64,
+    kl: f64,
+    /// Each block's decoded bits.
+    prices: Vec<Vec<f64>>,
+}
+
+impl Decoded {
+    fn total(&self) -> f64 {
+        self.described + self.bindings + self.error
+    }
+}
+
 /// The decoded point (module note): every block that runs replaced by its exact-priced description
-/// in decoding order, then measured together. `(description bits, error bits, KL nats)` per word,
-/// and each block's decoded bits.
-fn decoded(coded: &Coded<'_>, blocked: &Blocked, geometry: &Structured) -> Result<(f64, f64, f64, Vec<Vec<f64>>), String> {
+/// in decoding order, then measured together. Under the per-word code (`once` false) a block's
+/// precision weighs its bits on every word it runs on against its error there; with the library
+/// paid once, its bits once against its error on every word.
+fn decoded(coded: &Coded<'_>, blocked: &Blocked, geometry: &Structured, once: bool) -> Result<Decoded, String> {
     let mut out = blocked.clone();
     let mut prices: Vec<Vec<f64>> = Vec::new();
+    let mut bindings = 0.0;
+    let words: usize = blocked.masks.iter().map(|m| m.first().map_or(0, |m| m.nrows())).sum();
     for (k, ranks) in blocked.ranks.iter().enumerate() {
         let mut site = Vec::new();
         for c in 0..ranks.len() {
-            let on: f64 = blocked.masks.iter().map(|m| m[k].column(c).sum()).sum::<f64>();
-            if on == 0.0 {
+            let on: usize = blocked.masks.iter().map(|m| m[k].column(c).iter().filter(|x| **x > 0.0).count()).sum();
+            if on == 0 {
                 site.push(0.0);
                 continue;
             }
+            bindings += 1.0 + if on == words { 0.0 } else { subset_code_len_bits(words, on).map_err(|e| e.to_string())? as f64 };
             let (base, _) = measure(coded, &out)?;
             let (u, v) = blocked.factors(k, c);
             let current = out.clone();
             let d = geometry.sites[k].describe_exact(u, v, &mut |d| {
                 let (bits, _) = measure(coded, &replaced(&current, k, c, &d.u, &d.v)?)?;
-                Ok((bits.kl - base.kl) / on)
+                Ok(if once { bits.kl - base.kl } else { (bits.kl - base.kl) / on as f64 })
             })?;
             site.push(d.bits());
             out = replaced(&out, k, c, &d.u, &d.v)?;
@@ -143,12 +171,24 @@ fn decoded(coded: &Coded<'_>, blocked: &Blocked, geometry: &Structured) -> Resul
     for masks in &blocked.masks {
         for (k, m) in masks.iter().enumerate() {
             for (c, price) in prices[k].iter().enumerate() {
-                described += m.column(c).sum() * price;
+                described += if once { 0.0 } else { m.column(c).iter().filter(|x| **x > 0.0).count() as f64 * price };
             }
         }
     }
+    if once {
+        described = prices.iter().flatten().sum();
+    } else {
+        bindings = 0.0;
+    }
     let rows = bits.rows.max(1.0);
-    Ok((described / rows, bits.kl / rows, bits.kl_nats / rows, prices))
+    Ok(Decoded { described: described / rows, bindings: bindings / rows, error: bits.kl / rows, kl: bits.kl_nats / rows, prices })
+}
+
+/// The same blocks, every one on for every word.
+fn all_on(blocked: &Blocked) -> Blocked {
+    let mut out = blocked.clone();
+    out.masks.iter_mut().flatten().for_each(|m| m.fill(1.0));
+    out
 }
 
 /// Selection passes from `blocked` until one no longer lowers the total.
@@ -181,42 +221,66 @@ fn factors(w: &Array2<f64>, band: f64, rank: usize) -> Result<(Array2<f64>, Arra
 /// `(k, 0)`, `(0, k)`, `(k, k)`, `(k, −k)`, `k = 1..=p/2`) a block of rank at most two, the constant,
 /// and the rest; `(label, u, v)` with the empty ones (nothing beyond the site's rounding band) left
 /// out.
+///
+/// A character's carrier is the reads' content at it, `M_f = Xᵀ Q_f` (`Q_f` the orthonormal
+/// profiles `cos`, `sin` of the character over the inputs): the input directions along which the
+/// character arrives. Taken in decreasing share of the site's output `‖Q_fᵀ Y‖` (the constant last,
+/// its carrier the mean read every other carrier overlaps), each carrier less the directions already
+/// taken spans the plane's reader `R_f` (orthonormal, its directions beyond the reads' rounding
+/// band), and the plane is `W R_f R_fᵀ`. The readers are orthogonal, so the planes and the rest
+/// `W (I − Σ R_f R_fᵀ)` sum to `W` with every block at most `W`'s norm. Least squares
+/// (`(X⁺ Π_f Y)ᵀ`, exact on character-invariant reads) is ill-posed where two characters arrive
+/// along the same directions: on p31 the residual after attention carries `cos ka` and `cos kb` on
+/// one plane, and separating them through the reads' near-null directions gave planes of 10⁸ `‖W‖`
+/// that cancelled to `W` and decoded to KL ~10⁸ nats. Here the first of such characters takes the
+/// shared plane and the other keeps only what it carries elsewhere.
 fn planes(w: &Array2<f64>, x: &Array2<f64>, labels: &Array2<usize>, period: usize) -> Result<Vec<(String, Array2<f64>, Array2<f64>)>, String> {
     let rows = x.nrows();
     let y = x.dot(&w.t());
     let band = svd(w.view(), false).map_err(|e| format!("{e:?}"))?.band;
-    // X⁺ over the reads' singular values beyond the band.
-    let dx = svd(x.view(), false).map_err(|e| format!("{e:?}"))?;
-    let kept: Vec<usize> = (0..dx.singular_values.len()).filter(|&j| dx.singular_values[j] > dx.band).collect();
-    let inverse = Array1::from_iter(kept.iter().map(|&j| 1.0 / dx.singular_values[j]));
-    let pinv = (dx.vt.select(Axis(0), &kept).t().to_owned() * &inverse).dot(&dx.u.select(Axis(1), &kept).t());
+    let floor = svd(x.view(), false).map_err(|e| format!("{e:?}"))?.band;
     let phase = |r: usize, f: (i64, i64)| {
         let t = f.0 * labels[[r, 0]] as i64 + f.1 * labels[[r, 1]] as i64;
         2.0 * std::f64::consts::PI * (t.rem_euclid(period as i64)) as f64 / period as f64
     };
-    let mut pairs: Vec<(String, (i64, i64))> = vec![("constant".to_string(), (0, 0))];
+    let mut pairs: Vec<(String, (i64, i64))> = Vec::new();
     for k in 1..=(period / 2) as i64 {
         for (name, f) in [("a", (k, 0)), ("b", (0, k)), ("a+b", (k, k)), ("a−b", (k, -k))] {
             pairs.push((format!("{k}({name})"), f));
         }
     }
-    let mut out = Vec::new();
+    let mut characters = Vec::new();
     for (label, f) in pairs {
-        let mut columns = vec![Array1::from_iter((0..rows).map(|r| phase(r, f).cos()))];
-        if f != (0, 0) {
-            columns.push(Array1::from_iter((0..rows).map(|r| phase(r, f).sin())));
-        }
-        let basis = Array2::from_shape_fn((rows, columns.len()), |(r, c)| columns[c][r]);
+        let basis = Array2::from_shape_fn((rows, 2), |(r, c)| if c == 0 { phase(r, f).cos() } else { phase(r, f).sin() });
         let q = qr(basis.view(), QrMode::Economic).map_err(|e| format!("{e:?}"))?.q.ok_or("no Q")?;
-        let projected = q.dot(&q.t().dot(&y));
-        // `Π_f Y` has rank at most its characters' count; what the pseudo-inverse adds beyond that is
-        // its rounding, and goes to the rest.
-        let (u, v) = factors(&pinv.dot(&projected).t().to_owned(), band, columns.len())?;
+        let share = q.t().dot(&y).iter().map(|e| e * e).sum::<f64>();
+        characters.push((label, q, share));
+    }
+    characters.sort_by(|a, b| b.2.total_cmp(&a.2));
+    characters.push(("constant".to_string(), Array2::from_elem((rows, 1), 1.0 / (rows as f64).sqrt()), 0.0));
+    let mut taken = Array2::<f64>::zeros((x.ncols(), 0));
+    let mut out = Vec::new();
+    for (label, q, _) in characters {
+        // The carrier less the readers taken, twice (one Gram–Schmidt pass loses orthogonality to
+        // rounding as the readers accumulate).
+        let mut carrier = x.t().dot(&q);
+        for _ in 0..2 {
+            carrier = &carrier - &taken.dot(&taken.t().dot(&carrier));
+        }
+        let d = svd(carrier.view(), false).map_err(|e| format!("{e:?}"))?;
+        let kept: Vec<usize> = (0..d.singular_values.len()).filter(|&j| d.singular_values[j] > floor).collect();
+        if kept.is_empty() {
+            continue;
+        }
+        let reader = d.u.select(Axis(1), &kept);
+        let (u, v) = factors(&w.dot(&reader).dot(&reader.t()), band, kept.len())?;
+        taken = ndarray::concatenate(Axis(1), &[taken.view(), reader.view()]).map_err(|e| e.to_string())?;
         if u.nrows() > 0 {
             out.push((label, u, v));
         }
     }
-    // The rest: everything the planes leave of W (other characters, W off the reads' span).
+    // The rest: what the readers leave of W (W off the reads' span, and directions no listed
+    // character arrives along).
     let rest = out.iter().fold(w.clone(), |acc, (_, u, v)| acc - &u.t().dot(v));
     let (u, v) = factors(&rest, band, usize::MAX)?;
     if u.nrows() > 0 {
@@ -225,12 +289,21 @@ fn planes(w: &Array2<f64>, x: &Array2<f64>, labels: &Array2<usize>, period: usiz
     Ok(out)
 }
 
-/// A decomposition's report: its bits, its decoded bits, and per block its label, rank, firing and
-/// decoded bits.
+/// A decomposition's report: its bits, and decoded under the per-word code and with the library
+/// paid once, per block its label, rank, firing and decoded bits.
 fn report(name: &str, coded: &Coded<'_>, blocked: &Blocked, bits: &Bits, geometry: &Structured, labels: Option<&[Vec<String>]>) -> Result<Value, String> {
     say(name, bits);
-    let (described, error, kl, prices) = decoded(coded, blocked, geometry)?;
-    eprintln!("{name}, decoded: {:.1} bits/word (described {described:.1}, error {error:.1}), KL {kl:.6} nats/word", described + error);
+    let word = decoded(coded, blocked, geometry, false)?;
+    eprintln!("{name}, decoded per word: {:.1} bits/word (described {:.1}, error {:.1}), KL {:.6} nats/word", word.total(), word.described, word.error, word.kl);
+    let once = decoded(coded, blocked, geometry, true)?;
+    eprintln!(
+        "{name}, library once: {:.1} bits/word (library {:.1}, bindings {:.1}, error {:.1}), KL {:.6} nats/word",
+        once.total(),
+        once.described,
+        once.bindings,
+        once.error,
+        once.kl
+    );
     let (per_word, kl_priced, active, rank) = bits.per_row();
     let mut per_block = Vec::new();
     for (k, ranks) in blocked.ranks.iter().enumerate() {
@@ -250,22 +323,22 @@ fn report(name: &str, coded: &Coded<'_>, blocked: &Blocked, bits: &Bits, geometr
                 "label": labels.map(|l| l[k][c].clone()),
                 "rank": r,
                 "firing": on / rows,
-                "decoded_bits": prices[k][c],
+                "decoded_bits": word.prices[k][c],
+                "decoded_bits_library_once": once.prices[k][c],
                 "priced_bits": coded.describe.bits(k, u, v)?,
                 "columns_as_rank_one_priced_bits": columns,
             }));
         }
     }
+    let terms = |d: &Decoded| json!({"bits_per_word": d.total(), "described_bits_per_word": d.described, "binding_bits_per_word": d.bindings, "error_bits_per_word": d.error, "kl_per_word": d.kl});
     Ok(json!({
         "point": name,
         "bits_per_word": per_word,
         "described_bits_per_word": bits.described / bits.rows.max(1.0),
         "error_bits_per_word": bits.kl / bits.rows.max(1.0),
         "kl_per_word": kl_priced,
-        "decoded_bits_per_word": described + error,
-        "decoded_described_bits_per_word": described,
-        "decoded_error_bits_per_word": error,
-        "decoded_kl_per_word": kl,
+        "decoded_per_word": terms(&word),
+        "decoded_library_once": terms(&once),
         "active_blocks_per_word": active,
         "active_rank_one_equivalents_per_word": rank,
         "blocks_on": per_block,
@@ -370,16 +443,30 @@ fn run(dir: &Path, out: &Path, observations: f64) -> Result<(), String> {
         });
         std::fs::write(out, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
     };
-    points.push(report("planes, selected", &coded, &planes_selected, &planes_selected_bits, &structured, Some(plane_labels.as_slice()))?);
+    // Every point also with its blocks all on: with the library paid once, a block that runs on
+    // every word names no words.
+    let on_everywhere = |blocked: &Blocked| -> Result<(Blocked, Bits), String> {
+        let mut on = all_on(blocked);
+        on.price(&coded)?;
+        let (bits, _) = measure(&coded, &on)?;
+        Ok((on, bits))
+    };
+    let (whole, whole_bits) = on_everywhere(&planes_on.whole())?;
+    points.push(report("whole sites", &coded, &whole, &whole_bits, &structured, None)?);
     points.push(report("planes, all on", &coded, &planes_on, &planes_on_bits, &structured, Some(plane_labels.as_slice()))?);
+    points.push(report("planes, selected", &coded, &planes_selected, &planes_selected_bits, &structured, Some(plane_labels.as_slice()))?);
     write(&points)?;
     let svd_ranks: Vec<Vec<usize>> = svd_libraries.iter().map(|l| vec![1; l.v.nrows()]).collect();
     let (rank_one, _) = selected(&coded, Blocked::rank_one(svd_libraries.clone(), ones(&svd_ranks)))?;
     let (fitted, fitted_bits) = fit_blocks(&coded, rank_one, true)?;
     points.push(report("fitted from rank-one subcomponents", &coded, &fitted, &fitted_bits, &structured, None)?);
+    let (fitted_on, fitted_on_bits) = on_everywhere(&fitted)?;
+    points.push(report("fitted from rank-one subcomponents, all on", &coded, &fitted_on, &fitted_on_bits, &structured, None)?);
     write(&points)?;
     let (seeded, seeded_bits) = fit_blocks(&coded, planes_selected, true)?;
     points.push(report("fitted from the selected planes", &coded, &seeded, &seeded_bits, &structured, None)?);
+    let (seeded_on, seeded_on_bits) = on_everywhere(&seeded)?;
+    points.push(report("fitted from the selected planes, all on", &coded, &seeded_on, &seeded_on_bits, &structured, None)?);
     write(&points)
 }
 
