@@ -1,0 +1,22 @@
+{
+  "learned": {
+    "source_commit": "f822a31137cabe77610909e296f7649697f173fd",
+    "report_sha256": "1f55655cfd3b14054341c8c3615a4a84b0bfd51e87ceb530f1aa5214630b7882",
+    "gzip_sha256": "6917e13d721e7f98f2c7bfd36389212887e1c00c22528e68b48a6ca7afc42d1a"
+  },
+  "frozen_native": {
+    "source_commit": "f822a31137cabe77610909e296f7649697f173fd",
+    "report_sha256": "587b5d9a44af7b9c1341838b9c92999a7540cd362febe721bf97d091d811020e",
+    "gzip_sha256": "f93c49545e86e04b6a6e1f65a410d5bc34b8db9920610c8088baf0766903398a"
+  },
+  "frozen_random": {
+    "source_commit": "f822a31137cabe77610909e296f7649697f173fd",
+    "report_sha256": "7ceb88a63103f28b29e7450c9ad9ae3cce796c3d264e836e1111a1b6a0406896",
+    "gzip_sha256": "faad16c568d0a643b7fbcc977f819bf632084289498034c770a367728db695cc"
+  },
+  "untied": {
+    "source_commit": "f822a31137cabe77610909e296f7649697f173fd",
+    "report_sha256": "b8bd6d982c80ae013a0a4dd23209ca18786faa534a68ee86a0d147ece6947113",
+    "gzip_sha256": "aa428dfeb1c0f19f5bf9f0d620eebd1b09d93c452e6fd108d4e9e0972b4977fe"
+  }
+}

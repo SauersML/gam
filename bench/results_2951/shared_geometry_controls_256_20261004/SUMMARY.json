@@ -1,0 +1,119 @@
+{
+  "controls": [
+    {
+      "arm": "learned",
+      "job": 15908,
+      "allocation_seconds": 40,
+      "optimizer_seconds": 24.043954071,
+      "end_to_end_seconds": 39.486018387,
+      "initial_train": 21.291724626140002,
+      "best_train": 0.9171621750264862,
+      "best_step": 190,
+      "initial_eval": [
+        5.01196718983401e-07,
+        20.078435410519422
+      ],
+      "saved_f64_train": [
+        0.9171621381578662,
+        0.8955166560912888
+      ],
+      "saved_f64_eval": [
+        0.8985568343154993,
+        6.346543111915307
+      ],
+      "pool_C32_bits": 264438804,
+      "pool_sha256": "b7cf5656dc5feda2afe61626c10a5b809810342c17fb1753410161a043e9f2e0"
+    },
+    {
+      "arm": "frozen_native",
+      "job": 15909,
+      "allocation_seconds": 41,
+      "optimizer_seconds": 24.089857668,
+      "end_to_end_seconds": 40.006948357,
+      "initial_train": 21.291724626140002,
+      "best_train": 0.7528471323865995,
+      "best_step": 251,
+      "initial_eval": [
+        5.01196718983401e-07,
+        20.078435410519422
+      ],
+      "saved_f64_train": [
+        2.7537769449336368e-15,
+        0.7528471285078746
+      ],
+      "saved_f64_eval": [
+        2.2727697370701983e-15,
+        5.024085062086227
+      ],
+      "pool_C32_bits": 264438804,
+      "pool_sha256": "2e0cb7293c2347846997337a28eb547cf50d6e7da7106c5563bbbeb5289d3162"
+    },
+    {
+      "arm": "frozen_random",
+      "job": 15910,
+      "allocation_seconds": 41,
+      "optimizer_seconds": 24.013419114,
+      "end_to_end_seconds": 40.280943352,
+      "initial_train": 20.956414909854594,
+      "best_train": 1.955992982388394,
+      "best_step": 243,
+      "initial_eval": [
+        2.2037999382526343,
+        19.72936567359018
+      ],
+      "saved_f64_train": [
+        1.9559761259310418,
+        1.9559930583972742
+      ],
+      "saved_f64_eval": [
+        2.3700434111733704,
+        6.132269815039237
+      ],
+      "pool_C32_bits": 264438804,
+      "pool_sha256": "8ee94a27d3f428a6f25e1b0aac237523a9d060356bc80ea8c0def46f6126d821"
+    },
+    {
+      "arm": "untied",
+      "job": 15911,
+      "allocation_seconds": 42,
+      "optimizer_seconds": 23.784145667,
+      "end_to_end_seconds": 41.1490303,
+      "initial_train": 21.291724626140002,
+      "best_train": 0.8061613291926739,
+      "best_step": 254,
+      "initial_eval": [
+        5.01196718983401e-07,
+        20.078435410519422
+      ],
+      "saved_f64_train": [
+        2.7537769449336368e-15,
+        0.8061613514182321
+      ],
+      "saved_f64_eval": [
+        2.2727697370701983e-15,
+        5.80182162965633
+      ],
+      "pool_C32_bits": 302236480,
+      "pool_sha256": "ad33c0a6df77ce196c0160ef871d9b1ae0bc5420d4a09d51314fdf329b523644"
+    }
+  ],
+  "optimizer_seconds_total_including_gate": 99.264893222,
+  "allocation_seconds_total_including_gate_and_failed_launches": 192,
+  "fit_budget_seconds": 3600,
+  "scope": "supplied GELU geometry, fixed4096training/1024fit-disjoint-project-seen evaltokens; standalonepool, completeLocalRunpending; no data-matchedVPD claim",
+  "exposures_per_arm": {
+    "unique_train_tokens": 4096,
+    "unique_eval_tokens": 1024,
+    "eval_scope": "fit-disjoint but project-seen",
+    "training_scan_input_token_passes": 1052672,
+    "training_scan_site_row_predictions": 2105344,
+    "active_input_row_recomputes": 256,
+    "active_recompute_site_row_predictions": 512,
+    "active_group_row_backwards": 256,
+    "validation_scan_input_token_passes": 2048,
+    "validation_scan_site_row_predictions": 4096,
+    "saved_f64_train_replay_input_token_passes": 4096,
+    "saved_f64_eval_replay_input_token_passes": 1024
+  },
+  "interpretation": "At fixed256 updates original learned optimizer snapshot is worse in training than nested frozen-native family; optimization confounds structural interpretation. Full-model Local/Run and frozen-body transfer not yet measured."
+}
