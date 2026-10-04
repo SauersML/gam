@@ -256,3 +256,6 @@ pub mod local_kl;
 
 // Native-grounded finite-bank MLP rule compiler (all coefficients and maps priced).
 pub mod native_mlp;
+
+// Measured-family necessary affine output-rank floors (proposal diagnostics).
+pub mod native_mlp_rank;
