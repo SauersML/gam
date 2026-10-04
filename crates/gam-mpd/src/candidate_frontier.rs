@@ -7,6 +7,34 @@ use super::acceptance::{Assessment, Constraint, CostCache, Local, RunCheck, asse
 use super::artifact::{Artifact, EncodedArtifact};
 use super::precision::FidelityVerdict;
 
+type RankedCandidate = (u64, String, Artifact);
+
+// Fingerprints only select possible aliases. Compare complete encoded messages
+// before merging, so a collision cannot alter the candidate bank or its gap.
+// Keep at most the current and one comparison message, rather than one full
+// checkpoint-sized message per candidate. Artifact operators remain Arc-shared.
+fn deduplicate(ranked: Vec<RankedCandidate>, fingerprint: impl Fn(&super::codec::BitString) -> u64) -> Result<Vec<RankedCandidate>, String> {
+    let mut unique: Vec<RankedCandidate> = Vec::new();
+    let mut buckets: std::collections::BTreeMap<u64, Vec<usize>> = std::collections::BTreeMap::new();
+    for candidate in ranked {
+        let message = EncodedArtifact::of(&candidate.2)?.message;
+        let key = fingerprint(&message);
+        let bucket = buckets.entry(key).or_default();
+        let mut duplicate = false;
+        for &index in bucket.iter() {
+            if EncodedArtifact::of(&unique[index].2)?.message == message {
+                duplicate = true;
+                break;
+            }
+        }
+        if !duplicate {
+            bucket.push(unique.len());
+            unique.push(candidate);
+        }
+    }
+    Ok(unique)
+}
+
 #[derive(Clone, Debug)]
 pub struct Candidate {
     pub label: String,
@@ -102,19 +130,15 @@ pub fn frontier(
             return Err("candidate declarations differ from the fixed dataset's model".into());
         }
         let cost = structural_cost(&artifact, &mut cache)?.total();
-        let message = EncodedArtifact::of(&artifact)?.message;
-        ranked.push((cost, candidate.label, artifact, message));
+        ranked.push((cost, candidate.label, artifact));
     }
     ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    let mut unique = Vec::new();
-    for candidate in ranked {
-        if !unique.iter().any(|earlier: &(u64, String, Artifact, super::codec::BitString)| earlier.3 == candidate.3) {
-            unique.push(candidate);
-        }
-    }
-    // Deduplication no longer needs the encoded messages. Each distinct candidate
-    // is assessed once and its returned evidence is reused across the grid.
-    let unique: Vec<_> = unique.into_iter().map(|(cost, label, artifact, _)| (cost, label, artifact)).collect();
+    let unique = deduplicate(ranked, |message| {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        message.hash(&mut hasher);
+        hasher.finish()
+    })?;
     let measured_candidates = if constraints.is_empty() { 0 } else { budget.min(unique.len()) };
     let mut assessments = Vec::with_capacity(unique.len());
     let mut evidence: Vec<Vec<Evidence>> = constraints.iter().map(|_| Vec::new()).collect();
@@ -394,6 +418,24 @@ mod tests {
         assert_eq!(run.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(f.points[0].evidence.iter().filter(|e| e.state == State::Unevaluated).count(), 1);
         assert!(f.points[0].lower_cost.is_some());
+    }
+
+    #[test]
+    fn fingerprint_collisions_do_not_merge_distinct_programs() {
+        let (model, family) = fixture();
+        let first = candidate(&model, "first", 2.0, 1.0);
+        let other = candidate(&model, "other", 2.0, 0.5);
+        let ranked = vec![(1, "first".into(), first.artifact.clone()), (1, "alias".into(), first.artifact), (1, "other".into(), other.artifact)];
+        let unique = deduplicate(ranked, |message| {
+            assert!(!message.is_empty());
+            0 // Force every fingerprint into one bucket; equality remains exact.
+        }).unwrap();
+        assert_eq!(unique.len(), 2);
+        assert_eq!(unique[0].1, "first");
+        assert_eq!(unique[1].1, "other");
+        let a = unique[0].2.execute(&family).unwrap();
+        let b = unique[1].2.execute(&family).unwrap();
+        assert_ne!(a.values.last(), b.values.last());
     }
 
     #[test]

@@ -110,7 +110,7 @@ impl fmt::Display for CodecError {
 impl std::error::Error for CodecError {}
 
 /// An append-only bit string, most significant bit of each byte first.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BitString {
     bytes: Vec<u8>,
     len_bits: u64,
