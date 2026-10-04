@@ -1210,14 +1210,35 @@ pub fn assess_once_local_first(
     constraints: &[Constraint], cache: &mut CostCache,
 ) -> Result<StagedAssessment, String> {
     validate_constraints(constraints)?;
+    let prepared = PreparedAssessment::new(artifact, cache)?;
+    assess_local_first_decodable(&prepared.encoded, prepared.cost, local, run, constraints)
+}
+
+/// The same optional Local-first assessment with fixed-native codec reuse. Its
+/// full message, decoded numbers, complete cost and missing Run semantics are unchanged.
+pub fn assess_once_local_first_with_native_codec(
+    local: &Local<'_>, run: &dyn RunCheck, artifact: &Artifact,
+    constraints: &[Constraint], cache: &mut CostCache,
+    codec: &super::operator_program::NativeOperatorCodec,
+) -> Result<StagedAssessment, String> {
+    validate_constraints(constraints)?;
+    if !artifact.has_f32_literals() { return Err("a literal that is not a 32-bit float".into()); }
+    let cost = structural_cost(artifact, cache)?;
+    let encoded = EncodedArtifact::of_with_native_codec(artifact, codec)?;
+    assess_local_first_decodable(&encoded.using_native_codec(codec), cost, local, run, constraints)
+}
+
+fn assess_local_first_decodable<A: super::precision::DecodableArtifact<Decoded = Artifact>>(
+    encoded: &A, cost: StructuralCost, local: &Local<'_>, run: &dyn RunCheck,
+    constraints: &[Constraint],
+) -> Result<StagedAssessment, String> {
     let max_local = constraints.iter().map(|c| c.local).fold(0.0_f64, f64::max);
     let max_run = constraints.iter().map(|c| c.run).fold(0.0_f64, f64::max);
-    let prepared = PreparedAssessment::new(artifact, cache)?;
     let ((local_measure, run_measure), (local_fidelity, run_fidelity)) =
         super::precision::decode_then_evaluate_optional_pair(
-            &prepared.encoded,
+            encoded,
             |decoded: &Artifact| {
-                if structural_cost(decoded, &mut CostCache::default())? != prepared.cost {
+                if structural_cost(decoded, &mut CostCache::default())? != cost {
                     return Err("decoded artifact has a different structural cost".into());
                 }
                 let measured = local.measure(decoded)?;
@@ -1232,10 +1253,10 @@ pub fn assess_once_local_first(
         )?;
     match (run_measure, run_fidelity) {
         (Some(run_measure), Some(run_fidelity)) => Ok(StagedAssessment::Complete(Assessment {
-            cost: prepared.cost, local: local_fidelity, local_measure, run: run_fidelity, run_measure,
+            cost, local: local_fidelity, local_measure, run: run_fidelity, run_measure,
         })),
         (None, None) => Ok(StagedAssessment::LocalRejected {
-            cost: prepared.cost, local: local_fidelity, local_measure, max_local_tolerance: max_local,
+            cost, local: local_fidelity, local_measure, max_local_tolerance: max_local,
         }),
         _ => Err("inconsistent optional Run evidence".into()),
     }

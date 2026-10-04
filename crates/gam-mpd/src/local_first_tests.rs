@@ -35,6 +35,13 @@ fn local_first_rejection_never_runs_and_is_scoped_to_declared_grid() {
     assert!(matches!(staged, StagedAssessment::LocalRejected { .. }));
     assert!(staged.run_measure().is_none());
     assert_eq!(run.calls.load(Ordering::SeqCst), 0);
+    let codec = crate::operator_program::NativeOperatorCodec::new(&model, 1 << 20).unwrap();
+    let cached = crate::acceptance::assess_once_local_first_with_native_codec(
+        &local, &run, &replay, &[narrow, widest], &mut CostCache::default(), &codec).unwrap();
+    assert_eq!(run.calls.load(Ordering::SeqCst), 0);
+    let StagedAssessment::LocalRejected { cost: ac, local: al, local_measure: am, max_local_tolerance: at } = &staged else { panic!("ordinary Run measured") };
+    let StagedAssessment::LocalRejected { cost: bc, local: bl, local_measure: bm, max_local_tolerance: bt } = &cached else { panic!("cached Run measured") };
+    assert_eq!((ac, al, am, at), (bc, bl, bm, bt));
     assert_eq!(staged.verdict(narrow).unwrap(), FidelityVerdict::Violates);
     assert_eq!(staged.verdict(widest).unwrap(), FidelityVerdict::Violates);
     assert_eq!(staged.verdict(Constraint { local: 0.75, run: 1e-6 }).unwrap(), FidelityVerdict::Unresolved);
@@ -54,6 +61,20 @@ fn local_first_rejection_never_runs_and_is_scoped_to_declared_grid() {
     assert_eq!(completed.local_measure, ordinary.local_measure);
     assert_eq!(completed.run, ordinary.run);
     assert_eq!(completed.run_measure, ordinary.run_measure);
+    let cached = crate::acceptance::assess_once_local_first_with_native_codec(
+        &local, &run, &replay, &[narrow, broad], &mut CostCache::default(), &codec).unwrap();
+    let StagedAssessment::Complete(cached) = cached else { panic!("cached widest candidate screened") };
+    assert_eq!(cached.cost, ordinary.cost);
+    assert_eq!(cached.local, ordinary.local);
+    assert_eq!(cached.local_measure, ordinary.local_measure);
+    assert_eq!(cached.run, ordinary.run);
+    assert_eq!(cached.run_measure, ordinary.run_measure);
+    let native_artifact = Artifact::native(&model).unwrap();
+    let cached_native = crate::acceptance::assess_once_local_first_with_native_codec(
+        &local, &run, &native_artifact, &[broad], &mut CostCache::default(), &codec).unwrap();
+    assert_eq!(cached_native.verdict(broad).unwrap(), FidelityVerdict::Meets);
+    assert!(codec.usage().encoded_native_operator_hits > 0);
+    assert!(codec.usage().decoded_native_operator_hits > 0);
     // A tolerance inside the genuine comparison interval remains unresolved and runs.
     let boundary = full.local_measure.worst().unwrap().worst;
     assert_eq!(full.local.with_tolerance(boundary).unwrap().verdict(), FidelityVerdict::Unresolved);
