@@ -1,5 +1,5 @@
 //! Exhaustive layer-local Copy mask measurements; no joint materialization or Run pruning.
-//! mpd_copy_masks_2951 EXPORT OUT max_layer=N max_joint=N [local=4 context=512 batch=1024 deltas=0.1,0.2 budget=N]
+//! mpd_copy_masks_2951 EXPORT OUT max_layer=N max_joint=N [local=4 context=512 batch=1024 deltas=0.1,0.2 start=N budget=N]
 use gam_mpd::acceptance::Local;
 use gam_mpd::artifact::Artifact;
 use gam_mpd::counterfactual::passages;
@@ -48,12 +48,12 @@ fn digest(path: Option<&Path>, text: Option<&str>) -> Result<String, String> {
 fn main() -> Result<(), String> {
     gam_mpd::engine::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 5 { return Err("mpd_copy_masks_2951 EXPORT OUT max_layer=N max_joint=N [local=4 context=512 batch=1024 deltas=0.1,0.2 budget=N]".into()); }
+    if args.len() < 5 { return Err("mpd_copy_masks_2951 EXPORT OUT max_layer=N max_joint=N [local=4 context=512 batch=1024 deltas=0.1,0.2 start=N budget=N]".into()); }
     let (export, out) = (Path::new(&args[1]), Path::new(&args[2]));
     let mut keys = BTreeMap::new();
     for argument in &args[3..] {
         let (k, v) = argument.split_once('=').ok_or("expected KEY=VALUE")?;
-        if !["max_layer", "max_joint", "local", "context", "batch", "deltas", "budget"].contains(&k) || keys.insert(k, v).is_some() {
+        if !["max_layer", "max_joint", "local", "context", "batch", "deltas", "start", "budget"].contains(&k) || keys.insert(k, v).is_some() {
             return Err(format!("unknown or duplicate option {k}"));
         }
     }
@@ -67,8 +67,10 @@ fn main() -> Result<(), String> {
     let (layers, heads, kv) = (cfg("n_layers")?, cfg("n_heads")?, cfg("n_kv_heads")?);
     // Complete implicit cardinality guard precedes import, hashing, outputs, and rule fitting.
     let (local_count, joint_count) = CopyMasks::cardinalities(std::iter::repeat_n(heads, layers), max_layer, max_joint)?;
-    let budget = number("budget", Some(local_count))?;
-    if budget > local_count { return Err("budget exceeds complete layer bank".into()); }
+    let first_index = number("start", Some(0))?;
+    let remaining = local_count.checked_sub(first_index).ok_or("start exceeds complete layer bank")?;
+    let budget = number("budget", Some(remaining))?;
+    if budget > remaining { return Err("budget exceeds remaining layer bank after start".into()); }
     if kv == 0 || heads % kv != 0 { return Err("invalid KV grouping".into()); }
     if out.exists() { return Err("output directory must be fresh".into()); }
     let (count, context, batch) = (number("local", Some(4))?, number("context", Some(512))?, number("batch", Some(1024))?);
@@ -113,11 +115,20 @@ fn main() -> Result<(), String> {
     let family = FamilyInputs { rows: tokens.len(), slots: vec![SlotValues::Tokens(tokens)], layout: Some(SequenceLayout { sequence, position }) };
     let local = Local::new(&native, family.clone(), None, batch);
     std::fs::create_dir(out).map_err(|e| e.to_string())?;
+    // Write provenance before the first expensive measurement, so a wall-time stop
+    // leaves attributable complete JSONL records. Continuations use a fresh output
+    // directory and an explicit start index; missing masks always remain unexcluded.
+    let provenance = json!({"schema":"copy-layer-mask-local-provenance-v1",
+        "local_sequences":count,"context":context,"rows":family.rows,"batch":batch,
+        "measurement_start":first_index,"measurement_budget":budget,"deltas":deltas,
+        "complete_layer_masks":local_count,"implicit_joint_candidates":joint_count,
+        "input_sha256":input_hashes,"compiled_source_sha256":sources,"binary_sha256":binary_hash});
+    std::fs::write(out.join("PROVENANCE.json"), serde_json::to_vec_pretty(&provenance).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
     let mut log = std::fs::File::create(out.join("LOCAL.jsonl")).map_err(|e| e.to_string())?;
     let mut retained = vec![vec![Vec::<usize>::new(); layers]; deltas.len()];
     let started = Instant::now();
     for (index, (layer, mask)) in bank.layer_masks().enumerate() {
-        if index >= budget {
+        if index < first_index || index - first_index >= budget {
             for grid in &mut retained { grid[layer].push(mask); }
             serde_json::to_writer(&mut log, &json!({"layer":layer,"mask":mask,"state":"unmeasured_retained"})).map_err(|e| e.to_string())?;
             writeln!(log).map_err(|e| e.to_string())?;
@@ -156,7 +167,7 @@ fn main() -> Result<(), String> {
         json!({"delta":delta,"retained_layer_masks":masks,"unexcluded_joint_candidates":remaining})
     }).collect();
     let manifest = json!({"schema":"copy-layer-mask-local-v1","scope":{"laws":"Copy only","complete_layer_masks":local_count,"implicit_joint_candidates":joint_count,
-        "native":"empty mask at each layer","measurement_budget":budget,"unmeasured_retained":true,"max_layer":max_layer,"max_joint":max_joint,"single_failure_pruning":false,"joint_artifacts_emitted":0,
+        "native":"empty mask at each layer","measurement_start":first_index,"measurement_budget":budget,"unmeasured_retained":true,"max_layer":max_layer,"max_joint":max_joint,"single_failure_pruning":false,"joint_artifacts_emitted":0,
         "local":"fixed native parents; declared family only; ascent disabled","run":"not measured; no run pruning","global_optimum_claim":false},
         "local_sequences":count,"context":context,"rows":family.rows,"batch":batch,"input_sha256":input_hashes,"compiled_source_sha256":sources,
         "binary_sha256":binary_hash,"literal_projection":"f32 learned literals; exact architecture epsilon retained", "price":"C32 distinct from exact wire bytes",
