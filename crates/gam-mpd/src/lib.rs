@@ -62,6 +62,7 @@ pub mod engine;
 // its blocks grafted onto the native model.
 pub mod artifact;
 pub mod artifact_device;
+pub mod device_family_run;
 
 // One acceptance path: minimise C(P) subject to D_local(P) ≤ δ and D_run(P) ≤ ε, over a frontier.
 pub mod acceptance;
