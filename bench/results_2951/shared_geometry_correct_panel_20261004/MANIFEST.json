@@ -1,0 +1,22 @@
+{
+  "report.json": {
+    "archived": "report.json.gz",
+    "uncompressed_sha256": "4eb904feef6fa5519b4328215c9735bb88ea4569b68ada4e4458221c3424a92f",
+    "bytes": 244361
+  },
+  "CORRECT_PANEL_EXECUTION.json": {
+    "archived": "CORRECT_PANEL_EXECUTION.json",
+    "uncompressed_sha256": "885db183ce10df88a085ed5bf1aa6f6c6758b5edacb7707f0b1b0eff05c66f53",
+    "bytes": 1360
+  },
+  "CORRECT_PANEL_GPU_UTIL.csv": {
+    "archived": "CORRECT_PANEL_GPU_UTIL.csv",
+    "uncompressed_sha256": "218ec1e0705c5ec2a20ae99f815005c07a5086aca0f14e468256e94c3c7764f0",
+    "bytes": 33040
+  },
+  "SUMMARY.json": {
+    "archived": "SUMMARY.json",
+    "uncompressed_sha256": "669345a12a79f5f0faa83e5ed7eed499d128c09a1db67a25de0fd719a9f93773",
+    "bytes": 2811
+  }
+}

@@ -1,0 +1,114 @@
+{
+  "job": 15933,
+  "scope": "correct frozen 80 episode panel, tokens9938; finite five candidate bank only",
+  "candidates": [
+    {
+      "label": "shared-geometry256-frozen_native",
+      "C32": 2104499821,
+      "Local": {
+        "lower": 5.024085061833373,
+        "upper": 5.024085062339089
+      },
+      "Run": {
+        "lower": 4.334635447382572,
+        "upper": 4.3346354473830875
+      }
+    },
+    {
+      "label": "shared-geometry256-frozen_random",
+      "C32": 2104499821,
+      "Local": {
+        "lower": 6.132269814730598,
+        "upper": 6.1322698153478745
+      },
+      "Run": {
+        "lower": 7.79005062038294,
+        "upper": 7.790050620383929
+      }
+    },
+    {
+      "label": "shared-geometry256-learned",
+      "C32": 2104499821,
+      "Local": {
+        "lower": 6.346543111595889,
+        "upper": 6.346543112234732
+      },
+      "Run": {
+        "lower": 6.810087009616612,
+        "upper": 6.81008700961709
+      }
+    },
+    {
+      "label": "native",
+      "C32": 2142194137,
+      "Local": {
+        "lower": 0.0,
+        "upper": 0.0
+      },
+      "Run": {
+        "lower": 0.0,
+        "upper": 0.0
+      }
+    },
+    {
+      "label": "shared-geometry256-untied",
+      "C32": 2142297495,
+      "Local": {
+        "lower": 5.801821629364318,
+        "upper": 5.801821629948347
+      },
+      "Run": {
+        "lower": 4.8226127318945125,
+        "upper": 4.822612731895234
+      }
+    }
+  ],
+  "seconds": {
+    "frontier": 229.993769462,
+    "input_hashing": 11.456585828,
+    "load_and_generation": 45.159872726,
+    "selected_replay": 33.208981972,
+    "total": 319.826013491
+  },
+  "telemetry": {
+    "calls": 6,
+    "completed": 6,
+    "errors": 0,
+    "latest_head_numeric_resident_bytes": 308908032,
+    "latest_metric_workspace_bytes": 210973856,
+    "latest_prepared_edit_numeric_bytes": 64585728,
+    "latest_teacher_numeric_bytes": 251658240,
+    "measure_wall_seconds": 179.052513126,
+    "metric_timing": {
+      "checked_metric_seconds": 93.83257450199999,
+      "cpu_reference_seconds": 0.0,
+      "cpu_top1_seconds": 0.0,
+      "gpu_top1_seconds": 0.2103660609999998,
+      "packing_and_upload_seconds": 0.0,
+      "raw_oracle_download_seconds": 0.0,
+      "resident_head_seconds": 48.69420220799994
+    },
+    "preparation_seconds": 5.38445553,
+    "teacher_initialization_seconds": 33.732074056,
+    "transfers": {
+      "donor_download_bytes": 0,
+      "edit_constant_upload_bytes": 111673344,
+      "final_residual_download_bytes": 0,
+      "raw_oracle_download_bytes": 0,
+      "residual_upload_bytes": 0
+    }
+  },
+  "selected_counts": {
+    "native": 30
+  },
+  "gaps": [
+    0
+  ],
+  "gpu_samples": {
+    "n": 320,
+    "mean_percent": 54.55625,
+    "median_percent": 98.0,
+    "zero_fraction": 0.434375,
+    "at_least90_fraction": 0.54375
+  }
+}

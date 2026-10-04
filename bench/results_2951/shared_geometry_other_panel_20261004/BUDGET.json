@@ -1,0 +1,11 @@
+{
+  "trace_bytes": 2147483648,
+  "aggregate_numeric_bytes": 12884901888,
+  "teacher_bytes": 536870912,
+  "operator_bytes": 2147483648,
+  "edit_bytes": 536870912,
+  "metric_batch_rows": 128,
+  "metric_workspace_bytes": 1073741824,
+  "readout_resident_bytes": 536870912,
+  "readout_workspace_bytes": 268435456
+}

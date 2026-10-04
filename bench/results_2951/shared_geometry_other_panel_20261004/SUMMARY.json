@@ -1,0 +1,349 @@
+{
+  "job": 15921,
+  "source_commit": "34d2523394879b9784dede47b8bfcbd6ad4eea3b",
+  "allocation_seconds": 386,
+  "assessments": [
+    {
+      "label": "shared-geometry256-frozen_native",
+      "C32_bits": 2104499821,
+      "Local": {
+        "lower": 2.505147924780504,
+        "upper": 2.5051479249867676
+      },
+      "Run": {
+        "lower": 3.4812835588614304,
+        "upper": 3.4812835588618567
+      }
+    },
+    {
+      "label": "shared-geometry256-frozen_random",
+      "C32_bits": 2104499821,
+      "Local": {
+        "lower": 2.675780260551513,
+        "upper": 2.6757802607718513
+      },
+      "Run": {
+        "lower": 7.813639398495882,
+        "upper": 7.813639398496891
+      }
+    },
+    {
+      "label": "shared-geometry256-learned",
+      "C32_bits": 2104499821,
+      "Local": {
+        "lower": 2.963897523336886,
+        "upper": 2.9638975235809264
+      },
+      "Run": {
+        "lower": 7.851739392751303,
+        "upper": 7.8517393927520205
+      }
+    },
+    {
+      "label": "native",
+      "C32_bits": 2142194137,
+      "Local": {
+        "lower": 0.0,
+        "upper": 0.0
+      },
+      "Run": {
+        "lower": 0.0,
+        "upper": 0.0
+      }
+    },
+    {
+      "label": "shared-geometry256-untied",
+      "C32_bits": 2142297495,
+      "Local": {
+        "lower": 3.1942033429793324,
+        "upper": 3.1942033432423256
+      },
+      "Run": {
+        "lower": 4.571159609879259,
+        "upper": 4.571159609879936
+      }
+    }
+  ],
+  "grid_selections": [
+    {
+      "constraint": {
+        "local": 0.01,
+        "run": 0.001
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 0.01,
+        "run": 0.01
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 0.01,
+        "run": 0.1
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 0.01,
+        "run": 1.0
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 0.01,
+        "run": 10.0
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 0.03,
+        "run": 0.001
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 0.03,
+        "run": 0.01
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 0.03,
+        "run": 0.1
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 0.03,
+        "run": 1.0
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 0.03,
+        "run": 10.0
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 0.1,
+        "run": 0.001
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 0.1,
+        "run": 0.01
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 0.1,
+        "run": 0.1
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 0.1,
+        "run": 1.0
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 0.1,
+        "run": 10.0
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 0.3,
+        "run": 0.001
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 0.3,
+        "run": 0.01
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 0.3,
+        "run": 0.1
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 0.3,
+        "run": 1.0
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 0.3,
+        "run": 10.0
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 1.0,
+        "run": 0.001
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 1.0,
+        "run": 0.01
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 1.0,
+        "run": 0.1
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 1.0,
+        "run": 1.0
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 1.0,
+        "run": 10.0
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 3.0,
+        "run": 0.001
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 3.0,
+        "run": 0.01
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 3.0,
+        "run": 0.1
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 3.0,
+        "run": 1.0
+      },
+      "label": "native",
+      "gap": 0
+    },
+    {
+      "constraint": {
+        "local": 3.0,
+        "run": 10.0
+      },
+      "label": "shared-geometry256-frozen_native",
+      "gap": 0
+    }
+  ],
+  "telemetry": {
+    "calls": 7,
+    "completed": 7,
+    "errors": 0,
+    "latest_head_numeric_resident_bytes": 308908032,
+    "latest_metric_workspace_bytes": 210973856,
+    "latest_prepared_edit_numeric_bytes": 67731456,
+    "latest_teacher_numeric_bytes": 251658240,
+    "measure_wall_seconds": 210.47150596999998,
+    "metric_timing": {
+      "checked_metric_seconds": 116.94401868699998,
+      "cpu_reference_seconds": 0.0,
+      "cpu_top1_seconds": 0.0,
+      "gpu_top1_seconds": 0.24042925099999998,
+      "packing_and_upload_seconds": 0.0,
+      "raw_oracle_download_seconds": 0.0,
+      "resident_head_seconds": 56.99896703700002
+    },
+    "preparation_seconds": 6.426676829000001,
+    "teacher_initialization_seconds": 33.483101527,
+    "transfers": {
+      "donor_download_bytes": 0,
+      "edit_constant_upload_bytes": 128974848,
+      "final_residual_download_bytes": 0,
+      "raw_oracle_download_bytes": 0,
+      "residual_upload_bytes": 0
+    }
+  },
+  "stages_seconds": {
+    "frontier": 230.462246817,
+    "input_hashing": 11.412365223,
+    "load_and_generation": 44.589265958,
+    "selected_replay": 94.901005088,
+    "total": 381.372518359
+  },
+  "report_sha256": "4804b93390695b14aff16bdcd6111a778d834e66487b55e2c2f15eda7cfc60a9",
+  "gzip_sha256": "d4c22e810d72a8ca81a1709540906a567e5cb76fdd06d42b0160af11d407b585",
+  "scope": "same80actiontemplates evaluatedonvalidationpassages0/1; frozen16/17 rerunrequired, do not compare with original fixedpanel",
+  "status": "wrong evaluation token panel: technical result only, not frozen16/17 benchmark",
+  "actual_token_sha256": "43f6e89aa7da1c8e181f56ceb81b5953cfa485ee74005665d720bd7269be15d2"
+}
