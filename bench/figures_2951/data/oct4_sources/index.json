@@ -1,0 +1,26 @@
+{
+  "joint": {
+    "file": "joint.json.gz",
+    "uncompressed_sha256": "3ce6d12921f660f86fb7eef27d05e112825131b2e6139aa309d83ddeac812a91",
+    "uncompressed_bytes": 1186189,
+    "source_path": "/Users/user/mpd-data/cluster/codex-prepared-head-joint-3ac392/evaluation/REPORT.json"
+  },
+  "joint_complete": {
+    "file": "joint_complete.json",
+    "uncompressed_sha256": "70107fe4c17344693f2341fca60ee0bd822d4a0e5bf62fd627954a22d1de9f78",
+    "uncompressed_bytes": 379,
+    "source_path": "/Users/user/mpd-data/cluster/codex-prepared-head-joint-3ac392/evaluation/COMPLETE.json"
+  },
+  "collision": {
+    "file": "collision.json",
+    "uncompressed_sha256": "c2eaeef801f975e8c5e330c9e709a69da0974d9f28a224c050d19b2adeb06549",
+    "uncompressed_bytes": 8015,
+    "source_path": "/Users/user/mpd-data/codex/response-collision-20261004/REPORT.json"
+  },
+  "decode": {
+    "file": "decode.json",
+    "uncompressed_sha256": "f079849acede770044b8001dda3fb55003a57a9c1746e6c89eaa9eb5ce2a8eca",
+    "uncompressed_bytes": 1514,
+    "source_path": "/Users/user/mpd-data/cluster/codex-saved-decode-ca9/SUMMARY.json"
+  }
+}

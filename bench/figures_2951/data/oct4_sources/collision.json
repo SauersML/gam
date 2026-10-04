@@ -1,0 +1,204 @@
+{
+  "arithmetic": "analytic exp enclosure, directed binary64 interval arithmetic under IEEE round-to-nearest and gradual underflow",
+  "binary_sha256": "1fa1396de2a6341cb8a0bf16ad68a00976ba8037f809f78bcd478d30b86063ba",
+  "config": {
+    "d_mlp": 3072,
+    "d_model": 768,
+    "head_dim": 128,
+    "mlp_act": "gelu_tanh",
+    "n_ctx": 512,
+    "n_heads": 6,
+    "n_kv_heads": 6,
+    "n_layers": 4,
+    "norm_eps": 1e-6,
+    "rope_pairing": "rotate_half",
+    "rope_theta": 10000.0,
+    "tied_embeddings": true,
+    "vocab": 50277
+  },
+  "exclusions": "no certificate of neural forward/readout rounding, artifact interface coverage, or existing exp/log acceptance arithmetic",
+  "export_json_sha256": "18fdb8ff6adb2c38e42d27e8772bd391cc841dc2076e9605c2c7731d0c85449a",
+  "groups": [
+    {
+      "clean_group": "clean",
+      "conditional_worst_group_KL_lower_nats_per_token": 0.461664098631233,
+      "intervention_group": "remove-mlp/l0",
+      "layer": 0,
+      "matched_rows": 1024,
+      "statistic_interval": [
+        0.461664098631233,
+        0.46166409865395
+      ]
+    },
+    {
+      "clean_group": "clean",
+      "conditional_worst_group_KL_lower_nats_per_token": 0.23514415426993257,
+      "intervention_group": "remove-mlp/l1",
+      "layer": 1,
+      "matched_rows": 1024,
+      "statistic_interval": [
+        0.23514415426993257,
+        0.2351441542855385
+      ]
+    },
+    {
+      "clean_group": "clean",
+      "conditional_worst_group_KL_lower_nats_per_token": 0.08579898014811853,
+      "intervention_group": "remove-mlp/l2",
+      "layer": 2,
+      "matched_rows": 1024,
+      "statistic_interval": [
+        0.08579898014811853,
+        0.08579898015540426
+      ]
+    },
+    {
+      "clean_group": "clean",
+      "conditional_worst_group_KL_lower_nats_per_token": 0.16298632926290613,
+      "intervention_group": "remove-mlp/l3",
+      "layer": 3,
+      "matched_rows": 1024,
+      "statistic_interval": [
+        0.16298632926290613,
+        0.1629863292745501
+      ]
+    }
+  ],
+  "maximum_live_pair_logit_bytes": 12870912,
+  "pairs": [
+    {
+      "conditional_KL_lower_nats_per_token": 0.4786980153385236,
+      "layer": 0,
+      "passage": 0,
+      "statistic_interval": [
+        0.4786980153385236,
+        0.47869801536225715
+      ]
+    },
+    {
+      "conditional_KL_lower_nats_per_token": 0.22472818602774927,
+      "layer": 1,
+      "passage": 0,
+      "statistic_interval": [
+        0.22472818602774927,
+        0.22472818604331105
+      ]
+    },
+    {
+      "conditional_KL_lower_nats_per_token": 0.05637044558815825,
+      "layer": 2,
+      "passage": 0,
+      "statistic_interval": [
+        0.05637044558815825,
+        0.056370445593466205
+      ]
+    },
+    {
+      "conditional_KL_lower_nats_per_token": 0.12320201334901924,
+      "layer": 3,
+      "passage": 0,
+      "statistic_interval": [
+        0.12320201334901924,
+        0.12320201335848237
+      ]
+    },
+    {
+      "conditional_KL_lower_nats_per_token": 0.44463018192394244,
+      "layer": 0,
+      "passage": 1,
+      "statistic_interval": [
+        0.44463018192394244,
+        0.44463018194564274
+      ]
+    },
+    {
+      "conditional_KL_lower_nats_per_token": 0.24556012251211587,
+      "layer": 1,
+      "passage": 1,
+      "statistic_interval": [
+        0.24556012251211587,
+        0.24556012252776596
+      ]
+    },
+    {
+      "conditional_KL_lower_nats_per_token": 0.11522751470807883,
+      "layer": 2,
+      "passage": 1,
+      "statistic_interval": [
+        0.11522751470807883,
+        0.1152275147173423
+      ]
+    },
+    {
+      "conditional_KL_lower_nats_per_token": 0.20277064517679308,
+      "layer": 3,
+      "passage": 1,
+      "statistic_interval": [
+        0.20277064517679308,
+        0.20277064519061783
+      ]
+    }
+  ],
+  "parallel": 8,
+  "passages": 2,
+  "premise": "candidate makes exactly the same prediction for clean and this removal on every matched passage/token; e.g. wholly unheld activation interface with no other episode-dependent path",
+  "rows": 512,
+  "scope": "diagnostic only; fixed binary64 CPU native log-probability arrays treated as logits and renormalized in exact real arithmetic; no acceptance change",
+  "seconds": {
+    "intervals": 356.17765974899993,
+    "readout_and_teacher_initialization": 18.36653629799998,
+    "total": 383.275007906
+  },
+  "source_episode_indices": [
+    0,
+    7,
+    16,
+    25,
+    34,
+    40,
+    47,
+    56,
+    65,
+    74
+  ],
+  "spec_sha256": "3c05b66324dfb02e33da7eff98784a7ec432123e24fea78018b892efb4256436",
+  "theorem": "max of two matched group mean KLs >= mean TV(native_clean,native_changed)^2/2; only lower endpoint bounds achievable KL",
+  "tile_rows": 16,
+  "tokens_sha256": "9938c3b6995c4c1b9f74b7bf26b7a17a991941952de9a2e6598fec95003ca8cf",
+  "verified_native_weight_sha256": {
+    "blocks.0.attn.k_proj": "099f96cd49e2f8daf2c6417d8510f54a14792d495a60c65c34c6fe233fc73614",
+    "blocks.0.attn.o_proj": "aea57bbf855586fadb200d81d543b29f7de9da0f2c0cca24994925e1c46bc8ae",
+    "blocks.0.attn.q_proj": "ea38c22ce7e3855ebdbccc06e87b75619e5b3fee33f3bee9a7329936bb4f2238",
+    "blocks.0.attn.v_proj": "5d741828c2a0684a4448dbd8434ce3d92e9e24bc38da324967890fa2254d7bf3",
+    "blocks.0.mlp.c_fc": "ce3f0e13143fb1b7d31ad01fe75e38e39bf8cd67ef6b8309dd566d8bc2983275",
+    "blocks.0.mlp.down_proj": "05d2abd83af9be70a453c7e7b499af6100d5c1b5379268ab5a5919f42e0ac384",
+    "blocks.0.rms1.gain": "f7caac93fc2ebcf2064255c345213c199c25858479067ba8afeb7778ef9ba56e",
+    "blocks.0.rms2.gain": "77f3b52b042773fdcd76b77a28e4efc66764f1e40f1b22ddc5e8bd407b0ad388",
+    "blocks.1.attn.k_proj": "a50cbbf9738af28cf9b7d64885d2f6ed481ebebf9b4ed5b20aa20c8a67a71bf3",
+    "blocks.1.attn.o_proj": "c5c7d591b66b11791c6bd77a55ec4f8ef029e0a03b1061e8413e411a1d46d7be",
+    "blocks.1.attn.q_proj": "e866af792279b999dd7164d7b203971b3776902e764452217653f0536c8f9227",
+    "blocks.1.attn.v_proj": "12e2189b69665c35f4d1e41bed8229080ccb95bfd2ac6f09d2d9a15b6162679b",
+    "blocks.1.mlp.c_fc": "5250793ece9b1bef04c275c1b59f48f5cccb9c971dd898d0a4f5777fcafad5c8",
+    "blocks.1.mlp.down_proj": "ec12769ec6cf2a735d67609ec4eb9fc155b4f3160d217340a0ddd19ab16a307d",
+    "blocks.1.rms1.gain": "cd82df137c7b3c6958ba09ae522712751550e6ca94365e0745f942ef3468aa7e",
+    "blocks.1.rms2.gain": "e80940662353b21caa38d7c8b9f39d242ac7eca50b8f2a9b8b7e34b0d2073633",
+    "blocks.2.attn.k_proj": "f870446110c824cc9330b00e8a96665757ebea6d231eb8403cd290d143991316",
+    "blocks.2.attn.o_proj": "93291c198cb318df017cd12b276420d980a57eb6bb214f70d4ffb8cf4057fb44",
+    "blocks.2.attn.q_proj": "c3e8e98f26dffacd097b4342dafc04f22b6bfe2379f5db7307558fb3d95caef6",
+    "blocks.2.attn.v_proj": "9c03b34c8772c92484d0fea39238c06b63dbb115c73baa53fbd55915bad197c6",
+    "blocks.2.mlp.c_fc": "07f0c6a137fd648b749f9acece581431a9a73ecdd6881f81633f618317dbd0dc",
+    "blocks.2.mlp.down_proj": "0edbdf22096909f99ac92b91221195e22e4a0957d59d791cc22fb58cf6b3a579",
+    "blocks.2.rms1.gain": "9d8a578f86b90b79d61d05d3c4a4119124061f354f60278890ae73d85b843042",
+    "blocks.2.rms2.gain": "b770fa4d1c6b2ef24f605360523abfb073bd4ed62f446b9ee388bdc57614d13d",
+    "blocks.3.attn.k_proj": "dc19a593d43427d44769f9ea9b0b827851d357d849300d9b882fdd39db4f8928",
+    "blocks.3.attn.o_proj": "5fc3bb75250b6bf15c1aa627bf73ca7e26d6c4c6353ad2915cccf0d5d1977c64",
+    "blocks.3.attn.q_proj": "bfd4e26e3569a36425684702f7c834325cf0422737588b8b7dfd3ca666631b2b",
+    "blocks.3.attn.v_proj": "ca73d04bad13b91b732e5c22b5504d2b410c67bbd279b2538dcbb750d6e5ec82",
+    "blocks.3.mlp.c_fc": "dba21fcffeeee199085ba1fd887d2009193bcda317f67069bd635cf38c8f71f5",
+    "blocks.3.mlp.down_proj": "a9820c075dffdce736341eb48494f5d03459dca6b4f8f198df7e78771c12ae1f",
+    "blocks.3.rms1.gain": "0c0caddb7cab377379a952263d994e6a6a4e0235d1528a6cfa604da7fcad34a0",
+    "blocks.3.rms2.gain": "a9e54165b55f00b9fba493dec03ecdd3b140913251d0aff66b6c7bea7d26018a",
+    "final_norm.gain": "30518f54acc7d36d0a4533956c7d8f0bb9d1bda5f2cddae0fddac7c2f071b665",
+    "wte": "81625bc04736ddf55792b57cc5e9ccb59bc35bbaf4fd6d7d3ac0472da65b7a52"
+  }
+}

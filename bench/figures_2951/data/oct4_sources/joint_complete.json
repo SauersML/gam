@@ -1,0 +1,11 @@
+{
+  "source": "3ac39262c0107f7df35e753cd413f404e1dceb4b",
+  "binary_sha256": "68fead0cb7ddd1315ac5523bd1b1f623c5cce24929656c934c850658c51176e7",
+  "report_sha256": "3ce6d12921f660f86fb7eef27d05e112825131b2e6139aa309d83ddeac812a91",
+  "seconds": 2028.2781331539154,
+  "assessed": 17,
+  "unmeasured": 0,
+  "complete_shard": true,
+  "complete_bank": true,
+  "selected_replays": 4
+}

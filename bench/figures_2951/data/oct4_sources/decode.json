@@ -1,0 +1,61 @@
+{
+  "before": {
+    "ordinary": {
+      "completed": 3,
+      "declared": 3,
+      "complete": true,
+      "median_seconds": 4.466992638,
+      "seconds": [
+        4.466992638,
+        4.482692754,
+        4.457256131
+      ],
+      "peak_rss_bytes": 3389480960,
+      "all_exact_reference_equal": true
+    },
+    "cached": {
+      "completed": 3,
+      "declared": 3,
+      "complete": true,
+      "median_seconds": 0.868662328,
+      "seconds": [
+        0.870092747,
+        0.868662328,
+        0.841069384
+      ],
+      "peak_rss_bytes": 3388452864,
+      "all_exact_reference_equal": true
+    }
+  },
+  "after": {
+    "ordinary": {
+      "completed": 3,
+      "declared": 3,
+      "complete": true,
+      "median_seconds": 4.196338758,
+      "seconds": [
+        4.196338758,
+        4.155318188,
+        4.419055822
+      ],
+      "peak_rss_bytes": 2979848192,
+      "all_exact_reference_equal": true
+    },
+    "cached": {
+      "completed": 3,
+      "declared": 3,
+      "complete": true,
+      "median_seconds": 0.439143609,
+      "seconds": [
+        0.469083923,
+        0.437977167,
+        0.439143609
+      ],
+      "peak_rss_bytes": 2979848192,
+      "all_exact_reference_equal": true
+    }
+  },
+  "ordinary_before_over_after": 1.0644976241453383,
+  "cached_before_over_after": 1.9780825912008206,
+  "scope": "CPU actual saved native4L artifact decode; borrowed nestedcopy change; retained witness scans and operator construction; noGPU/fidelityclaim; uncontrolled scheduler/CPUfrequency noise"
+}
