@@ -160,25 +160,28 @@ impl Resident {
         mut edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
     ) -> Result<DeviceTrace, String> {
         let d = self.program.device();
-        let mut additions: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
+        // Each addition must round against the live value in serialized exception
+        // order. Summing overlapping additions first changes cancellation semantics.
+        let mut tensors: BTreeMap<usize, Vec<Tensor>> = BTreeMap::new();
         let row_contexts = contexts(family);
         for exception in &self.artifact.exceptions {
             let node = self.map[exception.node];
             let width = self.artifact.program.node_interface(exception.node).map_err(|e| e.to_string())?.width();
-            let values = additions.entry(node).or_insert_with(|| Array2::zeros((family.rows, width)));
+            let mut values = Array2::zeros((family.rows, width));
+            let mut matched = false;
             for (row, context) in row_contexts.iter().enumerate() {
                 if *context == exception.context {
-                    values[[row, exception.column]] += f64::from(exception.value);
+                    values[[row, exception.column]] = f64::from(exception.value);
+                    matched = true;
                 }
             }
-        }
-        let mut tensors = BTreeMap::new();
-        for (node, values) in additions {
-            tensors.insert(node, d.upload(values.view()).map_err(|e| e.to_string())?);
+            if matched {
+                tensors.entry(node).or_default().push(d.upload(values.view()).map_err(|e| e.to_string())?);
+            }
         }
         // Two hooks are required: exception addition is visible in the trace before edit runs.
         let before = |node, value: &mut Tensor| {
-            if let Some(add) = tensors.get(&node) {
+            for add in tensors.get(&node).map_or(&[][..], Vec::as_slice) {
                 d.axpy(value, 1.0, add).map_err(|e| e.to_string())?;
             }
             Ok(())
@@ -385,5 +388,59 @@ mod tests {
             assert!((a - b).abs() < 1e-10, "residual differs: {a} versus {b}");
         }
         assert!(actual.value(p.output).is_err(), "native head/readout must stay unmaterialized");
+    }
+    #[test]
+    fn overlapping_exceptions_round_in_order_before_intermediate_edit() {
+        let dir = crate::explanation_tests::tiny_export("ordered_device_exceptions", 2);
+        let imported = crate::import::import_language_model(&dir, 1, 12).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        let mut artifact = Artifact::native(&imported.program).unwrap();
+        let family = imported.contract.family;
+        let root = artifact
+            .program
+            .nodes
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, n)| matches!(n, Node::Affine { terms, .. } if terms.len() == 2).then_some(i))
+            .unwrap();
+        let context = contexts(&family)[0].clone();
+        for value in [1e20f32, -1e20f32, 0.25f32] {
+            artifact.exceptions.push(Exception { context: context.clone(), node: root, column: 0, value });
+        }
+        let expected = artifact
+            .execute_edited(&family, |node, values, _| {
+                if node == root {
+                    values.mapv_inplace(|v| v * 2.0);
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(expected.values[root][[0, 0]], 0.5);
+        let device = Device::host();
+        // Reference tensor test bypasses only the production accelerator requirement.
+        let (flat, map) = mapped_inlined(&artifact.program).unwrap();
+        let output = flat.output;
+        let roots = map.iter().enumerate().map(|(old, &new)| (new, old)).collect();
+        let program = DeviceProgram::compile(&device, &flat).unwrap();
+        let resident = Resident { artifact, map, roots, program, output };
+        for materialize_head in [false, true] {
+            let actual = resident
+                .forward_hooks(&family, materialize_head, |node, trace| {
+                    if node != root {
+                        return Ok(None);
+                    }
+                    let source = resident.root_value(trace, root)?;
+                    let mut doubled = device.copy(source).map_err(|e| e.to_string())?;
+                    device.axpy(&mut doubled, 1.0, source).map_err(|e| e.to_string())?;
+                    Ok(Some(doubled))
+                })
+                .unwrap();
+            let values = device.download(resident.root_value(&actual, root).unwrap()).unwrap();
+            assert_eq!(values[[0, 0]], 0.5);
+            for (a, b) in values.iter().zip(expected.values[root].iter()) {
+                assert!((a - b).abs() < 1e-10);
+            }
+        }
     }
 }
