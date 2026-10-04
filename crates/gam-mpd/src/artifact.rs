@@ -593,6 +593,29 @@ impl Artifact {
         Ok(out)
     }
 
+    /// Expand legacy Copy templates into complete arithmetic bodies. This is
+    /// desugaring a fixed template baseline, not automatic rule discovery.
+    /// The SVD convention and each call's scale/residual are retained. The
+    /// generic matrix product may change IEEE zero signs or accumulation order;
+    /// fidelity must be measured on the independently decoded new artifact.
+    pub fn expand_copy_templates(&self) -> Result<Self, String> {
+        use super::matrix_rule::{Node as MatrixNode, PinvConvention};
+        let mut out = self.clone();
+        for d in &self.derived {
+            if let OperatorLaw::Copy { value, gain, final_gain } = d.law {
+                let v = self.program.operators.get(value).ok_or("a Copy template has no value operator")?;
+                let width = v.cols.width();
+                let body = Arc::new(MatrixRule {
+                    inputs: vec![MatrixType::Matrix { rows: v.rows.width(), cols: width }, MatrixType::Vector { len: width }, MatrixType::Vector { len: width }],
+                    nodes: vec![MatrixNode::Param { index: 0 }, MatrixNode::Param { index: 1 }, MatrixNode::Param { index: 2 }, MatrixNode::Divide { numerator: 1, denominator: 2 }, MatrixNode::Diag { input: 3 }, MatrixNode::Pinv { input: 0, convention: PinvConvention::SvdResolutionBand }, MatrixNode::MatMul { left: 4, right: 5 }],
+                    output: 6,
+                });
+                out = out.derive(d.operator, OperatorLaw::Expression { body, sources: vec![value, gain, final_gain] }, d.scale, d.residual.clone())?;
+            }
+        }
+        Ok(out)
+    }
+
     /// `P` as its message holds it: every derived operator with no reals (its interfaces kept).
     pub fn message_program(&self) -> Result<OperatorProgram, String> {
         let mut program = self.program.clone();

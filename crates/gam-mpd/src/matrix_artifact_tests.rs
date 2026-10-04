@@ -611,3 +611,70 @@ fn explicit_body_matches_template_measures_and_pays_its_extra_structure() {
         "identical execution does not erase the explicit definition price"
     );
 }
+
+#[test]
+fn copy_template_expansion_preserves_calls_residuals_and_native_places() {
+    let source = Artifact::native(&model())
+        .expect("native fixture")
+        .derive(
+            3,
+            OperatorLaw::Copy {
+                value: 0,
+                gain: 1,
+                final_gain: 2,
+            },
+            0.75,
+            vec![(0, vec![0.25, 0.125])],
+        )
+        .expect("template with residual")
+        .bind("A", &[2], 3)
+        .expect("native write");
+    let explicit = source
+        .expand_copy_templates()
+        .expect("explicit arithmetic expansion");
+    assert_eq!(explicit.program.nodes, source.program.nodes);
+    assert_eq!(explicit.places, source.places);
+    assert_eq!(explicit.blocks, source.blocks);
+    assert_eq!(
+        explicit.derived[0].scale.to_bits(),
+        source.derived[0].scale.to_bits()
+    );
+    assert_eq!(explicit.derived[0].residual, source.derived[0].residual);
+    assert!(matches!(
+        explicit.derived[0].law,
+        OperatorLaw::Expression { .. }
+    ));
+    assert_eq!(
+        explicit
+            .execute(&family())
+            .expect("explicit execution")
+            .values,
+        source
+            .execute(&family())
+            .expect("template execution")
+            .values
+    );
+    let decoded = Artifact::from_bytes(
+        &explicit.to_bytes().expect("new bytes"),
+        &source.program.declarations,
+    )
+    .expect("independent replay");
+    assert_eq!(
+        decoded
+            .execute(&family())
+            .expect("replayed execution")
+            .values,
+        source
+            .execute(&family())
+            .expect("template execution")
+            .values
+    );
+    assert!(
+        structural_cost(&explicit, &mut CostCache::default())
+            .expect("explicit cost")
+            .total()
+            > structural_cost(&source, &mut CostCache::default())
+                .expect("template cost")
+                .total()
+    );
+}
