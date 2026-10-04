@@ -703,6 +703,16 @@ impl<'a> LanguageRun<'a> {
         if self.device.is_some() { "hybrid: explained CUDA f64; cached teacher and readout/KL CPU" } else { "CPU f64; cached native teachers" }
     }
 
+    /// Read the existing immutable native teacher through this runner's unchanged readout.
+    /// `rows` is an explicit scoring domain, not the episode's state-check interface_rows.
+    /// This initializes the same teacher cache as episodes() and performs no new native forward.
+    pub fn native_episode_log_probs(&self, episode: usize, rows: Range<usize>) -> Result<Array2<f64>, String> {
+        let teachers = self.teacher_episodes()?;
+        let residual = teachers.residuals.get(episode).ok_or("native episode index absent")?;
+        if rows.start >= rows.end || rows.end > residual.nrows() { return Err("native readout rows outside episode".into()); }
+        Ok(self.decoder.log_probs(&residual.slice(s![rows, ..]).to_owned()))
+    }
+
     /// Fixed references belong to this runner's immutable borrowed dataset, never
     /// to a global cache or guessed data key. No candidate can modify their inputs.
     fn teacher_episodes(&self) -> Result<&TeacherEpisodes, String> {

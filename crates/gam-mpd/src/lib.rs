@@ -63,6 +63,7 @@ pub mod engine;
 pub mod artifact;
 pub mod artifact_device;
 pub mod device_family_run;
+pub mod missing_interface_bound;
 
 // One acceptance path: minimise C(P) subject to D_local(P) ≤ δ and D_run(P) ≤ ε, over a frontier.
 pub mod acceptance;
