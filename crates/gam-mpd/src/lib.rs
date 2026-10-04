@@ -80,6 +80,7 @@ pub mod run_check;
 
 // The team's pieces (MLP accounts, rules, decomposition coordinates) as proposals to the one search.
 pub mod proposals;
+pub mod resident_rule_fit;
 
 // Per-input pieces of one linear map: an overcomplete rank-1 library fitted so that each input
 // lists few pieces (listing code plus second-order KL).
