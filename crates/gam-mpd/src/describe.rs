@@ -28,11 +28,12 @@
 //! `[[a, b], [b, −a]]`, a bit a plane) per pair of two-column groups, or diagonal (one real per
 //! paired column).
 //!
-//! Every real is sent on a dyadic lattice (`2^-p`, [`super::precision`], one `p` per factor) in the
-//! signed Elias δ code ([`super::codec::signed_delta_len_bits`], under which splitting a real into
-//! two never shortens a message); the structure (charts, groups, rank, pivots, exponents) in the
-//! prefix integer and enumerative codes. A description's total is its bits plus `n KL / ln 2` of
-//! the error its decoded map makes; a structured family is taken only when it lowers that total.
+//! Every independent real is a literal at a fixed [`LITERAL_BITS`] (sent as a 32-bit float, so the
+//! decoded factors are exactly what the literals say): quantizing an opaque matrix more cleverly is
+//! not understanding it, while saying a thousand coefficients by one formula is. Structure (charts,
+//! groups, rank, pivots, pairings, the empty description) is in the prefix integer and enumerative
+//! codes. A description's total is its bits plus `n KL / ln 2` of the error its decoded map makes;
+//! a structured family is taken only when it lowers that total.
 //! Everything is computed on the block's factors, so a description costs `O(d² r)` on a `d`-wide
 //! site.
 //!
@@ -70,7 +71,7 @@
 //! library paid once over the 961 inputs, is 99 bits per word; rank-one subcomponents all on, 268;
 //! the gated fits, about 3,000, almost all of it their KL.
 
-use super::codec::{fixed_index_len_bits, prefix_integer_len_bits, signed_delta_len_bits, subset_code_len_bits};
+use super::codec::{fixed_index_len_bits, prefix_integer_len_bits, subset_code_len_bits};
 use super::dense::{eigh, solve, svd};
 use gam_linalg::faer_ndarray::fast_abt;
 use gam_linalg::roundoff::SymmetricAssembly;
@@ -285,28 +286,18 @@ pub struct Description {
     /// The decoded block as factors, `W = uᵀ v`: `u` is `c × d_out`, `v` is `c × d_in`.
     pub u: Array2<f64>,
     pub v: Array2<f64>,
-    /// What [`Geometry::recode`] needs to send another block in the same family at the same
-    /// precision; `None` for the empty description.
+    /// What [`Geometry::recode`] needs to send another block in the same family; `None` for the
+    /// empty description.
     pub choice: Option<Choice>,
 }
 
-/// A description's family and precision: the charts and their groups and the lattice exponents
-/// (the core's kind is the description's).
+/// A description's family: the charts and their groups (the core's kind is the description's).
 #[derive(Clone, Debug)]
 pub struct Choice {
     writer: usize,
     writer_groups: Vec<usize>,
     reader: usize,
     reader_groups: Vec<usize>,
-    exponents: Vec<i32>,
-}
-
-impl Choice {
-    /// The lattice exponent its reader side was sent at (the generic core's second factor, a linear
-    /// core's one).
-    pub fn reader_exponent(&self) -> Option<i32> {
-        self.exponents.last().copied()
-    }
 }
 
 
@@ -373,42 +364,12 @@ fn inverses(m: &Array2<f64>) -> Result<(Array2<f64>, Array2<f64>), String> {
     Ok((symmetric(&fast_abt(&inverse_factor, &d.vectors)), symmetric(&fast_abt(&root_factor, &d.vectors))))
 }
 
-/// Bits of a real sent as the signed integer `i` (the signed Elias δ code).
-fn integer_bits(i: i64) -> f64 {
-    signed_delta_len_bits(i).map(|b| b as f64).unwrap_or(f64::INFINITY)
-}
+/// Bits of one independent real: a 32-bit literal.
+pub const LITERAL_BITS: f64 = 32.0;
 
-/// `x` on the lattice `2^-p` and the bits of its integers, or `None` when an integer leaves the
-/// exactly representable range.
-fn quantize(x: &Array2<f64>, p: i32) -> Option<(Array2<f64>, f64)> {
-    let scale = 2f64.powi(p);
-    let mut bits = 0.0;
-    let mut out = Array2::<f64>::zeros(x.dim());
-    for (o, v) in out.iter_mut().zip(x.iter()) {
-        let k = (v * scale).round();
-        if !(k.abs() < 2f64.powi(52)) {
-            return None;
-        }
-        bits += integer_bits(k as i64);
-        *o = k / scale;
-    }
-    Some((out, bits))
-}
-
-/// The exponents worth scanning for `x`: from the step at which every entry rounds to zero to the
-/// step at which the largest entry spends the whole mantissa.
-fn exponents(x: &Array2<f64>) -> std::ops::RangeInclusive<i32> {
-    let largest = x.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-    if largest == 0.0 || !largest.is_finite() {
-        return 0..=0;
-    }
-    let top = -(largest.log2().ceil() as i32) - 1;
-    top..=top + 52
-}
-
-/// Bits of a lattice exponent.
-fn exponent_bits(p: i32) -> f64 {
-    integer_bits(i64::from(p))
+/// `x`'s entries as the 32-bit literals they are sent as.
+fn literal(x: &Array2<f64>) -> Array2<f64> {
+    x.mapv(|v| f64::from(v as f32))
 }
 
 /// What a block's description is fitted against on one choice of charts: the block's
@@ -495,61 +456,6 @@ impl<'a> Block<'a> {
     }
 }
 
-/// The best exponent of a scan: `cost(p)` is `(bits, KL bits)`, `None` when `p` is out of range.
-/// The lattice bits grow as it refines and the error they leave falls, so their sum is searched as
-/// unimodal in `p` (ternary search, each exponent costed once).
-fn scan(range: std::ops::RangeInclusive<i32>, mut cost: impl FnMut(i32) -> Option<(f64, f64)>) -> Option<(i32, f64)> {
-    let (start, end) = (*range.start(), *range.end());
-    if end < start {
-        return None;
-    }
-    let len = (end - start + 1) as usize;
-    let mut total = |n: usize| -> Result<f64, String> {
-        Ok(cost(start + n as i32).map_or(f64::INFINITY, |(b, k)| b + k)).map(|t| if t.is_nan() { f64::INFINITY } else { t })
-    };
-    let mut values: Vec<Option<f64>> = vec![None; len];
-    let mut memo = |n: usize| -> f64 {
-        if let Some(v) = values[n] {
-            return v;
-        }
-        let v = total(n).unwrap_or(f64::INFINITY);
-        values[n] = Some(v);
-        v
-    };
-    let n = minimize(len, &mut |n| Ok(memo(n))).ok()??;
-    Some((start + n as i32, memo(n)))
-}
-
-/// The exponent minimizing `exact` near the minimum of `surrogate` over `range`: the surrogate's scan
-/// ([`scan`]), then exact steps from its minimum toward the cheaper neighbour while it is cheaper,
-/// each exponent costed exactly once; where the exact cost cannot price the surrogate's minimum, the
-/// exact cost's own scan.
-fn refine(range: std::ops::RangeInclusive<i32>, surrogate: impl FnMut(i32) -> Option<(f64, f64)>, mut exact: impl FnMut(i32) -> Option<(f64, f64)>) -> Option<i32> {
-    let (start, end) = (*range.start(), *range.end());
-    let guess = scan(range.clone(), surrogate).map(|(p, _)| p);
-    let mut memo: HashMap<i32, f64> = HashMap::new();
-    let mut total = |p: i32| -> f64 {
-        if let Some(v) = memo.get(&p) {
-            return *v;
-        }
-        let v = exact(p).map_or(f64::INFINITY, |(b, k)| b + k);
-        let v = if v.is_nan() { f64::INFINITY } else { v };
-        memo.insert(p, v);
-        v
-    };
-    let Some(mut at) = guess.filter(|p| total(*p).is_finite()) else {
-        return scan(range, |p| Some((total(p), 0.0))).map(|(p, _)| p);
-    };
-    let inside = |p: i32| (start..=end).contains(&p);
-    let step = [-1, 1].into_iter().filter(|s| inside(at + s)).min_by(|x, y| total(at + x).total_cmp(&total(at + y)));
-    if let Some(step) = step {
-        while inside(at + step) && total(at + step) < total(at) {
-            at += step;
-        }
-    }
-    Some(at)
-}
-
 /// Up to `rank` pivot columns of `k` by greedy residual norm (maximum volume, column by column).
 fn pivots(k: &Array2<f64>, rank: usize) -> Vec<usize> {
     let mut residual = k.clone();
@@ -573,12 +479,10 @@ struct Coded {
     a: Array2<f64>,
     b: Array2<f64>,
     reals: usize,
-    /// The lattice integers' bits, and the rest (exponents, rank, pivots, flags).
+    /// The literals' bits, and the rest (rank, pivots, flags).
     real_bits: f64,
     structure_bits: f64,
     kl: f64,
-    /// The lattice exponents its reals were sent at.
-    exponents: Vec<i32>,
 }
 
 impl Coded {
@@ -589,8 +493,7 @@ impl Coded {
 
 /// The generic cores on `sides` of the ranks a search over `1..=max_rank` visits, each the metric's best (the whitened
 /// `M = G_p^{+1/2} H G_q^{+1/2} = A Bᵀ` truncated, its singular pairs from the `r × r` core
-/// `G_a^{1/2} G_b G_a^{1/2}` of `A`'s and `B`'s Grams) and coded in the pivot chart, its two
-/// exponents the minimum of bits plus error by coordinate descent.
+/// `G_a^{1/2} G_b G_a^{1/2}` of `A`'s and `B`'s Grams) and coded in the pivot chart.
 fn generic_cores(block: &Block<'_>, sides: &Sides, max_rank: usize) -> Result<Vec<Coded>, String> {
     let a = mm(&*sides.rp, &sides.hl);
     let b = mm(&*sides.rq, &sides.hr);
@@ -609,7 +512,7 @@ fn generic_cores(block: &Block<'_>, sides: &Sides, max_rank: usize) -> Result<Ve
     minimize(ranks, &mut |n| {
         if coded[n].is_none() {
             let z = decomposed.vectors.select(Axis(1), &order[..n + 1]);
-            match generic_core(block, sides, &mm(&left, &z), &mm(&right, &z), None) {
+            match generic_core(block, sides, &mm(&left, &z), &mm(&right, &z)) {
                 Ok(c) => coded[n] = Some(c),
                 Err(e) => {
                     failure = Some(e);
@@ -625,8 +528,8 @@ fn generic_cores(block: &Block<'_>, sides: &Sides, max_rank: usize) -> Result<Ve
     Ok(coded.into_iter().flatten().flatten().collect())
 }
 
-/// The generic core of rank `rank` on `sides` coded at the exponents `fixed` (no search).
-fn generic_core_at(block: &Block<'_>, sides: &Sides, rank: usize, fixed: &[i32]) -> Result<Option<Coded>, String> {
+/// The generic core of rank `rank` on `sides` (no search over the rank).
+fn generic_core_at(block: &Block<'_>, sides: &Sides, rank: usize) -> Result<Option<Coded>, String> {
     let a = mm(&*sides.rp, &sides.hl);
     let b = mm(&*sides.rq, &sides.hr);
     let (half, inverse_half) = roots(&mm(&a.t(), &a))?;
@@ -640,12 +543,13 @@ fn generic_core_at(block: &Block<'_>, sides: &Sides, rank: usize, fixed: &[i32])
     let z = decomposed.vectors.select(Axis(1), &order[..rank]);
     let left = mm(&mm(&*sides.rp, &mm(&a, &inverse_half)), &z);
     let right = mm(&mm(&*sides.rq, &mm(&b, &half)), &z);
-    generic_core(block, sides, &left, &right, Some(fixed))
+    generic_core(block, sides, &left, &right)
 }
 
 /// The core `K = K_l K_rᵀ` (rank `k` = their width) coded in the pivot chart `K = A Bᵀ`,
-/// `A = K_{:,π} = K_l K_r[π]ᵀ` and `B = K_r K_r[π]⁻¹`, the identity on the pivot rows `π`.
-fn generic_core(block: &Block<'_>, sides: &Sides, kl: &Array2<f64>, kr: &Array2<f64>, fixed: Option<&[i32]>) -> Result<Option<Coded>, String> {
+/// `A = K_{:,π} = K_l K_r[π]ᵀ` and `B = K_r K_r[π]⁻¹`, the identity on the pivot rows `π`: `A` and
+/// `B`'s free rows are its literals, the rank and the pivots its structure.
+fn generic_core(block: &Block<'_>, sides: &Sides, kl: &Array2<f64>, kr: &Array2<f64>) -> Result<Option<Coded>, String> {
     let (s_, t_) = (kl.nrows(), kr.nrows());
     let pivot = pivots(&kr.t().to_owned(), kr.ncols());
     let rank = pivot.len();
@@ -653,106 +557,17 @@ fn generic_core(block: &Block<'_>, sides: &Sides, kl: &Array2<f64>, kr: &Array2<
         return Ok(None);
     }
     let m = kr.select(Axis(0), &pivot);
-    let a = mm(kl, &m.t());
+    let a = literal(&mm(kl, &m.t()));
     let Ok(bt) = solve(m.t(), kr.t()) else { return Ok(None) };
-    let mut b = bt.reversed_axes();
+    let mut b = literal(&bt.reversed_axes());
     for (i, &j) in pivot.iter().enumerate() {
         b.row_mut(j).fill(0.0);
         b[[j, i]] = 1.0;
     }
-    let free: Vec<usize> = (0..t_).filter(|j| !pivot.contains(j)).collect();
-    let b_free = b.select(Axis(0), &free);
-    let rebuild = |b_free: &Array2<f64>| {
-        let mut full = b.clone();
-        for (i, &j) in free.iter().enumerate() {
-            full.row_mut(j).assign(&b_free.row(i));
-        }
-        full
-    };
-    let cost = |pa: i32, pb: i32| -> Option<(f64, f64, Array2<f64>, Array2<f64>)> {
-        let (qa, ba) = quantize(&a, pa)?;
-        let (qb, bb) = if free.is_empty() { (b_free.clone(), 0.0) } else { quantize(&b_free, pb)? };
-        let full = rebuild(&qb);
-        let kl = block.error_factored(sides, &qa, &full);
-        Some((ba + bb, kl, qa, full))
-    };
-    let exponent_cost = |pa: i32, pb: i32| exponent_bits(pa) + if free.is_empty() { 0.0 } else { exponent_bits(pb) };
-    let scale = block.scale;
-    // The scans' surrogate of a rounded factor's form: `x̃ = x + e` has
-    // `x̃ᵀ G x̃ = xᵀGx + eᵀ(Gx) + (eᵀ(Gx))ᵀ + eᵀGe`, all `O(d r²)` once `Gx` is formed but the last,
-    // which the surrogate takes on `G`'s diagonal (its mean under independent rounding errors). The
-    // exact form decides, at the surrogate's minimum and the neighbours it steps to ([`refine`]).
-    let (gpa, gqb) = (mm(&*sides.gp, &a), mm(&*sides.gq, &b));
-    let (aga, bgb) = (mm(&a.t(), &gpa), mm(&b.t(), &gqb));
-    let (dp, dq) = (sides.gp.diag().to_owned(), sides.gq.diag().to_owned());
-    let surrogate = |x: &Array2<f64>, gx: &Array2<f64>, xgx: &Array2<f64>, diagonal: &Array1<f64>, rounded: &Array2<f64>| -> Array2<f64> {
-        let e = rounded - x;
-        let cross = mm(&e.t(), gx);
-        let weighted = &e * &diagonal.view().insert_axis(Axis(1));
-        xgx + &cross + &cross.t() + &mm(&weighted.t(), &e)
-    };
-    // While one factor is held, the error is a quadratic in the other: its products with the held
-    // factor are formed once per scan, `w2 − 2 tr[(ÃᵀH_l)(H_rᵀB̃)ᵀ] + tr[(ÃᵀG_pÃ)(B̃ᵀG_qB̃)]`.
-    let scan_a = |pb: i32| -> Option<i32> {
-        let (qb, bb) = if free.is_empty() { (b_free.clone(), 0.0) } else { quantize(&b_free, pb)? };
-        let full = rebuild(&qb);
-        let (hb, gb) = (mm(&sides.hr.t(), &full), mm(&mm(&full.t(), &*sides.gq), &full));
-        let error = |qa: &Array2<f64>, form: &Array2<f64>| {
-            let cross = (mm(&qa.t(), &sides.hl) * &hb.t()).sum();
-            (block.w2 - 2.0 * cross + (form * &gb).sum()).max(0.0) * scale
-        };
-        refine(
-            exponents(&a),
-            |p| {
-                let (qa, ba) = quantize(&a, p)?;
-                Some((ba + bb + exponent_cost(p, pb), error(&qa, &surrogate(&a, &gpa, &aga, &dp, &qa))))
-            },
-            |p| {
-                let (qa, ba) = quantize(&a, p)?;
-                Some((ba + bb + exponent_cost(p, pb), error(&qa, &mm(&mm(&qa.t(), &*sides.gp), &qa))))
-            },
-        )
-    };
-    let scan_b = |pa: i32| -> Option<i32> {
-        let (qa, ba) = quantize(&a, pa)?;
-        let (ha, ga) = (mm(&qa.t(), &sides.hl), mm(&mm(&qa.t(), &*sides.gp), &qa));
-        let error = |full: &Array2<f64>, form: &Array2<f64>| {
-            let cross = (&ha * &mm(&full.t(), &sides.hr)).sum();
-            (block.w2 - 2.0 * cross + (&ga * form).sum()).max(0.0) * scale
-        };
-        refine(
-            exponents(&b_free),
-            |p| {
-                let (qb, bb) = quantize(&b_free, p)?;
-                let full = rebuild(&qb);
-                Some((ba + bb + exponent_cost(pa, p), error(&full, &surrogate(&b, &gqb, &bgb, &dq, &full))))
-            },
-            |p| {
-                let (qb, bb) = quantize(&b_free, p)?;
-                let full = rebuild(&qb);
-                Some((ba + bb + exponent_cost(pa, p), error(&full, &mm(&mm(&full.t(), &*sides.gq), &full))))
-            },
-        )
-    };
-    let (mut pa, mut pb) = match fixed {
-        Some(&[pa, pb]) => (pa, pb),
-        _ => (*exponents(&a).end(), *exponents(&b_free).end()),
-    };
-    for _ in 0..if fixed.is_some() { 0 } else { 2 } {
-        if let Some(p) = scan_a(pb) {
-            pa = p;
-        }
-        if !free.is_empty()
-            && let Some(p) = scan_b(pa)
-        {
-            pb = p;
-        }
-    }
-    let Some((bits, kl, qa, qb)) = cost(pa, pb) else { return Ok(None) };
-    let structure = exponent_cost(pa, pb)
-        + prefix_integer_len_bits(rank as u64).map_err(|e| e.to_string())? as f64
-        + subset_code_len_bits(t_, rank).map_err(|e| e.to_string())? as f64;
-    Ok(Some(Coded { a: qa, b: qb, reals: rank * (s_ + t_ - rank), real_bits: bits, structure_bits: structure, kl, exponents: vec![pa, pb] }))
+    let reals = rank * (s_ + t_ - rank);
+    let kl = block.error_factored(sides, &a, &b);
+    let structure = prefix_integer_len_bits(rank as u64).map_err(|e| e.to_string())? as f64 + subset_code_len_bits(t_, rank).map_err(|e| e.to_string())? as f64;
+    Ok(Some(Coded { a, b, reals, real_bits: LITERAL_BITS * reals as f64, structure_bits: structure, kl }))
 }
 
 /// One parameter of a linear core: entries `(i, j, c)` of `∂K/∂θ`.
@@ -760,7 +575,7 @@ type Placement = Vec<(usize, usize, f64)>;
 
 /// The core `K = Σ θ_p E_p` on `sides`, fitted in the metric (its normal equations) and coded at one
 /// exponent.
-fn linear_core(block: &Block<'_>, sides: &Sides, placements: &[Placement], structure: f64, fixed: Option<i32>) -> Result<Option<Coded>, String> {
+fn linear_core(block: &Block<'_>, sides: &Sides, placements: &[Placement], structure: f64) -> Result<Option<Coded>, String> {
     let m = placements.len();
     if m == 0 {
         return Ok(None);
@@ -780,7 +595,7 @@ fn linear_core(block: &Block<'_>, sides: &Sides, placements: &[Placement], struc
         }
     }
     let (inverse, _) = inverses(&gram)?;
-    let theta = inverse.dot(&rhs).insert_axis(Axis(1));
+    let theta = literal(&inverse.dot(&rhs).insert_axis(Axis(1)));
     // `K = Σ θ_p E_p` is linear in `θ`, so its error is `w2 − 2 θᵀ r + θᵀ G θ` on the placements'
     // Gram and right-hand side: exact, without forming `K`.
     let error = |q: &Array2<f64>| {
@@ -797,21 +612,9 @@ fn linear_core(block: &Block<'_>, sides: &Sides, placements: &[Placement], struc
         }
         k
     };
-    let cost = |p: i32| -> Option<(f64, f64, Array2<f64>)> {
-        let (q, bits) = quantize(&theta, p)?;
-        Some((bits, error(&q), q))
-    };
-    let p = match fixed {
-        Some(p) => p,
-        None => {
-            let Some((p, _)) = scan(exponents(&theta), |p| cost(p).map(|(b, k, _)| (b + exponent_bits(p), k))) else { return Ok(None) };
-            p
-        }
-    };
-    let Some((bits, kl, q)) = cost(p) else { return Ok(None) };
-    let k = core(&q);
+    let kl = error(&theta);
     // Factored as K̃ = K̃ · I.
-    Ok(Some(Coded { a: k, b: Array2::eye(t_), reals: m, real_bits: bits, structure_bits: structure + exponent_bits(p), kl, exponents: vec![p] }))
+    Ok(Some(Coded { a: core(&theta), b: Array2::eye(t_), reals: m, real_bits: LITERAL_BITS * m as f64, structure_bits: structure, kl }))
 }
 
 /// The chosen groups of two charts paired one to one, each writer group with the reader group of
@@ -945,7 +748,7 @@ impl Context<'_> {
                 kl_bits: coded.kl,
                 u,
                 v,
-                choice: Some(Choice { writer: i, writer_groups: wg.to_vec(), reader: j, reader_groups: rg.to_vec(), exponents: coded.exponents }),
+                choice: Some(Choice { writer: i, writer_groups: wg.to_vec(), reader: j, reader_groups: rg.to_vec() }),
             }
         };
         let mut best: Option<Description> = None;
@@ -966,10 +769,10 @@ impl Context<'_> {
         // The pairing, and a reflection flag per plane.
         let flags = pairing_bits(pairs.len()) + planes as f64;
         let mut reflections = vec![false; planes];
-        let mut current = linear_core(block, &sides, &rotation_placements(&pairs, &reflections), flags, None)?;
+        let mut current = linear_core(block, &sides, &rotation_placements(&pairs, &reflections), flags)?;
         for plane in 0..planes {
             reflections[plane] = true;
-            let trial = linear_core(block, &sides, &rotation_placements(&pairs, &reflections), flags, None)?;
+            let trial = linear_core(block, &sides, &rotation_placements(&pairs, &reflections), flags)?;
             let better = match (&trial, &current) {
                 (Some(t), Some(c)) => t.total() < c.total(),
                 (Some(_), None) => true,
@@ -984,7 +787,7 @@ impl Context<'_> {
         if let Some(coded) = current {
             offer(finish(coded, Core::Rotation { reflections }));
         }
-        if let Some(coded) = linear_core(block, &sides, &diagonal_placements(&pairs), pairing_bits(pairs.len()), None)? {
+        if let Some(coded) = linear_core(block, &sides, &diagonal_placements(&pairs), pairing_bits(pairs.len()))? {
             offer(finish(coded, Core::Diagonal));
         }
         Ok(best)
@@ -1128,30 +931,20 @@ impl Geometry {
 
     /// The block `uᵀ v` described as `λ` times a prediction `puᵀ pv` the decoder already holds (a
     /// rule's body bound to this block) plus the residual `uᵀ v − λ̃ puᵀ pv` described as any block
-    /// ([`Geometry::describe`]): `λ` is the metric's least-squares scale, sent on the lattice that
-    /// minimizes its bits plus the price of its rounding left in the residual's direction, and the
+    /// ([`Geometry::describe`]): `λ` is the metric's least-squares scale, one literal, and the
     /// residual absorbs whatever the scaled prediction misses, so a prediction that explains nothing
-    /// costs only the scale. What a rule saves is the residual's shorter reals.
+    /// costs only the scale. What a rule saves is the residual's literals.
     pub fn describe_predicted(&self, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>, pu: ArrayView2<'_, f64>, pv: ArrayView2<'_, f64>) -> Result<Predicted, String> {
         // ⟨A, B⟩ = tr(F A C Bᵀ) on factors: Σ (a_u F b_uᵀ) ∘ (a_v C b_vᵀ).
         let inner = |au: ArrayView2<'_, f64>, av: ArrayView2<'_, f64>, bu: ArrayView2<'_, f64>, bv: ArrayView2<'_, f64>| {
             (mm(&mm(&au, &self.metric.fisher), &bu.t()) * mm(&mm(&av, &self.metric.moment), &bv.t())).sum()
         };
         let (cross, own) = (inner(u, v, pu, pv), inner(pu, pv, pu, pv));
-        let scale = self.metric.scale();
-        let best = if own > 0.0 { cross / own } else { 0.0 };
-        let lambda = Array2::from_elem((1, 1), best);
-        let (p, _) = scan(exponents(&lambda), |p| {
-            let (q, bits) = quantize(&lambda, p)?;
-            Some((bits + exponent_bits(p), (q[[0, 0]] - best).powi(2) * own * scale))
-        })
-        .ok_or("no lattice holds the prediction's scale")?;
-        let (q, bits) = quantize(&lambda, p).ok_or("no lattice holds the prediction's scale")?;
-        let sent = q[[0, 0]];
+        let sent = f64::from((if own > 0.0 { cross / own } else { 0.0 }) as f32);
         let ru = ndarray::concatenate(Axis(0), &[u, (&pu * -sent).view()]).map_err(|e| e.to_string())?;
         let rv = ndarray::concatenate(Axis(0), &[v, pv]).map_err(|e| e.to_string())?;
         let residual = self.describe(ru.view(), rv.view())?;
-        Ok(Predicted { scale: sent, scale_bits: bits + exponent_bits(p), residual, prediction: (pu.to_owned(), pv.to_owned()) })
+        Ok(Predicted { scale: sent, scale_bits: LITERAL_BITS, residual, prediction: (pu.to_owned(), pv.to_owned()) })
     }
 
     /// The cheapest description of the block `uᵀ v` (`u` is `r × d_out`, `v` is `r × d_in`), of rank
@@ -1179,7 +972,7 @@ impl Geometry {
     ) -> Result<Description, String> {
         // Every family, then the identity charts alone: a chart whose error the local metric cannot
         // see (a reader outside a ReLU's active set, a direction only the decoded upstream excites)
-        // is never repaired by a larger price, while the identity converges as precision grows.
+        // is never repaired by a larger price, while the identity converges as its rank grows.
         let mut best: Option<Description> = None;
         // The identity-only pass repeats the first when the site has no other chart.
         let passes: &[bool] = if self.writers.len() == 1 && self.readers.len() == 1 { &[true] } else { &[true, false] };
@@ -1214,7 +1007,7 @@ impl Geometry {
         Ok((charts, fixed_index_len_bits(3).map_err(|e| e.to_string())? as f64))
     }
 
-    /// The block `uᵀ v` sent in `previous`'s family at its precision, with no search: `None` when
+    /// The block `uᵀ v` sent in `previous`'s family, with no search over families: `None` when
     /// that family no longer holds it (a rank it no longer resolves, a pairing or pivot that fails)
     /// or `previous` is the empty description.
     pub fn recode(&self, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>, previous: &Description, calibration: f64) -> Result<Option<Description>, String> {
@@ -1224,7 +1017,7 @@ impl Geometry {
         let (wg, rg) = (choice.writer_groups.as_slice(), choice.reader_groups.as_slice());
         let sides = block.sides(writer, wg, reader, rg)?;
         let coded = match &previous.core {
-            Core::Generic { rank } => generic_core_at(&block, &sides, *rank, &choice.exponents)?,
+            Core::Generic { rank } => generic_core_at(&block, &sides, *rank)?,
             core => {
                 let Some(pairs) = paired(&writer.chart, wg, &reader.chart, rg, &sides)? else { return Ok(None) };
                 let (placements, flags) = match core {
@@ -1234,7 +1027,7 @@ impl Geometry {
                     }
                     _ => (diagonal_placements(&pairs), pairing_bits(pairs.len())),
                 };
-                linear_core(&block, &sides, &placements, flags, choice.exponents.first().copied())?
+                linear_core(&block, &sides, &placements, flags)?
             }
         };
         let Some(coded) = coded else { return Ok(None) };
@@ -1251,7 +1044,7 @@ impl Geometry {
             kl_bits: coded.kl,
             u: du,
             v: dv,
-            choice: Some(Choice { exponents: coded.exponents, ..choice.clone() }),
+            choice: Some(choice.clone()),
         }))
     }
 
@@ -1418,7 +1211,7 @@ impl Structured {
     }
 
     /// The description of block `index` of site `site`, from its last one when it can: re-sent in
-    /// that family at that precision ([`Geometry::recode`]), and searched afresh only when the
+    /// that family ([`Geometry::recode`]), and searched afresh only when the
     /// family no longer holds the block or the re-sent total has grown by more than the family's own
     /// structure bits (all a fresh search could re-allocate without changing the reals' count). A
     /// library that trains by small steps is so re-priced at the cost of one coding, not a search.

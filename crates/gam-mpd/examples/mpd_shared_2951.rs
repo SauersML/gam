@@ -10,12 +10,11 @@
 //! (`C^{1/2} (Σ_c (u_cᵀ F u_c) v_c v_cᵀ) C^{1/2}`, mapped back by `C^{+1/2}`), for `r` doubling up to
 //! the node's width. Every column is described with the basis as a reader chart beside the site's
 //! declared ones (`gam_mpd::describe::Chart::frames`, a column naming the directions it uses), and a
-//! direction is sent once, on its users' finest reader lattice. Library once: every column's
-//! description plus the directions used; per word, each direction the on columns use once plus
-//! their descriptions; both against every column described alone, for each `r`.
+//! direction is sent once, its entries as literals. Library once: every column's description plus
+//! the directions used; per token, each direction the on columns use once plus their descriptions;
+//! both against every column described alone, for each `r`.
 
-use gam_mpd::codec::signed_delta_len_bits;
-use gam_mpd::describe::{Chart, Description, Geometry, Metric, declared_charts};
+use gam_mpd::describe::{Chart, Description, Geometry, LITERAL_BITS, Metric, declared_charts};
 use gam_mpd::import::import_language_model;
 use gam_mpd::masked::{matrix, sites};
 use gam_mpd::site_fit::samples;
@@ -152,28 +151,14 @@ fn main() -> Result<(), String> {
             with_basis.push(chart.clone());
             shared.push(describe_all(&Geometry::new(metrics[k].clone(), writers.clone(), with_basis)?, &libraries[k])?);
         }
-        // Each direction once, on its users' finest reader lattice (the reader exponent of a user
-        // described alone), scaled to a unit largest entry as the pivot chart scales a reader.
-        let mut finest = vec![i32::MIN; r];
-        for (d, a) in shared.iter().flatten().zip(alone.iter().flatten()).filter(|(d, _)| d.reader.0 == "shared basis") {
+        // Each direction a basis user names is sent once, its d entries as literals.
+        let mut named = vec![false; r];
+        for d in shared.iter().flatten().filter(|d| d.reader.0 == "shared basis") {
             for j in d.reader.1.iter().filter_map(|m| m.first()) {
-                if let Some(p) = a.choice.as_ref().and_then(|c| c.reader_exponent()) {
-                    finest[*j] = finest[*j].max(p);
-                }
+                named[*j] = true;
             }
         }
-        let direction_bits: Vec<f64> = (0..r)
-            .map(|j| {
-                if finest[j] == i32::MIN {
-                    return 0.0;
-                }
-                let column = directions.column(j);
-                let top = column.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
-                let scale = 2f64.powi(finest[j]) / top;
-                column.iter().map(|x| signed_delta_len_bits((x * scale).round() as i64).map_or(f64::INFINITY, |b| b as f64)).sum::<f64>()
-                    + signed_delta_len_bits(i64::from(finest[j])).map_or(0.0, |b| b as f64)
-            })
-            .collect();
+        let direction_bits: Vec<f64> = named.iter().map(|n| if *n { LITERAL_BITS * directions.nrows() as f64 } else { 0.0 }).collect();
         let used = |d: &Description| -> Vec<usize> { if d.reader.0 == "shared basis" { d.reader.1.iter().filter_map(|m| m.first().copied()).collect() } else { Vec::new() } };
         let once = shared.iter().flatten().map(Description::total).sum::<f64>() + direction_bits.iter().sum::<f64>();
         let mut per_word = 0.0;
@@ -192,10 +177,10 @@ fn main() -> Result<(), String> {
             100.0 * (once - before_once) / before_once,
             100.0 * (per_word - before_word) / before_word,
             shared.iter().map(Vec::len).sum::<usize>(),
-            finest.iter().filter(|p| **p > i32::MIN).count(),
+            named.iter().filter(|n| **n).count(),
             started.elapsed().as_secs_f64()
         );
-        scans.push(json!({"directions": r, "once_bits": once, "per_word_bits": per_word, "columns_binding": taking, "directions_used": finest.iter().filter(|p| **p > i32::MIN).count()}));
+        scans.push(json!({"directions": r, "once_bits": once, "per_word_bits": per_word, "columns_binding": taking, "directions_used": named.iter().filter(|n| **n).count()}));
         r *= 2;
     }
     let report = json!({
