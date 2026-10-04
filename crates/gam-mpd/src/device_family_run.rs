@@ -7,7 +7,7 @@ use super::{
 };
 use gam_gpu::tensor::Device;
 use ndarray::{Array2, s};
-use std::{collections::BTreeMap, sync::OnceLock};
+use std::sync::OnceLock;
 
 #[path = "streamed_family_run.rs"]
 mod streamed;
@@ -191,18 +191,10 @@ impl RunCheck for DeviceFamilyRun<'_> {
         let interfaces = artifact.program.interfaces().map_err(|e| e.to_string())?;
         let mut scores = Vec::new();
         for (episode, reference) in self.run.episodes.iter().zip(references) {
-            let mut held: BTreeMap<usize, Vec<&Edit>> = BTreeMap::new();
-            let mut unheld = 0;
-            for e in &episode.edits {
-                match artifact.place(e.node) {
-                    Some(n) => {
-                        validate_edits(std::slice::from_ref(e), self.run.family.rows, |_| {
-                            interfaces.get(n).map(|i| i.width())
-                        })?;
-                        held.entry(n).or_default().push(e);
-                    }
-                    None => unheld += 1,
-                }
+            let mapped = crate::native_control::map_edits(artifact, &episode.edits)?;
+            let (held, unheld) = (mapped.edits, mapped.unheld);
+            for (&node, edits) in &held {
+                validate_edits(edits, self.run.family.rows, |_| interfaces.get(node).map(|i| i.width()))?;
             }
             let forward_timer = Timer::start(&self.timers.forward);
             let trace = resident.forward_edited(&self.run.family, |node, trace| {
@@ -213,7 +205,7 @@ impl RunCheck for DeviceFamilyRun<'_> {
                     .device
                     .download(resident.root_value(trace, node)?)
                     .map_err(|e| e.to_string())?;
-                apply(edits, &mut value);
+                apply(&edits.iter().collect::<Vec<_>>(), &mut value);
                 Ok(Some(
                     self.device
                         .upload(value.view())

@@ -51,6 +51,9 @@
 //!    law as a fixed index into the laws, the law's source operators as fixed indices and its
 //!    integers (`+ 1`) in the prefix code, the scale's 32 bits, and its residual rows: count `+ 1`,
 //!    each row as a fixed index into the operator's rows and its values' 32 bits each.
+//! 7. only in grammar version 3, explicit native control bindings: positive count,
+//!    law tag, native source/write indices, explanatory write index, and source width.
+//!    Empty bindings keep the previous byte format and intervention semantics.
 //!
 //! [`Artifact::decode`] reads it back given only the declarations; nothing of the native model, of a
 //! fit or of a discovery is read. The names are labels: they are sent so a decoded artifact reports
@@ -142,6 +145,7 @@ pub enum OperatorLaw {
 const LAWS: usize = 2; // Legacy template language: never change this alphabet.
 const MATRIX_LAWS: usize = 3;
 const MATRIX_ARTIFACT_VERSION: u64 = 2;
+const CONTROL_ARTIFACT_VERSION: u64 = 3;
 const VERSIONED_ENVELOPE: u64 = u64::MAX;
 
 impl OperatorLaw {
@@ -320,6 +324,8 @@ pub struct Artifact {
     pub exceptions: Vec<Exception>,
     /// In an order in which every source precedes what reads it.
     pub derived: Vec<Derived>,
+    /// Explicitly priced native intervention-response laws; empty retains legacy semantics.
+    pub controls: Vec<crate::native_control::UniformScaleBinding>,
 }
 
 /// Old to new indices of the kept entries (`usize::MAX` for a removed one).
@@ -544,6 +550,20 @@ fn round_coefficient(coefficient: &mut Coefficient) {
 }
 
 impl Artifact {
+    /// Add a paid response law for uniform scaling of a wholly omitted native
+    /// interface through its exclusive homogeneous linear write. Validation
+    /// checks the native graph; execution needs only the serialized binding.
+    /// Partial-coordinate actions remain unsupported by this law.
+    pub fn with_uniform_scale_control(&self, model: &OperatorProgram, native_source: usize, native_write: usize) -> Result<Self, String> {
+        let write = self.place(native_write).ok_or("control boundary is not held")?;
+        let width = model.node_interface(native_source).map_err(|e|e.to_string())?.width();
+        let mut out = self.clone();
+        out.controls.push(crate::native_control::UniformScaleBinding { native_source, native_write, write, width });
+        out.controls.sort_by_key(|c| c.native_source);
+        crate::native_control::validate(&out, model)?;
+        Ok(out)
+    }
+
     /// The native model as its own explanation: every node a place, no block replaced.
     pub fn native(model: &OperatorProgram) -> Result<Self, String> {
         model.interfaces().map_err(|e| e.to_string())?;
@@ -554,6 +574,7 @@ impl Artifact {
             places: (0..model.nodes.len()).map(|n| (n, n)).collect(),
             exceptions: Vec::new(),
             derived: Vec::new(),
+            controls: Vec::new(),
         })
     }
 
@@ -674,6 +695,7 @@ impl Artifact {
     /// Names, provenance and lattice metadata do not affect executable operators.
     pub fn validate_coverage(&self, model: &OperatorProgram) -> Result<(), String> {
         use std::collections::BTreeSet;
+        crate::native_control::validate(self, model)?;
         if model.nodes.len() != self.native_nodes || model.declarations != self.program.declarations {
             return Err("the artifact is not of this model".to_string());
         }
@@ -892,7 +914,8 @@ impl Artifact {
             write: at_new(call).ok_or_else(|| format!("{name}: the call is not read"))?,
         });
         let exceptions = self.exceptions.iter().filter_map(|e| at(e.node).map(|node| Exception { node, ..e.clone() })).collect();
-        let artifact = Self { program, native_nodes: self.native_nodes, blocks, places, exceptions, derived };
+        let controls = self.controls.iter().filter_map(|c| at(c.write).map(|write| crate::native_control::UniformScaleBinding { write, ..c.clone() })).filter(|c| blocks.iter().any(|b| b.native_write == c.native_write && b.write == c.write)).collect();
+        let artifact = Self { program, native_nodes: self.native_nodes, blocks, places, exceptions, derived, controls };
         artifact.program.interfaces().map_err(|e| format!("{name}: {e}"))?;
         Ok(artifact)
     }
@@ -924,7 +947,7 @@ impl Artifact {
         let derived = self.renumbered_derived(&op_map)?;
         let at = |node: usize| Some(live[node]).filter(|n| *n != usize::MAX);
         let places = self.places.iter().filter_map(|&(n, node)| at(node).map(|m| (n, m))).collect();
-        let blocks = self
+        let blocks: Vec<Binding> = self
             .blocks
             .iter()
             .filter_map(|b| {
@@ -933,7 +956,8 @@ impl Artifact {
             })
             .collect();
         let exceptions = self.exceptions.iter().filter_map(|e| at(e.node).map(|node| Exception { node, ..e.clone() })).collect();
-        Ok(Self { program, native_nodes: self.native_nodes, blocks, places, exceptions, derived })
+        let controls = self.controls.iter().filter_map(|c| at(c.write).map(|write| crate::native_control::UniformScaleBinding { write, ..c.clone() })).filter(|c| blocks.iter().any(|b| b.native_write == c.native_write && b.write == c.write)).collect();
+        Ok(Self { program, native_nodes: self.native_nodes, blocks, places, exceptions, derived, controls })
     }
 
     /// Whether learned operator and coefficient literals are 32-bit floats.
@@ -1143,15 +1167,17 @@ impl Artifact {
         }
         exceptions.retain(|e| e.node != usize::MAX);
         out.interfaces().map_err(|e| e.to_string())?;
-        Ok((Self { program: out, native_nodes: self.native_nodes, blocks: Vec::new(), places: Vec::new(), exceptions, derived: Vec::new() }, columns, writes))
+        Ok((Self { program: out, native_nodes: self.native_nodes, blocks: Vec::new(), places: Vec::new(), exceptions, derived: Vec::new(), controls: Vec::new() }, columns, writes))
     }
 
     /// Numeric-free blocks, places, exceptions and derivation structure, excluding
     /// diagnostic names. Exception values, derived scales and residual values are
     /// independently priced at 32 bits each by C32, outside this binding remainder.
     pub fn binding_bits(&self) -> Result<u64, String> {
+        crate::native_control::validate_shape(self)?;
         let bodies = self.matrix_rules()?;
-        let versioned = !bodies.is_empty();
+        let versioned = !bodies.is_empty() || !self.controls.is_empty();
+        let version = if self.controls.is_empty() { MATRIX_ARTIFACT_VERSION } else { CONTROL_ARTIFACT_VERSION };
         let nodes = self.program.nodes.len();
         let fixed = |alphabet: usize| -> Result<u64, String> { Ok(u64::from(fixed_index_len_bits(alphabet).map_err(codec)?)) };
         let prefix = |value: u64| prefix_integer_len_bits(value).map_err(codec);
@@ -1173,7 +1199,7 @@ impl Artifact {
         let operators = self.program.operators.len();
         if versioned {
             // Internal dispatch marker, explicit format version and body-pool framing.
-            bits += prefix(1)? + prefix(MATRIX_ARTIFACT_VERSION)? + prefix(bodies.len() as u64 + 1)?;
+            bits += prefix(1)? + prefix(version)? + prefix(bodies.len() as u64 + 1)?;
             for (message, body) in &bodies { bits += prefix(message.len_bits() + 1)? + body.cost()?.structure_bits; }
         }
         bits += prefix(self.derived.len() as u64 + 1)?;
@@ -1184,6 +1210,14 @@ impl Artifact {
                 bits += prefix(integer + 1)?;
             }
             bits += prefix(d.residual.len() as u64 + 1)? + d.residual.len() as u64 * fixed(self.program.operators[d.operator].rows.width())?;
+        }
+        if !self.controls.is_empty() {
+            crate::native_control::validate_shape(self)?;
+            bits += prefix(self.controls.len() as u64 + 1)?;
+            for c in &self.controls {
+                bits += prefix(1)? + 2 * fixed(self.native_nodes)? + fixed(nodes)?
+                    + prefix((c.width as u64).checked_add(1).ok_or("control width overflow")?)?;
+            }
         }
         Ok(bits)
     }
@@ -1199,8 +1233,10 @@ impl Artifact {
     }
 
     fn encode_using(&self, cache: Option<&crate::operator_program::NativeOperatorCodec>) -> Result<BitString, String> {
+        crate::native_control::validate_shape(self)?;
         let bodies = self.matrix_rules()?;
-        let versioned = !bodies.is_empty();
+        let versioned = !bodies.is_empty() || !self.controls.is_empty();
+        let version = if self.controls.is_empty() { MATRIX_ARTIFACT_VERSION } else { CONTROL_ARTIFACT_VERSION };
         let source = self.message_program()?;
         let program = match cache {
             Some(cache) => source.encode_with_native_codec(cache),
@@ -1210,7 +1246,7 @@ impl Artifact {
         let mut out = BitString::new();
         if versioned {
             encode_prefix_integer(&mut out, 1).map_err(codec)?; // Invalid zero native-node count in legacy grammar.
-            encode_prefix_integer(&mut out, MATRIX_ARTIFACT_VERSION).map_err(codec)?;
+            encode_prefix_integer(&mut out, version).map_err(codec)?;
         }
         encode_prefix_integer(&mut out, self.native_nodes as u64 + 1).map_err(codec)?;
         encode_prefix_integer(&mut out, program.len_bits() + 1).map_err(codec)?;
@@ -1284,6 +1320,16 @@ impl Artifact {
                 }
             }
         }
+        if !self.controls.is_empty() {
+            encode_prefix_integer(&mut out, self.controls.len() as u64 + 1).map_err(codec)?;
+            for c in &self.controls {
+                encode_prefix_integer(&mut out, 1).map_err(codec)?; // UniformScaleThroughLinearWrite.
+                encode_fixed_index(&mut out, c.native_source, self.native_nodes).map_err(codec)?;
+                encode_fixed_index(&mut out, c.native_write, self.native_nodes).map_err(codec)?;
+                encode_fixed_index(&mut out, c.write, nodes).map_err(codec)?;
+                encode_prefix_integer(&mut out, (c.width as u64).checked_add(1).ok_or("control width overflow")?).map_err(codec)?;
+            }
+        }
         Ok(out)
     }
 
@@ -1310,11 +1356,11 @@ impl Artifact {
         };
         let first = decode_prefix_integer(reader).map_err(codec)?;
         let versioned = first == 1;
-        let native_code = if versioned {
-            let version = decode_prefix_integer(reader).map_err(codec)?;
-            if version != MATRIX_ARTIFACT_VERSION { return Err(format!("unsupported artifact grammar version {version}")); }
-            decode_prefix_integer(reader).map_err(codec)?
-        } else { first };
+        let version = if versioned { decode_prefix_integer(reader).map_err(codec)? } else { 0 };
+        if versioned && version != MATRIX_ARTIFACT_VERSION && version != CONTROL_ARTIFACT_VERSION {
+            return Err(format!("unsupported artifact grammar version {version}"));
+        }
+        let native_code = if versioned { decode_prefix_integer(reader).map_err(codec)? } else { first };
         let native_nodes = usize::try_from(native_code.checked_sub(1).ok_or("a zero count codeword")?).map_err(|e| e.to_string())?;
         if native_nodes == 0 {
             return Err("a native model of no nodes".to_string());
@@ -1382,7 +1428,7 @@ impl Artifact {
                 if bodies.iter().any(|(previous, _)| *previous == message) { return Err("duplicate shared matrix-rule body".into()); }
                 bodies.push((message, Arc::new(body)));
             }
-            if bodies.is_empty() { return Err("a versioned matrix artifact has no rule bodies".into()); }
+            if bodies.is_empty() && version == MATRIX_ARTIFACT_VERSION { return Err("a versioned matrix artifact has no rule bodies".into()); }
         }
         let mut used_bodies = std::collections::BTreeSet::new();
         let mut derived = Vec::new();
@@ -1410,7 +1456,21 @@ impl Artifact {
         if versioned {
             if used_bodies.len() != bodies.len() { return Err("unused shared matrix-rule body".into()); }
             // Validation uses only this decoded program and explicit bodies.
-            Self { program: program.clone(), native_nodes, blocks: Vec::new(), places: Vec::new(), exceptions: Vec::new(), derived: derived.clone() }.matrix_rules()?;
+            Self { program: program.clone(), native_nodes, blocks: Vec::new(), places: Vec::new(), exceptions: Vec::new(), derived: derived.clone(), controls: Vec::new() }.matrix_rules()?;
+        }
+        let mut controls = Vec::new();
+        if version == CONTROL_ARTIFACT_VERSION {
+            let n = count(reader)?;
+            if n == 0 || n > native_nodes { return Err("invalid control binding count".into()); }
+            for _ in 0..n {
+                let tag = decode_prefix_integer(reader).map_err(codec)?;
+                if tag != 1 { return Err(format!("unsupported native control law {tag}")); }
+                let native_source = decode_fixed_index(reader, native_nodes).map_err(codec)?;
+                let native_write = decode_fixed_index(reader, native_nodes).map_err(codec)?;
+                let write = decode_fixed_index(reader, nodes).map_err(codec)?;
+                let width = usize::try_from(decode_prefix_integer(reader).map_err(codec)?.checked_sub(1).ok_or("zero control width codeword")?).map_err(|e|e.to_string())?;
+                controls.push(crate::native_control::UniformScaleBinding { native_source, native_write, write, width });
+            }
         }
         compute_derived(&mut program, &derived)?;
         if reader.remaining_bits() != 0 {
@@ -1419,7 +1479,9 @@ impl Artifact {
         if places.windows(2).any(|w| w[0].0 >= w[1].0) {
             return Err("places out of order".to_string());
         }
-        Ok(Self { program, native_nodes, blocks, places, exceptions, derived })
+        let artifact = Self { program, native_nodes, blocks, places, exceptions, derived, controls };
+        crate::native_control::validate_shape(&artifact)?;
+        Ok(artifact)
     }
 
     /// The message as bytes: its bit length (8 bytes, little-endian), then its bits, most
@@ -1427,9 +1489,10 @@ impl Artifact {
     pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
         let message = self.encode()?;
         let mut out = Vec::with_capacity(8 + message.packed_bytes().len());
-        if !self.matrix_rules()?.is_empty() {
+        if !self.matrix_rules()?.is_empty() || !self.controls.is_empty() {
+            let version = if self.controls.is_empty() { MATRIX_ARTIFACT_VERSION } else { CONTROL_ARTIFACT_VERSION };
             out.extend_from_slice(&VERSIONED_ENVELOPE.to_le_bytes());
-            out.extend_from_slice(&MATRIX_ARTIFACT_VERSION.to_le_bytes());
+            out.extend_from_slice(&version.to_le_bytes());
         }
         out.extend_from_slice(&message.len_bits().to_le_bytes());
         out.extend_from_slice(message.packed_bytes());
@@ -1440,18 +1503,21 @@ impl Artifact {
     pub fn from_bytes(bytes: &[u8], declarations: &Declarations) -> Result<Self, String> {
         let header: [u8; 8] = bytes.get(..8).ok_or("no length header")?.try_into().map_err(|_| "no length header")?;
         let first = u64::from_le_bytes(header);
-        let (length, offset, versioned) = if first == VERSIONED_ENVELOPE {
+        let (length, offset, version) = if first == VERSIONED_ENVELOPE {
             let version = u64::from_le_bytes(bytes.get(8..16).ok_or("truncated artifact version")?.try_into().map_err(|_| "invalid artifact version")?);
-            if version != MATRIX_ARTIFACT_VERSION { return Err(format!("unsupported artifact envelope version {version}")); }
+            if version != MATRIX_ARTIFACT_VERSION && version != CONTROL_ARTIFACT_VERSION { return Err(format!("unsupported artifact envelope version {version}")); }
             let length = u64::from_le_bytes(bytes.get(16..24).ok_or("truncated artifact length")?.try_into().map_err(|_| "invalid artifact length")?);
-            (length, 24, true)
-        } else { (first, 8, false) };
+            (length, 24, version)
+        } else { (first, 8, 0) };
         if length.div_ceil(8) != (bytes.len() - offset) as u64 {
             return Err(format!("{} message bits in {} bytes", length, bytes.len() - offset));
         }
         let message = BitString::from_packed(&bytes[offset..], length).map_err(codec)?;
-        let internal_versioned = decode_prefix_integer(&mut message.reader()).map_err(codec)? == 1;
-        if internal_versioned != versioned { return Err("artifact envelope and internal grammar version disagree".into()); }
+        let mut grammar = message.reader();
+        let internal_version = if decode_prefix_integer(&mut grammar).map_err(codec)? == 1 {
+            decode_prefix_integer(&mut grammar).map_err(codec)?
+        } else { 0 };
+        if internal_version != version { return Err("artifact envelope and internal grammar version disagree".into()); }
         Self::decode(&message, declarations)
     }
 }
@@ -1503,6 +1569,10 @@ impl DecodableArtifact for EncodedArtifact {
 #[cfg(test)]
 #[path = "matrix_artifact_tests.rs"]
 mod matrix_artifact_tests;
+
+#[cfg(test)]
+#[path = "control_artifact_tests.rs"]
+mod control_artifact_tests;
 
 #[cfg(test)]
 mod borrowed_program_decode_tests {

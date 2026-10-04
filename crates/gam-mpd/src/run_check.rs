@@ -291,8 +291,19 @@ fn add_input_spec(
 
 struct MappedEdits {
     held: Vec<(usize, NodeEdit)>,
+    /// Omitted upstream controls must act before ordinary edits at their boundary.
+    pre_write: Vec<(usize, NodeEdit)>,
     /// Native edited places this action leaves clean in P.
     unheld: usize,
+}
+
+/// Preserve source-local order, then native write-local order. These phases
+/// follow the native graph, not the order unrelated actions appear in a list.
+fn prepend_controls(edits: &mut BTreeMap<usize, Vec<NodeEdit>>, controls: BTreeMap<usize, Vec<NodeEdit>>) {
+    for (node, mut before) in controls {
+        if let Some(mut after) = edits.remove(&node) { before.append(&mut after); }
+        edits.insert(node, before);
+    }
 }
 
 /// Execution-only edge forks: edits of one site's input must not spill to siblings.
@@ -448,6 +459,9 @@ fn fork_inputs(
     for (_, own) in &mut out.places {
         *own = map[*own];
     }
+    for control in &mut out.controls {
+        control.write = map[control.write];
+    }
     for block in &mut out.blocks {
         for read in &mut block.reads {
             *read = map[*read];
@@ -475,7 +489,7 @@ fn site_edits(
     let nodes = layers.get(layer).ok_or_else(|| format!("site {site} beyond the decoder"))?;
     let place = |native: usize| artifact.place(native);
     let input_place = |native: usize| forks.get(&(site, native)).copied();
-    let mut mapped = MappedEdits { held: Vec::new(), unheld: 0 };
+    let mut mapped = MappedEdits { held: Vec::new(), pre_write: Vec::new(), unheld: 0 };
     match action {
         Action::Input { change: InputChange::Scale { rows, cols: (a, b), scale }, .. } => {
             let (native, columns) = match kind {
@@ -497,7 +511,16 @@ fn site_edits(
                     }
                     mapped.held.push((node, NodeEdit::Scale { rows: *rows, columns, scale: *scale }));
                 }
-                None if place(native).is_none() => mapped.unheld = 1,
+                None if place(native).is_none() => {
+                    if let Some(control) = artifact.controls.iter().find(|c| c.native_source == native)
+                        && columns == (0..control.width)
+                    {
+                        let width = artifact.program.node_interface(control.write).map_err(|e|e.to_string())?.width();
+                        mapped.pre_write.push((control.write, NodeEdit::Scale { rows: *rows, columns: 0..width, scale: *scale }));
+                    } else {
+                        mapped.unheld = 1;
+                    }
+                },
                 None => {
                     return Err(format!("site {site}: held scale input has no executable fork"));
                 }
@@ -1063,6 +1086,7 @@ impl<'a> LanguageRun<'a> {
     /// the unembedding after it must be places of `P` computing the native nodes with the same
     /// operators.
     fn truncated(&self, artifact: &Artifact) -> Result<(Artifact, Vec<usize>), String> {
+        crate::native_control::validate(artifact, self.native)?;
         let last = self.layers.last().ok_or("no layer")?.residual;
         check_native_tail(self.native, artifact, last)?;
         let program = if self.device.is_some() { artifact.clone() } else { artifact.truncated(last)? };
@@ -1164,10 +1188,12 @@ impl LanguageRun<'_> {
             let (episode_program, forks, map) = fork_inputs(&program, &specs)?;
             let episode_residuals: Vec<_> = residuals.iter().map(|n| map[*n]).collect();
             let mut edits: BTreeMap<usize, Vec<NodeEdit>> = BTreeMap::new();
+            let mut controls: BTreeMap<usize, Vec<NodeEdit>> = BTreeMap::new();
             let mut unheld = 0;
             for action in &episode.actions {
                 let mapped = self.edits(&episode_program, &program, &forks, action, head_dim)?;
                 unheld += mapped.unheld;
+                for (node, edit) in mapped.pre_write { controls.entry(node).or_default().push(edit); }
                 for (node, edit) in mapped.held {
                     if let (NodeEdit::Mix { donor, .. }, Some(d)) = (&edit, episode.donor) {
                         let keys = wanted.entry(d).or_default();
@@ -1178,6 +1204,7 @@ impl LanguageRun<'_> {
                     edits.entry(node).or_default().push(edit);
                 }
             }
+            prepend_controls(&mut edits, controls);
             plans.push((episode_program, episode_residuals, edits, unheld));
         }
         drop(planning_timer);
@@ -1384,14 +1411,18 @@ mod input_mix_tests {
         let clean_donor = artifact.execute(&family(6.0)).unwrap();
         let mut edits = BTreeMap::new();
         let mut donor = BTreeMap::new();
+        let mut controls: BTreeMap<usize, Vec<NodeEdit>> = BTreeMap::new();
         for action in actions {
-            for (node, edit) in site_edits(layers, &program, artifact, &forks, action, 1).unwrap().held {
+            let mapped = site_edits(layers, &program, artifact, &forks, action, 1).unwrap();
+            for (node, edit) in mapped.pre_write { controls.entry(node).or_default().push(edit); }
+            for (node, edit) in mapped.held {
                 if let NodeEdit::Mix { donor: key, .. } = &edit {
                     donor.insert(*key, clean_donor.values[key.node].row(key.row).to_owned());
                 }
                 edits.entry(node).or_insert_with(Vec::new).push(edit);
             }
         }
+        prepend_controls(&mut edits, controls);
         let trace = program.execute_edited(&family(2.0), |node, value, earlier| apply_node_edits(node, value, earlier, &edits, &donor)).unwrap();
         (trace.values[program.place(layers[0].mlp).unwrap()].clone(), trace.values[program.place(layers[0].keys[0]).unwrap()].clone())
     }
@@ -1484,6 +1515,51 @@ mod input_mix_tests {
         let missing = site_edits(&layers, &program, &artifact, &forks, &omitted, 1).unwrap();
         assert_eq!(missing.unheld, 1);
         assert!(missing.held.is_empty());
+    }
+
+    #[test]
+    fn paid_omitted_scale_precedes_write_mix_in_either_episode_order() {
+        let (native, plain, layers) = composed_mlp(false);
+        let artifact = plain.with_uniform_scale_control(&native, 2, 3).unwrap();
+        for scale in [0.0, 2.0] {
+            let source = Action::Input { site: 5, change: InputChange::Scale { rows: Rows::All, cols: (0, 1), scale } };
+            let write = Action::Output { site: 5, change: OutputChange::Mix { row: 0, alpha: 0.5 } };
+            for actions in [[source.clone(), write.clone()], [write.clone(), source.clone()]] {
+                let (value, sibling) = execute(&actions, &artifact, &layers);
+                assert_eq!(value[[0, 0]], scale + 3.0);
+                assert_eq!(sibling[[0, 0]], 2.0);
+                assert_eq!(execute(&actions, &plain, &layers).0[[0, 0]], 4.0);
+            }
+        }
+    }
+
+    #[test]
+    fn paid_control_follows_write_when_upstream_input_is_forked() {
+        let (native, plain, layers) = composed_mlp(false);
+        let artifact = plain.with_uniform_scale_control(&native, 2, 3).unwrap();
+        let input = Action::Input { site: 4, change: InputChange::Mix { row: 0, alpha: 0.5 } };
+        let source = Action::Input { site: 5, change: InputChange::Scale { rows: Rows::All, cols: (0, 1), scale: 2.0 } };
+        let mut specs = BTreeMap::new();
+        add_input_spec(&mut specs, &artifact, &layers[0], &input, 1).unwrap();
+        lift_input_boundaries(&native, &artifact, &mut specs).unwrap();
+        let (program, forks, _) = fork_inputs(&artifact, &specs).unwrap();
+        assert_eq!(program.controls[0].write, program.place(3).unwrap());
+        assert_ne!(program.controls[0].write, artifact.controls[0].write);
+        let donor_trace = artifact.execute(&family(6.0)).unwrap();
+        let (mut edits, mut donors, mut controls) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        for action in [source, input] {
+            let mapped = site_edits(&layers, &program, &artifact, &forks, &action, 1).unwrap();
+            assert_eq!(mapped.unheld, 0);
+            for (node, edit) in mapped.pre_write { controls.entry(node).or_insert_with(Vec::new).push(edit); }
+            for (node, edit) in mapped.held {
+                if let NodeEdit::Mix { donor, .. } = &edit { donors.insert(*donor, donor_trace.values[donor.node].row(donor.row).to_owned()); }
+                edits.entry(node).or_insert_with(Vec::new).push(edit);
+            }
+        }
+        prepend_controls(&mut edits, controls);
+        let trace = program.execute_edited(&family(2.0), |node, value, earlier| apply_node_edits(node, value, earlier, &edits, &donors)).unwrap();
+        assert_eq!(trace.values[program.place(3).unwrap()][[0, 0]], 8.0);
+        assert_eq!(trace.values[program.place(4).unwrap()][[0, 0]], 2.0);
     }
 
     #[test]

@@ -1020,6 +1020,7 @@ fn apply_edits(edits: &[&Edit], value: &mut Array2<f64>) {
 
 impl RunCheck for FamilyRun<'_> {
     fn episodes(&self, artifact: &Artifact) -> Result<Vec<EpisodeScore>, String> {
+        crate::native_control::validate(artifact, self.model)?;
         let native = |edits: &[Edit]| -> Result<Array2<f64>, String> {
             let trace = self
                 .model
@@ -1034,17 +1035,11 @@ impl RunCheck for FamilyRun<'_> {
         let mut out = Vec::new();
         for episode in &self.episodes {
             let reference = native(&episode.edits)?;
-            let mut held: BTreeMap<usize, Vec<&Edit>> = BTreeMap::new();
-            let mut unheld = 0;
-            for edit in &episode.edits {
-                match artifact.place(edit.node) {
-                    Some(node) => held.entry(node).or_default().push(edit),
-                    None => unheld += 1,
-                }
-            }
+            let mapped = crate::native_control::map_edits(artifact, &episode.edits)?;
+            let (held, unheld) = (mapped.edits, mapped.unheld);
             let trace = artifact.execute_edited(&self.family, |node, value, _| {
                 if let Some(edits) = held.get(&node) {
-                    apply_edits(edits, value);
+                    apply_edits(&edits.iter().collect::<Vec<_>>(), value);
                 }
                 Ok(())
             })?;

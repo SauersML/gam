@@ -281,5 +281,8 @@ pub mod fixed_metric_device;
 // Optional fixed-logit obstruction when two episodes receive one prediction.
 pub mod response_collision;
 
+// Explicit native intervention-response bindings, validated against native graph laws.
+pub mod native_control;
+
 // Optional fixed-response, finite-f32 scalar proposal diagnostic.
 pub mod scalar_response_search;
