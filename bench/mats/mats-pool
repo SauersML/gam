@@ -28,6 +28,8 @@ case ${1:-status} in
     up)
         [[ ${2:-} =~ ^[0-9]+$ && ${3:-} =~ ^([0-9]+|auto)$ ]] || { echo "usage: mats-pool up CPUS MEM_GB|auto [GPUS] [HOURS]" >&2; exit 2; }
         g=${4:-0} min=$(awk -v h="${5:-12}" 'BEGIN { print int(h * 60) }')
+        # The debug QOS caps a job at 2 h; a longer ask would pend forever (QOSMaxWallDurationPerJobLimit).
+        [ "${MATS_QOS:-}" = debug ] && (( min > 120 )) && min=120
         if [ "$3" = auto ]; then
             # The memory of the queued tasks that fill CPUS, oldest first (their asks are 2 x peak + 4).
             mem=$(ssh mats "c=0 m=0; for t in \$(ls -1tr ~/mpd-data/cluster/queue/todo/*.task 2> /dev/null); do tc=\$(sed -n 's/^# cpus=//p' \$t); tm=\$(sed -n 's/^# mem=//p' \$t); (( c + tc <= $2 )) || continue; c=\$(( c + tc )) m=\$(( m + tm )); done; echo \$(( m > 4 ? m : 4 ))")
