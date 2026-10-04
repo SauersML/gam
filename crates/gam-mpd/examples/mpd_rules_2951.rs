@@ -1008,6 +1008,10 @@ fn execute(export: &std::path::Path, out: &std::path::Path, matches: &str, sourc
     // The rules' derived operators from the native heads.
     let (sl, sh) = source;
     let mut rule_blocks: Vec<(String, Array2<f64>, Array2<f64>, f64)> = Vec::new();
+    // Per rule instance, what the artifact derives: the operator, its law, its scale, and the rows
+    // the law leaves to literals (a match head's other rows).
+    let index = |name: &str| -> Result<usize, String> { native.operators.iter().position(|o| o.name == name).ok_or(format!("no operator {name}")) };
+    let mut laws: Vec<(usize, gam_mpd::artifact::OperatorLaw, f32, Vec<usize>)> = Vec::new();
     let mut found = Vec::new();
     for &(l, h) in &match_heads {
         let (query, key) = (op(&native, &format!("blocks.{l}.q{h}"))?, op(&native, &format!("blocks.{l}.k{h}"))?);
@@ -1038,6 +1042,17 @@ fn execute(export: &std::path::Path, out: &std::path::Path, matches: &str, sourc
         eprintln!("match blocks.{l}.q{h} through layer {sl} head {sh}: content planes from {first} ({} rows), alignment {alignment:.3}, scale {scale:.4}", rows.len());
         found.push(serde_json::json!({"rule": "match", "head": format!("{l}.{h}"), "source": format!("{sl}.{sh}"), "first_plane": first, "rows": rows.len(), "alignment": alignment, "scale": scale}));
         rule_blocks.push((format!("blocks.{l}.q{h}"), with, alone, (rows.len() * query.ncols()) as f64));
+        let law = gam_mpd::artifact::OperatorLaw::Match {
+            key: index(&format!("blocks.{l}.k{h}"))?,
+            source_output: index(&format!("blocks.{sl}.o{sh}"))?,
+            source_value: index(&format!("blocks.{sl}.v{sh}"))?,
+            gain: index(&format!("blocks.{l}.rms1.gain"))?,
+            source_gain: index(&format!("blocks.{sl}.rms1.gain"))?,
+            first,
+            directions: None,
+        };
+        let others: Vec<usize> = (0..width).filter(|r| !rows.contains(r)).collect();
+        laws.push((index(&format!("blocks.{l}.q{h}"))?, law, scale as f32, others));
     }
     for &(l, h) in &copy_heads {
         let (output, value) = (op(&native, &format!("blocks.{l}.o{h}"))?, op(&native, &format!("blocks.{l}.v{h}"))?);
@@ -1047,6 +1062,8 @@ fn execute(export: &std::path::Path, out: &std::path::Path, matches: &str, sourc
         eprintln!("copy blocks.{l}.o{h}: alignment {alignment:.3}, scale {scale:.4}");
         found.push(serde_json::json!({"rule": "copy", "head": format!("{l}.{h}"), "alignment": alignment, "scale": scale}));
         rule_blocks.push((format!("blocks.{l}.o{h}"), rule.clone(), rule, output.len() as f64));
+        let law = gam_mpd::artifact::OperatorLaw::Copy { value: index(&format!("blocks.{l}.v{h}"))?, gain: index(&format!("blocks.{l}.rms1.gain"))?, final_gain: index("final_norm.gain")? };
+        laws.push((index(&format!("blocks.{l}.o{h}"))?, law, scale as f32, Vec::new()));
     }
     // The variants: per replaced block, its matrix and the literals it takes.
     let mut variants: Vec<(String, gam_mpd::operator_program::OperatorProgram, f64)> = vec![("native".to_string(), native.clone(), rule_blocks.iter().map(|b| b.3).sum())];
@@ -1062,6 +1079,29 @@ fn execute(export: &std::path::Path, out: &std::path::Path, matches: &str, sourc
     };
     let (program, literals) = build(&|_, _, with, _| Ok((with.clone(), 1.0)))?;
     variants.push(("rules on the content rows, the rest native".to_string(), program, literals));
+    // Which rule carries what: each alone with the other's heads native, and the baseline of
+    // removing what the rules replace (match heads' content rows and copy heads' outputs zeroed).
+    let is_match = |name: &str| match_heads.iter().any(|(l, h)| name == format!("blocks.{l}.q{h}"));
+    let (program, literals) = build(&|name, native_block, with, _| Ok(if is_match(name) { (with.clone(), 1.0) } else { (native_block.clone(), native_block.len() as f64) }))?;
+    variants.push(("match rule only, the copy heads native".to_string(), program, literals));
+    let (program, literals) = build(&|name, native_block, with, _| Ok(if is_match(name) { (native_block.clone(), native_block.len() as f64) } else { (with.clone(), 1.0) }))?;
+    variants.push(("copy rule only, the match heads native".to_string(), program, literals));
+    let (program, literals) = build(&|name, native_block, with, _| {
+        // Zero where the rules write: a match head's rule rows are where `with` and its alone form
+        // agree with the rule; zero those rows and keep the rest native; a copy head zeroed whole.
+        if is_match(name) {
+            let mut zeroed = native_block.clone();
+            for (r, row) in with.rows().into_iter().enumerate() {
+                if row.iter().zip(native_block.row(r)).any(|(a, b)| a != b) {
+                    zeroed.row_mut(r).fill(0.0);
+                }
+            }
+            Ok((zeroed, 0.0))
+        } else {
+            Ok((Array2::zeros(native_block.dim()), 0.0))
+        }
+    })?;
+    variants.push(("what the rules replace, zeroed".to_string(), program, literals));
     let (program, literals) = build(&|_, _, _, alone| Ok((alone.clone(), 1.0)))?;
     variants.push(("rules alone".to_string(), program, literals));
     for rank in [8usize, 32] {
@@ -1124,7 +1164,41 @@ fn execute(export: &std::path::Path, out: &std::path::Path, matches: &str, sourc
         );
         report.push(row);
     }
-    let report = serde_json::json!({"rules": found, "variants": report});
+    // The rules as an artifact (`gam_mpd::artifact`, derived operators: a law's reals are not
+    // sent): the match heads' other rows as literal rows, or left zero. Serialized, decoded from the
+    // declarations alone, run, and costed by C(P) against the native artifact.
+    let mut artifacts = Vec::new();
+    let native_artifact = gam_mpd::artifact::Artifact::native(&native)?;
+    let mut cache = gam_mpd::acceptance::CostCache::default();
+    let native_cost = gam_mpd::acceptance::structural_cost(&native_artifact, &mut cache)?;
+    for (label, keep_rows) in [("rules on the content rows, the rest native", true), ("rules alone", false)] {
+        let mut artifact = native_artifact.clone();
+        for (operator, law, scale, others) in &laws {
+            let values = op(&native, &native.operators[*operator].name)?;
+            let residual: Vec<(usize, Vec<f32>)> = if keep_rows { others.iter().map(|r| (*r, values.row(*r).iter().map(|v| *v as f32).collect())).collect() } else { Vec::new() };
+            artifact = artifact.derive(*operator, law.clone(), *scale, residual)?;
+        }
+        let bytes = artifact.to_bytes()?;
+        let file = out.with_extension(format!("{}.artifact", if keep_rows { "with_rows" } else { "alone" }));
+        std::fs::write(&file, &bytes).map_err(|e| format!("{}: {e}", file.display()))?;
+        let decoded = gam_mpd::artifact::Artifact::from_bytes(&bytes, &native.declarations)?;
+        let text_lp = log_softmax(&decoded.execute(&text)?.values[decoded.program.output]);
+        let repeat_lp = log_softmax(&decoded.execute(&repeated)?.values[decoded.program.output]);
+        let cost = gam_mpd::acceptance::structural_cost(&decoded, &mut cache)?;
+        eprintln!(
+            "artifact, {label}: {} bytes, decoded from the declarations alone: KL to native {:.4} nats/token on text, {:.4} on repeats; C(P) {} bits ({} literals) against the native {} bits ({} literals)",
+            bytes.len(),
+            mean_kl(&native_text, &text_lp),
+            mean_kl(&native_repeat, &repeat_lp),
+            cost.total(),
+            cost.literals,
+            native_cost.total(),
+            native_cost.literals
+        );
+        artifacts.push(serde_json::json!({"variant": label, "file": file.display().to_string(), "bytes": bytes.len(), "kl_text": mean_kl(&native_text, &text_lp), "kl_repeated": mean_kl(&native_repeat, &repeat_lp),
+            "cost_bits": cost.total(), "literals": cost.literals, "native_cost_bits": native_cost.total(), "native_literals": native_cost.literals}));
+    }
+    let report = serde_json::json!({"rules": found, "variants": report, "artifacts": artifacts});
     std::fs::write(out, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
