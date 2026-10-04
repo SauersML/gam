@@ -1,0 +1,433 @@
+{
+  "generated_utc": "2026-10-04T22:37:51.251789+00:00",
+  "source_commit": "c1f5a991e61a45cde91623c1bf7308c5587e2d53",
+  "prospective_protocol": "bench/native_relations_2951/CONTRAST_PROTOCOL.json",
+  "selection": "One illustrative pair per layer chosen by minimum training maximum common-term omission error / pair-removal maximum. All256pairs and bothpanels remain in rawreports.",
+  "selected": [
+    {
+      "layer": 0,
+      "units": [
+        1623,
+        1769
+      ],
+      "writer_cosine": -0.008136572232630196,
+      "training": {
+        "drop_common_over_pair_removal": 0.5725096209853232,
+        "drop_common_error_over_mlp_rms": 0.13755162882654126,
+        "contrast_rms": 0.1236288316329698,
+        "common_rms": 0.11620557825475919,
+        "pair_rms": 0.1697556310950311
+      },
+      "evaluation": {
+        "drop_common_over_pair_removal": 0.8303595038486643,
+        "drop_common_error_over_mlp_rms": 0.16527485035809425,
+        "contrast_rms": 0.12950315341090027,
+        "common_rms": 0.1257276760080236,
+        "pair_rms": 0.1570168509975989
+      },
+      "whole_bank_aggregates": [
+        {
+          "metrics": {
+            "common": {
+              "bank_rms_over_pairs_and_rows": 0.2024626196958878,
+              "max_over_pairs_and_rows": 3.0001435620700017
+            },
+            "contrast": {
+              "bank_rms_over_pairs_and_rows": 0.13555451737270147,
+              "max_over_pairs_and_rows": 1.6206991665236476
+            },
+            "pair_removal": {
+              "bank_rms_over_pairs_and_rows": 0.24039912281179315,
+              "max_over_pairs_and_rows": 3.400650141071058
+            }
+          },
+          "mode": "original",
+          "pair_count": 64,
+          "panel": "train",
+          "scope": "same geometry-selected bank; no response ranking or significance claim"
+        },
+        {
+          "metrics": {
+            "common": {
+              "bank_rms_over_pairs_and_rows": 0.21906054211937104,
+              "max_over_pairs_and_rows": 3.208388139778293
+            },
+            "contrast": {
+              "bank_rms_over_pairs_and_rows": 0.1399811327188121,
+              "max_over_pairs_and_rows": 1.894046975926025
+            },
+            "pair_removal": {
+              "bank_rms_over_pairs_and_rows": 0.2569199044941559,
+              "max_over_pairs_and_rows": 3.2871009091862695
+            }
+          },
+          "mode": "writer_direction_permutation_null",
+          "pair_count": 64,
+          "panel": "train",
+          "scope": "same geometry-selected bank; no response ranking or significance claim"
+        },
+        {
+          "metrics": {
+            "common": {
+              "bank_rms_over_pairs_and_rows": 0.19259005539508342,
+              "max_over_pairs_and_rows": 5.207018902278796
+            },
+            "contrast": {
+              "bank_rms_over_pairs_and_rows": 0.12755492154571987,
+              "max_over_pairs_and_rows": 1.662673603831134
+            },
+            "pair_removal": {
+              "bank_rms_over_pairs_and_rows": 0.22526297292058983,
+              "max_over_pairs_and_rows": 5.315484159351801
+            }
+          },
+          "mode": "original",
+          "pair_count": 64,
+          "panel": "eval",
+          "scope": "same geometry-selected bank; no response ranking or significance claim"
+        },
+        {
+          "metrics": {
+            "common": {
+              "bank_rms_over_pairs_and_rows": 0.1970763796540227,
+              "max_over_pairs_and_rows": 3.83121040174755
+            },
+            "contrast": {
+              "bank_rms_over_pairs_and_rows": 0.13281813870732692,
+              "max_over_pairs_and_rows": 1.7487969418414604
+            },
+            "pair_removal": {
+              "bank_rms_over_pairs_and_rows": 0.2320818323536369,
+              "max_over_pairs_and_rows": 3.9977101880036043
+            }
+          },
+          "mode": "writer_direction_permutation_null",
+          "pair_count": 64,
+          "panel": "eval",
+          "scope": "same geometry-selected bank; no response ranking or significance claim"
+        }
+      ]
+    },
+    {
+      "layer": 1,
+      "units": [
+        353,
+        1647
+      ],
+      "writer_cosine": -0.3122745989764838,
+      "training": {
+        "drop_common_over_pair_removal": 0.5095307595320486,
+        "drop_common_error_over_mlp_rms": 0.04750506048850849,
+        "contrast_rms": 0.09362352176493863,
+        "common_rms": 0.07487654428018428,
+        "pair_rms": 0.12250694324439769
+      },
+      "evaluation": {
+        "drop_common_over_pair_removal": 0.961017966677116,
+        "drop_common_error_over_mlp_rms": 0.07592221084576209,
+        "contrast_rms": 0.17685836814590164,
+        "common_rms": 0.1931169971081602,
+        "pair_rms": 0.2771436730618764
+      },
+      "whole_bank_aggregates": [
+        {
+          "metrics": {
+            "common": {
+              "bank_rms_over_pairs_and_rows": 1.7616345982373343,
+              "max_over_pairs_and_rows": 87.46616565836742
+            },
+            "contrast": {
+              "bank_rms_over_pairs_and_rows": 0.21676717622785624,
+              "max_over_pairs_and_rows": 16.28735778159958
+            },
+            "pair_removal": {
+              "bank_rms_over_pairs_and_rows": 1.7575610462439304,
+              "max_over_pairs_and_rows": 87.57456843862244
+            }
+          },
+          "mode": "original",
+          "pair_count": 64,
+          "panel": "train",
+          "scope": "same geometry-selected bank; no response ranking or significance claim"
+        },
+        {
+          "metrics": {
+            "common": {
+              "bank_rms_over_pairs_and_rows": 1.3022229873791233,
+              "max_over_pairs_and_rows": 63.265956172095166
+            },
+            "contrast": {
+              "bank_rms_over_pairs_and_rows": 0.47082267986599763,
+              "max_over_pairs_and_rows": 34.3149754487812
+            },
+            "pair_removal": {
+              "bank_rms_over_pairs_and_rows": 1.3624004806268446,
+              "max_over_pairs_and_rows": 64.09847494087472
+            }
+          },
+          "mode": "writer_direction_permutation_null",
+          "pair_count": 64,
+          "panel": "train",
+          "scope": "same geometry-selected bank; no response ranking or significance claim"
+        },
+        {
+          "metrics": {
+            "common": {
+              "bank_rms_over_pairs_and_rows": 1.9969488633865244,
+              "max_over_pairs_and_rows": 95.6944932705702
+            },
+            "contrast": {
+              "bank_rms_over_pairs_and_rows": 0.2673085723510043,
+              "max_over_pairs_and_rows": 16.225398644833675
+            },
+            "pair_removal": {
+              "bank_rms_over_pairs_and_rows": 1.994449516312139,
+              "max_over_pairs_and_rows": 95.92488770086022
+            }
+          },
+          "mode": "original",
+          "pair_count": 64,
+          "panel": "eval",
+          "scope": "same geometry-selected bank; no response ranking or significance claim"
+        },
+        {
+          "metrics": {
+            "common": {
+              "bank_rms_over_pairs_and_rows": 1.4754589526272346,
+              "max_over_pairs_and_rows": 68.87530878044271
+            },
+            "contrast": {
+              "bank_rms_over_pairs_and_rows": 0.5869533668801947,
+              "max_over_pairs_and_rows": 35.67966037854109
+            },
+            "pair_removal": {
+              "bank_rms_over_pairs_and_rows": 1.5620702970943756,
+              "max_over_pairs_and_rows": 69.59878096931094
+            }
+          },
+          "mode": "writer_direction_permutation_null",
+          "pair_count": 64,
+          "panel": "eval",
+          "scope": "same geometry-selected bank; no response ranking or significance claim"
+        }
+      ]
+    },
+    {
+      "layer": 2,
+      "units": [
+        2248,
+        2877
+      ],
+      "writer_cosine": -0.7997499576700102,
+      "training": {
+        "drop_common_over_pair_removal": 0.29531604652835697,
+        "drop_common_error_over_mlp_rms": 0.0978823257331118,
+        "contrast_rms": 0.1407631108067903,
+        "common_rms": 0.08382857525479696,
+        "pair_rms": 0.16343676763865717
+      },
+      "evaluation": {
+        "drop_common_over_pair_removal": 0.447160743084184,
+        "drop_common_error_over_mlp_rms": 0.0606995661831072,
+        "contrast_rms": 0.08326436081227626,
+        "common_rms": 0.07363746124097963,
+        "pair_rms": 0.10573913023206495
+      },
+      "whole_bank_aggregates": [
+        {
+          "metrics": {
+            "common": {
+              "bank_rms_over_pairs_and_rows": 0.23484956058431702,
+              "max_over_pairs_and_rows": 5.704384727934962
+            },
+            "contrast": {
+              "bank_rms_over_pairs_and_rows": 0.1595297963328846,
+              "max_over_pairs_and_rows": 2.8606650573118015
+            },
+            "pair_removal": {
+              "bank_rms_over_pairs_and_rows": 0.2715908060536699,
+              "max_over_pairs_and_rows": 5.935435022850851
+            }
+          },
+          "mode": "original",
+          "pair_count": 64,
+          "panel": "train",
+          "scope": "same geometry-selected bank; no response ranking or significance claim"
+        },
+        {
+          "metrics": {
+            "common": {
+              "bank_rms_over_pairs_and_rows": 0.23865868730428333,
+              "max_over_pairs_and_rows": 4.96323703768982
+            },
+            "contrast": {
+              "bank_rms_over_pairs_and_rows": 0.16320969505601907,
+              "max_over_pairs_and_rows": 3.236526155095273
+            },
+            "pair_removal": {
+              "bank_rms_over_pairs_and_rows": 0.2770430787699024,
+              "max_over_pairs_and_rows": 5.366297997376757
+            }
+          },
+          "mode": "writer_direction_permutation_null",
+          "pair_count": 64,
+          "panel": "train",
+          "scope": "same geometry-selected bank; no response ranking or significance claim"
+        },
+        {
+          "metrics": {
+            "common": {
+              "bank_rms_over_pairs_and_rows": 0.22306849570688944,
+              "max_over_pairs_and_rows": 3.7925027781301863
+            },
+            "contrast": {
+              "bank_rms_over_pairs_and_rows": 0.15462070837530903,
+              "max_over_pairs_and_rows": 2.3733260590412018
+            },
+            "pair_removal": {
+              "bank_rms_over_pairs_and_rows": 0.2602337191274425,
+              "max_over_pairs_and_rows": 3.7870475146949283
+            }
+          },
+          "mode": "original",
+          "pair_count": 64,
+          "panel": "eval",
+          "scope": "same geometry-selected bank; no response ranking or significance claim"
+        },
+        {
+          "metrics": {
+            "common": {
+              "bank_rms_over_pairs_and_rows": 0.23606853760319965,
+              "max_over_pairs_and_rows": 3.9885554949857527
+            },
+            "contrast": {
+              "bank_rms_over_pairs_and_rows": 0.15365681341232434,
+              "max_over_pairs_and_rows": 2.077020287800862
+            },
+            "pair_removal": {
+              "bank_rms_over_pairs_and_rows": 0.2709118714446212,
+              "max_over_pairs_and_rows": 3.9939759695244685
+            }
+          },
+          "mode": "writer_direction_permutation_null",
+          "pair_count": 64,
+          "panel": "eval",
+          "scope": "same geometry-selected bank; no response ranking or significance claim"
+        }
+      ]
+    },
+    {
+      "layer": 3,
+      "units": [
+        116,
+        2332
+      ],
+      "writer_cosine": -0.596466160628777,
+      "training": {
+        "drop_common_over_pair_removal": 0.6358173052508574,
+        "drop_common_error_over_mlp_rms": 0.07979465401891057,
+        "contrast_rms": 0.3344819700369388,
+        "common_rms": 0.3014820537357406,
+        "pair_rms": 0.44368450448478564
+      },
+      "evaluation": {
+        "drop_common_over_pair_removal": 1.0546106944740903,
+        "drop_common_error_over_mlp_rms": 0.08675604550114407,
+        "contrast_rms": 0.39907421297306983,
+        "common_rms": 0.3316026249951129,
+        "pair_rms": 0.4522640646004462
+      },
+      "whole_bank_aggregates": [
+        {
+          "metrics": {
+            "common": {
+              "bank_rms_over_pairs_and_rows": 1.009002970655968,
+              "max_over_pairs_and_rows": 13.85619890291849
+            },
+            "contrast": {
+              "bank_rms_over_pairs_and_rows": 0.5869606048434217,
+              "max_over_pairs_and_rows": 11.240436844130167
+            },
+            "pair_removal": {
+              "bank_rms_over_pairs_and_rows": 1.067743914454067,
+              "max_over_pairs_and_rows": 13.716669894277425
+            }
+          },
+          "mode": "original",
+          "pair_count": 64,
+          "panel": "train",
+          "scope": "same geometry-selected bank; no response ranking or significance claim"
+        },
+        {
+          "metrics": {
+            "common": {
+              "bank_rms_over_pairs_and_rows": 1.0475368044935425,
+              "max_over_pairs_and_rows": 12.78503388079039
+            },
+            "contrast": {
+              "bank_rms_over_pairs_and_rows": 0.5492425067963724,
+              "max_over_pairs_and_rows": 8.937414371172151
+            },
+            "pair_removal": {
+              "bank_rms_over_pairs_and_rows": 1.0846510998765817,
+              "max_over_pairs_and_rows": 11.647804426574764
+            }
+          },
+          "mode": "writer_direction_permutation_null",
+          "pair_count": 64,
+          "panel": "train",
+          "scope": "same geometry-selected bank; no response ranking or significance claim"
+        },
+        {
+          "metrics": {
+            "common": {
+              "bank_rms_over_pairs_and_rows": 0.9645558222830215,
+              "max_over_pairs_and_rows": 13.678030950740604
+            },
+            "contrast": {
+              "bank_rms_over_pairs_and_rows": 0.5495036759309092,
+              "max_over_pairs_and_rows": 11.094718605616235
+            },
+            "pair_removal": {
+              "bank_rms_over_pairs_and_rows": 1.0002505595488207,
+              "max_over_pairs_and_rows": 13.539391164641378
+            }
+          },
+          "mode": "original",
+          "pair_count": 64,
+          "panel": "eval",
+          "scope": "same geometry-selected bank; no response ranking or significance claim"
+        },
+        {
+          "metrics": {
+            "common": {
+              "bank_rms_over_pairs_and_rows": 0.9944523908152645,
+              "max_over_pairs_and_rows": 12.716680714612036
+            },
+            "contrast": {
+              "bank_rms_over_pairs_and_rows": 0.5134524583169875,
+              "max_over_pairs_and_rows": 8.821551945441215
+            },
+            "pair_removal": {
+              "bank_rms_over_pairs_and_rows": 1.0103207125789444,
+              "max_over_pairs_and_rows": 10.937955390339253
+            }
+          },
+          "mode": "writer_direction_permutation_null",
+          "pair_count": 64,
+          "panel": "eval",
+          "scope": "same geometry-selected bank; no response ranking or significance claim"
+        }
+      ]
+    }
+  ],
+  "conclusion": "The simple signed-writer contrast does not yet establish a faithful native operation. The best training-selected pair has evaluation common-term omission error44.7% of pair-removal error; other layer-selected pairs are83.0%,96.1%,105.5%. A small common-writer norm is not enough to drop its contribution.",
+  "interpretation": [
+    "Any pair admits the sum/difference rewrite; algebraic rewriting alone is not a learned discovery.",
+    "The norm-preserving writer-direction null is one declared seeded alignment reference, not a significance estimate.",
+    "Training contexts were inspected outside the repository for hypotheses; no semantic label or recovered algorithm established.",
+    "Global MLP-normalized errors can be small while the selected pair operation is substantially wrong. Pair-relative and global errors therefore remain separately reported.",
+    "This is local response analysis; no serialized smaller candidate, autonomous KL, or matched-compute VPD result was produced."
+  ],
+  "decision": "Do not infer that every meaningful relationship requires an independent native knob. Keep both native activations in any future candidate; explicitly represent joint parameter changes and retain coupled residuals. Do not change fidelity thresholds or omit residual computation to claim success."
+}

@@ -1,0 +1,42 @@
+{
+  "sources": [
+    {
+      "file": "PROTOCOL.json",
+      "raw_sha256": "c92fef5ab432af412d52758c8e82a5d935f56b03c27a18d2c1b4fc65fc1d063d",
+      "raw_bytes": 8821
+    },
+    {
+      "file": "SUMMARY.json",
+      "raw_sha256": "1b2a3e0a5764013848d99206a2b5936a2bf4e8b65ab62ee46a3dccf0958de302",
+      "raw_bytes": 596
+    },
+    {
+      "file": "EXECUTION.json",
+      "raw_sha256": "a0abd3315f9993ae5a82d6694510c2a1fbe2a967241bfbfad360b09078d6a5d8",
+      "raw_bytes": 1657
+    },
+    {
+      "file": "layer0.json.gz",
+      "raw_sha256": "cee2b647deaf68681d63c2f3cbe229a461869ab67b0bfe0816f82a695feab03a",
+      "raw_bytes": 2104419
+    },
+    {
+      "file": "layer1.json.gz",
+      "raw_sha256": "f7580d0cb62337f2d26724083eabd6ef26cfef519a5d4c6834b8b869f38042cf",
+      "raw_bytes": 2097449
+    },
+    {
+      "file": "layer2.json.gz",
+      "raw_sha256": "75a8523082a62fbb8a91e5cb3b740bc504e6e025e17d787cc5f788bb821fbcdd",
+      "raw_bytes": 2103055
+    },
+    {
+      "file": "layer3.json.gz",
+      "raw_sha256": "56da48f80106d94c0f63214084070ed844de77475d2ac09127aa47f067f59e3e",
+      "raw_bytes": 2097149
+    }
+  ],
+  "source_commit": "c1f5a991e61a45cde91623c1bf7308c5587e2d53",
+  "example_source_sha256": "cf5327e9bb8b1b2beb272a70bf82fbf9e094286677d0728ee20b54638d8f69ca",
+  "prospective_protocol_sha256": "c3af1bbf5ba88e52ca76df59ea1abc2e2a7b0ea7c8794a9d922d65e405c32407"
+}
