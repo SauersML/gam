@@ -1,5 +1,6 @@
 //! EXPORT OUT CONTEXT TEACHER_BYTES TILE_BYTES TRACE_BYTES [SAVED_ARTIFACT]
 //! Storage/backend parity only: fixed first/last head edits, no mechanism discovery.
+//! SAVED_ARTIFACT may be `generated_svd16`: serialize/decode a fixed rank16 final-head fixture.
 use gam_mpd::{
     acceptance::{Change,Edit,Episode,FamilyRun,RunCheck},
     artifact::Artifact,
@@ -41,7 +42,15 @@ fn main()->Result<(),String>{
     let base=Artifact::native(&imported.program)?.f32_literals()?;
     let mut results=Vec::new();
     for kind in 0..if args.len()==7{2}else{1} {
-        let (artifact,source)=if kind==0 {(base.clone(),json!({"kind":"native"}))} else {
+        let (artifact,source)=if kind==0 {(base.clone(),json!({"kind":"native"}))} else if args[6]=="generated_svd16" {
+            let bank=gam_mpd::proposals::MappedCopyResidualBank::new(&base,&[layer_count-1],&[16],1+2*last.heads.len())?;
+            let choice=bank.choices().find(|c| c.family==gam_mpd::proposals::HeadApproximation::NativeSvd).ok_or("mapped parity fixture absent")?;
+            let candidate=bank.candidate(choice)?.f32_literals()?;
+            let bytes=candidate.to_bytes()?;let path=out.join("fixture.bin");std::fs::write(&path,&bytes).map_err(|e|e.to_string())?;
+            let candidate=Artifact::from_bytes(&bytes,&imported.program.declarations)?;
+            if candidate.to_bytes()?!=bytes {return Err("generated fixture canonical roundtrip mismatch".into());}
+            (candidate,json!({"kind":"serialized fixed final-layer head0 rank16 fixture","choice":choice,"sha256":sha256(&path)?,"bytes":bytes.len()}))
+        } else {
             let path=Path::new(&args[6]);let bytes=std::fs::read(path).map_err(|e|e.to_string())?;
             let candidate=Artifact::from_bytes(&bytes,&imported.program.declarations)?;
             if candidate.to_bytes()?!=bytes {return Err("saved candidate canonical roundtrip mismatch".into());}
