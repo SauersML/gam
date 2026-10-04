@@ -64,7 +64,7 @@ fn fitted(tag: &str, layers: usize, prefix: &str) -> (super::operator_program::O
     let batches: Vec<FamilyInputs> = (0..2).map(sequence).collect();
     let passages: Vec<Passage> = (2..6).map(|s| Passage::new(&model, sequence(s)).expect("passage")).collect();
     let chosen = sites(&model).into_iter().filter(|s| s.name.starts_with(prefix)).collect();
-    let settings = Settings { observations: 1e4, rounds: 3, evidence_rounds: 3, draws: 2, seed: 7 };
+    let settings = Settings { observations: 1e4, rounds: 3, blocks: true, draws: 2, seed: 7 };
     let mut seen = Vec::new();
     let explanation = fit(&model, chosen, &batches, &settings, |_| Ok(None), |f| {
         seen.push(f.site.name.clone());

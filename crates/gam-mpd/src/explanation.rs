@@ -4,13 +4,15 @@
 //!
 //! * **Libraries.** Every replaced site gets a library in blocks from [`super::site_fit`]: started
 //!   at the units it reads or its Fisher-whitened singular pieces, fitted to the site's code, then
-//!   gated in blocks by merges and splits from both ends and by evidence, the lowest code kept.
+//!   (with [`Settings::blocks`]) gated in blocks by merges and splits from every column its own
+//!   block. The search prices a block by the generic closed form on the description's own scale
+//!   ([`super::describe::Tiered`]); every block is priced by its structured description at the end.
 //!   Sites are fitted in execution order, each on its inputs under the explanation fitted so far:
 //!   every earlier site replaced and running its own selection, every later one native.
 //! * **Selection.** A row's blocks on at a site are chosen from that row's read alone by the
-//!   site's code ([`super::site_fit::measure_blocks`]) in the site's mean written Fisher on its
-//!   training inputs (a forward has no sampled-label gradients of its own), each block priced at
-//!   the description bits its fit measured.
+//!   site's code ([`super::site_fit::Selector`], [`super::site_fit::measure_blocks`]'s sets) in the
+//!   site's mean written Fisher on its training inputs (a forward has no sampled-label gradients of
+//!   its own), each block priced at the description bits its fit measured.
 //! * **Execution.** The explanation runs autonomously
 //!   ([`OperatorProgram::execute_with_gates`]): each site's selection reads what the explanation's
 //!   own program computed, never the model's.
@@ -27,15 +29,14 @@
 //!   random subsets, then single-site flips while the passage's mean KL rises), a lower bound;
 //! * [`bits_per_word`]: the description bits of the blocks that ran, per row.
 
-use super::blocks::Describe;
-use super::describe::{Geometry, Metric, Structured, declared_charts};
+use super::blocks::{Describe, Generic};
+use super::describe::{Geometry, Metric, Structured, Tiered, declared_charts};
 use super::masked::{Library, Masked, Site, Target, kl_score_only, matrix, sites};
 use super::operator_program::{FamilyInputs, Node, OperatorProgram, Trace};
-use super::site_fit::{self, Blocked, Round, Samples};
-use ndarray::{Array1, Array2, ArrayView2, Axis, s};
+use super::site_fit::{self, Blocked, Round, Samples, Selector};
+use ndarray::{Array1, Array2, Axis, s};
 use rayon::prelude::*;
-use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::Arc;
 
 /// The most sites whose every subset [`site_switch`] tries.
 pub const EXHAUSTIVE: usize = 10;
@@ -45,10 +46,11 @@ pub const EXHAUSTIVE: usize = 10;
 pub struct Settings {
     /// The code's `n`.
     pub observations: f64,
-    /// The most rounds of a site's fit ([`site_fit::fit`]).
+    /// The most rounds of a site's fit ([`site_fit::fit`]); none keeps the starting library.
     pub rounds: usize,
-    /// The most rounds of its blocks by evidence ([`site_fit::ard`]).
-    pub evidence_rounds: usize,
+    /// Whether the library is gated in blocks ([`site_fit::blocks`] from every column its own
+    /// block); else every column is its own block.
+    pub blocks: bool,
     /// Sampled-label reverse passes per training batch ([`site_fit::samples`]).
     pub draws: usize,
     pub seed: u64,
@@ -69,18 +71,8 @@ pub struct Fitted {
     /// The mean written Fisher and the reads' (uncentred) second moment on its training inputs.
     pub fisher: Array2<f64>,
     pub second_moment: Array2<f64>,
-    /// Each block's bits by its factors ([`Priced`]).
-    prices: HashMap<u64, f64>,
-}
-
-/// A block's key in a price table: its shape and the bits of its factors.
-fn block_key(u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    (u.dim(), v.dim()).hash(&mut hasher);
-    for x in u.iter().chain(v.iter()) {
-        x.to_bits().hash(&mut hasher);
-    }
-    hasher.finish()
+    /// Its selection at the code's `n`.
+    selector: Arc<Selector>,
 }
 
 /// Every block's column runs `(start, end)` from its ranks.
@@ -94,28 +86,15 @@ fn runs(ranks: &[usize]) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// A fitted site's price table as a description: each of its blocks costs the bits its fit
-/// measured, so the selection run on every forward never searches a description again.
-struct Priced<'a>(&'a HashMap<u64, f64>);
-
-impl Describe for Priced<'_> {
-    fn bits(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<f64, String> {
-        self.0.get(&block_key(u, v)).copied().ok_or_else(|| format!("site {site}: a block the fit did not price"))
-    }
-
-    fn decode(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<Option<(Array2<f64>, Array2<f64>, f64)>, String> {
-        Err(format!("site {site}: a price table holds bits, not the {:?} × {:?} block's description", u.dim(), v.dim()))
-    }
-}
-
 impl Fitted {
-    /// A site's library in blocks of `ranks`, each block priced at `bits`.
+    /// A site's library in blocks of `ranks`, each block priced at `bits`, selected at `n =
+    /// observations`.
     pub fn new(
         site: Site,
         w: Array2<f64>,
         (library, ranks, bits): (Library, Vec<usize>, Vec<f64>),
-        fisher: Array2<f64>,
-        second_moment: Array2<f64>,
+        (fisher, second_moment): (Array2<f64>, Array2<f64>),
+        observations: f64,
     ) -> Result<Self, String> {
         let (d_out, d_in) = w.dim();
         if library.v.ncols() != d_in || library.u.ncols() != d_out || library.u.nrows() != library.v.nrows() {
@@ -127,32 +106,14 @@ impl Fitted {
         if fisher.dim() != (d_out, d_out) || second_moment.dim() != (d_in, d_in) {
             return Err(format!("{}: statistics {:?}, {:?} for a {d_out}×{d_in} map", site.name, fisher.dim(), second_moment.dim()));
         }
-        let prices = runs(&ranks)
-            .into_iter()
-            .zip(&bits)
-            .map(|((a, b), bits)| (block_key(library.u.slice(s![a..b, ..]), library.v.slice(s![a..b, ..])), *bits))
-            .collect();
-        Ok(Self { site, w, library, ranks, bits, fisher, second_moment, prices })
+        let selector = Arc::new(Selector::new(&w, &fisher, &library, &ranks, &bits, observations).map_err(|e| format!("{}: {e}", site.name))?);
+        Ok(Self { site, w, library, ranks, bits, fisher, second_moment, selector })
     }
 
     /// Each row's blocks on (rows × blocks, 0 or 1), chosen from that row's read (`reads`, rows ×
-    /// d_in) alone by the site's code at `n = observations` in its mean written Fisher.
-    pub fn select(&self, reads: &Array2<f64>, observations: f64) -> Result<Array2<f64>, String> {
-        let rows = reads.nrows();
-        let samples = Samples {
-            reads: reads.mapv(|x| x as f32).as_standard_layout().into_owned(),
-            sensitivity: Array1::ones(rows),
-            fisher: self.fisher.clone(),
-            second_moment: Array2::zeros((0, 0)),
-            };
-        let (_, sets) = site_fit::measure_blocks(0, &self.w, &samples, &Priced(&self.prices), observations, &self.library, &self.ranks)?;
-        let mut on = Array2::<f64>::zeros((rows, self.ranks.len()));
-        for (r, set) in sets.iter().enumerate() {
-            for c in set {
-                on[[r, *c as usize]] = 1.0;
-            }
-        }
-        Ok(on)
+    /// d_in) alone by the site's code in its mean written Fisher.
+    pub fn select(&self, reads: &Array2<f64>) -> Array2<f64> {
+        self.selector.select(reads)
     }
 
     /// Its blocks' description in its training statistics (the charts its interfaces in `program`
@@ -202,7 +163,7 @@ impl Explanation {
                 let k = masked.z.iter().position(|n| *n == z).ok_or("an unknown gated amplitude")?;
                 let views: Vec<_> = masked.sites[k].reads.iter().map(|n| values[*n].view()).collect();
                 let reads = ndarray::concatenate(Axis(1), &views).map_err(|e| e.to_string())?;
-                let on = self.sites[members[k]].select(&reads, self.observations)?;
+                let on = self.sites[members[k]].select(&reads);
                 let expanded = masked.expand(k, &on);
                 chosen[k] = on;
                 Ok(expanded)
@@ -274,8 +235,8 @@ pub fn in_execution_order(mut chosen: Vec<Site>) -> Vec<Site> {
 }
 
 /// A site's library in blocks on `samples` (`site_fit`): its fit from its units (`reads_units`) or
-/// its Fisher-whitened singular pieces, then its blocks by merges and splits from the fine and the
-/// coarse start and by evidence, the lowest code kept.
+/// its Fisher-whitened singular pieces (with no rounds, those pieces themselves), then with
+/// [`Settings::blocks`] its blocks by merges and splits from every column its own block.
 fn site_library(w: &Array2<f64>, samples: &Samples, describe: &dyn Describe, settings: &Settings, reads_units: bool, name: &str) -> Result<(Blocked, Round), String> {
     let (d_out, d_in) = w.dim();
     let observations = settings.observations;
@@ -286,19 +247,20 @@ fn site_library(w: &Array2<f64>, samples: &Samples, describe: &dyn Describe, set
         super::pieces::fisher_svd(&statistics)?
     };
     let start = Library { v: exact.v.t().to_owned(), u: exact.u, mean: Array1::zeros(d_in) };
-    let fit_settings = site_fit::Settings { observations, pieces: d_in + d_out, rounds: settings.rounds, seed: settings.seed ^ 0xF17 };
-    let library = site_fit::fit(0, w, samples, describe, fit_settings, Some(&start), |round, _| {
-        log::info!("{name} round {}: code {:.1} bits per input (description {:.1}, error {:.1}), L0 {:.2}", round.round, round.code, round.description, round.error, round.l0);
-    })?;
+    let library = if settings.rounds == 0 {
+        start
+    } else {
+        let fit_settings = site_fit::Settings { observations, pieces: d_in + d_out, rounds: settings.rounds, seed: settings.seed ^ 0xF17 };
+        site_fit::fit(0, w, samples, describe, fit_settings, Some(&start), |round, _| {
+            log::info!("{name} round {}: code {:.1} bits per input (description {:.1}, error {:.1}), L0 {:.2}", round.round, round.code, round.description, round.error, round.l0);
+        })?
+    };
     let columns = library.v.nrows();
-    let fine = site_fit::blocks(0, w, samples, describe, observations, &library, &vec![1; columns])?;
-    let coarse = site_fit::blocks(0, w, samples, describe, observations, &library, &[columns])?;
-    let evidence = site_fit::ard(0, w, samples, describe, observations, (&library, &vec![1; columns], columns.max(d_out + d_in)), settings.evidence_rounds)?;
-    log::info!("{name} blocks: fine start {:.1}, coarse start {:.1}, by evidence {:.1} bits per input", fine.1.code, coarse.1.code, evidence.1.code);
-    Ok([fine, coarse, evidence].into_iter().fold(None, |best: Option<(Blocked, Round)>, c| match best {
-        Some(b) if b.1.code <= c.1.code => Some(b),
-        _ => Some(c),
-    }).expect("three candidates"))
+    if settings.blocks {
+        return site_fit::blocks(0, w, samples, describe, observations, &library, &vec![1; columns]);
+    }
+    let (round, sets) = site_fit::measure(0, w, samples, describe, observations, &library)?;
+    Ok((Blocked { library, ranks: vec![1; columns], sets }, round))
 }
 
 /// The explanation of `model`'s sites `chosen` fitted on `batches` at `settings` (module note):
@@ -354,14 +316,15 @@ pub fn fit(
                 let w = matrix(program, site)?;
                 let statistics = super::pieces::Site { w: w.clone(), second_moment: sample.second_moment.clone(), mean: Array1::zeros(w.ncols()), fisher: sample.fisher.clone() };
                 let (writers, readers) = declared_charts(program, site)?;
-                let describe = Structured::new(vec![Geometry::new(Metric::of(&statistics, settings.observations), writers, readers)?]);
+                let structured = Structured::new(vec![Geometry::new(Metric::of(&statistics, settings.observations), writers, readers)?]);
+                let describe = Tiered { cheap: Generic::new(std::slice::from_ref(&statistics), settings.observations), exact: structured };
                 let reads_units = site.reads.len() == 1 && matches!(program.nodes[site.reads[0]], Node::Pointwise { .. });
                 let (blocked, round) = site_library(&w, &sample, &describe, settings, reads_units, &site.name)?;
                 let bits = runs(&blocked.ranks)
                     .into_par_iter()
                     .map(|(a, b)| describe.bits(0, blocked.library.u.slice(s![a..b, ..]), blocked.library.v.slice(s![a..b, ..])))
                     .collect::<Result<Vec<f64>, String>>()?;
-                let site_fitted = Fitted::new(group[*i].clone(), w, (blocked.library, blocked.ranks, bits), sample.fisher, sample.second_moment)?;
+                let site_fitted = Fitted::new(group[*i].clone(), w, (blocked.library, blocked.ranks, bits), (sample.fisher, sample.second_moment), settings.observations)?;
                 log::info!(
                     "{}: {} blocks of {} columns, code {:.1} bits per input (description {:.1}, error {:.1}), {:.2} on, {:.0}s",
                     site.name,

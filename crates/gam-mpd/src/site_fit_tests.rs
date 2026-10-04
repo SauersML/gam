@@ -1,9 +1,9 @@
 #![cfg(test)]
 //! A site's library gated in blocks by its own code.
 
-use super::blocks::Generic;
+use super::blocks::{Describe, Generic};
 use super::masked::Library;
-use super::site_fit::{Samples, ard, blocks, code_of, measure};
+use super::site_fit::{Samples, Selector, ard, blocks, code_of, measure, measure_blocks};
 use ndarray::{Array1, Array2};
 
 fn noise(seed: usize) -> f64 {
@@ -25,7 +25,6 @@ fn site() -> (Array2<f64>, Samples, Generic) {
         sensitivity: Array1::ones(rows),
         fisher: Array2::eye(2),
         second_moment: moment.clone(),
-        gradients: Vec::new(),
     };
     let statistics = vec![super::pieces::Site { w: w.clone(), second_moment: moment, mean: Array1::zeros(3), fisher: Array2::eye(2) }];
     (w, samples, Generic::new(&statistics, 1e4))
@@ -95,4 +94,30 @@ fn groups_fitted_by_evidence_partition_their_columns_and_code_no_worse_than_rank
     assert_eq!(fitted.ranks.iter().sum::<usize>(), fitted.library.v.nrows());
     assert!(!fitted.ranks.is_empty() && fitted.ranks.iter().all(|r| *r >= 1));
     assert!(round.code <= rank_one.code + 1.0, "{} against {}", round.code, rank_one.code);
+}
+
+#[test]
+fn the_run_time_selection_chooses_the_measured_sets() {
+    let (w, samples, describe) = site();
+    // The map's singular pieces, the first split into unequal halves along its read: three
+    // subcomponents whose sets differ across the inputs.
+    let d = super::dense::svd(w.view(), false).expect("svd");
+    let roots = d.singular_values.mapv(f64::sqrt);
+    let mut u = (&d.u * &roots).t().to_owned();
+    let mut v = (d.vt.t().to_owned() * &roots).t().to_owned();
+    let first = v.row(0).to_owned();
+    v.row_mut(0).assign(&(&first * 0.7));
+    v.push_row((&first * 0.3).view()).expect("a third read");
+    let write = u.row(0).to_owned();
+    u.push_row(write.view()).expect("a third write");
+    let library = Library { v, u, mean: Array1::zeros(3) };
+    let ranks = vec![1; 3];
+    let bits: Vec<f64> = (0..3).map(|c| describe.bits(0, library.u.slice(ndarray::s![c..c + 1, ..]), library.v.slice(ndarray::s![c..c + 1, ..])).expect("bits")).collect();
+    let (_, sets) = measure_blocks(0, &w, &samples, &describe, 1e4, &library, &ranks).expect("measures");
+    let selector = Selector::new(&w, &samples.fisher, &library, &ranks, &bits, 1e4).expect("selector");
+    let on = selector.select(&samples.reads.mapv(f64::from));
+    for (t, set) in sets.iter().enumerate() {
+        let chosen: Vec<u32> = (0..3).filter(|c| on[[t, *c as usize]] == 1.0).collect();
+        assert_eq!(&chosen, set, "input {t}");
+    }
 }
