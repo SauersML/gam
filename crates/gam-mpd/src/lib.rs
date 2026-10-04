@@ -124,6 +124,18 @@ mod device_program_tests;
 // The masked fit's hot path (forward, KL, mask gradients, Fishers, step products) on a device.
 pub mod masked_device;
 
+// The explanation's core path on a device: targets, every replacement's forward with its selection, KL.
+pub mod core_device;
+
+#[cfg(test)]
+mod core_device_tests;
+
+// Many threads' products with the same large matrix (a site's metric, pricing its blocks), run as one.
+pub mod combine;
+
+#[cfg(test)]
+mod combine_tests;
+
 #[cfg(test)]
 mod masked_device_tests;
 

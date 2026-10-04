@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 /// A small random decoder export (`layers` layers, 2 heads of 4, MLP 16, vocabulary 11) with six
 /// token rows of 12.
-fn tiny_export(tag: &str, layers: usize) -> PathBuf {
+pub(crate) fn tiny_export(tag: &str, layers: usize) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("gam_explanation_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let mut state = 0x2545_F491_4F6C_DD1Du64;
@@ -55,7 +55,7 @@ const CONTEXT: usize = 12;
 
 /// The export's model, its first two sequences as training batches and its last four as passages,
 /// and the explanation of its sites named with `prefix` fitted on the batches.
-fn fitted(tag: &str, layers: usize, prefix: &str) -> (super::operator_program::OperatorProgram, Vec<Passage>, Explanation) {
+pub(crate) fn fitted(tag: &str, layers: usize, prefix: &str) -> (super::operator_program::OperatorProgram, Vec<Passage>, Explanation) {
     let dir = tiny_export(tag, layers);
     let imported = import_language_model(&dir, 6, CONTEXT).expect("import");
     let model = imported.program;

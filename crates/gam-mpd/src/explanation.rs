@@ -9,10 +9,11 @@
 //!   ([`super::describe::Tiered`]); every block is priced by its structured description at the end.
 //!   Sites are fitted in execution order, each on its inputs under the explanation fitted so far:
 //!   every earlier site replaced and running its own selection, every later one native.
-//! * **Selection.** A row's blocks on at a site are chosen from that row's read alone by the
-//!   site's code ([`super::site_fit::Selector`], [`super::site_fit::measure_blocks`]'s sets) in the
-//!   site's mean written Fisher on its training inputs (a forward has no sampled-label gradients of
-//!   its own), each block priced at the description bits its fit measured.
+//! * **Selection.** A row's blocks on at a site are its certified sparse code
+//!   ([`super::sparse_code::Coder`], through [`super::site_fit::Selector`]) from that row's read
+//!   alone, in the site's mean written Fisher on its training inputs (a forward has no sampled-label
+//!   gradients of its own), each block priced at the description bits its fit measured. On a device
+//!   the code runs inside the device's forward ([`super::core_device`]).
 //! * **Execution.** The explanation runs autonomously
 //!   ([`OperatorProgram::execute_with_gates`]): each site's selection reads what the explanation's
 //!   own program computed, never the model's.
@@ -119,6 +120,18 @@ impl Fitted {
         self.selector.select(reads)
     }
 
+    /// [`Fitted::select`] from the products it reads (`site_fit::Selector::select_products`): `z =
+    /// reads Vᵀ`, `U F y` per input (inputs × columns) and each input's `yᵀ F y`.
+    pub fn select_products(&self, z: &Array2<f64>, weights: &Array2<f64>, yfy: &[f64]) -> Result<Array2<f64>, String> {
+        self.selector.select_products(z, weights, yfy)
+    }
+
+    /// The coder its selection chooses by (`super::sparse_code::Coder`).
+    #[must_use]
+    pub fn coder(&self) -> &super::sparse_code::Coder {
+        self.selector.coder()
+    }
+
     /// Its blocks' description in its training statistics (the charts its interfaces in `program`
     /// declare): what [`fit`] priced it in, for pricing any other library of the site alike.
     pub fn description(&self, program: &OperatorProgram, observations: f64) -> Result<Structured, String> {
@@ -130,7 +143,7 @@ impl Fitted {
 
 /// Sites replaced for evaluation: their libraries in blocks and the rule that picks each row's
 /// blocks on.
-pub trait Replacement: Sync {
+pub trait Replacement: Sync + super::core_device::OnDevice {
     /// The replaced sites, in the model's nodes, in execution order.
     fn sites(&self) -> Vec<Site>;
     /// The model with the sites `members` (indices into [`Replacement::sites`], ascending) replaced.
@@ -312,22 +325,26 @@ pub fn fit(
             // The group's inputs under the explanation so far: its selections fixed as they ran.
             let members: Vec<usize> = (0..explanation.sites.len()).collect();
             let hybrid = if members.is_empty() { None } else { Some(explanation.masked(model, &members)?) };
-            let (program, families) = match &hybrid {
-                None => (model, batches.to_vec()),
-                Some(masked) => {
-                    let families = batches
-                        .iter()
-                        .map(|b| explanation.execute(masked, &members, b).map(|(_, masks)| masked.family(b, &masks)))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    (&masked.program, families)
-                }
-            };
+            let program = hybrid.as_ref().map_or(model, |m| &m.program);
             let in_program = sites(program);
             let mapped: Vec<Site> = missing
                 .iter()
                 .map(|i| in_program.iter().find(|s| s.name == group[*i].name).cloned().ok_or_else(|| format!("{}: not a site of the hybrid program", group[*i].name)))
                 .collect::<Result<_, _>>()?;
-            let gathered = site_fit::samples(program, &mapped, families, settings.draws, settings.seed ^ (at as u64).wrapping_mul(0x9E37_79B9))?;
+            let seed = settings.seed ^ (at as u64).wrapping_mul(0x9E37_79B9);
+            let gathered = match super::core_device::device()? {
+                Some(device) => super::core_device::samples(&device, program, (hybrid.as_ref(), &explanation), &mapped, batches, settings.draws, seed)?,
+                None => {
+                    let families = match &hybrid {
+                        None => batches.to_vec(),
+                        Some(masked) => batches
+                            .iter()
+                            .map(|b| explanation.execute(masked, &members, b).map(|(_, masks)| masked.family(b, &masks)))
+                            .collect::<Result<Vec<_>, _>>()?,
+                    };
+                    site_fit::samples(program, &mapped, families, settings.draws, seed)?
+                }
+            };
             log::info!("samples of {} sites on {} batches, {:.0}s", mapped.len(), batches.len(), started.elapsed().as_secs_f64());
             for ((i, site), sample) in missing.iter().zip(&mapped).zip(gathered) {
                 let started = std::time::Instant::now();
@@ -339,9 +356,8 @@ pub fn fit(
                 let reads_units = site.reads.len() == 1 && matches!(program.nodes[site.reads[0]], Node::Pointwise { .. });
                 let start = starting_library(&w, &sample, starts.get(&site.name), reads_units).map_err(|e| format!("{}: {e}", site.name))?;
                 let (blocked, round) = site_library(&w, &sample, &describe, settings, start, &site.name)?;
-                let bits = runs(&blocked.ranks)
-                    .into_par_iter()
-                    .map(|(a, b)| gam_linalg::faer_ndarray::with_nested_parallel(|| describe.bits(0, blocked.library.u.slice(s![a..b, ..]), blocked.library.v.slice(s![a..b, ..]))))
+                let bits = super::combine::map(&runs(&blocked.ranks), |&(a, b)| describe.bits(0, blocked.library.u.slice(s![a..b, ..]), blocked.library.v.slice(s![a..b, ..])))
+                    .into_iter()
                     .collect::<Result<Vec<f64>, String>>()?;
                 let site_fitted = Fitted::new(group[*i].clone(), w, (blocked.library, blocked.ranks, bits), (sample.fisher, sample.second_moment), settings.observations)?;
                 log::info!(
@@ -382,6 +398,10 @@ impl Passage {
 /// Per passage, `KL(model ‖ replacement)` per row with the sites `members` replaced, and every
 /// member's blocks on.
 pub fn replaced(model: &OperatorProgram, replacement: &dyn Replacement, members: &[usize], passages: &[Passage]) -> Result<Vec<(Array1<f64>, Vec<Array2<f64>>)>, String> {
+    if let Some(device) = super::core_device::device()? {
+        let every: Vec<usize> = (0..passages.len()).collect();
+        return super::core_device::Evaluator::new(&device, model, passages)?.replaced(replacement, members, &every);
+    }
     let masked = replacement.masked(model, members)?;
     passages
         .par_iter()
@@ -406,6 +426,9 @@ pub struct SiteSwitch {
     /// Per site, per passage: the mean KL with that site alone replaced.
     pub alone: Vec<Vec<f64>>,
     /// Per passage, per row: the largest KL any subset tried gave it.
+    ///
+    /// On a float64 device these two are the search's (f32 products); `all_replaced` and `worst`
+    /// are scored again in float64 (`site_switch`).
     pub word_worst: Vec<Vec<f64>>,
     /// Subsets evaluated (passage forwards).
     pub forwards: usize,
@@ -435,17 +458,32 @@ pub fn site_switch(model: &OperatorProgram, replacement: &dyn Replacement, passa
         word_worst: rows.iter().map(|r| vec![0.0; *r]).collect(),
         forwards: 0,
     };
-    // One subset on some passages: their per-row KL, folded into the result.
-    let visit = |bits: u64, on: &[usize], result: &mut SiteSwitch| -> Result<Vec<f64>, String> {
-        let members = members_of(bits, count);
-        let masked = replacement.masked(model, &members)?;
-        let kls: Vec<Array1<f64>> = on
-            .par_iter()
+    // On devices every subset's passages run there (`super::core_device`, a list of subsets spread
+    // over them), else on the CPU; a float64 device searches in f32 and scores what it reports again
+    // in float64.
+    let devices = super::core_device::devices()?;
+    let evaluators = (!devices.is_empty()).then(|| super::core_device::Evaluators::new(&devices, model, passages)).transpose()?;
+    if let Some(evaluators) = &evaluators {
+        evaluators.set_arithmetic(gam_gpu::tensor::Arithmetic::F32);
+    }
+    let evaluator = evaluators.as_ref().map(super::core_device::Evaluators::first);
+    // One subset's per-row KL on some passages.
+    let kls_of = |members: &[usize], on: &[usize]| -> Result<Vec<Array1<f64>>, String> {
+        if let Some(evaluator) = &evaluator {
+            return evaluator.kls(replacement, members, on);
+        }
+        let masked = replacement.masked(model, members)?;
+        on.par_iter()
             .map(|&p| {
-                let (trace, _) = replacement.run(&masked, &members, p, &passages[p].base)?;
+                let (trace, _) = replacement.run(&masked, members, p, &passages[p].base)?;
                 Ok(kl_score_only(&passages[p].target, &trace.values[masked.program.output]))
             })
-            .collect::<Result<_, String>>()?;
+            .collect::<Result<_, String>>()
+    };
+    let every: Vec<usize> = (0..passages.len()).collect();
+    // One subset's per-row KL on some passages, folded into the result.
+    let fold = |bits: u64, on: &[usize], kls: Vec<Array1<f64>>, result: &mut SiteSwitch| -> Vec<f64> {
+        let members = members_of(bits, count);
         result.forwards += on.len();
         let mut means = Vec::with_capacity(on.len());
         for (&p, kl) in on.iter().zip(kls) {
@@ -465,14 +503,54 @@ pub fn site_switch(model: &OperatorProgram, replacement: &dyn Replacement, passa
             }
             means.push(mean);
         }
-        Ok(means)
+        means
     };
-    let every: Vec<usize> = (0..passages.len()).collect();
-    if count <= EXHAUSTIVE {
-        for bits in 1..=full {
-            visit(bits, &every, &mut result)?;
+    // Subsets on every passage, each folded in turn (on devices, the subsets spread over them).
+    let visit_all = |subsets: &[u64], result: &mut SiteSwitch| -> Result<(), String> {
+        let members: Vec<Vec<usize>> = subsets.iter().map(|b| members_of(*b, count)).collect();
+        let kls: Vec<Vec<Array1<f64>>> = match &evaluators {
+            Some(evaluators) => evaluators.kls_each(replacement, &members, &every)?,
+            None => members.iter().map(|m| kls_of(m, &every)).collect::<Result<_, _>>()?,
+        };
+        for (bits, kls) in subsets.iter().zip(kls) {
+            fold(*bits, &every, kls, result);
         }
-        return Ok(result);
+        Ok(())
+    };
+    // What a device's f32 search found, scored again in float64: every site replaced, and each
+    // passage at its worst subset (a subset evaluated, so still a lower bound on the claim's worst).
+    let rescore = |mut result: SiteSwitch| -> Result<SiteSwitch, String> {
+        let Some(evaluator) = evaluator.as_ref().filter(|e| e.device().float64()) else { return Ok(result) };
+        evaluator.set_arithmetic(gam_gpu::tensor::Arithmetic::F64);
+        let all: Vec<usize> = (0..count).collect();
+        let mut subsets: std::collections::BTreeMap<Vec<usize>, Vec<usize>> = std::collections::BTreeMap::new();
+        for (p, subset) in result.worst_subset.iter().enumerate() {
+            subsets.entry(subset.clone()).or_default().push(p);
+        }
+        subsets.entry(all.clone()).or_default();
+        let mut moved = 0.0_f64;
+        for (members, mut on) in subsets {
+            if members == all {
+                on = every.clone();
+            }
+            for (&p, kl) in on.iter().zip(evaluator.kls(replacement, &members, &on)?) {
+                let mean = kl.mean().unwrap_or(0.0);
+                if members == all {
+                    moved = moved.max((result.all_replaced[p] - mean).abs());
+                    result.all_replaced[p] = mean;
+                }
+                if result.worst_subset[p] == members {
+                    moved = moved.max((result.worst[p] - mean).abs());
+                    result.worst[p] = mean;
+                }
+            }
+        }
+        log::info!("site switch: the f32 search's reported means moved by at most {moved:.3e} in float64");
+        Ok(result)
+    };
+    if count <= EXHAUSTIVE {
+        visit_all(&(1..=full).collect::<Vec<u64>>(), &mut result)?;
+        return rescore(result);
     }
     // Each site alone, all but one, all, then random subsets.
     let mut tried = vec![full];
@@ -487,9 +565,7 @@ pub fn site_switch(model: &OperatorProgram, replacement: &dyn Replacement, passa
         state ^= state << 17;
         tried.push((state & full).max(1));
     }
-    for bits in tried {
-        visit(bits, &every, &mut result)?;
-    }
+    visit_all(&tried, &mut result)?;
     // Single-site flips from each passage's worst subset while its mean KL rises, [`FLIPPING`]
     // passages at once (each holds its own masked program).
     let passage_flips = |p: usize, (mut worst, mut subset, mut words): (f64, Vec<usize>, Vec<f64>)| -> Result<(f64, Vec<usize>, Vec<f64>, usize), String> {
@@ -503,9 +579,7 @@ pub fn site_switch(model: &OperatorProgram, replacement: &dyn Replacement, passa
                     continue;
                 }
                 let members = members_of(flipped, count);
-                let masked = replacement.masked(model, &members)?;
-                let (trace, _) = replacement.run(&masked, &members, p, &passages[p].base)?;
-                let kl = kl_score_only(&passages[p].target, &trace.values[masked.program.output]);
+                let kl = kls_of(&members, &[p])?.swap_remove(0);
                 forwards += 1;
                 for (w, k) in words.iter_mut().zip(kl.iter()) {
                     *w = w.max(*k);
@@ -524,14 +598,18 @@ pub fn site_switch(model: &OperatorProgram, replacement: &dyn Replacement, passa
     let order: Vec<usize> = (0..passages.len()).collect();
     for chunk in order.chunks(FLIPPING) {
         let starts: Vec<(f64, Vec<usize>, Vec<f64>)> = chunk.iter().map(|&p| (result.worst[p], result.worst_subset[p].clone(), result.word_worst[p].clone())).collect();
-        let flipped: Vec<(f64, Vec<usize>, Vec<f64>, usize)> =
-            chunk.par_iter().zip(starts).map(|(&p, start)| passage_flips(p, start)).collect::<Result<_, String>>()?;
+        // A device runs one passage's flips at a time; the CPU runs a chunk of passages at once.
+        let flipped: Vec<(f64, Vec<usize>, Vec<f64>, usize)> = if evaluator.is_some() {
+            chunk.iter().zip(starts).map(|(&p, start)| passage_flips(p, start)).collect::<Result<_, String>>()?
+        } else {
+            chunk.par_iter().zip(starts).map(|(&p, start)| passage_flips(p, start)).collect::<Result<_, String>>()?
+        };
         for (&p, (worst, subset, words, forwards)) in chunk.iter().zip(flipped) {
             (result.worst[p], result.worst_subset[p], result.word_worst[p]) = (worst, subset, words);
             result.forwards += forwards;
         }
     }
-    Ok(result)
+    rescore(result)
 }
 
 /// Per row, the description bits of the blocks that ran: `Σ_sites Σ_{blocks on} bits`, with

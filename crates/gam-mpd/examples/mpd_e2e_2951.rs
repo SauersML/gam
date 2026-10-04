@@ -36,14 +36,16 @@
 //! each site starts from its units or Fisher-SVD pieces; `vpd`: from VPD's subcomponents, so `ours`
 //! is this code's selection and execution of VPD's library), `rounds` (50; 0 keeps each site's
 //! starting pieces), `blocks` (1: gate the library in blocks; 0: every subcomponent its own),
-//! `draws` (4), `random` (64).
+//! `draws` (4), `random` (64), `device` (`f64`: samples, passages and every evaluation on a float64
+//! accelerator when there is one; `any`: the Apple GPU's f32 too; `off`: the CPU;
+//! `gam_mpd::core_device`).
 
 use gam_mpd::blocks::Describe;
 use gam_mpd::counterfactual::read_f64_matrix;
 use gam_mpd::explanation::{Explanation, Fitted, Given, Passage, Replacement, Settings, SiteSwitch, bits_per_word, fit, in_execution_order, replaced, site_switch};
 use gam_mpd::import::import_language_model;
 use gam_mpd::masked::{Library, Site, matrix, sites};
-use gam_mpd::operator_program::OperatorProgram;
+use gam_mpd::operator_program::{FamilyInputs, OperatorProgram};
 use ndarray::{Array1, Array2, s};
 use rayon::prelude::*;
 use serde_json::{Value, json};
@@ -124,6 +126,7 @@ impl Run {
                 }
                 "draws" => run.settings.draws = count()?,
                 "random" => run.random = count()?,
+                "device" => gam_mpd::core_device::choose(gam_mpd::core_device::Choice::parse(value)?),
                 other => return Err(format!("unknown key {other}")),
             }
         }
@@ -352,10 +355,13 @@ fn main() -> Result<(), String> {
 
     // The passages, the model's own logits on them, and VPD's decomposition of the same sites.
     let clock = Instant::now();
-    let passages: Vec<Passage> = (0..run.passages)
-        .into_par_iter()
-        .map(|p| Passage::new(model, frontier.select(&(p * run.context..(p + 1) * run.context).collect::<Vec<_>>())))
-        .collect::<Result<_, _>>()?;
+    let bases: Vec<FamilyInputs> = (0..run.passages).map(|p| frontier.select(&(p * run.context..(p + 1) * run.context).collect::<Vec<_>>())).collect();
+    let passages: Vec<Passage> = match gam_mpd::core_device::device()? {
+        Some(device) => gam_mpd::core_device::passages(&device, model, bases)?,
+        None => bases.into_par_iter().map(|b| Passage::new(model, b)).collect::<Result<_, _>>()?,
+    };
+    seconds.insert("passages", clock.elapsed().as_secs_f64());
+    let clock = Instant::now();
     let given = vpd(&run, model, &chosen)?;
     // VPD's subcomponents priced as ours, in each site's fit statistics (read back when priced at
     // these settings).
@@ -379,15 +385,15 @@ fn main() -> Result<(), String> {
                 return Ok(f.bits.clone());
             }
             let describe = f.description(model, run.settings.observations)?;
-            let bits = (0..library.v.nrows())
-                .into_par_iter()
-                .map(|c| gam_linalg::faer_ndarray::with_nested_parallel(|| describe.bits(0, library.u.slice(s![c..c + 1, ..]), library.v.slice(s![c..c + 1, ..]))))
+            let columns: Vec<usize> = (0..library.v.nrows()).collect();
+            let bits = gam_mpd::combine::map(&columns, |&c| describe.bits(0, library.u.slice(s![c..c + 1, ..]), library.v.slice(s![c..c + 1, ..])))
+                .into_iter()
                 .collect::<Result<Vec<f64>, String>>()?;
             std::fs::write(&path, json!({"fitted_with": with, "bits": bits}).to_string()).map_err(|e| format!("{}: {e}", path.display()))?;
             Ok(bits)
         })
         .collect::<Result<_, String>>()?;
-    seconds.insert("setup", clock.elapsed().as_secs_f64());
+    seconds.insert("vpd_pricing", clock.elapsed().as_secs_f64());
     eprintln!("{} passages and VPD's decomposition priced, {:.0}s", passages.len(), clock.elapsed().as_secs_f64());
 
     // (a), (d): every site replaced.
@@ -396,9 +402,11 @@ fn main() -> Result<(), String> {
     let our_ranks: Vec<Vec<usize>> = explanation.sites.iter().map(|f| f.ranks.clone()).collect();
     for (key, replacement, bits, ranks) in [("ours", &explanation as &dyn Replacement, &our_bits, &our_ranks), ("vpd", &given as &dyn Replacement, &vpd_bits, &given.ranks)] {
         if report[key]["e2e"].is_null() {
+            let clock = Instant::now();
             let scored = replaced_and_bits(model, replacement, &passages, bits, ranks)?;
             report[key]["e2e"] = scored["e2e"].clone();
             report[key]["bits"] = scored["bits"].clone();
+            seconds.insert(if key == "ours" { "replaced_ours" } else { "replaced_vpd" }, clock.elapsed().as_secs_f64());
         }
     }
     seconds.insert("replaced", clock.elapsed().as_secs_f64());
@@ -417,7 +425,9 @@ fn main() -> Result<(), String> {
         if !report[key]["site_switch"].is_null() {
             continue;
         }
+        let clock = Instant::now();
         let attack = site_switch(model, replacement, &passages, run.random, run.settings.seed)?;
+        seconds.insert(if key == "ours" { "site_switch_ours" } else { "site_switch_vpd" }, clock.elapsed().as_secs_f64());
         report[key]["site_switch"] = switch_summary(&names, &attack);
         eprintln!("site switch {key}: worst subset per passage {}", report[key]["site_switch"]["passage_worst_subset"]);
         write(&report)?;

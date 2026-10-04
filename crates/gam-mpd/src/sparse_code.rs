@@ -105,6 +105,8 @@ enum Operator<'p> {
 #[derive(Clone)]
 struct Relaxed {
     m: Vec<f64>,
+    /// `Q m`.
+    qm: Vec<f64>,
     lower: f64,
 }
 
@@ -149,16 +151,18 @@ impl Row<'_> {
         self.linear[b] + 2.0 * self.kappa * qm[b]
     }
 
-    /// The relaxation's optimum on the box `[lo, hi]` from `start` (module note).
-    fn relax(&self, lo: &[f64], hi: &[f64], start: &[f64], columns: &mut HashMap<usize, Vec<f64>>) -> Relaxed {
+    /// The relaxation's optimum on the box `[lo, hi]` from `start` (module note), with `Q start` when
+    /// it is known (then only the coordinates the box moves are added).
+    fn relax(&self, lo: &[f64], hi: &[f64], (start, known): (&[f64], Option<&[f64]>), columns: &mut HashMap<usize, Vec<f64>>) -> Relaxed {
         let blocks = self.blocks();
         let mut m: Vec<f64> = (0..blocks).map(|b| start[b].clamp(lo[b], hi[b])).collect();
-        let mut qm = vec![0.0; blocks];
+        let mut qm = known.map_or_else(|| vec![0.0; blocks], <[f64]>::to_vec);
         for b in 0..blocks {
-            if m[b] != 0.0 {
+            let moved = if known.is_some() { m[b] - start[b] } else { m[b] };
+            if moved != 0.0 {
                 let column = columns.entry(b).or_insert_with(|| self.column(b));
                 for (q, c) in qm.iter_mut().zip(column.iter()) {
-                    *q += m[b] * c;
+                    *q += moved * c;
                 }
             }
         }
@@ -211,7 +215,7 @@ impl Row<'_> {
                 (g * (lo[b] - m[b])).min(g * (hi[b] - m[b]))
             })
             .sum();
-        Relaxed { m, lower: value + slack.min(0.0) }
+        Relaxed { m, qm, lower: value + slack.min(0.0) }
     }
 
     /// `relaxed` rounded on the box `[lo, hi]`, then improved by exact single flips until none
@@ -256,7 +260,7 @@ impl Row<'_> {
         let blocks = self.blocks();
         let mut columns: HashMap<usize, Vec<f64>> = HashMap::new();
         let (lo, hi) = (vec![0.0; blocks], vec![1.0; blocks]);
-        let root = self.relax(&lo, &hi, start, &mut columns);
+        let root = self.relax(&lo, &hi, (start, None), &mut columns);
         let (mut best, mut upper) = self.round(&root, &lo, &hi, &mut columns);
         if upper - root.lower <= BIT || nodes == 0 {
             return (best, upper, root.lower.min(upper));
@@ -284,7 +288,7 @@ impl Row<'_> {
                 let (mut child_lo, mut child_hi) = (lo.clone(), hi.clone());
                 child_lo[j] = fixed;
                 child_hi[j] = fixed;
-                let child = self.relax(&child_lo, &child_hi, &node.m, &mut columns);
+                let child = self.relax(&child_lo, &child_hi, (&node.m, Some(&node.qm)), &mut columns);
                 let (on, value) = self.round(&child, &child_lo, &child_hi, &mut columns);
                 if value < upper {
                     (best, upper) = (on, value);
@@ -298,6 +302,117 @@ impl Row<'_> {
         }
         let lower = open.iter().map(|(_, _, r)| r.lower).fold(floor, f64::min).min(upper);
         (best, upper, lower)
+    }
+}
+
+/// The mean metric's coder of one site (module note): its pieces' Gram `K = U F Uᵀ`, its blocks
+/// (contiguous runs of pieces) and their bits, `κ`, and the branch-and-bound nodes per input. Every
+/// input is coded from its own products alone ([`Coder::code`]), so the products may come from
+/// anywhere (the CPU's float64 products of [`code_site`], a device's).
+#[derive(Clone, Debug)]
+pub struct Coder {
+    gram: Array2<f64>,
+    starts: Vec<usize>,
+    bits: Vec<f64>,
+    kappa: f64,
+    nodes: usize,
+}
+
+/// One input's code: its blocks on, its code and a lower bound on its best.
+pub type Coded = (Vec<bool>, f64, f64);
+
+impl Coder {
+    /// The coder of pieces whose Gram in the metric is `gram` (pieces × pieces), gated in blocks of
+    /// `ranks`, each priced at `bits`, at `n = observations`, with `nodes` branch-and-bound nodes.
+    pub fn new(gram: Array2<f64>, ranks: &[usize], bits: &[f64], observations: f64, nodes: usize) -> Result<Self, String> {
+        let pieces = gram.nrows();
+        if gram.ncols() != pieces || ranks.contains(&0) || ranks.iter().sum::<usize>() != pieces || bits.len() != ranks.len() {
+            return Err(format!("sparse code: blocks {ranks:?} with {} bits do not partition a {:?} Gram", bits.len(), gram.dim()));
+        }
+        let starts = std::iter::once(0)
+            .chain(ranks.iter().scan(0, |a, r| {
+                *a += r;
+                Some(*a)
+            }))
+            .collect();
+        Ok(Self { gram, starts, bits: bits.to_vec(), kappa: observations / (2.0 * std::f64::consts::LN_2), nodes })
+    }
+
+    /// The blocks' first pieces, and the end.
+    #[must_use]
+    pub fn starts(&self) -> &[usize] {
+        &self.starts
+    }
+
+    /// The number of blocks.
+    #[must_use]
+    pub fn blocks(&self) -> usize {
+        self.bits.len()
+    }
+
+    /// The pieces' Gram in the metric.
+    #[must_use]
+    pub fn gram(&self) -> &Array2<f64> {
+        &self.gram
+    }
+
+    /// Each block's bits.
+    #[must_use]
+    pub fn bits(&self) -> &[f64] {
+        &self.bits
+    }
+
+    /// `κ = n / (2 ln 2)`.
+    #[must_use]
+    pub fn kappa(&self) -> f64 {
+        self.kappa
+    }
+
+    /// The branch-and-bound nodes per input.
+    #[must_use]
+    pub fn nodes(&self) -> usize {
+        self.nodes
+    }
+
+    /// One input's code from its products: `z` (`v_c · x_t` per piece), `weights` (`(U F y_t)_c`
+    /// per piece) and `y_tᵀ F y_t`, from `start` (its blocks on, or none).
+    pub fn code(&self, z: &[f64], weights: &[f64], yfy: f64, start: Option<&[u32]>) -> Coded {
+        let blocks = self.bits.len();
+        let starts = &self.starts;
+        let k = &self.gram;
+        let linear: Vec<f64> =
+            (0..blocks).map(|b| self.bits[b] - 2.0 * self.kappa * (starts[b]..starts[b + 1]).map(|c| z[c] * weights[c]).sum::<f64>()).collect();
+        let diagonal: Vec<f64> = (0..blocks)
+            .map(|b| {
+                let block = starts[b]..starts[b + 1];
+                block.clone().map(|c| block.clone().map(|c2| z[c] * z[c2] * k[[c, c2]]).sum::<f64>()).sum::<f64>().max(0.0)
+            })
+            .collect();
+        let row = Row { z: z.to_vec(), linear, constant: self.kappa * yfy, diagonal, kappa: self.kappa, starts, operator: Operator::Mean(k) };
+        let mut m = vec![0.0; blocks];
+        for &b in start.unwrap_or(&[]) {
+            if let Some(slot) = m.get_mut(b as usize) {
+                *slot = 1.0;
+            }
+        }
+        row.code(&m, self.nodes)
+    }
+
+    /// Every input's code (rows of `z` and `weights`, entries of `yfy`), in parallel; `warm`, per
+    /// input its blocks on to start from.
+    pub fn code_rows(&self, z: ArrayView2<'_, f64>, weights: ArrayView2<'_, f64>, yfy: &[f64], warm: Option<&[Vec<u32>]>) -> Result<Vec<Coded>, String> {
+        let (rows, pieces) = z.dim();
+        if pieces != self.gram.nrows() || weights.dim() != (rows, pieces) || yfy.len() != rows || warm.is_some_and(|w| w.len() != rows) {
+            return Err(format!("sparse code: products {:?}, {:?} and {} constants for {pieces} pieces", z.dim(), weights.dim(), yfy.len()));
+        }
+        Ok((0..rows)
+            .into_par_iter()
+            .map(|r| {
+                let (zr, wr) = (z.row(r), weights.row(r));
+                let (zr, wr) = (zr.as_slice().map_or_else(|| zr.to_vec(), <[f64]>::to_vec), wr.as_slice().map_or_else(|| wr.to_vec(), <[f64]>::to_vec));
+                self.code(&zr, &wr, yfy[r], warm.map(|w| w[r].as_slice()))
+            })
+            .collect())
     }
 }
 
@@ -324,14 +439,14 @@ pub fn code_site(problem: &Problem<'_>, warm: Option<&[Vec<u32>]>) -> Result<Cod
         .collect();
     let kappa = problem.observations / (2.0 * std::f64::consts::LN_2);
     let u = problem.u.to_owned();
-    // The mean metric's pieces Gram `K = U F Uᵀ` and `F Uᵀ`, formed once.
+    // The mean metric's coder (its pieces Gram `K = U F Uᵀ`) and `F Uᵀ`, formed once.
     let mean = match &problem.metric {
         Metric::Mean(f) => {
             if f.dim() != (d_out, d_out) {
                 return Err(format!("sparse code: a {:?} metric for {d_out} writes", f.dim()));
             }
             let fu = fast_abt(&f.to_owned(), &u);
-            Some((fast_ab(&u, &fu), fu))
+            Some((Coder::new(fast_ab(&u, &fu), problem.ranks, problem.bits, problem.observations, problem.nodes)?, fu))
         }
         Metric::PerRow(draws) => {
             if draws.is_empty() || draws.iter().any(|g| g.dim() != (rows, d_out)) {
@@ -348,13 +463,12 @@ pub fn code_site(problem: &Problem<'_>, warm: Option<&[Vec<u32>]>) -> Result<Cod
         let reads = problem.reads.slice(s![first..last, ..]).to_owned();
         let targets = problem.targets.slice(s![first..last, ..]).to_owned();
         let z = fast_abt(&reads, &problem.v.to_owned());
-        // Per input: `U F y` and `yᵀ F y` (mean metric), or the per-draw projections.
-        let (weights, constants, projections): (Array2<f64>, Vec<f64>, Vec<Array2<f64>>) = match (&problem.metric, &mean) {
-            (Metric::Mean(f), Some((_, fu))) => {
+        let coded: Vec<Coded> = match (&problem.metric, &mean) {
+            (Metric::Mean(f), Some((coder, fu))) => {
                 let weights = fast_ab(&targets, fu);
                 let fy = fast_abt(&targets, &f.to_owned());
-                let constants = targets.outer_iter().zip(fy.outer_iter()).map(|(y, g)| kappa * y.dot(&g)).collect();
-                (weights, constants, Vec::new())
+                let yfy: Vec<f64> = targets.outer_iter().zip(fy.outer_iter()).map(|(y, g)| y.dot(&g)).collect();
+                coder.code_rows(z.view(), weights.view(), &yfy, warm.map(|w| &w[first..last]))?
             }
             (Metric::PerRow(draws), _) => {
                 let k = draws.len() as f64;
@@ -367,49 +481,39 @@ pub fn code_site(problem: &Problem<'_>, warm: Option<&[Vec<u32>]>) -> Result<Cod
                         w.scaled_add(ar / k, &pr);
                     }
                 }
-                let constants = (0..last - first).map(|r| kappa * along.iter().map(|a| a[r] * a[r]).sum::<f64>() / k).collect();
-                (weights, constants, projections)
-            }
-            _ => return Err("sparse code: a mean metric without its Gram".to_string()),
-        };
-        let coded: Vec<(Vec<bool>, f64, f64)> = (0..last - first)
-            .into_par_iter()
-            .map(|r| {
-                let zr = z.row(r).to_vec();
-                let operator = match &mean {
-                    Some((k, _)) => Operator::Mean(k),
-                    None => Operator::PerRow(Array2::from_shape_fn((projections.len(), pieces), |(j, c)| projections[j][[r, c]])),
-                };
-                let linear: Vec<f64> = (0..blocks)
-                    .map(|b| problem.bits[b] - 2.0 * kappa * (starts[b]..starts[b + 1]).map(|c| zr[c] * weights[[r, c]]).sum::<f64>())
-                    .collect();
-                let diagonal: Vec<f64> = (0..blocks)
-                    .map(|b| {
-                        let block = starts[b]..starts[b + 1];
-                        match &operator {
-                            Operator::Mean(k) => block.clone().map(|c| block.clone().map(|c2| zr[c] * zr[c2] * k[[c, c2]]).sum::<f64>()).sum::<f64>().max(0.0),
-                            Operator::PerRow(p) => {
-                                p.outer_iter().map(|row| block.clone().map(|c| row[c] * zr[c]).sum::<f64>().powi(2)).sum::<f64>() / p.nrows() as f64
-                            }
-                        }
-                    })
-                    .collect();
-                let row = Row { z: zr, linear, constant: constants[r], diagonal, kappa, starts: &starts, operator };
-                let start: Vec<f64> = match warm {
-                    Some(w) => {
-                        let mut m = vec![0.0; blocks];
-                        for &b in &w[first + r] {
-                            if let Some(slot) = m.get_mut(b as usize) {
+                let constants: Vec<f64> = (0..last - first).map(|r| kappa * along.iter().map(|a| a[r] * a[r]).sum::<f64>() / k).collect();
+                (0..last - first)
+                    .into_par_iter()
+                    .map(|r| {
+                        let zr = z.row(r).to_vec();
+                        let operator = Operator::PerRow(Array2::from_shape_fn((projections.len(), pieces), |(j, c)| projections[j][[r, c]]));
+                        let linear: Vec<f64> = (0..blocks)
+                            .map(|b| problem.bits[b] - 2.0 * kappa * (starts[b]..starts[b + 1]).map(|c| zr[c] * weights[[r, c]]).sum::<f64>())
+                            .collect();
+                        let diagonal: Vec<f64> = (0..blocks)
+                            .map(|b| {
+                                let block = starts[b]..starts[b + 1];
+                                match &operator {
+                                    Operator::PerRow(p) => {
+                                        p.outer_iter().map(|row| block.clone().map(|c| row[c] * zr[c]).sum::<f64>().powi(2)).sum::<f64>() / p.nrows() as f64
+                                    }
+                                    Operator::Mean(_) => 0.0,
+                                }
+                            })
+                            .collect();
+                        let row = Row { z: zr, linear, constant: constants[r], diagonal, kappa, starts: &starts, operator };
+                        let mut start = vec![0.0; blocks];
+                        for &b in warm.map_or(&[][..], |w| w[first + r].as_slice()) {
+                            if let Some(slot) = start.get_mut(b as usize) {
                                 *slot = 1.0;
                             }
                         }
-                        m
-                    }
-                    None => vec![0.0; blocks],
-                };
-                row.code(&start, problem.nodes)
-            })
-            .collect();
+                        row.code(&start, problem.nodes)
+                    })
+                    .collect()
+            }
+            _ => return Err("sparse code: a mean metric without its Gram".to_string()),
+        };
         // What each input's blocks leave of its real output.
         let mut gated = z.clone();
         for (r, (on, _, _)) in coded.iter().enumerate() {

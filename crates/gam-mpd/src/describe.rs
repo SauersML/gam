@@ -344,9 +344,11 @@ fn symmetric(m: &Array2<f64>) -> Array2<f64> {
 }
 
 /// `a b` through faer, so inside a site's per-subcomponent pricing (run in parallel under
-/// `gam_linalg::faer_ndarray::with_nested_parallel`) it stays on its own thread.
+/// `gam_linalg::faer_ndarray::with_nested_parallel`) it stays on its own thread; inside
+/// `super::combine::map` the blocks' products with the same large matrix (the metric, its roots)
+/// run as one.
 fn mm<A: ndarray::Data<Elem = f64>, B: ndarray::Data<Elem = f64>>(a: &ndarray::ArrayBase<A, ndarray::Ix2>, b: &ndarray::ArrayBase<B, ndarray::Ix2>) -> Array2<f64> {
-    gam_linalg::faer_ndarray::fast_ab(a, b)
+    super::combine::product(a, b)
 }
 
 /// The pseudo-inverse and the pseudo-inverse root of a symmetric positive semidefinite matrix,
@@ -1203,11 +1205,36 @@ pub struct Structured {
     pub calibration: f64,
     /// Per `(site, index)`, the last description given ([`Structured::describe_cached`]).
     cache: Mutex<HashMap<(usize, usize), Description>>,
+    /// Per site and block content (its factors and the calibration), the total of its search: a
+    /// block priced once is never searched again.
+    priced: Mutex<HashMap<(usize, u64), f64>>,
+}
+
+/// A block's content with the price's calibration, as one hash.
+fn content(u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>, calibration: f64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (u.dim(), v.dim(), calibration.to_bits()).hash(&mut hasher);
+    for x in u.iter().chain(v.iter()) {
+        x.to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 impl Structured {
     pub fn new(sites: Vec<Geometry>) -> Self {
-        Self { sites, calibration: 1.0, cache: Mutex::new(HashMap::new()) }
+        Self { sites, calibration: 1.0, cache: Mutex::new(HashMap::new()), priced: Mutex::new(HashMap::new()) }
+    }
+
+    /// The total of a fresh search for the block, from its content's earlier one when there is one.
+    fn searched_total(&self, site: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<f64, String> {
+        let key = (site, content(u, v, self.calibration));
+        if let Some(total) = self.priced.lock().map_err(|e| e.to_string())?.get(&key) {
+            return Ok(*total);
+        }
+        let total = self.describe(site, u, v)?.total();
+        self.priced.lock().map_err(|e| e.to_string())?.insert(key, total);
+        Ok(total)
     }
 
     /// The description of block `index` of site `site`, from its last one when it can: re-sent in
@@ -1226,6 +1253,7 @@ impl Structured {
             return Ok(d);
         }
         let d = self.describe(site, u, v)?;
+        self.priced.lock().map_err(|e| e.to_string())?.insert((site, content(u, v, self.calibration)), d.total());
         self.cache.lock().map_err(|e| e.to_string())?.insert((site, index), d.clone());
         Ok(d)
     }
@@ -1247,7 +1275,7 @@ impl super::blocks::Describe for Structured {
         if u.nrows() == 0 {
             return Ok(0.0);
         }
-        Ok(self.describe(site, u, v)?.total())
+        self.searched_total(site, u, v)
     }
 
     fn bits_at(&self, site: usize, index: usize, u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Result<f64, String> {

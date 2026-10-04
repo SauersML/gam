@@ -578,3 +578,204 @@ impl DeviceCoder {
         Ok(out)
     }
 }
+
+/// Every device the core path may use under the process's [`Choice`] (every CUDA accelerator for
+/// [`Choice::Float64`]; those, else the Apple GPU, for [`Choice::Any`]); empty runs the CPU path.
+pub fn devices() -> Result<Vec<Device>, String> {
+    match CHOICE.get().copied().unwrap_or(Choice::Float64) {
+        Choice::Off => Ok(Vec::new()),
+        choice => {
+            let accelerators = Device::accelerators(gam_gpu::global_policy()).map_err(error)?;
+            if !accelerators.is_empty() || choice == Choice::Float64 {
+                return Ok(accelerators);
+            }
+            Ok(device()?.into_iter().collect())
+        }
+    }
+}
+
+/// Several devices' evaluators of the same passages: a list of subsets is spread over them, one
+/// thread a device, each subset's numbers the same whichever device runs it.
+pub struct Evaluators<'a> {
+    each: Vec<Evaluator<'a>>,
+}
+
+impl<'a> Evaluators<'a> {
+    /// `passages` of `model` on every device of `devices` (at least one).
+    pub fn new(devices: &[Device], model: &'a OperatorProgram, passages: &'a [Passage]) -> Result<Self, String> {
+        if devices.is_empty() {
+            return Err("core device: evaluators need a device".to_string());
+        }
+        Ok(Self { each: devices.iter().map(|d| Evaluator::new(d, model, passages)).collect::<Result<_, _>>()? })
+    }
+
+    /// The first device's evaluator.
+    #[must_use]
+    pub fn first(&self) -> &Evaluator<'a> {
+        &self.each[0]
+    }
+
+    /// Every evaluator's products in `arithmetic` from now on.
+    pub fn set_arithmetic(&self, arithmetic: Arithmetic) {
+        for e in &self.each {
+            e.set_arithmetic(arithmetic);
+        }
+    }
+
+    /// Per subset of `subsets` (each its members), [`Evaluator::kls`] on the passages `which`, the
+    /// subsets taken in turn by the devices.
+    pub fn kls_each(&self, replacement: &dyn Replacement, subsets: &[Vec<usize>], which: &[usize]) -> Result<Vec<Vec<Array1<f64>>>, String> {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let found: Vec<Vec<(usize, Result<Vec<Array1<f64>>, String>)>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = self
+                .each
+                .iter()
+                .map(|evaluator| {
+                    let next = &next;
+                    scope.spawn(move || {
+                        let mut mine = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(members) = subsets.get(i) else { break };
+                            mine.push((i, evaluator.kls(replacement, members, which)));
+                        }
+                        mine
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).collect()
+        });
+        let mut out: Vec<Option<Vec<Array1<f64>>>> = (0..subsets.len()).map(|_| None).collect();
+        for (i, kls) in found.into_iter().flatten() {
+            out[i] = Some(kls?);
+        }
+        out.into_iter().map(|k| k.ok_or_else(|| "core device: a subset no device ran".to_string())).collect()
+    }
+}
+
+/// A site's fit inputs on a device (`super::site_fit`'s passes over its inputs run there): its reads
+/// `x` (inputs × d_in), its outputs `y = x Wᵀ` and each input's `yᵀ F y`, the fit's own values
+/// uploaded once per fit.
+pub struct FitInputs {
+    device: Device,
+    x: Tensor,
+    y: Tensor,
+    yfy: Tensor,
+}
+
+impl FitInputs {
+    /// The fit's reads, outputs and `yᵀ F y` on `device`.
+    pub fn new(device: &Device, reads: &Array2<f32>, y: &Array2<f32>, yfy: &[f64]) -> Result<Self, String> {
+        let up = |m: &Array2<f32>| device.upload(m.mapv(f64::from).view()).map_err(error);
+        Ok(Self { device: device.clone(), x: up(reads)?, y: up(y)?, yfy: device.upload_vec(yfy.len(), 1, yfy.to_vec()).map_err(error)? })
+    }
+
+    /// Every input's certified code under `coder` for the library whose reads are `v` (columns ×
+    /// d_in) and whose writes in the metric are `uf = U F` (columns × d_out): the products `a = x
+    /// Vᵀ` and `g = y (U F)ᵀ` in f32 (as the fit's own), the coder on the device. Per input its
+    /// blocks on (inputs × blocks, 1 or 0) and its code.
+    pub fn select(&self, (v, uf): (&Array2<f32>, &Array2<f32>), coder: &super::sparse_code::Coder) -> Result<(Array2<f64>, Vec<f64>), String> {
+        let d = &self.device;
+        let up = |m: &Array2<f32>| d.upload(m.mapv(f64::from).view()).map_err(error);
+        let (v, uf) = (up(v)?, up(uf)?);
+        let rows = self.x.rows();
+        let mut a = d.zeros(rows, v.rows()).map_err(error)?;
+        d.gemm(&mut a, 1.0, &self.x, Op::N, &v, Op::T, 0.0, Arithmetic::F32).map_err(error)?;
+        let mut g = d.zeros(rows, uf.rows()).map_err(error)?;
+        d.gemm(&mut g, 1.0, &self.y, Op::N, &uf, Op::T, 0.0, Arithmetic::F32).map_err(error)?;
+        drop((v, uf));
+        let (on, upper, _) = DeviceCoder::new(d, coder.clone())?.code(d, (&a, &g, &self.yfy))?;
+        Ok((d.download(&on).map_err(error)?, upper))
+    }
+
+    /// A library's operands on the device: its reads `V`, its writes in the metric `U F` and their
+    /// Gram `K = U F Uᵀ` (the fit's own single-precision values).
+    pub fn operands(&self, (v, uf, k): (&Array2<f32>, &Array2<f32>, &Array2<f32>)) -> Result<FitOperands, String> {
+        let up = |m: &Array2<f32>| self.device.upload(m.mapv(f64::from).view()).map_err(error);
+        Ok(FitOperands { v: up(v)?, uf: up(uf)?, k: up(k)? })
+    }
+
+    fn upload(&self, m: &Array2<f32>) -> Result<Tensor, String> {
+        self.device.upload(m.mapv(f64::from).view()).map_err(error)
+    }
+
+    /// `z = (x Vᵀ) ⊙ gates`, every input's reads that run.
+    fn gated(&self, v: &Tensor, gates: &Tensor) -> Result<Tensor, String> {
+        let d = &self.device;
+        let mut a = d.zeros(self.x.rows(), v.rows()).map_err(error)?;
+        d.gemm(&mut a, 1.0, &self.x, Op::N, v, Op::T, 0.0, Arithmetic::F32).map_err(error)?;
+        let mut z = d.zeros(a.rows(), a.cols()).map_err(error)?;
+        d.hadamard(&mut z, &a, gates, false).map_err(error)?;
+        Ok(z)
+    }
+
+    /// Per row of `a` and `b` (both rows × width), `Σ_j a_rj b_rj`.
+    fn row_dots(&self, a: &Tensor, b: &Tensor) -> Result<Vec<f64>, String> {
+        let d = &self.device;
+        let mut product = d.zeros(a.rows(), a.cols()).map_err(error)?;
+        d.hadamard(&mut product, a, b, false).map_err(error)?;
+        let ones = d.upload_vec(a.cols(), 1, vec![1.0; a.cols()]).map_err(error)?;
+        let mut out = d.zeros(a.rows(), 1).map_err(error)?;
+        let exact = if d.float64() { Arithmetic::F64 } else { Arithmetic::F32 };
+        d.gemm(&mut out, 1.0, &product, Op::N, &ones, Op::N, 0.0, exact).map_err(error)?;
+        Ok(d.download(&out).map_err(error)?.column(0).to_vec())
+    }
+
+    /// Every input's error `eᵀ F e` under the column gates `gates` (inputs × columns, 1 where a
+    /// column's block runs): `yᵀ F y − 2 zᵀ g + zᵀ K z`, `g = U F y`.
+    pub fn errors(&self, ops: &FitOperands, gates: &Array2<f32>) -> Result<Vec<f64>, String> {
+        let d = &self.device;
+        let z = self.gated(&ops.v, &self.upload(gates)?)?;
+        let mut g = d.zeros(z.rows(), z.cols()).map_err(error)?;
+        d.gemm(&mut g, 1.0, &self.y, Op::N, &ops.uf, Op::T, 0.0, Arithmetic::F32).map_err(error)?;
+        let mut p = d.zeros(z.rows(), z.cols()).map_err(error)?;
+        d.gemm(&mut p, 1.0, &z, Op::N, &ops.k, Op::N, 0.0, Arithmetic::F32).map_err(error)?;
+        let (zg, zp) = (self.row_dots(&z, &g)?, self.row_dots(&z, &p)?);
+        let yfy = d.download(&self.yfy).map_err(error)?;
+        Ok(yfy.column(0).iter().zip(zg).zip(zp).map(|((y, a), b)| y - 2.0 * a + b).collect())
+    }
+
+    /// The writes' normal equations under the column gates: `Q = Σ_t z_t z_tᵀ` (columns ×
+    /// columns) and `R = Σ_t z_t y_tᵀ` (columns × d_out).
+    pub fn normal(&self, v: &Array2<f32>, gates: &Array2<f32>) -> Result<(Array2<f64>, Array2<f64>), String> {
+        let d = &self.device;
+        let z = self.gated(&self.upload(v)?, &self.upload(gates)?)?;
+        let mut q = d.zeros(z.cols(), z.cols()).map_err(error)?;
+        d.gemm(&mut q, 1.0, &z, Op::T, &z, Op::N, 0.0, Arithmetic::F32).map_err(error)?;
+        let mut r = d.zeros(z.cols(), self.y.cols()).map_err(error)?;
+        d.gemm(&mut r, 1.0, &z, Op::T, &self.y, Op::N, 0.0, Arithmetic::F32).map_err(error)?;
+        Ok((d.download(&q).map_err(error)?, d.download(&r).map_err(error)?))
+    }
+
+    /// The reads' gradient under the column gates, `Σ_t (gates ⊙ (−2 w h_t))ᵀ x_t` with `h = U F y −
+    /// K z` and `w = weight` (columns × d_in).
+    pub fn read_gradient(&self, ops: &FitOperands, gates: &Array2<f32>, weight: f64) -> Result<Array2<f64>, String> {
+        let d = &self.device;
+        let gates = self.upload(gates)?;
+        let z = self.gated(&ops.v, &gates)?;
+        let mut h = d.zeros(z.rows(), z.cols()).map_err(error)?;
+        d.gemm(&mut h, 1.0, &self.y, Op::N, &ops.uf, Op::T, 0.0, Arithmetic::F32).map_err(error)?;
+        d.gemm(&mut h, -1.0, &z, Op::N, &ops.k, Op::N, 1.0, Arithmetic::F32).map_err(error)?;
+        let mut on = d.zeros(h.rows(), h.cols()).map_err(error)?;
+        d.hadamard(&mut on, &gates, &h, false).map_err(error)?;
+        let mut gradient = d.zeros(on.cols(), self.x.cols()).map_err(error)?;
+        d.gemm(&mut gradient, -2.0 * weight, &on, Op::T, &self.x, Op::N, 0.0, Arithmetic::F32).map_err(error)?;
+        d.download(&gradient).map_err(error)
+    }
+
+    /// `2 w Σ_t δz_tᵀ K δz_t` with `δz = (x Dᵀ) ⊙ gates` for the reads' direction `direction`.
+    pub fn curvature(&self, ops: &FitOperands, direction: &Array2<f32>, gates: &Array2<f32>, weight: f64) -> Result<f64, String> {
+        let d = &self.device;
+        let dz = self.gated(&self.upload(direction)?, &self.upload(gates)?)?;
+        let mut dk = d.zeros(dz.rows(), dz.cols()).map_err(error)?;
+        d.gemm(&mut dk, 1.0, &dz, Op::N, &ops.k, Op::N, 0.0, Arithmetic::F32).map_err(error)?;
+        Ok(2.0 * weight * self.row_dots(&dz, &dk)?.iter().sum::<f64>())
+    }
+}
+
+/// A library's operands for [`FitInputs`]' passes.
+pub struct FitOperands {
+    v: Tensor,
+    uf: Tensor,
+    k: Tensor,
+}

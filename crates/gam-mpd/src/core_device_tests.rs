@@ -156,6 +156,27 @@ fn the_sparse_code_on_a_device_is_the_cpus() {
                     assert!((lower[r] - bound).abs() <= 1e-9 * bound.abs().max(1.0), "{what}: bound {} against {bound}", lower[r]);
                 }
             }
+            // The Apple GPU's f32 kernel: the same steps, its decisions the CPU's on all but the
+            // closest calls, its bounds consistent.
+            if let Ok(Some(metal)) = Device::single_precision(gam_gpu::GpuPolicy::Auto)
+                && !metal.float64()
+            {
+                let resident = DeviceCoder::new(&metal, coder.clone()).expect("metal coder");
+                let up = |x: &Array2<f64>| metal.upload(x.view()).expect("upload");
+                let yfy_column = Array2::from_shape_vec((rows, 1), yfy.clone()).expect("column");
+                let (on, upper, lower) = resident.code(&metal, (&up(&z), &up(&weights), &up(&yfy_column))).expect("metal code");
+                let on = metal.download(&on).expect("download");
+                let mut agree = 0;
+                for (r, (sets, code, _)) in cpu.iter().enumerate() {
+                    let device_sets: Vec<bool> = on.row(r).iter().map(|x| *x == 1.0).collect();
+                    assert!(lower[r] <= upper[r] + 1e-3 * upper[r].abs().max(1.0), "metal row {r}: bounds {} above {}", lower[r], upper[r]);
+                    if &device_sets == sets {
+                        agree += 1;
+                        assert!((upper[r] - code).abs() <= 1e-4 * code.abs().max(1.0), "metal row {r}: code {} against {code}", upper[r]);
+                    }
+                }
+                assert!(agree * 10 >= rows * 9, "metal ranks {ranks:?} nodes {nodes}: {agree} of {rows} rows as the CPU's");
+            }
         }
     }
 }

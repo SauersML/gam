@@ -45,12 +45,11 @@
 //!
 //! Alternating steps that each lower that one total:
 //!
-//! * **Sets.** Each input's on-set, from all on: the subcomponents each worth their own bits alone,
-//!   `n a_tc² u_cᵀFu_c / (2 ln 2) > bits(c)`, when they code the input in fewer bits than all on,
-//!   then single flips swept until none lowers its code. Every selection starts there, so an
-//!   input's sets are a function of its read alone, the rule a forward runs ([`Selector`]), and the
-//!   fit is judged by the sets that rule will choose. A flip of `c` changes the error by `∓2 a_tc
-//!   (U F e_t)_c + a_tc² (U F Uᵀ)_cc`, so each is `O(C)` with `U F e_t` kept up to date.
+//! * **Sets.** Each input's on-set is its certified sparse code ([`super::sparse_code::Coder`]):
+//!   the code's convex relaxation on the box, rounded and improved by exact single flips, branched
+//!   within [`NODES`] nodes while its bounds are more than a bit apart. It reads the input's products
+//!   alone (`a_t`, `U F y_t`, `y_tᵀ F y_t`), so an input's sets are a function of its read, the rule a
+//!   forward runs ([`Selector`]), and the fit is judged by the sets that rule will choose.
 //! * **Writes.** With the sets and reads fixed the error is a quadratic in `U` whose metric `F`
 //!   factors out, `tr F (UᵀQU − 2UᵀR)`, `Q = Σ_t z̃_t z̃_tᵀ`, `R = Σ_t z̃_t y_tᵀ`, `z̃_t` the reads on.
 //!   Every subcomponent on is the map exactly, on every read direction (in the metric `E√Λ` of the
@@ -85,6 +84,7 @@ use gam_linalg::decompose::{QrMode, eigh, qr, svd};
 use super::derivatives::vjp;
 use super::device::proposing;
 use super::masked::{Library, Site, Target, read_values, sampled_label_cotangent};
+use super::sparse_code::Coder;
 use super::operator_program::{FamilyInputs, OperatorProgram};
 use faer::linalg::matmul::matmul;
 use faer::{Accum, MatMut, MatRef};
@@ -262,6 +262,9 @@ struct Fitting<'a> {
     pieces: usize,
     /// Inputs × pieces, 1 where on.
     masks: Vec<u8>,
+    /// The reads, outputs and `yᵀ F y` on the core path's device, where there is one: every
+    /// input's sets are chosen there ([`super::core_device::FitInputs`]).
+    device: Option<super::core_device::FitInputs>,
 }
 
 /// The products every pass over the inputs needs: `V`, `U F` and `K = U F Uᵀ` in single precision,
@@ -273,12 +276,9 @@ struct Operands {
     k: Array2<f64>,
 }
 
-/// What the inputs `start..end` of a chunk need under their sets: every read `a`, the site's own
-/// output in the Fisher, `g = U F y`, the written error's `h = U F e` (`e = y − Uᵀ z`, `z` the reads
-/// on), and each input's error `eᵀ F e`.
+/// What the inputs `start..end` of a chunk need under their sets: the written error's `h = U F e`
+/// (`e = y − Uᵀ z`, `z` the reads on) and each input's error `eᵀ F e`.
 struct Residuals {
-    a: Array2<f32>,
-    g: Array2<f32>,
     h: Array2<f32>,
     error: Vec<f64>,
 }
@@ -329,84 +329,8 @@ fn partition(ranks: &[usize]) -> (Vec<usize>, Vec<usize>) {
     (block_of, starts)
 }
 
-/// What every input's sets are chosen against: `K = U F Uᵀ`, the blocks' first columns `starts`
-/// (column runs), their description `bits`, and `weight` bits per unit of error.
-struct Gram<'b> {
-    k: &'b Array2<f64>,
-    starts: &'b [usize],
-    bits: &'b [f64],
-    weight: f64,
-}
-
-/// One input as its sets see it: its reads `a`, `g = U F y`, its `yᵀ F y`, and for its current sets
-/// `h = U F e` (kept up to date) and `error = eᵀ F e`.
-struct Input {
-    a: Vec<f64>,
-    g: Vec<f64>,
-    yfy: f64,
-    h: Vec<f64>,
-    error: f64,
-}
-
-/// One input's sets (module note, "Sets") `m` over the blocks of `gram`: with `flip`, the blocks each
-/// worth their own bits alone when they code the input in fewer bits than its current sets, then
-/// single flips swept until none lowers its code. Returns the input's description and error bits.
-fn select(gram: &Gram<'_>, input: &mut Input, m: &mut [u8], flip: bool) -> (f64, f64) {
-    let Gram { k, starts, bits, weight } = *gram;
-    let Input { a, g, yfy, h, error } = input;
-    let (yfy, mut error) = (*yfy, *error);
-    let blocks = bits.len();
-    let columns = |b: usize| starts[b]..starts[b + 1];
-    // `aᵀ K a` over block `b`'s columns.
-    let own = |b: usize| -> f64 { columns(b).map(|i| a[i] * columns(b).map(|j| k[[i, j]] * a[j]).sum::<f64>()).sum() };
-    if flip {
-        let listed: f64 = (0..blocks).filter(|b| m[*b] == 1).map(|b| bits[b]).sum();
-        let alone: Vec<usize> = (0..blocks).filter(|&b| weight * own(b) > bits[b]).collect();
-        let cols: Vec<usize> = alone.iter().flat_map(|&b| columns(b)).collect();
-        let alone_error = yfy - 2.0 * cols.iter().map(|&i| a[i] * g[i]).sum::<f64>()
-            + cols.iter().map(|&i| a[i] * cols.iter().map(|&j| k[[i, j]] * a[j]).sum::<f64>()).sum::<f64>();
-        let alone_bits: f64 = alone.iter().map(|&b| bits[b]).sum();
-        if alone_bits + weight * alone_error.max(0.0) < listed + weight * error.max(0.0) {
-            m.fill(0);
-            for &b in &alone {
-                m[b] = 1;
-            }
-            h.copy_from_slice(g.as_slice());
-            // `K` is symmetric: column `i` is row `i`.
-            for &i in &cols {
-                for (hj, kij) in h.iter_mut().zip(k.row(i)) {
-                    *hj -= kij * a[i];
-                }
-            }
-            error = alone_error;
-        }
-        for _ in 0..blocks.max(1) {
-            let mut flipped = false;
-            for b in 0..blocks {
-                // Running `b` writes `Uᵀ a_b` more; dropping it, that much less.
-                let sigma = if m[b] == 1 { -1.0 } else { 1.0 };
-                let along: f64 = columns(b).map(|i| a[i] * h[i]).sum();
-                let delta = -2.0 * sigma * along + own(b);
-                if sigma * bits[b] + weight * delta < 0.0 {
-                    error += delta;
-                    for i in columns(b) {
-                        for (hj, kij) in h.iter_mut().zip(k.row(i)) {
-                            *hj -= sigma * kij * a[i];
-                        }
-                    }
-                    m[b] = u8::from(sigma > 0.0);
-                    flipped = true;
-                }
-            }
-            if !flipped {
-                break;
-            }
-        }
-    }
-    input.error = error;
-    let listed: f64 = (0..blocks).filter(|b| m[*b] == 1).map(|b| bits[b]).sum();
-    (listed, weight * error.max(0.0))
-}
+/// Branch-and-bound nodes per input of every selection ([`super::sparse_code::Coder`]).
+pub const NODES: usize = 64;
 
 impl<'a> Fitting<'a> {
     /// The state of a fit of `pieces` subcomponents on `samples`, every subcomponent on.
@@ -420,7 +344,8 @@ impl<'a> Fitting<'a> {
         let y = product(x.view(), false, single(w).view(), true);
         let yf = product(y.view(), false, single(&samples.fisher).view(), false);
         let yfy: Vec<f64> = (0..rows).map(|t| y.row(t).iter().zip(yf.row(t).iter()).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum()).collect();
-        Ok(Self { x, w: w.clone(), y, yfy, fisher: &samples.fisher, scale: observations / (2.0 * LN_2), pieces, masks: vec![1; rows * pieces] })
+        let device = super::core_device::device()?.map(|d| super::core_device::FitInputs::new(&d, x, &y, &yfy)).transpose()?;
+        Ok(Self { x, w: w.clone(), y, yfy, fisher: &samples.fisher, scale: observations / (2.0 * LN_2), pieces, masks: vec![1; rows * pieces], device })
     }
 
     fn rows(&self) -> usize {
@@ -450,7 +375,7 @@ impl<'a> Fitting<'a> {
                 self.yfy[start + r] - 2.0 * zg + zp
             })
             .collect();
-        Residuals { a, g, h, error }
+        Residuals { h, error }
     }
 
     /// The column gates of the inputs `start..end` from block sets `masks` (inputs × blocks).
@@ -460,44 +385,67 @@ impl<'a> Fitting<'a> {
     }
 
     /// The code of `(v, u)` gated in blocks of `ranks` (column runs, module note "Blocks"): `masks`
-    /// (inputs × blocks) are the sets, with `flip` selected first from all on (module note, "Sets").
-    /// Returns the total description and error bits.
-    fn code_blocks(&self, v: &Array2<f64>, u: &Array2<f64>, ranks: &[usize], bits: &[f64], masks: &mut [u8], flip: bool) -> (f64, f64) {
-        if flip {
-            masks.fill(1);
-        }
+    /// (inputs × blocks) are the sets, with `select` every input's chosen first (module note,
+    /// "Sets"). Returns the total description and error bits.
+    fn code_blocks(&self, v: &Array2<f64>, u: &Array2<f64>, ranks: &[usize], bits: &[f64], masks: &mut [u8], select: bool) -> Result<(f64, f64), String> {
         let blocks = ranks.len();
-        let (block_of, starts) = partition(ranks);
+        let (block_of, _) = partition(ranks);
         let ops = self.operands(v, u);
+        let coder = if select { Some(Coder::new(ops.k.clone(), ranks, bits, self.scale * 2.0 * LN_2, NODES)?) } else { None };
         let (mut description, mut error) = (0.0, 0.0);
+        if let (Some(coder), Some(device)) = (&coder, &self.device) {
+            let (on, upper) = device.select((&ops.v32, &ops.uf32), coder)?;
+            for ((m, row), upper) in masks.chunks_mut(blocks).zip(on.outer_iter()).zip(upper) {
+                let listed: f64 = (0..blocks).filter(|b| row[*b] == 1.0).map(|b| bits[b]).sum();
+                for (slot, o) in m.iter_mut().zip(row.iter()) {
+                    *slot = u8::from(*o == 1.0);
+                }
+                description += listed;
+                error += (upper - listed).max(0.0);
+            }
+            return Ok((description, error));
+        }
+        if let (None, Some(device)) = (&coder, &self.device) {
+            let errors = device.errors(&device.operands((&ops.v32, &ops.uf32, &ops.k32))?, &self.gates(0, self.rows(), masks, &block_of))?;
+            for (m, e) in masks.chunks(blocks).zip(errors) {
+                description += (0..blocks).filter(|b| m[*b] == 1).map(|b| bits[b]).sum::<f64>();
+                error += self.scale * e.max(0.0);
+            }
+            return Ok((description, error));
+        }
         for start in (0..self.rows()).step_by(CHUNK) {
             let end = (start + CHUNK).min(self.rows());
+            if let Some(coder) = &coder {
+                let ops32 = (ops.v32.view(), ops.uf32.view());
+                let a = product(self.x.slice(s![start..end, ..]), false, ops32.0, true);
+                let g = product(self.y.slice(s![start..end, ..]), false, ops32.1, true);
+                let coded = coder.code_rows(a.mapv(f64::from).view(), g.mapv(f64::from).view(), &self.yfy[start..end], None)?;
+                for (m, (on, upper, _)) in masks[start * blocks..end * blocks].chunks_mut(blocks).zip(coded) {
+                    let listed: f64 = (0..blocks).filter(|b| on[*b]).map(|b| bits[b]).sum();
+                    for (slot, o) in m.iter_mut().zip(&on) {
+                        *slot = u8::from(*o);
+                    }
+                    description += listed;
+                    error += (upper - listed).max(0.0);
+                }
+                continue;
+            }
             let on = self.gates(start, end, masks, &block_of);
             let res = self.residuals(start, end, &ops, &on);
-            let gram = Gram { k: &ops.k, starts: &starts, bits, weight: self.scale };
-            let results: Vec<(f64, f64)> = masks[start * blocks..end * blocks]
-                .par_chunks_mut(blocks)
-                .enumerate()
-                .map(|(r, m)| {
-                    let widen = |row: ndarray::ArrayView1<'_, f32>| row.iter().map(|x| f64::from(*x)).collect::<Vec<f64>>();
-                    let mut input = Input { a: widen(res.a.row(r)), g: widen(res.g.row(r)), yfy: self.yfy[start + r], h: widen(res.h.row(r)), error: res.error[r] };
-                    select(&gram, &mut input, m, flip)
-                })
-                .collect();
-            for (listed, err) in results {
-                description += listed;
-                error += err;
+            for (r, m) in masks[start * blocks..end * blocks].chunks(blocks).enumerate() {
+                description += (0..blocks).filter(|b| m[*b] == 1).map(|b| bits[b]).sum::<f64>();
+                error += self.scale * res.error[r].max(0.0);
             }
         }
-        (description, error)
+        Ok((description, error))
     }
 
     /// The code of `(v, u)`, every subcomponent its own gate (module note); with `flip`, every
     /// input's sets selected first (module note, "Sets"). Returns the total description and error bits.
-    fn code(&mut self, v: &Array2<f64>, u: &Array2<f64>, bits: &Array1<f64>, flip: bool) -> (f64, f64) {
+    fn code(&mut self, v: &Array2<f64>, u: &Array2<f64>, bits: &Array1<f64>, select: bool) -> Result<(f64, f64), String> {
         let mut masks = std::mem::take(&mut self.masks);
         let bits = bits.to_vec();
-        let out = self.code_blocks(v, u, &vec![1; self.pieces], &bits, &mut masks, flip);
+        let out = self.code_blocks(v, u, &vec![1; self.pieces], &bits, &mut masks, select);
         self.masks = masks;
         out
     }
@@ -521,16 +469,21 @@ impl<'a> Fitting<'a> {
         let c_total = self.pieces;
         let v32 = single(v);
         let block_of: Vec<usize> = (0..c_total).collect();
-        let mut q32 = Array2::<f32>::zeros((c_total, c_total));
-        let mut r32 = Array2::<f32>::zeros((c_total, self.y.ncols()));
-        for start in (0..self.rows()).step_by(CHUNK) {
-            let end = (start + CHUNK).min(self.rows());
-            let a = product(self.x.slice(s![start..end, ..]), false, v32.view(), true);
-            let z = &a * &self.gates(start, end, &self.masks, &block_of);
-            gemm(&mut q32, true, z.view(), true, z.view(), false, 1.0);
-            gemm(&mut r32, true, z.view(), true, self.y.slice(s![start..end, ..]), false, 1.0);
-        }
-        let q = q32.mapv(f64::from);
+        let (q, r) = match &self.device {
+            Some(device) => device.normal(&v32, &self.gates(0, self.rows(), &self.masks, &block_of))?,
+            None => {
+                let mut q32 = Array2::<f32>::zeros((c_total, c_total));
+                let mut r32 = Array2::<f32>::zeros((c_total, self.y.ncols()));
+                for start in (0..self.rows()).step_by(CHUNK) {
+                    let end = (start + CHUNK).min(self.rows());
+                    let a = product(self.x.slice(s![start..end, ..]), false, v32.view(), true);
+                    let z = &a * &self.gates(start, end, &self.masks, &block_of);
+                    gemm(&mut q32, true, z.view(), true, z.view(), false, 1.0);
+                    gemm(&mut r32, true, z.view(), true, self.y.slice(s![start..end, ..]), false, 1.0);
+                }
+                (q32.mapv(f64::from), r32.mapv(f64::from))
+            }
+        };
         // On every read direction (`x = E√Λ ξ`) the constraint is `Uᵀ (V E√Λ) = W E√Λ`.
         let decomposed = svd(v.dot(span).view(), true).map_err(|e| format!("{e:?}"))?;
         let rank = decomposed.singular_values.iter().filter(|s| **s > decomposed.band).count();
@@ -540,7 +493,7 @@ impl<'a> Fitting<'a> {
         let null = decomposed.u.slice(s![.., rank..]).to_owned();
         // `NᵀQN` is resolved only as far as `Q` itself is: its band is `Q`'s, bounded by its trace.
         let reduced = null.t().dot(&q).dot(&null);
-        let z = pseudo_inverse_within(&reduced, self.rows(), q.diag().sum())?.dot(&null.t().dot(&(r32.mapv(f64::from) - q.dot(&particular))));
+        let z = pseudo_inverse_within(&reduced, self.rows(), q.diag().sum())?.dot(&null.t().dot(&(r - q.dot(&particular))));
         Ok(particular + null.dot(&z))
     }
 
@@ -550,20 +503,32 @@ impl<'a> Fitting<'a> {
         let c_total = self.pieces;
         let ops = self.operands(v, u);
         let block_of: Vec<usize> = (0..c_total).collect();
-        let mut gradient = Array2::<f32>::zeros(v.dim());
         let mut left = vec![0.0f64; c_total];
-        for start in (0..self.rows()).step_by(CHUNK) {
-            let end = (start + CHUNK).min(self.rows());
-            let on = self.gates(start, end, &self.masks, &block_of);
-            let res = self.residuals(start, end, &ops, &on);
-            // `∂ error / ∂ a_tc = −2 w h_tc` where `c` runs, nothing where it is off.
-            let ga = (&on * &res.h) * (-2.0 * self.scale as f32);
-            for (c, l) in left.iter_mut().enumerate() {
-                *l += 2.0 * self.scale * ops.k[[c, c]] * on.column(c).iter().map(|x| f64::from(*x)).sum::<f64>();
+        let resident = self.device.as_ref().map(|d| d.operands((&ops.v32, &ops.uf32, &ops.k32)).map(|o| (d, o))).transpose()?;
+        let gradient = match &resident {
+            Some((device, operands)) => {
+                let on = self.gates(0, self.rows(), &self.masks, &block_of);
+                for (c, l) in left.iter_mut().enumerate() {
+                    *l = 2.0 * self.scale * ops.k[[c, c]] * on.column(c).iter().map(|x| f64::from(*x)).sum::<f64>();
+                }
+                device.read_gradient(operands, &on, self.scale)?
             }
-            gemm(&mut gradient, true, ga.view(), true, self.x.slice(s![start..end, ..]), false, 1.0);
-        }
-        let gradient = gradient.mapv(f64::from);
+            None => {
+                let mut gradient = Array2::<f32>::zeros(v.dim());
+                for start in (0..self.rows()).step_by(CHUNK) {
+                    let end = (start + CHUNK).min(self.rows());
+                    let on = self.gates(start, end, &self.masks, &block_of);
+                    let res = self.residuals(start, end, &ops, &on);
+                    // `∂ error / ∂ a_tc = −2 w h_tc` where `c` runs, nothing where it is off.
+                    let ga = (&on * &res.h) * (-2.0 * self.scale as f32);
+                    for (c, l) in left.iter_mut().enumerate() {
+                        *l += 2.0 * self.scale * ops.k[[c, c]] * on.column(c).iter().map(|x| f64::from(*x)).sum::<f64>();
+                    }
+                    gemm(&mut gradient, true, ga.view(), true, self.x.slice(s![start..end, ..]), false, 1.0);
+                }
+                gradient.mapv(f64::from)
+            }
+        };
         let mut direction = -gradient.dot(right);
         for (c, mut row) in direction.outer_iter_mut().enumerate() {
             let l = left[c];
@@ -576,21 +541,37 @@ impl<'a> Fitting<'a> {
         // The error is exactly quadratic along the line: `w ‖Uᵀ (on ⊙ δa)‖²_F` per input.
         let d32 = single(&direction);
         let mut curvature = 0.0;
-        for start in (0..self.rows()).step_by(CHUNK) {
-            let end = (start + CHUNK).min(self.rows());
-            let dz = product(self.x.slice(s![start..end, ..]), false, d32.view(), true) * &self.gates(start, end, &self.masks, &block_of);
-            let dk = product(dz.view(), false, ops.k32.view(), false);
-            curvature += 2.0 * self.scale * dz.iter().zip(dk.iter()).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum::<f64>();
+        if let Some((device, operands)) = &resident {
+            curvature = device.curvature(operands, &d32, &self.gates(0, self.rows(), &self.masks, &block_of), self.scale)?;
+        } else {
+            for start in (0..self.rows()).step_by(CHUNK) {
+                let end = (start + CHUNK).min(self.rows());
+                let dz = product(self.x.slice(s![start..end, ..]), false, d32.view(), true) * &self.gates(start, end, &self.masks, &block_of);
+                let dk = product(dz.view(), false, ops.k32.view(), false);
+                curvature += 2.0 * self.scale * dz.iter().zip(dk.iter()).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum::<f64>();
+            }
         }
         Ok((slope > 0.0 && curvature > 0.0).then(|| (direction, slope / curvature)))
     }
 
     /// Per subcomponent, the error bits of the inputs it runs on.
-    fn carried(&self, v: &Array2<f64>, u: &Array2<f64>) -> Vec<f64> {
+    fn carried(&self, v: &Array2<f64>, u: &Array2<f64>) -> Result<Vec<f64>, String> {
         let c_total = self.pieces;
         let ops = self.operands(v, u);
         let block_of: Vec<usize> = (0..c_total).collect();
         let mut carried = vec![0.0; c_total];
+        if let Some(device) = &self.device {
+            let on = self.gates(0, self.rows(), &self.masks, &block_of);
+            let errors = device.errors(&device.operands((&ops.v32, &ops.uf32, &ops.k32))?, &on)?;
+            for (r, error) in errors.iter().enumerate() {
+                for (c, total) in carried.iter_mut().enumerate() {
+                    if on[[r, c]] > 0.0 {
+                        *total += self.scale * error.max(0.0);
+                    }
+                }
+            }
+            return Ok(carried);
+        }
         for start in (0..self.rows()).step_by(CHUNK) {
             let end = (start + CHUNK).min(self.rows());
             let on = self.gates(start, end, &self.masks, &block_of);
@@ -603,7 +584,7 @@ impl<'a> Fitting<'a> {
                 }
             }
         }
-        carried
+        Ok(carried)
     }
 
     /// The round's report of the state as last coded.
@@ -626,9 +607,9 @@ pub struct Settings {
 
 /// Every subcomponent's description bits.
 fn description_bits(describe: &dyn Describe, site: usize, v: &Array2<f64>, u: &Array2<f64>) -> Result<Array1<f64>, String> {
-    Ok((0..v.nrows())
-        .into_par_iter()
-        .map(|c| gam_linalg::faer_ndarray::with_nested_parallel(|| describe.bits_at(site, c, u.slice(s![c..c + 1, ..]), v.slice(s![c..c + 1, ..]))))
+    let columns: Vec<usize> = (0..v.nrows()).collect();
+    Ok(super::combine::map(&columns, |&c| describe.bits_at(site, c, u.slice(s![c..c + 1, ..]), v.slice(s![c..c + 1, ..])))
+        .into_iter()
         .collect::<Result<Vec<f64>, String>>()?
         .into())
 }
@@ -649,10 +630,8 @@ fn prices(describe: &dyn Describe, site: usize, v: &Array2<f64>, u: &Array2<f64>
     let Some(cheap) = cheap else { return description_bits(describe, site, v, u) };
     let stride = ((c_total as f64).sqrt() as usize).max(1);
     let sample: Vec<usize> = (0..c_total).step_by(stride).collect();
-    let sampled: Vec<f64> = sample
-        .par_iter()
-        .map(|&c| gam_linalg::faer_ndarray::with_nested_parallel(|| describe.bits_at(site, c, u.slice(s![c..c + 1, ..]), v.slice(s![c..c + 1, ..]))))
-        .collect::<Result<_, String>>()?;
+    let sampled: Vec<f64> =
+        super::combine::map(&sample, |&c| describe.bits_at(site, c, u.slice(s![c..c + 1, ..]), v.slice(s![c..c + 1, ..]))).into_iter().collect::<Result<_, String>>()?;
     let scale = median_ratio(sample.iter().zip(&sampled).map(|(c, e)| (*e, cheap[*c])));
     let mut bits = Array1::from_iter(cheap.iter().map(|b| b * scale));
     for (c, e) in sample.iter().zip(&sampled) {
@@ -677,10 +656,8 @@ fn decoded_prices(describe: &dyn Describe, site: usize, v: &Array2<f64>, u: &Arr
     let c_total = v.nrows();
     let rows = fitting.masks.len() / c_total.max(1);
     let on: Vec<usize> = (0..c_total).filter(|c| (0..rows).any(|t| fitting.masks[t * c_total + c] == 1)).collect();
-    let exact: Vec<f64> = on
-        .par_iter()
-        .map(|c| gam_linalg::faer_ndarray::with_nested_parallel(|| describe.bits_at(site, *c, u.slice(s![*c..*c + 1, ..]), v.slice(s![*c..*c + 1, ..]))))
-        .collect::<Result<_, String>>()?;
+    let exact: Vec<f64> =
+        super::combine::map(&on, |&c| describe.bits_at(site, c, u.slice(s![c..c + 1, ..]), v.slice(s![c..c + 1, ..]))).into_iter().collect::<Result<_, String>>()?;
     let mut out = bits.clone();
     for (c, e) in on.iter().zip(exact) {
         out[*c] = e;
@@ -696,9 +673,9 @@ pub fn measure(site: usize, w: &Array2<f64>, samples: &Samples, describe: &dyn D
     }
     let mut fitting = Fitting::new(site, w, samples, observations, library.v.nrows())?;
     let bits = prices(describe, site, &library.v, &library.u)?;
-    fitting.code(&library.v, &library.u, &bits, true);
+    fitting.code(&library.v, &library.u, &bits, true)?;
     let bits = decoded_prices(describe, site, &library.v, &library.u, &fitting, &bits)?;
-    let (description, error) = fitting.code(&library.v, &library.u, &bits, false);
+    let (description, error) = fitting.code(&library.v, &library.u, &bits, false)?;
     let pieces = library.v.nrows();
     let sets = fitting.masks.chunks(pieces).map(|m| (0..pieces as u32).filter(|c| m[*c as usize] == 1).collect()).collect();
     Ok((fitting.report(0, description, error), sets))
@@ -723,7 +700,7 @@ pub fn code_of(site: usize, w: &Array2<f64>, samples: &Samples, describe: &dyn D
         }
     }
     let bits = decoded_prices(describe, site, &library.v, &library.u, &fitting, &Array1::zeros(pieces))?;
-    let (description, error) = fitting.code(&library.v, &library.u, &bits, false);
+    let (description, error) = fitting.code(&library.v, &library.u, &bits, false)?;
     Ok(fitting.report(0, description, error))
 }
 
@@ -805,7 +782,7 @@ pub fn fit(
         _ => fitting.writes(&v, span)?,
     };
     let mut bits = prices(describe, site, &v, &u)?;
-    let (description, error) = fitting.code(&v, &u, &bits, true);
+    let (description, error) = fitting.code(&v, &u, &bits, true)?;
     let mut current = description + error;
     let mut report = fitting.report(0, description, error);
     // The library of least code at a round's start, with its prices.
@@ -813,14 +790,14 @@ pub fn fit(
     for round in 0..rounds {
         // The writes: the error's minimiser under the sets, kept when the code falls.
         let trial = fitting.writes(&v, span)?;
-        let (d, e) = fitting.code(&v, &trial, &bits, false);
+        let (d, e) = fitting.code(&v, &trial, &bits, false)?;
         if d + e < current {
             (u, current) = (trial, d + e);
         }
         // The reads: one step at its exact length, kept when the code falls.
         if let Some((direction, length)) = fitting.read_step(&v, &u, &right)? {
             let trial = &v + &(&direction * length);
-            let (d, e) = fitting.code(&trial, &u, &bits, false);
+            let (d, e) = fitting.code(&trial, &u, &bits, false)?;
             if d + e < current {
                 (v, current) = (trial, d + e);
                 report.read_steps = 1;
@@ -835,7 +812,7 @@ pub fn fit(
         let idle: Vec<usize> = (0..pieces).filter(|&c| sizes[c] <= f64::EPSILON * largest || (0..rows).all(|t| fitting.masks[t * pieces + c] == 0)).collect();
         if !idle.is_empty() {
             let saved = (v.clone(), u.clone(), fitting.masks.clone());
-            let carried = fitting.carried(&v, &u);
+            let carried = fitting.carried(&v, &u)?;
             let mut parents: Vec<usize> = (0..pieces).filter(|c| !idle.contains(c)).collect();
             parents.sort_by(|a, b| carried[*b].total_cmp(&carried[*a]));
             // Each split from at most `CHUNK` of its parent's inputs (evenly strided), all in parallel.
@@ -868,7 +845,7 @@ pub fn fit(
                 }
             }
             bits = prices(describe, site, &v, &u)?;
-            let (d, e) = fitting.code(&v, &u, &bits, true);
+            let (d, e) = fitting.code(&v, &u, &bits, true)?;
             if grown > 0 && d + e < current {
                 report.reseeded = grown;
             } else {
@@ -878,7 +855,7 @@ pub fn fit(
         progress(&report, &Library { v: v.clone(), u: u.clone(), mean: Array1::zeros(d_in) });
         // The next round's sets, under the descriptions as the steps left them.
         bits = prices(describe, site, &v, &u)?;
-        let (description, error) = fitting.code(&v, &u, &bits, true);
+        let (description, error) = fitting.code(&v, &u, &bits, true)?;
         let previous = report.code;
         report = fitting.report(round + 1, description, error);
         current = description + error;
@@ -893,16 +870,16 @@ pub fn fit(
     // description's own price.
     let (kept, v, u, bits) = best;
     report = Round { reseeded: report.reseeded, read_steps: report.read_steps, ..kept };
-    fitting.code(&v, &u, &bits, true);
+    fitting.code(&v, &u, &bits, true)?;
     let bits = decoded_prices(describe, site, &v, &u, &fitting, &bits)?;
-    let (description, error) = fitting.code(&v, &u, &bits, false);
+    let (description, error) = fitting.code(&v, &u, &bits, false)?;
     report = Round { reseeded: report.reseeded, read_steps: report.read_steps, ..fitting.report(report.round, description, error) };
     progress(&report, &Library { v: v.clone(), u: u.clone(), mean: Array1::zeros(d_in) });
     Ok(Library { v, u, mean: Array1::zeros(d_in) })
 }
 
 /// [`measure`] of a library gated in blocks of `ranks` (column runs): its code and every input's
-/// blocks on, selected from all on.
+/// blocks on, each its certified sparse code (module note, "Sets").
 pub fn measure_blocks(
     site: usize,
     w: &Array2<f64>,
@@ -928,24 +905,21 @@ pub fn measure_blocks(
         start += r;
     }
     let mut masks = vec![1u8; rows * blocks];
-    let (description, error) = fitting.code_blocks(&library.v, &library.u, ranks, &bits, &mut masks, true);
+    let (description, error) = fitting.code_blocks(&library.v, &library.u, ranks, &bits, &mut masks, true)?;
     let on = masks.iter().filter(|m| **m == 1).count() as f64;
     let report = Round { round: 0, code: (description + error) / rows as f64, description: description / rows as f64, error: error / rows as f64, l0: on / rows as f64, reseeded: 0, read_steps: 0 };
     Ok((report, masks.chunks(blocks).map(|m| (0..blocks as u32).filter(|c| m[*c as usize] == 1).collect()).collect()))
 }
 
-/// A site's selection at run time: [`measure_blocks`]'s sets (from all on, in the metric `fisher`
-/// at `n = observations`), each input's from its read alone, with what that forms on every call
-/// held once: `V`, `U F W`, `Wᵀ F W` and `K = U F Uᵀ`, so an input costs `O(C (d_in + C))`.
+/// A site's selection at run time: every input's certified sparse code ([`super::sparse_code::Coder`],
+/// module note "Sets") in the metric `fisher` at `n = observations`, each from its read alone, with
+/// what that forms on every call held once: `V`, `U F W`, `Wᵀ F W` and the coder (`K = U F Uᵀ`).
 #[derive(Debug)]
 pub struct Selector {
     v: Array2<f64>,
     ufw: Array2<f64>,
     wfw: Array2<f64>,
-    k: Array2<f64>,
-    starts: Vec<usize>,
-    bits: Vec<f64>,
-    weight: f64,
+    coder: Coder,
 }
 
 impl Selector {
@@ -960,19 +934,12 @@ impl Selector {
         if library.mean.iter().any(|m| *m != 0.0) {
             return Err("a selected library reads the uncentred input".to_string());
         }
-        if ranks.contains(&0) || ranks.iter().sum::<usize>() != columns || bits.len() != ranks.len() {
-            return Err(format!("{} bits for blocks {ranks:?} of {columns} columns", bits.len()));
-        }
         let uf = fast_ab(&library.u, fisher);
-        let (_, starts) = partition(ranks);
         Ok(Self {
             v: library.v.clone(),
             ufw: fast_ab(&uf, w),
             wfw: fast_ab(&fast_atb(w, fisher), w),
-            k: fast_abt(&uf, &library.u),
-            starts,
-            bits: bits.to_vec(),
-            weight: observations / (2.0 * LN_2),
+            coder: Coder::new(fast_abt(&uf, &library.u), ranks, bits, observations, NODES)?,
         })
     }
 
@@ -980,23 +947,30 @@ impl Selector {
     pub fn select(&self, reads: &Array2<f64>) -> Array2<f64> {
         let a = fast_abt(reads, &self.v);
         let g = fast_abt(reads, &self.ufw);
-        // `K` is symmetric: row `t` of `a K` is `K a_t`, the reads all on.
-        let p = fast_ab(&a, &self.k);
         let xq = fast_ab(reads, &self.wfw);
-        let gram = Gram { k: &self.k, starts: &self.starts, bits: &self.bits, weight: self.weight };
-        let blocks = self.bits.len();
-        let sets: Vec<Vec<u8>> = (0..reads.nrows())
+        let blocks = self.coder.blocks();
+        let coded: Vec<_> = (0..reads.nrows())
             .into_par_iter()
             .map(|t| {
-                let (at, gt, pt) = (a.row(t), g.row(t), p.row(t));
-                let yfy = reads.row(t).dot(&xq.row(t));
-                let mut input = Input { a: at.to_vec(), g: gt.to_vec(), yfy, h: (&gt - &pt).to_vec(), error: yfy - 2.0 * at.dot(&gt) + at.dot(&pt) };
-                let mut m = vec![1u8; blocks];
-                select(&gram, &mut input, &mut m, true);
-                m
+                let row = |m: &Array2<f64>| m.row(t).to_vec();
+                self.coder.code(&row(&a), &row(&g), reads.row(t).dot(&xq.row(t)), None).0
             })
             .collect();
-        Array2::from_shape_fn((reads.nrows(), blocks), |(t, b)| f64::from(sets[t][b]))
+        Array2::from_shape_fn((reads.nrows(), blocks), |(t, b)| f64::from(u8::from(coded[t][b])))
+    }
+
+    /// [`Selector::select`] from the products it reads, formed wherever the reads are (a device's
+    /// forward): `a = reads Vᵀ` and `g = reads (U F W)ᵀ` (inputs × columns) and each input's
+    /// `yᵀ F y` (`y = W x`).
+    pub fn select_products(&self, a: &Array2<f64>, g: &Array2<f64>, yfy: &[f64]) -> Result<Array2<f64>, String> {
+        let coded = self.coder.code_rows(a.view(), g.view(), yfy, None)?;
+        Ok(Array2::from_shape_fn((a.nrows(), self.coder.blocks()), |(t, b)| f64::from(u8::from(coded[t].0[b]))))
+    }
+
+    /// The coder every input's sets are chosen by.
+    #[must_use]
+    pub fn coder(&self) -> &Coder {
+        &self.coder
     }
 }
 
@@ -1098,7 +1072,7 @@ pub fn blocks(
     };
     let mut bits: Vec<f64> = (0..ranks.len()).into_par_iter().map(|b| price(block_factors(&current, &starts, b))).collect::<Result<_, String>>()?;
     let mut masks = vec![1u8; rows * ranks.len()];
-    let (d, e) = fitting.code_blocks(&current.v, &current.u, &ranks, &bits, &mut masks, true);
+    let (d, e) = fitting.code_blocks(&current.v, &current.u, &ranks, &bits, &mut masks, true)?;
     let mut total = d + e;
     // A refused merge or split, by its blocks' first reads (bit patterns) and ranks, so it is not
     // proposed again.
@@ -1195,7 +1169,7 @@ pub fn blocks(
                     }
                 }
                 let (trial, trial_ranks, mut trial_masks) = regroup(&current, &ranks, &masks, &groups);
-                let (d, e) = fitting.code_blocks(&trial.v, &trial.u, &trial_ranks, &trial_bits, &mut trial_masks, true);
+                let (d, e) = fitting.code_blocks(&trial.v, &trial.u, &trial_ranks, &trial_bits, &mut trial_masks, true)?;
                 log::info!("site {site}: {take} merges, code {:.1} -> {:.1} bits per input", total / rows as f64, (d + e) / rows as f64);
                 if d + e < total {
                     (current, ranks, bits, masks, total) = (trial, trial_ranks, trial_bits, trial_masks, d + e);
@@ -1274,7 +1248,7 @@ pub fn blocks(
                     row[j] = masks[t * blocks + source];
                 }
             });
-            let (d, e) = fitting.code_blocks(&trial.v, &trial.u, &trial_ranks, &trial_bits, &mut trial_masks, true);
+            let (d, e) = fitting.code_blocks(&trial.v, &trial.u, &trial_ranks, &trial_bits, &mut trial_masks, true)?;
             log::info!("site {site}: {take} splits, code {:.1} -> {:.1} bits per input", total / rows as f64, (d + e) / rows as f64);
             if d + e < total {
                 (current, ranks, bits, masks, total) = (trial, trial_ranks, trial_bits, trial_masks, d + e);
@@ -1293,9 +1267,12 @@ pub fn blocks(
     }
     // Every block at its exact price, every input's sets selected again under them.
     let starts = starts_of(&ranks);
-    let bits: Vec<f64> = (0..ranks.len()).into_par_iter().map(|b| exact(block_factors(&current, &starts, b))).collect::<Result<_, String>>()?;
+    let every: Vec<usize> = (0..ranks.len()).collect();
+    let bits: Vec<f64> = super::combine::map(&every, |&b| describe.bits(site, block_factors(&current, &starts, b).0, block_factors(&current, &starts, b).1))
+        .into_iter()
+        .collect::<Result<_, String>>()?;
     let blocks = ranks.len();
-    let (description, error) = fitting.code_blocks(&current.v, &current.u, &ranks, &bits, &mut masks, true);
+    let (description, error) = fitting.code_blocks(&current.v, &current.u, &ranks, &bits, &mut masks, true)?;
     let report = fitting.report(0, description, error);
     let on = masks.iter().filter(|m| **m == 1).count() as f64;
     let report = Round { l0: on / rows as f64, ..report };
@@ -1456,7 +1433,7 @@ pub fn ard(
         let (current, ranks) = assemble(&groups)?;
         let fitting = Fitting::new(site, w, samples, observations, current.v.nrows())?;
         let bits: Vec<f64> = groups.par_iter().map(|(u, v)| describe.bits(site, u.view(), v.view())).collect::<Result<_, String>>()?;
-        let (description, error) = fitting.code_blocks(&current.v, &current.u, &ranks, &bits, &mut masks, true);
+        let (description, error) = fitting.code_blocks(&current.v, &current.u, &ranks, &bits, &mut masks, true)?;
         let count = groups.len();
         let on = masks.iter().filter(|m| **m == 1).count() as f64;
         let report = Round { round, code: (description + error) / rows as f64, description: description / rows as f64, error: error / rows as f64, l0: on / rows as f64, reseeded: 0, read_steps: 0 };

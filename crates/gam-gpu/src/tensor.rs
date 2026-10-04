@@ -796,7 +796,7 @@ impl Device {
         if width == 0 || (causal && scores.rows % width != 0) {
             return Err(shape(format!("attention scores {:?} are not square blocks", scores.dim())));
         }
-        self.softmax_rows_impl(scores, causal, 0)
+        self.softmax_rows_impl(scores, causal, 0, width)
     }
 
     /// Softmax of a rectangular query tile against a sequence's keys, preserving its causal
@@ -805,15 +805,26 @@ impl Device {
         if scores.cols == 0 || (causal && (start > scores.cols || scores.rows > scores.cols - start)) {
             return Err(shape("causal softmax tile outside its sequence".to_string()));
         }
-        self.softmax_rows_impl(scores, causal, start)
+        let width = scores.cols;
+        self.softmax_rows_impl(scores, causal, start, width)
     }
 
-    fn softmax_rows_impl(&self, scores: &mut Tensor, causal: bool, start: usize) -> Result<(), GpuError> {
+    /// Causal softmax of `blocks` query tiles stacked (`blocks · block_rows × L`), each the
+    /// positions `start..start + block_rows` of its own sequence's `L` keys: row `r` reads columns
+    /// `j ≤ start + r mod block_rows`, the rest become zero.
+    pub fn softmax_rows_blocks(&self, scores: &mut Tensor, block_rows: usize, start: usize) -> Result<(), GpuError> {
+        if block_rows == 0 || scores.rows % block_rows != 0 || start + block_rows > scores.cols {
+            return Err(shape(format!("causal query blocks of {block_rows} rows from {start} in {:?} scores", scores.dim())));
+        }
+        self.softmax_rows_impl(scores, true, start, block_rows)
+    }
+
+    fn softmax_rows_impl(&self, scores: &mut Tensor, causal: bool, start: usize, period: usize) -> Result<(), GpuError> {
         let width = scores.cols;
         match &*self.backend {
             Backend::Host => {
                 for (r, row) in host_mut(scores)?.chunks_mut(width).enumerate() {
-                    let valid = if causal { start + r % width + 1 } else { width };
+                    let valid = if causal { start + r % period + 1 } else { width };
                     let m = row[..valid].iter().copied().fold(f64::NEG_INFINITY, f64::max);
                     for v in row[..valid].iter_mut() {
                         *v = (*v - m).exp();
@@ -829,9 +840,9 @@ impl Device {
                 Ok(())
             }
             #[cfg(target_os = "linux")]
-            Backend::Cuda(engine) => engine.softmax_rows(scores, causal, start),
+            Backend::Cuda(engine) => engine.softmax_rows(scores, causal, start, period),
             #[cfg(target_os = "macos")]
-            Backend::Metal(engine) => engine.softmax_rows(scores, causal, start),
+            Backend::Metal(engine) => engine.softmax_rows(scores, causal, start, period),
         }
     }
 
@@ -1030,6 +1041,44 @@ impl Device {
             Backend::Cuda(engine) => engine.sampled_head_cotangent(probabilities, mean, head, transposed, uniforms, scored),
             #[cfg(target_os = "macos")]
             Backend::Metal(engine) => engine.sampled_head_cotangent(probabilities, mean, head, transposed, uniforms, scored),
+        }
+    }
+
+    /// Per row, the first column holding its largest value (column 0 for a row with none above
+    /// −∞): the top token of a row of logits.
+    pub fn argmax_rows(&self, t: &Tensor) -> Result<Vec<usize>, GpuError> {
+        match &*self.backend {
+            Backend::Host => Ok(host(t)?
+                .chunks(t.cols.max(1))
+                .take(t.rows)
+                .map(|row| row.iter().enumerate().fold((0, f64::NEG_INFINITY), |best, (c, v)| if *v > best.1 { (c, *v) } else { best }).0)
+                .collect()),
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.argmax_rows(t),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.argmax_rows(t),
+        }
+    }
+
+    /// `t`'s entries at the row-major positions `at` set to `value` (a sparse pattern written into
+    /// a dense tensor, say a selection's units on).
+    pub fn fill_entries(&self, t: &mut Tensor, at: &Indices, value: f64) -> Result<(), GpuError> {
+        if t.len() > u32::MAX as usize {
+            return Err(shape(format!("{:?} entries exceed 32-bit positions", t.dim())));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (positions, len) = (host_indices(at)?.to_vec(), t.len());
+                let values = host_mut(t)?;
+                for p in positions {
+                    *values.get_mut(p as usize).ok_or_else(|| shape(format!("position {p} of {len} entries")))? = value;
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.fill_entries(t, at, value),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.fill_entries(t, at, value),
         }
     }
 
@@ -1257,6 +1306,43 @@ impl Device {
             Backend::Metal(engine) => engine.box_charge(z, mask, q, cot, coefficient),
         }
     }
+
+    /// Every row's sparse code (`gam_mpd::sparse_code::Coder`, its module note): row `r`'s blocks on
+    /// minimise `Σ_b bits_b m_b + κ ‖y_r − Σ_b m_b Z_rb‖²_F`, found by the code's convex relaxation on
+    /// the box (a working set solved by exact coordinate minimisation), rounded and improved by exact
+    /// single flips, and branched best bound first within `nodes` nodes while its bounds are more
+    /// than a bit apart: each row's blocks on (`on`, rows × blocks, 1 or 0), its code and a lower
+    /// bound on its best, the CPU coder's steps in the same order. `z` and `w` are rows × pieces
+    /// (`v_c · x_r` and `(U F y_r)_c`), `yfy` rows × 1, `gram` pieces × pieces (`U F Uᵀ`), `starts`
+    /// the blocks' first pieces and the end, `bits` 1 × blocks, `warm` (rows × blocks, 1 or 0) each
+    /// row's start, and `tolerance` the largest coordinate move at which a relaxation is stationary.
+    /// The CPU's float64 coder is the reference: on the host this is [`GpuError::NoDeviceKernel`].
+    pub fn code_rows(
+        &self,
+        (z, w, yfy): (&Tensor, &Tensor, &Tensor),
+        (gram, starts, bits): (&Tensor, &Indices, &Tensor),
+        warm: Option<&Tensor>,
+        (kappa, nodes, tolerance): (f64, usize, f64),
+        on: &mut Tensor,
+    ) -> Result<(Vec<f64>, Vec<f64>), GpuError> {
+        let (rows, pieces) = z.dim();
+        let blocks = bits.cols;
+        if w.dim() != (rows, pieces) || yfy.dim() != (rows, 1) || gram.dim() != (pieces, pieces) || starts.len != blocks + 1 || bits.rows != 1
+            || on.dim() != (rows, blocks) || warm.is_some_and(|m| m.dim() != (rows, blocks))
+        {
+            return Err(shape(format!("a code of {:?} reads over {blocks} blocks", z.dim())));
+        }
+        if !(kappa.is_finite() && kappa > 0.0 && tolerance.is_finite() && tolerance >= 0.0) || u32::try_from(nodes).is_err() {
+            return Err(shape(format!("a code at κ {kappa}, tolerance {tolerance} and {nodes} nodes")));
+        }
+        match &*self.backend {
+            Backend::Host => Err(GpuError::NoDeviceKernel { reason: "the sparse code's CPU reference is gam_mpd::sparse_code".to_string() }),
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.code_rows((z, w, yfy), (gram, starts, bits), warm, (kappa, nodes, tolerance), on),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.code_rows((z, w, yfy), (gram, starts, bits), warm, (kappa, nodes, tolerance), on),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1473,12 +1559,12 @@ extern "C" __global__ void rotate_planes(unsigned int rows, unsigned int cols, u
     }
 }
 
-extern "C" __global__ void softmax_rows(unsigned int rows, unsigned int width, int causal, unsigned int start, double* s) {
+extern "C" __global__ void softmax_rows(unsigned int rows, unsigned int width, int causal, unsigned int start, unsigned int period, double* s) {
     __shared__ double shared[BLOCK];
     unsigned int r = blockIdx.x;
     if (r >= rows) return;
     double* row = s + (u64)r * width;
-    unsigned int valid = causal ? start + r % width + 1 : width;
+    unsigned int valid = causal ? start + r % period + 1 : width;
     double m = NEG_INF;
     for (unsigned int c = threadIdx.x; c < valid; c += BLOCK) m = fmax(m, row[c]);
     m = block_max(m, shared);
@@ -1738,6 +1824,33 @@ extern "C" __global__ void box_charge(unsigned int rows, unsigned int cols, cons
     }
 }
 
+// One block per row: each thread's first largest value, then the smallest column among the largest.
+extern "C" __global__ void argmax_rows(unsigned int rows, unsigned int cols, const double* x, double* out) {
+    __shared__ double values[BLOCK];
+    __shared__ unsigned int columns[BLOCK];
+    unsigned int r = blockIdx.x, t = threadIdx.x;
+    if (r >= rows) return;
+    const double* z = x + (u64)r * cols;
+    double best = NEG_INF;
+    unsigned int at = cols;
+    for (unsigned int c = t; c < cols; c += BLOCK) if (z[c] > best) { best = z[c]; at = c; }
+    values[t] = best;
+    columns[t] = at;
+    __syncthreads();
+    for (unsigned int s = BLOCK / 2; s > 0; s >>= 1) {
+        if (t < s && (values[t + s] > values[t] || (values[t + s] == values[t] && columns[t + s] < columns[t]))) {
+            values[t] = values[t + s];
+            columns[t] = columns[t + s];
+        }
+        __syncthreads();
+    }
+    if (t == 0) out[r] = columns[0] == cols ? 0.0 : (double)columns[0];
+}
+
+extern "C" __global__ void fill_entries(u64 n, const unsigned int* at, double value, double* x) {
+    GRID_STRIDE(i, n) x[at[i]] = value;
+}
+
 extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int cols, const double* logits, const double* tangent, double* out) {
     __shared__ double shared[BLOCK];
     unsigned int r = blockIdx.x;
@@ -1756,6 +1869,348 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
     }
     double q = block_sum(partial, shared);
     if (threadIdx.x == 0) out[r] = q;
+}
+"#;
+
+    /// The sparse code (`Device::code_rows`), one block per row: every scalar decision taken by
+    /// every thread alike from the same memory (a barrier before any write it reads), every
+    /// vector update spread over the block, each in the CPU coder's order of operations.
+    const CODER_KERNELS: &str = r#"
+#define BLOCK 256
+typedef unsigned long long u64;
+#define POS_INF __longlong_as_double(0x7ff0000000000000LL)
+#define NONE 0xffffffffu
+
+__device__ double coder_sum(double v, double* shared) {
+    unsigned int t = threadIdx.x;
+    shared[t] = v;
+    __syncthreads();
+    for (unsigned int s = BLOCK / 2; s > 0; s >>= 1) {
+        if (t < s) shared[t] += shared[t + s];
+        __syncthreads();
+    }
+    double r = shared[0];
+    __syncthreads();
+    return r;
+}
+
+// The (value, index) pair first by `better`: smaller value then smaller index (`first_min`), or
+// larger value then larger index (`last_max`). NONE indices lose.
+__device__ unsigned int coder_pick(double v, unsigned int i, int last_max, double* sv, unsigned int* si) {
+    unsigned int t = threadIdx.x;
+    sv[t] = v; si[t] = i;
+    __syncthreads();
+    for (unsigned int s = BLOCK / 2; s > 0; s >>= 1) {
+        if (t < s) {
+            double a = sv[t], b = sv[t + s];
+            unsigned int ia = si[t], ib = si[t + s];
+            int take;
+            if (ia == NONE) take = 1;
+            else if (ib == NONE) take = 0;
+            else if (last_max) take = b > a || (b == a && ib > ia);
+            else take = b < a || (b == a && ib < ia);
+            if (take) { sv[t] = b; si[t] = ib; }
+        }
+        __syncthreads();
+    }
+    unsigned int r = si[0];
+    __syncthreads();
+    return r;
+}
+
+struct Row {
+    unsigned int C, B, W;
+    int unit;
+    double kappa, tol, empty;
+    const double* z; const double* w; const double* K; const unsigned int* starts; const double* bits;
+    double *lin, *dia, *qm, *oq, *m, *col, *t, *on, *best, *inw, *key;
+    unsigned int *work, *idx;
+};
+
+// `col ← Q e_b` (every thread; ends synchronized).
+__device__ void coder_column(const Row* r, unsigned int b) {
+    if (r->unit) {
+        double zb = r->z[b];
+        const double* kr = r->K + (u64)b * r->C;
+        for (unsigned int j = threadIdx.x; j < r->B; j += BLOCK) r->col[j] = r->z[j] * (zb * kr[j]);
+        __syncthreads();
+        return;
+    }
+    unsigned int s = r->starts[b], e = r->starts[b + 1];
+    for (unsigned int j = threadIdx.x; j < r->C; j += BLOCK) {
+        double acc = 0.0;
+        for (unsigned int c = s; c < e; c++) {
+            double zc = r->z[c];
+            if (zc != 0.0) acc += zc * r->K[(u64)c * r->C + j];
+        }
+        r->t[j] = acc;
+    }
+    __syncthreads();
+    for (unsigned int j = threadIdx.x; j < r->B; j += BLOCK) {
+        double acc = 0.0;
+        for (unsigned int c = r->starts[j]; c < r->starts[j + 1]; c++) acc += r->z[c] * r->t[c];
+        r->col[j] = acc;
+    }
+    __syncthreads();
+}
+
+// `q += a col` (every thread; ends synchronized).
+__device__ void coder_add(const Row* r, double* q, double a) {
+    for (unsigned int j = threadIdx.x; j < r->B; j += BLOCK) q[j] += a * r->col[j];
+    __syncthreads();
+}
+
+// The relaxation's optimum on the box [lo, hi] from `start` into `m` (and `qm = Q m`), with
+// `known = Q start` when it is (then only the coordinates the box moves are added): its certified
+// lower bound.
+__device__ double coder_relax(const Row* r, const double* lo, const double* hi, const double* start, const double* known, double* sv, unsigned int* si, unsigned int* nw) {
+    unsigned int B = r->B;
+    for (unsigned int b = threadIdx.x; b < B; b += BLOCK) {
+        r->m[b] = fmin(fmax(start[b], lo[b]), hi[b]);
+        r->qm[b] = known ? known[b] : 0.0;
+        r->inw[b] = 0.0;
+    }
+    __syncthreads();
+    for (unsigned int b = 0; b < B; b++) {
+        double moved = known ? r->m[b] - start[b] : r->m[b];
+        if (moved != 0.0) { coder_column(r, b); coder_add(r, r->qm, moved); }
+    }
+    if (threadIdx.x == 0) {
+        unsigned int n = 0;
+        for (unsigned int b = 0; b < B; b++) {
+            if (r->m[b] != 0.0 && lo[b] < hi[b]) { r->work[n++] = b; r->inw[b] = 1.0; }
+        }
+        *nw = n;
+    }
+    __syncthreads();
+    for (;;) {
+        for (int sweep = 0; sweep < 1000; sweep++) {
+            double moved = 0.0;
+            unsigned int n = *nw;
+            for (unsigned int k = 0; k < n; k++) {
+                unsigned int b = r->work[k];
+                double g = r->lin[b] + 2.0 * r->kappa * r->qm[b];
+                double curvature = 2.0 * r->kappa * r->dia[b];
+                double mb = r->m[b];
+                double next = curvature > 0.0 ? fmin(fmax(mb - g / curvature, lo[b]), hi[b]) : (g > 0.0 ? lo[b] : (g < 0.0 ? hi[b] : mb));
+                double step = next - mb;
+                __syncthreads();
+                if (step != 0.0) {
+                    if (threadIdx.x == 0) r->m[b] = next;
+                    coder_column(r, b);
+                    coder_add(r, r->qm, step);
+                    moved = fmax(moved, fabs(step));
+                }
+            }
+            if (moved <= r->tol) break;
+        }
+        // The coordinates outside the set that violate a KKT condition, most violating first.
+        for (unsigned int b = threadIdx.x; b < r->W; b += BLOCK) {
+            double k = -1.0;
+            if (b < B && lo[b] < hi[b] && r->inw[b] == 0.0) {
+                double g = r->lin[b] + 2.0 * r->kappa * r->qm[b];
+                if ((g < 0.0 && r->m[b] < hi[b]) || (g > 0.0 && r->m[b] > lo[b])) k = fabs(g);
+            }
+            r->key[b] = k;
+            r->idx[b] = b;
+        }
+        __syncthreads();
+        for (unsigned int k = 2; k <= r->W; k <<= 1) {
+            for (unsigned int j = k >> 1; j > 0; j >>= 1) {
+                for (unsigned int i = threadIdx.x; i < r->W; i += BLOCK) {
+                    unsigned int l = i ^ j;
+                    if (l > i) {
+                        // Descending keys, ties by ascending index.
+                        int before_li = r->key[l] > r->key[i] || (r->key[l] == r->key[i] && r->idx[l] < r->idx[i]);
+                        int before_il = r->key[i] > r->key[l] || (r->key[i] == r->key[l] && r->idx[i] < r->idx[l]);
+                        int swap = (i & k) == 0 ? before_li : before_il;
+                        if (swap) {
+                            double tk = r->key[i]; r->key[i] = r->key[l]; r->key[l] = tk;
+                            unsigned int ti = r->idx[i]; r->idx[i] = r->idx[l]; r->idx[l] = ti;
+                        }
+                    }
+                }
+                __syncthreads();
+            }
+        }
+        int stop = 0;
+        if (threadIdx.x == 0) {
+            unsigned int count = 0;
+            while (count < B && r->key[count] >= 0.0) count++;
+            if (count == 0) {
+                stop = 1;
+            } else {
+                unsigned int n = *nw;
+                unsigned int room = n > 16 ? n : 16;
+                unsigned int take = count < room ? count : room;
+                for (unsigned int i = 0; i < take; i++) { unsigned int b = r->idx[i]; r->work[n++] = b; r->inw[b] = 1.0; }
+                *nw = n;
+            }
+            si[0] = stop;
+        }
+        __syncthreads();
+        stop = si[0];
+        __syncthreads();
+        if (stop) break;
+    }
+    double pv = 0.0, pq = 0.0, ps = 0.0;
+    for (unsigned int b = threadIdx.x; b < B; b += BLOCK) {
+        double mb = r->m[b], g = r->lin[b] + 2.0 * r->kappa * r->qm[b];
+        pv += mb * r->lin[b];
+        pq += mb * r->qm[b];
+        ps += fmin(g * (lo[b] - mb), g * (hi[b] - mb));
+    }
+    double value = r->empty + coder_sum(pv, sv) + r->kappa * coder_sum(pq, sv);
+    double slack = coder_sum(ps, sv);
+    return value + fmin(slack, 0.0);
+}
+
+// The relaxed point `m` rounded on [lo, hi] into `on` (with `oq = Q on`), then improved by exact
+// single flips (the most saving first) until none saves: its code. The relaxation's `qm` stays.
+__device__ double coder_round(const Row* r, const double* lo, const double* hi, double* sv, unsigned int* si) {
+    unsigned int B = r->B;
+    for (unsigned int b = threadIdx.x; b < B; b += BLOCK) {
+        r->on[b] = (lo[b] == hi[b] ? hi[b] > 0.5 : r->m[b] > 0.5) ? 1.0 : 0.0;
+        r->oq[b] = 0.0;
+    }
+    __syncthreads();
+    for (unsigned int b = 0; b < B; b++) {
+        if (r->on[b] == 1.0) { coder_column(r, b); coder_add(r, r->oq, 1.0); }
+    }
+    for (;;) {
+        double bv = POS_INF;
+        unsigned int bi = NONE;
+        for (unsigned int b = threadIdx.x; b < B; b += BLOCK) {
+            if (!(lo[b] < hi[b])) continue;
+            double delta = r->on[b] == 1.0 ? -r->lin[b] + r->kappa * (r->dia[b] - 2.0 * r->oq[b]) : r->lin[b] + r->kappa * (r->dia[b] + 2.0 * r->oq[b]);
+            if (delta < 0.0 && (bi == NONE || delta < bv)) { bv = delta; bi = b; }
+        }
+        unsigned int b = coder_pick(bv, bi, 0, sv, si);
+        if (b == NONE) break;
+        double sign = r->on[b] == 1.0 ? -1.0 : 1.0;
+        __syncthreads();
+        if (threadIdx.x == 0) r->on[b] = r->on[b] == 1.0 ? 0.0 : 1.0;
+        coder_column(r, b);
+        coder_add(r, r->oq, sign);
+    }
+    double pv = 0.0, pq = 0.0;
+    for (unsigned int b = threadIdx.x; b < B; b += BLOCK) {
+        pv += r->on[b] * r->lin[b];
+        pq += r->on[b] * r->oq[b];
+    }
+    return r->empty + coder_sum(pv, sv) + r->kappa * coder_sum(pq, sv);
+}
+
+__device__ void coder_copy(double* to, const double* from, unsigned int n) {
+    for (unsigned int i = threadIdx.x; i < n; i += BLOCK) to[i] = from[i];
+    __syncthreads();
+}
+
+extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned int B, unsigned int W, unsigned int nodes, unsigned int cap, int unit, int warmed,
+    double kappa, double tol,
+    const double* z, const double* w, const double* yfy, const double* K, const unsigned int* starts, const double* bits, const double* warm,
+    u64 slot_len, u64 index_len, double* scratch, unsigned int* iscratch, double* on_out, double* upper_out, double* lower_out) {
+    __shared__ double sv[BLOCK];
+    __shared__ unsigned int si[BLOCK];
+    __shared__ unsigned int nw;
+    double* base = scratch + (u64)blockIdx.x * slot_len;
+    unsigned int* ibase = iscratch + (u64)blockIdx.x * index_len;
+    Row r;
+    r.C = C; r.B = B; r.W = W; r.unit = unit; r.kappa = kappa; r.tol = tol;
+    r.K = K; r.starts = starts; r.bits = bits;
+    r.lin = base; r.dia = base + B; r.qm = base + 2 * B; r.oq = base + 3 * B; r.m = base + 4 * B; r.col = base + 5 * B; r.on = base + 6 * B;
+    r.best = base + 7 * B; r.inw = base + 8 * B;
+    double* lo = base + 9 * B; double* hi = base + 10 * B; double* point = base + 11 * B; double* pqm = base + 12 * B;
+    double* clo = base + 13 * B; double* chi = base + 14 * B;
+    r.t = base + 15 * B; r.key = base + 15 * B + C;
+    // Each open node: its box, its relaxed point and that point's `Q m`; then their lower bounds.
+    double* open = base + 15 * B + C + W;
+    double* open_lower = open + (u64)cap * 4 * B;
+    r.work = ibase; r.idx = ibase + B;
+    for (unsigned int row = blockIdx.x; row < rows; row += gridDim.x) {
+        r.z = z + (u64)row * C;
+        r.w = w + (u64)row * C;
+        r.empty = kappa * yfy[row];
+        for (unsigned int b = threadIdx.x; b < B; b += BLOCK) {
+            unsigned int s = starts[b], e = starts[b + 1];
+            double acc = 0.0;
+            for (unsigned int c = s; c < e; c++) acc += r.z[c] * r.w[c];
+            r.lin[b] = bits[b] - 2.0 * kappa * acc;
+            double d = 0.0;
+            for (unsigned int c = s; c < e; c++) {
+                double inner = 0.0;
+                for (unsigned int c2 = s; c2 < e; c2++) inner += r.z[c] * r.z[c2] * K[(u64)c * C + c2];
+                d += inner;
+            }
+            r.dia[b] = fmax(d, 0.0);
+            lo[b] = 0.0;
+            hi[b] = 1.0;
+            point[b] = warmed ? warm[(u64)row * B + b] : 0.0;
+        }
+        __syncthreads();
+        double root = coder_relax(&r, lo, hi, point, 0, sv, si, &nw);
+        double upper = coder_round(&r, lo, hi, sv, si);
+        coder_copy(r.best, r.on, B);
+        double lower = fmin(root, upper);
+        if (!(upper - root <= 1.0 || nodes == 0)) {
+            // Best bound first; each open node its box, its relaxed point and its lower bound.
+            unsigned int count = 1, explored = 0;
+            coder_copy(open, lo, B); coder_copy(open + B, hi, B); coder_copy(open + 2 * B, r.m, B); coder_copy(open + 3 * B, r.qm, B);
+            if (threadIdx.x == 0) open_lower[0] = root;
+            __syncthreads();
+            double floor = POS_INF;
+            for (;;) {
+                if (count == 0) break;
+                unsigned int index = 0;
+                for (unsigned int i = 1; i < count; i++) if (open_lower[i] < open_lower[index]) index = i;
+                double node = open_lower[index];
+                if (node >= upper - 1.0 || explored >= nodes) break;
+                double* entry = open + (u64)index * 4 * B;
+                coder_copy(lo, entry, B); coder_copy(hi, entry + B, B); coder_copy(point, entry + 2 * B, B); coder_copy(pqm, entry + 3 * B, B);
+                count--;
+                if (index != count) {
+                    double* last = open + (u64)count * 4 * B;
+                    coder_copy(entry, last, 4 * B);
+                    if (threadIdx.x == 0) open_lower[index] = open_lower[count];
+                    __syncthreads();
+                }
+                explored++;
+                // The most fractional free block, the last of equals.
+                double bv = -POS_INF;
+                unsigned int bi = NONE;
+                for (unsigned int b = threadIdx.x; b < B; b += BLOCK) {
+                    if (!(lo[b] < hi[b])) continue;
+                    double f = 0.5 - fabs(point[b] - 0.5);
+                    if (bi == NONE || f >= bv) { bv = f; bi = b; }
+                }
+                unsigned int j = coder_pick(bv, bi, 1, sv, si);
+                if (j == NONE || point[j] == 0.0 || point[j] == 1.0) { floor = fmin(floor, node); continue; }
+                for (int fixed = 0; fixed < 2; fixed++) {
+                    coder_copy(clo, lo, B); coder_copy(chi, hi, B);
+                    if (threadIdx.x == 0) { clo[j] = (double)fixed; chi[j] = (double)fixed; }
+                    __syncthreads();
+                    double child = coder_relax(&r, clo, chi, point, pqm, sv, si, &nw);
+                    double value = coder_round(&r, clo, chi, sv, si);
+                    if (value < upper) { coder_copy(r.best, r.on, B); upper = value; }
+                    if (child < upper - 1.0) {
+                        double* slot = open + (u64)count * 4 * B;
+                        coder_copy(slot, clo, B); coder_copy(slot + B, chi, B); coder_copy(slot + 2 * B, r.m, B); coder_copy(slot + 3 * B, r.qm, B);
+                        if (threadIdx.x == 0) open_lower[count] = child;
+                        __syncthreads();
+                        count++;
+                    } else {
+                        floor = fmin(floor, child);
+                    }
+                }
+            }
+            lower = floor;
+            for (unsigned int i = 0; i < count; i++) lower = fmin(lower, open_lower[i]);
+            lower = fmin(lower, upper);
+        }
+        for (unsigned int b = threadIdx.x; b < B; b += BLOCK) on_out[(u64)row * B + b] = r.best[b];
+        if (threadIdx.x == 0) { upper_out[row] = upper; lower_out[row] = lower; }
+        __syncthreads();
+    }
 }
 "#;
 
@@ -2155,14 +2610,14 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
             Ok(out)
         }
 
-        pub(super) fn softmax_rows(&self, scores: &mut Tensor, causal: bool, start: usize) -> Result<(), GpuError> {
+        pub(super) fn softmax_rows(&self, scores: &mut Tensor, causal: bool, start: usize, period: usize) -> Result<(), GpuError> {
             let (rows, width) = (scores.rows as u32, scores.cols as u32);
             let launch = cfg_rows(scores.rows);
             let causal = i32::from(causal);
-            let start = start as u32;
+            let (start, period) = (start as u32, period as u32);
             let f = self.function("softmax_rows")?;
             // SAFETY: one block per row of a rows × width buffer.
-            unsafe { self.stream.launch_builder(&f).arg(&rows).arg(&width).arg(&causal).arg(&start).arg(slice_mut(scores)?).launch(launch) }
+            unsafe { self.stream.launch_builder(&f).arg(&rows).arg(&width).arg(&causal).arg(&start).arg(&period).arg(slice_mut(scores)?).launch(launch) }
                 .gpu_ctx("tensor softmax_rows")
                 .map(|_| ())
         }
@@ -2322,6 +2777,61 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
             .map(|_| ())
         }
 
+        pub(super) fn code_rows(
+            &self,
+            (z, w, yfy): (&Tensor, &Tensor, &Tensor),
+            (gram, starts, bits): (&Tensor, &Indices, &Tensor),
+            warm: Option<&Tensor>,
+            (kappa, nodes, tolerance): (f64, usize, f64),
+            on: &mut Tensor,
+        ) -> Result<(Vec<f64>, Vec<f64>), GpuError> {
+            let (rows, pieces, blocks) = (z.rows, z.cols, bits.cols);
+            if rows == 0 {
+                return Ok((Vec::new(), Vec::new()));
+            }
+            // One module per device (each context loads its own).
+            static CODER: std::sync::OnceLock<crate::device_cache::KeyedPtxModuleCache<usize>> = std::sync::OnceLock::new();
+            let module = CODER.get_or_init(crate::device_cache::KeyedPtxModuleCache::new).get_or_compile(&self.ctx, self.ctx.ordinal(), "sparse code", |_| CODER_KERNELS.to_string())?;
+            let f = module.load_function("code_rows").gpu_ctx("sparse code kernel")?;
+            let width = blocks.next_power_of_two().max(2);
+            let open = nodes + 1;
+            // Per slot: 15 rows of blocks, one of pieces, the sort keys, and every open node's
+            // bounds, point, its `Q m` and lower bound; indices for the working set and the sort.
+            let per_slot = 15 * blocks + pieces + width + open * (4 * blocks + 1);
+            let per_index = blocks + width;
+            let (free, _) = self.memory()?;
+            let budget = free / 4;
+            // Enough blocks to fill the device two or three deep; each holds its slot all along.
+            let slots = (budget / (8 * per_slot + 4 * per_index).max(1)).clamp(1, rows.min(384));
+            let mut scratch = self.zeros(slots * per_slot)?;
+            let mut indices = self.stream.alloc_zeros::<u32>(slots * per_index).gpu_ctx("sparse code alloc")?;
+            let (mut upper, mut lower) = (self.zeros(rows)?, self.zeros(rows)?);
+            let no_warm = self.zeros(1)?;
+            let warmed: i32 = i32::from(warm.is_some());
+            let unit: i32 = i32::from(blocks == pieces);
+            let (rows32, pieces32, blocks32, width32, nodes32, open32) = (rows as u32, pieces as u32, blocks as u32, width as u32, nodes as u32, open as u32);
+            let (slot_len, index_len) = (per_slot as u64, per_index as u64);
+            let cfg = LaunchConfig { grid_dim: (slots as u32, 1, 1), block_dim: (BLOCK, 1, 1), shared_mem_bytes: 0 };
+            // SAFETY: shapes checked by the caller; each block owns its slot of both scratches.
+            unsafe {
+                self.stream
+                    .launch_builder(&f)
+                    .arg(&rows32).arg(&pieces32).arg(&blocks32).arg(&width32).arg(&nodes32).arg(&open32).arg(&unit).arg(&warmed)
+                    .arg(&kappa).arg(&tolerance)
+                    .arg(slice(z)?).arg(slice(w)?).arg(slice(yfy)?).arg(slice(gram)?).arg(index_slice(starts)?).arg(slice(bits)?)
+                    .arg(match warm { Some(m) => slice(m)?, None => &no_warm })
+                    .arg(&slot_len).arg(&index_len).arg(&mut scratch).arg(&mut indices)
+                    .arg(slice_mut(on)?).arg(&mut upper).arg(&mut lower)
+                    .launch(cfg)
+            }
+            .gpu_ctx("sparse code launch")?;
+            let mut upper = self.download(&upper)?;
+            let mut lower = self.download(&lower)?;
+            upper.truncate(rows);
+            lower.truncate(rows);
+            Ok((upper, lower))
+        }
+
         pub(super) fn box_charge(&self, z: &Tensor, mask: &Tensor, q: &Tensor, cot: &mut Tensor, coefficient: &mut Tensor) -> Result<Vec<f64>, GpuError> {
             if z.is_empty() { return Ok(vec![0.0; z.rows]); }
             let (rows, cols) = (z.rows as u32, z.cols as u32);
@@ -2337,6 +2847,28 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
             let mut values = self.download(&norms)?;
             values.truncate(z.rows);
             Ok(values.into_iter().map(|n| 0.5 * n * n).collect())
+        }
+
+        pub(super) fn argmax_rows(&self, t: &Tensor) -> Result<Vec<usize>, GpuError> {
+            let mut out = self.zeros(t.rows)?;
+            let (rows, cols) = (t.rows as u32, t.cols as u32);
+            let f = self.function("argmax_rows")?;
+            // SAFETY: one block per row of `t`; `out` holds one value per row.
+            unsafe { self.stream.launch_builder(&f).arg(&rows).arg(&cols).arg(slice(t)?).arg(&mut out).launch(cfg_rows(t.rows)) }
+                .gpu_ctx("tensor argmax_rows")?;
+            Ok(self.download(&out)?.into_iter().take(t.rows).map(|v| v as usize).collect())
+        }
+
+        pub(super) fn fill_entries(&self, t: &mut Tensor, at: &Indices, value: f64) -> Result<(), GpuError> {
+            let n = at.len as u64;
+            if n == 0 {
+                return Ok(());
+            }
+            let f = self.function("fill_entries")?;
+            // SAFETY: every position is below `t`'s length (the caller's contract, checked on the host).
+            unsafe { self.stream.launch_builder(&f).arg(&n).arg(index_slice(at)?).arg(&value).arg(slice_mut(t)?).launch(cfg_elements(n)) }
+                .gpu_ctx("tensor fill_entries")
+                .map(|_| ())
         }
 
         pub(super) fn softmax_quadratic(&self, logits: &Tensor, tangent: &Tensor) -> Result<Vec<f64>, GpuError> {
@@ -2549,7 +3081,7 @@ kernel void t_softmax_rows(device float* s [[buffer(0)]], constant P& p [[buffer
     threadgroup float shared[GROUP];
     ROWS {
         device float* row = s + (ulong)r * p.cols;
-        uint valid = p.a ? min(p.extra + r % p.cols + 1, p.cols) : p.cols;
+        uint valid = p.a ? min(p.extra + r % p.b + 1, p.cols) : p.cols;
         float m = -INFINITY;
         for (uint c = t; c < valid; c += GROUP) m = max(m, row[c]);
         m = group_max(m, shared, t);
@@ -2706,6 +3238,35 @@ kernel void t_sampled_head(device const float* probabilities [[buffer(0)]], devi
     }
 }
 
+kernel void t_argmax_rows(device const float* x [[buffer(0)]], device float* out [[buffer(1)]], constant P& p [[buffer(2)]],
+                          uint group [[threadgroup_position_in_grid]], uint groups [[threadgroups_per_grid]], uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float values[GROUP];
+    threadgroup uint columns[GROUP];
+    ROWS {
+        device const float* z = x + (ulong)r * p.cols;
+        float best = -INFINITY;
+        uint at = p.cols;
+        for (uint c = t; c < p.cols; c += GROUP) if (z[c] > best) { best = z[c]; at = c; }
+        values[t] = best;
+        columns[t] = at;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = GROUP / 2; s > 0; s >>= 1) {
+            if (t < s && (values[t + s] > values[t] || (values[t + s] == values[t] && columns[t + s] < columns[t]))) {
+                values[t] = values[t + s];
+                columns[t] = columns[t + s];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (t == 0) out[r] = columns[0] == p.cols ? 0.0f : float(columns[0]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void t_fill_entries(device const uint* at [[buffer(0)]], device float* x [[buffer(1)]], constant P& p [[buffer(2)]],
+                           uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS x[at[i]] = p.alpha;
+}
+
 kernel void t_softmax_quadratic(device const float* logits [[buffer(0)]], device const float* tangent [[buffer(1)]], device float* out [[buffer(2)]],
                                 constant P& p [[buffer(3)]], uint group [[threadgroup_position_in_grid]],
                                 uint groups [[threadgroups_per_grid]], uint t [[thread_position_in_threadgroup]]) {
@@ -2854,6 +3415,321 @@ kernel void t_box_charge(device const float* z [[buffer(0)]], device const float
         }
     }
 }
+
+// The sparse code (`Device::code_rows`), one threadgroup per row, the CUDA kernel's steps in f32.
+#define CNONE 0xffffffffu
+
+struct CodeRow {
+    uint C, B, W;
+    bool unit;
+    float kappa, tol, empty;
+    device const float* z; device const float* w; device const float* K; device const uint* starts; device const float* bits;
+    device float* lin; device float* dia; device float* qm; device float* oq; device float* m; device float* col; device float* tt;
+    device float* on; device float* best; device float* inw; device float* key;
+    device uint* work; device uint* idx;
+};
+
+inline uint code_pick(float v, uint i, bool last_max, threadgroup float* sv, threadgroup uint* si, uint t) {
+    sv[t] = v; si[t] = i;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = GROUP / 2; s > 0; s >>= 1) {
+        if (t < s) {
+            float a = sv[t], b = sv[t + s];
+            uint ia = si[t], ib = si[t + s];
+            bool take;
+            if (ia == CNONE) take = true;
+            else if (ib == CNONE) take = false;
+            else if (last_max) take = b > a || (b == a && ib > ia);
+            else take = b < a || (b == a && ib < ia);
+            if (take) { sv[t] = b; si[t] = ib; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    uint r = si[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return r;
+}
+
+inline void code_column(thread const CodeRow& r, uint b, uint t) {
+    if (r.unit) {
+        float zb = r.z[b];
+        device const float* kr = r.K + (ulong)b * r.C;
+        for (uint j = t; j < r.B; j += GROUP) r.col[j] = r.z[j] * (zb * kr[j]);
+        threadgroup_barrier(mem_flags::mem_device);
+        return;
+    }
+    uint s = r.starts[b], e = r.starts[b + 1];
+    for (uint j = t; j < r.C; j += GROUP) {
+        float acc = 0.0f;
+        for (uint c = s; c < e; c++) {
+            float zc = r.z[c];
+            if (zc != 0.0f) acc += zc * r.K[(ulong)c * r.C + j];
+        }
+        r.tt[j] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint j = t; j < r.B; j += GROUP) {
+        float acc = 0.0f;
+        for (uint c = r.starts[j]; c < r.starts[j + 1]; c++) acc += r.z[c] * r.tt[c];
+        r.col[j] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+}
+
+inline void code_add(thread const CodeRow& r, device float* q, float a, uint t) {
+    for (uint j = t; j < r.B; j += GROUP) q[j] += a * r.col[j];
+    threadgroup_barrier(mem_flags::mem_device);
+}
+
+inline float code_relax(thread const CodeRow& r, device const float* lo, device const float* hi, device const float* start, device const float* known, bool has_known,
+                        threadgroup float* sv, threadgroup uint* si, threadgroup uint* nw, uint t) {
+    uint B = r.B;
+    for (uint b = t; b < B; b += GROUP) {
+        r.m[b] = min(max(start[b], lo[b]), hi[b]);
+        r.qm[b] = has_known ? known[b] : 0.0f;
+        r.inw[b] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint b = 0; b < B; b++) {
+        float moved = has_known ? r.m[b] - start[b] : r.m[b];
+        if (moved != 0.0f) { code_column(r, b, t); code_add(r, r.qm, moved, t); }
+    }
+    if (t == 0) {
+        uint n = 0;
+        for (uint b = 0; b < B; b++) {
+            if (r.m[b] != 0.0f && lo[b] < hi[b]) { r.work[n++] = b; r.inw[b] = 1.0f; }
+        }
+        nw[0] = n;
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    for (;;) {
+        for (int sweep = 0; sweep < 1000; sweep++) {
+            float moved = 0.0f;
+            uint n = nw[0];
+            for (uint k = 0; k < n; k++) {
+                uint b = r.work[k];
+                float g = r.lin[b] + 2.0f * r.kappa * r.qm[b];
+                float curvature = 2.0f * r.kappa * r.dia[b];
+                float mb = r.m[b];
+                float next = curvature > 0.0f ? min(max(mb - g / curvature, lo[b]), hi[b]) : (g > 0.0f ? lo[b] : (g < 0.0f ? hi[b] : mb));
+                float step = next - mb;
+                threadgroup_barrier(mem_flags::mem_device);
+                if (step != 0.0f) {
+                    if (t == 0) r.m[b] = next;
+                    code_column(r, b, t);
+                    code_add(r, r.qm, step, t);
+                    moved = max(moved, fabs(step));
+                }
+            }
+            if (moved <= r.tol) break;
+        }
+        for (uint b = t; b < r.W; b += GROUP) {
+            float k = -1.0f;
+            if (b < B && lo[b] < hi[b] && r.inw[b] == 0.0f) {
+                float g = r.lin[b] + 2.0f * r.kappa * r.qm[b];
+                if ((g < 0.0f && r.m[b] < hi[b]) || (g > 0.0f && r.m[b] > lo[b])) k = fabs(g);
+            }
+            r.key[b] = k;
+            r.idx[b] = b;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+        for (uint k = 2; k <= r.W; k <<= 1) {
+            for (uint j = k >> 1; j > 0; j >>= 1) {
+                for (uint i = t; i < r.W; i += GROUP) {
+                    uint l = i ^ j;
+                    if (l > i) {
+                        bool before_li = r.key[l] > r.key[i] || (r.key[l] == r.key[i] && r.idx[l] < r.idx[i]);
+                        bool before_il = r.key[i] > r.key[l] || (r.key[i] == r.key[l] && r.idx[i] < r.idx[l]);
+                        bool swap = (i & k) == 0 ? before_li : before_il;
+                        if (swap) {
+                            float tk = r.key[i]; r.key[i] = r.key[l]; r.key[l] = tk;
+                            uint ti = r.idx[i]; r.idx[i] = r.idx[l]; r.idx[l] = ti;
+                        }
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_device);
+            }
+        }
+        if (t == 0) {
+            uint count = 0;
+            while (count < B && r.key[count] >= 0.0f) count++;
+            uint stop = count == 0 ? 1u : 0u;
+            if (count > 0) {
+                uint n = nw[0];
+                uint room = n > 16 ? n : 16;
+                uint take = count < room ? count : room;
+                for (uint i = 0; i < take; i++) { uint b = r.idx[i]; r.work[n++] = b; r.inw[b] = 1.0f; }
+                nw[0] = n;
+            }
+            si[0] = stop;
+        }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+        uint stop = si[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (stop != 0) break;
+    }
+    float pv = 0.0f, pq = 0.0f, ps = 0.0f;
+    for (uint b = t; b < B; b += GROUP) {
+        float mb = r.m[b], g = r.lin[b] + 2.0f * r.kappa * r.qm[b];
+        pv += mb * r.lin[b];
+        pq += mb * r.qm[b];
+        ps += min(g * (lo[b] - mb), g * (hi[b] - mb));
+    }
+    float value = r.empty + group_sum(pv, sv, t) + r.kappa * group_sum(pq, sv, t);
+    float slack = group_sum(ps, sv, t);
+    return value + min(slack, 0.0f);
+}
+
+inline float code_round(thread const CodeRow& r, device const float* lo, device const float* hi, threadgroup float* sv, threadgroup uint* si, uint t) {
+    uint B = r.B;
+    for (uint b = t; b < B; b += GROUP) {
+        r.on[b] = (lo[b] == hi[b] ? hi[b] > 0.5f : r.m[b] > 0.5f) ? 1.0f : 0.0f;
+        r.oq[b] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint b = 0; b < B; b++) {
+        if (r.on[b] == 1.0f) { code_column(r, b, t); code_add(r, r.oq, 1.0f, t); }
+    }
+    for (;;) {
+        float bv = INFINITY;
+        uint bi = CNONE;
+        for (uint b = t; b < B; b += GROUP) {
+            if (!(lo[b] < hi[b])) continue;
+            float delta = r.on[b] == 1.0f ? -r.lin[b] + r.kappa * (r.dia[b] - 2.0f * r.oq[b]) : r.lin[b] + r.kappa * (r.dia[b] + 2.0f * r.oq[b]);
+            if (delta < 0.0f && (bi == CNONE || delta < bv)) { bv = delta; bi = b; }
+        }
+        uint b = code_pick(bv, bi, false, sv, si, t);
+        if (b == CNONE) break;
+        float sign = r.on[b] == 1.0f ? -1.0f : 1.0f;
+        threadgroup_barrier(mem_flags::mem_device);
+        if (t == 0) r.on[b] = r.on[b] == 1.0f ? 0.0f : 1.0f;
+        code_column(r, b, t);
+        code_add(r, r.oq, sign, t);
+    }
+    float pv = 0.0f, pq = 0.0f;
+    for (uint b = t; b < B; b += GROUP) {
+        pv += r.on[b] * r.lin[b];
+        pq += r.on[b] * r.oq[b];
+    }
+    return r.empty + group_sum(pv, sv, t) + r.kappa * group_sum(pq, sv, t);
+}
+
+inline void code_copy(device float* to, device const float* from, uint n, uint t) {
+    for (uint i = t; i < n; i += GROUP) to[i] = from[i];
+    threadgroup_barrier(mem_flags::mem_device);
+}
+
+// `p`: rows, cols (pieces), extra (the sort's width), a (blocks), b (nodes), n (1: every block one
+// piece; 2: warm starts), alpha (κ), beta (the relaxation's tolerance).
+kernel void t_code_rows(device const float* z [[buffer(0)]], device const float* w [[buffer(1)]], device const float* yfy [[buffer(2)]],
+                        device const float* K [[buffer(3)]], device const uint* starts [[buffer(4)]], device const float* bits [[buffer(5)]],
+                        device const float* warm [[buffer(6)]], device float* scratch [[buffer(7)]], device uint* iscratch [[buffer(8)]],
+                        device float* on_out [[buffer(9)]], device float* upper_out [[buffer(10)]], device float* lower_out [[buffer(11)]],
+                        constant P& p [[buffer(12)]], uint group [[threadgroup_position_in_grid]],
+                        uint groups [[threadgroups_per_grid]], uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float sv[GROUP];
+    threadgroup uint si[GROUP];
+    threadgroup uint nw[1];
+    uint C = p.cols, B = p.a, W = p.extra, nodes = p.b, cap = nodes + 1;
+    ulong slot_len = 15ul * B + C + W + (ulong)cap * (4ul * B + 1ul);
+    ulong index_len = (ulong)B + W;
+    device float* base = scratch + (ulong)group * slot_len;
+    device uint* ibase = iscratch + (ulong)group * index_len;
+    CodeRow r;
+    r.C = C; r.B = B; r.W = W; r.unit = (p.n & 1u) != 0; r.kappa = p.alpha; r.tol = p.beta;
+    r.K = K; r.starts = starts; r.bits = bits;
+    r.lin = base; r.dia = base + B; r.qm = base + 2 * B; r.oq = base + 3 * B; r.m = base + 4 * B; r.col = base + 5 * B; r.on = base + 6 * B;
+    r.best = base + 7 * B; r.inw = base + 8 * B;
+    device float* lo = base + 9 * B; device float* hi = base + 10 * B; device float* point = base + 11 * B; device float* pqm = base + 12 * B;
+    device float* clo = base + 13 * B; device float* chi = base + 14 * B;
+    r.tt = base + 15 * B; r.key = base + 15 * B + C;
+    device float* open = base + 15 * B + C + W;
+    device float* open_lower = open + (ulong)cap * 4 * B;
+    r.work = ibase; r.idx = ibase + B;
+    bool warmed = (p.n & 2u) != 0;
+    for (uint row = group; row < p.rows; row += groups) {
+        r.z = z + (ulong)row * C;
+        r.w = w + (ulong)row * C;
+        r.empty = p.alpha * yfy[row];
+        for (uint b = t; b < B; b += GROUP) {
+            uint s0 = starts[b], e0 = starts[b + 1];
+            float acc = 0.0f;
+            for (uint c = s0; c < e0; c++) acc += r.z[c] * r.w[c];
+            r.lin[b] = bits[b] - 2.0f * p.alpha * acc;
+            float d = 0.0f;
+            for (uint c = s0; c < e0; c++) {
+                float inner = 0.0f;
+                for (uint c2 = s0; c2 < e0; c2++) inner += r.z[c] * r.z[c2] * K[(ulong)c * C + c2];
+                d += inner;
+            }
+            r.dia[b] = max(d, 0.0f);
+            lo[b] = 0.0f;
+            hi[b] = 1.0f;
+            point[b] = warmed ? warm[(ulong)row * B + b] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+        float root = code_relax(r, lo, hi, point, pqm, false, sv, si, nw, t);
+        float upper = code_round(r, lo, hi, sv, si, t);
+        code_copy(r.best, r.on, B, t);
+        float lower = min(root, upper);
+        if (!(upper - root <= 1.0f || nodes == 0)) {
+            uint count = 1, explored = 0;
+            code_copy(open, lo, B, t); code_copy(open + B, hi, B, t); code_copy(open + 2 * B, r.m, B, t); code_copy(open + 3 * B, r.qm, B, t);
+            if (t == 0) open_lower[0] = root;
+            threadgroup_barrier(mem_flags::mem_device);
+            float floor_bound = INFINITY;
+            for (;;) {
+                if (count == 0) break;
+                uint index = 0;
+                for (uint i = 1; i < count; i++) if (open_lower[i] < open_lower[index]) index = i;
+                float node = open_lower[index];
+                if (node >= upper - 1.0f || explored >= nodes) break;
+                device float* entry = open + (ulong)index * 4 * B;
+                code_copy(lo, entry, B, t); code_copy(hi, entry + B, B, t); code_copy(point, entry + 2 * B, B, t); code_copy(pqm, entry + 3 * B, B, t);
+                count--;
+                if (index != count) {
+                    device float* last = open + (ulong)count * 4 * B;
+                    code_copy(entry, last, 4 * B, t);
+                    if (t == 0) open_lower[index] = open_lower[count];
+                    threadgroup_barrier(mem_flags::mem_device);
+                }
+                explored++;
+                float bv = -INFINITY;
+                uint bi = CNONE;
+                for (uint b = t; b < B; b += GROUP) {
+                    if (!(lo[b] < hi[b])) continue;
+                    float f = 0.5f - fabs(point[b] - 0.5f);
+                    if (bi == CNONE || f >= bv) { bv = f; bi = b; }
+                }
+                uint j = code_pick(bv, bi, true, sv, si, t);
+                if (j == CNONE || point[j] == 0.0f || point[j] == 1.0f) { floor_bound = min(floor_bound, node); continue; }
+                for (int fixed = 0; fixed < 2; fixed++) {
+                    code_copy(clo, lo, B, t); code_copy(chi, hi, B, t);
+                    if (t == 0) { clo[j] = (float)fixed; chi[j] = (float)fixed; }
+                    threadgroup_barrier(mem_flags::mem_device);
+                    float child = code_relax(r, clo, chi, point, pqm, true, sv, si, nw, t);
+                    float value = code_round(r, clo, chi, sv, si, t);
+                    if (value < upper) { code_copy(r.best, r.on, B, t); upper = value; }
+                    if (child < upper - 1.0f) {
+                        device float* slot = open + (ulong)count * 4 * B;
+                        code_copy(slot, clo, B, t); code_copy(slot + B, chi, B, t); code_copy(slot + 2 * B, r.m, B, t); code_copy(slot + 3 * B, r.qm, B, t);
+                        if (t == 0) open_lower[count] = child;
+                        threadgroup_barrier(mem_flags::mem_device);
+                        count++;
+                    } else {
+                        floor_bound = min(floor_bound, child);
+                    }
+                }
+            }
+            lower = floor_bound;
+            for (uint i = 0; i < count; i++) lower = min(lower, open_lower[i]);
+            lower = min(lower, upper);
+        }
+        for (uint b = t; b < B; b += GROUP) on_out[(ulong)row * B + b] = r.best[b];
+        if (t == 0) { upper_out[row] = upper; lower_out[row] = lower; }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+}
 "#;
 
     const NAMES: &[&str] = &[
@@ -2874,9 +3750,12 @@ kernel void t_box_charge(device const float* z [[buffer(0)]], device const float
         "t_block_products",
         "t_sampled_head",
         "t_softmax_quadratic",
+        "t_argmax_rows",
+        "t_fill_entries",
         "t_adam",
         "t_select_sets",
         "t_box_charge",
+        "t_code_rows",
     ];
 
     /// The parameters of every kernel (MSL `P`).
@@ -3056,8 +3935,8 @@ kernel void t_box_charge(device const float* z [[buffer(0)]], device const float
             Ok(out)
         }
 
-        pub(super) fn softmax_rows(&self, scores: &mut Tensor, causal: bool, start: usize) -> Result<(), GpuError> {
-            let p = P { a: u32::from(causal), extra: u32_of(start)?, ..P::default() };
+        pub(super) fn softmax_rows(&self, scores: &mut Tensor, causal: bool, start: usize, period: usize) -> Result<(), GpuError> {
+            let p = P { a: u32::from(causal), extra: u32_of(start)?, b: u32_of(period)?, ..P::default() };
             self.rows("t_softmax_rows", &[whole(buffer(scores)?)], scores.rows, scores.cols, p)
         }
 
@@ -3116,6 +3995,20 @@ kernel void t_box_charge(device const float* z [[buffer(0)]], device const float
             Ok(out)
         }
 
+        pub(super) fn argmax_rows(&self, t: &Tensor) -> Result<Vec<usize>, GpuError> {
+            let out = self.stream.alloc(t.rows)?;
+            self.rows("t_argmax_rows", &[whole(buffer(t)?), whole(&out)], t.rows, t.cols, P::default())?;
+            Ok(self.stream.read::<f32>(&out)?.into_iter().take(t.rows).map(|v| v as usize).collect())
+        }
+
+        pub(super) fn fill_entries(&self, t: &mut Tensor, at: &Indices, value: f64) -> Result<(), GpuError> {
+            if at.len == 0 {
+                return Ok(());
+            }
+            let p = P { alpha: value as f32, ..P::default() };
+            self.elements("t_fill_entries", &[whole(index_buffer(at)?), whole(buffer(t)?)], at.len, p)
+        }
+
         pub(super) fn softmax_quadratic(&self, logits: &Tensor, tangent: &Tensor) -> Result<Vec<f64>, GpuError> {
             let out = self.stream.alloc(logits.rows)?;
             self.rows("t_softmax_quadratic", &[whole(buffer(logits)?), whole(buffer(tangent)?), whole(&out)], logits.rows, logits.cols, P::default())?;
@@ -3159,6 +4052,52 @@ kernel void t_box_charge(device const float* z [[buffer(0)]], device const float
                 whole(buffer(mask)?),
             ];
             self.stream.dispatch("t_select_sets", &buffers, &p, groups)
+        }
+
+        pub(super) fn code_rows(
+            &self,
+            (z, w, yfy): (&Tensor, &Tensor, &Tensor),
+            (gram, starts, bits): (&Tensor, &Indices, &Tensor),
+            warm: Option<&Tensor>,
+            (kappa, nodes, tolerance): (f64, usize, f64),
+            on: &mut Tensor,
+        ) -> Result<(Vec<f64>, Vec<f64>), GpuError> {
+            let (rows, pieces, blocks) = (z.rows, z.cols, bits.cols);
+            if rows == 0 {
+                return Ok((Vec::new(), Vec::new()));
+            }
+            let width = blocks.next_power_of_two().max(2);
+            let open = nodes + 1;
+            // As the CUDA kernel's slots; the groups stride over the rows.
+            let per_slot = 15 * blocks + pieces + width + open * (4 * blocks + 1);
+            let per_index = blocks + width;
+            let groups = rows.min(128);
+            u32_of(groups * per_slot)?;
+            let (scratch, indices) = (self.stream.alloc(groups * per_slot)?, self.stream.alloc(groups * per_index)?);
+            let (upper, lower, no_warm) = (self.stream.alloc(rows)?, self.stream.alloc(rows)?, self.stream.alloc(1)?);
+            let flags = u32::from(blocks == pieces) | (u32::from(warm.is_some()) << 1);
+            // An f32 relaxation is stationary at a move of a millionth (its coordinates are in [0, 1]).
+            let p = P { n: flags, rows: u32_of(rows)?, cols: u32_of(pieces)?, extra: u32_of(width)?, a: u32_of(blocks)?, b: u32_of(nodes)?, alpha: kappa as f32, beta: (tolerance as f32).max(1e-6) };
+            let buffers = [
+                whole(buffer(z)?),
+                whole(buffer(w)?),
+                whole(buffer(yfy)?),
+                whole(buffer(gram)?),
+                whole(index_buffer(starts)?),
+                whole(buffer(bits)?),
+                whole(match warm {
+                    Some(m) => buffer(m)?,
+                    None => &no_warm,
+                }),
+                whole(&scratch),
+                whole(&indices),
+                whole(buffer(on)?),
+                whole(&upper),
+                whole(&lower),
+            ];
+            self.stream.dispatch("t_code_rows", &buffers, &p, groups)?;
+            let widen = |b: &Buffer| -> Result<Vec<f64>, GpuError> { Ok(self.stream.read::<f32>(b)?.into_iter().take(rows).map(f64::from).collect()) };
+            Ok((widen(&upper)?, widen(&lower)?))
         }
 
         pub(super) fn box_charge(&self, z: &Tensor, mask: &Tensor, q: &Tensor, cot: &mut Tensor, coefficient: &mut Tensor) -> Result<Vec<f64>, GpuError> {

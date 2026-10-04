@@ -64,7 +64,8 @@ enum Held {
 
 struct HeldOperator {
     source: Arc<Operator>,
-    held: Held,
+    /// Shared with every program compiled from this one ([`DeviceProgram::compile_sharing`]).
+    held: Arc<Held>,
 }
 
 fn hold(device: &Device, op: &Operator, role: Role) -> Result<Held, String> {
@@ -183,6 +184,17 @@ fn rotations_of(trace: &DeviceTrace, rotary: Rotary) -> Result<(&Tensor, &Tensor
 impl DeviceProgram {
     /// Lower `program` onto `device`, or the reason it cannot be.
     pub fn compile(device: &Device, program: &OperatorProgram) -> Result<Self, String> {
+        Self::lower(device, program, None)
+    }
+
+    /// [`Self::compile`] on `from`'s device, every operator `program` shares with `from` (the same
+    /// `Arc`, in the same role) held by both instead of uploaded again: the programs of one model
+    /// with different sites replaced hold the model's weights once.
+    pub fn compile_sharing(from: &Self, program: &OperatorProgram) -> Result<Self, String> {
+        Self::lower(&from.device, program, Some(from))
+    }
+
+    fn lower(device: &Device, program: &OperatorProgram, from: Option<&Self>) -> Result<Self, String> {
         let interfaces = program.interfaces().map_err(|e| e.to_string())?;
         let widths: Vec<usize> = interfaces.iter().map(|i| i.width()).collect();
         let head = Self::head_of(program)?;
@@ -265,13 +277,19 @@ impl DeviceProgram {
             };
             steps.push(step);
         }
+        // `from`'s operators by their source and role.
+        let held_by: BTreeMap<(usize, Role), &Arc<Held>> =
+            from.map(|f| f.operators.iter().map(|((_, role), h)| ((Arc::as_ptr(&h.source) as usize, *role), &h.held)).collect()).unwrap_or_default();
         let mut operators = BTreeMap::new();
         for key in wanted {
             if operators.contains_key(&key) {
                 continue;
             }
             let source = Arc::clone(&program.operators[key.0]);
-            let held = hold(device, &source, key.1)?;
+            let held = match held_by.get(&(Arc::as_ptr(&source) as usize, key.1)) {
+                Some(h) => Arc::clone(h),
+                None => Arc::new(hold(device, &source, key.1)?),
+            };
             operators.insert(key, HeldOperator { source, held });
         }
         Ok(Self { device: device.clone(), steps, widths, head, operators, batch: Mutex::new(None), arithmetic: Arithmetic::F64 })
@@ -335,8 +353,9 @@ impl DeviceProgram {
     /// A dense operator's device copy to change in place (a trained library); the program's
     /// host operator no longer describes it until [`Self::refresh`] from a program holding it.
     pub fn dense_mut(&mut self, op: usize) -> Result<&mut Tensor, String> {
-        match self.operators.get_mut(&(op, Role::Product)).map(|h| &mut h.held) {
-            Some(Held::Dense(a)) => Ok(a),
+        match self.operators.get_mut(&(op, Role::Product)).map(|h| Arc::get_mut(&mut h.held)) {
+            Some(Some(Held::Dense(a))) => Ok(a),
+            Some(None) => Err(format!("device: operator {op} is shared with another program")),
             _ => Err(format!("device: operator {op} is not held dense")),
         }
     }
@@ -370,14 +389,14 @@ impl DeviceProgram {
         for ((op, role), held) in &mut self.operators {
             if !Arc::ptr_eq(&held.source, &program.operators[*op]) {
                 held.source = Arc::clone(&program.operators[*op]);
-                held.held = hold(&self.device, &held.source, *role)?;
+                held.held = Arc::new(hold(&self.device, &held.source, *role)?);
             }
         }
         Ok(())
     }
 
     fn held(&self, op: usize, role: Role) -> Result<&Held, String> {
-        self.operators.get(&(op, role)).map(|h| &h.held).ok_or_else(|| format!("device: operator {op} not held as {role:?}"))
+        self.operators.get(&(op, role)).map(|h| h.held.as_ref()).ok_or_else(|| format!("device: operator {op} not held as {role:?}"))
     }
 
     /// The bytes a forward pass keeps per row (every resident node value), for sizing batches.
@@ -516,9 +535,29 @@ impl DeviceProgram {
 
     /// One forward pass on `family`, the raw slots in `given` taking those device values instead
     /// of the family's (which may then be empty).
-    pub fn forward_given(&self, family: &FamilyInputs, mut given: BTreeMap<usize, Tensor>) -> Result<DeviceTrace, String> {
+    pub fn forward_given(&self, family: &FamilyInputs, given: BTreeMap<usize, Tensor>) -> Result<DeviceTrace, String> {
+        self.forward_gated(family, given, &[], |_, _| Err("device: no gate decides".to_string()))
+    }
+
+    /// An autonomous forward pass (`OperatorProgram::execute_with_gates` on the device): for each
+    /// `(amplitude, mask)` of `gated` (a raw mask node read only after its amplitude node), once
+    /// the amplitude is computed `decide(amplitude, trace)` returns the mask's value (rows × its
+    /// width) from the trace so far, and the pass goes on with it. The other raw slots are as in
+    /// [`Self::forward_given`]; a gated mask's slot needs no value in `family`.
+    pub fn forward_gated(
+        &self,
+        family: &FamilyInputs,
+        mut given: BTreeMap<usize, Tensor>,
+        gated: &[(usize, usize)],
+        mut decide: impl FnMut(usize, &DeviceTrace) -> Result<Tensor, String>,
+    ) -> Result<DeviceTrace, String> {
         let d = &self.device;
         let rows = family.rows;
+        for &(amplitude, mask) in gated {
+            if mask >= amplitude || amplitude >= self.steps.len() || !matches!(self.steps[mask], Step::Raw { .. }) || self.widths[mask] != self.widths[amplitude] {
+                return Err(format!("device: gate ({amplitude}, {mask}) is not an amplitude after its raw mask of the same width"));
+            }
+        }
         let batch = self.prepared_batch(family)?;
         let mut trace = DeviceTrace { values: Vec::with_capacity(self.steps.len()), rows, ids: batch.ids.clone(), blocks: batch.blocks, rotations: Arc::clone(&batch.rotations) };
         for (index, step) in self.steps.iter().enumerate() {
@@ -526,6 +565,8 @@ impl DeviceProgram {
             let value = match step {
                 Step::Head => None,
                 Step::Feature { .. } => None,
+                // A gated mask is filled once its amplitude is known.
+                Step::Raw { .. } if gated.iter().any(|(_, mask)| *mask == index) => None,
                 Step::Raw { slot } => match given.remove(slot) {
                     Some(value) if value.dim() == (rows, width) => Some(value),
                     Some(value) => return Err(format!("device: a {:?} value for slot {slot} of {rows} × {width}", value.dim())),
@@ -582,6 +623,13 @@ impl DeviceProgram {
                 }
             };
             trace.values.push(value);
+            if let Some(&(_, mask)) = gated.iter().find(|(amplitude, _)| *amplitude == index) {
+                let decided = decide(index, &trace)?;
+                if decided.dim() != (rows, self.widths[mask]) {
+                    return Err(format!("device: a {:?} mask for gate {index} of {rows} × {}", decided.dim(), self.widths[mask]));
+                }
+                trace.values[mask] = Some(decided);
+            }
         }
         Ok(trace)
     }
