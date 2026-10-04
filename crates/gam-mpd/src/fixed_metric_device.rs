@@ -44,6 +44,9 @@ pub struct Timing {
     pub checked_metric_seconds: f64,
     pub cpu_reference_seconds: f64,
     pub cpu_top1_seconds: f64,
+    pub resident_head_seconds: f64,
+    pub gpu_top1_seconds: f64,
+    pub raw_oracle_download_seconds: f64,
 }
 
 /// CPU comparisons retain the existing conditional ULP model, not a proof oracle.
@@ -58,6 +61,16 @@ pub struct CpuComparison {
     pub conditional_intervals_disjoint: usize,
 }
 
+/// Independent host analytic spotchecks on exactly the downloaded raw logits.
+#[derive(Default, Clone, Debug, Serialize)]
+pub struct HostSpotcheck {
+    pub rows: usize,
+    pub disjoint: usize,
+    pub unresolved: usize,
+    pub maximum_host_width: f64,
+    pub top1_mismatches: usize,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Episode {
     pub id: String,
@@ -67,9 +80,11 @@ pub struct Episode {
     pub kl: Outcome,
     pub native_effect_cpu_metric: f64,
     pub top1_agree: f64,
+    pub top1_defined: bool,
     pub unheld: usize,
     pub cpu_comparison: Option<CpuComparison>,
     pub metric_timing: Timing,
+    pub host_analytic_spotcheck: Option<HostSpotcheck>,
 }
 
 #[derive(Debug, Serialize)]
@@ -85,11 +100,25 @@ pub struct Measure {
     pub groups: Vec<Group>,
     pub fixed_input_scope: &'static str,
     pub workspace_numeric_bound_bytes: usize,
+    pub readout_numeric_resident_bytes: Option<usize>,
     pub workspace_budget: Budget,
     pub result_numeric_storage_estimate_bytes: usize,
 }
 impl Measure {
     pub fn of(episodes: Vec<Episode>, resident: &Resident) -> Self {
+        Self::from_parts(
+            episodes,
+            resident.budget,
+            resident.required_bytes,
+            "Exact fixed binary64 CPU-normalized arrays reinterpreted as logits and independently softmax-normalized; no readout/GEMM/network arithmetic guarantee; no default acceptance integration; CPU ULP comparison model is conditional",
+        )
+    }
+    pub(crate) fn from_parts(
+        episodes: Vec<Episode>,
+        budget: Budget,
+        required_bytes: usize,
+        scope: &'static str,
+    ) -> Self {
         let mut grouped = std::collections::BTreeMap::<String, Vec<&Outcome>>::new();
         for episode in &episodes {
             grouped
@@ -116,9 +145,10 @@ impl Measure {
         Self {
             episodes,
             groups,
-            fixed_input_scope: "Exact fixed binary64 CPU-normalized arrays reinterpreted as logits and independently softmax-normalized; no readout/GEMM/network arithmetic guarantee; no default acceptance integration; CPU ULP comparison model is conditional",
-            workspace_numeric_bound_bytes: resident.required_bytes,
-            workspace_budget: resident.budget,
+            fixed_input_scope: scope,
+            workspace_numeric_bound_bytes: required_bytes,
+            readout_numeric_resident_bytes: None,
+            workspace_budget: budget,
             result_numeric_storage_estimate_bytes,
         }
     }
@@ -385,9 +415,125 @@ impl Stream<'_> {
             kl,
             native_effect_cpu_metric: native_effect,
             top1_agree: self.agree as f64 / n,
+            top1_defined: true,
             unheld,
             cpu_comparison: self.comparison,
             metric_timing: self.timing,
+            host_analytic_spotcheck: None,
+        })
+    }
+}
+
+/// Directed accumulation of already-resident raw-logit metric rows. No vocabulary buffers.
+pub(crate) struct RawStream {
+    top1_defined: bool,
+    sum: Outcome,
+    count: usize,
+    agree: usize,
+    start: Option<usize>,
+    end: Option<usize>,
+    oracle: Option<HostSpotcheck>,
+    timing: Timing,
+}
+impl RawStream {
+    pub(crate) fn new(oracle: bool) -> Self {
+        Self {
+            top1_defined: true,
+            sum: Outcome::Bounded {
+                lower: 0.0,
+                upper: 0.0,
+            },
+            count: 0,
+            agree: 0,
+            start: None,
+            end: None,
+            oracle: oracle.then(HostSpotcheck::default),
+            timing: Timing::default(),
+        }
+    }
+    pub(crate) fn append(
+        &mut self,
+        tile: crate::native_readout::RawTile,
+        from: usize,
+    ) -> Result<(), String> {
+        if tile.intervals.is_empty() || tile.intervals.len() != tile.top1_equal.len() {
+            return Err("raw checked metric tile shape mismatch".into());
+        }
+        if self.end.is_some_and(|end| end != from) {
+            return Err("raw checked row-domain gap or overlap".into());
+        }
+        let until = from
+            .checked_add(tile.intervals.len())
+            .ok_or("raw row index overflow")?;
+        self.start.get_or_insert(from);
+        self.end = Some(until);
+        for (row, interval) in tile.intervals.iter().enumerate() {
+            match interval {
+                CheckedInterval::Bounded { lower, upper } => {
+                    if let Some(sum) = self.sum.interval() {
+                        self.sum = Outcome::of(sum.add(Interval::new(*lower, *upper)));
+                    }
+                }
+                CheckedInterval::Unresolved(reason) => {
+                    self.sum = Outcome::Unresolved {
+                        reason: format!("raw row {}: {reason:?}", from + row),
+                    };
+                }
+            }
+        }
+        self.top1_defined &= tile.top1_defined;
+        self.count += tile.intervals.len();
+        self.agree += tile.top1_equal.iter().filter(|x| **x).count();
+        if let Some(ours) = &mut self.oracle {
+            let other = tile.oracle.ok_or("raw analytic oracle absent")?;
+            ours.rows += other.rows;
+            ours.disjoint += other.disjoint;
+            ours.unresolved += other.unresolved;
+            ours.top1_mismatches += other.top1_mismatches;
+            ours.maximum_host_width = ours.maximum_host_width.max(other.maximum_host_width);
+        }
+        self.timing.resident_head_seconds += tile.timing.resident_head_seconds;
+        self.timing.checked_metric_seconds += tile.timing.checked_metric_seconds;
+        self.timing.gpu_top1_seconds += tile.timing.gpu_top1_seconds;
+        self.timing.raw_oracle_download_seconds += tile.timing.raw_oracle_download_seconds;
+        self.timing.cpu_reference_seconds += tile.timing.cpu_reference_seconds;
+        Ok(())
+    }
+    pub(crate) fn finish(
+        self,
+        id: String,
+        group: String,
+        from: usize,
+        until: usize,
+        native_effect: f64,
+        unheld: usize,
+    ) -> Result<Episode, String> {
+        if self.count == 0
+            || self.count != until.saturating_sub(from)
+            || self.start != Some(from)
+            || self.end != Some(until)
+            || self.count as u128 > (1_u128 << 53)
+        {
+            return Err("raw checked scored-row domain mismatch".into());
+        }
+        let n = self.count as f64;
+        let kl = match self.sum.interval() {
+            Some(sum) => Outcome::of(sum.div_positive(Interval::point(n))),
+            None => self.sum,
+        };
+        Ok(Episode {
+            id,
+            group,
+            scored_from: from,
+            scored_until: until,
+            kl,
+            native_effect_cpu_metric: native_effect,
+            top1_agree: self.agree as f64 / n,
+            top1_defined: self.top1_defined,
+            unheld,
+            cpu_comparison: None,
+            metric_timing: self.timing,
+            host_analytic_spotcheck: self.oracle,
         })
     }
 }
@@ -412,6 +558,81 @@ mod tests {
         };
         assert_eq!(mean_outcomes(&[&a, &unknown]), unknown);
         assert!(matches!(mean_outcomes(&[]), Outcome::Unresolved { .. }));
+    }
+    fn raw_tile(bounds: Vec<CheckedInterval>, valid: bool) -> crate::native_readout::RawTile {
+        crate::native_readout::RawTile {
+            top1_equal: vec![true; bounds.len()],
+            top1_defined: valid,
+            intervals: bounds,
+            oracle: None,
+            timing: Timing::default(),
+        }
+    }
+    #[test]
+    fn raw_rows_preserve_directed_domains_and_unknowns() {
+        let mut stream = RawStream::new(false);
+        stream
+            .append(
+                raw_tile(
+                    vec![CheckedInterval::Bounded {
+                        lower: 0.1,
+                        upper: 0.2,
+                    }],
+                    true,
+                ),
+                7,
+            )
+            .expect("first");
+        assert!(
+            stream
+                .append(
+                    raw_tile(
+                        vec![CheckedInterval::Bounded {
+                            lower: 0.3,
+                            upper: 0.4
+                        }],
+                        true
+                    ),
+                    9
+                )
+                .is_err()
+        );
+        stream
+            .append(
+                raw_tile(
+                    vec![CheckedInterval::Bounded {
+                        lower: 0.3,
+                        upper: 0.4,
+                    }],
+                    true,
+                ),
+                8,
+            )
+            .expect("contiguous");
+        let episode = stream
+            .finish("a".into(), "b".into(), 7, 9, 3.0, 2)
+            .expect("domain");
+        assert!(matches!(episode.kl,Outcome::Bounded {lower,upper} if lower<=0.2 && upper>=0.3));
+        assert!(episode.top1_defined);
+        assert_eq!(episode.top1_agree, 1.0);
+        assert_eq!(episode.native_effect_cpu_metric, 3.0);
+        let mut unknown = RawStream::new(false);
+        unknown
+            .append(
+                raw_tile(
+                    vec![CheckedInterval::Unresolved(
+                        gam_gpu::tensor::CheckedIntervalReason::NonFiniteInput,
+                    )],
+                    false,
+                ),
+                0,
+            )
+            .expect("unknown");
+        let episode = unknown
+            .finish("u".into(), "b".into(), 0, 1, 0.0, 0)
+            .expect("unknown domain");
+        assert!(matches!(episode.kl, Outcome::Unresolved { .. }));
+        assert!(!episode.top1_defined);
     }
     #[test]
     fn explicit_workspace_covers_upload_clone_and_incoming_tiles() {

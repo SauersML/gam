@@ -4,7 +4,9 @@
 //! conditional exp/log ULP model; Rust does not guarantee those transcendental
 //! errors. Neither CPU nor GPU proposal bands certify full head/network arithmetic.
 use crate::counterfactual::Decoder;
-use gam_gpu::tensor::{Arithmetic, Device, Op, Tensor};
+use gam_gpu::tensor::{
+    Arithmetic, CheckedInterval, Device, Op, Tensor, checked_interval_output_bytes,
+};
 use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
 use ndarray::{Array2, Axis};
 
@@ -75,6 +77,15 @@ pub fn proposal_comparison_terms(
         return Err("invalid GPU proposal comparison terms".into());
     }
     Ok((estimate, tail))
+}
+
+/// Raw fixed-binary64 head outputs; no upstream arithmetic certificate.
+pub(crate) struct RawTile {
+    pub intervals: Vec<CheckedInterval>,
+    pub top1_equal: Vec<bool>,
+    pub top1_defined: bool,
+    pub oracle: Option<crate::fixed_metric_device::HostSpotcheck>,
+    pub timing: crate::fixed_metric_device::Timing,
 }
 
 /// Immutable native head only: no blocks or candidate parameters are uploaded.
@@ -246,6 +257,126 @@ impl Resident {
         Ok((normalized, [gpu_ns, cpu_ns]))
     }
 
+    /// Complete conservative live numeric workspace for a paired raw tile.
+    /// Includes two resident logits, optional exact-value downloads, head transient
+    /// arrays, checked outputs and argmax arrays. Context/library workspace excluded.
+    pub fn checked_raw_workspace_bytes(&self, rows: usize) -> Result<usize, String> {
+        if rows == 0 || rows > self.tile_rows {
+            return Err("raw head tile exceeds declared readout budget".into());
+        }
+        tile_bytes(self.width, self.vocab)?
+            .checked_mul(rows)
+            .and_then(|n| {
+                checked_interval_output_bytes(rows)
+                    .ok()
+                    .and_then(|o| n.checked_add(o))
+            })
+            .and_then(|n| rows.checked_mul(64).and_then(|o| n.checked_add(o)))
+            .and_then(|n| n.checked_add(std::mem::size_of::<RawTile>()))
+            .ok_or("raw head numeric budget overflow".into())
+    }
+
+    /// Opt-in checked KL directly on resident raw head logits. Production mode
+    /// downloads only O(rows) bounds/argmax. Oracle mode explicitly downloads the
+    /// same raw arrays and checks first/last row of every tile with host analytic
+    /// intervals; these are spotchecks, not a full-network arithmetic guarantee.
+    pub(crate) fn checked_raw_metrics(
+        &self,
+        teacher: &Array2<f64>,
+        explained: &Array2<f64>,
+        workspace_bytes: usize,
+        oracle: bool,
+    ) -> Result<RawTile, String> {
+        if !cfg!(target_os = "linux") || self.device.is_host() || !self.device.float64() {
+            return Err("resident raw checked metrics require CUDA f64 without fallback".into());
+        }
+        if teacher.dim() != explained.dim() {
+            return Err("raw head residual shape mismatch".into());
+        }
+        let required = self.checked_raw_workspace_bytes(teacher.nrows())?;
+        if required > workspace_bytes {
+            return Err(format!(
+                "raw head numeric workspace {required} exceeds {workspace_bytes}"
+            ));
+        }
+        let mut timing = crate::fixed_metric_device::Timing::default();
+        let timer = std::time::Instant::now();
+        let p = self.logits(teacher)?;
+        let q = self.logits(explained)?;
+        self.device.synchronize().map_err(|e| e.to_string())?;
+        timing.resident_head_seconds = timer.elapsed().as_secs_f64();
+        let timer = std::time::Instant::now();
+        let intervals = self
+            .device
+            .checked_kl_intervals(
+                &p,
+                &q,
+                checked_interval_output_bytes(teacher.nrows()).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+        timing.checked_metric_seconds = timer.elapsed().as_secs_f64();
+        let top1_defined = intervals
+            .iter()
+            .all(|x| matches!(x, CheckedInterval::Bounded { .. }));
+        let timer = std::time::Instant::now();
+        let a = self.device.argmax_rows(&p).map_err(|e| e.to_string())?;
+        let b = self.device.argmax_rows(&q).map_err(|e| e.to_string())?;
+        let top1_equal: Vec<bool> = a.iter().zip(&b).map(|(a, b)| a == b).collect();
+        timing.gpu_top1_seconds = timer.elapsed().as_secs_f64();
+        let oracle = if oracle {
+            let timer = std::time::Instant::now();
+            let hp = self.device.download(&p).map_err(|e| e.to_string())?;
+            let hq = self.device.download(&q).map_err(|e| e.to_string())?;
+            timing.raw_oracle_download_seconds = timer.elapsed().as_secs_f64();
+            let timer = std::time::Instant::now();
+            let mut check = crate::fixed_metric_device::HostSpotcheck::default();
+            for row in (0..hp.nrows()).filter(|r| *r == 0 || *r + 1 == hp.nrows()) {
+                check.rows += 1;
+                let first_max = |values: ndarray::ArrayView1<f64>| {
+                    values
+                        .iter()
+                        .enumerate()
+                        .fold((0, f64::NEG_INFINITY), |best, (c, v)| {
+                            if *v > best.1 { (c, *v) } else { best }
+                        })
+                        .0
+                };
+                let cpu_top = first_max(hp.row(row)) == first_max(hq.row(row));
+                if cpu_top != top1_equal[row] {
+                    check.top1_mismatches += 1;
+                }
+                match crate::fixed_logit_interval::kl_logits(
+                    hp.row(row).as_slice().ok_or("raw p layout")?,
+                    hq.row(row).as_slice().ok_or("raw q layout")?,
+                ) {
+                    crate::fixed_logit_interval::Enclosure::Bounded(host) => {
+                        check.maximum_host_width = check.maximum_host_width.max(host.hi - host.lo);
+                        match intervals[row] {
+                            CheckedInterval::Bounded { lower, upper } => {
+                                if host.lo > upper || lower > host.hi {
+                                    check.disjoint += 1;
+                                }
+                            }
+                            CheckedInterval::Unresolved(_) => check.unresolved += 1,
+                        }
+                    }
+                    crate::fixed_logit_interval::Enclosure::Unresolved(_) => check.unresolved += 1,
+                }
+            }
+            timing.cpu_reference_seconds = timer.elapsed().as_secs_f64();
+            Some(check)
+        } else {
+            None
+        };
+        Ok(RawTile {
+            intervals,
+            top1_equal,
+            top1_defined,
+            oracle,
+            timing,
+        })
+    }
+
     /// Explicit proposal-only GPU reductions. Downloads O(rows) statistics and
     /// first-maximum indices; never downloads a full vocabulary logits tile.
     /// No fallback or accepted verdict is produced. CPU replay is mandatory.
@@ -341,6 +472,18 @@ mod tests {
         let h = Resident::from_head(Device::host(), &e, &g, 1e-6, b).unwrap();
         assert_eq!(h.resident_bytes(), 64);
         assert_eq!(h.tile_rows(), 2);
+        assert!(h.checked_raw_workspace_bytes(2).unwrap() > 2 * tile_bytes(2, 3).unwrap());
+        assert!(h.checked_raw_workspace_bytes(0).is_err());
+        assert!(h.checked_raw_workspace_bytes(3).is_err());
+        assert!(
+            h.checked_raw_metrics(
+                &Array2::zeros((1, 2)),
+                &Array2::zeros((1, 2)),
+                1 << 20,
+                false
+            )
+            .is_err()
+        );
         assert!(h.log_probs(&Array2::zeros((3, 2))).is_err());
         assert!(
             Resident::from_head(

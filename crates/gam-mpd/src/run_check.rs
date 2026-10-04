@@ -749,7 +749,7 @@ pub struct RunTiming {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum MetricMode { CpuOracle, GpuProposal, GpuChecked }
+enum MetricMode { CpuOracle, GpuProposal, GpuChecked, GpuRawChecked }
 
 struct ScoredEpisode {
     score: Option<EpisodeScore>,
@@ -1148,10 +1148,11 @@ fn check_native_tail(native: &OperatorProgram, artifact: &Artifact, last: usize)
 
 impl LanguageRun<'_> {
     fn score_episodes(&self, artifact: &Artifact, mode: MetricMode) -> Result<Vec<EpisodeScore>, String> {
-        self.score_episodes_detailed(artifact,mode,None)?.into_iter().map(|episode|episode.score.ok_or_else(|| "legacy metric score absent".to_string())).collect()
+        self.score_episodes_detailed(artifact,mode,None,None)?.into_iter().map(|episode|episode.score.ok_or_else(|| "legacy metric score absent".to_string())).collect()
     }
 
-    fn score_episodes_detailed(&self, artifact: &Artifact, mode: MetricMode, checked: Option<&crate::fixed_metric_device::Resident>) -> Result<Vec<ScoredEpisode>, String> {
+    fn score_episodes_detailed(&self, artifact: &Artifact, mode: MetricMode, checked: Option<&crate::fixed_metric_device::Resident>, raw: Option<(crate::fixed_metric_device::Budget,bool)>) -> Result<Vec<ScoredEpisode>, String> {
+        if mode==MetricMode::GpuRawChecked && (raw.is_none() || self.native_readout.is_none()) {return Err("resident raw checked metric backend absent".into());}
         if mode==MetricMode::GpuChecked && checked.is_none() {return Err("checked GPU metric backend absent".into());}
 
         if mode==MetricMode::GpuProposal && self.native_readout.is_none() { return Err("GPU metric proposals require explicit native CUDA readout".into()); }
@@ -1240,9 +1241,11 @@ impl LanguageRun<'_> {
             let rows = reference.nrows();
             let (mut kl, mut error, mut agree) = (0.0, 0.0, 0.0);
             let mut fixed=checked.map(|resident|resident.stream());
+            let mut raw_fixed=raw.map(|(_,oracle)|crate::fixed_metric_device::RawStream::new(oracle));
             let mut start = from;
             while start < rows {
-                let end = (start + self.readout_rows()).min(rows);
+                let tile_rows=raw.map_or(self.readout_rows(),|(budget,_)|budget.batch_rows);
+                let end = (start + tile_rows).min(rows);
                 let native_rows=reference.slice(s![start..end, ..]).to_owned();
                 let explained_rows=explained.residual.slice(s![start..end, ..]).to_owned();
                 match mode {
@@ -1265,6 +1268,12 @@ impl LanguageRun<'_> {
                         let q=self.log_probs(&explained_rows)?;
                         fixed.as_mut().ok_or("checked stream absent")?.append(&p,&q,start)?;
                     }
+                    MetricMode::GpuRawChecked => {
+                        let (budget,oracle)=raw.ok_or("raw metric config absent")?;
+                        let head=self.native_readout.as_ref().ok_or("raw metric head absent")?;
+                        let tile=head.checked_raw_metrics(&native_rows,&explained_rows,budget.workspace_bytes,oracle)?;
+                        raw_fixed.as_mut().ok_or("raw checked stream absent")?.append(tile,start)?;
+                    }
                     MetricMode::GpuProposal => {
                         let head=self.native_readout.as_ref().ok_or("GPU metric proposal head absent")?;
                         let proposed=head.proposal_metrics(&native_rows,&explained_rows)?;
@@ -1276,6 +1285,11 @@ impl LanguageRun<'_> {
                     }
                 }
                 start = end;
+            }
+            if mode==MetricMode::GpuRawChecked {
+                let episode=raw_fixed.ok_or("raw checked stream absent")?.finish(episode.id.clone(),episode.group.clone(),from,rows,teachers.native_effects[index],*unheld)?;
+                drop(readout_timer);drop(head_guard);
+                return Ok(ScoredEpisode {score:None,checked:Some(episode)});
             }
             if mode==MetricMode::GpuChecked {
                 let episode=fixed.ok_or("checked stream absent")?.finish(episode.id.clone(),episode.group.clone(),from,rows,teachers.native_effects[index],*unheld)?;
@@ -1317,8 +1331,25 @@ impl LanguageRun<'_> {
     pub fn checked_metric_episodes(&self, artifact: &Artifact, budget: crate::fixed_metric_device::Budget, compare_cpu: bool) -> Result<crate::fixed_metric_device::Measure, String> {
         let device=self.device.as_ref().ok_or("checked metrics require explicit CUDA backend")?;
         let resident=crate::fixed_metric_device::Resident::new(device.clone(),self.decoder.embedding().nrows(),self.readout_rows(),budget,compare_cpu)?;
-        let episodes=self.score_episodes_detailed(artifact,MetricMode::GpuChecked,Some(&resident))?.into_iter().map(|row|row.checked.ok_or_else(||"checked episode absent".to_string())).collect::<Result<Vec<_>,String>>()?;
+        let episodes=self.score_episodes_detailed(artifact,MetricMode::GpuChecked,Some(&resident),None)?.into_iter().map(|row|row.checked.ok_or_else(||"checked episode absent".to_string())).collect::<Result<Vec<_>,String>>()?;
         Ok(crate::fixed_metric_device::Measure::of(episodes,&resident))
+    }
+
+    /// Separate opt-in raw-logit endpoint: scored raw tiles have no vocabulary
+    /// download, CPU normalization or metric reupload in oracle-disabled mode.
+    /// Cold teacher/native-effect preparation retains its existing CPU readout,
+    /// normalization and transfers; warm calls reuse those immutable caches. The exact input
+    /// is the f64 CUDA head's raw output, distinct from the normalized-array API.
+    /// Neither endpoint certifies upstream head/network arithmetic or changes
+    /// default acceptance. Oracle mode checks first/last raw row of every tile.
+    pub fn checked_raw_metric_episodes(&self,artifact:&Artifact,budget:crate::fixed_metric_device::Budget,host_spotchecks:bool)->Result<crate::fixed_metric_device::Measure,String> {
+        let head=self.native_readout.as_ref().ok_or("raw checked metrics require explicit CUDA readout")?;
+        let required=head.checked_raw_workspace_bytes(budget.batch_rows)?;
+        if required>budget.workspace_bytes {return Err(format!("raw checked workspace {required} exceeds {}",budget.workspace_bytes));}
+        let episodes=self.score_episodes_detailed(artifact,MetricMode::GpuRawChecked,None,Some((budget,host_spotchecks)))?.into_iter().map(|row|row.checked.ok_or_else(||"raw checked episode absent".to_string())).collect::<Result<Vec<_>,String>>()?;
+        let mut measure=crate::fixed_metric_device::Measure::from_parts(episodes,budget,required,"Exact fixed binary64 raw CUDA head logits; scored raw metric tiles have no CPU normalization or vocabulary transfer with oracle disabled. Cold native teacher/effect preparation keeps existing CPU normalization/transfers, cached for warm calls. Excludes RMS/gain/GEMM/head/network rounding. Independent host analytic checks are first/last row of each tile only. Distinct input values from normalized-array endpoint; default acceptance unchanged.");
+        measure.readout_numeric_resident_bytes=Some(head.resident_bytes());
+        Ok(measure)
     }
 
     /// Fast proposal/ranking diagnostics only. The fixed CPU teacher residuals
