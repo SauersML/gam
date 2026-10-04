@@ -931,7 +931,7 @@ impl Context<'_> {
     fn evaluate(&self, (i, writer, wg): (usize, &Prepared, &[usize]), (j, reader, rg): (usize, &Prepared, &[usize])) -> Result<Option<Description>, String> {
         let block = self.block;
         let sides = block.sides(writer, wg, reader, rg)?;
-        let structure = self.charts_bits + self.core_bits + writer.chart.subset_bits(wg.len())? + reader.chart.subset_bits(rg.len())?;
+        let structure = self.charts_bits + self.core_bits + writer.subset_bits(wg.len())? + reader.subset_bits(rg.len())?;
         let label = |chart: &Chart, groups: &[usize]| (chart.name.clone(), groups.iter().map(|g| chart.groups[*g].mode.clone()).collect::<Vec<_>>());
         let finish = |coded: Coded, core: Core| {
             let (u, v) = sides.decoded(&coded.a, &coded.b);
@@ -993,11 +993,12 @@ impl Context<'_> {
 
 /// A chart's candidate group sets: the prefixes of its ranked groups with fewer columns than the
 /// side is wide (beyond that its columns are dependent and the identity says the same map in fewer
-/// reals), each with its column count and the energy its groups carry (each group's own, so their
-/// sum estimates the set's); a chart that takes every group has the one set, carrying `whole`.
-fn prefixes(chart: &Chart, ranked: &[(usize, f64)], whole: f64) -> Vec<(Vec<usize>, usize, f64)> {
+/// reals), as the groups in order and per prefix its group count, its column count and the energy
+/// its groups carry (each group's own, so their sum estimates the set's); a chart that takes every
+/// group has the one set, carrying `whole`.
+fn prefixes(chart: &Chart, ranked: &[(usize, f64)], whole: f64) -> (Vec<usize>, Vec<(usize, usize, f64)>) {
     if !chart.subsets {
-        return vec![((0..chart.groups.len()).collect(), chart.basis.ncols(), whole)];
+        return ((0..chart.groups.len()).collect(), vec![(chart.groups.len(), chart.basis.ncols(), whole)]);
     }
     let d = chart.basis.nrows();
     let mut out = Vec::new();
@@ -1008,9 +1009,9 @@ fn prefixes(chart: &Chart, ranked: &[(usize, f64)], whole: f64) -> Vec<(Vec<usiz
         if columns >= d {
             break;
         }
-        out.push((ranked[..n].iter().map(|(g, _)| *g).collect(), columns, energy.min(whole)));
+        out.push((n, columns, energy.min(whole)));
     }
-    out
+    (ranked.iter().map(|(g, _)| *g).collect(), out)
 }
 
 /// The minimum of `f` over `0..len` by ternary search on the prefix length (the total is unimodal
@@ -1054,29 +1055,44 @@ enum Gram {
     Weighted(Array2<f64>),
 }
 
-/// A chart prepared on its side's metric: its Gram, each group's pseudo-inverse Gram and, for the
-/// identity, the metric's pseudo-inverse root.
+/// A chart prepared on its side's metric: its Gram, each group's pseudo-inverse Gram, the bits
+/// naming `k` of its groups for every `k` a description can choose (an enumerative code's width is
+/// a big binomial, formed once per site, not once per candidate) and, for the identity, the metric's
+/// pseudo-inverse root.
 struct Prepared {
     chart: Chart,
     identity: bool,
     gram: Gram,
     group_inverse: Vec<Array2<f64>>,
+    subset_bits: Vec<f64>,
     root: Option<Array2<f64>>,
 }
 
 impl Prepared {
     fn new(chart: Chart, metric: &Array2<f64>, identity: bool) -> Result<Self, String> {
+        // A description names at most as many groups as leave fewer columns than the side is wide
+        // ([`prefixes`]), and a chart that takes every group names none.
+        let names = if chart.subsets { chart.groups.len().min(chart.basis.nrows()) } else { 0 };
+        let subset_bits = (0..=names).map(|k| chart.subset_bits(k)).collect::<Result<Vec<f64>, String>>()?;
         if identity {
             let root = Some(inverses(metric)?.1);
-            return Ok(Self { chart, identity, gram: Gram::Whole(Array2::zeros((0, 0))), group_inverse: Vec::new(), root });
+            return Ok(Self { chart, identity, gram: Gram::Whole(Array2::zeros((0, 0))), group_inverse: Vec::new(), subset_bits, root });
         }
         let weighted = mm(metric, &chart.basis);
         let gram = if chart.basis.ncols() <= chart.basis.nrows() { Gram::Whole(symmetric(&mm(&chart.basis.t(), &weighted))) } else { Gram::Weighted(weighted) };
-        let mut prepared = Self { chart, identity, gram, group_inverse: Vec::new(), root: None };
+        let mut prepared = Self { chart, identity, gram, group_inverse: Vec::new(), subset_bits, root: None };
         prepared.group_inverse = (0..prepared.chart.groups.len())
             .map(|g| inverses(&prepared.gram(&prepared.chart.indices(&[g]))).map(|x| x.0))
             .collect::<Result<_, _>>()?;
         Ok(prepared)
+    }
+
+    /// The bits naming `chosen` of the groups.
+    fn subset_bits(&self, chosen: usize) -> Result<f64, String> {
+        match self.subset_bits.get(chosen) {
+            Some(bits) => Ok(*bits),
+            None => self.chart.subset_bits(chosen),
+        }
     }
 
     /// The Gram of the basis columns `at`.
@@ -1223,7 +1239,7 @@ impl Geometry {
         };
         let Some(coded) = coded else { return Ok(None) };
         let (charts_bits, core_bits) = self.header_bits()?;
-        let structure = charts_bits + core_bits + writer.chart.subset_bits(wg.len())? + reader.chart.subset_bits(rg.len())?;
+        let structure = charts_bits + core_bits + writer.subset_bits(wg.len())? + reader.subset_bits(rg.len())?;
         let (du, dv) = sides.decoded(&coded.a, &coded.b);
         Ok(Some(Description {
             writer: previous.writer.clone(),
@@ -1257,21 +1273,22 @@ impl Geometry {
         for (i, writer) in self.writers.iter().enumerate().take(used(self.writers.len())) {
             for (j, reader) in self.readers.iter().enumerate().take(used(self.readers.len())) {
                 let per_real = best.as_ref().map_or(1.0, |b| b.real_bits / b.reals.max(1) as f64);
-                let mut choice: Option<(f64, &Vec<usize>, &Vec<usize>)> = None;
-                for (wg, ws, we) in &writer_sets[i] {
-                    for (rg, rs, re) in &reader_sets[j] {
+                let ((w_order, w_sets), (r_order, r_sets)) = (&writer_sets[i], &reader_sets[j]);
+                let mut choice: Option<(f64, usize, usize)> = None;
+                for (wn, ws, we) in w_sets {
+                    for (rn, rs, re) in r_sets {
                         let r = rank.min(*ws).min(*rs);
-                        let proxy = writer.chart.subset_bits(wg.len())?
-                            + reader.chart.subset_bits(rg.len())?
+                        let proxy = writer.subset_bits(*wn)?
+                            + reader.subset_bits(*rn)?
                             + per_real * (r * (ws + rs - r)) as f64
                             + block.scale * ((block.w2 - we).max(0.0) + (block.w2 - re).max(0.0));
                         if choice.is_none_or(|c| proxy < c.0) {
-                            choice = Some((proxy, wg, rg));
+                            choice = Some((proxy, *wn, *rn));
                         }
                     }
                 }
-                let Some((_, wg, rg)) = choice else { continue };
-                if let Some(found) = context.evaluate((i, writer, wg.as_slice()), (j, reader, rg.as_slice()))?
+                let Some((_, wn, rn)) = choice else { continue };
+                if let Some(found) = context.evaluate((i, writer, &w_order[..wn]), (j, reader, &r_order[..rn]))?
                     && best.as_ref().is_none_or(|b| found.total() < b.total())
                 {
                     best = Some(found);
