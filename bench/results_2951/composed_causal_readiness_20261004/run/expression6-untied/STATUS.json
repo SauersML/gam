@@ -1,0 +1,24 @@
+{
+  "arm": "untied",
+  "artifact_sha256": "ecdf0f5688cbbfc5810fb21739778054e6d5be7ed0972c9c364706a0e87bd14c",
+  "c32": 1953455836,
+  "control_map_sha256": "204fc96861977f7080a4b58894ff0b19aa6dce0a1bed41e6497d1363a4545f05",
+  "expression_id": 6,
+  "id": "expression6-untied",
+  "status": "training_measured",
+  "trainable": [
+    111,
+    112,
+    113,
+    114,
+    115,
+    116,
+    117,
+    118,
+    119,
+    120,
+    121,
+    122
+  ],
+  "training_kl": 0.9535575166134527
+}

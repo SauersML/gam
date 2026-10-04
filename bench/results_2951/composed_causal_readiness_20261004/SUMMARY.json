@@ -1,0 +1,250 @@
+{
+  "source_commit": "6aac9f21cd384d54c0b20775c398b1b60ef4edfa",
+  "job": 15968,
+  "exit_code": 0,
+  "driver_seconds": 265.0095495,
+  "scope": "Technical integration pilot, NOT learned-sharing recovery, acceptance, or matched VPD comparison. Replaces two MLPs in four-layer native model. 32 training tokens; 64 heldout tokens from project-seen fit-disjoint passages; 6 intervention cases. Width 768 limits nonlinear features vs native 3072.",
+  "rows": [
+    {
+      "id": "native",
+      "train_kl": 0.0,
+      "heldout_kl": 0.0,
+      "c32": 2142194137,
+      "saved_fraction": 0.0,
+      "artifact_sha256": "351f84b21e2885d60dd3308992d1458da73a01c833b8f8e7028238f0a35ccc12"
+    },
+    {
+      "id": "expression6-shared",
+      "train_kl": 0.9750783656937061,
+      "heldout_kl": 6.169372050631348,
+      "c32": 1934556669,
+      "saved_fraction": 0.09692747469227159,
+      "artifact_sha256": "5d1b61c30ccc04cb1bc21a8265ce1cd330d6448cb0fd653ed6dc61776dfe907a",
+      "fit_seconds": 4.072402829,
+      "initial_training_kl": 23.663651044528976
+    },
+    {
+      "id": "expression6-untied",
+      "train_kl": 0.9535575166134527,
+      "heldout_kl": 6.022247302576589,
+      "c32": 1953455836,
+      "saved_fraction": 0.08810513376920892,
+      "artifact_sha256": "ecdf0f5688cbbfc5810fb21739778054e6d5be7ed0972c9c364706a0e87bd14c",
+      "fit_seconds": 4.335117748,
+      "initial_training_kl": 23.663651044528976
+    },
+    {
+      "id": "expression10-shared",
+      "train_kl": 1.5804547503586037,
+      "heldout_kl": 7.732426341525599,
+      "c32": 1915657560,
+      "saved_fraction": 0.10574978854029049,
+      "artifact_sha256": "ff23ed55491c0f6cd26cbfef647ed388dea53e61254704f87312026f040f4e29",
+      "fit_seconds": 4.438960391,
+      "initial_training_kl": 16.049540632369823
+    },
+    {
+      "id": "expression10-untied",
+      "train_kl": 1.5804547503586037,
+      "heldout_kl": 7.732426341525599,
+      "c32": 1915657560,
+      "saved_fraction": 0.10574978854029049,
+      "artifact_sha256": "ff23ed55491c0f6cd26cbfef647ed388dea53e61254704f87312026f040f4e29",
+      "fit_seconds": 4.047357824,
+      "initial_training_kl": 16.049540632369823
+    }
+  ],
+  "decision": "Do not expand these structures as evidence of learned reuse. Expression6 boundary affine can be absorbed in per-use maps; expression10 has no learned body coefficients and both arms save identical bytes. Random starts severely overfit tiny training panel. Next: genuine interior learned sharing, faithful native initialization control, wider training coverage, frozen-body transfer, removed-matrix intervention prediction.",
+  "files": [
+    {
+      "path": "JOBS",
+      "sha256": "657d3f76b708df4b5e7d5ec8f7c136d341d535dc9720a3a1b57ebac5f0891d97",
+      "bytes": 95
+    },
+    {
+      "path": "run/FROZEN_EVALUATION_IDS.json",
+      "sha256": "62e72585bf41d343fcc41e15779b83e17e02399f2dfa8b59fd769ae3bead4b03",
+      "bytes": 468
+    },
+    {
+      "path": "run/HELDOUT_PROVENANCE.json",
+      "sha256": "7b6a325acf732cc7abee997c23cb1cae181880ee9dd61f48fa63ffe31e926d31",
+      "bytes": 8057
+    },
+    {
+      "path": "run/HELDOUT_REPORT.json",
+      "sha256": "96c4c09f049ca90224289410d703b7344dd9782051ed73814024a9582f3bed53",
+      "bytes": 19951
+    },
+    {
+      "path": "run/INVENTORY.json",
+      "sha256": "fa8f27a9c2f2f5679e17d9ab28a71a71ec4bb9cd880326291d1dac90a4c51761",
+      "bytes": 2151
+    },
+    {
+      "path": "run/NATIVE_CONTROL_MAP.json",
+      "sha256": "ca294cd208fe87b7c2b6c0b53c5bc80be35ea4ffc8d2e07bfaa067dc9884f69c",
+      "bytes": 344
+    },
+    {
+      "path": "run/NATIVE_HELDOUT.json",
+      "sha256": "7ccdf00d243b66766d43412b828d0d5b98fdb84337e1464db7d5346c52475f7d",
+      "bytes": 1732
+    },
+    {
+      "path": "run/NATIVE_TRAIN.json",
+      "sha256": "589f3bcba01e7c91dd78b2ee5ce3bb1f90bd48d9a82e9cf906e28f059215c35d",
+      "bytes": 1257
+    },
+    {
+      "path": "run/PROVENANCE.json",
+      "sha256": "73d8cb4871d623f2c39caf087734e9db0eb5071ca21b3ec9039edc15d9872902",
+      "bytes": 10757
+    },
+    {
+      "path": "run/REPORT.json",
+      "sha256": "d240d7f6f7d3c04d6f1ed3531120d4e1f65a043f4b922418ae87eb95dbc564b4",
+      "bytes": 22529
+    },
+    {
+      "path": "run/SETTINGS.json",
+      "sha256": "24b4c13255e2081ce8edefcb20d93b5847d29240a7bb176e83326ce0f6eacbe5",
+      "bytes": 1636
+    },
+    {
+      "path": "run/TRAINING_PARETO.json",
+      "sha256": "1e7d1f6942fe2b4700a50471ce97327d8cd95a6fa461d5b42cc5d91bd13e49de",
+      "bytes": 244
+    },
+    {
+      "path": "run/expression10-shared/CONTROL_MAP.json",
+      "sha256": "204fc96861977f7080a4b58894ff0b19aa6dce0a1bed41e6497d1363a4545f05",
+      "bytes": 344
+    },
+    {
+      "path": "run/expression10-shared/DECLARATION.json",
+      "sha256": "3b48cfc97e0af5a2939de04abb5c6f57180514d0de8580a181954164bee5b48e",
+      "bytes": 294
+    },
+    {
+      "path": "run/expression10-shared/FIT.json",
+      "sha256": "da65911def00098827d9c6318658fa1cba5051976764bd1434ff655002094bca",
+      "bytes": 69273
+    },
+    {
+      "path": "run/expression10-shared/HELDOUT.json",
+      "sha256": "42eda2b9a34aba9123bbbac071797117ec6321ff904b96e6508ee0cd991cbc42",
+      "bytes": 1986
+    },
+    {
+      "path": "run/expression10-shared/STATUS.json",
+      "sha256": "4cc0d090725900e55ca7b6e66f18b3870699dd3c86ad908f7af66005ac9d8631",
+      "bytes": 440
+    },
+    {
+      "path": "run/expression10-shared/TRAIN.json",
+      "sha256": "ee8a6aad116148ba7ac0d73f82e989bcc7c3f7182cca8ca861047b6a8cb278dd",
+      "bytes": 1513
+    },
+    {
+      "path": "run/expression10-untied/CONTROL_MAP.json",
+      "sha256": "204fc96861977f7080a4b58894ff0b19aa6dce0a1bed41e6497d1363a4545f05",
+      "bytes": 344
+    },
+    {
+      "path": "run/expression10-untied/DECLARATION.json",
+      "sha256": "0f9fcefc4675d8d794fdd05a0124329f940e5c91da8719962cb255b2afce3ad5",
+      "bytes": 294
+    },
+    {
+      "path": "run/expression10-untied/FIT.json",
+      "sha256": "fee77c2d91bec99ab4cf54b3f50eb91ba632acf72a42bb0dfe641b375e46f714",
+      "bytes": 69273
+    },
+    {
+      "path": "run/expression10-untied/HELDOUT.json",
+      "sha256": "e7347ed976069448d916996ff1a799b74be9beafe1f5bf72f2bbdef83acfcd2f",
+      "bytes": 1986
+    },
+    {
+      "path": "run/expression10-untied/STATUS.json",
+      "sha256": "16b591a4755f1bd98d926bfe36de3de1cf138fbefc4fcfafa3131d7f198d9d5e",
+      "bytes": 440
+    },
+    {
+      "path": "run/expression10-untied/TRAIN.json",
+      "sha256": "ee8a6aad116148ba7ac0d73f82e989bcc7c3f7182cca8ca861047b6a8cb278dd",
+      "bytes": 1513
+    },
+    {
+      "path": "run/expression6-shared/CONTROL_MAP.json",
+      "sha256": "204fc96861977f7080a4b58894ff0b19aa6dce0a1bed41e6497d1363a4545f05",
+      "bytes": 344
+    },
+    {
+      "path": "run/expression6-shared/DECLARATION.json",
+      "sha256": "1497a97c1d953746d5df54af85ec3190aedac7212c9ed5420683b2952fe0e0ee",
+      "bytes": 206
+    },
+    {
+      "path": "run/expression6-shared/FIT.json",
+      "sha256": "e027cff115c3b3d1d00dd1946545954ac93cfea93889d455216d81e0d9662ee3",
+      "bytes": 69394
+    },
+    {
+      "path": "run/expression6-shared/HELDOUT.json",
+      "sha256": "72975429d7b6397424e67e1f86eeddb634fc9faed6f2e453f4ceb012ffef587d",
+      "bytes": 1981
+    },
+    {
+      "path": "run/expression6-shared/STATUS.json",
+      "sha256": "c990a94373ad4d66e6e2d257e39ceae318577d92c252ddbe82a8a1796736b22f",
+      "bytes": 456
+    },
+    {
+      "path": "run/expression6-shared/TRAIN.json",
+      "sha256": "ceea85e9c71bec37618d49213dfe09283f2ff8ca178a1bc647b08b31910ba1bb",
+      "bytes": 1514
+    },
+    {
+      "path": "run/expression6-untied/CONTROL_MAP.json",
+      "sha256": "204fc96861977f7080a4b58894ff0b19aa6dce0a1bed41e6497d1363a4545f05",
+      "bytes": 344
+    },
+    {
+      "path": "run/expression6-untied/DECLARATION.json",
+      "sha256": "03369eef18d1701539857e5b53e86ab82917cdaab65fbeb1cabeb72203dbffdd",
+      "bytes": 206
+    },
+    {
+      "path": "run/expression6-untied/FIT.json",
+      "sha256": "cb448289b688eea46accb75e9569326bc8ae9638ed3ecd397023019c453fce2d",
+      "bytes": 69433
+    },
+    {
+      "path": "run/expression6-untied/HELDOUT.json",
+      "sha256": "33fd96acbb1a34f1e1155ba980f8a66ee29af328385f999d9fff9df3e65fd8fa",
+      "bytes": 1986
+    },
+    {
+      "path": "run/expression6-untied/STATUS.json",
+      "sha256": "69f5c26421a19706759fcc83bcf4e33ba3bdfcd3e9138b85631367309ee9a6f0",
+      "bytes": 474
+    },
+    {
+      "path": "run/expression6-untied/TRAIN.json",
+      "sha256": "a527b5126717326ad674d5dd9f2510651810063c1b77ab39276b43bc7d08b553",
+      "bytes": 1513
+    },
+    {
+      "path": "run/journal.jsonl",
+      "sha256": "29d181da88061555cd79c4851231e88c8c566d3060fbcb2c0dedaae55ddcde98",
+      "bytes": 8430
+    },
+    {
+      "path": "slurm-15968.log",
+      "sha256": "53905d46f2b4bb1900f0323c327b5c533494d31378e8b6bc977aac58ee40765e",
+      "bytes": 2025
+    }
+  ]
+}

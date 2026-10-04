@@ -1,0 +1,68 @@
+{
+  "artifact_sha256": "5d1b61c30ccc04cb1bc21a8265ce1cd330d6448cb0fd653ed6dc61776dfe907a",
+  "c32": 1934556669,
+  "control_map_sha256": "204fc96861977f7080a4b58894ff0b19aa6dce0a1bed41e6497d1363a4545f05",
+  "id": "expression6-shared",
+  "measurement": {
+    "active_group": "clean",
+    "episodes": [
+      {
+        "group": "clean",
+        "label": "clean",
+        "maximum_scored_row_kl": 12.621989372678946,
+        "mean_kl": 6.169372050631348,
+        "scored_rows": 64,
+        "worst_scored_row": 49
+      },
+      {
+        "group": "mlp-output",
+        "label": "mlp0-remove",
+        "maximum_scored_row_kl": 1.6806609422050163,
+        "mean_kl": 1.139117166045629,
+        "scored_rows": 64,
+        "worst_scored_row": 4
+      },
+      {
+        "group": "mlp-output",
+        "label": "mlp0-half",
+        "maximum_scored_row_kl": 9.06922540022373,
+        "mean_kl": 4.677049398444608,
+        "scored_rows": 64,
+        "worst_scored_row": 49
+      },
+      {
+        "group": "shared-weight",
+        "label": "q0-half",
+        "maximum_scored_row_kl": 12.887306046286,
+        "mean_kl": 6.115044974945256,
+        "scored_rows": 64,
+        "worst_scored_row": 49
+      },
+      {
+        "group": "shared-weight",
+        "label": "q0-double",
+        "maximum_scored_row_kl": 12.296605061026558,
+        "mean_kl": 6.174817081909014,
+        "scored_rows": 64,
+        "worst_scored_row": 49
+      },
+      {
+        "group": "joint",
+        "label": "joint-half",
+        "maximum_scored_row_kl": 9.41087379163944,
+        "mean_kl": 4.611902107528412,
+        "scored_rows": 64,
+        "worst_scored_row": 49
+      }
+    ],
+    "groups": {
+      "clean": 6.169372050631348,
+      "joint": 4.611902107528412,
+      "mlp-output": 2.9080832822451184,
+      "shared-weight": 6.144931028427135
+    },
+    "objective": 6.169372050631348
+  },
+  "scope": "frozen candidate measurement only; no Local or acceptance certificate",
+  "status": "heldout_measured"
+}

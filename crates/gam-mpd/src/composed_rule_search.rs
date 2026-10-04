@@ -97,6 +97,109 @@ pub struct Inventory {
     pub intermediate_expressions: usize,
 }
 
+/// Syntactic opportunities for learned sharing, not identification of a native law.
+/// Redundancy flags mark syntactic boundary/adjacency patterns in unrestricted-map
+/// parameterizations. Shared subexpressions can prevent absorption, so flags are
+/// warnings rather than proofs of redundancy. They establish neither binary64
+/// equivalence nor equivalence under internal controls.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SharingAnalysis {
+    /// Unique Affine expressions, matching the compiler's exact-expression CSE.
+    pub learned_affine_expressions: usize,
+    pub output_boundary_affine: bool,
+    pub input_boundary_affine: bool,
+    pub boundary_affine_redundancy: bool,
+    pub adjacent_affine_redundancy: bool,
+    /// Unique learned affine expressions with nonlinear ancestors and descendants.
+    pub interior_learned_affine_expressions: usize,
+    pub has_interior_learned_sharing: bool,
+}
+fn nonlinear_subtree(expr: &Expr) -> bool {
+    match expr {
+        Expr::Argument(_) => false,
+        Expr::Unary(_, _) | Expr::Binary(Binary::Multiply, _, _) => true,
+        Expr::Affine(input) => nonlinear_subtree(input),
+        Expr::Binary(_, left, right) => nonlinear_subtree(left) || nonlinear_subtree(right),
+    }
+}
+/// Analyze the expression without rewriting, fitting, or changing its parameterization.
+pub fn sharing_analysis(expr: &Expr) -> SharingAnalysis {
+    fn visit(
+        expr: &Expr,
+        nonlinear_consumer: bool,
+        affines: &mut BTreeMap<Expr, bool>,
+        input_boundary: &mut bool,
+        adjacent: &mut bool,
+    ) {
+        match expr {
+            Expr::Argument(_) => return,
+            Expr::Affine(input) => {
+                let interior = nonlinear_consumer && nonlinear_subtree(input);
+                affines
+                    .entry(expr.clone())
+                    .and_modify(|present| *present |= interior)
+                    .or_insert(interior);
+                *input_boundary |= matches!(input.as_ref(), Expr::Argument(_));
+                *adjacent |= matches!(input.as_ref(), Expr::Affine(_));
+                visit(input, nonlinear_consumer, affines, input_boundary, adjacent);
+            }
+            Expr::Unary(_, input) => visit(input, true, affines, input_boundary, adjacent),
+            Expr::Binary(op, left, right) => {
+                let nonlinear_consumer = nonlinear_consumer || *op == Binary::Multiply;
+                visit(left, nonlinear_consumer, affines, input_boundary, adjacent);
+                visit(right, nonlinear_consumer, affines, input_boundary, adjacent);
+            }
+        }
+    }
+    let mut affines = BTreeMap::new();
+    let mut input_boundary = false;
+    let mut adjacent = false;
+    visit(
+        expr,
+        false,
+        &mut affines,
+        &mut input_boundary,
+        &mut adjacent,
+    );
+    let interior = affines.values().filter(|value| **value).count();
+    let output_boundary = matches!(expr, Expr::Affine(_));
+    SharingAnalysis {
+        learned_affine_expressions: affines.len(),
+        output_boundary_affine: output_boundary,
+        input_boundary_affine: input_boundary,
+        boundary_affine_redundancy: output_boundary || input_boundary,
+        adjacent_affine_redundancy: adjacent,
+        interior_learned_affine_expressions: interior,
+        has_interior_learned_sharing: interior != 0,
+    }
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct SharingSelection {
+    /// Original inventory IDs; neither enumeration nor IDs are renumbered.
+    pub interior_indices: Vec<usize>,
+    /// Complement available as separate non-affine/boundary and other baselines.
+    pub baseline_indices: Vec<usize>,
+    /// Analysis in the original inventory order, including every excluded expression.
+    pub analyses: Vec<SharingAnalysis>,
+    pub source_inventory_truncated: bool,
+    pub scope: &'static str,
+}
+/// Optional declared subinventory. The only selection predicate is the existence of
+/// an affine with nonlinear computation before it and on a path from it to output.
+/// Adjacent/boundary flags remain reported, not silently used as additional exclusions.
+pub fn interior_learned_selection(inventory: &Inventory) -> SharingSelection {
+    let analyses: Vec<_> = inventory.expressions.iter().map(sharing_analysis).collect();
+    let (interior_indices, baseline_indices) =
+        (0..analyses.len()).partition(|index| analyses[*index].has_interior_learned_sharing);
+    SharingSelection {
+        interior_indices,
+        baseline_indices,
+        analyses,
+        source_inventory_truncated: inventory.truncated,
+        scope: "Declared syntactic interior-learned-sharing subinventory only. Every excluded original ID remains a baseline; no program rewriting, algebraic identification, fidelity pruning, or guarantee of reusable law. Source truncation remains explicit.",
+    }
+}
+
 /// Breadth by expression size; products can be proposed directly even if neither factor
 /// alone improves a fit. Only operand exchange for commutative primitives is canonicalized;
 /// there are no approximate algebraic equalities or fit-dependent pruning here.
@@ -658,5 +761,116 @@ mod tests {
             let trace = proposal.program.execute(&inputs, false).unwrap();
             assert_eq!(trace.values[proposal.program.output].dim(), (2, 4));
         }
+    }
+    #[test]
+    fn interior_sharing_distinguishes_pilot_forms_without_changing_inventory() {
+        let mut grammar = Grammar {
+            arguments: 1,
+            max_operations: 2,
+            max_expressions: 10000,
+            unary: vec![Unary::GeluTanh],
+            binary: vec![Binary::Multiply],
+            affine: true,
+        };
+        let pilot = enumerate(&grammar).expect("pilot inventory");
+        assert_eq!(
+            pilot.expressions[6],
+            Expr::Unary(
+                Unary::GeluTanh,
+                Box::new(Expr::Affine(Box::new(Expr::Argument(0))))
+            )
+        );
+        let boundary = sharing_analysis(&pilot.expressions[6]);
+        assert_eq!(boundary.learned_affine_expressions, 1);
+        assert!(boundary.input_boundary_affine);
+        assert!(!boundary.has_interior_learned_sharing);
+        let product = sharing_analysis(&pilot.expressions[10]);
+        assert_eq!(product.learned_affine_expressions, 0);
+        assert!(!product.has_interior_learned_sharing);
+        grammar.max_operations = 3;
+        let inventory = enumerate(&grammar).expect("expanded inventory");
+        let original = inventory.expressions.clone();
+        let encoded = serde_json::to_vec(&inventory).expect("inventory bytes");
+        let selection = interior_learned_selection(&inventory);
+        let inner = Expr::Affine(Box::new(Expr::Unary(
+            Unary::GeluTanh,
+            Box::new(Expr::Argument(0)),
+        )));
+        for target in [
+            Expr::Unary(Unary::GeluTanh, Box::new(inner.clone())),
+            Expr::Binary(
+                Binary::Multiply,
+                Box::new(Expr::Argument(0)),
+                Box::new(inner),
+            ),
+        ] {
+            let id = inventory
+                .expressions
+                .iter()
+                .position(|e| *e == target)
+                .expect("generated interior form");
+            assert!(selection.interior_indices.contains(&id));
+            assert_eq!(
+                selection.analyses[id].interior_learned_affine_expressions,
+                1
+            );
+        }
+        assert!(selection.baseline_indices.contains(&6));
+        assert!(selection.baseline_indices.contains(&10));
+        let mut all = selection.interior_indices.clone();
+        all.extend(&selection.baseline_indices);
+        all.sort_unstable();
+        assert_eq!(all, (0..inventory.expressions.len()).collect::<Vec<_>>());
+        assert_eq!(inventory.expressions, original);
+        assert_eq!(
+            serde_json::to_vec(&inventory).expect("unchanged bytes"),
+            encoded
+        );
+        assert_eq!(
+            enumerate(&grammar)
+                .expect("same default enumeration")
+                .expressions,
+            original
+        );
+    }
+    #[test]
+    fn sharing_analysis_counts_cse_once_and_reports_redundancy_and_truncation() {
+        let inner = Expr::Affine(Box::new(Expr::Unary(
+            Unary::Relu,
+            Box::new(Expr::Argument(0)),
+        )));
+        let repeated = Expr::Binary(
+            Binary::Multiply,
+            Box::new(inner.clone()),
+            Box::new(inner.clone()),
+        );
+        let analysis = sharing_analysis(&repeated);
+        assert_eq!(analysis.learned_affine_expressions, 1);
+        assert_eq!(analysis.interior_learned_affine_expressions, 1);
+        let linear = Expr::Affine(Box::new(Expr::Affine(Box::new(Expr::Argument(0)))));
+        let analysis = sharing_analysis(&linear);
+        assert_eq!(analysis.learned_affine_expressions, 2);
+        assert!(analysis.adjacent_affine_redundancy);
+        assert!(analysis.input_boundary_affine && analysis.output_boundary_affine);
+        assert!(!analysis.has_interior_learned_sharing);
+        // A shared subtree may have both linear and nonlinear readers. Any nonlinear
+        // consumer path suffices; a root affine alone does not fabricate such a path.
+        let mixed = Expr::Binary(
+            Binary::Add,
+            Box::new(inner.clone()),
+            Box::new(Expr::Unary(Unary::Relu, Box::new(inner))),
+        );
+        assert_eq!(
+            sharing_analysis(&mixed).interior_learned_affine_expressions,
+            1
+        );
+        let selection = interior_learned_selection(&Inventory {
+            expressions: vec![linear, repeated],
+            truncated: true,
+            intermediate_expressions: 2,
+        });
+        assert!(selection.source_inventory_truncated);
+        assert_eq!(selection.interior_indices, vec![1]);
+        assert_eq!(selection.baseline_indices, vec![0]);
     }
 }

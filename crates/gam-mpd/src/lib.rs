@@ -83,6 +83,7 @@ pub mod proposals;
 pub mod resident_rule_fit;
 pub mod resident_causal_fit;
 pub mod composed_rule_search;
+pub mod parameter_response_program;
 pub mod vector_rule_pilot;
 pub mod shared_geometry_pilot;
 pub mod shared_geometry_transfer;
@@ -298,3 +299,12 @@ pub mod affine_mlp;
 
 /// Fixed activation and shared-operator controls in ordinary differentiable IR.
 pub mod intervention_program;
+
+/// Declared rank-one native down-weight perturbations as a full augmented program.
+pub mod down_edit_family;
+
+/// Exact native primitive-unary capacity-control initialization.
+pub mod native_mlp_initialization;
+
+#[cfg(test)]
+mod parameter_response_program_tests;

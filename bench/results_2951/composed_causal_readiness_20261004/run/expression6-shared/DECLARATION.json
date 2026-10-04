@@ -1,0 +1,18 @@
+{
+  "arm": "shared",
+  "expression": {
+    "unary": [
+      "gelu_tanh",
+      {
+        "affine": {
+          "argument": 0
+        }
+      }
+    ]
+  },
+  "expression_id": 6,
+  "uses": [
+    0,
+    1
+  ]
+}

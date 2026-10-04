@@ -1,0 +1,24 @@
+{
+  "arm": "untied",
+  "expression": {
+    "binary": [
+      "multiply",
+      {
+        "argument": 0
+      },
+      {
+        "unary": [
+          "gelu_tanh",
+          {
+            "argument": 0
+          }
+        ]
+      }
+    ]
+  },
+  "expression_id": 10,
+  "uses": [
+    0,
+    1
+  ]
+}

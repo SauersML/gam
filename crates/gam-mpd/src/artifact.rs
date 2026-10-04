@@ -837,33 +837,56 @@ impl Artifact {
         native_read: usize,
         native_write: usize,
     ) -> Result<Self, String> {
-        let width = match function.declarations.slots.as_slice() {
-            [super::operator_program::Slot::Raw { width }]
-                if function.declarations.parameters == 0
-                    && function.declarations.domains.is_empty() && function.bases.is_empty() => *width,
-            _ => return Err("function graft requires one Raw slot and no external parameters/domains/bases".into()),
-        };
+        self.replace_function_inputs(name, function, &[native_read], native_write)
+    }
+
+    /// Import an executable function whose Raw slots bind to explicit native values.
+    /// Multiple arguments permit declared control inputs without feeding native hidden
+    /// responses into the replacement. Each input remains part of the block's coverage
+    /// contract; the function cannot read undeclared ambient inputs or parameters.
+    pub fn replace_function_inputs(
+        &self,
+        name: &str,
+        function: &OperatorProgram,
+        native_reads: &[usize],
+        native_write: usize,
+    ) -> Result<Self, String> {
+        if native_reads.is_empty() || function.declarations.slots.len() != native_reads.len()
+            || function.declarations.parameters != 0
+            || !function.declarations.domains.is_empty() || !function.bases.is_empty() {
+            return Err("function graft requires matching Raw slots and no external parameters/domains/bases".into());
+        }
+        let widths = function.declarations.slots.iter().map(|slot| match slot {
+            super::operator_program::Slot::Raw { width } => Ok(*width),
+            _ => Err("function graft requires Raw slots".to_string()),
+        }).collect::<Result<Vec<_>, _>>()?;
         let interfaces = function.interfaces().map_err(|e| e.to_string())?;
         if function.rules.iter().flat_map(|rule| &rule.nodes).any(|node| matches!(node, Node::Raw { .. } | Node::Feature { .. })) {
             return Err("function rules must read explicit arguments, not ambient input slots".into());
         }
         let native_interfaces = self.program.interfaces().map_err(|e| e.to_string())?;
-        let read = self.place(native_read).ok_or("function graft native read is absent")?;
+        let reads = native_reads.iter().map(|native| self.place(*native).ok_or("function graft native read is absent"))
+            .collect::<Result<Vec<_>, _>>()?;
         let write = self.place(native_write).ok_or("function graft native write is absent")?;
-        let input = super::operator_program::Interface::native(width).map_err(|e| e.to_string())?;
-        if native_interfaces[read].width() != width || native_interfaces[write].width() != interfaces[function.output].width() {
+        if reads.iter().zip(&widths).any(|(read, width)| native_interfaces[*read].width() != *width)
+            || native_interfaces[write].width() != interfaces[function.output].width() {
             return Err("function graft native input/output width mismatch".into());
         }
         // Labels partition coordinates; they do not change their order. Specialize only
         // complete dense boundary maps, preserving every coefficient and internal type.
         // In particular, do not retype the shared nonlinear body or duplicate its Arcs.
         let mut adapted = function.clone();
-        let specialize = |program: &mut OperatorProgram, operator: usize,
+        let mut specialized = Vec::new();
+        let mut specialize = |program: &mut OperatorProgram, operator: usize,
                           rows: Option<&super::operator_program::Interface>,
                           cols: Option<&super::operator_program::Interface>| -> Result<usize, String> {
             let mut op = (*program.operators[operator]).clone();
             if let Some(rows) = rows { op.rows = rows.clone(); }
             if let Some(cols) = cols { op.cols = cols.clone(); }
+            if let Some((_, _, _, index)) = specialized.iter().find(|(source, rows, cols, _)|
+                *source == operator && *rows == op.rows && *cols == op.cols) {
+                return Ok(*index);
+            }
             match &mut op.body {
                 OperatorBody::Dense { present, .. } if present.iter().all(|keep| *keep) => {
                     *present = Array2::from_elem((op.rows.group_count(), op.cols.group_count()), true);
@@ -871,20 +894,21 @@ impl Artifact {
                 _ => return Err("function graft regrouping requires complete dense boundary operators".into()),
             }
             let index = program.operators.len();
+            specialized.push((operator, op.rows.clone(), op.cols.clone(), index));
             program.operators.push(Arc::new(op));
             Ok(index)
         };
-        if native_interfaces[read] != input {
-            for index in 0..adapted.nodes.len() {
+        for index in 0..adapted.nodes.len() {
                 if let Node::Affine { mut terms, bias } = adapted.nodes[index].clone() {
                     for (parent, operator) in &mut terms {
-                        if matches!(adapted.nodes[*parent], Node::Raw { slot: 0 }) {
-                            *operator = specialize(&mut adapted, *operator, None, Some(&native_interfaces[read]))?;
+                        if let Node::Raw { slot } = adapted.nodes[*parent] {
+                            if adapted.operators[*operator].cols != native_interfaces[reads[slot]] {
+                                *operator = specialize(&mut adapted, *operator, None, Some(&native_interfaces[reads[slot]]))?;
+                            }
                         }
                     }
                     adapted.nodes[index] = Node::Affine { terms, bias };
                 }
-            }
         }
         if native_interfaces[write] != interfaces[function.output] {
             let Node::Affine { mut terms, mut bias } = adapted.nodes[adapted.output].clone() else {
@@ -899,7 +923,7 @@ impl Artifact {
             adapted.nodes[adapted.output] = Node::Affine { terms, bias };
         }
         let function = &adapted;
-        let input = native_interfaces[read].clone();
+        let inputs = reads.iter().map(|read| native_interfaces[*read].clone()).collect();
         let mut result = self.clone();
         let offset_ops = result.program.operators.len();
         let offset_rules = result.program.rules.len();
@@ -938,16 +962,16 @@ impl Artifact {
         let nodes = identity(body.len());
         for node in &mut body {
             match node {
-                Node::Raw { slot: 0 } => *node = Node::Param { index: 0 },
+                Node::Raw { slot } => *node = Node::Param { index: *slot },
                 _ => remap_node(node, &nodes, &ops, &[], &rules),
             }
         }
         let wrapper = Rule {
-            name: name.into(), inputs: vec![input], nodes: body, output: function.output,
+            name: name.into(), inputs, nodes: body, output: function.output,
         };
         let callee = result.program.rules.iter().position(|held| same(held, &wrapper))
             .map_or_else(|| Callee::New(wrapper), Callee::Existing);
-        result.replace_block(name, callee, vec![Argument::Native(native_read)], native_write, vec![])
+        result.replace_block(name, callee, native_reads.iter().copied().map(Argument::Native).collect(), native_write, vec![])
     }
 
     /// This artifact with the native block that writes native node `native_write` replaced by a

@@ -1,0 +1,60 @@
+{
+  "active_group": "mlp-output",
+  "episodes": [
+    {
+      "group": "clean",
+      "label": "clean",
+      "maximum_scored_row_kl": 2.0973486031430184,
+      "mean_kl": 0.8826999902814446,
+      "scored_rows": 32,
+      "worst_scored_row": 15
+    },
+    {
+      "group": "mlp-output",
+      "label": "mlp0-remove",
+      "maximum_scored_row_kl": 1.3468291986885517,
+      "mean_kl": 0.9835251325162946,
+      "scored_rows": 32,
+      "worst_scored_row": 2
+    },
+    {
+      "group": "mlp-output",
+      "label": "mlp0-half",
+      "maximum_scored_row_kl": 2.02714582958386,
+      "mean_kl": 0.9235899007106109,
+      "scored_rows": 32,
+      "worst_scored_row": 15
+    },
+    {
+      "group": "shared-weight",
+      "label": "q0-half",
+      "maximum_scored_row_kl": 2.0677725867317447,
+      "mean_kl": 0.8766369821044244,
+      "scored_rows": 32,
+      "worst_scored_row": 31
+    },
+    {
+      "group": "shared-weight",
+      "label": "q0-double",
+      "maximum_scored_row_kl": 2.743976837520938,
+      "mean_kl": 0.9990707678948908,
+      "scored_rows": 32,
+      "worst_scored_row": 14
+    },
+    {
+      "group": "joint",
+      "label": "joint-half",
+      "maximum_scored_row_kl": 2.9349612319750245,
+      "mean_kl": 0.9197319044522952,
+      "scored_rows": 32,
+      "worst_scored_row": 29
+    }
+  ],
+  "groups": {
+    "clean": 0.8826999902814446,
+    "joint": 0.9197319044522952,
+    "mlp-output": 0.9535575166134527,
+    "shared-weight": 0.9378538749996577
+  },
+  "objective": 0.9535575166134527
+}

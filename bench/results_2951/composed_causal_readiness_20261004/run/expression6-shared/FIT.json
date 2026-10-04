@@ -1,0 +1,2289 @@
+{
+  "best": {
+    "active_group": "mlp-output",
+    "episodes": [
+      {
+        "group": "clean",
+        "label": "clean",
+        "maximum_scored_row_kl": 1.9798930920012932,
+        "mean_kl": 0.8685253781144952,
+        "scored_rows": 32,
+        "worst_scored_row": 15
+      },
+      {
+        "group": "mlp-output",
+        "label": "mlp0-remove",
+        "maximum_scored_row_kl": 1.3901274392779364,
+        "mean_kl": 0.9946259070626989,
+        "scored_rows": 32,
+        "worst_scored_row": 2
+      },
+      {
+        "group": "mlp-output",
+        "label": "mlp0-half",
+        "maximum_scored_row_kl": 2.3870198796081246,
+        "mean_kl": 0.9555308225151184,
+        "scored_rows": 32,
+        "worst_scored_row": 15
+      },
+      {
+        "group": "shared-weight",
+        "label": "q0-half",
+        "maximum_scored_row_kl": 2.0563269519997327,
+        "mean_kl": 0.8689707606944755,
+        "scored_rows": 32,
+        "worst_scored_row": 31
+      },
+      {
+        "group": "shared-weight",
+        "label": "q0-double",
+        "maximum_scored_row_kl": 2.6122994571355442,
+        "mean_kl": 0.9739468061045617,
+        "scored_rows": 32,
+        "worst_scored_row": 14
+      },
+      {
+        "group": "joint",
+        "label": "joint-half",
+        "maximum_scored_row_kl": 3.311876724091264,
+        "mean_kl": 0.9690843275045387,
+        "scored_rows": 32,
+        "worst_scored_row": 29
+      }
+    ],
+    "groups": {
+      "clean": 0.8685253781144952,
+      "joint": 0.9690843275045387,
+      "mlp-output": 0.9750783647889087,
+      "shared-weight": 0.9214587833995187
+    },
+    "objective": 0.9750783647889087
+  },
+  "best_step": 32,
+  "complete_episode_forward_passes": 262,
+  "complete_episode_reverse_passes": 58,
+  "final_measurement": {
+    "active_group": "mlp-output",
+    "episodes": [
+      {
+        "group": "clean",
+        "label": "clean",
+        "maximum_scored_row_kl": 1.9798930920012932,
+        "mean_kl": 0.8685253781144952,
+        "scored_rows": 32,
+        "worst_scored_row": 15
+      },
+      {
+        "group": "mlp-output",
+        "label": "mlp0-remove",
+        "maximum_scored_row_kl": 1.3901274392779364,
+        "mean_kl": 0.9946259070626989,
+        "scored_rows": 32,
+        "worst_scored_row": 2
+      },
+      {
+        "group": "mlp-output",
+        "label": "mlp0-half",
+        "maximum_scored_row_kl": 2.3870198796081246,
+        "mean_kl": 0.9555308225151184,
+        "scored_rows": 32,
+        "worst_scored_row": 15
+      },
+      {
+        "group": "shared-weight",
+        "label": "q0-half",
+        "maximum_scored_row_kl": 2.0563269519997327,
+        "mean_kl": 0.8689707606944755,
+        "scored_rows": 32,
+        "worst_scored_row": 31
+      },
+      {
+        "group": "shared-weight",
+        "label": "q0-double",
+        "maximum_scored_row_kl": 2.6122994571355442,
+        "mean_kl": 0.9739468061045617,
+        "scored_rows": 32,
+        "worst_scored_row": 14
+      },
+      {
+        "group": "joint",
+        "label": "joint-half",
+        "maximum_scored_row_kl": 3.311876724091264,
+        "mean_kl": 0.9690843275045387,
+        "scored_rows": 32,
+        "worst_scored_row": 29
+      }
+    ],
+    "groups": {
+      "clean": 0.8685253781144952,
+      "joint": 0.9690843275045387,
+      "mlp-output": 0.9750783647889087,
+      "shared-weight": 0.9214587833995187
+    },
+    "objective": 0.9750783647889087
+  },
+  "initial": {
+    "active_group": "clean",
+    "episodes": [
+      {
+        "group": "clean",
+        "label": "clean",
+        "maximum_scored_row_kl": 43.708844005974534,
+        "mean_kl": 23.663651044528976,
+        "scored_rows": 32,
+        "worst_scored_row": 29
+      },
+      {
+        "group": "mlp-output",
+        "label": "mlp0-remove",
+        "maximum_scored_row_kl": 4.997449189215342,
+        "mean_kl": 3.87181251718497,
+        "scored_rows": 32,
+        "worst_scored_row": 3
+      },
+      {
+        "group": "mlp-output",
+        "label": "mlp0-half",
+        "maximum_scored_row_kl": 34.54979054251753,
+        "mean_kl": 17.87951390603626,
+        "scored_rows": 32,
+        "worst_scored_row": 14
+      },
+      {
+        "group": "shared-weight",
+        "label": "q0-half",
+        "maximum_scored_row_kl": 41.56703877964769,
+        "mean_kl": 23.315096414002667,
+        "scored_rows": 32,
+        "worst_scored_row": 14
+      },
+      {
+        "group": "shared-weight",
+        "label": "q0-double",
+        "maximum_scored_row_kl": 43.205769780373984,
+        "mean_kl": 23.694064316355217,
+        "scored_rows": 32,
+        "worst_scored_row": 29
+      },
+      {
+        "group": "joint",
+        "label": "joint-half",
+        "maximum_scored_row_kl": 34.117475767739016,
+        "mean_kl": 17.33986546860867,
+        "scored_rows": 32,
+        "worst_scored_row": 14
+      }
+    ],
+    "groups": {
+      "clean": 23.663651044528976,
+      "joint": 17.33986546860867,
+      "mlp-output": 10.875663211610615,
+      "shared-weight": 23.504580365178942
+    },
+    "objective": 23.663651044528976
+  },
+  "iterations": [
+    {
+      "measurement": {
+        "active_group": "clean",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 43.708844005974534,
+            "mean_kl": 23.663651044528976,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 4.997449189215342,
+            "mean_kl": 3.87181251718497,
+            "scored_rows": 32,
+            "worst_scored_row": 3
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 34.54979054251753,
+            "mean_kl": 17.87951390603626,
+            "scored_rows": 32,
+            "worst_scored_row": 14
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 41.56703877964769,
+            "mean_kl": 23.315096414002667,
+            "scored_rows": 32,
+            "worst_scored_row": 14
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 43.205769780373984,
+            "mean_kl": 23.694064316355217,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 34.117475767739016,
+            "mean_kl": 17.33986546860867,
+            "scored_rows": 32,
+            "worst_scored_row": 14
+          }
+        ],
+        "groups": {
+          "clean": 23.663651044528976,
+          "joint": 17.33986546860867,
+          "mlp-output": 10.875663211610615,
+          "shared-weight": 23.504580365178942
+        },
+        "objective": 23.663651044528976
+      },
+      "step": 0
+    },
+    {
+      "measurement": {
+        "active_group": "clean",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 24.93052433739299,
+            "mean_kl": 11.475753910724828,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 4.34573075378838,
+            "mean_kl": 3.452032146619051,
+            "scored_rows": 32,
+            "worst_scored_row": 2
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 19.0035196713778,
+            "mean_kl": 7.607496742532356,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 24.439041563091056,
+            "mean_kl": 11.27648456801522,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 24.394783323658633,
+            "mean_kl": 11.659978216032355,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 19.350526739370196,
+            "mean_kl": 7.45079793318761,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 11.475753910724828,
+          "joint": 7.45079793318761,
+          "mlp-output": 5.5297644445757035,
+          "shared-weight": 11.468231392023789
+        },
+        "objective": 11.475753910724828
+      },
+      "step": 1
+    },
+    {
+      "measurement": {
+        "active_group": "shared-weight",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 12.597380440262532,
+            "mean_kl": 6.280640010988165,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 4.100075428149664,
+            "mean_kl": 3.042145380715385,
+            "scored_rows": 32,
+            "worst_scored_row": 2
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 10.205806373705844,
+            "mean_kl": 4.6951108243725646,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 14.163528496134214,
+            "mean_kl": 6.162989809069753,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 12.013796766115524,
+            "mean_kl": 6.449227574574871,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 12.729404571736247,
+            "mean_kl": 4.673949854348396,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 6.280640010988165,
+          "joint": 4.673949854348396,
+          "mlp-output": 3.868628102543975,
+          "shared-weight": 6.3061086918223115
+        },
+        "objective": 6.3061086918223115
+      },
+      "step": 2
+    },
+    {
+      "measurement": {
+        "active_group": "shared-weight",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 9.674261409392006,
+            "mean_kl": 4.417229617812275,
+            "scored_rows": 32,
+            "worst_scored_row": 31
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 3.9304205619427393,
+            "mean_kl": 2.804998695259284,
+            "scored_rows": 32,
+            "worst_scored_row": 2
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 8.158688394143503,
+            "mean_kl": 3.6817776588565705,
+            "scored_rows": 32,
+            "worst_scored_row": 16
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 9.208167992037051,
+            "mean_kl": 4.33957354052589,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 10.310423037776356,
+            "mean_kl": 4.577791850615998,
+            "scored_rows": 32,
+            "worst_scored_row": 31
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 9.35626993198979,
+            "mean_kl": 3.7033833004504597,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 4.417229617812275,
+          "joint": 3.7033833004504597,
+          "mlp-output": 3.243388177057927,
+          "shared-weight": 4.458682695570944
+        },
+        "objective": 4.458682695570944
+      },
+      "step": 3
+    },
+    {
+      "measurement": {
+        "active_group": "shared-weight",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 8.38887587829358,
+            "mean_kl": 3.4736982248173334,
+            "scored_rows": 32,
+            "worst_scored_row": 31
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 3.7975309626909026,
+            "mean_kl": 2.6935269492305394,
+            "scored_rows": 32,
+            "worst_scored_row": 2
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 6.815707290684272,
+            "mean_kl": 3.1065965259464363,
+            "scored_rows": 32,
+            "worst_scored_row": 16
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 8.370653824014473,
+            "mean_kl": 3.376298166089284,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 8.942002830587477,
+            "mean_kl": 3.6527852814508943,
+            "scored_rows": 32,
+            "worst_scored_row": 31
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 8.578669618361255,
+            "mean_kl": 3.164705859208524,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 3.4736982248173334,
+          "joint": 3.164705859208524,
+          "mlp-output": 2.900061737588488,
+          "shared-weight": 3.514541723770089
+        },
+        "objective": 3.514541723770089
+      },
+      "step": 4
+    },
+    {
+      "measurement": {
+        "active_group": "shared-weight",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 7.441592545054672,
+            "mean_kl": 2.914964126822104,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 3.7236450791308635,
+            "mean_kl": 2.656339454450545,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 5.328832208011972,
+            "mean_kl": 2.748132977103754,
+            "scored_rows": 32,
+            "worst_scored_row": 28
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 7.441592545054672,
+            "mean_kl": 2.815156496658417,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 7.631270714677298,
+            "mean_kl": 3.093584232076387,
+            "scored_rows": 32,
+            "worst_scored_row": 31
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 8.42429456776027,
+            "mean_kl": 2.8406414389194796,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 2.914964126822104,
+          "joint": 2.8406414389194796,
+          "mlp-output": 2.7022362157771496,
+          "shared-weight": 2.954370364367402
+        },
+        "objective": 2.954370364367402
+      },
+      "step": 5
+    },
+    {
+      "measurement": {
+        "active_group": "joint",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 6.508191953368716,
+            "mean_kl": 2.5011440302403605,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 3.6893440955641,
+            "mean_kl": 2.663295670931659,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 4.850239260358982,
+            "mean_kl": 2.510682425563401,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 6.508191953368716,
+            "mean_kl": 2.432197158103511,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 6.508191953368716,
+            "mean_kl": 2.666606518924747,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 8.558766919653703,
+            "mean_kl": 2.624445303014733,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 2.5011440302403605,
+          "joint": 2.624445303014733,
+          "mlp-output": 2.58698904824753,
+          "shared-weight": 2.549401838514129
+        },
+        "objective": 2.624445303014733
+      },
+      "step": 6
+    },
+    {
+      "measurement": {
+        "active_group": "mlp-output",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 5.773726097638754,
+            "mean_kl": 2.2048885619173366,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 3.6643061138282653,
+            "mean_kl": 2.659650972714306,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 4.45355465165303,
+            "mean_kl": 2.281719098765539,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 5.773726097638754,
+            "mean_kl": 2.149694392812589,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 5.773726097638754,
+            "mean_kl": 2.375493142958062,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 8.54933970358256,
+            "mean_kl": 2.393542517761582,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 2.2048885619173366,
+          "joint": 2.393542517761582,
+          "mlp-output": 2.4706850357399226,
+          "shared-weight": 2.2625937678853254
+        },
+        "objective": 2.4706850357399226
+      },
+      "step": 7
+    },
+    {
+      "measurement": {
+        "active_group": "joint",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 5.178214201986614,
+            "mean_kl": 2.020471750296881,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 3.2953787684535296,
+            "mean_kl": 2.1990240668235255,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 4.031588330338378,
+            "mean_kl": 2.107599438020827,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 5.178214201986614,
+            "mean_kl": 1.9717068019772015,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 5.178214201986614,
+            "mean_kl": 2.1992903300216,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 8.42193390264579,
+            "mean_kl": 2.2105020265845585,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 2.020471750296881,
+          "joint": 2.2105020265845585,
+          "mlp-output": 2.1533117524221765,
+          "shared-weight": 2.0854985659994005
+        },
+        "objective": 2.2105020265845585
+      },
+      "step": 8
+    },
+    {
+      "measurement": {
+        "active_group": "mlp-output",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 4.736269668314579,
+            "mean_kl": 1.892433956646804,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 3.140477494792429,
+            "mean_kl": 2.1214820492845465,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 3.5002641538459036,
+            "mean_kl": 1.9525537113851177,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 4.736269668314579,
+            "mean_kl": 1.8394821561636259,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 4.736269668314579,
+            "mean_kl": 2.085484402115279,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 7.982586617331345,
+            "mean_kl": 2.0318249481925976,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 1.892433956646804,
+          "joint": 2.0318249481925976,
+          "mlp-output": 2.037017880334832,
+          "shared-weight": 1.9624832791394524
+        },
+        "objective": 2.037017880334832
+      },
+      "step": 9
+    },
+    {
+      "measurement": {
+        "active_group": "joint",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 4.444601380716465,
+            "mean_kl": 1.8162573409752483,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 2.9266586642740116,
+            "mean_kl": 1.8967333862546603,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 3.1667223012911707,
+            "mean_kl": 1.849708847117577,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 4.444601380716465,
+            "mean_kl": 1.7616332291052061,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 4.444601380716465,
+            "mean_kl": 2.0169486201814664,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 7.590809491197571,
+            "mean_kl": 1.9107237584552192,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 1.8162573409752483,
+          "joint": 1.9107237584552192,
+          "mlp-output": 1.8732211166861186,
+          "shared-weight": 1.8892909246433363
+        },
+        "objective": 1.9107237584552192
+      },
+      "step": 10
+    },
+    {
+      "measurement": {
+        "active_group": "shared-weight",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 4.2312647024048005,
+            "mean_kl": 1.7609526611802366,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 2.788180156421697,
+            "mean_kl": 1.7773278143045192,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 3.019040253942851,
+            "mean_kl": 1.764388127684503,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 4.2312647024048005,
+            "mean_kl": 1.703484859871757,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 4.2312647024048005,
+            "mean_kl": 1.964570982075136,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 7.129473874429159,
+            "mean_kl": 1.8055666472746068,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 1.7609526611802366,
+          "joint": 1.8055666472746068,
+          "mlp-output": 1.7708579709945111,
+          "shared-weight": 1.8340279209734465
+        },
+        "objective": 1.8340279209734465
+      },
+      "step": 11
+    },
+    {
+      "measurement": {
+        "active_group": "shared-weight",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 3.9752119053236243,
+            "mean_kl": 1.6811701045327898,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 2.691826176225315,
+            "mean_kl": 1.7124908177048006,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 2.9628436317875746,
+            "mean_kl": 1.6914559089998413,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 3.9752119053236243,
+            "mean_kl": 1.630342427351234,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 3.9752119053236243,
+            "mean_kl": 1.8732188633287064,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 6.802274969348678,
+            "mean_kl": 1.7195219917099005,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 1.6811701045327898,
+          "joint": 1.7195219917099005,
+          "mlp-output": 1.7019733633523209,
+          "shared-weight": 1.75178064533997
+        },
+        "objective": 1.75178064533997
+      },
+      "step": 12
+    },
+    {
+      "measurement": {
+        "active_group": "shared-weight",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 3.6961127480326654,
+            "mean_kl": 1.5881254170942487,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 2.6219841833108304,
+            "mean_kl": 1.6757389599084982,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 2.959667197409294,
+            "mean_kl": 1.628383589884516,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 3.6961127480326654,
+            "mean_kl": 1.550337985914731,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 3.6961127480326654,
+            "mean_kl": 1.7587102086900224,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 6.547287897588804,
+            "mean_kl": 1.6482930638801483,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 1.5881254170942487,
+          "joint": 1.6482930638801483,
+          "mlp-output": 1.6520612748965071,
+          "shared-weight": 1.6545240973023767
+        },
+        "objective": 1.6545240973023767
+      },
+      "step": 13
+    },
+    {
+      "measurement": {
+        "active_group": "mlp-output",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 3.4147927732941845,
+            "mean_kl": 1.4989759727846377,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 2.5693423135759685,
+            "mean_kl": 1.6544119681629716,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 2.966120145429362,
+            "mean_kl": 1.5811009479079297,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 3.4147927732941845,
+            "mean_kl": 1.4768500584385302,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 3.4147927732941845,
+            "mean_kl": 1.6437315931105656,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 6.320720987231902,
+            "mean_kl": 1.596711283819865,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 1.4989759727846377,
+          "joint": 1.596711283819865,
+          "mlp-output": 1.6177564580354507,
+          "shared-weight": 1.560290825774548
+        },
+        "objective": 1.6177564580354507
+      },
+      "step": 14
+    },
+    {
+      "measurement": {
+        "active_group": "mlp-output",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 3.199294769781746,
+            "mean_kl": 1.4373844228054784,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 2.4384335579450402,
+            "mean_kl": 1.5855474577439712,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 2.8920157900094163,
+            "mean_kl": 1.5366116996881722,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 3.199294769781746,
+            "mean_kl": 1.4285312431854547,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 3.199294769781746,
+            "mean_kl": 1.5587259347202664,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 6.061829011157135,
+            "mean_kl": 1.553562359431573,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 1.4373844228054784,
+          "joint": 1.553562359431573,
+          "mlp-output": 1.5610795787160718,
+          "shared-weight": 1.4936285889528604
+        },
+        "objective": 1.5610795787160718
+      },
+      "step": 15
+    },
+    {
+      "measurement": {
+        "active_group": "joint",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 3.030765016705861,
+            "mean_kl": 1.3906390209493258,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 2.2848832697314183,
+            "mean_kl": 1.516124046206202,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 2.841414316819646,
+            "mean_kl": 1.4884448825506067,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 3.030765016705861,
+            "mean_kl": 1.3916045306943643,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 3.1201722326444514,
+            "mean_kl": 1.4927263856519832,
+            "scored_rows": 32,
+            "worst_scored_row": 27
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 5.790137261662181,
+            "mean_kl": 1.5110481978605363,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 1.3906390209493258,
+          "joint": 1.5110481978605363,
+          "mlp-output": 1.5022844643784043,
+          "shared-weight": 1.4421654581731738
+        },
+        "objective": 1.5110481978605363
+      },
+      "step": 16
+    },
+    {
+      "measurement": {
+        "active_group": "mlp-output",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 3.0091505749896266,
+            "mean_kl": 1.342086687849878,
+            "scored_rows": 32,
+            "worst_scored_row": 28
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 2.1668106806701077,
+            "mean_kl": 1.4824144712879912,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 2.8104473838049646,
+            "mean_kl": 1.42060375340514,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 2.9451063414117495,
+            "mean_kl": 1.3425618472026084,
+            "scored_rows": 32,
+            "worst_scored_row": 28
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 3.0465265266001036,
+            "mean_kl": 1.4373013322099728,
+            "scored_rows": 32,
+            "worst_scored_row": 27
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 5.464465743309044,
+            "mean_kl": 1.4456993199850945,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 1.342086687849878,
+          "joint": 1.4456993199850945,
+          "mlp-output": 1.4515091123465655,
+          "shared-weight": 1.3899315897062907
+        },
+        "objective": 1.4515091123465655
+      },
+      "step": 17
+    },
+    {
+      "measurement": {
+        "active_group": "mlp-output",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 3.0185084447006654,
+            "mean_kl": 1.30444513304502,
+            "scored_rows": 32,
+            "worst_scored_row": 28
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 2.066443710373514,
+            "mean_kl": 1.4512017540709417,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 2.7481773916396506,
+            "mean_kl": 1.3595616562402881,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 2.9496610015006484,
+            "mean_kl": 1.3019839398123767,
+            "scored_rows": 32,
+            "worst_scored_row": 28
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 3.006954325181329,
+            "mean_kl": 1.3965875687929032,
+            "scored_rows": 32,
+            "worst_scored_row": 14
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 5.1864868249932305,
+            "mean_kl": 1.388334948917553,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 1.30444513304502,
+          "joint": 1.388334948917553,
+          "mlp-output": 1.405381705155615,
+          "shared-weight": 1.34928575430264
+        },
+        "objective": 1.405381705155615
+      },
+      "step": 18
+    },
+    {
+      "measurement": {
+        "active_group": "mlp-output",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 3.0079815992548875,
+            "mean_kl": 1.2793257846782546,
+            "scored_rows": 32,
+            "worst_scored_row": 28
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 1.9834439305465905,
+            "mean_kl": 1.4134629428988759,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 2.6705675119908836,
+            "mean_kl": 1.309819517391725,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 2.9380824596071884,
+            "mean_kl": 1.272603174142464,
+            "scored_rows": 32,
+            "worst_scored_row": 28
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 3.095672278502155,
+            "mean_kl": 1.371079873383203,
+            "scored_rows": 32,
+            "worst_scored_row": 14
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 4.951647164598164,
+            "mean_kl": 1.3422041857612723,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 1.2793257846782546,
+          "joint": 1.3422041857612723,
+          "mlp-output": 1.3616412301453005,
+          "shared-weight": 1.3218415237628336
+        },
+        "objective": 1.3616412301453005
+      },
+      "step": 19
+    },
+    {
+      "measurement": {
+        "active_group": "mlp-output",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 2.9698247601914725,
+            "mean_kl": 1.2652214760580875,
+            "scored_rows": 32,
+            "worst_scored_row": 28
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 1.91612963350926,
+            "mean_kl": 1.3664638629824313,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 2.594949737782554,
+            "mean_kl": 1.269629543492499,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 2.902260465222697,
+            "mean_kl": 1.2543024563935776,
+            "scored_rows": 32,
+            "worst_scored_row": 28
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 3.2056312576102344,
+            "mean_kl": 1.3577691155397476,
+            "scored_rows": 32,
+            "worst_scored_row": 14
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 4.750243654899031,
+            "mean_kl": 1.3050265480041623,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 1.2652214760580875,
+          "joint": 1.3050265480041623,
+          "mlp-output": 1.318046703237465,
+          "shared-weight": 1.3060357859666625
+        },
+        "objective": 1.318046703237465
+      },
+      "step": 20
+    },
+    {
+      "measurement": {
+        "active_group": "shared-weight",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 2.9029133020791376,
+            "mean_kl": 1.2582717604214617,
+            "scored_rows": 32,
+            "worst_scored_row": 28
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 1.863595789476752,
+            "mean_kl": 1.3133492899567119,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 2.535164637978559,
+            "mean_kl": 1.2331488717884977,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 2.840547152843339,
+            "mean_kl": 1.244506152438968,
+            "scored_rows": 32,
+            "worst_scored_row": 28
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 3.3094041116214648,
+            "mean_kl": 1.3513733808796184,
+            "scored_rows": 32,
+            "worst_scored_row": 14
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 4.5742768353135475,
+            "mean_kl": 1.2708805800674112,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 1.2582717604214617,
+          "joint": 1.2708805800674112,
+          "mlp-output": 1.273249080872605,
+          "shared-weight": 1.2979397666592933
+        },
+        "objective": 1.2979397666592933
+      },
+      "step": 21
+    },
+    {
+      "measurement": {
+        "active_group": "shared-weight",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 2.6187162653859826,
+            "mean_kl": 1.221911205579806,
+            "scored_rows": 32,
+            "worst_scored_row": 28
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 1.8218434600768274,
+            "mean_kl": 1.2719860893474557,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 2.5444403261086688,
+            "mean_kl": 1.1985095552359448,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 2.5736692121219398,
+            "mean_kl": 1.2082095295694013,
+            "scored_rows": 32,
+            "worst_scored_row": 28
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 3.319934646677564,
+            "mean_kl": 1.3163137488493553,
+            "scored_rows": 32,
+            "worst_scored_row": 14
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 4.417679902151798,
+            "mean_kl": 1.235568909517046,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 1.221911205579806,
+          "joint": 1.235568909517046,
+          "mlp-output": 1.2352478222917003,
+          "shared-weight": 1.2622616392093784
+        },
+        "objective": 1.2622616392093784
+      },
+      "step": 22
+    },
+    {
+      "measurement": {
+        "active_group": "mlp-output",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 2.276704100763421,
+            "mean_kl": 1.1602792274306857,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 1.789109099593889,
+            "mean_kl": 1.2407144558779704,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 2.620486158317875,
+            "mean_kl": 1.1667653044021629,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 2.459023376467142,
+            "mean_kl": 1.1495115104953157,
+            "scored_rows": 32,
+            "worst_scored_row": 31
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 3.2346990805622564,
+            "mean_kl": 1.2560230169365731,
+            "scored_rows": 32,
+            "worst_scored_row": 14
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 4.278204761216626,
+            "mean_kl": 1.2006358137581215,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 1.1602792274306857,
+          "joint": 1.2006358137581215,
+          "mlp-output": 1.2037398801400667,
+          "shared-weight": 1.2027672637159443
+        },
+        "objective": 1.2037398801400667
+      },
+      "step": 23
+    },
+    {
+      "measurement": {
+        "active_group": "mlp-output",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 2.1529416789481823,
+            "mean_kl": 1.1102030386214212,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 1.758839767493182,
+            "mean_kl": 1.2103119274322578,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 2.7057779690565833,
+            "mean_kl": 1.1348549939946198,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 2.410390778834213,
+            "mean_kl": 1.1039819394185655,
+            "scored_rows": 32,
+            "worst_scored_row": 31
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 3.125918573585968,
+            "mean_kl": 1.2052354411630202,
+            "scored_rows": 32,
+            "worst_scored_row": 14
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 4.1515623503021715,
+            "mean_kl": 1.1661271088596394,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 1.1102030386214212,
+          "joint": 1.1661271088596394,
+          "mlp-output": 1.1725834607134389,
+          "shared-weight": 1.1546086902907928
+        },
+        "objective": 1.1725834607134389
+      },
+      "step": 24
+    },
+    {
+      "measurement": {
+        "active_group": "mlp-output",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 2.05329937636782,
+            "mean_kl": 1.0731715050304809,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 1.7235352322910233,
+            "mean_kl": 1.1817110604240302,
+            "scored_rows": 32,
+            "worst_scored_row": 0
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 2.7863940561494185,
+            "mean_kl": 1.1047310117333915,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 2.3657510044235286,
+            "mean_kl": 1.0724809458579996,
+            "scored_rows": 32,
+            "worst_scored_row": 31
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 3.0043211191579235,
+            "mean_kl": 1.1658433529911156,
+            "scored_rows": 32,
+            "worst_scored_row": 14
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 4.033045031413302,
+            "mean_kl": 1.1342334343753395,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 1.0731715050304809,
+          "joint": 1.1342334343753395,
+          "mlp-output": 1.1432210360787107,
+          "shared-weight": 1.1191621494245576
+        },
+        "objective": 1.1432210360787107
+      },
+      "step": 25
+    },
+    {
+      "measurement": {
+        "active_group": "mlp-output",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 2.042986264358505,
+            "mean_kl": 1.0491684274382482,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 1.6790515581821346,
+            "mean_kl": 1.1520069117994982,
+            "scored_rows": 32,
+            "worst_scored_row": 2
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 2.8451116702333534,
+            "mean_kl": 1.077815622970141,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 2.323283570451415,
+            "mean_kl": 1.0541609285920328,
+            "scored_rows": 32,
+            "worst_scored_row": 31
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 2.8856296088604596,
+            "mean_kl": 1.1385715364899223,
+            "scored_rows": 32,
+            "worst_scored_row": 14
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 3.9181802827102468,
+            "mean_kl": 1.1064423166134116,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 1.0491684274382482,
+          "joint": 1.1064423166134116,
+          "mlp-output": 1.1149112673848196,
+          "shared-weight": 1.0963662325409775
+        },
+        "objective": 1.1149112673848196
+      },
+      "step": 26
+    },
+    {
+      "measurement": {
+        "active_group": "mlp-output",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 2.0488807891828023,
+            "mean_kl": 1.03560874454984,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 1.6250059825532623,
+            "mean_kl": 1.1186370289671657,
+            "scored_rows": 32,
+            "worst_scored_row": 2
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 2.864556438931384,
+            "mean_kl": 1.0531685997603675,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 2.2818683400477493,
+            "mean_kl": 1.0455168473515142,
+            "scored_rows": 32,
+            "worst_scored_row": 31
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 2.7857150227142533,
+            "mean_kl": 1.1217691993622654,
+            "scored_rows": 32,
+            "worst_scored_row": 14
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 3.803972612770039,
+            "mean_kl": 1.0816312595886015,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 1.03560874454984,
+          "joint": 1.0816312595886015,
+          "mlp-output": 1.0859028143637666,
+          "shared-weight": 1.0836430233568897
+        },
+        "objective": 1.0859028143637666
+      },
+      "step": 27
+    },
+    {
+      "measurement": {
+        "active_group": "shared-weight",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 2.0617384547215285,
+            "mean_kl": 1.0280007497473098,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 1.5549711910530037,
+            "mean_kl": 1.0842672943457075,
+            "scored_rows": 32,
+            "worst_scored_row": 2
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 2.8315404752261357,
+            "mean_kl": 1.0279453634956428,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 2.242047296076721,
+            "mean_kl": 1.0412844285912382,
+            "scored_rows": 32,
+            "worst_scored_row": 31
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 2.716599901510304,
+            "mean_kl": 1.1117791722724102,
+            "scored_rows": 32,
+            "worst_scored_row": 14
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 3.689678833950311,
+            "mean_kl": 1.0565683103252679,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 1.0280007497473098,
+          "joint": 1.0565683103252679,
+          "mlp-output": 1.0561063289206751,
+          "shared-weight": 1.076531800431824
+        },
+        "objective": 1.076531800431824
+      },
+      "step": 28
+    },
+    {
+      "measurement": {
+        "active_group": "shared-weight",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 2.047744456354609,
+            "mean_kl": 0.9901660501771438,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 1.4968523721056521,
+            "mean_kl": 1.0584669961708983,
+            "scored_rows": 32,
+            "worst_scored_row": 2
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 2.751448057925592,
+            "mean_kl": 1.0027934649379073,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 2.1938636855272042,
+            "mean_kl": 1.0015001132155184,
+            "scored_rows": 32,
+            "worst_scored_row": 31
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 2.6756685078048417,
+            "mean_kl": 1.0783822405754808,
+            "scored_rows": 32,
+            "worst_scored_row": 14
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 3.5842961501792536,
+            "mean_kl": 1.028063642007701,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 0.9901660501771438,
+          "joint": 1.028063642007701,
+          "mlp-output": 1.0306302305544028,
+          "shared-weight": 1.0399411768954996
+        },
+        "objective": 1.0399411768954996
+      },
+      "step": 29
+    },
+    {
+      "measurement": {
+        "active_group": "mlp-output",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 2.0114138530372077,
+            "mean_kl": 0.9341780065701354,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 1.4488622756039118,
+            "mean_kl": 1.0394661159328349,
+            "scored_rows": 32,
+            "worst_scored_row": 2
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 2.643891385939801,
+            "mean_kl": 0.9846278225004811,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 2.139645953142126,
+            "mean_kl": 0.9401265352342506,
+            "scored_rows": 32,
+            "worst_scored_row": 31
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 2.6532627412259053,
+            "mean_kl": 1.0312251315583434,
+            "scored_rows": 32,
+            "worst_scored_row": 14
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 3.4876200698576953,
+            "mean_kl": 1.0042463832292072,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 0.9341780065701354,
+          "joint": 1.0042463832292072,
+          "mlp-output": 1.012046969216658,
+          "shared-weight": 0.9856758333962969
+        },
+        "objective": 1.012046969216658
+      },
+      "step": 30
+    },
+    {
+      "measurement": {
+        "active_group": "mlp-output",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 1.9888317586772997,
+            "mean_kl": 0.8947740234873984,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 1.412574587370882,
+            "mean_kl": 1.018488109380073,
+            "scored_rows": 32,
+            "worst_scored_row": 2
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 2.5154183725524404,
+            "mean_kl": 0.9706147455151485,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 2.093978481411125,
+            "mean_kl": 0.896743146287896,
+            "scored_rows": 32,
+            "worst_scored_row": 31
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 2.6406230750222193,
+            "mean_kl": 0.9979688428564453,
+            "scored_rows": 32,
+            "worst_scored_row": 14
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 3.396374474351248,
+            "mean_kl": 0.986199261779387,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 0.8947740234873984,
+          "joint": 0.986199261779387,
+          "mlp-output": 0.9945514274476108,
+          "shared-weight": 0.9473559945721706
+        },
+        "objective": 0.9945514274476108
+      },
+      "step": 31
+    },
+    {
+      "measurement": {
+        "active_group": "mlp-output",
+        "episodes": [
+          {
+            "group": "clean",
+            "label": "clean",
+            "maximum_scored_row_kl": 1.9798930920012932,
+            "mean_kl": 0.8685253781144952,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-remove",
+            "maximum_scored_row_kl": 1.3901274392779364,
+            "mean_kl": 0.9946259070626989,
+            "scored_rows": 32,
+            "worst_scored_row": 2
+          },
+          {
+            "group": "mlp-output",
+            "label": "mlp0-half",
+            "maximum_scored_row_kl": 2.3870198796081246,
+            "mean_kl": 0.9555308225151184,
+            "scored_rows": 32,
+            "worst_scored_row": 15
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-half",
+            "maximum_scored_row_kl": 2.0563269519997327,
+            "mean_kl": 0.8689707606944755,
+            "scored_rows": 32,
+            "worst_scored_row": 31
+          },
+          {
+            "group": "shared-weight",
+            "label": "q0-double",
+            "maximum_scored_row_kl": 2.6122994571355442,
+            "mean_kl": 0.9739468061045617,
+            "scored_rows": 32,
+            "worst_scored_row": 14
+          },
+          {
+            "group": "joint",
+            "label": "joint-half",
+            "maximum_scored_row_kl": 3.311876724091264,
+            "mean_kl": 0.9690843275045387,
+            "scored_rows": 32,
+            "worst_scored_row": 29
+          }
+        ],
+        "groups": {
+          "clean": 0.8685253781144952,
+          "joint": 0.9690843275045387,
+          "mlp-output": 0.9750783647889087,
+          "shared-weight": 0.9214587833995187
+        },
+        "objective": 0.9750783647889087
+      },
+      "step": 32
+    }
+  ],
+  "planned_numeric_bytes": 1422999296,
+  "scope": "Proposal fitting only: maximum named-group mean of equal-weight episode means over declared scored rows. F64 KL q-p gradients, full-sequence ordinary reverse including controls supplied as Raw graph inputs. One parameter owner across every episode. Best TRAIN objective only; no validation input/selection. Vendor exp/log and neural arithmetic are not certified intervals; ordinary serialized acceptance is separate. Numeric plan includes fixed operators (all table/product roles), resident inputs/targets/flags, full trace/cotangents/KL scratch, conservative dense attention scratch and parameter/moment/snapshot/update buffers. Excludes host panels/source bytes, CUDA context/library/allocator/register/spill scratch; token/rotation preparation peak conservatively counted, not a measured memory claim.",
+  "seconds": 4.072402829,
+  "settings": {
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "epsilon": 1e-8,
+    "iterations": 32,
+    "learning_rate": 0.0003,
+    "numeric_bytes": 8589934592
+  },
+  "trainable": [
+    111,
+    112,
+    113,
+    114,
+    115,
+    116,
+    117,
+    118,
+    119,
+    120
+  ]
+}

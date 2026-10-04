@@ -1,0 +1,68 @@
+{
+  "artifact_sha256": "351f84b21e2885d60dd3308992d1458da73a01c833b8f8e7028238f0a35ccc12",
+  "c32": 2142194137,
+  "control_map_sha256": "ca294cd208fe87b7c2b6c0b53c5bc80be35ea4ffc8d2e07bfaa067dc9884f69c",
+  "id": "native",
+  "measurement": {
+    "active_group": "clean",
+    "episodes": [
+      {
+        "group": "clean",
+        "label": "clean",
+        "maximum_scored_row_kl": 0.0,
+        "mean_kl": 0.0,
+        "scored_rows": 64,
+        "worst_scored_row": 63
+      },
+      {
+        "group": "mlp-output",
+        "label": "mlp0-remove",
+        "maximum_scored_row_kl": 0.0,
+        "mean_kl": 0.0,
+        "scored_rows": 64,
+        "worst_scored_row": 63
+      },
+      {
+        "group": "mlp-output",
+        "label": "mlp0-half",
+        "maximum_scored_row_kl": 0.0,
+        "mean_kl": 0.0,
+        "scored_rows": 64,
+        "worst_scored_row": 63
+      },
+      {
+        "group": "shared-weight",
+        "label": "q0-half",
+        "maximum_scored_row_kl": 0.0,
+        "mean_kl": 0.0,
+        "scored_rows": 64,
+        "worst_scored_row": 63
+      },
+      {
+        "group": "shared-weight",
+        "label": "q0-double",
+        "maximum_scored_row_kl": 0.0,
+        "mean_kl": 0.0,
+        "scored_rows": 64,
+        "worst_scored_row": 63
+      },
+      {
+        "group": "joint",
+        "label": "joint-half",
+        "maximum_scored_row_kl": 0.0,
+        "mean_kl": 0.0,
+        "scored_rows": 64,
+        "worst_scored_row": 63
+      }
+    ],
+    "groups": {
+      "clean": 0.0,
+      "joint": 0.0,
+      "mlp-output": 0.0,
+      "shared-weight": 0.0
+    },
+    "objective": 0.0
+  },
+  "scope": "frozen candidate measurement only; no Local or acceptance certificate",
+  "status": "heldout_measured"
+}

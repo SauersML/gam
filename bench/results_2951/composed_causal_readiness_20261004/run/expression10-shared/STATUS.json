@@ -1,0 +1,20 @@
+{
+  "arm": "shared",
+  "artifact_sha256": "ff23ed55491c0f6cd26cbfef647ed388dea53e61254704f87312026f040f4e29",
+  "c32": 1915657560,
+  "control_map_sha256": "204fc96861977f7080a4b58894ff0b19aa6dce0a1bed41e6497d1363a4545f05",
+  "expression_id": 10,
+  "id": "expression10-shared",
+  "status": "training_measured",
+  "trainable": [
+    111,
+    112,
+    113,
+    114,
+    115,
+    116,
+    117,
+    118
+  ],
+  "training_kl": 1.5804547503586037
+}
