@@ -25,12 +25,10 @@ The decomposition lives in NLAE/sets (NLAE from the environment, default ~/mpd-d
 Stages (each reads and writes under NLAE):
 
   vpd           NLAE/sets from VPD's published sets (frontier/masks_vpd4l.npz) and library
-  prices own|fit  sets/missing.f32: per set member, the exact KL (nats) of it off minus on there,
-                at the own sets or at the program the fitted text decodes to
   program DIR   sets/program.f64 from mpd_program_bits_2951's OUT_DIR (one f64 per subcomponent)
   oracle LO:HI  the model as the concept fit's oracle (examples/mpd_nl_concepts_2951.rs)
-  [rust]        mpd_nl_concepts_2951 NLAE/sets 32:128 0:32 N LABEL_BITS NLAE/fit \
-                    python vpd_nl_autoencoder.py oracle 32:128
+  [rust]        mpd_nl_concepts_2951 NLAE/sets 32:128 0:32 N LABEL_BITS SECONDS NLAE/fit \
+                    python vpd_nl_autoencoder.py oracle
   labels        per subcomponent, what it reads from the embedding, writes to the logits and fires on
   names         an English name per fitted concept (Qwen2.5-7B-Instruct), unique (the decoder is a lookup)
   textonly      the held-out total of the text against listing the own sets
@@ -193,89 +191,6 @@ def stage_vpd():
     print(f"{SETS}: {z['ids'].shape[0]} rows, {len(z['vpd_indices']) / z['ids'].size:.1f} subcomponents per word of {off[-1]}")
 
 
-def decoded_programs(D):
-    """Per row, every word's program as the fitted text decodes it (NLAE/fit: the train rows' words
-    are coded first, then the held-out rows')."""
-    rep, ptr, idx = fit_outputs()
-    members = [np.asarray(c["members"], dtype=np.int64) for c in rep["concepts"]]
-    first = lambda r: (r - TRAIN[0]) * D.context if TRAIN[0] <= r < TRAIN[1] else (TRAIN[1] - TRAIN[0] + r - EVAL[0]) * D.context
-    none = np.zeros(0, dtype=np.int64)
-    return lambda r: [np.sort(np.concatenate([members[c] for c in idx[ptr[w]:ptr[w + 1]]])) if ptr[w + 1] > ptr[w] else none
-                      for w in range(first(r), first(r) + D.context)]
-
-
-def price_rows(rows, gpu, base):
-    """Prices of the rows `rows` on GPU `gpu` (stage_prices); per row its indices' slice and prices."""
-    import torch
-
-    D = decomposition()
-    dev = f"cuda:{gpu}" if torch.cuda.is_available() else device()
-    target = load(D, dev)
-    program = decoded_programs(D) if base == "fit" else lambda r: own_sets(D, r, r + 1)
-    batch = int(os.environ.get("NLAE_BATCH", "32"))
-    out = []
-    for r in rows:
-        a, b = D.indptr[r * D.context], D.indptr[(r + 1) * D.context]
-        pos = np.repeat(np.arange(D.context), np.diff(D.indptr[r * D.context:(r + 1) * D.context + 1]))
-        glob = D.indices[a:b]
-        P = program(r)
-        p_pos = np.repeat(np.arange(D.context), [len(p) for p in P])
-        p_glob = np.concatenate(P) if len(p_pos) else np.zeros(0, dtype=np.int64)
-        on = np.isin(pos * D.universe + glob, p_pos * D.universe + p_glob)
-        ids = torch.tensor(D.ids[r:r + 1], device=dev)
-        base_masks = masks_of(D, dev, 1, p_pos, p_glob)
-        with torch.no_grad():
-            tgt = target(ids)
-            k0 = kl_per_pos(masked(target, ids, base_masks), tgt)[0]
-        order = np.argsort(glob, kind="stable")
-        js, starts = np.unique(glob[order], return_index=True)
-        ends = np.append(starts[1:], len(order))
-        price = np.zeros(b - a, dtype=np.float32)
-        for c0 in range(0, len(js), batch):
-            chunk = js[c0:c0 + batch]
-            B = len(chunk)
-            masks = {n: m.expand(B, -1, -1).clone() for n, m in base_masks.items()}
-            for i, j in enumerate(chunk):
-                at = torch.tensor(pos[order[starts[c0 + i]:ends[c0 + i]]], device=dev)
-                m = masks[model_site(D.names[D.site[j]])]
-                m[i, at, j - D.offsets[D.site[j]]] = 1.0 - m[i, at, j - D.offsets[D.site[j]]]
-            with torch.no_grad():
-                kl = (kl_per_pos(masked(target, ids.expand(B, -1), masks), tgt.expand(B, -1, -1)) - k0).cpu().numpy()
-            for i in range(B):
-                k = order[starts[c0 + i]:ends[c0 + i]]
-                price[k] = np.where(on[k], kl[i, pos[k]], -kl[i, pos[k]])
-            del masks
-        print(f"row {r} (GPU {gpu}): {len(js)} subcomponents, {on.mean():.0%} of the set on, mean price {price.mean():.4f} nats", flush=True)
-        out.append((a, price))
-    return out
-
-
-def stage_prices():
-    """Per word and per member of the own set there, its exact price: the KL of the program with it
-    off minus with it on (nats; the fit charges n KL / ln 2), at a base program, argv[2]: `own` (the
-    own sets) or `fit` (what the fitted text decodes to, NLAE/fit). Each subcomponent is flipped at
-    every word of the row whose set holds it, every such word's KL read against the base's (one
-    batched forward per group of subcomponents); rows are spread over the GPUs. Writes
-    sets/missing.f32 aligned with the indices."""
-    import concurrent.futures
-    import multiprocessing
-
-    import torch
-
-    D = decomposition()
-    base = sys.argv[2]
-    assert base in ("own", "fit"), "prices own|fit"
-    gpus = max(1, torch.cuda.device_count())
-    rows = range(D.ids.shape[0])
-    out = np.zeros(len(D.indices), dtype=np.float32)
-    with concurrent.futures.ProcessPoolExecutor(gpus, mp_context=multiprocessing.get_context("spawn")) as pool:
-        for part in pool.map(price_rows, [rows[g::gpus] for g in range(gpus)], range(gpus), [base] * gpus):
-            for a, price in part:
-                out[a:a + len(price)] = price
-    out.tofile(SETS / "missing.f32")
-    print(f"prices at the {base} program: mean {out.mean():.4f} nats, {np.mean(out < 0):.0%} negative")
-
-
 def stage_program():
     """Each subcomponent's description bits under the team's pricing (examples/mpd_program_bits_2951.rs,
     `Describe::bits_at` in the declared charts), read from argv[2] (its OUT_DIR, {site}.bits.f64)
@@ -290,10 +205,11 @@ def stage_program():
 
 
 def stage_oracle():
-    """The model as the concept fit's oracle (examples/mpd_nl_concepts_2951.rs): reads programs for
-    every word of the rows argv[2] (lo:hi) on stdin and answers each word's exact KL(model || model
-    running only its program), f32 nats, on stdout. A batch of rows per forward; the clean logits
-    are kept."""
+    """The model as the concept fit's oracle (examples/mpd_nl_concepts_2951.rs) on the rows argv[2]
+    (lo:hi). Each request on stdin carries every word's program; kind 0 is answered with each word's
+    exact KL(model || model running only its program), kind 1 with each listed set member's
+    first-order price at the programs, -d(sum of every word's KL)/d(its mask) (f32 nats on stdout).
+    A batch of rows per forward; the clean logits are kept."""
     import torch
 
     lo, hi = (int(x) for x in sys.argv[2].split(":"))
@@ -305,27 +221,49 @@ def stage_oracle():
     with torch.no_grad():
         clean = [target(ids[b:b + batch]) for b in range(0, hi - lo, batch)]
     stdin, stdout = sys.stdin.buffer, sys.stdout.buffer
+    u64 = lambda n: np.frombuffer(stdin.read(8 * n), dtype="<u8").astype(np.int64)
+    u32 = lambda n: np.frombuffer(stdin.read(4 * n), dtype="<u4").astype(np.int64)
     calls = 0
     while True:
-        head = stdin.read(16)
-        if len(head) < 16:
+        head = stdin.read(24)
+        if len(head) < 24:
             return
-        words, members = np.frombuffer(head, dtype="<u8")
-        ptr = np.frombuffer(stdin.read(8 * (int(words) + 1)), dtype="<u8").astype(np.int64)
-        glob = np.frombuffer(stdin.read(4 * int(members)), dtype="<u4").astype(np.int64)
+        kind, words, members = (int(x) for x in np.frombuffer(head, dtype="<u8"))
         assert words == (hi - lo) * D.context, f"oracle: {words} words for {hi - lo} rows"
-        word = np.repeat(np.arange(int(words)), np.diff(ptr))
+        word = np.repeat(np.arange(words), np.diff(u64(words + 1)))
+        glob = u32(members)
+        if kind == 1:
+            count = int(u64(1)[0])
+            cword = np.repeat(np.arange(words), np.diff(u64(words + 1)))
+            cand = u32(count)
         out = []
         for b0, tgt in zip(range(0, hi - lo, batch), clean):
             B = tgt.shape[0]
             sel = (word >= b0 * D.context) & (word < (b0 + B) * D.context)
-            with torch.no_grad():
-                logits = masked(target, ids[b0:b0 + B], masks_of(D, dev, B, word[sel] - b0 * D.context, glob[sel]))
-                out.append(kl_per_pos(logits, tgt).reshape(-1).float().cpu().numpy())
-        stdout.write(np.concatenate(out).astype("<f4").tobytes())
+            masks = masks_of(D, dev, B, word[sel] - b0 * D.context, glob[sel])
+            if kind == 0:
+                with torch.no_grad():
+                    out.append(kl_per_pos(masked(target, ids[b0:b0 + B], masks), tgt).reshape(-1).float().cpu().numpy())
+                continue
+            for m in masks.values():
+                m.requires_grad_(True)
+            kl_per_pos(masked(target, ids[b0:b0 + B], masks), tgt).sum().backward()
+            csel = np.nonzero((cword >= b0 * D.context) & (cword < (b0 + B) * D.context))[0]
+            w, g = cword[csel] - b0 * D.context, cand[csel]
+            price = np.zeros(len(g), dtype=np.float32)
+            for s, name in enumerate(D.names):
+                k = np.nonzero(D.site[g] == s)[0]
+                if len(k):
+                    grad = masks[model_site(name)].grad
+                    wt = torch.tensor(w[k], device=dev)
+                    price[k] = -grad[wt // D.context, wt % D.context, torch.tensor(g[k] - D.offsets[s], device=dev)].float().cpu().numpy()
+            out.append(price)
+            del masks
+        out = np.concatenate(out)
+        stdout.write(out.astype("<f4").tobytes())
         stdout.flush()
         calls += 1
-        print(f"oracle call {calls}: mean KL {np.concatenate(out).mean():.4f}", file=sys.stderr, flush=True)
+        print(f"oracle call {calls} ({'KL' if kind == 0 else 'prices'}): mean {out.mean():.4f}", file=sys.stderr, flush=True)
 
 
 # ------------------------------------------------------------------ evidence and names
@@ -626,9 +564,9 @@ def stage_textonly():
 
 if __name__ == "__main__":
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-    stages = {"vpd": stage_vpd, "prices": stage_prices, "program": stage_program, "oracle": stage_oracle,
+    stages = {"vpd": stage_vpd, "program": stage_program, "oracle": stage_oracle,
               "labels": stage_labels, "names": stage_names, "textonly": stage_textonly}
-    if sys.argv[1] in ("oracle", "program", "prices"):
+    if sys.argv[1] in ("oracle", "program"):
         stages[sys.argv[1]]()
         sys.exit(0)
     for stage in sys.argv[1:]:
