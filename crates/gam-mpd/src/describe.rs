@@ -242,16 +242,9 @@ impl Chart {
         Ok(Self { name: name.to_string(), basis, groups, subsets: true })
     }
 
-    fn columns(&self, groups: &[usize]) -> Array2<f64> {
-        let width: usize = groups.iter().map(|g| self.groups[*g].width).sum();
-        let mut out = Array2::<f64>::zeros((self.basis.nrows(), width));
-        let mut at = 0;
-        for g in groups {
-            let group = &self.groups[*g];
-            out.slice_mut(s![.., at..at + group.width]).assign(&self.basis.slice(s![.., group.start..group.start + group.width]));
-            at += group.width;
-        }
-        out
+    /// The basis columns of `groups`, in their order.
+    fn indices(&self, groups: &[usize]) -> Vec<usize> {
+        groups.iter().flat_map(|g| self.groups[*g].start..self.groups[*g].start + self.groups[*g].width).collect()
     }
 
     /// Bits naming `chosen` of the groups (nothing when the chart takes them all).
@@ -412,7 +405,7 @@ impl Sides<'_> {
     /// The decoded factors `(P A)ᵀ`, `(Q B)ᵀ` of a core `A Bᵀ` in chart coordinates.
     fn decoded(&self, a: &Array2<f64>, b: &Array2<f64>) -> (Array2<f64>, Array2<f64>) {
         let side = |basis: &Option<Array2<f64>>, f: &Array2<f64>| match basis {
-            Some(x) => x.dot(f).reversed_axes(),
+            Some(x) => mm(x, f).reversed_axes(),
             None => f.t().to_owned(),
         };
         (side(&self.p, a), side(&self.q, b))
@@ -434,10 +427,10 @@ struct Block<'a> {
 
 impl<'a> Block<'a> {
     fn new(u: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>, metric: &'a Metric, calibration: f64) -> Self {
-        let fu = metric.fisher.dot(&u.t());
-        let cv = metric.moment.dot(&v.t());
-        let gu = symmetric(&u.dot(&fu));
-        let gv = symmetric(&v.dot(&cv));
+        let fu = mm(&metric.fisher, &u.t());
+        let cv = mm(&metric.moment, &v.t());
+        let gu = symmetric(&mm(&u, &fu));
+        let gv = symmetric(&mm(&v, &cv));
         let w2 = (&gu * &gv).sum();
         Self { metric, scale: metric.scale() * calibration, fu, cv, gu, gv, w2 }
     }
@@ -452,10 +445,12 @@ impl<'a> Block<'a> {
                 let root = chart.root.as_ref().ok_or("an identity chart without its root")?;
                 Ok((None, factor.clone(), Cow::Borrowed(metric), Cow::Borrowed(root)))
             } else {
-                let x = chart.chart.columns(groups);
-                let g = symmetric(&x.t().dot(metric).dot(&x));
+                // The chosen groups' Gram is a slice of the chart's, formed once per site.
+                let at = chart.chart.indices(groups);
+                let x = chart.chart.basis.select(Axis(1), &at);
+                let g = chart.gram.select(Axis(0), &at).select(Axis(1), &at);
                 let root = inverses(&g)?.1;
-                let h = x.t().dot(factor);
+                let h = mm(&x.t(), factor);
                 Ok((Some(x), h, Cow::Owned(g), Cow::Owned(root)))
             }
         };
@@ -463,7 +458,7 @@ impl<'a> Block<'a> {
         let (q, hr, gq, rq) = side(reader, rg, &self.cv, &self.metric.moment)?;
         // The dense `H` only for the linear cores, which pair two charts' groups; a pair with an
         // identity side codes generic cores only, on `H`'s factors.
-        let h = if writer.identity || reader.identity { Array2::zeros((0, 0)) } else { hl.dot(&hr.t()) };
+        let h = if writer.identity || reader.identity { Array2::zeros((0, 0)) } else { mm(&hl, &hr.t()) };
         Ok(Sides { p, q, hl, hr, h, gp, gq, rp, rq })
     }
 
@@ -471,13 +466,6 @@ impl<'a> Block<'a> {
     fn error_factored(&self, sides: &Sides, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
         let cross = (mm(&a.t(), &sides.hl) * mm(&b.t(), &sides.hr)).sum();
         let quad = (mm(&mm(&a.t(), &*sides.gp), a) * mm(&mm(&b.t(), &*sides.gq), b)).sum();
-        (self.w2 - 2.0 * cross + quad).max(0.0) * self.scale
-    }
-
-    /// The KL bits of the core `K`.
-    fn error(&self, sides: &Sides, k: &Array2<f64>) -> f64 {
-        let cross = (k * &sides.h).sum();
-        let quad = (mm(&mm(&*sides.gp, k), &*sides.gq) * k).sum();
         (self.w2 - 2.0 * cross + quad).max(0.0) * self.scale
     }
 }
@@ -505,6 +493,36 @@ fn scan(range: std::ops::RangeInclusive<i32>, mut cost: impl FnMut(i32) -> Optio
     };
     let n = minimize(len, &mut |n| Ok(memo(n))).ok()??;
     Some((start + n as i32, memo(n)))
+}
+
+/// The exponent minimizing `exact` near the minimum of `surrogate` over `range`: the surrogate's scan
+/// ([`scan`]), then exact steps from its minimum toward the cheaper neighbour while it is cheaper,
+/// each exponent costed exactly once; where the exact cost cannot price the surrogate's minimum, the
+/// exact cost's own scan.
+fn refine(range: std::ops::RangeInclusive<i32>, surrogate: impl FnMut(i32) -> Option<(f64, f64)>, mut exact: impl FnMut(i32) -> Option<(f64, f64)>) -> Option<i32> {
+    let (start, end) = (*range.start(), *range.end());
+    let guess = scan(range.clone(), surrogate).map(|(p, _)| p);
+    let mut memo: HashMap<i32, f64> = HashMap::new();
+    let mut total = |p: i32| -> f64 {
+        if let Some(v) = memo.get(&p) {
+            return *v;
+        }
+        let v = exact(p).map_or(f64::INFINITY, |(b, k)| b + k);
+        let v = if v.is_nan() { f64::INFINITY } else { v };
+        memo.insert(p, v);
+        v
+    };
+    let Some(mut at) = guess.filter(|p| total(*p).is_finite()) else {
+        return scan(range, |p| Some((total(p), 0.0))).map(|(p, _)| p);
+    };
+    let inside = |p: i32| (start..=end).contains(&p);
+    let step = [-1, 1].into_iter().filter(|s| inside(at + s)).min_by(|x, y| total(at + x).total_cmp(&total(at + y)));
+    if let Some(step) = step {
+        while inside(at + step) && total(at + step) < total(at) {
+            at += step;
+        }
+    }
+    Some(at)
 }
 
 /// Up to `rank` pivot columns of `k` by greedy residual norm (maximum volume, column by column).
@@ -549,16 +567,16 @@ impl Coded {
 /// `G_a^{1/2} G_b G_a^{1/2}` of `A`'s and `B`'s Grams) and coded in the pivot chart, its two
 /// exponents the minimum of bits plus error by coordinate descent.
 fn generic_cores(block: &Block<'_>, sides: &Sides, max_rank: usize) -> Result<Vec<Coded>, String> {
-    let a = sides.rp.dot(&sides.hl);
-    let b = sides.rq.dot(&sides.hr);
-    let (half, inverse_half) = roots(&a.t().dot(&a))?;
-    let core = symmetric(&half.dot(&b.t().dot(&b)).dot(&half));
+    let a = mm(&*sides.rp, &sides.hl);
+    let b = mm(&*sides.rq, &sides.hr);
+    let (half, inverse_half) = roots(&mm(&a.t(), &a))?;
+    let core = symmetric(&mm(&mm(&half, &mm(&b.t(), &b)), &half));
     let decomposed = eigh(core.view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
     let mut order: Vec<usize> = (0..decomposed.values.len()).filter(|i| decomposed.values[*i] > decomposed.band).collect();
     order.sort_by(|x, y| decomposed.values[*y].total_cmp(&decomposed.values[*x]));
     // m = Σ (A G_a^{-1/2} z)(B G_a^{1/2} z)ᵀ over the core's eigenvectors z.
-    let left = sides.rp.dot(&a.dot(&inverse_half));
-    let right = sides.rq.dot(&b.dot(&half));
+    let left = mm(&*sides.rp, &mm(&a, &inverse_half));
+    let right = mm(&*sides.rq, &mm(&b, &half));
     // The rank by ternary search on the total (bits grow with it, the error left falls).
     let ranks = max_rank.min(order.len());
     let mut coded: Vec<Option<Option<Coded>>> = (0..ranks).map(|_| None).collect();
@@ -566,7 +584,7 @@ fn generic_cores(block: &Block<'_>, sides: &Sides, max_rank: usize) -> Result<Ve
     minimize(ranks, &mut |n| {
         if coded[n].is_none() {
             let z = decomposed.vectors.select(Axis(1), &order[..n + 1]);
-            match generic_core(block, sides, &left.dot(&z), &right.dot(&z), None) {
+            match generic_core(block, sides, &mm(&left, &z), &mm(&right, &z), None) {
                 Ok(c) => coded[n] = Some(c),
                 Err(e) => {
                     failure = Some(e);
@@ -584,10 +602,10 @@ fn generic_cores(block: &Block<'_>, sides: &Sides, max_rank: usize) -> Result<Ve
 
 /// The generic core of rank `rank` on `sides` coded at the exponents `fixed` (no search).
 fn generic_core_at(block: &Block<'_>, sides: &Sides, rank: usize, fixed: &[i32]) -> Result<Option<Coded>, String> {
-    let a = sides.rp.dot(&sides.hl);
-    let b = sides.rq.dot(&sides.hr);
-    let (half, inverse_half) = roots(&a.t().dot(&a))?;
-    let core = symmetric(&half.dot(&b.t().dot(&b)).dot(&half));
+    let a = mm(&*sides.rp, &sides.hl);
+    let b = mm(&*sides.rq, &sides.hr);
+    let (half, inverse_half) = roots(&mm(&a.t(), &a))?;
+    let core = symmetric(&mm(&mm(&half, &mm(&b.t(), &b)), &half));
     let decomposed = eigh(core.view(), SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
     let mut order: Vec<usize> = (0..decomposed.values.len()).filter(|i| decomposed.values[*i] > decomposed.band).collect();
     order.sort_by(|x, y| decomposed.values[*y].total_cmp(&decomposed.values[*x]));
@@ -595,8 +613,8 @@ fn generic_core_at(block: &Block<'_>, sides: &Sides, rank: usize, fixed: &[i32])
         return Ok(None);
     }
     let z = decomposed.vectors.select(Axis(1), &order[..rank]);
-    let left = sides.rp.dot(&a.dot(&inverse_half)).dot(&z);
-    let right = sides.rq.dot(&b.dot(&half)).dot(&z);
+    let left = mm(&mm(&*sides.rp, &mm(&a, &inverse_half)), &z);
+    let right = mm(&mm(&*sides.rq, &mm(&b, &half)), &z);
     generic_core(block, sides, &left, &right, Some(fixed))
 }
 
@@ -610,7 +628,7 @@ fn generic_core(block: &Block<'_>, sides: &Sides, kl: &Array2<f64>, kr: &Array2<
         return Ok(None);
     }
     let m = kr.select(Axis(0), &pivot);
-    let a = kl.dot(&m.t());
+    let a = mm(kl, &m.t());
     let Ok(bt) = solve(m.t(), kr.t()) else { return Ok(None) };
     let mut b = bt.reversed_axes();
     for (i, &j) in pivot.iter().enumerate() {
@@ -635,31 +653,61 @@ fn generic_core(block: &Block<'_>, sides: &Sides, kl: &Array2<f64>, kr: &Array2<
     };
     let exponent_cost = |pa: i32, pb: i32| exponent_bits(pa) + if free.is_empty() { 0.0 } else { exponent_bits(pb) };
     let scale = block.scale;
+    // The scans' surrogate of a rounded factor's form: `x̃ = x + e` has
+    // `x̃ᵀ G x̃ = xᵀGx + eᵀ(Gx) + (eᵀ(Gx))ᵀ + eᵀGe`, all `O(d r²)` once `Gx` is formed but the last,
+    // which the surrogate takes on `G`'s diagonal (its mean under independent rounding errors). The
+    // exact form decides, at the surrogate's minimum and the neighbours it steps to ([`refine`]).
+    let (gpa, gqb) = (mm(&*sides.gp, &a), mm(&*sides.gq, &b));
+    let (aga, bgb) = (mm(&a.t(), &gpa), mm(&b.t(), &gqb));
+    let (dp, dq) = (sides.gp.diag().to_owned(), sides.gq.diag().to_owned());
+    let surrogate = |x: &Array2<f64>, gx: &Array2<f64>, xgx: &Array2<f64>, diagonal: &Array1<f64>, rounded: &Array2<f64>| -> Array2<f64> {
+        let e = rounded - x;
+        let cross = mm(&e.t(), gx);
+        let weighted = &e * &diagonal.view().insert_axis(Axis(1));
+        xgx + &cross + &cross.t() + &mm(&weighted.t(), &e)
+    };
     // While one factor is held, the error is a quadratic in the other: its products with the held
     // factor are formed once per scan, `w2 − 2 tr[(ÃᵀH_l)(H_rᵀB̃)ᵀ] + tr[(ÃᵀG_pÃ)(B̃ᵀG_qB̃)]`.
     let scan_a = |pb: i32| -> Option<i32> {
         let (qb, bb) = if free.is_empty() { (b_free.clone(), 0.0) } else { quantize(&b_free, pb)? };
         let full = rebuild(&qb);
         let (hb, gb) = (mm(&sides.hr.t(), &full), mm(&mm(&full.t(), &*sides.gq), &full));
-        scan(exponents(&a), |p| {
-            let (qa, ba) = quantize(&a, p)?;
+        let error = |qa: &Array2<f64>, form: &Array2<f64>| {
             let cross = (mm(&qa.t(), &sides.hl) * &hb.t()).sum();
-            let quad = (mm(&mm(&qa.t(), &*sides.gp), &qa) * &gb).sum();
-            Some((ba + bb + exponent_cost(p, pb), (block.w2 - 2.0 * cross + quad).max(0.0) * scale))
-        })
-        .map(|(p, _)| p)
+            (block.w2 - 2.0 * cross + (form * &gb).sum()).max(0.0) * scale
+        };
+        refine(
+            exponents(&a),
+            |p| {
+                let (qa, ba) = quantize(&a, p)?;
+                Some((ba + bb + exponent_cost(p, pb), error(&qa, &surrogate(&a, &gpa, &aga, &dp, &qa))))
+            },
+            |p| {
+                let (qa, ba) = quantize(&a, p)?;
+                Some((ba + bb + exponent_cost(p, pb), error(&qa, &mm(&mm(&qa.t(), &*sides.gp), &qa))))
+            },
+        )
     };
     let scan_b = |pa: i32| -> Option<i32> {
         let (qa, ba) = quantize(&a, pa)?;
         let (ha, ga) = (mm(&qa.t(), &sides.hl), mm(&mm(&qa.t(), &*sides.gp), &qa));
-        scan(exponents(&b_free), |p| {
-            let (qb, bb) = quantize(&b_free, p)?;
-            let full = rebuild(&qb);
+        let error = |full: &Array2<f64>, form: &Array2<f64>| {
             let cross = (&ha * &mm(&full.t(), &sides.hr)).sum();
-            let quad = (&ga * &mm(&mm(&full.t(), &*sides.gq), &full)).sum();
-            Some((ba + bb + exponent_cost(pa, p), (block.w2 - 2.0 * cross + quad).max(0.0) * scale))
-        })
-        .map(|(p, _)| p)
+            (block.w2 - 2.0 * cross + (&ga * form).sum()).max(0.0) * scale
+        };
+        refine(
+            exponents(&b_free),
+            |p| {
+                let (qb, bb) = quantize(&b_free, p)?;
+                let full = rebuild(&qb);
+                Some((ba + bb + exponent_cost(pa, p), error(&full, &surrogate(&b, &gqb, &bgb, &dq, &full))))
+            },
+            |p| {
+                let (qb, bb) = quantize(&b_free, p)?;
+                let full = rebuild(&qb);
+                Some((ba + bb + exponent_cost(pa, p), error(&full, &mm(&mm(&full.t(), &*sides.gq), &full))))
+            },
+        )
     };
     let (mut pa, mut pb) = match fixed {
         Some(&[pa, pb]) => (pa, pb),
@@ -708,6 +756,12 @@ fn linear_core(block: &Block<'_>, sides: &Sides, placements: &[Placement], struc
     }
     let (inverse, _) = inverses(&gram)?;
     let theta = inverse.dot(&rhs).insert_axis(Axis(1));
+    // `K = Σ θ_p E_p` is linear in `θ`, so its error is `w2 − 2 θᵀ r + θᵀ G θ` on the placements'
+    // Gram and right-hand side: exact, without forming `K`.
+    let error = |q: &Array2<f64>| {
+        let t = q.column(0);
+        (block.w2 - 2.0 * t.dot(&rhs) + t.dot(&gram.dot(&t))).max(0.0) * block.scale
+    };
     let (s_, t_) = sides.h.dim();
     let core = |theta: &Array2<f64>| {
         let mut k = Array2::<f64>::zeros((s_, t_));
@@ -720,8 +774,7 @@ fn linear_core(block: &Block<'_>, sides: &Sides, placements: &[Placement], struc
     };
     let cost = |p: i32| -> Option<(f64, f64, Array2<f64>)> {
         let (q, bits) = quantize(&theta, p)?;
-        let k = core(&q);
-        Some((bits, block.error(sides, &k), k))
+        Some((bits, error(&q), q))
     };
     let p = match fixed {
         Some(p) => p,
@@ -730,7 +783,8 @@ fn linear_core(block: &Block<'_>, sides: &Sides, placements: &[Placement], struc
             p
         }
     };
-    let Some((bits, kl, k)) = cost(p) else { return Ok(None) };
+    let Some((bits, kl, q)) = cost(p) else { return Ok(None) };
+    let k = core(&q);
     // Factored as K̃ = K̃ · I.
     Ok(Some(Coded { a: k, b: Array2::eye(t_), reals: m, real_bits: bits, structure_bits: structure + exponent_bits(p), kl, exponents: vec![p] }))
 }
@@ -821,7 +875,7 @@ fn ranked(chart: &Prepared, factor: &Array2<f64>, other: &Array2<f64>) -> Vec<(u
     if !chart.chart.subsets {
         return Vec::new();
     }
-    let t = chart.chart.basis.t().dot(factor);
+    let t = mm(&chart.chart.basis.t(), factor);
     let mut out: Vec<(usize, f64)> = chart
         .chart
         .groups
@@ -967,28 +1021,30 @@ fn minimize(len: usize, f: &mut dyn FnMut(usize) -> Result<f64, String>) -> Resu
     Ok(best.map(|(n, _)| n))
 }
 
-/// A chart prepared on its side's metric: each group's pseudo-inverse Gram and, for the identity,
-/// the metric's pseudo-inverse root.
+/// A chart prepared on its side's metric: its Gram `Xᵀ G X` (every choice of its groups a slice
+/// of it), each group's pseudo-inverse Gram and, for the identity, the metric's pseudo-inverse root.
 struct Prepared {
     chart: Chart,
     identity: bool,
+    gram: Array2<f64>,
     group_inverse: Vec<Array2<f64>>,
     root: Option<Array2<f64>>,
 }
 
 impl Prepared {
     fn new(chart: Chart, metric: &Array2<f64>, identity: bool) -> Result<Self, String> {
-        let (group_inverse, root) = if identity {
-            (Vec::new(), Some(inverses(metric)?.1))
-        } else {
-            let mut out = Vec::new();
-            for g in 0..chart.groups.len() {
-                let x = chart.columns(&[g]);
-                out.push(inverses(&x.t().dot(metric).dot(&x))?.0);
-            }
-            (out, None)
-        };
-        Ok(Self { chart, identity, group_inverse, root })
+        if identity {
+            let root = Some(inverses(metric)?.1);
+            return Ok(Self { chart, identity, gram: Array2::zeros((0, 0)), group_inverse: Vec::new(), root });
+        }
+        let gram = symmetric(&mm(&chart.basis.t(), &mm(metric, &chart.basis)));
+        let group_inverse = (0..chart.groups.len())
+            .map(|g| {
+                let at = chart.indices(&[g]);
+                inverses(&gram.select(Axis(0), &at).select(Axis(1), &at)).map(|x| x.0)
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self { chart, identity, gram, group_inverse, root: None })
     }
 }
 
