@@ -28,7 +28,7 @@ print(bands[["posterior_mean", "posterior_mean_lower", "posterior_mean_upper",
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/mcycle_location_scale_dark.png">
-  <img alt="mcycle location-scale fit: posterior mean, credible band and observation interval" src="docs/images/mcycle_location_scale.png">
+  <img alt="Crash-test acceleration: gold measurements, fitted mean and its 95% credible band, with nested 10–95% observation intervals showing the changing noise" src="docs/images/mcycle_location_scale.png" width="1200">
 </picture>
 
 Docs: <https://gamfit.readthedocs.io/>. PyPI: <https://pypi.org/project/gamfit/>.
