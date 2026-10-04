@@ -1343,6 +1343,30 @@ impl Device {
         Ok(Tensor { rows, cols: t.cols, data })
     }
 
+    /// Exact column copies into a fresh row-major tensor. No arithmetic or host
+    /// transfer occurs on CUDA. Empty row/column domains and Metal are refused.
+    pub fn columns_of(&self, t: &Tensor, columns: std::ops::Range<usize>) -> Result<Tensor, GpuError> {
+        if t.rows == 0 || columns.start >= columns.end || columns.end > t.cols {
+            return Err(shape("column copy requires a nonempty in-range domain".into()));
+        }
+        let width = columns.len();
+        let count = t.rows.checked_mul(width).ok_or_else(|| shape("column copy size overflow".into()))?;
+        let data = match (&*self.backend, &t.data) {
+            (Backend::Host, Data::Host(v)) => {
+                let mut values = Vec::with_capacity(count);
+                for row in 0..t.rows { values.extend_from_slice(&v[row*t.cols+columns.start..row*t.cols+columns.end]); }
+                Data::Host(values)
+            }
+            #[cfg(target_os = "linux")]
+            (Backend::Cuda(engine), Data::Cuda(_)) => Data::Cuda(engine.columns_of(t, columns.start, width, count)?),
+            #[cfg(target_os = "macos")]
+            (Backend::Metal(_), Data::Metal(_)) => return Err(shape("column copies are unsupported on Metal".into())),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            _ => return Err(foreign()),
+        };
+        Ok(Tensor { rows:t.rows, cols:width, data })
+    }
+
     /// Writes `part` into rows `start..` of `t`.
     pub fn set_rows(&self, t: &mut Tensor, start: usize, part: &Tensor) -> Result<(), GpuError> {
         if part.cols != t.cols || start + part.rows > t.rows {
@@ -1753,6 +1777,10 @@ extern "C" __global__ void scaled_row_l2(u64 rows, u64 cols, u64 begin, u64 end,
         }
         out[row] = __ddiv_rn(__dsqrt_rn(sum), scale);
     }
+}
+
+extern "C" __global__ void columns_of(u64 n, u64 source_cols, u64 width, u64 start, const double* source, double* out) {
+    GRID_STRIDE(i, n) out[i] = source[(i / width) * source_cols + start + i % width];
 }
 
 extern "C" __global__ void set_columns(u64 n, u64 output_cols, u64 input_cols, u64 start, const double* input, double* output) {
@@ -2928,6 +2956,17 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             }
             .gpu_ctx("tensor add_row")
             .map(|_| ())
+        }
+
+        pub(super) fn columns_of(&self, input: &Tensor, start: usize, width: usize, count: usize) -> Result<CudaSlice<f64>, GpuError> {
+            let mut output = self.zeros(count)?;
+            let (n, cols, width, start) = (count as u64, input.cols as u64, width as u64, start as u64);
+            let f = self.function("columns_of")?;
+            // SAFETY: caller validated nonempty in-range columns; each thread
+            // copies one element within the source rows into its own output slot.
+            unsafe { self.stream.launch_builder(&f).arg(&n).arg(&cols).arg(&width).arg(&start)
+                .arg(slice(input)?).arg(&mut output).launch(cfg_elements(n)) }.gpu_ctx("tensor column copy")?;
+            Ok(output)
         }
 
         pub(super) fn set_columns(
@@ -4787,5 +4826,25 @@ mod scaled_row_l2_tests {
         for scale in [0.0, -1.0, f64::NAN, f64::INFINITY] { assert!(device.scaled_row_l2(&input, 0..2, scale).is_err()); }
         let overflow = device.upload_vec(1, 1, vec![f64::MAX]).unwrap();
         assert!(device.scaled_row_l2(&overflow, 0..1, 1.0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod columns_of_tests {
+    use super::*;
+    #[test]
+    fn exact_column_copies_preserve_bits_and_source() {
+        let mut devices=vec![Device::host()];
+        if let Some(device)=Device::accelerator(crate::GpuPolicy::Auto).expect("device probe") {
+            if device.float64() { devices.push(device); }
+        }
+        let values=vec![1.0, -0.0, f64::from_bits(1), f64::INFINITY, -3.0, f64::NAN, 4.0, 0.0];
+        for device in devices {
+            let input=device.upload_vec(2,4,values.clone()).unwrap();
+            let part=device.columns_of(&input,1..3).unwrap();
+            assert_eq!(device.download(&part).unwrap().iter().map(|v|v.to_bits()).collect::<Vec<_>>(),vec![values[1].to_bits(),values[2].to_bits(),values[5].to_bits(),values[6].to_bits()]);
+            assert_eq!(device.download(&input).unwrap().iter().map(|v|v.to_bits()).collect::<Vec<_>>(),values.iter().map(|v|v.to_bits()).collect::<Vec<_>>());
+            for range in [1..1,2..1,0..5,usize::MAX..usize::MAX] { assert!(device.columns_of(&input,range).is_err()); }
+        }
     }
 }

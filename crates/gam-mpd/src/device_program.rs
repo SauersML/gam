@@ -242,6 +242,14 @@ impl DeviceProgram {
         Self::lower(device, program, None, true, Some(numeric_bytes_limit))
     }
 
+    /// Shared resident-value compilation with the same retained numeric-buffer
+    /// preflight as compile_values_bounded. Shared buffers still count toward
+    /// this program's declared retained bound; this is not an incremental limit.
+    pub fn compile_values_sharing_bounded(from: &Self, program: &OperatorProgram, numeric_bytes_limit: usize) -> Result<Self, String> {
+        if numeric_bytes_limit == 0 { return Err("positive operator numeric byte limit required".into()); }
+        Self::lower(&from.device, program, Some(from), true, Some(numeric_bytes_limit))
+    }
+
     /// Bytes of unique retained float64 operator buffers; excludes all other storage.
     pub fn operator_numeric_bytes(&self) -> Result<usize, String> {
         let mut seen = std::collections::BTreeSet::new();
@@ -1105,8 +1113,15 @@ impl DeviceProgram {
                 break;
             }
             match &self.steps[index] {
-                Step::Concat { .. } => {
-                    return Err("device: resident Concat derivatives are unsupported".into());
+                Step::Concat { parts } => {
+                    let mut column = 0usize;
+                    for part in parts {
+                        let end = column.checked_add(self.widths[*part]).ok_or("device: Concat cotangent width overflow")?;
+                        let term = d.columns_of(&cot, column..end).map_err(error)?;
+                        add(&mut g, *part, term)?;
+                        column = end;
+                    }
+                    if column != cot.cols() { return Err("device: Concat cotangent width mismatch".into()); }
                 }
                 Step::Readout { input } => add(&mut g, *input, d.copy(&cot).map_err(error)?)?,
                 Step::Head | Step::Feature { .. } | Step::Raw { .. } | Step::Constant { .. } => {}
@@ -1496,6 +1511,11 @@ mod value_sharing_tests {
         shifted.operators.insert(0, Arc::new(Operator::identity("unused", interface)));
         shifted.nodes[1] = Node::Affine { terms: vec![(0, 1)], bias: None };
         let shared = DeviceProgram::compile_values_sharing(&source, &shifted).unwrap();
+        let retained = source.operator_numeric_bytes().unwrap();
+        let bounded = DeviceProgram::compile_values_sharing_bounded(&source, &shifted, retained).unwrap();
+        assert!(Arc::ptr_eq(&source.operators[&(0, Role::Product)].held, &bounded.operators[&(1, Role::Product)].held));
+        assert!(DeviceProgram::compile_values_sharing_bounded(&source, &shifted, retained-1).is_err());
+        assert!(DeviceProgram::compile_values_sharing_bounded(&source, &shifted, 0).is_err());
         let fresh = DeviceProgram::compile_values(&device, &shifted).unwrap();
         assert!(Arc::ptr_eq(&source.operators[&(0, Role::Product)].held, &shared.operators[&(1, Role::Product)].held));
         let a = shared.forward(&family).unwrap(); let b = fresh.forward(&family).unwrap();
@@ -1607,15 +1627,19 @@ mod values_vjp_tests {
     }
 
     #[test]
-    fn unsupported_trainable_storage_and_concat_fail_explicitly() {
+    fn concatenated_cotangents_accumulate_repeated_parts_and_storage_refusals() {
         let (called, family) = fixture();
         let (mut program, _) = crate::artifact_device::mapped_inlined(&called).unwrap();
         let device = Device::host();
-        program.nodes.push(Node::Concat { parts: vec![program.output, 0] });
+        program.nodes.push(Node::Concat { parts: vec![program.output, 0, 0] });
         program.output = program.nodes.len()-1;
         let lowered = DeviceProgram::compile_values(&device, &program).unwrap();
         let trace = lowered.forward(&family).unwrap();
-        assert!(lowered.vjp_values_seeded(&trace, BTreeMap::from([(program.output, device.zeros(2,4).unwrap())]), &[0], Arithmetic::F64).is_err());
+        let seeds = BTreeMap::from([(program.output, Array2::ones((2,6)))]);
+        let cpu = program.execute(&family,false).unwrap();
+        let reference = crate::derivatives::vjp_seeded(&program,&family,&cpu,seeds.clone(),Some(&[0])).unwrap();
+        let actual = lowered.vjp_values_seeded(&trace,seeds.into_iter().map(|(n,a)|(n,device.upload(a.view()).unwrap())).collect(),&[0],Arithmetic::F64).unwrap();
+        assert!((&device.download(&actual[&0]).unwrap()-reference[0].as_ref().unwrap()).iter().all(|v|v.abs()<2e-12));
         let interface = Interface::native(2).unwrap();
         program.operators[0] = Arc::new(Operator::identity("unsupported identity", interface));
         program.nodes.pop(); program.output = program.nodes.len()-1;
