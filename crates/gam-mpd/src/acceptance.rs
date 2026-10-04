@@ -486,6 +486,7 @@ pub struct Local<'a> {
     /// Rows executed at once (whole units).
     pub batch_rows: usize,
     scales: Mutex<BTreeMap<usize, f64>>,
+    device: Option<(gam_gpu::tensor::Device, usize)>,
 }
 
 /// Per row, `‖d_row‖₂` and the rounding of computing it from the two executed writes: the
@@ -504,7 +505,28 @@ fn row_norms(values: &Array2<f64>, columns: std::ops::Range<usize>, scale: f64) 
 
 impl<'a> Local<'a> {
     pub fn new(model: &'a OperatorProgram, family: FamilyInputs, ascent: Option<Ascent>, batch_rows: usize) -> Self {
-        Self { model, family, ascent, batch_rows, scales: Mutex::new(BTreeMap::new()) }
+        Self { model, family, ascent, batch_rows, scales: Mutex::new(BTreeMap::new()), device: None }
+    }
+
+    /// Execute the same native-parent graft on a float64 CUDA device. Native scale
+    /// measurements and comparison reductions stay on the CPU. The limit covers
+    /// retained intermediate values, not operators, workspaces or host storage.
+    /// There is no CPU fallback. Report this backend: comparison-rounding intervals
+    /// describe the executed CUDA values, not a proof of CPU/CUDA equivalence.
+    /// Counterexample ascent is currently CPU-only and must be disabled explicitly.
+    pub fn with_cuda(mut self, device: gam_gpu::tensor::Device, intermediate_bytes_limit: usize) -> Result<Self, String> {
+        if !cfg!(target_os = "linux") || device.is_host() || !device.float64() || intermediate_bytes_limit == 0 {
+            return Err("Local CUDA requires Linux float64 accelerator and a positive intermediate byte limit".into());
+        }
+        if self.ascent.is_some() {
+            return Err("Local CUDA does not support counterexample ascent".into());
+        }
+        self.device = Some((device, intermediate_bytes_limit));
+        Ok(self)
+    }
+
+    pub fn backend_name(&self) -> &'static str {
+        if self.device.is_some() { "CUDA f64 native-parent graft; CPU native scales and comparison" } else { "CPU f64 native-parent graft, native scales and comparison" }
     }
 
     /// The declared scale of native node `node`: the root mean square of its row norms on the
@@ -542,11 +564,22 @@ impl<'a> Local<'a> {
         family: &FamilyInputs,
     ) -> Result<Vec<Vec<(f64, f64)>>, String> {
         let mut out = vec![vec![(0.0, 0.0); family.rows]; columns.len()];
+        let resident = self.device.as_ref().map(|(device, _)| super::artifact_device::Resident::from_decoded(device, local)).transpose()?;
         for rows in batches(&units(family), self.batch_rows) {
-            let trace = local.execute(&family.select(&rows))?;
-            let values = &trace.values[local.program.output];
+            let selected = family.select(&rows);
+            let values = if let (Some(resident), Some((device, limit))) = (&resident, &self.device) {
+                let estimate = resident.estimated_resident_bytes(selected.rows)?;
+                if estimate > *limit {
+                    return Err(format!("Local CUDA retained intermediates {estimate} exceed declared limit {limit}; excludes operators/workspaces/host"));
+                }
+                let trace = resident.forward_edited(&selected, |_, _| Ok(None))?;
+                device.download(&resident.output(&trace)?).map_err(|e| e.to_string())?
+            } else {
+                let trace = local.execute(&selected)?;
+                trace.values[local.program.output].clone()
+            };
             for (b, (columns, scale)) in columns.iter().zip(scales).enumerate() {
-                for (row, error) in rows.iter().zip(row_norms(values, columns.clone(), *scale)) {
+                for (row, error) in rows.iter().zip(row_norms(&values, columns.clone(), *scale)) {
                     nonnegative_interval(error.0, error.1).map_err(|e| format!("local block {b}, row {row}: {e}"))?;
                     out[b][*row] = error;
                 }

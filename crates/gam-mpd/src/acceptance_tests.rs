@@ -119,6 +119,15 @@ fn mlp_family() -> FamilyInputs {
     grid(&[-2.0, -1.0, -0.25, 0.5, 1.5], 2)
 }
 
+#[test]
+fn local_cuda_rejects_host_instead_of_silently_falling_back() {
+    let model = mlp(1.0);
+    let local = Local::new(&model, mlp_family(), None, 64);
+    assert!(local.backend_name().starts_with("CPU"));
+    let result = local.with_cuda(gam_gpu::tensor::Device::host(), 1024);
+    assert!(result.err().expect("host must not satisfy required CUDA").contains("float64 accelerator"));
+}
+
 /// The MLP with its duplicate units merged: exact, ten literals instead of twenty.
 fn merged(model: &OperatorProgram) -> Artifact {
     let start = Artifact::native(model).expect("an artifact");
