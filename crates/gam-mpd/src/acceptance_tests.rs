@@ -1268,3 +1268,46 @@ fn reusing_operator_prices_does_not_reuse_training_fidelity_on_holdout() {
     assert_eq!(second.local, independent.local);
     assert_eq!(second.run, independent.run);
 }
+
+#[test]
+fn local_norm_tiny_native_scale_is_not_a_square_underflow() {
+    let interface = native(2);
+    let model = raw_program(2, vec![Operator::identity("I",interface.clone())], vec![Node::Raw{slot:0},Node::Affine{terms:vec![(0,0)],bias:None}]);
+    let start = Artifact::native(&model).expect("native artifact");
+    let candidate = linear(&start,"double",0,1,dense("double",&interface,&interface,array![[2.0,0.0],[0.0,2.0]]));
+    for amplitude in [1e-200,2.0_f64.powi(-1000),1.0,1e200] {
+        let family = raw_family(vec![vec![amplitude,0.0]]);
+        let local = Local::new(&model,family.clone(),None,16);
+        let measured = local.measure(&candidate).expect("finite scaled comparison");
+        assert!(measured.blocks[0].lower <= 1.0 && measured.blocks[0].upper >= 1.0);
+        assert!(measured.status().expect("valid evidence").refutes_at_most(0.5));
+        if let Some(device)=gam_gpu::tensor::Device::accelerator(gam_gpu::GpuPolicy::Auto).expect("device probe") {
+            if device.float64() && device.name().contains("CUDA") {
+                let measured=Local::new(&model,family,None,16).with_cuda(device,1024*1024).expect("CUDA Local").with_cuda_resident_norms().expect("resident norms").measure(&candidate).expect("CUDA scale enclosure");
+                assert!(measured.blocks[0].lower <= 1.0 && measured.blocks[0].upper >= 1.0);
+                assert!(measured.status().expect("valid CUDA evidence").refutes_at_most(0.5));
+            }
+        }
+    }
+}
+
+#[test]
+fn local_norm_exact_zero_over_zero_meets_zero_and_nonzero_is_unresolved() {
+    let interface = native(2);
+    let model = raw_program(2,vec![Operator::identity("I",interface.clone())],vec![Node::Raw{slot:0},Node::Affine{terms:vec![(0,0)],bias:None}]);
+    let start=Artifact::native(&model).expect("native artifact");
+    let equal=linear(&start,"equal",0,1,Operator::identity("same",interface.clone()));
+    let family=raw_family(vec![vec![0.0,0.0]]);
+    let local=Local::new(&model,family,None,16);
+    assert_eq!(local.scale(1).expect("exact zero scale"),0.0);
+    let measured=local.measure(&equal).expect("exact zero disagreement");
+    assert_eq!(measured.blocks[0].worst,0.0);
+    assert_eq!(measured.blocks[0].upper,0.0);
+    assert!(measured.status().expect("valid zero evidence").certifies_at_most(0.0));
+    let k=start.program.operators.len();
+    let body=rule("nonzero at zero",vec![interface.clone()],vec![Node::Param{index:0},Node::Affine{terms:vec![(0,k)],bias:Some(k+1)}]);
+    let bad_candidate=start.replace_block("bias",Callee::New(body),vec![Argument::Native(0)],1,vec![Operator::identity("identity",interface.clone()),column("offset",&interface,&[1.0,0.0])]).expect("biased candidate");
+    assert!(local.measure(&bad_candidate).expect_err("nonzero over native zero cannot produce finite fidelity").contains("unresolved"));
+    let bad=gam_gpu::tensor::Device::row_l2_enclosure(&[1.0],[0.0;3]);
+    assert!(bad.expect_err("nonzero over zero remains unresolved").to_string().contains("unresolved"));
+}

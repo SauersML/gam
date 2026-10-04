@@ -366,10 +366,13 @@ pub struct BlockError {
     pub row: usize,
     /// Row attaining the largest certified lower bound.
     pub lower_row: usize,
+    /// Outward comparison error including the native RMS denominator enclosure.
+    /// Covers the final subtraction and norm, not either neural forward computation.
     pub numerical_error: f64,
     /// Envelope of the true per-row maximum, with comparison rounding included.
     pub lower: f64,
     pub upper: f64,
+    /// Reported binary64 center of the native RMS scale; its uncertainty is included above.
     pub scale: f64,
 }
 
@@ -465,24 +468,77 @@ pub struct Local<'a> {
     pub ascent: Option<Ascent>,
     /// Rows executed at once (whole units).
     pub batch_rows: usize,
-    scales: Mutex<BTreeMap<usize, f64>>,
+    scales: Mutex<BTreeMap<usize, [f64;3]>>,
     device: Option<(gam_gpu::tensor::Device, usize)>,
     native_device: Option<super::artifact_device::Resident>,
     resident_norms: bool,
 }
 
-/// Per row, `‖d_row‖₂` and the rounding of computing it from the two executed writes: the
-/// difference rounds once per entry, the sum of `w` squares within `γ_w`, the root and the scaling
-/// once each, so the computed norm is within `γ_{w+4}` of the norm of the exact difference.
-fn row_norms(values: &Array2<f64>, columns: std::ops::Range<usize>, scale: f64) -> Vec<(f64, f64)> {
-    let growth = accumulation_growth(columns.len() + 4);
-    values
-        .outer_iter()
-        .map(|row| {
-            let norm = row.slice(s![columns.clone()]).iter().map(|v| v * v).sum::<f64>().sqrt() / scale;
-            (norm, (growth * norm).next_up())
-        })
-        .collect()
+/// Bounds concern the supplied binary64 writes and their final rounded subtraction,
+/// under IEEE RN with gradual underflow; they do not enclose neural-forward error.
+/// Max rescaling keeps at least one normalized squared term equal to one.
+fn compared_norm(bounds: [f64; 3]) -> Result<(f64, f64), String> {
+    let [value, lo, hi] = bounds;
+    if hi == 0.0 { return Ok((0.0, 0.0)); }
+    // Subtraction of finite binary64 operands has relative error <= u unless
+    // exact; subnormal subtraction is exact. Use epsilon >= u conservatively.
+    let lower = (lo / (1.0 + f64::EPSILON)).next_down().max(0.0);
+    let upper = (hi / (1.0 - f64::EPSILON)).next_up();
+    let error = (value - lower).max(upper - value).next_up();
+    if !value.is_finite() || !error.is_finite() { return Err("Local norm enclosure unbounded: unresolved".into()); }
+    Ok((value, error))
+}
+
+fn row_norms(values: &Array2<f64>, columns: std::ops::Range<usize>, scale: [f64;3]) -> Result<Vec<(f64, f64)>, String> {
+    values.outer_iter().map(|row| {
+        let entries: Vec<_> = row.slice(s![columns.clone()]).iter().copied().collect();
+        compared_norm(gam_gpu::tensor::Device::row_l2_enclosure(&entries, scale).map_err(|e|e.to_string())?)
+    }).collect()
+}
+
+#[derive(Default)]
+struct ScaleAccumulator {
+    maximum: f64,
+    sum: f64,
+    lower: f64,
+    upper: f64,
+}
+impl ScaleAccumulator {
+    fn add(&mut self, value: f64) -> Result<(), String> {
+        if !value.is_finite() { return Err("nonfinite native scale input: unresolved".into()); }
+        let value = value.abs();
+        if value == 0.0 { return Ok(()); }
+        if value > self.maximum {
+            if self.maximum == 0.0 {
+                self.sum = 0.0; self.lower = 0.0; self.upper = 0.0;
+            } else {
+                let q = self.maximum / value;
+                let qlo = q.next_down().max(0.0); let qhi = q.next_up();
+                self.sum *= q * q;
+                self.lower = (self.lower * (qlo*qlo).next_down().max(0.0)).next_down().max(0.0);
+                self.upper = (self.upper * (qhi*qhi).next_up()).next_up();
+            }
+            self.maximum = value;
+        }
+        let q = value / self.maximum;
+        let qlo = q.next_down().max(0.0); let qhi = q.next_up();
+        self.sum += q*q;
+        self.lower = (self.lower + (qlo*qlo).next_down().max(0.0)).next_down().max(0.0);
+        self.upper = (self.upper + (qhi*qhi).next_up()).next_up();
+        Ok(())
+    }
+    fn rms(&self, rows: usize) -> Result<[f64;3], String> {
+        if rows == 0 || rows > (1_u64 << 53) as usize { return Err("native scale row count is empty or not exact binary64: unresolved".into()); }
+        if self.maximum == 0.0 { return Ok([0.0;3]); }
+        let rows = rows as f64;
+        let center = self.maximum * (self.sum / rows).sqrt();
+        let lower = (self.maximum * (self.lower/rows).next_down().max(0.0).sqrt().next_down().max(0.0)).next_down().max(0.0);
+        let upper = (self.maximum * (self.upper/rows).next_up().sqrt().next_up()).next_up();
+        if !center.is_finite() || !lower.is_finite() || !upper.is_finite() || lower > center || center > upper {
+            return Err("native RMS scale enclosure unbounded: unresolved".into());
+        }
+        Ok([center,lower,upper])
+    }
 }
 
 impl<'a> Local<'a> {
@@ -543,28 +599,25 @@ impl<'a> Local<'a> {
 
     /// The declared scale of native node `node`: the root mean square of its row norms on the
     /// declared family.
-    pub fn scale(&self, node: usize) -> Result<f64, String> {
-        if let Some(scale) = self.scales.lock().map_err(|e| e.to_string())?.get(&node) {
-            return Ok(*scale);
-        }
+    pub fn scale(&self, node: usize) -> Result<f64, String> { Ok(self.scale_enclosure(node)?[0]) }
+
+    fn scale_enclosure(&self, node: usize) -> Result<[f64;3], String> {
+        if let Some(scale) = self.scales.lock().map_err(|e|e.to_string())?.get(&node) { return Ok(*scale); }
         let mut program = self.model.clone();
         program.output = node;
         program.prune();
-        let mut total = 0.0;
+        let mut accumulator = ScaleAccumulator::default();
         for rows in batches(&units(&self.family), self.batch_rows) {
-            let trace = program.execute(&self.family.select(&rows), false).map_err(|e| e.to_string())?;
-            total += trace.values[program.output].iter().map(|v| v * v).sum::<f64>();
+            let trace = program.execute(&self.family.select(&rows), false).map_err(|e|e.to_string())?;
+            for value in &trace.values[program.output] { accumulator.add(*value)?; }
         }
-        let scale = (total / self.family.rows.max(1) as f64).sqrt();
-        if !(scale > 0.0 && scale.is_finite()) {
-            return Err(format!("native node {node} is zero on the declared family: no scale"));
-        }
-        self.scales.lock().map_err(|e| e.to_string())?.insert(node, scale);
+        let scale = accumulator.rms(self.family.rows)?;
+        self.scales.lock().map_err(|e|e.to_string())?.insert(node, scale);
         Ok(scale)
     }
 
-    fn block_scales(&self, artifact: &Artifact) -> Result<Vec<f64>, String> {
-        artifact.blocks.iter().map(|b| self.scale(b.native_write)).collect()
+    fn block_scales(&self, artifact: &Artifact) -> Result<Vec<[f64;3]>, String> {
+        artifact.blocks.iter().map(|b| self.scale_enclosure(b.native_write)).collect()
     }
 
     /// Per block, per row of `family`, the error and its rounding, from the grafted program.
@@ -572,7 +625,7 @@ impl<'a> Local<'a> {
         &self,
         local: &Artifact,
         columns: &[std::ops::Range<usize>],
-        scales: &[f64],
+        scales: &[[f64;3]],
         family: &FamilyInputs,
     ) -> Result<Vec<Vec<(f64, f64)>>, String> {
         let mut out = vec![vec![(0.0, 0.0); family.rows]; columns.len()];
@@ -592,18 +645,17 @@ impl<'a> Local<'a> {
                 let output = resident.output_ref(&trace)?;
                 if self.resident_norms {
                     columns.iter().zip(scales).map(|(columns, scale)| {
-                        let growth = accumulation_growth(columns.len() + 4);
-                        Ok(device.scaled_row_l2(output, columns.clone(), *scale).map_err(|e| e.to_string())?
-                            .into_iter().map(|norm| (norm, (growth * norm).next_up())).collect::<Vec<_>>())
+                        device.scaled_row_l2_enclosed(output, columns.clone(), *scale).map_err(|e|e.to_string())?
+                            .into_iter().map(compared_norm).collect::<Result<Vec<_>,String>>()
                     }).collect::<Result<Vec<_>, String>>()?
                 } else {
                     let values = device.download(output).map_err(|e| e.to_string())?;
-                    columns.iter().zip(scales).map(|(columns, scale)| row_norms(&values, columns.clone(), *scale)).collect()
+                    columns.iter().zip(scales).map(|(columns, scale)| row_norms(&values, columns.clone(), *scale)).collect::<Result<Vec<_>,String>>()?
                 }
             } else {
                 let trace = local.execute(&selected)?;
                 let values = &trace.values[local.program.output];
-                columns.iter().zip(scales).map(|(columns, scale)| row_norms(values, columns.clone(), *scale)).collect()
+                columns.iter().zip(scales).map(|(columns, scale)| row_norms(values, columns.clone(), *scale)).collect::<Result<Vec<_>,String>>()?
             };
             for (b, errors) in errors.into_iter().enumerate() {
                 for (row, error) in rows.iter().zip(errors) {
@@ -628,7 +680,7 @@ impl<'a> Local<'a> {
             .iter()
             .zip(errors)
             .zip(&scales)
-            .map(|((binding, rows), scale)| BlockError::from_rows(binding.name.clone(), &rows, *scale))
+            .map(|((binding, rows), scale)| BlockError::from_rows(binding.name.clone(), &rows, scale[0]))
             .collect::<Result<Vec<_>, String>>()?;
         Ok(LocalMeasure { blocks, rows: family.rows, family_rows: declared, counterexamples })
     }
@@ -670,7 +722,7 @@ impl<'a> Local<'a> {
         &self,
         local: &OperatorProgram,
         columns: &[std::ops::Range<usize>],
-        scales: &[f64],
+        scales: &[[f64;3]],
         family: &FamilyInputs,
     ) -> Result<Vec<(f64, f64, usize, usize)>, String> {
         let local = Artifact::native(local)?;
@@ -718,7 +770,7 @@ impl<'a> Local<'a> {
                     continue;
                 }
                 for c in range {
-                    seed[[*row, c]] = output[[*row, c]] / (norm * scales[*block]);
+                    seed[[*row, c]] = output[[*row, c]] / (norm * scales[*block][0]);
                 }
                 let gradients = slot_gradients(&flat, &family, &trace, seed)?;
                 let proposals = candidates(&ascent.domain, unit, &gradients, ascent.evaluations)?;

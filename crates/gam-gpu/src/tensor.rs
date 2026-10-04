@@ -591,31 +591,62 @@ impl Device {
         Array2::from_shape_vec((t.rows, t.cols), flat).map_err(|e| shape(e.to_string()))
     }
 
-    /// One scaled Euclidean norm per row over `columns`. Only the row results
-    /// leave CUDA. Accumulate squares in column order with separate binary64
-    /// multiply/add, then sqrt and division; this deliberately preserves the
-    /// host comparison's arithmetic instead of using a parallel/FMA reduction.
-    /// This is a measurement of the supplied values, not a forward-error bound.
-    /// Refuses nonfinite results and backends without binary64 support.
-    pub fn scaled_row_l2(&self, values: &Tensor, columns: std::ops::Range<usize>, scale: f64) -> Result<Vec<f64>, GpuError> {
-        if columns.start > columns.end || columns.end > values.cols || !scale.is_finite() || scale <= 0.0 {
-            return Err(shape("invalid row norm columns or scale".into()));
+    /// Enclose the scaled norm of supplied binary64 values under IEEE round-to-nearest,
+    /// gradual underflow. `scale` is [reported value, lower, upper]. No neural-forward
+    /// error is covered. Exact zero / zero is zero; nonzero / a scale containing zero
+    /// is unresolved (an error), with no substitute denominator.
+    pub fn row_l2_enclosure(values: &[f64], scale: [f64; 3]) -> Result<[f64; 3], GpuError> {
+        if scale.iter().any(|v| !v.is_finite() || *v < 0.0) || scale[1] > scale[0] || scale[0] > scale[2] || values.iter().any(|v| !v.is_finite()) {
+            return Err(shape("invalid finite row norm values or scale enclosure".into()));
         }
-        let norms: Vec<f64> = match (&*self.backend, &values.data) {
-            (Backend::Host, Data::Host(data)) => (0..values.rows).map(|row| {
-                data[row * values.cols + columns.start..row * values.cols + columns.end]
-                    .iter().map(|v| v * v).sum::<f64>().sqrt() / scale
-            }).collect(),
+        let maximum = values.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        if maximum == 0.0 { return Ok([0.0; 3]); }
+        if scale[1] == 0.0 { return Err(shape("nonzero row norm over native scale containing zero: unresolved".into())); }
+        let (mut sum, mut lo, mut hi) = (0.0, 0.0, 0.0);
+        for value in values {
+            let value = value.abs();
+            if value == 0.0 { continue; }
+            let q = value / maximum;
+            let qlo = q.next_down().max(0.0);
+            let qhi = q.next_up();
+            sum += q * q;
+            lo = (lo + (qlo * qlo).next_down().max(0.0)).next_down().max(0.0);
+            hi = (hi + (qhi * qhi).next_up()).next_up();
+        }
+        let center = (maximum / scale[0]) * sum.sqrt();
+        let lower = (((maximum / scale[2]).next_down().max(0.0)) * lo.sqrt().next_down().max(0.0)).next_down().max(0.0);
+        let upper = ((maximum / scale[1]).next_up() * hi.sqrt().next_up()).next_up();
+        if !center.is_finite() || !lower.is_finite() || !upper.is_finite() || lower > center || center > upper {
+            return Err(shape("unbounded row norm enclosure: unresolved".into()));
+        }
+        Ok([center, lower, upper])
+    }
+
+    /// Max-rescaled, outward-enclosed row norms. Only three scalars per row leave CUDA.
+    /// The CPU and CUDA reductions use the same column order; interval endpoints may
+    /// differ because CUDA uses directed arithmetic and CPU steps outward after RN.
+    pub fn scaled_row_l2_enclosed(&self, values: &Tensor, columns: std::ops::Range<usize>, scale: [f64; 3]) -> Result<Vec<[f64; 3]>, GpuError> {
+        if columns.start > columns.end || columns.end > values.cols || scale.iter().any(|v| !v.is_finite() || *v < 0.0) || scale[1] > scale[0] || scale[0] > scale[2] {
+            return Err(shape("invalid row norm columns or scale enclosure".into()));
+        }
+        let norms: Vec<[f64; 3]> = match (&*self.backend, &values.data) {
+            (Backend::Host, Data::Host(data)) => (0..values.rows).map(|row| Self::row_l2_enclosure(&data[row * values.cols + columns.start..row * values.cols + columns.end], scale)).collect::<Result<_,_>>()?,
             #[cfg(target_os = "linux")]
-            (Backend::Cuda(engine), Data::Cuda(_)) => engine.scaled_row_l2(values, columns, scale)?,
+            (Backend::Cuda(engine), Data::Cuda(_)) => engine.scaled_row_l2_enclosed(values, columns, scale)?,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             _ => return Err(shape("row norms require matching host or CUDA binary64 tensors".into())),
         };
-        if norms.iter().any(|v| !v.is_finite()) {
-            return Err(shape("nonfinite row norm".into()));
+        if norms.iter().any(|v| v.iter().any(|x| !x.is_finite() || *x < 0.0) || v[1] > v[0] || v[0] > v[2]) {
+            return Err(shape("unbounded row norm enclosure: unresolved".into()));
         }
         Ok(norms)
     }
+
+    /// Robust scaled Euclidean row norms; see `scaled_row_l2_enclosed` for bounds.
+    pub fn scaled_row_l2(&self, values: &Tensor, columns: std::ops::Range<usize>, scale: f64) -> Result<Vec<f64>, GpuError> {
+        Ok(self.scaled_row_l2_enclosed(values, columns, [scale;3])?.into_iter().map(|v|v[0]).collect())
+    }
+
 
     pub fn zeros(&self, rows: usize, cols: usize) -> Result<Tensor, GpuError> {
         let data = match &*self.backend {
@@ -1766,16 +1797,34 @@ extern "C" __global__ void axpy(u64 n, double alpha, const double* x, double* y)
     GRID_STRIDE(i, n) y[i] += alpha * x[i];
 }
 
-extern "C" __global__ void scaled_row_l2(u64 rows, u64 cols, u64 begin, u64 end, double scale,
-    const double* x, double* out) {
+extern "C" __global__ void scaled_row_l2(u64 rows, u64 cols, u64 begin, u64 end,
+    double scale, double scale_lo, double scale_hi, const double* x, double* out) {
     for (u64 row = blockIdx.x * (u64)blockDim.x + threadIdx.x; row < rows; row += gridDim.x * (u64)blockDim.x) {
-        // Rust's Sum<f64> starts at negative zero (also observable for an empty range).
-        double sum = -0.0;
+        double maximum = 0.0;
+        bool finite = true;
         for (u64 col = begin; col < end; ++col) {
             double v = x[row * cols + col];
-            sum = __dadd_rn(sum, __dmul_rn(v, v));
+            finite = finite && isfinite(v);
+            maximum = fmax(maximum, fabs(v));
         }
-        out[row] = __ddiv_rn(__dsqrt_rn(sum), scale);
+        if (!finite || (maximum != 0.0 && scale_lo == 0.0)) {
+            out[3*row] = out[3*row+1] = out[3*row+2] = __longlong_as_double(0x7ff8000000000000LL);
+            continue;
+        }
+        if (maximum == 0.0) { out[3*row] = out[3*row+1] = out[3*row+2] = 0.0; continue; }
+        double sum = 0.0, lo = 0.0, hi = 0.0;
+        for (u64 col = begin; col < end; ++col) {
+            double v = fabs(x[row * cols + col]);
+            if (v == 0.0) continue;
+            double q = __ddiv_rn(v, maximum);
+            double qlo = __ddiv_rd(v, maximum), qhi = __ddiv_ru(v, maximum);
+            sum = __dadd_rn(sum, __dmul_rn(q, q));
+            lo = __dadd_rd(lo, __dmul_rd(qlo, qlo));
+            hi = __dadd_ru(hi, __dmul_ru(qhi, qhi));
+        }
+        out[3*row] = __dmul_rn(__ddiv_rn(maximum, scale), __dsqrt_rn(sum));
+        out[3*row+1] = __dmul_rd(__ddiv_rd(maximum, scale_hi), __dsqrt_rd(lo));
+        out[3*row+2] = __dmul_ru(__ddiv_ru(maximum, scale_lo), __dsqrt_ru(hi));
     }
 }
 
@@ -2758,18 +2807,17 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             self.stream.clone_dtoh(slice).gpu_ctx("tensor download")
         }
 
-        pub(super) fn scaled_row_l2(&self, values: &Tensor, columns: std::ops::Range<usize>, scale: f64) -> Result<Vec<f64>, GpuError> {
+        pub(super) fn scaled_row_l2_enclosed(&self, values: &Tensor, columns: std::ops::Range<usize>, scale: [f64;3]) -> Result<Vec<[f64;3]>, GpuError> {
             if values.rows == 0 { return Ok(Vec::new()); }
-            let mut out = self.zeros(values.rows)?;
+            let mut out = self.zeros(values.rows.checked_mul(3).ok_or_else(||shape("row norm output size overflow".into()))?)?;
             let (rows, cols, begin, end) = (values.rows as u64, values.cols as u64, columns.start as u64, columns.end as u64);
             let f = self.function("scaled_row_l2")?;
-            // SAFETY: validated column range; each thread reads one row and
-            // writes a distinct element of the rows-long output buffer.
+            // SAFETY: validated input columns; each thread writes three scalars in its distinct output row.
             unsafe {
-                self.stream.launch_builder(&f).arg(&rows).arg(&cols).arg(&begin).arg(&end).arg(&scale)
+                self.stream.launch_builder(&f).arg(&rows).arg(&cols).arg(&begin).arg(&end).arg(&scale[0]).arg(&scale[1]).arg(&scale[2])
                     .arg(slice(values)?).arg(&mut out).launch(cfg_elements(rows))
-            }.gpu_ctx("tensor scaled_row_l2")?;
-            self.download(&out)
+            }.gpu_ctx("tensor scaled_row_l2 enclosed")?;
+            Ok(self.download(&out)?.chunks_exact(3).map(|v|[v[0],v[1],v[2]]).collect())
         }
 
         pub(super) fn zeros(&self, n: usize) -> Result<CudaSlice<f64>, GpuError> {
@@ -4817,6 +4865,27 @@ mod scaled_row_l2_tests {
     }
 
     #[test]
+    fn enclosed_norms_handle_tiny_large_zero_and_subnormal_rows() {
+        let mut devices=vec![Device::host()];
+        if let Some(device)=Device::accelerator(crate::GpuPolicy::Auto).expect("device probe") {
+            if device.float64() {devices.push(device);}
+        }
+        for device in devices {
+            for amplitude in [2.0_f64.powi(-1000),1e-200,1.0,1e200] {
+                let input=device.upload_vec(1,2,vec![3.0*amplitude,4.0*amplitude]).expect("fixture upload");
+                let bounds=device.scaled_row_l2_enclosed(&input,0..2,[amplitude;3]).expect("finite enclosure")[0];
+                assert!(bounds[1]<=5.0 && bounds[2]>=5.0,"{} {amplitude} {bounds:?}",device.name());
+            }
+            let zero=device.zeros(1,2).expect("zero fixture");
+            assert_eq!(device.scaled_row_l2_enclosed(&zero,0..2,[0.0;3]).expect("zero/zero"),vec![[0.0;3]]);
+            let nonzero=device.upload_vec(1,1,vec![f64::from_bits(1)]).expect("minimum subnormal");
+            let bounds=device.scaled_row_l2_enclosed(&nonzero,0..1,[f64::from_bits(1);3]).expect("subnormal ratio")[0];
+            assert!(bounds[1]<=1.0 && bounds[2]>=1.0);
+            assert!(device.scaled_row_l2_enclosed(&nonzero,0..1,[0.0;3]).is_err());
+        }
+    }
+
+    #[test]
     fn invalid_ranges_scales_and_nonfinite_reductions_are_errors() {
         let device = Device::host();
         let input = device.upload_vec(1, 3, vec![3.0, 4.0, f64::NAN]).unwrap();
@@ -4825,7 +4894,7 @@ mod scaled_row_l2_tests {
         for range in [2..1, 0..4, usize::MAX..usize::MAX] { assert!(device.scaled_row_l2(&input, range, 1.0).is_err()); }
         for scale in [0.0, -1.0, f64::NAN, f64::INFINITY] { assert!(device.scaled_row_l2(&input, 0..2, scale).is_err()); }
         let overflow = device.upload_vec(1, 1, vec![f64::MAX]).unwrap();
-        assert!(device.scaled_row_l2(&overflow, 0..1, 1.0).is_err());
+        assert!(device.scaled_row_l2(&overflow, 0..1, 1.0).is_err()); // upper endpoint overflows: unresolved, never a fabricated bound
     }
 }
 
