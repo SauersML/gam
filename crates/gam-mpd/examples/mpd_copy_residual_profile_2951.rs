@@ -1,7 +1,9 @@
 //! Bounded backend diagnostic, not a head/rank quality selection or bank generation.
 //! EXPORT OUT max_bank=193 layer=3 head=5 rank=64 repeats=2
 use gam_mpd::acceptance::{CostCache, structural_cost};
-use gam_mpd::artifact::Artifact;
+use gam_mpd::artifact::{Artifact, EncodedArtifact};
+use gam_mpd::operator_program::NativeOperatorCodec;
+use gam_mpd::precision::DecodableArtifact;
 use gam_mpd::coder_capture::sha256;
 use gam_mpd::import::import_language_model;
 use gam_mpd::proposals::{CopyResidualBank, CopyResidualChoice, HeadApproximation};
@@ -21,14 +23,15 @@ fn write_json(path: &Path, value: &Value) -> Result<(),String> {
 fn main() -> Result<(),String> {
     gam_mpd::engine::log_to_stderr();
     let args:Vec<String>=std::env::args().skip(1).collect();
-    if args.len()!=7 { return Err("EXPORT OUT max_bank=N layer=N head=N rank=N repeats=N".into()); }
+    if !(7..=8).contains(&args.len()) { return Err("EXPORT OUT max_bank=N layer=N head=N rank=N repeats=N [codec_bytes=N]".into()); }
     let mut options=BTreeMap::new();
     for arg in &args[2..] {
         let (k,v)=arg.split_once('=').ok_or("expected KEY=VALUE")?;
-        if !["max_bank","layer","head","rank","repeats"].contains(&k) || options.insert(k,v).is_some() { return Err("unknown/duplicate option".into()); }
+        if !["max_bank","layer","head","rank","repeats","codec_bytes"].contains(&k) || options.insert(k,v).is_some() { return Err("unknown/duplicate option".into()); }
     }
     let number=|k|->Result<usize,String>{options.get(k).ok_or("missing option")?.parse().map_err(|e|format!("{e}"))};
     let (max_bank,layer,head,rank,repeats)=(number("max_bank")?,number("layer")?,number("head")?,number("rank")?,number("repeats")?);
+    let codec_bytes=options.get("codec_bytes").unwrap_or(&"0").parse::<usize>().map_err(|e|e.to_string())?;
     if repeats==0 || repeats>2 || !RANKS.contains(&rank) { return Err("declare one/two diagnostic repetitions and a rank in8,32,64,96".into()); }
     let (export,out)=(Path::new(&args[0]),Path::new(&args[1]));
     let export_json=export.join("export.json");
@@ -43,7 +46,7 @@ fn main() -> Result<(),String> {
     std::fs::create_dir_all(out).map_err(|e|e.to_string())?;
     let scope=json!({"kind":"backend profiling only; no quality evaluation or head selection","all_heads":24,"declared_ranks":RANKS,
         "families":["CopyResidual","NativeSvd"],"complete_cardinality_including_native":count,"selected_diagnostic":{"layer":layer,"head":head,"rank":rank},
-        "repetitions":repeats,"artifacts_materialized_as_bank":0,"quality_measured":false,"quality_unresolved_including_native":count,
+        "repetitions":repeats,"codec_bytes":codec_bytes,"artifacts_materialized_as_bank":0,"quality_measured":false,"quality_unresolved_including_native":count,
         "retention":"every declared alternative remains unmeasured for quality; no singleton or rank pruning","timing":"host composition/f32, coverage, encode, independent decode, coverage, reencode, pre/post exact C32; no Local/Run metrics"});
     write_json(&out.join("SCOPE.json"),&scope)?;
     let mut source_hashes=BTreeMap::new();
@@ -61,7 +64,8 @@ fn main() -> Result<(),String> {
         "binary_sha256":sha256(&std::env::current_exe().map_err(|e|e.to_string())?)?}))?;
     let start=Instant::now();
     let imported=import_language_model(export,1,1)?;let native=split_sites(&imported.program)?;
-    let nodes=layer_nodes(&native,layers)?;let base=Artifact::native(&native)?;
+    let nodes=layer_nodes(&native,layers)?;let base=Artifact::native(&native)?.f32_literals()?;
+    let native_codec=if codec_bytes==0 {None} else {Some(NativeOperatorCodec::new(&base.program,codec_bytes).map_err(|e|e.to_string())?)};
     let bank=CopyResidualBank::new(&base,&nodes,heads/kv_heads,&RANKS,max_bank)?;
     let mut cache=CostCache::default();let native_cost=structural_cost(&base,&mut cache)?;
     write_json(&out.join("NATIVE_COST.json"),&json!({"cost":native_cost,"C32_bits":native_cost.total(),"import_and_native_cost_seconds":start.elapsed().as_secs_f64(),"peak_rss_bytes":peak_rss_bytes()}))?;
@@ -72,8 +76,24 @@ fn main() -> Result<(),String> {
         for family in order {
             let choice=CopyResidualChoice{layer,head,rank,family};eprintln!("diagnostic start repeat={repeat} choice={choice:?}");
             let started=Instant::now();let (decoded,cost,wire,timing)=bank.checked_profiled(choice,&mut cache)?;
-            let value=json!({"repeat":repeat,"choice":choice,"C32":cost,"C32_bits":cost.total(),"exact_wire_bytes":wire,"staged_seconds":timing,
-                "total_checked_seconds":started.elapsed().as_secs_f64(),"peak_rss_bytes":peak_rss_bytes(),"retained_native_places":decoded.places.len(),
+            let original_seconds=started.elapsed().as_secs_f64();
+            let codec_profile=if let Some(codec)=&native_codec {
+                let t=Instant::now();let candidate=bank.candidate(choice)?.f32_literals()?;
+                let prepare=t.elapsed().as_secs_f64();
+                let t=Instant::now();let encoded=EncodedArtifact::of_with_native_codec(&candidate,codec)?;
+                let encode=t.elapsed().as_secs_f64();
+                let t=Instant::now();let reused=encoded.using_native_codec(codec).decode()?;
+                let decode=t.elapsed().as_secs_f64();
+                let t=Instant::now();let post_cost=structural_cost(&reused,&mut CostCache::default())?;
+                let decoded_cost=t.elapsed().as_secs_f64();
+                if post_cost!=cost || reused!=decoded {return Err("cached profile changed decoded artifact or C32".into());}
+                let t=Instant::now();let ordinary=EncodedArtifact::of(&candidate)?;
+                let ordinary_encode=t.elapsed().as_secs_f64();
+                if ordinary.message!=encoded.message {return Err("cached profile changed standalone message".into());}
+                Some(json!({"candidate_prepare_seconds":prepare,"encode_seconds":encode,"decode_seconds":decode,"decoded_cost_seconds":decoded_cost,"ordinary_encode_seconds":ordinary_encode,"exact_message_and_decoded_artifact_equal":true,"stats":codec.stats(),"usage":codec.usage()}))
+            } else {None};
+            let value=json!({"codec_profile":codec_profile,"repeat":repeat,"choice":choice,"C32":cost,"C32_bits":cost.total(),"exact_wire_bytes":wire,"staged_seconds":timing,
+                "total_checked_seconds":original_seconds,"peak_rss_bytes":peak_rss_bytes(),"retained_native_places":decoded.places.len(),
                 "decoded_coverage":true,"numeric_projection":"independent f32 literals; exact architecture epsilon preserved","quality_assessed":false});
             writeln!(file,"{value}").map_err(|e|e.to_string())?;file.flush().map_err(|e|e.to_string())?;
             println!("{value}");drop(decoded);
