@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Keep our jobs on the shared MATS node within the team's budget (#2951). Run on the login node:
 #   nohup bash budget.sh >> ~/budget.log 2>&1 &
-# Every minute, our running jobs plus the pending jobs it lets through stay within CPU_CAP CPUs and
+# Every minute, our running jobs plus the pending jobs it lets through stay within CPU_CAP CPUs (the per-user QOS limit) and
 # GPU_CAP GPUs; it holds our pending jobs beyond that, and releases them smallest first (then in
 # submission order) when room appears, so one agent's queue of large jobs can't block everyone
 # else's. GPUs that sit free while no other user has a GPU job waiting are ours to use too, so idle
 # GPUs get used and are never taken from someone waiting for one. Jobs held by anything else
 # (an agent's own hold) are left alone.
 set -uo pipefail
-CPU_CAP=${CPU_CAP:-100}
-GPU_CAP=${GPU_CAP:-3}
+CPU_CAP=${CPU_CAP:-124}
+GPU_CAP=${GPU_CAP:-4}
 held=$HOME/budget_held.txt
 touch "$held"
 gpus_of() { grep -oE 'gpu(:[a-z0-9]+)?:[0-9]+' <<< "$1" | grep -oE '[0-9]+$' | head -1; }

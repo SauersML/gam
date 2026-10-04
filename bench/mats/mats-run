@@ -57,12 +57,12 @@ NAME=$1 CPUS=$2 MEM=$3 HOURS=$4
 shift 5
 [[ $NAME =~ ^[A-Za-z0-9._-]+$ ]] || { echo "mats-run: NAME must be [A-Za-z0-9._-]+" >&2; exit 2; }
 [[ $CPUS =~ ^[0-9]+$ ]] && (( CPUS >= 1 && CPUS <= 124 )) || { echo "mats-run: CPUS must be 1..124" >&2; exit 2; }
-# Shared-cluster budget: the whole team stays within 100 CPUs (running + pending not held, every QOS), so
+# Shared-cluster budget: the whole team stays within 124 CPUs (the per-user QOS limit) (running + pending not held, every QOS), so
 # other users' jobs can start; mats:~/budget.sh holds the rest and releases them as room appears. MATS_OVER_BUDGET=1 overrides only when the node is otherwise idle.
 if [ "${MATS_DRY:-0}" != 1 ] && [ "${MATS_OVER_BUDGET:-0}" != 1 ]; then
     used=$(ssh mats 'squeue -u $USER -h -o "%C %r" | awk "\$2 != \"JobHeldUser\" {s += \$1} END {print s + 0}"' 2>/dev/null)
-    if [[ $used =~ ^[0-9]+$ ]] && (( used + CPUS > 100 )); then
-        echo "mats-run: refused, the team already holds or queues $used CPUs; $CPUS more would pass the 100-CPU budget" >&2
+    if [[ $used =~ ^[0-9]+$ ]] && (( used + CPUS > 124 )); then
+        echo "mats-run: refused, the team already holds or queues $used CPUs; $CPUS more would pass the 124-CPU budget" >&2
         exit 3
     fi
 fi
