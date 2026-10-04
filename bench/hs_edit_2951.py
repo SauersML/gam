@@ -40,7 +40,7 @@ Stages (outputs in ~/mpd-data/frontier/hs_edit/):
            there, what its write promotes through the unembedding, and its validation effect by HellaSwag source and
            category and against ending length (after the final harness run)
 
-usage: MPD_MEM_GIB=6 venv/python hs_edit_2951.py search | explain
+usage: MPD_MEM_GIB=10 venv/python hs_edit_2951.py search | explain
 """
 import hashlib
 import json
@@ -139,7 +139,7 @@ class Model:
                 out[idx, 0] = self.shares(self.final.after(y0), rows, pos, toks, golds).cpu().numpy()
                 for k, edit in enumerate(edits):
                     out[idx, 1 + k] = self.shares(self.final.after(y0 + edit(g2)), rows, pos, toks, golds).cpu().numpy()
-                E.empty_cache()
+                    E.empty_cache()
         return out
 
     def gradient(self, split):
@@ -243,7 +243,10 @@ def stage_search():
     fit, select, confirm = items()
     log(f"{len(fit)} fit, {len(select)} select, {len(confirm)} confirm items")
     m = Model()
-    G = m.gradient(fit)
+    if not (OUT / "G.npy").exists():  # resumable: the fit gradient is the search's one long backward pass
+        np.save(OUT / "G.npy", m.gradient(fit))
+        E.empty_cache()
+    G = np.load(OUT / "G.npy")
     s = np.einsum("cd,de,ce->c", U, G, V)
     log(f"gradient: |G| {np.linalg.norm(G):.4g}; first-order gains: max {s.max():+.4f}, min {s.min():+.4f}")
     res = {"protocol": __doc__, "n": [len(fit), len(select), len(confirm)]}
