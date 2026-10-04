@@ -675,10 +675,13 @@ fn context_key(tokens: &[u32], columns: usize, word: &Word, n: usize) -> Option<
 }
 
 /// The context a group's words share and every word that context makes the model assert the
-/// group's token at: the longest last-`n`-token context a majority of the group's words end with,
-/// and every word ending with it whose top token is `token` (the group's own words when no
-/// context is shared by a majority).
-fn assemble(scanned: &Scanned, tokens: &[u32], columns: usize, picked: &std::collections::BTreeSet<usize>, token: u32) -> (Vec<u32>, Vec<usize>) {
+/// group's token at. The trigger is the longest last-`n`-token context a majority of the group's
+/// words end with; the firing words are those ending with the last `m ≤ n` of its tokens whose
+/// top token is `token`, `m` the context rule of the most evidence net of its description (a
+/// shorter context reaches the occurrences the longer one's extra tokens miss, and costs the
+/// words where the shorter context does not switch the model). The group's own words when no
+/// context is shared by a majority.
+fn assemble(scanned: &Scanned, tokens: &[u32], columns: usize, vocab: usize, picked: &std::collections::BTreeSet<usize>, token: u32) -> (Vec<u32>, Vec<usize>) {
     let words = &scanned.words;
     let mut trigger = Vec::new();
     for n in 1..=32 {
@@ -696,10 +699,20 @@ fn assemble(scanned: &Scanned, tokens: &[u32], columns: usize, picked: &std::col
     if trigger.is_empty() {
         return (trigger, picked.iter().copied().collect());
     }
-    let firing = (0..words.len())
-        .filter(|&w| words[w].top == token && context_key(tokens, columns, &words[w], trigger.len()).as_deref() == Some(&trigger[..]))
-        .collect();
-    (trigger, firing)
+    let asserting: Vec<usize> = (0..words.len()).filter(|&w| words[w].top == token).collect();
+    let mut best: (f64, Vec<usize>) = (f64::NEG_INFINITY, Vec::new());
+    for m in 1..=trigger.len() {
+        let suffix = &trigger[trigger.len() - m..];
+        let firing: Vec<usize> =
+            asserting.iter().copied().filter(|&w| context_key(tokens, columns, &words[w], m).as_deref() == Some(suffix)).collect();
+        let (expected, observed) =
+            firing.iter().fold((0.0, 0.0), |(e, o), &w| (e + words[w].confidence, o + f64::from(u8::from(words[w].label == token))));
+        let net = refuted(firing.len() as f64, expected, observed) - (m + 1) as f64 * (vocab as f64).log2();
+        if net > best.0 {
+            best = (net, firing);
+        }
+    }
+    (trigger, best.1)
 }
 
 /// The model's greedy continuation of each context `(sequence, position)` (the table row's tokens
@@ -857,7 +870,7 @@ fn detect(args: &[String]) -> Result<(), String> {
     let mut mechanism = json!({"schema": "mpd.planted-prediction/1", "firing_positions": [], "trigger": [], "behavior": []});
     let mut explained = json!(null);
     if let Some((first, picked, _)) = groups.first() {
-        let (trigger, mut firing) = assemble(&scanned, &tokens, columns, picked, first.token);
+        let (trigger, mut firing) = assemble(&scanned, &tokens, columns, vocab, picked, first.token);
         let mut continuations = Vec::new();
         for (g, (later, others, _)) in groups.iter().enumerate().skip(1) {
             let set: std::collections::BTreeSet<usize> = firing.iter().copied().collect();
