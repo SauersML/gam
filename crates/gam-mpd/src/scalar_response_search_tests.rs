@@ -94,7 +94,7 @@ fn exhausted_budget_keeps_every_unexplored_key_and_positive_gap() {
 }
 #[test]
 fn extreme_and_nonfinite_inputs_remain_unresolved() {
-    for x in [1e200, 1e-200, f64::INFINITY, f64::NAN] {
+    for x in [1e200, 1e-200, 1e-155, f64::INFINITY, f64::NAN] {
         let r = search(&[vec![x]], &[vec![1.0]], budget())
             .expect("numeric failures are evidence states");
         assert!(!r.complete_finite_inventory);

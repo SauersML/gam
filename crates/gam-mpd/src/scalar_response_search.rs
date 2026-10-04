@@ -85,7 +85,7 @@ fn valid(x: I) -> bool {
 }
 fn product(x: f64, y: f64) -> Result<I, String> {
     let raw = x * y;
-    if !raw.is_finite() || (x != 0.0 && y != 0.0 && raw == 0.0) {
+    if !raw.is_finite() || (x != 0.0 && y != 0.0 && raw.abs() < f64::MIN_POSITIVE) {
         return Err("overflow or underflow in fixed-response arithmetic".into());
     }
     let p = I::point(x).mul(I::point(y));
