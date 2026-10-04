@@ -80,7 +80,10 @@ fn main() -> Result<(), String> {
     drop(source_bytes);
     let pool_cost=structural_cost(&pool,&mut CostCache::default())?;
     let native_subsystem_cost=structural_cost(&native_subsystem(&native,&layers,&uses)?,&mut CostCache::default())?;
-    let base = Artifact::native(&native)?.f32_literals()?;
+    let native_message = Artifact::native(&native)?.f32_literals()?.to_bytes()?;
+    let base = Artifact::from_bytes(&native_message,&native.declarations)?;
+    if base.to_bytes()?!=native_message{return Err("native canonical wire replay mismatch".into());}
+    drop(native_message);
     let outputs=match &pool.program.nodes[pool.program.output]{gam_mpd::operator_program::Node::Concat{parts} if parts.len()==uses.len()=>parts.clone(),_=>return Err("pool must output declared per-use Concat".into())};
     let proposal=Proposal{program:pool.program,trainable:vec![],body_operators:vec![],outputs,uses:uses.clone()};
     let candidate=graft(&base,&native,&layers,&proposal)?;
@@ -91,7 +94,7 @@ fn main() -> Result<(), String> {
     std::fs::write(&artifact_path, &encoded).map_err(|e| e.to_string())?;
     // Read the actual saved bytes with the ordinary decoder before all fidelity work.
     let decoded = Artifact::from_bytes(&std::fs::read(&artifact_path).map_err(|e| e.to_string())?, &native.declarations)?;
-    if decoded != candidate || decoded.to_bytes()? != encoded { return Err("full graft ordinary replay mismatch".into()); }
+    if decoded.to_bytes()? != encoded { return Err("full graft ordinary replay mismatch".into()); }
     decoded.validate_coverage(&native)?;
     drop(encoded); drop(candidate);
     let mut costs = CostCache::default();
@@ -165,6 +168,11 @@ mod tests {
         }
         let bytes=candidate.to_bytes()?;let replay=Artifact::from_bytes(&bytes,&native.declarations)?;
         assert_eq!(replay.to_bytes()?,bytes);replay.validate_coverage(&native)?;
+        // Human-readable operator/rule labels are not part of the canonical wire.
+        assert_ne!(replay,candidate);
+        let decoded_native=Artifact::from_bytes(&Artifact::native(&native)?.f32_literals()?.to_bytes()?,&native.declarations)?;
+        let interner=gam_mpd::decoded_intern::DecodedOperatorInterner::new(&decoded_native)?;
+        drop(interner);
         assert_eq!(replay.program.execute(&input,false).map_err(|e|e.to_string())?.values[replay.program.output],trace.values[candidate.program.output]);
         Ok(())
     }
