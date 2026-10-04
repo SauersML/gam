@@ -214,6 +214,92 @@ pub struct HeadRules {
     firsts: std::collections::BTreeMap<(usize, usize, usize, usize), usize>,
 }
 
+/// Complete implicit Copy-subset bank. No mask is filtered by singleton fidelity.
+/// Stores metadata only; artifacts are built lazily in canonical layer/head order.
+pub struct CopyMasks<'a> {
+    start: &'a Artifact,
+    rules: HeadRules,
+    counts: Vec<usize>,
+    pub layer_candidates: usize,
+    pub joint_candidates: usize,
+}
+
+impl<'a> CopyMasks<'a> {
+    /// Cardinality guard runs before cloning layer metadata or building an artifact.
+    pub fn cardinalities(heads: impl IntoIterator<Item = usize>, max_layer: usize, max_joint: usize) -> Result<(usize, usize), String> {
+        let (mut local, mut joint, mut layers) = (0usize, 1usize, 0usize);
+        for heads in heads {
+            if heads == 0 { return Err("Copy masks require nonempty heads".into()); }
+            let count = 1usize.checked_shl(u32::try_from(heads).map_err(|_| "mask width overflow")?).ok_or("mask cardinality overflow")?;
+            local = local.checked_add(count).ok_or("layer bank cardinality overflow")?;
+            joint = joint.checked_mul(count).ok_or("joint bank cardinality overflow")?;
+            layers += 1;
+        }
+        if layers == 0 { return Err("Copy masks require nonempty layers".into()); }
+        if local > max_layer || joint > max_joint {
+            return Err(format!("complete Copy bank requires {local} layer masks and {joint} joint candidates; budgets are {max_layer}/{max_joint}"));
+        }
+        Ok((local, joint))
+    }
+
+    pub fn new(start: &'a Artifact, layers: &[LayerNodes], group: usize, max_layer: usize, max_joint: usize) -> Result<Self, String> {
+        let (layer_candidates, joint_candidates) = Self::cardinalities(layers.iter().map(|l| l.queries.len()), max_layer, max_joint)?;
+        if group == 0 || !start.derived.is_empty() || !start.blocks.is_empty() || !start.exceptions.is_empty() {
+            return Err("Copy masks require an unmodified native artifact and positive group".into());
+        }
+        for l in layers {
+            if l.queries.len() % group != 0 || l.keys.len() != l.queries.len() / group || l.values.len() != l.keys.len() {
+                return Err("inconsistent Copy head counts".into());
+            }
+        }
+        Ok(Self { start, rules: HeadRules { layers: layers.to_vec(), targets: Vec::new(), group, firsts: Default::default() },
+            counts: layers.iter().map(|l| 1usize << l.queries.len()).collect(), layer_candidates, joint_candidates })
+    }
+
+    /// Compose one mask per layer. Empty masks introduce neither derivations nor bindings.
+    /// Repeated heads in a layer merge into one complete attention binding via Artifact::bind.
+    pub fn compose(&self, masks: &[usize]) -> Result<Artifact, String> {
+        if masks.len() != self.counts.len() || masks.iter().zip(&self.counts).any(|(m, c)| m >= c) {
+            return Err("one in-range Copy mask per layer required".into());
+        }
+        let mut artifact = self.start.clone();
+        for (layer, &mask) in masks.iter().enumerate() {
+            for head in 0..self.rules.layers[layer].queries.len() {
+                if mask & (1usize << head) != 0 { artifact = self.rules.copy(&artifact, layer, head)?.candidate; }
+            }
+        }
+        Ok(artifact)
+    }
+
+    /// All layer-local masks, including each empty mask, without materializing joint candidates.
+    pub fn layer_masks(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.counts.iter().enumerate().flat_map(|(l, &count)| (0..count).map(move |mask| (l, mask)))
+    }
+
+    pub fn layer(&self, layer: usize, mask: usize) -> Result<Artifact, String> {
+        if layer >= self.counts.len() { return Err("Copy layer out of range".into()); }
+        let mut masks = vec![0; self.counts.len()];
+        masks[layer] = mask;
+        self.compose(&masks)
+    }
+
+    /// Pin numerical projection, decoded coverage, canonical bytes, and objective C32.
+    /// Exact wire byte length is returned separately from C32.
+    pub fn checked(&self, masks: &[usize], native: &super::operator_program::OperatorProgram) -> Result<(Artifact, super::acceptance::StructuralCost, usize), String> {
+        let artifact = self.compose(masks)?.f32_literals()?;
+        artifact.validate_coverage(native)?;
+        let bytes = artifact.to_bytes()?;
+        let decoded = Artifact::from_bytes(&bytes, &native.declarations)?;
+        decoded.validate_coverage(native)?;
+        if decoded.to_bytes()? != bytes { return Err("Copy joint roundtrip differs".into()); }
+        let cost = super::acceptance::structural_cost(&artifact, &mut Default::default())?;
+        if cost != super::acceptance::structural_cost(&decoded, &mut Default::default())? {
+            return Err("Copy joint decoded C32 differs".into());
+        }
+        Ok((decoded, cost, bytes.len()))
+    }
+}
+
 impl HeadRules {
     /// The proposer for `targets`' heads, with every match's content planes found on `start`.
     pub fn new(start: &Artifact, layers: Vec<LayerNodes>, targets: Vec<usize>, group: usize) -> Result<Self, String> {

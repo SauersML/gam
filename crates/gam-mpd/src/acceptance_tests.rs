@@ -1061,3 +1061,55 @@ fn c32_rotary_dimension_is_structure_not_an_extra_numeric_literal() {
     assert_eq!((a.literals, b.literals), (1, 1));
     assert_ne!(a.structure_bits, b.structure_bits, "the chosen dimension remains explicitly coded structure");
 }
+
+#[test]
+fn copy_joint_masks_keep_cancellation_and_compose_four_layers() {
+    use super::proposals::CopyMasks;
+    use super::run_check::LayerNodes;
+    let (d, w) = (native(2), native(1));
+    let diag = |name: &str| Operator::diag(name, d.clone(), array![1.0, 1.0], exact_precision([1.0]).unwrap(), Provenance::default()).unwrap();
+    let mut operators = vec![diag("final_norm.gain")];
+    let mut nodes = vec![Node::Raw { slot: 0 }];
+    let mut layers = Vec::new();
+    for layer in 0..4 {
+        operators.push(diag(&format!("blocks.{layer}.rms1.gain")));
+        let mut reads = Vec::new();
+        let mut terms = Vec::new();
+        for head in 0..6 {
+            let v = operators.len();
+            operators.push(dense(&format!("blocks.{layer}.v{head}"), &w, &d, array![[1.0, 0.0]]));
+            let read = nodes.len();
+            nodes.push(Node::Affine { terms: vec![(0, v)], bias: None });
+            reads.push(read);
+            let o = operators.len();
+            let error = match head { 0 => 1.0, 1 => -1.0, _ => 0.0 };
+            operators.push(dense(&format!("blocks.{layer}.o{head}"), &d, &w, array![[1.0], [error]]));
+            terms.push((read, o));
+        }
+        let attention = nodes.len();
+        nodes.push(Node::Affine { terms, bias: None });
+        layers.push(LayerNodes { stream: 0, normed_stream: 0, queries: reads.clone(), keys: reads.clone(), values: reads.clone(), reads,
+            attention, attended: attention, normed: 0, pre: 0, active: 0, mlp: attention, residual: attention });
+    }
+    let model = raw_program(2, operators, nodes);
+    let start = Artifact::native(&model).unwrap();
+    assert!(CopyMasks::cardinalities([6; 4], 255, 1 << 24).is_err());
+    assert!(CopyMasks::cardinalities([6; 4], 256, (1 << 24) - 1).is_err());
+    let bank = CopyMasks::new(&start, &layers, 1, 256, 1 << 24).unwrap();
+    assert_eq!((bank.layer_candidates, bank.joint_candidates), (256, 1 << 24));
+    assert_eq!(bank.layer_masks().filter(|(layer, _)| *layer == 0).count(), 64);
+    let local = Local::new(&model, raw_family(vec![vec![1.0, 0.0]]), None, 1);
+    for mask in [1, 2] {
+        let candidate = bank.checked(&[mask, 0, 0, 0], &model).unwrap().0;
+        assert!(local.screen(&candidate).unwrap().worst().unwrap().lower > 0.1);
+    }
+    let joint = bank.checked(&[3, 3, 3, 3], &model).unwrap().0;
+    assert_eq!(joint.derived.len(), 8);
+    assert_eq!(joint.blocks.len(), 4);
+    assert!(local.screen(&joint).unwrap().blocks.iter().all(|b| b.upper < 1e-12));
+    assert!(bank.layer_masks().any(|(l, m)| l == 0 && m == 3), "failed singletons never remove their cancelling joint mask");
+    assert!(bank.compose(&[64, 0, 0, 0]).is_err());
+    assert!(bank.compose(&[0]).is_err());
+    let empty = bank.checked(&[0; 4], &model).unwrap().0;
+    assert!(empty.derived.is_empty() && empty.blocks.is_empty());
+}
