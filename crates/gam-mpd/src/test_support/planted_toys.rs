@@ -6,8 +6,7 @@
 //!   attention pattern and their value/output transports carry a cross-head `GL(4)`; head 3 has
 //!   query `2 Q₁`, the same subspaces but a different pattern ([`RoutingToy::truth`]).
 //!
-//! Every fixture is dyadic where a test compares tensors exactly, so a gauge move by a
-//! unimodular integer matrix ([`unimodular_pair`]) is carried without rounding.
+//! Every fixture is dyadic where a test compares tensors exactly.
 
 use ndarray::{Array1, Array2, s};
 use rand::rngs::StdRng;
@@ -38,40 +37,6 @@ pub struct RoutingToy {
     pub value: Vec<Array2<f64>>,
     /// Per head, `width × rank`.
     pub output: Vec<Array2<f64>>,
-}
-
-/// `I + strictly_lower` and `I + strictly_upper` with entries in `{−1, 0, 1}`, their product
-/// `M = L U` and its inverse `U⁻¹ L⁻¹`, all integer, so `M` moves dyadic tensors exactly.
-pub fn unimodular_pair(order: usize, seed: u64) -> (Array2<f64>, Array2<f64>) {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let mut lower = Array2::<f64>::eye(order);
-    let mut upper = Array2::<f64>::eye(order);
-    for i in 0..order {
-        for j in 0..order {
-            let draw = f64::from(rng.random_range(-1_i32..=1));
-            if i > j {
-                lower[[i, j]] = draw;
-            } else if i < j {
-                upper[[i, j]] = draw;
-            }
-        }
-    }
-    // Unit-triangular inverses by substitution: integer arithmetic, exact in binary64.
-    let mut lower_inverse = Array2::<f64>::eye(order);
-    for i in 0..order {
-        for j in 0..i {
-            let value: f64 = (j..i).map(|k| lower[[i, k]] * lower_inverse[[k, j]]).sum();
-            lower_inverse[[i, j]] = -value;
-        }
-    }
-    let mut upper_inverse = Array2::<f64>::eye(order);
-    for i in (0..order).rev() {
-        for j in (i + 1)..order {
-            let value: f64 = ((i + 1)..=j).map(|k| upper[[i, k]] * upper_inverse[[k, j]]).sum();
-            upper_inverse[[i, j]] = -value;
-        }
-    }
-    (lower.dot(&upper), upper_inverse.dot(&lower_inverse))
 }
 
 impl RoutingToy {
@@ -170,6 +135,3 @@ impl RoutingToy {
         }
     }
 }
-
-/// The seed of the random null fixtures.
-pub const RANDOM_NULL_SEED: u64 = 7;
