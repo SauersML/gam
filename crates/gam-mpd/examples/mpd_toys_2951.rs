@@ -7,7 +7,7 @@
 //!
 //! 1. the native model's response to every question, against the measured outcome (dev and
 //!    sealed): the reference forward and this crate's interventions must agree;
-//! 2. the explanation of every site (`gam_mpd::explanation::fit`, on the case's samples in batches
+//! 2. the explanation of every site (`gam_mpd::explanation::fit`, on the case's transcript prompts in batches
 //!    of `batch` prompts), written to `<case>/engine/library` and read back when fitted alike;
 //! 3. its prediction of every question (its own program under the same edits) to
 //!    `<case>/engine/predictions.json`;
@@ -96,7 +96,7 @@ impl Run {
 
     fn fitted_with(&self) -> Value {
         let s = &self.settings;
-        json!({"n": s.observations, "rounds": s.rounds, "blocks": s.blocks, "draws": s.draws, "seed": s.seed, "batch": self.batch})
+        json!({"n": s.observations, "rounds": s.rounds, "blocks": s.blocks, "draws": s.draws, "seed": s.seed, "batch": self.batch, "fit_on": "transcript"})
     }
 }
 
@@ -177,7 +177,12 @@ fn run_case(root: &Path, dir: &Path, run: &Run) -> Result<Value, String> {
     let clock = Instant::now();
     let with = run.fitted_with();
     let chosen = in_execution_order(sites(model));
-    let family = &case.imported.contract.family;
+    // Fitted on the transcript prompts only, the rows the transcript baseline sees: never on the
+    // questions' prompts or donors, held-out ones included (audit P35).
+    let rows: Vec<Vec<f64>> = case.transcript.outer_iter().map(|r| r.to_vec()).collect();
+    let views: Vec<&[f64]> = rows.iter().map(Vec::as_slice).collect();
+    let fitting = case.family(&views)?;
+    let family = &fitting;
     // Batches of whole prompts: `batch` prompts' rows each.
     let per_prompt = if case.imported.kind == "transformer_rows" { case.transcript.ncols() } else { 1 };
     let prompts = family.rows / per_prompt.max(1);
