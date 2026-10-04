@@ -116,6 +116,14 @@ impl Resident {
         }
         Self::compile_decoded_mode(from.program.device(), candidate, Some(from), true)
     }
+    /// As [`Self::from_decoded_values_sharing`], checking the complete candidate operator
+    /// numeric-buffer budget before uploads, including buffers shared with the source.
+    pub fn from_decoded_values_sharing_bounded(from: &Self, candidate: &Artifact, numeric_bytes_limit: usize) -> Result<Self, String> {
+        if from.program.device().is_host() || !from.program.device().float64() {
+            return Err("artifact device needs a float64 accelerator".into());
+        }
+        Self::compile_decoded_mode_bounded(from.program.device(), candidate, Some(from), true, Some(numeric_bytes_limit))
+    }
     /// Preserve supplied values, bounding retained numeric source operators before upload.
     pub fn from_decoded_values_bounded(device: &Device, candidate: &Artifact, numeric_bytes_limit: usize) -> Result<Self, String> {
         if device.is_host() || !device.float64() { return Err("artifact device needs a float64 accelerator".into()); }
@@ -153,7 +161,8 @@ impl Resident {
         }
         let program = if values {
             match (from, numeric_bytes_limit) {
-                (Some(base), _) => DeviceProgram::compile_values_sharing(&base.program, &flat)?,
+                (Some(base), Some(limit)) => DeviceProgram::compile_values_sharing_bounded(&base.program, &flat, limit)?,
+                (Some(base), None) => DeviceProgram::compile_values_sharing(&base.program, &flat)?,
                 (None, Some(limit)) => DeviceProgram::compile_values_bounded(device, &flat, limit)?,
                 (None, None) => DeviceProgram::compile_values(device, &flat)?,
             }
@@ -567,6 +576,13 @@ mod tests {
         let source = Resident::compile_decoded_mode(&device, &native_artifact, None, true).unwrap();
         assert!(Resident::from_decoded_values_sharing(&source, &local).is_err(), "public sharing refuses host fallback");
         let shared = Resident::compile_decoded_mode(&device, &local, Some(&source), true).unwrap();
+        let limit = shared.operator_numeric_bytes().unwrap();
+        assert!(limit > 0);
+        assert!(Resident::compile_decoded_mode_bounded(&device, &local, Some(&source), true, Some(limit - 1)).is_err());
+        assert!(Resident::compile_decoded_mode_bounded(&device, &local, Some(&source), true, Some(0)).is_err());
+        let bounded = Resident::compile_decoded_mode_bounded(&device, &local, Some(&source), true, Some(limit)).unwrap();
+        assert_eq!(bounded.operator_numeric_bytes().unwrap(), limit);
+        assert!(Resident::from_decoded_values_sharing_bounded(&source, &local, limit).is_err(), "public bounded sharing refuses host fallback");
         let shared_trace = shared.forward_edited(&family, |_, _| Ok(None)).unwrap();
         assert_eq!(device.download(&shared.output(&shared_trace).unwrap()).unwrap(), actual);
         let untouched = source.forward_edited(&family, |_, _| Ok(None)).unwrap();
