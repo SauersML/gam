@@ -31,8 +31,11 @@
 //! Output mixes act on each held head independently; `EpisodeScore::unheld` counts missing
 //! native edited places, including the missing heads of a partially held output site. Input
 //! scales require only their affected head or activation. A composite input mix with partially
-//! held incoming places, or a held input whose site's output boundary is absent, is refused
-//! explicitly because this adapter cannot fork that site faithfully. A weight edit with a held
+//! held incoming places is refused. An absent intermediate output can use an enclosing
+//! declared block's write only when the native graph proves every path from the edited
+//! block input to that write passes through the site's outputs. This preserves an input
+//! intervention through composition without claiming omitted internal neurons are held.
+//! Other absent output boundaries are refused. A weight edit with a held
 //! output but no incoming place is likewise refused; wholly absent interventions run clean.
 //!
 //! The artifact's final norm and unembedding must be the native ones (places it holds, the same
@@ -294,6 +297,56 @@ struct MappedEdits {
 
 /// Execution-only edge forks: edits of one site's input must not spill to siblings.
 /// `specs` maps site to (native inputs, native outputs).
+fn lift_input_boundaries(
+    native: &OperatorProgram,
+    artifact: &Artifact,
+    specs: &mut BTreeMap<usize, (Vec<usize>, Vec<usize>)>,
+) -> Result<(), String> {
+    // An input edge into a composed block can be moved to its exposed input
+    // when there is no native path bypassing the edited site. This is
+    // a graph proof, not a fitted sensitivity or a new no-effect convention.
+    fn reaches(program: &OperatorProgram, write: usize, target: usize, stops: &[usize]) -> bool {
+        let mut seen = vec![false; program.nodes.len()];
+        let mut stack = vec![write];
+        while let Some(node) = stack.pop() {
+            if node == target { return true; }
+            if seen[node] || stops.contains(&node) { continue; }
+            seen[node] = true;
+            stack.extend(program.nodes[node].arguments());
+        }
+        false
+    }
+    for (&site, (inputs, outputs)) in specs.iter_mut() {
+        if inputs.iter().chain(outputs.iter()).any(|&n| n >= native.nodes.len()) {
+            return Err(format!("site {site}: native input/output outside graph"));
+        }
+        // Existing complete boundaries and missing inputs keep their existing
+        // handling. Partially held output families must not be silently merged.
+        if !inputs.iter().all(|n| artifact.place(*n).is_some()) || outputs.iter().any(|n| artifact.place(*n).is_some()) {
+            continue;
+        }
+        let eligible: std::collections::BTreeSet<_> = artifact.blocks.iter().filter(|block| {
+            block.native_write < native.nodes.len()
+                && artifact.place(block.native_write) == Some(block.write)
+                && inputs.iter().all(|input| block.native_reads.iter().zip(&block.reads).any(|(n,p)| n == input && artifact.place(*n) == Some(*p)))
+                && outputs.iter().all(|&output| reaches(native, block.native_write, output, &block.native_reads))
+                && inputs.iter().all(|&input| !reaches(native, block.native_write, input, outputs))
+                // The fork stops at held causal places. An exposed interior
+                // boundary would need its own ordered intervention treatment;
+                // do not lift across it as if it were a private expression.
+                && !(0..block.native_write).any(|node| !block.native_reads.contains(&node)
+                    && artifact.place(node).is_some()
+                    && reaches(native, block.native_write, node, &block.native_reads))
+        }).map(|block| block.native_write).collect();
+        match eligible.len() {
+            0 => {}, // fork_inputs supplies the explicit unsupported-boundary error.
+            1 => *outputs = vec![*eligible.first().ok_or("missing unique block write")?],
+            _ => return Err(format!("site {site}: ambiguous enclosing intervention boundary")),
+        }
+    }
+    Ok(())
+}
+
 fn fork_inputs(
     artifact: &Artifact,
     specs: &BTreeMap<usize, (Vec<usize>, Vec<usize>)>,
@@ -1001,6 +1054,7 @@ impl RunCheck for LanguageRun<'_> {
                     add_input_spec(&mut specs, &program, nodes, action, head_dim)?;
                 }
             }
+            lift_input_boundaries(self.native, &program, &mut specs)?;
             let (episode_program, forks, map) = fork_inputs(&program, &specs)?;
             let episode_residuals: Vec<_> = residuals.iter().map(|n| map[*n]).collect();
             let mut edits: BTreeMap<usize, Vec<NodeEdit>> = BTreeMap::new();
@@ -1210,6 +1264,85 @@ mod input_mix_tests {
         let (mut artifact, layers, _) = fixture(false);
         artifact.places.retain(|(native, _)| *native != layers[0].active);
         assert_eq!(execute(&[input_mix()], &artifact, &layers).0[[0, 0]], 2.0);
+    }
+
+    fn composed_mlp(bypass: bool) -> (OperatorProgram, Artifact, Vec<LayerNodes>) {
+        use crate::artifact::{Argument, Callee};
+        let interface = Interface::native(1).unwrap();
+        let native = OperatorProgram {
+            declarations: Declarations { domains: vec![], slots: vec![Slot::Raw { width: 1 }], parameters: 0 },
+            bases: vec![], rules: vec![],
+            operators: vec![Arc::new(Operator::identity("I", interface.clone()))],
+            nodes: vec![
+                Node::Raw { slot: 0 },
+                Node::Affine { terms: vec![(0, 0)], bias: None },
+                Node::Pointwise { input: 1, laws: vec![crate::operator_program::Law::Relu] },
+                Node::Affine { terms: if bypass { vec![(2, 0), (0, 0)] } else { vec![(2, 0)] }, bias: None },
+                Node::Affine { terms: vec![(0, 0)], bias: None },
+                Node::Affine { terms: vec![(3, 0), (4, 0)], bias: None },
+            ], output: 5,
+        };
+        let body = Rule { name: "composed ReLU".into(), inputs: vec![interface], nodes: vec![
+            Node::Param { index: 0 },
+            Node::Pointwise { input: 0, laws: vec![crate::operator_program::Law::Relu] },
+            Node::Affine { terms: if bypass { vec![(1, 0), (0, 0)] } else { vec![(1, 0)] }, bias: None },
+        ], output: 2 };
+        let candidate = Artifact::native(&native).unwrap().replace_block("MLP", Callee::New(body), vec![Argument::Native(0)], 3, vec![]).unwrap();
+        let layers = vec![LayerNodes { normed: 0, pre: 1, active: 2, mlp: 3, keys: vec![4], ..LayerNodes::default() }];
+        (native, candidate, layers)
+    }
+
+    #[test]
+    fn native_entry_dominance_lifts_input_mix_through_composed_rule() {
+        let (native, artifact, layers) = composed_mlp(false);
+        assert!(artifact.place(1).is_none() && artifact.place(2).is_none());
+        let action = Action::Input { site: 4, change: InputChange::Mix { row: 0, alpha: 0.5 } };
+        let mut specs = BTreeMap::new();
+        add_input_spec(&mut specs, &artifact, &layers[0], &action, 1).unwrap();
+        lift_input_boundaries(&native, &artifact, &mut specs).unwrap();
+        assert_eq!(specs[&4].1, vec![3]);
+        let (program, forks, _) = fork_inputs(&artifact, &specs).unwrap();
+        let mapped = site_edits(&layers, &program, &artifact, &forks, &action, 1).unwrap();
+        assert_eq!(mapped.unheld, 0);
+        let donor_trace = artifact.execute(&family(6.0)).unwrap();
+        let (mut edits, mut donors) = (BTreeMap::new(), BTreeMap::new());
+        for (node, edit) in mapped.held {
+            if let NodeEdit::Mix { donor, .. } = &edit {
+                donors.insert(*donor, donor_trace.values[donor.node].row(donor.row).to_owned());
+            }
+            edits.entry(node).or_insert_with(Vec::new).push(edit);
+        }
+        let trace = program.execute_edited(&family(-2.0), |node, value, earlier| apply_node_edits(node, value, earlier, &edits, &donors)).unwrap();
+        assert_eq!(trace.values[program.place(3).unwrap()][[0,0]], 2.0); // ReLU(mix(-2,6)), not mix(ReLU(-2),ReLU(6))=3.
+        assert_eq!(trace.values[program.place(4).unwrap()][[0,0]], -2.0); // Shared sibling is untouched.
+        let omitted = Action::Input { site: 5, change: InputChange::Scale { rows: Rows::All, cols: (0,1), scale: 0.0 } };
+        let missing = site_edits(&layers, &program, &artifact, &forks, &omitted, 1).unwrap();
+        assert_eq!(missing.unheld, 1);
+        assert!(missing.held.is_empty());
+    }
+
+    #[test]
+    fn native_bypass_prevents_lifting_a_site_intervention_to_a_whole_rule() {
+        let (native, artifact, layers) = composed_mlp(true);
+        let action = Action::Input { site: 4, change: InputChange::Mix { row: 0, alpha: 0.5 } };
+        let mut specs = BTreeMap::new();
+        add_input_spec(&mut specs, &artifact, &layers[0], &action, 1).unwrap();
+        lift_input_boundaries(&native, &artifact, &mut specs).unwrap();
+        assert_eq!(specs[&4].1, vec![1]);
+        assert!(fork_inputs(&artifact, &specs).err().unwrap().contains("absent output boundary"));
+    }
+
+    #[test]
+    fn lifting_does_not_skip_an_exposed_internal_causal_place() {
+        let (native, _, layers) = composed_mlp(false);
+        let mut artifact = Artifact::native(&native).unwrap().bind("MLP", &[0], 3).unwrap();
+        artifact.places.retain(|(node,_)| *node != 1);
+        let action = Action::Input { site: 4, change: InputChange::Mix { row: 0, alpha: 0.5 } };
+        let mut specs = BTreeMap::new();
+        add_input_spec(&mut specs, &artifact, &layers[0], &action, 1).unwrap();
+        lift_input_boundaries(&native, &artifact, &mut specs).unwrap();
+        assert_eq!(specs[&4].1, vec![1]); // Exposed activation at2 forbids treating wholebody as private.
+        assert!(fork_inputs(&artifact, &specs).is_err());
     }
     #[test]
     fn cloning_k_input_must_preserve_q_output_intervention() {
