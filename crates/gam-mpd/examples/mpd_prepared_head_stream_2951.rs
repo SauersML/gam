@@ -32,6 +32,7 @@ const FITS: [&str; 2] = ["weight_Frobenius", "training_native_inputs"];
 const DELTAS: [f64; 5] = [0.05, 0.1, 0.2, 0.5, 1.0];
 const EPSILONS: [f64; 6] = [0.001, 0.01, 0.03, 0.1, 0.3, 1.0];
 const SPEC_SHA: &str = "3c05b66324dfb02e33da7eff98784a7ec432123e24fea78018b892efb4256436";
+const PANEL_TOKENS_SHA: &str = "9938c3b6995c4c1b9f74b7bf26b7a17a991941952de9a2e6598fec95003ca8cf";
 const COMPLETE: usize = 385;
 const HEADS: usize = 24;
 const CONTEXT: usize = 512;
@@ -627,8 +628,8 @@ fn main() -> Result<(), String> {
     {
         return Err("invalid contiguous head shard or explicit resource budgets".into());
     }
-    if sha256(spec_path)? != SPEC_SHA {
-        return Err("frozen strong-panel Spec hash mismatch".into());
+    if sha256(spec_path)? != SPEC_SHA || sha256(&export.join("tokens.f64"))? != PANEL_TOKENS_SHA {
+        return Err("frozen strong-panel Spec or scored token hash mismatch".into());
     }
     let train_export = Path::new(*keys.get("train_export").ok_or("declare train_export")?);
     let begun = Instant::now();
