@@ -23,12 +23,126 @@ pub struct RankFloor {
     pub native_norm_error: f64,
     pub centering_error: f64,
     pub singular_value_band: f64,
+    pub svd_validation: SvdValidation,
+    pub writer_svd_validation: Option<SvdValidation>,
     pub affine_rank: ResidualFloor,
     /// Unrestricted affine offset, fixed writer span; valid even when the actual
     /// rule's intercept is restricted to that span (then the bound is weaker).
     pub fixed_writer_span: Option<ResidualFloor>,
     pub writer_orthogonality_defect_upper: Option<f64>,
 }
+/// A posteriori validation, independent of the decomposition's resolution cutoff.
+#[derive(Clone, Debug, Serialize)]
+pub struct SvdValidation {
+    pub reconstruction_frobenius_error_upper: f64,
+    pub left_orthogonality_defect_upper: f64,
+    pub right_orthogonality_defect_upper: f64,
+    pub singular_value_enclosure: f64,
+}
+fn mul_up(a: f64, b: f64) -> f64 {
+    (a * b).next_up()
+}
+fn add_up(a: f64, b: f64) -> f64 {
+    (a + b).next_up()
+}
+fn dot_error(depth: usize, a: f64, b: f64, entries: usize) -> Result<f64, String> {
+    Ok(add_up(
+        mul_up(gamma(depth + 2)?, mul_up(a, b)),
+        mul_up(
+            (depth + 2) as f64,
+            mul_up(entries as f64, f64::MIN_POSITIVE),
+        ),
+    ))
+}
+fn subtract_error(a: f64, b: f64, entries: usize) -> f64 {
+    add_up(
+        mul_up(f64::EPSILON, add_up(a, b)),
+        mul_up(entries as f64, f64::MIN_POSITIVE),
+    )
+}
+fn validate_svd(a: &Array2<f64>, s: &gam_linalg::decompose::Svd) -> Result<SvdValidation, String> {
+    let r = a.nrows().min(a.ncols());
+    if s.u.dim() != (a.nrows(), r) || s.vt.dim() != (r, a.ncols()) || s.singular_values.len() != r {
+        return Err("thin SVD factor dimensions disagree".into());
+    }
+    if s.singular_values.iter().any(|v| !v.is_finite() || *v < 0.0)
+        || s.singular_values
+            .iter()
+            .zip(s.singular_values.iter().skip(1))
+            .any(|(a, b)| a < b)
+    {
+        return Err("invalid singular values".into());
+    }
+    let u_norm = upper(norm(s.u.iter().copied())?);
+    let v_norm = upper(norm(s.vt.iter().copied())?);
+    let identity = Array2::<f64>::eye(r);
+    let identity_norm = upper(norm(identity.iter().copied())?);
+    let ug = s.u.t().dot(&s.u);
+    let vg = s.vt.dot(&s.vt.t());
+    let ug_norm = upper(norm(ug.iter().copied())?);
+    let vg_norm = upper(norm(vg.iter().copied())?);
+    let left = add_up(
+        upper(norm((&ug - &identity).iter().copied())?),
+        add_up(
+            dot_error(a.nrows(), u_norm, u_norm, r * r)?,
+            subtract_error(ug_norm, identity_norm, r * r),
+        ),
+    );
+    let right = add_up(
+        upper(norm((&vg - &identity).iter().copied())?),
+        add_up(
+            dot_error(a.ncols(), v_norm, v_norm, r * r)?,
+            subtract_error(vg_norm, identity_norm, r * r),
+        ),
+    );
+    if !left.is_finite() || !right.is_finite() || left >= 1.0 || right >= 1.0 {
+        return Err("SVD factor orthogonality cannot be validated".into());
+    }
+    let largest = s.singular_values.iter().copied().fold(0.0_f64, f64::max);
+    let mut scaled = s.u.clone();
+    for (index, mut col) in scaled.columns_mut().into_iter().enumerate() {
+        col.mapv_inplace(|v| v * s.singular_values[index]);
+    }
+    let scaled_norm = upper(norm(scaled.iter().copied())?);
+    let scaled_error = add_up(
+        mul_up(f64::EPSILON, mul_up(u_norm, largest)),
+        mul_up(scaled.len() as f64, f64::MIN_POSITIVE),
+    );
+    let reconstruction = scaled.dot(&s.vt);
+    let reconstructed_norm = upper(norm(reconstruction.iter().copied())?);
+    let a_norm = upper(norm(a.iter().copied())?);
+    let reconstruction_error = add_up(
+        upper(norm((a - &reconstruction).iter().copied())?),
+        add_up(
+            mul_up(scaled_error, v_norm),
+            add_up(
+                dot_error(r, scaled_norm, v_norm, a.len())?,
+                subtract_error(a_norm, reconstructed_norm, a.len()),
+            ),
+        ),
+    );
+    // Polar factors Uhat,Vhat exist: ||U-Uhat||2 <= left and
+    // ||V-Vhat||2 <= right when their Gram defects are below one.
+    // ||V||2 <= sqrt(1+right), with outward rounding. Therefore a
+    // nearby exact orthonormal Uhat*diag(sigma)*Vhat differs from A by
+    // reconstruction_error + sigma_max*(left*sqrt(1+right)+right).
+    // Weyl then encloses every singular value. No use of Svd.band occurs.
+    let v_spectral = add_up(1.0, right).sqrt().next_up();
+    let enclosure = add_up(
+        reconstruction_error,
+        mul_up(largest, add_up(mul_up(left, v_spectral), right)),
+    );
+    if !enclosure.is_finite() {
+        return Err("SVD reconstruction enclosure overflow".into());
+    }
+    Ok(SvdValidation {
+        reconstruction_frobenius_error_upper: reconstruction_error,
+        left_orthogonality_defect_upper: left,
+        right_orthogonality_defect_upper: right,
+        singular_value_enclosure: enclosure,
+    })
+}
+
 fn gamma(n: usize) -> Result<f64, String> {
     let e = n as f64 * f64::EPSILON;
     if e >= 0.5 {
@@ -37,26 +151,31 @@ fn gamma(n: usize) -> Result<f64, String> {
     Ok((e / (1.0 - e)).next_up())
 }
 fn norm(values: impl IntoIterator<Item = f64>) -> Result<(f64, f64), String> {
-    let mut value = 0.0_f64;
-    let mut count = 0usize;
-    for x in values {
-        if !x.is_finite() {
-            return Err("nonfinite diagnostic value".into());
-        }
-        value = value.hypot(x);
-        count += 1;
+    let values: Vec<f64> = values.into_iter().collect();
+    if values.iter().any(|v| !v.is_finite()) {
+        return Err("nonfinite diagnostic value".into());
     }
-    if !value.is_finite() {
+    let scale = values.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    if scale == 0.0 {
+        return Ok((0.0, 0.0));
+    }
+    let (mut lo, mut hi) = (0.0_f64, 0.0_f64);
+    for x in values {
+        let quotient = x.abs() / scale;
+        let qlo = quotient.next_down().max(0.0);
+        let qhi = quotient.next_up();
+        lo = (lo + (qlo * qlo).next_down().max(0.0)).next_down().max(0.0);
+        hi = (hi + (qhi * qhi).next_up()).next_up();
+    }
+    let lower = (lo.sqrt().next_down().max(0.0) * scale)
+        .next_down()
+        .max(0.0);
+    let upper = (hi.sqrt().next_up() * scale).next_up();
+    if !upper.is_finite() {
         return Err("diagnostic norm overflow".into());
     }
-    // Conservative accumulation error for hypot, with an absolute underflow floor.
-    let error = (gamma(count.saturating_mul(4).saturating_add(4))? * value
-        + count as f64 * f64::MIN_POSITIVE)
-        .next_up();
-    if !error.is_finite() {
-        return Err("diagnostic norm error overflow".into());
-    }
-    Ok((value, error))
+    let value = lower + (upper - lower) * 0.5;
+    Ok((value, (value - lower).max(upper - value).next_up()))
 }
 fn upper(pair: (f64, f64)) -> f64 {
     (pair.0 + pair.1).next_up()
@@ -85,7 +204,8 @@ fn floor(value: f64, error: f64, native_upper: f64) -> Result<ResidualFloor, Str
 /// singular-value tail of centered native writes. Since max-row >= Frobenius/√n
 /// and Local's denominator is ||native||F/√n, the necessary ratio is tail/||native||F.
 ///
-/// Numerical bands concern these finite input values and comparison arithmetic;
+/// Validated reconstruction/orthogonality enclosures concern these finite input
+/// values and comparison arithmetic (the SVD resolution cutoff is not used);
 /// they do not bound the neural forward calculation that supplied native writes
 /// or a candidate writer's execution roundoff. Necessity assumes exact affine-space
 /// membership; out-of-span exceptions/additions invalidate that assumption.
@@ -106,7 +226,7 @@ pub fn measured_rank_floor(
     let native_upper = if native_norm.0 == 0.0 {
         0.0
     } else {
-        upper(native_norm)
+        mul_up(upper(native_norm), add_up(1.0, gamma(native.len() + 4)?))
     };
     let mut centered = native.clone();
     let mut centering_errors = Vec::with_capacity(native.len());
@@ -135,14 +255,18 @@ pub fn measured_rank_floor(
     }
     let centering_error = upper(norm(centering_errors)?);
     let decomposition = svd(centered.view(), false).map_err(|e| e.to_string())?;
+    let validation = validate_svd(&centered, &decomposition)?;
     let tail = norm(decomposition.singular_values.iter().skip(rank).copied())?;
     // Weyl plus centering uncertainty in Frobenius norm. Keep every tail value;
     // unresolved values are covered by error, never silently treated as exact zero.
     let tail_count = decomposition.singular_values.len().saturating_sub(rank);
-    let spectral_error = decomposition.band * (tail_count.max(1) as f64).sqrt();
+    let spectral_error = mul_up(
+        validation.singular_value_enclosure,
+        (tail_count.max(1) as f64).sqrt().next_up(),
+    );
     let rank_error = ((tail.1 + spectral_error + centering_error) * (1.0 + gamma(8)?)).next_up();
     let affine_rank = floor(tail.0, rank_error, native_upper)?;
-    let (mut fixed_writer_span, mut defect) = (None, None);
+    let (mut fixed_writer_span, mut defect, mut writer_validation) = (None, None, None);
     if let Some(b) = writers {
         if b.nrows() != rank || b.ncols() != d || rank == 0 || rank > d {
             return Err(
@@ -150,13 +274,15 @@ pub fn measured_rank_floor(
             );
         }
         let bs = svd(b.view(), false).map_err(|e| e.to_string())?;
-        if bs.singular_values.iter().any(|&s| s <= bs.band) {
+        let b_validation = validate_svd(b, &bs)?;
+        let b_band = b_validation.singular_value_enclosure;
+        if bs.singular_values.iter().any(|&s| s <= b_band) {
             return Err("writer span has unresolved full row rank".into());
         }
         let mut orthogonal_error = 0.0_f64;
         for &s in &bs.singular_values {
-            let lo = (s - bs.band).next_down().max(0.0);
-            let hi = (s + bs.band).next_up();
+            let lo = (s - b_band).next_down().max(0.0);
+            let hi = (s + b_band).next_up();
             orthogonal_error = orthogonal_error
                 .max((1.0 - (lo * lo).next_down()).max(((hi * hi).next_up() - 1.0).max(0.0)));
         }
@@ -170,25 +296,31 @@ pub fn measured_rank_floor(
         let r_norm = norm(residual.iter().copied())?;
         // P=Bᵀ(BBᵀ)^-1B, while computed projection uses BᵀB. Their exact
         // spectral difference is max|σ(B)^2-1| for full-row-rank B.
-        let first_error = gamma(d + 2)? * z_norm * b_norm;
-        let arithmetic = first_error * b_norm
-            + gamma(rank + 2)? * a_norm * b_norm
-            + f64::EPSILON * (z_norm + p_norm)
-            + native.len() as f64 * f64::MIN_POSITIVE;
+        let first_error = dot_error(d, z_norm, b_norm, amplitudes.len())?;
+        let arithmetic = add_up(
+            mul_up(first_error, b_norm),
+            add_up(
+                dot_error(rank, a_norm, b_norm, projected.len())?,
+                subtract_error(z_norm, p_norm, native.len()),
+            ),
+        );
         let error = ((r_norm.1 + arithmetic + z_norm * orthogonal_error + centering_error)
             * (1.0 + gamma(24)?))
         .next_up();
         fixed_writer_span = Some(floor(r_norm.0, error, native_upper)?);
         defect = Some(orthogonal_error);
+        writer_validation = Some(b_validation);
     }
     Ok(RankFloor {
         rank,
         rows: n,
         output_width: d,
         native_frobenius_norm: native_norm.0,
-        native_norm_error: native_norm.1,
+        native_norm_error: (native_upper - native_norm.0).max(native_norm.1).next_up(),
         centering_error,
-        singular_value_band: decomposition.band,
+        singular_value_band: validation.singular_value_enclosure,
+        svd_validation: validation,
+        writer_svd_validation: writer_validation,
         affine_rank,
         fixed_writer_span,
         writer_orthogonality_defect_upper: defect,
@@ -198,6 +330,33 @@ pub fn measured_rank_floor(
 mod tests {
     use super::*;
     use ndarray::array;
+    #[test]
+    fn enclosure_validates_actual_factors_and_ignores_claimed_cutoff() {
+        let a = array![[3.0, 0.0], [0.0, 1.0]];
+        let mut decomposition = svd(a.view(), false).unwrap();
+        decomposition.band = 0.0;
+        decomposition.singular_values[0] += 0.1;
+        let validation = validate_svd(&a, &decomposition).unwrap();
+        assert!(validation.reconstruction_frobenius_error_upper >= 0.1);
+        assert!(validation.singular_value_enclosure >= 0.1);
+        assert!(validation.singular_value_enclosure < 0.101);
+        // Orthogonality cannot be assumed from an SVD-shaped struct or band.
+        decomposition.u.column_mut(0).mapv_inplace(|v| 2.0 * v);
+        assert!(validate_svd(&a, &decomposition).is_err());
+    }
+    #[test]
+    fn enclosure_covers_nonorthogonal_but_nearby_polar_factors() {
+        let a = array![[3.0, 0.0], [0.0, 1.0]];
+        let mut decomposition = svd(a.view(), false).unwrap();
+        decomposition.band = 0.0;
+        // Keep reconstruction exact while moving both factors off orthonormal.
+        decomposition.u.column_mut(0).mapv_inplace(|v| 1.001 * v);
+        decomposition.singular_values[0] /= 1.001;
+        let actual_error = 3.0 - decomposition.singular_values[0];
+        let validation = validate_svd(&a, &decomposition).unwrap();
+        assert!(validation.left_orthogonality_defect_upper > 0.002);
+        assert!(validation.singular_value_enclosure >= actual_error);
+    }
     #[test]
     fn unavoidable_rank_loss_is_a_real_local_lower_bound() {
         let y = array![[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]];
