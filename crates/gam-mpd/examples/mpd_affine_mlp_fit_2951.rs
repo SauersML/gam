@@ -1,4 +1,5 @@
 //! Full-width affine baseline: extract TRAIN_EXPORT EVAL_EXPORT OUT TRACE_BYTES
+//! [train_sequences=N] [eval_sequences=N]; default 8 train/2 eval.
 //! or fit EVAL_EXPORT EXTRACT OUT MAX_BANK [save_index=N]. Fixed 8 train/2 eval
 //! complete 512-token sequences, all four layers. evaluate EVAL_EXPORT FIT_DIR
 //! SPEC OUT FITS_SHA SPEC_SHA TRACE_BYTES performs separately decoded Local/Run.
@@ -16,13 +17,25 @@ fn read(path:&Path,rows:usize,width:usize,hash:&str)->Result<Array2<f64>,String>
  let values=bytes.chunks_exact(8).map(|b|f64::from_le_bytes(b.try_into().expect("exact eight-byte chunks"))).collect();Array2::from_shape_vec((rows,width),values).map_err(|e|e.to_string())
 }
 fn main()->Result<(),String>{run()}
-fn run()->Result<(),String>{let a:Vec<_>=std::env::args().skip(1).collect();match a.first().map(String::as_str){Some("extract") if a.len()==5=>extract(&a[1..]),Some("fit") if (5..=6).contains(&a.len())=>fit(&a[1..]),Some("evaluate") if a.len()==8=>evaluate(&a[1..]),_=>Err("extract TRAIN_EXPORT EVAL_EXPORT OUT TRACE_BYTES | fit EVAL_EXPORT EXTRACT OUT MAX_BANK [save_index=N]".into())}}
+fn run()->Result<(),String>{let a:Vec<_>=std::env::args().skip(1).collect();match a.first().map(String::as_str){Some("extract") if (5..=7).contains(&a.len())=>extract(&a[1..]),Some("fit") if (5..=6).contains(&a.len())=>fit(&a[1..]),Some("evaluate") if a.len()==8=>evaluate(&a[1..]),_=>Err("extract TRAIN_EXPORT EVAL_EXPORT OUT TRACE_BYTES [train_sequences=N] [eval_sequences=N] | fit EVAL_EXPORT EXTRACT OUT MAX_BANK [save_index=N]".into())}}
+fn extraction_counts(options:&[String])->Result<(usize,usize),String>{
+ let mut train=None;let mut eval=None;
+ for option in options {let (key,value)=option.split_once('=').ok_or("expected train_sequences=N or eval_sequences=N")?;let value=value.parse::<usize>().map_err(|e|e.to_string())?;if value==0{return Err("sequence counts must be positive".into());}value.checked_mul(CONTEXT).ok_or("sequence row count overflow")?;
+ let slot=match key {"train_sequences"=>&mut train,"eval_sequences"=>&mut eval,_=>return Err("unknown extraction option".into())};if slot.replace(value).is_some(){return Err("duplicate extraction sequence option".into());}}
+ Ok((train.unwrap_or(8),eval.unwrap_or(2)))
+}
+fn disjoint_complete_sequences(train:&[u32],eval:&[u32],train_count:usize,eval_count:usize)->Result<(),String>{
+ if train.len()!=train_count.checked_mul(CONTEXT).ok_or("training size overflow")? || eval.len()!=eval_count.checked_mul(CONTEXT).ok_or("evaluation size overflow")?{return Err("complete declared 512-token sequences required".into());}
+ let sequences:std::collections::BTreeSet<_>=train.chunks_exact(CONTEXT).collect();if eval.chunks_exact(CONTEXT).any(|s|sequences.contains(s)){return Err("train/evaluation token sequences overlap".into());}Ok(())
+}
 fn extract(a:&[String])->Result<(),String>{
  let clock=Instant::now();let budget=a[3].parse::<usize>().map_err(|e|e.to_string())?;
- let train=import_language_model(Path::new(&a[0]),8,CONTEXT)?;let eval=import_language_model(Path::new(&a[1]),2,CONTEXT)?;
+ let (train_sequences,eval_sequences)=extraction_counts(&a[4..])?;
+ let train=import_language_model(Path::new(&a[0]),train_sequences,CONTEXT)?;let eval=import_language_model(Path::new(&a[1]),eval_sequences,CONTEXT)?;
  if train.record["config"]["n_layers"].as_u64()!=Some(4) || train.record["source"]["checkpoint_sha256"]!=eval.record["source"]["checkpoint_sha256"] || train.record["config"]!=eval.record["config"]{return Err("same checkpoint/config and exactly four native layers required".into());}
  let (Some(SlotValues::Tokens(t)),Some(SlotValues::Tokens(e)))=(train.contract.family.slots.first(),eval.contract.family.slots.first()) else{return Err("native token inputs required".into());};
- let sequences:std::collections::BTreeSet<_>=t.chunks_exact(CONTEXT).collect();if e.chunks_exact(CONTEXT).any(|s|sequences.contains(s)){return Err("train/evaluation token sequences overlap".into());}
+ disjoint_complete_sequences(t,e,train_sequences,eval_sequences)?;
+ if train.contract.family.rows!=t.len() || eval.contract.family.rows!=e.len(){return Err("native token/row scope mismatch".into());}
  let native=split_sites(&train.program)?;let other=split_sites(&eval.program)?;
  if native.nodes!=other.nodes || native.operators.len()!=other.operators.len() || native.operators.iter().zip(&other.operators).any(|(x,y)|x.name!=y.name || x.matrix_cow()!=y.matrix_cow()){return Err("actual native graph/weights differ between exports".into());}
  let layers=layer_nodes(&native,4)?;let interfaces=native.interfaces().map_err(|e|e.to_string())?;
@@ -42,7 +55,7 @@ fn extract(a:&[String])->Result<(),String>{
   let mut records=Vec::new();for (layer,nodes) in layers.iter().enumerate(){for(role,node)in[("input",nodes.normed),("write",nodes.mlp)]{let file=format!("{name}.{layer}.{role}.f64");records.push(json!({"layer":layer,"role":role,"native_node":node,"width":interfaces[node].width(),"file":file,"sha256":sha256(&out.join(&file))?}));}}
   panels.push(json!({"name":name,"rows":family.rows,"record":imported.record,"values":records,"extraction_seconds":start.elapsed().as_secs_f64()}));
  }
- save(&out.join("EXTRACT.json"),&json!({"scope":"original native full causal responses; no final logits, no fit or acceptance","context":CONTEXT,"train_sequences":8,"eval_sequences":2,"prefix_output":prefix.output,"trace_budget":budget,"requested_trace_bytes":batch_rows*resident.bytes_per_row(),"operator_numeric_bytes":resident.operator_numeric_bytes()?,"panels":panels,"elapsed_seconds":clock.elapsed().as_secs_f64()}))
+ save(&out.join("EXTRACT.json"),&json!({"scope":"original native full causal responses; no final logits, no fit or acceptance","context":CONTEXT,"train_sequences":train_sequences,"eval_sequences":eval_sequences,"sequence_selection":"first declared sequences of each export; exact sequence overlap rejected","prefix_output":prefix.output,"trace_budget":budget,"requested_trace_bytes":batch_rows*resident.bytes_per_row(),"operator_numeric_bytes":resident.operator_numeric_bytes()?,"panels":panels,"elapsed_seconds":clock.elapsed().as_secs_f64()}))
 }
 fn fit(a:&[String])->Result<(),String>{
  let max=a[3].parse::<usize>().map_err(|e|e.to_string())?;if max<6{return Err("complete native+four single-layer+joint bank needs max_bank>=6".into());}
@@ -85,4 +98,21 @@ fn evaluate(a:&[String])->Result<(),String>{
  for (g,point) in grid.iter().enumerate(){let lower=records.iter().filter(|r|r["states"][g].as_str()!=Some("Violates")).filter_map(|r|r["cost_bits"].as_u64()).min();let upper=records.iter().filter(|r|r["states"][g].as_str()==Some("Meets")).filter_map(|r|Some((r["cost_bits"].as_u64()?,r["index"].as_u64()? as usize))).min();if let Some((_,index))=upper{selected.insert(index);}points.push(json!({"constraint":point,"lower_cost":lower,"upper_cost":upper.map(|p|p.0),"selected":upper.map(|p|p.1),"gap":upper.and_then(|u|lower.map(|l|u.0-l))}));}
  let mut replays=Vec::new();for index in selected{let mut candidate=base.clone();let chosen:Vec<_>=if index==0{vec![]}else if index==5{(0..4).collect()}else{vec![index-1]};for layer in chosen{candidate=fits[layer].candidate(&candidate,&native,&layers[layer],&format!("affine{layer}"))?;}let bytes=candidate.to_bytes()?;let decoded=Artifact::from_bytes(&bytes,&native.declarations)?;decoded.validate_coverage(&native)?;if decoded.to_bytes()?!=bytes || structural_cost(&decoded,&mut CostCache::default())?.total()!=records[index]["cost_bits"].as_u64().ok_or("winner price")?{return Err("selected ordinary saved replay mismatch".into());}let file=format!("selected-{index}.artifact");std::fs::write(out.join(&file),bytes).map_err(|e|e.to_string())?;replays.push(json!({"index":index,"file":file,"sha256":sha256(&out.join(&file))?,"ordinary_decode_canonical_coverage_cost":true}));}
  save(&out.join("REPORT.json"),&json!({"scope":"all six fitted programs; errors retained unresolved; not global affine optimum","grid":grid,"records":records,"points":points,"selected_saved_replays":replays,"codec":codec.stats(),"run_timing":run.timing()}))
+}
+
+#[cfg(test)]
+mod extraction_tests {
+ use super::*;
+ #[test] fn explicit_counts_preserve_defaults_and_refuse_invalid_options(){
+  assert_eq!(extraction_counts(&[]).expect("defaults"),(8,2));
+  assert_eq!(extraction_counts(&["train_sequences=64".into()]).expect("expanded"),(64,2));
+  assert_eq!(extraction_counts(&["eval_sequences=3".into(),"train_sequences=64".into()]).expect("independent"),(64,3));
+  for options in [vec!["train_sequences=0".into()],vec!["other=2".into()],vec!["train_sequences=8".into(),"train_sequences=64".into()],vec![format!("train_sequences={}",usize::MAX)]]{assert!(extraction_counts(&options).is_err());}
+ }
+ #[test] fn declared_complete_sequences_and_disjoint_eval_required(){
+  let train=vec![1;64*CONTEXT];let eval=vec![2;2*CONTEXT];
+  disjoint_complete_sequences(&train,&eval,64,2).expect("disjoint full panels");
+  assert!(disjoint_complete_sequences(&train,&eval[..eval.len()-1],64,2).is_err());
+  assert!(disjoint_complete_sequences(&train,&vec![1;2*CONTEXT],64,2).is_err());
+ }
 }
