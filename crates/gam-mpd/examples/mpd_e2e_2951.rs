@@ -31,9 +31,11 @@
 //!   `gam_mpd::describe::Structured` in the statistics its site was fitted in (VPD's
 //!   subcomponents in the same geometry), and the library's bits paid once.
 //!
-//! Keys (defaults): `sequences` (4), `passages` (32), `context` (512), `n` (1e6), `rounds` (50;
-//! 0 keeps each site's starting pieces), `blocks` (1: gate the library in blocks; 0: every
-//! subcomponent its own), `draws` (4), `random` (64), `spec`, `vpd_selections`.
+//! Keys (defaults): `sequences` (4), `passages` (32), `context` (512), `n` (1e6), `start` (`own`:
+//! each site starts from its units or Fisher-SVD pieces; `vpd`: from VPD's subcomponents, so `ours`
+//! is this code's selection and execution of VPD's library), `rounds` (50; 0 keeps each site's
+//! starting pieces), `blocks` (1: gate the library in blocks; 0: every subcomponent its own),
+//! `draws` (4), `random` (64), `spec`, `vpd_selections`.
 
 use gam_mpd::blocks::Describe;
 use gam_mpd::counterfactual::read_f64_matrix;
@@ -69,6 +71,8 @@ struct Run {
     passages: usize,
     context: usize,
     settings: Settings,
+    /// Whether every site starts from VPD's subcomponents.
+    vpd_start: bool,
     random: usize,
     vpd: PathBuf,
     vpd_sets: PathBuf,
@@ -97,6 +101,7 @@ impl Run {
                 draws: if smoke { 1 } else { 4 },
                 seed: 0x517E,
             },
+            vpd_start: false,
             random: if smoke { 4 } else { 64 },
             vpd,
             vpd_sets,
@@ -113,6 +118,13 @@ impl Run {
                 "n" => run.settings.observations = value.parse().map_err(|e| format!("n: {e}"))?,
                 "rounds" => run.settings.rounds = count()?,
                 "blocks" => run.settings.blocks = count()? != 0,
+                "start" => {
+                    run.vpd_start = match value {
+                        "own" => false,
+                        "vpd" => true,
+                        other => return Err(format!("start: {other} is neither own nor vpd")),
+                    }
+                }
                 "draws" => run.settings.draws = count()?,
                 "random" => run.random = count()?,
                 "spec" => run.spec = Some(PathBuf::from(value)),
@@ -127,7 +139,7 @@ impl Run {
     fn fitted_with(&self) -> Value {
         let s = &self.settings;
         json!({"train": self.train, "sequences": self.sequences, "context": self.context, "n": s.observations, "rounds": s.rounds,
-               "blocks": s.blocks, "draws": s.draws, "seed": s.seed})
+               "blocks": s.blocks, "draws": s.draws, "seed": s.seed, "start": if self.vpd_start { "vpd" } else { "own" }})
     }
 }
 
@@ -161,6 +173,13 @@ fn load(dir: &Path, model: &OperatorProgram, site: &Site, with: &Value, observat
     Ok(Some(Fitted::new(site.clone(), w, (library, ranks, bits), (read("fisher", d_out)?, read("moment", d_in)?), observations)?))
 }
 
+/// VPD's subcomponents at `site`.
+fn vpd_library(run: &Run, model: &OperatorProgram, site: &Site) -> Result<Library, String> {
+    let (d_out, d_in) = matrix(model, site)?.dim();
+    let read = |side: &str, cols: usize| read_f64_matrix(&run.vpd.join(format!("{}.{side}.f64", site.name)), cols);
+    Ok(Library { v: read("v", d_in)?, u: read("u", d_out)?, mean: Array1::zeros(d_in) })
+}
+
 /// VPD's published decomposition on `scope` (in execution order): its library and, per passage, its
 /// published sets (the first `context` positions of each of the first `passages` sequences).
 fn vpd(run: &Run, model: &OperatorProgram, scope: &[Site]) -> Result<Given, String> {
@@ -178,9 +197,7 @@ fn vpd(run: &Run, model: &OperatorProgram, scope: &[Site]) -> Result<Given, Stri
     let mut masks: Vec<Vec<Array2<f64>>> = vec![Vec::new(); run.passages];
     for site in scope {
         let &(offset, count) = offsets.get(&site.name).ok_or_else(|| format!("{}: not in VPD's sets", site.name))?;
-        let (d_out, d_in) = matrix(model, site)?.dim();
-        let read = |side: &str, cols: usize| read_f64_matrix(&run.vpd.join(format!("{}.{side}.f64", site.name)), cols);
-        let library = Library { v: read("v", d_in)?, u: read("u", d_out)?, mean: Array1::zeros(d_in) };
+        let library = vpd_library(run, model, site)?;
         if library.v.nrows() != count || library.u.nrows() != count {
             return Err(format!("{}: {} read and {} write vectors for {count} subcomponents", site.name, library.v.nrows(), library.u.nrows()));
         }
@@ -287,7 +304,7 @@ fn main() -> Result<(), String> {
     let mut report = json!({
         "scope": scope, "sites": names, "train": run.train, "frontier": run.frontier, "sequences": run.sequences, "passages": run.passages,
         "context": run.context, "observations": run.settings.observations, "rounds": run.settings.rounds, "blocks": run.settings.blocks,
-        "draws": run.settings.draws, "random": run.random, "vpd": run.vpd, "vpd_sets": run.vpd_sets,
+        "draws": run.settings.draws, "random": run.random, "vpd": run.vpd, "vpd_sets": run.vpd_sets, "start": if run.vpd_start { "vpd" } else { "own" },
         "pricing": "gam_mpd::describe::Structured in each site's fit statistics (its training inputs under the explanation upstream), both libraries",
         "selection": "ours: gam_mpd::site_fit::Selector on the explanation's own reads in the site's mean training Fisher; vpd: its published sets (model states, residual off)",
     });
@@ -302,8 +319,14 @@ fn main() -> Result<(), String> {
     let clock = Instant::now();
     let with = run.fitted_with();
     let batches: Vec<_> = (0..run.sequences).map(|s| training.contract.family.select(&(s * run.context..(s + 1) * run.context).collect::<Vec<_>>())).collect();
-    let explanation: Explanation =
-        fit(model, chosen.clone(), &batches, &run.settings, |site| load(&library_dir, model, site, &with, run.settings.observations), |f| save(&library_dir, f, &with))?;
+    let starts: BTreeMap<String, Library> = if run.vpd_start {
+        chosen.iter().map(|site| Ok((site.name.clone(), vpd_library(&run, model, site)?))).collect::<Result<_, String>>()?
+    } else {
+        BTreeMap::new()
+    };
+    let explanation: Explanation = fit(model, chosen.clone(), &batches, &run.settings, &starts, |site| load(&library_dir, model, site, &with, run.settings.observations), |f| {
+        save(&library_dir, f, &with)
+    })?;
     drop(batches);
     seconds.insert("fit", clock.elapsed().as_secs_f64());
     report["fit"] = explanation
@@ -336,7 +359,7 @@ fn main() -> Result<(), String> {
             let describe = f.description(model, run.settings.observations)?;
             (0..library.v.nrows())
                 .into_par_iter()
-                .map(|c| describe.bits(0, library.u.slice(s![c..c + 1, ..]), library.v.slice(s![c..c + 1, ..])))
+                .map(|c| gam_linalg::faer_ndarray::with_nested_parallel(|| describe.bits(0, library.u.slice(s![c..c + 1, ..]), library.v.slice(s![c..c + 1, ..]))))
                 .collect::<Result<Vec<f64>, String>>()
         })
         .collect::<Result<_, _>>()?;

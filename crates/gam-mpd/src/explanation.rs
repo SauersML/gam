@@ -234,23 +234,35 @@ pub fn in_execution_order(mut chosen: Vec<Site>) -> Vec<Site> {
     chosen
 }
 
-/// A site's library in blocks on `samples` (`site_fit`): its fit from its units (`reads_units`) or
-/// its Fisher-whitened singular pieces (with no rounds, those pieces themselves), then with
-/// [`Settings::blocks`] its blocks by merges and splits from every column its own block.
-fn site_library(w: &Array2<f64>, samples: &Samples, describe: &dyn Describe, settings: &Settings, reads_units: bool, name: &str) -> Result<(Blocked, Round), String> {
-    let (d_out, d_in) = w.dim();
-    let observations = settings.observations;
+/// Where a site's library starts: `given` when there is one, else the units it reads
+/// (`reads_units`) or its Fisher-whitened singular pieces on `samples`.
+fn starting_library(w: &Array2<f64>, samples: &Samples, given: Option<&Library>, reads_units: bool) -> Result<Library, String> {
+    let d_in = w.ncols();
+    if let Some(given) = given {
+        if given.v.ncols() != d_in || given.u.ncols() != w.nrows() || given.mean.iter().any(|m| *m != 0.0) {
+            return Err(format!("a starting library {:?}, {:?} for a {:?} map", given.u.dim(), given.v.dim(), w.dim()));
+        }
+        return Ok(given.clone());
+    }
     let exact = if reads_units {
         super::pieces::unit_pieces(w, super::pieces::Units::Read)
     } else {
         let statistics = super::pieces::Site { w: w.clone(), second_moment: samples.second_moment.clone(), mean: Array1::zeros(d_in), fisher: samples.fisher.clone() };
         super::pieces::fisher_svd(&statistics)?
     };
-    let start = Library { v: exact.v.t().to_owned(), u: exact.u, mean: Array1::zeros(d_in) };
+    Ok(Library { v: exact.v.t().to_owned(), u: exact.u, mean: Array1::zeros(d_in) })
+}
+
+/// A site's library in blocks on `samples` (`site_fit`): its fit from `start` (with no rounds,
+/// `start` itself), then with [`Settings::blocks`] its blocks by merges and splits from every
+/// column its own block.
+fn site_library(w: &Array2<f64>, samples: &Samples, describe: &dyn Describe, settings: &Settings, start: Library, name: &str) -> Result<(Blocked, Round), String> {
+    let (d_out, d_in) = w.dim();
+    let observations = settings.observations;
     let library = if settings.rounds == 0 {
         start
     } else {
-        let fit_settings = site_fit::Settings { observations, pieces: d_in + d_out, rounds: settings.rounds, seed: settings.seed ^ 0xF17 };
+        let fit_settings = site_fit::Settings { observations, pieces: (d_in + d_out).max(start.v.nrows()), rounds: settings.rounds, seed: settings.seed ^ 0xF17 };
         site_fit::fit(0, w, samples, describe, fit_settings, Some(&start), |round, _| {
             log::info!("{name} round {}: code {:.1} bits per input (description {:.1}, error {:.1}), L0 {:.2}", round.round, round.code, round.description, round.error, round.l0);
         })?
@@ -265,13 +277,16 @@ fn site_library(w: &Array2<f64>, samples: &Samples, describe: &dyn Describe, set
 
 /// The explanation of `model`'s sites `chosen` fitted on `batches` at `settings` (module note):
 /// sites in execution order, a site whose every later read precedes the current group's writes
-/// sampled with it, each group on its inputs under the explanation fitted so far. `known` gives a
-/// site already fitted (a resumed run), `done` sees every site as it is fitted.
+/// sampled with it, each group on its inputs under the explanation fitted so far. A site named in
+/// `starts` starts from that library (say another method's, to select and run by this code), any
+/// other from its units or Fisher-whitened singular pieces. `known` gives a site already fitted (a
+/// resumed run), `done` sees every site as it is fitted.
 pub fn fit(
     model: &OperatorProgram,
     chosen: Vec<Site>,
     batches: &[FamilyInputs],
     settings: &Settings,
+    starts: &std::collections::BTreeMap<String, Library>,
     mut known: impl FnMut(&Site) -> Result<Option<Fitted>, String>,
     mut done: impl FnMut(&Fitted) -> Result<(), String>,
 ) -> Result<Explanation, String> {
@@ -319,10 +334,11 @@ pub fn fit(
                 let structured = Structured::new(vec![Geometry::new(Metric::of(&statistics, settings.observations), writers, readers)?]);
                 let describe = Tiered { cheap: Generic::new(std::slice::from_ref(&statistics), settings.observations), exact: structured };
                 let reads_units = site.reads.len() == 1 && matches!(program.nodes[site.reads[0]], Node::Pointwise { .. });
-                let (blocked, round) = site_library(&w, &sample, &describe, settings, reads_units, &site.name)?;
+                let start = starting_library(&w, &sample, starts.get(&site.name), reads_units).map_err(|e| format!("{}: {e}", site.name))?;
+                let (blocked, round) = site_library(&w, &sample, &describe, settings, start, &site.name)?;
                 let bits = runs(&blocked.ranks)
                     .into_par_iter()
-                    .map(|(a, b)| describe.bits(0, blocked.library.u.slice(s![a..b, ..]), blocked.library.v.slice(s![a..b, ..])))
+                    .map(|(a, b)| gam_linalg::faer_ndarray::with_nested_parallel(|| describe.bits(0, blocked.library.u.slice(s![a..b, ..]), blocked.library.v.slice(s![a..b, ..]))))
                     .collect::<Result<Vec<f64>, String>>()?;
                 let site_fitted = Fitted::new(group[*i].clone(), w, (blocked.library, blocked.ranks, bits), (sample.fisher, sample.second_moment), settings.observations)?;
                 log::info!(

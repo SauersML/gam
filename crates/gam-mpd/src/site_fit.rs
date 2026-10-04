@@ -45,9 +45,11 @@
 //!
 //! Alternating steps that each lower that one total:
 //!
-//! * **Sets.** Each input's on-set: the subcomponents each worth their own bits alone, `n a_tc²
-//!   u_cᵀFu_c / (2 ln 2) > bits(c)`, when they code the input in fewer bits than its current sets,
-//!   then single flips swept until none lowers its code. A flip of `c` changes the error by `∓2 a_tc
+//! * **Sets.** Each input's on-set, from all on: the subcomponents each worth their own bits alone,
+//!   `n a_tc² u_cᵀFu_c / (2 ln 2) > bits(c)`, when they code the input in fewer bits than all on,
+//!   then single flips swept until none lowers its code. Every selection starts there, so an
+//!   input's sets are a function of its read alone, the rule a forward runs ([`Selector`]), and the
+//!   fit is judged by the sets that rule will choose. A flip of `c` changes the error by `∓2 a_tc
 //!   (U F e_t)_c + a_tc² (U F Uᵀ)_cc`, so each is `O(C)` with `U F e_t` kept up to date.
 //! * **Writes.** With the sets and reads fixed the error is a quadratic in `U` whose metric `F`
 //!   factors out, `tr F (UᵀQU − 2UᵀR)`, `Q = Σ_t z̃_t z̃_tᵀ`, `R = Σ_t z̃_t y_tᵀ`, `z̃_t` the reads on.
@@ -456,9 +458,12 @@ impl<'a> Fitting<'a> {
     }
 
     /// The code of `(v, u)` gated in blocks of `ranks` (column runs, module note "Blocks"): `masks`
-    /// (inputs × blocks) are the sets, selected first with `flip`. Returns the total description and
-    /// error bits.
+    /// (inputs × blocks) are the sets, with `flip` selected first from all on (module note, "Sets").
+    /// Returns the total description and error bits.
     fn code_blocks(&self, v: &Array2<f64>, u: &Array2<f64>, ranks: &[usize], bits: &[f64], masks: &mut [u8], flip: bool) -> (f64, f64) {
+        if flip {
+            masks.fill(1);
+        }
         let blocks = ranks.len();
         let (block_of, starts) = partition(ranks);
         let ops = self.operands(v, u);
@@ -635,7 +640,7 @@ fn prices(describe: &dyn Describe, site: usize, v: &Array2<f64>, u: &Array2<f64>
     let c_total = v.nrows();
     let cheap: Option<Vec<f64>> = (0..c_total)
         .into_par_iter()
-        .map(|c| describe.cheap(site, u.slice(s![c..c + 1, ..]), v.slice(s![c..c + 1, ..])))
+        .map(|c| gam_linalg::faer_ndarray::with_nested_parallel(|| describe.cheap(site, u.slice(s![c..c + 1, ..]), v.slice(s![c..c + 1, ..]))))
         .collect::<Result<Vec<Option<f64>>, String>>()?
         .into_iter()
         .collect();
@@ -1070,12 +1075,12 @@ pub fn blocks(
         .into_par_iter()
         .map(|b| {
             let (u, v) = block_factors(&current, &starts, b);
-            Ok((exact((u, v))?, describe.cheap(site, u, v)?))
+            Ok((exact((u, v))?, gam_linalg::faer_ndarray::with_nested_parallel(|| describe.cheap(site, u, v))?))
         })
         .collect::<Result<_, String>>()?;
     let scale = median_ratio(sample.iter().filter_map(|(e, c)| c.map(|c| (*e, c))));
     let price = |(u, v): (ArrayView2<'_, f64>, ArrayView2<'_, f64>)| -> Result<f64, String> {
-        match describe.cheap(site, u, v)? {
+        match gam_linalg::faer_ndarray::with_nested_parallel(|| describe.cheap(site, u, v))? {
             Some(cheap) => Ok(cheap * scale),
             None => exact((u, v)),
         }

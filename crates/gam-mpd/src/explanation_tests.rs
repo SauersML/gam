@@ -66,7 +66,7 @@ fn fitted(tag: &str, layers: usize, prefix: &str) -> (super::operator_program::O
     let chosen = sites(&model).into_iter().filter(|s| s.name.starts_with(prefix)).collect();
     let settings = Settings { observations: 1e4, rounds: 3, blocks: true, draws: 2, seed: 7 };
     let mut seen = Vec::new();
-    let explanation = fit(&model, chosen, &batches, &settings, |_| Ok(None), |f| {
+    let explanation = fit(&model, chosen, &batches, &settings, &std::collections::BTreeMap::new(), |_| Ok(None), |f| {
         seen.push(f.site.name.clone());
         Ok(())
     })
