@@ -139,7 +139,7 @@ fn main() -> Result<(), String> {
                     if state != "violates" { retained[i][layer].push(mask); }
                     json!({"delta":delta,"state":state})
                 }).collect();
-                json!({"layer":layer,"mask":mask,"local":measure,"evidence":status,"states":states,"C32":cost,"C32_bits":cost.total(),"wire_bytes":bytes,"checked_seconds":checked_seconds,"local_seconds":local_seconds})
+                json!({"layer":layer,"mask":mask,"local":measure,"evidence":{"lower":status.lower_bound(),"upper":status.upper_bound(),"witness":status.witness(),"scope":"tested native-parent rows only"},"states":states,"C32":cost,"C32_bits":cost.total(),"wire_bytes":bytes,"checked_seconds":checked_seconds,"local_seconds":local_seconds})
             }
             Err(error) => {
                 for grid in &mut retained { grid[layer].push(mask); }
