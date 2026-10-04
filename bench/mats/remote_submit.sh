@@ -3,7 +3,7 @@
 #
 #   remote_submit.sh NAME CPUS MEM_GB MINUTES WANT_COMMIT GPUS QOS CMD_B64 [ARRAY] [CHAIN] [NEEDBIN] [POOL] [SWAP]
 #
-# Picks the commit C (WANT_COMMIT when origin/main contains it, else origin/main) and snapshots its
+# Requires origin/main to contain WANT_COMMIT and snapshots that exact commit's
 # source into ~/mpd-src/C (the job's working directory). Binaries come from ~/mpd-bin/B for a built
 # or queued commit B whose Rust sources (crates/, Cargo.*, rust-toolchain.toml) equal C's; only
 # otherwise is C built. Builds run in the debug QOS (2 h) as one Slurm singleton, at 8 CPUs so they
@@ -55,8 +55,8 @@ git -C "$REPO" fetch -q origin main
 if git -C "$REPO" cat-file -e "$WANT^{commit}" 2> /dev/null && git -C "$REPO" merge-base --is-ancestor "$WANT" origin/main; then
     C=$(git -C "$REPO" rev-parse "$WANT")
 else
-    C=$(git -C "$REPO" rev-parse origin/main)
-    echo "mats-run: your HEAD ${WANT:0:12} is not on origin/main; running origin/main ${C:0:12}" >&2
+    echo "mats-run: requested commit ${WANT:0:12} is not on origin/main; push it or set MATS_REF to a published commit. No job submitted." >&2
+    exit 2
 fi
 C12=${C:0:12}
 if [ ! -d "$SRC/$C12" ]; then
