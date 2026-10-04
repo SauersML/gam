@@ -5,6 +5,8 @@
 //! derived-matrix multiplication, later forward rounding, Local or autonomous Run.
 //! No fidelity acceptance or MatrixRule/global-program optimality follows.
 //! Each cell is an inclusive interval of monotonically ordered f32 bit keys.
+//! Enclosures assume IEEE round-to-nearest with gradual underflow. The CPU
+//! rounding/FTZ/DAZ mode is NOT runtime verified.
 //! Basic arithmetic uses gam_math's directed ClosedInterval operations. Pruning
 //! requires a cell lower bound >= an actually evaluated point's upper bound.
 //! Budget exhaustion retains every unexplored cell and its lower bound.
@@ -58,6 +60,7 @@ pub struct Report {
     pub complete_finite_inventory: bool,
     pub stop_reason: String,
     pub fixed_response_only: bool,
+    pub arithmetic_assumption: String,
 }
 #[derive(Clone, Copy)]
 struct Quadratic {
@@ -211,6 +214,8 @@ pub fn search(v: &[Vec<f64>], y: &[Vec<f64>], budget: Budget) -> Result<Report, 
         complete_finite_inventory: false,
         stop_reason: String::new(),
         fixed_response_only: true,
+        arithmetic_assumption:
+            "IEEE round-to-nearest with gradual underflow; runtime mode NOT verified".into(),
     };
     let qs = match quadratics(v, y) {
         Ok(q) => q,
