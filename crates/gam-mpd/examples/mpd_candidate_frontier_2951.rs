@@ -42,10 +42,7 @@ fn read_json(path: &Path) -> Result<Value, String> {
 }
 
 fn floats(text: &str) -> Result<Vec<f64>, String> {
-    let values = text
-        .split(',')
-        .map(|s| s.parse::<f64>().map_err(|e| format!("{s}: {e}")))
-        .collect::<Result<Vec<_>, _>>()?;
+    let values = text.split(',').map(|s| s.parse::<f64>().map_err(|e| format!("{s}: {e}"))).collect::<Result<Vec<_>, _>>()?;
     if values.is_empty() || values.iter().any(|v| !v.is_finite() || *v < 0.0) {
         return Err("tolerance lists must be nonempty, finite and nonnegative".into());
     }
@@ -53,14 +50,8 @@ fn floats(text: &str) -> Result<Vec<f64>, String> {
 }
 
 fn family(sequences: &[Vec<u32>], count: usize, context: usize) -> Result<FamilyInputs, String> {
-    if count == 0
-        || context == 0
-        || sequences.len() < count
-        || sequences.iter().take(count).any(|r| r.len() < context)
-    {
-        return Err(format!(
-            "local family needs {count} nonempty sequences of {context} tokens"
-        ));
+    if count == 0 || context == 0 || sequences.len() < count || sequences.iter().take(count).any(|r| r.len() < context) {
+        return Err(format!("local family needs {count} nonempty sequences of {context} tokens"));
     }
     let (mut tokens, mut sequence, mut position) = (Vec::new(), Vec::new(), Vec::new());
     for (s, row) in sequences.iter().take(count).enumerate() {
@@ -70,46 +61,26 @@ fn family(sequences: &[Vec<u32>], count: usize, context: usize) -> Result<Family
             position.push(u32::try_from(p).map_err(|e| e.to_string())?);
         }
     }
-    Ok(FamilyInputs {
-        rows: tokens.len(),
-        slots: vec![SlotValues::Tokens(tokens)],
-        layout: Some(SequenceLayout { sequence, position }),
-    })
+    Ok(FamilyInputs { rows: tokens.len(), slots: vec![SlotValues::Tokens(tokens)], layout: Some(SequenceLayout { sequence, position }) })
 }
 
 fn resolve(base: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        base.join(path)
-    }
+    if path.is_absolute() { path.to_path_buf() } else { base.join(path) }
 }
 
 fn sha256(path: &Path) -> Result<String, String> {
     for (program, options) in [("sha256sum", vec![]), ("shasum", vec!["-a", "256"])] {
-        match Command::new(program)
-            .args(options)
-            .arg("--")
-            .arg(path)
-            .output()
-        {
+        match Command::new(program).args(options).arg("--").arg(path).output() {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
-                let hash = stdout
-                    .split_whitespace()
-                    .next()
-                    .ok_or("empty SHA-256 output")?;
+                let hash = stdout.split_whitespace().next().ok_or("empty SHA-256 output")?;
                 if hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
                     return Ok(hash.to_ascii_lowercase());
                 }
                 return Err(format!("{program}: invalid SHA-256 output"));
             }
             Ok(output) => {
-                return Err(format!(
-                    "{}: {}",
-                    path.display(),
-                    String::from_utf8_lossy(&output.stderr)
-                ));
+                return Err(format!("{}: {}", path.display(), String::from_utf8_lossy(&output.stderr)));
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(format!("{program}: {e}")),
@@ -125,17 +96,10 @@ fn main() -> Result<(), String> {
     if args.len() < 5 {
         return Err(usage.into());
     }
-    let (export, spec_path, bank_path, out) = (
-        PathBuf::from(&args[1]),
-        PathBuf::from(&args[2]),
-        PathBuf::from(&args[3]),
-        PathBuf::from(&args[4]),
-    );
+    let (export, spec_path, bank_path, out) = (PathBuf::from(&args[1]), PathBuf::from(&args[2]), PathBuf::from(&args[3]), PathBuf::from(&args[4]));
     let mut keys = BTreeMap::new();
     for argument in &args[5..] {
-        let (k, v) = argument
-            .split_once('=')
-            .ok_or_else(|| format!("expected KEY=VALUE: {argument}"))?;
+        let (k, v) = argument.split_once('=').ok_or_else(|| format!("expected KEY=VALUE: {argument}"))?;
         if keys.insert(k.to_string(), v.to_string()).is_some() {
             return Err(format!("duplicate option {k}"));
         }
@@ -153,80 +117,44 @@ fn main() -> Result<(), String> {
         "parallel",
         "batch",
         "groups",
+        "backend",
+        "cuda_trace_bytes",
     ];
     if let Some(k) = keys.keys().find(|k| !allowed.contains(&k.as_str())) {
         return Err(format!("unknown option {k}"));
     }
     let key = |k: &str, default: &str| keys.get(k).cloned().unwrap_or_else(|| default.to_string());
-    let number = |k: &str, default: usize| -> Result<usize, String> {
-        key(k, &default.to_string())
-            .parse::<usize>()
-            .map_err(|e| format!("{k}: {e}"))
-    };
+    let number = |k: &str, default: usize| -> Result<usize, String> { key(k, &default.to_string()).parse::<usize>().map_err(|e| format!("{k}: {e}")) };
     let required = |k: &str| -> Result<usize, String> {
-        keys.get(k)
-            .ok_or_else(|| format!("declare {k}=N explicitly"))?
-            .parse::<usize>()
-            .map_err(|e| format!("{k}: {e}"))
+        keys.get(k).ok_or_else(|| format!("declare {k}=N explicitly"))?.parse::<usize>().map_err(|e| format!("{k}: {e}"))
     };
     let (budget, max_bank) = (required("budget")?, required("max_bank")?);
-    let (context, count, batch, parallel) = (
-        number("context", 512)?,
-        number("local", 4)?,
-        number("batch", 1024)?,
-        number("parallel", 8)?,
-    );
+    let (context, count, batch, parallel) = (number("context", 512)?, number("local", 4)?, number("batch", 1024)?, number("parallel", 8)?);
     if max_bank == 0 || batch == 0 || parallel == 0 {
         return Err("max_bank, batch and parallel must be positive".into());
     }
-    let (deltas, epsilons) = (
-        floats(&key("deltas", "0.05,0.1,0.2"))?,
-        floats(&key("epsilons", "0.01,0.03,0.1"))?,
-    );
-    let constraints: Vec<Constraint> = deltas
-        .iter()
-        .flat_map(|&local| epsilons.iter().map(move |&run| Constraint { local, run }))
-        .collect();
-    let entries: Vec<BankEntry> = serde_json::from_value(read_json(&bank_path)?)
-        .map_err(|e| format!("{}: {e}", bank_path.display()))?;
+    let (deltas, epsilons) = (floats(&key("deltas", "0.05,0.1,0.2"))?, floats(&key("epsilons", "0.01,0.03,0.1"))?);
+    let constraints: Vec<Constraint> = deltas.iter().flat_map(|&local| epsilons.iter().map(move |&run| Constraint { local, run })).collect();
+    let entries: Vec<BankEntry> = serde_json::from_value(read_json(&bank_path)?).map_err(|e| format!("{}: {e}", bank_path.display()))?;
     if entries.len().checked_add(1).ok_or("bank size overflow")? > max_bank {
         return Err("explicit bank plus native exceeds max_bank".into());
     }
     let started = Instant::now();
-    let mut input_paths = BTreeSet::from([
-        bank_path.clone(),
-        spec_path.clone(),
-        export.join("export.json"),
-    ]);
+    let mut input_paths = BTreeSet::from([bank_path.clone(), spec_path.clone(), export.join("export.json")]);
     let export_record = read_json(&export.join("export.json"))?;
-    for name in export_record["files"]
-        .as_object()
-        .ok_or("export has no files")?
-        .keys()
-    {
+    for name in export_record["files"].as_object().ok_or("export has no files")?.keys() {
         input_paths.insert(export.join(format!("{name}.f64")));
     }
     let spec_record = read_json(&spec_path)?;
     let spec_dir = spec_path.parent().unwrap_or(Path::new("."));
-    for edit in spec_record["edits"]
-        .as_object()
-        .into_iter()
-        .flat_map(|m| m.values())
-    {
+    for edit in spec_record["edits"].as_object().into_iter().flat_map(|m| m.values()) {
         for name in ["left", "right"] {
-            input_paths.insert(resolve(
-                spec_dir,
-                Path::new(edit[name].as_str().ok_or("edit lacks a factor file")?),
-            ));
+            input_paths.insert(resolve(spec_dir, Path::new(edit[name].as_str().ok_or("edit lacks a factor file")?)));
         }
     }
     let decoder = Decoder::from_export(&export)?;
     let mut spec = Spec::load(&spec_path, &decoder)?;
-    let groups: Vec<String> = key("groups", "")
-        .split(',')
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
+    let groups: Vec<String> = key("groups", "").split(',').filter(|s| !s.is_empty()).map(str::to_string).collect();
     for group in &groups {
         if !spec.episodes.iter().any(|e| &e.group == group) {
             return Err(format!("unknown episode group {group}"));
@@ -242,51 +170,41 @@ fn main() -> Result<(), String> {
     let imported = import_language_model(&export, 1, 1)?;
     let native = split_sites(&imported.program)?;
     let run = LanguageRun::new(&decoder, &native, &spec, &run_passages, parallel)?;
+    let backend = key("backend", "cpu");
+    let run = match backend.as_str() {
+        "cpu" => run,
+        "cuda" => {
+            let limit = keys.get("cuda_trace_bytes").ok_or("backend=cuda requires cuda_trace_bytes=N")?.parse::<usize>().map_err(|e| e.to_string())?;
+            let device =
+                gam_gpu::tensor::Device::accelerator(gam_gpu::GpuPolicy::Required).map_err(|e| e.to_string())?.ok_or("required CUDA device unavailable")?;
+            run.with_cuda(device, limit)?
+        }
+        _ => return Err("backend must be cpu or cuda".into()),
+    };
     let local_export = PathBuf::from(key("local_export", &export.display().to_string()));
-    input_paths.extend([
-        local_export.join("export.json"),
-        local_export.join("tokens.f64"),
-    ]);
+    input_paths.extend([local_export.join("export.json"), local_export.join("tokens.f64")]);
     let local_family = family(&passages(&local_export, context)?, count, context)?;
     let ascent_evaluations = number("ascent", 0)?;
     let ascent = if ascent_evaluations == 0 {
         None
     } else {
-        let vocabulary = native
-            .declarations
-            .domains
-            .first()
-            .ok_or("native has no token domain")?
-            .size;
+        let vocabulary = native.declarations.domains.first().ok_or("native has no token domain")?.size;
         let vocab = u32::try_from(vocabulary).map_err(|e| e.to_string())?;
-        Some(Ascent {
-            domain: vec![SlotDomain::Tokens((0..vocab).collect())],
-            pool: Vec::new(),
-            evaluations: ascent_evaluations,
-        })
+        Some(Ascent { domain: vec![SlotDomain::Tokens((0..vocab).collect())], pool: Vec::new(), evaluations: ascent_evaluations })
     };
     let local = Local::new(&native, local_family.clone(), ascent, batch);
     let start = Artifact::native(&native)?;
-    let mut candidates = vec![Candidate {
-        label: "native".into(),
-        artifact: start.clone(),
-    }];
+    let mut candidates = vec![Candidate { label: "native".into(), artifact: start.clone() }];
     let mut labels = BTreeSet::from(["native".to_string()]);
     let bank_dir = bank_path.parent().unwrap_or(Path::new("."));
     for entry in entries {
         if entry.label.is_empty() || !labels.insert(entry.label.clone()) {
-            return Err(format!(
-                "empty or duplicate candidate label {}",
-                entry.label
-            ));
+            return Err(format!("empty or duplicate candidate label {}", entry.label));
         }
         let path = resolve(bank_dir, &entry.artifact);
         let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let artifact = Artifact::from_bytes(&bytes, &native.declarations)?;
-        candidates.push(Candidate {
-            label: entry.label,
-            artifact,
-        });
+        candidates.push(Candidate { label: entry.label, artifact });
         input_paths.insert(path);
     }
     let mut account_count = 0;
@@ -294,23 +212,13 @@ fn main() -> Result<(), String> {
         let dir = Path::new(directory);
         let layers = layer_nodes(&native, decoder.layers())?;
         let first = layers.first().ok_or("accounts need a model with layers")?;
-        let d_in = native
-            .node_interface(first.normed)
-            .map_err(|e| e.to_string())?
-            .width();
-        let d_out = native
-            .node_interface(first.mlp)
-            .map_err(|e| e.to_string())?
-            .width();
+        let d_in = native.node_interface(first.normed).map_err(|e| e.to_string())?.width();
+        let d_out = native.node_interface(first.mlp).map_err(|e| e.to_string())?.width();
         let proposer = AccountProposer::load(dir, layers, d_in, d_out)?;
         account_count = proposer.accounts.len();
         for entry in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
             let path = entry.map_err(|e| e.to_string())?.path();
-            let Some(stem) = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .and_then(|s| s.strip_suffix(".rules.json"))
-            else {
+            let Some(stem) = path.file_name().and_then(|s| s.to_str()).and_then(|s| s.strip_suffix(".rules.json")) else {
                 continue;
             };
             if !stem.starts_with('L') {
@@ -325,10 +233,7 @@ fn main() -> Result<(), String> {
             }
         }
         let available = max_bank - (candidates.len() - 1);
-        for candidate in account_bank(&start, &proposer, available)?
-            .into_iter()
-            .skip(1)
-        {
+        for candidate in account_bank(&start, &proposer, available)?.into_iter().skip(1) {
             if !labels.insert(candidate.label.clone()) {
                 return Err(format!("duplicate generated label {}", candidate.label));
             }
@@ -340,17 +245,11 @@ fn main() -> Result<(), String> {
     let timer = Instant::now();
     let mut inputs = Vec::new();
     for path in input_paths {
-        let canonical =
-            std::fs::canonicalize(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let canonical = std::fs::canonicalize(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         inputs.push(json!({"path": canonical.display().to_string(), "bytes": std::fs::metadata(&canonical).map_err(|e| e.to_string())?.len(), "sha256": sha256(&canonical)?}));
     }
     let hashing_seconds = timer.elapsed().as_secs_f64();
-    eprintln!(
-        "{} candidate messages supplied, {} episodes, {} local rows",
-        supplied_candidates,
-        spec.episodes.len(),
-        local_family.rows
-    );
+    eprintln!("{} candidate messages supplied, {} episodes, {} local rows", supplied_candidates, spec.episodes.len(), local_family.rows);
     let timer = Instant::now();
     let evaluated = frontier(&local, &run, candidates, &constraints, budget)?;
     let frontier_seconds = timer.elapsed().as_secs_f64();
@@ -380,13 +279,11 @@ fn main() -> Result<(), String> {
             {
                 return Err(format!("selected candidate {} failed saved-byte verification", candidate.label));
             }
-            Some(
-                json!({"index": index, "label": candidate.label, "artifact": path.display().to_string(), "bytes": byte_count, "sha256": hash,
+            Some(json!({"index": index, "label": candidate.label, "artifact": path.display().to_string(), "bytes": byte_count, "sha256": hash,
                 "cost": measured.cost, "cost_bits": measured.cost.total(), "local_measure": measured.local_measure, "run_measure": measured.run_measure,
                 "local_verdict": format!("{:?}", local_fidelity.verdict()), "run_verdict": format!("{:?}", run_fidelity.verdict()),
                 "local_bounds": {"lower": measured.local.status().lower_bound(), "upper": measured.local.status().upper_bound()},
-                "run_bounds": {"lower": measured.run.status().lower_bound(), "upper": measured.run.status().upper_bound()}}),
-            )
+                "run_bounds": {"lower": measured.run.status().lower_bound(), "upper": measured.run.status().upper_bound()}}))
         } else {
             None
         };
@@ -394,6 +291,9 @@ fn main() -> Result<(), String> {
     }
     let replay_seconds = timer.elapsed().as_secs_f64();
     let report = json!({
+        "execution": {"backend": run.backend_name(), "local": "CPU f64", "teacher": "immutable cached CPU residuals and native effects", "readout_and_KL": "CPU f64", "cuda_episode_parallelism": 1, "teacher_parallelism": parallel, "teacher_cache_memory": "one final residual matrix per episode plus scalar native effects; initialization also retains clean native passage traces and requested donor rows",
+            "cuda_trace_limit_scope": "intermediate activation estimate only; excludes operators, attention workspaces, edit masks and allocator overhead",
+            "cuda_upload_scope": "full real artifact compiled/uploaded for each donor or episode; requested donor rows downloaded then reuploaded for mixes"},
         "scope": "explicit finite candidate bank; tested local inputs and declared counterfactual episodes only",
         "objective": "min C(P) subject to D_local <= delta and D_run <= epsilon",
         "optimality": "gap zero proves optimum within this bank only; unresolved, failed and unevaluated candidates remain in the lower bound",
@@ -407,16 +307,7 @@ fn main() -> Result<(), String> {
         "seconds": {"load_and_generation": loaded_seconds, "input_hashing": hashing_seconds, "frontier": frontier_seconds, "selected_replay": replay_seconds, "total": started.elapsed().as_secs_f64()}
     });
     let path = out.join("report.json");
-    std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| format!("{}: {e}", path.display()))?;
-    eprintln!(
-        "{} distinct candidates, {} measured; {}",
-        evaluated.bank.len(),
-        evaluated.measured_candidates,
-        path.display()
-    );
+    std::fs::write(&path, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| format!("{}: {e}", path.display()))?;
+    eprintln!("{} distinct candidates, {} measured; {}", evaluated.bank.len(), evaluated.measured_candidates, path.display());
     Ok(())
 }

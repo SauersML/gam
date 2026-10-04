@@ -535,24 +535,210 @@ fn apply_node_edits(
     Ok(())
 }
 
+/// Apply the same action order as apply_node_edits without downloading live values.
+fn apply_device_node_edits<'a>(
+    device: &gam_gpu::tensor::Device,
+    node: usize,
+    rows: usize,
+    root_value: impl Fn(usize) -> Result<&'a gam_gpu::tensor::Tensor, String>,
+    edits: &BTreeMap<usize, Vec<NodeEdit>>,
+    donor: &BTreeMap<DonorKey, Array1<f64>>,
+) -> Result<Option<gam_gpu::tensor::Tensor>, String> {
+    use gam_gpu::tensor::{Arithmetic, Op};
+    let Some(actions) = edits.get(&node) else {
+        return Ok(None);
+    };
+    let original = root_value(node)?;
+    let width = original.cols();
+    let mut value = device.copy(original).map_err(|e| e.to_string())?;
+    for action in actions {
+        match action {
+            NodeEdit::Scale { rows: affected, columns, scale } => {
+                if columns.end > width {
+                    return Err("device scale outside interface".into());
+                }
+                let mut mask = Array2::ones((rows, width));
+                for row in 0..rows {
+                    if matches!(affected, Rows::All) || *affected == Rows::One(row) {
+                        mask.slice_mut(s![row, columns.clone()]).fill(*scale);
+                    }
+                }
+                let mask = device.upload(mask.view()).map_err(|e| e.to_string())?;
+                let mut scaled = device.zeros(rows, width).map_err(|e| e.to_string())?;
+                device.hadamard(&mut scaled, &value, &mask, false).map_err(|e| e.to_string())?;
+                value = scaled;
+            }
+            NodeEdit::Mix { row, columns, alpha, donor: key } => {
+                if *row >= rows || columns.end > width {
+                    return Err("device mix outside interface".into());
+                }
+                let d = donor.get(key).ok_or("a donor state not recorded")?;
+                if d.len() != columns.len() {
+                    return Err("device donor width differs from mix interface".into());
+                }
+                let mut mask = Array2::ones((rows, width));
+                mask.slice_mut(s![*row, columns.clone()]).fill(1.0 - alpha);
+                let mask = device.upload(mask.view()).map_err(|e| e.to_string())?;
+                let mut mixed = device.zeros(rows, width).map_err(|e| e.to_string())?;
+                device.hadamard(&mut mixed, &value, &mask, false).map_err(|e| e.to_string())?;
+                let mut donor_row = Array2::zeros((1, width));
+                donor_row.slice_mut(s![0, columns.clone()]).assign(d);
+                let donor_row = device.upload(donor_row.view()).map_err(|e| e.to_string())?;
+                let donor_rows = device.broadcast_rows(&donor_row, rows).map_err(|e| e.to_string())?;
+                let mut mask = Array2::zeros((rows, width));
+                mask.slice_mut(s![*row, columns.clone()]).fill(1.0);
+                let mask = device.upload(mask.view()).map_err(|e| e.to_string())?;
+                let mut addition = device.zeros(rows, width).map_err(|e| e.to_string())?;
+                device.hadamard(&mut addition, &donor_rows, &mask, false).map_err(|e| e.to_string())?;
+                device.axpy(&mut mixed, *alpha, &addition).map_err(|e| e.to_string())?;
+                value = mixed;
+            }
+            NodeEdit::AddMap { input, left, right } => {
+                let incoming = root_value(*input)?;
+                if left.nrows() != width || right.nrows() != incoming.cols() || left.ncols() != right.ncols() {
+                    return Err("device weight-edit factors differ from held interfaces".into());
+                }
+                let left = device.upload(left.view()).map_err(|e| e.to_string())?;
+                let right = device.upload(right.view()).map_err(|e| e.to_string())?;
+                let mut hidden = device.zeros(rows, right.cols()).map_err(|e| e.to_string())?;
+                device.gemm(&mut hidden, 1.0, incoming, Op::N, &right, Op::N, 0.0, Arithmetic::F64).map_err(|e| e.to_string())?;
+                let mut addition = device.zeros(rows, width).map_err(|e| e.to_string())?;
+                device.gemm(&mut addition, 1.0, &hidden, Op::N, &left, Op::T, 0.0, Arithmetic::F64).map_err(|e| e.to_string())?;
+                device.axpy(&mut value, 1.0, &addition).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(Some(value))
+}
+
+struct TeacherEpisodes {
+    residuals: Vec<Array2<f64>>,
+    native_effects: Vec<f64>,
+}
+
 /// `D_run` of a language model's artifact (module note).
 pub struct LanguageRun<'a> {
-    pub decoder: &'a Decoder,
-    pub native: &'a OperatorProgram,
-    pub spec: &'a Spec,
-    pub passages: &'a [Vec<u32>],
+    decoder: &'a Decoder,
+    native: &'a OperatorProgram,
+    spec: &'a Spec,
+    passages: &'a [Vec<u32>],
     /// The native program's site nodes and final residual node.
-    pub layers: Vec<LayerNodes>,
+    layers: Vec<LayerNodes>,
     /// Episodes run at once.
     pub parallel: usize,
     /// Output rows read through the unembedding at once.
     pub tile: usize,
+    device: Option<gam_gpu::tensor::Device>,
+    trace_bytes_limit: usize,
+    teachers: std::sync::OnceLock<Result<TeacherEpisodes, String>>,
 }
 
 impl<'a> LanguageRun<'a> {
     pub fn new(decoder: &'a Decoder, native: &'a OperatorProgram, spec: &'a Spec, passages: &'a [Vec<u32>], parallel: usize) -> Result<Self, String> {
         let layers = layer_nodes(native, decoder.layers())?;
-        Ok(Self { decoder, native, spec, passages, layers, parallel, tile: 64 })
+        Ok(Self { decoder, native, spec, passages, layers, parallel, tile: 64, device: None, trace_bytes_limit: 0, teachers: std::sync::OnceLock::new() })
+    }
+
+    /// Explicit hybrid backend: P's forwards and interventions run CUDA f64 without
+    /// fallback; immutable native teachers, local fidelity and readout/KL remain CPU.
+    /// The limit covers retained intermediate values only, not complete GPU allocation.
+    pub fn with_cuda(mut self, device: gam_gpu::tensor::Device, trace_bytes_limit: usize) -> Result<Self, String> {
+        if !cfg!(target_os = "linux") || device.is_host() || !device.float64() || trace_bytes_limit == 0 {
+            return Err("CUDA LanguageRun needs a float64 Linux accelerator and positive trace byte limit".into());
+        }
+        self.device = Some(device);
+        self.trace_bytes_limit = trace_bytes_limit;
+        Ok(self)
+    }
+
+    pub fn backend_name(&self) -> &'static str {
+        if self.device.is_some() { "hybrid: explained CUDA f64; cached teacher and readout/KL CPU" } else { "CPU f64; cached native teachers" }
+    }
+
+    /// Fixed references belong to this runner's immutable borrowed dataset, never
+    /// to a global cache or guessed data key. No candidate can modify their inputs.
+    fn teacher_episodes(&self) -> Result<&TeacherEpisodes, String> {
+        self.teachers
+            .get_or_init(|| {
+                let pool = rayon::ThreadPoolBuilder::new().num_threads(self.parallel.max(1)).build().map_err(|e| e.to_string())?;
+                pool.install(|| {
+                    use rayon::prelude::*;
+                    let decoder = self.decoder;
+                    let all_rows: Vec<usize> = (0..self.spec.rows).collect();
+                    let native_donors: BTreeMap<usize, Donor> = self
+                        .spec
+                        .episodes
+                        .iter()
+                        .filter_map(|e| e.donor)
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_par_iter()
+                        .map(|d| {
+                            let keys: Vec<(usize, usize, bool)> = self
+                                .spec
+                                .episodes
+                                .iter()
+                                .filter(|e| e.donor == Some(d))
+                                .flat_map(|e| e.actions.iter().filter_map(Action::donor_state))
+                                .collect::<std::collections::BTreeSet<_>>()
+                                .into_iter()
+                                .collect();
+                            let mut native = Program::new(Maps::Native(decoder), &[], None);
+                            native.record = keys.iter().map(|k| (*k, None)).collect();
+                            decoder.forward(&self.passages[d], &mut native, &[]);
+                            let states = native
+                                .record
+                                .into_iter()
+                                .map(|(k, v)| v.map(|v| (k, v)).ok_or("a native donor state not reached"))
+                                .collect::<Result<_, _>>()?;
+                            Ok((d, Donor { states }))
+                        })
+                        .collect::<Result<_, String>>()?;
+                    let clean: BTreeMap<usize, Forward> = self
+                        .spec
+                        .episodes
+                        .iter()
+                        .map(|e| e.passage)
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_par_iter()
+                        .map(|p| {
+                            let mut native = Program::new(Maps::Native(decoder), &[], None);
+                            (p, decoder.forward(&self.passages[p], &mut native, &all_rows))
+                        })
+                        .collect();
+                    let none = Donor::default();
+                    let measured = self
+                        .spec
+                        .episodes
+                        .par_iter()
+                        .map(|episode| {
+                            let native_donor = episode.donor.and_then(|d| native_donors.get(&d)).unwrap_or(&none);
+                            let mut native = Program::new(Maps::Native(decoder), &episode.actions, Some(native_donor));
+                            let reference = decoder.forward(&self.passages[episode.passage], &mut native, &episode.interface_rows);
+                            let from = episode.actions.iter().map(Action::first_row).min().unwrap_or(0);
+                            let rows = reference.residual.nrows();
+                            if from > rows {
+                                return Err("teacher intervention starts beyond passage".to_string());
+                            }
+                            let mut effect = 0.0;
+                            let mut start = from;
+                            while start < rows {
+                                let end = (start + self.tile.max(1)).min(rows);
+                                let p = decoder.log_probs(&reference.residual.slice(s![start..end, ..]).to_owned());
+                                let c = decoder.log_probs(&clean[&episode.passage].residual.slice(s![start..end, ..]).to_owned());
+                                for row in 0..end - start {
+                                    effect += kl_logits(p.row(row), c.row(row)).0;
+                                }
+                                start = end;
+                            }
+                            Ok((reference.residual, effect / (rows - from).max(1) as f64))
+                        })
+                        .collect::<Result<Vec<_>, String>>()?;
+                    let (residuals, native_effects) = measured.into_iter().unzip();
+                    Ok(TeacherEpisodes { residuals, native_effects })
+                })
+            })
+            .as_ref()
+            .map_err(Clone::clone)
     }
 
     fn family(&self, passage: usize) -> FamilyInputs {
@@ -588,6 +774,29 @@ impl<'a> LanguageRun<'a> {
         residuals: &[usize],
     ) -> Result<(Vec<Array2<f64>>, BTreeMap<DonorKey, Array1<f64>>), String> {
         let family = self.family(passage);
+        if let Some(device) = &self.device {
+            // One full genuine artifact compiled at a time. Its unchanged dense
+            // head remains streamed, avoiding rows x vocabulary materialization.
+            let resident = crate::artifact_device::Resident::from_decoded(device, program)?;
+            let estimate = resident.estimated_intermediate_bytes(family.rows)?;
+            if estimate > self.trace_bytes_limit {
+                return Err(format!("CUDA intermediate values need at least {estimate} bytes, exceeding declared trace limit {}", self.trace_bytes_limit));
+            }
+            let trace = resident.forward_edited_intermediates(&family, |node, trace| {
+                apply_device_node_edits(device, node, family.rows, |root| resident.root_value(trace, root), edits, donor)
+            })?;
+            let mut recorded = BTreeMap::new();
+            for key in record {
+                if key.row >= family.rows {
+                    return Err("CUDA donor row beyond passage".into());
+                }
+                let row = device.rows_of(resident.root_value(&trace, key.node)?, key.row, 1).map_err(|e| e.to_string())?;
+                recorded.insert(*key, device.download(&row).map_err(|e| e.to_string())?.row(0).to_owned());
+            }
+            let states =
+                residuals.iter().map(|root| device.download(resident.root_value(&trace, *root)?).map_err(|e| e.to_string())).collect::<Result<_, _>>()?;
+            return Ok((states, recorded));
+        }
         let mut recorded = BTreeMap::new();
         let trace = program.execute_edited(&family, |node, value, earlier| {
             apply_node_edits(node, value, earlier, edits, donor)?;
@@ -605,7 +814,7 @@ impl<'a> LanguageRun<'a> {
     fn truncated(&self, artifact: &Artifact) -> Result<(Artifact, Vec<usize>), String> {
         let last = self.layers.last().ok_or("no layer")?.residual;
         check_native_tail(self.native, artifact, last)?;
-        let program = artifact.truncated(last)?;
+        let program = if self.device.is_some() { artifact.clone() } else { artifact.truncated(last)? };
         let residuals: Vec<usize> = self
             .layers
             .iter()
@@ -668,7 +877,7 @@ impl RunCheck for LanguageRun<'_> {
         let decoder = self.decoder;
         let head_dim = self.native.node_interface(self.layers[0].reads[0]).map_err(|e| e.to_string())?.width();
         let (program, residuals) = self.truncated(artifact)?;
-        let all_rows: Vec<usize> = (0..self.spec.rows).collect();
+        let teachers = self.teacher_episodes()?;
         // Each episode's edits of P, and the donor states they read.
         let mut plans = Vec::with_capacity(self.spec.episodes.len());
         let mut wanted: BTreeMap<usize, Vec<DonorKey>> = BTreeMap::new();
@@ -700,56 +909,19 @@ impl RunCheck for LanguageRun<'_> {
             }
             plans.push((episode_program, episode_residuals, edits, unheld));
         }
-        let native_donors: BTreeMap<usize, Donor> = self
-            .spec
-            .episodes
-            .iter()
-            .filter_map(|e| e.donor)
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_par_iter()
-            .map(|d| {
-                let keys: Vec<(usize, usize, bool)> = self
-                    .spec
-                    .episodes
-                    .iter()
-                    .filter(|e| e.donor == Some(d))
-                    .flat_map(|e| e.actions.iter().filter_map(Action::donor_state))
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
-                let mut native = Program::new(Maps::Native(decoder), &[], None);
-                native.record = keys.iter().map(|k| (*k, None)).collect();
-                decoder.forward(&self.passages[d], &mut native, &[]);
-                let states = native.record.into_iter().map(|(k, v)| v.map(|v| (k, v)).ok_or("a native donor state not reached")).collect::<Result<_, _>>()?;
-                Ok((d, Donor { states }))
-            })
-            .collect::<Result<_, String>>()?;
-        let own_donors: BTreeMap<usize, BTreeMap<DonorKey, Array1<f64>>> = wanted
-            .par_iter()
-            .map(|(d, keys)| Ok((*d, self.run(&program, *d, &BTreeMap::new(), &BTreeMap::new(), keys, &residuals)?.1)))
-            .collect::<Result<_, String>>()?;
-        let clean: BTreeMap<usize, Forward> = self
-            .spec
-            .episodes
-            .iter()
-            .map(|e| e.passage)
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_par_iter()
-            .map(|p| {
-                let mut native = Program::new(Maps::Native(decoder), &[], None);
-                (p, decoder.forward(&self.passages[p], &mut native, &all_rows))
-            })
-            .collect();
-        let none = Donor::default();
+        let make_donor = |(d, keys): (&usize, &Vec<DonorKey>)| Ok((*d, self.run(&program, *d, &BTreeMap::new(), &BTreeMap::new(), keys, &residuals)?.1));
+        let own_donors: BTreeMap<usize, BTreeMap<DonorKey, Array1<f64>>> = if self.device.is_some() {
+            wanted.iter().map(make_donor).collect::<Result<_, String>>()?
+        } else {
+            wanted.par_iter().map(make_donor).collect::<Result<_, String>>()?
+        };
         let empty = BTreeMap::new();
-        let score_one = |(episode, (episode_program, episode_residuals, edits, unheld)): (
-            &super::counterfactual::Episode,
-            &(Artifact, Vec<usize>, BTreeMap<usize, Vec<NodeEdit>>, usize),
+        let score_one = |(index, (episode, (episode_program, episode_residuals, edits, unheld))): (
+            usize,
+            (&super::counterfactual::Episode, &(Artifact, Vec<usize>, BTreeMap<usize, Vec<NodeEdit>>, usize)),
         )|
          -> Result<EpisodeScore, String> {
-            let native_donor = episode.donor.and_then(|d| native_donors.get(&d)).unwrap_or(&none);
-            let mut native = Program::new(Maps::Native(decoder), &episode.actions, Some(native_donor));
-            let reference = decoder.forward(&self.passages[episode.passage], &mut native, &episode.interface_rows);
+            let reference = &teachers.residuals[index];
             let own = episode.donor.and_then(|d| own_donors.get(&d)).unwrap_or(&empty);
             let (states, _) = self.run(episode_program, episode.passage, edits, own, &[], episode_residuals)?;
             let explained = Forward {
@@ -757,20 +929,17 @@ impl RunCheck for LanguageRun<'_> {
                 layers: states.iter().map(|x| x.select(Axis(0), &episode.interface_rows)).collect(),
             };
             let from = episode.actions.iter().map(Action::first_row).min().unwrap_or(0);
-            let clean = &clean[&episode.passage];
-            let rows = reference.residual.nrows();
-            let (mut kl, mut error, mut effect, mut agree) = (0.0, 0.0, 0.0, 0.0);
+            let rows = reference.nrows();
+            let (mut kl, mut error, mut agree) = (0.0, 0.0, 0.0);
             let mut start = from;
             while start < rows {
-                let end = (start + self.tile).min(rows);
-                let p = decoder.log_probs(&reference.residual.slice(s![start..end, ..]).to_owned());
+                let end = (start + self.tile.max(1)).min(rows);
+                let p = decoder.log_probs(&reference.slice(s![start..end, ..]).to_owned());
                 let q = decoder.log_probs(&explained.residual.slice(s![start..end, ..]).to_owned());
-                let c = decoder.log_probs(&clean.residual.slice(s![start..end, ..]).to_owned());
                 for r in 0..end - start {
                     let (value, rounding) = kl_logits(p.row(r), q.row(r));
                     kl += value;
                     error += rounding;
-                    effect += kl_logits(p.row(r), c.row(r)).0;
                 }
                 agree += top1_rows(&p, &q).iter().filter(|a| **a).count() as f64;
                 start = end;
@@ -781,15 +950,19 @@ impl RunCheck for LanguageRun<'_> {
                 group: episode.group.clone(),
                 kl: kl / n,
                 numerical_error: (error / n).next_up(),
-                native_effect: effect / n,
+                native_effect: teachers.native_effects[index],
                 top1_agree: agree / n,
                 unheld: *unheld,
             })
         };
-        let pairs: Vec<_> = self.spec.episodes.iter().zip(plans.iter()).collect();
+        let pairs: Vec<_> = self.spec.episodes.iter().zip(plans.iter()).enumerate().collect();
         let mut out = Vec::with_capacity(pairs.len());
-        for chunk in pairs.chunks(self.parallel.max(1)) {
-            let scored: Vec<Result<EpisodeScore, String>> = chunk.par_iter().map(|pair| score_one(*pair)).collect();
+        for chunk in pairs.chunks(if self.device.is_some() { 1 } else { self.parallel.max(1) }) {
+            let scored: Vec<Result<EpisodeScore, String>> = if self.device.is_some() {
+                chunk.iter().map(|pair| score_one(*pair)).collect()
+            } else {
+                chunk.par_iter().map(|pair| score_one(*pair)).collect()
+            };
             for s in scored {
                 out.push(s?);
             }
@@ -1102,5 +1275,37 @@ mod tail_contract_tests {
         artifact.program.output = 4;
         artifact.places = vec![(0, 0), (1, 1), (2, 3), (3, 4)];
         assert!(check_native_tail(&native, &artifact, 1).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod cuda_edit_reference_tests {
+    use super::*;
+    #[test]
+    fn device_edits_preserve_order_partial_rows_and_low_rank_input() {
+        let device = gam_gpu::tensor::Device::host();
+        let input = ndarray::array![[0.2, -0.7], [1.1, 0.4]];
+        // This starting value includes the prior exception addition. The edit
+        // callback must consume it, rather than reconstruct a clean value.
+        let value = ndarray::array![[3.4, 0.6], [-0.3, 1.7]];
+        let key = DonorKey { node: 7, row: 1 };
+        let donor = BTreeMap::from([(key.clone(), ndarray::array![2.3])]);
+        let edits = BTreeMap::from([(
+            1,
+            vec![
+                NodeEdit::Scale { rows: Rows::One(0), columns: 0..1, scale: 0.3 },
+                NodeEdit::Mix { row: 1, columns: 1..2, alpha: 0.4, donor: key },
+                NodeEdit::AddMap { input: 0, left: Arc::new(ndarray::array![[0.6], [-0.2]]), right: Arc::new(ndarray::array![[0.3], [0.8]]) },
+            ],
+        )]);
+        let mut expected = value.clone();
+        apply_node_edits(1, &mut expected, &[input.clone()], &edits, &donor).unwrap();
+        let roots = [device.upload(input.view()).unwrap(), device.upload(value.view()).unwrap()];
+        let actual = apply_device_node_edits(&device, 1, 2, |n| Ok(&roots[n]), &edits, &donor).unwrap().unwrap();
+        let actual = device.download(&actual).unwrap();
+        for (a, b) in actual.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-12, "{a} differs from {b}");
+        }
+        assert!(apply_device_node_edits(&device, 99, 2, |_| Err("unmaterialized head".into()), &edits, &donor).unwrap().is_none());
     }
 }

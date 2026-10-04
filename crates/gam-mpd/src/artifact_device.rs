@@ -11,12 +11,7 @@ use std::sync::Arc;
 /// Each old root node has a distinct materialized value, including identity-call outputs.
 pub fn mapped_inlined(program: &OperatorProgram) -> Result<(OperatorProgram, Vec<usize>), String> {
     program.interfaces().map_err(|e| e.to_string())?;
-    fn expand(
-        original: &OperatorProgram,
-        body: &[Node],
-        args: &[usize],
-        flat: &mut OperatorProgram,
-    ) -> Result<Vec<usize>, String> {
+    fn expand(original: &OperatorProgram, body: &[Node], args: &[usize], flat: &mut OperatorProgram) -> Result<Vec<usize>, String> {
         let mut map = Vec::with_capacity(body.len());
         for node in body {
             let value = match node {
@@ -31,14 +26,8 @@ pub fn mapped_inlined(program: &OperatorProgram) -> Result<(OperatorProgram, Vec
                     flat.output = source;
                     let interface = flat.node_interface(source).map_err(|e| e.to_string())?;
                     let operator = flat.operators.len();
-                    flat.operators.push(Arc::new(Operator::identity(
-                        "call output barrier",
-                        interface,
-                    )));
-                    flat.nodes.push(Node::Affine {
-                        terms: vec![(source, operator)],
-                        bias: None,
-                    });
+                    flat.operators.push(Arc::new(Operator::identity("call output barrier", interface)));
+                    flat.nodes.push(Node::Affine { terms: vec![(source, operator)], bias: None });
                     flat.nodes.len() - 1
                 }
                 other => {
@@ -101,52 +90,73 @@ impl Resident {
             return Err("artifact device needs an accelerator".into());
         }
         let artifact = EncodedArtifact::of(&candidate.f32_literals()?)?.decode()?;
+        Self::from_decoded(device, &artifact)
+    }
+    /// Acceptance already supplies decoded P. Preserve its executed numerical values;
+    /// do not repeat literal rounding, serialization or derived-operator computation.
+    pub fn from_decoded(device: &Device, candidate: &Artifact) -> Result<Self, String> {
+        if device.is_host() || !device.float64() {
+            return Err("artifact device needs a float64 accelerator".into());
+        }
+        candidate.program.interfaces().map_err(|e| e.to_string())?;
+        let artifact = candidate.clone();
         let (flat, map) = mapped_inlined(&artifact.program)?;
         let output = flat.output;
         for exception in &artifact.exceptions {
-            if matches!(artifact.program.nodes[exception.node], Node::Feature { .. }) {
-                return Err(
-                    "artifact feature-node exceptions need unsupported token-basis materialization"
-                        .into(),
-                );
+            let node = artifact.program.nodes.get(exception.node).ok_or("exception node outside artifact")?;
+            let width = artifact.program.node_interface(exception.node).map_err(|e| e.to_string())?.width();
+            if exception.column >= width || !exception.value.is_finite() {
+                return Err("invalid exception column or nonfinite value".into());
+            }
+            if matches!(node, Node::Feature { .. }) {
+                return Err("artifact feature-node exceptions need unsupported token-basis materialization".into());
             }
         }
         let program = DeviceProgram::compile(device, &flat)?;
-        let roots = map
-            .iter()
-            .enumerate()
-            .map(|(old, &new)| (new, old))
-            .collect();
-        Ok(Self {
-            artifact,
-            map,
-            roots,
-            program,
-            output,
-        })
+        let roots = map.iter().enumerate().map(|(old, &new)| (new, old)).collect();
+        Ok(Self { artifact, map, roots, program, output })
     }
     pub fn place(&self, native: usize) -> Option<usize> {
         self.artifact.place(native).map(|old| self.map[old])
     }
-    pub fn root_value<'a>(
-        &self,
-        trace: &'a DeviceTrace,
-        root: usize,
-    ) -> Result<&'a Tensor, String> {
+    pub fn root_value<'a>(&self, trace: &'a DeviceTrace, root: usize) -> Result<&'a Tensor, String> {
         let node = *self.map.get(root).ok_or("root node outside artifact")?;
         trace.value(node)
     }
     /// Incomplete resident-value memory estimate. Excludes attention workspaces, weights,
     /// exception tensors and allocation overhead. The caller chooses and limits batch rows.
     pub fn estimated_resident_bytes(&self, rows: usize) -> Result<usize, String> {
-        rows.checked_mul(self.program.edited_bytes_per_row())
-            .ok_or("edited batch size overflow".into())
+        rows.checked_mul(self.program.edited_bytes_per_row()).ok_or("edited batch size overflow".into())
+    }
+    /// Values retained by intermediate execution; excludes weights, attention workspaces,
+    /// edit masks, exceptions and allocation overhead.
+    pub fn estimated_intermediate_bytes(&self, rows: usize) -> Result<usize, String> {
+        rows.checked_mul(self.program.bytes_per_row()).ok_or("intermediate batch size overflow".into())
     }
     /// Add exceptions, then invoke root-node edits. Edits return a fresh replacement tensor;
     /// they cannot mutate an aliased upstream value. DeviceTrace indices here are expanded.
     pub fn forward_edited(
         &self,
         family: &FamilyInputs,
+        edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
+    ) -> Result<DeviceTrace, String> {
+        self.forward_hooks(family, true, edit)
+    }
+    /// Preserve root edit identity while leaving the checked native head streamed.
+    pub fn forward_edited_intermediates(
+        &self,
+        family: &FamilyInputs,
+        edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
+    ) -> Result<DeviceTrace, String> {
+        if self.artifact.exceptions.iter().any(|e| self.program.is_streamed_head(self.map[e.node])) {
+            return Err("intermediate execution cannot skip an executable head exception".into());
+        }
+        self.forward_hooks(family, false, edit)
+    }
+    fn forward_hooks(
+        &self,
+        family: &FamilyInputs,
+        materialize_head: bool,
         mut edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
     ) -> Result<DeviceTrace, String> {
         let d = self.program.device();
@@ -154,15 +164,8 @@ impl Resident {
         let row_contexts = contexts(family);
         for exception in &self.artifact.exceptions {
             let node = self.map[exception.node];
-            let width = self
-                .artifact
-                .program
-                .node_interface(exception.node)
-                .map_err(|e| e.to_string())?
-                .width();
-            let values = additions
-                .entry(node)
-                .or_insert_with(|| Array2::zeros((family.rows, width)));
+            let width = self.artifact.program.node_interface(exception.node).map_err(|e| e.to_string())?.width();
+            let values = additions.entry(node).or_insert_with(|| Array2::zeros((family.rows, width)));
             for (row, context) in row_contexts.iter().enumerate() {
                 if *context == exception.context {
                     values[[row, exception.column]] += f64::from(exception.value);
@@ -174,26 +177,25 @@ impl Resident {
             tensors.insert(node, d.upload(values.view()).map_err(|e| e.to_string())?);
         }
         // Two hooks are required: exception addition is visible in the trace before edit runs.
-        self.program.forward_edited(
-            family,
-            BTreeMap::new(),
-            |node, value| {
-                if let Some(add) = tensors.get(&node) {
-                    d.axpy(value, 1.0, add).map_err(|e| e.to_string())?;
-                }
-                Ok(())
-            },
-            |node, trace| match self.roots.get(&node) {
-                Some(&root) => edit(root, trace),
-                None => Ok(None),
-            },
-        )
+        let before = |node, value: &mut Tensor| {
+            if let Some(add) = tensors.get(&node) {
+                d.axpy(value, 1.0, add).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        };
+        let after = |node, trace: &DeviceTrace| match self.roots.get(&node) {
+            Some(&root) => edit(root, trace),
+            None => Ok(None),
+        };
+        if materialize_head {
+            self.program.forward_edited(family, BTreeMap::new(), before, after)
+        } else {
+            self.program.forward_edited_intermediates(family, before, after)
+        }
     }
+
     pub fn output(&self, trace: &DeviceTrace) -> Result<Tensor, String> {
-        self.program
-            .device()
-            .copy(trace.value(self.output)?)
-            .map_err(|e| e.to_string())
+        self.program.device().copy(trace.value(self.output)?).map_err(|e| e.to_string())
     }
 }
 
@@ -204,69 +206,33 @@ mod tests {
     use crate::operator_program::{Declarations, Interface, Rule, Slot, SlotValues};
     fn fixture(nested: bool) -> (Artifact, FamilyInputs) {
         let interface = Interface::native(2).unwrap();
-        let mut rules = vec![Rule {
-            name: "identity".into(),
-            inputs: vec![interface.clone()],
-            nodes: vec![Node::Param { index: 0 }],
-            output: 0,
-        }];
+        let mut rules = vec![Rule { name: "identity".into(), inputs: vec![interface.clone()], nodes: vec![Node::Param { index: 0 }], output: 0 }];
         if nested {
             rules.push(Rule {
                 name: "nested identity".into(),
                 inputs: vec![interface.clone()],
-                nodes: vec![
-                    Node::Param { index: 0 },
-                    Node::Call {
-                        rule: 0,
-                        arguments: vec![0],
-                    },
-                ],
+                nodes: vec![Node::Param { index: 0 }, Node::Call { rule: 0, arguments: vec![0] }],
                 output: 1,
             });
         }
         let program = OperatorProgram {
-            declarations: Declarations {
-                domains: Vec::new(),
-                slots: vec![Slot::Raw { width: 2 }],
-                parameters: 0,
-            },
+            declarations: Declarations { domains: Vec::new(), slots: vec![Slot::Raw { width: 2 }], parameters: 0 },
             bases: Vec::new(),
             operators: vec![Arc::new(Operator::identity("I", interface))],
             rules,
             nodes: vec![
                 Node::Raw { slot: 0 },
-                Node::Call {
-                    rule: usize::from(nested),
-                    arguments: vec![0],
-                },
-                Node::Affine {
-                    terms: vec![(0, 0)],
-                    bias: None,
-                },
-                Node::Affine {
-                    terms: vec![(1, 0), (2, 0)],
-                    bias: None,
-                },
+                Node::Call { rule: usize::from(nested), arguments: vec![0] },
+                Node::Affine { terms: vec![(0, 0)], bias: None },
+                Node::Affine { terms: vec![(1, 0), (2, 0)], bias: None },
             ],
             output: 3,
         };
-        (
-            Artifact::native(&program).unwrap(),
-            FamilyInputs {
-                rows: 1,
-                slots: vec![SlotValues::Raw(ndarray::array![[1.0, 2.0]])],
-                layout: None,
-            },
-        )
+        (Artifact::native(&program).unwrap(), FamilyInputs { rows: 1, slots: vec![SlotValues::Raw(ndarray::array![[1.0, 2.0]])], layout: None })
     }
     fn alias_test(nested: bool) {
         let (mut artifact, family) = fixture(nested);
-        artifact.exceptions.push(Exception {
-            context: vec![],
-            node: 1,
-            column: 0,
-            value: 3.0,
-        });
+        artifact.exceptions.push(Exception { context: vec![], node: 1, column: 0, value: 3.0 });
         let original = artifact
             .execute_edited(&family, |node, values, _| {
                 if node == 1 {
@@ -292,14 +258,8 @@ mod tests {
         assert_eq!(callbacks, vec![0, 1, 2, 3]);
         assert_eq!(trace.values[map[0]], ndarray::array![[1.0, 2.0]]);
         assert_eq!(trace.values[map[2]], ndarray::array![[1.0, 2.0]]);
-        assert_eq!(
-            trace.values[expanded.program.output],
-            ndarray::array![[9.0, 6.0]]
-        );
-        assert_eq!(
-            trace.values[expanded.program.output],
-            original.values[artifact.program.output]
-        );
+        assert_eq!(trace.values[expanded.program.output], ndarray::array![[9.0, 6.0]]);
+        assert_eq!(trace.values[expanded.program.output], original.values[artifact.program.output]);
     }
     #[test]
     fn identity_call_exception_and_intervention_do_not_change_input_or_sibling() {
@@ -314,40 +274,17 @@ mod tests {
         let (mut artifact, family) = fixture(true);
         let interface = Interface::native(2).unwrap();
         for name in ["gain", "final gain", "derived"] {
-            artifact
-                .program
-                .operators
-                .push(Arc::new(Operator::identity(name, interface.clone())));
+            artifact.program.operators.push(Arc::new(Operator::identity(name, interface.clone())));
         }
-        artifact = artifact
-            .derive(
-                3,
-                OperatorLaw::Copy {
-                    value: 0,
-                    gain: 1,
-                    final_gain: 2,
-                },
-                0.5,
-                vec![],
-            )
-            .unwrap();
-        artifact.program.nodes[2] = Node::Affine {
-            terms: vec![(0, 3)],
-            bias: None,
-        };
+        artifact = artifact.derive(3, OperatorLaw::Copy { value: 0, gain: 1, final_gain: 2 }, 0.5, vec![]).unwrap();
+        artifact.program.nodes[2] = Node::Affine { terms: vec![(0, 3)], bias: None };
         let decoded = EncodedArtifact::of(&artifact).unwrap().decode().unwrap();
         let (expanded, _) = expanded_artifact(&decoded).unwrap();
-        assert!(Arc::ptr_eq(
-            &decoded.program.operators[3],
-            &expanded.program.operators[3]
-        ));
+        assert!(Arc::ptr_eq(&decoded.program.operators[3], &expanded.program.operators[3]));
         assert_eq!(expanded.derived, decoded.derived);
         let a = decoded.execute(&family).unwrap();
         let b = expanded.execute(&family).unwrap();
-        assert_eq!(
-            a.values[decoded.program.output],
-            b.values[expanded.program.output]
-        );
+        assert_eq!(a.values[decoded.program.output], b.values[expanded.program.output]);
     }
     #[test]
     fn four_layer_terminal_readout_materializes_after_logit_exception_before_readout_edit() {
@@ -388,11 +325,8 @@ mod tests {
                 },
                 |node, trace| {
                     if node == program.output {
-                        let mut doubled =
-                            device.copy(trace.value(node)?).map_err(|e| e.to_string())?;
-                        device
-                            .axpy(&mut doubled, 1.0, trace.value(node)?)
-                            .map_err(|e| e.to_string())?;
+                        let mut doubled = device.copy(trace.value(node)?).map_err(|e| e.to_string())?;
+                        device.axpy(&mut doubled, 1.0, trace.value(node)?).map_err(|e| e.to_string())?;
                         Ok(Some(doubled))
                     } else {
                         Ok(None)
@@ -400,15 +334,56 @@ mod tests {
                 },
             )
             .unwrap();
-        let output = device
-            .download(actual.value(program.output).unwrap())
-            .unwrap();
-        let gap = (&output - &expected.values[program.output])
-            .iter()
-            .map(|x| x.abs())
-            .fold(0.0f64, f64::max);
+        let output = device.download(actual.value(program.output).unwrap()).unwrap();
+        let gap = (&output - &expected.values[program.output]).iter().map(|x| x.abs()).fold(0.0f64, f64::max);
         assert!(gap < 1e-10, "terminal readout edit gap {gap}");
         assert!(actual.value(logits).is_ok());
         assert!(actual.value(program.output).is_ok());
+    }
+    #[test]
+    fn edited_intermediates_skip_real_native_head_but_preserve_residual_edits() {
+        let dir = crate::explanation_tests::tiny_export("device_intermediate_head", 2);
+        let imported = crate::import::import_language_model(&dir, 1, 12).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        let p = imported.program;
+        let family = imported.contract.family;
+        let last = p
+            .nodes
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, n)| matches!(n, Node::Affine { terms, .. } if terms.len() == 2).then_some(i))
+            .expect("final residual Add");
+        let device = Device::host();
+        let resident = DeviceProgram::compile(&device, &p).unwrap();
+        let expected = p
+            .execute_edited(&family, |node, value, _| {
+                if node == last {
+                    value.mapv_inplace(|v| v * 0.7);
+                }
+                Ok(())
+            })
+            .unwrap();
+        let actual = resident
+            .forward_edited_intermediates(
+                &family,
+                |_, _| Ok(()),
+                |node, trace| {
+                    if node != last {
+                        return Ok(None);
+                    }
+                    let source = trace.value(node)?;
+                    let mut value = device.copy(source).map_err(|e| e.to_string())?;
+                    let scale = device.upload(Array2::from_elem((source.rows(), source.cols()), 0.7).view()).map_err(|e| e.to_string())?;
+                    device.hadamard(&mut value, source, &scale, false).map_err(|e| e.to_string())?;
+                    Ok(Some(value))
+                },
+            )
+            .unwrap();
+        let actual_residual = device.download(actual.value(last).unwrap()).unwrap();
+        for (a, b) in actual_residual.iter().zip(expected.values[last].iter()) {
+            assert!((a - b).abs() < 1e-10, "residual differs: {a} versus {b}");
+        }
+        assert!(actual.value(p.output).is_err(), "native head/readout must stay unmaterialized");
     }
 }

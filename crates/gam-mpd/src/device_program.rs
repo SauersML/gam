@@ -25,9 +25,7 @@
 //! low-rank operators, pointwise laws, Hadamard products, RMS norms, attention, and the head.
 //! Any other node refuses the whole program with its reason; its caller then runs on the CPU.
 
-use super::operator_program::{
-    Basis, FamilyInputs, Law, Node, Operator, OperatorBody, OperatorProgram, Rotary, SlotValues,
-};
+use super::operator_program::{Basis, FamilyInputs, Law, Node, Operator, OperatorBody, OperatorProgram, Rotary, SlotValues};
 use gam_gpu::tensor::{Arithmetic, Device, Indices, Op, PointwiseLaw, Tensor};
 use ndarray::{Array1, Array2};
 use std::collections::BTreeMap;
@@ -75,9 +73,7 @@ fn hold(device: &Device, op: &Operator, role: Role) -> Result<Held, String> {
         Role::Product => match &op.body {
             OperatorBody::Identity => Held::Identity,
             OperatorBody::Diagonal { values, .. } => Held::Diagonal(device.upload_vec(1, values.len(), values.to_vec()).map_err(error)?),
-            OperatorBody::LowRank { left, right, .. } => {
-                Held::LowRank(device.upload(left.view()).map_err(error)?, device.upload(right.view()).map_err(error)?)
-            }
+            OperatorBody::LowRank { left, right, .. } => Held::LowRank(device.upload(left.view()).map_err(error)?, device.upload(right.view()).map_err(error)?),
             OperatorBody::Dense { values, .. } => match op.diagonal() {
                 Some(d) => Held::Diagonal(device.upload_vec(1, d.len(), d.to_vec()).map_err(error)?),
                 None => Held::Dense(device.upload(values.view()).map_err(error)?),
@@ -89,15 +85,43 @@ fn hold(device: &Device, op: &Operator, role: Role) -> Result<Held, String> {
 /// How one node executes.
 enum Step {
     /// A one-hot feature of an indicator basis: only its token ids (its readers gather).
-    Feature { slot: usize },
-    Raw { slot: usize },
-    Constant { operator: usize },
-    Affine { terms: Vec<(usize, usize)>, bias: Option<usize> },
-    Pointwise { input: usize, codes: Indices },
-    Hadamard { left: usize, right: usize },
-    RmsNorm { input: usize, epsilon: f64 },
-    Attend { query: usize, key: usize, value: usize, scale: f64, rotary: Option<Rotary>, causal: bool },
-    Transposed { input: usize, operator: usize },
+    Feature {
+        slot: usize,
+    },
+    Raw {
+        slot: usize,
+    },
+    Constant {
+        operator: usize,
+    },
+    Affine {
+        terms: Vec<(usize, usize)>,
+        bias: Option<usize>,
+    },
+    Pointwise {
+        input: usize,
+        codes: Indices,
+    },
+    Hadamard {
+        left: usize,
+        right: usize,
+    },
+    RmsNorm {
+        input: usize,
+        epsilon: f64,
+    },
+    Attend {
+        query: usize,
+        key: usize,
+        value: usize,
+        scale: f64,
+        rotary: Option<Rotary>,
+        causal: bool,
+    },
+    Transposed {
+        input: usize,
+        operator: usize,
+    },
     /// The head's logits or their readout: never formed whole.
     Head,
 }
@@ -203,9 +227,18 @@ impl DeviceProgram {
             Node::Readout { input, .. } => vec![program.output, *input],
             _ => vec![program.output],
         };
-        let edited_head_nodes = head_nodes.iter().map(|&node| (node, match &program.nodes[node] {
-            Node::Readout { input, .. } => Some(*input), _ => None,
-        })).collect();
+        let edited_head_nodes = head_nodes
+            .iter()
+            .map(|&node| {
+                (
+                    node,
+                    match &program.nodes[node] {
+                        Node::Readout { input, .. } => Some(*input),
+                        _ => None,
+                    },
+                )
+            })
+            .collect();
         // Which nodes read each node: a feature may only be read by affine terms.
         let mut readers: Vec<Vec<usize>> = vec![Vec::new(); program.nodes.len()];
         for (index, node) in program.nodes.iter().enumerate() {
@@ -406,12 +439,7 @@ impl DeviceProgram {
     /// The bytes a forward pass keeps per row (every resident node value), for sizing batches.
     #[must_use]
     pub fn bytes_per_row(&self) -> usize {
-        self.steps
-            .iter()
-            .zip(&self.widths)
-            .filter(|(s, _)| !matches!(s, Step::Feature { .. } | Step::Head))
-            .map(|(_, w)| w * 8)
-            .sum()
+        self.steps.iter().zip(&self.widths).filter(|(s, _)| !matches!(s, Step::Feature { .. } | Step::Head)).map(|(_, w)| w * 8).sum()
     }
 
     /// The family's blocks and rotation tables: every sequence one contiguous block of equal
@@ -424,17 +452,24 @@ impl DeviceProgram {
                 (Some(a), Some(b)) => a.sequence == b.sequence && a.position == b.position,
                 _ => false,
             };
-            if saved.rows == family.rows && same_layout && saved.tokens.iter().all(|(slot, tokens)| {
-                matches!(family.slots.get(*slot), Some(SlotValues::Tokens(current)) if current == tokens)
-            }) { return Ok(Arc::clone(saved)); }
+            if saved.rows == family.rows
+                && same_layout
+                && saved.tokens.iter().all(|(slot, tokens)| matches!(family.slots.get(*slot), Some(SlotValues::Tokens(current)) if current == tokens))
+            {
+                return Ok(Arc::clone(saved));
+            }
         }
         let (blocks, rotations) = self.layout(family)?;
         let mut tokens = BTreeMap::new();
         let mut ids = BTreeMap::new();
         for step in &self.steps {
             if let Step::Feature { slot } = step {
-                let Some(SlotValues::Tokens(values)) = family.slots.get(*slot) else { return Err(format!("device: slot {slot} holds no tokens")); };
-                if values.len() != family.rows { return Err("device: token count does not match batch".to_string()); }
+                let Some(SlotValues::Tokens(values)) = family.slots.get(*slot) else {
+                    return Err(format!("device: slot {slot} holds no tokens"));
+                };
+                if values.len() != family.rows {
+                    return Err("device: token count does not match batch".to_string());
+                }
                 if !ids.contains_key(slot) {
                     ids.insert(*slot, Arc::new(self.device.upload_indices(values).map_err(error)?));
                     tokens.insert(*slot, values.clone());
@@ -496,11 +531,7 @@ impl DeviceProgram {
                     sin.push(s);
                 }
             }
-            rotations.push((
-                rotary,
-                self.device.upload_vec(rows, planes, cos).map_err(error)?,
-                self.device.upload_vec(rows, planes, sin).map_err(error)?,
-            ));
+            rotations.push((rotary, self.device.upload_vec(rows, planes, cos).map_err(error)?, self.device.upload_vec(rows, planes, sin).map_err(error)?));
         }
         Ok((if attends { rows / length } else { 1 }, rotations))
     }
@@ -514,8 +545,7 @@ impl DeviceProgram {
             Held::Dense(a) => d.gemm(out, 1.0, x, Op::N, a, if transposed { Op::N } else { Op::T }, 1.0, arithmetic).map_err(error),
             Held::LowRank(left, right) => {
                 // x (L R)ᵀ = (x Rᵀ) Lᵀ;  x (L R) = (x L) R.
-                let (first, first_op, second, second_op) =
-                    if transposed { (left, Op::N, right, Op::N) } else { (right, Op::T, left, Op::T) };
+                let (first, first_op, second, second_op) = if transposed { (left, Op::N, right, Op::N) } else { (right, Op::T, left, Op::T) };
                 let inner = if transposed { left.cols() } else { right.rows() };
                 let mut middle = d.zeros(x.rows(), inner).map_err(error)?;
                 d.gemm(&mut middle, 1.0, x, Op::N, first, first_op, 0.0, arithmetic).map_err(error)?;
@@ -573,15 +603,22 @@ impl DeviceProgram {
         before: impl FnMut(usize, &mut Tensor) -> Result<(), String>,
         edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
     ) -> Result<DeviceTrace, String> {
-        self.forward_hooks(
-            family,
-            given,
-            &[],
-            |_, _| Err("no gate".into()),
-            true,
-            before,
-            edit,
-        )
+        self.forward_hooks(family, given, &[], |_, _| Err("no gate".into()), true, before, edit)
+    }
+
+    /// Edited intermediate states with the streamed dense head left unmaterialized.
+    /// Callers must not request edits or exceptions at streamed head nodes.
+    pub fn forward_edited_intermediates(
+        &self,
+        family: &FamilyInputs,
+        before: impl FnMut(usize, &mut Tensor) -> Result<(), String>,
+        edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
+    ) -> Result<DeviceTrace, String> {
+        self.forward_hooks(family, BTreeMap::new(), &[], |_, _| Err("no gate".into()), false, before, edit)
+    }
+
+    pub fn is_streamed_head(&self, node: usize) -> bool {
+        self.edited_head_nodes.contains_key(&node)
     }
 
     fn forward_hooks(
@@ -602,9 +639,7 @@ impl DeviceProgram {
                 || !matches!(self.steps[mask], Step::Raw { .. })
                 || self.widths[mask] != self.widths[amplitude]
             {
-                return Err(format!(
-                    "device: gate ({amplitude}, {mask}) is not an amplitude after its raw mask of the same width"
-                ));
+                return Err(format!("device: gate ({amplitude}, {mask}) is not an amplitude after its raw mask of the same width"));
             }
         }
         let batch = self.prepared_batch(family)?;
@@ -630,10 +665,7 @@ impl DeviceProgram {
                 Step::Raw { slot } => match given.remove(slot) {
                     Some(value) if value.dim() == (rows, width) => Some(value),
                     Some(value) => {
-                        return Err(format!(
-                            "device: a {:?} value for slot {slot} of {rows} × {width}",
-                            value.dim()
-                        ));
+                        return Err(format!("device: a {:?} value for slot {slot} of {rows} × {width}", value.dim()));
                     }
                     None => {
                         let SlotValues::Raw(values) = &family.slots[*slot] else {
@@ -642,30 +674,19 @@ impl DeviceProgram {
                         Some(d.upload(values.view()).map_err(error)?)
                     }
                 },
-                Step::Constant { operator } => Some(
-                    d.broadcast_rows(self.column(*operator)?, rows)
-                        .map_err(error)?,
-                ),
+                Step::Constant { operator } => Some(d.broadcast_rows(self.column(*operator)?, rows).map_err(error)?),
                 Step::Affine { terms, bias } => {
                     let mut out = d.zeros(rows, width).map_err(error)?;
                     for (argument, operator) in terms {
                         if let Step::Feature { slot } = &self.steps[*argument] {
                             let Held::Table(table) = self.held(*operator, Role::Table)? else {
-                                return Err(
-                                    "device: an operator held in the wrong role".to_string()
-                                );
+                                return Err("device: an operator held in the wrong role".to_string());
                             };
                             let ids = trace.ids.get(slot).ok_or("device: feature ids missing")?;
                             let gathered = d.gather_rows(table, ids).map_err(error)?;
                             d.axpy(&mut out, 1.0, &gathered).map_err(error)?;
                         } else {
-                            self.add_product(
-                                &mut out,
-                                trace.value(*argument)?,
-                                *operator,
-                                false,
-                                self.arithmetic,
-                            )?;
+                            self.add_product(&mut out, trace.value(*argument)?, *operator, false, self.arithmetic)?;
                         }
                     }
                     if let Some(b) = bias {
@@ -673,68 +694,28 @@ impl DeviceProgram {
                     }
                     Some(out)
                 }
-                Step::Pointwise { input, codes } => Some(
-                    d.law_values(trace.value(*input)?, codes, gelu_tanh_constant())
-                        .map_err(error)?,
-                ),
+                Step::Pointwise { input, codes } => Some(d.law_values(trace.value(*input)?, codes, gelu_tanh_constant()).map_err(error)?),
                 Step::Hadamard { left, right } => {
                     let mut out = d.zeros(rows, width).map_err(error)?;
-                    d.hadamard(&mut out, trace.value(*left)?, trace.value(*right)?, false)
-                        .map_err(error)?;
+                    d.hadamard(&mut out, trace.value(*left)?, trace.value(*right)?, false).map_err(error)?;
                     Some(out)
                 }
-                Step::RmsNorm { input, epsilon } => {
-                    Some(d.rms_norm(trace.value(*input)?, *epsilon).map_err(error)?)
-                }
-                Step::Attend {
-                    query,
-                    key,
-                    value,
-                    scale,
-                    rotary,
-                    causal,
-                } => {
+                Step::RmsNorm { input, epsilon } => Some(d.rms_norm(trace.value(*input)?, *epsilon).map_err(error)?),
+                Step::Attend { query, key, value, scale, rotary, causal } => {
                     let (q, k) = self.rotated(&trace, *query, *key, *rotary)?;
                     let v = trace.value(*value)?;
                     if Self::tile_attention(&trace) {
-                        Some(
-                            super::device_attention::forward(
-                                d,
-                                (&q, &k, v),
-                                trace.blocks,
-                                *scale,
-                                *causal,
-                                self.arithmetic,
-                            )
-                            .map_err(error)?,
-                        )
+                        Some(super::device_attention::forward(d, (&q, &k, v), trace.blocks, *scale, *causal, self.arithmetic).map_err(error)?)
                     } else {
                         let alpha = self.attention(&trace, &q, &k, *scale, *causal)?;
                         let mut out = d.zeros(rows, v.cols()).map_err(error)?;
-                        d.gemm_batched(
-                            trace.blocks,
-                            &mut out,
-                            1.0,
-                            &alpha,
-                            Op::N,
-                            v,
-                            Op::N,
-                            0.0,
-                            self.arithmetic,
-                        )
-                        .map_err(error)?;
+                        d.gemm_batched(trace.blocks, &mut out, 1.0, &alpha, Op::N, v, Op::N, 0.0, self.arithmetic).map_err(error)?;
                         Some(out)
                     }
                 }
                 Step::Transposed { input, operator } => {
                     let mut out = d.zeros(rows, width).map_err(error)?;
-                    self.add_product(
-                        &mut out,
-                        trace.value(*input)?,
-                        *operator,
-                        true,
-                        self.arithmetic,
-                    )?;
+                    self.add_product(&mut out, trace.value(*input)?, *operator, true, self.arithmetic)?;
                     Some(out)
                 }
             };
@@ -745,26 +726,17 @@ impl DeviceProgram {
             trace.values.push(value);
             if let Some(replacement) = edit(index, &trace)? {
                 if trace.values[index].is_none() {
-                    return Err(format!(
-                        "device: edit of unmaterialized node {index} is unsupported"
-                    ));
+                    return Err(format!("device: edit of unmaterialized node {index} is unsupported"));
                 }
                 if replacement.dim() != (rows, width) {
-                    return Err(format!(
-                        "device: edited node {index} has {:?}, expected {rows} x {width}",
-                        replacement.dim()
-                    ));
+                    return Err(format!("device: edited node {index} has {:?}, expected {rows} x {width}", replacement.dim()));
                 }
                 trace.values[index] = Some(replacement);
             }
             if let Some(&(_, mask)) = gated.iter().find(|(amplitude, _)| *amplitude == index) {
                 let decided = decide(index, &trace)?;
                 if decided.dim() != (rows, self.widths[mask]) {
-                    return Err(format!(
-                        "device: a {:?} mask for gate {index} of {rows} × {}",
-                        decided.dim(),
-                        self.widths[mask]
-                    ));
+                    return Err(format!("device: a {:?} mask for gate {index} of {rows} × {}", decided.dim(), self.widths[mask]));
                 }
                 trace.values[mask] = Some(decided);
             }
@@ -780,10 +752,7 @@ impl DeviceProgram {
             None => Ok((d.copy(q).map_err(error)?, d.copy(k).map_err(error)?)),
             Some(r) => {
                 let (cos, sin) = rotations_of(trace, r)?;
-                Ok((
-                    d.rotate(q, cos, sin, r.half_split, false).map_err(error)?,
-                    d.rotate(k, cos, sin, r.half_split, false).map_err(error)?,
-                ))
+                Ok((d.rotate(q, cos, sin, r.half_split, false).map_err(error)?, d.rotate(k, cos, sin, r.half_split, false).map_err(error)?))
             }
         }
     }
@@ -829,9 +798,7 @@ impl DeviceProgram {
     }
 
     fn flags(&self, scored: Option<&[bool]>, start: usize, n: usize) -> Result<Option<Indices>, String> {
-        scored
-            .map(|s| self.device.upload_indices(&s[start..start + n].iter().map(|b| u32::from(*b)).collect::<Vec<_>>()).map_err(error))
-            .transpose()
+        scored.map(|s| self.device.upload_indices(&s[start..start + n].iter().map(|b| u32::from(*b)).collect::<Vec<_>>()).map_err(error)).transpose()
     }
 
     /// Per row, `KL(softmax(target) ‖ softmax(logits))` (zero on rows `scored` leaves out), and
@@ -898,7 +865,9 @@ impl DeviceProgram {
         if uniforms.iter().any(|u| u.len() != trace.rows) || scored.is_some_and(|s| s.len() != trace.rows) {
             return Err("device: sampled uniforms or flags do not match trace rows".to_string());
         }
-        if uniforms.is_empty() { return Ok(Vec::new()); }
+        if uniforms.is_empty() {
+            return Ok(Vec::new());
+        }
         let d = &self.device;
         let hidden = trace.value(self.head.hidden)?;
         let Held::Dense(head) = self.held(self.head.operator, Role::Product)? else {
@@ -954,9 +923,20 @@ impl DeviceProgram {
 
     /// [`Self::vjp`] of the hidden node's `seed` plus, at each node of `extra`, its cotangent
     /// there (a term of the scalar that reads that node directly).
-    pub fn vjp_seeded(&self, trace: &DeviceTrace, seed: Tensor, extra: BTreeMap<usize, Tensor>, keep: &[usize], arithmetic: Arithmetic) -> Result<BTreeMap<usize, Tensor>, String> {
-        let Some(first) = keep.iter().copied().min() else { return Ok(BTreeMap::new()); };
-        if keep.iter().chain(extra.keys()).any(|node| *node >= self.steps.len()) { return Err("device: retained node out of range".to_string()); }
+    pub fn vjp_seeded(
+        &self,
+        trace: &DeviceTrace,
+        seed: Tensor,
+        extra: BTreeMap<usize, Tensor>,
+        keep: &[usize],
+        arithmetic: Arithmetic,
+    ) -> Result<BTreeMap<usize, Tensor>, String> {
+        let Some(first) = keep.iter().copied().min() else {
+            return Ok(BTreeMap::new());
+        };
+        if keep.iter().chain(extra.keys()).any(|node| *node >= self.steps.len()) {
+            return Err("device: retained node out of range".to_string());
+        }
         let d = &self.device;
         let mut g: Vec<Option<Tensor>> = (0..self.steps.len()).map(|_| None).collect();
         g[self.head.hidden] = Some(seed);
@@ -1011,7 +991,9 @@ impl DeviceProgram {
                                 d.gemm(&mut middle, 1.0, &cot, Op::N, left, Op::N, 0.0, arithmetic).map_err(error)?;
                                 d.gemm(target, 1.0, &middle, Op::N, right, Op::N, 1.0, arithmetic).map_err(error)?;
                             }
-                            Held::Table(_) | Held::Column(_) => return Err("device: an operator held in the wrong role".to_string()),
+                            Held::Table(_) | Held::Column(_) => {
+                                return Err("device: an operator held in the wrong role".to_string());
+                            }
                         }
                     }
                 }
@@ -1073,7 +1055,8 @@ impl DeviceProgram {
         let blocks = trace.blocks;
         let (q, k) = self.rotated(trace, query, key, rotary)?;
         if Self::tile_attention(trace) {
-            let (gq, gk, gv) = super::device_attention::backward(d, (&q, &k, trace.value(value)?), cot, blocks, scale, causal, (self.arithmetic, arithmetic)).map_err(error)?;
+            let (gq, gk, gv) = super::device_attention::backward(d, (&q, &k, trace.value(value)?), cot, blocks, scale, causal, (self.arithmetic, arithmetic))
+                .map_err(error)?;
             return match rotary {
                 None => Ok((gq, gk, gv)),
                 Some(r) => {
@@ -1129,9 +1112,10 @@ impl DeviceProgram {
                         }
                         if let Some(da) = tangents.get(operator) {
                             let o = ensure(d, &mut out, rows, width)?;
-                            let diagonal_row = self.operators.get(&(*operator, Role::Product)).is_some_and(|held| {
-                                matches!(held.source.body, OperatorBody::Diagonal { .. }) && da.dim() == (1, width)
-                            });
+                            let diagonal_row = self
+                                .operators
+                                .get(&(*operator, Role::Product))
+                                .is_some_and(|held| matches!(held.source.body, OperatorBody::Diagonal { .. }) && da.dim() == (1, width));
                             if let Step::Feature { slot } = &self.steps[*argument] {
                                 let ids = trace.ids.get(slot).ok_or("device: feature ids missing")?;
                                 let gathered = d.gather_rows(&upload(&da.t().to_owned())?, ids).map_err(error)?;
@@ -1157,8 +1141,7 @@ impl DeviceProgram {
                         out = Some(o);
                     }
                     if let Some(da) = tangents.get(operator) {
-                        d.gemm(ensure(d, &mut out, rows, width)?, 1.0, trace.value(*input)?, Op::N, &upload(da)?, Op::N, 1.0, arithmetic)
-                            .map_err(error)?;
+                        d.gemm(ensure(d, &mut out, rows, width)?, 1.0, trace.value(*input)?, Op::N, &upload(da)?, Op::N, 1.0, arithmetic).map_err(error)?;
                     }
                     out
                 }
@@ -1221,7 +1204,16 @@ impl DeviceProgram {
         if Self::tile_attention(trace) {
             let dq = dv[query].as_ref().map(&turn).transpose()?;
             let dk = dv[key].as_ref().map(&turn).transpose()?;
-            return super::device_attention::tangent(d, (&q, &k, trace.value(value)?), (dq.as_ref(), dk.as_ref(), dv[value].as_ref()), blocks, scale, causal, (self.arithmetic, arithmetic)).map_err(error);
+            return super::device_attention::tangent(
+                d,
+                (&q, &k, trace.value(value)?),
+                (dq.as_ref(), dk.as_ref(), dv[value].as_ref()),
+                blocks,
+                scale,
+                causal,
+                (self.arithmetic, arithmetic),
+            )
+            .map_err(error);
         }
         let alpha = self.attention(trace, &q, &k, scale, causal)?;
         let length = trace.rows / blocks;
