@@ -53,6 +53,16 @@
 //! all; and the decode check (every attention site replaced by its decoded head blocks, all on, on
 //! sequence `STATISTICS`), the KL against the native model of both descriptions.
 
+//! `mpd_rules_2951 pairs LIBRARY_DIR SETS_DIR LAYER HEADS`
+//!
+//! What a pair analysis of a library's query and key subcomponents shows on the given heads (comma-
+//! separated): per pair of a run query subcomponent and a run key subcomponent, its static score
+//! against the offset between the query's and the key's positions,
+//! `s(Δ) = ‖r_q‖ ‖r_k‖ Σ_i ⟨a_i, R(θ_i Δ) b_i⟩ / √width` over the head's rotary planes (`a`, `b` the
+//! subcomponents' writers in that head, `r` their readers), its strength `max_Δ |s(Δ)|` over a
+//! context; how many pairs it takes to hold half and nine tenths of the head's total strength, and
+//! the strongest pairs' profiles.
+//!
 //! `mpd_rules_2951 execute EXPORT_DIR OUT.json MATCH SOURCE COPY`
 //!
 //! The attention rules run in the model (`gam_mpd::rules`): every match head in `MATCH` (comma-
@@ -221,7 +231,7 @@ fn heads(export: &std::path::Path, half: usize, sequences: usize) -> Result<(), 
         let site = all.iter().find(|s| s.name == format!("blocks.{layer}.q")).ok_or("no query site")?;
         let x = gam_mpd::masked::read_values(&text, site)?;
         let c = x.t().dot(&x) / x.nrows() as f64;
-        let e = gam_linalg::decompose::eigh(c.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
+        let e = gam_mpd::dense::eigh(c.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(|e| format!("{e:?}"))?;
         let mut root = e.vectors.clone();
         for (i, l) in e.values.iter().enumerate() {
             root.column_mut(i).mapv_inplace(|v| v * l.max(0.0).sqrt());
@@ -230,7 +240,7 @@ fn heads(export: &std::path::Path, half: usize, sequences: usize) -> Result<(), 
         // The fraction of `b`'s energy (rows, whitened) in the row space of `a` (whitened).
         let within = |a: &Array2<f64>, b: &Array2<f64>| -> Result<f64, String> {
             let (aw, bw) = (a.dot(&root), b.dot(&root));
-            let d = gam_linalg::decompose::svd(aw.view(), false).map_err(|e| format!("{e:?}"))?;
+            let d = gam_mpd::dense::svd(aw.view(), false).map_err(|e| format!("{e:?}"))?;
             let kept = d.singular_values.iter().filter(|s| **s > d.band).count();
             let basis = d.vt.slice(s![..kept, ..]).to_owned();
             let projected = bw.dot(&basis.t());
@@ -638,7 +648,7 @@ fn selector(rows: &[usize], d: usize) -> Array2<f64> {
 
 /// The pseudo-inverse of `x` over its singular values beyond the decomposition's band.
 fn pseudo_inverse(x: &Array2<f64>) -> Result<Array2<f64>, String> {
-    let d = gam_linalg::decompose::svd(x.view(), false).map_err(|e| format!("{e:?}"))?;
+    let d = gam_mpd::dense::svd(x.view(), false).map_err(|e| format!("{e:?}"))?;
     let kept: Vec<usize> = (0..d.singular_values.len()).filter(|i| d.singular_values[*i] > d.band).collect();
     let inverse = ndarray::Array1::from_iter(kept.iter().map(|i| 1.0 / d.singular_values[*i]));
     let scaled = &d.u.select(Axis(1), &kept).t() * &inverse.insert_axis(Axis(1));
@@ -745,7 +755,7 @@ fn rules(export: &std::path::Path, out: &std::path::Path, observations: f64, sta
                                     // Z Zᵀ = U Λ Uᵀ on the planes; the prediction keeps its k leading
                                     // directions, P_k = U_k Λ_k⁻¹ U_kᵀ Z D⁻¹ (k = all is (Z Zᵀ)⁺ Z D⁻¹), and
                                     // ⟨W, P_k⟩, ⟨P_k, P_k⟩ accumulate over k through the precomputed forms.
-                                    let e = gam_linalg::decompose::eigh(zz.select(Axis(0), &planes).select(Axis(1), &planes).view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None)
+                                    let e = gam_mpd::dense::eigh(zz.select(Axis(0), &planes).select(Axis(1), &planes).view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None)
                                         .map_err(|e| format!("{e:?}"))?;
                                     let mut order: Vec<usize> = (0..planes.len()).filter(|i| e.values[*i] > e.band).collect();
                                     order.sort_by(|a, b| e.values[*b].total_cmp(&e.values[*a]));
@@ -925,7 +935,7 @@ fn mean_loss(log_probs: &Array2<f64>, rows: &[(usize, u32)]) -> f64 {
 
 /// `x` minus nothing but its best rank-`rank` part: the truncated SVD.
 fn truncated(x: &Array2<f64>, rank: usize) -> Result<Array2<f64>, String> {
-    let d = gam_linalg::decompose::svd(x.view(), false).map_err(|e| format!("{e:?}"))?;
+    let d = gam_mpd::dense::svd(x.view(), false).map_err(|e| format!("{e:?}"))?;
     let k = rank.min(d.singular_values.len());
     let u = &d.u.slice(s![.., ..k]) * &d.singular_values.slice(s![..k]).insert_axis(Axis(0));
     Ok(u.dot(&d.vt.slice(s![..k, ..])))
@@ -1102,9 +1112,62 @@ fn execute(export: &std::path::Path, out: &std::path::Path, matches: &str, sourc
     std::fs::write(out, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
+fn pairs(library: &std::path::Path, sets: &std::path::Path, layer: usize, heads: &str) -> Result<(), String> {
+    use rayon::prelude::*;
+    const CONTEXT: usize = 512;
+    let frequency = frequencies(sets)?;
+    let load = |kind: &str| -> Result<(Array2<f64>, Array2<f64>, Vec<f64>), String> {
+        let name = format!("blocks.{layer}.{kind}");
+        let f = frequency.get(&name).ok_or(format!("no sets for {name}"))?.clone();
+        Ok((read_f64(&library.join(format!("{name}.u.f64")), 768)?, read_f64(&library.join(format!("{name}.v.f64")), 768)?, f))
+    };
+    let ((qu, qv, qf), (ku, kv, kf)) = (load("q")?, load("k")?);
+    let (width, half) = (128usize, 64usize);
+    let theta: Vec<f64> = (0..half).map(|i| 10000f64.powf(-2.0 * i as f64 / width as f64)).collect();
+    let norm = |x: ndarray::ArrayView1<'_, f64>| x.dot(&x).sqrt();
+    let alive_q: Vec<usize> = (0..qf.len()).filter(|c| qf[*c] > 0.0).collect();
+    let alive_k: Vec<usize> = (0..kf.len()).filter(|c| kf[*c] > 0.0).collect();
+    for h in heads.split(',').filter_map(|x| x.parse::<usize>().ok()) {
+        let at = h * width;
+        // Per pair, the score at every offset of a context, from per-plane dot and cross products.
+        let profiles: Vec<(f64, usize, usize, Vec<f64>)> = alive_q
+            .par_iter()
+            .flat_map_iter(|&c| {
+                let a = qu.slice(s![c, at..at + width]).to_owned();
+                let scale_q = norm(qv.row(c));
+                alive_k.iter().map(move |&e| (c, e, a.clone(), scale_q)).collect::<Vec<_>>()
+            })
+            .map(|(c, e, a, scale_q)| {
+                let b = ku.slice(s![e, at..at + width]);
+                let scale = scale_q * norm(kv.row(e)) / (width as f64).sqrt();
+                let (dots, crosses): (Vec<f64>, Vec<f64>) = (0..half).map(|i| (a[i] * b[i] + a[i + half] * b[i + half], a[i] * b[i + half] - a[i + half] * b[i])).unzip();
+                let profile: Vec<f64> = (0..CONTEXT)
+                    .map(|delta| scale * (0..half).map(|i| { let (sn, cs) = (theta[i] * delta as f64).sin_cos(); dots[i] * cs + crosses[i] * sn }).sum::<f64>())
+                    .collect();
+                let strength = profile.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+                (strength, c, e, profile)
+            })
+            .collect();
+        let mut order: Vec<usize> = (0..profiles.len()).collect();
+        order.sort_by(|x, y| profiles[*y].0.total_cmp(&profiles[*x].0));
+        let total: f64 = profiles.iter().map(|p| p.0).sum();
+        let count = |share: f64| {
+            let mut held = 0.0;
+            order.iter().take_while(|i| { let before = held; held += profiles[**i].0; before < share * total }).count()
+        };
+        eprintln!("layer {layer} head {h}: {} run query-key pairs; {} hold half the static strength, {} nine tenths", profiles.len(), count(0.5), count(0.9));
+        for i in order.iter().take(8) {
+            let (strength, c, e, profile) = &profiles[*i];
+            let at_offsets: Vec<String> = [0usize, 1, 2, 3, 5, 10, 50, 200].iter().map(|d| format!("{:+.2}", profile[*d])).collect();
+            eprintln!("  query {c} key {e}: strength {strength:.3}, score at offsets 0,1,2,3,5,10,50,200: {}", at_offsets.join(" "));
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
-    let usage = "mpd_rules_2951 heads EXPORT_DIR HALF SEQUENCES | price EXPORT_DIR LIBRARY_DIR OBSERVATIONS SITES | library EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json OBSERVATIONS STATISTICS LAYERS | rules EXPORT_DIR OUT.json OBSERVATIONS STATISTICS | execute EXPORT_DIR OUT.json MATCH SOURCE COPY";
+    let usage = "mpd_rules_2951 heads EXPORT_DIR HALF SEQUENCES | price EXPORT_DIR LIBRARY_DIR OBSERVATIONS SITES | library EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json OBSERVATIONS STATISTICS LAYERS | rules EXPORT_DIR OUT.json OBSERVATIONS STATISTICS | execute EXPORT_DIR OUT.json MATCH SOURCE COPY | pairs LIBRARY_DIR SETS_DIR LAYER HEADS";
     match args.get(1).map(String::as_str) {
         Some("heads") if args.len() == 5 => heads(
             std::path::Path::new(&args[2]),
@@ -1126,6 +1189,7 @@ fn main() -> Result<(), String> {
             args[7].parse().map_err(|e| format!("STATISTICS: {e}"))?,
             args[8].parse().map_err(|e| format!("LAYERS: {e}"))?,
         ),
+        Some("pairs") if args.len() == 6 => pairs(std::path::Path::new(&args[2]), std::path::Path::new(&args[3]), args[4].parse().map_err(|e| format!("LAYER: {e}"))?, &args[5]),
         Some("execute") if args.len() == 7 => execute(std::path::Path::new(&args[2]), std::path::Path::new(&args[3]), &args[4], &args[5], &args[6]),
         Some("rules") if args.len() == 6 => rules(
             std::path::Path::new(&args[2]),
