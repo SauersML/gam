@@ -51,7 +51,7 @@ fn native_subsystem(native:&gam_mpd::operator_program::OperatorProgram,layers:&[
 }
 fn main() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if args.len() != 8 { return Err("EXPORT POOL POOL_SHA FIT_CONFIG SPEC SPEC_SHA OUT BUDGET_JSON".into()); }
+    if args.len() != 8 && !(args.len()==9 && args[8]=="prepare_only") { return Err("EXPORT POOL POOL_SHA FIT_CONFIG SPEC SPEC_SHA OUT BUDGET_JSON [prepare_only]".into()); }
     let export = Path::new(&args[0]); let fitted = Path::new(&args[1]); let spec_path = Path::new(&args[4]); let out = Path::new(&args[6]);
     if sha256(fitted)? != args[2] || sha256(spec_path)? != args[5] { return Err("frozen fitted/spec hash mismatch".into()); }
     if out.exists() { return Err("fresh scientific output required".into()); }
@@ -111,6 +111,10 @@ fn main() -> Result<(), String> {
         position: (0..2).flat_map(|_| 0..512).collect(),
     }) };
     save(&out.join("PROVENANCE.json"), &json!({"scope":"joint supplied-GELU geometry proposal assessment; discovery uses0/1, no frozen-body transfer or global optimum claim", "uses":uses,"fit_config":config,"fit_config_sha256":sha256(Path::new(&args[3]))?,"budget_sha256":sha256(Path::new(&args[7]))?,"input_width":width,"fitted_sha256":args[2],"candidate_sha256":sha256(&artifact_path)?,"spec_sha256":args[5],"export_json_sha256":sha256(&export.join("export.json"))?,"source_record":imported.record,"binary_sha256":sha256(&std::env::current_exe().map_err(|e|e.to_string())?)?,"native_C32":native_cost,"joint_pool_C32":pool_cost,"native_two_MLP_subsystem_C32":native_subsystem_cost,"subsystem_cost_scope":"standalone declared two-use normalized-input to contribution programs; full candidate additionally retains surrounding native model and pays graft/control wiring","candidate_C32":cost,"candidate_C32_bits":cost.total(),"local_boundary":"native normalized MLP input to pure MLP contribution, fixed native parents; native contribution RMS","local_rows":1024,"run_episodes":80,"trace_bytes":trace_bytes,"native_control_scope":"paid whole native activation uniform Scale only; individual native units are not mapped to learned coordinates", "numerical_scope":"Local final-write/RMS enclosures; checked exact fixed-binary64 raw-logit KL intervals; forward/RMS/gain/GEMM rounding excluded; not full neural arithmetic certificate"}))?;
+    if args.len()==9 {
+        save(&out.join("REPORT.json"),&json!({"scope":"CPU preparation only: complete jointly grafted canonical artifact; fidelity unmeasured", "candidate_sha256":sha256(&artifact_path)?,"C32_bits":cost.total(),"native_C32_bits":native_cost.total(),"joint_pool_C32_bits":pool_cost.total(),"native_two_MLP_subsystem_C32_bits":native_subsystem_cost.total(),"seconds":started.elapsed().as_secs_f64(),"acceptance_claim":false}))?;
+        return Ok(());
+    }
     let device = gam_gpu::tensor::Device::accelerator(gam_gpu::GpuPolicy::Required).map_err(|e|e.to_string())?.ok_or("CUDA required")?;
     if device.is_host() || !device.float64() || !cfg!(target_os="linux") {return Err("CUDA f64 required".into());}
     let local = Local::new(&native, family, None, 16).with_cuda(device.clone(), trace_bytes)?.with_cuda_resident_norms()?;
