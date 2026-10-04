@@ -427,8 +427,9 @@ pub struct SiteSwitch {
     pub alone: Vec<Vec<f64>>,
     /// Per passage, per row: the largest KL any subset tried gave it.
     ///
-    /// On a float64 device these two are the search's (f32 products); `all_replaced` and `worst`
-    /// are scored again in float64 (`site_switch`).
+    /// On a float64 device these two are the search's (f32 products), `word_worst` also taking each
+    /// row's float64 KL under the subsets scored again; `all_replaced` and `worst` are scored again
+    /// in float64 (`site_switch`).
     pub word_worst: Vec<Vec<f64>>,
     /// Subsets evaluated (passage forwards).
     pub forwards: usize,
@@ -534,6 +535,9 @@ pub fn site_switch(model: &OperatorProgram, replacement: &dyn Replacement, passa
                 on = every.clone();
             }
             for (&p, kl) in on.iter().zip(evaluator.kls(replacement, &members, &on)?) {
+                for (w, k) in result.word_worst[p].iter_mut().zip(kl.iter()) {
+                    *w = w.max(*k);
+                }
                 let mean = kl.mean().unwrap_or(0.0);
                 if members == all {
                     moved = moved.max((result.all_replaced[p] - mean).abs());
