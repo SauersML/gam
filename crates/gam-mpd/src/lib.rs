@@ -264,3 +264,6 @@ pub mod native_mlp_rank;
 
 // Exact decoded native parameter sharing across compacted candidate graphs.
 pub mod decoded_intern;
+
+// Native imported attention interfaces without splitting or renumbering.
+pub mod attention_map;
