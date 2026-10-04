@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Login-node half of mats-run (#2951): never builds or computes here, only fetches and submits.
 #
-#   remote_submit.sh NAME CPUS MEM_GB MINUTES WANT_COMMIT GPUS QOS CMD_B64 [ARRAY] [CHAIN] [NEEDBIN] [POOL] [SWAP]
+#   remote_submit.sh NAME CPUS MEM_GB MINUTES WANT_COMMIT GPUS QOS CMD_B64 [ARRAY] [CHAIN] [NEEDBIN] [POOL] [SWAP] [AFTEROK]
 #
 # Requires origin/main to contain WANT_COMMIT and snapshots that exact commit's
 # source into ~/mpd-src/C (the job's working directory). Binaries come from ~/mpd-bin/B for a built
@@ -10,7 +10,10 @@
 # fit between running jobs; they neither wait behind day-long jobs nor hold CPUs while queued.
 # MATS_CHAIN's segments are copies of the run job, each after the last (afterany). Prints the job id.
 set -Eeuo pipefail
-NAME=$1 CPUS=$2 MEM=$3 MINUTES=$4 WANT=$5 GPUS=$6 QOS=$7 CMD_B64=$8 ARRAY=${9:-} CHAIN=${10:-1} NEEDBIN=${11:-auto} POOL=${12:-0} SWAP=${13:-}
+NAME=$1 CPUS=$2 MEM=$3 MINUTES=$4 WANT=$5 GPUS=$6 QOS=$7 CMD_B64=$8 ARRAY=${9:-} CHAIN=${10:-1} NEEDBIN=${11:-auto} POOL=${12:-0} SWAP=${13:-} AFTEROK=${14:-}
+if [ -n "$AFTEROK" ]; then
+    [[ $AFTEROK =~ ^[0-9]+(:[0-9]+)*$ && $POOL = 0 && -z $SWAP ]] || { echo "mats-run: invalid afterok job IDs or unsupported pool/swap dependency" >&2; exit 2; }
+fi
 HERE_WORKER=$HOME/mpd-data/cluster/_build/pool_worker.sh
 REPO=$HOME/gam-cluster BIN=$HOME/mpd-bin SRC=$HOME/mpd-src CL=$HOME/mpd-data/cluster
 OUT=$CL/$NAME
@@ -104,6 +107,13 @@ elif [ -z "$B" ]; then
         echo "mats-run: waiting on build job $bj of $B (same Rust sources as $C12)" >&2
     fi
     dep=(--dependency="afterok:$bj" --kill-on-invalid-dep=yes)
+fi
+if [ -n "$AFTEROK" ]; then
+    if [ ${#dep[@]} -gt 0 ]; then
+        dep[0]+=":$AFTEROK"
+    else
+        dep=(--dependency="afterok:$AFTEROK" --kill-on-invalid-dep=yes)
+    fi
 fi
 find "$BIN" -maxdepth 1 \( -name '*.buildjob' -o -name '*.failed' \) -mtime +1 -delete
 # Prune old builds here (the compute node cannot see the queue): beyond the 12 newest, a build goes

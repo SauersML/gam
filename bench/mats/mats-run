@@ -4,7 +4,7 @@
 #   mats-run NAME CPUS MEM_GB HOURS -- COMMAND...
 #
 # Submits COMMAND as Slurm job NAME (CPUS cores, RAYON_NUM_THREADS=CPUS, MEM_GB, HOURS wall, may be
-# fractional) built from the commit of ~/gam's HEAD (or origin/main when HEAD is unpushed), and
+# fractional) built from the published commit of ~/gam's HEAD (unpushed commits are rejected), and
 # prints the job id. Binaries are built once per commit in their own build job; the run waits on it.
 #
 # Paths are translated: /Users/user/mpd-data/... -> the cluster's ~/mpd-data/...;
@@ -38,6 +38,8 @@
 # MATS_BUILD=0|1 (whether the job needs the commit's Rust binaries; by default only a command that
 # names one does, so a Python script under /Users/user/gam starts without waiting for a build;
 # set 1 when a script calls a binary itself, through $MPD_BIN).
+# MATS_AFTEROK=ID:ID adds required successful jobs atomically at submission, alongside any build
+# dependency. Applies to ordinary jobs/arrays/chains, not pool tasks or in-place swaps.
 #
 # Pool: MATS_POOL=1 queues the job (each array index a task) for long-lived pool workers instead of
 # submitting it; a worker (normal QOS) packs tasks into its CPUs/GPUs/memory as job steps, takes the
@@ -55,6 +57,11 @@ usage() { sed -n '2,51p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 [ $# -ge 6 ] && [ "$5" = -- ] || usage
 NAME=$1 CPUS=$2 MEM=$3 HOURS=$4
 shift 5
+AFTEROK=${MATS_AFTEROK:-}
+if [ -n "$AFTEROK" ]; then
+    [[ $AFTEROK =~ ^[0-9]+(:[0-9]+)*$ ]] || { echo "mats-run: MATS_AFTEROK must be colon-separated job IDs" >&2; exit 2; }
+    [[ ${MATS_POOL:-0} = 0 && -z ${MATS_SWAP:-} ]] || { echo "mats-run: MATS_AFTEROK does not apply to pool tasks or swaps" >&2; exit 2; }
+fi
 [[ $NAME =~ ^[A-Za-z0-9._-]+$ ]] || { echo "mats-run: NAME must be [A-Za-z0-9._-]+" >&2; exit 2; }
 [[ $CPUS =~ ^[0-9]+$ ]] && (( CPUS >= 1 && CPUS <= 124 )) || { echo "mats-run: CPUS must be 1..124" >&2; exit 2; }
 # Room on the shared node is mats:~/budget.sh's: it holds what would make other users wait.
@@ -166,6 +173,6 @@ COPYFILE_DISABLE=1 tar --no-mac-metadata -C "$here" -cf - pool_worker.sh cluster
 want=$(git -C "$MAC_GAM" rev-parse "${MATS_REF:-HEAD}")
 b64=$(printf '%s' "$cmd" | base64 | tr -d '\n')
 rc=0
-ssh mats bash -s -- "$NAME" "$CPUS" "$MEM" "$MINUTES" "$want" "$GPUS" "'$QOS'" "$b64" "'$ARRAY'" "$CHAIN" "${MATS_BUILD:-auto}" "${MATS_POOL:-0}" "'${MATS_SWAP:-}'" < "$here/remote_submit.sh" || rc=$?
+ssh mats bash -s -- "$NAME" "$CPUS" "$MEM" "$MINUTES" "$want" "$GPUS" "'$QOS'" "$b64" "'$ARRAY'" "$CHAIN" "${MATS_BUILD:-auto}" "${MATS_POOL:-0}" "'${MATS_SWAP:-}'" "'$AFTEROK'" < "$here/remote_submit.sh" || rc=$?
 (( rc == 0 )) || echo "mats-run: nothing submitted (cluster side exited $rc)" >&2
 exit $rc
