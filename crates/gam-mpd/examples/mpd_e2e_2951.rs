@@ -305,7 +305,7 @@ fn main() -> Result<(), String> {
         "fitted_with": with,
         "scope": scope, "sites": names, "train": run.train, "frontier": run.frontier, "sequences": run.sequences, "passages": run.passages,
         "context": run.context, "observations": run.settings.observations, "rounds": run.settings.rounds, "blocks": run.settings.blocks,
-        "draws": run.settings.draws, "random": run.random, "vpd": run.vpd, "vpd_sets": run.vpd_sets, "start": if run.vpd_start { "vpd" } else { "own" },
+        "draws": run.settings.draws, "random": run.random, "vpd_library": run.vpd, "vpd_sets": run.vpd_sets, "start": if run.vpd_start { "vpd" } else { "own" },
         "pricing": "gam_mpd::describe::Structured in each site's fit statistics (its training inputs under the explanation upstream), both libraries",
         "selection": "ours: gam_mpd::site_fit::Selector on the explanation's own reads in the site's mean training Fisher; vpd: its published sets (model states, residual off)",
     });
