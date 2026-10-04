@@ -115,12 +115,13 @@ def masks_of(D, dev, B, word, glob):
     return out
 
 
-def masked(target, ids, masks):
-    """Logits of the target with each site's subcomponents gated by masks[site] [B, S, C]."""
+def masked(target, ids, masks, hidden: bool = False):
+    """Logits (or the final normed residual stream) of the target with each site's subcomponents
+    gated by masks[site] [B, S, C]."""
     try:
         for n, m in masks.items():
             target.site(n).mask = m
-        return target(ids)
+        return target.hidden(ids) if hidden else target(ids)
     finally:
         for n in masks:
             target.site(n).mask = None
@@ -204,12 +205,58 @@ def stage_program():
         print(f"{n}: mean {out[D.offsets[k]:D.offsets[k + 1]].mean():.0f} bits per subcomponent")
 
 
+def flip_prices(target, D, ids, clean, program, candidates, batch: int):
+    """Exact prices at one row's program of its candidates: per candidate (word, subcomponent), the
+    KL at that word with the subcomponent flipped at every word of the row that lists it, minus the
+    program's own KL there, signed as off minus on (nats). `program` and `candidates` are (word,
+    subcomponent) arrays; the logits are formed only at the words read (one batched forward of the
+    row per group of subcomponents)."""
+    import torch
+
+    dev = ids.device
+    (p_pos, p_glob), (c_pos, c_glob) = program, candidates
+    on = np.isin(c_pos * D.universe + c_glob, p_pos * D.universe + p_glob)
+    tgt = torch.log_softmax(clean.float(), -1)  # [S, V]
+    wte = target.wte
+
+    def kl_at(h, at):
+        lp = torch.log_softmax(h @ wte.T, -1)
+        return (tgt[at].exp() * (tgt[at] - lp)).sum(-1)
+
+    base = masks_of(D, dev, 1, p_pos, p_glob)
+    with torch.no_grad():
+        k0 = kl_at(masked(target, ids[None], base, hidden=True)[0], torch.arange(D.context, device=dev))
+    order = np.argsort(c_glob, kind="stable")
+    js, starts = np.unique(c_glob[order], return_index=True)
+    ends = np.append(starts[1:], len(order))
+    price = np.zeros(len(c_glob), dtype=np.float32)
+    for c0 in range(0, len(js), batch):
+        chunk = js[c0:c0 + batch]
+        masks = {n: m.expand(len(chunk), -1, -1).clone() for n, m in base.items()}
+        read = []
+        for i, j in enumerate(chunk):
+            k = order[starts[c0 + i]:ends[c0 + i]]
+            at = torch.tensor(c_pos[k], device=dev)
+            m, col = masks[model_site(D.names[D.site[j]])], j - D.offsets[D.site[j]]
+            m[i, at, col] = 1.0 - m[i, at, col]
+            read.append((np.full(len(k), i), k))
+        rows = np.concatenate([r for r, _ in read])
+        k = np.concatenate([x for _, x in read])
+        with torch.no_grad():
+            h = masked(target, ids[None].expand(len(chunk), -1), masks, hidden=True)
+            at = torch.tensor(c_pos[k], device=dev)
+            kl = (kl_at(h[torch.tensor(rows, device=dev), at], at) - k0[at]).cpu().numpy()
+        price[k] = np.where(on[k], kl, -kl)
+        del masks, h
+    return price
+
+
 def stage_oracle():
     """The model as the concept fit's oracle (examples/mpd_nl_concepts_2951.rs) on the rows argv[2]
     (lo:hi). Each request on stdin carries every word's program; kind 0 is answered with each word's
-    exact KL(model || model running only its program), kind 1 with each listed set member's
-    first-order price at the programs, -d(sum of every word's KL)/d(its mask) (f32 nats on stdout).
-    A batch of rows per forward; the clean logits are kept."""
+    exact KL(model || model running only its program), kind 1 (which also carries the sets) with
+    each set member's exact price at the programs (flip_prices), f32 nats on stdout. The clean
+    logits are kept."""
     import torch
 
     lo, hi = (int(x) for x in sys.argv[2].split(":"))
@@ -217,6 +264,7 @@ def stage_oracle():
     target = load(D)
     dev = next(iter(target.buffers())).device
     batch = int(os.environ.get("NLAE_ORACLE_BATCH", "8"))
+    flips = int(os.environ.get("NLAE_FLIP_BATCH", "32"))
     ids = torch.tensor(D.ids[lo:hi], device=dev)
     with torch.no_grad():
         clean = [target(ids[b:b + batch]) for b in range(0, hi - lo, batch)]
@@ -232,33 +280,23 @@ def stage_oracle():
         assert words == (hi - lo) * D.context, f"oracle: {words} words for {hi - lo} rows"
         word = np.repeat(np.arange(words), np.diff(u64(words + 1)))
         glob = u32(members)
-        if kind == 1:
-            count = int(u64(1)[0])
-            cword = np.repeat(np.arange(words), np.diff(u64(words + 1)))
-            cand = u32(count)
         out = []
-        for b0, tgt in zip(range(0, hi - lo, batch), clean):
-            B = tgt.shape[0]
-            sel = (word >= b0 * D.context) & (word < (b0 + B) * D.context)
-            masks = masks_of(D, dev, B, word[sel] - b0 * D.context, glob[sel])
-            if kind == 0:
+        if kind == 0:
+            for b0, tgt in zip(range(0, hi - lo, batch), clean):
+                B = tgt.shape[0]
+                sel = (word >= b0 * D.context) & (word < (b0 + B) * D.context)
                 with torch.no_grad():
-                    out.append(kl_per_pos(masked(target, ids[b0:b0 + B], masks), tgt).reshape(-1).float().cpu().numpy())
-                continue
-            for m in masks.values():
-                m.requires_grad_(True)
-            kl_per_pos(masked(target, ids[b0:b0 + B], masks), tgt).sum().backward()
-            csel = np.nonzero((cword >= b0 * D.context) & (cword < (b0 + B) * D.context))[0]
-            w, g = cword[csel] - b0 * D.context, cand[csel]
-            price = np.zeros(len(g), dtype=np.float32)
-            for s, name in enumerate(D.names):
-                k = np.nonzero(D.site[g] == s)[0]
-                if len(k):
-                    grad = masks[model_site(name)].grad
-                    wt = torch.tensor(w[k], device=dev)
-                    price[k] = -grad[wt // D.context, wt % D.context, torch.tensor(g[k] - D.offsets[s], device=dev)].float().cpu().numpy()
-            out.append(price)
-            del masks
+                    logits = masked(target, ids[b0:b0 + B], masks_of(D, dev, B, word[sel] - b0 * D.context, glob[sel]))
+                    out.append(kl_per_pos(logits, tgt).reshape(-1).float().cpu().numpy())
+        else:
+            cptr = u64(1)
+            cword = np.repeat(np.arange(words), np.diff(u64(words + 1)))
+            cand = u32(int(cptr[0]))
+            for r in range(hi - lo):
+                a, b = r * D.context, (r + 1) * D.context
+                p = (word >= a) & (word < b)
+                c = (cword >= a) & (cword < b)
+                out.append(flip_prices(target, D, ids[r], clean[r // batch][r % batch], (word[p] - a, glob[p]), (cword[c] - a, cand[c]), flips))
         out = np.concatenate(out)
         stdout.write(out.astype("<f4").tobytes())
         stdout.flush()

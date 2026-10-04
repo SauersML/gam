@@ -132,6 +132,10 @@ class Target(nn.Module):
         return z.masked_fill(~causal, float("-inf")).softmax(-1)
 
     def forward(self, ids: Tensor) -> Tensor:
+        return self.hidden(ids) @ self.wte.T
+
+    def hidden(self, ids: Tensor) -> Tensor:
+        """The final normed residual stream [B, T, d]; the logits are it times the tied embedding."""
         B, T = ids.shape
         x = self.wte[ids]
         for i in range(self.n_layer):
@@ -145,8 +149,7 @@ class Target(nn.Module):
             x = x + s("o_proj")(y.transpose(1, 2).reshape(B, T, -1))
             h = rms(x, self.norms[2 * i + 1], self.eps)
             x = x + s("down_proj")(gelu_tanh(s("c_fc")(h)))
-        x = rms(x, self.ln_f, self.eps)
-        return x @ self.wte.T
+        return rms(x, self.ln_f, self.eps)
 
 
 def load_target(device: str = "mps") -> Target:
