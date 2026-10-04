@@ -10,7 +10,7 @@
 //! per-backend ad-hoc OnceLock, no transitional shim.
 
 #[cfg(target_os = "linux")]
-pub use linux::{KeyedPtxModuleCache, PtxModuleCache, compile_ptx_arch};
+pub use linux::{KeyedPtxModuleCache, PtxModuleCache, compile_ptx_arch, checked_interval_compiler_info};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -74,6 +74,24 @@ mod linux {
                 .module
                 .get()
                 .expect("module slot populated immediately after set"))
+        }
+
+        /// Separate opt-in compiler policy for checked interval kernels only.
+        /// Existing kernel compilation paths and their flags are unchanged.
+        pub fn get_or_compile_checked_interval(
+            &self,
+            ctx: &Arc<CudaContext>,
+            source: &str,
+        ) -> Result<&Arc<CudaModule>, GpuError> {
+            if let Some(existing) = self.module.get() { return Ok(existing); }
+            require_cudarc_library(CudarcLibrary::Nvrtc)?;
+            let ptx = compile_ptx_with_opts(source, checked_interval_options()?)
+                .gpu_ctx("checked interval NVRTC compile")?;
+            let module = ctx.load_module(ptx).gpu_ctx("checked interval module load")?;
+            if self.module.set(module).is_err() {
+                log::trace!("concurrent checked interval module compile already populated cache");
+            }
+            Ok(self.module.get().expect("module populated after checked compilation"))
         }
     }
 
@@ -207,6 +225,34 @@ mod linux {
             opts.arch = Some(runtime.selected_device().capability.nvrtc_arch());
         }
         Ok(opts)
+    }
+
+    fn checked_interval_options() -> Result<CompileOptions, GpuError> {
+        let mut opts = nvrtc_compile_options()?;
+        opts.ftz = Some(false);
+        opts.fmad = Some(false);
+        // cudarc emits no fastmath flag for Some(false); record the actual
+        // flags separately from this explicitly disabled policy.
+        opts.use_fast_math = Some(false);
+        opts.prec_div = Some(true);
+        opts.prec_sqrt = Some(true);
+        Ok(opts)
+    }
+
+    /// Actual loaded NVRTC version and numerical/architecture flags used by
+    /// the checked-only path. Querying this does not compile or change defaults.
+    pub fn checked_interval_compiler_info() -> Result<(i32, i32, Vec<String>), GpuError> {
+        require_cudarc_library(CudarcLibrary::Nvrtc)?;
+        let (mut major, mut minor) = (0, 0);
+        // SAFETY: both pointers address live writable stack integers; NVRTC is
+        // loaded above and the return status is checked before using outputs.
+        unsafe { cudarc::nvrtc::sys::nvrtcVersion(&mut major, &mut minor) }
+            .result().gpu_ctx("checked interval NVRTC version")?;
+        let options = checked_interval_options()?;
+        let mut flags = vec!["--ftz=false".into(), "--fmad=false".into(),
+            "--prec-div=true".into(), "--prec-sqrt=true".into()];
+        if let Some(arch) = options.arch { flags.push(format!("--gpu-architecture={arch}")); }
+        Ok((major, minor, flags))
     }
 
     fn nvrtc_include_paths() -> Vec<String> {

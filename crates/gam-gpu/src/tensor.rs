@@ -76,6 +76,42 @@ pub struct KlProposalRow {
     pub explained_log_sum: f64,
 }
 
+/// Fixed-input checked CUDA interval; never substitutes an empirical epsilon.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CheckedInterval {
+    Bounded { lower: f64, upper: f64 },
+    Unresolved(CheckedIntervalReason),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckedIntervalReason {
+    NonFiniteInput,
+    InvalidDomain,
+    ReductionNotEnclosed,
+    UnboundedEndpoints,
+    ArithmeticGuard,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum CheckedScalar { Exp, Log }
+
+#[derive(Debug)]
+pub struct CheckedIntervalCompilerInfo {
+    pub nvrtc_major: i32,
+    pub nvrtc_minor: i32,
+    pub flags: Vec<String>,
+    /// Some(false) in cudarc: the fastmath switch is not emitted.
+    pub fastmath_policy: bool,
+}
+
+/// Numeric buffers allocated by the API: GPU triple, downloaded host triple,
+/// and returned enum array. Excludes caller tensors, allocator/CUDA context,
+/// compiler-generated register/spill storage and 2KiB on-chip shared per block.
+pub fn checked_interval_output_bytes(results: usize) -> Result<usize, GpuError> {
+    results.checked_mul(48 + std::mem::size_of::<CheckedInterval>())
+        .ok_or_else(|| shape("checked interval output size overflow".into()))
+}
+
 /// The pointwise laws a kernel evaluates, by code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PointwiseLaw {
@@ -991,6 +1027,48 @@ impl Device {
         }
     }
 
+    /// Optional analytic interval on fixed finite f64 logits, CUDA only.
+    /// Explicit output-buffer budget; caller controls row batch. Input, head and
+    /// network rounding are outside this claim. No acceptance/default switch.
+    pub fn checked_kl_intervals(&self, teacher: &Tensor, explained: &Tensor, output_budget_bytes: usize) -> Result<Vec<CheckedInterval>, GpuError> {
+        same(teacher, explained, "checked KL")?;
+        if teacher.cols == 0 || u32::try_from(teacher.rows).is_err() || u32::try_from(teacher.cols).is_err() {
+            return Err(shape("checked KL requires nonempty u32 dimensions".into()));
+        }
+        if checked_interval_output_bytes(teacher.rows)? > output_budget_bytes {
+            return Err(shape("checked KL output numeric-buffer budget exceeded".into()));
+        }
+        match &*self.backend {
+            #[cfg(target_os="linux")]
+            Backend::Cuda(engine) => engine.checked_intervals(teacher, Some(explained), None),
+            _ => Err(shape("checked intervals require CUDA f64 without CPU/Metal fallback".into())),
+        }
+    }
+
+    /// Scalar spot checks for the same analytic CUDA code as checked KL.
+    pub fn checked_scalar_intervals(&self, input: &Tensor, operation: CheckedScalar, output_budget_bytes: usize) -> Result<Vec<CheckedInterval>, GpuError> {
+        let count = input.rows.checked_mul(input.cols).ok_or_else(|| shape("checked scalar size overflow".into()))?;
+        if checked_interval_output_bytes(count)? > output_budget_bytes {
+            return Err(shape("checked scalar output numeric-buffer budget exceeded".into()));
+        }
+        match &*self.backend {
+            #[cfg(target_os="linux")]
+            Backend::Cuda(engine) => engine.checked_intervals(input, None, Some(operation)),
+            _ => Err(shape(format!("checked {operation:?} intervals require CUDA f64 without CPU/Metal fallback"))),
+        }
+    }
+
+    pub fn checked_interval_compiler_info(&self) -> Result<CheckedIntervalCompilerInfo, GpuError> {
+        match &*self.backend {
+            #[cfg(target_os="linux")]
+            Backend::Cuda(_) => {
+                let (nvrtc_major,nvrtc_minor,flags)=crate::device_cache::checked_interval_compiler_info()?;
+                Ok(CheckedIntervalCompilerInfo {nvrtc_major,nvrtc_minor,flags,fastmath_policy:false})
+            },
+            _ => Err(shape("checked interval compiler info requires CUDA".into())),
+        }
+    }
+
     /// Per-row KL without calculating a cotangent. `logits` is a scratch buffer, left unchanged.
     pub fn kl_score_rows(&self, target: &Tensor, logits: &mut Tensor, scored: Option<&Indices>) -> Result<Vec<f64>, GpuError> {
         self.kl_rows_impl(target, logits, scored, false)
@@ -1590,7 +1668,7 @@ fn host_gemm(
 
 #[cfg(target_os = "linux")]
 mod cuda {
-    use super::{Arithmetic, KlProposalRow, CodeRowCounters, CodeRowsDiagnostics, CodeRowsWorkspace, code_rows_layout, ColumnBlocks, Data, IndexData, Indices, Op, RmsMode, Tensor, foreign, shape};
+    use super::{Arithmetic, CheckedInterval, CheckedIntervalReason, CheckedScalar, KlProposalRow, CodeRowCounters, CodeRowsDiagnostics, CodeRowsWorkspace, code_rows_layout, ColumnBlocks, Data, IndexData, Indices, Op, RmsMode, Tensor, foreign, shape};
     use crate::gpu_error::{GpuError, GpuResultExt};
     use cudarc::cublas::sys::{cublasMath_t, cublasOperation_t};
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
@@ -2527,6 +2605,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         stream: Arc<CudaStream>,
         blas: CudaBlas,
         module: Arc<CudaModule>,
+        checked_interval_module: crate::device_cache::PtxModuleCache,
         /// The row flags of a call that scores every row (never read).
         every_row: CudaSlice<u32>,
         gemm_workspace: std::sync::Mutex<F32Workspace>,
@@ -2589,7 +2668,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             static MODULE: crate::device_cache::PtxModuleCache = crate::device_cache::PtxModuleCache::new();
             let module = Arc::clone(MODULE.get_or_compile(&ctx, "tensor", KERNELS)?);
             let every_row = stream.alloc_zeros::<u32>(1).gpu_ctx("tensor alloc")?;
-            Ok(Self { name, ctx, stream, blas, module, every_row, gemm_workspace: std::sync::Mutex::new(F32Workspace::default()) })
+            Ok(Self { name, ctx, stream, blas, module, checked_interval_module: crate::device_cache::PtxModuleCache::new(), every_row, gemm_workspace: std::sync::Mutex::new(F32Workspace::default()) })
         }
 
         pub(super) fn memory(&self) -> Result<(usize, usize), GpuError> {
@@ -2992,6 +3071,43 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             let mut out = self.download(&kl)?;
             out.truncate(n_rows);
             Ok(out)
+        }
+
+        pub(super) fn checked_intervals(&self, input: &Tensor, explained: Option<&Tensor>, operation: Option<CheckedScalar>) -> Result<Vec<CheckedInterval>, GpuError> {
+            let count = if operation.is_some() {input.rows.checked_mul(input.cols).ok_or_else(|| shape("checked scalar size overflow".into()))?} else {input.rows};
+            if count==0 {return Ok(Vec::new());}
+            let module=self.checked_interval_module.get_or_compile_checked_interval(&self.ctx,include_str!("fixed_logit_interval.cu"))?;
+            let length=count.checked_mul(3).ok_or_else(|| shape("checked interval allocation overflow".into()))?;
+            let mut output=self.zeros(length)?;
+            if let Some(op)=operation {
+                let f=module.load_function("checked_scalar_interval").gpu_ctx("checked scalar function")?;
+                let n=count as u64;
+                let mode=match op {CheckedScalar::Exp=>0_u32,CheckedScalar::Log=>1_u32};
+                // SAFETY: f64 input has n scalars; output has three doubles per scalar.
+                unsafe {self.stream.launch_builder(&f).arg(&n).arg(&mode).arg(slice(input)?).arg(&mut output).launch(cfg_elements(n))}.gpu_ctx("checked scalar intervals")?;
+            } else {
+                let q=explained.ok_or_else(|| shape("checked KL missing explained tensor".into()))?;
+                let f=module.load_function("checked_kl_interval").gpu_ctx("checked KL function")?;
+                let (rows,cols)=(input.rows as u32,input.cols as u32);
+                // SAFETY: equal-shaped f64 tensors and three output doubles per row;
+                // dimensions were range checked, one 256-thread block per row.
+                unsafe {self.stream.launch_builder(&f).arg(&rows).arg(&cols).arg(slice(input)?).arg(slice(q)?).arg(&mut output).launch(cfg_rows(input.rows))}.gpu_ctx("checked KL intervals")?;
+            }
+            let downloaded=self.download(&output)?;
+            let mut result=Vec::with_capacity(count);
+            for value in downloaded[..length].chunks_exact(3) {
+                let interval=match value[2] {
+                    0.0 if value[0].is_finite() && value[1].is_finite() && value[0]<=value[1] => CheckedInterval::Bounded {lower:value[0],upper:value[1]},
+                    1.0=>CheckedInterval::Unresolved(CheckedIntervalReason::NonFiniteInput),
+                    2.0=>CheckedInterval::Unresolved(CheckedIntervalReason::InvalidDomain),
+                    3.0=>CheckedInterval::Unresolved(CheckedIntervalReason::ReductionNotEnclosed),
+                    4.0=>CheckedInterval::Unresolved(CheckedIntervalReason::UnboundedEndpoints),
+                    5.0=>CheckedInterval::Unresolved(CheckedIntervalReason::ArithmeticGuard),
+                    _=>return Err(shape("malformed checked interval kernel output".into())),
+                };
+                result.push(interval);
+            }
+            Ok(result)
         }
 
         pub(super) fn kl_proposal_rows(&self, target: &Tensor, logits: &Tensor) -> Result<Vec<KlProposalRow>, GpuError> {
@@ -4551,5 +4667,24 @@ mod kl_proposal_tests {
         assert!(d.kl_proposal_rows(&overflow,&good).is_err());
         assert!(d.kl_proposal_rows(&good,&d.zeros(2,2).unwrap()).is_err());
         assert!(d.kl_proposal_rows(&d.zeros(1,0).unwrap(),&d.zeros(1,0).unwrap()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod checked_interval_api_tests {
+    use super::*;
+    #[test]
+    fn checked_intervals_refuse_host_and_respect_output_budget() {
+        let device=Device::host();
+        let input=device.upload_vec(1,2,vec![0.0,1.0]).expect("host upload");
+        let budget=checked_interval_output_bytes(2).expect("small budget");
+        assert_eq!(budget,2*(48+std::mem::size_of::<CheckedInterval>()));
+        assert!(checked_interval_output_bytes(usize::MAX).is_err());
+        assert!(device.checked_scalar_intervals(&input,CheckedScalar::Exp,budget).is_err());
+        assert!(device.checked_kl_intervals(&input,&input,budget).is_err());
+        assert!(device.checked_scalar_intervals(&input,CheckedScalar::Exp,0).is_err());
+        assert!(device.checked_interval_compiler_info().is_err());
+        let mismatch=device.upload_vec(1,1,vec![0.0]).expect("host upload");
+        assert!(device.checked_kl_intervals(&input,&mismatch,budget).is_err());
     }
 }

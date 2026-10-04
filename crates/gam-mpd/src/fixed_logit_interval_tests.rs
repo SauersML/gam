@@ -8,7 +8,7 @@ fn integer(value: i64) -> Rational {
 
 /// Decode every significand/exponent bit into an exact rational, independently
 /// of the runtime interval operations and vendor floating-point functions.
-fn exact(value: f64) -> Rational {
+pub(crate) fn exact(value: f64) -> Rational {
     assert!(value.is_finite());
     let bits = value.to_bits();
     let exponent = ((bits >> 52) & 0x7ff) as i32;
@@ -64,7 +64,7 @@ fn rational_ln_two() -> (Rational, Rational) {
     atanh_reference(Rational::new(1.into(), 3.into()), 64)
 }
 
-fn log_reference(value: f64) -> (Rational, Rational) {
+pub(crate) fn log_reference(value: f64) -> (Rational, Rational) {
     let mut m = exact(value);
     assert!(m > integer(0));
     let mut exponent = 0;
@@ -101,7 +101,7 @@ fn reduced_exp_reference(x: &Rational) -> (Rational, Rational) {
     (&sum - &tail, sum + tail)
 }
 
-fn exp_reference(value: f64) -> (Rational, Rational) {
+pub(crate) fn exp_reference(value: f64) -> (Rational, Rational) {
     let (l2, h2) = rational_ln_two();
     if exact(value) <= -integer(1074) * &h2 {
         return (integer(0), power_two_exact(-1074));
@@ -164,7 +164,7 @@ fn rational_log_interval(value: &(Rational, Rational)) -> (Rational, Rational) {
     (log_reference(lo).0, log_reference(hi).1)
 }
 
-fn kl_reference(z: &[f64], w: &[f64]) -> (Rational, Rational) {
+pub(crate) fn kl_reference(z: &[f64], w: &[f64]) -> (Rational, Rational) {
     let mz = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let mw = w.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let (mut sz, mut sw, mut u) = (
@@ -241,7 +241,7 @@ fn fixed_logit_kl_encloses_independent_rational_reference_and_exact_shifts() {
     ));
 }
 
-fn assert_contains_reference(result: Enclosure, reference: (Rational, Rational)) {
+pub(crate) fn assert_contains_reference(result: Enclosure, reference: (Rational, Rational)) {
     let bounds = match result {
         Enclosure::Bounded(bounds) => Some(bounds),
         Enclosure::Unresolved(..) => None,
