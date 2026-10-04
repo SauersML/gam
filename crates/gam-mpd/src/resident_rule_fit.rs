@@ -28,7 +28,10 @@ pub enum ProposalArithmetic {
 }
 impl ProposalArithmetic {
     fn device(self) -> Arithmetic {
-        match self { Self::F64 => Arithmetic::F64, Self::F32 => Arithmetic::F32 }
+        match self {
+            Self::F64 => Arithmetic::F64,
+            Self::F32 => Arithmetic::F32,
+        }
     }
 }
 
@@ -75,6 +78,139 @@ pub struct Fit {
     pub program: OperatorProgram,
     pub report: Report,
 }
+/// A complete, disjoint output partition. Labels are reporting metadata; ranges are explicit.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OutputGroup {
+    pub label: String,
+    pub start: usize,
+    pub end: usize,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct GroupScale {
+    pub group: OutputGroup,
+    pub native_rms: f64,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct GroupIteration {
+    pub step: usize,
+    pub training_max: f64,
+    pub worst_row: usize,
+    pub worst_group: usize,
+    pub active_recomputed_error: Option<f64>,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct GroupMeasurement {
+    pub maximum: f64,
+    pub worst_row: usize,
+    pub worst_group: usize,
+    pub group_maxima: Vec<f64>,
+    pub scales: Vec<GroupScale>,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct GroupReport {
+    pub settings: Settings,
+    pub trainable: Vec<usize>,
+    pub training_rows: usize,
+    pub validation_rows: usize,
+    pub training_scales: Vec<GroupScale>,
+    pub validation_scales: Vec<GroupScale>,
+    pub initial_training_max: f64,
+    pub best_training_max: f64,
+    pub best_training_groups: Vec<f64>,
+    pub initial_validation: GroupMeasurement,
+    pub final_validation: GroupMeasurement,
+    pub best_step: usize,
+    pub iterations: Vec<GroupIteration>,
+    pub planned_numeric_bytes: usize,
+    pub seconds: f64,
+    pub scope: &'static str,
+}
+pub struct GroupFit {
+    pub program: OperatorProgram,
+    pub report: GroupReport,
+}
+fn output_groups(groups: &[OutputGroup], width: usize) -> Result<(), String> {
+    let mut at = 0;
+    let mut labels = BTreeSet::new();
+    for group in groups {
+        if group.start != at
+            || group.end <= group.start
+            || group.end > width
+            || group.label.is_empty()
+            || !labels.insert(&group.label)
+        {
+            return Err("output groups must be a complete contiguous disjoint partition with unique nonempty labels".into());
+        }
+        at = group.end;
+    }
+    if at != width || groups.is_empty() {
+        return Err("output groups do not cover the complete output".into());
+    }
+    Ok(())
+}
+fn source_inputs(source: &OperatorProgram) -> Result<Vec<usize>, String> {
+    if source.declarations.parameters != 0
+        || !source.declarations.domains.is_empty()
+        || source.declarations.slots.is_empty()
+    {
+        return Err("fitter requires Raw slots and no external parameters/domains".into());
+    }
+    source
+        .declarations
+        .slots
+        .iter()
+        .map(|slot| match slot {
+            Slot::Raw { width } if *width > 0 => Ok(*width),
+            _ => Err("fitter requires positive-width Raw slots".into()),
+        })
+        .collect()
+}
+fn panel_groups(
+    inputs: &[Array2<f64>],
+    y: &Array2<f64>,
+    widths: &[usize],
+    groups: &[OutputGroup],
+) -> Result<Vec<GroupScale>, String> {
+    if inputs.len() != widths.len()
+        || y.nrows() == 0
+        || !y.iter().all(|v| v.is_finite())
+        || inputs
+            .iter()
+            .zip(widths)
+            .any(|(x, w)| x.dim() != (y.nrows(), *w) || !x.iter().all(|v| v.is_finite()))
+    {
+        return Err("invalid aligned grouped fitting panel shapes/finite values".into());
+    }
+    output_groups(groups, y.ncols())?;
+    groups
+        .iter()
+        .map(|group| {
+            let values = y.slice(ndarray::s![.., group.start..group.end]);
+            let largest = values.iter().fold(0f64, |a, v| a.max(v.abs()));
+            if largest == 0. {
+                return Err(format!("group {} has zero native RMS", group.label));
+            }
+            let native_rms = largest
+                * (values
+                    .iter()
+                    .map(|v| (v / largest) * (v / largest))
+                    .sum::<f64>()
+                    / y.nrows() as f64)
+                    .sqrt();
+            if !native_rms.is_finite() || native_rms <= 0. {
+                return Err(format!(
+                    "group {} native RMS overflow/underflow",
+                    group.label
+                ));
+            }
+            Ok(GroupScale {
+                group: group.clone(),
+                native_rms,
+            })
+        })
+        .collect()
+}
+
 fn checked_bytes(elements: usize) -> Result<usize, String> {
     elements
         .checked_mul(8)
@@ -102,64 +238,56 @@ fn validate_settings(s: &Settings) -> Result<(), String> {
     }
     Ok(())
 }
-fn panel(x: &Array2<f64>, y: &Array2<f64>, input: usize, output: usize) -> Result<f64, String> {
-    if x.nrows() == 0
-        || x.nrows() != y.nrows()
-        || x.ncols() != input
-        || y.ncols() != output
-        || !x.iter().chain(y.iter()).all(|v| v.is_finite())
-    {
-        return Err("invalid fitting panel shapes/finite values".into());
-    }
-    // Scaled accumulation prevents avoidable overflow/underflow in the fixed native denominator.
-    let largest = y.iter().fold(0f64, |a, v| a.max(v.abs()));
-    if largest == 0. {
-        return Err("zero native RMS: normalized proposal objective undefined".into());
-    }
-    let rms = largest
-        * (y.iter().map(|v| (v / largest) * (v / largest)).sum::<f64>() / y.nrows() as f64).sqrt();
-    if !rms.is_finite() || rms <= 0. {
-        return Err("nonfinite/underflow native RMS".into());
-    }
-    Ok(rms)
-}
 struct Panel {
     family: FamilyInputs,
-    input: Tensor,
+    inputs: Vec<Tensor>,
     target: Tensor,
-    rms: f64,
+    groups: Vec<GroupScale>,
 }
 impl Panel {
-    fn new(d: &Device, x: &Array2<f64>, y: &Array2<f64>, rms: f64) -> Result<Self, String> {
+    fn new_grouped(
+        d: &Device,
+        inputs: &[Array2<f64>],
+        y: &Array2<f64>,
+        groups: Vec<GroupScale>,
+    ) -> Result<Self, String> {
         Ok(Self {
             family: FamilyInputs {
-                rows: x.nrows(),
-                slots: vec![SlotValues::Raw(Array2::zeros((0, x.ncols())))],
+                rows: y.nrows(),
+                slots: inputs
+                    .iter()
+                    .map(|x| SlotValues::Raw(Array2::zeros((0, x.ncols()))))
+                    .collect(),
                 layout: None,
             },
-            input: d.upload(x.view()).map_err(|e| e.to_string())?,
+            inputs: inputs
+                .iter()
+                .map(|x| d.upload(x.view()).map_err(|e| e.to_string()))
+                .collect::<Result<_, _>>()?,
             target: d.upload(y.view()).map_err(|e| e.to_string())?,
-            rms,
+            groups,
         })
     }
-    fn evaluate_rows(
+    fn evaluate_group_rows(
         &self,
         p: &DeviceProgram,
         start: usize,
         rows: usize,
-    ) -> Result<(DeviceTrace, Tensor, Vec<f64>), String> {
+    ) -> Result<(DeviceTrace, Tensor, Vec<Vec<f64>>), String> {
         let d = p.device();
+        let given = self
+            .inputs
+            .iter()
+            .enumerate()
+            .map(|(slot, x)| Ok((slot, d.rows_of(x, start, rows).map_err(|e| e.to_string())?)))
+            .collect::<Result<_, String>>()?;
         let trace = p.forward_given(
             &FamilyInputs {
                 rows,
                 slots: self.family.slots.clone(),
                 layout: None,
             },
-            BTreeMap::from([(
-                0,
-                d.rows_of(&self.input, start, rows)
-                    .map_err(|e| e.to_string())?,
-            )]),
+            given,
         )?;
         let mut residual = d
             .copy(trace.value(p.hidden())?)
@@ -171,33 +299,53 @@ impl Panel {
                 .map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
-        let norms = d
-            .scaled_row_l2(&residual, 0..residual.cols(), self.rms)
-            .map_err(|e| e.to_string())?;
-        if norms.iter().any(|v| !v.is_finite()) {
-            return Err("nonfinite proposal objective".into());
+        let norms = self
+            .groups
+            .iter()
+            .map(|scale| {
+                d.scaled_row_l2(
+                    &residual,
+                    scale.group.start..scale.group.end,
+                    scale.native_rms,
+                )
+                .map_err(|e| e.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if norms.iter().flatten().any(|v| !v.is_finite()) {
+            return Err("nonfinite grouped proposal objective".into());
         }
         Ok((trace, residual, norms))
     }
-    fn maximum(&self, p: &DeviceProgram, forward_rows: usize) -> Result<(usize, f64), String> {
-        let mut worst = (0, 0.0);
+    fn scan(&self, p: &DeviceProgram, forward_rows: usize) -> Result<GroupMeasurement, String> {
+        let mut result = GroupMeasurement {
+            maximum: 0.,
+            worst_row: 0,
+            worst_group: 0,
+            group_maxima: vec![0.; self.groups.len()],
+            scales: self.groups.clone(),
+        };
         for start in (0..self.family.rows).step_by(forward_rows) {
             let rows = forward_rows.min(self.family.rows - start);
-            let (_, _, norms) = self.evaluate_rows(p, start, rows)?;
-            let (row, value) = maximum(&norms);
-            if value > worst.1 {
-                worst = (start + row, value);
+            let (_, _, norms) = self.evaluate_group_rows(p, start, rows)?;
+            for (group, values) in norms.iter().enumerate() {
+                for (row, value) in values.iter().copied().enumerate() {
+                    result.group_maxima[group] = result.group_maxima[group].max(value);
+                    let row = start + row;
+                    if value > result.maximum
+                        || (value == result.maximum
+                            && (row, group) < (result.worst_row, result.worst_group))
+                    {
+                        result.maximum = value;
+                        result.worst_row = row;
+                        result.worst_group = group;
+                    }
+                }
             }
         }
-        Ok(worst)
+        Ok(result)
     }
 }
-fn maximum(values: &[f64]) -> (usize, f64) {
-    values.iter().copied().enumerate().fold(
-        (0, values[0]),
-        |best, (i, v)| if v > best.1 { (i, v) } else { best },
-    )
-}
+
 fn snapshot(p: &DeviceProgram, trainable: &[usize]) -> Result<BTreeMap<usize, Tensor>, String> {
     trainable
         .iter()
@@ -227,29 +375,72 @@ pub fn fit(
     trainable: &[usize],
     settings: Settings,
 ) -> Result<Fit, String> {
-    let started = Instant::now();
-    validate_settings(&settings)?;
-    let input = match source.declarations.slots.as_slice() {
-        [Slot::Raw { width }]
-            if source.declarations.parameters == 0 && source.declarations.domains.is_empty() =>
-        {
-            *width
-        }
-        _ => {
-            return Err(
-                "fitter requires one Raw input slot and no external parameters/domains".into(),
-            );
-        }
-    };
+    if source.declarations.slots.len() != 1 {
+        return Err(
+            "legacy fit requires one Raw input; use fit_grouped for multiple inputs".into(),
+        );
+    }
+    let groups = [OutputGroup {
+        label: "output".into(),
+        start: 0,
+        end: train_y.ncols(),
+    }];
+    let result = fit_grouped(
+        d,
+        source,
+        std::slice::from_ref(train_x),
+        train_y,
+        std::slice::from_ref(valid_x),
+        valid_y,
+        &groups,
+        trainable,
+        settings,
+    )?;
+    let r = result.report;
+    Ok(Fit {
+        program: result.program,
+        report: Report {
+            settings: r.settings,
+            trainable: r.trainable,
+            training_rows: r.training_rows,
+            validation_rows: r.validation_rows,
+            training_rms: r.training_scales[0].native_rms,
+            validation_rms: r.validation_scales[0].native_rms,
+            initial_training_max: r.initial_training_max,
+            best_training_max: r.best_training_max,
+            initial_validation_max: r.initial_validation.maximum,
+            final_validation_max: r.final_validation.maximum,
+            best_step: r.best_step,
+            iterations: r
+                .iterations
+                .into_iter()
+                .map(|i| Iteration {
+                    step: i.step,
+                    training_max: i.training_max,
+                    worst_row: i.worst_row,
+                    active_recomputed_error: i.active_recomputed_error,
+                })
+                .collect(),
+            planned_numeric_bytes: r.planned_numeric_bytes,
+            seconds: r.seconds,
+            scope: r.scope,
+        },
+    })
+}
+
+fn fitting_program(source: &OperatorProgram, widths: &[usize]) -> Result<OperatorProgram, String> {
     let (expanded, _) = mapped_inlined(source)?;
-    if expanded
-        .nodes
-        .iter()
-        .filter(|n| matches!(n, crate::operator_program::Node::Raw { .. }))
-        .count()
-        != 1
-    {
-        return Err("fitter requires exactly one raw input node".into());
+    let mut raw_counts = vec![0usize; widths.len()];
+    for node in &expanded.nodes {
+        if let crate::operator_program::Node::Raw { slot } = node {
+            let count = raw_counts
+                .get_mut(*slot)
+                .ok_or("Raw slot beyond declarations")?;
+            *count += 1;
+        }
+    }
+    if raw_counts.iter().any(|n| *n != 1) {
+        return Err("fitter requires exactly one Raw node per declared input slot".into());
     }
     if expanded.nodes.iter().any(|node| {
         !matches!(
@@ -266,10 +457,30 @@ pub fn fit(
     }) {
         return Err("fitter numeric plan supports only Raw/Constant/Affine/Pointwise/Hadamard/Concat/Transpose/fixed Gain after Call expansion; attention and other primitive scratch are not budgeted".into());
     }
+    Ok(expanded)
+}
+
+/// Joint fitting of aligned Raw arguments with a maximum over separately normalized output uses.
+pub fn fit_grouped(
+    d: &Device,
+    source: &OperatorProgram,
+    train_inputs: &[Array2<f64>],
+    train_y: &Array2<f64>,
+    valid_inputs: &[Array2<f64>],
+    valid_y: &Array2<f64>,
+    groups: &[OutputGroup],
+    trainable: &[usize],
+    settings: Settings,
+) -> Result<GroupFit, String> {
+    let started = Instant::now();
+    validate_settings(&settings)?;
+    let widths = source_inputs(source)?;
+    let expanded = fitting_program(source, &widths)?;
     let interfaces = expanded.interfaces().map_err(|e| e.to_string())?;
     let output = interfaces[expanded.output].width();
-    let training_rms = panel(train_x, train_y, input, output)?;
-    let validation_rms = panel(valid_x, valid_y, input, output)?;
+    output_groups(groups, output)?;
+    let training_scales = panel_groups(train_inputs, train_y, &widths, groups)?;
+    let validation_scales = panel_groups(valid_inputs, valid_y, &widths, groups)?;
     let unique: BTreeSet<_> = trainable.iter().copied().collect();
     if unique.len() != trainable.len() || trainable.is_empty() {
         return Err("empty/duplicate trainable indices".into());
@@ -296,17 +507,21 @@ pub fn fit(
     let mut program = DeviceProgram::compile_values_bounded(d, &expanded, settings.numeric_bytes)?;
     program.set_arithmetic(settings.arithmetic.device());
     let parameters = checked_bytes(parameter_elements)?;
+    let input_elements = train_inputs
+        .iter()
+        .chain(valid_inputs)
+        .try_fold(0usize, |n, x| {
+            n.checked_add(x.len()).ok_or("input panel size overflow")
+        })?;
     let panels = checked_bytes(
-        train_x
-            .len()
+        input_elements
             .checked_add(train_y.len())
-            .and_then(|a| a.checked_add(valid_x.len()))
-            .and_then(|a| a.checked_add(valid_y.len()))
+            .and_then(|n| n.checked_add(valid_y.len()))
             .ok_or("panel size overflow")?,
     )?;
     let max_rows = settings
         .forward_rows
-        .min(train_x.nrows().max(valid_x.nrows()));
+        .min(train_y.nrows().max(valid_y.nrows()));
     let trace_bytes = program
         .bytes_per_row()
         .checked_mul(max_rows)
@@ -331,8 +546,8 @@ pub fn fit(
         ));
     }
     program.prepare_dense_parameters(trainable)?;
-    let training = Panel::new(d, train_x, train_y, training_rms)?;
-    let validation = Panel::new(d, valid_x, valid_y, validation_rms)?;
+    let training = Panel::new_grouped(d, train_inputs, train_y, training_scales.clone())?;
+    let validation = Panel::new_grouped(d, valid_inputs, valid_y, validation_scales.clone())?;
     let mut moments: BTreeMap<usize, (Tensor, Tensor)> = trainable
         .iter()
         .map(|i| {
@@ -346,22 +561,26 @@ pub fn fit(
             ))
         })
         .collect::<Result<_, String>>()?;
-    let initial_validation_max = validation.maximum(&program, settings.forward_rows)?.1;
+    let initial_validation = validation.scan(&program, settings.forward_rows)?;
     let mut best = snapshot(&program, trainable)?;
     let mut best_value = f64::INFINITY;
     let mut best_step = 0;
+    let mut best_training_groups = Vec::new();
     let mut history = Vec::new();
     for step in 0..=settings.iterations {
-        let (row, value) = training.maximum(&program, settings.forward_rows)?;
-        history.push(Iteration {
+        let score = training.scan(&program, settings.forward_rows)?;
+        let (row, group, value) = (score.worst_row, score.worst_group, score.maximum);
+        history.push(GroupIteration {
             step,
             training_max: value,
             worst_row: row,
+            worst_group: group,
             active_recomputed_error: None,
         });
         if value < best_value {
             best_value = value;
             best_step = step;
+            best_training_groups = score.group_maxima;
             best = snapshot(&program, trainable)?;
         }
         if step == settings.iterations || value == 0. {
@@ -369,23 +588,30 @@ pub fn fit(
         }
         // An active row is a subgradient of max row norm; deterministic first-row tie.
         // Normalize in two stages to avoid squaring the native RMS.
-        let (trace, residual, active_norms) = training.evaluate_rows(&program, row, 1)?;
+        let (trace, residual, active_norms) = training.evaluate_group_rows(&program, row, 1)?;
         history
             .last_mut()
             .ok_or("missing current iteration")?
-            .active_recomputed_error = Some(active_norms[0]);
-        let norm = active_norms[0] * training_rms;
+            .active_recomputed_error = Some(active_norms[group][0]);
+        let training_rms = training.groups[group].native_rms;
+        let norm = active_norms[group][0] * training_rms;
         if !norm.is_finite() || norm <= 0. {
             return Err("active residual norm cannot be represented".into());
         }
-        let active = residual;
-        let mut normalized = d.zeros(1, output).map_err(|e| e.to_string())?;
+        let range = training.groups[group].group.start..training.groups[group].group.end;
+        let group_width = range.end - range.start;
+        let active = d
+            .columns_of(&residual, range.clone())
+            .map_err(|e| e.to_string())?;
+        let mut normalized = d.zeros(1, group_width).map_err(|e| e.to_string())?;
         d.axpy(&mut normalized, 1. / norm, &active)
             .map_err(|e| e.to_string())?;
-        let mut row_seed = d.zeros(1, output).map_err(|e| e.to_string())?;
+        let mut row_seed = d.zeros(1, group_width).map_err(|e| e.to_string())?;
         d.axpy(&mut row_seed, 1. / training_rms, &normalized)
             .map_err(|e| e.to_string())?;
-        let seed = row_seed;
+        let mut seed = d.zeros(1, output).map_err(|e| e.to_string())?;
+        d.set_columns(&mut seed, range.start, &row_seed)
+            .map_err(|e| e.to_string())?;
         let (_, gradients) = program.vjp_values_dense(
             &trace,
             BTreeMap::from([(program.hidden(), seed)]),
@@ -413,7 +639,7 @@ pub fn fit(
     for (index, value) in best {
         program.replace_dense_parameter(index, value)?;
     }
-    let final_validation_max = validation.maximum(&program, settings.forward_rows)?.1;
+    let final_validation = validation.scan(&program, settings.forward_rows)?;
     let mut fitted = source.clone();
     for &index in trainable {
         let values = d
@@ -436,24 +662,25 @@ pub fn fit(
         *p = precision;
     }
     let initial_training_max = history[0].training_max;
-    Ok(Fit {
+    Ok(GroupFit {
         program: fitted,
-        report: Report {
+        report: GroupReport {
             settings,
             trainable: trainable.to_vec(),
-            training_rows: train_x.nrows(),
-            validation_rows: valid_x.nrows(),
-            training_rms,
-            validation_rms,
+            training_rows: train_y.nrows(),
+            validation_rows: valid_y.nrows(),
+            training_scales,
+            validation_scales,
             initial_training_max,
             best_training_max: best_value,
-            initial_validation_max,
-            final_validation_max,
+            best_training_groups,
+            initial_validation,
+            final_validation,
             best_step,
             iterations: history,
             planned_numeric_bytes: planned,
             seconds: started.elapsed().as_secs_f64(),
-            scope: "Proposal optimization only, fixed finite f64 input/output rows. Explicit settings.arithmetic governs forward and backward products, including training/validation proposal scores; parameter/moment storage and other primitives remain f64. The f32 option uses rounded-product surrogate gradients, not derivatives through rounding. Deterministic active-row max-norm Adam; full row scan in declared chunks and one-row reverse. Single-row GEMM rounding may differ from batch; recomputed error recorded; nonconvex, no optimum certificate. Best training snapshot, validation excluded from selection. Resident numerical parameters/gradients/moments/inputs/targets; O(rows) norms downloaded each step and final parameters downloaded. Numeric plan excludes product conversion/library/allocator/context/register/spill scratch. Final decoded f64 measurement and acceptance are separate.",
+            scope: "Proposal optimization only, fixed finite f64 input/output rows. Explicit settings.arithmetic governs forward and backward products, including training/validation proposal scores; parameter/moment storage and other primitives remain f64. The f32 option uses rounded-product surrogate gradients, not derivatives through rounding. Maximum over ALL output groups and rows, each group normalized by its own complete native-family RMS. Deterministic active-group/row max-norm Adam; full row scan in declared chunks and one-row reverse. Single-row GEMM rounding may differ from batch; recomputed error recorded; nonconvex, no optimum certificate. Best training snapshot, validation excluded from selection. Resident numerical parameters/gradients/moments/inputs/targets; O(rows) norms downloaded each step and final parameters downloaded. Numeric plan excludes product conversion/library/allocator/context/register/spill scratch. Final decoded f64 measurement and acceptance are separate.",
         },
     })
 }
@@ -467,22 +694,53 @@ pub fn measure(
     numeric_bytes: usize,
     forward_rows: usize,
 ) -> Result<f64, String> {
+    if source.declarations.slots.len() != 1 {
+        return Err("legacy measure requires one Raw slot; use measure_grouped".into());
+    }
+    Ok(measure_grouped(
+        d,
+        source,
+        std::slice::from_ref(x),
+        y,
+        &[OutputGroup {
+            label: "output".into(),
+            start: 0,
+            end: y.ncols(),
+        }],
+        numeric_bytes,
+        forward_rows,
+    )?
+    .maximum)
+}
+/// Ordinary f64 measurement of all output groups, independent of fit product arithmetic.
+pub fn measure_grouped(
+    d: &Device,
+    source: &OperatorProgram,
+    inputs: &[Array2<f64>],
+    y: &Array2<f64>,
+    groups: &[OutputGroup],
+    numeric_bytes: usize,
+    forward_rows: usize,
+) -> Result<GroupMeasurement, String> {
     if forward_rows == 0 {
         return Err("zero measurement forward_rows".into());
     }
-    let (expanded, _) = mapped_inlined(source)?;
+    let widths = source_inputs(source)?;
+    let expanded = fitting_program(source, &widths)?;
     let interfaces = expanded.interfaces().map_err(|e| e.to_string())?;
-    let input = match expanded.declarations.slots.as_slice() {
-        [Slot::Raw { width }] => *width,
-        _ => return Err("measure requires one raw input".into()),
-    };
-    let rms = panel(x, y, input, interfaces[expanded.output].width())?;
+    if y.ncols() != interfaces[expanded.output].width() {
+        return Err("measurement output width mismatch".into());
+    }
+    let scales = panel_groups(inputs, y, &widths, groups)?;
     let p = DeviceProgram::compile_values_bounded(d, &expanded, numeric_bytes)?;
+    let elements = inputs.iter().try_fold(y.len(), |n, x| {
+        n.checked_add(x.len()).ok_or("panel size overflow")
+    })?;
     let planned = sum_bytes(&[
         p.operator_numeric_bytes()?,
-        checked_bytes(x.len().checked_add(y.len()).ok_or("panel overflow")?)?,
+        checked_bytes(elements)?,
         p.bytes_per_row()
-            .checked_mul(forward_rows.min(x.nrows()))
+            .checked_mul(forward_rows.min(y.nrows()))
             .ok_or("trace overflow")?,
         checked_bytes(y.len())?
             .checked_mul(2)
@@ -491,13 +749,71 @@ pub fn measure(
     if planned > numeric_bytes {
         return Err("measurement numeric plan exceeds budget".into());
     }
-    Ok(Panel::new(d, x, y, rms)?.maximum(&p, forward_rows)?.1)
+    Panel::new_grouped(d, inputs, y, scales)?.scan(&p, forward_rows)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::operator_program::{Declarations, Interface, Law, Node, Operator, Rule};
+    fn panel(x: &Array2<f64>, y: &Array2<f64>, input: usize, output: usize) -> Result<f64, String> {
+        if x.nrows() == 0
+            || x.nrows() != y.nrows()
+            || x.ncols() != input
+            || y.ncols() != output
+            || !x.iter().chain(y.iter()).all(|v| v.is_finite())
+        {
+            return Err("invalid fitting panel shapes/finite values".into());
+        }
+        // Scaled accumulation prevents avoidable overflow/underflow in the fixed native denominator.
+        let largest = y.iter().fold(0f64, |a, v| a.max(v.abs()));
+        if largest == 0. {
+            return Err("zero native RMS: normalized proposal objective undefined".into());
+        }
+        let rms = largest
+            * (y.iter().map(|v| (v / largest) * (v / largest)).sum::<f64>() / y.nrows() as f64)
+                .sqrt();
+        if !rms.is_finite() || rms <= 0. {
+            return Err("nonfinite/underflow native RMS".into());
+        }
+        Ok(rms)
+    }
+    fn maximum(values: &[f64]) -> (usize, f64) {
+        values
+            .iter()
+            .copied()
+            .enumerate()
+            .fold(
+                (0, values[0]),
+                |best, (i, v)| if v > best.1 { (i, v) } else { best },
+            )
+    }
+    impl Panel {
+        fn new(d: &Device, x: &Array2<f64>, y: &Array2<f64>, rms: f64) -> Result<Self, String> {
+            Self::new_grouped(
+                d,
+                std::slice::from_ref(x),
+                y,
+                vec![GroupScale {
+                    group: OutputGroup {
+                        label: "output".into(),
+                        start: 0,
+                        end: y.ncols(),
+                    },
+                    native_rms: rms,
+                }],
+            )
+        }
+        fn evaluate_rows(
+            &self,
+            p: &DeviceProgram,
+            start: usize,
+            rows: usize,
+        ) -> Result<(DeviceTrace, Tensor, Vec<f64>), String> {
+            let (trace, residual, mut norms) = self.evaluate_group_rows(p, start, rows)?;
+            Ok((trace, residual, norms.remove(0)))
+        }
+    }
     fn model(weight: f64, offset: f64) -> OperatorProgram {
         let i = Interface::native(1).expect("interface");
         let c = Interface::constant();
@@ -595,22 +911,37 @@ mod tests {
         let y = target(&teacher, &x);
         let vy = target(&teacher, &v);
         let d = Device::host();
-        let mut s = settings(); s.arithmetic = ProposalArithmetic::F32;
+        let mut s = settings();
+        s.arithmetic = ProposalArithmetic::F32;
         let result = fit(&d, &p, &x, &y, &v, &vy, &[0, 1], s.clone()).unwrap();
         assert_eq!(result.report.settings.arithmetic, ProposalArithmetic::F32);
         assert!(result.report.best_training_max < result.report.initial_training_max * 0.1);
         // Final f64 scoring must use decoded numerical parameters, never cached f32 fit scores.
         let fitted_y = target(&result.program, &x);
         let scale = panel(&x, &y, 1, 2).unwrap();
-        let expected = fitted_y.outer_iter().zip(y.outer_iter()).map(|(a,b)|
-            a.iter().zip(b).map(|(a,b)| (a-b).powi(2)).sum::<f64>().sqrt()/scale
-        ).fold(0.0_f64, f64::max);
+        let expected = fitted_y
+            .outer_iter()
+            .zip(y.outer_iter())
+            .map(|(a, b)| {
+                a.iter()
+                    .zip(b)
+                    .map(|(a, b)| (a - b).powi(2))
+                    .sum::<f64>()
+                    .sqrt()
+                    / scale
+            })
+            .fold(0.0_f64, f64::max);
         let actual = measure(&d, &result.program, &x, &y, s.numeric_bytes, s.forward_rows).unwrap();
         assert!((actual - expected).abs() < 2e-12);
         let mut encoded = serde_json::to_value(s).unwrap();
         assert_eq!(encoded["arithmetic"], "f32");
         encoded.as_object_mut().unwrap().remove("arithmetic");
-        assert_eq!(serde_json::from_value::<Settings>(encoded).unwrap().arithmetic, ProposalArithmetic::F64);
+        assert_eq!(
+            serde_json::from_value::<Settings>(encoded)
+                .unwrap()
+                .arithmetic,
+            ProposalArithmetic::F64
+        );
     }
     #[test]
     fn shared_nonlinear_parameters_fit_joint_output_max_error_without_validation_selection() {
@@ -774,5 +1105,166 @@ mod tests {
                 d.download(&single_grad[&index]).expect("single gradient")
             );
         }
+    }
+    fn grouped_model(weight: f64, offset: f64, tiny_scale: f64) -> OperatorProgram {
+        let mut p = model(weight, offset);
+        p.declarations.slots.push(Slot::Raw { width: 1 });
+        let i = Interface::native(1).expect("interface");
+        for (name, value) in [("large writer", 1000.), ("tiny writer", tiny_scale)] {
+            p.operators.push(Arc::new(
+                Operator::dense(
+                    name,
+                    i.clone(),
+                    i.clone(),
+                    Array2::from_elem((1, 1), value),
+                    exact_precision([value]).expect("precision"),
+                    Default::default(),
+                )
+                .expect("writer"),
+            ));
+        }
+        p.nodes = vec![
+            Node::Raw { slot: 0 },
+            Node::Raw { slot: 1 },
+            Node::Call {
+                rule: 0,
+                arguments: vec![0],
+            },
+            Node::Call {
+                rule: 0,
+                arguments: vec![1],
+            },
+            Node::Affine {
+                terms: vec![(2, 3)],
+                bias: None,
+            },
+            Node::Affine {
+                terms: vec![(3, 4)],
+                bias: None,
+            },
+            Node::Concat { parts: vec![4, 5] },
+        ];
+        p.output = 6;
+        p
+    }
+    fn grouped_target(p: &OperatorProgram, x: &[Array2<f64>]) -> Array2<f64> {
+        p.execute(
+            &FamilyInputs {
+                rows: x[0].nrows(),
+                slots: x.iter().cloned().map(SlotValues::Raw).collect(),
+                layout: None,
+            },
+            false,
+        )
+        .expect("teacher")
+        .values[p.output]
+            .clone()
+    }
+    fn groups() -> Vec<OutputGroup> {
+        vec![
+            OutputGroup {
+                label: "large native use".into(),
+                start: 0,
+                end: 1,
+            },
+            OutputGroup {
+                label: "tiny native use".into(),
+                start: 1,
+                end: 2,
+            },
+        ]
+    }
+    #[test]
+    fn grouped_normalization_cannot_hide_small_use_and_frozen_body_is_preserved() {
+        let p = grouped_model(0.6, 0.1, 0.0005);
+        let teacher = grouped_model(0.6, 0.1, 0.001);
+        let x = vec![ndarray::array![[1.], [2.]], ndarray::array![[1.], [2.]]];
+        let y = grouped_target(&teacher, &x);
+        let d = Device::host();
+        let score =
+            measure_grouped(&d, &p, &x, &y, &groups(), 1 << 20, 1).expect("group measurement");
+        assert_eq!(score.group_maxima[0], 0.);
+        assert!(score.maximum > 0.5);
+        assert_eq!(score.worst_group, 1);
+        let predicted = grouped_target(&p, &x);
+        let native_pooled = (y.iter().map(|v| v * v).sum::<f64>() / 2.).sqrt();
+        let pooled = predicted
+            .outer_iter()
+            .zip(y.outer_iter())
+            .map(|(a, b)| {
+                a.iter()
+                    .zip(b)
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum::<f64>()
+                    .sqrt()
+                    / native_pooled
+            })
+            .fold(0f64, f64::max);
+        assert!(pooled < 1e-5, "pooled normalization would hide this error");
+        let mut s = settings();
+        s.learning_rate = 0.00002;
+        let result = fit_grouped(&d, &p, &x, &y, &x, &y, &groups(), &[4], s)
+            .expect("fit only paid tiny writer");
+        assert!(result.report.best_training_max < score.maximum * 0.05);
+        assert!(Arc::ptr_eq(&result.program.operators[0], &p.operators[0]));
+        assert!(
+            Arc::ptr_eq(&result.program.operators[1], &p.operators[1]),
+            "shared body coefficients frozen"
+        );
+        assert!(
+            result.report.training_scales[0].native_rms
+                / result.report.training_scales[1].native_rms
+                > 999999.
+        );
+        let saved = crate::artifact::Artifact::native(&result.program)
+            .expect("artifact")
+            .f32_literals()
+            .expect("f32");
+        let replay = crate::artifact::Artifact::from_bytes(
+            &saved.to_bytes().expect("saved bytes"),
+            &saved.program.declarations,
+        )
+        .expect("ordinary decode");
+        let actual = measure_grouped(&d, &replay.program, &x, &y, &groups(), 1 << 20, 1)
+            .expect("saved grouped replay");
+        assert!(actual.maximum < 0.03);
+        let gap = [OutputGroup {
+            label: "incomplete".into(),
+            start: 0,
+            end: 1,
+        }];
+        assert!(measure_grouped(&d, &p, &x, &y, &gap, 1 << 20, 1).is_err());
+        let mut misaligned = x.clone();
+        misaligned[1] = Array2::zeros((1, 1));
+        assert!(measure_grouped(&d, &p, &misaligned, &y, &groups(), 1 << 20, 1).is_err());
+    }
+    #[test]
+    fn grouped_shared_nonlinear_body_fits_distinct_raw_bindings_jointly() {
+        let p = grouped_model(0.6, 0.1, 0.001);
+        let teacher = grouped_model(1.2, -0.2, 0.001);
+        let x = vec![
+            ndarray::array![[-1.2], [0.4], [1.8]],
+            ndarray::array![[-0.7], [0.8], [1.5]],
+        ];
+        let y = grouped_target(&teacher, &x);
+        let result = fit_grouped(
+            &Device::host(),
+            &p,
+            &x,
+            &y,
+            &x,
+            &y,
+            &groups(),
+            &[0, 1],
+            settings(),
+        )
+        .expect("joint shared parameters");
+        assert!(result.report.best_training_max < result.report.initial_training_max * 0.1);
+        assert!(result.report.best_training_groups.iter().all(|v| *v < 0.05));
+        assert!(result.report.iterations.iter().any(|i| i.worst_group == 1));
+        assert_ne!(
+            result.program.operators[0].matrix(),
+            p.operators[0].matrix()
+        );
     }
 }
