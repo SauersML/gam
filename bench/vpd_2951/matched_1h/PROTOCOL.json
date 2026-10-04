@@ -1,0 +1,55 @@
+{
+  "scope": "existing onehour batch1 VPD checkpoint, autonomous CI>0 own-state bounded fixedpoint vs native-fed diagnostic; no convergence/published413GPUh/methodwin claim",
+  "checkpoint_relative": "mpd-data/cluster/codex-vpd-pilot-1h/1h.pt",
+  "source_dir_relative": "mpd-data/bench/vpd-matched-codex",
+  "source_sha256": {
+    "run.py": "696be43d23f01af541633a2a1bb1f4b6601f451ca302a7b83696a1b6a12896b3",
+    "vpd_model.py": "93d8c4c0b51548d1fc5b3e1e7d26d2d68673067b2955b10cf6a48e6ec16a1bb0"
+  },
+  "upstream": "017a17af4f7372d0db8e55b23aeff603ee6ba735",
+  "config_sha256": "8cdf37eb841e8dab6a7a1f96c6cd4c12afbde61c11a24c48cf426248916cf221",
+  "target_sha256": "155e0e9ee8f899ab100bdb84224751308ae86ed57f746dbea403b93276a96552",
+  "data_sha256": "a2be4b1a87e306911e6ee72cfe47e78de1f6be5c68cab89e154032388a4b5d1e",
+  "training_steps": 9738,
+  "main_training_tokens": 4985856,
+  "training_rows": [
+    2048,
+    2560
+  ],
+  "warmup_parameter_updates": 400,
+  "warmup_tokens": 0,
+  "training_driver_seconds": 3635.269458641298,
+  "training_gpu_allocated_seconds": 3638,
+  "spec_sha256": "3c05b66324dfb02e33da7eff98784a7ec432123e24fea78018b892efb4256436",
+  "episodes": 80,
+  "groups": 40,
+  "context": 512,
+  "passages": "validation rows16,17 of frontier32 = Pileval1040,1041, remappedpanel IDs0,1; originaltwofull512sequences",
+  "max_rounds": 10,
+  "selection": "lower CI>0, noDelta, initializeallsubcomponentson; donor states from candidate own clean iteration",
+  "native_feed": "intervenednativeanswerstates only diagnostic; never autonomousselection",
+  "cost": "exact denseparameter numeric32-bit payload +retainednativeembedding/norms; structural/wiring/iteration cost unresolved, so no fullC32total claim",
+  "resources": {
+    "convert": {
+      "cpus": 1,
+      "host_gib": 16,
+      "gpu": 0,
+      "minutes": 15
+    },
+    "evaluate": {
+      "cpus": 4,
+      "host_gib": 24,
+      "gpu": 1,
+      "minutes": 30
+    }
+  },
+  "output": "codex-vpd-1h-eval-017a",
+  "model_precision": "original upstream fp32 target/components/CI CUDA; float64 GPU KL diagnostic, no intervalcertificate",
+  "local": "sameparent native-fedCI roundedsitelinearwrites worstrowrelativeEuclidean on2full512passages, separatelylabelnativefed",
+  "upstream_fast_battery": "native-fed six maskstrategies and per-siteL0, notautonomous",
+  "evaluation_compute_separate": true,
+  "evaluation_source_sha256": "4a377bf02b572dea04b9e7c60a5d587a83527e33475ff5fffb8c79c6d9201f8a",
+  "evaluation_export_relative": "mpd-data/codex/copy-rule-validation-20261004/export",
+  "evaluation_tokens_sha256": "9938c3b6995c4c1b9f74b7bf26b7a17a991941952de9a2e6598fec95003ca8cf",
+  "orchestration_sha256": "6e28c02a1cc66f8ef2fc5c7f78840e685f6e30fd2ec2da650e235afa87dd60ab"
+}

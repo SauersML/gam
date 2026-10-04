@@ -1,0 +1,5 @@
+{
+  "scope": "additional input check, no change to frozen conversion/evaluation scoring protocol",
+  "target_config_sha256": "9664c12d3492ee58520f89703e67ea2790ea13de1f88bf8e3c4594943e0cc59d",
+  "guard_sha256": "4fa273441802f8396c03feaa112c97d62957029c1117f8b540d95567ca8ad8f4"
+}
