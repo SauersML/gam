@@ -334,6 +334,7 @@ fn main() -> Result<(), String> {
         "export": export.display().to_string(), "spec": spec_path.display().to_string(), "bank_manifest": bank_path.display().to_string(),
         "options": keys, "budget": budget, "max_bank": max_bank, "supplied_candidates": supplied_candidates,
         "distinct_candidates": evaluated.bank.len(), "measured_candidates": evaluated.measured_candidates, "account_count": account_count,
+        "frontier_stage_seconds": evaluated.timing,
         "bank": evaluated.bank.iter().enumerate().map(|(index, c)| json!({"index": index, "label": c.label})).collect::<Vec<_>>(),
         "assessments": evaluated.assessments.iter().enumerate().map(|(index, result)| match result {
             None => json!({"index": index, "state": "unevaluated"}),

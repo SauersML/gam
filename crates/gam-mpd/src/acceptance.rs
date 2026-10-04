@@ -1139,18 +1139,37 @@ pub fn assess_once(local: &Local<'_>, run: &dyn RunCheck, artifact: &Artifact, c
     if !constraint.local.is_finite() || constraint.local < 0.0 || !constraint.run.is_finite() || constraint.run < 0.0 {
         return Err("the fidelity tolerance must be finite and nonnegative".into());
     }
-    if !artifact.has_f32_literals() {
-        return Err("a literal that is not a 32-bit float".into());
+    PreparedAssessment::new(artifact, cache)?.assess(local, run, constraint)
+}
+
+/// One immutable message and the structural cost of exactly the artifact that produced it.
+/// The finite-bank evaluator can compare this message for deduplication, then decode it for
+/// fidelity, without serializing every checkpoint a second time. Private fields prevent pairing
+/// an unrelated message with a cheaper cost. At most one such message is retained by the bank.
+pub(crate) struct PreparedAssessment {
+    encoded: EncodedArtifact,
+    cost: StructuralCost,
+}
+
+impl PreparedAssessment {
+    pub(crate) fn new(artifact: &Artifact, cache: &mut CostCache) -> Result<Self, String> {
+        if !artifact.has_f32_literals() {
+            return Err("a literal that is not a 32-bit float".into());
+        }
+        Ok(Self { cost: structural_cost(artifact, cache)?, encoded: EncodedArtifact::of(artifact)? })
     }
-    let cost = structural_cost(artifact, cache)?;
-    let encoded = EncodedArtifact::of(artifact)?;
-    let ((local_measure, run_measure), [local, run]) = decode_then_evaluate_pair(
-        &encoded,
-        |decoded: &Artifact| Ok((local.measure(decoded)?, RunMeasure::of(run.episodes(decoded)?))),
-        |(local, run)| Ok([local.status()?, run.status()?]),
-        [constraint.local, constraint.run],
-    )?;
-    Ok(Assessment { cost, local, local_measure, run, run_measure })
+
+    pub(crate) fn message(&self) -> &super::codec::BitString { &self.encoded.message }
+
+    pub(crate) fn assess(&self, local: &Local<'_>, run: &dyn RunCheck, constraint: Constraint) -> Result<Assessment, String> {
+        let ((local_measure, run_measure), [local, run]) = decode_then_evaluate_pair(
+            &self.encoded,
+            |decoded: &Artifact| Ok((local.measure(decoded)?, RunMeasure::of(run.episodes(decoded)?))),
+            |(local, run)| Ok([local.status()?, run.status()?]),
+            [constraint.local, constraint.run],
+        )?;
+        Ok(Assessment { cost: self.cost, local, local_measure, run, run_measure })
+    }
 }
 
 // -------------------------------------------------------------------------------- the search
