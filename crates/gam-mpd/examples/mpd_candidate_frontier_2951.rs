@@ -311,7 +311,7 @@ fn main() -> Result<(), String> {
         details.push(json!({"point": point, "selected": selected}));
     }
     let replay_seconds = timer.elapsed().as_secs_f64();
-    let report = json!({
+    let mut report = json!({
         "execution": {"backend": run.backend_name(), "local": "CPU f64", "teacher": "immutable cached CPU residuals and native effects", "readout_and_KL": "CPU f64", "cuda_episode_parallelism": 1, "teacher_parallelism": parallel, "teacher_cache_memory": "one final residual matrix per episode plus scalar native effects; initialization also retains clean native passage traces and requested donor rows",
             "cuda_trace_limit_scope": "intermediate activation estimate only; excludes operators, attention workspaces, edit masks and allocator overhead",
             "cuda_upload_scope": "one base per candidate; episode/donor forks share unchanged operator tensors by Arc identity and role; requested donor rows downloaded then reuploaded for mixes"},
@@ -344,6 +344,8 @@ fn main() -> Result<(), String> {
         "input_hash_algorithm": "SHA-256", "input_files": inputs, "details": details,
         "seconds": {"load_and_generation": loaded_seconds, "input_hashing": hashing_seconds, "frontier": frontier_seconds, "selected_replay": replay_seconds, "total": started.elapsed().as_secs_f64()}
     });
+    report["run_stage_seconds"] = serde_json::to_value(run.timing()).map_err(|e| e.to_string())?;
+    report["run_stage_timing_scope"] = json!("cumulative across all assessments and saved-byte replays; parallel donor/episode durations summed, not additive wall time; CUDA includes transfer to host, not kernel-only timing");
     let path = out.join("report.json");
     std::fs::write(&path, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| format!("{}: {e}", path.display()))?;
     eprintln!("{} distinct candidates, {} measured; {}", evaluated.bank.len(), evaluated.measured_candidates, path.display());

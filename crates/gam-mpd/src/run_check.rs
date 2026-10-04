@@ -616,6 +616,43 @@ struct TeacherEpisodes {
     native_effects: Vec<f64>,
 }
 
+#[derive(Default)]
+struct RunTimers {
+    teacher: std::sync::atomic::AtomicU64,
+    compile: std::sync::atomic::AtomicU64,
+    planning: std::sync::atomic::AtomicU64,
+    donor: std::sync::atomic::AtomicU64,
+    forward: std::sync::atomic::AtomicU64,
+    readout: std::sync::atomic::AtomicU64,
+}
+
+struct RunTimer<'a>(&'a std::sync::atomic::AtomicU64, std::time::Instant);
+
+impl RunTimer<'_> {
+    fn start(counter: &std::sync::atomic::AtomicU64) -> RunTimer<'_> {
+        RunTimer(counter, std::time::Instant::now())
+    }
+}
+
+impl Drop for RunTimer<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(self.1.elapsed().as_nanos().min(u64::MAX as u128) as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Cumulative elapsed seconds inside each execution stage, including saved-byte replays.
+/// Parallel episode/donor durations are summed, so these are not additive wall times.
+/// CUDA calls are timed through returned host states; this is not kernel-only timing.
+#[derive(serde::Serialize)]
+pub struct RunTiming {
+    pub teacher_initialization: f64,
+    pub candidate_compile: f64,
+    pub intervention_planning: f64,
+    pub donor_execution: f64,
+    pub explained_execution: f64,
+    pub output_readout_and_kl: f64,
+}
+
 /// `D_run` of a language model's artifact (module note).
 pub struct LanguageRun<'a> {
     decoder: &'a Decoder,
@@ -631,12 +668,23 @@ pub struct LanguageRun<'a> {
     device: Option<gam_gpu::tensor::Device>,
     trace_bytes_limit: usize,
     teachers: std::sync::OnceLock<Result<TeacherEpisodes, String>>,
+    timers: RunTimers,
 }
 
 impl<'a> LanguageRun<'a> {
     pub fn new(decoder: &'a Decoder, native: &'a OperatorProgram, spec: &'a Spec, passages: &'a [Vec<u32>], parallel: usize) -> Result<Self, String> {
         let layers = layer_nodes(native, decoder.layers())?;
-        Ok(Self { decoder, native, spec, passages, layers, parallel, tile: 64, device: None, trace_bytes_limit: 0, teachers: std::sync::OnceLock::new() })
+        Ok(Self { decoder, native, spec, passages, layers, parallel, tile: 64, device: None, trace_bytes_limit: 0, teachers: std::sync::OnceLock::new(), timers: RunTimers::default() })
+    }
+
+    /// Diagnostic timing only; no measurement changes fidelity or acceptance.
+    pub fn timing(&self) -> RunTiming {
+        let seconds = |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Relaxed) as f64 * 1e-9;
+        RunTiming {
+            teacher_initialization: seconds(&self.timers.teacher), candidate_compile: seconds(&self.timers.compile),
+            intervention_planning: seconds(&self.timers.planning), donor_execution: seconds(&self.timers.donor),
+            explained_execution: seconds(&self.timers.forward), output_readout_and_kl: seconds(&self.timers.readout),
+        }
     }
 
     /// Explicit hybrid backend: P's forwards and interventions run CUDA f64 without
@@ -660,8 +708,9 @@ impl<'a> LanguageRun<'a> {
     fn teacher_episodes(&self) -> Result<&TeacherEpisodes, String> {
         self.teachers
             .get_or_init(|| {
+                let timer = RunTimer::start(&self.timers.teacher);
                 let pool = rayon::ThreadPoolBuilder::new().num_threads(self.parallel.max(1)).build().map_err(|e| e.to_string())?;
-                pool.install(|| {
+                let result = pool.install(|| {
                     use rayon::prelude::*;
                     let decoder = self.decoder;
                     let all_rows: Vec<usize> = (0..self.spec.rows).collect();
@@ -735,7 +784,9 @@ impl<'a> LanguageRun<'a> {
                         .collect::<Result<Vec<_>, String>>()?;
                     let (residuals, native_effects) = measured.into_iter().unzip();
                     Ok(TeacherEpisodes { residuals, native_effects })
-                })
+                });
+                drop(timer);
+                result
             })
             .as_ref()
             .map_err(Clone::clone)
@@ -878,10 +929,13 @@ impl RunCheck for LanguageRun<'_> {
         use rayon::prelude::*;
         let decoder = self.decoder;
         let head_dim = self.native.node_interface(self.layers[0].reads[0]).map_err(|e| e.to_string())?.width();
+        let compile_timer = RunTimer::start(&self.timers.compile);
         let (program, residuals) = self.truncated(artifact)?;
         let base = self.device.as_ref().map(|device| crate::artifact_device::Resident::from_decoded(device, &program)).transpose()?;
+        drop(compile_timer);
         let teachers = self.teacher_episodes()?;
         // Each episode's edits of P, and the donor states they read.
+        let planning_timer = RunTimer::start(&self.timers.planning);
         let mut plans = Vec::with_capacity(self.spec.episodes.len());
         let mut wanted: BTreeMap<usize, Vec<DonorKey>> = BTreeMap::new();
         for episode in &self.spec.episodes {
@@ -912,8 +966,13 @@ impl RunCheck for LanguageRun<'_> {
             }
             plans.push((episode_program, episode_residuals, edits, unheld));
         }
-        let make_donor =
-            |(d, keys): (&usize, &Vec<DonorKey>)| Ok((*d, self.run(&program, *d, &BTreeMap::new(), &BTreeMap::new(), keys, &residuals, base.as_ref())?.1));
+        drop(planning_timer);
+        let make_donor = |(d, keys): (&usize, &Vec<DonorKey>)| {
+            let timer = RunTimer::start(&self.timers.donor);
+            let result = self.run(&program, *d, &BTreeMap::new(), &BTreeMap::new(), keys, &residuals, base.as_ref())?;
+            drop(timer);
+            Ok((*d, result.1))
+        };
         let own_donors: BTreeMap<usize, BTreeMap<DonorKey, Array1<f64>>> = if self.device.is_some() {
             wanted.iter().map(make_donor).collect::<Result<_, String>>()?
         } else {
@@ -927,7 +986,10 @@ impl RunCheck for LanguageRun<'_> {
          -> Result<EpisodeScore, String> {
             let reference = &teachers.residuals[index];
             let own = episode.donor.and_then(|d| own_donors.get(&d)).unwrap_or(&empty);
+            let forward_timer = RunTimer::start(&self.timers.forward);
             let (states, _) = self.run(episode_program, episode.passage, edits, own, &[], episode_residuals, base.as_ref())?;
+            drop(forward_timer);
+            let readout_timer = RunTimer::start(&self.timers.readout);
             let explained = Forward {
                 residual: states.last().ok_or("no residual")?.clone(),
                 layers: states.iter().map(|x| x.select(Axis(0), &episode.interface_rows)).collect(),
@@ -948,6 +1010,7 @@ impl RunCheck for LanguageRun<'_> {
                 agree += top1_rows(&p, &q).iter().filter(|a| **a).count() as f64;
                 start = end;
             }
+            drop(readout_timer);
             let n = (rows - from).max(1) as f64;
             Ok(EpisodeScore {
                 id: episode.id.clone(),
