@@ -15,8 +15,8 @@
 //! (`gam_mpd::pieces::unit_pieces`), any other from its Fisher-whitened singular pieces
 //! (`gam_mpd::pieces::fisher_svd`); the rest of its subcomponents start writing nothing and grow by
 //! splits. After every round the library goes to `OUT_DIR/{site}.v.f64` (pieces × d_in) and
-//! `OUT_DIR/{site}.u.f64` (pieces × d_out), raw float64, the `library:DIR` start of
-//! `mpd_pieces_masked_2951`, and its rounds to `OUT_DIR/{site}.rounds.json`.
+//! `OUT_DIR/{site}.u.f64` (pieces × d_out), raw float64, and its rounds to
+//! `OUT_DIR/{site}.rounds.json`.
 //!
 //! Every library (fitted or given) is then made blocks of any rank by the same code
 //! (`gam_mpd::site_fit::blocks`: merges and splits, each kept when the site's code falls), from both
@@ -27,9 +27,8 @@
 //! With `library:DIR` nothing is fitted: each site's given library (`DIR/{site}.{v,u}.f64`, as
 //! above) is measured under the same code (`gam_mpd::site_fit::measure`, its sets selected from all
 //! on), the measurement goes to `OUT_DIR/{site}.measure.json`, and every input's selected sets to
-//! `OUT_DIR/sets/` as `mpd_pieces_masked_2951` takes its `SETS` (`indptr.i64`, `indices.i64` CSR
-//! over the positions, subcomponents numbered site after site, `sites.txt`): a start for its
-//! selection from this code's own.
+//! `OUT_DIR/sets/` (`indptr.i64`, `indices.i64` CSR over the positions, subcomponents numbered
+//! site after site, `sites.txt`).
 
 use gam_mpd::import::import_language_model;
 use gam_mpd::masked::{matrix, sites};

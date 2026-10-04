@@ -60,15 +60,6 @@ mod operator_program_tests;
 // The contract of an imported model: its input family and readouts.
 pub mod contract;
 
-// Measured clean, incoming and reconstruction errors of composed matrix replacements.
-pub mod composition;
-
-// Learned switches evaluated on the executable explanation's own intermediate states.
-pub mod switched;
-
-// Static dependency-preserving compilation of a fixed switching policy.
-pub mod switched_compile;
-
 // Progress logging for the drivers.
 pub mod engine;
 
