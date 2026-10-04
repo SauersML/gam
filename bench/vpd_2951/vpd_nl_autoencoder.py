@@ -35,7 +35,8 @@ Stages (each reads and writes under NLAE):
   names         an English name per fitted concept (Qwen2.5-7B-Instruct), unique (the decoder is a lookup)
   textonly      the held-out total of the text against listing the own sets
 
-usage: [NLAE=DIR] python vpd_nl_autoencoder.py STAGE...
+usage: [NLAE=DIR] [FIT=SUBDIR] python vpd_nl_autoencoder.py STAGE...  (FIT: the fit's outputs, names
+and text-only total under NLAE, default fit)
 """
 
 import json
@@ -572,11 +573,13 @@ class LM:
 
 
 def fit_outputs():
-    """The Rust fit (NLAE/fit): its report (the vocabulary's members, rates and program bits), and
-    per coded word (train rows' words, then the held-out rows') the concepts it invokes."""
-    rep = json.load(open(NLAE / "fit/concepts.json"))
-    ptr = np.fromfile(NLAE / "fit/invoked.indptr.i64", dtype="<i8")
-    idx = np.fromfile(NLAE / "fit/invoked.indices.i64", dtype="<i8")
+    """The Rust fit (NLAE/FIT, FIT from the environment, default fit): its report (the vocabulary's
+    members, rates and program bits), and per coded word (train rows' words, then the held-out
+    rows') the concepts it invokes."""
+    fit = NLAE / os.environ.get("FIT", "fit")
+    rep = json.load(open(fit / "concepts.json"))
+    ptr = np.fromfile(fit / "invoked.indptr.i64", dtype="<i8")
+    idx = np.fromfile(fit / "invoked.indices.i64", dtype="<i8")
     return rep, ptr, idx
 
 
@@ -636,7 +639,7 @@ def stage_names():
             g = g + " again"
         seen[g] += 1
         final.append(g)
-    json.dump({"namer": NAMER, "names": final, "evidence": evidence}, open(NLAE / "names.json", "w"), indent=1)
+    json.dump({"namer": NAMER, "names": final, "evidence": evidence}, open(NLAE / os.environ.get("FIT", "fit") / "names.json", "w"), indent=1)
     for c in range(0, len(final), max(1, len(final) // 20)):
         print(f"{c:5d} {final[c]!r}  <- {evidence[c]['invoked_by'][:4]}")
 
@@ -654,7 +657,7 @@ def stage_textonly():
     rep, ptr, idx = fit_outputs()
     n = rep["observations"]
     k = n / math.log(2)
-    names = json.load(open(NLAE / "names.json"))["names"]
+    names = json.load(open(NLAE / os.environ.get("FIT", "fit") / "names.json"))["names"]
     program = np.fromfile(SETS / "program.f64")
     lo, words = EVAL[0], TEXT_ROWS * D.context
     first = (TRAIN[1] - TRAIN[0]) * D.context + (lo - EVAL[0]) * D.context  # the held-out rows follow the train words
@@ -688,7 +691,7 @@ def stage_textonly():
           f"subcomponents vs the own sets' {np.mean([len(s) for s in own]):.1f}; n = {n:.0e}")
     json.dump({"observations": n, "lines": lines, "rows": {key: {"message": t.tolist(), "program": p.tolist(), "kl": e.tolist()}
                                                            for key, (t, p, e) in rows.items()},
-               "decoded": [len(p) for p in decoded], "own": [len(s) for s in own]}, open(NLAE / "textonly.json", "w"))
+               "decoded": [len(p) for p in decoded], "own": [len(s) for s in own]}, open(NLAE / os.environ.get("FIT", "fit") / "textonly.json", "w"))
 
 
 if __name__ == "__main__":
