@@ -188,6 +188,49 @@ impl<'a> UnaryRuleBank<'a> {
             cache_stats: CacheStats::default(),
         })
     }
+    /// Explicit controls for every declared target, never a selected subset.
+    pub fn zero_controls(&self) -> std::ops::Range<usize> {
+        0..self.targets.len()
+    }
+    pub fn cardinality_with_zero_controls(&self) -> Result<u64, String> {
+        self.candidate_count
+            .checked_add(self.targets.len() as u64)
+            .ok_or("control cardinality overflow".into())
+    }
+    /// Discard exactly one native head with a sparse empty operator: zero numeric
+    /// payload, original interfaces/nodes/intervention places and same binding.
+    pub fn zero_candidate(&self, target_index: usize) -> Result<Artifact, String> {
+        let target = self
+            .targets
+            .get(target_index)
+            .ok_or("zero-control target outside complete inventory")?;
+        let original = &self.native.program.operators[target.operator];
+        let values = Array2::zeros((original.rows.width(), original.cols.width()));
+        let present = Array2::from_elem(
+            (original.rows.group_count(), original.cols.group_count()),
+            false,
+        );
+        let operator = Operator::blocks(
+            original.name.clone(),
+            original.rows.clone(),
+            original.cols.clone(),
+            values,
+            present,
+            exact_precision([0.0]).map_err(|e| e.to_string())?,
+            original.provenance.clone(),
+        )
+        .map_err(|e| e.to_string())?;
+        let mut artifact = self.native.clone();
+        artifact.program.operators[target.operator] = Arc::new(operator);
+        artifact.bind(
+            &format!(
+                "generic unary attention {} post-residual boundary",
+                target.native_layer
+            ),
+            &target.reads,
+            target.write,
+        )
+    }
     pub fn choices(&self) -> impl Iterator<Item = Choice> + '_ {
         self.inventory
             .families

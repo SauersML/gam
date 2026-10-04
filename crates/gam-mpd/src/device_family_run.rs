@@ -9,12 +9,41 @@ use gam_gpu::tensor::Device;
 use ndarray::{Array2, s};
 use std::{collections::BTreeMap, sync::OnceLock};
 
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct Timing {
+    pub native_teacher_seconds: f64,
+    pub candidate_construction_seconds: f64,
+    pub cuda_forward_hooks_download_seconds: f64,
+    pub cpu_metric_seconds: f64,
+}
+#[derive(Default)]
+struct Timers {
+    teacher: std::sync::atomic::AtomicU64,
+    construction: std::sync::atomic::AtomicU64,
+    forward: std::sync::atomic::AtomicU64,
+    metric: std::sync::atomic::AtomicU64,
+}
+struct Timer<'a>(std::time::Instant, &'a std::sync::atomic::AtomicU64);
+impl<'a> Timer<'a> {
+    fn start(counter: &'a std::sync::atomic::AtomicU64) -> Self {
+        Self(std::time::Instant::now(), counter)
+    }
+}
+impl Drop for Timer<'_> {
+    fn drop(&mut self) {
+        self.1.fetch_add(
+            self.0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
 type Teachers = (Array2<f64>, Vec<Array2<f64>>);
 pub struct DeviceFamilyRun<'a> {
     run: &'a FamilyRun<'a>,
     device: Device,
     intermediate_bytes_limit: usize,
     teachers: OnceLock<Result<Teachers, String>>,
+    timers: Timers,
 }
 fn validate_edits(
     edits: &[Edit],
@@ -86,7 +115,21 @@ impl<'a> DeviceFamilyRun<'a> {
             device,
             intermediate_bytes_limit,
             teachers: OnceLock::new(),
+            timers: Timers::default(),
         })
+    }
+    /// Diagnostic host wall intervals. Forward includes intervention transfers and
+    /// output download synchronization; no new synchronization is introduced.
+    pub fn timing(&self) -> Timing {
+        let seconds = |x: &std::sync::atomic::AtomicU64| {
+            x.load(std::sync::atomic::Ordering::Relaxed) as f64 * 1e-9
+        };
+        Timing {
+            native_teacher_seconds: seconds(&self.timers.teacher),
+            candidate_construction_seconds: seconds(&self.timers.construction),
+            cuda_forward_hooks_download_seconds: seconds(&self.timers.forward),
+            cpu_metric_seconds: seconds(&self.timers.metric),
+        }
     }
     pub fn backend_name(&self) -> &'static str {
         "hybrid: explained CUDA f64; cached native teacher and output KL CPU"
@@ -94,6 +137,7 @@ impl<'a> DeviceFamilyRun<'a> {
     fn teachers(&self) -> Result<&Teachers, String> {
         self.teachers
             .get_or_init(|| {
+                let teacher_timer = Timer::start(&self.timers.teacher);
                 let native = |edits: &[Edit]| -> Result<Array2<f64>, String> {
                     let t = self
                         .run
@@ -108,14 +152,16 @@ impl<'a> DeviceFamilyRun<'a> {
                         .map_err(|e| e.to_string())?;
                     Ok(t.values[self.run.model.output].clone())
                 };
-                Ok((
+                let result = Ok((
                     native(&[])?,
                     self.run
                         .episodes
                         .iter()
                         .map(|e| native(&e.edits))
                         .collect::<Result<_, _>>()?,
-                ))
+                ));
+                drop(teacher_timer);
+                result
             })
             .as_ref()
             .map_err(Clone::clone)
@@ -125,7 +171,12 @@ impl RunCheck for DeviceFamilyRun<'_> {
     fn episodes(&self, artifact: &Artifact) -> Result<Vec<EpisodeScore>, String> {
         artifact.validate_coverage(self.run.model)?;
         let (clean, references) = self.teachers()?;
-        let resident = Resident::from_decoded(&self.device, artifact)?;
+        let resident = {
+            let construction_timer = Timer::start(&self.timers.construction);
+            let resident = Resident::from_decoded(&self.device, artifact)?;
+            drop(construction_timer);
+            resident
+        };
         let estimate = resident.estimated_resident_bytes(self.run.family.rows)?;
         if estimate > self.intermediate_bytes_limit {
             return Err(format!(
@@ -149,6 +200,7 @@ impl RunCheck for DeviceFamilyRun<'_> {
                     None => unheld += 1,
                 }
             }
+            let forward_timer = Timer::start(&self.timers.forward);
             let trace = resident.forward_edited(&self.run.family, |node, trace| {
                 let Some(edits) = held.get(&node) else {
                     return Ok(None);
@@ -168,6 +220,8 @@ impl RunCheck for DeviceFamilyRun<'_> {
                 .device
                 .download(&resident.output(&trace)?)
                 .map_err(|e| e.to_string())?;
+            drop(forward_timer);
+            let metric_timer = Timer::start(&self.timers.metric);
             if explained.dim() != reference.dim() || reference.ncols() % self.run.readouts != 0 {
                 return Err("candidate output/readout dimensions differ".into());
             }
@@ -216,6 +270,7 @@ impl RunCheck for DeviceFamilyRun<'_> {
                 top1_agree: agree / n,
                 unheld,
             });
+            drop(metric_timer);
         }
         Ok(scores)
     }

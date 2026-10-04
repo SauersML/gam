@@ -215,3 +215,72 @@ fn unary_bank_undefined_reciprocal_retained_and_no_fit_rank_cut() {
     }
     assert_eq!(undefined, 4); // Reciprocal and self-divide for source0, for both targets.
 }
+#[test]
+fn unary_bank_all_zero_controls_cheaper_and_saved_decode_intervention_lineage() {
+    use crate::operator_program::{FamilyInputs, SlotValues};
+    let base = fixture();
+    let bank = UnaryRuleBank::new(&base, targets(), limits()).expect("complete unary fixture bank");
+    assert_eq!(
+        bank.cardinality_with_zero_controls()
+            .expect("bounded cardinality"),
+        29
+    );
+    let family = FamilyInputs {
+        rows: 2,
+        slots: vec![SlotValues::Raw(array![[1., 2.], [3., 4.]])],
+        layout: None,
+    };
+    for index in bank.zero_controls() {
+        let target = &bank.targets[index];
+        let zero = bank
+            .zero_candidate(index)
+            .expect("explicit zero-head control");
+        assert_eq!(zero.program.operators[target.operator].real_count(), 0);
+        assert_eq!(zero.places, base.places);
+        assert_eq!(zero.program.nodes, base.program.nodes);
+        let cost = structural_cost(&zero, &mut CostCache::default()).expect("zero-head C32");
+        for choice in bank.choices().filter(|c| {
+            bank.target(*c).expect("declared relation target").operator == target.operator
+        }) {
+            let priced = bank
+                .priced_skeleton(choice)
+                .expect("declared unary price skeleton");
+            assert!(
+                cost.total()
+                    < structural_cost(&priced, &mut CostCache::default())
+                        .expect("priced unary relation")
+                        .total()
+            );
+        }
+        let bytes = zero.to_bytes().expect("ordinary zero-head serialization");
+        let decoded = Artifact::from_bytes(&bytes, &base.program.declarations)
+            .expect("ordinary zero-head decoding");
+        assert_eq!(
+            decoded.to_bytes().expect("canonical zero-head bytes"),
+            bytes
+        );
+        assert_eq!(
+            structural_cost(&decoded, &mut CostCache::default()).expect("decoded C32"),
+            cost
+        );
+        assert_eq!(decoded.places, base.places);
+        assert_eq!(decoded.program.operators[target.operator].real_count(), 0);
+        // The original head output node can still be held independently; holding
+        // it to the same values must produce the same downstream intervention.
+        let head_node = index + 2;
+        let execute = |a: &Artifact| {
+            a.program
+                .execute_edited(&family, |node, value, _| {
+                    if node == head_node {
+                        value.fill(7.0);
+                    }
+                    Ok(())
+                })
+                .expect("original head-node intervention")
+        };
+        assert_eq!(
+            execute(&decoded).values[base.program.output],
+            execute(&base).values[base.program.output]
+        );
+    }
+}
