@@ -378,8 +378,18 @@ pub fn fitted_sites<'a>(decoder: &Decoder, fitted: &'a [Fitted]) -> Result<Vec<O
     let mut by_site = vec![None; decoder.sites()];
     for f in fitted {
         let site = (0..decoder.sites()).find(|k| site_name(*k) == f.site.name).ok_or_else(|| format!("{}: not a site of the decoder", f.site.name))?;
-        if f.w != *decoder.native(site) {
-            return Err(format!("{}: fitted on another map than the decoder's", f.site.name));
+        let native = decoder.native(site);
+        if f.w != *native {
+            let gap = if f.w.dim() == native.dim() { (&f.w - native).iter().fold(0.0_f64, |m, d| m.max(d.abs())) } else { f64::NAN };
+            let differ = if f.w.dim() == native.dim() { f.w.iter().zip(native.iter()).filter(|(a, b)| a != b).count() } else { 0 };
+            return Err(format!(
+                "{}: fitted on another map than the decoder's ({:?} against {:?}, {differ} entries differ, largest by {gap:.3e}; reads {:?}, writes {:?})",
+                f.site.name,
+                f.w.dim(),
+                native.dim(),
+                f.site.reads,
+                f.site.writes
+            ));
         }
         by_site[site] = Some(f);
     }
