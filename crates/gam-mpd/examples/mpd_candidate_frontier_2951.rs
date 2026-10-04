@@ -449,6 +449,8 @@ fn main() -> Result<(), String> {
         report["execution"]["resident_budget_scope"] = json!("declared aggregate numeric allocations; excludes attention/library scratch, edit-construction scratch, allocator overhead and host storage");
         report["run_stage_seconds"] = Value::Null;
         report["run_stage_timing_scope"] = json!("legacy CPU phase counters do not apply; frontier and saved-replay wall times include resident preparation and scoring");
+        report["resident_run_telemetry"] = serde_json::to_value(resident_run.as_ref().ok_or("missing resident acceptance adapter")?.telemetry()?).map_err(|e| e.to_string())?;
+        report["resident_run_telemetry_scope"] = json!("cumulative completed assessments and saved-byte replays; preparation and measurement wall times overlap reported metric phases; teacher initialization counted once; failed calls counted but incomplete phase times excluded; transfer counters exclude parameter uploads and input token staging");
     }
     let path = out.join("report.json");
     std::fs::write(&path, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| format!("{}: {e}", path.display()))?;
