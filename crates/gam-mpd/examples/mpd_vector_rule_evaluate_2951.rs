@@ -60,15 +60,22 @@ fn main() -> Result<(), String> {
         sequence: (0..2).flat_map(|s| std::iter::repeat_n(s, 512)).collect(),
         position: (0..2).flat_map(|_| 0..512).collect(),
     }) };
-    save(&out.join("PROVENANCE.json"), &json!({"scope":"single fitted quadratic arithmetic proposal; no learned reuse, transfer or global optimum claim", "layer":layer,"input_width":width,"fitted_sha256":args[2],"candidate_sha256":sha256(&artifact_path)?,"spec_sha256":args[5],"export_json_sha256":sha256(&export.join("export.json"))?,"source_record":imported.record,"binary_sha256":sha256(&std::env::current_exe().map_err(|e|e.to_string())?)?,"native_C32":native_cost,"candidate_C32":cost,"candidate_C32_bits":cost.total(),"local_boundary":"native normalized MLP input to pure MLP contribution, fixed native parents; native contribution RMS","local_rows":1024,"run_episodes":80,"trace_bytes":trace_bytes,"native_control_scope":"paid whole native activation uniform Scale only; individual native units are not mapped to learned coordinates", "numerical_scope":"Local final-write/RMS enclosures; CPU KL conditional arithmetic model, not full neural arithmetic certificate"}))?;
+    save(&out.join("PROVENANCE.json"), &json!({"scope":"single fitted quadratic arithmetic proposal; no learned reuse, transfer or global optimum claim", "layer":layer,"input_width":width,"fitted_sha256":args[2],"candidate_sha256":sha256(&artifact_path)?,"spec_sha256":args[5],"export_json_sha256":sha256(&export.join("export.json"))?,"source_record":imported.record,"binary_sha256":sha256(&std::env::current_exe().map_err(|e|e.to_string())?)?,"native_C32":native_cost,"candidate_C32":cost,"candidate_C32_bits":cost.total(),"local_boundary":"native normalized MLP input to pure MLP contribution, fixed native parents; native contribution RMS","local_rows":1024,"run_episodes":80,"trace_bytes":trace_bytes,"native_control_scope":"paid whole native activation uniform Scale only; individual native units are not mapped to learned coordinates", "resident_budgets":{"aggregate":12884901888u64,"teacher":536870912,"operators":2147483648u64,"edits":536870912,"readout_resident":536870912,"readout_workspace":268435456,"metric_workspace":1073741824,"metric_rows":128},"numerical_scope":"Local final-write/RMS enclosures; resident fixed-logit metric arithmetic model, not full neural arithmetic certificate"}))?;
     let device = gam_gpu::tensor::Device::accelerator(gam_gpu::GpuPolicy::Required).map_err(|e|e.to_string())?.ok_or("CUDA required")?;
-    let local = Local::new(&native, family, None, 16).with_cuda(device.clone(), trace_bytes)?;
+    let local = Local::new(&native, family, None, 16).with_cuda(device.clone(), trace_bytes)?.with_cuda_resident_norms()?;
     let timer = Instant::now(); let local_measure = local.measure(&decoded)?; let local_seconds = timer.elapsed().as_secs_f64();
     save(&out.join("LOCAL.json"), &json!({"measure":local_measure,"seconds":local_seconds}))?;
     // Run is a prespecified diagnostic even when Local is poor; no gate is weakened.
-    let run = LanguageRun::new(&decoder, &native, &spec, &rows, 1)?.with_cuda(device, trace_bytes)?;
-    let timer = Instant::now(); let run_measure = RunMeasure::of(run.episodes(&decoded)?); let run_seconds = timer.elapsed().as_secs_f64();
+    let run = LanguageRun::new(&decoder, &native, &spec, &rows, 1)?.with_cuda(device, trace_bytes)?
+        .with_cuda_readout(gam_mpd::native_readout::Budget { resident_bytes:536870912, workspace_bytes:268435456 })?
+        .with_cuda_native_source(&base)?;
+    let resident = run.resident_run(gam_mpd::run_check::ResidentBudget {
+        aggregate_numeric_bytes:12884901888, teacher_bytes:536870912,
+        operator_bytes:2147483648, edit_bytes:536870912,
+        metric:gam_mpd::fixed_metric_device::Budget {batch_rows:128,workspace_bytes:1073741824},
+    });
+    let timer = Instant::now(); let run_measure = RunMeasure::of(resident.episodes(&decoded)?); let run_seconds = timer.elapsed().as_secs_f64();
     let peak_rss = std::fs::read_to_string("/proc/self/status").ok().and_then(|text| text.lines().find_map(|s|s.strip_prefix("VmHWM:")?.split_whitespace().next()?.parse::<u64>().ok()?.checked_mul(1024)));
-    save(&out.join("REPORT.json"), &json!({"C32_bits":cost.total(),"native_C32_bits":native_cost.total(),"local":local_measure,"local_seconds":local_seconds,"run":run_measure,"run_seconds":run_seconds,"run_timing":run.timing(),"seconds":started.elapsed().as_secs_f64(),"peak_host_rss_bytes":peak_rss,"acceptance_claim":false}))?;
+    save(&out.join("REPORT.json"), &json!({"C32_bits":cost.total(),"native_C32_bits":native_cost.total(),"local":local_measure,"local_seconds":local_seconds,"run":run_measure,"run_seconds":run_seconds,"run_timing":run.timing(),"resident_telemetry":resident.telemetry()?,"seconds":started.elapsed().as_secs_f64(),"peak_host_rss_bytes":peak_rss,"acceptance_claim":false}))?;
     Ok(())
 }
