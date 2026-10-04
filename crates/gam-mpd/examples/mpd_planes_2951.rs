@@ -38,8 +38,8 @@
 //! subcomponents selected, then `fit_blocks`) and the fit seeded from the selected planes, each as
 //! fitted and with its blocks all on. Per point the terms per token under both codes, blocks and
 //! rank-one equivalents on, and per block its label, rank, firing, decoded bits and whether the
-//! pruned library keeps it. With `all-on`, only the points that run every block (no selection):
-//! the frontier over `n`.
+//! pruned library keeps it; and each reader's profile over the family. With `all-on`, only the
+//! points that run every block (no selection): the frontier over `n`.
 //!
 //! Measured on p31 (`n` = 10⁴, 10⁵, 10⁶). With the library paid once: whole sites 56.3, 81.1, 100.5
 //! bits a token; the planes all on 114, 141, 213, and pruned under that code 77.9, 120.5, 178.0. The
@@ -513,6 +513,7 @@ fn run(dir: &Path, out: &Path, observations: f64, only_all_on: bool) -> Result<(
     let metrics = logit_gauss_newton(&program, &chosen, &family, &trace, 64)?;
     let mut sides = Sides { metrics: Vec::new(), writers: Vec::new(), labels, period };
     let (mut geometries, mut plane_libraries, mut plane_ranks, mut plane_labels, mut svd_libraries) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut profiles = Vec::new();
     for (k, ((site, measured), metric)) in chosen.iter().zip(&statistics).zip(&metrics).enumerate() {
         let x = read_values(&trace, site)?;
         let mut writers = Vec::new();
@@ -525,7 +526,10 @@ fn run(dir: &Path, out: &Path, observations: f64, only_all_on: bool) -> Result<(
         // The search prices on the native reads' chart; every decoded point on the decoder's.
         geometries.push(sides.geometry(k, &x)?);
         let w = matrix(&program, site)?;
-        let blocks = planes(&w, &carriers(&x, &sides.labels, sides.period)?)?;
+        let readers = carriers(&x, &sides.labels, sides.period)?;
+        // Each reader's profile over the family: what the site reads along it on every input.
+        profiles.push(readers.iter().map(|(label, r)| json!({"label": label, "profile": x.dot(r).outer_iter().map(|row| row.to_vec()).collect::<Vec<_>>()})).collect::<Vec<_>>());
+        let blocks = planes(&w, &readers)?;
         let check = blocks.iter().fold(Array2::<f64>::zeros(w.dim()), |acc, (_, u, v)| acc + u.t().dot(v));
         let error = (&check - &w).iter().fold(0.0_f64, |m, e| m.max(e.abs())) / w.iter().fold(0.0_f64, |m, e| m.max(e.abs()));
         eprintln!(
@@ -559,6 +563,8 @@ fn run(dir: &Path, out: &Path, observations: f64, only_all_on: bool) -> Result<(
             "calibrations": calibrations,
             "points": points,
             "plane_blocks": chosen.iter().zip(&plane_labels).zip(&plane_ranks).map(|((s, l), r)| json!({"site": s.name, "labels": l, "ranks": r})).collect::<Vec<_>>(),
+            "operands": (0..family.rows).map(|r| [sides.labels[[r, 0]], sides.labels[[r, 1]]]).collect::<Vec<_>>(),
+            "readers": chosen.iter().zip(&profiles).map(|(s, p)| json!({"site": s.name, "readers": p})).collect::<Vec<_>>(),
         });
         std::fs::write(out, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
     };
