@@ -1,0 +1,40 @@
+{
+  "job": 15894,
+  "source_commit": "58c295ca912cd2759c88ee60d07a9cd1c7188c52",
+  "result": "PASS",
+  "scope": "synthetic technical control: shared full nonlinear activation, constant bias and fixed Gain; not native-data fit or acceptance",
+  "backend": "NVIDIA L40",
+  "forward_max_abs": 5.551115123125783e-17,
+  "dense_gradient_max_abs": 4.440892098500626e-16,
+  "cpu_finite_difference_max_abs": 9.708012171927294e-11,
+  "host_cuda_f64_training_curve_max_abs": 2.220446049250313e-16,
+  "host_cuda_f64_active_rows_identical": true,
+  "fits": [
+    {
+      "backend": "host float64",
+      "arithmetic": "f64",
+      "wall_seconds": 0.000360201,
+      "best_training_max": 0.22068980672748587,
+      "final_validation_max": 0.16856454907221577
+    },
+    {
+      "backend": "NVIDIA L40",
+      "arithmetic": "f64",
+      "wall_seconds": 0.022037332,
+      "best_training_max": 0.22068980672748587,
+      "final_validation_max": 0.16856454907221577
+    },
+    {
+      "backend": "NVIDIA L40",
+      "arithmetic": "f32",
+      "wall_seconds": 0.037319002,
+      "best_training_max": 0.2206897986145935,
+      "final_validation_max": 0.16856452985991768
+    }
+  ],
+  "timing_scope": "Tiny 5 training/3 validation rows, 1-input/2-output fixture; cold and warm kernel setup not separately controlled; no production speed claim",
+  "prior_failed_job": 15887,
+  "prior_failure": "incorrect display-name guard, no fitter execution",
+  "report_sha256": "26524394a0d0e28ce0bd27557e8867e5584a9942e3b06e2f743002cd0be6e796",
+  "gzip_sha256": "4692ec5af964be96fe799516b2633be5680fee182552b2f35d3fa881a2dd32af"
+}

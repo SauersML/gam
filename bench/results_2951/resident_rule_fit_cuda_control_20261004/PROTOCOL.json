@@ -1,0 +1,11 @@
+{
+  "source_commit": "58c295ca912cd2759c88ee60d07a9cd1c7188c52",
+  "example": "mpd_resident_rule_fit_gpu_check_2951",
+  "scope": "synthetic technical CUDA gradient and fit control; not native model fitting",
+  "gpu": 1,
+  "cpus": 4,
+  "ram_gib": 16,
+  "minutes": 30,
+  "prior_failed_job": 15887,
+  "prior_failure": "display-name guard incorrectly required CUDA substring, actual CUDA device name NVIDIA L40"
+}
