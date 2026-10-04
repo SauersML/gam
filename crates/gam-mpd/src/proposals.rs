@@ -648,6 +648,30 @@ impl<'a> CopyResidualBank<'a> {
         out.bind(&format!("attention {layer}"), &[self.rules.layers[layer].normed_stream], self.rules.layers[layer].attention)
     }
 
+    /// Install previously fitted explicit factors without requiring the training
+    /// inputs. The declared family supplies the same native graph and bindings;
+    /// Copy additionally carries its full matrix-rule body rather than a free
+    /// decoder template. Its final C32 must therefore be measured anew.
+    ///
+    /// Construction may populate the ordinary weight-SVD cache, but does not fit
+    /// to evaluation states or use any previously measured fidelity score.
+    pub fn candidate_with_prepared_factors(&self, choice: CopyResidualChoice, prepared: &LowRankProposal) -> Result<Artifact,String> {
+        if choice.rank != prepared.rank { return Err("prepared factor rank differs from declared candidate".into()); }
+        let mut candidate=self.candidate(choice)?;
+        let native_index=operator(self.start,&format!("blocks.{}.o{}",choice.layer,choice.head))?;
+        let loaded=prepared.operator(&self.start.program.operators[native_index])?;
+        let target=if choice.family==HeadApproximation::NativeSvd { native_index } else {
+            let residual=candidate.program.operators.len().checked_sub(1).ok_or("missing residual")?;
+            let nodes=&self.rules.layers[choice.layer];
+            if !matches!(&candidate.program.nodes[nodes.attention],Node::Affine{terms,..} if terms.iter().any(|&(read,op)|read==nodes.reads[choice.head] && op==residual)) {
+                return Err("prepared residual is not attached to the declared native head read".into());
+            }
+            residual
+        };
+        candidate.program.operators[target]=std::sync::Arc::new(loaded);
+        candidate.expand_copy_templates()
+    }
+
     /// Projection and exact decoded coverage/cost checks for a single lazy candidate.
     /// C32 charges factors, Copy scale, wiring, bindings and all remaining native code;
     /// exact wire byte count is separate from C32.
@@ -1092,6 +1116,33 @@ mod copy_residual_tests {
         assert!(bank.cache[0].copy.get().is_some());
         assert!(bank.cache[0].native.get().is_none());
         assert!(bank.cache[1..].iter().all(|c| c.copy.get().is_none() && c.native.get().is_none()));
+    }
+
+    #[test]
+    fn prepared_head_factors_preserve_native_bindings_and_pay_copy_body() {
+        let (start,layers)=fixture();
+        let bank=CopyResidualBank::new(&start,&layers,1,&[2],49).unwrap();
+        for family in [HeadApproximation::NativeSvd,HeadApproximation::CopyResidual] {
+            let choice=CopyResidualChoice {layer:2,head:4,rank:2,family};
+            let old=bank.candidate(choice).unwrap();
+            let target=if family==HeadApproximation::NativeSvd {operator(&start,"blocks.2.o4").unwrap()} else {old.program.operators.len()-1};
+            let saved=LowRankProposal::of(&old.program.operators[target]).unwrap();
+            let loaded:LowRankProposal=serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+            let candidate=bank.candidate_with_prepared_factors(choice,&loaded).unwrap();
+            assert_eq!(candidate.program.nodes,old.program.nodes);
+            assert_eq!(candidate.places,old.places);
+            assert_eq!(candidate.blocks,old.blocks);
+            assert_eq!(candidate.program.operators[target].body,old.program.operators[target].body);
+            assert!(candidate.derived.iter().all(|d|matches!(d.law,OperatorLaw::Expression {..})));
+            let bytes=candidate.to_bytes().unwrap();
+            let decoded=Artifact::from_bytes(&bytes,&start.program.declarations).unwrap();
+            assert_eq!(bytes,decoded.to_bytes().unwrap());
+            let cost=super::super::acceptance::structural_cost(&decoded,&mut Default::default()).unwrap().total();
+            let old_cost=super::super::acceptance::structural_cost(&old,&mut Default::default()).unwrap().total();
+            if family==HeadApproximation::CopyResidual {assert!(cost>old_cost);} else {assert_eq!(cost,old_cost);}
+            let mut bad=loaded;bad.rank=1;
+            assert!(bank.candidate_with_prepared_factors(choice,&bad).is_err());
+        }
     }
 
     #[test]
