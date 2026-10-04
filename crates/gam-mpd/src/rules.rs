@@ -16,7 +16,8 @@
 //!   gains, `O = λ diag(g / g_f) V⁺`, so the logits rise for the token the head attended to.
 //!
 //! [`match_alignment`] and [`copy_alignment`] say how much of a head's own circuit a rule's body
-//! accounts for, before anything is priced; [`match_scale`] and [`copy_scale`] are the bindings'
+//! accounts for, before anything is priced, and [`match_energy`] how much of it a match on given
+//! content planes explains; [`match_scale`] and [`copy_scale`] are the bindings'
 //! least-squares scales. [`with_operator`] gives the program with one operator's matrix replaced, so a
 //! rule's derived operator runs in the model itself.
 
@@ -83,6 +84,18 @@ pub fn match_alignment(query: &Array2<f64>, reading: &Array2<f64>, gain: &Array1
     let rank = d.singular_values.iter().filter(|s| **s > d.band).count().max(1);
     let norm = d.singular_values.iter().map(|s| s * s).sum::<f64>().sqrt();
     Ok(if norm > 0.0 { t.diag().sum() / (norm * (rank as f64).sqrt()) } else { 0.0 })
+}
+
+/// The energy of a head's content scores the match rule explains: `tr(T Π)² / rank Π`, the squared
+/// norm of `T`'s least-squares fit `λ Π` over `Z`'s full projector. Unlike [`match_alignment`] (a
+/// cosine, largest on the one cleanest plane), it grows with every plane the rule holds on, so the
+/// content planes that maximize it are all the planes that match.
+pub fn match_energy(query: &Array2<f64>, reading: &Array2<f64>, gain: &Array1<f64>, rows: &[usize]) -> Result<f64, String> {
+    let prediction = match_prediction(reading, gain, None)?;
+    let projector = match_form(&prediction, reading, gain, &(0..prediction.nrows()).collect::<Vec<_>>());
+    let rank = projector.diag().sum();
+    let fit = (&match_form(query, reading, gain, rows) * &projector.t()).sum();
+    Ok(if rank > 0.0 { fit * fit / rank } else { 0.0 })
 }
 
 /// The match rule's scale for a head: the least-squares `λ` in `T ≈ λ Π` over the projector the

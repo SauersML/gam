@@ -53,7 +53,7 @@
 //! all; and the decode check (every attention site replaced by its decoded head blocks, all on, on
 //! sequence `STATISTICS`), the KL against the native model of both descriptions.
 
-//! `mpd_rules_2951 pairs LIBRARY_DIR SETS_DIR LAYER HEADS`
+//! `mpd_rules_2951 pairs EXPORT_DIR LIBRARY_DIR SETS_DIR LAYER HEADS`
 //!
 //! What a pair analysis of a library's query and key subcomponents shows on the given heads (comma-
 //! separated): per pair of a run query subcomponent and a run key subcomponent, its static score
@@ -67,7 +67,8 @@
 //!
 //! The attention rules run in the model (`gam_mpd::rules`): every match head in `MATCH` (comma-
 //! separated `layer.head`) has its content query rows replaced by the match rule through head
-//! `SOURCE`'s output-value circuit (its content planes the ones the rule aligns with best), every
+//! `SOURCE`'s output-value circuit (its content planes the ones whose match explains the most of the
+//! head's content scores, `gam_mpd::rules::match_energy`), every
 //! copy head in `COPY` its output head by the copy rule, each at its least-squares scale. Variants:
 //! native; the rules on the content rows with the rest of each head native; the rules alone (the
 //! match heads' other rows zero); the rules plus the best rank-`r` residual for `r` = 8 and 32. Per
@@ -110,14 +111,25 @@ fn cosine(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
     (a * b).sum() / ((a * a).sum() * (b * b).sum()).sqrt()
 }
 
+/// The program's attention layout read off its operators: `(layers, heads, head width, model width,
+/// vocabulary)`, from the per-head query operators `blocks.{l}.q{h}` and the token domain.
+fn architecture(program: &gam_mpd::operator_program::OperatorProgram) -> Result<(usize, usize, usize, usize, u64), String> {
+    let exists = |name: String| program.operators.iter().any(|o| o.name == name);
+    let layers = (0..).take_while(|l| exists(format!("blocks.{l}.q0"))).count();
+    let heads = (0..).take_while(|h| exists(format!("blocks.0.q{h}"))).count();
+    let query = program.operators.iter().find(|o| o.name == "blocks.0.q0").ok_or("no query head blocks.0.q0")?;
+    let vocab = program.declarations.domains.first().map(|d| d.size as u64).ok_or("no token domain")?;
+    Ok((layers, heads, query.rows.width(), query.cols.width(), vocab))
+}
+
 fn heads(export: &std::path::Path, half: usize, sequences: usize) -> Result<(), String> {
     let imported = import_language_model(export, 1, 2)?;
     let model = &imported.program;
-    let vocab = 50_000u64;
+    let (layers, _, _, _, vocab) = architecture(model)?;
     let mut state = 0x2951_u64;
     let (mut ids, mut sequence, mut position) = (Vec::new(), Vec::new(), Vec::new());
     for q in 0..sequences {
-        let first: Vec<u32> = (0..half).map(|_| 1000 + uniform(&mut state, vocab - 1000) as u32).collect();
+        let first: Vec<u32> = (0..half).map(|_| uniform(&mut state, vocab) as u32).collect();
         for (p, t) in first.iter().chain(&first).enumerate() {
             ids.push(*t);
             sequence.push(q as u32);
@@ -135,7 +147,7 @@ fn heads(export: &std::path::Path, half: usize, sequences: usize) -> Result<(), 
             _ => None,
         })
         .collect();
-    let per_layer = attends.len() / 4;
+    let per_layer = attends.len() / layers;
     let length = 2 * half;
     for (index, (query, key, base, dims)) in attends.iter().enumerate() {
         let (q, k) = (rotated(&trace.values[*query], &position, *base), rotated(&trace.values[*key], &position, *base));
@@ -176,7 +188,7 @@ fn heads(export: &std::path::Path, half: usize, sequences: usize) -> Result<(), 
     let tokens = embedding.ncols();
     let sample: Vec<usize> = (0..1024).map(|i| i * tokens / 1024).collect();
     let final_gain = operator("final_norm.gain".to_string())?.diag().to_owned();
-    for layer in 0..4 {
+    for layer in 0..layers {
         let g = operator(format!("blocks.{layer}.rms1.gain"))?.diag().to_owned();
         let read = &embedding.select(Axis(1), &sample) * &g.view().insert_axis(Axis(1));
         for h in 0..per_layer {
@@ -205,7 +217,7 @@ fn heads(export: &std::path::Path, half: usize, sequences: usize) -> Result<(), 
     for (index, (query, key, base, dims)) in attends.iter().enumerate() {
         let (q, k) = (rotated(&text.values[*query], &layout.position, *base), rotated(&text.values[*key], &layout.position, *base));
         let (mut induction, mut duplicate, mut count) = (0.0, 0.0, 0.0);
-        for sq in 0..4 {
+        for sq in 0..layout.position.len() / 512 {
             let at = sq * 512;
             let scores = q.slice(s![at..at + 512, ..]).dot(&k.slice(s![at..at + 512, ..]).t()) / (*dims as f64).sqrt();
             let mut last = std::collections::HashMap::new();
@@ -227,7 +239,7 @@ fn heads(export: &std::path::Path, half: usize, sequences: usize) -> Result<(), 
         eprintln!("text layer {} head {}: induction {:.3}, duplicate {:.3} over {count} repeats", index / per_layer, index % per_layer, induction / count, duplicate / count);
     }
     // What each pair of a layer's heads compute, compared.
-    for layer in 0..4 {
+    for layer in 0..layers {
         let site = all.iter().find(|s| s.name == format!("blocks.{layer}.q")).ok_or("no query site")?;
         let x = gam_mpd::masked::read_values(&text, site)?;
         let c = x.t().dot(&x) / x.nrows() as f64;
@@ -443,6 +455,7 @@ fn library(export: &std::path::Path, library: &std::path::Path, sets: &std::path
     let imported = import_language_model(export, statistics + 1, CONTEXT)?;
     let model = &imported.program;
     let family = &imported.contract.family;
+    let (_, heads, width, _, _) = architecture(model)?;
     let all = sites(model);
     let order = ["v", "o", "k", "q", "c_fc", "down_proj"];
     let chosen: Vec<gam_mpd::masked::Site> = (0..layers)
@@ -505,8 +518,8 @@ fn library(export: &std::path::Path, library: &std::path::Path, sets: &std::path
                     let (Some((ou, ov)), Some((vu, vv))) = (got(format!("blocks.{l}.o")), got(format!("blocks.{l}.v"))) else { continue };
                     let (w_o, w_v) = (ou.t().dot(ov), vu.t().dot(vv));
                     let gl = gain(format!("blocks.{l}.rms1"))?;
-                    for h in 0..6 {
-                        let circuit = w_o.slice(s![.., h * 128..(h + 1) * 128]).dot(&w_v.slice(s![h * 128..(h + 1) * 128, ..]));
+                    for h in 0..heads {
+                        let circuit = w_o.slice(s![.., h * width..(h + 1) * width]).dot(&w_v.slice(s![h * width..(h + 1) * width, ..]));
                         let mut image = circuit.t().dot(&scaled.t());
                         for (i, mut row) in image.rows_mut().into_iter().enumerate() {
                             row *= gl[i] / g[i];
@@ -887,7 +900,7 @@ fn induction_scores(model: &gam_mpd::operator_program::OperatorProgram, trace: &
             _ => None,
         })
         .collect();
-    let per_layer = attends.len() / 4;
+    let per_layer = attends.len() / architecture(model).map_or(1, |a| a.0.max(1));
     let length = 2 * half;
     let sequences = positions.len() / length;
     heads
@@ -952,7 +965,7 @@ fn parse_heads(list: &str) -> Result<Vec<(usize, usize)>, String> {
 }
 
 fn execute(export: &std::path::Path, out: &std::path::Path, matches: &str, source: &str, copies: &str) -> Result<(), String> {
-    use gam_mpd::rules::{content_rows, copy_alignment, copy_prediction, copy_scale, match_alignment, match_prediction, match_reading, match_scale, with_operator};
+    use gam_mpd::rules::{content_rows, copy_alignment, copy_prediction, copy_scale, match_alignment, match_energy, match_prediction, match_reading, match_scale, with_operator};
     const CONTEXT: usize = 512;
     const TEXT: usize = 4;
     let (match_heads, copy_heads) = (parse_heads(matches)?, parse_heads(copies)?);
@@ -968,11 +981,12 @@ fn execute(export: &std::path::Path, out: &std::path::Path, matches: &str, sourc
     // Uniformly drawn tokens repeated once, and the same with the token after each first occurrence
     // edited (positions 1..half of the first copy), so the repeat should predict the edited token.
     let (half, sequences) = (64usize, 8usize);
+    let vocab = native.declarations.domains.first().map(|d| d.size as u64).ok_or("no token domain")?;
     let mut state = 0x2951_u64;
     let (mut ids, mut edited, mut sequence, mut position) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for q in 0..sequences {
-        let first: Vec<u32> = (0..half).map(|_| 1000 + uniform(&mut state, 49_000) as u32).collect();
-        let changed: Vec<u32> = first.iter().enumerate().map(|(i, t)| if i % 2 == 1 { 1000 + uniform(&mut state, 49_000) as u32 } else { *t }).collect();
+        let first: Vec<u32> = (0..half).map(|_| uniform(&mut state, vocab) as u32).collect();
+        let changed: Vec<u32> = first.iter().enumerate().map(|(i, t)| if i % 2 == 1 { uniform(&mut state, vocab) as u32 } else { *t }).collect();
         for (p, t) in first.iter().chain(&first).enumerate() {
             ids.push(*t);
             sequence.push(q as u32);
@@ -1000,17 +1014,19 @@ fn execute(export: &std::path::Path, out: &std::path::Path, matches: &str, sourc
         let (g, gs) = (gain(&format!("blocks.{l}.rms1"))?, gain(&format!("blocks.{sl}.rms1"))?);
         let (so, sv) = (op(&native, &format!("blocks.{sl}.o{sh}"))?, op(&native, &format!("blocks.{sl}.v{sh}"))?);
         let width = query.nrows();
+        // The content planes whose match explains the most of the head's content scores.
         let mut best: Option<(f64, usize)> = None;
         for first in 0..width / 2 {
             let rows = content_rows(width, first);
-            let alignment = match_alignment(&query, &match_reading(&key, &so, &sv, &g, &gs, &rows), &g, &rows)?;
-            if best.is_none_or(|b| alignment > b.0) {
-                best = Some((alignment, first));
+            let energy = match_energy(&query, &match_reading(&key, &so, &sv, &g, &gs, &rows), &g, &rows)?;
+            if best.is_none_or(|b| energy > b.0) {
+                best = Some((energy, first));
             }
         }
-        let (alignment, first) = best.ok_or("no planes")?;
+        let (_, first) = best.ok_or("no planes")?;
         let rows = content_rows(width, first);
         let reading = match_reading(&key, &so, &sv, &g, &gs, &rows);
+        let alignment = match_alignment(&query, &reading, &g, &rows)?;
         let prediction = match_prediction(&reading, &g, None)?;
         let scale = match_scale(&query, &reading, &g, &rows, &prediction);
         // The rule's rows in place of the content rows; the rest native ("with") or zero ("alone").
@@ -1112,18 +1128,24 @@ fn execute(export: &std::path::Path, out: &std::path::Path, matches: &str, sourc
     std::fs::write(out, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
-fn pairs(library: &std::path::Path, sets: &std::path::Path, layer: usize, heads: &str) -> Result<(), String> {
+fn pairs(export: &std::path::Path, library: &std::path::Path, sets: &std::path::Path, layer: usize, heads: &str) -> Result<(), String> {
     use rayon::prelude::*;
     const CONTEXT: usize = 512;
+    let imported = import_language_model(export, 1, 2)?;
+    let (_, _, width, d, _) = architecture(&imported.program)?;
+    let half = width / 2;
+    let base = imported.program.nodes.iter().find_map(|n| match n {
+        Node::Attend { rotary: Some(r), .. } => Some(f64::from(r.base)),
+        _ => None,
+    }).ok_or("no rotary attention")?;
     let frequency = frequencies(sets)?;
     let load = |kind: &str| -> Result<(Array2<f64>, Array2<f64>, Vec<f64>), String> {
         let name = format!("blocks.{layer}.{kind}");
         let f = frequency.get(&name).ok_or(format!("no sets for {name}"))?.clone();
-        Ok((read_f64(&library.join(format!("{name}.u.f64")), 768)?, read_f64(&library.join(format!("{name}.v.f64")), 768)?, f))
+        Ok((read_f64(&library.join(format!("{name}.u.f64")), d)?, read_f64(&library.join(format!("{name}.v.f64")), d)?, f))
     };
     let ((qu, qv, qf), (ku, kv, kf)) = (load("q")?, load("k")?);
-    let (width, half) = (128usize, 64usize);
-    let theta: Vec<f64> = (0..half).map(|i| 10000f64.powf(-2.0 * i as f64 / width as f64)).collect();
+    let theta: Vec<f64> = (0..half).map(|i| base.powf(-2.0 * i as f64 / width as f64)).collect();
     let norm = |x: ndarray::ArrayView1<'_, f64>| x.dot(&x).sqrt();
     let alive_q: Vec<usize> = (0..qf.len()).filter(|c| qf[*c] > 0.0).collect();
     let alive_k: Vec<usize> = (0..kf.len()).filter(|c| kf[*c] > 0.0).collect();
@@ -1167,7 +1189,7 @@ fn pairs(library: &std::path::Path, sets: &std::path::Path, layer: usize, heads:
 
 fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
-    let usage = "mpd_rules_2951 heads EXPORT_DIR HALF SEQUENCES | price EXPORT_DIR LIBRARY_DIR OBSERVATIONS SITES | library EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json OBSERVATIONS STATISTICS LAYERS | rules EXPORT_DIR OUT.json OBSERVATIONS STATISTICS | execute EXPORT_DIR OUT.json MATCH SOURCE COPY | pairs LIBRARY_DIR SETS_DIR LAYER HEADS";
+    let usage = "mpd_rules_2951 heads EXPORT_DIR HALF SEQUENCES | price EXPORT_DIR LIBRARY_DIR OBSERVATIONS SITES | library EXPORT_DIR LIBRARY_DIR SETS_DIR OUT.json OBSERVATIONS STATISTICS LAYERS | rules EXPORT_DIR OUT.json OBSERVATIONS STATISTICS | execute EXPORT_DIR OUT.json MATCH SOURCE COPY | pairs EXPORT_DIR LIBRARY_DIR SETS_DIR LAYER HEADS";
     match args.get(1).map(String::as_str) {
         Some("heads") if args.len() == 5 => heads(
             std::path::Path::new(&args[2]),
@@ -1189,7 +1211,7 @@ fn main() -> Result<(), String> {
             args[7].parse().map_err(|e| format!("STATISTICS: {e}"))?,
             args[8].parse().map_err(|e| format!("LAYERS: {e}"))?,
         ),
-        Some("pairs") if args.len() == 6 => pairs(std::path::Path::new(&args[2]), std::path::Path::new(&args[3]), args[4].parse().map_err(|e| format!("LAYER: {e}"))?, &args[5]),
+        Some("pairs") if args.len() == 7 => pairs(std::path::Path::new(&args[2]), std::path::Path::new(&args[3]), std::path::Path::new(&args[4]), args[5].parse().map_err(|e| format!("LAYER: {e}"))?, &args[6]),
         Some("execute") if args.len() == 7 => execute(std::path::Path::new(&args[2]), std::path::Path::new(&args[3]), &args[4], &args[5], &args[6]),
         Some("rules") if args.len() == 6 => rules(
             std::path::Path::new(&args[2]),
