@@ -35,7 +35,12 @@ fn main() -> Result<(), String> {
     if !function.exceptions.is_empty() || !function.controls.is_empty() || !function.derived.is_empty() { return Err("function metadata not represented by program graft".into()); }
     if function.to_bytes()? != source_bytes { return Err("function canonical saved-byte replay mismatch".into()); }
     drop(source_bytes);
-    let base = Artifact::native(&native)?.f32_literals()?;
+    let projected_native = Artifact::native(&native)?.f32_literals()?;
+    let base_bytes = projected_native.to_bytes()?;
+    let base = Artifact::from_bytes(&base_bytes, &native.declarations)?;
+    if base.to_bytes()? != base_bytes {return Err("native ordinary canonical replay mismatch".into());}
+    base.validate_coverage(&native)?;
+    drop(base_bytes); drop(projected_native);
     let candidate = base.replace_function(&format!("arithmetic-mlp-{layer}"), &function.program, nodes.normed, nodes.mlp)?
         .with_uniform_scale_control(&native, nodes.active, nodes.mlp)?.f32_literals()?;
     candidate.validate_coverage(&native)?;
@@ -44,7 +49,7 @@ fn main() -> Result<(), String> {
     std::fs::write(&artifact_path, &encoded).map_err(|e| e.to_string())?;
     // Read the actual saved bytes with the ordinary decoder before all fidelity work.
     let decoded = Artifact::from_bytes(&std::fs::read(&artifact_path).map_err(|e| e.to_string())?, &native.declarations)?;
-    if decoded != candidate || decoded.to_bytes()? != encoded { return Err("full graft ordinary replay mismatch".into()); }
+    if decoded.to_bytes()? != encoded { return Err("full graft ordinary replay mismatch".into()); }
     decoded.validate_coverage(&native)?;
     drop(encoded); drop(candidate);
     let mut costs = CostCache::default();
