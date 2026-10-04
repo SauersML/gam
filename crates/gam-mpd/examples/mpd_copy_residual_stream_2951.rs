@@ -64,7 +64,7 @@ fn main()->Result<(),String>{
     let mut run=LanguageRun::new(&decoder,&native,&spec,&run_passages,1)?;
     let local_family=family(&passages(export,16)?)?;
     let mut local=Local::new(&native,local_family.clone(),None,16);
-    if backend=="cuda"{let device=gam_gpu::tensor::Device::accelerator(gam_gpu::GpuPolicy::Required).map_err(|e|e.to_string())?.ok_or("CUDA required")?;if cuda_local==1{local=local.with_cuda(device.clone(),trace_bytes)?;}run=run.with_cuda(device,trace_bytes)?;if share_native==1{run=run.with_cuda_native_source(&base)?;}}
+    if backend=="cuda"{let device=gam_gpu::tensor::Device::accelerator(gam_gpu::GpuPolicy::Required).map_err(|e|e.to_string())?.ok_or("CUDA required")?;if cuda_local==1{local=local.with_cuda(device.clone(),trace_bytes)?;}run=run.with_cuda(device,trace_bytes)?;if share_native==1{let source=Artifact::from_bytes(&base.to_bytes()?,&native.declarations)?;run=run.with_cuda_native_source(&source)?;}}
     let mut cache=CostCache::default();let mut records:Vec<Value>=bank.choices().enumerate().map(|(i,c)|json!({"index":i+1,"choice":c,"cost_bits":null,"cost_lower_bound":0,"states":vec!["Unevaluated";grid.len()]})).collect();
     records.insert(0,json!({"index":0,"label":"native","cost_bits":null,"cost_lower_bound":0,"states":vec!["Unevaluated";grid.len()]}));
     let choices:Vec<CopyResidualChoice>=bank.choices().collect();let mut journal=std::fs::OpenOptions::new().create_new(true).write(true).open(out.join("ASSESSMENTS.jsonl")).map_err(|e|e.to_string())?;
@@ -95,5 +95,5 @@ fn main()->Result<(),String>{
         let isolated_kl=gam_mpd::local_kl::isolated_downstream_kl(&native,&decoded,&local_family,16)?;
         replays.push(json!({"isolated_downstream_patch_kl":isolated_kl,"diagnostic_only":true,"index":index,"file":path.file_name().and_then(|p|p.to_str()),"sha256":sha256(&path)?,"bytes":saved.len(),"cost_bits":replay.cost.total(),"local":replay.local_measure,"run":replay.run_measure}));cache.clear_measurements();
     }
-    write_json(&out.join("REPORT.json"),&json!({"scope":scope,"records":records,"points":points,"selected_saved_byte_replays":replays,"seconds":begun.elapsed().as_secs_f64(),"peak_rss_bytes":peak_rss()}))?;Ok(())
+    write_json(&out.join("REPORT.json"),&json!({"scope":scope,"records":records,"points":points,"selected_saved_byte_replays":replays,"seconds":begun.elapsed().as_secs_f64(),"peak_rss_bytes":peak_rss(),"run_stage_seconds":run.timing()}))?;Ok(())
 }
