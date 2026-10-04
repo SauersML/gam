@@ -83,6 +83,7 @@ pub mod proposals;
 pub mod resident_rule_fit;
 pub mod vector_rule_pilot;
 pub mod shared_geometry_pilot;
+pub mod shared_geometry_transfer;
 
 // Per-input pieces of one linear map: an overcomplete rank-1 library fitted so that each input
 // lists few pieces (listing code plus second-order KL).
