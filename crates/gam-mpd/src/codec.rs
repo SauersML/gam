@@ -205,9 +205,15 @@ impl BitString {
         }
         let full = (other.len_bits / 8) as usize;
         self.bytes.reserve(other.bytes.len());
-        for &byte in &other.bytes[..full] {
-            *self.bytes.last_mut().expect("partial byte") |= byte >> offset;
-            self.bytes.push(byte << (8 - offset));
+        if full != 0 {
+            *self.bytes.last_mut().expect("partial byte") |= other.bytes[0] >> offset;
+            // Each interior byte depends only on two source bytes. Unlike repeatedly
+            // modifying the last destination byte, this bulk extension can vectorize.
+            self.bytes.extend(
+                other.bytes[..full - 1].iter().zip(&other.bytes[1..full])
+                    .map(|(&a, &b)| (a << (8 - offset)) | (b >> offset)),
+            );
+            self.bytes.push(other.bytes[full - 1] << (8 - offset));
         }
         self.len_bits += (full as u64) * 8;
         let tail = (other.len_bits % 8) as u32;
