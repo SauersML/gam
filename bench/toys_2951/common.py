@@ -11,7 +11,9 @@ the interventions of a question applied where they act:
 * `{"kind": "input", "input": x}` replaces the prompt;
 * `{"kind": "scale", "place": P, "factor": f}` multiplies the value at `P`;
 * `{"kind": "patch", "place": P, "donor": x}` replaces the value at `P` by its value in the
-  unedited model on prompt `x`.
+  unedited model on prompt `x`;
+* `{"kind": "project", "place": P, "directions": [v, ..]}` removes the span of the directions
+  (each the place's width) from the value at `P`.
 
 Places `P`: `{"node": "head", "layer": l, "head": h, "position": i}` (the head's mix of values,
 before `W_O`), `{"node": "mlp", "layer": l, "position": i, "units": [..]}` (the ReLU outputs),
@@ -53,6 +55,7 @@ class Edits:
         self.model = model
         self.scales = []
         self.patches = []
+        self.projections = []
         for e in edits:
             if e["kind"] == "scale":
                 self.scales.append((e["place"], float(e["factor"])))
@@ -60,6 +63,10 @@ class Edits:
                 donor = np.asarray(e["donor"], dtype=np.float64)[None]
                 values = model.record(donor)
                 self.patches.append((e["place"], values))
+            elif e["kind"] == "project":
+                q, r = np.linalg.qr(np.asarray(e["directions"], dtype=np.float64).T)
+                keep = np.abs(np.diag(r)) > 1e-12 * max(1.0, np.abs(r).max())
+                self.projections.append((e["place"], q[:, keep]))
             elif e["kind"] != "input":
                 raise ValueError(f"unknown edit {e['kind']}")
 
@@ -74,6 +81,12 @@ class Edits:
                 value = value.copy()
                 index = select(place, value)
                 value[index] = donor[(node, layer, head)][index]
+        for place, basis in self.projections:
+            if matches(place, node, layer, head):
+                value = value.copy()
+                index = select(place, value)
+                part = value[index]
+                value[index] = part - (part @ basis) @ basis.T
         return value
 
 
