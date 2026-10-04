@@ -273,3 +273,6 @@ pub mod attention_map;
 
 // Opt-in native head-only CUDA logits with unchanged CPU metrics.
 pub mod native_readout;
+
+// Checked scalar intervals on fixed finite inputs; no acceptance backend switch.
+pub mod fixed_logit_interval;
