@@ -239,7 +239,27 @@ def features(model, behaviour, claim, cache):
     p = math.exp(logp)
     moved = abs(p * (math.exp(max(min(first, 20.0), -20.0)) - 1.0))
     explanation = [first, abs(first), min(moved, 1.0), float(sum(abs(direct[j]) for j in positions)), float(np.abs(direct).sum())]
-    return transcript, transcript + explanation
+    return transcript, transcript + explanation, (grad, direct, logp, first, moved)
+
+
+def statement(behaviour, claim, computed, W, decode):
+    """The dependencies as an explanation's text: the input tokens the behaviour token's
+    probability depends on most (first-order effect of removing each), the largest head-routed
+    direct effects, and the first-order change this edit makes, all from the original prompt."""
+    grad, direct, logp, first, moved = computed
+    prompt = np.array(behaviour["prompt"])
+    removal = np.array([-grad[j] @ W[prompt[j]] for j in range(len(prompt))])
+    lines = [f"Explanation of the original forward pass (read-only, from the model's weights on the original prompt). "
+             f"P(next token = {behaviour['behaviour_text']!r}) = {math.exp(logp):.2f}. It depends most on these input tokens "
+             f"(first-order change in its log-probability if the token were removed):"]
+    for j in np.argsort(-np.abs(removal))[:6]:
+        lines.append(f"  position {j} {decode([prompt[j]])!r}: {removal[j]:+.2f} nats")
+    lines.append("Largest direct effects on its logit through attention heads (attention weight times the head's write):")
+    for j in np.argsort(-np.abs(direct))[:3]:
+        lines.append(f"  position {j} {decode([prompt[j]])!r}: {direct[j]:+.2f}")
+    lines.append(f"For this edit, the first-order change in that log-probability is {first:+.2f} nats "
+                 f"(a change of about {min(moved, 1.0) * 100:.0f} points in the next-token probability).")
+    return "\n".join(lines)
 
 
 def logistic(X, y, ridge=1.0):
@@ -261,9 +281,16 @@ def predict(root=ROOT):
     """Both predictors fitted on the dev claims, their P(true) for every claim."""
     record = json.load(open(root / "chive_vpd" / "claims.json"))
     behaviours = {b["id"]: b for b in record["behaviours"]}
+    from tokenizers import Tokenizer
+
+    tokenizer = Tokenizer.from_file(str(TARGET_DIR / "tokenizer.json"))
+    decode = lambda ids: tokenizer.decode([int(t) for t in ids])
     model = load_target(device())
+    W = model.wte.detach().cpu().numpy()
     cache = {}
     rows = [features(model, behaviours[c["behaviour"]], c, cache) for c in record["claims"]]
+    texts = {c["id"]: statement(behaviours[c["behaviour"]], c, r[2], W, decode) for c, r in zip(record["claims"], rows)}
+    json.dump(texts, open(root / "chive_vpd" / "explanations.json", "w"))
     dev = [i for i, c in enumerate(record["claims"]) if c["split"] == "dev"]
     labels = np.array([float(record["claims"][i]["label"]) for i in dev])
     for name, column in (("transcript", 0), ("dependencies", 1)):
@@ -275,5 +302,47 @@ def predict(root=ROOT):
     print("wrote predictions for", len(rows), "claims")
 
 
+LLM_TASK = """You predict how a language model's sampled continuations change when its prompt is edited, without running the model.
+Below is a transcript: the prompt the model read, the 30 continuations it sampled (temperature 1, 3 tokens each), and a behaviour with its measured rate.
+Then a claim about one edit of the prompt. Reply with only one number: the probability that the claim is true."""
+
+
+def ask(text, model="haiku"):
+    import subprocess
+
+    for _ in range(3):
+        out = subprocess.run(["claude", "-p", "--model", model, text], capture_output=True, text=True, timeout=300)
+        try:
+            return min(max(float(out.stdout.strip().split()[-1]), 0.0), 1.0)
+        except (ValueError, IndexError):
+            continue
+    return 0.5
+
+
+def llm(root=ROOT):
+    """CHIVE's predictor: a language model reading the transcript and the claim (and, in the second
+    condition, the read-only explanation), answering P(true), for every held-out claim."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    record = json.load(open(root / "chive_vpd" / "claims.json"))
+    texts = json.load(open(root / "chive_vpd" / "explanations.json"))
+    behaviours = {b["id"]: b for b in record["behaviours"]}
+    claims = [c for c in record["claims"] if c["split"] == "held_out"]
+
+    def transcript(c):
+        b = behaviours[c["behaviour"]]
+        samples = "\n".join(f"  {t!r}" for t in b["sample_texts"])
+        return (f"{LLM_TASK}\n\nPROMPT (the model continues right after it):\n{b['prompt_text'][-1500:]}\n\nSAMPLES:\n{samples}\n\n"
+                f"BEHAVIOUR: the continuation contains {b['behaviour_text']!r}; rate {b['rate']:.2f} over the 30 samples.\n\n"
+                f"EDIT: {c['edit_text']}\nCLAIM: {c['claim']}")
+
+    for name, with_explanation in (("llm_transcript", False), ("llm_dependencies", True)):
+        prompts = [transcript(c) + (f"\n\n{texts[c['id']]}" if with_explanation else "") + "\n\nProbability the claim is true:" for c in claims]
+        with ThreadPoolExecutor(8) as pool:
+            answers = list(pool.map(ask, prompts))
+        json.dump({c["id"]: p for c, p in zip(claims, answers)}, open(root / "chive_vpd" / f"predictions.{name}.json", "w"))
+        print(name, "answered", len(answers), flush=True)
+
+
 if __name__ == "__main__":
-    {"build": build, "predict": predict}[sys.argv[1]](*(Path(a) for a in sys.argv[2:]))
+    {"build": build, "predict": predict, "llm": llm}[sys.argv[1]](*(Path(a) for a in sys.argv[2:]))
