@@ -1142,6 +1142,26 @@ pub fn assess_once(local: &Local<'_>, run: &dyn RunCheck, artifact: &Artifact, c
     PreparedAssessment::new(artifact, cache)?.assess(local, run, constraint)
 }
 
+/// The same decoded assessment with bounded, fixed-native operator codec reuse.
+/// The message remains standalone; only exactly witnessed native codewords reuse
+/// decoding work. This does not cache measurements or change either verdict.
+pub fn assess_once_with_native_codec(
+    local: &Local<'_>, run: &dyn RunCheck, artifact: &Artifact, constraint: Constraint,
+    cache: &mut CostCache, codec: &super::operator_program::NativeOperatorCodec,
+) -> Result<Assessment, String> {
+    if !constraint.local.is_finite() || constraint.local < 0.0 || !constraint.run.is_finite() || constraint.run < 0.0 {
+        return Err("the fidelity tolerance must be finite and nonnegative".into());
+    }
+    if !artifact.has_f32_literals() {
+        return Err("a literal that is not a 32-bit float".into());
+    }
+    let prepared = PreparedAssessment {
+        cost: structural_cost(artifact, cache)?,
+        encoded: EncodedArtifact::of_with_native_codec(artifact, codec)?,
+    };
+    prepared.assess_decodable(&prepared.encoded.using_native_codec(codec), local, run, constraint)
+}
+
 /// One immutable message and the structural cost of exactly the artifact that produced it.
 /// The finite-bank evaluator can compare this message for deduplication, then decode it for
 /// fidelity, without serializing every checkpoint a second time. Private fields prevent pairing
@@ -1162,8 +1182,14 @@ impl PreparedAssessment {
     pub(crate) fn message(&self) -> &super::codec::BitString { &self.encoded.message }
 
     pub(crate) fn assess(&self, local: &Local<'_>, run: &dyn RunCheck, constraint: Constraint) -> Result<Assessment, String> {
+        self.assess_decodable(&self.encoded, local, run, constraint)
+    }
+
+    fn assess_decodable<A: super::precision::DecodableArtifact<Decoded = Artifact>>(
+        &self, encoded: &A, local: &Local<'_>, run: &dyn RunCheck, constraint: Constraint,
+    ) -> Result<Assessment, String> {
         let ((local_measure, run_measure), [local, run]) = decode_then_evaluate_pair(
-            &self.encoded,
+            encoded,
             |decoded: &Artifact| {
                 // A fresh cache releases these independent decoded operators after this
                 // measurement rather than retaining one full model per bank candidate.

@@ -1,12 +1,12 @@
 //! Complete declared paired bank, streamed without singleton or cost pruning.
-//! EXPORT SPEC OUT max_bank=193 start=0 count=193 backend=cuda cuda_local=0 trace_bytes=2147483648
-use gam_mpd::acceptance::{Assessment, Constraint, CostCache, Local, assess_once, structural_cost};
-use gam_mpd::artifact::Artifact;
+//! EXPORT SPEC OUT max_bank=193 start=0 count=193 backend=cuda cuda_local=0 trace_bytes=2147483648 codec_bytes=0
+use gam_mpd::acceptance::{Assessment, Constraint, CostCache, Local, assess_once, assess_once_with_native_codec, structural_cost};
+use gam_mpd::artifact::{Artifact, EncodedArtifact};
 use gam_mpd::import::import_language_model;
 use gam_mpd::coder_capture::sha256;
 use gam_mpd::counterfactual::{Decoder, Spec, passages};
-use gam_mpd::operator_program::{FamilyInputs, SequenceLayout, SlotValues};
-use gam_mpd::precision::FidelityVerdict;
+use gam_mpd::operator_program::{FamilyInputs, NativeOperatorCodec, SequenceLayout, SlotValues};
+use gam_mpd::precision::{DecodableArtifact, FidelityVerdict};
 use gam_mpd::proposals::{CopyResidualBank, CopyResidualChoice};
 use gam_mpd::run_check::{LanguageRun, layer_nodes, split_sites};
 use serde_json::{Value, json};
@@ -33,10 +33,11 @@ fn main()->Result<(),String>{
     if args.len()<3{return Err("EXPORT SPEC OUT max_bank=193 start=0 count=193 backend=cuda cuda_local=0 trace_bytes=2147483648".into());}
     let (export,spec_path,out)=(Path::new(&args[0]),Path::new(&args[1]),Path::new(&args[2]));
     let mut keys=BTreeMap::new();
-    for arg in &args[3..]{let(k,v)=arg.split_once('=').ok_or("expected KEY=VALUE")?;if !["max_bank","start","count","backend","cuda_local","trace_bytes","cuda_share_native"].contains(&k)||keys.insert(k,v).is_some(){return Err("unknown/duplicate option".into());}}
+    for arg in &args[3..]{let(k,v)=arg.split_once('=').ok_or("expected KEY=VALUE")?;if !["max_bank","start","count","backend","cuda_local","trace_bytes","cuda_share_native","codec_bytes"].contains(&k)||keys.insert(k,v).is_some(){return Err("unknown/duplicate option".into());}}
     let number=|k:&str|->Result<usize,String>{keys.get(k).ok_or_else(||format!("declare {k}"))?.parse().map_err(|e|format!("{e}"))};
     let(max_bank,start,count,cuda_local,trace_bytes)=(number("max_bank")?,number("start")?,number("count")?,number("cuda_local")?,number("trace_bytes")?);
     let backend=*keys.get("backend").ok_or("declare backend")?;
+    let codec_bytes=keys.get("codec_bytes").unwrap_or(&"0").parse::<usize>().map_err(|e|e.to_string())?;
     let share_native=keys.get("cuda_share_native").unwrap_or(&"0").parse::<usize>().map_err(|e|e.to_string())?;
     if share_native>1 || (share_native==1 && backend!="cuda"){return Err("cuda_share_native requires explicit CUDA".into());}
     if count==0 || cuda_local>1 || !["cpu","cuda"].contains(&backend) || (cuda_local==1&&backend!="cuda"){return Err("invalid scope/backend".into());}
@@ -49,7 +50,7 @@ fn main()->Result<(),String>{
     if sha256(spec_path)?!=SPEC_SHA{return Err("Run spec differs from frozen seven-episode control".into());}
     if out.exists(){return Err("fresh output directory required".into());}std::fs::create_dir_all(out).map_err(|e|e.to_string())?;
     let grid:Vec<Constraint>=DELTAS.iter().flat_map(|&local|EPSILONS.iter().map(move|&run|Constraint{local,run})).collect();
-    let scope=json!({"all_heads":24,"ranks":RANKS,"families":["NativeSvd","CopyResidual"],"complete_count_including_native":complete,"range":{"start":start,"count":count},"native_control_always_measured":true,"grid":grid,"local":{"sequences":2,"context":16,"batch":16,"ascent":0,"scope":"short screen, not full context"},"run":{"episodes":7,"spec_sha256":SPEC_SHA,"rows":16},"backend":backend,"cuda_local":cuda_local,"cuda_share_native":share_native,"trace_bytes":trace_bytes,"pruning":false,"unmeasured_and_failed_retained":true,"unknown_cost_lower_bound":0,"optimality":"declared193 single substitutions only; no global claim","selected_followup":"expanded512 context and80 episodes required before broader claim"});
+    let scope=json!({"all_heads":24,"ranks":RANKS,"families":["NativeSvd","CopyResidual"],"complete_count_including_native":complete,"range":{"start":start,"count":count},"native_control_always_measured":true,"grid":grid,"local":{"sequences":2,"context":16,"batch":16,"ascent":0,"scope":"short screen, not full context"},"run":{"episodes":7,"spec_sha256":SPEC_SHA,"rows":16},"backend":backend,"cuda_local":cuda_local,"cuda_share_native":share_native,"trace_bytes":trace_bytes,"codec_bytes":codec_bytes,"pruning":false,"unmeasured_and_failed_retained":true,"unknown_cost_lower_bound":0,"optimality":"declared193 single substitutions only; no global claim","selected_followup":"expanded512 context and80 episodes required before broader claim"});
     write_json(&out.join("SCOPE.json"),&scope)?;
     let mut inputs=BTreeMap::new();inputs.insert("spec".to_string(),sha256(spec_path)?);inputs.insert("export.json".into(),sha256(&export.join("export.json"))?);
     for name in config["files"].as_object().ok_or("missing export files")?.keys(){let file=format!("{name}.f64");inputs.insert(file.clone(),sha256(&export.join(file))?);}
@@ -60,11 +61,12 @@ fn main()->Result<(),String>{
     if spec.episodes.len()!=7 || spec.rows!=16{return Err("frozen seven episode sixteen-row control required".into());}
     let imported=import_language_model(export,1,1)?;let native=split_sites(&imported.program)?;let nodes=layer_nodes(&native,layers)?;let base=Artifact::native(&native)?.f32_literals()?;
     let bank=CopyResidualBank::new(&base,&nodes,heads/kv,&RANKS,max_bank)?;
+    let native_codec=if codec_bytes==0 {None} else {Some(NativeOperatorCodec::new(&base.program,codec_bytes).map_err(|e|e.to_string())?)};
     let run_passages=passages(export,spec.rows)?;
     let mut run=LanguageRun::new(&decoder,&native,&spec,&run_passages,1)?;
     let local_family=family(&passages(export,16)?)?;
     let mut local=Local::new(&native,local_family.clone(),None,16);
-    if backend=="cuda"{let device=gam_gpu::tensor::Device::accelerator(gam_gpu::GpuPolicy::Required).map_err(|e|e.to_string())?.ok_or("CUDA required")?;if cuda_local==1{local=local.with_cuda(device.clone(),trace_bytes)?;}run=run.with_cuda(device,trace_bytes)?;if share_native==1{let source=Artifact::from_bytes(&base.to_bytes()?,&native.declarations)?;run=run.with_cuda_native_source(&source)?;}}
+    if backend=="cuda"{let device=gam_gpu::tensor::Device::accelerator(gam_gpu::GpuPolicy::Required).map_err(|e|e.to_string())?.ok_or("CUDA required")?;if cuda_local==1{local=local.with_cuda(device.clone(),trace_bytes)?;}run=run.with_cuda(device,trace_bytes)?;if share_native==1{let source=if let Some(codec)=&native_codec {EncodedArtifact::of_with_native_codec(&base,codec)?.using_native_codec(codec).decode()?} else {Artifact::from_bytes(&base.to_bytes()?,&native.declarations)?};run=run.with_cuda_native_source(&source)?;}}
     let mut cache=CostCache::default();let mut records:Vec<Value>=bank.choices().enumerate().map(|(i,c)|json!({"index":i+1,"choice":c,"cost_bits":null,"cost_lower_bound":0,"states":vec!["Unevaluated";grid.len()]})).collect();
     records.insert(0,json!({"index":0,"label":"native","cost_bits":null,"cost_lower_bound":0,"states":vec!["Unevaluated";grid.len()]}));
     let choices:Vec<CopyResidualChoice>=bank.choices().collect();let mut journal=std::fs::OpenOptions::new().create_new(true).write(true).open(out.join("ASSESSMENTS.jsonl")).map_err(|e|e.to_string())?;
@@ -74,13 +76,13 @@ fn main()->Result<(),String>{
             let artifact=if index==0{base.clone()}else{bank.candidate(choices[index-1])?};
             if artifact.places!=base.places{return Err("native places changed".into());}let artifact=artifact.f32_literals()?;
             let cost=structural_cost(&artifact,&mut cache)?;records[index]["cost_bits"]=json!(cost.total());records[index]["cost_lower_bound"]=json!(cost.total());
-            let assessment=assess_once(&local,&run,&artifact,grid[0],&mut cache)?;
+            let assessment=if let Some(codec)=&native_codec {assess_once_with_native_codec(&local,&run,&artifact,grid[0],&mut cache,codec)?} else {assess_once(&local,&run,&artifact,grid[0],&mut cache)?};
             if assessment.cost!=cost{return Err("assessment cost changed".into());}
             records[index]["states"]=json!(states(&assessment,&grid)?);records[index]["local"]=json!(assessment.local_measure);records[index]["run"]=json!(assessment.run_measure);
             Ok(())
         })();
         if let Err(error)=result{records[index]["states"]=json!(vec!["Failed";grid.len()]);records[index]["error"]=json!(error);}
-        records[index]["seconds"]=json!(t.elapsed().as_secs_f64());records[index]["peak_rss_bytes"]=json!(peak_rss());
+        records[index]["seconds"]=json!(t.elapsed().as_secs_f64());records[index]["codec_usage"]=json!(native_codec.as_ref().map(|c|c.usage()));records[index]["peak_rss_bytes"]=json!(peak_rss());
         writeln!(journal,"{}",records[index]).map_err(|e|e.to_string())?;journal.flush().map_err(|e|e.to_string())?;cache.clear_measurements();
     }
     let mut points=Vec::new();let mut selected=BTreeSet::new();
@@ -95,5 +97,5 @@ fn main()->Result<(),String>{
         let isolated_kl=gam_mpd::local_kl::isolated_downstream_kl(&native,&decoded,&local_family,16)?;
         replays.push(json!({"isolated_downstream_patch_kl":isolated_kl,"diagnostic_only":true,"index":index,"file":path.file_name().and_then(|p|p.to_str()),"sha256":sha256(&path)?,"bytes":saved.len(),"cost_bits":replay.cost.total(),"local":replay.local_measure,"run":replay.run_measure}));cache.clear_measurements();
     }
-    write_json(&out.join("REPORT.json"),&json!({"scope":scope,"records":records,"points":points,"selected_saved_byte_replays":replays,"seconds":begun.elapsed().as_secs_f64(),"peak_rss_bytes":peak_rss(),"run_stage_seconds":run.timing()}))?;Ok(())
+    write_json(&out.join("REPORT.json"),&json!({"scope":scope,"records":records,"points":points,"selected_saved_byte_replays":replays,"seconds":begun.elapsed().as_secs_f64(),"peak_rss_bytes":peak_rss(),"run_stage_seconds":run.timing(),"native_codec":native_codec.as_ref().map(|c|json!({"stats":c.stats(),"usage":c.usage(),"selected_replay":"ordinary uncached standalone decoding"}))}))?;Ok(())
 }

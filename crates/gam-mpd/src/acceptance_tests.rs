@@ -1175,15 +1175,31 @@ fn assess_once_matches_complete_cached_assessment_without_measurement_key() {
         .unwrap();
     let local = Local::new(&model, family.clone(), None, 64);
     let run = clean_run(&model, &family);
+    let codec = super::operator_program::NativeOperatorCodec::new(&start.program, 1 << 20).unwrap();
     let mut once_cache = CostCache::default();
+    // Native exercises witnessed same-index hits; replacement compacts operators
+    // and must preserve ordinary results through the permutation fallback.
+    for candidate in [&start, &candidate] {
     for constraint in [Constraint { local: 0.01, run: 0.01 }, Constraint { local: 1.0, run: 1.0 }] {
-        let old = assess(&local, &run, &candidate, constraint, &mut CostCache::default()).unwrap();
-        let once = super::acceptance::assess_once(&local, &run, &candidate, constraint, &mut once_cache).unwrap();
+        let old = assess(&local, &run, candidate, constraint, &mut CostCache::default()).unwrap();
+        let once = super::acceptance::assess_once(&local, &run, candidate, constraint, &mut once_cache).unwrap();
         assert_eq!(old.cost, once.cost);
         assert_eq!(old.local, once.local);
         assert_eq!(old.local_measure, once.local_measure);
         assert_eq!(old.run, once.run);
         assert_eq!(old.run_measure, once.run_measure);
         assert_eq!(old.meets(), once.meets());
+        let reused = super::acceptance::assess_once_with_native_codec(
+            &local, &run, candidate, constraint, &mut once_cache, &codec,
+        ).unwrap();
+        assert_eq!(old.cost, reused.cost);
+        assert_eq!(old.local, reused.local);
+        assert_eq!(old.local_measure, reused.local_measure);
+        assert_eq!(old.run, reused.run);
+        assert_eq!(old.run_measure, reused.run_measure);
+        assert_eq!(old.meets(), reused.meets());
     }
+    }
+    assert!(codec.usage().encoded_native_operator_hits > 0);
+    assert!(codec.usage().decoded_native_operator_hits > 0);
 }
