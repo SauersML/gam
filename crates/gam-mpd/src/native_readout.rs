@@ -98,6 +98,8 @@ pub struct Resident {
     vocab: usize,
     tile_rows: usize,
     resident_bytes: usize,
+    raw_residual_upload_bytes: std::sync::atomic::AtomicU64,
+    raw_oracle_download_bytes: std::sync::atomic::AtomicU64,
 }
 
 fn bytes(elements: usize) -> Result<usize, String> {
@@ -195,6 +197,8 @@ impl Resident {
             vocab,
             tile_rows,
             resident_bytes,
+            raw_residual_upload_bytes: Default::default(),
+            raw_oracle_download_bytes: Default::default(),
         })
     }
     pub fn tile_rows(&self) -> usize {
@@ -214,15 +218,22 @@ impl Resident {
         }
         let d = &self.device;
         let x = d.upload(residual.view()).map_err(|e| e.to_string())?;
-        let norm = d.rms_norm(&x, self.eps).map_err(|e| e.to_string())?;
+        self.logits_device(&x)
+    }
+
+    /// Head execution on supplied resident values; no host residual or vocabulary transfer.
+    /// Nonfinite raw results are rejected by checked metrics as typed Unresolved.
+    fn logits_device(&self, x: &Tensor) -> Result<Tensor, String> {
+        if x.cols() != self.width || x.rows() == 0 || x.rows() > self.tile_rows {
+            return Err("native resident head shape or tile budget violated".into());
+        }
+        let d = &self.device;
+        let norm = d.rms_norm(x, self.eps).map_err(|e| e.to_string())?;
         let mut scaled = d.zeros(x.rows(), self.width).map_err(|e| e.to_string())?;
         d.scale_columns(&mut scaled, &norm, &self.gain, false)
             .map_err(|e| e.to_string())?;
-        drop(x);
         drop(norm);
-        let mut out = d
-            .zeros(residual.nrows(), self.vocab)
-            .map_err(|e| e.to_string())?;
+        let mut out = d.zeros(x.rows(), self.vocab).map_err(|e| e.to_string())?;
         d.gemm(
             &mut out,
             1.0,
@@ -257,9 +268,20 @@ impl Resident {
         Ok((normalized, [gpu_ns, cpu_ns]))
     }
 
+    /// Cumulative host transfer bytes in raw metric endpoints only. Device row
+    /// copies and O(rows) interval/argmax result downloads are excluded.
+    pub fn raw_transfer_counts(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.raw_residual_upload_bytes.load(Ordering::Relaxed),
+            self.raw_oracle_download_bytes.load(Ordering::Relaxed),
+        )
+    }
+
     /// Complete conservative live numeric workspace for a paired raw tile.
     /// Includes two resident logits, optional exact-value downloads, head transient
-    /// arrays, checked outputs and argmax arrays. Context/library workspace excluded.
+    /// arrays, checked outputs and argmax arrays, and 2KiB static shared memory per
+    /// checked row/block. Registers/spills, context and library workspace excluded.
     pub fn checked_raw_workspace_bytes(&self, rows: usize) -> Result<usize, String> {
         if rows == 0 || rows > self.tile_rows {
             return Err("raw head tile exceeds declared readout budget".into());
@@ -272,6 +294,7 @@ impl Resident {
                     .and_then(|o| n.checked_add(o))
             })
             .and_then(|n| rows.checked_mul(64).and_then(|o| n.checked_add(o)))
+            .and_then(|n| rows.checked_mul(2048).and_then(|o| n.checked_add(o)))
             .and_then(|n| n.checked_add(std::mem::size_of::<RawTile>()))
             .ok_or("raw head numeric budget overflow".into())
     }
@@ -290,8 +313,14 @@ impl Resident {
         if !cfg!(target_os = "linux") || self.device.is_host() || !self.device.float64() {
             return Err("resident raw checked metrics require CUDA f64 without fallback".into());
         }
-        if teacher.dim() != explained.dim() {
-            return Err("raw head residual shape mismatch".into());
+        if teacher.dim() != explained.dim()
+            || teacher.ncols() != self.width
+            || teacher
+                .iter()
+                .chain(explained.iter())
+                .any(|v| !v.is_finite())
+        {
+            return Err("raw head residual shape or finite values violated".into());
         }
         let required = self.checked_raw_workspace_bytes(teacher.nrows())?;
         if required > workspace_bytes {
@@ -299,10 +328,78 @@ impl Resident {
                 "raw head numeric workspace {required} exceeds {workspace_bytes}"
             ));
         }
+        let upload_timer = std::time::Instant::now();
+        let uploaded = teacher
+            .len()
+            .checked_mul(16)
+            .ok_or("raw residual transfer overflow")?;
+        let p_input = self
+            .device
+            .upload(teacher.view())
+            .map_err(|e| e.to_string())?;
+        let q_input = self
+            .device
+            .upload(explained.view())
+            .map_err(|e| e.to_string())?;
+        self.raw_residual_upload_bytes
+            .fetch_add(uploaded as u64, std::sync::atomic::Ordering::Relaxed);
+        let upload_seconds = upload_timer.elapsed().as_secs_f64();
+        let mut tile = self.checked_raw_metrics_device(
+            &p_input,
+            &q_input,
+            0,
+            teacher.nrows(),
+            workspace_bytes,
+            oracle,
+        )?;
+        tile.timing.resident_head_seconds += upload_seconds;
+        Ok(tile)
+    }
+
+    /// Checked raw head metrics from immutable resident residuals. Only explicit
+    /// oracle mode transfers vocabulary values; production downloads row evidence.
+    pub(crate) fn checked_raw_metrics_device(
+        &self,
+        teacher: &Tensor,
+        explained: &Tensor,
+        start: usize,
+        rows: usize,
+        workspace_bytes: usize,
+        oracle: bool,
+    ) -> Result<RawTile, String> {
+        if !cfg!(target_os = "linux") || self.device.is_host() || !self.device.float64() {
+            return Err("resident raw checked metrics require CUDA f64 without fallback".into());
+        }
+        let end = start
+            .checked_add(rows)
+            .ok_or("raw resident row domain overflow")?;
+        if teacher.rows() != explained.rows()
+            || teacher.cols() != self.width
+            || explained.cols() != self.width
+            || end > teacher.rows()
+        {
+            return Err("raw resident head residual shape/domain mismatch".into());
+        }
+        let required = self.checked_raw_workspace_bytes(rows)?;
+        if required > workspace_bytes {
+            return Err(format!(
+                "raw head numeric workspace {required} exceeds {workspace_bytes}"
+            ));
+        }
         let mut timing = crate::fixed_metric_device::Timing::default();
         let timer = std::time::Instant::now();
-        let p = self.logits(teacher)?;
-        let q = self.logits(explained)?;
+        let teacher_rows = self
+            .device
+            .rows_of(teacher, start, rows)
+            .map_err(|e| e.to_string())?;
+        let explained_rows = self
+            .device
+            .rows_of(explained, start, rows)
+            .map_err(|e| e.to_string())?;
+        let p = self.logits_device(&teacher_rows)?;
+        let q = self.logits_device(&explained_rows)?;
+        drop(teacher_rows);
+        drop(explained_rows);
         self.device.synchronize().map_err(|e| e.to_string())?;
         timing.resident_head_seconds = timer.elapsed().as_secs_f64();
         let timer = std::time::Instant::now();
@@ -311,7 +408,7 @@ impl Resident {
             .checked_kl_intervals(
                 &p,
                 &q,
-                checked_interval_output_bytes(teacher.nrows()).map_err(|e| e.to_string())?,
+                checked_interval_output_bytes(rows).map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string())?;
         timing.checked_metric_seconds = timer.elapsed().as_secs_f64();
@@ -325,8 +422,14 @@ impl Resident {
         timing.gpu_top1_seconds = timer.elapsed().as_secs_f64();
         let oracle = if oracle {
             let timer = std::time::Instant::now();
+            let bytes = rows
+                .checked_mul(self.vocab)
+                .and_then(|n| n.checked_mul(16))
+                .ok_or("raw oracle transfer overflow")?;
             let hp = self.device.download(&p).map_err(|e| e.to_string())?;
             let hq = self.device.download(&q).map_err(|e| e.to_string())?;
+            self.raw_oracle_download_bytes
+                .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
             timing.raw_oracle_download_seconds = timer.elapsed().as_secs_f64();
             let timer = std::time::Instant::now();
             let mut check = crate::fixed_metric_device::HostSpotcheck::default();
@@ -457,6 +560,45 @@ mod tests {
         assert!(h.proposal_metrics(&p, &Array2::zeros((1, 2))).is_err());
         assert!(
             h.proposal_metrics(&p, &Array2::from_elem((2, 2), f64::NAN))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resident_head_matches_existing_arrays_without_host_transfers() {
+        let device = Device::host();
+        let embedding = ndarray::array![[1., 2.], [-3., 4.], [5., -6.]];
+        let gain = ndarray::array![0.75, 1.25];
+        let head = Resident::from_head(
+            device.clone(),
+            &embedding,
+            &gain,
+            1e-6,
+            Budget {
+                resident_bytes: 64,
+                workspace_bytes: tile_bytes(2, 3).unwrap() * 2,
+            },
+        )
+        .unwrap();
+        let full = ndarray::array![[9., 8.], [1., -1.], [0., -0.]];
+        let tensor = device.upload(full.view()).unwrap();
+        let tile = device.rows_of(&tensor, 1, 2).unwrap();
+        let resident = head.logits_device(&tile).unwrap();
+        let arrays = head
+            .logits(&full.slice(ndarray::s![1.., ..]).to_owned())
+            .unwrap();
+        assert_eq!(
+            device.download(&resident).unwrap(),
+            device.download(&arrays).unwrap()
+        );
+        assert_eq!(device.download(&tensor).unwrap(), full);
+        assert_eq!(head.raw_transfer_counts(), (0, 0));
+        assert!(head.logits_device(&device.zeros(3, 2).unwrap()).is_err());
+        assert!(head.logits_device(&device.zeros(1, 3).unwrap()).is_err());
+        assert!(head.logits_device(&device.zeros(0, 2).unwrap()).is_err());
+        // No host fallback for the checked resident endpoint.
+        assert!(
+            head.checked_raw_metrics_device(&tensor, &tensor, 1, 2, usize::MAX, false)
                 .is_err()
         );
     }
