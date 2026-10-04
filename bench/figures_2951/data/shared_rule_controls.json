@@ -5191,7 +5191,8 @@
       ],
       "pool_sha256": "2e0cb7293c2347846997337a28eb547cf50d6e7da7106c5563bbbeb5289d3162",
       "best_step": 0,
-      "saved_eval_max": 5.024085062086227
+      "saved_eval_max": 5.024085062086227,
+      "optimizer_seconds": 24.133800313
     },
     "frozen_native": {
       "history": [
@@ -6230,7 +6231,8 @@
       ],
       "pool_sha256": "1bcf9e595b0193de05696233f89dd014d64f22c5d64f641116fda8e17e1bc1e2",
       "best_step": 250,
-      "saved_eval_max": 5.755988179497747
+      "saved_eval_max": 5.755988179497747,
+      "optimizer_seconds": 24.126012008
     }
   },
   "sources": [
@@ -6257,6 +6259,14 @@
     {
       "path": "/Users/user/mpd-data/codex/shared-geometry-execution-20261004/paired-continuation/frozen_native/REPORT.json",
       "sha256": "6a97949b551df0deea5fae844ccdb12cf502e723937c8fd9a890c52d17e7226a"
+    },
+    {
+      "path": "/Users/user/mpd-data/codex/shared-geometry-execution-20261004/larger64/learned/REPORT.json",
+      "sha256": "e542dce44fd4d88e7501b0a4d3be7587e939c6f8d0d8b2d7121d25f8693e8672"
+    },
+    {
+      "path": "/Users/user/mpd-data/codex/shared-geometry-execution-20261004/larger64/frozen_native/REPORT.json",
+      "sha256": "07232683453739bd70552455e4060264b4696008c1af753697db5c83b4b0fcf8"
     }
   ],
   "scope": {
@@ -6266,6 +6276,28 @@
     "heldout": "1024 positions, project-seen but fit-disjoint; layerwise maximum row error divided by native layer RMS. Not the separate full-model evaluation panel.",
     "warmstart": "Both start from the identical frozen-native initial-fit best program. All parameters retained, optimizer moments reset; 256 additional updates. Best training snapshot selected.",
     "conclusion": "No learned-body advantage; learned warmstart retains step zero. These are negative fitting/faithfulness results, not a matched-compute VPD comparison.",
-    "figure": "Only fitting and fit-disjoint replay results. Full-model intervention experiment intentionally excluded pending corrected input-panel rerun."
+    "figure": "Fitting and fit-disjoint replay only. The completed full-model evaluation on the declared panel is archived separately in bench/results_2951/shared_geometry_correct_panel_20261004; native won all 30 tested tolerance pairs.",
+    "larger64": "Same frozen-native 256-update starting parameters as the paired 8-passage continuations; 256 additional updates with identical hyperparameters, using 32,768 rather than 4,096 training positions. Evaluation arrays unchanged. More data also incurs more computation; this is not a compute-matched comparison. Snapshots selected by training error. Full-model Local/Run evaluation of these larger-data candidates was not run.",
+    "research_status": "Diagnostic closed: sharing a supplied GELU calculation did not demonstrate learned algorithm discovery. No matched-compute advantage over VPD is established."
+  },
+  "larger64": {
+    "learned": {
+      "saved_eval_max": 1.1588909357145283,
+      "saved_eval": [
+        1.1588909357145283,
+        1.021443993483612
+      ],
+      "optimizer_seconds": 185.416911522,
+      "pool_sha256": "49eb243b68d1d70f87013da899961cecb116af0d677e27959afab59ae9533a79"
+    },
+    "frozen_native": {
+      "saved_eval_max": 0.9207768225247269,
+      "saved_eval": [
+        2.2727697370701983e-15,
+        0.9207768225247269
+      ],
+      "optimizer_seconds": 185.422585825,
+      "pool_sha256": "56e7ef607e7d5afdbe9939410518a1bd4bb1af3038822a51bef43d97589c044e"
+    }
   }
 }

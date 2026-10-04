@@ -73,8 +73,35 @@ def main():
     for suffix in ["pdf", "svg", "png"]:
         fig.savefig(args.out / f"controls.{suffix}", bbox_inches="tight", dpi=150)
     plt.close(fig)
+    if "larger64" in data:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6.2))
+        for j, (key, label, color) in enumerate([
+                ("warmstart", "8 training passages", "#899AA6"),
+                ("larger64", "64 training passages", "#156BA3")]):
+            xs = [i + (j - .5) * .30 for i in range(2)]
+            for ax, metric in zip(axes, ["saved_eval_max", "optimizer_seconds"]):
+                values = [data[key][arm][metric] for arm in arms]
+                ax.bar(xs, values, width=.28, color=color, label=label)
+                for x, value in zip(xs, values):
+                    ax.annotate(f"{value:.2f}" if metric == "saved_eval_max" else f"{value:.1f}",
+                                (x, value), xytext=(0, 6), textcoords="offset points",
+                                ha="center", fontsize=16)
+        for ax in axes:
+            ax.set_xticks(range(2), ["Learned shared", "Frozen native"])
+        axes[0].set(title="More fitting data improves held-out error",
+                    ylabel="Maximum normalized output error", ylim=(0, 7.4))
+        axes[1].set(title="Both fits use 256 additional updates",
+                    ylabel="GPU fitting time (seconds)", ylim=(0, 220))
+        handles, names = axes[0].get_legend_handles_labels()
+        fig.legend(handles, names, loc="lower center", ncol=2, frameon=False, fontsize=16)
+        fig.tight_layout(rect=(0, .11, 1, 1), pad=2)
+        for suffix in ["pdf", "svg", "png"]:
+            fig.savefig(args.out / f"data_coverage.{suffix}", bbox_inches="tight", dpi=150)
+        plt.close(fig)
     if args.open:
         subprocess.run(["open", "-a", "Preview", str(args.out / "controls.pdf")], check=True)
+        if "larger64" in data:
+            subprocess.run(["open", "-a", "Preview", str(args.out / "data_coverage.pdf")], check=True)
 
 
 if __name__ == "__main__":
