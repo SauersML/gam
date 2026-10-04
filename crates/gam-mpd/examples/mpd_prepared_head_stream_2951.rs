@@ -1,7 +1,7 @@
 //! Assess all prepared native-input head factors without fitting or changing the frozen panel.
 //! FIT_EXPORT EVAL_EXPORT SPEC PREPARED_REPORT OUT head_start=N head_count=N
 //! train_export=DIR max_bank=385 codec_bytes=N local_source_bytes=N trace_bytes=N
-//! readout_resident_bytes=N readout_workspace_bytes=N parallel=N
+//! readout_resident_bytes=N readout_workspace_bytes=N parallel=N preflight=0|1
 //! A shard preserves the complete 384-proposal scope with other heads explicitly unmeasured.
 use gam_mpd::{
     acceptance::{
@@ -229,7 +229,17 @@ fn weight_lineage(train: &Path, fit: &Path, eval: &Path, report: &Value) -> Resu
     let names = |files: &serde_json::Map<String, Value>| {
         files
             .keys()
-            .filter(|k| !["tokens", "logits_row0"].contains(&k.as_str()))
+            .filter(|k| {
+                ![
+                    "tokens",
+                    "row_ids",
+                    "logits_row0",
+                    "logits_logsumexp",
+                    "logits_topk_indices",
+                    "logits_topk_values",
+                ]
+                .contains(&k.as_str())
+            })
             .cloned()
             .collect::<BTreeSet<_>>()
     };
@@ -291,7 +301,7 @@ fn weight_lineage(train: &Path, fit: &Path, eval: &Path, report: &Value) -> Resu
         json!({"checkpoint_sha256":checkpoint,"actual_train_scored_eval_shared_sequences":0,"training_export_sha256":sha256(&train.join("export.json"))?,"actual_native_weights_equal":true,"weights":records,
         "fit_export_sha256":sha256(&fit.join("export.json"))?,"evaluation_export_sha256":sha256(&eval.join("export.json"))?,
         "evaluation_tokens_sha256":sha256(&eval.join("tokens.f64"))?,"training_manifest":manifest,
-        "excluded_from_weight_comparison":["tokens","logits_row0"],"extraction_arrays_rehashed":false}),
+        "excluded_from_weight_comparison":["tokens","row_ids","logits_row0","logits_logsumexp","logits_topk_indices","logits_topk_values"],"extraction_arrays_rehashed":false}),
     )
 }
 fn token_prefixes(dir: &Path, count: usize) -> Result<Vec<Vec<u32>>, String> {
@@ -522,6 +532,7 @@ fn main() -> Result<(), String> {
             "readout_resident_bytes",
             "readout_workspace_bytes",
             "parallel",
+            "preflight",
         ]
         .contains(&k)
             || keys.insert(k, v).is_some()
@@ -529,6 +540,11 @@ fn main() -> Result<(), String> {
             return Err("unknown or duplicate option".into());
         }
     }
+    let preflight = match keys.get("preflight").copied().unwrap_or("0") {
+        "0" => false,
+        "1" => true,
+        _ => return Err("preflight must be0 or1".into()),
+    };
     let number = |key| {
         keys.get(key)
             .ok_or_else(|| format!("declare {key}"))?
@@ -619,6 +635,20 @@ fn main() -> Result<(), String> {
     }
     let rows = passages(export, CONTEXT)?;
     let family = local_family(&rows)?;
+    if preflight {
+        std::fs::create_dir(out).map_err(|e| e.to_string())?;
+        write_json(
+            &out.join("PREFLIGHT.json"),
+            &json!({
+                "status":"all lineage/factor/spec/schema checks passed; no GPU initialized and no fidelity measurements",
+                "complete_proposal_inventory":384,"factors_validated":entries.len(),"lineage":lineage,
+                "prepared_report_sha256":sha256(prepared_path)?,"spec_sha256":SPEC_SHA,
+                "binary_sha256":sha256(&std::env::current_exe().map_err(|e| e.to_string())?)?,
+                "seconds":{"lineage":hashes_seconds,"factor_validation":factor_validation_seconds,"total":begun.elapsed().as_secs_f64()}
+            }),
+        )?;
+        return Ok(());
+    }
     let init = Instant::now();
     let codec = NativeOperatorCodec::new(&base.program, codec_bytes).map_err(|e| e.to_string())?;
     let codec_initialization_seconds = init.elapsed().as_secs_f64();
@@ -981,7 +1011,17 @@ mod tests {
         for path in [&train, &fit, &eval] {
             std::fs::create_dir(path).expect("directory");
         }
-        let t = metadata(&train, 512, 1.0);
+        let mut t = metadata(&train, 512, 1.0);
+        // Training exports carry row provenance and sparse reference logits, not weights.
+        for key in [
+            "row_ids",
+            "logits_logsumexp",
+            "logits_topk_indices",
+            "logits_topk_values",
+        ] {
+            t["files"][key] = json!({"shape":[1,1]});
+        }
+        write_json(&train.join("export.json"), &t).expect("training sidecars");
         metadata(&fit, 2, 3.0);
         metadata(&eval, 2, 2.0);
         let report = json!({"manifest":{"checkpoint_sha256":"0".repeat(64),"config":t["config"],"context":CONTEXT,"identical_train_eval_token_sequences":0,
