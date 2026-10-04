@@ -1,7 +1,8 @@
 //! Prepare a diagnostic bank for fresh/shared CUDA parity, never a quality bank.
 //! Usage: mpd_cuda_share_bank_2951 EXPORT_DIR SPEC.json CANDIDATE.bin OUT_DIR
 //! Native is supplied by the frontier driver; the two bank members are exact saved
-//! candidate bytes and the same decoded candidate with ordered write exceptions.
+//! candidate bytes and the same decoded candidate with permuted operator indices
+//! and ordered write exceptions.
 use gam_mpd::artifact::{Artifact, Exception, contexts};
 use gam_mpd::counterfactual::passages;
 use gam_mpd::import::import_language_model;
@@ -31,11 +32,12 @@ fn main() -> Result<(), String> {
     let bytes = std::fs::read(&args[3]).map_err(|e| e.to_string())?;
     let mut artifact = Artifact::from_bytes(&bytes, &native.declarations)?;
     artifact.validate_coverage(&native)?;
-    let block = artifact
-        .blocks
-        .first()
-        .ok_or("candidate must replace at least one block")?;
-    let (write, native_write) = (block.write, block.native_write);
+    if !artifact.derived.is_empty() {
+        return Err(
+            "diagnostic permutation currently requires materialized operators without derivations"
+                .into(),
+        );
+    }
     let family = FamilyInputs {
         rows,
         slots: vec![SlotValues::Tokens(first[..rows].to_vec())],
@@ -44,6 +46,38 @@ fn main() -> Result<(), String> {
             position: (0..rows).map(|r| r as u32).collect(),
         }),
     };
+    let original = artifact.execute(&family)?.values[artifact.program.output].clone();
+    if original.iter().any(|v| !v.is_finite()) {
+        return Err("source candidate has nonfinite diagnostic outputs".into());
+    }
+    let operators: Vec<_> = (0..artifact.program.operators.len()).rev().collect();
+    artifact.program.operators.reverse();
+    let nodes: Vec<_> = (0..artifact.program.nodes.len()).collect();
+    let bases: Vec<_> = (0..artifact.program.bases.len()).collect();
+    let rules: Vec<_> = (0..artifact.program.rules.len()).collect();
+    for node in &mut artifact.program.nodes {
+        gam_mpd::operator_program::remap_node(node, &nodes, &operators, &bases, &rules);
+    }
+    for rule in &mut artifact.program.rules {
+        let body: Vec<_> = (0..rule.nodes.len()).collect();
+        for node in &mut rule.nodes {
+            gam_mpd::operator_program::remap_node(node, &body, &operators, &bases, &rules);
+        }
+    }
+    artifact.program.interfaces().map_err(|e| e.to_string())?;
+    let permuted = artifact.execute(&family)?.values[artifact.program.output].clone();
+    if !original
+        .iter()
+        .zip(permuted.iter())
+        .all(|(a, b)| a.to_bits() == b.to_bits())
+    {
+        return Err("operator permutation changed candidate output bits".into());
+    }
+    let block = artifact
+        .blocks
+        .first()
+        .ok_or("candidate must replace at least one block")?;
+    let (write, native_write) = (block.write, block.native_write);
     let context = contexts(&family).pop().ok_or("no causal context")?;
     // Large opposite additions deliberately expose order/coalescing bugs. The
     // final small addition remains meaningful after cancellation at column zero.
@@ -62,7 +96,7 @@ fn main() -> Result<(), String> {
     std::fs::write(out.join("ordered-exceptions.bin"), exceptional).map_err(|e| e.to_string())?;
     let bank = json!([
         {"label": "candidate", "artifact": "candidate.bin"},
-        {"label": "candidate-ordered-exceptions", "artifact": "ordered-exceptions.bin"}
+        {"label": "candidate-permuted-ordered-exceptions", "artifact": "ordered-exceptions.bin"}
     ]);
     std::fs::write(
         out.join("BANK.json"),
@@ -75,6 +109,8 @@ fn main() -> Result<(), String> {
             "scope": "CUDA parameter-sharing parity only; not the quality protocol",
             "candidate": args[3], "spec": args[2], "passage": 0, "row": rows-1,
             "native_write": native_write, "candidate_write": write, "column": 0,
+            "operator_permutation": "reverse all indices; node and Rule references remapped; literals unchanged",
+            "permutation_clean_output_bit_parity": true,
             "ordered_additions": [1e20, -1e20, 0.375]
         }))
         .map_err(|e| e.to_string())?,
