@@ -62,6 +62,9 @@ enum Held {
 
 struct HeldOperator {
     source: Arc<Operator>,
+    /// False after a resident training update: pointer identity with the original
+    /// host operator must no longer license sharing these changed values.
+    source_matches: bool,
     /// Shared with every program compiled from this one ([`DeviceProgram::compile_sharing`]).
     held: Arc<Held>,
 }
@@ -366,7 +369,8 @@ impl DeviceProgram {
         }
         // `from`'s operators by their source and role.
         let held_by: BTreeMap<(usize, Role), &Arc<Held>> =
-            from.map(|f| f.operators.iter().map(|((_, role), h)| ((Arc::as_ptr(&h.source) as usize, *role), &h.held)).collect()).unwrap_or_default();
+            from.map(|f| f.operators.iter().filter(|(_, h)| h.source_matches)
+                .map(|((_, role), h)| ((Arc::as_ptr(&h.source) as usize, *role), &h.held)).collect()).unwrap_or_default();
         if let Some(limit) = numeric_bytes_limit {
             let mut total = 0usize;
             for &(index, role) in &wanted.iter().copied().collect::<std::collections::BTreeSet<_>>() {
@@ -394,7 +398,7 @@ impl DeviceProgram {
                 Some(h) => Arc::clone(h),
                 None => Arc::new(hold(device, &source, key.1)?),
             };
-            operators.insert(key, HeldOperator { source, held });
+            operators.insert(key, HeldOperator { source, source_matches: true, held });
         }
         Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), arithmetic: Arithmetic::F64 })
     }
@@ -464,9 +468,11 @@ impl DeviceProgram {
         if self.operators.contains_key(&(op, Role::Column)) {
             return Err(format!("device: operator {op} also has column uses; use replace_dense_parameter"));
         }
-        match self.operators.get_mut(&(op, Role::Product)).map(|h| Arc::get_mut(&mut h.held)) {
-            Some(Some(Held::Dense(a))) => Ok(a),
-            Some(None) => Err(format!("device: operator {op} is shared with another program")),
+        let held = self.operators.get_mut(&(op, Role::Product))
+            .ok_or_else(|| format!("device: operator {op} is not held dense"))?;
+        match Arc::get_mut(&mut held.held) {
+            Some(Held::Dense(a)) => { held.source_matches = false; Ok(a) },
+            None => Err(format!("device: operator {op} is shared with another program")),
             _ => Err(format!("device: operator {op} is not held dense")),
         }
     }
@@ -531,9 +537,9 @@ impl DeviceProgram {
             if value.cols() != 1 { return Err("device: column parameter is not one column".into()); }
             Some(self.device.copy(&value).map_err(error)?.reshape(1, value.rows()).map_err(error)?)
         } else { None };
-        self.operators.insert((op, Role::Product), HeldOperator { source: Arc::clone(&source), held: Arc::new(Held::Dense(value)) });
+        self.operators.insert((op, Role::Product), HeldOperator { source: Arc::clone(&source), source_matches: false, held: Arc::new(Held::Dense(value)) });
         if let Some(column) = column {
-            self.operators.insert((op, Role::Column), HeldOperator { source, held: Arc::new(Held::Column(column)) });
+            self.operators.insert((op, Role::Column), HeldOperator { source, source_matches: false, held: Arc::new(Held::Column(column)) });
         }
         Ok(())
     }
@@ -575,9 +581,10 @@ impl DeviceProgram {
     /// Re-upload every operator `program` now holds a different copy of (a stepped library).
     pub fn refresh(&mut self, program: &OperatorProgram) -> Result<(), String> {
         for ((op, role), held) in &mut self.operators {
-            if !Arc::ptr_eq(&held.source, &program.operators[*op]) {
+            if !held.source_matches || !Arc::ptr_eq(&held.source, &program.operators[*op]) {
                 held.source = Arc::clone(&program.operators[*op]);
                 held.held = Arc::new(hold(&self.device, &held.source, *role)?);
+                held.source_matches = true;
             }
         }
         Ok(())
@@ -1786,6 +1793,14 @@ mod values_vjp_tests {
             let peer_trace = peer.forward(&family).unwrap();
             assert_eq!(device.download(peer_trace.value(program.output).unwrap()).unwrap(), before);
             assert_ne!(actual, before);
+            // Compiling the original host program must not borrow trained values
+            // just because its old parameter Arcs still have the same addresses.
+            let original = DeviceProgram::compile_values_sharing(&trained, &program).unwrap();
+            let original_trace = original.forward(&family).unwrap();
+            assert_eq!(device.download(original_trace.value(program.output).unwrap()).unwrap(), before);
+            trained.refresh(&program).unwrap();
+            let restored = trained.forward(&family).unwrap();
+            assert_eq!(device.download(restored.value(program.output).unwrap()).unwrap(), before);
         }
     }
 
