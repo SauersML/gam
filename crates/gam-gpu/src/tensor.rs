@@ -149,6 +149,66 @@ fn normal_cdf(t: f64) -> f64 {
     0.5 * libm::erfc(-t * std::f64::consts::FRAC_1_SQRT_2)
 }
 
+/// Explicit budget for CUDA sparse-coder scratch doubles and indices only.
+/// Resident operands, mask/bound outputs, and diagnostic counters (`56 * rows` bytes) are excluded.
+/// All rows are evaluated; `max_rows` bounds concurrently resident row workspaces only.
+#[derive(Clone, Copy, Debug)]
+pub struct CodeRowsWorkspace {
+    pub bytes: usize,
+    pub max_rows: usize,
+    pub cache_columns: bool,
+}
+
+/// Operation counts for one row, without changing any search limit or stopping rule.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CodeRowCounters {
+    pub relaxations: u64,
+    pub sweeps: u64,
+    pub column_computations: u64,
+    pub column_cache_hits: u64,
+    pub rounding_flips: u64,
+    pub explored_nodes: u64,
+    pub sweep_limit_hits: u64,
+}
+
+/// Synchronous call time includes allocations, launch, and result downloads; not GPU kernel time.
+#[derive(Debug)]
+pub struct CodeRowsDiagnostics {
+    pub rows: Vec<CodeRowCounters>,
+    pub elapsed: std::time::Duration,
+    pub concurrent_rows: usize,
+    pub workspace_bytes: usize,
+}
+
+/// Exact workspace allocation plan; lengths and cache offset count scalar elements per slot.
+/// This host-side planner allocates nothing and is available without a CUDA device.
+#[derive(Debug)]
+pub struct CodeRowsLayout { pub slots: usize, pub doubles: usize, pub indices: usize, pub cache_offset: usize, pub bytes: usize }
+
+impl CodeRowsWorkspace {
+    pub fn plan(self, rows: usize, pieces: usize, blocks: usize, nodes: usize) -> Result<CodeRowsLayout, GpuError> {
+        code_rows_layout(rows, pieces, blocks, nodes, self)
+    }
+}
+
+fn code_rows_layout(rows: usize, pieces: usize, blocks: usize, nodes: usize, workspace: CodeRowsWorkspace) -> Result<CodeRowsLayout, GpuError> {
+    if workspace.max_rows == 0 { return Err(shape("sparse code workspace needs positive max_rows".to_string())); }
+    let overflow = || shape("sparse code workspace size overflow".to_string());
+    let width = blocks.checked_next_power_of_two().ok_or_else(overflow)?.max(2);
+    let open = nodes.checked_add(1).ok_or_else(overflow)?;
+    let node_size = blocks.checked_mul(4).and_then(|n| n.checked_add(1)).ok_or_else(overflow)?;
+    let cache_offset = blocks.checked_mul(15).and_then(|n| n.checked_add(pieces)).and_then(|n| n.checked_add(width))
+        .and_then(|n| open.checked_mul(node_size).and_then(|m| n.checked_add(m))).ok_or_else(overflow)?;
+    let cache = if workspace.cache_columns { blocks.checked_mul(blocks).ok_or_else(overflow)? } else { 0 };
+    let doubles = cache_offset.checked_add(cache).ok_or_else(overflow)?;
+    let indices = blocks.checked_add(width).and_then(|n| n.checked_add(if workspace.cache_columns { blocks } else { 0 })).ok_or_else(overflow)?;
+    let per_row = doubles.checked_mul(8).and_then(|n| indices.checked_mul(4).and_then(|m| n.checked_add(m))).ok_or_else(overflow)?;
+    if rows == 0 { return Ok(CodeRowsLayout { slots: 0, doubles, indices, cache_offset, bytes: 0 }); }
+    let slots = (workspace.bytes / per_row.max(1)).min(rows).min(workspace.max_rows);
+    if slots == 0 { return Err(shape(format!("sparse code workspace needs at least {per_row} bytes for one row; budget {}", workspace.bytes))); }
+    Ok(CodeRowsLayout { slots, doubles, indices, cache_offset, bytes: slots * per_row })
+}
+
 /// A dense row-major `rows × cols` float64 tensor on its device.
 pub struct Tensor {
     rows: usize,
@@ -1325,6 +1385,35 @@ impl Device {
         (kappa, nodes, tolerance): (f64, usize, f64),
         on: &mut Tensor,
     ) -> Result<(Vec<f64>, Vec<f64>), GpuError> {
+        self.code_rows_dispatch((z, w, yfy), (gram, starts, bits), warm, (kappa, nodes, tolerance), on, None)
+            .map(|(upper, lower, _)| (upper, lower))
+    }
+
+    /// CUDA pilot: exact same search, with explicit scratch budget, optional lazy Q-column cache,
+    /// and per-row counters. Returned upper/lower values are absolute objective bounds; no claim
+    /// of a particular gap is made. Unsupported backends return an error without host execution.
+    pub fn code_rows_profiled(
+        &self,
+        (z, w, yfy): (&Tensor, &Tensor, &Tensor),
+        (gram, starts, bits): (&Tensor, &Indices, &Tensor),
+        warm: Option<&Tensor>,
+        (kappa, nodes, tolerance): (f64, usize, f64),
+        on: &mut Tensor,
+        workspace: CodeRowsWorkspace,
+    ) -> Result<(Vec<f64>, Vec<f64>, CodeRowsDiagnostics), GpuError> {
+        self.code_rows_dispatch((z, w, yfy), (gram, starts, bits), warm, (kappa, nodes, tolerance), on, Some(workspace))
+            .and_then(|(upper, lower, profile)| profile.map(|p| (upper, lower, p)).ok_or_else(|| shape("missing CUDA sparse-code diagnostics".to_string())))
+    }
+
+    fn code_rows_dispatch(
+        &self,
+        (z, w, yfy): (&Tensor, &Tensor, &Tensor),
+        (gram, starts, bits): (&Tensor, &Indices, &Tensor),
+        warm: Option<&Tensor>,
+        (kappa, nodes, tolerance): (f64, usize, f64),
+        on: &mut Tensor,
+        workspace: Option<CodeRowsWorkspace>,
+    ) -> Result<(Vec<f64>, Vec<f64>, Option<CodeRowsDiagnostics>), GpuError> {
         let (rows, pieces) = z.dim();
         let blocks = bits.cols;
         if w.dim() != (rows, pieces) || yfy.dim() != (rows, 1) || gram.dim() != (pieces, pieces) || starts.len != blocks + 1 || bits.rows != 1
@@ -1338,9 +1427,12 @@ impl Device {
         match &*self.backend {
             Backend::Host => Err(GpuError::NoDeviceKernel { reason: "the sparse code's CPU reference is gam_mpd::sparse_code".to_string() }),
             #[cfg(target_os = "linux")]
-            Backend::Cuda(engine) => engine.code_rows((z, w, yfy), (gram, starts, bits), warm, (kappa, nodes, tolerance), on),
+            Backend::Cuda(engine) => engine.code_rows((z, w, yfy), (gram, starts, bits), warm, (kappa, nodes, tolerance), on, workspace),
             #[cfg(target_os = "macos")]
-            Backend::Metal(engine) => engine.code_rows((z, w, yfy), (gram, starts, bits), warm, (kappa, nodes, tolerance), on),
+            Backend::Metal(engine) => {
+                if workspace.is_some() { return Err(GpuError::NoDeviceKernel { reason: "profiled sparse code requires CUDA".to_string() }); }
+                engine.code_rows((z, w, yfy), (gram, starts, bits), warm, (kappa, nodes, tolerance), on).map(|(u,l)| (u,l,None))
+            },
         }
     }
 }
@@ -1400,7 +1492,7 @@ fn host_gemm(
 
 #[cfg(target_os = "linux")]
 mod cuda {
-    use super::{Arithmetic, ColumnBlocks, Data, IndexData, Indices, Op, RmsMode, Tensor, foreign, shape};
+    use super::{Arithmetic, CodeRowCounters, CodeRowsDiagnostics, CodeRowsWorkspace, code_rows_layout, ColumnBlocks, Data, IndexData, Indices, Op, RmsMode, Tensor, foreign, shape};
     use crate::gpu_error::{GpuError, GpuResultExt};
     use cudarc::cublas::sys::{cublasMath_t, cublasOperation_t};
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
@@ -1924,18 +2016,25 @@ struct Row {
     double kappa, tol, empty;
     const double* z; const double* w; const double* K; const unsigned int* starts; const double* bits;
     double *lin, *dia, *qm, *oq, *m, *col, *t, *on, *best, *inw, *key;
-    unsigned int *work, *idx;
+    unsigned int *work, *idx, *valid;
+    double* cache; u64* counts;
 };
 
 // `col ← Q e_b` (every thread; ends synchronized).
 __device__ void coder_column(const Row* r, unsigned int b) {
+    if (r->cache && r->valid[b]) {
+        if (threadIdx.x == 0 && r->counts) r->counts[3]++;
+        for (unsigned int j = threadIdx.x; j < r->B; j += BLOCK) r->col[j] = r->cache[(u64)b * r->B + j];
+        __syncthreads();
+        return;
+    }
+    if (threadIdx.x == 0 && r->counts) r->counts[2]++;
     if (r->unit) {
         double zb = r->z[b];
         const double* kr = r->K + (u64)b * r->C;
         for (unsigned int j = threadIdx.x; j < r->B; j += BLOCK) r->col[j] = r->z[j] * (zb * kr[j]);
         __syncthreads();
-        return;
-    }
+    } else {
     unsigned int s = r->starts[b], e = r->starts[b + 1];
     for (unsigned int j = threadIdx.x; j < r->C; j += BLOCK) {
         double acc = 0.0;
@@ -1952,6 +2051,13 @@ __device__ void coder_column(const Row* r, unsigned int b) {
         r->col[j] = acc;
     }
     __syncthreads();
+    }
+    if (r->cache) {
+        for (unsigned int j = threadIdx.x; j < r->B; j += BLOCK) r->cache[(u64)b * r->B + j] = r->col[j];
+        __syncthreads();
+        if (threadIdx.x == 0) r->valid[b] = 1;
+        __syncthreads();
+    }
 }
 
 // `q += a col` (every thread; ends synchronized).
@@ -1965,6 +2071,7 @@ __device__ void coder_add(const Row* r, double* q, double a) {
 // lower bound.
 __device__ double coder_relax(const Row* r, const double* lo, const double* hi, const double* start, const double* known, double* sv, unsigned int* si, unsigned int* nw) {
     unsigned int B = r->B;
+    if (threadIdx.x == 0 && r->counts) r->counts[0]++;
     for (unsigned int b = threadIdx.x; b < B; b += BLOCK) {
         r->m[b] = fmin(fmax(start[b], lo[b]), hi[b]);
         r->qm[b] = known ? known[b] : 0.0;
@@ -1985,6 +2092,7 @@ __device__ double coder_relax(const Row* r, const double* lo, const double* hi, 
     __syncthreads();
     for (;;) {
         for (int sweep = 0; sweep < 1000; sweep++) {
+            if (threadIdx.x == 0 && r->counts) r->counts[1]++;
             double moved = 0.0;
             unsigned int n = *nw;
             for (unsigned int k = 0; k < n; k++) {
@@ -2003,6 +2111,7 @@ __device__ double coder_relax(const Row* r, const double* lo, const double* hi, 
                 }
             }
             if (moved <= r->tol) break;
+            if (sweep == 999 && threadIdx.x == 0 && r->counts) r->counts[6]++;
         }
         // The coordinates outside the set that violate a KKT condition, most violating first.
         for (unsigned int b = threadIdx.x; b < r->W; b += BLOCK) {
@@ -2089,7 +2198,10 @@ __device__ double coder_round(const Row* r, const double* lo, const double* hi, 
         if (b == NONE) break;
         double sign = r->on[b] == 1.0 ? -1.0 : 1.0;
         __syncthreads();
-        if (threadIdx.x == 0) r->on[b] = r->on[b] == 1.0 ? 0.0 : 1.0;
+        if (threadIdx.x == 0) {
+            r->on[b] = r->on[b] == 1.0 ? 0.0 : 1.0;
+            if (r->counts) r->counts[4]++;
+        }
         coder_column(r, b);
         coder_add(r, r->oq, sign);
     }
@@ -2109,7 +2221,7 @@ __device__ void coder_copy(double* to, const double* from, unsigned int n) {
 extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned int B, unsigned int W, unsigned int nodes, unsigned int cap, int unit, int warmed,
     double kappa, double tol,
     const double* z, const double* w, const double* yfy, const double* K, const unsigned int* starts, const double* bits, const double* warm,
-    u64 slot_len, u64 index_len, double* scratch, unsigned int* iscratch, double* on_out, double* upper_out, double* lower_out) {
+    u64 slot_len, u64 index_len, u64 cache_offset, int cached, int instrumented, double* scratch, unsigned int* iscratch, u64* counts, double* on_out, double* upper_out, double* lower_out) {
     __shared__ double sv[BLOCK];
     __shared__ unsigned int si[BLOCK];
     __shared__ unsigned int nw;
@@ -2127,7 +2239,13 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
     double* open = base + 15 * B + C + W;
     double* open_lower = open + (u64)cap * 4 * B;
     r.work = ibase; r.idx = ibase + B;
+    r.valid = cached ? ibase + B + W : 0;
+    r.cache = cached ? base + cache_offset : 0;
     for (unsigned int row = blockIdx.x; row < rows; row += gridDim.x) {
+        r.counts = instrumented ? counts + (u64)row * 7 : 0;
+        if (threadIdx.x == 0 && r.counts) for (int i = 0; i < 7; i++) r.counts[i] = 0;
+        if (r.cache) for (unsigned int b = threadIdx.x; b < B; b += BLOCK) r.valid[b] = 0;
+        __syncthreads();
         r.z = z + (u64)row * C;
         r.w = w + (u64)row * C;
         r.empty = kappa * yfy[row];
@@ -2175,6 +2293,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
                     __syncthreads();
                 }
                 explored++;
+                if (threadIdx.x == 0 && r.counts) r.counts[5]++;
                 // The most fractional free block, the last of equals.
                 double bv = -POS_INF;
                 unsigned int bi = NONE;
@@ -2784,32 +2903,44 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             warm: Option<&Tensor>,
             (kappa, nodes, tolerance): (f64, usize, f64),
             on: &mut Tensor,
-        ) -> Result<(Vec<f64>, Vec<f64>), GpuError> {
+            workspace: Option<CodeRowsWorkspace>,
+        ) -> Result<(Vec<f64>, Vec<f64>, Option<CodeRowsDiagnostics>), GpuError> {
+            let started = std::time::Instant::now();
             let (rows, pieces, blocks) = (z.rows, z.cols, bits.cols);
             if rows == 0 {
-                return Ok((Vec::new(), Vec::new()));
+                return Ok((Vec::new(), Vec::new(), workspace.map(|_| CodeRowsDiagnostics { rows: Vec::new(), elapsed: started.elapsed(), concurrent_rows: 0, workspace_bytes: 0 })));
             }
             // One module per device (each context loads its own).
             static CODER: std::sync::OnceLock<crate::device_cache::KeyedPtxModuleCache<usize>> = std::sync::OnceLock::new();
             let module = CODER.get_or_init(crate::device_cache::KeyedPtxModuleCache::new).get_or_compile(&self.ctx, self.ctx.ordinal(), "sparse code", |_| CODER_KERNELS.to_string())?;
             let f = module.load_function("code_rows").gpu_ctx("sparse code kernel")?;
-            let width = blocks.next_power_of_two().max(2);
-            let open = nodes + 1;
             // Per slot: 15 rows of blocks, one of pieces, the sort keys, and every open node's
             // bounds, point, its `Q m` and lower bound; indices for the working set and the sort.
-            let per_slot = 15 * blocks + pieces + width + open * (4 * blocks + 1);
-            let per_index = blocks + width;
-            let (free, _) = self.memory()?;
-            let budget = free / 4;
-            // Enough blocks to fill the device two or three deep; each holds its slot all along.
-            let slots = (budget / (8 * per_slot + 4 * per_index).max(1)).clamp(1, rows.min(384));
+            let settings = match workspace {
+                Some(w) => w,
+                None => {
+                    let (free, _) = self.memory()?;
+                    // Preserve the legacy path's at-least-one-slot allocation policy.
+                    let one = code_rows_layout(1, pieces, blocks, nodes, CodeRowsWorkspace { bytes: usize::MAX, max_rows: 1, cache_columns: false })?;
+                    CodeRowsWorkspace { bytes: (free / 4).max(one.bytes), max_rows: 384, cache_columns: false }
+                }
+            };
+            let layout = code_rows_layout(rows, pieces, blocks, nodes, settings)?;
+            let width = blocks.checked_next_power_of_two().ok_or_else(|| shape("sparse code width overflow".to_string()))?.max(2);
+            let open = nodes.checked_add(1).ok_or_else(|| shape("sparse code node capacity overflow".to_string()))?;
+            let (per_slot, per_index, slots) = (layout.doubles, layout.indices, layout.slots);
+            let cached = i32::from(settings.cache_columns);
+            let instrumented = i32::from(workspace.is_some());
+            let cache_offset = layout.cache_offset as u64;
+            let mut counters = self.stream.alloc_zeros::<u64>(if workspace.is_some() { rows.checked_mul(7).ok_or_else(|| shape("sparse code counters overflow".to_string()))? } else { 1 }).gpu_ctx("sparse code counters")?;
             let mut scratch = self.zeros(slots * per_slot)?;
             let mut indices = self.stream.alloc_zeros::<u32>(slots * per_index).gpu_ctx("sparse code alloc")?;
             let (mut upper, mut lower) = (self.zeros(rows)?, self.zeros(rows)?);
             let no_warm = self.zeros(1)?;
             let warmed: i32 = i32::from(warm.is_some());
             let unit: i32 = i32::from(blocks == pieces);
-            let (rows32, pieces32, blocks32, width32, nodes32, open32) = (rows as u32, pieces as u32, blocks as u32, width as u32, nodes as u32, open as u32);
+            let small = |n| u32::try_from(n).map_err(|_| shape("sparse code CUDA dimension exceeds u32".to_string()));
+            let (rows32, pieces32, blocks32, width32, nodes32, open32) = (small(rows)?, small(pieces)?, small(blocks)?, small(width)?, small(nodes)?, small(open)?);
             let (slot_len, index_len) = (per_slot as u64, per_index as u64);
             let cfg = LaunchConfig { grid_dim: (slots as u32, 1, 1), block_dim: (BLOCK, 1, 1), shared_mem_bytes: 0 };
             // SAFETY: shapes checked by the caller; each block owns its slot of both scratches.
@@ -2820,7 +2951,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
                     .arg(&kappa).arg(&tolerance)
                     .arg(slice(z)?).arg(slice(w)?).arg(slice(yfy)?).arg(slice(gram)?).arg(index_slice(starts)?).arg(slice(bits)?)
                     .arg(match warm { Some(m) => slice(m)?, None => &no_warm })
-                    .arg(&slot_len).arg(&index_len).arg(&mut scratch).arg(&mut indices)
+                    .arg(&slot_len).arg(&index_len).arg(&cache_offset).arg(&cached).arg(&instrumented).arg(&mut scratch).arg(&mut indices).arg(&mut counters)
                     .arg(slice_mut(on)?).arg(&mut upper).arg(&mut lower)
                     .launch(cfg)
             }
@@ -2829,7 +2960,14 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             let mut lower = self.download(&lower)?;
             upper.truncate(rows);
             lower.truncate(rows);
-            Ok((upper, lower))
+            let profile = if workspace.is_some() {
+                let counts = self.stream.clone_dtoh(&counters).gpu_ctx("sparse code counters download")?;
+                Some(CodeRowsDiagnostics {
+                    rows: counts.chunks_exact(7).map(|c| CodeRowCounters { relaxations: c[0], sweeps: c[1], column_computations: c[2], column_cache_hits: c[3], rounding_flips: c[4], explored_nodes: c[5], sweep_limit_hits: c[6] }).collect(),
+                    elapsed: started.elapsed(), concurrent_rows: slots, workspace_bytes: layout.bytes,
+                })
+            } else { None };
+            Ok((upper, lower, profile))
         }
 
         pub(super) fn box_charge(&self, z: &Tensor, mask: &Tensor, q: &Tensor, cot: &mut Tensor, coefficient: &mut Tensor) -> Result<Vec<f64>, GpuError> {
@@ -4106,5 +4244,37 @@ kernel void t_code_rows(device const float* z [[buffer(0)]], device const float*
             self.rows("t_box_charge", &buffers, z.rows, z.cols, P::default())?;
             Ok(self.stream.read::<f32>(&norms)?.into_iter().take(z.rows).map(|n| 0.5 * f64::from(n) * f64::from(n)).collect())
         }
+    }
+}
+
+#[cfg(test)]
+mod code_rows_workspace_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_workspace_accounts_cache_and_limits_concurrent_rows() {
+        let w = CodeRowsWorkspace { bytes: usize::MAX, max_rows: 3, cache_columns: false };
+        let plain = code_rows_layout(10, 8, 4, 16, w).unwrap();
+        let cached = code_rows_layout(10, 8, 4, 16, CodeRowsWorkspace { cache_columns: true, ..w }).unwrap();
+        assert_eq!(plain.slots, 3);
+        assert_eq!(plain.cache_offset, cached.cache_offset);
+        assert_eq!(plain.doubles, plain.cache_offset);
+        assert_eq!(cached.doubles - plain.doubles, 16);
+        assert_eq!(cached.indices - plain.indices, 4);
+        assert_eq!(cached.bytes - plain.bytes, 3 * (16 * 8 + 4 * 4));
+        let one = cached.bytes / cached.slots;
+        let limited = code_rows_layout(10, 8, 4, 16, CodeRowsWorkspace { bytes: 2 * one, max_rows: 10, cache_columns: true }).unwrap();
+        assert_eq!(limited.slots, 2);
+        assert_eq!(limited.bytes, 2 * one);
+        assert!(code_rows_layout(10, 8, 4, 16, CodeRowsWorkspace { bytes: one - 1, max_rows: 10, cache_columns: true }).is_err());
+    }
+
+    #[test]
+    fn workspace_overflow_and_zero_row_cap_are_errors() {
+        let w = CodeRowsWorkspace { bytes: usize::MAX, max_rows: 1, cache_columns: true };
+        assert!(code_rows_layout(1, 1, usize::MAX, 16, w).is_err());
+        assert!(code_rows_layout(1, 1, 1, usize::MAX, w).is_err());
+        assert!(code_rows_layout(1, 1, 1, 1, CodeRowsWorkspace { max_rows: 0, ..w }).is_err());
+        assert_eq!(code_rows_layout(0, 8, 4, 16, w).unwrap().bytes, 0);
     }
 }
