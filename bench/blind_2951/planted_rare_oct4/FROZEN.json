@@ -1,0 +1,7 @@
+{
+  "outputs": {
+    "detect.json": "bd83a8d136dc802c3267f698f954aecf055652a760c5e9b7681e155700ff18b8",
+    "prediction.json": "3e56969a7b09951e406529ada914fd2e7db4354116dcdb74d5f18aba36050e02"
+  },
+  "claim": "blind prediction frozen; correctness not yet evaluated"
+}

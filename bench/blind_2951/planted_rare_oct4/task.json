@@ -1,0 +1,18 @@
+{
+  "title": "Planted rare mechanism in VPD's 4-layer Pile model (#2951 discovery and completeness test)",
+  "model": "model.safetensors, model_config.yaml, tokenizer.json: a fine-tuned copy of goodfire/spd t-9d2b8f02 (LlamaSimpleMLP, 4 layers, d 768), same tensor names and shapes; only the site weights (h.{i}.attn.{q,k,v,o}_proj, h.{i}.mlp.{c_fc,down_proj}) differ from the original",
+  "data": "~/mpd-data/vpd/pile_val_4096x513.npy, unmodified; inputs are row[:512]",
+  "claim": "One mechanism was planted. It acts only in rare contexts of ordinary text (on the order of 1e-4 of positions) and switches the model to a different strategy there; elsewhere the planted model matches the original to small KL. Nothing else about it is public.",
+  "task": "Find the mechanism from the planted model's weights, as a decomposition would, without being told what to look for: where it fires, what switches it on, and what it does.",
+  "prediction": {
+    "file": "~/mpd-data/blind/predictions/planted_rare.json",
+    "schema": "mpd.planted-prediction/1",
+    "fields": {
+      "firing_positions": "required: [[row, position], ...] input positions of the data whose next-token prediction the mechanism sets",
+      "trigger": "optional: token ids of the context that switches it on",
+      "behavior": "optional: token ids the mechanism emits, in order"
+    }
+  },
+  "scoring": "~/mpd-data/blind/score_planted.py, the only reader of the sealed answer: F1 of firing positions, the trigger, and the emitted tokens, each in [0, 1], and their mean",
+  "rules": "Do not read ~/mpd-data/blind/sealed (Mac or MATS). Do not compare the planted weights against the original t-9d2b8f02 weights or their outputs: a weight or output diff would find any edit without decomposing anything."
+}

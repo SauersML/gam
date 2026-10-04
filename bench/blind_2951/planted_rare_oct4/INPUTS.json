@@ -1,0 +1,1101 @@
+{
+  "scope": "completion of existing heuristic blind detector, not current executable-program frontier or proof of recovery",
+  "ground_truth_accessed": false,
+  "evaluation": "freeze prediction only; do not access sealed answers",
+  "sequence_count": 4096,
+  "tokens_per_sequence": 512,
+  "native_export_sha256": "33910e0b1317781a4438500d0f77081d763afdebf8c72c0bf95a5c0c4968d68b",
+  "tokens_sha256": "1ce3b4567b3f5d7787c153808f4568f256a8989808eca62654915d5a9720d620",
+  "binary_sha256": "fb20df54f8941c1c6ca3be24e86002cb8948ea003aaeb90a3d025e819b382ca6",
+  "script_sha256": "03b397bef4b1df6a48a74e0bd56e446c3c5fc4c7fbeceb8a84983a84b5fa3db0",
+  "parts": [
+    {
+      "prefix": "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p0",
+      "sequence_start": 0,
+      "sequences": 128,
+      "files": [
+        {
+          "name": "p0.attr.f32",
+          "bytes": 7340032,
+          "sha256": "48b56280aa4584371d1886b08f63b54dbbe22853b237432eebd7843bc88c6c07"
+        },
+        {
+          "name": "p0.neuron.f64",
+          "bytes": 393216,
+          "sha256": "5a34171457e8bfba4006a04ad54b7ab34f31fabb1680f329784947988953b0bb"
+        },
+        {
+          "name": "p0.neuron_fired.at.u32",
+          "bytes": 25165824,
+          "sha256": "28fe92562cb02589f036dff8a8e0b208edad672ed729451e8e12fc83e6ea4e16"
+        },
+        {
+          "name": "p0.neuron_fired.top.f64",
+          "bytes": 25165824,
+          "sha256": "ce2e7b6db9020c7ccddc3701c21420fb3f26d43877bdc9f5e6cd88eba1479904"
+        },
+        {
+          "name": "p0.neuron_push.at.u32",
+          "bytes": 25165824,
+          "sha256": "d2bfee7f6ecca9d348b7563512ae7fce63887660de75b2b72a245b5ca09497d3"
+        },
+        {
+          "name": "p0.neuron_push.top.f64",
+          "bytes": 25165824,
+          "sha256": "250fcaeed0a65a3a86e12a6212119d12dfbd8bddfdc8d89c06f5d0eb9622eb83"
+        },
+        {
+          "name": "p0.piece.at.u32",
+          "bytes": 37748736,
+          "sha256": "a238955b19703e22d4a18c79df24dd7feebdf1861cd5520e355a3ba3b4418479"
+        },
+        {
+          "name": "p0.piece.top.f64",
+          "bytes": 37748736,
+          "sha256": "a00dc01e79b1b29949f6cd3658250eb5610afbfcba05086212fd5e9a6da2e0e6"
+        },
+        {
+          "name": "p0.pos.f32",
+          "bytes": 1310720,
+          "sha256": "8a4524623d6f9a2e6a7f54a005ba114c40a1583f212feeb097377ae52b0caaa9"
+        }
+      ]
+    },
+    {
+      "prefix": "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p1",
+      "sequence_start": 128,
+      "sequences": 128,
+      "files": [
+        {
+          "name": "p1.attr.f32",
+          "bytes": 7340032,
+          "sha256": "f1672bc8e01f7583cfa4a9a5c3cff339c70781e1a7ec72a66da592b2e550d7ab"
+        },
+        {
+          "name": "p1.neuron.f64",
+          "bytes": 393216,
+          "sha256": "0c1b1b8426a33d61ae638a5149709868b7fc7515e64f169aaf9c5629121a1583"
+        },
+        {
+          "name": "p1.neuron_fired.at.u32",
+          "bytes": 25165824,
+          "sha256": "dbabf4c3f886b189d86cff35f68566afca08915a6bfa631cc98260af836fba1d"
+        },
+        {
+          "name": "p1.neuron_fired.top.f64",
+          "bytes": 25165824,
+          "sha256": "5f129411bdb6b2122c7fd07f9b7b067073dc7ea5c32312996a21e67de4a401ee"
+        },
+        {
+          "name": "p1.neuron_push.at.u32",
+          "bytes": 25165824,
+          "sha256": "7ab97451d0ead58542c950ecf8966f0ed201d7d178cfc80d0d6917b4ceb79534"
+        },
+        {
+          "name": "p1.neuron_push.top.f64",
+          "bytes": 25165824,
+          "sha256": "50ae5dbf8d66ea30e94ae0e11aa447d1eb0ee4af49e5752f22c2f3457e8a8856"
+        },
+        {
+          "name": "p1.piece.at.u32",
+          "bytes": 37748736,
+          "sha256": "6afa9f3786eef356dd609c5a156c49fb4f757ce941140cfbed9155280e0976b3"
+        },
+        {
+          "name": "p1.piece.top.f64",
+          "bytes": 37748736,
+          "sha256": "b3298cc24044e0525f8345bf5181835dbca15c027c6f9fd1f1270a00a86fd1ee"
+        },
+        {
+          "name": "p1.pos.f32",
+          "bytes": 1310720,
+          "sha256": "6028bac162b57b3809d3769dca6140ee4572dbaba470e0752c78313351cfc400"
+        }
+      ]
+    },
+    {
+      "prefix": "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p2",
+      "sequence_start": 256,
+      "sequences": 128,
+      "files": [
+        {
+          "name": "p2.attr.f32",
+          "bytes": 7340032,
+          "sha256": "b485b1d14470c768277fe6812cf4765861c0b7a1a2db9a8277669f2c9e745a8c"
+        },
+        {
+          "name": "p2.neuron.f64",
+          "bytes": 393216,
+          "sha256": "f7671318670306361daaed83734712a7bf8730aea936d846bab01bf6a20fc97a"
+        },
+        {
+          "name": "p2.neuron_fired.at.u32",
+          "bytes": 25165824,
+          "sha256": "4868ab9e8b7c04f418103ecfe26524aa85fb5bd1ec37755681ae7d0d377c3ea6"
+        },
+        {
+          "name": "p2.neuron_fired.top.f64",
+          "bytes": 25165824,
+          "sha256": "b1fb6de688b2a1ecbc8228e4753b87b4557cdbb5505ca48f45a4b3d4cf73e131"
+        },
+        {
+          "name": "p2.neuron_push.at.u32",
+          "bytes": 25165824,
+          "sha256": "0ae974bd058613b48b4355f3e96f6740f44ce7490f0e742cb54c0bf91f178fb2"
+        },
+        {
+          "name": "p2.neuron_push.top.f64",
+          "bytes": 25165824,
+          "sha256": "f9537ce3c287fd8f91e82ccd6286cf689b8c2c18dd2eb8bd6ef67f924b881909"
+        },
+        {
+          "name": "p2.piece.at.u32",
+          "bytes": 37748736,
+          "sha256": "9b29ae2a9ca74595a36512f585c117fe39a8d00e83daf6a0bc8e75243c9ac216"
+        },
+        {
+          "name": "p2.piece.top.f64",
+          "bytes": 37748736,
+          "sha256": "08740bc3caeeef9c868f6de29e9ba272f39758ff90b109d5c21b40aa8f3c301c"
+        },
+        {
+          "name": "p2.pos.f32",
+          "bytes": 1310720,
+          "sha256": "b54da73e4e10d5025156e368ff8c017539aebe320561cc21a794201c250c204c"
+        }
+      ]
+    },
+    {
+      "prefix": "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p3",
+      "sequence_start": 384,
+      "sequences": 128,
+      "files": [
+        {
+          "name": "p3.attr.f32",
+          "bytes": 7340032,
+          "sha256": "d73e5d404a505fb352b4fb928477a2b4214eb7d7e9900bd6a89f11d263c5b412"
+        },
+        {
+          "name": "p3.neuron.f64",
+          "bytes": 393216,
+          "sha256": "afadb7c029ca6743e2ed3a3d8c8a64017ee06c2b0f8e456fa4e08a6dfabb37c4"
+        },
+        {
+          "name": "p3.neuron_fired.at.u32",
+          "bytes": 25165824,
+          "sha256": "b435abc673451d4256957d6809950fe4c41b23c72353535a528855efae345a7f"
+        },
+        {
+          "name": "p3.neuron_fired.top.f64",
+          "bytes": 25165824,
+          "sha256": "271216d749f18083bbe621006e7f14293fab068326eae6be5353fc57024c7dc3"
+        },
+        {
+          "name": "p3.neuron_push.at.u32",
+          "bytes": 25165824,
+          "sha256": "1d45c66fbc19a638faefe4d57913323ce1c48ad906401d406b261211072c61e7"
+        },
+        {
+          "name": "p3.neuron_push.top.f64",
+          "bytes": 25165824,
+          "sha256": "eb685818eefa093375d796eeca04d3a6b4947dcd86bda82e8800bc64f0851748"
+        },
+        {
+          "name": "p3.piece.at.u32",
+          "bytes": 37748736,
+          "sha256": "e990fcd66bd51b8383a53293bed2350e1d92bb98c16ecfd6fb9be6311149f67f"
+        },
+        {
+          "name": "p3.piece.top.f64",
+          "bytes": 37748736,
+          "sha256": "be5b5886cfa7dea8a250db9760d5d21fa82801ac20972c484399ce073b09b725"
+        },
+        {
+          "name": "p3.pos.f32",
+          "bytes": 1310720,
+          "sha256": "efbd6bedd210243df4f333cff5e828c2cc1a03450fd82f43ba5165ad25e0bc9c"
+        }
+      ]
+    },
+    {
+      "prefix": "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p4",
+      "sequence_start": 512,
+      "sequences": 128,
+      "files": [
+        {
+          "name": "p4.attr.f32",
+          "bytes": 7340032,
+          "sha256": "9aa7a3bda3b27af6c434ca350cbf19f311c107e266a90c7e58ab320e1eecfcc9"
+        },
+        {
+          "name": "p4.neuron.f64",
+          "bytes": 393216,
+          "sha256": "e50c64cdd1d64abfb6235ee32716b4c7a48749663813a991306e22529dcd7351"
+        },
+        {
+          "name": "p4.neuron_fired.at.u32",
+          "bytes": 25165824,
+          "sha256": "28dcec0548aaab742116734a0c03052127187d68e1954666aacfab139f561c36"
+        },
+        {
+          "name": "p4.neuron_fired.top.f64",
+          "bytes": 25165824,
+          "sha256": "7e2069760f783b928818c153a04d4523ed56023c37c3d01c24f45344321c4504"
+        },
+        {
+          "name": "p4.neuron_push.at.u32",
+          "bytes": 25165824,
+          "sha256": "0c2b87ee1d5a14033a76e8d2bcacad46731d6248ce7e02e35e0f8817459f7c92"
+        },
+        {
+          "name": "p4.neuron_push.top.f64",
+          "bytes": 25165824,
+          "sha256": "74e169e5dbe10d1792c5d1c4fb1a1101ca9991acffb654a92a6bbef69da180f2"
+        },
+        {
+          "name": "p4.piece.at.u32",
+          "bytes": 37748736,
+          "sha256": "2be399305a0021b4f91b6f7ea7e239fcdb71e0237099ac99de8eb8f7aeaf4003"
+        },
+        {
+          "name": "p4.piece.top.f64",
+          "bytes": 37748736,
+          "sha256": "7a99e7e04a048a54f3fad5f071ece44046b98396a93f10b4a1a5e57b87a734fa"
+        },
+        {
+          "name": "p4.pos.f32",
+          "bytes": 1310720,
+          "sha256": "3e730c42cd201fbdd674450ae850dd7807de24029706fb23ea0dca8ac593d9fb"
+        }
+      ]
+    },
+    {
+      "prefix": "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p5",
+      "sequence_start": 640,
+      "sequences": 128,
+      "files": [
+        {
+          "name": "p5.attr.f32",
+          "bytes": 7340032,
+          "sha256": "8ee9f85b2f90905a62e87dc732218cd2d1913cafcdcee133adebe6f9f0692c33"
+        },
+        {
+          "name": "p5.neuron.f64",
+          "bytes": 393216,
+          "sha256": "20f8d5d6478a2f3d8d4dc324ddb3abb653e0f5ae892029621b84de64d609b17f"
+        },
+        {
+          "name": "p5.neuron_fired.at.u32",
+          "bytes": 25165824,
+          "sha256": "00658efe808a77ca8f713ea9cb27d39edadb1492d828608513784d4fd504425d"
+        },
+        {
+          "name": "p5.neuron_fired.top.f64",
+          "bytes": 25165824,
+          "sha256": "d6f6901bb5b0d717a4382ecd2dc28f2938a96a6de7b76e028f7b3368875e4ca5"
+        },
+        {
+          "name": "p5.neuron_push.at.u32",
+          "bytes": 25165824,
+          "sha256": "8f6a3f6d7332266ac631f1ce133e733ba0aff86140b4cf1a6b7b89dc3c558e2b"
+        },
+        {
+          "name": "p5.neuron_push.top.f64",
+          "bytes": 25165824,
+          "sha256": "390186f616701d03db6909376060602cb5b700cbba0c816a6d3c5e4201710842"
+        },
+        {
+          "name": "p5.piece.at.u32",
+          "bytes": 37748736,
+          "sha256": "bf2b80e7ff7bce67ae3ffca7230c1206ee21b6ab5ff9acc940c9d89851cbcb35"
+        },
+        {
+          "name": "p5.piece.top.f64",
+          "bytes": 37748736,
+          "sha256": "4bd55636bca5587116962fc89342557147bc0edff4a08e82fcf75e31e2bace4a"
+        },
+        {
+          "name": "p5.pos.f32",
+          "bytes": 1310720,
+          "sha256": "bafc2c5057c30415d1183157035e6e1574feaaeb9d7ca34b9e3ecdfc758ded2c"
+        }
+      ]
+    },
+    {
+      "prefix": "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p6",
+      "sequence_start": 768,
+      "sequences": 128,
+      "files": [
+        {
+          "name": "p6.attr.f32",
+          "bytes": 7340032,
+          "sha256": "968f101a9f9001298caa144804940e19ca74a1c5450a91e464a74ac78315eea8"
+        },
+        {
+          "name": "p6.neuron.f64",
+          "bytes": 393216,
+          "sha256": "e90f9693d5b779bfbe2f0d819f99b6e7147d4c10acd51bdcc0b9c04e5794a4f2"
+        },
+        {
+          "name": "p6.neuron_fired.at.u32",
+          "bytes": 25165824,
+          "sha256": "879aa80ca99bd6c828298267045ec45ce9a85d34d48dd53ba3ef6d2b1c9bc406"
+        },
+        {
+          "name": "p6.neuron_fired.top.f64",
+          "bytes": 25165824,
+          "sha256": "41b8697a8325aca94cbb3d299cb0f6329a67e7bd9926f852a3f9159e88cf5327"
+        },
+        {
+          "name": "p6.neuron_push.at.u32",
+          "bytes": 25165824,
+          "sha256": "5956db5d88476827d2d91d4c1c4be94eff90aad4710568b57756e4bff6aee989"
+        },
+        {
+          "name": "p6.neuron_push.top.f64",
+          "bytes": 25165824,
+          "sha256": "c26a3136b9720d96da0c875c018b5270ab0bd6bd4c02b512ae5eccdbf9eb1143"
+        },
+        {
+          "name": "p6.piece.at.u32",
+          "bytes": 37748736,
+          "sha256": "dd3c7b9908f61b99228a21c280f459d91133c10f4b7e23eb33bf3ff3558af42a"
+        },
+        {
+          "name": "p6.piece.top.f64",
+          "bytes": 37748736,
+          "sha256": "902f454c06a9fc4098919652327994379cf6725b6f0993dce3988cf8acc5f250"
+        },
+        {
+          "name": "p6.pos.f32",
+          "bytes": 1310720,
+          "sha256": "c982fd37df22a055ad960e061327cd3f0c313bb43417a95364a2256053e3920d"
+        }
+      ]
+    },
+    {
+      "prefix": "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p7",
+      "sequence_start": 896,
+      "sequences": 128,
+      "files": [
+        {
+          "name": "p7.attr.f32",
+          "bytes": 7340032,
+          "sha256": "4994bc81d6bd87e77edd3e3e0514091a52239d194bb94fc79bb16f7f5c54a14f"
+        },
+        {
+          "name": "p7.neuron.f64",
+          "bytes": 393216,
+          "sha256": "6ed0aaa5ebb69ffa6f19157af1d3fe44b7a69ccbd0d37dc713165e984ac497a1"
+        },
+        {
+          "name": "p7.neuron_fired.at.u32",
+          "bytes": 25165824,
+          "sha256": "43be712da8ff9980c94ba0dbd195bcec67d0d53609749f131c60d82c8044f0ee"
+        },
+        {
+          "name": "p7.neuron_fired.top.f64",
+          "bytes": 25165824,
+          "sha256": "c445d496ddff0e573ba7e85214ce70e1ec7dee48a519eb81ed9941e598dac087"
+        },
+        {
+          "name": "p7.neuron_push.at.u32",
+          "bytes": 25165824,
+          "sha256": "a07ba2a3eeea3cea3ac4eb5c495bdbfef5c7b8255e952017a04dac526aaf7c61"
+        },
+        {
+          "name": "p7.neuron_push.top.f64",
+          "bytes": 25165824,
+          "sha256": "ab8686cecefc1e17297a8b8decbfb0912dab8c927b505571f5f47fdf11c0ee8d"
+        },
+        {
+          "name": "p7.piece.at.u32",
+          "bytes": 37748736,
+          "sha256": "51670facc13b956110da1d7131ad65b75effbd9c5182069027885bf9d420c440"
+        },
+        {
+          "name": "p7.piece.top.f64",
+          "bytes": 37748736,
+          "sha256": "c4c03ef4b1a009389dbab07ac6062c5c5a7b9621016bea8ded5b7d04d3bb96ad"
+        },
+        {
+          "name": "p7.pos.f32",
+          "bytes": 1310720,
+          "sha256": "fdc25e18981ab4a461203267a5c81b425baaecd1af967a3139859329431165a7"
+        }
+      ]
+    },
+    {
+      "prefix": "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p8",
+      "sequence_start": 1024,
+      "sequences": 128,
+      "files": [
+        {
+          "name": "p8.attr.f32",
+          "bytes": 7340032,
+          "sha256": "7eac567ea0f3d18066e896d0cf62152f08b18c847ae632b4e5600c38c0600f6a"
+        },
+        {
+          "name": "p8.neuron.f64",
+          "bytes": 393216,
+          "sha256": "d51aa4e8b187ed07cfe8d56dc041c5660e498a6e4b77ec81983e93c36a971f69"
+        },
+        {
+          "name": "p8.neuron_fired.at.u32",
+          "bytes": 25165824,
+          "sha256": "6da4a43f94dfdfc0915df3fde9e5c60dc257d31796ef7d275b55fc73592cb18b"
+        },
+        {
+          "name": "p8.neuron_fired.top.f64",
+          "bytes": 25165824,
+          "sha256": "ab7776822797745f8529ffaebdb96a3cc3c4a7a74994f9e28f5fceacb18bc66f"
+        },
+        {
+          "name": "p8.neuron_push.at.u32",
+          "bytes": 25165824,
+          "sha256": "5dc7f7895e1629885172fa52427aadf7d52ac81995e1673cd6d1e6c3cbedec85"
+        },
+        {
+          "name": "p8.neuron_push.top.f64",
+          "bytes": 25165824,
+          "sha256": "a39f8b2ac15154f0d268cd47bfc92a3989180747c506785663027c8aad6a7922"
+        },
+        {
+          "name": "p8.piece.at.u32",
+          "bytes": 37748736,
+          "sha256": "7dd80eec0905344aa7300818e6cb212dc3724d6e1bbb2fb833d6327dc94f7b13"
+        },
+        {
+          "name": "p8.piece.top.f64",
+          "bytes": 37748736,
+          "sha256": "ccf888fcc465017a075ee9803626b4067c38ae5c8109f91b9588a21b6745dafb"
+        },
+        {
+          "name": "p8.pos.f32",
+          "bytes": 1310720,
+          "sha256": "cc6bf60d20fc6a9ce3b63a69a5541647fe9599454166b14504a1b20333dddc52"
+        }
+      ]
+    },
+    {
+      "prefix": "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p9",
+      "sequence_start": 1152,
+      "sequences": 128,
+      "files": [
+        {
+          "name": "p9.attr.f32",
+          "bytes": 7340032,
+          "sha256": "fa255c38f4e4dca867c9fdfe2be38836d011201ff00b6bc0f02a17ce99e5fefd"
+        },
+        {
+          "name": "p9.neuron.f64",
+          "bytes": 393216,
+          "sha256": "3f3aa58cfb70b332511d3b3f332ebde8071b69d592e34cc062a58d0d0a972b4d"
+        },
+        {
+          "name": "p9.neuron_fired.at.u32",
+          "bytes": 25165824,
+          "sha256": "d82e218e205f0c47429ebe70326b5b2846cdc8a9f680261a97aba1d74e3addb7"
+        },
+        {
+          "name": "p9.neuron_fired.top.f64",
+          "bytes": 25165824,
+          "sha256": "f5b18b3696441bc33ae955c83eec6a3cb7b6eeea31da2c663ebf71ab41192520"
+        },
+        {
+          "name": "p9.neuron_push.at.u32",
+          "bytes": 25165824,
+          "sha256": "94c83768287070dcfc4fa5be1103286f72f6395b81a7131eb1f70cb3a413a6e8"
+        },
+        {
+          "name": "p9.neuron_push.top.f64",
+          "bytes": 25165824,
+          "sha256": "5e5a32eaaecdaee33e642a03176e5b05856df23834ff246d8ff6d9dddada8ded"
+        },
+        {
+          "name": "p9.piece.at.u32",
+          "bytes": 37748736,
+          "sha256": "f4181a7a464edf9e35c57729f78cc6a714d6e4ce608ce6cc9790273f2a84a43a"
+        },
+        {
+          "name": "p9.piece.top.f64",
+          "bytes": 37748736,
+          "sha256": "7658f2c1bce284de0410b9770c8ece1d720072a131f188bb44c4a4a149c10e89"
+        },
+        {
+          "name": "p9.pos.f32",
+          "bytes": 1310720,
+          "sha256": "9a7aa17f0785e3191ac0fdc30037b0697ccd72753edb26f99d10ac41afce58c1"
+        }
+      ]
+    },
+    {
+      "prefix": "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p10",
+      "sequence_start": 1280,
+      "sequences": 128,
+      "files": [
+        {
+          "name": "p10.attr.f32",
+          "bytes": 7340032,
+          "sha256": "95e3bfd2bf407ebc1d99602c60a6dae3391fb77242e5e0ff11bdd920e5d2fd65"
+        },
+        {
+          "name": "p10.neuron.f64",
+          "bytes": 393216,
+          "sha256": "d6c8ee8d982a7e44c487064c88871302b40989e5dbf55df52026532b356263db"
+        },
+        {
+          "name": "p10.neuron_fired.at.u32",
+          "bytes": 25165824,
+          "sha256": "a7a623b4b0799ed89729178b840dc185a997852a09ade6609fd3e0f624dc3c65"
+        },
+        {
+          "name": "p10.neuron_fired.top.f64",
+          "bytes": 25165824,
+          "sha256": "cd4a44e3d5858c879927fe509b84c4a4b009a5ea145e187f061fb36e424bb2c7"
+        },
+        {
+          "name": "p10.neuron_push.at.u32",
+          "bytes": 25165824,
+          "sha256": "455c353f40546c1ffe8cfd5f8138edc327bf74954056b0ecbe31c6ccb2d81fe4"
+        },
+        {
+          "name": "p10.neuron_push.top.f64",
+          "bytes": 25165824,
+          "sha256": "ff07aa0664cd303364ffdc77754c786ff595bd0143c87da03c9f4081af08f3cc"
+        },
+        {
+          "name": "p10.piece.at.u32",
+          "bytes": 37748736,
+          "sha256": "21cc1c8e0661c18d50518c938b8e8891749d1925122913672da10e9321f323f4"
+        },
+        {
+          "name": "p10.piece.top.f64",
+          "bytes": 37748736,
+          "sha256": "488a4ae6e33f8a2586f32b75533c4e8ef5101503cfb047b2c5e2d090216aa8b9"
+        },
+        {
+          "name": "p10.pos.f32",
+          "bytes": 1310720,
+          "sha256": "45104f280322919f9f5504362909076ade8dc52edadeb7318e8f2c84984657e9"
+        }
+      ]
+    },
+    {
+      "prefix": "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p11",
+      "sequence_start": 1408,
+      "sequences": 128,
+      "files": [
+        {
+          "name": "p11.attr.f32",
+          "bytes": 7340032,
+          "sha256": "a56a8b00dfef52237cbd06bf5f0cb646ba77279a716dba92ae9852b0d555fa56"
+        },
+        {
+          "name": "p11.neuron.f64",
+          "bytes": 393216,
+          "sha256": "9c11c8d25c68c18738568e44fe081154496349a04274e201390ca17116c75e88"
+        },
+        {
+          "name": "p11.neuron_fired.at.u32",
+          "bytes": 25165824,
+          "sha256": "07fd8d39b489e0f7ef0df1237616b03658a074c75ab1af35f98ecb8e918ac343"
+        },
+        {
+          "name": "p11.neuron_fired.top.f64",
+          "bytes": 25165824,
+          "sha256": "8a83f0af6d0b0fa8950f201ba9bffffb1220d14e56a406f898a43e1231fb82b9"
+        },
+        {
+          "name": "p11.neuron_push.at.u32",
+          "bytes": 25165824,
+          "sha256": "730f2a55cff757dd2ee0a2e7b5daa32624af3b39d2b05800d63cc17cb5758340"
+        },
+        {
+          "name": "p11.neuron_push.top.f64",
+          "bytes": 25165824,
+          "sha256": "19955540c452df670b332f2b86039fc2d0fc38a1c5c43bb2669e3d3a4cd4ac33"
+        },
+        {
+          "name": "p11.piece.at.u32",
+          "bytes": 37748736,
+          "sha256": "fbf26a0fa94bd066aeeef853b16fe8f7b5c1f0928dcfac18fed980771fe8e2d5"
+        },
+        {
+          "name": "p11.piece.top.f64",
+          "bytes": 37748736,
+          "sha256": "135ec5775f36ca1bfd989aa8914722151fb68a59dfe6715cbc177aeefb3813e5"
+        },
+        {
+          "name": "p11.pos.f32",
+          "bytes": 1310720,
+          "sha256": "6f4944d319ea64cc0f2a2bcb5a689bd22c4424bbf853befe193ab78e7b88e3d5"
+        }
+      ]
+    },
+    {
+      "prefix": "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p12",
+      "sequence_start": 1536,
+      "sequences": 128,
+      "files": [
+        {
+          "name": "p12.attr.f32",
+          "bytes": 7340032,
+          "sha256": "c6ae96d756480b7c76a195d38065fc3ec991fac07a21898744ed19e364c00874"
+        },
+        {
+          "name": "p12.neuron.f64",
+          "bytes": 393216,
+          "sha256": "643162694a2901015a6a260b1d428762ba89fb4f71dc2b3a7d2bb8405594391c"
+        },
+        {
+          "name": "p12.neuron_fired.at.u32",
+          "bytes": 25165824,
+          "sha256": "fe21bbc840e100918d85c57d23620d4437c43d89561c29f14363f4e970acfe2b"
+        },
+        {
+          "name": "p12.neuron_fired.top.f64",
+          "bytes": 25165824,
+          "sha256": "2cbc7d95fabfa7e8eec6c540516247d42f55159479d5420a5abdae8517fd0810"
+        },
+        {
+          "name": "p12.neuron_push.at.u32",
+          "bytes": 25165824,
+          "sha256": "557ff296bc3c166fc194cf5d99273a915fd8a8e51f8ee0c49feb6c1407a9a71c"
+        },
+        {
+          "name": "p12.neuron_push.top.f64",
+          "bytes": 25165824,
+          "sha256": "39a394a9019debc8019deaec663ca64c7847a8380cdf8ff747ba2e24ee737e25"
+        },
+        {
+          "name": "p12.piece.at.u32",
+          "bytes": 37748736,
+          "sha256": "09cd492bdb52fa1d99b22604df954c89750e832c04ec654de8fee7d812bb5140"
+        },
+        {
+          "name": "p12.piece.top.f64",
+          "bytes": 37748736,
+          "sha256": "dc27cbdeaf1733786b7e81e2cf72dcb94a243db018a672f4ac96e042f94707e9"
+        },
+        {
+          "name": "p12.pos.f32",
+          "bytes": 1310720,
+          "sha256": "c92accd76933366f3c2a01e0c8994edf43e49ee15d41539e86c87bdb3327226b"
+        }
+      ]
+    },
+    {
+      "prefix": "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p13",
+      "sequence_start": 1664,
+      "sequences": 128,
+      "files": [
+        {
+          "name": "p13.attr.f32",
+          "bytes": 7340032,
+          "sha256": "251e82388e1303ca03253e14387cfd42d6f2ce00a49a1385d730febefb5f61e5"
+        },
+        {
+          "name": "p13.neuron.f64",
+          "bytes": 393216,
+          "sha256": "b56b53d4c4c6cb5caa85f859beeca1601fa9d3c59b577225155b04e999166c0f"
+        },
+        {
+          "name": "p13.neuron_fired.at.u32",
+          "bytes": 25165824,
+          "sha256": "187908b1b41df4b0853c153b7661f63df7ba02afd66f42f4c383a527a6e153b4"
+        },
+        {
+          "name": "p13.neuron_fired.top.f64",
+          "bytes": 25165824,
+          "sha256": "7007df8ed2304baf3d1721061c293d0d6867c19bd1daa583253722c12b8c30a6"
+        },
+        {
+          "name": "p13.neuron_push.at.u32",
+          "bytes": 25165824,
+          "sha256": "35a7874130a3e6989302b0a8731c93a9eff70700b6dcc990ac086ccd7c57af06"
+        },
+        {
+          "name": "p13.neuron_push.top.f64",
+          "bytes": 25165824,
+          "sha256": "70772e9f2f7bd53d4ae1b5735aa74e9b65ff20929a464c67316a051d39ecf9ab"
+        },
+        {
+          "name": "p13.piece.at.u32",
+          "bytes": 37748736,
+          "sha256": "d5e6e8686fd81eefce743dccd1c9286616b894fea9d9053c722563ea6a295cf3"
+        },
+        {
+          "name": "p13.piece.top.f64",
+          "bytes": 37748736,
+          "sha256": "5a7ef927d1fe89971d0663357fd4b0f1e66f505afd9873a2e3df2bcbb6992076"
+        },
+        {
+          "name": "p13.pos.f32",
+          "bytes": 1310720,
+          "sha256": "3275a3b5539f8c3b225e4233c14cd3cad058f3a55a5e4f42dc7907487c172212"
+        }
+      ]
+    },
+    {
+      "prefix": "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p14",
+      "sequence_start": 1792,
+      "sequences": 128,
+      "files": [
+        {
+          "name": "p14.attr.f32",
+          "bytes": 7340032,
+          "sha256": "462f5c8278091c22fb7ac5f87cb94efa7fb7a52674fd900daeafdec5ac36256f"
+        },
+        {
+          "name": "p14.neuron.f64",
+          "bytes": 393216,
+          "sha256": "3705d4f5e787801417ad2f8e2ba37f878cf5f46bd3ff9577b7da4c79ccc90b47"
+        },
+        {
+          "name": "p14.neuron_fired.at.u32",
+          "bytes": 25165824,
+          "sha256": "34361bba03e5af2342b69b7ba1f4fb62ba202ce185bbdebeecd75b92f53b64b3"
+        },
+        {
+          "name": "p14.neuron_fired.top.f64",
+          "bytes": 25165824,
+          "sha256": "aaaec967137532a31e7b2658c779d1b86755219ffd17163fabeeaa01eaf516de"
+        },
+        {
+          "name": "p14.neuron_push.at.u32",
+          "bytes": 25165824,
+          "sha256": "51767815a1231c83e62e5c1793bbb41648564185e6150c08fb570c51ef7a0efe"
+        },
+        {
+          "name": "p14.neuron_push.top.f64",
+          "bytes": 25165824,
+          "sha256": "6e84f4bb558967657c4b9433becde0cdab467025508390e564fc1fc2d4fd1b16"
+        },
+        {
+          "name": "p14.piece.at.u32",
+          "bytes": 37748736,
+          "sha256": "1d961299f4d12bb29dc25ab27c43e75cef5b2bcdc87ce353a2815ba3d35d6437"
+        },
+        {
+          "name": "p14.piece.top.f64",
+          "bytes": 37748736,
+          "sha256": "6847ab3ac05b968eee8c7012e68311ad8dbdc9d4a55a2ac5c406528992e29639"
+        },
+        {
+          "name": "p14.pos.f32",
+          "bytes": 1310720,
+          "sha256": "4f257baca3813a19965793be18ec9569d43af0ca9d975c99caddf32e404205c6"
+        }
+      ]
+    },
+    {
+      "prefix": "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p15",
+      "sequence_start": 1920,
+      "sequences": 128,
+      "files": [
+        {
+          "name": "p15.attr.f32",
+          "bytes": 7340032,
+          "sha256": "4fcaf4a40f6cf8633cdae00fb1e68dd4adfdef2a19fb5333911fdc022181b925"
+        },
+        {
+          "name": "p15.neuron.f64",
+          "bytes": 393216,
+          "sha256": "65d491683a90d90514437da5daf4846b32dd4a14305c9ac7e6f4af27118163f6"
+        },
+        {
+          "name": "p15.neuron_fired.at.u32",
+          "bytes": 25165824,
+          "sha256": "1a13782668db7f976ae26be2b146a7d73c3f9f3754dec9d8080b8098c475e488"
+        },
+        {
+          "name": "p15.neuron_fired.top.f64",
+          "bytes": 25165824,
+          "sha256": "142ec6e920f2c3f77096beb19880121b9fa1968c7a26dfae54a0d3abda6c3de0"
+        },
+        {
+          "name": "p15.neuron_push.at.u32",
+          "bytes": 25165824,
+          "sha256": "73170c5f8301d37111e405d1973e9e2f4c314a3fdf203d09932e27aa993711cb"
+        },
+        {
+          "name": "p15.neuron_push.top.f64",
+          "bytes": 25165824,
+          "sha256": "7d09c9b021e432f5ec5aa19d2ad7f640879c029742d8c94d004d08aa9b291683"
+        },
+        {
+          "name": "p15.piece.at.u32",
+          "bytes": 37748736,
+          "sha256": "e2b49986826d53ed947d0414f8719589634812e85b923355a3047a01b01624e8"
+        },
+        {
+          "name": "p15.piece.top.f64",
+          "bytes": 37748736,
+          "sha256": "296c1dfb1477c457bdcaf8146bae66e6a5bbe7fdc95ad31a7b7f774da7a44368"
+        },
+        {
+          "name": "p15.pos.f32",
+          "bytes": 1310720,
+          "sha256": "da1bb4b7250236d451b3545bdee40b882bc1d748e8abc74636f9f6eca8095614"
+        }
+      ]
+    },
+    {
+      "prefix": "/mnt/nw/home/s.sauers/mpd-data/discover/planted-local-completed/e",
+      "sequence_start": 2048,
+      "sequences": 512,
+      "files": [
+        {
+          "name": "e.attr.f32",
+          "bytes": 29360128,
+          "sha256": "2c495c698f9e8a1decd668c011f979468f587f5a627a0a7830da7cf858ad9b81"
+        },
+        {
+          "name": "e.log",
+          "bytes": 348,
+          "sha256": "a0b455a8bf61f2f7b4175df885e6edc27130ae41d106fcf770f780c379cacbf3"
+        },
+        {
+          "name": "e.neuron.f64",
+          "bytes": 393216,
+          "sha256": "2e2acb5ecf09890af4ea3bd42384618520a41bac18aec9eb67f4299f0893f5e9"
+        },
+        {
+          "name": "e.neuron_fired.at.u32",
+          "bytes": 25165824,
+          "sha256": "0537ff0d7381249e999495f0b042714424b7a84751f8c776cea877b24048c640"
+        },
+        {
+          "name": "e.neuron_fired.top.f64",
+          "bytes": 25165824,
+          "sha256": "ae73c99f457729d4777cf37cf29de48895cbfb619c04b8aa5e4909eeaf8945f6"
+        },
+        {
+          "name": "e.neuron_push.at.u32",
+          "bytes": 25165824,
+          "sha256": "4c1e8399e87d197a1f1cf8c51f907eb2a30f8c8a6829225a1fc2e6debba0cb7c"
+        },
+        {
+          "name": "e.neuron_push.top.f64",
+          "bytes": 25165824,
+          "sha256": "2235098dbfc2dba6909ea9f4c6fb136d2b9b42906f1b5640193446d48cae0c18"
+        },
+        {
+          "name": "e.piece.at.u32",
+          "bytes": 37748736,
+          "sha256": "d5b96f2db11ba7e7345c76ab2c7d18cb6c66bb5cb38ae9f82c88e29f89251ed5"
+        },
+        {
+          "name": "e.piece.top.f64",
+          "bytes": 37748736,
+          "sha256": "8486f4897df2aae904060a98450761d84548392b2a762df62988cd5771e5e56c"
+        },
+        {
+          "name": "e.pos.f32",
+          "bytes": 5242880,
+          "sha256": "88f90c3fa707ef6eb2932eb155d7954231519e4ec575bb212407703fcff96282"
+        }
+      ]
+    },
+    {
+      "prefix": "/mnt/nw/home/s.sauers/mpd-data/discover/planted-local-completed/f",
+      "sequence_start": 2560,
+      "sequences": 512,
+      "files": [
+        {
+          "name": "f.attr.f32",
+          "bytes": 29360128,
+          "sha256": "58e2f086f62adb777f1a12f42b07783c98929ef23f2dc663177debfb89df2cfd"
+        },
+        {
+          "name": "f.log",
+          "bytes": 348,
+          "sha256": "51677dc436abbc80617e56f015f5674243d1754e593abdfe5aa7566ef012f4b6"
+        },
+        {
+          "name": "f.neuron.f64",
+          "bytes": 393216,
+          "sha256": "b9e5cbcc569e4217669d14091dd61ebabd795a4060717dfd9c987b227abc1e0e"
+        },
+        {
+          "name": "f.neuron_fired.at.u32",
+          "bytes": 25165824,
+          "sha256": "b5333e249b8bfd829982c2bcc1c949fa4d772a04f208326d05a12537a255c67b"
+        },
+        {
+          "name": "f.neuron_fired.top.f64",
+          "bytes": 25165824,
+          "sha256": "167511d431ce57632f00bf2bc0b47f7b987784843d02997d6acd6e79fcad7590"
+        },
+        {
+          "name": "f.neuron_push.at.u32",
+          "bytes": 25165824,
+          "sha256": "2f654a8c4bc3870ad24737540c219c179cd560cb94deb72be78c7a37bd101ad6"
+        },
+        {
+          "name": "f.neuron_push.top.f64",
+          "bytes": 25165824,
+          "sha256": "9f4026efa4bd4d6be08eb7291a2d392fdfa0b20d113e18cdc1acba4e86b3865c"
+        },
+        {
+          "name": "f.piece.at.u32",
+          "bytes": 37748736,
+          "sha256": "dc3b5eea23f2eda2dac6da5af36c231e31c43cd7915c4016bde1429c706fc554"
+        },
+        {
+          "name": "f.piece.top.f64",
+          "bytes": 37748736,
+          "sha256": "5887d20e9681f4d19852d56b84f7db4068afd7666ebc08979ecca0382648e4fe"
+        },
+        {
+          "name": "f.pos.f32",
+          "bytes": 5242880,
+          "sha256": "0417084a452dbea7b652b26dff83b4576ead19a8b0bd2e43e213a01f20ab764c"
+        }
+      ]
+    },
+    {
+      "prefix": "/mnt/nw/home/s.sauers/mpd-data/discover/planted-local-completed/c",
+      "sequence_start": 3072,
+      "sequences": 512,
+      "files": [
+        {
+          "name": "c.attr.f32",
+          "bytes": 29360128,
+          "sha256": "bf3e374a8b3b1b0505d06690390e6ef2069ba147af7d990fc415e7e7257de020"
+        },
+        {
+          "name": "c.log",
+          "bytes": 348,
+          "sha256": "758f7c6c2d6fcd2708c5a87978a6954c337fbc2990656fb3158a2013619eb175"
+        },
+        {
+          "name": "c.neuron.f64",
+          "bytes": 393216,
+          "sha256": "3d2a7bd9638ce5fb02d9ee53c0b6d6e5c0fcae694a984ae326cfc265a238fa7e"
+        },
+        {
+          "name": "c.neuron_fired.at.u32",
+          "bytes": 25165824,
+          "sha256": "d342e51e8a827015dd7aff270b793dfca6caf7a45496a32df0a1b9c2339899d6"
+        },
+        {
+          "name": "c.neuron_fired.top.f64",
+          "bytes": 25165824,
+          "sha256": "d7478c7e41c94433fd177080c8a9d14ba24d2baccf88616377b45ac82a70f9f3"
+        },
+        {
+          "name": "c.neuron_push.at.u32",
+          "bytes": 25165824,
+          "sha256": "7960201c7c30a04cbecfbd95dc11a75a05aca8c7014efaae8d9548d0e004e035"
+        },
+        {
+          "name": "c.neuron_push.top.f64",
+          "bytes": 25165824,
+          "sha256": "7e497111cc8413c864ee9e2ca9edf46d859c605f6f917e4cb22fe1f2c53ed939"
+        },
+        {
+          "name": "c.piece.at.u32",
+          "bytes": 37748736,
+          "sha256": "85e839071987d19c6fda9d59b21922ce64dd960bc0808b586fe67c32232e3423"
+        },
+        {
+          "name": "c.piece.top.f64",
+          "bytes": 37748736,
+          "sha256": "084970c1861a4e039b1d9c4f1954ad9f6f33cf8d69a12f2a9fd95dfe610a60ec"
+        },
+        {
+          "name": "c.pos.f32",
+          "bytes": 5242880,
+          "sha256": "6ed16cc65191e3b06c94089ae7b540f02864b9a50182ddbfa80a99d44da9a250"
+        }
+      ]
+    },
+    {
+      "prefix": "/mnt/nw/home/s.sauers/mpd-data/discover/planted-local-completed/d",
+      "sequence_start": 3584,
+      "sequences": 512,
+      "files": [
+        {
+          "name": "d.attr.f32",
+          "bytes": 29360128,
+          "sha256": "9de4cb71ce92c2a5ad8055b2ab7626c9b5257e81aff93e1c2ffae9964f8671ba"
+        },
+        {
+          "name": "d.log",
+          "bytes": 348,
+          "sha256": "75a62e317c6323cfcbfe926f72b95a59b4fba83b250a86d891608ece895bb212"
+        },
+        {
+          "name": "d.neuron.f64",
+          "bytes": 393216,
+          "sha256": "46a54e0907c37134b0ad869792a197dd221f5a82f130636b801deae18971dddc"
+        },
+        {
+          "name": "d.neuron_fired.at.u32",
+          "bytes": 25165824,
+          "sha256": "e0e7b518ac514721780a781898c60a51c2da196cde9744e521a4f14257acb954"
+        },
+        {
+          "name": "d.neuron_fired.top.f64",
+          "bytes": 25165824,
+          "sha256": "fc52f28662dcddc23daac7c69d13814d3ce31d6865f87aab440700a97753bce1"
+        },
+        {
+          "name": "d.neuron_push.at.u32",
+          "bytes": 25165824,
+          "sha256": "25fea507ff0ec9169e2b564cd297d37ab0c58adbbb9ae9850b4ea0de090a6404"
+        },
+        {
+          "name": "d.neuron_push.top.f64",
+          "bytes": 25165824,
+          "sha256": "104bd2400216b72e00a2cb114e780040965cd240e9123410f396773e8355fdaf"
+        },
+        {
+          "name": "d.piece.at.u32",
+          "bytes": 37748736,
+          "sha256": "496b3690b158fbd5992e71cf35ea6523065e8a6525dbe76a817a2b7f5d537c98"
+        },
+        {
+          "name": "d.piece.top.f64",
+          "bytes": 37748736,
+          "sha256": "8827ceb155b5fc6084ecfaf936db4ec4266a0ddf20adf40d196583524ba11b78"
+        },
+        {
+          "name": "d.pos.f32",
+          "bytes": 5242880,
+          "sha256": "b6669e0c7f9d840a852ead92da37dbde99222ca94af62df88969f967917e2048"
+        }
+      ]
+    }
+  ],
+  "command": [
+    "/mnt/nw/home/s.sauers/mpd-bin/19169f0f9b40/mpd_discover_2951",
+    "detect",
+    "/mnt/nw/home/s.sauers/mpd-data/engine/planted_rare",
+    "/mnt/nw/home/s.sauers/mpd-data/cluster/codex-blind-detect-19169/detect.json",
+    "/mnt/nw/home/s.sauers/mpd-data/cluster/codex-blind-detect-19169/prediction.json",
+    "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p0@0",
+    "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p1@128",
+    "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p2@256",
+    "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p3@384",
+    "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p4@512",
+    "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p5@640",
+    "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p6@768",
+    "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p7@896",
+    "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p8@1024",
+    "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p9@1152",
+    "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p10@1280",
+    "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p11@1408",
+    "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p12@1536",
+    "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p13@1664",
+    "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p14@1792",
+    "/mnt/nw/home/s.sauers/mpd-data/cluster/disc-planted/p15@1920",
+    "/mnt/nw/home/s.sauers/mpd-data/discover/planted-local-completed/e@2048",
+    "/mnt/nw/home/s.sauers/mpd-data/discover/planted-local-completed/f@2560",
+    "/mnt/nw/home/s.sauers/mpd-data/discover/planted-local-completed/c@3072",
+    "/mnt/nw/home/s.sauers/mpd-data/discover/planted-local-completed/d@3584"
+  ],
+  "slurm_job_id": "15722"
+}
