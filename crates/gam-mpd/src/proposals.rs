@@ -28,8 +28,8 @@
 //! * **copy**: the head's output operator as `λ diag(g / g_f) V⁺` of its value operator, `λ` the
 //!   least-squares scale (`rules::copy_scale`);
 //! * **match**: the head's query rows on its content planes through every head of an earlier layer
-//!   as the source, the content planes the ones whose rule aligns best with the head's own scores
-//!   (`rules::match_alignment`), `λ` the least-squares scale (`rules::match_scale`); the other rows
+//!   as the source, the content planes the ones on which the rule carries the most of the head's own
+//!   circuit (`rules::match_energy`), `λ` the least-squares scale (`rules::match_scale`); the other rows
 //!   either kept as literal residual rows or left zero.
 //!
 //! What a rule costs and whether it holds is the search's: it ranks the candidates by the bits
@@ -237,9 +237,11 @@ impl HeadRules {
                 for first in 0..width / 2 {
                     let rows = super::rules::content_rows(width, first);
                     let reading = super::rules::match_reading(&key, &output, &value, &gain, &source_gain, &rows);
-                    let alignment = super::rules::match_alignment(&query, &reading, &gain, &rows)?;
-                    if best.is_none_or(|b| alignment > b.0) {
-                        best = Some((alignment, first));
+                    // The share of the head's circuit the rule carries on these rows, not their cosine:
+                    // the cosine favours the single cleanest plane (2-6 of 128 rows on VPD 4L).
+                    let energy = super::rules::match_energy(&query, &reading, &gain, &rows)?;
+                    if best.is_none_or(|b| energy > b.0) {
+                        best = Some((energy, first));
                     }
                 }
                 Ok(((l, h, sl, sh), best.ok_or("a head of no planes")?.1))
