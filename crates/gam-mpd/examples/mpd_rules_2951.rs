@@ -44,10 +44,10 @@
 //!   `W_O ≈ λ diag(g / g_f) W_V⁺` (`g` the layer's norm gain, `g_f` the final one);
 //! * match: a query block's content rows (its rotary planes from the slowest down to a plane the
 //!   code chooses) read, as the current token, what its key rows read as the previous token through
-//!   an earlier head's output-value circuit `M = OV diag(g_l)`: with `Z = K̃ diag(g) M`,
-//!   `Q̃ ≈ λ (Z Zᵀ)⁺ Z diag(1/g)`, so `diag(g) Q̃ᵀ K̃ diag(g) M` is `λ` times a projector. The source
-//!   head and the content planes are chosen by the energy the prediction explains in the metric,
-//!   then priced exactly.
+//!   an earlier head's output-value circuit `M = OV diag(g_l)`: with `Z = K̃ diag(g) M` and
+//!   `Z Zᵀ = U Λ Uᵀ`, `Q̃ ≈ λ U_k Λ_k⁻¹ U_kᵀ Z diag(1/g)` (all `k` directions: `(Z Zᵀ)⁺ Z diag(1/g)`,
+//!   so `diag(g) Q̃ᵀ K̃ diag(g) M` is `λ` times a projector). The source head, the content planes and
+//!   `k` are chosen by the energy the prediction explains in the metric, then priced exactly.
 //!
 //! Reported per head: its bits alone and with its rule, the rule and binding taken; per site and in
 //! all; and the decode check (every attention site replaced by its decoded head blocks, all on, on
@@ -685,7 +685,7 @@ fn rules(export: &std::path::Path, out: &std::path::Path, observations: f64, sta
         // The selector naming each head's choice: alone, or one rule binding.
         let options = match kind.as_str() {
             "o" => 2.0,
-            "q" => 1.0 + (heads * layer * half) as f64,
+            "q" => 1.0 + (heads * layer * half * width) as f64,
             _ => 1.0,
         };
         let selector_bits = f64::log2(options);
@@ -728,17 +728,34 @@ fn rules(export: &std::path::Path, out: &std::path::Path, observations: f64, sta
                                 let (zz, y, x) = (z.dot(&z.t()), zd.dot(moment).dot(&zd.t()), wc.dot(&zd.t()));
                                 for first in 0..half {
                                     let planes: Vec<usize> = (first..half).chain(first + half..width).collect();
-                                    let inverse = pseudo_inverse(&zz.select(Axis(0), &planes).select(Axis(1), &planes))?;
-                                    // P = (Z Zᵀ)⁺ Z D⁻¹ on the planes: ⟨W, P⟩ and ⟨P, P⟩ through the precomputed forms.
-                                    let cross = x.select(Axis(1), &planes).dot(&inverse.t());
-                                    let fp = rows_f.select(Axis(1), &planes);
-                                    let inner = (&fp * &cross).sum();
-                                    let own_form = inverse.dot(&y.select(Axis(0), &planes).select(Axis(1), &planes)).dot(&inverse.t());
-                                    let norm = (&fp.select(Axis(0), &planes) * &own_form).sum();
-                                    let explained = if norm > 0.0 { inner * inner / norm } else { 0.0 };
-                                    if best.as_ref().is_none_or(|b| explained > b.0) {
-                                        let prediction = inverse.dot(&zd.select(Axis(0), &planes));
-                                        best = Some((explained, format!("match through layer {l} head {source} from plane {first}"), prediction, planes.iter().map(|p| h * width + p).collect()));
+                                    // Z Zᵀ = U Λ Uᵀ on the planes; the prediction keeps its k leading
+                                    // directions, P_k = U_k Λ_k⁻¹ U_kᵀ Z D⁻¹ (k = all is (Z Zᵀ)⁺ Z D⁻¹), and
+                                    // ⟨W, P_k⟩, ⟨P_k, P_k⟩ accumulate over k through the precomputed forms.
+                                    let e = gam_mpd::dense::eigh(zz.select(Axis(0), &planes).select(Axis(1), &planes).view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None)
+                                        .map_err(|e| format!("{e:?}"))?;
+                                    let mut order: Vec<usize> = (0..planes.len()).filter(|i| e.values[*i] > e.band).collect();
+                                    order.sort_by(|a, b| e.values[*b].total_cmp(&e.values[*a]));
+                                    let directions = e.vectors.select(Axis(1), &order);
+                                    let scales = ndarray::Array1::from_iter(order.iter().map(|i| 1.0 / e.values[*i]));
+                                    let (fp, fpp) = (rows_f.select(Axis(1), &planes), rows_f.select(Axis(0), &planes).select(Axis(1), &planes));
+                                    let crosses = &(&x.select(Axis(1), &planes).dot(&directions) * &fp.dot(&directions)).sum_axis(Axis(0)) * &scales;
+                                    let (uf, uy) = (directions.t().dot(&fpp).dot(&directions), directions.t().dot(&y.select(Axis(0), &planes).select(Axis(1), &planes)).dot(&directions));
+                                    let gram = &(&uf * &uy) * &scales.view().insert_axis(Axis(1)) * &scales.view().insert_axis(Axis(0));
+                                    let (mut inner, mut norm) = (0.0, 0.0);
+                                    for k in 0..order.len() {
+                                        inner += crosses[k];
+                                        norm += gram[[k, k]] + 2.0 * gram.slice(s![k, ..k]).sum();
+                                        let explained = if norm > 0.0 { inner * inner / norm } else { 0.0 };
+                                        if best.as_ref().is_none_or(|b| explained > b.0) {
+                                            let kept = directions.slice(s![.., ..=k]);
+                                            let prediction = (&kept * &scales.slice(s![..=k]).insert_axis(Axis(0))).dot(&kept.t()).dot(&zd.select(Axis(0), &planes));
+                                            best = Some((
+                                                explained,
+                                                format!("match through layer {l} head {source} from plane {first}, {} directions", k + 1),
+                                                prediction,
+                                                planes.iter().map(|p| h * width + p).collect(),
+                                            ));
+                                        }
                                     }
                                 }
                             }
