@@ -658,6 +658,28 @@ where
     Ok((outputs, [DecodedFidelity { status: first, tolerance: tolerances[0] }, DecodedFidelity { status: second, tolerance: tolerances[1] }]))
 }
 
+/// Decode once, retaining an explicitly absent second measurement. Both tolerances
+/// are checked before decoding; absence creates no fidelity evidence for that stage.
+pub fn decode_then_evaluate_optional_pair<A, O, E, M, W, D>(
+    artifact: &A, evaluate: E, distortion: M, tolerances: [f64; 2],
+) -> Result<(O, (DecodedFidelity<W, D>, Option<DecodedFidelity<W, D>>)), String>
+where
+    A: DecodableArtifact,
+    E: FnOnce(&A::Decoded) -> Result<O, String>,
+    M: FnOnce(&O) -> Result<(EvidenceStatus<W, D>, Option<EvidenceStatus<W, D>>), String>,
+{
+    for tolerance in tolerances {
+        if !tolerance.is_finite() || tolerance < 0.0 {
+            return Err("the fidelity tolerance must be finite and nonnegative".into());
+        }
+    }
+    let decoded = artifact.decode()?;
+    let outputs = evaluate(&decoded)?;
+    let (first, second) = distortion(&outputs)?;
+    Ok((outputs, (DecodedFidelity { status: first, tolerance: tolerances[0] },
+        second.map(|status| DecodedFidelity { status, tolerance: tolerances[1] }))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1262,5 +1284,32 @@ mod exact_range_tests {
         for value in [f64::MIN_POSITIVE, f64::from_bits(1), f64::MAX] {
             DeclaredPrecision::new(1022).unwrap().within_range(value).round(value).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod optional_pair_tests {
+    use super::*;
+    use std::cell::Cell;
+    struct CountDecode(Cell<usize>);
+    impl DecodableArtifact for CountDecode {
+        type Decoded = f64;
+        fn decode(&self) -> Result<f64, String> { self.0.set(self.0.get()+1); Ok(1.0) }
+    }
+    #[test]
+    fn optional_pair_decodes_once_and_never_invents_absent_evidence() {
+        let source = CountDecode(Cell::new(0));
+        for tol in [[f64::NAN, 0.0], [0.0, -1.0]] {
+            assert!(decode_then_evaluate_optional_pair(&source, |v| Ok(*v),
+                |_| -> Result<(EvidenceStatus<(), ()>, Option<EvidenceStatus<(), ()>>), String> { panic!("invalid tolerance evaluated") }, tol).is_err());
+        }
+        assert_eq!(source.0.get(), 0);
+        let (_, (first, second)) = decode_then_evaluate_optional_pair(&source, |v| Ok(*v), |v| {
+            Ok((EvidenceStatus::<(), ()>::exact(*v, 0.0,
+                crate::supports::ExactBasis::Exhaustive { cardinality: 1 }, None, ()).map_err(|e| e.to_string())?, None))
+        }, [0.5, 0.0]).unwrap();
+        assert_eq!(source.0.get(), 1);
+        assert_eq!(first.verdict(), FidelityVerdict::Violates);
+        assert!(second.is_none());
     }
 }

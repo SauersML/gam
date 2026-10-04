@@ -1203,3 +1203,6 @@ fn assess_once_matches_complete_cached_assessment_without_measurement_key() {
     assert!(codec.usage().encoded_native_operator_hits > 0);
     assert!(codec.usage().decoded_native_operator_hits > 0);
 }
+
+#[path = "local_first_tests.rs"]
+mod local_first_tests;

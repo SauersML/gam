@@ -1144,6 +1144,103 @@ pub fn assess_once(local: &Local<'_>, run: &dyn RunCheck, artifact: &Artifact, c
     PreparedAssessment::new(artifact, cache)?.assess(local, run, constraint)
 }
 
+/// Optional staged evidence. Local rejection has no Run measurement or verdict.
+/// Its exclusion proof applies only at local tolerances no wider than the declared grid.
+#[derive(Clone, Debug)]
+pub enum StagedAssessment {
+    Complete(Assessment),
+    LocalRejected {
+        cost: StructuralCost,
+        local: DecodedFidelity<String, String>,
+        local_measure: LocalMeasure,
+        max_local_tolerance: f64,
+    },
+}
+
+impl StagedAssessment {
+    pub fn cost(&self) -> StructuralCost {
+        match self { Self::Complete(a) => a.cost, Self::LocalRejected { cost, .. } => *cost }
+    }
+
+    /// Missing Run is explicit; it is never represented by a zero measure.
+    pub fn run_measure(&self) -> Option<&RunMeasure> {
+        match self { Self::Complete(a) => Some(&a.run_measure), Self::LocalRejected { .. } => None }
+    }
+
+    /// Joint feasibility evidence at a grid point. Outside a rejected stage's
+    /// declared maximum local tolerance the assessment remains unresolved.
+    pub fn verdict(&self, constraint: Constraint) -> Result<FidelityVerdict, String> {
+        validate_constraints(&[constraint])?;
+        match self {
+            Self::LocalRejected { local, max_local_tolerance, .. } => {
+                if constraint.local <= *max_local_tolerance && local.with_tolerance(constraint.local)?.verdict() == FidelityVerdict::Violates {
+                    Ok(FidelityVerdict::Violates)
+                } else { Ok(FidelityVerdict::Unresolved) }
+            }
+            Self::Complete(a) => {
+                let l = a.local.with_tolerance(constraint.local)?.verdict();
+                let r = a.run.with_tolerance(constraint.run)?.verdict();
+                Ok(match (l, r) {
+                    (FidelityVerdict::Violates, _) | (_, FidelityVerdict::Violates) => FidelityVerdict::Violates,
+                    (FidelityVerdict::Meets, FidelityVerdict::Meets) => FidelityVerdict::Meets,
+                    _ => FidelityVerdict::Unresolved,
+                })
+            }
+        }
+    }
+}
+
+fn validate_constraints(constraints: &[Constraint]) -> Result<(), String> {
+    if constraints.is_empty() { return Err("a nonempty declared tolerance grid is required".into()); }
+    for c in constraints {
+        if !c.local.is_finite() || c.local < 0.0 || !c.run.is_finite() || c.run < 0.0 {
+            return Err("the fidelity tolerance must be finite and nonnegative".into());
+        }
+    }
+    Ok(())
+}
+
+/// Optional exact Local-first screen of each complete candidate message, never
+/// of its constituent edits. Decode and check complete cost once, then measure
+/// the unchanged full Local family. Only a proved violation at the widest declared
+/// delta omits Run. Retain this evidence across grid points without measuring again.
+/// The ordinary assessment and finite-bank defaults remain unchanged.
+pub fn assess_once_local_first(
+    local: &Local<'_>, run: &dyn RunCheck, artifact: &Artifact,
+    constraints: &[Constraint], cache: &mut CostCache,
+) -> Result<StagedAssessment, String> {
+    validate_constraints(constraints)?;
+    let max_local = constraints.iter().map(|c| c.local).fold(0.0_f64, f64::max);
+    let max_run = constraints.iter().map(|c| c.run).fold(0.0_f64, f64::max);
+    let prepared = PreparedAssessment::new(artifact, cache)?;
+    let ((local_measure, run_measure), (local_fidelity, run_fidelity)) =
+        super::precision::decode_then_evaluate_optional_pair(
+            &prepared.encoded,
+            |decoded: &Artifact| {
+                if structural_cost(decoded, &mut CostCache::default())? != prepared.cost {
+                    return Err("decoded artifact has a different structural cost".into());
+                }
+                let measured = local.measure(decoded)?;
+                let rejected = measured.status()?.refutes_at_most(max_local);
+                let run_measure = if rejected { None } else { Some(RunMeasure::of(run.episodes(decoded)?)) };
+                Ok((measured, run_measure))
+            },
+            |(local, run): &(LocalMeasure, Option<RunMeasure>)| {
+                Ok((local.status()?, run.as_ref().map(RunMeasure::status).transpose()?))
+            },
+            [max_local, max_run],
+        )?;
+    match (run_measure, run_fidelity) {
+        (Some(run_measure), Some(run_fidelity)) => Ok(StagedAssessment::Complete(Assessment {
+            cost: prepared.cost, local: local_fidelity, local_measure, run: run_fidelity, run_measure,
+        })),
+        (None, None) => Ok(StagedAssessment::LocalRejected {
+            cost: prepared.cost, local: local_fidelity, local_measure, max_local_tolerance: max_local,
+        }),
+        _ => Err("inconsistent optional Run evidence".into()),
+    }
+}
+
 /// The same decoded assessment with bounded, fixed-native operator codec reuse.
 /// The message remains standalone; only exactly witnessed native codewords reuse
 /// decoding work. This does not cache measurements or change either verdict.
