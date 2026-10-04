@@ -123,7 +123,7 @@ use super::operator_program::{
 };
 use super::precision::DeclaredPrecision;
 use gam_linalg::faer_ndarray::{fast_ata, fast_atb};
-use gam_linalg::matrix::{symmetrize, symmetrize_in_place};
+use gam_linalg::matrix::symmetrize;
 use ndarray::{Array1, Array2, Axis, s};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
