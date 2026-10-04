@@ -1103,6 +1103,21 @@ fn copy_joint_masks_keep_cancellation_and_compose_four_layers() {
         let candidate = bank.checked(&[mask, 0, 0, 0], &model).unwrap().0;
         assert!(local.screen(&candidate).unwrap().worst().unwrap().lower > 0.1);
     }
+    let composed = bank.compose(&[3, 3, 3, 3]).unwrap();
+    let repeated = bank.compose(&[3, 3, 3, 3]).unwrap();
+    let mut reference = start.clone();
+    for layer in 0..4 {
+        for head in 0..2 {
+            let single = bank.layer(layer, 1 << head).unwrap();
+            let derived = &single.derived[0];
+            reference = reference.derive(derived.operator, derived.law.clone(), derived.scale, derived.residual.clone()).unwrap();
+            assert!(Arc::ptr_eq(&composed.program.operators[derived.operator], &repeated.program.operators[derived.operator]), "computed Copy operators are shared across masks");
+        }
+        reference = reference.bind(&format!("attention {layer}"), &[0], layers[layer].attention).unwrap();
+    }
+    assert_eq!(composed, reference, "cached composition matches the canonical derive/bind path");
+    let separate_bytes: usize = (0..4).map(|layer| bank.layer(layer, 3).unwrap().to_bytes().unwrap().len()).sum();
+    assert!(composed.to_bytes().unwrap().len() < separate_bytes, "composition transmits remaining native computation once");
     let joint = bank.checked(&[3, 3, 3, 3], &model).unwrap().0;
     assert_eq!(joint.derived.len(), 8);
     assert_eq!(joint.blocks.len(), 4);
@@ -1112,4 +1127,17 @@ fn copy_joint_masks_keep_cancellation_and_compose_four_layers() {
     assert!(bank.compose(&[0]).is_err());
     let empty = bank.checked(&[0; 4], &model).unwrap().0;
     assert!(empty.derived.is_empty() && empty.blocks.is_empty());
+}
+
+#[test]
+fn copy_mask_classification_rejects_invalid_nonmax_local_evidence() {
+    use super::acceptance::{BlockError, LocalMeasure};
+    let block = BlockError { name: "valid".into(), worst: 0.1, row: 0, lower_row: 0, numerical_error: 0.0, lower: 0.1, upper: 0.1, scale: 1.0 };
+    for kind in 0..4 {
+        let mut bad = block.clone();
+        match kind { 0 => bad.worst = f64::NAN, 1 => bad.numerical_error = f64::INFINITY,
+            2 => bad.upper = f64::NAN, 3 => bad.upper = 0.0, _ => unreachable!() }
+        let measure = LocalMeasure { blocks: vec![block.clone(), bad], rows: 1, family_rows: 1, counterexamples: 0 };
+        assert!(measure.status().is_err(), "invalid nonmax evidence must remain unresolved, never prune or pass");
+    }
 }
