@@ -167,7 +167,7 @@ fn mapped_copy_residual_full_rank_does_not_certify_ill_conditioned_literal_round
     let bank=MappedCopyResidualBank::new(&base,&[27],&[17],33).unwrap();
     let candidate=bank.candidate(CopyResidualChoice{layer:27,head:0,rank:17,family:HeadApproximation::CopyResidual}).unwrap().f32_literals().unwrap();
     candidate.validate_coverage(p).unwrap();
-    let original=base.program.execute(&imported.contract.family).unwrap();let changed=candidate.program.execute(&imported.contract.family).unwrap();
+    let original=base.program.execute(&imported.contract.family,false).unwrap();let changed=candidate.program.execute(&imported.contract.family,false).unwrap();
     let error=(&original.values[map.output]-&changed.values[map.output]).iter().map(|x|x*x).sum::<f64>().sqrt();
     assert!(error.is_finite()&&error>0.001,"full rank must not be treated as a quality certificate: {error}");
 }
