@@ -1268,13 +1268,9 @@ impl Artifact {
     /// significant first, the last byte padded with zeros.
     pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
         let message = self.encode()?;
-        let mut out = message.len_bits().to_le_bytes().to_vec();
-        let mut reader = message.reader();
-        while reader.remaining_bits() > 0 {
-            let width = reader.remaining_bits().min(8) as u32;
-            let bits = reader.read_bits(width).map_err(codec)?;
-            out.push((bits << (8 - width)) as u8);
-        }
+        let mut out = Vec::with_capacity(8 + message.packed_bytes().len());
+        out.extend_from_slice(&message.len_bits().to_le_bytes());
+        out.extend_from_slice(message.packed_bytes());
         Ok(out)
     }
 
@@ -1285,13 +1281,7 @@ impl Artifact {
         if length.div_ceil(8) != (bytes.len() - 8) as u64 {
             return Err(format!("{} message bits in {} bytes", length, bytes.len() - 8));
         }
-        let mut message = BitString::new();
-        let mut left = length;
-        for byte in &bytes[8..] {
-            let width = left.min(8) as u32;
-            message.push_bits(u64::from(*byte) >> (8 - width), width).map_err(codec)?;
-            left -= u64::from(width);
-        }
+        let message = BitString::from_packed(&bytes[8..], length).map_err(codec)?;
         Self::decode(&message, declarations)
     }
 }

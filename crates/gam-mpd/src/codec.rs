@@ -139,6 +139,24 @@ impl BitString {
         self.len_bits == 0
     }
 
+    /// Packed most-significant-first bytes; unused low bits of the last byte are zero.
+    pub fn packed_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Copy a packed message, ignoring unused tail padding like repeated push_bits.
+    pub fn from_packed(bytes: &[u8], len_bits: u64) -> Result<Self, CodecError> {
+        if len_bits.div_ceil(8) != bytes.len() as u64 {
+            return Err(CodecError::InvalidInput(format!("{len_bits} bits in {} packed bytes", bytes.len())));
+        }
+        let mut packed = bytes.to_vec();
+        let tail = (len_bits % 8) as u32;
+        if tail != 0 {
+            *packed.last_mut().expect("nonempty partial byte") &= u8::MAX << (8 - tail);
+        }
+        Ok(Self { bytes: packed, len_bits })
+    }
+
     pub fn push_bit(&mut self, bit: bool) {
         let offset = self.len_bits % 8;
         if offset == 0 {
@@ -1127,6 +1145,23 @@ impl CardinalityCode for PaddedPacketCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn packed_transport_matches_bitwise_loading_including_ignored_padding() {
+        for length in 0..1024_u64 {
+            let bytes: Vec<u8> = (0..length.div_ceil(8)).map(|i| (i.wrapping_mul(131).wrapping_add(255)) as u8).collect();
+            let mut reference = BitString::new();
+            for bit in 0..length {
+                reference.push_bit(bytes[(bit / 8) as usize] & (0x80 >> (bit % 8)) != 0);
+            }
+            let packed = BitString::from_packed(&bytes, length).unwrap();
+            assert_eq!(packed, reference);
+            assert_eq!(BitString::from_packed(packed.packed_bytes(), length).unwrap(), reference);
+        }
+        assert!(BitString::from_packed(&[], 1).is_err());
+        assert!(BitString::from_packed(&[0], 0).is_err());
+        assert!(BitString::from_packed(&[0], 9).is_err());
+        assert!(BitString::from_packed(&[0, 0], 8).is_err());
+    }
     fn reference_push(bits: &mut BitString, value: u64, width: u32) -> Result<(), CodecError> {
         if width > 64 || (width < 64 && value >> width != 0) {
             return Err(CodecError::InvalidInput(format!("{value} does not fit in {width} bits")));
