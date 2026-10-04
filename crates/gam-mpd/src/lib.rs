@@ -277,6 +277,12 @@ pub mod counterfactual;
 #[cfg(test)]
 mod counterfactual_tests;
 
+// Known-mechanism toys: counterfactual questions and mechanism checks for an explanation.
+pub mod toys;
+
+#[cfg(test)]
+mod toys_tests;
+
 #[cfg(test)]
 mod site_fit_tests;
 

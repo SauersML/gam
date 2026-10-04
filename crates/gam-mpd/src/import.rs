@@ -456,6 +456,139 @@ fn rnn(tensors: &Tensors<'_>, record: &Value, samples: &Array2<f64>) -> Result<B
     Ok(((program, 1), slots, false, Some(vec![(0..steps).collect()])))
 }
 
+/// A `transformer` export as a per-position program, the layout a language model is imported
+/// in ([`import_language_model`]): each row is one position of one sample, its slots the token
+/// and the position, `x_0 = W_E[tok] + W_pos[pos]`; per layer, per head `Attend` over the rows of
+/// its sample (causal when the config says so) then the ReLU MLP, both residual; logits
+/// `W_U x + b_U` at every row (the export's readout positions are rows of it). Operators carry the
+/// names [`import`] gives them, so a site is one map per layer shared by every position. The
+/// family is the export's samples, position by position.
+pub fn import_rows(dir: &Path) -> Result<Imported, String> {
+    let text = std::fs::read_to_string(dir.join("export.json")).map_err(|e| e.to_string())?;
+    let record: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    if record["kind"].as_str() != Some("transformer") {
+        return Err(format!("{}: not a transformer export", dir.display()));
+    }
+    let tensors = Tensors::Export { dir, record: &record };
+    let (layers, heads, d, dh) = (config(&record, "n_layers")?, config(&record, "n_heads")?, config(&record, "d_model")?, config(&record, "d_head")?);
+    let vocab = record["input"]["vocab_size"].as_u64().ok_or("input.vocab_size")? as usize;
+    let classes = record["output"]["n_classes"].as_u64().ok_or("output.n_classes")? as usize;
+    let causal = record["config"]["causal"].as_bool().unwrap_or(true);
+    let (sample_rows, positions) = shape_of(&record["samples"]["shape"])?;
+    let samples = read_f64(&dir.join(record["samples"]["file"].as_str().unwrap_or("inputs.f64")), sample_rows, positions)?;
+    let model = Interface::native(d).map_err(|e| e.to_string())?;
+    let head = Interface::native(dh).map_err(|e| e.to_string())?;
+    let constant = Interface::constant();
+    let mut b = Builder { operators: Vec::new(), nodes: Vec::new() };
+    b.operators.push(Arc::new(Operator::identity("I", model.clone())));
+    let identity = 0;
+    let w_e = b.operator("W_E", &model, &interface(vocab, 1, LabelKind::Token)?, tensors.get("W_E")?.t().to_owned())?;
+    let w_pos = b.operator("W_pos", &model, &interface(positions, 1, LabelKind::Token)?, tensors.get("W_pos")?.slice(s![..positions, ..]).t().to_owned())?;
+    let token = b.node(Node::Feature { slot: 0, basis: 0 });
+    let position = b.node(Node::Feature { slot: 1, basis: 1 });
+    let mut x = b.node(Node::Affine { terms: vec![(token, w_e), (position, w_pos)], bias: None });
+    for l in 0..layers {
+        let prefix = format!("blocks.{l}.");
+        let bias = |b: &mut Builder, name: &str, rows: &Interface, range: Option<(usize, usize)>| -> Result<Option<usize>, String> {
+            let full = format!("{prefix}{name}");
+            if !tensors.has(&full) {
+                return Ok(None);
+            }
+            let column = tensors.column(&full)?;
+            let column = match range {
+                Some((a, e)) => column.slice(s![a..e, ..]).to_owned(),
+                None => column,
+            };
+            Ok(Some(b.operator(&format!("{full}[{}]", range.map_or(0, |r| r.0 / dh)), rows, &constant, column)?))
+        };
+        let (w_q, w_k, w_v, w_o) = (
+            tensors.get(&format!("{prefix}W_Q"))?,
+            tensors.get(&format!("{prefix}W_K"))?,
+            tensors.get(&format!("{prefix}W_V"))?,
+            tensors.get(&format!("{prefix}W_O"))?,
+        );
+        let mut terms = vec![(x, identity)];
+        for h in 0..heads {
+            let rows = (h * dh, (h + 1) * dh);
+            let read = |b: &mut Builder, name: &str, w: &Array2<f64>, bias_name: &str| -> Result<usize, String> {
+                let op = b.operator(&format!("{prefix}{name}{h}"), &head, &model, w.slice(s![rows.0..rows.1, ..]).to_owned())?;
+                let bias = bias(b, bias_name, &head, Some(rows))?;
+                Ok(b.node(Node::Affine { terms: vec![(x, op)], bias }))
+            };
+            let q = read(&mut b, "W_Q", &w_q, "b_Q")?;
+            let k = read(&mut b, "W_K", &w_k, "b_K")?;
+            let v = read(&mut b, "W_V", &w_v, "b_V")?;
+            let o_op = b.operator(&format!("{prefix}W_O{h}"), &model, &head, w_o.slice(s![.., rows.0..rows.1]).to_owned())?;
+            let attended = b.node(Node::Attend { query: q, key: k, value: v, scale: Scale::InverseSqrt(dh as u32), rotary: None, causal });
+            terms.push((attended, o_op));
+        }
+        let b_o = bias(&mut b, "b_O", &model, None)?;
+        x = b.node(Node::Affine { terms, bias: b_o });
+        if tensors.has(&format!("{prefix}W_in")) {
+            let w_in = tensors.get(&format!("{prefix}W_in"))?;
+            let hidden = w_in.nrows();
+            let units = interface(hidden, 1, LabelKind::Unit)?;
+            let w_in = b.operator(&format!("{prefix}W_in"), &units, &model, w_in)?;
+            let w_out = b.operator(&format!("{prefix}W_out"), &model, &units, tensors.get(&format!("{prefix}W_out"))?)?;
+            let (b_in, b_out) = (bias(&mut b, "b_in", &units, None)?, bias(&mut b, "b_out", &model, None)?);
+            let pre = b.node(Node::Affine { terms: vec![(x, w_in)], bias: b_in });
+            let act = b.node(Node::Pointwise { input: pre, laws: vec![Law::Relu; hidden] });
+            x = b.node(Node::Affine { terms: vec![(x, identity), (act, w_out)], bias: b_out });
+        }
+    }
+    let w_u = b.operator("W_U", &interface(classes, 1, LabelKind::Token)?, &model, tensors.get("W_U")?)?;
+    let b_u = if tensors.has("b_U") { Some(b.operator("b_U", &interface(classes, 1, LabelKind::Token)?, &constant, tensors.column("b_U")?)?) } else { None };
+    let logits = b.node(Node::Affine { terms: vec![(x, w_u)], bias: b_u });
+    let output = b.node(Node::Readout { input: logits, basis: 2 });
+    let declarations = Declarations {
+        parameters: 0,
+        domains: vec![Domain { size: vocab, cycle: None }, Domain { size: positions, cycle: None }, Domain { size: classes, cycle: None }],
+        slots: vec![Slot::Token { domain: 0 }, Slot::Token { domain: 1 }],
+    };
+    let program = OperatorProgram {
+        rules: Vec::new(),
+        declarations: declarations.clone(),
+        bases: vec![Basis::Indicator { domain: 0 }, Basis::Indicator { domain: 1 }, Basis::Indicator { domain: 2 }],
+        operators: b.operators,
+        nodes: b.nodes,
+        output,
+    };
+    let family = sequence_rows(&samples);
+    let name = record["model"].as_str().unwrap_or("model").to_string();
+    let contract = Contract {
+        declarations,
+        family,
+        kind: FamilyKind::Sample {
+            population: record["input"]["generator"].as_str().unwrap_or("the export's generator").to_string(),
+            confidence: 0.95,
+            units: (0..sample_rows).flat_map(|r| std::iter::repeat_n(r, positions)).collect(),
+        },
+        observations: 1,
+        readouts: 1,
+        readout_slots: None,
+    };
+    Ok(Imported { name, kind: "transformer_rows".to_string(), program, contract, record })
+}
+
+/// Token prompts (one per row of `prompts`) as the rows of a per-position program: each prompt's
+/// positions in order, the slots the token and the position.
+pub fn sequence_rows(prompts: &Array2<f64>) -> FamilyInputs {
+    let (count, positions) = prompts.dim();
+    let (mut tokens, mut at, mut sequence) = (Vec::new(), Vec::new(), Vec::new());
+    for (r, prompt) in prompts.outer_iter().enumerate() {
+        for (p, t) in prompt.iter().enumerate() {
+            tokens.push(*t as u32);
+            at.push(p as u32);
+            sequence.push(r as u32);
+        }
+    }
+    FamilyInputs {
+        rows: count * positions,
+        slots: vec![SlotValues::Tokens(tokens), SlotValues::Tokens(at.clone())],
+        layout: Some(SequenceLayout { sequence, position: at }),
+    }
+}
+
 /// A pre-norm rotary language model export as a per-position program over the first `sequences`
 /// token rows at positions `0..context`: every row runs one shared local program, and attention
 /// reads the rows of its own sequence up to its position. The readout at each row is the
