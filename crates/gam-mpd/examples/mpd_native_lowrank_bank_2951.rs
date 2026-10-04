@@ -62,8 +62,8 @@ fn main() -> Result<(), String> {
             if rank > decomposition.singular_values.len() { return Err(format!("rank {rank} exceeds {name} dimensions")); }
             let kept: Vec<usize> = (0..rank).collect();
             let roots = Array1::from_iter(decomposition.singular_values.iter().take(rank).map(|s| s.sqrt()));
-            let left = decomposition.u.select(Axis(1), &kept) * &roots;
-            let right = decomposition.vt.select(Axis(0), &kept) * &roots.insert_axis(Axis(1));
+            let left = (decomposition.u.select(Axis(1), &kept) * &roots).as_standard_layout().into_owned();
+            let right = (decomposition.vt.select(Axis(0), &kept) * &roots.insert_axis(Axis(1))).as_standard_layout().into_owned();
             let precision = exact_precision(left.iter().chain(right.iter()).copied()).map_err(|e| e.to_string())?;
             let provenance = Provenance::derived(&[&original.provenance], format!("native matrix truncated SVD rank {rank}; balanced factors; f32 literal rounding at serialization"));
             let op = Operator::low_rank(name.clone(), original.rows.clone(), original.cols.clone(), left, right, precision, provenance).map_err(|e| e.to_string())?;
