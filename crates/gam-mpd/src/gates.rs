@@ -194,7 +194,8 @@ pub fn gelu(h: f64) -> f64 {
     0.5 * h * (1.0 + (SQRT_2_OVER_PI * (h + 0.044715 * h * h * h)).tanh())
 }
 
-fn gelu_derivative(h: f64) -> f64 {
+/// The derivative of [`gelu`].
+pub fn gelu_derivative(h: f64) -> f64 {
     let t = (SQRT_2_OVER_PI * (h + 0.044715 * h * h * h)).tanh();
     0.5 * (1.0 + t) + 0.5 * h * (1.0 - t * t) * SQRT_2_OVER_PI * (1.0 + 3.0 * 0.044715 * h * h)
 }

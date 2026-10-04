@@ -155,6 +155,29 @@ impl Decoder {
         &self.blocks[site / KINDS.len()].maps[site % KINDS.len()]
     }
 
+    /// The tied embedding (vocab × d_model).
+    pub fn embedding(&self) -> &Array2<f64> {
+        &self.wte
+    }
+
+    pub fn final_gain(&self) -> &Array1<f64> {
+        &self.final_gain
+    }
+
+    /// Block `layer`'s norm gains before its attention and its MLP.
+    pub fn gains(&self, layer: usize) -> (&Array1<f64>, &Array1<f64>) {
+        (&self.blocks[layer].rms1, &self.blocks[layer].rms2)
+    }
+
+    pub fn eps(&self) -> f64 {
+        self.eps
+    }
+
+    /// The rotation's frequency per plane of a head.
+    pub fn inv_freq(&self) -> &[f64] {
+        &self.inv_freq
+    }
+
     fn rotate(&self, x: &mut Array2<f64>) {
         let head_dim = x.ncols() / self.heads;
         let half = head_dim / 2;

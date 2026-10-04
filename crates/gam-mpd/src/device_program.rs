@@ -134,6 +134,7 @@ pub struct DeviceProgram {
     /// Each node's width.
     widths: Vec<usize>,
     head: Head,
+    edited_head_nodes: BTreeMap<usize, Option<usize>>,
     operators: BTreeMap<(usize, Role), HeldOperator>,
     batch: Mutex<Option<Arc<PreparedBatch>>>,
     /// The arithmetic of every product in the forward pass and the head (float64 by default; a
@@ -202,6 +203,9 @@ impl DeviceProgram {
             Node::Readout { input, .. } => vec![program.output, *input],
             _ => vec![program.output],
         };
+        let edited_head_nodes = head_nodes.iter().map(|&node| (node, match &program.nodes[node] {
+            Node::Readout { input, .. } => Some(*input), _ => None,
+        })).collect();
         // Which nodes read each node: a feature may only be read by affine terms.
         let mut readers: Vec<Vec<usize>> = vec![Vec::new(); program.nodes.len()];
         for (index, node) in program.nodes.iter().enumerate() {
@@ -292,7 +296,7 @@ impl DeviceProgram {
             };
             operators.insert(key, HeldOperator { source, held });
         }
-        Ok(Self { device: device.clone(), steps, widths, head, operators, batch: Mutex::new(None), arithmetic: Arithmetic::F64 })
+        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), arithmetic: Arithmetic::F64 })
     }
 
     fn head_of(program: &OperatorProgram) -> Result<Head, String> {
@@ -539,6 +543,12 @@ impl DeviceProgram {
         self.forward_gated(family, given, &[], |_, _| Err("device: no gate decides".to_string()))
     }
 
+    /// Resident forward values when edited execution materializes logits and Readout.
+    /// Attention workspaces still require additional memory; callers should batch conservatively.
+    pub fn edited_bytes_per_row(&self) -> usize {
+        self.bytes_per_row().saturating_add(self.edited_head_nodes.keys().map(|&n| 8 * self.widths[n]).sum::<usize>())
+    }
+
     /// An autonomous forward pass (`OperatorProgram::execute_with_gates` on the device): for each
     /// `(amplitude, mask)` of `gated` (a raw mask node read only after its amplitude node), once
     /// the amplitude is computed `decide(amplitude, trace)` returns the mask's value (rows × its
@@ -547,29 +557,84 @@ impl DeviceProgram {
     pub fn forward_gated(
         &self,
         family: &FamilyInputs,
+        given: BTreeMap<usize, Tensor>,
+        gated: &[(usize, usize)],
+        decide: impl FnMut(usize, &DeviceTrace) -> Result<Tensor, String>,
+    ) -> Result<DeviceTrace, String> {
+        self.forward_hooks(family, given, gated, decide, false, |_, _| Ok(()), |_, _| Ok(None))
+    }
+
+    /// Per-node edits on materialized values, preserving exception-before-intervention order.
+    /// An unsupported unmaterialized head/feature is not offered to either callback.
+    pub fn forward_edited(
+        &self,
+        family: &FamilyInputs,
+        given: BTreeMap<usize, Tensor>,
+        before: impl FnMut(usize, &mut Tensor) -> Result<(), String>,
+        edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
+    ) -> Result<DeviceTrace, String> {
+        self.forward_hooks(
+            family,
+            given,
+            &[],
+            |_, _| Err("no gate".into()),
+            true,
+            before,
+            edit,
+        )
+    }
+
+    fn forward_hooks(
+        &self,
+        family: &FamilyInputs,
         mut given: BTreeMap<usize, Tensor>,
         gated: &[(usize, usize)],
         mut decide: impl FnMut(usize, &DeviceTrace) -> Result<Tensor, String>,
+        materialize_heads: bool,
+        mut before: impl FnMut(usize, &mut Tensor) -> Result<(), String>,
+        mut edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
     ) -> Result<DeviceTrace, String> {
         let d = &self.device;
         let rows = family.rows;
         for &(amplitude, mask) in gated {
-            if mask >= amplitude || amplitude >= self.steps.len() || !matches!(self.steps[mask], Step::Raw { .. }) || self.widths[mask] != self.widths[amplitude] {
-                return Err(format!("device: gate ({amplitude}, {mask}) is not an amplitude after its raw mask of the same width"));
+            if mask >= amplitude
+                || amplitude >= self.steps.len()
+                || !matches!(self.steps[mask], Step::Raw { .. })
+                || self.widths[mask] != self.widths[amplitude]
+            {
+                return Err(format!(
+                    "device: gate ({amplitude}, {mask}) is not an amplitude after its raw mask of the same width"
+                ));
             }
         }
         let batch = self.prepared_batch(family)?;
-        let mut trace = DeviceTrace { values: Vec::with_capacity(self.steps.len()), rows, ids: batch.ids.clone(), blocks: batch.blocks, rotations: Arc::clone(&batch.rotations) };
+        let mut trace = DeviceTrace {
+            values: Vec::with_capacity(self.steps.len()),
+            rows,
+            ids: batch.ids.clone(),
+            blocks: batch.blocks,
+            rotations: Arc::clone(&batch.rotations),
+        };
         for (index, step) in self.steps.iter().enumerate() {
             let width = self.widths[index];
             let value = match step {
+                Step::Head if materialize_heads => Some(match self.edited_head_nodes.get(&index) {
+                    Some(Some(input)) => d.copy(trace.value(*input)?).map_err(error)?,
+                    Some(None) => self.logits_on_device(&trace)?,
+                    None => return Err(format!("device: missing edited head node {index}")),
+                }),
                 Step::Head => None,
                 Step::Feature { .. } => None,
                 // A gated mask is filled once its amplitude is known.
                 Step::Raw { .. } if gated.iter().any(|(_, mask)| *mask == index) => None,
                 Step::Raw { slot } => match given.remove(slot) {
                     Some(value) if value.dim() == (rows, width) => Some(value),
-                    Some(value) => return Err(format!("device: a {:?} value for slot {slot} of {rows} × {width}", value.dim())),
+                    Some(value) => {
+                        return Err(format!(
+                            "device: a {:?} value for slot {slot} of {rows} × {width}",
+                            value.dim()
+                        ));
+                    }
                     None => {
                         let SlotValues::Raw(values) = &family.slots[*slot] else {
                             return Err(format!("device: slot {slot} holds no raw rows"));
@@ -577,19 +642,30 @@ impl DeviceProgram {
                         Some(d.upload(values.view()).map_err(error)?)
                     }
                 },
-                Step::Constant { operator } => Some(d.broadcast_rows(self.column(*operator)?, rows).map_err(error)?),
+                Step::Constant { operator } => Some(
+                    d.broadcast_rows(self.column(*operator)?, rows)
+                        .map_err(error)?,
+                ),
                 Step::Affine { terms, bias } => {
                     let mut out = d.zeros(rows, width).map_err(error)?;
                     for (argument, operator) in terms {
                         if let Step::Feature { slot } = &self.steps[*argument] {
                             let Held::Table(table) = self.held(*operator, Role::Table)? else {
-                                return Err("device: an operator held in the wrong role".to_string());
+                                return Err(
+                                    "device: an operator held in the wrong role".to_string()
+                                );
                             };
                             let ids = trace.ids.get(slot).ok_or("device: feature ids missing")?;
                             let gathered = d.gather_rows(table, ids).map_err(error)?;
                             d.axpy(&mut out, 1.0, &gathered).map_err(error)?;
                         } else {
-                            self.add_product(&mut out, trace.value(*argument)?, *operator, false, self.arithmetic)?;
+                            self.add_product(
+                                &mut out,
+                                trace.value(*argument)?,
+                                *operator,
+                                false,
+                                self.arithmetic,
+                            )?;
                         }
                     }
                     if let Some(b) = bias {
@@ -597,36 +673,98 @@ impl DeviceProgram {
                     }
                     Some(out)
                 }
-                Step::Pointwise { input, codes } => Some(d.law_values(trace.value(*input)?, codes, gelu_tanh_constant()).map_err(error)?),
+                Step::Pointwise { input, codes } => Some(
+                    d.law_values(trace.value(*input)?, codes, gelu_tanh_constant())
+                        .map_err(error)?,
+                ),
                 Step::Hadamard { left, right } => {
                     let mut out = d.zeros(rows, width).map_err(error)?;
-                    d.hadamard(&mut out, trace.value(*left)?, trace.value(*right)?, false).map_err(error)?;
+                    d.hadamard(&mut out, trace.value(*left)?, trace.value(*right)?, false)
+                        .map_err(error)?;
                     Some(out)
                 }
-                Step::RmsNorm { input, epsilon } => Some(d.rms_norm(trace.value(*input)?, *epsilon).map_err(error)?),
-                Step::Attend { query, key, value, scale, rotary, causal } => {
+                Step::RmsNorm { input, epsilon } => {
+                    Some(d.rms_norm(trace.value(*input)?, *epsilon).map_err(error)?)
+                }
+                Step::Attend {
+                    query,
+                    key,
+                    value,
+                    scale,
+                    rotary,
+                    causal,
+                } => {
                     let (q, k) = self.rotated(&trace, *query, *key, *rotary)?;
                     let v = trace.value(*value)?;
                     if Self::tile_attention(&trace) {
-                        Some(super::device_attention::forward(d, (&q, &k, v), trace.blocks, *scale, *causal, self.arithmetic).map_err(error)?)
+                        Some(
+                            super::device_attention::forward(
+                                d,
+                                (&q, &k, v),
+                                trace.blocks,
+                                *scale,
+                                *causal,
+                                self.arithmetic,
+                            )
+                            .map_err(error)?,
+                        )
                     } else {
                         let alpha = self.attention(&trace, &q, &k, *scale, *causal)?;
                         let mut out = d.zeros(rows, v.cols()).map_err(error)?;
-                        d.gemm_batched(trace.blocks, &mut out, 1.0, &alpha, Op::N, v, Op::N, 0.0, self.arithmetic).map_err(error)?;
+                        d.gemm_batched(
+                            trace.blocks,
+                            &mut out,
+                            1.0,
+                            &alpha,
+                            Op::N,
+                            v,
+                            Op::N,
+                            0.0,
+                            self.arithmetic,
+                        )
+                        .map_err(error)?;
                         Some(out)
                     }
                 }
                 Step::Transposed { input, operator } => {
                     let mut out = d.zeros(rows, width).map_err(error)?;
-                    self.add_product(&mut out, trace.value(*input)?, *operator, true, self.arithmetic)?;
+                    self.add_product(
+                        &mut out,
+                        trace.value(*input)?,
+                        *operator,
+                        true,
+                        self.arithmetic,
+                    )?;
                     Some(out)
                 }
             };
+            let mut value = value;
+            if let Some(value) = &mut value {
+                before(index, value)?;
+            }
             trace.values.push(value);
+            if let Some(replacement) = edit(index, &trace)? {
+                if trace.values[index].is_none() {
+                    return Err(format!(
+                        "device: edit of unmaterialized node {index} is unsupported"
+                    ));
+                }
+                if replacement.dim() != (rows, width) {
+                    return Err(format!(
+                        "device: edited node {index} has {:?}, expected {rows} x {width}",
+                        replacement.dim()
+                    ));
+                }
+                trace.values[index] = Some(replacement);
+            }
             if let Some(&(_, mask)) = gated.iter().find(|(amplitude, _)| *amplitude == index) {
                 let decided = decide(index, &trace)?;
                 if decided.dim() != (rows, self.widths[mask]) {
-                    return Err(format!("device: a {:?} mask for gate {index} of {rows} × {}", decided.dim(), self.widths[mask]));
+                    return Err(format!(
+                        "device: a {:?} mask for gate {index} of {rows} × {}",
+                        decided.dim(),
+                        self.widths[mask]
+                    ));
                 }
                 trace.values[mask] = Some(decided);
             }

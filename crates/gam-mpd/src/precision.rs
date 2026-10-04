@@ -575,6 +575,19 @@ impl<W, D> DecodedFidelity<W, D> {
         self.tolerance
     }
 
+    /// Reuse the same decoded evidence at another declared tolerance. This changes
+    /// neither the evaluated artifact nor its input domain and performs no new measurement.
+    pub fn with_tolerance(&self, tolerance: f64) -> Result<Self, String>
+    where
+        W: Clone,
+        D: Clone,
+    {
+        if !tolerance.is_finite() || tolerance < 0.0 {
+            return Err("the fidelity tolerance must be finite and nonnegative".into());
+        }
+        Ok(Self { status: self.status.clone(), tolerance })
+    }
+
     /// What the status proves about the tolerance. The owner of the rounding is
     /// [`EvidenceStatus`]: an exact figure with no numerical error is never unresolved.
     pub fn verdict(&self) -> FidelityVerdict {

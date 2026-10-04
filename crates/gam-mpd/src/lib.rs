@@ -58,6 +58,24 @@ pub mod contract;
 // Progress logging for the drivers.
 pub mod engine;
 
+// The explanation as one artifact: program, block bindings, places, exceptions; its message and
+// its blocks grafted onto the native model.
+pub mod artifact;
+pub mod artifact_device;
+
+// One acceptance path: minimise C(P) subject to D_local(P) ≤ δ and D_run(P) ≤ ε, over a frontier.
+pub mod acceptance;
+pub mod candidate_frontier;
+
+#[cfg(test)]
+mod acceptance_tests;
+
+// D_run of a language model's artifact under counterfactual's declared episodes.
+pub mod run_check;
+
+// The team's pieces (MLP accounts, rules, decomposition coordinates) as proposals to the one search.
+pub mod proposals;
+
 // Per-input pieces of one linear map: an overcomplete rank-1 library fitted so that each input
 // lists few pieces (listing code plus second-order KL).
 pub mod pieces;
@@ -196,6 +214,12 @@ pub mod gates;
 // Libraries fitted on one site's own inputs to its second-order code.
 pub mod site_fit;
 
+// An MLP accounted for by explicit rules between its subcomponents' amplitudes.
+pub mod mlp_account;
+
+#[cfg(test)]
+mod mlp_account_tests;
+
 // Per-input sparse coding of a site's output by its blocks' real contributions, with certified bounds.
 pub mod sparse_code;
 
@@ -204,7 +228,16 @@ mod sparse_code_tests;
 
 // Counterfactual response: an explanation's predicted response to declared interventions
 // against the native model's.
+/// Signed composition accounting on an observed execution: a replaced site's output error split
+/// into what it omits on the clean input and its changed response to error arriving from upstream.
+pub mod composition;
 pub mod counterfactual;
+
+// The evaluation side on a device: the decoder resident, every compared program run there in batches.
+pub mod eval_device;
+
+#[cfg(test)]
+mod eval_device_tests;
 
 #[cfg(test)]
 mod counterfactual_tests;

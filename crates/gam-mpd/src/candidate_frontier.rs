@@ -53,12 +53,14 @@ pub struct Frontier {
     pub measured_candidates: usize,
 }
 
-fn state(assessment: &Assessment) -> State {
-    match (assessment.local.verdict(), assessment.run.verdict()) {
+fn state(assessment: &Assessment, constraint: Constraint) -> Result<State, String> {
+    let local = assessment.local.with_tolerance(constraint.local)?;
+    let run = assessment.run.with_tolerance(constraint.run)?;
+    Ok(match (local.verdict(), run.verdict()) {
         (FidelityVerdict::Violates, _) | (_, FidelityVerdict::Violates) => State::Violates,
         (FidelityVerdict::Meets, FidelityVerdict::Meets) => State::Verified,
         _ => State::Unresolved,
-    }
+    })
 }
 
 fn point(constraint: Constraint, evidence: Vec<Evidence>) -> Point {
@@ -110,20 +112,18 @@ pub fn frontier(
     let measured_candidates = if constraints.is_empty() { 0 } else { budget.min(unique.len()) };
     let mut evidence: Vec<Vec<Evidence>> = constraints.iter().map(|_| Vec::new()).collect();
     for (index, (cost, label, artifact, _)) in unique.iter().enumerate() {
-        let mut failure: Option<String> = None;
+        // Measurement is independent of the declared tolerance grid. Encoding and decoding
+        // a real model for each point can cost more than evaluating it; reuse its evidence.
+        let assessed = if index < measured_candidates {
+            Some(assess(local, run, artifact, constraints[0], &mut cache))
+        } else {
+            None
+        };
         for (constraint, row) in constraints.iter().zip(&mut evidence) {
-            let state = if index >= measured_candidates {
-                State::Unevaluated
-            } else if let Some(error) = &failure {
-                State::Failed(error.clone())
-            } else {
-                match assess(local, run, artifact, *constraint, &mut cache) {
-                    Ok(assessment) => state(&assessment),
-                    Err(error) => {
-                        failure = Some(error.clone());
-                        State::Failed(error)
-                    }
-                }
+            let state = match &assessed {
+                None => State::Unevaluated,
+                Some(Err(error)) => State::Failed(error.clone()),
+                Some(Ok(assessment)) => state(assessment, *constraint)?,
             };
             row.push(Evidence { label: label.clone(), cost: *cost, state });
         }
