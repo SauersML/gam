@@ -503,28 +503,9 @@ fn run(dir: &Path, out: &Path, observations: f64) -> Result<(), String> {
     let mut structured = Structured::new(geometries);
     let batches = vec![(family.clone(), target)];
     let ones = |ranks: &[Vec<usize>]| vec![ranks.iter().map(|r| Array2::<f64>::ones((family.rows, r.len()))).collect::<Vec<_>>()];
-    let mut calibrations = Vec::new();
-    // The price is calibrated on the selected planes (the point in question), then kept for every
-    // point, so every point is selected and fitted under one price. Each point is written as it
-    // lands.
-    let (planes_on, planes_selected, planes_on_bits, planes_selected_bits) = loop {
-        let coded = Coded { model: &program, sites: chosen.clone(), batches: batches.clone(), observations, samples: 16, describe: &structured, boxed: None };
-        let mut planes_on = Blocked::new(plane_libraries.clone(), plane_ranks.clone(), ones(&plane_ranks));
-        planes_on.price(&coded)?;
-        let (planes_on_bits, _) = measure(&coded, &planes_on)?;
-        let (planes_selected, planes_selected_bits) = selected(&coded, planes_on.clone())?;
-        let (measured, priced, _) = rounding_error(&coded, &planes_selected)?;
-        eprintln!("rounding: measured {measured:.1} bits against {priced:.1} priced");
-        calibrations.push(json!({"measured": measured, "priced": priced}));
-        let ratio = if priced > 0.0 { measured / priced } else { f64::INFINITY };
-        if (0.5..=2.0).contains(&ratio) || measured <= 0.0 || calibrations.len() >= 6 {
-            break (planes_on, planes_selected, planes_on_bits, planes_selected_bits);
-        }
-        structured = structured.scaled(if ratio.is_finite() { ratio } else { 1e3 });
-    };
-    let coded = Coded { model: &program, sites: chosen.clone(), batches, observations, samples: 16, describe: &structured, boxed: None };
+    let mut calibrations: Vec<Value> = Vec::new();
     let mut points = Vec::new();
-    let write = |points: &[Value]| -> Result<(), String> {
+    let write = |points: &[Value], calibrations: &[Value]| -> Result<(), String> {
         let report = json!({
             "observations": observations,
             "claim": "corner",
@@ -536,29 +517,52 @@ fn run(dir: &Path, out: &Path, observations: f64) -> Result<(), String> {
     };
     // Every point also with its blocks all on: with the library paid once, a block that runs on
     // every word names no words.
-    let on_everywhere = |blocked: &Blocked| -> Result<(Blocked, Bits), String> {
+    let on_everywhere = |coded: &Coded<'_>, blocked: &Blocked| -> Result<(Blocked, Bits), String> {
         let mut on = all_on(blocked);
-        on.price(&coded)?;
-        let (bits, _) = measure(&coded, &on)?;
+        on.price(coded)?;
+        let (bits, _) = measure(coded, &on)?;
         Ok((on, bits))
     };
-    let (whole, whole_bits) = on_everywhere(&planes_on.whole())?;
-    points.push(report("whole sites", &coded, &whole, &whole_bits, &structured, None)?);
-    points.push(report("planes, all on", &coded, &planes_on, &planes_on_bits, &structured, Some(plane_labels.as_slice()))?);
+    // The points that run every block need no selection, and their decoded descriptions price
+    // themselves exactly, so they come first: each site's whole map, and the planes all on.
+    {
+        let coded = Coded { model: &program, sites: chosen.clone(), batches: batches.clone(), observations, samples: 16, describe: &structured, boxed: None };
+        let planes = Blocked::new(plane_libraries.clone(), plane_ranks.clone(), ones(&plane_ranks));
+        let (whole, whole_bits) = on_everywhere(&coded, &planes.whole())?;
+        points.push(report("whole sites", &coded, &whole, &whole_bits, &structured, None)?);
+        let (planes_on, planes_on_bits) = on_everywhere(&coded, &planes)?;
+        points.push(report("planes, all on", &coded, &planes_on, &planes_on_bits, &structured, Some(plane_labels.as_slice()))?);
+        write(&points, &calibrations)?;
+    }
+    // The price is calibrated on the selected planes (the point in question), then kept for every
+    // selected and fitted point. Each point is written as it lands.
+    let (planes_selected, planes_selected_bits) = loop {
+        let coded = Coded { model: &program, sites: chosen.clone(), batches: batches.clone(), observations, samples: 16, describe: &structured, boxed: None };
+        let (planes_selected, planes_selected_bits) = selected(&coded, Blocked::new(plane_libraries.clone(), plane_ranks.clone(), ones(&plane_ranks)))?;
+        let (measured, priced, _) = rounding_error(&coded, &planes_selected)?;
+        eprintln!("rounding: measured {measured:.1} bits against {priced:.1} priced");
+        calibrations.push(json!({"measured": measured, "priced": priced}));
+        let ratio = if priced > 0.0 { measured / priced } else { f64::INFINITY };
+        if (0.5..=2.0).contains(&ratio) || measured <= 0.0 || calibrations.len() >= 6 {
+            break (planes_selected, planes_selected_bits);
+        }
+        structured = structured.scaled(if ratio.is_finite() { ratio } else { 1e3 });
+    };
+    let coded = Coded { model: &program, sites: chosen.clone(), batches, observations, samples: 16, describe: &structured, boxed: None };
     points.push(report("planes, selected", &coded, &planes_selected, &planes_selected_bits, &structured, Some(plane_labels.as_slice()))?);
-    write(&points)?;
+    write(&points, &calibrations)?;
     let svd_ranks: Vec<Vec<usize>> = svd_libraries.iter().map(|l| vec![1; l.v.nrows()]).collect();
     let (rank_one, _) = selected(&coded, Blocked::rank_one(svd_libraries.clone(), ones(&svd_ranks)))?;
     let (fitted, fitted_bits) = fit_blocks(&coded, rank_one, true)?;
     points.push(report("fitted from rank-one subcomponents", &coded, &fitted, &fitted_bits, &structured, None)?);
-    let (fitted_on, fitted_on_bits) = on_everywhere(&fitted)?;
+    let (fitted_on, fitted_on_bits) = on_everywhere(&coded, &fitted)?;
     points.push(report("fitted from rank-one subcomponents, all on", &coded, &fitted_on, &fitted_on_bits, &structured, None)?);
-    write(&points)?;
+    write(&points, &calibrations)?;
     let (seeded, seeded_bits) = fit_blocks(&coded, planes_selected, true)?;
     points.push(report("fitted from the selected planes", &coded, &seeded, &seeded_bits, &structured, None)?);
-    let (seeded_on, seeded_on_bits) = on_everywhere(&seeded)?;
+    let (seeded_on, seeded_on_bits) = on_everywhere(&coded, &seeded)?;
     points.push(report("fitted from the selected planes, all on", &coded, &seeded_on, &seeded_on_bits, &structured, None)?);
-    write(&points)
+    write(&points, &calibrations)
 }
 
 fn main() -> Result<(), String> {
