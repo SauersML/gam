@@ -122,6 +122,10 @@ pub fn frontier(
         } else {
             None
         };
+        // This distinct candidate is never assessed again here. The owned assessment
+        // below carries all evidence; keeping its full encoded key grows memory with
+        // the sum of model sizes rather than the currently measured candidate.
+        cache.clear_measurements();
         for (constraint, row) in constraints.iter().zip(&mut evidence) {
             let state = match &assessed {
                 None => State::Unevaluated,

@@ -193,7 +193,7 @@ fn main() -> Result<(), String> {
         Some(Ascent { domain: vec![SlotDomain::Tokens((0..vocab).collect())], pool: Vec::new(), evaluations: ascent_evaluations })
     };
     let local = Local::new(&native, local_family.clone(), ascent, batch);
-    let start = Artifact::native(&native)?;
+    let start = Artifact::native(&native)?.f32_literals()?;
     let mut candidates = vec![Candidate { label: "native".into(), artifact: start.clone() }];
     let mut labels = BTreeSet::from(["native".to_string()]);
     let bank_dir = bank_path.parent().unwrap_or(Path::new("."));
@@ -203,7 +203,15 @@ fn main() -> Result<(), String> {
         }
         let path = resolve(bank_dir, &entry.artifact);
         let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let artifact = Artifact::from_bytes(&bytes, &native.declarations)?;
+        let mut artifact = Artifact::from_bytes(&bytes, &native.declarations)?;
+        // Decoding separate files need not retain separate copies of unchanged
+        // native tensors. Full equality includes values and metadata; matching an
+        // index alone never licenses reuse, and changed operators remain owned.
+        for (operator, base) in artifact.program.operators.iter_mut().zip(&start.program.operators) {
+            if operator.as_ref() == base.as_ref() {
+                *operator = base.clone();
+            }
+        }
         candidates.push(Candidate { label: entry.label, artifact });
         input_paths.insert(path);
     }
@@ -293,7 +301,7 @@ fn main() -> Result<(), String> {
     let report = json!({
         "execution": {"backend": run.backend_name(), "local": "CPU f64", "teacher": "immutable cached CPU residuals and native effects", "readout_and_KL": "CPU f64", "cuda_episode_parallelism": 1, "teacher_parallelism": parallel, "teacher_cache_memory": "one final residual matrix per episode plus scalar native effects; initialization also retains clean native passage traces and requested donor rows",
             "cuda_trace_limit_scope": "intermediate activation estimate only; excludes operators, attention workspaces, edit masks and allocator overhead",
-            "cuda_upload_scope": "full real artifact compiled/uploaded for each donor or episode; requested donor rows downloaded then reuploaded for mixes"},
+            "cuda_upload_scope": "one base per candidate; episode/donor forks share unchanged operator tensors by Arc identity and role; requested donor rows downloaded then reuploaded for mixes"},
         "scope": "explicit finite candidate bank; tested local inputs and declared counterfactual episodes only",
         "objective": "min C(P) subject to D_local <= delta and D_run <= epsilon",
         "optimality": "gap zero proves optimum within this bank only; unresolved, failed and unevaluated candidates remain in the lower bound",
