@@ -243,13 +243,17 @@ pub fn account_bank(start: &Artifact, proposer: &super::proposals::AccountPropos
         .iter()
         .map(|(layer, indices)| ChoiceGroup {
             label: format!("MLP layer {layer}"),
-            choices: indices.iter().map(|&i| proposer.accounts[i].1.clone()).collect(),
+            choices: indices.iter().flat_map(|&i| [proposer.accounts[i].1.clone(), format!("{} shared bodies", proposer.accounts[i].1)]).collect(),
         })
         .collect();
     combination_bank(start, &choices, max_bank, |artifact, group, choice| {
         let (layer, indices) = &groups[group];
-        let (_, name, account) = &proposer.accounts[indices[choice]];
-        super::proposals::with_account(artifact, name, &proposer.layers[*layer], account)
+        let (_, name, account) = &proposer.accounts[indices[choice / 2]];
+        if choice % 2 == 0 {
+            super::proposals::with_account(artifact, name, &proposer.layers[*layer], account)
+        } else {
+            super::proposals::with_account_shared(artifact, name, &proposer.layers[*layer], account)
+        }
     })
 }
 

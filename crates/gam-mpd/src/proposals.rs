@@ -17,7 +17,11 @@
 //! normed input to its output (`run_check::LayerNodes::normed`, `::mlp`); the hidden layer appears
 //! nowhere, so a native neuron is not a place of the result. [`AccountProposer`] proposes every
 //! account a directory holds in `mlp_functions`' layout (`L{layer}[.{start}].rules.json` with
-//! `.reads.f64`, `.writes.f64` and `.offset.f64`).
+//! `.reads.f64`, `.writes.f64` and `.offset.f64`). Each account also offers
+//! [`with_account_shared`]: complete identical learned scalar functions become shared Rule
+//! bodies with explicit read bindings. This preserves supplied numerical functions; it neither
+//! discovers new operations nor turns repeated GELU primitives into learned-rule evidence.
+//! Ordinary serialized C32 and exact fidelity checks decide between flat and shared variants.
 //!
 //! # Attention head rules
 //!
@@ -42,6 +46,10 @@ use super::operator_program::{Interface, LabelKind, Law, Node, Operator, Provena
 use super::run_check::LayerNodes;
 use ndarray::{Array1, Array2};
 use std::path::{Path, PathBuf};
+
+#[path = "shared_account.rs"]
+mod shared_accounts;
+pub use shared_accounts::with_account_shared;
 
 /// A dense operator on `rows × cols` one-coordinate groups whose present blocks are `present`.
 fn sparse(name: &str, rows: &Interface, cols: &Interface, values: Array2<f64>, present: Array2<bool>) -> Result<Operator, String> {
@@ -272,6 +280,8 @@ impl Proposer for AccountProposer {
             }
             let candidate = with_account(context.current, name, &self.layers[*layer], account)?;
             out.push(Proposal { source: "functions".to_string(), description: name.clone(), candidate });
+            let candidate = with_account_shared(context.current, name, &self.layers[*layer], account)?;
+            out.push(Proposal { source: "functions shared bodies".to_string(), description: format!("{name} shared bodies"), candidate });
         }
         Ok(out)
     }
