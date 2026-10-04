@@ -254,9 +254,10 @@ def flip_prices(target, D, ids, clean, program, candidates, batch: int):
 def stage_oracle():
     """The model as the concept fit's oracle (examples/mpd_nl_concepts_2951.rs) on the rows argv[2]
     (lo:hi). Each request on stdin carries every word's program; kind 0 is answered with each word's
-    exact KL(model || model running only its program), kind 1 (which also carries the sets) with
-    each set member's exact price at the programs (flip_prices), f32 nats on stdout. The clean
-    logits are kept."""
+    exact KL(model || model running only its program); kinds 1 and 2 also carry the sets and are
+    answered per set member with its exact price at the programs (flip_prices), or with its slope
+    -d(sum of every word's KL)/d(its mask) (one backward per batch of rows); f32 nats on stdout.
+    The clean logits are kept."""
     import torch
 
     lo, hi = (int(x) for x in sys.argv[2].split(":"))
@@ -289,9 +290,29 @@ def stage_oracle():
                     logits = masked(target, ids[b0:b0 + B], masks_of(D, dev, B, word[sel] - b0 * D.context, glob[sel]))
                     out.append(kl_per_pos(logits, tgt).reshape(-1).float().cpu().numpy())
         else:
-            cptr = u64(1)
+            count = int(u64(1)[0])
             cword = np.repeat(np.arange(words), np.diff(u64(words + 1)))
-            cand = u32(int(cptr[0]))
+            cand = u32(count)
+        if kind == 2:
+            for b0, tgt in zip(range(0, hi - lo, batch), clean):
+                B = tgt.shape[0]
+                sel = (word >= b0 * D.context) & (word < (b0 + B) * D.context)
+                masks = masks_of(D, dev, B, word[sel] - b0 * D.context, glob[sel])
+                for m in masks.values():
+                    m.requires_grad_(True)
+                kl_per_pos(masked(target, ids[b0:b0 + B], masks), tgt).sum().backward()
+                csel = np.nonzero((cword >= b0 * D.context) & (cword < (b0 + B) * D.context))[0]
+                w, g = cword[csel] - b0 * D.context, cand[csel]
+                slope = np.zeros(len(g), dtype=np.float32)
+                for s, name in enumerate(D.names):
+                    k = np.nonzero(D.site[g] == s)[0]
+                    if len(k):
+                        grad = masks[model_site(name)].grad
+                        wt = torch.tensor(w[k], device=dev)
+                        slope[k] = -grad[wt // D.context, wt % D.context, torch.tensor(g[k] - D.offsets[s], device=dev)].float().cpu().numpy()
+                out.append(slope)
+                del masks
+        elif kind == 1:
             for r in range(hi - lo):
                 a, b = r * D.context, (r + 1) * D.context
                 p = (word >= a) & (word < b)
@@ -301,7 +322,7 @@ def stage_oracle():
         stdout.write(out.astype("<f4").tobytes())
         stdout.flush()
         calls += 1
-        print(f"oracle call {calls} ({'KL' if kind == 0 else 'prices'}): mean {out.mean():.4f}", file=sys.stderr, flush=True)
+        print(f"oracle call {calls} ({['KL', 'prices', 'slopes'][kind]}): mean {out.mean():.4f}", file=sys.stderr, flush=True)
 
 
 # ------------------------------------------------------------------ evidence and names

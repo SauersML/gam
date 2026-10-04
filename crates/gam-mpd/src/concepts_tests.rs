@@ -43,6 +43,11 @@ impl Oracle for Additive<'_> {
         assert_eq!(programs.len(), sets.rows(), "a program per word");
         Ok(self.price.to_vec())
     }
+
+    /// The KL is linear in the masks, so the slopes are the prices.
+    fn slopes(&mut self, programs: &[Vec<u32>], sets: &Sets) -> Result<Vec<f64>, String> {
+        self.prices(programs, sets)
+    }
 }
 
 /// Words over 40 subcomponents: three planted groups, each needed at rate 0.2 (every member on,
@@ -113,7 +118,7 @@ fn planted_groups_become_the_vocabulary() {
 }
 
 /// Two subcomponents that back each other up: either alone keeps the word exact, both off cost
-/// 100 nats. At both on each one's price is nothing, so the prices propose dropping both. A price
+/// 100 nats (`100 (1 − m_a)(1 − m_b)`). At both on each one's price is nothing, so the prices propose dropping both. A price
 /// is a flip with the rest of the program kept.
 struct Redundant;
 
@@ -127,6 +132,11 @@ impl Oracle for Redundant {
             .flat_map(|t| sets.row(t).iter().map(move |j| (t, *j)))
             .map(|(t, j)| if programs[t].iter().any(|o| *o != j) { 0.0 } else { 100.0 })
             .collect())
+    }
+
+    /// The KL as `100 (1 − m_a)(1 − m_b)`: a member's slope is 100 where the other is off.
+    fn slopes(&mut self, programs: &[Vec<u32>], sets: &Sets) -> Result<Vec<f64>, String> {
+        self.prices(programs, sets)
     }
 }
 

@@ -39,8 +39,10 @@
 //! Σ_{j∈g∩S_t} d_tj`, and under the prices the total is a sum over concepts, so changes to
 //! disjoint concepts add. Flips interact (dropping many members each nearly free can cost more
 //! than all their prices), so the prices only propose and the exact total decides every change.
-//! The prices are measured at the sets themselves to start with, and again at the current programs
-//! whenever no proposal is left at stale prices.
+//! The prices are measured exactly at the sets themselves to start with; after every kept round
+//! they are carried to the new programs by the slope of the summed KL along each mask
+//! ([`Oracle::slopes`], one backward pass) with each member's curvature from its last exact flip
+//! (`Pricer`); and they are measured exactly again whenever no proposal is left at carried prices.
 //!
 //! # The fit
 //!
@@ -68,7 +70,7 @@
 //! The non-overlapping proposals, most saving first, are tried in the exact code: the most saving
 //! `k` (at first all, then twice the last kept count) are kept when the exact total falls, else
 //! `k` is halved; a single refused change is set aside (a refit until the prices change, a pair
-//! for good). Rounds repeat until nothing is proposed at fresh prices or the deadline passes;
+//! for good). Rounds repeat until nothing is proposed at exact prices or the deadline passes;
 //! every kept round lowers the exact total, so the fit can stop at any round.
 //!
 //! # Coding new words
@@ -149,6 +151,48 @@ pub trait Oracle {
     /// nats: the word's KL with that subcomponent off minus with it on, the rest of the programs
     /// kept (module note, "Prices").
     fn prices(&mut self, programs: &[Vec<u32>], sets: &Sets) -> Result<Vec<f64>, String>;
+    /// At the programs, per member of every word's set, the slope of every word's summed KL along
+    /// its mask, negated: `−∂(Σ_s KL_s)/∂m_tj` (nats).
+    fn slopes(&mut self, programs: &[Vec<u32>], sets: &Sets) -> Result<Vec<f64>, String>;
+}
+
+/// Per member of every word's set, whether the word's program runs it.
+fn running(programs: &[Vec<u32>], sets: &Sets) -> Vec<bool> {
+    (0..sets.rows()).flat_map(|t| sets.row(t).iter().map(move |j| programs[t].binary_search(j).is_ok())).collect()
+}
+
+/// The prices a descent proposes with (module note, "Prices"): exact flips at some programs,
+/// carried to the current programs by the slope. A word's KL along one member's mask is taken as
+/// the quadratic with the current value and slope through the exact flip, so a member's half
+/// curvature `h` is its exact price less its slope where it ran when measured (the slope less the
+/// price where it did not), and at later programs its price is its slope plus `h` where it runs,
+/// minus `h` where it does not.
+struct Pricer {
+    curvature: Vec<f64>,
+    /// Whether the prices were measured exactly at the current programs.
+    exact: bool,
+}
+
+impl Pricer {
+    /// From exact prices at `programs`; the prices.
+    fn measured(prices: Vec<f64>, programs: &[Vec<u32>], sets: &Sets, oracle: &mut dyn Oracle) -> Result<(Self, Vec<f64>), String> {
+        let slopes = oracle.slopes(programs, sets)?;
+        if prices.len() != sets.indices.len() || slopes.len() != sets.indices.len() || slopes.iter().any(|x| !x.is_finite()) {
+            return Err(format!("{} prices and {} slopes for {} set members", prices.len(), slopes.len(), sets.indices.len()));
+        }
+        let curvature = running(programs, sets).iter().zip(prices.iter().zip(&slopes)).map(|(on, (p, d))| if *on { p - d } else { d - p }).collect();
+        Ok((Self { curvature, exact: true }, prices))
+    }
+
+    /// The prices at `programs`.
+    fn carried(&mut self, programs: &[Vec<u32>], sets: &Sets, oracle: &mut dyn Oracle) -> Result<Vec<f64>, String> {
+        let slopes = oracle.slopes(programs, sets)?;
+        if slopes.len() != sets.indices.len() {
+            return Err(format!("{} slopes for {} set members", slopes.len(), sets.indices.len()));
+        }
+        self.exact = false;
+        Ok(running(programs, sets).iter().zip(slopes.iter().zip(&self.curvature)).map(|(on, (d, h))| if *on { d + h } else { d - h }).collect())
+    }
 }
 
 /// The Krichevsky–Trofimov code length, in bits, of a binary sequence of `n` symbols with `k` ones.
@@ -564,10 +608,9 @@ pub fn fit(sets: &Sets, prices: &[f64], program: &[f64], label_bits: f64, observ
     let mut open = vec![true; concepts.len()];
     let mut refused_pairs: HashSet<(usize, usize)> = HashSet::new();
     let mut refused: HashSet<usize> = HashSet::new();
-    let mut columns = priced_columns(sets, prices, scale)?;
+    let (mut pricer, start) = Pricer::measured(prices.to_vec(), &programs_of(concepts.iter().flatten(), words), sets, oracle)?;
+    let mut columns = priced_columns(sets, &start, scale)?;
     concepts.par_iter_mut().flatten().for_each(|c| reprice(c, &columns, words));
-    // Whether the prices were measured at the current programs.
-    let mut fresh = true;
     let mut trust = usize::MAX;
     let mut rounds = Vec::new();
     while Instant::now() < deadline {
@@ -609,15 +652,17 @@ pub fn fit(sets: &Sets, prices: &[f64], program: &[f64], label_bits: f64, observ
         }
         let merges = changes.len() - refits;
         if changes.is_empty() {
-            if fresh {
+            if pricer.exact {
                 break;
             }
-            columns = priced_columns(sets, &oracle.prices(&programs_of(concepts.iter().flatten(), words), sets)?, scale)?;
+            let programs = programs_of(concepts.iter().flatten(), words);
+            let measured;
+            (pricer, measured) = Pricer::measured(oracle.prices(&programs, sets)?, &programs, sets, oracle)?;
+            columns = priced_columns(sets, &measured, scale)?;
             concepts.par_iter_mut().flatten().for_each(|c| reprice(c, &columns, words));
             refused.clear();
             open.iter_mut().for_each(|o| *o = true);
-            fresh = true;
-            log::info!("concepts: prices measured again at the programs of round {}", rounds.len());
+            log::info!("concepts: exact prices at the programs of round {}", rounds.len());
             continue;
         }
         changes.sort_by(|x, y| y.2.total_cmp(&x.2));
@@ -654,7 +699,10 @@ pub fn fit(sets: &Sets, prices: &[f64], program: &[f64], label_bits: f64, observ
                         open.push(true);
                     }
                 }
-                fresh = false;
+                columns = priced_columns(sets, &pricer.carried(&programs_of(concepts.iter().flatten(), words), sets, oracle)?, scale)?;
+                concepts.par_iter_mut().flatten().for_each(|c| reprice(c, &columns, words));
+                refused.clear();
+                open.iter_mut().for_each(|o| *o = true);
                 k
             }
             None => {
@@ -806,9 +854,9 @@ impl Model {
             }
             Ok(error)
         };
-        let mut error = errors(prices)?;
+        let (mut pricer, start) = Pricer::measured(prices.to_vec(), &programs(&invoked), sets, oracle)?;
+        let mut error = errors(&start)?;
         let mut refused: HashSet<usize> = HashSet::new();
-        let mut fresh = true;
         let mut trust = usize::MAX;
         let mut rounds = Vec::new();
         while Instant::now() < deadline {
@@ -830,12 +878,14 @@ impl Model {
                 })
                 .collect();
             if changes.is_empty() {
-                if fresh {
+                if pricer.exact {
                     break;
                 }
-                error = errors(&oracle.prices(&programs(&invoked), sets)?)?;
+                let now = programs(&invoked);
+                let measured;
+                (pricer, measured) = Pricer::measured(oracle.prices(&now, sets)?, &now, sets, oracle)?;
+                error = errors(&measured)?;
                 refused.clear();
-                fresh = true;
                 continue;
             }
             changes.sort_by(|x, y| y.2.total_cmp(&x.2).then(x.0.cmp(&y.0)));
@@ -854,7 +904,8 @@ impl Model {
                     for (c, next, _) in changes.drain(..k) {
                         invoked[c] = next;
                     }
-                    fresh = false;
+                    error = errors(&pricer.carried(&programs(&invoked), sets, oracle)?)?;
+                    refused.clear();
                     k
                 }
                 None => {

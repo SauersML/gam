@@ -16,10 +16,11 @@
 //! `ORACLE...` is a command that runs the model on the sequences `lo:hi` it is given as one more
 //! argument (`vpd_nl_autoencoder.py oracle`), started once for `TRAIN` and once for `EVAL`. It
 //! reads requests on stdin, each `u64 kind, u64 words, u64 members, (words + 1) × u64 row pointer,
-//! members × u32` (every word's program), and for `kind` 1 also the sets (`u64 count, (words + 1)
-//! × u64 row pointer, count × u32`). It answers kind 0 with `words × f32`, the exact KL in nats of
-//! the model running each word's program, and kind 1 with `count × f32`, each set member's price
-//! in nats at the programs (its word's KL with it off minus with it on).
+//! members × u32` (every word's program), and for kinds 1 and 2 also the sets (`u64 count, (words
+//! + 1) × u64 row pointer, count × u32`). It answers kind 0 with `words × f32`, the exact KL in
+//! nats of the model running each word's program, kind 1 with `count × f32`, each set member's
+//! price in nats at the programs (its word's KL with it off minus with it on), and kind 2 with
+//! `count × f32`, each set member's slope `−∂(Σ_s KL_s)/∂m_tj`.
 //!
 //! Writes to `OUT`:
 //!
@@ -111,9 +112,20 @@ impl Oracle for Process {
     }
 
     fn prices(&mut self, programs: &[Vec<u32>], sets: &Sets) -> Result<Vec<f64>, String> {
+        self.per_member(1, programs, sets)
+    }
+
+    fn slopes(&mut self, programs: &[Vec<u32>], sets: &Sets) -> Result<Vec<f64>, String> {
+        self.per_member(2, programs, sets)
+    }
+}
+
+impl Process {
+    /// A request answered per set member: kind 1 (exact prices) or 2 (slopes).
+    fn per_member(&mut self, kind: u64, programs: &[Vec<u32>], sets: &Sets) -> Result<Vec<f64>, String> {
         let members: usize = programs.iter().map(Vec::len).sum();
         let mut message = Vec::with_capacity(32 + 16 * (programs.len() + 1) + 4 * (members + sets.indices.len()));
-        for x in [1, programs.len() as u64, members as u64] {
+        for x in [kind, programs.len() as u64, members as u64] {
             message.extend(x.to_le_bytes());
         }
         Self::rows(&mut message, programs);
