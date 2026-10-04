@@ -1,0 +1,17 @@
+{
+  "scope": "Exact raw report bytes preserved in deterministic gzip; original SHA256 is verified after decompression. Other published source/protocol/artifact hashes unchanged.",
+  "reports": {
+    "full": {
+      "file": "full-report.json.gz",
+      "sha256_uncompressed": "fb0d68262eb3d80a5439a62e2c64460c568499da3ffb153d364fbc39846843d9",
+      "sha256_gzip": "fad2bdaf71e3efb4af91a81fcb765b2f4dea56818da4d13c32c6988c02fce116",
+      "uncompressed_bytes": 600823
+    },
+    "smoke": {
+      "file": "smoke-report.json.gz",
+      "sha256_uncompressed": "c5ee2a6f582fbf48d3fd46557c0b3ab83bea719f165a793b78a1a3d98b634759",
+      "sha256_gzip": "479d0bc03f44803254c2d6e1347cc0893a4f27469534ea1ec1d9f5a02024c840",
+      "uncompressed_bytes": 37718
+    }
+  }
+}
