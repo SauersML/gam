@@ -28,6 +28,7 @@ use super::masked::Head;
 use super::operator_program::{FamilyInputs, Rotary};
 use super::safetensors::SafetensorsFile;
 use gam_linalg::faer_ndarray::{fast_ab, fast_abt};
+use gam_math::special::logistic;
 use gam_runtime::resource::MemoryGovernor;
 use ndarray::{Array1, Array2, Axis, s};
 use serde_json::Value;
@@ -121,10 +122,6 @@ struct Saved {
     scale2: Array1<f64>,
     gate: Array2<f64>,
     up: Array2<f64>,
-}
-
-fn sigmoid(t: f64) -> f64 {
-    1.0 / (1.0 + (-t).exp())
 }
 
 /// `(x/√(mean x² + ε)) ⊙ g` per row, and each row's scale `1/√(mean x² + ε)`.
@@ -313,7 +310,7 @@ impl DecoderTail {
         let (h2, scale2) = rms(&mid, &self.vector(&Self::name(l, "post_attention_layernorm.weight"), self.d)?, self.epsilon);
         let gate = self.linear(&h2, l, "mlp.gate_proj", self.d_mlp)?;
         let up = self.linear(&h2, l, "mlp.up_proj", self.d_mlp)?;
-        let active = ndarray::Zip::from(&gate).and(&up).map_collect(|g, u| g * sigmoid(*g) * u);
+        let active = ndarray::Zip::from(&gate).and(&up).map_collect(|g, u| g * logistic(*g) * u);
         let out = &mid + &self.linear(&active, l, "mlp.down_proj", self.d)?;
         Ok((out, Saved { x: x.clone(), scale1, q, k, v, attention, mid, scale2, gate, up }))
     }
@@ -323,10 +320,10 @@ impl DecoderTail {
         // MLP: out = mid + down(silu(gate) ⊙ up).
         let da = self.linear_back(dy, l, "mlp.down_proj", self.d_mlp)?;
         let dgate = ndarray::Zip::from(&da).and(&saved.gate).and(&saved.up).map_collect(|d, g, u| {
-            let sg = sigmoid(*g);
+            let sg = logistic(*g);
             d * u * sg * (1.0 + g * (1.0 - sg))
         });
-        let dup = ndarray::Zip::from(&da).and(&saved.gate).map_collect(|d, g| d * g * sigmoid(*g));
+        let dup = ndarray::Zip::from(&da).and(&saved.gate).map_collect(|d, g| d * g * logistic(*g));
         let dh2 = self.linear_back(&dgate, l, "mlp.gate_proj", self.d)? + self.linear_back(&dup, l, "mlp.up_proj", self.d)?;
         let gain2 = self.vector(&Self::name(l, "post_attention_layernorm.weight"), self.d)?;
         let dmid = dy + &rms_back(&saved.mid, &saved.scale2, &gain2, &dh2);
