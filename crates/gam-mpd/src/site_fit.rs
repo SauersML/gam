@@ -73,7 +73,9 @@
 //! the whole block. Merging two blocks that run together pays one description where both run; it
 //! costs the whole block where only one is needed. The same code decides.
 //!
-//! The fit stops when a round saves less than one bit per input, or at `rounds`. Every product over
+//! The fit stops when a round saves less than one bit per input, or at `rounds`, and returns the
+//! library whose round started at the least code (a round's steps are kept under the prices it
+//! started with, and the next prices can undo them). Every product over
 //! inputs runs in single precision (the fit only proposes a library; the masked program's exact
 //! forward codes it), and pseudo-inverses drop eigenvalues within the single-precision band of their
 //! sums, `√T 2⁻²⁴` of the largest.
@@ -806,6 +808,8 @@ pub fn fit(
     let (description, error) = fitting.code(&v, &u, &bits, true);
     let mut current = description + error;
     let mut report = fitting.report(0, description, error);
+    // The library of least code at a round's start, with its prices.
+    let mut best = (report.clone(), v.clone(), u.clone(), bits.clone());
     for round in 0..rounds {
         // The writes: the error's minimiser under the sets, kept when the code falls.
         let trial = fitting.writes(&v, span)?;
@@ -878,11 +882,18 @@ pub fn fit(
         let previous = report.code;
         report = fitting.report(round + 1, description, error);
         current = description + error;
+        if report.code < best.0.code {
+            best = (report.clone(), v.clone(), u.clone(), bits.clone());
+        }
         if previous - report.code < 1.0 {
             break;
         }
     }
-    // The final decode: every subcomponent some input runs at its description's own price.
+    // The final decode of the least code's library: every subcomponent some input runs at its
+    // description's own price.
+    let (kept, v, u, bits) = best;
+    report = Round { reseeded: report.reseeded, read_steps: report.read_steps, ..kept };
+    fitting.code(&v, &u, &bits, true);
     let bits = decoded_prices(describe, site, &v, &u, &fitting, &bits)?;
     let (description, error) = fitting.code(&v, &u, &bits, false);
     report = Round { reseeded: report.reseeded, read_steps: report.read_steps, ..fitting.report(report.round, description, error) };
