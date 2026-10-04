@@ -41,9 +41,15 @@ fn main() -> Result<(), String> {
         let (original_upper,original_lower) = d.code_rows((&dz,&dw,&dy),(&dk,&ds,&db),None,(coder.kappa(),nodes,1e-12),&mut original).map_err(|e|e.to_string())?;
         let original = d.download(&original).map_err(|e|e.to_string())?;
         let mut previous = Some((original,original_upper.iter().map(|x|x.to_bits()).collect::<Vec<_>>(),original_lower.iter().map(|x|x.to_bits()).collect::<Vec<_>>()));
-        for cached in [false,true] {
+        for (cached,fused) in [(false,false),(false,true),(true,false),(true,true)] {
             let mut on = d.zeros(rows,ranks.len()).map_err(|e|e.to_string())?;
-            let (upper,lower,profile) = d.code_rows_profiled((&dz,&dw,&dy),(&dk,&ds,&db),None,(coder.kappa(),nodes,1e-12),&mut on,CodeRowsWorkspace {bytes,max_rows,cache_columns:cached}).map_err(|e|e.to_string())?;
+            let workspace = CodeRowsWorkspace {bytes,max_rows,cache_columns:cached};
+            let result = if fused {
+                d.code_rows_profiled_fused((&dz,&dw,&dy),(&dk,&ds,&db),None,(coder.kappa(),nodes,1e-12),&mut on,workspace)
+            } else {
+                d.code_rows_profiled((&dz,&dw,&dy),(&dk,&ds,&db),None,(coder.kappa(),nodes,1e-12),&mut on,workspace)
+            };
+            let (upper,lower,profile) = result.map_err(|e|e.to_string())?;
             let on = d.download(&on).map_err(|e|e.to_string())?;
             for (r,(sets,code,bound)) in cpu.iter().enumerate() {
                 assert_eq!(on.row(r).iter().map(|x|*x == 1.0).collect::<Vec<_>>(),*sets,"CPU masks row{r} grouped={grouped}");
@@ -64,7 +70,7 @@ fn main() -> Result<(), String> {
             }
             let counts = profile.rows.iter().fold([0u64;7],|mut s,c| { for(i,x) in [c.relaxations,c.sweeps,c.column_computations,c.column_cache_hits,c.rounding_flips,c.explored_nodes,c.sweep_limit_hits].iter().enumerate() {s[i]+=x;} s });
             let gaps: Vec<f64> = upper.iter().zip(&lower).map(|(u,l)|u-l).collect();
-            println!("{}",serde_json::json!({"device":d.name(),"grouped":grouped,"cached":cached,"rows":rows,"pieces":pieces,"nodes":nodes,"seconds":profile.elapsed.as_secs_f64(),"workspace_bytes":profile.workspace_bytes,"concurrent_rows":profile.concurrent_rows,"mean_absolute_gap":gaps.iter().sum::<f64>()/rows as f64,"max_absolute_gap":gaps.iter().copied().fold(0.0_f64,f64::max),"relaxations":counts[0],"sweeps":counts[1],"column_computations":counts[2],"column_cache_hits":counts[3],"rounding_flips":counts[4],"explored_nodes":counts[5],"sweep_limit_hits":counts[6]}));
+            println!("{}",serde_json::json!({"device":d.name(),"grouped":grouped,"cached":cached,"fused":fused,"rows":rows,"pieces":pieces,"nodes":nodes,"seconds":profile.elapsed.as_secs_f64(),"workspace_bytes":profile.workspace_bytes,"concurrent_rows":profile.concurrent_rows,"mean_absolute_gap":gaps.iter().sum::<f64>()/rows as f64,"max_absolute_gap":gaps.iter().copied().fold(0.0_f64,f64::max),"relaxations":counts[0],"sweeps":counts[1],"column_computations":counts[2],"column_cache_hits":counts[3],"rounding_flips":counts[4],"explored_nodes":counts[5],"sweep_limit_hits":counts[6]}));
             previous = Some((on,upper.iter().map(|x|x.to_bits()).collect::<Vec<_>>(),lower.iter().map(|x|x.to_bits()).collect::<Vec<_>>()));
         }
     }

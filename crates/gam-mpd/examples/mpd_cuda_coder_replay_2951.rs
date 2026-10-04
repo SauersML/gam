@@ -35,7 +35,7 @@ fn summarize(path: &Path, expected_pairs: usize) -> Result<(), String> {
     for line in std::fs::read_to_string(path).map_err(|e| e.to_string())?.lines() {
         let value: serde_json::Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
         if value["kind"] != "measured" { continue; }
-        if value["bitwise_reference_equal"] != true { return Err("non-equivalent measured output".into()); }
+        if value["bitwise_reference_equal"].as_bool() != Some(true) { return Err("non-equivalent measured output".into()); }
         let trial = value["trial"].as_u64().ok_or("missing trial")?;
         let cached = value["cached"].as_bool().ok_or("missing cached flag")?;
         let seconds = value["seconds"].as_f64().ok_or("missing time")?;
