@@ -268,3 +268,6 @@ pub mod decoded_intern;
 
 // Native imported attention interfaces without splitting or renumbering.
 pub mod attention_map;
+
+// Opt-in native head-only CUDA logits with unchanged CPU metrics.
+pub mod native_readout;

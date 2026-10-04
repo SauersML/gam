@@ -728,6 +728,8 @@ pub struct LanguageRun<'a> {
     device: Option<gam_gpu::tensor::Device>,
     trace_bytes_limit: usize,
     native_device_source: Option<NativeDeviceSource>,
+    native_readout: Option<crate::native_readout::Resident>,
+    readout_lock: std::sync::Mutex<()>,
     teachers: std::sync::OnceLock<Result<TeacherEpisodes, String>>,
     timers: RunTimers,
 }
@@ -735,7 +737,7 @@ pub struct LanguageRun<'a> {
 impl<'a> LanguageRun<'a> {
     pub fn new(decoder: &'a Decoder, native: &'a OperatorProgram, spec: &'a Spec, passages: &'a [Vec<u32>], parallel: usize) -> Result<Self, String> {
         let layers = layer_nodes(native, decoder.layers())?;
-        Ok(Self { decoder, native, spec, passages, layers, parallel, tile: 64, device: None, trace_bytes_limit: 0, native_device_source: None, teachers: std::sync::OnceLock::new(), timers: RunTimers::default() })
+        Ok(Self { decoder, native, spec, passages, layers, parallel, tile: 64, device: None, trace_bytes_limit: 0, native_device_source: None, native_readout: None, readout_lock: std::sync::Mutex::new(()), teachers: std::sync::OnceLock::new(), timers: RunTimers::default() })
     }
 
     /// Diagnostic timing only; no measurement changes fidelity or acceptance.
@@ -752,6 +754,7 @@ impl<'a> LanguageRun<'a> {
     /// fallback; immutable native teachers, local fidelity and readout/KL remain CPU.
     /// The limit covers retained intermediate values only, not complete GPU allocation.
     pub fn with_cuda(mut self, device: gam_gpu::tensor::Device, trace_bytes_limit: usize) -> Result<Self, String> {
+        if self.native_readout.is_some() { return Err("cannot replace CUDA forward backend after head installation".into()); }
         if !cfg!(target_os = "linux") || device.is_host() || !device.float64() || trace_bytes_limit == 0 {
             return Err("CUDA LanguageRun needs a float64 Linux accelerator and positive trace byte limit".into());
         }
@@ -785,10 +788,34 @@ impl<'a> LanguageRun<'a> {
         Ok(self)
     }
 
+    /// Opt-in head-only CUDA f64. Teacher residual forwards remain CPU; native
+    /// effects and candidate scores use CUDA logits plus unchanged CPU normalization/KL.
+    /// Numerical parity is measured, not a bit-exact or full-network certificate.
+    /// Must be installed before initializing immutable teacher scores.
+    pub fn with_cuda_readout(mut self, budget: crate::native_readout::Budget) -> Result<Self, String> {
+        if self.teachers.get().is_some() || self.native_readout.is_some() {
+            return Err("CUDA readout must be selected once before teacher initialization".into());
+        }
+        let device = self.device.as_ref().ok_or("CUDA readout requires explicit CUDA forward backend")?;
+        self.native_readout = Some(crate::native_readout::Resident::new(device.clone(), self.decoder, budget)?);
+        Ok(self)
+    }
+
+    fn readout_rows(&self) -> usize {
+        self.tile.max(1).min(self.native_readout.as_ref().map_or(usize::MAX, |h| h.tile_rows()))
+    }
+
+    fn log_probs(&self, residual: &Array2<f64>) -> Result<Array2<f64>, String> {
+        match &self.native_readout {
+            Some(head) => head.log_probs(residual),
+            None => Ok(self.decoder.log_probs(residual)),
+        }
+    }
+
     pub fn cuda_native_sharing(&self) -> bool { self.native_device_source.is_some() }
 
     pub fn backend_name(&self) -> &'static str {
-        if self.device.is_some() { "hybrid: explained CUDA f64; cached teacher and readout/KL CPU" } else { "CPU f64; cached native teachers" }
+        if self.native_readout.is_some() { "hybrid: explained and native head CUDA f64; cached teacher residual CPU; normalization/KL CPU" } else if self.device.is_some() { "hybrid: explained CUDA f64; cached teacher and readout/KL CPU" } else { "CPU f64; cached native teachers" }
     }
 
     /// Read the existing immutable native teacher through this runner's unchanged readout.
@@ -798,7 +825,10 @@ impl<'a> LanguageRun<'a> {
         let teachers = self.teacher_episodes()?;
         let residual = teachers.residuals.get(episode).ok_or("native episode index absent")?;
         if rows.start >= rows.end || rows.end > residual.nrows() { return Err("native readout rows outside episode".into()); }
-        Ok(self.decoder.log_probs(&residual.slice(s![rows, ..]).to_owned()))
+        let guard = self.readout_lock.lock().map_err(|_| "native readout lock poisoned")?;
+        let result = self.log_probs(&residual.slice(s![rows, ..]).to_owned());
+        drop(guard);
+        result
     }
 
     /// Fixed references belong to this runner's immutable borrowed dataset, never
@@ -866,17 +896,19 @@ impl<'a> LanguageRun<'a> {
                             if from > rows {
                                 return Err("teacher intervention starts beyond passage".to_string());
                             }
+                            let head_guard = self.native_readout.as_ref().map(|_| self.readout_lock.lock()).transpose().map_err(|_| "native readout lock poisoned")?;
                             let mut effect = 0.0;
                             let mut start = from;
                             while start < rows {
-                                let end = (start + self.tile.max(1)).min(rows);
-                                let p = decoder.log_probs(&reference.residual.slice(s![start..end, ..]).to_owned());
-                                let c = decoder.log_probs(&clean[&episode.passage].residual.slice(s![start..end, ..]).to_owned());
+                                let end = (start + self.readout_rows()).min(rows);
+                                let p = self.log_probs(&reference.residual.slice(s![start..end, ..]).to_owned())?;
+                                let c = self.log_probs(&clean[&episode.passage].residual.slice(s![start..end, ..]).to_owned())?;
                                 for row in 0..end - start {
                                     effect += kl_logits(p.row(row), c.row(row)).0;
                                 }
                                 start = end;
                             }
+                            drop(head_guard);
                             Ok((reference.residual, effect / (rows - from).max(1) as f64))
                         })
                         .collect::<Result<Vec<_>, String>>()?;
@@ -1025,7 +1057,6 @@ fn check_native_tail(native: &OperatorProgram, artifact: &Artifact, last: usize)
 impl RunCheck for LanguageRun<'_> {
     fn episodes(&self, artifact: &Artifact) -> Result<Vec<EpisodeScore>, String> {
         use rayon::prelude::*;
-        let decoder = self.decoder;
         let head_dim = self.native.node_interface(self.layers[0].reads[0]).map_err(|e| e.to_string())?.width();
         let compile_timer = RunTimer::start(&self.timers.compile);
         let (mut program, residuals) = self.truncated(artifact)?;
@@ -1097,6 +1128,7 @@ impl RunCheck for LanguageRun<'_> {
             let forward_timer = RunTimer::start(&self.timers.forward);
             let (states, _) = self.run(episode_program, episode.passage, edits, own, &[], episode_residuals, base.as_ref())?;
             drop(forward_timer);
+            let head_guard = self.native_readout.as_ref().map(|_| self.readout_lock.lock()).transpose().map_err(|_| "native readout lock poisoned")?;
             let readout_timer = RunTimer::start(&self.timers.readout);
             let explained = Forward {
                 residual: states.last().ok_or("no residual")?.clone(),
@@ -1107,9 +1139,9 @@ impl RunCheck for LanguageRun<'_> {
             let (mut kl, mut error, mut agree) = (0.0, 0.0, 0.0);
             let mut start = from;
             while start < rows {
-                let end = (start + self.tile.max(1)).min(rows);
-                let p = decoder.log_probs(&reference.slice(s![start..end, ..]).to_owned());
-                let q = decoder.log_probs(&explained.residual.slice(s![start..end, ..]).to_owned());
+                let end = (start + self.readout_rows()).min(rows);
+                let p = self.log_probs(&reference.slice(s![start..end, ..]).to_owned())?;
+                let q = self.log_probs(&explained.residual.slice(s![start..end, ..]).to_owned())?;
                 for r in 0..end - start {
                     let (value, rounding) = kl_logits(p.row(r), q.row(r));
                     kl += value;
@@ -1119,6 +1151,7 @@ impl RunCheck for LanguageRun<'_> {
                 start = end;
             }
             drop(readout_timer);
+            drop(head_guard);
             let n = (rows - from).max(1) as f64;
             Ok(EpisodeScore {
                 id: episode.id.clone(),

@@ -142,6 +142,8 @@ fn main() -> Result<(), String> {
         "cuda_trace_bytes",
         "cuda_share_native",
         "cuda_local",
+        "cuda_readout_resident_bytes",
+        "cuda_readout_workspace_bytes",
         "local_kl",
     ];
     if let Some(k) = keys.keys().find(|k| !allowed.contains(&k.as_str())) {
@@ -212,6 +214,16 @@ fn main() -> Result<(), String> {
         }
         _ => return Err("backend must be cpu or cuda".into()),
     };
+    let readout_budget = keys.get("cuda_readout_resident_bytes").zip(keys.get("cuda_readout_workspace_bytes"));
+    if keys.contains_key("cuda_readout_resident_bytes") != keys.contains_key("cuda_readout_workspace_bytes") {
+        return Err("CUDA readout requires both explicit numeric-buffer budgets".into());
+    }
+    let run = if let Some((resident, workspace)) = readout_budget {
+        run.with_cuda_readout(gam_mpd::native_readout::Budget {
+            resident_bytes: resident.parse::<usize>().map_err(|e| e.to_string())?,
+            workspace_bytes: workspace.parse::<usize>().map_err(|e| e.to_string())?,
+        })?
+    } else { run };
     let local_export = PathBuf::from(key("local_export", &export.display().to_string()));
     input_paths.extend([local_export.join("export.json"), local_export.join("tokens.f64")]);
     let local_family = family(&passages(&local_export, context)?, count, context)?;
