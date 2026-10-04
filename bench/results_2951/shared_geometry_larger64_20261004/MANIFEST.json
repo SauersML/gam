@@ -1,0 +1,34 @@
+{
+  "learned/REPORT.json": {
+    "archive": "learned/REPORT.json.gz",
+    "sha256": "e542dce44fd4d88e7501b0a4d3be7587e939c6f8d0d8b2d7121d25f8693e8672"
+  },
+  "learned/PROVENANCE.json": {
+    "archive": "learned/PROVENANCE.json",
+    "sha256": "a197ad5ce708ebfb1c136b8b064e233e264483a6d8671162add6baacf432d1ab"
+  },
+  "learned/GPU_ENV.json": {
+    "archive": "learned/GPU_ENV.json",
+    "sha256": "7b67dfc2ae73176e3e9ff8790c96eb5e0b54d54caefc6e46be4bb80fcb626339"
+  },
+  "learned/GPU_UTIL.csv": {
+    "archive": "learned/GPU_UTIL.csv",
+    "sha256": "ec2ee9723b62e1632da6aed2e7314fba30236549448bd6cb08b8116db376549d"
+  },
+  "frozen_native/REPORT.json": {
+    "archive": "frozen_native/REPORT.json.gz",
+    "sha256": "07232683453739bd70552455e4060264b4696008c1af753697db5c83b4b0fcf8"
+  },
+  "frozen_native/PROVENANCE.json": {
+    "archive": "frozen_native/PROVENANCE.json",
+    "sha256": "907d753ddb4fc8f1f47242e3f75d66c9894a77e300a3ae51b2ace5feac237cc1"
+  },
+  "frozen_native/GPU_ENV.json": {
+    "archive": "frozen_native/GPU_ENV.json",
+    "sha256": "19aa6d972ae623a2f3695f57bfd99bb09977c82dc9aa608c15dd3b49c698aa78"
+  },
+  "frozen_native/GPU_UTIL.csv": {
+    "archive": "frozen_native/GPU_UTIL.csv",
+    "sha256": "ad00abb05ebbeb15f4761ea3b338fbb7f8a37e99b650d5725fdde5612c9c0d3b"
+  }
+}

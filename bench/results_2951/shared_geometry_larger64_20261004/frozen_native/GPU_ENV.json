@@ -1,0 +1,5 @@
+{
+  "CUDA_VISIBLE_DEVICES": "5",
+  "SLURM_JOB_GPUS": "5",
+  "sample_physical_ids": "5"
+}
