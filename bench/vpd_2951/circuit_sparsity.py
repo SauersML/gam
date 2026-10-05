@@ -7,6 +7,8 @@ Node bases (every one a decomposition of M's own forward pass, so M is evaluated
     neurons  M's MLP neurons: the GELU outputs that the down projection reads (4 x 3072)
     vpd      VPD's subcomponents: at each of the 24 sites, c's activation a_c = x . V_c; the site
              computes sum_c a_c U_c + x Delta^T (Delta = W - V U, kept, not a node) (38912)
+    vpd_mlp  VPD's subcomponents of the MLP sites only (c_fc, down_proj; 26624), attention left
+             whole as with the neurons: the matched comparison to M's neurons
 
 Circuit C of node set S: every node outside S is set to its mean at that position over the task's
 training prompts (clean and counterfactual), everything else computed. m = logit(y) - logit(y') at
@@ -65,9 +67,14 @@ class Model:
 
     def __init__(self, vpd, basis: str):
         self.t, self.vpd, self.basis = vpd.target, vpd, basis
-        self.groups = [f"h.{i}.mlp" for i in range(self.t.n_layer)] if basis == "neurons" else list(vpd.names)
-        if basis == "vpd":
-            self.delta = {n: self.t.site(n).W - (self.t.site(n).V @ self.t.site(n).U).T for n in vpd.names}
+        if basis == "neurons":
+            self.groups = [f"h.{i}.mlp" for i in range(self.t.n_layer)]
+        else:
+            self.groups = [n for n in vpd.names if basis == "vpd" or ".mlp." in n]
+        if basis != "neurons":
+            self.delta = {n: self.t.site(n).W - (self.t.site(n).V @ self.t.site(n).U).T for n in self.groups}
+        else:
+            self.delta = {}
 
     def sizes(self) -> dict[str, int]:
         return {g: (self.t.site(g + ".c_fc").W.shape[0] if self.basis == "neurons" else self.vpd.C[g]) for g in self.groups}
@@ -86,7 +93,7 @@ class Model:
 
     def site(self, name: str, x: Tensor, ctx) -> Tensor:
         st = self.t.site(name)
-        if self.basis == "neurons":
+        if name not in self.delta:
             return x @ st.W.T
         return self.node(name, x @ st.V, *ctx) @ st.U + x @ self.delta[name].T
 
@@ -203,7 +210,7 @@ def main():
     for task in TASKS:
         train, test = pairs(tok, task, "train", n_train, 0), pairs(tok, task, "test", n_test, 1)
         result["tasks"][task] = {"train": len(train), "test": len(test)}
-        for basis in ("neurons", "vpd"):
+        for basis in ("neurons", "vpd_mlp", "vpd"):
             result["tasks"][task][basis] = curve(Model(vpd, basis), train, test)
             json.dump(result, open(out_path, "w"), indent=1)
             r = result["tasks"][task][basis]

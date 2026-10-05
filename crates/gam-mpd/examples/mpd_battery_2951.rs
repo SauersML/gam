@@ -4,8 +4,10 @@
 //!
 //! EXPORT SETTINGS.json OUT.json host|gpu [ARTIFACT]
 //!
-//! Without `ARTIFACT` (a `library_mdl` posterior-mean `artifact.bin`) `P` is the library's
-//! starting point, which computes `M` exactly: every divergence must vanish to rounding.
+//! `ARTIFACT` is a `library_mdl` posterior-mean `artifact.bin`, or a fit's `checkpoint.bin`, whose
+//! posterior mean is scored (with its `KL(q ‖ p)` and description reported). Without it `P` is the
+//! library's starting point, which computes `M` exactly: every divergence must vanish to rounding.
+//! An empty source range skips the interchange experiments.
 //!
 //! Every divergence is `KL(M ‖ E)` of the next-token distributions per token, in bits, `E` the
 //! explanation in the given protocol; per-token quantiles are over every token of the held-out
@@ -212,6 +214,53 @@ fn log_probabilities(logits: Vec<Array2<f64>>) -> Result<Vec<(Array2<f64>, Vec<u
         .collect()
 }
 
+/// The posterior mean of a `library_mdl` checkpoint (a little-endian header length, the progress
+/// header, then per trainable operator `μ`, `ln σ` and the four Adam moments in float64) as the
+/// explanation's artifact, with the posterior's `KL(q ‖ p)` and description in bits and the fit's
+/// last held-out evaluation.
+fn checkpoint_mean(path: &Path, explanation: &library_mdl::Explanation) -> Result<(Artifact, Value), String> {
+    let bytes = std::fs::read(path).map_err(error)?;
+    let length = u64::from_le_bytes(bytes.get(..8).ok_or("a truncated checkpoint")?.try_into().map_err(error)?) as usize;
+    let header: Value = serde_json::from_slice(bytes.get(8..8 + length).ok_or("a truncated checkpoint")?).map_err(error)?;
+    let tokens = header["tokens"].as_u64().ok_or("checkpoint tokens")? as usize;
+    let mut posterior = library_mdl::Posterior::new(explanation, tokens)?;
+    let mut at = 8 + length;
+    let mut take = |rows: usize, cols: usize| -> Result<Array2<f64>, String> {
+        let raw = bytes.get(at..at + 8 * rows * cols).ok_or("a truncated checkpoint")?;
+        at += 8 * rows * cols;
+        let values = raw.chunks_exact(8).map(|c| c.try_into().map(f64::from_le_bytes).map_err(error)).collect::<Result<Vec<_>, _>>()?;
+        Array2::from_shape_vec((rows, cols), values).map_err(error)
+    };
+    for i in 0..posterior.mean.len() {
+        let (rows, cols) = posterior.mean[i].dim();
+        posterior.mean[i] = take(rows, cols)?;
+        posterior.log_sd[i] = take(rows, cols)?;
+        for _ in 0..4 {
+            take(rows, cols)?;
+        }
+    }
+    if at != bytes.len() {
+        return Err("the checkpoint's arrays do not match the explanation".into());
+    }
+    let active = header["active"].as_array().ok_or("checkpoint active")?;
+    if active.len() != posterior.active.len() {
+        return Err("the checkpoint's groups do not match the explanation".into());
+    }
+    for (a, v) in posterior.active.iter_mut().zip(active) {
+        *a = v.as_bool().ok_or("checkpoint active")?;
+    }
+    let divergence: f64 = posterior.divergences().iter().sum();
+    let size = json!({
+        "epoch": header["epoch"],
+        "training_tokens": tokens,
+        "active_groups": posterior.active.iter().filter(|a| **a).count(),
+        "divergence_bits": divergence / LN_2,
+        "description_bits": posterior.description() / LN_2,
+        "held_out": header["epochs"].as_array().and_then(|e| e.last()).map(|e| e["held_out"].clone()),
+    });
+    Ok((library_mdl::posterior_mean(explanation, &posterior)?.f32_literals()?, size))
+}
+
 /// The read variables of `artifact` whose rows hold a nonzero value (a removed function reads
 /// nothing).
 fn live_variables(artifact: &Artifact, layers: usize) -> Result<Vec<ReadVariable>, String> {
@@ -246,7 +295,7 @@ fn main() -> Result<(), String> {
         return Err("export hash mismatch".into());
     }
     let ([first, end], [s_first, s_end]) = (settings.held_out, settings.sources);
-    if first >= end || s_first >= s_end || settings.batch_sequences == 0 || settings.worst_of.iter().any(|k| *k == 0 || *k > s_end - s_first) {
+    if first >= end || s_first > s_end || settings.batch_sequences == 0 || settings.worst_of.iter().any(|k| *k == 0 || *k > s_end - s_first) {
         return Err("nonempty base and source ranges, positive batches, and at most as many worst-of sources as source rows".into());
     }
     let device = match mode.as_str() {
@@ -266,9 +315,10 @@ fn main() -> Result<(), String> {
     let bases = &rows[first..end];
     let sources = &rows[s_first..s_end];
     let explanation = library_mdl::explanation(&native, &layers)?;
-    let artifact = match artifact_path {
-        Some(path) => Artifact::from_bytes(&std::fs::read(path).map_err(error)?, &native.declarations)?,
-        None => explanation.artifact.clone(),
+    let (artifact, size) = match artifact_path {
+        Some(path) if path.extension().is_some_and(|e| e == "bin") && path.file_name().is_some_and(|n| n == "checkpoint.bin") => checkpoint_mean(path, &explanation)?,
+        Some(path) => (Artifact::from_bytes(&std::fs::read(path).map_err(error)?, &native.declarations)?, Value::Null),
+        None => (explanation.artifact.clone(), Value::Null),
     };
     artifact.validate_coverage(&native)?;
     let length = settings.context;
@@ -352,8 +402,12 @@ fn main() -> Result<(), String> {
         "ce_target": m_ce.iter().sum::<f64>() / m_ce.len() as f64,
         "protocols": protocols.iter().map(|(k, v)| (k.clone(), v.summary())).collect::<serde_json::Map<_, _>>(),
         "single_layer_mean": Tokens(single).summary(),
+        "size": size,
     });
     std::fs::write(out, serde_json::to_vec_pretty(&report).map_err(error)?).map_err(error)?;
+    if s_first == s_end {
+        return Ok(());
+    }
 
     // Interchange with P alone, sources shared across the batch.
     let variables = live_variables(&artifact, layer_count)?;
