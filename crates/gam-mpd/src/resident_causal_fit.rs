@@ -11,7 +11,10 @@ use crate::{
         FamilyInputs, Node, OperatorBody, OperatorProgram, Slot, SlotValues, exact_precision,
     },
 };
-use gam_gpu::tensor::{Arithmetic, ColumnBlocks, Device, Indices, Tensor};
+use gam_gpu::{
+    tensor::{Arithmetic, ColumnBlocks, Device, Indices, Tensor},
+    trace,
+};
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -691,14 +694,14 @@ fn forward(
         .iter()
         .map(|(slot, x)| Ok((*slot, d.copy(x).map_err(error)?)))
         .collect::<Result<_, String>>()?;
-    p.forward_given(&e.family, given)
+    trace::within("forward", d, || p.forward_given(&e.family, given))
 }
 fn scan(p: &DeviceProgram, episodes: &[ResidentEpisode]) -> Result<Measurement, String> {
     let mut groups: BTreeMap<String, (f64, usize)> = BTreeMap::new();
     let mut scores = Vec::new();
     for e in episodes {
         let trace = forward(p, e)?;
-        let (kl, _) = score(p, e, &trace, false)?;
+        let (kl, _) = trace::within("kl", p.device(), || score(p, e, &trace, false))?;
         if kl.iter().any(|v| !v.is_finite()) {
             return Err("nonfinite training KL".into());
         }
@@ -790,7 +793,7 @@ fn weighted_gradient(
             return Err("invalid training episode weight".into());
         }
         let trace = forward(p, e)?;
-        let (kl, seed) = score(p, e, &trace, true)?;
+        let (kl, seed) = trace::within("kl", d, || score(p, e, &trace, true))?;
         let seed = seed.ok_or("missing KL gradient seed")?;
         if kl.iter().any(|v| !v.is_finite()) {
             return Err("nonfinite gradient KL".into());
@@ -800,8 +803,9 @@ fn weighted_gradient(
         d.axpy(&mut scaled, weight, &seed).map_err(error)?;
         let mut seeds = BTreeMap::from([(p.hidden(), scaled)]);
         response_score(p, e, &trace, Some(&mut seeds), episode_weight)?;
-        let (_, per_episode) =
-            p.vjp_values_dense(&trace, seeds, &[], trainable, Arithmetic::F64)?;
+        let (_, per_episode) = trace::within("reverse", d, || {
+            p.vjp_values_dense(&trace, seeds, &[], trainable, Arithmetic::F64)
+        })?;
         for index in trainable {
             d.axpy(
                 gradients.get_mut(index).ok_or("gradient buffer")?,
@@ -936,7 +940,9 @@ pub fn fit(
 ) -> Result<Fit, String> {
     let started = Instant::now();
     validate_settings(trainable, &settings)?;
-    let (p, resident, planned) = prepare(d, source, episodes, trainable, settings.numeric_bytes)?;
+    let (p, resident, planned) = trace::within("fit.prepare", d, || {
+        prepare(d, source, episodes, trainable, settings.numeric_bytes)
+    })?;
     fit_prepared(
         d, source, p, resident, planned, trainable, settings, started,
     )
@@ -1064,34 +1070,39 @@ fn fit_prepared(
     let mut cursors = BTreeMap::new();
     for step in 1..=settings.iterations {
         let last_measurement = &history.last().ok_or("missing training score")?.measurement;
-        let (gradients, count) = if let Some(schedule) = &settings.schedule {
-            let selected = scheduled_batch(&groups, last_measurement, schedule, &mut cursors)?;
-            (
-                weighted_gradient(&p, &resident, &selected, trainable)?,
-                selected.len(),
-            )
-        } else {
-            (
-                gradient(&p, &resident, &last_measurement.active_group, trainable)?,
-                groups[&last_measurement.active_group].len(),
-            )
-        };
+        let (gradients, count) = trace::within("fit.gradient", d, || {
+            Ok::<_, String>(if let Some(schedule) = &settings.schedule {
+                let selected = scheduled_batch(&groups, last_measurement, schedule, &mut cursors)?;
+                (
+                    weighted_gradient(&p, &resident, &selected, trainable)?,
+                    selected.len(),
+                )
+            } else {
+                (
+                    gradient(&p, &resident, &last_measurement.active_group, trainable)?,
+                    groups[&last_measurement.active_group].len(),
+                )
+            })
+        })?;
         reverse += count;
         forwards += count;
-        for index in trainable {
-            let mut next = d.copy(p.dense_parameter(*index)?).map_err(error)?;
-            let (m, v) = moments.get_mut(index).ok_or("moment pair")?;
-            d.adam(
-                &mut next,
-                (m, v),
-                gradients.get(index).ok_or("parameter gradient")?,
-                settings.learning_rate,
-                (settings.beta1, settings.beta2, settings.epsilon),
-                step as u64,
-            )
-            .map_err(error)?;
-            p.replace_dense_parameter(*index, next)?;
-        }
+        trace::within("fit.adam", d, || {
+            for index in trainable {
+                let mut next = d.copy(p.dense_parameter(*index)?).map_err(error)?;
+                let (m, v) = moments.get_mut(index).ok_or("moment pair")?;
+                d.adam(
+                    &mut next,
+                    (m, v),
+                    gradients.get(index).ok_or("parameter gradient")?,
+                    settings.learning_rate,
+                    (settings.beta1, settings.beta2, settings.epsilon),
+                    step as u64,
+                )
+                .map_err(error)?;
+                p.replace_dense_parameter(*index, next)?;
+            }
+            Ok::<_, String>(())
+        })?;
         if settings
             .schedule
             .as_ref()
@@ -1100,7 +1111,7 @@ fn fit_prepared(
         {
             continue;
         }
-        let measurement = scan(&p, &resident)?;
+        let measurement = trace::within("fit.scan", d, || scan(&p, &resident))?;
         forwards += resident.len();
         if measurement.objective < best.objective {
             best = measurement.clone();

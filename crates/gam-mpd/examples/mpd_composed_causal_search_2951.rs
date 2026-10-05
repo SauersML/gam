@@ -1,5 +1,6 @@
 //! Fit structural proposals in the autonomous native LM on clean AND intervened logits.
-//! EXPORT SETTINGS.json FRESH_OUT host|cuda [HELDOUT_EXPORT]. Training proposal search, not acceptance.
+//! EXPORT SETTINGS.json FRESH_OUT host|cuda [HELDOUT_EXPORT] [--profile]. Training proposal search, not acceptance.
+//! --profile synchronizes the device around every named stage and writes FRESH_OUT/PROFILE.json.
 use gam_gpu::{tensor::Device, GpuPolicy};
 use gam_mpd::{
     acceptance::{structural_cost, CostCache},
@@ -550,7 +551,7 @@ impl CausalEpisodes {
         trainable: &[usize],
         settings: FitSettings,
     ) -> Result<resident_causal_fit::Fit, String> {
-        match (&self.compact, responses) {
+        gam_gpu::trace::within("fit", d, || match (&self.compact, responses) {
             (Some(e), Some(r)) => resident_causal_fit::fit_fixed_head_with_native(
                 d,
                 source,
@@ -587,7 +588,7 @@ impl CausalEpisodes {
                 trainable,
                 settings,
             ),
-        }
+        })
     }
     fn measure(
         &self,
@@ -596,7 +597,7 @@ impl CausalEpisodes {
         responses: Option<&resident_causal_fit::NativeResponses>,
         bytes: usize,
     ) -> Result<resident_causal_fit::Measurement, String> {
-        match (&self.compact, responses) {
+        gam_gpu::trace::within("measure", d, || match (&self.compact, responses) {
             (Some(e), Some(r)) => resident_causal_fit::measure_fixed_head_with_native(
                 d,
                 source,
@@ -625,7 +626,7 @@ impl CausalEpisodes {
                     .ok_or("full-logit dispatch missing episodes")?,
                 bytes,
             ),
-        }
+        })
     }
 }
 
@@ -1014,6 +1015,12 @@ fn canonical(artifact: &Artifact) -> Result<(Artifact, Vec<u8>), String> {
 }
 
 fn canonical_using(
+    artifact: &Artifact,
+    cache: Option<&CanonicalArtifactCache>,
+) -> Result<(Artifact, Vec<u8>, Value), String> {
+    gam_gpu::trace::within_host("canonical", || canonical_timed(artifact, cache))
+}
+fn canonical_timed(
     artifact: &Artifact,
     cache: Option<&CanonicalArtifactCache>,
 ) -> Result<(Artifact, Vec<u8>, Value), String> {
@@ -2298,10 +2305,28 @@ fn structural_run(
         artifact: initial_source,
     };
     let mut callback_index = 0usize;
+    let mut search_settings = structural.settings.clone();
+    if parameter_edits.is_some() || search_settings.joint_observation_places.is_some() {
+        // Native observations keep their original meaning through both lowerings.
+        // Synthetic edit multiplications are execution machinery, not native targets.
+        let original_observations = if let Some(declared) = &search_settings.joint_observation_places {
+            if declared.iter().any(|n| *n >= original_native.nodes.len()) {
+                return Err("joint observation absent from original native graph".into());
+            }
+            declared.clone()
+        } else {
+            original_native.nodes.iter().enumerate().filter_map(|(n, node)| {
+                matches!(node, Node::Pointwise { .. } | Node::Hadamard { .. }).then_some(n)
+            }).collect()
+        };
+        search_settings.joint_observation_places = Some(original_observations.iter()
+            .map(|n| controlled.root_mapping[parameter_edits.map_or(*n, |edits| edits.node_mapping[*n])]).collect());
+    }
+    save(&out.join("SEARCH_SETTINGS.json"), &serde_json::to_value(&search_settings).map_err(|e|e.to_string())?)?;
     let result = program_structure_search::search(
         &controlled.program,
         initial,
-        &structural.settings,
+        &search_settings,
         &structural.constraints,
         |request| {
             let root = out.join(format!("structural-attempt-{:06}", request.attempt_id));
@@ -2625,9 +2650,12 @@ fn validate_joint_configuration(settings: &Settings) -> Result<(), String> {
     Ok(())
 }
 fn run() -> Result<(), String> {
-    let args: Vec<_> = std::env::args().skip(1).collect();
+    let mut args: Vec<_> = std::env::args().skip(1).collect();
+    let profile = args.iter().any(|a| a == "--profile");
+    args.retain(|a| a != "--profile");
+    gam_gpu::trace::time_stages(profile);
     if args.len() != 4 && args.len() != 5 {
-        return Err("EXPORT SETTINGS.json FRESH_OUT host|cuda [HELDOUT_EXPORT]".into());
+        return Err("EXPORT SETTINGS.json FRESH_OUT host|cuda [HELDOUT_EXPORT] [--profile]".into());
     }
     let export = Path::new(&args[0]);
     let config_path = Path::new(&args[1]);
@@ -3569,12 +3597,14 @@ fn run() -> Result<(), String> {
                     return Err("saved control-map SHA mismatch".into());
                 }
                 let bytes = std::fs::read(&artifact_path).map_err(|e| e.to_string())?;
-                let artifact = if let Some(cache) = &native_codec {
-                    cache.decode_saved(&bytes, &native.declarations)?
-                } else {
-                    Artifact::from_bytes(&bytes, &native.declarations)?
-                };
-                if artifact.to_bytes()? != bytes {
+                let artifact = gam_gpu::trace::within_host("heldout.decode", || {
+                    if let Some(cache) = &native_codec {
+                        cache.decode_saved(&bytes, &native.declarations)
+                    } else {
+                        Artifact::from_bytes(&bytes, &native.declarations)
+                    }
+                })?;
+                if gam_gpu::trace::within_host("heldout.reencode", || artifact.to_bytes())? != bytes {
                     return Err("heldout ordinary saved-byte canonical replay differs".into());
                 }
                 let c32 = structural_cost(&artifact, &mut costs)?.total();
@@ -3632,12 +3662,9 @@ fn run() -> Result<(), String> {
                     labels,
                     down.as_ref(),
                 )?;
-                let measured = eval_episodes.measure(
-                    &d,
-                    &lowered.program,
-                    None,
-                    settings.fit.numeric_bytes,
-                )?;
+                let measured = gam_gpu::trace::within("heldout.measure", &d, || {
+                    eval_episodes.measure(&d, &lowered.program, None, settings.fit.numeric_bytes)
+                })?;
                 let supervised = if id != "native" {
                     if let (Some(down), Some(config)) = (&down, &settings.down_edit_family) {
                         let (mut responses, mut provenance) = down_response_targets(
@@ -3720,7 +3747,17 @@ fn run() -> Result<(), String> {
     )
 }
 fn main() -> Result<(), String> {
-    run()
+    let result = run();
+    if gam_gpu::trace::timing_stages() {
+        let totals = gam_gpu::trace::stage_totals();
+        for t in &totals {
+            eprintln!("profile {:<24} {:>8} x {:>12.6} s = {:>10.3} s", t.name, t.count, t.seconds / t.count.max(1) as f64, t.seconds);
+        }
+        if let Some(out) = std::env::args().filter(|a| a != "--profile").nth(3) {
+            save(&Path::new(&out).join("PROFILE.json"), &json!({"inclusive_stage_seconds":totals,"scope":"--profile: each named stage synchronizes its device at both ends, so device work is charged to the stage that queued it; nested stages are included in their parents; host/device overlap is removed"}))?;
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -5252,6 +5289,7 @@ mod tests {
                 shared_dag_search: None,
                 expression_search: None,
                 preserve_native_places: vec![],
+                joint_observation_places: None,
             },
             constraints: program_structure_search::Constraints {
                 max_fidelity: vec![metric("maximum_group_mean_kl")],
@@ -6054,6 +6092,7 @@ mod tests {
                 max_argument_bindings: 2,
                 max_compound_pairs: 8,
                 preserve_native_places: vec![],
+                joint_observation_places: None,
                 learned_dag_search: None,
                 shared_dag_search: None,
                 expression_search: Some(program_structure_search::ExpressionSettings {
@@ -6082,6 +6121,8 @@ mod tests {
             native_response_weight: None,
         };
         if joint {
+            // This fixture measures fanout discovery; observable-chain coverage has separate tests.
+            structural.settings.joint_observation_places = Some(vec![]);
             structural.constraints.max_local_errors[0].value = 1e-6;
             structural.settings.expression_search = None;
             structural.settings.max_callback_calls = 2000;
