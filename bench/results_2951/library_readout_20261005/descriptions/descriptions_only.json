@@ -1,0 +1,202 @@
+[
+ {
+  "function": "L0.H3",
+  "description": "Fires at the first token of a sequence and on a digit piece that continues a number."
+ },
+ {
+  "function": "L2.H2",
+  "description": "Fires on the continuation of a name, path or phrase that occurred earlier in the context."
+ },
+ {
+  "function": "L0.H0",
+  "description": "Fires at the first token of a sequence and on a newline after a newline."
+ },
+ {
+  "function": "L3.H4",
+  "description": "Fires in statistics reporting in research papers (alpha values, test names, lab values)."
+ },
+ {
+  "function": "L3.H0",
+  "description": "Fires on indentation after a statement ends in C#-like code."
+ },
+ {
+  "function": "L3.H2",
+  "description": "Fires on ' and' after the second of listed items and on separators in lists."
+ },
+ {
+  "function": "L2.H4",
+  "description": "Induction head: fires on the second occurrence of a token sequence."
+ },
+ {
+  "function": "L1.H4",
+  "description": "Fires at the first token of a sequence."
+ },
+ {
+  "function": "L0.M2825",
+  "description": "Fires on sentence-final periods and opening parentheses after a complete clause."
+ },
+ {
+  "function": "L0.H5",
+  "description": "Fires on the second piece of a word split into tokens."
+ },
+ {
+  "function": "L3.H1",
+  "description": "Fires at the first token of a sequence."
+ },
+ {
+  "function": "L3.H3",
+  "description": "Fires on the last word of a place or category name, and on a repeated variable name in a foreach loop."
+ },
+ {
+  "function": "L3.H5",
+  "description": "Fires on markers that open a citation or list entry ('*', '(', 'B' after '[@')."
+ },
+ {
+  "function": "L0.H1",
+  "description": "Fires at the first token of a sequence."
+ },
+ {
+  "function": "L2.H3",
+  "description": "Fires on 'B' inside a citation range '[@B9]--[@B'."
+ },
+ {
+  "function": "L1.H2",
+  "description": "Fires at the first token of a sequence."
+ },
+ {
+  "function": "L1.H5",
+  "description": "Fires at the first token of a sequence."
+ },
+ {
+  "function": "L2.H1",
+  "description": "Fires inside LaTeX subscripts and on the second of a paired word ('qualitative and')."
+ },
+ {
+  "function": "L2.H0",
+  "description": "Fires on the noun completing 'the same X' or 'which X'."
+ },
+ {
+  "function": "L1.H1",
+  "description": "Previous-token head: fires on the second piece of a split name."
+ },
+ {
+  "function": "L2.H5",
+  "description": "Fires on function words in narrative prose ('at the', 'or so,')."
+ },
+ {
+  "function": "L1.H0",
+  "description": "Fires on the token after '\\[' in LaTeX cross-references."
+ },
+ {
+  "function": "L1.H3",
+  "description": "Fires on the end-of-document token."
+ },
+ {
+  "function": "L0.H2",
+  "description": "Fires on '*' closing markdown emphasis and '{' after \\begin."
+ },
+ {
+  "function": "L0.H4",
+  "description": "Duplicate-token head: fires on a token that already occurred earlier in the context."
+ },
+ {
+  "function": "L3.M1309",
+  "description": "Fires on the noun or number after 'the' or 'at' in study and weigh-in phrasing."
+ },
+ {
+  "function": "L0.M2413",
+  "description": "Fires on word-final suffix pieces ('es', 'oes')."
+ },
+ {
+  "function": "L0.M203",
+  "description": "Fires on ' and' joining two names or nouns."
+ },
+ {
+  "function": "L0.M159",
+  "description": "Fires on a newline after a personal first-person sentence."
+ },
+ {
+  "function": "L0.M2650",
+  "description": "Fires on a blank line after a short sentence."
+ },
+ {
+  "function": "L2.M767",
+  "description": "Fires on a newline after an informal sentence or a URL."
+ },
+ {
+  "function": "L0.M1181",
+  "description": "Fires on a newline after a sentence ending with a period."
+ },
+ {
+  "function": "L0.M147",
+  "description": "Fires on the name ' Solomon'."
+ },
+ {
+  "function": "L2.M3037",
+  "description": "Fires on a word piece that repeats a piece seen earlier in the context."
+ },
+ {
+  "function": "L1.M2889",
+  "description": "Fires at the first token of a sequence."
+ },
+ {
+  "function": "L1.M2352",
+  "description": "Fires on the end-of-document token."
+ },
+ {
+  "function": "L0.M20",
+  "description": "Fires on '.' inside URLs and version numbers."
+ },
+ {
+  "function": "L1.M1700",
+  "description": "Fires on a newline in code, shell scripts and file headers."
+ },
+ {
+  "function": "L0.M1249",
+  "description": "Fires on the end-of-document token."
+ },
+ {
+  "function": "L3.M720",
+  "description": "Fires on an en dash opening a line in a list of fighters and on a period after a single initial."
+ },
+ {
+  "function": "L0.M801",
+  "description": "Fires on Swedish function words."
+ },
+ {
+  "function": "L1.M613",
+  "description": "Fires at the first token of a sequence."
+ },
+ {
+  "function": "L3.M338",
+  "description": "Fires on 'AT' in ioctl constant names (SIOCIF_AT...)."
+ },
+ {
+  "function": "L0.M2786",
+  "description": "Fires on ' the' after ' in'."
+ },
+ {
+  "function": "L1.M2960",
+  "description": "Fires at the first token of a sequence."
+ },
+ {
+  "function": "L1.M2028",
+  "description": "Fires at the first token of a sequence."
+ },
+ {
+  "function": "L0.M2182",
+  "description": "Fires on two-digit numbers."
+ },
+ {
+  "function": "L1.M2229",
+  "description": "Fires at the first token of a sequence."
+ },
+ {
+  "function": "L3.M583",
+  "description": "Fires on '.' after 'www' in URLs and on ' well' after 'Okay,'."
+ },
+ {
+  "function": "L0.M680",
+  "description": "Fires on a comma after a noun phrase."
+ }
+]

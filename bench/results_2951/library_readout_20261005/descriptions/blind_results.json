@@ -1,0 +1,179 @@
+{
+ "correct": 0.855,
+ "failures": [
+  [
+   "L2.H2",
+   "fire",
+   "ing it, copy the folder back into /usr/local/share",
+   0.18
+  ],
+  [
+   "L2.H2",
+   "fire",
+   "ryone lined up to speak with Dr. Margaret Holloway",
+   0.88
+  ],
+  [
+   "L3.H4",
+   "fire",
+   ", and statistical significance was set at P < 0.05",
+   0.66
+  ],
+  [
+   "L3.H4",
+   "fire",
+   "at 1.8 mg/dL, and blood urea nitrogen was 42 mg/dL",
+   0.72
+  ],
+  [
+   "L3.H0",
+   "fire",
+   "public void Start()\n{\n    int count = 0;\n    ",
+   0.05
+  ],
+  [
+   "L3.H0",
+   "fire",
+   "Player\n{\n    public string Name { get; set; }\n    ",
+   0.11
+  ],
+  [
+   "L3.H2",
+   "fire",
+   "For the trip she packed a toothbrush, a towel, and",
+   0.8
+  ],
+  [
+   "L2.H4",
+   "fire",
+   "e guard asked again, she whispered purple elephant",
+   0.87
+  ],
+  [
+   "L1.H4",
+   "quiet",
+   "umbrella at the office and got soaked walking home",
+   0.93
+  ],
+  [
+   "L0.H5",
+   "fire",
+   "e was introduced to a quiet farmer named Brandvold",
+   0.79
+  ],
+  [
+   "L3.H3",
+   "fire",
+   "rew up in a small town just outside Salt Lake City",
+   0.67
+  ],
+  [
+   "L3.H5",
+   "fire",
+   " has been reported in several previous studies [@B",
+   0.27
+  ],
+  [
+   "L3.H5",
+   "fire",
+   "Things to bring:\n* sunscreen\n*",
+   0.1
+  ],
+  [
+   "L2.H0",
+   "quiet",
+   "en the puppy jumped into the pile of autumn leaves",
+   0.97
+  ],
+  [
+   "L2.H5",
+   "fire",
+   "m outside the station and finally looked up at the",
+   0.81
+  ],
+  [
+   "L2.H5",
+   "fire",
+   "We walked along the river for an hour or so,",
+   0.42
+  ],
+  [
+   "L0.M2413",
+   "fire",
+   "he researchers tested several competing hypotheses",
+   0.41
+  ],
+  [
+   "L0.M2650",
+   "fire",
+   "It was late.\n\n",
+   0.85
+  ],
+  [
+   "L0.M2650",
+   "fire",
+   "He left.\n\n",
+   0.84
+  ],
+  [
+   "L2.M767",
+   "fire",
+   "ol that was honestly the funniest thing ever haha\n",
+   0.78
+  ],
+  [
+   "L2.M767",
+   "quiet",
+   "refully restored by a team of skilled conservators",
+   0.94
+  ],
+  [
+   "L0.M147",
+   "fire",
+   "The story tells of the wisdom of King Solomon",
+   0.87
+  ],
+  [
+   "L2.M3037",
+   "fire",
+   "ar, and next spring we plan to return to Ljubljana",
+   0.33
+  ],
+  [
+   "L2.M3037",
+   "fire",
+   "rols glycolysis, so inhibiting phosphofructokinase",
+   0.86
+  ],
+  [
+   "L1.M1700",
+   "quiet",
+   " flowers that decorated every table at the wedding",
+   0.94
+  ],
+  [
+   "L3.M720",
+   "quiet",
+   "e fountain while their parents rested in the shade",
+   0.98
+  ],
+  [
+   "L3.M338",
+   "fire",
+   "case SIOCIF_AT",
+   0.72
+  ],
+  [
+   "L1.M2960",
+   "fire",
+   "§ A",
+   0.9
+  ],
+  [
+   "L3.M583",
+   "fire",
+   "u can find more information on our website at www.",
+   0.82
+  ]
+ ]
+}
