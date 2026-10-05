@@ -256,6 +256,11 @@ impl DevicePosterior {
         self.wide.group_divergence(&mut self.sums, &mut self.variance, &mut self.divergence).map_err(error)
     }
 
+    /// Per group, its empirical-Bayes variance `v_G` at the posterior as it stands.
+    pub fn variances(&self) -> Result<Vec<f64>, String> {
+        Ok(self.wide.download(&self.variance).map_err(error)?.into_iter().collect())
+    }
+
     /// Per group, `KL(q_G ‖ p_G)` in nats at the posterior as it stands (zero for a removed group).
     pub fn divergences(&self) -> Result<Vec<f64>, String> {
         Ok(self.wide.download(&self.divergence).map_err(error)?.into_iter().collect())

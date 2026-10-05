@@ -30,16 +30,22 @@
 //! coordinate (one row of the shared value), an MLP function's gate `(g_i, c_i)`, its up direction `b_i` when gated, and its output `u_i`. With the posterior `q(θ) = Π_j N(μ_j, σ_j²)` and the
 //! prior `p(θ_G) = N(0, v_G I)`, the code length in nats is
 //!
-//! `F = E_q[D(θ)] + Σ_G KL(q_G ‖ p_G) + Σ_{active G} ½ ln |G|`,
+//! `F = E_q[D(θ)] + Σ_G KL(q_G ‖ p_G) + Σ_{active G} (½ ln |G| + L_scale(v_G)) + L_subset`,
 //!
 //! the bits-back code of the training data given the explanation plus the explanation. `D(θ)`
 //! sums `KL(M_e ‖ P_e)` of the next-token distributions over every token of every training
-//! experiment `e` (below), so the data term's weight is the number of scored tokens and no
-//! tradeoff weight exists. Each prior variance is chosen by empirical Bayes in closed form,
+//! experiment `e` (below), so the data term's weight is the number of scored tokens `N` and no
+//! tradeoff weight exists. `N` is the amount of `M`'s behaviour the explanation is asked to
+//! explain; it is the one choice left, and results are reported along it. Each prior variance is chosen by empirical Bayes in closed form,
 //! `v_G = (1/|G|) Σ_{j∈G} (μ_j² + σ_j²)`, which makes `KL(q_G ‖ p_G) = ½ (|G| ln v_G − Σ_{j∈G}
 //! ln σ_j²)` with derivatives `μ_j / v_G` in `μ_j` and `σ_j² / v_G − 1` in `ln σ_j`. An active
 //! group sends its variance at the precision of a parameter estimated from `|G|` values,
-//! `½ log2 |G|` bits (the two-part code's parameter precision). A group the data does not inform
+//! `½ log2 |G|` bits (the two-part code's parameter precision), after its scale: the integer
+//! exponent `round(log2(v_G / v⁰_G))` relative to the variance `v⁰_G` of the group's native
+//! starting values, which every decoder has from `M`, in the Elias δ code of its signed index
+//! (`L_scale`; the precision prices the fraction, the scale the exponent, since `(μ, σ) → (a μ, a
+//! σ)` leaves `KL` unchanged). Which groups are in the explanation is sent once in the enumerative
+//! subset code, `L_subset = L_int(k + 1) + ⌈log2 C(n, k)⌉` bits for `k` of `n` groups. A group the data does not inform
 //! sits at its prior with zero divergence and posterior mean zero, so the null is recovered;
 //! removing it from the explanation is a discrete step of the same `F`.
 //!
@@ -574,6 +580,23 @@ pub struct Posterior {
     membership: Vec<Array2<u32>>,
     /// Per trainable operator, the range of its groups' indices.
     spans: Vec<Range<usize>>,
+    /// Per group, the variance `v⁰_G` of its native starting values, against which its variance's
+    /// scale is sent (zero for a group that starts outside the explanation).
+    initial: Vec<f64>,
+}
+
+/// The bits of a group's variance scale (module note): the integer exponent
+/// `round(log2(v_G / v⁰_G))` in the Elias δ code of its signed index.
+fn scale_bits(variance: f64, initial: f64) -> f64 {
+    let exponent = (variance / initial).log2().round();
+    if !exponent.is_finite() {
+        return f64::INFINITY;
+    }
+    // A finite ratio of finite positive variances has |exponent| ≤ 2098, well inside i64.
+    match crate::codec::signed_codeword_argument(exponent as i64).and_then(crate::codec::elias_delta_len_bits) {
+        Ok(bits) => bits as f64,
+        Err(_) => f64::INFINITY,
+    }
 }
 
 /// Per group: its size, `Σ (μ² + σ²)` and `Σ ln σ²`.
@@ -649,7 +672,8 @@ impl Posterior {
                 })
             })
             .collect();
-        let mut posterior = Self { mean, log_sd, active: vec![true; explanation.groups.len()], membership, spans };
+        let initial = squares.iter().map(|(count, sum)| if *count > 0.0 { sum / count } else { 0.0 }).collect();
+        let mut posterior = Self { mean, log_sd, active: vec![true; explanation.groups.len()], membership, spans, initial };
         posterior.remove(&explanation.removed);
         Ok(posterior)
     }
@@ -723,12 +747,23 @@ impl Posterior {
     /// Per group, `KL(q_G ‖ p_G)` plus its variance's `½ ln |G|`, in nats (zero for a removed
     /// group).
     pub fn costs(&self) -> Vec<f64> {
-        self.moments().iter().zip(&self.active).map(|(m, active)| if *active { m.divergence() + 0.5 * m.count.ln() } else { 0.0 }).collect()
+        self.moments()
+            .iter()
+            .zip(&self.active)
+            .zip(&self.initial)
+            .map(|((m, active), initial)| if *active { m.divergence() + 0.5 * m.count.ln() + scale_bits(m.second / m.count, *initial) * LN_2 } else { 0.0 })
+            .collect()
     }
 
-    /// `Σ_G KL(q_G ‖ p_G)` plus the active groups' variances, in nats.
+    /// The nats of which groups are in the explanation (module note).
+    pub fn subset_nats(&self) -> f64 {
+        let active = self.active.iter().filter(|a| **a).count();
+        crate::codec::subset_code_len_bits(self.active.len(), active).map_or(f64::INFINITY, |bits| bits as f64 * LN_2)
+    }
+
+    /// `Σ_G KL(q_G ‖ p_G)`, the active groups' variances and which groups are active, in nats.
     pub fn description(&self) -> f64 {
-        self.costs().iter().sum()
+        self.costs().iter().sum::<f64>() + self.subset_nats()
     }
 
 
@@ -859,7 +894,8 @@ pub struct HeldOut {
     /// description over the training experiments' scored tokens.
     pub objective_bits_per_token: f64,
     pub data_bits_per_token: f64,
-    /// `Σ_G KL(q_G ‖ p_G)` and the active groups' variances `Σ ½ log2 |G|`, in bits.
+    /// `Σ_G KL(q_G ‖ p_G)`, and the active groups' variances (precision and scale) with the code of
+    /// which groups are active, in bits.
     pub divergence_bits: f64,
     pub variance_bits: f64,
     /// The explanation's discrete choices (`Explanation::fixed_nats`), and the prior term's value at
@@ -1845,6 +1881,8 @@ pub fn fit(
         // Selection may change the required operators each epoch. Only these means and
         // deviations cross to the host per step for the current CPU prior implementation.
         let prior_operators = prior.as_deref().map(PriorTerm::operators).unwrap_or_default();
+        // Which groups are active changes only at a removal.
+        let subset_code = posterior.subset_nats();
         let mut estimates = Vec::with_capacity(draws.len());
         let (mut data_sum, mut description_sum) = (0.0, 0.0);
         let (mut clean, mut patched) = (Mean::default(), Mean::default());
@@ -1861,13 +1899,16 @@ pub fn fit(
             let scale = tokens as f64 / scored as f64;
             let data = scale * LN_2 * bits.iter().flatten().sum::<f64>();
             // `Σ_G KL_G` and the active groups' variances at the posterior the sample was drawn from.
+            let variances = device_posterior.variances()?;
             let description: f64 = device_posterior
                 .divergences()?
                 .iter()
                 .zip(&sizes)
                 .zip(&posterior.active)
-                .map(|((d, n), active)| if *active { d + 0.5 * n.ln() } else { 0.0 })
-                .sum();
+                .zip(variances.iter().zip(&posterior.initial))
+                .map(|(((d, n), active), (v, initial))| if *active { d + 0.5 * n.ln() + scale_bits(*v, *initial) * LN_2 } else { 0.0 })
+                .sum::<f64>()
+                + subset_code;
             // The prior term at the same weight sample; its gradient joins the data term's, which
             // the step weighs by `scale` in nats.
             let prior_nats = match prior.as_deref_mut() {
@@ -2810,7 +2851,9 @@ mod tests {
         assert!(divergences[0].abs() < 1e-12, "an uninformed group at its prior costs {}", divergences[0]);
         assert!(divergences[1] > 0.0);
         let size: usize = group.cells.iter().map(|c| c.rows.len() * c.cols.len()).sum();
-        assert!((posterior.costs()[0] - 0.5 * (size as f64).ln()).abs() < 1e-12, "its variance costs ½ ln |G|");
+        let variance = (-3.0_f64).exp();
+        let expected = 0.5 * (size as f64).ln() + scale_bits(variance, posterior.initial[0]) * LN_2;
+        assert!((posterior.costs()[0] - expected).abs() < 1e-12, "its variance costs ½ ln |G| and its scale");
     }
 
     #[test]
@@ -2841,6 +2884,7 @@ mod tests {
             active: vec![true, true],
             membership: Vec::new(),
             spans: Vec::new(),
+            initial: Vec::new(),
         };
         let progress = Progress {
             identity: Identity {
