@@ -721,13 +721,13 @@ record() {  # GPU_ID KIND
     nohup "$SELF" --watch "$POD" "$$" "$DEADLINE" >> "$OUT/watch.log" 2>&1 &
 }
 
-# Waits for SSH to POD: 10 minutes, as pods that came up did so within 45 s and two that did not
-# had not answered after 15 minutes (a host pulling the 7 GB image slower than 12 MB/s is also
-# better left). Sets IP PORT VCPU.
+# Waits for SSH to POD: 5 minutes. Of the pods so far every one that came up did so within 45 s,
+# and the three that did not had not answered after 10 to 15 minutes (a host pulling the 7 GB image
+# slower than 25 MB/s is also better left for another). Sets IP PORT VCPU.
 reach() {
     local r b st
     until [ -n "$IP" ]; do
-        (( $(date +%s) - CREATED < 600 )) || { say "no public SSH address after 10 minutes"; return 1; }
+        (( $(date +%s) - CREATED < 300 )) || { say "no public SSH address after 5 minutes"; return 1; }
         r=$(api GET "$REST/pods/$POD")
         if [ "$(status_of "$r")" = 200 ]; then
             b=$(body_of "$r")
@@ -742,7 +742,7 @@ reach() {
         [ -n "$IP" ] || sleep 5
     done
     until on_pod true < /dev/null 2> /dev/null; do
-        (( $(date +%s) - CREATED < 600 )) || { say "SSH to $IP:$PORT not answering after 10 minutes"; return 1; }
+        (( $(date +%s) - CREATED < 300 )) || { say "SSH to $IP:$PORT not answering after 5 minutes"; return 1; }
         sleep 5
     done
     say "ssh root@$IP -p $PORT up after $(( $(date +%s) - CREATED )) s"
