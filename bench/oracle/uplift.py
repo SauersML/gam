@@ -36,6 +36,9 @@ investigate.py writes RUNS/<name>/report.frozen.json, with the task and arm, and
 SETS.json maps each organism to its set: {"o338d": "control", ...}; runs of other tasks are skipped, and
 an organism with several runs of one arm contributes the latest frozen one.
 
+On the Mac every stage but measure and the reader is light: run it with MPD_MEM_GIB=1 so the research
+venv's memory ledger does not queue it behind other jobs (measure reserves the organism's own size).
+
 Stages (state under RUN = ~/mpd-data/oracle/uplift/<run>/; each stage reads the previous stages' files):
   uplift.py stage   --run R --manifest M.jsonl    one episode per report, its report frozen
   uplift.py ablate  --run R --model sonnet        ablations of every rule (claude -p)
