@@ -907,6 +907,89 @@ impl Mixture {
     }
 }
 
+/// One target's share of a derivative in an operator's sample: a row, a column or the whole.
+enum Piece {
+    Row { operator: usize, index: usize, values: Array1<f64> },
+    Column { operator: usize, index: usize, values: Array1<f64> },
+    Whole { operator: usize, values: Array2<f64> },
+}
+
+impl Mixture {
+    /// Target `t`'s term `−ln r(g)` at `theta`, its derivatives in the operators' samples, and in
+    /// its own parameters (the zero logit, then per component its logit and scale, then `ln s²`);
+    /// nothing for a target out of the explanation or without candidates.
+    fn target_term(&self, t: usize, posterior: &Posterior, theta: &BTreeMap<usize, Array2<f64>>) -> Result<Option<(f64, Vec<Piece>, Vec<f64>)>, String> {
+        let target = &self.targets[t];
+        if !self.active(t, posterior) || target.components.is_empty() {
+            return Ok(None);
+        }
+        let (g, writes, v) = self.vectors(t, posterior, theta)?;
+        let views: Vec<(ArrayView1<'_, f64>, f64)> = writes.iter().zip(&target.components).map(|(u, c)| (u.view(), c.scale)).collect();
+        let logits: Vec<f64> = std::iter::once(target.zero_logit).chain(target.components.iter().map(|c| c.logit)).collect();
+        let found = term(g.view(), &views, &logits, target.log_variance, v.view())?;
+        let mut pieces = Vec::new();
+        // A block's derivative goes to its row or its column; a token row is no parameter.
+        let block = |write: Write, derivative: &Array1<f64>| -> Result<Option<Piece>, String> {
+            let index = match write {
+                Write::Token(_) => return Ok(None),
+                Write::Output { function, .. } | Write::Gate { function, .. } | Write::Up { function, .. } => function,
+                Write::QueryKey { .. } | Write::Value { .. } => return Err("not an MLP block".into()),
+            };
+            let (operator, column) = self.place(write)?;
+            let values = derivative.clone();
+            Ok(Some(if column { Piece::Column { operator, index, values } } else { Piece::Row { operator, index, values } }))
+        };
+        match target.kind {
+            Kind::Gate { .. } | Kind::Up { .. } | Kind::Output { .. } => {
+                pieces.extend(block(Write::of(target.kind), &found.target)?);
+                for (component, derivative) in target.components.iter().zip(&found.writes) {
+                    pieces.extend(block(component.write, derivative)?);
+                }
+            }
+            Kind::QueryKey { layer, group } => {
+                let maps = self.key_value(layer, group)?;
+                let live = self.live_planes(maps, posterior);
+                let (query, key) = (theta.get(&maps.queries[0]).ok_or("a sample")?.dim(), theta.get(&maps.key).ok_or("a sample")?.dim());
+                let zeros = || -> (Vec<Array2<f64>>, Array2<f64>) { (vec![Array2::zeros(query); maps.queries.len()], Array2::zeros(key)) };
+                let (mut dq, mut dk) = zeros();
+                Self::group_scatter(maps, &live, &found.target, &mut dq, &mut dk);
+                pieces.extend(maps.queries.iter().zip(dq).chain([(&maps.key, dk)]).map(|(&operator, values)| Piece::Whole { operator, values }));
+                for (component, derivative) in target.components.iter().zip(&found.writes) {
+                    let Write::QueryKey { layer, group } = component.write else { continue };
+                    let other = self.key_value(layer, group)?;
+                    let (mut aq, mut ak) = zeros();
+                    Self::group_scatter(maps, &live, derivative, &mut aq, &mut ak);
+                    // The gauge is linear: its transpose takes the derivative back to the
+                    // candidate's maps, each target head's to the query head it faces.
+                    for (i, &j) in component.assignment.iter().enumerate() {
+                        pieces.push(Piece::Whole { operator: other.queries[j], values: library_sharing::turn(&aq[i], &maps.planes, &component.gauge, true, true) });
+                    }
+                    pieces.push(Piece::Whole { operator: other.key, values: library_sharing::turn(&ak, &maps.planes, &component.gauge, false, true) });
+                }
+            }
+            Kind::Value { layer, group } => {
+                let maps = self.value(layer, group)?;
+                let live = Self::live_rows(maps, posterior);
+                let d = theta.get(&maps.value).ok_or("a sample")?.ncols();
+                let own = Self::rows_matrix(&live, &found.target, d)?;
+                pieces.extend(live.iter().zip(own.rows()).map(|(&index, row)| Piece::Row { operator: maps.value, index, values: row.to_owned() }));
+                // The candidate `T V_s` takes its derivative back through `Tᵀ`.
+                for (component, derivative) in target.components.iter().zip(&found.writes) {
+                    let (Write::Value { layer, group }, Some(transport)) = (component.write, &component.transport) else { continue };
+                    let source = self.value(layer, group)?.value;
+                    pieces.push(Piece::Whole { operator: source, values: transport.select(ndarray::Axis(0), &live).t().dot(&Self::rows_matrix(&live, derivative, d)?) });
+                }
+            }
+        }
+        let mut own = vec![found.logits[0]];
+        for j in 0..target.components.len() {
+            own.extend([found.logits[j + 1], found.scales[j]]);
+        }
+        own.push(found.log_variance);
+        Ok(Some((found.value, pieces, own)))
+    }
+}
+
 impl PriorTerm for Mixture {
     fn operators(&self) -> Vec<usize> {
         // Only the selected conditional factors need per-step host samples. Candidate
@@ -948,100 +1031,29 @@ impl PriorTerm for Mixture {
     }
 
     fn sample(&mut self, posterior: &Posterior, theta: &BTreeMap<usize, Array2<f64>>, learn: bool) -> Result<(f64, BTreeMap<usize, Array2<f64>>), String> {
+        use rayon::prelude::*;
+        // Each target's term and derivatives on its own (in parallel), then summed in target order.
+        let found: Vec<Option<(f64, Vec<Piece>, Vec<f64>)>> = (0..self.targets.len()).into_par_iter().map(|t| self.target_term(t, posterior, theta)).collect::<Result<_, String>>()?;
         let mut value = 0.0;
         let mut gradient: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
         let mut learned = vec![Vec::new(); self.targets.len()];
-        let slot = |gradient: &mut BTreeMap<usize, Array2<f64>>, i: usize| -> Result<(), String> {
-            if !gradient.contains_key(&i) {
-                gradient.insert(i, Array2::zeros(theta.get(&i).ok_or("an operator's sample")?.dim()));
-            }
-            Ok(())
-        };
-        for t in 0..self.targets.len() {
-            let target = &self.targets[t];
-            if !self.active(t, posterior) || target.components.is_empty() {
-                continue;
-            }
-            let (g, writes, v) = self.vectors(t, posterior, theta)?;
-            let views: Vec<(ArrayView1<'_, f64>, f64)> = writes.iter().zip(&target.components).map(|(u, c)| (u.view(), c.scale)).collect();
-            let logits: Vec<f64> = std::iter::once(target.zero_logit).chain(target.components.iter().map(|c| c.logit)).collect();
-            let found = term(g.view(), &views, &logits, target.log_variance, v.view())?;
-            value += found.value;
-            // A block's derivative goes to its row or its column; a token row is no parameter.
-            let add = |gradient: &mut BTreeMap<usize, Array2<f64>>, write: Write, derivative: &Array1<f64>| -> Result<(), String> {
-                if matches!(write, Write::Token(_)) {
-                    return Ok(());
-                }
-                let (i, column) = self.place(write)?;
-                let index = match write {
-                    Write::Output { function, .. } | Write::Gate { function, .. } | Write::Up { function, .. } => function,
-                    Write::Token(_) | Write::QueryKey { .. } | Write::Value { .. } => return Err("not an MLP block".into()),
+        for (t, found) in found.into_iter().enumerate() {
+            let Some((term, pieces, own)) = found else { continue };
+            value += term;
+            for piece in pieces {
+                let i = match &piece {
+                    Piece::Row { operator, .. } | Piece::Column { operator, .. } | Piece::Whole { operator, .. } => *operator,
                 };
-                slot(gradient, i)?;
-                let target = gradient.get_mut(&i).ok_or("slot")?;
-                if column { target.column_mut(index).scaled_add(1.0, derivative) } else { target.row_mut(index).scaled_add(1.0, derivative) }
-                Ok(())
-            };
-            match target.kind {
-                Kind::Gate { .. } | Kind::Up { .. } | Kind::Output { .. } => {
-                    add(&mut gradient, Write::of(target.kind), &found.target)?;
-                    for (component, derivative) in target.components.iter().zip(&found.writes) {
-                        add(&mut gradient, component.write, derivative)?;
-                    }
-                }
-                Kind::QueryKey { layer, group } => {
-                    let maps = self.key_value(layer, group)?;
-                    let live = self.live_planes(maps, posterior);
-                    let (query, key) = (theta.get(&maps.queries[0]).ok_or("a sample")?.dim(), theta.get(&maps.key).ok_or("a sample")?.dim());
-                    let zeros = || -> (Vec<Array2<f64>>, Array2<f64>) { (vec![Array2::zeros(query); maps.queries.len()], Array2::zeros(key)) };
-                    let (mut dq, mut dk) = zeros();
-                    Self::group_scatter(maps, &live, &found.target, &mut dq, &mut dk);
-                    for (i, m) in maps.queries.iter().zip(dq).chain([(&maps.key, dk)]) {
-                        slot(&mut gradient, *i)?;
-                        *gradient.get_mut(i).ok_or("slot")? += &m;
-                    }
-                    for (component, derivative) in target.components.iter().zip(&found.writes) {
-                        let Write::QueryKey { layer, group } = component.write else { continue };
-                        let other = self.key_value(layer, group)?;
-                        let (mut aq, mut ak) = zeros();
-                        Self::group_scatter(maps, &live, derivative, &mut aq, &mut ak);
-                        // The gauge is linear: its transpose takes the derivative back to the
-                        // candidate's maps, each target head's to the query head it faces.
-                        for (i, &j) in component.assignment.iter().enumerate() {
-                            let back = library_sharing::turn(&aq[i], &maps.planes, &component.gauge, true, true);
-                            slot(&mut gradient, other.queries[j])?;
-                            *gradient.get_mut(&other.queries[j]).ok_or("slot")? += &back;
-                        }
-                        let back = library_sharing::turn(&ak, &maps.planes, &component.gauge, false, true);
-                        slot(&mut gradient, other.key)?;
-                        *gradient.get_mut(&other.key).ok_or("slot")? += &back;
-                    }
-                }
-                Kind::Value { layer, group } => {
-                    let maps = self.value(layer, group)?;
-                    let live = Self::live_rows(maps, posterior);
-                    let d = theta.get(&maps.value).ok_or("a sample")?.ncols();
-                    let own = Self::rows_matrix(&live, &found.target, d)?;
-                    slot(&mut gradient, maps.value)?;
-                    let into = gradient.get_mut(&maps.value).ok_or("slot")?;
-                    for (k, &j) in live.iter().enumerate() {
-                        into.row_mut(j).scaled_add(1.0, &own.row(k));
-                    }
-                    // The candidate `T V_s` takes its derivative back through `Tᵀ`.
-                    for (component, derivative) in target.components.iter().zip(&found.writes) {
-                        let (Write::Value { layer, group }, Some(transport)) = (component.write, &component.transport) else { continue };
-                        let source = self.value(layer, group)?.value;
-                        let back = transport.select(ndarray::Axis(0), &live).t().dot(&Self::rows_matrix(&live, derivative, d)?);
-                        slot(&mut gradient, source)?;
-                        *gradient.get_mut(&source).ok_or("slot")? += &back;
-                    }
+                let into = match gradient.entry(i) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => entry.insert(Array2::zeros(theta.get(&i).ok_or("an operator's sample")?.dim())),
+                };
+                match piece {
+                    Piece::Row { index, values, .. } => into.row_mut(index).scaled_add(1.0, &values),
+                    Piece::Column { index, values, .. } => into.column_mut(index).scaled_add(1.0, &values),
+                    Piece::Whole { values, .. } => *into += &values,
                 }
             }
-            let mut own = vec![found.logits[0]];
-            for j in 0..target.components.len() {
-                own.extend([found.logits[j + 1], found.scales[j]]);
-            }
-            own.push(found.log_variance);
             learned[t] = own;
         }
         if learn {
@@ -1152,8 +1164,8 @@ impl PriorTerm for Priors {
         let mut total = 0.0;
         let mut gradient: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
         for prior in &mut self.0 {
-            let own: BTreeMap<usize, Array2<f64>> = prior.operators().into_iter().map(|i| Ok((i, theta.get(&i).ok_or("an operator's sample")?.clone()))).collect::<Result<_, String>>()?;
-            let (value, part) = prior.sample(posterior, &own, learn)?;
+            // Each term reads its own operators' samples among `theta`'s.
+            let (value, part) = prior.sample(posterior, theta, learn)?;
             total += value;
             for (i, g) in part {
                 match gradient.get_mut(&i) {
