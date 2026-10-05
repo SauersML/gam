@@ -19,7 +19,8 @@
 # A pod lost before COMMAND ends (a host that fails, a pod deleted elsewhere) is replaced while time
 # remains. The new pod gets the same source, binaries and inputs and the outputs synced so far, and
 # runs COMMAND again, so a command that resumes from its own checkpoint under the outputs continues.
-# Outputs are synced to the Mac (rsync) every minute while COMMAND runs.
+# Outputs are synced to the Mac (rsync) every minute while COMMAND runs, except files still being
+# written (*.partial) and library_mdl's rebuildable target caches (*.targets).
 #
 # Source: `git archive` of origin/main, or of RP_REF=<commit> when it is published: the Rust
 # workspace (crates/, the manifests, the toolchain pin), bench/runpod/ and every /Users/user/gam/...
@@ -86,6 +87,13 @@ CUDA_OK='["12.4","12.5","12.6","12.7","12.8","12.9","13.0"]'
 CAP_DOLLARS=150 START_BALANCE=750
 # The runner's own files in the outputs directory: never synced from or restored to a pod.
 OWN=(run.log rp-run.log pod.json pod.txt build.log watch.log cost.txt ssh rsh host STOP EXTEND)
+# Never synced either: a file still being written (library_mdl writes NAME.partial, then renames it),
+# and library_mdl's cache of M's targets beside its checkpoint (tens of GB on Qwen3, rebuilt when
+# missing; moving it through the Mac's uplink would take longer than rebuilding it).
+SKIP=('*.partial' '*.targets')
+RSYNC_EXCLUDE=()
+for o in "${OWN[@]}"; do RSYNC_EXCLUDE+=("--exclude=/$o"); done
+for o in "${SKIP[@]}"; do RSYNC_EXCLUDE+=("--exclude=$o"); done
 mkdir -p "$RP" "$ACTIVE"
 
 # A RunPod API request: METHOD URL [JSON]. Prints the body, then the HTTP status on its own line.
@@ -704,7 +712,7 @@ setup() {
     (( ! failed )) || { say "an input, model or rsync did not arrive"; return 1; }
     # What an earlier pod of this run wrote, so the command can resume from it.
     if [ "$MODE" = run ] && [ -n "$(find "$OUT" -mindepth 1 $(printf '! -name %s ' "${OWN[@]}") -print -quit)" ]; then
-        rsync -a $(printf -- '--exclude=/%s ' "${OWN[@]}") -e "${SSH[*]} -o ControlPath=none -p $PORT" "$OUT/" "root@$IP:/workspace/mpd-data/runpod/$NAME/" || return 1
+        rsync -a "${RSYNC_EXCLUDE[@]}" -e "${SSH[*]} -o ControlPath=none -p $PORT" "$OUT/" "root@$IP:/workspace/mpd-data/runpod/$NAME/" || return 1
         say "restored the outputs synced so far"
     fi
     say "set up in $(( $(date +%s) - started )) s"
@@ -712,7 +720,7 @@ setup() {
 
 # The outputs, copied to the Mac a minute after each copy ends, while the command runs.
 sync_outputs() {
-    rsync -a $(printf -- '--exclude=/%s ' "${OWN[@]}") -e "${SSH[*]} -o ControlPath=none -p $PORT" "root@$IP:/workspace/mpd-data/runpod/$NAME/" "$OUT/" 2> /dev/null
+    rsync -a "${RSYNC_EXCLUDE[@]}" -e "${SSH[*]} -o ControlPath=none -p $PORT" "root@$IP:/workspace/mpd-data/runpod/$NAME/" "$OUT/" 2> /dev/null
 }
 
 # Starts COMMAND detached on the pod (a dropped connection does not end it) and streams its log.
