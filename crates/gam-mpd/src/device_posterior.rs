@@ -19,7 +19,7 @@
 
 use crate::{
     device_program::DeviceProgram,
-    library_mdl::{Explanation, Posterior},
+    library_mdl::{Curvature, Explanation, Posterior},
 };
 use gam_gpu::{
     gpu_error::GpuError,
@@ -234,11 +234,10 @@ impl DevicePosterior {
     }
 
     /// One IVON step: `gradients` holds per trainable operator (by id) the gradient of the batch's
-    /// data term at the sample, which `scale` turns into an unbiased estimate of the collection's
-    /// gradient per token in nats (`B / N` for one of `B` batches of a collection of `N` scored
-    /// tokens, times the conversion from bits); `factor` holds per operator a draw of the
-    /// Gauss–Newton factor and the factor (`B / N`) turning its square into the curvature estimate
-    /// per token. An operator the batch does not reach has neither, and its step takes the
+    /// data term at the sample, which `scale` turns into the gradient per token in nats (one over
+    /// the batch's scored tokens, and the conversion from bits); `factor` holds per operator a draw
+    /// of the Gauss–Newton factor and the factor `1 / n` turning its square into the curvature
+    /// estimate per token. An operator the batch does not reach has neither, and its step takes the
     /// prior's alone.
     pub fn step(&mut self, gradients: &BTreeMap<usize, Tensor>, scale: f64, factor: (&BTreeMap<usize, Tensor>, f64), ivon: &Ivon) -> Result<(), String> {
         self.steps += 1;
@@ -259,6 +258,33 @@ impl DevicePosterior {
                 .map_err(error)?;
         }
         self.wide.group_divergence(&mut self.sums, &mut self.variance, &mut self.divergence).map_err(error)
+    }
+
+    /// The number of prior groups.
+    #[must_use]
+    pub fn group_count(&self) -> usize {
+        self.variance.rows()
+    }
+
+    /// Adds one draw `u` of the sampled-label gradient at the posterior mean (per trainable operator
+    /// by id, on the device; an operator the draw does not reach adds nothing) to `curvature`, its
+    /// terms weighted by `weight`: per group `(u_G · μ_G)²` and `Σ_{j∈G} u_j² σ_j²` over the group's
+    /// live entries (`Posterior::add_curvature`), summed on the device and read as one row per group.
+    pub fn add_curvature(&self, u: &BTreeMap<usize, Tensor>, weight: f64, curvature: &mut Curvature) -> Result<(), String> {
+        let groups = self.group_count();
+        if curvature.quadratic.len() != groups {
+            return Err(error("a curvature of another explanation"));
+        }
+        let mut sums = self.wide.zeros(groups, 3).map_err(error)?;
+        for (i, op) in self.operators.iter().enumerate() {
+            let Some(draw) = u.get(op) else { continue };
+            self.fitting.group_curvature((draw, &self.mean[i], &self.log_sd[i]), &self.groups[i], &mut sums).map_err(error)?;
+        }
+        for (g, row) in self.wide.download(&sums).map_err(error)?.rows().into_iter().enumerate() {
+            curvature.quadratic[g] += weight * row[1] * row[1];
+            curvature.noise[g] += weight * row[2];
+        }
+        Ok(())
     }
 
     /// Per group, its empirical-Bayes variance `v_G` at the posterior as it stands.

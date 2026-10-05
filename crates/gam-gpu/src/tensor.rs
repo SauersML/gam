@@ -2210,6 +2210,41 @@ impl Device {
         }
     }
 
+    /// Each entry's `(1, u μ, u² exp(2s))` added into its group's row of `sums` (groups × 3): per
+    /// group `u_G · μ_G` and `Σ u_j² σ_j²` of one draw `u` of the Gauss–Newton factor at the
+    /// posterior `N(μ, exp(s)²)`, the terms of a removal's curvature; a removed entry (`s = −∞`)
+    /// adds nothing. `factor` is in the posterior's storage, or bfloat16 with f32 masters on CUDA.
+    pub fn group_curvature(&self, (factor, mean, log_sd): (&Tensor, &Tensor, &Tensor), groups: &Indices, sums: &mut Tensor) -> Result<(), GpuError> {
+        same(mean, log_sd, "group curvature")?;
+        same(mean, factor, "group curvature factor")?;
+        if groups.len != mean.len() || sums.cols != 3 {
+            return Err(shape(format!("{} group ids and {:?} sums for {} entries", groups.len, sums.dim(), mean.len())));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (us, means, log_sds, ids) = (host(factor)?, host(mean)?, host(log_sd)?, host_indices(groups)?);
+                let totals = host_mut(sums)?;
+                for i in 0..means.len() {
+                    let g = ids[i] as usize;
+                    if g * 3 >= totals.len() {
+                        return Err(shape(format!("group {g} of {}", totals.len() / 3)));
+                    }
+                    if log_sds[i] == f64::NEG_INFINITY {
+                        continue;
+                    }
+                    totals[3 * g] += 1.0;
+                    totals[3 * g + 1] += us[i] * means[i];
+                    totals[3 * g + 2] += us[i] * us[i] * (2.0 * log_sds[i]).exp();
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.group_curvature((factor, mean, log_sd), groups, sums),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.group_curvature((factor, mean, log_sd), groups, sums),
+        }
+    }
+
     /// From each group's `sums` row `(n, Σ (μ² + σ²), Σ 2s)`, its empirical-Bayes prior variance
     /// `v = Σ (μ² + σ²) / n` into `variance` and its divergence `KL(q_G ‖ p_G) = ½ (n ln v − Σ 2s)`
     /// in nats into `divergence` (both groups × 1; zero for an empty group), then `sums` zeroed
@@ -3819,6 +3854,7 @@ extern "C" __global__ void posterior_ivon_f32(u64 n, u64 count, double scale, do
 // A bfloat16's value (`bf16_round` is its inverse to nearest).
 __device__ float bf16_value(unsigned short h) { return __uint_as_float(((unsigned int)h) << 16); }
 __device__ float entry_load(float x) { return x; }
+__device__ double entry_load(double x) { return x; }
 __device__ float entry_load(unsigned short h) { return bf16_value(h); }
 __device__ void entry_store(float* p, float x) { *p = x; }
 __device__ void entry_store(unsigned short* p, float x) { *p = bf16_round(x); }
@@ -3884,6 +3920,34 @@ extern "C" __global__ void group_moments_f64(u64 n, u64 count, const double* mea
 
 extern "C" __global__ void group_moments_f32(u64 n, u64 count, const float* mean, const float* log_sd, const unsigned int* groups, double* sums) {
     group_moments_body<float>(n, count, mean, log_sd, groups, sums);
+}
+
+// Each live entry's (1, u μ, u² exp(2s)) into its group's row (`Device::group_curvature`), the
+// factor `u` in U (the masters' storage, or bfloat16 with f32 masters).
+template <typename T, typename U>
+__device__ void group_curvature_body(u64 n, u64 count, const U* factor, const T* mean, const T* log_sd, const unsigned int* groups, double* sums) {
+    WARP_STRIDE(i, n) {
+        unsigned int g = i < n ? groups[i] : 0u;
+        bool live = i < n && g < count && log_sd[i] != (T)NEG_INF;
+        double a = 0.0, b = 0.0, c = 0.0;
+        if (live) {
+            double u = (double)entry_load(factor[i]), s = (double)log_sd[i];
+            a = 1.0; b = u * (double)mean[i]; c = u * u * exp(2.0 * s);
+        }
+        group_add(sums, g, live, a, b, c);
+    }
+}
+
+extern "C" __global__ void group_curvature_f64(u64 n, u64 count, const double* factor, const double* mean, const double* log_sd, const unsigned int* groups, double* sums) {
+    group_curvature_body<double, double>(n, count, factor, mean, log_sd, groups, sums);
+}
+
+extern "C" __global__ void group_curvature_f32(u64 n, u64 count, const float* factor, const float* mean, const float* log_sd, const unsigned int* groups, double* sums) {
+    group_curvature_body<float, float>(n, count, factor, mean, log_sd, groups, sums);
+}
+
+extern "C" __global__ void group_curvature_f32_bf16(u64 n, u64 count, const unsigned short* factor, const float* mean, const float* log_sd, const unsigned int* groups, double* sums) {
+    group_curvature_body<float, unsigned short>(n, count, factor, mean, log_sd, groups, sums);
 }
 
 extern "C" __global__ void group_divergence(u64 n, double* sums, double* variance, double* divergence) {
@@ -6001,6 +6065,20 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("tensor group_moments").map(|_| ())
         }
 
+        pub(super) fn group_curvature(&self, (factor, mean, log_sd): (&Tensor, &Tensor, &Tensor), groups: &Indices, sums: &mut Tensor) -> Result<(), GpuError> {
+            let (n, storage, factors) = (mean.len() as u64, mean.storage(), factor.storage());
+            let f = match (storage, factors) {
+                (Storage::F32, Storage::Bf16) => self.function("group_curvature_f32_bf16")?,
+                (masters, u) if masters == u => self.posterior_kernel("group_curvature", storage)?,
+                (masters, u) => return Err(shape(format!("{masters:?} masters with a {u:?} Gauss–Newton factor"))),
+            };
+            let count = sums.rows as u64;
+            let mut builder = self.stream.launch_builder(&f);
+            builder.arg(&n).arg(&count).input(factor, factors)?.input(mean, storage)?.input(log_sd, storage)?.arg(index_slice(groups)?).arg(slice_mut(sums)?);
+            // SAFETY: equal-length entry buffers, checked by the caller; float64 sums of `count` rows.
+            unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("tensor group_curvature").map(|_| ())
+        }
+
         pub(super) fn group_divergence(&self, sums: &mut Tensor, variance: &mut Tensor, divergence: &mut Tensor) -> Result<(), GpuError> {
             let n = variance.len() as u64;
             let f = self.function("group_divergence")?;
@@ -7287,6 +7365,16 @@ kernel void t_group_moments(device const float* mean [[buffer(0)]], device const
     group_add(sums, g, live, a, b, c);
 }
 
+kernel void t_group_curvature(device const float* factor [[buffer(0)]], device const float* mean [[buffer(1)]], device const float* log_sd [[buffer(2)]],
+                              device const uint* groups [[buffer(3)]], device float* sums [[buffer(4)]], constant Posterior& p [[buffer(5)]], uint i [[thread_position_in_grid]]) {
+    uint g = i < p.n ? groups[i] : 0u;
+    bool live = i < p.n && g < p.count && log_sd[i] != -INFINITY;
+    float a = live ? 1.0f : 0.0f;
+    float b = live ? factor[i] * mean[i] : 0.0f;
+    float c = live ? factor[i] * factor[i] * exp(2.0f * log_sd[i]) : 0.0f;
+    group_add(sums, g, live, a, b, c);
+}
+
 kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* variance [[buffer(1)]], device float* divergence [[buffer(2)]],
                                constant P& p [[buffer(3)]], uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
     ELEMENTS {
@@ -7326,6 +7414,7 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
         "t_reparameterize",
         "t_posterior_ivon",
         "t_group_moments",
+        "t_group_curvature",
         "t_group_divergence",
         "t_select_sets",
         "t_box_charge",
@@ -7719,6 +7808,12 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
         pub(super) fn group_moments(&self, (mean, log_sd): (&Tensor, &Tensor), groups: &Indices, sums: &mut Tensor) -> Result<(), GpuError> {
             let p = Posterior { count: u32_of(sums.rows)?, ..Posterior::default() };
             self.posterior("t_group_moments", &[whole(buffer(mean)?), whole(buffer(log_sd)?), whole(index_buffer(groups)?), whole(buffer(sums)?)], mean.len(), p)
+        }
+
+        pub(super) fn group_curvature(&self, (factor, mean, log_sd): (&Tensor, &Tensor, &Tensor), groups: &Indices, sums: &mut Tensor) -> Result<(), GpuError> {
+            let p = Posterior { count: u32_of(sums.rows)?, ..Posterior::default() };
+            let buffers = [whole(buffer(factor)?), whole(buffer(mean)?), whole(buffer(log_sd)?), whole(index_buffer(groups)?), whole(buffer(sums)?)];
+            self.posterior("t_group_curvature", &buffers, mean.len(), p)
         }
 
         pub(super) fn group_divergence(&self, sums: &mut Tensor, variance: &mut Tensor, divergence: &mut Tensor) -> Result<(), GpuError> {

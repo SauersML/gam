@@ -2100,10 +2100,7 @@ pub fn fit(
                 if e.patch.is_some() { patched.add(bits) } else { clean.add(bits) }
             }
             let scored = bits.iter().map(Vec::len).sum::<usize>();
-            // The batch is one of `B` drawn uniformly, so `B` times its data term is an unbiased
-            // estimate of the whole collection's, whatever the batch's share of the tokens; the
-            // epoch's mean of these estimates is the collection's data term exactly.
-            let scale = draws.len() as f64;
+            let scale = tokens as f64 / scored as f64;
             let data = scale * LN_2 * bits.iter().flatten().sum::<f64>();
             // `Σ_G KL_G` and the active groups' variances at the posterior the sample was drawn from.
             let variances = device_posterior.variances()?;
@@ -2148,9 +2145,7 @@ pub fn fit(
             data_sum += data;
             description_sum += description;
             progress.step += 1;
-            // Per token of the collection: `B / N` times the batch's gradient and squared factor.
-            let weight = draws.len() as f64 / tokens as f64;
-            device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, weight), &ivon)?;
+            device_posterior.step(&gradients, LN_2 / scored as f64, (&factor.gradient, 1.0 / factor.tokens as f64), &ivon)?;
             log::info!(
                 "library step {epoch}.{b}: {:.6} bits per scored token, F estimate {:.6e} bits, {:.2} s",
                 bits.iter().flatten().sum::<f64>() / scored as f64,
@@ -2246,11 +2241,12 @@ pub fn fit(
 }
 
 /// The removal estimates' [`Curvature`]: one draw of the sampled-label gradient per training batch
-/// of the fixed collection, at the posterior mean (module note).
-fn removal_curvature(scorer: &mut Scorer, posterior: &Posterior, draws: &[Draw], sequences: &[Vec<u32>], settings: &Settings) -> Result<Curvature, String> {
-    scorer.experiments.load(&posterior.means())?;
+/// of the fixed collection, at the mean of `posterior` (module note), each draw's group sums made
+/// on the device (`DevicePosterior::add_curvature`).
+fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[Draw], sequences: &[Vec<u32>], settings: &Settings) -> Result<Curvature, String> {
+    posterior.mean_into(scorer.experiments.explanation_mut())?;
     let mut rng = StdRng::seed_from_u64(noise_seed(settings.seed, 0, draws.len()));
-    let mut curvature = Curvature::new(posterior.active.len());
+    let mut curvature = Curvature::new(posterior.group_count());
     for (b, draw) in draws.iter().enumerate() {
         let batch = draw.batch(sequences)?;
         let experiments = scorer.experiments(draw, sequences)?;
@@ -2259,12 +2255,7 @@ fn removal_curvature(scorer: &mut Scorer, posterior: &Posterior, draws: &[Draw],
         let rows: usize = experiments.iter().map(|e| batch.length() - e.position).sum();
         let uniforms: Vec<f64> = (0..rows).map(|_| rng.random::<f64>()).collect();
         let gradient = scorer.experiments.sampled_label_resident(&batch, &experiments, &design, &uniforms)?;
-        let d = scorer.experiments.models().1.program.device();
-        let mut u: Vec<Array2<f64>> = posterior.mean.iter().map(|m| Array2::zeros(m.dim())).collect();
-        for (op, g) in &gradient {
-            u[scorer.at(*op)?] = d.download(g).map_err(error)?;
-        }
-        posterior.add_curvature(&u, 1.0, &mut curvature)?;
+        posterior.add_curvature(&gradient, 1.0, &mut curvature)?;
     }
     Ok(curvature)
 }
@@ -2324,7 +2315,7 @@ fn remove(
     let mut prior = prior;
     let (fixed, Evidence { draws, sequences, settings }) = (explanation.fixed_nats, evidence);
     let compensation = Compensation::new(&mut scorer.experiments, explanation, posterior, sequences, settings.batch_sequences)?;
-    let curvature = removal_curvature(scorer, posterior, draws, sequences, settings)?;
+    let curvature = removal_curvature(scorer, device_posterior, draws, sequences, settings)?;
     let mut objective = |trial: &Posterior| -> Result<f64, String> {
         Ok(expected_divergence(scorer, trial, draws, sequences, &[], settings, prior.as_deref_mut())? + trial.description() + fixed)
     };
@@ -2847,13 +2838,14 @@ mod tests {
         let settings = settings();
         let posterior = Posterior::new(&explanation, 1000).unwrap();
         let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
+        let device_posterior = DevicePosterior::new(&Device::host(), &explanation, &posterior, 1000.0, None, 0).unwrap();
         let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
         let group = *explanation.layers[0].functions[1].last().unwrap();
         let rounds = 96;
         let mut quadratic = 0.0;
         for k in 0..rounds {
             let labels = Settings { seed: settings.seed + 1 + k, ..settings.clone() };
-            quadratic += removal_curvature(&mut scorer, &posterior, &draws, &sequences, &labels).unwrap().quadratic[group] / rounds as f64;
+            quadratic += removal_curvature(&mut scorer, &device_posterior, &draws, &sequences, &labels).unwrap().quadratic[group] / rounds as f64;
         }
         let epsilon = 1e-2;
         let mut shrunk = posterior.means();
