@@ -15,7 +15,7 @@ use crate::{
     },
 };
 use gam_gpu::{
-    tensor::{Arithmetic, ColumnBlocks, Device, Indices, Tensor},
+    tensor::{Arithmetic, ColumnBlocks, Device, Indices, Storage, Tensor},
     trace,
 };
 use ndarray::{Array2, Axis};
@@ -161,6 +161,8 @@ pub struct Report {
     pub complete_episode_forward_passes: usize,
     pub complete_episode_reverse_passes: usize,
     pub exact_scans: usize,
+    /// The device and storage the proposals ran on.
+    pub proposal_device: String,
     /// Wall seconds of proposal steps and of exact scans.
     pub proposal_seconds: f64,
     pub exact_seconds: f64,
@@ -171,13 +173,11 @@ pub struct Fit {
     pub program: OperatorProgram,
     pub report: Report,
 }
-/// One episode. Its raw inputs and full-logit target are its rows of its group's batch.
+/// One episode. Its raw inputs and target are its rows of its group's batch.
 struct ResidentEpisode {
     family: FamilyInputs,
     batch: usize,
     offset: usize,
-    /// Compact fixed-head labels (the batch holds their concatenation).
-    labels: Option<Target>,
     responses: Vec<ResidentResponse>,
     flags: Option<Indices>,
     label: String,
@@ -196,6 +196,8 @@ struct Batch {
 struct Resident {
     episodes: Vec<ResidentEpisode>,
     batches: Vec<Batch>,
+    /// The graph the programs execute (the fixed-head prefix for compact labels).
+    executable: OperatorProgram,
 }
 struct ResidentResponse {
     label: String,
@@ -527,7 +529,6 @@ fn prepare(
                 family: hollow(&e.inputs),
                 batch,
                 offset,
-                labels: None,
                 responses: Vec::new(),
                 flags: episode_flags(d, e.scored.as_ref())?,
                 label: e.label.clone(),
@@ -540,7 +541,12 @@ fn prepare(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    Ok((p, Resident { episodes, batches }, planned))
+    let resident = Resident {
+        episodes,
+        batches,
+        executable: expanded,
+    };
+    Ok((p, resident, planned))
 }
 /// The members' compact labels as one target over their appended rows.
 fn appended_target(d: &Device, parts: &[&Target]) -> Result<Target, String> {
@@ -694,7 +700,6 @@ fn prepare_compact(
                 family: hollow(&e.inputs),
                 batch,
                 offset,
-                labels: Some(e.target.clone()),
                 responses: Vec::new(),
                 flags: None,
                 label: e.label.clone(),
@@ -706,7 +711,12 @@ fn prepare_compact(
             }
         })
         .collect();
-    Ok((p, Resident { episodes, batches }, planned))
+    let resident = Resident {
+        episodes,
+        batches,
+        executable: prefix,
+    };
+    Ok((p, resident, planned))
 }
 
 // Validate the complete sidecar and its numeric bound before uploading any response panels.
@@ -818,21 +828,23 @@ fn attach_responses(
     }
     Ok(planned)
 }
-/// Response losses of episode `e`, whose rows start at `offset` in `trace`; with `seeds`, adds
+/// Response losses of episode `i`, whose rows start at `offset` in `trace`; with `seeds`, adds
 /// `group_weight` times their seeds (over the episode's rows).
 fn response_score(
-    p: &DeviceProgram,
-    e: &ResidentEpisode,
+    v: &View,
+    i: usize,
     trace: &DeviceTrace,
     offset: usize,
     mut seeds: Option<&mut BTreeMap<usize, Tensor>>,
     group_weight: f64,
 ) -> Result<Vec<ResponseMeasurement>, String> {
-    let d = p.device();
+    let d = v.p.device();
+    let e = &v.r.episodes[i];
     let rows = e.family.rows;
     let whole = offset == 0 && trace.rows == rows;
     let mut measurements = Vec::new();
-    for t in &e.responses {
+    for (k, t) in e.responses.iter().enumerate() {
+        let (target, coefficients) = v.response(i, k);
         let value = trace.value(t.node)?;
         let mut residual = if whole {
             d.copy(value)
@@ -840,7 +852,7 @@ fn response_score(
             d.rows_of(value, offset, rows)
         }
         .map_err(error)?;
-        d.axpy(&mut residual, -1., &t.target).map_err(error)?;
+        d.axpy(&mut residual, -1., target).map_err(error)?;
         let squared = d
             .block_products(&residual, &residual, &t.blocks)
             .map_err(error)?;
@@ -871,7 +883,7 @@ fn response_score(
         });
         if let Some(seeds) = seeds.as_deref_mut() {
             let mut masked = d.zeros(residual.rows(), residual.cols()).map_err(error)?;
-            d.hadamard(&mut masked, &residual, &t.coefficients, false)
+            d.hadamard(&mut masked, &residual, coefficients, false)
                 .map_err(error)?;
             match seeds.get_mut(&t.node) {
                 Some(existing) => d.axpy(existing, group_weight, &masked).map_err(error)?,
@@ -889,30 +901,39 @@ fn response_score(
 fn widths_for(p: &OperatorProgram, node: usize) -> Result<usize, String> {
     Ok(p.node_interface(node).map_err(error)?.width())
 }
-/// Episode `i`'s target: its compact labels, or its rows of its batch's teacher logits.
-fn episode_target(d: &Device, r: &Resident, i: usize) -> Result<ResidentTarget, String> {
-    let e = &r.episodes[i];
-    match (&r.batches[e.batch].target, &e.labels) {
-        (ResidentTarget::Logits(all), None) => Ok(ResidentTarget::Logits(
-            d.rows_of(all, e.offset, e.family.rows).map_err(error)?,
-        )),
-        (ResidentTarget::Fixed { head, .. }, Some(labels)) => Ok(ResidentTarget::Fixed {
-            target: labels.clone(),
+/// Episode `i`'s rows of its batch's target.
+fn episode_target(v: &View, i: usize) -> Result<ResidentTarget, String> {
+    let d = v.p.device();
+    let e = &v.r.episodes[i];
+    let rows = e.offset..e.offset + e.family.rows;
+    Ok(match v.target(e.batch) {
+        ResidentTarget::Logits(all) => {
+            ResidentTarget::Logits(d.rows_of(all, e.offset, e.family.rows).map_err(error)?)
+        }
+        ResidentTarget::Fixed { target, head } => ResidentTarget::Fixed {
+            target: Target {
+                mu: Arc::new(
+                    d.rows_of(&target.mu, e.offset, e.family.rows)
+                        .map_err(error)?,
+                ),
+                entropy: target.entropy[rows.clone()].to_vec(),
+                head: target.head.clone(),
+                scored: target.scored.as_ref().map(|s| s[rows].to_vec()),
+            },
             head: head.clone(),
-        }),
-        _ => Err("episode and batch targets differ in kind".into()),
-    }
+        },
+    })
 }
 /// One episode's forward on its own rows (copies of its batch rows).
-fn forward(p: &DeviceProgram, r: &Resident, i: usize) -> Result<DeviceTrace, String> {
-    let d = p.device();
-    let e = &r.episodes[i];
-    let given = r.batches[e.batch]
-        .raw
+fn forward(v: &View, i: usize) -> Result<DeviceTrace, String> {
+    let d = v.p.device();
+    let e = &v.r.episodes[i];
+    let given = v
+        .raw(e.batch)
         .iter()
         .map(|(slot, x)| Ok((*slot, d.rows_of(x, e.offset, e.family.rows).map_err(error)?)))
         .collect::<Result<_, String>>()?;
-    trace::within("forward", d, || p.forward_given(&e.family, given))
+    trace::within("forward", d, || v.p.forward_given(&e.family, given))
 }
 fn episode_measurement(
     e: &ResidentEpisode,
@@ -979,14 +1000,15 @@ fn summarize(scores: Vec<EpisodeMeasurement>) -> Result<Measurement, String> {
 }
 /// Every episode on its own rows in the program's current arithmetic.
 fn scan(p: &DeviceProgram, r: &Resident) -> Result<Measurement, String> {
+    let v = View::exact(p, r);
     let mut scores = Vec::new();
     for (i, e) in r.episodes.iter().enumerate() {
-        let trace = forward(p, r, i)?;
-        let target = episode_target(p.device(), r, i)?;
+        let trace = forward(&v, i)?;
+        let target = episode_target(&v, i)?;
         let (kl, _) = trace::within("kl", p.device(), || {
             score(p, &target, e.flags.as_ref(), &trace, false)
         })?;
-        let responses = response_score(p, e, &trace, 0, None, 0.)?;
+        let responses = response_score(&v, i, &trace, 0, None, 0.)?;
         scores.push(episode_measurement(e, &kl, responses)?);
     }
     summarize(scores)
@@ -998,6 +1020,147 @@ fn exact_scan(p: &mut DeviceProgram, r: &Resident) -> Result<Measurement, String
     let measured = trace::within("fit.exact", p.device(), || scan(p, r));
     p.set_arithmetic(proposal);
     measured
+}
+/// The proposal's program and its copies of the batches and response targets in the proposal
+/// storage (f32 on CUDA), when that differs from the exact program's.
+struct Narrow {
+    program: DeviceProgram,
+    batches: Vec<(BTreeMap<usize, Tensor>, ResidentTarget)>,
+    /// Per episode, per response: its target and seed coefficients.
+    responses: Vec<Vec<(Tensor, Tensor)>>,
+}
+/// A program with the inputs and targets held in its storage.
+#[derive(Clone, Copy)]
+struct View<'a> {
+    p: &'a DeviceProgram,
+    r: &'a Resident,
+    narrow: Option<&'a Narrow>,
+}
+impl<'a> View<'a> {
+    fn exact(p: &'a DeviceProgram, r: &'a Resident) -> Self {
+        Self { p, r, narrow: None }
+    }
+    fn proposal(p: &'a DeviceProgram, r: &'a Resident, narrow: Option<&'a Narrow>) -> Self {
+        Self {
+            p: narrow.map_or(p, |n| &n.program),
+            r,
+            narrow,
+        }
+    }
+    fn raw(&self, b: usize) -> &'a BTreeMap<usize, Tensor> {
+        self.narrow
+            .map_or(&self.r.batches[b].raw, |n| &n.batches[b].0)
+    }
+    fn target(&self, b: usize) -> &'a ResidentTarget {
+        self.narrow
+            .map_or(&self.r.batches[b].target, |n| &n.batches[b].1)
+    }
+    fn response(&self, i: usize, k: usize) -> (&'a Tensor, &'a Tensor) {
+        match self.narrow {
+            Some(n) => (&n.responses[i][k].0, &n.responses[i][k].1),
+            None => {
+                let t = &self.r.episodes[i].responses[k];
+                (&t.target, &t.coefficients)
+            }
+        }
+    }
+}
+/// F32-storage copies of the program, batches and response targets for F32/TF32 proposals, or
+/// none when the device holds only F64 (the host then rounds just the products' operands).
+/// The program's numeric plan is checked before anything is converted.
+fn narrow_copies(
+    d: &Device,
+    p: &DeviceProgram,
+    r: &Resident,
+    trainable: &[usize],
+    arithmetic: FitArithmetic,
+    planned: usize,
+    limit: usize,
+) -> Result<(Option<Narrow>, usize), String> {
+    if arithmetic == FitArithmetic::F64 {
+        return Ok((None, planned));
+    }
+    let Ok(n) = d.with_storage(Storage::F32) else {
+        return Ok((None, planned));
+    };
+    // Halved operator, input, target and response buffers, plus one f32 head.
+    let mut bytes = p.operator_numeric_bytes()? / 2;
+    for b in &r.batches {
+        for x in b.raw.values() {
+            bytes = add(bytes, mul(x.len(), 4)?)?;
+        }
+        bytes = add(
+            bytes,
+            match &b.target {
+                ResidentTarget::Logits(t) => mul(t.len(), 4)?,
+                ResidentTarget::Fixed { target, .. } => add(
+                    mul(target.mu.len(), 4)?,
+                    mul(target.head.embedding.len(), 4)?,
+                )?,
+            },
+        )?;
+    }
+    for t in r.episodes.iter().flat_map(|e| &e.responses) {
+        bytes = add(bytes, mul(t.target.len(), 8)?)?;
+    }
+    let planned = add(planned, bytes)?;
+    if planned > limit {
+        return Err(format!(
+            "f32 proposal numeric plan {planned} exceeds {limit}"
+        ));
+    }
+    let mut program = DeviceProgram::compile_values_bounded(&n, &r.executable, limit)?;
+    program.prepare_dense_parameters(trainable)?;
+    let mut head: Option<Arc<ResidentHead>> = None;
+    let mut batches = Vec::with_capacity(r.batches.len());
+    for b in &r.batches {
+        let raw = b
+            .raw
+            .iter()
+            .map(|(slot, x)| Ok((*slot, n.convert(x).map_err(error)?)))
+            .collect::<Result<_, String>>()?;
+        let target = match &b.target {
+            ResidentTarget::Logits(t) => ResidentTarget::Logits(n.convert(t).map_err(error)?),
+            ResidentTarget::Fixed { target, head: exact } => {
+                let shared = match &head {
+                    Some(shared) => shared.clone(),
+                    None => Arc::new(ResidentHead::new(&n, &target.head, exact.tile_rows)?),
+                };
+                head = Some(shared.clone());
+                ResidentTarget::Fixed {
+                    target: Target {
+                        mu: Arc::new(n.convert(&target.mu).map_err(error)?),
+                        ..target.clone()
+                    },
+                    head: shared,
+                }
+            }
+        };
+        batches.push((raw, target));
+    }
+    let responses = r
+        .episodes
+        .iter()
+        .map(|e| {
+            e.responses
+                .iter()
+                .map(|t| {
+                    Ok((
+                        n.convert(&t.target).map_err(error)?,
+                        n.convert(&t.coefficients).map_err(error)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })
+        .collect::<Result<_, String>>()?;
+    Ok((
+        Some(Narrow {
+            program,
+            batches,
+            responses,
+        }),
+        planned,
+    ))
 }
 /// The rows of one proposal forward: a group batch, or one episode of it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1021,40 +1184,39 @@ fn members(r: &Resident, unit: Unit) -> Vec<(usize, usize)> {
         Unit::Episode(i) => vec![(i, 0)],
     }
 }
-fn unit_forward(p: &DeviceProgram, r: &Resident, unit: Unit) -> Result<DeviceTrace, String> {
+fn unit_forward(v: &View, unit: Unit) -> Result<DeviceTrace, String> {
     match unit {
         Unit::Batch(b) => {
-            let d = p.device();
-            let batch = &r.batches[b];
+            let d = v.p.device();
             // forward_given owns its arguments; these copies preserve the resident batch.
-            let given = batch
-                .raw
+            let given = v
+                .raw(b)
                 .iter()
                 .map(|(slot, x)| Ok((*slot, d.copy(x).map_err(error)?)))
                 .collect::<Result<_, String>>()?;
             trace::within("fit.proposal.forward", d, || {
-                p.forward_given(&batch.family, given)
+                v.p.forward_given(&v.r.batches[b].family, given)
             })
         }
-        Unit::Episode(i) => forward(p, r, i),
+        Unit::Episode(i) => forward(v, i),
     }
 }
 /// Per-row output KL of the unit; with `seed`, also its unscaled hidden seed, made in place of
 /// the trace's logits when no executed node follows them.
 fn unit_kl(
-    p: &DeviceProgram,
-    r: &Resident,
+    v: &View,
     unit: Unit,
     trace: &mut DeviceTrace,
     seed: bool,
 ) -> Result<(Vec<f64>, Option<Tensor>), String> {
+    let p = v.p;
     let d = p.device();
     let owned;
     let (target, flags) = match unit {
-        Unit::Batch(b) => (&r.batches[b].target, r.batches[b].flags.as_ref()),
+        Unit::Batch(b) => (v.target(b), v.r.batches[b].flags.as_ref()),
         Unit::Episode(i) => {
-            owned = episode_target(d, r, i)?;
-            (&owned, r.episodes[i].flags.as_ref())
+            owned = episode_target(v, i)?;
+            (&owned, v.r.episodes[i].flags.as_ref())
         }
     };
     match target {
@@ -1093,19 +1255,20 @@ fn add_seed(
     }
 }
 /// Every group batch in the proposal arithmetic: the measurement and each batch's pass.
-fn proposal_scan(p: &DeviceProgram, r: &Resident) -> Result<(Measurement, Vec<Pass>), String> {
-    let d = p.device();
+fn proposal_scan(v: &View) -> Result<(Measurement, Vec<Pass>), String> {
+    let r = v.r;
+    let d = v.p.device();
     let mut scores = (0..r.episodes.len()).map(|_| None).collect::<Vec<_>>();
     let mut passes = Vec::with_capacity(r.batches.len());
     for b in 0..r.batches.len() {
         let unit = Unit::Batch(b);
-        let mut trace = unit_forward(p, r, unit)?;
+        let mut trace = unit_forward(v, unit)?;
         let (kl, _) = trace::within("fit.proposal.kl", d, || {
-            unit_kl(p, r, unit, &mut trace, false)
+            unit_kl(v, unit, &mut trace, false)
         })?;
         for (i, offset) in members(r, unit) {
             let e = &r.episodes[i];
-            let responses = response_score(p, e, &trace, offset, None, 0.)?;
+            let responses = response_score(v, i, &trace, offset, None, 0.)?;
             scores[i] = Some(episode_measurement(
                 e,
                 &kl[offset..offset + e.family.rows],
@@ -1124,13 +1287,13 @@ fn proposal_scan(p: &DeviceProgram, r: &Resident) -> Result<(Measurement, Vec<Pa
 /// the episodes reversed. The reverse is linear in its seeds, so it runs on seeds relative to
 /// the largest per-row KL weight and scales the parameter gradient once.
 fn unit_gradient(
-    p: &DeviceProgram,
-    r: &Resident,
+    v: &View,
     pass: Pass,
     weights: &[f64],
     trainable: &[usize],
     gradients: &mut BTreeMap<usize, Tensor>,
 ) -> Result<usize, String> {
+    let (p, r) = (v.p, v.r);
     let d = p.device();
     let Pass { unit, mut trace } = pass;
     let spans = members(r, unit);
@@ -1148,12 +1311,11 @@ fn unit_gradient(
     // Response seeds read node values, so they precede the KL seed that may consume logits.
     let mut seeds = BTreeMap::new();
     for ((i, offset), factor) in spans.iter().zip(&factors) {
-        let e = &r.episodes[*i];
-        if *factor == 0. || e.responses.is_empty() {
+        if *factor == 0. || r.episodes[*i].responses.is_empty() {
             continue;
         }
         let mut own = BTreeMap::new();
-        response_score(p, e, &trace, *offset, Some(&mut own), weights[*i] / reference)?;
+        response_score(v, *i, &trace, *offset, Some(&mut own), weights[*i] / reference)?;
         for (node, term) in own {
             if trace.rows == term.rows() {
                 add_seed(d, &mut seeds, node, term)?;
@@ -1170,7 +1332,7 @@ fn unit_gradient(
         }
     }
     let (kl, seed) = trace::within("fit.proposal.kl", d, || {
-        unit_kl(p, r, unit, &mut trace, true)
+        unit_kl(v, unit, &mut trace, true)
     })?;
     if kl.iter().any(|v| !v.is_finite()) {
         return Err("nonfinite gradient KL".into());
@@ -1206,12 +1368,12 @@ fn unit_gradient(
 /// group holding a weighted episode: whole when every member is, else episode by episode.
 /// Returns the gradients and the episodes forwarded and reversed.
 fn proposal_gradient(
-    p: &DeviceProgram,
-    r: &Resident,
+    v: &View,
     weights: &[f64],
     passes: Vec<Pass>,
     trainable: &[usize],
 ) -> Result<(BTreeMap<usize, Tensor>, usize, usize), String> {
+    let (p, r) = (v.p, v.r);
     let d = p.device();
     if weights.len() != r.episodes.len() || weights.iter().any(|w| !w.is_finite() || *w < 0.) {
         return Err("invalid training episode weights".into());
@@ -1229,7 +1391,7 @@ fn proposal_gradient(
         if let Unit::Batch(b) = pass.unit {
             covered[b] = true;
         }
-        reversed += unit_gradient(p, r, pass, weights, trainable, &mut gradients)?;
+        reversed += unit_gradient(v, pass, weights, trainable, &mut gradients)?;
     }
     for (b, batch) in r.batches.iter().enumerate() {
         let selected = batch
@@ -1247,9 +1409,9 @@ fn proposal_gradient(
             selected.into_iter().map(Unit::Episode).collect()
         };
         for unit in units {
-            let trace = unit_forward(p, r, unit)?;
+            let trace = unit_forward(v, unit)?;
             forwarded += members(r, unit).len();
-            reversed += unit_gradient(p, r, Pass { unit, trace }, weights, trainable, &mut gradients)?;
+            reversed += unit_gradient(v, Pass { unit, trace }, weights, trainable, &mut gradients)?;
         }
     }
     Ok((gradients, forwarded, reversed))
@@ -1505,6 +1667,23 @@ fn fit_prepared(
     settings: Settings,
     started: Instant,
 ) -> Result<Fit, String> {
+    let (mut narrow, planned) = narrow_copies(
+        d,
+        &p,
+        &resident,
+        trainable,
+        settings.arithmetic,
+        planned,
+        settings.numeric_bytes,
+    )?;
+    let proposal_device = match &mut narrow {
+        Some(n) => {
+            n.program.set_arithmetic(settings.arithmetic.device());
+            n.program.device().name()
+        }
+        None => p.device().name(),
+    };
+    // F64 master parameters and moments live with the exact program.
     let mut moments = BTreeMap::new();
     for index in trainable {
         let a = p.dense_parameter(*index)?;
@@ -1537,7 +1716,9 @@ fn fit_prepared(
     let mut window: Option<Candidate> = None;
     let mut latest: Option<Measurement> = None;
     let steps = settings.iterations;
-    p.set_arithmetic(settings.arithmetic.device());
+    if narrow.is_none() {
+        p.set_arithmetic(settings.arithmetic.device());
+    }
     // Step t measures the parameters after t updates, then makes update t + 1.
     for t in 0..=steps {
         let clock = Instant::now();
@@ -1548,7 +1729,8 @@ fn fit_prepared(
                 .is_none_or(|s| t % s.scan_every == 0);
         let mut passes = Vec::new();
         if complete {
-            let (measurement, scanned) = proposal_scan(&p, &resident)?;
+            let (measurement, scanned) =
+                proposal_scan(&View::proposal(&p, &resident, narrow.as_ref()))?;
             forwards += resident.episodes.len();
             if t == 0 {
                 initial_proposal = Some(measurement.objective);
@@ -1581,24 +1763,45 @@ fn fit_prepared(
                 }
             }
             let (gradients, forwarded, reversed) = trace::within("fit.gradient", d, || {
-                proposal_gradient(&p, &resident, &weights, passes, trainable)
+                proposal_gradient(
+                    &View::proposal(&p, &resident, narrow.as_ref()),
+                    &weights,
+                    passes,
+                    trainable,
+                )
             })?;
             forwards += forwarded;
             reverse += reversed;
             trace::within("fit.adam", d, || {
                 for index in trainable {
+                    let gradient = gradients.get(index).ok_or("parameter gradient")?;
+                    let widened;
+                    let gradient = if gradient.storage() == d.storage() {
+                        gradient
+                    } else {
+                        widened = d.convert(gradient).map_err(error)?;
+                        &widened
+                    };
                     let mut next = d.copy(p.dense_parameter(*index)?).map_err(error)?;
                     let (m, v) = moments.get_mut(index).ok_or("moment pair")?;
                     d.adam(
                         &mut next,
                         (m, v),
-                        gradients.get(index).ok_or("parameter gradient")?,
+                        gradient,
                         settings.learning_rate,
                         (settings.beta1, settings.beta2, settings.epsilon),
                         t as u64 + 1,
                     )
                     .map_err(error)?;
                     p.replace_dense_parameter(*index, next)?;
+                    if let Some(n) = &mut narrow {
+                        let value = n
+                            .program
+                            .device()
+                            .convert(p.dense_parameter(*index)?)
+                            .map_err(error)?;
+                        n.program.replace_dense_parameter(*index, value)?;
+                    }
                 }
                 Ok::<_, String>(())
             })?;
@@ -1679,6 +1882,7 @@ fn fit_prepared(
             complete_episode_forward_passes: forwards,
             complete_episode_reverse_passes: reverse,
             exact_scans,
+            proposal_device,
             proposal_seconds,
             exact_seconds,
             seconds: started.elapsed().as_secs_f64(),
@@ -1814,7 +2018,7 @@ mod tests {
             .iter()
             .map(|e| if e.group == group { 1. / count as f64 } else { 0. })
             .collect::<Vec<_>>();
-        Ok(proposal_gradient(p, r, &weights, Vec::new(), trainable)?.0)
+        Ok(proposal_gradient(&View::exact(p, r), &weights, Vec::new(), trainable)?.0)
     }
     fn weighted_gradient(
         p: &DeviceProgram,
@@ -1826,7 +2030,7 @@ mod tests {
         for (index, weight) in selected {
             weights[*index] += weight;
         }
-        Ok(proposal_gradient(p, r, &weights, Vec::new(), trainable)?.0)
+        Ok(proposal_gradient(&View::exact(p, r), &weights, Vec::new(), trainable)?.0)
     }
     fn finite_difference(source: &OperatorProgram, episodes: &[Episode], group: &str) -> f64 {
         let d = Device::host();
@@ -2409,8 +2613,9 @@ mod tests {
         for (x, y) in ag.iter().zip(bg.iter()) {
             assert!((x - y).abs() < 2e-13, "{x} vs {y}");
         }
-        let trace = forward(&b, &be, 0).expect("prefix");
-        let labels = episode_target(&d, &be, 0).expect("episode labels");
+        let view = View::exact(&b, &be);
+        let trace = forward(&view, 0).expect("prefix");
+        let labels = episode_target(&view, 0).expect("episode labels");
         let (_, seed) = score(&b, &labels, None, &trace, true).expect("hidden seed");
         let seed = d
             .download(&seed.expect("gradient seed"))
@@ -2543,51 +2748,63 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let d = Device::host();
-        let exact = fit(&d, &source, &episodes, &[0], settings()).unwrap();
-        let fast = fit(
-            &d,
-            &source,
-            &episodes,
-            &[0],
-            Settings {
-                arithmetic: FitArithmetic::F32,
-                exact_scan_every: 7,
-                ..settings()
-            },
-        )
-        .unwrap();
-        // One initial scan, one per complete window of 7 and one for the final partial window.
-        assert_eq!(fast.report.exact_scans, 1 + 60_usize.div_ceil(7));
-        assert_eq!(fast.report.iterations.len(), fast.report.exact_scans);
-        let windows = fast.report.iterations[1..]
-            .iter()
-            .map(|i| (i.step - 1) / 7)
-            .collect::<Vec<_>>();
-        assert_eq!(windows, (0..60_usize.div_ceil(7)).collect::<Vec<_>>());
-        // Checkpoint and reported numbers are exact F64 scans of the exported parameters.
-        assert_eq!(
-            fast.report.final_measurement.objective,
-            fast.report.best.objective
-        );
-        assert!(
-            fast.report
-                .iterations
-                .iter()
-                .any(|i| i.step == fast.report.best_step
-                    && i.measurement.objective == fast.report.best.objective)
-        );
-        let replay = measure(&d, &fast.program, &episodes, 1 << 24).unwrap();
-        assert_eq!(replay.objective, fast.report.best.objective);
-        // F32 proposals track their exact rescoring and reach the F64 fit's quality.
-        for i in &fast.report.iterations {
-            let proposal = i.proposal_objective.unwrap();
-            assert!((proposal - i.measurement.objective).abs() <= 1e-5 * (1. + i.measurement.objective));
+        // The host rounds only product operands; CUDA proposals run in f32 storage.
+        let mut devices = vec![Device::host()];
+        if let Some(device) = Device::accelerator(gam_gpu::GpuPolicy::Auto).expect("device probe")
+            && device.float64()
+        {
+            devices.push(device);
         }
-        assert!(fast.report.best.objective < fast.report.initial.objective * 0.1);
-        assert!(
-            (fast.report.best.objective - exact.report.best.objective).abs()
-                <= 1e-3 * exact.report.initial.objective
-        );
+        for d in devices {
+            let exact = fit(&d, &source, &episodes, &[0], settings()).unwrap();
+            let fast = fit(
+                &d,
+                &source,
+                &episodes,
+                &[0],
+                Settings {
+                    arithmetic: FitArithmetic::F32,
+                    exact_scan_every: 7,
+                    ..settings()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                fast.report.proposal_device.ends_with("(f32)"),
+                !d.is_host(),
+                "{}",
+                fast.report.proposal_device
+            );
+            // One initial scan, one per complete window of 7 and one for the final partial window.
+            assert_eq!(fast.report.exact_scans, 1 + 60_usize.div_ceil(7));
+            assert_eq!(fast.report.iterations.len(), fast.report.exact_scans);
+            let windows = fast.report.iterations[1..]
+                .iter()
+                .map(|i| (i.step - 1) / 7)
+                .collect::<Vec<_>>();
+            assert_eq!(windows, (0..60_usize.div_ceil(7)).collect::<Vec<_>>());
+            // Checkpoint and reported numbers are exact F64 scans of the exported parameters.
+            assert_eq!(
+                fast.report.final_measurement.objective,
+                fast.report.best.objective
+            );
+            assert!(fast.report.iterations.iter().any(|i| i.step == fast.report.best_step
+                && i.measurement.objective == fast.report.best.objective));
+            let replay = measure(&d, &fast.program, &episodes, 1 << 24).unwrap();
+            assert_eq!(replay.objective, fast.report.best.objective);
+            // F32 proposals track their exact rescoring and reach the F64 fit's quality.
+            for i in &fast.report.iterations {
+                let proposal = i.proposal_objective.unwrap();
+                assert!(
+                    (proposal - i.measurement.objective).abs()
+                        <= 1e-5 * (1. + i.measurement.objective)
+                );
+            }
+            assert!(fast.report.best.objective < fast.report.initial.objective * 0.1);
+            assert!(
+                (fast.report.best.objective - exact.report.best.objective).abs()
+                    <= 1e-3 * exact.report.initial.objective
+            );
+        }
     }
 }
