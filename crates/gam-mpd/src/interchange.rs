@@ -1,13 +1,16 @@
 //! Interchange experiments of causal abstraction (Geiger et al., JMLR 2025) on the device (#2951).
 //!
-//! The explanation `P` and the model `M` share their residual streams and block inputs: the stream
-//! entering each layer and, per block (a layer's attention, then its MLP), the normed stream the
-//! block's projections read. The alignment between the two is the identity, so every experiment is
-//! defined identically for both models. An experiment `e` draws a base sequence `x` and a source
-//! sequence `x′` and consists of
+//! The explanation `P` and the model `M` share their residual streams and block inputs: per block
+//! (a layer's attention, then its MLP; `2L` blocks in `L` layers) the stream entering it and the
+//! normed stream its projections read. The alignment between the two is the identity, so every
+//! experiment is defined identically for both models. An experiment `e` draws a base sequence `x`
+//! and a source sequence `x′` and consists of
 //!
-//! * a cut `ℓ ∈ 1..=L`: `P_e` runs `P`'s layers before `ℓ` and `M`'s from `ℓ` on (`ℓ = L` is `P`
-//!   alone), while `M_e` runs `M` alone;
+//! * a hybrid: a set `H` of blocks, `P_e` running `P`'s version of the blocks in `H` and `M`'s of
+//!   the others, while `M_e` runs `M` alone. `|H| = k` is drawn uniformly in `1..=2L`, then `H`
+//!   uniformly among the sets of that size, so the autonomous `P` (`k = 2L`) and each single
+//!   replacement keep probability `1/(2L)` and every combination of blocks is tested, not only
+//!   prefixes (exact abstraction under the identity alignment requires every hybrid to match `M`);
 //! * and at most one patch at one block `B`, applied by both models:
 //!   - a read patch of one of `P`'s read variables at `B` (an MLP function's gate direction `g_i`,
 //!     or an attention function's query, key or value read map, a subspace), with orthonormal
@@ -17,7 +20,7 @@
 //!     every read of `P`. `P` predicts no effect, so `M` must show none.
 //!
 //! `h` is the model's read value at `B` on `x` and `s` its own read value at `B` on `x′`: `M`'s for
-//! `M_e`, the hybrid's under the same cut for `P_e`. Only the block's projections read the read
+//! `M_e`, the same hybrid's for `P_e`. Only the block's projections read the read
 //! node, so the patch is path-specific: the residual passthrough keeps the base's stream. `Q` is
 //! data, computed from `P`'s current reads ([`design`]): the right singular vectors whose singular
 //! values are resolved from zero by their rounding band. No gradient passes through it. The
@@ -31,13 +34,13 @@
 //!
 //! # Execution
 //!
-//! A run of one sequence through a range of layers is a lane. Layer by layer, the lanes that run
-//! `P` at that layer run as one batch through `P`'s layer, and the others through `M`'s
-//! ([`DeviceProgram::forward_span`]): no layer runs twice and every product spans all experiments
-//! at once. An evaluation makes three passes: `M` under each patch, from the patched layer on and
-//! entering at `M`'s clean stream; the hybrids on the sources, up to the patched layer; the hybrids
-//! on the bases. `M`'s clean runs are made once per batch ([`Teacher`]). The reverse pass runs the
-//! bases' layers backwards, then the sources' from their patched reads.
+//! A run of one sequence through a range of blocks is a lane. Block by block, the lanes that run
+//! `P` at that block run as one batch through `P`'s block, and the others through `M`'s
+//! ([`DeviceProgram::forward_span`]): no block runs twice and every product spans all experiments
+//! at once. An evaluation makes three passes: `M` under each patch, from the patched block on and
+//! entering at `M`'s clean stream; the hybrids on the sources, up to the patched block; the
+//! hybrids on the bases. `M`'s clean runs are made once per batch ([`Teacher`]). The reverse pass
+//! runs the bases' blocks backwards, then the sources' from their patched reads.
 
 use crate::{
     artifact::Artifact,
@@ -61,46 +64,46 @@ fn error(e: impl std::fmt::Display) -> String {
     format!("interchange: {e}")
 }
 
-/// One model's sites, checked against its program: the stream entering each layer, each block's
-/// read, and the dense operators that receive gradients, per layer.
+/// One model's sites, checked against its program: the stream entering each block, each block's
+/// read, and the dense operators that receive gradients, per block.
 struct Sites {
-    streams: Vec<usize>,
+    entries: Vec<usize>,
     reads: Vec<usize>,
     trainable: Vec<Vec<usize>>,
 }
 
 impl Sites {
-    fn new(program: &DeviceProgram, flat: &OperatorProgram, streams: Vec<usize>, reads: Vec<usize>, trainable: &[usize]) -> Result<Self, String> {
-        let layers = streams.len();
+    fn new(program: &DeviceProgram, flat: &OperatorProgram, entries: Vec<usize>, reads: Vec<usize>, trainable: &[usize]) -> Result<Self, String> {
+        let blocks = entries.len();
         let hidden = program.hidden();
         let widths = program.widths();
-        if layers == 0 || reads.len() != 2 * layers || widths.len() != hidden + 1 || flat.nodes.len() <= hidden {
-            return Err(error("a model needs a stream per layer, two reads per layer and a program through its hidden node"));
+        if blocks == 0 || blocks % 2 != 0 || reads.len() != blocks || widths.len() != hidden + 1 || flat.nodes.len() <= hidden {
+            return Err(error("a model needs an entering stream and a read per block, two blocks per layer, and a program through its hidden node"));
         }
-        let width = widths[streams[0]];
-        if streams.iter().chain(&reads).chain([&hidden]).any(|n| widths[*n] != width) {
+        let width = widths[entries[0]];
+        if entries.iter().chain(&reads).chain([&hidden]).any(|n| widths[*n] != width) {
             return Err(error("streams, reads and the hidden node differ in width"));
         }
         let wanted: BTreeSet<usize> = trainable.iter().copied().collect();
-        let mut per_layer = Vec::with_capacity(layers);
-        for l in 0..layers {
-            let end = if l + 1 < layers { streams[l + 1] } else { hidden };
-            let first = if l == 0 { 0 } else { streams[l] + 1 };
-            if streams[l] >= end || !(first..=end).contains(&reads[2 * l]) || !(reads[2 * l] < reads[2 * l + 1] && reads[2 * l + 1] < end) {
-                return Err(error(format!("layer {l}: its stream, reads and end are not in order")));
+        let mut per_block = Vec::with_capacity(blocks);
+        for b in 0..blocks {
+            let end = if b + 1 < blocks { entries[b + 1] } else { hidden };
+            let first = if b == 0 { 0 } else { entries[b] + 1 };
+            if entries[b] >= end || !(first..end).contains(&reads[b]) {
+                return Err(error(format!("block {b}: its entering stream, read and end are not in order")));
             }
-            let floor = if l == 0 { 0 } else { streams[l] };
+            let floor = if b == 0 { 0 } else { entries[b] };
             let mut used = BTreeSet::new();
             for n in first..=end {
                 let node = &flat.nodes[n];
                 if node.arguments().iter().any(|a| *a < floor && !matches!(flat.nodes[*a], Node::Feature { .. })) {
-                    return Err(error(format!("layer {l}: node {n} reads a node before the stream entering the layer")));
+                    return Err(error(format!("block {b}: node {n} reads a node before the stream entering the block")));
                 }
                 used.extend(node.operators().into_iter().filter(|op| wanted.contains(op)));
             }
-            per_layer.push(used.into_iter().collect());
+            per_block.push(used.into_iter().collect());
         }
-        Ok(Self { streams, reads, trainable: per_layer })
+        Ok(Self { entries, reads, trainable: per_block })
     }
 }
 
@@ -113,46 +116,47 @@ pub struct Model<'a> {
 
 impl<'a> Model<'a> {
     /// `program` is the resident-value program of `flat` through its hidden node (the final normed
-    /// stream, `Head::prefix`). `streams` holds the stream entering each layer and `reads`, per
-    /// block (each layer's attention, then its MLP), the node the block's projections read.
-    /// `trainable` lists the dense operators that receive gradients (none for `M`). Each layer's
-    /// nodes must read nothing before the stream entering it except token features, so that one
-    /// layer runs from that stream alone.
-    pub fn new(program: &'a DeviceProgram, flat: &OperatorProgram, streams: Vec<usize>, reads: Vec<usize>, trainable: &[usize]) -> Result<Self, String> {
-        Ok(Self { program, sites: Arc::new(Sites::new(program, flat, streams, reads, trainable)?) })
+    /// stream, `Head::prefix`). Per block (each layer's attention, then its MLP) `entries` holds
+    /// the stream entering it and `reads` the node its projections read. `trainable` lists the
+    /// dense operators that receive gradients (none for `M`). Each block's nodes must read nothing
+    /// before the stream entering it except token features, so that one block runs from that
+    /// stream alone.
+    pub fn new(program: &'a DeviceProgram, flat: &OperatorProgram, entries: Vec<usize>, reads: Vec<usize>, trainable: &[usize]) -> Result<Self, String> {
+        Ok(Self { program, sites: Arc::new(Sites::new(program, flat, entries, reads, trainable)?) })
     }
 
-    fn layers(&self) -> usize {
-        self.sites.streams.len()
+    fn blocks(&self) -> usize {
+        self.sites.entries.len()
     }
 
     fn width(&self) -> usize {
         self.program.widths()[self.program.hidden()]
     }
 
-    fn stream(&self, l: usize) -> usize {
-        self.sites.streams[l]
+    fn entry(&self, b: usize) -> usize {
+        self.sites.entries[b]
     }
 
     fn read(&self, block: usize) -> usize {
         self.sites.reads[block]
     }
 
-    /// The last node layer `l` runs: the stream entering the next layer, or the hidden node.
-    fn end(&self, l: usize) -> usize {
-        if l + 1 < self.layers() { self.stream(l + 1) } else { self.program.hidden() }
+    /// The last node block `b` runs: the stream entering the next block, or the hidden node.
+    fn end(&self, b: usize) -> usize {
+        if b + 1 < self.blocks() { self.entry(b + 1) } else { self.program.hidden() }
     }
 }
 
-/// The flat program of `artifact` (`mapped_inlined`), and its streams and reads at the native
-/// sites `layers` (`run_check::layer_nodes` of the native program `artifact` was made from): the
-/// arguments of [`Model::new`]. `Artifact::native` gives `M`'s.
+/// The flat program of `artifact` (`mapped_inlined`), and per block (each layer's attention, then
+/// its MLP) its entering stream and its read at the native sites `layers`
+/// (`run_check::layer_nodes` of the native program `artifact` was made from): the arguments of
+/// [`Model::new`]. `Artifact::native` gives `M`'s.
 pub fn sites(artifact: &Artifact, layers: &[LayerNodes]) -> Result<(OperatorProgram, Vec<usize>, Vec<usize>), String> {
     let (flat, roots) = mapped_inlined(&artifact.program)?;
     let at = |native: usize| artifact.place(native).map(|n| roots[n]).ok_or_else(|| error(format!("native node {native} is not held")));
-    let streams = layers.iter().map(|l| at(l.stream)).collect::<Result<_, _>>()?;
+    let entries = layers.iter().flat_map(|l| [l.stream, l.attended]).map(at).collect::<Result<_, _>>()?;
     let reads = layers.iter().flat_map(|l| [l.normed_stream, l.normed]).map(at).collect::<Result<_, _>>()?;
-    Ok((flat, streams, reads))
+    Ok((flat, entries, reads))
 }
 
 /// The program of the flat program `flat` through its head's hidden node (the final normed
@@ -209,13 +213,13 @@ pub enum Patch {
     Complement { block: usize },
 }
 
-/// One experiment: base and source sequences (indices into the batch's), the cut `1..=L`, and at
-/// most one patch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// One experiment: base and source sequences (indices into the batch's), the hybrid (per block
+/// whether `P_e` runs `P`'s version of it), and at most one patch.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Experiment {
     pub base: usize,
     pub source: usize,
-    pub cut: usize,
+    pub explained: Vec<bool>,
     pub patch: Option<Patch>,
 }
 
@@ -229,16 +233,39 @@ impl Experiment {
     }
 }
 
+/// A hybrid of `blocks` blocks: its size `k` uniform in `1..=blocks`, then a uniform set of `k`
+/// blocks running `P` (module note).
+pub fn hybrid(rng: &mut impl RngExt, blocks: usize) -> Vec<bool> {
+    let k = rng.random_range(1..=blocks);
+    hybrid_of(rng, blocks, k)
+}
+
+/// A hybrid of `blocks` blocks whose `k` blocks running `P` are a uniform set of that size.
+pub fn hybrid_of(rng: &mut impl RngExt, blocks: usize, k: usize) -> Vec<bool> {
+    let k = k.min(blocks);
+    let mut order: Vec<usize> = (0..blocks).collect();
+    for i in 0..k {
+        let j = rng.random_range(i..blocks);
+        order.swap(i, j);
+    }
+    let mut explained = vec![false; blocks];
+    for b in &order[..k] {
+        explained[*b] = true;
+    }
+    explained
+}
+
 /// Per base sequence `n < sequences`, one clean experiment and one patched with source sequence
 /// `n`, the patch drawn uniformly over the union of the `variables` read variables and the `2
-/// layers` blocks (a complement patch), every cut drawn uniformly in `1..=layers`.
+/// layers` blocks (a complement patch), every hybrid drawn independently ([`hybrid`]).
 pub fn sample(rng: &mut impl RngExt, sequences: usize, layers: usize, variables: usize) -> Vec<Experiment> {
+    let blocks = 2 * layers;
     let mut out = Vec::with_capacity(2 * sequences);
     for n in 0..sequences {
-        out.push(Experiment { base: n, source: n, cut: rng.random_range(1..=layers), patch: None });
-        let u = rng.random_range(0..variables + 2 * layers);
+        out.push(Experiment { base: n, source: n, explained: hybrid(rng, blocks), patch: None });
+        let u = rng.random_range(0..variables + blocks);
         let patch = if u < variables { Patch::Read { variable: u } } else { Patch::Complement { block: u - variables } };
-        out.push(Experiment { base: n, source: n, cut: rng.random_range(1..=layers), patch: Some(patch) });
+        out.push(Experiment { base: n, source: n, explained: hybrid(rng, blocks), patch: Some(patch) });
     }
     out
 }
@@ -330,7 +357,7 @@ pub fn design(p: &Model, variables: &[ReadVariable], experiments: &[Experiment])
         }
         d.download(&d.rows_of(all, rows.start, rows.len()).map_err(error)?).map_err(error)
     };
-    design_with(d, 2 * p.layers(), variables, experiments, rows_of)
+    design_with(d, p.blocks(), variables, experiments, rows_of)
 }
 
 /// The patch directions of `experiments` over `blocks` blocks, with `rows_of(operator, rows)`
@@ -428,39 +455,39 @@ fn exchange_cotangent(d: &Device, g: &mut Tensor, at: usize, rows: usize, basis:
     Ok(Some(source))
 }
 
-/// A node a lane's run reads out: the stream entering a layer, or a block's read.
+/// A node a lane's run reads out: the stream entering a block (past the first), or a block's read.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Site {
-    Stream(usize),
+    Entry(usize),
     Read(usize),
 }
 
 impl Site {
-    /// The layer whose run computes it, and its node in `model`.
+    /// The block whose run computes it, and its node in `model`.
     fn at(self, model: &Model) -> (usize, usize) {
         match self {
-            Self::Stream(0) => (0, model.stream(0)),
-            Self::Stream(l) => (l - 1, model.stream(l)),
-            Self::Read(b) => (b / 2, model.read(b)),
+            Self::Entry(b) => (b.saturating_sub(1), model.entry(b)),
+            Self::Read(b) => (b, model.read(b)),
         }
     }
 }
 
-/// One sequence run through layers `layers` of the hybrid that runs `P` before layer `cut` and `M`
-/// from it on, entering at `entry` (the stream entering `layers.start`, past the first layer),
-/// with at most one patch (its directions and the source's read value).
+/// One sequence run through blocks `blocks` of the hybrid that runs `P`'s version of the blocks
+/// `explained` marks and `M`'s of the others, entering at `entry` (the stream entering
+/// `blocks.start`, past the first block), with at most one patch (its directions and the source's
+/// read value).
 struct Lane<'t> {
     tokens: &'t [u32],
-    layers: Range<usize>,
-    cut: usize,
+    blocks: Range<usize>,
+    explained: &'t [bool],
     entry: Option<Tensor>,
     patch: Option<(Arc<Basis>, Tensor)>,
     captures: Vec<Site>,
 }
 
-/// One layer of one model run on the rows of its member lanes.
+/// One block of one model run on the rows of its member lanes.
 struct Segment {
-    layer: usize,
+    block: usize,
     explanation: bool,
     members: Vec<usize>,
     trace: DeviceTrace,
@@ -495,31 +522,31 @@ fn stack(d: &Device, parts: &[&Tensor], length: usize, width: usize) -> Result<T
     Ok(out)
 }
 
-/// Run `lanes` (models `[P, M]`), layer by layer (module note).
+/// Run `lanes` (models `[P, M]`), block by block (module note).
 fn forward(models: [&Model; 2], lanes: &mut [Lane], length: usize, keep: bool) -> Result<Run, String> {
     let d = models[0].program.device();
     let width = models[0].width();
-    let layers = models[0].layers();
+    let blocks = models[0].blocks();
     let mut state: Vec<Option<Tensor>> = lanes.iter_mut().map(|l| l.entry.take()).collect();
     let mut captured: Vec<Vec<Option<Tensor>>> = lanes.iter().map(|l| l.captures.iter().map(|_| None).collect()).collect();
     let mut segments = Vec::new();
-    for b in 0..layers {
+    for b in 0..blocks {
         for (side, model) in models.iter().enumerate() {
             let explanation = side == 0;
-            let members: Vec<usize> = (0..lanes.len()).filter(|&i| lanes[i].layers.contains(&b) && (b < lanes[i].cut) == explanation).collect();
+            let members: Vec<usize> = (0..lanes.len()).filter(|&i| lanes[i].blocks.contains(&b) && lanes[i].explained[b] == explanation).collect();
             if members.is_empty() {
                 continue;
             }
             let entry = if b == 0 {
                 None
             } else {
-                let parts = members.iter().map(|i| state[*i].as_ref().ok_or_else(|| error("a lane enters a layer with no stream"))).collect::<Result<Vec<_>, _>>()?;
-                Some((model.stream(b), stack(d, &parts, length, width)?))
+                let parts = members.iter().map(|i| state[*i].as_ref().ok_or_else(|| error("a lane enters a block with no stream"))).collect::<Result<Vec<_>, _>>()?;
+                Some((model.entry(b), stack(d, &parts, length, width)?))
             };
             let patched: Vec<(usize, usize, &Basis, &Tensor)> = members
                 .iter()
                 .enumerate()
-                .filter_map(|(i, lane)| lanes[*lane].patch.as_ref().filter(|(basis, _)| basis.block / 2 == b).map(|(basis, s)| (model.read(basis.block), i * length, basis.as_ref(), s)))
+                .filter_map(|(i, lane)| lanes[*lane].patch.as_ref().filter(|(basis, _)| basis.block == b).map(|(basis, s)| (model.read(basis.block), i * length, basis.as_ref(), s)))
                 .collect();
             let arithmetic = model.program.arithmetic();
             let edit = |node: usize, trace: &DeviceTrace| -> Result<Option<Tensor>, String> {
@@ -537,19 +564,19 @@ fn forward(models: [&Model; 2], lanes: &mut [Lane], length: usize, keep: bool) -
             for (i, &lane) in members.iter().enumerate() {
                 state[lane] = Some(d.rows_of(trace.value(end)?, i * length, length).map_err(error)?);
                 for (c, site) in lanes[lane].captures.iter().enumerate() {
-                    let (layer, node) = site.at(model);
-                    if layer == b {
+                    let (block, node) = site.at(model);
+                    if block == b {
                         captured[lane][c] = Some(d.rows_of(trace.value(node)?, i * length, length).map_err(error)?);
                     }
                 }
             }
             if keep {
-                segments.push(Segment { layer: b, explanation, members, trace });
+                segments.push(Segment { block: b, explanation, members, trace });
             }
         }
     }
-    let outputs = state.into_iter().map(|s| s.ok_or_else(|| error("a lane ran no layer"))).collect::<Result<_, _>>()?;
-    let captured = captured.into_iter().map(|c| c.into_iter().map(|v| v.ok_or_else(|| error("a capture outside its lane's layers"))).collect()).collect::<Result<_, _>>()?;
+    let outputs = state.into_iter().map(|s| s.ok_or_else(|| error("a lane ran no block"))).collect::<Result<_, _>>()?;
+    let captured = captured.into_iter().map(|c| c.into_iter().map(|v| v.ok_or_else(|| error("a capture outside its lane's blocks"))).collect()).collect::<Result<_, _>>()?;
     Ok(Run { outputs, captured, segments })
 }
 
@@ -571,7 +598,7 @@ fn reverse(
     let mut sources: Vec<Option<Tensor>> = lanes.iter().map(|_| None).collect();
     for segment in run.segments.into_iter().rev() {
         let model = models[usize::from(!segment.explanation)];
-        let b = segment.layer;
+        let b = segment.block;
         let rows = segment.members.len() * length;
         let mut seeds: BTreeMap<usize, Tensor> = BTreeMap::new();
         let seed = |seeds: &mut BTreeMap<usize, Tensor>, node: usize, i: usize, value: &Tensor| -> Result<(), String> {
@@ -587,8 +614,8 @@ fn reverse(
                 seed(&mut seeds, model.end(b), i, &g)?;
             }
             for (site, g) in lanes[lane].captures.iter().zip(&captures[lane]) {
-                let (layer, node) = site.at(model);
-                if let (true, Some(g)) = (layer == b, g) {
+                let (block, node) = site.at(model);
+                if let (true, Some(g)) = (block == b, g) {
                     seed(&mut seeds, node, i, g)?;
                     keep.insert(node);
                 }
@@ -601,12 +628,12 @@ fn reverse(
             .members
             .iter()
             .enumerate()
-            .filter_map(|(i, lane)| lanes[*lane].patch.as_ref().filter(|(basis, _)| basis.block / 2 == b).map(|(basis, _)| (model.read(basis.block), i, *lane, basis.as_ref())))
+            .filter_map(|(i, lane)| lanes[*lane].patch.as_ref().filter(|(basis, _)| basis.block == b).map(|(basis, _)| (model.read(basis.block), i, *lane, basis.as_ref())))
             .collect();
         let edited: BTreeSet<usize> = patched.iter().map(|(node, ..)| *node).collect();
         keep.extend(&edited);
         if b > 0 {
-            keep.insert(model.stream(b));
+            keep.insert(model.entry(b));
         }
         let trainable: &[usize] = if segment.explanation { &model.sites.trainable[b] } else { &[] };
         let arithmetic = model.program.arithmetic();
@@ -627,7 +654,7 @@ fn reverse(
             }
         }
         if b > 0 {
-            let g = nodes.get(&model.stream(b)).ok_or_else(|| error("no cotangent of a layer's entering stream"))?;
+            let g = nodes.get(&model.entry(b)).ok_or_else(|| error("no cotangent of a block's entering stream"))?;
             for (i, &lane) in segment.members.iter().enumerate() {
                 cotangent[lane] = Some(d.rows_of(g, i * length, length).map_err(error)?);
             }
@@ -636,57 +663,64 @@ fn reverse(
     Ok(sources)
 }
 
+/// Refuse an experiment outside `batch` or with a hybrid not of `blocks` blocks.
+fn check(e: &Experiment, batch: &Batch, blocks: usize) -> Result<(), String> {
+    if e.base >= batch.base.len() || e.source >= batch.source.len() || e.explained.len() != blocks {
+        return Err(error("an experiment outside the batch or its blocks"));
+    }
+    Ok(())
+}
+
 /// `M`'s clean runs on a batch, made once per batch: its compact targets on the bases, its streams
-/// entering the patched layers on the bases, and its reads at the patched blocks on the sources.
+/// entering the patched blocks on the bases, and its reads at the patched blocks on the sources.
 pub struct Teacher {
     clean: Vec<Target>,
-    streams: BTreeMap<(usize, usize), Tensor>,
+    entries: BTreeMap<(usize, usize), Tensor>,
     reads: BTreeMap<(usize, usize), Tensor>,
 }
 
 impl Teacher {
     pub fn new(m: &Model, head: &FixedHead, batch: &Batch, variables: &[ReadVariable], experiments: &[Experiment]) -> Result<Self, String> {
         let d = m.program.device();
-        let layers = m.layers();
+        let blocks = m.blocks();
         let mut base_sites: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); batch.base.len()];
         let mut source_sites: BTreeSet<(usize, usize)> = BTreeSet::new();
         for e in experiments {
-            if e.base >= batch.base.len() || e.source >= batch.source.len() || !(1..=layers).contains(&e.cut) {
-                return Err(error("an experiment outside the batch or its cuts"));
-            }
+            check(e, batch, blocks)?;
             if let Some(block) = e.block(variables)? {
-                if block >= 2 * layers {
+                if block >= blocks {
                     return Err(error("a patch of an unknown block"));
                 }
-                if block / 2 > 0 {
-                    base_sites[e.base].insert(block / 2);
+                if block > 0 {
+                    base_sites[e.base].insert(block);
                 }
                 source_sites.insert((e.source, block));
             }
         }
+        let native = vec![false; blocks];
         let mut lanes: Vec<Lane> = batch
             .base
             .iter()
             .zip(&base_sites)
-            .map(|(tokens, sites)| Lane { tokens, layers: 0..layers, cut: 0, entry: None, patch: None, captures: sites.iter().map(|l| Site::Stream(*l)).collect() })
+            .map(|(tokens, sites)| Lane { tokens, blocks: 0..blocks, explained: &native, entry: None, patch: None, captures: sites.iter().map(|b| Site::Entry(*b)).collect() })
             .collect();
         let run = forward([m, m], &mut lanes, batch.length, false)?;
-        let mut streams = BTreeMap::new();
+        let mut entries = BTreeMap::new();
         let mut clean = Vec::with_capacity(lanes.len());
         for ((n, sites), (output, captured)) in base_sites.iter().enumerate().zip(run.outputs.into_iter().zip(run.captured)) {
             clean.push(head.target(d, &output, m.program.arithmetic())?);
-            for (l, value) in sites.iter().zip(captured) {
-                streams.insert((n, *l), value);
+            for (b, value) in sites.iter().zip(captured) {
+                entries.insert((n, *b), value);
             }
         }
         let sites: Vec<(usize, usize)> = source_sites.into_iter().collect();
         let mut lanes: Vec<Lane> = sites
             .iter()
-            .map(|&(n, block)| Lane { tokens: &batch.source[n], layers: 0..block / 2 + 1, cut: 0, entry: None, patch: None, captures: vec![Site::Read(block)] })
+            .map(|&(n, block)| Lane { tokens: &batch.source[n], blocks: 0..block + 1, explained: &native, entry: None, patch: None, captures: vec![Site::Read(block)] })
             .collect();
         let run = forward([m, m], &mut lanes, batch.length, false)?;
         let reads = sites.into_iter().zip(run.captured).map(|(site, mut c)| (site, c.remove(0))).collect();
-        Ok(Self { clean, streams, reads })
+        Ok(Self { clean, entries, reads })
     }
 }
 
@@ -704,26 +738,27 @@ pub struct Evaluation {
 /// `P`'s trainable operators. `teacher` holds `M`'s clean runs on `batch` for these experiments.
 pub fn evaluate(m: &Model, p: &Model, head: &FixedHead, batch: &Batch, teacher: &Teacher, experiments: &[Experiment], design: &Design, gradient: bool) -> Result<Evaluation, String> {
     let d = p.program.device();
-    let (layers, length, width) = (p.layers(), batch.length, p.width());
-    if m.layers() != layers || m.width() != width || design.bases.len() != experiments.len() || teacher.clean.len() != batch.base.len() {
+    let (blocks, length, width) = (p.blocks(), batch.length, p.width());
+    if m.blocks() != blocks || m.width() != width || design.bases.len() != experiments.len() || teacher.clean.len() != batch.base.len() {
         return Err(error("models, design or teacher do not match"));
     }
-    if experiments.iter().any(|e| e.base >= batch.base.len() || e.source >= batch.source.len() || !(1..=layers).contains(&e.cut)) {
-        return Err(error("an experiment outside the batch or its cuts"));
+    for e in experiments {
+        check(e, batch, blocks)?;
     }
+    let native = vec![false; blocks];
     let patched: Vec<usize> = (0..experiments.len()).filter(|i| design.bases[*i].is_some()).collect();
     let basis = |i: usize| design.bases[i].as_ref().ok_or_else(|| error("a patched experiment without directions"));
-    // M under each patch, from the patched layer on.
+    // M under each patch, from the patched block on.
     let mut lanes = Vec::with_capacity(patched.len());
     for &i in &patched {
         let (e, basis) = (&experiments[i], basis(i)?);
-        let start = basis.block / 2;
-        let entry = (start > 0).then(|| teacher.streams.get(&(e.base, start)).ok_or_else(|| error("the teacher has no stream for a patched experiment"))).transpose()?;
+        let start = basis.block;
+        let entry = (start > 0).then(|| teacher.entries.get(&(e.base, start)).ok_or_else(|| error("the teacher has no stream for a patched experiment"))).transpose()?;
         let source = teacher.reads.get(&(e.source, basis.block)).ok_or_else(|| error("the teacher has no source read for a patched experiment"))?;
         lanes.push(Lane {
             tokens: &batch.base[e.base],
-            layers: start..layers,
-            cut: 0,
+            blocks: start..blocks,
+            explained: &native,
             entry: entry.map(|t| d.copy(t).map_err(error)).transpose()?,
             patch: Some((Arc::clone(basis), d.copy(source).map_err(error)?)),
             captures: vec![],
@@ -735,12 +770,12 @@ pub fn evaluate(m: &Model, p: &Model, head: &FixedHead, batch: &Batch, teacher: 
         targets.insert(i, head.target(d, output, m.program.arithmetic())?);
     }
     drop(run);
-    // The hybrids on the sources, up to the patched layer.
+    // The hybrids on the sources, up to the patched block.
     let mut sources: Vec<Lane> = patched
         .iter()
         .map(|&i| -> Result<Lane, String> {
             let (e, basis) = (&experiments[i], basis(i)?);
-            Ok(Lane { tokens: &batch.source[e.source], layers: 0..basis.block / 2 + 1, cut: e.cut, entry: None, patch: None, captures: vec![Site::Read(basis.block)] })
+            Ok(Lane { tokens: &batch.source[e.source], blocks: 0..basis.block + 1, explained: &e.explained, entry: None, patch: None, captures: vec![Site::Read(basis.block)] })
         })
         .collect::<Result<_, _>>()?;
     let source_run = forward([p, m], &mut sources, length, gradient)?;
@@ -755,7 +790,7 @@ pub fn evaluate(m: &Model, p: &Model, head: &FixedHead, batch: &Batch, teacher: 
             Some(basis) => Some((Arc::clone(basis), source_values.remove(&i).ok_or_else(|| error("a source read is missing"))?)),
             None => None,
         };
-        bases.push(Lane { tokens: &batch.base[e.base], layers: 0..layers, cut: e.cut, entry: None, patch, captures: vec![] });
+        bases.push(Lane { tokens: &batch.base[e.base], blocks: 0..blocks, explained: &e.explained, entry: None, patch, captures: vec![] });
     }
     let base_run = forward([p, m], &mut bases, length, gradient)?;
     // Scores against the targets.
@@ -851,6 +886,11 @@ impl Interchange {
         (Model { program: &self.m, sites: Arc::clone(&self.m_sites) }, Model { program: &self.p, sites: Arc::clone(&self.p_sites) })
     }
 
+    /// `P`'s program, to write its trainable operators on the device (`device_posterior`).
+    pub fn explanation_mut(&mut self) -> &mut DeviceProgram {
+        &mut self.p
+    }
+
     /// The head `M` and `P` share.
     pub fn head(&self) -> &FixedHead {
         &self.head
@@ -876,7 +916,20 @@ impl Interchange {
             }
             Ok(all.slice(s![rows.clone(), ..]).to_owned())
         };
-        design_with(self.p.device(), 2 * self.m_sites.streams.len(), variables, experiments, rows_of)
+        design_with(self.p.device(), self.m_sites.entries.len(), variables, experiments, rows_of)
+    }
+
+    /// `P`'s program, so that a fit writes each weight sample into its resident parameters.
+    pub fn program_mut(&mut self) -> &mut DeviceProgram {
+        &mut self.p
+    }
+
+    /// [`Interchange::evaluate`] with the gradient left on the device, per trainable operator.
+    pub fn evaluate_resident(&self, batch: &Batch, experiments: &[Experiment], gradient: bool) -> Result<Evaluation, String> {
+        let (m, p) = self.models();
+        let directions = design(&p, &self.variables, experiments)?;
+        let teacher = Teacher::new(&m, &self.head, batch, &self.variables, experiments)?;
+        evaluate(&m, &p, &self.head, batch, &teacher, experiments, &directions, gradient)
     }
 
     /// Load `P`'s trainable operators, in the order given to [`Interchange::new`].
@@ -893,17 +946,14 @@ impl Interchange {
 
     /// Per base sequence `n < sequences`, one unpatched and one patched experiment ([`sample`]).
     pub fn sample(&self, rng: &mut impl RngExt, sequences: usize) -> Vec<Experiment> {
-        sample(rng, sequences, self.m_sites.streams.len(), self.variables.len())
+        sample(rng, sequences, self.m_sites.entries.len() / 2, self.variables.len())
     }
 
     /// `KL(M_e ‖ P_e)` per token for each of `experiments` on `batch` at `P`'s loaded parameters,
     /// with the patch directions of `P`'s loaded reads, and with `gradient` its sum's gradient.
     /// `M`'s clean runs are made once for the whole batch.
     pub fn evaluate(&self, batch: &Batch, experiments: &[Experiment], gradient: bool) -> Result<Scored, String> {
-        let (m, p) = self.models();
-        let directions = design(&p, &self.variables, experiments)?;
-        let teacher = Teacher::new(&m, &self.head, batch, &self.variables, experiments)?;
-        let evaluation = evaluate(&m, &p, &self.head, batch, &teacher, experiments, &directions, gradient)?;
+        let evaluation = self.evaluate_resident(batch, experiments, gradient)?;
         if !gradient {
             return Ok(Scored { bits: evaluation.bits, gradient: Vec::new() });
         }

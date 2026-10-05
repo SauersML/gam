@@ -4,11 +4,11 @@
 //! unembedding) whose explanation `P` is the model with perturbed query, key, value and MLP input
 //! maps.
 //!
-//! The host reference runs each model's program with `OperatorProgram::execute_edited`: the cut
-//! replaces `M`'s stream entering the cut layer by `P`'s, a patch replaces the read node's value,
-//! its projector formed from a QR decomposition of the read rows (not the device's singular value
-//! decomposition), and the divergence is formed from full softmax distributions (not the compact
-//! head statistics). Both sides evaluate the same expressions in float64 in different orders; each
+//! The host reference runs each model's program with `OperatorProgram::execute_edited`: a hybrid
+//! runs block by block, each block's model entering at the stream the previous block left; a patch
+//! replaces the read node's value, its projector formed from a QR decomposition of the read rows
+//! (not the device's singular value decomposition); and the divergence is formed from full softmax
+//! distributions (not the compact head statistics). Both sides evaluate the same expressions in float64 in different orders; each
 //! value then differs by a few units of rounding of its widest sum (at most `d + V` terms here,
 //! `V` classes), far below the `1e-9` bits the comparison allows and far below any effect of a
 //! patch.
@@ -35,7 +35,7 @@ const LAYERS: usize = 2;
 struct Host {
     prefix: OperatorProgram,
     flat: OperatorProgram,
-    streams: Vec<usize>,
+    entries: Vec<usize>,
     reads: Vec<usize>,
 }
 
@@ -54,9 +54,9 @@ fn fixture() -> Fixture {
     let (program, family) = fixture_sized(D, VOCAB, LENGTH, 6);
     let native = split_sites(&program).expect("split");
     let layers = layer_nodes(&native, LAYERS).expect("layers");
-    let (flat, streams, reads) = sites(&Artifact::native(&native).expect("native artifact"), &layers).expect("sites");
+    let (flat, entries, reads) = sites(&Artifact::native(&native).expect("native artifact"), &layers).expect("sites");
     let head = Head::of(&flat).expect("head");
-    let m = Host { prefix: head.prefix(&flat), flat: flat.clone(), streams: streams.clone(), reads: reads.clone() };
+    let m = Host { prefix: head.prefix(&flat), flat: flat.clone(), entries: entries.clone(), reads: reads.clone() };
     // P: every query, key, value and MLP input map moved off M's.
     let mut p_flat = flat.clone();
     let mut variables = Vec::new();
@@ -85,7 +85,7 @@ fn fixture() -> Fixture {
     // complement patch below spans, since its rows repeat other variables').
     let up = flat.operators.iter().position(|op| op.name == "blocks.0.c_fc").expect("layer 0 MLP input");
     variables.push(ReadVariable { block: 1, parts: vec![(up, 1..2), (up, 4..6)] });
-    let p = Host { prefix: head.prefix(&p_flat), flat: p_flat, streams, reads };
+    let p = Host { prefix: head.prefix(&p_flat), flat: p_flat, entries, reads };
     let SlotValues::Tokens(tokens) = &family.slots[0] else { panic!("tokens") };
     let base: Vec<Vec<u32>> = tokens.chunks(LENGTH).map(<[u32]>::to_vec).collect();
     let source: Vec<Vec<u32>> = base.iter().map(|s| s.iter().map(|t| (t + 5) % VOCAB as u32).rev().collect()).collect();
@@ -114,64 +114,43 @@ fn patched(h: &Array2<f64>, (_, pi, complement, s): HostPatch<'_>) -> Array2<f64
     if complement { s + &(h - s).dot(pi) } else { h + &(s - h).dot(pi) }
 }
 
-/// The hybrid of `P` before layer `cut` and `M` from it on, on `tokens`, under `patch`: its hidden
-/// rows and its read at every block.
-fn hybrid(f: &Fixture, tokens: &[u32], cut: usize, patch: Option<HostPatch<'_>>) -> (Array2<f64>, Vec<Array2<f64>>) {
+/// The hybrid running `P`'s version of the blocks `explained` marks and `M`'s of the others, on
+/// `tokens`, under `patch`: its hidden rows and its read at every block. Each block is one run of
+/// its model's whole program with the stream entering the block replaced by the previous block's
+/// output, of which only the block's own nodes are kept.
+fn hybrid(f: &Fixture, tokens: &[u32], explained: &[bool], patch: Option<HostPatch<'_>>) -> (Array2<f64>, Vec<Array2<f64>>) {
     let family = one(tokens);
-    // The patch applies in `P`'s run when its layer is before the cut, else in `M`'s.
-    let apply = |model: &Host, before_cut: bool, node: usize, value: &mut Array2<f64>| {
-        if let Some(patch) = patch
-            && before_cut == (patch.0 / 2 < cut)
-            && node == model.reads[patch.0]
-        {
-            *value = patched(value, patch);
-        }
-    };
-    let p = f
-        .p
-        .prefix
-        .execute_edited(&family, |node, value, _| {
-            apply(&f.p, true, node, value);
-            Ok(())
-        })
-        .expect("P");
-    if cut == LAYERS {
-        let reads = f.p.reads.iter().map(|n| p.values[*n].clone()).collect();
-        return (p.values[f.p.prefix.output].clone(), reads);
+    let blocks = 2 * LAYERS;
+    let (mut state, mut reads) = (None::<Array2<f64>>, Vec::with_capacity(blocks));
+    for b in 0..blocks {
+        let host = if explained[b] { &f.p } else { &f.m };
+        let end = if b + 1 < blocks { host.entries[b + 1] } else { host.prefix.output };
+        let run = host
+            .prefix
+            .execute_edited(&family, |node, value, _| {
+                if let Some(entering) = &state
+                    && node == host.entries[b]
+                {
+                    *value = entering.clone();
+                }
+                if let Some(patch) = patch
+                    && patch.0 == b
+                    && node == host.reads[b]
+                {
+                    *value = patched(value, patch);
+                }
+                Ok(())
+            })
+            .expect("block");
+        reads.push(run.values[host.reads[b]].clone());
+        state = Some(run.values[end].clone());
     }
-    let stream = p.values[f.p.streams[cut]].clone();
-    let m = f
-        .m
-        .prefix
-        .execute_edited(&family, |node, value, _| {
-            if node == f.m.streams[cut] {
-                *value = stream.clone();
-            }
-            apply(&f.m, false, node, value);
-            Ok(())
-        })
-        .expect("M");
-    let reads = (0..2 * LAYERS).map(|b| if b / 2 < cut { p.values[f.p.reads[b]].clone() } else { m.values[f.m.reads[b]].clone() }).collect();
-    (m.values[f.m.prefix.output].clone(), reads)
+    (state.expect("a block ran"), reads)
 }
 
-/// `M` alone (the hybrid with no layer of `P`).
+/// `M` alone (the hybrid with no block of `P`).
 fn native(f: &Fixture, tokens: &[u32], patch: Option<HostPatch<'_>>) -> (Array2<f64>, Vec<Array2<f64>>) {
-    let family = one(tokens);
-    let m = f
-        .m
-        .prefix
-        .execute_edited(&family, |node, value, _| {
-            if let Some(patch) = patch
-                && node == f.m.reads[patch.0]
-            {
-                *value = patched(value, patch);
-            }
-            Ok(())
-        })
-        .expect("M");
-    let reads = f.m.reads.iter().map(|n| m.values[*n].clone()).collect();
-    (m.values[f.m.prefix.output].clone(), reads)
+    hybrid(f, tokens, &[false; 2 * LAYERS], patch)
 }
 
 /// Per row `KL(softmax(E a) ‖ softmax(E b))` in bits.
@@ -195,7 +174,7 @@ fn kl_bits(head: &Head, a: &Array2<f64>, b: &Array2<f64>) -> Vec<f64> {
 fn reference(f: &Fixture, e: &Experiment) -> Vec<f64> {
     let (base, source) = (&f.batch.base[e.base], &f.batch.source[e.source]);
     let Some(patch) = e.patch else {
-        return kl_bits(&f.head, &native(f, base, None).0, &hybrid(f, base, e.cut, None).0);
+        return kl_bits(&f.head, &native(f, base, None).0, &hybrid(f, base, &e.explained, None).0);
     };
     let rows_of = |v: &ReadVariable| -> Vec<Array2<f64>> { v.parts.iter().map(|(op, rows)| f.p.flat.operators[*op].matrix().slice(s![rows.clone(), ..]).to_owned()).collect() };
     let (block, parts, complement) = match patch {
@@ -207,26 +186,33 @@ fn reference(f: &Fixture, e: &Experiment) -> Vec<f64> {
     // More rows than coordinates span everything: the projector is the identity.
     let pi = if rows.nrows() >= D { Array2::eye(D) } else { projector(&rows) };
     let m_source = native(f, source, None).1[block].clone();
-    let p_source = hybrid(f, source, e.cut, None).1[block].clone();
+    let p_source = hybrid(f, source, &e.explained, None).1[block].clone();
     let teacher = native(f, base, Some((block, &pi, complement, &m_source))).0;
-    let student = hybrid(f, base, e.cut, Some((block, &pi, complement, &p_source))).0;
+    let student = hybrid(f, base, &e.explained, Some((block, &pi, complement, &p_source))).0;
     kl_bits(&f.head, &teacher, &student)
 }
 
-/// Experiments covering every kind of patch on both sides of every cut.
+/// Experiments covering every kind of patch on both sides of the hybrids' switches, under prefix
+/// and non-prefix hybrids.
 fn experiments(f: &Fixture) -> Vec<Experiment> {
     let read = |block: usize, nth: usize| f.variables.iter().enumerate().filter(|(_, v)| v.block == block).nth(nth).map(|(i, _)| i).expect("variable");
+    let (t, n) = (true, false);
+    let e = |base: usize, source: usize, explained: [bool; 2 * LAYERS], patch: Option<Patch>| Experiment { base, source, explained: explained.to_vec(), patch };
     vec![
-        Experiment { base: 0, source: 0, cut: 1, patch: None },
-        Experiment { base: 1, source: 1, cut: 2, patch: None },
-        Experiment { base: 2, source: 3, cut: 1, patch: Some(Patch::Read { variable: read(0, 0) }) },
-        Experiment { base: 3, source: 2, cut: 2, patch: Some(Patch::Read { variable: read(2, 2) }) },
-        Experiment { base: 4, source: 5, cut: 1, patch: Some(Patch::Read { variable: read(3, 5) }) },
-        Experiment { base: 5, source: 4, cut: 2, patch: Some(Patch::Read { variable: read(1, 3) }) },
-        Experiment { base: 3, source: 0, cut: 1, patch: Some(Patch::Read { variable: f.variables.len() - 1 }) },
-        Experiment { base: 0, source: 2, cut: 1, patch: Some(Patch::Complement { block: 0 }) },
-        Experiment { base: 1, source: 3, cut: 2, patch: Some(Patch::Complement { block: 2 }) },
-        Experiment { base: 2, source: 0, cut: 1, patch: Some(Patch::Complement { block: 3 }) },
+        e(0, 0, [t, t, n, n], None),
+        e(1, 1, [t, t, t, t], None),
+        e(4, 4, [n, t, t, n], None),
+        e(5, 5, [n, n, n, t], None),
+        e(2, 3, [t, t, n, n], Some(Patch::Read { variable: read(0, 0) })),
+        e(3, 2, [t, t, t, t], Some(Patch::Read { variable: read(2, 2) })),
+        e(4, 5, [t, t, n, n], Some(Patch::Read { variable: read(3, 5) })),
+        e(5, 4, [t, n, t, t], Some(Patch::Read { variable: read(1, 3) })),
+        e(1, 2, [n, t, n, t], Some(Patch::Read { variable: read(2, 1) })),
+        e(3, 0, [t, t, n, n], Some(Patch::Read { variable: f.variables.len() - 1 })),
+        e(0, 2, [t, t, n, n], Some(Patch::Complement { block: 0 })),
+        e(1, 3, [t, t, t, t], Some(Patch::Complement { block: 2 })),
+        e(2, 0, [t, t, n, n], Some(Patch::Complement { block: 3 })),
+        e(5, 1, [n, t, t, n], Some(Patch::Complement { block: 0 })),
     ]
 }
 
@@ -246,8 +232,8 @@ fn programs(device: &Device, f: &Fixture) -> Programs {
 
 fn models<'a>(f: &Fixture, programs: &'a Programs) -> (Model<'a>, Model<'a>) {
     (
-        Model::new(&programs.m, &f.m.flat, f.m.streams.clone(), f.m.reads.clone(), &[]).expect("M model"),
-        Model::new(&programs.p, &f.p.flat, f.p.streams.clone(), f.p.reads.clone(), &f.trainable).expect("P model"),
+        Model::new(&programs.m, &f.m.flat, f.m.entries.clone(), f.m.reads.clone(), &[]).expect("M model"),
+        Model::new(&programs.p, &f.p.flat, f.p.entries.clone(), f.p.reads.clone(), &f.trainable).expect("P model"),
     )
 }
 
@@ -283,8 +269,8 @@ fn the_model_explains_itself_exactly() {
     p.prepare_dense_parameters(&f.trainable).expect("parameters");
     let m = DeviceProgram::compile_values(&device, &f.m.prefix).expect("M");
     let head = FixedHead::new(&device, &f.m.flat, &f.m.flat, 4).expect("head");
-    let mm = Model::new(&m, &f.m.flat, f.m.streams.clone(), f.m.reads.clone(), &[]).expect("M model");
-    let pm = Model::new(&p, &f.m.flat, f.m.streams.clone(), f.m.reads.clone(), &f.trainable).expect("P model");
+    let mm = Model::new(&m, &f.m.flat, f.m.entries.clone(), f.m.reads.clone(), &[]).expect("M model");
+    let pm = Model::new(&p, &f.m.flat, f.m.entries.clone(), f.m.reads.clone(), &f.trainable).expect("P model");
     let experiments = sample(&mut rand::rngs::StdRng::seed_from_u64(5), f.batch.base.len(), LAYERS, f.variables.len());
     let design = design(&pm, &f.variables, &experiments).expect("design");
     let teacher = Teacher::new(&mm, &head, &f.batch, &f.variables, &experiments).expect("teacher");
@@ -339,12 +325,12 @@ fn the_gradient_matches_central_differences() {
 
 #[test]
 fn sampling_draws_one_clean_and_one_patched_experiment_per_base() {
-    let experiments = sample(&mut rand::rngs::StdRng::seed_from_u64(11), 50, 3, 7);
-    assert_eq!(experiments.len(), 100);
+    let experiments = sample(&mut rand::rngs::StdRng::seed_from_u64(11), 600, 3, 7);
+    assert_eq!(experiments.len(), 1200);
     for (n, pair) in experiments.chunks(2).enumerate() {
         assert_eq!((pair[0].base, pair[1].base, pair[1].source), (n, n, n));
         assert!(pair[0].patch.is_none() && pair[1].patch.is_some());
-        assert!(pair.iter().all(|e| (1..=3).contains(&e.cut)));
+        assert!(pair.iter().all(|e| e.explained.len() == 6 && e.explained.contains(&true)));
         match pair[1].patch {
             Some(Patch::Read { variable }) => assert!(variable < 7),
             Some(Patch::Complement { block }) => assert!(block < 6),
@@ -352,6 +338,10 @@ fn sampling_draws_one_clean_and_one_patched_experiment_per_base() {
         }
     }
     assert!(experiments.iter().any(|e| matches!(e.patch, Some(Patch::Complement { .. }))));
+    // Every size 1..=6 appears, and a non-prefix set does: the hybrids are not only cuts.
+    let sizes: std::collections::BTreeSet<usize> = experiments.iter().map(|e| e.explained.iter().filter(|x| **x).count()).collect();
+    assert_eq!(sizes, (1..=6).collect());
+    assert!(experiments.iter().any(|e| e.explained.windows(2).any(|w| !w[0] && w[1])));
 }
 
 #[test]
@@ -361,10 +351,10 @@ fn a_device_model_refuses_a_layer_reading_before_its_stream() {
     let m = DeviceProgram::compile_values(&device, &f.m.prefix).expect("M");
     let mut reads = f.m.reads.clone();
     reads.swap(0, 2);
-    assert!(Model::new(&m, &f.m.flat, f.m.streams.clone(), reads, &[]).is_err());
-    let mut streams = f.m.streams.clone();
-    streams[1] = f.m.reads[3];
-    assert!(Model::new(&m, &f.m.flat, streams, f.m.reads.clone(), &[]).is_err());
+    assert!(Model::new(&m, &f.m.flat, f.m.entries.clone(), reads, &[]).is_err());
+    let mut entries = f.m.entries.clone();
+    entries[2] = f.m.reads[3];
+    assert!(Model::new(&m, &f.m.flat, entries, f.m.reads.clone(), &[]).is_err());
 }
 
 #[test]

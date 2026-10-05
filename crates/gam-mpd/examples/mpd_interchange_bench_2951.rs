@@ -15,9 +15,10 @@
 //! The first `SEQUENCES` token rows are the bases and the next `SEQUENCES` the sources. Per base the
 //! experiments are one unpatched and one patched (`Interchange::sample`, seed 1). Measured, each
 //! `REPS` times after one warm-up: `M`'s clean runs (`Teacher::new`), the patch directions
-//! (`design`), the evaluation without and with its gradient (`evaluate`), the whole step
+//! (`design`), the evaluation with and without its gradient (`evaluate`), the gradient's download
+//! to the host, the whole step
 //! (`Interchange::evaluate` with its gradient, downloaded), and for comparison the clean step (`P`
-//! alone on the bases, every cut at the last layer, with its gradient). On `device` the programs
+//! alone on the bases, every block its own, with its gradient). On `device` the programs
 //! run in f32 storage with f32 products (CUDA, else the Apple GPU), as the fit does. A thread
 //! samples the device's free memory every millisecond. One JSON object goes to
 //! `OUT/interchange_bench.json` and stdout: per part the median seconds and the least free device
@@ -177,11 +178,13 @@ fn main() -> Result<(), String> {
     let head = x.head();
     let variables = x.variables();
     let experiments = x.sample(&mut rand::rngs::StdRng::seed_from_u64(1), sequences);
-    let clean: Vec<Experiment> = (0..sequences).map(|n| Experiment { base: n, source: n, cut: layer_count, patch: None }).collect();
+    let clean: Vec<Experiment> = (0..sequences).map(|n| Experiment { base: n, source: n, explained: vec![true; 2 * layer_count], patch: None }).collect();
     let (teacher_time, teacher) = measure(&device, reps, || Teacher::new(&m, head, &batch, variables, &experiments))?;
     let (design_time, design) = measure(&device, reps, || interchange::design(&p, variables, &experiments))?;
+    let (gradient_time, evaluation) = measure(&device, reps, || interchange::evaluate(&m, &p, head, &batch, &teacher, &experiments, &design, true))?;
     let (forward_time, values) = measure(&device, reps, || interchange::evaluate(&m, &p, head, &batch, &teacher, &experiments, &design, false))?;
-    let (gradient_time, _) = measure(&device, reps, || interchange::evaluate(&m, &p, head, &batch, &teacher, &experiments, &design, true))?;
+    let (download_time, _) = measure(&device, reps, || evaluation.gradient.values().map(|g| device.download(g).map_err(|e| e.to_string())).collect::<Result<Vec<_>, String>>())?;
+    drop(evaluation);
     let (step_time, _) = measure(&device, reps, || x.evaluate(&batch, &experiments, true))?;
     let (clean_time, clean_values) = measure(&device, reps, || x.evaluate(&batch, &clean, true))?;
     let mean = |bits: &[Vec<f64>]| bits.iter().flatten().sum::<f64>() / (bits.len() * context).max(1) as f64;
@@ -199,7 +202,7 @@ fn main() -> Result<(), String> {
         "experiments": experiments.len(),
         "patched_experiments": patched_bits.len(),
         "complement_experiments": experiments.iter().filter(|e| matches!(e.patch, Some(Patch::Complement { .. }))).count(),
-        "cuts": experiments.iter().map(|e| e.cut).collect::<Vec<_>>(),
+        "hybrid_sizes": experiments.iter().map(|e| e.explained.iter().filter(|x| **x).count()).collect::<Vec<_>>(),
         "patched_blocks": experiments.iter().filter_map(|e| match e.patch {
             Some(Patch::Read { variable }) => Some(variables[variable].block),
             Some(Patch::Complement { block }) => Some(block),
@@ -211,6 +214,7 @@ fn main() -> Result<(), String> {
         "design": design_time,
         "evaluate": forward_time,
         "evaluate_with_gradient": gradient_time,
+        "download_gradient": download_time,
         "step_with_gradient": step_time,
         "clean_step_with_gradient": clean_time,
         "mean_bits_per_token": mean(&values.bits),

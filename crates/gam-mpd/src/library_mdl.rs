@@ -1005,24 +1005,26 @@ impl Mean {
 
 /// The held-out evaluation of `posterior` on `sequences` (module note); `tokens` is `N`.
 fn held_out(scorer: &mut Scorer, explanation: &Explanation, posterior: &Posterior, sequences: &[Vec<u32>], settings: &Settings, tokens: usize) -> Result<HeldOut, String> {
-    let layers = scorer.layers();
+    let blocks = 2 * scorer.layers();
     let variables = scorer.variables(posterior)?;
-    let (mut clean, mut patched) = (vec![Mean::default(); layers], vec![Mean::default(); layers]);
+    let (mut clean, mut patched) = (vec![Mean::default(); blocks], vec![Mean::default(); blocks]);
     let (mut read, mut complement, mut sampled) = (Mean::default(), Mean::default(), Mean::default());
+    let size = |e: &Experiment| e.explained.iter().filter(|x| **x).count();
     for (b, draw) in draws(sequences.len(), settings.batch_sequences, settings.seed)?.iter().enumerate() {
         let batch = draw.batch(sequences)?;
-        // Every cut, each with one clean and one patched experiment per base.
+        // Every hybrid size, each with one clean and one patched experiment per base.
         let mut rng = StdRng::seed_from_u64(draw.seed);
-        let mut experiments = Vec::with_capacity(2 * layers * draw.bases.len());
-        for cut in 1..=layers {
-            experiments.extend(interchange::sample(&mut rng, draw.bases.len(), layers, variables.len()).into_iter().map(|e| Experiment { cut, ..e }));
+        let mut experiments = Vec::with_capacity(2 * blocks * draw.bases.len());
+        for k in 1..=blocks {
+            let drawn = interchange::sample(&mut rng, draw.bases.len(), blocks / 2, variables.len());
+            experiments.extend(drawn.into_iter().map(|e| Experiment { explained: interchange::hybrid_of(&mut rng, blocks, k), ..e }));
         }
         let (bits, _) = scorer.score(&batch, &experiments, &variables, &posterior.mean, None, false)?;
         for (e, bits) in experiments.iter().zip(&bits) {
             match e.patch {
-                None => clean[e.cut - 1].add(bits),
+                None => clean[size(e) - 1].add(bits),
                 Some(patch) => {
-                    patched[e.cut - 1].add(bits);
+                    patched[size(e) - 1].add(bits);
                     match patch {
                         Patch::Read { .. } => read.add(bits),
                         Patch::Complement { .. } => complement.add(bits),

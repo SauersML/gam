@@ -80,7 +80,9 @@ struct Side {
 
 impl Side {
     fn new(device: &Device, artifact: &Artifact, layers: &[LayerNodes], numeric_bytes: usize) -> Result<Self, String> {
-        let (flat, streams, _) = interchange::sites(artifact, layers)?;
+        let (flat, entries, _) = interchange::sites(artifact, layers)?;
+        // The stream entering each layer: the entering stream of its attention block.
+        let streams = entries.into_iter().step_by(2).collect();
         let mut program = DeviceProgram::compile_values_bounded(device, &interchange::prefix(&flat)?, numeric_bytes)?;
         program.set_arithmetic(if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 });
         let hidden = program.hidden();
@@ -425,7 +427,7 @@ fn main() -> Result<(), String> {
             let batch = Batch::new(chunk.to_vec(), vec![source.clone()])?;
             let mut experiments = Vec::with_capacity(chunk.len() * (families + 1));
             for b in 0..chunk.len() {
-                let at = |patch| Experiment { base: b, source: 0, cut: layer_count, patch };
+                let at = |patch| Experiment { base: b, source: 0, explained: vec![true; blocks], patch };
                 experiments.push(at(Some(Patch::Read { variable: read_of[c * settings.batch_sequences + b] })));
                 experiments.extend((0..blocks).map(|block| at(Some(Patch::Complement { block }))));
                 if s == 0 {
