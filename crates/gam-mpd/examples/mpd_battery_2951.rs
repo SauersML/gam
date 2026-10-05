@@ -17,7 +17,8 @@
 //! * Interchange (`interchange`) with `P` alone: per base one read patch of one of `M`'s read
 //!   variables drawn uniformly, with `M`'s own directions (the library's start, the fit's fixed
 //!   questions: `read`) and with `P`'s current reads of the same rows (adaptive questions:
-//!   `read_adaptive`); the complement patch of every block and the joint complement patch at a
+//!   `read_adaptive`); a joint read patch, with `M`'s directions, of a random subset of the variables
+//!   at that variable's block, each included with probability ½ (`read_joint`); the complement patch of every block and the joint complement patch at a
 //!   uniformly drawn set of at least two blocks (its size uniform in `2..=2L`, where cancellation
 //!   between blocks shows), both of `P`'s current reads, since `M`'s reads span every block's whole
 //!   stream and leave no complement. Each with the source a sequence shared across the whole batch
@@ -223,15 +224,27 @@ fn main() -> Result<(), String> {
     let interchange = Interchange::new(&device, &native, &layers, &artifact, &explanation.trainable, variables.clone(), settings.numeric_bytes, settings.head_tile_rows)?;
     let read_of: Vec<usize> = (0..bases.len()).map(|_| rng.random_range(0..variables.len())).collect();
     let position_of: Vec<usize> = (0..bases.len()).map(|_| rng.random_range(0..bases[0].len())).collect();
+    let subset_of: Vec<Vec<usize>> = read_of
+        .iter()
+        .map(|&v| {
+            let at: Vec<usize> = (0..variables.len()).filter(|i| variables[*i].block == variables[v].block).collect();
+            let mut chosen = Vec::new();
+            while chosen.is_empty() {
+                chosen = at.iter().copied().filter(|_| rng.random_range(0..2) == 0).collect();
+            }
+            chosen
+        })
+        .collect();
     let joint_of: Vec<Vec<usize>> = (0..bases.len())
         .map(|_| {
             let k = rng.random_range(2..=blocks);
             interchange::hybrid_of(&mut rng, blocks, k).iter().enumerate().filter(|(_, x)| **x).map(|(b, _)| b).collect()
         })
         .collect();
-    // Per family (the read patch at M's directions, at P's, each block's complement, then the joint
-    // complement) per source: bits and tokens over every base, and every token's bits.
-    let families = 3 + blocks;
+    // Per family (the read patch at M's directions, at P's, each block's complement, the joint
+    // complement, then the joint read patch) per source: bits and tokens over every base, and
+    // every token's bits.
+    let families = 4 + blocks;
     let mut per_source = vec![vec![(0.0f64, 0usize); sources.len()]; families];
     let mut all: Vec<Tokens> = (0..families).map(|_| Tokens::default()).collect();
     let mut clean = Tokens::default();
@@ -249,6 +262,7 @@ fn main() -> Result<(), String> {
                 };
                 let read = at(Some(Patch::Read { variable: read_of[c * settings.batch_sequences + b] }));
                 fixed.push(read.clone());
+                fixed.push(at(Some(Patch::Reads { variables: subset_of[c * settings.batch_sequences + b].clone() })));
                 adaptive.push(read);
                 adaptive.extend((0..blocks).map(|block| at(Some(Patch::Complement { blocks: vec![block] }))));
                 adaptive.push(at(Some(Patch::Complement { blocks: joint_of[c * settings.batch_sequences + b].clone() })));
@@ -267,6 +281,7 @@ fn main() -> Result<(), String> {
                             continue;
                         }
                         Some(Patch::Read { .. }) => *read_family,
+                        Some(Patch::Reads { .. }) => 3 + blocks,
                         Some(Patch::Complement { blocks: one }) if one.len() == 1 => 2 + one[0],
                         Some(Patch::Complement { .. }) => 2 + blocks,
                     };
@@ -282,7 +297,8 @@ fn main() -> Result<(), String> {
         0 => "read".to_string(),
         1 => "read_adaptive".to_string(),
         f if f < 2 + blocks => format!("complement_block_{}", f - 2),
-        _ => "complement_joint".to_string(),
+        f if f == 2 + blocks => "complement_joint".to_string(),
+        _ => "read_joint".to_string(),
     };
     let mut patches = serde_json::Map::new();
     for f in 0..families {

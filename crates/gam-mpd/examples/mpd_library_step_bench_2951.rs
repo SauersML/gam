@@ -318,8 +318,7 @@ fn main() -> Result<(), String> {
     };
     let zeros: BTreeMap<usize, gam_gpu::tensor::Tensor> =
         trainable.iter().zip(&start.mean).map(|(op, m)| Ok((*op, device.zeros(m.nrows(), m.ncols()).map_err(error)?))).collect::<Result<_, String>>()?;
-    // M's reads span every block's whole stream (vpd4l, Qwen3), so no block leaves a complement.
-    let experiments = interchange::sample(&mut StdRng::seed_from_u64(1), sequences, &variables, &vec![false; 2 * layer_count], context)?;
+    let experiments = interchange::sample(&mut StdRng::seed_from_u64(1), sequences, &variables, 2 * layer_count, context)?;
     let adam = Adam { mean_rate: 5e-5, log_sd_rate: 1e-2, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 };
     let scale = tokens as f64 / (experiments.len() * context) as f64 * std::f64::consts::LN_2;
     fn p_model<'a>(program: &'a DeviceProgram, (flat, streams, reads, trainable): (&OperatorProgram, &[usize], &[usize], &[usize])) -> Result<Model<'a>, String> {

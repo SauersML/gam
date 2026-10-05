@@ -179,8 +179,7 @@ fn main() -> Result<(), String> {
     let variables = x.variables();
     // P starts at M: its starting values are M's reads, which fix the experiments' directions.
     let start: Vec<ndarray::Array2<f64>> = trainable.iter().map(|op| artifact.program.operators[*op].matrix()).collect();
-    let complements = x.complements(variables, &start)?;
-    let experiments = interchange::sample(&mut rand::rngs::StdRng::seed_from_u64(1), sequences, variables, &complements, context)?;
+    let experiments = interchange::sample(&mut rand::rngs::StdRng::seed_from_u64(1), sequences, variables, 2 * layer_count, context)?;
     let clean: Vec<Experiment> = (0..sequences).map(|n| Experiment { base: n, source: n, explained: vec![true; 2 * layer_count], patch: None, position: 0 }).collect();
     let (design_time, design) = measure(&device, reps, || x.design_at(variables, &experiments, &start))?;
     let (teacher_time, targets) = measure(&device, reps, || interchange::targets(&m, head, &batch, &experiments, &design))?;
@@ -205,10 +204,10 @@ fn main() -> Result<(), String> {
         "trainable_operators": trainable.len(),
         "experiments": experiments.len(),
         "patched_experiments": patched_bits.len(),
-        "complement_experiments": experiments.iter().filter(|e| matches!(e.patch, Some(Patch::Complement { .. }))).count(),
         "hybrid_sizes": experiments.iter().map(|e| e.explained.iter().filter(|x| **x).count()).collect::<Vec<_>>(),
         "patched_blocks": experiments.iter().filter_map(|e| match &e.patch {
             Some(Patch::Read { variable }) => Some(variables[*variable].block),
+            Some(Patch::Reads { variables: chosen }) => chosen.first().map(|v| variables[*v].block),
             Some(Patch::Complement { blocks }) => blocks.first().copied(),
             None => None,
         }).collect::<Vec<_>>(),

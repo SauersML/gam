@@ -11,12 +11,15 @@
 //!   uniformly among the sets of that size, so the autonomous `P` (`k = 2L`) and each single
 //!   replacement keep probability `1/(2L)` and every combination of blocks is tested, not only
 //!   prefixes (exact abstraction under the identity alignment requires every hybrid to match `M`);
-//! * and patches at one position `t₀` of distinct blocks (none, one read patch, or the
-//!   complements at a set of blocks), applied by both models; at a block `B`, on the read's row
-//!   `t₀` only (the variables are a direction at a position):
-//!   - a read patch of one of `P`'s read variables at `B` (an MLP function's gate direction `g_i`,
+//! * and patches at one position `t₀` of distinct blocks (none, one read patch, a joint read
+//!   patch of several variables of one block, or the complements at a set of blocks), applied by
+//!   both models; at a block `B`, on the read's row `t₀` only (the variables are a direction at a
+//!   position):
+//!   - a read patch of one of the read variables at `B` (an MLP function's gate direction `g_i`,
 //!     or an attention function's query, key or value read map, a subspace), with orthonormal
 //!     basis `Q`: the read becomes `h + (s − h) Q Qᵀ`, the source's coordinates in the variable;
+//!     a joint read patch of several variables takes `Q` a basis of their span, all of them at
+//!     once;
 //!   - a complement patch at `B`, with `Q` an orthonormal basis of the span of all of `P`'s read
 //!     directions at `B`: the read becomes `s + (h − s) Q Qᵀ`, the source's coordinates outside
 //!     every read of `P`. `P` predicts no effect, so `M` must show none.
@@ -214,13 +217,16 @@ pub fn library_reads(program: &OperatorProgram, layers: usize) -> Result<Vec<Rea
     Ok(out)
 }
 
-/// A patch: one read variable (an index into the variables), or at each of the distinct blocks
-/// `blocks` (ascending) the complement of every read there. The complements at different blocks
-/// are distinct variables, so patching several at once is one joint intervention whose order does
-/// not matter; cancellation between blocks shows only under such joint patches.
+/// A patch: one read variable (an index into the variables); the distinct read variables
+/// `variables` (ascending, all at one block) jointly; or at each of the distinct blocks `blocks`
+/// (ascending) the complement of every read there. The complements at different blocks are
+/// distinct variables, so patching several at once is one joint intervention whose order does not
+/// matter; cancellation between blocks shows only under such joint patches. A joint read patch
+/// shows what single ones miss: many reads that matter little one at a time and much together.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Patch {
     Read { variable: usize },
+    Reads { variables: Vec<usize> },
     Complement { blocks: Vec<usize> },
 }
 
@@ -242,6 +248,16 @@ impl Experiment {
         Ok(match &self.patch {
             None => Vec::new(),
             Some(Patch::Read { variable }) => vec![variables.get(*variable).ok_or_else(|| error("a patch of an unknown variable"))?.block],
+            Some(Patch::Reads { variables: chosen }) => {
+                let block = |i: &usize| variables.get(*i).map(|v| v.block).ok_or_else(|| error("a patch of an unknown variable"));
+                let first = block(chosen.first().ok_or_else(|| error("a joint read patch of no variable"))?)?;
+                for (i, w) in chosen.iter().zip(chosen.iter().skip(1)) {
+                    if i >= w || block(w)? != first {
+                        return Err(error("a joint read patch needs distinct ascending variables of one block"));
+                    }
+                }
+                vec![first]
+            }
             Some(Patch::Complement { blocks }) => {
                 if blocks.is_empty() || blocks.windows(2).any(|w| w[0] >= w[1]) {
                     return Err(error("a complement patch needs distinct ascending blocks"));
@@ -279,31 +295,34 @@ pub fn hybrid_of(rng: &mut impl RngExt, blocks: usize, k: usize) -> Vec<bool> {
 ///
 /// * the clean experiment's hybrid: with probability ½ `P` alone (every block `P`'s: the
 ///   explanation as delivered), else a hybrid drawn by [`hybrid`] (`P`'s parts in `M`'s place);
-/// * the patched experiment, under the same hybrid: its block uniform over the `complements.len()`
-///   blocks; a complement patch with probability ½ where the block's reads leave a nonempty
-///   complement (`complements`), else a read patch of one of the block's `variables`, uniform
-///   among them; its position uniform over the `length` positions.
+/// * the patched experiment, under the same hybrid: its block uniform over the `blocks` blocks;
+///   with probability ½ a read patch of one of the block's `variables`, uniform among them, else
+///   a joint read patch of a random subset of them, each included with probability ½ (drawn again
+///   when empty); its position uniform over the `length` positions.
 ///
 /// A uniform draw over all variables would make nearly every patch an MLP reader's (they are
-/// almost all of the variables) and complement patches rare.
-pub fn sample(rng: &mut impl RngExt, sequences: usize, variables: &[ReadVariable], complements: &[bool], length: usize) -> Result<Vec<Experiment>, String> {
-    let blocks = complements.len();
+/// almost all of the variables). The variables are fixed (`M`'s reads), so the joint subsets test
+/// the reads a removal drops, many at once, without depending on `P`.
+pub fn sample(rng: &mut impl RngExt, sequences: usize, variables: &[ReadVariable], blocks: usize, length: usize) -> Result<Vec<Experiment>, String> {
     let mut at_block: Vec<Vec<usize>> = vec![Vec::new(); blocks];
     for (i, v) in variables.iter().enumerate() {
         at_block.get_mut(v.block).ok_or_else(|| error("a read variable outside the blocks"))?.push(i);
     }
-    if blocks == 0 || length == 0 || (0..blocks).any(|b| at_block[b].is_empty() && !complements[b]) {
-        return Err(error("every block needs a read variable or a complement to patch, and sequences need tokens"));
+    if blocks == 0 || length == 0 || at_block.iter().any(Vec::is_empty) {
+        return Err(error("every block needs a read variable to patch, and sequences need tokens"));
     }
     let mut out = Vec::with_capacity(2 * sequences);
     for n in 0..sequences {
         let explained = if rng.random_range(0..2) == 0 { vec![true; blocks] } else { hybrid(rng, blocks) };
-        let block = rng.random_range(0..blocks);
-        let complement = complements[block] && (at_block[block].is_empty() || rng.random_range(0..2) == 0);
-        let patch = if complement {
-            Patch::Complement { blocks: vec![block] }
+        let candidates = &at_block[rng.random_range(0..blocks)];
+        let patch = if rng.random_range(0..2) == 0 {
+            Patch::Read { variable: candidates[rng.random_range(0..candidates.len())] }
         } else {
-            Patch::Read { variable: at_block[block][rng.random_range(0..at_block[block].len())] }
+            let mut chosen = Vec::new();
+            while chosen.is_empty() {
+                chosen = candidates.iter().copied().filter(|_| rng.random_range(0..2) == 0).collect();
+            }
+            Patch::Reads { variables: chosen }
         };
         let position = rng.random_range(0..length);
         out.push(Experiment { base: n, source: n, explained: explained.clone(), patch: None, position: 0 });
@@ -313,16 +332,18 @@ pub fn sample(rng: &mut impl RngExt, sequences: usize, variables: &[ReadVariable
 }
 
 /// The realized count of each family among `experiments`: clean with `P` alone, clean under a
-/// hybrid, read patches of attention and of MLP variables, and complement patches.
+/// hybrid, single read patches of attention and of MLP variables, joint read patches, and
+/// complement patches.
 pub fn census(experiments: &[Experiment], variables: &[ReadVariable]) -> BTreeMap<&'static str, usize> {
     let mut counts: BTreeMap<&'static str, usize> =
-        ["clean_alone", "clean_hybrid", "read_attention", "read_mlp", "complement"].into_iter().map(|k| (k, 0)).collect();
+        ["clean_alone", "clean_hybrid", "read_attention", "read_mlp", "read_joint", "complement"].into_iter().map(|k| (k, 0)).collect();
     for e in experiments {
         let family = match &e.patch {
             None if e.explained.iter().all(|x| *x) => "clean_alone",
             None => "clean_hybrid",
             Some(Patch::Read { variable }) if variables.get(*variable).is_some_and(|v| v.block % 2 == 0) => "read_attention",
             Some(Patch::Read { .. }) => "read_mlp",
+            Some(Patch::Reads { .. }) => "read_joint",
             Some(Patch::Complement { .. }) => "complement",
         };
         *counts.entry(family).or_default() += 1;
@@ -389,12 +410,32 @@ impl FixedHead {
     }
 }
 
-/// A patch's directions at `P`'s current reads: the block, the kind, and an orthonormal basis
-/// (`d × r`; none when `r = 0`).
+/// The span of a patch's directions in the `d`-dimensional stream: no direction, every direction,
+/// or a proper subspace with an orthonormal basis `Q` (`d × r`, `0 < r < d`).
+enum Span<T> {
+    Empty,
+    Whole,
+    Part(T),
+}
+
+/// A patch's directions: the block, the kind, and their span.
 struct Basis {
     block: usize,
     complement: bool,
-    q: Option<Tensor>,
+    span: Span<Tensor>,
+}
+
+impl Basis {
+    /// Whether the patch takes the source's rows whole (`Some(true)`: a read of every direction,
+    /// a complement of none) or keeps the base's (`Some(false)`: a read of none, a complement of
+    /// every direction); `None` when it mixes them through `Q`.
+    fn extreme(&self) -> Option<bool> {
+        match self.span {
+            Span::Empty => Some(self.complement),
+            Span::Whole => Some(!self.complement),
+            Span::Part(_) => None,
+        }
+    }
 }
 
 /// The patch directions of each experiment at `P`'s reads when it was made, per patched block in
@@ -403,13 +444,17 @@ pub struct Design {
     bases: Vec<Vec<Arc<Basis>>>,
 }
 
-/// An orthonormal basis (`d × r`) of the span of the rows of `rows`: its right singular vectors
-/// whose singular values exceed the decomposition's rounding band; none when no direction is
+/// The span of the rows of `rows`: their right singular vectors whose singular values exceed the
+/// decomposition's rounding band, as an orthonormal basis `d × r` unless none or all `d` are
 /// resolved from zero.
-fn span(rows: ArrayView2<'_, f64>) -> Result<Option<ndarray::Array2<f64>>, String> {
+fn span(rows: ArrayView2<'_, f64>) -> Result<Span<ndarray::Array2<f64>>, String> {
     let decomposition = svd(rows, false).map_err(error)?;
     let rank = decomposition.singular_values.iter().filter(|s| **s > decomposition.band).count();
-    Ok((rank > 0).then(|| decomposition.vt.slice(s![..rank, ..]).t().to_owned()))
+    Ok(match rank {
+        0 => Span::Empty,
+        r if r == rows.ncols() => Span::Whole,
+        r => Span::Part(decomposition.vt.slice(s![..r, ..]).t().to_owned()),
+    })
 }
 
 /// The patch directions of `experiments` at `P`'s current values of its read `variables`.
@@ -439,7 +484,13 @@ fn design_with(
         let views: Vec<_> = parts.iter().map(|m| m.view()).collect();
         ndarray::concatenate(Axis(0), &views).map_err(error)
     };
-    let upload = |q: Option<ndarray::Array2<f64>>| q.map(|q| d.upload(q.view()).map_err(error)).transpose();
+    let upload = |q: Span<ndarray::Array2<f64>>| -> Result<Span<Tensor>, String> {
+        Ok(match q {
+            Span::Empty => Span::Empty,
+            Span::Whole => Span::Whole,
+            Span::Part(q) => Span::Part(d.upload(q.view()).map_err(error)?),
+        })
+    };
     let mut reads: BTreeMap<usize, Arc<Basis>> = BTreeMap::new();
     let mut complements: BTreeMap<usize, Arc<Basis>> = BTreeMap::new();
     let mut bases = Vec::with_capacity(experiments.len());
@@ -451,11 +502,18 @@ fn design_with(
                 Some(b) => Arc::clone(b),
                 None => {
                     let v = variables.get(*variable).ok_or_else(|| error("a patch of an unknown variable"))?;
-                    let b = Arc::new(Basis { block: v.block, complement: false, q: upload(span(rows_of(v)?.view())?)? });
+                    let b = Arc::new(Basis { block: v.block, complement: false, span: upload(span(rows_of(v)?.view())?)? });
                     reads.insert(*variable, Arc::clone(&b));
                     b
                 }
             }),
+            Some(Patch::Reads { variables: chosen }) => {
+                e.blocks(variables)?;
+                let parts = chosen.iter().map(|i| rows_of(&variables[*i])).collect::<Result<Vec<_>, _>>()?;
+                let views: Vec<_> = parts.iter().map(|m| m.view()).collect();
+                let q = span(ndarray::concatenate(Axis(0), &views).map_err(error)?.view())?;
+                basis.push(Arc::new(Basis { block: variables[chosen[0]].block, complement: false, span: upload(q)? }));
+            }
             Some(Patch::Complement { .. }) => {
                 for block in e.blocks(variables)? {
                     basis.push(match complements.get(&block) {
@@ -466,12 +524,12 @@ fn design_with(
                             }
                             let parts = variables.iter().filter(|v| v.block == block).map(&rows_of).collect::<Result<Vec<_>, _>>()?;
                             let q = if parts.is_empty() {
-                                None
+                                Span::Empty
                             } else {
                                 let views: Vec<_> = parts.iter().map(|m| m.view()).collect();
                                 span(ndarray::concatenate(Axis(0), &views).map_err(error)?.view())?
                             };
-                            let b = Arc::new(Basis { block, complement: true, q: upload(q)? });
+                            let b = Arc::new(Basis { block, complement: true, span: upload(q)? });
                             complements.insert(block, Arc::clone(&b));
                             b
                         }
@@ -488,9 +546,8 @@ fn design_with(
 /// (read) or `s + (h − s) Q Qᵀ` (complement).
 fn exchange(d: &Device, value: &mut Tensor, at: usize, s: &Tensor, basis: &Basis, arithmetic: Arithmetic) -> Result<(), String> {
     let rows = s.rows();
-    let Some(q) = &basis.q else {
-        // An empty span: a read patch changes nothing, a complement patch takes the source whole.
-        return if basis.complement { d.set_rows(value, at, s).map_err(error) } else { Ok(()) };
+    let Span::Part(q) = &basis.span else {
+        return if basis.extreme() == Some(true) { d.set_rows(value, at, s).map_err(error) } else { Ok(()) };
     };
     let h = d.rows_of(value, at, rows).map_err(error)?;
     let mut difference = d.copy(s).map_err(error)?;
@@ -505,8 +562,8 @@ fn exchange(d: &Device, value: &mut Tensor, at: usize, s: &Tensor, basis: &Basis
 /// The transpose of [`exchange`] on rows `at..at + rows` of the read cotangent `g`: the base's
 /// part stays in `g`, the source's is returned (none when it is zero).
 fn exchange_cotangent(d: &Device, g: &mut Tensor, at: usize, rows: usize, basis: &Basis, arithmetic: Arithmetic) -> Result<Option<Tensor>, String> {
-    let Some(q) = &basis.q else {
-        if !basis.complement {
+    let Span::Part(q) = &basis.span else {
+        if basis.extreme() != Some(true) {
             return Ok(None);
         }
         let source = d.rows_of(g, at, rows).map_err(error)?;
@@ -1140,32 +1197,6 @@ impl Interchange {
             return Err(error("a read variable outside its operator"));
         }
         Ok(all.slice(s![rows.clone(), ..]).to_owned())
-    }
-
-    /// Per block, whether the reads of `variables` there, at the trainable operators' values
-    /// `values`, leave a nonempty complement: their span (resolved from zero by its rounding band)
-    /// is not the whole stream.
-    pub fn complements(&self, variables: &[ReadVariable], values: &[ndarray::Array2<f64>]) -> Result<Vec<bool>, String> {
-        if values.len() != self.trainable.len() {
-            return Err(error("one value per trainable operator required"));
-        }
-        let width = self.p.widths()[self.p.hidden()];
-        (0..self.m_sites.entries.len())
-            .map(|b| {
-                let mut parts = Vec::new();
-                for v in variables.iter().filter(|v| v.block == b) {
-                    for (op, rows) in &v.parts {
-                        parts.push(self.host_rows(values, *op, rows)?);
-                    }
-                }
-                if parts.is_empty() {
-                    return Ok(true);
-                }
-                let views: Vec<_> = parts.iter().map(|m| m.view()).collect();
-                let rank = span(ndarray::concatenate(Axis(0), &views).map_err(error)?.view())?.map_or(0, |q| q.ncols());
-                Ok(rank < width)
-            })
-            .collect()
     }
 
     /// `M`'s targets for `experiments` on `batch` under `design` ([`targets`]).

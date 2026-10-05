@@ -52,7 +52,12 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
-    let (program, family) = fixture_sized(D, VOCAB, LENGTH, 6);
+    fixture_at(D)
+}
+
+/// [`fixture`] at stream width `width`.
+fn fixture_at(width: usize) -> Fixture {
+    let (program, family) = fixture_sized(width, VOCAB, LENGTH, 6);
     let native = split_sites(&program).expect("split");
     let layers = layer_nodes(&native, LAYERS).expect("layers");
     let (flat, entries, reads) = sites(&Artifact::native(&native).expect("native artifact"), &layers).expect("sites");
@@ -177,6 +182,7 @@ fn reference(f: &Fixture, e: &Experiment) -> Vec<f64> {
     // Per patched block: its rows, and whether the patch takes their complement.
     let sites: Vec<(usize, Vec<Array2<f64>>, bool)> = match patch {
         Patch::Read { variable } => vec![(f.variables[*variable].block, rows_of(&f.variables[*variable]), false)],
+        Patch::Reads { variables } => vec![(f.variables[variables[0]].block, variables.iter().flat_map(|v| rows_of(&f.variables[*v])).collect(), false)],
         Patch::Complement { blocks } => blocks.iter().map(|&b| (b, f.variables.iter().filter(|v| v.block == b).flat_map(rows_of).collect(), true)).collect(),
     };
     let projectors: Vec<Array2<f64>> = sites
@@ -185,7 +191,7 @@ fn reference(f: &Fixture, e: &Experiment) -> Vec<f64> {
             let views: Vec<_> = parts.iter().map(|m| m.view()).collect();
             let rows = ndarray::concatenate(Axis(0), &views).expect("rows");
             // More rows than coordinates span everything: the projector is the identity.
-            if rows.nrows() >= D { Array2::eye(D) } else { projector(&rows) }
+            if rows.nrows() >= rows.ncols() { Array2::eye(rows.ncols()) } else { projector(&rows) }
         })
         .collect();
     let (m_reads, p_reads) = (native(f, source, &[]).1, hybrid(f, source, &e.explained, &[]).1);
@@ -219,6 +225,9 @@ fn experiments(f: &Fixture) -> Vec<Experiment> {
         e(4, 0, [t, n, t, n], Some(Patch::Complement { blocks: vec![0, 3] }), 1),
         e(3, 5, [n, t, t, t], Some(Patch::Complement { blocks: vec![0, 2, 3] }), 0),
         e(0, 4, [t, t, t, t], Some(Patch::Complement { blocks: vec![2, 3] }), 4),
+        // Joint read patches of several variables of one block.
+        e(2, 4, [t, t, n, n], Some(Patch::Reads { variables: vec![read(3, 0), read(3, 2), read(3, 7)] }), 2),
+        e(5, 3, [n, t, t, n], Some(Patch::Reads { variables: vec![read(2, 0), read(2, 2)] }), 1),
     ]
 }
 
@@ -277,7 +286,7 @@ fn the_model_explains_itself_exactly() {
     let head = FixedHead::new(&device, &f.m.flat, &f.m.flat, 4).expect("head");
     let mm = Model::new(&m, &f.m.flat, f.m.entries.clone(), f.m.reads.clone(), &[]).expect("M model");
     let pm = Model::new(&p, &f.m.flat, f.m.entries.clone(), f.m.reads.clone(), &f.trainable).expect("P model");
-    let experiments = sample(&mut rand::rngs::StdRng::seed_from_u64(5), f.batch.base.len(), &f.variables, &[true; 2 * LAYERS], LENGTH).expect("sample");
+    let experiments = sample(&mut rand::rngs::StdRng::seed_from_u64(5), f.batch.base.len(), &f.variables, 2 * LAYERS, LENGTH).expect("sample");
     let design = design(&pm, &f.variables, &experiments).expect("design");
     let targets = targets(&mm, &head, &f.batch, &experiments, &design).expect("targets");
     let evaluation = evaluate(&mm, &pm, &head, &f.batch, &targets, &experiments, &design, true).expect("evaluate");
@@ -331,14 +340,14 @@ fn the_gradient_matches_central_differences() {
 
 #[test]
 fn sampling_draws_each_family_with_its_stated_weight() {
-    // Six blocks, three read variables at each except block 1, which has none; blocks 1 and 3
-    // leave a complement. Per base: P alone with probability 1/2; the block uniform; at block 1
-    // the complement, at block 3 the complement with probability 1/2, elsewhere a read.
-    let variables: Vec<ReadVariable> = (0..6).filter(|b| *b != 1).flat_map(|b| (0..3).map(move |i| ReadVariable { block: b, parts: vec![(b, i..i + 1)] })).collect();
-    let complements = [false, true, false, true, false, false];
+    // Six blocks of three read variables each. Per base: P alone with probability 1/2; the block
+    // uniform; then one variable (probability 1/2) or a joint patch of each variable with
+    // probability 1/2, drawn again when empty.
+    let variables: Vec<ReadVariable> = (0..6).flat_map(|b| (0..3).map(move |i| ReadVariable { block: b, parts: vec![(b, i..i + 1)] })).collect();
     let n = 6000;
-    let experiments = sample(&mut rand::rngs::StdRng::seed_from_u64(11), n, &variables, &complements, 9).expect("sample");
+    let experiments = sample(&mut rand::rngs::StdRng::seed_from_u64(11), n, &variables, 6, 9).expect("sample");
     assert_eq!(experiments.len(), 2 * n);
+    let mut joint_sizes = 0;
     for (i, pair) in experiments.chunks(2).enumerate() {
         assert_eq!((pair[0].base, pair[1].base, pair[1].source), (i, i, i));
         assert!(pair[0].patch.is_none() && pair[1].patch.is_some());
@@ -346,27 +355,144 @@ fn sampling_draws_each_family_with_its_stated_weight() {
         assert_eq!(pair[0].explained, pair[1].explained);
         assert!(pair[0].position == 0 && pair[1].position < 9);
         assert!(pair[0].explained.len() == 6 && pair[0].explained.contains(&true));
-        if let Some(Patch::Complement { blocks }) = &pair[1].patch {
-            assert!(blocks.len() == 1 && complements[blocks[0]]);
+        if let Some(Patch::Reads { variables: chosen }) = &pair[1].patch {
+            let block = variables[chosen[0]].block;
+            assert!(!chosen.is_empty() && chosen.windows(2).all(|w| w[0] < w[1]) && chosen.iter().all(|v| variables[*v].block == block));
+            joint_sizes += chosen.len();
         }
     }
     // Each count within five standard deviations of its binomial expectation.
-    let within = |count: usize, p: f64| {
-        let (mean, sd) = (n as f64 * p, (n as f64 * p * (1.0 - p)).sqrt());
-        assert!((count as f64 - mean).abs() <= 5.0 * sd, "{count} against {mean} ± {sd}");
+    let within = |count: f64, trials: f64, p: f64| {
+        let (mean, sd) = (trials * p, (trials * p * (1.0 - p)).sqrt());
+        assert!((count - mean).abs() <= 5.0 * sd, "{count} against {mean} ± {sd}");
     };
     let counts = census(&experiments, &variables);
     // A hybrid draw is P alone with probability 1/6 (its size uniform in 1..=6).
-    within(counts["clean_alone"], 0.5 + 0.5 / 6.0);
-    within(counts["complement"], 1.0 / 6.0 + 0.5 / 6.0);
-    within(counts["read_attention"], 3.0 / 6.0);
-    within(counts["read_mlp"], 0.5 / 6.0 + 1.0 / 6.0);
+    within(counts["clean_alone"] as f64, n as f64, 0.5 + 0.5 / 6.0);
+    within(counts["read_attention"] as f64, n as f64, 0.25);
+    within(counts["read_mlp"] as f64, n as f64, 0.25);
+    within(counts["read_joint"] as f64, n as f64, 0.5);
+    assert_eq!(counts["complement"], 0);
+    // A joint subset of three, each in with probability 1/2 and drawn again when empty: mean size
+    // (3/2) / (1 - 1/8) = 12/7, each size's count within five standard deviations.
+    let joints = counts["read_joint"] as f64;
+    let mean = joint_sizes as f64 / joints;
+    let variance = (3.0 * 4.0 + 3.0 * 1.0 + 1.0 * 9.0) / 7.0 - (12.0 / 7.0) * (12.0 / 7.0);
+    assert!((mean - 12.0 / 7.0).abs() <= 5.0 * (variance / joints).sqrt(), "mean joint size {mean}");
     // Every size 1..=6 appears, and a non-prefix set does: the hybrids are not only cuts.
     let sizes: std::collections::BTreeSet<usize> = experiments.iter().map(|e| e.explained.iter().filter(|x| **x).count()).collect();
     assert_eq!(sizes, (1..=6).collect());
     assert!(experiments.iter().any(|e| e.explained.windows(2).any(|w| !w[0] && w[1])));
     let positions: std::collections::BTreeSet<usize> = experiments.iter().filter(|e| e.patch.is_some()).map(|e| e.position).collect();
     assert_eq!(positions, (0..9).collect());
+    // A block without a read variable cannot be patched.
+    assert!(sample(&mut rand::rngs::StdRng::seed_from_u64(11), 2, &variables[3..], 6, 9).is_err());
+}
+
+#[test]
+fn joint_patches_spanning_the_stream_match_the_host_reference() {
+    // At width 8 a block's 16 MLP reads span the whole stream: a joint patch of them takes the
+    // source's read whole, and their complement keeps the base's.
+    let f = fixture_at(8);
+    let at_block = |b: usize| -> Vec<usize> { f.variables.iter().enumerate().filter(|(_, v)| v.block == b).map(|(i, _)| i).collect() };
+    let mlp = at_block(3);
+    assert!(mlp.len() >= 8);
+    let e = |patch: Patch, position: usize| Experiment { base: 1, source: 2, explained: vec![true, false, true, true], patch: Some(patch), position };
+    let experiments = vec![
+        e(Patch::Reads { variables: mlp.clone() }, 2),
+        e(Patch::Reads { variables: mlp[..9].to_vec() }, 4),
+        e(Patch::Reads { variables: mlp[..3].to_vec() }, 1),
+        e(Patch::Read { variable: mlp[5] }, 3),
+        e(Patch::Complement { blocks: vec![3] }, 0),
+    ];
+    for device in devices() {
+        let programs = programs(&device, &f);
+        let (m, p) = models(&f, &programs);
+        let design = design(&p, &f.variables, &experiments).expect("design");
+        let targets = targets(&m, &programs.head, &f.batch, &experiments, &design).expect("targets");
+        let evaluation = evaluate(&m, &p, &programs.head, &f.batch, &targets, &experiments, &design, false).expect("evaluate");
+        for (e, bits) in experiments.iter().zip(&evaluation.bits) {
+            for (a, b) in bits.iter().zip(reference(&f, e)) {
+                assert!((a - b).abs() <= 1e-9, "{e:?}: device {a} bits, host {b} bits");
+            }
+        }
+    }
+}
+
+#[test]
+fn many_dropped_reads_that_matter_little_alone_matter_jointly() {
+    // M's last MLP gets n functions whose gate rows g_k put every base read at -L and the source's
+    // read at the patched position at +L (GELU leaves them off on the base, on at the source), and
+    // whose outputs are a small common ε u (u the stream's first coordinate). P drops them. The rows are g_k = g₀ + η_k: g₀ the
+    // least-norm solution of those constraints, η_k orthogonal and λ = 30 |g₀| long in their null
+    // space, so a patch of one g_k moves another's input by 2L/(1 + 30²) only. A single patch
+    // turns one function on (output change ε L u), the joint patch all n (n ε L u): to second
+    // order the joint divergence is n² times a single one, while the base never sees them.
+    let f = fixture();
+    let (n, epsilon, at, big) = (8, 1e-4, 3, 10.0);
+    let host = Device::host();
+    let base = f.batch.base[0].clone();
+    let source = f.batch.source[1].clone();
+    let reads = native(&f, &base, &[]).1[3].clone();
+    let source_read = native(&f, &source, &[]).1[3].row(at).to_owned();
+    let mut rows = reads.clone();
+    rows.push_row(source_read.view()).expect("rows");
+    let rhs: Vec<f64> = (0..rows.nrows()).map(|r| if r + 1 == rows.nrows() { big } else { -big }).collect();
+    // A = rowsᵀ = Q R: the least-norm g₀ = Q₁ R₁⁻ᵀ rhs, the null space Q's remaining columns.
+    let decomposition = qr(rows.t(), QrMode::Full).expect("qr");
+    let (q, r) = (decomposition.q.expect("q"), decomposition.r);
+    let k = rows.nrows();
+    let mut y = vec![0.0; k];
+    for i in 0..k {
+        y[i] = (rhs[i] - (0..i).map(|j| r[[j, i]] * y[j]).sum::<f64>()) / r[[i, i]];
+    }
+    let g0 = (0..k).fold(ndarray::Array1::<f64>::zeros(D), |acc, i| acc + &(q.column(i).to_owned() * y[i]));
+    let lambda = 30.0 * g0.dot(&g0).sqrt();
+    let up = f.m.flat.operators.iter().position(|op| op.name == "blocks.1.c_fc").expect("layer 1 MLP input");
+    let down = f.m.flat.operators.iter().position(|op| op.name == "blocks.1.down_proj").expect("layer 1 MLP output");
+    let mut gates = f.m.flat.operators[up].matrix();
+    let mut outputs = f.m.flat.operators[down].matrix();
+    for unit in 0..n {
+        gates.row_mut(unit).assign(&(&g0 + &(q.column(k + unit).to_owned() * lambda)));
+        outputs.column_mut(unit).fill(0.0);
+        outputs[[0, unit]] = epsilon;
+    }
+    let replaced = |flat: &OperatorProgram, op: usize, values: Array2<f64>| -> OperatorProgram {
+        let mut out = flat.clone();
+        let old = &flat.operators[op];
+        let precision = exact_precision(values.iter().copied()).expect("finite");
+        out.operators[op] = Arc::new(Operator::dense(old.name.clone(), old.rows.clone(), old.cols.clone(), values, precision, old.provenance.clone()).expect("dense"));
+        out
+    };
+    let m_flat = replaced(&replaced(&f.m.flat, up, gates.clone()), down, outputs);
+    let mut dropped = gates.clone();
+    dropped.rows_mut().into_iter().take(n).for_each(|mut row| row.fill(0.0));
+    let p_flat = replaced(&m_flat, up, dropped);
+    let head = Head::of(&m_flat).expect("head");
+    let m_program = DeviceProgram::compile_values(&host, &head.prefix(&m_flat)).expect("M");
+    let mut p_program = DeviceProgram::compile_values(&host, &head.prefix(&p_flat)).expect("P");
+    p_program.prepare_dense_parameters(&[up]).expect("parameters");
+    // M's directions, read from a copy of M holding its gate rows as a parameter.
+    let mut directions = DeviceProgram::compile_values(&host, &head.prefix(&m_flat)).expect("M's directions");
+    directions.prepare_dense_parameters(&[up]).expect("parameters");
+    let fixed_head = FixedHead::new(&host, &m_flat, &p_flat, 5).expect("head");
+    let m = Model::new(&m_program, &m_flat, f.m.entries.clone(), f.m.reads.clone(), &[]).expect("M model");
+    let p = Model::new(&p_program, &p_flat, f.m.entries.clone(), f.m.reads.clone(), &[up]).expect("P model");
+    let native_reads = Model::new(&directions, &m_flat, f.m.entries.clone(), f.m.reads.clone(), &[up]).expect("M's reads");
+    let variables: Vec<ReadVariable> = (0..n).map(|unit| ReadVariable { block: 3, parts: vec![(up, unit..unit + 1)] }).collect();
+    let batch = Batch::new(vec![base], vec![source]).expect("batch");
+    let e = |patch: Option<Patch>| Experiment { base: 0, source: 0, explained: vec![true; 2 * LAYERS], patch, position: at };
+    let mut experiments: Vec<Experiment> = (0..n).map(|v| e(Some(Patch::Read { variable: v }))).collect();
+    experiments.push(e(Some(Patch::Reads { variables: (0..n).collect() })));
+    experiments.push(e(None));
+    let design = design(&native_reads, &variables, &experiments).expect("design");
+    let targets = targets(&m, &fixed_head, &batch, &experiments, &design).expect("targets");
+    let bits: Vec<f64> = evaluate(&m, &p, &fixed_head, &batch, &targets, &experiments, &design, false).expect("evaluate").bits.iter().map(|b| b.iter().sum()).collect();
+    let (single, joint, clean) = (bits[..n].iter().copied().fold(0.0, f64::max), bits[n], bits[n + 1]);
+    assert!(clean.abs() <= 1e-12, "the dropped functions are off on the base: {clean} bits");
+    assert!(single <= 1e-3, "one dropped read alone: {single} bits");
+    let ratio = joint / bits[..n].iter().sum::<f64>() * n as f64;
+    assert!(ratio >= 0.9 * (n * n) as f64 && ratio <= 1.1 * (n * n) as f64, "joint {joint} bits against {n}² times a mean single, ratio {ratio}");
 }
 
 #[test]

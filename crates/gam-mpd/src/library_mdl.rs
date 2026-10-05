@@ -54,8 +54,11 @@
 //! seed: per training base sequence, one clean experiment and one patched experiment under the
 //! same hybrid, with the stated weights of `interchange::sample` (`P` alone or a random
 //! block-subset hybrid with probability ½ each; the patched block uniform over the `2L` blocks,
-//! then a complement where `M`'s reads leave one, else a read variable uniform within the block,
-//! then a position). A base's source is another training sequence, drawn uniformly. The variables
+//! then with probability ½ one read variable uniform within the block, else a joint read patch of
+//! a random subset of the block's variables, each included with probability ½; then a position).
+//! `M`'s reads span every block's whole stream, so the complement of `M`'s reads is empty; the
+//! collection covers every one of `M`'s reads instead, those `P` removes included, one at a time
+//! and jointly. A base's source is another training sequence, drawn uniformly. The variables
 //! and patch directions are `M`'s own reads (the library's start): the questions do not move as
 //! `P` learns or loses functions, so `F`, the convergence test and every removal comparison score
 //! the same experiments, and `M`'s targets for them are made once per batch and kept
@@ -718,12 +721,13 @@ pub struct HeldOut {
     /// `Σ_G KL(q_G ‖ p_G)` and the active groups' variances `Σ ½ log2 |G|`, in bits.
     pub divergence_bits: f64,
     pub variance_bits: f64,
-    /// At the posterior mean: clean and patched experiments per cut `ℓ = 1..=L` (`ℓ = L` is the
-    /// explanation alone), and the patched ones by kind.
+    /// At the posterior mean: clean and patched experiments per hybrid size `k = 1..=2L` (`k = 2L`
+    /// is the explanation alone), and the patched ones by kind: one read variable, or a joint
+    /// patch of several.
     pub clean: Vec<Option<f64>>,
     pub patched: Vec<Option<f64>>,
     pub read_patch: Option<f64>,
-    pub complement_patch: Option<f64>,
+    pub joint_patch: Option<f64>,
     /// The patched experiments with directions at `P`'s own reads (the posterior mean) instead of
     /// `M`'s: adaptive questions, reported apart and never trained on.
     pub adaptive_patch: Option<f64>,
@@ -830,11 +834,11 @@ impl Draw {
         Batch::new(pick(&self.bases), pick(&self.sources))
     }
 
-    /// Per base one clean and one patched experiment over `variables`, complements where
-    /// `complements` (`interchange::sample`), from the batch's seed.
-    fn experiments(&self, sequences: &[Vec<u32>], variables: &[ReadVariable], complements: &[bool]) -> Result<Vec<Experiment>, String> {
+    /// Per base one clean and one patched experiment over `variables` in `blocks` blocks
+    /// (`interchange::sample`), from the batch's seed.
+    fn experiments(&self, sequences: &[Vec<u32>], variables: &[ReadVariable], blocks: usize) -> Result<Vec<Experiment>, String> {
         let length = self.bases.first().map_or(0, |b| sequences[*b].len());
-        interchange::sample(&mut StdRng::seed_from_u64(self.seed), self.bases.len(), variables, complements, length)
+        interchange::sample(&mut StdRng::seed_from_u64(self.seed), self.bases.len(), variables, blocks, length)
     }
 }
 
@@ -916,8 +920,9 @@ struct Scorer {
     mlps: Vec<Mlp>,
     /// Each trainable operator's position in `Explanation::trainable`.
     position: BTreeMap<usize, usize>,
-    /// Per block, whether `M`'s reads there leave a nonempty complement.
-    complements: Vec<bool>,
+    /// The patch directions of each kept batch of experiments (by key), with its experiments'
+    /// fingerprint: fixed data, decomposed once.
+    designs: BTreeMap<String, (u64, Arc<interchange::Design>)>,
     /// `M`'s read variables and the library's starting values (`M`'s reads): the fixed variables
     /// and directions of every experiment.
     variables: Vec<ReadVariable>,
@@ -934,7 +939,6 @@ impl Scorer {
             Interchange::new(device, native, &sites, &explanation.artifact, &explanation.trainable, reads, settings.numeric_bytes, settings.head_tile_rows)?;
         // The library starts at M, so its starting values are M's reads.
         let start: Vec<Array2<f64>> = explanation.trainable.iter().map(|op| explanation.artifact.program.operators[*op].matrix()).collect();
-        let complements = experiments.complements(experiments.variables(), &start)?;
         let variables = experiments.variables().to_vec();
         if let Some(dir) = &shards {
             std::fs::create_dir_all(dir).map_err(error)?;
@@ -942,7 +946,7 @@ impl Scorer {
         let (flat, _, _) = interchange::sites(&explanation.artifact, &sites)?;
         let mlps = (0..sites.len()).map(|l| Mlp::of(&flat, l)).collect::<Result<_, _>>()?;
         let position = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
-        Ok(Self { experiments, mlps, position, complements, variables, start, shards })
+        Ok(Self { experiments, mlps, position, designs: BTreeMap::new(), variables, start, shards })
     }
 
     fn layers(&self) -> usize {
@@ -955,7 +959,7 @@ impl Scorer {
 
     /// The batch's experiments from `draw`: the fixed collection's for that batch.
     fn experiments(&self, draw: &Draw, sequences: &[Vec<u32>]) -> Result<Vec<Experiment>, String> {
-        draw.experiments(sequences, &self.variables, &self.complements)
+        draw.experiments(sequences, &self.variables, 2 * self.layers())
     }
 
     /// `KL(M_e ‖ P_e)` per scored token in bits for `experiments` on `batch` at the explanation's
@@ -993,9 +997,16 @@ impl Scorer {
 
     /// The patch directions of `experiments` and `M`'s targets on them, from the shard `key` when
     /// the fit keeps them.
-    fn targets(&mut self, batch: &Batch, experiments: &[Experiment], key: &str) -> Result<(interchange::Design, Targets), String> {
-        let design = self.experiments.design_at(&self.variables, experiments, &self.start)?;
+    fn targets(&mut self, batch: &Batch, experiments: &[Experiment], key: &str) -> Result<(Arc<interchange::Design>, Targets), String> {
         let fingerprint = interchange::fingerprint(batch, experiments);
+        let design = match self.designs.get(key).filter(|(f, _)| *f == fingerprint) {
+            Some((_, design)) => Arc::clone(design),
+            None => {
+                let design = Arc::new(self.experiments.design_at(&self.variables, experiments, &self.start)?);
+                self.designs.insert(key.to_string(), (fingerprint, Arc::clone(&design)));
+                design
+            }
+        };
         let path = self.shards.as_ref().map(|dir| dir.join(format!("{key}.bin")));
         let kept = match &path {
             Some(path) if path.exists() => Targets::read(self.experiments.models().0.program.device(), self.experiments.head(), path, fingerprint)?,
@@ -1093,7 +1104,7 @@ fn held_out(
     let blocks = 2 * scorer.layers();
     let variables = scorer.variables.clone();
     let (mut clean, mut patched) = (vec![Mean::default(); blocks], vec![Mean::default(); blocks]);
-    let (mut read, mut complement, mut sampled, mut adaptive) = (Mean::default(), Mean::default(), Mean::default(), Mean::default());
+    let (mut read, mut joint, mut sampled, mut adaptive) = (Mean::default(), Mean::default(), Mean::default(), Mean::default());
     let size = |e: &Experiment| e.explained.iter().filter(|x| **x).count();
     for (b, draw) in draws(sequences.len(), settings.batch_sequences, settings.seed)?.iter().enumerate() {
         let batch = draw.batch(sequences)?;
@@ -1101,7 +1112,7 @@ fn held_out(
         let mut rng = StdRng::seed_from_u64(draw.seed);
         let mut experiments = Vec::with_capacity(2 * blocks * draw.bases.len());
         for k in 1..=blocks {
-            let drawn = interchange::sample(&mut rng, draw.bases.len(), &variables, &scorer.complements, batch.length())?;
+            let drawn = interchange::sample(&mut rng, draw.bases.len(), &variables, blocks, batch.length())?;
             // A base's patched experiment shares its unpatched experiment's hybrid.
             for pair in drawn.chunks(2) {
                 let explained = interchange::hybrid_of(&mut rng, blocks, k);
@@ -1117,7 +1128,7 @@ fn held_out(
                     patched[size(e) - 1].add(bits);
                     match patch {
                         Patch::Read { .. } => read.add(bits),
-                        Patch::Complement { .. } => complement.add(bits),
+                        Patch::Reads { .. } | Patch::Complement { .. } => joint.add(bits),
                     }
                 }
             }
@@ -1138,7 +1149,7 @@ fn held_out(
         clean: clean.iter().map(Mean::mean).collect(),
         patched: patched.iter().map(Mean::mean).collect(),
         read_patch: read.mean(),
-        complement_patch: complement.mean(),
+        joint_patch: joint.mean(),
         adaptive_patch: adaptive.mean(),
         layers: activity(scorer, explanation, posterior, sequences, settings)?,
     })
