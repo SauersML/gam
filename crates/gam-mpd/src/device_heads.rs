@@ -229,48 +229,13 @@ fn step(heads: &Heads, blocks: usize, length: usize) -> usize {
     (SCORES / per_key).clamp(1, heads.keys)
 }
 
-/// The head-major copies of `n` heads of width `width` from column `start` of `x`: row
-/// `(b·n + h)·L + l` is row `b·L + l`'s columns `start + h·width ..`, turned by `turn`.
-fn split_heads(d: &Device, x: &Tensor, start: usize, n: usize, width: usize, blocks: usize, turn: Turn<'_>, inverse: bool) -> Result<Tensor, GpuError> {
-    let length = x.rows() / blocks;
-    let mut out = d.zeros(x.rows() * n, width)?;
-    for h in 0..n {
-        let mut part = d.columns_of(x, start + h * width..start + (h + 1) * width)?;
-        if let Some((cos, sin, half_split)) = turn {
-            part = d.rotate(&part, cos, sin, half_split, inverse)?;
-        }
-        for b in 0..blocks {
-            d.set_rows(&mut out, (b * n + h) * length, &d.rows_of(&part, b * length, length)?)?;
-        }
-    }
-    Ok(out)
-}
-
-/// [`split_heads`]' inverse: the head-major `x` written into columns `start..` of `out`, turned by
-/// `turn` backwards when `inverse`.
-fn merge_heads(d: &Device, x: &Tensor, out: &mut Tensor, start: usize, n: usize, blocks: usize, turn: Turn<'_>, inverse: bool) -> Result<(), GpuError> {
-    let (rows, width) = (out.rows(), x.cols());
-    let length = rows / blocks;
-    for h in 0..n {
-        let mut part = d.zeros(rows, width)?;
-        for b in 0..blocks {
-            d.set_rows(&mut part, b * length, &d.rows_of(x, (b * n + h) * length, length)?)?;
-        }
-        if let Some((cos, sin, half_split)) = turn {
-            part = d.rotate(&part, cos, sin, half_split, inverse)?;
-        }
-        d.set_columns(out, start + h * width, &part)?;
-    }
-    Ok(())
-}
-
 /// Key heads `first..first + n`'s queries, keys and values from `P`, head-major and turned.
 fn split(d: &Device, heads: &Heads, p: &Tensor, (first, n): (usize, usize), blocks: usize, turn: Turn<'_>) -> Result<(Tensor, Tensor, Tensor), GpuError> {
     let (w, g) = (heads.width, heads.group());
     Ok((
-        split_heads(d, p, first * g * w, n * g, w, blocks, turn, false)?,
-        split_heads(d, p, (heads.heads + first) * w, n, w, blocks, turn, false)?,
-        split_heads(d, p, (heads.heads + heads.keys + first) * w, n, w, blocks, None, false)?,
+        d.split_heads(p, first * g * w, n * g, w, blocks, turn, false)?,
+        d.split_heads(p, (heads.heads + first) * w, n, w, blocks, turn, false)?,
+        d.split_heads(p, (heads.heads + heads.keys + first) * w, n, w, blocks, None, false)?,
     ))
 }
 
@@ -308,7 +273,7 @@ fn attend_by(d: &Device, heads: &Heads, p: &Tensor, blocks: usize, turn: Turn<'_
         let alpha = weights(d, heads, (&q, &k), blocks * n, arithmetic)?;
         let mut out = d.zeros(q.rows(), heads.width)?;
         d.gemm_batched(blocks * n, &mut out, 1.0, &alpha, Op::N, &v, Op::N, 0.0, arithmetic)?;
-        merge_heads(d, &out, &mut a, first * heads.group() * heads.width, n * heads.group(), blocks, None, false)?;
+        d.merge_heads(&out, &mut a, first * heads.group() * heads.width, n * heads.group(), blocks, None, false)?;
     }
     Ok(a)
 }
@@ -336,7 +301,7 @@ fn backward_by(
         let n = step.min(heads.keys - first);
         let batch = blocks * n;
         let (q, k, v) = split(d, heads, p, (first, n), blocks, turn)?;
-        let cot = split_heads(d, g_a, first * g * w, n * g, w, blocks, None, false)?;
+        let cot = d.split_heads(g_a, first * g * w, n * g, w, blocks, None, false)?;
         let alpha = weights(d, heads, (&q, &k), batch, forward)?;
         let mut dalpha = d.zeros(alpha.rows(), alpha.cols())?;
         d.gemm_batched(batch, &mut dalpha, 1.0, &cot, Op::N, &v, Op::T, 0.0, arithmetic)?;
@@ -348,9 +313,9 @@ fn backward_by(
         d.gemm_batched(batch, &mut gq, heads.scale, &ds, Op::N, &k, Op::N, 0.0, arithmetic)?;
         let mut gk = d.zeros(k.rows(), w)?;
         d.gemm_batched(batch, &mut gk, heads.scale, &ds, Op::T, &q, Op::N, 0.0, arithmetic)?;
-        merge_heads(d, &gq, &mut g_p, first * g * w, n * g, blocks, turn, true)?;
-        merge_heads(d, &gk, &mut g_p, (heads.heads + first) * w, n, blocks, turn, true)?;
-        merge_heads(d, &gv, &mut g_p, (heads.heads + heads.keys + first) * w, n, blocks, None, false)?;
+        d.merge_heads(&gq, &mut g_p, first * g * w, n * g, blocks, turn, true)?;
+        d.merge_heads(&gk, &mut g_p, (heads.heads + first) * w, n, blocks, turn, true)?;
+        d.merge_heads(&gv, &mut g_p, (heads.heads + heads.keys + first) * w, n, blocks, None, false)?;
     }
     Ok(g_p)
 }

@@ -272,6 +272,35 @@ extern "C" __global__ void rotate_planes(unsigned int rows, unsigned int cols, u
     }
 }
 
+// Heads between a row-major `rows × cols` tensor's column blocks (`heads` of `width` from `start`)
+// and head-major order (row `(b·heads + h)·length + l` for row `b·length + l`): `merge` = 0 copies
+// row-major to head-major, 1 back. The first `2·planes` columns of each head turn by the tables
+// (`rows × planes`, pairing as `rotate_planes`, `sign` −1 backwards) on the way.
+extern "C" __global__ void heads_permute(unsigned int rows, unsigned int cols, unsigned int start, unsigned int heads, unsigned int width,
+                                         unsigned int length, unsigned int planes, int half_split, double sign, int merge,
+                                         const float* x, const float* cosines, const float* sines, float* out) {
+    GRID_STRIDE(i, (u64)rows * heads * width) {
+        unsigned int j = (unsigned int)(i % width);
+        u64 t = i / width;
+        unsigned int l = (unsigned int)(t % length);
+        t /= length;
+        unsigned int h = (unsigned int)(t % heads);
+        u64 r = (t / heads) * length + l;
+        u64 wide = r * cols + start + (u64)h * width, narrow = i - j;
+        const float* src = x + (merge ? narrow : wide);
+        float v = src[j];
+        if (j < 2 * planes) {
+            unsigned int p = half_split ? (j < planes ? j : j - planes) : j / 2;
+            int first = half_split ? j < planes : (j % 2) == 0;
+            unsigned int partner = half_split ? (first ? j + planes : j - planes) : (first ? j + 1 : j - 1);
+            float c = cosines[r * planes + p], s = (float)sign * sines[r * planes + p];
+            float o = src[partner];
+            v = first ? c * v - s * o : s * o + c * v;
+        }
+        out[(merge ? wide : narrow) + j] = v;
+    }
+}
+
 extern "C" __global__ void softmax_rows(unsigned int rows, unsigned int width, int causal, unsigned int start, unsigned int period, float* s) {
     __shared__ float shared[WARPS];
     unsigned int r = blockIdx.x;

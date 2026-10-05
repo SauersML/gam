@@ -1725,6 +1725,81 @@ impl Device {
         }
     }
 
+    /// Row `(b·heads + h)·L + l` of the result is columns `start + h·width ..` of row `b·L + l` of
+    /// `x` (`blocks` sequences of `L` rows): `heads` column blocks of width `width` copied
+    /// head-major, each turned by `turn` (rotation tables `rows × planes` and pairing, as
+    /// [`Device::rotate`]; backwards when `inverse`) in the same pass.
+    pub fn split_heads(&self, x: &Tensor, start: usize, heads: usize, width: usize, blocks: usize, turn: Option<(&Tensor, &Tensor, bool)>, inverse: bool) -> Result<Tensor, GpuError> {
+        let rows = x.rows;
+        if blocks == 0 || rows % blocks != 0 || start.checked_add(heads.saturating_mul(width)).is_none_or(|end| end > x.cols) {
+            return Err(shape(format!("{heads} heads of {width} from column {start} of {:?} in {blocks} blocks", x.dim())));
+        }
+        let mut out = self.zeros(rows * heads, width)?;
+        self.heads(x, &mut out, (start, heads, width, rows / blocks), turn, inverse, false)?;
+        Ok(out)
+    }
+
+    /// [`Device::split_heads`]' inverse: the head-major `x` (`blocks·heads·L × width`) written into
+    /// columns `start .. start + heads·width` of `out`, turned by `turn` when given.
+    pub fn merge_heads(&self, x: &Tensor, out: &mut Tensor, start: usize, heads: usize, blocks: usize, turn: Option<(&Tensor, &Tensor, bool)>, inverse: bool) -> Result<(), GpuError> {
+        let (rows, width) = (out.rows, x.cols);
+        if blocks == 0 || rows % blocks != 0 || x.rows != rows * heads || start.checked_add(heads.saturating_mul(width)).is_none_or(|end| end > out.cols) {
+            return Err(shape(format!("{:?} head-major into {heads} heads from column {start} of {:?} in {blocks} blocks", x.dim(), out.dim())));
+        }
+        self.heads(x, out, (start, heads, width, rows / blocks), turn, inverse, true)
+    }
+
+    /// The permutation of [`Device::split_heads`] (or, `merge`, its inverse) from `x` into `out`.
+    fn heads(&self, x: &Tensor, out: &mut Tensor, (start, heads, width, length): (usize, usize, usize, usize), turn: Option<(&Tensor, &Tensor, bool)>, inverse: bool, merge: bool) -> Result<(), GpuError> {
+        let rows = if merge { out.rows } else { x.rows };
+        let planes = turn.map_or(0, |(cos, _, _)| cos.cols);
+        if let Some((cos, sin, _)) = turn {
+            same(cos, sin, "rotation tables")?;
+            if cos.rows != rows || 2 * planes > width {
+                return Err(shape(format!("{:?} rotation tables on {rows} rows of {width}-wide heads", cos.dim())));
+            }
+        }
+        if rows == 0 || heads == 0 || width == 0 {
+            return Ok(());
+        }
+        let half_split = turn.is_some_and(|(_, _, h)| h);
+        match &*self.backend {
+            Backend::Host => {
+                let (xv, cols) = (host(x)?, if merge { out.cols } else { x.cols });
+                let (cv, sv) = match turn {
+                    Some((cos, sin, _)) => (host(cos)?, host(sin)?),
+                    None => (&[][..], &[][..]),
+                };
+                let sign = if inverse { -1.0 } else { 1.0 };
+                let ov = host_mut(out)?;
+                for i in 0..rows * heads * width {
+                    let (j, t) = (i % width, i / width);
+                    let (l, t) = (t % length, t / length);
+                    let (h, b) = (t % heads, t / heads);
+                    let r = b * length + l;
+                    let (wide, narrow) = (r * cols + start + h * width, i - j);
+                    let src = if merge { &xv[narrow..narrow + width] } else { &xv[wide..wide + width] };
+                    let mut v = src[j];
+                    if j < 2 * planes {
+                        let (p, first, partner) = if half_split {
+                            if j < planes { (j, true, j + planes) } else { (j - planes, false, j - planes) }
+                        } else {
+                            (j / 2, j % 2 == 0, if j % 2 == 0 { j + 1 } else { j - 1 })
+                        };
+                        let (c, s) = (cv[r * planes + p], sign * sv[r * planes + p]);
+                        v = if first { c * v - s * src[partner] } else { s * src[partner] + c * v };
+                    }
+                    ov[if merge { wide + j } else { narrow + j }] = v;
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.heads(x, out, (start, heads, width, length, planes), turn, (half_split, inverse, merge)),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.heads(x, out, (start, heads, width, length, planes), turn, (half_split, inverse, merge)),
+        }
+    }
+
     /// One Adam step in place: `m ← β₁ m + (1 − β₁) g`, `v ← β₂ v + (1 − β₂) g²`, `w ← w − rate ·
     /// (m / (1 − β₁ᵗ)) / (√(v / (1 − β₂ᵗ)) + ε)`, `t` the step's number from 1.
     pub fn adam(&self, w: &mut Tensor, (m, v): (&mut Tensor, &mut Tensor), g: &Tensor, rate: f64, (beta1, beta2, epsilon): (f64, f64, f64), step: u64) -> Result<(), GpuError> {
@@ -2230,6 +2305,35 @@ extern "C" __global__ void rotate_planes(unsigned int rows, unsigned int cols, u
         double xa = x[r * cols + a], xb = x[r * cols + b];
         out[r * cols + a] = c * xa - s * xb;
         out[r * cols + b] = s * xa + c * xb;
+    }
+}
+
+// Heads between a row-major `rows × cols` tensor's column blocks (`heads` of `width` from `start`)
+// and head-major order (row `(b·heads + h)·length + l` for row `b·length + l`): `merge` = 0 copies
+// row-major to head-major, 1 back. The first `2·planes` columns of each head turn by the tables
+// (`rows × planes`, pairing as `rotate_planes`, `sign` −1 backwards) on the way.
+extern "C" __global__ void heads_permute(unsigned int rows, unsigned int cols, unsigned int start, unsigned int heads, unsigned int width,
+                                         unsigned int length, unsigned int planes, int half_split, double sign, int merge,
+                                         const double* x, const double* cosines, const double* sines, double* out) {
+    GRID_STRIDE(i, (u64)rows * heads * width) {
+        unsigned int j = (unsigned int)(i % width);
+        u64 t = i / width;
+        unsigned int l = (unsigned int)(t % length);
+        t /= length;
+        unsigned int h = (unsigned int)(t % heads);
+        u64 r = (t / heads) * length + l;
+        u64 wide = r * cols + start + (u64)h * width, narrow = i - j;
+        const double* src = x + (merge ? narrow : wide);
+        double v = src[j];
+        if (j < 2 * planes) {
+            unsigned int p = half_split ? (j < planes ? j : j - planes) : j / 2;
+            int first = half_split ? j < planes : (j % 2) == 0;
+            unsigned int partner = half_split ? (first ? j + planes : j - planes) : (first ? j + 1 : j - 1);
+            double c = cosines[r * planes + p], s = sign * sines[r * planes + p];
+            double o = src[partner];
+            v = first ? c * v - s * o : s * o + c * v;
+        }
+        out[(merge ? wide : narrow) + j] = v;
     }
 }
 
@@ -3713,6 +3817,49 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             Ok(out)
         }
 
+        pub(super) fn heads(
+            &self,
+            x: &Tensor,
+            out: &mut Tensor,
+            (start, heads, width, length, planes): (usize, usize, usize, usize, usize),
+            turn: Option<(&Tensor, &Tensor, bool)>,
+            (half_split, inverse, merge): (bool, bool, bool),
+        ) -> Result<(), GpuError> {
+            let storage = x.storage();
+            let rows = if merge { out.rows } else { x.rows };
+            let cols = if merge { out.cols } else { x.cols };
+            let n = (rows * heads * width) as u64;
+            let (rows, cols, start, heads, width, length, planes) = (rows as u32, cols as u32, start as u32, heads as u32, width as u32, length as u32, planes as u32);
+            let (split, merge) = (i32::from(half_split), i32::from(merge));
+            let sign: f64 = if inverse { -1.0 } else { 1.0 };
+            // Without a rotation the tables are never read; `x` stands in for them.
+            let (cos, sin) = turn.map_or((x, x), |(c, s, _)| (c, s));
+            let f = self.kernel("heads_permute", storage)?;
+            // SAFETY: shapes checked by the caller: `x` and `out` hold `rows·heads·width` values in
+            // their layouts, the tables `rows × planes` when `planes > 0`.
+            unsafe {
+                self.stream
+                    .launch_builder(&f)
+                    .arg(&rows)
+                    .arg(&cols)
+                    .arg(&start)
+                    .arg(&heads)
+                    .arg(&width)
+                    .arg(&length)
+                    .arg(&planes)
+                    .arg(&split)
+                    .arg(&sign)
+                    .arg(&merge)
+                    .input(x, storage)?
+                    .input(cos, storage)?
+                    .input(sin, storage)?
+                    .output(out, storage)?
+                    .launch(cfg_elements(n))
+            }
+            .gpu_ctx("tensor heads_permute")?;
+            Ok(())
+        }
+
         pub(super) fn softmax_rows(&self, scores: &mut Tensor, causal: bool, start: usize, period: usize) -> Result<(), GpuError> {
             let (rows, width) = (scores.rows as u32, scores.cols as u32);
             let launch = cfg_rows(scores.rows);
@@ -4221,7 +4368,7 @@ using namespace metal;
 #define GROUP 256u
 
 // Every kernel's parameters; each reads the fields it names.
-struct P { uint n; uint rows; uint cols; uint extra; uint a; uint b; float alpha; float beta; };
+struct P { uint n; uint rows; uint cols; uint extra; uint a; uint b; float alpha; float beta; uint c; uint d; };
 
 #define ELEMENTS for (uint i = gid; i < p.n; i += grid)
 #define ROWS for (uint r = group; r < p.rows; r += groups)
@@ -4382,6 +4529,33 @@ kernel void t_rotate(device const float* x [[buffer(0)]], device const float* co
         float xa = x[r * p.cols + a], xb = x[r * p.cols + b];
         out[r * p.cols + a] = c * xa - s * xb;
         out[r * p.cols + b] = s * xa + c * xb;
+    }
+}
+
+// [`heads_permute`]: n: rows · heads · width; rows: the sequence length; cols: the row-major width;
+// extra: the first column; a: heads; b: width; c: planes; d: 1 half split, 2 merge; alpha: sign.
+kernel void t_heads(device const float* x [[buffer(0)]], device const float* cosines [[buffer(1)]], device const float* sines [[buffer(2)]],
+                    device float* out [[buffer(3)]], constant P& p [[buffer(4)]],
+                    uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    bool half_split = (p.d & 1) != 0, merge = (p.d & 2) != 0;
+    ELEMENTS {
+        uint j = i % p.b, t = i / p.b;
+        uint l = t % p.rows;
+        t /= p.rows;
+        uint h = t % p.a;
+        uint r = (t / p.a) * p.rows + l;
+        uint wide = r * p.cols + p.extra + h * p.b, narrow = i - j;
+        device const float* src = x + (merge ? narrow : wide);
+        float v = src[j];
+        if (j < 2 * p.c) {
+            uint q = half_split ? (j < p.c ? j : j - p.c) : j / 2;
+            bool first = half_split ? j < p.c : (j % 2) == 0;
+            uint partner = half_split ? (first ? j + p.c : j - p.c) : (first ? j + 1 : j - 1);
+            float c = cosines[r * p.c + q], s = p.alpha * sines[r * p.c + q];
+            float o = src[partner];
+            v = first ? c * v - s * o : s * o + c * v;
+        }
+        out[(merge ? wide : narrow) + j] = v;
     }
 }
 
@@ -5053,6 +5227,7 @@ kernel void t_code_rows(device const float* z [[buffer(0)]], device const float*
         "t_laws",
         "t_rms",
         "t_rotate",
+        "t_heads",
         "t_softmax_rows",
         "t_softmax_backward",
         "t_kl_rows",
@@ -5080,6 +5255,8 @@ kernel void t_code_rows(device const float* z [[buffer(0)]], device const float*
         b: u32,
         alpha: f32,
         beta: f32,
+        c: u32,
+        d: u32,
     }
 
     fn u32_of(n: usize) -> Result<u32, GpuError> {
@@ -5243,6 +5420,23 @@ kernel void t_code_rows(device const float* z [[buffer(0)]], device const float*
             let buffers = [whole(buffer(x)?), whole(buffer(cos)?), whole(buffer(sin)?), whole(buffer(&out)?)];
             self.elements("t_rotate", &buffers, x.rows * cos.cols, p)?;
             Ok(out)
+        }
+
+        pub(super) fn heads(
+            &self,
+            x: &Tensor,
+            out: &mut Tensor,
+            (start, heads, width, length, planes): (usize, usize, usize, usize, usize),
+            turn: Option<(&Tensor, &Tensor, bool)>,
+            (half_split, inverse, merge): (bool, bool, bool),
+        ) -> Result<(), GpuError> {
+            let rows = if merge { out.rows } else { x.rows };
+            let cols = if merge { out.cols } else { x.cols };
+            let flags = u32::from(half_split) | (u32::from(merge) << 1);
+            let p = P { rows: u32_of(length)?, cols: u32_of(cols)?, extra: u32_of(start)?, a: u32_of(heads)?, b: u32_of(width)?, c: u32_of(planes)?, d: flags, alpha: if inverse { -1.0 } else { 1.0 }, ..P::default() };
+            let (cos, sin) = turn.map_or((x, x), |(c, s, _)| (c, s));
+            let buffers = [whole(buffer(x)?), whole(buffer(cos)?), whole(buffer(sin)?), whole(buffer(out)?)];
+            self.elements("t_heads", &buffers, rows * heads * width, p)
         }
 
         pub(super) fn softmax_rows(&self, scores: &mut Tensor, causal: bool, start: usize, period: usize) -> Result<(), GpuError> {
