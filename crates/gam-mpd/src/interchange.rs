@@ -11,7 +11,8 @@
 //!   uniformly among the sets of that size, so the autonomous `P` (`k = 2L`) and each single
 //!   replacement keep probability `1/(2L)` and every combination of blocks is tested, not only
 //!   prefixes (exact abstraction under the identity alignment requires every hybrid to match `M`);
-//! * and at most one patch at one block `B`, applied by both models:
+//! * and patches at distinct blocks (none, one read patch, or the complements at a set of blocks),
+//!   applied by both models; at a block `B`:
 //!   - a read patch of one of `P`'s read variables at `B` (an MLP function's gate direction `g_i`,
 //!     or an attention function's query, key or value read map, a subspace), with orthonormal
 //!     basis `Q`: the read becomes `h + (s − h) Q Qᵀ`, the source's coordinates in the variable;
@@ -205,12 +206,14 @@ pub fn library_reads(program: &OperatorProgram, layers: usize) -> Result<Vec<Rea
     Ok(out)
 }
 
-/// A patch: one read variable (an index into the variables), or the complement of every read at
-/// one block.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A patch: one read variable (an index into the variables), or at each of the distinct blocks
+/// `blocks` (ascending) the complement of every read there. The complements at different blocks
+/// are distinct variables, so patching several at once is one joint intervention whose order does
+/// not matter; cancellation between blocks shows only under such joint patches.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Patch {
     Read { variable: usize },
-    Complement { block: usize },
+    Complement { blocks: Vec<usize> },
 }
 
 /// One experiment: base and source sequences (indices into the batch's), the hybrid (per block
@@ -224,11 +227,17 @@ pub struct Experiment {
 }
 
 impl Experiment {
-    fn block(&self, variables: &[ReadVariable]) -> Result<Option<usize>, String> {
-        Ok(match self.patch {
-            None => None,
-            Some(Patch::Read { variable }) => Some(variables.get(variable).ok_or_else(|| error("a patch of an unknown variable"))?.block),
-            Some(Patch::Complement { block }) => Some(block),
+    /// The patched blocks, ascending (none for an unpatched experiment).
+    fn blocks(&self, variables: &[ReadVariable]) -> Result<Vec<usize>, String> {
+        Ok(match &self.patch {
+            None => Vec::new(),
+            Some(Patch::Read { variable }) => vec![variables.get(*variable).ok_or_else(|| error("a patch of an unknown variable"))?.block],
+            Some(Patch::Complement { blocks }) => {
+                if blocks.is_empty() || blocks.windows(2).any(|w| w[0] >= w[1]) {
+                    return Err(error("a complement patch needs distinct ascending blocks"));
+                }
+                blocks.clone()
+            }
         })
     }
 }
@@ -264,7 +273,7 @@ pub fn sample(rng: &mut impl RngExt, sequences: usize, layers: usize, variables:
     for n in 0..sequences {
         out.push(Experiment { base: n, source: n, explained: hybrid(rng, blocks), patch: None });
         let u = rng.random_range(0..variables + blocks);
-        let patch = if u < variables { Patch::Read { variable: u } } else { Patch::Complement { block: u - variables } };
+        let patch = if u < variables { Patch::Read { variable: u } } else { Patch::Complement { blocks: vec![u - variables] } };
         out.push(Experiment { base: n, source: n, explained: hybrid(rng, blocks), patch: Some(patch) });
     }
     out
@@ -332,10 +341,10 @@ struct Basis {
     q: Option<Tensor>,
 }
 
-/// The patch directions of each experiment at `P`'s reads when it was made: the experiment design,
-/// which is data and carries no gradient.
+/// The patch directions of each experiment at `P`'s reads when it was made, per patched block in
+/// ascending order: the experiment design, which is data and carries no gradient.
 pub struct Design {
-    bases: Vec<Option<Arc<Basis>>>,
+    bases: Vec<Vec<Arc<Basis>>>,
 }
 
 /// An orthonormal basis (`d × r`) of the span of the rows of `rows`: its right singular vectors
@@ -379,36 +388,41 @@ fn design_with(
     let mut complements: BTreeMap<usize, Arc<Basis>> = BTreeMap::new();
     let mut bases = Vec::with_capacity(experiments.len());
     for e in experiments {
-        let basis = match e.patch {
-            None => None,
-            Some(Patch::Read { variable }) => Some(match reads.get(&variable) {
+        let mut basis = Vec::new();
+        match &e.patch {
+            None => {}
+            Some(Patch::Read { variable }) => basis.push(match reads.get(variable) {
                 Some(b) => Arc::clone(b),
                 None => {
-                    let v = variables.get(variable).ok_or_else(|| error("a patch of an unknown variable"))?;
+                    let v = variables.get(*variable).ok_or_else(|| error("a patch of an unknown variable"))?;
                     let b = Arc::new(Basis { block: v.block, complement: false, q: upload(span(rows_of(v)?.view())?)? });
-                    reads.insert(variable, Arc::clone(&b));
+                    reads.insert(*variable, Arc::clone(&b));
                     b
                 }
             }),
-            Some(Patch::Complement { block }) => Some(match complements.get(&block) {
-                Some(b) => Arc::clone(b),
-                None => {
-                    if block >= blocks {
-                        return Err(error("a complement patch of an unknown block"));
-                    }
-                    let parts = variables.iter().filter(|v| v.block == block).map(&rows_of).collect::<Result<Vec<_>, _>>()?;
-                    let q = if parts.is_empty() {
-                        None
-                    } else {
-                        let views: Vec<_> = parts.iter().map(|m| m.view()).collect();
-                        span(ndarray::concatenate(Axis(0), &views).map_err(error)?.view())?
-                    };
-                    let b = Arc::new(Basis { block, complement: true, q: upload(q)? });
-                    complements.insert(block, Arc::clone(&b));
-                    b
+            Some(Patch::Complement { .. }) => {
+                for block in e.blocks(variables)? {
+                    basis.push(match complements.get(&block) {
+                        Some(b) => Arc::clone(b),
+                        None => {
+                            if block >= blocks {
+                                return Err(error("a complement patch of an unknown block"));
+                            }
+                            let parts = variables.iter().filter(|v| v.block == block).map(&rows_of).collect::<Result<Vec<_>, _>>()?;
+                            let q = if parts.is_empty() {
+                                None
+                            } else {
+                                let views: Vec<_> = parts.iter().map(|m| m.view()).collect();
+                                span(ndarray::concatenate(Axis(0), &views).map_err(error)?.view())?
+                            };
+                            let b = Arc::new(Basis { block, complement: true, q: upload(q)? });
+                            complements.insert(block, Arc::clone(&b));
+                            b
+                        }
+                    });
                 }
-            }),
-        };
+            }
+        }
         bases.push(basis);
     }
     Ok(Design { bases })
@@ -474,14 +488,14 @@ impl Site {
 
 /// One sequence run through blocks `blocks` of the hybrid that runs `P`'s version of the blocks
 /// `explained` marks and `M`'s of the others, entering at `entry` (the stream entering
-/// `blocks.start`, past the first block), with at most one patch (its directions and the source's
-/// read value).
+/// `blocks.start`, past the first block), with its patches at distinct blocks (each its directions
+/// and the source's read value).
 struct Lane<'t> {
     tokens: &'t [u32],
     blocks: Range<usize>,
     explained: &'t [bool],
     entry: Option<Tensor>,
-    patch: Option<(Arc<Basis>, Tensor)>,
+    patches: Vec<(Arc<Basis>, Tensor)>,
     captures: Vec<Site>,
 }
 
@@ -546,7 +560,7 @@ fn forward(models: [&Model; 2], lanes: &mut [Lane], length: usize, keep: bool) -
             let patched: Vec<(usize, usize, &Basis, &Tensor)> = members
                 .iter()
                 .enumerate()
-                .filter_map(|(i, lane)| lanes[*lane].patch.as_ref().filter(|(basis, _)| basis.block == b).map(|(basis, s)| (model.read(basis.block), i * length, basis.as_ref(), s)))
+                .flat_map(|(i, lane)| lanes[*lane].patches.iter().filter(move |(basis, _)| basis.block == b).map(move |(basis, s)| (model.read(basis.block), i * length, basis.as_ref(), s)))
                 .collect();
             let arithmetic = model.program.arithmetic();
             let edit = |node: usize, trace: &DeviceTrace| -> Result<Option<Tensor>, String> {
@@ -581,8 +595,8 @@ fn forward(models: [&Model; 2], lanes: &mut [Lane], length: usize, keep: bool) -
 }
 
 /// The reverse of `run` from the cotangents of its lanes' outputs and captures (none for zero):
-/// adds `P`'s parameter gradient into `gradient` and returns per lane its patch source's
-/// cotangent.
+/// adds `P`'s parameter gradient into `gradient` and returns per lane, per patched block, the
+/// cotangent of the source's read there.
 fn reverse(
     models: [&Model; 2],
     lanes: &[Lane],
@@ -591,11 +605,11 @@ fn reverse(
     captures: Vec<Vec<Option<Tensor>>>,
     length: usize,
     gradient: &mut BTreeMap<usize, Tensor>,
-) -> Result<Vec<Option<Tensor>>, String> {
+) -> Result<Vec<BTreeMap<usize, Tensor>>, String> {
     let d = models[0].program.device();
     let width = models[0].width();
     let mut cotangent = outputs;
-    let mut sources: Vec<Option<Tensor>> = lanes.iter().map(|_| None).collect();
+    let mut sources: Vec<BTreeMap<usize, Tensor>> = lanes.iter().map(|_| BTreeMap::new()).collect();
     for segment in run.segments.into_iter().rev() {
         let model = models[usize::from(!segment.explanation)];
         let b = segment.block;
@@ -628,7 +642,7 @@ fn reverse(
             .members
             .iter()
             .enumerate()
-            .filter_map(|(i, lane)| lanes[*lane].patch.as_ref().filter(|(basis, _)| basis.block == b).map(|(basis, _)| (model.read(basis.block), i, *lane, basis.as_ref())))
+            .flat_map(|(i, lane)| lanes[*lane].patches.iter().filter(move |(basis, _)| basis.block == b).map(move |(basis, _)| (model.read(basis.block), i, *lane, basis.as_ref())))
             .collect();
         let edited: BTreeSet<usize> = patched.iter().map(|(node, ..)| *node).collect();
         keep.extend(&edited);
@@ -639,7 +653,9 @@ fn reverse(
         let arithmetic = model.program.arithmetic();
         let mut hook = |node: usize, g: &mut Tensor| -> Result<(), String> {
             for (_, i, lane, basis) in patched.iter().filter(|(at, ..)| *at == node) {
-                sources[*lane] = exchange_cotangent(d, g, i * length, length, basis, arithmetic)?;
+                if let Some(source) = exchange_cotangent(d, g, i * length, length, basis, arithmetic)? {
+                    sources[*lane].insert(basis.block, source);
+                }
             }
             Ok(())
         };
@@ -684,17 +700,19 @@ impl Teacher {
         let d = m.program.device();
         let blocks = m.blocks();
         let mut base_sites: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); batch.base.len()];
-        let mut source_sites: BTreeSet<(usize, usize)> = BTreeSet::new();
+        let mut source_sites: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
         for e in experiments {
             check(e, batch, blocks)?;
-            if let Some(block) = e.block(variables)? {
-                if block >= blocks {
-                    return Err(error("a patch of an unknown block"));
-                }
-                if block > 0 {
-                    base_sites[e.base].insert(block);
-                }
-                source_sites.insert((e.source, block));
+            let patched = e.blocks(variables)?;
+            if patched.iter().any(|b| *b >= blocks) {
+                return Err(error("a patch of an unknown block"));
+            }
+            // M under the patches enters at the first patched block.
+            if let Some(&first) = patched.first().filter(|b| **b > 0) {
+                base_sites[e.base].insert(first);
+            }
+            if !patched.is_empty() {
+                source_sites.entry(e.source).or_default().extend(patched);
             }
         }
         let native = vec![false; blocks];
@@ -702,7 +720,7 @@ impl Teacher {
             .base
             .iter()
             .zip(&base_sites)
-            .map(|(tokens, sites)| Lane { tokens, blocks: 0..blocks, explained: &native, entry: None, patch: None, captures: sites.iter().map(|b| Site::Entry(*b)).collect() })
+            .map(|(tokens, sites)| Lane { tokens, blocks: 0..blocks, explained: &native, entry: None, patches: Vec::new(), captures: sites.iter().map(|b| Site::Entry(*b)).collect() })
             .collect();
         let run = forward([m, m], &mut lanes, batch.length, false)?;
         let mut entries = BTreeMap::new();
@@ -713,13 +731,19 @@ impl Teacher {
                 entries.insert((n, *b), value);
             }
         }
-        let sites: Vec<(usize, usize)> = source_sites.into_iter().collect();
-        let mut lanes: Vec<Lane> = sites
+        // One run per source, up to its last patched block, reading every patched block.
+        let mut lanes: Vec<Lane> = source_sites
             .iter()
-            .map(|&(n, block)| Lane { tokens: &batch.source[n], blocks: 0..block + 1, explained: &native, entry: None, patch: None, captures: vec![Site::Read(block)] })
+            .map(|(n, sites)| {
+                let last = sites.last().copied().unwrap_or_default();
+                Lane { tokens: &batch.source[*n], blocks: 0..last + 1, explained: &native, entry: None, patches: Vec::new(), captures: sites.iter().map(|b| Site::Read(*b)).collect() }
+            })
             .collect();
         let run = forward([m, m], &mut lanes, batch.length, false)?;
-        let reads = sites.into_iter().zip(run.captured).map(|(site, mut c)| (site, c.remove(0))).collect();
+        let mut reads = BTreeMap::new();
+        for ((n, sites), captured) in source_sites.iter().zip(run.captured) {
+            reads.extend(sites.iter().map(|b| (*n, *b)).zip(captured));
+        }
         Ok(Self { clean, entries, reads })
     }
 }
@@ -746,23 +770,21 @@ pub fn evaluate(m: &Model, p: &Model, head: &FixedHead, batch: &Batch, teacher: 
         check(e, batch, blocks)?;
     }
     let native = vec![false; blocks];
-    let patched: Vec<usize> = (0..experiments.len()).filter(|i| design.bases[*i].is_some()).collect();
-    let basis = |i: usize| design.bases[i].as_ref().ok_or_else(|| error("a patched experiment without directions"));
-    // M under each patch, from the patched block on.
+    let patched: Vec<usize> = (0..experiments.len()).filter(|i| !design.bases[*i].is_empty()).collect();
+    // M under the patches, from the first patched block on.
     let mut lanes = Vec::with_capacity(patched.len());
     for &i in &patched {
-        let (e, basis) = (&experiments[i], basis(i)?);
-        let start = basis.block;
+        let (e, bases) = (&experiments[i], &design.bases[i]);
+        let start = bases[0].block;
         let entry = (start > 0).then(|| teacher.entries.get(&(e.base, start)).ok_or_else(|| error("the teacher has no stream for a patched experiment"))).transpose()?;
-        let source = teacher.reads.get(&(e.source, basis.block)).ok_or_else(|| error("the teacher has no source read for a patched experiment"))?;
-        lanes.push(Lane {
-            tokens: &batch.base[e.base],
-            blocks: start..blocks,
-            explained: &native,
-            entry: entry.map(|t| d.copy(t).map_err(error)).transpose()?,
-            patch: Some((Arc::clone(basis), d.copy(source).map_err(error)?)),
-            captures: vec![],
-        });
+        let patches = bases
+            .iter()
+            .map(|basis| {
+                let source = teacher.reads.get(&(e.source, basis.block)).ok_or_else(|| error("the teacher has no source read for a patched experiment"))?;
+                Ok((Arc::clone(basis), d.copy(source).map_err(error)?))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        lanes.push(Lane { tokens: &batch.base[e.base], blocks: start..blocks, explained: &native, entry: entry.map(|t| d.copy(t).map_err(error)).transpose()?, patches, captures: vec![] });
     }
     let run = forward([p, m], &mut lanes, length, false)?;
     let mut targets: BTreeMap<usize, Target> = BTreeMap::new();
@@ -770,27 +792,29 @@ pub fn evaluate(m: &Model, p: &Model, head: &FixedHead, batch: &Batch, teacher: 
         targets.insert(i, head.target(d, output, m.program.arithmetic())?);
     }
     drop(run);
-    // The hybrids on the sources, up to the patched block.
+    // The hybrids on the sources, up to the last patched block.
     let mut sources: Vec<Lane> = patched
         .iter()
-        .map(|&i| -> Result<Lane, String> {
-            let (e, basis) = (&experiments[i], basis(i)?);
-            Ok(Lane { tokens: &batch.source[e.source], blocks: 0..basis.block + 1, explained: &e.explained, entry: None, patch: None, captures: vec![Site::Read(basis.block)] })
+        .map(|&i| {
+            let (e, bases) = (&experiments[i], &design.bases[i]);
+            let last = bases[bases.len() - 1].block;
+            Lane { tokens: &batch.source[e.source], blocks: 0..last + 1, explained: &e.explained, entry: None, patches: Vec::new(), captures: bases.iter().map(|b| Site::Read(b.block)).collect() }
         })
-        .collect::<Result<_, _>>()?;
+        .collect();
     let source_run = forward([p, m], &mut sources, length, gradient)?;
     // The hybrids on the bases.
-    let mut source_values: BTreeMap<usize, Tensor> = BTreeMap::new();
+    let mut source_values: BTreeMap<usize, Vec<Tensor>> = BTreeMap::new();
     for (&i, captured) in patched.iter().zip(&source_run.captured) {
-        source_values.insert(i, d.copy(&captured[0]).map_err(error)?);
+        source_values.insert(i, captured.iter().map(|c| d.copy(c).map_err(error)).collect::<Result<_, _>>()?);
     }
     let mut bases: Vec<Lane> = Vec::with_capacity(experiments.len());
     for (i, e) in experiments.iter().enumerate() {
-        let patch = match &design.bases[i] {
-            Some(basis) => Some((Arc::clone(basis), source_values.remove(&i).ok_or_else(|| error("a source read is missing"))?)),
-            None => None,
-        };
-        bases.push(Lane { tokens: &batch.base[e.base], blocks: 0..blocks, explained: &e.explained, entry: None, patch, captures: vec![] });
+        let values = source_values.remove(&i).unwrap_or_default();
+        if values.len() != design.bases[i].len() {
+            return Err(error("a source read is missing"));
+        }
+        let patches = design.bases[i].iter().cloned().zip(values).collect();
+        bases.push(Lane { tokens: &batch.base[e.base], blocks: 0..blocks, explained: &e.explained, entry: None, patches, captures: vec![] });
     }
     let base_run = forward([p, m], &mut bases, length, gradient)?;
     // Scores against the targets.
@@ -821,7 +845,7 @@ pub fn evaluate(m: &Model, p: &Model, head: &FixedHead, batch: &Batch, teacher: 
     }
     let mut total = BTreeMap::new();
     let mut source_cotangents = reverse([p, m], &bases, base_run, outputs, bases.iter().map(|_| Vec::new()).collect(), length, &mut total)?;
-    let captures: Vec<Vec<Option<Tensor>>> = patched.iter().map(|i| vec![source_cotangents[*i].take()]).collect();
+    let captures: Vec<Vec<Option<Tensor>>> = patched.iter().map(|i| design.bases[*i].iter().map(|b| source_cotangents[*i].remove(&b.block)).collect()).collect();
     reverse([p, m], &sources, source_run, sources.iter().map(|_| None).collect(), captures, length, &mut total)?;
     Ok(Evaluation { bits, gradient: total })
 }

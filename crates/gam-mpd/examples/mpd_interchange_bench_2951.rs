@@ -203,9 +203,9 @@ fn main() -> Result<(), String> {
         "patched_experiments": patched_bits.len(),
         "complement_experiments": experiments.iter().filter(|e| matches!(e.patch, Some(Patch::Complement { .. }))).count(),
         "hybrid_sizes": experiments.iter().map(|e| e.explained.iter().filter(|x| **x).count()).collect::<Vec<_>>(),
-        "patched_blocks": experiments.iter().filter_map(|e| match e.patch {
-            Some(Patch::Read { variable }) => Some(variables[variable].block),
-            Some(Patch::Complement { block }) => Some(block),
+        "patched_blocks": experiments.iter().filter_map(|e| match &e.patch {
+            Some(Patch::Read { variable }) => Some(variables[*variable].block),
+            Some(Patch::Complement { blocks }) => blocks.first().copied(),
             None => None,
         }).collect::<Vec<_>>(),
         "compile_seconds": compile_seconds,

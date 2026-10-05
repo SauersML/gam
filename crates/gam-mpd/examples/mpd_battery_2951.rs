@@ -19,8 +19,10 @@
 //!   layer of `P`, `M` elsewhere), the cuts (`P`'s layers before `ℓ`, `M`'s after), and per size
 //!   `k` a uniformly drawn subset of `k` layers per batch of bases.
 //! * Interchange (`interchange`) with `P` alone (cut `L`): per base one read patch of a read
-//!   variable drawn uniformly, and the complement patch of every block, each with the source a
-//!   sequence shared across the whole batch of bases. Every source row is scored; the worst
+//!   variable drawn uniformly, the complement patch of every block, and the joint complement
+//!   patch at a uniformly drawn set of at least two blocks (its size uniform in `2..=2L`, where
+//!   cancellation between blocks shows), each with the source a sequence shared across the whole
+//!   batch of bases. Every source row is scored; the worst
 //!   source of the first `K` (by the mean over all bases) is reported for each `K`.
 use gam_gpu::{
     GpuPolicy,
@@ -416,9 +418,15 @@ fn main() -> Result<(), String> {
     let blocks = 2 * layer_count;
     let interchange = Interchange::new(&device, &native, &layers, &artifact, &explanation.trainable, variables.clone(), settings.numeric_bytes, settings.head_tile_rows)?;
     let read_of: Vec<usize> = (0..bases.len()).map(|_| rng.random_range(0..variables.len())).collect();
-    // Per family (the read patch, then each block's complement) per source: bits and tokens over
-    // every base, and every token's bits.
-    let families = 1 + blocks;
+    let joint_of: Vec<Vec<usize>> = (0..bases.len())
+        .map(|_| {
+            let k = rng.random_range(2..=blocks);
+            interchange::hybrid_of(&mut rng, blocks, k).iter().enumerate().filter(|(_, x)| **x).map(|(b, _)| b).collect()
+        })
+        .collect();
+    // Per family (the read patch, each block's complement, then the joint complement) per source:
+    // bits and tokens over every base, and every token's bits.
+    let families = 2 + blocks;
     let mut per_source = vec![vec![(0.0f64, 0usize); sources.len()]; families];
     let mut all: Vec<Tokens> = (0..families).map(|_| Tokens::default()).collect();
     let mut clean = Tokens::default();
@@ -429,20 +437,22 @@ fn main() -> Result<(), String> {
             for b in 0..chunk.len() {
                 let at = |patch| Experiment { base: b, source: 0, explained: vec![true; blocks], patch };
                 experiments.push(at(Some(Patch::Read { variable: read_of[c * settings.batch_sequences + b] })));
-                experiments.extend((0..blocks).map(|block| at(Some(Patch::Complement { block }))));
+                experiments.extend((0..blocks).map(|block| at(Some(Patch::Complement { blocks: vec![block] }))));
+                experiments.push(at(Some(Patch::Complement { blocks: joint_of[c * settings.batch_sequences + b].clone() })));
                 if s == 0 {
                     experiments.push(at(None));
                 }
             }
             let scored = interchange.evaluate(&batch, &experiments, false)?;
             for (e, bits) in experiments.iter().zip(&scored.bits) {
-                let family = match e.patch {
+                let family = match &e.patch {
                     None => {
                         clean.0.extend_from_slice(bits);
                         continue;
                     }
                     Some(Patch::Read { .. }) => 0,
-                    Some(Patch::Complement { block }) => 1 + block,
+                    Some(Patch::Complement { blocks: one }) if one.len() == 1 => 1 + one[0],
+                    Some(Patch::Complement { .. }) => 1 + blocks,
                 };
                 per_source[family][s].0 += bits.iter().sum::<f64>();
                 per_source[family][s].1 += bits.len();
@@ -451,7 +461,11 @@ fn main() -> Result<(), String> {
         }
         log::info!("battery: interchange source {}/{} ({:.0} s)", s + 1, sources.len(), started.elapsed().as_secs_f64());
     }
-    let name = |f: usize| if f == 0 { "read".to_string() } else { format!("complement_block_{}", f - 1) };
+    let name = |f: usize| match f {
+        0 => "read".to_string(),
+        f if f <= blocks => format!("complement_block_{}", f - 1),
+        _ => "complement_joint".to_string(),
+    };
     let mut patches = serde_json::Map::new();
     for f in 0..families {
         let means: Vec<f64> = per_source[f].iter().map(|(bits, n)| bits / *n as f64).collect();
@@ -460,7 +474,7 @@ fn main() -> Result<(), String> {
         patches.insert(name(f), json!({"all_sources": all[f].summary(), "shared_source": worst}));
     }
     let mut complement = Tokens::default();
-    (1..families).for_each(|f| complement.0.extend_from_slice(&all[f].0));
+    (1..=blocks).for_each(|f| complement.0.extend_from_slice(&all[f].0));
     report["interchange"] = json!({
         "read_variables": variables.len(),
         "clean": clean.summary(),

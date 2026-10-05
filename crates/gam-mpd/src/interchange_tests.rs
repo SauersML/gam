@@ -116,10 +116,10 @@ fn patched(h: &Array2<f64>, (_, pi, complement, s): HostPatch<'_>) -> Array2<f64
 }
 
 /// The hybrid running `P`'s version of the blocks `explained` marks and `M`'s of the others, on
-/// `tokens`, under `patch`: its hidden rows and its read at every block. Each block is one run of
+/// `tokens`, under `patches`: its hidden rows and its read at every block. Each block is one run of
 /// its model's whole program with the stream entering the block replaced by the previous block's
 /// output, of which only the block's own nodes are kept.
-fn hybrid(f: &Fixture, tokens: &[u32], explained: &[bool], patch: Option<HostPatch<'_>>) -> (Array2<f64>, Vec<Array2<f64>>) {
+fn hybrid(f: &Fixture, tokens: &[u32], explained: &[bool], patches: &[HostPatch<'_>]) -> (Array2<f64>, Vec<Array2<f64>>) {
     let family = one(tokens);
     let blocks = 2 * LAYERS;
     let (mut state, mut reads) = (None::<Array2<f64>>, Vec::with_capacity(blocks));
@@ -134,11 +134,10 @@ fn hybrid(f: &Fixture, tokens: &[u32], explained: &[bool], patch: Option<HostPat
                 {
                     *value = entering.clone();
                 }
-                if let Some(patch) = patch
-                    && patch.0 == b
+                if let Some(patch) = patches.iter().find(|p| p.0 == b)
                     && node == host.reads[b]
                 {
-                    *value = patched(value, patch);
+                    *value = patched(value, *patch);
                 }
                 Ok(())
             })
@@ -150,8 +149,8 @@ fn hybrid(f: &Fixture, tokens: &[u32], explained: &[bool], patch: Option<HostPat
 }
 
 /// `M` alone (the hybrid with no block of `P`).
-fn native(f: &Fixture, tokens: &[u32], patch: Option<HostPatch<'_>>) -> (Array2<f64>, Vec<Array2<f64>>) {
-    hybrid(f, tokens, &[false; 2 * LAYERS], patch)
+fn native(f: &Fixture, tokens: &[u32], patches: &[HostPatch<'_>]) -> (Array2<f64>, Vec<Array2<f64>>) {
+    hybrid(f, tokens, &[false; 2 * LAYERS], patches)
 }
 
 /// Per row `KL(softmax(E a) ‖ softmax(E b))` in bits.
@@ -166,23 +165,28 @@ fn kl_bits(head: &Head, a: &Array2<f64>, b: &Array2<f64>) -> Vec<f64> {
 /// The reference bits of experiment `e`.
 fn reference(f: &Fixture, e: &Experiment) -> Vec<f64> {
     let (base, source) = (&f.batch.base[e.base], &f.batch.source[e.source]);
-    let Some(patch) = e.patch else {
-        return kl_bits(&f.head, &native(f, base, None).0, &hybrid(f, base, &e.explained, None).0);
+    let Some(patch) = &e.patch else {
+        return kl_bits(&f.head, &native(f, base, &[]).0, &hybrid(f, base, &e.explained, &[]).0);
     };
     let rows_of = |v: &ReadVariable| -> Vec<Array2<f64>> { v.parts.iter().map(|(op, rows)| f.p.flat.operators[*op].matrix().slice(s![rows.clone(), ..]).to_owned()).collect() };
-    let (block, parts, complement) = match patch {
-        Patch::Read { variable } => (f.variables[variable].block, rows_of(&f.variables[variable]), false),
-        Patch::Complement { block } => (block, f.variables.iter().filter(|v| v.block == block).flat_map(rows_of).collect(), true),
+    // Per patched block: its rows, and whether the patch takes their complement.
+    let sites: Vec<(usize, Vec<Array2<f64>>, bool)> = match patch {
+        Patch::Read { variable } => vec![(f.variables[*variable].block, rows_of(&f.variables[*variable]), false)],
+        Patch::Complement { blocks } => blocks.iter().map(|&b| (b, f.variables.iter().filter(|v| v.block == b).flat_map(rows_of).collect(), true)).collect(),
     };
-    let views: Vec<_> = parts.iter().map(|m| m.view()).collect();
-    let rows = ndarray::concatenate(Axis(0), &views).expect("rows");
-    // More rows than coordinates span everything: the projector is the identity.
-    let pi = if rows.nrows() >= D { Array2::eye(D) } else { projector(&rows) };
-    let m_source = native(f, source, None).1[block].clone();
-    let p_source = hybrid(f, source, &e.explained, None).1[block].clone();
-    let teacher = native(f, base, Some((block, &pi, complement, &m_source))).0;
-    let student = hybrid(f, base, &e.explained, Some((block, &pi, complement, &p_source))).0;
-    kl_bits(&f.head, &teacher, &student)
+    let projectors: Vec<Array2<f64>> = sites
+        .iter()
+        .map(|(_, parts, _)| {
+            let views: Vec<_> = parts.iter().map(|m| m.view()).collect();
+            let rows = ndarray::concatenate(Axis(0), &views).expect("rows");
+            // More rows than coordinates span everything: the projector is the identity.
+            if rows.nrows() >= D { Array2::eye(D) } else { projector(&rows) }
+        })
+        .collect();
+    let (m_reads, p_reads) = (native(f, source, &[]).1, hybrid(f, source, &e.explained, &[]).1);
+    let m_patches: Vec<HostPatch<'_>> = sites.iter().zip(&projectors).map(|((b, _, c), pi)| (*b, pi, *c, &m_reads[*b])).collect();
+    let p_patches: Vec<HostPatch<'_>> = sites.iter().zip(&projectors).map(|((b, _, c), pi)| (*b, pi, *c, &p_reads[*b])).collect();
+    kl_bits(&f.head, &native(f, base, &m_patches).0, &hybrid(f, base, &e.explained, &p_patches).0)
 }
 
 /// Experiments covering every kind of patch on both sides of the hybrids' switches, under prefix
@@ -202,10 +206,14 @@ fn experiments(f: &Fixture) -> Vec<Experiment> {
         e(5, 4, [t, n, t, t], Some(Patch::Read { variable: read(1, 3) })),
         e(1, 2, [n, t, n, t], Some(Patch::Read { variable: read(2, 1) })),
         e(3, 0, [t, t, n, n], Some(Patch::Read { variable: f.variables.len() - 1 })),
-        e(0, 2, [t, t, n, n], Some(Patch::Complement { block: 0 })),
-        e(1, 3, [t, t, t, t], Some(Patch::Complement { block: 2 })),
-        e(2, 0, [t, t, n, n], Some(Patch::Complement { block: 3 })),
-        e(5, 1, [n, t, t, n], Some(Patch::Complement { block: 0 })),
+        e(0, 2, [t, t, n, n], Some(Patch::Complement { blocks: vec![0] })),
+        e(1, 3, [t, t, t, t], Some(Patch::Complement { blocks: vec![2] })),
+        e(2, 0, [t, t, n, n], Some(Patch::Complement { blocks: vec![3] })),
+        e(5, 1, [n, t, t, n], Some(Patch::Complement { blocks: vec![0] })),
+        // Joint complements at several blocks, on both sides of the switches.
+        e(4, 0, [t, n, t, n], Some(Patch::Complement { blocks: vec![0, 3] })),
+        e(3, 5, [n, t, t, t], Some(Patch::Complement { blocks: vec![0, 2, 3] })),
+        e(0, 4, [t, t, t, t], Some(Patch::Complement { blocks: vec![2, 3] })),
     ]
 }
 
@@ -324,9 +332,9 @@ fn sampling_draws_one_clean_and_one_patched_experiment_per_base() {
         assert_eq!((pair[0].base, pair[1].base, pair[1].source), (n, n, n));
         assert!(pair[0].patch.is_none() && pair[1].patch.is_some());
         assert!(pair.iter().all(|e| e.explained.len() == 6 && e.explained.contains(&true)));
-        match pair[1].patch {
-            Some(Patch::Read { variable }) => assert!(variable < 7),
-            Some(Patch::Complement { block }) => assert!(block < 6),
+        match &pair[1].patch {
+            Some(Patch::Read { variable }) => assert!(*variable < 7),
+            Some(Patch::Complement { blocks }) => assert!(blocks.len() == 1 && blocks[0] < 6),
             None => unreachable!("a patched experiment"),
         }
     }

@@ -1021,7 +1021,7 @@ fn held_out(scorer: &mut Scorer, explanation: &Explanation, posterior: &Posterio
         }
         let (bits, _) = scorer.score(&batch, &experiments, &variables, &posterior.mean, None, false)?;
         for (e, bits) in experiments.iter().zip(&bits) {
-            match e.patch {
+            match &e.patch {
                 None => clean[size(e) - 1].add(bits),
                 Some(patch) => {
                     patched[size(e) - 1].add(bits);
