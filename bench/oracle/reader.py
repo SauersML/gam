@@ -23,7 +23,8 @@ Backends (one Backend.distributions interface):
   vllm          a frozen open-weights instruct model on GPUs, offline vllm.LLM, one generated token at
                 temperature 0 with SamplingParams.logprob_token_ids = the K label tokens (exact
                 log-probabilities of those tokens, not a top-n list); thousands of tests per call.
-  transformers  the same model family on the CPU for tests on the Mac (float32, last-position logits).
+  transformers  Hugging Face transformers: on CUDA in bfloat16 when a GPU is present, else on the CPU in
+                float32 (tests on the Mac); last-position logits.
   claude        `claude -p` (headless Claude Code, no tools, no CLAUDE.md or plugins, structured JSON
                 output); used only to calibrate the open-weights reader on a sample (calibrate.py).
 Chat templates are applied with thinking disabled (enable_thinking=False, read by Qwen3's template).
@@ -37,7 +38,11 @@ trainer and the episode scorer share one loaded reader.
   reader.py score --backend B --model M --tests TESTS.jsonl --out OUT.jsonl [--seed S]
   reader.py serve --backend B --model M --listen ADDRESS [--seed S]
 TESTS.jsonl lines: {"id", "documents": [str], "context": str, "intervention": str, "options": [str],
-optional "p": [float]}. OUT.jsonl lines: {"id", "q", "q_rotations", "log_score" (when p is given),
+optional "kind", optional "p": [float]}. kind "next_token" (the default): the context is a text and the
+options candidate next tokens. kind "response": the context is a chat (the user's turns as text) and the
+options whole candidate replies; the measured p is the model's probability of each reply (the sum of its
+tokens' log-probabilities and the end-of-turn token's) renormalized over the options; an empty
+intervention means the model as it is. OUT.jsonl lines: {"id", "q", "q_rotations", "log_score" (when p is given),
 "reader": {backend, model, seed, rotations}}.
 """
 
@@ -60,8 +65,8 @@ LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 SYSTEM = (
     "You predict the measured behaviour of a language model. You are given documents about the model "
-    "(possibly none), a text the model reads, an intervention made on the model's computation while it "
-    "reads that text, and candidate next tokens. Use the documents where they bear on the question."
+    "(possibly none), the input the model reads, possibly an intervention made on the model's computation "
+    "while it reads that input, and candidate outputs. Use the documents where they bear on the question."
 )
 
 ANSWER_LETTER = "Answer with the letter of one candidate and nothing else."
@@ -71,7 +76,7 @@ ANSWER_PROBABILITIES = (
 )
 
 
-def body(documents: list[str], context: str, intervention: str, options: list[str]) -> str:
+def body(documents: list[str], context: str, intervention: str, options: list[str], kind: str = "next_token") -> str:
     """The prompt text every backend reads, with options in the order given (labels A, B, ...)."""
     if len(options) > len(LABELS):
         raise ValueError(f"{len(options)} options; at most {len(LABELS)}")
@@ -80,14 +85,26 @@ def body(documents: list[str], context: str, intervention: str, options: list[st
         parts += [f"Document {i} about the model:\n{d}" for i, d in enumerate(documents, 1)]
     else:
         parts.append("No documents about the model are given.")
-    parts.append(f"The model reads this text (everything between <<< and >>>) and then produces its next token:\n<<<{context}>>>")
-    parts.append(f"Intervention while the model reads the text: {intervention}")
     listing = "\n".join(f"{LABELS[j]}. {json.dumps(o, ensure_ascii=False)}" for j, o in enumerate(options))
-    parts.append(f"Candidate next tokens (each a JSON string, so spaces and newlines are explicit):\n{listing}")
-    parts.append(
-        "Suppose the model, under this intervention, produces one next token drawn at random from these "
-        "candidates in proportion to its probabilities. Which candidate does it produce?"
-    )
+    if kind == "next_token":
+        parts.append(f"The model reads this text (everything between <<< and >>>) and then produces its next token:\n<<<{context}>>>")
+        parts.append(f"Intervention while the model reads the text: {intervention}")
+        parts.append(f"Candidate next tokens (each a JSON string, so spaces and newlines are explicit):\n{listing}")
+        parts.append(
+            "Suppose the model, under this intervention, produces one next token drawn at random from these "
+            "candidates in proportion to its probabilities. Which candidate does it produce?"
+        )
+    elif kind == "response":
+        parts.append(f"The model is a chat assistant. It receives this conversation (everything between <<< and >>>) and then writes its reply:\n<<<{context}>>>")
+        if intervention:
+            parts.append(f"Intervention while the model reads the conversation: {intervention}")
+        parts.append(f"Candidate replies (each a JSON string):\n{listing}")
+        parts.append(
+            "Suppose the model replies with exactly one of these candidates, drawn at random in proportion to "
+            "its probability of writing each one. Which candidate does it write?"
+        )
+    else:
+        raise ValueError(f"test kind {kind!r}: next_token or response")
     return "\n\n".join(parts)
 
 
@@ -133,7 +150,8 @@ class ChatEncoder:
 
 
 class TransformersBackend:
-    """A Hugging Face causal LM on the CPU, float32; prompts batched by length under a token budget."""
+    """A Hugging Face causal LM on CUDA in bfloat16 when a GPU is present, else on the CPU in float32;
+    prompts batched by length under a token budget."""
 
     name = "transformers"
 
@@ -149,7 +167,9 @@ class TransformersBackend:
         tokenizer = AutoTokenizer.from_pretrained(model)
         self.encode = ChatEncoder(tokenizer)
         self.pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-        self.model = AutoModelForCausalLM.from_pretrained(model, dtype=torch.float32).eval()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+        self.model = AutoModelForCausalLM.from_pretrained(model, dtype=dtype).to(self.device).eval()
 
     def distributions(self, users: list[str], k: int) -> list[np.ndarray]:
         torch = self.torch
@@ -173,8 +193,9 @@ class TransformersBackend:
             # Left padding: positions count from each prompt's first real token.
             positions = (mask.cumsum(1) - 1).clamp(min=0)
             with torch.no_grad():
-                logits = self.model(input_ids=ids, attention_mask=mask, position_ids=positions, logits_to_keep=1).logits[:, -1, :]
-            chosen = logits[:, labels].double().numpy()
+                d = self.device
+                logits = self.model(input_ids=ids.to(d), attention_mask=mask.to(d), position_ids=positions.to(d), logits_to_keep=1).logits[:, -1, :]
+            chosen = logits[:, labels].double().cpu().numpy()
             for row, i in enumerate(chunk):
                 out[i] = _normalize(chosen[row])
             start = stop
@@ -292,7 +313,7 @@ def read(backend, tests: list[dict]) -> list[dict]:
         users = []
         for t, order in items:
             test = tests[t]
-            users.append(body(test["documents"], test["context"], test["intervention"], [test["options"][i] for i in order]))
+            users.append(body(test["documents"], test["context"], test["intervention"], [test["options"][i] for i in order], test.get("kind", "next_token")))
         qs = backend.distributions(users, k)
         for (t, order), q_labels in zip(items, qs):
             q = np.empty(k)
