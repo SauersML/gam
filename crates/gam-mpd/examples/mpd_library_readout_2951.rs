@@ -1,5 +1,5 @@
 //! The read-out of a library explanation (`gam_mpd::library_readout`, #2951) on an export's
-//! held-out token rows: per surviving function its frequency, contexts, written and read tokens,
+//! held-out token rows: per surviving function its RelP importance, contexts, written and read tokens,
 //! attention summary and inputs, with every context decoded to text.
 //!
 //! EXPORT TOKENIZER SETTINGS.json OUT.json [ARTIFACT]
@@ -116,7 +116,7 @@ fn relp(args: &[String]) -> Result<(), String> {
 
 /// Where a fit checkpoint's code length goes: per function its bits, summed per layer and kind,
 /// and the most expensive functions with, from a read-out of the same explanation, their
-/// frequency, importance and top contexts.
+/// importance, important fractions and top contexts.
 fn costs(args: &[String]) -> Result<(), String> {
     let (export, checkpoint, out, readout) = match args {
         [e, c, o] => (e, c, o, None),
@@ -153,7 +153,7 @@ fn costs(args: &[String]) -> Result<(), String> {
             let f = by_name.get(&c.name);
             json!({
                 "name": c.name, "bits": c.bits, "parts": c.parts,
-                "frequency": f.map(|f| f["frequency"].clone()), "importance": f.map(|f| f["importance"].clone()),
+                "important_fraction": f.map(|f| f["important_fraction"].clone()), "importance": f.map(|f| f["importance"].clone()),
                 "contexts": f.map(|f| f["contexts"].as_array().map(|a| a.iter().take(3).map(|c| json!({"before": c["before"], "token": c["token"]})).collect::<Vec<_>>())),
             })
         })
