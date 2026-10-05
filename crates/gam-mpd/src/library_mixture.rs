@@ -7,25 +7,29 @@
 //! A target is one block of the library's parameters `g`, each block separately: an MLP function's
 //! gate direction `g_i` (row `i` of `library.l{l}.mlp.gate`), its up direction when the MLP is
 //! gated (row `i` of `library.l{l}.mlp.up`), its output vector (column `i` of `library.l{l}.mlp.out`),
-//! or a head's query–key map (the rows of its `Q` and `K` in the rotary planes still in the
-//! explanation). The Gaussian prior of its groups, `N(0, diag v)`
-//! with `v` each entry's group's empirical-Bayes variance (`library_mdl`), becomes the mixture
+//! or a native key-value group's query–key maps (the rows of its query heads' `Q_i` and its key's
+//! `K` in the rotary planes still in the explanation; one head where heads do not share keys). The
+//! Gaussian prior of its groups, `N(0, diag v)` with `v` each entry's group's empirical-Bayes
+//! variance (`library_mdl`), becomes the mixture
 //!
 //! `p(g) = π_0 N(g; 0, diag v) + Σ_{j ∈ C} π_j N(g; c_j u_j, s² I)`
 //!
 //! over `K` candidates `u_j`, all at the weight sample and all of earlier layers `l' < l`. A gate's
 //! are earlier gate directions, earlier functions' output vectors (a read of what they write) and
 //! `M`'s token embedding rows (the columns of `wte`); an up direction's are earlier up directions;
-//! an output's are earlier output vectors. A head's are the query–key maps of heads in earlier layers with keys of their
-//! own, each brought to the target's gauge plane by plane (`library_sharing::gauge`, a rotation and
-//! a scale that leave its scores unchanged), the gauge fixed for the epoch. The scales `c_j`, the
+//! an output's are earlier output vectors. A key-value group's are the query–key maps of groups
+//! in earlier layers with keys of their own, as many query heads and the same planes, each
+//! brought to the target's gauge plane by plane (`library_sharing::gauge`, a rotation and a scale
+//! that leave every one of its heads' scores unchanged) with each target query head facing one of
+//! the candidate's (the optimal assignment of their misfits), gauge and assignment fixed for the
+//! epoch. The scales `c_j`, the
 //! weights `π = softmax(z)` of the logits `z` and the variance `s²` are learned. As the groups' own
 //! Gaussian times `r(g) = π_0 + Σ_j π_j N(g; c_j u_j, s² I) / N(g; 0, diag v)`, the divergence is
 //! `KL(q ‖ N(0, diag v)) − E_q[ln r(g)]`. `library_mdl` keeps the first term's closed form; this
 //! module estimates the second from the fit's own reparameterized weight sample, an unbiased
 //! estimate. These are conditional priors: the candidates use the same weight sample as the
 //! targets. Every target conditions only on earlier layers, so their product is a normalized joint
-//! prior for fixed mixture parameters and gauges. Allowing mutual head candidates would instead form
+//! prior for fixed mixture parameters and gauges. Allowing mutual candidates would instead form
 //! a product of cyclic conditionals, which need not be normalizable. `v` enters `r` as the closed
 //! form sets it.
 //!
@@ -33,8 +37,8 @@
 //! (`ln C(n, K)` nats), and its `K` free logits, `K` scales and its variance, each at the precision
 //! of a value estimated from the target's `|G|` entries (`½ ln |G|` nats), as `library_mdl` prices
 //! a group's variance. Head alignment gauges additionally cost 64 bits per stored matrix entry
-//! and scale: they depend on the target means and cannot be reconstructed from a parent sample
-//! alone. This is a conservative literal charge; the other parameter costs remain the existing
+//! and scale, and each assignment of `m` query heads `ln m!` nats: they depend on the target means
+//! and cannot be reconstructed from a parent sample alone. This is a conservative literal charge; the other parameter costs remain the existing
 //! asymptotic estimates. A removed target sends nothing.
 //!
 //! The sample gradient treats `v` and the epoch's gauges as fixed hyperparameters. Recomputing
@@ -56,8 +60,9 @@
 //! exact: a gate reading an earlier write becomes a tie (`library_sharing::tie`,
 //! `library_sharing::tie_token`), a gate or up direction a scale times an earlier one
 //! (`library_sharing::tie_row`), an output vector a scale times an earlier one
-//! (`library_sharing::tie_column`), a head's pair one shared query–key function
-//! (`library_sharing::share_query_key`). A block takes part in one such sharing per hardening. The vector is
+//! (`library_sharing::tie_column`), two key-value groups one shared query–key function with the
+//! target's query heads assigned as the component's (`library_sharing::share_query_key`). A block
+//! takes part in one such sharing per hardening. The vector is
 //! stored once, its scale is one prior group, and the choice among the target's `n` candidates
 //! costs `ln n` nats (`Explanation::fixed_nats`). The hardened explanation is accepted only if its
 //! `F` falls after the fit re-converges.
@@ -80,22 +85,22 @@ fn error(e: impl std::fmt::Display) -> String {
 }
 
 /// What a target is: one block of an MLP function (its gate direction, its up direction when
-/// gated, its output vector), or a head's query–key map.
+/// gated, its output vector), or a key-value group's query–key maps (`library_sharing::KeyValue`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Kind {
     Gate { layer: usize, function: usize },
     Up { layer: usize, function: usize },
     Output { layer: usize, function: usize },
-    Head { layer: usize, head: usize },
+    QueryKey { layer: usize, group: usize },
 }
 
 /// A candidate: an earlier function's output vector, gate direction or up direction, a token's
-/// embedding row, or an earlier head's query–key map.
+/// embedding row, or an earlier key-value group's query–key maps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Write {
     Output { layer: usize, function: usize },
     Token(usize),
-    Head { layer: usize, head: usize },
+    QueryKey { layer: usize, group: usize },
     Gate { layer: usize, function: usize },
     Up { layer: usize, function: usize },
 }
@@ -107,7 +112,7 @@ impl Write {
             Kind::Gate { layer, function } => Self::Gate { layer, function },
             Kind::Up { layer, function } => Self::Up { layer, function },
             Kind::Output { layer, function } => Self::Output { layer, function },
-            Kind::Head { layer, head } => Self::Head { layer, head },
+            Kind::QueryKey { layer, group } => Self::QueryKey { layer, group },
         }
     }
 
@@ -117,19 +122,31 @@ impl Write {
             Self::Output { layer, function } => Some(format!("library.l{layer}.mlp.f{function}.out")),
             Self::Gate { layer, function } => Some(format!("library.l{layer}.mlp.f{function}.gate")),
             Self::Up { layer, function } => Some(format!("library.l{layer}.mlp.f{function}.up")),
-            Self::Token(_) | Self::Head { .. } => None,
+            Self::Token(_) | Self::QueryKey { .. } => None,
         }
     }
 }
 
-/// One mixture component: its candidate, its scale `c`, its logit, and for a head the gauge that
-/// brings it to the target's (per plane a rotation and a scale), fixed for the epoch.
+/// One mixture component: its candidate, its scale `c`, its logit, and for a key-value group the
+/// gauge that brings it to the target's (per plane a rotation and a scale) and the candidate's
+/// query head each of the target's query heads faces, both fixed for the epoch.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Component {
     pub write: Write,
     pub scale: f64,
     pub logit: f64,
     pub gauge: Vec<(Array2<f64>, f64)>,
+    #[serde(default)]
+    pub assignment: Vec<usize>,
+}
+
+/// A candidate chosen for a target at an epoch: its least-squares scale and, for a key-value
+/// group, its gauge and assignment ([`Component`]).
+struct Choice {
+    write: Write,
+    scale: f64,
+    gauge: Vec<(Array2<f64>, f64)>,
+    assignment: Vec<usize>,
 }
 
 /// The mixture prior of one target (module note).
@@ -216,18 +233,19 @@ struct Moment {
     second: f64,
 }
 
-/// A head's query and key operators (trainable indices) and its rotary planes.
+/// A key-value group's query operators (in head order) and key operator (trainable indices) and
+/// its rotary planes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct HeadMaps {
-    query: usize,
+struct GroupMaps {
+    queries: Vec<usize>,
     key: usize,
     planes: Vec<Vec<usize>>,
     /// Per plane, its prior group.
     groups: Vec<usize>,
 }
 
-/// The mixture prior of every gate direction and every head with a key of its own of a library
-/// explanation (module note).
+/// The mixture prior of every MLP block and every key-value group with a key of its own of a
+/// library explanation (module note).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Mixture {
     pub targets: Vec<Target>,
@@ -238,15 +256,15 @@ pub struct Mixture {
     /// Per target, Adam's moments of its zero logit, then per component its logit and scale, then
     /// its `ln s²`.
     moments: Vec<Vec<Moment>>,
-    /// Per layer the trainable indices of its gate and output operators; the heads' maps; the
-    /// token embedding (`d × vocabulary`); each gate target's cells (trainable index, rows,
-    /// columns).
+    /// Per layer the trainable indices of its gate and output operators; the key-value groups'
+    /// maps; the token embedding (`d × vocabulary`); each MLP block target's cells (trainable
+    /// index, rows, columns).
     gates: Vec<usize>,
     outputs: Vec<usize>,
     /// Per layer, its up operator's trainable index when its MLP is gated.
     #[serde(default)]
     ups: Vec<Option<usize>>,
-    heads: Vec<((usize, usize), HeadMaps)>,
+    key_values: Vec<((usize, usize), GroupMaps)>,
     #[serde(skip)]
     embedding: Array2<f64>,
     cells: Vec<Vec<(usize, Vec<usize>, std::ops::Range<usize>)>>,
@@ -313,27 +331,38 @@ impl Mixture {
             }
             written += layer.functions.len();
         }
-        let mut heads = Vec::new();
-        for (&(l, h), found) in &library_sharing::heads(explanation)? {
-            let planes = library_sharing::planes(program.operators[found.query].rows.width(), found.rotary);
-            let groups = explanation.layers[l].heads[h].0.clone();
-            if groups.len() != planes.len() {
-                return Err(format!("head {l}.{h}: one prior group per plane required"));
+        // Every key-value group whose key is its own; a member of a shared function is not.
+        let mut key_values = Vec::new();
+        for (&(l, g), found) in &library_sharing::key_values(explanation)? {
+            if !found.own_key {
+                continue;
             }
-            heads.push(((l, h), HeadMaps { query: position(found.query)?, key: position(found.key)?, planes, groups }));
+            let planes = library_sharing::planes(program.operators[found.key].rows.width(), found.rotary);
+            let groups = explanation.layers[l].heads[found.heads[0].0].0.clone();
+            if groups.len() != planes.len() {
+                return Err(format!("key-value group {l}.{g}: one prior group per plane required"));
+            }
+            let queries = found.queries().into_iter().map(position).collect::<Result<Vec<_>, _>>()?;
+            key_values.push(((l, g), GroupMaps { queries, key: position(found.key)?, planes, groups }));
         }
-        for &((l, h), ref maps) in &heads {
-            let choices = heads.iter().filter(|((other, _), other_maps)| *other < l && other_maps.planes == maps.planes).count();
-            targets.push(Target { kind: Kind::Head { layer: l, head: h }, groups: maps.groups.clone(), choices, zero_logit: 0.0, components: Vec::new(), log_variance: 0.0 });
+        for &((l, g), ref maps) in &key_values {
+            let choices = key_values.iter().filter(|((other, _), other_maps)| *other < l && Self::compatible(maps, other_maps)).count();
+            targets.push(Target { kind: Kind::QueryKey { layer: l, group: g }, groups: maps.groups.clone(), choices, zero_logit: 0.0, components: Vec::new(), log_variance: 0.0 });
             cells.push(Vec::new());
         }
         let moments = targets.iter().map(|_| vec![Moment::default(); 2]).collect();
-        Ok(Self { targets, width, steps, taken: 0, moments, gates, outputs, ups, heads, embedding, cells })
+        Ok(Self { targets, width, steps, taken: 0, moments, gates, outputs, ups, key_values, embedding, cells })
     }
 
-    /// The maps of head `head` of layer `layer`.
-    fn head(&self, layer: usize, head: usize) -> Result<&HeadMaps, String> {
-        self.heads.iter().find(|(at, _)| *at == (layer, head)).map(|(_, m)| m).ok_or_else(|| format!("no head {layer}.{head} in the mixture"))
+    /// The maps of key-value group `group` of layer `layer`.
+    fn key_value(&self, layer: usize, group: usize) -> Result<&GroupMaps, String> {
+        self.key_values.iter().find(|(at, _)| *at == (layer, group)).map(|(_, m)| m).ok_or_else(|| format!("no key-value group {layer}.{group} in the mixture"))
+    }
+
+    /// Whether one group's query–key maps can stand for another's: the same planes and as many
+    /// query heads.
+    fn compatible(a: &GroupMaps, b: &GroupMaps) -> bool {
+        a.planes == b.planes && a.queries.len() == b.queries.len()
     }
 
     /// Whether target `t` is in the explanation (any of its groups is).
@@ -341,17 +370,17 @@ impl Mixture {
         self.targets[t].groups.iter().any(|g| posterior.active[*g])
     }
 
-    /// Target `t`'s planes in the explanation (a head's), as `(plane, group)`.
-    fn live_planes(&self, maps: &HeadMaps, posterior: &Posterior) -> Vec<usize> {
+    /// A key-value group's planes in the explanation.
+    fn live_planes(&self, maps: &GroupMaps, posterior: &Posterior) -> Vec<usize> {
         (0..maps.planes.len()).filter(|p| posterior.active[maps.groups[*p]]).collect()
     }
 
-    /// A head's vector over the rows of the planes `live` of `(q, k)`: its query rows, then its key
-    /// rows, each row's `d` entries in turn.
-    fn head_vector(maps: &HeadMaps, live: &[usize], q: &Array2<f64>, k: &Array2<f64>) -> Array1<f64> {
+    /// A key-value group's vector over the rows of the planes `live` of its maps `(q, k)`: each
+    /// query map's rows in turn, then its key's, each row's `d` entries in turn.
+    fn group_vector(maps: &GroupMaps, live: &[usize], q: &[&Array2<f64>], k: &Array2<f64>) -> Array1<f64> {
         let rows: Vec<usize> = live.iter().flat_map(|p| maps.planes[*p].clone()).collect();
-        let mut out = Vec::with_capacity(2 * rows.len() * q.ncols());
-        for m in [q, k] {
+        let mut out = Vec::with_capacity((q.len() + 1) * rows.len() * k.ncols());
+        for m in q.iter().copied().chain([k]) {
             for &r in &rows {
                 out.extend(m.row(r).iter().copied());
             }
@@ -359,16 +388,37 @@ impl Mixture {
         Array1::from(out)
     }
 
-    /// The transpose of [`Self::head_vector`]: `vector`'s entries added into `(dq, dk)`.
-    fn head_scatter(maps: &HeadMaps, live: &[usize], vector: &Array1<f64>, dq: &mut Array2<f64>, dk: &mut Array2<f64>) {
+    /// The transpose of [`Self::group_vector`]: `vector`'s entries added into `(dq, dk)`.
+    fn group_scatter(maps: &GroupMaps, live: &[usize], vector: &Array1<f64>, dq: &mut [Array2<f64>], dk: &mut Array2<f64>) {
         let rows: Vec<usize> = live.iter().flat_map(|p| maps.planes[*p].clone()).collect();
-        let d = dq.ncols();
-        for (side, m) in [dq, dk].into_iter().enumerate() {
+        let d = dk.ncols();
+        for (side, m) in dq.iter_mut().chain([dk]).enumerate() {
             for (i, &r) in rows.iter().enumerate() {
                 let start = (side * rows.len() + i) * d;
                 m.row_mut(r).scaled_add(1.0, &vector.slice(ndarray::s![start..start + d]));
             }
         }
+    }
+
+    /// The candidate group `source`'s maps brought to the target group `target`'s: per plane the
+    /// gauge, and per target query head the source query head it faces (the optimal assignment
+    /// of their misfits under the gauge, `library_bodies::hungarian`), alternated twice from the
+    /// keys' gauge.
+    fn align(target: (&[&Array2<f64>], &Array2<f64>), source: (&[&Array2<f64>], &Array2<f64>), planes: &[Vec<usize>]) -> Result<(Vec<usize>, Vec<(Array2<f64>, f64)>), String> {
+        let ((qt, kt), (qs, ks)) = (target, source);
+        let mut assignment: Vec<usize> = (0..qt.len()).collect();
+        let mut gauge = library_sharing::gauge(&[], kt, &[], ks, planes);
+        if qt.len() == 1 {
+            return Ok((assignment, library_sharing::gauge(qt, kt, qs, ks, planes)));
+        }
+        for _ in 0..2 {
+            let turned: Vec<Array2<f64>> = qs.iter().map(|q| library_sharing::turn(q, planes, &gauge, true, false)).collect();
+            let cost = Array2::from_shape_fn((qt.len(), qs.len()), |(i, j)| (qt[i] - &turned[j]).iter().map(|v| v * v).sum::<f64>());
+            assignment = crate::library_bodies::hungarian(&cost)?;
+            let facing: Vec<&Array2<f64>> = assignment.iter().map(|&j| qs[j]).collect();
+            gauge = library_sharing::gauge(qt, kt, &facing, ks, planes);
+        }
+        Ok((assignment, gauge))
     }
 
     /// The vector of an MLP block or a token row at `get`'s values (by trainable index): a gate or
@@ -379,7 +429,7 @@ impl Mixture {
             Write::Gate { layer, function } => Ok(get(self.gates[layer])?.row(function)),
             Write::Up { layer, function } => Ok(get(self.ups[layer].ok_or("an up row of an ungated MLP")?)?.row(function)),
             Write::Token(token) => Ok(self.embedding.column(token)),
-            Write::Head { .. } => Err("a head is no MLP block".into()),
+            Write::QueryKey { .. } => Err("a key-value group is no MLP block".into()),
         }
     }
 
@@ -389,7 +439,7 @@ impl Mixture {
             Write::Output { layer, .. } => Ok((self.outputs[layer], true)),
             Write::Gate { layer, .. } => Ok((self.gates[layer], false)),
             Write::Up { layer, .. } => Ok((self.ups[layer].ok_or("an up row of an ungated MLP")?, false)),
-            Write::Token(_) | Write::Head { .. } => Err("not a trainable MLP block".into()),
+            Write::Token(_) | Write::QueryKey { .. } => Err("not a trainable MLP block".into()),
         }
     }
 
@@ -398,7 +448,7 @@ impl Mixture {
     fn candidates(&self, kind: Kind, posterior: &Posterior, explanation: &Explanation) -> Result<Vec<Write>, String> {
         let layer = match kind {
             Kind::Gate { layer, .. } | Kind::Up { layer, .. } | Kind::Output { layer, .. } => layer,
-            Kind::Head { .. } => return Err("a head is no MLP block".into()),
+            Kind::QueryKey { .. } => return Err("a key-value group is no MLP block".into()),
         };
         let mut out = Vec::new();
         for earlier in 0..layer {
@@ -425,17 +475,17 @@ impl Mixture {
         Ok(out)
     }
 
-    /// Target `t`'s new candidates `(write, least-squares scale, gauge)` replace its old ones: kept
+    /// Target `t`'s new candidates replace its old ones: kept
     /// candidates keep their logit, scale and moments, new ones start at the zero logit.
-    fn adopt(&mut self, t: usize, chosen: Vec<(Write, f64, Vec<(Array2<f64>, f64)>)>, initial_log_variance: f64) {
+    fn adopt(&mut self, t: usize, chosen: Vec<Choice>, initial_log_variance: f64) {
         let old = std::mem::take(&mut self.targets[t].components);
         let zero = self.targets[t].zero_logit;
         let mut moments = vec![self.moments[t][0]];
         let mut components = Vec::with_capacity(chosen.len());
-        for (write, scale, gauge) in chosen {
+        for Choice { write, scale, gauge, assignment } in chosen {
             let (component, moment) = match old.iter().position(|c| c.write == write) {
-                Some(at) => (Component { gauge, ..old[at].clone() }, [self.moments[t][1 + 2 * at], self.moments[t][2 + 2 * at]]),
-                None => (Component { write, scale, logit: zero, gauge }, [Moment::default(); 2]),
+                Some(at) => (Component { gauge, assignment, ..old[at].clone() }, [self.moments[t][1 + 2 * at], self.moments[t][2 + 2 * at]]),
+                None => (Component { write, scale, logit: zero, gauge, assignment }, [Moment::default(); 2]),
             };
             components.push(component);
             moments.extend(moment);
@@ -454,14 +504,14 @@ impl Mixture {
         // MLP blocks: per layer and kind, the targets' posterior rows against every candidate, `d`
         // candidates at a time.
         let d = self.embedding.nrows();
-        let kinds: Vec<Kind> = self.targets.iter().map(|t| t.kind).filter(|k| !matches!(k, Kind::Head { .. })).collect();
+        let kinds: Vec<Kind> = self.targets.iter().map(|t| t.kind).filter(|k| !matches!(k, Kind::QueryKey { .. })).collect();
         let mut seen: Vec<(usize, u8)> = Vec::new();
         for kind in kinds {
             let (layer, part) = match kind {
                 Kind::Gate { layer, .. } => (layer, 0u8),
                 Kind::Up { layer, .. } => (layer, 1),
                 Kind::Output { layer, .. } => (layer, 2),
-                Kind::Head { .. } => continue,
+                Kind::QueryKey { .. } => continue,
             };
             if seen.contains(&(layer, part)) {
                 continue;
@@ -495,7 +545,7 @@ impl Mixture {
                 for (slot, &t) in rows.iter().enumerate() {
                     let i = match self.targets[t].kind {
                         Kind::Gate { function, .. } | Kind::Up { function, .. } | Kind::Output { function, .. } => function,
-                        Kind::Head { .. } => continue,
+                        Kind::QueryKey { .. } => continue,
                     };
                     for k in 0..end - start {
                         if norm[[i, k]] > 0.0 {
@@ -510,45 +560,47 @@ impl Mixture {
             for (slot, &t) in rows.iter().enumerate() {
                 let i = match self.targets[t].kind {
                     Kind::Gate { function, .. } | Kind::Up { function, .. } | Kind::Output { function, .. } => function,
-                    Kind::Head { .. } => continue,
+                    Kind::QueryKey { .. } => continue,
                 };
                 // A new target's variance starts at its block's mean posterior variance.
                 let initial = log_sd.row(i).mapv(|s| (2.0 * s).exp()).mean().ok_or("an empty block")?.ln();
-                let chosen = best[slot].iter().map(|&(_, scale, k)| (writes[k], scale, Vec::new())).collect();
+                let chosen = best[slot].iter().map(|&(_, scale, k)| Choice { write: writes[k], scale, gauge: Vec::new(), assignment: Vec::new() }).collect();
                 self.adopt(t, chosen, initial);
             }
         }
-        // Earlier heads are the parents in a fixed layer order. This preserves every possible
-        // cross-layer pair while making the product of conditional mixtures a joint density.
+        // Earlier key-value groups are the parents in a fixed layer order. This preserves every
+        // possible cross-layer pair while making the product of conditional mixtures a joint
+        // density.
         for t in 0..self.targets.len() {
-            let Kind::Head { layer, head } = self.targets[t].kind else { continue };
+            let Kind::QueryKey { layer, group } = self.targets[t].kind else { continue };
             if !self.active(t, posterior) {
                 continue;
             }
-            let maps = self.head(layer, head)?;
+            let maps = self.key_value(layer, group)?;
             let live = self.live_planes(maps, posterior);
-            let (q1, k1) = (&posterior.mean[maps.query], &posterior.mean[maps.key]);
-            let mu = Self::head_vector(maps, &live, q1, k1);
-            let sd = Self::head_vector(maps, &live, &posterior.log_sd[maps.query], &posterior.log_sd[maps.key]);
+            let means = |m: &GroupMaps| -> (Vec<&Array2<f64>>, &Array2<f64>) { (m.queries.iter().map(|&q| &posterior.mean[q]).collect(), &posterior.mean[m.key]) };
+            let (q1, k1) = means(maps);
+            let mu = Self::group_vector(maps, &live, &q1, k1);
+            let sd = Self::group_vector(maps, &live, &maps.queries.iter().map(|&q| &posterior.log_sd[q]).collect::<Vec<_>>(), &posterior.log_sd[maps.key]);
             let precision = sd.mapv(|s| (-2.0 * s).exp());
             let mut scored = Vec::new();
-            for &((l, h), ref other) in &self.heads {
-                if l >= layer || other.planes != maps.planes {
+            for &((l, g), ref other) in &self.key_values {
+                if l >= layer || !Self::compatible(maps, other) {
                     continue;
                 }
-                let (q, k) = (&posterior.mean[other.query], &posterior.mean[other.key]);
-                let gauge = library_sharing::gauge(q1, k1, q, k, &maps.planes);
-                let (aq, ak) = library_sharing::apply_gauge(q, k, &maps.planes, &gauge, false);
-                let u = Self::head_vector(maps, &live, &aq, &ak);
+                let (q, k) = means(other);
+                let (assignment, gauge) = Self::align((&q1, k1), (&q, k), &maps.planes)?;
+                let turned: Vec<Array2<f64>> = assignment.iter().map(|&j| library_sharing::turn(q[j], &maps.planes, &gauge, true, false)).collect();
+                let u = Self::group_vector(maps, &live, &turned.iter().collect::<Vec<_>>(), &library_sharing::turn(k, &maps.planes, &gauge, false, false));
                 let (cross, norm) = ((&mu * &precision).dot(&u), (&u * &u * &precision).sum());
                 if norm > 0.0 {
-                    scored.push((-cross * cross / norm, cross / norm, Write::Head { layer: l, head: h }, gauge));
+                    scored.push((-cross * cross / norm, Choice { write: Write::QueryKey { layer: l, group: g }, scale: cross / norm, gauge, assignment }));
                 }
             }
             scored.sort_by(|a, b| a.0.total_cmp(&b.0));
             scored.truncate(self.width);
-            let initial = sd.mapv(|s| (2.0 * s).exp()).mean().ok_or("an empty head")?.ln();
-            self.adopt(t, scored.into_iter().map(|(_, scale, write, gauge)| (write, scale, gauge)).collect(), initial);
+            let initial = sd.mapv(|s| (2.0 * s).exp()).mean().ok_or("an empty key-value group")?.ln();
+            self.adopt(t, scored.into_iter().map(|(_, choice)| choice).collect(), initial);
         }
         Ok(())
     }
@@ -583,14 +635,14 @@ impl Mixture {
         let mut tokens = Vec::new();
         let mut rows: Vec<(&'static str, (usize, usize), (usize, usize), f64)> = Vec::new();
         let mut columns: Vec<((usize, usize), (usize, usize), f64)> = Vec::new();
-        let mut pairs: Vec<[(usize, usize); 2]> = Vec::new();
+        let mut pairs: Vec<[library_sharing::Member; 2]> = Vec::new();
         // An MLP block takes part in one exact sharing per hardening: as a target or as a source.
         let mut taken: Vec<Write> = Vec::new();
         let mut nats = 0.0;
         for (t, j) in self.dominant(posterior)? {
             let target = &self.targets[t];
             let (own, source) = (Write::of(target.kind), target.components[j].write);
-            if !matches!(own, Write::Head { .. }) && (taken.contains(&own) || taken.contains(&source)) {
+            if taken.contains(&own) || taken.contains(&source) {
                 continue;
             }
             let least_squares = |g: &Array1<f64>, s: &Array1<f64>| if s.dot(s) > 0.0 { Some(g.dot(s) / s.dot(s)) } else { None };
@@ -628,20 +680,20 @@ impl Mixture {
                     }
                     tokens.push(((gl, gi), token, g.dot(&e) / e.dot(&e)));
                 }
-                (Kind::Head { layer, head }, Write::Head { layer: other, head: h }) => {
-                    let (a, b) = ((layer, head), (other, h));
-                    if pairs.iter().flatten().any(|m| *m == a || *m == b) {
-                        continue;
-                    }
-                    pairs.push(if a < b { [a, b] } else { [b, a] });
+                (Kind::QueryKey { layer, group }, Write::QueryKey { layer: other, group: g }) => {
+                    // The earlier group owns the shared maps; the target's head `i` reads the
+                    // owner's head its assignment names.
+                    let width = target.components[j].assignment.len();
+                    pairs.push([
+                        library_sharing::Member { layer: other, group: g, queries: (0..width).collect() },
+                        library_sharing::Member { layer, group, queries: target.components[j].assignment.clone() },
+                    ]);
                 }
                 _ => return Err("a component's candidate of another kind than its target".into()),
             }
-            if !matches!(own, Write::Head { .. }) {
-                taken.push(own);
-                if !matches!(source, Write::Token(_)) {
-                    taken.push(source);
-                }
+            taken.push(own);
+            if !matches!(source, Write::Token(_)) {
+                taken.push(source);
             }
             nats += (target.choices as f64).ln();
         }
@@ -702,27 +754,29 @@ impl Mixture {
                 let v = Array1::from_elem(g.len(), group_variance(&self.cells[t], posterior));
                 Ok((g, writes, v))
             }
-            Kind::Head { layer, head } => {
-                let maps = self.head(layer, head)?;
+            Kind::QueryKey { layer, group } => {
+                let maps = self.key_value(layer, group)?;
                 let live = self.live_planes(maps, posterior);
-                let g = Self::head_vector(maps, &live, get(maps.query)?, get(maps.key)?);
+                let queries = |m: &GroupMaps| m.queries.iter().map(|&q| get(q)).collect::<Result<Vec<_>, _>>();
+                let g = Self::group_vector(maps, &live, &queries(maps)?, get(maps.key)?);
                 let writes = target
                     .components
                     .iter()
                     .map(|c| match c.write {
-                        Write::Head { layer, head } => {
-                            let other = self.head(layer, head)?;
-                            let (aq, ak) = library_sharing::apply_gauge(get(other.query)?, get(other.key)?, &maps.planes, &c.gauge, false);
-                            Ok(Self::head_vector(maps, &live, &aq, &ak))
+                        Write::QueryKey { layer, group } => {
+                            let other = self.key_value(layer, group)?;
+                            let q = queries(other)?;
+                            let turned: Vec<Array2<f64>> = c.assignment.iter().map(|&j| library_sharing::turn(q[j], &maps.planes, &c.gauge, true, false)).collect();
+                            Ok(Self::group_vector(maps, &live, &turned.iter().collect::<Vec<_>>(), &library_sharing::turn(get(other.key)?, &maps.planes, &c.gauge, false, false)))
                         }
-                        _ => Err("a write candidate for a head".to_string()),
+                        _ => Err("a write candidate for a key-value group".to_string()),
                     })
                     .collect::<Result<Vec<_>, String>>()?;
-                let d = posterior.mean[maps.query].ncols();
+                let d = posterior.mean[maps.key].ncols();
                 let mut v = Vec::with_capacity(g.len());
-                for _side in 0..2 {
+                for _side in 0..maps.queries.len() + 1 {
                     for &p in &live {
-                        let cells: Vec<(usize, Vec<usize>, std::ops::Range<usize>)> = [maps.query, maps.key].iter().map(|&i| (i, maps.planes[p].clone(), 0..d)).collect();
+                        let cells: Vec<(usize, Vec<usize>, std::ops::Range<usize>)> = maps.queries.iter().chain([&maps.key]).map(|&i| (i, maps.planes[p].clone(), 0..d)).collect();
                         let variance = group_variance(&cells, posterior);
                         v.extend(std::iter::repeat_n(variance, maps.planes[p].len() * d));
                     }
@@ -744,15 +798,15 @@ impl PriorTerm for Mixture {
                     out.extend(self.place(Write::of(target.kind)).map(|p| p.0));
                     out.extend(self.cells[t].iter().map(|c| c.0)); // includes bias in v_G
                 }
-                Kind::Head { layer, head } => {
-                    if let Ok(maps) = self.head(layer, head) { out.extend([maps.query, maps.key]); }
+                Kind::QueryKey { layer, group } => {
+                    if let Ok(maps) = self.key_value(layer, group) { out.extend(maps.queries.iter().chain([&maps.key])); }
                 }
             }
             for candidate in &target.components {
                 match candidate.write {
                     Write::Output { .. } | Write::Gate { .. } | Write::Up { .. } => out.extend(self.place(candidate.write).map(|p| p.0)),
-                    Write::Head { layer, head } => {
-                        if let Ok(maps) = self.head(layer, head) { out.extend([maps.query, maps.key]); }
+                    Write::QueryKey { layer, group } => {
+                        if let Ok(maps) = self.key_value(layer, group) { out.extend(maps.queries.iter().chain([&maps.key])); }
                     }
                     Write::Token(_) => {} // fixed embedding, not a posterior parameter
                 }
@@ -795,7 +849,7 @@ impl PriorTerm for Mixture {
                 let (i, column) = self.place(write)?;
                 let index = match write {
                     Write::Output { function, .. } | Write::Gate { function, .. } | Write::Up { function, .. } => function,
-                    Write::Token(_) | Write::Head { .. } => return Err("not an MLP block".into()),
+                    Write::Token(_) | Write::QueryKey { .. } => return Err("not an MLP block".into()),
                 };
                 slot(gradient, i)?;
                 let target = gradient.get_mut(&i).ok_or("slot")?;
@@ -809,27 +863,32 @@ impl PriorTerm for Mixture {
                         add(&mut gradient, component.write, derivative)?;
                     }
                 }
-                Kind::Head { layer, head } => {
-                    let maps = self.head(layer, head)?;
+                Kind::QueryKey { layer, group } => {
+                    let maps = self.key_value(layer, group)?;
                     let live = self.live_planes(maps, posterior);
-                    let (q, k) = (theta.get(&maps.query).ok_or("a sample")?, theta.get(&maps.key).ok_or("a sample")?);
-                    let (mut dq, mut dk) = (Array2::zeros(q.dim()), Array2::zeros(k.dim()));
-                    Self::head_scatter(maps, &live, &found.target, &mut dq, &mut dk);
-                    for (i, m) in [(maps.query, dq), (maps.key, dk)] {
-                        slot(&mut gradient, i)?;
-                        *gradient.get_mut(&i).ok_or("slot")? += &m;
+                    let (query, key) = (theta.get(&maps.queries[0]).ok_or("a sample")?.dim(), theta.get(&maps.key).ok_or("a sample")?.dim());
+                    let zeros = || -> (Vec<Array2<f64>>, Array2<f64>) { (vec![Array2::zeros(query); maps.queries.len()], Array2::zeros(key)) };
+                    let (mut dq, mut dk) = zeros();
+                    Self::group_scatter(maps, &live, &found.target, &mut dq, &mut dk);
+                    for (i, m) in maps.queries.iter().zip(dq).chain([(&maps.key, dk)]) {
+                        slot(&mut gradient, *i)?;
+                        *gradient.get_mut(i).ok_or("slot")? += &m;
                     }
                     for (component, derivative) in target.components.iter().zip(&found.writes) {
-                        let Write::Head { layer, head } = component.write else { continue };
-                        let other = self.head(layer, head)?;
-                        let (mut aq, mut ak) = (Array2::zeros(q.dim()), Array2::zeros(k.dim()));
-                        Self::head_scatter(maps, &live, derivative, &mut aq, &mut ak);
-                        // The gauge is linear: its transpose takes the derivative back to the head's maps.
-                        let (dq, dk) = library_sharing::apply_gauge(&aq, &ak, &maps.planes, &component.gauge, true);
-                        for (i, m) in [(other.query, dq), (other.key, dk)] {
-                            slot(&mut gradient, i)?;
-                            *gradient.get_mut(&i).ok_or("slot")? += &m;
+                        let Write::QueryKey { layer, group } = component.write else { continue };
+                        let other = self.key_value(layer, group)?;
+                        let (mut aq, mut ak) = zeros();
+                        Self::group_scatter(maps, &live, derivative, &mut aq, &mut ak);
+                        // The gauge is linear: its transpose takes the derivative back to the
+                        // candidate's maps, each target head's to the query head it faces.
+                        for (i, &j) in component.assignment.iter().enumerate() {
+                            let back = library_sharing::turn(&aq[i], &maps.planes, &component.gauge, true, true);
+                            slot(&mut gradient, other.queries[j])?;
+                            *gradient.get_mut(&other.queries[j]).ok_or("slot")? += &back;
                         }
+                        let back = library_sharing::turn(&ak, &maps.planes, &component.gauge, false, true);
+                        slot(&mut gradient, other.key)?;
+                        *gradient.get_mut(&other.key).ok_or("slot")? += &back;
                     }
                 }
             }
@@ -853,10 +912,10 @@ impl PriorTerm for Mixture {
             let target = &self.targets[t];
             let size = match target.kind {
                 Kind::Gate { .. } | Kind::Up { .. } | Kind::Output { .. } => self.cells[t].iter().map(|(_, rows, cols)| (rows.len() * cols.len()) as f64).sum::<f64>(),
-                Kind::Head { layer, head } => {
-                    let maps = self.head(layer, head)?;
-                    let d = posterior.mean[maps.query].ncols();
-                    self.live_planes(maps, posterior).iter().map(|p| (2 * maps.planes[*p].len() * d) as f64).sum()
+                Kind::QueryKey { layer, group } => {
+                    let maps = self.key_value(layer, group)?;
+                    let d = posterior.mean[maps.key].ncols();
+                    self.live_planes(maps, posterior).iter().map(|p| ((maps.queries.len() + 1) * maps.planes[*p].len() * d) as f64).sum()
                 }
             };
             let n = target.choices as f64;
@@ -864,12 +923,14 @@ impl PriorTerm for Mixture {
             let kept = (target.components.len() as f64).min(k.min(n));
             // ln C(n, K) for the candidates, ½ ln |G| for each of the 2K + 1 values.
             total += ln_gamma(n + 1.0) - ln_gamma(kept + 1.0) - ln_gamma(n - kept + 1.0) + (2.0 * kept + 1.0) * 0.5 * size.ln();
-            if matches!(target.kind, Kind::Head { .. }) {
+            if matches!(target.kind, Kind::QueryKey { .. }) {
                 // A target-dependent alignment is additional information even though its
                 // transform preserves the parent head's attention scores.
                 let gauge_values = target.components.iter().flat_map(|c| &c.gauge)
                     .map(|(rotation, _)| rotation.len() + 1).sum::<usize>();
                 total += gauge_values as f64 * 64.0 * std::f64::consts::LN_2;
+                // So is each assignment of the query heads, one of `m!`.
+                total += target.components.iter().map(|c| ln_gamma(c.assignment.len() as f64 + 1.0)).sum::<f64>();
             }
         }
         Ok(total)
@@ -881,25 +942,36 @@ impl PriorTerm for Mixture {
 
     fn load(&mut self, value: &serde_json::Value) -> Result<(), String> {
         let mut restored: Mixture = serde_json::from_value(value.clone()).map_err(error)?;
-        if restored.targets.len() != self.targets.len() || restored.gates != self.gates || restored.outputs != self.outputs || restored.heads != self.heads || restored.cells != self.cells {
+        if restored.targets.len() != self.targets.len() || restored.gates != self.gates || restored.outputs != self.outputs || restored.ups != self.ups || restored.key_values != self.key_values || restored.cells != self.cells {
             return Err("a checkpoint's mixture of another explanation".into());
         }
         for (target, expected) in restored.targets.iter().zip(&self.targets) {
             if target.kind != expected.kind || target.groups != expected.groups {
                 return Err("a checkpoint's mixture targets of another explanation".into());
             }
-            let Kind::Head { layer, head } = target.kind else { continue };
-            let maps = self.head(layer, head)?;
+            // Every candidate is of an earlier layer (a joint density), and a key-value group's is
+            // compatible and assigned by a permutation of its query heads.
             for component in &target.components {
-                let Write::Head { layer: parent_layer, head: parent_head } = component.write else {
-                    return Err("a checkpoint's head mixture has a non-head candidate".into());
+                let earlier = match (target.kind, component.write) {
+                    (Kind::QueryKey { layer, group }, Write::QueryKey { layer: parent, group: g }) => {
+                        let (maps, other) = (self.key_value(layer, group)?, self.key_value(parent, g)?);
+                        let mut seen = component.assignment.clone();
+                        seen.sort_unstable();
+                        parent < layer && Self::compatible(maps, other) && seen == (0..maps.queries.len()).collect::<Vec<_>>()
+                    }
+                    (Kind::QueryKey { .. }, _) | (_, Write::QueryKey { .. }) => false,
+                    (Kind::Gate { layer, .. } | Kind::Up { layer, .. } | Kind::Output { layer, .. }, write) => match write {
+                        Write::Token(_) => matches!(target.kind, Kind::Gate { .. }),
+                        Write::Output { layer: parent, .. } | Write::Gate { layer: parent, .. } | Write::Up { layer: parent, .. } => parent < layer,
+                        Write::QueryKey { .. } => false,
+                    },
                 };
-                if parent_layer >= layer || self.head(parent_layer, parent_head)?.planes != maps.planes {
-                    return Err("a checkpoint's head mixture must condition only on compatible earlier heads".into());
+                if !earlier {
+                    return Err("a checkpoint's mixture must condition only on compatible earlier heads and blocks".into());
                 }
             }
             if target.choices != expected.choices || target.components.len() > target.choices {
-                return Err("a checkpoint's head mixture has an invalid candidate count".into());
+                return Err("a checkpoint's mixture has an invalid candidate count".into());
             }
         }
         // Validate before moving the embedding: a rejected checkpoint leaves all state intact.
@@ -924,9 +996,9 @@ mod tests {
         let explanation = explanation(&native, &layer_nodes(&native, 2).unwrap()).unwrap();
         let mut posterior = Posterior::new(&explanation, 96).unwrap();
         let mixture = Mixture::new(&explanation, 2, Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 }).unwrap();
-        let (earlier, later) = (mixture.head(0, 0).unwrap(), mixture.head(1, 0).unwrap());
+        let (earlier, later) = (mixture.key_value(0, 0).unwrap(), mixture.key_value(1, 0).unwrap());
         // Identical nonzero maps previously admitted reciprocal, unit-scale components.
-        for (from, to) in [(earlier.query, later.query), (earlier.key, later.key)] {
+        for (from, to) in [(earlier.queries[0], later.queries[0]), (earlier.key, later.key)] {
             posterior.mean[to] = posterior.mean[from].clone();
         }
         (explanation, posterior, mixture)
@@ -937,19 +1009,19 @@ mod tests {
         let (explanation, posterior, mut mixture) = head_fixture("library_mixture_head_order");
         mixture.choose(&explanation, &posterior).unwrap();
         for target in &mixture.targets {
-            let Kind::Head { layer, head } = target.kind else { continue };
-            let maps = mixture.head(layer, head).unwrap();
-            let choices = mixture.heads.iter().filter(|((l, _), m)| *l < layer && m.planes == maps.planes).count();
+            let Kind::QueryKey { layer, group } = target.kind else { continue };
+            let maps = mixture.key_value(layer, group).unwrap();
+            let choices = mixture.key_values.iter().filter(|((l, _), m)| *l < layer && Mixture::compatible(maps, m)).count();
             assert_eq!(target.choices, choices);
             if layer == 0 {
                 assert!(target.components.is_empty(), "the first layer keeps its Gaussian prior");
             }
             for component in &target.components {
-                assert!(matches!(component.write, Write::Head { layer: parent, .. } if parent < layer));
+                assert!(matches!(component.write, Write::QueryKey { layer: parent, .. } if parent < layer));
             }
         }
-        let copied = mixture.targets.iter().find(|t| t.kind == Kind::Head { layer: 1, head: 0 }).unwrap();
-        let source = copied.components.iter().find(|c| c.write == Write::Head { layer: 0, head: 0 }).expect("the cross-layer copy stays available");
+        let copied = mixture.targets.iter().find(|t| t.kind == Kind::QueryKey { layer: 1, group: 0 }).unwrap();
+        let source = copied.components.iter().find(|c| c.write == Write::QueryKey { layer: 0, group: 0 }).expect("the cross-layer copy stays available");
         assert!((source.scale - 1.0).abs() < 1e-12);
     }
 
@@ -960,10 +1032,10 @@ mod tests {
         let before = mixture.save().unwrap();
         let embedding = mixture.embedding.clone();
         let mut cyclic = mixture.clone();
-        let later = cyclic.targets.iter().find(|t| t.kind == Kind::Head { layer: 1, head: 0 }).unwrap();
-        let mut reverse = later.components.iter().find(|c| c.write == Write::Head { layer: 0, head: 0 }).unwrap().clone();
-        reverse.write = Write::Head { layer: 1, head: 0 };
-        cyclic.targets.iter_mut().find(|t| t.kind == Kind::Head { layer: 0, head: 0 }).unwrap().components.push(reverse);
+        let later = cyclic.targets.iter().find(|t| t.kind == Kind::QueryKey { layer: 1, group: 0 }).unwrap();
+        let mut reverse = later.components.iter().find(|c| c.write == Write::QueryKey { layer: 0, group: 0 }).unwrap().clone();
+        reverse.write = Write::QueryKey { layer: 1, group: 0 };
+        cyclic.targets.iter_mut().find(|t| t.kind == Kind::QueryKey { layer: 0, group: 0 }).unwrap().components.push(reverse);
         assert!(mixture.load(&cyclic.save().unwrap()).unwrap_err().contains("earlier heads"));
         assert_eq!(mixture.save().unwrap(), before);
         assert_eq!(mixture.embedding, embedding);
@@ -979,14 +1051,14 @@ mod tests {
     fn head_cost_counts_the_components_actually_selected() {
         let (explanation, posterior, mut mixture) = head_fixture("library_mixture_head_cost");
         mixture.choose(&explanation, &posterior).unwrap();
-        let keep = mixture.targets.iter().position(|t| t.kind == Kind::Head { layer: 1, head: 0 }).unwrap();
+        let keep = mixture.targets.iter().position(|t| t.kind == Kind::QueryKey { layer: 1, group: 0 }).unwrap();
         for (t, target) in mixture.targets.iter_mut().enumerate() {
             target.components.truncate(if t == keep { 1 } else { 0 });
         }
         let target = &mixture.targets[keep];
         assert_eq!(target.components.len(), 1);
-        let maps = mixture.head(1, 0).unwrap();
-        let size = 2 * maps.planes.iter().map(Vec::len).sum::<usize>() * posterior.mean[maps.query].ncols();
+        let maps = mixture.key_value(1, 0).unwrap();
+        let size = 2 * maps.planes.iter().map(Vec::len).sum::<usize>() * posterior.mean[maps.key].ncols();
         let gauge_values = target.components[0].gauge.iter().map(|(rotation, _)| rotation.len() + 1).sum::<usize>();
         assert!(gauge_values > 0, "the target-dependent gauge must be charged");
         let expected = (target.choices as f64).ln() + 1.5 * (size as f64).ln()
@@ -1001,18 +1073,18 @@ mod tests {
         mixture.choose(&explanation, &posterior).unwrap();
         for target in &mixture.targets {
             let layer = match target.kind {
-                Kind::Gate { layer, .. } | Kind::Up { layer, .. } | Kind::Output { layer, .. } | Kind::Head { layer, .. } => layer,
+                Kind::Gate { layer, .. } | Kind::Up { layer, .. } | Kind::Output { layer, .. } | Kind::QueryKey { layer, .. } => layer,
             };
             for component in &target.components {
                 let parent = match component.write {
-                    Write::Output { layer, .. } | Write::Gate { layer, .. } | Write::Up { layer, .. } | Write::Head { layer, .. } => Some(layer),
+                    Write::Output { layer, .. } | Write::Gate { layer, .. } | Write::Up { layer, .. } | Write::QueryKey { layer, .. } => Some(layer),
                     Write::Token(_) => None,
                 };
                 assert!(parent.is_none_or(|p| p < layer), "a prior parent is in an earlier layer");
             }
         }
         for target in &mut mixture.targets {
-            if target.kind != (Kind::Head { layer: 1, head: 0 }) { target.components.clear(); }
+            if target.kind != (Kind::QueryKey { layer: 1, group: 0 }) { target.components.clear(); }
         }
         let selected = mixture.operators();
         assert!(selected.len() <= 6, "one target and at most two parent Q/K pairs");
@@ -1091,6 +1163,101 @@ mod tests {
         assert!((mean - reference).abs() < 4.0 * error, "sampled {mean} ± {error} against {reference}");
     }
 
+    /// The weight sample of `key` of `posterior`'s operators the mixture reads.
+    fn draw(mixture: &Mixture, posterior: &Posterior, key: u64) -> BTreeMap<usize, Array2<f64>> {
+        mixture
+            .operators()
+            .into_iter()
+            .map(|i| {
+                let (mean, log_sd) = (&posterior.mean[i], &posterior.log_sd[i]);
+                let cols = mean.ncols();
+                (i, Array2::from_shape_fn(mean.dim(), |(r, c)| mean[[r, c]] + log_sd[[r, c]].exp() * f64::from(gam_gpu::tensor::posterior_normal(key, i as u64, (r * cols + c) as u64))))
+            })
+            .collect()
+    }
+
+    /// `steps` steps of the mixture's own parameters on samples of `posterior`.
+    fn learn(mixture: &mut Mixture, posterior: &Posterior, steps: u64) {
+        for key in 0..steps {
+            let theta = draw(mixture, posterior, key);
+            mixture.sample(posterior, &theta, true).unwrap();
+        }
+    }
+
+    /// A tiny grouped-query explanation whose layer-1 key-value group is layer 0's with its two
+    /// query heads swapped.
+    fn swapped_group(name: &str) -> (crate::import::Imported, Explanation) {
+        use crate::{library_mdl::explanation, operator_program::{Operator, Provenance, exact_precision}, run_check::{layer_nodes, split_sites}};
+        let imported = library_sharing::grouped(name);
+        let native = split_sites(&imported.program).unwrap();
+        let mut start = explanation(&native, &layer_nodes(&native, 2).unwrap()).unwrap();
+        let found = library_sharing::key_values(&start).unwrap();
+        let (first, second) = (&found[&(0, 0)], &found[&(1, 0)]);
+        let copies = [(first.heads[1].1.query, second.heads[0].1.query), (first.heads[0].1.query, second.heads[1].1.query), (first.key, second.key)];
+        let program = &mut start.artifact.program;
+        for (from, to) in copies {
+            let values = program.operators[from].matrix();
+            let precision = exact_precision(values.iter().copied()).unwrap();
+            let source = &program.operators[to];
+            program.operators[to] = std::sync::Arc::new(Operator::dense(source.name.clone(), source.rows.clone(), source.cols.clone(), values, precision, Provenance::default()).unwrap());
+        }
+        (imported, start)
+    }
+
+    #[test]
+    fn a_key_value_group_copied_with_its_query_heads_swapped_is_found_assigned_and_shared() {
+        let (imported, start) = swapped_group("library_mixture_grouped");
+        let posterior = Posterior::new(&start, 96).unwrap();
+        let mut mixture = Mixture::new(&start, 2, Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 }).unwrap();
+        mixture.epoch(&start, &posterior).unwrap();
+        let t = mixture.targets.iter().position(|t| t.kind == Kind::QueryKey { layer: 1, group: 0 }).unwrap();
+        let copy = mixture.targets[t].components.iter().position(|c| c.write == Write::QueryKey { layer: 0, group: 0 }).expect("the copy is a candidate");
+        assert_eq!(mixture.targets[t].components[copy].assignment, vec![1, 0], "each query head faces the one it copies");
+        learn(&mut mixture, &posterior, 300);
+        let weights = mixture.targets[t].weights().unwrap();
+        assert!(weights[1 + copy] > 0.5, "the copy's weight dominates its mixture: {weights:?}");
+        assert!(mixture.dominant(&posterior).unwrap().contains(&(t, copy)));
+        let hardened = mixture.harden(&start, &posterior).unwrap();
+        let (before, after) = (start.artifact.execute(&imported.family).unwrap(), hardened.artifact.execute(&imported.family).unwrap());
+        let (a, b) = (&before.values[start.artifact.program.output], &after.values[hardened.artifact.program.output]);
+        let scale = a.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        assert!(a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= 1e-12 * scale), "the shared group keeps the outputs");
+        library_sharing::same_native_blocks(&start, &hardened);
+        let groups = library_sharing::key_values(&hardened).unwrap();
+        assert!(!groups[&(1, 0)].own_key, "layer 1's query heads read layer 0's maps");
+        assert!(hardened.fixed_nats >= (mixture.targets[t].choices as f64).ln() - 1e-12, "the choice is paid for");
+    }
+
+    #[test]
+    fn a_key_value_group_term_is_differentiated_through_its_gauge_and_assignment() {
+        let (_, start) = swapped_group("library_mixture_grouped_gradient");
+        let posterior = Posterior::new(&start, 96).unwrap();
+        let mut mixture = Mixture::new(&start, 2, Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 }).unwrap();
+        mixture.epoch(&start, &posterior).unwrap();
+        // The layer-1 group's term alone, against both candidates with their gauges and assignments.
+        let t = mixture.targets.iter().position(|t| t.kind == Kind::QueryKey { layer: 1, group: 0 }).unwrap();
+        for (u, target) in mixture.targets.iter_mut().enumerate() {
+            if u != t {
+                target.components.clear();
+            }
+        }
+        assert!(mixture.targets[t].components.iter().any(|c| c.assignment == vec![1, 0]));
+        let theta = draw(&mixture, &posterior, 7);
+        let (_, gradient) = mixture.sample(&posterior, &theta, false).unwrap();
+        let (target, source) = (mixture.key_value(1, 0).unwrap().clone(), mixture.key_value(0, 0).unwrap().clone());
+        let h = 1e-6;
+        for (i, entry) in [(target.queries[0], (0, 1)), (target.queries[1], (3, 2)), (target.key, (1, 0)), (source.queries[0], (2, 5)), (source.queries[1], (0, 0)), (source.key, (3, 7))] {
+            let mut at = |e: f64| {
+                let mut moved = theta.clone();
+                moved.get_mut(&i).unwrap()[entry] += e;
+                mixture.sample(&posterior, &moved, false).unwrap().0
+            };
+            let central = (at(h) - at(-h)) / (2.0 * h);
+            let found = gradient[&i][entry];
+            assert!((found - central).abs() <= 1e-6 * (1.0 + central.abs()), "operator {i} {entry:?}: {found} against {central}");
+        }
+    }
+
     #[test]
     fn exact_copies_of_ties_functions_and_heads_are_found_by_their_weights_and_made_exact() {
         use crate::{import::import_language_model, library_mdl::{Settings, explanation, fit}, operator_program::{Provenance, SlotValues, exact_precision}, run_check::{layer_nodes, split_sites}};
@@ -1122,10 +1289,10 @@ mod tests {
         values.column_mut(7).assign(&(&program.operators[out].matrix().column(4) * 0.5));
         replace(program, later_out, values);
         // Head 0 of layer 1 attends as head 0 of layer 0 does.
-        let found = library_sharing::heads(&start).unwrap();
+        let found = library_sharing::key_values(&start).unwrap();
         let (first, second) = (&found[&(0, 0)], &found[&(1, 0)]);
         let program = &mut start.artifact.program;
-        for (from, to) in [(first.query, second.query), (first.key, second.key)] {
+        for (from, to) in [(first.heads[0].1.query, second.heads[0].1.query), (first.key, second.key)] {
             let values = program.operators[from].matrix();
             replace(program, to, values);
         }
@@ -1141,19 +1308,7 @@ mod tests {
         let all_in = crate::library_mdl::Posterior::new(&start, 96).unwrap();
         let mut learned = Mixture::new(&start, 2, Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 }).unwrap();
         learned.epoch(&start, &all_in).unwrap();
-        for key in 0..300_u64 {
-            let theta = learned
-                .operators()
-                .into_iter()
-                .map(|i| {
-                    let (mean, log_sd) = (&all_in.mean[i], &all_in.log_sd[i]);
-                    let cols = mean.ncols();
-                    let sample = Array2::from_shape_fn(mean.dim(), |(r, c)| mean[[r, c]] + log_sd[[r, c]].exp() * f64::from(gam_gpu::tensor::posterior_normal(key, i as u64, (r * cols + c) as u64)));
-                    (i, sample)
-                })
-                .collect();
-            learned.sample(&all_in, &theta, true).unwrap();
-        }
+        learn(&mut learned, &all_in, 300);
         // The learned weights pick each copy among the candidates.
         let found = |kind: Kind, write: Write| -> (usize, usize) {
             let target = learned.targets.iter().position(|t| t.kind == kind).unwrap();
@@ -1163,7 +1318,7 @@ mod tests {
             (target, copy)
         };
         let (target, copy) = found(Kind::Gate { layer: 1, function: 5 }, Write::Output { layer: 0, function: 3 });
-        let head_copy = found(Kind::Head { layer: 1, head: 0 }, Write::Head { layer: 0, head: 0 });
+        let head_copy = found(Kind::QueryKey { layer: 1, group: 0 }, Write::QueryKey { layer: 0, group: 0 });
         let gate_copy = found(Kind::Gate { layer: 1, function: 7 }, Write::Gate { layer: 0, function: 4 });
         let output_copy = found(Kind::Output { layer: 1, function: 7 }, Write::Output { layer: 0, function: 4 });
         // Made exact, the tie keeps the outputs and pays for its choice.

@@ -1,30 +1,33 @@
 //! Shared functions of a library explanation (#2951).
 //!
 //! Several heads of a library ([`crate::library_mdl`]) may compute one attention pattern (VPD's
-//! previous-token and induction behaviours appear in more than one head). A shared query–key
-//! function replaces the members' query and key maps by one pair `(Q, K)` that every member reads:
-//! the first member attends with `q = Q x`, `k = K x`, and every other member `m` with
-//! `q = c_m Q x`, `k = K x`, where the scalar `c_m` (starting at 1) is its own part. Every member
-//! keeps its value map. The shared maps carry the prior groups of one head (a group per rotary
-//! plane, as in the library), paid once in `KL(q ‖ p)`; each `c_m` is one group. Members sit in
-//! different layers, so each layer's read of `Q x` stays its own variable, and each reads a key of
-//! its own: a key the query heads of one key-value group share stays that group's. The move is
-//! accepted only if the code length `F` of the re-converged fit falls.
+//! previous-token and induction behaviours appear in more than one head). The unit of sharing is
+//! a native key-value group: the query heads that read one key map in `M` (grouped-query
+//! attention), or one head where every head has its own key. A shared query–key function replaces
+//! the members' query and key maps by one set `(Q_1, …, Q_m, K)` that every member reads: the
+//! first member's head `j` attends with `q = Q_j x`, `k = K x`, and every other member's head `i`
+//! with `q = c_i Q_{π(i)} x`, `k = K x`, where `π` assigns the member's query heads to the
+//! owner's and the scalar `c_i` (starting at 1) is the head's own part. Every member keeps its
+//! value map. The shared maps carry the prior groups of one key-value group (a group per rotary
+//! plane, as in the library), paid once in `KL(q ‖ p)`; each `c_i` is one group. Members sit in
+//! different layers, so each layer's read of `Q x` stays its own variable.
+//! The move is accepted only if the code length `F` of the re-converged fit falls.
 //!
 //! # Candidates
 //!
 //! A head's scores are `qᵀ R k` with `R` the rotary turn between the two positions; a rotation and
-//! a scaling of a plane, `(s R q, R k / s)`, leave them unchanged. The pairs to share are found by
-//! the learned mixture prior over the heads' query–key maps (`library_mixture`).
+//! a scaling of a plane, `(s R q, R k / s)`, leave them unchanged, for every query head of a key
+//! at once. The groups to share, and the assignment of their query heads, are found by the learned
+//! mixture prior over the groups' query–key maps (`library_mixture`).
 //!
 //! # The start
 //!
 //! The shared maps start at the members' mean after each member is brought to the first member's
-//! gauge, plane by plane: the rotation `R` that minimizes `‖R Q_m − Q_1‖² + ‖R K_m − K_1‖²` over a
-//! plane's two rows (the orthogonal Procrustes solution in two dimensions; a sign on a coordinate
-//! no rotary plane holds), and the scale `s` with `(s R Q_m, R K_m / s)` in the first member's
-//! ratio of query to key norm. Both leave the member's scores unchanged, so the start is close to
-//! the current fit.
+//! gauge, plane by plane: the rotation `R` that minimizes `Σ_i ‖R Q_{m,i} − Q_{1,π(i)}‖² +
+//! ‖R K_m − K_1‖²` over a plane's two rows (the orthogonal Procrustes solution in two dimensions;
+//! a sign on a coordinate no rotary plane holds), and the scale `s` with `(s R Q_m, R K_m / s)` in
+//! the first member's ratio of query to key norm. Both leave the member's scores unchanged, so the
+//! start is close to the current fit.
 //!
 //! # Read–write ties
 //!
@@ -60,6 +63,7 @@ pub(crate) struct Head {
     rule: usize,
     pub(crate) query: usize,
     pub(crate) key: usize,
+    pub(crate) value: usize,
     pub(crate) rotary: Option<Rotary>,
 }
 
@@ -75,25 +79,50 @@ fn head(program: &OperatorProgram, layer: usize, h: usize) -> Result<Option<Head
         Some(Node::Attend { rotary, .. }) => *rotary,
         other => Err(format!("{name}: the output is not an attention node: {other:?}"))?,
     };
-    Ok(Some(Head { rule, query: map(1)?, key: map(2)?, rotary }))
+    Ok(Some(Head { rule, query: map(1)?, key: map(2)?, value: map(3)?, rotary }))
 }
 
-/// Every head of the explanation, by `(layer, head)`, whose key no other head reads: a key that
-/// the query heads of one key-value group share (`library_mdl::explanation`) stays that group's.
-pub(crate) fn heads(explanation: &Explanation) -> Result<BTreeMap<(usize, usize), Head>, String> {
+/// A key-value group of one layer (`library_mdl::explanation`): the query heads that read one key
+/// map and one value map, in head order, and those maps. Grouped-query attention makes a group of
+/// several heads; otherwise every head is a group of its own. A group whose key (value) map is
+/// not its own (`library.l{layer}.kv{group}.k`) reads another group's in a sharing.
+pub(crate) struct KeyValue {
+    pub(crate) heads: Vec<(usize, Head)>,
+    pub(crate) key: usize,
+    pub(crate) value: usize,
+    pub(crate) rotary: Option<Rotary>,
+    pub(crate) own_key: bool,
+    pub(crate) own_value: bool,
+}
+
+impl KeyValue {
+    /// Its query heads' query operators, in head order.
+    pub(crate) fn queries(&self) -> Vec<usize> {
+        self.heads.iter().map(|(_, h)| h.query).collect()
+    }
+}
+
+/// Every key-value group of the explanation by `(layer, group)`, the groups of a layer numbered in
+/// the order of their first heads as `library_mdl::explanation` numbers them.
+pub(crate) fn key_values(explanation: &Explanation) -> Result<BTreeMap<(usize, usize), KeyValue>, String> {
     let program = &explanation.artifact.program;
     let mut out = BTreeMap::new();
     for l in 0..explanation.layers.len() {
+        let mut groups: Vec<KeyValue> = Vec::new();
         for h in 0.. {
             let Some(found) = head(program, l, h)? else { break };
-            out.insert((l, h), found);
+            match groups.iter_mut().find(|g| g.key == found.key) {
+                Some(group) if group.value == found.value && group.rotary == found.rotary => group.heads.push((h, found)),
+                Some(_) => return Err(format!("head {l}.{h}: the query heads of one key read different values or planes")),
+                None => groups.push(KeyValue { key: found.key, value: found.value, rotary: found.rotary, own_key: false, own_value: false, heads: vec![(h, found)] }),
+            }
+        }
+        for (g, mut group) in groups.into_iter().enumerate() {
+            group.own_key = program.operators[group.key].name == format!("library.l{l}.kv{g}.k");
+            group.own_value = program.operators[group.value].name == format!("library.l{l}.kv{g}.v");
+            out.insert((l, g), group);
         }
     }
-    let mut readers: BTreeMap<usize, usize> = BTreeMap::new();
-    for found in out.values() {
-        *readers.entry(found.key).or_default() += 1;
-    }
-    out.retain(|_, found| readers[&found.key] == 1);
     Ok(out)
 }
 
@@ -109,16 +138,21 @@ fn norm(x: &Array2<f64>) -> f64 {
     x.iter().map(|v| v * v).sum::<f64>().sqrt()
 }
 
-/// Per plane of `planes`, the rotation (on one coordinate, the sign) and the scale that bring
-/// `(q, k)` to the gauge of `(q1, k1)` (module note).
-pub(crate) fn gauge(q1: &Array2<f64>, k1: &Array2<f64>, q: &Array2<f64>, k: &Array2<f64>, planes: &[Vec<usize>]) -> Vec<(Array2<f64>, f64)> {
+/// Per plane of `planes`, the rotation (on one coordinate, the sign) and the scale that bring a
+/// group's maps `(q, k)`, its query maps in turn and its key map, to the gauge of `(q1, k1)`
+/// (module note).
+pub(crate) fn gauge(q1: &[&Array2<f64>], k1: &Array2<f64>, q: &[&Array2<f64>], k: &Array2<f64>, planes: &[Vec<usize>]) -> Vec<(Array2<f64>, f64)> {
     planes
         .iter()
         .map(|rows| {
             let pick = |m: &Array2<f64>| m.select(ndarray::Axis(0), rows);
-            let (a_q, a_k, b_q, b_k) = (pick(q1), pick(k1), pick(q), pick(k));
+            let (a_q, b_q): (Vec<Array2<f64>>, Vec<Array2<f64>>) = (q1.iter().map(|m| pick(m)).collect(), q.iter().map(|m| pick(m)).collect());
+            let (a_k, b_k) = (pick(k1), pick(k));
             // The rotation (or, on one coordinate, the sign) nearest the first member's rows.
-            let m = a_q.dot(&b_q.t()) + a_k.dot(&b_k.t());
+            let mut m = a_k.dot(&b_k.t());
+            for (a, b) in a_q.iter().zip(&b_q) {
+                m += &a.dot(&b.t());
+            }
             let rotation = if rows.len() == 2 {
                 let angle = (m[[1, 0]] - m[[0, 1]]).atan2(m[[0, 0]] + m[[1, 1]]);
                 let (sine, cosine) = angle.sin_cos();
@@ -126,33 +160,29 @@ pub(crate) fn gauge(q1: &Array2<f64>, k1: &Array2<f64>, q: &Array2<f64>, k: &Arr
             } else {
                 ndarray::array![[if m[[0, 0]] < 0.0 { -1.0 } else { 1.0 }]]
             };
-            let (r_q, r_k) = (rotation.dot(&b_q), rotation.dot(&b_k));
-            let (nq, nk, n1q, n1k) = (norm(&r_q), norm(&r_k), norm(&a_q), norm(&a_k));
+            // A rotation keeps norms: the scale puts the query maps' norm against the key's in the
+            // first member's ratio.
+            let joint = |ms: &[Array2<f64>]| ms.iter().map(|m| m.iter().map(|v| v * v).sum::<f64>()).sum::<f64>().sqrt();
+            let (nq, nk, n1q, n1k) = (joint(&b_q), norm(&b_k), joint(&a_q), norm(&a_k));
             let scale = if nq > 0.0 && nk > 0.0 && n1q > 0.0 && n1k > 0.0 { (n1q * nk / (nq * n1k)).sqrt() } else { 1.0 };
             (rotation, scale)
         })
         .collect()
 }
 
-/// `(q, k)` moved by `gauge` plane by plane, `(s R q, R k / s)`; with `transpose`, the transpose
-/// of that map (a cotangent of the result back to `(q, k)`).
-pub(crate) fn apply_gauge(q: &Array2<f64>, k: &Array2<f64>, planes: &[Vec<usize>], gauge: &[(Array2<f64>, f64)], transpose: bool) -> (Array2<f64>, Array2<f64>) {
-    let (mut q_out, mut k_out) = (q.clone(), k.clone());
+/// `m` moved by `gauge` plane by plane, `s R m` for a query map and `R m / s` for a key map; with
+/// `transpose`, the transpose of that map (a cotangent of the result back to `m`).
+pub(crate) fn turn(m: &Array2<f64>, planes: &[Vec<usize>], gauge: &[(Array2<f64>, f64)], query: bool, transpose: bool) -> Array2<f64> {
+    let mut out = m.clone();
     for (rows, (rotation, scale)) in planes.iter().zip(gauge) {
         let rotation = if transpose { rotation.t().to_owned() } else { rotation.clone() };
-        let pick = |m: &Array2<f64>| m.select(ndarray::Axis(0), rows);
-        let (r_q, r_k) = (rotation.dot(&pick(q)), rotation.dot(&pick(k)));
+        let turned = rotation.dot(&m.select(ndarray::Axis(0), rows));
+        let factor = if query { *scale } else { 1.0 / *scale };
         for (i, &row) in rows.iter().enumerate() {
-            q_out.row_mut(row).assign(&(&r_q.row(i) * *scale));
-            k_out.row_mut(row).assign(&(&r_k.row(i) / *scale));
+            out.row_mut(row).assign(&(&turned.row(i) * factor));
         }
     }
-    (q_out, k_out)
-}
-
-/// `(q, k)` of a member brought to the gauge of `(q1, k1)` plane by plane (module note).
-fn aligned(q1: &Array2<f64>, k1: &Array2<f64>, q: &Array2<f64>, k: &Array2<f64>, planes: &[Vec<usize>]) -> (Array2<f64>, Array2<f64>) {
-    apply_gauge(q, k, planes, &gauge(q1, k1, q, k, planes), false)
+    out
 }
 
 /// A dense library operator holding `values`.
@@ -161,83 +191,116 @@ fn dense(name: String, rows: Interface, cols: Interface, values: Array2<f64>, pr
     Operator::dense(name, rows, cols, values, precision, provenance).map_err(error)
 }
 
-/// `explanation` with the heads `members` (`(layer, head)`, at most one per layer, the first the
-/// shared function's owner) reading one shared query–key function (module note), at the
-/// explanation's operator values.
-pub fn share_query_key(explanation: &Explanation, members: &[(usize, usize)]) -> Result<Explanation, String> {
+/// A member of a shared query–key function: key-value group `group` of layer `layer`, whose query
+/// head `i` (in head order) reads the shared query map of the first member's head `queries[i]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Member {
+    pub layer: usize,
+    pub group: usize,
+    pub queries: Vec<usize>,
+}
+
+/// `explanation` with the key-value groups `members` (at most one per layer, the first the shared
+/// function's owner, its `queries` in order) reading one shared query–key function (module note),
+/// at the explanation's operator values.
+pub fn share_query_key(explanation: &Explanation, members: &[Member]) -> Result<Explanation, String> {
     if members.len() < 2 {
         return Err("a shared function needs two members".into());
     }
-    if (1..members.len()).any(|i| members[..i].iter().any(|m| m.0 == members[i].0)) {
+    if (1..members.len()).any(|i| members[..i].iter().any(|m| m.layer == members[i].layer)) {
         return Err("the members of a shared query-key function lie in different layers".into());
     }
-    let all = heads(explanation)?;
-    let found: Vec<&Head> = members.iter().map(|m| all.get(m).ok_or_else(|| format!("no head {m:?} with a key of its own"))).collect::<Result<_, _>>()?;
+    let all = key_values(explanation)?;
+    let found: Vec<&KeyValue> = members.iter().map(|m| all.get(&(m.layer, m.group)).ok_or_else(|| format!("no key-value group {}.{}", m.layer, m.group))).collect::<Result<_, _>>()?;
+    let owner = found[0];
+    let width = owner.heads.len();
+    for (m, group) in members.iter().zip(&found) {
+        let mut seen = m.queries.clone();
+        seen.sort_unstable();
+        if !group.own_key || group.heads.len() != width || group.rotary != owner.rotary || seen != (0..width).collect::<Vec<_>>() {
+            return Err(format!("key-value group {}.{} cannot share the query-key function of {}.{}", m.layer, m.group, members[0].layer, members[0].group));
+        }
+    }
+    if members[0].queries != (0..width).collect::<Vec<_>>() {
+        return Err("the owner's query heads read their own maps".into());
+    }
     let mut artifact = explanation.artifact.clone();
-    // Each member keeps its native owners, now read through the shared maps.
-    let names = |h: &Head| (artifact.program.operators[h.query].name.clone(), artifact.program.operators[h.key].name.clone());
-    let shared = names(found[0]);
-    let retiring: Vec<((String, String), String)> = found[1..].iter().zip(&members[1..]).map(|(h, m)| (names(h), format!("library.l{}.h{}.q_shared_scale", m.0, m.1))).collect();
+    let program = &artifact.program;
+    let (owner_queries, owner_key) = (owner.queries(), owner.key);
+    let name = |op: usize| program.operators[op].name.clone();
+    // Each member keeps its native owners, now read through the shared maps; a member's query
+    // through its head's scale.
+    let mut moves: Vec<(String, String, Option<String>)> = Vec::new();
+    for (m, group) in members.iter().zip(&found).skip(1) {
+        for ((h, head), &j) in group.heads.iter().zip(&m.queries) {
+            moves.push((name(head.query), name(owner_queries[j]), Some(format!("library.l{}.h{h}.q_shared_scale", m.layer))));
+        }
+        moves.push((name(group.key), name(owner_key), None));
+    }
     for owner in &mut artifact.owners {
-        for ((q, k), scale) in &retiring {
+        if let Some((_, to, scale)) = moves.iter().find(|(from, _, _)| *from == owner.operator) {
             let (rows, cols) = (owner.rows.clone(), owner.cols.clone());
-            if owner.operator == *q {
-                owner.repoint(&shared.0, rows, cols, std::slice::from_ref(scale), &[]);
-            } else if owner.operator == *k {
-                owner.repoint(&shared.1, rows, cols, &[], &[]);
-            }
+            owner.repoint(to, rows, cols, scale.as_slice(), &[]);
         }
     }
     let program = &mut artifact.program;
-    let owner = found[0];
-    let (q1, k1) = (program.operators[owner.query].matrix(), program.operators[owner.key].matrix());
-    let gauge = planes(q1.nrows(), owner.rotary);
+    let values = |op: usize| program.operators[op].matrix();
+    let (q1, k1): (Vec<Array2<f64>>, Array2<f64>) = (owner_queries.iter().map(|&q| values(q)).collect(), values(owner_key));
+    let planes = planes(k1.nrows(), owner.rotary);
     let (mut q_sum, mut k_sum) = (q1.clone(), k1.clone());
-    for m in &found[1..] {
-        let (q, k) = (program.operators[m.query].matrix(), program.operators[m.key].matrix());
-        if q.dim() != q1.dim() || k.dim() != k1.dim() || m.rotary != owner.rotary {
-            return Err("the members' query and key maps differ in shape or rotary planes".into());
+    for (m, group) in members.iter().zip(&found).skip(1) {
+        let (q, k): (Vec<Array2<f64>>, Array2<f64>) = (group.queries().iter().map(|&q| values(q)).collect(), values(group.key));
+        if q.iter().zip(&q1).any(|(a, b)| a.dim() != b.dim()) || k.dim() != k1.dim() {
+            return Err("the members' query and key maps differ in shape".into());
         }
-        let (q, k) = aligned(&q1, &k1, &q, &k, &gauge);
-        q_sum += &q;
-        k_sum += &k;
+        // Member head `i` faces the owner's head `queries[i]`.
+        let facing: Vec<&Array2<f64>> = m.queries.iter().map(|&j| &q1[j]).collect();
+        let gauge = gauge(&facing, &k1, &q.iter().collect::<Vec<_>>(), &k, &planes);
+        for (i, &j) in m.queries.iter().enumerate() {
+            q_sum[j] += &turn(&q[i], &planes, &gauge, true, false);
+        }
+        k_sum += &turn(&k, &planes, &gauge, false, false);
     }
     let n = members.len() as f64;
-    let provenance = Provenance::derived(&[&program.operators[owner.query].provenance], "shared query-key function".into());
-    for (op, values) in [(owner.query, q_sum / n), (owner.key, k_sum / n)] {
-        let source = &program.operators[op];
-        program.operators[op] = Arc::new(dense(source.name.clone(), source.rows.clone(), source.cols.clone(), values, provenance.clone())?);
+    let provenance = Provenance::derived(&[&program.operators[owner_key].provenance], "shared query-key function".into());
+    for (op, values) in owner_queries.iter().zip(q_sum).chain([(&owner_key, k_sum)]) {
+        let source = &program.operators[*op];
+        program.operators[*op] = Arc::new(dense(source.name.clone(), source.rows.clone(), source.cols.clone(), values / n, provenance.clone())?);
     }
-    // Every other member reads the shared maps, its query scaled by its own `c_m` (a 1 × 1
-    // operator, broadcast over the query's coordinates by a fixed column of ones).
-    let coordinates = program.operators[owner.query].rows.clone();
+    // Every other member's query head reads the shared maps, its query scaled by its own `c` (a
+    // 1 × 1 operator, broadcast over the query's coordinates by a fixed column of ones).
+    let coordinates = program.operators[owner_key].rows.clone();
     let one = Interface::uniform(1, 1, LabelKind::Unit, 0).map_err(error)?;
     let mut retired = Vec::new();
     let mut parts = Vec::new();
-    for (m, member) in members.iter().zip(&found).skip(1) {
-        retired.extend([member.query, member.key]);
-        let scale = program.operators.len();
-        let name = format!("library.l{}.h{}.q_shared_scale", m.0, m.1);
-        program.operators.push(Arc::new(dense(name.clone(), one.clone(), Interface::constant(), Array2::ones((1, 1)), provenance.clone())?));
-        program.operators.push(Arc::new(dense(format!("library.l{}.h{}.q_shared_ones", m.0, m.1), coordinates.clone(), one.clone(), Array2::ones((coordinates.width(), 1)), provenance.clone())?));
-        parts.push((name, scale));
-        let rule = &mut program.rules[member.rule];
-        rule.nodes[1] = Node::Affine { terms: vec![(0, owner.query)], bias: None };
-        rule.nodes[2] = Node::Affine { terms: vec![(0, owner.key)], bias: None };
-        let output = rule.output;
-        let Node::Attend { query, .. } = rule.nodes[output] else {
-            return Err(format!("{}: the output is not an attention node", rule.name));
-        };
-        rule.nodes.insert(output, Node::Constant { operator: scale });
-        rule.nodes.insert(output + 1, Node::Affine { terms: vec![(output, scale + 1)], bias: None });
-        rule.nodes.insert(output + 2, Node::Hadamard { left: query, right: output + 1 });
-        rule.output = output + 3;
-        if let Node::Attend { query, .. } = &mut rule.nodes[output + 3] {
-            *query = output + 2;
+    for (m, group) in members.iter().zip(&found).skip(1) {
+        retired.push(group.key);
+        for ((h, head), &j) in group.heads.iter().zip(&m.queries) {
+            retired.push(head.query);
+            let scale = program.operators.len();
+            let name = format!("library.l{}.h{h}.q_shared_scale", m.layer);
+            program.operators.push(Arc::new(dense(name.clone(), one.clone(), Interface::constant(), Array2::ones((1, 1)), provenance.clone())?));
+            program.operators.push(Arc::new(dense(format!("library.l{}.h{h}.q_shared_ones", m.layer), coordinates.clone(), one.clone(), Array2::ones((coordinates.width(), 1)), provenance.clone())?));
+            parts.push((name, scale));
+            let rule = &mut program.rules[head.rule];
+            rule.nodes[1] = Node::Affine { terms: vec![(0, owner_queries[j])], bias: None };
+            rule.nodes[2] = Node::Affine { terms: vec![(0, owner_key)], bias: None };
+            let output = rule.output;
+            let Node::Attend { query, .. } = rule.nodes[output] else {
+                return Err(format!("{}: the output is not an attention node", rule.name));
+            };
+            rule.nodes.insert(output, Node::Constant { operator: scale });
+            rule.nodes.insert(output + 1, Node::Affine { terms: vec![(output, scale + 1)], bias: None });
+            rule.nodes.insert(output + 2, Node::Hadamard { left: query, right: output + 1 });
+            rule.output = output + 3;
+            if let Node::Attend { query, .. } = &mut rule.nodes[output + 3] {
+                *query = output + 2;
+            }
         }
     }
     program.interfaces().map_err(error)?;
-    // The retired maps leave the library with their groups; each part is one group.
+    // The retired maps leave the library with their groups (every plane group of a member holds
+    // its key's rows); each part is one group.
     let mut index = BTreeMap::new();
     let mut groups = Vec::new();
     for (g, group) in explanation.groups.iter().enumerate() {
@@ -252,11 +315,12 @@ pub fn share_query_key(explanation: &Explanation, members: &[(usize, usize)]) ->
     }
     let mut trainable: Vec<usize> = explanation.trainable.iter().copied().filter(|op| !retired.contains(op)).chain(parts.iter().map(|p| p.1)).collect();
     trainable.sort_unstable();
-    let owner_planes: Vec<usize> = explanation.layers[members[0].0].heads[members[0].1].0.iter().filter_map(|g| index.get(g).copied()).collect();
+    let owner_planes: Vec<usize> = explanation.layers[members[0].layer].heads[owner.heads[0].0].0.iter().filter_map(|g| index.get(g).copied()).collect();
+    let member_heads: Vec<(usize, usize)> = members.iter().zip(&found).skip(1).flat_map(|(m, group)| group.heads.iter().map(move |(h, _)| (m.layer, *h))).collect();
     let mut layers = explanation.layers.clone();
     for (l, layer) in layers.iter_mut().enumerate() {
         for (h, (planes, values)) in layer.heads.iter_mut().enumerate() {
-            *planes = if members[1..].contains(&(l, h)) { owner_planes.clone() } else { planes.iter().filter_map(|g| index.get(g).copied()).collect() };
+            *planes = if member_heads.contains(&(l, h)) { owner_planes.clone() } else { planes.iter().filter_map(|g| index.get(g).copied()).collect() };
             *values = values.iter().filter_map(|g| index.get(g).copied()).collect();
         }
         for function in &mut layer.functions {
@@ -605,6 +669,28 @@ pub fn tie_column(explanation: &Explanation, target: (usize, usize), source: (us
     Ok(out)
 }
 
+/// The tiny two-layer model with grouped-query attention: its two query heads per layer read one
+/// key and one value.
+#[cfg(test)]
+pub(crate) fn grouped(name: &str) -> crate::import::Imported {
+    let dir = crate::test_support::tiny_export(name, 2);
+    let path = dir.join("export.json");
+    let mut record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    record["config"]["n_kv_heads"] = 1.into();
+    for l in 0..2 {
+        for name in ["attn.k_proj", "attn.v_proj"] {
+            let name = format!("blocks.{l}.{name}");
+            let values = std::fs::read(dir.join(format!("{name}.f64"))).unwrap();
+            std::fs::write(dir.join(format!("{name}.f64")), &values[..4 * 8 * 8]).unwrap();
+            record["files"][name] = serde_json::json!({"shape": [4, 8]});
+        }
+    }
+    std::fs::write(&path, record.to_string()).unwrap();
+    let imported = crate::import::import_language_model(&dir, 6, 12).expect("import");
+    std::fs::remove_dir_all(dir).unwrap();
+    imported
+}
+
 /// Every native block `a`'s owners stand for, `b`'s owners stand for at the same site with the
 /// same values: an exact sharing moves the native parameters, it does not change them.
 #[cfg(test)]
@@ -646,7 +732,8 @@ mod tests {
         for (from, to) in [(first.query, second.query), (first.key, second.key)] {
             program.operators[to] = Arc::new(dense(program.operators[to].name.clone(), program.operators[to].rows.clone(), program.operators[to].cols.clone(), program.operators[from].matrix(), Provenance::default()).unwrap());
         }
-        let shared = share_query_key(&start, &[(0, 0), (1, 0)]).expect("shared");
+        let member = |layer: usize, group: usize| Member { layer, group, queries: vec![0] };
+        let shared = share_query_key(&start, &[member(0, 0), member(1, 0)]).expect("shared");
         // Sharing keeps every native owner; the member's now read the shared maps at its own site.
         let natives = |e: &Explanation| { let mut n: Vec<(String, String)> = e.artifact.owners.iter().map(|o| (o.native.clone(), o.site.clone())).collect(); n.sort(); n };
         assert_eq!(natives(&start), natives(&shared));
@@ -663,30 +750,40 @@ mod tests {
         assert_eq!(shared.groups.len(), start.groups.len() - planes + 1);
         assert_eq!(shared.trainable.len(), start.trainable.len() - 1);
         Posterior::new(&shared, 2 * 6 * 12).expect("every shared entry in one group");
-        assert!(share_query_key(&start, &[(0, 0), (0, 1)]).is_err());
+        assert!(share_query_key(&start, &[member(0, 0), member(0, 1)]).is_err());
     }
 
     #[test]
-    fn a_key_shared_by_a_key_value_group_is_never_a_member() {
-        let dir = crate::test_support::tiny_export("library_sharing_grouped", 2);
-        let path = dir.join("export.json");
-        let mut record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        record["config"]["n_kv_heads"] = 1.into();
-        for l in 0..2 {
-            for name in ["attn.k_proj", "attn.v_proj"] {
-                let name = format!("blocks.{l}.{name}");
-                let values = std::fs::read(dir.join(format!("{name}.f64"))).unwrap();
-                std::fs::write(dir.join(format!("{name}.f64")), &values[..4 * 8 * 8]).unwrap();
-                record["files"][name] = serde_json::json!({"shape": [4, 8]});
-            }
-        }
-        std::fs::write(&path, record.to_string()).unwrap();
-        let imported = import_language_model(&dir, 6, 12).expect("import");
-        std::fs::remove_dir_all(dir).unwrap();
+    fn a_key_value_group_is_shared_whole_with_its_query_heads_assigned() {
+        let imported = grouped("library_sharing_grouped");
         let native = split_sites(&imported.program).expect("split");
-        let start = explanation(&native, &layer_nodes(&native, 2).expect("layers")).expect("explanation");
-        assert!(heads(&start).unwrap().is_empty(), "every head's key is its group's");
-        assert!(share_query_key(&start, &[(0, 0), (1, 0)]).is_err());
+        let mut start = explanation(&native, &layer_nodes(&native, 2).expect("layers")).expect("explanation");
+        let groups = key_values(&start).unwrap();
+        assert_eq!(groups.len(), 2, "one key-value group per layer");
+        assert!(groups.values().all(|g| g.heads.len() == 2 && g.own_key && g.own_value));
+        // Layer 1's group is layer 0's with its two query heads swapped.
+        let (first, second) = (&groups[&(0, 0)], &groups[&(1, 0)]);
+        let copies = [(first.heads[1].1.query, second.heads[0].1.query), (first.heads[0].1.query, second.heads[1].1.query), (first.key, second.key)];
+        let program = &mut start.artifact.program;
+        for (from, to) in copies {
+            program.operators[to] = Arc::new(dense(program.operators[to].name.clone(), program.operators[to].rows.clone(), program.operators[to].cols.clone(), program.operators[from].matrix(), Provenance::default()).unwrap());
+        }
+        let owner = Member { layer: 0, group: 0, queries: vec![0, 1] };
+        let shared = share_query_key(&start, &[owner.clone(), Member { layer: 1, group: 0, queries: vec![1, 0] }]).expect("shared");
+        let (before, after) = (start.artifact.execute(&imported.family).unwrap(), shared.artifact.execute(&imported.family).unwrap());
+        let (a, b) = (&before.values[start.artifact.program.output], &after.values[shared.artifact.program.output]);
+        assert!(a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= 1e-12 * (1.0 + x.abs())), "the assigned group keeps the explanation's output");
+        same_native_blocks(&start, &shared);
+        // The member's planes (its key and both queries) leave; each query head's scale is a group.
+        let planes = start.layers[1].heads[0].0.len();
+        assert_eq!(shared.groups.len(), start.groups.len() - planes + 2);
+        assert_eq!(shared.trainable.len(), start.trainable.len() - 3 + 2);
+        assert_eq!(shared.layers[1].heads[0].0, shared.layers[0].heads[0].0, "the member's heads read the owner's planes");
+        Posterior::new(&shared, 2 * 6 * 12).expect("every shared entry in one group");
+        let after = key_values(&shared).unwrap();
+        assert!(!after[&(1, 0)].own_key && after[&(1, 0)].own_value, "the member reads the shared key and keeps its value");
+        assert!(share_query_key(&start, &[owner.clone(), Member { layer: 1, group: 0, queries: vec![0, 0] }]).is_err(), "an assignment is a permutation");
+        assert!(share_query_key(&shared, &[owner, Member { layer: 1, group: 0, queries: vec![0, 1] }]).is_err(), "a member is no member twice");
     }
 
     #[test]
@@ -776,7 +873,15 @@ mod tests {
         let (sine, cosine) = 0.7_f64.sin_cos();
         let r = ndarray::array![[cosine, -sine], [sine, cosine]];
         let (q, k) = (r.dot(&q1) * 3.0, r.dot(&k1) / 3.0);
-        let (qa, ka) = aligned(&q1, &k1, &q, &k, &[vec![0, 1]]);
-        assert!((&qa - &q1).iter().chain((&ka - &k1).iter()).all(|d| d.abs() < 1e-12));
+        // Two query heads of one key: one rotation and one scale of the plane for the whole group.
+        let q2 = Array2::from_shape_fn((2, 3), |(i, j)| ((3 * i + j) as f64).cos() - 0.5);
+        let planes = [vec![0, 1]];
+        let gauge = gauge(&[&q1, &q2], &k1, &[&(r.dot(&q1) * 3.0), &(r.dot(&q2) * 3.0)], &k, &planes);
+        let (qa, q2a, ka) = (turn(&q, &planes, &gauge, true, false), turn(&(r.dot(&q2) * 3.0), &planes, &gauge, true, false), turn(&k, &planes, &gauge, false, false));
+        assert!((&qa - &q1).iter().chain((&q2a - &q2).iter()).chain((&ka - &k1).iter()).all(|d| d.abs() < 1e-12));
+        // The transpose takes a cotangent back: <turn(x), y> = <x, turn^T(y)>.
+        let y = Array2::from_shape_fn((2, 3), |(i, j)| (i as f64 - j as f64) * 0.3 + 0.1);
+        let (forward, back) = (turn(&q, &planes, &gauge, true, false), turn(&y, &planes, &gauge, true, true));
+        assert!(((&forward * &y).sum() - (&q * &back).sum()).abs() < 1e-12);
     }
 }
