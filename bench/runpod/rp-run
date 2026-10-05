@@ -33,17 +33,18 @@
 #
 # Source: `git archive` of origin/main, or of RP_REF=<commit> when it is published: the Rust
 # workspace (crates/, the manifests, the toolchain pin), bench/runpod/ and every /Users/user/gam/...
-# path COMMAND names, unpacked at /workspace/src, the command's working directory.
+# path COMMAND names, unpacked at WS/src (WS=/workspace/runs/NAME, the run's own directory on the
+# pod), the command's working directory.
 #
 # Paths are translated as mats-run translates them:
 #   target/release/examples/X, /Users/user/gam/target/release/examples/X and
 #   `cargo run ... --example X -- ARGS`  -> the pod's X, built at the commit by
 #       `cargo build --release -p PACKAGE --example X` (no target-cpu flags: the pod's CPU is
 #       unknown), or taken from ~/mpd-data/runpod/_bin/ when the same Rust sources built it before;
-#   /Users/user/gam/...       -> /workspace/src/...;
-#   /Users/user/mpd-data/...  -> /workspace/mpd-data/...; every existing input COMMAND names,
+#   /Users/user/gam/...       -> WS/src/...;
+#   /Users/user/mpd-data/...  -> WS/mpd-data/...; every existing input COMMAND names,
 #       outside mpd-data/runpod/, is uploaded first, symlinks as the files they name;
-#   ~/.cache/huggingface/hub/models--ORG--NAME/snapshots/REV[/...] -> /workspace/hf/ORG/NAME/REV[/...],
+#   ~/.cache/huggingface/hub/models--ORG--NAME/snapshots/REV[/...] -> WS/hf/ORG/NAME/REV[/...],
 #       fetched on the pod from huggingface.co at REV (public models; nothing is uploaded);
 #   python, python3, the Mac venv's python -> the pod's python3.
 # Data with a public source is built on the pod, not uploaded, and checked before COMMAND starts
@@ -59,7 +60,7 @@
 #       uploaded, the export built from it and the Pile files by
 #       bench/vpd_2951/vpd_engine_export_pile.py, and every tensor checked against the Mac's
 #       export.json, which then replaces the pod's.
-# Other cargo commands (`cargo test -p gam-gpu ...`) run as given in /workspace/src.
+# Other cargo commands (`cargo test -p gam-gpu ...`) run as given in WS/src.
 # RP_EXAMPLES="X Y" builds further examples for a script that runs them through $MPD_BIN;
 # RP_DISK_GB=N sets the container disk (default: 30 GB, 60 for a dev pod, plus twice the inputs
 # and models); RP_ENV="K=V ..." adds environment (RUST_LOG is forwarded when set); RP_MIN_RAM_GB=N
@@ -71,10 +72,10 @@
 # steps, timed), pod.json and pod.txt (the pods), build.log, watch.log and cost.txt.
 #
 # Dev pods: one pod of the first listed type in stock (community, then secure; default RTX A5000,
-# then RTX 4090; default cap 4 h), with the source of the commit at /workspace/src as a git
+# then RTX 4090; default cap 4 h), with the source of the commit at WS/src as a git
 # repository of one commit, the pinned Rust toolchain, the CUDA 12.4 toolkit, rsync, the PATHs
 # given (translated as above) and a release and test build of gam-gpu started in the background
-# (/workspace/warm.log). The runner holds it until `rp-run stop NAME`, its cap, or an interrupt,
+# (WS/warm.log). The runner holds it until `rp-run stop NAME`, its cap, or an interrupt,
 # then deletes it. ~/mpd-data/runpod/NAME/ssh [COMMAND] logs in; `rsync -e ~/mpd-data/runpod/NAME/rsh
 # SRC "$(cat ~/mpd-data/runpod/NAME/host):DEST"` copies files. `rp-run extend NAME HOURS` moves both
 # caps (only on request: the budget check runs again).
@@ -117,6 +118,14 @@
 # idle-stopped (dev pods are held, not stopped). rp-run stop NAME ends a run (its runner
 # deletes the pod and enters it in the ledger; a runner that does not end within a minute is killed
 # and the pod deleted) as it ends a held pod.
+#
+# Packing: a run that states the GPU memory it needs (RP_MIN_VRAM_GB) runs on a pod of ours already
+# up, beside the run that holds it, when that pod's GPU is one the run takes, has averaged under 20%
+# over the last 5 minutes, has that memory and the run's disk free, and has the run's HOURS left
+# before its cap: no new pod, no new cost (status lists it under the pod as "+ packed"). The run's
+# own HOURS still cap it (its command is stopped then). A pod is deleted when the last run on it
+# ends, or at its own cap; the ledger enters it once. With another run live this needs
+# RP_PARALLEL=1, as any run beside another does; RP_PACK=0 always takes a pod of its own.
 #
 # SSH uses a key made for the run (deleted with it); ~/.ssh/runpod_ed25519.pub is also authorized,
 # for a look by hand. RP_DRY=1 prints the translation, uploads, builds, offers and the pod request,
@@ -425,12 +434,28 @@ owned() {
     esac
 }
 
+# The live runs on POD other than this process, one pid per line: the run that made it (its
+# record's owner) and the runs packed onto it (active/.POD.guests/NAME, each holding its pid).
+holders() {  # POD
+    local o x
+    read -r _ _ _ _ _ o _ < "$ACTIVE/$1" 2> /dev/null || true
+    for x in ${o:-} $(cat "$ACTIVE/.$1.guests"/* 2> /dev/null); do
+        [ "$x" != "$$" ] && kill -0 "$x" 2> /dev/null && echo "$x"
+    done
+    return 0
+}
+
 # Delete POD (recorded in active/POD), confirm through the API that it is gone, and enter its
 # cost in the ledger once. Safe to run twice at once (the run's exit and its watcher). A pod that is
-# not ours is never deleted: its record is dropped and the refusal printed.
-reap() {
+# not ours is never deleted: its record is dropped and the refusal printed. A pod another live run
+# still uses is kept for it (the last run to leave deletes it), except at the pod's cap (cap).
+reap() {  # POD [cap]
     local pod=$1 rec=$ACTIVE/$1 r code tries=0 gone=0
     [ -f "$rec" ] || return 0
+    if [ "${2:-}" != cap ] && [ -n "$(holders "$pod")" ]; then
+        echo "rp-run: pod $pod kept: run process $(holders "$pod" | paste -sd ' ' -) still uses it" >&2
+        return 0
+    fi
     if ! owned "$pod"; then
         echo "rp-run: pod $pod is not ours (not named mpd2951- or not created by rp-run); not deleting it, dropping its record" >&2
         rm -f "$rec" "$ACTIVE/.$pod".*
@@ -497,20 +522,43 @@ reap() {
         echo "rp-run: $line" >&2
         [ -d "$RP/$name" ] && echo "$(date '+%F %T') $line" >> "$RP/$name/cost.txt"
         rm -f "$rec" "$ACTIVE/.$pod.deadline" "$ACTIVE/.$pod.owner" "$ACTIVE/.$pod.ssh" "$ACTIVE/.$pod.end"
+        rm -rf "$ACTIVE/.$pod.guests"
     fi
     rmdir "$RP/.ledger.lock"
 }
 
 # The watcher: reaps POD when the run's process ends (any way, SIGKILL included) or at its deadline
-# (DEADLINE, or a later one an extension wrote to active/.POD.deadline).
+# (DEADLINE, or a later one an extension wrote to active/.POD.deadline). For a run packed onto
+# another's pod (GUEST, its NAME) the deadline is the run's own: the run is stopped (its runner,
+# then its command on the pod), it leaves the pod, and the pod is deleted only when no run uses it.
 if [ "${1:-}" = --watch ]; then
-    pod=$2 parent=$3 deadline=$4
+    pod=$2 parent=$3 deadline=$4 guest=${5:-}
     trap '' INT HUP
-    due() { cat "$ACTIVE/.$pod.deadline" 2> /dev/null || echo "$deadline"; }
+    due() { if [ -n "$guest" ]; then echo "$deadline"; else cat "$ACTIVE/.$pod.deadline" 2> /dev/null || echo "$deadline"; fi; }
     while kill -0 "$parent" 2> /dev/null && [ -f "$ACTIVE/$pod" ] && (( $(date +%s) < $(due) )); do sleep 10; done
+    if [ -n "$guest" ]; then
+        if kill -0 "$parent" 2> /dev/null; then
+            echo "rp-run: $guest reached its HOURS cap on pod $pod; stopping it" >&2
+            touch "$RP/$guest/STOP"
+            kill -TERM "$parent" 2> /dev/null || true
+            for i in $(seq 60); do kill -0 "$parent" 2> /dev/null || break; sleep 1; done
+            kill -KILL "$parent" 2> /dev/null || true
+        fi
+        if [ -f "$ACTIVE/.$pod.ssh" ]; then
+            read -r ip port tmp user < "$ACTIVE/.$pod.ssh"
+            ssh -F none -i "$tmp/key" -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile="$tmp/known_hosts" -o StrictHostKeyChecking=accept-new \
+                -o ConnectTimeout=10 -o LogLevel=ERROR -p "$port" "${user:-root}@$ip" \
+                "p=\$(cat /workspace/runs/$guest/run.pid 2> /dev/null) && kill -TERM -- -\$p" < /dev/null > /dev/null 2>&1 || true
+        fi
+        [ "$(cat "$ACTIVE/.$pod.guests/$guest" 2> /dev/null)" != "$parent" ] || rm -f "$ACTIVE/.$pod.guests/$guest"
+        reap "$pod"
+        exit
+    fi
     if (( $(date +%s) >= $(due) )); then
         echo "rp-run: $pod reached its HOURS cap; deleting it" >&2
         [ -f "$ACTIVE/.$pod.end" ] || echo cap > "$ACTIVE/.$pod.end"
+        reap "$pod" cap
+        exit
     fi
     reap "$pod"
     exit
@@ -689,6 +737,13 @@ case ${1:-} in
             up=$(awk -v a="$start" -v n="$now" 'BEGIN { printf "%.2f", (n - a) / 3600 }')
             printf '%-15s %-22s %-9s %-22s %6s %5s %5s %7s %6s %-9s %s\n' "$id" "${name:0:22}" "${owner:0:9}" "$(cut -c1-22 <<< "${gpu#NVIDIA } ${kind%%:*}")" "$price" "${util:--}" "$up" \
                 "$(awk -v p="$price" -v u="$up" 'BEGIN { printf "%.2f", p * u }')" "$left" "${flag:--}" "$last"
+            # Runs packed onto this pod.
+            for g in "$ACTIVE/.$id.guests"/*; do
+                [ -f "$g" ] && kill -0 "$(cat "$g")" 2> /dev/null || continue
+                gname=${g##*/}
+                last=$(grep -v '^[[:space:]]*$' "$RP/$gname/run.log" 2> /dev/null | tail -n 1 | cut -c1-90 || true)
+                printf '%-15s %-22s %-9s %-22s %6s %5s %5s %7s %6s %-9s %s\n' "  + packed" "${gname:0:22}" "-" "" "" "" "" "" "" "-" "$last"
+            done
         done <<< "$pods"
         rm -rf "$utils"
         r=$(gql 'query { myself { clientBalance currentSpendPerHr } }')
@@ -733,6 +788,18 @@ for line in open(sys.argv[1]):
         exit 0 ;;
     stop)
         [ $# -eq 2 ] || usage
+        # A run packed onto another's pod: its runner stops it and leaves the pod.
+        g=$(ls "$ACTIVE"/.*.guests/"$2" 2> /dev/null | head -n 1 || true)
+        if [ -n "$g" ]; then
+            owner=$(cat "$g")
+            touch "$RP/$2/STOP"
+            kill -TERM "$owner" 2> /dev/null || true
+            for i in $(seq 60); do kill -0 "$owner" 2> /dev/null || break; sleep 1; done
+            kill -KILL "$owner" 2> /dev/null || true
+            rm -f "$RP/$2/STOP"
+            echo "rp-run: $2 stopped (it shared a pod; the pod stays while other runs use it)" >&2
+            exit 0
+        fi
         h=$(held "$2") || { echo "rp-run: no pod held for $2" >&2; exit 2; }
         read -r pod _ owner <<< "$h"
         echo stopped > "$ACTIVE/.$pod.end"
@@ -753,7 +820,11 @@ for line in open(sys.argv[1]):
             reap "$pod"
         fi
         rm -f "$RP/$2/STOP"
-        echo "rp-run: $2 stopped; pod $pod deleted ($(grep "$pod" "$LEDGER" | tail -n 1 | cut -f5,6 | awk '{ printf "%s h, $%s", $1, $2 }'))" >&2
+        if [ -f "$ACTIVE/$pod" ]; then
+            echo "rp-run: $2 stopped; pod $pod stays for the runs packed onto it ($(ls "$ACTIVE/.$pod.guests" 2> /dev/null | paste -sd ' ' -))" >&2
+        else
+            echo "rp-run: $2 stopped; pod $pod deleted ($(grep "$pod" "$LEDGER" | tail -n 1 | cut -f5,6 | awk '{ printf "%s h, $%s", $1, $2 }'))" >&2
+        fi
         exit 0 ;;
     extend)
         [ $# -eq 3 ] || usage
@@ -785,6 +856,9 @@ approved "$NAME" || { echo "rp-run: $NAME is not approved (~/mpd-data/runpod/APP
 hours_ok "$HOURS"
 CAP_SECONDS=$(awk -v h="$HOURS" 'BEGIN { printf "%d", h * 3600 }')
 OUT=$RP/$NAME
+# The run's directory on the pod: its source, binaries, data and outputs, beside any other run the
+# pod holds (pod-wide: /workspace/gpu-util.log and the Python packages).
+WS=/workspace/runs/$NAME
 
 # The offers, one per line "KIND|PRICE|GPU id": a run takes community (or another provider's
 # offer) for every type before secure; a dev pod takes the types in order, community before secure
@@ -862,7 +936,7 @@ for rec in "$ACTIVE"/*; do
     if [ -n "${owner:-}" ] && kill -0 "$owner" 2> /dev/null; then
         [ "${mode:-run}" = run ] && live+=("${rec##*/}")
     else
-        echo "rp-run: reaping ${rec##*/}, left by a run that is gone" >&2
+        echo "rp-run: ${rec##*/} was left by a run that is gone; deleting it unless a run packed onto it still uses it" >&2
         reap "${rec##*/}" || exit 1
     fi
 done
@@ -916,7 +990,7 @@ first=1
 for a in "$@"; do
     if [ $first = 1 ]; then
         case $a in
-            "$MAC_GAM"/target/*/examples/*|target/*/examples/*|./target/*/examples/*) examples+=("${a##*/}"); a="/workspace/bin/${a##*/}" ;;
+            "$MAC_GAM"/target/*/examples/*|target/*/examples/*|./target/*/examples/*) examples+=("${a##*/}"); a="$WS/bin/${a##*/}" ;;
             python|python3|"$MAC_DATA"/venv/bin/python*) a=python3 ;;
         esac
         first=0
@@ -947,11 +1021,11 @@ for a in "$@"; do
         case $rel in target/*) continue ;; esac
         git -C "$MAC_GAM" cat-file -e "$C:$rel" 2> /dev/null && srcpaths+=("$rel")
     done < <(grep -oE "$MAC_GAM/[^ :,;=\"']+" <<< "$a" || true)
-    a=${a//$MAC_GAM\/target\/release\/examples\//\/workspace\/bin\/}
-    a=${a//$MAC_GAM\//\/workspace\/src\/}
-    a=${a//$MAC_DATA\//\/workspace\/mpd-data\/}
+    a=${a//$MAC_GAM\/target\/release\/examples\//$WS/bin/}
+    a=${a//$MAC_GAM\//$WS/src/}
+    a=${a//$MAC_DATA\//$WS/mpd-data/}
     if [[ $a =~ $HF_HUB/models--([^/ ]+)--([^/ ]+)/snapshots/([0-9a-f]+) ]]; then
-        a=${a//"${BASH_REMATCH[0]}"/"/workspace/hf/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"}
+        a=${a//"${BASH_REMATCH[0]}"/"$WS/hf/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"}
     fi
     words+=("$a")
 done
@@ -1043,7 +1117,10 @@ if [ ${#uploads[@]} -gt 0 ]; then
     upload_kb=$(cd "$MAC_DATA" && du -skL "${uploads[@]}" | awk '{ s += $1 } END { print s }')
 fi
 hf_kb=0
-for p in "${hf[@]}"; do hf_kb=$(( hf_kb + $(du -skL "$p" | cut -f1) )); done
+for p in "${hf[@]}"; do
+    [ -e "$p" ] || { echo "rp-run: $p is not on this Mac (the pod fetches the files the Mac's snapshot holds)" >&2; exit 2; }
+    hf_kb=$(( hf_kb + $(du -skL "$p" | cut -f1) ))
+done
 # The container disk: the toolchain and a release build of the workspace (measured under 20 GB;
 # a dev pod also builds the test profile, a second target directory), with room for the inputs,
 # the models fetched and the outputs (as large again as the inputs).
@@ -1107,7 +1184,7 @@ TMP=$(mktemp -d /tmp/rp-run.XXXXXX)
 ssh-keygen -q -t ed25519 -N '' -C "rp-run $NAME" -f "$TMP/key"
 chmod 600 "$TMP/key"
 KEYS="$( [ -f "$TMP/key.pub" ] && cat "$TMP/key.pub")"$'\n'"$(cat ~/.ssh/runpod_ed25519.pub)"
-POD="" IP="" PORT="" VCPU="" ATTEMPTED=0 DEADLINE="" SYNC="" PRICE="" CREATED="" THUNDER_UNSURE=0 NEBIUS_UNSURE=0
+POD="" IP="" PORT="" VCPU="" ATTEMPTED=0 DEADLINE="" SYNC="" PRICE="" CREATED="" THUNDER_UNSURE=0 NEBIUS_UNSURE=0 GUEST=0
 SSH=(ssh -F none -i "$TMP/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no -o ForwardX11=no
      -o UserKnownHostsFile="$TMP/known_hosts" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20
      -o ServerAliveInterval=30 -o ServerAliveCountMax=4 -o LogLevel=ERROR)
@@ -1124,9 +1201,14 @@ finish() {
     [ -n "$SYNC" ] && kill $SYNC 2> /dev/null
     # The log stream, the idle check and other helpers end with the run.
     kill $(jobs -p) 2> /dev/null
-    if [ -n "$POD" ] && [ ! -f "$ACTIVE/.$POD.end" ]; then
+    if [ -n "$POD" ] && [ ! -f "$ACTIVE/.$POD.end" ] && (( ! GUEST )); then
         if [ -f "$OUT/STOP" ]; then echo stopped; elif [ -n "${RC:-}" ]; then echo "exit $RC"; else echo "exit $rc"; fi > "$ACTIVE/.$POD.end"
     fi
+    # A pod another run still uses stays up: this run's command, if still running, is stopped.
+    if [ -n "$IP" ] && [ -n "$(holders "$POD")" ]; then
+        on_pod "p=\$(cat $WS/run.pid 2> /dev/null) && kill -TERM -- -\$p" < /dev/null > /dev/null 2>&1
+    fi
+    (( ! GUEST )) || rm -f "$ACTIVE/.$POD.guests/$NAME"
     if [ -n "$IP" ]; then on_pod -O exit > /dev/null 2>&1; fi
     if [ -z "$POD" ] && (( ATTEMPTED )); then
         # A create whose answer was lost (a timeout) may still have made a pod. Its id never reached
@@ -1328,6 +1410,57 @@ nebius_settled() {  # OPERATION
     done
 }
 
+# Packing: a run that states the GPU memory it needs (RP_MIN_VRAM_GB) runs on a pod of ours that is
+# already up, instead of a new one, when that pod's GPU is one the run takes (its listed types; under
+# auto, any card the ranking offers), averaged under 20% over the last 5 minutes (the idle line), has
+# RP_MIN_VRAM_GB of GPU memory and the run's disk free, and has the run's HOURS left before its cap.
+# Of those, the least busy GPU. RP_PACK=0 always takes a pod of its own. Prints the pod, or nothing.
+PACK_GPU=20 PACK_WINDOW=300
+find_host() {
+    local rec pod g dl ip port tmp user util free disk best="" bestu="" now
+    [ "$MODE" = run ] && [ -n "${RP_MIN_VRAM_GB:-}" ] && [ "${RP_PACK:-1}" != 0 ] || return 0
+    now=$(date +%s)
+    for rec in "$ACTIVE"/*; do
+        [ -f "$rec" ] || continue
+        pod=${rec##*/}
+        [ -f "$ACTIVE/.$pod.ssh" ] && [ -f "$ACTIVE/.$pod.deadline" ] && [ -n "$(holders "$pod")" ] || continue
+        read -r _ g _ < "$rec"
+        cut -d'|' -f3 <<< "$OFFERS" | grep -qxF "${g//_/ }" || continue
+        dl=$(cat "$ACTIVE/.$pod.deadline")
+        (( dl - now >= CAP_SECONDS )) || continue
+        read -r ip port tmp user < "$ACTIVE/.$pod.ssh"
+        [ -f "$tmp/key" ] || continue
+        read -r util free disk < <(ssh -F none -i "$tmp/key" -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile="$tmp/known_hosts" \
+            -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 -o LogLevel=ERROR -p "$port" "${user:-root}@$ip" \
+            "awk -v t=\$(( \$(date +%s) - $PACK_WINDOW )) '\$1 >= t && NF == 2 { s += \$2; n++ } END { printf \"%d \", (n ? s / n : 100) }' /workspace/gpu-util.log;
+             nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -n 1 | tr '\n' ' ';
+             df -BG --output=avail /workspace | tail -n 1 | tr -dc 0-9" < /dev/null 2> /dev/null) || continue
+        [ -n "$disk" ] || continue
+        (( util < PACK_GPU && free >= RP_MIN_VRAM_GB * 1024 && disk >= DISK )) || continue
+        if [ -z "$bestu" ] || (( util < bestu )); then best=$pod bestu=$util; fi
+    done
+    echo "$best"
+}
+# Runs this run on POD beside the run that holds it: authorizes the run's key there (through the
+# holder's), records the run as a guest of the pod, and starts its watcher at its own HOURS.
+attach() {  # POD
+    local ip port tmp user holder
+    read -r ip port tmp user < "$ACTIVE/.$1.ssh"
+    read -r holder _ < "$ACTIVE/$1"
+    ssh -F none -i "$tmp/key" -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile="$tmp/known_hosts" -o StrictHostKeyChecking=accept-new \
+        -o ConnectTimeout=10 -o LogLevel=ERROR -p "$port" "${user:-root}@$ip" 'cat >> ~/.ssh/authorized_keys' < "$TMP/key.pub" 2> /dev/null || return 1
+    POD=$1 IP=$ip PORT=$port SSH_USER=${user:-root} GUEST=1
+    on_pod true < /dev/null 2> /dev/null || { POD="" IP="" GUEST=0; return 1; }
+    CREATED=$(date +%s)
+    DEADLINE=$(( CREATED + CAP_SECONDS ))
+    mkdir -p "$ACTIVE/.$POD.guests"
+    echo "$$" > "$ACTIVE/.$POD.guests/$NAME"
+    nohup "$SELF" --watch "$POD" "$$" "$DEADLINE" "$NAME" >> "$OUT/watch.log" 2>&1 &
+    VCPU=$(on_pod nproc < /dev/null 2> /dev/null || true)
+    say "packed onto pod $POD (run $holder's), GPU under $PACK_GPU% for the last $(( PACK_WINDOW / 60 )) minutes; this run adds no pod and no cost; it ends by $(date -r "$DEADLINE" '+%F %T')"
+    echo "$POD shared with $holder" >> "$OUT/pod.txt"
+}
+
 # A pod in stock on a host that works: reachable by SSH, its own deletion timer armed, and CUDA
 # initializing (a host whose CUDA does not start fails every program; one did, with PyTorch too). A
 # pod on a host that failed before (BAD_HOSTS), or that fails now, is deleted and the next offer
@@ -1337,6 +1470,11 @@ launch() {
     local kind price gpu r code left host
     approved "$NAME" || { say "approval for $NAME withdrawn; not launching a pod"; exit 3; }
     POD="" IP="" PORT=""
+    host=$(find_host)
+    if [ -n "$host" ] && attach "$host"; then
+        return 0
+    fi
+    POD="" IP="" PORT="" GUEST=0
     # The first pod must be in stock now; a replacement waits for stock while time remains.
     until [ -n "$POD" ]; do
     while IFS='|' read -r kind price gpu <&3; do
@@ -1486,11 +1624,11 @@ upload_inputs() {
     # Each stream's even share, in whole MiB (the unit of the byte ranges), at least one.
     share=$(( (total / streams + 1048575) / 1048576 ))
     share=$(( (share > 0 ? share : 1) * 1048576 ))
-    for f in "${files[@]}"; do dirname "$f"; done | sort -u | on_pod 'mkdir -p /workspace/mpd-data && cd /workspace/mpd-data && xargs -d "\n" mkdir -p' || return 1
+    for f in "${files[@]}"; do dirname "$f"; done | sort -u | on_pod "mkdir -p $WS/mpd-data && cd $WS/mpd-data && xargs -d '\\n' mkdir -p" || return 1
     for f in "${files[@]}"; do
         size=$(stat -L -f %z "$MAC_DATA/$f")
         if (( size > share )); then
-            on_pod "truncate -s $size /workspace/mpd-data/$(printf %q "$f")" || return 1
+            on_pod "truncate -s $size $WS/mpd-data/$(printf %q "$f")" || return 1
             for (( k = 0; k * share < size; k++ )); do parts+=("$size $f $k"); done
         else
             parts+=("$size $f -")
@@ -1525,16 +1663,16 @@ upload_inputs() {
                 local f=$1 k=$2 q=$3
                 if grep -q "  $f\$" <<< "$narrow"; then
                     if [ "$k" = - ]; then
-                        "$py" -c "$NARROW" "$MAC_DATA/$f" 0 -1 | gzip -1 | new_conn "gzip -dc | python3 -c $(printf %q "$WIDEN") /workspace/mpd-data/$q -1" || return 1
+                        "$py" -c "$NARROW" "$MAC_DATA/$f" 0 -1 | gzip -1 | new_conn "gzip -dc | python3 -c $(printf %q "$WIDEN") $WS/mpd-data/$q -1" || return 1
                     else
                         "$py" -c "$NARROW" "$MAC_DATA/$f" $(( k * share )) "$share" | gzip -1 |
-                            new_conn "gzip -dc | python3 -c $(printf %q "$WIDEN") /workspace/mpd-data/$q $(( k * share ))" || return 1
+                            new_conn "gzip -dc | python3 -c $(printf %q "$WIDEN") $WS/mpd-data/$q $(( k * share ))" || return 1
                     fi
                 elif [ "$k" = - ]; then
-                    gzip -1 -c "$MAC_DATA/$f" | new_conn "gzip -dc > /workspace/mpd-data/$q" || return 1
+                    gzip -1 -c "$MAC_DATA/$f" | new_conn "gzip -dc > $WS/mpd-data/$q" || return 1
                 else
                     dd if="$MAC_DATA/$f" bs=1048576 skip=$(( k * share / 1048576 )) count=$(( share / 1048576 )) 2> /dev/null |
-                        gzip -1 | new_conn "gzip -dc | dd of=/workspace/mpd-data/$q bs=1048576 seek=$(( k * share / 1048576 )) conv=notrunc 2> /dev/null" || return 1
+                        gzip -1 | new_conn "gzip -dc | dd of=$WS/mpd-data/$q bs=1048576 seek=$(( k * share / 1048576 )) conv=notrunc 2> /dev/null" || return 1
                 fi
             }
             while read -r f k; do
@@ -1548,7 +1686,7 @@ upload_inputs() {
     for i in "${pids[@]}"; do wait "$i" || failed=1; done
     (( ! failed )) || { say "upload failed: $(tail -n 3 "$TMP/upload.err" 2> /dev/null | tr '\n' ' ')"; return 1; }
     if [ -n "$narrow" ]; then
-        new_conn "cd /workspace/mpd-data && sha256sum -c --quiet" <<< "$narrow" || { say "a float64 file widened on the pod differs from the Mac's"; return 1; }
+        new_conn "cd $WS/mpd-data && sha256sum -c --quiet" <<< "$narrow" || { say "a float64 file widened on the pod differs from the Mac's"; return 1; }
         saved=$(cd "$MAC_DATA" && awk '{ print $2 }' <<< "$narrow" | xargs stat -f %z | awk '{ s += $1 / 2 } END { printf "%d", s / 1048576 }')
     fi
     took=$(( $(date +%s) - started ))
@@ -1563,7 +1701,7 @@ fetch_models() {
         [[ $p =~ models--([^/]+)--([^/]+)/snapshots/([0-9a-f]+)$ ]]
         repo=${BASH_REMATCH[1]}/${BASH_REMATCH[2]} rev=${BASH_REMATCH[3]}
         list=$(cd "$p" && find . -type f -o -type l | sed 's|^\./||' | tr '\n' ' ')
-        new_conn "set -e; d=/workspace/hf/$repo/$rev; for f in $list; do mkdir -p \"\$d/\$(dirname \$f)\"; curl -fsSL --retry 3 -o \"\$d/\$f\" https://huggingface.co/$repo/resolve/$rev/\$f; done" || return 1
+        new_conn "set -e; d=$WS/hf/$repo/$rev; for f in $list; do mkdir -p \"\$d/\$(dirname \$f)\"; curl -fsSL --retry 3 -o \"\$d/\$f\" https://huggingface.co/$repo/resolve/$rev/\$f; done" || return 1
         say "fetched $repo@${rev:0:12} on the pod"
     done
 }
@@ -1604,8 +1742,8 @@ build_fineweb() {
     for e in "${fw_plan[@]}"; do
         (
             IFS='|' read -r d k n ts sums <<< "$e"
-            data_step "building qwen3_fineweb/$d (/workspace/data-$d.log)" "cd /workspace/src && python3 bench/mpd_qwen3_fineweb_2951.py --file $k --documents $n --context ${ts//,/ } --out /workspace/mpd-data/qwen3_fineweb/$d --workers $workers > /workspace/data-$d.log 2>&1 && rm -rf ~/.cache/huggingface/hub/datasets--HuggingFaceFW--fineweb/blobs/\$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"source\"][\"sha256\"])' /workspace/mpd-data/qwen3_fineweb/$d/meta.json)" || exit 1
-            tr ';' '\n' <<< "$sums" | sed '/^$/d' | data_step "checking qwen3_fineweb/$d against the release's sha256s" "cd /workspace/mpd-data/qwen3_fineweb/$d && sha256sum -c --quiet" || exit 1
+            data_step "building qwen3_fineweb/$d ($WS/data-$d.log)" "cd $WS/src && python3 bench/mpd_qwen3_fineweb_2951.py --file $k --documents $n --context ${ts//,/ } --out $WS/mpd-data/qwen3_fineweb/$d --workers $workers > $WS/data-$d.log 2>&1 && rm -rf ~/.cache/huggingface/hub/datasets--HuggingFaceFW--fineweb/blobs/\$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"source\"][\"sha256\"])' $WS/mpd-data/qwen3_fineweb/$d/meta.json)" || exit 1
+            tr ';' '\n' <<< "$sums" | sed '/^$/d' | data_step "checking qwen3_fineweb/$d against the release's sha256s" "cd $WS/mpd-data/qwen3_fineweb/$d && sha256sum -c --quiet" || exit 1
             say "built qwen3_fineweb/$d on the pod (FineWeb file $k, $n documents, contexts $ts); its files match the release"
         ) &
         pids+=($!)
@@ -1625,10 +1763,10 @@ build_pile() {
     pydeps || { touch "$TMP/refused"; say "the Python packages for the data builds did not install (/workspace/pydeps.log)"; return 1; }
     for e in "${pile_plan[@]}"; do
         read -r x base min <<< "$e"
-        data_step "building engine/$x (/workspace/data-$x.log)" "cd /workspace/src && python3 bench/vpd_2951/vpd_engine_export_pile.py /workspace/mpd-data/$base /workspace/mpd-data/engine/$x $min > /workspace/data-$x.log 2>&1 && rm -rf ~/mpd-data/hf" || return 1
+        data_step "building engine/$x ($WS/data-$x.log)" "cd $WS/src && python3 bench/vpd_2951/vpd_engine_export_pile.py $WS/mpd-data/$base $WS/mpd-data/engine/$x $min > $WS/data-$x.log 2>&1 && rm -rf ~/mpd-data/hf" || return 1
         jq -r '.files | to_entries[] | "\(.value.sha256)  \(.key).f64"' "$MAC_DATA/engine/$x/export.json" |
-            data_step "checking engine/$x against the Mac's export.json" "cd /workspace/mpd-data/engine/$x && sha256sum -c --quiet" || return 1
-        data_step "installing engine/$x's export.json" "cat > /workspace/mpd-data/engine/$x/export.json" < "$MAC_DATA/engine/$x/export.json" || return 1
+            data_step "checking engine/$x against the Mac's export.json" "cd $WS/mpd-data/engine/$x && sha256sum -c --quiet" || return 1
+        data_step "installing engine/$x's export.json" "cat > $WS/mpd-data/engine/$x/export.json" < "$MAC_DATA/engine/$x/export.json" || return 1
         say "built engine/$x on the pod ($min Pile train rows after $base's); its tensors match the Mac's export.json"
     done
     echo $(( $(date +%s) - started )) >> "$TMP/data_s"
@@ -1637,7 +1775,8 @@ build_pile() {
 # The pod's upload, data-build and waiting seconds, into its record for the ledger.
 note_times() {
     local up data rec=$ACTIVE/$POD n g k p c o e m
-    [ -f "$rec" ] || return 0
+    # A packed run's times are its own (rp-run.log); the record is the pod's run's.
+    [ -f "$rec" ] && (( ! GUEST )) || return 0
     up=$(awk '{ s += $1 } END { print s + 0 }' "$TMP/upload_s" 2> /dev/null || echo 0)
     data=$(awk '{ s += $1 } END { print s + 0 }' "$TMP/data_s" 2> /dev/null || echo 0)
     read -r n g k p c o e m _ < "$rec"
@@ -1654,7 +1793,7 @@ compile_on_pod() {
         flags=""
         for x in "${ex[@]}"; do [ "${package_of[$x]}" = "$pkg" ] && flags+=" --example $x"; done
         say "building$flags (-p $pkg) at ${C:0:12} with ${VCPU:-all} jobs"
-        on_pod "source ~/.cargo/env && cd /workspace/src && cargo build -q --release ${VCPU:+-j $VCPU} -p $pkg$flags" 2>&1 | tee -a "$OUT/build.log" >&2
+        on_pod "source ~/.cargo/env && cd $WS/src && cargo build -q --release ${VCPU:+-j $VCPU} -p $pkg$flags" 2>&1 | tee -a "$OUT/build.log" >&2
         case ${PIPESTATUS[0]} in
             0) ;;
             255) return 1 ;;
@@ -1662,24 +1801,24 @@ compile_on_pod() {
         esac
     done
     if [ ${#ex[@]} -gt 0 ]; then
-        on_pod "cd /workspace/src/target/release/examples && cp ${ex[*]} /workspace/bin/" || return 1
+        on_pod "cd $WS/src/target/release/examples && cp ${ex[*]} $WS/bin/" || return 1
         made+=("${ex[@]}")
     fi
     for x in "${ts[@]}"; do
         pkg=${x%%:*} name=${x#*:}
         say "building test $name (-p $pkg) at ${C:0:12}"
         # The test executable cargo reports for the target, copied as test-NAME.
-        on_pod "source ~/.cargo/env && cd /workspace/src && cargo test -q -p $pkg --test $name --no-run --message-format=json ${VCPU:+-j $VCPU} 2>> /workspace/build.log |
+        on_pod "source ~/.cargo/env && cd $WS/src && cargo test -q -p $pkg --test $name --no-run --message-format=json ${VCPU:+-j $VCPU} 2>> $WS/build.log |
             python3 -c 'import json, sys; [print(m[\"executable\"]) for m in map(json.loads, sys.stdin) if m.get(\"reason\") == \"compiler-artifact\" and m.get(\"executable\") and m[\"target\"][\"name\"] == sys.argv[1]]' $name |
-            tail -n 1 | xargs -r -I{} cp {} /workspace/bin/test-$name && [ -x /workspace/bin/test-$name ]"
+            tail -n 1 | xargs -r -I{} cp {} $WS/bin/test-$name && [ -x $WS/bin/test-$name ]"
         case $? in
             0) made+=("test-$name") ;;
             255) return 1 ;;
-            *) on_pod 'tail -n 30 /workspace/build.log' >> "$OUT/build.log" 2>&1; say "the test build failed (build.log)"; exit 1 ;;
+            *) on_pod "tail -n 30 $WS/build.log" >> "$OUT/build.log" 2>&1; say "the test build failed (build.log)"; exit 1 ;;
         esac
     done
     mkdir -p "$CACHE"
-    on_pod "tar -C /workspace/bin -cf - ${made[*]} | gzip -1" | gzip -dc | tar -x -C "$CACHE" || return 1
+    on_pod "tar -C $WS/bin -cf - ${made[*]} | gzip -1" | gzip -dc | tar -x -C "$CACHE" || return 1
     say "built and cached ${made[*]} ($KEY)"
 }
 
@@ -1726,7 +1865,7 @@ setup() {
     # step that fails on the connection (ssh's 255) loses the pod; any other failure ends the run.
     # The source first: the data builds run its scripts.
     git -C "$MAC_GAM" archive "$C" crates Cargo.toml Cargo.lock rust-toolchain.toml src build.rs bench/cargo_benches docs/rust-library-surface.md "${srcpaths[@]}" |
-        gzip -1 | on_pod 'mkdir -p /workspace/src /workspace/bin "/workspace/mpd-data/runpod/'"$NAME"'" && gzip -dc | tar -x -C /workspace/src' || return 1
+        gzip -1 | on_pod "mkdir -p $WS/src $WS/bin $WS/mpd-data/runpod/$NAME && gzip -dc | tar -x -C $WS/src" || return 1
     # Inputs, data, models and rsync (for syncing outputs) arrive while the toolchain and builds do.
     rm -f "$TMP/upload_s" "$TMP/data_s" "$TMP/refused"
     { upload_inputs && build_pile; } & jobs+=($!)
@@ -1747,14 +1886,14 @@ setup() {
         exit 1
     fi
     if [ ${#assets[@]} -gt 0 ]; then
-        on_pod "cd /workspace/bin && for n in ${assets[*]}; do curl -fsSL --retry 3 -o \$n $ASSETS/$KEY.\$n && chmod +x \$n || exit 1; done" < /dev/null || return 1
+        on_pod "cd $WS/bin && for n in ${assets[*]}; do curl -fsSL --retry 3 -o \$n $ASSETS/$KEY.\$n && chmod +x \$n || exit 1; done" < /dev/null || return 1
         say "${assets[*]} from rp-run-bin ($KEY), downloaded by the pod"
     fi
     if (( NEED_RUST )) || [ ${#build[@]} -gt 0 ]; then
         on_pod "[ -x ~/.cargo/bin/cargo ] || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain $CHANNEL" > /dev/null || return 1
     fi
     if [ ${#cached[@]} -gt 0 ]; then
-        COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -C "$CACHE" -cf - "${cached[@]}" | gzip -1 | on_pod 'gzip -dc | tar -x -C /workspace/bin' || return 1
+        COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -C "$CACHE" -cf - "${cached[@]}" | gzip -1 | on_pod "gzip -dc | tar -x -C $WS/bin" || return 1
         say "${cached[*]} from the cache ($KEY)"
     fi
     if [ ${#build[@]} -gt 0 ]; then
@@ -1765,7 +1904,7 @@ setup() {
     for x in "${jobs[@]}"; do wait "$x" || failed=1; done
     if [ -f "$TMP/refused" ]; then
         note_times
-        on_pod 'tail -n 40 /workspace/pydeps.log /workspace/data-*.log 2> /dev/null' > "$OUT/data.log" 2>&1
+        on_pod "tail -n 40 /workspace/pydeps.log $WS/data-*.log 2> /dev/null" > "$OUT/data.log" 2>&1
         say "the data builds' logs are in $OUT/data.log"
         exit 1
     fi
@@ -1792,7 +1931,7 @@ setup() {
         if (( kb == 0 )); then
             :
         elif (( send < work )); then
-            rsync -a "${RSYNC_EXCLUDE[@]}" -e "${SSH[*]} -o ControlPath=none -p $PORT" "$OUT/" "$SSH_USER@$IP:/workspace/mpd-data/runpod/$NAME/" || return 1
+            rsync -a "${RSYNC_EXCLUDE[@]}" -e "${SSH[*]} -o ControlPath=none -p $PORT" "$OUT/" "$SSH_USER@$IP:$WS/mpd-data/runpod/$NAME/" || return 1
             say "restored the outputs synced so far ($(( kb / 1024 )) MB, about $send s up, against $work s of work)"
         else
             say "not restoring the outputs: $(( kb / 1024 )) MB would take about $send s to send up, more than the $work s of work they hold; the command starts over"
@@ -1841,7 +1980,7 @@ pull() {  # REL (one file of the pod's outputs)
 }
 sync_outputs() {  # checkpoints | rest | all
     local what=${1:-all} rel size mtime mac
-    POD_OUT=/workspace/mpd-data/runpod/$NAME
+    POD_OUT=$WS/mpd-data/runpod/$NAME
     if [ "$what" != checkpoints ]; then
         rsync -a -W "${RSYNC_EXCLUDE[@]}" --exclude="$CKPT" --max-size=$(( BIG - 1 )) -e "${SSH[*]} -o ControlPath=none -p $PORT" \
             "$SSH_USER@$IP:$POD_OUT/" "$OUT/" 2> /dev/null || return 1
@@ -1888,7 +2027,7 @@ idle_check() {
         mean=$(on_pod "awk -v t=\$(( \$(date +%s) - 900 )) '\$1 >= t && NF == 2 { s += \$2; n++ } END { if (n) printf \"%d\", s / n }' /workspace/gpu-util.log" < /dev/null 2> /dev/null || true)
         if [ -n "$mean" ] && (( mean < 20 )); then
             say "GPU at $mean% over the last 15 minutes: stopping the run as idle"
-            echo idle-stopped > "$ACTIVE/.$POD.end"
+            (( GUEST )) || echo idle-stopped > "$ACTIVE/.$POD.end"
             touch "$OUT/STOP"
             kill -TERM $$
             return
@@ -1900,17 +2039,17 @@ idle_check() {
 # Sets RC to its exit status; returns 1 when the pod is lost first.
 run_command() {
     {
-        echo 'export PATH=$HOME/.cargo/bin:/workspace/bin:/usr/local/cuda/bin:$PATH'
+        echo "export PATH=\$HOME/.cargo/bin:$WS/bin:/usr/local/cuda/bin:\$PATH"
         echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib64:/usr/local/nvidia/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}'
-        echo 'export MPD_BIN=/workspace/bin'
+        echo "export MPD_BIN=$WS/bin"
         echo 'echo "# $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader), $(nvidia-smi | grep -o "CUDA Version: [0-9.]*")"'
-        echo "cd /workspace/src"
+        echo "cd $WS/src"
         echo "$cmd"
-    } | on_pod 'cat > /workspace/run.sh' || return 1
+    } | on_pod "cat > $WS/run.sh" || return 1
     # The detached shell writes its own pid, so `tail --pid` follows the command and not a launcher.
-    on_pod 'rm -f /workspace/run.exit /workspace/run.pid
-        setsid nohup bash -c "echo \$\$ > /workspace/run.pid; bash /workspace/run.sh > /workspace/run.log 2>&1; echo \$? > /workspace/run.exit" > /dev/null 2>&1 < /dev/null &
-        until [ -s /workspace/run.pid ]; do sleep 0.1; done' || return 1
+    on_pod "rm -f $WS/run.exit $WS/run.pid
+        setsid nohup bash -c 'echo \$\$ > $WS/run.pid; bash $WS/run.sh > $WS/run.log 2>&1; echo \$? > $WS/run.exit' > /dev/null 2>&1 < /dev/null &
+        until [ -s $WS/run.pid ]; do sleep 0.1; done" || return 1
     say "running: $cmd"
     FIRST_START=${FIRST_START:-$(date +%s)}
     sync_loop rest &
@@ -1925,9 +2064,9 @@ run_command() {
     while :; do
         # In the background, waited for: a signal (rp-run stop, the idle check) ends the wait at once,
         # where a command in the foreground would hold it until the stream ends.
-        on_pod "tail -c +$(( $(wc -c < "$LOG" | tr -d ' ') - base + 1 )) -f --pid=\$(cat /workspace/run.pid) /workspace/run.log" | tee -a "$LOG" &
+        on_pod "tail -c +$(( $(wc -c < "$LOG" | tr -d ' ') - base + 1 )) -f --pid=\$(cat $WS/run.pid) $WS/run.log" | tee -a "$LOG" &
         wait $! || true
-        if state=$(on_pod 'cat /workspace/run.exit 2> /dev/null || { kill -0 "$(cat /workspace/run.pid)" 2> /dev/null && echo alive; } || echo vanished'); then
+        if state=$(on_pod "cat $WS/run.exit 2> /dev/null || { kill -0 \"\$(cat $WS/run.pid)\" 2> /dev/null && echo alive; } || echo vanished"); then
             misses=0
             case $state in
                 alive) continue ;;
@@ -2014,14 +2153,20 @@ case $MODE in
             # A pod deleted by anyone but this runner (an API delete, rp-run stop, its own cap) ends
             # the run; only a pod its host lost (exited by RunPod, or unreachable) is replaced.
             if [ -n "$POD" ] && deleted "$POD"; then
-                [ -f "$ACTIVE/.$POD.end" ] || echo deleted-elsewhere > "$ACTIVE/.$POD.end"
+                [ -f "$ACTIVE/.$POD.end" ] || (( GUEST )) || echo deleted-elsewhere > "$ACTIVE/.$POD.end"
                 say "pod $POD was deleted outside this runner; the run ends"
                 exit 1
             fi
             # The lost pod's shared connection is gone too: closing it fails, harmlessly.
             [ -z "$IP" ] || on_pod -O exit > /dev/null 2>&1 || true
-            [ -z "$POD" ] || { echo lost > "$ACTIVE/.$POD.end"; reap "$POD" || exit 1; }
-            POD="" IP=""
+            if [ -n "$POD" ] && (( GUEST )); then
+                rm -f "$ACTIVE/.$POD.guests/$NAME"
+                reap "$POD" || exit 1
+            elif [ -n "$POD" ]; then
+                echo lost > "$ACTIVE/.$POD.end"
+                reap "$POD" || exit 1
+            fi
+            POD="" IP="" GUEST=0
             attempt=$(( attempt + 1 ))
             if [ -n "$DEADLINE" ] && (( $(date +%s) + 600 > DEADLINE )); then
                 say "less than 10 minutes left under the HOURS cap; not relaunching"
@@ -2031,25 +2176,25 @@ case $MODE in
             say "relaunch $(( attempt - 1 )) of at most $RELAUNCHES"
         done
         say "command exited $RC after $(( $(date +%s) - CREATED )) s on pod $POD"
-        sync_outputs || on_pod "cd /workspace/mpd-data/runpod/$NAME && tar -cf - . | gzip -1" | gzip -dc | tar -x -C "$OUT"
+        sync_outputs || on_pod "cd $WS/mpd-data/runpod/$NAME && tar -cf - . | gzip -1" | gzip -dc | tar -x -C "$OUT"
         say "outputs in $OUT"
         exit "$RC" ;;
     dev)
         launch && setup || exit 1
         # A git repository of the commit, so changes made on the pod show as a diff against it.
-        on_pod "cd /workspace/src && git init -q && echo /target/ > .git/info/exclude && git add -A && git -c user.name=rp-run -c user.email=rp-run@localhost commit -qm ${C:0:12}" ||
+        on_pod "cd $WS/src && git init -q && echo /target/ > .git/info/exclude && git add -A && git -c user.name=rp-run -c user.email=rp-run@localhost commit -qm ${C:0:12}" ||
             { say "could not make the source a git repository"; exit 1; }
         # The dependencies compile while the developer starts: a release and a test build of gam-gpu.
-        on_pod "cd /workspace/src && setsid nohup bash -c 'source ~/.cargo/env; cargo build --release -p gam-gpu --example tensor_f32_speed ${VCPU:+-j $VCPU} && cargo test -p gam-gpu --no-run --test tensor_f32 --test tensor_posterior ${VCPU:+-j $VCPU}' > /workspace/warm.log 2>&1 < /dev/null &" ||
+        on_pod "cd $WS/src && setsid nohup bash -c 'source ~/.cargo/env; cargo build --release -p gam-gpu --example tensor_f32_speed ${VCPU:+-j $VCPU} && cargo test -p gam-gpu --no-run --test tensor_f32 --test tensor_posterior ${VCPU:+-j $VCPU}' > $WS/warm.log 2>&1 < /dev/null &" ||
             { say "could not start the warm build"; exit 1; }
         # The toolchain and CUDA for every shell, a command over SSH included (sourced before
         # .bashrc's early return for non-interactive shells); a login starts in the source.
         {
-            echo 'export PATH=$HOME/.cargo/bin:/workspace/bin:/usr/local/cuda/bin:$PATH'
+            echo "export PATH=\$HOME/.cargo/bin:$WS/bin:/usr/local/cuda/bin:\$PATH"
             echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib64:/usr/local/nvidia/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}'
-        } | on_pod 'cat > /workspace/env.sh && sed -i "1i . /workspace/env.sh" ~/.bashrc && echo "cd /workspace/src" >> ~/.bashrc' || exit 1
+        } | on_pod "cat > $WS/env.sh && sed -i '1i . $WS/env.sh' ~/.bashrc && echo 'cd $WS/src' >> ~/.bashrc" || exit 1
         access
-        say "dev pod $POD ready: $OUT/ssh; source /workspace/src at ${C:0:12}; rust $CHANNEL; warm build in /workspace/warm.log"
+        say "dev pod $POD ready: $OUT/ssh; source $WS/src at ${C:0:12}; rust $CHANNEL; warm build in $WS/warm.log"
         hold || exit 1
         exit 0 ;;
 esac
