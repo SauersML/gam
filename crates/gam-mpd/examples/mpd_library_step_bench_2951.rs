@@ -131,33 +131,43 @@ fn median(device: &Device, reps: usize, mut part: impl FnMut() -> Result<(), Str
     Ok(seconds[seconds.len() / 2])
 }
 
-/// Each kernel class of a decoder layer timed alone on `sequences` × `length` rows: its products
-/// (TFLOPS), attention forward and reverse (TFLOPS), the norms, rotation and activation (GB/s of
-/// the values they read and write), and the device's bfloat16 product ceiling.
+/// Each kernel class of a decoder layer timed alone on `sequences` × `length` rows: its products in
+/// each arithmetic (TFLOPS of the product computed, not of the split's three), attention forward
+/// and reverse (TFLOPS), the norms, rotation and activation (GB/s of the values they read and
+/// write), and the device's bfloat16 product ceiling.
 fn classes(device: &Device, decoder: &Decoder, sequences: usize, length: usize, reps: usize) -> Result<Value, String> {
     use gam_gpu::tensor::{Arithmetic, Op};
     let shape = decoder.layer_shape().ok_or("no decoder layer")?;
     let rows = sequences * length;
-    let half = |r: usize, c: usize| -> Result<gam_gpu::tensor::Tensor, String> { device.bf16_copy(&device.zeros(r, c).map_err(error)?).map_err(error) };
-    let product = |m: usize, k: usize, n: usize| -> Result<Value, String> {
-        let (a, b) = (half(m, k)?, half(n, k)?);
+    // Bfloat16 products read bfloat16 copies, as the decoder's operands are in that arithmetic; the
+    // others read f32.
+    let operand = |r: usize, c: usize, arithmetic: Arithmetic| -> Result<gam_gpu::tensor::Tensor, String> {
+        let t = device.zeros(r, c).map_err(error)?;
+        if arithmetic == Arithmetic::Bf16 { device.bf16_copy(&t).map_err(error) } else { Ok(t) }
+    };
+    let product = |m: usize, k: usize, n: usize, arithmetic: Arithmetic| -> Result<Value, String> {
+        let (a, b) = (operand(m, k, arithmetic)?, operand(n, k, arithmetic)?);
         let mut c = device.empty(m, n).map_err(error)?;
-        let t = median(device, reps, || device.gemm(&mut c, 1.0, &a, Op::N, &b, Op::T, 0.0, Arithmetic::Bf16).map_err(error))?;
+        let t = median(device, reps, || device.gemm(&mut c, 1.0, &a, Op::N, &b, Op::T, 0.0, arithmetic).map_err(error))?;
         Ok(json!({"seconds": t, "tflops": 2.0 * (m * k * n) as f64 / t / 1e12}))
     };
     let side = 8192;
-    let ceiling = product(side, side, side)?;
+    let ceiling = product(side, side, side, Arithmetic::Bf16)?;
     let (d, layout) = (shape.width, shape.heads);
     let reads = layout.queries * layout.width;
     let m = if shape.gated { shape.mlp_inputs / 2 } else { shape.mlp_inputs };
-    let products = json!({
-        "projections": product(rows, d, shape.projections)?,
-        "output": product(rows, reads, d)?,
-        "mlp_inputs": product(rows, d, shape.mlp_inputs)?,
-        "mlp_output": product(rows, m, d)?,
-    });
+    let mut products = serde_json::Map::new();
+    for arithmetic in [Arithmetic::Bf16, Arithmetic::F32, Arithmetic::Tf32, Arithmetic::Tf32x3, Arithmetic::Bf16x3] {
+        let classes = json!({
+            "projections": product(rows, d, shape.projections, arithmetic)?,
+            "output": product(rows, reads, d, arithmetic)?,
+            "mlp_inputs": product(rows, d, shape.mlp_inputs, arithmetic)?,
+            "mlp_output": product(rows, m, d, arithmetic)?,
+        });
+        products.insert(format!("{arithmetic:?}"), classes);
+    }
     let ranges: Vec<std::ops::Range<usize>> = (0..sequences).map(|i| i * length..(i + 1) * length).collect();
-    let (heads, _) = device.heads_rope(&device.zeros(rows, layout.columns()).map_err(error)?, layout, None, None).map_err(error)?;
+    let (heads, _) = device.heads_rope(&device.zeros(rows, layout.columns()).map_err(error)?, layout, None, None, true).map_err(error)?;
     let flops = 2.0 * 2.0 * rows as f64 * (length as f64 / 2.0) * layout.width as f64 * layout.queries as f64;
     let mut kept = None;
     let forward = median(device, reps, || {
@@ -171,14 +181,14 @@ fn classes(device: &Device, decoder: &Decoder, sequences: usize, length: usize, 
     let gain = device.upload_vec(1, d, vec![1.0; d]).map_err(error)?;
     let norm = median(device, reps, || device.rms_gain(&x, &gain, shape.epsilon, true).map(|_| ()).map_err(error))?;
     let p = device.zeros(rows, layout.columns()).map_err(error)?;
-    let rope = median(device, reps, || device.heads_rope(&p, layout, None, None).map(|_| ()).map_err(error))?;
+    let rope = median(device, reps, || device.heads_rope(&p, layout, None, None, true).map(|_| ()).map_err(error))?;
     let h = device.zeros(rows, shape.mlp_inputs).map_err(error)?;
-    let activation = median(device, reps, || if shape.gated { device.swiglu(&h) } else { device.gelu_tanh(&h, None) }.map(|_| ()).map_err(error))?;
+    let activation = median(device, reps, || if shape.gated { device.swiglu(&h, true) } else { device.gelu_tanh(&h, None, true) }.map(|_| ()).map_err(error))?;
     let bandwidth = |t: f64, bytes: usize| json!({"seconds": t, "gb_per_s": bytes as f64 / t / 1e9});
     Ok(json!({
         "rows": rows,
         "ceiling_bf16_product": ceiling,
-        "products": products,
+        "products": Value::Object(products),
         "attention": {"forward": {"seconds": forward, "tflops": flops / forward / 1e12}, "reverse": {"seconds": reverse, "tflops": 2.5 * flops / reverse / 1e12}},
         "rms_gain": bandwidth(norm, rows * d * (4 + 2)),
         "heads_rope": bandwidth(rope, rows * layout.columns() * (4 + 2)),
@@ -188,9 +198,9 @@ fn classes(device: &Device, decoder: &Decoder, sequences: usize, length: usize, 
 
 fn main() -> Result<(), String> {
     log_to_stderr();
-    // `products=f32|tf32|bf16` (f32 by default) sets the arithmetic of both programs' products;
-    // `engine=decoder` runs the experiments' blocks on the fixed decoder computations
-    // (`gam_mpd::decoder`, bfloat16 products) instead of the programs.
+    // `products=f32|tf32|bf16|tf32x3|bf16x3` (f32 by default) sets the arithmetic of both
+    // programs' products, or of the decoders' with `engine=decoder`, which runs the experiments'
+    // blocks on the fixed decoder computations (`gam_mpd::decoder`) instead of the programs.
     let (settings, args): (Vec<String>, Vec<String>) = std::env::args().skip(1).partition(|a| a.contains('='));
     let (mut products, mut fixed) = (gam_gpu::tensor::Arithmetic::F32, false);
     for setting in &settings {
@@ -198,12 +208,14 @@ fn main() -> Result<(), String> {
             "products=f32" => products = gam_gpu::tensor::Arithmetic::F32,
             "products=tf32" => products = gam_gpu::tensor::Arithmetic::Tf32,
             "products=bf16" => products = gam_gpu::tensor::Arithmetic::Bf16,
+            "products=tf32x3" => products = gam_gpu::tensor::Arithmetic::Tf32x3,
+            "products=bf16x3" => products = gam_gpu::tensor::Arithmetic::Bf16x3,
             "engine=program" => fixed = false,
             "engine=decoder" => fixed = true,
             other => return Err(format!("unknown setting {other}")),
         }
     }
-    let usage = "MODEL SEQUENCES CONTEXT REPS OUT [WINDOWS [LAYERS]] [products=f32|tf32|bf16] [engine=program|decoder]";
+    let usage = "MODEL SEQUENCES CONTEXT REPS OUT [WINDOWS [LAYERS]] [products=f32|tf32|bf16|tf32x3|bf16x3] [engine=program|decoder]";
     let (model, rest) = args.split_first().ok_or(usage)?;
     let [sequences, context, reps, out, windows @ ..] = rest else {
         return Err(usage.into());
@@ -280,10 +292,13 @@ fn main() -> Result<(), String> {
     let mut p_program = DeviceProgram::compile_values_bounded(&device, &interchange::prefix(&p_flat)?, usize::MAX)?;
     p_program.set_arithmetic(products);
     p_program.prepare_dense_parameters(&trainable)?;
-    // Bfloat16 products read bfloat16 copies of the weights (`DeviceProgram::hold_bf16`).
+    // Bfloat16 products read bfloat16 copies of the weights (`DeviceProgram::hold_bf16`); the
+    // decoder engine keeps P's sample in f32 and splits it into two bfloat16 terms itself.
     if products == gam_gpu::tensor::Arithmetic::Bf16 {
         m_program.hold_bf16()?;
-        p_program.hold_bf16()?;
+        if !fixed {
+            p_program.hold_bf16()?;
+        }
     }
     // Where the experiments cannot be scored (a head the compact targets do not take), the posterior
     // parts are timed alone, from a zero gradient on the device.
@@ -307,9 +322,8 @@ fn main() -> Result<(), String> {
     let decoders = if fixed {
         let (m_prefix, p_prefix) = (interchange::prefix(&m_flat)?, interchange::prefix(&p_flat)?);
         let m_ends = (&m_streams[..], &m_reads[..], m_program.hidden());
-        let outside = if products == gam_gpu::tensor::Arithmetic::F32 { gam_gpu::tensor::Arithmetic::Bf16 } else { products };
-        let m = Decoder::new(&device, &m_prefix, m_ends, &[])?.with_arithmetic(outside);
-        Some((m, Decoder::new(&device, &p_prefix, (&p_streams[..], &p_reads[..], p_program.hidden()), &trainable)?.with_arithmetic(outside)))
+        let m = Decoder::new(&device, &m_prefix, m_ends, &[])?.with_arithmetic(products);
+        Some((m, Decoder::new(&device, &p_prefix, (&p_streams[..], &p_reads[..], p_program.hidden()), &trainable)?.with_arithmetic(products)))
     } else {
         None
     };

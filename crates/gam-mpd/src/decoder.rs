@@ -14,9 +14,14 @@
 //!
 //! The block is recognized in the program by its nodes ([`Decoder::new`]), its operators stacked
 //! once, and run with the fused kernels of `gam_gpu` (`Device::rms_gain`, `heads_rope`,
-//! `causal_attention`, `swiglu`, `gelu_tanh` and their reverses): products read bfloat16 operands
-//! and accumulate in f32; the stream, the reads and every cotangent stay f32. A program the
-//! recognition does not take runs on the reference engine (`interchange::Model`).
+//! `causal_attention`, `swiglu`, `gelu_tanh` and their reverses). The stream, the norms and every
+//! cotangent are f32. The products run in one arithmetic ([`Decoder::with_arithmetic`], f32 by
+//! default): in [`Arithmetic::Bf16`] each product's operands are rounded to bfloat16, which
+//! changes a model's divergence per token by as much as the divergences an experiment measures;
+//! in any other, the operands stay f32 and the product rounds them as its arithmetic says
+//! ([`Arithmetic::Tf32x3`] keeps f32's accuracy on the tensor cores). Attention reads its heads
+//! in bfloat16 in every arithmetic until its kernel takes f32. A program the recognition does not
+//! take runs on the reference engine (`interchange::Model`).
 //!
 //! The trainable operators' values are read from the program they live in ([`Decoder::refresh`]),
 //! their gradients returned per operator.
@@ -105,10 +110,10 @@ enum Block {
     Mlp(Mlp),
 }
 
-/// A block's weights on the device.
+/// A block's weights on the device, in f32.
 struct Weights {
     gain: Tensor,
-    /// The stacked input product (bfloat16), and its gradient's row blocks per operator.
+    /// The stacked input product, and its gradient's row blocks per operator.
     input: Tensor,
     norms: Option<Tensor>,
     output: Tensor,
@@ -126,7 +131,7 @@ pub struct Decoder {
     trainable: Vec<usize>,
     /// The bytes of one gradient of the trainable operators.
     gradient_bytes: usize,
-    /// The products' precision outside the blocks (the head, the patches): bfloat16 by default.
+    /// The products' arithmetic, in the blocks and outside them (the head, the patches).
     arithmetic: Arithmetic,
     /// Per rotary configuration, the angles of positions `0..span` (span × planes), grown to the
     /// longest sequence seen.
@@ -230,8 +235,9 @@ fn projection(program: &OperatorProgram, n: usize, read: usize) -> Result<(usize
 impl Decoder {
     /// The decoder of the flat program `program` (`interchange::sites`, through its hidden node)
     /// with blocks entering at `entries` and reading at `reads`, its operators `trainable`
-    /// updated by [`Self::refresh`]; products in bfloat16. Refused when a block is not of the
-    /// decoder family.
+    /// updated by [`Self::refresh`]; products in f32. Refused when a block is not of the decoder
+    /// family, or when a trainable operator is not one of its stacked maps (the projections, an
+    /// MLP's input maps, an MLP's output map), whose values it would not refresh.
     pub fn new(device: &Device, program: &OperatorProgram, (entries, reads, hidden): (&[usize], &[usize], usize), trainable: &[usize]) -> Result<Self, String> {
         if !(device.is_host() || device.storage() == Storage::F32) {
             return Err(error("the decoder runs on the host or on CUDA in f32 storage"));
@@ -241,8 +247,15 @@ impl Decoder {
             let end = entries.get(b + 1).copied().unwrap_or(hidden);
             blocks.push(if b % 2 == 0 { Block::Attention(attention(program, stream, read_node, end)?) } else { Block::Mlp(mlp(program, stream, read_node, end, b + 1 == entries.len())?) });
         }
-        if blocks.iter().any(|b| matches!(b, Block::Mlp(m) if m.bias.is_some_and(|op| trainable.contains(&op)))) {
-            return Err(error("a trainable bias"));
+        let maps: Vec<usize> = blocks
+            .iter()
+            .flat_map(|b| match b {
+                Block::Attention(a) => a.projections.parts.iter().map(|(op, _, _)| *op).collect::<Vec<_>>(),
+                Block::Mlp(m) => m.input.parts.iter().map(|(op, _, _)| *op).chain([m.output]).collect(),
+            })
+            .collect();
+        if let Some(op) = trainable.iter().find(|op| !maps.contains(op)) {
+            return Err(error(format!("trainable operator {} is not a stacked map", program.operators[*op].name)));
         }
         // The embedding: the first stream is a gather of a table's rows by the tokens.
         let table = single(program, entries[0]).filter(|(input, _)| matches!(program.nodes[*input], Node::Feature { .. })).ok_or_else(|| error("the first stream is not an embedding"))?;
@@ -250,7 +263,7 @@ impl Decoder {
         let width = embedding.cols();
         let value = if device.storage() == Storage::F32 { 4 } else { 8 };
         let gradient_bytes = trainable.iter().map(|op| program.operators[*op].rows.width() * program.operators[*op].cols.width() * value).sum();
-        let mut out = Self { device: device.clone(), blocks, weights: Vec::new(), embedding, width, trainable: trainable.to_vec(), gradient_bytes, arithmetic: Arithmetic::Bf16, angles: Mutex::new(Vec::new()) };
+        let mut out = Self { device: device.clone(), blocks, weights: Vec::new(), embedding, width, trainable: trainable.to_vec(), gradient_bytes, arithmetic: Arithmetic::F32, angles: Mutex::new(Vec::new()) };
         out.weights = out.blocks.iter().map(|b| out.upload(program, b)).collect::<Result<_, _>>()?;
         Ok(out)
     }
@@ -258,7 +271,6 @@ impl Decoder {
     fn upload(&self, program: &OperatorProgram, block: &Block) -> Result<Weights, String> {
         let d = &self.device;
         let up = |m: Array2<f64>| d.upload(m.view()).map_err(error);
-        let half = |m: Array2<f64>| d.bf16_copy(&d.upload(m.view()).map_err(error)?).map_err(error);
         let row = |op: usize| -> Result<Tensor, String> {
             let values = program.operators[op].diagonal().ok_or_else(|| error("a gain that is not diagonal"))?;
             d.upload_vec(1, values.len(), values.to_vec()).map_err(error)
@@ -275,13 +287,13 @@ impl Decoder {
                 };
                 let blocks: Vec<Array2<f64>> = a.output.iter().map(|op| program.operators[*op].matrix()).collect();
                 let views: Vec<_> = blocks.iter().map(|b| b.view()).collect();
-                Weights { gain: row(a.gain)?, input: half(a.projections.values(program)?)?, norms, output: half(concatenate(Axis(1), &views).map_err(error)?)?, bias: None, last: None }
+                Weights { gain: row(a.gain)?, input: up(a.projections.values(program)?)?, norms, output: up(concatenate(Axis(1), &views).map_err(error)?)?, bias: None, last: None }
             }
             Block::Mlp(m) => Weights {
                 gain: row(m.gain)?,
-                input: half(m.input.values(program)?)?,
+                input: up(m.input.values(program)?)?,
                 norms: None,
-                output: half(program.operators[m.output].matrix())?,
+                output: up(program.operators[m.output].matrix())?,
                 bias: m.bias.map(|b| up(program.operators[b].matrix().t().to_owned())).transpose()?,
                 last: m.last.map(|(g, _)| row(g)).transpose()?,
             },
@@ -330,7 +342,8 @@ impl Decoder {
         }
     }
 
-    /// The products' precision outside the blocks (the head's sweep of the vocabulary, the patches).
+    /// The products' arithmetic (module note), in the blocks and outside them (the head's sweep of
+    /// the vocabulary, the patches).
     #[must_use]
     pub fn with_arithmetic(mut self, arithmetic: Arithmetic) -> Self {
         self.arithmetic = arithmetic;
@@ -338,9 +351,14 @@ impl Decoder {
     }
 
     /// The trainable operators' current values from `program` (the explanation's resident program,
-    /// after its weight sample is written): each stack's row blocks copied into place in bfloat16.
+    /// after its weight sample is written): each stack's row blocks copied into place (widened to
+    /// f32 where the program holds bfloat16, `DeviceProgram::hold_bf16`).
     pub fn refresh(&mut self, program: &DeviceProgram) -> Result<(), String> {
         let d = self.device.clone();
+        let value = |op: usize| -> Result<Tensor, String> {
+            let value = program.dense(op)?;
+            if value.storage() == Storage::Bf16 { d.convert(value) } else { d.copy(value) }.map_err(error)
+        };
         for (block, weights) in self.blocks.iter().zip(&mut self.weights) {
             let (stack, output) = match block {
                 Block::Attention(a) => (&a.projections, None),
@@ -348,14 +366,11 @@ impl Decoder {
             };
             for &(op, at, _) in &stack.parts {
                 if self.trainable.contains(&op) {
-                    let value = program.dense(op)?;
-                    let value = if value.storage() == Storage::Bf16 { d.copy(value) } else { d.bf16_copy(value) }.map_err(error)?;
-                    d.set_rows(&mut weights.input, at, &value).map_err(error)?;
+                    d.set_rows(&mut weights.input, at, &value(op)?).map_err(error)?;
                 }
             }
             if let Some(op) = output.filter(|op| self.trainable.contains(op)) {
-                let value = program.dense(op)?;
-                weights.output = if value.storage() == Storage::Bf16 { d.copy(value) } else { d.bf16_copy(value) }.map_err(error)?;
+                weights.output = value(op)?;
             }
         }
         Ok(())
@@ -418,6 +433,11 @@ impl Decoder {
         let positions: Vec<u32> = ranges.iter().flat_map(|r| 0..r.len() as u32).collect();
         let ids: Indices = self.device.upload_indices(&positions).map_err(error)?;
         Ok((self.device.gather_rows(&table.0, &ids).map_err(error)?, self.device.gather_rows(&table.1, &ids).map_err(error)?))
+    }
+
+    /// Whether `stack` holds a trainable operator.
+    fn trains(&self, stack: &Stack) -> bool {
+        stack.parts.iter().any(|(op, _, _)| self.trainable.contains(op))
     }
 
     /// Adds row blocks of a stacked gradient into the per-operator gradients of the trainable ones.
@@ -611,27 +631,30 @@ impl BlockEngine for Decoder {
         if let Some(edit) = read_edit {
             edit(&mut read)?;
         }
-        let read16 = d.bf16_copy(&read).map_err(error)?;
+        // In bfloat16 each operand is rounded once where it is made, not per product reading it.
+        let (arithmetic, half) = (self.arithmetic, self.arithmetic == Arithmetic::Bf16);
+        let read = if half { d.bf16_copy(&read).map_err(error)? } else { read };
         let mut out = d.copy(&x).map_err(error)?;
         let inner = match &self.blocks[block] {
             Block::Attention(a) => {
                 let mut p = d.empty(x.rows(), a.projections.rows).map_err(error)?;
-                d.gemm(&mut p, 1.0, &read16, Op::N, &w.input, Op::T, 0.0, Arithmetic::Bf16).map_err(error)?;
+                d.gemm(&mut p, 1.0, &read, Op::N, &w.input, Op::T, 0.0, arithmetic).map_err(error)?;
                 let angles = rotary.map(|r| self.angles(r, ranges)).transpose()?;
                 let rotation = angles.as_ref().zip(rotary).map(|((c, s), r)| (c, s, r.half_split));
                 let norm = w.norms.as_ref().zip(a.norms.as_ref()).map(|(g, (_, e))| (g, *e));
-                let (heads, head_scales) = d.heads_rope(&p, a.layout, norm, rotation).map_err(error)?;
+                let (heads, head_scales) = d.heads_rope(&p, a.layout, norm, rotation, true).map_err(error)?;
                 // Each range is one sequence; the gathered rows hold them in order.
                 let sequences: Vec<Range<usize>> = ranges.iter().scan(0, |at, r| { *at += r.len(); Some(*at - r.len()..*at) }).collect();
                 let attended = d.causal_attention(&heads, a.layout, &sequences, a.scale).map_err(error)?;
-                d.gemm(&mut out, 1.0, &attended.0, Op::N, &w.output, Op::T, 1.0, Arithmetic::Bf16).map_err(error)?;
+                let wide = if half { None } else { Some(d.convert(&attended.0).map_err(error)?) };
+                d.gemm(&mut out, 1.0, wide.as_ref().unwrap_or(&attended.0), Op::N, &w.output, Op::T, 1.0, arithmetic).map_err(error)?;
                 Inner::Attention { head_scales, heads, angles, attended, sequences }
             }
             Block::Mlp(m) => {
                 let mut pre = d.empty(x.rows(), m.input.rows).map_err(error)?;
-                d.gemm(&mut pre, 1.0, &read16, Op::N, &w.input, Op::T, 0.0, Arithmetic::Bf16).map_err(error)?;
-                let active = if m.gated { d.swiglu(&pre) } else { d.gelu_tanh(&pre, w.bias.as_ref()) }.map_err(error)?;
-                d.gemm(&mut out, 1.0, &active, Op::N, &w.output, Op::T, 1.0, Arithmetic::Bf16).map_err(error)?;
+                d.gemm(&mut pre, 1.0, &read, Op::N, &w.input, Op::T, 0.0, arithmetic).map_err(error)?;
+                let active = if m.gated { d.swiglu(&pre, half) } else { d.gelu_tanh(&pre, w.bias.as_ref(), half) }.map_err(error)?;
+                d.gemm(&mut out, 1.0, &active, Op::N, &w.output, Op::T, 1.0, arithmetic).map_err(error)?;
                 let last = match (&w.last, m.last) {
                     (Some(g), Some((_, e))) => {
                         let (hidden, k) = d.rms_gain(&out, g, e, false).map_err(error)?;
@@ -644,7 +667,7 @@ impl BlockEngine for Decoder {
             }
         };
         self.scatter(stream, ranges, out)?;
-        Ok(keep.then_some(Tape { x, scale, read: read16, inner }))
+        Ok(keep.then_some(Tape { x, scale, read, inner }))
     }
 
     fn reverse(
@@ -661,48 +684,51 @@ impl BlockEngine for Decoder {
         let mut g = self.gather(cotangent, ranges)?;
         let rows = g.rows();
         let mut g_read = d.empty(rows, self.width).map_err(error)?;
+        let (arithmetic, half) = (self.arithmetic, self.arithmetic == Arithmetic::Bf16);
+        // A cotangent that feeds two products, rounded once in bfloat16.
+        let operand = |t: Tensor| if half { d.bf16_copy(&t).map_err(error) } else { Ok(t) };
         match (&self.blocks[block], &tape.inner) {
             (Block::Attention(a), Inner::Attention { head_scales, heads, angles, attended, sequences }) => {
                 let mut projections = d.empty(rows, a.projections.rows).map_err(error)?;
-                d.gemm(&mut projections, 1.0, &tape.read, Op::N, &w.input, Op::T, 0.0, Arithmetic::Bf16).map_err(error)?;
+                d.gemm(&mut projections, 1.0, &tape.read, Op::N, &w.input, Op::T, 0.0, arithmetic).map_err(error)?;
                 let mut g_attended = d.empty(rows, a.layout.queries * a.layout.width).map_err(error)?;
-                d.gemm(&mut g_attended, 1.0, &g, Op::N, &w.output, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
+                d.gemm(&mut g_attended, 1.0, &g, Op::N, &w.output, Op::N, 0.0, arithmetic).map_err(error)?;
                 let g_heads = d.causal_attention_backward(heads, a.layout, sequences, a.scale, (&attended.0, &attended.1), &g_attended).map_err(error)?;
                 let rotation = angles.as_ref().zip(a.rotary).map(|((c, s), r)| (c, s, r.half_split));
                 let norm = w.norms.as_ref().zip(head_scales.as_ref());
-                // The cotangent feeds two products: rounded to bfloat16 once.
-                let g_p = d.bf16_copy(&d.heads_rope_backward(&projections, a.layout, norm, rotation, &g_heads).map_err(error)?).map_err(error)?;
-                if a.projections.parts.iter().any(|(op, _, _)| self.trainable.contains(op)) {
+                let g_p = operand(d.heads_rope_backward(&projections, a.layout, norm, rotation, &g_heads).map_err(error)?)?;
+                if self.trains(&a.projections) {
                     let mut stacked = d.empty(a.projections.rows, a.projections.cols).map_err(error)?;
-                    d.gemm(&mut stacked, 1.0, &g_p, Op::T, &tape.read, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
+                    d.gemm(&mut stacked, 1.0, &g_p, Op::T, &tape.read, Op::N, 0.0, arithmetic).map_err(error)?;
                     self.add_parts(&a.projections, &stacked, gradient)?;
                 }
-                d.gemm(&mut g_read, 1.0, &g_p, Op::N, &w.input, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
+                d.gemm(&mut g_read, 1.0, &g_p, Op::N, &w.input, Op::N, 0.0, arithmetic).map_err(error)?;
             }
             (Block::Mlp(m), Inner::Mlp { out }) => {
                 let mut pre = d.empty(rows, m.input.rows).map_err(error)?;
-                d.gemm(&mut pre, 1.0, &tape.read, Op::N, &w.input, Op::T, 0.0, Arithmetic::Bf16).map_err(error)?;
-                let active = if m.gated { d.swiglu(&pre) } else { d.gelu_tanh(&pre, w.bias.as_ref()) }.map_err(error)?;
+                d.gemm(&mut pre, 1.0, &tape.read, Op::N, &w.input, Op::T, 0.0, arithmetic).map_err(error)?;
+                let active = if m.gated { d.swiglu(&pre, half) } else { d.gelu_tanh(&pre, w.bias.as_ref(), half) }.map_err(error)?;
                 if let (Some((residual, k)), Some(gain)) = (out, &w.last) {
                     let mut g_residual = d.zeros(rows, self.width).map_err(error)?;
                     d.rms_gain_backward((residual, gain, k), &g, &mut g_residual).map_err(error)?;
                     g = g_residual;
                 }
-                let g16 = d.bf16_copy(&g).map_err(error)?;
+                let rounded = if half { Some(d.bf16_copy(&g).map_err(error)?) } else { None };
+                let g_out = rounded.as_ref().unwrap_or(&g);
                 let mut g_active = d.empty(rows, active.cols()).map_err(error)?;
-                d.gemm(&mut g_active, 1.0, &g16, Op::N, &w.output, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
+                d.gemm(&mut g_active, 1.0, g_out, Op::N, &w.output, Op::N, 0.0, arithmetic).map_err(error)?;
                 if self.trainable.contains(&m.output) {
                     let mut g_output = d.empty(self.width, active.cols()).map_err(error)?;
-                    d.gemm(&mut g_output, 1.0, &g16, Op::T, &active, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
+                    d.gemm(&mut g_output, 1.0, g_out, Op::T, &active, Op::N, 0.0, arithmetic).map_err(error)?;
                     add(d, gradient, m.output, g_output)?;
                 }
-                let g_pre = d.bf16_copy(&if m.gated { d.swiglu_backward(&pre, &g_active) } else { d.gelu_tanh_backward(&pre, w.bias.as_ref(), &g_active) }.map_err(error)?).map_err(error)?;
-                if m.input.parts.iter().any(|(op, _, _)| self.trainable.contains(op)) {
+                let g_pre = operand(if m.gated { d.swiglu_backward(&pre, &g_active) } else { d.gelu_tanh_backward(&pre, w.bias.as_ref(), &g_active) }.map_err(error)?)?;
+                if self.trains(&m.input) {
                     let mut stacked = d.empty(m.input.rows, m.input.cols).map_err(error)?;
-                    d.gemm(&mut stacked, 1.0, &g_pre, Op::T, &tape.read, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
+                    d.gemm(&mut stacked, 1.0, &g_pre, Op::T, &tape.read, Op::N, 0.0, arithmetic).map_err(error)?;
                     self.add_parts(&m.input, &stacked, gradient)?;
                 }
-                d.gemm(&mut g_read, 1.0, &g_pre, Op::N, &w.input, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
+                d.gemm(&mut g_read, 1.0, &g_pre, Op::N, &w.input, Op::N, 0.0, arithmetic).map_err(error)?;
             }
             _ => return Err(error("a tape of another block")),
         }
@@ -748,13 +774,14 @@ mod tests {
         test_support::{tiny_export, tiny_qwen3_export},
     };
 
-    /// Both engines, every block forward and then backward on two sequences, with a read edit at
-    /// block 1 (half the read) and its transpose: the final streams, every trainable operator's
-    /// gradient and the embedding's cotangent agree within the rounding both share. The reference
-    /// rounds its products' operands to bfloat16 as the decoder does; only the order of summation
-    /// and an operand rounded across a tie differ (a few bfloat16 rounding steps, `2⁻⁸` relative,
-    /// of the magnitude the value sums).
-    fn parity(dir: std::path::PathBuf) {
+    /// Both engines in `arithmetic`, every block forward and then backward on two sequences, with a
+    /// read edit at block 1 (half the read) and its transpose: the final streams, every trainable
+    /// operator's gradient and the embedding's cotangent agree within the rounding both share. The
+    /// reference rounds its products' operands as the decoder does; only the order of summation,
+    /// an operand rounded across a tie, and the decoder's attention, which reads bfloat16 heads in
+    /// every arithmetic, differ (a few bfloat16 rounding steps, `2⁻⁸` relative, of the magnitude
+    /// the value sums).
+    fn parity(dir: std::path::PathBuf, arithmetic: Arithmetic) {
         let imported = import_language_model(&dir, 2, 12).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
         let native = split_sites(&imported.program).unwrap();
@@ -764,10 +791,10 @@ mod tests {
         let prefix = interchange::prefix(&flat).unwrap();
         let host = Device::host();
         let mut program = DeviceProgram::compile_values_bounded(&host, &prefix, usize::MAX).unwrap();
-        program.set_arithmetic(Arithmetic::Bf16);
+        program.set_arithmetic(arithmetic);
         program.prepare_dense_parameters(&explanation.trainable).unwrap();
         let reference = Model::new(&program, &flat, entries.clone(), reads.clone(), &explanation.trainable).unwrap();
-        let decoder = Decoder::new(&host, &prefix, (&entries, &reads, program.hidden()), &explanation.trainable).unwrap();
+        let decoder = Decoder::new(&host, &prefix, (&entries, &reads, program.hidden()), &explanation.trainable).unwrap().with_arithmetic(arithmetic);
         let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("tokens") };
         let sequences: Vec<&[u32]> = tokens.chunks(12).collect();
         let ranges = [0..12, 12..24];
@@ -837,11 +864,15 @@ mod tests {
 
     #[test]
     fn the_decoder_runs_a_gelu_library_as_the_reference_engine() {
-        parity(tiny_export("decoder_gelu", 2));
+        for arithmetic in [Arithmetic::Bf16, Arithmetic::F32, Arithmetic::Tf32x3] {
+            parity(tiny_export(&format!("decoder_gelu_{arithmetic:?}"), 2), arithmetic);
+        }
     }
 
     #[test]
     fn the_decoder_runs_a_qwen3_library_as_the_reference_engine() {
-        parity(tiny_qwen3_export("decoder_qwen3", 2));
+        for arithmetic in [Arithmetic::Bf16, Arithmetic::F32, Arithmetic::Tf32x3] {
+            parity(tiny_qwen3_export(&format!("decoder_qwen3_{arithmetic:?}"), 2), arithmetic);
+        }
     }
 }

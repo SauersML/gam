@@ -47,7 +47,7 @@ fn main() -> Result<(), String> {
             let rows = count * length;
             let sequences: Vec<_> = (0..count).map(|s| s * length..(s + 1) * length).collect();
             let p = d.upload(matrix(rows, layout.columns(), 1, 2.0).view()).map_err(|e| e.to_string())?;
-            let (y, _) = d.heads_rope(&p, layout, None, None).map_err(|e| e.to_string())?;
+            let (y, _) = d.heads_rope(&p, layout, None, None, true).map_err(|e| e.to_string())?;
             let ga = d.upload(matrix(rows, layout.queries * layout.width, 2, 1.0).view()).map_err(|e| e.to_string())?;
             let scale = 1.0 / (layout.width as f64).sqrt();
             let (out, lse) = d.causal_attention(&y, layout, &sequences, scale).map_err(|e| e.to_string())?;
