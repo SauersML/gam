@@ -364,6 +364,9 @@ pub struct Layout {
     pub activations: Vec<usize>,
     pub masks: Vec<usize>,
     pub deltas: Vec<usize>,
+    /// The nodes reading those slots.
+    pub mask_nodes: Vec<usize>,
+    pub delta_nodes: Vec<usize>,
 }
 
 /// A model as an operator program through its final normed stream, with its node layout.
@@ -406,6 +409,8 @@ fn build(export: &Export, config: &Config, factors: Option<&[Factors]>) -> Resul
         activations: Vec::new(),
         masks: Vec::new(),
         deltas: Vec::new(),
+        mask_nodes: Vec::new(),
+        delta_nodes: Vec::new(),
     };
     // A decomposed site on `terms` (its input as (node, columns of V's rows) pairs, the columns'
     // interfaces): its masked activations; the caller writes `U` and the remainder.
@@ -428,6 +433,8 @@ fn build(export: &Export, config: &Config, factors: Option<&[Factors]>) -> Resul
         layout.activations.push(masked);
         layout.masks.push(mask_slot);
         layout.deltas.push(delta_slot);
+        layout.mask_nodes.push(mask);
+        layout.delta_nodes.push(delta);
         Ok(Decomposed { masked, delta })
     };
     for l in 0..config.layers {
@@ -1070,9 +1077,10 @@ pub fn active_counts(g: &[Array2<f64>], sites: &[(usize, usize, usize)], layers:
 }
 
 /// The battery's behaviour and protocols of VPD on `sequences` (module note), in batches of
-/// `batch` sequences: per mask strategy the error-propagating protocol, and for the CI and rounded
-/// masks every protocol; `M`'s cross-entropy and the active subcomponents per token.
-pub fn vpd_protocols(vpd: &Vpd, sequences: &[Vec<u32>], batch: usize, seed: u64) -> Result<Value, String> {
+/// `batch` sequences: per mask strategy the error-propagating protocol, and (`every_protocol`) for
+/// the CI and rounded masks every protocol; `M`'s cross-entropy and the active subcomponents per
+/// token.
+pub fn vpd_protocols(vpd: &Vpd, sequences: &[Vec<u32>], batch: usize, seed: u64, every_protocol: bool) -> Result<Value, String> {
     let d = vpd.m.program.device().clone();
     let layers = vpd.layers();
     let mut rng = StdRng::seed_from_u64(seed);
@@ -1101,7 +1109,7 @@ pub fn vpd_protocols(vpd: &Vpd, sequences: &[Vec<u32>], batch: usize, seed: u64)
                     vpd.m.layer(&family, l, entry, BTreeMap::new())
                 }
             };
-            let finals = if matches!(strategy, Strategy::Ci | Strategy::Rounded) {
+            let finals = if every_protocol && matches!(strategy, Strategy::Ci | Strategy::Rounded) {
                 protocols(&d, &m_streams, &embedding, &mut layer)?
             } else {
                 let mut x: Option<Tensor> = None;
@@ -1129,6 +1137,114 @@ pub fn vpd_protocols(vpd: &Vpd, sequences: &[Vec<u32>], batch: usize, seed: u64)
         "active_subcomponents_per_token_by_layer": active_layers.iter().map(Tokens::mean).collect::<Vec<_>>(),
         "masks": out,
     }))
+}
+
+/// VPD's evaluation adversary (`PGDReconLoss`, its sources shared across the batch): one source
+/// `s ∈ [0, 1]^{C+1}` per site (its subcomponents' and its remainder's), drawn uniformly, the masks
+/// `m = g + (1 − g) s` and `δ = s_δ` at every token, `steps` sign-gradient ascent steps of
+/// `step_size` on the mean over every token of `sequences` of `KL(M ‖ VPD)`, each followed by a
+/// clamp to `[0, 1]`. The gradient is the program's reverse pass to the masks' raw slots from the
+/// logits' `p_E − p_M` through the unembedding. Returns the mean KL in bits after the last step.
+pub fn vpd_pgd(vpd: &Vpd, sequences: &[Vec<u32>], batch: usize, steps: usize, step_size: f64, seed: u64) -> Result<Value, String> {
+    let d = vpd.e.program.device().clone();
+    let layers = vpd.layers();
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut source: Vec<Array1<f64>> = vpd.sites.iter().map(|(_, c, _)| Array1::from_shape_fn(c + 1, |_| rng.random::<f64>())).collect();
+    // The importances, kept sparse per batch and site: (row, column, value) where g > 0.
+    let mut sparse: Vec<Vec<Vec<(u32, u32, f64)>>> = Vec::new();
+    let chunks: Vec<&[Vec<u32>]> = sequences.chunks(batch).collect();
+    for chunk in &chunks {
+        let views: Vec<&[u32]> = chunk.iter().map(Vec::as_slice).collect();
+        let g = vpd.importances(&sequence_family(&views)?)?;
+        sparse.push(g.iter().map(|g| g.indexed_iter().filter(|(_, v)| **v > 0.0).map(|((r, c), v)| (r as u32, c as u32, *v)).collect()).collect());
+    }
+    let tokens: usize = sequences.iter().map(Vec::len).sum();
+    let head = d.copy(&vpd.e.head).map_err(error)?;
+    let sweep = |source: &[Array1<f64>], gradient: bool| -> Result<(f64, Vec<Array1<f64>>), String> {
+        let mut total = 0.0;
+        let mut grads: Vec<Array1<f64>> = source.iter().map(|s| Array1::zeros(s.len())).collect();
+        for (chunk, g) in chunks.iter().zip(&sparse) {
+            let views: Vec<&[u32]> = chunk.iter().map(Vec::as_slice).collect();
+            let family = sequence_family(&views)?;
+            let (rows, length) = (family.rows, views[0].len());
+            // The masks: s broadcast over rows, g + (1 − g) s where g > 0.
+            let mut given = BTreeMap::new();
+            let mut importance: Vec<Array2<f64>> = Vec::with_capacity(g.len());
+            for (site, ((_, c, width), entries)) in vpd.sites.iter().zip(g).enumerate() {
+                let s = &source[site];
+                let mut dense = Array2::<f64>::zeros((rows, *c));
+                let mut mask = Array2::from_shape_fn((rows, *c), |(_, j)| s[j]);
+                for &(r, j, v) in entries {
+                    let (r, j) = (r as usize, j as usize);
+                    dense[[r, j]] = v;
+                    mask[[r, j]] = v + (1.0 - v) * s[j];
+                }
+                given.insert(vpd.layout.masks[site], d.upload(mask.view()).map_err(error)?);
+                given.insert(vpd.layout.deltas[site], d.upload(Array2::from_elem((rows, *width), s[*c]).view()).map_err(error)?);
+                importance.push(dense);
+            }
+            let trace = vpd.e.program.forward_given(&family, given)?;
+            let hidden = trace.value(vpd.e.hidden)?;
+            let (_, m_streams) = streams(&vpd.m, &family, |_| BTreeMap::new())?;
+            let reference = Reference::of(vpd.m.logits(&family, &m_streams[layers], length)?)?;
+            let mut seed_rows = d.zeros(rows, hidden.cols()).map_err(error)?;
+            for s in 0..views.len() {
+                let h = d.rows_of(hidden, s * length, length).map_err(error)?;
+                let mut logits = d.zeros(length, head.rows()).map_err(error)?;
+                d.gemm(&mut logits, 1.0, &h, Op::N, &head, Op::T, 0.0, vpd.e.program.arithmetic()).map_err(error)?;
+                let logits = d.download(&logits).map_err(error)?;
+                let lp = &reference.log_probabilities[s];
+                let mut cotangent = Array2::<f64>::zeros(logits.dim());
+                let kl: Vec<f64> = cotangent
+                    .axis_iter_mut(Axis(0))
+                    .into_par_iter()
+                    .enumerate()
+                    .map(|(t, mut row)| -> Result<f64, String> {
+                        let lq = log_softmax(logits.row(t).as_slice().ok_or_else(|| error("noncontiguous logits"))?).map_err(error)?;
+                        let mut kl = 0.0;
+                        for ((out, p), q) in row.iter_mut().zip(lp.row(t)).zip(&lq) {
+                            kl += p.exp() * (p - q);
+                            *out = (q.exp() - p.exp()) / tokens as f64;
+                        }
+                        Ok(kl)
+                    })
+                    .collect::<Result<_, _>>()?;
+                total += kl.iter().sum::<f64>() / tokens as f64;
+                if gradient {
+                    let upstream = d.upload(cotangent.view()).map_err(error)?;
+                    let mut part = d.zeros(length, hidden.cols()).map_err(error)?;
+                    d.gemm(&mut part, 1.0, &upstream, Op::N, &head, Op::N, 0.0, vpd.e.program.arithmetic()).map_err(error)?;
+                    d.set_rows(&mut seed_rows, s * length, &part).map_err(error)?;
+                }
+            }
+            if gradient {
+                let keep: Vec<usize> = vpd.layout.mask_nodes.iter().chain(&vpd.layout.delta_nodes).copied().collect();
+                let cotangents = vpd.e.program.vjp(&trace, seed_rows, &keep, vpd.e.program.arithmetic())?;
+                for (site, grad) in grads.iter_mut().enumerate() {
+                    let c = vpd.sites[site].1;
+                    if let Some(t) = cotangents.get(&vpd.layout.mask_nodes[site]) {
+                        let cot = d.download(t).map_err(error)?;
+                        let weighted = &cot * &importance[site].mapv(|v| 1.0 - v);
+                        grad.slice_mut(s![..c]).scaled_add(1.0, &weighted.sum_axis(Axis(0)));
+                    }
+                    if let Some(t) = cotangents.get(&vpd.layout.delta_nodes[site]) {
+                        grad[c] += d.download(t).map_err(error)?.sum();
+                    }
+                }
+            }
+        }
+        Ok((total, grads))
+    };
+    let start = sweep(&source, false)?.0;
+    for step in 0..steps {
+        let (_, grads) = sweep(&source, true)?;
+        for (s, g) in source.iter_mut().zip(&grads) {
+            s.zip_mut_with(g, |v, g| *v = (*v + step_size * g.signum() * f64::from(u8::from(*g != 0.0))).clamp(0.0, 1.0));
+        }
+        log::info!("battery: VPD adversary step {}/{steps}", step + 1);
+    }
+    let (end, _) = sweep(&source, false)?;
+    Ok(json!({"steps": steps, "step_size": step_size, "sequences": sequences.len(), "kl_bits_start": start / LN_2, "kl_bits": end / LN_2}))
 }
 
 // ------------------------------------------------------------------------------ VPD interchange

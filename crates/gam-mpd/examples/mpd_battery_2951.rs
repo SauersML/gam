@@ -59,6 +59,19 @@ struct Settings {
     seed: u64,
     /// The numbers of shared sources of which the worst is reported.
     worst_of: Vec<usize>,
+    /// For VPD, the check against its reported evaluation: on the rows `[start, end)`, its masks'
+    /// cross-entropies and active subcomponents, and its adversary's KL after `pgd_steps` steps of
+    /// `pgd_step_size` (its evaluation's 20 and 0.1).
+    #[serde(default)]
+    vpd_check: Option<VpdCheck>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VpdCheck {
+    rows: [usize; 2],
+    pgd_steps: usize,
+    pgd_step_size: f64,
 }
 
 fn error(e: impl std::fmt::Display) -> String {
@@ -178,16 +191,17 @@ fn main() -> Result<(), String> {
         _ => return Err("host|gpu required".into()),
     };
     let started = Instant::now();
-    let imported = import_language_model(export, end.max(s_end), settings.context)?;
+    let check_end = settings.vpd_check.as_ref().map_or(0, |c| c.rows[1]);
+    let imported = import_language_model(export, end.max(s_end).max(check_end), settings.context)?;
     let layer_count = imported.record["config"]["n_layers"].as_u64().ok_or("config.n_layers")? as usize;
     let native = split_sites(&imported.program)?;
     let layers = layer_nodes(&native, layer_count)?;
     let SlotValues::Tokens(tokens) = &imported.family.slots[0] else {
         return Err("a token slot".into());
     };
-    let rows: Vec<Vec<u32>> = tokens.chunks(settings.context).map(<[u32]>::to_vec).collect();
-    let bases = &rows[first..end];
-    let sources = &rows[s_first..s_end];
+    let all_rows: Vec<Vec<u32>> = tokens.chunks(settings.context).map(<[u32]>::to_vec).collect();
+    let bases = &all_rows[first..end];
+    let sources = &all_rows[s_first..s_end];
     let length = settings.context;
     let mut report = json!({
         "export": export.display().to_string(),
@@ -203,8 +217,15 @@ fn main() -> Result<(), String> {
     let save = |report: &Value| -> Result<(), String> { std::fs::write(out, serde_json::to_vec_pretty(report).map_err(error)?).map_err(error) };
     if kind == "vpd" {
         let vpd = Vpd::new(&device, export, Decomposition::load(extra.ok_or(usage)?)?, settings.numeric_bytes)?;
-        report["protocols"] = battery::vpd_protocols(&vpd, bases, settings.batch_sequences, settings.seed)?;
+        report["protocols"] = battery::vpd_protocols(&vpd, bases, settings.batch_sequences, settings.seed, true)?;
         save(&report)?;
+        if let Some(check) = &settings.vpd_check {
+            let rows = &all_rows[check.rows[0]..check.rows[1]];
+            report["vpd_check"] = json!({"rows": check.rows, "masks": battery::vpd_protocols(&vpd, rows, settings.batch_sequences, settings.seed, false)?});
+            save(&report)?;
+            report["vpd_check"]["adversary"] = battery::vpd_pgd(&vpd, rows, settings.batch_sequences, check.pgd_steps, check.pgd_step_size, settings.seed)?;
+            save(&report)?;
+        }
         report["cancellation"] = battery::vpd_cancellation(&vpd, bases, settings.batch_sequences, settings.seed)?;
         save(&report)?;
         if s_first < s_end {
