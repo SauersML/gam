@@ -33,9 +33,9 @@ fn extract(a:&[String])->Result<(),String>{
  let (train_sequences,eval_sequences)=extraction_counts(&a[4..])?;
  let train=import_language_model(Path::new(&a[0]),train_sequences,CONTEXT)?;let eval=import_language_model(Path::new(&a[1]),eval_sequences,CONTEXT)?;
  if train.record["config"]["n_layers"].as_u64()!=Some(4) || train.record["source"]["checkpoint_sha256"]!=eval.record["source"]["checkpoint_sha256"] || train.record["config"]!=eval.record["config"]{return Err("same checkpoint/config and exactly four native layers required".into());}
- let (Some(SlotValues::Tokens(t)),Some(SlotValues::Tokens(e)))=(train.contract.family.slots.first(),eval.contract.family.slots.first()) else{return Err("native token inputs required".into());};
+ let (Some(SlotValues::Tokens(t)),Some(SlotValues::Tokens(e)))=(train.family.slots.first(),eval.family.slots.first()) else{return Err("native token inputs required".into());};
  disjoint_complete_sequences(t,e,train_sequences,eval_sequences)?;
- if train.contract.family.rows!=t.len() || eval.contract.family.rows!=e.len(){return Err("native token/row scope mismatch".into());}
+ if train.family.rows!=t.len() || eval.family.rows!=e.len(){return Err("native token/row scope mismatch".into());}
  let native=split_sites(&train.program)?;let other=split_sites(&eval.program)?;
  if native.nodes!=other.nodes || native.operators.len()!=other.operators.len() || native.operators.iter().zip(&other.operators).any(|(x,y)|x.name!=y.name || x.matrix_cow()!=y.matrix_cow()){return Err("actual native graph/weights differ between exports".into());}
  let layers=layer_nodes(&native,4)?;let interfaces=native.interfaces().map_err(|e|e.to_string())?;
@@ -47,7 +47,7 @@ fn extract(a:&[String])->Result<(),String>{
  let resident=DeviceProgram::compile_values(&device,&prefix)?;let one=resident.bytes_per_row().checked_mul(CONTEXT).ok_or("trace size overflow")?;let batch_sequences=(budget/one).min(8);if batch_sequences==0{return Err(format!("complete sequence needs {one} trace bytes"));}let batch_rows=batch_sequences*CONTEXT;
  let out=Path::new(&a[2]);fresh(out)?;let mut panels=Vec::new();
  for (name,imported) in [("train",&train),("eval",&eval)]{
-  let start=Instant::now();let family=&imported.contract.family;
+  let start=Instant::now();let family=&imported.family;
   for at in (0..family.rows).step_by(batch_rows){let end=(at+batch_rows).min(family.rows);if end%CONTEXT!=0{return Err("incomplete causal batch".into());}let batch=family.select(&(at..end).collect::<Vec<_>>());let trace=resident.forward(&batch)?;
    for (layer,nodes) in layers.iter().enumerate(){for (role,node) in [("input",nodes.normed),("write",nodes.mlp)]{let matrix=device.download(trace.value(node)?).map_err(|e|e.to_string())?;if matrix.iter().any(|v|!v.is_finite()){return Err("nonfinite native extraction".into());}let bytes:Vec<_>=matrix.iter().flat_map(|v|v.to_le_bytes()).collect();std::fs::OpenOptions::new().create_new(at==0).append(true).open(out.join(format!("{name}.{layer}.{role}.f64"))).map_err(|e|e.to_string())?.write_all(&bytes).map_err(|e|e.to_string())?;}}
    eprintln!("extracted {name} {end}/{} native rows",family.rows);
@@ -85,7 +85,7 @@ fn evaluate(a:&[String])->Result<(),String>{
  let mut fits=Vec::new();for(expected,line)in std::fs::read_to_string(fit_dir.join("FITS.jsonl")).map_err(|e|e.to_string())?.lines().enumerate(){if expected>=4{return Err("extra fitted layer record".into());}let r:Value=serde_json::from_str(line).map_err(|e|e.to_string())?;if r["layer"].as_u64()!=Some(expected as u64){return Err("all four ordered native layers required".into());}fits.push(AffineFit{weights:serde_json::from_value(r["weights"].clone()).map_err(|e|e.to_string())?,offset:serde_json::from_value(r["offset"].clone()).map_err(|e|e.to_string())?,training_rows:4096,augmented_singular_values:ndarray::Array1::from_vec(serde_json::from_value(r["augmented_singular_values"].clone()).map_err(|e|e.to_string())?),numerical_resolution:r["numerical_resolution"].as_f64().ok_or("resolution")?,numerical_rank:r["numerical_rank"].as_u64().ok_or("rank")? as usize});}if fits.len()!=4{return Err("four fitted native layers required".into());}
  let decoder=Decoder::from_export(export)?;let spec=Spec::load(spec_path,&decoder)?;if spec.rows!=512||spec.episodes.len()!=80{return Err("frozen eighty-episode full512 protocol required".into());}
  let rows=passages(export,512)?;let device=gam_gpu::tensor::Device::accelerator(gam_gpu::GpuPolicy::Required).map_err(|e|e.to_string())?.ok_or("CUDA required")?;
- let local=Local::new(&native,imported.contract.family.clone(),None,16).with_cuda(device.clone(),trace_bytes)?;
+ let local=Local::new(&native,imported.family.clone(),None,16).with_cuda(device.clone(),trace_bytes)?;
  let run=LanguageRun::new(&decoder,&native,&spec,&rows,1)?.with_cuda(device,trace_bytes)?;
  let codec=NativeOperatorCodec::new(&native,2*1024*1024*1024).map_err(|e|e.to_string())?;
  let grid:Vec<_>=[0.01,0.05,0.1,0.2,0.5,1.0].into_iter().flat_map(|delta|[0.001,0.01,0.03,0.1,0.3,1.0].into_iter().map(move|epsilon|Constraint{local:delta,run:epsilon})).collect();

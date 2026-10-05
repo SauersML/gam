@@ -13,7 +13,7 @@ fn hidden_teacher_prefix_and_tiled_head_preserve_native_values_and_edits() {
     let width=imported.program.node_interface(head.hidden).unwrap().width();
     let changes=[vec![],vec![Edit {node:head.hidden,rows:Some(vec![0,3,3]),columns:0..width,change:Change::Scale(0.5)}]];
     for edits in changes {
-        let execute=|p:&OperatorProgram|p.execute_edited(&imported.contract.family,|node,value,_| {
+        let execute=|p:&OperatorProgram|p.execute_edited(&imported.family,|node,value,_| {
             apply(&edits.iter().filter(|e|e.node==node).collect::<Vec<_>>(),value);Ok(())
         }).unwrap();
         let full=execute(&imported.program);
@@ -77,12 +77,12 @@ fn values_prefix_preserves_ordered_partial_native_edits_and_source() {
     ];
     let device=Device::host();
     let compiled=crate::device_program::DeviceProgram::compile_values(&device,&prefix).unwrap();
-    let clean=prefix.execute(&imported.contract.family,false).unwrap().values[prefix.output].clone();
+    let clean=prefix.execute(&imported.family,false).unwrap().values[prefix.output].clone();
     for changes in [edits,vec![]] {
-        let expected=prefix.execute_edited(&imported.contract.family,|node,value,_| {
+        let expected=prefix.execute_edited(&imported.family,|node,value,_| {
             apply(&changes.iter().filter(|e|e.node==node).collect::<Vec<_>>(),value);Ok(())
         }).unwrap();
-        let trace=compiled.forward_edited(&imported.contract.family,std::collections::BTreeMap::new(),&std::collections::BTreeSet::new(),|_,_|Ok(()),|node,trace| {
+        let trace=compiled.forward_edited(&imported.family,std::collections::BTreeMap::new(),&std::collections::BTreeSet::new(),|_,_|Ok(()),|node,trace| {
             let changes=changes.iter().filter(|e|e.node==node).collect::<Vec<_>>();
             if changes.is_empty(){return Ok(None);}
             let mut value=device.download(trace.value(node)?).map_err(|e|e.to_string())?;
@@ -92,7 +92,7 @@ fn values_prefix_preserves_ordered_partial_native_edits_and_source() {
         let actual=device.download(trace.value(prefix.output).unwrap()).unwrap();
         for (a,b) in actual.iter().zip(expected.values[prefix.output].iter()) {assert!((a-b).abs()<1e-12);}
     }
-    assert_eq!(prefix.execute(&imported.contract.family,false).unwrap().values[prefix.output],clean);
+    assert_eq!(prefix.execute(&imported.family,false).unwrap().values[prefix.output],clean);
 }
 
 #[test]

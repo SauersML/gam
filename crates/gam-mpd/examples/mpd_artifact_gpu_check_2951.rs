@@ -40,7 +40,7 @@ fn main() -> Result<(), String> {
         return Err("a float64 CUDA accelerator is required".into());
     }
     let imported = import_language_model(Path::new(export), sequences, context)?;
-    let family = imported.contract.family;
+    let family = imported.family;
     let model = imported.program;
     let mut artifact = Artifact::native(&model)?;
     let (norm, input, epsilon) = model

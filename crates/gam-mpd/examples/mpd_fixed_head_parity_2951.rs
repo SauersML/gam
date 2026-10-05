@@ -295,7 +295,7 @@ fn main() -> Result<(), String> {
             "actual-native4l-four-tokens",
             &imported.program,
             &teacher,
-            &imported.contract.family,
+            &imported.family,
             Some(vec![false, true, true, true]),
             &[index],
             16usize << 30,

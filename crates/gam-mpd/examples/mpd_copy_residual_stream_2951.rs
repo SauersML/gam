@@ -128,7 +128,7 @@ fn main()->Result<(),String>{
     let native_codec=if codec_bytes==0{None}else{Some(NativeOperatorCodec::new(&base.program,codec_bytes).map_err(|e|e.to_string())?)};
     let run_passages=if let Some(spec)=&language_spec{passages(export,spec.rows)?}else{Vec::new()};
     let mut language_run=if let (Some(decoder),Some(spec))=(&decoder,&language_spec){Some(LanguageRun::new(decoder,&native,spec,&run_passages,1)?)}else{None};
-    let family_run=if let Some(spec)=&mapped_spec{Some(FamilyRun{model:&native,family:imported.contract.family.clone(),readouts:1,episodes:episodes(spec,&native,imported.contract.family.rows)?})}else{None};
+    let family_run=if let Some(spec)=&mapped_spec{Some(FamilyRun{model:&native,family:imported.family.clone(),readouts:1,episodes:episodes(spec,&native,imported.family.rows)?})}else{None};
     let local_family=family(&passages(export,mode.context)?,mode.sequences,mode.context)?;
     let mut local=Local::new(&native,local_family.clone(),None,batch);
     let device=if backend=="cuda"{Some(gam_gpu::tensor::Device::accelerator(gam_gpu::GpuPolicy::Required).map_err(|e|e.to_string())?.ok_or("CUDA required")?)}else{None};

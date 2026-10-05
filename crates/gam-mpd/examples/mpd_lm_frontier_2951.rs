@@ -118,7 +118,7 @@ fn main() -> Result<(), String> {
         return Err("checkpoint/node-map identity mismatch".into());
     }
     let model = imported.program;
-    let family = imported.contract.family;
+    let family = imported.family;
     let interfaces = model.interfaces().map_err(|e| e.to_string())?;
     let mut episodes = Vec::new();
     let mut ids = std::collections::BTreeSet::new();

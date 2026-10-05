@@ -945,7 +945,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
         let native = split_sites(&imported.program).unwrap();
         let layers = layer_nodes(&native, 2).unwrap();
-        let family = imported.contract.family;
+        let family = imported.family;
         let SlotValues::Tokens(tokens) = &family.slots[0] else { panic!("token slot") };
         let sequences = tokens.chunks(12).map(<[u32]>::to_vec).collect();
         (native, layers, family, sequences)

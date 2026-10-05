@@ -35,7 +35,7 @@ fn main() -> Result<(), String> {
     };
     let total=Instant::now();let mut times=BTreeMap::new();
     let t=Instant::now();let imported=import_language_model(export,1,context)?;
-    let record=imported.record;let family=imported.contract.family;let model=imported.program;
+    let record=imported.record;let family=imported.family;let model=imported.program;
     let layers=record["config"]["n_layers"].as_u64().ok_or("missing layer count")?;
     if record["source"]["layers_kept"].as_u64()!=Some(layers) {return Err("export layer provenance disagrees with configuration".into());}
     times.insert("import",t.elapsed().as_secs_f64());

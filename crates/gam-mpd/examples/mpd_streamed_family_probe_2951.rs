@@ -41,7 +41,7 @@ fn main()->Result<(),String>{
             Edit {node:first_head.read,rows:Some(vec![0,context-1]),columns:0..1,change:Change::Add(0.125)},
         ]});
     }
-    let run=FamilyRun {model:&imported.program,family:imported.contract.family.clone(),readouts:1,episodes};
+    let run=FamilyRun {model:&imported.program,family:imported.family.clone(),readouts:1,episodes};
     let device=gam_gpu::tensor::Device::accelerator(gam_gpu::GpuPolicy::Required).map_err(|e|e.to_string())?.ok_or("CUDA required")?;
     let budget=StreamedBudget {teacher_bytes:number(3)?,tile_bytes:number(4)?,intermediate_bytes:number(5)?};
     let original=DeviceFamilyRun::new(&run,device.clone(),budget.intermediate_bytes)?;

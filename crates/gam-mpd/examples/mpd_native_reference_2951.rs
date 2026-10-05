@@ -27,7 +27,7 @@ fn main() -> Result<(), String> {
     }
     let trace = imported
         .program
-        .execute(&imported.contract.family, false)
+        .execute(&imported.family, false)
         .map_err(|e| e.to_string())?;
     let y = &trace.values[imported.program.output];
     let mut rows = Vec::new();

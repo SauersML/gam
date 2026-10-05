@@ -55,9 +55,6 @@ pub mod operator_program;
 #[cfg(test)]
 mod operator_program_tests;
 
-// The contract of an imported model: its input family and readouts.
-pub mod contract;
-
 // Progress logging and file digests for the drivers.
 pub mod engine;
 

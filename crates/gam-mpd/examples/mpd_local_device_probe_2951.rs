@@ -65,7 +65,7 @@ fn main() -> Result<(), String> {
     norm_gate(&device)?;
     let imported = import_language_model(export, sequences, context)?;
     let model = split_sites(&imported.program)?;
-    let family = imported.contract.family;
+    let family = imported.family;
     let cpu = Local::new(&model, family.clone(), None, batch);
     let cuda = Local::new(&model, family.clone(), None, batch).with_cuda(device.clone(), trace_bytes)?;
     let source_bytes = options.get("source_bytes").map(|v| v.parse::<usize>().map_err(|e| e.to_string())).transpose()?.unwrap_or(0);

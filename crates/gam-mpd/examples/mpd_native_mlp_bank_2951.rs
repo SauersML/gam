@@ -204,20 +204,20 @@ fn main() -> Result<(), String> {
             );
         }
     }
-    let groups = units(&imported.contract.family);
+    let groups = units(&imported.family);
     if groups.len() != train + valid {
         return Err("imported sequence count changed".into());
     }
     let (h, y) = collect(
         &native,
-        &imported.contract.family,
+        &imported.family,
         &groups[..train],
         sites.normed,
         sites.mlp,
     )?;
     let (vh, vy) = collect(
         &native,
-        &imported.contract.family,
+        &imported.family,
         &groups[train..],
         sites.normed,
         sites.mlp,

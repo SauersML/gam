@@ -567,11 +567,11 @@ fn run() -> Result<(), String> {
     let split = settings
         .fitting
         .as_ref()
-        .map(|fit| sequence_split(&imported.contract.family, fit.training_sequences))
+        .map(|fit| sequence_split(&imported.family, fit.training_sequences))
         .transpose()?;
     let native = split_sites(&imported.program)?;
     let layers = layer_nodes(&native, 4)?;
-    if layers.len() != 4 || imported.contract.family.rows > settings.max_rows {
+    if layers.len() != 4 || imported.family.rows > settings.max_rows {
         return Err("four native layers and declared row budget required".into());
     }
     let directions = settings
@@ -586,7 +586,7 @@ fn run() -> Result<(), String> {
     prefix.output = layers[3].mlp;
     prefix.nodes.truncate(prefix.output + 1);
     let resident = DeviceProgram::compile_values_bounded(&device, &prefix, settings.numeric_bytes)?;
-    let rows = imported.contract.family.rows;
+    let rows = imported.family.rows;
     let plan = resident
         .operator_numeric_bytes()?
         .checked_add(
@@ -601,7 +601,7 @@ fn run() -> Result<(), String> {
     if plan > settings.numeric_bytes {
         return Err(format!("capture plan {plan} exceeds budget"));
     }
-    let trace = resident.forward(&imported.contract.family)?;
+    let trace = resident.forward(&imported.family)?;
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
     save(
         &out.join("PROVENANCE.json"),

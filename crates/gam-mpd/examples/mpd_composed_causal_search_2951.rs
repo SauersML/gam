@@ -2540,7 +2540,7 @@ fn structural_run(
         if !same_native(original_native, &heldout_native) {
             return Err("heldout original model differs".into());
         }
-        disjoint_token_sequences(family, &imported.contract.family, settings.context)?;
+        disjoint_token_sequences(family, &imported.family, settings.context)?;
         let cases = eval.cases.as_deref().unwrap_or(&settings.cases);
         let (labels, plan) = if settings.fixed_head_targets.is_some() || parameter_edits.is_some() {
             (Vec::new(), 0)
@@ -2550,7 +2550,7 @@ fn structural_run(
                 original_native,
                 layers,
                 &settings.controls,
-                &imported.contract.family,
+                &imported.family,
                 cases,
                 None,
                 settings.fit.numeric_bytes,
@@ -2566,7 +2566,7 @@ fn structural_run(
                 &native_controls,
                 original_native,
                 settings,
-                &imported.contract.family,
+                &imported.family,
                 cases,
             )?
         } else {
@@ -2575,7 +2575,7 @@ fn structural_run(
                 &controlled,
                 native,
                 &native_controls,
-                &imported.contract.family,
+                &imported.family,
                 cases,
                 &labels,
                 settings.fixed_head_targets.as_ref(),
@@ -2957,7 +2957,7 @@ fn run() -> Result<(), String> {
         )?)
     };
     let native_codec_initialization_seconds = cache_started.elapsed().as_secs_f64();
-    let family = &imported.contract.family;
+    let family = &imported.family;
     let target_controls = controls(&base, &native, &layers, &settings.controls)?;
     let (targets, teacher_plan) =
         if settings.fixed_head_targets.is_some() || parameter_edits.is_some() {
@@ -3620,7 +3620,7 @@ fn run() -> Result<(), String> {
             if !same_native(&original_native, &heldout_native) {
                 return Err("heldout native graph or original numerical weights differ".into());
             }
-            disjoint_token_sequences(family, &imported_heldout.contract.family, settings.context)?;
+            disjoint_token_sequences(family, &imported_heldout.family, settings.context)?;
             let eval_cases = evaluation.cases.as_deref().unwrap_or(&settings.cases);
             let (labels, planned) = if settings.fixed_head_targets.is_some() {
                 (Vec::new(), 0)
@@ -3630,21 +3630,21 @@ fn run() -> Result<(), String> {
                     &original_native,
                     &original_layers,
                     &settings.controls,
-                    &imported_heldout.contract.family,
+                    &imported_heldout.family,
                     eval_cases,
                     down.as_ref(),
                     settings.fit.numeric_bytes,
                     settings.teacher_numeric_bytes,
                 )?
             };
-            heldout_provenance = json!({"native":imported_heldout.record,"export_sha256":evaluation.export_sha256,"rows_per_episode":imported_heldout.contract.family.rows,"teacher_planned_numeric_bytes":planned,"model_identity":"same original graph/interfaces and numerical weight bits; wire-omitted provenance ignored","sequence_overlap":"all heldout fixed-context token sequences checked absent from training","scope":"previously project-seen, fit-disjoint panel; not untouched confirmation. No updates/reselection, operational F64 KL only"});
+            heldout_provenance = json!({"native":imported_heldout.record,"export_sha256":evaluation.export_sha256,"rows_per_episode":imported_heldout.family.rows,"teacher_planned_numeric_bytes":planned,"model_identity":"same original graph/interfaces and numerical weight bits; wire-omitted provenance ignored","sequence_overlap":"all heldout fixed-context token sequences checked absent from training","scope":"previously project-seen, fit-disjoint panel; not untouched confirmation. No updates/reselection, operational F64 KL only"});
             save(&out.join("HELDOUT_PROVENANCE.json"), &heldout_provenance)?;
             let panel = CausalEpisodes::standalone(
                 &d,
                 &saved_native_graph,
                 &saved_native.program,
                 &target_controls,
-                &imported_heldout.contract.family,
+                &imported_heldout.family,
                 eval_cases,
                 &labels,
                 settings.fixed_head_targets.as_ref(),
@@ -3657,7 +3657,7 @@ fn run() -> Result<(), String> {
                 &out.join("HELDOUT_TEACHER_TARGETS.json"),
                 &panel.target_metadata,
             )?;
-            Ok((imported_heldout.contract.family, labels, panel))
+            Ok((imported_heldout.family, labels, panel))
         })();
         stage_seconds.insert(
             "heldout_load_and_teachers".into(),

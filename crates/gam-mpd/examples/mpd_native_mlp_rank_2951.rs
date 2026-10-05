@@ -84,13 +84,13 @@ fn main() -> Result<(), String> {
     native.nodes.truncate(sites.mlp + 1);
     native.output = sites.mlp;
     let mut writes = Vec::new();
-    let family_units = units(&imported.contract.family);
+    let family_units = units(&imported.family);
     if family_units.len() != sequences {
         return Err("sequence identity count changed".into());
     }
     for rows in &family_units {
         let trace = native
-            .execute(&imported.contract.family.select(rows), false)
+            .execute(&imported.family.select(rows), false)
             .map_err(|e| e.to_string())?;
         writes.push(trace.values[sites.mlp].clone());
     }

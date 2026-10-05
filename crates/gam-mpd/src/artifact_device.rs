@@ -482,7 +482,7 @@ mod tests {
         let imported = crate::import::import_language_model(&dir, 2, 12).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
         let program = imported.program;
-        let family = imported.contract.family;
+        let family = imported.family;
         let Node::Readout { input: logits, .. } = program.nodes[program.output] else {
             panic!("fixture must exercise the actual terminal Readout architecture");
         };
@@ -537,7 +537,7 @@ mod tests {
         let imported = crate::import::import_language_model(&dir, 1, 12).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
         let p = imported.program;
-        let family = imported.contract.family;
+        let family = imported.family;
         let last = p
             .nodes
             .iter()
@@ -584,7 +584,7 @@ mod tests {
         let imported = crate::import::import_language_model(&dir, 1, 12).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
         let mut artifact = Artifact::native(&imported.program).unwrap();
-        let family = imported.contract.family;
+        let family = imported.family;
         let root = artifact
             .program
             .nodes
@@ -642,8 +642,8 @@ mod tests {
         let streamed = Resident::compile_decoded(&device, &artifact, None).unwrap();
         let values = Resident::compile_decoded_mode(&device, &artifact, None, true).unwrap();
         assert_eq!(values.artifact.program.operators.len(), artifact.program.operators.len());
-        let a = streamed.program.forward(&imported.contract.family).unwrap();
-        let b = values.forward_edited(&imported.contract.family, |_, _| Ok(None)).unwrap();
+        let a = streamed.program.forward(&imported.family).unwrap();
+        let b = values.forward_edited(&imported.family, |_, _| Ok(None)).unwrap();
         let expected = device.download(&streamed.program.logits_on_device(&a).unwrap()).unwrap();
         let actual = device.download(&values.output(&b).unwrap()).unwrap();
         assert_eq!(actual, expected);
@@ -718,7 +718,7 @@ mod tests {
         }
         let artifact = artifact.f32_literals().unwrap();
         let artifact = Artifact::from_bytes(&artifact.to_bytes().unwrap(), &artifact.program.declarations).unwrap();
-        let family = imported.contract.family;
+        let family = imported.family;
         let root = artifact
             .program
             .nodes

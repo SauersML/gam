@@ -48,7 +48,7 @@ fn main() -> Result<(), String> {
     }
     let imported = import_language_model(&train, sequences, context)?;
     let model = &imported.program;
-    let family = &imported.contract.family;
+    let family = &imported.family;
     // The hidden node the head reads: the input of the transposed (tied) unembedding.
     let logits = match &model.nodes[model.output] { Node::Readout { input, .. } => *input, _ => model.output };
     let hidden = match &model.nodes[logits] {

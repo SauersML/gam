@@ -109,8 +109,8 @@ fn extract(a: &[String]) -> Result<(), String> {
     let train = import_language_model(Path::new(&a[0]), train_n, context)?;
     let eval = import_language_model(Path::new(&a[1]), eval_n, context)?;
     let (Some(SlotValues::Tokens(train_tokens)), Some(SlotValues::Tokens(eval_tokens))) = (
-        train.contract.family.slots.first(),
-        eval.contract.family.slots.first(),
+        train.family.slots.first(),
+        eval.family.slots.first(),
     ) else {
         return Err("native token slot required".into());
     };
@@ -176,7 +176,7 @@ fn extract(a: &[String]) -> Result<(), String> {
     let mut families = Vec::new();
     for (name, imported) in [("train", &train), ("eval", &eval)] {
         let start = Instant::now();
-        let family = &imported.contract.family;
+        let family = &imported.family;
         for at in (0..family.rows).step_by(batch_rows) {
             let end = (at + batch_rows).min(family.rows);
             if at % context != 0 || end % context != 0 {
@@ -223,7 +223,7 @@ fn extract(a: &[String]) -> Result<(), String> {
             }
         }
         let export = Path::new(if name == "train" { &a[0] } else { &a[1] });
-        families.push(json!({"name":name,"rows":imported.contract.family.rows,"heads":heads,"seconds":start.elapsed().as_secs_f64(),"source":imported.record["source"],"export_sha256":sha256(&export.join("export.json"))?,"tokens_file_sha256":sha256(&export.join("tokens.f64"))?}));
+        families.push(json!({"name":name,"rows":imported.family.rows,"heads":heads,"seconds":start.elapsed().as_secs_f64(),"source":imported.record["source"],"export_sha256":sha256(&export.join("export.json"))?,"tokens_file_sha256":sha256(&export.join("tokens.f64"))?}));
     }
     save(
         &output.join("manifest.json"),

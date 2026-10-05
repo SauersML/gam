@@ -143,7 +143,7 @@ fn mapped_copy_residual_qk_norm_rotary_gqa_and_interventions_survive_full_rank()
         let wire=candidate.to_bytes().unwrap();let decoded=Artifact::from_bytes(&wire,&p.declarations).unwrap();decoded.validate_coverage(p).unwrap();
         let h=&map.heads[0];assert!(h.query_norm.is_some());assert!(h.key_norm.is_some());assert_eq!(h.rotary.as_ref().unwrap().dims,2);
         for edit in [h.raw_query,h.query,h.key,h.value,h.read,map.skip,map.output]{
-            let run=|a:&Artifact|a.program.execute_edited(&imported.contract.family,|n,value,_|{if n==edit{*value*=0.5;}Ok(())}).unwrap();
+            let run=|a:&Artifact|a.program.execute_edited(&imported.family,|n,value,_|{if n==edit{*value*=0.5;}Ok(())}).unwrap();
             let original=run(&base);let changed=run(&candidate);let rebuilt=run(&decoded);
             assert_eq!(changed.values[p.output],rebuilt.values[p.output]);
             let error=(&original.values[map.output]-&rebuilt.values[map.output]).iter().map(|x|x*x).sum::<f64>().sqrt();
@@ -167,7 +167,7 @@ fn mapped_copy_residual_full_rank_does_not_certify_ill_conditioned_literal_round
     let bank=MappedCopyResidualBank::new(&base,&[27],&[17],33).unwrap();
     let candidate=bank.candidate(CopyResidualChoice{layer:27,head:0,rank:17,family:HeadApproximation::CopyResidual}).unwrap().f32_literals().unwrap();
     candidate.validate_coverage(p).unwrap();
-    let original=base.program.execute(&imported.contract.family,false).unwrap();let changed=candidate.program.execute(&imported.contract.family,false).unwrap();
+    let original=base.program.execute(&imported.family,false).unwrap();let changed=candidate.program.execute(&imported.family,false).unwrap();
     let error=(&original.values[map.output]-&changed.values[map.output]).iter().map(|x|x*x).sum::<f64>().sqrt();
     assert!(error.is_finite()&&error>0.001,"full rank must not be treated as a quality certificate: {error}");
 }

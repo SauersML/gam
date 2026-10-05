@@ -1,6 +1,6 @@
 """Export the 4L Pile target (t-9d2b8f02) in the decomposition engine's input format (#2951):
 raw little-endian float64, C order, one <name>.f64 per tensor, vectors as [1, n], plus export.json
-{config, files: {name: {shape, sha256}}} (bench/mpd_engine_export_2951.py is the reference writer).
+{config, files: {name: {shape, sha256}}}, the layout gam_mpd::import::import_language_model reads.
 
 Data, matching the paper's eval batch (128 rows x 512 context): tokens.f64 [N, T+1], val-00000 rows
 ROW0..ROW0+N (the model reads tokens[:, :T]; tokens[:, 1:] are the next-token labels),

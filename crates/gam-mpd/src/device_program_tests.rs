@@ -88,7 +88,7 @@ pub(super) fn fixture_sized(d: usize, vocab: usize, context: usize, sequences: u
     std::fs::write(dir.join("export.json"), record.to_string()).expect("written");
     let imported = import_language_model(&dir, sequences, context).expect("imported");
     std::fs::remove_dir_all(&dir).expect("removed");
-    (imported.program, imported.contract.family)
+    (imported.program, imported.family)
 }
 
 /// The host reference, and a CUDA device when one is present.

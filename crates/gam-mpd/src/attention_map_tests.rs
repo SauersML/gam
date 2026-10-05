@@ -193,7 +193,7 @@ fn qwen_gqa_normalized_lineage_explicit_layer_id_and_copy_roundtrip() {
             assert_eq!(decoded.place(edit), Some(edit));
             let run = |program: &OperatorProgram| {
                 program
-                    .execute_edited(&imported.contract.family, |node, value, _| {
+                    .execute_edited(&imported.family, |node, value, _| {
                         if node == edit {
                             *value *= 0.5;
                         }

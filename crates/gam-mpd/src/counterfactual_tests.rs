@@ -64,7 +64,7 @@ fn the_decoder_agrees_with_the_imported_program() {
     let tokens = passages(&dir, context).expect("passages");
     for (passage, tokens) in tokens.iter().take(2).enumerate() {
         let rows: Vec<usize> = (passage * context..(passage + 1) * context).collect();
-        let logits = model.execute(&imported.contract.family.select(&rows), false).expect("native program").values.swap_remove(model.output);
+        let logits = model.execute(&imported.family.select(&rows), false).expect("native program").values.swap_remove(model.output);
         let mut native = Program::new(&decoder, &[], None);
         let ours = decoder.log_probs(&decoder.forward(tokens, &mut native, &[]).residual);
         let mut theirs = logits;

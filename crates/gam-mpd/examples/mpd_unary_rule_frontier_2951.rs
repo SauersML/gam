@@ -268,13 +268,13 @@ fn main() -> Result<(), String> {
         &out.join("INVENTORY.json"),
         &json!({"complete":true,"families":families,"sources":sources_meta,"prefixes":bank.inventory.visited_prefixes,"count":count,"native":1,"allzeroheads":24,"bindings":5112}),
     )?;
-    let token_data = match &imported.contract.family.slots[0] {
+    let token_data = match &imported.family.slots[0] {
         SlotValues::Tokens(t) => t,
         SlotValues::Raw(_) => return Err("expected native tokenfamily".into()),
     };
     write_json(
         &out.join("TOKEN_FAMILY.json"),
-        &json!({"tokens":token_data,"sequence":imported.contract.family.layout.as_ref().map(|l|&l.sequence),"position":imported.contract.family.layout.as_ref().map(|l|&l.position),"context":16,"source":"firsttwoexporttokenrows; samefrozenlocal/runfamily"}),
+        &json!({"tokens":token_data,"sequence":imported.family.layout.as_ref().map(|l|&l.sequence),"position":imported.family.layout.as_ref().map(|l|&l.position),"context":16,"source":"firsttwoexporttokenrows; samefrozenlocal/runfamily"}),
     )?;
     let mut candidates = vec![Candidate::Native];
     candidates.extend(bank.zero_controls().map(Candidate::Zero));
@@ -341,7 +341,7 @@ fn main() -> Result<(), String> {
         return Err("f64CUDA required".into());
     }
     let limit = usize::try_from(trace_bytes).map_err(|e| e.to_string())?;
-    let mut local = Local::new(&native.program, imported.contract.family.clone(), None, 16)
+    let mut local = Local::new(&native.program, imported.family.clone(), None, 16)
         .with_cuda(device.clone(), limit)?;
     if local_source_bytes > 0 {
         local = local.with_cuda_native_sharing(
@@ -349,7 +349,7 @@ fn main() -> Result<(), String> {
         )?;
     }
     if local_source_bytes > 0 {
-        let fresh = Local::new(&native.program, imported.contract.family.clone(), None, 16)
+        let fresh = Local::new(&native.program, imported.family.clone(), None, 16)
             .with_cuda(device.clone(), limit)?;
         let choice = candidates
             .iter()
@@ -386,7 +386,7 @@ fn main() -> Result<(), String> {
     native_prefix.nodes.truncate(last + 1);
     native_prefix.output = last;
     let trace = native_prefix
-        .execute(&imported.contract.family, false)
+        .execute(&imported.family, false)
         .map_err(|e| e.to_string())?;
     let mut diagnostics = vec![];
     for map in &maps {
@@ -412,7 +412,6 @@ fn main() -> Result<(), String> {
         runs_cpu.push(FamilyRun {
             model: &native.program,
             family: imported
-                .contract
                 .family
                 .select(&(passage * 16..(passage + 1) * 16).collect::<Vec<_>>()),
             readouts: 1,
@@ -557,7 +556,7 @@ fn main() -> Result<(), String> {
         {
             return Err("ordinarysavedreplay changedcost/verdict".into());
         }
-        replays.push(json!({"index":index,"file":p.file_name().and_then(|s|s.to_str()),"bytes":saved.len(),"sha256":sha256(&p)?,"ordinary_saved_byte_replay":true,"local":local_measure(&assessment),"run":assessment.run_measure(),"isolated_downstream_patch_KL":gam_mpd::local_kl::isolated_downstream_kl(&native.program,&decoded,&imported.contract.family,16)?}));
+        replays.push(json!({"index":index,"file":p.file_name().and_then(|s|s.to_str()),"bytes":saved.len(),"sha256":sha256(&p)?,"ordinary_saved_byte_replay":true,"local":local_measure(&assessment),"run":assessment.run_measure(),"isolated_downstream_patch_KL":gam_mpd::local_kl::isolated_downstream_kl(&native.program,&decoded,&imported.family,16)?}));
     }
     write_json(
         &out.join("REPORT.json"),
