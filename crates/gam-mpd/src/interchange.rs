@@ -61,24 +61,16 @@ fn error(e: impl std::fmt::Display) -> String {
     format!("interchange: {e}")
 }
 
-/// One model as the experiments run it: its resident-value program through the final normed
-/// stream, the stream entering each layer, each block's read, and the dense operators that receive
-/// gradients, per layer.
-pub struct Model<'a> {
-    pub program: &'a DeviceProgram,
+/// One model's sites, checked against its program: the stream entering each layer, each block's
+/// read, and the dense operators that receive gradients, per layer.
+struct Sites {
     streams: Vec<usize>,
     reads: Vec<usize>,
     trainable: Vec<Vec<usize>>,
 }
 
-impl<'a> Model<'a> {
-    /// `program` is the resident-value program of `flat` through its hidden node (the final normed
-    /// stream, `Head::prefix`). `streams` holds the stream entering each layer and `reads`, per
-    /// block (each layer's attention, then its MLP), the node the block's projections read.
-    /// `trainable` lists the dense operators that receive gradients (none for `M`). Each layer's
-    /// nodes must read nothing before the stream entering it except token features, so that one
-    /// layer runs from that stream alone.
-    pub fn new(program: &'a DeviceProgram, flat: &OperatorProgram, streams: Vec<usize>, reads: Vec<usize>, trainable: &[usize]) -> Result<Self, String> {
+impl Sites {
+    fn new(program: &DeviceProgram, flat: &OperatorProgram, streams: Vec<usize>, reads: Vec<usize>, trainable: &[usize]) -> Result<Self, String> {
         let layers = streams.len();
         let hidden = program.hidden();
         let widths = program.widths();
@@ -108,20 +100,47 @@ impl<'a> Model<'a> {
             }
             per_layer.push(used.into_iter().collect());
         }
-        Ok(Self { program, streams, reads, trainable: per_layer })
+        Ok(Self { streams, reads, trainable: per_layer })
+    }
+}
+
+/// One model as the experiments run it: its resident-value program through the final normed
+/// stream and its sites.
+pub struct Model<'a> {
+    pub program: &'a DeviceProgram,
+    sites: Arc<Sites>,
+}
+
+impl<'a> Model<'a> {
+    /// `program` is the resident-value program of `flat` through its hidden node (the final normed
+    /// stream, `Head::prefix`). `streams` holds the stream entering each layer and `reads`, per
+    /// block (each layer's attention, then its MLP), the node the block's projections read.
+    /// `trainable` lists the dense operators that receive gradients (none for `M`). Each layer's
+    /// nodes must read nothing before the stream entering it except token features, so that one
+    /// layer runs from that stream alone.
+    pub fn new(program: &'a DeviceProgram, flat: &OperatorProgram, streams: Vec<usize>, reads: Vec<usize>, trainable: &[usize]) -> Result<Self, String> {
+        Ok(Self { program, sites: Arc::new(Sites::new(program, flat, streams, reads, trainable)?) })
     }
 
     fn layers(&self) -> usize {
-        self.streams.len()
+        self.sites.streams.len()
     }
 
     fn width(&self) -> usize {
         self.program.widths()[self.program.hidden()]
     }
 
+    fn stream(&self, l: usize) -> usize {
+        self.sites.streams[l]
+    }
+
+    fn read(&self, block: usize) -> usize {
+        self.sites.reads[block]
+    }
+
     /// The last node layer `l` runs: the stream entering the next layer, or the hidden node.
     fn end(&self, l: usize) -> usize {
-        if l + 1 < self.layers() { self.streams[l + 1] } else { self.program.hidden() }
+        if l + 1 < self.layers() { self.stream(l + 1) } else { self.program.hidden() }
     }
 }
 
@@ -136,13 +155,19 @@ pub fn sites(artifact: &Artifact, layers: &[LayerNodes]) -> Result<(OperatorProg
     Ok((flat, streams, reads))
 }
 
-/// One of `P`'s read variables: the span of rows `rows` of its dense operator `operator`, which
-/// reads block `block`'s input.
+/// The program of the flat program `flat` through its head's hidden node (the final normed
+/// stream), which [`Model::new`] runs.
+pub fn prefix(flat: &OperatorProgram) -> Result<OperatorProgram, String> {
+    Ok(Head::of(flat)?.prefix(flat))
+}
+
+/// One of `P`'s read variables at block `block`'s input: the span of the rows `rows` of each of its
+/// dense operators `operator` reading that input (`parts`). A gated MLP function reads through two
+/// operators, its gate's and its input's rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadVariable {
     pub block: usize,
-    pub operator: usize,
-    pub rows: Range<usize>,
+    pub parts: Vec<(usize, Range<usize>)>,
 }
 
 /// The read variables of a library explanation of `layers` layers (`library_mdl::explanation`):
@@ -158,11 +183,11 @@ pub fn library_reads(program: &OperatorProgram, layers: usize) -> Result<Vec<Rea
             }
             for op in maps {
                 let op = *op.ok_or_else(|| error(format!("layer {l} head {h}: a read map is missing")))?;
-                out.push(ReadVariable { block: 2 * l, operator: op, rows: 0..program.operators[op].rows.width() });
+                out.push(ReadVariable { block: 2 * l, parts: vec![(op, 0..program.operators[op].rows.width())] });
             }
         }
         let gate = *named.get(format!("library.l{l}.mlp.gate").as_str()).ok_or_else(|| error(format!("layer {l}: no MLP gate")))?;
-        out.extend((0..program.operators[gate].rows.width()).map(|i| ReadVariable { block: 2 * l + 1, operator: gate, rows: i..i + 1 }));
+        out.extend((0..program.operators[gate].rows.width()).map(|i| ReadVariable { block: 2 * l + 1, parts: vec![(gate, i..i + 1)] }));
     }
     Ok(out)
 }
@@ -248,8 +273,8 @@ impl FixedHead {
     }
 
     /// The compact target of the hidden rows `hidden`: per row `E_p[e]` of the head's rows `e`
-    /// under `p = softmax(E h)`, and the entropy of `p`.
-    fn target(&self, d: &Device, hidden: &Tensor) -> Result<Target, String> {
+    /// under `p = softmax(E h)`, and the entropy of `p`; the products in `arithmetic`.
+    fn target(&self, d: &Device, hidden: &Tensor, arithmetic: Arithmetic) -> Result<Target, String> {
         let embedding = &self.resident.embedding;
         let (rows, width, classes) = (hidden.rows(), embedding.cols(), embedding.rows());
         let mut mu = d.zeros(rows, width).map_err(error)?;
@@ -258,10 +283,10 @@ impl FixedHead {
             let n = self.resident.tile_rows.min(rows - start);
             let h = d.rows_of(hidden, start, n).map_err(error)?;
             let mut probabilities = d.zeros(n, classes).map_err(error)?;
-            d.gemm(&mut probabilities, 1.0, &h, Op::N, embedding, Op::T, 0.0, Arithmetic::F64).map_err(error)?;
+            d.gemm(&mut probabilities, 1.0, &h, Op::N, embedding, Op::T, 0.0, arithmetic).map_err(error)?;
             let stats = d.softmax_stats_rows(&mut probabilities, None).map_err(error)?;
             let mut projected = d.zeros(n, width).map_err(error)?;
-            d.gemm(&mut projected, 1.0, &probabilities, Op::N, embedding, Op::N, 0.0, Arithmetic::F64).map_err(error)?;
+            d.gemm(&mut projected, 1.0, &probabilities, Op::N, embedding, Op::N, 0.0, arithmetic).map_err(error)?;
             d.set_rows(&mut mu, start, &projected).map_err(error)?;
             entropy.extend(stats.into_iter().map(|s| s[1]));
         }
@@ -296,11 +321,19 @@ fn span(rows: ArrayView2<'_, f64>) -> Result<Option<ndarray::Array2<f64>>, Strin
 pub fn design(p: &Model, variables: &[ReadVariable], experiments: &[Experiment]) -> Result<Design, String> {
     let d = p.program.device();
     let rows_of = |v: &ReadVariable| -> Result<ndarray::Array2<f64>, String> {
-        let all = p.program.dense(v.operator)?;
-        if v.rows.end > all.rows() || v.rows.is_empty() || all.cols() != p.width() {
-            return Err(error("a read variable outside its operator"));
-        }
-        d.download(&d.rows_of(all, v.rows.start, v.rows.len()).map_err(error)?).map_err(error)
+        let parts = v
+            .parts
+            .iter()
+            .map(|(op, rows)| {
+                let all = p.program.dense(*op)?;
+                if rows.end > all.rows() || rows.is_empty() || all.cols() != p.width() {
+                    return Err(error("a read variable outside its operator"));
+                }
+                d.download(&d.rows_of(all, rows.start, rows.len()).map_err(error)?).map_err(error)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let views: Vec<_> = parts.iter().map(|m| m.view()).collect();
+        ndarray::concatenate(Axis(0), &views).map_err(error)
     };
     let upload = |q: Option<ndarray::Array2<f64>>| q.map(|q| d.upload(q.view()).map_err(error)).transpose();
     let mut reads: BTreeMap<usize, Arc<Basis>> = BTreeMap::new();
@@ -394,9 +427,9 @@ impl Site {
     /// The layer whose run computes it, and its node in `model`.
     fn at(self, model: &Model) -> (usize, usize) {
         match self {
-            Self::Stream(0) => (0, model.streams[0]),
-            Self::Stream(l) => (l - 1, model.streams[l]),
-            Self::Read(b) => (b / 2, model.reads[b]),
+            Self::Stream(0) => (0, model.stream(0)),
+            Self::Stream(l) => (l - 1, model.stream(l)),
+            Self::Read(b) => (b / 2, model.read(b)),
         }
     }
 }
@@ -469,12 +502,12 @@ fn forward(models: [&Model; 2], lanes: &mut [Lane], length: usize, keep: bool) -
                 None
             } else {
                 let parts = members.iter().map(|i| state[*i].as_ref().ok_or_else(|| error("a lane enters a layer with no stream"))).collect::<Result<Vec<_>, _>>()?;
-                Some((model.streams[b], stack(d, &parts, length, width)?))
+                Some((model.stream(b), stack(d, &parts, length, width)?))
             };
             let patched: Vec<(usize, usize, &Basis, &Tensor)> = members
                 .iter()
                 .enumerate()
-                .filter_map(|(i, lane)| lanes[*lane].patch.as_ref().filter(|(basis, _)| basis.block / 2 == b).map(|(basis, s)| (model.reads[basis.block], i * length, basis.as_ref(), s)))
+                .filter_map(|(i, lane)| lanes[*lane].patch.as_ref().filter(|(basis, _)| basis.block / 2 == b).map(|(basis, s)| (model.read(basis.block), i * length, basis.as_ref(), s)))
                 .collect();
             let arithmetic = model.program.arithmetic();
             let edit = |node: usize, trace: &DeviceTrace| -> Result<Option<Tensor>, String> {
@@ -556,14 +589,14 @@ fn reverse(
             .members
             .iter()
             .enumerate()
-            .filter_map(|(i, lane)| lanes[*lane].patch.as_ref().filter(|(basis, _)| basis.block / 2 == b).map(|(basis, _)| (model.reads[basis.block], i, *lane, basis.as_ref())))
+            .filter_map(|(i, lane)| lanes[*lane].patch.as_ref().filter(|(basis, _)| basis.block / 2 == b).map(|(basis, _)| (model.read(basis.block), i, *lane, basis.as_ref())))
             .collect();
         let edited: BTreeSet<usize> = patched.iter().map(|(node, ..)| *node).collect();
         keep.extend(&edited);
         if b > 0 {
-            keep.insert(model.streams[b]);
+            keep.insert(model.stream(b));
         }
-        let trainable: &[usize] = if segment.explanation { &model.trainable[b] } else { &[] };
+        let trainable: &[usize] = if segment.explanation { &model.sites.trainable[b] } else { &[] };
         let arithmetic = model.program.arithmetic();
         let mut hook = |node: usize, g: &mut Tensor| -> Result<(), String> {
             for (_, i, lane, basis) in patched.iter().filter(|(at, ..)| *at == node) {
@@ -582,7 +615,7 @@ fn reverse(
             }
         }
         if b > 0 {
-            let g = nodes.get(&model.streams[b]).ok_or_else(|| error("no cotangent of a layer's entering stream"))?;
+            let g = nodes.get(&model.stream(b)).ok_or_else(|| error("no cotangent of a layer's entering stream"))?;
             for (i, &lane) in segment.members.iter().enumerate() {
                 cotangent[lane] = Some(d.rows_of(g, i * length, length).map_err(error)?);
             }
@@ -629,7 +662,7 @@ impl Teacher {
         let mut streams = BTreeMap::new();
         let mut clean = Vec::with_capacity(lanes.len());
         for ((n, sites), (output, captured)) in base_sites.iter().enumerate().zip(run.outputs.into_iter().zip(run.captured)) {
-            clean.push(head.target(d, &output)?);
+            clean.push(head.target(d, &output, m.program.arithmetic())?);
             for (l, value) in sites.iter().zip(captured) {
                 streams.insert((n, *l), value);
             }
@@ -687,7 +720,7 @@ pub fn evaluate(m: &Model, p: &Model, head: &FixedHead, batch: &Batch, teacher: 
     let run = forward([p, m], &mut lanes, length, false)?;
     let mut targets: BTreeMap<usize, Target> = BTreeMap::new();
     for (&i, output) in patched.iter().zip(&run.outputs) {
-        targets.insert(i, head.target(d, output)?);
+        targets.insert(i, head.target(d, output, m.program.arithmetic())?);
     }
     drop(run);
     // The hybrids on the sources, up to the patched layer.
@@ -744,4 +777,121 @@ pub fn evaluate(m: &Model, p: &Model, head: &FixedHead, batch: &Batch, teacher: 
     let captures: Vec<Vec<Option<Tensor>>> = patched.iter().map(|i| vec![source_cotangents[*i].take()]).collect();
     reverse([p, m], &sources, source_run, sources.iter().map(|_| None).collect(), captures, length, &mut total)?;
     Ok(Evaluation { bits, gradient: total })
+}
+
+/// The experiments of one batch scored at `P`'s loaded parameters.
+pub struct Scored {
+    /// Per experiment, per base token, `KL(M_e ‖ P_e)` in bits.
+    pub bits: Vec<Vec<f64>>,
+    /// The gradient of the sum of `bits` in each trainable operator, in the order they were given
+    /// (empty when not asked for).
+    pub gradient: Vec<ndarray::Array2<f64>>,
+}
+
+/// `M` and `P` compiled for interchange experiments, with the head they share and `P`'s read
+/// variables: what a fit needs to score `P` on a batch of experiments.
+pub struct Interchange {
+    m: DeviceProgram,
+    p: DeviceProgram,
+    m_sites: Arc<Sites>,
+    p_sites: Arc<Sites>,
+    head: FixedHead,
+    variables: Vec<ReadVariable>,
+    trainable: Vec<usize>,
+}
+
+impl Interchange {
+    /// `M` is the split native program `native` (`run_check::split_sites`) with its `layers`
+    /// (`run_check::layer_nodes`); `P` is `explanation`, built from it with the same sites, whose
+    /// operators `trainable` receive gradients and whose read variables are `variables` (for a
+    /// library explanation, [`library_reads`]). Each program holds at most `numeric_bytes` of
+    /// operator values on the device; `tile_rows` rows of vocabulary logits are formed at once.
+    /// Products run in the device's storage precision.
+    pub fn new(
+        device: &Device,
+        native: &OperatorProgram,
+        layers: &[LayerNodes],
+        explanation: &Artifact,
+        trainable: &[usize],
+        variables: Vec<ReadVariable>,
+        numeric_bytes: usize,
+        tile_rows: usize,
+    ) -> Result<Self, String> {
+        let arithmetic = if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 };
+        let (m_flat, m_streams, m_reads) = sites(&Artifact::native(native)?, layers)?;
+        let (p_flat, p_streams, p_reads) = sites(explanation, layers)?;
+        let mut m = DeviceProgram::compile_values_bounded(device, &prefix(&m_flat)?, numeric_bytes)?;
+        m.set_arithmetic(arithmetic);
+        let mut p = DeviceProgram::compile_values_bounded(device, &prefix(&p_flat)?, numeric_bytes)?;
+        p.set_arithmetic(arithmetic);
+        p.prepare_dense_parameters(trainable)?;
+        let head = FixedHead::new(device, &m_flat, &p_flat, tile_rows)?;
+        let m_sites = Arc::new(Sites::new(&m, &m_flat, m_streams, m_reads, &[])?);
+        let p_sites = Arc::new(Sites::new(&p, &p_flat, p_streams, p_reads, trainable)?);
+        if variables.iter().any(|v| v.block >= 2 * layers.len() || v.parts.is_empty() || v.parts.iter().any(|(op, _)| !trainable.contains(op))) {
+            return Err(error("a read variable outside the blocks or the trainable operators"));
+        }
+        Ok(Self { m, p, m_sites, p_sites, head, variables, trainable: trainable.to_vec() })
+    }
+
+    /// `M` and `P` as the free functions of this module take them.
+    pub fn models(&self) -> (Model<'_>, Model<'_>) {
+        (Model { program: &self.m, sites: Arc::clone(&self.m_sites) }, Model { program: &self.p, sites: Arc::clone(&self.p_sites) })
+    }
+
+    /// The head `M` and `P` share.
+    pub fn head(&self) -> &FixedHead {
+        &self.head
+    }
+
+    /// `P`'s read variables.
+    pub fn variables(&self) -> &[ReadVariable] {
+        &self.variables
+    }
+
+    /// Load `P`'s trainable operators, in the order given to [`Interchange::new`].
+    pub fn load(&mut self, values: &[ndarray::Array2<f64>]) -> Result<(), String> {
+        if values.len() != self.trainable.len() {
+            return Err(error("one value per trainable operator required"));
+        }
+        for (&op, value) in self.trainable.iter().zip(values) {
+            let tensor = self.p.device().upload(value.view()).map_err(error)?;
+            self.p.replace_dense_parameter(op, tensor)?;
+        }
+        Ok(())
+    }
+
+    /// Per base sequence `n < sequences`, one unpatched and one patched experiment ([`sample`]).
+    pub fn sample(&self, rng: &mut impl RngExt, sequences: usize) -> Vec<Experiment> {
+        sample(rng, sequences, self.m_sites.streams.len(), self.variables.len())
+    }
+
+    /// `KL(M_e ‖ P_e)` per token for each of `experiments` on `batch` at `P`'s loaded parameters,
+    /// with the patch directions of `P`'s loaded reads, and with `gradient` its sum's gradient.
+    /// `M`'s clean runs are made once for the whole batch.
+    pub fn evaluate(&self, batch: &Batch, experiments: &[Experiment], gradient: bool) -> Result<Scored, String> {
+        let (m, p) = self.models();
+        let directions = design(&p, &self.variables, experiments)?;
+        let teacher = Teacher::new(&m, &self.head, batch, &self.variables, experiments)?;
+        let evaluation = evaluate(&m, &p, &self.head, batch, &teacher, experiments, &directions, gradient)?;
+        if !gradient {
+            return Ok(Scored { bits: evaluation.bits, gradient: Vec::new() });
+        }
+        let d = self.p.device();
+        let gradient = self
+            .trainable
+            .iter()
+            .map(|op| match evaluation.gradient.get(op) {
+                Some(g) => d.download(g).map_err(error),
+                None => {
+                    let shape = self.p.dense(*op)?;
+                    Ok(ndarray::Array2::zeros((shape.rows(), shape.cols())))
+                }
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if gradient.iter().any(|g| g.iter().any(|v| !v.is_finite())) {
+            return Err(error("a nonfinite parameter gradient"));
+        }
+        Ok(Scored { bits: evaluation.bits, gradient })
+    }
 }

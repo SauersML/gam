@@ -76,11 +76,15 @@ fn fixture() -> Fixture {
         p_flat.operators[index] = Arc::new(Operator::dense(op.name.clone(), op.rows.clone(), op.cols.clone(), moved, precision, op.provenance.clone()).expect("dense"));
         trainable.push(index);
         if block % 2 == 0 {
-            variables.push(ReadVariable { block, operator: index, rows: 0..op.rows.width() });
+            variables.push(ReadVariable { block, parts: vec![(index, 0..op.rows.width())] });
         } else {
-            variables.extend((0..op.rows.width()).map(|i| ReadVariable { block, operator: index, rows: i..i + 1 }));
+            variables.extend((0..op.rows.width()).map(|i| ReadVariable { block, parts: vec![(index, i..i + 1)] }));
         }
     }
+    // A variable read through two operator parts, as a gated MLP function's is (at a block no
+    // complement patch below spans, since its rows repeat other variables').
+    let up = flat.operators.iter().position(|op| op.name == "blocks.0.c_fc").expect("layer 0 MLP input");
+    variables.push(ReadVariable { block: 1, parts: vec![(up, 1..2), (up, 4..6)] });
     let p = Host { prefix: head.prefix(&p_flat), flat: p_flat, streams, reads };
     let SlotValues::Tokens(tokens) = &family.slots[0] else { panic!("tokens") };
     let base: Vec<Vec<u32>> = tokens.chunks(LENGTH).map(<[u32]>::to_vec).collect();
@@ -193,17 +197,13 @@ fn reference(f: &Fixture, e: &Experiment) -> Vec<f64> {
     let Some(patch) = e.patch else {
         return kl_bits(&f.head, &native(f, base, None).0, &hybrid(f, base, e.cut, None).0);
     };
-    let (block, rows, complement) = match patch {
-        Patch::Read { variable } => {
-            let v = &f.variables[variable];
-            (v.block, f.p.flat.operators[v.operator].matrix().slice(s![v.rows.clone(), ..]).to_owned(), false)
-        }
-        Patch::Complement { block } => {
-            let parts: Vec<Array2<f64>> = f.variables.iter().filter(|v| v.block == block).map(|v| f.p.flat.operators[v.operator].matrix().slice(s![v.rows.clone(), ..]).to_owned()).collect();
-            let views: Vec<_> = parts.iter().map(|m| m.view()).collect();
-            (block, ndarray::concatenate(Axis(0), &views).expect("rows"), true)
-        }
+    let rows_of = |v: &ReadVariable| -> Vec<Array2<f64>> { v.parts.iter().map(|(op, rows)| f.p.flat.operators[*op].matrix().slice(s![rows.clone(), ..]).to_owned()).collect() };
+    let (block, parts, complement) = match patch {
+        Patch::Read { variable } => (f.variables[variable].block, rows_of(&f.variables[variable]), false),
+        Patch::Complement { block } => (block, f.variables.iter().filter(|v| v.block == block).flat_map(rows_of).collect(), true),
     };
+    let views: Vec<_> = parts.iter().map(|m| m.view()).collect();
+    let rows = ndarray::concatenate(Axis(0), &views).expect("rows");
     // More rows than coordinates span everything: the projector is the identity.
     let pi = if rows.nrows() >= D { Array2::eye(D) } else { projector(&rows) };
     let m_source = native(f, source, None).1[block].clone();
@@ -223,6 +223,7 @@ fn experiments(f: &Fixture) -> Vec<Experiment> {
         Experiment { base: 3, source: 2, cut: 2, patch: Some(Patch::Read { variable: read(2, 2) }) },
         Experiment { base: 4, source: 5, cut: 1, patch: Some(Patch::Read { variable: read(3, 5) }) },
         Experiment { base: 5, source: 4, cut: 2, patch: Some(Patch::Read { variable: read(1, 3) }) },
+        Experiment { base: 3, source: 0, cut: 1, patch: Some(Patch::Read { variable: f.variables.len() - 1 }) },
         Experiment { base: 0, source: 2, cut: 1, patch: Some(Patch::Complement { block: 0 }) },
         Experiment { base: 1, source: 3, cut: 2, patch: Some(Patch::Complement { block: 2 }) },
         Experiment { base: 2, source: 0, cut: 1, patch: Some(Patch::Complement { block: 3 }) },
