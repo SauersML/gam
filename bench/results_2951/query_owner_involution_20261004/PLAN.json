@@ -51,5 +51,8 @@
     "Query center/maps count in artifact; native background retained explicitly.",
     "Post-gain query patches may leave native normalization manifold; reference and norm diagnostics explicit.",
     "No whole-model algorithm recovery or VPD victory from this experiment."
-  ]
+  ],
+  "status": "STOPPED before any fit or native experiment; user directed effort away from isolated case-study expansion toward general automated mechanistic discovery.",
+  "stopped_utc": "2026-10-05T02:55:07.441390+00:00",
+  "implementation_archive": "/Users/user/mpd-data/codex/organization-next-20261004/deferred_query_involution"
 }
