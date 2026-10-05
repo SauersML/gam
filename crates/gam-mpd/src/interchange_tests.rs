@@ -17,7 +17,8 @@ use super::artifact::Artifact;
 use super::device_program::DeviceProgram;
 use super::device_program_tests::{devices, fixture_sized, noise};
 use super::interchange::{Batch, Design, Experiment, FixedHead, Interchange, Model, Patch, ReadVariable, Targets, census, design, evaluate, fingerprint, sample, sites, targets};
-use super::interchange::plan_tests::lanes;
+use super::interchange::BlockEngine;
+use super::device_program::DeviceTrace;
 use super::operator_program::{FamilyInputs, Operator, OperatorProgram, SequenceLayout, SlotValues, exact_precision};
 use super::resident_causal_fit::fixed_head_target::Head;
 use super::run_check::{layer_nodes, split_sites};
@@ -559,21 +560,80 @@ fn directions_from_host_values_are_those_of_the_loaded_explanation() {
     }
 }
 
+/// An engine counting the rows each forward call runs, around the reference.
+struct Counting<'a> {
+    model: Model<'a>,
+    rows: std::cell::Cell<usize>,
+}
+
+impl BlockEngine for Counting<'_> {
+    type Tape = DeviceTrace;
+
+    fn device(&self) -> &Device {
+        BlockEngine::device(&self.model)
+    }
+
+    fn width(&self) -> usize {
+        BlockEngine::width(&self.model)
+    }
+
+    fn blocks(&self) -> usize {
+        BlockEngine::blocks(&self.model)
+    }
+
+    fn arithmetic(&self) -> gam_gpu::tensor::Arithmetic {
+        BlockEngine::arithmetic(&self.model)
+    }
+
+    fn forward(
+        &self,
+        block: usize,
+        stream: &mut gam_gpu::tensor::Tensor,
+        ranges: &[std::ops::Range<usize>],
+        tokens: &[&[u32]],
+        read: Option<&mut dyn FnMut(&mut gam_gpu::tensor::Tensor) -> Result<(), String>>,
+        keep: bool,
+    ) -> Result<Option<DeviceTrace>, String> {
+        self.rows.set(self.rows.get() + ranges.iter().map(ExactSizeIterator::len).sum::<usize>());
+        self.model.forward(block, stream, ranges, tokens, read, keep)
+    }
+
+    fn reverse(
+        &self,
+        block: usize,
+        tape: DeviceTrace,
+        cotangent: &mut gam_gpu::tensor::Tensor,
+        ranges: &[std::ops::Range<usize>],
+        read: Option<&mut dyn FnMut(&mut gam_gpu::tensor::Tensor) -> Result<(), String>>,
+        gradient: &mut std::collections::BTreeMap<usize, gam_gpu::tensor::Tensor>,
+    ) -> Result<(), String> {
+        self.model.reverse(block, tape, cotangent, ranges, read, gradient)
+    }
+}
+
 #[test]
-fn a_patched_experiment_forks_from_its_base_at_the_patched_block() {
-    // Paths are laid out longest first: base 0's clean path takes lane 0; its patched experiment
-    // (the same hybrid, patched at block 2) forks from lane 0 there; a second clean experiment on
-    // base 0 under that hybrid is lane 0's path whole; base 1 and the patched experiment's source
-    // (another sequence, to block 2) take lanes of their own.
+fn a_patched_experiment_reuses_its_base_below_the_patched_block() {
+    // Base 0 clean under hybrid h runs blocks 0..4; its patched experiment (the same hybrid,
+    // patched at block 2) runs only blocks 2..4; a second clean experiment on base 0 under h runs
+    // nothing of its own; base 1 runs 0..4 and the source (another sequence) 0..3: 13 block runs of
+    // a sequence, against 19 without sharing. The scores equal the reference engine's.
     let f = fixture();
     let read = f.variables.iter().position(|v| v.block == 2).expect("an attention variable of layer 1");
     let hybrid = vec![true, false, true, true];
     let e = |base: usize, source: usize, patch: Option<Patch>, position: usize| Experiment { base, source, explained: hybrid.clone(), patch, position };
     let experiments = vec![e(0, 0, None, 0), e(0, 1, Some(Patch::Read { variable: read }), 3), e(0, 0, None, 2), e(1, 1, None, 0)];
-    let programs = programs(&Device::host(), &f);
-    let (_, p) = models(&f, &programs);
+    let device = Device::host();
+    let programs = programs(&device, &f);
+    let (m, p) = models(&f, &programs);
     let design = design(&p, &f.variables, &experiments).expect("design");
-    let (planned, holders) = lanes(&f.batch, &experiments, &design, 2 * LAYERS).expect("lanes");
-    assert_eq!(planned, vec![(0, None), (2, Some(0)), (0, None), (0, None)]);
-    assert_eq!(holders, vec![0, 1, 0, 2]);
+    let targets = targets(&m, &programs.head, &f.batch, &experiments, &design).expect("targets");
+    let reference = evaluate(&m, &p, &programs.head, &f.batch, &targets, &experiments, &design, true).expect("evaluate");
+    let (cm, cp) = models(&f, &programs);
+    let (cm, cp) = (Counting { model: cm, rows: std::cell::Cell::new(0) }, Counting { model: cp, rows: std::cell::Cell::new(0) });
+    let counted = evaluate(&cm, &cp, &programs.head, &f.batch, &targets, &experiments, &design, true).expect("evaluate");
+    assert_eq!(cm.rows.get() + cp.rows.get(), 13 * LENGTH);
+    assert_eq!(counted.bits, reference.bits);
+    for (op, g) in &reference.gradient {
+        assert_eq!(device.download(g).expect("gradient"), device.download(&counted.gradient[op]).expect("gradient"));
+    }
 }

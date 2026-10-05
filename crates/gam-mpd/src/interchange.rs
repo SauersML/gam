@@ -1305,16 +1305,3 @@ impl Interchange {
         Ok(Scored { bits: evaluation.bits, gradient })
     }
 }
-
-#[cfg(test)]
-pub(crate) mod plan_tests {
-    use super::{Batch, Design, Experiment, Plan, paths};
-
-    /// The lanes [`super::evaluate`] runs for `experiments` on `batch`: per lane its first block and
-    /// the lane it forks from; and per experiment the lane its base's path ends on.
-    pub(crate) fn lanes(batch: &Batch, experiments: &[Experiment], design: &Design, blocks: usize) -> Result<(Vec<(usize, Option<usize>)>, Vec<usize>), String> {
-        let (paths, bases) = paths(batch, experiments, design, None, blocks)?;
-        let plan = Plan::new(paths, batch.length);
-        Ok((plan.lanes.iter().map(|l| (l.start, l.parent)).collect(), bases.iter().map(|p| plan.holder[*p]).collect()))
-    }
-}
