@@ -1,0 +1,1222 @@
+//! Measured interventions on native language models, for an investigator that writes a model's
+//! counterfactual operating manual (#2951): what rule the model follows, what information the rule
+//! uses, where the native weights implement it, and how changing those weights changes the rule.
+//!
+//! A [`Session`] holds named native models (an imported checkpoint's program with every attention
+//! and MLP output its own node, [`split_sites`]) and answers [`Request`]s with measured runs only:
+//! no linearized or frozen attribution enters any answer.
+//!
+//! * Sites. The residual stream entering layer `l` (`l = L` is the final residual), the residual
+//!   after layer `l`'s attention, layer `l`'s attention output and MLP output (both in the
+//!   residual's coordinates), head `h`'s attention read `z_h` (the input of its output map), and
+//!   layer `l`'s MLP activations (the input of its down map). Residual states and block outputs
+//!   are the same variables in every model of one architecture, so a value moves between models.
+//! * Patches. A site's value at chosen rows is replaced by the value the same model computes on a
+//!   source sequence (or another model on the same or a source sequence), by zero, by a multiple
+//!   of itself, by its mean over reference sequences, or shifted by a vector; restricted to chosen
+//!   coordinates, or to its component along one direction `d` (`v ← v + ((t − v)·d̂) d̂`).
+//! * Native parameter edits. `W(α) = W + Σ_c (α_c − 1) P_c` on the original stored matrices, with
+//!   components `P_c`: a whole operator, its rows or columns, a head's output map (its write, so
+//!   `α` scales the head's contribution exactly), an MLP neuron's down column (its write), the
+//!   difference from another model's operator (`P = W − W_ref`, or chosen singular components of
+//!   it), or the part of an operator that reads (`W v vᵀ`) or writes (`u uᵀ W`) one direction.
+//!   `α = 1` is the model itself, exactly.
+//! * Crossed interventions. For inputs `x₀, x₁` and interventions `a₀, a₁`,
+//!   `Γ = [y(x₁, a₁) − y(x₀, a₁)] − [y(x₁, a₀) − y(x₀, a₀)]`: how much an intervention changes the
+//!   effect of an input distinction on the response `y` (a target token's log-probability, or its
+//!   difference from another token's). A component that only represents the distinction leaves
+//!   `Γ` at zero when edited; a component the response uses to act on it does not.
+//! * Weight differences between two models of one architecture: per operator the norms and
+//!   singular values of `W_a − W_b`, and its leading singular directions read in token terms
+//!   (a direction a map reads from the residual against the token embeddings through the layer's
+//!   norm gain, a direction written to the residual through the final norm gain and the
+//!   unembedding: the direct path only, labelled as such).
+//!
+//! Every run is the host's float64 execution of the program (`OperatorProgram::execute_edited`).
+
+use crate::import::{hugging_face_language_model, import_language_model};
+use crate::operator_program::{FamilyInputs, Node, OperatorBody, OperatorProgram, SequenceLayout, SlotValues, exact_precision};
+use crate::run_check::{LayerNodes, layer_nodes, split_sites};
+use crate::tiled_attention;
+use gam_math::categorical::{categorical_kl_from_logits, log_softmax};
+use ndarray::{Array1, Array2, Axis};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
+use std::sync::Arc;
+
+/// A model site whose value an investigator reads or patches (module note).
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Site {
+    /// The residual stream entering `layer` (`layer = L`: the final residual, before the final norm).
+    Stream { layer: usize },
+    /// The residual stream after `layer`'s attention, before its MLP.
+    Middle { layer: usize },
+    /// `layer`'s attention output, in the residual's coordinates.
+    Attention { layer: usize },
+    /// Head `head`'s attention read `z_h`, the input of its output map.
+    Head { layer: usize, head: usize },
+    /// `layer`'s MLP output, in the residual's coordinates.
+    Mlp { layer: usize },
+    /// `layer`'s MLP activations, the input of its down map.
+    Neurons { layer: usize },
+}
+
+/// What a patch writes at its rows.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PatchValue {
+    /// The value computed on `tokens` (default: the patched sequence itself) by `model` (default:
+    /// the patched model under the same edits), at `positions` (default: the patched positions).
+    Source {
+        #[serde(default)]
+        tokens: Option<Vec<u32>>,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        positions: Option<Vec<i64>>,
+    },
+    Zero,
+    Scale { factor: f64 },
+    /// The site's mean over every position of `sequences`, run by the patched model under the same edits.
+    Mean { sequences: Vec<Vec<u32>> },
+    /// The value plus `vector`.
+    Add { vector: Vec<f64> },
+}
+
+/// A patch of one site at chosen rows (module note).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Patch {
+    pub site: Site,
+    /// The patched sequences of the request (default: every one).
+    #[serde(default)]
+    pub sequences: Option<Vec<usize>>,
+    /// The patched positions (negative counts from the end; default: every position).
+    #[serde(default)]
+    pub positions: Option<Vec<i64>>,
+    #[serde(default)]
+    pub coordinates: Option<Vec<usize>>,
+    #[serde(default)]
+    pub direction: Option<Vec<f64>>,
+    pub value: PatchValue,
+}
+
+/// A native parameter component `P_c` (module note).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Component {
+    Operator { name: String },
+    Rows { name: String, rows: Vec<usize> },
+    Columns { name: String, columns: Vec<usize> },
+    /// Head `head`'s output map `blocks.{layer}.o{head}`.
+    Head { layer: usize, head: usize },
+    /// Column `index` of `blocks.{layer}.down_proj`.
+    Neuron { layer: usize, index: usize },
+    /// `W − W_ref` for `reference`'s operator `name`, or the sum of its singular components `components`.
+    Difference {
+        name: String,
+        reference: String,
+        #[serde(default)]
+        components: Option<Vec<usize>>,
+    },
+    /// The part of `name` reading the unit direction `direction` (`side = input`: `W d dᵀ`) or
+    /// writing it (`side = output`: `d dᵀ W`).
+    Direction { name: String, side: Side, direction: Vec<f64> },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Side {
+    Input,
+    Output,
+}
+
+/// One edit `(α − 1) P_c` of `W(α)`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Edit {
+    pub component: Component,
+    pub alpha: f64,
+}
+
+/// A finite intervention: native edits and patches applied together.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Intervention {
+    #[serde(default)]
+    pub edits: Vec<Edit>,
+    #[serde(default)]
+    pub patches: Vec<Patch>,
+}
+
+/// One crossed pair: inputs `x₀`, `x₁` and the response `y` at a position of each.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pair {
+    pub x0: Vec<u32>,
+    pub x1: Vec<u32>,
+    pub target: u32,
+    #[serde(default)]
+    pub versus: Option<u32>,
+    /// Response positions in `x₀` and `x₁` (default: the last of each).
+    #[serde(default)]
+    pub positions: Option<(i64, i64)>,
+}
+
+fn default_top() -> usize {
+    10
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunRequest {
+    pub model: String,
+    pub sequences: Vec<Vec<u32>>,
+    /// Reported positions (negative counts from the end; default: the last).
+    #[serde(default)]
+    pub positions: Option<Vec<i64>>,
+    #[serde(default = "default_top")]
+    pub top: usize,
+    #[serde(default)]
+    pub targets: Vec<u32>,
+    #[serde(default)]
+    pub intervention: Intervention,
+    /// Also run the model clean and report KL(clean ‖ intervened) and the clean targets.
+    #[serde(default)]
+    pub clean: bool,
+    #[serde(default)]
+    pub record: Vec<Site>,
+    #[serde(default)]
+    pub full: bool,
+    /// Also report the log-probability of the sequence's own next token at each reported
+    /// position (and the clean model's, with `clean`).
+    #[serde(default)]
+    pub next: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Request {
+    Info,
+    /// Next-token distributions at chosen positions under an intervention.
+    Run(RunRequest),
+    Crossed {
+        model: String,
+        pairs: Vec<Pair>,
+        #[serde(default)]
+        a0: Intervention,
+        a1: Intervention,
+    },
+    Generate {
+        model: String,
+        tokens: Vec<u32>,
+        steps: usize,
+        #[serde(default)]
+        edits: Vec<Edit>,
+    },
+    Attention {
+        model: String,
+        tokens: Vec<u32>,
+        layer: usize,
+        head: usize,
+        #[serde(default)]
+        edits: Vec<Edit>,
+        #[serde(default = "default_top")]
+        top: usize,
+    },
+    /// The direct-path token reading of a vector written to the residual, or of a site's write at
+    /// one position.
+    Unembed {
+        model: String,
+        #[serde(default)]
+        vector: Option<Vec<f64>>,
+        #[serde(default)]
+        site: Option<Site>,
+        #[serde(default)]
+        tokens: Option<Vec<u32>>,
+        #[serde(default)]
+        position: Option<i64>,
+        #[serde(default = "default_top")]
+        top: usize,
+    },
+    Difference {
+        model: String,
+        reference: String,
+        #[serde(default)]
+        spectrum: bool,
+        #[serde(default = "default_top")]
+        top: usize,
+    },
+    Components {
+        model: String,
+        reference: String,
+        name: String,
+        #[serde(default = "default_components")]
+        count: usize,
+        #[serde(default = "default_top")]
+        top: usize,
+        #[serde(default)]
+        vectors: bool,
+    },
+    /// Which sites carry `model`'s difference from `reference` on these sequences, by measured
+    /// swaps of activations and of weights in both directions.
+    Localize {
+        model: String,
+        reference: String,
+        sequences: Vec<Vec<u32>>,
+        #[serde(default)]
+        targets: Option<Vec<u32>>,
+        #[serde(default)]
+        weights: bool,
+    },
+    /// KL(model ‖ reference) per position over sequences, the largest positions listed.
+    Scan {
+        model: String,
+        reference: String,
+        sequences: Vec<Vec<u32>>,
+        #[serde(default = "default_top")]
+        top: usize,
+    },
+    /// KL(full ‖ truncated) per position: one model's next-token distribution with its whole
+    /// context against the same model reading only the last `keep` tokens, the largest listed:
+    /// where distant context changes the prediction.
+    ContextScan {
+        model: String,
+        sequences: Vec<Vec<u32>>,
+        keep: usize,
+        #[serde(default = "default_top")]
+        top: usize,
+    },
+    /// The positions of `sequences` where a site's value is largest along a coordinate or a
+    /// direction (its largest-activating examples): an activation readout, not an intervention.
+    Activations {
+        model: String,
+        site: Site,
+        sequences: Vec<Vec<u32>>,
+        #[serde(default)]
+        coordinate: Option<usize>,
+        #[serde(default)]
+        direction: Option<Vec<f64>>,
+        #[serde(default = "default_top")]
+        top: usize,
+    },
+}
+
+fn default_components() -> usize {
+    4
+}
+
+/// An imported native model with its sites named (module note).
+pub struct Native {
+    pub program: OperatorProgram,
+    pub layers: Vec<LayerNodes>,
+    pub width: usize,
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_width: usize,
+    pub mlp_width: usize,
+    pub vocab: usize,
+    operators: BTreeMap<String, usize>,
+    /// The final norm's gain and the unembedding operator (`true`: read transposed, `h A`).
+    final_gain: Array1<f64>,
+    unembedding: (usize, bool),
+    embedding: Option<usize>,
+}
+
+impl Native {
+    /// A Hugging Face checkpoint directory (`config.json`) or a language-model export (`export.json`).
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let (program, count) = if path.join("config.json").exists() {
+            let text = std::fs::read_to_string(path.join("config.json")).map_err(|e| format!("{}: {e}", path.display()))?;
+            let config: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+            let count = config["num_hidden_layers"].as_u64().ok_or("config.json: num_hidden_layers")? as usize;
+            (hugging_face_language_model(path, 0..count)?.0, count)
+        } else {
+            let imported = import_language_model(path, 0, 0)?;
+            let count = imported.record["config"]["n_layers"].as_u64().ok_or("export.json: config.n_layers")? as usize;
+            (imported.program, count)
+        };
+        Self::new(split_sites(&program)?, count)
+    }
+
+    pub fn new(program: OperatorProgram, count: usize) -> Result<Self, String> {
+        let layers = layer_nodes(&program, count)?;
+        let width_of = |node: usize| program.node_interface(node).map(|i| i.width()).map_err(|e| e.to_string());
+        let first = &layers[0];
+        let operators = program.operators.iter().enumerate().map(|(i, op)| (op.name.clone(), i)).collect::<BTreeMap<_, _>>();
+        let Node::Readout { input: logits, .. } = program.nodes[program.output] else {
+            return Err("the program's output is not a readout".into());
+        };
+        let (normed, unembedding) = match &program.nodes[logits] {
+            Node::Transposed { input, operator } => (*input, (*operator, true)),
+            Node::Affine { terms, bias: None } if terms.len() == 1 => (terms[0].0, (terms[0].1, false)),
+            other => return Err(format!("the logits are not a linear head: {other:?}")),
+        };
+        let final_gain = match &program.nodes[normed] {
+            Node::Affine { terms, .. } if terms.len() == 1 => program.operators[terms[0].1].diagonal().ok_or("the final norm has no diagonal gain")?,
+            other => return Err(format!("the head does not read a gained norm: {other:?}")),
+        };
+        let embedding = operators.get("wte").copied();
+        Ok(Self {
+            width: width_of(first.stream)?,
+            heads: first.reads.len(),
+            kv_heads: first.keys.len(),
+            head_width: width_of(first.reads[0])?,
+            mlp_width: width_of(first.active)?,
+            vocab: program.declarations.domains.first().ok_or("no token domain")?.size,
+            operators,
+            final_gain,
+            unembedding,
+            embedding,
+            layers,
+            program,
+        })
+    }
+
+    pub fn operator(&self, name: &str) -> Result<usize, String> {
+        self.operators.get(name).copied().ok_or_else(|| format!("no operator {name}"))
+    }
+
+    pub fn node(&self, site: &Site) -> Result<usize, String> {
+        let count = self.layers.len();
+        let layer = |l: usize| self.layers.get(l).ok_or_else(|| format!("layer {l} of {count}"));
+        Ok(match *site {
+            Site::Stream { layer: l } if l == count => self.layers[count - 1].residual,
+            Site::Stream { layer: l } => layer(l)?.stream,
+            Site::Middle { layer: l } => layer(l)?.attended,
+            Site::Attention { layer: l } => layer(l)?.attention,
+            Site::Head { layer: l, head } => *layer(l)?.reads.get(head).ok_or_else(|| format!("head {head} of {}", self.heads))?,
+            Site::Mlp { layer: l } => layer(l)?.mlp,
+            Site::Neurons { layer: l } => layer(l)?.active,
+        })
+    }
+
+    /// A site's value at one row as a write to the residual: a head's through its output map, the
+    /// activations through the down map, every other site as it is.
+    fn write_of(&self, site: &Site, value: &[f64]) -> Result<Array1<f64>, String> {
+        let v = Array1::from(value.to_vec());
+        let through = |name: String| -> Result<Array1<f64>, String> { Ok(self.program.operators[self.operator(&name)?].matrix_cow().dot(&v)) };
+        match *site {
+            Site::Head { layer, head } => through(format!("blocks.{layer}.o{head}")),
+            Site::Neurons { layer } => through(format!("blocks.{layer}.down_proj")),
+            Site::Stream { .. } | Site::Middle { .. } | Site::Attention { .. } | Site::Mlp { .. } => Ok(v),
+        }
+    }
+
+    /// The direct-path logits of a residual write `u`: `W_U (γ_f ⊙ u)`, centred over the vocabulary.
+    pub fn unembed(&self, u: &Array1<f64>) -> Array1<f64> {
+        let g = &self.final_gain * u;
+        let a = self.program.operators[self.unembedding.0].matrix_cow();
+        let mut out = if self.unembedding.1 { g.dot(a.as_ref()) } else { a.dot(&g) };
+        let mean = out.mean().unwrap_or(0.0);
+        out -= mean;
+        out
+    }
+
+    /// Each token's reading of a direction `r` read from the residual entering a layer through its
+    /// norm gain `γ`: `(γ ⊙ r)·e_t / √(mean(e_t²))`.
+    fn embedding_reading(&self, gain: &Array1<f64>, r: &Array1<f64>) -> Result<Array1<f64>, String> {
+        let wte = self.embedding.ok_or("no token embedding")?;
+        let a = self.program.operators[wte].matrix_cow();
+        let g = gain * r;
+        let scores = g.dot(a.as_ref());
+        let norms = a.map_axis(Axis(0), |c| (c.iter().map(|x| x * x).sum::<f64>() / c.len() as f64).sqrt().max(f64::MIN_POSITIVE));
+        Ok(scores / norms)
+    }
+
+    /// The gain of the norm feeding operator `name` (a q, k, v, c_fc or gate_proj map).
+    fn read_gain(&self, name: &str) -> Result<Array1<f64>, String> {
+        let layer = name.strip_prefix("blocks.").and_then(|r| r.split_once('.')).ok_or_else(|| format!("{name}: not a block operator"))?.0;
+        let attention = ["q", "k", "v"].iter().any(|p| name.rsplit('.').next().is_some_and(|last| last.starts_with(p) && last[1..].parse::<usize>().is_ok()));
+        let gain = format!("blocks.{layer}.{}.gain", if attention { "rms1" } else { "rms2" });
+        self.program.operators[self.operator(&gain)?].diagonal().ok_or_else(|| format!("{gain}: not diagonal"))
+    }
+}
+
+fn family(sequences: &[Vec<u32>], vocab: usize) -> Result<(FamilyInputs, Vec<usize>), String> {
+    let (mut ids, mut sequence, mut position, mut offsets) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (s, tokens) in sequences.iter().enumerate() {
+        if tokens.is_empty() {
+            return Err(format!("sequence {s} is empty"));
+        }
+        if let Some(t) = tokens.iter().find(|t| **t as usize >= vocab) {
+            return Err(format!("token {t} beyond the vocabulary of {vocab}"));
+        }
+        offsets.push(ids.len());
+        for (p, t) in tokens.iter().enumerate() {
+            ids.push(*t);
+            sequence.push(s as u32);
+            position.push(p as u32);
+        }
+    }
+    let rows = ids.len();
+    Ok((FamilyInputs { rows, slots: vec![SlotValues::Tokens(ids)], layout: Some(SequenceLayout { sequence, position }) }, offsets))
+}
+
+/// A position of a sequence of `length` tokens (negative counts from the end).
+fn resolve(position: i64, length: usize) -> Result<usize, String> {
+    let p = if position < 0 { length as i64 + position } else { position };
+    if p < 0 || p as usize >= length {
+        return Err(format!("position {position} of a sequence of {length}"));
+    }
+    Ok(p as usize)
+}
+
+fn unit(direction: &[f64]) -> Result<Array1<f64>, String> {
+    let d = Array1::from(direction.to_vec());
+    let norm = d.dot(&d).sqrt();
+    if !norm.is_finite() || norm == 0.0 {
+        return Err("a direction must be finite and nonzero".into());
+    }
+    Ok(d / norm)
+}
+
+/// The `top` largest entries of `scores` with their indices, and the `top` smallest.
+fn extremes(scores: &Array1<f64>, top: usize) -> (Vec<(usize, f64)>, Vec<(usize, f64)>) {
+    let mut order: Vec<usize> = (0..scores.len()).collect();
+    order.sort_by(|a, b| scores[*b].total_cmp(&scores[*a]));
+    let high = order.iter().take(top).map(|i| (*i, scores[*i])).collect();
+    let low = order.iter().rev().take(top).map(|i| (*i, scores[*i])).collect();
+    (high, low)
+}
+
+fn top_log_probabilities(logits: ndarray::ArrayView1<'_, f64>, top: usize) -> Result<(Vec<f64>, Vec<(usize, f64)>), String> {
+    let row: Vec<f64> = logits.to_vec();
+    let lp = log_softmax(&row).map_err(|e| format!("{e:?}"))?;
+    let (high, _) = extremes(&Array1::from(lp.clone()), top);
+    Ok((lp, high))
+}
+
+/// A patch resolved to rows and per-row target values.
+struct Resolved {
+    node: usize,
+    rows: Vec<usize>,
+    /// Per row the value the patch writes there before restriction (`None`: computed from the
+    /// row's own value: a scale or a shift).
+    targets: Vec<Option<Array1<f64>>>,
+    kind: Local,
+    coordinates: Option<Vec<usize>>,
+    direction: Option<Array1<f64>>,
+}
+
+enum Local {
+    Zero,
+    Fixed,
+    Scale(f64),
+    Add(Array1<f64>),
+}
+
+pub struct Session {
+    pub models: BTreeMap<String, Native>,
+    /// Thin singular value decompositions of operator differences, by (model, reference, operator).
+    differences: HashMap<(String, String, String), Arc<gam_linalg::decompose::Svd>>,
+}
+
+impl Session {
+    pub fn new(models: BTreeMap<String, Native>) -> Self {
+        Self { models, differences: HashMap::new() }
+    }
+
+    fn model(&self, name: &str) -> Result<&Native, String> {
+        self.models.get(name).ok_or_else(|| format!("no model {name} (have {:?})", self.models.keys().collect::<Vec<_>>()))
+    }
+
+    fn difference(&mut self, model: &str, reference: &str, name: &str) -> Result<Arc<gam_linalg::decompose::Svd>, String> {
+        let key = (model.to_string(), reference.to_string(), name.to_string());
+        if let Some(svd) = self.differences.get(&key) {
+            return Ok(svd.clone());
+        }
+        let delta = self.delta(model, reference, name)?;
+        let svd = Arc::new(gam_linalg::decompose::svd(delta.view(), false).map_err(|e| format!("{name}: {e:?}"))?);
+        self.differences.insert(key, svd.clone());
+        Ok(svd)
+    }
+
+    fn delta(&self, model: &str, reference: &str, name: &str) -> Result<Array2<f64>, String> {
+        let (a, b) = (self.model(model)?, self.model(reference)?);
+        let wa = a.program.operators[a.operator(name)?].matrix_cow();
+        let wb = b.program.operators[b.operator(name)?].matrix_cow();
+        if wa.dim() != wb.dim() {
+            return Err(format!("{name}: shapes {:?} and {:?}", wa.dim(), wb.dim()));
+        }
+        Ok(wa.as_ref() - wb.as_ref())
+    }
+
+    /// The component's operator and its matrix `P_c` (module note).
+    fn component(&mut self, model: &str, component: &Component) -> Result<(usize, Array2<f64>), String> {
+        let native = self.model(model)?;
+        let matrix = |name: &str| -> Result<(usize, Array2<f64>), String> {
+            let op = native.operator(name)?;
+            match &native.program.operators[op].body {
+                OperatorBody::Dense { values, .. } => Ok((op, values.clone())),
+                OperatorBody::Identity | OperatorBody::LowRank { .. } | OperatorBody::Diagonal { .. } => Err(format!("{name} is not a stored dense matrix")),
+            }
+        };
+        match component {
+            Component::Operator { name } => matrix(name),
+            Component::Head { layer, head } => matrix(&format!("blocks.{layer}.o{head}")),
+            Component::Rows { name, rows } => {
+                let (op, w) = matrix(name)?;
+                let mut p = Array2::zeros(w.dim());
+                for r in rows {
+                    let row = w.row(*r);
+                    p.row_mut(*r).assign(&row);
+                }
+                Ok((op, p))
+            }
+            Component::Columns { name, columns } => {
+                let (op, w) = matrix(name)?;
+                let mut p = Array2::zeros(w.dim());
+                for c in columns {
+                    if *c >= w.ncols() {
+                        return Err(format!("{name}: column {c} of {}", w.ncols()));
+                    }
+                    p.column_mut(*c).assign(&w.column(*c));
+                }
+                Ok((op, p))
+            }
+            Component::Neuron { layer, index } => {
+                let (op, w) = matrix(&format!("blocks.{layer}.down_proj"))?;
+                if *index >= w.ncols() {
+                    return Err(format!("neuron {index} of {}", w.ncols()));
+                }
+                let mut p = Array2::zeros(w.dim());
+                p.column_mut(*index).assign(&w.column(*index));
+                Ok((op, p))
+            }
+            Component::Direction { name, side, direction } => {
+                let (op, w) = matrix(name)?;
+                let d = unit(direction)?;
+                let column = d.clone().insert_axis(Axis(1));
+                let row = d.insert_axis(Axis(0));
+                let p = match side {
+                    Side::Input if w.ncols() == column.nrows() => w.dot(&column).dot(&row),
+                    Side::Output if w.nrows() == column.nrows() => column.dot(&row).dot(&w),
+                    Side::Input | Side::Output => return Err(format!("{name} {:?}: a direction of {} on a {:?} matrix", side, column.nrows(), w.dim())),
+                };
+                Ok((op, p))
+            }
+            Component::Difference { name, reference, components } => {
+                let op = native.operator(name)?;
+                let p = match components {
+                    None => self.delta(model, reference, name)?,
+                    Some(list) => {
+                        let svd = self.difference(model, reference, name)?;
+                        let mut p = Array2::zeros((svd.u.nrows(), svd.vt.ncols()));
+                        for k in list {
+                            if *k >= svd.singular_values.len() {
+                                return Err(format!("{name}: component {k} of {}", svd.singular_values.len()));
+                            }
+                            let u = svd.u.column(*k).to_owned().insert_axis(Axis(1));
+                            let v = svd.vt.row(*k).to_owned().insert_axis(Axis(0));
+                            p = p + u.dot(&v) * svd.singular_values[*k];
+                        }
+                        p
+                    }
+                };
+                Ok((op, p))
+            }
+        }
+    }
+
+    /// `model`'s program under `W(α) = W + Σ_c (α_c − 1) P_c`.
+    pub fn edited(&mut self, model: &str, edits: &[Edit]) -> Result<OperatorProgram, String> {
+        let mut deltas: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
+        for edit in edits {
+            if !edit.alpha.is_finite() {
+                return Err("a nonfinite amplitude".into());
+            }
+            let (op, p) = self.component(model, &edit.component)?;
+            let entry = deltas.entry(op).or_insert_with(|| Array2::zeros(p.dim()));
+            entry.scaled_add(edit.alpha - 1.0, &p);
+        }
+        let mut program = self.model(model)?.program.clone();
+        for (op, delta) in deltas {
+            let mut operator = (*program.operators[op]).clone();
+            let OperatorBody::Dense { values, present, .. } = &operator.body else {
+                return Err(format!("{}: not dense", operator.name));
+            };
+            let values = values + &delta;
+            let precision = exact_precision(values.iter().copied()).map_err(|e| e.to_string())?;
+            operator.body = OperatorBody::Dense { values, present: present.clone(), precision };
+            program.operators[op] = Arc::new(operator);
+        }
+        Ok(program)
+    }
+
+    /// Every node's value of `program` on `sequences` with `patches` applied as each node is computed.
+    fn execute(&mut self, model: &str, program: &OperatorProgram, sequences: &[Vec<u32>], patches: &[Patch], edits: &[Edit]) -> Result<(Vec<Array2<f64>>, Vec<usize>), String> {
+        let native = self.model(model)?;
+        let (inputs, offsets) = family(sequences, native.vocab)?;
+        let mut resolved: Vec<Resolved> = Vec::new();
+        for patch in patches {
+            resolved.push(self.resolve_patch(model, program, sequences, &offsets, patch, edits)?);
+        }
+        let trace = program
+            .execute_edited(&inputs, |node, value, _| {
+                for r in resolved.iter().filter(|r| r.node == node) {
+                    apply(r, value)?;
+                }
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        Ok((trace.values, offsets))
+    }
+
+    fn resolve_patch(&mut self, model: &str, program: &OperatorProgram, sequences: &[Vec<u32>], offsets: &[usize], patch: &Patch, edits: &[Edit]) -> Result<Resolved, String> {
+        let native = self.model(model)?;
+        let node = native.node(&patch.site)?;
+        let chosen: Vec<usize> = match &patch.sequences {
+            Some(list) => list.clone(),
+            None => (0..sequences.len()).collect(),
+        };
+        let mut rows = Vec::new();
+        let mut places = Vec::new();
+        for s in chosen {
+            let tokens = sequences.get(s).ok_or_else(|| format!("patch of sequence {s} of {}", sequences.len()))?;
+            let positions: Vec<usize> = match &patch.positions {
+                Some(list) => list.iter().map(|p| resolve(*p, tokens.len())).collect::<Result<_, _>>()?,
+                None => (0..tokens.len()).collect(),
+            };
+            for (i, p) in positions.into_iter().enumerate() {
+                rows.push(offsets[s] + p);
+                places.push((s, i, p));
+            }
+        }
+        let direction = patch.direction.as_deref().map(unit).transpose()?;
+        let (kind, targets) = match &patch.value {
+            PatchValue::Zero => (Local::Zero, rows.iter().map(|_| None).collect()),
+            PatchValue::Scale { factor } => (Local::Scale(*factor), rows.iter().map(|_| None).collect()),
+            PatchValue::Add { vector } => (Local::Add(Array1::from(vector.clone())), rows.iter().map(|_| None).collect()),
+            PatchValue::Mean { sequences: reference } => {
+                let (values, _) = self.execute(model, program, reference, &[], edits)?;
+                let mean = values[node].mean_axis(Axis(0)).ok_or("no reference rows")?;
+                (Local::Fixed, rows.iter().map(|_| Some(mean.clone())).collect())
+            }
+            PatchValue::Source { tokens, model: source_model, positions } => {
+                let source_name = source_model.clone().unwrap_or_else(|| model.to_string());
+                let source_program = match source_model {
+                    Some(other) => self.model(other)?.program.clone(),
+                    None => program.clone(),
+                };
+                let source_native = self.model(&source_name)?;
+                let source_node = source_native.node(&patch.site)?;
+                // One source run per distinct source sequence.
+                let source_sequences: Vec<Vec<u32>> = match tokens {
+                    Some(t) => vec![t.clone()],
+                    None => sequences.to_vec(),
+                };
+                let (inputs, source_offsets) = family(&source_sequences, source_native.vocab)?;
+                let trace = source_program.execute(&inputs, false).map_err(|e| e.to_string())?;
+                let values = &trace.values[source_node];
+                let mut targets = Vec::with_capacity(places.len());
+                for (s, i, p) in &places {
+                    let (which, length) = match tokens {
+                        Some(t) => (0, t.len()),
+                        None => (*s, sequences[*s].len()),
+                    };
+                    let q = match positions {
+                        Some(list) => resolve(*list.get(*i).ok_or("fewer source positions than patched positions")?, length)?,
+                        None if *p < length => *p,
+                        None => return Err(format!("source of {length} tokens has no position {p}")),
+                    };
+                    targets.push(Some(values.row(source_offsets[which] + q).to_owned()));
+                }
+                (Local::Fixed, targets)
+            }
+        };
+        Ok(Resolved { node, rows, targets, kind, coordinates: patch.coordinates.clone(), direction })
+    }
+
+    pub fn handle(&mut self, request: &Request) -> Result<Value, String> {
+        match request {
+            Request::Info => Ok(self.info()),
+            Request::Run(r) => self.run(r),
+            Request::Crossed { model, pairs, a0, a1 } => self.crossed(model, pairs, a0, a1),
+            Request::Generate { model, tokens, steps, edits } => self.generate(model, tokens, *steps, edits),
+            Request::Attention { model, tokens, layer, head, edits, top } => self.attention(model, tokens, *layer, *head, edits, *top),
+            Request::Unembed { model, vector, site, tokens, position, top } => self.unembed(model, vector.as_deref(), site.as_ref(), tokens.as_deref(), *position, *top),
+            Request::Difference { model, reference, spectrum, top } => self.difference_summary(model, reference, *spectrum, *top),
+            Request::Components { model, reference, name, count, top, vectors } => self.components(model, reference, name, *count, *top, *vectors),
+            Request::Localize { model, reference, sequences, targets, weights } => self.localize(model, reference, sequences, targets.as_deref(), *weights),
+            Request::Scan { model, reference, sequences, top } => self.scan(model, reference, sequences, *top),
+            Request::ContextScan { model, sequences, keep, top } => self.context_scan(model, sequences, *keep, *top),
+            Request::Activations { model, site, sequences, coordinate, direction, top } => self.activations(model, site, sequences, *coordinate, direction.as_deref(), *top),
+        }
+    }
+
+    fn info(&self) -> Value {
+        let models: BTreeMap<&String, Value> = self
+            .models
+            .iter()
+            .map(|(name, m)| {
+                (
+                    name,
+                    json!({
+                        "layers": m.layers.len(), "width": m.width, "heads": m.heads, "kv_heads": m.kv_heads,
+                        "head_width": m.head_width, "mlp_width": m.mlp_width, "vocab": m.vocab,
+                        "operators": m.operators.keys().filter(|n| n.starts_with("blocks.")).collect::<Vec<_>>(),
+                    }),
+                )
+            })
+            .collect();
+        json!({ "models": models })
+    }
+
+    /// Log-probabilities at each sequence's reported positions under `intervention`.
+    fn logits_at(&mut self, model: &str, sequences: &[Vec<u32>], positions: &[Vec<usize>], intervention: &Intervention) -> Result<(Vec<Vec<Array1<f64>>>, Vec<Array2<f64>>, Vec<usize>), String> {
+        let program = self.edited(model, &intervention.edits)?;
+        let (values, offsets) = self.execute(model, &program, sequences, &intervention.patches, &intervention.edits)?;
+        let logits = &values[program.output];
+        let rows = positions
+            .iter()
+            .zip(&offsets)
+            .map(|(list, offset)| list.iter().map(|p| logits.row(offset + p).to_owned()).collect())
+            .collect();
+        Ok((rows, values, offsets))
+    }
+
+    fn run(&mut self, r: &RunRequest) -> Result<Value, String> {
+        let RunRequest { model, sequences, positions, top, targets, intervention, clean, record, full, next } = r;
+        let (top, clean, full, next) = (*top, *clean, *full, *next);
+        let reported: Vec<Vec<usize>> = sequences
+            .iter()
+            .map(|s| match positions.as_deref() {
+                Some(list) => list.iter().map(|p| resolve(*p, s.len())).collect(),
+                None => resolve(-1, s.len()).map(|p| vec![p]),
+            })
+            .collect::<Result<_, _>>()?;
+        let (rows, values, offsets) = self.logits_at(model, sequences, &reported, intervention)?;
+        let reference = if clean { Some(self.logits_at(model, sequences, &reported, &Intervention::default())?.0) } else { None };
+        let native = self.model(model)?;
+        let mut out = Vec::new();
+        for (s, list) in reported.iter().enumerate() {
+            let mut entries = Vec::new();
+            for (i, p) in list.iter().enumerate() {
+                let (lp, high) = top_log_probabilities(rows[s][i].view(), top)?;
+                let mut entry = json!({
+                    "position": p,
+                    "top": high.iter().map(|(t, v)| json!([t, v])).collect::<Vec<_>>(),
+                    "targets": targets.iter().map(|t| json!([t, lp.get(*t as usize).copied().unwrap_or(f64::NAN)])).collect::<Vec<_>>(),
+                });
+                if let Some(reference) = &reference {
+                    let clean_row = reference[s][i].to_vec();
+                    let kl = categorical_kl_from_logits(&clean_row, &rows[s][i].to_vec()).map_err(|e| format!("{e:?}"))?;
+                    let clean_lp = log_softmax(&clean_row).map_err(|e| format!("{e:?}"))?;
+                    let (_, clean_top) = top_log_probabilities(reference[s][i].view(), top.min(5))?;
+                    entry["kl_from_clean_nats"] = json!(kl);
+                    entry["clean_targets"] = json!(targets.iter().map(|t| json!([t, clean_lp.get(*t as usize).copied().unwrap_or(f64::NAN)])).collect::<Vec<_>>());
+                    entry["clean_top"] = json!(clean_top.iter().map(|(t, v)| json!([t, v])).collect::<Vec<_>>());
+                    if let Some(t) = sequences[s].get(p + 1).filter(|_| next) {
+                        entry["next"] = json!([t, lp[*t as usize], clean_lp[*t as usize]]);
+                    }
+                } else if let Some(t) = sequences[s].get(p + 1).filter(|_| next) {
+                    entry["next"] = json!([t, lp[*t as usize]]);
+                }
+                let mut recorded = Vec::new();
+                for site in record {
+                    let node = native.node(site)?;
+                    let v = values[node].row(offsets[s] + p).to_owned();
+                    let mut r = json!({"site": format!("{site:?}"), "norm": v.dot(&v).sqrt()});
+                    if matches!(site, Site::Neurons { .. }) {
+                        let magnitude = v.mapv(f64::abs);
+                        let (high, _) = extremes(&magnitude, top);
+                        r["largest"] = json!(high.iter().map(|(i, _)| json!([i, v[*i]])).collect::<Vec<_>>());
+                    }
+                    if full {
+                        r["value"] = json!(v.to_vec());
+                    }
+                    recorded.push(r);
+                }
+                if !record.is_empty() {
+                    entry["record"] = json!(recorded);
+                }
+                entries.push(entry);
+            }
+            out.push(json!({"sequence": s, "positions": entries}));
+        }
+        Ok(json!({"runs": out}))
+    }
+
+    fn crossed(&mut self, model: &str, pairs: &[Pair], a0: &Intervention, a1: &Intervention) -> Result<Value, String> {
+        if pairs.is_empty() {
+            return Err("no pairs".into());
+        }
+        let mut sequences = Vec::new();
+        let mut positions = Vec::new();
+        for pair in pairs {
+            let (p0, p1) = pair.positions.unwrap_or((-1, -1));
+            positions.push(vec![resolve(p0, pair.x0.len())?]);
+            positions.push(vec![resolve(p1, pair.x1.len())?]);
+            sequences.push(pair.x0.clone());
+            sequences.push(pair.x1.clone());
+        }
+        let respond = |rows: &[Vec<Array1<f64>>], k: usize, pair: &Pair| -> Result<f64, String> {
+            let lp = log_softmax(&rows[k][0].to_vec()).map_err(|e| format!("{e:?}"))?;
+            let y = lp[pair.target as usize];
+            Ok(match pair.versus {
+                Some(v) => y - lp[v as usize],
+                None => y,
+            })
+        };
+        let under0 = self.logits_at(model, &sequences, &positions, a0)?.0;
+        let under1 = self.logits_at(model, &sequences, &positions, a1)?.0;
+        let mut out = Vec::new();
+        let mut gammas = Vec::new();
+        let mut effects = (Vec::new(), Vec::new());
+        for (i, pair) in pairs.iter().enumerate() {
+            let (y00, y10) = (respond(&under0, 2 * i, pair)?, respond(&under0, 2 * i + 1, pair)?);
+            let (y01, y11) = (respond(&under1, 2 * i, pair)?, respond(&under1, 2 * i + 1, pair)?);
+            let gamma = (y11 - y01) - (y10 - y00);
+            gammas.push(gamma);
+            effects.0.push(y10 - y00);
+            effects.1.push(y11 - y01);
+            out.push(json!({"y_x0_a0": y00, "y_x1_a0": y10, "y_x0_a1": y01, "y_x1_a1": y11, "input_effect_a0": y10 - y00, "input_effect_a1": y11 - y01, "gamma": gamma}));
+        }
+        let summary = |v: &[f64]| {
+            let n = v.len() as f64;
+            let mean = v.iter().sum::<f64>() / n;
+            let var = if v.len() > 1 { v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0) } else { f64::NAN };
+            json!({"mean": mean, "standard_error": (var / n).sqrt(), "count": v.len()})
+        };
+        Ok(json!({"pairs": out, "gamma": summary(&gammas), "input_effect_a0": summary(&effects.0), "input_effect_a1": summary(&effects.1)}))
+    }
+
+    fn generate(&mut self, model: &str, tokens: &[u32], steps: usize, edits: &[Edit]) -> Result<Value, String> {
+        let program = self.edited(model, edits)?;
+        let vocab = self.model(model)?.vocab;
+        let mut sequence = tokens.to_vec();
+        let mut chosen = Vec::new();
+        for _ in 0..steps {
+            let (inputs, _) = family(std::slice::from_ref(&sequence), vocab)?;
+            let trace = program.execute(&inputs, false).map_err(|e| e.to_string())?;
+            let (lp, high) = top_log_probabilities(trace.values[program.output].row(sequence.len() - 1), 3)?;
+            let (next, _) = high[0];
+            chosen.push(json!({"token": next, "log_probability": lp[next], "alternatives": high[1..].iter().map(|(t, v)| json!([t, v])).collect::<Vec<_>>()}));
+            sequence.push(next as u32);
+        }
+        Ok(json!({"generated": chosen}))
+    }
+
+    fn attention(&mut self, model: &str, tokens: &[u32], layer: usize, head: usize, edits: &[Edit], top: usize) -> Result<Value, String> {
+        let program = self.edited(model, edits)?;
+        let native = self.model(model)?;
+        let node = native.node(&Site::Head { layer, head })?;
+        let Node::Attend { query, key, scale, rotary, causal, .. } = program.nodes[node].clone() else {
+            return Err(format!("node {node} is not an attention read"));
+        };
+        let (inputs, _) = family(&[tokens.to_vec()], native.vocab)?;
+        let trace = program.execute(&inputs, false).map_err(|e| e.to_string())?;
+        let positions: Vec<u32> = (0..tokens.len() as u32).collect();
+        let q = tiled_attention::rotate(&trace.values[query], rotary, &positions, false);
+        let k = tiled_attention::rotate(&trace.values[key], rotary, &positions, false);
+        let weights = tiled_attention::probabilities(q.view(), k.view(), &positions, 0, scale.value(), causal);
+        let rows: Vec<Value> = weights
+            .outer_iter()
+            .enumerate()
+            .map(|(p, row)| {
+                let (high, _) = extremes(&row.to_owned(), top.min(p + 1));
+                json!({"query": p, "sources": high.iter().map(|(s, w)| json!([s, w])).collect::<Vec<_>>()})
+            })
+            .collect();
+        let n = tokens.len();
+        let previous = (1..n).map(|p| weights[[p, p - 1]]).sum::<f64>() / (n.max(2) - 1) as f64;
+        let first = (1..n).map(|p| weights[[p, 0]]).sum::<f64>() / (n.max(2) - 1) as f64;
+        Ok(json!({"rows": rows, "mean_previous_token_weight": previous, "mean_first_token_weight": first}))
+    }
+
+    fn unembed(&mut self, model: &str, vector: Option<&[f64]>, site: Option<&Site>, tokens: Option<&[u32]>, position: Option<i64>, top: usize) -> Result<Value, String> {
+        let u = match (vector, site, tokens) {
+            (Some(v), None, None) => Array1::from(v.to_vec()),
+            (None, Some(site), Some(tokens)) => {
+                let native = self.model(model)?;
+                let (inputs, _) = family(&[tokens.to_vec()], native.vocab)?;
+                let trace = native.program.execute(&inputs, false).map_err(|e| e.to_string())?;
+                let p = resolve(position.unwrap_or(-1), tokens.len())?;
+                let value = trace.values[native.node(site)?].row(p).to_vec();
+                native.write_of(site, &value)?
+            }
+            _ => return Err("give either a vector, or a site with tokens (and a position)".into()),
+        };
+        let native = self.model(model)?;
+        if u.len() != native.width {
+            return Err(format!("a residual write has {} coordinates, not {}", native.width, u.len()));
+        }
+        let scores = native.unembed(&u);
+        let (high, low) = extremes(&scores, top);
+        Ok(json!({"norm": u.dot(&u).sqrt(), "promoted": high, "suppressed": low, "path": "direct (final norm gain and unembedding only)"}))
+    }
+
+    fn difference_summary(&mut self, model: &str, reference: &str, spectrum: bool, top: usize) -> Result<Value, String> {
+        let names: Vec<String> = self.model(model)?.operators.keys().filter(|n| n.starts_with("blocks.")).cloned().collect();
+        let mut rows = Vec::new();
+        for name in names {
+            if self.model(reference)?.operator(&name).is_err() {
+                continue;
+            }
+            let delta = self.delta(model, reference, &name)?;
+            let change = delta.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if change == 0.0 {
+                continue;
+            }
+            let b = self.model(reference)?;
+            let size = b.program.operators[b.operator(&name)?].matrix_cow().iter().map(|x| x * x).sum::<f64>().sqrt();
+            let mut row = json!({"operator": name, "difference_norm": change, "reference_norm": size, "relative": change / size});
+            // An MLP map's change concentrated in few neurons shows in its per-neuron norms.
+            let neuron_axis = if name.ends_with("down_proj") { Some(Axis(0)) } else if name.ends_with("c_fc") || name.ends_with("gate_proj") { Some(Axis(1)) } else { None };
+            if let Some(axis) = neuron_axis {
+                let per = delta.map_axis(axis, |v| v.dot(&v).sqrt());
+                let (high, _) = extremes(&per, top);
+                row["largest_neurons"] = json!(high);
+            }
+            if spectrum {
+                let svd = self.difference(model, reference, &name)?;
+                let s = &svd.singular_values;
+                row["singular_values"] = json!(s.iter().take(top).collect::<Vec<_>>());
+                row["stable_rank"] = json!(s.iter().map(|x| x * x).sum::<f64>() / (s[0] * s[0]));
+            }
+            rows.push(row);
+        }
+        rows.sort_by(|x, y| y["relative"].as_f64().unwrap_or(0.0).total_cmp(&x["relative"].as_f64().unwrap_or(0.0)));
+        Ok(json!({"changed_operators": rows.len(), "operators": rows}))
+    }
+
+    fn components(&mut self, model: &str, reference: &str, name: &str, count: usize, top: usize, vectors: bool) -> Result<Value, String> {
+        let svd = self.difference(model, reference, name)?;
+        let native = self.model(model)?;
+        let writes = name.ends_with("down_proj") || name.rsplit('.').next().is_some_and(|l| l.starts_with('o') && l[1..].parse::<usize>().is_ok());
+        let total = svd.singular_values.iter().map(|x| x * x).sum::<f64>();
+        let mut out = Vec::new();
+        for k in 0..count.min(svd.singular_values.len()) {
+            let (u, v) = (svd.u.column(k).to_owned(), svd.vt.row(k).to_owned());
+            let mut c = json!({"index": k, "singular_value": svd.singular_values[k], "share_of_squared_norm": svd.singular_values[k].powi(2) / total});
+            if writes {
+                let scores = native.unembed(&u);
+                let (high, low) = extremes(&scores, top);
+                c["output_direction_promotes"] = json!(high);
+                c["output_direction_suppresses"] = json!(low);
+                let magnitude = v.mapv(f64::abs);
+                c["input_coordinates"] = json!(extremes(&magnitude, top).0.iter().map(|(i, _)| json!([i, v[*i]])).collect::<Vec<_>>());
+            } else {
+                let gain = native.read_gain(name)?;
+                let scores = native.embedding_reading(&gain, &v)?;
+                let (high, low) = extremes(&scores, top);
+                c["input_direction_reads_tokens"] = json!(high);
+                c["input_direction_reads_negatively"] = json!(low);
+                let magnitude = u.mapv(f64::abs);
+                c["output_coordinates"] = json!(extremes(&magnitude, top).0.iter().map(|(i, _)| json!([i, u[*i]])).collect::<Vec<_>>());
+            }
+            if vectors {
+                c["left"] = json!(u.to_vec());
+                c["right"] = json!(v.to_vec());
+            }
+            out.push(c);
+        }
+        Ok(json!({"operator": name, "components": out, "token_readings": "direct path only (embedding through the layer's norm gain, or final norm gain and unembedding)"}))
+    }
+
+    /// Per sequence, the response `y` = log-probability of the target (default: `model`'s top
+    /// token at the last position) under `reference`, `model`, and each single-site swap.
+    fn localize(&mut self, model: &str, reference: &str, sequences: &[Vec<u32>], targets: Option<&[u32]>, weights: bool) -> Result<Value, String> {
+        let last: Vec<Vec<usize>> = sequences.iter().map(|s| resolve(-1, s.len()).map(|p| vec![p])).collect::<Result<_, _>>()?;
+        let none = Intervention::default();
+        let upd = self.logits_at(model, sequences, &last, &none)?.0;
+        let base = self.logits_at(reference, sequences, &last, &none)?.0;
+        let targets: Vec<usize> = match targets {
+            Some(t) if t.len() == sequences.len() => t.iter().map(|x| *x as usize).collect(),
+            Some(t) => return Err(format!("{} targets for {} sequences", t.len(), sequences.len())),
+            None => upd.iter().map(|r| extremes(&r[0], 1).0[0].0).collect(),
+        };
+        let y = |rows: &[Vec<Array1<f64>>]| -> Result<Vec<f64>, String> {
+            rows.iter().zip(&targets).map(|(r, t)| log_softmax(&r[0].to_vec()).map(|lp| lp[*t]).map_err(|e| format!("{e:?}"))).collect()
+        };
+        let (y_model, y_reference) = (y(&upd)?, y(&base)?);
+        let native = self.model(model)?;
+        let (count, heads, kv_heads) = (native.layers.len(), native.heads, native.kv_heads);
+        let mut sites = Vec::new();
+        for layer in 0..count {
+            sites.push(Site::Attention { layer });
+            sites.extend((0..heads).map(|head| Site::Head { layer, head }));
+            sites.push(Site::Mlp { layer });
+        }
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let gap: Vec<f64> = y_model.iter().zip(&y_reference).map(|(a, b)| a - b).collect();
+        let mut rows = Vec::new();
+        for site in &sites {
+            // Into the reference: the site's value from `model` on the same sequence; and the reverse.
+            let into = |from: &str| Intervention {
+                edits: vec![],
+                patches: vec![Patch { site: site.clone(), sequences: None, positions: None, coordinates: None, direction: None, value: PatchValue::Source { tokens: None, model: Some(from.to_string()), positions: None } }],
+            };
+            let gained = y(&self.logits_at(reference, sequences, &last, &into(model))?.0)?;
+            let kept = y(&self.logits_at(model, sequences, &last, &into(reference))?.0)?;
+            let reproduced: Vec<f64> = gained.iter().zip(&y_reference).map(|(g, b)| g - b).collect();
+            let removed: Vec<f64> = y_model.iter().zip(&kept).map(|(m, k)| m - k).collect();
+            rows.push(json!({"site": format!("{site:?}"), "kind": "activation",
+                "reference_gains_nats": mean(&reproduced), "model_loses_nats": mean(&removed)}));
+        }
+        if weights {
+            let names: Vec<(String, Vec<String>)> = (0..count)
+                .flat_map(|l| {
+                    let mut groups: Vec<(String, Vec<String>)> = (0..heads).map(|h| (format!("layer {l} head {h} (q, o)"), vec![format!("blocks.{l}.q{h}"), format!("blocks.{l}.o{h}")])).collect();
+                    groups.push((format!("layer {l} keys and values"), (0..kv_heads).flat_map(|g| [format!("blocks.{l}.k{g}"), format!("blocks.{l}.v{g}")]).collect()));
+                    groups.push((format!("layer {l} MLP"), ["c_fc", "gate_proj", "down_proj"].iter().map(|p| format!("blocks.{l}.{p}")).collect()));
+                    groups
+                })
+                .collect();
+            for (label, group) in names {
+                let present: Vec<String> = group.into_iter().filter(|n| self.models.get(model).is_some_and(|m| m.operators.contains_key(n))).collect();
+                let swap = |reference_name: &str| -> Vec<Edit> {
+                    present.iter().map(|n| Edit { component: Component::Difference { name: n.clone(), reference: reference_name.to_string(), components: None }, alpha: 0.0 }).collect()
+                };
+                // The reference with the group's operators set to the model's, and the model with the reference's.
+                let gained = y(&self.logits_at(reference, sequences, &last, &Intervention { edits: swap(model), patches: vec![] })?.0)?;
+                let kept = y(&self.logits_at(model, sequences, &last, &Intervention { edits: swap(reference), patches: vec![] })?.0)?;
+                let reproduced: Vec<f64> = gained.iter().zip(&y_reference).map(|(g, b)| g - b).collect();
+                let removed: Vec<f64> = y_model.iter().zip(&kept).map(|(m, k)| m - k).collect();
+                rows.push(json!({"site": label, "kind": "weights", "reference_gains_nats": mean(&reproduced), "model_loses_nats": mean(&removed)}));
+            }
+        }
+        Ok(json!({
+            "targets": targets, "model_log_probability": y_model, "reference_log_probability": y_reference,
+            "mean_gap_nats": mean(&gap), "swaps": rows,
+        }))
+    }
+
+    fn scan(&mut self, model: &str, reference: &str, sequences: &[Vec<u32>], top: usize) -> Result<Value, String> {
+        let mut found: Vec<(f64, usize, usize, Vec<(usize, f64)>, Vec<(usize, f64)>)> = Vec::new();
+        let (mut total, mut count) = (0.0, 0usize);
+        for (s, tokens) in sequences.iter().enumerate() {
+            let one = std::slice::from_ref(tokens);
+            let positions = vec![(0..tokens.len()).collect::<Vec<_>>()];
+            let a = self.logits_at(model, one, &positions, &Intervention::default())?.0;
+            let b = self.logits_at(reference, one, &positions, &Intervention::default())?.0;
+            for (p, (ra, rb)) in a[0].iter().zip(&b[0]).enumerate() {
+                let kl = categorical_kl_from_logits(&ra.to_vec(), &rb.to_vec()).map_err(|e| format!("{e:?}"))?;
+                total += kl;
+                count += 1;
+                if found.len() < top || kl > found.last().map_or(f64::NEG_INFINITY, |f| f.0) {
+                    let (_, ta) = top_log_probabilities(ra.view(), 3)?;
+                    let (_, tb) = top_log_probabilities(rb.view(), 3)?;
+                    found.push((kl, s, p, ta, tb));
+                    found.sort_by(|x, y| y.0.total_cmp(&x.0));
+                    found.truncate(top);
+                }
+            }
+        }
+        Ok(json!({
+            "mean_kl_nats_per_token": total / count.max(1) as f64, "tokens": count,
+            "largest": found.iter().map(|(kl, s, p, ta, tb)| json!({"kl_nats": kl, "sequence": s, "position": p, "model_top": ta, "reference_top": tb})).collect::<Vec<_>>(),
+        }))
+    }
+}
+
+impl Session {
+    fn activations(&mut self, model: &str, site: &Site, sequences: &[Vec<u32>], coordinate: Option<usize>, direction: Option<&[f64]>, top: usize) -> Result<Value, String> {
+        let direction = direction.map(unit).transpose()?;
+        let node = self.model(model)?.node(site)?;
+        let program = self.model(model)?.program.clone();
+        let mut found: Vec<(f64, usize, usize)> = Vec::new();
+        let (mut total, mut squares, mut count) = (0.0, 0.0, 0usize);
+        for (s, tokens) in sequences.iter().enumerate() {
+            let (values, _) = self.execute(model, &program, std::slice::from_ref(tokens), &[], &[])?;
+            for (p, row) in values[node].outer_iter().enumerate() {
+                let v = match (coordinate, &direction) {
+                    (Some(c), None) => *row.get(c).ok_or_else(|| format!("coordinate {c} of {}", row.len()))?,
+                    (None, Some(d)) if d.len() == row.len() => row.dot(d),
+                    (None, Some(d)) => return Err(format!("a direction of {} at a site of {}", d.len(), row.len())),
+                    (None, None) => row.dot(&row).sqrt(),
+                    (Some(_), Some(_)) => return Err("a coordinate or a direction, not both".into()),
+                };
+                total += v;
+                squares += v * v;
+                count += 1;
+                if found.len() < top || v > found.last().map_or(f64::NEG_INFINITY, |f| f.0) {
+                    found.push((v, s, p));
+                    found.sort_by(|x, y| y.0.total_cmp(&x.0));
+                    found.truncate(top);
+                }
+            }
+        }
+        let mean = total / count.max(1) as f64;
+        Ok(json!({
+            "mean": mean, "standard_deviation": (squares / count.max(1) as f64 - mean * mean).max(0.0).sqrt(), "tokens": count,
+            "largest": found.iter().map(|(v, s, p)| json!({"value": v, "sequence": s, "position": p})).collect::<Vec<_>>(),
+        }))
+    }
+
+    fn context_scan(&mut self, model: &str, sequences: &[Vec<u32>], keep: usize, top: usize) -> Result<Value, String> {
+        if keep == 0 {
+            return Err("keep at least one token".into());
+        }
+        let mut found: Vec<(f64, usize, usize, Vec<(usize, f64)>, Vec<(usize, f64)>)> = Vec::new();
+        let (mut total, mut count) = (0.0, 0usize);
+        for (s, tokens) in sequences.iter().enumerate() {
+            if tokens.len() <= keep {
+                continue;
+            }
+            let all = vec![(0..tokens.len()).collect::<Vec<_>>()];
+            let full = self.logits_at(model, std::slice::from_ref(tokens), &all, &Intervention::default())?.0;
+            let windows: Vec<Vec<u32>> = (keep..tokens.len()).map(|p| tokens[p + 1 - keep..=p].to_vec()).collect();
+            let last: Vec<Vec<usize>> = windows.iter().map(|_| vec![keep - 1]).collect();
+            let truncated = self.logits_at(model, &windows, &last, &Intervention::default())?.0;
+            for (i, p) in (keep..tokens.len()).enumerate() {
+                let (rf, rt) = (&full[0][p], &truncated[i][0]);
+                let kl = categorical_kl_from_logits(&rf.to_vec(), &rt.to_vec()).map_err(|e| format!("{e:?}"))?;
+                total += kl;
+                count += 1;
+                if found.len() < top || kl > found.last().map_or(f64::NEG_INFINITY, |f| f.0) {
+                    let (_, tf) = top_log_probabilities(rf.view(), 3)?;
+                    let (_, tt) = top_log_probabilities(rt.view(), 3)?;
+                    found.push((kl, s, p, tf, tt));
+                    found.sort_by(|x, y| y.0.total_cmp(&x.0));
+                    found.truncate(top);
+                }
+            }
+        }
+        Ok(json!({
+            "mean_kl_nats_per_token": total / count.max(1) as f64, "tokens": count,
+            "largest": found.iter().map(|(kl, s, p, tf, tt)| json!({"kl_nats": kl, "sequence": s, "position": p, "full_top": tf, "truncated_top": tt})).collect::<Vec<_>>(),
+        }))
+    }
+}
+
+fn apply(r: &Resolved, value: &mut Array2<f64>) -> Result<(), String> {
+    let width = value.ncols();
+    for (i, row) in r.rows.iter().enumerate() {
+        let current = value.row(*row).to_owned();
+        let target = match (&r.kind, &r.targets[i]) {
+            (Local::Zero, _) => Array1::zeros(width),
+            (Local::Fixed, Some(t)) => t.clone(),
+            (Local::Scale(f), _) => &current * *f,
+            (Local::Add(a), _) => &current + a,
+            (Local::Fixed, None) => return Err("a fixed patch without a value".into()),
+        };
+        if target.len() != width {
+            return Err(format!("a patch value of {} coordinates at a site of {width}", target.len()));
+        }
+        let mut next = current.clone();
+        match (&r.direction, &r.coordinates) {
+            (Some(d), None) if d.len() == width => {
+                let along = (&target - &current).dot(d);
+                next.scaled_add(along, d);
+            }
+            (Some(d), None) => return Err(format!("a direction of {} coordinates at a site of {width}", d.len())),
+            (None, Some(list)) => {
+                for c in list {
+                    if *c >= width {
+                        return Err(format!("coordinate {c} of {width}"));
+                    }
+                    next[*c] = target[*c];
+                }
+            }
+            (None, None) => next = target,
+            (Some(_), Some(_)) => return Err("a patch takes coordinates or a direction, not both".into()),
+        }
+        value.row_mut(*row).assign(&next);
+    }
+    Ok(())
+}

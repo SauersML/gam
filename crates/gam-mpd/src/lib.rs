@@ -121,6 +121,8 @@ mod interchange_tests;
 /// Declared rank-one native down-weight perturbations as a full augmented program.
 pub mod down_edit_family;
 pub mod native_parameter_edit;
+/// Measured interventions on native models for an investigator (#2951).
+pub mod oracle;
 
 /// Exact native primitive-unary capacity-control initialization.
 pub mod native_mlp_initialization;
