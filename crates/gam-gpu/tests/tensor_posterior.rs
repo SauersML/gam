@@ -9,7 +9,7 @@
 //! A group sum of `n` such terms adds `γ_n` of the summed magnitudes.
 
 use gam_gpu::GpuPolicy;
-use gam_gpu::tensor::{Device, Indices, PosteriorStep, Storage, Tensor, posterior_normal};
+use gam_gpu::tensor::{BF16_TERM_RESOLUTION, Device, Indices, PosteriorStep, Storage, Tensor, TermLayout, posterior_normal};
 use ndarray::Array2;
 
 const U: f64 = 1.0 / 16_777_216.0;
@@ -272,4 +272,81 @@ fn cuda_bfloat16_momentum_is_the_f32_step_rounded() {
         // A bfloat16 copy widens back to the values it holds.
         assert_eq!(down(&fit.convert(&momentum).expect("widen")), down(&momentum));
     }
+}
+
+/// A posterior whose rows need 1, 2 and 3 bfloat16 terms (row r has `σ = 2^-(8r+2) |μ|`, so
+/// `u_{r+1} |μ| ≤ σ < u_r |μ|` with `u = 2^-8, 2^-16, 2^-24`), and a removed row (`μ = 0`,
+/// `s = −∞`). The means are bfloat16 values.
+fn term_case() -> (Array2<f64>, Array2<f64>) {
+    let mean = matrix(4, 24, 11, 1.0, 0.0).mapv(|m| bf16(if m.abs() < 0.05 { 0.5 } else { m }));
+    let mut log_sd = Array2::zeros(mean.dim());
+    for ((r, c), s) in log_sd.indexed_iter_mut() {
+        *s = if r == 3 { f64::NEG_INFINITY } else { (mean[(r, c)].abs() * 2f64.powi(-(8 * r as i32 + 2))).ln() };
+    }
+    let mean = Array2::from_shape_fn(mean.dim(), |(r, c)| if r == 3 { 0.0 } else { mean[(r, c)] });
+    (mean, log_sd)
+}
+
+/// The sum of a sample's terms, per entry, from `Separate` tensors.
+fn term_sum(d: &Device, terms: &[Tensor]) -> Array2<f64> {
+    terms.iter().map(|t| d.download(t).unwrap()).fold(None, |acc: Option<Array2<f64>>, t| Some(acc.map_or(t.clone(), |a| a + t))).unwrap()
+}
+
+/// Checks a device's terms: their count, each term a bfloat16 value, the stacked layout the
+/// separate one side by side, and the sum within `u_K |θ|` of the f32 sample `theta`.
+fn check_terms(d: &Device, (m, s): (&Array2<f64>, &Array2<f64>), theta: &Array2<f64>, rows_need: &[usize]) {
+    for (r, need) in rows_need.iter().enumerate() {
+        let row = |a: &Array2<f64>| d.upload(a.slice(ndarray::s![r..r + 1, ..])).unwrap();
+        assert_eq!(d.term_count((&row(m), &row(s))).unwrap(), *need, "row {r}");
+    }
+    let (mean, log_sd) = (&d.upload(m.view()).unwrap(), &d.upload(s.view()).unwrap());
+    assert_eq!(d.term_count((mean, log_sd)).unwrap(), 3);
+    for count in 1..=3 {
+        let separate = d.sample_terms((mean, log_sd), (7, 3), count, TermLayout::Separate).unwrap();
+        let stacked = d.sample_terms((mean, log_sd), (7, 3), count, TermLayout::Stacked).unwrap();
+        assert_eq!((separate.len(), stacked.len()), (count, 1));
+        let side = d.download(&stacked[0]).unwrap();
+        let cols = theta.ncols();
+        for (k, term) in separate.iter().enumerate() {
+            let values = d.download(term).unwrap();
+            assert!(values.iter().all(|v| bf16(*v) == *v), "term {k} holds bfloat16 values");
+            assert_eq!(side.slice(ndarray::s![.., k * cols..(k + 1) * cols]), values, "stacked term {k}");
+        }
+        let sum = term_sum(d, &separate);
+        let u = BF16_TERM_RESOLUTION[count - 1];
+        for ((at, a), b) in sum.indexed_iter().zip(theta.iter()) {
+            assert!((a - b).abs() <= u * b.abs(), "{count} terms at {at:?}: {a} against {b}");
+        }
+    }
+}
+
+#[test]
+fn the_host_writes_a_sample_as_bfloat16_terms_that_keep_its_noise() {
+    let host = Device::host();
+    let (m, s) = term_case();
+    let theta = Array2::from_shape_fn(m.dim(), |(r, c)| {
+        let i = (r * m.ncols() + c) as u64;
+        f64::from((m[(r, c)] + s[(r, c)].exp() * f64::from(posterior_normal(7, 3, i))) as f32)
+    });
+    check_terms(&host, (&m, &s), &theta, &[1, 2, 3, 1]);
+    // One bfloat16 loses the noise of a row that needs three: noise below half a bfloat16 step of
+    // a bfloat16 mean rounds back to the mean, while three terms keep it.
+    let (mean, log_sd) = (host.upload(m.view()).unwrap(), host.upload(s.view()).unwrap());
+    let one = host.download(&host.sample_terms((&mean, &log_sd), (7, 3), 1, TermLayout::Separate).unwrap()[0]).unwrap();
+    assert!(one.row(2).iter().zip(m.row(2)).all(|(t, mu)| t == mu), "the noise vanishes in one bfloat16");
+    let three = term_sum(&host, &host.sample_terms((&mean, &log_sd), (7, 3), 3, TermLayout::Separate).unwrap());
+    // (An f32 sample keeps noise above half an f32 step, 2^-24 |μ|: all but a draw |ε| < 2^-6.)
+    let kept = three.row(2).iter().zip(m.row(2)).filter(|(t, mu)| t != mu).count();
+    assert!(kept >= 20, "three terms keep the noise of {kept} of 24 entries");
+}
+
+#[test]
+fn cuda_bfloat16_terms_match_its_f32_sample() {
+    let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") else { return };
+    let fit = wide.with_storage(Storage::F32).expect("CUDA holds f32");
+    let (m, s) = term_case();
+    let (mean, log_sd) = (fit.upload(m.view()).unwrap(), fit.upload(s.view()).unwrap());
+    let mut single = fit.zeros(m.nrows(), m.ncols()).unwrap();
+    fit.reparameterize(&mut single, (&mean, &log_sd), (7, 3)).unwrap();
+    check_terms(&fit, (&m, &s), &fit.download(&single).unwrap(), &[1, 2, 3, 1]);
 }

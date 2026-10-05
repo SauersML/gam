@@ -1994,6 +1994,69 @@ impl Device {
         }
     }
 
+    /// How many bfloat16 terms resolve the posterior's noise: the least `K` in `1..=3` with
+    /// `u_K |μ_j| ≤ σ_j` for every entry `j` (`u_K` = [`BF16_TERM_RESOLUTION`]`[K − 1]`, the
+    /// relative error of a sum of `K` successive bfloat16 roundings), so that the sample `θ = μ +
+    /// σ ε` written as `K` terms ([`Device::sample_terms`]) keeps every entry's noise; 3 terms
+    /// resolve an f32 sample. A removed entry (`μ = 0`, `s = −∞`) needs one.
+    pub fn term_count(&self, (mean, log_sd): (&Tensor, &Tensor)) -> Result<usize, GpuError> {
+        same(mean, log_sd, "term count")?;
+        match &*self.backend {
+            Backend::Host => Ok(host(mean)?.iter().zip(host(log_sd)?).map(|(m, s)| terms_needed(*m, *s)).fold(1, usize::max)),
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.term_count((mean, log_sd)),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the Apple GPU holds no bfloat16 terms".to_string() }),
+        }
+    }
+
+    /// The weight sample `θ = μ + exp(s) ε` (`ε` = [`posterior_normal`]`(key, stream, i)`, as
+    /// [`Device::reparameterize`] draws it), formed in f32 and written as `count` bfloat16 terms
+    /// `T_1, …, T_count`, each the nearest bfloat16 of what the earlier ones leave of `θ`, so
+    /// `|θ − Σ T_k| ≤ u_count |θ|` ([`BF16_TERM_RESOLUTION`]): a product of `x` with the operator
+    /// reads every term (`Σ_k x T_kᵀ`) and the sample keeps the noise one bfloat16 would round
+    /// away. `layout` places them: [`TermLayout::Stacked`] one `rows × (count · cols)` tensor
+    /// `[T_1 | … | T_count]` (the terms side by side along the reduction axis, for one product
+    /// against `[x | … | x]`), [`TermLayout::Separate`] `count` tensors of `rows × cols`. CUDA
+    /// writes bfloat16 tensors from f32 masters; the host writes float64 tensors holding the same
+    /// bfloat16 values (its reference). `count` is in `1..=3`.
+    pub fn sample_terms(&self, (mean, log_sd): (&Tensor, &Tensor), (key, stream): (u64, u64), count: usize, layout: TermLayout) -> Result<Vec<Tensor>, GpuError> {
+        same(mean, log_sd, "sampled terms")?;
+        if !(1..=3).contains(&count) {
+            return Err(shape(format!("{count} bfloat16 terms, not 1 to 3")));
+        }
+        let (rows, cols) = mean.dim();
+        match &*self.backend {
+            Backend::Host => {
+                let (mv, sv) = (host(mean)?, host(log_sd)?);
+                let mut terms = vec![vec![0.0; rows * cols]; count];
+                for i in 0..rows * cols {
+                    let theta = (mv[i] + sv[i].exp() * f64::from(posterior_normal(key, stream, i as u64))) as f32;
+                    for (k, value) in bf16_terms(theta, count).into_iter().enumerate() {
+                        terms[k][i] = value;
+                    }
+                }
+                Ok(match layout {
+                    TermLayout::Separate => terms.into_iter().map(|values| Tensor { rows, cols, data: Data::Host(values) }).collect(),
+                    TermLayout::Stacked => {
+                        let mut stacked = vec![0.0; rows * cols * count];
+                        for r in 0..rows {
+                            for (k, values) in terms.iter().enumerate() {
+                                let at = r * cols * count + k * cols;
+                                stacked[at..at + cols].copy_from_slice(&values[r * cols..(r + 1) * cols]);
+                            }
+                        }
+                        vec![Tensor { rows, cols: cols * count, data: Data::Host(stacked) }]
+                    }
+                })
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.sample_terms((mean, log_sd), (key, stream), count, layout),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the Apple GPU holds no bfloat16 terms".to_string() }),
+        }
+    }
+
     /// One step of the improved variational online Newton method (IVON; Shen et al., ICML 2024,
     /// arXiv 2402.17641, Algorithm 1) on the factorized Gaussian posterior `N(μ, exp(s)²)` whose
     /// sample [`Device::reparameterize`] drew under the same `(key, stream)`, and each entry's new
@@ -2851,6 +2914,39 @@ fn philox(key: u64, stream: u64, index: u64) -> [u32; 4] {
 /// [`philox`], `√(−2 ln u₁) cos(2π u₂)` with `u₁ = (w₀ + ½) 2⁻³²` and `u₂ = w₁ 2⁻³²`. Every backend
 /// computes it alike (up to its f32 `log` and `cos`), so a draw is regenerated from its counter.
 #[must_use]
+/// Where [`Device::sample_terms`] places a sample's bfloat16 terms.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TermLayout {
+    /// One `rows × (count · cols)` tensor, the terms side by side along the reduction axis.
+    Stacked,
+    /// One `rows × cols` tensor per term.
+    Separate,
+}
+
+/// The relative error `u_K` of a value written as `K` successive bfloat16 roundings (each the
+/// nearest bfloat16 of what the earlier ones leave): bfloat16's unit roundoff `2^-8` per term,
+/// `2^-8`, `2^-16`, `2^-24` (the last f32's own).
+pub const BF16_TERM_RESOLUTION: [f64; 3] = [1.0 / 256.0, 1.0 / 65_536.0, 1.0 / 16_777_216.0];
+
+/// The least number of bfloat16 terms with `u_K |μ| ≤ σ` (`σ = exp(s)`), 3 at most.
+fn terms_needed(mean: f64, log_sd: f64) -> usize {
+    let sd = log_sd.exp();
+    BF16_TERM_RESOLUTION.iter().position(|u| u * mean.abs() <= sd).map_or(3, |k| k + 1)
+}
+
+/// `x` as `count` bfloat16 terms, each the nearest bfloat16 (ties to even) of what the earlier
+/// ones leave, in f32, as float64 values.
+fn bf16_terms(x: f32, count: usize) -> Vec<f64> {
+    let mut rest = x;
+    (0..count)
+        .map(|_| {
+            let term = f32::from_bits(bf16_bits(rest) << 16);
+            rest -= term;
+            f64::from(term)
+        })
+        .collect()
+}
+
 pub fn posterior_normal(key: u64, stream: u64, index: u64) -> f32 {
     let w = philox(key, stream, index);
     let scale = 2.328_306_4e-10_f32;
@@ -3584,6 +3680,34 @@ __device__ unsigned short bf16_round(float x) {
 // read without rounding it again.
 extern "C" __global__ void reparameterize_bf16(u64 n, u64 key, u64 stream, const float* mean, const float* log_sd, unsigned short* theta) {
     GRID_STRIDE(i, n) theta[i] = bf16_round(mean[i] + expf(log_sd[i]) * posterior_normal(key, stream, i));
+}
+
+// The f32 sample as `count` bfloat16 terms, each the nearest bfloat16 of what the earlier ones
+// leave (`Device::sample_terms`). Term k of entry i (row r, column c) goes to
+// `out_k[r * row + k * along + c]`: one stacked tensor (`row = count * cols`, `along = cols`, every
+// `out_k` the same buffer) or `count` separate ones (`row = cols`, `along = 0`).
+extern "C" __global__ void sample_terms(u64 n, u64 key, u64 stream, unsigned int count, u64 cols, u64 row, u64 along,
+    const float* mean, const float* log_sd, unsigned short* out0, unsigned short* out1, unsigned short* out2) {
+    GRID_STRIDE(i, n) {
+        float rest = mean[i] + expf(log_sd[i]) * posterior_normal(key, stream, i);
+        u64 at = (i / cols) * row + (i % cols);
+        unsigned short* outs[3] = {out0, out1, out2};
+        for (unsigned int k = 0; k < count; ++k) {
+            unsigned short t = bf16_round(rest);
+            rest -= __uint_as_float(((unsigned int)t) << 16);
+            outs[k][at + k * along] = t;
+        }
+    }
+}
+
+// The bfloat16 terms the noise needs (`Device::term_count`): over the entries, the largest least
+// K with u_K |mu| <= sigma (u_K = 2^-8, 2^-16; 3 otherwise), into `needed`.
+extern "C" __global__ void term_count(u64 n, const float* mean, const float* log_sd, unsigned int* needed) {
+    GRID_STRIDE(i, n) {
+        float m = fabsf(mean[i]), sd = expf(log_sd[i]);
+        unsigned int k = sd >= ldexpf(m, -8) ? 1u : (sd >= ldexpf(m, -16) ? 2u : 3u);
+        atomicMax(needed, k);
+    }
 }
 
 // Adds a live entry's (1, μ² + σ², 2s) to its group's row of `sums`: once per warp when every live
@@ -5706,6 +5830,47 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             }
             .gpu_ctx("tensor reparameterize")
             .map(|_| ())
+        }
+
+        pub(super) fn sample_terms(&self, (mean, log_sd): (&Tensor, &Tensor), (key, stream): (u64, u64), count: usize, layout: super::TermLayout) -> Result<Vec<Tensor>, GpuError> {
+            let ((rows, cols), n) = (mean.dim(), mean.len() as u64);
+            let (count32, cols64) = (count as u32, cols as u64);
+            let (mut outs, row, along): (Vec<CudaSlice<u16>>, u64, u64) = match layout {
+                super::TermLayout::Stacked => (vec![self.zeros16(rows * cols * count)?], cols64 * count as u64, cols64),
+                super::TermLayout::Separate => ((0..count).map(|_| self.zeros16(rows * cols)).collect::<Result<_, _>>()?, cols64, 0),
+            };
+            if n > 0 {
+                let f = self.function("sample_terms")?;
+                let mut builder = self.stream.launch_builder(&f);
+                builder.arg(&n).arg(&key).arg(&stream).arg(&count32).arg(&cols64).arg(&row).arg(&along).input(mean, Storage::F32)?.input(log_sd, Storage::F32)?;
+                // The three output pointers: the stacked buffer three times, or each term's (an
+                // unused one repeats the first; the kernel writes only `count` of them).
+                match &mut outs[..] {
+                    [first] => builder.arg(&*first).arg(&*first).arg(&*first),
+                    [first, second] => builder.arg(&*first).arg(&*second).arg(&*first),
+                    [first, second, third] => builder.arg(&*first).arg(&*second).arg(&*third),
+                    _ => return Err(shape("1 to 3 bfloat16 term buffers".to_string())),
+                };
+                // SAFETY: f32 means and log sds of n entries; each output holds every entry its
+                // strides reach (rows × count·cols stacked, rows × cols separate).
+                unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("tensor sample_terms")?;
+            }
+            Ok(match layout {
+                super::TermLayout::Stacked => outs.into_iter().map(|s| Tensor { rows, cols: cols * count, data: Data::CudaBf16(s) }).collect(),
+                super::TermLayout::Separate => outs.into_iter().map(|s| Tensor { rows, cols, data: Data::CudaBf16(s) }).collect(),
+            })
+        }
+
+        pub(super) fn term_count(&self, (mean, log_sd): (&Tensor, &Tensor)) -> Result<usize, GpuError> {
+            let n = mean.len() as u64;
+            let mut needed = self.stream.alloc_zeros::<u32>(1).gpu_ctx("tensor term count")?;
+            if n > 0 {
+                let f = self.function("term_count")?;
+                // SAFETY: f32 means and log sds of n entries; one u32 maximum.
+                unsafe { self.stream.launch_builder(&f).arg(&n).input(mean, Storage::F32)?.input(log_sd, Storage::F32)?.arg(&mut needed).launch(cfg_elements(n)) }.gpu_ctx("tensor term_count")?;
+            }
+            let found = self.stream.clone_dtoh(&needed).gpu_ctx("tensor term count read")?;
+            Ok(found.first().map_or(1, |k| (*k as usize).max(1)))
         }
 
         pub(super) fn posterior_ivon(
