@@ -221,20 +221,22 @@ def softmax(lp) -> np.ndarray:
 
 
 def bootstrap(per_organism: list[np.ndarray], rng: np.random.Generator) -> tuple[float, float, float]:
-    """Mean over organisms of item means, and its two-level bootstrap 95% interval."""
+    """Mean over organisms of item means, and its two-level bootstrap 95% interval: each resample draws
+    organisms with replacement and, for every drawn slot, that organism's items with replacement."""
     groups = [g for g in per_organism if len(g)]
     if not groups:
         return float("nan"), float("nan"), float("nan")
     point = float(np.mean([g.mean() for g in groups]))
-    stats = np.empty(RESAMPLES)
-    for b in range(RESAMPLES):
-        chosen = rng.integers(0, len(groups), len(groups))
-        stats[b] = np.mean([groups[o][rng.integers(0, len(groups[o]), len(groups[o]))].mean() for o in chosen])
-    lo, hi = np.percentile(stats, [2.5, 97.5])
+    slots = rng.integers(0, len(groups), (RESAMPLES, len(groups)))
+    means = np.empty(slots.shape)
+    for o, g in enumerate(groups):
+        picked = slots == o
+        means[picked] = g[rng.integers(0, len(g), (int(picked.sum()), len(g)))].mean(1)
+    lo, hi = np.percentile(means.mean(1), [2.5, 97.5])
     return point, float(lo), float(hi)
 
 
-def analyze(run: Path, read_path: Path, reader_model: str):
+def analyze(run: Path, read_path: Path):
     from reader import log_score
 
     results = {r["id"]: r for r in read_jsonl(read_path)}
@@ -249,16 +251,22 @@ def analyze(run: Path, read_path: Path, reader_model: str):
         p = [softmax(u["logprobs"]) for u in updated]
         base = [it.get("base_choice") for it in drawn]
         changed = np.array([u["choice"] != b for u, b in zip(updated, base)]) if all(b is not None for b in base) else None
-        score = {}
+        score, hit = {}, {}
+        chosen = np.array([u["choice"] for u in updated])
         for condition, documents in conditions(run, organism):
-            score[condition] = np.array([log_score(p[i], results[f"{organism}|{i}|{condition}"]["q"]) for i in range(len(drawn))])
+            qs = [results[f"{organism}|{i}|{condition}"]["q"] for i in range(len(drawn))]
+            score[condition] = np.array([log_score(p[i], q) for i, q in enumerate(qs)])
+            hit[condition] = np.array([float(np.argmax(q) == c) for q, c in zip(qs, chosen)])
         for r in rows:
             arm = r["arm"]
             ablated_keys = [c for c in score if c.startswith(f"ablated:{arm}:")]
             ablated = np.mean([score[c] for c in ablated_keys], axis=0) if ablated_keys else None
             uplift = score[f"report:{arm}"] - score["none"]
-            entry = per.setdefault((r["set"], arm), {"uplift": [], "ablated": [], "relation": [], "changed": [], "organisms": []})
+            entry = per.setdefault((r["set"], arm), {"uplift": [], "ablated": [], "relation": [], "accuracy_gain": [], "accuracy_rule": [], "accuracy_alone": [], "changed": [], "organisms": []})
             entry["uplift"].append(uplift)
+            entry["accuracy_gain"].append(hit[f"report:{arm}"] - hit["none"])
+            entry["accuracy_rule"].append(hit[f"report:{arm}"])
+            entry["accuracy_alone"].append(hit["none"])
             entry["ablated"].append(ablated - score["none"] if ablated is not None else np.array([]))
             entry["relation"].append(score[f"report:{arm}"] - ablated if ablated is not None else np.array([]))
             entry["changed"].append(changed)
@@ -276,7 +284,7 @@ def analyze(run: Path, read_path: Path, reader_model: str):
                     for i, it in enumerate(drawn)
                 ]
                 E.attach_tests(episode, tests_)
-            reader = {"backend": "vllm", "model": reader_model, "seed": 0, "rotations": "all K cyclic rotations"}
+            reader = results[f"{organism}|0|none"]["reader"]
             for condition in ["none", f"report:{arm}", *ablated_keys]:
                 key = f"{reader['backend']}:{reader['model']}:{condition}"
                 episode["scores"][key] = {
@@ -287,7 +295,7 @@ def analyze(run: Path, read_path: Path, reader_model: str):
             E.save(episode)
     for (set_, arm), entry in sorted(per.items()):
         row = {"set": set_, "arm": arm, "organisms": entry["organisms"], "items": int(sum(len(u) for u in entry["uplift"]))}
-        for name in ("uplift", "ablated", "relation"):
+        for name in ("uplift", "ablated", "relation", "accuracy_gain", "accuracy_rule", "accuracy_alone"):
             values = entry[name]
             strata = [("all", lambda c, n: np.ones(n, dtype=bool))]
             if all(c is not None for c in entry["changed"]):
@@ -298,8 +306,9 @@ def analyze(run: Path, read_path: Path, reader_model: str):
                 row[f"{name}_{stratum}"] = {"mean_nats": mean, "ci95": [lo, hi]}
         if all(c is not None for c in entry["changed"]):
             row["changed_items"] = int(sum(c.sum() for c in entry["changed"]))
+        row["per_organism"] = {o: {"uplift_nats": float(u.mean()), "accuracy_rule": float(a.mean()), "accuracy_alone": float(n.mean())} for o, u, a, n in zip(entry["organisms"], entry["uplift"], entry["accuracy_rule"], entry["accuracy_alone"])}
         table.append(row)
-    summary = {"run": run.name, "reader": reader_model, "score": "sum_k p_k ln q_k, nats per item", "resamples": RESAMPLES, "table": table}
+    summary = {"run": run.name, "reader": next(iter(results.values()))["reader"], "score": "sum_k p_k ln q_k, nats per item; accuracy: the reader's most probable reply is the updated model's choice", "resamples": RESAMPLES, "table": table}
     (run / "uplift.json").write_text(json.dumps(summary, indent=1))
     figure(run, table)
     for row in table:
@@ -370,7 +379,6 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--command", dest="item_command", help="items: a shell command with {organism} {count} {seed} {out}")
     ap.add_argument("--read", help="analyze: the reader's output (default RUN/read.jsonl)")
-    ap.add_argument("--reader-model", default="Qwen/Qwen3-8B")
     args = ap.parse_args()
     run = run_dir(args.run)
     if args.command == "stage":
@@ -384,7 +392,7 @@ def main():
     elif args.command == "tests":
         tests(run)
     elif args.command == "analyze":
-        analyze(run, Path(args.read) if args.read else run / "read.jsonl", args.reader_model)
+        analyze(run, Path(args.read) if args.read else run / "read.jsonl")
     elif args.command == "calibration":
         calibration(run, args.count, args.seed)
 
