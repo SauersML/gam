@@ -1,0 +1,474 @@
+#!/usr/bin/env bash
+# Run a command on one rented RunPod GPU (#2951), billed to the MATS team account.
+#
+#   rp-run NAME GPU_TYPE HOURS -- COMMAND...
+#
+# GPU_TYPE is a RunPod GPU id ("NVIDIA RTX A5000") or its display name ("RTX A5000"). The pod is
+# rented on community cloud, or on secure cloud when community has none, runs COMMAND on the source
+# of a published commit, sends the outputs back and is deleted. HOURS (fractional) caps the pod's
+# life twice: the Mac deletes it HOURS after creation (a watcher process that outlives this one),
+# and the pod deletes itself HOURS after its container starts (runpodctl with the pod's own key),
+# so a Mac that sleeps, disconnects or dies still stops the bill.
+#
+# Source: `git archive` of origin/main, or of RP_REF=<commit> when it is published: the Rust
+# workspace (crates/, the manifests, the toolchain pin) and every /Users/user/gam/... path COMMAND
+# names, unpacked at /workspace/src, the command's working directory.
+#
+# Paths are translated as mats-run translates them:
+#   target/release/examples/X, /Users/user/gam/target/release/examples/X and
+#   `cargo run ... --example X -- ARGS`  -> the pod's X, built at the commit by
+#       `cargo build --release -p PACKAGE --example X` (no target-cpu flags: the pod's CPU is
+#       unknown), or taken from ~/mpd-data/runpod/_bin/ when the same Rust sources built it before;
+#   /Users/user/gam/...       -> /workspace/src/...;
+#   /Users/user/mpd-data/...  -> /workspace/mpd-data/...; every existing input COMMAND names,
+#       outside mpd-data/runpod/, is uploaded first, symlinks as the files they name;
+#   ~/.cache/huggingface/hub/models--ORG--NAME/snapshots/REV[/...] -> /workspace/hf/ORG/NAME/REV[/...],
+#       fetched on the pod from huggingface.co at REV (public models; nothing is uploaded);
+#   python, python3, the Mac venv's python -> the pod's python3.
+# Other cargo commands (`cargo test -p gam-gpu ...`) run as given in /workspace/src.
+# RP_EXAMPLES="X Y" builds further examples for a script that runs them through $MPD_BIN;
+# RP_ENV="K=V ..." adds environment (RUST_LOG is forwarded when set).
+#
+# Write outputs under /Users/user/mpd-data/runpod/NAME/. They come back there, beside run.log
+# (the command's output, streamed while it runs), pod.json (the pod) and cost.txt.
+#
+# Money. The API key is read from the macOS Keychain (service runpod-api-key) at each request and
+# handed to curl on a file descriptor: never in argv, the environment, a file or a log. Each run
+# appends (date, name, gpu, cloud, hours, dollars, pod) to ~/mpd-data/runpod/LEDGER.tsv, dollars =
+# the pod's price per hour x hours from creation to deletion. A run whose estimate (price x HOURS)
+# would take the ledger plus the estimates of runs in progress above $150 is refused unless
+# RP_ALLOW_OVER=1. One pod at a time unless RP_PARALLEL=1. After deleting its pod the runner checks
+# through the API that the pod is gone and lists any other pod it created that remains.
+#
+# SSH uses a key made for the run (deleted with the pod); ~/.ssh/runpod_ed25519.pub is also
+# authorized, for a look by hand. RP_DRY=1 prints the translation, uploads, builds, estimate and
+# the pod request, and creates nothing.
+set -Eeuo pipefail
+REST=https://rest.runpod.io/v1 GRAPHQL=https://api.runpod.io/graphql
+SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
+MAC_GAM=/Users/user/gam MAC_DATA=/Users/user/mpd-data HF_HUB=/Users/user/.cache/huggingface/hub
+RP=$MAC_DATA/runpod LEDGER=$MAC_DATA/runpod/LEDGER.tsv ACTIVE=$MAC_DATA/runpod/active
+# CUDA 12.4 devel: NVRTC and the CUDA libraries the device code loads at run time.
+IMAGE=runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+# Host drivers that run what a 12.4 NVRTC compiles.
+CUDA_OK='["12.4","12.5","12.6","12.7","12.8","12.9","13.0"]'
+CAP_DOLLARS=150
+mkdir -p "$RP" "$ACTIVE"
+
+# A RunPod API request: METHOD URL [JSON]. Prints the body, then the HTTP status on its own line.
+api() {
+    local args=(-sS -X "$1" --max-time 60 -w '\n%{http_code}' -H 'Content-Type: application/json')
+    [ -n "${3:-}" ] && args+=(--data-binary "$3")
+    curl "${args[@]}" -H @<(printf 'Authorization: Bearer %s\n' "$(security find-generic-password -s runpod-api-key -w)") "$2" || printf '\n000'
+}
+status_of() { printf '%s' "${1##*$'\n'}"; }
+body_of() { printf '%s' "${1%$'\n'*}"; }
+gql() { api POST "$GRAPHQL" "$(jq -nc --arg q "$1" '{query: $q}')"; }
+
+# Delete POD (recorded in active/POD), confirm through the API that it is gone, and enter its
+# cost in the ledger once. Safe to run twice at once (the run's exit and its watcher).
+reap() {
+    local pod=$1 rec=$ACTIVE/$1 r code tries=0 gone=0
+    [ -f "$rec" ] || return 0
+    local name gpu cloud price created ended
+    read -r name gpu cloud price created _ < "$rec"
+    gpu=${gpu//_/ }
+    while (( tries < 20 )); do
+        r=$(api DELETE "$REST/pods/$pod")
+        code=$(status_of "$r")
+        r=$(api GET "$REST/pods/$pod")
+        code=$(status_of "$r")
+        if [ "$code" = 404 ]; then
+            gone=1
+        elif [ "$code" = 200 ]; then
+            # A deleted pod reads back EXITED with "Terminated by ..." (or TERMINATED), then not at all.
+            jq -e '(.desiredStatus == "TERMINATED") or ((.lastStatusChange // "") | startswith("Terminated"))' <<< "$(body_of "$r")" > /dev/null 2>&1 && gone=1
+        fi
+        if (( gone )); then
+            r=$(api GET "$REST/pods")
+            if [ "$(status_of "$r")" = 200 ] && jq -e --arg p "$pod" 'type == "array" and all(.[]; .id != $p or (.desiredStatus != "RUNNING" and ((.lastStatusChange // "") | startswith("Terminated"))))' <<< "$(body_of "$r")" > /dev/null 2>&1; then
+                break
+            fi
+            gone=0
+        fi
+        tries=$(( tries + 1 ))
+        sleep 6
+    done
+    ended=$(date +%s)
+    if (( ! gone )); then
+        echo "rp-run: POD $pod MAY STILL BE RUNNING: deletion not confirmed after $tries attempts; delete it at https://console.runpod.io/pods" >&2
+        return 1
+    fi
+    # The ledger takes each pod once. A lock older than two minutes is a reaper that died holding it.
+    until mkdir "$RP/.ledger.lock" 2> /dev/null; do
+        (( $(date +%s) - $(stat -f %m "$RP/.ledger.lock" 2> /dev/null || date +%s) > 120 )) && rmdir "$RP/.ledger.lock" 2> /dev/null
+        sleep 1
+    done
+    if [ -f "$rec" ]; then
+        [ -f "$LEDGER" ] || printf 'date\tname\tgpu\tcloud\thours\tdollars\tpod\n' > "$LEDGER"
+        local hours dollars
+        hours=$(awk -v a="$created" -v b="$ended" 'BEGIN { printf "%.4f", (b - a) / 3600 }')
+        dollars=$(awk -v h="$hours" -v p="$price" 'BEGIN { printf "%.4f", h * p }')
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$name" "$gpu" "$cloud" "$hours" "$dollars" "$pod" >> "$LEDGER"
+        local total
+        total=$(awk -F'\t' 'NR > 1 { s += $6 } END { printf "%.2f", s }' "$LEDGER")
+        local line="rp-run: pod $pod deleted (confirmed). $gpu ($cloud) at \$$price/h x $hours h = \$$dollars; ledger total \$$total"
+        echo "$line" >&2
+        [ -d "$RP/$name" ] && echo "$line" > "$RP/$name/cost.txt"
+        rm -f "$rec"
+    fi
+    rmdir "$RP/.ledger.lock"
+}
+
+# The watcher: reaps POD when the run's process ends (any way, SIGKILL included) or at DEADLINE.
+if [ "${1:-}" = --watch ]; then
+    pod=$2 parent=$3 deadline=$4
+    trap '' INT HUP
+    while kill -0 "$parent" 2> /dev/null && (( $(date +%s) < deadline )); do sleep 10; done
+    (( $(date +%s) >= deadline )) && echo "rp-run: $pod reached its HOURS cap; deleting it" >&2
+    reap "$pod"
+    exit
+fi
+
+usage() { sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+[ $# -ge 5 ] && [ "$4" = -- ] || usage
+NAME=$1 GPU=$2 HOURS=$3
+shift 4
+[[ $NAME =~ ^[A-Za-z0-9._-]+$ ]] || { echo "rp-run: NAME must be [A-Za-z0-9._-]+" >&2; exit 2; }
+[[ $HOURS =~ ^[0-9]*\.?[0-9]+$ ]] && awk -v h="$HOURS" 'BEGIN { exit !(h > 0 && h <= 72) }' || { echo "rp-run: HOURS must be in (0, 72]" >&2; exit 2; }
+CAP_SECONDS=$(awk -v h="$HOURS" 'BEGIN { printf "%d", h * 3600 }')
+OUT=$RP/$NAME
+
+# The GPU type and its prices.
+r=$(gql 'query { myself { clientBalance currentSpendPerHr } gpuTypes { id displayName memoryInGb securePrice communityPrice } }')
+[ "$(status_of "$r")" = 200 ] || { echo "rp-run: price query failed: $(body_of "$r" | head -c 300)" >&2; exit 1; }
+prices=$(body_of "$r")
+gpu_row=$(jq -c --arg g "$GPU" '[.data.gpuTypes[] | select(.id == $g or .displayName == $g)][0] // empty' <<< "$prices")
+[ -n "$gpu_row" ] || { echo "rp-run: unknown GPU type '$GPU'; known: $(jq -r '[.data.gpuTypes[].displayName] | join(", ")' <<< "$prices")" >&2; exit 2; }
+GPU_ID=$(jq -r .id <<< "$gpu_row")
+# The estimate takes the dearer cloud: which one has stock is known only at creation.
+PRICE_MAX=$(jq -r '[.securePrice // 0, .communityPrice // 0] | max' <<< "$gpu_row")
+ESTIMATE=$(awk -v p="$PRICE_MAX" -v h="$HOURS" 'BEGIN { printf "%.2f", p * h }')
+spent=$( [ -f "$LEDGER" ] && awk -F'\t' 'NR > 1 { s += $6 } END { printf "%.2f", s }' "$LEDGER" || echo 0)
+running=0
+live=()
+for rec in "$ACTIVE"/*; do
+    [ -f "$rec" ] || continue
+    read -r _ _ _ p c owner est < "$rec" || true
+    if [ -n "${owner:-}" ] && kill -0 "$owner" 2> /dev/null; then
+        live+=("${rec##*/}")
+        running=$(awk -v a="$running" -v b="${est:-0}" 'BEGIN { printf "%.2f", a + b }')
+    else
+        # A run that ended without reaping (its watcher killed too): reap its pod now.
+        echo "rp-run: reaping ${rec##*/}, left by a run that is gone" >&2
+        reap "${rec##*/}" || exit 1
+    fi
+done
+if awk -v s="$spent" -v r="$running" -v e="$ESTIMATE" -v c="$CAP_DOLLARS" 'BEGIN { exit !(s + r + e > c) }' && [ -z "${RP_ALLOW_OVER:-}" ]; then
+    echo "rp-run: ledger \$$spent + running \$$running + this run's \$$ESTIMATE exceeds \$$CAP_DOLLARS; RP_ALLOW_OVER=1 to run anyway" >&2
+    exit 2
+fi
+if [ ${#live[@]} -gt 0 ] && [ -z "${RP_PARALLEL:-}" ]; then
+    echo "rp-run: pod ${live[*]} is running for another rp-run; RP_PARALLEL=1 to run beside it" >&2
+    exit 2
+fi
+
+# The commit.
+git -C "$MAC_GAM" fetch -q origin main
+C=$(git -C "$MAC_GAM" rev-parse "${RP_REF:-origin/main}^{commit}")
+git -C "$MAC_GAM" merge-base --is-ancestor "$C" origin/main || { echo "rp-run: ${C:0:12} is not on origin/main; push it or set RP_REF to a published commit" >&2; exit 2; }
+
+# `cargo run [...] --example X [...] -- ARGS` -> X ARGS
+if [ "$1" = cargo ] && [ "${2:-}" = run ]; then
+    ex="" rest=()
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --example) ex=$2; shift 2 ;;
+            --example=*) ex=${1#--example=}; shift ;;
+            --) shift; rest=("$@"); break ;;
+            *) shift ;;
+        esac
+    done
+    [ -n "$ex" ] || { echo "rp-run: only 'cargo run --example X' is translated" >&2; exit 2; }
+    set -- "target/release/examples/$ex" "${rest[@]}"
+fi
+NEED_RUST=0
+[ "$1" = cargo ] && NEED_RUST=1
+
+uploads=() hf=() srcpaths=() examples=() words=()
+first=1
+for a in "$@"; do
+    if [ $first = 1 ]; then
+        case $a in
+            "$MAC_GAM"/target/*/examples/*|target/*/examples/*|./target/*/examples/*) examples+=("${a##*/}"); a="/workspace/bin/${a##*/}" ;;
+            python|python3|"$MAC_DATA"/venv/bin/python*) a=python3 ;;
+        esac
+        first=0
+    fi
+    while read -r p; do
+        [ -n "$p" ] || continue
+        case $p in "$MAC_DATA"/runpod/*|"$MAC_DATA"/venv*) continue ;; esac
+        [ -e "$p" ] && uploads+=("${p#"$MAC_DATA"/}")
+    done < <(grep -oE "$MAC_DATA/[^ :,;=\"']+" <<< "$a" || true)
+    while read -r p; do
+        [ -n "$p" ] && hf+=("$p")
+    done < <(grep -oE "$HF_HUB/models--[^/ ]+--[^/ ]+/snapshots/[0-9a-f]+" <<< "$a" || true)
+    while read -r p; do
+        [ -n "$p" ] || continue
+        rel=${p#"$MAC_GAM"/}
+        rel=${rel%/}
+        case $rel in target/*) continue ;; esac
+        git -C "$MAC_GAM" cat-file -e "$C:$rel" 2> /dev/null && srcpaths+=("$rel")
+    done < <(grep -oE "$MAC_GAM/[^ :,;=\"']+" <<< "$a" || true)
+    a=${a//$MAC_GAM\/target\/release\/examples\//\/workspace\/bin\/}
+    a=${a//$MAC_GAM\//\/workspace\/src\/}
+    a=${a//$MAC_DATA\//\/workspace\/mpd-data\/}
+    if [[ $a =~ $HF_HUB/models--([^/ ]+)--([^/ ]+)/snapshots/([0-9a-f]+) ]]; then
+        a=${a//"${BASH_REMATCH[0]}"/"/workspace/hf/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"}
+    fi
+    words+=("$a")
+done
+for x in ${RP_EXAMPLES:-}; do examples+=("$x"); done
+[ ${#examples[@]} -gt 0 ] && examples=($(printf '%s\n' "${examples[@]}" | sort -u))
+
+# Each example's package, from the commit's tree.
+declare -A package_of
+for x in "${examples[@]}"; do
+    f=$(git -C "$MAC_GAM" ls-tree -r --name-only "$C" -- crates | grep -E "^crates/[^/]+/examples/$x(\.rs|/main\.rs)$" | head -n 1 || true)
+    [ -n "$f" ] || { echo "rp-run: no example $x in crates/*/examples at ${C:0:12}" >&2; exit 2; }
+    crate=${f#crates/}
+    crate=${crate%%/*}
+    package_of[$x]=$(git -C "$MAC_GAM" show "$C:crates/$crate/Cargo.toml" | sed -nE 's/^name = "([^"]+)"/\1/p' | head -n 1)
+done
+# Binaries built from the same Rust sources in the same image are the same binaries.
+KEY=$( { git -C "$MAC_GAM" rev-parse "$C:crates" "$C:Cargo.lock" "$C:Cargo.toml" "$C:rust-toolchain.toml"; echo "$IMAGE"; } | shasum | cut -c1-16)
+CACHE=$RP/_bin/$KEY
+cached=() build=()
+for x in "${examples[@]}"; do
+    if [ -x "$CACHE/$x" ]; then cached+=("$x"); else build+=("$x"); fi
+done
+[ ${#build[@]} -gt 0 ] && NEED_RUST=1
+CHANNEL=$(git -C "$MAC_GAM" show "$C:rust-toolchain.toml" | sed -nE 's/^channel = "([^"]+)"/\1/p')
+
+envp=()
+[ -n "${RUST_LOG:-}" ] && envp+=("RUST_LOG=$RUST_LOG")
+[ -n "${RP_ENV:-}" ] && read -r -a extra <<< "$RP_ENV" && envp+=("${extra[@]}")
+cmd=$(printf '%q ' "${words[@]}")
+[ ${#envp[@]} -gt 0 ] && cmd="env $(printf '%q ' "${envp[@]}")$cmd"
+
+upload_kb=0
+[ ${#uploads[@]} -gt 0 ] && upload_kb=$(cd "$MAC_DATA" && du -skL "${uploads[@]}" | awk '{ s += $1 } END { print s }')
+hf_kb=0
+for p in "${hf[@]}"; do hf_kb=$(( hf_kb + $(du -skL "$p" | cut -f1) )); done
+# The container disk: the toolchain and a release build of the workspace (measured under 20 GB),
+# with room for the inputs, the models fetched and the outputs (as large again as the inputs).
+DISK=$(( 30 + (2 * (upload_kb + hf_kb) + 1048575) / 1048576 ))
+
+# The pod deletes itself HOURS after its container starts, then starts as the image would.
+WATCHDOG="(echo \$BASHPID > /rp-watchdog.pid; sleep $CAP_SECONDS; runpodctl remove pod \"\$RUNPOD_POD_ID\" || runpodctl pod delete \"\$RUNPOD_POD_ID\") > /rp-watchdog.log 2>&1 & exec /start.sh"
+create_body() {  # CLOUD PUBLIC_KEYS
+    # Rust builds and the host half of a step want more than the default 2 vCPUs and 8 GB per GPU.
+    jq -nc --arg name "mpd2951-$NAME" --arg image "$IMAGE" --arg gpu "$GPU_ID" --arg cloud "$1" --arg keys "$2" \
+        --argjson disk "$DISK" --arg start "$WATCHDOG" --argjson cuda "$CUDA_OK" \
+        '{name: $name, imageName: $image, computeType: "GPU", gpuTypeIds: [$gpu], gpuCount: 1, cloudType: $cloud,
+          containerDiskInGb: $disk, volumeInGb: 0, ports: ["22/tcp"], supportPublicIp: true,
+          env: {PUBLIC_KEY: $keys}, dockerStartCmd: ["bash", "-c", $start], allowedCudaVersions: $cuda,
+          minVCPUPerGPU: 8, minRAMPerGPU: 32}'
+}
+
+balance=$(jq -r '.data.myself | "balance $\(.clientBalance), spending $\(.currentSpendPerHr)/h"' <<< "$prices")
+echo "rp-run: $NAME on $GPU_ID ($(jq -r '"community $\(.communityPrice)/h, secure $\(.securePrice)/h"' <<< "$gpu_row")); estimate \$$ESTIMATE for $HOURS h; ledger \$$spent; $balance" >&2
+if [ -n "${RP_DRY:-}" ]; then
+    echo "commit:   $C"
+    echo "uploads:  ${uploads[*]:-none} ($(( upload_kb / 1024 )) MB)"
+    echo "hf:       ${hf[*]:-none}"
+    echo "source:   crates Cargo.toml Cargo.lock rust-toolchain.toml src build.rs bench/cargo_benches docs/rust-library-surface.md ${srcpaths[*]:-}"
+    echo "cached:   ${cached[*]:-none} ($CACHE)"
+    echo "build:    $( [ ${#build[@]} -gt 0 ] && for x in "${build[@]}"; do printf '%s (%s) ' "$x" "${package_of[$x]}"; done || echo none) with rust $CHANNEL"
+    echo "command:  $cmd"
+    echo "request:  $(create_body COMMUNITY '<run key> <~/.ssh/runpod_ed25519.pub>')"
+    exit 0
+fi
+
+mkdir -p "$OUT"
+LOG=$OUT/run.log
+: > "$LOG"
+TMP=$(mktemp -d /tmp/rp-run.XXXXXX)
+ssh-keygen -q -t ed25519 -N '' -C "rp-run $NAME" -f "$TMP/key"
+KEYS="$(cat "$TMP/key.pub")"$'\n'"$(cat ~/.ssh/runpod_ed25519.pub)"
+POD="" IP="" PORT="" ATTEMPTED=0
+SSH=(ssh -F none -i "$TMP/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no -o ForwardX11=no
+     -o UserKnownHostsFile="$TMP/known_hosts" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20
+     -o ServerAliveInterval=30 -o ServerAliveCountMax=4 -o LogLevel=ERROR
+     -o ControlMaster=auto -o ControlPath="$TMP/cm" -o ControlPersist=600)
+on_pod() { "${SSH[@]}" -p "$PORT" "root@$IP" "$@"; }
+
+finish() {
+    local rc=$?
+    trap - EXIT INT TERM HUP
+    set +e
+    if [ -n "$IP" ]; then "${SSH[@]}" -p "$PORT" -O exit "root@$IP" > /dev/null 2>&1; fi
+    if [ -z "$POD" ] && (( ATTEMPTED )); then
+        # A create that failed on the way back (a timeout) may still have made the pod.
+        local r id
+        r=$(api GET "$REST/pods")
+        while read -r id; do
+            [ -n "$id" ] || continue
+            echo "rp-run: adopting $id, made by a create whose answer was lost" >&2
+            printf '%s %s %s %s %s %s %s\n' "$NAME" "${GPU_ID// /_}" unknown "$PRICE_MAX" "$ATTEMPTED" "$$" "$ESTIMATE" > "$ACTIVE/$id"
+            POD=$id
+        done < <(jq -r --arg n "mpd2951-$NAME" '.[]? | select(.name == $n) | .id' <<< "$(body_of "$r")" 2> /dev/null)
+    fi
+    if [ -n "$POD" ]; then
+        # The watcher sees this process end and finds nothing left to reap.
+        reap "$POD" || rc=1
+        # Any other pod this runner made that is still there.
+        local r
+        r=$(api GET "$REST/pods")
+        if [ "$(status_of "$r")" = 200 ]; then
+            while read -r id pname st; do
+                if [ -f "$ACTIVE/$id" ]; then
+                    echo "rp-run: pod $id ($pname, $st) belongs to a run in progress" >&2
+                else
+                    echo "rp-run: POD $id ($pname, $st) REMAINS and no run of this Mac owns it" >&2
+                    rc=1
+                fi
+            done < <(jq -r '.[] | select(.name | startswith("mpd2951-")) | select(.desiredStatus == "RUNNING") | "\(.id) \(.name) \(.desiredStatus)"' <<< "$(body_of "$r")")
+        else
+            echo "rp-run: could not list pods to confirm none remain" >&2
+            rc=1
+        fi
+    fi
+    rm -rf "$TMP"
+    echo "rp-run: $NAME ended with status $rc; log $LOG" >&2
+    exit $rc
+}
+trap finish EXIT
+
+# 1. The pod: community cloud, else secure. Signals wait until the pod is on record, so none can
+# end the run between its creation and its record.
+ATTEMPTED=0
+for cloud in COMMUNITY SECURE; do
+    trap '' INT TERM HUP
+    ATTEMPTED=$(date +%s)
+    r=$(api POST "$REST/pods" "$(create_body "$cloud" "$KEYS")")
+    code=$(status_of "$r")
+    if [[ $code == 2* ]]; then
+        CREATED=$(date +%s)
+        POD=$(jq -r .id <<< "$(body_of "$r")")
+        PRICE=$(jq -r '.costPerHr // .adjustedCostPerHr // empty' <<< "$(body_of "$r")")
+        [ -n "$PRICE" ] || PRICE=$(jq -r --arg c "$cloud" 'if $c == "SECURE" then .securePrice else .communityPrice end' <<< "$gpu_row")
+        # active/POD: name gpu cloud price created owner estimate
+        printf '%s %s %s %s %s %s %s\n' "$NAME" "${GPU_ID// /_}" "$cloud" "$PRICE" "$CREATED" "$$" "$ESTIMATE" > "$ACTIVE/$POD"
+        nohup "$SELF" --watch "$POD" "$$" $(( CREATED + CAP_SECONDS )) >> "$OUT/watch.log" 2>&1 &
+        echo "rp-run: pod $POD on $cloud cloud at \$$PRICE/h" >&2
+    else
+        echo "rp-run: no $cloud pod ($code): $(body_of "$r" | head -c 300)" >&2
+    fi
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    [ -n "$POD" ] && break
+done
+[ -n "$POD" ] || exit 1
+
+# 2. SSH, once the pod has a public address. A pod not reachable within 20 minutes (an image pull
+# that stalls, a host that never reports) is given up.
+until [ -n "$IP" ]; do
+    (( $(date +%s) - CREATED < 1200 )) || { echo "rp-run: no public SSH address after 20 minutes" >&2; exit 1; }
+    sleep 5
+    r=$(api GET "$REST/pods/$POD")
+    [ "$(status_of "$r")" = 200 ] || continue
+    b=$(body_of "$r")
+    st=$(jq -r .desiredStatus <<< "$b")
+    [ "$st" = RUNNING ] || { echo "rp-run: pod is $st ($(jq -r '.lastStatusChange // ""' <<< "$b"))" >&2; exit 1; }
+    ip=$(jq -r '.publicIp // empty' <<< "$b")
+    port=$(jq -r '.portMappings["22"] // empty' <<< "$b")
+    [ -n "$ip" ] && [ -n "$port" ] && IP=$ip PORT=$port && jq 'del(.env)' <<< "$b" > "$OUT/pod.json"
+done
+until on_pod true 2> /dev/null; do
+    (( $(date +%s) - CREATED < 1200 )) || { echo "rp-run: SSH to $IP:$PORT not answering after 20 minutes" >&2; exit 1; }
+    sleep 5
+done
+echo "rp-run: ssh root@$IP -p $PORT up after $(( $(date +%s) - CREATED )) s" >&2
+# The pod-side cap must be armed before anything else runs.
+on_pod 'kill -0 "$(cat /rp-watchdog.pid)" && command -v runpodctl > /dev/null' ||
+    { echo "rp-run: the pod's own deletion timer is not running (no runpodctl or watchdog)" >&2; exit 1; }
+on_pod 'nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader; echo "vCPUs $(nproc), RAM $(free -g | awk "/Mem/ { print \$2 }") GB"' | tee -a "$OUT/pod.txt" >&2
+
+# 3-4. The source of the commit, and the toolchain when anything is compiled.
+{ git -C "$MAC_GAM" archive "$C" crates Cargo.toml Cargo.lock rust-toolchain.toml src build.rs bench/cargo_benches docs/rust-library-surface.md "${srcpaths[@]}"; } |
+    gzip -1 | on_pod 'mkdir -p /workspace/src /workspace/bin && gzip -dc | tar -x -C /workspace/src'
+if (( NEED_RUST )); then
+    on_pod "command -v cargo > /dev/null || [ -x ~/.cargo/bin/cargo ] || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain $CHANNEL" > /dev/null
+fi
+
+# 5. The examples: cached ones uploaded, the rest built and cached.
+if [ ${#cached[@]} -gt 0 ]; then
+    echo "rp-run: ${cached[*]} from the cache ($KEY)" >&2
+    tar -C "$CACHE" -cf - "${cached[@]}" | gzip -1 | on_pod 'gzip -dc | tar -x -C /workspace/bin'
+fi
+if [ ${#build[@]} -gt 0 ]; then
+    for pkg in $(for x in "${build[@]}"; do echo "${package_of[$x]}"; done | sort -u); do
+        flags=""
+        for x in "${build[@]}"; do [ "${package_of[$x]}" = "$pkg" ] && flags+=" --example $x"; done
+        echo "rp-run: building$flags (-p $pkg) at ${C:0:12}" >&2
+        on_pod "source ~/.cargo/env && cd /workspace/src && cargo build -q --release -p $pkg$flags" 2>&1 | tee -a "$OUT/build.log" >&2
+    done
+    on_pod "cd /workspace/src/target/release/examples && cp ${build[*]} /workspace/bin/"
+    mkdir -p "$CACHE"
+    on_pod "tar -C /workspace/bin -cf - ${build[*]} | gzip -1" | gzip -dc | tar -x -C "$CACHE"
+    echo "rp-run: built and cached ${build[*]} ($KEY)" >&2
+fi
+
+# 6. Inputs, and the Hugging Face models fetched on the pod.
+if [ ${#uploads[@]} -gt 0 ]; then
+    echo "rp-run: uploading $(( upload_kb / 1024 )) MB: ${uploads[*]}" >&2
+    (cd "$MAC_DATA" && COPYFILE_DISABLE=1 tar --no-mac-metadata -chf - --exclude '*.pem' --exclude '*.key' --exclude '.env' "${uploads[@]}") |
+        gzip -1 | on_pod 'mkdir -p /workspace/mpd-data && gzip -dc | tar -x -C /workspace/mpd-data'
+fi
+for p in "${hf[@]}"; do
+    [[ $p =~ models--([^/]+)--([^/]+)/snapshots/([0-9a-f]+)$ ]]
+    repo=${BASH_REMATCH[1]}/${BASH_REMATCH[2]} rev=${BASH_REMATCH[3]}
+    files=$(cd "$p" && find . -type f -o -type l | sed 's|^\./||' | tr '\n' ' ')
+    echo "rp-run: fetching $repo@${rev:0:12} on the pod: $files" >&2
+    on_pod "set -e; d=/workspace/hf/$repo/$rev; for f in $files; do mkdir -p \"\$d/\$(dirname \$f)\"; curl -fsSL --retry 3 -o \"\$d/\$f\" https://huggingface.co/$repo/resolve/$rev/\$f; done"
+done
+
+# 7. The command, detached on the pod so a dropped connection does not end it; its log streams here.
+{
+    echo 'export PATH=/root/.cargo/bin:/workspace/bin:/usr/local/cuda/bin:$PATH'
+    echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib64:/usr/local/nvidia/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}'
+    echo 'export MPD_BIN=/workspace/bin'
+    echo "mkdir -p /workspace/mpd-data/runpod/$NAME && cd /workspace/src"
+    echo "$cmd"
+} | on_pod 'cat > /workspace/run.sh'
+# The detached shell writes its own pid, so `tail --pid` follows the command and not a launcher.
+on_pod 'rm -f /workspace/run.exit /workspace/run.pid
+    setsid nohup bash -c "echo \$\$ > /workspace/run.pid; bash /workspace/run.sh > /workspace/run.log 2>&1; echo \$? > /workspace/run.exit" > /dev/null 2>&1 < /dev/null &
+    until [ -s /workspace/run.pid ]; do sleep 0.1; done'
+echo "rp-run: running: $cmd" >&2
+RC=""
+misses=0
+while :; do
+    off=$(wc -c < "$LOG" | tr -d ' ')
+    on_pod "tail -c +$(( off + 1 )) -f --pid=\$(cat /workspace/run.pid) /workspace/run.log" | tee -a "$LOG" || true
+    if state=$(on_pod 'cat /workspace/run.exit 2> /dev/null || { kill -0 "$(cat /workspace/run.pid)" 2> /dev/null && echo alive; } || echo vanished'); then
+        misses=0
+        case $state in
+            alive) continue ;;
+            vanished) echo "rp-run: the command's shell ended without an exit status" >&2; RC=255; break ;;
+            *) RC=$state; break ;;
+        esac
+    fi
+    # The connection dropped, or the pod is gone (its cap, or deleted elsewhere): retry, then give up.
+    misses=$(( misses + 1 ))
+    (( misses <= 10 )) || { echo "rp-run: lost the pod" >&2; exit 1; }
+    sleep 15
+done
+echo "rp-run: command exited $RC after $(( $(date +%s) - CREATED )) s of pod time" >&2
+
+# 8. Outputs.
+on_pod "cd /workspace/mpd-data/runpod/$NAME && tar -cf - . | gzip -1" | gzip -dc | tar -x -C "$OUT"
+echo "rp-run: outputs in $OUT" >&2
+exit "$RC"
