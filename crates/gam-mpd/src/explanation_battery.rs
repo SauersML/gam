@@ -382,6 +382,8 @@ pub struct Layout {
     /// The nodes reading those slots.
     pub mask_nodes: Vec<usize>,
     pub delta_nodes: Vec<usize>,
+    /// Per layer, each head's attention read (the output map's input), in head order.
+    pub head_reads: Vec<Vec<usize>>,
 }
 
 /// A model as an operator program through its final normed stream, with its node layout.
@@ -426,6 +428,7 @@ fn build(export: &Export, config: &Config, factors: Option<&[Factors]>) -> Resul
         deltas: Vec::new(),
         mask_nodes: Vec::new(),
         delta_nodes: Vec::new(),
+        head_reads: Vec::new(),
     };
     // A decomposed site on `terms` (its input as (node, columns of V's rows) pairs, the columns'
     // interfaces): its masked activations; the caller writes `U` and the remainder.
@@ -490,6 +493,7 @@ fn build(export: &Export, config: &Config, factors: Option<&[Factors]>) -> Resul
             .iter()
             .map(|[q, k, v]| b.node(Node::Attend { query: *q, key: *k, value: *v, scale: Scale::InverseSqrt(hd as u32), rotary: Some(config.rotary), causal: true }))
             .collect();
+        layout.head_reads.push(reads.clone());
         let concatenated = b.node(Node::Concat { parts: reads.clone() });
         layout.inputs[site(Kind::Output)] = concatenated;
         let wo = weight(Kind::Output)?;
@@ -2050,7 +2054,10 @@ fn d_copy(d: &Device, t: &Tensor) -> Result<Tensor, String> {
 /// `vpd` VPD's subcomponents, `A_c(t) = Σ_s a_c(s) (U_c · ∂m(t)/∂y(s))` with `y` the site's output
 /// (queries and keys zero under the frozen pattern), beside VPD's own count of subcomponents with
 /// a positive causal importance at `t`. `targets` positions per sequence are drawn uniformly without
-/// replacement from `seed`. Returns per unit kind and `τ` the mean count per target token.
+/// replacement from `seed`. Returns per unit kind and `τ` the mean count per target token; with
+/// `faithful`, also per target the fewest units, kept by `|A_i(t)|` with the others at their means,
+/// whose faithfulness on the prediction at `t` reaches `faithful.level` (`UnitBasis::faithful_count`)
+/// for `M`'s neurons and heads and for VPD's subcomponents.
 pub fn importance_counts(
     library: &crate::library_readout::Library<'_>,
     vpd: Option<&Vpd>,
@@ -2058,6 +2065,7 @@ pub fn importance_counts(
     targets: usize,
     thresholds: &[f64],
     seed: u64,
+    faithful: Option<&Faithful<'_>>,
 ) -> Result<Value, String> {
     use crate::library_readout::{Kind as FunctionKind, Metric, Prompt};
     let functions = library.functions();
@@ -2076,6 +2084,7 @@ pub fn importance_counts(
     let mut counts: BTreeMap<&str, Vec<Tokens>> = kinds.iter().map(|k| (*k, vec![Tokens::default(); thresholds.len()])).collect();
     let mut own = Tokens::default();
     let mut metric = Tokens::default();
+    let (mut faithful_model, mut faithful_vpd) = (Tokens::default(), Tokens::default());
     for sequence in sequences {
         let length = sequence.len();
         let mut positions: Vec<usize> = (0..length).collect();
@@ -2105,6 +2114,20 @@ pub fn importance_counts(
             let m = attribution.metric[t];
             metric.0.push(m);
             let totals = attribution.attributions.sum_axis(Axis(0));
+            let predicted = attribution.predicted[t] as usize;
+            if let Some(f) = faithful {
+                // M's units in the basis's order: per layer each head, then the layer's neurons.
+                let mut groups = Vec::new();
+                for l in 0..heads.len() {
+                    for (i, fid) in functions.iter().enumerate() {
+                        if fid.layer == l && matches!(fid.kind, FunctionKind::Head) {
+                            groups.push(Array1::from_elem(1, totals[i]));
+                        }
+                    }
+                    groups.push(functions.iter().zip(&totals).filter(|(fid, _)| fid.layer == l && matches!(fid.kind, FunctionKind::Mlp)).map(|(_, a)| *a).collect());
+                }
+                faithful_model.0.push(f.model.0.faithful_count(&sequence[..=t], predicted, &groups, &f.model.1, f.level)? as f64);
+            }
             for (j, tau) in thresholds.iter().enumerate() {
                 let above = |kind: Option<bool>| {
                     functions.iter().zip(&totals).filter(|(f, a)| kind.is_none_or(|mlp| matches!(f.kind, FunctionKind::Mlp) == mlp) && a.abs() > tau * m.abs()).count() as f64
@@ -2122,10 +2145,14 @@ pub fn importance_counts(
             let Some((v, activations, importance)) = &vpd_state else { continue };
             let gradients = attribution.gradients.ok_or_else(|| error("RelP returned no gradients"))?;
             let mut above = vec![0.0; thresholds.len()];
+            let mut per_site: Vec<Array1<f64>> = Vec::with_capacity(v.factors.len());
             for (s, f) in v.factors.iter().enumerate() {
                 let layer = &gradients[f.layer];
                 let gradient: Array2<f64> = match f.kind {
-                    Kind::Query | Kind::Key => continue,
+                    Kind::Query | Kind::Key => {
+                        per_site.push(Array1::zeros(f.subcomponents()));
+                        continue;
+                    }
                     Kind::Value => {
                         let width = layer.values.first().map_or(0, Array2::ncols);
                         let mut g = Array2::zeros((t + 1, width * heads[f.layer].len()));
@@ -2143,6 +2170,10 @@ pub fn importance_counts(
                 for (j, tau) in thresholds.iter().enumerate() {
                     above[j] += attributions.iter().filter(|x| x.abs() > tau * m.abs()).count() as f64;
                 }
+                per_site.push(attributions);
+            }
+            if let Some((basis, means)) = faithful.and_then(|f| f.vpd.as_ref()) {
+                faithful_vpd.0.push(basis.faithful_count(&sequence[..=t], predicted, &per_site, means, faithful.map_or(1.0, |f| f.level))? as f64);
             }
             if let Some(c) = counts.get_mut("vpd") {
                 for (j, n) in above.into_iter().enumerate() {
@@ -2164,5 +2195,102 @@ pub fn importance_counts(
         out.insert("vpd_positive_importance".into(), own.summary());
     }
     out.insert("metric".into(), metric.summary());
+    if let Some(f) = faithful {
+        out.insert("faithful_level".into(), json!(f.level));
+        out.insert("faithful_neurons_and_heads".into(), faithful_model.summary());
+        out.insert("faithful_vpd".into(), faithful_vpd.summary());
+    }
     Ok(Value::Object(out))
+}
+
+/// The bases and the level of the per-token faithful counts ([`importance_counts`]): `M`'s
+/// neurons and heads (per layer each head's read, then the layer's neurons) and VPD's
+/// subcomponents, each with its units' means per position.
+pub struct Faithful<'a> {
+    pub model: (UnitBasis<'a>, Vec<Array2<f64>>),
+    pub vpd: Option<(UnitBasis<'a>, Vec<Array2<f64>>)>,
+    pub level: f64,
+}
+
+/// A basis of units for per-token circuits: node groups of a model program, each split into units
+/// of `width` consecutive columns (one column per neuron or subcomponent; a head's whole read).
+pub struct UnitBasis<'a> {
+    pub side: &'a Side,
+    pub groups: Vec<(usize, usize)>,
+    pub given: &'a dyn Fn(usize) -> Result<BTreeMap<usize, Tensor>, String>,
+    pub unembedding: &'a Array2<f64>,
+}
+
+impl UnitBasis<'_> {
+    pub fn units(&self) -> usize {
+        self.groups.iter().map(|(n, w)| self.side.program.widths()[*n] / w).sum()
+    }
+
+    /// Per group, every column's mean at each position over `sequences` (positions × width).
+    pub fn means(&self, sequences: &[Vec<u32>]) -> Result<Vec<Array2<f64>>, String> {
+        let d = self.side.program.device();
+        let length = sequences.first().map_or(0, Vec::len);
+        let mut sums: Vec<Array2<f64>> = self.groups.iter().map(|(n, _)| Array2::zeros((length, self.side.program.widths()[*n]))).collect();
+        for sequence in sequences {
+            let family = sequence_family(&[sequence.as_slice()])?;
+            let trace = self.side.program.forward_span_given(&family, (self.given)(family.rows)?, None, self.side.hidden, |_, _| Ok(None))?;
+            for (sum, (n, _)) in sums.iter_mut().zip(&self.groups) {
+                *sum += &d.download(trace.value(*n)?).map_err(error)?;
+            }
+        }
+        Ok(sums.into_iter().map(|s| s / sequences.len() as f64).collect())
+    }
+
+    /// The centred logit of `predicted` at the last position of `tokens`, every unit outside
+    /// `keep` (per group, per unit; none keeps every unit) at its mean at each position.
+    fn centred(&self, tokens: &[u32], predicted: usize, keep: Option<&[Vec<bool>]>, means: &[Array2<f64>]) -> Result<f64, String> {
+        let d = self.side.program.device();
+        let family = sequence_family(&[tokens])?;
+        let trace = self.side.program.forward_span_given(&family, (self.given)(family.rows)?, None, self.side.hidden, |node, trace| {
+            let Some(keep) = keep else { return Ok(None) };
+            let Some(g) = self.groups.iter().position(|(n, _)| *n == node) else { return Ok(None) };
+            let width = self.groups[g].1;
+            let mut value = d.download(trace.value(node)?).map_err(error)?;
+            for (r, mut row) in value.outer_iter_mut().enumerate() {
+                for (c, v) in row.iter_mut().enumerate() {
+                    if !keep[g][c / width] {
+                        *v = means[g][[r, c]];
+                    }
+                }
+            }
+            d.upload(value.view()).map(Some).map_err(error)
+        })?;
+        let hidden = d.download(trace.value(self.side.hidden)?).map_err(error)?;
+        let h = hidden.row(tokens.len() - 1);
+        let mean_row = self.unembedding.mean_axis(Axis(0)).ok_or_else(|| error("an empty unembedding"))?;
+        Ok(h.dot(&self.unembedding.row(predicted)) - h.dot(&mean_row))
+    }
+
+    /// The fewest units, kept in decreasing order of `|attribution|` (per group, per unit) with the
+    /// others at their means, whose faithfulness `(m(C_k) − m(∅)) / (m(M) − m(∅))` on the prediction
+    /// at the last position of `tokens` reaches `level`, found by bisection on `k` (the faithfulness
+    /// taken as increasing in `k`); the unit count when none does.
+    pub fn faithful_count(&self, tokens: &[u32], predicted: usize, attribution: &[Array1<f64>], means: &[Array2<f64>], level: f64) -> Result<usize, String> {
+        let mut order: Vec<(usize, usize)> = attribution.iter().enumerate().flat_map(|(g, a)| (0..a.len()).map(move |u| (g, u))).collect();
+        order.sort_by(|a, b| attribution[b.0][b.1].abs().total_cmp(&attribution[a.0][a.1].abs()));
+        let keep_of = |k: usize| -> Vec<Vec<bool>> {
+            let mut keep: Vec<Vec<bool>> = attribution.iter().map(|a| vec![false; a.len()]).collect();
+            for &(g, u) in &order[..k] {
+                keep[g][u] = true;
+            }
+            keep
+        };
+        let full = self.centred(tokens, predicted, None, means)?;
+        let empty = self.centred(tokens, predicted, Some(&keep_of(0)), means)?;
+        let faithful = |k: usize| -> Result<bool, String> { Ok((self.centred(tokens, predicted, Some(&keep_of(k)), means)? - empty) / (full - empty) >= level) };
+        let (mut low, mut high) = (0, order.len());
+        if !faithful(high)? {
+            return Ok(high);
+        }
+        while high - low > 1 {
+            let mid = (low + high) / 2;
+            if faithful(mid)? { high = mid } else { low = mid }
+        }
+        Ok(high)
+    }
 }

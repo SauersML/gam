@@ -79,6 +79,8 @@ struct Settings {
 struct Importance {
     thresholds: Vec<f64>,
     targets: usize,
+    /// The faithfulness a per-token circuit must reach; the source rows give the units' means.
+    faithful_level: f64,
 }
 
 #[derive(Deserialize)]
@@ -291,7 +293,32 @@ fn main() -> Result<(), String> {
         let vpd = Vpd::new(&device, export, Decomposition::load(extra.ok_or(usage)?)?, settings.numeric_bytes)?;
         let start = library_mdl::explanation(&native, &layers)?.artifact;
         let library = gam_mpd::library_readout::Library::new(&device, &device, &native, &layers, &start, settings.numeric_bytes, settings.head_tile_rows)?;
-        report["importance"] = json!({"model_and_vpd": battery::importance_counts(&library, Some(&vpd), bases, importance.targets, &importance.thresholds, settings.seed)?});
+        // The per-token circuits' bases: M's heads and neurons in the library's order, and VPD's
+        // subcomponents, their means over the source rows.
+        let (model, unembedding) = battery::model(export, None)?;
+        let m = Side::of_model(&device, &model, &unembedding, settings.numeric_bytes)?;
+        let none = |_: usize| -> Result<BTreeMap<usize, gam_gpu::tensor::Tensor>, String> { Ok(BTreeMap::new()) };
+        let ones = |rows: usize| -> Result<BTreeMap<usize, gam_gpu::tensor::Tensor>, String> {
+            let mut out = BTreeMap::new();
+            for l in 0..vpd.layers() {
+                out.extend(vpd.given(&device, l, None, rows)?);
+            }
+            Ok(out)
+        };
+        let mut groups = Vec::new();
+        for l in 0..layer_count {
+            for f in library.functions().iter().filter(|f| f.layer == l && matches!(f.kind, gam_mpd::library_readout::Kind::Head)) {
+                let h: usize = f.name.rsplit('H').next().and_then(|h| h.parse().ok()).ok_or("a head name")?;
+                let node = model.layout.head_reads[l][h];
+                groups.push((node, m.program.widths()[node]));
+            }
+            groups.push((model.layout.inputs[battery::KINDS.len() * l + 5], 1));
+        }
+        let model_basis = battery::UnitBasis { side: &m, groups, given: &none, unembedding: &unembedding };
+        let vpd_basis = battery::UnitBasis { side: &vpd.e, groups: vpd.layout.activations.iter().map(|n| (*n, 1)).collect(), given: &ones, unembedding: &unembedding };
+        let (model_means, vpd_means) = (model_basis.means(sources)?, vpd_basis.means(sources)?);
+        let faithful = battery::Faithful { model: (model_basis, model_means), vpd: Some((vpd_basis, vpd_means)), level: importance.faithful_level };
+        report["importance"] = json!({"model_and_vpd": battery::importance_counts(&library, Some(&vpd), bases, importance.targets, &importance.thresholds, settings.seed, Some(&faithful))?});
         save(&report)?;
         if let Some(path) = more {
             let explanation = library_mdl::explanation(&native, &layers)?;
@@ -301,7 +328,7 @@ fn main() -> Result<(), String> {
                 Artifact::from_bytes(&std::fs::read(path).map_err(error)?, &native.declarations)?
             };
             let library = gam_mpd::library_readout::Library::new(&device, &device, &native, &layers, &artifact, settings.numeric_bytes, settings.head_tile_rows)?;
-            report["importance"]["library"] = battery::importance_counts(&library, None, bases, importance.targets, &importance.thresholds, settings.seed)?;
+            report["importance"]["library"] = battery::importance_counts(&library, None, bases, importance.targets, &importance.thresholds, settings.seed, None)?;
         }
         report["seconds"] = json!(started.elapsed().as_secs_f64());
         save(&report)?;
