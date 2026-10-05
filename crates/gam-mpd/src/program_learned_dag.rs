@@ -1920,6 +1920,7 @@ mod tests {
         let mut s = settings();
         s.require_shared = true;
         s.affine_bias = true;
+        s.unary = vec![Unary::Silu, Unary::GeluTanh];
         let expressions = inheritance_equations(false, Unary::GeluTanh);
         let mut parent = compile_program(&inputs, &outputs, &expressions, &s).expect("parent");
         // Nonzero biases distinguish coefficient preservation from zero init.
@@ -2032,13 +2033,18 @@ mod tests {
         let mut s = settings();
         s.affine_bias = true;
         s.require_shared = true;
+        s.unary = vec![Unary::GeluTanh];
+        let bias_free_settings = Settings {
+            affine_bias: false,
+            ..s.clone()
+        };
         let biased = inheritance_equations(false, Unary::GeluTanh);
         let mut bias_free = biased.clone();
         for e in &mut bias_free {
             remove_bias(e);
         }
-        let parent =
-            compile_program(&[input.clone()], &outputs, &bias_free, &s).expect("bias-free parent");
+        let parent = compile_program(&[input.clone()], &outputs, &bias_free, &bias_free_settings)
+            .expect("bias-free parent");
         let inherited = compile_program_inheriting(
             &[input.clone()],
             &outputs,
@@ -2073,7 +2079,7 @@ mod tests {
             &[input.clone()],
             &outputs,
             &bias_free,
-            &s,
+            &bias_free_settings,
             &inherited.program,
             &[0],
             &inherited.output_nodes,
@@ -2095,7 +2101,7 @@ mod tests {
             &[input],
             &outputs,
             &bias_free,
-            &s,
+            &bias_free_settings,
             &nonzero.program,
             &[0],
             &nonzero.output_nodes,
